@@ -42,7 +42,7 @@ XeStrata は、オープンな標準の SYCL で書いた 1 つのコードで�
 GPU の計算を CUDA から SYCL と Level Zero に書き直し、同じコードを AMD の GPU 向け（free と contrib-llvm のビルド）と NVIDIA の GPU 向け（contrib-llvm のビルド）にもコンパイルします。
 モデル、インストールの流れ、画面、API は Strata とほぼ同じです。
 
-- **ほかのモデル**: Qwen3.8-Flash-Next の調整版や圧縮の違う版のほか、Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B、Qwen3.5-9B、GLM-5.3-Flash も動かせます（BETA）。
+- **ほかのモデル**: Qwen3.8-Flash-Next の調整版や圧縮の違う版のほか、Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B、Qwen3.5-9B・2B・0.8B、GLM-5.3-Flash も動かせます（BETA）。Qwen3.5-2B と 0.8B は GPU のない PC でも CPU だけで動きます。
 - **GPU は 1 枚が基本**です。同じ PC の 2 枚以上の GPU に層を分けて載せることもでき、メーカーの違う GPU も組み合わせられます（NVIDIA を含むときは contrib-llvm のビルド）。
   2 枚のときは、2 枚目を層の分担にするか、1 枚目のキャッシュの助けにするかを、速い方に自動で選びます（[MULTIGPU](docs/MULTIGPU.ja.md)）。
 - **自由ソフトウェアだけでも動きます**（free のビルド、Debian main に入れられる程度に自由な構成。[ソースから作ります](docs/BUILD.ja.md#deb-と-rpm-のパッケージ)）。
@@ -106,9 +106,10 @@ RAM がそれより少ない PC では、Coder（32 GB）、Gyro（36 GB、RAM �
 | **llm-jp-4.1**（BETA） | 320 億（1 トークンで 30 億） | 30〜73 GB | 日本語と英語の思考するモデル |
 | **Qwen3.6-35B-A3B**（BETA） | 350 億（1 トークンで 30 億） | 31〜46 GB | 画像も読む思考するモデル。RAM の少ない PC 向け |
 | **Qwen3.5-9B**（BETA） | 90 億（密） | 8 GB（VRAM は 8〜20 GB） | 画像も読む思考するモデル。重みを GPU に全部載せる。拒否を外した版もあります |
+| **Qwen3.5-2B・0.8B**（BETA） | 20 億・8 億（密） | 8 GB（VRAM は 2〜6 GB）、GPU なしでは 4〜6 GB | 小さな GPU や GPU のない PC 向けの、画像も読む思考するモデル。答えは 9B に及びません |
 | **GLM-5.3-Flash**（BETA） | 3,200 億（1 トークンで 180 億） | RAM と VRAM で 101〜165 GB | 思考する大きなモデル。RAM の多い PC 向け |
 
-BETA のモデルは、画像の生成にまだ対応していません。画像を読ませられるのは Ornith-1.5、Qwen3.6-35B-A3B、Qwen3.5-9B です。大きさの表とオプションは [DETAILS](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41qwen36-35b-a3bqwen35-9bglm-53-flash) にあります。
+BETA のモデルは、画像の生成にまだ対応していません。画像を読ませられるのは Ornith-1.5、Qwen3.6-35B-A3B、Qwen3.5 の 9B・2B・0.8B です（2B と 0.8B は GPU で動かすときだけ）。大きさの表とオプションは [DETAILS](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41qwen36-35b-a3bqwen35-9bglm-53-flash) にあります。
 
 ### Qwen3.8-Flash-Next の版と大きさ
 
@@ -386,7 +387,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
    - AtomicChat による [AD-4.27bpw と AD-5.00bpw](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF)。
    - Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj、[拒否を外した版](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF)は dealignai）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、
      Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)（[拒否を外した版](https://huggingface.co/SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF)は llmfan46 の重みを SC117 が量子化）、Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）。
-   - Qwen の [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（GGUF は Unsloth）と、HauhauCS による拒否を外した版の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)。
+   - Qwen の [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)、[Qwen3.5-2B](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF)、[Qwen3.5-0.8B](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF)（GGUF は Unsloth）と、HauhauCS による拒否を外した版の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)。
    - 画像の生成: Qwen の Qwen-Image-2.1、Microsoft の Mage-Flow、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image と編集の LoRA（chinoll の Moss-Image-Edit、akhaliq の MOSS-Image-Edit-HQ）、CircleStone Labs の Anima と Wan 2.1 の VAE、文の読み手の Qwen3-VL、Qwen3.5-9B、Qwen3-0.6B-Base、Detailer の検出器の Bingsu の adetailer（Ultralytics YOLOv8 で学習）、拡大の Xintao Wang らの RealESRGAN x4plus と ByteDance Seed の SeedVR2、言葉からマスクの Meta の SAM 3.1（SAM License、同意の後だけ）と Microsoft の Florence-2、背景を消す Peng Zheng の BiRefNet、構図の制御の alibaba-pai の Qwen-Image-2.1 Fun ControlNet Union（Qwen Research License）と darask0 の MOSS-Image の色と深度のアダプターと 4 ステップのアダプター、制御の図を作る Depth Anything V2 Small・DWPose・Megvii の YOLOX-L・ControlNet 1.1 の HED・Caroline Chan の線画・NAVER の M-LSD（[IMAGE](docs/IMAGE.ja.md#ライセンス)）。
 
   モデルのファイルには、それぞれのライセンスが適用されます。

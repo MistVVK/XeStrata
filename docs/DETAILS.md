@@ -381,11 +381,12 @@ The picture reader is Swift 1.5's, and the license is the Swift Open License 1.0
 ### Or: models other than Qwen3.8-Flash-Next (Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B, Qwen3.5-9B, GLM-5.3-Flash)
 
 setup's first question also offers four MoE models built differently from Qwen3.8-Flash-Next, and the dense
-Qwen3.5-9B.
+Qwen3.5 models of 9B, 2B and 0.8B.
 Each is read from its GGUF file as it is (GLM-5.3-Flash's in three or four parts).
 The MoE models keep the most used experts in the GPU's VRAM and the rest in RAM (the ones VRAM does not hold are
 handled as for Qwen3.8-Flash-Next).
-Qwen3.5-9B keeps every weight in the GPU's VRAM.
+Qwen3.5's 9B, 2B and 0.8B keep every weight in the GPU's VRAM; 2B and 0.8B also run on the CPU alone, on a PC without
+a GPU ([a PC without a GPU](#a-pc-without-a-gpu)).
 
 - **[Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)** (Ornith AI, MIT): a Qwen3.5-family
   MoE of 35B with 3B active per token, context up to 256K. The official Q4_K_M to BF16, and pfeifferj's GSQ-RCO 3 and
@@ -407,6 +408,12 @@ Qwen3.5-9B keeps every weight in the GPU's VRAM.
   [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)
   (Apache-2.0, the same four sizes), can be chosen too (`--family qwen35-uncensored`). It refuses far less, and its
   safety filtering is reduced, so check what it writes.
+- **[Qwen3.5-2B](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF), [Qwen3.5-0.8B](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF)**
+  (Qwen, Apache-2.0): small dense thinking models built as the 9B, that read images too, context up to 256K.
+  For a small GPU or a PC without one; their answers fall short of the 9B's (and the 0.8B's of the 2B's).
+  The GGUFs are Unsloth's: Q4_K_M, UD-Q5_K_XL, Q6_K, Q8_0 and BF16 for the 2B, Q4_K_M, Q6_K, Q8_0 and BF16 for the
+  0.8B (`--family qwen35-2b`, `--family qwen35-0.8b`). setup recommends UD-Q5_K_XL for the 2B and Q8_0 for the 0.8B
+  (the largest that fits when the GPU does not hold it).
 - **[GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)** (Z.ai, MIT): a thinking MoE of 320B with 18B
   active per token; setup offers contexts up to 256K. Its attention is KDA (linear attention) and DSA (attention over
   the tokens it selects), with four residual streams (mHC). The GGUFs are Unsloth's UD-IQ1_S, UD-IQ3_XXS and UD-IQ4_XS.
@@ -433,14 +440,23 @@ Qwen3.5-9B keeps every weight in the GPU's VRAM.
 | | Q6_K | 7.5 GB | 8 GB | 10 GB and up |
 | | Q8_0 | 9.5 GB | 8 GB | 12 GB and up |
 | | BF16 | 17.9 GB | 8 GB | 20 GB and up |
+| Qwen3.5-2B | Q4_K_M | 1.3 GB | 8 GB | 3 GB and up |
+| | **UD-Q5_K_XL** | 1.5 GB | 8 GB | 3 GB and up |
+| | Q6_K | 1.6 GB | 8 GB | 3 GB and up |
+| | Q8_0 | 2.0 GB | 8 GB | 4 GB and up |
+| | BF16 | 3.8 GB | 8 GB | 6 GB and up |
+| Qwen3.5-0.8B | Q4_K_M | 0.5 GB | 8 GB | 2 GB and up |
+| | Q6_K | 0.6 GB | 8 GB | 2 GB and up |
+| | **Q8_0** | 0.8 GB | 8 GB | 3 GB and up |
+| | BF16 | 1.5 GB | 8 GB | 3 GB and up |
 | GLM-5.3-Flash | **UD-IQ1_S** | 93.1 GB | 101 GB | 12 GB and up |
 | | **UD-IQ3_XXS** | 120.4 GB | 128 GB | 12 GB and up |
 | | UD-IQ4_XS | 156.8 GB | 165 GB | 12 GB and up |
 
 The RAM is about the download's size plus 8 GB (for GLM-5.3-Flash, RAM and VRAM together).
 With less, the experts that RAM and VRAM do not hold are read from the model's files, which is slower.
-Qwen3.5-9B's VRAM is its weights and, at a 32K context, its KV cache (32 KB a token) and about 1 GB more (the same
-for the version without refusals).
+Qwen3.5's VRAM is its weights and, at a 32K context, its KV cache (a token's: 32 KB for the 9B, 12 KB for the 2B and
+the 0.8B) and about 1 GB more (the same for the version without refusals).
 setup recommends the largest version the GPU's VRAM holds and warns of a choice it does not; weights that do not fit
 the VRAM are not streamed from RAM yet.
 The sizes in bold are the files whose answers this release compared with llama.cpp's.
@@ -465,10 +481,10 @@ With two or more GPUs chosen by `setup --gpus`, the layers are split across them
 the next the later ones, the head and the MTP layer; the points follow each GPU's share of the free memory), and the
 experts in VRAM are all the GPUs' together.
 `setup`'s `--kv`, `--parallel`, `--replicas` and `--resident-budget-gib N` (N GiB of the experts the GPU does not hold in RAM, the rest read from the file) go into the config as for Qwen3.8-Flash-Next (`--kv`'s `q4_0` and `k8v4` for the models with heads of 256, `fp16` and `int8` for llm-jp, `fp16` alone for GLM-5.3-Flash; `--parallel` not for GLM-5.3-Flash nor with images).
-Ornith-1.5, Qwen3.6-35B-A3B and Qwen3.5-9B read images (setup asks as for Qwen3.8-Flash-Next, and takes the GPU reader
-on a GPU of 24 GB and more, the CPU reader below that).
+Ornith-1.5, Qwen3.6-35B-A3B and Qwen3.5's 9B, 2B and 0.8B read images (2B and 0.8B on a GPU only; setup asks as for
+Qwen3.8-Flash-Next, and takes the GPU reader on a GPU of 24 GB and more, the CPU reader below that).
 Each picture reader (mmproj) is its publisher's: Ornith AI's BF16 for Ornith-1.5 (pfeifferj's GSQ-RCO files use it too),
-dealignai's for its version without refusals, Unsloth's BF16 for Qwen3.6-35B-A3B and Qwen3.5-9B, and SC117's F16 for
+dealignai's for its version without refusals, Unsloth's BF16 for Qwen3.6-35B-A3B and Qwen3.5's 9B, 2B and 0.8B (each repository's own), and SC117's F16 for
 Qwen3.6-35B-A3B's version without refusals.
 Not yet: llm-jp-4.1's and GLM-5.3-Flash's images, image generation, and the options made for Qwen3.8-Flash-Next such as the low-RAM modes (GLM-5.3-Flash's KV cache is FP16 only for now).
 When RAM is short of all the experts, the engine keeps the ones VRAM does not hold in RAM as far as it has room and
@@ -515,10 +531,31 @@ The engine's options (added to the settings' `args`):
 | `--pipeline-windows N` | with a layer split, 1 (the default) pipelines the windows a prompt is read through over the stages (an earlier stage computes the next window while a later one computes this one; the rows and their order are the serial ones, so the state is too); 2, with two stages and the MTP layer, the decode too: the first stage computes a guess of the next window while the last checks this one (when this one holds whole and its next token is the draft layer's, the guess is the next window; else the first stage goes back), only where the chance that it holds (the draft layer's probability, scaled by the share of the guesses so far that held) times the first stage's time it saves exceeds the time a guess beside a window adds to it, each time measured over the windows; until they are measured, where that chance is 0.5 or more (Qwen3.8-Flash-Next's default is 0.2). The windows are sized by the serial rule (`--spec-window`). The text is that of the serial windows with the experts in the same places (2 keeps the second verifier's VRAM out of the experts, so their places change, and a text at temperature can change with the CPU's and the GPU's rounding). Qwen3.6-35B-A3B on a B70 + RTX 4070 split at layer 20: a copy reply 187.2 -> 247.2 tokens/s, a story at temperature 0.8 134.5 and 135.7 -> 133.0 and 134.1. Qwen3.8-Flash-Next on the same pair split at layer 24 (the experts not swapped): a story, greedy, serial 65.9 -> 67.2 and 67.5 tokens/s, at temperature 0.8 60.7 -> 60.9 and 64.0 (57.6 and 57.9, 54.7 and 55.1 when `--spec` sized the windows). 0: serial. Qwen3.6-35B-A3B on a B70 + RTX 4070 split at layer 20, 819 tokens with `--prompt-chunk 0`: prefill 108.5 -> 139.3 tokens/s, the same answer. A long prompt read in chunks has its chunks pipelined over the stages the same way (13,506 tokens on the same split: prefill 1,030.8 -> 1,357.9 tokens/s, the same answer) |
 | `--vram-reserve-later-mib N` | with a layer split, the VRAM left free on the later GPUs (by default as `--vram-reserve-mib`) |
 | `--vision` | with `--serve`, take requests with images (Qwen3.5-9B and the qwen35moe models; setup writes it when images are chosen) |
+| `--device cpu`, `--cpu-threads N` | run a dense Qwen3.5 model (qwen35) on the CPU alone ([a PC without a GPU](#a-pc-without-a-gpu); without a GPU that SYCL can use it runs on the CPU unasked). `--cpu-threads` is the number of threads (default: all) |
 | `--batch N` (`"parallel": N`) | with `--serve`, decode up to N conversations together ([BATCHING](BATCHING.md#the-other-models-the-plain-engine); not GLM-5.3-Flash nor `--vision` yet) |
 | `--prompt-cache N`, `--prompt-cache-every N`, `--prompt-cache-root N`, `--turn-token ID`, `--conversation-save-checkpoints N` | with `--serve`, the conversation checkpoints of a model with a recurrent state (Ornith, Qwen3.6, Qwen3.5-9B). A recurrent state cannot go back to an earlier position, so a request that takes a conversation up short of its end (the next turn after a reply rendered otherwise, an edited message, a new chat on the same system prompt) reads all of it again without one. The meanings and defaults are Qwen3.8-Flash-Next's ([the conversation cache](#the-conversation-cache)), and a request's `pin` and `"strata_checkpoint": false` apply. A checkpoint is the recurrent state only (about 60 MB for Qwen3.6); the K/V of the positions below it are the conversation's. `--turn-token` defaults to the vocabulary's `<|im_start|>`, else `<|start|>`. A model of attention layers only (llm-jp, GLM-5.3-Flash) needs none: the K/V up to any position serve |
 | `--tail-role-token ID`, `--prompt-cache-tail`, `--prompt-cache-spread`, `--conversation-cache-min-tokens N`, `--conversation-cache-park-gain N`, `--short-read N`, `--session-save-reclaim` | `--serve`'s policies of the conversation cache and the checkpoints (Qwen3.8-Flash-Next's meanings); `--short-read` defaults to `--max-t` |
 | `--rope-scaling none\|linear\|yarn`, `--rope-scale F`, `--yarn-orig-ctx N`, `--yarn-ext-factor F`, `--yarn-attn-factor F`, `--yarn-beta-fast F`, `--yarn-beta-slow F` | context extension (the YaRN knobs as llama.cpp's) |
+
+#### A PC without a GPU
+
+When setup finds no GPU, it offers Qwen3.5-2B and 0.8B, which run on the CPU alone (the 2B by default).
+The engine runs with `--device cpu`: the weights repacked as int8 and computed on the CPU. It needs AVX2, and takes
+AVX-VNNI, AVX-VNNI-INT8 or AVX-512 VNNI where the CPU has them.
+On a CPU with AVX2 alone the weights are kept in seven bits (faster; the answers differ slightly.
+`XESTRATA_I8_GEMM_WEIGHT_BITS=8` keeps eight).
+
+The RAM is the int8 weights (about 2.4 GB for the 2B, 0.9 GB for the 0.8B), the KV cache in FP32 (24 KB a token, taken
+for the whole context at the start) and about 2 GB more: at a 32K context about 5 GB for the 2B and 4 GB for the 0.8B,
+at 256K about 11 GB and 9 GB. setup recommends the longest context up to 32K that the RAM holds.
+
+On the CPU there are no images to read (a request with one is answered that the CPU reads text only), no decode of
+several conversations together (`--parallel`), no choice of the KV cache's precision (`--kv`: FP32 only) and no image
+generation.
+The conversation cache, the checkpoints and the conversation save work as on a GPU.
+
+On an i7-14700 (AVX-VNNI), reading a prompt of 1,692 tokens and giving a short answer took about 1.1 s with the 0.8B
+and 2.1 s with the 2B. A long prompt is slow: 31,000 tokens took the 2B about two and a half minutes.
 
 ### Less RAM than the model: the low-RAM mode
 
@@ -771,7 +808,7 @@ A model setup does not list can be installed from GGUF files you have; nothing i
 xestrata --setup --gguf ~/models/My-Model-Q4_K_M-00001-of-00003.gguf --name my-model
 ```
 
-- **What goes in**: Qwen3.8-Flash-Next (`qwen4exp`), and models of the other models' architectures (`qwen35moe`: Ornith-1.5, Qwen3.6-35B-A3B; `qwen35`: Qwen3.5-9B; `qwen3moe`: llm-jp-4.1; `glm5-next`: GLM-5.3-Flash).
+- **What goes in**: Qwen3.8-Flash-Next (`qwen4exp`), and models of the other models' architectures (`qwen35moe`: Ornith-1.5, Qwen3.6-35B-A3B; `qwen35`: Qwen3.5-9B, 2B and 0.8B; `qwen3moe`: llm-jp-4.1; `glm5-next`: GLM-5.3-Flash).
 - **What to give**: a `.gguf` file (any one of a split model's, all of them in the same folder), or a folder with one model only. Without `--name`, the file's name is used.
 - **What is checked**: setup reads the headers and asks the engine whether it runs them (`xestrata-engine --check-model <file>`, which opens no GPU).
   When the headers cannot be read (a file cut short too), the architecture is another, or the experts or the PLE table are stored in a type the engine's kernels do not take, setup stops with the reason for each layer and makes nothing.
@@ -2147,7 +2184,7 @@ The model files are not part of it; their licenses apply to them (below).
   The abliterated versions: [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF) by huihui-ai;
   the GSQ-RCO abliterated versions: [SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF](https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF) by SC117 (the weights with the refusals removed are OrcaRouter's);
   Swift 1.5's GSQ-RCO abliterated versions: [SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF](https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF) by SC117.
-  The other models: [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones pfeifferj's [reproduction](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF), the version with its refusals removed dealignai's [Ornith-1.5-35B-A3B-UNCENSORED](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF)), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp, [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen (the version with its refusals removed llmfan46's, as SC117's [APEX GGUFs](https://huggingface.co/SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF)) and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth), [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) by Qwen (GGUFs by Unsloth) and [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive) by HauhauCS.
+  The other models: [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones pfeifferj's [reproduction](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF), the version with its refusals removed dealignai's [Ornith-1.5-35B-A3B-UNCENSORED](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF)), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp, [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen (the version with its refusals removed llmfan46's, as SC117's [APEX GGUFs](https://huggingface.co/SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF)) and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth), [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF), [Qwen3.5-2B](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF) and [Qwen3.5-0.8B](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF) by Qwen (GGUFs by Unsloth) and [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive) by HauhauCS.
   The image models: Qwen's Qwen-Image-2.1 and Qwen-Image-2.1-Turbo (GGUFs by Unsloth), Microsoft's Mage-Flow (Comfy-Org's safetensors), RicemanT's MageTrail with Black Forest Labs' Flux2 VAE (FLUX.2-klein-4B's), Tencent's HunyuanImage 3.0 (quantized as single files for ComfyUI by PedroMarinhoDev), OpenMOSS's MOSS-Image with its edit adapters (chinoll's Moss-Image-Edit, in ComfyUI's form by PedroMarinhoDev; akhaliq's MOSS-Image-Edit-HQ armV5 and armV6), the text encoders, Qwen3-VL (Unsloth's, AtomicChat's, and huihui-ai's by noctrex), and the Detailer's detectors, Bingsu's adetailer (`face_yolov8m`, `hand_yolov8s`, `person_yolov8m-seg`, trained with Ultralytics YOLOv8: Apache 2.0 by their publisher; Ultralytics holds models trained with YOLO to be under AGPL-3.0 by default), and the upscalers, Xintao Wang, Liangbin Xie, Chao Dong and Ying Shan's RealESRGAN x4plus (BSD-3-Clause; the official release's file, fetched from lllyasviel/Annotators) and ByteDance Seed's SeedVR2 7B, 7B sharp and 3B with its VAE (Apache-2.0; Comfy-Org's repackaging), the composition control's alibaba-pai Qwen-Image-2.1 Fun ControlNet Union (Qwen Research License) and darask0's MOSS-Image color and depth adapter and 4-step adapter (Apache-2.0), and the networks that make the control maps, Depth Anything V2 Small (Apache-2.0), DWPose (Apache-2.0), Megvii's YOLOX-L (Apache-2.0), ControlNet 1.1's HED (Apache-2.0), Caroline Chan's line art (MIT) and NAVER's M-LSD (Apache-2.0) ([IMAGE](IMAGE.md#licenses)).
   Their licenses apply to the weights.
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** (MIT): the i-quant formats, the GPU dot products and dequantizers transcribed in `src/kernels/xe/`,

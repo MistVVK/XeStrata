@@ -42,7 +42,7 @@ A port of [Strata](https://github.com/Niko1221/Strata) (for NVIDIA GPUs) to Inte
 Its GPU code is rewritten from CUDA to SYCL and Level Zero, and the same code is compiled for AMD GPUs (the free and contrib-llvm builds) and NVIDIA GPUs (the contrib-llvm build) as well.
 The models, the install, the app and the API are much the same as Strata's.
 
-- **Other models:** besides tuned and differently compressed versions of Qwen3.8-Flash-Next, it runs Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B, Qwen3.5-9B and GLM-5.3-Flash (BETA).
+- **Other models:** besides tuned and differently compressed versions of Qwen3.8-Flash-Next, it runs Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B, Qwen3.5-9B, 2B and 0.8B and GLM-5.3-Flash (BETA). Qwen3.5-2B and 0.8B also run on the CPU alone, on a PC without a GPU.
 - **One GPU, as a rule.** The layers can also be spread over two or more GPUs in the same PC, of different makers too (with NVIDIA, in the contrib-llvm build).
   With two, it chooses by itself whichever is faster: the second GPU taking a share of the layers, or helping the first one's cache ([MULTIGPU](docs/MULTIGPU.md)).
 - **Runs with free software only, too** (the free build, free enough for Debian main; [made from the source](docs/BUILD.md#the-deb-and-rpm-packages)).
@@ -109,9 +109,10 @@ A model not in the table can be installed from GGUF files you have with `xestrat
 | **llm-jp-4.1** (BETA) | 32B (3B a token) | 30-73 GB | a thinking model for Japanese and English |
 | **Qwen3.6-35B-A3B** (BETA) | 35B (3B a token) | 31-46 GB | a thinking model that reads images too; a PC with less RAM |
 | **Qwen3.5-9B** (BETA) | 9B (dense) | 8 GB (VRAM 8-20 GB) | a thinking model that reads images too, every weight on the GPU; also with its refusals removed |
+| **Qwen3.5-2B, 0.8B** (BETA) | 2B, 0.8B (dense) | 8 GB (VRAM 2-6 GB); 4-6 GB without a GPU | thinking models that read images too, for a small GPU or a PC without one; their answers fall short of the 9B's |
 | **GLM-5.3-Flash** (BETA) | 320B (18B a token) | 101-165 GB of RAM and VRAM | a large thinking model; a PC with a lot of RAM |
 
-The BETA models do not make images yet; of them Ornith-1.5, Qwen3.6-35B-A3B and Qwen3.5-9B read images. Their sizes and
+The BETA models do not make images yet; of them Ornith-1.5, Qwen3.6-35B-A3B and Qwen3.5's 9B, 2B and 0.8B read images (2B and 0.8B on a GPU only). Their sizes and
 options are in
 [DETAILS](docs/DETAILS.md#or-models-other-than-qwen38-flash-next-ornith-15-llm-jp-41-qwen36-35b-a3b-qwen35-9b-glm-53-flash).
 
@@ -403,7 +404,7 @@ permission under GPL section 7, what goes in, and how to report).
    - [AD-4.27bpw and AD-5.00bpw](https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF), by AtomicChat;
    - [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones by pfeifferj, the [version with its refusals removed](https://huggingface.co/dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF) by dealignai), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp,
      [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen (the [version with its refusals removed](https://huggingface.co/SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF) llmfan46's, quantized by SC117) and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth);
-   - [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) by Qwen (GGUFs by Unsloth), and the version with its refusals removed, [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive), by HauhauCS;
+   - [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF), [Qwen3.5-2B](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF) and [Qwen3.5-0.8B](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF) by Qwen (GGUFs by Unsloth), and the version with its refusals removed, [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive), by HauhauCS;
    - image generation: Qwen's Qwen-Image-2.1, Microsoft's Mage-Flow, RicemanT's MageTrail with Black Forest Labs' Flux2 VAE, Tencent's HunyuanImage 3.0, OpenMOSS's MOSS-Image with its edit adapters (chinoll's Moss-Image-Edit, akhaliq's MOSS-Image-Edit-HQ), CircleStone Labs' Anima with Wan 2.1's VAE, Qwen3-VL, Qwen3.5-9B and Qwen3-0.6B-Base as the text encoders, Bingsu's adetailer (trained with Ultralytics YOLOv8) as the Detailer's detectors, Xintao Wang et al.'s RealESRGAN x4plus and ByteDance Seed's SeedVR2 as the upscalers, Meta's SAM 3.1 (the SAM License, only once agreed to) and Microsoft's Florence-2 to find parts by words, Peng Zheng's BiRefNet to remove backgrounds, and for the composition control alibaba-pai's Qwen-Image-2.1 Fun ControlNet Union (the Qwen Research License) and darask0's MOSS-Image color and depth adapter and 4-step adapter, with Depth Anything V2 Small, DWPose, Megvii's YOLOX-L, ControlNet 1.1's HED, Caroline Chan's line art and NAVER's M-LSD to make the control maps ([IMAGE](docs/IMAGE.md#licenses)).
 
   Each model's own license applies to its files.

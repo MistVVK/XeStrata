@@ -118,6 +118,8 @@ HF_REVISIONS = {
     "SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF": "90a3350cd800ec1fe0d1660a38414ad9e985782f",    # 2026-10-24
     "SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF": "3db919a964b1f0ae0d1000ba7be90b3e38b1f7a3",  # 10-24
     "unsloth/Qwen3.5-9B-GGUF": "3885219b6810b007914f3a7950a8d1b469d598a5",                          # 2026-10-26
+    "unsloth/Qwen3.5-2B-GGUF": "f6d5376be1edb4d416d56da11e5397a961aca8ae",                          # 2026-11-08
+    "unsloth/Qwen3.5-0.8B-GGUF": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",                        # 2026-11-08
     "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": "0a41c68809d375475f954be12ba7c40efa56c2a9",  # 2026-10-26
     "AtomicChat/Qwen3.8-Flash-Next-GGUF": "f5b0b790eebb89033c48091c26abf74c1b385940",               # 2026-11-03
 }
@@ -372,9 +374,9 @@ MODELS: dict[str, dict[str, Any]] = {
                             "together); lower quality than Gyro-Coder-L",
                    "download_gb": 75.8, "ram_gb": 26.0, "arena_gb": 16.0, "families": ("gyro-coder",),
                    "file": "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf", "shards": 1, "vision": True},
-    # AtomicChat's AD files (ATOMICCHAT_FILES): IQ3_S gate/up experts in layers 0-3 and 40-47, IQ2_S in the others, IQ4_NL
-    # downs (50.6 GB, IQ3_S's size), Q8_0 dense weights; the n-gram table Q5_1 (4.27) or Q8_0 (5.00), the rest of the
-    # download.  The RAM as Gyro's ("arena_gb" + LOW_RAM_HEADROOM_GB).  Their AD-3.84bpw is not here: its downs are
+    # AtomicChat's AD files (ATOMICCHAT_FILES): IQ3_S gate/up experts in layers 0-3 and 40-47, IQ2_S in the others,
+    # IQ4_NL downs (50.6 GB, IQ3_S's size), Q8_0 dense weights; the n-gram table Q5_1 (4.27) or Q8_0 (5.00), the rest of
+    # the download.  The RAM as Gyro's ("arena_gb" + LOW_RAM_HEADROOM_GB).  Their AD-3.84bpw is not here: its downs are
     # MXFP4, which the expert kernels do not read
     "AD-4.27bpw": {"about": "experts of 2.5 to 3.5 bits with 4.5-bit downs, the n-gram table at 5 bits",
                    "download_gb": 94.5, "ram_gb": 60.6, "arena_gb": 50.6, "families": ("atomicchat",), "shards": 3,
@@ -688,10 +690,11 @@ FAMILIES: dict[str, dict[str, Any]] = {
                       "(59 or 61 GB): 58, 92 and 108 GB downloads (the files include the n-gram table)",
              "hf": hf("agentionai/Qwen3.8-Flash-Next-Gyro-GGUF"), "file": "Qwen3.8-Flash-Next-{q}.gguf", "shards": 1,
              "tag": "gyro-", "name": "qwen3.8-flash-next-gyro", "vision": True, "pack_args": ["--compat-bf16"],
-             "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"), "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+             "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
+             "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
              "sha256": GYRO_FILES,
-             "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; the Gyro files are agentionai's quantization): "
-                        "https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF"},
+             "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; the Gyro files are agentionai's "
+                        "quantization): https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF"},
     # agentionai's Gyro-Coder (GYRO_CODER_FILES): Gyro's format with half the experts, for code; never the default.
     # Images: the original's vision encoder, as the Gyro files take it (agentionai ships none for the Coder)
     "gyro-coder": {"title": "Qwen3.8-Flash-Next Gyro-Coder", "by": "agentionai's coding version, Gyro quantized",
@@ -788,6 +791,8 @@ _QWEN36_UNC = "SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APE
 _QWEN36_UNC_FILE = "Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-I-{}.gguf"
 _GLM53 = "unsloth/GLM-5.3-Flash-GGUF"
 _QWEN35 = "unsloth/Qwen3.5-9B-GGUF"
+_QWEN35_2B = "unsloth/Qwen3.5-2B-GGUF"
+_QWEN35_08B = "unsloth/Qwen3.5-0.8B-GGUF"
 # The 35B-A3B models' picture readers (qwen35moe, as Qwen3.5-9B's): each repository's mmproj.  Unsloth's Qwen3.6, Ornith
 # AI's and dealignai's (named f16, BF16 inside) hold the same tensors byte for byte, SC117's the same weights in F16
 # (2026-11-08).  pfeifferj's GSQ-RCO repository has none: Ornith AI's reads pictures for those files too (the same
@@ -954,6 +959,54 @@ PLAIN_FAMILIES["qwen35"] = {
                  "about": "8-bit, the closest to the full model"},
         "BF16": {"repo": _QWEN35, "file": "Qwen3.5-9B-BF16.gguf", "size": 17920697312,
                  "sha256": "daebe40eeea7057c1cdf35ac56d13f507d8bf12171bbb7a6b6b0d3f05439159a",
+                 "about": "the unquantized weights"},
+    }}
+# Qwen3.5-2B and Qwen3.5-0.8B (qwen35, as the 9B): dense, 24 blocks, a full attention every 4th (the GGUFs'
+# full_attention_interval) with 2 K/V heads of 256: 6 layers x (K and V) x 2 heads x 256 x 2 bytes = 12288 bytes of
+# FP16 K/V a token (kv_bytes; the CPU keeps it in FP32, twice that: cpu_ram_gb), up to the GGUFs' context_length of
+# 262144.  Every weight in VRAM, or on the CPU alone (--device cpu, "cpu") on a PC without a GPU.  "default": the size
+# setup recommends where it fits.  Each reads pictures through its own mmproj (Unsloth's, at the same revision), on a
+# GPU only: the CPU's forward reads text
+PLAIN_FAMILIES["qwen35-2b"] = {
+    "title": "Qwen3.5-2B", "by": "Qwen (Apache-2.0), GGUFs by Unsloth",
+    "about": "2B, dense, reads images: for a small GPU or a PC without one; its answers fall short of the 9B's",
+    "tag": "qwen35-2b-", "name": "qwen3.5-2b", "max_context": 262144, "plain": True, "dense": True, "kv_bytes": 12288,
+    "cpu": True, "default": "UD-Q5_K_XL",
+    "mmproj": {"repo": _QWEN35_2B, "path": "mmproj-BF16.gguf", "size": 671372992,
+               "sha256": "f17196c0d8fc756bc65be60075bd4a359917eee8a438505639511727c585d3c2"},
+    "models": {
+        "Q4_K_M": {"repo": _QWEN35_2B, "file": "Qwen3.5-2B-Q4_K_M.gguf", "size": 1280835840,
+                   "sha256": "aaf42c8b7c3cab2bf3d69c355048d4a0ee9973d48f16c731c0520ee914699223", "about": "4-bit"},
+        "UD-Q5_K_XL": {"repo": _QWEN35_2B, "file": "Qwen3.5-2B-UD-Q5_K_XL.gguf", "size": 1466687744,
+                       "sha256": "67bff9774bc55e44af2eee3c448dc054478b45c0607858fc6df5b336b55f36f4",
+                       "about": "5-bit (Unsloth Dynamic)", "tested": True},
+        "Q6_K": {"repo": _QWEN35_2B, "file": "Qwen3.5-2B-Q6_K.gguf", "size": 1574961408,
+                 "sha256": "fc90339420b4298887aafb307a4291c55440b730133bbffe6ba9630503dcb548", "about": "6-bit"},
+        "Q8_0": {"repo": _QWEN35_2B, "file": "Qwen3.5-2B-Q8_0.gguf", "size": 2012012800,
+                 "sha256": "1b04acba824817554f4ce23639bc8495ff70453b8fcb047900c731521021f2c1",
+                 "about": "8-bit, the closest to the full model"},
+        "BF16": {"repo": _QWEN35_2B, "file": "Qwen3.5-2B-BF16.gguf", "size": 3775709216,
+                 "sha256": "dc11be2ca4519954a3e4b013ef59497b5522209987d67891851113eda89619f1",
+                 "about": "the unquantized weights"},
+    }}
+PLAIN_FAMILIES["qwen35-0.8b"] = {
+    "title": "Qwen3.5-0.8B", "by": "Qwen (Apache-2.0), GGUFs by Unsloth",
+    "about": "0.8B, dense, reads images: the smallest, for a small GPU or a PC without one; its answers fall short of "
+             "the 2B's and the 9B's",
+    "tag": "qwen35-0.8b-", "name": "qwen3.5-0.8b", "max_context": 262144, "plain": True, "dense": True,
+    "kv_bytes": 12288, "cpu": True, "default": "Q8_0",
+    "mmproj": {"repo": _QWEN35_08B, "path": "mmproj-BF16.gguf", "size": 207346528,
+               "sha256": "d312c4d02fd46eea7a16e4f3bbb58840e6222209322ca1e33ca03247ad8935d6"},
+    "models": {
+        "Q4_K_M": {"repo": _QWEN35_08B, "file": "Qwen3.5-0.8B-Q4_K_M.gguf", "size": 532517120,
+                   "sha256": "bd258782e35f7f458f8aced1adc053e6e92e89bc735ba3be89d38a06121dc517", "about": "4-bit"},
+        "Q6_K": {"repo": _QWEN35_08B, "file": "Qwen3.5-0.8B-Q6_K.gguf", "size": 639029504,
+                 "sha256": "8408c5c222111cec253682b49eece2a02ed641ded68490001ec4ee160e71098e", "about": "6-bit"},
+        "Q8_0": {"repo": _QWEN35_08B, "file": "Qwen3.5-0.8B-Q8_0.gguf", "size": 811843840,
+                 "sha256": "0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c",
+                 "about": "8-bit, the closest to the full model", "tested": True},
+        "BF16": {"repo": _QWEN35_08B, "file": "Qwen3.5-0.8B-BF16.gguf", "size": 1516744736,
+                 "sha256": "cedf89af31c9041b601fa58303285bc46d99c51baee1b13f5e919626ca526ee5",
                  "about": "the unquantized weights"},
     }}
 PLAIN_FAMILIES["qwen35-uncensored"] = {
@@ -4394,9 +4447,9 @@ def choose_compiler(a, gpu: dict) -> dict:
                      (" --contrib" if llvm.resolve() == INTEL_LLVM_CONTRIB.resolve() else ""))
             a.intel_llvm_rebuild = True
             build_intel_llvm(a, contrib=llvm.resolve() == INTEL_LLVM_CONTRIB.resolve())
-    if gpu.get("vendor") in ("nvidia", "amd"):
+    if gpu.get("vendor") in ("nvidia", "amd") or gpu.get("cpu"):
         # the tensor cores through cuBLAS and joint_matrix, AMD's WMMA and dot instructions: the XMX question is
-        # Intel's
+        # Intel's; without a GPU there is none to ask
         xmx = False
     else:
         probed = probe_gpu(comp, pci)
@@ -4425,7 +4478,7 @@ def choose_compiler(a, gpu: dict) -> dict:
     comp["version"] = compiler_version(comp["cxx"], comp["env"])
     comp["xmx"] = xmx
     what = ("NVIDIA's tensor cores" if gpu.get("vendor") == "nvidia" else "an AMD GPU" if gpu.get("vendor") == "amd"
-            else "XMX" if xmx else "no XMX: the slower prompt path")
+            else "no GPU: the CPU's forward" if gpu.get("cpu") else "XMX" if xmx else "no XMX: the slower prompt path")
     ok(f"SYCL compiler: {comp['version']} ({mode}; {what}" +
        (f"; NVIDIA code for {', '.join(comp['cuda_archs'])}" if comp["cuda_archs"] else "") +
        (f"; AMD code for {', '.join(comp['hip_archs'])}" if comp["hip_archs"] else "") + ")")
@@ -5972,7 +6025,8 @@ def recommend_pool_workers(args: list) -> list:
     """`args` with setup's recommended `--pool-workers` for a hybrid CPU, unless they set one already (a calibration's
     measured count, or the user's own).  A recommendation: the config line can be edited or removed."""
     n = hybrid_pool_workers(cpu_cores())
-    if n is None or "--pool-workers" in args:
+    on_cpu = "--device" in args[:-1] and args[args.index("--device") + 1] == "cpu"   # no expert pool: --cpu-threads
+    if n is None or "--pool-workers" in args or on_cpu:
         return args
     n = min(n, POOL_WORKERS_CAP)   # setup never writes more workers than the engine's own default takes
     p, e = cpu_cores()
@@ -7029,6 +7083,26 @@ def dense_vram_gb(fam: dict, d: dict, ctx: int) -> float:
     return d["size"] / 1e9 + fam["kv_bytes"] * ctx / 1e9 + DENSE_MARGIN_GB
 
 
+# A dense model on the CPU (--device cpu, the families with "cpu"): its weights repacked as int8 (one byte a weight, a
+# 4-byte scale and a 4-byte correction for each 32 of a row: 1.25 bytes; 895 MiB measured for Qwen3.5-0.8B), the K/V
+# in FP32 for the whole context from the start (src/core/plain_cpu.cpp), and the rest of the engine and the server
+CPU_MARGIN_GB = 2.0
+
+
+def cpu_ram_gb(fam: dict, ctx: int) -> float:
+    """The RAM (GB) a dense model of PLAIN_FAMILIES needs on the CPU at a context of `ctx`, any of its sizes: the
+    int8 copy of its weights (counted from the BF16 file's two bytes a weight), its FP32 K/V and the margin"""
+    weights = fam["models"]["BF16"]["size"] / 2 * 1.25
+    return weights / 1e9 + 2 * fam["kv_bytes"] * ctx / 1e9 + CPU_MARGIN_GB
+
+
+def cpu_ctx(fam: dict, ram: float) -> int:
+    """The context recommended on the CPU: the longest of CONTEXTS up to 32K (a longer prompt takes minutes to read on
+    a CPU) that the RAM holds, else the shortest"""
+    fits = [c for c in CONTEXTS if c <= min(32768, fam["max_context"]) and cpu_ram_gb(fam, c) <= ram]
+    return max(fits) if fits else CONTEXTS[0]
+
+
 def replicas_config(a, cfg: dict) -> None:
     """--replicas N: data-parallel replicas (serve/replicas.py, upstream 8d276c19) over the chosen GPUs, in equal
     groups"""
@@ -7078,12 +7152,18 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     vram = sum(max(0.0, gpu_info(i).get("vram_gb", 0.0) - 5) for i in sel) if len(sel) > 1 \
         else max(0.0, gpu.get("vram_gb", 0.0) - 5)
     dense = bool(fam.get("dense"))
-    gpu_gb = sum(gpu_expert_vram(gpu_info(i)) for i in sel) if len(sel) > 1 else gpu_expert_vram(gpu)
-    rec_ctx = min(vram_ctx(chosen), fam["max_context"])
+    on_cpu = bool(gpu.get("cpu"))                      # no GPU: the CPU's forward (--device cpu)
+    gpu_gb = 0.0 if on_cpu else \
+        sum(gpu_expert_vram(gpu_info(i)) for i in sel) if len(sel) > 1 else gpu_expert_vram(gpu)
+    rec_ctx = cpu_ctx(fam, ram) if on_cpu else min(vram_ctx(chosen), fam["max_context"])
     for i, m in enumerate(names, 1):
         d = models[m]
         gb = d["size"] / 1e9
-        if dense:
+        if on_cpu:
+            need = cpu_ram_gb(fam, rec_ctx)
+            fit = "" if ram >= need else \
+                f"   <- needs ~{need:.0f} GB of RAM at {rec_ctx // 1024}K, this PC has {ram:.0f} GB"
+        elif dense:
             need = dense_vram_gb(fam, d, rec_ctx)
             fit = "" if gpu_gb >= need else \
                 f"   <- needs ~{need:.0f} GB of VRAM at {rec_ctx // 1024}K, the GPU has {gpu_gb:.0f} GB"
@@ -7091,9 +7171,13 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
             fit = "" if ram + vram >= gb + 8 else f"   <- {gb:.0f} GB of weights, this PC has {ram:.0f} GB of RAM"
         say(f"  {i}) {m:15s} {d['about']}" + ("" if d.get("custom") else f"; download {gb:.0f} GB") +
             ("" if d.get("tested") else "   [untested]") + fit)
-    if dense:   # the largest that fits the GPU, else the smallest
+    if on_cpu:   # the family's own choice: on the CPU every size runs as int8, so it decides only the answers
+        rec = str(names.index(fam.get("default", names[0])) + 1)
+    elif dense:   # the family's own choice where it fits the GPU, else the largest that fits, else the smallest
         fits = [i for i, m in enumerate(names, 1) if gpu_gb >= dense_vram_gb(fam, models[m], rec_ctx)]
-        rec = str(max(fits, key=lambda i: models[names[i - 1]]["size"])) if fits else \
+        own_rec = names.index(fam["default"]) + 1 if fam.get("default") in names else None
+        rec = str(own_rec) if own_rec in fits else \
+            str(max(fits, key=lambda i: models[names[i - 1]]["size"])) if fits else \
             str(min(range(1, len(names) + 1), key=lambda i: models[names[i - 1]]["size"]))
     else:
         rec = next((str(i) for i, m in enumerate(names, 1) if models[m].get("tested")), "1")
@@ -7109,7 +7193,11 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     tag = fam["tag"] + model
     # images: the family's picture reader, asked as for Qwen3.8-Flash-Next (the GPU encoder from 24 GB of VRAM)
     vision = "none"
-    if not fam.get("mmproj"):
+    if on_cpu and fam.get("mmproj"):                   # the CPU's forward takes no picture's embeddings
+        if a.vision not in (None, "no", "none"):
+            warn("images are not available on the CPU (its forward reads text only): off")
+        ok("images: not available on the CPU (a GPU reads them)")
+    elif not fam.get("mmproj"):
         if a.vision not in (None, "no", "none"):
             warn(f"images are not available with {fam['title']} yet: off")
     elif a.vision:
@@ -7120,7 +7208,7 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         say("  download; the image encoder runs on the GPU from 24 GB of VRAM, else on the CPU (a few seconds a"
             " picture).")
         vision = images_encoder("yes", gpu) if ask("Do you want images?", ["y", "n"], "y", a.yes) == "y" else "none"
-    if fam.get("mmproj"):
+    if fam.get("mmproj") and not on_cpu:
         ok("images: " + {"none": "off", "gpu": "on (encoder on the GPU, the CPU encoder as fallback)",
                          "cpu": "on (encoder on the CPU)"}[vision])
     # the context: up to the model's, recommended by the smallest card's memory as for Qwen3.8-Flash-Next
@@ -7132,14 +7220,23 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
                  f"--context {fam['max_context']}")
     else:
         say()
-        say("  Context length = how much text the model can see at once. Longer needs more VRAM for it, so fewer")
-        say("  experts fit on the GPU:")
+        if on_cpu:
+            say("  Context length = how much text the model can see at once. Longer needs more RAM, and a long prompt")
+            say("  takes the CPU minutes to read:")
+        else:
+            say("  Context length = how much text the model can see at once. Longer needs more VRAM for it, so fewer")
+            say("  experts fit on the GPU:")
         for i, c in enumerate(contexts, 1):
-            say(f"  {i}) {c // 1024}K tokens" + ("   (recommended for your GPU)" if c == rec_ctx else ""))
+            rec_mark = "   (recommended for your " + ("PC)" if on_cpu else "GPU)")
+            say(f"  {i}) {c // 1024}K tokens" + (rec_mark if c == rec_ctx else ""))
         ctx = contexts[int(ask("Context?", [str(i) for i in range(1, len(contexts) + 1)],
                                str(contexts.index(rec_ctx) + 1), a.yes)) - 1]
     ok(f"context: {ctx} tokens")
-    if dense and gpu_gb < dense_vram_gb(fam, d, ctx):
+    if on_cpu and ram < cpu_ram_gb(fam, ctx):
+        warn(f"{fam['title']} on the CPU keeps its weights as int8 and the KV cache in FP32: "
+             f"~{cpu_ram_gb(fam, ctx):.0f} GB at a {ctx // 1024}K context, and this PC has {ram:.0f} GB, so the engine "
+             "may not start; a shorter context fits")
+    elif dense and not on_cpu and gpu_gb < dense_vram_gb(fam, d, ctx):
         warn(f"{fam['title']} {model} keeps every weight in VRAM: ~{dense_vram_gb(fam, d, ctx):.0f} GB at a "
              f"{ctx // 1024}K context, and the GPU has {gpu_gb:.0f} GB, so the engine may not start; a smaller size "
              "or context fits")
@@ -7219,6 +7316,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     # ---- 7. the settings
     step(7, "writing the model's settings" if PACKAGED else "writing the start script")
     args = ["--native", str(gguf), "--max-context", str(ctx)]
+    if on_cpu:
+        args += ["--device", "cpu"]
     if fam.get("profile"):                             # the experts filled into VRAM at start, most routed first
         args += ["--expert-profile", str(ROOT / "data" / fam["profile"])]
     if fam.get("draft_vocab"):                         # the MTP layer's drafts over a token subset (--draft-vocab)
@@ -7231,7 +7330,9 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         args += ["--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
     args += ram_reserve_args(a)
     # --kv: the KV cache's precision, as far as the model's engine path takes it
-    if a.kv:
+    if a.kv and on_cpu:
+        warn(f"--kv {a.kv}: the CPU keeps the KV cache in FP32")
+    elif a.kv:
         takes = plain_kv_takes(family)
         if a.kv not in takes:
             warn(f"--kv {a.kv} is not available for {fam['title']} ({', '.join(takes)}): the KV cache stays FP16")
@@ -7270,7 +7371,9 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     if a.browser is not None:
         cfg["open_browser"] = a.browser
     if a.parallel is not None and a.parallel >= 2:   # the batch slots (docs/BATCHING.md, the plain engine's part)
-        if family == "glm53" or vision != "none":
+        if on_cpu:
+            warn("--parallel is not available on the CPU: one request at a time")
+        elif family == "glm53" or vision != "none":
             warn(f"--parallel is not available {'for GLM-5.3-Flash' if family == 'glm53' else 'with images'} yet: "
                  "one request at a time")
         else:
@@ -7290,8 +7393,11 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
                              "gpu_pci": gpu["pci"], "max_tokens": vt, "fallback": cpu_enc}
     elif a.vision_tokens is not None:
         warn("--vision-tokens: images are off for this model, so it is not used")
-    if a.images is None and not a.yes and not JSON_OUT:   # as for Qwen3.8-Flash-Next: asked only interactively
-        a.images = ask_images(CONF / f"xestrata-{tag.lower()}.json")
+    if on_cpu and a.images:
+        warn("image generation is not available without a GPU: no image models")
+        a.images = None
+    elif a.images is None and not a.yes and not JSON_OUT and not on_cpu:   # as for Qwen3.8-Flash-Next: asked only
+        a.images = ask_images(CONF / f"xestrata-{tag.lower()}.json")    # interactively
     if a.images:   # only when given: else an earlier "images" is carried over
         # the RAM the chat model keeps, as --describe estimates it (a dense model's DENSE_RAM_GB, the others' file and
         # 8 GB); an image model's text encoder of the same file shares it (shared_text_quant)
@@ -7941,86 +8047,118 @@ def main() -> int:
     # ---- 1. the PC
     step(1, "checking your PC")
     found = gpus()
-    if not found:
+    # no GPU: the dense Qwen3.5 models that run on the CPU alone ("cpu" in PLAIN_FAMILIES), text only and one request
+    # at a time; setup asks for no GPU then (--gpu, --gpus and the other families still need one)
+    cpu_fams = [f for f, d in PLAIN_FAMILIES.items() if d.get("cpu")]
+    on_cpu = not found and (a.family is None or a.family in cpu_fams) and a.gpu is None and not a.gpus
+    if not found and not on_cpu:
         fail("no Intel GPU on the xe or i915 driver, no AMD GPU on amdgpu and no NVIDIA GPU on NVIDIA's driver found",
              "XeStrata's Xe engine needs an Intel GPU (Intel Arc, or the processor's graphics) on the xe or i915 "
              "kernel driver, an RDNA2 or later AMD GPU on amdgpu, or with --license contrib an NVIDIA GPU on NVIDIA's "
              "driver (lspci -k shows the driver)")
-    if len(found) > 1 or gpu_problem(found[0]) is not None:
-        gpu_table(found)
-    gpu_chosen = a.gpu is not None                     # --gpu given: the config names the card
-    a.gpus_chosen = gpu_chosen or bool(a.gpus)         # and with --gpus, the earlier split is not kept (carry_over)
-    sel = choose_gpus(a, found)
-    a.gpu = sel[0]
-    GPU_PICK = a.gpu
-    gpu = gpu_info(a.gpu)
-    chosen = [gpu]
-    mem = "no VRAM of its own (it shares the system RAM)" if gpu.get("integrated") else f"{gpu['vram_gb']:.0f} GB VRAM"
-    if "uma_gb" in gpu:
-        mem = (f"unified memory: a {gpu['carve_gb']:.1f} GB BIOS carve-out + {gpu['shared_gb']:.0f} GB shared with the "
-               f"RAM, {gpu['uma_gb']:.0f} GB usable by the GPU")
-    ok(f"GPU: {gpu['name']}, {mem}, PCI {gpu['pci']}, PCIe link " + (gpu["link"] or "not readable"))
-    if gpu.get("gfx") == STRIX_HALO_GFX and "uma_gb" in gpu:
-        for line in strix_halo_notes(gpu, ram_gb()):
+    if on_cpu:
+        gpu_chosen = a.gpus_chosen = False
+        sel, chosen = [], []
+        gpu: dict[str, Any] = {"name": "none", "cpu": True, "vram_gb": 0.0, "pci": None, "vendor": None, "count": 0}
+        ok("GPU: none found: the CPU alone runs " + " and ".join(PLAIN_FAMILIES[f]["title"] for f in cpu_fams) +
+           " (text only, slower than on a GPU)")
+    else:
+        if len(found) > 1 or gpu_problem(found[0]) is not None:
+            gpu_table(found)
+        gpu_chosen = a.gpu is not None                     # --gpu given: the config names the card
+        a.gpus_chosen = gpu_chosen or bool(a.gpus)         # and with --gpus, the earlier split is not kept (carry_over)
+        sel = choose_gpus(a, found)
+        a.gpu = sel[0]
+        GPU_PICK = a.gpu
+        gpu = gpu_info(a.gpu)
+        chosen = [gpu]
+        mem = "no VRAM of its own (it shares the system RAM)" if gpu.get("integrated") else \
+            f"{gpu['vram_gb']:.0f} GB VRAM"
+        if "uma_gb" in gpu:
+            mem = (f"unified memory: a {gpu['carve_gb']:.1f} GB BIOS carve-out + {gpu['shared_gb']:.0f} GB shared with "
+                   f"the RAM, {gpu['uma_gb']:.0f} GB usable by the GPU")
+        ok(f"GPU: {gpu['name']}, {mem}, PCI {gpu['pci']}, PCIe link " + (gpu["link"] or "not readable"))
+        if gpu.get("gfx") == STRIX_HALO_GFX and "uma_gb" in gpu:
+            for line in strix_halo_notes(gpu, ram_gb()):
+                (warn if line.startswith("!") else say)(line.lstrip("!"))
+        for line in unused_apu_notes(found, set(sel), ram_gb()):
             (warn if line.startswith("!") else say)(line.lstrip("!"))
-    for line in unused_apu_notes(found, set(sel), ram_gb()):
-        (warn if line.startswith("!") else say)(line.lstrip("!"))
-    for i in sel[1:]:                                  # --gpus: the later layers' cards
-        x = gpu_info(i)
-        ok(f"then GPU {i}: {x['name']}, {x['vram_gb']:.0f} GB VRAM, PCI {x['pci']} (layer split, "
-           f"{a.layer_split or 'auto'})")
-    if not WIN and gpu.get("vendor") == "amd" and not os.access("/dev/kfd", os.R_OK | os.W_OK):
-        fail("no access to the GPU's compute device (/dev/kfd)",
-             "add yourself to the render group (sudo usermod -aG render $USER), log out and in, and run it again")
-    makers = {x["vendor"] for x in chosen} | {gpu_info(i)["vendor"] for i in sel[1:]}
-    amd_gfx = {x.get("gfx") for x in [*chosen, *(gpu_info(i) for i in sel[1:])] if x["vendor"] == "amd"}
-    check_iommu([x["pci"] for x in [*chosen, *(gpu_info(i) for i in sel[1:])] if x.get("pci")])
-    check_compaction(makers)
-    if PACKAGED:                                       # the GPU makers' packages the package only suggests
-        check_runtime(makers, amd_gfx, data, a.yes, a.old_driver, install=not a.check)
-    elif not WIN:
-        check_build_packages(makers, license_mode(a))
-        if majors := [v for t in cuda_toolkits() if (v := cuda_major(t))]:       # a contrib build: its CUDA
-            linux_nvidia_libs(makers, data, nvidia_pip_names(max(majors)))
-    if not WIN and (gpu["render"] is None or not os.access(gpu["render"], os.R_OK | os.W_OK)):
-        fail(f"no access to the GPU ({gpu['render'] or 'no render node'})",
-             "NVIDIA's driver is not loaded (nvidia-smi says why)" if gpu.get("vendor") == "nvidia" else
-             "add yourself to the render group (sudo usermod -aG render $USER), log out and in, and run it again")
-    if gpu["bar_gb"] < gpu["vram_gb"] - 0.5:
-        warn(f"Resizable BAR looks off: the card shows {gpu['bar_gb']:.1f} GB of its {gpu['vram_gb']:.0f} GB to the "
-             "CPU. "
-             "Copies to the GPU will be slower; turn on Re-Size BAR (and Above 4G Decoding) in the BIOS")
-    if gpu.get("integrated") and "uma_gb" not in gpu:
-        warn("the processor's own graphics: XeStrata will run, but slowly - its memory is the system RAM, and it has "
-             "no matrix engines (XMX) on most processors")
-    elif gpu["vram_gb"] < 11:
-        warn("less than 12 GB of VRAM: XeStrata will run, but most experts stay on the CPU and it will be slow")
+        for i in sel[1:]:                                  # --gpus: the later layers' cards
+            x = gpu_info(i)
+            ok(f"then GPU {i}: {x['name']}, {x['vram_gb']:.0f} GB VRAM, PCI {x['pci']} (layer split, "
+               f"{a.layer_split or 'auto'})")
+        if not WIN and gpu.get("vendor") == "amd" and not os.access("/dev/kfd", os.R_OK | os.W_OK):
+            fail("no access to the GPU's compute device (/dev/kfd)",
+                 "add yourself to the render group (sudo usermod -aG render $USER), log out and in, and run it again")
+        makers = {x["vendor"] for x in chosen} | {gpu_info(i)["vendor"] for i in sel[1:]}
+        amd_gfx = {x.get("gfx") for x in [*chosen, *(gpu_info(i) for i in sel[1:])] if x["vendor"] == "amd"}
+        check_iommu([x["pci"] for x in [*chosen, *(gpu_info(i) for i in sel[1:])] if x.get("pci")])
+        check_compaction(makers)
+        if PACKAGED:                                       # the GPU makers' packages the package only suggests
+            check_runtime(makers, amd_gfx, data, a.yes, a.old_driver, install=not a.check)
+        elif not WIN:
+            check_build_packages(makers, license_mode(a))
+            if majors := [v for t in cuda_toolkits() if (v := cuda_major(t))]:       # a contrib build: its CUDA
+                linux_nvidia_libs(makers, data, nvidia_pip_names(max(majors)))
+        if not WIN and (gpu["render"] is None or not os.access(gpu["render"], os.R_OK | os.W_OK)):
+            fail(f"no access to the GPU ({gpu['render'] or 'no render node'})",
+                 "NVIDIA's driver is not loaded (nvidia-smi says why)" if gpu.get("vendor") == "nvidia" else
+                 "add yourself to the render group (sudo usermod -aG render $USER), log out and in, and run it again")
+        if gpu["bar_gb"] < gpu["vram_gb"] - 0.5:
+            warn(f"Resizable BAR looks off: the card shows {gpu['bar_gb']:.1f} GB of its {gpu['vram_gb']:.0f} GB to "
+                 "the CPU. "
+                 "Copies to the GPU will be slower; turn on Re-Size BAR (and Above 4G Decoding) in the BIOS")
+        if gpu.get("integrated") and "uma_gb" not in gpu:
+            warn("the processor's own graphics: XeStrata will run, but slowly - its memory is the system RAM, and it "
+                 "has no matrix engines (XMX) on most processors")
+        elif gpu["vram_gb"] < 11:
+            warn("less than 12 GB of VRAM: XeStrata will run, but most experts stay on the CPU and it will be slow")
     ram, ram_total = usable_ram_gb(), ram_gb()
     cpu, avx2, avx512 = cpu_info()
-    need = min(d["ram_gb"] for d in MODELS.values())
-    low_ok = low_ram_fits("IQ1_M", ram, gpu_expert_vram(gpu)) and a.low_ram != "off"   # the smallest model, mapped
-    if a.ram_reserve_gib and ram < need - 4 and not low_ok and ram_total >= need - 4:
-        # the reserve leaves less than the smallest model runs in: it keeps that least, and less stays free
-        ram = need - 4
-        warn(f"--ram-reserve-gib {a.ram_reserve_gib:g} leaves less RAM than the smallest model runs in "
-             f"({need - 4:.0f} GB): XeStrata takes that much, and about {ram_total - ram:.0f} GB stay free")
-        a.ram_reserve_gib = math.floor(ram_total - ram)
-    if ram < need - 4 and not a.check and not low_ok:
-        # every model keeps ALL its experts in RAM (23+ GB) unless the GPU holds enough of them for the low-RAM mode
-        fail(f"RAM: {ram:.0f} GB - the smallest model (the Coder) needs about {need} GB",
-             "XeStrata keeps the model's experts in RAM (23-50 GB) and the GPU holds a copy of the most-used ones: it "
-             "needs 32 GB of RAM or more (48 GB for the full model), or a GPU with the VRAM to hold most of them")
-    if a.ram_reserve_gib:
-        ok(f"RAM: {ram_total:.0f} GB, {a.ram_reserve_gib:g} GiB of it kept free for other programs "
-           f"(--ram-reserve-gib): XeStrata plans with {max(ram, 0.0):.0f} GB")
-    elif ram >= need - 4:
+    if on_cpu:                                         # the smallest of the CPU's models at the shortest context
+        need = min(cpu_ram_gb(PLAIN_FAMILIES[f], CONTEXTS[0]) for f in cpu_fams)
+        if ram < need and not a.check:
+            fail(f"RAM: {ram:.0f} GB - without a GPU the smallest model needs about {need:.0f} GB")
         ok(f"RAM: {ram:.0f} GB")
     else:
-        ok(f"RAM: {ram:.0f} GB (less than the {need} GB the smallest model needs)" +
-           ("; the GPU's VRAM makes up for it (the low-RAM mode)" if low_ok else ""))
+        need = min(d["ram_gb"] for d in MODELS.values())
+        low_ok = low_ram_fits("IQ1_M", ram, gpu_expert_vram(gpu)) and a.low_ram != "off"   # the smallest model, mapped
+        if a.ram_reserve_gib and ram < need - 4 and not low_ok and ram_total >= need - 4:
+            # the reserve leaves less than the smallest model runs in: it keeps that least, and less stays free
+            ram = need - 4
+            warn(f"--ram-reserve-gib {a.ram_reserve_gib:g} leaves less RAM than the smallest model runs in "
+                 f"({need - 4:.0f} GB): XeStrata takes that much, and about {ram_total - ram:.0f} GB stay free")
+            a.ram_reserve_gib = math.floor(ram_total - ram)
+        if ram < need - 4 and not a.check and not low_ok:
+            # every model keeps ALL its experts in RAM (23+ GB) unless the GPU holds enough of them for the low-RAM mode
+            fail(f"RAM: {ram:.0f} GB - the smallest model (the Coder) needs about {need} GB",
+                 "XeStrata keeps the model's experts in RAM (23-50 GB) and the GPU holds a copy of the most-used ones: "
+                 "it needs 32 GB of RAM or more (48 GB for the full model), or a GPU with the VRAM to hold most of "
+                 "them")
+        if a.ram_reserve_gib:
+            ok(f"RAM: {ram_total:.0f} GB, {a.ram_reserve_gib:g} GiB of it kept free for other programs "
+               f"(--ram-reserve-gib): XeStrata plans with {max(ram, 0.0):.0f} GB")
+        elif ram >= need - 4:
+            ok(f"RAM: {ram:.0f} GB")
+        else:
+            ok(f"RAM: {ram:.0f} GB (less than the {need} GB the smallest model needs)" +
+               ("; the GPU's VRAM makes up for it (the low-RAM mode)" if low_ok else ""))
     ok(f"CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})")
     if not avx2:
         fail("this CPU has no AVX2; XeStrata needs at least AVX2")
+    if a.check and on_cpu:                             # without a GPU: the CPU's models alone
+        say()
+        any_fits = False
+        for f in cpu_fams:
+            fam = PLAIN_FAMILIES[f]
+            c = cpu_ctx(fam, ram)
+            holds = ram >= cpu_ram_gb(fam, c)
+            any_fits = any_fits or holds
+            say(f"  {fam['title']} (every size): ~{cpu_ram_gb(fam, c):.0f} GB of RAM at {c // 1024}K on the CPU: "
+                + ("fits" if holds else "does not fit"))
+        say("\nWithout a GPU, " + ("this PC can run these models on the CPU (text only). Run it again without --check "
+                                   "to install." if any_fits else "this PC has too little RAM for them."))
+        return 0 if any_fits else 1
     if a.check:
         say()
         any_fits = False
@@ -8072,7 +8210,10 @@ def main() -> int:
         a.custom = custom_info([Path(f["path"]) for f in old["files"]], a.model)
         register_custom(a.custom)
         a.family = CUSTOM
-    fams = [f for f in FAMILIES if f != CUSTOM]
+    if on_cpu and a.family == CUSTOM:
+        fail("a model of your own files needs a GPU: without one the CPU runs " +
+             " and ".join(PLAIN_FAMILIES[f]["title"] for f in cpu_fams))
+    fams = cpu_fams if on_cpu else [f for f in FAMILIES if f != CUSTOM]
     # a Strix Halo with the memory for it: UD-IQ4_XS is the recommendation, the menus list the rest (upstream c4a329fe)
     halo = gpu.get("gfx") == STRIX_HALO_GFX and "uma_gb" in gpu and ram + gpu.get("carve_gb", 0.0) >= STRIX_HALO_MIN_GB
     halo_fam = (next((f for f in fams if f in MODELS.get(STRIX_HALO_MODEL, {}).get("families", ())), None)
@@ -8080,7 +8221,7 @@ def main() -> int:
     if a.family:
         family = a.family
     else:
-        rec_fam = halo_fam or fams[0]
+        rec_fam = halo_fam or ("qwen35-2b" if on_cpu else fams[0])   # without a GPU: the 2B, the better answers
         for i, f in enumerate(fams, 1):
             d = FAMILIES[f]
             say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" +

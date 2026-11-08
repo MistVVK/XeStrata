@@ -3774,6 +3774,7 @@ class Service:
                  fit_max_tokens: bool = True):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
         self.vision_error: str | None = None           # why the configured encoder did not start (images off)
+        self.text_only: str | None = None              # why this model reads no images by design (the CPU's forward)
         self.vision_fallback: str | None = None        # why a later encoder serves instead of the configured one
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         # default: clamp the output cap to the room left; False (--no-fit-max-tokens) = 400
@@ -4810,7 +4811,7 @@ class Service:
             for n, item in enumerate(content):
                 if not isinstance(item, dict) or item.get("type") != "image":
                     continue
-                why = "this server has no image encoder" if self.vision is None else None
+                why = None if self.vision is not None else self.text_only or "this server has no image encoder"
                 if why is None:
                     src = item["source"]
                     try:
@@ -4915,6 +4916,8 @@ class Service:
         images = images_of(messages)
         if images:
             if self.vision is None:
+                if self.text_only:
+                    raise ValueError("images are not available: " + self.text_only)
                 if self.vision_error:
                     raise ValueError("images are unavailable: " + self.vision_error)
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
@@ -10682,6 +10685,9 @@ def main() -> int:
                                                       and cfg.get("fit_max_tokens") is not False))
     svc.vision_error = vision_error
     svc.vision_fallback = vision_fallback
+    eargs = [str(x) for x in cfg.get("args", [])]
+    if "--device" in eargs[:-1] and eargs[eargs.index("--device") + 1] == "cpu":   # setup's model without a GPU
+        svc.text_only = "the model runs on the CPU, which reads text only (a GPU reads images)"
     if (tpath / "vocab.json").exists():
         svc.tokenizer_dir = str(tpath.resolve())
     svc.public_urls = True                             # #28: a request's image URL only from a public address
