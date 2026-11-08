@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """#3370: the encoder's work folder is made again when a temp cleaner removed it while the encoder was unloaded.
 
     python -m serve.test_vision_workdir
@@ -20,8 +21,8 @@ class WorkDir(unittest.TestCase):
                                wait=lambda timeout=None: 0, poll=lambda: None)
         with tempfile.TemporaryDirectory() as tmp:
             v = server.Vision.__new__(server.Vision)
-            v.spawn = (["strata-vision"], None, None)
-            v.dir = Path(tmp) / "strata-vision-gone"
+            v.spawn = (["xestrata-vision"], None, None)
+            v.dir = Path(tmp) / "xestrata-vision-gone"
             v.cache = {"k": (v.dir / "k.sve", 4)}
             seen = []
 

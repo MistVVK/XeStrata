@@ -92,7 +92,7 @@
   "about.kept": "Les discussions, les réglages et la clé restent dans ce navigateur seulement.",
   "about.github": "XeStrata sur GitHub",
   "about.cfgTitle": "Réglages du modèle",
-  "about.cfgNote": "Enregistrés dans la configuration de démarrage du modèle pour tous les clients. Un champ vide est la valeur par défaut. Ils s'appliquent au prochain démarrage du modèle (fermez la fenêtre de Strata et redémarrez-le).",
+  "about.cfgNote": "Enregistrés dans la configuration de démarrage du modèle pour tous les clients. Un champ vide est la valeur par défaut. Ils s'appliquent au prochain démarrage du modèle (fermez la fenêtre de XeStrata et redémarrez-le).",
   "branch.back": "Y retourner",
   "branch.from": "Créée à partir de « {title} »",
   "branch.open": "Ouvrir l’originale",

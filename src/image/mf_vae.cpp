@@ -1884,7 +1884,7 @@ bool MfVae::finite(const float* x, int64_t n) {
 bool MfVae::overflowed(const float* x, int64_t n) {
     if (vbf_ || finite(x, n)) return false;
     vbf_ = true;
-    std::fprintf(stderr, "strata-image: the VAE's activations passed FP16's range: BF16 from now on\n");
+    std::fprintf(stderr, "xestrata-image: the VAE's activations passed FP16's range: BF16 from now on\n");
     return true;
 }
 

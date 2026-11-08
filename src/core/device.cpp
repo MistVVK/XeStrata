@@ -6,6 +6,7 @@
 #define STRATA_DEVICE_ARCH_TAG_TU core_device
 #include "strata/kernels/device_arch_tag.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/platform/env.hpp"
 
 
 #if defined(__has_include)
@@ -136,19 +137,19 @@ std::vector<sycl::device> find_devices() {
     }
     if (candidates.empty()) throw DeviceError(refused.empty() ? no_gpu_listed() : "no usable GPU" + refused);
     // setup names the card by PCI address: Level Zero's own numbering can include GPUs that setup does not list
-    if (const char* want = std::getenv("STRATA_GPU_PCI"); want != nullptr && *want != '\0') {
+    if (const char* want = strata::env_get("GPU_PCI"); want != nullptr && *want != '\0') {
         std::string w = want;
         for (auto& c : w) c = (char) std::tolower((unsigned char) c);
         std::vector<sycl::device> match;
         for (const auto& d : candidates)
             if (pci_of(d) == w) match.push_back(d);
         if (match.size() != 1)
-            throw DeviceError(std::string("STRATA_GPU_PCI=") + want + ": no usable GPU at that PCI address" +
+            throw DeviceError(std::string("XESTRATA_GPU_PCI=") + want + ": no usable GPU at that PCI address" +
                               refused);
     }
     // A discrete card before the processor's own graphics, then the most memory, then the most compute units (whose
     // size differs between GPU makers, so they only break a tie); the GPU STRATA_GPU_PCI names goes first.
-    const char* want = std::getenv("STRATA_GPU_PCI");
+    const char* want = strata::env_get("GPU_PCI");
     std::string w = want ? want : "";
     for (auto& c : w) c = (char) std::tolower((unsigned char) c);
     std::stable_sort(candidates.begin(), candidates.end(), [&w](const sycl::device& x, const sycl::device& y) {
@@ -452,7 +453,7 @@ Runtime::Runtime(int ordinal, const sycl::device& device) : ordinal_(ordinal), d
 // on the B70 with 26.05, 22 to 25 us with 26.35 and 4.1 to 4.3 us on the RTX 4070 (an i7-14700's submissions).
 // STRATA_EVENT_MARK=tag or barrier chooses instead.
 bool Runtime::measure_marks() {
-    if (const char* v = std::getenv("STRATA_EVENT_MARK")) return std::strcmp(v, "barrier") == 0;
+    if (const char* v = strata::env_get("EVENT_MARK")) return std::strcmp(v, "barrier") == 0;
     constexpr int kMarks = 64;
     constexpr double kCostUs = 6.0;
     try {
@@ -498,7 +499,7 @@ sycl::queue* Runtime::create_stream(bool high_priority) {
 sycl::queue* Runtime::create_copy_stream() {
 #ifdef STRATA_HAVE_ZE_API
     static const bool off = [] {
-        const char* v = std::getenv("STRATA_COPY_ENGINE");
+        const char* v = strata::env_get("COPY_ENGINE");
         return v != nullptr && std::strtol(v, nullptr, 10) == 0;
     }();
     if (!off && device_.get_backend() == sycl::backend::ext_oneapi_level_zero) {
@@ -541,12 +542,12 @@ sycl::queue* Runtime::create_copy_stream() {
                     sycl::make_queue<sycl::backend::ext_oneapi_level_zero>(in, context_, handler()));
                 static std::atomic<bool> said{false};
                 if (!said.exchange(true))
-                    std::fprintf(stderr, "strata: the prompt's expert copies on the GPU's copy engine (queue group %u; "
-                                         "STRATA_COPY_ENGINE=0 turns it off)\n", i);
+                    std::fprintf(stderr, "xestrata: the prompt's expert copies on the GPU's copy engine (queue group %u; "
+                                         "XESTRATA_COPY_ENGINE=0 turns it off)\n", i);
                 return q;
             }
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "strata: no copy-engine queue (%s): an ordinary stream\n", e.what());
+            std::fprintf(stderr, "xestrata: no copy-engine queue (%s): an ordinary stream\n", e.what());
         }
     }
 #endif
@@ -624,8 +625,8 @@ void Runtime::preload_kernels() {
                 ++skipped;
             }
         }
-        if (std::getenv("STRATA_TRACE"))
-            std::fprintf(stderr, "strata trace: %d kernels built ahead, %d not for this GPU\n", built, skipped);
+        if (strata::env_get("TRACE"))
+            std::fprintf(stderr, "xestrata trace: %d kernels built ahead, %d not for this GPU\n", built, skipped);
     });
 }
 
@@ -762,17 +763,17 @@ void Runtime::free(void* pointer) noexcept {
 
 namespace {
 uint64_t env_mib(const char* name) {
-    const char* v = std::getenv(name);
+    const char* v = strata::env_get(name);
     return v ? (uint64_t) std::strtoull(v, nullptr, 10) << 20 : 0;
 }
 }  // namespace
 
 uint64_t vram_limit_bytes() {
-    static const uint64_t v = env_mib("STRATA_VRAM_LIMIT_MIB");
+    static const uint64_t v = env_mib("VRAM_LIMIT_MIB");
     return v;
 }
 uint64_t max_alloc_limit_bytes() {
-    static const uint64_t v = env_mib("STRATA_MAX_ALLOC_MIB");
+    static const uint64_t v = env_mib("MAX_ALLOC_MIB");
     return v;
 }
 
@@ -930,7 +931,7 @@ void apply_os_budget(const std::string& pci, uint64_t& free) {
 
 void apply_uma_limit(uint64_t& free) {
     static const uint64_t headroom = [] {
-        const char* v = std::getenv("STRATA_UMA_HEADROOM_GIB");
+        const char* v = strata::env_get("UMA_HEADROOM_GIB");
         const long long g = v != nullptr ? std::strtoll(v, nullptr, 10) : 6;
         return (uint64_t) std::max(0LL, g) << 30;
     }();

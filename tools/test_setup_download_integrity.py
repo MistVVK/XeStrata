@@ -126,7 +126,7 @@ class DownloadCase(unittest.TestCase):
                    mock.patch.object(setup, "DL_BACKOFF", 0.0), mock.patch.object(setup, "DL_SAVE_EVERY", 0.0),
                    mock.patch.object(setup, "DL_ROUNDS", 3), mock.patch.object(setup.time, "sleep", lambda s: None),
                    mock.patch.object(setup, "file_pin", lambda url: (SIZE, SHA)),
-                   mock.patch.dict("os.environ", {"STRATA_DL_CONNECTIONS": "4", "STRATA_SOURCE": "huggingface"})]
+                   mock.patch.dict("os.environ", {"XESTRATA_DL_CONNECTIONS": "4", "XESTRATA_SOURCE": "huggingface"})]
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
@@ -334,14 +334,14 @@ class Misbehaving(DownloadCase):
         url = self.serve(Behavior(
             lambda n, s, e: {"cr": f"bytes {s + 5}-{e}/{SIZE}", "body": (s + 5, e)} if s > 0 else {}))
         self.part.write_bytes(DATA[:PIECE * 3])
-        with mock.patch.dict("os.environ", {"STRATA_DL_CONNECTIONS": "1"}):
+        with mock.patch.dict("os.environ", {"XESTRATA_DL_CONNECTIONS": "1"}):
             self.run_download(url)
         self.assertGood()
 
     def test_single_stream_resume_ignores_a_200(self):
         url = self.serve(Behavior(lambda n, s, e: {"status": 200}))
         self.part.write_bytes(DATA[:PIECE * 3])
-        with mock.patch.dict("os.environ", {"STRATA_DL_CONNECTIONS": "1"}):
+        with mock.patch.dict("os.environ", {"XESTRATA_DL_CONNECTIONS": "1"}):
             self.run_download(url)
         self.assertGood()
 

@@ -31,20 +31,23 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # the checkout, for serve/envvars.py
+from serve import envvars  # noqa: E402
 
 # #214: a fixed commit of the checkpoint (its `sha` from https://huggingface.co/api/models/Qwen/Qwen3.8-Flash-Next
-# on 2026-09-30), so every install reads the same tensors; STRATA_MTP_REVISION overrides it (e.g. main).  When the
-# repository no longer has it, reading stops (resolve_repo) unless STRATA_ALLOW_UNPINNED=1.
+# on 2026-09-30), so every install reads the same tensors; XESTRATA_MTP_REVISION overrides it (e.g. main).  When the
+# repository no longer has it, reading stops (resolve_repo) unless XESTRATA_ALLOW_UNPINNED=1.
 PINNED_REVISION = "de4b8e4d43b917e7706784d8bb445c9af86a3540"
-REVISION = os.environ.get("STRATA_MTP_REVISION") or PINNED_REVISION
+REVISION = envvars.get("MTP_REVISION") or PINNED_REVISION
 # #495: HF_ENDPOINT (a mirror, e.g. https://hf-mirror.com) serves the same revision; the SHA256 checks below still apply
 HF_ENDPOINT = (os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/") or "https://huggingface.co"
 REPO = HF_ENDPOINT + "/Qwen/Qwen3.8-Flash-Next/resolve/%s/" % REVISION
 PINNED = HF_ENDPOINT + "/Qwen/Qwen3.8-Flash-Next/resolve/%s/" % PINNED_REVISION   # SHA256's revision
-# STRATA_SOURCE=modelscope (setup's --source): the same checkpoint from ModelScope.  It serves the repository's current
-# files, not a pinned revision, so REPO and PINNED are one URL here: every tensor is still checked against the pinned
-# revision's SHA256 below, so a tensor that differs from it is caught, not used.
-if (os.environ.get("STRATA_SOURCE") or "").strip().lower() in ("ms", "modelscope"):
+# XESTRATA_SOURCE=modelscope (setup's --source): the same checkpoint from ModelScope.  It serves the repository's
+# current files, not a pinned revision, so REPO and PINNED are one URL here: every tensor is still checked against the
+# pinned revision's SHA256 below, so a tensor that differs from it is caught, not used.
+if (envvars.get("SOURCE") or "").strip().lower() in ("ms", "modelscope"):
     MS_ENDPOINT = (os.environ.get("MODELSCOPE_ENDPOINT") or "").strip().rstrip("/") or "https://www.modelscope.cn"
     REPO = PINNED = MS_ENDPOINT + "/models/Qwen/Qwen3.8-Flash-Next/resolve/master/"
 DTYPE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "I64": 8, "I32": 4}
@@ -137,7 +140,7 @@ def get(url, start=None, end=None, retries=6):
     for attempt in range(retries):
         try:
             used = _final(url)
-            req = urllib.request.Request(used, headers={"User-Agent": "strata-mtp-fetch"})
+            req = urllib.request.Request(used, headers={"User-Agent": "xestrata-mtp-fetch"})
             if start is not None:
                 req.add_header("Range", "bytes=%d-%d" % (start, end))
             with urllib.request.urlopen(req, timeout=120) as r:
@@ -215,10 +218,10 @@ def lock_folder(out, wait=900.0):
 
 
 def exit_with_parent():
-    """STRATA_EXIT_WITH_PARENT=1 (set by setup.py for the tools it runs): end when the process that started this one
+    """XESTRATA_EXIT_WITH_PARENT=1 (set by setup.py for the tools it runs): end when the process that started this one
     ends, so a cancelled or killed setup does not leave a download running on its own (upstream #3257: taskkill /T does
     not reach a grandchild whose parent is gone)."""
-    if (os.environ.get("STRATA_EXIT_WITH_PARENT") or "").strip() != "1":
+    if (envvars.get("EXIT_WITH_PARENT") or "").strip() != "1":
         return
     parent = os.getppid()
     if parent <= 1:
@@ -247,10 +250,10 @@ def exit_with_parent():
 
 
 def connections():
-    """Ranges read at once: STRATA_DL_CONNECTIONS (the setting of setup's downloads), else 16; 1 reads them one by
+    """Ranges read at once: XESTRATA_DL_CONNECTIONS (the setting of setup's downloads), else 16; 1 reads them one by
     one."""
     try:
-        n = int((os.environ.get("STRATA_DL_CONNECTIONS") or "").strip() or 16)
+        n = int((envvars.get("DL_CONNECTIONS") or "").strip() or 16)
     except ValueError:
         n = 16
     return max(1, min(n, 32))
@@ -298,8 +301,8 @@ def check_range(status, content_range, start, end):
 
 def pinned():
     """The tensors' hashes (SHA256, the pinned revision's) apply: whenever this run asks for the pinned revision -
-    from Hugging Face, ModelScope, or (STRATA_ALLOW_UNPINNED=1, resolve_repo) the current files that replaced it, which
-    must still be the same bytes (#31: that path used to drop every check).  Not when STRATA_MTP_REVISION names
+    from Hugging Face, ModelScope, or (XESTRATA_ALLOW_UNPINNED=1, resolve_repo) the current files that replaced it,
+    which must still be the same bytes (#31: that path used to drop every check).  Not when XESTRATA_MTP_REVISION names
     another revision: the table is not that one's."""
     return REVISION == PINNED_REVISION
 
@@ -314,19 +317,19 @@ def sha256_of(path):
 
 def resolve_repo():
     """REPO.  When the pinned revision is gone from the repository (a 404 on its index) it stops, unless
-    STRATA_ALLOW_UNPINNED=1: then the current files are read (their tensors are still checked against the pinned
+    XESTRATA_ALLOW_UNPINNED=1: then the current files are read (their tensors are still checked against the pinned
     SHA256; upstream e193161de)."""
     global REPO
     try:
         req = urllib.request.Request(REPO + "model.safetensors.index.json", method="HEAD",
-                                     headers={"User-Agent": "strata-mtp-fetch"})
+                                     headers={"User-Agent": "xestrata-mtp-fetch"})
         urllib.request.urlopen(req, timeout=120).close()
     except urllib.error.HTTPError as e:
         if e.code == 404 and "/resolve/%s/" % REVISION in REPO:
-            if (os.environ.get("STRATA_ALLOW_UNPINNED") or "").strip() != "1":
+            if (envvars.get("ALLOW_UNPINNED") or "").strip() != "1":
                 sys.exit("the pinned version of the checkpoint (%s) is no longer on Hugging Face: update XeStrata"
                          % REVISION)
-            print("STRATA_ALLOW_UNPINNED=1: the checkpoint's pinned revision %s is gone: reading its current files "
+            print("XESTRATA_ALLOW_UNPINNED=1: the checkpoint's pinned revision %s is gone: reading its current files "
                   "(main); every tensor is still checked against the pinned SHA256" % REVISION, file=sys.stderr)
             REPO = REPO.replace("/resolve/%s/" % REVISION, "/resolve/main/")
     except OSError:
@@ -444,7 +447,7 @@ def fetch(out, only):
             os.remove(path)                         # wrong bytes (#327): the whole tensor again, once
             attempt += 1
             if attempt > 1:
-                if "/resolve/main/" in REPO and REPO != PINNED:   # STRATA_ALLOW_UNPINNED=1's current files (#31)
+                if "/resolve/main/" in REPO and REPO != PINNED:   # XESTRATA_ALLOW_UNPINNED=1's current files (#31)
                     sys.exit("%s: sha256 %s is not the pinned checkpoint's %s - the repository's current files have "
                              "changed since this version pinned them: update XeStrata" % (r["name"], digest, want))
                 sys.exit("%s: sha256 %s is not the checkpoint's %s - the download source sends wrong data (a mirror "
@@ -459,7 +462,7 @@ def fetch(out, only):
 
 def verify(out):
     """#327: the fetched tensors against SHA256 -> the names that are missing or wrong.  [] when they are right, or
-    when there is nothing to check (no tensors/, or STRATA_MTP_REVISION names another revision).  A tensor's verdict
+    when there is nothing to check (no tensors/, or XESTRATA_MTP_REVISION names another revision).  A tensor's verdict
     is kept in tensors/verified.json by size and mtime, so a later run hashes only what changed."""
     tdir = os.path.join(out, "tensors")
     if not pinned() or not os.path.isdir(tdir):

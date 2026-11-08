@@ -5,6 +5,7 @@
 // Built with the tests (STRATA_BUILD_TESTS); no GPU, no model.
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
+#include "strata/platform/env.hpp"
 
 #include <array>
 #include <cerrno>
@@ -181,7 +182,7 @@ int main() try {
         check(u64(40) == 0 && u64(48) == 0, "golden: reserved fields are zero");
         check(std::memcmp(g.data() + g.size() - 8, "STRSEND\x01", 8) == 0, "golden: end marker");
         const uint64_t h = session_hash64(g.data(), g.size(), 0);
-        const char* golden = std::getenv("STRATA_SESSION_GOLDEN_PRINT");
+        const char* golden = strata::env_get("SESSION_GOLDEN_PRINT");
         if (golden) std::printf("golden size %zu hash %016llx\n", g.size(), (unsigned long long)h);
         check(g.size() == kGoldenSize && h == kGoldenHash, "golden: the fixed sample's file bytes are unchanged");
     }
@@ -210,16 +211,16 @@ int main() try {
     }
     // buffered I/O (the path taken where direct I/O is refused or unavailable) writes and reads the same bytes
     {
-        const char* inherited = std::getenv("STRATA_SESSION_BUFFERED");
+        const char* inherited = strata::env_get("SESSION_BUFFERED");
         const std::string kept = inherited ? inherited : "";
-        set_env("STRATA_SESSION_BUFFERED", "1");
+        set_env("XESTRATA_SESSION_BUFFERED", "1");
         const fs::path p = dir / "buffered.bin";
         check(session_file_write(p.string(), original, id, written, error), "buffered write");
         check(slurp(p) == slurp(good), "buffered write equals the default write");
         SavedConversation back;
         size_t read = 0;
         check(session_file_read(p.string(), id, back, read, error) && same(original, back), "buffered read");
-        set_env("STRATA_SESSION_BUFFERED", inherited ? kept.c_str() : nullptr);   // the caller's choice again
+        set_env("XESTRATA_SESSION_BUFFERED", inherited ? kept.c_str() : nullptr);   // the caller's choice again
     }
 
     const std::vector<char> image = slurp(good);
@@ -370,7 +371,7 @@ int main() try {
         c.engine_version = "0.1.38"; c.backend = "cuda"; c.kv = "int8"; c.max_context = 65536; c.kv_resident = 0;
         c.mtp_window = 4; c.rope.type = 0; c.rope.freq_base = 1e7; c.rope.factor = 1.0; c.rope.freq_scale = 1.0;
         c.rope.orig_ctx = 262144; c.rope.attn_factor = 1.0; c.rope.beta_fast = 32; c.rope.beta_slow = 1;
-        c.switches = {{"STRATA_FAST_GDN", 0}};
+        c.switches = {{"XESTRATA_FAST_GDN", 0}};
         const uint64_t base = session_config_fingerprint(c);
         check(session_config_fingerprint(c) == base, "config fingerprint is deterministic");
         auto differs = [&](auto edit) { SessionConfig d = c; edit(d); return session_config_fingerprint(d) != base; };

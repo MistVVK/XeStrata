@@ -88,14 +88,14 @@ int main() {
     // plain: one allocation, no pieces
     bad += open_and_check("plain", slots, 3, 4, 6);
     // the one allocation refused: every piece taken, the whole cache in pieces
-    set_env("STRATA_TEST_ALLOC_FAIL", "1");
+    set_env("XESTRATA_TEST_ALLOC_FAIL", "1");
     bad += open_and_check("fallback", slots, 3, 4, 6);
     // the same refusal, with the pieces from the second on refused: only the first piece's slots stay
-    set_env("STRATA_TEST_ALLOC_FAIL", "1");
-    set_env("STRATA_TEST_PIECE_FAIL", "5");
+    set_env("XESTRATA_TEST_ALLOC_FAIL", "1");
+    set_env("XESTRATA_TEST_PIECE_FAIL", "5");
     bad += open_and_check("prefix", slots, 3, 4, 1);
-    set_env("STRATA_TEST_PIECE_FAIL", "");
-    set_env("STRATA_TEST_ALLOC_FAIL", "");
+    set_env("XESTRATA_TEST_PIECE_FAIL", "");
+    set_env("XESTRATA_TEST_ALLOC_FAIL", "");
     // a want beyond any card here: the pre-check's refusal, said in full (Lower --expert-cache)
     bad += open_and_check("toobig", std::vector<int64_t>(6, 64ll << 30), 3, 4, -1);
     return bad == 0 ? 0 : 1;

@@ -16,6 +16,7 @@
 #include "strata/kernels/f16_gpu.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/platform/env.hpp"
 #include "../kernels/xe/attn_parts.hpp"
 
 #include <sycl/sycl.hpp>
@@ -71,7 +72,7 @@ Choices& sdpa_choices_of(sycl::queue& q) {   // the maker's kernel (true) or the
 }
 int forced_i8() {   // STRATA_IMAGE_ATTN_I8: 1 always, 0 never, else -1 (timed)
     static const int forced = [] {
-        const char* v = std::getenv("STRATA_IMAGE_ATTN_I8");
+        const char* v = strata::env_get("IMAGE_ATTN_I8");
         return v == nullptr || *v == 0 ? -1 : (int) (std::strtol(v, nullptr, 10) != 0);
     }();
     return forced;
@@ -192,7 +193,7 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
                 // 6.58 against 6.66 ms) picked one or the other from start to start, and with it the image
                 use = i8ms > 0.0 && i8ms < f16ms * 1.05;
                 ch.of[key] = use;
-                std::fprintf(stderr, "strata-image: the attention's image rows %s at %lld rows of %lld keys (int8 "
+                std::fprintf(stderr, "xestrata-image: the attention's image rows %s at %lld rows of %lld keys (int8 "
                                      "%.2f ms, 16-bit %.2f ms)\n", use ? "in int8" : "in 16 bits", (long long) (T - r0),
                              (long long) T, i8ms, f16ms);
             } else {
@@ -240,7 +241,7 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
         ch.of[key] = use;
         if (mk >= 0.0)
             std::fprintf(stderr,
-                         "strata-image: the attention's image rows by %s at %lld rows of %lld keys (the maker's %.2f "
+                         "xestrata-image: the attention's image rows by %s at %lld rows of %lld keys (the maker's %.2f "
                          "ms, the engine's own %.2f ms)\n",
                          use ? "the maker's kernel" : "the engine's own", (long long) (T - r0), (long long) T, mk, own);
         return use;
@@ -320,7 +321,7 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
             if (ms < best) { best = ms; nsg = n; }
         }
         tuned.store(nsg);
-        std::fprintf(stderr, "strata-image: the attention takes %d sub-groups a work-group (timed at %lld rows of %lld "
+        std::fprintf(stderr, "xestrata-image: the attention takes %d sub-groups a work-group (timed at %lld rows of %lld "
                              "keys: %s)\n", nsg, (long long) (big->second - big->first), (long long) T, said.c_str());
     }
     if (nsg == 0) nsg = most;

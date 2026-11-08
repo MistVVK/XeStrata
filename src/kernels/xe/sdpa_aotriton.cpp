@@ -44,10 +44,10 @@ AotFn aotriton_module() {
 #if defined(_WIN32)
         char exe[MAX_PATH] = {};
         const fs::path dir = GetModuleFileNameA(nullptr, exe, MAX_PATH) > 0 ? fs::path(exe).parent_path() : fs::path();
-        const char* name = "strata_sdpa_aotriton.dll";
+        const char* name = "xestrata_sdpa_aotriton.dll";
 #else
         const fs::path dir = fs::read_symlink("/proc/self/exe", ec).parent_path();
-        const char* name = "libstrata_sdpa_aotriton.so";
+        const char* name = "libxestrata_sdpa_aotriton.so";
 #endif
         std::string why = "not found";
         for (const fs::path& p : {dir / name, dir / "lib" / name}) {
@@ -72,7 +72,7 @@ AotFn aotriton_module() {
             if (fn != nullptr) return;
             why = p.string() + ": no strata_sdpa_aotriton";
         }
-        std::fprintf(stderr, "strata: aotriton's attention module did not open (%s): the engine's own kernel\n",
+        std::fprintf(stderr, "xestrata: aotriton's attention module did not open (%s): the engine's own kernel\n",
                      why.c_str());
     });
     return fn;

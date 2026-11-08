@@ -16,6 +16,7 @@
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/rows_cols.hpp"
+#include "strata/platform/env.hpp"
 
 #if STRATA_ONEMATH
 #include "strata/kernels/matrix_report.hpp"
@@ -49,7 +50,7 @@ using strata::kernels::XmxType;
 namespace {
 #if STRATA_ONEMATH
 bool env_on(const char* name) {
-    const char* v = std::getenv(name);
+    const char* v = strata::env_get(name);
     return v != nullptr && std::strtol(v, nullptr, 10) != 0;
 }
 
@@ -62,7 +63,7 @@ struct Trial {
 // compare) - and BF16 ones too - not when the trial product failed (a GPU whose library has no BF16 product), nor with
 // STRATA_NO_BF16_MMA=1, which imitates a GPU without BF16 matrix engines.
 struct Backend {
-    bool blas = !env_on("STRATA_NO_BLAS");
+    bool blas = !env_on("NO_BLAS");
     bool bf16 = !strata::kernels::no_bf16_mma();
     int i8 = -1;   // whether the backend takes int8 products (Gemm::i8_usable's trial; -1 before it)
     std::shared_future<Trial> ready;   // Gemm::prepare's trial, until it is settled
@@ -140,11 +141,11 @@ Backend backend(const sycl::device& dev) {
     if (b.ready.valid()) {
         b.ready = {};
         if (!t.why.empty()) {
-            std::fprintf(stderr, "strata: oneMath: %s; the prompt's matrix products take XeStrata's own kernels\n",
+            std::fprintf(stderr, "xestrata: oneMath: %s; the prompt's matrix products take XeStrata's own kernels\n",
                          t.why.c_str());
             b.blas = false;
         } else if (!t.bf16 && b.bf16) {
-            std::fprintf(stderr, "strata: oneMath has no BF16 product on this GPU: those take XeStrata's own "
+            std::fprintf(stderr, "xestrata: oneMath has no BF16 product on this GPU: those take XeStrata's own "
                                  "kernels\n");
             b.bf16 = false;
         }
@@ -173,7 +174,7 @@ bool blas(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, 
         product<E>(q, X, W, Y, T, N, K, ldy, accumulate);
         return true;
     } catch (const oneapi::math::exception& e) {
-        std::fprintf(stderr, "strata: oneMath: %s; the prompt's matrix products take XeStrata's own kernels\n",
+        std::fprintf(stderr, "xestrata: oneMath: %s; the prompt's matrix products take XeStrata's own kernels\n",
                      e.what());
         std::lock_guard<std::mutex> lock(g_mutex);
         g_backends[q.get_device()].blas = false;
@@ -197,7 +198,7 @@ bool half_out(const uint16_t* X, const uint16_t* W, uint16_t* Y16, int64_t T, in
                                      reinterpret_cast<const sycl::half*>(W), K, reinterpret_cast<const sycl::half*>(X),
                                      K, sycl::half(0.0f), reinterpret_cast<sycl::half*>(Y16), ldy);
     } catch (const oneapi::math::exception& e) {
-        std::fprintf(stderr, "strata: oneMath (FP16 sums): %s; the FP32 sums instead\n", e.what());
+        std::fprintf(stderr, "xestrata: oneMath (FP16 sums): %s; the FP32 sums instead\n", e.what());
         return false;
     }
     return true;
@@ -235,7 +236,7 @@ bool half_sums(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
 
 bool dense_f32(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                void* stream) {
-    static const bool on = env_on("STRATA_DENSE_F32");
+    static const bool on = env_on("DENSE_F32");
     if (!on) return false;
     sycl::queue& q = core::Runtime::get().stream(stream);
     const Backend b = backend(q.get_device());
@@ -272,7 +273,7 @@ bool dense_f32(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
                                      Y, ldy);
         return true;
     } catch (const oneapi::math::exception& e) {
-        std::fprintf(stderr, "strata: oneMath (STRATA_DENSE_F32): %s; the FP16 products instead\n", e.what());
+        std::fprintf(stderr, "xestrata: oneMath (XESTRATA_DENSE_F32): %s; the FP16 products instead\n", e.what());
         return false;
     }
 }
@@ -347,7 +348,7 @@ const char* Gemm::path() {
 }
 
 bool gemm_dequant_side() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_DEQUANT_SIDE"); return v && v[0] == '1'; }();
+    static const bool on = [] { const char* v = strata::env_get("DEQUANT_SIDE"); return v && v[0] == '1'; }();
     return on;
 }
 
@@ -420,7 +421,7 @@ bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
 bool Gemm::bf16_through_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K,
                             int64_t ldy) {
     static const bool off = [] {
-        const char* v = std::getenv("STRATA_BF16_TC");
+        const char* v = strata::env_get("BF16_TC");
         return v != nullptr && v[0] == '0';
     }();
     if (off || N <= 1 || K <= 0 || !strata::kernels::f16_only_matrix_engines()) return false;
@@ -493,7 +494,7 @@ void Gemm::f16_batch(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, 
                                                reinterpret_cast<const sycl::half*>(X), K, sx, 0.0f, Y, ldy, sy, batch);
             return;
         } catch (const oneapi::math::exception& e) {
-            std::fprintf(stderr, "strata: oneMath (a batch of FP16 products): %s; one product each\n", e.what());
+            std::fprintf(stderr, "xestrata: oneMath (a batch of FP16 products): %s; one product each\n", e.what());
         }
     }
 #endif

@@ -371,7 +371,7 @@ int bench(bool quick, const std::string& only) {
     std::vector<Variant> vars;
     auto add_tq = [&](int type) {
         for (TqIsa isa : {TqIsa::scalar, TqIsa::avx2, TqIsa::avx512}) {
-            vars.push_back({std::string("strata ") + tq_isa_name(isa), type,
+            vars.push_back({std::string("xestrata ") + tq_isa_name(isa), type,
                             [type, isa](const BenchExpert& e, int nt) {
                                 thread_local std::vector<uint8_t> a, h;
                                 thread_local std::vector<float> ff, out;
@@ -414,7 +414,7 @@ int bench(bool quick, const std::string& only) {
                         ggml_has_type(type)});
     };
     auto add_q2 = [&](bool avx512) {
-        vars.push_back({avx512 ? "strata Q2_0 avx512" : "strata Q2_0 avx2", 42,
+        vars.push_back({avx512 ? "xestrata Q2_0 avx512" : "xestrata Q2_0 avx2", 42,
                         [avx512](const BenchExpert& e, int nt) {
                             thread_local ActQ a1[MAXT], a2[MAXT];
                             thread_local bool init = false;
@@ -443,7 +443,7 @@ int bench(bool quick, const std::string& only) {
     add_q2(false);
     add_q2(true);
     // the Q2_0 pack's own AVX-512 kernel (the repacked 1,382,400-byte blob that setup makes on AVX-512 CPUs)
-    vars.push_back({"strata Q2_0 avx512 pack", 42,
+    vars.push_back({"xestrata Q2_0 avx512 pack", 42,
                     [](const BenchExpert& e, int nt) {
                         thread_local ActQ a1, a2;
                         thread_local bool init = false;

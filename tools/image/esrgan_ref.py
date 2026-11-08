@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""tools/image/esrgan_ref.py - RealESRGAN x4plus in PyTorch, the reference strata-image's (src/image/esrgan.cpp) is
+"""tools/image/esrgan_ref.py - RealESRGAN x4plus in PyTorch, the reference xestrata-image's (src/image/esrgan.cpp) is
 checked against: RRDBNet as basicsr defines it (written from its paper and its published structure, the official
 weights loaded into it strictly, every key and shape), in FP32 with TF32 off, the whole image at once; and the
-comparison of strata-image's output with it.
+comparison of xestrata-image's output with it.
 
   python tools/image/esrgan_ref.py RealESRGAN_x4plus.pth IMAGE OUT.png [--device cuda|xpu|cpu]
   python tools/image/esrgan_ref.py --compare REF.png ENGINE.rgba WIDTH HEIGHT

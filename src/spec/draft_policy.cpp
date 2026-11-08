@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/spec/draft_policy.cpp - see include/strata/spec/draft_policy.hpp.
 #include "strata/spec/draft_policy.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -34,7 +35,7 @@ constexpr double kProbeHeld = 0.5;
 
 DraftPolicy::DraftPolicy(int max_t, double margin)
     : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin) {
-    const char* v = std::getenv("STRATA_SPEC_COST");
+    const char* v = strata::env_get("SPEC_COST");
     robust_ = v != nullptr && std::strtol(v, nullptr, 10) != 0;
 }
 

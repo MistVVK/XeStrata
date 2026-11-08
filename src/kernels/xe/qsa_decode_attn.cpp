@@ -18,6 +18,7 @@
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_qsa_decode_attn
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <cfloat>
@@ -420,7 +421,7 @@ core::PerDevice<int>& nc_store() {
 }
 template <int HD, int G>
 int nc_of(sycl::queue& q) {
-    if (const char* e = std::getenv("STRATA_QSA_NC")) {   // 2, 4 or 8 over the timed choice (the parity test, --bench)
+    if (const char* e = strata::env_get("QSA_NC")) {   // 2, 4 or 8 over the timed choice (the parity test, --bench)
         const long v = std::strtol(e, nullptr, 10);
         if (v == 2 || v == 4 || v == 8) return (int) v;
     }
@@ -539,7 +540,7 @@ int time_nc(sycl::queue& q, const QsaShapes& s, int64_t cells) {
     int pick = 0;
     for (int i = 1; i < 3; ++i)
         if (best[i] < best[pick]) pick = i;
-    std::fprintf(stderr, "strata: the decode attention (%lld/%lld heads of %d) takes %d cells a step (timed at %lld "
+    std::fprintf(stderr, "xestrata: the decode attention (%lld/%lld heads of %d) takes %d cells a step (timed at %lld "
                          "cells: 2: %.0f us, 4: %.0f, 8: %.0f)\n", (long long) s.n_head, (long long) s.n_head_kv, HD,
                  ncs[pick], (long long) cells, best[0] / 16, best[1] / 16, best[2] / 16);
     return ncs[pick];

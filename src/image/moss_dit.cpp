@@ -18,6 +18,7 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/flash_attn.hpp"
 #include "strata/prefill/kernels.hpp"
+#include "strata/platform/env.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -296,7 +297,7 @@ bool MossDit::open(const std::string& path, void* stream, std::string& err, bool
         dry_ = dry;
         q8_ = q8;
         norm_cache_.clear();
-        w8_ = q8 && std::getenv("STRATA_NO_W8A8") == nullptr && prefill::Gemm::i8_usable(stream);
+        w8_ = q8 && strata::env_get("NO_W8A8") == nullptr && prefill::Gemm::i8_usable(stream);
         files_ = std::make_unique<Shards>(path);
         const Shards& f = *files_;
         if (std::filesystem::is_directory(path)) {   // config.json's rope_base, where it differs from 10000

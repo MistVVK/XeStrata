@@ -56,6 +56,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -402,7 +403,7 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
                   (next >= Runtime::count() ? std::string("no GPU left that runs no stage") : err);
             return false;
         }
-        std::fprintf(stderr, "strata plain: helper GPU %d (%s), %.2f GiB free before the experts' RAM copy\n", next,
+        std::fprintf(stderr, "xestrata plain: helper GPU %d (%s), %.2f GiB free before the experts' RAM copy\n", next,
                      strata::gpu::device_name(next).c_str(), free_gib);
         helper_dev_[(size_t) r] = next++;
     }
@@ -430,7 +431,7 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
         for (PlainModel* st : chain())
             where += (where.empty() ? "" : ", ") + strata::gpu::device_name(st->dev_) + " blocks " +
                      std::to_string(st->lb_) + ".." + std::to_string(st->le_ - 1);
-        std::fprintf(stderr, "strata plain: a layer split: %s\n", where.c_str());
+        std::fprintf(stderr, "xestrata plain: a layer split: %s\n", where.c_str());
     }
     return true;
 }
@@ -548,7 +549,7 @@ bool PlainModel::split_auto_points(std::string& err) {
     }
     if ((int) opt_.split_at.size() != n - 1) opt_.split_at.clear();
     for (int d = 0; d < n; ++d)
-        std::fprintf(stderr, "strata plain: --layer-split auto: %s, %.1f GiB for experts, %.1f GB/s from the host: %lld "
+        std::fprintf(stderr, "xestrata plain: --layer-split auto: %s, %.1f GiB for experts, %.1f GB/s from the host: %lld "
                              "MoE layers\n", strata::gpu::device_name(split_devs_[(size_t) d]).c_str(),
                      room[(size_t) d] / 1073741824.0, link[(size_t) d] / 1e9, (long long) count[(size_t) d]);
     return true;
@@ -765,7 +766,7 @@ bool PlainModel::load_qwen(std::string& err) {
         }
         pl_ready_ = ok;
         if (!ok)
-            std::fprintf(stderr, "strata plain: --pipeline-windows 2: no VRAM for the guessed windows' copies on %s; the "
+            std::fprintf(stderr, "xestrata plain: --pipeline-windows 2: no VRAM for the guessed windows' copies on %s; the "
                                  "decode stays serial\n", strata::gpu::device_name(dev_).c_str());
     }
     // the drafts' head over a token subset (Qwen3.8's draft head, mtp.cpp): on the RX 9060 XT the whole Q8_0 head of
@@ -778,7 +779,7 @@ bool PlainModel::load_qwen(std::string& err) {
         const size_t row = head_.type == kBF16 ? (size_t) head_.n_in * 2
                                                : k::cpu::native_row_bytes(gguf_type, head_.n_in);
         subset_ = std::make_unique<DraftSubset>();   // the shared part (core/draft_head), as Qwen3.8's drafter's
-        if (!subset_->load(opt_.draft_vocab, n_vocab_, head_.data, row, cs_, "strata plain", err)) return false;
+        if (!subset_->load(opt_.draft_vocab, n_vocab_, head_.data, row, cs_, "xestrata plain", err)) return false;
         if (subset_->size() > 0) {
             dhead_ = const_cast<uint8_t*>(subset_->rows());
             dvocab_ = subset_->ids();
@@ -821,7 +822,7 @@ bool PlainModel::load_qwen(std::string& err) {
                         : !vmm_available() || !strata::gpu::vmem_supported() ? "no virtual memory on this GPU"
                         : opt_.vram_segment_mib < 64 ? "--vram-segment-mib is below 64" : nullptr;
         const bool grow = asked && why == nullptr;
-        if (opt_.kv_grow > 0 && !grow) std::fprintf(stderr, "strata plain: --kv-grow is off: %s\n", why);
+        if (opt_.kv_grow > 0 && !grow) std::fprintf(stderr, "xestrata plain: --kv-grow is off: %s\n", why);
         if (grow) opt_.vram_elastic = true;   // the tier in segments it can give up (vram)
         for (int64_t i = 0; i < n_attn; ++i) {   // this stage's attention blocks, the MTP layer on the last
             bool mine = has_mtp_ && i == mtp_.attn;
@@ -852,7 +853,7 @@ bool PlainModel::load_qwen(std::string& err) {
         }
         allocs_.push_back(page_table_);
         if (grow) {   // the first cells (STRATA_KV_GROW_INIT, 16384 by default) mapped now
-            const char* iv = std::getenv("STRATA_KV_GROW_INIT");
+            const char* iv = strata::env_get("KV_GROW_INIT");
             const long long init = iv != nullptr && std::strtoll(iv, nullptr, 10) > 0 ? std::strtoll(iv, nullptr, 10) : 16384;
             kv_cells_ = 0;
             if (!kv_map(std::min<int64_t>(opt_.max_cells, init), err)) return false;
@@ -922,7 +923,7 @@ bool PlainModel::load_qwen(std::string& err) {
 }
 
 bool PlainModel::prompt_int8() const {
-    const char* v = std::getenv("STRATA_PLAIN_MMQ");
+    const char* v = strata::env_get("PLAIN_MMQ");
     if (v != nullptr && std::strtol(v, nullptr, 10) == 0) return false;
     if (!prefill::mmq::chosen()) return false;
     // the products' outputs in 128s (2 n_ff and n_embd), their K in blocks of 32; gate's rows right before up's
@@ -1154,7 +1155,7 @@ bool PlainModel::open_experts(std::string& err) {
             if (detail::host_available_memory(hm) &&
                 !detail::resident_pin_fits(need, 0, beside, std::min(hm.available - std::min(hm.available, cma),
                                                                      hm.cgroup_limit), why)) {
-                std::fprintf(stderr, "strata plain: the experts need %.1f GiB of RAM and %.1f GiB beside them, %.1f GiB "
+                std::fprintf(stderr, "xestrata plain: the experts need %.1f GiB of RAM and %.1f GiB beside them, %.1f GiB "
                                      "is available: read in place\n",
                              (double) need / 1073741824.0, (double) beside / 1073741824.0,
                              (double) std::min(hm.available, hm.cgroup_limit) / 1073741824.0);
@@ -1169,14 +1170,14 @@ bool PlainModel::open_experts(std::string& err) {
             strata::gpu::pin_reserve_release_soft();
             if (!arena_ok) return false;
             if (!arena->ram_warning().empty())
-                std::fprintf(stderr, "strata plain: WARNING: %s\n", arena->ram_warning().c_str());
-            std::fprintf(stderr, "strata plain: experts in RAM, %.2f GiB at %.2f GiB/s\n",
+                std::fprintf(stderr, "xestrata plain: WARNING: %s\n", arena->ram_warning().c_str());
+            std::fprintf(stderr, "xestrata plain: experts in RAM, %.2f GiB at %.2f GiB/s\n",
                          (double) lay.total / 1073741824.0, arena->load_gib_per_second());
             src_own_ = std::move(arena);
         } else {
             auto file = std::make_unique<FileExpertSource>();
             file->set_gguf(opt_.gguf);
-            if (const char* v = std::getenv("STRATA_FETCH_THREADS"))   // the prompt's read-ahead threads, as generate.cpp
+            if (const char* v = strata::env_get("FETCH_THREADS"))   // the prompt's read-ahead threads, as generate.cpp
                 if (const long n = std::strtol(v, nullptr, 10); n > 0) file->set_fetch_threads((int) std::min<long>(n, 256));
             if (!file->open(std::string(), L, E, err)) return false;
             src_own_ = std::move(file);
@@ -1220,12 +1221,12 @@ bool PlainModel::open_experts(std::string& err) {
             prompt_host_ = nullptr;
         }
         if (prompt_host_ == nullptr) {
-            std::fprintf(stderr, "strata plain: no pinned memory for the prompt path's chunks (%lld tokens asked): "
+            std::fprintf(stderr, "xestrata plain: no pinned memory for the prompt path's chunks (%lld tokens asked): "
                                  "prompts are read through the decode windows\n", (long long) asked);
             opt_.prompt_chunk = 0;
         } else {
             if (opt_.prompt_chunk != asked)
-                std::fprintf(stderr, "strata plain: the prompt path's chunks are %lld tokens (the pinned memory for %lld "
+                std::fprintf(stderr, "xestrata plain: the prompt path's chunks are %lld tokens (the pinned memory for %lld "
                                      "was not there)\n", (long long) opt_.prompt_chunk, (long long) asked);
             prompt_carve(opt_.prompt_chunk, pb_, nullptr, (uint8_t*) prompt_host_, db, hb);
         }
@@ -1296,7 +1297,7 @@ bool PlainModel::open_experts(std::string& err) {
                         : opt_.vram_segment_mib < 64 ? "--vram-segment-mib is below 64"
                         : !strata::gpu::vmem_supported() ? "this GPU's runtime has no virtual memory" : nullptr;
         if (why != nullptr) {
-            std::fprintf(stderr, "strata plain: --vram-elastic is off: %s\n", why);
+            std::fprintf(stderr, "xestrata plain: --vram-elastic is off: %s\n", why);
             opt_.vram_elastic = false;
         } else {
             cache_.set_segment_bytes(opt_.vram_segment_mib << 20);
@@ -1392,7 +1393,7 @@ bool PlainModel::open_experts(std::string& err) {
     int64_t filled = 0;
     if (!fill_tier(want, filled, err)) return false;
     if (!opt_.profile.empty())
-        std::fprintf(stderr, "strata plain: the VRAM tier filled from %s: %lld experts\n", opt_.profile.c_str(),
+        std::fprintf(stderr, "xestrata plain: the VRAM tier filled from %s: %lld experts\n", opt_.profile.c_str(),
                      (long long) filled);
     // the slots the prompt path lends for its longest chunk (prompt_borrow): their experts are kept in RAM too
     lend_from_ = -1;
@@ -1405,7 +1406,7 @@ bool PlainModel::open_experts(std::string& err) {
         while (off != nullptr && lend_from_ > lowest && off[n_slots_] - off[lend_from_] < db) --lend_from_;
     }
     if (!prompt_dev_.at.empty())
-        std::fprintf(stderr, "strata plain: the prompt's buffers beside the tier, chunks of up to %lld tokens\n",
+        std::fprintf(stderr, "xestrata plain: the prompt's buffers beside the tier, chunks of up to %lld tokens\n",
                      (long long) prompt_dev_T_);
     free_b_ = free_b;
     return true;
@@ -1455,11 +1456,11 @@ bool PlainModel::open_dense(std::string& err) {
             prompt_host_ = nullptr;
         }
         if (prompt_host_ == nullptr) {
-            std::fprintf(stderr, "strata plain: no memory for the prompt path's chunks (%lld tokens asked): prompts are "
+            std::fprintf(stderr, "xestrata plain: no memory for the prompt path's chunks (%lld tokens asked): prompts are "
                                  "read through the decode windows\n", (long long) asked);
             opt_.prompt_chunk = 0;
         } else if (opt_.prompt_chunk != asked) {
-            std::fprintf(stderr, "strata plain: the prompt path's chunks are %lld tokens (the memory for %lld was not "
+            std::fprintf(stderr, "xestrata plain: the prompt path's chunks are %lld tokens (the memory for %lld was not "
                                  "there)\n", (long long) opt_.prompt_chunk, (long long) asked);
         }
     }
@@ -1500,7 +1501,7 @@ void PlainModel::auto_prompt_chunk(uint64_t beside) {
     prompt_carve(c, pb_, nullptr, nullptr, db, hb);
     void* h = nullptr;
     if (!strata::gpu::alloc_host(&h, hb)) {
-        std::fprintf(stderr, "strata plain: prompt chunks of %lld tokens would fit the tier, but not their %llu MiB of "
+        std::fprintf(stderr, "xestrata plain: prompt chunks of %lld tokens would fit the tier, but not their %llu MiB of "
                              "pinned memory: %lld\n", (long long) c, (unsigned long long) (hb >> 20),
                      (long long) opt_.prompt_chunk);
         return;
@@ -1509,7 +1510,7 @@ void PlainModel::auto_prompt_chunk(uint64_t beside) {
     prompt_host_ = h;
     opt_.prompt_chunk = c;
     prompt_carve(c, pb_, nullptr, (uint8_t*) prompt_host_, db, hb);
-    std::fprintf(stderr, "strata plain: prompt chunks of %lld tokens (the largest the tier lends, --prompt-chunk sets "
+    std::fprintf(stderr, "xestrata plain: prompt chunks of %lld tokens (the largest the tier lends, --prompt-chunk sets "
                          "it)\n", (long long) c);
 }
 
@@ -1520,25 +1521,25 @@ void PlainModel::pinned_split() {
     // was read by the GPU's kernels; --no-pcie-split started and answered.  The cause is not known, so under WSL 2 the
     // split is off unless STRATA_WSL_PCIE_SPLIT=1 asks for it.
     static const bool wsl_split = [] {
-        const char* v = std::getenv("STRATA_WSL_PCIE_SPLIT");
+        const char* v = strata::env_get("WSL_PCIE_SPLIT");
         return v != nullptr && std::strtol(v, nullptr, 10) != 0;
     }();
     if (moe_local_.empty()) return;
     const char* keep = !opt_.pcie_split ? "--no-pcie-split"
                        : strata::platform::under_wsl() && !wsl_split
-                           ? "under WSL 2: the GPU reading the experts' RAM failed there; STRATA_WSL_PCIE_SPLIT=1 tries it"
+                           ? "under WSL 2: the GPU reading the experts' RAM failed there; XESTRATA_WSL_PCIE_SPLIT=1 tries it"
                            : nullptr;
     const bool fixed = opt_.pcie_frac >= 0.0 && opt_.pcie_split;
     if (fixed) keep = "--pcie-frac is given";
     const bool measured = setup_pcie_split(disp_, n_moe_, split_, false, keep, fixed ? opt_.pcie_frac : 0.0,
-                                           "strata plain");   // overlap: after the hits
+                                           "xestrata plain");   // overlap: after the hits
     if (fixed) {   // --pcie-frac: that share in every window, read where the GPU can read it
         disp_.pcie_split = nullptr;
         disp_.pcie_num = (int) std::lround(std::clamp(opt_.pcie_frac, 0.0, 1.0) * 256.0);
         pcie_probe_ = -1;
         std::string why;
         if (disp_.pcie_num > 0 && !src_->make_kernel_readable(why)) {
-            std::fprintf(stderr, "strata plain: the experts stay registered for copies (%s): the CPU takes every "
+            std::fprintf(stderr, "xestrata plain: the experts stay registered for copies (%s): the CPU takes every "
                                  "missed expert\n", why.c_str());
             disp_.pcie_num = 0;
         }
@@ -1547,7 +1548,7 @@ void PlainModel::pinned_split() {
     if (!measured) return;
     // the decode's PCIe share (its size from the times: pcie_split_m): chosen by the first windows (pcie_probe), which
     // Qwen3.8-Flash-Next's engine does not do; STRATA_PLAIN_DECODE_PCIE=1 / 0: on / off
-    if (const char* v = std::getenv("STRATA_PLAIN_DECODE_PCIE")) {
+    if (const char* v = strata::env_get("PLAIN_DECODE_PCIE")) {
         disp_.pcie_num = std::strtol(v, nullptr, 10) != 0 ? 256 : 0;
     } else {
         disp_.pcie_num = 256;
@@ -1561,7 +1562,7 @@ void PlainModel::pinned_split() {
     for (int f = 1; f <= 16 && !any; ++f) any = pcie_split_m(split_, false, f, f) > 0;
     std::string why;
     if (any && !src_->pcie_layer(split_.layer) && !src_->make_kernel_readable(why)) {
-        std::fprintf(stderr, "strata plain: the experts stay registered for copies (%s): the CPU takes every "
+        std::fprintf(stderr, "xestrata plain: the experts stay registered for copies (%s): the CPU takes every "
                              "missed expert\n", why.c_str());
         disp_.pcie_split = nullptr;
         disp_.pcie_num = 0;
@@ -1642,7 +1643,7 @@ bool PlainModel::open_helpers(std::string& err) {
             err.insert(0, "plain model: ");
             return false;
         }
-        std::fprintf(stderr, "strata plain: helper GPU %d holds %lld more experts (%.2f GiB), placed %s\n",
+        std::fprintf(stderr, "xestrata plain: helper GPU %d holds %lld more experts (%.2f GiB), placed %s\n",
                      helper_dev_[(size_t) r], (long long) h->resident(), h->gib(),
                      opt_.expert_cache_remote_placement.c_str());
         for (PlainModel* st : chain())
@@ -1655,7 +1656,7 @@ bool PlainModel::open_helpers(std::string& err) {
 void PlainModel::finish_experts() {
     if (dense_) {   // no experts: every stage's weights in its VRAM
         for (PlainModel* st : chain())
-            std::fprintf(stderr, "strata plain: a dense model, every weight in VRAM, %lld MiB free after it, prompt "
+            std::fprintf(stderr, "xestrata plain: a dense model, every weight in VRAM, %lld MiB free after it, prompt "
                                  "chunks of %lld tokens\n", (long long) (st->free_b_ >> 20), (long long) st->opt_.prompt_chunk);
         return;
     }
@@ -1692,7 +1693,7 @@ void PlainModel::finish_experts() {
                 for (int32_t l = 0; l < (int32_t) n_moe_; ++l) order.emplace_back(l, e);
         // STRATA_RESIDENT_PIN=0: never page-locked, 1: always; else as the RAM allows (#11), as generate.cpp
         using Pin = FileExpertSource::Pin;
-        const char* pin_env = std::getenv("STRATA_RESIDENT_PIN");
+        const char* pin_env = strata::env_get("RESIDENT_PIN");
         const Pin pin = opt_.resident_pageable || (pin_env != nullptr && std::strcmp(pin_env, "0") == 0) ? Pin::off
                         : pin_env != nullptr && std::strcmp(pin_env, "1") == 0                          ? Pin::on
                                                                                                          : Pin::automatic;
@@ -1701,13 +1702,13 @@ void PlainModel::finish_experts() {
         const uint64_t budget = opt_.resident_gib > 0 ? (uint64_t) (opt_.resident_gib * 1073741824.0)
                                                       : FileExpertSource::kResidentWhatFits;
         if (!file->pin_complement(n_slots_, held, slots, why, pin, others, lend_from_, headroom, budget, &order)) {
-            std::fprintf(stderr, "strata plain: the experts outside the VRAM tier do not fit in RAM (%s): read in "
+            std::fprintf(stderr, "xestrata plain: the experts outside the VRAM tier do not fit in RAM (%s): read in "
                                  "place\n", why.c_str());
         } else {
             if (opt_.adapt_every > 0 && opt_.adapt_swaps > 0 && !file->reserve_exchanges(opt_.adapt_swaps, why))
-                std::fprintf(stderr, "strata plain: no exchange buffers (%s): an expert the adaptive tier evicts is "
+                std::fprintf(stderr, "xestrata plain: no exchange buffers (%s): an expert the adaptive tier evicts is "
                                      "read in place after\n", why.c_str());
-            std::fprintf(stderr, "strata plain: the experts outside the VRAM tier in RAM: %.2f GiB (%lld experts%s)\n",
+            std::fprintf(stderr, "xestrata plain: the experts outside the VRAM tier in RAM: %.2f GiB (%lld experts%s)\n",
                          (double) file->resident_bytes() / 1073741824.0, (long long) file->resident_count(),
                          file->complement_pinned() ? ", pinned" : "");
             for (PlainModel* st : chain()) st->complement_ = file;
@@ -1730,7 +1731,7 @@ void PlainModel::finish_experts() {
             std::string ferr;
             const OnDevice on(st->dev_);
             const bool ok = st->fill_tier(want, filled, ferr);
-            std::fprintf(stderr, "strata plain: %s: %s's copies from RAM are pageable, its VRAM tier stays as it is "
+            std::fprintf(stderr, "xestrata plain: %s: %s's copies from RAM are pageable, its VRAM tier stays as it is "
                                  "filled now (%lld experts%s)\n", why.c_str(), strata::gpu::device_name(st->dev_).c_str(),
                          (long long) filled, ok ? "" : ("; " + ferr).c_str());
         }
@@ -1742,7 +1743,7 @@ void PlainModel::finish_experts() {
     }
     for (PlainModel* st : chain()) {
         const OnDevice on(st->dev_);
-        std::fprintf(stderr, "strata plain: %lld MoE layers x %lld experts, %lld VRAM slots (%lld a layer, %.2f GiB), "
+        std::fprintf(stderr, "xestrata plain: %lld MoE layers x %lld experts, %lld VRAM slots (%lld a layer, %.2f GiB), "
                              "%d CPU workers, %lld MiB free before the tier\n",
                      (long long) st->moe_local_.size(), (long long) E, (long long) st->n_slots_,
                      (long long) (st->moe_local_.empty() ? 0 : st->n_slots_ / (int64_t) st->moe_local_.size()),
@@ -1917,7 +1918,7 @@ bool PlainModel::kv_grow_to(int64_t cells, std::string& err) {
         if (!vram(reserve + (int64_t) (need >> 20) + 1, answer, err)) return false;
     }
     if (!kv_map(target, err)) return false;
-    std::fprintf(stderr, "strata plain: the K/V grown to %lld cells (%.2f GiB more); the expert tier %lld -> %lld slots, "
+    std::fprintf(stderr, "xestrata plain: the K/V grown to %lld cells (%.2f GiB more); the expert tier %lld -> %lld slots, "
                          "in %.0f ms\n", (long long) kv_cells_, (double) need / 1073741824.0, (long long) slots0,
                  (long long) cache_.slots(),
                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
@@ -1943,7 +1944,7 @@ bool PlainModel::kv_trim(int64_t cells, std::string& err) {
     kv_cells_ = pages * qs.page_size;
     std::string answer;
     if (cache_.segmented() && !vram(-1, answer, err)) return false;   // the tier takes the VRAM back
-    std::fprintf(stderr, "strata plain: the K/V trimmed from %lld to %lld cells; the expert tier %lld -> %lld slots\n",
+    std::fprintf(stderr, "xestrata plain: the K/V trimmed from %lld to %lld cells; the expert tier %lld -> %lld slots\n",
                  (long long) from, (long long) kv_cells_, (long long) slots0, (long long) cache_.slots());
     return true;
 }
@@ -2050,7 +2051,7 @@ bool PlainModel::vram(int64_t reserve_mib, std::string& answer, std::string& err
             if (!taken[(size_t) s]) free_[(size_t) slot_layer_[(size_t) s]].push_back((int32_t) s);
     }
     strata::gpu::mem_info(&free_b, &total_b);
-    std::fprintf(stderr, "strata plain: VRAM %lld MiB kept free: the expert tier %lld -> %lld of %lld slots (%.2f of "
+    std::fprintf(stderr, "xestrata plain: VRAM %lld MiB kept free: the expert tier %lld -> %lld of %lld slots (%.2f of "
                          "%.2f GiB), %lld MiB free now, in %.0f ms%s\n", (long long) reserve_mib, (long long) before,
                  (long long) cache_.slots(), (long long) cache_.full_slots(),
                  (double) cache_.mapped_bytes() / 1073741824.0, (double) cache_.full_bytes() / 1073741824.0,
@@ -2426,7 +2427,7 @@ bool PlainModel::alloc_batch_slots(std::string& err) {
     }
     bslot_snaps_ = snaps;
     if (!strata::gpu::stream_sync(cs_)) { err = std::string("plain model: ") + strata::gpu::last_error(); return false; }
-    std::fprintf(stderr, "strata plain: %d of %d batch slots (%zu MiB each%s)\n", (int) bslots_.size(),
+    std::fprintf(stderr, "xestrata plain: %d of %d batch slots (%zu MiB each%s)\n", (int) bslots_.size(),
                  opt_.batch_slots, one >> 20,
                  (int) bslots_.size() < opt_.batch_slots
                      ? opt_.batch_slots > opt_.max_t ? ", a window holds --max-t rows" : ", half the VRAM free at most"
@@ -2830,7 +2831,7 @@ void PlainModel::draft_logits(const int32_t* pos, strata::gpu::Stream cs) {
 }
 
 void PlainModel::setup_int2() {
-    const char* v = std::getenv("STRATA_DRAFT_INT2");
+    const char* v = strata::env_get("DRAFT_INT2");
     if (!has_mtp_ || n_mtp_ < 1 || head_.n_in % k::kInt2Group != 0 ||
         (v != nullptr && v[0] != 0 && std::strtol(v, nullptr, 10) == 0))
         return;
@@ -2848,7 +2849,7 @@ void PlainModel::setup_int2() {
     if (file_row == 0 || !h->build(type, n, head_.n_in, [&](int64_t i) {
             return src + (size_t) (dhead_ != nullptr ? dvocab_[(size_t) i] : i) * file_row;
         }, row, e)) {
-        std::fprintf(stderr, "strata plain: the drafts' head stays as it is (%s)\n", e.c_str());
+        std::fprintf(stderr, "xestrata plain: the drafts' head stays as it is (%s)\n", e.c_str());
         return;
     }
     const void* rows = dhead_ != nullptr ? dhead_ : head_.data;
@@ -2861,7 +2862,7 @@ void PlainModel::setup_int2() {
     const bool on = s != nullptr &&
                     h->choose(hn_, static_cast<const uint8_t*>(rows), exact,
                               [&](float* out, void* st) { exact(static_cast<const uint8_t*>(rows), (int) n, out, st); },
-                              logits_, s, "strata plain");
+                              logits_, s, "xestrata plain");
     if (s != nullptr) strata::gpu::stream_destroy(s);
     if (on) int2_ = std::move(h);
 }
@@ -3063,7 +3064,7 @@ bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const 
         return false;
     }
     const double win_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-    if (timing) step_form_.timed(win_ms, "strata plain", "the decode windows");
+    if (timing) step_form_.timed(win_ms, "xestrata plain", "the decode windows");
     pcie_probe_after(win_ms, T);
     if (disp_.failed) {
         err = std::string("plain model: the CPU experts: ") + (disp_.fail ? disp_.fail : "failed");
@@ -3335,11 +3336,11 @@ bool PlainModel::after_rows(int rows, int64_t pos0, std::string& err) {
         // a token, and scaling the decay to the period gave 36.3-37.9
         const double share = win > 0.0 ? pool / win : 0.0;
         if (spec_.arch == ModelArch::Qwen3Moe)
-            std::fprintf(stderr, "strata plain: adaptive tier every %lld tokens: the CPU pool took %.0f%% of the verify "
+            std::fprintf(stderr, "xestrata plain: adaptive tier every %lld tokens: the CPU pool took %.0f%% of the verify "
                                  "windows, and this model keeps the period (--adapt-every sets it)\n",
                          (long long) adapt_period_, 100.0 * share);
         else
-            set_adapt_period(auto_adapt_period(share, adapt_period_, from_files, "strata plain"));
+            set_adapt_period(auto_adapt_period(share, adapt_period_, from_files, "xestrata plain"));
     }
     // a round at fixed positions of the text (window-invariant swaps, #152), a layer split's stages in turn
     // (adapt_phase_), so that one's copies land before the next's
@@ -3363,7 +3364,7 @@ void PlainModel::set_adapt_period(int64_t period) {
 // thread (ram_adapt_round).  One GPU only: a layer split's stages share the copy.
 void PlainModel::ram_adapt() {
     static const int n = [] {
-        const char* e = std::getenv("STRATA_RAM_ADAPT");
+        const char* e = strata::env_get("RAM_ADAPT");
         return e != nullptr ? std::max(0, (int) std::strtol(e, nullptr, 10)) : 0;
     }();
     if (n <= 0 || complement_ == nullptr || !complement_->complement_ready() || disp_.usage.empty() ||
@@ -3417,7 +3418,7 @@ void PlainModel::pcie_probe_after(double ms, int T) {
     const double b = pcie_probe_ms_[0] / (double) std::max<int64_t>(pcie_probe_tok_[0], 1);
     disp_.pcie_num = a <= b ? 256 : 0;
     pcie_probe_ = -1;
-    std::fprintf(stderr, "strata plain: the decode's PCIe share: %.2f ms a token with it, %.2f without: %s\n", a, b,
+    std::fprintf(stderr, "xestrata plain: the decode's PCIe share: %.2f ms a token with it, %.2f without: %s\n", a, b,
                  a <= b ? "on" : "off");
 }
 
@@ -3612,8 +3613,8 @@ bool PlainModel::pipelined_spec() const {
 // Measured on that pair only.
 float PlainModel::pl_theta() {
     static const float t = [] {
-        const char* dbg = std::getenv("STRATA_PIPELINE_DEBUG");
-        const char* v = dbg != nullptr && std::strcmp(dbg, "1") == 0 ? std::getenv("STRATA_PIPELINE_THETA") : nullptr;
+        const char* dbg = strata::env_get("PIPELINE_DEBUG");
+        const char* v = dbg != nullptr && std::strcmp(dbg, "1") == 0 ? strata::env_get("PIPELINE_THETA") : nullptr;
         return v != nullptr ? (float) std::strtod(v, nullptr) : 0.5f;
     }();
     return t;

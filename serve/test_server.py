@@ -127,14 +127,14 @@ class MaxTokens(unittest.TestCase):
         self.assertEqual(b["input_tokens"], n_in)
 
     def test_request_line_parses_the_engine_summary(self):
-        line = ("strata serve: prompt 1200 tokens = 1000 reused + 200 read in 50 ms (4000.0 tok/s), 30 generated in "
+        line = ("xestrata serve: prompt 1200 tokens = 1000 reused + 200 read in 50 ms (4000.0 tok/s), 30 generated in "
                 "300 ms (100.0 tok/s), drafts accepted 20 of 28, 2 checkpoints")
         from serve.server import ENGINE_REQUEST
         m = ENGINE_REQUEST.search(line)
         self.assertIsNotNone(m)
         self.assertEqual((m["prompt"], m["reused"], m["gen"], m["tg"]), ("1200", "1000", "30", "100.0"))
         # #471: a request cancelled while its prompt was read says how far it got
-        m = ENGINE_REQUEST.search("strata serve: prompt 98179 tokens = 0 reused + 12288 of 98179 read in 17565 ms "
+        m = ENGINE_REQUEST.search("xestrata serve: prompt 98179 tokens = 0 reused + 12288 of 98179 read in 17565 ms "
                                   "(699.6 tok/s), 0 generated in 0 ms (0.0 tok/s), drafts accepted 0 of 0, "
                                   "0 checkpoints (cancelled)")
         self.assertIsNotNone(m)
@@ -268,7 +268,7 @@ class MaxTokens(unittest.TestCase):
     def test_debug_log_shows_the_resolved_budget(self):
         import contextlib
         import io
-        os.environ["STRATA_DEBUG"] = "1"
+        os.environ["XESTRATA_DEBUG"] = "1"
         try:
             for api in ("openai",):                 # (Anthropic's max_tokens is required: no unset budget there)
                 with self.subTest(api=api):
@@ -277,7 +277,7 @@ class MaxTokens(unittest.TestCase):
                         _, _, pt, _ = self.call(api, max_tokens=-1)
                     self.assertIn(f"max_new={CTX - CTX_SLACK - pt} ", out.getvalue())
         finally:
-            del os.environ["STRATA_DEBUG"]
+            del os.environ["XESTRATA_DEBUG"]
 
 
 class FitMaxTokens(unittest.TestCase):
@@ -753,7 +753,7 @@ class VisionWorkDir(unittest.TestCase):
 
         pipe = Pipe()
         v = Vision.__new__(Vision)
-        v.dir, v.lock, v.cache = Path(tempfile.mkdtemp(prefix="strata-vision-test-")), threading.Lock(), {}
+        v.dir, v.lock, v.cache = Path(tempfile.mkdtemp(prefix="xestrata-vision-test-")), threading.Lock(), {}
         v.proc = mock.Mock(stdin=pipe, stdout=mock.Mock(readline=lambda: "OK 7 1 1 1\n"))
         v.dead, v._line = None, lambda timeout: "OK 7 1 1 1\n"
         try:
@@ -797,7 +797,7 @@ class VisionWorkDir(unittest.TestCase):
             err.winerror = code
             with self.subTest(winerror=code), mock.patch.object(subprocess, "Popen", side_effect=err):
                 with self.assertRaises(OSError) as cm:
-                    popen("the image encoder", ["strata-vision.exe"])
+                    popen("the image encoder", ["xestrata-vision.exe"])
                 self.assertIn("Smart App Control", str(cm.exception))
                 self.assertIn("--vision no", str(cm.exception))
         with mock.patch.object(subprocess, "Popen", side_effect=FileNotFoundError("gone")):
@@ -1139,7 +1139,7 @@ class ConfigApiKey(unittest.TestCase):
         err = io.StringIO()
         with tempfile.TemporaryDirectory() as d, mock.patch.dict(os.environ), \
                 mock.patch.object(S, "serve", fake_serve), mock.patch.object(sys, "stderr", new=err):
-            os.environ.pop("STRATA_API_KEY", None)
+            os.environ.pop("XESTRATA_API_KEY", None)
             p = Path(d) / "cfg.json"
             p.write_text(json.dumps(cfg), encoding="utf-8")
             with mock.patch.object(sys, "argv", ["server.py", "--engine", "mock", "--port", "0", "--config", str(p)]):
@@ -1748,7 +1748,7 @@ class ClientShapes(unittest.TestCase):
                 pass
 
         v = Vision.__new__(Vision)
-        v.dir, v.lock, v.cache = Path(tempfile.mkdtemp(prefix="strata-vision-test-")), threading.Lock(), {}
+        v.dir, v.lock, v.cache = Path(tempfile.mkdtemp(prefix="xestrata-vision-test-")), threading.Lock(), {}
         v.proc, v.dead = mock.Mock(stdin=Gone()), None
         with mock.patch.object(Vision, "load", return_value=b""), \
                 mock.patch.object(Vision, "normalize", return_value=b"png"):
@@ -2817,24 +2817,24 @@ class DraftHeadHint(unittest.TestCase):
         return str(p), len(before.encode())
 
     def test_the_engines_hint_is_relayed(self):
-        p, off = self.log("strata mtp: the draft head over 106299 tokens needs 348 MiB of VRAM and 120 MiB is free.\n"
-                          "strata mtp: hint: a smaller draft vocabulary needs less VRAM: --draft-vocab en (...)\n"
-                          "strata serve: mtp: the draft head does not fit\n")
+        p, off = self.log("xestrata mtp: the draft head over 106299 tokens needs 348 MiB of VRAM and 120 MiB is free.\n"
+                          "xestrata mtp: hint: a smaller draft vocabulary needs less VRAM: --draft-vocab en (...)\n"
+                          "xestrata serve: mtp: the draft head does not fit\n")
         h = start_failure_hint(p, off)
         self.assertIn("the draft head does not fit", h)
         self.assertIn("348 MiB", h)
         self.assertIn("--draft-vocab en", h)
 
     def test_an_older_engine_gets_the_advice_in_words(self):
-        p, off = self.log("strata serve: mtp: the draft head does not fit\n")
+        p, off = self.log("xestrata serve: mtp: the draft head does not fit\n")
         self.assertIn("--draft-vocab en", start_failure_hint(p, off))
 
     def test_other_failures_and_earlier_starts_add_nothing(self):
-        p, off = self.log("strata serve: cannot open the pack\n")
+        p, off = self.log("xestrata serve: cannot open the pack\n")
         self.assertEqual(start_failure_hint(p, off), "")
         # an earlier start's failure (before this start's offset) is not this one's
-        p, off = self.log("strata serve: cannot open the pack\n",
-                          before="strata serve: mtp: the draft head does not fit\n")
+        p, off = self.log("xestrata serve: cannot open the pack\n",
+                          before="xestrata serve: mtp: the draft head does not fit\n")
         self.assertEqual(start_failure_hint(p, off), "")
         self.assertEqual(start_failure_hint(None, 0), "")
         self.assertEqual(start_failure_hint(str(Path(tempfile.mkdtemp()) / "missing.log"), 0), "")
@@ -2847,9 +2847,9 @@ class StartFailureLog(unittest.TestCase):
         from serve.server import start_log_tail
         d = tempfile.mkdtemp()
         p = Path(d) / "engine.log"
-        before = "strata serve: an earlier start's line\n"
-        p.write_text(before + "".join(f"strata serve: line {i}\n" for i in range(30)) + "\n"
-                     "strata serve: cannot open the pack\n", encoding="utf-8")
+        before = "xestrata serve: an earlier start's line\n"
+        p.write_text(before + "".join(f"xestrata serve: line {i}\n" for i in range(30)) + "\n"
+                     "xestrata serve: cannot open the pack\n", encoding="utf-8")
         tail = start_log_tail(str(p), len(before.encode()))
         self.assertIn("the engine log's last lines:", tail)
         self.assertIn("cannot open the pack", tail)
@@ -2865,7 +2865,7 @@ class StartFailureLog(unittest.TestCase):
 
     def test_the_start_error_has_them(self):
         import serve.server as server
-        fake = "import sys\nsys.stderr.write('strata serve: cannot open the pack packs/x\\n')\nsys.exit(2)\n"
+        fake = "import sys\nsys.stderr.write('xestrata serve: cannot open the pack packs/x\\n')\nsys.exit(2)\n"
         with tempfile.TemporaryDirectory() as d:
             script, log = Path(d) / "fake_strata.py", Path(d) / "strata.log"
             script.write_text(fake, encoding="utf-8")
@@ -2913,14 +2913,14 @@ class StartNarrator(unittest.TestCase):
         return out.getvalue()
 
     def test_a_mapped_start(self):
-        said = self.narrate(["--mmap-experts"], ["strata generate: experts via mmap (--mmap-experts; the GGUF shards "
+        said = self.narrate(["--mmap-experts"], ["xestrata generate: experts via mmap (--mmap-experts; the GGUF shards "
                                                  "in place, no experts.bin)"])
         self.assertIn("mapping the experts from the model files", said)
         self.assertNotIn("loading the experts into RAM", said)
 
     def test_an_arena_start(self):
-        said = self.narrate([], ["strata generate: expert arena: resident, 31.64 GiB",
-                                 "strata generate: loaded 31.64 GiB at 3.17 GiB/s"])
+        said = self.narrate([], ["xestrata generate: expert arena: resident, 31.64 GiB",
+                                 "xestrata generate: loaded 31.64 GiB at 3.17 GiB/s"])
         self.assertIn("loading the experts into RAM (tens of GB)", said)
         self.assertIn("experts loaded: 31.64 GiB at 3.17 GiB/s", said)
 
@@ -3136,8 +3136,8 @@ class LiveRate(unittest.TestCase):
 
 
 class KeptReplies(unittest.TestCase):
-    """A web app's reply (strata_reply) lives on past its connection: a client whose connection broke reads the rest
-    again (GET /v1/strata/replies/<id>), and only its own cancel stops it (the web app's Stop)."""
+    """A web app's reply (xestrata_reply) lives on past its connection: a client whose connection broke reads the rest
+    again (GET /v1/xestrata/replies/<id>), and only its own cancel stops it (the web app's Stop)."""
 
     TOKENS = 120
     PACE_S = 0.01                    # about 1.2 s for the whole answer
@@ -3160,7 +3160,8 @@ class KeptReplies(unittest.TestCase):
         return c, c.getresponse()
 
     def chat(self, rid):
-        return self.request("POST", "/v1/chat/completions", {"model": "m", "stream": True, "strata_reply": {"id": rid},
+        return self.request("POST", "/v1/chat/completions", {"model": "m", "stream": True,
+                                                             "xestrata_reply": {"id": rid},
                                                              "messages": [{"role": "user", "content": "hi"}]})
 
     @staticmethod
@@ -3182,7 +3183,7 @@ class KeptReplies(unittest.TestCase):
         while not reply.done and time.time() - t0 < 10:
             time.sleep(0.02)
         self.assertTrue(reply.done)                      # made to the end without its client
-        c, r = self.request("GET", "/v1/strata/replies/kept-drop-0001?from=0")
+        c, r = self.request("GET", "/v1/xestrata/replies/kept-drop-0001?from=0")
         raw = r.read()
         self.assertEqual(r.status, 200)
         self.assertEqual(self.text(raw), "y" * self.TOKENS)
@@ -3192,7 +3193,7 @@ class KeptReplies(unittest.TestCase):
     def test_its_cancel_stops_it(self):
         c, r = self.chat("kept-cancel-0001")
         r.read1(256)
-        c2, r2 = self.request("POST", "/v1/strata/replies/kept-cancel-0001/cancel", {})
+        c2, r2 = self.request("POST", "/v1/xestrata/replies/kept-cancel-0001/cancel", {})
         self.assertEqual(r2.status, 200)
         self.assertEqual(json.loads(r2.read()), {"cancelled": True})
         raw = r.read()                                   # the stream ends, short of the whole answer
@@ -3205,9 +3206,45 @@ class KeptReplies(unittest.TestCase):
         c, r = self.chat("bad id!")
         self.assertEqual(r.status, 400)
         c.close()
-        c, r = self.request("GET", "/v1/strata/replies/no-such-reply-0001")
+        c, r = self.request("GET", "/v1/xestrata/replies/no-such-reply-0001")
         self.assertEqual(r.status, 404)
         c.close()
+
+    def test_the_earlier_names(self):
+        """The names before XeStrata's own (strata_reply, /v1/strata/..., strata_images, X-Strata-Upload, STRATA_*)
+        reach what the new ones do."""
+        from serve import envvars
+        c, r = self.request("POST", "/v1/chat/completions", {"model": "m", "stream": True,
+                                                             "strata_reply": {"id": "kept-old-0001"},
+                                                             "messages": [{"role": "user", "content": "hi"}]})
+        r.read()
+        c.close()
+        c, r = self.request("GET", "/v1/strata/replies/kept-old-0001?from=0")
+        self.assertEqual((r.status, self.text(r.read())), (200, "y" * self.TOKENS))
+        c.close()
+        c, r = self.request("POST", "/v1/strata/replies/kept-old-0001/ack", {})
+        self.assertEqual(r.status, 200)
+        c.close()
+        for field in ("strata_images", "xestrata_images"):   # this server makes no images: the same refusal
+            c, r = self.request("POST", "/v1/chat/completions", {"model": "m", field: {"force": True},
+                                                                 "messages": [{"role": "user", "content": "hi"}]})
+            self.assertEqual(r.status, 400)
+            self.assertIn("xestrata_images.force", json.loads(r.read())["error"]["message"])
+            c.close()
+        import http.client
+        seen = {}
+        for header in ("X-Strata-Upload", "X-XeStrata-Upload", None):   # the Video tab's form from the own page
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+            c.request("POST", "/v1/videos/files", b"--b--\r\n",
+                      {"Content-Type": "multipart/form-data; boundary=b", "Origin": f"http://127.0.0.1:{self.port}",
+                       **({header: "1"} if header else {})})
+            seen[header] = c.getresponse().status
+            c.close()
+        self.assertEqual(seen["X-Strata-Upload"], seen["X-XeStrata-Upload"])
+        self.assertEqual(seen[None], 415)                # without the header the form is refused
+        self.assertNotEqual(seen["X-Strata-Upload"], 415)
+        self.assertEqual(envvars.get("GDN_TC", env={"STRATA_GDN_TC": "1"}), "1")
+        self.assertEqual(envvars.get("GDN_TC", env={"STRATA_GDN_TC": "1", "XESTRATA_GDN_TC": "0"}), "0")
 
 
 class PromptProgress(unittest.TestCase):
@@ -3732,7 +3769,7 @@ class WebApp(unittest.TestCase):
         try:
             props = json.loads(self.get("/props")[2])
             self.assertEqual(props["model_path"], engine.model_path)
-            self.assertEqual(props["build_info"], "Strata 0.1.21")
+            self.assertEqual(props["build_info"], "XeStrata 0.1.21")
             for busy in (True, False):
                 with self.svc.status_lock:
                     self.svc.status["busy"] = busy
@@ -5111,14 +5148,14 @@ class SilentEngine(unittest.TestCase):
         self.assertNotIn("STOP", engine.proc.stdin.getvalue())    # nothing is listening: no STOP, no drain
 
     def test_death_note_finds_the_watchdog_line_under_a_long_trace(self):
-        # #1705: STRATA_VERIFY_TRACE dumps (~30 KB) after the watchdog's line must not hide it
+        # #1705: XESTRATA_VERIFY_TRACE dumps (~30 KB) after the watchdog's line must not hide it
         import tempfile
         engine = self.bare(0.3)
         with tempfile.TemporaryDirectory() as d:
             engine.log_path = os.path.join(d, "e.log")
             with open(engine.log_path, "w", encoding="utf-8") as f:
-                f.write("strata serve: no progress for 60 s during a request (issue #29)\n")
-                f.write("strata verify trace: dump\n" * 1500)
+                f.write("xestrata serve: no progress for 60 s during a request (issue #29)\n")
+                f.write("xestrata verify trace: dump\n" * 1500)
             engine.proc.poll.return_value = -6
             self.assertIn("a hang it caught", engine.death_note())
 
@@ -5743,7 +5780,7 @@ class VisionArgs(unittest.TestCase):
             return Proc()
 
         with mock.patch.object(server.subprocess, "Popen", popen):
-            server.Vision({"exe": "strata-vision", "mmproj": "m.gguf", "model": "t.gguf", **cfg})
+            server.Vision({"exe": "xestrata-vision", "mmproj": "m.gguf", "model": "t.gguf", **cfg})
         return seen[0]
 
     def test_min_tokens_is_passed_only_when_set(self):
@@ -5863,7 +5900,7 @@ class LazyVision(unittest.TestCase):
             return p
 
         with mock.patch.object(server, "popen", popen):
-            v = server.Vision({"exe": "strata-vision", "mmproj": "m.gguf", "model": "t.gguf"}, lazy=True)
+            v = server.Vision({"exe": "xestrata-vision", "mmproj": "m.gguf", "model": "t.gguf"}, lazy=True)
             self.addCleanup(lambda: shutil.rmtree(v.dir, ignore_errors=True))
             return v, started, popen
 
@@ -5915,7 +5952,7 @@ class VisionShutdown(unittest.TestCase):
     def test_shutdown_removes_the_work_dir_but_close_keeps_it(self):
         import serve.server as server
         with tempfile.TemporaryDirectory() as t:
-            d = Path(t) / "strata-vision-x"
+            d = Path(t) / "xestrata-vision-x"
             d.mkdir()
             (d / "k.sve").write_bytes(b"x")
             v = server.Vision.__new__(server.Vision)
@@ -6094,7 +6131,7 @@ class UntimedReads(unittest.TestCase):
 
     def silent_vision(self, server, silent):
         v = server.Vision.__new__(server.Vision)
-        v.dir, v.lock, v.cache, v.dead = Path(tempfile.mkdtemp(prefix="strata-vision-test-")), threading.Lock(), {}, \
+        v.dir, v.lock, v.cache, v.dead = Path(tempfile.mkdtemp(prefix="xestrata-vision-test-")), threading.Lock(), {}, \
             None
         v.stopped = False
         v.proc = SimpleNamespace(stdin=io.StringIO(), stdout=silent, kill=silent.kill, terminate=silent.kill,
@@ -6128,8 +6165,8 @@ class UntimedReads(unittest.TestCase):
         proc = SimpleNamespace(stdin=io.StringIO(), stdout=silent, kill=silent.kill, terminate=silent.kill,
                                wait=silent.wait, poll=lambda: None)
         v = server.Vision.__new__(server.Vision)
-        v.spawn = (["strata-vision"], None, None)
-        v.dir = Path(tempfile.mkdtemp(prefix="strata-vision-test-"))
+        v.spawn = (["xestrata-vision"], None, None)
+        v.dir = Path(tempfile.mkdtemp(prefix="xestrata-vision-test-"))
         try:
             with mock.patch.object(server, "popen", lambda *a, **k: proc), \
                     mock.patch.object(server, "VISION_READY_S", 0.3):

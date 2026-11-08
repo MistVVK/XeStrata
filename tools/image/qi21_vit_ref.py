@@ -1,25 +1,26 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """tools/image/qi21_vit_ref.py - a NumPy reference of Qwen-Image-2.1's vision encoder (Qwen3-VL's ViT, the mmproj
-GGUF) in double precision (the attention in single), to tell which of strata-image and stable-diffusion.cpp is the
+GGUF) in double precision (the attention in single), to tell which of xestrata-image and stable-diffusion.cpp is the
 nearer one where they differ.
 
-    STRATA_GGUF_PY=<llama.cpp>/gguf-py python tools/image/qi21_vit_ref.py MMPROJ.gguf DUMP_DIR [OUT_DIR]
+    XESTRATA_GGUF_PY=<llama.cpp>/gguf-py python tools/image/qi21_vit_ref.py MMPROJ.gguf DUMP_DIR [OUT_DIR]
 
 DUMP_DIR: a stable-diffusion.cpp run's dump (vit_in_0.bin, [3][H][W] FP32 in -1 .. 1; vit_out_0_K.bin, K = 0 the
 embeddings, 1.. the DeepStack blocks).  Prints how far the run's values are from the reference; OUT_DIR gets the
-reference's as ref_out_K.bin (FP32), which strata-image-vision-probe can read in place of the run's.
+reference's as ref_out_K.bin (FP32), which xestrata-image-vision-probe can read in place of the run's.
 """
 from __future__ import annotations
 
 import math
-import os
 import sys
 from pathlib import Path
 
 import numpy as np
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # the checkout, for serve/envvars.py
+from serve import envvars  # noqa: E402
 
-sys.path.insert(0, os.environ.get("STRATA_GGUF_PY", ""))
+sys.path.insert(0, envvars.get("GGUF_PY", ""))
 import gguf  # noqa: E402
 
 

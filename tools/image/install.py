@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """tools/image/install.py - image generation (Qwen-Image-2.1-Turbo, Qwen-Image-2.1, Mage-Flow, HunyuanImage 3.0 or
 MOSS-Image) for an existing XeStrata install: downloads and checks the model files for the image engine setup compiled
-with the text engine (engine/strata-image), and writes the "images" section into a run config (or prints it), as
+with the text engine (engine/xestrata-image), and writes the "images" section into a run config (or prints it), as
 setup.py --images does inside the normal setup (setup.py's setup_images).
 
     python tools/image/install.py --config ~/.config/xestrata/xestrata-iq3_xxs.json
@@ -97,8 +97,8 @@ def main(argv=None) -> int:
     ns.ram_reserve_gib = rr
     eng = Path(cfg["exe"]).parent if cfg.get("exe") else ROOT / "engine"     # the text engine's folder
     # the RAM the text model of that config keeps (its size by the name setup gave it), none without a config; a
-    # model of PLAIN_FAMILIES (`strata --native`) as setup_plain estimates it, its GGUF the file a text encoder can
-    # share (MOSS-Image's Qwen3.5-9B)
+    # model of PLAIN_FAMILIES (`xestrata-engine --native`) as setup_plain estimates it, its GGUF the file a text encoder
+    # can share (MOSS-Image's Qwen3.5-9B)
     args = cfg.get("args") or []
     native = Path(args[args.index("--native") + 1]) if "--native" in args[:-1] else None
     name = str(cfg.get("model_name", "")).lower()

@@ -5,13 +5,13 @@ place: what is measured and how the runs are made, alternated and read.
 
 Three ways of running an engine:
 
-- generate: `strata --tokens-file`, one new process a run, 256 greedy tokens after a tier's code-agent prompt; with two
-  engines, upstream's first run of a tier writes the text every later run follows (--spec-follow).
-- serve: `strata --serve` over stdin (GEN, DONE), one new process a run: a chat of four turns, the tier's prompt and
-  three follow-ups, 256 tokens a turn, greedy or at a temperature (t07 = 0.7, the default).
+- generate: `xestrata-engine --tokens-file`, one new process a run, 256 greedy tokens after a tier's code-agent
+  prompt; with two engines, upstream's first run of a tier writes the text every later run follows (--spec-follow).
+- serve: `xestrata-engine --serve` over stdin (GEN, DONE), one new process a run: a chat of four turns, the tier's
+  prompt and three follow-ups, 256 tokens a turn, greedy or at a temperature (t07 = 0.7, the default).
 - usage: the engine's own serve/server.py, streamed /v1/chat/completions: two short chats and a coding agent, at
   the temperature Qwen recommends (0.7) or another.
-- image: the engine's image generator as its server runs it (its serve/images.py: XeStrata's resident strata-image,
+- image: the engine's image generator as its server runs it (its serve/images.py: XeStrata's resident xestrata-image,
   measured warm; upstream's sd-cli, a process a request), one 1024x1024 image of the model card's 8 steps from a
   fixed prompt and seed.
 
@@ -353,7 +353,8 @@ def output_ids(text: str) -> str | None:
 
 def engine_error(text: str) -> str | None:
     lines = [x.strip() for x in text.splitlines() if x.strip() and not x.startswith(("#", "PP ", "T "))]
-    return next((x for x in reversed(lines) if x.startswith(("strata", "ERR"))), lines[-1] if lines else None)
+    heads = ("xestrata", "strata", "ERR")   # upstream's engine says strata
+    return next((x for x in reversed(lines) if x.startswith(heads)), lines[-1] if lines else None)
 
 
 def generate_row(text: str) -> dict:
@@ -371,7 +372,7 @@ def generate_row(text: str) -> dict:
     if stopped == "output" and pp and pp[-1][0] == pp[-1][1]:
         row["prefill_tok_s"] = float(pp[-1][2])
     elif stopped == "output" and not pp:
-        row["prefill_tok_s"] = grab(r"^strata generate: prefill \d+ tokens in .*?\(([\d.]+) tok/s\)", text)
+        row["prefill_tok_s"] = grab(r"^(?:xe)?strata generate: prefill \d+ tokens in .*?\(([\d.]+) tok/s\)", text)
     return row
 
 
@@ -392,7 +393,7 @@ def watch_generate(p: subprocess.Popen, log: Path, slow: float, owner: str) -> s
             continue
         pp = re.findall(r"^PP (\d+) (\d+) (\d+) ([\d.]+)$", text, re.M)
         if not pp:
-            if not re.search(r"^strata generate: prefill \d+ tokens in", text, re.M):
+            if not re.search(r"^(?:xe)?strata generate: prefill \d+ tokens in", text, re.M):
                 continue
             pp = [("1", "1", "0", "0")]
         done, total, ms, rate = int(pp[-1][0]), int(pp[-1][1]), int(pp[-1][2]), pp[-1][3]
@@ -633,7 +634,8 @@ def run_usage(e: Engine, cfg: dict, seed: int, agent_files: list[str], stem: Pat
     cfg = {**{k: v for k, v in cfg.items() if k not in ("api_key", "host", "port", "args")}, "port": port,
            "args": e.run_args(cfg["args"])}
     cpath = stem.with_name(stem.name + ".config.json")
-    cmd = [e.py, str(Path(e.root or ROOT) / e.server), "--engine", "strata", "--config", str(cpath),
+    # upstream's server takes strata only, XeStrata's both
+    cmd = [e.py, str(Path(e.root or ROOT) / e.server), "--engine", "strata", "--config", str(cpath),  # upstream
            "--port", str(port), "--host", "127.0.0.1"]
     if dry:
         print("DRY usage " + shlex.join(cmd) + " | " + json.dumps(cfg, sort_keys=True), flush=True)
@@ -904,7 +906,7 @@ IMAGE_REQUEST = {"prompt": "A red fox sitting in a snowy forest at dawn, photogr
 # Run by the engine tree's own Python with its tools/image/qimage.py and serve/images.py (both trees have modules of
 # those names, so each in a process of its own).  "make": the config section its setup writes for this GPU (with
 # setup's timed choices where the tree makes them, qimage.tune); "run": one image as its server makes it.  A tree whose
-# server keeps a resident image engine (XeStrata's strata-image) starts it and makes a warm-up image of another prompt
+# server keeps a resident image engine (XeStrata's xestrata-image) starts it and makes a warm-up image of another prompt
 # first, so the image measured is one the server makes while it runs ("cold_s": the warm-up's, with the start); one
 # whose server runs sd-cli for each request (upstream's) runs that command once.
 IMAGE_RUNNER = r"""
@@ -955,7 +957,7 @@ if hasattr(IM, "ImageEngine"):
     Path(job["log"]).write_text(json.dumps(fig, indent=1) + "\n")
     print(json.dumps({"rc": 0, "seconds": round(wall, 2), "cold_s": round(cold, 2),
                       "text_s": round(fig["text_encode_ms"] / 1000, 3), "sampling_s": fig["sampling_s"],
-                      "decode_s": fig["vae_decode_s"], "backend": "strata-image"}))
+                      "decode_s": fig["vae_decode_s"], "backend": "xestrata-image"}))
     sys.exit(0)
 cmd = IM.sd_cli_args(cfg, IM.parse_request(dict(job["request"]), cfg), job["png"])
 t0 = time.monotonic()

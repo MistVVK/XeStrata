@@ -21,8 +21,8 @@ models:
   xestrata:
     cmd: >-
       sh -c 'cd /path/to/XeStrata && exec .venv/bin/python -m serve.server
-      --engine strata --config xestrata-<model>.json --port ${PORT}'
-    env: ["STRATA_ALLOWED_HOSTS=my-server"]     # the host name your clients use -- see below
+      --engine xestrata-engine --config xestrata-<model>.json --port ${PORT}'
+    env: ["XESTRATA_ALLOWED_HOSTS=my-server"]     # the host name your clients use -- see below
     checkEndpoint: /health
     ttl: 1800
 ```
@@ -44,7 +44,7 @@ llama-swap passes the client's Host header through, so a client that reaches the
 Requests by IP address and to `localhost` always pass, which is why it can work in a quick test and fail from another machine.
 Any one of these fixes it:
 
-- `STRATA_ALLOWED_HOSTS=my-server` in the entry's `env` (comma-separated names; ports are ignored)
+- `XESTRATA_ALLOWED_HOSTS=my-server` in the entry's `env` (comma-separated names; ports are ignored)
 - `"allowed_hosts": ["my-server"]` in `xestrata-<model>.json`
 - an `"api_key"`, which turns the check off (then every client must send the key)
 

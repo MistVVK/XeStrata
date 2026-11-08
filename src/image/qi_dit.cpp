@@ -19,6 +19,7 @@
 #include "strata/core/runtime.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/native_qsa.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -262,7 +263,7 @@ bool QiDit::open(const std::string& path, void* stream, std::string& err, bool d
             }) == 1;
         };
         uint64_t w8t_bytes = 0;
-        if (std::getenv("STRATA_NO_W8A8") == nullptr && prefill::Gemm::i8_usable(s_) && w8_not_slower()) {
+        if (strata::env_get("NO_W8A8") == nullptr && prefill::Gemm::i8_usable(s_) && w8_not_slower()) {
             for (Block& b : blocks_)
                 for (W* w : {&b.q, &b.k, &b.v, &b.o, &b.gu, &b.down}) {
                     w->w8 = w->k % kQiRotate == 0 &&

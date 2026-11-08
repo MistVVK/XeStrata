@@ -16,6 +16,7 @@
 #include "strata/kernels/canon_math.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
+#include "strata/platform/env.hpp"
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -228,7 +229,7 @@ template <class F> void with_nt(int nt, F&& f) {
         case 7: f(std::integral_constant<int, 7>{}); break;
         case 8: f(std::integral_constant<int, 8>{}); break;
         default:   // the arrays a job's tokens fill hold 8 (#45: a ninth wrote past them, and the pool faulted)
-            std::fprintf(stderr, "strata: an expert job of %d tokens reached the CPU kernels, which take 1 to 8\n", nt);
+            std::fprintf(stderr, "xestrata: an expert job of %d tokens reached the CPU kernels, which take 1 to 8\n", nt);
             std::abort();
     }
 }
@@ -237,7 +238,7 @@ template <class F> void with_nt(int nt, F&& f) {
 
 bool canon_layer(const NativeFmt& f) {
     static const bool on = [] {   // STRATA_CANON=0: the CPU's former kernels (comparisons; no longer the GPU's bits)
-        const char* v = std::getenv("STRATA_CANON");
+        const char* v = strata::env_get("CANON");
         return v == nullptr || v[0] != '0';
     }();
     const auto gu_ok = [](int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 23 || t == 42; };
@@ -253,7 +254,7 @@ void canon_quant(const float* x, int64_t n, int group, void* dst, CanonOrder ord
     float* ds = static_cast<float*>(dst);
     int32_t* sums = reinterpret_cast<int32_t*>(ds + n / group);   // one for each 32
     int8_t* q = static_cast<int8_t*>(dst) + qs_offset(n, group);
-    static const bool scalar = std::getenv("STRATA_CANON_SCALAR") != nullptr;   // the reference loops (A/B)
+    static const bool scalar = strata::env_get("CANON_SCALAR") != nullptr;   // the reference loops (A/B)
     if (scalar) {
         for (int64_t g0 = 0; g0 < n; g0 += group) {
             float amax = 0.0f;
@@ -336,7 +337,7 @@ void canon_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* a
         for (int t = 0; t < nt; ++t) qs32[t] = act_sums(act[t], n, QK_K);
     // iq_avx2's canonical rows (or the reference loops of IQ2_XS, A/B), a chunk of rows at a time for the gate and the
     // up rows, then the SwiGLU
-    static const bool scalar_env = std::getenv("STRATA_CANON_SCALAR") != nullptr;
+    static const bool scalar_env = strata::env_get("CANON_SCALAR") != nullptr;
     const bool scalar = scalar_env && f.gu_type == up_type && (f.gu_type == 17 || f.gu_type == 42);
     constexpr int kChunk = 32;
     float gb[8][kChunk], ub[8][kChunk];
@@ -403,7 +404,7 @@ void canon_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const*
         x[t] = act_values(hq[t], n, QK4_NL);
         dx[t] = act_scales(hq[t]);
     }
-    static const bool scalar = std::getenv("STRATA_CANON_SCALAR") != nullptr;
+    static const bool scalar = strata::env_get("CANON_SCALAR") != nullptr;
     if (f.d_type == 42) {   // Q2_0
         const int32_t* qs32[8];
         for (int t = 0; t < nt; ++t) qs32[t] = act_sums(hq[t], n, 32);

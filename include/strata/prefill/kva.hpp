@@ -36,6 +36,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include "strata/platform/env.hpp"
 
 namespace strata::prefill {
 
@@ -88,13 +89,13 @@ struct KvaConfig {
     /// approximated positions behind it.
     const char* decline(const KvaEngine& e, int64_t pos0, int64_t n, int64_t lb, int64_t le, int64_t n_layers,
                         bool pictures, bool unmeasured_shape) const {
-        if (!on) return "off (STRATA_KVA is not 1)";
+        if (!on) return "off (XESTRATA_KVA is not 1)";
         if (capture) return "capture mode";
         if (!e.blocked.empty()) return e.blocked.c_str();
         if (pos0 != 0) return "a continuation read (pos0 != 0)";
         if (lb != 0 || (le >= 0 && le != n_layers)) return "a layer split (not the whole trunk)";
         if (pictures) return "a prompt with pictures";
-        if (n < min_prompt) return "the prompt is shorter than STRATA_KVA_MIN_PROMPT";
+        if (n < min_prompt) return "the prompt is shorter than XESTRATA_KVA_MIN_PROMPT";
         if (n <= effective_suffix() + 64) return "the suffix leaves too few positions to approximate";
         // the split layer, the state-only layers and the tail were measured on one geometry (Qwen3.8-Flash-Next, 48
         // layers, 512 experts); another model reads exactly unless the research override asks for it
@@ -104,13 +105,13 @@ struct KvaConfig {
 };
 
 inline int64_t kva_env_i64(const char* name, int64_t dflt) {
-    const char* v = std::getenv(name);
+    const char* v = strata::env_get(name);
     if (v == nullptr || *v == '\0') return dflt;
     return (int64_t) std::strtoll(v, nullptr, 10);
 }
 
 inline bool kva_env_flag(const char* name, bool dflt) {
-    const char* v = std::getenv(name);
+    const char* v = strata::env_get(name);
     if (v == nullptr || *v == '\0') return dflt;
     return v[0] != '0';
 }
@@ -118,33 +119,33 @@ inline bool kva_env_flag(const char* name, bool dflt) {
 /// The settings as the environment says now (uncached).
 inline KvaConfig kva_config_from_env() {
     KvaConfig k;
-    const char* sw = std::getenv("STRATA_KVA");
+    const char* sw = strata::env_get("KVA");
     k.on = sw != nullptr && *sw != '\0' && sw[0] != '0';
-    k.split = kva_env_i64("STRATA_KVA_SPLIT", kKvaSplitDefault);
-    k.suffix_env = std::max<int64_t>(0, kva_env_i64("STRATA_KVA_SUFFIX", 0));
-    k.min_prompt = kva_env_i64("STRATA_KVA_MIN_PROMPT", 4096);
-    k.any_model = kva_env_flag("STRATA_KVA_ANY_MODEL", false);
-    if (const char* d = std::getenv("STRATA_KVA_CAPTURE"); d != nullptr && *d != '\0') {
+    k.split = kva_env_i64("KVA_SPLIT", kKvaSplitDefault);
+    k.suffix_env = std::max<int64_t>(0, kva_env_i64("KVA_SUFFIX", 0));
+    k.min_prompt = kva_env_i64("KVA_MIN_PROMPT", 4096);
+    k.any_model = kva_env_flag("KVA_ANY_MODEL", false);
+    if (const char* d = strata::env_get("KVA_CAPTURE"); d != nullptr && *d != '\0') {
         k.capture = true;
         k.capture_dir = d;
-        k.capture_fp32 = kva_env_flag("STRATA_KVA_CAPTURE_FP32", false);
+        k.capture_fp32 = kva_env_flag("KVA_CAPTURE_FP32", false);
     }
-    if (const char* d = std::getenv("STRATA_KVA_ORACLE"); d != nullptr && *d != '\0') {
+    if (const char* d = strata::env_get("KVA_ORACLE"); d != nullptr && *d != '\0') {
         k.oracle_dir = d;
         k.mode = KvaConfig::Mode::Oracle;
-        k.oracle_fp32 = kva_env_flag("STRATA_KVA_ORACLE_FP32", false);
+        k.oracle_fp32 = kva_env_flag("KVA_ORACLE_FP32", false);
     }
-    if (const char* d = std::getenv("STRATA_KVA_PROJECTOR"); d != nullptr && *d != '\0') {
+    if (const char* d = strata::env_get("KVA_PROJECTOR"); d != nullptr && *d != '\0') {
         k.projector = d;
         k.mode = KvaConfig::Mode::Linear;
     }
-    if (const char* m = std::getenv("STRATA_KVA_MODE"); m != nullptr && *m != '\0') {
+    if (const char* m = strata::env_get("KVA_MODE"); m != nullptr && *m != '\0') {
         if (std::string(m) == "oracle") k.mode = KvaConfig::Mode::Oracle;
         else if (std::string(m) == "linear") k.mode = KvaConfig::Mode::Linear;
         else k.mode = KvaConfig::Mode::Identity;
     }
-    if (const char* sk = std::getenv("STRATA_KVA_SKIP"); sk != nullptr && std::string(sk) == "moe") k.skip = KvaConfig::Skip::Moe;
-    if (const char* o = std::getenv("STRATA_KVA_ONLY"); o != nullptr && *o != '\0') {
+    if (const char* sk = strata::env_get("KVA_SKIP"); sk != nullptr && std::string(sk) == "moe") k.skip = KvaConfig::Skip::Moe;
+    if (const char* o = strata::env_get("KVA_ONLY"); o != nullptr && *o != '\0') {
         if (std::string(o) == "gdn") k.only = KvaConfig::Only::Gdn;
         else if (std::string(o) == "qsa") k.only = KvaConfig::Only::Qsa;
         else k.only = KvaConfig::Only::All;

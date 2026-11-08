@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Decode A/B on coding-agent turns over this repository: arms restarted per round, per-turn ratios.
 
-    python tools/agent_turns_bench.py strata-iq2_xs.json base: hcq8:STRATA_HC_Q8=2 [--rounds 2]
+    python tools/agent_turns_bench.py strata-iq2_xs.json base: hcq8:XESTRATA_HC_Q8=2 [--rounds 2]
 
 The workload is five simulated coding-agent sessions over this repository's own files (README, serve/, setup.py, the
 expert cache, the hyper-connection kernels, the tokenizer): a system prompt, four tools, a task (three in English, two
@@ -176,7 +176,7 @@ def main() -> int:
             cfg["log"] = str(Path(tempfile.gettempdir()) / f"agent_turns_{name}_r{rnd}.log")
             cpath = Path(tempfile.gettempdir()) / f"agent_turns_{name}.json"
             cpath.write_text(json.dumps(cfg, indent=1))
-            proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata",
+            proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "xestrata",
                                      "--config", str(cpath), "--port", str(a.port)],
                                     cwd=str(ROOT), env=dict(os.environ, **e),
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

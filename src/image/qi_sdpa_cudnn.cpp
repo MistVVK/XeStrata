@@ -21,6 +21,7 @@ void* cudnn_dlhandle = nullptr;
 
 #include "qi_conv.hpp"
 #include "strata/core/graph.hpp"
+#include "strata/platform/env.hpp"
 #include "qi_sdpa.hpp"
 
 #include <sycl/sycl.hpp>
@@ -223,7 +224,7 @@ void open_cudnn(cudnnHandle_t& handle) {
         return;
     }
     std::vector<std::string> libs;
-    if (const char* lib = std::getenv("STRATA_CUDNN_LIB")) libs.emplace_back(lib);
+    if (const char* lib = strata::env_get("CUDNN_LIB")) libs.emplace_back(lib);
 #if defined(_WIN32)
     namespace fs = std::filesystem;
     libs.emplace_back("cudnn64_9.dll");
@@ -331,7 +332,7 @@ bool cudnn(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint1
             if (!g->execute(handle, pack, ws).is_good()) throw std::runtime_error("cuDNN's SDPA failed");
         });
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image: cuDNN's attention is not taken on this GPU (%s): the engine's own kernel\n",
+        std::fprintf(stderr, "xestrata-image: cuDNN's attention is not taken on this GPU (%s): the engine's own kernel\n",
                      e.what());
         d.failed = true;
         return false;
@@ -361,7 +362,7 @@ bool run_conv(sycl::queue& q, const std::vector<int64_t>& key,
     try {
         if (d.handle == nullptr) sdpa::open_cudnn(d.handle);
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image: cuDNN's convolution is not taken on this GPU (%s): the engine's own path\n",
+        std::fprintf(stderr, "xestrata-image: cuDNN's convolution is not taken on this GPU (%s): the engine's own path\n",
                      e.what());
         d.conv_failed = true;
         return false;
@@ -390,7 +391,7 @@ bool run_conv(sycl::queue& q, const std::vector<int64_t>& key,
         });
     } catch (const std::exception& e) {   // this shape on the engine's own path from now on
         std::fprintf(stderr,
-                     "strata-image: cuDNN does not take a convolution of %s (%s): the engine's own path for it\n",
+                     "xestrata-image: cuDNN does not take a convolution of %s (%s): the engine's own path for it\n",
                      what.c_str(), e.what());
         d.convs[key] = nullptr;
         return false;

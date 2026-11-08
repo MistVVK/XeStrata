@@ -285,7 +285,7 @@ Esrgan::~Esrgan() {
     try {
         impl_->q().wait();
     } catch (const std::exception& e) {   // a lost device: the buffers go with it
-        std::fprintf(stderr, "strata-image: RealESRGAN's queue at its end: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image: RealESRGAN's queue at its end: %s\n", e.what());
     }
     impl_->drop_scratch();
     impl_->drop_weights();

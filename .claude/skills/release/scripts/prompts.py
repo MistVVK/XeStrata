@@ -6,7 +6,7 @@
     python prompts.py PACK_DIR OUT_DIR
 
 Run from the repository root.  PACK_DIR is any pack (its `tokenizer/` is read).  Writes OUT_DIR/<tier>.ids,
-comma-separated, for `strata generate --tokens-file`.
+comma-separated, for `xestrata-engine generate --tokens-file` (upstream's `strata generate`).
 """
 import json
 import pathlib

@@ -110,7 +110,7 @@ inline Result resolve(const Input& in) {
 
 inline const char* serial_what(Serial s) {
     return s == Serial::BatchMtp ? "--batch-mtp" : s == Serial::AdaptAsync ? "--adapt-async 1"
-         : s == Serial::TwoCardsSerialFaster ? "serial windows (STRATA_BATCH_GROUPS_NV_SERIAL=1 asked for them on two NVIDIA cards; --batch-groups auto pipelines)" : "";
+         : s == Serial::TwoCardsSerialFaster ? "serial windows (XESTRATA_BATCH_GROUPS_NV_SERIAL=1 asked for them on two NVIDIA cards; --batch-groups auto pipelines)" : "";
 }
 
 }  // namespace strata::program::batch_groups

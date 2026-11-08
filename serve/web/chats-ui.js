@@ -75,7 +75,7 @@ function chatName(id) {
   const c = chats.find((x) => x.id === id);
   return c ? H.chatTitle(c, untitled()) : untitled();
 }
-// The answers a page closed while it read them (their strata_reply id kept in the message): read again from the server,
+// The answers a page closed while it read them (their xestrata_reply id kept in the message): read again from the server,
 // which keeps each one until the page has read it, up to 12 hours.  Once a load, after /health.
 function resumeReplies() {
   if (!health.kept_replies) return;
@@ -93,7 +93,7 @@ function sendDebugChat(c) {
   clearTimeout(debugTimers.get(c.id));
   debugTimers.set(c.id, setTimeout(() => {
     debugTimers.delete(c.id);
-    fetch("v1/strata/debug/chat", {method: "POST", headers: headers(true), body: JSON.stringify(c)}).catch(() => {});
+    fetch("v1/xestrata/debug/chat", {method: "POST", headers: headers(true), body: JSON.stringify(c)}).catch(() => {});
   }, 1000));
 }
 function stillWriting() { toast("warn", tr("busy.stillWriting", "Still writing"), tr("busy.stopFirst", "Stop the answer first.")); }

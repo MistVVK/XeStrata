@@ -17,6 +17,7 @@
 #include "strata/core/per_device.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_verify_kernels
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 // sycl_ext_oneapi_clock is newer than some DPC++ releases (intel/llvm 6.2 lacks it): without it there is no stamp
 #if __has_include(<sycl/ext/oneapi/experimental/clock.hpp>)
@@ -541,7 +542,7 @@ core::PerDevice<GdnChoice>& gdn_choices() {
 }
 int gdn_forced() {   // STRATA_GDN_STEP=0|1|2: one form always (one group a head, split, prefetch)
     static const int forced = [] {
-        const char* v = std::getenv("STRATA_GDN_STEP");
+        const char* v = strata::env_get("GDN_STEP");
         const long f = v == nullptr ? -1 : std::strtol(v, nullptr, 10);
         return f >= 0 && f < kGdnForms ? (int) f : -1;
     }();
@@ -621,7 +622,7 @@ void gdn_step_tune(int C, int h_k, int h_v, void* stream) {
         sycl::free(buf, q);
         char forms[kVerifyMaxT + 1] = {};
         for (int T = 1; T <= kVerifyMaxT; ++T) forms[T - 1] = (char) ('0' + c.form[T]);
-        std::fprintf(stderr, "strata: GDN step forms for windows of 1..%d tokens: %s (0 one group a head, 1 split, "
+        std::fprintf(stderr, "xestrata: GDN step forms for windows of 1..%d tokens: %s (0 one group a head, 1 split, "
                      "2 prefetch)\n", kVerifyMaxT, forms);
         return c;
     });
@@ -634,7 +635,7 @@ namespace {
 // reports it (no device printf, which CUDA's link warns about).  The default path is unchanged.
 struct GdnDbg { int32_t* keep; int32_t* bad; };
 const int32_t* gdn_dbg_keep(sycl::queue& q, const int32_t* n_keep, int n_max) {
-    static const bool dbg = [] { const char* e = std::getenv("STRATA_DBG_GDN"); return e && e[0] == '1'; }();
+    static const bool dbg = [] { const char* e = strata::env_get("DBG_GDN"); return e && e[0] == '1'; }();
     if (!dbg) return n_keep;
     static core::PerDevice<GdnDbg> per_device;
     const GdnDbg d = per_device.get(q.get_device(), [&q] {
@@ -646,7 +647,7 @@ const int32_t* gdn_dbg_keep(sycl::queue& q, const int32_t* n_keep, int n_max) {
     });
     sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::system> seen(d.bad[0]);
     if (const int32_t n = seen.exchange(0); n != 0)
-        std::fprintf(stderr, "strata DBG: gdn_step commit: n_keep %d is past the window's %d rows: commit skipped (#937)\n",
+        std::fprintf(stderr, "xestrata DBG: gdn_step commit: n_keep %d is past the window's %d rows: commit skipped (#937)\n",
                      n, d.bad[1]);
     int32_t *keep = d.keep, *bad = d.bad;
     q.single_task([=] {
@@ -670,7 +671,7 @@ void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* ga
     if (y_q8_1 != nullptr && (S * h_v) % 32 != 0) fail("gdn_step_norm_multi: q8_1 blocks need 32 | value_dim");
     if (n_keep != nullptr && t_out_begin >= n_tok) n_keep = gdn_dbg_keep(q, n_keep, n_tok);
     static const bool commit_state = [] {   // STRATA_GDN_COMMIT_SPLIT=0: the commit runs the window's form
-        const char* v = std::getenv("STRATA_GDN_COMMIT_SPLIT");
+        const char* v = strata::env_get("GDN_COMMIT_SPLIT");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     if (commit_state && n_keep != nullptr && t_out_begin >= n_tok) {   // the commit: no outputs
@@ -687,8 +688,8 @@ bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, con
                        int conv_channels, int h_k, int h_v, int n_max, int n_layers, const int32_t* n_keep, void* stream) {
     // only the per-layer commit's state-only kernel is batched (gdn_step_norm_multi above): its other choices keep the loop
     static const bool per_layer = [] {
-        const char* cs = std::getenv("STRATA_GDN_COMMIT_SPLIT");
-        const char* dbg = std::getenv("STRATA_DBG_GDN");
+        const char* cs = strata::env_get("GDN_COMMIT_SPLIT");
+        const char* dbg = strata::env_get("DBG_GDN");
         return (cs != nullptr && std::strtol(cs, nullptr, 10) == 0) || (dbg != nullptr && dbg[0] == '1');
     }();
     if (per_layer || n_layers <= 0 || n_max < 1 || n_max > kVerifyMaxT || n_keep == nullptr || h_v <= 0 || h_k <= 0 ||
@@ -759,7 +760,7 @@ bool graph_branch_pays(void* stream, void* side0, void* side1) {
             if (round > 0 && (t_min[v] == 0.0 || us < t_min[v])) t_min[v] = us;
         }
     sycl::free(buf, q);
-    std::fprintf(stderr, "strata: graph side branches: %.1f us in a row, %.1f us branched: %s\n", t_min[0], t_min[1],
+    std::fprintf(stderr, "xestrata: graph side branches: %.1f us in a row, %.1f us branched: %s\n", t_min[0], t_min[1],
                  t_min[1] <= 0.95 * t_min[0] ? "used" : "not used");
     return t_min[1] <= 0.95 * t_min[0];
 }
@@ -941,7 +942,7 @@ core::PerDevice<int>& fetch_groups() {
 }
 int fetch_groups_fixed() {
     static const int fixed = [] {
-        const char* v = std::getenv("STRATA_FETCH_GROUPS");
+        const char* v = strata::env_get("FETCH_GROUPS");
         const long f = v == nullptr ? 0 : std::strtol(v, nullptr, 10);
         return f > 0 ? (int) f : 0;
     }();
@@ -1006,7 +1007,7 @@ void fetch_blobs_tune(void* stream) {
         size_t pick = counts.size() - 1;
         for (size_t c = 0; c < counts.size(); ++c)
             if (t_min[c] <= best * 1.02) { pick = c; break; }
-        std::fprintf(stderr, "strata: the PCIe share's fetch runs %d work-groups (%.1f GB/s; %d: %.1f GB/s)\n", counts[pick],
+        std::fprintf(stderr, "xestrata: the PCIe share's fetch runs %d work-groups (%.1f GB/s; %d: %.1f GB/s)\n", counts[pick],
                      (double) nb * blob * 8 / t_min[pick] / 1e3, most, (double) nb * blob * 8 / t_min.back() / 1e3);
         return counts[pick];
     });
@@ -1204,7 +1205,7 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
     auto& q = Q(stream);
     const int wg = xe::work_group_upto_1024(q);   // the draft probabilities sum in another order below 1024
     static const bool split = [] {   // STRATA_TOP_PROB_SPLIT=0: one work-group a row
-        const char* v = std::getenv("STRATA_TOP_PROB_SPLIT");
+        const char* v = strata::env_get("TOP_PROB_SPLIT");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     // the split for the main model's head (248,320 tokens: RTX 4070 15.1 -> 10.2 us a row, B70 38.95 -> 38.79), not
@@ -1323,7 +1324,7 @@ bool gpu_stamp_available() {
             (void) sycl::get_kernel_bundle<sycl::bundle_state::executable>(ctx, {d}, {sycl::get_kernel_id<StampKernel>()});
             return true;
         } catch (const sycl::exception& e) {
-            std::fprintf(stderr, "strata verify: the stamp kernel does not build on this device (%s)\n", e.what());
+            std::fprintf(stderr, "xestrata verify: the stamp kernel does not build on this device (%s)\n", e.what());
             return false;
         }
     });

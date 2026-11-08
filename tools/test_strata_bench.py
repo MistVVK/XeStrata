@@ -191,7 +191,7 @@ class RedactionTests(unittest.TestCase):
         self.assertEqual(red("127.0.0.1:8080 and version 0.1.40.3 and driver 32.0.15.7"),
                          "127.0.0.1:8080 and version 0.1.40.3 and driver 32.0.15.7")
         self.assertNotIn(str(B.ROOT), red(f"loading {B.ROOT / 'strata-x.json'}"))
-        self.assertIn("<strata>", red(f"loading {B.ROOT / 'strata-x.json'}"))
+        self.assertIn("<xestrata>", red(f"loading {B.ROOT / 'strata-x.json'}"))
         self.assertNotIn(str(Path.home()), red(f"in {Path.home() / 'data'}"))
         if len(user) >= 4:
             self.assertNotIn(user, red(f"hello {user} world"))
@@ -206,13 +206,13 @@ class RedactionTests(unittest.TestCase):
         cfg = {"exe": r"C:\Users\me\Strata\engine\strata.exe",
                "args": ["--native", "/home/me/models/m-IQ3_XXS.gguf", "--ctx", "65536"],
                "api_key": "hunter2", "model_name": "Fake Model", "log": "/tmp/x.log", "port": 8080,
-               "env": {"STRATA_FOO": "/home/me/z", "PATH": "/usr/bin", "STRATA_TOKEN": "t"}}
+               "env": {"XESTRATA_FOO": "/home/me/z", "PATH": "/usr/bin", "XESTRATA_TOKEN": "t"}}
         v = B.config_view(cfg)
         self.assertEqual(v["exe"], "strata.exe")
         self.assertEqual(v["args"], ["--native", "m-IQ3_XXS.gguf", "--ctx", "65536"])
         self.assertNotIn("api_key", v)
         self.assertNotIn("log", v)
-        self.assertEqual(v["env"], {"STRATA_FOO": "z"})
+        self.assertEqual(v["env"], {"XESTRATA_FOO": "z"})
         self.assertEqual(B.detect_quant(v), "IQ3_XXS")
         self.assertNotIn("hunter2", json.dumps(v))
 

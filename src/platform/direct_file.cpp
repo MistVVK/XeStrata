@@ -4,6 +4,7 @@
 // src/platform/direct_file.cpp - see include/strata/platform/direct_file.hpp.
 #include "strata/platform/direct_file.hpp"
 #include "strata/platform/aux_cpus.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -67,7 +68,7 @@ struct Pending {
 /// i7-14700, 16 threads 1.18 s, 32 0.71 s, 64 0.49 s, 64 with twice the slots the same; a drive that cannot serve
 /// the depth queues the reads and the threads wait).
 int io_threads(int dflt) {
-    const char* v = std::getenv("STRATA_IO_THREADS");
+    const char* v = strata::env_get("IO_THREADS");
     const int n = v ? std::atoi(v) : dflt;
     return std::clamp(n, 1, 64);
 }

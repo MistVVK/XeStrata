@@ -119,7 +119,7 @@ int main(int argc, char** argv) {
     for (const auto& x : cases(512))
         failures += !same("native_quant_h", 512, 0, ref, via_h, x, ggml_row_size(GGML_TYPE_Q8_K, 512));
     std::printf("q8k_quant_parity: %d rows x 4 sizes, AVX-2 copy %s: %s\n", checked / 4,
-                avx2 ? "checked" : "skipped (no AVX2, or STRATA_FORCE_ISA)", failures ? "FAILED" : "identical");
+                avx2 ? "checked" : "skipped (no AVX2, or XESTRATA_FORCE_ISA)", failures ? "FAILED" : "identical");
     if (bench && avx2) {
         std::mt19937 rng(3);  // NOLINT(bugprone-random-generator-seed): reproducible rows.
         std::normal_distribution<float> nd(0.f, 1.f);

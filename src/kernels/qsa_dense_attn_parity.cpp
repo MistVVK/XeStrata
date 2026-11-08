@@ -33,10 +33,10 @@ namespace par = strata::parity;
 // the fp16 score loop's form for the calls that follow (qsa_decode_attn.cpp's STRATA_QSA_NC); "" back to its choice
 void set_nc(const char* nc) {
 #if defined(_WIN32)
-    _putenv_s("STRATA_QSA_NC", nc);
+    _putenv_s("XESTRATA_QSA_NC", nc);
 #else
-    if (*nc) setenv("STRATA_QSA_NC", nc, 1);
-    else unsetenv("STRATA_QSA_NC");
+    if (*nc) setenv("XESTRATA_QSA_NC", nc, 1);
+    else unsetenv("XESTRATA_QSA_NC");
 #endif
 }
 

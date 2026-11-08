@@ -8,6 +8,7 @@
 #include "strata/platform/memory.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU core_gpu
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <sycl/ext/oneapi/experimental/graph.hpp>
 #include <sycl/ext/oneapi/experimental/profiling_tag.hpp>
@@ -222,7 +223,7 @@ void* alloc_host(size_t bytes) {
             }
             if (hard != nullptr) {
                 free(hard);
-                std::fprintf(stderr, "strata: pinned memory: %zu bytes refused, the reserve given back for them\n", bytes);
+                std::fprintf(stderr, "xestrata: pinned memory: %zu bytes refused, the reserve given back for them\n", bytes);
                 p = sycl::malloc_host(bytes, rt().context());
             }
         }
@@ -233,7 +234,7 @@ void* alloc_host(size_t bytes) {
 
 void pin_reserve_take() {
     uint64_t mib = 0;
-    if (const char* e = std::getenv("STRATA_PIN_RESERVE_MIB"); e != nullptr && *e != '\0') {
+    if (const char* e = strata::env_get("PIN_RESERVE_MIB"); e != nullptr && *e != '\0') {
         mib = std::strtoull(e, nullptr, 10);
     } else {
 #if defined(_WIN32)

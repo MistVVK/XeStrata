@@ -10,8 +10,8 @@
 #
 #   XE="CMD..." UP="CMD..." DATA=DIR IDS=DIR .claude/skills/release/scripts/bench.sh OUT GPU
 #
-# XE and UP: the command that starts each engine (its strata binary, or a wrapper that runs it in its container);
-# the generate options are appended.  XE_PROFILE and UP_PROFILE: each engine's shipped expert profile (its
+# XE and UP: the command that starts each engine (XeStrata's xestrata-engine, upstream's strata, or a wrapper that runs
+# it in its container); the generate options are appended.  XE_PROFILE and UP_PROFILE: each engine's shipped expert profile (its
 # data/expert-profile.bin).  DATA: the data folder (packs/qwen-iq3_xxs, models/...IQ3_XXS-0000N-of-00002.gguf,
 # mtp/rt).  IDS: the prompts of prompts.py and the continuations of follow.sh beside this script.  ROUNDS (default
 # 2): runs per arm and tier.

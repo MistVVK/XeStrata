@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/overlap_main.cpp - `strata-overlap`: does streaming an expert overlap with computing on it?
 //
 // THE ARCHITECTURE'S CENTRAL PREMISE.  Only (1 - h) of a token's expert weights are in VRAM, so the rest must
@@ -54,7 +55,7 @@ int main(int argc, char** argv) {
         else if (a == "--experts") experts = std::atoi(val());
         else if (a == "--tpr") threads_per_row = std::atoi(val());
         else {
-            std::fprintf(stderr, "usage: strata-overlap --file experts.bin [--experts N] [--tpr N]\n");
+            std::fprintf(stderr, "usage: xestrata-overlap --file experts.bin [--experts N] [--tpr N]\n");
             return 2;
         }
     }

@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """serve/images.py - image generation (Qwen-Image-2.1-Turbo, Qwen-Image-2.1, Mage-Flow, HunyuanImage 3.0, MOSS-Image)
-through XeStrata's own image engine, strata-image.
+through XeStrata's own image engine, xestrata-image.
 
 POST /v1/images/generations takes OpenAI's request shape (prompt, size, n, response_format b64_json|url) plus Strata's
 own field seed; POST /v1/images/edits the same with reference images (OpenAI's multipart form, image or image[]; or JSON
@@ -13,7 +13,7 @@ and its pixels) and a strength (diffusers' img2img strength, above 0 and at most
 the first image's latent, strength_run; 1, the default of an edit, starts from noise).  A model without edits
 (MageTrail, Mage-Flow without its edit model, one without its vision file) takes one image as img2img's: its
 strength, else img2img_strength (with a mask, 1).  src/image/img_start.hpp.  The engine (src/image/strata_image.cpp,
-`strata-image --serve`) starts with the first image and stays, outside the server (serve/image_daemon.py, the next
+`xestrata-image --serve`) starts with the first image and stays, outside the server (serve/image_daemon.py, the next
 server of the same image model and GPU finds it: a model switch does not lose it): its kernels built once, the
 prompt's text states and the layers that fit in VRAM kept between images, one image a request.  It runs Turbo's
 8 steps (CFG 1, the Euler flow sampler, the model's own sigmas), the image the one stable-diffusion.cpp makes with the
@@ -36,7 +36,7 @@ its tokenizer carries - <answer>, <boi>, <img_size_1024>, <img_ratio_i>, <timest
 block's <img> tokens (one a 16 x 16 pixel square) and <eoi>.  Its sizes snap to the model's resolution buckets
 (hunyuanimage3_bucket: the config's "resolutions" parameters, the 37 shapes its image processor walks), the bucket's
 shape and ratio index going into the sequence and its tokens being what the response's usage counts; the response's
-size is the bucket's, and "strata" names the size asked for (requested_size) when it differs.  Its guidance is one
+size is the bucket's, and "xestrata" names the size asked for (requested_size) when it differs.  Its guidance is one
 token, not two passes: guidance_scale (true_cfg_scale as its other name), default the config's "guidance" 2.5, and a
 negative prompt has nothing to steer (model_defaults says so with guidance_token, so the web page and the estimate
 treat a guided step as one).  Its steps are the config's (the Distil model's 8) on the model's own schedule - the
@@ -67,9 +67,9 @@ Adapters (serve/loras.py): a request's "lora" field - a list of {"name", "scale"
 the same as a form's JSON text - and the prompt's tags, <lora:name:0.8> in A1111's and Forge's form, positive prompt
 and negative; they go to the engine as IMG's and NEED's LORA:<strength>:<path> words (the path's whitespace %XX'd:
 the engine splits the line on it).  A name the model's LoRA folder ("lora_dir") does not offer is refused where the
-field gives it and taken out of the prompt with a warning where a tag does (the response's strata.lora_unknown).
+field gives it and taken out of the prompt with a warning where a tag does (the response's xestrata.lora_unknown).
 "local_path" is a file inside that folder only.  The response's data[] items carry the adapters applied as "lora":
-[{"name", "scale"}], and strata their count and VRAM (lora_n, lora_mib, the IMAGE line's).
+[{"name", "scale"}], and xestrata their count and VRAM (lora_n, lora_mib, the IMAGE line's).
 
 The GPU is shared with the text engine one job at a time: an image job takes the service's turn (the FIFO every chat
 request takes), so no chat turn runs on the GPU meanwhile.  A config whose "images" section names a card of its own
@@ -92,7 +92,7 @@ otherwise it lets go of everything but its process (about 200 MiB).  The daemon 
 1800) without a server.
 
 The config's "images" section (written by setup --images, tools/image/qimage.py):
-  {"exe": "engine/strata-image", "diffusion_model": "...Q8_0.gguf", "schedule": "turbo"|"base", "steps": 8|40,
+  {"exe": "engine/xestrata-image", "diffusion_model": "...Q8_0.gguf", "schedule": "turbo"|"base", "steps": 8|40,
    "vae": "...", "llm": "...Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf", "quant": "Q8_0", "gpu_policy": "auto",
    "reload": "lazy"|"eager", "max_n": 16, "budget_s": 600, "max_side": 2048, "timeout_s": 3600, "uma": false,
    "out_dir": null, "keep_files": 64,
@@ -149,6 +149,7 @@ from typing import Any, Callable, cast
 
 from serve import image_aux
 from serve import loras as lora_api
+from serve import envvars
 
 TURBO_STEPS = 8
 MAX_STEPS = 100                    # the base model's
@@ -506,7 +507,7 @@ def parse_request(req: dict, cfg: dict) -> dict:
     its config has the ratio head (job["choose_size"]: ImageGen.run asks the engine first, the 1024 x 1024 bucket
     standing for it until then - no bucket has more tokens).  The adapters it applies come from "lora" and from the
     two prompts' <lora:name:0.8> tags (serve/loras.py): job["loras"], and for a tag's name the model does not offer
-    job["lora_unknown"] (the response's strata.lora_unknown).  A text encoder's adapter is not applied (the human's
+    job["lora_unknown"] (the response's xestrata.lora_unknown).  A text encoder's adapter is not applied (the human's
     decision of 2026-10-29): "scale_text" and a tag's third field are no fields of the image engine's, and are taken
     as its other unknown fields are, style and user, ignored."""
     prompt = req.get("prompt")
@@ -517,7 +518,7 @@ def parse_request(req: dict, cfg: dict) -> dict:
     if "\0" in prompt:
         raise ImageRequestError("prompt: no NUL characters")
     # the adapters: the "lora" field, then the tags of both prompts (A1111's and Forge's form); a tag's name the model
-    # does not offer is taken out and said in the response's strata (lora_unknown), a field's name is refused
+    # does not offer is taken out and said in the response's xestrata (lora_unknown), a field's name is refused
     folder = lora_api.folder(cfg)
     try:
         loras = lora_api.field(req.get("lora"), folder)
@@ -2331,9 +2332,10 @@ def _kv(line: str) -> dict:
 
 
 # the environment that makes one image engine another: the GPU it takes and the libraries it loads
-ENGINE_ENV = ("STRATA_GPU_PCI", "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "ONEAPI_DEVICE_SELECTOR",
-              "HIP_VISIBLE_DEVICES", "ZE_AFFINITY_MASK", "STRATA_VRAM_LIMIT_MIB", "STRATA_MAX_ALLOC_MIB",
-              "STRATA_NO_XMX", "LD_LIBRARY_PATH")
+ENGINE_ENV = (*(p + n for n in ("GPU_PCI", "VRAM_LIMIT_MIB", "MAX_ALLOC_MIB", "NO_XMX")
+                for p in (envvars.NEW, envvars.OLD)),
+              "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "ONEAPI_DEVICE_SELECTOR", "HIP_VISIBLE_DEVICES",
+              "ZE_AFFINITY_MASK", "LD_LIBRARY_PATH")
 
 
 def daemon_address(cmd: list[str], env: dict) -> str:
@@ -2349,8 +2351,8 @@ def daemon_address(cmd: list[str], env: dict) -> str:
 def gpu_key(env: dict) -> str:
     """The GPU an engine environment names (its device selection; none: the system's first), for GpuTurn."""
     import hashlib
-    sel = [env.get(k) for k in ("STRATA_GPU_PCI", "CUDA_VISIBLE_DEVICES", "ONEAPI_DEVICE_SELECTOR",
-                                "HIP_VISIBLE_DEVICES", "ZE_AFFINITY_MASK")]
+    others = ("CUDA_VISIBLE_DEVICES", "ONEAPI_DEVICE_SELECTOR", "HIP_VISIBLE_DEVICES", "ZE_AFFINITY_MASK")
+    sel = [envvars.get("GPU_PCI", env=env)] + [env.get(k) for k in others]
     return hashlib.sha256(json.dumps(sel).encode()).hexdigest()[:16]
 
 
@@ -2441,7 +2443,7 @@ def stop_daemon_at(addr: str) -> bool:
 
 
 class ImageEngine:
-    """The image engine, `strata-image --serve`, through the image daemon (serve/image_daemon.py): started outside the
+    """The image engine, `xestrata-image --serve`, through the image daemon (serve/image_daemon.py): started outside the
     server the first time and found again by the next server of the same image model and GPU, so a model switch does
     not lose it; one request line at a time (the caller serializes, the daemon between servers)."""
 
@@ -2682,7 +2684,7 @@ class ImageGen:
         self.model = self.cfg.get("model_name") or MODEL_NAME
         self.log = log
         out = self.cfg.get("out_dir")
-        self.dir = Path(out) if out else Path(tempfile.mkdtemp(prefix="strata-images-"))
+        self.dir = Path(out) if out else Path(tempfile.mkdtemp(prefix="xestrata-images-"))
         self.dir.mkdir(parents=True, exist_ok=True)
         self.keep_files = int(self.cfg.get("keep_files") or 64)
         self.reserve = int(self.cfg.get("reserve_mib") or 512)
@@ -2690,7 +2692,7 @@ class ImageGen:
         self.lock = EngineLock(self)              # one request line at a time even when the service's turn is not taken
         self.long_job: dict | None = None         # a long job's state while it runs (videos.upscale): EngineLock
         self.loras = lora_api.folder(self.cfg)    # the adapters its DiT takes (serve/loras.py)
-        self.engine = ImageEngine(self.cfg, dict(os.environ) if env is None else env, self.dir / "strata-image.log",
+        self.engine = ImageEngine(self.cfg, dict(os.environ) if env is None else env, self.dir / "xestrata-image.log",
                                   self._say)
         self.tok = None
         self.t5 = None   # Anima's T5 tokenizer (tools/strata_unigram.py), read with the first prompt
@@ -2816,7 +2818,7 @@ class ImageGen:
         return int((params or {}).get("base_size") or 1024)
 
     def _say(self, text: str) -> None:
-        print(f"[strata] {text}", flush=True)
+        print(f"[xestrata] {text}", flush=True)
         if self.log is not None:
             try:
                 self.log.write(f"[images] {text}\n")
@@ -3409,7 +3411,7 @@ class ImageGen:
                    "n": len(images), "refs": len(job.get("refs") or ()),
                    **({"strength": job["strength"]} if job.get("strength") is not None else {}),
                    **({"img2img": True} if job.get("init") else {}), **({"mask": True} if job.get("mask") else {}),
-                   "size": f"{job['width']}x{job['height']}", "seed": job["seed"], "engine": "strata-image",
+                   "size": f"{job['width']}x{job['height']}", "seed": job["seed"], "engine": "xestrata-image",
                    "quant": self.cfg.get("quant"),
                    "text_encode_ms": round(sum(r.get("text_s", 0) for r in parts) * 1000, 1),
                    **({"size_choice_s": job["ratio_s"]} if "ratio_s" in job else {}),
@@ -3490,7 +3492,7 @@ class ImageGen:
             data.append(item)
         return {"created": int(time.time()), "data": data, "model": self.model, "output_format": fmt,
                 "size": f"{job['width']}x{job['height']}", "background": job.get("background") or "auto",
-                "quality": job.get("quality") or "auto", "usage": usage(job), "strata": figures}
+                "quality": job.get("quality") or "auto", "usage": usage(job), "xestrata": figures}
 
     # ---- the progress the Monitor shows (/metrics' live.image) and the jobs that ended (its Requests table)
     STAGE_LABELS = {"waiting": "Making room on the GPU", "size": "Choosing the image's size",
@@ -3549,7 +3551,7 @@ class ImageGen:
         return list(self.ended)
 
     def status(self) -> dict:
-        out = {"enabled": True, "model": self.model, "engine": "strata-image", "quant": self.cfg.get("quant"),
+        out = {"enabled": True, "model": self.model, "engine": "xestrata-image", "quant": self.cfg.get("quant"),
                "gpu_policy": self.policy, "running": self.engine.alive(), **self.totals}
         if self.note():
             out["note"] = self.note()
@@ -3852,7 +3854,7 @@ def fit_mask(mask: bytes, image: bytes) -> bytes:
 
 
 def user_marks(want: dict, load, file) -> dict:
-    """strata_images' edit and layout, what the user marked on an image in the web page's preview, into ImageTools'
+    """xestrata_images' edit and layout, what the user marked on an image in the web page's preview, into ImageTools'
     `user`: {"edit": {"image": a data: URL or a /v1/images/files/ link, "mask": {"image_url": a data: URL}}} - the
     picture and the paint over the part to change; {"layout": {"items": [{"label", "caption", "text", "box": [x0, y0,
     x1, y1] in shares of the sides}], "size": "WxH", "image": the picture they were drawn on}} - MOSS-Image's boxes, in
@@ -3865,19 +3867,19 @@ def user_marks(want: dict, load, file) -> dict:
         url = mask.get("image_url") if isinstance(mask, dict) else None
         which = edit.get("image") if isinstance(edit, dict) else None
         if not (isinstance(url, str) and url.startswith("data:")) or not isinstance(which, str):
-            raise ImageRequestError('strata_images.edit: {"image": a data: URL or a /v1/images/files/ link, '
+            raise ImageRequestError('xestrata_images.edit: {"image": a data: URL or a /v1/images/files/ link, '
                                     '"mask": {"image_url": a data: URL}}')
         kept = FILE_REF.search(which)
         image = file(kept.group(1)) if kept else load(which) if which.startswith("data:") else None
         if image is None:
-            raise ImageRequestError("strata_images.edit: the image is not here (a kept image the server let go?)")
+            raise ImageRequestError("xestrata_images.edit: the image is not here (a kept image the server let go?)")
         out["image"], out["mask"] = image, load(url)
     layout = want.get("layout")
     if layout is not None:
         size = layout.get("size") if isinstance(layout, dict) else None
         items = layout.get("items") if isinstance(layout, dict) else None
         if not isinstance(size, str) or not re.fullmatch(r"\d+x\d+", size) or not isinstance(items, list) or not items:
-            raise ImageRequestError('strata_images.layout: {"items": [{"label", "caption", "text", "box"}], '
+            raise ImageRequestError('xestrata_images.layout: {"items": [{"label", "caption", "text", "box"}], '
                                     '"size": "WxH"}')
         w, h = (int(v) for v in size.split("x"))
         drawn = []
@@ -3885,7 +3887,7 @@ def user_marks(want: dict, load, file) -> dict:
             box = it.get("box") if isinstance(it, dict) else None
             if not (isinstance(box, list) and len(box) == 4 and all(isinstance(v, (int, float)) and
                                                                     not isinstance(v, bool) for v in box)):
-                raise ImageRequestError("strata_images.layout: each item's box is [x0, y0, x1, y1] in shares")
+                raise ImageRequestError("xestrata_images.layout: each item's box is [x0, y0, x1, y1] in shares")
             drawn.append({**{k: it[k] for k in ("label", "caption", "text") if isinstance(it.get(k), str)},
                           "bbox": [round(box[0] * w), round(box[1] * h), round(box[2] * w), round(box[3] * h)]})
         out["layout"], out["size"] = {"items": drawn}, (w, h)
@@ -3942,10 +3944,10 @@ class ImageTools:
                  skills: str = "index", tools=None):
         self.models = images if isinstance(images, ImageModels) else None
         gen = images.default if isinstance(images, ImageModels) else images
-        if model is not None:   # the request's own image model (strata_images {"model": ...}): that one alone
+        if model is not None:   # the request's own image model (xestrata_images {"model": ...}): that one alone
             gen = images.pick(model) if isinstance(images, ImageModels) else gen
             if gen.model != model:
-                raise ValueError(f"strata_images: model must be one of "
+                raise ValueError(f"xestrata_images: model must be one of "
                                  f"{', '.join(images.gens if isinstance(images, ImageModels) else [gen.model])}")
             self.models = None
         self.user = user or {}
@@ -3953,8 +3955,8 @@ class ImageTools:
             every = list(images.gens.values()) if isinstance(images, ImageModels) else [gen]
             moss = [g for g in every if g.family == "moss-image"]
             if not moss:
-                raise ImageRequestError("strata_images.layout: the boxes are MOSS-Image's, and no MOSS-Image model is "
-                                        "installed here")
+                raise ImageRequestError("xestrata_images.layout: the boxes are MOSS-Image's, and no MOSS-Image model "
+                                        "is installed here")
             if self.models is None and gen.family != "moss-image":
                 gen = moss[0]
         self.svc, self.gen, self.messages, self.load, self.normalize = svc, gen, messages, load, normalize
@@ -3964,16 +3966,16 @@ class ImageTools:
         # an image's for certain, and the Responses route's image_generation tool)
         self.skills = skills
         # the image tools this request may use: the config's "image_tools" (every one by default), narrowed by the
-        # request's strata_images.tools - a tool the config leaves out cannot be asked for
+        # request's xestrata_images.tools - a tool the config leaves out cannot be asked for
         offered = [t["name"] for t in TOOLS]
         conf = gen.cfg.get("image_tools")
         allowed = set(offered if conf is None else conf)
         if tools is not None:
             if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
-                raise ImageRequestError("strata_images.tools: a list of image tools' names")
+                raise ImageRequestError("xestrata_images.tools: a list of image tools' names")
             unknown = [t for t in tools if t not in offered]
             if unknown:
-                raise ImageRequestError(f"strata_images.tools: {', '.join(unknown)}: one of {', '.join(offered)}")
+                raise ImageRequestError(f"xestrata_images.tools: {', '.join(unknown)}: one of {', '.join(offered)}")
             allowed &= set(tools)
         self.allowed = allowed
         # a Responses request's image_generation tool: its size, quality, output_format, output_compression and
@@ -3985,7 +3987,7 @@ class ImageTools:
         self.max_calls: int | None = None  # a Responses request's max_tool_calls: the calls that run, at most
         self.calls = 0
         self.mask = mask                   # an edit's mask (Responses' input_image_mask), over the image it edits
-        # what the user marked on an image in the web page's preview (strata_images' edit and layout, user_marks):
+        # what the user marked on an image in the web page's preview (xestrata_images' edit and layout, user_marks):
         # {"image": bytes, "mask": bytes} that edit_image takes, {"layout": ..., "size": (w, h)} generate_image does
         # a streamed Responses request's partial_images (the tool's, 1..3): each call's partial images, put here as
         # (index, the image in the tool's output_format) for run_with_mcp to send while the call runs
@@ -4755,7 +4757,7 @@ def enhance_prompt(svc, gen: ImageGen, job: dict, cancel: threading.Event | None
     """MOSS-Image's prompt enhancer (job["enhance"]: "auto", "caption" or "layout"): the chat's model, in its own turn
     (Service.prepare and Service.run, thinking off), writes the prompt out - a caption becomes job["enhanced_prompt"],
     a layout job["layout"] and its JSON job["layout_prompt"] (its boxes kept on the canvas).  job["enhanced"] says what
-    was made (the response's "strata" carries it; the image's revised_prompt is the prompt the model read).  An answer
+    was made (the response's "xestrata" carries it; the image's revised_prompt is the prompt the model read).  An answer
     that cannot be read, or no chat model, leaves the prompt as it was, and says why there."""
     t0 = time.monotonic()
     mode = job["enhance"]
@@ -4920,7 +4922,7 @@ def upscale_images(svc, gen: ImageGen, job: dict,
     with gpu_turn(svc, gen, job, cancel) as policy:
         png, got = gen.upscale(job, cancel)
     u = job["upscaler"]
-    figures = {"seconds": round(time.monotonic() - t0, 2), "n": 1, "seed": job["seed"], "engine": "strata-image",
+    figures = {"seconds": round(time.monotonic() - t0, 2), "n": 1, "seed": job["seed"], "engine": "xestrata-image",
                "size": f"{job['width']}x{job['height']}", "text_encode_ms": 0.0, "sampling_s": 0.0,
                "vae_decode_s": 0.0,
                "upscale": {"method": u["method"], "asked": u["asked"], "color": got.get("color", "none"),
@@ -5014,7 +5016,7 @@ def fix_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = N
     gen.end(None)
     figures = {**{k: v for k, v in last.items() if k not in ("crop", "made_size", "mask")}, **totals,
                "seconds": round(time.monotonic() - t0, 2), "n": len(images), "seed": job["seed"],
-               "size": f"{job['width']}x{job['height']}", "engine": "strata-image", "detect_s": round(detect_s, 3),
+               "size": f"{job['width']}x{job['height']}", "engine": "xestrata-image", "detect_s": round(detect_s, 3),
                "fix": {"parts": job["fix"]["parts"], "strength": job["fix"]["strength"],
                        "regions": report[0]["regions"] if report else [], "left_out": left,
                        **({"candidates": [r["regions"] for r in report]} if len(report) > 1 else {})}}
@@ -5301,7 +5303,7 @@ def _drop_for(eng, gen: ImageGen, need: dict, kept):
     if avail is None:
         gen._say("image job: the free RAM is not known; the expert arena goes with the model")
         return None
-    reserve = int(str(gen.engine.env.get("STRATA_RAM_RESERVE_MIB") or "0") or 0)
+    reserve = int(str(envvars.get("RAM_RESERVE_MIB", env=gen.engine.env) or "0") or 0)
     want = int(need.get("host_mib") or 0) + model_mib(gen) + RAM_SPARE_MIB + reserve
     short = want - avail - engine_anon_mib(eng)
     if short <= 0:
@@ -5368,9 +5370,9 @@ def restore_session(svc) -> None:
     svc.restore_after_load = None
     try:
         r = svc.engine.session_file("restore", path)
-        print(f"[strata] the conversation from before the image job is back ({r.get('tokens')} tokens)", flush=True)
+        print(f"[xestrata] the conversation from before the image job is back ({r.get('tokens')} tokens)", flush=True)
     except Exception as e:                           # noqa: BLE001 - the engine runs, without the old cache
-        print(f"[strata] the conversation from before the image job was not restored ({e}); the next request "
+        print(f"[xestrata] the conversation from before the image job was not restored ({e}); the next request "
               "reads its prompt again", flush=True)
     finally:
         with contextlib.suppress(OSError):

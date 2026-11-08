@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Stop, edit and resend, over and over (#879, #606): every answer must be real text, never a repeated token.
 
 The reports are an all-logits NaN (one token repeated, "!!!!") after a request was stopped and the next one, an edit
 or a resend of the same prompt, started while the engine was still winding the first down.  This drives that loop
 against a running server: stream an answer, read a few lines, close the connection (the client's Stop), wait 0 to
 ~0.4 s (sometimes not at all, sometimes a second request already running), send the edited prompt, and check the
-answer.  Run the engine with STRATA_DBG_NAN=1 to get the first non-finite layer named in its log.
+answer.  Run the engine with XESTRATA_DBG_NAN=1 to get the first non-finite layer named in its log.
 
-  STRATA_KEY=... python3 tools/stop_resend_test.py http://127.0.0.1:8090 [rounds=40] [seed=1]
+  XESTRATA_KEY=... python3 tools/stop_resend_test.py http://127.0.0.1:8090 [rounds=40] [seed=1]
 
 Exit 0 when every answer was real text, 1 otherwise.
 """
@@ -25,7 +26,7 @@ import urllib.request
 BASE = sys.argv[1].rstrip("/") if len(sys.argv) > 1 else "http://127.0.0.1:8080"
 ROUNDS = int(sys.argv[2]) if len(sys.argv) > 2 else 40
 SEED = int(sys.argv[3]) if len(sys.argv) > 3 else 1
-KEY = os.environ.get("STRATA_KEY", "")
+KEY = os.environ.get("XESTRATA_KEY", "")
 URL = BASE + "/v1/chat/completions"
 
 LONG = ["Describe the weather in Montpellier in great detail, at length.",

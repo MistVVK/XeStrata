@@ -21,7 +21,7 @@ namespace sv = strata::video;
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: strata-video-probe info FILE | copy FILE STEM [CHUNK] [CODEC] | "
+        std::fprintf(stderr, "usage: xestrata-video-probe info FILE | copy FILE STEM [CHUNK] [CODEC] | "
                              "frames FILE FIRST N OUT.rgb\n");
         return 2;
     }
@@ -68,10 +68,10 @@ int main(int argc, char** argv) {
             std::printf("frames=%lld\n", (long long) got);
             return 0;
         }
-        std::fprintf(stderr, "strata-video-probe: unknown mode %s\n", mode.c_str());
+        std::fprintf(stderr, "xestrata-video-probe: unknown mode %s\n", mode.c_str());
         return 2;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-video-probe: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-video-probe: %s\n", e.what());
         return 1;
     }
 }

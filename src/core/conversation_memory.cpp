@@ -274,7 +274,7 @@ std::optional<HostMemoryReading> sample_host_memory(const MemoryProbePaths& path
         if (explicit_limit != 0) return {};
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true))
-            std::fprintf(stderr, "[strata] memory guard: the cgroup memory files could not be read or parsed, using "
+            std::fprintf(stderr, "[xestrata] memory guard: the cgroup memory files could not be read or parsed, using "
                                  "MemAvailable; set --memory-limit-mib to the container's limit\n");
         cg = CgroupScan{};
     }

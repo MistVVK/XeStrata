@@ -71,7 +71,7 @@ int run(int argc, char** argv) {
         else if (a == "--no-pin") pin = false;
         else if (a == "--stream") stream = true;
         else if (a == "--help" || a == "-h") {
-            std::printf("usage: strata-load --file experts.bin [--layers N] [--threads N] [--chunk-mb N]\n"
+            std::printf("usage: xestrata-load --file experts.bin [--layers N] [--threads N] [--chunk-mb N]\n"
                         "                   [--no-pin] [--stream]\n");
             return 0;
         } else {
@@ -148,7 +148,7 @@ int run(int argc, char** argv) {
 int main(int argc, char** argv) {
     try { return run(argc, argv); }
     catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-load: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-load: %s\n", e.what());
         return 1;
     }
 }

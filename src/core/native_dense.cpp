@@ -10,6 +10,7 @@
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/platform/env.hpp"
 #include <algorithm>
 #include <climits>
 #include <cstdio>
@@ -36,7 +37,7 @@ bool in_range(const std::string& name) {
 enum class HcQ8 { Off, On, Auto };
 HcQ8 hc_q8_mode() {
     static const HcQ8 mode = [] {
-        const char* v = std::getenv("STRATA_HC_Q8");
+        const char* v = strata::env_get("HC_Q8");
         if (v == nullptr || *v == 0) return HcQ8::Auto;
         return std::strtol(v, nullptr, 10) != 0 ? HcQ8::On : HcQ8::Off;
     }();
@@ -101,22 +102,22 @@ bool hc_q8_faster(const WeightTable& table, const std::vector<std::pair<WeightRe
             strata::kernels::fused_gr_time_q8(w, 1, 20, stream, b1, q1, f1);
             strata::kernels::fused_gr_time_q8(w, 4, 20, stream, b4, q4, f4);
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "strata: STRATA_HC_Q8: timing the read failed (%s): the BF16 read\n", e.what());
+            std::fprintf(stderr, "xestrata: XESTRATA_HC_Q8: timing the read failed (%s): the BF16 read\n", e.what());
             return false;
         }
         // the read with the launch that quantizes mixed after it, or (the 32-column Q8_0 up) writing the q8_1 itself
         // STRATA_HC_Q8_FUSE=0/1 overrides the choice between the two Q8_0 forms (the same bits either way)
         static const int fuse_env = [] {
-            const char* v = std::getenv("STRATA_HC_Q8_FUSE");
+            const char* v = strata::env_get("HC_Q8_FUSE");
             return v == nullptr || *v == 0 ? -1 : (int) (std::strtol(v, nullptr, 10) != 0);
         }();
         const bool fuse = fuse_env >= 0 ? fuse_env == 1 : f1 + f4 < q1 + q4;
         const double best = fuse ? f1 + f4 : q1 + q4;
         const bool faster = best < 0.99 * (b1 + b4);
         strata::kernels::fused_gr_set_q8_fuse(faster && fuse);
-        std::fprintf(stderr, "strata: STRATA_HC_Q8: the hyper-connection read and mixed's q8_1, 1 and 4 tokens: BF16 "
+        std::fprintf(stderr, "xestrata: XESTRATA_HC_Q8: the hyper-connection read and mixed's q8_1, 1 and 4 tokens: BF16 "
                              "%.1f + %.1f us, Q8_0 %.1f + %.1f us, Q8_0 writing the q8_1 %.1f + %.1f us: the %s read "
-                             "(STRATA_HC_Q8=0/1 picks one)\n",
+                             "(XESTRATA_HC_Q8=0/1 picks one)\n",
                      b1, b4, q1, q4, f1, f4, faster ? (fuse ? "Q8_0 (q8_1 in the read)" : "Q8_0") : "BF16");
         return faster;
     }
@@ -230,7 +231,7 @@ bool NativeDense::drop_hc_bf16(WeightTable& table, std::string& err) {
     }
     for (void*& p : g_hc_scratch) {
         if (p == nullptr && !strata::gpu::alloc_device(&p, largest)) {
-            err = std::string("native dense (STRATA_HC_Q8): the BF16 scratch: ") + strata::gpu::last_error();
+            err = std::string("native dense (XESTRATA_HC_Q8): the BF16 scratch: ") + strata::gpu::last_error();
             return false;
         }
     }
@@ -376,7 +377,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (tensor.shape.size() != 2 || tensor.shape[0] != (uint64_t) ref.ne0 ||
                     tensor.shape[1] != (uint64_t) ref.ne1 || ref.ne0 > INT_MAX || ref.ne1 > INT_MAX ||
                     !strata::kernels::native_q8_0_rows_ok((int) ref.ne0)) {
-                    err = "native dense (STRATA_HC_Q8): incompatible matrix " + tensor.name; return false;
+                    err = "native dense (XESTRATA_HC_Q8): incompatible matrix " + tensor.name; return false;
                 }
                 const uint64_t bytes = (uint64_t) ref.ne0 / 32 * 34 * (uint64_t) ref.ne1;
                 void* allocation = nullptr;
@@ -385,7 +386,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 if (status) status = strata::gpu::copy(data.get(), gguf.tensor_data(tensor), bytes);
                 if (!status) {
                     if (hc_q8_mode() == HcQ8::Auto) { hc_q8_short = true; break; }
-                    err = "native dense (STRATA_HC_Q8) upload " + tensor.name + ": " + strata::gpu::last_error();
+                    err = "native dense (XESTRATA_HC_Q8) upload " + tensor.name + ": " + strata::gpu::last_error();
                     return false;
                 }
                 strata::kernels::native_q8_0_to_rows(data.get(), (int) ref.ne0, (int) ref.ne1, &compute);
@@ -404,14 +405,14 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     continue;
                 if (ref.ne0 > INT_MAX || ref.ne1 > INT_MAX || ref.elements != ref.ne0 * ref.ne1 ||
                     ref.bytes != (uint64_t) ref.elements * 2 || !strata::kernels::native_q8_0_rows_ok((int) ref.ne0)) {
-                    err = "native dense (STRATA_HC_Q8): the arena copy of " + name + " is not a BF16 matrix";
+                    err = "native dense (XESTRATA_HC_Q8): the arena copy of " + name + " is not a BF16 matrix";
                     return false;
                 }
                 const uint64_t nb = (uint64_t) ref.elements / 32, bytes = nb * 34;
                 void* allocation = nullptr;
                 if (!strata::gpu::alloc_device(&allocation, bytes)) {
                     if (hc_q8_mode() == HcQ8::Auto) { hc_q8_short = true; break; }
-                    err = "native dense (STRATA_HC_Q8) alloc " + name + ": " + strata::gpu::last_error();
+                    err = "native dense (XESTRATA_HC_Q8) alloc " + name + ": " + strata::gpu::last_error();
                     return false;
                 }
                 DevicePtr data(allocation);
@@ -434,8 +435,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             const double share = strata::gpu::mem_info(&free_b, &total_b) && free_b + q8_bytes > 0
                                      ? (double) q8_bytes / (double) (free_b + q8_bytes) : 1.0;
             if (!hc_side_ && share > 0.05) {
-                std::fprintf(stderr, "strata: STRATA_HC_Q8: the Q8_0 hyper-connection projections would take %.1f%% "
-                                     "of the free VRAM from the expert cache: the BF16 read (STRATA_HC_Q8=1 keeps "
+                std::fprintf(stderr, "xestrata: XESTRATA_HC_Q8: the Q8_0 hyper-connection projections would take %.1f%% "
+                                     "of the free VRAM from the expert cache: the BF16 read (XESTRATA_HC_Q8=1 keeps "
                                      "them)\n", 100.0 * share);
                 hc_q8.clear();
             } else if (!hc_q8_faster(table, hc_q8, &compute)) {
@@ -476,10 +477,10 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         }
         bytes_ = total + hc_q8_bytes;
         if (!hc_q8_.empty())
-            std::fprintf(stderr, "strata: STRATA_HC_Q8: %.2f GiB of Q8_0 hyper-connection projections (%zu)\n",
+            std::fprintf(stderr, "xestrata: XESTRATA_HC_Q8: %.2f GiB of Q8_0 hyper-connection projections (%zu)\n",
                          (double) hc_q8_bytes / 1073741824.0, hc_q8_.size());
         else if (hc_q8_short)
-            std::fprintf(stderr, "strata: STRATA_HC_Q8: no VRAM for the Q8_0 hyper-connection projections, the BF16 "
+            std::fprintf(stderr, "xestrata: XESTRATA_HC_Q8: no VRAM for the Q8_0 hyper-connection projections, the BF16 "
                                  "read\n");
         return true;
     } catch (const std::exception& error) {

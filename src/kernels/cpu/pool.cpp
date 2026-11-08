@@ -8,6 +8,7 @@
 #include "strata/core/progress.hpp"
 #include "strata/kernels/cpu/canon_expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -60,24 +61,24 @@ bool cpu_waitpkg() {
 }
 uint64_t umwait_cycles() {
     static const uint64_t c = [] {
-        const char* e = std::getenv("STRATA_POOL_UMWAIT");
+        const char* e = strata::env_get("POOL_UMWAIT");
         if (e == nullptr || std::strtoll(e, nullptr, 10) <= 0) return (uint64_t) 0;
         if (!cpu_waitpkg()) {
-            std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: this CPU has no WAITPKG, the workers spin\n");
+            std::fprintf(stderr, "xestrata: XESTRATA_POOL_UMWAIT: this CPU has no WAITPKG, the workers spin\n");
             return (uint64_t) 0;
         }
-        std::fprintf(stderr, "strata: STRATA_POOL_UMWAIT: parked workers wait with UMWAIT (%lld cycles)\n", std::strtoll(e, nullptr, 10));
+        std::fprintf(stderr, "xestrata: XESTRATA_POOL_UMWAIT: parked workers wait with UMWAIT (%lld cycles)\n", std::strtoll(e, nullptr, 10));
         return (uint64_t) std::strtoll(e, nullptr, 10);
     }();
     return c;
 }
 unsigned umwait_state() {   // 1 = C0.1 (light), 0 = C0.2
-    static const unsigned s = [] { const char* e = std::getenv("STRATA_POOL_UMWAIT_C02"); return e && *e == '1' ? 0u : 1u; }();
+    static const unsigned s = [] { const char* e = strata::env_get("POOL_UMWAIT_C02"); return e && *e == '1' ? 0u : 1u; }();
     return s;
 }
 uint64_t umwait_escalate() {   // a park that has lasted this long is a GPU phase, where a slower wake costs little
     static const uint64_t c = [] {
-        const char* e = std::getenv("STRATA_POOL_UMWAIT_ESC");
+        const char* e = strata::env_get("POOL_UMWAIT_ESC");
         return e ? (uint64_t) (std::max)(0LL, std::strtoll(e, nullptr, 10)) : (uint64_t) 0;
     }();
     return c;
@@ -258,7 +259,7 @@ void pin_this_thread(int core) {
     target.Group = (WORD) (core / 64);
     target.Mask = KAFFINITY(1) << (core & 63);
     if (!SetThreadGroupAffinity(GetCurrentThread(), &target, nullptr))
-        std::fprintf(stderr, "strata cpu pool: affinity for processor %d failed: %lu; previous affinity kept\n", core,
+        std::fprintf(stderr, "xestrata cpu pool: affinity for processor %d failed: %lu; previous affinity kept\n", core,
                      (unsigned long) GetLastError());
 #else
     cpu_set_t set;
@@ -280,7 +281,7 @@ ThreadAffinity pin_current_thread(int core) {
     previous.cpu_sets.resize(count);
     if ((count != 0 && !GetThreadSelectedCpuSets(GetCurrentThread(), previous.cpu_sets.data(), count, &count)) ||
         !cpu_set_for_core(core, target) || !SetThreadSelectedCpuSets(GetCurrentThread(), &target, 1)) {
-        std::fprintf(stderr, "strata cpu pool: host CPU Set selection for processor %d failed: %lu; previous placement "
+        std::fprintf(stderr, "xestrata cpu pool: host CPU Set selection for processor %d failed: %lu; previous placement "
                              "kept\n", core, (unsigned long) GetLastError());
         return {};
     }
@@ -303,7 +304,7 @@ void restore_thread_affinity(const ThreadAffinity& previous) {
     // an empty selection puts the thread back on the process defaults
     if (!SetThreadSelectedCpuSets(GetCurrentThread(), previous.cpu_sets.empty() ? nullptr : previous.cpu_sets.data(),
                                   (ULONG) previous.cpu_sets.size()))
-        std::fprintf(stderr, "strata cpu pool: host CPU Set restoration failed: %lu\n", (unsigned long) GetLastError());
+        std::fprintf(stderr, "xestrata cpu pool: host CPU Set restoration failed: %lu\n", (unsigned long) GetLastError());
 #else
     cpu_set_t set;
     CPU_ZERO(&set);
@@ -383,7 +384,7 @@ static int default_worker_cap() {
 ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int first_core, int tasks)
     : tasks_(tasks), host_works_(host_works) {
     if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
-    if (const char* e = std::getenv("STRATA_POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
+    if (const char* e = strata::env_get("POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
         spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
     pinned_ = pin;
     std::vector<int> cores = physical_cores(true);
@@ -395,10 +396,10 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int first_core,
         static std::atomic<bool> told{false};   // (a second pool, --batch-cpu-split's, checks the same list again)
         const bool say = !told.exchange(true);
         if (say)
-            for (const std::string& w : chk.warnings) std::fprintf(stderr, "strata cpu pool: --pool-cores: %s\n", w.c_str());
+            for (const std::string& w : chk.warnings) std::fprintf(stderr, "xestrata cpu pool: --pool-cores: %s\n", w.c_str());
         if (chk.cpus.empty()) {
             if (say)
-                std::fprintf(stderr, "strata cpu pool: --pool-cores: no usable logical processor in the list; the pool "
+                std::fprintf(stderr, "xestrata cpu pool: --pool-cores: no usable logical processor in the list; the pool "
                                      "uses its default placement\n");
         } else {
             cores = chk.cpus;
@@ -423,7 +424,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int first_core,
         const int core = pin ? (c < (int) cores.size() ? cores[(size_t) c] : -1) : -1;
         if (core >= 0) worker_cpus_.push_back(core);
         threads_.emplace_back([this, i, core] {
-            strata::platform::name_this_thread("strata-pool", i);
+            strata::platform::name_this_thread("xs-pool", i);
             strata::aux_cpus::note_owned_thread();   // --aux-cpus never moves a worker
             pin_this_thread(core);
             worker(i);
@@ -538,7 +539,7 @@ int ExpertPool::claim(uint32_t epoch) {
 
 uint32_t ExpertPool::begin_batch(int n) {
     if (n < 0 || n > 0xffff) {
-        std::fprintf(stderr, "strata: expert pool batch of %d jobs is out of range\n", n);
+        std::fprintf(stderr, "xestrata: expert pool batch of %d jobs is out of range\n", n);
         std::abort();
     }
     // Every job of the previous batch has completed (`wait_done`), and a claim of it can no longer succeed, so
@@ -561,7 +562,7 @@ void ExpertPool::wait_parked(const char* what) {
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u) t0 = now;
         else if (now - t0 > kStall) {
-            std::fprintf(stderr, "strata: the CPU expert pool stalled %s (%u of %d workers parked) - stopping the engine "
+            std::fprintf(stderr, "xestrata: the CPU expert pool stalled %s (%u of %d workers parked) - stopping the engine "
                                  "so the server can start it again (issue #29)\n",
                          what, parked_.load(), n_);
             strata::core::release_gpu_waits(stderr);   // #267: the GPU may be spinning on this layer's flag
@@ -584,7 +585,7 @@ void ExpertPool::wait_done(int n) {
         const auto now = std::chrono::steady_clock::now();
         if (spins == 1024u || d != seen) { t0 = now; seen = d; }     // progress restarts the clock
         else if (now - t0 > kStall) {
-            std::fprintf(stderr, "strata: the CPU expert pool stalled: %u of %d jobs done, %u of %d workers parked - "
+            std::fprintf(stderr, "xestrata: the CPU expert pool stalled: %u of %d jobs done, %u of %d workers parked - "
                                  "stopping the engine so the server can start it again (issue #29)\n",
                          d, n, parked_.load(), n_);
             strata::core::release_gpu_waits(stderr);   // #267

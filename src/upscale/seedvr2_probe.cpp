@@ -23,6 +23,7 @@
 #include "strata/image/mf_vae.hpp"
 #include "strata/upscale/seedvr2.hpp"
 #include "strata/upscale/seedvr2_dit.hpp"
+#include "strata/platform/env.hpp"
 #include "../image/probe_npy.hpp"
 
 #include <algorithm>
@@ -228,12 +229,12 @@ int video(const std::string& path, const std::string& clip, int64_t W, int64_t H
         size_t free = 0, total = 0;
         strata::gpu::mem_info(&free, &total);
         uint64_t room = free > (1ull << 30) ? (uint64_t) free - (1ull << 30) : 0;
-        if (const char* e = std::getenv("STRATA_SEEDVR2_ROOM_MIB"))
+        if (const char* e = strata::env_get("SEEDVR2_ROOM_MIB"))
             room = std::min<uint64_t>(room, std::stoull(e) << 20);
         m.set_room(room);
     }
     // STRATA_PROBE_REPEAT: the clip run that many times, each one's time printed (the last warm), its frames the last's
-    const char* rep = std::getenv("STRATA_PROBE_REPEAT");
+    const char* rep = strata::env_get("PROBE_REPEAT");
     const long repeat = rep != nullptr ? std::max(1L, std::strtol(rep, nullptr, 10)) : 1L;
     for (long r = 0; r < repeat; ++r) {
         res.clear();

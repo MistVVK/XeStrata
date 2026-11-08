@@ -521,7 +521,7 @@ Seedvr2::~Seedvr2() {
         impl_->drop_scratch();
         core::Runtime::get().stream(impl_->s).wait();
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image: SeedVR2's queue at its end: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image: SeedVR2's queue at its end: %s\n", e.what());
     }
 }
 

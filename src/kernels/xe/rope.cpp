@@ -16,6 +16,7 @@
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_rope
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <array>
 #include <atomic>
@@ -76,7 +77,7 @@ void rope_table_release(const float* cos_tab) {
 }
 RopeTab rope_table_for(const RopeScaling& scaling) {
     static const bool on = [] {
-        const char* v = std::getenv("STRATA_ROPE_TABLE");
+        const char* v = strata::env_get("ROPE_TABLE");
         return v != nullptr && v[0] == '1';
     }();
     if (!on) return RopeTab{};
@@ -173,7 +174,7 @@ void native_rope_apply(const float* x, float* out, int rows, int head_dim,
 
 bool native_norm_rope_usable(int head_dim, int n_rot) {
     static const bool on = [] {
-        const char* v = std::getenv("STRATA_NO_NORM_ROPE");
+        const char* v = strata::env_get("NO_NORM_ROPE");
         return v == nullptr || std::strtol(v, nullptr, 10) == 0;
     }();
     return on && (head_dim == 128 || head_dim == 256) && (n_rot == 64 || n_rot == head_dim);

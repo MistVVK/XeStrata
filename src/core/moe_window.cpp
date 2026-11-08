@@ -14,6 +14,7 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -141,7 +142,7 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
     // segments also on the processor's own graphics, where the running kernels see the host's writes through the first
     // Level Zero adapter but wait on them slowly: llm-jp-4.1 Q4_K_M on the UHD 770 decoded 1.7 tok/s waiting, 5.3 in
     // segments (2026-10-19)
-    const char* v = std::getenv("STRATA_VERIFY_SEGMENTED");
+    const char* v = strata::env_get("VERIFY_SEGMENTED");
     segmented_ = v != nullptr ? std::strtol(v, nullptr, 10) != 0
                               : core::integrated_gpu(core::Runtime::get().device()) ||
                                     !strata::kernels::doorbell_visible(probe);
@@ -275,7 +276,7 @@ bool MoeWindow::serve(int64_t rings, const int64_t* layers, const int* grps, con
     // STRATA_WINDOW_TIMES=1 (measuring): the host's time per ring, waiting for it (the GPU's work up to the layer's
     // experts) and answering it (the plan, the CPU's experts and the flags), summed over the run and printed every
     // 64 windows
-    static const bool times = std::getenv("STRATA_WINDOW_TIMES") != nullptr;
+    static const bool times = strata::env_get("WINDOW_TIMES") != nullptr;
     static double t_wait = 0.0, t_answer = 0.0, t_tail = 0.0;
     static int64_t n_rings = 0, n_windows = 0;
     const Clock::time_point w0 = Clock::now();

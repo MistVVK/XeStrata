@@ -189,7 +189,7 @@ int info(const std::string& path) {
     si::HunyuanImage3File f;
     std::string err;
     if (!f.open(path, err, true)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     std::printf("%s\n", path.c_str());
@@ -250,16 +250,16 @@ int calib(const std::string& qpath, const std::string& qname, const std::string&
     si::HunyuanImage3File q;
     std::string err;
     if (!q.open(qpath, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     si::HunyuanImage3Matrix m;
     if (!q.matrix(qname, m, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     if (m.experts > 1 && (expert < 0 || expert >= m.experts)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: expert %lld of %lld\n", (long long) expert,
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: expert %lld of %lld\n", (long long) expert,
                      (long long) m.experts);
         return 1;
     }
@@ -268,11 +268,11 @@ int calib(const std::string& qpath, const std::string& qname, const std::string&
     try {
         ref = b.f32(bname);   // one expert a tensor in the original's files: [N][K]
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", e.what());
         return 1;
     }
     if ((int64_t) ref.size() != m.n * m.k) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s holds %lld values, the quantized row %lld x %lld\n",
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s holds %lld values, the quantized row %lld x %lld\n",
                      bname.c_str(), (long long) ref.size(), (long long) m.n, (long long) m.k);
         return 1;
     }
@@ -340,13 +340,13 @@ int seq_cmd(const std::string& idfile) {
     std::vector<int32_t> ids;
     int64_t h = 0, w = 0;
     if (!read_ids(idfile, ids, h, w)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s\n", idfile.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s\n", idfile.c_str());
         return 1;
     }
     std::string terr;
     const int64_t keep = si::hunyuanimage3_trim(ids.data(), (int64_t) ids.size(), terr);
     if (keep < 0) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", terr.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", terr.c_str());
         return 1;
     }
     ids.resize((size_t) keep);
@@ -354,7 +354,7 @@ int seq_cmd(const std::string& idfile) {
     int64_t start = 0;
     std::string err;
     if (!si::hunyuanimage3_positions(ids.data(), (int64_t) ids.size(), h, w, y, x, start, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     std::printf("%s: %zu tokens, image block %lld x %lld at %lld (n_text %lld)\n", idfile.c_str(), ids.size(),
@@ -374,43 +374,43 @@ int layer_cmd(const std::string& path, int64_t layer, int64_t t, const std::stri
     si::HunyuanImage3File f;
     std::string err;
     if (!f.open(path, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     std::vector<int32_t> ids, y, x;
     int64_t h = 0, w = 0, start = 0;
     if (!idfile.empty()) {
         if (!read_ids(idfile, ids, h, w)) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s\n", idfile.c_str());
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s\n", idfile.c_str());
             return 1;
         }
         // the reference's ids carry <eoi> and </answer> after the block; the engine's sequence stops at the block
         const int64_t keep = si::hunyuanimage3_trim(ids.data(), (int64_t) ids.size(), err);
         if (keep < 0) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
             return 1;
         }
         ids.resize((size_t) keep);
         if ((int64_t) ids.size() != t) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s holds %zu ids, the command says %lld tokens\n",
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s holds %zu ids, the command says %lld tokens\n",
                          idfile.c_str(), ids.size(), (long long) t);
             return 1;
         }
         if (!si::hunyuanimage3_positions(ids.data(), t, h, w, y, x, start, err)) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
             return 1;
         }
     }
     std::vector<float> xx((size_t) (t * 4096)), out((size_t) (t * 4096));
     std::FILE* in = std::fopen(src.c_str(), "rb");
     if (in == nullptr) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot open %s\n", src.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot open %s\n", src.c_str());
         return 1;
     }
     const size_t got = std::fread(xx.data(), sizeof(float), xx.size(), in);
     std::fclose(in);
     if (got != xx.size()) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s holds %zu of %zu values\n", src.c_str(), got,
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s holds %zu of %zu values\n", src.c_str(), got,
                      xx.size());
         return 1;
     }
@@ -419,12 +419,12 @@ int layer_cmd(const std::string& path, int64_t layer, int64_t t, const std::stri
                         : si::hunyuanimage3_layer_host(f, layer, xx.data(), t, out.data(), y.data(), x.data(),
                                                        h * w, err);
     if (!ok) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     std::FILE* o = std::fopen(dst.c_str(), "wb");
     if (o == nullptr) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot write %s\n", dst.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot write %s\n", dst.c_str());
         return 1;
     }
     std::fwrite(out.data(), sizeof(float), out.size(), o);
@@ -450,32 +450,32 @@ int step_cmd(const std::string& path, const std::string& idfile, int64_t layers,
     si::HunyuanImage3File f;
     std::string err;
     if (!f.open(path, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     std::vector<int32_t> ids;
     int64_t h = 0, w = 0;
     if (!read_ids(idfile, ids, h, w)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s\n", idfile.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s\n", idfile.c_str());
         return 1;
     }
     const int64_t keep = si::hunyuanimage3_trim(ids.data(), (int64_t) ids.size(), err);
     if (keep < 0) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     ids.resize((size_t) keep);
     std::vector<float> latent((size_t) (32 * h * w)), vel((size_t) (32 * h * w));
     std::FILE* fp = std::fopen(latent_in.c_str(), "rb");
     if (fp == nullptr || std::fread(latent.data(), sizeof(float), latent.size(), fp) != latent.size()) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s\n", latent_in.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s\n", latent_in.c_str());
         if (fp != nullptr) std::fclose(fp);
         return 1;
     }
     std::fclose(fp);
     if (!si::hunyuanimage3_step_host(f, ids.data(), (int64_t) ids.size(), h, w, latent.data(), timestep,
                                      /*timestep_r*/ 0.0f, /*guidance*/ 2500.0f, layers, vel.data(), err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     double sum = 0, absmax = 0;
@@ -485,7 +485,7 @@ int step_cmd(const std::string& path, const std::string& idfile, int64_t layers,
     }
     std::FILE* out = std::fopen(dst.c_str(), "wb");
     if (out == nullptr) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot write %s\n", dst.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot write %s\n", dst.c_str());
         return 1;
     }
     std::fwrite(vel.data(), sizeof(float), vel.size(), out);
@@ -503,18 +503,18 @@ int gpulayer_cmd(const std::string& path, int64_t layer, const std::string& idfi
     si::HunyuanImage3File f;
     std::string err;
     if (!f.open(path, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     std::vector<int32_t> ids;
     int64_t h = 0, w = 0;
     if (!read_ids(idfile, ids, h, w)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s\n", idfile.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s\n", idfile.c_str());
         return 1;
     }
     const int64_t keep = si::hunyuanimage3_trim(ids.data(), (int64_t) ids.size(), err);
     if (keep < 0) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     ids.resize((size_t) keep);
@@ -522,20 +522,20 @@ int gpulayer_cmd(const std::string& path, int64_t layer, const std::string& idfi
     std::vector<int32_t> y, x;
     int64_t start = 0;
     if (!si::hunyuanimage3_positions(ids.data(), T, h, w, y, x, start, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     std::vector<float> in((size_t) T * 4096);
     std::FILE* fp = std::fopen(src.c_str(), "rb");
     if (fp == nullptr || std::fread(in.data(), sizeof(float), in.size(), fp) != in.size()) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s\n", src.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s\n", src.c_str());
         if (fp != nullptr) std::fclose(fp);
         return 1;
     }
     std::fclose(fp);
     std::vector<float> host_out((size_t) T * 4096);
     if (!si::hunyuanimage3_layer_host(f, layer, in.data(), T, host_out.data(), y.data(), x.data(), n_img, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: host layer: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: host layer: %s\n", err.c_str());
         return 1;
     }
     std::vector<float> stage((size_t) 6144 * 4096);
@@ -543,7 +543,7 @@ int gpulayer_cmd(const std::string& path, int64_t layer, const std::string& idfi
     void* s = strata::core::Runtime::get().create_stream();
     float *dx = nullptr, *dout = nullptr;
     if (!gpu::alloc_device(&dx, in.size() * sizeof(float)) || !gpu::alloc_device(&dout, in.size() * sizeof(float))) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: GPU memory: %s\n", gpu::last_error());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: GPU memory: %s\n", gpu::last_error());
         return 1;
     }
     gpu::copy(dx, in.data(), in.size() * sizeof(float));
@@ -551,13 +551,13 @@ int gpulayer_cmd(const std::string& path, int64_t layer, const std::string& idfi
     int32_t* dxy = nullptr;
     if (!gpu::alloc_device(&dy, (size_t) T * sizeof(int32_t)) ||
         !gpu::alloc_device(&dxy, (size_t) T * sizeof(int32_t))) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: GPU memory: %s\n", gpu::last_error());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: GPU memory: %s\n", gpu::last_error());
         return 1;
     }
     gpu::copy(dy, y.data(), (size_t) T * sizeof(int32_t));
     gpu::copy(dxy, x.data(), (size_t) T * sizeof(int32_t));
     if (!si::hunyuanimage3_layer_gpu(f, layer, dx, dout, T, dy, dxy, n_img, stage.data(), scratch16.data(), s, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: GPU layer: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: GPU layer: %s\n", err.c_str());
         return 1;
     }
     gpu::device_sync();
@@ -603,7 +603,7 @@ int parts_cmd(const std::string& path, int64_t h, int64_t w, int64_t t, float ti
     si::HunyuanImage3File f;
     std::string err;
     if (!f.open(path, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     const int64_t n = h * w;
@@ -616,7 +616,7 @@ int parts_cmd(const std::string& path, int64_t h, int64_t w, int64_t t, float ti
         return got == v.size();
     };
     if (!read_all(latent_in, latent) || !read_all(hidden_in, hidden)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read the inputs\n");
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read the inputs\n");
         return 1;
     }
     std::vector<int32_t> ids((size_t) t);
@@ -627,7 +627,7 @@ int parts_cmd(const std::string& path, int64_t h, int64_t w, int64_t t, float ti
         !si::hunyuanimage3_time_host(f, "timestep_emb", timestep, tim.data(), err) ||
         !si::hunyuanimage3_patch_embed_host(f, latent.data(), h, w, timestep, patch.data(), err) ||
         !si::hunyuanimage3_final_layer_host(f, hidden.data(), h, w, timestep, fin.data(), err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     fs::create_directories(dir);
@@ -641,7 +641,7 @@ int parts_cmd(const std::string& path, int64_t h, int64_t w, int64_t t, float ti
     };
     if (!write_all("wte.bin", wte) || !write_all("time.bin", tim) || !write_all("patch.bin", patch) ||
         !write_all("final.bin", fin)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot write to %s\n", dir.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot write to %s\n", dir.c_str());
         return 1;
     }
     double psum = 0, fsum = 0;
@@ -659,7 +659,7 @@ int parts_cmd(const std::string& path, int64_t h, int64_t w, int64_t t, float ti
 int mem_cmd() {
     size_t free_b = 0, total_b = 0;
     if (!strata::gpu::mem_info(&free_b, &total_b)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", strata::gpu::last_error());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", strata::gpu::last_error());
         return 1;
     }
     std::printf("VRAM: free %.1f MiB of %.1f MiB, cap %.1f MiB (%s)\n", (double) free_b / 1048576.0,
@@ -678,7 +678,7 @@ int around_cmd(const std::string& path, int64_t th, int64_t tw, float timestep) 
     si::HunyuanImage3File f;
     std::string err;
     if (!f.open(path, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     const int64_t n = th * tw, hidden = 4096, latent_c = 32;
@@ -703,13 +703,13 @@ int around_cmd(const std::string& path, int64_t th, int64_t tw, float timestep) 
         write_all("e_latent.bin", latent.data(), latent.size() * 4);
     }
     if (!si::hunyuanimage3_patch_embed_host(f, latent.data(), th, tw, timestep, rows_host.data(), err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     const double host_patch = std::chrono::duration<double>(clock::now() - t0).count();
     const auto t1 = clock::now();
     if (!si::hunyuanimage3_final_layer_host(f, rows_host.data(), th, tw, timestep, vel_host.data(), err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     const double host_final = std::chrono::duration<double>(clock::now() - t1).count();
@@ -717,12 +717,12 @@ int around_cmd(const std::string& path, int64_t th, int64_t tw, float timestep) 
     si::HunyuanImage3EntryExit around;
     void* probe_stream = strata::core::Runtime::get().create_stream();
     if (!around.open(path, probe_stream, err) || !around.set_grid(th, tw, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     const auto t2 = clock::now();
     if (!around.patch_embed(latent.data(), th, tw, timestep, rows_gpu.data(), err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     const double gpu_patch = std::chrono::duration<double>(clock::now() - t2).count();
@@ -751,7 +751,7 @@ int around_cmd(const std::string& path, int64_t th, int64_t tw, float timestep) 
 
     const auto t3 = clock::now();
     if (!around.final_layer(rows_host.data(), th, tw, timestep, vel_gpu.data(), err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     const double gpu_final = std::chrono::duration<double>(clock::now() - t3).count();
@@ -896,25 +896,25 @@ int walk_cmd(const std::string& path, const std::string& idfile, const std::stri
     namespace gpu = strata::gpu;
     Npy hidden, layers;
     if (!read_npy(golden + "/step0_hidden_in.npy", hidden) || hidden.shape.size() != 2) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s/step0_hidden_in.npy\n",
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s/step0_hidden_in.npy\n",
                      golden.c_str());
         return 1;
     }
     if (!read_npy(golden + "/step0_layer_hidden.npy", layers) || layers.shape.size() != 3) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s/step0_layer_hidden.npy\n",
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s/step0_layer_hidden.npy\n",
                      golden.c_str());
         return 1;
     }
     std::vector<int32_t> ids;
     int64_t h = 0, w = 0;
     if (!read_ids(idfile, ids, h, w)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s\n", idfile.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s\n", idfile.c_str());
         return 1;
     }
     std::string err;
     const int64_t keep = si::hunyuanimage3_trim(ids.data(), (int64_t) ids.size(), err);
     if (keep < 0) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     ids.resize((size_t) keep);
@@ -922,7 +922,7 @@ int walk_cmd(const std::string& path, const std::string& idfile, const std::stri
     const int64_t n_layers = want_layers > 0 ? want_layers : layers.shape[0];
     if (hidden.shape[0] != T || layers.shape[1] != T || n_layers <= 0 || n_layers > layers.shape[0]) {
         std::fprintf(stderr,
-                     "strata-image-hunyuanimage3-probe: the golden is %ld tokens of %ld layers, the ids %ld, "
+                     "xestrata-image-hunyuanimage3-probe: the golden is %ld tokens of %ld layers, the ids %ld, "
                      "%ld layers asked for\n", (long) hidden.shape[0], (long) layers.shape[0], (long) T,
                      (long) n_layers);
         return 1;
@@ -930,14 +930,14 @@ int walk_cmd(const std::string& path, const std::string& idfile, const std::stri
     std::vector<int32_t> y, x;
     int64_t start = 0;
     if (!si::hunyuanimage3_positions(ids.data(), T, h, w, y, x, start, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
 
     si::HunyuanImage3Dit dit;
     void* s = strata::core::Runtime::get().create_stream();
     if (!dit.open(path, s, err, n_layers)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: open: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: open: %s\n", err.c_str());
         return 1;
     }
     size_t free_b = 0, total_b = 0;
@@ -954,7 +954,7 @@ int walk_cmd(const std::string& path, const std::string& idfile, const std::stri
     try {
         dit.set_bank_budget(budget);
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: the bank budget: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: the bank budget: %s\n", e.what());
         return 1;
     }
     std::printf("walk: %s  (%ld layers, T=%ld, image block %ld tokens)\n", dit.file()->path().c_str(),
@@ -966,7 +966,7 @@ int walk_cmd(const std::string& path, const std::string& idfile, const std::stri
     std::printf("  VRAM: free %.2f GB, cap %.2f GB, budget %.2f GB, resident %d of %d banks\n", (double) free_b / gb,
                 (double) room / gb, (double) budget / gb, dit.resident_banks(), (int) dit.layers());
     if (!dit.set_sequence(T, n_img, y.data(), x.data(), err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: set_sequence: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: set_sequence: %s\n", err.c_str());
         return 1;
     }
 
@@ -975,7 +975,7 @@ int walk_cmd(const std::string& path, const std::string& idfile, const std::stri
     const size_t row = (size_t) T * C;
     float *dx = nullptr, *dout = nullptr;
     if (!gpu::alloc_device(&dx, row * sizeof(float)) || !gpu::alloc_device(&dout, row * sizeof(float))) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: GPU memory: %s\n", gpu::last_error());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: GPU memory: %s\n", gpu::last_error());
         return 1;
     }
     std::vector<float> got(row);
@@ -984,7 +984,7 @@ int walk_cmd(const std::string& path, const std::string& idfile, const std::stri
     // hidden states grow past 400 by the last layer, and a rel over all 301 rows is their story, not the image's.
     auto check = [&](int64_t l, const float* out) -> Diff2 {
         if (!gpu::copy(got.data(), out, row * sizeof(float))) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: layer %ld: %s\n", (long) l, gpu::last_error());
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: layer %ld: %s\n", (long) l, gpu::last_error());
             return Diff2{};
         }
         return compare2(got.data(), gl + (size_t) l * row, (int64_t) row);
@@ -1004,7 +1004,7 @@ int walk_cmd(const std::string& path, const std::string& idfile, const std::stri
         const float* src = l == 0 ? hidden.f32.data() : gl + (size_t) (l - 1) * row;
         gpu::copy(dx, src, row * sizeof(float));
         if (!dit.layer(l, dx, dout, err)) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: layer %ld: %s\n", (long) l, err.c_str());
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: layer %ld: %s\n", (long) l, err.c_str());
             return 1;
         }
         const Diff2 d = check(l, dout), di = check_img(l, dout);
@@ -1037,7 +1037,7 @@ int walk_cmd(const std::string& path, const std::string& idfile, const std::stri
             }
         }
     }, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: forward: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: forward: %s\n", err.c_str());
         return 1;
     }
     const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -1069,13 +1069,13 @@ int sample_cmd(const std::string& path, const std::string& idfile, const std::st
     std::vector<int32_t> ids;
     int64_t h = 0, w = 0;
     if (!read_ids(idfile, ids, h, w)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s\n", idfile.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s\n", idfile.c_str());
         return 1;
     }
     std::string err;
     const int64_t keep = si::hunyuanimage3_trim(ids.data(), (int64_t) ids.size(), err);
     if (keep < 0) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     ids.resize((size_t) keep);
@@ -1083,16 +1083,16 @@ int sample_cmd(const std::string& path, const std::string& idfile, const std::st
     std::vector<int32_t> y, x;
     int64_t start = 0;
     if (!si::hunyuanimage3_positions(ids.data(), T, h, w, y, x, start, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     Npy lat0;
     if (steps < 1) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: STEPS must be at least 1\n");
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: STEPS must be at least 1\n");
         return 2;
     }
     if (!read_npy(golden + "/latent_init.npy", lat0) || lat0.f32.size() != (size_t) n_lat) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s/latent_init.npy ([32][%lld][%lld])\n",
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s/latent_init.npy ([32][%lld][%lld])\n",
                      golden.c_str(), (long long) h, (long long) w);
         return 1;
     }
@@ -1101,7 +1101,7 @@ int sample_cmd(const std::string& path, const std::string& idfile, const std::st
     si::HunyuanImage3Dit dit;
     void* s = strata::core::Runtime::get().create_stream();
     if (!dit.open(path, s, err, want_layers)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: open: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: open: %s\n", err.c_str());
         return 1;
     }
     size_t free_b = 0, total_b = 0;
@@ -1117,7 +1117,7 @@ int sample_cmd(const std::string& path, const std::string& idfile, const std::st
     try {
         dit.set_bank_budget(budget);
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: the bank budget: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: the bank budget: %s\n", e.what());
         return 1;
     }
     std::printf("sample: %s  (%ld layers, T=%ld, %ld x %ld block, %ld steps)\n", dit.file()->path().c_str(),
@@ -1131,7 +1131,7 @@ int sample_cmd(const std::string& path, const std::string& idfile, const std::st
         std::printf("  %ld of %ld layers: a plumbing check - the golden's numbers cannot hold for a truncated model\n",
                     (long) dit.layers(), (long) dit.file()->layer_count());
     if (!dit.set_sequence(T, n_img, y.data(), x.data(), err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: set_sequence: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: set_sequence: %s\n", err.c_str());
         return 1;
     }
 
@@ -1141,7 +1141,7 @@ int sample_cmd(const std::string& path, const std::string& idfile, const std::st
     // golden's step s only with the golden's own sigmas, whose entry s + 1 is that step's timestep_r.
     const int64_t sched = 8;   // the golden's steps (records/.../golden-cpu/manifest.json)
     if (steps > sched) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: the golden holds %ld steps\n", (long) sched);
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: the golden holds %ld steps\n", (long) sched);
         return 2;
     }
     std::vector<float> sigmas((size_t) (sched + 1));
@@ -1159,7 +1159,7 @@ int sample_cmd(const std::string& path, const std::string& idfile, const std::st
             !read_npy(p + "v.npy", g_v) || !read_npy(p + "latent_out.npy", g_x) ||
             g_in.f32.size() != hid.size() || g_out.f32.size() != hid.size() ||
             g_v.f32.size() != (size_t) n_lat || g_x.f32.size() != (size_t) n_lat) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s: no step-%ld golden files of the right "
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s: no step-%ld golden files of the right "
                                  "sizes\n", golden.c_str(), (long) st);
             return 1;
         }
@@ -1167,14 +1167,14 @@ int sample_cmd(const std::string& path, const std::string& idfile, const std::st
         auto clk = std::chrono::steady_clock::now();
         if (!si::hunyuanimage3_hidden_in_host(f, ids.data(), T, h, w, lat.data(), t, t_r, guidance, hid.data(),
                                               err)) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: step %ld: %s\n", (long) st, err.c_str());
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: step %ld: %s\n", (long) st, err.c_str());
             return 1;
         }
         const double asm_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - clk).count();
         const Diff d_in = compare(hid.data(), g_in.f32.data(), (int64_t) hid.size());
         clk = std::chrono::steady_clock::now();
         if (!dit.forward(hid.data(), hid.data(), dit.layers(), {}, err)) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: step %ld: forward: %s\n", (long) st,
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: step %ld: forward: %s\n", (long) st,
                          err.c_str());
             return 1;
         }
@@ -1186,7 +1186,7 @@ int sample_cmd(const std::string& path, const std::string& idfile, const std::st
         const Rows rh = compare_rows(img, gim, n_img, 4096, 0.2);
         clk = std::chrono::steady_clock::now();
         if (!si::hunyuanimage3_final_layer_host(f, img, h, w, t, vel.data(), err)) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: step %ld: %s\n", (long) st, err.c_str());
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: step %ld: %s\n", (long) st, err.c_str());
             return 1;
         }
         const double fin_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - clk).count();
@@ -1218,7 +1218,7 @@ int sample_cmd(const std::string& path, const std::string& idfile, const std::st
 
     Npy g_fin;
     if (!read_npy(golden + "/final_latent.npy", g_fin) || g_fin.f32.size() != (size_t) n_lat) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s/final_latent.npy\n",
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s/final_latent.npy\n",
                      golden.c_str());
         return 1;
     }
@@ -1254,7 +1254,7 @@ int sample_cmd(const std::string& path, const std::string& idfile, const std::st
             std::fclose(fo);
             std::printf("  wrote %s\n", dst.c_str());
         } else {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot write %s\n", dst.c_str());
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot write %s\n", dst.c_str());
             return 1;
         }
     }
@@ -1279,14 +1279,14 @@ int vae_cmd(const std::string& vae_file, const std::string& lat_file, const std:
     if (lat_file.size() > 4 && lat_file.compare(lat_file.size() - 4, 4, ".npy") == 0) {
         Npy L;
         if (!read_npy(lat_file, L) || L.is_int) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s as a [32][h][w] latent\n",
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s as a [32][h][w] latent\n",
                          lat_file.c_str());
             return 1;
         }
         std::vector<int64_t> sh = L.shape;
         if (sh.size() == 4 && sh[0] == 1) sh.erase(sh.begin());
         if (sh.size() != 3 || sh[0] != 32) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s: not [32][h][w]\n", lat_file.c_str());
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s: not [32][h][w]\n", lat_file.c_str());
             return 1;
         }
         h = sh[1], w = sh[2];
@@ -1294,7 +1294,7 @@ int vae_cmd(const std::string& vae_file, const std::string& lat_file, const std:
     } else {
         std::FILE* fp = std::fopen(lat_file.c_str(), "rb");
         if (fp == nullptr) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s\n", lat_file.c_str());
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s\n", lat_file.c_str());
             return 1;
         }
         std::fseek(fp, 0, SEEK_END);
@@ -1305,13 +1305,13 @@ int vae_cmd(const std::string& vae_file, const std::string& lat_file, const std:
         const bool ok = std::fread(lz.data(), sizeof(float), (size_t) n, fp) == (size_t) n && n % 32 == 0;
         std::fclose(fp);
         if (!ok || n <= 0) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s: not a flat [32][h][w] FP32 file\n",
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s: not a flat [32][h][w] FP32 file\n",
                          lat_file.c_str());
             return 1;
         }
         const int64_t hw = n / 32, side = (int64_t) std::llround(std::sqrt((double) hw));
         if (side * side != hw) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s: %lld values are not a square latent\n",
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s: %lld values are not a square latent\n",
                          lat_file.c_str(), (long long) n);
             return 1;
         }
@@ -1319,7 +1319,7 @@ int vae_cmd(const std::string& vae_file, const std::string& lat_file, const std:
     }
     const int64_t HW = h * w, n_lat = 32 * HW;
     if ((int64_t) lz.size() != n_lat) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s: %zu values for a [%lld][%lld][%lld] latent\n",
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s: %zu values for a [%lld][%lld][%lld] latent\n",
                      lat_file.c_str(), lz.size(), (long long) 32, (long long) h, (long long) w);
         return 1;
     }
@@ -1335,13 +1335,13 @@ int vae_cmd(const std::string& vae_file, const std::string& lat_file, const std:
     si::HunyuanImage3Vae vae;
     const auto t_open = std::chrono::steady_clock::now();
     if (!vae.open(vae_file, s, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: vae open: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: vae open: %s\n", err.c_str());
         return 1;
     }
     const double open_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_open).count();
     float *dz = nullptr, *drgb = nullptr;
     if (!gpu::alloc_device(&dz, (size_t) n_lat * 4) || !gpu::alloc_device(&drgb, (size_t) (3 * H * W) * 4)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: GPU memory: %s\n", gpu::last_error());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: GPU memory: %s\n", gpu::last_error());
         return 1;
     }
     gpu::copy(dz, lz.data(), (size_t) n_lat * 4);
@@ -1368,7 +1368,7 @@ int vae_cmd(const std::string& vae_file, const std::string& lat_file, const std:
     if (!dst.empty()) {
         std::FILE* fo = std::fopen(dst.c_str(), "wb");
         if (fo == nullptr) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot write %s\n", dst.c_str());
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot write %s\n", dst.c_str());
             return 1;
         }
         std::fwrite(got.data(), sizeof(float), got.size(), fo);
@@ -1378,13 +1378,13 @@ int vae_cmd(const std::string& vae_file, const std::string& lat_file, const std:
     if (gold_file.empty()) return 0;
     Npy G;
     if (!read_npy(gold_file, G) || G.is_int) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s\n", gold_file.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s\n", gold_file.c_str());
         return 1;
     }
     std::vector<int64_t> gs = G.shape;
     if (gs.size() == 4 && gs[0] == 1) gs.erase(gs.begin());
     if (gs.size() != 3 || gs[0] != 3 || gs[1] != H || gs[2] != W || (int64_t) G.f32.size() != 3 * H * W) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s: not [1,3,%lld,%lld]\n", gold_file.c_str(),
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s: not [1,3,%lld,%lld]\n", gold_file.c_str(),
                      (long long) H, (long long) W);
         return 1;
     }
@@ -1442,7 +1442,7 @@ int pipeline_cmd(const std::string& dit_file, const std::string& vae_file, const
     std::vector<int32_t> ids;
     int64_t h = 0, w = 0;
     if (!read_ids(idfile, ids, h, w)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s\n", idfile.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s\n", idfile.c_str());
         return 1;
     }
     const int64_t n_lat = 32 * h * w;
@@ -1453,7 +1453,7 @@ int pipeline_cmd(const std::string& dit_file, const std::string& vae_file, const
         if (init_file.size() > 4 && init_file.compare(init_file.size() - 4, 4, ".npy") == 0) {
             Npy L;
             if (!read_npy(init_file, L) || L.is_int || L.f32.size() != (size_t) n_lat) {
-                std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s: not a [32][%lld][%lld] FP32 latent\n",
+                std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s: not a [32][%lld][%lld] FP32 latent\n",
                              init_file.c_str(), (long long) h, (long long) w);
                 return 1;
             }
@@ -1461,14 +1461,14 @@ int pipeline_cmd(const std::string& dit_file, const std::string& vae_file, const
         } else {
             std::FILE* fp = std::fopen(init_file.c_str(), "rb");
             if (fp == nullptr) {
-                std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s\n", init_file.c_str());
+                std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s\n", init_file.c_str());
                 return 1;
             }
             lat.resize((size_t) n_lat);
             const size_t got = std::fread(lat.data(), sizeof(float), lat.size(), fp);
             std::fclose(fp);
             if (got != lat.size()) {
-                std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s: not %lld floats\n", init_file.c_str(),
+                std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s: not %lld floats\n", init_file.c_str(),
                              (long long) n_lat);
                 return 1;
             }
@@ -1478,7 +1478,7 @@ int pipeline_cmd(const std::string& dit_file, const std::string& vae_file, const
     si::HunyuanImage3Pipeline pipe;
     const auto t_open = std::chrono::steady_clock::now();
     if (!pipe.open(dit_file, vae_file, err, want_layers, vision_file)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: open: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: open: %s\n", err.c_str());
         return 1;
     }
     if (budget_mib > 0) pipe.set_budget((uint64_t) budget_mib << 20);
@@ -1497,7 +1497,7 @@ int pipeline_cmd(const std::string& dit_file, const std::string& vae_file, const
             si::QiRef f;
             f.rgba = si::load_rgba8(tok, f.width, f.height, err);
             if (f.rgba.empty()) {
-                std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s: %s\n", tok.c_str(), err.c_str());
+                std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s: %s\n", tok.c_str(), err.c_str());
                 return 1;
             }
             r.refs.push_back(std::move(f));
@@ -1530,7 +1530,7 @@ int pipeline_cmd(const std::string& dit_file, const std::string& vae_file, const
             return true;
         }, [](const char* stage) { std::printf("  stage %s\n", stage); std::fflush(stdout); });
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: generate: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: generate: %s\n", e.what());
         return 1;
     }
     const double run_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_run).count();
@@ -1556,7 +1556,7 @@ int pipeline_cmd(const std::string& dit_file, const std::string& vae_file, const
     if (!dst.empty()) {
         std::FILE* fo = std::fopen(dst.c_str(), "wb");
         if (fo == nullptr) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot write %s\n", dst.c_str());
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot write %s\n", dst.c_str());
             return 1;
         }
         std::fwrite(rgba.data(), 1, rgba.size(), fo);
@@ -1571,13 +1571,13 @@ int pipeline_cmd(const std::string& dit_file, const std::string& vae_file, const
     if (gold_image.size() > 4 && gold_image.compare(gold_image.size() - 4, 4, ".npy") == 0) {
         Npy G;
         if (!read_npy(gold_image, G) || G.is_int) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s\n", gold_image.c_str());
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s\n", gold_image.c_str());
             return 1;
         }
         std::vector<int64_t> sh = G.shape;
         if (sh.size() == 4 && sh[0] == 1) sh.erase(sh.begin());
         if (sh.size() != 3 || sh[0] != 3 || sh[1] != r.height || sh[2] != r.width) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s: not [1,3,%lld,%lld]\n", gold_image.c_str(),
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s: not [1,3,%lld,%lld]\n", gold_image.c_str(),
                          (long long) r.height, (long long) r.width);
             return 1;
         }
@@ -1586,7 +1586,7 @@ int pipeline_cmd(const std::string& dit_file, const std::string& vae_file, const
         std::string ierr;
         gold = si::load_rgba8(gold_image, gw, gh, ierr);
         if (gold.empty() || gw != r.width || gh != r.height) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s: %s (%lld x %lld)\n", gold_image.c_str(),
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s: %s (%lld x %lld)\n", gold_image.c_str(),
                          ierr.c_str(), (long long) gw, (long long) gh);
             return 1;
         }
@@ -1631,13 +1631,13 @@ int tiles_cmd(const std::string& vae_file, const std::string& image, int64_t W, 
     si::QiRef f;
     f.rgba = si::load_rgba8(image, f.width, f.height, err);
     if (f.rgba.empty()) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     void* stream = strata::core::Runtime::get().create_stream();
     si::HunyuanImage3Vae vae;
     if (!vae.open(vae_file, stream, err, false, true)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: VAE: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: VAE: %s\n", err.c_str());
         return 1;
     }
     const int64_t h = H / 16, w = W / 16, n = 32 * h * w;
@@ -1645,7 +1645,7 @@ int tiles_cmd(const std::string& vae_file, const std::string& image, int64_t W, 
     float *d_img = nullptr, *d_z = nullptr, *d_rgb = nullptr;
     if (!strata::gpu::alloc_device(&d_img, img.size() * 4) || !strata::gpu::alloc_device(&d_z, (size_t) n * 4) ||
         !strata::gpu::alloc_device(&d_rgb, img.size() * 4)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: GPU memory\n");
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: GPU memory\n");
         return 1;
     }
     strata::gpu::copy(d_img, img.data(), img.size() * 4);
@@ -1682,7 +1682,7 @@ int refs_cmd(const std::string& dit_file, const std::string& vae_file, const std
              const std::string& golden, const std::string& image) {
     auto npy = [&](const char* name, Npy& out) {
         if (!read_npy(golden + "/" + name, out) || out.is_int) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s/%s\n", golden.c_str(), name);
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s/%s\n", golden.c_str(), name);
             return false;
         }
         return true;
@@ -1704,7 +1704,7 @@ int refs_cmd(const std::string& dit_file, const std::string& vae_file, const std
         !npy("cond_vae_rows.npy", vrows) || !npy("cond_timestep_row.npy", trow))
         return 1;
     if (img.shape.size() != 3 || img.shape[0] != 3 || lat.shape.size() != 3 || lat.shape[0] != 32) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: the golden's VAE copy is not [3][H][W] / [32][h][w]\n");
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: the golden's VAE copy is not [3][H][W] / [32][h][w]\n");
         return 1;
     }
     const int64_t H = img.shape[1], W = img.shape[2], h = lat.shape[1], w = lat.shape[2];
@@ -1718,12 +1718,12 @@ int refs_cmd(const std::string& dit_file, const std::string& vae_file, const std
     // --- the VAE encoder on the golden's copy
     si::HunyuanImage3Vae vae;
     if (!vae.open(vae_file, stream, err, false, true)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: VAE: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: VAE: %s\n", err.c_str());
         return 1;
     }
     float *d_img = nullptr, *d_z = nullptr;
     if (!strata::gpu::alloc_device(&d_img, (size_t) img.f32.size() * 4) || !strata::gpu::alloc_device(&d_z, (size_t) lat.f32.size() * 4)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: GPU memory\n");
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: GPU memory\n");
         return 1;
     }
     strata::gpu::copy(d_img, img.f32.data(), img.f32.size() * 4);
@@ -1741,7 +1741,7 @@ int refs_cmd(const std::string& dit_file, const std::string& vae_file, const std
         const auto eps = si::philox_randn(20261025u, (uint64_t) lat.f32.size());
         float* d_eps = nullptr;
         if (!strata::gpu::alloc_device(&d_eps, eps.size() * 4)) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: GPU memory\n");
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: GPU memory\n");
             return 1;
         }
         strata::gpu::copy(d_eps, eps.data(), eps.size() * 4);
@@ -1762,12 +1762,12 @@ int refs_cmd(const std::string& dit_file, const std::string& vae_file, const std
     {
         si::HunyuanImage3EntryExit around;
         if (!around.open(dit_file, stream, err) || !around.set_grid(h, w, err)) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: entry: %s\n", err.c_str());
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: entry: %s\n", err.c_str());
             return 1;
         }
         std::vector<float> r((size_t) (h * w * around.hidden()));
         if (!around.patch_embed(lat.f32.data(), h, w, 0.0f, r.data(), err)) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: patch_embed: %s\n", err.c_str());
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: patch_embed: %s\n", err.c_str());
             return 1;
         }
         report("cond_vae_rows", r, vrows.f32);
@@ -1776,7 +1776,7 @@ int refs_cmd(const std::string& dit_file, const std::string& vae_file, const std
         report("cond_vae_rows(own z)", rg, vrows.f32);
         si::HunyuanImage3File f;
         if (!f.open(dit_file, err)) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
             return 1;
         }
         std::vector<float> tr((size_t) around.hidden());
@@ -1787,13 +1787,13 @@ int refs_cmd(const std::string& dit_file, const std::string& vae_file, const std
     // --- SigLIP2 and the aligner on the golden's patches
     si::HunyuanImage3Vision vision;
     if (!vision.open(vision_file, dit_file, stream, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: SigLIP2: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: SigLIP2: %s\n", err.c_str());
         return 1;
     }
     std::vector<float> out((size_t) (vision.max_patches() * vision.out_width()));
     t0 = std::chrono::steady_clock::now();
     if (!vision.rows(pix.f32.data(), ph, pw, out.data(), err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: SigLIP2: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: SigLIP2: %s\n", err.c_str());
         return 1;
     }
     std::printf("  SigLIP2 + aligner %.2f s (weights %.2f GB, scratch %.2f GB)\n",
@@ -1816,7 +1816,7 @@ int refs_cmd(const std::string& dit_file, const std::string& vae_file, const std
         si::QiRef f;
         f.rgba = si::load_rgba8(image, f.width, f.height, err);
         if (f.rgba.empty()) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s: %s\n", image.c_str(), err.c_str());
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s: %s\n", image.c_str(), err.c_str());
             return 1;
         }
         const std::vector<float> mine = si::hunyuanimage3_vae_copy(f, W, H);
@@ -1887,7 +1887,7 @@ int gemm_cmd(int64_t T, int64_t K, int64_t N) {
     float* dy = nullptr;
     if (!gpu::alloc_device(&dx, hx.size() * 2) || !gpu::alloc_device(&dw, hw.size() * 2) ||
         !gpu::alloc_device(&dy, hy.size() * 4)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: GPU memory: %s\n", gpu::last_error());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: GPU memory: %s\n", gpu::last_error());
         return 1;
     }
     gpu::copy(dx, hx.data(), hx.size() * 2);
@@ -1895,7 +1895,7 @@ int gemm_cmd(int64_t T, int64_t K, int64_t N) {
     strata::prefill::Gemm gemm;
     std::string err;
     if (!gemm.init(s, N * K, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     gemm.f16(dx, dw, dy, T, N, K);
@@ -1952,7 +1952,7 @@ int attn_cmd(int64_t T, int64_t heads, int64_t dim) {
     uint16_t *dq = nullptr, *dk = nullptr, *dv = nullptr, *dout = nullptr;
     if (!gpu::alloc_device(&dq, hq.size() * 2) || !gpu::alloc_device(&dk, hk.size() * 2) ||
         !gpu::alloc_device(&dv, hv.size() * 2) || !gpu::alloc_device(&dout, (size_t) T * heads * dim * 2)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: GPU memory: %s\n", gpu::last_error());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: GPU memory: %s\n", gpu::last_error());
         return 1;
     }
     gpu::copy(dq, hq.data(), hq.size() * 2);
@@ -2009,12 +2009,12 @@ int gpu_cmd(const std::string& path, const std::string& tensor, int64_t rows) {
     si::HunyuanImage3File f;
     std::string err;
     if (!f.open(path, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     si::HunyuanImage3Matrix m;
     if (!f.matrix(tensor, m, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     const int64_t r1 = std::min(rows, m.n);
@@ -2028,7 +2028,7 @@ int gpu_cmd(const std::string& path, const std::string& tensor, int64_t rows) {
     uint16_t* d_out = (uint16_t*) gpu::alloc_device((size_t) r1 * m.k * sizeof(uint16_t));
     uint16_t* d_rot = (uint16_t*) gpu::alloc_device((size_t) r1 * m.k * sizeof(uint16_t));
     if (d_codes == nullptr || d_out == nullptr || d_rot == nullptr) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: GPU memory: %s\n", gpu::last_error());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: GPU memory: %s\n", gpu::last_error());
         return 1;
     }
     gpu::copy(d_codes, m.weight, (size_t) code_bytes);
@@ -2168,26 +2168,26 @@ int stages_cmd(const std::string& path, const std::string& golden, const std::st
     namespace gpu = strata::gpu;
     Npy hidden, layers;
     if (!read_npy(golden + "/step0_hidden_in.npy", hidden) || hidden.shape.size() != 2) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s/step0_hidden_in.npy\n",
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s/step0_hidden_in.npy\n",
                      golden.c_str());
         return 1;
     }
     if (!read_npy(golden + "/step0_layer_hidden.npy", layers) || layers.shape.size() != 3 ||
         layer >= layers.shape[0]) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s/step0_layer_hidden.npy\n",
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s/step0_layer_hidden.npy\n",
                      golden.c_str());
         return 1;
     }
     std::vector<int32_t> ids;
     int64_t h = 0, w = 0;
     if (!read_ids(idfile, ids, h, w)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s\n", idfile.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: cannot read %s\n", idfile.c_str());
         return 1;
     }
     std::string err;
     const int64_t keep = si::hunyuanimage3_trim(ids.data(), (int64_t) ids.size(), err);
     if (keep < 0) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     ids.resize((size_t) keep);
@@ -2196,7 +2196,7 @@ int stages_cmd(const std::string& path, const std::string& golden, const std::st
     std::vector<int32_t> y, x;
     int64_t start = 0;
     if (!si::hunyuanimage3_positions(ids.data(), T, h, w, y, x, start, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     const float* in = layer == 0 ? hidden.f32.data() : layers.f32.data() + (size_t) (layer - 1) * T * C;
@@ -2204,14 +2204,14 @@ int stages_cmd(const std::string& path, const std::string& golden, const std::st
     // --- the host FP32 reference, with its stages kept
     si::HunyuanImage3File f;
     if (!f.open(path, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", err.c_str());
         return 1;
     }
     si::HunyuanImage3HostStages st;
     std::vector<float> hout((size_t) T * C);
     const auto th = std::chrono::steady_clock::now();
     if (!si::hunyuanimage3_layer_host(f, layer, in, T, hout.data(), y.data(), x.data(), n_img, err, &st)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: host layer: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: host layer: %s\n", err.c_str());
         return 1;
     }
     std::printf("stages: layer %ld, %ld tokens (%ld of the image block) - the host's walk took %.0f s\n", (long) layer,
@@ -2222,7 +2222,7 @@ int stages_cmd(const std::string& path, const std::string& golden, const std::st
     si::HunyuanImage3Dit dit;
     void* s = strata::core::Runtime::get().create_stream();
     if (!dit.open(path, s, err, layer + 1)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: open: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: open: %s\n", err.c_str());
         return 1;
     }
     size_t free_b = 0, total_b = 0;
@@ -2237,22 +2237,22 @@ int stages_cmd(const std::string& path, const std::string& golden, const std::st
     try {
         dit.set_bank_budget(budget);
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: the bank budget: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: the bank budget: %s\n", e.what());
         return 1;
     }
     if (!dit.set_sequence(T, n_img, y.data(), x.data(), err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: set_sequence: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: set_sequence: %s\n", err.c_str());
         return 1;
     }
     float *dx = nullptr, *dout = nullptr;
     if (!gpu::alloc_device(&dx, (size_t) T * C * sizeof(float)) ||
         !gpu::alloc_device(&dout, (size_t) T * C * sizeof(float))) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: GPU memory: %s\n", gpu::last_error());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: GPU memory: %s\n", gpu::last_error());
         return 1;
     }
     gpu::copy(dx, in, (size_t) T * C * sizeof(float));
     if (!dit.layer(layer, dx, dout, err)) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: layer: %s\n", err.c_str());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: layer: %s\n", err.c_str());
         return 1;
     }
     gpu::device_sync();
@@ -2264,7 +2264,7 @@ int stages_cmd(const std::string& path, const std::string& golden, const std::st
     int stages_past = 0;
     auto show = [&](const char* name, const void* dev, bool is16, int64_t cols, const std::vector<float>& want_in) {
         if (cols <= 0 || cols % T != 0) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s: %ld is not a whole number of rows of %ld\n",
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s: %ld is not a whole number of rows of %ld\n",
                          name, (long) cols, (long) T);
             return;
         }
@@ -2275,16 +2275,16 @@ int stages_cmd(const std::string& path, const std::string& golden, const std::st
         if (is16) {
             std::vector<uint16_t> bits((size_t) cols);
             if (!gpu::copy(bits.data(), dev, cols * 2)) {
-                std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s: %s\n", name, gpu::last_error());
+                std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s: %s\n", name, gpu::last_error());
                 return;
             }
             for (int64_t i = 0; i < cols; ++i) got[(size_t) i] = strata::kernels::f32_from_f16(bits[(size_t) i]);
         } else if (!gpu::copy(got.data(), dev, cols * sizeof(float))) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s: %s\n", name, gpu::last_error());
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s: %s\n", name, gpu::last_error());
             return;
         }
         if ((int64_t) want.size() != cols) {
-            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s: the host holds %zu, the device %ld\n", name,
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s: the host holds %zu, the device %ld\n", name,
                          want.size(), (long) cols);
             return;
         }
@@ -2339,7 +2339,7 @@ int stages_cmd(const std::string& path, const std::string& golden, const std::st
     picks(st.logits, dit.dims().experts, dit.dims().topk, hp);
     std::vector<float> glg((size_t) T * dit.dims().experts);   // the device's raw logits, down to the host
     if (!gpu::copy(glg.data(), sc.logits, glg.size() * sizeof(float))) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: logits: %s\n", gpu::last_error());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: logits: %s\n", gpu::last_error());
         return 1;
     }
     picks(glg, dit.dims().experts, dit.dims().topk, gp);
@@ -2385,7 +2385,7 @@ double real_number(const char* s) {
     char* end = nullptr;
     const double v = std::strtod(s, &end);
     if (end == s || *end != '\0') {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s is not a number\n", s);
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s is not a number\n", s);
         std::exit(2);
     }
     return v;
@@ -2396,7 +2396,7 @@ int64_t number(const char* s) {
     char* end = nullptr;
     const long long v = std::strtoll(s, &end, 10);
     if (end == s || *end != '\0') {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s is not a number\n", s);
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s is not a number\n", s);
         std::exit(2);
     }
     return (int64_t) v;
@@ -2494,7 +2494,7 @@ int main(int argc, char** argv) {
                      argv[0]);
         return 2;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: %s\n", e.what());
         return 1;
     }
 }

@@ -198,7 +198,7 @@ def _selfcheck() -> int:
     w.add("general.architecture", "qwen4exp")
     w.add("qwen4exp.block_count", 8, "u32")
     w.add("qwen4exp.test.array", [1, 2, 3, 4], "array:i32")
-    w.add("general.name", "strata tiny")
+    w.add("general.name", "xestrata tiny")
 
     A = rng.standard_normal((16, 64)).astype(np.float32)
     B = rng.standard_normal((4, 8)).astype(np.float32)

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/platform/memory.cpp - see include/strata/platform/memory.hpp.
 #include "strata/platform/memory.hpp"
+#include "strata/platform/env.hpp"
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -262,7 +263,7 @@ constexpr uint64_t kAdviseStep = 128ull << 10;
 
 bool read_ahead_enabled() {
     static const bool on = [] {
-        const char* v = std::getenv("STRATA_READ_AHEAD");
+        const char* v = strata::env_get("READ_AHEAD");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     return on;
@@ -395,13 +396,13 @@ void settle_before_ready() {
     // (10,000 pages a second for 5 s, here 2 s), not measured here; they count host pages, no GPU's.
     // STRATA_SETTLE_S: the most it waits (default 30, 0: not at all).
     static const double cap = [] {
-        const char* v = std::getenv("STRATA_SETTLE_S");
+        const char* v = strata::env_get("SETTLE_S");
         return v != nullptr ? std::strtod(v, nullptr) : 30.0;
     }();
     double peak = 0.0;
     const double waited = settle_page_migration(cap, 2.0, 10000.0, peak);
     if (waited > 0.0)
-        std::fprintf(stderr, "strata: host page migration settled in %.1f s (peak %.0f pages/s; STRATA_SETTLE_S=0: no wait)\n",
+        std::fprintf(stderr, "xestrata: host page migration settled in %.1f s (peak %.0f pages/s; XESTRATA_SETTLE_S=0: no wait)\n",
                      waited, peak);
 }
 

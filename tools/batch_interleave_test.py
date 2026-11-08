@@ -235,7 +235,7 @@ def main():
     log = Path(eng.log_path).read_text(errors="replace")
     for ln in log.splitlines():
         if "drafts accepted" in ln:
-            print("  log:", ln.split("strata serve: ")[-1][:160], flush=True)
+            print("  log:", ln.split("xestrata serve: ")[-1][:160], flush=True)
     for key in ("gave back", "its turn checkpoint", "takes", "the prompt was read in", "gives way"):
         print(f"engine log '{key}': {log.count(key)} lines", flush=True)
     return 0 if ok else 2

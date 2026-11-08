@@ -16,7 +16,7 @@ For each of the four models (Mage-Flow, MageTrail, MOSS-Image, Qwen-Image-2.1), 
 each of the two kinds (a style, a character) must go through **train, save, load and generate** to the end. Each model's card (5, 7, 8, 9) judges it
 by the [checks below](#the-checks). Mage-Flow goes first, measured; then MOSS-Image, Qwen-Image-2.1 and MageTrail.
 
-Training is built inside the image engine (`strata-image`). `serve`'s `--train-lora` (card 10) is the entry point and reads a TOML setting.
+Training is built inside the image engine (`xestrata-image`). `serve`'s `--train-lora` (card 10) is the entry point and reads a TOML setting.
 There is no text encoder training. The VAE and the text readers are not in VRAM during a training step: the step reads what preprocessing put on disk.
 
 ## The four models
@@ -73,7 +73,7 @@ alpha is a free value; **the default candidate is alpha = rank** (the multiplier
 Qwen-Image-2.1's MLP's first weight is one fused matrix on the GPU: `img_mlp.gate_up.weight`, 24576 rows × 4096 columns (`[2 * inter][dim]`).
 v1 saves it **split: `img_mlp.gate_layer` and `img_mlp.proj` as two weights** (the rows cut 12288 and 12288; `img_mlp.out` stays one).
 
-- All three readers apply the split form. Ours: the slots in `qi_dit.cpp` read gate_layer from row 0 and proj from row 12288, the bind of `strata-image-lora-probe` maps all 21 keys of its synthetic model (21 of 21), and `records/2026-10-29-image-lora/parity` gives cos 1.0000000 per weight for both the split and the fused form.
+- All three readers apply the split form. Ours: the slots in `qi_dit.cpp` read gate_layer from row 0 and proj from row 12288, the bind of `xestrata-image-lora-probe` maps all 21 keys of its synthetic model (21 of 21), and `records/2026-10-29-image-lora/parity` gives cos 1.0000000 per weight for both the split and the fused form.
   ComfyUI: `comfy/lora.py` says "LoRAs address the halves" and cuts the fused weight by rows. diffusers 0.41.0: `img_mlp.gate_layer` and `img_mlp.proj` are the real
   modules and there is no `gate_up`.
 - If a file carries the fused `img_mlp.gate_up`, diffusers cannot find that target and **silently drops it** (the injection still succeeds while other targets match;
@@ -207,7 +207,7 @@ Names and contents follow sd-scripts' MOSS-Image (`library/strategy_moss_image.p
 
 - The latent cache holds the **VAE's raw output**. The 2×2 packing and the normalization (BatchNorm or statistics) happen when training reads it, as sd-scripts'
   MOSS-Image does.
-- Our own engine makes the values (the VAE is `strata-image`'s encoder; the text follows each model's reader through the same `text_states` path). Their match is
+- Our own engine makes the values (the VAE is `xestrata-image`'s encoder; the text follows each model's reader through the same `text_states` path). Their match is
   checked against the inference goldens (card 4).
 - The empty prompt's embedding (`uncond_*`) is always written: MOSS-Image's negative is empty, and adding a dropout later needs no re-caching.
 - The model's part of the name is `mf` (Mage-Flow and MageTrail — their VAEs differ, so their latents are not shared), `moss`, `qi`.
@@ -281,7 +281,7 @@ The data is the data folder's `records/2026-11-02-lora-train-data/` (`<data>`: L
 ## The checks
 
 1. **The listing**: read `serve/loras.py`'s `Folder` for that family. The file must be in `listing`, not in `skipped`. Its `rank`, `trigger` and `targets` must be the real values.
-1. **The bind**: `strata-image-lora-probe`'s `map` must match every name with no refusal.
+1. **The bind**: `xestrata-image-lora-probe`'s `map` must match every name with no refusal.
 1. **Generation and effect**: through serve, make the same prompt and seed with and without one adapter, show the difference with LPIPS and leave the eye check to a person
    (the way of `records/2026-10-29-image-lora/pipeline`).
 1. **The outside readers**: the same file must load in ComfyUI 7a28332 (once each in cards 5, 7, 8, 9). diffusers is only Qwen-Image-2.1, as in the table above.

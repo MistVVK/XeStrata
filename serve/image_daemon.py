@@ -1,15 +1,15 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""serve/image_daemon.py - the image engine outside the servers: one `strata-image --serve` that the servers of one
+"""serve/image_daemon.py - the image engine outside the servers: one `xestrata-image --serve` that the servers of one
 image model on one GPU share, so that it stays warm (its kernels built, the prompt's states, the layers it holds) when
 a server stops - a model switch starts another server on the same port - and serves them one request at a time.
 
-    python serve/image_daemon.py --socket ADDR [--idle S] [--log FILE] -- strata-image --dit ... --serve
+    python serve/image_daemon.py --socket ADDR [--idle S] [--log FILE] -- xestrata-image --dit ... --serve
 
 serve/images.py starts it (its environment the server's engine's: the same GPU and libraries) and connects; another
 server of the same image model and GPU finds it at the same address (images.daemon_address).  ADDR: a Unix socket's
 path, or on Windows a file the daemon writes its loopback port and a random token to (a client sends the token
-first).  The lines are strata-image's own (src/image/strata_image.cpp): on connecting a client gets READY (or ERROR,
+first).  The lines are xestrata-image's own (src/image/strata_image.cpp): on connecting a client gets READY (or ERROR,
 and the daemon ends); a request line (IMG, NEED, FREE, FIT, BUDGET, RELEASE, RATIO, DETECT, UPS, UPSNEED) waits for
 the engine and gets its lines up to the answer (STEP lines before an IMAGE); STOP ends the client's running image after
 its step; RESUME goes on with the client's running video after its YIELD (the engine waits there for it); QUIT closes
@@ -173,7 +173,7 @@ class Daemon:
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            # SIGTERM first: strata-image drains its GPU queues on it before it exits (at most 5 s); a SIGKILL alone
+            # SIGTERM first: xestrata-image drains its GPU queues on it before it exits (at most 5 s); a SIGKILL alone
             # left a copy running that read unmapped memory (the B70: an engine memory fault and a reset)
             proc.terminate()
             try:

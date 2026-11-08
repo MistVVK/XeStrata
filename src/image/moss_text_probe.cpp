@@ -58,8 +58,8 @@ int main(int argc, char** argv) {
     const bool files = argc >= 2 && std::strcmp(argv[1], "--states") == 0;
     const int a0 = files ? 2 : 1;   // the GGUF (or the states' folder), then REF_DIR
     if (argc < a0 + 2) {
-        std::fprintf(stderr, "usage: strata-image-moss-text-probe QWEN3.5-9B.gguf REF_DIR [NAME...]\n"
-                             "       strata-image-moss-text-probe --states DIR REF_DIR [NAME...]\n");
+        std::fprintf(stderr, "usage: xestrata-image-moss-text-probe QWEN3.5-9B.gguf REF_DIR [NAME...]\n"
+                             "       xestrata-image-moss-text-probe --states DIR REF_DIR [NAME...]\n");
         return 2;
     }
     std::vector<std::string> names;
@@ -74,7 +74,7 @@ int main(int argc, char** argv) {
             const uint64_t budget = b != nullptr && *b != '\0' ? std::strtoull(b, nullptr, 10) << 20 : UINT64_MAX;
             const auto t0 = std::chrono::steady_clock::now();
             if (!te.open(argv[a0], 4096, err, budget)) {
-                std::fprintf(stderr, "strata-image-moss-text-probe: %s\n", err.c_str());
+                std::fprintf(stderr, "xestrata-image-moss-text-probe: %s\n", err.c_str());
                 return 1;
             }
             std::printf("open %.0f ms, blocks %.2f GB, %d resident, %.2f GB of VRAM\n",
@@ -127,7 +127,7 @@ int main(int argc, char** argv) {
         }
         return bad == 0 ? 0 : 1;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image-moss-text-probe: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image-moss-text-probe: %s\n", e.what());
         return 1;
     }
 }

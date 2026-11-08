@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/concurrent_main.cpp - do the CPU expert path and the GPU stream path actually run at once?
 //
 // L9 concluded that the two miss paths are INDEPENDENT RESOURCES - 42.55 GB/s of DRAM bandwidth for the CPU
@@ -70,7 +71,7 @@ int main(int argc, char** argv) {
         else if (a == "--cpu-threads") cpu_threads = std::atoi(val());
         else if (a == "--gpu-roles") gpu_roles = std::atoi(val());
         else {
-            std::fprintf(stderr, "usage: strata-concurrent --file experts.bin [--experts N] "
+            std::fprintf(stderr, "usage: xestrata-concurrent --file experts.bin [--experts N] "
                                  "[--cpu-threads N] [--gpu-roles N]\n");
             return 2;
         }

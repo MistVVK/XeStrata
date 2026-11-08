@@ -202,19 +202,19 @@ class ParallelArgs(unittest.TestCase):
 
         def said(args, env):
             buf = io.StringIO()
-            old = os.environ.get("STRATA_BATCH_MTP")
+            old = os.environ.get("XESTRATA_BATCH_MTP")
             if env is None:
-                os.environ.pop("STRATA_BATCH_MTP", None)
+                os.environ.pop("XESTRATA_BATCH_MTP", None)
             else:
-                os.environ["STRATA_BATCH_MTP"] = env
+                os.environ["XESTRATA_BATCH_MTP"] = env
             try:
                 with contextlib.redirect_stdout(buf):
                     r = parallel_args({"parallel": 12}, args)
             finally:
                 if old is None:
-                    os.environ.pop("STRATA_BATCH_MTP", None)
+                    os.environ.pop("XESTRATA_BATCH_MTP", None)
                 else:
-                    os.environ["STRATA_BATCH_MTP"] = old
+                    os.environ["XESTRATA_BATCH_MTP"] = old
             self.assertEqual(r, ["--batch", "12"])
             return "at most" in buf.getvalue()
         self.assertTrue(said([], None))                  # 0.1.39: the window holds 8 rows
@@ -407,7 +407,7 @@ class ParallelService(unittest.TestCase):
 
     def test_a_burst_of_connections_is_not_reset(self):
         """30-40 clients at once got "connection reset by peer" with the listen backlog of 5 (4 x R9700 burst): the
-        server listens with a deep backlog (STRATA_HTTP_BACKLOG, 256), so 60 simultaneous requests all get answers."""
+        server listens with a deep backlog (XESTRATA_HTTP_BACKLOG, 256), so 60 simultaneous requests all get answers."""
         import serve.server as server
         self.assertGreaterEqual(server.Server.request_queue_size, 64)
         self.start(2)

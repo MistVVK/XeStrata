@@ -4,7 +4,7 @@
 
 Asked for by a request's "script_guard" (a language below, "off", or {"lang": "ja", "allow_context": false}), by the
 header X-XeStrata-Script-Guard (the same values, for clients that cannot add a field to the body), by the Chat settings
-shared with other apps, or for every request by the run config's "script_guard" / STRATA_SCRIPT_GUARD (the
+shared with other apps, or for every request by the run config's "script_guard" / XESTRATA_SCRIPT_GUARD (the
 environment wins); off when none of them says so.
 
 "ja" bans the Han characters of GB2312 (Simplified Chinese's character set) that JIS X 0213 does not have - the forms
@@ -37,6 +37,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from serve import logit_bias as bias_api
+from serve import envvars
 
 LANGS = ("ja", "en", "ko", "zh-cn", "zh-tw")
 REWIND_MAX = 8
@@ -126,10 +127,10 @@ def parse(value, where="script_guard"):
 
 
 def setting(cfg: dict | None, env) -> dict | str | None:
-    """The server's default: STRATA_SCRIPT_GUARD when set, else the run config's "script_guard"."""
-    v = env.get("STRATA_SCRIPT_GUARD")
+    """The server's default: XESTRATA_SCRIPT_GUARD when set, else the run config's "script_guard"."""
+    v = envvars.get("SCRIPT_GUARD", env=env)
     if v is not None and str(v).strip():
-        return parse(v, "STRATA_SCRIPT_GUARD")
+        return parse(v, "XESTRATA_SCRIPT_GUARD")
     return parse((cfg or {}).get("script_guard"), "config \"script_guard\"")
 
 

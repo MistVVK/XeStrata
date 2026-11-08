@@ -73,7 +73,7 @@ int main(int argc, char** argv) {
         std::printf("vision: %lld x %lld image, %lld tokens, %.3f s (weights %.2f GB)\n", (long long) side,
                     (long long) side, (long long) out.rows, secs, (double) vit.weight_bytes() / 1e9);
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image-vision-probe: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image-vision-probe: %s\n", e.what());
         return 1;
     }
     return 0;

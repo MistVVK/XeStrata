@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """A client that stops reading a streamed answer early must not leave its tokens to the next request.
 
-  STRATA_KEY=... python3 tools/early_close_test.py http://127.0.0.1:8090
+  XESTRATA_KEY=... python3 tools/early_close_test.py http://127.0.0.1:8090
 """
 import json
 import os
@@ -13,7 +13,7 @@ import threading
 import urllib.request
 
 URL = sys.argv[1].rstrip("/") + "/v1/chat/completions"
-KEY = os.environ.get("STRATA_KEY", "")
+KEY = os.environ.get("XESTRATA_KEY", "")
 
 
 def req(content, stream, max_tokens=300):

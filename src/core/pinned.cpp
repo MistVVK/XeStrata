@@ -5,6 +5,7 @@
 #include "strata/core/runtime.hpp"
 #include "strata/core/device.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -66,10 +67,10 @@ std::atomic<uint64_t> g_registered{0};   // what the arenas hold registered on t
 // (#43, an Arc Pro B50); the budget is kept for the later GPUs (register_on).  `why` names the cap when there is one.
 uint64_t arena_pin_cap(uint64_t bytes, std::string& why) {
     why.clear();
-    if (const char* e = std::getenv("STRATA_ARENA_PIN_GIB"); e != nullptr && *e != '\0') {
+    if (const char* e = strata::env_get("ARENA_PIN_GIB"); e != nullptr && *e != '\0') {
         const uint64_t gib = std::strtoull(e, nullptr, 10);
         if (gib == 0) return bytes;
-        why = "STRATA_ARENA_PIN_GIB=" + std::to_string(gib);
+        why = "XESTRATA_ARENA_PIN_GIB=" + std::to_string(gib);
         return std::min(bytes, gib << 30);
     }
     return bytes;
@@ -156,7 +157,7 @@ uint64_t free_huge_bytes() {
 }
 
 std::string thp_request_skipped(uint64_t bytes) {
-    if (std::getenv("STRATA_NO_ARENA_THP") != nullptr) return "transparent huge pages skipped (STRATA_NO_ARENA_THP)";
+    if (strata::env_get("NO_ARENA_THP") != nullptr) return "transparent huge pages skipped (XESTRATA_NO_ARENA_THP)";
     std::string mode;
     if (std::FILE* f = std::fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r")) {
         char line[128] = {0};
@@ -173,13 +174,13 @@ std::string thp_request_skipped(uint64_t bytes) {
     // compacts until it finds a 2 MiB block.  When the free 2 MiB blocks cover less than half of the arena (a 62 GB
     // machine holding 47 GB of anonymous memory: the load never ended, at 100% system time), that is minutes of kernel
     // work per GiB for a TLB gain.  STRATA_ARENA_THP=1 asks for them anyway.
-    if (std::getenv("STRATA_ARENA_THP") == nullptr) {
+    if (strata::env_get("ARENA_THP") == nullptr) {
         const uint64_t free_huge = free_huge_bytes();
         if (free_huge < bytes / 2) {
             std::string why = "transparent huge pages NOT requested: only " + std::to_string(free_huge >> 30) +
                               " GiB of free 2 MiB blocks for a " + std::to_string(bytes >> 30) +
-                              " GiB arena, compaction would stall the load (STRATA_ARENA_THP=1 requests them anyway)";
-            std::fprintf(stderr, "strata: expert arena: %s\n", why.c_str());   // now: the load that follows can be long
+                              " GiB arena, compaction would stall the load (XESTRATA_ARENA_THP=1 requests them anyway)";
+            std::fprintf(stderr, "xestrata: expert arena: %s\n", why.c_str());   // now: the load that follows can be long
             return why;
         }
     }
@@ -681,7 +682,7 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::functio
         // rebind swapped it in and the OOM killer emptied the host).  Each layer moves only while the RAM has room
         // for it and a reserve (STRATA_HOST_USM_RESERVE_MIB, default 1024); otherwise the arena stays as it was.
         static const uint64_t reserve = [] {
-            const char* v = std::getenv("STRATA_HOST_USM_RESERVE_MIB");
+            const char* v = strata::env_get("HOST_USM_RESERVE_MIB");
             return (uint64_t) (v != nullptr ? std::strtoull(v, nullptr, 10) : 1024) << 20;
         }();
         const uint64_t avail = ram_available ? ram_available() : UINT64_MAX;   // the caller's reading of the RAM

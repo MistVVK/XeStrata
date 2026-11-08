@@ -19,6 +19,7 @@
 #include "device_caps.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_shared_expert
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <climits>
 #include <cstdlib>
@@ -77,7 +78,7 @@ bool shared_expert_multi(int n_tok, const float* x, const NativeSharedWeights& n
     }
     // gate and up in one launch where the layout allows (upstream b08cf3e1; STRATA_LFUSE_PAIR=0: two)
     static const bool pair_on = [] {
-        const char* v = std::getenv("STRATA_LFUSE_PAIR");
+        const char* v = strata::env_get("LFUSE_PAIR");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     if (!(pair_on && nw.gate_type == nw.up_type &&
@@ -88,7 +89,7 @@ bool shared_expert_multi(int n_tok, const float* x, const NativeSharedWeights& n
     }
     // the SwiGLU and its q8_1 image in one launch (upstream be7889ed); STRATA_VERIFY_QDEDUP=0: two
     static const bool fused_q8 = [] {
-        const char* v = std::getenv("STRATA_VERIFY_QDEDUP");
+        const char* v = strata::env_get("VERIFY_QDEDUP");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     if (fused_q8) {
@@ -98,7 +99,7 @@ bool shared_expert_multi(int n_tok, const float* x, const NativeSharedWeights& n
         native_quantize_q8_1(gate, nw.q8_1, (int) n_ff, n_tok, stream);
     }
     native_mmvq(nw.down_type, nw.down_data, nw.q8_1, out, (int) n_ff, (int) n_embd, n_tok, stream);
-    static const bool batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::strtol(v, nullptr, 10) != 0; }();
+    static const bool batch = [] { const char* v = strata::env_get("DEC_BATCH"); return v == nullptr || std::strtol(v, nullptr, 10) != 0; }();
     if (g_ready) {
         // the router's launch computed the raw gates
     } else if (batch && n_tok > 1) {   // one gemv for all rows (outputs identical), the sigmoid in the scale

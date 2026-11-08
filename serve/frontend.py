@@ -23,7 +23,6 @@ import datetime
 import json
 import logging
 import mimetypes
-import os
 import re
 import threading
 import uuid
@@ -34,6 +33,7 @@ from urllib.parse import unquote
 
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
+from serve import envvars
 
 LOGGER = logging.getLogger(__name__)
 # The earlier turns' thinking kept where a template drops it unless asked (Qwen3.6-35B-A3B's preserve_thinking; the
@@ -114,8 +114,8 @@ class ChatTemplate:
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
         # Do not use completed empty assistant turns as examples for the next reply. Keep the final message.
-        # (#843.  STRATA_KEEP_EMPTY_TURNS=1 renders them as before.)
-        keep_empty = os.environ.get("STRATA_KEEP_EMPTY_TURNS") == "1"
+        # (#843.  XESTRATA_KEEP_EMPTY_TURNS=1 renders them as before.)
+        keep_empty = envvars.get("KEEP_EMPTY_TURNS") == "1"
         messages = [m for i, m in enumerate(messages)
                     if i == len(messages) - 1 or keep_empty or not (isinstance(m, dict) and m.get("role") == "assistant"
                                                                     and not _text_of(m.get("content")).strip()

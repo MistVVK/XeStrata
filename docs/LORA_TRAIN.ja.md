@@ -15,7 +15,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 アダプターが **学習 → 保存 → 読み込み → 生成**まで通ること。判定は各模型のカード（5・7・8・9）が[確かめの手順](#確かめの手順)どおりにやります。
 Mage-Flow で一通り通して実測し、その後 MOSS-Image、Qwen-Image-2.1、MageTrail と広げます。
 
-学習は画像のエンジン（`strata-image`）の中で作ります。入口は serve の `--train-lora`（カード 10）で、設定は TOML を読みます。
+学習は画像のエンジン（`xestrata-image`）の中で作ります。入口は serve の `--train-lora`（カード 10）で、設定は TOML を読みます。
 文エンコーダの学習はありません。VAE と文の読み手は学習の step では VRAM に載せません（前処理でディスクに置いた値だけを使います）。
 
 ## 対象の 4 模型
@@ -66,7 +66,7 @@ alpha は自由値で、**既定の候補は alpha = rank**（掛かりが 1.0 �
 Qwen-Image-2.1 の MLP の第 1 の重みは GPU では束ねた 1 枚です（`img_mlp.gate_up.weight`、24576 行 × 4096 列 = `[2 * inter][dim]`）。
 v1 の保存は**束ねず、`img_mlp.gate_layer` と `img_mlp.proj` を別々に**書きます（行を 12288 ずつに割る。`img_mlp.out` はそのまま 1 本）。
 
-- 分けた形は読む側が 3 つとも当てます。当方（`qi_dit.cpp` の slot が gate_layer を行 0 から、proj を行 12288 から読む。`strata-image-lora-probe` の bind で合成模型の全鍵 21 本が 21/21 当たり、
+- 分けた形は読む側が 3 つとも当てます。当方（`qi_dit.cpp` の slot が gate_layer を行 0 から、proj を行 12288 から読む。`xestrata-image-lora-probe` の bind で合成模型の全鍵 21 本が 21/21 当たり、
   `records/2026-10-29-image-lora/parity` で分けた形も束ねた形も重みごとに cos 1.0000000）、ComfyUI（`comfy/lora.py` が「LoRAs address the halves」と書いて束ねた重みを行で半々に割る）、
   diffusers 0.41.0（`img_mlp.gate_layer` と `img_mlp.proj` が実際のモジュールで、束ねた `gate_up` は無い）。
 - 束ねた `img_mlp.gate_up` をファイルに入れると、diffusers 側はその target を見つけられず**黙って無視します**（他の層が一致すれば注入は通る。`peft/tuners/tuners_utils.py` の `NoMatchingPeftModuleError` は一致 0 件のときだけ）。
@@ -188,7 +188,7 @@ v1 のデータは 1792×2400 前後なので、たとえば 1792×2400 → 864�
 | 文埋め込み | `<画像>_<模型>_te.npz` | `prompt_embeds`、`attn_mask`、`uncond_embeds`、`uncond_mask`、`caption_dropout_rate` | bf16 のビットを uint16、mask は int32、dropout の値は F32 |
 
 - latent は**VAE の生出力**を置きます。DiT 向けの詰め（2×2）と正規化（BatchNorm や統計）は学習の時に掛けます（sd-scripts の MOSS-Image と同じ順序）。
-- 値を作るのは当方のエンジンです（VAE は `strata-image` のエンコーダ、文は各模型の読み手の `text_states` と同じ道）。前処理の一致は推論の golden との突き合わせで確かめます（カード 4）。
+- 値を作るのは当方のエンジンです（VAE は `xestrata-image` のエンコーダ、文は各模型の読み手の `text_states` と同じ道）。前処理の一致は推論の golden との突き合わせで確かめます（カード 4）。
 - 空のプロンプトの埋め込み（`uncond_*`）も必ず置きます。MOSS-Image の negative は空で、後で dropout を足すときに再生成がいらないためです。
 - 模型の接頭辞は `mf`（Mage-Flow・MageTrail。VAE が違うので latent は共用しません）・`moss`・`qi`。
 - SimpleTuner は latent も文埋め込みも `.pt` を 1 枚 1 ファイルで別めのキャッシュ・フォルダーに置き、名前は SHA-256 の hash です（`simpletuner/helpers/caching/vae.py`、`text_embeds.py`）。v1 は sd-scripts の形（画像の隣に `.npz`）にします（名前が見えるので 1 枚ずつ見直せるため）。
@@ -257,7 +257,7 @@ DiffSynth-Studio `543bf84`（Qwen-Image-2.1 の副参照）は別作りです。
 ## 確かめの手順
 
 1. **一覧**: その模型の family で `serve/loras.py` の `Folder` を読み、ファイルが `listing` に出ること（`skipped` に出たら不合格）。`rank`・`trigger`・`targets` の値が本物と合うことも見ます。
-1. **バインド**: `strata-image-lora-probe` の `map` で名前が全部当たり、拒否の理由が出ないこと。
+1. **バインド**: `xestrata-image-lora-probe` の `map` で名前が全部当たり、拒否の理由が出ないこと。
 1. **生成と効き目**: serve 経由で素の画像と 1 本当てた画像を同じ prompt・同じ seed で作り、LPIPS で差を示し、目視は人に残します（`records/2026-10-29-image-lora/pipeline` の流儀）。
 1. **外の読む側**: ComfyUI（7a28332）で同じファイルが読めること（カード 5・7・8・9 で 1 度ずつ）。diffusers は上の表どおり Qwen-Image-2.1 だけ。
 

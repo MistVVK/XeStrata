@@ -22,6 +22,9 @@ import sys
 import threading
 import time
 import urllib.request
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # the checkout, for serve/envvars.py
+from serve import envvars  # noqa: E402
 
 TOPICS = [
     "the history of lighthouses and how their lenses worked",
@@ -100,8 +103,8 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--words", type=int, default=800,
                     help="the essay length asked for (longer = longer prompt? no: the answer)")
-    ap.add_argument("--model", default="strata")
-    ap.add_argument("--key", default=os.environ.get("STRATA_KEY", ""))
+    ap.add_argument("--model", default="xestrata")
+    ap.add_argument("--key", default=envvars.get("KEY", ""))
     ap.add_argument("--nonce", default=str(int(time.time())),
                     help="prefix of the per-request nonce (every round reads fresh prompts); '' = identical prompts "
                          "every round; fix it to compare two runs")

@@ -15,6 +15,7 @@
 #include "strata/kernels/q8_act.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_fused_gr
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -70,7 +71,7 @@ inline float sigmoidf_(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
 // STRATA_GR_FAST=0 the former kernels.
 bool gr_fast(sycl::queue&) {
     static const bool on = [] {
-        const char* v = std::getenv("STRATA_GR_FAST");
+        const char* v = strata::env_get("GR_FAST");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     return on;
@@ -521,7 +522,7 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     // STRATA_HC_SPLIT=0: one group per token (norm_step, or its latency-hidden form with gr_fast).
     const bool fast = gr_fast(q);
     static const bool split = [] {
-        const char* v = std::getenv("STRATA_HC_SPLIT");
+        const char* v = strata::env_get("HC_SPLIT");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     if (split) {

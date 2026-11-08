@@ -6,6 +6,7 @@
 
 #include "strata/core/expert_source.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -245,7 +246,7 @@ void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
 }
 
 void LayerStream::choose_source(Slot& s) {
-    if (const char* e = std::getenv("STRATA_IMAGE_STREAM_SOURCE")) {
+    if (const char* e = strata::env_get("IMAGE_STREAM_SOURCE")) {
         const std::string v = e;
         if (v == "relay" || v == "home" || v == "file") {
             source_ = v == "relay" ? Source::relay : v == "home" ? Source::home : Source::file;
@@ -332,12 +333,12 @@ uint8_t* LayerStream::take_home(uint64_t bytes) {
     // beside the pinned memory), less the CMA no pinned page can use, faulted the GPU's copies (#11).
     // STRATA_RESIDENT_PIN=0: never, 1: whatever the RAM, as the experts' RAM copy
     static const int pin = [] {
-        const char* v = std::getenv("STRATA_RESIDENT_PIN");
+        const char* v = strata::env_get("RESIDENT_PIN");
         return v == nullptr ? -1 : std::strtol(v, nullptr, 10) != 0 ? 1 : 0;
     }();
     if (homes_full_) return nullptr;
     core::detail::HostMemory hm;
-    std::string why = pin == 0 ? "STRATA_RESIDENT_PIN=0" : "";
+    std::string why = pin == 0 ? "XESTRATA_RESIDENT_PIN=0" : "";
     bool fits = pin != 0 && (pin == 1 || core::detail::host_available_memory(hm));
     if (fits && pin != 1) {
         const uint64_t cma = platform::cma_free_bytes();

@@ -35,6 +35,7 @@
 #pragma once
 
 #include "strata/kernels/sampler.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -54,7 +55,7 @@ inline constexpr int kCoupledHistCap = 4096;
 
 inline bool& coupled_draft_state() {
     static bool on = [] {
-        const char* e = std::getenv("STRATA_SPEC_COUPLED");
+        const char* e = strata::env_get("SPEC_COUPLED");
         return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
     }();
     return on;

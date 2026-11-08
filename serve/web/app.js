@@ -133,7 +133,7 @@ function saveApiKey(notify = false) {
 $("api-key").oninput = () => saveApiKey();
 $("api-key").onchange = () => saveApiKey(true);
 
-let health = {model: "strata", images: false, max_context: 0};
+let health = {model: "xestrata", images: false, max_context: 0};
 // the texts that depend on what this server offers: the empty chat's line and the attach button's hint
 function renderEmptyChat() {
   $("attach-btn").title = health.images ? tr("composer.attachPictures", "Attach a text file or a picture (or drop it here)")
@@ -173,7 +173,7 @@ async function loadSwitcher() {
   sel.replaceChildren(...keys.map((k) => {
     const o = document.createElement("option");
     o.value = k;
-    o.textContent = sw.choices[k].replace(/ \(Strata SYCL engine\)$/, "");
+    o.textContent = sw.choices[k].replace(/ \(Strata SYCL engine\)$/, "");   // the label upstream's switch gives
     o.selected = k === (sw.starting || sw.mode);
     return o;
   }));
@@ -1964,7 +1964,7 @@ function settlePending(cut, finished) {
 }
 
 // the message box (or a parked message, `payload`) becomes a user turn and a reply is asked for
-// while the image switch is on, the reply must make or edit an image (strata_images' force)
+// while the image switch is on, the reply must make or edit an image (xestrata_images' force)
 async function send(payload) {
   const own = !payload;
   const p = payload || {text: $("input").value.trim(), images: attachments.filter((a) => a.kind !== "file"),
@@ -1984,7 +1984,7 @@ async function send(payload) {
   return generateReply({image: !!p.image});
 }
 // an answer for the messages as they are: the last one is a user turn
-// A streamed reply the server keeps past its connection (strata_reply): its data lines are counted as they are read, so
+// A streamed reply the server keeps past its connection (xestrata_reply): its data lines are counted as they are read, so
 // that a connection that breaks (not the page's own abort) is read again from where it stopped, a few times, waiting a
 // little longer each time.  A connection that ends before [DONE] broke too (a proxy or a network that closed it); an
 // error the stream itself reports is not a broken connection.
@@ -2020,7 +2020,7 @@ async function readReply(r, rid, signal, onData) {
         await new Promise((ok) => setTimeout(ok, Math.min(1000 * tries, 5000)));
         if (signal.aborted) throw e;
         try {
-          r = await fetch(`v1/strata/replies/${rid}?from=${seen}`, {headers: headers(), signal});
+          r = await fetch(`v1/xestrata/replies/${rid}?from=${seen}`, {headers: headers(), signal});
           if (r.ok) break;
           if (r.status === 404) throw e;                       // the server no longer has it (restarted)
         } catch (e2) { if (e2 === e || e2.name === "AbortError") throw e2; }
@@ -2030,16 +2030,16 @@ async function readReply(r, rid, signal, onData) {
 }
 // Stop (and an interjection): the server ends the reply too, then this page's connection is closed
 function stopReply(b = busy) {
-  if (b.rid) fetch(`v1/strata/replies/${b.rid}/cancel`, {method: "POST", headers: headers(true), body: "{}"}).catch(() => {});
+  if (b.rid) fetch(`v1/xestrata/replies/${b.rid}/cancel`, {method: "POST", headers: headers(true), body: "{}"}).catch(() => {});
   b.controller.abort();
 }
 // a kept reply this page has read to its end (or given up on): the server lets it go (else it keeps it 12 hours)
 function replyRead(rid) {
-  if (rid) fetch(`v1/strata/replies/${rid}/ack`, {method: "POST", headers: headers(true), body: "{}"}).catch(() => {});
+  if (rid) fetch(`v1/xestrata/replies/${rid}/ack`, {method: "POST", headers: headers(true), body: "{}"}).catch(() => {});
 }
 // The answer goes to the chat it was asked in (`home`: its id, the chat record when the list is on, its messages), on the
 // screen or not: another chat can be opened or started while it is written.  `opts.resume`: an answer a closed page left
-// unread (its strata_reply id kept in the message, rid), read again from the server's start of it.
+// unread (its xestrata_reply id kept in the message, rid), read again from the server's start of it.
 async function generateReply(opts = {}) {
   const home = opts.home || {id: chat ? chat.id : "single", chat, messages, cache: chatId || "chat"};
   const msgs = home.messages, shown = () => msgs === messages;
@@ -2071,12 +2071,12 @@ async function generateReply(opts = {}) {
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
   // and make images when the conversation asks for one: by the model the words choose (auto), by one, or none
   const ci = $("chat-images").value;
-  if (health.image_generation && ci !== "off") body.strata_images = ci === "auto" || !ci ? true : {model: ci};
+  if (health.image_generation && ci !== "off") body.xestrata_images = ci === "auto" || !ci ? true : {model: ci};
   if (health.image_generation && opts.image)                // the image button: by the model chosen, else the words'
-    body.strata_images = {...(ci && ci !== "auto" && ci !== "off" ? {model: ci} : {}), force: true};
+    body.xestrata_images = {...(ci && ci !== "auto" && ci !== "off" ? {model: ci} : {}), force: true};
   // what the user marked on a picture in its preview (previewAttachment): this message's image tools take it, even with
   // images off
-  if (health.image_generation && imageMarks && !opts.resume) body.strata_images = marksBody(body.strata_images);
+  if (health.image_generation && imageMarks && !opts.resume) body.xestrata_images = marksBody(body.xestrata_images);
   if (health.web_search && $("chat-search").value !== "off") body.web_search_options = {};   // the server's search tools
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0, overflow = false, handoff = false;
@@ -2103,7 +2103,7 @@ async function generateReply(opts = {}) {
         if (m.tools) m.tools = m.tools.slice(0, base.tools || 0);
         for (const k of ["error", "stopped", "meta", "limit"]) delete m[k];
         if (!frame) frame = requestAnimationFrame(paint);
-        r = await fetch(`v1/strata/replies/${me.rid}?from=0`, {headers: headers(), signal: controller.signal});
+        r = await fetch(`v1/xestrata/replies/${me.rid}?from=0`, {headers: headers(), signal: controller.signal});
         if (r.status === 404) throw replyError(tr("chat.replyLost", "The server no longer has this answer (it was restarted, or the answer waited more than 12 hours)."));
       } else {
         body.messages = apiMessages(round > 0, msgs, m);
@@ -2111,17 +2111,17 @@ async function generateReply(opts = {}) {
         // marks hold until an image tool has run in it (sent again after that, every round made one more image;
         // dropped before it, a mask the model had not used yet was lost when it wrote its memory first)
         const imageRan = (m.tools || []).some((t) => ["edit_image", "generate_image"].includes(t.tool || t.name) && t.state !== "writing");
-        if (round > 0 && imageRan && body.strata_images && typeof body.strata_images === "object") {
-          const rest = {...body.strata_images};
+        if (round > 0 && imageRan && body.xestrata_images && typeof body.xestrata_images === "object") {
+          const rest = {...body.xestrata_images};
           for (const k of ["force", "edit", "layout"]) delete rest[k];
-          body.strata_images = Object.keys(rest).length ? rest : true;
+          body.xestrata_images = Object.keys(rest).length ? rest : true;
         }
         // kept past its connection (a tab put to sleep, a network that dropped, the page closed): the rest is read again
         // below, or, when the page is opened again, from the id kept in the message (resumeReplies)
         const prev = me.rid;
         me.rid = health.kept_replies ? replyId() : null;
         if (me.rid) {
-          body.strata_reply = {id: me.rid};
+          body.xestrata_reply = {id: me.rid};
           Object.assign(m, {rid: me.rid, ridBase: {text: m.text.length, reasoning: m.reasoning.length, tools: (m.tools || []).length}});
           saveChatOf(home);
         }
@@ -2298,7 +2298,7 @@ $("export-btn").onclick = () => {
     `## ${health.model}\n\n${m.reasoning ? `<details><summary>Thinking</summary>\n\n${m.reasoning}\n\n</details>\n\n` : ""}${tools(m)}${m.text || m.error || ""}\n`).join("\n");
   const a = document.createElement("a");
   a.href = URL.createObjectURL(new Blob([md], {type: "text/markdown"}));
-  a.download = `strata-chat-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.md`;
+  a.download = `xestrata-chat-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, "-")}.md`;
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 5000);
 };
@@ -2642,7 +2642,7 @@ function paintMarks() {
     setMarksOverlay(el, on ? imageMarks.overlay : null);
   }
 }
-// the marks into a request's strata_images (then they are spent): edit's image and mask, layout's boxes at the image's
+// the marks into a request's xestrata_images (then they are spent): edit's image and mask, layout's boxes at the image's
 // shape at about 1024 x 1024 pixels (as the Images tab's auto size)
 function marksBody(want) {
   if (!imageMarks) return want;
@@ -3466,7 +3466,7 @@ async function imgRegionMask() {
     g.putImageData(px, 0, 0);
     $("img-hint").textContent = j.data.length ? tr("img.regionFound", "{n} found by {model}", {n: j.data.length, model: j.model})
       : tr("img.regionNone", "Not found: try other words");
-    $("img-sam-license").hidden = !(j.strata && /license/.test(j.strata.fallback || ""));
+    $("img-sam-license").hidden = !(j.xestrata && /license/.test(j.xestrata.fallback || ""));
   } catch (e) {
     toast("error", tr("img.regionGo", "Make mask"), String(e.message || e), 8000);
   } finally {
@@ -3828,10 +3828,10 @@ function imgMossBody(body) {
   }
   return null;
 }
-// what the prompt enhancer did (the response's strata.enhance), under the image: the prompt it wrote, or its layout
+// what the prompt enhancer did (the response's xestrata.enhance), under the image: the prompt it wrote, or its layout
 // with a button that loads it into the boxes, or why it gave nothing
 function imgEnhanced(j, item) {
-  const e = j.strata && j.strata.enhance;
+  const e = j.xestrata && j.xestrata.enhance;
   if (!e) return null;
   const div = document.createElement("div"), p = document.createElement("span");
   div.className = "img-enhanced";
@@ -3904,7 +3904,7 @@ async function imgStream(r) {
           imgPartial(`data:image/${e.output_format || "png"};base64,` + e.b64_json,
                      tr("img.partialCap", "Partial image {n}…", {n: e.partial_image_index + 1}));
         } else if (e.type.endsWith(".completed")) {
-          Object.assign(j, {model: e.model, size: e.size, output_format: e.output_format, strata: e.strata});
+          Object.assign(j, {model: e.model, size: e.size, output_format: e.output_format, xestrata: e.xestrata});
           j.data.push({b64_json: e.b64_json, seed: e.seed});
         }
       }
@@ -3962,10 +3962,10 @@ function imgAdd(shot) {
 function imgInfo(url, body, j, d, seconds) {
   const req = {...body, seed: d.seed};
   for (const k of ["n", "stream", "partial_images"]) delete req[k];
-  const made = j.strata && j.strata.crop && !j.strata.crop.whole && j.strata.made_size ? tr("img.madeCrop", "(drawn at {size} around the painted part)", {size: j.strata.made_size})
-    : j.strata && j.strata.crop ? ""
-    : j.strata && j.strata.made_size ? tr("img.madeCut", "(made at {size}, middle cut out)", {size: j.strata.made_size})
-    : j.strata && j.strata.requested_size ? tr("img.madeNearest", "({size} asked: the model's nearest size)", {size: j.strata.requested_size}) : "";
+  const made = j.xestrata && j.xestrata.crop && !j.xestrata.crop.whole && j.xestrata.made_size ? tr("img.madeCrop", "(drawn at {size} around the painted part)", {size: j.xestrata.made_size})
+    : j.xestrata && j.xestrata.crop ? ""
+    : j.xestrata && j.xestrata.made_size ? tr("img.madeCut", "(made at {size}, middle cut out)", {size: j.xestrata.made_size})
+    : j.xestrata && j.xestrata.requested_size ? tr("img.madeNearest", "({size} asked: the model's nearest size)", {size: j.xestrata.requested_size}) : "";
   return {req, info: imgInfoText(url, req, [`model: ${j.model}`, `size: ${j.size} ${made}`.trim(), `seconds: ${seconds}`])};
 }
 // "POST <endpoint>", the request's fields as key: value (an image as its kind, not its data), then the answer's lines
@@ -4086,10 +4086,10 @@ $("img-form").onsubmit = async (ev) => {
     imgShow(0);
     $("img-hint").textContent = tr("img.doneIn", "Done in {n} s.", {n: seconds});
     if (imgPhone.matches) $("img-view").scrollIntoView({block: "start", behavior: "smooth"});
-    if (j.strata && j.strata.made_size && !j.strata.crop)
-      toast("info", tr("img.madeAt", "Made at {size}", {size: j.strata.made_size}), tr("img.madeCutText", "The image model needs sides that are multiples of 16: the middle {size} was cut out.", {size: j.size}), 8000);
-    else if (j.strata && j.strata.requested_size)
-      toast("info", tr("img.madeAt", "Made at {size}", {size: j.size}), tr("img.madeNearestText", "This image model makes a fixed set of sizes: {size} is the one whose shape is nearest the {asked} asked for.", {size: j.size, asked: j.strata.requested_size}), 8000);
+    if (j.xestrata && j.xestrata.made_size && !j.xestrata.crop)
+      toast("info", tr("img.madeAt", "Made at {size}", {size: j.xestrata.made_size}), tr("img.madeCutText", "The image model needs sides that are multiples of 16: the middle {size} was cut out.", {size: j.size}), 8000);
+    else if (j.xestrata && j.xestrata.requested_size)
+      toast("info", tr("img.madeAt", "Made at {size}", {size: j.size}), tr("img.madeNearestText", "This image model makes a fixed set of sizes: {size} is the one whose shape is nearest the {asked} asked for.", {size: j.size, asked: j.xestrata.requested_size}), 8000);
   } catch (e) {
     if (imgAbort.signal.aborted) $("img-hint").textContent = tr("img.interrupted", "Interrupted.");
     else {
@@ -4406,10 +4406,10 @@ $("tool-form").onsubmit = async (ev) => {
       const items = j.data.map(d => ({score: d.score, box: d.box, mask: d.mask, label: d.label}));
       toolResult({req: body, info: imgInfoText(url, body, [`model: ${j.model}`, `task: ${j.task}`, `found: ${items.length}`, `seconds: ${seconds}`]),
                   found: {items, width: j.width, height: j.height, prompt: body.prompt}});
-      $("tool-sam-license").hidden = !(j.strata && /license/.test(j.strata.fallback || ""));
+      $("tool-sam-license").hidden = !(j.xestrata && /license/.test(j.xestrata.fallback || ""));
     } else {
       const fmt = j.output_format || "png", d = j.data[0];
-      const fix = j.strata && j.strata.fix;   // the Detailer's regions found and drawn again
+      const fix = j.xestrata && j.xestrata.fix;   // the Detailer's regions found and drawn again
       const answer = [`model: ${j.model}`, j.size ? `size: ${j.size}` : j.width ? `size: ${j.width}x${j.height}` : "", d.seed != null ? `seed: ${d.seed}` : "",
                       fix ? `regions: ${(fix.regions || []).map(x => `${x.part} ${x.score.toFixed(2)}`).join(", ") || 0}` : "", `seconds: ${seconds}`].filter(Boolean);
       const req = d.seed != null && body.seed == null && (body.prompt || body.fix) ? {...body, seed: d.seed} : body;
@@ -4569,7 +4569,7 @@ function vidPost(url, fd, signal, uploaded) {
     const x = new XMLHttpRequest();
     x.open("POST", url);
     for (const [k, v] of Object.entries(headers(false))) x.setRequestHeader(k, v);
-    x.setRequestHeader("X-Strata-Upload", "1");   // the server's mark of its own page's form (_foreign_page)
+    x.setRequestHeader("X-XeStrata-Upload", "1");   // the server's mark of its own page's form (_foreign_page)
     x.responseType = "blob";
     x.upload.onprogress = (e) => { if (e.lengthComputable) uploaded(e.loaded / e.total); };
     x.onload = () => ok({status: x.status, header: (n) => x.getResponseHeader(n), body: x.response});

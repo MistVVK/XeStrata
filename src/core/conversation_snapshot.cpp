@@ -8,6 +8,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/platform/env.hpp"
 
 #include <array>
 #include <chrono>
@@ -146,7 +147,7 @@ struct VramKv {
 VramKv& vram_kv() { static VramKv v; return v; }
 size_t park_vram_budget() {
     static const size_t b = [] {
-        const char* v = std::getenv("STRATA_PARK_VRAM_MIB");
+        const char* v = strata::env_get("PARK_VRAM_MIB");
         const long long mib = v != nullptr ? std::strtoll(v, nullptr, 10) : 0;
         return mib > 0 ? (size_t) mib << 20 : (size_t) 0;
     }();
@@ -232,7 +233,7 @@ struct ParkAsync {
 ParkAsync& park_async() { static ParkAsync a; return a; }
 constexpr size_t kParkPiece = (size_t) 4 << 20;
 bool park_async_on() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_PARK_ASYNC"); return v != nullptr && v[0] == '1'; }();
+    static const bool on = [] { const char* v = strata::env_get("PARK_ASYNC"); return v != nullptr && v[0] == '1'; }();
     return on;
 }
 // Whether part `i` of a layer is device memory, which the stage takes: the K/V pools of a resident layer (kv_mode 0)
@@ -245,7 +246,7 @@ bool on_device(const QsaState& st, const void* p) {
 struct KvSaveTrace { double attrs = 0, resize = 0, copy = 0; };
 KvSaveTrace& kv_save_trace() { static KvSaveTrace t; return t; }
 bool park_trace_on() {
-    static const bool on = std::getenv("STRATA_PARK_TRACE") != nullptr;
+    static const bool on = strata::env_get("PARK_TRACE") != nullptr;
     return on;
 }
 
@@ -525,7 +526,7 @@ void conversation_park_join() {
     std::lock_guard<std::mutex> lk(a.mu);
     if (a.pending.valid()) {
         const std::string e = a.pending.get();
-        if (!e.empty()) std::fprintf(stderr, "strata: STRATA_PARK_ASYNC: a parked K/V copy failed (%s)\n", e.c_str());
+        if (!e.empty()) std::fprintf(stderr, "xestrata: XESTRATA_PARK_ASYNC: a parked K/V copy failed (%s)\n", e.c_str());
     }
 }
 
@@ -552,9 +553,9 @@ bool conversation_park_async_begin(size_t need) {
     a.slot_tag = a.slot != nullptr ? a.slot->tag : 0;
     if (park_trace_on() && park_vram_budget() != 0) {
         if (a.slot != nullptr)
-            std::fprintf(stderr, "strata parktrace: kv slot %zu MB tag %llu\n", need >> 20, (unsigned long long) a.slot_tag);
+            std::fprintf(stderr, "xestrata parktrace: kv slot %zu MB tag %llu\n", need >> 20, (unsigned long long) a.slot_tag);
         else
-            std::fprintf(stderr, "strata parktrace: kv slot: none (%s)\n", why);
+            std::fprintf(stderr, "xestrata parktrace: kv slot: none (%s)\n", why);
     }
     if (a.dev != dev || (a.stage != nullptr && a.slot == nullptr && a.cap < need)) {
         if (a.stage) strata::gpu::free(a.stage);
@@ -693,7 +694,7 @@ void conversation_park_join_for(const SavedConversation& image) {
     size_t hits = 0;
     for (const auto& k : image.kv) hits += vram_kv_find(k.dev_tag) != nullptr ? 1 : 0;
     if (park_trace_on() && park_vram_budget() != 0)
-        std::fprintf(stderr, "strata parktrace: kv restore: %zu of %zu layers from the slot\n", hits, image.kv.size());
+        std::fprintf(stderr, "xestrata parktrace: kv restore: %zu of %zu layers from the slot\n", hits, image.kv.size());
     if (hits < image.kv.size()) conversation_park_join();
 }
 

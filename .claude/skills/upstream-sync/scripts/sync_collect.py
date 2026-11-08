@@ -3,7 +3,8 @@
 """Reads bench_generate.py's OUT/runs/*.txt and writes OUT/matrix.json (every run) and, per GPU, the prompt and output
 tables (the median of the rounds; a cell no run finished is "-", one stopped as too slow "too slow") as Markdown to
 stdout.  An upstream run stopped as too slow has "stopped" (prompt or output); one stopped in its output takes its
-prompt rate from the last PP line (or, without PP lines, from its "strata generate: prefill" line).
+prompt rate from the last PP line (or, without PP lines, from its "xestrata generate: prefill" line, upstream's
+"strata generate: prefill").
 When bench_serve.py ran too, OUT/serve-runs/*.json go to OUT/matrix-serve.json and three more tables per GPU and mode:
 the tier's prompt, the follow-ups (the median time a follow-up's prompt takes, in ms) and the output of all four
 turns.

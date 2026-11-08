@@ -341,7 +341,7 @@ KitchenFn kitchen_module() {
         namespace fs = std::filesystem;
         std::error_code ec;
         const fs::path dir = fs::read_symlink("/proc/self/exe", ec).parent_path();
-        const char* name = "libstrata_hip_kitchen.so";
+        const char* name = "libxestrata_hip_kitchen.so";
         std::string why = "not found";
         for (const fs::path& p : {dir / name, dir / "lib" / name}) {
             if (!fs::exists(p, ec)) continue;
@@ -358,7 +358,7 @@ KitchenFn kitchen_module() {
             fn = nullptr;
             why = p.string() + ": no strata_kitchen_i8_gemm";
         }
-        std::fprintf(stderr, "strata: comfy-kitchen's int8 product module did not open (%s): the library's product\n",
+        std::fprintf(stderr, "xestrata: comfy-kitchen's int8 product module did not open (%s): the library's product\n",
                      why.c_str());
     });
     return fn;

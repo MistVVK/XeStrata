@@ -81,8 +81,8 @@ std::string last_lines(const std::string& s, int lines = 4) {
 
 }  // namespace
 
-std::string ffmpeg_command() { return env_or("STRATA_FFMPEG", "ffmpeg"); }
-std::string ffprobe_command() { return env_or("STRATA_FFPROBE", "ffprobe"); }
+std::string ffmpeg_command() { return env_or("FFMPEG", "ffmpeg"); }
+std::string ffprobe_command() { return env_or("FFPROBE", "ffprobe"); }
 bool available() { return !ffmpeg_command().empty() && !ffprobe_command().empty(); }
 
 Info probe(const std::string& path) {
@@ -252,7 +252,7 @@ Writer::Writer(const std::string& stem, int64_t w, int64_t h, double fps, const 
         try {
             src = probe(o.audio_from);
         } catch (const VideoError& e) {   // a source that no longer reads: the video without its audio
-            std::fprintf(stderr, "strata-image: the audio of %s is left out: %s\n", o.audio_from.c_str(), e.what());
+            std::fprintf(stderr, "xestrata-image: the audio of %s is left out: %s\n", o.audio_from.c_str(), e.what());
         }
         if (src.audio) {
             a.insert(a.end(), {"-i", o.audio_from, "-map", "0:v:0", "-map", "1:a:0"});

@@ -1045,7 +1045,7 @@ bool intel_fits(sycl::queue& q) {
                                                                        {sycl::get_kernel_id<Big>()});
         return true;
     } catch (const sycl::exception& e) {
-        std::fprintf(stderr, "strata: the int8 XMX products do not build for this GPU (%s)\n", e.what());
+        std::fprintf(stderr, "xestrata: the int8 XMX products do not build for this GPU (%s)\n", e.what());
         return false;
     }
 }
@@ -1061,7 +1061,7 @@ bool intel_layout_ok(sycl::queue& q) {
         });
         q.memcpy(&res, out, sizeof(int)).wait();
     } catch (const sycl::exception& e) {
-        std::fprintf(stderr, "strata: the int8 XMX layout check did not run (%s)\n", e.what());
+        std::fprintf(stderr, "xestrata: the int8 XMX layout check did not run (%s)\n", e.what());
         res = 0;
     }
     sycl::free(out, q);
@@ -1086,7 +1086,7 @@ int intel_shape_of(sycl::queue& q) {
             }
             if (!rep || !(is == 1 ? intel_fits<1>(q) : intel_fits<2>(q))) continue;
             if (is == 1 ? intel_layout_ok<1>(q) : intel_layout_ok<2>(q)) return is;
-            std::fprintf(stderr, "strata: the GPU's int8 XMX accumulators are laid out otherwise: the experts' prompt "
+            std::fprintf(stderr, "xestrata: the GPU's int8 XMX accumulators are laid out otherwise: the experts' prompt "
                                  "products do not take them\n");
         }
         return 0;
@@ -1393,11 +1393,11 @@ bool iq_mmq_usable(sycl::queue& q) {
             });
             q.memcpy(&res, out, sizeof(int)).wait();
         } catch (const sycl::exception& e) {
-            std::fprintf(stderr, "strata: the int8 expert products' layout check did not run (%s)\n", e.what());
+            std::fprintf(stderr, "xestrata: the int8 expert products' layout check did not run (%s)\n", e.what());
             res = 0;
         }
         sycl::free(out, q);
-        if (!res) std::fprintf(stderr, "strata: the GPU's int8 and FP32 accumulators differ in layout: the experts' "
+        if (!res) std::fprintf(stderr, "xestrata: the GPU's int8 and FP32 accumulators differ in layout: the experts' "
                                "prompt products stay in FP16\n");
         return res == 1;
     });

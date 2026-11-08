@@ -125,7 +125,7 @@ int main(int argc, char** argv) {
             o.write(reinterpret_cast<const char*>(got.data()), (std::streamsize) (got.size() * 4));
         }
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image-dit-probe: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image-dit-probe: %s\n", e.what());
         return 1;
     }
     return 0;

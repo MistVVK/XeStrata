@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """The image table of an upstream merge or a release on one GPU: XeStrata's and upstream's image generators
 (Qwen-Image-2.1-Turbo), each as its own setup sets it up on this GPU and as its server runs it (serve/images.py), one
-1024x1024 image of 8 steps from a fixed prompt and seed a run.  XeStrata: its resident image engine (strata-image, in
+1024x1024 image of 8 steps from a fixed prompt and seed a run.  XeStrata: its resident image engine (xestrata-image, in
 engine/ beside the text engine), measured warm (a warm-up image of another prompt first, in the same process);
 upstream: stable-diffusion.cpp's sd-cli on the backend its setup picks for the GPU (CUDA on NVIDIA, HIP on AMD,
 Vulkan on Intel; UP_IMAGE_BACKEND), built by its setup (build_image_engine), one process an image.  The runs are
@@ -11,9 +11,9 @@ tools/bench_core.py's (ab_image), which setup's --bench makes too.
     XE_ROOT=DIR UP_ROOT=DIR DATA=DIR QUANT=Q8_0 UP_IMAGE_BACKEND=cuda [XE_IMAGE_PCI=ADDR] [UP_IMAGE_GPU=N] \\
       python .claude/skills/upstream-sync/scripts/bench_image.py OUT GPU [--dry-run]     # from the repository root
 
-XE_ROOT: XeStrata's tree, with engine/strata-image and the BUILD.json setup writes beside it (the "lib_dirs" of the
-compiler's runtime); XE_IMAGE_EXE: a strata-image elsewhere (a build folder: then XE_LIB_DIRS, the runtime's folders,
-separated as PATH is).  XE_IMAGE_PCI: the GPU's PCI address (STRATA_GPU_PCI, as setup's config names it).  UP_ROOT:
+XE_ROOT: XeStrata's tree, with engine/xestrata-image and the BUILD.json setup writes beside it (the "lib_dirs" of the
+compiler's runtime); XE_IMAGE_EXE: a xestrata-image elsewhere (a build folder: then XE_LIB_DIRS, the runtime's folders,
+separated as PATH is).  XE_IMAGE_PCI: the GPU's PCI address (XESTRATA_GPU_PCI, as setup's config names it).  UP_ROOT:
 upstream's tree, with its sd-cli in engine-image/ and the BUILD.json its setup writes beside it (its backend, checked
 against the one asked for, and the "lib_dirs" its config takes); UP_ROOT=none: XeStrata alone.  UP_SD_CLI: an sd-cli
 elsewhere (its BUILD.json beside it).  DATA: the data folder (the image model's files in its models/).  QUANT: the
@@ -53,7 +53,7 @@ for arm in ("xe", "up"):
     e = B.Engine(arm, arm, [], "", root=Path(root), py=py)
     if arm == "xe":
         exe = Path(os.environ.get("XE_IMAGE_EXE") or
-                   Path(root) / "engine" / ("strata-image.exe" if os.name == "nt" else "strata-image"))
+                   Path(root) / "engine" / ("xestrata-image.exe" if os.name == "nt" else "xestrata-image"))
         if os.environ.get("XE_IMAGE_EXE"):
             lib_dirs = [d for d in os.environ.get("XE_LIB_DIRS", "").split(os.pathsep) if d]
         else:
@@ -66,8 +66,8 @@ for arm in ("xe", "up"):
             var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
             env[var] = os.pathsep.join(lib_dirs + ([os.environ[var]] if os.environ.get(var) else []))
         if os.environ.get("XE_IMAGE_PCI"):
-            env["STRATA_GPU_PCI"] = os.environ["XE_IMAGE_PCI"]
-        cfg = B.image_config(e, "strata-image", quant, str(exe), models, model=model)
+            env["XESTRATA_GPU_PCI"] = os.environ["XE_IMAGE_PCI"]
+        cfg = B.image_config(e, "xestrata-image", quant, str(exe), models, model=model)
         envs["xe"] = env
     else:
         backend = os.environ.get("UP_IMAGE_BACKEND", "")
@@ -86,7 +86,7 @@ for arm in ("xe", "up"):
                              stamp.get("lib_dirs") or [])
     if "error" in cfg:
         sys.exit(f"{arm}: its image config: {cfg['error']}")
-    print(f"{arm}: {cfg.get('backend') or 'strata-image'} {quant}, args {' '.join(cfg.get('args') or [])}, "
+    print(f"{arm}: {cfg.get('backend') or 'xestrata-image'} {quant}, args {' '.join(cfg.get('args') or [])}, "
           f"env {cfg.get('env') or envs.get(arm) or {}}", flush=True)
     engines.append(e)
     cfgs[arm] = cfg

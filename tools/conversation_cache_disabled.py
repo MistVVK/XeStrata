@@ -132,13 +132,15 @@ def main():
                     'Reply with only that code.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n')
     args = common_args(cfg, a.spec)
     env = child_env(cfg)
-    env.pop('STRATA_SNAPSHOT_VERIFY', None)
-    env['STRATA_STATE_HASH'] = '1'
-    env['STRATA_MTP_BATCH'] = '1'
+    env.pop('XESTRATA_SNAPSHOT_VERIFY', None)
+    env.pop('STRATA_SNAPSHOT_VERIFY', None)   # upstream's name, which the engine reads too
+    env['XESTRATA_STATE_HASH'] = '1'
+    env['XESTRATA_MTP_BATCH'] = '1'
     a.output.mkdir(mode=0o700, parents=False, exist_ok=False)
     results = {'config': cfg, 'paragraphs': a.paragraphs, 'spec': a.spec, 'arms': [], 'requests': [],
                'compared_state_fields': STATE_KEYS,
-               'environment': {k: v for k, v in env.items() if k.startswith('STRATA_')}}
+               'environment': {k: v for k, v in env.items()
+                               if k.startswith(('XESTRATA_', 'STRATA_'))}}   # upstream's names too
     for index, exe in enumerate([a.upstream, *a.candidate]):
         name = 'upstream' if index == 0 else f'candidate-{index}'
         log = a.output / f'{name}.log'

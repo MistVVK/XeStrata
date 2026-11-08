@@ -326,7 +326,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         MEMORYSTATUSEX ms;
         ms.dwLength = sizeof(ms);
         if (GlobalMemoryStatusEx(&ms) && need > ms.ullTotalPhys / 2)
-            std::fprintf(stderr, "strata: warning: --ple-io ram locks %.1f GiB, more than half of this PC's %.1f GiB of RAM\n",
+            std::fprintf(stderr, "xestrata: warning: --ple-io ram locks %.1f GiB, more than half of this PC's %.1f GiB of RAM\n",
                          (double) need / (1ull << 30), (double) ms.ullTotalPhys / (1ull << 30));
         const strata::platform::LockResult lr =
             strata::platform::lock_resident((void*) impl_->data, need);
@@ -335,7 +335,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         } else {
             // a partial lock is not a lock: the unlocked rest would fault on the token path, so give it back
             if (lr.locked_bytes > 0) strata::platform::unlock_resident((void*) impl_->data, lr.locked_bytes);
-            std::fprintf(stderr, "strata: PLE table lock failed (%s): touching its pages instead\n",
+            std::fprintf(stderr, "xestrata: PLE table lock failed (%s): touching its pages instead\n",
                          lr.note.c_str());
             volatile uint8_t sink = 0;
             for (uint64_t off = 0; off < need; off += 4096) sink = sink + impl_->data[off];
@@ -369,7 +369,7 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         if (mlock((const void*) a0, a1 - a0) == 0) {
             impl_->locked = true;
         } else {
-            std::fprintf(stderr, "strata: PLE table mlock failed (%s; raise `ulimit -l`): its pages stay faulted in "
+            std::fprintf(stderr, "xestrata: PLE table mlock failed (%s; raise `ulimit -l`): its pages stay faulted in "
                                  "but may be reclaimed\n", std::strerror(errno));
         }
 #endif

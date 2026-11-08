@@ -1323,7 +1323,7 @@ int main(int argc, char** argv) {
                      argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image-lora-probe: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image-lora-probe: %s\n", e.what());
         return 1;
     }
 }

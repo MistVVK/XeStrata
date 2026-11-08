@@ -13,15 +13,15 @@ The last part of the prompt (the tail) is read exactly through every layer, as b
 Decode runs on the usual path over the state KVA built.
 
 It is an approximation that changes the answers, so it is **off by default**.
-`STRATA_KVA=1` turns it on: layers 36 to 47 (the last 12 of 48) are approximated, and the last 2,048 tokens are read exactly.
-Without it (or with `STRATA_KVA=0`) prefill and the draft layer are as before.
+`XESTRATA_KVA=1` turns it on: layers 36 to 47 (the last 12 of 48) are approximated, and the last 2,048 tokens are read exactly.
+Without it (or with `XESTRATA_KVA=0`) prefill and the draft layer are as before.
 
 ## What it does to the answers (upstream's measurements)
 
 These are the results of upstream's 0.2.7 quality runs, not measurements of XeStrata.
 
 - Approximating from layer 24 (upstream's first form) dropped records in tasks that extract scattered records from a 14K to 30K token document, and an answer began with an invented row. Agent tasks with a system prompt of about 10K tokens lost a total or got the arithmetic wrong.
-- Approximating from layer 36 kept agents and extraction at the level of the exact read on the same tasks, the best form upstream measured. `STRATA_KVA=1` selects it.
+- Approximating from layer 36 kept agents and extraction at the level of the exact read on the same tasks, the best form upstream measured. `XESTRATA_KVA=1` selects it.
 - Finding a needle, unanswerable questions, short summaries, code and JSON did not change in any form.
 - Prefill gets faster (upstream's RTX 5070: +11% at 14K, +18% at 30K), and on fast GPUs the decode after it gets somewhat slower, because the draft layer's guesses are accepted less often over approximated context (upstream's Radeon AI PRO R9700 at 27K: decode −11%).
 
@@ -29,17 +29,17 @@ These are the results of upstream's 0.2.7 quality runs, not measurements of XeSt
 
 A read is approximated when all of these hold:
 
-- The model has Qwen3.8-Flash-Next's shape (48 layers, 512 experts). A model of another shape is read exactly even with `STRATA_KVA=1` (`STRATA_KVA_ANY_MODEL=1` allows it, for research).
+- The model has Qwen3.8-Flash-Next's shape (48 layers, 512 experts). A model of another shape is read exactly even with `XESTRATA_KVA=1` (`XESTRATA_KVA_ANY_MODEL=1` allows it, for research).
 - One GPU (no layer split across GPUs) and no `--batch` slots.
 - The read starts at position 0 of the conversation (not a continuation), and the prompt has no pictures.
-- The part read at once has at least `STRATA_KVA_MIN_PROMPT` tokens (4,096) and more than the tail plus 64.
+- The part read at once has at least `XESTRATA_KVA_MIN_PROMPT` tokens (4,096) and more than the tail plus 64.
 
 Approximation goes by chunks: only a chunk whose last position is before the tail is approximated.
 The number of approximated positions is therefore rounded down to the chunk size.
-The layer-major read of `STRATA_PREFILL_LAYER_MAJOR=1` has no KVA form, so with `STRATA_KVA=1` it is not used and the prompt is read chunk by chunk.
+The layer-major read of `XESTRATA_PREFILL_LAYER_MAJOR=1` has no KVA form, so with `XESTRATA_KVA=1` it is not used and the prompt is read chunk by chunk.
 
-An engine started with `STRATA_KVA=1` logs one line with the reason for every read it did not approximate (`strata prefill: KVA configured but NOT applied: <reason>`), and one line at start-up when its configuration rules KVA out for the whole process.
-Without `STRATA_KVA=1` it logs nothing about KVA.
+An engine started with `XESTRATA_KVA=1` logs one line with the reason for every read it did not approximate (`xestrata prefill: KVA configured but NOT applied: <reason>`), and one line at start-up when its configuration rules KVA out for the whole process.
+Without `XESTRATA_KVA=1` it logs nothing about KVA.
 
 ## The draft layer (MTP)
 
@@ -58,26 +58,26 @@ The target model verifies every token, so the draft decides only how many tokens
 
 | Variable | Default | What it does |
 | --- | ---: | --- |
-| `STRATA_KVA` | off | `1` turns it on (from layer 36, a 2,048-token tail). Unset or `0`: the exact read |
-| `STRATA_KVA_ANY_MODEL` | off | `1` (research): approximate a model of a shape KVA was not measured on, with a warning |
-| `STRATA_KVA_SPLIT` | 36 | The first approximated layer (from 0). 24 is faster and dropped records |
-| `STRATA_KVA_SUFFIX` | 2048 | The tokens of the exactly read tail |
-| `STRATA_KVA_MIN_PROMPT` | 4096 | Shorter reads are exact |
-| `STRATA_KVA_SKIP` | state | `moe`: the late layers of an approximated chunk compute their whole attention half (its output added to the residual) and skip only the MoE half and its expert transfers. Slower than the state-only form, closer to the exact residual |
-| `STRATA_KVA_ONLY` | all | `gdn` or `qsa`: approximate only layers of that kind |
-| `STRATA_KVA_MODE` | identity | `identity`, `oracle`, `linear` (linear is not implemented) |
-| `STRATA_KVA_CAPTURE` | — | A folder: write the real residual entering every late layer (the read is exact while writing) |
-| `STRATA_KVA_CAPTURE_FP32` | off | Write FP32 instead of BF16 |
-| `STRATA_KVA_ORACLE` | — | A folder: use the written residuals as the late layers' inputs (with the same prompt and the same chunks) |
-| `STRATA_KVA_ORACLE_FP32` | off | Those files are FP32 |
-| `STRATA_KVA_GDN_NORM` | off | `1`: a state-only layer still computes the GDN output normalization (to compare with the state-only recurrence) |
+| `XESTRATA_KVA` | off | `1` turns it on (from layer 36, a 2,048-token tail). Unset or `0`: the exact read |
+| `XESTRATA_KVA_ANY_MODEL` | off | `1` (research): approximate a model of a shape KVA was not measured on, with a warning |
+| `XESTRATA_KVA_SPLIT` | 36 | The first approximated layer (from 0). 24 is faster and dropped records |
+| `XESTRATA_KVA_SUFFIX` | 2048 | The tokens of the exactly read tail |
+| `XESTRATA_KVA_MIN_PROMPT` | 4096 | Shorter reads are exact |
+| `XESTRATA_KVA_SKIP` | state | `moe`: the late layers of an approximated chunk compute their whole attention half (its output added to the residual) and skip only the MoE half and its expert transfers. Slower than the state-only form, closer to the exact residual |
+| `XESTRATA_KVA_ONLY` | all | `gdn` or `qsa`: approximate only layers of that kind |
+| `XESTRATA_KVA_MODE` | identity | `identity`, `oracle`, `linear` (linear is not implemented) |
+| `XESTRATA_KVA_CAPTURE` | — | A folder: write the real residual entering every late layer (the read is exact while writing) |
+| `XESTRATA_KVA_CAPTURE_FP32` | off | Write FP32 instead of BF16 |
+| `XESTRATA_KVA_ORACLE` | — | A folder: use the written residuals as the late layers' inputs (with the same prompt and the same chunks) |
+| `XESTRATA_KVA_ORACLE_FP32` | off | Those files are FP32 |
+| `XESTRATA_KVA_GDN_NORM` | off | `1`: a state-only layer still computes the GDN output normalization (to compare with the state-only recurrence) |
 
 An approximated read logs what it did in one line:
 
 ```text
-strata prefill: KVA on: split 36, suffix 2048, approximated 5120 of 7533 positions in 5 of 8 chunks, mode identity
+xestrata prefill: KVA on: split 36, suffix 2048, approximated 5120 of 7533 positions in 5 of 8 chunks, mode identity
 ```
 
-`STRATA_KVA_CAPTURE` writes `L<layer>.bin` for every late layer.
+`XESTRATA_KVA_CAPTURE` writes `L<layer>.bin` for every late layer.
 A row is `hc * n_embd` values, in the order of the prompt's positions.
 The next prompt overwrites them.

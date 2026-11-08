@@ -42,6 +42,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/prefill/kernels.hpp"
+#include "strata/platform/env.hpp"
 #include "plain_prompt.hpp"
 
 #include <algorithm>
@@ -69,7 +70,7 @@ namespace {
 
 bool dense_int8_env() {   // STRATA_PLAIN_DENSE_MMQ=0: every dense product through Gemm::native
     static const bool on = [] {
-        const char* v = std::getenv("STRATA_PLAIN_DENSE_MMQ");
+        const char* v = strata::env_get("PLAIN_DENSE_MMQ");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     return on;
@@ -472,7 +473,7 @@ void PlainModel::prompt_dense_calibrate() {
         const double d0 = n[0] - q[0], d1 = ((n[1] - q[1]) - d0) / (double) (hi - lo);
         if (d0 <= 0) dense_native_rows_ = 0;
         else if (d1 < 0) dense_native_rows_ = std::max<int64_t>(64, (lo + (int64_t) std::ceil(d0 / -d1) + 32) / 64 * 64);
-        std::fprintf(stderr, "strata plain: dense products in FP16 (the products' library, %s sums) from %s rows, in "
+        std::fprintf(stderr, "xestrata plain: dense products in FP16 (the products' library, %s sums) from %s rows, in "
                              "int8 below (%.2f / %.2f ms at %lld rows, %.2f / %.2f at %lld)\n",
                      dense_half_sums_ ? "FP16" : "FP32",
                      dense_native_rows_ == INT64_MAX ? "no" : std::to_string(dense_native_rows_).c_str(), 1e3 * n[0],
@@ -480,7 +481,7 @@ void PlainModel::prompt_dense_calibrate() {
         std::lock_guard<std::mutex> lock(chosen.mu);
         chosen.of[key] = {dense_native_rows_, dense_half_sums_};
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata plain: timing the dense products: %s (int8 kept)\n", e.what());
+        std::fprintf(stderr, "xestrata plain: timing the dense products: %s (int8 kept)\n", e.what());
         dense_native_rows_ = INT64_MAX;
         dense_half_sums_ = false;
     }
@@ -691,7 +692,7 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
         pg.mmq.run(gu, cs);
         // STRATA_SWIGLU_QUANT=1: swiglu and the down product's int8 rows in one kernel, the same bytes (upstream
         // dd97421d3); opt-in, as in prefill.cpp
-        static const bool sq = [] { const char* e = std::getenv("STRATA_SWIGLU_QUANT"); return e != nullptr && e[0] == '1'; }();
+        static const bool sq = [] { const char* e = strata::env_get("SWIGLU_QUANT"); return e != nullptr && e[0] == '1'; }();
         if (sq && FF % 32 == 0) {
             prefill::mmq::swiglu_quantize(P.gu + (int64_t) r0 * 2 * FF, P.hq, f.d_type, nr, FF, /*interleaved=*/false, cs);
         } else {
@@ -844,7 +845,7 @@ bool PlainModel::prompt_split(const int32_t* tokens, int64_t n, int64_t pos, int
             give_back(i);
             if (c[i]->borrow_short_) {   // as prompt_one: the windows read the prompt
                 static bool said = false;
-                if (!said) std::fprintf(stderr, "strata plain: %s: prompts are read through the decode windows\n", err.c_str());
+                if (!said) std::fprintf(stderr, "xestrata plain: %s: prompts are read through the decode windows\n", err.c_str());
                 said = true;
                 err.clear();
             }
@@ -932,15 +933,15 @@ bool PlainModel::prompt_one(const int32_t* tokens, int64_t n, int64_t pos, int32
         // failed; the windows read the prompt instead (slower, but it answers), said once
         if (borrow_short_) {
             static bool said = false;
-            if (!said) std::fprintf(stderr, "strata plain: %s: prompts are read through the decode windows\n", err.c_str());
+            if (!said) std::fprintf(stderr, "xestrata plain: %s: prompts are read through the decode windows\n", err.c_str());
             said = true;
             err.clear();
         }
         return false;
     }
-    static const bool profile = std::getenv("STRATA_PROMPT_PROFILE") != nullptr;
+    static const bool profile = strata::env_get("PROMPT_PROFILE") != nullptr;
     if (profile)
-        std::fprintf(stderr, "strata plain: borrowing the tier's slots %.1f ms\n",
+        std::fprintf(stderr, "xestrata plain: borrowing the tier's slots %.1f ms\n",
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tb).count());
     auto since = [](std::chrono::steady_clock::time_point t) {
         return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t).count();
@@ -952,11 +953,11 @@ bool PlainModel::prompt_one(const int32_t* tokens, int64_t n, int64_t pos, int32
     std::string err2;
     if (!prompt_return(err2) && ok) { err = err2; return false; }
     if (profile)
-        std::fprintf(stderr, "strata plain: the chunks %.1f ms, giving the tier its slots back %.1f ms\n", chunks_ms, since(tc));
+        std::fprintf(stderr, "xestrata plain: the chunks %.1f ms, giving the tier its slots back %.1f ms\n", chunks_ms, since(tc));
     const auto t0 = std::chrono::steady_clock::now();
     if (ok && !prompt_settle(err)) return false;
     if (profile)
-        std::fprintf(stderr, "strata plain: the tier after the prompt: %.1f ms\n",
+        std::fprintf(stderr, "xestrata plain: the tier after the prompt: %.1f ms\n",
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     return ok;
 }
@@ -994,13 +995,13 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     // window's kernels: the int8 and the FP16 path take them alike); STRATA_PLAIN_CPU_SHARE=0, or
     // --prefill-cpu-share 0 (STRATA_PREFILL_CPU_SHARE, as Qwen3.8-Flash-Next's): every expert on the GPU
     static const bool cpu_env = [] {
-        const char* v = std::getenv("STRATA_PLAIN_CPU_SHARE");
+        const char* v = strata::env_get("PLAIN_CPU_SHARE");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     const bool cpu_share = cpu_env && strata::prefill::cpu_share_setting() != 0.0 && split_.c > 0.0 && split_.p > 0.0 &&
                            P.cpu_cap > 0;
     static const bool prompt_attn_on = [] {   // STRATA_PLAIN_PROMPT_ATTN=0: the decode's attention kernel
-        const char* v = std::getenv("STRATA_PLAIN_PROMPT_ATTN");
+        const char* v = strata::env_get("PLAIN_PROMPT_ATTN");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     PromptGemm& pg = prompt_gemm();
@@ -1012,7 +1013,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     // STRATA_PROMPT_PROFILE=1: the time of each stage, the stream synchronized after each (slower; for finding where it
     // goes): 0 the GDN layers, 4 the attention layers, 1 the router and the host's grouping, 2 the experts, 3 the shared
     // expert and the combine
-    static const bool profile = std::getenv("STRATA_PROMPT_PROFILE") != nullptr;
+    static const bool profile = strata::env_get("PROMPT_PROFILE") != nullptr;
     double stage_ms[10] = {};   // 5-9: the GDN layers' parts (stage 0 is their sum)
     int64_t cpu_n = 0, cpu_rows = 0, miss_n = 0;   // for the profile: the CPU's experts and rows, the missed experts
     auto mark = [&](int stage, std::chrono::steady_clock::time_point& t) {
@@ -1336,15 +1337,15 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     windows_ += (n + opt_.max_t - 1) / opt_.max_t;
     mtp_h_set_ = has_mtp_ && pos + n < opt_.max_cells;   // the trunk's last row is in mtp_h_ for spec_start
     if (profile)
-        std::fprintf(stderr, "strata plain: prompt of %lld tokens: GDN %.1f ms, attention %.1f, router and grouping %.1f, "
+        std::fprintf(stderr, "xestrata plain: prompt of %lld tokens: GDN %.1f ms, attention %.1f, router and grouping %.1f, "
                              "experts %.1f, shared and combine %.1f\n", (long long) n, stage_ms[0], stage_ms[4], stage_ms[1],
                      stage_ms[2], stage_ms[3]);
     if (profile && stage_ms[0] > 0.0)
-        std::fprintf(stderr, "strata plain: the GDN layers: in-projections %.1f ms, alpha and beta %.1f, gates and conv %.1f, "
+        std::fprintf(stderr, "xestrata plain: the GDN layers: in-projections %.1f ms, alpha and beta %.1f, gates and conv %.1f, "
                              "recurrence %.1f, out-projection %.1f\n", stage_ms[5], stage_ms[6], stage_ms[7], stage_ms[8],
                      stage_ms[9]);
     if (profile)
-        std::fprintf(stderr, "strata plain: prompt experts not in VRAM %lld, of them on the CPU %lld (%lld rows)\n",
+        std::fprintf(stderr, "xestrata plain: prompt experts not in VRAM %lld, of them on the CPU %lld (%lld rows)\n",
                      (long long) miss_n, (long long) cpu_n, (long long) cpu_rows);
     if (!last()) return true;
     *out = ((volatile int32_t*) h_out_)[0];

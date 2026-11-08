@@ -44,6 +44,7 @@
 #include "sm70_table.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_iq_kernels
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #define GGML_COMMON_DECL_SYCL
 #define GGML_COMMON_IMPL_SYCL
@@ -1350,7 +1351,7 @@ sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsi
 // STRATA_EXP_MODE=<another value> (0): the default kernels; upstream's modes 1-7 are gfx906's and not here.
 bool exp_mode8(sycl::queue& q) {
     static const int env = [] {
-        const char* v = std::getenv("STRATA_EXP_MODE");
+        const char* v = strata::env_get("EXP_MODE");
         return v != nullptr ? (int) std::strtol(v, nullptr, 10) : -1;
     }();
     (void) q;
@@ -1369,7 +1370,7 @@ size_t local_mem_bytes(sycl::queue& q) {
 // 72.6 / 53.5 us -> 42.3 / 38.6 us for IQ4_NL / Q2_0); there is no such GPU here.  Elsewhere the switch does nothing.
 bool down_ws_on(sycl::queue& q) {
     static const bool env = [] {
-        const char* v = std::getenv("STRATA_DOWN_WS");
+        const char* v = strata::env_get("DOWN_WS");
         return v != nullptr && v[0] == '1';
     }();
     if (!env) return false;
@@ -2377,7 +2378,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     // SwiGLU + q8_1 run as one pass over the call's own entries; STRATA_GROUPED_V1=1: a row per possible group and the
     // two passes over every entry (A/B; the same bits)
     static const bool v1 = [] {
-        const char* v = std::getenv("STRATA_GROUPED_V1");
+        const char* v = strata::env_get("GROUPED_V1");
         return v != nullptr && v[0] == '1';
     }();
     const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;

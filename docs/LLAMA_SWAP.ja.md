@@ -21,8 +21,8 @@ models:
   xestrata:
     cmd: >-
       sh -c 'cd /path/to/XeStrata && exec .venv/bin/python -m serve.server
-      --engine strata --config xestrata-<model>.json --port ${PORT}'
-    env: ["STRATA_ALLOWED_HOSTS=my-server"]     # クライアントが使うホスト名（下を参照）
+      --engine xestrata-engine --config xestrata-<model>.json --port ${PORT}'
+    env: ["XESTRATA_ALLOWED_HOSTS=my-server"]     # クライアントが使うホスト名（下を参照）
     checkEndpoint: /health
     ttl: 1800
 ```
@@ -44,7 +44,7 @@ llama-swap はクライアントの Host ヘッダーをそのまま渡すので
 IP アドレスと `localhost` への要求はいつも通るので、手元の試しでは動き、ほかの機械からだけ失敗することがあります。
 次のどれかで直ります。
 
-- エントリーの `env` に `STRATA_ALLOWED_HOSTS=my-server`（カンマ区切りの名前。ポートは見ない）
+- エントリーの `env` に `XESTRATA_ALLOWED_HOSTS=my-server`（カンマ区切りの名前。ポートは見ない）
 - `xestrata-<model>.json` に `"allowed_hosts": ["my-server"]`
 - `"api_key"` を設定する（この確かめはなくなり、どのクライアントも鍵を送る）
 

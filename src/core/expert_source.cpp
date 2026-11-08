@@ -19,6 +19,7 @@
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -429,7 +430,7 @@ bool resident_pin_fits(uint64_t copy, uint64_t in_place, uint64_t headroom, uint
                          "%.2f GiB still read from the model's files and the %.0f GiB headroom"
                        : "the %.2f GiB RAM copy stays pageable (#11): of %.2f GiB available, %.2f GiB stays beside it, "
                          "less than the %.2f GiB still read from the model's files and the %.0f GiB headroom (memory "
-                         "page-locked there faulted the GPU's copies when the files paged; STRATA_RESIDENT_PIN=1 locks it "
+                         "page-locked there faulted the GPU's copies when the files paged; XESTRATA_RESIDENT_PIN=1 locks it "
                          "anyway)",
                   (double) copy / gib, (double) available / gib, (double) left / gib, (double) in_place / gib,
                   (double) headroom / gib);
@@ -445,7 +446,7 @@ std::atomic<int64_t> g_ram_reserve{-1};
 uint64_t ram_reserve_bytes() {
     int64_t v = g_ram_reserve.load();
     if (v < 0) {
-        const char* e = std::getenv("STRATA_RAM_RESERVE_MIB");
+        const char* e = strata::env_get("RAM_RESERVE_MIB");
         const long long mib = e != nullptr ? std::strtoll(e, nullptr, 10) : 0;
         int64_t expected = -1;
         g_ram_reserve.compare_exchange_strong(expected, mib > 0 ? (int64_t) mib << 20 : 0);
@@ -476,7 +477,7 @@ std::string page_cache_hint(const std::string& meminfo_text) {
                   "; %.1f GiB of the RAM is file cache (earlier runs' model files, which Linux gives back on demand - "
                   "'free' showing little is normal). If the start still fails, free it with: "
                   "sync; echo 1 | sudo tee /proc/sys/vm/drop_caches   (or start the server with "
-                  "STRATA_DROP_CACHE_ON_EXIT=1 so it releases its model files when it stops)",
+                  "XESTRATA_DROP_CACHE_ON_EXIT=1 so it releases its model files when it stops)",
                   (double) cache / 1073741824.0);
     return msg;
 }
@@ -684,13 +685,13 @@ void FileExpertSource::set_io_prefetch(bool on, int threads) {
     }
     if (!warm_stamp_) warm_stamp_.reset(new std::atomic<uint32_t>[(size_t) (n_layers_ * n_expert_)]());
     io_threads_ = threads > 0 ? threads : 8;
-    if (const char* v = std::getenv("STRATA_IO_PF_AHEAD")) io_ahead_ = std::strtol(v, nullptr, 10) != 0;
+    if (const char* v = strata::env_get("IO_PF_AHEAD")) io_ahead_ = std::strtol(v, nullptr, 10) != 0;
     io_fill_ = role_ptr_.empty();   // experts.bin: fill the page cache, the kernels read the mapping
     gate_on_ = true;                // the decode gate comes with io prefetch; STRATA_IO_PF_GATE=0 turns it off
-    if (const char* m = std::getenv("STRATA_IO_PF_GATE"); m != nullptr && m[0] != '\0') gate_on_ = std::strtol(m, nullptr, 10) != 0;
-    if (const char* m = std::getenv("STRATA_IO_PF_GATE_LO")) gate_lo_ = std::clamp(std::strtod(m, nullptr), 0.0, 1.0);
-    if (const char* m = std::getenv("STRATA_IO_PF_GATE_HI")) gate_hi_ = std::clamp(std::strtod(m, nullptr), gate_lo_, 1.0);
-    if (const char* m = std::getenv("STRATA_IO_PF_GATE_USEFUL")) gate_min_useful_ = std::clamp(std::strtod(m, nullptr), 0.0, 1.0);
+    if (const char* m = strata::env_get("IO_PF_GATE"); m != nullptr && m[0] != '\0') gate_on_ = std::strtol(m, nullptr, 10) != 0;
+    if (const char* m = strata::env_get("IO_PF_GATE_LO")) gate_lo_ = std::clamp(std::strtod(m, nullptr), 0.0, 1.0);
+    if (const char* m = strata::env_get("IO_PF_GATE_HI")) gate_hi_ = std::clamp(std::strtod(m, nullptr), gate_lo_, 1.0);
+    if (const char* m = strata::env_get("IO_PF_GATE_USEFUL")) gate_min_useful_ = std::clamp(std::strtod(m, nullptr), 0.0, 1.0);
     if (io_fill_ && !pf_mark_) {
         pf_mark_.reset(new std::atomic<uint8_t>[(size_t) (n_layers_ * n_expert_)]);
         for (int64_t i = 0; i < n_layers_ * n_expert_; ++i) pf_mark_[(size_t) i].store(0, std::memory_order_relaxed);
@@ -739,7 +740,7 @@ void FileExpertSource::io_enqueue(int64_t layer, int64_t expert, bool ahead) {
 // staged.  The GGUF in place reads the whole blob into a stage buffer (copy_from_files); experts.bin reads what is not
 // cached into a scratch buffer, so its pages are cached when the kernels read the mapping.
 void FileExpertSource::io_worker() {
-    strata::platform::name_this_thread("strata-io");
+    strata::platform::name_this_thread("xs-io");
     for (;;) {
         int32_t layer, expert;
         bool ahead;
@@ -2126,7 +2127,7 @@ bool FileExpertSource::pin_complement(
                     if (offsets[i] != kNoComplement)
                         blobs.emplace_back(offsets[i], layer_blob_bytes_[i / (size_t) n_expert_]);
                 std::sort(blobs.begin(), blobs.end());
-                const char* parts_env = std::getenv("STRATA_PIN_PARTS");   // 0: one allocation or none (A/B)
+                const char* parts_env = strata::env_get("PIN_PARTS");   // 0: one allocation or none (A/B)
                 const int max_parts = parts_env != nullptr ? (int) std::strtol(parts_env, nullptr, 10) : 32;
                 for (int parts = 2; parts <= max_parts && chunks.empty(); ++parts) {
                     std::vector<ComplementChunk> got;
@@ -2370,7 +2371,7 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err, int64_t bo
         err = "FileExpertSource: the exchange buffers' size overflows";
         return false;
     }
-    const char* rotate_env = std::getenv("STRATA_EXCHANGE_ROTATE");
+    const char* rotate_env = strata::env_get("EXCHANGE_ROTATE");
     const bool requested = rotate_env != nullptr && std::strcmp(rotate_env, "1") == 0;
     // layers of several block sizes (a GGUF's mixed i-quants): spares of every size, see ExchangeStorage
     bounce = std::max<int64_t>(0, std::min(bounce, n));
@@ -2896,7 +2897,7 @@ namespace {
 // start-up reading 8x slow at 2x after the first update).  STRATA_PCIE_SPLIT_REFINE=0: the start-up times stay.
 void refine_split(ExpertDispatch& d, bool both, int experts, double ms) {
     static const bool on = [] {
-        const char* v = std::getenv("STRATA_PCIE_SPLIT_REFINE");
+        const char* v = strata::env_get("PCIE_SPLIT_REFINE");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     ExpertDispatch::SplitRefine& r = d.split_refine;
@@ -2916,7 +2917,7 @@ void refine_split(ExpertDispatch& d, bool both, int experts, double ms) {
     t.c *= f;
     t.cb0 *= f;
     t.cb *= f;
-    std::fprintf(stderr, "strata: PCIe split: the decode's CPU pool calls took %.2fx the start-up times; an expert on "
+    std::fprintf(stderr, "xestrata: PCIe split: the decode's CPU pool calls took %.2fx the start-up times; an expert on "
                          "the CPU is now %.3f ms (%.3f beside the link), update %d of 3\n", ratio, t.c, t.cb, r.updates);
 }
 
@@ -2928,7 +2929,7 @@ std::atomic<int> g_tail_skip_rank{-1};   // -1: not resolved yet
 int tail_skip_rank() {
     int r = g_tail_skip_rank.load(std::memory_order_relaxed);
     if (r < 0) {
-        const char* v = std::getenv("STRATA_ROUTE_TAIL_SKIP");
+        const char* v = strata::env_get("ROUTE_TAIL_SKIP");
         r = v != nullptr ? (int) std::strtol(v, nullptr, 10) : 0;
         r = r > 0 && r < 10 ? r : 0;
         g_tail_skip_rank.store(r, std::memory_order_relaxed);
@@ -2962,7 +2963,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     if (native && d.nact_multi.size() < (size_t) MAXT) d.nact_multi.resize((size_t) MAXT);
     if (d.job_of.size() != (size_t) d.n_expert) d.job_of.assign((size_t) d.n_expert, (int16_t) -1);
     if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (MAXT * k));
-    static const bool ptrace = std::getenv("STRATA_POOL_TRACE") != nullptr;
+    static const bool ptrace = strata::env_get("POOL_TRACE") != nullptr;
     auto pt = [&](const char* what, long long a = -1) {
         if (ptrace) { std::fprintf(stderr, "pool trace: layer %lld %s %lld\n", (long long) d.layers, what, a); std::fflush(stderr); }
     };
@@ -2971,7 +2972,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const FileExpertSource::DecodeScope decode_scope;   // the file tier's decode gate: this thread reads for the decode
     // zero-copy (upstream 149, STRATA_COLD_OVERLAP=4): unset, on where the source's Linux file-tier defaults apply
     static const int cold_env = [] {
-        const char* v = std::getenv("STRATA_COLD_OVERLAP");
+        const char* v = strata::env_get("COLD_OVERLAP");
         return v == nullptr || v[0] == '\0' ? -1 : (std::strtol(v, nullptr, 10) == 4 ? 4 : 0);
     }();
     d.cold_mode = cold_env >= 0 ? cold_env : (d.src->linux_file_defaults() ? 4 : 0);
@@ -3028,7 +3029,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // rank >= R by every token of the window: the SSD is not waited for.  Maya also skips such an expert by its
         // route weight; the dispatch has the ids only, so the rank alone here
         static const int disk_rank = [] {
-            const char* v = std::getenv("STRATA_DISK_SKIP_FROM");
+            const char* v = strata::env_get("DISK_SKIP_FROM");
             return v != nullptr ? std::max(0, (int) std::strtol(v, nullptr, 10)) : 0;
         }();
         bool skip_d[kMaxWindowEntries];
@@ -3058,7 +3059,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // is computed on the GPU from the slot of a resident expert of the layer instead of fetched or computed on the
         // CPU, so a run times the decode as if every expert were in VRAM - the bound the CPU / PCIe split works toward
         static const bool free_misses = [] {
-            const char* v = std::getenv("STRATA_FREE_MISSES");
+            const char* v = strata::env_get("FREE_MISSES");
             return v != nullptr && std::strtol(v, nullptr, 10) != 0;
         }();
         int32_t standin = -1;
@@ -3077,7 +3078,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // PCIe lane idles on the typical decode step; with two misses or more one goes over PCIe (the last in routing
         // order; only where its blob is pinned, as the fetch below checks).  Not with the measured split.
         static const bool pcie_min1 = [] {
-            const char* v = std::getenv("STRATA_PCIE_MIN1");
+            const char* v = strata::env_get("PCIE_MIN1");
             return v != nullptr && std::strtol(v, nullptr, 10) != 0;
         }();
         if (pcie_min1 && pcie_ok && d.pcie_split == nullptr && m < 1 && nmiss >= 2) m = 1;
@@ -3182,11 +3183,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     // default); STRATA_VERIFY_DEVICE_PLAN's copy_or_zero_from_mapped copies every row, so there the host still zeroes
     // them.  A layer with no row for the CPU quantizes no activation and fetches nothing (upstream a36be1db)
     static const bool dec_batch = [] {
-        const char* v = std::getenv("STRATA_DEC_BATCH");
+        const char* v = strata::env_get("DEC_BATCH");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     static const bool device_plan = [] {
-        const char* v = std::getenv("STRATA_VERIFY_DEVICE_PLAN");
+        const char* v = strata::env_get("VERIFY_DEVICE_PLAN");
         return v != nullptr && std::strtol(v, nullptr, 10) != 0;
     }();
     const bool gpu_zeroes_hits = d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap && dec_batch && !device_plan;
@@ -3243,7 +3244,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             if (jo >= 0 && d.jobs_multi[(size_t) jo].nt >= MAXT) {
                 static std::atomic<bool> said{false};
                 if (!said.exchange(true))
-                    std::fprintf(stderr, "strata: expert %lld of layer %lld is routed more than %d times in a window "
+                    std::fprintf(stderr, "xestrata: expert %lld of layer %lld is routed more than %d times in a window "
                                          "of %lld tokens (an id repeated within a token); it is computed in two "
                                          "jobs (#45, said once)\n",
                                  (long long) e, (long long) d.layers, MAXT, (long long) n_tok);
@@ -3928,7 +3929,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
 #if defined(_WIN32)
     static const bool arena_mmap = false;   // POSIX mmap/madvise: Linux only for now
 #else
-    static const bool arena_mmap = [] { const char* v = std::getenv("STRATA_ARENA_MMAP"); return v && v[0] == '1'; }();
+    static const bool arena_mmap = [] { const char* v = strata::env_get("ARENA_MMAP"); return v && v[0] == '1'; }();
     if (arena_mmap) {
         const uint64_t file_bytes = want + (uint64_t) blob;
         uint64_t have = 0;
@@ -3950,7 +3951,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
             blobs_ = n_layers * n_expert;
             n_expert_ = n_expert;
             reads_ = 0;
-            note_ = "mapped read-only from " + path + " (STRATA_ARENA_MMAP: not locked, not pinned)";
+            note_ = "mapped read-only from " + path + " (XESTRATA_ARENA_MMAP: not locked, not pinned)";
             gib_per_s_ = 0.0;
             load_seconds_ = load_read_s_ = load_copy_s_ = 0.0;
             record_inputs(path, gguf_, lay, from_gguf);   // session files: the mapped experts.bin is a model input
@@ -3984,7 +3985,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
             // giving its RAM back: wait for it, not for ever, and say so.  STRATA_ARENA_RAM_WAIT_S changes the seconds
             // (0 loads at once).  The load then goes on either way - it only warns.
             double wait_s = 20.0;
-            if (const char* w = std::getenv("STRATA_ARENA_RAM_WAIT_S"); w != nullptr && w[0] != '\0') {
+            if (const char* w = strata::env_get("ARENA_RAM_WAIT_S"); w != nullptr && w[0] != '\0') {
                 char* end = nullptr;
                 const double v = std::strtod(w, &end);
                 if (end != w && *end == '\0' && v >= 0.0 && v <= 3600.0) wait_s = v;
@@ -4002,14 +4003,14 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
                     },
                     [](double s) { std::this_thread::sleep_for(std::chrono::duration<double>(s)); },
                     [&](double w, uint64_t a) {
-                        std::fprintf(stderr, "strata generate: the expert arena needs %.2f GiB of RAM and %.2f GiB is "
+                        std::fprintf(stderr, "xestrata generate: the expert arena needs %.2f GiB of RAM and %.2f GiB is "
                                              "available; waiting up to %.0f s for it (another engine still exiting?) - "
-                                             "%.0f s so far (STRATA_ARENA_RAM_WAIT_S changes this)\n",
+                                             "%.0f s so far (XESTRATA_ARENA_RAM_WAIT_S changes this)\n",
                                      (double) need / gib, (double) a / gib, wait_s, w);
                     },
                     waited, avail);
                 if (came)
-                    std::fprintf(stderr, "strata generate: %.2f GiB of RAM is available now (after %.1f s): loading the "
+                    std::fprintf(stderr, "xestrata generate: %.2f GiB of RAM is available now (after %.1f s): loading the "
                                          "expert arena\n", (double) avail / gib, waited);
                 hm.available = avail;
             }
@@ -4045,7 +4046,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // STRATA_ARENA_HOST_USM=1: every layer in its own host USM block, which GPU kernels can read (the PCIe share).
     // Without it the one registered mapping, moved into host USM later only when the measured split reads experts
     // over PCIe and the runtime's registration is for copies only (Level Zero's): make_kernel_readable.
-    static const bool host_usm = [] { const char* e = std::getenv("STRATA_ARENA_HOST_USM"); return e && *e == '1'; }();
+    static const bool host_usm = [] { const char* e = strata::env_get("ARENA_HOST_USM"); return e && *e == '1'; }();
     if (!shared_arena_file.empty() && host_usm) {
         err = "shared arena cannot use layer-separated host USM"; return false;
     }
@@ -4062,7 +4063,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
             err = std::string("ArenaExpertSource: ") + e.what();
             return false;
         }
-        std::fprintf(stderr, "strata: %s; the expert arena takes host USM instead\n", e.what());
+        std::fprintf(stderr, "xestrata: %s; the expert arena takes host USM instead\n", e.what());
         try {
             a = new PinnedArena(want + (uint64_t) blob, bounds, (uint64_t) blob, /*host_usm=*/true);
         } catch (const std::exception& e2) {
@@ -4112,7 +4113,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         std::filesystem::path(path).parent_path(), space_ec).available : 0;
     const bool room = !space_ec && free_disk >= want + (uint64_t) blob + (2ull << 30);
     if (arena_mmap && from_gguf && !room)
-        std::fprintf(stderr, "strata generate: STRATA_ARENA_MMAP: NOT writing %s - %.1f GiB free on that drive, it needs "
+        std::fprintf(stderr, "xestrata generate: XESTRATA_ARENA_MMAP: NOT writing %s - %.1f GiB free on that drive, it needs "
                              "%.1f GiB plus 2 GiB to spare; this start keeps the arena in RAM\n", path.c_str(),
                      (double) free_disk / 1073741824.0, (double) (want + (uint64_t) blob) / 1073741824.0);
     if (arena_mmap && from_gguf && room) {
@@ -4126,7 +4127,7 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         if (f) ok = std::fclose(f) == 0 && ok;
         if (ok) ok = std::rename(tmp.c_str(), path.c_str()) == 0;
         if (!ok) std::remove(tmp.c_str());
-        std::fprintf(stderr, "strata generate: STRATA_ARENA_MMAP: %s %s (the next start maps it)\n",
+        std::fprintf(stderr, "xestrata generate: XESTRATA_ARENA_MMAP: %s %s (the next start maps it)\n",
                      ok ? "wrote" : "could NOT write", path.c_str());
     }
     a->hold_in_place();   // filled: locking or pinning it now does not zero it before the load (#42)

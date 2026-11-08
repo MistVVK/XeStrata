@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """tools/canonical_xcheck.py - P1.T3 in prototype: does the canonical form round-trip BIT-EXACTLY?
 
 P1.S6's release-blocking test is `dequant(canonical) == dequant_ggml(original)` bit for bit, for every tensor
@@ -33,6 +34,8 @@ import sys
 import time
 
 import numpy as np
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))   # the checkout, for serve/envvars.py
+from serve import envvars  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -44,8 +47,8 @@ import gguf_reader as G                                    # noqa: E402
 from gguf_writer import dequantize_q2_0                    # noqa: E402
 from load import _dequant_flat                             # noqa: E402
 
-# default: $STRATA_SHARD1, else the development layout (<Strata>/Q2_0 beside <Strata>/Public/Engine)
-SHARD1 = os.environ.get("STRATA_SHARD1") or os.path.join(os.path.dirname(os.path.dirname(REPO)), "Q2_0",
+# default: $XESTRATA_SHARD1, else the development layout (<Strata>/Q2_0 beside <Strata>/Public/Engine)
+SHARD1 = envvars.get("SHARD1") or os.path.join(os.path.dirname(os.path.dirname(REPO)), "Q2_0",
                                                           "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf")
 
 QK = 64          # Q2_0 block: 64 elements

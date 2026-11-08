@@ -29,6 +29,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/platform/env.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -606,11 +607,11 @@ int main(int argc, char** argv) {
     }
     if (pin >= 0 && !pin_to(pin)) std::printf("iq_avx2_parity: could not pin to CPU %d\n", pin);
     ggml_cpu_init();
-    auto env = [](const char* k) { const char* v = std::getenv(k); return v ? v : "-"; };
+    auto env = [](const char* k) { const char* v = strata::env_get(k); return v ? v : "-"; };
     std::printf("iq_avx2_parity: %s (avx2 %d, avx512 %d), CPU %d, core type %02Xh\n", cpu::cpu_name().c_str(),
                 (int) cpu::cpu_avx2_ok(), (int) cpu::cpu_avx512_ok(), pin, core_type());
-    std::printf("  STRATA_IQ256_GATHER %s, STRATA_NO_AVXVNNI %s, STRATA_IQ_MT_MIN %s, STRATA_IQ_PREFETCH %s\n",
-                env("STRATA_IQ256_GATHER"), env("STRATA_NO_AVXVNNI"), env("STRATA_IQ_MT_MIN"), env("STRATA_IQ_PREFETCH"));
+    std::printf("  XESTRATA_IQ256_GATHER %s, XESTRATA_NO_AVXVNNI %s, XESTRATA_IQ_MT_MIN %s, XESTRATA_IQ_PREFETCH %s\n",
+                env("IQ256_GATHER"), env("NO_AVXVNNI"), env("IQ_MT_MIN"), env("IQ_PREFETCH"));
     if (!cpu::cpu_avx2_ok()) {
         std::printf("iq_avx2_parity: no AVX2 here, nothing to check (the engine takes ggml-cpu's dot)\n");
         return 0;

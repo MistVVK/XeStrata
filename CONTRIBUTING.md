@@ -22,8 +22,8 @@ GPUs included), any x86-64 CPU with AVX2, and in the contrib-llvm mode on NVIDIA
   fallback that works on a smaller device, and say in a comment where it was measured and what it depends on.
 - **A feature some devices lack** (XMX, large GRF mode, a SYCL extension) is checked before use, with a path that works
   without it.
-- **Check a smaller configuration as well**, for example `STRATA_VRAM_LIMIT_MIB=8192 STRATA_MAX_ALLOC_MIB=4096
-  STRATA_NO_XMX=1` with fewer CPU threads. Mark what was not checked `unverified` in the pull request.
+- **Check a smaller configuration as well**, for example `XESTRATA_VRAM_LIMIT_MIB=8192 XESTRATA_MAX_ALLOC_MIB=4096
+  XESTRATA_NO_XMX=1` with fewer CPU threads. Mark what was not checked `unverified` in the pull request.
 
 A change that breaks this rule does not go in, however fast it is ([AGENTS.md](AGENTS.md#hardware-independence-the-first-rule)).
 

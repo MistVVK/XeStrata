@@ -9,7 +9,7 @@ and `added_tokens`, and classifies its `pre_tokenizer` regex against the shapes 
 
     python -m unittest tools.test_tokenizer_hf_json -v
 
-The fixtures are written here, so the real file is not needed.  With `$STRATA_HUNYUANIMAGE3_TOKENIZER` pointing at the
+The fixtures are written here, so the real file is not needed.  With `$XESTRATA_HUNYUANIMAGE3_TOKENIZER` pointing at the
 folder that holds HunyuanImage 3.0's `tokenizer.json`, `RealHunyuanImage3` runs against it and compares the ids
 with the ones the file's own BPE gives - checked against Hugging Face's loader of the same file on 2026-10-24.
 """
@@ -133,7 +133,7 @@ class FromHfReadsTheFile(unittest.TestCase):
                 self.tok(**kwargs)
 
 
-REAL = os.environ.get("STRATA_HUNYUANIMAGE3_TOKENIZER")
+REAL = os.environ.get("XESTRATA_HUNYUANIMAGE3_TOKENIZER")
 
 _USER_TURN_IDS = [1502, 25, 362, 2579, 39935, 304, 279, 12056, 271, 72803, 25, 220]
 
@@ -151,7 +151,7 @@ HUNYUANIMAGE3_IDS = {
 
 
 @unittest.skipUnless(REAL and Path(REAL).is_dir(),
-                     "set $STRATA_HUNYUANIMAGE3_TOKENIZER to the folder with the model's files")
+                     "set $XESTRATA_HUNYUANIMAGE3_TOKENIZER to the folder with the model's files")
 class RealHunyuanImage3(unittest.TestCase):
     def setUp(self):
         self.tok = ST.Tokenizer.from_hf(REAL)

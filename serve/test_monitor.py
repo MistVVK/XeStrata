@@ -213,9 +213,9 @@ class ConversationCacheCard(unittest.TestCase):
     """#596: /metrics' "conversation_cache": the parked conversations from the engine's log lines, the budget and
     slots from its INFO line, and how much of the prompts the cache gave back."""
 
-    PARK = ("strata serve: conversation cache: parked 5000 tokens in 12.0 ms; parked=1 bytes=104857600 evictions=0 "
+    PARK = ("xestrata serve: conversation cache: parked 5000 tokens in 12.0 ms; parked=1 bytes=104857600 evictions=0 "
             "snapshot_bytes=104857600 reused_kv_bytes=0\n")
-    RESTORE = "strata serve: conversation cache: restored 4000 tokens (exact) in 30.0 ms; parked=2 bytes=209715200\n"
+    RESTORE = "xestrata serve: conversation cache: restored 4000 tokens (exact) in 30.0 ms; parked=2 bytes=209715200\n"
 
     def test_the_log(self):
         from serve.server import ConvCacheLog
@@ -227,7 +227,8 @@ class ConversationCacheCard(unittest.TestCase):
             c = ConvCacheLog()
             self.assertEqual(c.poll(str(log), start)["parked"], 0)
             with open(log, "a", encoding="utf-8") as f:
-                f.write("strata serve: something else\n" + self.PARK + self.RESTORE + "strata serve: conversation ca")
+                f.write("xestrata serve: something else\n" + self.PARK + self.RESTORE
+                        + "xestrata serve: conversation ca")
             st = c.poll(str(log), start)
             self.assertEqual((st["parked"], st["bytes"], st["parks"], st["restores"]), (2, 209715200, 1, 1))
             self.assertEqual((st["last_event"], st["last_tokens"]), ("restored", 4000))

@@ -171,7 +171,7 @@ for enc in cpu vulkan; do
     -DSTRATA_PORTABLE=ON $opt
   cmake --build "/build/vision-$enc" --target strata-vision -j "$jobs"
   mkdir -p /build/vision
-  cp "/build/vision-$enc/bin/strata-vision" "/build/vision/strata-vision-$enc"
+  cp "/build/vision-$enc/bin/xestrata-vision" "/build/vision/xestrata-vision-$enc"
 done
 
 lap encoders
@@ -244,7 +244,7 @@ case "$distro" in
     : > /stage/debian/control
     # its own assignment, so that set -e stops on a failure (in a pipe the last command's status would hide it)
     # shellcheck disable=SC2046
-    substvars=$(cd /stage && dpkg-shlibdeps -O --ignore-missing-info -l"$eng/lib" "$eng"/strata "$eng"/strata-image "$eng"/strata-vision-* \
+    substvars=$(cd /stage && dpkg-shlibdeps -O --ignore-missing-info -l"$eng/lib" "$eng"/xestrata-engine "$eng"/xestrata-image "$eng"/xestrata-vision-* \
       $(find "$eng/lib" -type f \( -name 'libsycl.so*' -o -name 'libumf.so*' \
         -o -name 'libur_adapter_level_zero*' -o -name 'libonemath.so*' \)))
     shlibs=$(echo "$substvars" | sed -n 's/^shlibs:Depends=//p')

@@ -53,6 +53,8 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # the checkout, for serve/envvars.py
+from serve import envvars  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -84,7 +86,7 @@ def redactor(extra: tuple[str, ...] = (), key: str = ""):
                 subs.append((re.compile(r"(?<![\w-])" + pat + r"(?![\w-])" if word else pat, re.I), label,
                              len(form)))
 
-    add(ROOT, "<strata>")
+    add(ROOT, "<xestrata>")
     add(Path.home(), "<home>")
     add(tempfile.gettempdir(), "<tmp>")
     try:
@@ -141,7 +143,7 @@ def chat(base: str, key: str, messages: list, max_tokens: int, think: bool = Fal
          timeout: float = 3600) -> dict:
     """One streamed chat request -> {first, total, text, usage, timings, err}.  `first` is the seconds to the first
     non-empty content or reasoning piece (keep-alive pings and empty deltas ignored)."""
-    body = {"model": "strata", "stream": True, "max_tokens": max_tokens, "temperature": 0, "messages": messages,
+    body = {"model": "xestrata", "stream": True, "max_tokens": max_tokens, "temperature": 0, "messages": messages,
             "script_guard": "off"}  # never the script guard in a measurement
     if tools:
         body["tools"] = tools
@@ -395,7 +397,7 @@ class Suite:
             t0 = time.perf_counter()
             for i in range(n):
                 t = threading.Thread(target=serve_load.one,
-                                     args=(self.base, self.key, "strata", i, 400, BURST_MAX_TOKENS, res, {},
+                                     args=(self.base, self.key, "xestrata", i, 400, BURST_MAX_TOKENS, res, {},
                                            self.think, f" {self.tag('b', n, rd)}"))
                 t.start()
                 th.append(t)
@@ -554,14 +556,15 @@ def config_view(cfg: dict) -> dict:
     env = cfg.get("env")
     if isinstance(env, dict):
         out["env"] = {k: base_if_path(str(v)) for k, v in env.items()
-                      if k.startswith(("STRATA_", "HIP_", "CUDA_", "ROCR_", "ONEAPI_", "SYCL_"))
+                      if k.startswith(("XESTRATA_", "STRATA_",   # and upstream's names
+                                       "HIP_", "CUDA_", "ROCR_", "ONEAPI_", "SYCL_"))
                       and not SECRET_KEY.search(k)}
     return out
 
 
 def launch_line(view: dict) -> str:
     args = " ".join(f'"{a}"' if " " in str(a) else str(a) for a in view.get("args", []))
-    return f"{view.get('exe', 'strata')} {args}".strip()
+    return f"{view.get('exe', 'xestrata-engine')} {args}".strip()
 
 
 def detect_quant(view: dict) -> str | None:
@@ -656,7 +659,7 @@ def collect_machine(base: str, key: str, cfg: dict | None, gpu_arg: str | None =
         "python": platform.python_version(),
         "strata_version": project_version(), "strata_commit": git_commit(),
         "engine_version": (eng.get("version") or status.get("engine")
-                           or str(props.get("build_info", "")).replace("Strata ", "") or None),
+                           or str(props.get("build_info", "")).replace("XeStrata ", "") or None),
         "model": view.get("model_name") or status.get("model") or props.get("model_alias"),
         "quant": detect_quant(view) if view else None,
         "context": n_ctx or eng.get("max_context"), "parallel_slots": props.get("total_slots"),
@@ -725,7 +728,7 @@ def start_server(cfg_path: Path, port: int, gpu: str | None, log_path: Path):
             tmp = log_path.with_suffix(".config.json")
             tmp.write_text(json.dumps(safe), encoding="utf-8")
             cfg_path = tmp
-    cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
+    cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "xestrata", "--config", str(cfg_path),
            "--port", str(port)]
     if gpu:
         cmd += ["--gpu", gpu]
@@ -765,7 +768,7 @@ def log_excerpt(path: Path, limit: int = 80) -> list[str]:
         return []
     keep = re.compile(r"(?i)expert cache|slots|vram|ready|resident|kv |context|backend|gpu|prefill|mtp|spec|batch|"
                       r"version|hit")
-    out = [x for x in lines if keep.search(x) and "[strata] done:" not in x]
+    out = [x for x in lines if keep.search(x) and "[xestrata] done:" not in x]
     return out[:limit]
 
 
@@ -871,7 +874,7 @@ def render_readme(res: dict) -> str:
     if env:
         L += ["Environment of the config: " + ", ".join(f"`{k}={v}`" for k, v in env.items()), ""]
     L += ["## Method", "",
-          f"Run by `{p['command']}` against the HTTP API of a Strata server "
+          f"Run by `{p['command']}` against the HTTP API of an XeStrata server "
           f"({'started by the benchmark from the install configuration' if p['started_server'] else 'already running'}"
           f"); model loading is not timed. One warm-up chat and a 1K prompt are discarded first. Every prompt starts "
           f"with a unique tag, so the conversation cache cannot help the fresh-prompt tests.", "",
@@ -979,15 +982,15 @@ def server_base(host, port) -> str:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Measure this Strata install and write a shareable report (see the top of "
-                                             "this file).")
+    ap = argparse.ArgumentParser(description="Measure this XeStrata install and write a shareable report (see the top "
+                                             "of this file).")
     ap.add_argument("--config", help="the model config to run (default: the newest xestrata-*.json setup wrote)")
     ap.add_argument("--url", help="use the server already running at this address (http://127.0.0.1:8080) instead of "
                                   "starting one")
     ap.add_argument("--port", type=int, help="the port to start the server on (default: the config's)")
     ap.add_argument("--gpu", help="start the server on this GPU only (as the server's --gpu)")
-    ap.add_argument("--api-key", default=os.environ.get("STRATA_KEY", ""),
-                    help="the server's API key, if it has one (or STRATA_KEY)")
+    ap.add_argument("--api-key", default=envvars.get("KEY", ""),
+                    help="the server's API key, if it has one (or XESTRATA_KEY)")
     ap.add_argument("--runs", type=int, default=3, help="runs per test (default 3)")
     ap.add_argument("--clients", type=int, default=0, metavar="N", help="also send N requests at once")
     ap.add_argument("--long", action="store_true", help="also a prompt of about 32,768 tokens")
@@ -1036,16 +1039,16 @@ def main(argv=None) -> int:
     started = False
     try:
         if is_strata(base, key):
-            say(f"Using the Strata server already running at {base}.")
+            say(f"Using the XeStrata server already running at {base}.")
         elif a.url:
-            print(f"No Strata server answers at {base}.", file=sys.stderr)
+            print(f"No XeStrata server answers at {base}.", file=sys.stderr)
             return 2
         else:
             if try_json(base, "/health", key, 3) is not None:
-                print(f"Port {port} is used by something that is not Strata: pass --port N.", file=sys.stderr)
+                print(f"Port {port} is used by something that is not XeStrata: pass --port N.", file=sys.stderr)
                 return 2
             assert cfg_path is not None
-            log_path = Path(tempfile.gettempdir()) / f"strata-bench-{os.getpid()}.log"
+            log_path = Path(tempfile.gettempdir()) / f"xestrata-bench-{os.getpid()}.log"
             say(f"Starting {cfg_path.name} on port {port} (loading takes 1-3 minutes; the PC may be slow "
                 "meanwhile) ...")
             proc = start_server(cfg_path, port, a.gpu, log_path)

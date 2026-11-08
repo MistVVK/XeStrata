@@ -37,9 +37,9 @@ int main() {
         DirectFile f;
         std::string error;
 #if defined(_WIN32)
-        _putenv_s("STRATA_IO_THREADS", "4");
+        _putenv_s("XESTRATA_IO_THREADS", "4");
 #else
-        setenv("STRATA_IO_THREADS", "4", 1);
+        setenv("XESTRATA_IO_THREADS", "4", 1);
 #endif   // the pool's size (out-of-range values are clamped to 1..64)
         check(f.open(name, error), error.c_str());
         check(!f.submit(1, memory, 4096, 0, error), "unaligned request accepted");

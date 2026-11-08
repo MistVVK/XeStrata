@@ -110,6 +110,16 @@ XeStrata's kernels are written from scratch (SYCL) and its prompt path and runti
 - Each ledger line gets the commit that took it, or `N/A` and why (the code is not in XeStrata, or XeStrata does it another way).
   A line taken names the commit for each engine (`generate: <hash>, plain: <hash>`; one hash when one commit gives both the shared part), or `plain: N/A` and the architecture that keeps it from the plain engine.
 - The documents XeStrata has (Japanese first) get what is true of XeStrata; upstream's new documents are not copied as files.
+- <!-- upstream-name: off -->Upstream's name is read as XeStrata's while porting, as nothing a user sees says strata alone:
+  a message or log head `"strata generate: ..."`, `"strata serve: ..."`, `"strata: ..."` becomes `"xestrata ...: ..."`;
+  an environment variable `std::getenv("STRATA_X")` becomes `strata::env_get("X")` (include/strata/platform/env.hpp,
+  which reads `XESTRATA_X` and then `STRATA_X`), and `os.environ.get("STRATA_X")` in serve/, setup.py and tools/ becomes
+  `envvars.get("X")` (serve/envvars.py); a document or message names it `XESTRATA_X`;
+  a program is named by its output name (`xestrata-engine`, `xestrata-image`, `xestrata-*`: CMakeLists.txt sets
+  OUTPUT_NAME at its end, so a new `strata-*` target gets it there), while CMake's target names, options (`-DSTRATA_*`)
+  and the namespace `strata` stay upstream's.
+  `tools/lint/upstream_name.py` (run by `tools/lint/run.sh`) reports what was missed; a use that is upstream's on
+  purpose (a field shared with upstream, a mark inside a file) goes into its ALLOWED list.<!-- upstream-name: on -->
 - Once the ledger is done, set `STRATA_UPSTREAM_VERSION` in `CMakeLists.txt` to the tag and `XESTRATA_REVISION` back to 1 (AGENTS.md, "Versions"), and replace any old upstream hash a document names with the rewritten one.
 - Then bring the license classes (AGENTS.md, Licenses) to the new tag, in one commit (`ライセンスの表示を upstream <version> に合わせる`): `python tools/license_class.py --fix` rewrites the headers, so a file brought back to upstream's content loses XeStrata's line and goes back to MIT, and one XeStrata has changed for the first time gets XeStrata's line and `LGPL-3.0-or-later AND MIT`.
   What it reports and does not fix is fixed by hand: a `REUSE.toml` annotation (upstream's unchanged data files go under one with upstream's holders and MIT) and a file without a header. A new file of upstream's taken as it is gets a header with upstream's holders and MIT (the header is not a change); one taken and changed, both holders and `LGPL-3.0-or-later AND MIT`.
@@ -122,14 +132,14 @@ While porting, build and measure with the contrib-llvm build (`build/contrib-llv
 
 Every idea is ported and measured, whether XeStrata wins or loses against upstream in its setting: an idea that made upstream faster can make XeStrata faster still, and a win only grows this way.
 
-- Port it behind an environment switch (`STRATA_<NAME>=0|1`, or the option upstream gave it), so it can be measured on and off and turned off later. Related ideas go in as a group, each behind its own switch.
+- Port it behind an environment switch (`XESTRATA_<NAME>=0|1` through `strata::env_get`, or the option upstream gave it), so it can be measured on and off and turned off later. Related ideas go in as a group, each behind its own switch.
 - Its condition is XeStrata's: what the device reports (matrix units, memory, the PCIe link, the CPU pool's measured speed), not upstream's backend.
 - An exact change that can be checked bitwise is checked by a probe; an opt-in feature is run once to see it works.
 - A speed idea is measured with `scripts/ab_pair.py`: the same binary with its switch off (A) and on (B), in the setting the idea is for (its tier, the serve path, a conversation; `TIERS`, `MODES`, `CONVS`), once (`ROUNDS=1`) on one GPU, the one the idea is most likely to help (the user's decision of 2026-10-12).
   Both runs are XeStrata with one seed: they write one text unless the switch changes the output, so the difference is the switch's alone and a difference of 1 to 2% shows.
 
 ```sh
-A="env STRATA_X=0 build/contrib-llvm/strata" B="env STRATA_X=1 build/contrib-llvm/strata" \
+A="env XESTRATA_X=0 build/contrib-llvm/xestrata-engine" B="env XESTRATA_X=1 build/contrib-llvm/xestrata-engine" \
   PROFILE=data/expert-profile.bin DATA=<data> IDS=<ids> TIERS="32k" A_NAME=off B_NAME=on \
   python .claude/skills/upstream-sync/scripts/ab_pair.py generate|serve|usage <out> <GPU>
 python .claude/skills/upstream-sync/scripts/judge.py <out>        # B against A per cell
@@ -155,7 +165,7 @@ Its correctness is checked on what there is:
 | --- | --- |
 | NVIDIA Pascal, Volta, Turing | a contrib-llvm build with only that generation's code (`STRATA_CUDA_ARCHS=sm_60`, `sm_70`, `sm_75`) run on the RTX 4070 (its driver compiles the PTX; docs/BUILD.md did so for Pascal): CTest and the bitwise probes |
 | AMD gfx103x, gfx11 | a build for them (`STRATA_HIP_ARCHS=gfx1030;gfx1100`) in the AMD container; a path without their own instructions forced on the RX 9060 XT by its switch; code with their own instructions (gfx11's WMMA) is checked by the build alone |
-| GPUs without matrix units (Pascal, RDNA2, Intel without XMX) | the fallback paths with `STRATA_NO_XMX`, `STRATA_NO_BF16_MMA`, `STRATA_NO_INT8_MMA` on the three GPUs |
+| GPUs without matrix units (Pascal, RDNA2, Intel without XMX) | the fallback paths with `XESTRATA_NO_XMX`, `XESTRATA_NO_BF16_MMA`, `XESTRATA_NO_INT8_MMA` on the three GPUs |
 
 What could not run is `unverified`. These GPUs are not part of step 8's check: the record and the report list each such path with upstream's measurement and `unverified` on XeStrata's speed.
 Paths an earlier merge left out for want of a machine (the `移さない` lines of `.upstream-0140.md`'s group A) are taken up the same way.

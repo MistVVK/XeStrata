@@ -92,7 +92,7 @@
   "about.kept": "Los chats, los ajustes y la clave se guardan solo en este navegador.",
   "about.github": "XeStrata en GitHub",
   "about.cfgTitle": "Ajustes del modelo",
-  "about.cfgNote": "Se guardan en la configuración de arranque del modelo para todos los clientes. Un campo vacío es el valor por defecto. Se aplican la próxima vez que arranque el modelo (cierra la ventana de Strata y arráncalo de nuevo).",
+  "about.cfgNote": "Se guardan en la configuración de arranque del modelo para todos los clientes. Un campo vacío es el valor por defecto. Se aplican la próxima vez que arranque el modelo (cierra la ventana de XeStrata y arráncalo de nuevo).",
   "branch.back": "Volver a ella",
   "branch.from": "Rama creada desde «{title}»",
   "branch.open": "Abrir la original",

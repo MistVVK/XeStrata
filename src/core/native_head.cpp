@@ -10,6 +10,7 @@
 #include "strata/platform/memory.hpp"
 
 #include "strata/core/gpu.hpp"
+#include "strata/platform/env.hpp"
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -190,14 +191,14 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
         // scattered row reads go, which over a slow host link cost more than the table's size in VRAM is worth.
         // Taken only with the table plus 512 MiB free; otherwise, or when the upload fails, the mapped placement
         // below is used as before, and the fallback is said.
-        if (const char* ev = std::getenv("STRATA_EMBED_VRAM"); ev != nullptr && ev[0] == '1') {
+        if (const char* ev = strata::env_get("EMBED_VRAM"); ev != nullptr && ev[0] == '1') {
             size_t free_b = 0, total_b = 0;
             const bool have_free = strata::gpu::mem_info(&free_b, &total_b);
             void* d = nullptr;
             if (have_free && (uint64_t) free_b > bytes_ + ((uint64_t) 512 << 20) &&
                 strata::gpu::alloc_device(&d, bytes_)) {
                 if (strata::gpu::copy(d, gguf.tensor_data(*t), bytes_)) {
-                    std::fprintf(stderr, "strata: native embedding: STRATA_EMBED_VRAM=1: %llu MiB placed in VRAM "
+                    std::fprintf(stderr, "xestrata: native embedding: XESTRATA_EMBED_VRAM=1: %llu MiB placed in VRAM "
                                          "(%llu MiB were free)\n",
                                  (unsigned long long) (bytes_ >> 20), (unsigned long long) (free_b >> 20));
                     dev_ = d;   // host_ stays null: the destructor frees dev_
@@ -208,7 +209,7 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
                 }
                 strata::gpu::free(d);
             }
-            std::fprintf(stderr, "strata: native embedding: STRATA_EMBED_VRAM=1 not taken (%llu MiB free, the table "
+            std::fprintf(stderr, "xestrata: native embedding: XESTRATA_EMBED_VRAM=1 not taken (%llu MiB free, the table "
                                  "needs %llu MiB plus 512 MiB): kept in mapped host memory\n",
                          (unsigned long long) (have_free ? free_b >> 20 : 0), (unsigned long long) (bytes_ >> 20));
         }

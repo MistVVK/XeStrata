@@ -13,6 +13,7 @@
 #include "device_caps.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_router
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <cfloat>
 #include <cmath>
@@ -329,7 +330,7 @@ void native_route_resident(const float* logits, int32_t* ids, float* weights, co
     // wins, the smaller expert index breaks a tie, the ranks in order (a swap changes the set already picked).
     // STRATA_ROUTE_RESIDENT_SERIAL=1: the serial form, to compare.
     static const bool serial_env = [] {
-        const char* v = std::getenv("STRATA_ROUTE_RESIDENT_SERIAL");
+        const char* v = strata::env_get("ROUTE_RESIDENT_SERIAL");
         return v != nullptr && std::strtol(v, nullptr, 10) != 0;
     }();
     if (!serial_env) {

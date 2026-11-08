@@ -634,7 +634,7 @@ def _number(fields: dict, name: str, default: float, lo: float, hi: float) -> fl
 def segmentation_response(svc, gen, fields: dict, picture: bytes, cancel=None) -> dict:
     """POST /v1/images/segmentations: vLLM-Omni's form fields (prompt, score_threshold, mask_threshold, mask_format
     png or rle, model) and XeStrata's task (mask, box, grounding) -> its answer (created, model, width, height,
-    mask_format, data [{score, box, mask}]; a label where Florence-2 named one; the task and "strata" figures)."""
+    mask_format, data [{score, box, mask}]; a label where Florence-2 named one; the task and "xestrata" figures)."""
     if fields.get("boxes") not in (None, "", "[]"):
         raise img.ImageRequestError("boxes: exemplar boxes are not taken here (SAM 3's text prompt alone)")
     fmt = str(fields.get("mask_format") or "png").lower()
@@ -653,8 +653,8 @@ def segmentation_response(svc, gen, fields: dict, picture: bytes, cancel=None) -
         data.append(one)
     return {"created": int(time.time()), "model": got["model"], "width": got["width"], "height": got["height"],
             "mask_format": fmt, "task": got["task"], "data": data,
-            "strata": {"seconds": got["seconds"], "engine_s": got["engine_s"],
-                       **({"fallback": got["fallback"]} if got.get("fallback") else {})}}
+            "xestrata": {"seconds": got["seconds"], "engine_s": got["engine_s"],
+                         **({"fallback": got["fallback"]} if got.get("fallback") else {})}}
 
 
 def remove_background_request(fields: dict) -> dict:
@@ -678,7 +678,7 @@ def remove_background_request(fields: dict) -> dict:
 
 def remove_background_response(svc, gen, req: dict, picture: bytes, base_url: str, cancel=None) -> dict:
     """The cut-out (and with output_mask its mask) as vLLM-Omni's images answer: created, data [{b64_json or url}],
-    the version, size and format, and "strata" figures."""
+    the version, size and format, and "xestrata" figures."""
     got = matte(svc, gen, picture, req["version"], req["resolution"], req["refine"], cancel)
     im = cut_out(picture, got, req["background"], req["grow"], req["blur"], req["mask_only"])
     files = [encode(im, req["format"])]
@@ -691,8 +691,8 @@ def remove_background_response(svc, gen, req: dict, picture: bytes, base_url: st
         data.append({**entry, **({"role": "mask"} if i == 1 else {})})
     return {"created": int(time.time()), "model": f"birefnet-{got['version']}", "width": im.width, "height": im.height,
             "output_format": req["format"], "data": data,
-            "strata": {"seconds": got["seconds"], "operating_resolution": "{}x{}".format(*got["size"]),
-                       **got["engine"], **({"fallback": got["fallback"]} if got.get("fallback") else {})}}
+            "xestrata": {"seconds": got["seconds"], "operating_resolution": "{}x{}".format(*got["size"]),
+                         **got["engine"], **({"fallback": got["fallback"]} if got.get("fallback") else {})}}
 
 
 def stability_remove_background(svc, gen, fields: dict, picture: bytes, cancel=None) -> tuple[bytes, str]:

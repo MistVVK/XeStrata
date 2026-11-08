@@ -101,7 +101,7 @@ def main():
     args.output.mkdir(mode=0o700, parents=False, exist_ok=False)
     fixtures(args.output, width)
     env = child_env(cfg)
-    env['STRATA_STATE_HASH'] = '1'
+    env['XESTRATA_STATE_HASH'] = '1'
     results = {'engine_info': {}}
     for label, budget in [('baseline', 0), ('candidate', 8192)]:
         log = args.output / (label + '.log')

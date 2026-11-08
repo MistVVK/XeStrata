@@ -11,7 +11,7 @@
 #   XE="CMD..." DATA=DIR IDS=DIR XE_PROFILE=FILE .claude/skills/release/scripts/follow.sh [TIER...]
 #
 # XE, DATA, IDS and XE_PROFILE as for bench.sh; TIER defaults to the six.  Each run takes bench.sh's settings with
-# the BF16 hyper-connection read (STRATA_HC_Q8=0, the model's own weights).  An existing file is kept.
+# the BF16 hyper-connection read (XESTRATA_HC_Q8=0, the model's own weights).  An existing file is kept.
 set -u
 : "${XE:?}" "${DATA:?}" "${IDS:?}" "${XE_PROFILE:?}"
 P=$DATA/packs/qwen-iq3_xxs
@@ -35,7 +35,7 @@ for t in "$@"; do
     C+=("${k[@]}") ;;
   esac
   log=$(mktemp) || exit 1
-  STRATA_HC_Q8=0 timeout 2400 "${cmd[@]}" --pack "$P" --native "$G-00001-of-00002.gguf" \
+  XESTRATA_HC_Q8=0 timeout 2400 "${cmd[@]}" --pack "$P" --native "$G-00001-of-00002.gguf" \
     --ple-gguf "$G-00002-of-00002.gguf" --expert-profile "$XE_PROFILE" --expert-cache auto --prefill auto --spec 4 \
     --spec-min-p 0.5 --mtp "$DATA/mtp/rt" "${C[@]}" --tokens-file "$IDS/$t.ids" --max-new 256 > "$log" 2>&1
   rc=$?

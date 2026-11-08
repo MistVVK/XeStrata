@@ -21,7 +21,7 @@ contrib-llvm では NVIDIA と AMD の GPU でも動きます。そのため、�
 - **どうしても測って決める値**は、1 枚のカードで決めません。Intel・NVIDIA・AMD の GPU で測り、小さいデバイスでも動く
   フォールバックを用意し、どこで測って何に依存するかをコメントに書きます。
 - **一部のデバイスにない機能**（XMX、大きな GRF のモード、SYCL の拡張）は、使う前に有無を調べ、ない場合にも動く経路を用意します。
-- **小さい構成でも確かめる。** 例: `STRATA_VRAM_LIMIT_MIB=8192 STRATA_MAX_ALLOC_MIB=4096 STRATA_NO_XMX=1` と少ない CPU スレッド。
+- **小さい構成でも確かめる。** 例: `XESTRATA_VRAM_LIMIT_MIB=8192 XESTRATA_MAX_ALLOC_MIB=4096 XESTRATA_NO_XMX=1` と少ない CPU スレッド。
   確かめていない構成は、プルリクエストに `unverified` と書きます。
 
 このルールを守らない変更は、速くても入れません（[AGENTS.md](AGENTS.md#hardware-independence-the-first-rule)）。

@@ -17,6 +17,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -167,7 +168,7 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
         // the arena is registered for copies with GPU 0's context only: fill from it as fast on this one
         std::string why;
         if (!source.register_on(device, why))
-            std::fprintf(stderr, "strata generate: GPU%d experts: %s; its fill from the arena is slower\n", device,
+            std::fprintf(stderr, "xestrata generate: GPU%d experts: %s; its fill from the arena is slower\n", device,
                          why.c_str());
         uint64_t needed = 0;
         selected.reserve((size_t) std::min<int64_t>(slots, layers * experts));
@@ -247,7 +248,7 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
         if (step != nullptr) { err = failed(device, step); close(); return false; }
         // Zero copy: the helper's kernels read their input from, and write their compact rows into, its own host USM
         // - two copies fewer a layer, each a PCIe round trip.  STRATA_REMOTE_ZEROCOPY=0 copies.
-        const char* zc = std::getenv("STRATA_REMOTE_ZEROCOPY");
+        const char* zc = strata::env_get("REMOTE_ZEROCOPY");
         zero_copy_ = !(zc && zc[0] == '0') && gpu::kernels_read_host(h_x_) && gpu::kernels_read_host(h_out_);
         auto* meta = (RemoteMeta*) d_meta_;
         d_ptr_ = meta->ptr;
@@ -388,7 +389,7 @@ bool RemoteExperts::finish(float* out, std::string& err) {
     // launch (begin to done, a moving average; none yet: the first wait blocks), then blocks as before, so a stuck
     // GPU still reaches the runtime's watchdog.  STRATA_REMOTE_SPIN=0 always blocks.
     static const bool spin = [] {
-        const char* v = std::getenv("STRATA_REMOTE_SPIN");
+        const char* v = strata::env_get("REMOTE_SPIN");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     const auto w0 = std::chrono::steady_clock::now();

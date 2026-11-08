@@ -30,7 +30,7 @@ sudo apt install gitleaks shellcheck clang-tidy cppcheck flake8 mypy python3-pyf
 ```
 
 `tools/lint/run.sh` runs oneAPI's clang-tidy, which knows SYCL (found under `/opt/intel/oneapi/compiler`), not the distribution's.
-clang-tidy reads `compile_commands.json` from the build folder (by default `build/free`; `STRATA_LINT_BUILD` changes it):
+clang-tidy reads `compile_commands.json` from the build folder (by default `build/free`; `XESTRATA_LINT_BUILD` changes it):
 
 ```sh
 cmake -S . -B build/free -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
@@ -273,8 +273,8 @@ For oneMKL add `-DSTRATA_ONEMKL=ON -DMKL_ROOT=<oneMKL for Windows' Library/>`: o
 
 ### Running on a Windows PC
 
-Put `build/win`'s `strata*.exe` in one folder with `.tools/intel-llvm-win/install/bin`'s `sycl9.dll`, `ur_win_proxy_loader.dll`, the adapter of the GPU (`ur_adapter_cuda.dll` for NVIDIA, `ur_adapter_level_zero.dll` for Intel) and `xptifw.dll`.
-When `strata-device.exe --list-devices` lists the GPU, the engine runs.
+Put `build/win`'s `xestrata*.exe` in one folder with `.tools/intel-llvm-win/install/bin`'s `sycl9.dll`, `ur_win_proxy_loader.dll`, the adapter of the GPU (`ur_adapter_cuda.dll` for NVIDIA, `ur_adapter_level_zero.dll` for Intel) and `xptifw.dll`.
+When `xestrata-device.exe --list-devices` lists the GPU, the engine runs.
 
 ## Intel SDE (the AVX-512 paths)
 
@@ -296,11 +296,11 @@ sde64 -version
 
 ### What works without extra tools
 
-- The engine's own timings: `STRATA_PREFILL_TIMING=1` for the prefill path.
+- The engine's own timings: `XESTRATA_PREFILL_TIMING=1` for the prefill path.
   The decode's `verify window` line (the host's wait for the GPU, the CPU pool) is always printed.
-- `STRATA_VERIFY_NODES=1` prints how many kernels a decode window's graph holds.
+- `XESTRATA_VERIFY_NODES=1` prints how many kernels a decode window's graph holds.
 - Scratch probes that time single kernels with SYCL event profiling.
-- `STRATA_VERIFY_PROFILE=1` prints the stages of a decode window's layers (device clock ticks) on the `verify profile` line of `--stats`.
+- `XESTRATA_VERIFY_PROFILE=1` prints the stages of a decode window's layers (device clock ticks) on the `verify profile` line of `--stats`.
   Level Zero does not report the device clock aspect on the B70, but its compiler runs SPIR-V's OpReadClockKHR, so the engine builds the stamp kernel once at start and uses it where that works (NVIDIA: %globaltimer; AMD: no profile).
   On the B70 the tick is the GPU's core clock (2.8 GHz against a bandwidth kernel of known length, its `max_freq`), slower when the clock drops, so read the stages as shares.
 

@@ -14,6 +14,7 @@
 #include "device_caps.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_qsa_select
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <cstdlib>
 #include <mutex>
@@ -439,7 +440,7 @@ bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_
     // no TF32 matrix scorer here (CUDA's mma.sync): the FP32 tiled one (a 38,738-token prompt on the B70 1,451 -> 1,536
     // tok/s, the RTX 4070 1,013 -> 1,057); STRATA_SELECT_SIMT=0: refused, and the caller runs qsa_block_scores
     static const bool simt = [] {
-        const char* v = std::getenv("STRATA_SELECT_SIMT");
+        const char* v = strata::env_get("SELECT_SIMT");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     if (!simt || s.idx_dim != IDX_DIM || s.idx_n_head != IDX_HEADS || s.idx_block != R) return false;
@@ -488,7 +489,7 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
                     const QsaShapes& s, int32_t* ids, void* stream) {
     // STRATA_TOPK_OLD=1: the kernel with one shared histogram, which a device whose wide kernel takes no TK_T-item
     // work-group (topk_wide_fits) runs as well; the same ids
-    static const bool old = std::getenv("STRATA_TOPK_OLD") != nullptr;
+    static const bool old = strata::env_get("TOPK_OLD") != nullptr;
     if (nq <= 0) return;
     if (old || !topk_wide_fits(queue_for(stream))) {
         qsa_block_topk_ref(scores, steps, nq, max_blocks, cap, s, ids, stream);

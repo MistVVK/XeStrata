@@ -26,6 +26,7 @@
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "ggml-cpu.h"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/platform/env.hpp"
 
 #include "ggml.h"
 
@@ -379,7 +380,7 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
         // STRATA_GROUPED_BENCH (measuring): a decode token's call, 8 groups of one entry, each a different expert out
         // of 64 copies of this one (past the GPU's last-level cache), in rotation; the time a call and the weight
         // bytes it reads a microsecond
-        if (std::getenv("STRATA_GROUPED_BENCH") != nullptr && f.gu_type != 30) {
+        if (strata::env_get("GROUPED_BENCH") != nullptr && f.gu_type != 30) {
             constexpr int kCopies = 64, kG = 8, kSets = kCopies / kG, kIters = 200;
             auto* many = static_cast<uint8_t*>(par::alloc_bytes(blob.size() * kCopies));
             for (int c = 0; c < kCopies; ++c) par::copy_bytes_in(many + blob.size() * c, blob.data(), blob.size());

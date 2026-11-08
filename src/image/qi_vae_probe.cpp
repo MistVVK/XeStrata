@@ -80,7 +80,7 @@ int main(int argc, char** argv) {
         try {
             return encode_probe(argv[2], argv[3]);
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "strata-image-vae-probe: %s\n", e.what());
+            std::fprintf(stderr, "xestrata-image-vae-probe: %s\n", e.what());
             return 1;
         }
     }
@@ -122,7 +122,7 @@ int main(int argc, char** argv) {
                     (double) vae.weight_bytes() / 1e9, 16LL * (long long) side, 16LL * (long long) side, secs,
                     sum / (double) got.size() * 255.0, mx * 255.0);
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image-vae-probe: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image-vae-probe: %s\n", e.what());
         return 1;
     }
     return 0;

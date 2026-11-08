@@ -18,6 +18,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/platform/env.hpp"
 #include "parity_device.hpp"
 
 #include <algorithm>
@@ -158,7 +159,7 @@ int check(const char* name, int64_t nh, int64_t nkv, int64_t hd, int64_t pos0, i
     if (!vq.empty()) { pools.v_q = up(dev, vq); pools.v_scale = up(dev, vsc); }
     if (!k4.empty()) pools.k_q4 = up(dev, k4);
     if (!v4.empty()) pools.v_q4 = up(dev, v4);
-    const char* mma = std::getenv("STRATA_PROMPT_ATTN_MMA");
+    const char* mma = strata::env_get("PROMPT_ATTN_MMA");
     const bool fma = mma != nullptr && std::strtol(mma, nullptr, 10) == 0;
     const bool took = fmt == kPlain ? k::prompt_attn(d_q, pools.k_pool, pools.v_pool, d_table, pos0, T, s, d_attn, nullptr)
                                     : k::prompt_attn(d_q, pools, pos0, T, s, d_attn, nullptr);

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/xe/matrix_report.cpp - see include/strata/kernels/matrix_report.hpp.
 #include "strata/kernels/matrix_report.hpp"
+#include "strata/platform/env.hpp"
 
 #include <cstdlib>
 
@@ -11,23 +12,23 @@ namespace syclex = sycl::ext::oneapi::experimental;
 namespace mx = syclex::matrix;
 
 bool env_on(const char* name) {
-    const char* v = std::getenv(name);
+    const char* v = strata::env_get(name);
     return v != nullptr && std::strtol(v, nullptr, 10) != 0;
 }
 }  // namespace
 
 bool no_bf16_mma() {
-    static const bool v = env_on("STRATA_NO_BF16_MMA");
+    static const bool v = env_on("NO_BF16_MMA");
     return v;
 }
 
 bool no_xmx() {
-    static const bool v = env_on("STRATA_NO_XMX");
+    static const bool v = env_on("NO_XMX");
     return v;
 }
 
 std::vector<mx::combination> matrix_combinations(const sycl::device& d) {
-    static const bool no_int8 = env_on("STRATA_NO_INT8_MMA");
+    static const bool no_int8 = env_on("NO_INT8_MMA");
     std::vector<mx::combination> out;
     for (const auto& c : d.get_info<syclex::info::device::matrix_combinations>()) {
         const bool bf16 = c.atype == mx::matrix_type::bf16 || c.btype == mx::matrix_type::bf16;

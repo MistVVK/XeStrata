@@ -69,7 +69,7 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--cpu") == 0) return cpu_report();
         else if (std::strcmp(argv[i], "--version") == 0) { std::puts(version); return 0; }
         else if (std::strcmp(argv[i], "--help") == 0 || std::strcmp(argv[i], "-h") == 0) {
-            std::printf("usage: strata-device [--selftest] [--list-devices] [--cpu] [--version]\n");
+            std::printf("usage: xestrata-device [--selftest] [--list-devices] [--cpu] [--version]\n");
             return 0;
         } else {
             std::fprintf(stderr, "unknown argument: %s\n", argv[i]);
@@ -113,11 +113,11 @@ int main(int argc, char** argv) {
             } catch (const strata::core::DeviceError&) {
                 std::printf("selftest: over-allocation refused as required\n");
             }
-            std::printf("strata-device selftest OK\n");
+            std::printf("xestrata-device selftest OK\n");
         }
         return 0;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-device: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-device: %s\n", e.what());
         return 1;
     }
 }

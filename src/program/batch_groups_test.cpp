@@ -61,7 +61,7 @@ int main() {
         i.mtp_serial = true;
         r = bg::resolve(i);
         check(r.groups == 1 && r.from_auto && r.serial == bg::Serial::BatchMtp && r.would_be == 2 && !r.mtp_dropped,
-              "STRATA_BATCH_MTP_SERIAL: one group, because of --batch-mtp");
+              "XESTRATA_BATCH_MTP_SERIAL: one group, because of --batch-mtp");
         check(bg::serial_what(r.serial)[0] == '-', "the reason names the feature");
     }
     {   // STRATA_PIPED_MTP: the pipelined groups draft too, with any number of slots per group
@@ -70,25 +70,25 @@ int main() {
         i.mtp_piped = true;
         auto r = bg::resolve(i);
         check(r.groups == 4 && r.mtp_piped && !r.mtp_dropped && r.serial == bg::Serial::None,
-              "STRATA_PIPED_MTP, 4 slots on 4 GPUs: 4 groups of 1 slot, and the drafts stay");
+              "XESTRATA_PIPED_MTP, 4 slots on 4 GPUs: 4 groups of 1 slot, and the drafts stay");
         i.batch = 8;   // two slots per group: the group's window carries both slots' rows, each with its own drafts
         r = bg::resolve(i);
         check(r.groups == 4 && r.mtp_piped && !r.mtp_dropped && r.serial == bg::Serial::None,
-              "STRATA_PIPED_MTP, 8 slots on 4 GPUs: 4 groups of 2 slots, and the drafts stay");
+              "XESTRATA_PIPED_MTP, 8 slots on 4 GPUs: 4 groups of 2 slots, and the drafts stay");
         i.batch = 4;
         i.mtp_serial = true;   // asked for the serial windows: those win
         r = bg::resolve(i);
         check(r.groups == 1 && !r.mtp_piped && r.serial == bg::Serial::BatchMtp,
-              "STRATA_PIPED_MTP with STRATA_BATCH_MTP_SERIAL: one serial group");
+              "XESTRATA_PIPED_MTP with XESTRATA_BATCH_MTP_SERIAL: one serial group");
         i.mtp_serial = false;
         i.batch_mtp = false;
         r = bg::resolve(i);
-        check(r.groups == 4 && !r.mtp_piped && !r.mtp_dropped, "STRATA_PIPED_MTP without --batch-mtp: nothing to draft");
+        check(r.groups == 4 && !r.mtp_piped && !r.mtp_dropped, "XESTRATA_PIPED_MTP without --batch-mtp: nothing to draft");
         i.batch_mtp = true;
         i.set = true;
         i.given = 1;   // one group: the serial windows, where --batch-mtp's own drafts run
         r = bg::resolve(i);
-        check(r.groups == 1 && !r.mtp_piped && !r.mtp_dropped, "STRATA_PIPED_MTP, --batch-groups 1: the serial path, --batch-mtp runs there");
+        check(r.groups == 1 && !r.mtp_piped && !r.mtp_dropped, "XESTRATA_PIPED_MTP, --batch-groups 1: the serial path, --batch-mtp runs there");
     }
     {   // 0.1.49.2 port: --batch-groups given EXPLICITLY (a number or `auto`) must not silently
         // drop the drafts: the operator asked for those groups, and one slot per group still drafts.
@@ -100,15 +100,15 @@ int main() {
         i.given = 4;
         auto r = bg::resolve(i);
         check(r.groups == 4 && r.mtp_piped && !r.mtp_dropped && r.serial == bg::Serial::None,
-              "STRATA_PIPED_MTP, --batch-groups auto given: 4 groups of 1 slot, and the drafts stay");
+              "XESTRATA_PIPED_MTP, --batch-groups auto given: 4 groups of 1 slot, and the drafts stay");
         i.auto_given = false;  // --batch-groups 4
         r = bg::resolve(i);
         check(r.groups == 4 && r.mtp_piped && !r.mtp_dropped && r.serial == bg::Serial::None,
-              "STRATA_PIPED_MTP, --batch-groups 4 given: 4 groups of 1 slot, and the drafts stay");
+              "XESTRATA_PIPED_MTP, --batch-groups 4 given: 4 groups of 1 slot, and the drafts stay");
         i.given = 2;           // two slots per group: the group's window carries both slots' rows
         r = bg::resolve(i);
         check(r.groups == 2 && r.mtp_piped && !r.mtp_dropped,
-              "STRATA_PIPED_MTP, --batch-groups 2 given: 2 groups of 2 slots, and the drafts stay");
+              "XESTRATA_PIPED_MTP, --batch-groups 2 given: 2 groups of 2 slots, and the drafts stay");
     }
     {   // STRATA_PIPED_MTP unset: nothing changes, whatever --batch-mtp and the groups say
         bg::Input i = in(4, 1);
@@ -127,7 +127,7 @@ int main() {
         i.mtp_serial = true;
         r = bg::resolve(i);
         check(r.groups == 1 && !r.mtp_piped && !r.mtp_dropped && r.serial == bg::Serial::BatchMtp,
-              "unset, STRATA_BATCH_MTP_SERIAL: one serial group (as before)");
+              "unset, XESTRATA_BATCH_MTP_SERIAL: one serial group (as before)");
     }
     {
         bg::Input i = in(2, 1);
@@ -141,7 +141,7 @@ int main() {
         i.adapt_async = true;
         check(bg::resolve(i).serial == bg::Serial::AdaptAsync, "both: --adapt-async 1 still gives one group");
         i.mtp_serial = true;
-        check(bg::resolve(i).serial == bg::Serial::BatchMtp, "both with STRATA_BATCH_MTP_SERIAL: --batch-mtp is named");
+        check(bg::resolve(i).serial == bg::Serial::BatchMtp, "both with XESTRATA_BATCH_MTP_SERIAL: --batch-mtp is named");
     }
     {   // nothing to give way: the slots do not divide, so auto is one group anyway and there is nothing to say
         bg::Input i = in(3, 1);

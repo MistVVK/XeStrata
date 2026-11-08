@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """tools/image/yolo_pt.py - a YOLOv8 checkpoint (a PyTorch .pt: a zip of a pickle and its tensors' bytes) to a
-safetensors file the image engine reads (strata-image --detect, src/image/yolo_detect.cpp), without PyTorch and without
-the package the checkpoint was made with.
+safetensors file the image engine reads (xestrata-image --detect, src/image/yolo_detect.cpp), without PyTorch and
+without the package the checkpoint was made with.
 
     python -I tools/image/yolo_pt.py IN.pt OUT.safetensors [--sha256 HEX]
 

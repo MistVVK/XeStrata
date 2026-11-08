@@ -33,6 +33,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/spec/suffix_drafter.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -146,7 +147,7 @@ void linkless_gpu_adapter() {
         return !f || !std::getline(f, v) || v.rfind("Unknown", 0) == 0;
     };
     bool all = true, any = false;
-    if (const char* pci = std::getenv("STRATA_GPU_PCI"); pci != nullptr && *pci != '\0') {
+    if (const char* pci = strata::env_get("GPU_PCI"); pci != nullptr && *pci != '\0') {
         any = true;
         all = linkless(pci);
     } else if (DIR* d = opendir("/sys/bus/pci/devices")) {
@@ -535,7 +536,7 @@ bool load_control_vectors(ControlVectors& cv, int64_t L, int64_t N, const std::s
             }
             const MetaValue* hint = f.get("controlvector.model_hint");
             if (hint != nullptr && hint->s != arch)
-                std::fprintf(stderr, "strata (%s): %s was made for '%s'\n", arch.c_str(), path.c_str(), hint->s.c_str());
+                std::fprintf(stderr, "xestrata (%s): %s was made for '%s'\n", arch.c_str(), path.c_str(), hint->s.c_str());
             int found = 0;
             for (const TensorInfo& t : f.tensors()) {
                 if (t.name.rfind("direction.", 0) != 0) continue;
@@ -591,7 +592,7 @@ bool load_control_vectors(ControlVectors& cv, int64_t L, int64_t N, const std::s
                 (uint64_t) cv.mode;
     cv.summary = std::string(cv.mode == 0 ? "project" : "add") + ":" + std::to_string(first) + "-" +
                  std::to_string(last) + (single >= 0 ? ":single" + std::to_string(single) : "");
-    std::fprintf(stderr, "strata (%s): control vector mode = %s, dir = %s, layers %d..%d (%d steered)\n", arch.c_str(),
+    std::fprintf(stderr, "xestrata (%s): control vector mode = %s, dir = %s, layers %d..%d (%d steered)\n", arch.c_str(),
                  cv.mode == 0 ? "project" : "add", single >= 0 ? "single" : "per-layer", first, last, steered);
     return true;
 }
@@ -720,23 +721,23 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         bin.batch = (int) bs.size();
         bin.later_stages = model.stages() - 1;
         bin.batch_mtp = slot_drafts;
-        const char* ms = std::getenv("STRATA_BATCH_MTP_SERIAL");
+        const char* ms = strata::env_get("BATCH_MTP_SERIAL");
         bin.mtp_serial = ms != nullptr && *ms != 0 && *ms != '0';
         const bg::Result r = bg::resolve(bin);
         groups = r.groups;
         if (r.from_auto && r.serial != bg::Serial::None)
-            std::fprintf(stderr, "strata (%s): --batch-groups auto: 1 group of %zu slots - %s does not run in pipelined "
+            std::fprintf(stderr, "xestrata (%s): --batch-groups auto: 1 group of %zu slots - %s does not run in pipelined "
                                  "groups; --batch-groups %d would pipeline them and turn it off\n", arch.c_str(),
                          bs.size(), bg::serial_what(r.serial), r.would_be);
         if (groups > 1 && (model.stages() < 2 || bs.size() % (size_t) groups != 0)) {
-            std::fprintf(stderr, "strata (%s): --batch-groups %d is off: it needs a layer split and to divide the %zu "
+            std::fprintf(stderr, "xestrata (%s): --batch-groups %d is off: it needs a layer split and to divide the %zu "
                                  "slots\n", arch.c_str(), groups, bs.size());
             groups = 1;
         }
         if (groups > 1) {
-            std::fprintf(stderr, "strata (%s): --batch-groups: %d groups of %zu slots pipelined through the %d stages%s\n",
+            std::fprintf(stderr, "xestrata (%s): --batch-groups: %d groups of %zu slots pipelined through the %d stages%s\n",
                          arch.c_str(), groups, bs.size() / (size_t) groups, model.stages(),
-                         slot_drafts ? "; --batch-mtp is off beside them (STRATA_BATCH_MTP_SERIAL=1 or --batch-groups 1 "
+                         slot_drafts ? "; --batch-mtp is off beside them (XESTRATA_BATCH_MTP_SERIAL=1 or --batch-groups 1 "
                                        "keeps it in one group)" : "");
             slot_drafts = false;
         }
@@ -910,10 +911,10 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         for (const int64_t k : model.split_points()) folder.id += std::to_string((long long) k) + ",";
         std::string ferr;
         if (folder.open(ferr))
-            std::fprintf(stderr, "strata (%s): conversation save: %s holds %zu usable conversations%s\n", arch.c_str(),
+            std::fprintf(stderr, "xestrata (%s): conversation save: %s holds %zu usable conversations%s\n", arch.c_str(),
                          folder.dir.string().c_str(), folder.entries.size(), folder.compress ? "; writing compressed" : "");
         else {
-            std::fprintf(stderr, "strata (%s): conversation save: %s; not saving conversations\n", arch.c_str(),
+            std::fprintf(stderr, "xestrata (%s): conversation save: %s; not saving conversations\n", arch.c_str(),
                          ferr.c_str());
             folder.dir.clear();
         }
@@ -927,11 +928,11 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         size_t bytes = 0;
         std::string ferr;
         if (folder.save(ids, snap, cks, bytes, ferr))
-            std::fprintf(stderr, "strata (%s): conversation save: wrote %zu tokens (%s, %zu MiB) in %.1f ms\n",
+            std::fprintf(stderr, "xestrata (%s): conversation save: wrote %zu tokens (%s, %zu MiB) in %.1f ms\n",
                          arch.c_str(), ids.size(), why, bytes >> 20,
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
         else
-            std::fprintf(stderr, "strata (%s): conversation save: %s\n", arch.c_str(), ferr.c_str());
+            std::fprintf(stderr, "xestrata (%s): conversation save: %s\n", arch.c_str(), ferr.c_str());
     };
     // the live conversation itself to the folder, when the RAM cache cannot take it (its copy is freed after)
     auto live_to_folder = [&](const char* why) {
@@ -942,7 +943,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         strata::core::PlainModel::Snapshot snap;
         std::string serr;
         if (model.save_state((int64_t) live.size(), snap, serr)) to_folder(live, snap, checks, why);
-        else std::fprintf(stderr, "strata (%s): conversation save: %s\n", arch.c_str(), serr.c_str());
+        else std::fprintf(stderr, "xestrata (%s): conversation save: %s\n", arch.c_str(), serr.c_str());
     };
     auto folder_expired_at = Clock::now();
     std::vector<int32_t> out((size_t) opt.max_t);
@@ -1021,14 +1022,14 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         // --conversation-save: files past their age go between requests too, not only at the next start
         if (folder.on() && Clock::now() - folder_expired_at >= std::chrono::minutes(10)) {
             if (const size_t n = folder.expire())
-                std::fprintf(stderr, "strata (%s): conversation save: deleted %zu old file%s\n", arch.c_str(), n,
+                std::fprintf(stderr, "xestrata (%s): conversation save: deleted %zu old file%s\n", arch.c_str(), n,
                              n == 1 ? "" : "s");
             folder_expired_at = Clock::now();
         }
         if (!profile_save.empty() && save_min > 0 &&
             std::chrono::steady_clock::now() - saved_at >= std::chrono::duration<double>(save_min * 60.0)) {
             if (!model.save_profile(profile_save, err))
-                std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
+                std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
             saved_at = std::chrono::steady_clock::now();
         }
         if (line.empty()) continue;
@@ -1365,7 +1366,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             if (grammar.active()) {
                 masked = grammar.fill(&fed, 1, grammar_row.data());
                 if (!masked) {
-                    std::fprintf(stderr, "strata (%s): the grammar failed: the rest of this reply is not constrained\n",
+                    std::fprintf(stderr, "xestrata (%s): the grammar failed: the rest of this reply is not constrained\n",
                                  arch.c_str());
                     grammar.stop();
                 }
@@ -1378,7 +1379,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             seen.push_back(y);
             script.commit(&y, 1);
             if (grammar.active() && !grammar.commit(&y, 1)) {
-                std::fprintf(stderr, "strata (%s): the grammar refused a token its mask allowed: the rest of this reply "
+                std::fprintf(stderr, "xestrata (%s): the grammar refused a token its mask allowed: the rest of this reply "
                                      "is not constrained\n", arch.c_str());
                 grammar.stop();
                 return model.set_allowed(nullptr, cerr);
@@ -1436,7 +1437,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                     if (got == 0) break;
                     if (got != 5 || hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[2] < 1 || hdr[3] < 1 ||
                         (int64_t) hdr[2] * hdr[3] != hdr[1] || hdr[4] != (int32_t) N) {
-                        ve = "bad embeddings file (expected strata-vision records of width " + std::to_string((long long) N) + ")";
+                        ve = "bad embeddings file (expected xestrata-vision records of width " + std::to_string((long long) N) + ")";
                         break;
                     }
                     const size_t off = img_rows.size(), cnt = (size_t) hdr[1] * (size_t) hdr[4];
@@ -1604,7 +1605,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                     std::fflush(stdout);
                     return 1;
                 }
-                std::fprintf(stderr, "strata (%s): batch slot %d's conversation: %lld of its %zu tokens\n", arch.c_str(),
+                std::fprintf(stderr, "xestrata (%s): batch slot %d's conversation: %lld of its %zu tokens\n", arch.c_str(),
                              from_slot, (long long) slot_r, sl.ids.size());
                 live = sl.ids;
                 checks = sl.checks;
@@ -1661,7 +1662,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                         std::fflush(stdout);
                         return 1;
                     }
-                    std::fprintf(stderr, "strata (%s): conversation save: read %zu tokens (%zu MiB) in %.1f ms%s\n",
+                    std::fprintf(stderr, "xestrata (%s): conversation save: read %zu tokens (%zu MiB) in %.1f ms%s\n",
                                  arch.c_str(), fids.size(), snap.bytes() >> 20,
                                  std::chrono::duration<double, std::milli>(Clock::now() - f0).count(),
                                  file_ck >= 0 ? ", from its checkpoint" : "");
@@ -1671,7 +1672,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                     from_check.reset();
                     resume = best_r;
                 } else {
-                    std::fprintf(stderr, "strata (%s): conversation save: %s; reading the prompt\n", arch.c_str(),
+                    std::fprintf(stderr, "xestrata (%s): conversation save: %s; reading the prompt\n", arch.c_str(),
                                  ferr.c_str());
                 }
             } else if (best != cache.parked.end()) {
@@ -1687,7 +1688,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                     best->checks[(size_t) best_ck].used = ++check_clock;
                     live = best->ids;
                     checks = best->checks;
-                    std::fprintf(stderr, "strata (%s): a parked conversation's checkpoint at %lld of its %zu tokens\n",
+                    std::fprintf(stderr, "xestrata (%s): a parked conversation's checkpoint at %lld of its %zu tokens\n",
                                  arch.c_str(), (long long) best_r, best->ids.size());
                 } else {
                     live = std::move(best->ids);
@@ -1710,7 +1711,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 std::fflush(stdout);
                 return 1;
             }
-            std::fprintf(stderr, "strata (%s): the conversation's checkpoint at %lld of its %zu tokens\n", arch.c_str(),
+            std::fprintf(stderr, "xestrata (%s): the conversation's checkpoint at %lld of its %zu tokens\n", arch.c_str(),
                          (long long) resume, live.size());
         }
         // a prompt read from token 0 starts from a clean state: also after a request that failed half-way (`live` is
@@ -1775,10 +1776,10 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                     }
             if (req_pin > 0) {
                 if (cache.checkpoints < 3 || !req_ckpt)
-                    std::fprintf(stderr, "strata (%s): pin=%lld ignored: %s\n", arch.c_str(), (long long) req_pin,
+                    std::fprintf(stderr, "xestrata (%s): pin=%lld ignored: %s\n", arch.c_str(), (long long) req_pin,
                                  req_ckpt ? "it needs --prompt-cache 3 or more" : "ckpt=0 keeps no checkpoint");
                 else if (req_pin >= n - 1)
-                    std::fprintf(stderr, "strata (%s): pin=%lld ignored: the prefix must be shorter than the prompt "
+                    std::fprintf(stderr, "xestrata (%s): pin=%lld ignored: the prefix must be shorter than the prompt "
                                  "(%lld tokens)\n", arch.c_str(), (long long) req_pin, (long long) n);
                 else if (req_pin > resume) pin_at = req_pin;
                 else {   // one already there
@@ -1788,7 +1789,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                         found = found || c.pinned;
                     }
                     if (!found)
-                        std::fprintf(stderr, "strata (%s): pin=%lld: no checkpoint there to pin (the request resumed "
+                        std::fprintf(stderr, "xestrata (%s): pin=%lld: no checkpoint there to pin (the request resumed "
                                      "from %lld)\n", arch.c_str(), (long long) req_pin, (long long) resume);
                 }
             }
@@ -1823,19 +1824,19 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             auto snap = std::make_shared<strata::core::PlainModel::Snapshot>();
             std::string cerr;
             if (!model.save_recurrent(L, *snap, cerr)) {
-                std::fprintf(stderr, "strata (%s): checkpoint at %lld skipped: %s\n", arch.c_str(), (long long) L,
+                std::fprintf(stderr, "xestrata (%s): checkpoint at %lld skipped: %s\n", arch.c_str(), (long long) L,
                              cerr.c_str());
                 return;
             }
             const auto avail = strata::core::available_host_bytes();
             if (!avail || (int64_t) *avail <= cache.min_free) {
-                std::fprintf(stderr, "strata (%s): checkpoint at %lld skipped: the RAM is short\n", arch.c_str(),
+                std::fprintf(stderr, "xestrata (%s): checkpoint at %lld skipped: the RAM is short\n", arch.c_str(),
                              (long long) L);
                 return;
             }
             if (pin)
                 for (Checkpoint& c : checks) c.pinned = false;
-            std::fprintf(stderr, "strata (%s): checkpoint at %lld tokens (%zu MiB%s)\n", arch.c_str(), (long long) L,
+            std::fprintf(stderr, "xestrata (%s): checkpoint at %lld tokens (%zu MiB%s)\n", arch.c_str(), (long long) L,
                          snap->bytes() >> 20, root ? ", the system prompt's" : pin ? ", pinned" : "");
             if (reply)   // a reply's newest only: the next request leaves it near its end, if at all
                 checks.erase(std::remove_if(checks.begin(), checks.end(), [](const Checkpoint& c) { return c.reply; }),
@@ -2055,7 +2056,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             // --batch-mtp: the MTP layer's cell at n too, where the request's first draft came from (spec_start)
             const bool first_draft = spec && model.batch_drafts() && !model.pending_drafts().empty();
             if (cont && !model.copy_session(-1, admit_slot, first_draft ? n + 1 : n, false, err)) {
-                std::fprintf(stderr, "strata (%s): batch admission failed: %s\n", arch.c_str(), err.c_str());
+                std::fprintf(stderr, "xestrata (%s): batch admission failed: %s\n", arch.c_str(), err.c_str());
                 err.clear();
                 bs[(size_t) admit_slot].held = false;   // its state may be half written
                 cont = false;
@@ -2077,7 +2078,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 for (const Checkpoint& c : checks)
                     if (c.len < n && (best == nullptr || c.len > best->len)) best = &c;
                 if (best != nullptr) sl.checks.push_back(*best);
-                std::fprintf(stderr, "strata (%s): batch slot %d takes %lld tokens (copied in %.1f ms)\n", arch.c_str(),
+                std::fprintf(stderr, "xestrata (%s): batch slot %d takes %lld tokens (copied in %.1f ms)\n", arch.c_str(),
                              admit_slot, (long long) n,
                              std::chrono::duration<double, std::milli>(Clock::now() - tc0).count());
             }
@@ -2099,7 +2100,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         live_to_folder("at the end");
     }
     if (!profile_save.empty() && !model.save_profile(profile_save, err)) {
-        std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
+        std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
         return 1;
     }
     return 0;
@@ -2107,7 +2108,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
 
 static void plain_usage(const std::string& arch) {
     std::fprintf(stderr,
-                 "strata --native GGUF --tokens \"1,2,3\" [options]   (%s: the models other than Qwen3.8-Flash-Next)\n"
+                 "xestrata-engine --native GGUF --tokens \"1,2,3\" [options]   (%s: the models other than Qwen3.8-Flash-Next)\n"
                  "\n"
                  "  --native PATH        the model's GGUF (its first shard)\n"
                  "  --tokens LIST        the prompt as comma-separated token ids\n"
@@ -2228,8 +2229,8 @@ static void plain_usage(const std::string& arch) {
                  "                       0 = no check)\n"
                  "  --ram-reserve-mib N  leave N MiB of RAM free for other programs (setup's --ram-reserve-gib): the\n"
                  "                       experts' RAM copy keeps at least it beside it, and it is the least\n"
-                 "                       --conversation-cache-min-free-mib (also STRATA_RAM_RESERVE_MIB; 0 = none)\n"
-                 "  --vision             --serve takes pictures too (GENI; qwen35 and qwen35moe, the rows from strata-vision)\n"
+                 "                       --conversation-cache-min-free-mib (also XESTRATA_RAM_RESERVE_MIB; 0 = none)\n"
+                 "  --vision             --serve takes pictures too (GENI; qwen35 and qwen35moe, the rows from xestrata-vision)\n"
                  "  --gpu PCI            the GPU (its PCI address)\n"
                  "  --layer-split K[,K2..]|auto  the blocks across the GPUs: the first runs the blocks before K, the\n"
                  "                       next those from K on, ..; auto: in proportion to each GPU's free memory\n"
@@ -2248,7 +2249,7 @@ int plain_main(int argc, char** argv) {
 
     strata::core::PlainOptions opt;
     opt.coupled_draft = strata::core::coupled_draft_env();   // STRATA_SPEC_COUPLED=1, as Qwen3.8-Flash-Next's
-    if (const char* e = std::getenv("STRATA_BATCH_MTP"); e != nullptr && *e != 0)   // (=0: --no-batch-mtp)
+    if (const char* e = strata::env_get("BATCH_MTP"); e != nullptr && *e != 0)   // (=0: --no-batch-mtp)
         opt.batch_mtp = std::strtol(e, nullptr, 10) != 0;
     opt.gguf = gguf;
     std::vector<int32_t> prompt;
@@ -2266,7 +2267,7 @@ int plain_main(int argc, char** argv) {
     int64_t memory_limit_mib = -1;      // --memory-limit-mib (else STRATA_MEMORY_LIMIT_MIB)
     double save_min = 10.0;   // --expert-profile-save-every (serve)
     // the options Qwen3.8-Flash-Next's engine takes with the same meaning, parsed by the same code
-    const std::string who = "strata (" + arch + ")";
+    const std::string who = "xestrata (" + arch + ")";
     strata::program::SharedOptionFields shared;
     shared.who = who.c_str();
     shared.adapt_every = &opt.adapt_every;
@@ -2367,7 +2368,7 @@ int plain_main(int argc, char** argv) {
             const double v = std::strtod(next(a.c_str()), nullptr);
             // as generate.cpp checks them: finite, the ext factor >= -1 (< 0: auto), the rest positive
             if (!std::isfinite(v) || (a == "--yarn-ext-factor" ? v < -1.0 : v <= 0.0)) {
-                std::fprintf(stderr, "strata (%s): %s %g: invalid rope scaling knob\n", arch.c_str(), a.c_str(), v);
+                std::fprintf(stderr, "xestrata (%s): %s %g: invalid rope scaling knob\n", arch.c_str(), a.c_str(), v);
                 return 2;
             }
             (a == "--yarn-ext-factor"    ? opt.yarn_ext_factor
@@ -2382,13 +2383,13 @@ int plain_main(int argc, char** argv) {
             std::string aerr;
             strata::aux_cpus::Config acfg;
             if (!strata::aux_cpus::parse_spec(aux_cpus, acfg, aerr)) {
-                std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), aerr.c_str());
+                std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), aerr.c_str());
                 return 2;
             }
         } else if (a == "--pool-tasks") {
             const long tasks = std::strtol(next("--pool-tasks"), nullptr, 10);
             if (tasks < 0 || tasks > 4096) {
-                std::fprintf(stderr, "strata (%s): --pool-tasks takes 0..4096\n", arch.c_str());
+                std::fprintf(stderr, "xestrata (%s): --pool-tasks takes 0..4096\n", arch.c_str());
                 return 2;
             }
             opt.pool_tasks = (int) tasks;
@@ -2470,7 +2471,7 @@ int plain_main(int argc, char** argv) {
         else if (a == "--pcie-frac") {
             const double f = std::strtod(next("--pcie-frac"), nullptr);
             if (!std::isfinite(f) || f < 0.0 || f > 1.0) {
-                std::fprintf(stderr, "strata (%s): --pcie-frac takes 0 .. 1\n", arch.c_str());
+                std::fprintf(stderr, "xestrata (%s): --pcie-frac takes 0 .. 1\n", arch.c_str());
                 return 2;
             }
             opt.pcie_frac = f;
@@ -2490,7 +2491,7 @@ int plain_main(int argc, char** argv) {
                 char* end = nullptr;
                 const long long k = std::strtoll(part.c_str(), &end, 10);
                 if (part.empty() || end == nullptr || *end != '\0') {
-                    std::fprintf(stderr, "strata (%s): --layer-split takes K[,K2..] or auto, not \"%s\"\n", arch.c_str(),
+                    std::fprintf(stderr, "xestrata (%s): --layer-split takes K[,K2..] or auto, not \"%s\"\n", arch.c_str(),
                                  v.c_str());
                     return 2;
                 }
@@ -2514,7 +2515,7 @@ int plain_main(int argc, char** argv) {
                         if (strata::core::device_info(d).pci == t) found = d;
                 }
                 if (found < 0) {
-                    std::fprintf(stderr, "strata (%s): --split-device: no usable GPU at \"%s\"\n", arch.c_str(), t.c_str());
+                    std::fprintf(stderr, "xestrata (%s): --split-device: no usable GPU at \"%s\"\n", arch.c_str(), t.c_str());
                     return 2;
                 }
                 opt.split_devices.push_back(found);
@@ -2533,7 +2534,7 @@ int plain_main(int argc, char** argv) {
         else if (a == "--kv-ram") {
             const std::string v = next("--kv-ram");
             if (v != "on" && v != "off") {
-                std::fprintf(stderr, "strata (%s): --kv-ram takes on or off\n", arch.c_str());
+                std::fprintf(stderr, "xestrata (%s): --kv-ram takes on or off\n", arch.c_str());
                 return 2;
             }
             opt.kv_ram = v == "on";
@@ -2542,7 +2543,7 @@ int plain_main(int argc, char** argv) {
             std::string v = next("--kv");
             if (v == "q4") v = "q4_0";
             if (v != "fp16" && v != "int8" && v != "q4_0" && v != "k8v4") {
-                std::fprintf(stderr, "strata (%s): --kv takes fp16, int8, q4_0 or k8v4, not \"%s\"\n", arch.c_str(),
+                std::fprintf(stderr, "xestrata (%s): --kv takes fp16, int8, q4_0 or k8v4, not \"%s\"\n", arch.c_str(),
                              v.c_str());
                 return 2;
             }
@@ -2552,11 +2553,11 @@ int plain_main(int argc, char** argv) {
         else {
             switch (option_scope(a)) {
                 case OptionScope::qwen38_only:
-                    std::fprintf(stderr, "strata (%s): %s is Qwen3.8-Flash-Next's (qwen4exp) only: this model has no "
+                    std::fprintf(stderr, "xestrata (%s): %s is Qwen3.8-Flash-Next's (qwen4exp) only: this model has no "
                                          "such part\n", arch.c_str(), a.c_str());
                     break;
                 case OptionScope::unknown:
-                    std::fprintf(stderr, "strata (%s): unknown option %s\n", arch.c_str(), a.c_str());
+                    std::fprintf(stderr, "xestrata (%s): unknown option %s\n", arch.c_str(), a.c_str());
                     break;
             }
             return 2;
@@ -2566,12 +2567,12 @@ int plain_main(int argc, char** argv) {
     // the parked conversations leave the RAM reserve free, as the experts' RAM copy does (plain_model.cpp)
     cache.min_free = std::max<int64_t>(cache.min_free, (int64_t) strata::core::detail::ram_reserve_bytes());
     if (folder.compress && !strata::core::conversation_disk_can_compress()) {
-        std::fprintf(stderr, "strata (%s): --conversation-save-compress: this build has no c-blosc2 (install "
+        std::fprintf(stderr, "xestrata (%s): --conversation-save-compress: this build has no c-blosc2 (install "
                              "libblosc2-dev and build again)\n", arch.c_str());
         return 2;
     }
     if (!serve && (prompt.empty() || n_new < 1)) {
-        std::fprintf(stderr, "strata (%s): needs --tokens and --max-new >= 1\n", arch.c_str());
+        std::fprintf(stderr, "xestrata (%s): needs --tokens and --max-new >= 1\n", arch.c_str());
         return 2;
     }
     // the last window's drafts and the MTP layer's cells reach a window past the last token
@@ -2581,7 +2582,7 @@ int plain_main(int argc, char** argv) {
     if (sp.greedy) sp.temperature = 0.0f;
     if (stop_eos && eos.empty()) eos = eos_tokens(gguf);
     if (opt.vision && arch != "qwen35" && arch != "qwen35moe") {   // the M-RoPE table: the Qwen3.5 rotation's
-        std::fprintf(stderr, "strata (%s): --vision is off: pictures are read for qwen35 and qwen35moe\n", arch.c_str());
+        std::fprintf(stderr, "xestrata (%s): --vision is off: pictures are read for qwen35 and qwen35moe\n", arch.c_str());
         opt.vision = false;
     }
     auto at_eos = [&](int32_t t) { return stop_eos && std::find(eos.begin(), eos.end(), t) != eos.end(); };
@@ -2590,13 +2591,13 @@ int plain_main(int argc, char** argv) {
     model.set_sampler(sp);
     std::string err;
     if (!opt.shared_arena.empty() && (opt.mmap_experts || opt.resident_gib != 0)) {
-        std::fprintf(stderr, "strata (%s): --shared-expert-arena shares the experts' RAM copy: not with --mmap-experts or "
+        std::fprintf(stderr, "xestrata (%s): --shared-expert-arena shares the experts' RAM copy: not with --mmap-experts or "
                              "the resident RAM mode\n", arch.c_str());
         return 2;
     }
     if (!serve) opt.kv_grow = 0;   // it grows between requests
     if (opt.vram_elastic && !serve) {   // the VRAM command comes between requests
-        std::fprintf(stderr, "strata (%s): --vram-elastic is off: it works between requests of --serve\n", arch.c_str());
+        std::fprintf(stderr, "xestrata (%s): --vram-elastic is off: it works between requests of --serve\n", arch.c_str());
         opt.vram_elastic = false;
     }
     const Clock::time_point t0 = Clock::now();
@@ -2604,30 +2605,30 @@ int plain_main(int argc, char** argv) {
     {   // before the expert pool is built: its workers' CPUs, the other threads' plan, the RAM guard's limit
         std::string text = pool_cores;
         if (text.empty())
-            if (const char* e = std::getenv("STRATA_POOL_CORES")) text = e;
+            if (const char* e = strata::env_get("POOL_CORES")) text = e;
         if (!text.empty()) {   // a list that cannot be read is said and ignored (the default placement)
             std::vector<int> cpus;
             std::string why;
             if (strata::kernels::cpu::parse_pool_cores(text, cpus, why)) strata::kernels::cpu::set_pool_cores(cpus);
-            else std::fprintf(stderr, "strata (%s): --pool-cores: %s; the pool uses its default placement\n", arch.c_str(),
+            else std::fprintf(stderr, "xestrata (%s): --pool-cores: %s; the pool uses its default placement\n", arch.c_str(),
                               why.c_str());
         }
         std::string ac = aux_cpus, aerr;
         if (ac.empty())
-            if (const char* e = std::getenv("STRATA_AUX_CPUS")) ac = e;
+            if (const char* e = strata::env_get("AUX_CPUS")) ac = e;
         if (!strata::aux_cpus::configure(ac, aerr)) {
-            std::fprintf(stderr, "strata (%s): STRATA_AUX_CPUS: %s\n", arch.c_str(), aerr.c_str());
+            std::fprintf(stderr, "xestrata (%s): XESTRATA_AUX_CPUS: %s\n", arch.c_str(), aerr.c_str());
             return 2;
         }
         int64_t mib = memory_limit_mib;
         if (mib < 0) {
-            const char* e = std::getenv("STRATA_MEMORY_LIMIT_MIB");
+            const char* e = strata::env_get("MEMORY_LIMIT_MIB");
             mib = e != nullptr && e[0] != '\0' ? std::max<long long>(0, std::strtoll(e, nullptr, 10)) : 0;
         }
         strata::core::set_memory_limit_bytes((uint64_t) mib << 20);
     }
     if (!model.load(opt, err) || !model.prompt_warm(err)) {
-        std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
+        std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
         // --serve: said where the server waits for READY, and ended at once: the clean-up of a model half loaded can
         // wait on a GPU for good (two engines on one pair of GPUs, 2026-11-01); the process's end frees its memory
         if (serve) {
@@ -2647,23 +2648,23 @@ int plain_main(int argc, char** argv) {
     }
     if (!cvecs.files.empty()) {   // before the first window records the blocks
         if (model.spec().arch == ModelArch::Glm5Next) {
-            std::fprintf(stderr, "strata (%s): --control-vector is not available for GLM-5.3-Flash yet\n", arch.c_str());
+            std::fprintf(stderr, "xestrata (%s): --control-vector is not available for GLM-5.3-Flash yet\n", arch.c_str());
             return 2;
         }
         if (!load_control_vectors(cvecs, model.spec().n_layer, model.spec().n_embd, arch, err) ||
             !model.replicate_cvec(err)) {
-            std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
+            std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
             return 2;
         }
     }
     opt.prompt_chunk = model.prompt_chunk();   // the model may take the prompt in windows (short of pinned memory)
     if (opt.prompt_chunk > 0 && model.spec().n_expert == 0) {   // a dense model (qwen35)
-        std::fprintf(stderr, "strata (%s): prompt matrix products on %s, the int8 ones on %s\n", arch.c_str(),
+        std::fprintf(stderr, "xestrata (%s): prompt matrix products on %s, the int8 ones on %s\n", arch.c_str(),
                      strata::prefill::Gemm::path(),
                      strata::prefill::mmq::chosen() ? strata::prefill::mmq::path() : "none (FP16 for all)");
     } else if (opt.prompt_chunk > 0) {
         const char* experts = model.prompt_int8() ? strata::prefill::mmq::path() : nullptr;
-        std::fprintf(stderr, "strata (%s): prompt matrix products on %s; the experts' in %s%s%s\n", arch.c_str(),
+        std::fprintf(stderr, "xestrata (%s): prompt matrix products on %s; the experts' in %s%s%s\n", arch.c_str(),
                      strata::prefill::Gemm::path(), experts ? "int8 (" : "FP16", experts ? experts : "",
                      experts ? ")" : "");
     }
@@ -2673,14 +2674,14 @@ int plain_main(int argc, char** argv) {
             : 0;
         cache.budget = mib << 20;
         if (mib > 0)
-            std::fprintf(stderr, "strata (%s): conversation cache sized from the free RAM: %lld MiB for up to %d parked "
+            std::fprintf(stderr, "xestrata (%s): conversation cache sized from the free RAM: %lld MiB for up to %d parked "
                                  "conversations (--conversation-cache-mib N sets it, 0 turns it off)\n", arch.c_str(),
                          (long long) mib, cache.slots);
     }
     // the files hold what the RAM cache lets go, as generate.cpp's
     if (folder.on() && (!serve || cache.budget == 0)) {
         if (serve)
-            std::fprintf(stderr, "strata (%s): warning: --conversation-save needs conversation parking, and the RAM "
+            std::fprintf(stderr, "xestrata (%s): warning: --conversation-save needs conversation parking, and the RAM "
                                  "cache is off (--conversation-cache-mib); not saving conversations\n", arch.c_str());
         folder.dir.clear();
     }
@@ -2722,14 +2723,14 @@ int plain_main(int argc, char** argv) {
             pos = (int64_t) prompt.size();
             if (!emit(0)) return 1;
         } else if (!err.empty()) {   // (empty: no room for the chunks, the windows below read it)
-            std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
+            std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
             return 1;
         }
     }
     while (pos < (int64_t) prompt.size()) {
         const int n = (int) std::min<int64_t>(T, (int64_t) prompt.size() - pos);
         if (!model.forward(prompt.data() + pos, n, pos, out.data(), lg, err)) {
-            std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
+            std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
             return 1;
         }
         pos += n;
@@ -2740,7 +2741,7 @@ int plain_main(int argc, char** argv) {
     const bool spec = model.drafts() > 0 && sp.greedy;
     if (spec && (int64_t) produced.size() < n_new && !at_eos(produced.back()) &&
         !model.spec_start(produced.back(), pos, err)) {
-        std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
+        std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
         return 1;
     }
     const std::vector<int32_t> stop = stop_eos ? eos : std::vector<int32_t>();
@@ -2751,7 +2752,7 @@ int plain_main(int argc, char** argv) {
             const bool forced = !follow.empty() && at + (size_t) model.drafts() + 1 <= follow.size();
             if (!model.spec_step(stop, n_new - (int64_t) produced.size(), out.data(), n_emit, lg, err,
                                  forced ? follow.data() + at : nullptr)) {
-                std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
+                std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
                 return 1;
             }
             for (int j = 0; j < n_emit; ++j)
@@ -2761,7 +2762,7 @@ int plain_main(int argc, char** argv) {
         }
         const int32_t x = produced.back();
         if (!model.forward(&x, 1, pos, out.data(), lg, err)) {
-            std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
+            std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
             return 1;
         }
         ++pos;
@@ -2769,7 +2770,7 @@ int plain_main(int argc, char** argv) {
     }
     const Clock::time_point t3 = Clock::now();
     if (!profile_save.empty() && !model.save_profile(profile_save, err)) {
-        std::fprintf(stderr, "strata (%s): %s\n", arch.c_str(), err.c_str());
+        std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
         return 1;
     }
     std::printf("tokens: ");
@@ -2777,21 +2778,21 @@ int plain_main(int argc, char** argv) {
     std::printf("\n");
     const double pp = std::chrono::duration<double>(t2 - t1).count(), tg = std::chrono::duration<double>(t3 - t2).count();
     const int64_t routed = model.hits() + model.misses();
-    std::fprintf(stderr, "strata (%s): load %.1f s, prompt %zu tokens %.2f s (%.1f tok/s), %zu generated %.2f s (%.2f tok/s); "
+    std::fprintf(stderr, "xestrata (%s): load %.1f s, prompt %zu tokens %.2f s (%.1f tok/s), %zu generated %.2f s (%.2f tok/s); "
                          "VRAM tier %lld of %lld slots filled, %.1f%% of routed experts hit, %lld swaps\n",
                  arch.c_str(), load_s, prompt.size(), pp, (double) prompt.size() / pp, produced.size() - 1, tg,
                  (double) (produced.size() - 1) / (tg > 0 ? tg : 1), (long long) model.resident(),
                  (long long) model.slots(), routed > 0 ? 100.0 * (double) model.hits() / (double) routed : 0.0,
                  (long long) model.swaps());
-    std::fprintf(stderr, "strata (%s): below the VRAM tier: %lld routed entries read over PCIe; experts taken from "
+    std::fprintf(stderr, "xestrata (%s): below the VRAM tier: %lld routed entries read over PCIe; experts taken from "
                          "RAM %lld, from the files %lld (%.1f MB)\n", arch.c_str(), (long long) model.offloaded(),
                  (long long) model.ram_reads(), (long long) model.file_reads(), (double) model.file_read_bytes() / 1e6);
     if (model.ram_adapts() > 0)
-        std::fprintf(stderr, "strata (%s): %lld experts moved into the RAM copy in the places of unused ones, %lld of "
-                             "them out of a stage buffer (STRATA_RAM_ADAPT)\n", arch.c_str(),
+        std::fprintf(stderr, "xestrata (%s): %lld experts moved into the RAM copy in the places of unused ones, %lld of "
+                             "them out of a stage buffer (XESTRATA_RAM_ADAPT)\n", arch.c_str(),
                      (long long) model.ram_adapts(), (long long) model.ram_staged());
     if (model.spec_windows() > 0)
-        std::fprintf(stderr, "strata (%s): %lld windows checked %lld drafts, accepted %lld (%.1f%%), %.2f tokens a window; "
+        std::fprintf(stderr, "xestrata (%s): %lld windows checked %lld drafts, accepted %lld (%.1f%%), %.2f tokens a window; "
                              "a window %.2f ms, its drafts %.2f ms\n",
                      arch.c_str(), (long long) model.spec_windows(), (long long) model.spec_drafted(),
                      (long long) model.spec_accepted(),
@@ -2800,7 +2801,7 @@ int plain_main(int argc, char** argv) {
                      model.spec_ms_check() / (double) model.spec_windows(),
                      model.spec_ms_draft() / (double) model.spec_windows());
     if (model.pl_gate().started() > 0)
-        std::fprintf(stderr, "strata (%s): --pipeline-windows 2: %lld guessed windows, %lld held; a guess starts at an "
+        std::fprintf(stderr, "xestrata (%s): --pipeline-windows 2: %lld guessed windows, %lld held; a guess starts at an "
                              "estimate of %.2f\n", arch.c_str(), (long long) model.pl_gate().started(),
                      (long long) model.pl_gate().held(), model.pl_gate().threshold(false));
     return 0;

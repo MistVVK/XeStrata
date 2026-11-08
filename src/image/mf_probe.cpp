@@ -466,7 +466,7 @@ int main(int argc, char** argv) {
                      "dit DIT.safetensors GOLDEN_DIR [q8|bf16 [VAE.safetensors OUT.f32]]\n", argv[0]);
         return 2;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image-mf-probe: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image-mf-probe: %s\n", e.what());
         return 1;
     }
 }

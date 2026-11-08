@@ -8,7 +8,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 
 XeStrata は、文章のモデルと同じ PC、同じ GPU で画像も作ります（All in One）。
 画像を作るモデルは任意で、`xestrata --setup` の質問か `--images` で、文章のモデルと一緒に入れます。
-画像は XeStrata 自身の画像のエンジン `strata-image` が作ります。文章のエンジンと同じ SYCL のカーネルで、Intel・AMD・NVIDIA のどの GPU でも動きます。
+画像は XeStrata 自身の画像のエンジン `xestrata-image` が作ります。文章のエンジンと同じ SYCL のカーネルで、Intel・AMD・NVIDIA のどの GPU でも動きます。
 Qwen3.8-Flash-Next のどの版とも組み合わせられ（BETA のモデルとはまだ組み合わせられません）、文章のモデルと同じサーバーの、Web のページの Images のタブ、チャット、API（vLLM-Omni 互換（OpenAI 互換））から使えます。
 文章と画像は 1 枚の GPU を順番に使い、VRAM を分け合います。画像を作る間の文章のモデルの扱い（そのまま残す、VRAM を一時的に空ける、外してあとで戻す）は、その画像に要る VRAM から自動で選びます（[GPU のメモリの分け合い](#gpu-のメモリの分け合い)）。
 
@@ -146,7 +146,7 @@ Qwen-Image-2.1 の画像のモデルも、int8 の積がある GPU では同じ�
 | `reload` | `lazy` | `unload` で外した文章のモデルを、次の要求で戻す（`lazy`）か、画像のすぐあとに戻す（`eager`） |
 | `daemon_idle_s` | 1800 | どのサーバーもつながっていない画像のエンジンが終わるまでの秒数 |
 | `keep_files` | 64 | `response_format: "url"` の画像を残す数 |
-| `out_dir` | 一時フォルダー | 画像とエンジンのログ（`strata-image.log`）を置くフォルダー |
+| `out_dir` | 一時フォルダー | 画像とエンジンのログ（`xestrata-image.log`）を置くフォルダー |
 | `lora_bake` | `true` | DiT のブロックに当てる素の LoRA を、重みに焼き込む（`false` で、積のたびに差分を足す。[LoRA](#loraアダプター)） |
 | `edit_adapter` | `chinoll` | MOSS-Image の編集の LoRA（`chinoll`・`armv5`・`armv6` か `edit_adapters` に足した名前、下の「画像を直す」のマスク）。環境変数 `XESTRATA_MOSS_EDIT` がこれより優先します |
 | `image_tools` | すべて | チャットのモデルが使ってよい画像の道具の一覧（`generate_image`・`edit_image`）。ここにない道具は、チャットにも Images API にも出しません |
@@ -300,7 +300,7 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
 - ControlNet のないモデル（Mage-Flow の編集、HunyuanImage 3.0、編集のある MOSS-Image のほかの種類）: 図を参照の画像の 1 枚として渡し、プロンプトの最後に「その図の姿勢に沿う」などの頼みを足します。姿勢はよく効きますが、輪郭と深度では元の画像の人物まで写すことがあります。`strength`・`start`・`end` は受けません。
 - 編集のないモデル（MageTrail、Anima、編集のない MOSS-Image の色と深度以外）は `control` を受けません。
 - 重み（Fun ControlNet Union、前処理の網、MOSS-Image のアダプター）は、初めて使うときにサーバーが取ります（取っている間は 503 で、進み具合を返します）。
-- 応答の `strata` には、作った図の大きさと秒数が入ります。
+- 応答の `xestrata-engine` には、作った図の大きさと秒数が入ります。
 
 ### 画像を直す（`POST /v1/images/edits`）
 
@@ -350,7 +350,7 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
    - 大きい部分から 1 か所ずつ、前の部分を直した後の画像の上で描きます（大きい順は XeStrata の選び方で、FaceDetailer の既定は検出の順です）。重なる部分は、後から描いた方が前の結果を変えることがあります。箱の一辺が 10 ピクセル以下のものと、両辺が 1024 ピクセル以上のもの（もう十分大きい）は飛ばします。何も見つからないときは、元の画像をそのまま返します。
    - 部分 k の seed は要求の seed + k です（`n` が 2 以上なら、i 枚目はさらに + 1000 i）。設定の `budget_s` は、次の部分を描き始める前にも見ます。GPU の番が来てから（検出を含めて）その秒数を過ぎると、残りの部分は飛ばして、応答にそう書きます（描いている途中の部分は止めません）。
    - `prompt` は直した部分の見た目です。付けないと、部分ごとの決まった言葉（「a detailed, well-drawn face」など）で描きます。マスク・`extend`・`upscale` と一緒には使えません。
-   - 応答の `strata` の `fix` に、描いた部分（`regions`: 部分の名前、画像の上の箱、点数、seed、切り出した範囲、描いた大きさ、秒数。飛ばしたものはその理由）と、検出の時間（`detect_s`）が入ります。
+   - 応答の `xestrata-engine` の `fix` に、描いた部分（`regions`: 部分の名前、画像の上の箱、点数、seed、切り出した範囲、描いた大きさ、秒数。飛ばしたものはその理由）と、検出の時間（`detect_s`）が入ります。
 - **言葉の場所（`region`）**: `region` に `"hair"` のような言葉を付けると、マスクを塗る代わりに、1 枚目の画像からその言葉の場所を見つけてマスクにし、そこだけ描き直します（上の「マスク」と同じ道筋）。見つけたものをすべて合わせ、短い辺の 1%（4 ピクセル以上）広げます。見つけるのは下の「言葉からマスク」と同じモデルで、`region_model` で選べます。マスクとは一緒に使えません。
 - **補助の重み**: 道具が使う重み（Detailer の検出器など）は、初めて使うときにサーバーが Hugging Face から取ります（版と SHA-256 を固定し、`HF_ENDPOINT` のミラーも使えます）。置き場所は画像のモデルと同じフォルダーの `image-tools/` です。取っている間は画像を作らず、Images API は 503（`code` が `weights_downloading`、`downloads` に大きさと進み具合とライセンス）、チャットの道具は「取っている途中」と返します。終わったら、もう一度頼むと使えます。取れなかったとき（オフライン、ディスクがいっぱい、書き込めないフォルダー）は、その理由を返します。進み具合はサーバーのログに出ます。
   SAM 3.1 の重みは、利用者が SAM License に同意するまで取りません（setup の問い、または Web の画像の画面の「SAM 3 のライセンス…」で同意します。同意は `image-tools/sam3.accepted` に残ります）。同意するまでは Florence-2 が場所を見つけます。
@@ -367,7 +367,7 @@ LocalAI の拡大と同じ形です。multipart の `image`（1 枚）・`model`
 - `model` は拡大の手段です。`realesrgan-x4plus`（RealESRGAN x4plus）、`seedvr2-7b`・`seedvr2-7b-sharp`・`seedvr2-3b`（SeedVR2）、`lanczos`、`auto`（付けないときも `auto`）。これらは `/v1/models` にも出ます。`scale` の既定は RealESRGAN では 4、ほかは 2 です。
 - vLLM-Omni の画像の共通の欄 `response_format`・`output_format`・`output_compression`・`seed` も受けます。
 - `extra_params` に、色の補正 `color_correction_method`（vLLM-Omni の SeedVR2 と同じ名前。`none`・`lab`・`adain`・`wavelet`）と、XeStrata の拡張の `redraw`（`true` で拡大の後に画像のモデルで描き直す。既定は `false`）・`redraw_strength`（描き直しの strength、既定 0.35）・`redraw_model`（描き直す画像のモデル、既定は既定のモデル）を書けます。描き直すときは `prompt` も要ります。
-- 中身は上の「拡大」と同じです（`upscale` の `method`・`redraw`・`strength`・`color`）。応答の `strata` の `upscale` に、使った手段、色の補正、拡大の時間（`upscale_s`、そのうちモデル `model_s`・大きさの合わせ `resize_s`・色の補正 `color_s`）、タイルに分けたときはその大きさと数（`tile`・`tiles`）が入ります。
+- 中身は上の「拡大」と同じです（`upscale` の `method`・`redraw`・`strength`・`color`）。応答の `xestrata-engine` の `upscale` に、使った手段、色の補正、拡大の時間（`upscale_s`、そのうちモデル `model_s`・大きさの合わせ `resize_s`・色の補正 `color_s`）、タイルに分けたときはその大きさと数（`tile`・`tiles`）が入ります。
 
 ### 言葉からマスク（`POST /v1/images/segmentations`）
 
@@ -377,10 +377,10 @@ vLLM-Omni の SAM 3 の分割と同じ形です。multipart の `image`（1 枚�
 - `model` は `sam3.1`、`florence-2-large`、`florence-2-base`、`auto`（付けないときも `auto`）です。これらは `/v1/models` にも出ます。
    - `sam3.1`: Meta の SAM 3.1（Comfy-Org の FP16 の重み）。言葉の表すもの（概念）をすべて見つけ、点数の高い順に返します。
    - `florence-2-large`・`florence-2-base`: Microsoft の Florence-2。言葉を指し示しの言い回しとして読み、多角形で答えたものを塗ってマスクにします。点数は出さないので `score` は `null` です。
-   - `auto`: SAM License に同意していて、言葉が 4 語以下（概念）で CLIP の 32 トークンに収まるときは SAM 3.1、そうでないとき（「左の女の子」のような言い回し）は Florence-2 large、GPU のメモリに入らないときは base です。応答の `strata` の `fallback` に、SAM 3.1 にしなかった理由が入ります。
+   - `auto`: SAM License に同意していて、言葉が 4 語以下（概念）で CLIP の 32 トークンに収まるときは SAM 3.1、そうでないとき（「左の女の子」のような言い回し）は Florence-2 large、GPU のメモリに入らないときは base です。応答の `xestrata-engine` の `fallback` に、SAM 3.1 にしなかった理由が入ります。
 - 拡張の `task` で、`mask`（既定）、`box`（箱だけ。`mask` は `null`）、`grounding`（Florence-2 の言葉の位置合わせ。文の中の言い回しごとの箱と `label`）を選べます。
 - vLLM-Omni の見本の箱（`boxes`）は受けません。
-- 応答の `strata` に、かかった秒数とエンジンの秒数が入ります。
+- 応答の `xestrata-engine` に、かかった秒数とエンジンの秒数が入ります。
 
 ### 背景を消す（`POST /v1/images/remove-background`）
 
@@ -395,18 +395,18 @@ BiRefNet で、1 枚の画像の被写体を切り抜きます。multipart の `
 
 ### 制御の図だけ（`POST /v1/images/controls`）
 
-`control` に渡す図を作って返します（Web のページの「図を確かめる」）。multipart の `image` と `type` と種類ごとの欄、または JSON（`image` に data: URL か http(s) の URL）で送ります。応答は `created`・`type`・`width`・`height`・`data[]`（`b64_json` か `url`）と、秒数の `strata` です。返した図は、`control` に `preprocess: false`（MOSS-Image の色と深度）か `type: none` で送れば、作り直さずに使えます。
+`control` に渡す図を作って返します（Web のページの「図を確かめる」）。multipart の `image` と `type` と種類ごとの欄、または JSON（`image` に data: URL か http(s) の URL）で送ります。応答は `created`・`type`・`width`・`height`・`data[]`（`b64_json` か `url`）と、秒数の `xestrata-engine` です。返した図は、`control` に `preprocess: false`（MOSS-Image の色と深度）か `type: none` で送れば、作り直さずに使えます。
 
 ### 応答
 
 - `data[]`: 画像（`b64_json` か `url`）と、`revised_prompt`、`seed`。アダプターを当てたときは `lora`（当てたものの `name` と `scale`）も。
 - `usage`: 画像のエンジンのトークンで数えます（プロンプトのトークンと、参照画像と作った画像の 16x16 ピクセルで 1 つのトークン）。HunyuanImage 3.0 では、プロンプトの ids と、作った画像の 16x16 画素ごとの 1 個で、参照画像は VAE のトークンと SigLIP2 の 1,024 スロットを数えます。
-- `strata`: かかった秒数、ステップ数（strength で回した数）、`strength`（1 未満のとき）、img2img か（`img2img`）とマスクを使ったか（`mask`）、配置を使ったか（`layout`）、書き広げの結果（`enhance`）、CFG の強さ、文の読み手・サンプリング・VAE のそれぞれの時間、文章のモデルの扱い（`gpu_policy`）、アダプターを当てたときはその本数（`lora_n`）、VRAM（`lora_mib`）、プロンプトのタグで飛ばした名前（`lora_unknown`）。HunyuanImage 3.0 では、ガイダンスの強さ（`guidance`）、バケットの番号（`ratio`）、頼んだ大きさが別のときはそれ（`requested_size`）、モデルが大きさを選んだときはそれにかかった秒数（`size_choice_s`）も。マスクの部分を切り出して描いたときは、描いた大きさ（`made_size`）と、切り出した範囲（`crop`: `box` が 1 枚目の画像の上の x・y・幅・高さ、`whole` が画像全体を描き直したか。何も塗っていないマスクでは `empty`）、切り出しと貼り戻しの秒数（`plan` の `crop_s`）も。2 段で描いたときは、2 段目の範囲・描いた大きさ・strength（`refine`）も。
+- `xestrata-engine`: かかった秒数、ステップ数（strength で回した数）、`strength`（1 未満のとき）、img2img か（`img2img`）とマスクを使ったか（`mask`）、配置を使ったか（`layout`）、書き広げの結果（`enhance`）、CFG の強さ、文の読み手・サンプリング・VAE のそれぞれの時間、文章のモデルの扱い（`gpu_policy`）、アダプターを当てたときはその本数（`lora_n`）、VRAM（`lora_mib`）、プロンプトのタグで飛ばした名前（`lora_unknown`）。HunyuanImage 3.0 では、ガイダンスの強さ（`guidance`）、バケットの番号（`ratio`）、頼んだ大きさが別のときはそれ（`requested_size`）、モデルが大きさを選んだときはそれにかかった秒数（`size_choice_s`）も。マスクの部分を切り出して描いたときは、描いた大きさ（`made_size`）と、切り出した範囲（`crop`: `box` が 1 枚目の画像の上の x・y・幅・高さ、`whole` が画像全体を描き直したか。何も塗っていないマスクでは `empty`）、切り出しと貼り戻しの秒数（`plan` の `crop_s`）も。2 段で描いたときは、2 段目の範囲・描いた大きさ・strength（`refine`）も。
 - 画像のモデルは `/v1/models` にも出ます。
 
 ### チャットから
 
-- `/v1/chat/completions` に `"strata_images": true` を付けると（Web のページは付けます）、モデルに `generate_image` と `edit_image` の道具を渡し、モデルが呼ぶとサーバーが画像を作ってその場に出します。
+- `/v1/chat/completions` に `"xestrata_images": true` を付けると（Web のページは付けます）、モデルに `generate_image` と `edit_image` の道具を渡し、モデルが呼ぶとサーバーが画像を作ってその場に出します。
   `edit_image` は、会話の最後の画像（添付したものか、会話で作ったもの）を直します。`strength` も受け、編集のないモデルでは img2img になります。1 回の要求で道具を呼べるのは 4 回までです。
   `extend_image` は、会話の最後の画像の外側を描き足します（上の「描き足し」と同じ。引数は上下左右の画素か `aspect`）。
   `upscale_image` は、会話の最後の画像を大きくし、`redraw` で細かく描き直します（上の「拡大」と同じ。引数は `scale`（既定は 2）・`method`・`redraw`（既定は描き直さない）・`strength`）。「そのまま大きく」なら描き直さず、「大きく、細かく描き込んで」なら描き直す、という使い分けは、スキルの `tools/upscale_image` に書いてあります。
@@ -414,8 +414,8 @@ BiRefNet で、1 枚の画像の被写体を切り抜きます。multipart の `
   `edit_region` は、言葉の場所（`region`）だけを `prompt` のとおりに描き直し（上の「言葉の場所」と同じ）、`find_region` は言葉の場所を赤で塗った画像を見せ（描き直さない）、`remove_background` は背景を消すか単色を敷きます（引数は `version` と `background_color`）。使いどころはスキルの `tools/edit_region`・`tools/find_region`・`tools/remove_background` に書いてあります。
   `control` は、会話の最後の画像（添付したものか、会話で作ったもの）の姿勢・輪郭・深度などに沿って新しい画像を作ります（上の「構図の制御」と同じ。引数は `type`・`prompt`・`strength`・`end`）。「このポーズで」「この構図で」のときの使い分けは、スキルの `tools/control` に書いてあります。
   Qwen-Image-2.1 と Mage-Flow では、`generate_image` と `edit_image` に `guidance`（上の「サンプリングのガイダンス」の名前の配列）も渡します。CFG の要る 3 つは、モデルの既定で CFG が掛かるときだけ並べます。使いどころは `image_skill` の `guidance` に書いてあります。
-- `"strata_images": {"force": true}`（`model` と一緒にも書けます）は、渡す道具を画像の道具だけにし、返事の最初で必ずそのどれかを呼ばせます。プロンプトはモデルが会話から書きます。Web のページでは、送信ボタンの左の「画像」の切り替えがオンの間、送るたびに付けます（送信ボタンではありません）。`tool_choice` とは一緒に使えません。
-- `strata_images` に `{"tools": [...]}` を付けると、その要求で使う画像の道具を絞ります（設定の `image_tools` にない道具は付けても使えません）。
+- `"xestrata_images": {"force": true}`（`model` と一緒にも書けます）は、渡す道具を画像の道具だけにし、返事の最初で必ずそのどれかを呼ばせます。プロンプトはモデルが会話から書きます。Web のページでは、送信ボタンの左の「画像」の切り替えがオンの間、送るたびに付けます（送信ボタンではありません）。`tool_choice` とは一緒に使えません。
+- `xestrata_images` に `{"tools": [...]}` を付けると、その要求で使う画像の道具を絞ります（設定の `image_tools` にない道具は付けても使えません）。
 - 画像を読めるチャットのモデル（`vision` の設定がある）には、作った画像の小さな写し（長い辺 512 ピクセル）を道具の結果として見せ、頼んだとおりかを確かめさせます。
 - 画像のモデルごとのプロンプトの書き方（スキル）は、`image_skill` の道具で読みます。いつも渡すのは、画像の道具の短い説明と、`image_skill` の説明（共通の書き方、どのモデルがタグか文か、スキルの一覧）だけで、チャットのモデルは画像を作ると決めたときに、要るスキルを選んで（いくつでもまとめて）読みます。画像を作らない会話には、スキルの中身は入りません。Anima と MageTrail は Danbooru のタグ、ほかのモデルは英語の文で、そのうえにモデルごとの決まりがあります。モデルが 2 つ以上なら、それぞれの得意なこと（`models`）も同じように読みます。書き方は `serve/image_skills/` にあります（共通の `common.md`、タグの `booru.md`、文の `natural.md`、モデルや系統ごとのファイル。各ファイルの `When:` の行が一覧の説明になります）。画像のボタンで送った要求と `/v1/responses` の `image_generation` では、今までどおり、渡すモデルのスキルを道具の説明に最初から入れます。
 - MOSS-Image では、`generate_image` に配置（`layout`、API と同じ形）も渡し、チャットのモデルが枠の下書きを書けます。
@@ -427,7 +427,7 @@ BiRefNet で、1 枚の画像の被写体を切り抜きます。multipart の `
 
 画像を設定したサーバーでは、動画を大きくすること（SeedVR2 ほか）と、動画の中の物体を探して追うこと（SAM 3.1）もできます。Web のページの Video のタブ、チャット、API（vLLM-Omni 互換）から使えます。
 
-- 動画の読み書きには ffmpeg と ffprobe を使います（サーバーの PATH にあるもの。`STRATA_FFMPEG`・`STRATA_FFPROBE` でも指定できます）。XeStrata には入っていません。無いときは動画の道具だけが使えず、`xestrata --setup` が入れ方を案内します。
+- 動画の読み書きには ffmpeg と ffprobe を使います（サーバーの PATH にあるもの。`XESTRATA_FFMPEG`・`XESTRATA_FFPROBE` でも指定できます）。XeStrata には入っていません。無いときは動画の道具だけが使えず、`xestrata --setup` が入れ方を案内します。
 - 読む動画: ffmpeg が読めるもの（MP4、WebM、MOV、MKV など）です。
    - 回転の情報があれば、その向きに直して読みます。
    - フレームの間隔が一定でない動画（VFR）は、平均の fps で読み直し（フレームを間引くか繰り返す）、応答にそう書きます。
@@ -524,7 +524,7 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 - 1 回に重ねられるのは 4 本までです。同じ名前を 2 回書くと 400 です。
 - プロンプトのタグ `<lora:名前:強さ>` も読みます（肯定と否定の両方。強さは省略でき、省略すると 1.0 です）。タグはプロンプトから取り除き、名前が一覧にないときは、そのタグを外して画像を作り、応答の `strata.lora_unknown` とサーバーのログに名前を出します。`<lora:名前:強さ:強さ>` の 3 つ目は A1111 の文章エンコーダー側の強さで、読みません（タグは取り除きます）。タグだけのプロンプトは 400 です。
 - 欄とタグを合わせて 4 本までで、同じ名前は最初の 1 つだけを使います（欄、肯定のタグ、否定のタグの順）。
-- 応答の `data[]` の各画像に `lora`（当てたものの `name` と `scale`）が付き、`strata` に `lora_n`（本数）、`lora_mib`（アダプターが VRAM で使う量）、`lora_unknown`（タグで飛ばした名前）が入ります。
+- 応答の `data[]` の各画像に `lora`（当てたものの `name` と `scale`）が付き、`xestrata-engine` に `lora_n`（本数）、`lora_mib`（アダプターが VRAM で使う量）、`lora_unknown`（タグで飛ばした名前）が入ります。
 
 **Web**: Images のタブに LoRA の行が出ます（一覧が空のモデルでは出ません）。「LoRA を追加…」で一覧から選ぶと、選んだもののチップが出ます。チップの数値の欄で強さ（-2〜2、0.05 刻み）を変えられ、`trigger` を持つファイルには「トリガー」のボタンが出て、押すとその語をプロンプトの末尾に足します（タグは書きません）。× で外します。4 本で上限です。選んだものと強さはモデルごとにブラウザーが覚えます。
 
@@ -635,7 +635,7 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
 | `image: one image (this image model has no edits ...`（400） | 編集のないモデルの img2img は画像 1 枚です |
 | `the VAE file has no encoder for a base image` | VAE のファイルにエンコーダーがないので、img2img とマスクは使えません。setup を `--images` を付けてもう一度実行します |
 | `the VRAM budget ... is below the weights that always stay`（400） | HunyuanImage 3.0 の常に置く重みと入れ物（約 10 GB）が VRAM に入りません。この GPU では動きません |
-| `the image engine did not start ...`、`the image engine ended` | 画像のエンジンが起動しないか、止まりました。表示にあるログ（`strata-image.log`）を見てください |
+| `the image engine did not start ...`、`the image engine ended` | 画像のエンジンが起動しないか、止まりました。表示にあるログ（`xestrata-image.log`）を見てください |
 | `Image generation runs the image model at Q6_K instead of Q8_0 ...` | RAM が足りないので、setup が大きさを下げました（[大きさとメモリ](#大きさとメモリ)） |
 | `faster with NVIDIA's ... cuDNN for the image engine's attention`（setup） | cuDNN がないので、NVIDIA の GPU の注意を XeStrata のカーネルで計算します。示されたコマンドで入れると速くなります |
 | `anima:<名前>: not Anima's DiT ...`（setup） | `models/anima` のファイルが Anima の形ではありません。LoRA は `models/loras` に置きます |

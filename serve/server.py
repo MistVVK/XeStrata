@@ -4,19 +4,19 @@
 """serve/server.py - plan v0.3 P8: OpenAI and Anthropic endpoints over any engine that maps token ids to tokens.
 
     python -m serve.server --engine mock --port 8095            (a scripted engine, for clients and tests)
-    python -m serve.server --engine strata --config strata.json --port 8095   (the real engine, resident)
+    python -m serve.server --engine xestrata --config xestrata-<model>.json --port 8095   (the real engine, resident)
 
 Endpoints: POST /v1/chat/completions (OpenAI, stream and non-stream), POST /v1/messages (Anthropic, stream and
 non-stream), GET /v1/models, GET /models, GET /props, GET /slots, GET /health, GET /mcp. One sequence at a time
 behind a FIFO (plan: one resident sequence).
 Image generation (optional, when the config has an "images" section): POST /v1/images/generations and
 /v1/images/edits (OpenAI's shapes, plus seed) run the image model setup --images installed (Qwen-Image-2.1-Turbo,
-Qwen-Image-2.1 or Mage-Flow) on XeStrata's own image engine (strata-image, resident after the first image), one job at
+Qwen-Image-2.1 or Mage-Flow) on XeStrata's own image engine (xestrata-image, resident after the first image), one job at
 a time on the GPU the text engine uses (serve/images.py; docs/IMAGE.md).
 Tools from MCP servers (serve/mcp.py, `"mcp_servers"` in the config or --mcp-config) are offered only to requests that
 ask for them with `"strata_mcp": true` - the web app does; other clients see exactly the API they always saw.
 Images (optional, when the config has a "vision" entry): OpenAI image_url parts and Anthropic image blocks (base64
-data, http(s) URLs or local file paths) go through `strata-vision` (the model's mmproj file) and reach the engine as
+data, http(s) URLs or local file paths) go through `xestrata-vision` (the model's mmproj file) and reach the engine as
 embeddings (`GENI`).  JPEG/PNG/BMP/GIF go straight in; WebP, TIFF, AVIF, ... (agents like omp send WebP) are
 converted to PNG first with Pillow.
 A request whose prompt alone does not fit the engine's context is REJECTED with 400, never truncated.  When the prompt
@@ -26,7 +26,7 @@ brings back the strict 400 of llama.cpp.
 An unset (or 0, or -1) max tokens means "unlimited": whatever the prompt leaves of the context.
 
 The engine boundary is `Engine.generate(prompt_ids, max_new, sampling, cancel) -> iterator of token ids`.
-`StrataEngine` keeps one `strata --serve` process resident (weights, expert arena and VRAM tier load once) and
+`StrataEngine` keeps one `xestrata-engine --serve` process resident (weights, expert arena and VRAM tier load once) and
 talks to it over stdin/stdout; `MockEngine` is a scripted stand-in that makes every API path testable without a GPU.
 """
 from __future__ import annotations
@@ -74,6 +74,7 @@ from serve.frontend import (CALL_START, THINK_END, ChatTemplate, Event, GlmOutpu
 from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import places  # noqa: E402
+from serve import envvars  # noqa: E402
 from serve import search as search_api  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
@@ -119,14 +120,14 @@ def listen_problem(host: str, port: int, e: OSError) -> str:
     import errno
     code = getattr(e, "winerror", None) or e.errno
     if code in (errno.EADDRINUSE, 10048):
-        return (f"port {port} is already in use - is Strata (or another server) already running? "
+        return (f"port {port} is already in use - is XeStrata (or another server) already running? "
                 f"Close it, or start this one with a different --port")
     what = e.strerror or str(e)
     if code in (10013, errno.EACCES):
         hint = ("Windows may keep this port for itself (see `netsh int ipv4 show excludedportrange protocol=tcp`) "
                 "or a firewall rule forbids it: start this one with a different --port")
     elif code in (10049, errno.EADDRNOTAVAIL):
-        hint = f"{host} is not an address of this PC: check \"host\" in the model's strata-<model>.json or --host"
+        hint = f"{host} is not an address of this PC: check \"host\" in the model's xestrata-<model>.json or --host"
     else:
         hint = "check --host and --port"
     return f"cannot listen on {host}:{port}: {what} [{code}]. {hint}"
@@ -143,7 +144,7 @@ def combined_embeddings_path(vision_dir: Path, nbytes: int) -> Path:
     if os.name != "nt" and shm.is_dir() and os.access(shm, os.W_OK):
         try:
             if shutil.disk_usage(shm).free > 2 * nbytes + (16 << 20):
-                return shm / f"strata-vision-{os.getpid()}-{name}"
+                return shm / f"xestrata-vision-{os.getpid()}-{name}"
         except OSError:
             pass
     return Path(vision_dir) / name
@@ -246,7 +247,7 @@ def focused_recovery_prompt(tok, ids, generated):
 LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
-CTX_SLACK = 8               # `strata --serve` rejects prompt + max_new + 8 > context: keep the same margin here
+CTX_SLACK = 8               # `xestrata-engine --serve` rejects prompt + max_new + 8 > context: the same margin here
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
 RATE_WINDOW_S = 2.0
@@ -269,12 +270,13 @@ PP_SLACK = 3.0
 # fire and every later request queued behind it (the "lost step" class of #481).  Generous on purpose: a cold model
 # load, a slow disk or a slow CPU encode is not a hang.  Only a process that says nothing at all for this long is
 # ended; the next request starts it again.
-# STRATA_ENGINE_READY_S / STRATA_VISION_READY_S / STRATA_VISION_ENCODE_S override them (0 = wait for ever, as before).
+# XESTRATA_ENGINE_READY_S / XESTRATA_VISION_READY_S / XESTRATA_VISION_ENCODE_S override them (0 = wait for ever, as
+# before).
 
 
 def _timeout_env(name: str, default: float) -> float | None:
     try:
-        v = float(os.environ.get(name, default))
+        v = float(envvars.get(name) or default)
     except ValueError:
         v = default
     return None if v <= 0 else v
@@ -285,18 +287,18 @@ def _timeout_env(name: str, default: float) -> float | None:
 # no CPU time and moves no bytes of I/O in that time is not slow, it is idle or frozen (a deadlock in a CUDA call, a
 # driver stall, a lost step), and waiting longer cannot help: it is ended, and the next request starts it again.  An
 # engine that is silent but still working is never ended by this, only reported once (the recommendation:
-# engine_silence_s, or this variable). STRATA_ENGINE_STALL_S overrides it (0 = off).  Needs psutil (setup installs it);
-# without it nothing is ended.
-ENGINE_STALL_S = _timeout_env("STRATA_ENGINE_STALL_S", 90.0)
+# engine_silence_s, or this variable). XESTRATA_ENGINE_STALL_S overrides it (0 = off).  Needs psutil (setup installs
+# it); without it nothing is ended.
+ENGINE_STALL_S = _timeout_env("ENGINE_STALL_S", 90.0)
 # --batch: new requests take the control lines (one prompt read at a time) short prompts first: a prompt of at most
-# STRATA_ADMIT_SHORT_FIRST tokens goes before longer ones (opt-in; unset or 0: whoever gets the lock first), and a
-# longer one that waited STRATA_ADMIT_MAX_WAIT_S (default 30) counts as short.  A chat question then waits for the one
+# XESTRATA_ADMIT_SHORT_FIRST tokens goes before longer ones (opt-in; unset or 0: whoever gets the lock first), and a
+# longer one that waited XESTRATA_ADMIT_MAX_WAIT_S (default 30) counts as short.  A chat question then waits for the one
 # read in progress, not for every agent read that came before it.
 try:
-    ADMIT_SHORT_FIRST = max(0, int(os.environ.get("STRATA_ADMIT_SHORT_FIRST") or 0))
+    ADMIT_SHORT_FIRST = max(0, int(envvars.get("ADMIT_SHORT_FIRST") or 0))
 except ValueError:
     ADMIT_SHORT_FIRST = 0
-ADMIT_MAX_WAIT_S = _timeout_env("STRATA_ADMIT_MAX_WAIT_S", 30.0) or 0.0
+ADMIT_MAX_WAIT_S = _timeout_env("ADMIT_MAX_WAIT_S", 30.0) or 0.0
 STALL_CPU_EPS_S = 0.5       # CPU seconds the engine may use in the whole stall window and still count as frozen
 STALL_IO_EPS_B = 1 << 20    # bytes read or written in that window
 
@@ -306,9 +308,9 @@ def engine_frozen(base: tuple[float, int], now: tuple[float, int]) -> bool:
     return (now[0] - base[0]) <= STALL_CPU_EPS_S and (now[1] - base[1]) <= STALL_IO_EPS_B
 
 
-VISION_READY_S = _timeout_env("STRATA_VISION_READY_S", 600.0)   # a first GPU start compiles its kernels (JIT)
-VISION_ENCODE_S = _timeout_env("STRATA_VISION_ENCODE_S", 300.0)
-ENGINE_READY_S = _timeout_env("STRATA_ENGINE_READY_S", 900.0)
+VISION_READY_S = _timeout_env("VISION_READY_S", 600.0)   # a first GPU start compiles its kernels (JIT)
+VISION_ENCODE_S = _timeout_env("VISION_ENCODE_S", 300.0)
+ENGINE_READY_S = _timeout_env("ENGINE_READY_S", 900.0)
 
 
 # ------------------------------------------------------------------------------------------------ engines
@@ -366,11 +368,11 @@ REPLY_ID = re.compile(r"[A-Za-z0-9_-]{8,64}")
 
 
 class Reply:
-    """A streamed chat reply kept apart from its connection (strata_reply): its SSE lines as they were made, so that a
+    """A streamed chat reply kept apart from its connection (xestrata_reply): its SSE lines as they were made, so that a
     client whose connection broke (a browser that put the tab to sleep, a network that dropped for a moment) reads the
     rest again, and the answer, an image job's included, is not cancelled with the connection.  It is cancelled only
-    by its own cancel (POST /v1/strata/replies/<id>/cancel: the web app's Stop).  The client says when it has read it
-    (POST /v1/strata/replies/<id>/ack): `read_by_client`."""
+    by its own cancel (POST /v1/xestrata/replies/<id>/cancel: the web app's Stop).  The client says when it has read it
+    (POST /v1/xestrata/replies/<id>/ack): `read_by_client`."""
 
     def __init__(self, cancel: threading.Event):
         self.cancel = cancel
@@ -420,7 +422,7 @@ class Replies:
                 del self.items[ended.pop(0)[1]]
             old = self.items.get(rid)
             if old is not None and not old.done:
-                raise ValueError("strata_reply: a reply with this id is still running")
+                raise ValueError("xestrata_reply: a reply with this id is still running")
             r = self.items[rid] = Reply(cancel)
             return r
 
@@ -448,16 +450,28 @@ class Replies:
 REPLIES = Replies()
 
 
+def own_field(req: dict, name: str):
+    """A field of XeStrata's own in a request: xestrata_<name>, else its earlier name strata_<name>."""
+    v = req.get("xestrata_" + name)
+    return req.get("strata_" + name) if v is None else v   # its earlier name
+
+
+def own_path(path: str) -> str:
+    """XeStrata's own routes are /v1/xestrata/...; their earlier /v1/strata/... reaches the same."""
+    old = "/v1/strata/"                                 # their earlier name
+    return "/v1/xestrata/" + path[len(old):] if path.startswith(old) else path
+
+
 def reply_id(req: dict) -> str | None:
-    """A streamed request's strata_reply id (the web app's: {"id": ...}), or None."""
-    r = req.get("strata_reply")
+    """A streamed request's xestrata_reply id (the web app's: {"id": ...}), or None."""
+    r = own_field(req, "reply")
     if r is None:
         return None
     rid = r.get("id") if isinstance(r, dict) else None
     if not isinstance(rid, str) or not REPLY_ID.fullmatch(rid):
-        raise ValueError("strata_reply: {\"id\": 8 to 64 letters, digits, - or _}")
+        raise ValueError("xestrata_reply: {\"id\": 8 to 64 letters, digits, - or _}")
     if not req.get("stream"):
-        raise ValueError("strata_reply needs stream: true")
+        raise ValueError("xestrata_reply needs stream: true")
     return rid
 
 
@@ -593,7 +607,7 @@ def exit_text(rc: int | None) -> str:
 
 def start_failure_hint(log: str | None, offset: int) -> str:
     """#474 (upstream f2aaba1): what to change when the engine stopped at the start because the MTP draft head did not
-    fit the VRAM left: the engine's own `strata mtp:` lines after that failure (what it needs, what is free, the
+    fit the VRAM left: the engine's own `xestrata mtp:` lines after that failure (what it needs, what is free, the
     smaller subsets), else the same advice in words.  "" for any other failure: the log says why."""
     if not log:
         return ""
@@ -605,8 +619,8 @@ def start_failure_hint(log: str | None, offset: int) -> str:
         return ""
     if DRAFT_HEAD_FAIL not in text:
         return ""
-    said = [x.strip()[len("strata mtp: "):] for x in text.splitlines()
-            if x.strip().startswith("strata mtp: ") and ("draft head over" in x or "hint:" in x)]
+    said = [x.strip()[len("xestrata mtp: "):] for x in text.splitlines()
+            if x.strip().startswith("xestrata mtp: ") and ("draft head over" in x or "hint:" in x)]
     return ". mtp: " + DRAFT_HEAD_FAIL + ". " + (" ".join(said) if said else "Hint: " + DRAFT_HEAD_HINT)
 
 
@@ -721,9 +735,9 @@ def start_log_marks(log: str | None, offset: int) -> list:
 # A start that ends at once with the GPU runtime's own failure and none of the engine's lines: on ROCm, a start right
 # after the previous engine exited can fail inside the runtime's device/queue set-up while the old process's queues are
 # still being torn down ("terminate called after throwing an instance of 'rocr::AMD::hsa_exception'", or an exit with
-# nothing in the log).  Such a start is tried again after a short wait (STRATA_START_RETRIES, default 3; 0: never).
+# nothing in the log).  Such a start is tried again after a short wait (XESTRATA_START_RETRIES, default 3; 0: never).
 TRANSIENT_START_MARKS = ("hsa_exception", "HSA_STATUS_ERROR", "hsaKmt")
-START_RETRIES = max(0, int(os.environ.get("STRATA_START_RETRIES", "3") or 0))
+START_RETRIES = max(0, int(envvars.get("START_RETRIES", "3") or 0))
 
 
 def transient_start_failure(log: str | None, offset: int, elapsed_s: float, rc: int | None = None) -> bool:
@@ -739,7 +753,7 @@ def transient_start_failure(log: str | None, offset: int, elapsed_s: float, rc: 
     except (OSError, ValueError):
         return False
     lines = [x.strip() for x in text.splitlines() if x.strip()]
-    engine_lines = [x for x in lines if not x.startswith("[strata]")]
+    engine_lines = [x for x in lines if not x.startswith("[xestrata]")]
     if any(m in text for m in TRANSIENT_START_MARKS):
         return all(x.startswith("terminate called") or x.startswith("what()") or
                    any(m in x for m in TRANSIENT_START_MARKS) for x in engine_lines)
@@ -751,7 +765,7 @@ def transient_start_failure(log: str | None, offset: int, elapsed_s: float, rc: 
 
 
 def echo_requests(log_path: str, offset: int) -> None:
-    """STRATA_REQUEST_LINES=1: one stdout line per finished request, from the engine's own summary in its log.
+    """XESTRATA_REQUEST_LINES=1: one stdout line per finished request, from the engine's own summary in its log.
 
     The engine's stderr goes to the log file (the start narrator reads it), so a supervisor that only sees this
     process's output - a tray, llama-swap - has no per-request numbers. This re-states the engine's line with the
@@ -768,7 +782,7 @@ def echo_requests(log_path: str, offset: int) -> None:
             m = ENGINE_REQUEST.search(line)
             if m:
                 read_ms, gen_ms = float(m["read"]), float(m["gen_ms"])
-                print("[strata] request prompt %s cached %s output %s prompt_read %.0f ms total %.0f ms prefill %s "
+                print("[xestrata] request prompt %s cached %s output %s prompt_read %.0f ms total %.0f ms prefill %s "
                       "tok/s decode %s tok/s" % (m["prompt"], m["reused"], m["gen"], read_ms, read_ms + gen_ms, m["pp"],
                                                  m["tg"]), flush=True)
 
@@ -816,7 +830,7 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             last = time.time()
             print(text, flush=True)
 
-    say("weights", "[strata] starting the engine: reading the model's weights ...")
+    say("weights", "[xestrata] starting the engine: reading the model's weights ...")
     pos = offset
     while not done.wait(0.5):
         try:
@@ -830,29 +844,29 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             pos += cut
             for line in chunk[:cut].decode("utf-8", "replace").splitlines():
                 if "PLE on" in line or "expert arena:" in line or "experts via mmap" in line:   # #505: mapped
-                    say("arena", f"[strata] {loading}\n"
+                    say("arena", f"[xestrata] {loading}\n"
                         "         YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES NOW - this is normal.\n"
                         "         Please wait and don't close this window; the browser opens when it is ready.")
                 elif " loaded " in line and "GiB at" in line:
-                    say("loaded", "[strata] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
+                    say("loaded", "[xestrata] experts loaded: " + line.split(" loaded ", 1)[1].strip() +
                         f" ({time.time() - t0:.0f} s so far)")
                 elif "expert cache " in line and " slots, " in line and "auto" not in line:
                     n = line.split("expert cache ", 1)[1].split(";")[0].replace(" slots,", " experts,").strip()
-                    say("cache", f"[strata] filling the GPU's expert cache ({n}) ...")
+                    say("cache", f"[xestrata] filling the GPU's expert cache ({n}) ...")
                 elif "IGC's GEP simplification is off" in line:   # Intel's compiler 2.27 to 2.30 (AGENTS.md)
                     v = line.split("; IGC ", 1)[1].split(")", 1)[0] if "; IGC " in line else "?"
-                    say("igc", f"[strata] Intel's compiler IGC {v} has a bug XeStrata works around: the decode of "
+                    say("igc", f"[xestrata] Intel's compiler IGC {v} has a bug XeStrata works around: the decode of "
                         "short prompts is up to 10% slower.\n"
                         "         For full speed, use Fedora 44 (its IGC is 2.32 or later), or install with Podman "
                         "(Fedora 44 inside).")
                 elif "session is up" in line:
-                    say("up", "[strata] almost ready ...")
+                    say("up", "[xestrata] almost ready ...")
         if time.time() - last > heartbeat:
             last = time.time()
-            print(f"[strata] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
+            print(f"[xestrata] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
 
 
-_BTRACE = bool(os.environ.get("STRATA_BATCH_TRACE"))
+_BTRACE = bool(envvars.get("BATCH_TRACE"))
 
 
 def btrace(*a):
@@ -889,9 +903,10 @@ FATAL_PREFIXES = ("ERR verify: timed out at layer ", "ERR verify batch: timed ou
 
 
 class ConvCacheLog:
-    """upstream #596: the engine's conversation cache as its log tells it (the engine writes "strata serve: conversation
-    cache: parked N tokens ...; parked=P bytes=B evictions=E" and "restored N tokens ...; parked=P bytes=B" to stderr,
-    which is the log): read on from where it was last read, from the start of the engine's current run."""
+    """upstream #596: the engine's conversation cache as its log tells it (the engine writes "xestrata serve:
+    conversation cache: parked N tokens ...; parked=P bytes=B evictions=E" and "restored N tokens ...; parked=P
+    bytes=B" to stderr, which is the log): read on from where it was last read, from the start of the engine's current
+    run."""
     EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
                        r"(?: evictions=(\d+))?")
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
@@ -972,7 +987,7 @@ def conversation_cache_view(info: dict, hist: list, totals: dict, parked: dict) 
 
 
 class StrataEngine:
-    """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
+    """The resident engine: `xestrata-engine --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
 
     Per-request sampling rides the same line as engine-side keys between max_new and the ids
@@ -1042,13 +1057,13 @@ class StrataEngine:
             threading.Thread(target=narrate_start, args=(log, os.path.getsize(log), args, loading),
                              daemon=True).start()
             # once per log: the follower keeps reading the same (appended) log across restarts and reloads
-            if os.environ.get("STRATA_REQUEST_LINES") and os.path.abspath(log) not in _echoing:
+            if envvars.get("REQUEST_LINES") and os.path.abspath(log) not in _echoing:
                 _echoing.add(os.path.abspath(log))
                 threading.Thread(target=echo_requests, args=(log, os.path.getsize(log)), daemon=True).start()
         if log:                                          # #779: when an engine started (a crash report has the time)
             try:
                 assert not isinstance(self.log, int)
-                self.log.write(f"[strata] {time.strftime('%Y-%m-%d %H:%M:%S')} engine started: {exe} --serve "
+                self.log.write(f"[xestrata] {time.strftime('%Y-%m-%d %H:%M:%S')} engine started: {exe} --serve "
                                f"{' '.join(args)}\n")
                 self.log.flush()
             except OSError:
@@ -1061,7 +1076,7 @@ class StrataEngine:
             pin["pass_fds"] = tuple(fds)
         spawned_at = time.monotonic()
         try:
-            self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
+            self.proc = popen("the XeStrata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env,
                               **pin)
         except OSError:                                  # nothing started: the narrator stops, the log handle goes back
@@ -1088,9 +1103,9 @@ class StrataEngine:
                 now = self._activity() if work_window else None
                 if work_window and now is not None and (work_base is None or not engine_frozen(work_base, now)):
                     if work_base is None:
-                        print(f"[strata] the engine has not reported READY within {ENGINE_READY_S:.0f} s but is still "
-                              "loading (CPU or disk at work): waiting while it works (STRATA_ENGINE_READY_S, "
-                              "STRATA_ENGINE_STALL_S)", flush=True)
+                        print(f"[xestrata] the engine has not reported READY within {ENGINE_READY_S:.0f} s but is "
+                              "still loading (CPU or disk at work): waiting while it works (XESTRATA_ENGINE_READY_S, "
+                              "XESTRATA_ENGINE_STALL_S)", flush=True)
                     work_base, ready_deadline = now, time.monotonic() + work_window
                     continue
                 timed_out = True
@@ -1134,12 +1149,12 @@ class StrataEngine:
                 wait_s = 2.0 * (2 ** _attempt)              # 2, 4, 8 s: the previous process's GPU queues go away
                 exit_words = engine_exit_words(self.proc.returncode)
                 if start_log_marks(log, log_start):         # the runtime said so itself (hsa_exception ...)
-                    print(f"[strata] the engine stopped while the GPU runtime was starting (most often right after "
+                    print(f"[xestrata] the engine stopped while the GPU runtime was starting (most often right after "
                           f"another engine exited, whose GPU queues were still being released"
                           f"{'; ' + exit_words if exit_words else ''}): starting it again in {wait_s:.0f} s "
                           f"(try {_attempt + 2} of {START_RETRIES + 1})", flush=True)
                 else:                                       # an exit with nothing in the log: say only what is known
-                    print(f"[strata] the engine exited before it wrote anything to its log"
+                    print(f"[xestrata] the engine exited before it wrote anything to its log"
                           f"{' (' + exit_words + ')' if exit_words else ''}; it may be a GPU runtime that was not "
                           f"ready yet: starting it again in {wait_s:.0f} s (try {_attempt + 2} of {START_RETRIES + 1})",
                           flush=True)
@@ -1154,7 +1169,7 @@ class StrataEngine:
             note = "" if timed_out or start_err is not None else start_exit_note(self.proc.returncode)
             tail = start_log_tail(log, log_start)
             lines = [x for x in tail.split("\n")[2:] if x.strip()]
-            if tail and lines and all(x.strip().startswith("[strata]") for x in lines):
+            if tail and lines and all(x.strip().startswith("[xestrata]") for x in lines):
                 tail += "\n  (those are the launcher's own lines: the engine itself wrote nothing)"
             raise EngineDied(why + (f" (see {log})" if log else "") + note +
                              start_failure_hint(log, log_start) + tail)
@@ -1171,7 +1186,7 @@ class StrataEngine:
         asked = next((int(args[args.index(k) + 1]) for k in ("--batch", "--slots") if k in args[:-1]), 0)
         self.batch = int(self.info.get("batch_slots") or 0)
         if asked and self.batch != asked:
-            print(f"[strata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
+            print(f"[xestrata] parallel requests: {asked} asked, the engine runs {self.batch or 'one at a time'} "
                   "(its log says why)", flush=True)
         # the engine resolves the groups (a number, auto, or auto by default on a layer split) and says what it runs:
         # INFO batch_groups=G (upstream 1bf6344c, ca001df5); an engine without it runs what --batch-groups asked
@@ -1291,7 +1306,7 @@ class StrataEngine:
             tail = wide[-4096:]
         except (OSError, TypeError):
             pass
-        # #1705: STRATA_VERIFY_TRACE dumps are ~30 KB and push the watchdog's line out of a 4 KB tail
+        # #1705: XESTRATA_VERIFY_TRACE dumps are ~30 KB and push the watchdog's line out of a 4 KB tail
         for line in reversed(wide.splitlines()):
             if "issue #29" in line:
                 return ("The engine stopped itself because it had stopped making progress - a hang it caught (issue "
@@ -1302,7 +1317,7 @@ class StrataEngine:
         if rc is not None and rc >= 0 and self.last_err:  # its own last words on stdout: they say why
             return (f"The engine exited (code {rc}) after it reported: {self.last_err} - please report it at "
                     "github.com/MistVVK/XeStrata/issues with the log.")
-        last = next((x.strip() for x in reversed(tail.splitlines()) if x.strip().startswith(("strata", "ERR"))), "")
+        last = next((x.strip() for x in reversed(tail.splitlines()) if x.strip().startswith(("xestrata", "ERR"))), "")
         if rc is not None and rc < 0 and -rc != signal.SIGKILL:   # issue #12: a crash, not the OS ending it for RAM
             return (f"The engine crashed ({exit_text(rc)}). " + (f"It reported: {self.last_err}" if self.last_err
                     else f"Its last log line: {last}" if last else "It wrote nothing about it") +
@@ -1503,7 +1518,7 @@ class StrataEngine:
                         pass
                     if i == tries - 1:
                         raise
-                    print(f"[strata] the engine did not start (try {i + 1} of {tries}); again in "
+                    print(f"[xestrata] the engine did not start (try {i + 1} of {tries}); again in "
                           f"{self.RESTART_RETRY_S:g} s", flush=True)
                     time.sleep(self.RESTART_RETRY_S)
         finally:
@@ -1829,7 +1844,7 @@ class StrataEngine:
             else:
                 self._orphan_seen.pop(b, None)
         if freed:
-            print(f"[strata] parallel: slot(s) {', '.join(map(str, freed))} were marked busy with no request "
+            print(f"[xestrata] parallel: slot(s) {', '.join(map(str, freed))} were marked busy with no request "
                   "using them "
                   "(issue #1603); freed, the waiting request goes on", flush=True)
             self.slot_cv.notify_all()
@@ -1840,8 +1855,8 @@ class StrataEngine:
     def _take_control(self, cancel, plen: int, after_epoch: int | None = None, new: bool = False):
         """Waits for the control lines (one prompt read at a time), yielding None heartbeats; False when cancelled.
         `after_epoch`: a request whose read gave way lets the requests waiting then go first.
-        `new`: the request's first admission (STRATA_ADMIT_SHORT_FIRST orders only these)."""
-        entry = [plen, time.monotonic(), new]           # (length, arrival, ordered: STRATA_ADMIT_SHORT_FIRST)
+        `new`: the request's first admission (XESTRATA_ADMIT_SHORT_FIRST orders only these)."""
+        entry = [plen, time.monotonic(), new]           # (length, arrival, ordered: XESTRATA_ADMIT_SHORT_FIRST)
         with self.slot_cv:
             self.waiting += 1
             self.wait_lens.append(entry)
@@ -1889,9 +1904,9 @@ class StrataEngine:
         return True
 
     def _admit_next(self):
-        """STRATA_ADMIT_SHORT_FIRST=<tokens> (the caller holds slot_cv): the new request that takes the control lines
+        """XESTRATA_ADMIT_SHORT_FIRST=<tokens> (the caller holds slot_cv): the new request that takes the control lines
         next - one whose prompt is at most that long (it reads little) before a longer one, in arrival order within
-        each; a longer one that has waited STRATA_ADMIT_MAX_WAIT_S counts as short (it is never held back for good).
+        each; a longer one that has waited XESTRATA_ADMIT_MAX_WAIT_S counts as short (it is never held back for good).
         Off (unset or 0): whoever gets the lock first, as before.  Only the order changes, never what is read."""
         now = time.monotonic()
         ordered = [e for e in self.wait_lens if len(e) > 2 and e[2]]
@@ -1906,9 +1921,9 @@ class StrataEngine:
     def _may_go_solo(self, left: int, times: int, embeddings) -> bool:
         """A request decoding in a slot that is alone now (no other slot busy, nobody waiting) goes back to the solo
         path with its MTP drafts: the engine continues it from the slot's sessions (its slot cache; INFO
-        slot_cache=1).  STRATA_PARALLEL_SOLO=0 keeps it in the slot."""
+        slot_cache=1).  XESTRATA_PARALLEL_SOLO=0 keeps it in the slot."""
         if (embeddings or times >= self.SOLO_AGAIN_MAX or left < self.SOLO_AGAIN_MIN_LEFT or
-                not (self.info or {}).get("slot_cache") or os.environ.get("STRATA_PARALLEL_SOLO") == "0"):
+                not (self.info or {}).get("slot_cache") or envvars.get("PARALLEL_SOLO") == "0"):
             return False
         with self.slot_cv:
             return sum(1 for b in self.slot_busy if b) == 1 and self.waiting == 0
@@ -1928,7 +1943,7 @@ class StrataEngine:
                 self.lp_lines = LPLines()
             return None
         lines = LPLines(cancel)
-        cancel._strata_lp_lines = lines
+        cancel._xestrata_lp_lines = lines
         if make_current:
             self.lp_lines = lines
         return lines
@@ -2072,7 +2087,7 @@ class StrataEngine:
                                             admit_said = True
                                             busy = [b for b, v in enumerate(self.slot_busy) if v]
                                             waited = time.monotonic() - admit_since
-                                            print(f"[strata] parallel: a request has waited {waited:.0f} s "
+                                            print(f"[xestrata] parallel: a request has waited {waited:.0f} s "
                                                   f"for a free slot (busy: {busy}, in use: {sorted(self.slot_claims)}, "
                                                   f"ending: {sorted(self.slot_releasing)}) (issue #1603)", flush=True)
                                     self._reap_orphan_slots()
@@ -2135,7 +2150,7 @@ class StrataEngine:
                         if not (self._ctl_erred and str(e).startswith("BGEN:") and left >= 1 and not cancel.is_set()):
                             raise
                         refused += 1
-                        print(f"[strata] parallel: the engine refused slot {slot} ({e}); trying another slot "
+                        print(f"[xestrata] parallel: the engine refused slot {slot} ({e}); trying another slot "
                               f"({refused}/{self.BGEN_REFUSALS_MAX}) (issue #1994)", flush=True)
                         if refused > self.BGEN_REFUSALS_MAX:
                             raise GpuBusy("the engine's batch slots are not free right now; try again in a moment",
@@ -2512,12 +2527,12 @@ class StrataEngine:
             gpu_working = False
         if now is not None and not gpu_working and engine_frozen(state["base"], now):
             raise self._silent(f"the engine said nothing for {age:.0f} s and used no CPU or disk in that time (frozen; "
-                               "STRATA_ENGINE_STALL_S sets this, 0 = off)")
+                               "XESTRATA_ENGINE_STALL_S sets this, 0 = off)")
         if now is not None:   # working: look again after another window from here, and say so once
             state["base"], state["next"] = now, age + stall_s
             if not state.get("warned"):
                 state["warned"] = True
-                print(f"[strata] the engine has said nothing for {age:.0f} s but is still working; it is not ended "
+                print(f"[xestrata] the engine has said nothing for {age:.0f} s but is still working; it is not ended "
                       "(the limit is engine_silence_s). If it is stuck, \"engine_silence_s\" can be set lower.",
                       flush=True)
         else:
@@ -2662,7 +2677,7 @@ class StrataEngine:
             try:
                 self.proc.wait(timeout=20)
             except subprocess.TimeoutExpired:
-                raise EngineStuck("Strata is still releasing GPU/RAM; retry unloading after it exits") from None
+                raise EngineStuck("XeStrata is still releasing GPU/RAM; retry unloading after it exits") from None
         except OSError:
             pass
         finally:
@@ -2688,10 +2703,10 @@ IMAGE_URL_MAX = 32 << 20        # an image URL is read up to this (the web app a
 def private_url_host(url: str) -> str | None:
     """#28: the address an image URL's host resolves to when it is not a public one (loopback, link-local - the cloud
     metadata address -, private, reserved, multicast), else None.  A request's image URL must not make the server a
-    proxy into its own network; STRATA_IMAGE_URL_PRIVATE=1 allows it (pictures served from the LAN on purpose).  An
+    proxy into its own network; XESTRATA_IMAGE_URL_PRIVATE=1 allows it (pictures served from the LAN on purpose).  An
     address that changes between this check and the connection (DNS rebinding) is not caught."""
     import ipaddress
-    if (os.environ.get("STRATA_IMAGE_URL_PRIVATE") or "").strip() == "1":
+    if (envvars.get("IMAGE_URL_PRIVATE") or "").strip() == "1":
         return None
     parts = urlsplit(url)
     host = parts.hostname or ""
@@ -2714,7 +2729,7 @@ class _PublicRedirects(urllib.request.HTTPRedirectHandler):
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         if (addr := private_url_host(newurl)) is not None:
-            raise ValueError(f"the image URL redirects to a private address ({addr}); STRATA_IMAGE_URL_PRIVATE=1 "
+            raise ValueError(f"the image URL redirects to a private address ({addr}); XESTRATA_IMAGE_URL_PRIVATE=1 "
                              "allows it")
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -2743,7 +2758,7 @@ def vision_attempts(cfg: dict) -> list[dict]:
 
 
 class Vision:
-    """The resident image encoder: `strata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
+    """The resident image encoder: `xestrata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
     lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
     sends the same picture again (every turn, with most clients) encodes it once.
 
@@ -2759,7 +2774,7 @@ class Vision:
         resort (the encoder's own files are then named relative to it, see `_start`)."""
         for parent in (None, Path.cwd(), Path(os.environ.get("SystemDrive", "C:") + os.sep)):
             try:
-                d = Path(tempfile.mkdtemp(prefix="strata-vision-", dir=parent))
+                d = Path(tempfile.mkdtemp(prefix="xestrata-vision-", dir=parent))
             except OSError:
                 continue                                       # not writable, or no such drive
             if " " not in str(d):
@@ -2768,7 +2783,7 @@ class Vision:
                 d.rmdir()                                      # just created, so still empty
             except OSError:
                 pass
-        return Path(tempfile.mkdtemp(prefix="strata-vision-"))
+        return Path(tempfile.mkdtemp(prefix="xestrata-vision-"))
 
     def __init__(self, cfg: dict, log=None, env: dict | None = None, lazy: bool = False):
         args = self.reader_args(cfg)
@@ -2943,7 +2958,7 @@ class Vision:
     @staticmethod
     def download_public(url: str) -> bytes:
         """#28: a request's image URL, fetched by a running server (Service.public_urls): only from a public address,
-        redirects included, so the server is no proxy into its own network (STRATA_IMAGE_URL_PRIVATE=1 allows it)."""
+        redirects included, so the server is no proxy into its own network (XESTRATA_IMAGE_URL_PRIVATE=1 allows it)."""
         return Vision._fetch(url, True)
 
     @staticmethod
@@ -2952,9 +2967,9 @@ class Vision:
         opener = urllib.request.build_opener(_PublicRedirects) if public else urllib.request.build_opener()
         if public and (addr := private_url_host(url)) is not None:
             raise ValueError(f"the image URL points to a private address ({addr}): the server does not fetch from "
-                             "its own network for a request; STRATA_IMAGE_URL_PRIVATE=1 allows it")
+                             "its own network for a request; XESTRATA_IMAGE_URL_PRIVATE=1 allows it")
         try:
-            with opener.open(urllib.request.Request(url, headers={"User-Agent": "strata"}), timeout=60) as r:
+            with opener.open(urllib.request.Request(url, headers={"User-Agent": "xestrata"}), timeout=60) as r:
                 size = r.headers.get("Content-Length") or ""
                 if size.isdigit() and int(size) > IMAGE_URL_MAX:
                     raise ValueError(too_big)
@@ -2979,7 +2994,7 @@ class Vision:
 
     @staticmethod
     def normalize(data: bytes, keep_alpha: bool = False) -> bytes:
-        """The formats strata-vision's decoder (stb_image) reads pass through; anything else is converted to PNG (JPEG
+        """The formats xestrata-vision's decoder (stb_image) reads pass through; anything else is converted to PNG (JPEG
         XL by libjxl's djxl, the rest by Pillow).
         A JPEG with an EXIF Orientation other than 1 is turned upright first (needs Pillow).  `keep_alpha` (an image
         edit's reference: the image model reads the alpha): a transparent image stays RGBA, else it goes on white."""
@@ -3077,12 +3092,13 @@ class Vision:
     def warn_if_over_limit(self, tokens: int) -> None:
         """I7: one picture that became more than 4 times the limit is logged with the numbers, so the next report has
         them (the reader's own stderr has the warm-up line).  A reader built before the limit was enforced inside it
-        (strata-vision refuses these now) still lets them by."""
+        (xestrata-vision refuses these now) still lets them by."""
         limit = getattr(self, "max_tokens", 0)
         if limit and tokens > 4 * limit:
-            print(f"[strata] images: one picture became {tokens} image tokens, more than 4 times the limit of {limit} "
-                  "(vision.max_tokens); the picture reader is not applying its limit. Update the engine, and send the "
-                  "line 'strata-vision: warmed up at N image tokens' from the reader's log with the report", flush=True)
+            print(f"[xestrata] images: one picture became {tokens} image tokens, more than 4 times the limit of "
+                  f"{limit} (vision.max_tokens); the picture reader is not applying its limit. Update the engine, and "
+                  "send the line 'xestrata-vision: warmed up at N image tokens' from the reader's log with the report",
+                  flush=True)
 
     def _end(self):
         if self.proc.poll() is None:
@@ -3133,10 +3149,10 @@ def effort_end_args(cfg: dict, exe: str, tok) -> list[str] | None:
         known = False
     role = tok.encode("system", parse_special=True)
     if not known or len(role) != 1:
-        print("[strata] effort_position \"end\" needs an engine that knows --tail-role-token (build it again): the "
+        print("[xestrata] effort_position \"end\" needs an engine that knows --tail-role-token (build it again): the "
               "reasoning effort stays at the top of the prompt", flush=True)
         return None
-    print("[strata] effort_position end: a request's non-default reasoning effort goes right before the answer, so "
+    print("[xestrata] effort_position end: a request's non-default reasoning effort goes right before the answer, so "
           "changing it keeps the cached conversation", flush=True)
     return ["--tail-role-token", str(role[0])]
 
@@ -3226,13 +3242,13 @@ def engine_args(cfg: dict) -> list[str]:
         if cfg["vision"].get("gpu") and "--vram-reserve-mib" not in args:
             args += ["--vram-reserve-mib", "700"]
             note += " and --vram-reserve-mib 700"
-        print(f'[strata] the config has a "vision" section but no --vision in its args: {note} (run setup again with '
+        print(f'[xestrata] the config has a "vision" section but no --vision in its args: {note} (run setup again with '
               "--vision to write them)", flush=True)
     if len(gpu_list(cfg)) > 1 and "--layer-split" not in args:
         args += ["--layer-split", layer_split_value(cfg)]
-    # the Xe engine's layer split (setup --gpus): the later GPUs by PCI address; STRATA_LAYER_SPLIT=off (setup --gpu N
+    # the Xe engine's layer split (setup --gpus): the later GPUs by PCI address; XESTRATA_LAYER_SPLIT=off (setup --gpu N
     # for one start) runs on the first card alone
-    if cfg.get("split_pci") and "--layer-split" not in args and os.environ.get("STRATA_LAYER_SPLIT") != "off":
+    if cfg.get("split_pci") and "--layer-split" not in args and envvars.get("LAYER_SPLIT") != "off":
         args += ["--layer-split", layer_split_value(cfg), "--split-device", ",".join(cfg["split_pci"])]
         # "gpu_order": "as_given": the auto split keeps the cards in the config's order (upstream be8db787)
         if cfg.get("gpu_order") == "as_given" and "--split-order" not in args:
@@ -3277,17 +3293,17 @@ def parallel_args(cfg: dict, args: list[str]) -> list[str]:
     if n is None or n is False:
         return []
     if isinstance(n, bool) or not isinstance(n, int):
-        print(f'[strata] "parallel" must be a whole number of requests (2..{PARALLEL_MAX}), not {n!r}: ignored',
+        print(f'[xestrata] "parallel" must be a whole number of requests (2..{PARALLEL_MAX}), not {n!r}: ignored',
               flush=True)
         return []
     if n <= 1:
         return []
-    # --batch-mtp is on by default with --mtp (the engine's --no-batch-mtp / STRATA_BATCH_MTP=0 turn it off)
-    env = os.environ.get("STRATA_BATCH_MTP", "")
+    # --batch-mtp is on by default with --mtp (the engine's --no-batch-mtp / XESTRATA_BATCH_MTP=0 turn it off)
+    env = envvars.get("BATCH_MTP", "")
     batch_mtp = "--batch-mtp" in args or env not in ("", "0") or (
         "--mtp" in args and "--no-batch-mtp" not in args and env != "0")
     if n > PARALLEL_MAX and not batch_mtp:
-        print(f'[strata] "parallel": {n} - the engine runs at most {PARALLEL_MAX} requests together; it will use '
+        print(f'[xestrata] "parallel": {n} - the engine runs at most {PARALLEL_MAX} requests together; it will use '
               f"{PARALLEL_MAX}", flush=True)
     return ["--batch", str(n)]
 
@@ -3342,7 +3358,7 @@ def pool_cores_args(cfg: dict, args: list[str]) -> list[str]:
     else:
         text = ""
     if not _POOL_CORES_OK.match(text):
-        print(f'[strata] "pool_cores" must be logical processor numbers like "0,2,4,6" or "2-14:2", not {value!r}: '
+        print(f'[xestrata] "pool_cores" must be logical processor numbers like "0,2,4,6" or "2-14:2", not {value!r}: '
               "ignored (the CPU workers keep their default placement)", flush=True)
         return []
     return ["--pool-cores", text]
@@ -3402,9 +3418,9 @@ def child_env(cfg: dict) -> dict:
         env[str(k)] = str(v)
     args = cfg.get("args")
     if isinstance(args, list) and "--ram-reserve-mib" in args[:-1]:   # setup's --ram-reserve-gib: the image engine too
-        env["STRATA_RAM_RESERVE_MIB"] = str(args[args.index("--ram-reserve-mib") + 1])
+        envvars.put(env, "RAM_RESERVE_MIB", str(args[args.index("--ram-reserve-mib") + 1]))
     if cfg.get("gpu_pci"):                           # the Xe engine: the GPU setup chose, by PCI address
-        env.setdefault("STRATA_GPU_PCI", str(cfg["gpu_pci"]))   # a --gpu for this start (setup sets it) wins
+        envvars.put_default(env, "GPU_PCI", str(cfg["gpu_pci"]))   # a --gpu for this start (setup sets it) wins
     dirs = [d for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"   # Windows finds a program's DLLs on PATH
@@ -3427,7 +3443,7 @@ def image_helper_card(cfg: dict) -> str:
     later = [str(p).lower() for p in cfg.get("split_pci") or []]
     if not want or len(later) != 1 or want != later[0] or cfg.get("replicas") or cfg.get("split_serve"):
         return ""
-    if os.environ.get("STRATA_LAYER_SPLIT") == "off" or cfg.get("layer_split") not in (None, "", "auto"):
+    if envvars.get("LAYER_SPLIT") == "off" or cfg.get("layer_split") not in (None, "", "auto"):
         return ""
     return want
 
@@ -3460,7 +3476,7 @@ def image_env(cfg: dict, env: dict) -> tuple[dict, bool, str]:
     want = str((cfg.get("images") or {}).get("gpu_pci") or "").lower()
     if not want:
         return env, False, ""
-    text = {str(env.get("STRATA_GPU_PCI") or cfg.get("gpu_pci") or "").lower()}
+    text = {str(envvars.get("GPU_PCI", env=env) or cfg.get("gpu_pci") or "").lower()}
     text |= {str(p).lower() for p in cfg.get("split_pci") or []}
     reps = cfg.get("replicas")
     for r in reps if isinstance(reps, list) else []:
@@ -3479,7 +3495,7 @@ def image_env(cfg: dict, env: dict) -> tuple[dict, bool, str]:
            "no text card is named (the engine takes the first)" if not text else gpu_files_missing(want))
     if why:
         return env, False, f"image GPU: {want} is not used ({why}); the image jobs share the text model's card"
-    out = dict(env, STRATA_GPU_PCI=want)
+    out = dict(env, XESTRATA_GPU_PCI=want)
     if cfg.get("gpu") not in (None, ""):          # CUDA_VISIBLE_DEVICES of the text card alone would hide this one
         out.pop("CUDA_VISIBLE_DEVICES", None)
     if want == image_helper_card(cfg):
@@ -3520,7 +3536,7 @@ def gpu_roles(cfg: dict, gpu_pci: str | None, groups: list | None = None, split_
         add(split_serve.get("decode_gpu"), "text")
         add(split_serve.get("decode_gpu"), "decode")
     else:
-        later = [] if os.environ.get("STRATA_LAYER_SPLIT") == "off" else list(cfg.get("split_pci") or [])
+        later = [] if envvars.get("LAYER_SPLIT") == "off" else list(cfg.get("split_pci") or [])
         numbered = gpu_list(cfg)
         if len(numbered) > 1 or (numbered and not gpu_pci):
             # "gpu": the cards by nvidia-smi's numbers (the CUDA engine's layer split), their addresses from NVML
@@ -3776,9 +3792,9 @@ class Service:
         self.cors_origins: list[str] = []
         self.conv_log = ConvCacheLog()                  # #596: the parked conversations, from the engine's log
         # #321: origins that count as Strata's own page for /settings and MCP tools, e.g. the web app reached through a
-        # reverse proxy or tunnel whose Host differs ("https://strata.example.com"); never a wildcard
+        # reverse proxy or tunnel whose Host differs ("https://xestrata.example.com"); never a wildcard
         self.trusted_origins: list[str] = []
-        # DNS rebinding: extra Host names this server answers to (the config's allowed_hosts, $STRATA_ALLOWED_HOSTS;
+        # DNS rebinding: extra Host names this server answers to (the config's allowed_hosts, $XESTRATA_ALLOWED_HOSTS;
         # "*" = any), and every name it answers to, which serve() works out from the address it listens on
         self.allowed_hosts: list[str] = []
         self.host_names: set[str] = set(LOOPBACK_NAMES)
@@ -3831,11 +3847,11 @@ class Service:
         self.vision_held = False                         # an elastic encoder holds VRAM the expert cache gave it
         self.last_image_at = 0.0                         # when an image turn last ended (the elastic encoder's idle)
         self.reasoning_loop_recovery = False
-        # the loop guard (serve/loop_guard.py; STRATA_LOOP_GUARD=0 / "loop_guard": false: off) and what it did since
+        # the loop guard (serve/loop_guard.py; XESTRATA_LOOP_GUARD=0 / "loop_guard": false: off) and what it did since
         # the start (the JSON /metrics and its Prometheus form)
         self.loop_guard = True
         self.loop_guard_counts = {"detected": 0, "penalised": 0, "thinking_closed": 0, "stopped": 0}
-        # the script guard (serve/script_guard.py): the server's default ("script_guard" / STRATA_SCRIPT_GUARD; None:
+        # the script guard (serve/script_guard.py): the server's default ("script_guard" / XESTRATA_SCRIPT_GUARD; None:
         # off) and what it did since the start
         self.script_guard: dict | str | None = None
         self.script_guard_counts = {"requests": 0, "rewinds": 0, "passed": 0}
@@ -3981,7 +3997,7 @@ class Service:
         every reply unconstrained (checked after it, as before).  -> whether it was attached."""
         info = getattr(self.engine, "info", None) or {}
         if grammar is None or str(info.get("grammar")) != "1" or not self.tokenizer_dir or \
-                os.environ.get("STRATA_GRAMMAR") == "0":
+                envvars.get("GRAMMAR") == "0":
             return False
         req["strata_grammar"] = {**grammar, "vocab": self.tokenizer_dir, "prefix": ""}
         return True
@@ -4032,7 +4048,7 @@ class Service:
         if str((getattr(self.engine, "info", None) or {}).get("vram_elastic")) in ("0", "False") and self.loaded():
             # the engine cannot give VRAM back (a runtime that keeps an unmapped segment's VRAM: ROCm 7.x's HIP): the
             # encoder starts before the model from now on, as a non-elastic one does, the model loaded again once
-            print("[strata] images: the expert cache cannot give VRAM back on this GPU's runtime, so the image "
+            print("[xestrata] images: the expert cache cannot give VRAM back on this GPU's runtime, so the image "
                   "encoder starts before the model from now on (the model loads again once)", flush=True)
             v.elastic = False
             if getattr(self.engine, "kept_arena", None) is not None:
@@ -4045,10 +4061,10 @@ class Service:
             try:
                 out = self.engine.vram((self._engine_reserve() or 0) + v.elastic_mib)
                 self.vision_held = True
-                print(f"[strata] images: the expert cache keeps {v.elastic_mib} MiB free for the image encoder "
+                print(f"[xestrata] images: the expert cache keeps {v.elastic_mib} MiB free for the image encoder "
                       f"({out.get('expert_cache_mib')} of {out.get('expert_cache_full_mib')} MiB left)", flush=True)
             except ValueError as e:
-                print(f"[strata] images: the expert cache did not make room for the image encoder ({e}); starting "
+                print(f"[xestrata] images: the expert cache did not make room for the image encoder ({e}); starting "
                       "it anyway", flush=True)
         if self.vision_held:
             time.sleep(0.2)          # the driver's free-VRAM counter shows the cache's release a moment later
@@ -4059,7 +4075,7 @@ class Service:
             raise EngineDied(f"the image encoder failed to start: {e}") from e
         free1 = self.free_vram_mib()
         took = f", {free0 - free1} MiB of VRAM" if free0 is not None and free1 is not None else ""
-        print(f"[strata] images: the image encoder started in {time.time() - t0:.1f} s{took}", flush=True)
+        print(f"[xestrata] images: the image encoder started in {time.time() - t0:.1f} s{took}", flush=True)
 
     def _vision_idle_down(self, force: bool = False) -> str:
         """An elastic encoder idle for elastic_idle_s (or force) stops, and the expert cache takes its VRAM back:
@@ -4080,7 +4096,7 @@ class Service:
                 back = (f"; the expert cache took its VRAM back ({out.get('expert_cache_mib')} of "
                         f"{out.get('expert_cache_full_mib')} MiB)")
             # also when the cache never made room (a layer split, an engine without --vram-elastic): the stop happened
-            print(f"[strata] images: the image encoder stopped after {v.elastic_idle_s:g} s without a picture{back}",
+            print(f"[xestrata] images: the image encoder stopped after {v.elastic_idle_s:g} s without a picture{back}",
                   flush=True)
             self.vision_held = False
             return "down"
@@ -4091,7 +4107,7 @@ class Service:
         v = self.vision
         if not getattr(v, "elastic", False):
             return
-        print(f"[strata] images: the image encoder starts with the first picture and stops after "
+        print(f"[xestrata] images: the image encoder starts with the first picture and stops after "
               f"{v.elastic_idle_s:g} s without one; while it runs the expert cache keeps {v.elastic_mib} MiB free "
               "for it", flush=True)
 
@@ -4101,7 +4117,7 @@ class Service:
                 try:
                     self._vision_idle_down()
                 except Exception as e:                 # tried again at the next turn; the thread keeps running
-                    print(f"[strata] images: stopping the idle image encoder: {e}", flush=True)
+                    print(f"[xestrata] images: stopping the idle image encoder: {e}", flush=True)
         threading.Thread(target=loop, daemon=True).start()
 
     def free_vram_mib(self) -> int | None:
@@ -4123,7 +4139,7 @@ class Service:
         hook_failed = None
         if self.before_load:
             cmd = self.before_load
-            print(f"[strata] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
+            print(f"[xestrata] before loading: {cmd if isinstance(cmd, str) else ' '.join(map(str, cmd))}", flush=True)
             why = None
             try:
                 r = subprocess.run(cmd, shell=isinstance(cmd, str), timeout=self.before_load_timeout_s,
@@ -4140,18 +4156,18 @@ class Service:
                 # does not refuse: the card's free VRAM decides (min_free_vram_mib, checked just below); "strict" always
                 # refuses, "ignore" always loads.
                 if self.before_load_strict and not self.before_load_ignore_failure:
-                    print(f"[strata] the before_load command failed ({why}); the model stays unloaded and this "
+                    print(f"[xestrata] the before_load command failed ({why}); the model stays unloaded and this "
                           "request is answered 503 - try again (before_load_strict)", flush=True)
                     raise GpuBusy(f"the before_load command failed ({why}): the GPU was not given back, so the "
                                   "model was not loaded; try again in a moment", retry_after=15)
                 hook_failed = why
                 if self.before_load_ignore_failure or not self.min_free_vram_mib:
-                    print(f"[strata] the before_load command failed ({why}); loading anyway"
+                    print(f"[xestrata] the before_load command failed ({why}); loading anyway"
                           + ("" if self.before_load_ignore_failure else
                              " (set min_free_vram_mib to have the free VRAM checked, or before_load_strict to refuse)"),
                           flush=True)
                 else:
-                    print(f"[strata] the before_load command failed ({why}); checking the free VRAM", flush=True)
+                    print(f"[xestrata] the before_load command failed ({why}); checking the free VRAM", flush=True)
         if self.min_free_vram_mib and not (hook_failed and self.before_load_ignore_failure):
             free = self.free_vram_mib()
             deadline = time.time() + self.vram_free_wait_s   # memory another process just gave back can take a moment
@@ -4160,18 +4176,18 @@ class Service:
                 free = self.free_vram_mib()
             if free is not None and free < self.min_free_vram_mib:
                 if hook_failed and not self.before_load_ignore_failure:
-                    print(f"[strata] the before_load command failed ({hook_failed}) and only {free} MiB of VRAM is "
+                    print(f"[xestrata] the before_load command failed ({hook_failed}) and only {free} MiB of VRAM is "
                           f"free (the model needs {self.min_free_vram_mib}): not loading; 503", flush=True)
                 raise GpuBusy(f"the GPU is in use by another program: {free} MiB of VRAM free, the model needs "
                               f"{self.min_free_vram_mib} (min_free_vram_mib) - it stays unloaded until that is free"
                               + (f"; the before_load command failed ({hook_failed})" if hook_failed else ""),
                               retry_after=15)
             if hook_failed and not self.before_load_ignore_failure:
-                print(f"[strata] the before_load command failed ({hook_failed}), but {free} MiB of VRAM is free: "
+                print(f"[xestrata] the before_load command failed ({hook_failed}), but {free} MiB of VRAM is free: "
                       "loading", flush=True)
         vision_started = False
         if self._vision_down():                         # first, as at a start: a GPU encoder takes its VRAM before
-            print("[strata] starting the vision encoder ...", flush=True)   # the engine sizes its cache
+            print("[xestrata] starting the vision encoder ...", flush=True)   # the engine sizes its cache
             try:
                 self.vision.restart()
             except Exception as e:
@@ -4180,10 +4196,10 @@ class Service:
         if self.loaded():
             return
         if getattr(self.engine, "unloaded", False):
-            print("[strata] loading the model again (it was unloaded) ...", flush=True)
+            print("[xestrata] loading the model again (it was unloaded) ...", flush=True)
         else:
             code = self.engine.exit_code() if hasattr(self.engine, "exit_code") else None
-            print(f"[strata] the engine had stopped ({exit_text(code)}); starting it again "
+            print(f"[xestrata] the engine had stopped ({exit_text(code)}); starting it again "
                   "(a minute or two) ...", flush=True)
         # what the web app's chat says while a request waits for it (/metrics live.loading): after an image job
         # (restore_after_load) the model comes back with the conversation it had
@@ -4201,7 +4217,7 @@ class Service:
                 if isinstance(e, OSError):
                     raise EngineDied(f"the engine could not be started: {e}") from e
                 raise
-            print("[strata] the engine is running again", flush=True)
+            print("[xestrata] the engine is running again", flush=True)
             if self.restore_after_load:                  # an image job unloaded it: its conversation comes back
                 images_api.restore_session(self)
         finally:
@@ -4211,7 +4227,7 @@ class Service:
             try:
                 self.engine.vram(self.vram_reserve)
             except (ValueError, EngineDied) as e:
-                print(f"[strata] the VRAM reserve ({self.vram_reserve} MiB) was not applied: {e}", flush=True)
+                print(f"[xestrata] the VRAM reserve ({self.vram_reserve} MiB) was not applied: {e}", flush=True)
 
     vram_wait_s = 300.0                                  # #533: how long POST /v1/vram waits for a running request
 
@@ -4239,8 +4255,8 @@ class Service:
             held = self.vision.elastic_mib if self.vision_held and self.vision is not None else None
             out = self.engine.vram((reserve_mib or 0) + held if held is not None else reserve_mib)
             self.vram_reserve, self.vram_reserve_asked = reserve_mib, True
-            print(f"[strata] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} of "
-                  f"{out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
+            print(f"[xestrata] VRAM: {out.get('vram_free_mib')} MiB free, expert cache {out.get('expert_cache_mib')} "
+                  f"of {out.get('expert_cache_full_mib')} MiB ({out.get('expert_slots')} experts)", flush=True)
             return {"status": "ok", **out}
         finally:
             if ctl is not None:
@@ -4253,7 +4269,7 @@ class Service:
         note = self.engine.death_note() if hasattr(self.engine, "death_note") else ""
         log = getattr(self.engine, "log_path", None)
         self.engine_failure = {"at": int(time.time()), "message": f"{e}. {note}".strip(), "log": log}
-        print(f"[strata] {e}. {note} The next request starts the engine again."
+        print(f"[xestrata] {e}. {note} The next request starts the engine again."
               f"{' Its log: ' + log if log else ''}", flush=True)
 
     def load(self):
@@ -4326,7 +4342,7 @@ class Service:
             if self.vision is not None and hasattr(self.vision, "unload"):
                 self.vision.unload()
             self.vision_held = False
-            print(f"[strata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
+            print(f"[xestrata] model unloaded{f' after {idle_for:.0f} s idle' if idle_for else ''}; "
                   "the next request loads it again", flush=True)
             return "unloaded"
         finally:
@@ -4335,7 +4351,7 @@ class Service:
     def start_idle_unload(self):
         if not self.idle_unload_s or not hasattr(self.engine, "unload"):
             return
-        print(f"[strata] the model unloads after {self.idle_unload_s} s without requests", flush=True)
+        print(f"[xestrata] the model unloads after {self.idle_unload_s} s without requests", flush=True)
 
         def loop():
             while True:
@@ -4343,7 +4359,7 @@ class Service:
                 try:
                     self.unload(idle_for=self.idle_unload_s)
                 except EngineStuck as e:                # tried again at the next turn; the thread keeps running
-                    print(f"[strata] idle unload: {e}", flush=True)
+                    print(f"[xestrata] idle unload: {e}", flush=True)
         threading.Thread(target=loop, daemon=True).start()
 
     def set_shared(self, defaults) -> dict:
@@ -4356,7 +4372,7 @@ class Service:
                 else:
                     Path(self.shared_path).unlink(missing_ok=True)
             except OSError as e:
-                print(f"[strata] could not save the shared settings: {e}", flush=True)
+                print(f"[xestrata] could not save the shared settings: {e}", flush=True)
         return self.shared
 
     def effort_default(self) -> str | None:
@@ -4790,7 +4806,7 @@ class Service:
                         # a file error's sentence without its path: the note goes into the model's prompt
                         why = (e.strerror or type(e).__name__) if isinstance(e, OSError) else str(e)
                 if why is not None:
-                    print(f"[strata] a picture a tool returned was left out of the prompt: {why}", flush=True)
+                    print(f"[xestrata] a picture a tool returned was left out of the prompt: {why}", flush=True)
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
         return fetched
 
@@ -4965,7 +4981,7 @@ class Service:
                                  f"({ctx}); requests are never truncated. Send a smaller "
                                  f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
                                  "model's xestrata-<model>.json to shorten it to the room left (#545)")
-            print(f"[strata] max_tokens {max_new} shortened to {max(1, room)}: the prompt ({len(ids)} tokens) "
+            print(f"[xestrata] max_tokens {max_new} shortened to {max(1, room)}: the prompt ({len(ids)} tokens) "
                   f"leaves that much of the context ({ctx}); \"fit_max_tokens\": false answers 400 instead", flush=True)
             max_new = max(1, room)          # a shorter completion beats a 400 (the default; upstream f31b6efd6)
         if images:
@@ -5004,7 +5020,7 @@ class Service:
             if not isinstance(v, int) or isinstance(v, bool) or v < (0 if k == "message" else 1):
                 raise ValueError(f"strata_prefix.{k}: a whole number ({'0' if k == 'message' else '1'} or more)")
         if has_images:
-            print("[strata] strata_prefix ignored: the request has images", flush=True)
+            print("[xestrata] strata_prefix ignored: the request has images", flush=True)
             return {}
         what = ",".join(f"{k}={v}" for k, v in spec.items())
 
@@ -5038,7 +5054,7 @@ class Service:
         elif "messages" in spec:
             k = spec["messages"]
             if k >= len(messages):
-                print(f"[strata] strata_prefix.messages={k} ignored: the request has {len(messages)} message(s) and "
+                print(f"[xestrata] strata_prefix.messages={k} ignored: the request has {len(messages)} message(s) and "
                       "the prefix must leave at least the last one", flush=True)
                 return {}
             head = head_ids(messages[:k])
@@ -5047,13 +5063,13 @@ class Service:
             i, chars = spec["message"], spec["chars"]
             text = messages[i].get("content") if 0 <= i < len(messages) else None
             if not isinstance(text, str) or chars > len(text):
-                print(f"[strata] strata_prefix ignored: message {i} has no text of {chars} characters", flush=True)
+                print(f"[xestrata] strata_prefix ignored: message {i} has no text of {chars} characters", flush=True)
                 return {}
             cut = messages[:i] + [{**messages[i], "content": text[:chars] + self.PREFIX_END}]
             head = head_ids(cut)
             n = lcp(head, ids)
         if n < 1 or n >= len(ids) - 1:
-            print(f"[strata] strata_prefix {what} ignored: it leaves no usable prefix of the {len(ids)}-token prompt "
+            print(f"[xestrata] strata_prefix {what} ignored: it leaves no usable prefix of the {len(ids)}-token prompt "
                   f"(common start {n})", flush=True)
             return {}
         return {"tokens": n}
@@ -5107,13 +5123,13 @@ class Service:
         if s.get("first_token") is None:
             pr = getattr(self.engine, "progress", None)   # (position reached, prompt tokens): a reused prefix counts
             done = f"{pr[0]:,} of {pr[1]:,}" if pr and pr[1] else f"{s.get('prompt_tokens', 0):,}"   # as read (#29)
-            print(f"[strata] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
+            print(f"[xestrata] reading the prompt: {done} tokens, {el:.0f} s so far", flush=True)
         else:
             rate = s["generated"] / max(RATE_MIN_SPAN_S, now - s["first_token"])
             # #984: while a thinking budget applies, the thinking line shows it, not the request's max_tokens
             limit = (f"budget {s['thinking_budget']} (max {s.get('max_tokens')})"
                      if s["phase"] == "thinking" and s.get("thinking_budget") else f"max {s.get('max_tokens')}")
-            print(f"[strata] {s['phase']}: {s['generated']} of {limit} tokens, {rate:.1f} tok/s, "
+            print(f"[xestrata] {s['phase']}: {s['generated']} of {limit} tokens, {rate:.1f} tok/s, "
                   f"{el:.0f} s", flush=True)
         return now
 
@@ -5133,7 +5149,7 @@ class Service:
         if info.get("logit_bias") != 1 or getattr(self.engine, "batch", 0):
             if not self.script_guard_unsupported:
                 self.script_guard_unsupported = True
-                print("[strata] script guard: not applied - this engine takes no logit_bias (an older engine, or "
+                print("[xestrata] script guard: not applied - this engine takes no logit_bias (an older engine, or "
                       "\"parallel\" batch slots)", flush=True)
             return None
         with self.status_lock:
@@ -5144,7 +5160,7 @@ class Service:
             try:
                 table = voc.table(places.user_dir("state") / "script-tables")
             except OSError as e:
-                print(f"[strata] script guard: cannot write its table ({e}); the server applies it", flush=True)
+                print(f"[xestrata] script guard: cannot write its table ({e}); the server applies it", flush=True)
         return script_guard.Guard(voc, ids, want["allow_context"], table)
 
     def _guard_pieces(self):
@@ -5153,7 +5169,7 @@ class Service:
 
     def _loop_noted(self, act, written: int):
         """A loop the guard broke: a line in the server window, and the Monitor's count."""
-        print(f"[strata] loop guard: {act.describe()}"
+        print(f"[xestrata] loop guard: {act.describe()}"
               f"{' (now ' + format(written, ',') + ' tokens)' if act.kind != loop_guard.STOP else ''}", flush=True)
         with self.status_lock:
             c = self.loop_guard_counts
@@ -5204,14 +5220,14 @@ class Service:
             # left as it was.
             budget = max_new - min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
             if max_new <= 32768:
-                print(f"[strata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
+                print(f"[xestrata] thinking limited to {budget} of max_tokens {max_new} so the answer has room "
                       "(\"answer_room\": false in the config turns this off)", flush=True)
         if budget and max_new and max_new > 0:
             # #984: a budget at or near max_tokens never fires before the reply is cut off while still thinking, so
             # it has no answer.  Close the thinking early enough to leave room for one.
             reserve = min(max(ANSWER_RESERVE_MIN, max_new // 4), max_new // 2)
             if budget > max_new - reserve:
-                print(f"[strata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
+                print(f"[xestrata] thinking capped at {max_new - reserve} of max_tokens {max_new} to leave room for "
                       f"the answer (budget {budget})", flush=True)
                 budget = max(1, max_new - reserve)
         reader = GlmOutputParser if getattr(self.template, "call_form", "qwen") == "glm" else OutputParser
@@ -5266,7 +5282,7 @@ class Service:
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
-        raw_ids: list = []                              # every generated id (STRATA_DEBUG: dump raw model text)
+        raw_ids: list = []                              # every generated id (XESTRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
         if emb and img_keys:
@@ -5377,7 +5393,7 @@ class Service:
                             else (sampling, left)
                         if guard is not None and guard.events:
                             # after a loop the rest of the reply routes the experts exactly: the engine's
-                            # STRATA_ROUTE_PRIOR bias towards the experts in VRAM can hold a loop
+                            # XESTRATA_ROUTE_PRIOR bias towards the experts in VRAM can hold a loop
                             smp_call = {**(smp_call or {}), "strata_route_prior": False}
                         if sg is not None:
                             # (the thinking may have been closed by the server: a budget's wrap-up, the loop guard)
@@ -5442,7 +5458,7 @@ class Service:
                                             n -= drop
                                             detok = Detokenizer(self.tok)
                                             break
-                                        print(f"[strata] script guard: let {piece!r} through at {n} tokens (after "
+                                        print(f"[xestrata] script guard: let {piece!r} through at {n} tokens (after "
                                               f"{sg.rewinds} rewinds, or part of it was sent)", flush=True)
                                     sg.follow(was_pending, piece, detok.pending(), len(raw_ids) - 1)
                                 tail = (tail + piece)[-2:]
@@ -5502,7 +5518,7 @@ class Service:
                             raise
                         except ValueError as e:             # the engine's ERR line (it may have ended after it)
                             finish = "error"
-                            print(f"[strata] the engine reported an error: {e}", flush=True)
+                            print(f"[xestrata] the engine reported an error: {e}", flush=True)
                             raise
                         except GeneratorExit:               # the client went away: an engine that never acknowledges
                             leaving = True                  # the STOP below is ended, but no error replaces this
@@ -5533,13 +5549,13 @@ class Service:
                                 nf_retried = True
                                 # the retry reads from token 0: its DONE, not this one's, says what was reused
                                 del segments[segments_before:]
-                                print("[strata] the engine's logits became non-finite before the first token "
+                                print("[xestrata] the engine's logits became non-finite before the first token "
                                       "(upstream Strata #879); it dropped its cached state: sending the request again "
                                       "once", flush=True)
                                 continue
                             finish = "error"
                             if n == 0:
-                                print("[strata] the engine's logits became non-finite again on the retry (upstream "
+                                print("[xestrata] the engine's logits became non-finite again on the retry (upstream "
                                       "Strata #879): the request ends with an error", flush=True)
                                 raise EngineNonFinite("the model's output became non-finite (NaN) twice in a row "
                                                       "(upstream Strata #879); the engine has dropped its cached "
@@ -5547,7 +5563,7 @@ class Service:
                             # an error, as vLLM and llama.cpp end a reply their engine broke off: a stream gets its
                             # error event after the text it already has, a whole answer is not sent; a "length"
                             # finish would read as a reply cut at max_tokens
-                            print(f"[strata] the engine's logits became non-finite after {n} tokens (upstream Strata "
+                            print(f"[xestrata] the engine's logits became non-finite after {n} tokens (upstream Strata "
                                   "#879): the request ends with an error; the engine dropped its cached state, so the "
                                   "next request reads its prompt from the start", flush=True)
                             raise EngineNonFinite(f"the model's output became non-finite (NaN) after {n} tokens "
@@ -5617,7 +5633,7 @@ class Service:
                             if trace is not None:
                                 trace["reasoning_recoveries"] = recovery_count
                                 trace["reasoning_repeat_coverage"] = round(repeat_coverage, 3)
-                            print(f"[strata] repeated reasoning detected at {n} tokens "
+                            print(f"[xestrata] repeated reasoning detected at {n} tokens "
                                   f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
                                   "instruction (reasoning_loop_recovery)", flush=True)
                             continue
@@ -5631,7 +5647,7 @@ class Service:
                             close_retried = True
                             extra = self.tok.encode(REASONING_CLOSE, parse_special=True)
                             if max_new - n - len(extra) >= 1:
-                                print("[strata] the reply ended inside its thinking with no answer: closing the "
+                                print("[xestrata] the reply ended inside its thinking with no answer: closing the "
                                       "thinking once and continuing (reasoning_close_retry)", flush=True)
                                 for t in extra:
                                     n += 1
@@ -5661,7 +5677,7 @@ class Service:
                         if max_new - n - len(extra) < 1:
                             break                       # no room left to answer: "length", as without a budget
                         if wrap:
-                            print(f"[strata] thinking budget reached ({thought} tokens): wrapping up the thinking",
+                            print(f"[xestrata] thinking budget reached ({thought} tokens): wrapping up the thinking",
                                   flush=True)
                         for t in extra:
                             n += 1
@@ -5682,11 +5698,11 @@ class Service:
                         for ev in cut([Event("content", LOOP_STOP_NOTE)]):
                             yield "event", ev
                     elif looped:
-                        print(f"[strata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
+                        print(f"[xestrata] the thinking repeated the same passages (coverage={repeat_coverage:.3f}) at "
                               f"{n} tokens: ended as \"length\" (reasoning_loop_recovery: \"stop\" in "
-                              "strata-<model>.json; remove it to turn this off)", flush=True)
+                              "xestrata-<model>.json; remove it to turn this off)", flush=True)
                     elif repeated:
-                        print(f"[strata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
+                        print(f"[xestrata] the reply repeated one token ({self.tok.decode([run_tok])!r}) "
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
                               "xestrata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
                               "same, restart the server and report it (#606)", flush=True)
@@ -5753,14 +5769,14 @@ class Service:
                             if hit_msg and pcie_share:
                                 hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
                             rate_txt = f"{tok_s:.1f} tok/s" if tok_s is not None else "no speed"
-                            print(f"[strata] done: {n} tokens in {el:.0f} s ({rate_txt}) "
+                            print(f"[xestrata] done: {n} tokens in {el:.0f} s ({rate_txt}) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
                             if finish == "length" and parser.state in ("reasoning", "rcall"):   # #530
-                                print("[strata] the reply reached max tokens while still thinking, so it has no "
+                                print("[xestrata] the reply reached max tokens while still thinking, so it has no "
                                       "answer: a thinking budget (reasoning_budget_tokens, in the request or in "
                                       "xestrata-<model>.json for every request) leaves room to answer", flush=True)
-                            if os.environ.get("STRATA_DEBUG") and raw_ids:
-                                print(f"[strata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
+                            if envvars.get("DEBUG") and raw_ids:
+                                print(f"[xestrata] raw: {self.tok.decode(raw_ids)!r}", flush=True)
                         st["busy"] = False
                         st.pop("tail", None)                     # #212: the answer's end is not kept once it is done
                         st.pop("tool", None)
@@ -5783,26 +5799,27 @@ class Service:
             yield "event", ev
         if parser.rescued or parser.refused:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
-            print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
-                  f"reasoning (quoted, or the turn did not end on a stop)", flush=True)
+            print(f"[xestrata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept "
+                  f"as reasoning (quoted, or the turn did not end on a stop)", flush=True)
         stray = getattr(parser, "stray_think", 0)
         if stray:
             # #4077: the model wrote a closing think tag while thinking; the reasoning after it was sent as the answer
             with self.status_lock:
                 self.totals["stray_think_closers"] = self.totals.get("stray_think_closers", 0) + stray
-            print(f"[strata] {stray} extra closing think tag(s) in the answer were dropped (the model "
+            print(f"[xestrata] {stray} extra closing think tag(s) in the answer were dropped (the model "
                   "wrote one while thinking, so the rest of its reasoning went out as the answer; a call after it "
                   "still counts)", flush=True)
         notes = list(getattr(parser, "notes", None) or [])
         if notes:
             with self.status_lock:
                 self.totals["tool_args_repaired"] = self.totals.get("tool_args_repaired", 0) + len(notes)
-            print(f"[strata] {len(notes)} tool call argument(s) repaired: {'; '.join(sorted(set(notes)))}", flush=True)
+            print(f"[xestrata] {len(notes)} tool call argument(s) repaired: {'; '.join(sorted(set(notes)))}",
+                  flush=True)
         unread = getattr(parser, "unread", 0)          # the Harmony reader keeps no such count
         rejected = []
         if unread:
             named = getattr(parser, "unread_names", None)
-            print(f"[strata] {unread} <tool_call> block(s) in the answer did not read as a call of a declared "
+            print(f"[xestrata] {unread} <tool_call> block(s) in the answer did not read as a call of a declared "
                   "tool and went back as text (a name the request did not declare, or a form the template does "
                   "not use)" + (f"; the names the model wrote: {', '.join(named)}" if named else "")
                   + "; the response carries them as strata_rejected_tool_calls, /metrics counts them", flush=True)
@@ -5914,15 +5931,15 @@ def request_stats(segments: list[dict]) -> dict:
 
 
 def _debug_req(api, req, messages, tools, max_new, thinking, prompt_tokens):
-    """One compact line per request while diagnosing blank/empty turns. Set STRATA_DEBUG=1 to enable."""
-    if not os.environ.get("STRATA_DEBUG"):
+    """One compact line per request while diagnosing blank/empty turns. Set XESTRATA_DEBUG=1 to enable."""
+    if not envvars.get("DEBUG"):
         return
     last = messages[-1] if messages else {}
     body = last.get("content")
     if isinstance(body, list):
         body = " ".join(p.get("text", "") for p in body if isinstance(p, dict))
     preview = (str(body or "")[:80]).replace("\n", " ")
-    print(f"[strata] req {api}: msgs={len(messages)} tools={len(tools or [])} "
+    print(f"[xestrata] req {api}: msgs={len(messages)} tools={len(tools or [])} "
           f"max_tokens_raw={req.get('max_tokens')!r}/{req.get('max_completion_tokens')!r} "
           f"max_new={max_new} thinking={thinking} stream={bool(req.get('stream'))} "
           f"prompt_tokens={prompt_tokens} last={last.get('role')!r}:{preview!r}", flush=True)
@@ -6032,7 +6049,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
             if "r" not in box:
                 break
             r = box["r"]
-            print(f"[strata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
+            print(f"[xestrata] tool {c.name}: {'ok' if r['ok'] else 'error'}, {r['chars']:,} characters in "
                   f"{r['ms'] / 1000:.1f} s{' (truncated for the model)' if r['truncated'] else ''}", flush=True)
             dbg = getattr(svc.request_trace, "debug", None)
             if dbg is not None:
@@ -6142,7 +6159,7 @@ def _pdf_python(data: bytes, label: str, vision: bool) -> tuple[list, list]:
     except ImportError:                  # pypdf alone: the text alone
         if vision and not getattr(read_file, "said", False):
             read_file.said = True        # type: ignore[attr-defined]
-            print("[strata] a PDF's pages are read as text only: drawing them as pictures needs poppler's pdftoppm "
+            print("[xestrata] a PDF's pages are read as text only: drawing them as pictures needs poppler's pdftoppm "
                   "(Linux: poppler-utils) or the Python package pypdfium2", flush=True)
         vision = False
     if vision:
@@ -6313,7 +6330,7 @@ class LogprobEntries:
     def take(self, eng) -> list:
         # the request's own lines (on its cancel Event), else the engine's when they carry its Event; a later generate
         # pass of the same request (an MCP round) makes new ones, and the old ones are read to the end first
-        own = getattr(self.owner, "_strata_lp_lines", None)
+        own = getattr(self.owner, "_xestrata_lp_lines", None)
         cur, old = (own if own is not None else getattr(eng, "lp_lines", None)), None
         if cur is not self.lines and getattr(cur, "owner", None) is self.owner:
             old, self.lines = self.lines, cur
@@ -7007,10 +7024,10 @@ CHUNKED_BODY_MAX = 256 << 20                # #893: the most a Transfer-Encoding
 
 def body_limit() -> int:
     """The most a request body may hold, in bytes (read into memory): 256 MiB, which is a million-token conversation
-    with room to spare; STRATA_MAX_BODY_MIB changes it (0 or an unreadable value: the default).  A larger one is
+    with room to spare; XESTRATA_MAX_BODY_MIB changes it (0 or an unreadable value: the default).  A larger one is
     answered 413 before it is read (a Content-Length of 10 TB used to be read until the client gave up)."""
     try:
-        mib = int(os.environ.get("STRATA_MAX_BODY_MIB", "0"))
+        mib = int(envvars.get("MAX_BODY_MIB", "0"))
     except ValueError:
         mib = 0
     return mib << 20 if mib > 0 else CHUNKED_BODY_MAX
@@ -7149,7 +7166,7 @@ def make_handler(svc: Service):
             if length > limit:
                 self.close_connection = True               # the body is not read: the connection ends with the answer
                 raise BadBody(413, f"the request body is larger than {limit >> 20} MiB "
-                                   "(STRATA_MAX_BODY_MIB raises the limit)")
+                                   "(XESTRATA_MAX_BODY_MIB raises the limit)")
             return self.rfile.read(length)
 
         def _drain_body(self):
@@ -7194,34 +7211,36 @@ def make_handler(svc: Service):
             host = self.headers.get("Host")
             if svc.api_key or host_allowed(host, svc.host_names, "*" in svc.allowed_hosts):
                 return True
-            print(f"[strata] refused a request for Host {host!r} from {self.client_address[0]}: not a name this server "
-                  f"answers to (add it to \"allowed_hosts\" in the config or STRATA_ALLOWED_HOSTS, or set an API key)",
+            print(f"[xestrata] refused a request for Host {host!r} from {self.client_address[0]}: not a name this "
+                  f"server answers to (add it to \"allowed_hosts\" in the config or XESTRATA_ALLOWED_HOSTS, or set "
+                  "an API key)",
                   flush=True)
             self._json(403, {"error": {"type": "forbidden", "message":
-                             f"Host {host!r} is not allowed (DNS rebinding protection). Reaching Strata under this "
-                             f"name on purpose? Add it to \"allowed_hosts\" in the config (strata-<model>.json) or to "
-                             f"the STRATA_ALLOWED_HOSTS environment variable, or set an API key (\"api_key\"), which "
-                             f"turns this check off"}})
+                             f"Host {host!r} is not allowed (DNS rebinding protection). Reaching XeStrata under this "
+                             f"name on purpose? Add it to \"allowed_hosts\" in the config (xestrata-<model>.json) or "
+                             f"to the XESTRATA_ALLOWED_HOSTS environment variable, or set an API key (\"api_key\"), "
+                             f"which turns this check off"}})
             return False
 
         def _foreign_page(self) -> bool:
             """Without an API key, a /v1 POST from a browser page of another site (any site can POST text/plain
             there without a CORS preflight) would burn GPU time: an Origin header must name an allowed page, and
-            then the body must be JSON (the Video tab's upload: a form with X-Strata-Upload).  No Origin (curl, the
+            then the body must be JSON (the Video tab's upload: a form with X-XeStrata-Upload).  No Origin (curl, the
             SDKs, other servers): any content type, as before."""
             origin = self.headers.get("Origin")
             if svc.api_key or not origin:
                 return False
             if not origin_allowed(origin, self.headers.get("Host"), svc.host_names,
                                   [*svc.trusted_origins, *svc.cors_origins]):
-                print(f"[strata] refused an API request from the web page {origin!r} (no API key; add its host to "
+                print(f"[xestrata] refused an API request from the web page {origin!r} (no API key; add its host to "
                       f"\"allowed_hosts\" or its origin to \"cors_origins\" in the config)", flush=True)
                 msg = (f"web pages of {origin} may not use this server without an API key; set \"api_key\", "
                        f"or add the page's host to \"allowed_hosts\" (or its origin to \"cors_origins\") in the config")
                 self._json(403, {"error": {"type": "forbidden", "message": msg}})
                 return True
             ctype = self.headers.get("Content-Type", "")
-            if ctype.startswith("multipart/form-data") and self.headers.get("X-Strata-Upload") \
+            own = self.headers.get("X-XeStrata-Upload") or self.headers.get("X-Strata-Upload")   # its earlier name
+            if ctype.startswith("multipart/form-data") and own \
                     and self.path.split("?")[0].rstrip("/") in ("/v1/videos", "/v1/videos/sync", "/v1/videos/files",
                                                                 "/v1/videos/segmentations"):
                 return False   # the Video tab's upload: a header of its own, which a page elsewhere cannot send
@@ -7263,7 +7282,7 @@ def make_handler(svc: Service):
                         cancel.set()
                         return
 
-            threading.Thread(target=watch, daemon=True, name="strata-client-watch").start()
+            threading.Thread(target=watch, daemon=True, name="xestrata-client-watch").start()
 
         def _note(self, **values):
             """#332: what the monitor shows about this request (nothing when the monitor is off)."""
@@ -7348,7 +7367,7 @@ def make_handler(svc: Service):
             return False
 
         def do_GET(self):
-            path = self.path.split("?")[0].rstrip("/")
+            path = own_path(self.path.split("?")[0].rstrip("/"))
             if path.startswith("/v1/images/loras/fetch/"):   # a Hugging Face fetch of the Images view, as it goes
                 if not self._authorized():
                     return
@@ -7358,10 +7377,10 @@ def make_handler(svc: Service):
                     return
                 self._json(200, f.view())
                 return
-            if path.startswith("/v1/strata/replies/"):      # a kept reply again, from its line `from`
+            if path.startswith("/v1/xestrata/replies/"):      # a kept reply again, from its line `from`
                 if not self._authorized():
                     return
-                reply = REPLIES.get(path[len("/v1/strata/replies/"):])
+                reply = REPLIES.get(path[len("/v1/xestrata/replies/"):])
                 if reply is None:
                     self._json(404, {"error": {"message": "no such reply (it ended long ago, or never began)"}})
                     return
@@ -7520,7 +7539,7 @@ def make_handler(svc: Service):
                                                             Path(svc.images.default.dir) / "video-jobs")
                                  if svc.images is not None else None,
                                  "thinking": getattr(svc.template, "thinking", None),
-                                 # a streamed chat reply can be kept past its connection (strata_reply)
+                                 # a streamed chat reply can be kept past its connection (xestrata_reply)
                                  "kept_replies": True,
                                  "debug_chat_log": svc.debug_log is not None,
                                  "loaded": svc.loaded(), "service": "strata"})
@@ -7650,7 +7669,7 @@ def make_handler(svc: Service):
         def _post(self):
             if not self._authorized():
                 return
-            path = self.path.split("?")[0].rstrip("/")   # issue #55: Claude Code posts /v1/messages?beta=true
+            path = own_path(self.path.split("?")[0].rstrip("/"))   # issue #55: Claude Code posts /v1/messages?beta=true
             if path == "/v1/images/loras" or path.startswith("/v1/images/loras/"):   # the Images view's adapters:
                 self._loras_post(path)                   # its own page checks (an upload is not JSON)
                 return
@@ -7681,7 +7700,7 @@ def make_handler(svc: Service):
             # the same for the slot files: else any site could overwrite a saved conversation or replace the live one
             if path.startswith("/slots/") and not self._own_page("conversations can be saved or restored"):
                 return
-            if path == "/v1/strata/debug/chat":              # the web page's chat, for the debug chat log
+            if path == "/v1/xestrata/debug/chat":              # the web page's chat, for the debug chat log
                 if svc.debug_log is None:
                     self._json(404, {"error": {"message": "the debug chat log is off"}})
                     return
@@ -7694,20 +7713,20 @@ def make_handler(svc: Service):
                     return
                 self._json(200, {"saved": True})
                 return
-            if path.startswith("/v1/strata/replies/") and path.endswith("/cancel"):   # the web app's Stop
+            if path.startswith("/v1/xestrata/replies/") and path.endswith("/cancel"):   # the web app's Stop
                 if not self._control_body():
                     return
-                reply = REPLIES.get(path[len("/v1/strata/replies/"):-len("/cancel")])
+                reply = REPLIES.get(path[len("/v1/xestrata/replies/"):-len("/cancel")])
                 if reply is None:
                     self._json(404, {"error": {"message": "no such reply"}})
                     return
                 reply.cancel.set()
                 self._json(200, {"cancelled": not reply.done})
                 return
-            if path.startswith("/v1/strata/replies/") and path.endswith("/ack"):      # the web app has read it
+            if path.startswith("/v1/xestrata/replies/") and path.endswith("/ack"):      # the web app has read it
                 if not self._control_body():
                     return
-                if not REPLIES.ack(path[len("/v1/strata/replies/"):-len("/ack")]):
+                if not REPLIES.ack(path[len("/v1/xestrata/replies/"):-len("/ack")]):
                     self._json(404, {"error": {"message": "no such reply"}})
                     return
                 self._json(200, {"released": True})
@@ -7833,11 +7852,11 @@ def make_handler(svc: Service):
                     self._json(404, {"error": {"message": f"Invalid URL (POST {path})",
                                                "type": "invalid_request_error"}})
             except EngineNonFinite as e:                    # #879, twice: not the request's fault
-                print(f"[strata] 503: {e}", flush=True)
+                print(f"[xestrata] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
                            else {"error": {"type": "server_error", "message": str(e)}})
             except ValueError as e:
-                print(f"[strata] 400 invalid request: {e}", flush=True)
+                print(f"[xestrata] 400 invalid request: {e}", flush=True)
                 if path == "/v1/responses":
                     self._json(400, responses_error_body(str(e)))
                 else:
@@ -7863,7 +7882,7 @@ def make_handler(svc: Service):
                 if getattr(self, "answer_started", False):
                     raise
                 import traceback
-                print(f"[strata] 400 malformed request ({type(e).__name__}: {e}):\n" + traceback.format_exc(),
+                print(f"[xestrata] 400 malformed request ({type(e).__name__}: {e}):\n" + traceback.format_exc(),
                       flush=True)
                 body = {"error": {"type": "invalid_request_error",
                                   "message": f"the request is malformed ({type(e).__name__}: {e})"}}
@@ -7883,7 +7902,7 @@ def make_handler(svc: Service):
                     self._note(outcome="disconnected")
                     raise                                    # the server's own handling
                 import traceback
-                print(f"[strata] 500: a file error ({type(e).__name__}: {e}):\n" + traceback.format_exc(), flush=True)
+                print(f"[xestrata] 500: a file error ({type(e).__name__}: {e}):\n" + traceback.format_exc(), flush=True)
                 self._json(500, {"error": {"type": "server_error", "message": "the server could not read or write a "
                                            f"file of its own: {e.strerror or type(e).__name__}"}})
             finally:
@@ -7998,7 +8017,7 @@ def make_handler(svc: Service):
                 except (images_api.AuxPending, images_api.ImageJobFailed) as e:
                     self._aux_failed(e)
                     return
-                print(f"[strata] image: region {str(region)[:40]!r}: {len(found['instances'])} instance(s) by "
+                print(f"[xestrata] image: region {str(region)[:40]!r}: {len(found['instances'])} instance(s) by "
                       f"{found['model']}", flush=True)
             for key, tool in (("fix", "fix_image"), ("upscale", "upscale_image"), ("extend", "extend_image")):
                 if req.get(key) is not None:
@@ -8088,7 +8107,7 @@ def make_handler(svc: Service):
                             regions_api.SEG_ALIASES.get(model, regions_api.SAM3) != regions_api.SAM3:
                         raise videos_api.VideoRequestError(f"model: sam3.1, not {model!r}")
                     svc.last_request_at = time.time()
-                    print(f"[strata] video segmentation: {[w['prompt'] for w in job['segment']['words']]!r} "
+                    print(f"[xestrata] video segmentation: {[w['prompt'] for w in job['segment']['words']]!r} "
                           f"{len(job['segment']['clicks'])} clicks, {info['frames']} frames", flush=True)
                     if not sync:
                         rec = jobs.create(vid, model, job, src["path"])
@@ -8323,11 +8342,11 @@ def make_handler(svc: Service):
             self._watch_client(cancel)
             try:
                 if path == "/v1/images/segmentations":
-                    print(f"[strata] segmentation: {str(fields.get('prompt') or '')[:60]!r}", flush=True)
+                    print(f"[xestrata] segmentation: {str(fields.get('prompt') or '')[:60]!r}", flush=True)
                     self._json(200, regions_api.segmentation_response(svc, gen, fields, picture, cancel))
                 elif path == "/v1/images/remove-background":
                     req = regions_api.remove_background_request(fields)
-                    print(f"[strata] remove background: BiRefNet {req['version']}", flush=True)
+                    print(f"[xestrata] remove background: BiRefNet {req['version']}", flush=True)
                     addr = cast(Any, self.server.server_address)
                     host = self.headers.get("Host") or f"{addr[0]}:{addr[1]}"
                     scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
@@ -8367,7 +8386,7 @@ def make_handler(svc: Service):
             addr = cast(Any, self.server.server_address)
             host = self.headers.get("Host") or f"{addr[0]}:{addr[1]}"
             scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
-            print(f"[strata] control image: {str(fields.get('type') or '')[:20]!r}", flush=True)
+            print(f"[xestrata] control image: {str(fields.get('type') or '')[:20]!r}", flush=True)
             try:
                 self._json(200, controls_api.preview_response(svc, gen, req, f"{scheme}://{host}", cancel))
             except (images_api.AuxPending, images_api.ImageJobFailed) as e:
@@ -8388,8 +8407,8 @@ def make_handler(svc: Service):
                 if req.get("accept") is not True:
                     raise ValueError('send {"accept": true} to agree to the license')
                 image_aux.accept(name, root, "the web page")
-                print(f"[strata] image tools: the {name} license agreed to on the web page", flush=True)
-            got = image_aux.license_text(name, root, lambda m: print(f"[strata] {m}", flush=True))
+                print(f"[xestrata] image tools: the {name} license agreed to on the web page", flush=True)
+            got = image_aux.license_text(name, root, lambda m: print(f"[xestrata] {m}", flush=True))
             self._json(200, {**{k: v for k, v in got.items() if k != "path"},
                              "accepted": not image_aux.needs_consent(name, root)})
 
@@ -8399,12 +8418,12 @@ def make_handler(svc: Service):
             svc.last_request_at = time.time()
             cancel = threading.Event()
             self._watch_client(cancel)
-            print(f"[strata] image: {job['width']}x{job['height']}, n={job['n']}, {job['steps']} steps, "
+            print(f"[xestrata] image: {job['width']}x{job['height']}, n={job['n']}, {job['steps']} steps, "
                   f"seed {job['seed']}" + (f", {len(job['refs'])} reference image(s)" if job.get("refs") else "")
                   + ("".join(f", adapter {u['name']} at {u['scale']:g}" for u in job.get("loras") or ())),
                   flush=True)
             if job.get("lora_unknown"):
-                print(f"[strata] image: no such LoRA {', '.join(job['lora_unknown'])} in this model's folder: "
+                print(f"[xestrata] image: no such LoRA {', '.join(job['lora_unknown'])} in this model's folder: "
                       "left out of the prompt", flush=True)
             if stream:
                 return self._image_stream(gen, job, cancel, edit)
@@ -8413,7 +8432,7 @@ def make_handler(svc: Service):
             try:
                 images, figures, policy = images_api.make_images(svc, gen, job, cancel)
                 figures["gpu_policy"] = policy
-                print(f"[strata] image done in {figures['seconds']:.1f} s ({policy})", flush=True)
+                print(f"[xestrata] image done in {figures['seconds']:.1f} s ({policy})", flush=True)
                 body = gen.response(images, job, figures, f"{scheme}://{host}")   # cjxl may fail (jxl)
             except images_api.LoraRejected as e:   # an adapter the request names, which the engine does not take
                 self._json(400, {"error": {"type": "invalid_request_error", "code": "lora_rejected", "param": "lora",
@@ -8439,7 +8458,7 @@ def make_handler(svc: Service):
         def _image_stream(self, gen, job, cancel, edit):
             """OpenAI's streamed images: image_generation.partial_image events (image_edit.* for an edit) as the
             engine makes the job's partial_images, then one .completed event an image (b64_json, with the usage on
-            each; and as the JSON body has, its seed and the "strata" figures), as SSE.  A failure after the stream
+            each; and as the JSON body has, its seed and the "xestrata" figures), as SSE.  A failure after the stream
             started is an error event."""
             kind = "image_edit" if edit else "image_generation"
             fmt, opaque = job["output_format"], job["background"] == "opaque"
@@ -8459,7 +8478,7 @@ def make_handler(svc: Service):
                     images, figures, policy = images_api.make_images(svc, gen, job, cancel,
                                                                      preview if job.get("partial_images") else None)
                     figures["gpu_policy"] = policy
-                    print(f"[strata] image done in {figures['seconds']:.1f} s ({policy}, stream)", flush=True)
+                    print(f"[xestrata] image done in {figures['seconds']:.1f} s ({policy}, stream)", flush=True)
                     result["images"], result["figures"] = images, figures
                 except Exception as e:  # noqa: BLE001 - said in the stream: its status is sent already
                     result["error"] = e
@@ -8504,7 +8523,7 @@ def make_handler(svc: Service):
                                                "created_at": int(time.time()), **common(),
                                                **({"lora": applied} if applied else {}),
                                                "usage": images_api.usage(job), "model": gen.model,
-                                               "seed": job["seed"] + i, "strata": result["figures"]})
+                                               "seed": job["seed"] + i, "xestrata": result["figures"]})
             except OSError:
                 self._note(outcome="disconnected")
                 cancel.set()
@@ -8536,7 +8555,7 @@ def make_handler(svc: Service):
                 props["model_path"] = svc.engine.model_path
             version = getattr(svc.engine, "info", {}).get("version")
             if version:
-                props["build_info"] = "Strata " + str(version)
+                props["build_info"] = "XeStrata " + str(version)
             self._json(200, props)
 
         def _control_body(self) -> bool:
@@ -8581,7 +8600,7 @@ def make_handler(svc: Service):
                 self._json(415, {"error": {"message": "send application/json"}})
                 return False
             if self._foreign_origin():
-                self._json(403, {"error": {"message": f"{what} only from Strata's own page (or an origin in the "
+                self._json(403, {"error": {"message": f"{what} only from XeStrata's own page (or an origin in the "
                                                       f"config's trusted_origins)"}})
                 return False
             return True
@@ -8598,7 +8617,7 @@ def make_handler(svc: Service):
                     self._json(415, {"error": {"message": "send the file as application/octet-stream"}})
                     return
                 if self._foreign_origin():
-                    self._json(403, {"error": {"message": "LoRA files are added only from Strata's own page"}})
+                    self._json(403, {"error": {"message": "LoRA files are added only from XeStrata's own page"}})
                     return
                 name = parse_qs(urlsplit(self.path).query).get("name", [""])[0]
                 try:
@@ -8633,7 +8652,7 @@ def make_handler(svc: Service):
                 except (lora_api.LoraError, OSError) as e:
                     self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                     return
-                print(f"[strata] LoRA added: {added['path']} ({', '.join(added['models'])})", flush=True)
+                print(f"[xestrata] LoRA added: {added['path']} ({', '.join(added['models'])})", flush=True)
                 self._json(200, {"added": added})
                 return
             if not self._own_page("LoRA files can be added or removed"):
@@ -8647,12 +8666,12 @@ def make_handler(svc: Service):
             try:
                 if path == "/v1/images/loras/remove":
                     gone = lora_api.remove(folders, req.get("path"))
-                    print(f"[strata] LoRA removed: {gone['removed']}", flush=True)
+                    print(f"[xestrata] LoRA removed: {gone['removed']}", flush=True)
                     self._json(200, gone)
                 elif path == "/v1/images/loras/fetch":
                     lora_api.staging(folders)                    # a model that takes one, before the download
                     f = lora_api.FETCHES.start(folders, req.get("url"))
-                    print(f"[strata] LoRA fetch: {f.url}", flush=True)
+                    print(f"[xestrata] LoRA fetch: {f.url}", flush=True)
                     self._json(202, f.view())
                 else:
                     self._json(404, {"error": {"message": f"Invalid URL (POST {path})"}})
@@ -8715,7 +8734,7 @@ def make_handler(svc: Service):
             if changed:
                 where = (f"{svc.settings_path} (every model)" if scope == "global" else
                          f"{Path(svc.config_path).name} (the earlier file: {bak.name})")
-                print(f"[strata] the Settings view changed {', '.join(changed)} in {where}; used from the next start",
+                print(f"[xestrata] the Settings view changed {', '.join(changed)} in {where}; used from the next start",
                       flush=True)
             self._json(200, {**runconfig.view(new, svc.config_path, settings, svc.settings_path), "changed": changed})
 
@@ -8759,8 +8778,8 @@ def make_handler(svc: Service):
             except ValueError as e:
                 self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
                 return
-            print("[strata] other apps now use the Chat settings: " + ", ".join(f"{k}={v}" for k, v in shared.items())
-                  if shared else "[strata] other apps use their own settings again", flush=True)
+            print("[xestrata] other apps now use the Chat settings: " + ", ".join(f"{k}={v}" for k, v in shared.items())
+                  if shared else "[xestrata] other apps use their own settings again", flush=True)
             self._json(200, {"shared": bool(shared), "defaults": shared})
 
         def _sse(self):
@@ -8893,12 +8912,12 @@ def make_handler(svc: Service):
             # opt-in: the image tools (true, or {"model": name}); {"force": true} (the web page's image button): the
             # reply opens a call of one of them, as the Responses route's tool_choice image_generation does, and they
             # are the request's only tools
-            want = req.get("strata_images")
+            want = own_field(req, "images")
             image_force = isinstance(want, dict) and want.get("force") is True
             image_force_names: list = []
             if image_force and (svc.images is None or force or tool_choice_of(req.get("tool_choice"))[0] == "none"):
-                raise ValueError("strata_images.force: " + ("this server makes no images" if svc.images is None else
-                                                            "it is a tool_choice of its own; send none beside it"))
+                raise ValueError("xestrata_images.force: " + ("this server makes no images" if svc.images is None else
+                                                              "it is a tool_choice of its own; send none beside it"))
             if (want is True or isinstance(want, dict)) and svc.images is not None:
                 # what the user marked in the web page's preview: the mask over an image an edit takes, the boxes of
                 # MOSS-Image's layout (images_api.user_marks)
@@ -8914,7 +8933,7 @@ def make_handler(svc: Service):
                 more = image_tools.template_tools(exclude=own | {t["name"] for t in extra})
                 if image_force:
                     if not more:
-                        raise ValueError("strata_images.force: the image tools are not available for this request")
+                        raise ValueError("xestrata_images.force: the image tools are not available for this request")
                     # the request's own tools stay declared (the page's memory tools: a call of them after the image
                     # is the page's to run, not text in the answer); the forced call is of an image tool, its name
                     # kept to them by a grammar where the engine takes one (call_names_grammar, the first round)
@@ -9020,7 +9039,7 @@ def make_handler(svc: Service):
                     finally:
                         svc.drop_embeddings()            # when the reply ended before run() took them
                         reply.finish()
-                threading.Thread(target=make, daemon=True, name="strata-reply").start()
+                threading.Thread(target=make, daemon=True, name="xestrata-reply").start()
                 self._sse()
                 self._stream_reply(reply, 0)
                 return
@@ -9068,7 +9087,7 @@ def make_handler(svc: Service):
 
         def _stream_reply(self, reply: Reply, start: int) -> None:
             """Write a kept reply's lines from `start` as they come, a keep-alive while none does, until it ends.  A
-            connection that breaks only ends this read: the reply goes on (GET /v1/strata/replies/<id> reads it
+            connection that breaks only ends this read: the reply goes on (GET /v1/xestrata/replies/<id> reads it
             again)."""
             at = start
             try:
@@ -9343,7 +9362,7 @@ def make_handler(svc: Service):
                 raise ResponsesError(str(e).replace("response_format", "text.format"), "text.format") from None
             noted = svc.__dict__.setdefault("hosted_tools_noted", set())   # said once per tool, not per request
             if set(skipped) - noted:
-                print(f"[strata] /v1/responses: left out the hosted tools {', '.join(sorted(set(skipped) - noted))} "
+                print(f"[xestrata] /v1/responses: left out the hosted tools {', '.join(sorted(set(skipped) - noted))} "
                       f"(this server cannot run them)", flush=True)
                 noted.update(skipped)
             if req.get("max_output_tokens") is None and "max_tokens" in svc.shared:   # the shared Chat settings
@@ -9531,7 +9550,7 @@ def make_handler(svc: Service):
             """An error no other handler expects, raised after a stream's headers went out (a bug): its traceback to
             the log, and the sentence its error event carries - a stream that only stopped read as an empty answer."""
             import traceback
-            print(f"[strata] error in a stream ({type(e).__name__}: {e}):\n" + traceback.format_exc(), flush=True)
+            print(f"[xestrata] error in a stream ({type(e).__name__}: {e}):\n" + traceback.format_exc(), flush=True)
             return f"internal error ({type(e).__name__}: {e}); the server's log has the details"
 
     return Handler
@@ -9544,8 +9563,8 @@ class Server(ThreadingHTTPServer):
     allow_reuse_address = os.name != "nt"
     # socketserver listens with a backlog of 5: a burst of 30-40 clients at once got "connection reset by peer" on the
     # first ones (measured on 4 x R9700, also with one request at a time); the requests wait in the server, not the
-    # kernel (STRATA_HTTP_BACKLOG overrides it)
-    request_queue_size = max(5, int(os.environ.get("STRATA_HTTP_BACKLOG") or 256))
+    # kernel (XESTRATA_HTTP_BACKLOG overrides it)
+    request_queue_size = max(5, int(envvars.get("HTTP_BACKLOG") or 256))
 
     def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True):
         if ":" in server_address[0]:                    # an IPv6 address (`::`): an IPv6 socket (upstream eba3106c0)
@@ -9598,8 +9617,8 @@ def desktop_vram_note(amd: bool, vram_free_mib, args: list, desktop: bool) -> st
         reserve = 700
     if reserve >= DESKTOP_RESERVE_MIB:
         return ""
-    return (f"[strata] note: {vram_free_mib} MiB of VRAM free with the model loaded. If this AMD card also drives your "
-            "desktop and the desktop or apps crash after the start (the driver moves the expert cache to RAM and "
+    return (f"[xestrata] note: {vram_free_mib} MiB of VRAM free with the model loaded. If this AMD card also drives "
+            "your desktop and the desktop or apps crash after the start (the driver moves the expert cache to RAM and "
             "the OOM killer ends the session), keep more VRAM free: setup with --vram-reserve-mib "
             f"{DESKTOP_RESERVE_MIB} (remembered; the expert cache gets "
             f"{(DESKTOP_RESERVE_MIB - reserve) / 1024:.1f} GB less, a few % of speed)")
@@ -9622,7 +9641,7 @@ def warn_tight_ram(arena_mib, experts_ram=None) -> None:
     if left < 6:
         what = ("the RAM copy of the experts the GPU does not hold takes" if experts_ram == "resident"
                 else "the model's experts take")
-        print(f"[strata] WARNING: RAM is tight - {what} {arena_mib / 1024:.1f} GB of this PC's "
+        print(f"[xestrata] WARNING: RAM is tight - {what} {arena_mib / 1024:.1f} GB of this PC's "
               f"{total / 2**30:.0f} GB, leaving {left:.1f} GB for everything else. "
               + "Linux may stop the engine in the middle of an answer. "
               + f"Close other programs, or run {SETUP_CMD} --setup and pick a smaller size (Q2_0 / IQ2_XS).",
@@ -9649,7 +9668,7 @@ def warn_budget_over_ram(args) -> str | None:
            f"{free:.0f} GiB free of {total:.0f} GiB: what does not fit goes to swap or is read from disk, which can "
            "make decoding very slow. Lower it (setup sizes it for this PC) or remove the argument to let the engine "
            "choose.")
-    print("[strata] " + msg, flush=True)
+    print("[xestrata] " + msg, flush=True)
     return msg
 
 
@@ -9707,7 +9726,7 @@ def _name_in(name: str, names) -> bool:
 
 
 def allowed_hosts_of(value, env: str = "") -> list[str]:
-    """The config's allowed_hosts (a name or a list) plus $STRATA_ALLOWED_HOSTS (comma-separated): host names, "*" or
+    """The config's allowed_hosts (a name or a list) plus $XESTRATA_ALLOWED_HOSTS (comma-separated): host names, "*" or
     ".example.com" (it and every name below it).  A scheme, port or path is dropped ("https://a.example.com:8443/"
     -> "a.example.com"); a wrong entry stops the start (ValueError)."""
     items = [] if value in (None, "") else [value] if isinstance(value, str) else value
@@ -9723,7 +9742,7 @@ def allowed_hosts_of(value, env: str = "") -> list[str]:
         dot = x.startswith(".")
         name = host_name(x[1:] if dot else x)
         if not name:
-            raise ValueError(f"allowed_hosts: {raw!r} is not a host name like strata.example.com")
+            raise ValueError(f"allowed_hosts: {raw!r} is not a host name like xestrata.example.com")
         out.append("." + name if dot else name)
     return list(dict.fromkeys(out))
 
@@ -9763,7 +9782,7 @@ def host_allowed(host, names, any_host=False) -> bool:
 
 
 def key_list(value) -> list[str]:
-    """#1344: the keys a server accepts.  --api-key / STRATA_API_KEY / "api_key" take llama.cpp's form, several keys
+    """#1344: the keys a server accepts.  --api-key / XESTRATA_API_KEY / "api_key" take llama.cpp's form, several keys
     separated by commas ("k1,k2"; spaces around each are dropped), or a list in the config ("api_key": ["k1", "k2"],
     the way to give a key that contains a comma).  A list is taken as it is."""
     if value is None or value == "":
@@ -9774,7 +9793,7 @@ def key_list(value) -> list[str]:
 
 
 def explicit_no_key(value) -> bool:
-    """The owner chose to serve without a key: "api_key": "none" in the config, STRATA_API_KEY=none or --api-key none
+    """The owner chose to serve without a key: "api_key": "none" in the config, XESTRATA_API_KEY=none or --api-key none
     (or --no-api-key, handled by the caller).  Never a key called "none"."""
     return isinstance(value, str) and value.strip().lower() == "none"
 
@@ -9856,7 +9875,7 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
         return []
     items = [value] if isinstance(value, str) else value
     if not isinstance(items, list) or not all(isinstance(x, str) for x in items):
-        raise SystemExit(f"[strata] {key}: expected an origin or a list of origins")
+        raise SystemExit(f"[xestrata] {key}: expected an origin or a list of origins")
     out = []
     for x in items:
         x = x.strip().rstrip("/")
@@ -9865,7 +9884,7 @@ def origins_of(value, key: str, wildcard: bool) -> list[str]:
             continue
         scheme, sep, rest = x.partition("://")
         if scheme not in ("http", "https") or not sep or not rest or "/" in rest or "*" in rest:
-            raise SystemExit(f"[strata] {key}: {x!r} is not an origin like https://chat.example.com"
+            raise SystemExit(f"[xestrata] {key}: {x!r} is not an origin like https://chat.example.com"
                              + ("" if wildcard else " (no wildcards here)"))
         out.append(x)
     return out
@@ -9947,8 +9966,8 @@ def split_joined_args(cfg: dict) -> None:
         changed.append(a)
     if changed:
         cfg["args"] = out
-        print("[strata] the config's args hold " + ", ".join(repr(c) for c in changed) + " as one element each: split "
-              'into the flag and its value (write them as two elements, e.g. "--ple-io", "mmap")', flush=True)
+        print("[xestrata] the config's args hold " + ", ".join(repr(c) for c in changed) + " as one element each: "
+              'split into the flag and its value (write them as two elements, e.g. "--ple-io", "mmap")', flush=True)
 
 
 def read_config(path) -> dict:
@@ -9958,9 +9977,9 @@ def read_config(path) -> dict:
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        raise SystemExit(f"[strata] {path} is not valid JSON: {e.msg} at line {e.lineno}, column {e.colno}. Check the "
-                         'commas between the entries of "args" (each option and each value is its own quoted entry, '
-                         'e.g. "--ple-io", "mmap",) and that no entry is followed by a comma at the end of a '
+        raise SystemExit(f"[xestrata] {path} is not valid JSON: {e.msg} at line {e.lineno}, column {e.colno}. Check "
+                         'the commas between the entries of "args" (each option and each value is its own quoted '
+                         'entry, e.g. "--ple-io", "mmap",) and that no entry is followed by a comma at the end of a '
                          'list.') from None
 
 
@@ -9987,8 +10006,8 @@ def lift_reasoning_effort_arg(cfg: dict) -> None:
     cfg["args"] = out
     if cfg.get("reasoning_effort") is None:
         cfg["reasoning_effort"] = value
-    print("[strata] '--reasoning-effort' in the config's args is not an engine option: taken out of them. The thinking "
-          "level is the config's 'reasoning_effort' key (outside 'args'); it is used as " +
+    print("[xestrata] '--reasoning-effort' in the config's args is not an engine option: taken out of them. The "
+          "thinking level is the config's 'reasoning_effort' key (outside 'args'); it is used as " +
           f"{cfg['reasoning_effort']!r}", flush=True)
 
 
@@ -10010,7 +10029,7 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     for alias, canon in SAMPLING_ALIASES.items():      # #1819: llama.cpp's names for the same two fields
         if block.get(alias) is not None:
             if block.get(canon) is not None:
-                raise SystemExit(f"[strata] config sampling: both {alias!r} and {canon!r} are set; they are the same "
+                raise SystemExit(f"[xestrata] config sampling: both {alias!r} and {canon!r} are set; they are the same "
                                  f"setting, keep one")
             block[canon] = block.pop(alias)
     for key, value in block.items():
@@ -10019,57 +10038,60 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "temperature":
             if not number or value < 0:
-                raise SystemExit(f"[strata] config sampling.temperature={value!r}: expected a number >= 0 (0 = greedy)")
+                raise SystemExit(f"[xestrata] config sampling.temperature={value!r}: expected a number >= 0 "
+                                 "(0 = greedy)")
             out[key] = float(value)
         elif key == "top_p":
             if not number or not 0 < value <= 1:
-                raise SystemExit(f"[strata] config sampling.top_p={value!r}: expected 0 < top_p <= 1")
+                raise SystemExit(f"[xestrata] config sampling.top_p={value!r}: expected 0 < top_p <= 1")
             out[key] = float(value)
         elif key == "min_p":
             if not number or not 0 <= value <= 1:
-                raise SystemExit(f"[strata] config sampling.min_p={value!r}: expected 0 <= min_p <= 1")
+                raise SystemExit(f"[xestrata] config sampling.min_p={value!r}: expected 0 <= min_p <= 1")
             out[key] = float(value)
         elif key == "top_k":
             if not number or value != int(value) or not 1 <= value <= 64:
-                raise SystemExit(f"[strata] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
+                raise SystemExit(f"[xestrata] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
             out[key] = int(value)
         elif key == "presence_penalty":
             if not number or value < 0:
-                raise SystemExit(f"[strata] config sampling.presence_penalty={value!r}: expected a number >= 0")
+                raise SystemExit(f"[xestrata] config sampling.presence_penalty={value!r}: expected a number >= 0")
             out[key] = float(value)
         elif key == "frequency_penalty":
             if not number or value < 0:
-                raise SystemExit(f"[strata] config sampling.frequency_penalty={value!r}: expected a number >= 0")
+                raise SystemExit(f"[xestrata] config sampling.frequency_penalty={value!r}: expected a number >= 0")
             out[key] = float(value)
         elif key == "repetition_penalty":
             if not number or value <= 0:
-                raise SystemExit(f"[strata] config sampling.repetition_penalty={value!r}: "
+                raise SystemExit(f"[xestrata] config sampling.repetition_penalty={value!r}: "
                                  "expected a number > 0 (1 = off)")
             out[key] = float(value)
         elif key == "penalty_last_n":
             if not number or value != int(value) or value < 0:
-                raise SystemExit(f"[strata] config sampling.penalty_last_n={value!r}: expected a non-negative integer")
+                raise SystemExit(f"[xestrata] config sampling.penalty_last_n={value!r}: expected a non-negative "
+                                 "integer")
             out[key] = int(value)
         elif key == "seed":
             if not number or value != int(value) or value <= 0:
-                raise SystemExit(f"[strata] config sampling.seed={value!r}: expected a positive integer")
+                raise SystemExit(f"[xestrata] config sampling.seed={value!r}: expected a positive integer")
             out[key] = int(value)
         elif key == "experimental_speed_projection":
             if not isinstance(value, bool):
-                raise SystemExit(f"[strata] config sampling.experimental_speed_projection={value!r}: expected true or "
-                                 "false (the default for requests that leave it out, when the engine has the vector)")
+                raise SystemExit(f"[xestrata] config sampling.experimental_speed_projection={value!r}: expected true "
+                                 "or false (the default for requests that leave it out, when the engine has the "
+                                 "vector)")
             out[key] = value
         else:
-            print(f"[strata] config sampling.{key}={value!r}: unknown key, ignored", flush=True)
+            print(f"[xestrata] config sampling.{key}={value!r}: unknown key, ignored", flush=True)
     return out
 
 
 def loop_guard_setting(cfg: dict | None, env=None) -> bool:
-    """The loop guard (serve/loop_guard.py), on unless STRATA_LOOP_GUARD says 0 / off / false / no or the run config
+    """The loop guard (serve/loop_guard.py), on unless XESTRATA_LOOP_GUARD says 0 / off / false / no or the run config
     has "loop_guard": false; the environment, when set, wins over the config."""
     off = ("0", "off", "false", "no", "none")
     env = os.environ if env is None else env
-    v = env.get("STRATA_LOOP_GUARD")
+    v = envvars.get("LOOP_GUARD", env=env)
     if v is not None and str(v).strip():
         return str(v).strip().lower() not in off
     v = (cfg or {}).get("loop_guard")
@@ -10132,7 +10154,7 @@ def start_replicas(cfg: dict, groups: list[list[str]], exe: str, effort_end: lis
     n = len(groups)
     cpus = rp.cpu_sets(n, cfg.get("replica_cpus") is not False)
     arena, arena_fd, arena_note = sp.arena_path(cfg, {"shared_arena": cfg.get("replica_shared_arena", True)})
-    print(f"[strata] {n} replicas on the cards {' | '.join(','.join(g) for g in groups)}"
+    print(f"[xestrata] {n} replicas on the cards {' | '.join(','.join(g) for g in groups)}"
           f"{' (own CPU cores each)' if cpus else ''}: requests go to the least busy one, "
           f"a conversation back to its own; {arena_note}",
           flush=True)
@@ -10144,7 +10166,7 @@ def start_replicas(cfg: dict, groups: list[list[str]], exe: str, effort_end: lis
         if arena:
             rc["args"] = list(rc.get("args") or []) + ["--shared-expert-arena", arena]
         env = child_env(rc)
-        env["STRATA_GPU_PCI"] = rc["gpu_pci"]           # its own card, whatever the server's environment names
+        envvars.put(env, "GPU_PCI", rc["gpu_pci"])           # its own card, whatever the server's environment names
         try:
             engines[i] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
                                       env=env, lazy=lazy, cpus=cpus[i] if cpus else None,
@@ -10153,7 +10175,7 @@ def start_replicas(cfg: dict, groups: list[list[str]], exe: str, effort_end: lis
             errors.append((i, e))
     rc0 = rp.replica_cfg(cfg, 0, groups[0])
     warn_budget_over_ram(engine_args(rc0) if "args" in rc0 else [])
-    if os.environ.get("STRATA_REPLICA_START", "") == "serial":
+    if envvars.get("REPLICA_START", "") == "serial":
         for i in range(n):
             one(i)
     else:
@@ -10176,7 +10198,7 @@ def start_replicas(cfg: dict, groups: list[list[str]], exe: str, effort_end: lis
         if arena_fd is not None:
             os.close(arena_fd)
         i, e = errors[0]
-        raise SystemExit(f"[strata] replica {i} did not start: {e}")
+        raise SystemExit(f"[xestrata] replica {i} did not start: {e}")
     load = int(cfg.get("replica_load_tokens") or rp.LOAD_TOKENS)
     return rp.ReplicaEngine(engines, load_tokens=load)
 
@@ -10240,10 +10262,10 @@ class KeptArena:
         elif pending:
             try:
                 n = self.punch(pending)
-                print(f"[strata] expert arena: {n / 2 ** 30:.2f} GiB of the coldest experts given back to the RAM "
+                print(f"[xestrata] expert arena: {n / 2 ** 30:.2f} GiB of the coldest experts given back to the RAM "
                       "(the next start reads them again)", flush=True)
             except OSError as e:
-                print(f"[strata] expert arena: the dropped experts could not be given back ({e}); the whole arena "
+                print(f"[xestrata] expert arena: the dropped experts could not be given back ({e}); the whole arena "
                       "goes", flush=True)
                 self.reset()
         with contextlib.suppress(OSError):
@@ -10286,7 +10308,7 @@ class KeptArena:
             self._k32().CloseHandle(self.handle)
             self.handle = self._section()
             return
-        new = os.memfd_create("strata-arena")
+        new = os.memfd_create("xestrata-arena")
         os.dup2(new, self.fd, inheritable=False)
         os.close(new)
 
@@ -10327,7 +10349,7 @@ def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bo
     sp.check_cfg(cfg, spec)
     arena, arena_fd, arena_note = sp.arena_path(cfg, spec)
     work = sp.session_dir(spec)
-    print(f"[strata] split serving: the prompt is read on card {spec['prefill_gpu']}, the answer is made on card "
+    print(f"[xestrata] split serving: the prompt is read on card {spec['prefill_gpu']}, the answer is made on card "
           f"{spec['decode_gpu']} (prompts with {spec['min_prompt_tokens']}+ new tokens are handed over); {arena_note}",
           flush=True)
     engines = {}
@@ -10339,7 +10361,7 @@ def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bo
             if role == "prefill":
                 warn_budget_over_ram(engine_args(rc) if "args" in rc else [])
             env = child_env(rc)
-            env["STRATA_GPU_PCI"] = rc["gpu_pci"]       # its own card, whatever the server's environment names
+            envvars.put(env, "GPU_PCI", rc["gpu_pci"])       # its own card, whatever the server's environment names
             engines[role] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
                                          env=env, lazy=lazy, fds=(arena_fd,) if arena_fd is not None else ())
     except BaseException:
@@ -10414,14 +10436,14 @@ def tool_call_recovery_setting(cfg: dict) -> bool:
     "tool_call_recovery": false turns it off.  Anything but true or false stops the start."""
     recovery = cfg.get("tool_call_recovery", True)
     if not isinstance(recovery, bool):
-        raise SystemExit(f"[strata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
+        raise SystemExit(f"[xestrata] config \"tool_call_recovery\" must be true or false, not {recovery!r}")
     return recovery
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--engine", choices=["mock", "strata"], default="mock")
-    ap.add_argument("--config", help="strata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
+    ap.add_argument("--engine", choices=["mock", "xestrata", "strata"], default="mock")   # strata: upstream's name
+    ap.add_argument("--config", help="xestrata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), "
@@ -10443,8 +10465,8 @@ def main() -> int:
                     help="answer 400 when prompt + max_tokens does not fit the context, like llama.cpp "
                          "(also \"fit_max_tokens\": false in the config). A prompt that alone does not fit is "
                          "always 400")
-    ap.add_argument("--api-key", default=os.environ.get("STRATA_API_KEY", ""),
-                    help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $STRATA_API_KEY. "
+    ap.add_argument("--api-key", default=envvars.get("API_KEY", ""),
+                    help="require this key on /v1/* (Authorization: Bearer ... or x-api-key); also $XESTRATA_API_KEY. "
                          "Several keys: separate them with commas (key1,key2), as llama.cpp does")
     ap.add_argument("--no-api-key", action="store_true",
                     help="serve on the network without an API key on purpose (anyone who can reach the port can use "
@@ -10483,8 +10505,10 @@ def main() -> int:
                          "(0000:03:00.0,0000:09:00.0; also \"split_serve\" in the config: {\"prefill_gpu\": "
                          "\"0000:03:00.0\", \"decode_gpu\": \"0000:09:00.0\"}; docs/MULTIGPU.md)")
     a = ap.parse_args()
-    if a.engine == "strata" and (_rt := rttime_limit_note()):   # upstream #3238: say it before the first unexplained -9
-        print("[strata] WARNING: " + _rt, flush=True)
+    if a.engine == "strata":                            # the name upstream's scripts and older launchers pass
+        a.engine = "xestrata"
+    if a.engine == "xestrata" and (_rt := rttime_limit_note()):   # upstream #3238: said before the first unexplained -9
+        print("[xestrata] WARNING: " + _rt, flush=True)
     cfg = read_config(a.config) if a.config else {}
     split_joined_args(cfg)
     if a.replicas is not None:
@@ -10509,21 +10533,21 @@ def main() -> int:
         a.tokenizer = cfg["tokenizer"]
     tok = ByteTokenizer()
     tpath = Path(a.tokenizer)
-    if a.engine == "strata" and not (tpath / "vocab.json").exists():
+    if a.engine == "xestrata" and not (tpath / "vocab.json").exists():
         ap.error(f"the model's tokenizer is missing ({tpath / 'vocab.json'}); run setup again")
     if (tpath / "vocab.json").exists():
         import strata_tokenizer as ST
         tok = ST.Tokenizer.from_dir(tpath)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
-    if a.engine == "strata":
+    if a.engine == "xestrata":
         if not cfg:
-            ap.error("--engine strata needs --config")
+            ap.error("--engine xestrata needs --config")
         vision = None
         env = child_env(cfg)
         sampling_defaults = sampling_defaults_from_config(cfg)
         if sampling_defaults:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
-            print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
+            print(f"[xestrata] sampling defaults from the config: {pretty}", flush=True)
         vision_error = vision_fallback = None
         lazy = a.lazy or cfg.get("lazy_load") is True
         if cfg.get("vision"):
@@ -10537,65 +10561,68 @@ def main() -> int:
                     for k, v in cfg["vision"].items()}
             vcfg["elastic"] = vision_elastic_on(cfg)
             if vcfg["elastic"] and not vram_elastic_on(cfg):
-                print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
-                      "encoder its VRAM): the encoder starts with the model instead", flush=True)
+                print('[xestrata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives '
+                      "the encoder its VRAM): the encoder starts with the model instead", flush=True)
                 vcfg["elastic"] = False
             elif vcfg.get("elastic") is True and (len(gpu_list(cfg)) > 1 or (
-                    cfg.get("split_pci") and os.environ.get("STRATA_LAYER_SPLIT") != "off")):
+                    cfg.get("split_pci") and envvars.get("LAYER_SPLIT") != "off")):
                 # the engine turns --vram-elastic off on a layer split (a cache per GPU): the encoder still starts
                 # with the first picture and stops when idle, but its VRAM has to be free already (upstream 092c7d1ef)
-                print('[strata] images: on a layer split the expert cache cannot make room for the image encoder (the '
-                      'engine turns --vram-elastic off); keep its VRAM free with "--vram-reserve-mib" on the '
+                print('[xestrata] images: on a layer split the expert cache cannot make room for the image encoder '
+                      '(the engine turns --vram-elastic off); keep its VRAM free with "--vram-reserve-mib" on the '
                       "encoder's GPU, or the first picture may not get it", flush=True)
             failed: list = []
             for vc in vision_attempts(vcfg):
                 if failed:
-                    print(f"[strata] images: trying {vision_label(vc)} instead", flush=True)
+                    print(f"[xestrata] images: trying {vision_label(vc)} instead", flush=True)
                 try:
                     vision = Vision(vc, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
                                     env=env, lazy=lazy)
                     break
                 except (OSError, RuntimeError) as e:    # the next one; with none left the model still serves text
                     failed.append(f"{vision_label(vc)}: {e}")
-                    print(f"[strata] images: {failed[-1]}", flush=True)
+                    print(f"[xestrata] images: {failed[-1]}", flush=True)
             if vision is None:
                 vision_error = "; ".join(failed)
-                print("[strata] images are off: no image encoder started", flush=True)
+                print("[xestrata] images are off: no image encoder started", flush=True)
             elif failed:
                 vision_fallback = "; ".join(failed)
-                print(f"[strata] images: {vision.label} serves them ({vision_fallback})", flush=True)
+                print(f"[xestrata] images: {vision.label} serves them ({vision_fallback})", flush=True)
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         try:
             split = layer_split_value(cfg)              # upstream #644: before the (minutes-long) start
         except ValueError as e:
-            raise SystemExit(f"[strata] config {e}")
+            raise SystemExit(f"[xestrata] config {e}")
         warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
         if len(gpu_list(cfg)) > 1:
-            print(f"[strata] layer split across GPUs {gpu_list(cfg)} ({split})", flush=True)
+            print(f"[xestrata] layer split across GPUs {gpu_list(cfg)} ({split})", flush=True)
         # a relative "exe" is the config's cwd's, made absolute here
         exe = cfg["exe"] if os.path.isabs(cfg["exe"]) else \
             os.path.abspath(os.path.join(cfg.get("cwd") or ".", cfg["exe"]))
+        if not os.path.isfile(exe):                     # e.g. a config older than the engine's name xestrata-engine
+            raise SystemExit(f"[xestrata] the engine the config names (\"exe\": {exe}) is not there: run xestrata "
+                             "--setup to write the config again")
         try:
             silence = engine_silence_s(cfg)             # #481: checked before the (minutes-long) start
         except ValueError as e:
-            raise SystemExit(f"[strata] config {e}")
+            raise SystemExit(f"[xestrata] config {e}")
         try:
             effort_end = effort_end_args(cfg, exe, tok)  # #458
         except ValueError as e:
-            raise SystemExit(f"[strata] config {e}")
+            raise SystemExit(f"[xestrata] config {e}")
         from serve import replicas as rp
         try:
             groups = rp.gpu_groups(cfg)
         except rp.ReplicaConfigError as e:
-            raise SystemExit(f"[strata] config {e}")
+            raise SystemExit(f"[xestrata] config {e}")
         from serve import split as split_mod
         try:
             split_serve = split_mod.split_spec(cfg)
             if split_serve:
                 split_mod.check_cfg(cfg, split_serve)
         except split_mod.SplitConfigError as e:
-            raise SystemExit(f"[strata] config {e}")
+            raise SystemExit(f"[xestrata] config {e}")
         if groups:
             engine = start_replicas(cfg, groups, exe, effort_end or [], lazy)
         elif split_serve:
@@ -10604,7 +10631,7 @@ def main() -> int:
             eargs = engine_args(cfg) + (effort_end or [])
             kept, said = (None, "") if image_env(cfg, env)[1] else kept_arena(cfg, eargs)
             if said:
-                print(f"[strata] {said}", flush=True)
+                print(f"[xestrata] {said}", flush=True)
             if kept is not None:
                 eargs += ["--shared-expert-arena", kept.path]
             engine = StrataEngine(exe, eargs, cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy,
@@ -10639,7 +10666,7 @@ def main() -> int:
     if (tpath / "vocab.json").exists():
         svc.tokenizer_dir = str(tpath.resolve())
     svc.public_urls = True                             # #28: a request's image URL only from a public address
-    if a.engine == "strata":                            # the model card's sampling when nothing else is said
+    if a.engine == "xestrata":                          # the model card's sampling when nothing else is said
         svc.model_arch = card_family(cfg)
     svc.answer_room = cfg.get("answer_room") is not False
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
@@ -10647,7 +10674,7 @@ def main() -> int:
         # the default image model ("images") and the others a request can name ("image_models")
         extra = cfg.get("image_models") or []
         if not isinstance(extra, list) or not all(isinstance(m, dict) for m in extra):
-            raise SystemExit('[strata] config: "image_models" must be a list of "images" sections')
+            raise SystemExit('[xestrata] config: "image_models" must be a list of "images" sections')
         icfgs = [{k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
                       if k in ("exe", "diffusion_model", "vae", "llm", "tokenizer", "system_prompt", "out_dir",
                                "lora_dir")
@@ -10659,22 +10686,22 @@ def main() -> int:
             # the text engine's environment: its libraries, and its GPU unless the images have a card of their own
             ienv, separate, said = image_env(cfg, child_env(cfg))
             if said:
-                print(f"[strata] {said}", flush=True)
+                print(f"[xestrata] {said}", flush=True)
             svc.images = images_api.ImageModels(icfgs, log=ilog, env=ienv, separate=separate)
             svc.images.helper_card = image_helper_card(cfg)
-            svc.images.gpu_pci = ienv.get("STRATA_GPU_PCI") if separate else None   # the Monitor's image card
+            svc.images.gpu_pci = envvars.get("GPU_PCI", env=ienv) if separate else None   # the Monitor's image card
         except ValueError as e:
-            raise SystemExit(f"[strata] config: {e}")
+            raise SystemExit(f"[xestrata] config: {e}")
         gone = svc.images.missing()
         if gone:
-            print(f"[strata] image generation: missing {', '.join(gone)} - requests fail until setup --images has run "
-                  "again", flush=True)
+            print(f"[xestrata] image generation: missing {', '.join(gone)} - requests fail until setup --images has "
+                  "run again", flush=True)
         for g in svc.images.gens.values():
-            print(f"[strata] image generation: {g.model} {g.cfg.get('quant') or ''} on strata-image "
+            print(f"[xestrata] image generation: {g.model} {g.cfg.get('quant') or ''} on xestrata-image "
                   f"(POST /v1/images/generations{'' if g is svc.images.default else ', model ' + g.model}; "
                   f"GPU policy {g.policy})", flush=True)
         if svc.images.note():
-            print(f"[strata] image generation: {svc.images.note()}", flush=True)
+            print(f"[xestrata] image generation: {svc.images.note()}", flush=True)
         import atexit
         atexit.register(svc.images.close)               # the image engine ends with the server
     if cfg.get("reasoning_effort") is not None:         # #1641: the thinking level of requests that name none
@@ -10682,23 +10709,23 @@ def main() -> int:
             svc.config_effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}).get(
                 "reasoning_effort")
         except ValueError as e:
-            raise SystemExit(f"[strata] config {e}")
+            raise SystemExit(f"[xestrata] config {e}")
         if svc.config_effort:
-            print(f"[strata] thinking level: {svc.config_effort} (reasoning_effort in the config; a request, or the "
+            print(f"[xestrata] thinking level: {svc.config_effort} (reasoning_effort in the config; a request, or the "
                   "Chat settings shared with other apps, can set its own)", flush=True)
     svc.codex_thread_titles = cfg.get("codex_thread_titles") is True    # #923: opt-in, off by default
     svc.codex_compaction_cache = cfg.get("codex_compaction_cache") is True   # #924: opt-in, off by default
     try:
         svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
     except ValueError as e:
-        raise SystemExit(f"[strata] config {e}")
+        raise SystemExit(f"[xestrata] config {e}")
     if svc.aliases:
-        print(f"[strata] model aliases: {', '.join(svc.aliases)}", flush=True)
-    if ("STRATA_API_KEY" in os.environ and not os.environ["STRATA_API_KEY"].strip()) or \
+        print(f"[xestrata] model aliases: {', '.join(svc.aliases)}", flush=True)
+    if (envvars.get("API_KEY") is not None and not str(envvars.get("API_KEY")).strip()) or \
             any(x == "--api-key" and i + 1 < len(sys.argv) and not sys.argv[i + 1].strip() or x.strip() == "--api-key="
                 for i, x in enumerate(sys.argv)):
         # #213: an empty key would switch authentication off without a word
-        print("[strata] an API key was given but it is empty: set a key, or leave --api-key / STRATA_API_KEY out",
+        print("[xestrata] an API key was given but it is empty: set a key, or leave --api-key / XESTRATA_API_KEY out",
               file=sys.stderr)
         return 2
     raw_key = a.api_key or cfg.get("api_key", "")
@@ -10708,30 +10735,30 @@ def main() -> int:
     try:
         svc.api_key = api_key_of(raw_key)
     except ValueError as e:
-        print(f'[strata] {e}: set a key, or leave --api-key / STRATA_API_KEY / "api_key" out', file=sys.stderr)
+        print(f'[xestrata] {e}: set a key, or leave --api-key / XESTRATA_API_KEY / "api_key" out', file=sys.stderr)
         return 2
     # #569: written, but empty: the server has none (a warning, not a stop)
     if not svc.api_key and "api_key" in cfg and not no_key_chosen:
-        print("[strata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
+        print("[xestrata] the api_key in the config is empty: this server has no API key (anyone who can reach it can "
               "use it); set one, or leave api_key out", file=sys.stderr, flush=True)
     svc.cors_origins = origins_of(cfg.get("cors_origins"), "cors_origins", wildcard=True)
     svc.trusted_origins = origins_of(cfg.get("trusted_origins"), "trusted_origins", wildcard=False)
     try:
-        svc.allowed_hosts = allowed_hosts_of(cfg.get("allowed_hosts"), os.environ.get("STRATA_ALLOWED_HOSTS", ""))
+        svc.allowed_hosts = allowed_hosts_of(cfg.get("allowed_hosts"), envvars.get("ALLOWED_HOSTS", ""))
     except ValueError as e:
-        raise SystemExit(f"[strata] config {e}")
+        raise SystemExit(f"[xestrata] config {e}")
     if svc.allowed_hosts:
-        print("[strata] Host check off: any name reaches this server (allowed_hosts \"*\")"
+        print("[xestrata] Host check off: any name reaches this server (allowed_hosts \"*\")"
               if "*" in svc.allowed_hosts
-              else f"[strata] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)",
+              else f"[xestrata] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)",
               flush=True)
     svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True
     if svc.api_monitor:
-        print("[strata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
-              "memory" + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),
+        print("[xestrata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept "
+              "in memory" + ("" if svc.api_key else "; anyone who can reach this server can read them (no API key)"),
               flush=True)
     if svc.cors_origins:
-        print(f"[strata] CORS on /v1/* for {', '.join(svc.cors_origins)}"
+        print(f"[xestrata] CORS on /v1/* for {', '.join(svc.cors_origins)}"
               + ("" if svc.api_key or "*" not in svc.cors_origins else
                  " - WARNING: any web page may use the model (no API key)"), flush=True)
     svc.idle_unload_s = a.idle_unload if a.idle_unload is not None else float(cfg.get("idle_unload_s") or 0)
@@ -10741,7 +10768,7 @@ def main() -> int:
     try:
         svc.before_load_timeout_s = float(cfg.get("before_load_timeout_s") or svc.before_load_timeout_s)
     except (TypeError, ValueError):
-        print("[strata] \"before_load_timeout_s\" in the config is not a number; using "
+        print("[xestrata] \"before_load_timeout_s\" in the config is not a number; using "
               f"{svc.before_load_timeout_s:g} s", flush=True)
     svc.before_load_ignore_failure = cfg.get("before_load_ignore_failure") is True
     svc.before_load_strict = cfg.get("before_load_strict") is True
@@ -10752,48 +10779,48 @@ def main() -> int:
             svc.slot_save_path = slot_save_dir(a.slot_save_path) if a.slot_save_path else \
                 slot_save_dir(cfg["slot_save_path"], cfg.get("cwd"))
         except (ValueError, OSError) as e:
-            raise SystemExit(f"[strata] {e}")
-        print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
+            raise SystemExit(f"[xestrata] {e}")
+        print(f"[xestrata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
     mode = str(cfg.get("anthropic_thinking") or "on_request")   # #278: "model" thinks unasked too
     if mode not in ("model", "on_request"):
-        raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
+        raise SystemExit(f"[xestrata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
     svc.tool_call_recovery = tool_call_recovery_setting(cfg)
     etu = cfg.get("env_to_user", False)                # opt-in: see frontend._env_to_user
     if not isinstance(etu, bool):
-        raise SystemExit(f"[strata] config \"env_to_user\" must be true or false, not {etu!r}")
+        raise SystemExit(f"[xestrata] config \"env_to_user\" must be true or false, not {etu!r}")
     import serve.frontend as _frontend
     _frontend.ENV_TO_USER = etu
     rs = cfg.get("repeat_stop_tokens", REPEAT_STOP_TOKENS)   # #606: opt-out with 0
     if isinstance(rs, bool) or not isinstance(rs, int) or rs < 0:
-        raise SystemExit(f"[strata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
+        raise SystemExit(f"[xestrata] config \"repeat_stop_tokens\" must be a whole number >= 0 (0 = off), not {rs!r}")
     svc.repeat_stop_tokens = rs
-    svc.loop_guard = loop_guard_setting(cfg)            # (STRATA_LOOP_GUARD=0 or "loop_guard": false: off)
+    svc.loop_guard = loop_guard_setting(cfg)            # (XESTRATA_LOOP_GUARD=0 or "loop_guard": false: off)
     if not svc.loop_guard:
-        print("[strata] loop guard: off (a request's \"loop_guard\": true turns it on for that request)", flush=True)
+        print("[xestrata] loop guard: off (a request's \"loop_guard\": true turns it on for that request)", flush=True)
     svc.effort_end = bool(effort_end)                   # #458: "effort_position": "end" with an engine that has it
     if cfg.get("reasoning_budget_tokens") is not None:  # #123: a default thinking budget for every request
         try:
             svc.reasoning_budget_tokens = cfg["reasoning_budget_tokens"]
             budget = svc.reasoning_budget({})
         except ValueError as e:
-            raise SystemExit(f"[strata] config {e}")
+            raise SystemExit(f"[xestrata] config {e}")
         if budget:
-            print(f"[strata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
+            print(f"[xestrata] thinking budget: {budget} tokens (reasoning_budget_tokens; a request can set its own)",
                   flush=True)
     recovery = cfg.get("reasoning_loop_recovery", False)   # #728: false (default) | "stop" | "recover" (true)
     if recovery is True:
         recovery = "recover"
     if recovery is not False and recovery not in ("stop", "recover"):
-        raise SystemExit("[strata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
+        raise SystemExit("[xestrata] config \"reasoning_loop_recovery\" must be false, \"stop\" or \"recover\", "
                          f"not {recovery!r}")
     svc.reasoning_loop_recovery = recovery
-    svc.gpu_pci = os.environ.get("STRATA_GPU_PCI") or cfg.get("gpu_pci")   # the Monitor reads the engine's card
+    svc.gpu_pci = envvars.get("GPU_PCI") or cfg.get("gpu_pci")   # the Monitor reads the engine's card
     svc.split_pci = cfg.get("split_pci") or None       # and a layer split's other cards
-    if a.engine == "strata" and split_serve:            # split serving: the decode card, and the prefill card beside it
+    if a.engine == "xestrata" and split_serve:          # split serving: the decode card, and the prefill card beside it
         svc.gpu_pci, svc.split_pci = split_serve["decode_gpu"], [split_serve["prefill_gpu"]]
-    strata = a.engine == "strata"
+    strata = a.engine == "xestrata"
     svc.gpu_roles = gpu_roles(cfg, svc.gpu_pci, groups if strata else None, split_serve if strata else None,
                               getattr(svc.images, "gpu_pci", None), getattr(svc.images, "helper_card", ""))
     if a.config:
@@ -10801,26 +10828,26 @@ def main() -> int:
     try:                                                # the user's settings: the keys every model shares (runconfig)
         user_settings = runconfig.load_settings(svc.settings_path)
     except (OSError, ValueError) as e:
-        print(f"[strata] WARNING: {svc.settings_path} cannot be read ({e}); started without it", flush=True)
+        print(f"[xestrata] WARNING: {svc.settings_path} cannot be read ({e}); started without it", flush=True)
         user_settings = {}
     try:                                                # the script guard: the model's config over the settings'
         svc.script_guard = script_guard.setting(
             {"script_guard": runconfig.effective(cfg, user_settings, "script_guard")}, os.environ)
     except ValueError as e:
-        raise SystemExit(f"[strata] {e}") from None
+        raise SystemExit(f"[xestrata] {e}") from None
     if isinstance(svc.script_guard, dict):
-        print(f"[strata] script guard: {script_guard_name(svc.script_guard)} for every request that names none "
+        print(f"[xestrata] script guard: {script_guard_name(svc.script_guard)} for every request that names none "
               "(a request's \"script_guard\": \"off\" turns it off for that request)", flush=True)
     try:                                                # the debug chat log (debuglog.py): model over settings
         on = a.debug_chat_log or runconfig.check(
             "debug_chat_log", runconfig.effective(cfg, user_settings, "debug_chat_log"), cfg)
         mib = runconfig.check("debug_chat_log_mib", runconfig.effective(cfg, user_settings, "debug_chat_log_mib"), cfg)
     except ValueError as e:
-        raise SystemExit(f"[strata] {e}") from None
+        raise SystemExit(f"[xestrata] {e}") from None
     if on:
         svc.debug_log = debuglog.DebugLog(places.user_dir("state") / "debug-chat-log", mib or 1024)
-        print(f"[strata] debug chat log on: every chat request's prompt, tool rounds, answer and pictures, and the web "
-              f"page's chats, are written to {svc.debug_log.folder} (at most {mib or 1024:g} MiB)" +
+        print(f"[xestrata] debug chat log on: every chat request's prompt, tool rounds, answer and pictures, and the "
+              f"web page's chats, are written to {svc.debug_log.folder} (at most {mib or 1024:g} MiB)" +
               ("" if svc.api_key else "; set an API key if others can reach this server"), flush=True)
     searcher = None
     try:                                                # web search: the engine and its address (search.py)
@@ -10829,26 +10856,26 @@ def main() -> int:
         svc.search_url = runconfig.check("search_url", runconfig.effective(cfg, user_settings, "search_url"),
                                          cfg) or None
     except ValueError as e:
-        print(f"[strata] WARNING: web search is off: {e}", flush=True)
+        print(f"[xestrata] WARNING: web search is off: {e}", flush=True)
     deepseek_key = user_settings.get("deepseek_api_key")   # the settings' only (runconfig.GLOBAL_ONLY): never logged
     tinyfish_key = user_settings.get("tinyfish_api_key")
     if searcher == "deepseek" and isinstance(deepseek_key, str) and deepseek_key.strip():
         svc.search_backend = search_api.DeepSeek(deepseek_key.strip())
-        print("[strata] web search: DeepSeek's search API (for requests that ask for it; billed per search)",
+        print("[xestrata] web search: DeepSeek's search API (for requests that ask for it; billed per search)",
               flush=True)
     elif searcher == "deepseek":
-        print(f"[strata] WARNING: web search is off: search_engine is deepseek, but {svc.settings_path} has no "
+        print(f"[xestrata] WARNING: web search is off: search_engine is deepseek, but {svc.settings_path} has no "
               "deepseek_api_key", flush=True)
     elif searcher == "tinyfish" and isinstance(tinyfish_key, str) and tinyfish_key.strip():
         svc.search_backend = search_api.TinyFish(tinyfish_key.strip())
-        print("[strata] web search: TinyFish's search API (for requests that ask for it; free up to a daily "
+        print("[xestrata] web search: TinyFish's search API (for requests that ask for it; free up to a daily "
               "allowance)", flush=True)
     elif searcher == "tinyfish":
-        print(f"[strata] WARNING: web search is off: search_engine is tinyfish, but {svc.settings_path} has no "
+        print(f"[xestrata] WARNING: web search is off: search_engine is tinyfish, but {svc.settings_path} has no "
               "tinyfish_api_key", flush=True)
     elif searcher == "searxng" and svc.search_url:
         svc.search_backend = search_api.Searxng(svc.search_url)
-        print(f"[strata] web search: {svc.search_url} (for requests that ask for it)", flush=True)
+        print(f"[xestrata] web search: {svc.search_url} (for requests that ask for it)", flush=True)
     # A host that runs one model at a time and swaps them (a GPU shared with other work) can name the RPC that does
     # the swap: the web app then offers the models served on this port. {"mode": m} switches, {} only reports.
     svc.switcher = cfg.get("model_switcher") or None
@@ -10858,7 +10885,7 @@ def main() -> int:
         try:
             svc.shared = clean_shared_defaults(json.loads(Path(svc.shared_path).read_text(encoding="utf-8")))
             if svc.shared:
-                print("[strata] other apps use the Chat settings: " +
+                print("[xestrata] other apps use the Chat settings: " +
                       ", ".join(f"{k}={v}" for k, v in svc.shared.items()), flush=True)
         except (OSError, ValueError):
             svc.shared = {}
@@ -10867,7 +10894,7 @@ def main() -> int:
         svc.mcp = hub
         if hub.settings["image_results"]:
             hub.media_dir = Path(a.config).with_suffix(".tool-media") if a.config else Path.cwd() / ".tool-media"
-        print(f"[strata] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "
+        print(f"[xestrata] starting {len(hub.servers)} MCP server{'s' * (len(hub.servers) != 1)} for the web app's "
               f"chat: {', '.join(hub.servers)}", flush=True)
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
@@ -10895,10 +10922,10 @@ def main() -> int:
     def check_kernel():                                 # Debian's debsecan asks the security tracker: off the start
         svc.xe_kernel = kernel_check.unfixed_release()
         if svc.xe_kernel:
-            print("[strata] WARNING: " + kernel_check.text(svc.xe_kernel), flush=True)
+            print("[xestrata] WARNING: " + kernel_check.text(svc.xe_kernel), flush=True)
     threading.Thread(target=check_kernel, daemon=True, name="kernel-check").start()
     if release_check.enabled():                         # at the start and every six hours, said here once
-        svc.updates.watch(lambda line: print("[strata] " + line, flush=True))
+        svc.updates.watch(lambda line: print("[xestrata] " + line, flush=True))
     if a.open and cfg.get("open_browser") is not False:   # #609: the config's "open_browser": false wins (an older
         import webbrowser                                  # run-<model>.sh still passes --open)
         webbrowser.open(f"http://{here}:{a.port}/")
@@ -10919,7 +10946,7 @@ def main() -> int:
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
-        print("\n[strata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
+        print("\n[xestrata] stopping (Ctrl+C again to end the engine at once) ...", flush=True)
         closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
         for close in filter(None, closers):
@@ -10931,10 +10958,10 @@ def main() -> int:
                     proc.kill()
         try:
             from serve import cache_drop
-            cache_drop.drop_after_exit(engine)           # opt-in (STRATA_DROP_CACHE_ON_EXIT=1), default unchanged
+            cache_drop.drop_after_exit(engine)           # opt-in (XESTRATA_DROP_CACHE_ON_EXIT=1), default unchanged
         except Exception as e:  # noqa: BLE001 - never block the exit
-            print(f"[strata] could not release the model files' cache: {e}", flush=True)
-        print("[strata] stopped", flush=True)
+            print(f"[xestrata] could not release the model files' cache: {e}", flush=True)
+        print("[xestrata] stopped", flush=True)
     return 0
 
 

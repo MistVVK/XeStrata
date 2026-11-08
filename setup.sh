@@ -5,7 +5,7 @@
 # Strata for Linux: the first run installs everything and starts the model; later runs just start it.
 # Needs the Intel GPU driver (xe) and Intel oneAPI (DPC++, oneMKL). Python (with venv) is installed through
 # apt/dnf/pacman if it is missing (asks for sudo).
-# NixOS (or STRATA_UV=1) with uv installed: uv makes the project venv; every other Linux uses the standard venv.
+# NixOS (or XESTRATA_UV=1) with uv installed: uv makes the project venv; every other Linux uses the standard venv.
 cd "$(dirname "$0")" || exit 1
 # Python 3.10+ that can make a venv WITH pip: Debian/Ubuntu ship `venv` without `ensurepip` (that is the separate
 # python3-venv package), and a venv made without it has no pip
@@ -30,10 +30,11 @@ if [ -x .venv/bin/python ] && ! .venv/bin/python -m pip --version >/dev/null 2>&
   rm -rf .venv
 fi
 if [ ! -x .venv/bin/python ]; then
-  # uv's own Python only on NixOS (its Python cannot load pip wheels' libraries), or when asked: STRATA_UV=1.
+  # uv's own Python only on NixOS (its Python cannot load pip wheels' libraries), or when asked: XESTRATA_UV=1
+  # (or upstream's STRATA_UV=1).
   # Everywhere else the standard venv stays the default (#662: a silent toolchain change was not wanted).
   UV=""
-  if [ "${STRATA_UV:-}" = "1" ] || grep -qi '^ID=nixos' /etc/os-release 2>/dev/null; then
+  if [ "${XESTRATA_UV:-${STRATA_UV:-}}" = "1" ] || grep -qi '^ID=nixos' /etc/os-release 2>/dev/null; then
     UV="$(command -v uv 2>/dev/null || true)"
   fi
   PY=""

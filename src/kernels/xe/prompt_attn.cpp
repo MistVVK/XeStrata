@@ -14,6 +14,7 @@
 #include "strata/kernels/sdpa_aotriton.hpp"
 #include "strata/kernels/sdpa_onednn.hpp"
 #include "strata/core/gpu.hpp"
+#include "strata/platform/env.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -57,7 +58,7 @@ bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
     if (s.n_head_kv <= 0 || s.n_head % s.n_head_kv != 0 || s.page_size <= 0) return false;
     sycl::queue& queue = core::Runtime::get().stream(stream);
     static const bool no_mma = [] {   // STRATA_PROMPT_ATTN_MMA=0: the FMA kernel on every GPU
-        const char* v = std::getenv("STRATA_PROMPT_ATTN_MMA");
+        const char* v = strata::env_get("PROMPT_ATTN_MMA");
         return v != nullptr && std::strtol(v, nullptr, 10) == 0;
     }();
     // RDNA3 and RDNA4: the shared attention's WMMA form (flash_attn.hpp), which these GPUs' FMA form is far behind;
@@ -122,7 +123,7 @@ core::PerDevice<Picks>& picks_for(const QsaShapes& s, int fmt) {
 }
 
 bool env_off(const char* name) {
-    const char* v = std::getenv(name);
+    const char* v = strata::env_get(name);
     return v != nullptr && std::strtol(v, nullptr, 10) == 0;
 }
 
@@ -131,7 +132,7 @@ bool env_off(const char* name) {
 // the matrix engines' accumulators.  STRATA_PROMPT_ATTN_FLASH=0: the kernels above (A/B)
 bool flash_pools(sycl::queue& queue, const float* q, const QsaAttnPools& pools, int fmt, int64_t pos0, int64_t T,
                  const QsaShapes& s, float* attn) {
-    static const bool off = env_off("STRATA_PROMPT_ATTN_FLASH");
+    static const bool off = env_off("PROMPT_ATTN_FLASH");
     if (off) return false;
     FlashAttnArgs a;
     a.q32 = q;
@@ -413,12 +414,12 @@ int time_pick(sycl::queue& queue, const QsaShapes& s, int fmt, int64_t cells, vo
             }
         if (ms[kPickNone] >= 0.0 && (t_best < 0.0 || ms[kPickNone] < kDecodeMargin * t_best)) best = kPickNone;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata: timing the prompt attention at %lld cells: %s\n", (long long) cells, e.what());
+        std::fprintf(stderr, "xestrata: timing the prompt attention at %lld cells: %s\n", (long long) cells, e.what());
         best = kPickUntimed;
     }
     for (void* p : owned) sycl::free(p, queue);
     if (best >= 0)
-        std::fprintf(stderr, "strata: prompt attention (%lld/%lld heads of %lld, %s pools, %lld queries after %lld cells): "
+        std::fprintf(stderr, "xestrata: prompt attention (%lld/%lld heads of %lld, %s pools, %lld queries after %lld cells): "
                              "the decode kernel %.1f ms, the matrix engines' %.1f, the FP16 kernel %.1f, the int8 "
                              "kernel %.1f, the maker's %.1f: %s\n",
                      (long long) s.n_head, (long long) s.n_head_kv, (long long) s.head_dim, kFmtNames[fmt],
@@ -430,7 +431,7 @@ int time_pick(sycl::queue& queue, const QsaShapes& s, int fmt, int64_t cells, vo
 // STRATA_PROMPT_ATTN_PICK=decode|mma|fp16|int8|maker: that kernel whatever the timing would choose (A/B);
 // kPickUntimed: none
 int forced_pick() {
-    const char* v = std::getenv("STRATA_PROMPT_ATTN_PICK");
+    const char* v = strata::env_get("PROMPT_ATTN_PICK");
     if (v == nullptr) return kPickUntimed;
     const std::string w = v;
     return w == "decode" ? kPickNone
@@ -450,9 +451,9 @@ void prompt_attn_tune(const QsaShapes& s, int fmt, int64_t max_cells, void* stre
     sycl::queue& queue = core::Runtime::get().stream(stream);
     picks_for(s, fmt).get(queue.get_device(), [&] {
         Picks p;
-        if (env_off("STRATA_PROMPT_ATTN_MMA")) return p;   // the fixed choice (prompt_attn)
+        if (env_off("PROMPT_ATTN_MMA")) return p;   // the fixed choice (prompt_attn)
         if (const int f = forced_pick(); f != kPickUntimed) {   // prompt_attn takes it untimed
-            std::fprintf(stderr, "strata: prompt attention: %s (STRATA_PROMPT_ATTN_PICK)\n", kPickNames[f]);
+            std::fprintf(stderr, "xestrata: prompt attention: %s (XESTRATA_PROMPT_ATTN_PICK)\n", kPickNames[f]);
             return p;
         }
         // 8K and up to 64K cells (1 to 2 s on a B70); a cache shorter than the long point takes the short one's choice
@@ -475,7 +476,7 @@ bool prompt_attn(const float* q, const QsaAttnPools& pools, int64_t pos0, int64_
     sycl::queue& queue = core::Runtime::get().stream(stream);
     // STRATA_PROMPT_ATTN_MMA=0: the FP16 kernel for FP16 pools and the decode kernel for INT8 ones, as before; untimed
     // (no prompt_attn_tune for this shape): the matrix engines' kernel where there is one
-    static const bool no_mma = env_off("STRATA_PROMPT_ATTN_MMA");
+    static const bool no_mma = env_off("PROMPT_ATTN_MMA");
     static const int forced = forced_pick();
     int pick = kPickUntimed;
     if (no_mma) {

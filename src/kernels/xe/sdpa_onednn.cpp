@@ -200,7 +200,7 @@ bool onednn_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, 
         dg::sycl_interop::execute(cp, strm, ins, outs);
         return true;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata: oneDNN's attention is not taken on this GPU (%s): the engine's own kernel\n",
+        std::fprintf(stderr, "xestrata: oneDNN's attention is not taken on this GPU (%s): the engine's own kernel\n",
                      e.what());
         failed = true;
         return false;

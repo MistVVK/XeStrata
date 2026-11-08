@@ -569,7 +569,7 @@ int scan_fit(sycl::queue& q) {
         (void) sycl::get_kernel_bundle<sycl::bundle_state::executable>(
             q.get_context(), {d}, {sycl::get_kernel_id<K>(), sycl::get_kernel_id<Pr>()});
     } catch (const sycl::exception& e) {
-        std::fprintf(stderr, "strata: STRATA_GDN_TC: the GPU does not build the chunked DeltaNet scan (%s)\n", e.what());
+        std::fprintf(stderr, "xestrata: XESTRATA_GDN_TC: the GPU does not build the chunked DeltaNet scan (%s)\n", e.what());
         return 0;
     }
     return nsg;
@@ -582,7 +582,7 @@ bool tc(sycl::queue& q, float* state, const float* h, const float* gate, const f
         TcDev r;
         const sycl::device d = q.get_device();
         const int path = pick_path(d);
-        const char* why = "no FP16 matrix engines this scan is written for, or STRATA_NO_XMX=1";
+        const char* why = "no FP16 matrix engines this scan is written for, or XESTRATA_NO_XMX=1";
         int nsg = 0;
         if (path >= 0) {
             nsg = path == 0 ? scan_fit<HK, HV, 0>(q) : path == 1 ? scan_fit<HK, HV, 1>(q)
@@ -608,12 +608,12 @@ bool tc(sycl::queue& q, float* state, const float* h, const float* gate, const f
             r.path = path;
             r.nsg = nsg;
             const int tm = path == 1 || path == 0 ? 8 : 16, tn = path == 1 ? 8 : 16;
-            std::fprintf(stderr, "strata: STRATA_GDN_TC: the DeltaNet recurrence of prompt chunks as a chunked scan on "
+            std::fprintf(stderr, "xestrata: XESTRATA_GDN_TC: the DeltaNet recurrence of prompt chunks as a chunked scan on "
                          "the matrix engines (%dx%dx16 tiles, %d sub-groups a work-group, %d-token super-blocks, "
                          "%.1f MiB of scratch)\n", tm, tn, nsg, r.nb * GCH,
                          (double) Scratch<HK, HV>::bytes(r.nb) / (1024.0 * 1024.0));
         } else {
-            std::fprintf(stderr, "strata: STRATA_GDN_TC: not on this GPU (%s): the recurrence kernels as before\n", why);
+            std::fprintf(stderr, "xestrata: XESTRATA_GDN_TC: not on this GPU (%s): the recurrence kernels as before\n", why);
         }
         return r;
     });

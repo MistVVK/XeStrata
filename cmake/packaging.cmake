@@ -6,9 +6,9 @@
 #
 # - the program XeStrata's users run (setup.py as `xestrata`, the server, the web app, the tools setup runs, gguf-py,
 #   the data files), in <datadir>/xestrata, read-only; the user's files go to the XDG folders (setup.py, PACKAGED).
-# - the engine: strata, the image encoders and the SYCL runtime it was built with (intel/llvm's, which no distribution
-#   has as new: libsycl 9), with oneMath (its rocBLAS backend for AMD GPUs; oneMKL's and cuBLAS's in the contrib mode),
-#   in <libdir>/xestrata/engine.
+# - the engine: xestrata-engine, the image encoders and the SYCL runtime it was built with (intel/llvm's, which no
+#   distribution has as new: libsycl 9), with oneMath (its rocBLAS backend for AMD GPUs; oneMKL's and cuBLAS's in the
+#   contrib mode), in <libdir>/xestrata/engine.
 #
 # The packages provide and conflict with xestrata-engine, so one is installed at a time, and installing another
 # replaces it.  Nothing non-free goes in: the contrib engine opens oneMKL, cuBLAS and NVIDIA's driver at run time (the
@@ -18,7 +18,7 @@
 include(GNUInstallDirs)
 
 set(STRATA_PACKAGE_NAME "" CACHE STRING "the package's name, e.g. xestrata-free (STRATA_PACKAGE)")
-set(STRATA_PACKAGE_VISION_DIR "" CACHE PATH "the folder with strata-vision-cpu and strata-vision-vulkan")
+set(STRATA_PACKAGE_VISION_DIR "" CACHE PATH "the folder with xestrata-vision-cpu and xestrata-vision-vulkan")
 set(STRATA_PACKAGE_DEPENDS "" CACHE STRING "the package's dependencies, the distribution's names")
 set(STRATA_PACKAGE_RECOMMENDS "" CACHE STRING "the package's weak dependencies, installed by default")
 set(STRATA_PACKAGE_SUGGESTS "" CACHE STRING "the package's suggestions, not installed by default")
@@ -52,7 +52,7 @@ set(_pkg_engine_abs ${CMAKE_INSTALL_FULL_LIBDIR}/xestrata/engine)
 # ---- the engine
 set_target_properties(strata strata-image PROPERTIES INSTALL_RPATH "$ORIGIN/lib")
 install(TARGETS strata strata-image RUNTIME DESTINATION ${_pkg_engine})
-install(PROGRAMS ${STRATA_PACKAGE_VISION_DIR}/strata-vision-cpu ${STRATA_PACKAGE_VISION_DIR}/strata-vision-vulkan
+install(PROGRAMS ${STRATA_PACKAGE_VISION_DIR}/xestrata-vision-cpu ${STRATA_PACKAGE_VISION_DIR}/xestrata-vision-vulkan
         DESTINATION ${_pkg_engine})
 # the SYCL runtime the engine was built with: what libsycl loads for Level Zero and HIP (and CUDA in the contrib mode).
 # (tools/intel_llvm_build.py builds no libsycl-jit: libsycl opens it only to compile kernels from source.)
@@ -137,7 +137,7 @@ install(FILES third_party/main/intel-llvm/LICENSE.TXT
 # ROCm's device libraries: the engine's code for AMD GPUs carries parts of them (NCSA asks for the notice with binaries)
 install(FILES third_party/main/rocm-device-libs/LICENSE.TXT
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.rocm-device-libs)
-install(FILES third_party/main/stb/LICENSE   # stb_image, compiled into strata-image
+install(FILES third_party/main/stb/LICENSE   # stb_image, compiled into xestrata-image
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.stb)
 if(TARGET strata_xgrammar)   # XGrammar, picojson and DLPack, compiled into the engine (grammar-constrained decoding)
   install(FILES third_party/main/xgrammar/LICENSE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME}

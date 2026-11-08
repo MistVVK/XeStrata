@@ -8,7 +8,7 @@ English | [日本語](IMAGE.ja.md)
 
 XeStrata makes images as well, in the same PC and on the same GPU as the text model (All in One).
 The models that make images are optional, installed with the text model by `xestrata --setup`'s questions or `--images`.
-The images are made by XeStrata's own image engine, `strata-image`. It runs on the same SYCL kernels as the text engine, on Intel, AMD and NVIDIA GPUs alike.
+The images are made by XeStrata's own image engine, `xestrata-image`. It runs on the same SYCL kernels as the text engine, on Intel, AMD and NVIDIA GPUs alike.
 It goes with any version of Qwen3.8-Flash-Next (not yet with the BETA models), and is used from the text model's server: the web page's Images tab, the chat and the API (vLLM-Omni-compatible, so OpenAI-compatible).
 Text and images take turns on one GPU and share its VRAM. What happens to the text model while an image is made (it stays, gives up VRAM for the while, or is unloaded and comes back) is chosen by itself from the VRAM the image needs ([Sharing the GPU's memory](#sharing-the-gpus-memory)).
 
@@ -146,7 +146,7 @@ The config file's (`xestrata-<model>.json`) `"images"` also has entries to set b
 | `reload` | `lazy` | A text model taken off by `unload` comes back at the next request (`lazy`) or right after the image (`eager`) |
 | `daemon_idle_s` | 1800 | The seconds an image engine no server is connected to waits before it ends |
 | `keep_files` | 64 | How many `response_format: "url"` images are kept |
-| `out_dir` | a temporary folder | The folder for the images and the engine's log (`strata-image.log`) |
+| `out_dir` | a temporary folder | The folder for the images and the engine's log (`xestrata-image.log`) |
 | `lora_bake` | `true` | The plain LoRAs on the DiT's blocks baked into the weights (`false`: the delta added to each product. [LoRA](#lora-adapters)) |
 | `edit_adapter` | `chinoll` | MOSS-Image's edit adapter (`chinoll`, `armv5`, `armv6` or a name added to `edit_adapters`; the mask in "Changing an image" below). The environment variable `XESTRATA_MOSS_EDIT` wins over it |
 | `image_tools` | every one | The image tools a chat's model may use (`generate_image`, `edit_image`). A tool left out is offered neither to a chat nor by the Images API |
@@ -300,7 +300,7 @@ A map of another picture (`control.image`) - its pose, outlines, depth and the l
 - Models without ControlNet (Mage-Flow's edits, HunyuanImage 3.0, MOSS-Image with edits for the other kinds): the map goes in as one more reference image, and the prompt ends with an ask to follow it ("the pose of the person in image 2" and the like). The pose works well; outlines and depth can carry the picture's own people over. `strength`, `start` and `end` are not taken.
 - Models without edits (MageTrail, Anima, MOSS-Image without edits for kinds other than color and depth) take no `control`.
 - The weights (the Fun ControlNet Union, the maps' networks, MOSS-Image's adapter) are fetched by the server the first time they are used (a 503 with the progress meanwhile).
-- The answer's `strata` holds the map's size and its seconds.
+- The answer's `xestrata-engine` holds the map's size and its seconds.
 
 ### Changing an image (`POST /v1/images/edits`)
 
@@ -350,7 +350,7 @@ A model without edits (MageTrail, Mage-Flow without its edit model, MOSS-Image w
    - The parts are drawn largest first (XeStrata's choice: FaceDetailer goes in the detections' order), one at a time, each on the image as the ones before left it: where they overlap, a later one may change an earlier one's result. A box of 10 pixels or less a side, and one of 1024 pixels or more on both sides (large enough already), is skipped. With nothing found the image comes back as it was.
    - Part k's seed is the request's seed + k (with `n` of 2 or more, image i's + 1000 i too). The config's `budget_s` is also checked before each part: past that many seconds from the GPU's turn (the finding included) the parts left are skipped and the response says so (a part being drawn is not stopped).
    - `prompt` is what the parts should look like; without one each part's own words ("a detailed, well-drawn face" and so on) are drawn. Not with a mask, `extend` or `upscale`.
-   - The response's `strata` `fix` lists the parts drawn (`regions`: the part, its box on the image, the score, the seed, the cut, the size drawn, the seconds; a skipped one its reason), and `detect_s` the finding's time.
+   - The response's `xestrata-engine` `fix` lists the parts drawn (`regions`: the part, its box on the image, the score, the seed, the cut, the size drawn, the seconds; a skipped one its reason), and `detect_s` the finding's time.
 - **A region in words (`region`):** `region` with words such as `"hair"` makes the mask instead of painting one: the place the words name is found in the first image and only it is drawn again (the way of "Mask" above). Everything found is joined and grown by 1% of the short side (4 pixels at least). The finding is "Words to masks" below's, its model chosen with `region_model`. It does not go with a mask.
 - **Auxiliary weights:** the weights the tools use (the Detailer's detectors and so on) are fetched by the server from Hugging Face the first time they are used (at a pinned revision and SHA-256; `HF_ENDPOINT`'s mirror works too), into `image-tools/` in the image models' folder. While one downloads no image is made: the Images API answers 503 (`code` `weights_downloading`, `downloads` with the size, the progress and the license), the chat's tool that it is downloading. Once it is done, asking again works. A download that fails (offline, a full disk, a folder that cannot be written) gives the reason. The server's log shows the progress.
   SAM 3.1's weights are not fetched until the user has agreed to the SAM License (setup's question, or "SAM 3's license…" in the web page's Images view; the agreement is kept as `image-tools/sam3.accepted`). Until then Florence-2 finds the parts.
@@ -367,7 +367,7 @@ LocalAI's upscale: a multipart form with `image` (one), `model` and `scale`, or 
 - `model` is the upscaler: `realesrgan-x4plus` (RealESRGAN x4plus), `seedvr2-7b`, `seedvr2-7b-sharp` or `seedvr2-3b` (SeedVR2), `lanczos` or `auto` (also when none is given). They are listed in `/v1/models` too. `scale` is 4 by default with RealESRGAN, else 2.
 - vLLM-Omni's common image fields `response_format`, `output_format`, `output_compression` and `seed` are taken too.
 - `extra_params` takes the color correction `color_correction_method` (vLLM-Omni's SeedVR2's name: `none`, `lab`, `adain` or `wavelet`) and XeStrata's own `redraw` (`true`: drawn again by the image model after the upscale; `false` by default), `redraw_strength` (the redraw's strength, 0.35 by default) and `redraw_model` (the image model that draws it again; the default model by default). A redraw needs a `prompt` too.
-- It does what "Upscaling" above does (`upscale`'s `method`, `redraw`, `strength` and `color`). The answer's `strata` has `upscale`: the upscaler used, the color correction, the upscale's time (`upscale_s`; of it the model's `model_s`, the resize's `resize_s` and the correction's `color_s`) and, where it ran in tiles, their size and count (`tile`, `tiles`).
+- It does what "Upscaling" above does (`upscale`'s `method`, `redraw`, `strength` and `color`). The answer's `xestrata-engine` has `upscale`: the upscaler used, the color correction, the upscale's time (`upscale_s`; of it the model's `model_s`, the resize's `resize_s` and the correction's `color_s`) and, where it ran in tiles, their size and count (`tile`, `tiles`).
 
 ### Words to masks (`POST /v1/images/segmentations`)
 
@@ -377,10 +377,10 @@ vLLM-Omni's SAM 3 segmentation: a multipart form with `image` (one), `prompt` (t
 - `model` is `sam3.1`, `florence-2-large`, `florence-2-base` or `auto` (also when none is given). They are listed in `/v1/models` too.
    - `sam3.1`: Meta's SAM 3.1 (Comfy-Org's FP16 weights). It finds every instance of what the words name (a concept), highest score first.
    - `florence-2-large`, `florence-2-base`: Microsoft's Florence-2. It reads the words as a referring expression and answers with polygons, filled into the mask. It gives no score: `score` is `null`.
-   - `auto`: SAM 3.1 where the SAM License is agreed to and the words are a concept of at most four words within CLIP's 32 tokens; else (a phrase such as "the girl on the left") Florence-2 large, base where the large does not fit the GPU. The answer's `strata` has `fallback`, why it was not SAM 3.1.
+   - `auto`: SAM 3.1 where the SAM License is agreed to and the words are a concept of at most four words within CLIP's 32 tokens; else (a phrase such as "the girl on the left") Florence-2 large, base where the large does not fit the GPU. The answer's `xestrata-engine` has `fallback`, why it was not SAM 3.1.
 - XeStrata's `task` picks `mask` (the default), `box` (the boxes alone; `mask` is `null`) or `grounding` (Florence-2's phrase grounding: a box and `label` for each phrase of a caption).
 - vLLM-Omni's exemplar boxes (`boxes`) are not taken.
-- The answer's `strata` has the seconds taken and the engine's.
+- The answer's `xestrata-engine` has the seconds taken and the engine's.
 
 ### Removing the background (`POST /v1/images/remove-background`)
 
@@ -395,18 +395,18 @@ Words to masks and removing the background run in the image jobs' GPU turn and a
 
 ### A control map alone (`POST /v1/images/controls`)
 
-Makes and returns the map a `control` would give the model (the web page's "Preview the map"): a multipart form's `image`, `type` and the kind's fields, or JSON (`image` a data: URL or an http(s) URL). The answer is `created`, `type`, `width`, `height`, `data[]` (`b64_json` or `url`) and `strata` with the seconds. The map returned can go in a `control` with `preprocess: false` (MOSS-Image's color and depth) or `type: none`, and is not made again.
+Makes and returns the map a `control` would give the model (the web page's "Preview the map"): a multipart form's `image`, `type` and the kind's fields, or JSON (`image` a data: URL or an http(s) URL). The answer is `created`, `type`, `width`, `height`, `data[]` (`b64_json` or `url`) and `xestrata-engine` with the seconds. The map returned can go in a `control` with `preprocess: false` (MOSS-Image's color and depth) or `type: none`, and is not made again.
 
 ### The answer
 
 - `data[]`: the images (`b64_json` or `url`), with `revised_prompt` and `seed`; `lora` (each adapter's `name` and `scale`) when adapters were applied.
 - `usage`: counted in the image engine's tokens (the prompt's tokens, and one token for each 16x16 pixels of the reference images and the image made). For HunyuanImage 3.0: the prompt's ids, one for each 16x16 pixels of the image made, and a reference image's VAE tokens and 1,024 SigLIP2 slots.
-- `strata`: the seconds taken, the steps (those a strength ran), `strength` (when below 1), whether it was img2img (`img2img`) and took a mask (`mask`), whether it took a layout (`layout`), what the prompt's writing out made (`enhance`), CFG's strength, the text encoder's, the sampling's and the VAE's times, and what happened to the text model (`gpu_policy`); when adapters were applied, their count (`lora_n`), their VRAM (`lora_mib`) and the names a prompt's tag left out (`lora_unknown`). For HunyuanImage 3.0 it also has the guidance's strength (`guidance`), the bucket's number (`ratio`), when the size asked for was another, that size (`requested_size`), and when the model chose the size, the seconds the choice took (`size_choice_s`). When the mask's part was cut out and drawn, the size drawn (`made_size`), the part cut out (`crop`: `box` the x, y, width and height on the first image, `whole` whether the whole image was drawn again; `empty` for a mask with nothing painted) and the seconds of the cut and the putting back (`plan`'s `crop_s`). When it was drawn in two passes, the second's part, size and strength (`refine`).
+- `xestrata-engine`: the seconds taken, the steps (those a strength ran), `strength` (when below 1), whether it was img2img (`img2img`) and took a mask (`mask`), whether it took a layout (`layout`), what the prompt's writing out made (`enhance`), CFG's strength, the text encoder's, the sampling's and the VAE's times, and what happened to the text model (`gpu_policy`); when adapters were applied, their count (`lora_n`), their VRAM (`lora_mib`) and the names a prompt's tag left out (`lora_unknown`). For HunyuanImage 3.0 it also has the guidance's strength (`guidance`), the bucket's number (`ratio`), when the size asked for was another, that size (`requested_size`), and when the model chose the size, the seconds the choice took (`size_choice_s`). When the mask's part was cut out and drawn, the size drawn (`made_size`), the part cut out (`crop`: `box` the x, y, width and height on the first image, `whole` whether the whole image was drawn again; `empty` for a mask with nothing painted) and the seconds of the cut and the putting back (`plan`'s `crop_s`). When it was drawn in two passes, the second's part, size and strength (`refine`).
 - The image model is listed in `/v1/models` too.
 
 ### From the chat
 
-- `/v1/chat/completions` with `"strata_images": true` (the web page sends it) gives the model the `generate_image` and `edit_image` tools; when the model calls one, the server makes the image and shows it there.
+- `/v1/chat/completions` with `"xestrata_images": true` (the web page sends it) gives the model the `generate_image` and `edit_image` tools; when the model calls one, the server makes the image and shows it there.
   `edit_image` changes the conversation's last image (one attached or one made in the conversation); it takes a `strength` too, and is img2img with a model without edits. One request calls the tools up to 4 times.
   `extend_image` draws past the edges of the conversation's last image (as "Extending" above: the pixels a side, or `aspect`).
   `upscale_image` makes the conversation's last image larger, and with `redraw` draws it again finer (as "Upscaling" above: `scale`, 2 by default, `method`, `redraw`, not drawn again by default, and `strength`). When to draw it again ("just larger" no, "larger, with more detail" yes) is in the skill `tools/upscale_image`.
@@ -414,8 +414,8 @@ Makes and returns the map a `control` would give the model (the web page's "Prev
   `edit_region` draws the place the words name (`region`) again as `prompt` says (as "A region in words" above), `find_region` shows the image with that place painted red (nothing drawn), and `remove_background` takes the background away or puts a plain color behind (`version` and `background_color`). When to use them is in the skills `tools/edit_region`, `tools/find_region` and `tools/remove_background`.
   `control` makes a new image after the pose, outlines, depth and the like of the conversation's last image (one attached or one made in the conversation; as "Composition from a picture" above: `type`, `prompt`, `strength`, `end`). When to use it for "in this pose" and "with this composition" is in the skill `tools/control`.
   With Qwen-Image-2.1 and Mage-Flow, `generate_image` and `edit_image` take `guidance` too (a list of the names of "Sampling guidance" above); the three that need CFG are listed only where the model guides by default. When to use them is in `image_skill`'s `guidance`.
-- `"strata_images": {"force": true}` (with a `model` too, if wanted) offers the image tools alone and makes the reply open a call of one of them; the model writes the prompt from the conversation. The web page sends it with every message while the "Image" switch left of the send button is on (it is a switch, not a send button). It does not go together with a `tool_choice`.
-- `strata_images` with `{"tools": [...]}` narrows the image tools of that request (a tool the config's `image_tools` leaves out cannot be asked for).
+- `"xestrata_images": {"force": true}` (with a `model` too, if wanted) offers the image tools alone and makes the reply open a call of one of them; the model writes the prompt from the conversation. The web page sends it with every message while the "Image" switch left of the send button is on (it is a switch, not a send button). It does not go together with a `tool_choice`.
+- `xestrata_images` with `{"tools": [...]}` narrows the image tools of that request (a tool the config's `image_tools` leaves out cannot be asked for).
 - A chat model that reads pictures (a config with `vision`) is shown a small copy of the image it made (512 pixels on the longer side) as the tool's result, to check that it shows what was asked.
 - How to write each image model's prompt (its skills) is read with the `image_skill` tool. What always goes with the request is the image tools' short descriptions and `image_skill`'s (the rules for all, which models take tags and which sentences, the list of skills); the chat's model reads the skills it needs (several at once) when it decides to make an image, and a conversation that makes none carries none of them. Danbooru tags for Anima and MageTrail, English sentences for the other models, and each model's own rules over them. With two image models or more, what each is made for (`models`) is read the same way. They are in `serve/image_skills/` (`common.md` for all, `booru.md` for tags, `natural.md` for sentences, and a file for a model or its family; each file's `When:` line is its line in the list). A request sent with the image button, and `/v1/responses`' `image_generation`, carry the offered models' skills in the tools' descriptions from the start, as before.
 - With MOSS-Image, `generate_image` takes a layout too (`layout`, as the API's), so the chat's model can draft its boxes.
@@ -427,7 +427,7 @@ Makes and returns the map a `control` would give the model (the web page's "Prev
 
 A server with images set up can also make a video larger (SeedVR2 and the others) and find and follow the objects in a video (SAM 3.1). Both are in the web page's Video tab, in the chat and in the API (vLLM-Omni-compatible).
 
-- Videos are read and written with ffmpeg and ffprobe (the ones on the server's PATH, or those `STRATA_FFMPEG` and `STRATA_FFPROBE` name). XeStrata does not include them. Without them only the video tools are unavailable, and `xestrata --setup` says how to install them.
+- Videos are read and written with ffmpeg and ffprobe (the ones on the server's PATH, or those `XESTRATA_FFMPEG` and `XESTRATA_FFPROBE` name). XeStrata does not include them. Without them only the video tools are unavailable, and `xestrata --setup` says how to install them.
 - The videos read: whatever ffmpeg reads (MP4, WebM, MOV, MKV and the like).
    - A rotation in the file is applied as it is read.
    - A video whose frame rate varies (VFR) is read again at its average rate (frames dropped or repeated), and the answer says so.
@@ -524,7 +524,7 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 - Up to 4 stack at once. A name given twice is a 400.
 - The prompt's tags `<lora:name:strength>` are read too (in the positive and the negative prompt; the strength may be left out, and is 1.0 then). A tag is taken out of the prompt; when the listing has not the name, that tag is left out of the image and the name is said in the answer's `strata.lora_unknown` and the server's log. A tag's third field (`<lora:name:strength:strength>`) is A1111's text encoder's strength: it is not read (the tag is taken out). A prompt that is only a tag is a 400.
 - The field and the tags together take 4 at most, and a name twice uses the first only (the field, then the positive prompt's tags, then the negative prompt's).
-- Each image of the answer's `data[]` carries `lora` (the `name` and `scale` applied), and `strata` has `lora_n` (their count), `lora_mib` (the VRAM they take) and `lora_unknown` (the names a tag left out).
+- Each image of the answer's `data[]` carries `lora` (the `name` and `scale` applied), and `xestrata-engine` has `lora_n` (their count), `lora_mib` (the VRAM they take) and `lora_unknown` (the names a tag left out).
 
 **The web page:** the Images tab has a LoRA row (not for a model whose listing is empty). "Add a LoRA…" adds one from the listing, which shows as a chip: its strength can be changed in the chip's number field (-2 to 2, steps of 0.05), a file with `trigger` words has a "Trigger" button that puts them at the end of the prompt (it writes no tag), and × takes it off. 4 at most, and the browser keeps each model's choice and strengths.
 
@@ -635,7 +635,7 @@ HunyuanImage 3.0 (`hunyuan-image-3-distil`, w4a8, 1024x1024, 8 steps, one image 
 | `image: one image (this image model has no edits ...` (400) | img2img with a model without edits takes one image |
 | `the VAE file has no encoder for a base image` | The VAE file has no encoder, so img2img and masks cannot run. Run setup with `--images` again |
 | `the VRAM budget ... is below the weights that always stay` (400) | HunyuanImage 3.0's weights that always stay and its slots (about 10 GB) do not fit the VRAM. It does not run on this GPU |
-| `the image engine did not start ...`, `the image engine ended` | The image engine did not start, or stopped. See the log the message names (`strata-image.log`) |
+| `the image engine did not start ...`, `the image engine ended` | The image engine did not start, or stopped. See the log the message names (`xestrata-image.log`) |
 | `Image generation runs the image model at Q6_K instead of Q8_0 ...` | The RAM is short, so setup lowered the size ([Sizes and memory](#sizes-and-memory)) |
 | `faster with NVIDIA's ... cuDNN for the image engine's attention` (setup) | Without cuDNN, the attention on NVIDIA GPUs runs on XeStrata's own kernel. The command shown installs it, which is faster |
 | `anima:<name>: not Anima's DiT ...` (setup) | The file in `models/anima` is not in Anima's form. LoRAs go in `models/loras` |

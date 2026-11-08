@@ -34,7 +34,7 @@ A1111's and Forge's form, in the positive prompt and the negative one.  "local_p
 and no other path is taken (a path is not a capability).  A text encoder's adapter is not applied (the human's
 decision of 2026-10-29): "scale_text" and a tag's third field, A1111's text encoder's weight, are taken as the
 engine's other unknown fields are, ignored.  A name the listing does not have is refused where the field
-gives it, and taken out of the prompt with a warning where a tag gives it (the response's strata.lora_unknown and the
+gives it, and taken out of the prompt with a warning where a tag gives it (the response's xestrata.lora_unknown and the
 server's log; the human's decision of 2026-10-29, as A1111 and Forge do).  A model whose DiT takes no adapter at all
 takes neither the field nor a tag: both are refused, so no image is made without what was asked for.
 
@@ -970,7 +970,7 @@ class Fetch:
         self.error: str | None = None
         self.added: dict | None = None
         self.cancel = threading.Event()
-        threading.Thread(target=self._run, daemon=True, name="strata-lora-fetch").start()
+        threading.Thread(target=self._run, daemon=True, name="xestrata-lora-fetch").start()
 
     def view(self) -> dict:
         return {"id": self.id, "name": self.name, "state": self.state, "bytes": self.got, "total": self.total,

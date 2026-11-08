@@ -30,6 +30,7 @@
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/swiglu_clamp.hpp"
+#include "strata/platform/env.hpp"
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -190,7 +191,7 @@ inline float hsum8(__m256 v) {
 // worse than T0 at the same distance, so this keeps T0.
 int prefetch_distance() {
     static const int d = [] {
-        const char* v = std::getenv("STRATA_IQ_PREFETCH");
+        const char* v = strata::env_get("IQ_PREFETCH");
         return v ? (int) std::strtol(v, nullptr, 10) : 2048;
     }();
     return d;

@@ -16,6 +16,7 @@
 #include "strata/kernels/mrope.hpp"
 
 #include "strata/core/gpu.hpp"
+#include "strata/platform/env.hpp"
 
 #include <atomic>
 #include <chrono>
@@ -548,7 +549,7 @@ bool SessionLoopScratch::init(size_t parts_bytes_in, std::string& err) {
         pinned = true;
     }
     strata::aux_cpus::note_owned_thread();   // the host: --aux-cpus leaves it where it is
-    strata::platform::name_this_thread("strata-host");
+    strata::platform::name_this_thread("xs-host");
     return true;
 }
 
@@ -911,7 +912,7 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
     if (!le) { err = std::string("session_run_token: launch: ") + strata::gpu::last_error(); return false; }
     (void) strata::gpu::stream_idle(cs);                     // enter the driver before polling the mapped doorbell
     static const int flush_us = [] {
-        const char* e = std::getenv("STRATA_TG_FLUSH_US");
+        const char* e = strata::env_get("TG_FLUSH_US");
         return e ? std::atoi(e) : 2000;   // 24 Sep: 0 flushes run as fast as 5 us ones; this only notices faults
     }();
     volatile uint32_t* const seq = s.db->h_seq;

@@ -216,6 +216,7 @@
 #include "strata/image/yolo_detect.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/upscale/upscale.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1331,7 +1332,7 @@ int serve(si::ImagePipeline& p) {
         try {
             p.generate(r);
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "strata-image: no warm-up (%s)\n", e.what());
+            std::fprintf(stderr, "xestrata-image: no warm-up (%s)\n", e.what());
         }
         p.release(true);   // idle, the engine holds next to nothing on the GPU: the first request opens the parts
     }
@@ -1894,7 +1895,7 @@ int serve(si::ImagePipeline& p) {
                 try {
                     p.release(false);
                 } catch (const std::exception& e2) {
-                    std::fprintf(stderr, "strata-image: release after a failed request: %s\n", e2.what());
+                    std::fprintf(stderr, "xestrata-image: release after a failed request: %s\n", e2.what());
                 }
             }
             std::string m = e.what();
@@ -2028,7 +2029,7 @@ int main(int argc, char** argv) {
             si::YoloDetector& det = d.get(argv[2]);
             const si::QiRef img = read_image(argv[3]);
             const float conf = argc >= 5 ? std::stof(argv[4]) : 0.5f;
-            const char* rep = std::getenv("STRATA_DETECT_REPEAT");   // a timing's repeats
+            const char* rep = strata::env_get("DETECT_REPEAT");   // a timing's repeats
             const int repeat = rep != nullptr ? (int) std::strtol(rep, nullptr, 10) : 1;
             for (int i = 0; i < std::max(1, repeat); ++i)
                 std::printf("%s\n", detect_line(det, img, conf, argc >= 6 ? argv[5] : "", i + 1 < repeat).c_str());
@@ -2041,7 +2042,7 @@ int main(int argc, char** argv) {
             const si::QiRef img = read_image(argv[3]);
             std::string words;
             for (int i = 5; i < argc; ++i) words.append(argv[i]).append(" ");
-            const char* rep = std::getenv("STRATA_CONTROL_REPEAT");   // a timing's repeats
+            const char* rep = strata::env_get("CONTROL_REPEAT");   // a timing's repeats
             const int repeat = rep != nullptr ? (int) std::strtol(rep, nullptr, 10) : 1;
             for (int i = 0; i < std::max(1, repeat); ++i) {
                 std::istringstream ws(words);
@@ -2209,7 +2210,7 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
         }
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image: %s\n", e.what());
         return 1;
     }
     return 0;

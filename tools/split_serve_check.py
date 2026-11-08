@@ -22,7 +22,7 @@ The prompts folder has pp_<N>.txt files of comma-separated token ids (the bench 
 
 exact: a fresh engine reads a prompt and answers (the reference, twice, to show the engine's own run-to-run noise);
 then the prefill engine reads the same prompt, saves the session, a fresh decode engine restores it and answers.
-Compared: the state fingerprint (STRATA_STATE_HASH) of the prefill engine and of the decode engine right after the
+Compared: the state fingerprint (XESTRATA_STATE_HASH) of the prefill engine and of the decode engine right after the
 restore, then the answer's token ids and the fingerprint after the answer.
 
 bench: one arm per call (run it in its own job so the engines start fresh):
@@ -56,7 +56,7 @@ def session_dir(cfg):
     if not d and os.path.isdir("/dev/shm"):
         import shutil
         if shutil.disk_usage("/dev/shm").free > (6 << 30):
-            d = "/dev/shm/strata-split-check"
+            d = "/dev/shm/xestrata-split-check"
     d = d or cfg["dir"]
     os.makedirs(d, exist_ok=True)
     return d
@@ -82,9 +82,9 @@ def make_engine(cfg, gpus, tag, extra_args=(), arena=None, min_free_gib=8.0, sta
     c["log"] = os.path.join(cfg["dir"], f"engine-{tag}.log")
     open(c["log"], "w").close()
     env = srv.child_env(c)
-    env["STRATA_GPU_PCI"] = c["gpu_pci"]
+    env["XESTRATA_GPU_PCI"] = c["gpu_pci"]
     if state_hash:                  # the fingerprint after every request costs time with the prompt: exact mode only
-        env["STRATA_STATE_HASH"] = "1"
+        env["XESTRATA_STATE_HASH"] = "1"
     for k, v in (cfg.get("env") or {}).items():
         env[str(k)] = str(v)
     t0 = time.time()

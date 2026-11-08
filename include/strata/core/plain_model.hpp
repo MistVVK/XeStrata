@@ -878,7 +878,7 @@ private:
     bool dense_ = false;             ///< a dense FFN in every block and no experts (qwen35)
     /// a dense model's one-row windows with a graph or straight onto the stream: timed on the first decode windows
     /// (STRATA_PLAIN_EAGER=0 / 1 fixes it).  Other models: with a graph
-    StepForm step_form_{"STRATA_PLAIN_EAGER"};
+    StepForm step_form_{"PLAIN_EAGER"};
     int emb_type_ = -1;
     const uint8_t* emb_ = nullptr;   ///< token_embd in the GGUF mapping (rows dequantized on the host)
     const std::vector<const float*>* emb_rows_ = nullptr;   ///< set_embeddings'

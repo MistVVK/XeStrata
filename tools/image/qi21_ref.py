@@ -5,7 +5,7 @@ checked against.  Written from the model's structure: a single stream of the tex
 32 blocks of LayerNorm with a time scale, attention with RMS-normed q and k and a 3-axis rotary embedding (text
 tokens see the text before them, image tokens see everything), and a SwiGLU MLP with a time gate.
 
-    PY=... STRATA_GGUF_PY=<llama.cpp>/gguf-py python tools/image/qi21_ref.py DIT.gguf DUMP_DIR [STEP] [LAYERS]
+    PY=... XESTRATA_GGUF_PY=<llama.cpp>/gguf-py python tools/image/qi21_ref.py DIT.gguf DUMP_DIR [STEP] [LAYERS]
     ... python tools/image/qi21_ref.py --dump-block DIT.gguf DUMP_DIR OUT_DIR STEP BLOCK
 
 DUMP_DIR holds a run's dit_x_STEP / dit_t_STEP / dit_ctx_STEP (.bin + .json); prints how far this DiT's output is
@@ -14,11 +14,12 @@ from dit_out_STEP.  LAYERS (default all) runs only the first blocks (then nothin
 from __future__ import annotations
 
 import json
-import os
 import sys
 from pathlib import Path
 
 import numpy as np
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))   # the checkout, for serve/envvars.py
+from serve import envvars  # noqa: E402
 
 HEAD = 128
 AXES = (16, 56, 56)            # the rotary embedding's dims per axis: frame / text position, height, width
@@ -33,7 +34,7 @@ def load(d: Path, name: str) -> np.ndarray:
 
 class Weights:
     def __init__(self, path: str):
-        sys.path.insert(0, os.environ.get("STRATA_GGUF_PY", ""))
+        sys.path.insert(0, envvars.get("GGUF_PY", ""))
         from gguf import GGUFReader
         from gguf.quants import dequantize
         self.r, self.deq = GGUFReader(path), dequantize

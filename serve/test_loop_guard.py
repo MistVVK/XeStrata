@@ -203,8 +203,8 @@ class Serving(unittest.TestCase):
     def test_settings(self):
         self.assertTrue(loop_guard_setting({}, env={}))
         self.assertFalse(loop_guard_setting({"loop_guard": False}, env={}))
-        self.assertTrue(loop_guard_setting({"loop_guard": False}, env={"STRATA_LOOP_GUARD": "1"}))
-        self.assertFalse(loop_guard_setting({}, env={"STRATA_LOOP_GUARD": "off"}))
+        self.assertTrue(loop_guard_setting({"loop_guard": False}, env={"XESTRATA_LOOP_GUARD": "1"}))
+        self.assertFalse(loop_guard_setting({}, env={"XESTRATA_LOOP_GUARD": "off"}))
         req = {"loop_guard": "false"}
         check_request_sampling(req)
         self.assertIs(req["loop_guard"], False)

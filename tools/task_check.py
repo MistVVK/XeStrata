@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """Task scores of a quant, compared question by question with another run's (tools/quant_quality.py's companion):
 GSM8K (grade-school math, 1,319 questions) and HumanEval (164 Python functions run against their tests), greedy,
-through `strata --serve`.
+through `xestrata-engine --serve`.
 
     python tools/task_check.py fetch --out DIR
         the two data files, pinned by commit and SHA-256 (openai/grade-school-math, openai/human-eval; MIT)

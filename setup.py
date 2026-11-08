@@ -76,7 +76,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NoReturn
 
-from serve import kernel_check, places, release_check
+from serve import envvars, kernel_check, places, release_check
 
 ROOT = Path(__file__).resolve().parent
 WIN = places.WIN
@@ -96,7 +96,7 @@ SETUP_CMD = ("xestrata-cli" if WIN else "xestrata") if PACKAGED else "./setup.sh
 # Every Hugging Face file comes from a fixed commit of its repository (the `sha` of
 # https://huggingface.co/api/models/<repo> when it was pinned, upstream #214), so a checkout installs the same files
 # on any day.  Every file has a fixed size and SHA-256 too (REPO_PINS); a revision the repository no longer has stops
-# the download (download()), unless a tester sets STRATA_ALLOW_UNPINNED=1.
+# the download (download()), unless a tester sets XESTRATA_ALLOW_UNPINNED=1.
 HF_REVISIONS = {
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",        # 2026-09-29
     # 2026-10-07: the commit that adds Swift's IQ3_S (upstream e193161de)
@@ -146,13 +146,13 @@ _unpinned_said: list[int] = []
 
 
 def allow_unpinned() -> bool:
-    """STRATA_ALLOW_UNPINNED=1: a tester's opt-out (upstream e193161de).  A file whose pinned version is gone from
+    """XESTRATA_ALLOW_UNPINNED=1: a tester's opt-out (upstream e193161de).  A file whose pinned version is gone from
     Hugging Face is then taken from the repository's current files, without the SHA-256 check (nothing pins them).
     Off by default, announced when set."""
-    on = (os.environ.get("STRATA_ALLOW_UNPINNED") or "").strip() == "1"
+    on = (envvars.get("ALLOW_UNPINNED") or "").strip() == "1"
     if on and not _unpinned_said:
         _unpinned_said.append(1)
-        warn("STRATA_ALLOW_UNPINNED=1: a model file whose pinned version is gone from Hugging Face is taken from its "
+        warn("XESTRATA_ALLOW_UNPINNED=1: a model file whose pinned version is gone from Hugging Face is taken from its "
              "current files instead, and is NOT checked against a SHA-256. Unset it to get the checked files only")
     return on
 
@@ -169,12 +169,12 @@ def file_pin(url: str):
 # sizes, and is reachable from mainland China where huggingface.co often is not.  It serves a repository's current
 # files (no pinned revision), so a file from it is checked against the SHA-256 ModelScope publishes for it, and the
 # MTP tensors against the pinned checkpoint's own hashes (tools/mtp_fetch.py).
-# --source / STRATA_SOURCE: huggingface (what auto means), or modelscope: only when asked for (a different host
+# --source / XESTRATA_SOURCE: huggingface (what auto means), or modelscope: only when asked for (a different host
 # serving current files, not our pinned revision: setup never switches to it by itself, it recommends it, #908).
 MS_DEFAULT = "https://www.modelscope.cn"
 SOURCES = ("auto", "modelscope", "huggingface")
 HF_FILE = re.compile(r"^https?://[^/]+/(?P<repo>[^/]+/[^/]+)/resolve/[^/]+/(?P<path>.+)$")
-_sources = {}                                      # model_source()'s answer per (STRATA_SOURCE, HF_ENDPOINT, host)
+_sources = {}                                      # model_source()'s answer per (XESTRATA_SOURCE, HF_ENDPOINT, host)
 _ms_files = {}
 
 
@@ -185,7 +185,7 @@ def ms_endpoint() -> str:
 def reachable(url: str, timeout: float = 5.0) -> bool:
     """Whether `url` answers a HEAD request with success (2xx, after redirects) within `timeout` seconds."""
     try:
-        urllib.request.urlopen(urllib.request.Request(url, method="HEAD", headers={"User-Agent": "strata-setup"}),
+        urllib.request.urlopen(urllib.request.Request(url, method="HEAD", headers={"User-Agent": "xestrata-setup"}),
                                timeout=timeout).close()
         return True
     except OSError:                                    # HTTPError too: an error page is not the file
@@ -193,10 +193,10 @@ def reachable(url: str, timeout: float = 5.0) -> bool:
 
 
 def model_source() -> str:
-    """"modelscope" or "huggingface".  ModelScope only when --source modelscope / STRATA_SOURCE=modelscope asks for it;
-    everything else (auto, a HF_ENDPOINT mirror chosen on purpose, #495) is Hugging Face.  Setup does not switch hosts
-    by itself (#908): ModelScope serves a repository's current files, not our pinned revision."""
-    want = (os.environ.get("STRATA_SOURCE") or "auto").strip().lower()
+    """"modelscope" or "huggingface".  ModelScope only when --source modelscope / XESTRATA_SOURCE=modelscope asks for
+    it; everything else (auto, a HF_ENDPOINT mirror chosen on purpose, #495) is Hugging Face.  Setup does not switch
+    hosts by itself (#908): ModelScope serves a repository's current files, not our pinned revision."""
+    want = (envvars.get("SOURCE") or "auto").strip().lower()
     key = (want, os.environ.get("HF_ENDPOINT") or "", ms_endpoint())
     if key not in _sources:
         _sources[key] = "modelscope" if want in ("ms", "modelscope") else "huggingface"
@@ -228,7 +228,7 @@ def ms_meta(repo: str, path: str):
     if repo not in _ms_files:
         try:
             api = f"{ms_endpoint()}/api/v1/models/{repo}/repo/files?Recursive=true"
-            with urllib.request.urlopen(urllib.request.Request(api, headers={"User-Agent": "strata-setup"}),
+            with urllib.request.urlopen(urllib.request.Request(api, headers={"User-Agent": "xestrata-setup"}),
                                         timeout=60) as r:
                 files = json.loads(r.read())["Data"]["Files"]
             _ms_files[repo] = {f["Path"]: (int(f.get("Size") or 0), (f.get("Sha256") or "").lower()) for f in files}
@@ -349,8 +349,8 @@ MODELS: dict[str, dict[str, Any]] = {
     # Gyro (agentionai): "ram_gb" is the RAM that holds every expert with the usual room beside them ("arena_gb" +
     # LOW_RAM_HEADROOM_GB); with less, the low-RAM mode needs RAM and VRAM together of "arena_gb" + 12 (low_ram_fits:
     # 6 GB of each for the rest).  The rest of the download is the n-gram table, read from the SSD.  Neither is anyone's
-    # default.  Images: the same mmproj as every Flash-Next model; strata-vision reads only the vocabulary and header of
-    # the Gyro GGUF (tools/vision/gguf_meta.h), whose TQK6 / TQK7 tensors llama.cpp does not know.
+    # default.  Images: the same mmproj as every Flash-Next model; xestrata-vision reads only the vocabulary and header
+    # of the Gyro GGUF (tools/vision/gguf_meta.h), whose TQK6 / TQK7 tensors llama.cpp does not know.
     "Gyro-S": {"about": "for PCs with little memory (36 GB of RAM, or 38 GB of RAM and VRAM together); lower "
                         "quality than the 2-3-bit sizes, and the 2-bit Q2_0 decodes faster",
                "download_gb": 58.5, "ram_gb": 35.8, "arena_gb": 25.8, "families": ("gyro",),
@@ -771,9 +771,9 @@ FAMILIES: dict[str, dict[str, Any]] = {
                    "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; the AD files are AtomicChat's "
                               "quantization): https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF"},
 }
-# The models the engine runs other than Qwen3.8-Flash-Next (src/core/plain_model.cpp: `strata --native` with another
-# architecture): one GGUF file each, its size and SHA-256 at the pinned revision (the Hub's LFS pointers), or its
-# "parts" (a model in several files: each one's path in the repository, size and SHA-256; "file" is the first, which
+# The models the engine runs other than Qwen3.8-Flash-Next (src/core/plain_model.cpp: `xestrata-engine --native` with
+# another architecture): one GGUF file each, its size and SHA-256 at the pinned revision (the Hub's LFS pointers), or
+# its "parts" (a model in several files: each one's path in the repository, size and SHA-256; "file" is the first, which
 # the engine is given), no pack and no PLE table.  "tested": the files this release was checked with (the rest use the
 # same tensor types, checked on those files and in the kernels' tests).  "mmproj": the picture reader's file (the
 # family reads images); "dense": a model without experts, every weight of which the engine keeps in VRAM, and
@@ -1047,12 +1047,17 @@ def esp_download(data: Path) -> Path | None:
 # sizes its expert slots around it and the default reserve (700 MiB) is enough; engines before 0.1.2 need more
 VISION = {"gpu": {"max_tokens": 1024, "reserve_mib": 700},
           "cpu": {"max_tokens": 300, "reserve_mib": 700}}
-EXE = "strata.exe" if WIN else "strata"
-IMAGE_EXE = "strata-image.exe" if WIN else "strata-image"   # the image engine (serve/images.py), built with it
+EXE = "xestrata-engine.exe" if WIN else "xestrata-engine"
+IMAGE_EXE = "xestrata-image.exe" if WIN else "xestrata-image"   # the image engine (serve/images.py), built with it
 # the image encoder, one binary per place it runs: the configs of different models may use different ones
 # the image encoders: on the CPU, and on the GPU through Vulkan
 VEXE = {k: v + (".exe" if WIN else "") for k, v in
-        {"cpu": "strata-vision-cpu", "vulkan": "strata-vision-vulkan"}.items()}
+        {"cpu": "xestrata-vision-cpu", "vulkan": "xestrata-vision-vulkan"}.items()}
+# a config written before the programs took XeStrata's names names upstream's: point_engine_parts writes the new ones
+# (repoint_engine, on every start)
+UPSTREAM_EXES = ("strata", "strata-image", "strata-vision-cpu", "strata-vision-vulkan")   # upstream's names
+RENAMED = {old + ext: ("xestrata-engine" if old == UPSTREAM_EXES[0] else "xe" + old) + ext
+           for old in UPSTREAM_EXES for ext in (("", ".exe") if WIN else ("",))}
 
 
 # ------------------------------------------------------------------------------------------------ output
@@ -1178,7 +1183,7 @@ def run(cmd, cwd=None, env=None, check=True, quiet=False):
                        stdout=subprocess.PIPE if quiet else None, stderr=subprocess.STDOUT if quiet else None,
                        text=True)
     env = dict(os.environ if env is None else env)
-    env.setdefault("STRATA_EXIT_WITH_PARENT", "1")     # mtp_fetch.py ends with setup (upstream #3257: a cancel left it)
+    envvars.put_default(env, "EXIT_WITH_PARENT", "1")   # mtp_fetch.py ends with setup (upstream #3257)
     if check and r.returncode != 0:
         if quiet and r.stdout:
             say(r.stdout[-4000:])
@@ -1190,7 +1195,7 @@ def fetch_mtp(mtp: Path, env: dict, tries: int = 3):
     """The ~5 GB of MTP tensors (tools/mtp_fetch.py).  A timeout or a dropped connection stops one run, not the
     install (upstream #3214 #3193): it is run again, and each run continues where the last one stopped."""
     cmd = [sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "fetch", "--out", str(mtp)]
-    env = {**env, "STRATA_SOURCE": model_source()}
+    env = {**env, "XESTRATA_SOURCE": model_source()}
     for n in range(1, tries + 1):
         r = run(cmd, env=env, check=False)
         rc = 0 if r is None else r.returncode              # (a test double answers None)
@@ -1201,7 +1206,7 @@ def fetch_mtp(mtp: Path, env: dict, tries: int = 3):
                  f"({n + 1} of {tries})")
             time.sleep(5)
     fail(f"the draft layer's download keeps stopping (exit {rc}): the connection to Hugging Face is slow or drops",
-         "run setup again - what is downloaded is kept. If it still stops, set STRATA_SOURCE=modelscope "
+         "run setup again - what is downloaded is kept. If it still stops, set XESTRATA_SOURCE=modelscope "
          "(setup --source modelscope) to read the same files from ModelScope")
 
 
@@ -1263,7 +1268,7 @@ def ram_gb():
 
 def ram_reserve_args(a) -> list:
     """The engines' --ram-reserve-mib for setup's --ram-reserve-gib (none without it); the server gives the image
-    engine the same (STRATA_RAM_RESERVE_MIB)."""
+    engine the same (XESTRATA_RAM_RESERVE_MIB)."""
     return ["--ram-reserve-mib", str(int(a.ram_reserve_gib * 1024))] if a.ram_reserve_gib else []
 
 
@@ -1278,7 +1283,7 @@ def cpu_info():
     """(name, avx2, avx512): avx512 means everything Strata's fast AVX-512 kernels use (F, BW, VL, VNNI, VBMI),
     the same test the engine makes (cpu_avx512_ok), not just AVX-512F."""
     name, avx2, avx512 = platform.processor() or "unknown CPU", False, False
-    if WIN:                                            # no /proc/cpuinfo: the engine's own tests (strata-device --cpu)
+    if WIN:                                          # no /proc/cpuinfo: the engine's own tests (xestrata-device --cpu)
         try:
             c = json.loads(engine_tool("--cpu"))
             return c.get("name") or name, bool(c.get("avx2")), bool(c.get("avx512"))
@@ -2469,8 +2474,8 @@ def gpus_wsl():
 
 
 def gpus_from_engine():
-    """The GPUs as the engine sees them (strata-device --list-devices), in its order (the card it would take first), in
-    gpus()'s form.  What sysfs alone gives on Linux is not known here: the PCIe link, a small BAR (taken as the whole
+    """The GPUs as the engine sees them (xestrata-device --list-devices), in its order (the card it would take first),
+    in gpus()'s form.  What sysfs alone gives on Linux is not known here: the PCIe link, a small BAR (taken as the whole
     VRAM); an AMD card's gfx name is the HIP runtime's (its "arch"), the render node is not needed (no device files to
     open)."""
     vendors = {0x8086: "intel", 0x10DE: "nvidia", 0x1002: "amd"}
@@ -2593,7 +2598,7 @@ def check_gpus(sel, found, what="") -> None:
         gpu_table(found)
         single = [x for x in found if gpu_problem(x) is None]
         hint = ("use " + " or ".join(f"--gpu {x['index']}" for x in single)) if single else \
-            "Strata's Xe engine needs an Intel GPU on the xe or i915 driver, an RDNA2 or later AMD GPU on amdgpu, " \
+            "XeStrata's Xe engine needs an Intel GPU on the xe or i915 driver, an RDNA2 or later AMD GPU on amdgpu, " \
             "or with --license contrib an NVIDIA GPU"
         fail(f"GPU {i}{'' if g is None else ' (' + g['name'] + ')'} {what}cannot be used: {p}", hint)
 
@@ -2609,7 +2614,7 @@ def choose_gpus(a, found) -> list:
     single = sorted([g for g in found if gpu_problem(g) is None], key=lambda x: (-round(x["vram_gb"]), x["index"]))
     if not single:
         gpu_table(found)
-        fail("none of your GPUs can run Strata",
+        fail("none of your GPUs can run XeStrata",
              "it needs an Intel GPU on the xe or i915 driver, an RDNA2 or later AMD GPU on amdgpu, or with --license "
              "contrib an NVIDIA GPU")
     return [single[0]["index"]]
@@ -2696,7 +2701,7 @@ def free_gb(path):
 # piece at its own offset, and keeps the finished pieces in <name>.part.chunks so a stopped download continues where it
 # was.  Anything that is not a ranged file of known length (no Range support, no length, a small file) is one stream,
 # as before.
-DL_CONNECTIONS = 16             # STRATA_DL_CONNECTIONS=1 restores one stream (for testers)
+DL_CONNECTIONS = 16             # XESTRATA_DL_CONNECTIONS=1 restores one stream (for testers)
 DL_CHUNK = 32 << 20             # bytes per piece: what the piece list records and what a failed request loses at most
 # pieces one request asks for (4 x 32 MiB): a new connection per piece spends its first seconds in TCP slow start
 # (upstream's measurement: 8 connections 66 MB/s with a request per piece, 73 with 128 MiB)
@@ -2709,8 +2714,8 @@ DL_SAVE_EVERY = 5.0             # seconds between writes of the progress file
 
 
 def dl_connections() -> int:
-    """How many connections a big download uses: STRATA_DL_CONNECTIONS, else DL_CONNECTIONS (1 = one stream)."""
-    raw = (os.environ.get("STRATA_DL_CONNECTIONS") or "").strip()
+    """How many connections a big download uses: XESTRATA_DL_CONNECTIONS, else DL_CONNECTIONS (1 = one stream)."""
+    raw = (envvars.get("DL_CONNECTIONS") or "").strip()
     try:
         n = int(raw) if raw else DL_CONNECTIONS
     except ValueError:
@@ -2820,7 +2825,7 @@ class _Source:
         with self.lock:
             if stale is not None and self.final is not None and self.final != stale:
                 return self.final                        # another connection already got a fresh address
-            req = urllib.request.Request(self.url, headers={"User-Agent": "strata-setup", "Range": "bytes=0-0"})
+            req = urllib.request.Request(self.url, headers={"User-Agent": "xestrata-setup", "Range": "bytes=0-0"})
             with urllib.request.urlopen(req, timeout=60) as r:
                 cr = (r.headers.get("Content-Range") or "").strip()
                 if r.status != 206 or cr != f"bytes 0-0/{self.total}":
@@ -2897,7 +2902,7 @@ def _prefix_bytes(done: set, total: int) -> int:
 
 def _load_pieces(part: Path, total: int) -> set:
     """The finished pieces of an earlier run.  <name>.part.chunks lists them; a .part without it comes from one stream
-    (an older setup, or STRATA_DL_CONNECTIONS=1): its bytes are a run from the start, so those pieces are finished."""
+    (an older setup, or XESTRATA_DL_CONNECTIONS=1): its bytes are a run from the start, so those pieces are finished."""
     side = part.with_name(part.name + ".chunks")
     n = -(-total // DL_CHUNK)
     try:
@@ -3020,7 +3025,7 @@ def _fetch_run(src: _Source, st: _Pieces, f, run: list):
         attempt_pos = pos
         try:
             url = src.get()
-            req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={pos}-{end}"})
+            req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup", "Range": f"bytes={pos}-{end}"})
             with urllib.request.urlopen(req, timeout=60) as r:
                 _check_ranged(r, pos, end, st.total, src.etag)
                 while pos <= end:
@@ -3225,7 +3230,7 @@ def _repair_piece(src: _Source, st: _Pieces, f, i: int, stats: dict):
         before = pos
         try:
             url = src.get()
-            req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={pos}-{end}"})
+            req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup", "Range": f"bytes={pos}-{end}"})
             with urllib.request.urlopen(req, timeout=60) as r:
                 _check_ranged(r, pos, end, st.total, src.etag)
                 while pos <= end:
@@ -3336,7 +3341,7 @@ def download_single(url: str, part: Path, total: int, label: str):
         if total and have >= total:                    # stopped after the last byte, before the rename: nothing to
             break                                      # ask for (a range past the end is a 416, retried 30 times)
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={have}-"})
+            req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup", "Range": f"bytes={have}-"})
             with urllib.request.urlopen(req, timeout=60) as r:
                 if have:
                     m = _CONTENT_RANGE.match(r.headers.get("Content-Range") or "")
@@ -3377,7 +3382,7 @@ def range_total(url: str) -> int:
     """The file's length from a one-byte ranged GET (Content-Range: bytes 0-0/N), for a server whose HEAD gives none
     (ModelScope's: #1915); 0 when it does not say.  With the length known the file comes over several connections."""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": "bytes=0-0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup", "Range": "bytes=0-0"})
         with urllib.request.urlopen(req, timeout=60) as r:
             m = re.match(r"\s*bytes 0-0/(\d+)\s*$", r.headers.get("Content-Range") or "")
             return int(m.group(1)) if r.status == 206 and m else 0
@@ -3413,7 +3418,7 @@ def download(url, dst: Path, what=None):
     pin = REPO_PINS.get(ms[0], {}).get(ms[1].rsplit("/", 1)[-1]) if ms is not None else file_pin(url)
     for attempt in range(5):
         try:
-            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "strata-setup"})
+            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "xestrata-setup"})
             total = int(urllib.request.urlopen(req, timeout=60).headers.get("Content-Length", 0))
             break
         except urllib.error.HTTPError as e:
@@ -3786,7 +3791,7 @@ def custom_of(cfg_path: Path) -> dict | None:
 
 
 def engine_check(exe: Path, lib_dirs: list, gguf: Path) -> dict | None:
-    """The engine's own verdict on the model in `gguf` (strata --check-model: its headers against the engine's
+    """The engine's own verdict on the model in `gguf` (xestrata-engine --check-model: its headers against the engine's
     kernels, no GPU opened), its JSON line; None from an engine without the check (an older one would start the model
     instead).  Raises OSError when the engine gives no verdict."""
     try:
@@ -4116,9 +4121,9 @@ def packaged_engine_dir() -> Path:
 
 
 def engine_tool(*args: str) -> str:
-    """strata-device's output for `args` (--list-devices, --cpu): where setup has no sysfs or /proc to read (Windows),
+    """xestrata-device's output for `args` (--list-devices, --cpu): where setup has no sysfs or /proc to read (Windows),
     the engine reports the GPUs and the CPU itself."""
-    exe = packaged_engine_dir() / ("strata-device.exe" if WIN else "strata-device")
+    exe = packaged_engine_dir() / ("xestrata-device.exe" if WIN else "xestrata-device")
     r = subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         raise subprocess.SubprocessError((r.stderr or r.stdout).strip() or f"{exe.name} {' '.join(args)} failed")
@@ -4534,8 +4539,8 @@ def build_engine(visions, llama, comp: dict, data: Path) -> Path:
                                or (meta.get("compiler") or {}).get("cmake_args") != used.get("cmake_args")):
             shutil.rmtree(bdir)                        # CMake keeps the compiler and the -D values it configured with
         say("  The engine's source changed: compiling it again (only what changed) ..." if xe and (eng / EXE).exists()
-            and bdir.exists() else "  Compiling the Strata engine for the GPU (20-40 minutes, once) ...")
-        cmake_build(ROOT, bdir, ["strata", "strata-image"],
+            and bdir.exists() else "  Compiling the XeStrata engine for the GPU (20-40 minutes, once) ...")
+        cmake_build(ROOT, bdir, ["strata", "strata-image"],   # the targets keep upstream's names (CMakeLists.txt)
                     [f"-DCMAKE_CXX_COMPILER={comp['cxx']}", f"-DCMAKE_C_COMPILER={comp['cc']}",
                      f"-DSTRATA_LICENSE={comp['license']}",
                      f"-DSTRATA_CUDA_ARCHS={'auto' if comp['cuda_archs'] else ''}",
@@ -4552,13 +4557,14 @@ def build_engine(visions, llama, comp: dict, data: Path) -> Path:
         if v == "vulkan":
             say("  Compiling the image encoder for the GPU (Vulkan; 5-15 minutes, once) ...")
             bdir = ROOT / "build-vision-vulkan"
-            cmake_build(ROOT / "tools" / "vision", bdir, "strata-vision",
+            cmake_build(ROOT / "tools" / "vision", bdir, "strata-vision",   # upstream's target name
                         [llama_def, "-DSTRATA_VISION_VULKAN=ON", "-DSTRATA_PORTABLE=ON"])
         else:
             say("  Compiling the image encoder for the CPU ...")
             bdir = ROOT / "build-vision-cpu"
-            cmake_build(ROOT / "tools" / "vision", bdir, "strata-vision", [llama_def, "-DSTRATA_PORTABLE=ON"])
-        install_binary(bdir / "bin" / "strata-vision", eng / VEXE[v])
+            cmake_build(ROOT / "tools" / "vision", bdir, "strata-vision",   # upstream's target name
+                        [llama_def, "-DSTRATA_PORTABLE=ON"])
+        install_binary(bdir / "bin" / ("xestrata-vision.exe" if WIN else "xestrata-vision"), eng / VEXE[v])
         built[v] = vsrc
     stamp.write_text(json.dumps({"source": "local", "backend": "xe", "version": source_version(), "compiler": used,
                                  "lib_dirs": comp["lib_dirs"], "src": src, "vision_srcs": built}, indent=1))
@@ -4602,12 +4608,14 @@ def update_installed_engine() -> None:
     remove_old_image_engine()
     eng = ROOT / "engine"
     info = eng / "BUILD.json"
-    if not info.exists() or not (eng / EXE).exists():
+    if not info.exists():
         return
     meta = json.loads(info.read_text())
     visions = list((meta.get("vision_srcs") or {}).keys())
     vsrc = source_hash(VISION_SOURCES)
-    if engine_is_xe(meta) and meta.get("src") == source_hash(ENGINE_SOURCES) and \
+    # an engine compiled before the programs took XeStrata's names has none of EXE's name: it is compiled again
+    have = (eng / EXE).exists() and all((eng / VEXE[v]).exists() for v in visions if v in VEXE)
+    if have and engine_is_xe(meta) and meta.get("src") == source_hash(ENGINE_SOURCES) and \
             all(meta["vision_srcs"][v] == vsrc for v in visions):
         return
 
@@ -4615,14 +4623,15 @@ def update_installed_engine() -> None:
         build_engine(visions, get_llama_cpp(), recorded_compiler(meta), data_folder_path(None, load_settings()))
     except (Exception, SystemExit) as e:
         why = "" if isinstance(e, SystemExit) else f" ({e})"
-        if not engine_is_xe(meta):
-            fail(f"the installed engine is not the Xe build and compiling it failed{why}", "run ./setup.sh --setup")
+        if not engine_is_xe(meta) or not (eng / EXE).exists():
+            fail(f"the installed engine is not the Xe build of this version and compiling it failed{why}",
+                 "run ./setup.sh --setup")
         warn(f"could not compile the updated engine{why}: starting the installed one")
 
 
-# ---- image generation: Qwen-Image-2.1-Turbo on XeStrata's own image engine (strata-image, built with the text
+# ---- image generation: Qwen-Image-2.1-Turbo on XeStrata's own image engine (xestrata-image, built with the text
 # engine; serve/images.py).  upstream 0.1.44 (a5b3b6c2) runs stable-diffusion.cpp's sd-cli instead.
-# what XeStrata's earlier image generator (stable-diffusion.cpp's sd-cli, before strata-image) left in the install
+# what XeStrata's earlier image generator (stable-diffusion.cpp's sd-cli, before xestrata-image) left in the install
 OLD_IMAGE_ENGINE = ("engine-image", "build-image-vulkan", "build-image-cpu", "third_party/stable-diffusion.cpp")
 
 
@@ -4816,7 +4825,7 @@ def write_ratio_head(QI, models_dir: Path) -> None:
     def read(url: str, start: int, end: int) -> bytes:
         for attempt in range(5):
             try:
-                req = urllib.request.Request(url, headers={"User-Agent": "strata-setup",
+                req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup",
                                                            "Range": f"bytes={start}-{end}"})
                 data = urllib.request.urlopen(req, timeout=120).read()
                 if len(data) == end - start + 1:
@@ -5271,12 +5280,13 @@ def other_installs(settings: dict) -> list:
     """Strata folders besides this one that may hold model files: the ones this user ran before, and Strata* folders
     next to this one (a zip unpacked again lands in e.g. `Strata-main (1)\\Strata-main`)."""
     cands = [Path(p) for p in settings.get("installs", []) if not in_trash(p)]
+    NAMES = ("xestrata", "strata")                     # XeStrata's folders and upstream's
     for base in dict.fromkeys((ROOT.parent, ROOT.parent.parent)):
         try:
             for d in base.iterdir():
-                if d.is_dir() and d.name.lower().startswith("strata"):
+                if d.is_dir() and d.name.lower().startswith(NAMES):
                     cands.append(d)
-                    cands += [c for c in d.iterdir() if c.is_dir() and c.name.lower().startswith("strata")]
+                    cands += [c for c in d.iterdir() if c.is_dir() and c.name.lower().startswith(NAMES)]
         except OSError:
             pass
     found = []
@@ -5438,7 +5448,7 @@ def data_folder(requested: str | None, move: bool = False, yes: bool = True, set
             elsewhere.append(folder)                    # in use, or a copy the data folder already has
             warn(f"some model files are still in {folder} (in use, or already in {dest})")
         else:
-            ok(f"model files from {folder} moved to {dest} (a new copy of Strata finds them there)")
+            ok(f"model files from {folder} moved to {dest} (a new copy of XeStrata finds them there)")
     # the Strata folders this user ran (a package's folder holds no model files or configs: not one of them)
     installs = [*([] if PACKAGED else [str(ROOT)])] + \
         [p for p in settings.get("installs", []) if p != str(ROOT) and Path(p).is_dir() and not in_trash(p)]
@@ -5721,7 +5731,7 @@ def model_config(path: Path) -> bool:
         why = e.strerror or str(e)
     except ValueError:
         why = "not valid JSON"
-    warn(f"skipped {path.name} ({why}): it is not a XeStrata model config")
+    warn(f"skipped {path.name} ({why}): it is not an XeStrata model config")
     return False
 
 
@@ -6014,7 +6024,7 @@ def calibrate_config(cfg_path: Path) -> bool:
     import calibrate as CAL
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     say()
-    say("  Tuning Strata for this PC: the output speed is measured with a few engine settings (the PCIe share, the")
+    say("  Tuning XeStrata for this PC: the output speed is measured with a few engine settings (the PCIe share, the")
     say("  CPU threads, the expert cache). It takes roughly 15-30 minutes (3 rounds of each value); "
         "the PC is busy meanwhile.")
     try:
@@ -6089,6 +6099,10 @@ def repoint_engine(cfg_path: Path, cfg: dict) -> dict:
     (container/) share the settings, and keep the engine in different folders (lib vs lib64); the engine finds its
     libraries by its RPATH, so a config's other package's lib_dirs, missing here, are skipped."""
     if not PACKAGED:
+        # a source install's engine stays where it is; a config older than the programs' names XeStrata's (RENAMED)
+        # gets the new names there
+        if cfg.get("exe") and point_engine_parts(cfg, Path(cfg["exe"]).parent):
+            write_config(cfg_path, cfg)
         return cfg
     if point_engine_parts(cfg, packaged_engine_dir()):
         write_config(cfg_path, cfg)
@@ -6107,7 +6121,8 @@ def point_engine_parts(cfg: dict, eng: Path, parts: tuple = ("text", "vision", "
     changed = False
     for part in found:
         if isinstance(part, dict) and part.get("exe"):
-            new = eng / Path(part["exe"]).name
+            name = Path(part["exe"]).name
+            new = eng / RENAMED.get(name, name)
             if part["exe"] != str(new) and (PACKAGED or new.is_file()):
                 part["exe"] = str(new)
                 changed = True
@@ -6403,7 +6418,7 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     cfg_path.touch()                                     # the most recently used model
     if "--mtp" in cfg["args"][:-1]:
         refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
-    cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
+    cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "xestrata", "--config", str(cfg_path),
            "--port", str(port or cfg.get("port", 8095))]
     found = gpus()
     env = None
@@ -6420,9 +6435,9 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     elif gpu is not None:                              # --gpu N: this start only, by the card's PCI address
         check_gpus(gpu if isinstance(gpu, list) else [gpu], found)
         g = next(x for x in found if x["index"] == (gpu[0] if isinstance(gpu, list) else gpu))
-        env = dict(os.environ, STRATA_GPU_PCI=g["pci"])
+        env = dict(os.environ, XESTRATA_GPU_PCI=g["pci"])
         if cfg.get("split_pci"):                       # one card for this start, the saved split kept
-            env["STRATA_LAYER_SPLIT"] = "off"
+            envvars.put(env, "LAYER_SPLIT", "off")
         ok("GPU: " + gpu_name(g) + " (this start)")
     elif cfg.get("split_pci"):
         cards = [next((x for x in found if x["pci"] == pci), None) for pci in [cfg.get("gpu_pci"), *cfg["split_pci"]]]
@@ -6510,8 +6525,8 @@ def warm_up(cfg_path: Path) -> None:
     log = STATE / (cfg_path.stem + "-warmup.log")
     base = f"http://127.0.0.1:{port}"
     # #19: a server with a key answers 401 to a request without it (the warm-up waited out its 15 minutes): the first
-    # of the keys it takes, in its order (STRATA_API_KEY, else "api_key": a string "k1,k2" or a list)
-    key = os.environ.get("STRATA_API_KEY") or cfg.get("api_key") or ""
+    # of the keys it takes, in its order (XESTRATA_API_KEY, else "api_key": a string "k1,k2" or a list)
+    key = envvars.get("API_KEY") or cfg.get("api_key") or ""
     keys = [k.strip() for k in (key if isinstance(key, list) else str(key).split(",")) if str(k).strip()]
     auth = {"Authorization": f"Bearer {keys[0]}"} if keys else {}
     elog = cfg.get("log")                              # the engine's own log: the prompt's CPU share it measured
@@ -6575,7 +6590,7 @@ def warm_up(cfg_path: Path) -> None:
         return box["answer"]
 
     with open(log, "w", encoding="utf-8") as out:
-        proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config",
+        proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "xestrata", "--config",
                                  str(cfg_path), "--port", str(port)], stdout=out, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, **new_process_group())
         try:
@@ -6612,7 +6627,7 @@ def warm_up(cfg_path: Path) -> None:
 
 
 def start_free_mib(elog: str | None, since: int) -> int | None:
-    """The VRAM free at the engine's start ("strata generate: N MiB of VRAM free at the start") in its log after byte
+    """The VRAM free at the engine's start ("xestrata generate: N MiB of VRAM free at the start") in its log after byte
     `since`, the lowest if it started more than once; None when the log has none, or only 0: an engine that could not
     read the free VRAM wrote 0 (an unsupported integrated GPU beside the card broke Level Zero's sysman for both), and
     kept in the config, it left every start without an expert cache."""
@@ -6624,7 +6639,7 @@ def start_free_mib(elog: str | None, since: int) -> int | None:
             text = f.read().decode("utf-8", "replace")
     except OSError:
         return None
-    found = [int(v) for v in re.findall(r"strata generate: ([0-9]+) MiB of VRAM free at the start", text)]
+    found = [int(v) for v in re.findall(r"xestrata generate: ([0-9]+) MiB of VRAM free at the start", text)]
     found = [v for v in found if v > 0]
     return min(found) if found else None
 
@@ -6660,7 +6675,7 @@ def saved_vram_free(cfg: dict) -> str | None:
 
 
 def measured_cpu_share(elog: str | None, since: int) -> float | None:
-    """The last prompt's CPU share the engine measured ("strata serve: prefill CPU share X (measured)") in its log
+    """The last prompt's CPU share the engine measured ("xestrata serve: prefill CPU share X (measured)") in its log
     after byte `since`; None when it measured none (the share is not armed, or fixed already)."""
     if not elog:
         return None
@@ -6670,7 +6685,7 @@ def measured_cpu_share(elog: str | None, since: int) -> float | None:
             text = f.read().decode("utf-8", "replace")
     except OSError:
         return None
-    found = re.findall(r"strata serve: prefill CPU share ([0-9.]+) \(measured\)", text)
+    found = re.findall(r"xestrata serve: prefill CPU share ([0-9.]+) \(measured\)", text)
     return float(found[-1]) if found else None
 
 
@@ -6893,7 +6908,7 @@ def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None, gp
 
 def write_run_script(model, cfg_path, port, open_browser=True):
     """run-<model>.sh: the server with this config; `open_browser` False (--no-browser) leaves --open out."""
-    serve = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
+    serve = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "xestrata", "--config", str(cfg_path),
              "--port", str(port)] + (["--open"] if open_browser else [])
     script = ROOT / f"run-{model.lower()}.sh"
     script.write_text("#!/bin/sh\ncd \"" + str(ROOT) + "\"\nexec " + " ".join(f'"{x}"' for x in serve) + "\n",
@@ -6946,7 +6961,7 @@ def prepare_engine(a, gpu: dict, vision: str) -> tuple[Path, Path, str, list]:
                     "numpy, jinja2, regex, pyyaml, tqdm, requests, pillow, psutil, jsonschema")
 
     # ---- 4. the engine
-    step(4, "the Strata engine")
+    step(4, "the XeStrata engine")
     if PACKAGED:                                       # the package's: nothing is compiled
         llama = ROOT / "third_party" / "main" / "llama.cpp"   # gguf-py, for the tools below
         eng = packaged_engine_dir()
@@ -7021,10 +7036,10 @@ def plain_kv_takes(family: str) -> tuple:
 def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, found: list, gpu_chosen: bool,
                 ram: float, roots: list, elsewhere: list, port: int, adopted: Path | None) -> int:
     """Steps 2-7 for a model of PLAIN_FAMILIES: its size and context, the engine, the GGUF file (size and SHA-256 at
-    the pinned revision), its tokenizer and chat template written out, and the config: `strata --native` with no pack,
-    PLE table or MTP layer.  Images where the family has a picture reader ("mmproj"), as for Qwen3.8-Flash-Next.  --kv,
-    --parallel and --replicas as for Qwen3.8-Flash-Next where the engine takes them (the speed projection's vector is
-    that model's); --low-ram on|mmap reads
+    the pinned revision), its tokenizer and chat template written out, and the config: `xestrata-engine --native` with
+    no pack, PLE table or MTP layer.  Images where the family has a picture reader ("mmproj"), as for
+    Qwen3.8-Flash-Next.  --kv, --parallel and --replicas as for Qwen3.8-Flash-Next where the engine takes them (the
+    speed projection's vector is that model's); --low-ram on|mmap reads
     the experts from the model file instead of RAM (--mmap-experts), the engine's own choice when the RAM is short;
     --resident-budget-gib N keeps N GiB of them in RAM and reads the rest from the file;
     --gpus with several cards splits the layers across them (docs/MULTIGPU.md).  A dense model's sizes are recommended
@@ -7167,10 +7182,10 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         ok(f"vision encoder: {mmproj}")
 
     # ---- 6. the tokenizer and the chat template, for the server
-    step(6, "preparing the model for Strata")
+    step(6, "preparing the model for XeStrata")
     tok_dir = (find_in(roots, f"tokenizers/{tag.lower()}") or roots[0] / "tokenizers" / tag.lower())
     if not (tok_dir / "tokenizer" / "vocab.json").exists():
-        env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
+        env = dict(os.environ, XESTRATA_GGUF_PY=str(llama / "gguf-py"))
         run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--gguf", str(gguf), "--out", str(tok_dir)],
             env=env)
     ok(f"tokenizer: {tok_dir / 'tokenizer'}")
@@ -7216,7 +7231,7 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
                            "tokenizer": str(tok_dir / "tokenizer"), "model_name": f"{fam['name']}-{model.lower()}",
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
-        cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (STRATA_GPU_PCI)
+        cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (XESTRATA_GPU_PCI)
     if len(sel) > 1:                                   # --gpus: the layer split's other cards, as Qwen3.8-Flash-Next's
         cfg["gpu_pci"] = gpu["pci"]
         cfg["split_pci"] = [gpu_info(i)["pci"] for i in sel[1:]]
@@ -7432,7 +7447,7 @@ def main() -> int:
     if sys.platform != "linux" and not (WIN and PACKAGED):
         fail("XeStrata runs on Linux, and on Windows from its 7z" if WIN else "XeStrata runs on Linux and Windows")
     if wsl_version() == 1:
-        fail("Strata does not run on WSL 1 (it has no GPU access)", "use WSL 2, or a native Linux installation")
+        fail("XeStrata does not run on WSL 1 (it has no GPU access)", "use WSL 2, or a native Linux installation")
     if wsl_version() == 2:
         warn("WSL 2 has not been tested: XeStrata may work there, or not. If you get it working (or fix what stops "
              "it), a pull request is welcome")
@@ -7547,7 +7562,7 @@ def main() -> int:
     ap.add_argument("--api-key", help="require this key from clients (recommended with --host 0.0.0.0 or --host ::); "
                                       "several keys: key1,key2")
     ap.add_argument("--data-dir", help="where the model files go (~70-120 GB): default XeStrata-data next to this "
-                                       "folder, remembered for every Strata folder on this PC")
+                                       "folder, remembered for every XeStrata folder on this PC")
     ap.add_argument("--move-data", action="store_true",
                     help="with --data-dir: move the model files already on this PC into the new folder (without it "
                          "nothing is moved: the old files stay usable and the new folder gets the new downloads)")
@@ -7569,7 +7584,7 @@ def main() -> int:
     ap.add_argument("--source", choices=SOURCES, default=None,
                     help="where the model files come from: auto (default: Hugging Face), huggingface or modelscope "
                          "(mainland China: the same files, checked against ModelScope's published SHA-256; "
-                         "STRATA_SOURCE)")
+                         "XESTRATA_SOURCE)")
     ap.add_argument("--license", choices=[*LICENSES, "contrib-icpx"],
                     help="the build mode: free builds with free software only, for Intel and AMD GPUs; contrib (the "
                          "default) builds with intel/llvm's CUDA target for Intel, AMD and NVIDIA GPUs, and hands the "
@@ -7703,7 +7718,7 @@ def main() -> int:
     if a.name and not a.gguf:
         ap.error("--name names a model installed with --gguf, e.g. --gguf model.gguf --name my-model")
     if a.source:
-        os.environ["STRATA_SOURCE"] = a.source
+        envvars.put(os.environ, "SOURCE", a.source)
     if a.inspect:                                      # upstream #911: headers only, nothing is installed
         code = subprocess.run([sys.executable, str(ROOT / "tools" / "strata_inspect.py"), *a.inspect[:2]]).returncode
         sys.exit(inspect_with_engine(Path(a.inspect[0]).expanduser(), code) if len(a.inspect) == 1 else code)
@@ -7755,7 +7770,7 @@ def main() -> int:
     if a.describe:
         emit(describe())
         return 0
-    say("Strata - Qwen3.8-Flash-Next on a normal PC (a GPU + system RAM + CPU)")
+    say("XeStrata - Qwen3.8-Flash-Next on a normal PC (a GPU + system RAM + CPU)")
     # --check only reports (a user ran it to look, on a work machine): nothing made, moved or saved.  Given with what
     # acts before it (a measurement, an update), the data folder is prepared as for those
     if a.check and not (a.bench or a.bench_verbose or a.bench_original_compat is not None or a.update):
@@ -7776,12 +7791,13 @@ def main() -> int:
         return update_install(have)
     explicit = a.setup or a.model or a.family or a.check or a.no_start
     adopted = None                                     # the earlier install this copy is set up like
-    if not have and not explicit:                      # a new copy of Strata (an update unzipped elsewhere): set it
+    if not have and not explicit:                      # a new copy of XeStrata (an update unzipped elsewhere): set it
         prev = previous_config(elsewhere, load_settings())   # up like the last one, from the files already here
         if prev is not None:
             ch = choices_from_config(prev)
             if ch["model"]:
-                say(f"  Found your earlier install in {prev.parent} ({prev.stem[len('strata-'):]}): setting up this "
+                model = re.sub(r"^(?:xe)?strata-", "", prev.stem)   # xestrata-<model>.json, or an older strata-
+                say(f"  Found your earlier install in {prev.parent} ({model}): setting up this "
                     "copy the same way - the model files are reused, nothing big is downloaded.")
                 a.family, a.model, a.context = ch["family"], ch["model"], a.context or ch["context"]
                 adopted = prev
@@ -7901,9 +7917,9 @@ def main() -> int:
     found = gpus()
     if not found:
         fail("no Intel GPU on the xe or i915 driver, no AMD GPU on amdgpu and no NVIDIA GPU on NVIDIA's driver found",
-             "Strata's Xe engine needs an Intel GPU (Intel Arc, or the processor's graphics) on the xe or i915 kernel "
-             "driver, an RDNA2 or later AMD GPU on amdgpu, or with --license contrib an NVIDIA GPU on NVIDIA's driver "
-             "(lspci -k shows the driver)")
+             "XeStrata's Xe engine needs an Intel GPU (Intel Arc, or the processor's graphics) on the xe or i915 "
+             "kernel driver, an RDNA2 or later AMD GPU on amdgpu, or with --license contrib an NVIDIA GPU on NVIDIA's "
+             "driver (lspci -k shows the driver)")
     if len(found) > 1 or gpu_problem(found[0]) is not None:
         gpu_table(found)
     gpu_chosen = a.gpu is not None                     # --gpu given: the config names the card
@@ -7949,10 +7965,10 @@ def main() -> int:
              "CPU. "
              "Copies to the GPU will be slower; turn on Re-Size BAR (and Above 4G Decoding) in the BIOS")
     if gpu.get("integrated") and "uma_gb" not in gpu:
-        warn("the processor's own graphics: Strata will run, but slowly - its memory is the system RAM, and it has "
+        warn("the processor's own graphics: XeStrata will run, but slowly - its memory is the system RAM, and it has "
              "no matrix engines (XMX) on most processors")
     elif gpu["vram_gb"] < 11:
-        warn("less than 12 GB of VRAM: Strata will run, but most experts stay on the CPU and it will be slow")
+        warn("less than 12 GB of VRAM: XeStrata will run, but most experts stay on the CPU and it will be slow")
     ram, ram_total = usable_ram_gb(), ram_gb()
     cpu, avx2, avx512 = cpu_info()
     need = min(d["ram_gb"] for d in MODELS.values())
@@ -7966,7 +7982,7 @@ def main() -> int:
     if ram < need - 4 and not a.check and not low_ok:
         # every model keeps ALL its experts in RAM (23+ GB) unless the GPU holds enough of them for the low-RAM mode
         fail(f"RAM: {ram:.0f} GB - the smallest model (the Coder) needs about {need} GB",
-             "Strata keeps the model's experts in RAM (23-50 GB) and the GPU holds a copy of the most-used ones: it "
+             "XeStrata keeps the model's experts in RAM (23-50 GB) and the GPU holds a copy of the most-used ones: it "
              "needs 32 GB of RAM or more (48 GB for the full model), or a GPU with the VRAM to hold most of them")
     if a.ram_reserve_gib:
         ok(f"RAM: {ram_total:.0f} GB, {a.ram_reserve_gib:g} GiB of it kept free for other programs "
@@ -7978,7 +7994,7 @@ def main() -> int:
            ("; the GPU's VRAM makes up for it (the low-RAM mode)" if low_ok else ""))
     ok(f"CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})")
     if not avx2:
-        fail("this CPU has no AVX2; Strata needs at least AVX2")
+        fail("this CPU has no AVX2; XeStrata needs at least AVX2")
     if a.check:
         say()
         any_fits = False
@@ -8013,10 +8029,10 @@ def main() -> int:
         if not any_fits:
             # upstream #977: every size says "does not fit", so the verdict says so too (and the exit code, for
             # scripts). It only reports: --model NAME --yes still installs one anyway.
-            say(f"\nThis PC cannot run Strata yet: no model size fits {ram:.0f} GB of RAM (the smallest needs about "
+            say(f"\nThis PC cannot run XeStrata yet: no model size fits {ram:.0f} GB of RAM (the smallest needs about "
                 f"{need} GB). --model NAME --yes installs one anyway, slowly.")
             return 1
-        say("\nThis PC can run Strata. Run it again without --check to install.")
+        say("\nThis PC can run XeStrata. Run it again without --check to install.")
         return 0
 
     # ---- 2. the questions
@@ -8385,9 +8401,9 @@ def main() -> int:
                 "cosine 0.999 vs BF16); see 'A Q8_0 encoder' in docs/DETAILS.md")
 
     # ---- 6. the pack and the MTP draft layer
-    step(6, "preparing the model for Strata")
+    step(6, "preparing the model for XeStrata")
     pack = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
-    env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
+    env = dict(os.environ, XESTRATA_GGUF_PY=str(llama / "gguf-py"))
     if model == "Q2_0" and avx512 and family == "qwen":
         # the Q2_0 experts repacked for the AVX-512 kernel (the measured speed): a one-time ~40 GB conversion
         if not (pack / "index.txt").exists() or not (pack / "experts.bin").exists():   # index.txt is written last
@@ -8533,7 +8549,7 @@ def main() -> int:
                            "model_name": f"{fam['name']}-{model.lower()}",
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
-        cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (STRATA_GPU_PCI)
+        cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (XESTRATA_GPU_PCI)
     if len(sel) > 1:                                   # --gpus: the layer split's other cards (docs/MULTIGPU.md)
         cfg["gpu_pci"] = gpu["pci"]
         cfg["split_pci"] = [gpu_info(i)["pci"] for i in sel[1:]]

@@ -44,7 +44,7 @@ def tool(name: str) -> str:
 
 
 def engine_of(path: Path, tmp: Path) -> Path:
-    """The strata executable: the path itself, or the one inside a deb or rpm."""
+    """The xestrata-engine executable: the path itself, or the one inside a deb or rpm."""
     if path.suffix not in (".deb", ".rpm"):
         return path
     root = tmp / "root"
@@ -54,9 +54,9 @@ def engine_of(path: Path, tmp: Path) -> Path:
     else:
         rpm = subprocess.run(["rpm2cpio", str(path)], check=True, capture_output=True).stdout
         subprocess.run(["cpio", "-idm", "--quiet"], input=rpm, cwd=root, check=True)
-    found = [p for p in root.rglob("strata") if p.is_file() and p.parent.name == "engine"]
+    found = [p for p in root.rglob("xestrata-engine") if p.is_file() and p.parent.name == "engine"]
     if not found:
-        sys.exit(f"no engine/strata in {path}")
+        sys.exit(f"no engine/xestrata-engine in {path}")
     return found[0]
 
 

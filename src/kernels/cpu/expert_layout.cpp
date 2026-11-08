@@ -4,6 +4,7 @@
 // src/kernels/cpu/expert_layout.cpp - plan v0.3 P6: the per-layer expert table.  See the header.
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
+#include "strata/platform/env.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -29,7 +30,7 @@ void expert_layout_set(const ExpertLayout& layout) { g_layout = layout; }
 
 bool cpu_avx512_ok() {
     static const bool ok = [] {
-        if (const char* f = std::getenv("STRATA_FORCE_AVX2"); f != nullptr && f[0] == '1') return false;
+        if (const char* f = strata::env_get("FORCE_AVX2"); f != nullptr && f[0] == '1') return false;
         unsigned r[4] = {0, 0, 0, 0};
         auto cpuid = [&](unsigned leaf, unsigned sub) {
 #if defined(_MSC_VER)
@@ -94,7 +95,7 @@ bool cpu_avx2_ok() {
 bool cpu_avxvnni_ok() {
 #if defined(STRATA_HAVE_AVXVNNI)
     static const bool ok = [] {
-        if (const char* e = std::getenv("STRATA_NO_AVXVNNI"); e != nullptr && e[0] == '1') return false;
+        if (const char* e = strata::env_get("NO_AVXVNNI"); e != nullptr && e[0] == '1') return false;
         if (!cpu_avx2_ok()) return false;
         unsigned a = 0, b = 0, c = 0, d = 0;
         auto cpuid = [&](unsigned leaf, unsigned sub) {
@@ -133,7 +134,7 @@ void cpuid_regs(unsigned leaf, unsigned sub, unsigned r[4]) {
 
 int iq256_gather_setting() {
     static const int s = [] {
-        const char* v = std::getenv("STRATA_IQ256_GATHER");
+        const char* v = strata::env_get("IQ256_GATHER");
         if (v == nullptr || v[0] == '\0') return -1;
         return std::strtol(v, nullptr, 10) != 0 ? 1 : 0;
     }();
@@ -245,7 +246,7 @@ void cpu_require_expert_support() {
     const CpuFeatures f = cpu_features();
     if (f.usable()) return;
     std::fprintf(stderr,
-                 "strata: this CPU cannot run the expert kernel: %s.\n"
+                 "xestrata: this CPU cannot run the expert kernel: %s.\n"
                  "        The pack in --pack is the AVX-512 Q2_0 pack (its folder has no native_experts.txt): its CPU kernel needs\n"
                  "        AVX512-VNNI and AVX512-VBMI (Intel Ice Lake / AMD Zen 4 or newer).\n"
                  "        An i-quant (IQ3_XXS, IQ3_S, ...) or Unsloth pack has native_experts.txt in its folder and runs on an\n"

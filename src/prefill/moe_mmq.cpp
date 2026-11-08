@@ -10,6 +10,7 @@
 #include "strata/kernels/xmx_gemm.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU prefill_moe_mmq
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -39,7 +40,7 @@ void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols,
 void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, void* xq, int t, int64_t cols,
                       int64_t ld, int64_t tokens, int k_used, void* stream) {
     static const bool gather = [] {
-        const char* e = std::getenv("STRATA_QUANT_GATHER");
+        const char* e = strata::env_get("QUANT_GATHER");
         return e != nullptr && e[0] == '1';
     }();
     if (gather) return quantize(x, src, xq, t, cols, ld, tokens * k_used, stream);

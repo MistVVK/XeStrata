@@ -10,7 +10,7 @@ follows it) and B XeStrata's.
     A="CMD..." B="CMD..." PROFILE=... DATA=DIR IDS=DIR [A_ARGS="..."] [B_ARGS="..."] \\
       python .claude/skills/upstream-sync/scripts/ab_pair.py generate|serve|usage OUT GPU [--dry-run]
 
-A and B: each run's binary or wrapper, optionally after `env K=V ...` (the switch: `env STRATA_X=0 build/...`).
+A and B: each run's binary or wrapper, optionally after `env K=V ...` (the switch: `env XESTRATA_X=0 build/...`).
 A_ARGS and B_ARGS: options one of them takes besides the model's and setup's.  PROFILE: the expert profile of both
 (A_PROFILE and B_PROFILE when they differ).  A_ROOT and B_ROOT (default this tree): the trees whose serve/server.py
 everyday use starts.  A_NAME and B_NAME (default "A" and "B"): their names in the tables.  TIERS (default "32k"),

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """serve/image_controls.py - the composition control (the chat's `control`, the Images API's `control` field and
-POST /v1/images/controls): a control image made from a picture by the engine's CONTROL line (strata-image's
+POST /v1/images/controls): a control image made from a picture by the engine's CONTROL line (xestrata-image's
 cnet_prep: canny, depth, pose and the others), then given to the image model.
 
     job["control"] = parse_control(req["control"], cfg, picture)   # the request's, checked
@@ -308,7 +308,7 @@ def parse_job(req: dict, cfg: dict, files: list[bytes] | None = None, mask: byte
 
 
 def control_words(c: dict) -> str:
-    """CONTROL's words of a control's parameters (strata-image's)."""
+    """CONTROL's words of a control's parameters (xestrata-image's)."""
     p = c.get("params") or {}
     words = f" RES:{int(c.get('resolution') or RESOLUTION)}"
     if "low" in p:
@@ -488,7 +488,7 @@ def color_map(svc, gen, picture: bytes, cancel=None) -> dict:
 
 
 def img_words(job: dict, cfg: dict, width: int, height: int) -> str:
-    """IMG's ControlNet words (strata-image's CNET:, CTRL:, CTRLS:, CTRLNOINPAINT) of a prepared job; "" without one.
+    """IMG's ControlNet words (xestrata-image's CNET:, CTRL:, CTRLS:, CTRLNOINPAINT) of a prepared job; "" without one.
     The start and end shares of the schedule as the model's sigmas (images.percent_sigma).  MOSS-Image's control:
     MCTL:, MCOLOR:, MDEPTH: and MCTLENDS: (its LoRA is among the request's LORA: words)."""
     m = job.get("mctl")
@@ -530,7 +530,7 @@ def preview_request(fields: dict, picture: bytes | None) -> dict:
 
 def preview_response(svc, gen, req: dict, base_url: str, cancel=None) -> dict:
     """The control image a request would give the model (the web page's look before sending) as OpenAI's images
-    answer: created, data [{b64_json or url}], the type and size, and "strata" figures."""
+    answer: created, data [{b64_json or url}], the type and size, and "xestrata" figures."""
     fields = dict(req["fields"])
     kind = str(fields.get("type") or fields.get("kind") or "").lower()
     kind = ALIASES.get(kind, kind)
@@ -550,4 +550,4 @@ def preview_response(svc, gen, req: dict, base_url: str, cancel=None) -> dict:
     entry = ({"url": f"{base_url}/v1/images/files/{gen.store(made['image'], 'png')}"}
              if req["response_format"] == "url" else {"b64_json": base64.b64encode(made["image"]).decode()})
     return {"created": int(time.time()), "type": c["type"], "width": made["width"], "height": made["height"],
-            "data": [entry], "strata": {"seconds": made["seconds"], "engine_s": made["engine_s"]}}
+            "data": [entry], "xestrata": {"seconds": made["seconds"], "engine_s": made["engine_s"]}}

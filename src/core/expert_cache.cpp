@@ -5,6 +5,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/gpu.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -316,17 +317,17 @@ bool g_cache_vmm = false;   // set_vmm
 // piece fallback and its give-up can be tested without a driver in that state (the B70's xe, 2026-10-22: 25.5 GiB
 // refused with 26.4 GiB reported free, every retry after it refused).
 bool fake_alloc_fail() {
-    static const char* const kEnv = "STRATA_TEST_ALLOC_FAIL";
-    const char* v = std::getenv(kEnv);
+    static const char* const kEnv = "TEST_ALLOC_FAIL", *const kSet = "XESTRATA_TEST_ALLOC_FAIL";
+    const char* v = strata::env_get(kEnv);
     char* end = nullptr;
     const long n = v != nullptr ? std::strtol(v, &end, 10) : 0;
     if (n <= 0 || end == v) return false;
     char one[8] = "1";
     std::snprintf(one, sizeof one, "%ld", n - 1);   // counts down, so a test can stage several cases
 #if defined(_WIN32)
-    _putenv_s(kEnv, one);
+    _putenv_s(kSet, one);
 #else
-    ::setenv(kEnv, one, 1);
+    ::setenv(kSet, one, 1);
 #endif
     return true;
 }
@@ -335,17 +336,17 @@ bool fake_alloc_fail() {
 // of it leaves no prefix to keep, the same give-up as no piece at all).
 bool fake_piece_fail(bool first) {
     if (first) return false;
-    static const char* const kEnv = "STRATA_TEST_PIECE_FAIL";
-    const char* v = std::getenv(kEnv);
+    static const char* const kEnv = "TEST_PIECE_FAIL", *const kSet = "XESTRATA_TEST_PIECE_FAIL";
+    const char* v = strata::env_get(kEnv);
     char* end = nullptr;
     const long n = v != nullptr ? std::strtol(v, &end, 10) : 0;
     if (n <= 0 || end == v) return false;
     char one[8];
     std::snprintf(one, sizeof one, "%ld", n - 1);
 #if defined(_WIN32)
-    _putenv_s(kEnv, one);
+    _putenv_s(kSet, one);
 #else
-    ::setenv(kEnv, one, 1);
+    ::setenv(kSet, one, 1);
 #endif
     return true;
 }
@@ -423,7 +424,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
                 std::vector<uint64_t> off((size_t) n_slots + 1, 0);
                 for (size_t i = 0; i < (size_t) n_slots; ++i) off[i + 1] = off[i] + (uint64_t) blob_bytes;
                 if (alloc_pieces(off, piece, true, &fitted, err)) {
-                    std::fprintf(stderr, "strata: expert cache: the one allocation of %lld MiB was refused; %lld slots "
+                    std::fprintf(stderr, "xestrata: expert cache: the one allocation of %lld MiB was refused; %lld slots "
                                          "(%lld MiB) taken in pieces instead\n",
                                  (long long) (want >> 20), (long long) fitted,
                                  (long long) (slot_end(fitted) >> 20));
@@ -574,7 +575,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
         const uint64_t piece = std::min(std::max<uint64_t>(want / 8, 256u << 20), max_alloc_bytes());
         int64_t fitted = 0;
         if (alloc_refused_ && want > piece && alloc_pieces(off, piece, true, &fitted, err)) {
-            std::fprintf(stderr, "strata: expert cache: the one allocation of %lld MiB was refused; %lld slots "
+            std::fprintf(stderr, "xestrata: expert cache: the one allocation of %lld MiB was refused; %lld slots "
                                  "(%lld MiB) taken in pieces instead\n",
                          (long long) (want >> 20), (long long) fitted, (long long) (slot_end(fitted) >> 20));
             start_tables(fitted, n_layers, n_expert, mx);   // seeds the layers' cursors on these slots (#369)

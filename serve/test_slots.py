@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class FakeProc:
-    """Stands in for the engine process: answers SAVE / RESTORE lines like `strata --serve` does."""
+    """Stands in for the engine process: answers SAVE / RESTORE lines like `xestrata-engine --serve` does."""
 
     def __init__(self, engine) -> None:
         self.engine = engine

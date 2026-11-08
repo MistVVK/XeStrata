@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-# tools/vision - strata-vision, the image encoder for Strata's multimodal path (optional; setup.py builds it when
+# tools/vision - xestrata-vision, the image encoder for XeStrata's multimodal path (optional; setup.py builds it when
 # the vision encoder is chosen).  Uses llama.cpp's mtmd library at the same pinned commit as the engine's ggml.
 #
 #   cmake -S tools/vision -B build-vision-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=third_party/main/llama.cpp
@@ -47,8 +47,11 @@ add_subdirectory(${LLAMA_DIR} llama EXCLUDE_FROM_ALL)
 
 add_executable(strata-vision strata_vision.cpp)
 target_link_libraries(strata-vision PRIVATE mtmd llama)
+# the engine's header-only strata/platform/env.hpp: the XESTRATA_* variables, with the old STRATA_* names read too
+target_include_directories(strata-vision PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
 target_compile_features(strata-vision PRIVATE cxx_std_17)
-set_target_properties(strata-vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set_target_properties(strata-vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+                      OUTPUT_NAME xestrata-vision)   # the program's name is XeStrata's, the target upstream's
 if(WIN32)
   # #24: the Windows package's CPU reader, cross-built as the engine is (cmake/toolchain-windows-msvc.cmake): the C
   # runtime's deprecation of getenv and fopen off, and the UTF-8 manifest the engine takes (upstream #3202)

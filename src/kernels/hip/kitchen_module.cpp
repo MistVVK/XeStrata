@@ -3,7 +3,7 @@
 // src/kernels/hip/kitchen_module.cpp - the module of comfy-kitchen's HIP kernels (third_party/main/comfy-kitchen,
 // Apache-2.0: its WMMA int8 product with the scales and bias in its epilogue, and its int8 attention, for RDNA3 and
 // RDNA4), which i8_gemm.cpp opens on an AMD GPU only: the kernels need AMD's HIP runtime, which a machine with other
-// makers' GPUs need not have (libstrata_hip_kitchen.so, strata_hip_kitchen.dll, beside the engine).  Its entries take
+// makers' GPUs need not have (libxestrata_hip_kitchen.so, xestrata_hip_kitchen.dll, beside the engine).  Its entries take
 // the SYCL queue's HIP stream and the device's pointers.
 #include <hip/hip_runtime_api.h>
 

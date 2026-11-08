@@ -144,7 +144,7 @@ inline llama_model* strata_open_text_model(const std::string& model, std::string
     if (!tmpdir || !*tmpdir) tmpdir = std::getenv("TEMP");
     if (!tmpdir || !*tmpdir) tmpdir = std::getenv("TMP");
     if (!tmpdir || !*tmpdir) tmpdir = "/tmp";
-    const std::string meta = std::string(tmpdir) + "/strata-vision-meta-" + std::to_string((long) STRATA_GETPID()) + ".gguf";
+    const std::string meta = std::string(tmpdir) + "/xestrata-vision-meta-" + std::to_string((long) STRATA_GETPID()) + ".gguf";
     std::string err;
     llama_model* m = nullptr;
     if (strata_gguf::copy_meta(model, meta, err)) {

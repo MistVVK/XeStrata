@@ -185,7 +185,7 @@ def arena_path(cfg: dict, spec: dict) -> tuple[str | None, int | None, str]:
         return None, None, ("this OS has no memfd: each engine keeps its own copy of the experts; name a file in "
                             "\"shared_arena\" to share one")
     try:
-        fd = os.memfd_create("strata-split-arena")      # close-on-exec: only the engines given it (pass_fds) get it
+        fd = os.memfd_create("xestrata-split-arena")      # close-on-exec: only the engines given it (pass_fds) get it
     except OSError as e:
         return None, None, f"no memory file for a shared arena ({e}): each engine keeps its own copy of the experts"
     return f"/proc/self/fd/{fd}", fd, "one shared expert arena in RAM"
@@ -201,10 +201,10 @@ def session_dir(spec: dict) -> str:
     try:
         if os.name != "nt" and os.path.isdir(shm) and os.access(shm, os.W_OK) and \
                 shutil.disk_usage(shm).free > (6 << 30):
-            return tempfile.mkdtemp(prefix="strata-split-", dir=shm)
+            return tempfile.mkdtemp(prefix="xestrata-split-", dir=shm)
     except OSError:
         pass
-    return tempfile.mkdtemp(prefix="strata-split-")
+    return tempfile.mkdtemp(prefix="xestrata-split-")
 
 
 def common_prefix(a, b) -> int:
@@ -228,7 +228,7 @@ class SplitEngine:
         d["prefill"], d["decode"] = prefill, decode
         d["cur"] = decode                      # the engine the request is on now (progress, last)
         d["min_tokens"] = int(min_tokens)
-        d["work_dir"] = work_dir or tempfile.mkdtemp(prefix="strata-split-")
+        d["work_dir"] = work_dir or tempfile.mkdtemp(prefix="xestrata-split-")
         d["arena_fd"] = arena_fd
         d["say"] = say or (lambda s: print(s, flush=True))
         d["held"] = []                         # the tokens the decode engine's session holds (estimated: ids + answer)
@@ -326,7 +326,7 @@ class SplitEngine:
         if "decode" in errors:
             raise errors["decode"]
         for name, err in errors.items():
-            self.say(f"[strata] the {name} engine of the split did not start ({err}); the other one serves")
+            self.say(f"[xestrata] the {name} engine of the split did not start ({err}); the other one serves")
         self.__dict__["held"] = []
 
     def unload(self):
@@ -363,11 +363,11 @@ class SplitEngine:
 
         def run():
             try:
-                self.say("[strata] split: the prefill engine had stopped; starting it again")
+                self.say("[xestrata] split: the prefill engine had stopped; starting it again")
                 e.restart()
-                self.say("[strata] split: the prefill engine is running again")
+                self.say("[xestrata] split: the prefill engine is running again")
             except BaseException as x:           # noqa: BLE001
-                self.say(f"[strata] split: the prefill engine did not start again: {x}")
+                self.say(f"[xestrata] split: the prefill engine did not start again: {x}")
             finally:
                 self.__dict__["healing"] = False
         threading.Thread(target=run, daemon=True).start()
@@ -417,7 +417,8 @@ class SplitEngine:
                 for _ in P.generate(ids, 0, {}, cancel, prefill_only=True):
                     yield None
             except (EngineDied, ValueError) as e:
-                self.say(f"[strata] split: the prefill engine failed ({e}); the decode engine reads the prompt itself")
+                self.say(f"[xestrata] split: the prefill engine failed ({e}); the decode engine reads the prompt "
+                         "itself")
                 self.heal()
                 return
             if cancel.is_set():
@@ -430,21 +431,21 @@ class SplitEngine:
                 self.__dict__["cur"] = D
                 restored = yield from self._wait(lambda: D.session_file("restore", path))
             except SessionRefused as e:
-                self.say(f"[strata] split: the session file was refused ({e}); the decode engine reads the prompt "
+                self.say(f"[xestrata] split: the session file was refused ({e}); the decode engine reads the prompt "
                          "itself")
                 return
             except EngineDied as e:
                 if not D.alive():
                     raise
-                self.say(f"[strata] split: the prefill engine failed while saving ({e}); the decode engine reads the "
+                self.say(f"[xestrata] split: the prefill engine failed while saving ({e}); the decode engine reads the "
                          "prompt itself")
                 self.heal()
                 return
             rec.update(save_ms=float(saved["ms"]), restore_ms=float(restored["ms"]), bytes=int(saved["bytes"]),
                        tokens=int(restored["tokens"]), ok=restored["tokens"] == n - 1)
             if not rec["ok"]:
-                self.say(f"[strata] split: the decode engine restored {restored['tokens']} tokens, not the {n - 1} the "
-                         "prompt needs; it reads the rest itself")
+                self.say(f"[xestrata] split: the decode engine restored {restored['tokens']} tokens, not the {n - 1} "
+                         "the prompt needs; it reads the rest itself")
                 rec["ok"] = restored["tokens"] > 0
         finally:
             self.__dict__["cur"] = D
@@ -510,7 +511,7 @@ class SplitEngine:
                     split_restore_ms=round(rec["restore_ms"], 1), split_bytes=rec["bytes"])
         D.last = last
         self.stats["last"] = {k: last[k] for k in last if k.startswith("split_")}
-        self.say(f"[strata] split: prompt {len(ids)} tokens read on the prefill card in "
+        self.say(f"[xestrata] split: prompt {len(ids)} tokens read on the prefill card in "
                  f"{rec['prefill_ms'] / 1000:.1f} s, "
                  f"session {rec['bytes'] / 2**20:.0f} MiB saved in {rec['save_ms'] / 1000:.2f} s and restored in "
                  f"{rec['restore_ms'] / 1000:.2f} s; the decode card makes the answer")

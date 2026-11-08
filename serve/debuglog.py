@@ -10,7 +10,7 @@ For looking into a conversation afterwards, the server writes what it saw and di
   read), the answer (reasoning, text, calls), usage and timings, an error.
 - img/<sha256>.<ext>: the pictures, once each: the ones a request sent (its body names the file instead of the data
   URL) and the ones a tool made.
-- chats/<chat id>.json: the web page's own record of a chat, as the browser keeps it (POST /v1/strata/debug/chat).
+- chats/<chat id>.json: the web page's own record of a chat, as the browser keeps it (POST /v1/xestrata/debug/chat).
 
 When the folder grows past its limit ("debug_chat_log_mib", 1024 by default) the oldest days' lines go first, then the
 pictures no line or chat names.  A write that fails is said in the server's log once and the request goes on."""
@@ -38,8 +38,8 @@ class DebugLog:
     def _say(self, e: OSError) -> None:
         if not self.warned:
             self.warned = True
-            print(f"[strata] debug chat log: could not write to {self.folder} ({e.strerror or e}); the requests go on",
-                  flush=True)
+            print(f"[xestrata] debug chat log: could not write to {self.folder} ({e.strerror or e}); the requests go "
+                  "on", flush=True)
 
     def picture(self, data: bytes, ext: str) -> str:
         """The picture saved once by its hash: its path in the folder ("img/<sha256>.<ext>")."""

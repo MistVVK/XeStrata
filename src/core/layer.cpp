@@ -38,6 +38,7 @@
 #include <cstdlib>
 #include <exception>
 #include "strata/core/gpu.hpp"
+#include "strata/platform/env.hpp"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -481,14 +482,14 @@ bool pool_grow(ElasticPool& p, int64_t cells, const std::function<strata::core::
             if (!p.range.mapped(c)) fresh.push_back(c);
         if (fresh.empty()) continue;
         if (!p.range.map_range(c0, c1, take)) {
-            std::fprintf(stderr, "strata: the elastic K/V could not map %zu chunks (the driver has no VRAM left)\n",
+            std::fprintf(stderr, "xestrata: the elastic K/V could not map %zu chunks (the driver has no VRAM left)\n",
                          fresh.size());
             return false;
         }
         // what the chunk held before (another pool's cells, an expert) is not K/V: zeroed, as a new session is
         for (const int64_t c : fresh)
             if (!strata::gpu::memset(p.range.base() + (uint64_t) c * G, 0, (size_t) G)) {
-                std::fprintf(stderr, "strata: the elastic K/V could not clear a chunk: %s\n",
+                std::fprintf(stderr, "xestrata: the elastic K/V could not clear a chunk: %s\n",
                              strata::gpu::last_error());
                 return false;
             }
@@ -562,8 +563,8 @@ KvPlan kv_plan(const QsaShapes& s, int64_t max_cells, int64_t ring_cells) {
     p.pooled_rows = max_cells / s.idx_block + 2;
     if (g_kv_resident <= 0 || ring_cells < 0) return p;   // ring_cells < 0: always fully resident
     // A/B only: STRATA_KV_RING_OFF keeps the drafter fully resident, STRATA_KV_MAIN_OFF the main layers
-    static const bool ring_off = std::getenv("STRATA_KV_RING_OFF") != nullptr;
-    static const bool main_off = std::getenv("STRATA_KV_MAIN_OFF") != nullptr;
+    static const bool ring_off = strata::env_get("KV_RING_OFF") != nullptr;
+    static const bool main_off = strata::env_get("KV_MAIN_OFF") != nullptr;
     if (ring_cells > 0 ? ring_off : main_off) return p;
     if (ring_cells > 0) {
         const int64_t r = (ring_cells + s.page_size - 1) / s.page_size;
@@ -651,7 +652,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         pool->n_slots = p.slots;
         pool->page_size = s.page_size;
         if (!pool->range.reserve(at) || !pool_grow(*pool, g_kv_elastic_init, [] { return (strata::core::VmmChunk) 0; })) {
-            std::fprintf(stderr, "strata: the elastic K/V could not reserve or map its pools\n");
+            std::fprintf(stderr, "xestrata: the elastic K/V could not reserve or map its pools\n");
             return 0;
         }
         uint8_t* b = pool->range.base();
@@ -735,7 +736,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         uint8_t* d = nullptr;
         if (!strata::gpu::alloc_host((void**) &h, bytes) ||
             !strata::gpu::device_pointer((void**) &d, h)) {
-            if (p.mode == 1) std::fprintf(stderr, "strata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
+            if (p.mode == 1) std::fprintf(stderr, "xestrata: KV streaming: cannot pin %.2f GiB of RAM for a layer's KV copy "
                                  "(%.2f GiB pinned so far) - lower the context, or run without --kv-resident\n",
                                  (double) bytes / 1073741824.0,
                                  (double) g_kv_host_bytes / 1073741824.0);

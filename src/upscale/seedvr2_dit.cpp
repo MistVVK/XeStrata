@@ -14,6 +14,7 @@
 #include "strata/kernels/i8_gemm.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/platform/env.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -246,7 +247,7 @@ bool Seedvr2Dit::open(const std::string& path, void* stream, std::string& err, b
             if (meta.find("int8_tensorwise") == std::string::npos || meta.find("\"convrot\": true") == std::string::npos ||
                 meta.find("\"convrot_groupsize\": 256") == std::string::npos)
                 throw std::runtime_error("image engine (SeedVR2 DiT): an 8-bit form it does not take: " + meta);
-            w8_ = !dry_ && std::getenv("STRATA_NO_W8A8") == nullptr && prefill::Gemm::i8_usable(stream);
+            w8_ = !dry_ && strata::env_get("NO_W8A8") == nullptr && prefill::Gemm::i8_usable(stream);
         }
         {   // the RoPE: an axis's frequencies (the 7B's pixel ones, the 3B's lang ones), as the blocks' rope buffer holds
             // them; 3 axes of them in pairs
@@ -763,7 +764,7 @@ void Seedvr2Dit::forward(const float* noise, const float* cond, int64_t h, int64
             stream_mlp(b.t, base, t_, L);
         }
         blocks_.end(i);
-        if (const char* dump = std::getenv("STRATA_SEEDVR2_DUMP")) {   // a check: the video stream after each block
+        if (const char* dump = strata::env_get("SEEDVR2_DUMP")) {   // a check: the video stream after each block
             gpu::stream_sync(s_);
             std::vector<float> hx((size_t) (N * C));
             gpu::copy(hx.data(), x_, hx.size() * 4);

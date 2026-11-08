@@ -40,6 +40,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "strata/platform/env.hpp"
 
 namespace {
 
@@ -90,7 +91,7 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     if (mmproj.empty() || model.empty()) {
-        std::fprintf(stderr, "usage: strata-vision --mmproj <mmproj.gguf> --model <model.gguf> [--gpu [--gpu-pci ADDR]] "
+        std::fprintf(stderr, "usage: xestrata-vision --mmproj <mmproj.gguf> --model <model.gguf> [--gpu [--gpu-pci ADDR]] "
                              "[--threads N] [--max-tokens N] [--min-tokens N] [--flash-attn on|off|auto]\n");
         return 2;
     }
@@ -102,7 +103,7 @@ int main(int argc, char** argv) {
 #if !defined(_WIN32)   // posix_fadvise; on Windows the loader's reads go as they are (#24)
     // ask the OS for the projector file up front (128 KiB steps) so the loader's sequential reads find it cached;
     // STRATA_READ_AHEAD=0 turns it off, as in the engine
-    if (const char* ra = std::getenv("STRATA_READ_AHEAD"); ra == nullptr || std::strtol(ra, nullptr, 10) != 0) {
+    if (const char* ra = strata::env_get("READ_AHEAD"); ra == nullptr || std::strtol(ra, nullptr, 10) != 0) {
         const int fd = open(mmproj.c_str(), O_RDONLY);
         if (fd >= 0) {
             const off_t n = lseek(fd, 0, SEEK_END);
@@ -156,7 +157,7 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
         return 1;
     }
-    std::fprintf(stderr, "strata-vision: model files loaded in %.1f s\n",
+    std::fprintf(stderr, "xestrata-vision: model files loaded in %.1f s\n",
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - load_t0).count());
     // a vocab-only model reports no hparams, so the width comes from the projector: its output is the model's input
     int n_embd = 0;
@@ -173,7 +174,7 @@ int main(int argc, char** argv) {
     // what is really left. (A square image well above any cap; mtmd scales it to the token limit.)
     // On the CPU there is no VRAM to reserve, and the warm-up would only delay the engine's start by one encode
     // (~6 s at 1,024 tokens).
-    if (!gpu) std::fprintf(stderr, "strata-vision: on the CPU, %d threads, no warm-up\n", threads);
+    if (!gpu) std::fprintf(stderr, "xestrata-vision: on the CPU, %d threads, no warm-up\n", threads);
     else {
         const auto warm_t0 = std::chrono::steady_clock::now();
         const uint32_t side = 2048;
@@ -191,12 +192,12 @@ int main(int argc, char** argv) {
                     warm_tokens = (int) mtmd_input_chunk_get_n_tokens(ch);
             }
         }
-        std::fprintf(stderr, "strata-vision: warmed up at %d image tokens in %.1f s\n", warm_tokens,
+        std::fprintf(stderr, "xestrata-vision: warmed up at %d image tokens in %.1f s\n", warm_tokens,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_t0).count());
         // I7 (#3690): a picture that became 93,700 image tokens under --max-tokens 1024. The limit is not applied by this build of mtmd for
         // this model, and the log line above is the evidence to ask for.
         if (max_tokens > 0 && warm_tokens > max_tokens + max_tokens / 8)
-            std::fprintf(stderr, "strata-vision: WARNING the warm-up picture became %d image tokens, over the limit of %d (--max-tokens): "
+            std::fprintf(stderr, "xestrata-vision: WARNING the warm-up picture became %d image tokens, over the limit of %d (--max-tokens): "
                                  "the limit is not applied for this model; pictures over it are refused\n", warm_tokens, max_tokens);
         mtmd_input_chunks_free(chunks);
         if (bm) mtmd_bitmap_free(bm);

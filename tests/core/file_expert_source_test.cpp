@@ -356,7 +356,7 @@ void test_page_cache_hint() {
     const std::string info =
         "MemTotal:       65011484 kB\nMemFree:         1284096 kB\nMemAvailable:   33463296 kB\nCached:         54507520 kB\n";
     require(page_cache_hint(info).find("drop_caches") != std::string::npos &&
-            page_cache_hint(info).find("STRATA_DROP_CACHE_ON_EXIT") != std::string::npos &&
+            page_cache_hint(info).find("XESTRATA_DROP_CACHE_ON_EXIT") != std::string::npos &&
             page_cache_hint(info).find("52.0 GiB") != std::string::npos, "the cache hint is incomplete");
     require(page_cache_hint("MemFree: 100 kB\nCached: 1000 kB\n").empty(), "a small cache was reported");
 }
@@ -368,9 +368,9 @@ void test_rotating_source(bool rotate, bool pin) {
     using namespace strata::core;
     using namespace strata::kernels::cpu;
 #if defined(_WIN32)
-    _putenv_s("STRATA_EXCHANGE_ROTATE", rotate ? "1" : "0");
+    _putenv_s("XESTRATA_EXCHANGE_ROTATE", rotate ? "1" : "0");
 #else
-    setenv("STRATA_EXCHANGE_ROTATE", rotate ? "1" : "0", 1);
+    setenv("XESTRATA_EXCHANGE_ROTATE", rotate ? "1" : "0", 1);
 #endif
     TempDirectory dir;
     std::string err;
@@ -454,9 +454,9 @@ void test_replace_resident(bool pin) {
     using namespace strata::core;
     using namespace strata::kernels::cpu;
 #if defined(_WIN32)
-    _putenv_s("STRATA_EXCHANGE_ROTATE", "0");
+    _putenv_s("XESTRATA_EXCHANGE_ROTATE", "0");
 #else
-    setenv("STRATA_EXCHANGE_ROTATE", "0", 1);
+    setenv("XESTRATA_EXCHANGE_ROTATE", "0", 1);
 #endif
     TempDirectory dir;
     std::string err;

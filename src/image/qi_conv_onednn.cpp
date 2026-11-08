@@ -80,7 +80,7 @@ bool onednn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, 
                                                             {stride, stride}, {pt, pl}, {pb, pr}, attr);
             it = d.prims.emplace(key, dnnl::convolution_forward(pd)).first;
         } catch (const dnnl::error& e) {   // this form alone (a stride or an output the library does not take)
-            std::fprintf(stderr, "strata-image: oneDNN takes no convolution of %lld x %lld x %lld to %lld in this form "
+            std::fprintf(stderr, "xestrata-image: oneDNN takes no convolution of %lld x %lld x %lld to %lld in this form "
                          "(%s): the engine's own path for it\n", (long long) H, (long long) W, (long long) C,
                          (long long) O, e.what());
             d.refused.insert(key);
@@ -99,7 +99,7 @@ bool onednn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, 
         it->second.execute(strm, args);
         return true;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image: oneDNN's convolution is not taken on this GPU (%s): the engine's own path\n",
+        std::fprintf(stderr, "xestrata-image: oneDNN's convolution is not taken on this GPU (%s): the engine's own path\n",
                      e.what());
         d.failed = true;
         return false;

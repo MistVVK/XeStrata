@@ -15,7 +15,7 @@ Every GPU runs three measurements, each with both engines, and step 8 judges all
 | Measurement | Script | What it covers |
 | --- | --- | --- |
 | generate | `bench_generate.py` | the kernels and the speculative loop, both engines writing one text (`--spec-follow`); every model file below |
-| serve | `bench_serve.py` | `strata --serve`'s own decode loop and the conversation checkpoints, a chat of four turns; IQ3_XXS |
+| serve | `bench_serve.py` | `xestrata-engine --serve`'s own decode loop and the conversation checkpoints, a chat of four turns; IQ3_XXS |
 | everyday use | `bench_usage.py` | the whole path a user meets: `serve/server.py`, the chat template, streaming, chats and a coding agent; IQ3_XXS |
 
 Each GPU is one matrix path (the B70 XMX, the RTX 4070 tensor cores, the RX 9060 XT WMMA), and every GPU runs the same model files (their paths on each machine: `LOCAL.md`):
@@ -53,7 +53,7 @@ It stops upstream mid-run once its progress shows it at 10 tok/s or less (the pr
 
 ## The serve path
 
-`strata --serve`, what users run, has a decode loop of its own (`src/program/generate.cpp`: the `--serve` block, apart from generate's speculative loop) and no `--spec-follow`, so bench_generate.py does not cover it.
+`xestrata-engine --serve`, what users run, has a decode loop of its own (`src/program/generate.cpp`: the `--serve` block, apart from generate's speculative loop) and no `--spec-follow`, so bench_generate.py does not cover it.
 `bench_serve.py` runs both engines with `--serve` and the options setup writes, over stdin (`GEN`, `DONE`), for IQ3_XXS at 64K, 32K and 1K (the three kinds of prompt above), per GPU, in the same folder as the IQ3_XXS table:
 
 ```sh

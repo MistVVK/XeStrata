@@ -17,6 +17,7 @@
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/platform/env.hpp"
 #include "ple_oracle_vectors.inc"
 
 #include <cuda_runtime.h>
@@ -246,7 +247,7 @@ int main(int argc, char** argv) {
     bool check_fixtures = false;
     std::string pack = "pack/full";
     // --gguf, else $STRATA_PLE_GGUF, else the development layout (run from the engine root)
-    const char* gguf_env = std::getenv("STRATA_PLE_GGUF");
+    const char* gguf_env = strata::env_get("PLE_GGUF");
     std::string gguf = gguf_env ? gguf_env
                                 : "../../Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf";
     std::string in_bin = "bench/micro/ple_in.bin", out_bin = "bench/micro/ple_out.bin";

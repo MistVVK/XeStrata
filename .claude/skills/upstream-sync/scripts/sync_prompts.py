@@ -7,9 +7,9 @@ tools/bench_core.py ships (data/bench-corpus.json.xz), which setup's --bench rea
 
     python .claude/skills/upstream-sync/scripts/sync_prompts.py PACK_DIR OUT_DIR
 
-PACK_DIR is any pack (its `tokenizer/` is read).  Writes OUT_DIR/<tier>.ids, comma-separated, for `strata generate
---tokens-file`, and OUT_DIR/turn<N>.ids, the user's next messages of the same chat for bench_serve.py (each opens with
-the <|im_end|> that closes the assistant's answer before it).
+PACK_DIR is any pack (its `tokenizer/` is read).  Writes OUT_DIR/<tier>.ids, comma-separated, for `xestrata-engine
+--tokens-file` (upstream's `strata --tokens-file`), and OUT_DIR/turn<N>.ids, the user's next messages of the same chat
+for bench_serve.py (each opens with the <|im_end|> that closes the assistant's answer before it).
 """
 import sys
 from pathlib import Path

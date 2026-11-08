@@ -42,6 +42,7 @@
 #include "cuda_intrinsics.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_mmvq
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -754,9 +755,9 @@ bool time_layout(sycl::queue& q, const void* weights, const void* x_q8_1, float*
         std::sort(ratio, ratio + kTuneRounds);
         const double worse = ratio[kTuneRounds - 2];   // the other's second least favourable round
         const bool row = us[rule ? 1 : 0] >= kTuneFloorUs && worse < kTuneMargin ? !rule : rule;
-        static const bool log_all = std::getenv("STRATA_MMVQ_TUNE_LOG") != nullptr;
+        static const bool log_all = strata::env_get("MMVQ_TUNE_LOG") != nullptr;
         if (row != rule || log_all)
-            std::fprintf(stderr, "strata: the decode products of %s %d -> %d on %s: %s a row (timed: %.1f us a "
+            std::fprintf(stderr, "xestrata: the decode products of %s %d -> %d on %s: %s a row (timed: %.1f us a "
                                  "work-group, %.1f a sub-group; the other's rounds at %.3f of the rule's or less "
                                  "but one)\n", format_name(std::type_index(typeid(F))), n_in, n_out,
                          dev.get_info<sycl::info::device::name>().c_str(), row ? "a sub-group" : "a work-group",
@@ -764,7 +765,7 @@ bool time_layout(sycl::queue& q, const void* weights, const void* x_q8_1, float*
         if (span != nullptr) sycl::free(span, q);
         return row;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata: timing the decode products of %s %d -> %d: %s\n",
+        std::fprintf(stderr, "xestrata: timing the decode products of %s %d -> %d: %s\n",
                      format_name(std::type_index(typeid(F))), n_in, n_out, e.what());
         if (span != nullptr) {
             q.wait();
@@ -775,14 +776,14 @@ bool time_layout(sycl::queue& q, const void* weights, const void* x_q8_1, float*
 }
 
 bool env_off(const char* name) {
-    const char* v = std::getenv(name);
+    const char* v = strata::env_get(name);
     return v != nullptr && std::strtol(v, nullptr, 10) == 0;
 }
 
 // the shape's layout on the queue's GPU (true: a sub-group a row), timed over the call's buffers the first time
 template<typename F>
 bool row_layout(sycl::queue& q, void* stream, const void* weights, const void* x_q8_1, float* y, int n_in, int n_out) {
-    static const bool tune = !env_off("STRATA_MMVQ_TUNE");
+    static const bool tune = !env_off("MMVQ_TUNE");
     if (!tune) return steps_rule(n_in / F::DIV, WARP / F::T);
     return layouts_for(LayoutKey{std::type_index(typeid(F)), n_in, n_out}).get(q.get_device(), [&]() -> char {
         if (gpu::is_capturing(stream)) return steps_rule(n_in / F::DIV, WARP / F::T);
@@ -847,7 +848,7 @@ void mmvq_tune(const void* weights, int n_in, int n_out, void* stream, const Reg
     if (n_out <= 0) throw std::invalid_argument("native MMVQ requires n_out > 0");
     validate_pointer(weights);
     auto& q = validate_stream(stream);
-    if (env_off("STRATA_MMVQ_TUNE") || gpu::is_capturing(stream)) return;
+    if (env_off("MMVQ_TUNE") || gpu::is_capturing(stream)) return;
     layouts_for(LayoutKey{std::type_index(typeid(F)), n_in, n_out}).get(q.get_device(), [&]() -> char {
         void* x = sycl::malloc_device(native_q8_1_bytes(n_in, 1), q);
         float* y = sycl::malloc_device<float>((size_t) n_out, q);

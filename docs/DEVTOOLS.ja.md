@@ -30,7 +30,7 @@ sudo apt install gitleaks shellcheck clang-tidy cppcheck flake8 mypy python3-pyf
 ```
 
 `tools/lint/run.sh` は、ディストリビューションの clang-tidy ではなく、SYCL を理解する oneAPI の clang-tidy（`/opt/intel/oneapi/compiler` の下）を使います。
-clang-tidy はビルドフォルダー（既定は `build/free`、`STRATA_LINT_BUILD` で変えられます）の `compile_commands.json` を読みます。
+clang-tidy はビルドフォルダー（既定は `build/free`、`XESTRATA_LINT_BUILD` で変えられます）の `compile_commands.json` を読みます。
 
 ```sh
 cmake -S . -B build/free -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
@@ -273,8 +273,8 @@ Windows 版の 7z は、`tools/package/build.sh windows cuda12.4` が Ubuntu 26.
 
 ### Windows の PC で動かす
 
-`build/win` の `strata*.exe` と、`.tools/intel-llvm-win/install/bin` の `sycl9.dll`・`ur_win_proxy_loader.dll`・使う GPU のアダプター（NVIDIA は `ur_adapter_cuda.dll`、Intel は `ur_adapter_level_zero.dll`）・`xptifw.dll` を、1 つのフォルダーに置きます。
-`strata-device.exe --list-devices` で GPU が見えれば、エンジンは動きます。
+`build/win` の `xestrata*.exe` と、`.tools/intel-llvm-win/install/bin` の `sycl9.dll`・`ur_win_proxy_loader.dll`・使う GPU のアダプター（NVIDIA は `ur_adapter_cuda.dll`、Intel は `ur_adapter_level_zero.dll`）・`xptifw.dll` を、1 つのフォルダーに置きます。
+`xestrata-device.exe --list-devices` で GPU が見えれば、エンジンは動きます。
 
 ## AVX-512 の経路を確かめる Intel SDE
 
@@ -296,11 +296,11 @@ sde64 -version
 
 ### 道具を足さずにできること
 
-- エンジン自身の時間の計測: prefill の経路は `STRATA_PREFILL_TIMING=1` で出ます。
+- エンジン自身の時間の計測: prefill の経路は `XESTRATA_PREFILL_TIMING=1` で出ます。
   decode の `verify window` の行（ホストが GPU を待つ時間、CPU のプール）は、いつも出ます。
-- `STRATA_VERIFY_NODES=1` は、decode の窓のグラフに入るカーネルの数を出します。
+- `XESTRATA_VERIFY_NODES=1` は、decode の窓のグラフに入るカーネルの数を出します。
 - SYCL のイベントのプロファイリングで単独のカーネルを測る使い捨てのプローブ。
-- `STRATA_VERIFY_PROFILE=1` は、decode の窓の層内の段ごとの時間（デバイスの時計の tick）を `--stats` の `verify profile` の行に出します。
+- `XESTRATA_VERIFY_PROFILE=1` は、decode の窓の層内の段ごとの時間（デバイスの時計の tick）を `--stats` の `verify profile` の行に出します。
   B70 は Level Zero がデバイスの時計の aspect を報告しませんが、SPIR-V の OpReadClockKHR はコンパイラが動かすので、エンジンは起動時にその stamp のカーネルを試しに組んで使います（NVIDIA は %globaltimer、AMD は出ません）。
   B70 の tick は GPU のコアクロックで（長さの分かる帯域カーネルに対し 2.8 GHz、`max_freq`）、クロックが下がれば遅くなるので、段は比率で読みます。
 

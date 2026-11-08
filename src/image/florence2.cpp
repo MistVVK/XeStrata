@@ -557,7 +557,7 @@ std::vector<int32_t> Florence2::decode(int max_new, int beams, int& steps) {
             throw std::runtime_error("image engine (Florence-2): " + err);
         gpu::stream_sync(s_);
         if (steps_.form() == -1)
-            steps_.timed(since(t0) * 1e3, "strata image (Florence-2)", "the decoder's steps");
+            steps_.timed(since(t0) * 1e3, "xestrata image (Florence-2)", "the decoder's steps");
         gpu::copy(lg.data(), logits, lg.size() * 4);
         if (steps < 4 && dump)
             dump(("logits" + std::to_string(steps)).c_str(), std::vector<float>(lg.begin(), lg.begin() + V));

@@ -23,7 +23,7 @@ namespace c = strata::kernels::cpu;
 
 int main() {
     if (!c::q2_bitplane_enabled()) {
-        std::printf("q2_bitplane_parity: the bit-plane kernel is off (STRATA_Q2_BITPLANE=0)\n");
+        std::printf("q2_bitplane_parity: the bit-plane kernel is off (XESTRATA_Q2_BITPLANE=0)\n");
         return 1;
     }
     std::mt19937 rng(706);  // NOLINT(bugprone-random-generator-seed): reproducible rows.

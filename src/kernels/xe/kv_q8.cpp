@@ -13,6 +13,7 @@
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_kv_q8
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <cstdlib>
 #include <cstring>
@@ -52,7 +53,7 @@ void kv_append_cells(const KvAppend& a, const QsaShapes& s, void* stream) {
     // bytes a group, instead of one 1- or 2-byte store a lane, which ran at ~30 MB/s into pinned host memory on a B70
     // (2 s of a 4K prompt there with --kv-resident).  STRATA_KV_WIDE_HOST=0: the narrow stores.
     static const bool wide_env = [] {
-        const char* v = std::getenv("STRATA_KV_WIDE_HOST");
+        const char* v = strata::env_get("KV_WIDE_HOST");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     const bool wide = !q4 && wide_env && (f16 ? host.k_pool != nullptr || stage.k_pool != nullptr

@@ -8,6 +8,7 @@
 #include "strata/core/runtime.hpp"
 #include "strata/image/flow_sampler.hpp"
 #include "strata/image/moss_pipeline.hpp"
+#include "strata/platform/env.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -411,7 +412,7 @@ std::vector<uint8_t> AnimaPipeline::generate(const QiRequest& r, QiTimes* times,
     if (stage) stage("text");
     // STRATA_IMAGE_PARTS: each part's time on stderr (the comparison with ComfyUI's parts), the prompt's states and
     // contexts made again every image
-    const bool parts = std::getenv("STRATA_IMAGE_PARTS") != nullptr;
+    const bool parts = strata::env_get("IMAGE_PARTS") != nullptr;
     if (parts) {
         last_ids_.clear();
         last_neg_ids_.clear();

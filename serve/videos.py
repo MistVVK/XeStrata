@@ -45,6 +45,7 @@ from typing import Callable
 
 from serve import image_aux
 from serve import images as img
+from serve import envvars
 
 SYNC_MAX_FRAMES = 2048                 # vLLM-Omni's /v1/videos/segmentations and /v1/videos/sync limits
 SYNC_MAX_BYTES = 512 << 20
@@ -156,9 +157,9 @@ def stream_multipart(rfile, ctype: str, length: int, dest: Path, max_file: int) 
 
 # ------------------------------------------------------------------------------------------- the source
 def command(name: str) -> str | None:
-    """ffmpeg's or ffprobe's command, as the engine finds it (video_io.hpp): STRATA_FFMPEG / STRATA_FFPROBE, else the
-    PATH's."""
-    return os.environ.get(f"STRATA_{name.upper()}") or shutil.which(name)
+    """ffmpeg's or ffprobe's command, as the engine finds it (video_io.hpp): XESTRATA_FFMPEG / XESTRATA_FFPROBE, else
+    the PATH's."""
+    return envvars.get(name.upper()) or shutil.which(name)
 
 
 def available() -> bool:
@@ -462,7 +463,7 @@ def segment(svc, gen, job: dict, source: Path, stem: Path, model: str, progress:
         finally:
             svc.long_job = gen.long_job = None
     answer = segment_answer(got, job, model, stem.parent / "segmentation.json")
-    figures = {"seconds": round(time.monotonic() - t0, 2), "engine": "strata-image", "model": regions.SAM3,
+    figures = {"seconds": round(time.monotonic() - t0, 2), "engine": "xestrata-image", "model": regions.SAM3,
                "frames": int(got.get("frames", 0)), "fps": float(got.get("fps", 0)),
                "vfr": bool(int(got.get("vfr") or 0)), "objects": len(answer["objects"]),
                "segment": {k: float(got[k]) for k in ("segment_s", "read_s", "trunk_s", "detect_s", "track_s",
@@ -750,7 +751,7 @@ def upscale(svc, gen, job: dict, source: Path, stem: Path, progress: Callable[[i
         finally:
             svc.long_job = gen.long_job = None
     u = job["upscaler"]
-    figures = {"seconds": round(time.monotonic() - t0, 2), "engine": "strata-image",
+    figures = {"seconds": round(time.monotonic() - t0, 2), "engine": "xestrata-image",
                "size": f"{job['width']}x{job['height']}", "seed": job["seed"],
                "frames": int(got.get("frames", 0)), "fps": float(got.get("fps", 0)), "vfr": bool(got.get("vfr")),
                "upscale": {"method": u["method"], "asked": u["asked"], "color": got.get("color", "none"),

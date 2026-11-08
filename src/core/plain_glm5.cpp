@@ -313,7 +313,7 @@ bool PlainModel::load_glm5(std::string& err) {
         }
         allocs_.push_back(g_lat_gather_);
         allocs_.push_back(g_lat_stage_);
-        std::fprintf(stderr, "strata plain: --kv-ram: the DSA latent cells in RAM (%.1f MiB), %.1f MiB of VRAM for them\n",
+        std::fprintf(stderr, "xestrata plain: --kv-ram: the DSA latent cells in RAM (%.1f MiB), %.1f MiB of VRAM for them\n",
                      (double) (n_dsa * cells * KVR * 2) / 1048576.0,
                      (double) ((opt_.max_t * g_gather_stride_ + cells) * KVR * 2) / 1048576.0);
     }
@@ -379,7 +379,7 @@ bool PlainModel::load_glm5(std::string& err) {
     mexec_.assign((size_t) opt_.max_t + 1, nullptr);
     msegs_.assign((size_t) opt_.max_t + 1, {});
     if (root_ == this)
-        std::fprintf(stderr, "strata plain: GLM-5.3-Flash, %lld KDA and %lld DSA blocks, %lld cells; the prompt in chunks "
+        std::fprintf(stderr, "xestrata plain: GLM-5.3-Flash, %lld KDA and %lld DSA blocks, %lld cells; the prompt in chunks "
                              "of %lld%s\n", (long long) n_kda, (long long) (has_mtp_ ? n_dsa - 1 : n_dsa),
                      (long long) cells, (long long) opt_.prompt_chunk, model_mtp_ ? "; the MTP layer drafts" : "");
     return true;

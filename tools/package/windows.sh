@@ -152,7 +152,7 @@ cmake -G Ninja -S "$src/tools/vision" -B /build/vision -DCMAKE_BUILD_TYPE=Releas
   -DCMAKE_CXX_COMPILER="$src/.tools/intel-llvm-contrib/install/bin/clang++" \
   -DSTRATA_XWIN=/build/xwin -DSTRATA_SYCL_WINDOWS="$sycl" -DLLAMA_DIR="$llama" -DSTRATA_PORTABLE=ON
 cmake --build /build/vision --target strata-vision -j "$jobs"
-cp /build/vision/bin/strata-vision.exe /build/engine/strata-vision-cpu.exe
+cp /build/vision/bin/xestrata-vision.exe /build/engine/xestrata-vision-cpu.exe
 lap encoders
 
 # the launchers (framework-dependent: Windows' .NET 10 runtime runs them); Avalonia's build telemetry off

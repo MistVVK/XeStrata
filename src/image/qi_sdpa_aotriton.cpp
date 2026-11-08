@@ -3,7 +3,7 @@
 // src/image/qi_sdpa_aotriton.cpp - see include/strata/kernels/sdpa_aotriton.hpp: aotriton's flash attention on AMD
 // GPUs (MIT; its library and its kernels' images beside the engine), on the queue's HIP stream (while the queue records
 // a SYCL graph, in a native command whose stream the graph takes in).  A module of its own
-// (libstrata_sdpa_aotriton.so, strata_sdpa_aotriton.dll), which the kernels open on an AMD GPU only
+// (libxestrata_sdpa_aotriton.so, xestrata_sdpa_aotriton.dll), which the kernels open on an AMD GPU only
 // (kernels::aotriton_sdpa): aotriton needs AMD's HIP runtime, which a machine with other makers' GPUs need not have,
 // and the engine must start there.
 
@@ -109,7 +109,7 @@ bool aotriton(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const ui
     const hipStream_t hs = sycl::get_native<sycl::backend::ext_oneapi_hip>(q);
     const hipError_t e = ao::v3::flash::attn_fwd(p, ao::v3::flash::attn_fwd_params::kVersion, ao::Stream(hs));
     if (e != hipSuccess) {
-        std::fprintf(stderr, "strata-image: aotriton's attention is not taken on this GPU (HIP error %d): the engine's "
+        std::fprintf(stderr, "xestrata-image: aotriton's attention is not taken on this GPU (HIP error %d): the engine's "
                              "own kernel\n", (int) e);
         d.failed = true;
         return false;

@@ -12,15 +12,15 @@ KVA（upstream 0.2.7）は、長いプロンプトの prefill で、前の層は
 decode は、KVA が作った状態の上で、いつもの経路で動きます。
 
 答えが変わる近似なので、**既定ではオフ**です。
-`STRATA_KVA=1` で有効になり、層 36〜47（48 層のうち後ろの 12 層）を近似し、末尾の 2,048 トークンを正確に読みます。
-付けなければ（または `STRATA_KVA=0`）、prefill も推測の層もこれまでと同じです。
+`XESTRATA_KVA=1` で有効になり、層 36〜47（48 層のうち後ろの 12 層）を近似し、末尾の 2,048 トークンを正確に読みます。
+付けなければ（または `XESTRATA_KVA=0`）、prefill も推測の層もこれまでと同じです。
 
 ## 答えへの影響（upstream の測り）
 
 以下は upstream の 0.2.7 の品質の確かめの結果で、XeStrata で測ったものではありません。
 
 - 層 24 から近似すると（upstream の最初の形）、14K〜30K トークンの文書から散らばった記録を抜き出す課題で記録が抜け、答えの先頭に作り話の行が入りました。約 10K トークンのシステムプロンプトのエージェントの課題でも、合計が抜けたり計算が誤ったりしました。
-- 層 36 からの近似は、同じ課題でエージェントも抜き出しも正確に読んだときと同じ水準で、upstream の測った中で最もよい形でした。`STRATA_KVA=1` はこの形を選びます。
+- 層 36 からの近似は、同じ課題でエージェントも抜き出しも正確に読んだときと同じ水準で、upstream の測った中で最もよい形でした。`XESTRATA_KVA=1` はこの形を選びます。
 - 針を探す課題、答えられない質問、短い要約、コード、JSON は、どの形でも変わりませんでした。
 - prefill は速くなり（upstream の RTX 5070 で 14K で +11%、30K で +18%）、速い GPU では後の decode が少し遅くなります。近似したところの推測の層の当たりが減るためです（upstream の Radeon AI PRO R9700 の 27K で decode −11%）。
 
@@ -28,17 +28,17 @@ decode は、KVA が作った状態の上で、いつもの経路で動きます
 
 次のすべてが成り立つとき、その読みは近似を使います。
 
-- モデルの形が Qwen3.8-Flash-Next（48 層、エキスパート 512 個）。ほかの形のモデルは `STRATA_KVA=1` でも正確に読みます（`STRATA_KVA_ANY_MODEL=1` で研究用に許します）。
+- モデルの形が Qwen3.8-Flash-Next（48 層、エキスパート 512 個）。ほかの形のモデルは `XESTRATA_KVA=1` でも正確に読みます（`XESTRATA_KVA_ANY_MODEL=1` で研究用に許します）。
 - 1 枚の GPU（GPU をまたぐ層の分割なし）で、`--batch` のスロットがない。
 - 会話の位置 0 から読む（続きの読みでない）、画像のないプロンプト。
-- 一度に読む長さが `STRATA_KVA_MIN_PROMPT`（4,096）以上で、末尾と 64 の和より長い。
+- 一度に読む長さが `XESTRATA_KVA_MIN_PROMPT`（4,096）以上で、末尾と 64 の和より長い。
 
 近似はチャンクの単位で、最後の位置が末尾より前にあるチャンクだけを近似します。
 そのため近似する位置の数は、チャンクの大きさに合わせて切り下がります。
-`STRATA_PREFILL_LAYER_MAJOR=1` の層ごとの読みには KVA の形がないので、`STRATA_KVA=1` のときは使わず、チャンクごとに読みます。
+`XESTRATA_PREFILL_LAYER_MAJOR=1` の層ごとの読みには KVA の形がないので、`XESTRATA_KVA=1` のときは使わず、チャンクごとに読みます。
 
-`STRATA_KVA=1` で起動したエンジンは、近似を使わなかった読みごとに理由を 1 行出し（`strata prefill: KVA configured but NOT applied: <理由>`）、エンジンの設定がプロセス全体で使えなくするときは起動時に 1 行出します。
-`STRATA_KVA=1` がなければ、KVA について何も出しません。
+`XESTRATA_KVA=1` で起動したエンジンは、近似を使わなかった読みごとに理由を 1 行出し（`xestrata prefill: KVA configured but NOT applied: <理由>`）、エンジンの設定がプロセス全体で使えなくするときは起動時に 1 行出します。
+`XESTRATA_KVA=1` がなければ、KVA について何も出しません。
 
 ## 推測の層（MTP）
 
@@ -57,26 +57,26 @@ decode は、KVA が作った状態の上で、いつもの経路で動きます
 
 | 環境変数 | 既定 | 働き |
 | --- | ---: | --- |
-| `STRATA_KVA` | オフ | `1` で有効（層 36 から、末尾 2,048）。なしか `0` で正確に読む |
-| `STRATA_KVA_ANY_MODEL` | オフ | `1`（研究用）: 測っていない形のモデルでも、警告を出して近似する |
-| `STRATA_KVA_SPLIT` | 36 | 近似を始める層（0 から数える）。24 は速く、記録が抜けた |
-| `STRATA_KVA_SUFFIX` | 2048 | 正確に読む末尾のトークン数 |
-| `STRATA_KVA_MIN_PROMPT` | 4096 | これより短い読みは正確に読む |
-| `STRATA_KVA_SKIP` | state | `moe`: 近似したチャンクの後ろの層で注意の半分を全部計算し（出力も残差に足す）、MoE の半分とそのエキスパートの転送だけを省く。状態だけの形より遅く、正確な残差に近い |
-| `STRATA_KVA_ONLY` | all | `gdn` か `qsa`: その種類の層だけを近似する |
-| `STRATA_KVA_MODE` | identity | `identity`、`oracle`、`linear`（linear は未実装） |
-| `STRATA_KVA_CAPTURE` | — | フォルダー: 後ろの各層に入る本当の残差を書く（書くあいだは正確に読む） |
-| `STRATA_KVA_CAPTURE_FP32` | オフ | BF16 でなく FP32 で書く |
-| `STRATA_KVA_ORACLE` | — | フォルダー: 書いた残差を後ろの各層の入力に使う（同じプロンプトと同じチャンクで） |
-| `STRATA_KVA_ORACLE_FP32` | オフ | そのファイルが FP32 |
-| `STRATA_KVA_GDN_NORM` | オフ | `1`: 状態だけの層でも GDN の出力の正規化まで計算する（状態だけの再帰と比べるため） |
+| `XESTRATA_KVA` | オフ | `1` で有効（層 36 から、末尾 2,048）。なしか `0` で正確に読む |
+| `XESTRATA_KVA_ANY_MODEL` | オフ | `1`（研究用）: 測っていない形のモデルでも、警告を出して近似する |
+| `XESTRATA_KVA_SPLIT` | 36 | 近似を始める層（0 から数える）。24 は速く、記録が抜けた |
+| `XESTRATA_KVA_SUFFIX` | 2048 | 正確に読む末尾のトークン数 |
+| `XESTRATA_KVA_MIN_PROMPT` | 4096 | これより短い読みは正確に読む |
+| `XESTRATA_KVA_SKIP` | state | `moe`: 近似したチャンクの後ろの層で注意の半分を全部計算し（出力も残差に足す）、MoE の半分とそのエキスパートの転送だけを省く。状態だけの形より遅く、正確な残差に近い |
+| `XESTRATA_KVA_ONLY` | all | `gdn` か `qsa`: その種類の層だけを近似する |
+| `XESTRATA_KVA_MODE` | identity | `identity`、`oracle`、`linear`（linear は未実装） |
+| `XESTRATA_KVA_CAPTURE` | — | フォルダー: 後ろの各層に入る本当の残差を書く（書くあいだは正確に読む） |
+| `XESTRATA_KVA_CAPTURE_FP32` | オフ | BF16 でなく FP32 で書く |
+| `XESTRATA_KVA_ORACLE` | — | フォルダー: 書いた残差を後ろの各層の入力に使う（同じプロンプトと同じチャンクで） |
+| `XESTRATA_KVA_ORACLE_FP32` | オフ | そのファイルが FP32 |
+| `XESTRATA_KVA_GDN_NORM` | オフ | `1`: 状態だけの層でも GDN の出力の正規化まで計算する（状態だけの再帰と比べるため） |
 
 近似した読みは、何をしたかを 1 行出します。
 
 ```text
-strata prefill: KVA on: split 36, suffix 2048, approximated 5120 of 7533 positions in 5 of 8 chunks, mode identity
+xestrata prefill: KVA on: split 36, suffix 2048, approximated 5120 of 7533 positions in 5 of 8 chunks, mode identity
 ```
 
-`STRATA_KVA_CAPTURE` は、後ろの各層について `L<層>.bin` を書きます。
+`XESTRATA_KVA_CAPTURE` は、後ろの各層について `L<層>.bin` を書きます。
 1 行が `hc * n_embd` 個の値で、プロンプトの位置の順に並びます。
 次のプロンプトで上書きします。

@@ -33,6 +33,7 @@
 #include "strata/kernels/sampler.hpp"
 #include "strata/kernels/shared_expert.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -54,7 +55,7 @@ constexpr float EPS = 1e-6f;
 // STRATA_MTP_CATCHUP_ALL=1 catches the drafter's K/V up for the whole verified window, rejected rows included
 bool mtp_catchup_all() {
     static const bool on = [] {
-        const char* v = std::getenv("STRATA_MTP_CATCHUP_ALL");
+        const char* v = strata::env_get("MTP_CATCHUP_ALL");
         return v != nullptr && std::strtol(v, nullptr, 10) != 0;
     }();
     return on;
@@ -293,7 +294,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     if (!strata::gpu::alloc_device(&state_arena_, sb)) { err = "mtp: the K/V state does not fit"; return false; }
     if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
         if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
-        std::fprintf(stderr, "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
+        std::fprintf(stderr, "xestrata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
         strata::gpu::free(state_arena_);
         st_ = QsaState{};
         ring = -1;   // fully resident
@@ -375,7 +376,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     // STRATA_MTP_PRIO=1: the drafter's stream at high priority, so its round is not queued behind the verifier's copies
     // and the next window (upstream 1d21b9cd6, 655145426: on HIP, R9700)
     static const bool prio = [] {
-        const char* v = std::getenv("STRATA_MTP_PRIO");
+        const char* v = strata::env_get("MTP_PRIO");
         return v != nullptr && std::strtol(v, nullptr, 10) != 0;
     }();
     cs_ = strata::gpu::stream_create(prio);
@@ -386,10 +387,10 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     }
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
     if (shared != nullptr)
-        std::fprintf(stderr, "strata mtp: shared draft weights, %.0f MiB of private state and buffers\n",
+        std::fprintf(stderr, "xestrata mtp: shared draft weights, %.0f MiB of private state and buffers\n",
                      (double) vram_ / 1048576.0);
     else
-        std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in "
+        std::fprintf(stderr, "xestrata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in "
                              "%.2f s (%.0f MiB/s)\n",
                      (double) vram_ / 1048576.0, (double) g.n_expert * strata::kernels::cpu::BLOB / 1048576.0,
                      (double) tensors_.back().off / 1048576.0, files_s,
@@ -402,13 +403,13 @@ namespace {
 // STRATA_MTP_FULL_HEAD=1 (a diagnostic): draft over the whole vocabulary (the main head itself) instead of
 // rt/draft_vocab.bin's subset - the reference head, to measure what the subset costs in acceptance
 bool full_head_env() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_MTP_FULL_HEAD"); return v && v[0] == '1'; }();
+    static const bool on = [] { const char* v = strata::env_get("MTP_FULL_HEAD"); return v && v[0] == '1'; }();
     return on;
 }
 }  // namespace
 
 bool MtpDrafter::top2_env() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_MTP_TOP2"); return v && v[0] == '1'; }();
+    static const bool on = [] { const char* v = strata::env_get("MTP_TOP2"); return v && v[0] == '1'; }();
     return on;
 }
 
@@ -435,7 +436,7 @@ void MtpDrafter::record_top2(int j) {
 namespace {
 // STRATA_DRAFT_INT2=0: never the draft head at 2 bits (1: always, 0 or 1 skips the measurement)
 bool int2_allowed(int64_t n_embd) {
-    const char* v = std::getenv("STRATA_DRAFT_INT2");
+    const char* v = strata::env_get("DRAFT_INT2");
     return n_embd % strata::kernels::kInt2Group == 0 && (v == nullptr || v[0] == 0 || std::strtol(v, nullptr, 10) != 0);
 }
 }  // namespace
@@ -463,7 +464,7 @@ bool MtpDrafter::setup_coupled(std::string& err) {
     const int64_t nv = dhead_ != nullptr ? n_dvocab_ : n_vocab_;
     const size_t scratch = strata::kernels::coupled_draft_scratch_bytes((int) nv);
     if (scratch == 0) {
-        std::fprintf(stderr, "strata mtp: STRATA_SPEC_COUPLED: %lld draft logits are too wide for the coupled sampler; "
+        std::fprintf(stderr, "xestrata mtp: XESTRATA_SPEC_COUPLED: %lld draft logits are too wide for the coupled sampler; "
                              "argmax drafts\n", (long long) nv);
         return true;
     }
@@ -495,7 +496,7 @@ bool MtpDrafter::setup_coupled(std::string& err) {
         return false;
     }
     coupled_ok_ = true;
-    std::fprintf(stderr, "strata mtp: coupled draft sampling on (STRATA_SPEC_COUPLED): sampled requests draft with the "
+    std::fprintf(stderr, "xestrata mtp: coupled draft sampling on (XESTRATA_SPEC_COUPLED): sampled requests draft with the "
                          "target's chain and Philox draw over %lld tokens\n", (long long) nv);
     return true;
 }
@@ -545,7 +546,7 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
     const std::string vocab = rt_dir_ + "/draft_vocab.bin";
     if (dhead_ == nullptr && shared == nullptr && !full_head_env() && DraftSubset::file_tokens(vocab) > 0) {
         auto sub = std::make_shared<DraftSubset>();
-        if (!sub->load(vocab, n_vocab_, head->weights(), head->row_bytes(), nullptr, "strata mtp", err)) return false;
+        if (!sub->load(vocab, n_vocab_, head->weights(), head->row_bytes(), nullptr, "xestrata mtp", err)) return false;
         if (sub->size() > 0) {
             subset_ = sub;
             dhead_ = const_cast<uint8_t*>(sub->rows());
@@ -576,7 +577,7 @@ void MtpDrafter::setup_int2() {
     const size_t bytes = (size_t) nv * rb;
     uint8_t* host = nullptr;
     if (!strata::gpu::alloc_host(&host, bytes)) {
-        std::fprintf(stderr, "strata mtp: the drafts' head stays as it is (no pinned memory for its copy)\n");
+        std::fprintf(stderr, "xestrata mtp: the drafts' head stays as it is (no pinned memory for its copy)\n");
         return;
     }
     std::string e;
@@ -585,7 +586,7 @@ void MtpDrafter::setup_int2() {
                        h->build(head_->type(), nv, (int) N, [&](int64_t i) { return host + (size_t) i * rb; }, rb, e);
     strata::gpu::free(host);
     if (!built) {
-        std::fprintf(stderr, "strata mtp: the drafts' head stays as it is (%s)\n", e.empty() ? "copy" : e.c_str());
+        std::fprintf(stderr, "xestrata mtp: the drafts' head stays as it is (%s)\n", e.empty() ? "copy" : e.c_str());
         return;
     }
     const int type = head_->type();
@@ -595,7 +596,7 @@ void MtpDrafter::setup_int2() {
     strata::gpu::Stream s = strata::gpu::stream_create();
     const bool on = s != nullptr &&
                     h->choose(sample_, rows, exact, [&](float* out, void* st) { native_mmvq(type, rows, xq_, out, (int) N, (int) nv, 1, st); },
-                              head_logits_, s, "strata mtp");
+                              head_logits_, s, "xestrata mtp");
     if (s != nullptr) strata::gpu::stream_destroy(s);
     if (!on) return;
     int2_ = h;
@@ -668,7 +669,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         // the T tokens' K norm, rotation and K/V append each run once over all T rows (the rope keeps each token's
         // positions); STRATA_NO_BATCH_KV_STEP=1 appends per token
         static const bool no_batch_kv = [] {
-            const char* v = std::getenv("STRATA_NO_BATCH_KV_STEP");
+            const char* v = strata::env_get("NO_BATCH_KV_STEP");
             return v != nullptr && std::strtol(v, nullptr, 10) != 0;
         }();
         native_qsa_rms_norm_weighted(kcur_, f32("self_attn.k_norm.weight"), kcur_, (int) HD, (int) (T * NKV), EPS, cs);
@@ -745,7 +746,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         // router and the routed experts, joined before the combine (upstream 4a5713fb).  STRATA_MTP_SHARED_BRANCH=0:
         // one queue.
         static const bool branch_on = [] {
-            const char* v = std::getenv("STRATA_MTP_SHARED_BRANCH");
+            const char* v = strata::env_get("MTP_SHARED_BRANCH");
             return v == nullptr || std::strtol(v, nullptr, 10) != 0;
         }();
         const bool branch = branch_on && side_ != nullptr;
@@ -792,7 +793,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         // ---- the final mixer and the main model's head: the rows in one fused read (upstream edc592b1; the layers'
         // read without an injection weight); STRATA_HEAD_MIX_MULTI=0: gr_read per row
         static const bool head_mix_multi_on = [] {
-            const char* v = std::getenv("STRATA_HEAD_MIX_MULTI");
+            const char* v = strata::env_get("HEAD_MIX_MULTI");
             return v == nullptr || std::strtol(v, nullptr, 10) != 0;
         }();
         if (head_mix_multi_on && fused_gr_supported(N, HC, g.hc_lr)) {
@@ -993,7 +994,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     // 32768, mixed load (chats, 32K and 7K prompts, deep follow-ups): E-4 hung in the first round on 2 of 2 tries,
     // the old loop ran 30 of 30 rounds clean, prompt speed unchanged.
     static const bool per_group_sync = [] {
-        if (const char* v = std::getenv("STRATA_MTP_PREFILL_SYNC")) return std::strtol(v, nullptr, 10) != 0;
+        if (const char* v = strata::env_get("MTP_PREFILL_SYNC")) return std::strtol(v, nullptr, 10) != 0;
 #if defined(STRATA_USE_HIP)
         return true;
 #else

@@ -217,7 +217,7 @@ bool large_grf_ok(const sycl::device& d) {
             ctx, {d}, {sycl::get_kernel_id<GemmKernel<sycl::half, 128, 256>>()});
         return true;
     } catch (const sycl::exception& e) {
-        std::fprintf(stderr, "strata: the GPU does not build kernels with the large register file (%s): XeStrata's own "
+        std::fprintf(stderr, "xestrata: the GPU does not build kernels with the large register file (%s): XeStrata's own "
                      "matrix-product kernels take their DP4a form\n", e.what());
         return false;
     }

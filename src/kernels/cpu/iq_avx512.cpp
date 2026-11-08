@@ -11,8 +11,10 @@
 //
 // Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22).  IQ1_M stays on ggml-cpu (no shipped
 // model has IQ1_M expert rows: the 'Coder IQ1_M' pack's gate/up are IQ2_S / IQ3_XXS / IQ3_S).
+#include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
 #include "strata/kernels/swiglu_clamp.hpp"
+#include "strata/platform/env.hpp"
 
 #define GGML_COMMON_DECL_CPP
 #define GGML_COMMON_IMPL_CPP
@@ -33,14 +35,10 @@ inline uint16_t u16(const uint8_t* p) { uint16_t v; std::memcpy(&v, p, 2); retur
 inline uint64_t u64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); return v; }
 
 // E-2: the IQ3 grids by one AVX-512 gather (the same words, the same results) - measured 3-5% SLOWER than the scalar
-// lookups on a Ryzen 5 7600 (Zen 4 gathers are microcoded), so opt-in: STRATA_IQ_GATHER=1
-const bool gather = std::getenv("STRATA_IQ_GATHER") != nullptr;
-// E-2: software prefetch distance in bytes (STRATA_IQ_PREFETCH; 0 = off): -2-3% gate/up time on IQ3_S decode
-// (the rows are read at ~30 GB/s by 6 cores, near what DDR5 with 4 KB pages gives: the pool is memory-bound)
-const int prefetch_ahead = [] {
-    const char* v = std::getenv("STRATA_IQ_PREFETCH");
-    return v ? std::atoi(v) : 2048;
-}();
+// lookups on a Ryzen 5 7600 (Zen 4 gathers are microcoded) and faster on a core whose gather is one instruction, so
+// the two decodes are timed once at the first use (iq3_gather_probe): a CPU's name does not say which it is.
+// XESTRATA_IQ_GATHER=0/1 fixes one; unset/auto measures.
+bool gather = false;
 
 // lanes 0-7 -> s0, 8-15 -> s1, 16-23 -> s2, 24-31 -> s3 (int16 lanes of a maddubs result: two values each)
 inline __m512i scales4(int s0, int s1, int s2, int s3) {
@@ -156,8 +154,92 @@ template <> struct Fmt<21> {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4]
     }
 };
 
+template <> struct Fmt<23> {   // IQ4_XS: d, scales_h, scales_l[4], qs[128] - 136 B, 8 signed sub-scales
+    // The same 16-value codebook as IQ4_NL (kvalues_iq4nl), a 32-value sub-block from 16 bytes of nibbles (the low
+    // nibbles first, then the high ones).  Each of the eight 32-value sub-blocks carries its own signed 6-bit scale
+    // (a nibble of scales_l and two bits of scales_h, less 32), which folds into the int16 operand of madd_epi16 as in
+    // the AVX-2 kernel (iq_avx2.cpp's Fmt32<23>); the codebook's sign becomes the activation's mask.
+    static constexpr int bytes = 136;
+    static constexpr float K = 1.0f;
+    static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
+        const __m512i tab = _mm512_broadcast_i32x4(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl)));
+        const __m128i q0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 8 + 16 * (2 * j)));
+        const __m128i q1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 8 + 16 * (2 * j + 1)));
+        const __m128i m4 = _mm_set1_epi8(0x0f);
+        const __m256i h0 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q0, 4), m4), _mm_and_si128(q0, m4));
+        const __m256i h1 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q1, 4), m4), _mm_and_si128(q1, m4));
+        const __m512i idx = _mm512_inserti64x4(_mm512_castsi256_si512(h0), h1, 1);
+        const __m512i q = _mm512_permutexvar_epi8(idx, tab);
+        g = _mm512_abs_epi8(q);
+        m = _mm512_movepi8_mask(q);
+        const int H0 = 2 * j, H1 = H0 + 1;
+        const uint8_t l = b[4 + j];
+        const uint16_t h = u16(b + 2);
+        const int s0 = ((l & 15) | ((h >> (2 * H0) & 3) << 4)) - 32;
+        const int s1 = ((l >> 4) | ((h >> (2 * H1) & 3) << 4)) - 32;
+        sc = scales4(s0, s0, s1, s1);
+    }
+};
+
+// XESTRATA_IQ_GATHER=auto (unset): the two decodes, gather and scalar lookups, on 256 blocks of each IQ3 format, in
+// turn after a warm-up; the gather is taken when it is 2% faster.  The margin keeps a start from moving the choice
+// where the two are close, and the difference the gather makes is 3-5%: one instruction on some cores, microcode on
+// others, which a CPU's name does not say.
+bool iq3_gather_probe() {
+    constexpr int kBlocks = 256, kReps = 64;
+    static uint8_t blocks18[kBlocks * Fmt<18>::bytes], blocks21[kBlocks * Fmt<21>::bytes];
+    static bool filled = false;
+    if (!filled) {
+        uint32_t x = 2463534242u;
+        for (uint8_t& c : blocks18) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; c = (uint8_t) x; }
+        for (uint8_t& c : blocks21) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; c = (uint8_t) x; }
+        filled = true;
+    }
+    static volatile int64_t sink = 0;
+    auto time = [](bool g) {
+        gather = g;
+        __m512i acc = _mm512_setzero_si512();
+        auto pass = [&acc]() {
+            for (int b = 0; b < kBlocks; ++b)
+                for (int j = 0; j < 4; ++j) {
+                    __m512i gg, sc;
+                    __mmask64 m;
+                    Fmt<18>::decode(blocks18 + (size_t) b * Fmt<18>::bytes, j, gg, m, sc);
+                    acc = _mm512_add_epi64(acc, gg);
+                    Fmt<21>::decode(blocks21 + (size_t) b * Fmt<21>::bytes, j, gg, m, sc);
+                    acc = _mm512_add_epi64(acc, gg);
+                }
+        };
+        for (int w = 0; w < 4; ++w) pass();   // the clocks up
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int r = 0; r < kReps; ++r) pass();
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        sink += _mm512_reduce_add_epi64(acc);
+        return us;
+    };
+    const double scalar = std::min(time(false), time(false));
+    const double gathered = std::min(time(true), time(true));
+    gather = false;
+    const bool on = gathered * 1.02 < scalar;
+    std::fprintf(stderr, "xestrata: the IQ3 decode: AVX-512 gather %.0f us, scalar lookups %.0f us (%d blocks x 4; "
+                         "XESTRATA_IQ_GATHER=0/1 picks one)\n", gathered, scalar, kBlocks);
+    return on;
+}
+
+void iq3_gather_decide() {
+    static const bool once = [] {
+        const int v = strata::env_auto("IQ_GATHER");
+        gather = v >= 0 ? v == 1 : iq3_gather_probe();
+        return true;
+    }();
+    (void) once;
+}
+
+// prefetch_ahead: E-2's software prefetch distance in bytes (iq_prefetch_bytes, STRATA_IQ_PREFETCH; 0 = off): -2-3%
+// gate/up time on IQ3_S decode (the rows are read at ~30 GB/s by 6 cores, near what DDR5 with 4 KB pages gives: the
+// pool is memory-bound)
 template <int TY, int NT>
-inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res, int prefetch_ahead) {
     __m512 accf[NT];
     for (int t = 0; t < NT; ++t) accf[t] = _mm512_setzero_ps();
     const __m512i zero = _mm512_setzero_si512();
@@ -197,9 +279,10 @@ void gu_rows(const uint8_t* blob, size_t gu_row, size_t up_off, int n, const voi
     const int nb = n / QK_K;
     float g[NT], u[NT];
     const float lim = expert_swiglu_limit();
+    const int pf = iq_prefetch_bytes();
     for (int r = r0; r < r1; ++r) {
-        row_dot<TY, NT>(blob + (size_t) r * gu_row, nb, y, g);
-        row_dot<TY, NT>(blob + up_off + (size_t) r * gu_row, nb, y, u);
+        row_dot<TY, NT>(blob + (size_t) r * gu_row, nb, y, g, pf);
+        row_dot<TY, NT>(blob + up_off + (size_t) r * gu_row, nb, y, u, pf);
         for (int t = 0; t < NT; ++t) ff[t][r] = swiglu_host(g[t], u[t], lim);
     }
 }
@@ -209,8 +292,9 @@ void dot_rows(const uint8_t* w, size_t row_bytes, int n, const void* const* act,
     const block_q8_K* y[NT];
     for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
     float res[NT];
+    const int pf = iq_prefetch_bytes();
     for (int r = r0; r < r1; ++r) {
-        row_dot<TY, NT>(w + (size_t) r * row_bytes, n / QK_K, y, res);
+        row_dot<TY, NT>(w + (size_t) r * row_bytes, n / QK_K, y, res, pf);
         for (int t = 0; t < NT; ++t) out[t][r] = res[t];
     }
 }

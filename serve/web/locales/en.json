@@ -92,7 +92,7 @@
   "about.kept": "Chats, settings and the key are kept in this browser only.",
   "about.github": "XeStrata on GitHub",
   "about.cfgTitle": "Model settings",
-  "about.cfgNote": "Kept in the model's run config for every client. An empty field is the default. They take effect the next time the model starts (close Strata's window and start it again).",
+  "about.cfgNote": "Kept in the model's run config for every client. An empty field is the default. They take effect the next time the model starts (close XeStrata's window and start it again).",
   "branch.back": "Back to it",
   "branch.from": "Branched from “{title}”",
   "branch.open": "Open the original",

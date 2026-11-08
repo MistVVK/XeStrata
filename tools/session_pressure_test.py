@@ -5,7 +5,7 @@
 """SAVE / RESTORE round trip with parked conversations holding the host RAM (#1572 / #1573).
 
   python3 tools/session_pressure_test.py CFG OUTFILE
-  STRATA_EXTRA_ARGS="--prompt-cache 4 --conversation-cache-mib 3072 --conversation-cache-slots 4
+  XESTRATA_EXTRA_ARGS="--prompt-cache 4 --conversation-cache-mib 3072 --conversation-cache-slots 4
                      --conversation-cache-min-free-mib <floor> [--session-save-reclaim]"
 
 Parks three conversations, runs a fourth (D), SAVEs it, runs an unrelated one, RESTOREs, and checks that D's next turn
@@ -18,7 +18,7 @@ import sys
 import threading
 from pathlib import Path
 
-REPO = Path(os.environ.get("STRATA_REPO", Path(__file__).resolve().parent.parent))
+REPO = Path(os.environ.get("XESTRATA_REPO", Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(REPO / "tools"))
 sys.path.insert(0, str(REPO))
 import strata_tokenizer as ST  # noqa: E402
@@ -33,9 +33,9 @@ toks = [None] * len(vocab)
 for t, i in vocab.items():
     toks[i] = t
 tok = ST.Tokenizer(toks, (tp / "merges.txt").read_text().split("\n"), json.loads((tp / "token_type.json").read_text()))
-args = cfg["args"] + os.environ.get("STRATA_EXTRA_ARGS", "").split()
+args = cfg["args"] + os.environ.get("XESTRATA_EXTRA_ARGS", "").split()
 eng = StrataEngine(
-    os.environ.get("STRATA_EXE", cfg["exe"]),
+    os.environ.get("XESTRATA_EXE", cfg["exe"]),
     args,
     cwd=cfg.get("cwd"),
     log=os.environ.get("SMOKE_LOG", cfg["log"]),

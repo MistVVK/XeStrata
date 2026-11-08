@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/graph.cpp - P2.S5: the GraphRegistry implementation, on SYCL command graphs (strata/core/gpu.hpp).
 #include "strata/core/graph.hpp"
+#include "strata/platform/env.hpp"
 
 #include <immintrin.h>
 
@@ -142,7 +143,7 @@ uint64_t graph_epoch() { return g_epoch.load(std::memory_order_acquire); }
 void graph_epoch_bump() { g_epoch.fetch_add(1, std::memory_order_acq_rel); }
 
 StepForm::StepForm(const char* env) {
-    const char* e = env != nullptr ? std::getenv(env) : nullptr;
+    const char* e = env != nullptr ? strata::env_get(env) : nullptr;
     if (e != nullptr && (e[0] == '0' || e[0] == '1')) form_ = e[0] - '0';
 }
 
@@ -190,13 +191,13 @@ bool StepForm::run(uint64_t key, void* stream, const std::function<void()>& body
             body();
         } catch (const std::exception& e) {
             gpu::abandon_capture(stream);
-            std::fprintf(stderr, "strata: a step could not be recorded (%s); its steps go straight\n", e.what());
+            std::fprintf(stderr, "xestrata: a step could not be recorded (%s); its steps go straight\n", e.what());
             form_ = 1;
             body();
             return true;
         }
         if (!gpu::end_capture(stream, &g)) {
-            std::fprintf(stderr, "strata: a step could not be recorded (%s); its steps go straight\n",
+            std::fprintf(stderr, "xestrata: a step could not be recorded (%s); its steps go straight\n",
                          gpu::last_error());
             form_ = 1;
             body();
@@ -211,7 +212,7 @@ bool StepForm::run(uint64_t key, void* stream, const std::function<void()>& body
             if (got != want) {
                 size_t differ = 0;
                 for (size_t i = 0; i < std::min(got.size(), want.size()); ++i) differ += got[i] != want[i];
-                std::fprintf(stderr, "strata: a recorded step gave other results than the step itself (%zu of %zu "
+                std::fprintf(stderr, "xestrata: a recorded step gave other results than the step itself (%zu of %zu "
                                      "bytes); its steps go straight\n", differ, want.size());
                 form_ = 1;
                 body();

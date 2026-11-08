@@ -33,12 +33,12 @@ from pathlib import Path
 # not use).  ze_loader.dll comes with Intel's driver, nvcuda.dll and nvml.dll with NVIDIA's, amdhip64_7.dll with AMD's.
 SYCL_DLLS = ("sycl9.dll", "ur_win_proxy_loader.dll", "ur_adapter_cuda.dll", "ur_adapter_hip.dll",
              "ur_adapter_level_zero.dll", "ur_adapter_level_zero_v2.dll", "xptifw.dll")
-ENGINE_EXES = ("strata.exe", "strata-device.exe", "strata-image.exe", "strata-vision-cpu.exe")
+ENGINE_EXES = ("xestrata-engine.exe", "xestrata-device.exe", "xestrata-image.exe", "xestrata-vision-cpu.exe")
 # oneMath and its oneMKL backend (the engine's build folder's bin/), which loads oneMKL where the user installed it
 ONEMATH_DLLS = ("onemath.dll", "onemath_blas_mklgpu.dll", "onemath_blas_cublas.dll", "onemath_blas_rocblas.dll")
 # AMD GPUs' image attention: the engine's module that opens aotriton (on an AMD GPU only), aotriton's library (built
 # in the engine's build, liblzma linked in) and its kernels' images, which it finds beside it
-AOTRITON_DLLS = ("strata_sdpa_aotriton.dll", "aotriton_v2.dll")
+AOTRITON_DLLS = ("xestrata_sdpa_aotriton.dll", "aotriton_v2.dll")
 # Intel GPUs' image attention: oneDNN (built in the engine's build, onednn/bin/)
 ONEDNN_DLLS = ("dnnl.dll",)
 # what a Windows PC brings (the Visual C++ runtime, which xestrata.exe checks for) and what must never be carried
@@ -113,11 +113,11 @@ COMPONENTS = [
      "https://github.com/uxlfoundation/oneDNN",
      ["src:third_party/main/oneDNN/LICENSE", "src:third_party/main/oneDNN/THIRD-PARTY-PROGRAMS"],
      ["app/engine/dnnl.dll"]),
-    ("cuDNN Frontend (compiled into strata-image.exe)", "1.32.2", "Apache-2.0 (parts MIT)",
+    ("cuDNN Frontend (compiled into xestrata-image.exe)", "1.32.2", "Apache-2.0 (parts MIT)",
      "https://github.com/NVIDIA/cudnn-frontend", ["src:third_party/main/cudnn-frontend/LICENSE.txt"], []),
     ("CUTLASS (compiled into the engine)", "4.8.1", "BSD-3-Clause", "https://github.com/NVIDIA/cutlass",
      ["src:third_party/main/cutlass/LICENSE.txt"], []),
-    ("stb_image (compiled into strata-image.exe)", "2.30", "MIT OR Unlicense", "https://github.com/nothings/stb",
+    ("stb_image (compiled into xestrata-image.exe)", "2.30", "MIT OR Unlicense", "https://github.com/nothings/stb",
      ["src:third_party/main/stb/LICENSE"], []),
     ("libjxl's cjxl and djxl (statically linked with Highway, Brotli, skcms, libpng, zlib, libjpeg-turbo, giflib, "
      "libwebp and sjpeg)", "jxl", "BSD-3-Clause; the libraries under their own licenses (Apache-2.0, BSD-3-Clause, "

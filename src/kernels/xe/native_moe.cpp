@@ -12,6 +12,7 @@
 #define STRATA_DEVICE_ARCH_TAG_TU xe_native_moe
 #include "strata/kernels/device_arch_tag.hpp"
 #include "strata/kernels/rows_cols.hpp"
+#include "strata/platform/env.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -67,7 +68,7 @@ sycl::queue& explicit_stream(void* stream) {
 
 bool native_moe_fuse_hits() {
     static const bool on = [] {
-        const char* v = std::getenv("STRATA_FUSE_HITS");
+        const char* v = strata::env_get("FUSE_HITS");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     return on;

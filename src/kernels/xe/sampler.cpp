@@ -13,6 +13,7 @@
 #include "device_caps.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_sampler
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <cstdlib>
 #include <cstring>
@@ -459,7 +460,7 @@ void* split_scratch(sycl::queue& q, size_t bytes) {
 
 bool gumbel_env() {
     static const bool on = [] {
-        const char* e = std::getenv("STRATA_SPEC_GUMBEL");
+        const char* e = strata::env_get("SPEC_GUMBEL");
         return e != nullptr && *e != '\0' && std::strcmp(e, "0") != 0;
     }();
     return on;
@@ -487,7 +488,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                       : (wg == 1024 ? sample_launch<1024, float> : wg == 512 ? sample_launch<512, float>
                                                                       : sample_launch<256, float>);
     // the sampled path split over the GPU; STRATA_OLD_SAMPLER=1: the one-group kernel (A/B and reference)
-    static const bool old_sampler = std::getenv("STRATA_OLD_SAMPLER") != nullptr;
+    static const bool old_sampler = strata::env_get("OLD_SAMPLER") != nullptr;
     int k = (pp.top_k > 0 && pp.top_k < KMAX) ? pp.top_k : KMAX;
     if (k > n_vocab) k = n_vocab;
     const int nb = (n_vocab + SPLIT_BL - 1) / SPLIT_BL;

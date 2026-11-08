@@ -14,6 +14,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -182,7 +183,7 @@ ProfileFill<Pairs> plan_profile_fill(const Pairs& prior, int64_t layers, int64_t
 /// default, STRATA_ADAPT_LAG over it.
 inline int adapt_lag(int windows = 2) {
     static const int v = [] {
-        const char* e = std::getenv("STRATA_ADAPT_LAG");
+        const char* e = strata::env_get("ADAPT_LAG");
         return e ? std::max(1, (int) std::strtol(e, nullptr, 10)) : 0;
     }();
     return v > 0 ? v : windows;
@@ -222,7 +223,7 @@ inline int64_t auto_adapt_period(double share, int64_t period, bool from_files, 
 /// STRATA_USAGE_SEED=0: the counts start from nothing.
 inline void seed_usage(std::vector<float>& usage, const std::vector<int64_t>& routed, int64_t routed_k,
                        std::vector<int64_t>& seen, int64_t n_expert, int64_t period, double decay) {
-    static const bool on = [] { const char* v = std::getenv("STRATA_USAGE_SEED"); return v == nullptr || *v != '0'; }();
+    static const bool on = [] { const char* v = strata::env_get("USAGE_SEED"); return v == nullptr || *v != '0'; }();
     if (!on || usage.empty() || routed.empty() || routed_k <= 0 || usage.size() != routed.size() || n_expert <= 0 ||
         period <= 0)
         return;

@@ -180,12 +180,12 @@ class Calibrate(unittest.TestCase):
     def test_engine_error(self):
         with tempfile.TemporaryDirectory() as d:
             log = Path(d) / "strata-x.log"
-            log.write_text("strata generate: an old error\n", encoding="utf-8")
+            log.write_text("xestrata generate: an old error\n", encoding="utf-8")
             since = log.stat().st_size
             with open(log, "a", encoding="utf-8") as f:
-                f.write("loading ...\nstrata generate: --expert-cache-remote with a layer split needs a GPU that runs "
-                        "no stage (2 visible, 2 used by the split)\n\n")
-            self.assertEqual(CAL.engine_error(str(log), since), "strata generate: --expert-cache-remote with a layer "
+                f.write("loading ...\nxestrata generate: --expert-cache-remote with a layer split needs a GPU that "
+                        "runs no stage (2 visible, 2 used by the split)\n\n")
+            self.assertEqual(CAL.engine_error(str(log), since), "xestrata generate: --expert-cache-remote with a layer "
                              "split needs a GPU that runs no stage (2 visible, 2 used by the split)")
             with open(log, "a", encoding="utf-8") as f:
                 f.write("Segmentation fault\n")

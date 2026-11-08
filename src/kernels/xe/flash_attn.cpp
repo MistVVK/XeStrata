@@ -37,6 +37,7 @@
 #include "device_target.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_flash_attn
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <sycl/sycl.hpp>
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
@@ -1892,7 +1893,7 @@ bool batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const 
         });
         if (!mma || pools.k_q4 != nullptr) return false;
         static const bool ptx_on = [] {
-            const char* v = std::getenv("STRATA_PROMPT_ATTN_PTX");
+            const char* v = strata::env_get("PROMPT_ATTN_PTX");
             return v == nullptr || v[0] != '0';
         }();
         const int64_t nkv = s.n_head_kv, ps = s.page_size;
@@ -1916,7 +1917,7 @@ bool batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const 
     }
     // STRATA_PROMPT_ATTN_Q4=0: Q4_0 K or V (--kv q4_0, --kv k8v4) to the FP32 kernel, as before upstream 778e1f6 (A/B)
     static const bool q4_on = [] {
-        const char* v = std::getenv("STRATA_PROMPT_ATTN_Q4");
+        const char* v = strata::env_get("PROMPT_ATTN_Q4");
         return v == nullptr || v[0] != '0';
     }();
     const int64_t nkv = s.n_head_kv, ps = s.page_size;

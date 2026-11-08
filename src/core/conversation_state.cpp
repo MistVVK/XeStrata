@@ -9,6 +9,7 @@
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/platform/aux_cpus.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <array>
@@ -218,11 +219,11 @@ struct CkptAsync {
 };
 CkptAsync& ckpt_async() { static CkptAsync a; return a; }
 bool ckpt_async_on() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_CKPT_ASYNC"); return v != nullptr && v[0] == '1'; }();
+    static const bool on = [] { const char* v = strata::env_get("CKPT_ASYNC"); return v != nullptr && v[0] == '1'; }();
     return on;
 }
 bool park_trace_env() {   // STRATA_PARK_TRACE: the timing of the save and park steps
-    static const bool on = std::getenv("STRATA_PARK_TRACE") != nullptr;
+    static const bool on = strata::env_get("PARK_TRACE") != nullptr;
     return on;
 }
 double ms_since(std::chrono::steady_clock::time_point t) {
@@ -289,7 +290,7 @@ struct VramSlots { std::vector<VramSlot> s; uint64_t clock = 0, next_tag = 0; };
 VramSlots& vram_slots() { static VramSlots v; return v; }
 int vram_slots_n() {
     static const int n = [] {
-        const char* v = std::getenv("STRATA_CKPT_VRAM_SLOTS");
+        const char* v = strata::env_get("CKPT_VRAM_SLOTS");
         return v ? std::max(0, std::min(16, (int) std::strtol(v, nullptr, 10))) : 0;
     }();
     return n;
@@ -331,7 +332,7 @@ int ckpt_async_save_gdn(uint8_t* dst, const SessionState& ss, size_t n, bool pin
         slot->tag = tag = ++v.next_tag;
         slot->used = ++v.clock;
     }
-    if (park_trace_env()) std::fprintf(stderr, "strata parktrace: async ckpt d2d %.2f ms\n", ms_since(q0));
+    if (park_trace_env()) std::fprintf(stderr, "xestrata parktrace: async ckpt d2d %.2f ms\n", ms_since(q0));
     ckpt_async_launch(a, dst, pinned_dst ? nullptr : a.host, dsrc, n);
     return 1;
 }
@@ -344,7 +345,7 @@ int ckpt_async_save_gdn(uint8_t* dst, const SessionState& ss, size_t n, bool pin
 struct CkptGather { std::mutex mu; void* stage = nullptr; void* host = nullptr; size_t cap = 0; int dev = -1; };
 CkptGather& ckpt_gather() { static CkptGather a; return a; }
 bool ckpt_gather_on() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_CKPT_GATHER"); return v != nullptr && v[0] == '1'; }();
+    static const bool on = [] { const char* v = strata::env_get("CKPT_GATHER"); return v != nullptr && v[0] == '1'; }();
     return on;
 }
 // 1: the vectors are filled; 0: no buffers (the caller copies them one by one); -1: a copy failed (`error` set)
@@ -404,7 +405,7 @@ void conversation_checkpoint_join(const void* only) {
     std::lock_guard<std::mutex> lk(a.mu);
     if (a.pending.valid() && (only == nullptr || only == a.dst)) {
         const std::string e = a.pending.get();
-        if (!e.empty()) std::fprintf(stderr, "strata: STRATA_CKPT_ASYNC: a checkpoint copy failed (%s)\n", e.c_str());
+        if (!e.empty()) std::fprintf(stderr, "xestrata: XESTRATA_CKPT_ASYNC: a checkpoint copy failed (%s)\n", e.c_str());
     }
 }
 
@@ -461,7 +462,7 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
                                   const ModelGeometry& g, std::string& error) {
     const auto j0 = std::chrono::steady_clock::now();
     conversation_checkpoint_join(nullptr);   // (the stage is reused)
-    if (park_trace_env()) std::fprintf(stderr, "strata parktrace: save join %.2f ms\n", ms_since(j0));
+    if (park_trace_env()) std::fprintf(stderr, "xestrata parktrace: save join %.2f ms\n", ms_since(j0));
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss, g);
@@ -469,7 +470,7 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     const auto r0 = std::chrono::steady_clock::now();
     c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
     c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
-    if (park_trace_env()) std::fprintf(stderr, "strata parktrace: save vectors %s, resize %.2f ms\n",
+    if (park_trace_env()) std::fprintf(stderr, "xestrata parktrace: save vectors %s, resize %.2f ms\n",
                                        ready ? "ready" : "fresh", ms_since(r0));
     c.dev_tag = 0;
     int staged = 0;   // STRATA_CKPT_ASYNC: the GDN bytes land in c.gdn on the background thread
@@ -494,7 +495,7 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
         }
         return true;
     }();
-    if (park_trace_env()) std::fprintf(stderr, "strata parktrace: save small copies %.2f ms\n", ms_since(s0));
+    if (park_trace_env()) std::fprintf(stderr, "xestrata parktrace: save small copies %.2f ms\n", ms_since(s0));
     if (!ok && staged > 0) conversation_checkpoint_join(c.gdn.data());   // a failed save's caller drops `c` at once
     return ok;
 }
@@ -717,7 +718,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
         for (const auto& k : captured.kv) kvb += k.bytes();
         double attrs_ms = 0, resize_ms = 0, copy_ms = 0;
         conversation_kv_save_trace(attrs_ms, resize_ms, copy_ms);   // (the main layers' saves above)
-        std::fprintf(stderr, "strata parktrace: joins %.1f ms, sync %.1f ms, %zu checkpoints copied %.1f ms, live state "
+        std::fprintf(stderr, "xestrata parktrace: joins %.1f ms, sync %.1f ms, %zu checkpoints copied %.1f ms, live state "
                              "%.1f ms, begin %.1f ms, K/V %zu MB %.1f ms (layer max %.2f, sum %.2f; attrs %.2f, resize "
                              "%.2f, copy %.2f)\n", ms(pj, p0), ms(p0, p1), captured.checkpoints.size(), ms(p1, p2),
                      ms(p2, p3), ms(p3, p4), kvb >> 20, ms(p4, Steady::now()), kv_max, kv_sum, attrs_ms, resize_ms,

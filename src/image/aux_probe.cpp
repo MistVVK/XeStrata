@@ -30,6 +30,7 @@
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/qi_sdpa_ex.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/platform/env.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -213,7 +214,7 @@ int main(int argc, char** argv) {
                 std::printf("segment %zu score=%.4f box=%.1f,%.1f,%.1f,%.1f\n", i, g.score, g.x0, g.y0, g.x1, g.y1);
                 write_raw(out + "/mask" + std::to_string(i) + ".u8", g.mask.data(), g.mask.size());
             }
-            const char* rep = std::getenv("STRATA_PROBE_REPEAT");
+            const char* rep = strata::env_get("PROBE_REPEAT");
             const int reps = rep != nullptr ? (int) std::strtol(rep, nullptr, 10) : 1;
             std::printf("cold vision_s=%.4f text_s=%.4f detect_s=%.4f masks_s=%.4f\n", t.vision, t.text, t.detect,
                         t.masks);
@@ -247,7 +248,7 @@ int main(int argc, char** argv) {
             write_raw(out + "/fg.rgb", fg.data(), fg.size());
             std::printf("cold backbone_s=%.4f decoder_s=%.4f mask_s=%.4f refine_s=%.4f\n", t.backbone, t.decoder,
                         t.mask, fg_s);
-            const char* rep = std::getenv("STRATA_PROBE_REPEAT");
+            const char* rep = strata::env_get("PROBE_REPEAT");
             const int reps = rep != nullptr ? (int) std::strtol(rep, nullptr, 10) : 1;
             for (int r = 0; r < reps; ++r) {
                 si::Birefnet::Times t2;
@@ -284,7 +285,7 @@ int main(int argc, char** argv) {
             print(got);
             // once more (STRATA_PROBE_REPEAT times), warm, for the times (and the same tokens without the dumps' waits)
             si::Florence2::Times t2;
-            const char* rep = std::getenv("STRATA_PROBE_REPEAT");
+            const char* rep = strata::env_get("PROBE_REPEAT");
             for (int r = 0, n = rep ? std::max(1, (int) std::strtol(rep, nullptr, 10)) : 1; r < n; ++r) {
                 got = f.run(img, ids, max_new, beams, &t2);
                 print(got);
@@ -309,7 +310,7 @@ int main(int argc, char** argv) {
                              "<x,y,...>...\n", argv[0]);
         return 2;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image-aux-probe: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image-aux-probe: %s\n", e.what());
         return 1;
     }
 }

@@ -37,7 +37,7 @@ The contrib-llvm build (below) runs on NVIDIA GPUs as well, through the same ker
 - Choose code paths from what the hardware reports: the CPUID feature bits (as `cpu_avx512_ok` does); the device's matrix combinations, sub-group sizes, GRF modes, local memory, memory size and largest allocation. Never from a vendor string, a model number, a device ID or a product name.
 - Sizes and thresholds (tile shapes, chunk sizes, ring slots, cache sizes, thread counts, memory reserves, spin bounds) are not hard-coded, as far as they can be: they are derived from those reports at run time. A value that has to be measured is measured on the three makers' GPUs the maintainer has, the Arc Pro B70, the RTX 4070 and the RX 9060 XT, not on the B70 alone; it has a fallback that works on a smaller device, and a comment says where it was measured and what it depends on.
 - A feature some devices lack (XMX, large GRF mode, a SYCL extension) is checked before use, with a working fallback.
-- Check a change on a smaller configuration as well: on the B70 with `STRATA_VRAM_LIMIT_MIB=8192 STRATA_MAX_ALLOC_MIB=4096 STRATA_NO_XMX=1` (the memory, the largest allocation and the matrix engines of a small card) and fewer CPU threads; at milestones also on the processor's own graphics (the UHD 770, a check only: start and a short answer). Mark what was not checked `unverified`.
+- Check a change on a smaller configuration as well: on the B70 with `XESTRATA_VRAM_LIMIT_MIB=8192 XESTRATA_MAX_ALLOC_MIB=4096 XESTRATA_NO_XMX=1` (the memory, the largest allocation and the matrix engines of a small card) and fewer CPU threads; at milestones also on the processor's own graphics (the UHD 770, a check only: start and a short answer). Mark what was not checked `unverified`.
 
 ## Operating systems: Linux (main) and Windows
 
@@ -206,11 +206,12 @@ It picks the lints by file kind, with the configurations in `tools/lint/`:
 | all text files | codespell |
 | every file | gitleaks (built-in rules, no configuration of its own) |
 | every file | `tools/license_class.py` (the license classes, see Licenses above) |
+| C++, Python, documents, the web app | `tools/lint/upstream_name.py` (upstream's name where a user reads XeStrata's: `xestrata`, `XESTRATA_*`) |
 | the whole repository | `reuse lint` (see Licenses above) |
 
 The files a change touches must get no new findings; findings that were there before may stay.
 Other projects' files in `third_party/<area>/<project>/` (kept as they are; XeStrata's `patches/` there excepted) get only gitleaks and `reuse lint`.
-clang-tidy reads `compile_commands.json` from the build folder (`build/free`, or `STRATA_LINT_BUILD`): configure it with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
+clang-tidy reads `compile_commands.json` from the build folder (`build/free`, or `XESTRATA_LINT_BUILD`): configure it with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
 
 Then run the existing tests the change can affect (CTest in the build folder, `python -m unittest` for `serve/` and `tools/`).
 For memory and undefined-behavior bugs, build in a folder of its own with `-DSTRATA_SANITIZE=address,undefined` (for example `build/free-asan`) and run CTest there.

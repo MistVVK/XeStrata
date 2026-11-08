@@ -14,7 +14,7 @@
 // The source names itself before the include (#define STRATA_DEVICE_ARCH_TAG_TU xe_sampler): the device link joins
 // every source's code before it splits it into images, and a mark with the same name in two sources is kept once.
 #ifndef STRATA_DEVICE_ARCH_TAG_TU
-#error "define STRATA_DEVICE_ARCH_TAG_TU (the source's name) before including strata/kernels/device_arch_tag.hpp"
+#error "define XESTRATA_DEVICE_ARCH_TAG_TU (the source's name) before including strata/kernels/device_arch_tag.hpp"
 #endif
 
 #define STRATA_DEVICE_ARCH_TAG_STR2(x) #x

@@ -12,10 +12,10 @@ so a user's record and the development machines' records go into the same tables
 
 | Measurement | How it runs | What it shows |
 | --- | --- | --- |
-| generate | `strata` started once per run, reading the tier's prompt and writing 256 tokens (greedy) | the kernels and the speculative decoding |
-| serve | a chat of four turns sent to `strata --serve` over stdin (the tier's prompt and three follow-up questions, 256 tokens a turn) | the server's decode loop and the conversation checkpoints (the wait before a follow-up's answer) |
+| generate | `xestrata-engine` started once per run, reading the tier's prompt and writing 256 tokens (greedy) | the kernels and the speculative decoding |
+| serve | a chat of four turns sent to `xestrata-engine --serve` over stdin (the tier's prompt and three follow-up questions, 256 tokens a turn) | the server's decode loop and the conversation checkpoints (the wait before a follow-up's answer) |
 | everyday use | `serve/server.py` started, requests streamed to `/v1/chat/completions` | the whole path a user meets (the chat template, the thinking, tool calls) |
-| image generation | one 1024x1024 image of 8 steps a run from a fixed prompt and seed (42), made as the server makes it (XeStrata: its resident `strata-image`, an image once it is warm; upstream: an `sd-cli` process an image) | the time of an image, and its sampling and VAE in it |
+| image generation | one 1024x1024 image of 8 steps a run from a fixed prompt and seed (42), made as the server makes it (XeStrata: its resident `xestrata-image`, an image once it is warm; upstream: an `sd-cli` process an image) | the time of an image, and its sampling and VAE in it |
 
 The tiers are lengths of a coding agent's prompt (XeStrata's sources at 58dbbe5, read as files): 1K, 4K, 32K, 64K, 128K, 192K and 262K.
 Each tier runs with what setup writes for its context (INT8 K/V above 8K, `--kv-resident 32768` from 64K).

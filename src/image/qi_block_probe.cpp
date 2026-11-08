@@ -227,7 +227,7 @@ int main(int argc, char** argv) {
                     "attention %.2f ms (%.1f TFLOPS)\n", t_prod, flops / t_prod / 1e9, t_attn, t_mx,
                     aflops / t_mx / 1e9);
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image-probe: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image-probe: %s\n", e.what());
         return 1;
     }
     return 0;

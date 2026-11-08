@@ -159,7 +159,7 @@ class Config(unittest.TestCase):
     """The run config's "images" section for HunyuanImage 3.0."""
 
     def setUp(self):
-        self.cfg = QI.image_config("w4a8", "/engine/strata-image", "/models", model="hunyuan-image-3-distil")
+        self.cfg = QI.image_config("w4a8", "/engine/xestrata-image", "/models", model="hunyuan-image-3-distil")
 
     def test_the_section(self):
         self.assertEqual(self.cfg["model_name"], "hunyuan-image-3-distil")
@@ -186,7 +186,7 @@ class Config(unittest.TestCase):
     def test_the_models_that_take_adapters_name_their_folder(self):
         """serve/loras.py reads a model's LoRA files from "lora_dir": one folder for every model that applies them."""
         for model in ("qwen-image-turbo", "mage-flow-turbo", "moss-image"):
-            cfg = QI.image_config("Q8_0", "/engine/strata-image", "/models", model=model)
+            cfg = QI.image_config("Q8_0", "/engine/xestrata-image", "/models", model=model)
             self.assertEqual(cfg["lora_dir"], "/models/loras", model)
 
 

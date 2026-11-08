@@ -37,7 +37,7 @@ class DisabledCacheGateTest(unittest.TestCase):
         verify(fixture())
 
     def test_upstream_hash_schema(self):
-        line = 'strata serve: STATE_HASH L=2 gdn=ab ple=cd tail=ef pooled=12 kv=34 mtp=56 stale=78 ple_prev=1,2'
+        line = 'xestrata serve: STATE_HASH L=2 gdn=ab ple=cd tail=ef pooled=12 kv=34 mtp=56 stale=78 ple_prev=1,2'
         self.assertEqual(set(state_hashes(line)[0]), set(STATE_KEYS))
         self.assertEqual(state_hashes(line), state_hashes(line + ' dead=99'))
         # the candidate's pooled= is the upstream extent; pooled_full= (with the spare row) is not compared

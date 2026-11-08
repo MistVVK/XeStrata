@@ -19,6 +19,7 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/native_qsa.hpp"
+#include "strata/platform/env.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -159,7 +160,7 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
         norm_cache_.clear();
         // the int8 form: W8A8 (int8 activations a token, kTypeW8) where the GPU's library takes int8 products, else
         // Q8_0 (dequantized to FP16 for each product)
-        w8_ = q8 && std::getenv("STRATA_NO_W8A8") == nullptr && prefill::Gemm::i8_usable(stream);
+        w8_ = q8 && strata::env_get("NO_W8A8") == nullptr && prefill::Gemm::i8_usable(stream);
         st_ = std::make_unique<SafeTensors>(path);
         SafeTensors& st = *st_;
         file_ = std::make_unique<MappedFile>(path);

@@ -513,7 +513,7 @@ class Requests(Tree):
 
 def cfg(**kw) -> dict:
     """A run config's "images" section of Qwen-Image-2.1 Turbo."""
-    out = {"exe": "strata-image", "diffusion_model": "dit.gguf", "vae": "vae.safetensors", "llm": "text.gguf",
+    out = {"exe": "xestrata-image", "diffusion_model": "dit.gguf", "vae": "vae.safetensors", "llm": "text.gguf",
            "schedule": "turbo"}
     out.update(kw)
     return out
@@ -565,7 +565,8 @@ class Added(Tree):
         from serve.test_server import CTX, ROOT, ByteTokenizer
         for name in ("dit.safetensors", "vae.safetensors", "text.gguf"):
             (self.d.parent / name).write_bytes(b"x")
-        cfg = {"model_name": "mage-test", "family": "mage-flow", "exe": "strata-image", "steps": 4, "schedule": "mage",
+        cfg = {"model_name": "mage-test", "family": "mage-flow", "exe": "xestrata-image", "steps": 4,
+               "schedule": "mage",
                "diffusion_model": str(self.d.parent / "dit.safetensors"), "vae": str(self.d.parent / "vae.safetensors"),
                "llm": str(self.d.parent / "text.gguf"), "lora_dir": str(self.d)}
         tok = ByteTokenizer()
@@ -683,7 +684,7 @@ class Job(Tree):
             images.parse_request({"prompt": "a cat", "lora": [{"name": "style/gouache"}]}, mage)
         self.assertIn("is not one of this image model's weights", str(e.exception),
                       "Mage-Flow takes adapters now: Qwen-Image-2.1's file is another model's")
-        hunyuan = {"exe": "strata-image", "family": "hunyuan-image-3", "diffusion_model": "d", "vae": "v",
+        hunyuan = {"exe": "xestrata-image", "family": "hunyuan-image-3", "diffusion_model": "d", "vae": "v",
                    "tokenizer": "t", "system_prompt": "s", "schedule": "hunyuanimage3"}
         with self.assertRaises(images.ImageRequestError) as e:
             images.parse_request({"prompt": "a cat <lora:style/gouache:1>"}, hunyuan)
@@ -718,7 +719,7 @@ class Job(Tree):
         self.assertEqual((figures["lora_n"], figures["lora_mib"]), (2, 8))
         body = self.gen.response(made, job, figures, "http://x")
         self.assertEqual(body["data"][0]["lora"], [{"name": "Strong Style", "scale": 0.75}])
-        self.assertEqual(body["strata"]["lora_n"], 2)
+        self.assertEqual(body["xestrata"]["lora_n"], 2)
         job = images.parse_request({"prompt": "a cat", "size": "256x256", "seed": 3}, self.cfg)
         made, figures = self.gen.run(job)
         self.assertNotIn("lora", self.gen.response(made, job, figures, "http://x")["data"][0])

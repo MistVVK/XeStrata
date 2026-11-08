@@ -80,8 +80,8 @@ class HuggingFacePins(unittest.TestCase):
             raise not_found(req.full_url)
 
         with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", urlopen), \
-                mock.patch.dict(setup.os.environ, {"STRATA_SOURCE": "huggingface"}):
-            setup.os.environ.pop("STRATA_ALLOW_UNPINNED", None)
+                mock.patch.dict(setup.os.environ, {"XESTRATA_SOURCE": "huggingface"}):
+            setup.os.environ.pop("XESTRATA_ALLOW_UNPINNED", None)
             dst = Path(d) / "m.gguf"
             with self.assertRaises(SystemExit):
                 _, out = quiet(setup.download, setup.FAMILIES["qwen"]["mmproj_hf"] + "m.gguf", dst)
@@ -90,7 +90,7 @@ class HuggingFacePins(unittest.TestCase):
         self.assertTrue(all("/resolve/main/" not in u for _, u in seen))
 
     def test_the_opt_out_downloads_the_current_file(self):
-        """STRATA_ALLOW_UNPINNED=1 (a tester's choice): the repository's current file, announced, off by default."""
+        """XESTRATA_ALLOW_UNPINNED=1 (a tester's choice): the repository's current file, announced, off by default."""
         seen = []
 
         def urlopen(req, timeout=None):
@@ -101,12 +101,12 @@ class HuggingFacePins(unittest.TestCase):
 
         # the pinned Hugging Face path itself (setup's --source huggingface; auto may pick ModelScope)
         with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", urlopen), \
-                mock.patch.dict(setup.os.environ, {"STRATA_SOURCE": "huggingface", "STRATA_ALLOW_UNPINNED": "1"}), \
+                mock.patch.dict(setup.os.environ, {"XESTRATA_SOURCE": "huggingface", "XESTRATA_ALLOW_UNPINNED": "1"}), \
                 mock.patch.object(setup, "_unpinned_said", []):
             dst = Path(d) / "m.gguf"
             _, out = quiet(setup.download, setup.FAMILIES["qwen"]["mmproj_hf"] + "m.gguf", dst)
             self.assertEqual(dst.read_bytes(), b"model bytes")
-        self.assertIn("STRATA_ALLOW_UNPINNED=1", out)
+        self.assertIn("XESTRATA_ALLOW_UNPINNED=1", out)
         self.assertIn("not at the pinned revision any more", out)
         self.assertEqual([m for m, _ in seen], ["HEAD", "HEAD", "GET"])
         self.assertTrue(all("/resolve/main/" in u for _, u in seen[1:]))
@@ -122,17 +122,17 @@ class HuggingFacePins(unittest.TestCase):
 
         try:
             with mock.patch.object(mtp_fetch.urllib.request, "urlopen", urlopen), \
-                    mock.patch.dict(mtp_fetch.os.environ, {"STRATA_ALLOW_UNPINNED": ""}):
+                    mock.patch.dict(mtp_fetch.os.environ, {"XESTRATA_ALLOW_UNPINNED": ""}):
                 with self.assertRaises(SystemExit) as stop:
                     mtp_fetch.resolve_repo()
                 self.assertIn("no longer on Hugging Face", str(stop.exception))
                 self.assertEqual(mtp_fetch.REPO, pinned)
             with mock.patch.object(mtp_fetch.urllib.request, "urlopen", urlopen), \
-                    mock.patch.dict(mtp_fetch.os.environ, {"STRATA_ALLOW_UNPINNED": "1"}), \
+                    mock.patch.dict(mtp_fetch.os.environ, {"XESTRATA_ALLOW_UNPINNED": "1"}), \
                     contextlib.redirect_stderr(io.StringIO()) as err:
                 self.assertEqual(mtp_fetch.resolve_repo(),
                                  "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/")
-            self.assertIn("STRATA_ALLOW_UNPINNED=1", err.getvalue())
+            self.assertIn("XESTRATA_ALLOW_UNPINNED=1", err.getvalue())
         finally:
             mtp_fetch.REPO = pinned
 

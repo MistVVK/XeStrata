@@ -104,19 +104,19 @@ coder-iq1_m の 997 トークンのプリフィルは、B70 で 1421 ms から 1
 それもなければ DP4a の経路を選び、どちらになったかを一度だけ表示します。
 Arc A シリーズが `mma_gemm` を使うのは、その SYCL ランタイムが XMX のカーネルの使う Intel の拡張（joint_matrix の prefetch と境界つきの読み込み・書き込み）を受け付けないためです。
 A380 では DP4a より 17〜38% 速く、FP64 との相対誤差も小さくなります（0.53% に対して 0.0001%）。
-`STRATA_NO_XMX=1` を付けると、行列エンジンがあっても DP4a の経路を選びます。
-`STRATA_MMA=1` を付けると、`mma_gemm` が扱う形（Xe2 の 8 x 16 x 16 など）を GPU が報告していれば、XMX があってもそれを選びます（その経路を確かめるためのものです）。
-`STRATA_NO_BF16_MMA=1` は BF16 の、`STRATA_NO_INT8_MMA=1` は int8 の行列の組み合わせを、GPU の報告から除きます（`src/kernels/xe/matrix_report.cpp`）。
+`XESTRATA_NO_XMX=1` を付けると、行列エンジンがあっても DP4a の経路を選びます。
+`XESTRATA_MMA=1` を付けると、`mma_gemm` が扱う形（Xe2 の 8 x 16 x 16 など）を GPU が報告していれば、XMX があってもそれを選びます（その経路を確かめるためのものです）。
+`XESTRATA_NO_BF16_MMA=1` は BF16 の、`XESTRATA_NO_INT8_MMA=1` は int8 の行列の組み合わせを、GPU の報告から除きます（`src/kernels/xe/matrix_report.cpp`）。
 行列エンジンにその型がない GPU（NVIDIA の sm_80 より前は BF16、sm_72 より前は int8 がない）を、持っている GPU で模すためのものです。
-`STRATA_NO_BF16_MMA=1` のときは、contrib-llvm のモードでも BF16 の積を oneMath に任せず、FP16 の行列エンジンがあれば下の FP16 を経由する経路になります。
-`STRATA_NO_BLAS=1` は、contrib-llvm のモードでも密な行列積を自前のカーネルで計算します（比べるためのものです）。
+`XESTRATA_NO_BF16_MMA=1` のときは、contrib-llvm のモードでも BF16 の積を oneMath に任せず、FP16 の行列エンジンがあれば下の FP16 を経由する経路になります。
+`XESTRATA_NO_BLAS=1` は、contrib-llvm のモードでも密な行列積を自前のカーネルで計算します（比べるためのものです）。
 RTX 4070 で、それぞれの組み合わせでも CTest は変わらず、16 トークンの最上位はすべて一致しました。
 oneMath がある GPU の BF16 の積で失敗したとき（起動時に小さな積で試します）は、BF16 の積だけを自前のカーネルに任せます。
 行列エンジンが FP16 を扱い BF16 を扱わない GPU（NVIDIA の sm_80 より前、Volta と Turing）では、prefill の経路の BF16 の積を、両方を FP16 に変換して FP16 の積として計算します（`src/prefill/gemm.cpp`、upstream の f2fb7c1・ff6f9f1）。
 そのような GPU の BF16 の積を、cuBLAS は Tensor Core を使わずに計算し、自前のカーネルでは DP4a に落ちるためです。
 変換は FP16 の正規数の範囲では正確で、それを超える有限の値は ±65504 に飽和させます。累積する積と出力が 1 行の積は BF16 のままです。
-RTX 4070 で sm_70 のコードを動かし `STRATA_NO_BF16_MMA=1` で模すと、FP64 との相対誤差は 2e-6 以下で、DP4a の経路（0.7%）より 2.5〜3.2 倍速くなりました。
-`STRATA_BF16_TC=0` で止まります。
+RTX 4070 で sm_70 のコードを動かし `XESTRATA_NO_BF16_MMA=1` で模すと、FP64 との相対誤差は 2e-6 以下で、DP4a の経路（0.7%）より 2.5〜3.2 倍速くなりました。
+`XESTRATA_BF16_TC=0` で止まります。
 `tools/xmx_probe.cpp` は、エンジンをビルドせずに、FP16 と BF16 の行列エンジンを XMX のカーネルの形か `mma_gemm` の Intel の形（8 x 8 x 16）で報告するかを、すべての GPU に問い合わせます。
 
 prefill の経路のエキスパートの積は、GPU が int8 の 16 x 16 x 16（32 レーン）の組み合わせを報告すれば（NVIDIA の Tensor Core）、int8 の行列エンジンで計算します（`src/kernels/xe/iq_mmq.cpp`、llama.cpp の MMQ を `joint_matrix` で書き直したもの）。
@@ -129,23 +129,23 @@ KV は FP16・INT8・K8V4 で、Q4_0 は FP32 のカーネルのままです（u
 INT8 と Q4_0 の符号は FP16 で正確に表せるのでそのまま行列エンジンに渡し、尺度は FP32 で掛けます。
 RTX 4070 で sm_70 のコードを動かすと、`qsa_prompt_attn_parity` の FP64 との誤差は FP32 のカーネルの 3 倍以内で、2,048 クエリ・32K セルの塊が INT8 で 1.6 倍、FP16 と K8V4 で 1.5 倍速くなりました。
 Intel の GPU はこの形を報告しないので、これまでどおり XMX の FP16 の経路を使います。
-Qwen3.8 の prefill のエキスパートの積は、int8 と FP16 の経路の速い方を、チャンクの層ごとにエキスパートの平均の行数で選びます。境目は起動時に GPU ごとに、モデルの最初の層の形で両方を 16〜256 行で測って決め、ログに出します（B70 は 181 行、RTX 4070 はどの行数でも int8）。`STRATA_PREFILL_MMQ=0` で FP16 の経路、`1` で int8 に決めます。
+Qwen3.8 の prefill のエキスパートの積は、int8 と FP16 の経路の速い方を、チャンクの層ごとにエキスパートの平均の行数で選びます。境目は起動時に GPU ごとに、モデルの最初の層の形で両方を 16〜256 行で測って決め、ログに出します（B70 は 181 行、RTX 4070 はどの行数でも int8）。`XESTRATA_PREFILL_MMQ=0` で FP16 の経路、`1` で int8 に決めます。
 
 Pascal（sm_60・sm_61。P100、P40、GTX 10 系）にも、CUDA 12 のツールキットでコードを作ります。
 Tensor Core がないので、行列エンジンの経路は選ばれず、DP4a と FP32 の経路で動きます。
 sm_60 には dp4a の命令がないので、その積だけを 1 バイトずつの計算にしていて、和は同じ整数です（`src/kernels/xe/cuda_intrinsics.hpp`、upstream の e200e08f）。
 Tensor Core を使うカーネルは、sm_70 より前のコードでは空の本体になり、そのような GPU では起動されません。
 sm_60 だけのコードを作って RTX 4070 で動かすと（ドライバーが PTX をコンパイル）、CTest 59 件が通り、
-`STRATA_NO_XMX=1` で行列エンジンを外して IQ2_XS で答えさせると、sm_89 のコードと 8 問すべて同じ答えになりました（エキスパートのキャッシュの大きさを固定、decode の速さは 3〜5% 遅い）。
-compute capability 6.0 の GPU（GP100: P100）では、`STRATA_DOWN_WS=1` で、ルーティングされたエキスパートの IQ4_NL と Q2_0 の down の重みの行を、作業グループのローカルメモリに写してから積を取ります（upstream の 6a6d58ad0、opt-in。出力はビット単位で同じで、ほかの GPU では何もしません）。
+`XESTRATA_NO_XMX=1` で行列エンジンを外して IQ2_XS で答えさせると、sm_89 のコードと 8 問すべて同じ答えになりました（エキスパートのキャッシュの大きさを固定、decode の速さは 3〜5% 遅い）。
+compute capability 6.0 の GPU（GP100: P100）では、`XESTRATA_DOWN_WS=1` で、ルーティングされたエキスパートの IQ4_NL と Q2_0 の down の重みの行を、作業グループのローカルメモリに写してから積を取ります（upstream の 6a6d58ad0、opt-in。出力はビット単位で同じで、ほかの GPU では何もしません）。
 Maxwell 以前（compute capability 6.0 未満）では動きません。NVIDIA の GPU の SYCL のランタイムは 5.3 未満の GPU に FP16 を報告せず、エンジンは FP16 を報告しない GPU を使いません（`xestrata --setup` もそう知らせます）。
 
-Volta（sm_70）では、upstream が V100 で測った出力のカーネル 2 つを `STRATA_SM70_TABLE=1` で使います（upstream の c85b7c87 と同じく、確認が済むまで opt-in）。
+Volta（sm_70）では、upstream が V100 で測った出力のカーネル 2 つを `XESTRATA_SM70_TABLE=1` で使います（upstream の c85b7c87 と同じく、確認が済むまで opt-in）。
 ひとつはルーティングされたエキスパートの「モード 8」で、gate/up の積と SwiGLU・q8_1 への量子化を 1 回で行い、格子の表と活性を作業グループのローカルメモリに置きます（`src/kernels/xe/iq_kernels.cpp`、upstream の f6330507: V100 で 227 → 159 µs）。
 もうひとつはハイパーコネクションの読み出しの norm と up の積で、重みを先に読んで遅延を隠します（`src/kernels/xe/fused_gr.cpp`、upstream の aaa323fe: V100 で 1 回 50.9 → 46.7 µs）。
 どちらも出力は既定のカーネルとビット単位で同じです。
-読み出しの norm と up は、すべての GPU で既定です（Qwen3.8-Flash-Next の decode が RTX 4070 で 23.75 → 24.8 tok/s、B70 と RX 9060 XT は同等）。`STRATA_GR_FAST=0` で従来のカーネルです。
-モード 8 は、ローカルメモリに入るすべての GPU で既定です（B70 の decode が 1K・32K で +0.8〜1.1%、RTX 4070 は同等。upstream の f7eaf2de の STRATA_EXPDEC と同じ考え）。`STRATA_EXP_MODE=0` で従来のカーネルです。
+読み出しの norm と up は、すべての GPU で既定です（Qwen3.8-Flash-Next の decode が RTX 4070 で 23.75 → 24.8 tok/s、B70 と RX 9060 XT は同等）。`XESTRATA_GR_FAST=0` で従来のカーネルです。
+モード 8 は、ローカルメモリに入るすべての GPU で既定です（B70 の decode が 1K・32K で +0.8〜1.1%、RTX 4070 は同等。upstream の f7eaf2de の STRATA_EXPDEC と同じ考え）。`XESTRATA_EXP_MODE=0` で従来のカーネルです。
 sm_70 だけのコードを作って RTX 3070 で動かすと、既定でも両方を使っても CTest 71 件が通り、エキスパートと読み出しの出力は既定とビット単位で同じでした（RX 9060 XT でも同じ）。
 
 ### エンジンの部品とテスト
@@ -160,7 +160,7 @@ cmake -S . -B build/free \
   -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_NATIVE_EXPERTS=OFF \
   -DSTRATA_BUILD_TESTS=ON
-cmake --build build/free --target strata-device strata-load elementwise_parity \
+cmake --build build/free --target xestrata-device xestrata-load elementwise_parity \
   gguf_reader_test suffix_drafter_test controller_test draft_policy_test conv_cache_test \
   platform_memory_test ple_reader_test -j4
 ```
@@ -178,7 +178,7 @@ cmake --build build/free --target strata-device strata-load elementwise_parity \
 
 ### エンジン本体
 
-エンジン本体（実行ファイル `strata`）は、ネイティブの i-quant のエキスパートに llama.cpp を使います。
+エンジン本体（実行ファイル `xestrata-engine`）は、ネイティブの i-quant のエキスパートに llama.cpp を使います。
 llama.cpp は固定したコミット（`3cf03257f219afbe7334045ff7c6a06ac68c627d`）のものを `third_party/main/llama.cpp` に置きます。
 setup.py が取ってきます。画像のエンコーダーは、その `tools/mtmd` も使います。
 
@@ -197,7 +197,7 @@ cmake -S . -B build/contrib-llvm -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_C
   -DSTRATA_LICENSE=contrib \
   -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
 cmake --build build/contrib-llvm --target strata -j6
-LD_LIBRARY_PATH=$C/lib build/contrib-llvm/strata-device
+LD_LIBRARY_PATH=$C/lib build/contrib-llvm/xestrata-device
 ```
 
 別の機械向けには、`STRATA_CUDA_ARCHS` に GPU のアーキテクチャを並べます（RTX 40 は `sm_89`、RTX 30 は `sm_86`）。
@@ -419,7 +419,7 @@ Windows 版の 7z も、同じ `tools/package/build.sh` で、Ubuntu 26.04 の�
 tools/package/build.sh windows cuda12.4      # XeStrata-<版>-windows-x64.7z
 ```
 
-- すべて Linux の上で Windows 向けにクロスビルドします。intel/llvm（Linux 版の contrib と、Windows 版の SYCL のランタイム）、エンジン（contrib-llvm のモード、NVIDIA のコードは cuda12.4 の deb と同じ）、CPU の画像のエンコーダー（`strata-vision-cpu.exe`。GPU の Vulkan のものは入れず、画像は CPU で読みます）、.NET の入口（`dotnet-sdk-10.0`）、Python の embeddable 版と wheel を作り、`tools/package/windows_bundle.py` がフォルダーと 7z にします。
+- すべて Linux の上で Windows 向けにクロスビルドします。intel/llvm（Linux 版の contrib と、Windows 版の SYCL のランタイム）、エンジン（contrib-llvm のモード、NVIDIA のコードは cuda12.4 の deb と同じ）、CPU の画像のエンコーダー（`xestrata-vision-cpu.exe`。GPU の Vulkan のものは入れず、画像は CPU で読みます）、.NET の入口（`dotnet-sdk-10.0`）、Python の embeddable 版と wheel を作り、`tools/package/windows_bundle.py` がフォルダーと 7z にします。
 - MSVC の CRT と Windows SDK は xwin で Microsoft から取り、ライセンスに同意します（自由ソフトウェアではなく、7z には入れません）。CUDA の Windows 版のヘッダーとインポートライブラリも 7z には入れません。
 - Ubuntu 26.04 のパッケージと同じ ccache（`build/pkg-ccache/ubuntu26.04/`）を使い、xwin と NuGet の取得物は `build/pkg-cache/windows/` に残します。
 - 7z の中の exe・DLL・Python のパッケージは、どれも `windows_bundle.py` の部品の一覧にあるものでなければならず、Visual C++ のランタイムや NVIDIA のライブラリが入っていると止まります。
@@ -435,7 +435,7 @@ xe0.1.43.1-1 は `0.1.43.1-1`（rpm は Version が 0.1.43.1、Release が 1）�
 | 中身 | 置き場所 |
 | --- | --- |
 | `xestrata` のコマンド（setup.py）、サーバー、Web アプリ、setup が使う道具、llama.cpp の gguf-py、データ、systemd の user unit | `/usr/share/xestrata`、`/usr/bin/xestrata`、`/usr/lib/systemd/user/xestrata.service` |
-| エンジン（`strata`）、画像のエンコーダー、intel/llvm の SYCL の実行時（`libsycl.so.9`、UR のローダーと Level Zero と HIP（AMD）のアダプター、cuda の版では CUDA のアダプターも、`libumf`）、oneMath（rocBLAS の後端、cuda の版では oneMKL と cuBLAS の後端も） | `<libdir>/xestrata/engine` |
+| エンジン（`xestrata-engine`）、画像のエンコーダー、intel/llvm の SYCL の実行時（`libsycl.so.9`、UR のローダーと Level Zero と HIP（AMD）のアダプター、cuda の版では CUDA のアダプターも、`libumf`）、oneMath（rocBLAS の後端、cuda の版では oneMKL と cuBLAS の後端も） | `<libdir>/xestrata/engine` |
 
 - パッケージは `xestrata-engine` を提供し、互いに衝突します。一度に 1 つだけ入り、別のものを入れると入れ替わります。
 - libsycl 9 は Ubuntu 26.04（`dpclang` 6 まで）にも Fedora 44 にもないので、パッケージに同梱します。

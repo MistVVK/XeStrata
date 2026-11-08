@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """tools/image/qimage.py - Qwen-Image-2.1-Turbo, Qwen-Image-2.1, Mage-Flow, HunyuanImage 3.0 and MOSS-Image for
 XeStrata's image endpoint: the models' files at pinned Hugging Face revisions, and the run config's "images" section
-for XeStrata's own image engine (strata-image, built with the text engine).
+for XeStrata's own image engine (xestrata-image, built with the text engine).
 
 setup.py (--images, IMAGE_MODELS) and tools/image/install.py use these pieces; serve/images.py runs the result.
 The two share the VAE, the text encoders and the vision encoder; only the DiT differs, the base model's (Turbo's
@@ -588,7 +588,7 @@ AUX = {
     "moss-control": {"file": "moss-control", "convert": None, "out": "moss-color-depth-control.safetensors",
                      "license": _MOSS_CONTROL_LICENSE},
 }
-# the control images (strata-image's CONTROL kinds) and the AUX weights each needs, in the order the engine's W:, W2:
+# the control images (xestrata-image's CONTROL kinds) and the AUX weights each needs, in the order the engine's W:, W2:
 CNET_KINDS = {"canny": (), "gray": (), "scribble": (), "scribble_xdog": (), "scribble_hed": ("cnet-hed",),
               "hed": ("cnet-hed",), "lineart": ("cnet-lineart",), "lineart_coarse": ("cnet-lineart-coarse",),
               "mlsd": ("cnet-mlsd",), "depth": ("cnet-depth",), "pose": ("cnet-yolox", "cnet-dwpose")}
@@ -607,7 +607,7 @@ ANIMA_29_MAP = tuple(b for b in range(40) if b not in ANIMA_29_INSERTED)
 MF_Q8_SHARE = 34 / 64      # Mage-Flow's DiT in RAM: its bf16 blocks quantized to Q8_0 (34 bytes a 32 values)
 # every model's files in one folder (named after the first one): they share all but the DiT
 MODEL_DIR = "qwen-image-2.1-turbo"
-IMAGE_EXE = "strata-image.exe" if os.name == "nt" else "strata-image"
+IMAGE_EXE = "xestrata-image.exe" if os.name == "nt" else "xestrata-image"
 DEFAULT_QUANT = "Q8_0"
 DEFAULT_TEXT_QUANT = "Q8_0"
 HOST_GB = 2.0          # the image engine's own RAM besides its files (its process, the pinned relay, the prompt states)

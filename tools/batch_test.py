@@ -102,7 +102,7 @@ def main():
     ap.add_argument("--long-tokens", type=int, default=0,
                     help="the LAST prompt is read from about this many tokens of filler text first: its chunks run "
                          "beside the earlier slots' windows (the prompt path lends experts then)")
-    ap.add_argument("--mt-min", default="", help="STRATA_IQ_MT_MIN for the engine (empty: the default, which is exact)")
+    ap.add_argument("--mt-min", default="", help="XESTRATA_IQ_MT_MIN for the engine (empty: the default, exact)")
     a = ap.parse_args()
     cfg = json.loads(Path(a.config).read_text())
     tok = tokenizer(cfg["tokenizer"])
@@ -116,9 +116,9 @@ def main():
             filler = "".join(para % i for i in range(a.long_tokens // per + 1))
             text = f"<|im_start|>user\n{filler}\n\n{q}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
         prompts.append(tok.encode(text, parse_special=True))
-    env = {"STRATA_DECODE_TIMING": "1", **({"STRATA_VERIFY_PROFILE": "1"} if os.environ.get("PROF") else {})}
+    env = {"XESTRATA_DECODE_TIMING": "1", **({"XESTRATA_VERIFY_PROFILE": "1"} if os.environ.get("PROF") else {})}
     if a.mt_min:
-        env["STRATA_IQ_MT_MIN"] = a.mt_min
+        env["XESTRATA_IQ_MT_MIN"] = a.mt_min
     eng = Engine(a.exe, cfg, a.batch, env, a.extra.split())
     out = eng.lines()
 

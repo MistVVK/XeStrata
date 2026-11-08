@@ -92,7 +92,7 @@
   "about.kept": "聊天、设置和密钥只保存在这个浏览器中。",
   "about.github": "GitHub 上的 XeStrata",
   "about.cfgTitle": "模型设置",
-  "about.cfgNote": "保存在模型的运行配置中，对所有客户端生效。空字段为默认值。下次启动模型时生效（关闭 Strata 的窗口后重新启动）。",
+  "about.cfgNote": "保存在模型的运行配置中，对所有客户端生效。空字段为默认值。下次启动模型时生效（关闭 XeStrata 的窗口后重新启动）。",
   "branch.back": "回到原聊天",
   "branch.from": "分支自“{title}”",
   "branch.open": "打开原聊天",

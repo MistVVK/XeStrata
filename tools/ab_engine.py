@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """A/B two engine builds or environments on one config: restart the server per arm, alternate arms over rounds.
 
-    python tools/ab_engine.py strata-q2_0.json A:exe=/path/a B:exe=/path/b,STRATA_EXP_MODE=0 [--rounds 3]
+    python tools/ab_engine.py strata-q2_0.json A:exe=/path/a B:exe=/path/b,XESTRATA_EXP_MODE=0 [--rounds 3]
 
 An arm is NAME:key=value,...; `exe` replaces the config's engine, `xargs` appends ';'-separated engine arguments, every
 other key is set in the engine's environment.  Each round starts the server once per arm (the arms' order alternates),
@@ -101,7 +101,7 @@ def main() -> int:
             cpath = Path(tempfile.gettempdir()) / f"ab_{name}.json"
             cpath.write_text(json.dumps(cfg, indent=1))
             penv = dict(os.environ, **e)
-            proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata",
+            proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "xestrata",
                                      "--config", str(cpath), "--port", str(a.port)], cwd=str(ROOT), env=penv,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             try:

@@ -18,6 +18,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/platform/env.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -66,7 +67,7 @@ inline constexpr int64_t kAutoChunks[] = {32768, 16384, 8192, 6144, 4096, 3072, 
 template <class Take>
 int64_t auto_chunk(int64_t max_context, Take&& take) {
     static const int64_t auto_max = [] {
-        const char* v = std::getenv("STRATA_PREFILL_AUTO_MAX");
+        const char* v = strata::env_get("PREFILL_AUTO_MAX");
         return v ? (int64_t) std::strtoll(v, nullptr, 10) : (int64_t) 32768;
     }();
     for (const int64_t c : kAutoChunks) {
@@ -78,7 +79,7 @@ int64_t auto_chunk(int64_t max_context, Take&& take) {
 /// The percent of the expert tier's slots a prompt chunk's buffers may borrow (a lent slot's expert is streamed during
 /// the prompt and refilled after it): STRATA_PREFILL_LEND_PCT, else `fallback` (the engine's own, measured).
 inline int64_t lend_pct(int64_t fallback) {
-    const char* v = std::getenv("STRATA_PREFILL_LEND_PCT");
+    const char* v = strata::env_get("PREFILL_LEND_PCT");
     return v ? (int64_t) std::strtol(v, nullptr, 10) : fallback;
 }
 

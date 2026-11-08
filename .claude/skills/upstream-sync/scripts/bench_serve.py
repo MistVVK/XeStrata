@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """The serve table of an upstream merge on one GPU: XeStrata and upstream's release run as the server runs them
-(`strata --serve`, the options setup writes), one chat of four turns per run: the tier's prompt, then the three
+(`xestrata-engine --serve`, the options setup writes), one chat of four turns per run: the tier's prompt, then the three
 follow-ups of sync_prompts.py, each with the answer before it, 256 tokens a turn.  bench_generate.py measures the
 generate path; this one the serve loop users meet (the conversation checkpoints, the per-request sampling, its own
 decode loop).  The engines are driven over stdin (GEN, DONE), not through serve/server.py.  The runs are

@@ -13,6 +13,7 @@
 #include "strata/kernels/swiglu_clamp.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/cpu/tq_cpu.hpp"
+#include "strata/platform/env.hpp"
 
 #include "ggml.h"
 #include "ggml-cpu.h"
@@ -147,7 +148,7 @@ namespace {
 // iq_avx2.cpp is compiled for AVX2 (an AVX-only CPU, or STRATA_FORCE_ISA=avx, keeps ggml's).  STRATA_NO_Q8K_AVX2=1:
 // ggml's on any CPU.
 bool q8k_avx2(int type) {
-    static const bool on = cpu_avx2_ok() && std::getenv("STRATA_NO_Q8K_AVX2") == nullptr;
+    static const bool on = cpu_avx2_ok() && strata::env_get("NO_Q8K_AVX2") == nullptr;
     return on && type == (int) GGML_TYPE_Q8_K;
 }
 }  // namespace
@@ -189,7 +190,7 @@ void native_quant_h(const NativeFmt& f, const float* h, void* dst) {
 
 namespace {
 const char* mt_min_env() {
-    static const char* env = std::getenv("STRATA_IQ_MT_MIN");
+    static const char* env = strata::env_get("IQ_MT_MIN");
     return env;
 }
 }  // namespace
@@ -216,7 +217,7 @@ namespace {
 // Ornith's shape against ggml-cpu's 0.170 / 0.235 / 0.309, and llm-jp's down 0.275 / 0.334 / 0.383 against 0.171 /
 // 0.240 / 0.317; the K-quants were 1.3 to 1.6 times ggml-cpu's there.
 bool kq_on(int type) {
-    static const bool on = cpu_avx2_ok() && std::getenv("STRATA_NO_KQ256") == nullptr;
+    static const bool on = cpu_avx2_ok() && strata::env_get("NO_KQ256") == nullptr;
     static const bool q80 = on && cpu_avxvnni_ok();
     return type == (int) GGML_TYPE_Q8_0 ? q80 : on && kq256_supported(type);
 }
@@ -285,13 +286,13 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     // first, then the AVX-2 one (Zen 2/3, Intel 12th-14th gen).  STRATA_NO_IQ512 drops an AVX-512 CPU to the
     // AVX-2 kernel, STRATA_NO_IQ256 drops the AVX-2 kernel; ggml-cpu's single-token vec_dot is reached only with
     // both set (and on a CPU without AVX-512, STRATA_NO_IQ512 changes nothing).
-    static const bool avx512 = cpu_avx512_ok() && std::getenv("STRATA_NO_IQ512") == nullptr;
-    static const bool avx2 = std::getenv("STRATA_NO_IQ256") == nullptr;
+    static const bool avx512 = cpu_avx512_ok() && strata::env_get("NO_IQ512") == nullptr;
+    static const bool avx2 = strata::env_get("NO_IQ256") == nullptr;
     const int mt_min = native_gu_mt_min(f.gu_type);   // #152
     // Unsloth UD-Q4_K_XL's Q4_K gate/up: the multi-token kernel is bit-exact against ggml's per-token dot (any group
     // size, no #152 rule).  Opt-in, STRATA_KQ256=1: measured no faster in the engine (a window's expert groups hold
     // ~1.4 tokens and the weights stay in L1 across ggml's per-token calls; 1.01-1.13x in native_expert_parity).
-    static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return cpu_avx2_ok() && v != nullptr && std::strtol(v, nullptr, 10) != 0; }();
+    static const bool kq = [] { const char* v = strata::env_get("KQ256"); return cpu_avx2_ok() && v != nullptr && std::strtol(v, nullptr, 10) != 0; }();
     if (kq && f.gu_type == 12 && nt >= 2) {   // one token: ggml's own dot below (the same bits, less overhead)
         kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
@@ -342,9 +343,9 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     // IQ4_NL down rows: the AVX-2 multi-token kernel decodes the nibbles and absolutises the weights once per
     // block instead of once per token; ggml-cpu's dot is single-token.  STRATA_NO_IQ4NL falls back to it.  From one
     // token on as the gate/up rows (#152): 0.062 / 0.065 ms a row set against ggml-cpu (i7-14700, one thread).
-    static const bool iq4nl_mt = std::getenv("STRATA_NO_IQ4NL") == nullptr;
+    static const bool iq4nl_mt = strata::env_get("NO_IQ4NL") == nullptr;
     const int mt_min = native_gu_mt_min(f.gu_type);
-    static const bool kq = [] { const char* v = std::getenv("STRATA_KQ256"); return v != nullptr && std::strtol(v, nullptr, 10) != 0; }();
+    static const bool kq = [] { const char* v = strata::env_get("KQ256"); return v != nullptr && std::strtol(v, nullptr, 10) != 0; }();
     if (tq_rows_own(f.d_type)) {   // the trellis types, as in native_gu_rows
         tq_rows(tq_isa(), f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
@@ -360,7 +361,7 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     // the i-quant down rows (GLM-5.3-Flash's IQ3_S, IQ3_XXS, IQ2_XXS) by the gate/up rows' AVX-2 kernel on its Q8_K
     // rows, on AVX-2 CPUs only, as the gate/up rows' formats with no AVX-512 kernel (an AVX-512 CPU keeps ggml-cpu for
     // them).  i7-14700, one thread, 4096 x 2048: IQ3_S 0.770 -> 0.423 ms an expert at one token, 3.05 -> 0.66 at four
-    static const bool avx2 = std::getenv("STRATA_NO_IQ256") == nullptr;
+    static const bool avx2 = strata::env_get("NO_IQ256") == nullptr;
     static const bool cpu512 = cpu_avx512_ok();
     if (nt >= mt_min && avx2 && !cpu512 && iq256_supported(f.d_type)) {
         iq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);

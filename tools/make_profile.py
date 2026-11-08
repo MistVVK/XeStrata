@@ -42,7 +42,7 @@ MAGIC, VERSION = b"STRP", 1
 def read_profile(path, n_expert=N_EXPERT):
     blob = Path(path).read_bytes()
     if blob[:4] != MAGIC:
-        raise SystemExit(f"{path}: not a Strata profile")
+        raise SystemExit(f"{path}: not an XeStrata profile")
     ver, nl, ne, slots, n = struct.unpack_from("<5I", blob, 4)
     if (nl, ne) != (N_LAYER, n_expert):
         raise SystemExit(f"{path}: {nl}x{ne}, not {N_LAYER}x{n_expert}")

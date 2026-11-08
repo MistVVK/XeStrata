@@ -333,9 +333,9 @@ int bench(int64_t T, int64_t n_text) {
 int main(int argc, char** argv) {
     // the 16-bit path as qi_attention takes it without the int8 kernel (which this program calls by itself)
 #if defined(_WIN32)
-    _putenv_s("STRATA_IMAGE_ATTN_I8", "0");
+    _putenv_s("XESTRATA_IMAGE_ATTN_I8", "0");
 #else
-    setenv("STRATA_IMAGE_ATTN_I8", "0", 1);
+    setenv("XESTRATA_IMAGE_ATTN_I8", "0", 1);
 #endif
     if (argc >= 3 && std::strcmp(argv[1], "--bench") == 0)
         return bench(std::strtoll(argv[2], nullptr, 10), argc >= 4 ? std::strtoll(argv[3], nullptr, 10) : 0);

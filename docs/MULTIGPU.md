@@ -9,7 +9,7 @@ The first GPU runs the early layers, the next GPU the layers after them.
 Each GPU holds its own layers' dense weights (the PLE tensors on every GPU), their sessions (the GDN recurrent state, the QSA K/V) and an expert cache of its own.
 The extra VRAM keeps more experts on GPUs, so fewer are computed on the CPU.
 So the split pays most on a PC where one GPU's window waits on the CPU's experts (a CPU that reads RAM slowly).
-How long it waits is in the `strata decode timing:` line the log gets for each request with `STRATA_DECODE_TIMING=1` in the engine's environment (the GPU's wait per window, `GPU-reach wait`, and the CPU's experts per layer and window, `CPU experts`).
+How long it waits is in the `xestrata decode timing:` line the log gets for each request with `XESTRATA_DECODE_TIMING=1` in the engine's environment (the GPU's wait per window, `GPU-reach wait`, and the CPU's experts per layer and window, `CPU experts`).
 GPUs of different makers can be combined (Intel, AMD and NVIDIA; with NVIDIA, in the contrib-llvm build).
 
 The GPUs hand off once per verify window, through the CPU's memory (12,804 floats a token).
@@ -51,12 +51,12 @@ Those that do not fit are read from the files on every prefill.
 Conversation parking (`--conversation-cache-mib`, `--conversation-save`) copies every GPU's session out and back.
 A saved file is read only by an engine with the same split points; `--layer-split auto` can choose others from what it measures, and then the earlier files are not read.
 
-A prefill chunk's rows go on to the next GPU in eight pieces (upstream 1d9758f8, opt-in there): the next GPU starts copying a piece in once it is in RAM, so the two GPUs' PCIe copies overlap, and it reads its chunks on one thread started once. `STRATA_HANDOFF_PIPE=P` (2 to 16) sets the pieces; `STRATA_HANDOFF_PIPE=0` goes back to one copy.
+A prefill chunk's rows go on to the next GPU in eight pieces (upstream 1d9758f8, opt-in there): the next GPU starts copying a piece in once it is in RAM, so the two GPUs' PCIe copies overlap, and it reads its chunks on one thread started once. `XESTRATA_HANDOFF_PIPE=P` (2 to 16) sets the pieces; `XESTRATA_HANDOFF_PIPE=0` goes back to one copy.
 
 ## GPU numbers
 
 The engine numbers the GPUs it can drive from 0.
-0 is the GPU setup chose with `STRATA_GPU_PCI` (`--gpu <PCI address>` does the same when you run the engine yourself; upstream #852).
+0 is the GPU setup chose with `XESTRATA_GPU_PCI` (`--gpu <PCI address>` does the same when you run the engine yourself; upstream #852).
 The rest follow in this order: GPUs that are not the processor's own graphics, then the most memory, then the most compute units.
 The processor's own graphics is used only when `--split-device` (setup: `--gpus`) names it.
 
@@ -80,8 +80,8 @@ The log shows the choice (`layer split auto: K=...`); from there on it runs as i
 - When the choice gives a GPU only one or two layers, it chooses again among the placements that give every GPU three or more (upstream 1c6c82ef).
   A GPU with few layers has a small cache, and the prefill chunk shrinks to it.
   On two GPUs it first chooses among the placements that give each GPU at least its share of the layers by its room for experts (upstream 3b848837, #2644): the estimate leans the layers to the faster card, and the three-layer rule landed on its own edge (the slower card with three layers) and left that card idle (upstream: an RTX 4060 Ti 16 GB with an RTX 3060 12 GB read a prompt at 452 tok/s instead of 802). The log says which rule chose the split.
-  `STRATA_SPLIT_SPEED_SCALE=1,0.55` multiplies each stage's read speed by the factor (a test seam for an unequal pair on two equal cards, upstream 4a1ef86b).
-- `STRATA_SPLIT_UNIFORM=1` (opt-in, upstream b8844516) prices every link's misses the same (the uniform cost before upstream 0.1.41), for links where any scaling moves auto off the balanced placement (upstream: 2x RTX 3090 on x16 + x4, decode -4..-8%).
+  `XESTRATA_SPLIT_SPEED_SCALE=1,0.55` multiplies each stage's read speed by the factor (a test seam for an unequal pair on two equal cards, upstream 4a1ef86b).
+- `XESTRATA_SPLIT_UNIFORM=1` (opt-in, upstream b8844516) prices every link's misses the same (the uniform cost before upstream 0.1.41), for links where any scaling moves auto off the balanced placement (upstream: 2x RTX 3090 on x16 + x4, decode -4..-8%).
 - On GPUs of different speed or link, when another placement whose split points lie three or more layers away is predicted within 4%, the log names it (`NEAR TIE`, upstream 8bb250d8).
   The prediction prices decode, not prefill, so it is worth a try; the choice stays.
 - Which of the later GPUs runs which stage is chosen from the same prediction (what upstream's "the faster card last", be8db787 and others, does).
@@ -91,7 +91,7 @@ The log shows the choice (`layer split auto: K=...`); from there on it runs as i
 - A hand-off between stages is priced from each GPU's link speed and the time of a small copy.
 - The misses left to the CPU are priced without those the route tail skip (default rank 7, [DETAILS](DETAILS.md)) neither reads nor computes.
 - With `--pipeline-windows 2` a window is priced at its slowest stage, not the stages' sum: the first GPU runs the next window while the later ones verify this one, so a balanced split is the faster one.
-- Last, the first GPU alone is priced too: unless the second GPU's role (split or helper) is predicted 5% shorter, the first GPU runs alone (`STRATA_SPLIT_GAIN_PCT`). On a B70 + RTX 4070 the first GPU alone decoded IQ3_XXS fastest (32K: 104 tok/s, the helper 96, the split 79; predicted 12.0, 12.1 and 12.3 ms), and the helper won with IQ3_S and with both GPUs at 12 GiB (predicted 9% shorter or more).
+- Last, the first GPU alone is priced too: unless the second GPU's role (split or helper) is predicted 5% shorter, the first GPU runs alone (`XESTRATA_SPLIT_GAIN_PCT`). On a B70 + RTX 4070 the first GPU alone decoded IQ3_XXS fastest (32K: 104 tok/s, the helper 96, the split 79; predicted 12.0, 12.1 and 12.3 ms), and the helper won with IQ3_S and with both GPUs at 12 GiB (predicted 9% shorter or more).
 - `--split-roles helper` (the server's, when it makes images on the second GPU) gives the second GPU a helper cache's role or none: a helper can be closed and opened again between requests (`HELPER off` / `HELPER on`; [IMAGE](IMAGE.md)).
 - `--split-skip-if-fits` (`"split_skip_if_fits": true` in the config; opt-in, upstream 18ad40c0d) runs on the first GPU alone when its cache holds every profiled pair beside the session, the drafter and the reserve: a split would only add hand-offs.
 - With two GPUs, the second is also priced, with the same model, as a helper cache (as `--expert-cache-device1`) instead of a stage, and the helper is taken only when its time is more than 5% shorter.
@@ -105,14 +105,14 @@ Environment variables change the model's assumptions:
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `STRATA_SPLIT_ROWS` | 3 | tokens computed per window (the average, with the MTP drafts) |
-| `STRATA_SPLIT_MASS_EXP` | 0.8 | a, where the expert of rank r by use takes a share (r+1)^-a of the routing |
-| `STRATA_SPLIT_CPU_GBPS` | measured | how fast the CPU reads the RAM (GB/s) |
-| `STRATA_SPLIT_NEAR_TIE_PCT` | 4 | the difference (%) within which another placement is named; 0 names none |
-| `STRATA_SPLIT_HELPER_GAIN_PCT` | 5 | how much shorter (%) the helper cache's predicted time must be to be taken; 0 takes it when shorter at all |
-| `STRATA_SPLIT_ROLE` | predicted | the second GPU's role with two GPUs: `split` a stage, `helper` the helper cache |
-| `STRATA_SPLIT_GAIN_PCT` | 5 | how much shorter (%) the second GPU's role must be predicted than the first GPU alone; also the helper against the split (unless `STRATA_SPLIT_HELPER_GAIN_PCT` is set) |
-| `STRATA_REMOTE_SPIN` | 1 | the host polls for the helper cache's results each layer (as upstream's CUDA helper spins); 0 waits in the driver |
+| `XESTRATA_SPLIT_ROWS` | 3 | tokens computed per window (the average, with the MTP drafts) |
+| `XESTRATA_SPLIT_MASS_EXP` | 0.8 | a, where the expert of rank r by use takes a share (r+1)^-a of the routing |
+| `XESTRATA_SPLIT_CPU_GBPS` | measured | how fast the CPU reads the RAM (GB/s) |
+| `XESTRATA_SPLIT_NEAR_TIE_PCT` | 4 | the difference (%) within which another placement is named; 0 names none |
+| `XESTRATA_SPLIT_HELPER_GAIN_PCT` | 5 | how much shorter (%) the helper cache's predicted time must be to be taken; 0 takes it when shorter at all |
+| `XESTRATA_SPLIT_ROLE` | predicted | the second GPU's role with two GPUs: `split` a stage, `helper` the helper cache |
+| `XESTRATA_SPLIT_GAIN_PCT` | 5 | how much shorter (%) the second GPU's role must be predicted than the first GPU alone; also the helper against the split (unless `XESTRATA_SPLIT_HELPER_GAIN_PCT` is set) |
+| `XESTRATA_REMOTE_SPIN` | 1 | the host polls for the helper cache's results each layer (as upstream's CUDA helper spins); 0 waits in the driver |
 
 `--vram-reserve-later-mib N` is the VRAM left free on the second and later GPUs (default: `--vram-reserve-mib`'s value; upstream 5c4105c0).
 The GPU that drives the monitors needs more headroom than one that drives none.
@@ -130,18 +130,18 @@ The fewer slots a group has, the fewer tokens share one read of the weights, so 
 On a layer split without `--batch-groups` the default is `auto` (upstream ca001df5; `--batch-groups 1` for one group).
 The default groups do not give way to `--batch-mtp` (on by default with `--mtp`): it is turned off then, and the log says so (upstream a0116b27).
 Grouped windows do not verify the MTP proposals, but four concurrent requests on 2x RTX A4000 ran 25-30% faster in groups than in the one group that verifies them.
-`--batch-groups 1` or `STRATA_BATCH_MTP_SERIAL=1` keeps `--batch-mtp` in one group, as before (with few concurrent requests, or prompts that come rarely, it can be the faster choice).
-`STRATA_PIPED_MTP=N` (opt-in) keeps the groups and has each slot verify its MTP proposals in them ([BATCHING](BATCHING.md#mtp-drafts-in-the-pipelined-groups-strata_piped_mtp-opt-in)).
+`--batch-groups 1` or `XESTRATA_BATCH_MTP_SERIAL=1` keeps `--batch-mtp` in one group, as before (with few concurrent requests, or prompts that come rarely, it can be the faster choice).
+`XESTRATA_PIPED_MTP=N` (opt-in) keeps the groups and has each slot verify its MTP proposals in them ([BATCHING](BATCHING.md#mtp-drafts-in-the-pipelined-groups-xestrata_piped_mtp-opt-in)).
 The engine logs the groups it chose and reports them as `INFO batch_groups`, and the server assigns the slots by them.
 A free slot before a busy one in its group is used first (upstream 2c7c02ab).
 
 `--batch-mtp` works on a layer split too (upstream 48f2c47d).
 The slots' drafters sit on the last GPU, and each slot's two rows pass every GPU.
-It is off when the slots run in groups (the default `auto` included; not with `STRATA_PIPED_MTP`), with two stages on one GPU, and with helper caches (`--expert-cache-device1..3`).
-On a layer split too, the draft layer's prefill K/V are built in batches through the last GPU's prefill path, as one GPU does (upstream a22a0e8c, opt-in there as `STRATA_SPLIT_MTP_BATCH=1`; the default here).
+It is off when the slots run in groups (the default `auto` included; not with `XESTRATA_PIPED_MTP`), with two stages on one GPU, and with helper caches (`--expert-cache-device1..3`).
+On a layer split too, the draft layer's prefill K/V are built in batches through the last GPU's prefill path, as one GPU does (upstream a22a0e8c, opt-in there as `XESTRATA_SPLIT_MTP_BATCH=1`; the default here).
 On a B70 + RTX 4070 (IQ2_XS, K=45, a 32K prompt) prefill went from 2,350 to 2,424 tok/s.
 
-> **Note: with every expert in VRAM, consider turning it off with `STRATA_SPLIT_MTP_BATCH=0`.**
+> **Note: with every expert in VRAM, consider turning it off with `XESTRATA_SPLIT_MTP_BATCH=0`.**
 > Upstream measured it 21.9% slower on two R9700s that held every expert.
 > It pays only when the experts do not fit the VRAM.
 > The drafter's K/V are built another way, so the drafts can differ a little (the tokens out do not: the verify window decides them).
@@ -187,7 +187,7 @@ In the config (`xestrata-<model>.json`) the cards are PCI addresses, as in `"gpu
 ```
 
 `serve/server.py --split-serve 0000:03:00.0,0000:09:00.0` (the prefill card first) does the same.
-The two cards take the place of the config's `"gpu_pci"` and `"split_pci"`, and each engine gets its card through `STRATA_GPU_PCI`.
+The two cards take the place of the config's `"gpu_pci"` and `"split_pci"`, and each engine gets its card through `XESTRATA_GPU_PCI`.
 It cannot be used with `"replicas"`, `--layer-split`, `--split-device`, `--batch`/`--slots`/`"parallel"` or `--prompt-cache 0`, and it needs `--mtp` (the server stops at start and says why).
 
 | Key | Default | Meaning |
@@ -230,7 +230,7 @@ Limits:
 - RAM for one copy of the experts (the shared arena, Linux) or two, and the session file during a hand-over.
 - `"conversation_save"` is the decode engine's alone.
 
-`tools/split_serve_check.py` compares the answer of one engine with the split's, by tokens and by the state fingerprint (`STRATA_STATE_HASH`) (`exact`), and measures the layer split, one card and the split (`bench`).
+`tools/split_serve_check.py` compares the answer of one engine with the split's, by tokens and by the state fingerprint (`XESTRATA_STATE_HASH`) (`exact`), and measures the layer split, one card and the split (`bench`).
 
 ## One conversation with both cards busy (`--pipeline-windows`)
 
@@ -247,13 +247,13 @@ Only the last stage waits for the verdict.
 
 It works with a split of two or more stages, each on its own GPU, and `--serve`.
 When it is not given, it is `2` on a split of exactly two Xe2 (Battlemage) GPUs with `--serve` and the draft layer, and no `--batch` or helper caches (upstream a6fd78856: on two Arc Pro B65 upstream measured decode 17-28% faster than the serial windows, and a one-hour serve with no token differences).
-`--pipeline-windows 0` or `STRATA_PIPELINE_AUTO=0` turns it off; every other setup stays serial.
+`--pipeline-windows 0` or `XESTRATA_PIPELINE_AUTO=0` turns it off; every other setup stays serial.
 With three or more stages `--pipeline-windows 2` turns `--adapt-async` off, and the adaptive tier runs at a verdict.
 
 - **Cost**: a second verify window on each GPU, 160 MiB more kept out of each GPU's expert cache, and with `2` two copies of the recurrent state on every GPU before the last stage (about 3 MiB per GDN layer of that GPU).
 - **The text**: the last GPU only runs windows that are verified, and picks the tokens by the serial loop's rules.
   The windows are cut differently from the serial loop's, though, and a verify window's rounding can depend on how many rows it holds, so even greedy output can flip a near-tie.
-  The serial loop's output changes the same way with another `--spec` or `--spec-min-p` (B70 + RTX 4070, IQ2_XS, `STRATA_IQ_MT_MIN=1 --pcie-frac 0 --adapt-every 0`, the expert caches matched: 2 of 3 answers; the same on the B70 alone).
+  The serial loop's output changes the same way with another `--spec` or `--spec-min-p` (B70 + RTX 4070, IQ2_XS, `XESTRATA_IQ_MT_MIN=1 --pcie-frac 0 --adapt-every 0`, the expert caches matched: 2 of 3 answers; the same on the B70 alone).
   The pipeline keeps its VRAM out of the caches, so against a run without the flag a few experts move from a GPU to the CPU, which rounds them differently, and a near-tie can flip.
 - **Off, with one line in the log saying why**, with `--batch` slots, the helper caches (`--expert-cache-device1..3`), a split onto one GPU (`--split-device 0`), `--pipeline-windows 1` on three or more stages, or no draft layer.
   A request with repetition penalties (`penalty_last_n`), coupled draft sampling or log-probabilities (`logprobs`), and `--lookup-chain`, decode serially.
@@ -261,7 +261,7 @@ With three or more stages `--pipeline-windows 2` turns `--adapt-async` off, and 
   So prefill queues a window's commit after the window has completed (upstream queues the window, its commit and the next window back to back).
   The adaptive tier runs at a verdict with no window in flight on either card (upstream runs it on a thread beside the windows).
   With `--adapt-async 1` the decode loop queues each card's copies while that card has no window in flight (upstream 13eee452).
-- The `STRATA_PIPELINE_*` tuning and test variables (THETA, FORCE_MISS, SWITCH, LOG, TRACE and the like) are read only with `STRATA_PIPELINE_DEBUG=1` (upstream 2bfac510).
+- The `XESTRATA_PIPELINE_*` tuning and test variables (THETA, FORCE_MISS, SWITCH, LOG, TRACE and the like) are read only with `XESTRATA_PIPELINE_DEBUG=1` (upstream 2bfac510).
 
 ## Measurements
 

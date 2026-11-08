@@ -187,7 +187,7 @@ A cell that does not fit the GPU's or the machine's memory stays `-` with the re
 
 ### serve and everyday use
 
-Beside that table, two smaller ones on the same GPUs and engines, closer to what a user meets, by the upstream merge's scripts (`tools/bench_core.py`), cut down to about 40 minutes a GPU (the AMD container measures meanwhile): `strata --serve` at 32K, sampled at temperature 0.7, and the engines' own `serve/server.py` with the Japanese chat and the coding agent; two rounds each, the engines alternating, each engine writing its own text.
+Beside that table, two smaller ones on the same GPUs and engines, closer to what a user meets, by the upstream merge's scripts (`tools/bench_core.py`), cut down to about 40 minutes a GPU (the AMD container measures meanwhile): `xestrata-engine --serve` at 32K, sampled at temperature 0.7, and the engines' own `serve/server.py` with the Japanese chat and the coding agent; two rounds each, the engines alternating, each engine writing its own text.
 They go into `$o/serve/`, apart from the table's `matrix.json`; the prompts come from the merge's `sync_prompts.py` (its 32K is the table's 32K, and it writes the follow-up questions).
 
 ```sh

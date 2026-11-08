@@ -13,7 +13,7 @@ It is opt-in and changes nothing when the options are absent (upstream's #465; t
 
 ## Turning it on
 
-Add `"parallel": 2` to the model's config (`strata-<model>.json`) and restart, or run setup with `--parallel 2`.
+Add `"parallel": 2` to the model's config (`xestrata-<model>.json`) and restart, or run setup with `--parallel 2`.
 Setup recommends it only where it does not cost speed (below); any number you ask for is kept as asked, with a note when it is more than setup would recommend.
 
 ```json
@@ -23,7 +23,7 @@ Setup recommends it only where it does not cost speed (below); any number you as
 | Option | What it does |
 | --- | --- |
 | `"parallel": N` / `--batch N` / `--slots N` (2..8) | up to N conversations decoded together; more requests wait for a free slot. Each slot gets its own session (GDN recurrence, QSA K/V and indexer, PLE history). |
-| `--batch-mtp` / `--no-batch-mtp` | on by default with `--mtp` (upstream 8cfb3fd7, c8c79b17; opt-in upstream): each slot also verifies one MTP proposal per window and moves two tokens when it holds. The draft layer's weights are shared; each slot's own state is about 50 MiB. Slots that do not fit a window take turns, so `"parallel"` above 8 works too. On a layer split the slots' drafters sit on the last GPU ([MULTIGPU](MULTIGPU.md#decoding-several-conversations)). `STRATA_BATCH_MTP=0` turns it off as well. |
+| `--batch-mtp` / `--no-batch-mtp` | on by default with `--mtp` (upstream 8cfb3fd7, c8c79b17; opt-in upstream): each slot also verifies one MTP proposal per window and moves two tokens when it holds. The draft layer's weights are shared; each slot's own state is about 50 MiB. Slots that do not fit a window take turns, so `"parallel"` above 8 works too. On a layer split the slots' drafters sit on the last GPU ([MULTIGPU](MULTIGPU.md#decoding-several-conversations)). `XESTRATA_BATCH_MTP=0` turns it off as well. |
 
 The engine never refuses a count it cannot run: it says so in its log and runs what it can.
 That is at most 8 slots (a window holds 8 rows), as many as fit in VRAM, or none (one request at a time) when not two fit.
@@ -52,11 +52,11 @@ At a 32K context that is 4 slots from a 24 GB card; a smaller card stays at one 
   The engine's prompt cache holds exactly that, so nothing is read again; the new request is admitted next to it.
   A request in a slot decodes **without MTP drafts** (one token per window).
 - **A request left alone in a slot** (the others finished, nobody waits) goes back to the solo path.
-  The slot is stopped, the engine copies its sessions back and decodes with MTP drafts again (at most twice per request; with `--prompt-cache 0` it stays in the slot; `STRATA_PARALLEL_SOLO=0` turns it off).
+  The slot is stopped, the engine copies its sessions back and decodes with MTP drafts again (at most twice per request; with `--prompt-cache 0` it stays in the slot; `XESTRATA_PARALLEL_SOLO=0` turns it off).
 - **More requests than slots** wait for a free one (`/metrics` -> `live.slots` shows each slot: idle, reading or decoding, its tokens and tok/s).
 - **Each admission** reads the request's prompt through the usual prefill path (prompt cache and conversation checkpoints included) and produces its first token there; the state is then copied into the slot.
   Admissions are taken one at a time, and **the slots decode between prefill's chunks**.
-  After each chunk they decode for half as long as the chunk took (`STRATA_BATCH_DECODE_SHARE`, default 0.5), so a long prompt slows the others down instead of stopping them.
+  After each chunk they decode for half as long as the chunk took (`XESTRATA_BATCH_DECODE_SHARE`, default 0.5), so a long prompt slows the others down instead of stopping them.
   The chunks are the ones one uninterrupted read takes, so prefill's arithmetic is unchanged.
 - **A long prompt gives way to a short one**: when a request with a prompt under half as long is waiting, the server sends `BYIELD`.
   At its next chunk boundary the long read stops, the part read so far is copied into a slot, the short request is admitted, and the long one then goes on from its slot with the same chunks (at most twice per request).
@@ -93,17 +93,17 @@ The swaps run beside the window's commit, emits and drafts, and have landed befo
 The tier stands still while a long prompt is read beside decoding slots (the prompt may hold a loan of cache slots).
 With `--adapt-async` (the default in the resident RAM mode) no window waits for a round: each batch window moves the round on a step (upstream 495dc436), and a request that arrives finishes the round in flight before it starts.
 The pipelined groups of `--batch-groups` do not adapt by default: their windows count the routing, but no round starts while groups are in flight, so the tier moves only when the slots go back to the solo path.
-`STRATA_PIPE_ADAPT_EVERY=N` (opt-in; unset or 0 keeps the old behaviour) lets the pipelined path adapt (upstream a3bb38ec4).
+`XESTRATA_PIPE_ADAPT_EVERY=N` (opt-in; unset or 0 keeps the old behaviour) lets the pipelined path adapt (upstream a3bb38ec4).
 After N group windows it starts no new group, lets the groups in flight finish, runs one round as the serial batch windows do, and goes on. The swaps run while no card has a window waiting on the host, so no window reads a cache slot that is changing, and the swapped-in experts land before the next group starts.
-It stands still while a prompt is read beside decoding slots, and does nothing with `--adapt-async 1`. The engine says so at start, and the `strata batch (pipelined ...)` line adds the rounds, the experts swapped in and the time spent.
+It stands still while a prompt is read beside decoding slots, and does nothing with `--adapt-async 1`. The engine says so at start, and the `xestrata batch (pipelined ...)` line adds the rounds, the experts swapped in and the time spent.
 Upstream measured it on 2x RTX 5090 (layer split, `--batch 6 --batch-groups 2`, `--adapt-every 16`, eight bursts of six streams right after start): 309 rows/s on average without it, 410 with 128 and 402 with 32 (32 empties the pipeline four times as often).
-The `strata batch:` log line shows the rounds, the experts swapped in and the wait per window (`adapt wait`).
+The `xestrata batch:` log line shows the rounds, the experts swapped in and the wait per window (`adapt wait`).
 Swaps move experts between the GPU and the CPU, which round differently, so greedy output can differ from run to run; `--adapt-every 1000000` keeps the tier fixed (Exactness, below).
 
-## MTP drafts in the pipelined groups (`STRATA_PIPED_MTP`, opt-in)
+## MTP drafts in the pipelined groups (`XESTRATA_PIPED_MTP`, opt-in)
 
 Grouped windows (`--batch-groups` above 1) verify no MTP proposals, and `--batch-mtp` in one group keeps one GPU busy at a time.
-`STRATA_PIPED_MTP=N` together with `--batch-mtp` gives both: the groups stay pipelined, and each slot verifies its proposals in them (upstream 17878ac57).
+`XESTRATA_PIPED_MTP=N` together with `--batch-mtp` gives both: the groups stay pipelined, and each slot verifies its proposals in them (upstream 17878ac57).
 Without the variable nothing changes.
 
 A group's window carries, for each of its slots, the slot's token and up to N MTP proposals (at most `--spec` - 1; the first always, each further one while the draft layer was at least `--spec-min-p` sure of the one before).
@@ -152,10 +152,10 @@ How the server uses them (moving from the solo path into a slot, each slot's con
 
 - At most `--max-t` slots (8 by default). Each slot's state is taken before the VRAM tier of experts, within half the VRAM free then, and the start log says how many were taken.
 - A slot grows with the context (Qwen3.6-35B-A3B: 414 MiB at a 16K context, 2,878 MiB at 128K; Qwen3.5-9B: 562 MiB at 16K).
-- With the MTP layer, each slot also checks one MTP draft a window, as Qwen3.8-Flash-Next's, and moves two tokens when it holds (`--batch-mtp`, on by default; `--no-batch-mtp` or `STRATA_BATCH_MTP=0` turns it off). A window holds `--max-t` rows, so the slots past that go without a draft in it. Each slot keeps a copy of its recurrent states after its first row (about 60 MiB for Qwen3.6-35B-A3B).
+- With the MTP layer, each slot also checks one MTP draft a window, as Qwen3.8-Flash-Next's, and moves two tokens when it holds (`--batch-mtp`, on by default; `--no-batch-mtp` or `XESTRATA_BATCH_MTP=0` turns it off). A window holds `--max-t` rows, so the slots past that go without a draft in it. Each slot keeps a copy of its recurrent states after its first row (about 60 MiB for Qwen3.6-35B-A3B).
 - While a prompt is read the slots wait (they do not decode between its chunks); `BYIELD` is taken and does nothing.
 - A batch window is recorded as a graph once for each set of slots in it.
-- On a layer split the slots run in groups pipelined through the stages, as Qwen3.8-Flash-Next's (`--batch-groups G` or `auto`, `auto` by default there): each stage computes another group at once. The groups' windows carry no drafts, so `--batch-mtp` is off then (`--batch-groups 1` or `STRATA_BATCH_MTP_SERIAL=1` keeps one group with them). No adaptive round starts while groups are in the stages. Qwen3.6-35B-A3B on a B70 + RTX 4070 split at layer 20, 4 slots: 89.3 tokens/s in 2 groups, against 66.1 in one group without drafts and 69.2 with them.
+- On a layer split the slots run in groups pipelined through the stages, as Qwen3.8-Flash-Next's (`--batch-groups G` or `auto`, `auto` by default there): each stage computes another group at once. The groups' windows carry no drafts, so `--batch-mtp` is off then (`--batch-groups 1` or `XESTRATA_BATCH_MTP_SERIAL=1` keeps one group with them). No adaptive round starts while groups are in the stages. Qwen3.6-35B-A3B on a B70 + RTX 4070 split at layer 20, 4 slots: 89.3 tokens/s in 2 groups, against 66.1 in one group without drafts and 69.2 with them.
 
 `tools/batch_test.py` (greedy) with 4 slots on the B70:
 
@@ -184,13 +184,13 @@ Four scripts drive a built engine or a running server; each exits non-zero on a 
 For exact comparisons pass `--pcie-frac 0 --adapt-every 1000000`:
 
 ```sh
-python3 tools/batch_test.py --exe build/contrib-llvm/strata --config xestrata-<model>.json --batch 3 --n 3 \
+python3 tools/batch_test.py --exe build/contrib-llvm/xestrata-engine --config xestrata-<model>.json --batch 3 --n 3 \
     --extra "--pcie-frac 0 --adapt-every 1000000"
-python3 tools/batch_interleave_test.py --exe build/contrib-llvm/strata --config xestrata-<model>.json \
+python3 tools/batch_interleave_test.py --exe build/contrib-llvm/xestrata-engine --config xestrata-<model>.json \
     --extra "--pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow"
-python3 tools/parking_test.py --exe build/contrib-llvm/strata --config xestrata-<model>.json \
+python3 tools/parking_test.py --exe build/contrib-llvm/xestrata-engine --config xestrata-<model>.json \
     --extra "--conversation-cache-mib 8192 --conversation-cache-slots 4 --pcie-frac 0 --adapt-every 1000000"
-STRATA_KEY=<key> python3 tools/early_close_test.py http://127.0.0.1:8095
+XESTRATA_KEY=<key> python3 tools/early_close_test.py http://127.0.0.1:8095
 ```
 
 All four passed on the B70 (IQ2_XS, contrib-llvm build) on 2026-10-06.

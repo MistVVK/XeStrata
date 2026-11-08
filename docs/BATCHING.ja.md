@@ -13,7 +13,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 
 ## 有効にする
 
-モデルの設定（`strata-<model>.json`）に `"parallel": 2` を足して再起動するか、setup を `--parallel 2` で実行します。
+モデルの設定（`xestrata-<model>.json`）に `"parallel": 2` を足して再起動するか、setup を `--parallel 2` で実行します。
 setup は速さを落とさない所でだけ勧めます（下）。指定した数は、勧める数より多くてもそのまま使い、その旨を表示します。
 
 ```json
@@ -23,7 +23,7 @@ setup は速さを落とさない所でだけ勧めます（下）。指定し�
 | オプション | 働き |
 | --- | --- |
 | `"parallel": N` / `--batch N` / `--slots N`（2〜8） | 最大 N 個の会話をまとめて decode します。それより多い要求は空きスロットを待ちます。スロットごとに専用のセッション（GDN の再帰状態、QSA の K/V とインデクサ、PLE の履歴）を持ちます。 |
-| `--batch-mtp` / `--no-batch-mtp` | `--mtp` があれば既定で有効です（upstream 8cfb3fd7、c8c79b17。upstream では opt-in）。各スロットが窓ごとに MTP の下書きを 1 つ一緒に確かめ、合えば 2 トークン進みます。下書き層の重みは共有し、スロットごとの状態は約 50 MiB です。窓に入らない数のスロットは順に回るので、8 を超える `"parallel"` も使えます。層の分割では、スロットごとの下書き器を最後の GPU に置きます（[MULTIGPU](MULTIGPU.ja.md#まとめて-decode-するとき)）。`STRATA_BATCH_MTP=0` でも切れます。 |
+| `--batch-mtp` / `--no-batch-mtp` | `--mtp` があれば既定で有効です（upstream 8cfb3fd7、c8c79b17。upstream では opt-in）。各スロットが窓ごとに MTP の下書きを 1 つ一緒に確かめ、合えば 2 トークン進みます。下書き層の重みは共有し、スロットごとの状態は約 50 MiB です。窓に入らない数のスロットは順に回るので、8 を超える `"parallel"` も使えます。層の分割では、スロットごとの下書き器を最後の GPU に置きます（[MULTIGPU](MULTIGPU.ja.md#まとめて-decode-するとき)）。`XESTRATA_BATCH_MTP=0` でも切れます。 |
 
 エンジンは動かせない数を拒否しません。ログにそう書いて、動かせる数で動きます。
 上限は 8 スロット（ウィンドウは 8 行）で、VRAM に収まる数まで、2 つも収まらなければスロットなし（1 つずつ）です。
@@ -53,11 +53,11 @@ KV を流す場合（`--kv-resident N`）は、各 QSA 層の N セルだけが 
   エンジンのプロンプトキャッシュがちょうどその内容を持っているので、読み直しはありません。新しい要求はその横に入ります。
   スロットの要求は **MTP の推測なし**で decode します（ウィンドウごとに 1 トークン）。
 - **スロットに 1 つだけ残った要求**（ほかが終わり、待つ要求もない）は、単独の経路に戻ります。
-  スロットを止め、エンジンがセッションを戻して、また MTP の推測つきで decode します（1 要求につき 2 回まで。`--prompt-cache 0` ならスロットに残ります。`STRATA_PARALLEL_SOLO=0` でオフ）。
+  スロットを止め、エンジンがセッションを戻して、また MTP の推測つきで decode します（1 要求につき 2 回まで。`--prompt-cache 0` ならスロットに残ります。`XESTRATA_PARALLEL_SOLO=0` でオフ）。
 - **スロットより多い要求**は空きを待ちます（`/metrics` の `live.slots` に、スロットごとの状態（空き、読み込み中、decode 中）、トークン数、tok/s が出ます）。
 - **受け入れ**のたびに、要求のプロンプトをいつもの prefill の経路（プロンプトキャッシュと会話のチェックポイントを含む）で読み、そこで最初のトークンを出してから、状態をスロットにコピーします。
   受け入れは 1 つずつで、**prefill のチャンクの合間にスロットが decode します**。
-  チャンクを 1 つ読むたびに、その所要時間の半分だけ decode します（`STRATA_BATCH_DECODE_SHARE`、既定 0.5）。長いプロンプトはほかの会話を止めずに遅くするだけです。
+  チャンクを 1 つ読むたびに、その所要時間の半分だけ decode します（`XESTRATA_BATCH_DECODE_SHARE`、既定 0.5）。長いプロンプトはほかの会話を止めずに遅くするだけです。
   チャンクの区切りは中断なしで読むときと同じなので、prefill の計算は変わりません。
 - **長いプロンプトは短いものに譲ります**。半分より短いプロンプトの要求が待っていると、サーバーは `BYIELD` を送ります。
   長い読み込みは次のチャンクの区切りで止まり、読んだ分をスロットにコピーし、短い要求を受け入れてから、スロットから同じチャンクで続けます（1 要求につき 2 回まで）。
@@ -94,17 +94,17 @@ RAM を減らすためにキャッシュを絞るときも、移るときの使�
 decode 中のスロットの横で長いプロンプトを読んでいる間（プロンプトがキャッシュのスロットを借りていることがあります）は止まります。
 `--adapt-async`（RAM 常駐のモードで既定）では、1 回分を待たずに、バッチのウィンドウごとに 1 歩ずつ進めます（upstream 495dc436）。新しい要求は、進行中の回を終えてから始まります。
 `--batch-groups` で組をパイプラインにしたときは、既定では適応しません。振り分けは数えますが、組が流れている間は回を始めないので、スロットが単独の経路に戻ったときにしか層が動きません。
-`STRATA_PIPE_ADAPT_EVERY=N`（明示的に有効にする機能。なし・0 なら今までどおり）を付けると、パイプラインでも適応します（upstream a3bb38ec4）。
+`XESTRATA_PIPE_ADAPT_EVERY=N`（明示的に有効にする機能。なし・0 なら今までどおり）を付けると、パイプラインでも適応します（upstream a3bb38ec4）。
 組のウィンドウ N 回ごとに新しい組を始めず、流れている組が終わるのを待ってから、直列のバッチのウィンドウと同じ 1 回を回して続けます。どのカードにもホストを待つウィンドウがない間に入れ替えるので、入れ替え中のキャッシュのスロットを読むウィンドウはなく、入れたエキスパートは次の組の前に着地します。
-decode 中のスロットの横でプロンプトを読む間と `--adapt-async 1` では何もしません。起動時のログにその旨が出て、`strata batch (pipelined ...)` の行に回数、入れ替えたエキスパートの数、かかった時間が足されます。
+decode 中のスロットの横でプロンプトを読む間と `--adapt-async 1` では何もしません。起動時のログにその旨が出て、`xestrata batch (pipelined ...)` の行に回数、入れ替えたエキスパートの数、かかった時間が足されます。
 upstream の測定（2x RTX 5090、層の分割、`--batch 6 --batch-groups 2`、`--adapt-every 16`、起動直後の 6 本の流れの 8 回）では、なしの平均 309 行/s に対し、128 で 410 行/s、32 で 402 行/s でした（32 はパイプラインを 4 倍空けるぶん少し低い）。
-`strata batch:` のログの行に、適応の回数、入れ替えたエキスパートの数、ウィンドウあたりの待ち（`adapt wait`）が出ます。
+`xestrata batch:` のログの行に、適応の回数、入れ替えたエキスパートの数、ウィンドウあたりの待ち（`adapt wait`）が出ます。
 入れ替えでエキスパートが GPU と CPU のあいだを移り、丸めが変わるので、貪欲な出力も実行ごとに変わることがあります。層を固定するには `--adapt-every 1000000` を渡します（下の「一致」）。
 
-## 流れ作業の組でも MTP の下書きを確かめる（`STRATA_PIPED_MTP`、明示的に有効にする機能）
+## 流れ作業の組でも MTP の下書きを確かめる（`XESTRATA_PIPED_MTP`、明示的に有効にする機能）
 
 組に分けたウィンドウ（`--batch-groups` が 2 以上）は MTP の下書きを確かめず、1 組の `--batch-mtp` は一度に 1 枚の GPU しか動きません。
-`--batch-mtp` と一緒に `STRATA_PIPED_MTP=N` を付けると、組の流れ作業のまま、各スロットが下書きを確かめます（upstream 17878ac57）。
+`--batch-mtp` と一緒に `XESTRATA_PIPED_MTP=N` を付けると、組の流れ作業のまま、各スロットが下書きを確かめます（upstream 17878ac57）。
 付けなければ何も変わりません。
 
 組のウィンドウは、組の各スロットについて、そのトークンと最大 N 個の MTP の下書き（`--spec` - 1 まで。1 つ目は必ず、2 つ目からは下書き層が 1 つ前を `--spec-min-p` 以上の確かさで出したとき）を運びます。
@@ -153,10 +153,10 @@ Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B、Qwen3.5-9B も、同じ `"parallel":
 
 - スロットは最大で `--max-t`（既定 8）個です。各スロットの状態は、エキスパートの VRAM の層より先に、その時点の空き VRAM の半分までで取り、取れた数を起動のログが言います。
 - 1 スロットの大きさは文脈の長さに比例します（Qwen3.6-35B-A3B で 16K の文脈なら 414 MiB、128K なら 2,878 MiB。Qwen3.5-9B は 16K で 562 MiB）。
-- MTP の層のあるモデルでは、Qwen3.8-Flash-Next と同じく、各スロットが窓ごとに MTP の下書きを 1 つ一緒に確かめ、合えば 2 トークン進みます（`--batch-mtp`、既定で有効。`--no-batch-mtp` か `STRATA_BATCH_MTP=0` で切れます）。窓に入るのは `--max-t` 行までなので、それを超える分のスロットはその窓では下書きなしで進みます。スロットごとに、最初の行の後の再帰の状態の写しを持ちます（Qwen3.6-35B-A3B で約 60 MiB）。
+- MTP の層のあるモデルでは、Qwen3.8-Flash-Next と同じく、各スロットが窓ごとに MTP の下書きを 1 つ一緒に確かめ、合えば 2 トークン進みます（`--batch-mtp`、既定で有効。`--no-batch-mtp` か `XESTRATA_BATCH_MTP=0` で切れます）。窓に入るのは `--max-t` 行までなので、それを超える分のスロットはその窓では下書きなしで進みます。スロットごとに、最初の行の後の再帰の状態の写しを持ちます（Qwen3.6-35B-A3B で約 60 MiB）。
 - プロンプトを読む間、スロットは待ちます（チャンクの間に decode しません）。`BYIELD` は受け取っても何もしません。
 - スロットのウィンドウは、スロットの組み合わせごとに 1 度グラフに記録します。
-- 層の分割では、Qwen3.8-Flash-Next と同じく、スロットを組に分けて段をまたいで流します（`--batch-groups G`・`auto`。層の分割では既定で `auto`）。各段が別の組を同時に計算し、組の窓は下書きを運ばないので、`--batch-mtp` はそのとき切れます（`--batch-groups 1` か `STRATA_BATCH_MTP_SERIAL=1` で 1 組のまま下書きを使います）。組が段にいる間は、適応の段は入れ替えません。B70 と RTX 4070 の分割（層 20 で分ける）で Qwen3.6-35B-A3B を 4 スロット回すと、1 組・下書きなしの 66.1、1 組・下書きありの 69.2 に対し、2 組で 89.3 トークン/秒でした。
+- 層の分割では、Qwen3.8-Flash-Next と同じく、スロットを組に分けて段をまたいで流します（`--batch-groups G`・`auto`。層の分割では既定で `auto`）。各段が別の組を同時に計算し、組の窓は下書きを運ばないので、`--batch-mtp` はそのとき切れます（`--batch-groups 1` か `XESTRATA_BATCH_MTP_SERIAL=1` で 1 組のまま下書きを使います）。組が段にいる間は、適応の段は入れ替えません。B70 と RTX 4070 の分割（層 20 で分ける）で Qwen3.6-35B-A3B を 4 スロット回すと、1 組・下書きなしの 66.1、1 組・下書きありの 69.2 に対し、2 組で 89.3 トークン/秒でした。
 
 B70 で `tools/batch_test.py`（貪欲 decode）を 4 スロットで回すと、次のとおりでした。
 
@@ -185,13 +185,13 @@ B70（32 GB）、i7-14700、Qwen3.8-Flash-Next IQ2_XS、エンジンへ直接、
 厳密に比べるには `--pcie-frac 0 --adapt-every 1000000` を渡します。
 
 ```sh
-python3 tools/batch_test.py --exe build/contrib-llvm/strata --config xestrata-<model>.json --batch 3 --n 3 \
+python3 tools/batch_test.py --exe build/contrib-llvm/xestrata-engine --config xestrata-<model>.json --batch 3 --n 3 \
     --extra "--pcie-frac 0 --adapt-every 1000000"
-python3 tools/batch_interleave_test.py --exe build/contrib-llvm/strata --config xestrata-<model>.json \
+python3 tools/batch_interleave_test.py --exe build/contrib-llvm/xestrata-engine --config xestrata-<model>.json \
     --extra "--pcie-frac 0 --adapt-every 1000000 --no-prefill-borrow"
-python3 tools/parking_test.py --exe build/contrib-llvm/strata --config xestrata-<model>.json \
+python3 tools/parking_test.py --exe build/contrib-llvm/xestrata-engine --config xestrata-<model>.json \
     --extra "--conversation-cache-mib 8192 --conversation-cache-slots 4 --pcie-frac 0 --adapt-every 1000000"
-STRATA_KEY=<key> python3 tools/early_close_test.py http://127.0.0.1:8095
+XESTRATA_KEY=<key> python3 tools/early_close_test.py http://127.0.0.1:8095
 ```
 
 2026-10-06 に B70（IQ2_XS、contrib-llvm のビルド）で 4 つとも通りました。

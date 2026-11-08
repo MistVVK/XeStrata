@@ -24,6 +24,7 @@
 #define STRATA_DEVICE_ARCH_TAG_TU xe_mma_gemm
 #include "strata/kernels/device_arch_tag.hpp"
 #include "strata/kernels/rows_cols.hpp"
+#include "strata/platform/env.hpp"
 #include "device_caps.hpp"
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
@@ -447,7 +448,7 @@ bool reported(const sycl::device& d, mx::matrix_type in, const Shape& s) {
 }
 
 bool env_on(const char* name) {
-    const char* v = std::getenv(name);
+    const char* v = strata::env_get(name);
     return v != nullptr && std::strtol(v, nullptr, 10) != 0;
 }
 
@@ -490,7 +491,7 @@ bool layout_fits(const sycl::queue& q) {
         const size_t local = d.get_info<sycl::info::device::local_mem_size>();
         const size_t wg = d.get_info<sycl::info::device::max_work_group_size>() / (KT::L.grf ? 4 : 1);
         if (local >= KT::LOCAL && wg >= (size_t) KT::NSG * KT::SG) return true;
-        std::fprintf(stderr, "strata: mma_gemm's layout for %s needs %zu bytes of local memory and work-groups of %d, "
+        std::fprintf(stderr, "xestrata: mma_gemm's layout for %s needs %zu bytes of local memory and work-groups of %d, "
                      "the GPU has %zu and %zu%s\n", what, KT::LOCAL, KT::NSG * KT::SG, local, wg,
                      KT::L.grf ? " (a quarter of its largest, with the large register file)" : "");
         return false;
@@ -569,7 +570,7 @@ sycl::event run(sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t w_
                               : launch_split<S, E, false>(q, x, w, Y, ldy, T, N, K, &slices);
         } catch (const sycl::exception& e) {
             if (dense.exchange(false))
-                std::fprintf(stderr, "strata: mma_gemm's layout for a product did not launch (%s): its products take "
+                std::fprintf(stderr, "xestrata: mma_gemm's layout for a product did not launch (%s): its products take "
                              "the experts' layout\n", e.what());
         }
     }
@@ -588,7 +589,7 @@ sycl::event by_shape(int s, sycl::queue& q, const uint16_t* X, const uint16_t* W
 }  // namespace
 
 bool mma_forced() {
-    static const bool v = env_on("STRATA_MMA");
+    static const bool v = env_on("MMA");
     return v;
 }
 

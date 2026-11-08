@@ -19,7 +19,7 @@
 namespace strata::program {
 
 struct SharedOptionFields {
-    const char* who = "strata";   ///< the engine's name in its messages
+    const char* who = "xestrata";   ///< the engine's name in its messages
     // the adaptive tier
     int* adapt_every = nullptr;
     bool* adapt_every_given = nullptr;
@@ -77,7 +77,7 @@ int parse_shared_option(const std::string& a, Next&& next, const SharedOptionFie
         const double v = std::strtod(next(a.c_str()), nullptr);
         *f.adapt_decay = std::isfinite(v) && v >= 0.0 && v <= 1.0 ? (float) v : 0.7f;
         if (*f.adapt_decay != (float) v)
-            std::fprintf(stderr, "strata: --adapt-decay %g is not between 0 and 1; using 0.7 (counts above 1 grow without "
+            std::fprintf(stderr, "xestrata: --adapt-decay %g is not between 0 and 1; using 0.7 (counts above 1 grow without "
                                  "end and the swap gains turn NaN)\n", v);
         return 1;
     }

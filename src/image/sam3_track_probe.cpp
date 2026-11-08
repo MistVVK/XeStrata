@@ -20,6 +20,7 @@
 #include "strata/image/sam3_video.hpp"
 #include "strata/video/video_io.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/platform/env.hpp"
 #include "probe_npy.hpp"
 
 #include <cstdio>
@@ -112,7 +113,7 @@ int video_mode(int argc, char** argv) {
         const strata::video::Info info = strata::video::probe(argv[3]);
         si::Sam3 sam(argv[2]);
         // STRATA_PROBE_REPEAT: the clip run that many times, each one's times printed (the last warm)
-        const char* rep = std::getenv("STRATA_PROBE_REPEAT");
+        const char* rep = strata::env_get("PROBE_REPEAT");
         const int repeat = rep != nullptr ? std::max(1, std::atoi(rep)) : 1;
         for (int r = 0; r < repeat; ++r) {
             si::Sam3Video vs(sam, info.width, info.height, info.frames, words, clicks);

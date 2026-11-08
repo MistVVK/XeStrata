@@ -6,6 +6,7 @@
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/platform/env.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -281,7 +282,7 @@ void Guidance::dump(const float* x, const float* c, const float* u, const float*
     // STRATA_GUIDANCE_DUMP=<folder>: each call's inputs and result as raw FP32 files (g<run>_step<i>_<x|c|u|k|den>.f32,
     // a run one guided sampling of this process) and a line of meta.txt (the run, the step, the model's sigma, cfg, n,
     // channels, layout): what checks the methods against ComfyUI's nodes on the same values
-    const char* dir = std::getenv("STRATA_GUIDANCE_DUMP");
+    const char* dir = strata::env_get("GUIDANCE_DUMP");
     if (dir == nullptr || *dir == '\0') return;
     gpu::stream_sync(s_);
     std::vector<float> h((size_t) n_);

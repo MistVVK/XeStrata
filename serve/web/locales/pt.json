@@ -92,7 +92,7 @@
   "about.kept": "Os chats, as configurações e a chave ficam só neste navegador.",
   "about.github": "XeStrata no GitHub",
   "about.cfgTitle": "Configurações do modelo",
-  "about.cfgNote": "Guardadas na configuração de execução do modelo para todos os clientes. Um campo vazio é o padrão. Valem na próxima vez que o modelo iniciar (feche a janela do Strata e inicie de novo).",
+  "about.cfgNote": "Guardadas na configuração de execução do modelo para todos os clientes. Um campo vazio é o padrão. Valem na próxima vez que o modelo iniciar (feche a janela do XeStrata e inicie de novo).",
   "branch.back": "Voltar a ele",
   "branch.from": "Ramificado de “{title}”",
   "branch.open": "Abrir o original",

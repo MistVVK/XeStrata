@@ -7,6 +7,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/draft_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -25,7 +26,7 @@ namespace {
 // top-k at 22-58 us (32: 39-126, 64: 74-222; records/2026-10-26-plan/d1).  STRATA_DRAFT_INT2_K sets it (1..64).
 int candidates() {
     static const int k = [] {
-        const char* v = std::getenv("STRATA_DRAFT_INT2_K");
+        const char* v = strata::env_get("DRAFT_INT2_K");
         const int n = v != nullptr ? (int) std::strtol(v, nullptr, 10) : 16;
         return std::clamp(n, 1, k::kTopKMax);
     }();
@@ -197,7 +198,7 @@ void DraftHeadInt2::logits(const float* x, const uint8_t* head_rows, const Exact
 
 bool DraftHeadInt2::choose(const float* x, const uint8_t* head_rows, const Exact& exact,
                            const std::function<void(float*, void*)>& full, float* out, void* stream, const char* who) {
-    if (const char* v = std::getenv("STRATA_DRAFT_INT2"); v != nullptr && v[0] != 0)
+    if (const char* v = strata::env_get("DRAFT_INT2"); v != nullptr && v[0] != 0)
         return std::strtol(v, nullptr, 10) != 0;
     auto time_us = [&](const std::function<void()>& f) {
         constexpr int kWarm = 50, kReps = 50;   // the GPU's clock ramps from idle (LOCAL.md: B70 400 -> 2800 MHz)

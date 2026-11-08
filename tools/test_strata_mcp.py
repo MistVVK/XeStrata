@@ -118,7 +118,7 @@ class H(BaseHTTPRequestHandler):
             self.js(404, {})
 httpd = ThreadingHTTPServer(("127.0.0.1", port), H)
 def term(*_):
-    print("[strata] stopped (fake)", flush=True)
+    print("[xestrata] stopped (fake)", flush=True)
     os._exit(0)
 signal.signal(signal.SIGTERM, term)
 print(f"ready: http://127.0.0.1:{port}/v1", flush=True)
@@ -336,7 +336,7 @@ class Validation(FakeRoot):
         self.write_config("q2_0", log=str(Path(self.tmp.name).parent / "elsewhere.log"))
         res, err = self.call("strata_logs", {"source": "engine", "model": "q2_0"})
         self.assertTrue(err)
-        self.assertIn("outside the Strata folder", res["error"])
+        self.assertIn("outside the XeStrata folder", res["error"])
         self.write_config("q2_0")
         res, err = self.call("strata_logs", {"source": "engine"})
         self.assertFalse(err)
@@ -414,7 +414,7 @@ class StartStop(FakeRoot):
         self.write_config("q2_0", port=port, delay=1.5)
         res, err = self.call("strata_start", {"wait_seconds": 30})
         self.assertFalse(err, res)
-        self.assertIn("Strata is running", res["summary"])
+        self.assertIn("XeStrata is running", res["summary"])
         pid = res["server"]["pid"]
 
         st, _ = self.call("strata_status", {"hardware": False})
@@ -449,7 +449,7 @@ class StartStop(FakeRoot):
         st, _ = self.call("strata_status", {"hardware": False})
         self.assertEqual(st["running"], [])
         res, _ = self.call("strata_stop", {})
-        self.assertEqual(res["summary"], "Strata is not running")
+        self.assertEqual(res["summary"], "XeStrata is not running")
 
     def test_start_reports_a_crash(self):
         self.write_config("q2_0", port=free_port(), crash=True)
@@ -502,7 +502,7 @@ class StartStop(FakeRoot):
         self.strata.save_state("server", {"pid": other.pid, "ident": "linux:1",
                                           "port": free_port(), "model": "q2_0"})
         res, _ = self.call("strata_stop", {})
-        self.assertEqual(res["summary"], "Strata is not running")
+        self.assertEqual(res["summary"], "XeStrata is not running")
         self.assertFalse(M.proc_terminate(other.pid, "linux:1"))
         time.sleep(0.3)
         self.assertIsNone(other.poll())
@@ -536,7 +536,7 @@ class Helpers(unittest.TestCase):
     def test_progress_from_setup_output(self):
         with tempfile.TemporaryDirectory() as d:
             f = Path(d) / "setup.log"
-            f.write_text("=== Step 4: the Strata engine ===\n  [ok] engine\n=== Step 5: downloading X ===\n"
+            f.write_text("=== Step 4: the XeStrata engine ===\n  [ok] engine\n=== Step 5: downloading X ===\n"
                          "\r  a.gguf:   1.00 / 50.00 GB (2%)   \r  a.gguf:  25.00 / 50.00 GB (50%)   \n")
             p = M.install_progress(M.read_tail(f, 50))
         self.assertEqual(p["step"], "5/7: downloading X")

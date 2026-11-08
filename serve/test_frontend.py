@@ -248,7 +248,7 @@ class EmptyTurnsSwitch(unittest.TestCase):
                 {"role": "user", "content": "b"}]
         clean = template.render([msgs[0], msgs[2]])
         self.assertEqual(template.render(msgs), clean)
-        with mock.patch.dict(os.environ, {"STRATA_KEEP_EMPTY_TURNS": "1"}):
+        with mock.patch.dict(os.environ, {"XESTRATA_KEEP_EMPTY_TURNS": "1"}):
             self.assertNotEqual(template.render(msgs), clean)
 
 

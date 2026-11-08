@@ -21,6 +21,7 @@
 #include "strata/core/per_device.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU prefill_kernels
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
@@ -369,7 +370,7 @@ struct Gdn {
     }
 
     static void conv(float* hist, const float* qkv, const float* w, float* h, int64_t T, float eps, void* stream) {
-        static const bool serial = std::getenv("STRATA_GDN_CONV_SERIAL") != nullptr;   // the old walk (A/B)
+        static const bool serial = strata::env_get("GDN_CONV_SERIAL") != nullptr;   // the old walk (A/B)
         auto& q = Q(stream);
         if (serial || T <= CONV_TILE) {
             // one work-item per channel walks the chunk
@@ -390,7 +391,7 @@ struct Gdn {
             // the same expression per element, then the history written afterwards
             const size_t tiles = (size_t) ((T + CONV_TILE - 1) / CONV_TILE);
             static const bool fused = [] {   // upstream 9668e324; STRATA_GDN_CONVL2=0: the conv, then the norm kernel
-                const char* v = std::getenv("STRATA_GDN_CONVL2");
+                const char* v = strata::env_get("GDN_CONVL2");
                 return v == nullptr || std::strtol(v, nullptr, 10) != 0;
             }();
             if (fused) {
@@ -702,7 +703,7 @@ struct Gdn {
     static bool gdn_lane_ok(sycl::queue& q) {
         static core::PerDevice<bool> per_device;
         return per_device.get(q.get_device(), [&] {
-            const char* v = std::getenv("STRATA_GDN_REC_LANE");
+            const char* v = strata::env_get("GDN_REC_LANE");
             if (v != nullptr && v[0] == '0') return false;
             const sycl::device d = q.get_device();
             if (!d.has(sycl::aspect::ext_intel_gpu_eu_simd_width) ||
@@ -713,7 +714,7 @@ struct Gdn {
                     q.get_context(), {d}, {sycl::get_kernel_id<GdnRecLane<16>>()});
                 return true;
             } catch (const sycl::exception& e) {
-                std::fprintf(stderr, "strata: the GPU does not build the DeltaNet recurrence with the large register file "
+                std::fprintf(stderr, "xestrata: the GPU does not build the DeltaNet recurrence with the large register file "
                              "(%s): the prompt path keeps the work-group kernel\n", e.what());
                 return false;
             }
@@ -725,7 +726,7 @@ struct Gdn {
     static void recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                            const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, bool silu, void* stream,
                            bool with_out = true) {
-        static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-group-per-head kernel (A/B)
+        static const bool serial = strata::env_get("GDN_REC_HEADS") != nullptr;   // the one-group-per-head kernel (A/B)
         auto& q = Q(stream);
         if (!with_out && T <= 0) return;
         if ((serial && with_out) || T <= 0) {
@@ -766,14 +767,14 @@ struct Gdn {
         // beta) are loaded into registers while this one computes (upstream ac6aad4, 04f4a53): the same bits.
         // STRATA_GDN_PIPELINE=0: each token's inputs loaded when it starts (rec_step), to compare.
         static const bool pipe_on = [] {
-            const char* v = std::getenv("STRATA_GDN_PIPELINE");
+            const char* v = strata::env_get("GDN_PIPELINE");
             return v == nullptr || std::strtol(v, nullptr, 10) != 0;
         }();
         const bool pipe = pipe_on;   // the kernel takes a copy
         static_assert(CB * RG == S, "one q and one k value a work-item");
         // STRATA_GDN_KEYHEAD=0: the D-2 kernel where GdnRecLane does not run (A/B)
         static const bool kh_on = [] {
-            const char* v = std::getenv("STRATA_GDN_KEYHEAD");
+            const char* v = strata::env_get("GDN_KEYHEAD");
             return v == nullptr || std::strtol(v, nullptr, 10) != 0;
         }();
         auto launch_kh = [&](float* st, float* yy, const int64_t n) {
@@ -860,7 +861,7 @@ struct Gdn {
         // chunked scan on the matrix engines (gdn_tc.cpp; not these kernels' bits).  A GPU without them, a shorter
         // chunk or no room for its scratch takes the kernels below
         static const bool tc_on = [] {
-            const char* v = std::getenv("STRATA_GDN_TC");
+            const char* v = strata::env_get("GDN_TC");
             return v != nullptr && std::strtol(v, nullptr, 10) != 0;
         }();
         if (tc_on && T >= kGdnTcMin && gdn_rec_tc(q, HK, HV, state, h, gate, beta, y, T)) {
@@ -886,12 +887,12 @@ struct Gdn {
                     };
                     const double d2 = time(launch_d2), kh = time(launch_kh);
                     pick = kh < d2 ? 1 : 0;
-                    std::fprintf(stderr, "strata: the DeltaNet recurrence, %lld tokens: D-2 %.0f us, the key-head form %.0f "
+                    std::fprintf(stderr, "xestrata: the DeltaNet recurrence, %lld tokens: D-2 %.0f us, the key-head form %.0f "
                                  "us: %s\n", (long long) tn, d2, kh, pick ? "the key-head form" : "D-2");
                 } else {
                     static bool said = false;   // D-2 meanwhile; the next call tries again
                     if (!said)
-                        std::fprintf(stderr, "strata: the DeltaNet recurrence: no VRAM to time the two forms on %lld "
+                        std::fprintf(stderr, "xestrata: the DeltaNet recurrence: no VRAM to time the two forms on %lld "
                                              "tokens, D-2 until it can be timed\n", (long long) tn);
                     said = true;
                 }

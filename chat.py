@@ -23,7 +23,7 @@ import urllib.request
 
 
 def stream(url, messages, think, max_tokens):
-    body = {"model": "strata", "messages": messages, "stream": True, "max_tokens": max_tokens,
+    body = {"model": "xestrata", "messages": messages, "stream": True, "max_tokens": max_tokens,
             "reasoning_effort": think}
     req = urllib.request.Request(url, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=3600) as r:
@@ -48,7 +48,7 @@ def main() -> int:
     gray, reset = ("\033[90m", "\033[0m") if sys.stdout.isatty() else ("", "")
     messages, pending = [], []
     think = "none" if a.no_think else a.think
-    print(f"Strata chat ({url}).  /image <path> = attach a picture, /think none|low|medium|high (now: {think}), "
+    print(f"XeStrata chat ({url}).  /image <path> = attach a picture, /think none|low|medium|high (now: {think}), "
           f"/reset = new conversation, /quit = leave.")
     while True:
         try:

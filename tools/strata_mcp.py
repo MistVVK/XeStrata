@@ -191,7 +191,7 @@ BENCH_PROMPT = ("Write a short story (about 300 words) about a lighthouse keeper
 def log(msg: str) -> None:
     """Diagnostics go to stderr: stdout carries only the protocol."""
     try:
-        sys.stderr.write(f"[strata-mcp] {msg}\n")
+        sys.stderr.write(f"[xestrata-mcp] {msg}\n")
         sys.stderr.flush()
     except (OSError, ValueError):
         pass
@@ -514,7 +514,7 @@ class Strata:
     def settings_path(self) -> Path:
         # the checkout's serve/places.py (the user's folders on Linux and on Windows)
         places = self.root / "serve" / "places.py"
-        spec = importlib.util.spec_from_file_location("strata_places_for_mcp", places) if places.is_file() else None
+        spec = importlib.util.spec_from_file_location("xestrata_places_for_mcp", places) if places.is_file() else None
         if spec is not None and spec.loader is not None:
             mod = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(mod)
@@ -733,11 +733,11 @@ class Strata:
             fam, model, why = "coder", "IQ1_M", (f"{ram:.0f} GB of RAM: the full model needs ~48 GB; the Coder "
                                                  "(half the experts, best for code) needs ~32 GB")
         else:
-            return {"family": None, "model": None, "why": f"{ram:.0f} GB of RAM: Strata needs 32 GB or more "
+            return {"family": None, "model": None, "why": f"{ram:.0f} GB of RAM: XeStrata needs 32 GB or more "
                                                           "(the smallest model, the Coder, keeps ~23 GB of experts in "
                                                           "RAM)"}
         if hw.get("cpu", {}).get("avx2") is False:
-            return {"family": None, "model": None, "why": "this CPU has no AVX2; Strata needs at least AVX2"}
+            return {"family": None, "model": None, "why": "this CPU has no AVX2; XeStrata needs at least AVX2"}
         ctx = 32768 if vram < 14 else 65536 if vram < 20 else 131072
         if best.get("integrated"):
             notes.append("the processor's own graphics: it runs, but slowly (its memory is the system RAM)")
@@ -816,7 +816,7 @@ class Strata:
         if st == 0:
             return None
         if st != 200 or not isinstance(health, dict) or health.get("service") != "strata":
-            return {"port": port, "other": True, "note": "something else answers on this port (not a Strata server)"}
+            return {"port": port, "other": True, "note": "something else answers on this port (not an XeStrata server)"}
         info = {"port": port, "url": base, "model": health.get("model"), "context": health.get("max_context"),
                 "images": health.get("images"), "loaded": health.get("loaded"),
                 "api_key_required": bool(health.get("api_key"))}
@@ -936,8 +936,8 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
                                       "'coder-iq1_m', 'swift-iq3_xxs'); default: the most recently used one"}
     ro = {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}
     return [
-        {"name": "strata_status", "title": "Strata status",
-         "description": "Is Strata (the local AI model server) running, and what is installed? Reports the running "
+        {"name": "strata_status", "title": "XeStrata status",
+         "description": "Is XeStrata (the local AI model server) running, and what is installed? Reports the running "
                         "server (model, engine version, context, busy or idle, VRAM/RAM in use), the installed models "
                         "and data folder, an install in progress, this PC's hardware (OS, CPU, RAM, GPUs, free disk) "
                         "and the model size setup recommends for this PC. Read-only; call it first.",
@@ -946,15 +946,15 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
              "hardware": {"type": "boolean", "description": "include the hardware check and the recommendation "
                                                             "(default true; takes a second or two)"}}},
          "annotations": ro},
-        {"name": "strata_models", "title": "Strata models",
-         "description": "The models and sizes Strata's setup offers (families: qwen = Qwen3.8-Flash-Next, swift = "
+        {"name": "strata_models", "title": "XeStrata models",
+         "description": "The models and sizes XeStrata's setup offers (families: qwen = Qwen3.8-Flash-Next, swift = "
                         "Swift 1.5, coder = the Coder), with download size, RAM needed, "
                         "whether each fits this PC, which are installed, the context lengths, and the recommendation. "
                         "Read-only.",
          "inputSchema": {"type": "object", "additionalProperties": False, "properties": {}},
          "annotations": ro},
-        {"name": "strata_install", "title": "Install Strata",
-         "description": "Install a Strata model on this PC by running Strata's setup non-interactively in the "
+        {"name": "strata_install", "title": "Install XeStrata",
+         "description": "Install an XeStrata model on this PC by running XeStrata's setup non-interactively in the "
                         "background (Python packages, the engine, a 58-111 GB model download, preparation, start "
                         "script). Without confirm=true it only returns the plan (what would be downloaded, disk "
                         "space): show it to the user and call again with confirm=true once they agree. Returns at "
@@ -990,8 +990,8 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
              "cancel": {"type": "boolean", "description": "true = stop the install in progress"}}},
          "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True,
                          "openWorldHint": True}},
-        {"name": "strata_start", "title": "Start Strata",
-         "description": "Start an installed Strata model in the background (as its start script does, without "
+        {"name": "strata_start", "title": "Start XeStrata",
+         "description": "Start an installed XeStrata model in the background (as its start script does, without "
                         "opening a browser) and wait until it answers. Loading takes 1-3 minutes and the PC can be "
                         "slow meanwhile; if it is not ready within wait_seconds this returns 'loading' - check again "
                         "with strata_status. The model keeps running until strata_stop.",
@@ -1004,9 +1004,9 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
                                              "a tool call after 60 s)"}}},
          "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True,
                          "openWorldHint": False}},
-        {"name": "strata_stop", "title": "Stop Strata",
-         "description": "Stop the Strata model: the engine is unloaded through the server's own API (it frees its "
-                        "VRAM and RAM itself), then the server this tool started is ended. A Strata started "
+        {"name": "strata_stop", "title": "Stop XeStrata",
+         "description": "Stop the XeStrata model: the engine is unloaded through the server's own API (it frees its "
+                        "VRAM and RAM itself), then the server this tool started is ended. An XeStrata started "
                         "elsewhere (e.g. its own window) is only unloaded - close its window to end it. Refuses while "
                         "a request is running unless force=true.",
          "inputSchema": {"type": "object", "additionalProperties": False, "properties": {
@@ -1014,8 +1014,8 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
              "force": {"type": "boolean", "description": "stop even while a request is running"}}},
          "annotations": {"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True,
                          "openWorldHint": False}},
-        {"name": "strata_logs", "title": "Strata logs",
-         "description": "The last lines of a Strata log: 'server' (the model server this tool started: loading, "
+        {"name": "strata_logs", "title": "XeStrata logs",
+         "description": "The last lines of an XeStrata log: 'server' (the model server this tool started: loading, "
                         "requests, errors), 'engine' (the engine's own log for a model), 'setup' (the install). "
                         "Default: the setup log while an install runs, else the server log. Read-only.",
          "inputSchema": {"type": "object", "additionalProperties": False, "properties": {
@@ -1023,16 +1023,16 @@ def tool_defs(models: dict, families: dict, contexts: list) -> list:
              "model": installed_model,
              "lines": {"type": "integer", "minimum": 1, "maximum": 500, "description": "default 80"}}},
          "annotations": ro},
-        {"name": "strata_benchmark", "title": "Strata speed test",
-         "description": "A short fixed request (greedy, thinking off) through the running Strata server; reports "
+        {"name": "strata_benchmark", "title": "XeStrata speed test",
+         "description": "A short fixed request (greedy, thinking off) through the running XeStrata server; reports "
                         "the output speed (tokens/s) and prompt speed. Takes 10-60 s. Refuses while the model is "
                         "busy.",
          "inputSchema": {"type": "object", "additionalProperties": False, "properties": {
              "port": port,
              "max_tokens": {"type": "integer", "minimum": 16, "maximum": 512, "description": "default 200"}}},
          "annotations": {"readOnlyHint": True, "destructiveHint": False, "openWorldHint": False}},
-        {"name": "strata_connect_info", "title": "Connect to Strata",
-         "description": "How to point other apps at the local Strata server: the OpenAI and Anthropic base URLs, "
+        {"name": "strata_connect_info", "title": "Connect to XeStrata",
+         "description": "How to point other apps at the local XeStrata server: the OpenAI and Anthropic base URLs, "
                         "the model id, whether an API key is needed, and ready-to-paste settings for Claude Code, "
                         "Codex CLI, the OpenAI SDK, curl, Cursor/Continue/Open WebUI. Read-only.",
          "inputSchema": {"type": "object", "additionalProperties": False, "properties": {"port": port}},
@@ -1085,13 +1085,13 @@ class Tools:
             out["ports_used_by_other_programs"] = others
         if running:
             r = running[0]
-            summary = (f"Strata is running on port {r['port']}: {r.get('model')}"
+            summary = (f"XeStrata is running on port {r['port']}: {r.get('model')}"
                        + (", busy" if r.get("busy") else ", idle")
                        + ("" if r.get("loaded", True) else " (model unloaded; the next request loads it)"))
         elif "loading" in out:
-            summary = f"Strata is loading {out['loading']['model']} (port {out['loading']['port']})"
+            summary = f"XeStrata is loading {out['loading']['model']} (port {out['loading']['port']})"
         else:
-            summary = "Strata is not running"
+            summary = "XeStrata is not running"
         inst = s.installed()
         job = s.install_job()
         if job:
@@ -1188,7 +1188,7 @@ class Tools:
             plan, args = self.install_plan(family, model, context, vision, kv, gpu, port, data_dir)
             tracked = s.tracked_server()
             if tracked and not tracked.get("ended"):
-                raise ToolError("Strata is running (started by strata_start): stop it first with strata_stop - setup "
+                raise ToolError("XeStrata is running (started by strata_start): stop it first with strata_stop - setup "
                                 "may update the engine files it uses")
             if not confirm:
                 return {"summary": f"Plan: install {plan['title']} ({plan['download_gb']:.0f} GB download"
@@ -1203,7 +1203,7 @@ class Tools:
         s = self.s
         models, families, contexts, _src = s.tables()
         if sys.version_info < (3, 10):
-            raise ToolError("this Python is too old: Strata's setup needs Python 3.10+; run ./setup.sh once instead "
+            raise ToolError("this Python is too old: XeStrata's setup needs Python 3.10+; run ./setup.sh once instead "
                             "(it installs Python)")
         hw = s.hardware()
         rec = s.recommend(hw)
@@ -1283,7 +1283,7 @@ class Tools:
         job_id = f"{int(time.time())}-{os.getpid()}"
         log_path = s.state_dir / "setup.log"
         with open(log_path, "a", encoding="utf-8") as f:
-            f.write(f"\n===== strata-mcp: install {plan['title']} at {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+            f.write(f"\n===== xestrata-mcp: install {plan['title']} at {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
         spec = {"job": job_id, "root": str(s.root), "python": s.run_python(), "base_python": sys.executable,
                 "create_venv": s.python_override is None and not s.venv_python().exists(),
                 "args": args, "result": str(s.state_dir / "install-result.json")}
@@ -1323,29 +1323,29 @@ class Tools:
             tracked = s.tracked_server()
             if tracked and not tracked.get("ended"):
                 info = s.probe(tracked["port"])
-                return {"summary": f"Strata is already {'running' if info else 'loading'} ({tracked.get('model')}, "
+                return {"summary": f"XeStrata is already {'running' if info else 'loading'} ({tracked.get('model')}, "
                                    f"port {tracked['port']}, started by this MCP server)"
                                    + ("" if tracked.get("model") == desc["model"] else
                                       ": stop it first (strata_stop) to start another model"),
                         "server": info}
             info = s.probe(port, deep=False)
             if info and not info.get("other"):
-                return {"summary": f"a Strata server already runs on port {port} ({info.get('model')}), started "
+                return {"summary": f"an XeStrata server already runs on port {port} ({info.get('model')}), started "
                                    "outside this MCP server; stop it (close its window) or use another port",
                         "server": info}
             if info or not port_free(port):
                 raise ToolError(f"port {port} is used by another program; choose another port (port=...)")
             py = s.run_python()
             if not Path(py).exists():
-                raise ToolError("Strata's Python environment (.venv) is missing: run the install again")
-            cmd = [py, str(s.root / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
+                raise ToolError("XeStrata's Python environment (.venv) is missing: run the install again")
+            cmd = [py, str(s.root / "serve" / "server.py"), "--engine", "xestrata", "--config", str(cfg_path),
                    "--port", str(port)]
             if gpu is not None:
                 cmd += ["--gpu", str(gpu)]
             log_path = s.state_dir / "server.log"
             s.state_dir.mkdir(parents=True, exist_ok=True)
             with open(log_path, "a", encoding="utf-8") as f:
-                f.write(f"\n===== strata-mcp: start {desc['model']} on port {port} at "
+                f.write(f"\n===== xestrata-mcp: start {desc['model']} on port {port} at "
                         f"{time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
             env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
             try:
@@ -1369,15 +1369,15 @@ class Tools:
                 tail = read_tail(log_path, 15)
                 end_group_leftovers(p.pid)
                 s.save_state("server", None)
-                raise ToolError(f"Strata stopped while starting (exit code {p.poll()}). Its last output:\n"
+                raise ToolError(f"XeStrata stopped while starting (exit code {p.poll()}). Its last output:\n"
                                 + "\n".join(tail))
             info = s.probe(port)
             if info and not info.get("other"):
-                return {"summary": f"Strata is running: {info.get('model')} on http://127.0.0.1:{port}/v1 "
+                return {"summary": f"XeStrata is running: {info.get('model')} on http://127.0.0.1:{port}/v1 "
                                    "(OpenAI and Anthropic APIs; chat page at http://127.0.0.1:" + str(port) + "/)",
                         "server": {**info, "pid": p.pid}}
             if time.time() >= end:
-                return {"summary": f"Strata is loading {desc['model']} (this takes 1-3 minutes; the PC may be slow "
+                return {"summary": f"XeStrata is loading {desc['model']} (this takes 1-3 minutes; the PC may be slow "
                                    "meanwhile). Check with strata_status in a minute.",
                         "loading": {"pid": p.pid, "port": port,
                                     "last_log_line": (read_tail(log_path, 1) or [""])[-1] or None}}
@@ -1396,12 +1396,12 @@ class Tools:
                 key = s.api_key_for(port)
                 st, body = http_json(f"http://127.0.0.1:{port}/status", api_key=key, timeout=3)
                 if st == 200 and isinstance(body, dict) and body.get("busy") and not force:
-                    raise ToolError("a request is running on Strata right now; wait for it, or call strata_stop "
+                    raise ToolError("a request is running on XeStrata right now; wait for it, or call strata_stop "
                                     "with force=true to stop anyway")
                 st, body = http_json(f"http://127.0.0.1:{port}/unload", "POST", api_key=key, timeout=120)
                 unloaded = (body or {}).get("status") if isinstance(body, dict) else None
                 if st == 409 and not force:
-                    raise ToolError("Strata is busy (a request is running or queued); call again with force=true "
+                    raise ToolError("XeStrata is busy (a request is running or queued); call again with force=true "
                                     "to stop anyway")
                 proc_terminate(tracked["pid"], tracked["ident"])   # POSIX: SIGTERM = the server's own Ctrl+C path
                 clean = wait_gone(tracked["pid"], tracked["ident"], 30)
@@ -1413,7 +1413,8 @@ class Tools:
                 if gone:
                     end_group_leftovers(tracked["pid"])
                     s.save_state("server", None)
-                return {"summary": "Strata stopped" + ("" if gone else " - but its process still runs; see strata_logs")
+                return {"summary": "XeStrata stopped" + ("" if gone else
+                                                         " - but its process still runs; see strata_logs")
                                    + (" (the engine unloaded itself first)" if unloaded == "unloaded" else ""),
                         "model": tracked.get("model"), "port": port, "engine_unloaded": unloaded,
                         "ended_cleanly": clean}
@@ -1424,16 +1425,16 @@ class Tools:
                     st, body = http_json(f"http://127.0.0.1:{p}/unload", "POST", api_key=key, timeout=120)
                     r = body.get("status") if isinstance(body, dict) else None
                     if st == 409:
-                        raise ToolError("Strata is busy (a request is running); try again when it is done")
+                        raise ToolError("XeStrata is busy (a request is running); try again when it is done")
                     if st == 401:
-                        raise ToolError("Strata (started outside this MCP server) wants an API key this folder's "
+                        raise ToolError("XeStrata (started outside this MCP server) wants an API key this folder's "
                                         "configs do not have; close its window to stop it")
-                    return {"summary": f"Strata on port {p} was started outside this MCP server (its own window or a "
+                    return {"summary": f"XeStrata on port {p} was started outside this MCP server (its own window or a "
                                        f"service), so only its model was unloaded ({r}): its VRAM and RAM are free, "
                                        "but the server still listens and loads the model again on the next request. "
                                        "Close its window to end it completely.",
                             "port": p, "engine_unloaded": r}
-            return {"summary": "Strata is not running"}
+            return {"summary": "XeStrata is not running"}
 
     # ---- strata_logs
     def strata_logs(self, source=None, model=None, lines=80) -> dict:
@@ -1452,7 +1453,7 @@ class Tools:
                 raise ToolError(f"{cfg.name} names no engine log")
             path = Path(raw)
             if not s.allowed(path):
-                raise ToolError(f"{cfg.name}'s log {raw} is outside the Strata folder and its data folder: not shown")
+                raise ToolError(f"{cfg.name}'s log {raw} is outside the XeStrata folder and its data folder: not shown")
         if not path.exists():
             return {"summary": f"no {source} log yet ({path})", "log": str(path), "lines": []}
         tail = read_tail(path, lines)
@@ -1468,13 +1469,13 @@ class Tools:
                 target = info
                 break
         if target is None:
-            raise ToolError("Strata is not running: start it first (strata_start)")
+            raise ToolError("XeStrata is not running: start it first (strata_start)")
         p = target["port"]
         key = s.api_key_for(p)
         st, stat = http_json(f"http://127.0.0.1:{p}/status", api_key=key, timeout=3)
         if st == 200 and isinstance(stat, dict) and (stat.get("busy") or stat.get("queued")):
-            raise ToolError("Strata is busy with a request; run the speed test when it is idle")
-        body = {"model": target.get("model") or "strata", "max_tokens": max_tokens, "temperature": 0,
+            raise ToolError("XeStrata is busy with a request; run the speed test when it is idle")
+        body = {"model": target.get("model") or "xestrata", "max_tokens": max_tokens, "temperature": 0,
                 "reasoning_effort": "none", "stream": False,
                 "messages": [{"role": "user", "content": BENCH_PROMPT}]}
         t0 = time.time()
@@ -1511,14 +1512,14 @@ class Tools:
         if port is None:
             cfgs = s.configs()
             port = target["port"] if target else (s.describe_config(cfgs[0])["port"] if cfgs else DEFAULT_PORT)
-        model = (target or {}).get("model") or "strata"
+        model = (target or {}).get("model") or "xestrata"
         key_needed = (target or {}).get("api_key_required")
         if key_needed is None:
             key_needed = any(s.describe_config(c)["api_key_set"] for c in s.configs())
         key = "<your api_key from xestrata-<model>.json>" if key_needed else "none"
         base = f"http://127.0.0.1:{port}"
         return {
-            "summary": (f"Strata {'runs' if target else 'will run'} at {base}: OpenAI base URL {base}/v1, Anthropic "
+            "summary": (f"XeStrata {'runs' if target else 'will run'} at {base}: OpenAI base URL {base}/v1, Anthropic "
                         f"base URL {base}" + (" (an API key is required)" if key_needed else " (any API key works)")),
             "running": bool(target), "openai_base_url": f"{base}/v1", "anthropic_base_url": base,
             "anthropic_messages_endpoint": f"{base}/v1/messages", "chat_page": base + "/", "model": model,
@@ -1527,10 +1528,10 @@ class Tools:
             "examples": {
                 "claude_code": {"env": {"ANTHROPIC_BASE_URL": base, "ANTHROPIC_AUTH_TOKEN": key,
                                         "ANTHROPIC_MODEL": "claude-sonnet-4-5"},
-                                "note": "Claude Code needs a Claude model name it knows; Strata ignores the name"},
+                                "note": "Claude Code needs a Claude model name it knows; XeStrata ignores the name"},
                 "codex_cli": {"file": "~/.codex/config.toml",
-                              "toml": f'model = "{model}"\nmodel_provider = "strata"\n\n[model_providers.strata]\n'
-                                      f'name = "Strata"\nbase_url = "{base}/v1"\nwire_api = "chat"'},
+                              "toml": f'model = "{model}"\nmodel_provider = "xestrata"\n\n[model_providers.xestrata]\n'
+                                      f'name = "XeStrata"\nbase_url = "{base}/v1"\nwire_api = "chat"'},
                 "openai_python": (f'from openai import OpenAI\nclient = OpenAI(base_url="{base}/v1", api_key="{key}")\n'
                                   f'r = client.chat.completions.create(model="{model}", messages=[{{"role": "user", '
                                   f'"content": "Hello!"}}])\nprint(r.choices[0].message.content)'),
@@ -1547,8 +1548,8 @@ class Tools:
 
 
 # ------------------------------------------------------------------------------------------------ MCP over stdio
-INSTRUCTIONS = ("Strata runs a large AI model (Qwen3.8-Flash-Next, a mixture of experts) locally on this PC's GPU and "
-                "RAM, with an OpenAI- and Anthropic-compatible server on http://127.0.0.1:8095. Call strata_status "
+INSTRUCTIONS = ("XeStrata runs a large AI model (Qwen3.8-Flash-Next, a mixture of experts) locally on this PC's GPU "
+                "and RAM, with an OpenAI- and Anthropic-compatible server on http://127.0.0.1:8095. Call strata_status "
                 "first. To install: strata_install (it returns a plan; get the user's OK for the 58-111 GB download, "
                 "then call it with confirm=true; it runs in the background - call it again for progress). Then "
                 "strata_start, strata_stop, strata_logs for problems, strata_connect_info to point other apps at it.")
@@ -1681,10 +1682,10 @@ def install_job(spec_path: str) -> int:
         if spec.get("create_venv"):
             venv = root / ".venv"
             if py.exists() and subprocess.run([str(py), "-m", "pip", "--version"], capture_output=True).returncode:
-                print("strata-mcp: .venv has no pip (an earlier run stopped half-way): making it again", flush=True)
+                print("xestrata-mcp: .venv has no pip (an earlier run stopped half-way): making it again", flush=True)
                 shutil.rmtree(venv, ignore_errors=True)
             if not py.exists():
-                print(f"strata-mcp: creating Strata's Python environment in {venv} ...", flush=True)
+                print(f"xestrata-mcp: creating XeStrata's Python environment in {venv} ...", flush=True)
                 r = subprocess.run([spec["base_python"], "-m", "venv", str(venv)])
                 if r.returncode or not py.exists():
                     print("\n  [X]  could not create the Python environment (.venv)", flush=True)
@@ -1693,23 +1694,23 @@ def install_job(spec_path: str) -> int:
                     record(exit_code=1, ended=time.strftime("%Y-%m-%d %H:%M:%S"))
                     return 1
         cmd = [str(py), str(root / "setup.py"), *spec["args"]]
-        print("strata-mcp: running " + " ".join(cmd), flush=True)
+        print("xestrata-mcp: running " + " ".join(cmd), flush=True)
         env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
         p = subprocess.Popen(cmd, cwd=str(root), stdin=subprocess.DEVNULL, env=env)
         record(child_pid=p.pid, child_ident=proc_identity(p.pid))
         rc = p.wait()
     except Exception as e:                              # noqa: BLE001
-        print(f"\n  [X]  strata-mcp could not run setup: {e}", flush=True)
+        print(f"\n  [X]  xestrata-mcp could not run setup: {e}", flush=True)
         rc = 1
-    print(f"strata-mcp: setup ended with exit code {rc}", flush=True)
+    print(f"xestrata-mcp: setup ended with exit code {rc}", flush=True)
     record(exit_code=rc, ended=time.strftime("%Y-%m-%d %H:%M:%S"))
     return rc
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Strata's MCP server (stdio): install, start, check and stop Strata "
+    ap = argparse.ArgumentParser(description="XeStrata's MCP server (stdio): install, start, check and stop XeStrata "
                                              "from an AI assistant. See docs/DETAILS.md.")
-    ap.add_argument("--root", help="the Strata folder (default: the one this file is in)")
+    ap.add_argument("--root", help="the XeStrata folder (default: the one this file is in)")
     ap.add_argument("--install-job", help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
     if a.install_job:
@@ -1719,12 +1720,12 @@ def main(argv=None) -> int:
         return 2
     root = Path(a.root).expanduser().resolve() if a.root else DEFAULT_ROOT
     if not (root / "setup.py").is_file() or not (root / "serve" / "server.py").is_file():
-        log(f"{root} is not a Strata folder (no setup.py / serve/server.py)")
+        log(f"{root} is not an XeStrata folder (no setup.py / serve/server.py)")
         return 2
     out = sys.stdout.buffer
     sys.stdout = sys.stderr                             # stray prints must never corrupt the protocol stream
     server = McpServer(Strata(root), out)
-    log(f"ready (Strata folder {root})")
+    log(f"ready (XeStrata folder {root})")
     try:
         server.serve(sys.stdin.buffer)
     except KeyboardInterrupt:

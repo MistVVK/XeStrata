@@ -187,7 +187,7 @@ std::filesystem::path write_model(std::vector<float>& head) {
         b.insert(b.end(), t.data.begin(), t.data.end());
         b.resize((b.size() + 31) / 32 * 32, 0);
     }
-    const auto path = std::filesystem::temp_directory_path() / "strata_moss_text_parity.gguf";
+    const auto path = std::filesystem::temp_directory_path() / "xestrata_moss_text_parity.gguf";
     std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(b.data()), (std::streamsize) b.size());
     return path;
 }
@@ -196,9 +196,9 @@ std::filesystem::path write_model(std::vector<float>& head) {
 
 int main() {
 #if defined(_WIN32)
-    _putenv_s("STRATA_PLAIN_DENSE_MMQ", "0");
+    _putenv_s("XESTRATA_PLAIN_DENSE_MMQ", "0");
 #else
-    setenv("STRATA_PLAIN_DENSE_MMQ", "0", 1);
+    setenv("XESTRATA_PLAIN_DENSE_MMQ", "0", 1);
 #endif
     std::vector<float> head;
     const std::filesystem::path path = write_model(head);

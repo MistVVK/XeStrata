@@ -94,7 +94,7 @@ int main(int argc, char** argv) {
         std::printf("text encoder: %.2f GB of layers, %d resident, %zu tokens in %.3f s\n",
                     (double) te.layer_bytes() / 1e9, te.resident_layers(), ids.size(), secs);
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "strata-image-text-probe: %s\n", e.what());
+        std::fprintf(stderr, "xestrata-image-text-probe: %s\n", e.what());
         return 1;
     }
     return 0;

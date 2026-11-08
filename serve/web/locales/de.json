@@ -92,7 +92,7 @@
   "about.kept": "Chats, Einstellungen und der Schlüssel bleiben nur in diesem Browser.",
   "about.github": "XeStrata auf GitHub",
   "about.cfgTitle": "Modelleinstellungen",
-  "about.cfgNote": "In der Startkonfiguration des Modells für alle Clients gespeichert. Ein leeres Feld ist der Standard. Sie gelten ab dem nächsten Start des Modells (Strata-Fenster schließen und neu starten).",
+  "about.cfgNote": "In der Startkonfiguration des Modells für alle Clients gespeichert. Ein leeres Feld ist der Standard. Sie gelten ab dem nächsten Start des Modells (XeStrata-Fenster schließen und neu starten).",
   "branch.back": "Zurück dorthin",
   "branch.from": "Abgezweigt von „{title}“",
   "branch.open": "Das Original öffnen",

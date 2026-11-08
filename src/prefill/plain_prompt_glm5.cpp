@@ -27,6 +27,7 @@
 #include "strata/prefill/kernels.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/platform/env.hpp"
 #include "plain_prompt.hpp"
 
 #include <algorithm>
@@ -68,7 +69,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
     // x [T][n_in] (ldx a row) through the weight into y [T][n_out] (ldy a row): int8 where the weight's type and shape
     // are the int8 products', else from an FP16 copy of x (contiguous rows)
     static const bool dense_env = [] {   // STRATA_PLAIN_DENSE_MMQ=0: every dense product from FP16
-        const char* v = std::getenv("STRATA_PLAIN_DENSE_MMQ");
+        const char* v = strata::env_get("PLAIN_DENSE_MMQ");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     const bool dense_on = dense_env && prefill::mmq::chosen();
@@ -92,12 +93,12 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
     };
     // the routed experts' CPU share, as the Qwen-family chunks take it (plain_prompt.cpp)
     static const bool cpu_env = [] {
-        const char* v = std::getenv("STRATA_PLAIN_CPU_SHARE");
+        const char* v = strata::env_get("PLAIN_CPU_SHARE");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     const bool cpu_share = cpu_env && strata::prefill::cpu_share_setting() != 0.0 && split_.c > 0.0 && split_.p > 0.0 &&
                            P.cpu_cap > 0;
-    static const bool profile = std::getenv("STRATA_PROMPT_PROFILE") != nullptr;
+    static const bool profile = strata::env_get("PROMPT_PROFILE") != nullptr;
     // 0 KDA (its parts 5 projections, 6 convolutions and gates, 7 recurrence, 8 output), 1 DSA, 2 the grouping, 3 the
     // experts, 4 the shared expert, mHC and dense FFN
     double stage_ms[12] = {};   // 9 the chunk's staging, 10 the head, 11 what is left at the end
@@ -345,7 +346,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
     if (c_end < n) return true;   // a layer split's chunk: the stage's part of the prompt goes on with the next
     windows_ += (n + opt_.max_t - 1) / opt_.max_t;
     if (profile)
-        std::fprintf(stderr, "strata plain: GLM prompt of %lld tokens: KDA %.1f ms (projections %.1f, convolutions and "
+        std::fprintf(stderr, "xestrata plain: GLM prompt of %lld tokens: KDA %.1f ms (projections %.1f, convolutions and "
                              "gates %.1f, recurrence %.1f, output %.1f), DSA %.1f, grouping %.1f, experts %.1f, shared and "
                              "dense FFN %.1f, staging %.1f, head %.1f, the rest %.1f; experts not in VRAM %lld, on the CPU %lld "
                              "(%lld rows)\n",

@@ -8,6 +8,7 @@
 // (rel 1.461e-06 against the ggml formula) and the three performance findings recorded in
 // include/strata/kernels/cpu/expert.hpp.  Read that header first; it says why each piece is shaped this way.
 #include "strata/kernels/cpu/expert.hpp"
+#include "strata/platform/env.hpp"
 
 #include <immintrin.h>
 #if defined(_MSC_VER)
@@ -152,7 +153,7 @@ inline float hsum_ps(__m256 v) {
 // products built for eight blocks at a time; the weight-independent correction is one FMA per eight blocks.
 // The sum order differs from the 256-bit kernel (last-bit differences); the verify window and plain decode both
 // use this kernel, so speculative decode still reproduces plain decode exactly.
-static const bool kZmm = std::getenv("STRATA_CPU_YMM") == nullptr;
+static const bool kZmm = strata::env_get("CPU_YMM") == nullptr;
 
 inline __m512i unpack64_q2_0(const uint8_t* codes) {
     const __m128i packed = _mm_loadu_si128((const __m128i*) codes);          // 8 u16 = 64 codes

@@ -92,7 +92,7 @@
   "about.kept": "채팅, 설정, 키는 이 브라우저에만 저장됩니다.",
   "about.github": "GitHub의 XeStrata",
   "about.cfgTitle": "모델 설정",
-  "about.cfgNote": "모든 클라이언트에 적용되도록 모델의 실행 설정에 저장합니다. 빈 칸은 기본값입니다. 다음에 모델을 시작할 때 적용됩니다(Strata 창을 닫고 다시 시작하세요).",
+  "about.cfgNote": "모든 클라이언트에 적용되도록 모델의 실행 설정에 저장합니다. 빈 칸은 기본값입니다. 다음에 모델을 시작할 때 적용됩니다(XeStrata 창을 닫고 다시 시작하세요).",
   "branch.back": "원래 채팅으로",
   "branch.from": "“{title}”에서 분기됨",
   "branch.open": "원본 열기",

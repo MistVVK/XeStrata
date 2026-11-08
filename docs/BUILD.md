@@ -102,19 +102,19 @@ Without them it takes the path that uses another shape the GPU reports (the Arc 
 and without that the DP4a path, and says once which.
 The Arc A series takes `mma_gemm` because its SYCL runtime refuses the Intel extensions the XMX kernels use (joint_matrix's prefetches and checked loads and stores).
 On the A380 it ran 17–38% faster than DP4a, and closer to FP64 (relative error 0.0001% against 0.53%).
-`STRATA_NO_XMX=1` takes the DP4a path even when the GPU has matrix engines.
-`STRATA_MMA=1` takes `mma_gemm` even where XMX is there, if the GPU reports a shape it carries (Xe2's 8 x 16 x 16 and others; to check that path).
-`STRATA_NO_BF16_MMA=1` drops the BF16 matrix combinations from what the GPU reports, `STRATA_NO_INT8_MMA=1` the int8 ones (`src/kernels/xe/matrix_report.cpp`),
+`XESTRATA_NO_XMX=1` takes the DP4a path even when the GPU has matrix engines.
+`XESTRATA_MMA=1` takes `mma_gemm` even where XMX is there, if the GPU reports a shape it carries (Xe2's 8 x 16 x 16 and others; to check that path).
+`XESTRATA_NO_BF16_MMA=1` drops the BF16 matrix combinations from what the GPU reports, `XESTRATA_NO_INT8_MMA=1` the int8 ones (`src/kernels/xe/matrix_report.cpp`),
 to imitate a GPU whose matrix engines lack the type (NVIDIA's before sm_80 have no BF16, before sm_72 no int8) on one that has it.
-With `STRATA_NO_BF16_MMA=1` the contrib-llvm mode does not hand the BF16 products to oneMath either; with FP16 matrix engines they take the path through FP16 below.
-`STRATA_NO_BLAS=1` computes the dense matrix products with the own kernels in the contrib-llvm mode too (to compare).
+With `XESTRATA_NO_BF16_MMA=1` the contrib-llvm mode does not hand the BF16 products to oneMath either; with FP16 matrix engines they take the path through FP16 below.
+`XESTRATA_NO_BLAS=1` computes the dense matrix products with the own kernels in the contrib-llvm mode too (to compare).
 On the RTX 4070 CTest gave the same results under each of them, and the top token of all 16 positions agreed.
 Where oneMath fails a BF16 product on the GPU (a small one is tried at start), the BF16 products alone take the own kernels.
 On a GPU whose matrix engines take FP16 and not BF16 (NVIDIA's before sm_80, Volta and Turing), the prefill path's BF16 products convert both operands to FP16 and run as FP16 products (`src/prefill/gemm.cpp`, upstream f2fb7c1 and ff6f9f1).
 On such a GPU cuBLAS computes BF16 products without the tensor cores, and the own kernels fall to DP4a.
 The conversion is exact within FP16's normal range; finite values past it saturate at ±65504. An accumulating product and one of a single output row stay BF16.
-With sm_70 code on the RTX 4070 and `STRATA_NO_BF16_MMA=1` to imitate it, the relative error against FP64 was 2e-6 or less, 2.5–3.2 times as fast as the DP4a path (0.7%).
-`STRATA_BF16_TC=0` turns it off.
+With sm_70 code on the RTX 4070 and `XESTRATA_NO_BF16_MMA=1` to imitate it, the relative error against FP64 was 2e-6 or less, 2.5–3.2 times as fast as the DP4a path (0.7%).
+`XESTRATA_BF16_TC=0` turns it off.
 `tools/xmx_probe.cpp` asks every GPU, without building the engine, whether it reports FP16 and BF16 matrix engines in the XMX kernels' shape or in `mma_gemm`'s Intel one (8 x 8 x 16).
 
 Where the GPU reports the int8 combination 16 x 16 x 16 on 32 lanes (NVIDIA's tensor cores), the prefill path's expert products run on the int8 matrix engines (`src/kernels/xe/iq_mmq.cpp`, llama.cpp's MMQ written anew on joint_matrix).
@@ -127,23 +127,23 @@ It takes FP16, INT8 and K8V4 KV; Q4_0 keeps the FP32 kernel (the range of upstre
 INT8's and Q4_0's codes are exact in FP16 and go to the matrix engines as they are, with the scales applied in FP32.
 With sm_70 code on the RTX 4070, `qsa_prompt_attn_parity` was off FP64 by at most 3 times the FP32 kernel's error, and a chunk of 2,048 queries over 32K cells ran 1.6 times as fast at INT8 and 1.5 times at FP16 and K8V4.
 Intel GPUs do not report that shape and keep the XMX FP16 path.
-Qwen3.8's prefill takes the faster of the int8 and the FP16 expert products for each layer of a chunk, by the rows its experts average. Where one stops beating the other is measured at the start on each GPU, both timed at 16 to 256 rows an expert in the shape of the model's first layer, and logged (181 rows on the B70; int8 at every count on the RTX 4070). `STRATA_PREFILL_MMQ=0` takes the FP16 path, `1` the int8 products.
+Qwen3.8's prefill takes the faster of the int8 and the FP16 expert products for each layer of a chunk, by the rows its experts average. Where one stops beating the other is measured at the start on each GPU, both timed at 16 to 256 rows an expert in the shape of the model's first layer, and logged (181 rows on the B70; int8 at every count on the RTX 4070). `XESTRATA_PREFILL_MMQ=0` takes the FP16 path, `1` the int8 products.
 
 Pascal (sm_60, sm_61: P100, P40, the GTX 10 series) gets code too, from a CUDA 12 toolkit.
 It has no tensor cores, so no matrix-engine path is chosen and it runs on the DP4a and FP32 paths.
 sm_60 has no dp4a instruction, so that one product is computed a byte at a time there, to the same integer (`src/kernels/xe/cuda_intrinsics.hpp`, upstream e200e08f).
 The kernels for the tensor cores compile an empty body in code for an architecture before sm_70 and are never launched on such a GPU.
-Built with sm_60 code only and run on the RTX 4070 (the driver compiles the PTX), CTest passed its 59 tests, and with the matrix engines left out (`STRATA_NO_XMX=1`)
+Built with sm_60 code only and run on the RTX 4070 (the driver compiles the PTX), CTest passed its 59 tests, and with the matrix engines left out (`XESTRATA_NO_XMX=1`)
 IQ2_XS gave the same answers as sm_89 code on all 8 questions (the expert cache size pinned; decode 3-5% slower).
-On a GPU of compute capability 6.0 (GP100: the P100), `STRATA_DOWN_WS=1` copies the routed experts' IQ4_NL and Q2_0 down weight rows into the work-group's local memory before their products (upstream 6a6d58ad0, opt-in; the output is bitwise the same, and other GPUs ignore it).
+On a GPU of compute capability 6.0 (GP100: the P100), `XESTRATA_DOWN_WS=1` copies the routed experts' IQ4_NL and Q2_0 down weight rows into the work-group's local memory before their products (upstream 6a6d58ad0, opt-in; the output is bitwise the same, and other GPUs ignore it).
 Maxwell and older (compute capability below 6.0) do not run it: the SYCL runtime reports no FP16 for an NVIDIA GPU below 5.3, and the engine takes no GPU without FP16 (`xestrata --setup` says so).
 
-On Volta (sm_70), `STRATA_SM70_TABLE=1` takes two decode kernels upstream measured on a V100 (opt-in until confirmed, as in upstream's c85b7c87).
+On Volta (sm_70), `XESTRATA_SM70_TABLE=1` takes two decode kernels upstream measured on a V100 (opt-in until confirmed, as in upstream's c85b7c87).
 One is the routed experts' "mode 8": gate/up, SwiGLU and the q8_1 quantization in one pass, with the codebook grid and the activations in the work-group's local memory (`src/kernels/xe/iq_kernels.cpp`, upstream f6330507: 227 -> 159 µs on a V100).
 The other is the hyper-connection read's norm and up projection, with the weights loaded ahead to hide the latency (`src/kernels/xe/fused_gr.cpp`, upstream aaa323fe: 50.9 -> 46.7 µs a read on a V100).
 Both give the default kernels' output bit for bit.
-The read's norm and up are the default on every GPU (Qwen3.8-Flash-Next's decode on the RTX 4070 23.75 -> 24.8 tok/s, the B70 and the RX 9060 XT equal). `STRATA_GR_FAST=0` keeps the former kernels.
-Mode 8 is the default on every GPU whose local memory holds it (B70 decode +0.8-1.1% at 1K and 32K, RTX 4070 equal; the idea of upstream f7eaf2de's STRATA_EXPDEC). `STRATA_EXP_MODE=0` keeps the former kernels.
+The read's norm and up are the default on every GPU (Qwen3.8-Flash-Next's decode on the RTX 4070 23.75 -> 24.8 tok/s, the B70 and the RX 9060 XT equal). `XESTRATA_GR_FAST=0` keeps the former kernels.
+Mode 8 is the default on every GPU whose local memory holds it (B70 decode +0.8-1.1% at 1K and 32K, RTX 4070 equal; the idea of upstream f7eaf2de's STRATA_EXPDEC). `XESTRATA_EXP_MODE=0` keeps the former kernels.
 Built with sm_70 code only and run on an RTX 3070, CTest passed its 71 tests with and without them, and the experts' and the read's outputs were the default's bit for bit (on an RX 9060 XT as well).
 
 ### The engine's parts and tests
@@ -158,7 +158,7 @@ cmake -S . -B build/free \
   -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_NATIVE_EXPERTS=OFF \
   -DSTRATA_BUILD_TESTS=ON
-cmake --build build/free --target strata-device strata-load elementwise_parity \
+cmake --build build/free --target xestrata-device xestrata-load elementwise_parity \
   gguf_reader_test suffix_drafter_test controller_test draft_policy_test conv_cache_test \
   platform_memory_test ple_reader_test -j4
 ```
@@ -176,7 +176,7 @@ cmake --build build/free --target strata-device strata-load elementwise_parity \
 
 ### The engine
 
-The engine (the `strata` executable) uses llama.cpp for the native i-quant experts.
+The engine (the `xestrata-engine` executable) uses llama.cpp for the native i-quant experts.
 llama.cpp goes in `third_party/main/llama.cpp` at the pinned commit (`3cf03257f219afbe7334045ff7c6a06ac68c627d`).
 setup.py fetches it; the image encoder also uses its `tools/mtmd`.
 
@@ -195,7 +195,7 @@ cmake -S . -B build/contrib-llvm -DCMAKE_CXX_COMPILER=$C/bin/clang++ -DCMAKE_C_C
   -DSTRATA_LICENSE=contrib \
   -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR=$PWD/third_party/main/llama.cpp
 cmake --build build/contrib-llvm --target strata -j6
-LD_LIBRARY_PATH=$C/lib build/contrib-llvm/strata-device
+LD_LIBRARY_PATH=$C/lib build/contrib-llvm/xestrata-device
 ```
 
 For another machine, `STRATA_CUDA_ARCHS` lists the GPUs' architectures (`sm_89` for the RTX 40 series, `sm_86` for the RTX 30).
@@ -417,7 +417,7 @@ The Windows 7z is built with the same `tools/package/build.sh`, in a disposable 
 tools/package/build.sh windows cuda12.4      # XeStrata-<version>-windows-x64.7z
 ```
 
-- All of it is cross-built on Linux for Windows: intel/llvm (the Linux contrib toolchain and the SYCL runtime for Windows), the engine (the contrib-llvm mode, the NVIDIA code as the cuda12.4 deb's), the image encoder on the CPU (`strata-vision-cpu.exe`; no Vulkan one, so pictures are read on the CPU), the .NET launchers (`dotnet-sdk-10.0`), and Python's embeddable distribution with the wheels; `tools/package/windows_bundle.py` makes the folder and the 7z.
+- All of it is cross-built on Linux for Windows: intel/llvm (the Linux contrib toolchain and the SYCL runtime for Windows), the engine (the contrib-llvm mode, the NVIDIA code as the cuda12.4 deb's), the image encoder on the CPU (`xestrata-vision-cpu.exe`; no Vulkan one, so pictures are read on the CPU), the .NET launchers (`dotnet-sdk-10.0`), and Python's embeddable distribution with the wheels; `tools/package/windows_bundle.py` makes the folder and the 7z.
 - The MSVC CRT and the Windows SDK come from Microsoft through xwin, its license accepted (they are not free software and do not go into the 7z). Neither do the Windows CUDA headers and import libraries.
 - It uses the Ubuntu 26.04 packages' ccache (`build/pkg-ccache/ubuntu26.04/`) and keeps xwin's and NuGet's downloads in `build/pkg-cache/windows/`.
 - Every exe, DLL and Python package in the 7z must be one of `windows_bundle.py`'s components; a Visual C++ runtime or an NVIDIA library in it stops the build.
@@ -433,7 +433,7 @@ xe0.1.43.1-1 is `0.1.43.1-1` (for rpm, Version 0.1.43.1 and Release 1).
 | What | Where |
 | --- | --- |
 | the `xestrata` command (setup.py), the server, the web app, the tools setup runs, llama.cpp's gguf-py, the data files, a systemd user unit | `/usr/share/xestrata`, `/usr/bin/xestrata`, `/usr/lib/systemd/user/xestrata.service` |
-| the engine (`strata`), the image encoders, intel/llvm's SYCL runtime (`libsycl.so.9`, UR's loader, its Level Zero and HIP (AMD) adapters and in the cuda variants its CUDA adapter, `libumf`), oneMath (its rocBLAS backend, and in the cuda variants its oneMKL and cuBLAS backends) | `<libdir>/xestrata/engine` |
+| the engine (`xestrata-engine`), the image encoders, intel/llvm's SYCL runtime (`libsycl.so.9`, UR's loader, its Level Zero and HIP (AMD) adapters and in the cuda variants its CUDA adapter, `libumf`), oneMath (its rocBLAS backend, and in the cuda variants its oneMKL and cuBLAS backends) | `<libdir>/xestrata/engine` |
 
 - The packages provide and conflict with `xestrata-engine`: one is installed at a time, and installing another replaces it.
 - Neither Ubuntu 26.04 (`dpclang` up to 6) nor Fedora 44 has libsycl 9, so the packages carry it.

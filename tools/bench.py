@@ -39,7 +39,7 @@ ROOT = C.ROOT
 REFS = ROOT / "data" / "bench-ref"
 TIERS = ("64k", "32k", "1k")          # the upstream merges' IQ3_XXS tiers (the longest first), as this config holds
 # --bench-verbose's extra run per tier: the engine's per-stage timings (kept out of the measured runs)
-STATS_ENV = {"STRATA_PREFILL_TIMING": "1", "STRATA_DECODE_TIMING": "1"}
+STATS_ENV = {"XESTRATA_PREFILL_TIMING": "1", "XESTRATA_DECODE_TIMING": "1"}
 GPU_LABEL = "PC"                      # the record's GPU name (the merges name their machines' GPUs)
 
 
@@ -125,7 +125,7 @@ def engine_lines(text: str) -> list[str]:
             if "session is up" in line:
                 out.append(line)
             break
-        if line.startswith(("strata", "INFO ")) or line.startswith(" " * 8):
+        if line.startswith(("xestrata", "strata", "INFO ")) or line.startswith(" " * 8):   # upstream's engine too
             out.append(line.rstrip())
     return out
 
@@ -138,7 +138,8 @@ def busy_engines() -> list[str]:
         if pid == os.getpid() or not words:
             continue
         exe = os.path.basename(words[0])
-        if (exe.startswith("strata") and "--serve" in words) or \
+        engine = exe.startswith(("xestrata", "strata"))   # XeStrata's or upstream's
+        if (engine and "--serve" in words) or \
                 any(w.replace("\\", "/").endswith("serve/server.py") for w in words):
             found.append(f"{pid} {' '.join(words[:3])}")
     return found
@@ -291,7 +292,8 @@ def environment(cfg: dict, gpus: list[dict], data: Path) -> dict:
         os_name = grab(r'^PRETTY_NAME="?([^"\n]*)', read("/etc/os-release", "") or "", str)
         ram = int(grab(r"^MemTotal:\s+(\d+)", read("/proc/meminfo", "") or "", int) or 0) * 1024
     env = {k: v for k, v in {**os.environ, **{str(k): str(v) for k, v in (cfg.get("env") or {}).items()}}.items()
-           if k.startswith(("STRATA_", "ONEAPI_", "SYCL_", "UR_", "ZE_", "CUDA_", "HIP_", "ROCR_", "HSA_"))}
+           if k.startswith(("XESTRATA_", "STRATA_",   # and upstream's names
+                            "ONEAPI_", "SYCL_", "UR_", "ZE_", "CUDA_", "HIP_", "ROCR_", "HSA_"))}
     args = cfg.get("args", [])
     return {
         "xestrata": {k: build.get(k) for k in BUILD_KEYS if k in build},
@@ -316,8 +318,8 @@ def model_files(args: list[str]) -> list[str]:
 
 
 def hw_bench(exe: str, env: dict, cwd: str | None, args: list[str], log: Path) -> dict:
-    """The engine's measurement of this machine (strata --hw-bench): the RAM's read bandwidth with the expert pool's
-    threads and with one, the copies over PCIe each way, the SSD under the model.  `HW key value` lines."""
+    """The engine's measurement of this machine (xestrata-engine --hw-bench): the RAM's read bandwidth with the expert
+    pool's threads and with one, the copies over PCIe each way, the SSD under the model.  `HW key value` lines."""
     cmd = [exe, "--hw-bench", *model_files(args)]
     try:
         r = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=300)
@@ -338,12 +340,13 @@ def hw_bench(exe: str, env: dict, cwd: str | None, args: list[str], log: Path) -
 # the paths the kernels are measured on: the one the engine takes here, then the device without its matrix engines,
 # and without their BF16 combinations (the switches AGENTS.md checks a small card with)
 KERNEL_VARIANTS: tuple[tuple[str, dict[str, str]], ...] = (
-    ("default", {}), ("no-xmx", {"STRATA_NO_XMX": "1"}), ("no-bf16-mma", {"STRATA_NO_BF16_MMA": "1"}))
+    ("default", {}), ("no-xmx", {"XESTRATA_NO_XMX": "1"}), ("no-bf16-mma", {"XESTRATA_NO_BF16_MMA": "1"}))
 
 
 def kernel_bench(exe: str, env: dict, cwd: str | None, pack: str | None, log: Path) -> list[dict]:
-    """The prompt path's products on synthetic data of the model's shapes (strata --kernel-bench, `KB <kernel> <path>
-    <shape> <us>` lines), once on each of KERNEL_VARIANTS; "default" is the path the engine takes on this device."""
+    """The prompt path's products on synthetic data of the model's shapes (xestrata-engine --kernel-bench, `KB <kernel>
+    <path> <shape> <us>` lines), once on each of KERNEL_VARIANTS; "default" is the path the engine takes on this
+    device."""
     rows: list[dict] = []
     with open(log, "w", encoding="utf-8") as f:
         for variant, extra in KERNEL_VARIANTS:
@@ -607,7 +610,7 @@ def run(cfg_path: Path, data: Path, gpus: list[dict], verbose: bool = False, ori
             cfg["split_pci"] = cards[1:]
     busy = busy_engines()
     if busy:
-        raise BenchError("a Strata engine or server is running and would share the GPU with the measurements; stop "
+        raise BenchError("an XeStrata engine or server is running and would share the GPU with the measurements; stop "
                          "it first (" + "; ".join(busy[:3]) + ")")
     out = data / "records" / f"bench-{time.strftime('%Y%m%d-%H%M%S')}"
     extra_dir = out / "verbose"

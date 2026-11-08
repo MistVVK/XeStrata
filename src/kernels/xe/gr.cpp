@@ -17,6 +17,7 @@
 #include "strata/kernels/native_qsa.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_gr
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -189,7 +190,7 @@ void gr_write_multi(const float* R, const float* block_out, const float* inject,
                     int n_tok, void* stream) {
     if (n_tok <= 0 || s.n_embd <= 0 || s.hc <= 0) return;
     static const bool per_token = [] {
-        const char* v = std::getenv("STRATA_NO_MULTI_GR");
+        const char* v = strata::env_get("NO_MULTI_GR");
         return v != nullptr && std::strtol(v, nullptr, 10) != 0;
     }();
     if (n_tok > 1 && !per_token) {

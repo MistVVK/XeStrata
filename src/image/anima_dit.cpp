@@ -19,6 +19,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/platform/env.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -368,7 +369,7 @@ bool AnimaDit::open(const std::string& path, void* stream, std::string& err, boo
         File& f = *file_;
         // a file whose blocks are not bf16 has no bytes the GPU could rewrite in place: 8 bits
         q8_ = q8 || f.get("blocks.0.self_attn.q_proj.weight").dtype != "BF16";
-        w8_ = q8_ && std::getenv("STRATA_NO_W8A8") == nullptr && prefill::Gemm::i8_usable(stream);
+        w8_ = q8_ && strata::env_get("NO_W8A8") == nullptr && prefill::Gemm::i8_usable(stream);
         // the patch embedder: its first 64 columns (the 17th channel, the padding mask, is zero for an image)
         lat_ = f.get("final_layer.linear.weight").shape[0] / 4;
         xemb_ = dense("x_embedder.proj.1", false, nullptr, allocs_, weight_bytes_, 4 * lat_);

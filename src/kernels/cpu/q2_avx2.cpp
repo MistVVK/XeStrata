@@ -11,6 +11,7 @@
 // bit for bit.
 #include "strata/kernels/cpu/expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/platform/env.hpp"
 
 #include <immintrin.h>
 
@@ -151,7 +152,7 @@ void rows_bp(const uint8_t* w, size_t row_bytes, int npairs, const ActQ* const* 
 
 bool q2_bitplane_enabled() {
     static const bool on = [] {
-        const char* e = std::getenv("STRATA_Q2_BITPLANE");
+        const char* e = strata::env_get("Q2_BITPLANE");
         return e == nullptr || std::strtol(e, nullptr, 10) != 0;
     }();
     return on;

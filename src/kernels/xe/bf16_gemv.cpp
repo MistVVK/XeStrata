@@ -14,6 +14,7 @@
 #include "strata/core/per_device.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_bf16_gemv
 #include "strata/kernels/device_arch_tag.hpp"
+#include "strata/platform/env.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -205,7 +206,7 @@ RowsTable& rows_table(sycl::queue& q) {
 }
 int rows_forced() {
     static const int forced = [] {
-        const char* v = std::getenv("STRATA_MMVF_ROWS");
+        const char* v = strata::env_get("MMVF_ROWS");
         return v == nullptr ? -1 : (std::strtol(v, nullptr, 10) != 0 ? 1 : 0);
     }();
     return forced;
@@ -340,7 +341,7 @@ void bf16_gemv_fp32_mmvf_multi_tune(int64_t n_in, int64_t n_out, void* stream) {
         std::string counts;
         for (int T = 2; T <= 8; ++T)
             if ((mask >> T) & 1u) counts += (counts.empty() ? "" : ",") + std::to_string(T);
-        std::fprintf(stderr, "strata: the %lld x %lld BF16 GEMV takes 4 rows a work-group for %s rows\n",
+        std::fprintf(stderr, "xestrata: the %lld x %lld BF16 GEMV takes 4 rows a work-group for %s rows\n",
                      (long long) n_in, (long long) n_out, counts.c_str());
     }
     std::lock_guard<std::mutex> lock(table.mutex);

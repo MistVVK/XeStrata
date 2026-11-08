@@ -22,6 +22,7 @@
 #include "strata/image/img_start.hpp"
 #include "strata/image/qi_dit.hpp"
 #include "strata/image/safetensors.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -695,7 +696,7 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
             // STRATA_HUNYUANIMAGE3_HOST_ENDS=patch|final|both: a check's - the host FP32 pieces in place of the
             // card's, so one run at a time can tell either piece's cost in the picture (see the pipeline header)
             static const std::string kHostEnds = [] {
-                const char* v = std::getenv("STRATA_HUNYUANIMAGE3_HOST_ENDS");
+                const char* v = strata::env_get("HUNYUANIMAGE3_HOST_ENDS");
                 return std::string(v != nullptr ? v : "");
             }();
             const bool host_patch = kHostEnds == "patch" || kHostEnds == "both";

@@ -328,7 +328,7 @@ std::vector<float> fetch(const uint16_t* d, size_t n) {
 
 int main() {
     const Model m = make_model();
-    const auto path = std::filesystem::temp_directory_path() / "strata_moss_dit_parity.safetensors";
+    const auto path = std::filesystem::temp_directory_path() / "xestrata_moss_dit_parity.safetensors";
     m.write(path);
     std::mt19937 rng(7);  // NOLINT(bugprone-random-generator-seed): the same inputs each run.
     std::normal_distribution<float> nd;
@@ -360,7 +360,7 @@ int main() {
     // the control's adapter: the input projection over three latents' channels, the color's and the depth's after
     Model ctl;
     ctl.linear("video_embedder", kC, 3 * kLat, true);
-    const auto ctl_path = std::filesystem::temp_directory_path() / "strata_moss_dit_parity_control.safetensors";
+    const auto ctl_path = std::filesystem::temp_directory_path() / "xestrata_moss_dit_parity_control.safetensors";
     ctl.write(ctl_path);
     const Rows col = rnd(kHW * kLat), dep = rnd(kHW * kLat);
     Rows wide((size_t) (kHW * 3 * kLat));

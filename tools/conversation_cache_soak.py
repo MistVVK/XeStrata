@@ -113,7 +113,7 @@ def main():
     other = prompt('Unrelated worker conversation. Reply with HELLO and nothing else.')
     args.output.mkdir(mode=0o700, parents=False, exist_ok=False)
     env = child_env(cfg)
-    env['STRATA_STATE_HASH'] = '1'
+    env['XESTRATA_STATE_HASH'] = '1'
     results = {'requested_cycles': args.cycles, 'engine_info': {}, 'contexts': [], 'cycles': []}
     heads, continuations = [], []
     for label, budget in [('baseline', 0), ('candidate', args.cache_mib)]:
