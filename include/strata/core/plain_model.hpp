@@ -563,7 +563,8 @@ private:
 
     /// A projection's GGUF tensor into VRAM: its first dimension the input, every other the outputs (a 3-D tensor, the
     /// MLA's per-head wk_b and wv_b, is its heads' matrices one after another).  `f32`: an F32 matrix is taken as it is
-    /// (Qwen3.6's GDN alpha and beta: llama.cpp's float product)
+    /// (Qwen3.6's GDN alpha and beta: llama.cpp's float product), and an F16 one widened to F32 (exact; Unsloth's
+    /// Qwen3.5 UD files keep alpha and beta in F16, which no product kernel reads)
     bool upload(const GgufModel& m, const std::string& name, W& w, std::string& err, bool f32 = false);
     /// The decode layouts of the matrices upload put on the GPU since the last call (native_mmvq_tune), timed over
     /// all of them: the model's weights, read as the decode reads them, rather than a span allocated for the timing.
@@ -573,6 +574,9 @@ private:
     /// An F32 vector or matrix, or a BF16 one widened to F32 at load (exact: Qwen3.6's MTP layer keeps its two routers
     /// in BF16).
     bool upload_f32(const GgufModel& m, const std::string& name, uint64_t elements, const float*& out, std::string& err);
+    /// The head's tensor: output.weight, or token_embd.weight where the file ties the two (as llama.cpp reads Qwen3.5's
+    /// small models, which have no output.weight)
+    const char* head_name() const;
     bool open_experts(std::string& err);
     /// qwen35's in place of open_experts: no tiers, the prompt's buffers beside the weights
     bool open_dense(std::string& err);
@@ -905,6 +909,7 @@ private:
     std::vector<const W*> tune_wait_;              ///< upload's matrices not yet timed (tune_uploaded)
     std::vector<const void*> weight_at_;           ///< upload's matrices on the GPU, and their bytes
     std::vector<uint64_t> weight_bytes_;
+    std::vector<std::vector<float>> widened_;      ///< streamed blocks' F16 matrices upload widened (their spans' host)
 
     // the expert tiers (src_ and pool_ the root's, shared by every stage)
     std::unique_ptr<ExpertSource> src_own_;

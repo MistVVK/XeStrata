@@ -328,7 +328,8 @@ void gr_broadcast(const float* e, float* R, int64_t T, void* stream) {
 
 // ---------------------------------------------------------------- GDN
 // The kernels of one GDN shape: HK key heads and HV value heads of S, conv channels C = 2 HK S + HV S.  Qwen3.8 is
-// <16, 48>, Ornith-1.5 (qwen35moe) <16, 32>; the public functions below dispatch on the shape.
+// <16, 48>, Ornith-1.5 (qwen35moe) and Qwen3.5-9B <16, 32>, Qwen3.5's 2B and 0.8B <16, 16>; the public functions below
+// dispatch on the shape.
 template <int HK, int HV>
 struct Gdn {
     static constexpr int C = 2 * HK * S + HV * S;
@@ -926,6 +927,7 @@ namespace {
 template <class F> void gdn_dispatch(int64_t h_k, int64_t h_v, const char* what, F&& f) {
     if (h_k == 16 && h_v == 48) f(Gdn<16, 48>{});
     else if (h_k == 16 && h_v == 32) f(Gdn<16, 32>{});
+    else if (h_k == 16 && h_v == 16) f(Gdn<16, 16>{});
     else throw core::DeviceError(std::string(what) + ": no kernels for " + std::to_string(h_k) + " key and " +
                                  std::to_string(h_v) + " value heads");
 }

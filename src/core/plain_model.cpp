@@ -78,6 +78,7 @@ constexpr int kQ6K = 14;
 constexpr int kQ80 = 8;
 constexpr int kBF16 = 30;   // a BF16 file's projections: bf16_gemv_fp32_mmvf_multi on the FP32 rows
 constexpr int kF32 = 0;
+constexpr int kF16 = 1;
 
 bool mapped(size_t bytes, void** h, void** d) {
     if (!strata::gpu::alloc_host(h, bytes)) return false;
@@ -130,13 +131,26 @@ bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::
     uint64_t rows = 1;
     for (size_t i = 1; i < t->shape.size(); ++i) rows *= t->shape[i];
     w.n_out = (int) rows;
+    const void* src = m.shard(at).tensor_data(*t);
+    uint64_t bytes = tensor_payload_bytes(*t);
+    std::vector<float> wide;
+    if (f32 && w.type == kF16) {
+        wide.resize((size_t) w.n_in * rows);
+        if (!k::cpu::native_row_to_float(kF16, src, wide.data(), (int64_t) wide.size())) {
+            err = "plain model: widening " + name + " from F16 failed";
+            return false;
+        }
+        src = wide.data();
+        bytes = (uint64_t) wide.size() * 4;
+        w.type = kF32;
+    }
     if (!k::native_mmvq_supported(w.type) && !((w.type == kBF16 || (f32 && w.type == kF32)) && w.n_in % 2 == 0)) {
         err = "plain model: " + name + " is " + t->type_name() + ", which the native matrix-vector kernels do not take";
         return false;
     }
-    const uint64_t bytes = tensor_payload_bytes(*t);
     if (stream_into_ != nullptr) {   // a streamed block's: left in the file, laid out as below when it is copied
-        stream_into_->push_back({&w, {m.shard(at).tensor_data(*t), bytes}, 0});
+        if (!wide.empty()) src = widened_.emplace_back(std::move(wide)).data();
+        stream_into_->push_back({&w, {src, bytes}, 0});
         if (w.type == kQ6K && k::native_q6_k_rows_ok(w.n_in)) w.type = k::kNativeQ6KRows;
         else if (w.type == kQ80 && k::native_q8_0_rows_ok(w.n_in)) w.type = k::kNativeQ8Rows;
         w.data = nullptr;
@@ -148,7 +162,7 @@ bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::
         return false;
     }
     allocs_.push_back(d);
-    if (!strata::gpu::copy(d, m.shard(at).tensor_data(*t), bytes)) {
+    if (!strata::gpu::copy(d, src, bytes)) {
         err = "plain model: uploading " + name + " failed";
         return false;
     }
@@ -180,6 +194,11 @@ bool PlainModel::tune_uploaded(std::string& err) {
     }
     tune_wait_.clear();
     return true;
+}
+
+const char* PlainModel::head_name() const {
+    size_t at = 0;
+    return model_->find("output.weight", &at) != nullptr ? "output.weight" : "token_embd.weight";
 }
 
 bool PlainModel::upload_f32(const GgufModel& m, const std::string& name, uint64_t elements, const float*& out,
@@ -475,7 +494,7 @@ bool PlainModel::split_auto_points(std::string& err) {
     const int64_t M = s.n_moe_layers();
     if (M < n) return true;
     uint64_t head = 0;
-    if (size_t at = 0; const TensorInfo* t = model_->find("output.weight", &at)) head = tensor_payload_bytes(*t);
+    if (size_t at = 0; const TensorInfo* t = model_->find(head_name(), &at)) head = tensor_payload_bytes(*t);
     // a MoE layer's experts (the largest layer's three tensors: a file's layers can differ in type), and whether the
     // last GPU runs the MTP layer as well
     uint64_t layer_b = 0;
@@ -619,11 +638,11 @@ bool PlainModel::load_qwen(std::string& err) {
     const GgufModel& m = *model_;
     if (!load_embedding(err)) return false;
     if (last()) {   // the head: the last stage's (an encoder's states end at the final norm: no head)
-        if ((!opt_.encoder && !upload(m, "output.weight", head_, err)) ||
+        if ((!opt_.encoder && !upload(m, head_name(), head_, err)) ||
             !upload_f32(m, "output_norm.weight", (uint64_t) s.n_embd, out_norm_, err))
             return false;
         if (!opt_.encoder && (head_.n_in != s.n_embd || head_.n_out != n_vocab_)) {
-            err = "plain model: output.weight's shape";
+            err = std::string("plain model: ") + head_name() + "'s shape";
             return false;
         }
     }
@@ -2836,7 +2855,7 @@ void PlainModel::setup_int2() {
         (v != nullptr && v[0] != 0 && std::strtol(v, nullptr, 10) == 0))
         return;
     size_t at = 0;
-    const TensorInfo* t = model_->find("output.weight", &at);
+    const TensorInfo* t = model_->find(head_name(), &at);
     if (t == nullptr) return;
     const auto* src = static_cast<const uint8_t*>(model_->shard(at).tensor_data(*t));
     const int type = (int) t->type;

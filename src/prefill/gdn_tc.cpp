@@ -634,6 +634,7 @@ bool gdn_rec_tc(sycl::queue& q, int64_t h_k, int64_t h_v, float* state, const fl
     if (T <= 0) return false;
     if (h_k == 16 && h_v == 48) return tc<16, 48>(q, state, h, gate, beta, y, T);
     if (h_k == 16 && h_v == 32) return tc<16, 32>(q, state, h, gate, beta, y, T);
+    if (h_k == 16 && h_v == 16) return tc<16, 16>(q, state, h, gate, beta, y, T);
     return false;
 }
 
