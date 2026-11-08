@@ -132,6 +132,9 @@ INSTALLER_TOOLS = ("strata_mcp", "iq_pack", "strata_pack", "pack_index", "mtp_fe
 #: tests/terminal/test_bundle_tools_paths.py reads the by-path references out of the source and fails when one is missing from the bundle.
 INSTALLER_SCRIPTS = ("dsv41/pack_gguf", "dsv41/smoke", "dsv41/tune", "nvfp4_local_pack", "strata_bench", "strata_inspect")
 INSTALLER_DATA = "data"           # draft vocabularies, expert profiles: 2 MB
+#: gguf-py and llama.cpp's HF converter at the llama.cpp pin (third_party/strata-gguf-py, 1.8 MB, MIT): the preparation tools import them, so
+#: no llama.cpp download is needed to prepare a model (before 0.2.15 the installed Terminal fetched the 170 MB zip for this)
+INSTALLER_THIRD_PARTY = ("third_party/strata-gguf-py",)
 #: the Mac install's tools (setup.py's mac_control_setup runs them by path): Unsloth's many-shard sets become ONE GGUF for the Metal engine (stdlib only, 15 KB)
 INSTALLER_METAL_TOOLS = ("metal_repack", "stream_experts")
 
@@ -304,6 +307,11 @@ def add_installer(folder: Path, source: Path = ROOT) -> dict:
     if (folder / INSTALLER_DATA).exists():
         shutil.rmtree(folder / INSTALLER_DATA)
     shutil.copytree(source / INSTALLER_DATA, folder / INSTALLER_DATA, ignore=shutil.ignore_patterns("__pycache__"))
+    for name in INSTALLER_THIRD_PARTY:
+        if (folder / name).exists():
+            shutil.rmtree(folder / name)
+        shutil.copytree(source / name, folder / name, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        copied.append(name + "/")
     return {"files": copied, "data": INSTALLER_DATA, "setup_sha256": sha256(folder / "setup.py"),
             "mode": "STRATA_CONTROL_INSTALL=1: downloads the chosen model, prepares it, installs no package and no engine"}
 

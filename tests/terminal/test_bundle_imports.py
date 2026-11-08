@@ -52,6 +52,19 @@ class BundleImports(unittest.TestCase):
     def tearDownClass(cls):
         cls.temp.cleanup()
 
+    def test_gguf_py_and_the_converter_are_in_the_bundle(self):
+        """OWN-1B: the Terminal and Control packages carry third_party/strata-gguf-py (the preparation tools' gguf-py and llama.cpp's converter), so
+        preparing a model downloads no llama.cpp; the bundled copy is byte-identical to the source tree's."""
+        here = self.root / "third_party" / "strata-gguf-py"
+        for rel in ("gguf/__init__.py", "gguf/quants.py", "converter/convert_hf_to_gguf.py", "converter/conversion/qwen4exp.py", "LICENSE", "UPSTREAM.md"):
+            self.assertTrue((here / rel).is_file(), rel)
+            self.assertEqual((here / rel).read_bytes(), (ROOT / "third_party" / "strata-gguf-py" / rel).read_bytes(), rel)
+        self.assertIn("third_party/strata-gguf-py/", self.installer["files"])
+        probe = subprocess.run([sys.executable, "-I", "-c", f"import sys; sys.path.insert(0, {str(self.root / 'tools')!r}); import _paths; print(_paths.gguf_py())"],
+                               capture_output=True, text=True, timeout=60, env={k: v for k, v in os.environ.items() if k != "STRATA_GGUF_PY"})
+        self.assertEqual(probe.returncode, 0, probe.stderr[-500:])
+        self.assertEqual(Path(probe.stdout.strip()).resolve(), here.resolve(), "a bundled tool finds the bundled copy")
+
     def test_calibrate_is_in_the_bundle(self):
         # the exact file #3613 and #3467 lacked
         self.assertTrue((self.root / "tools" / "calibrate.py").is_file())

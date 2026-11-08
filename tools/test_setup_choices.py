@@ -262,16 +262,30 @@ class ReadOnlyModelFolderMark(unittest.TestCase):
 class OfflineStart(unittest.TestCase):
     """0.2.10: a PC with every file and no internet starts a model that is already prepared."""
 
-    def test_the_llama_cpp_source_is_not_fetched_until_a_model_is_prepared(self):
+    def test_preparing_a_model_never_fetches_llama_cpp(self):
+        """OWN-1B: gguf-py is vendored (third_party/strata-gguf-py), so neither starting a prepared model nor running a preparation tool reaches github.com."""
+        fetched = []
+        env = {k: v for k, v in os.environ.items() if k not in ("STRATA_GGUF_PY", "STRATA_GGML_DIR")}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(setup, "get_llama_cpp", lambda: fetched.append(1)):
+            self.assertIsNone(setup.llama_cpp_if_here(), "no override tree by default")
+            self.assertEqual(setup.gguf_py_dir(), setup.ROOT / "third_party" / "strata-gguf-py")
+            self.assertTrue((setup.gguf_py_dir() / "gguf").is_dir())
+            with mock.patch.object(setup.subprocess, "run", lambda *a, **k: mock.Mock(returncode=0)), \
+                    mock.patch.object(setup.acquisition, "require", lambda *a, **k: None), mock.patch.object(setup, "CONTROL", False):
+                setup.run([sys.executable, "tools/x.py"], env=dict(os.environ, STRATA_GGUF_PY=str(setup.gguf_py_dir())))
+            self.assertEqual(fetched, [], "nothing is downloaded")
+
+    def test_the_overrides_are_kept(self):
+        """STRATA_GGUF_PY and STRATA_GGML_DIR still name another copy (kept for two releases)."""
         with tempfile.TemporaryDirectory() as tmp:
-            fetched = []
-            with mock.patch.object(setup, "home", lambda: Path(tmp)), mock.patch.object(setup, "get_llama_cpp", lambda: fetched.append(1)):
-                path = setup.llama_cpp_if_here()
-                self.assertEqual(path, Path(tmp) / "third_party" / "llama.cpp")
-                self.assertEqual(fetched, [], "starting a prepared model does not reach github.com")
-                with mock.patch.object(setup.subprocess, "run", lambda *a, **k: mock.Mock(returncode=0)),                         mock.patch.object(setup.acquisition, "require", lambda *a, **k: None), mock.patch.object(setup, "CONTROL", False):
-                    setup.run([sys.executable, "tools/x.py"], env=dict(os.environ, STRATA_GGUF_PY=str(path / "gguf-py")))
-                self.assertEqual(fetched, [1], "a preparation tool needs it: fetched then")
+            (Path(tmp) / "gguf").mkdir()
+            (Path(tmp) / "ggml").mkdir()
+            (Path(tmp) / "ggml" / "CMakeLists.txt").write_text("", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"STRATA_GGUF_PY": tmp, "STRATA_GGML_DIR": tmp}):
+                self.assertEqual(setup.gguf_py_dir(), Path(tmp))
+                self.assertEqual(setup.llama_override(), Path(tmp))
+                self.assertEqual(setup.ggml_defs(setup.llama_override()), [f"-DSTRATA_GGML_DIR={tmp}"])
+            self.assertEqual(setup.ggml_defs(None), [], "nothing is passed by default")
 
     def test_a_pinned_file_copied_in_by_hand_is_checked_here_without_the_network(self):
         with tempfile.TemporaryDirectory() as tmp:
