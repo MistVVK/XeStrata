@@ -38,8 +38,11 @@ iccver=$(icpx --version | sed -n 's/.*Compiler \([0-9][0-9.]*\).*/\1/p' | head -
 
 cd "$repo"
 ggml=""
-if [ -n "${LLAMA_CPP:-}" ]; then ggml="-DFETCHCONTENT_SOURCE_DIR_STRATA_LLAMACPP=$LLAMA_CPP -DFETCHCONTENT_FULLY_DISCONNECTED=ON"
-elif [ -d "$repo/third_party/llama.cpp/ggml" ]; then ggml="-DSTRATA_GGML_DIR=$repo/third_party/llama.cpp"; fi
+# ggml is the vendored third_party/strata-ggml. STRATA_GGML_DIR=<llama.cpp checkout> (or LLAMA_CPP=, the name this script used before) builds from that
+# checkout instead: an override kept for two releases. (LLAMA_CPP used to set a FetchContent variable that the CMake files stopped reading when ggml was
+# vendored, so it did nothing, and a downloaded third_party/llama.cpp was picked up by itself; neither happens now.)
+override=${STRATA_GGML_DIR:-${LLAMA_CPP:-}}
+[ -z "$override" ] || ggml="-DSTRATA_GGML_DIR=$override"
 # shellcheck disable=SC2086
 cmake -S sycl -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
     -DSTRATA_SYCL_PARITY=OFF -DSTRATA_SYCL_IQ_DECODE_FAST=${IQ_DECODE_FAST:-ON} ${aot:+"-DSTRATA_SYCL_AOT=$aot"} $ggml ${STRATA_CMAKE_EXTRA:-}   # STRATA_CMAKE_EXTRA: e.g. -DSTRATA_GEOMETRY_FILE=/abs/path/geometry.hpp
