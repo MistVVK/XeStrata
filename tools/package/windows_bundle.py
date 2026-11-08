@@ -62,9 +62,9 @@ COMPONENTS = [
     ("ROCm BLAS headers (rocBLAS, hipBLASLt and hipblas-common; compiled into onemath_blas_rocblas.dll)",
      "ROCm 7.1 (Ubuntu 26.04's)", "MIT",
      "https://github.com/ROCm/rocm-libraries", ["rocm:LICENSE-*.txt"], []),
-    ("intel/llvm (DPC++) SYCL runtime, with Unified Runtime, UMF and hwloc", "intel-llvm",
-     "Apache-2.0 WITH LLVM-exception; UMF Apache-2.0 WITH LLVM-exception; hwloc BSD-3-Clause; Level Zero loader "
-     "headers MIT; AMD's HIP headers MIT", "https://github.com/intel/llvm", ["sycl:licenses/*"],
+    ("intel/llvm (DPC++) SYCL runtime, with Unified Runtime, UMF, hwloc and zstd", "intel-llvm",
+     "Apache-2.0 WITH LLVM-exception; UMF Apache-2.0 WITH LLVM-exception; hwloc BSD-3-Clause; zstd BSD-3-Clause; "
+     "Level Zero loader headers MIT; AMD's HIP headers MIT", "https://github.com/intel/llvm", ["sycl:licenses/*"],
      [f"app/engine/{d}" for d in SYCL_DLLS]),
     (".NET application host", "dotnet", "MIT", "https://github.com/dotnet/runtime",
      ["https://raw.githubusercontent.com/dotnet/runtime/main/LICENSE.TXT",

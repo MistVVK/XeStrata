@@ -1294,7 +1294,9 @@ class StrataEngine:
             q.put(None)
 
     def death_note(self) -> str:
-        """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
+        """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM.  Only
+        this start's lines (log_start): the log is appended across starts, and an earlier engine's watchdog line is
+        not why this one ended (#59)."""
         if self.silent_note:                            # #481: the server ended it, not the OS or the engine itself
             return self.silent_note
         tail = wide = ""
@@ -1302,8 +1304,9 @@ class StrataEngine:
             if self.log_path is None:
                 raise OSError("no log")
             with open(self.log_path, "rb") as f:
-                f.seek(0, 2)
-                f.seek(max(0, f.tell() - 262144))
+                size = f.seek(0, 2)
+                start = getattr(self, "log_start", 0) or 0
+                f.seek(max(start if start <= size else 0, size - 262144))
                 wide = f.read().decode("utf-8", "replace")
             tail = wide[-4096:]
         except (OSError, TypeError):
@@ -1319,7 +1322,8 @@ class StrataEngine:
         if rc is not None and rc >= 0 and self.last_err:  # its own last words on stdout: they say why
             return (f"The engine exited (code {rc}) after it reported: {self.last_err} - please report it at "
                     "github.com/MistVVK/XeStrata/issues with the log.")
-        last = next((x.strip() for x in reversed(tail.splitlines()) if x.strip().startswith(("xestrata", "ERR"))), "")
+        last = next((x.strip() for x in reversed(tail.splitlines())
+                     if x.strip().startswith(("xestrata", "ERR", "Xe runtime"))), "")
         if rc is not None and rc < 0 and -rc != signal.SIGKILL:   # issue #12: a crash, not the OS ending it for RAM
             return (f"The engine crashed ({exit_text(rc)}). " + (f"It reported: {self.last_err}" if self.last_err
                     else f"Its last log line: {last}" if last else "It wrote nothing about it") +

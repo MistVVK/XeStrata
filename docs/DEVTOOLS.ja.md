@@ -261,6 +261,7 @@ ninja -C build/win $(git diff --name-only HEAD -- '*.cpp' | sed "s|^|$PWD/|; s|$
 
 - コンパイルは `--contrib` で作った同じ版のツールチェーンの clang-cl、リンクは lld-link が行います。デバイスライブラリを作るツールも、そのツールチェーンのものです（`--contrib` のビルドは、入れ先にない `opt` も入れ先に写します）。Windows 向けにもこの機械向けにも、コンパイラは作りません。先に `--contrib` を作っておきます。
 - MSVC の CRT と Windows SDK は xwin の展開（`--xwin`、既定は `.tools/xwin/sdk`）を使います。`llvm-lib`・`llvm-rc`・`llvm-mt`・`llvm-ml` はディストリビューションの LLVM のものです（`sudo apt install llvm`）。
+- `sycl9.dll` には zstd（BSD-3-Clause。ライセンス文は `install/licenses/zstd-LICENSE`）を静的にリンクします。oneMKL の SYCL の DLL は zstd で圧縮した装置イメージを持ち、zstd の無いランタイムでは読み込みが WinError 1114 で失敗します。zstd はスクリプトに書いた版のリリースを SHA-256 で確かめて取り、同じツールチェーンで Windows 向けに作ります。入れ先には、エンジンがローダーの関数を呼ぶための Level Zero のヘッダー（MIT）も入れます。
 - CUDA のアダプターがリンクする CUDA の Windows 版のヘッダーとインポートライブラリは、NVIDIA の再配布用のアーカイブ（CUDA 12.4.1 の `cuda_cudart`・`cuda_nvml_dev`・`cuda_cccl`）から取ります。自由ソフトウェアではなく、7z には入れません。
 - HIP のアダプター（AMD の GPU）は、この機械の ROCm の HIP（Ubuntu の `libamdhip64-dev`）があり、`--contrib` が HIP のターゲットつきで作られているときに作ります。ヘッダーはその HIP のもの（MIT。ライセンス文は `install/licenses/hip-headers.txt`）で、リンクする `amdhip64.lib` は、Linux の `libamdhip64.so.7` が出す C の名前から `llvm-dlltool` で作った `amdhip64_7.dll` のインポートライブラリです。`amdhip64_7.dll` は AMD のドライバー（Adrenalin 26.5.1 以降）が System32 に入れます。
 - Windows のエンジンの NVIDIA と AMD の GPU 向けのコードは、Linux のツールチェーンが v7.2.0 から作る Windows 向けの l32 の libspirv（`lib/clang/<版>/lib/<対象>`）と、そのツールチェーンの ROCm のデバイスライブラリをリンクします。どちらも `wchar_size` を持たないので、Windows 向けに作り直す必要はありません。

@@ -13,7 +13,6 @@
 #if __has_include(<level_zero/ze_api.h>) && __has_include(<sycl/ext/oneapi/backend/level_zero.hpp>)
 #include <level_zero/ze_api.h>
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
-#include <dlfcn.h>
 #define STRATA_HAVE_ZE_API 1
 #endif
 #endif
@@ -60,6 +59,22 @@
 
 namespace strata::core {
 namespace {
+#ifdef STRATA_HAVE_ZE_API
+// A function of the Level Zero loader the SYCL runtime has loaded (libze_loader.so.1, Windows' ze_loader.dll); `load`:
+// load it where it has not.  Null where there is none.
+void* ze_function(const char* name, bool load) {
+#if defined(_WIN32)
+    HMODULE lib = GetModuleHandleA("ze_loader.dll");
+    if (lib == nullptr && load) lib = LoadLibraryA("ze_loader.dll");
+    return lib != nullptr ? reinterpret_cast<void*>(GetProcAddress(lib, name)) : nullptr;
+#else
+    void* lib = dlopen("libze_loader.so.1", RTLD_NOW | RTLD_NOLOAD);
+    if (lib == nullptr && load) lib = dlopen("libze_loader.so.1", RTLD_NOW);
+    return lib != nullptr ? dlsym(lib, name) : nullptr;
+#endif
+}
+#endif
+
 // The backends the engine runs on: Level Zero for Intel GPUs, CUDA and HIP where the build has their targets.  The
 // same Intel GPU is listed by OpenCL as well, which the engine does not use.
 bool engine_backend(const sycl::device& d) {
@@ -363,8 +378,16 @@ void report_host_at_fault() {
 
 // The xe driver resets a job after its job_timeout_ms (5 s here, at most 10 s), which completes the event with an
 // error, so a healthy wait - even a drain of many queued jobs - returns well inside this.  A wait that outlives it
-// is stuck in the driver or the host, and only a thread other than the waiter can report that.
-constexpr auto kHangLimit = std::chrono::seconds(120);
+// is stuck in the driver or the host, and only a thread other than the waiter can report that.  #59: other drivers
+// (Windows', CUDA's, HIP's) may not end a job that long, so XESTRATA_GPU_WAIT_LIMIT_S sets it (seconds; 0: no limit).
+std::chrono::seconds hang_limit() {
+    static const std::chrono::seconds limit = [] {
+        const char* v = strata::env_get("GPU_WAIT_LIMIT_S");
+        const long s = v != nullptr ? std::strtol(v, nullptr, 10) : 120;
+        return std::chrono::seconds(s > 0 ? s : 0);
+    }();
+    return limit;
+}
 }  // namespace
 
 std::string compiler_workaround() {
@@ -504,12 +527,10 @@ sycl::queue* Runtime::create_copy_stream() {
     }();
     if (!off && device_.get_backend() == sycl::backend::ext_oneapi_level_zero) {
         try {
-            void* lib = dlopen("libze_loader.so.1", RTLD_NOW | RTLD_NOLOAD);   // the SYCL runtime has loaded it
-            if (lib == nullptr) lib = dlopen("libze_loader.so.1", RTLD_NOW);
             using GroupsFn = decltype(&zeDeviceGetCommandQueueGroupProperties);
             using ImmFn = decltype(&zeCommandListCreateImmediate);
-            auto groups = lib ? reinterpret_cast<GroupsFn>(dlsym(lib, "zeDeviceGetCommandQueueGroupProperties")) : nullptr;
-            auto imm = lib ? reinterpret_cast<ImmFn>(dlsym(lib, "zeCommandListCreateImmediate")) : nullptr;
+            auto groups = reinterpret_cast<GroupsFn>(ze_function("zeDeviceGetCommandQueueGroupProperties", true));
+            auto imm = reinterpret_cast<ImmFn>(ze_function("zeCommandListCreateImmediate", true));
             const auto zdev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(device_);
             const auto zctx = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(context_);
             uint32_t n = 0;
@@ -558,9 +579,8 @@ std::string Runtime::device_status() {
 #ifdef STRATA_HAVE_ZE_API
     if (device_.get_backend() == sycl::backend::ext_oneapi_level_zero) {
         try {
-            void* lib = dlopen("libze_loader.so.1", RTLD_NOW | RTLD_NOLOAD);
             using StatusFn = decltype(&zeDeviceGetStatus);
-            auto status = lib ? reinterpret_cast<StatusFn>(dlsym(lib, "zeDeviceGetStatus")) : nullptr;
+            auto status = reinterpret_cast<StatusFn>(ze_function("zeDeviceGetStatus", false));
             if (status == nullptr) return "unknown";
             const ze_result_t r = status(sycl::get_native<sycl::backend::ext_oneapi_level_zero>(device_));
             if (r == ZE_RESULT_SUCCESS) return "answers";
@@ -573,9 +593,9 @@ std::string Runtime::device_status() {
         }
     }
 #endif
-    // no status query here (CUDA, HIP, Windows): whether the driver still answers a question about the device's free
-    // memory, which CUDA refuses once a kernel has faulted its context (its errors stick).  A failure report on these
-    // said "the GPU: unknown" every time (#36, #39).
+    // no status query here (CUDA, HIP, a build without Level Zero's headers): whether the driver still answers a
+    // question about the device's free memory, which CUDA refuses once a kernel has faulted its context (its errors
+    // stick).  A failure report on these said "the GPU: unknown" every time (#36, #39).
     if (device_.has(sycl::aspect::ext_intel_free_memory)) {
         try {
             (void) device_.get_info<sycl::ext::intel::info::device::free_memory>();
@@ -645,14 +665,16 @@ Runtime::~Runtime() {
 
 void Runtime::watch() {
     std::unique_lock<std::mutex> lock(watch_mutex_);
+    const std::chrono::seconds limit = hang_limit();
     while (!watch_cv_.wait_for(lock, std::chrono::seconds(1), [this] { return stop_; })) {
+        if (limit.count() == 0) continue;
         const auto now = std::chrono::steady_clock::now();
         for (const Waiter& w : waiters_) {
-            if (now - w.since < kHangLimit) continue;
+            if (now - w.since < limit) continue;
             const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(now - w.since).count();
             std::fprintf(stderr, "Xe runtime: waiting for %s for %lld s (%zu waits in progress)\n", w.what,
                          (long long) seconds, waiters_.size());
-            fatal("GPU wait exceeded the hang limit");
+            fatal("GPU wait exceeded the hang limit (XESTRATA_GPU_WAIT_LIMIT_S)");
         }
     }
 }

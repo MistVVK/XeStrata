@@ -23,6 +23,7 @@ incremental.  v7.1.1 built in 13 minutes on 28 threads and keeps 3.5 GB (the clo
 
 Prints the toolchain's folder on its last line.  setup.py runs it for --intel-llvm-build."""
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -427,6 +428,12 @@ echo "#$ LIBRARIES=\"-L{root}/lib/x64\""
 # (Adrenalin 26.5.1 and later ship only it, in place of amdhip64_6.dll), made with llvm-dlltool from the names the
 # Linux runtime of the same major version exports
 WIN_HIP_DLL = "amdhip64_7.dll"
+# zstd for the Windows SYCL runtime (BSD-3-Clause; dual-licensed with GPL-2.0, taken under the BSD license), linked into
+# sycl9.dll: oneMKL's SYCL DLLs carry zstd-compressed device images, which a runtime without it refuses as they
+# register them in their DllMain - mkl_sycl_blas.6.dll then does not load (WinError 1114, XeStrata #59)
+WIN_ZSTD = "1.5.7"
+WIN_ZSTD_SHA256 = "eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3"
+WIN_ZSTD_URL = f"https://github.com/facebook/zstd/releases/download/v{WIN_ZSTD}/zstd-{WIN_ZSTD}.tar.gz"
 # what a Windows engine's SYCL runtime is: the headers and the device libraries, installed by their components, and
 # the DLLs and import libraries, copied (their components install the Debug ones too, which are not built); the UR
 # loader and the OpenCL adapter are linked into sycl9.dll since v7.2.0 (UR_STATIC_LOADER, UR_STATIC_ADAPTER_OPENCL)
@@ -506,6 +513,31 @@ def win_hip(dest: Path) -> Path | None:
     return dest
 
 
+def win_zstd(dest: Path, toolchain: Path) -> Path:
+    """zstd's static library for Windows in `dest` (include/zstd.h, lib/zstd_static.lib, LICENSE), cross-built with
+    the cross build's `toolchain`, WIN_ZSTD's release checked against its SHA-256."""
+    if (dest / "lib" / "zstd_static.lib").exists() and (dest / "include" / "zstd.h").exists():
+        return dest
+    tar = OUT / f"zstd-{WIN_ZSTD}.tar.gz"
+    run(["curl", "-fsSL", "-o", tar, WIN_ZSTD_URL])
+    if hashlib.sha256(tar.read_bytes()).hexdigest() != WIN_ZSTD_SHA256:
+        fail(f"zstd {WIN_ZSTD}'s release does not have the SHA-256 this script expects", f"look at {WIN_ZSTD_URL}")
+    src, build = OUT / f"zstd-{WIN_ZSTD}", OUT / "zstd-build"
+    shutil.rmtree(src, ignore_errors=True)
+    shutil.rmtree(build, ignore_errors=True)
+    run(["tar", "-xzf", tar, "-C", OUT])
+    run(["cmake", "-G", "Ninja", "-S", src / "build" / "cmake", "-B", build, f"-DCMAKE_TOOLCHAIN_FILE={toolchain}",
+         "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_INSTALL_PREFIX={dest}", "-DZSTD_BUILD_SHARED=OFF",
+         "-DZSTD_BUILD_STATIC=ON", "-DZSTD_BUILD_PROGRAMS=OFF", "-DZSTD_BUILD_TESTS=OFF", "-DZSTD_LEGACY_SUPPORT=OFF"])
+    run(["cmake", "--build", build])
+    run(["cmake", "--install", build])
+    shutil.copy2(src / "LICENSE", dest / "LICENSE")
+    shutil.rmtree(src)
+    shutil.rmtree(build)
+    tar.unlink()
+    return dest
+
+
 def win_toolchain(xwin: Path, host_bin: Path) -> Path:
     """The CMake toolchain of the cross build: the host toolchain's clang-cl and lld-link, xwin's CRT and SDK."""
     case_inc, case_lib = OUT / "case" / "include", OUT / "case" / "lib"
@@ -571,8 +603,10 @@ def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> N
         xwin / "crt" / "include", *(xwin / "sdk" / "include" / s for s in ("ucrt", "um", "shared"))))])
     s = SRC
     projects = "sycl;llvm-spirv;opencl;xpti;xptifw;libdevice"
+    toolchain = win_toolchain(xwin, hb)
+    zstd = win_zstd(OUT / "zstd", toolchain)
     options = [
-        f"-DCMAKE_TOOLCHAIN_FILE={win_toolchain(xwin, hb)}", "-DCMAKE_BUILD_TYPE=Release",
+        f"-DCMAKE_TOOLCHAIN_FILE={toolchain}", "-DCMAKE_BUILD_TYPE=Release",
         f"-DCMAKE_INSTALL_PREFIX={INSTALL}", "-DLLVM_ENABLE_ASSERTIONS=OFF",
         f"-DLLVM_TARGETS_TO_BUILD=X86;SPIRV;NVPTX{';AMDGPU' if hip else ''}",
         "-DLLVM_HOST_TRIPLE=x86_64-pc-windows-msvc",
@@ -594,7 +628,9 @@ def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> N
         "-DSYCL_ENABLE_EXTENSION_JIT=OFF",
         "-DSYCL_ENABLE_MAJOR_RELEASE_PREVIEW_LIB=OFF",
         "-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON", f"-DCUDAToolkit_ROOT={cuda}", "-DLLVM_ENABLE_DIA_SDK=OFF",
-        "-DLLVM_ENABLE_ZSTD=OFF",
+        "-DLLVM_ENABLE_ZSTD=FORCE_ON", "-DLLVM_USE_STATIC_ZSTD=ON", f"-Dzstd_INCLUDE_DIR={zstd / 'include'}",
+        f"-Dzstd_LIBRARY={zstd / 'lib' / 'zstd_static.lib'}",
+        f"-Dzstd_STATIC_LIBRARY={zstd / 'lib' / 'zstd_static.lib'}",
         # the device libraries' tools, this machine's (patch build-libdevice-custom-tools); each also by its own
         # variable, else LLVM's get_host_tool_path sets its *_target in the cache to a build of it for this machine
         f"-DLIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR={hb}", f"-DSYCL_LIBDEVICE_CXX_FLAGS={devflags}",
@@ -609,8 +645,8 @@ def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> N
     # llvm-rc preprocesses the resource scripts with the clang it finds on PATH: the host toolchain's
     env = dict(os.environ, PATH=f"{hb}{os.pathsep}{os.environ.get('PATH', '')}")
     started = time.time()
-    if not (BUILD / "build.ninja").exists():
-        run(["cmake", "-G", "Ninja", "-S", s / "llvm", "-B", BUILD, *options], env=env)
+    # configured every time, so a kept build tree takes the options a change of this script gives (zstd)
+    run(["cmake", "-G", "Ninja", "-S", s / "llvm", "-B", BUILD, *options], env=env)
     targets = [*WIN_TARGETS, *(["ur_adapter_hip"] if hip else [])]
     run(["cmake", "--build", BUILD, "--target", *targets, "--", "-j", str(jobs or os.cpu_count() or 4)], env=env)
     shutil.rmtree(INSTALL, ignore_errors=True)
@@ -620,12 +656,17 @@ def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> N
         (INSTALL / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(BUILD / rel, INSTALL / rel)
     shutil.copytree(s / "xpti" / "include" / "xpti", INSTALL / "include" / "xpti", dirs_exist_ok=True)
+    # Level Zero's headers (MIT, the loader's the build fetched), for the engine's calls into the loader the SYCL
+    # runtime loads (the copy engine's queue, the device's status: src/core/device.cpp); no component installs them
+    shutil.copytree(BUILD / "_deps" / "level-zero-loader-src" / "include" / "level_zero",
+                    INSTALL / "include" / "level_zero", dirs_exist_ok=True)
     # the license texts of what the DLLs carry: intel/llvm's, and those of the projects its build fetched (UMF and the
     # hwloc it links statically, Level Zero's loader and headers, emhash, parallel-hashmap, OpenCL's headers and ICD
     # loader, vc-intrinsics), for the Windows package's notices
     lic = INSTALL / "licenses"
     lic.mkdir(parents=True, exist_ok=True)
     shutil.copy2(s / "llvm" / "LICENSE.TXT", lic / "intel-llvm.txt")
+    shutil.copy2(zstd / "LICENSE", lic / "zstd-LICENSE")
     if hip:
         shutil.copy2(hip / "LICENSE-hip.txt", lic / "hip-headers.txt")
     for dep in sorted((BUILD / "_deps").glob("*-src")):
@@ -634,7 +675,7 @@ def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> N
                 shutil.copy2(f, lic / f"{dep.name[:-4]}-{f.name}")
     commit = subprocess.run(["git", "-C", str(SRC), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     RECORD.write_text(json.dumps({"tag": tag, "commit": commit, "fixes": [patch_id(p) for p in PATCHES],
-                                  "target": "x86_64-pc-windows-msvc", "cuda": WIN_CUDA,
+                                  "target": "x86_64-pc-windows-msvc", "cuda": WIN_CUDA, "zstd": WIN_ZSTD,
                                   "hip": WIN_HIP_DLL if hip else None,
                                   "built": time.strftime("%Y-%m-%d %H:%M"),
                                   "minutes": round((time.time() - started) / 60)}, indent=1))
@@ -666,7 +707,9 @@ def main() -> None:
     if a.windows:
         set_out(WIN_OUT)
         have = json.loads(RECORD.read_text()) if RECORD.exists() else {}
-        if a.rebuild or have.get("tag") != a.tag or have.get("fixes") != [patch_id(p) for p in PATCHES]:
+        # an install from before zstd and Level Zero's headers were in it is built again
+        if a.rebuild or have.get("tag") != a.tag or have.get("fixes") != [patch_id(p) for p in PATCHES] or \
+                have.get("zstd") != WIN_ZSTD or not (INSTALL / "include" / "level_zero" / "ze_api.h").exists():
             say(f"building intel/llvm {a.tag}'s SYCL runtime for Windows in {OUT} ...")
             build_windows(a.tag, a.xwin.resolve(), a.keep_build, a.jobs)
         else:

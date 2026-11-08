@@ -1020,9 +1020,19 @@ MemSample mem_sample() {
 // the stage the watchdog names: "<where> <detail>", and the prompt chunk a batched read is in (upstream 9631c96)
 // upstream #1407: the file tier's activity as the OS counts it (Linux: major page faults and bytes read from storage). The
 // watchdog treats a growing count as "the step is slow, not stuck": a prompt layer whose experts are re-read from the
-// pack (low RAM, mmap experts) can take minutes while the heartbeat stands still. Zero where unavailable.
+// pack (low RAM, mmap experts) can take minutes while the heartbeat stands still. Zero where unavailable.  #59:
+// Windows counts no hard faults for a process alone, so there it is all its page faults (the experts mapped from the
+// pack come in as faults, not as reads) and the MiB its reads brought in: a stuck engine's host makes almost none, and
+// a busy one is still bounded by the allowance (XESTRATA_WATCHDOG_IO_S).
 static uint64_t file_tier_activity() {
-#if defined(__linux__)
+#if defined(_WIN32)
+    uint64_t total = 0;
+    PROCESS_MEMORY_COUNTERS pmc{};
+    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) total += pmc.PageFaultCount;
+    IO_COUNTERS io{};
+    if (GetProcessIoCounters(GetCurrentProcess(), &io)) total += io.ReadTransferCount >> 20;   // MiB
+    return total;
+#elif defined(__linux__)
     uint64_t total = 0;
     if (FILE* f = std::fopen("/proc/self/stat", "r")) {
         char buf[1024] = {};
@@ -1515,13 +1525,38 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
     return true;
 }
 
+// Copies of `bytes` from `src` to `dst` after a warm-up (the context up, the copy engine primed): four bursts, each one
+// waited for and timed on the host's clock, the fastest in GB/s (< 0 when a copy fails).  `samples`, when given, gets
+// every burst's reading for the log.  #485 (upstream 4e308eb): a single timed burst can read a link low (a link still
+// in a low-power state, other DMA, a context not yet up to speed), and such a disturbance only ever slows a copy, so the
+// fastest of the four is the link's figure.  #59: the host's clock, not the GPU's timestamps (timing events): upstream
+// timed the bursts with those, and reading them back is the one thing this probe asked of the driver that no other part
+// of a start does - an Arc A770 on Windows faulted in it, which ended the start.  A 256 MiB burst takes 9 ms at 28 GB/s;
+// a wait's wake-up (tens of microseconds) moves the figure by under 1%.
+double best_copy_gbps(void* dst, const void* src, size_t bytes, std::string* samples) {
+    constexpr int kBursts = 4;
+    if (samples != nullptr) samples->clear();
+    if (!strata::gpu::copy(dst, src, bytes)) return -1.0;
+    double bw = -1.0;
+    for (int b = 0; b < kBursts; ++b) {
+        const Clock::time_point t0 = Clock::now();
+        if (!strata::gpu::copy(dst, src, bytes)) return -1.0;
+        const double s = std::chrono::duration<double>(Clock::now() - t0).count();
+        const double sv = s > 1e-5 ? (double) bytes / s / 1e9 : -1.0;
+        bw = std::max(bw, sv);
+        if (samples != nullptr) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%s%.1f", b == 0 ? "" : " ", sv);
+            *samples += buf;
+        }
+    }
+    return bw;
+}
+
 // The effective host->device bandwidth of the PCIe link: copies from pinned host memory, as the expert arena's
 // reads are.  The native default share (0.55) was measured on x16 links (~26-28 GB/s); a x8 card in a x8 slot
-// carries about half of that.  Returns < 0 when the probe cannot run (then the caller keeps the default).
-// #485 (upstream 4e308eb): a single timed burst can read a link low (a link still in a low-power state, other DMA, a
-// context not yet up to speed), and the low reading set the share.  Such a disturbance only ever slows a copy, so the
-// same 1 GiB is copied as four bursts of 256 MiB, timed one by one, and the fastest is the link's figure.  `samples`,
-// when given, gets every burst's reading for the log.
+// carries about half of that.  Returns < 0 when the probe cannot run (then the caller keeps the default).  The same
+// 1 GiB is copied as four bursts of 256 MiB (best_copy_gbps).
 // Each GPU's last link reading (probe_pcie_h2d_gbps), for the ones taken again after the model is loaded
 std::map<int, double>& link_readings() {
     static std::map<int, double> seen;
@@ -1529,7 +1564,6 @@ std::map<int, double>& link_readings() {
 }
 double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
     constexpr size_t kBytes = 256ull << 20;
-    constexpr int kBursts = 4;
     void* h = nullptr;
     void* d = nullptr;
     if (!strata::gpu::alloc_host(&h, kBytes)) return -1.0;
@@ -1538,34 +1572,7 @@ double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
         return -1.0;
     }
     std::memset(h, 0, kBytes);   // fault the pages in before timing
-    strata::gpu::copy_async(d, h, kBytes, nullptr);   // warmup: context up, copy engine primed
-    // the bursts run back to back on the stream, an event between each two
-    strata::gpu::Event* ev[kBursts + 1] = {};
-    int n_ev = 0;
-    while (n_ev <= kBursts && strata::gpu::event_create(&ev[n_ev], true)) ++n_ev;
-    bool ok = n_ev == kBursts + 1;
-    float ms[kBursts] = {};
-    if (ok) {
-        strata::gpu::event_record(ev[0], nullptr);
-        for (int b = 0; b < kBursts; ++b) {
-            strata::gpu::copy_async(d, h, kBytes, nullptr);
-            strata::gpu::event_record(ev[b + 1], nullptr);
-        }
-        ok = strata::gpu::event_sync(ev[kBursts]);
-        for (int b = 0; b < kBursts && ok; ++b) ok = strata::gpu::event_elapsed_ms(&ms[b], ev[b], ev[b + 1]);
-    }
-    for (int i = 0; i < n_ev; ++i) strata::gpu::event_destroy(ev[i]);
-    double bw = -1.0;
-    if (samples != nullptr) samples->clear();
-    for (int b = 0; b < kBursts && ok; ++b) {
-        const double sv = ms[b] > 0.01f ? (double) kBytes / (ms[b] * 1e-3) / 1e9 : -1.0;
-        bw = std::max(bw, sv);
-        if (samples != nullptr) {
-            char buf[32];
-            std::snprintf(buf, sizeof(buf), "%s%.1f", b == 0 ? "" : " ", sv);
-            *samples += buf;
-        }
-    }
+    const double bw = best_copy_gbps(d, h, kBytes, samples);
     strata::gpu::free(d);
     strata::gpu::free(h);
     if (bw > 0.0) link_readings()[strata::core::current_device()] = bw;
@@ -1728,32 +1735,16 @@ double bench_ram_read_gbps(const std::vector<int>& cores, size_t bytes) {
     return best;   // `sink` only keeps the reads from being optimized away
 }
 
-// Copies of 256 MiB between the device and the host, four timed back to back after a warm-up (as
-// probe_pcie_h2d_gbps), the fastest: `pinned` host USM as the expert arena's reads use, else pageable memory.
+// Copies of 256 MiB between the device and the host, four timed after a warm-up (best_copy_gbps), the fastest:
+// `pinned` host USM as the expert arena's reads use, else pageable memory.
 double bench_copy_gbps(bool to_device, bool pinned) {
     constexpr size_t kBytes = 256ull << 20;
-    constexpr int kBursts = 4;
     void* h = pinned ? strata::gpu::alloc_host(kBytes) : strata::platform::DirectFile::alloc_aligned(kBytes);
     void* d = strata::gpu::alloc_device(kBytes);
     double bw = -1.0;
     if (h != nullptr && d != nullptr) {
         std::memset(h, 0, kBytes);
-        void* dst = to_device ? d : h;
-        const void* src = to_device ? h : d;
-        strata::gpu::copy_async(dst, src, kBytes, nullptr);
-        strata::gpu::Event* ev[kBursts + 1] = {};
-        int n_ev = 0;
-        while (n_ev <= kBursts && strata::gpu::event_create(&ev[n_ev], true)) ++n_ev;
-        bool ok = n_ev == kBursts + 1 && strata::gpu::event_record(ev[0], nullptr);
-        for (int b = 0; b < kBursts && ok; ++b)
-            ok = strata::gpu::copy_async(dst, src, kBytes, nullptr) && strata::gpu::event_record(ev[b + 1], nullptr);
-        ok = ok && strata::gpu::event_sync(ev[kBursts]);
-        for (int b = 0; b < kBursts && ok; ++b) {
-            float ms = 0.0f;
-            if (strata::gpu::event_elapsed_ms(&ms, ev[b], ev[b + 1]) && ms > 0.01f)
-                bw = std::max(bw, (double) kBytes / (ms * 1e-3) / 1e9);
-        }
-        for (int i = 0; i < n_ev; ++i) strata::gpu::event_destroy(ev[i]);
+        bw = to_device ? best_copy_gbps(d, h, kBytes, nullptr) : best_copy_gbps(h, d, kBytes, nullptr);
     }
     strata::gpu::free(d);
     if (pinned) strata::gpu::free(h);
@@ -3311,7 +3302,7 @@ int main(int argc, char** argv) {
     // real H2D bandwidth is probed once; from 20 GB/s up (x16 PCIe 4/5) the measured default stays.  The canonical
     // pack's 0.2 was never measured against the link, so it is left alone.  `--calibrate` measures it outright.
     double link_gbps = -1.0;   // the host->device link, when probed here (the conversation copies below read it too)
-    if (o.pcie_frac < 0.0) {
+    if (!pcie_given) {
         const double base = native_pack ? 0.55 : 0.2;
         std::string bursts;
         const double bw = native_pack ? probe_pcie_h2d_gbps(&bursts) : -1.0;
@@ -3331,11 +3322,15 @@ int main(int argc, char** argv) {
     // ca378670b: STRATA_CKPT_ASYNC, STRATA_CKPT_GATHER, STRATA_PARK_ASYNC, opt-in there): on by themselves under
     // --serve when the link probes below 12 GB/s and none of the three is set.  Measured 2026-10-28 (IQ3_XXS, serve
     // 32K): the RTX 4070 on a 6.4 GB/s link waited 226 -> 201 ms for a follow-up and decoded 72.1 -> 73.4 tok/s; the
-    // B70 on a 28 GB/s link waited 155 -> 172 ms.  Setting any of them to 0 or 1 keeps the user's choice.
+    // B70 on a 28 GB/s link waited 155 -> 172 ms.  Setting any of them to 0 or 1 keeps the user's choice.  #59: with
+    // --pcie-frac the link is not probed for this alone (as before these copies moved): the copies stay in line.
     if (o.serve && strata::env_get("CKPT_ASYNC") == nullptr && strata::env_get("CKPT_GATHER") == nullptr &&
         strata::env_get("PARK_ASYNC") == nullptr) {
-        std::string bursts;
-        if (link_gbps <= 0.0) link_gbps = probe_pcie_h2d_gbps(&bursts);
+        if (link_gbps <= 0.0 && !pcie_given) link_gbps = probe_pcie_h2d_gbps();
+        if (link_gbps <= 0.0)
+            std::fprintf(stderr, "xestrata generate: the host link was not read (%s): the conversation cache copies in "
+                                 "line (XESTRATA_CKPT_ASYNC=1 moves them to the background)\n",
+                         pcie_given ? "--pcie-frac was given" : "the probe failed");
         if (link_gbps > 0.0 && link_gbps < 12.0) {
             for (const char* k : {"XESTRATA_CKPT_ASYNC", "XESTRATA_CKPT_GATHER", "XESTRATA_PARK_ASYNC"}) {
 #if defined(_WIN32)
