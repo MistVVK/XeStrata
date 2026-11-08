@@ -1,0 +1,2037 @@
+{
+ "type": "describe",
+ "version": "0.2.8-1",
+ "packaged": true,
+ "ram_gb": 35.9,
+ "cpu": {
+  "name": "AMD Ryzen 5 5600H with Radeon Graphics",
+  "avx2": true,
+  "avx512": false
+ },
+ "gpu": 0,
+ "gpus": [
+  {
+   "index": 0,
+   "name": "NVIDIA GeForce RTX 3050 Laptop GPU",
+   "vendor": "nvidia",
+   "vram_gb": 4.0,
+   "integrated": false,
+   "pci": null,
+   "problem": null
+  }
+ ],
+ "data_dir": "C:\\XeStrata\\data",
+ "families": [
+  {
+   "id": "qwen",
+   "title": "Qwen3.8-Flash-Next",
+   "by": "Qwen; GSQ-RCO quants by ISTA-DASLab",
+   "about": "the original model",
+   "license": null,
+   "experimental": false,
+   "images": true,
+   "kv": true,
+   "speed_projection": true,
+   "kv_takes": [
+    "int8",
+    "q4_0",
+    "k8v4",
+    "fp16"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144,
+    393216,
+    524288
+   ],
+   "models": [
+    {
+     "id": "Q2_0",
+     "about": "2-bit, the fastest",
+     "download_gb": 66.4,
+     "ram_gb": 48,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "IQ2_XS",
+     "about": "2-bit i-quant, a little better quality, close in speed",
+     "download_gb": 68.0,
+     "ram_gb": 48,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "IQ3_XXS",
+     "about": "3-bit i-quant, better quality, slower (more CPU work per token)",
+     "download_gb": 75.8,
+     "ram_gb": 60,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "IQ3_S",
+     "about": "3.5-bit i-quant, the best quality (matches the full model), the slowest; needs a 64 GB PC with little else running",
+     "download_gb": 83.6,
+     "ram_gb": 62,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    }
+   ]
+  },
+  {
+   "id": "swift",
+   "title": "Swift 1.5",
+   "by": "UkisAI's fine-tune of Qwen3.8-Flash-Next",
+   "about": "thinks much shorter (-63% thinking tokens, 1.8x sooner answers by its authors' numbers)",
+   "license": "Swift Open License 1.0: https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+   "experimental": false,
+   "images": true,
+   "kv": true,
+   "speed_projection": false,
+   "kv_takes": [
+    "int8",
+    "q4_0",
+    "k8v4",
+    "fp16"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144,
+    393216,
+    524288
+   ],
+   "models": [
+    {
+     "id": "Q2_0",
+     "about": "2-bit, the fastest",
+     "download_gb": 66.4,
+     "ram_gb": 48,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "IQ2_XS",
+     "about": "2-bit i-quant, a little better quality, close in speed",
+     "download_gb": 68.0,
+     "ram_gb": 48,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "IQ3_XXS",
+     "about": "3-bit i-quant, better quality, slower (more CPU work per token)",
+     "download_gb": 75.8,
+     "ram_gb": 60,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "IQ3_S",
+     "about": "3.5-bit i-quant, the best quality (matches the full model), the slowest; needs a 64 GB PC with little else running",
+     "download_gb": 83.6,
+     "ram_gb": 62,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    }
+   ]
+  },
+  {
+   "id": "coder",
+   "title": "Qwen3.8-Flash-Next Coder",
+   "by": "ISTA-DASLab's coding version",
+   "about": "half the experts (code, tools, images kept): needs ~32 GB of RAM, faster; weaker outside coding",
+   "license": null,
+   "experimental": false,
+   "images": true,
+   "kv": true,
+   "speed_projection": true,
+   "kv_takes": [
+    "int8",
+    "q4_0",
+    "k8v4",
+    "fp16"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144,
+    393216,
+    524288
+   ],
+   "models": [
+    {
+     "id": "IQ1_M",
+     "about": "the Coder's only size: half the experts, stored like IQ3_S (3.5 bits)",
+     "download_gb": 58.4,
+     "ram_gb": 32,
+     "fits": "yes",
+     "tested": true,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    }
+   ]
+  },
+  {
+   "id": "unsloth",
+   "title": "Qwen3.8-Flash-Next (Unsloth)",
+   "by": "Unsloth's Dynamic v3.1 quantizations",
+   "about": "2 to 4 bits (UD-Q2_0 to UD-Q4_K_XL, 71 to 111 GB downloads) and 5 to 8 bits; with too little RAM part of the experts are read from the SSD",
+   "license": null,
+   "experimental": false,
+   "images": true,
+   "kv": true,
+   "speed_projection": true,
+   "kv_takes": [
+    "int8",
+    "q4_0",
+    "k8v4",
+    "fp16"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144,
+    393216,
+    524288
+   ],
+   "models": [
+    {
+     "id": "UD-Q2_0",
+     "about": "2-bit (Unsloth Dynamic v3.1), experts a little larger than the GSQ-RCO IQ2_XS's; on a PC with less than ~61 GB of RAM part of its experts are read from the SSD",
+     "download_gb": 70.5,
+     "ram_gb": 48,
+     "fits": "budget",
+     "tested": true,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "UD-IQ2_XS",
+     "about": "2-bit i-quant (Unsloth Dynamic v3.1), experts about the GSQ-RCO IQ3_XXS's size; on a PC with less than ~66 GB of RAM part of its experts are read from the SSD",
+     "download_gb": 75.8,
+     "ram_gb": 48,
+     "fits": "budget",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "UD-Q2_K_XL",
+     "about": "2- to 3-bit (Unsloth Dynamic v3.1), experts between the GSQ-RCO IQ3_XXS and IQ3_S in size; on a PC with less than ~70 GB of RAM part of its experts are read from the SSD",
+     "download_gb": 79.6,
+     "ram_gb": 48,
+     "fits": "budget",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "UD-IQ3_XXS",
+     "about": "3-bit i-quant (Unsloth Dynamic v3.1), experts the GSQ-RCO IQ3_S's size; on a PC with less than ~74 GB of RAM part of its experts are read from the SSD",
+     "download_gb": 83.6,
+     "ram_gb": 48,
+     "fits": "budget",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "UD-Q3_K_XL",
+     "about": "3-bit (Unsloth Dynamic v3.1), experts between IQ3_S and UD-IQ4_XS in size; on a PC with less than ~80 GB of RAM part of its experts are read from the SSD",
+     "download_gb": 89.5,
+     "ram_gb": 48,
+     "fits": "budget",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "UD-IQ4_XS",
+     "about": "~4-bit i-quant (Unsloth Dynamic v3.1), between IQ3_S and UD-Q4_K_XL in quality; on a PC with less than ~84 GB of RAM part of its experts are read from the SSD",
+     "download_gb": 93.7,
+     "ram_gb": 48,
+     "fits": "budget",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "UD-Q4_K_XL",
+     "about": "4-bit (Unsloth Dynamic v3.1), EXPERIMENTAL: the best quality, but on a 64 GB PC part of its experts come from the SSD while it answers, so it is slower than the 2-3-bit models",
+     "download_gb": 111.3,
+     "ram_gb": 48,
+     "fits": "budget",
+     "tested": true,
+     "experimental": true,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "UD-Q5_K_XL",
+     "about": "5-bit (Unsloth Dynamic): Q5_K experts with Q8_0 downs, close to Q8_0 in quality; not tested in XeStrata",
+     "download_gb": 158.3,
+     "ram_gb": 108,
+     "fits": "budget",
+     "tested": true,
+     "experimental": true,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "UD-Q6_K_XL",
+     "about": "6-bit (Unsloth Dynamic): Q6_K experts with Q8_0 downs; not tested in XeStrata",
+     "download_gb": 169.2,
+     "ram_gb": 118,
+     "fits": "budget",
+     "tested": true,
+     "experimental": true,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "Q8_0",
+     "about": "8-bit, the reference quality (every expert Q8_0), for a 192 GB PC; not tested in XeStrata",
+     "download_gb": 188.2,
+     "ram_gb": 136,
+     "fits": "budget",
+     "tested": true,
+     "experimental": true,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    }
+   ]
+  },
+  {
+   "id": "gyro",
+   "title": "Qwen3.8-Flash-Next (Gyro)",
+   "by": "Gyro quantizations by agentionai",
+   "about": "Gyro-S (36 GB of RAM, or 38 GB of RAM and VRAM together), Gyro-M (43 or 45 GB) and Gyro-L (59 or 61 GB): 58, 92 and 108 GB downloads (the files include the n-gram table)",
+   "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; the Gyro files are agentionai's quantization): https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF",
+   "experimental": false,
+   "images": true,
+   "kv": true,
+   "speed_projection": false,
+   "kv_takes": [
+    "int8",
+    "q4_0",
+    "k8v4",
+    "fp16"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144,
+    393216,
+    524288
+   ],
+   "models": [
+    {
+     "id": "Gyro-S",
+     "about": "for PCs with little memory (36 GB of RAM, or 38 GB of RAM and VRAM together); lower quality than the 2-3-bit sizes, and the 2-bit Q2_0 decodes faster",
+     "download_gb": 58.5,
+     "ram_gb": 35.8,
+     "fits": "yes",
+     "tested": true,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "Gyro-M",
+     "about": "about IQ3_XXS quality with about 20% less GPU memory (43 GB of RAM, or 45 GB of RAM and VRAM together)",
+     "download_gb": 92.0,
+     "ram_gb": 42.1,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "Gyro-L",
+     "about": "the best of the Gyro sizes, close to IQ3_S, slower than Gyro-M (59 GB of RAM, or 61 GB of RAM and VRAM together)",
+     "download_gb": 108.3,
+     "ram_gb": 58.4,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    }
+   ]
+  },
+  {
+   "id": "gyro-coder",
+   "title": "Qwen3.8-Flash-Next Gyro-Coder",
+   "by": "agentionai's coding version, Gyro quantized",
+   "about": "half the experts (kept for code): Gyro-Coder-L (35 GB of RAM, or 37 GB of RAM and VRAM together) and Gyro-Coder (26 or 28 GB); 84 and 76 GB downloads (the files include the n-gram table); weaker outside coding",
+   "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; the Gyro-Coder files are agentionai's pruning and quantization): https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF",
+   "experimental": false,
+   "images": true,
+   "kv": true,
+   "speed_projection": false,
+   "kv_takes": [
+    "int8",
+    "q4_0",
+    "k8v4",
+    "fp16"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144,
+    393216,
+    524288
+   ],
+   "models": [
+    {
+     "id": "Gyro-Coder-L",
+     "about": "half the experts, kept for code, at 3.2 bits (35 GB of RAM, or 37 GB of RAM and VRAM together); weaker outside coding",
+     "download_gb": 84.0,
+     "ram_gb": 34.2,
+     "fits": "yes",
+     "tested": true,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "Gyro-Coder",
+     "about": "half the experts, kept for code, at 2.1 bits (26 GB of RAM, or 28 GB of RAM and VRAM together); lower quality than Gyro-Coder-L",
+     "download_gb": 75.8,
+     "ram_gb": 26.0,
+     "fits": "yes",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    }
+   ]
+  },
+  {
+   "id": "huihui-swift",
+   "title": "Swift 1.5 (abliterated)",
+   "by": "huihui-ai's uncensored version of Swift 1.5",
+   "about": "Swift 1.5 with its refusals removed (abliteration): far fewer refusals, and its safety filtering is reduced, so check what it writes",
+   "license": "Swift Open License 1.0 (Swift 1.5's; huihui-ai's abliterated copy): https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF",
+   "experimental": false,
+   "images": true,
+   "kv": true,
+   "speed_projection": false,
+   "kv_takes": [
+    "int8",
+    "q4_0",
+    "k8v4",
+    "fp16"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144,
+    393216,
+    524288
+   ],
+   "models": [
+    {
+     "id": "IQ2_XS",
+     "about": "2-bit i-quant, a little better quality, close in speed",
+     "download_gb": 68.0,
+     "ram_gb": 48,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "IQ3_XXS",
+     "about": "3-bit i-quant, better quality, slower (more CPU work per token)",
+     "download_gb": 75.8,
+     "ram_gb": 60,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    }
+   ]
+  },
+  {
+   "id": "huihui-unsloth",
+   "title": "Qwen3.8-Flash-Next (abliterated)",
+   "by": "huihui-ai's uncensored version, Unsloth's sizes",
+   "about": "Qwen3.8-Flash-Next with its refusals removed (abliteration), as Unsloth's 4- and 8-bit files: far fewer refusals, and its safety filtering is reduced, so check what it writes",
+   "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; huihui-ai's abliterated copy): https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF",
+   "experimental": false,
+   "images": true,
+   "kv": true,
+   "speed_projection": false,
+   "kv_takes": [
+    "int8",
+    "q4_0",
+    "k8v4",
+    "fp16"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144,
+    393216,
+    524288
+   ],
+   "models": [
+    {
+     "id": "UD-IQ4_XS",
+     "about": "~4-bit i-quant (Unsloth Dynamic v3.1), between IQ3_S and UD-Q4_K_XL in quality; on a PC with less than ~84 GB of RAM part of its experts are read from the SSD",
+     "download_gb": 93.7,
+     "ram_gb": 48,
+     "fits": "budget",
+     "tested": true,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "UD-Q4_K_XL",
+     "about": "4-bit (Unsloth Dynamic v3.1), EXPERIMENTAL: the best quality, but on a 64 GB PC part of its experts come from the SSD while it answers, so it is slower than the 2-3-bit models",
+     "download_gb": 111.3,
+     "ram_gb": 48,
+     "fits": "budget",
+     "tested": true,
+     "experimental": true,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "Q8_0",
+     "about": "8-bit, the reference quality (every expert Q8_0), for a 192 GB PC; not tested in XeStrata",
+     "download_gb": 188.2,
+     "ram_gb": 136,
+     "fits": "budget",
+     "tested": true,
+     "experimental": true,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    }
+   ]
+  },
+  {
+   "id": "sc117",
+   "title": "Qwen3.8-Flash-Next GSQ-RCO (abliterated)",
+   "by": "SC117's uncensored version of ISTA-DASLab's GSQ-RCO files",
+   "about": "the original's four sizes with OrcaRouter's refusal removal (abliteration) put in: far fewer refusals, and its safety filtering is reduced, so check what it writes",
+   "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; SC117's abliterated copy): https://huggingface.co/SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF",
+   "experimental": false,
+   "images": true,
+   "kv": true,
+   "speed_projection": false,
+   "kv_takes": [
+    "int8",
+    "q4_0",
+    "k8v4",
+    "fp16"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144,
+    393216,
+    524288
+   ],
+   "models": [
+    {
+     "id": "Q2_0",
+     "about": "2-bit, the fastest",
+     "download_gb": 66.4,
+     "ram_gb": 48,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "IQ2_XS",
+     "about": "2-bit i-quant, a little better quality, close in speed",
+     "download_gb": 68.0,
+     "ram_gb": 48,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "IQ3_XXS",
+     "about": "3-bit i-quant, better quality, slower (more CPU work per token)",
+     "download_gb": 75.8,
+     "ram_gb": 60,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "IQ3_S",
+     "about": "3.5-bit i-quant, the best quality (matches the full model), the slowest; needs a 64 GB PC with little else running",
+     "download_gb": 83.6,
+     "ram_gb": 62,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    }
+   ]
+  },
+  {
+   "id": "sc117-swift",
+   "title": "Swift 1.5 GSQ-RCO (abliterated)",
+   "by": "SC117's uncensored version of Swift 1.5",
+   "about": "Swift 1.5's four sizes with OrcaRouter's refusal removal (abliteration) put in: far fewer refusals, and its safety filtering is reduced, so check what it writes",
+   "license": "Swift Open License 1.0 (Swift 1.5's; SC117's abliterated copy): https://huggingface.co/SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF",
+   "experimental": false,
+   "images": true,
+   "kv": true,
+   "speed_projection": false,
+   "kv_takes": [
+    "int8",
+    "q4_0",
+    "k8v4",
+    "fp16"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144,
+    393216,
+    524288
+   ],
+   "models": [
+    {
+     "id": "Q2_0",
+     "about": "2-bit, the fastest",
+     "download_gb": 66.4,
+     "ram_gb": 48,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "IQ2_XS",
+     "about": "2-bit i-quant, a little better quality, close in speed",
+     "download_gb": 68.0,
+     "ram_gb": 48,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "IQ3_XXS",
+     "about": "3-bit i-quant, better quality, slower (more CPU work per token)",
+     "download_gb": 75.8,
+     "ram_gb": 60,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "IQ3_S",
+     "about": "3.5-bit i-quant, the best quality (matches the full model), the slowest; needs a 64 GB PC with little else running",
+     "download_gb": 83.6,
+     "ram_gb": 62,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    }
+   ]
+  },
+  {
+   "id": "atomicchat",
+   "title": "Qwen3.8-Flash-Next (AtomicChat)",
+   "by": "AtomicChat's AD quantizations",
+   "about": "AD-4.27bpw and AD-5.00bpw: experts stored like IQ3_S's (61 GB of RAM), the n-gram table at 5 or 8 bits; 94 and 110 GB downloads",
+   "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; the AD files are AtomicChat's quantization): https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF",
+   "experimental": false,
+   "images": true,
+   "kv": true,
+   "speed_projection": false,
+   "kv_takes": [
+    "int8",
+    "q4_0",
+    "k8v4",
+    "fp16"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144,
+    393216,
+    524288
+   ],
+   "models": [
+    {
+     "id": "AD-4.27bpw",
+     "about": "experts of 2.5 to 3.5 bits with 4.5-bit downs, the n-gram table at 5 bits",
+     "download_gb": 94.5,
+     "ram_gb": 60.6,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "AD-5.00bpw",
+     "about": "the same experts as AD-4.27bpw, the n-gram table at 8 bits",
+     "download_gb": 110.5,
+     "ram_gb": 60.6,
+     "fits": "no",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    }
+   ]
+  },
+  {
+   "id": "ornith",
+   "title": "Ornith-1.5-35B-A3B",
+   "by": "Ornith AI (MIT)",
+   "about": "35B, 3B active; a Qwen3.5 MoE that reads images: Q4_K_M to BF16, and community GSQ-RCO 3 and 3.5 bits",
+   "license": null,
+   "experimental": false,
+   "images": true,
+   "kv": false,
+   "speed_projection": false,
+   "kv_takes": [
+    "fp16",
+    "int8",
+    "q4_0",
+    "k8v4"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144
+   ],
+   "models": [
+    {
+     "id": "Q4_K_M",
+     "about": "4-bit",
+     "download_gb": 21.7,
+     "ram_gb": 30,
+     "fits": "yes",
+     "tested": true,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "Q5_K_M",
+     "about": "5-bit",
+     "download_gb": 25.3,
+     "ram_gb": 33,
+     "fits": "yes",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "Q6_K",
+     "about": "6-bit",
+     "download_gb": 29.2,
+     "ram_gb": 37,
+     "fits": "yes",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "Q8_0",
+     "about": "8-bit",
+     "download_gb": 37.8,
+     "ram_gb": 46,
+     "fits": "slow",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "BF16",
+     "about": "the unquantized weights",
+     "download_gb": 71.1,
+     "ram_gb": 79,
+     "fits": "slow",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "GSQ-RCO-3BIT",
+     "about": "3-bit GSQ-RCO by pfeifferj (a community reproduction of the method, not IST-DASLab's)",
+     "download_gb": 13.0,
+     "ram_gb": 21,
+     "fits": "yes",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "GSQ-RCO-3.5BIT",
+     "about": "3.5-bit GSQ-RCO by pfeifferj (as above)",
+     "download_gb": 15.2,
+     "ram_gb": 23,
+     "fits": "yes",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    }
+   ]
+  },
+  {
+   "id": "ornith-uncensored",
+   "title": "Ornith-1.5-35B-A3B (uncensored)",
+   "by": "dealignai (MIT), from Ornith AI's Ornith-1.5-35B-A3B",
+   "about": "Ornith-1.5 with its refusals removed (dealignai's CRACK): far fewer refusals, and its safety filtering is reduced, so check what it writes",
+   "license": null,
+   "experimental": false,
+   "images": true,
+   "kv": false,
+   "speed_projection": false,
+   "kv_takes": [
+    "fp16",
+    "int8",
+    "q4_0",
+    "k8v4"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144
+   ],
+   "models": [
+    {
+     "id": "Q4_K_M",
+     "about": "4-bit",
+     "download_gb": 21.7,
+     "ram_gb": 30,
+     "fits": "yes",
+     "tested": false,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "Q5_K_M",
+     "about": "5-bit",
+     "download_gb": 25.3,
+     "ram_gb": 33,
+     "fits": "yes",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "Q6_K",
+     "about": "6-bit",
+     "download_gb": 29.2,
+     "ram_gb": 37,
+     "fits": "yes",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "Q8_0",
+     "about": "8-bit",
+     "download_gb": 37.8,
+     "ram_gb": 46,
+     "fits": "slow",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    }
+   ]
+  },
+  {
+   "id": "llmjp",
+   "title": "llm-jp-4.1-32b-a3b-thinking",
+   "by": "LLM-jp (Apache-2.0)",
+   "about": "32B, 3B active; Japanese and English, a thinking model",
+   "license": null,
+   "experimental": false,
+   "images": true,
+   "kv": false,
+   "speed_projection": false,
+   "kv_takes": [
+    "fp16",
+    "int8"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144
+   ],
+   "models": [
+    {
+     "id": "Q4_K_M",
+     "about": "4-bit",
+     "download_gb": 21.5,
+     "ram_gb": 30,
+     "fits": "yes",
+     "tested": true,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": false,
+     "budget": true
+    },
+    {
+     "id": "BF16",
+     "about": "the unquantized weights",
+     "download_gb": 64.3,
+     "ram_gb": 72,
+     "fits": "slow",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": false,
+     "budget": true
+    }
+   ]
+  },
+  {
+   "id": "qwen36",
+   "title": "Qwen3.6-35B-A3B",
+   "by": "Qwen (Apache-2.0), GGUFs with the MTP layer by Unsloth",
+   "about": "35B, 3B active; a Qwen3.5 MoE that reads images: Unsloth's 4-, 6- and 8-bit files",
+   "license": null,
+   "experimental": false,
+   "images": true,
+   "kv": false,
+   "speed_projection": false,
+   "kv_takes": [
+    "fp16",
+    "int8",
+    "q4_0",
+    "k8v4"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144
+   ],
+   "models": [
+    {
+     "id": "UD-Q4_K_XL",
+     "about": "4-bit (Unsloth Dynamic)",
+     "download_gb": 22.9,
+     "ram_gb": 31,
+     "fits": "yes",
+     "tested": true,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "UD-Q6_K_XL",
+     "about": "6-bit (Unsloth Dynamic), closer to the full model",
+     "download_gb": 32.6,
+     "ram_gb": 41,
+     "fits": "slow",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "Q8_0",
+     "about": "8-bit, the closest to the full model",
+     "download_gb": 37.8,
+     "ram_gb": 46,
+     "fits": "slow",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    }
+   ]
+  },
+  {
+   "id": "qwen36-uncensored",
+   "title": "Qwen3.6-35B-A3B (uncensored)",
+   "by": "llmfan46 (Apache-2.0), APEX GGUFs by SC117, from Qwen's model",
+   "about": "Qwen3.6-35B-A3B with its refusals removed (Heretic + MPOA): far fewer refusals, and its safety filtering is reduced, so check what it writes",
+   "license": null,
+   "experimental": false,
+   "images": true,
+   "kv": false,
+   "speed_projection": false,
+   "kv_takes": [
+    "fp16",
+    "int8",
+    "q4_0",
+    "k8v4"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144
+   ],
+   "models": [
+    {
+     "id": "APEX-I-Quality",
+     "about": "the best of the four by its authors' numbers (APEX's mixed 4 to 6 bits)",
+     "download_gb": 23.5,
+     "ram_gb": 32,
+     "fits": "yes",
+     "tested": false,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "APEX-I-Balanced",
+     "about": "5 and 6 bits, its authors' all-rounder",
+     "download_gb": 26.0,
+     "ram_gb": 34,
+     "fits": "yes",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "APEX-I-Compact",
+     "about": "3 and 4 bits, smaller and a little lower in quality",
+     "download_gb": 17.0,
+     "ram_gb": 25,
+     "fits": "yes",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    },
+    {
+     "id": "APEX-I-MINI",
+     "about": "2 and 3 bits, the smallest, lower in quality",
+     "download_gb": 14.3,
+     "ram_gb": 22,
+     "fits": "yes",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": true
+    }
+   ]
+  },
+  {
+   "id": "qwen35",
+   "title": "Qwen3.5-9B",
+   "by": "Qwen (Apache-2.0), GGUFs by Unsloth",
+   "about": "9B, dense, reads images: for a GPU of 8 GB or more, every weight in its VRAM",
+   "license": null,
+   "experimental": false,
+   "images": true,
+   "kv": false,
+   "speed_projection": false,
+   "kv_takes": [
+    "fp16",
+    "int8",
+    "q4_0",
+    "k8v4"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144
+   ],
+   "models": [
+    {
+     "id": "Q4_K_M",
+     "about": "4-bit",
+     "download_gb": 5.7,
+     "ram_gb": 8,
+     "fits": "no",
+     "tested": false,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "Q6_K",
+     "about": "6-bit",
+     "download_gb": 7.5,
+     "ram_gb": 8,
+     "fits": "no",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "Q8_0",
+     "about": "8-bit, the closest to the full model",
+     "download_gb": 9.5,
+     "ram_gb": 8,
+     "fits": "no",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "BF16",
+     "about": "the unquantized weights",
+     "download_gb": 17.9,
+     "ram_gb": 8,
+     "fits": "no",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    }
+   ]
+  },
+  {
+   "id": "qwen35-2b",
+   "title": "Qwen3.5-2B",
+   "by": "Qwen (Apache-2.0), GGUFs by Unsloth",
+   "about": "2B, dense, reads images: for a small GPU or a PC without one; its answers fall short of the 9B's",
+   "license": null,
+   "experimental": false,
+   "images": true,
+   "kv": false,
+   "speed_projection": false,
+   "kv_takes": [
+    "fp16",
+    "int8",
+    "q4_0",
+    "k8v4"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144
+   ],
+   "models": [
+    {
+     "id": "Q4_K_M",
+     "about": "4-bit",
+     "download_gb": 1.3,
+     "ram_gb": 8,
+     "fits": "yes",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "UD-Q5_K_XL",
+     "about": "5-bit (Unsloth Dynamic)",
+     "download_gb": 1.5,
+     "ram_gb": 8,
+     "fits": "yes",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "Q6_K",
+     "about": "6-bit",
+     "download_gb": 1.6,
+     "ram_gb": 8,
+     "fits": "yes",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "Q8_0",
+     "about": "8-bit, the closest to the full model",
+     "download_gb": 2.0,
+     "ram_gb": 8,
+     "fits": "yes",
+     "tested": false,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "BF16",
+     "about": "the unquantized weights",
+     "download_gb": 3.8,
+     "ram_gb": 8,
+     "fits": "no",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    }
+   ]
+  },
+  {
+   "id": "qwen35-0.8b",
+   "title": "Qwen3.5-0.8B",
+   "by": "Qwen (Apache-2.0), GGUFs by Unsloth",
+   "about": "0.8B, dense, reads images: the smallest, for a small GPU or a PC without one; its answers fall short of the 2B's and the 9B's",
+   "license": null,
+   "experimental": false,
+   "images": true,
+   "kv": false,
+   "speed_projection": false,
+   "kv_takes": [
+    "fp16",
+    "int8",
+    "q4_0",
+    "k8v4"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144
+   ],
+   "models": [
+    {
+     "id": "Q4_K_M",
+     "about": "4-bit",
+     "download_gb": 0.5,
+     "ram_gb": 8,
+     "fits": "yes",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "Q6_K",
+     "about": "6-bit",
+     "download_gb": 0.6,
+     "ram_gb": 8,
+     "fits": "yes",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "Q8_0",
+     "about": "8-bit, the closest to the full model",
+     "download_gb": 0.8,
+     "ram_gb": 8,
+     "fits": "yes",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "BF16",
+     "about": "the unquantized weights",
+     "download_gb": 1.5,
+     "ram_gb": 8,
+     "fits": "yes",
+     "tested": false,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    }
+   ]
+  },
+  {
+   "id": "qwen35-uncensored",
+   "title": "Qwen3.5-9B (uncensored)",
+   "by": "HauhauCS (Apache-2.0), from Qwen's Qwen3.5-9B",
+   "about": "Qwen3.5-9B with its refusals removed (HauhauCS's Aggressive): far fewer refusals, and its safety filtering is reduced, so check what it writes",
+   "license": null,
+   "experimental": false,
+   "images": true,
+   "kv": false,
+   "speed_projection": false,
+   "kv_takes": [
+    "fp16",
+    "int8",
+    "q4_0",
+    "k8v4"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144
+   ],
+   "models": [
+    {
+     "id": "Q4_K_M",
+     "about": "4-bit",
+     "download_gb": 5.6,
+     "ram_gb": 8,
+     "fits": "no",
+     "tested": false,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "Q6_K",
+     "about": "6-bit",
+     "download_gb": 7.4,
+     "ram_gb": 8,
+     "fits": "no",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "Q8_0",
+     "about": "8-bit",
+     "download_gb": 9.5,
+     "ram_gb": 8,
+     "fits": "no",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    },
+    {
+     "id": "BF16",
+     "about": "the unquantized weights",
+     "download_gb": 17.9,
+     "ram_gb": 8,
+     "fits": "no",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": true,
+     "budget": false
+    }
+   ]
+  },
+  {
+   "id": "glm53",
+   "title": "GLM-5.3-Flash",
+   "by": "Z.ai (MIT), GGUFs by Unsloth",
+   "about": "320B, 18B active; a large MoE for the PCs whose RAM and VRAM hold 95 GB or more",
+   "license": null,
+   "experimental": false,
+   "images": true,
+   "kv": false,
+   "speed_projection": false,
+   "kv_takes": [
+    "fp16"
+   ],
+   "contexts": [
+    8192,
+    32768,
+    65536,
+    131072,
+    204800,
+    262144
+   ],
+   "models": [
+    {
+     "id": "UD-IQ3_XXS",
+     "about": "3-bit (Unsloth Dynamic)",
+     "download_gb": 120.4,
+     "ram_gb": 128,
+     "fits": "slow",
+     "tested": true,
+     "experimental": false,
+     "recommended": true,
+     "context": 32768,
+     "vision": false,
+     "budget": true
+    },
+    {
+     "id": "UD-IQ1_S",
+     "about": "1-bit (Unsloth Dynamic), the smallest",
+     "download_gb": 93.1,
+     "ram_gb": 101,
+     "fits": "slow",
+     "tested": true,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": false,
+     "budget": true
+    },
+    {
+     "id": "UD-IQ4_XS",
+     "about": "4-bit (Unsloth Dynamic), the best quality",
+     "download_gb": 156.8,
+     "ram_gb": 165,
+     "fits": "slow",
+     "tested": false,
+     "experimental": false,
+     "recommended": false,
+     "context": 32768,
+     "vision": false,
+     "budget": true
+    }
+   ]
+  }
+ ],
+ "installed": [
+  {
+   "config": "C:\\XeStrata\\settings\\xestrata-ornith-1.5-35b-a3b-gsq-rco-3bit.json",
+   "model_name": "ornith-1.5-35b-a3b-gsq-rco-3bit",
+   "family": "ornith",
+   "model": "GSQ-RCO-3BIT",
+   "context": 32768,
+   "port": 8095,
+   "images": []
+  }
+ ],
+ "images": [
+  {
+   "id": "qwen-image-turbo",
+   "title": "Qwen-Image-2.1-Turbo",
+   "about": "Everyday images and edits (recommended), 8 steps",
+   "download_gb": 18.2,
+   "ram_gb": 20.2,
+   "edits": true,
+   "license": "Qwen-Image-2.1-Turbo is under the Qwen Research License (not Apache 2.0): https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo/blob/main/LICENSE - read it before you use the images commercially",
+   "tools": [
+    "generate_image",
+    "edit_image",
+    "extend_image",
+    "upscale_image",
+    "upscale_video",
+    "segment_video",
+    "fix_image",
+    "edit_region",
+    "find_region",
+    "control",
+    "remove_background"
+   ],
+   "uncensored": true,
+   "quants": [
+    "Q8_0",
+    "Q6_K",
+    "Q4_K_M"
+   ]
+  },
+  {
+   "id": "qwen-image-base",
+   "title": "Qwen-Image-2.1",
+   "about": "Turbo's base model: the steps can be changed, about 5 times as long an image",
+   "download_gb": 18.2,
+   "ram_gb": 20.2,
+   "edits": true,
+   "license": "Qwen-Image-2.1 is under the Qwen Research License (not Apache 2.0): https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/LICENSE - read it before you use the images commercially",
+   "tools": [
+    "generate_image",
+    "edit_image",
+    "extend_image",
+    "upscale_image",
+    "upscale_video",
+    "segment_video",
+    "fix_image",
+    "edit_region",
+    "find_region",
+    "control",
+    "remove_background"
+   ],
+   "uncensored": true,
+   "quants": [
+    "Q8_0",
+    "Q6_K",
+    "Q4_K_M"
+   ]
+  },
+  {
+   "id": "mage-flow-turbo",
+   "title": "Mage-Flow-Turbo",
+   "about": "The fastest, a small model (4B) for PCs with little RAM or VRAM, 4 steps",
+   "download_gb": 21.9,
+   "ram_gb": 16.2,
+   "edits": true,
+   "license": "Mage-Flow-Turbo is under the MIT license; Microsoft released it for research, and asks those who deploy it more widely to add their own safeguards (content moderation): https://github.com/microsoft/Mage",
+   "tools": [
+    "generate_image",
+    "edit_image",
+    "extend_image",
+    "upscale_image",
+    "upscale_video",
+    "segment_video",
+    "fix_image",
+    "edit_region",
+    "find_region",
+    "control",
+    "remove_background"
+   ],
+   "uncensored": true,
+   "quants": [
+    "int8",
+    "bf16"
+   ]
+  },
+  {
+   "id": "mage-flow",
+   "title": "Mage-Flow",
+   "about": "Mage-Flow tuned to follow instructions and draw text better, 20 steps with guidance",
+   "download_gb": 21.9,
+   "ram_gb": 16.2,
+   "edits": true,
+   "license": "Mage-Flow is under the MIT license; Microsoft released it for research, and asks those who deploy it more widely to add their own safeguards (content moderation): https://github.com/microsoft/Mage",
+   "tools": [
+    "generate_image",
+    "edit_image",
+    "extend_image",
+    "upscale_image",
+    "upscale_video",
+    "segment_video",
+    "fix_image",
+    "edit_region",
+    "find_region",
+    "control",
+    "remove_background"
+   ],
+   "uncensored": true,
+   "quants": [
+    "int8",
+    "bf16"
+   ]
+  },
+  {
+   "id": "mage-flow-base",
+   "title": "Mage-Flow-Base",
+   "about": "Mage-Flow's base model, 30 steps with guidance",
+   "download_gb": 21.9,
+   "ram_gb": 16.2,
+   "edits": true,
+   "license": "Mage-Flow-Base is under the MIT license; Microsoft released it for research, and asks those who deploy it more widely to add their own safeguards (content moderation): https://github.com/microsoft/Mage",
+   "tools": [
+    "generate_image",
+    "edit_image",
+    "extend_image",
+    "upscale_image",
+    "upscale_video",
+    "segment_video",
+    "fix_image",
+    "edit_region",
+    "find_region",
+    "control",
+    "remove_background"
+   ],
+   "uncensored": true,
+   "quants": [
+    "int8",
+    "bf16"
+   ]
+  },
+  {
+   "id": "magetrail",
+   "title": "MageTrail",
+   "about": "Mage-Flow tuned on Danbooru and e621 images, for illustrations from booru tags; no edits",
+   "download_gb": 10.4,
+   "ram_gb": 9.6,
+   "edits": false,
+   "license": "MageTrail (RicemanT's finetune of Mage-Flow on Danbooru and e621 images) is under the MIT license: https://huggingface.co/RicemanT/MageTrail; its VAE, Black Forest Labs' Flux2 VAE from FLUX.2-klein-4B, under Apache 2.0",
+   "tools": [
+    "generate_image",
+    "edit_image",
+    "extend_image",
+    "upscale_image",
+    "upscale_video",
+    "segment_video",
+    "fix_image",
+    "edit_region",
+    "find_region",
+    "control",
+    "remove_background"
+   ],
+   "uncensored": true,
+   "quants": [
+    "int8",
+    "bf16"
+   ]
+  },
+  {
+   "id": "hunyuan-image-3-distil",
+   "title": "HunyuanImage 3.0 Instruct-Distil",
+   "about": "Tencent's large MoE model (80B), the most detailed and the slowest; reads its own prompt, needs about 50 GB of RAM; edits with up to 3 reference images",
+   "download_gb": 52.8,
+   "ram_gb": 52.4,
+   "edits": true,
+   "license": "HunyuanImage 3.0 Instruct-Distil is under the Tencent Hunyuan Community License Agreement, which does not apply in the European Union, the United Kingdom or South Korea: https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE - read it and its Acceptable Use Policy before you use the images",
+   "tools": [
+    "generate_image",
+    "edit_image",
+    "extend_image",
+    "upscale_image",
+    "upscale_video",
+    "segment_video",
+    "fix_image",
+    "edit_region",
+    "find_region",
+    "control",
+    "remove_background"
+   ],
+   "uncensored": false,
+   "quants": [
+    "int8",
+    "w4a8"
+   ]
+  },
+  {
+   "id": "moss-image",
+   "title": "MOSS-Image",
+   "about": "OpenMOSS's 5B model: text in images and a layout of boxes in the prompt, 50 steps with guidance; edits with up to four reference images (its edit adapter, fetched with it)",
+   "download_gb": 22.1,
+   "ram_gb": 14.5,
+   "edits": true,
+   "license": "MOSS-Image is under the Apache 2.0 license: https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT; its text encoder, Qwen3.5-9B, too (HauhauCS's uncensored one, from it, as well).  Its edit adapters: chinoll's Moss-Image-Edit (PedroMarinhoDev's ComfyUI copy) under GPL-3.0, https://huggingface.co/PedroMarinhoDev/Moss-Image-Edit-ComfyUI; akhaliq's MOSS-Image-Edit-HQ armV5 and armV6 under Apache 2.0, https://huggingface.co/akhaliq/MOSS-Image-Edit-HQ",
+   "tools": [
+    "generate_image",
+    "edit_image",
+    "extend_image",
+    "upscale_image",
+    "upscale_video",
+    "segment_video",
+    "fix_image",
+    "edit_region",
+    "find_region",
+    "control",
+    "remove_background"
+   ],
+   "uncensored": true,
+   "quants": [
+    "int8",
+    "bf16"
+   ]
+  },
+  {
+   "id": "moss-image-base",
+   "title": "MOSS-Image-Base",
+   "about": "MOSS-Image's base model, before its fine-tuning, 50 steps with guidance",
+   "download_gb": 22.1,
+   "ram_gb": 14.5,
+   "edits": true,
+   "license": "MOSS-Image-Base is under the Apache 2.0 license: https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base; its text encoder, Qwen3.5-9B, too (HauhauCS's uncensored one, from it, as well).  Its edit adapters: chinoll's Moss-Image-Edit (PedroMarinhoDev's ComfyUI copy) under GPL-3.0, https://huggingface.co/PedroMarinhoDev/Moss-Image-Edit-ComfyUI; akhaliq's MOSS-Image-Edit-HQ armV5 and armV6 under Apache 2.0, https://huggingface.co/akhaliq/MOSS-Image-Edit-HQ",
+   "tools": [
+    "generate_image",
+    "edit_image",
+    "extend_image",
+    "upscale_image",
+    "upscale_video",
+    "segment_video",
+    "fix_image",
+    "edit_region",
+    "find_region",
+    "control",
+    "remove_background"
+   ],
+   "uncensored": true,
+   "quants": [
+    "int8",
+    "bf16"
+   ]
+  },
+  {
+   "id": "moss-image-4-step",
+   "title": "MOSS-Image 4-step",
+   "about": "MOSS-Image with darask0's 4-step adapter: about ten times as fast, 4 steps without guidance; no edits",
+   "download_gb": 21.2,
+   "ram_gb": 13.9,
+   "edits": false,
+   "license": "MOSS-Image 4-step is MOSS-Image (SFT), under the Apache 2.0 license: https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT, with darask0's 4-step adapter, under Apache 2.0 too: https://huggingface.co/darask0/MOSS-Image_4-step_adapter_lora; its text encoder, Qwen3.5-9B, too (HauhauCS's uncensored one, from it, as well)",
+   "tools": [
+    "generate_image",
+    "edit_image",
+    "extend_image",
+    "upscale_image",
+    "upscale_video",
+    "segment_video",
+    "fix_image",
+    "edit_region",
+    "find_region",
+    "control",
+    "remove_background"
+   ],
+   "uncensored": true,
+   "quants": [
+    "int8",
+    "bf16"
+   ]
+  },
+  {
+   "id": "anima-base",
+   "title": "Anima",
+   "about": "Anima (2B), anime illustrations from Danbooru tags and sentences, 30 steps with guidance; the model to train LoRAs on",
+   "download_gb": 5.6,
+   "ram_gb": 5.7,
+   "edits": false,
+   "license": "Anima is under CircleStone Labs' non-commercial license and NVIDIA's Open Model License (it is built on Cosmos-Predict2): https://huggingface.co/circlestone-labs/Anima - the model may not be used commercially; the images it makes may be.  Its text encoder Qwen3-0.6B-Base and T5's tokenizer are under Apache 2.0",
+   "tools": [
+    "generate_image",
+    "edit_image",
+    "extend_image",
+    "upscale_image",
+    "upscale_video",
+    "segment_video",
+    "fix_image",
+    "edit_region",
+    "find_region",
+    "control",
+    "remove_background"
+   ],
+   "uncensored": false,
+   "quants": [
+    "int8",
+    "bf16"
+   ]
+  },
+  {
+   "id": "anima-aesthetic",
+   "title": "Anima-Aesthetic",
+   "about": "Anima tuned to a consistent, polished default style, 30 steps with guidance",
+   "download_gb": 5.6,
+   "ram_gb": 5.7,
+   "edits": false,
+   "license": "Anima-Aesthetic is under CircleStone Labs' non-commercial license and NVIDIA's Open Model License (it is built on Cosmos-Predict2): https://huggingface.co/circlestone-labs/Anima - the model may not be used commercially; the images it makes may be.  Its text encoder Qwen3-0.6B-Base and T5's tokenizer are under Apache 2.0",
+   "tools": [
+    "generate_image",
+    "edit_image",
+    "extend_image",
+    "upscale_image",
+    "upscale_video",
+    "segment_video",
+    "fix_image",
+    "edit_region",
+    "find_region",
+    "control",
+    "remove_background"
+   ],
+   "uncensored": false,
+   "quants": [
+    "int8",
+    "bf16"
+   ]
+  },
+  {
+   "id": "anima-turbo",
+   "title": "Anima-Turbo",
+   "about": "Anima distilled for speed, 10 steps without guidance",
+   "download_gb": 5.6,
+   "ram_gb": 5.7,
+   "edits": false,
+   "license": "Anima-Turbo is under CircleStone Labs' non-commercial license and NVIDIA's Open Model License (it is built on Cosmos-Predict2): https://huggingface.co/circlestone-labs/Anima - the model may not be used commercially; the images it makes may be.  Its text encoder Qwen3-0.6B-Base and T5's tokenizer are under Apache 2.0",
+   "tools": [
+    "generate_image",
+    "edit_image",
+    "extend_image",
+    "upscale_image",
+    "upscale_video",
+    "segment_video",
+    "fix_image",
+    "edit_region",
+    "find_region",
+    "control",
+    "remove_background"
+   ],
+   "uncensored": false,
+   "quants": [
+    "int8",
+    "bf16"
+   ]
+  },
+  {
+   "id": "anima-2.9b",
+   "title": "Anima-2.9B",
+   "about": "Anima expanded to 40 blocks (2.9B, a preview), 30 steps with guidance",
+   "download_gb": 7.3,
+   "ram_gb": 6.6,
+   "edits": false,
+   "license": "Anima-2.9B is under CircleStone Labs' non-commercial license and NVIDIA's Open Model License (it is built on Cosmos-Predict2): https://huggingface.co/Gazingstars123/Anima-2.9B - the model may not be used commercially; the images it makes may be.  Its text encoder Qwen3-0.6B-Base and T5's tokenizer are under Apache 2.0",
+   "tools": [
+    "generate_image",
+    "edit_image",
+    "extend_image",
+    "upscale_image",
+    "upscale_video",
+    "segment_video",
+    "fix_image",
+    "edit_region",
+    "find_region",
+    "control",
+    "remove_background"
+   ],
+   "uncensored": false,
+   "quants": [
+    "int8",
+    "bf16"
+   ]
+  }
+ ],
+ "image_default": [
+  "mage-flow-turbo",
+  "qwen-image-turbo",
+  "moss-image"
+ ],
+ "web_search": null,
+ "custom": null
+}

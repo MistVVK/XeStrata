@@ -175,6 +175,12 @@ FALLBACK_FAMILIES = {
     "qwen35": {"title": "Qwen3.5-9B",
                "about": "9B, dense, reads images: for a GPU of 8 GB or more, every weight in its VRAM",
                "tag": "qwen35-"},
+    "qwen35-2b": {"title": "Qwen3.5-2B",
+                  "about": "2B, dense, reads images: for a small GPU or a PC without one; its answers fall short of "
+                           "the 9B's", "tag": "qwen35-2b-"},
+    "qwen35-0.8b": {"title": "Qwen3.5-0.8B",
+                    "about": "0.8B, dense, reads images: the smallest, for a small GPU or a PC without one",
+                    "tag": "qwen35-0.8b-"},
     "qwen35-uncensored": {"title": "Qwen3.5-9B (uncensored)",
                           "about": "Qwen3.5-9B with its refusals removed (HauhauCS's Aggressive): far fewer refusals, "
                                    "and its safety filtering is reduced, so check what it writes",

@@ -112,7 +112,7 @@ A model not in the table can be installed from GGUF files you have with `xestrat
 | **Qwen3.5-2B, 0.8B** (BETA) | 2B, 0.8B (dense) | 8 GB (VRAM 2-6 GB); 4-6 GB without a GPU | thinking models that read images too, for a small GPU or a PC without one; their answers fall short of the 9B's |
 | **GLM-5.3-Flash** (BETA) | 320B (18B a token) | 101-165 GB of RAM and VRAM | a large thinking model; a PC with a lot of RAM |
 
-The BETA models do not make images yet; of them Ornith-1.5, Qwen3.6-35B-A3B and Qwen3.5's 9B, 2B and 0.8B read images (2B and 0.8B on a GPU only). Their sizes and
+Of the BETA models, Ornith-1.5, Qwen3.6-35B-A3B and Qwen3.5's 9B, 2B and 0.8B read images (2B and 0.8B on a GPU only); image generation can be added to any model on a PC with a GPU. Their sizes and
 options are in
 [DETAILS](docs/DETAILS.md#or-models-other-than-qwen38-flash-next-ornith-15-llm-jp-41-qwen36-35b-a3b-qwen35-9b-glm-53-flash).
 
@@ -263,7 +263,7 @@ Installing from the source with `./setup.sh` is in [docs/BUILD.md](docs/BUILD.md
 ### Windows
 
 1. Download `XeStrata-<version>-windows-x64.7z` from [GitHub's Releases](https://github.com/MistVVK/XeStrata/releases) (with `SHA256SUMS`) and unpack it into a folder of your choice.
-1. Start `xestrata.exe`. It takes you through the install (the GPU and the model, the download) and the start on screen. Setup's questions and options, tuning, measuring the speed and removing the data are on screen too. Installing from your own GGUF files (`--gguf`) is "Install from files on this PC". On the console, `xestrata-cli.exe` (used as `xestrata` on Linux, `xestrata-cli chat` and `xestrata-cli images` included).
+1. Start `xestrata.exe`. It takes you through the install (the GPU and the model, the download) and the start on screen. Setup's questions and options, tuning, measuring the speed and removing the data are on screen too. Installing from your own GGUF files (`--gguf`) is "Install from files on this PC". The window is in Windows' display language (English, German, French, Spanish, Japanese, Korean, Portuguese, Russian or Chinese; English for the others), or the one `xestrata.exe --lang ja` names; setup's steps and the models' descriptions are in English. On the console, `xestrata-cli.exe` (used as `xestrata` on Linux, `xestrata-cli chat` and `xestrata-cli images` included).
 
 - **What it needs:** the [.NET 10 runtime](https://dotnet.microsoft.com/download/dotnet/10.0), the [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) and the GPU's driver.
   Without the Visual C++ Redistributable, `xestrata.exe` says so and stops.

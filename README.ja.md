@@ -109,7 +109,7 @@ RAM がそれより少ない PC では、Coder（32 GB）、Gyro（36 GB、RAM �
 | **Qwen3.5-2B・0.8B**（BETA） | 20 億・8 億（密） | 8 GB（VRAM は 2〜6 GB）、GPU なしでは 4〜6 GB | 小さな GPU や GPU のない PC 向けの、画像も読む思考するモデル。答えは 9B に及びません |
 | **GLM-5.3-Flash**（BETA） | 3,200 億（1 トークンで 180 億） | RAM と VRAM で 101〜165 GB | 思考する大きなモデル。RAM の多い PC 向け |
 
-BETA のモデルは、画像の生成にまだ対応していません。画像を読ませられるのは Ornith-1.5、Qwen3.6-35B-A3B、Qwen3.5 の 9B・2B・0.8B です（2B と 0.8B は GPU で動かすときだけ）。大きさの表とオプションは [DETAILS](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41qwen36-35b-a3bqwen35-9bglm-53-flash) にあります。
+画像を読ませられる BETA のモデルは Ornith-1.5、Qwen3.6-35B-A3B、Qwen3.5 の 9B・2B・0.8B です（2B と 0.8B は GPU で動かすときだけ）。画像の生成は、GPU があればどのモデルにも足せます。大きさの表とオプションは [DETAILS](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41qwen36-35b-a3bqwen35-9bglm-53-flash) にあります。
 
 ### Qwen3.8-Flash-Next の版と大きさ
 
@@ -254,7 +254,7 @@ sudo dnf remove xestrata-contrib-cuda13.4    # Fedora（同じ）
 ### Windows
 
 1. [GitHub の Releases](https://github.com/MistVVK/XeStrata/releases) から `XeStrata-<版>-windows-x64.7z` を取ってきて（`SHA256SUMS` も一緒に）、好きなフォルダーに展開します。
-1. `xestrata.exe` を起動します。導入（GPU とモデルの選択、ダウンロード）と起動を画面で進めます。setup の質問とオプション、較正、速さの計測、データの削除も画面から使えます。手元の GGUF からの導入（`--gguf`）は「Install from files on this PC」です。端末で使うときは `xestrata-cli.exe`（Linux の `xestrata` と同じ使い方で、`xestrata-cli chat`・`xestrata-cli images` も）です。
+1. `xestrata.exe` を起動します。導入（GPU とモデルの選択、ダウンロード）と起動を画面で進めます。setup の質問とオプション、較正、速さの計測、データの削除も画面から使えます。手元の GGUF からの導入（`--gguf`）は「Install from files on this PC」です。画面は Windows の表示言語（英語・ドイツ語・フランス語・スペイン語・日本語・韓国語・ポルトガル語・ロシア語・中国語。ほかは英語）で出し、`xestrata.exe --lang ja` のように言語を選べます。setup が出す手順やモデルの説明は英語です。端末で使うときは `xestrata-cli.exe`（Linux の `xestrata` と同じ使い方で、`xestrata-cli chat`・`xestrata-cli images` も）です。
 
 - **要るもの**: [.NET 10 のランタイム](https://dotnet.microsoft.com/download/dotnet/10.0)と [Visual C++ の再頒布可能パッケージ](https://aka.ms/vs/17/release/vc_redist.x64.exe)、GPU のドライバー。
   Visual C++ の再頒布可能パッケージがなければ、`xestrata.exe` が知らせて止まります。

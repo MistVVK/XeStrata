@@ -13,6 +13,7 @@ open Avalonia.Controls
 open Avalonia.Layout
 open Avalonia.Platform.Storage
 open Avalonia.Threading
+open Xestrata.Launcher.I18n
 open Xestrata.Launcher.Protocol
 open Xestrata.Launcher.Views
 
@@ -45,7 +46,7 @@ let private optionOf (name: string) (box: TextBox) (ok: string -> bool) (takes: 
     match trimmed box with
     | "" -> Result.Ok []
     | t when ok t -> Result.Ok [ name; t ]
-    | _ -> Error(sprintf "%s takes %s." name takes)
+    | _ -> Error(trf "opt.takes" "{name} takes {what}." [ "name", name :> obj; "what", takes :> obj ])
 
 /// The options' words in order, or the first reason one is refused.
 let private collectArgs (parts: Result<string list, string> list) =
@@ -58,30 +59,30 @@ let private flag (name: string) (box: CheckBox) = if box.IsChecked = Nullable tr
 /// options (blank: as set up before, or setup's default).
 let private runOptions (gpus: Gpu[]) =
     let splitBoxes = [| for g in gpus -> CheckBox(Content = text (sprintf "%s (%s)" g.Name (gb g.VramGb))) |]
-    let layerSplit = TextBox(PlaceholderText = "auto (measured on this PC)", MinWidth = 260.0)
-    let port = TextBox(PlaceholderText = "as set up (8095 for a new model)", MinWidth = 260.0)
+    let layerSplit = TextBox(PlaceholderText = (tr "run.autoMeasuredOnThis" "auto (measured on this PC)"), MinWidth = 260.0)
+    let port = TextBox(PlaceholderText = (tr "run.asSetUp8095" "as set up (8095 for a new model)"), MinWidth = 260.0)
     let host, hostValue =
-        choice [ "This PC only (127.0.0.1)", ""; "Every IPv4 network (0.0.0.0)", "0.0.0.0"; "Every IPv6 network (::)", "::" ] 0
-    let apiKey = TextBox(PlaceholderText = "(none) a key the clients must send; several: key1,key2", MinWidth = 420.0)
-    let reserve = TextBox(PlaceholderText = "the engine's default (700)", MinWidth = 260.0)
+        choice [ (tr "run.thisPcOnly127" "This PC only (127.0.0.1)"), ""; (tr "run.everyIpv4Network0" "Every IPv4 network (0.0.0.0)"), "0.0.0.0"; (tr "run.everyIpv6Network" "Every IPv6 network (::)"), "::" ] 0
+    let apiKey = TextBox(PlaceholderText = (tr "run.noneAKeyThe" "(none) a key the clients must send; several: key1,key2"), MinWidth = 420.0)
+    let reserve = TextBox(PlaceholderText = (tr "run.theEngineSDefault" "the engine's default (700)"), MinWidth = 260.0)
     let vocab, vocabValue =
         choice
-            [ "With Chinese, Japanese and Korean (default)", ""
-              "English and code only (~110 MiB less VRAM)", "en"
-              "English, code and the Cyrillic script", "cyrillic"
-              "English, code and French", "fr" ]
+            [ (tr "run.withChineseJapaneseAnd" "With Chinese, Japanese and Korean (default)"), ""
+              (tr "run.englishAndCodeOnly" "English and code only (~110 MiB less VRAM)"), "en"
+              (tr "run.englishCodeAndThe" "English, code and the Cyrillic script"), "cyrillic"
+              (tr "run.englishCodeAndFrench" "English, code and French"), "fr" ]
             0
-    let oldDriver = CheckBox(Content = text "Start although the Intel GPU's driver is older than the one setup asks for")
+    let oldDriver = CheckBox(Content = text (tr "run.startAlthoughTheIntel" "Start although the Intel GPU's driver is older than the one setup asks for"))
     let control =
         stack 10.0 [
             if gpus.Length > 1 then
-                yield field "Split the model's layers over these GPUs (two or more; the first runs the early layers)" (stack 4.0 [ for b in splitBoxes -> b :> Control ]) :> Control
-                yield field "With a split: the first layer of each later GPU's share (e.g. 36, or 16,32 for three GPUs)" layerSplit :> Control
-            yield field "Port" port :> Control
-            yield field "Who may connect (with networks: set an API key too)" host :> Control
-            yield field "API key" apiKey :> Control
-            yield field "VRAM left free for other programs, in MiB" reserve :> Control
-            yield field "The draft layer's tokens" vocab :> Control
+                yield field (tr "run.splitTheModelS" "Split the model's layers over these GPUs (two or more; the first runs the early layers)") (stack 4.0 [ for b in splitBoxes -> b :> Control ]) :> Control
+                yield field (tr "run.withASplitThe" "With a split: the first layer of each later GPU's share (e.g. 36, or 16,32 for three GPUs)") layerSplit :> Control
+            yield field (tr "run.port" "Port") port :> Control
+            yield field (tr "run.whoMayConnectWith" "Who may connect (with networks: set an API key too)") host :> Control
+            yield field (tr "run.apiKey" "API key") apiKey :> Control
+            yield field (tr "run.vramLeftFreeFor" "VRAM left free for other programs, in MiB") reserve :> Control
+            yield field (tr "run.theDraftLayerS" "The draft layer's tokens") vocab :> Control
             yield oldDriver :> Control
         ]
     let args () =
@@ -89,12 +90,12 @@ let private runOptions (gpus: Gpu[]) =
         collectArgs [
             Result.Ok(if split.Length >= 2 then [ "--gpus"; String.Join(",", split) ] else [])
             (if split.Length >= 2 then
-                 optionOf "--layer-split" layerSplit (fun t -> t = "auto" || t.Split(',') |> Array.forall (isInt 1)) "auto or rising layer numbers, e.g. 36 or 16,32"
+                 optionOf "--layer-split" layerSplit (fun t -> t = "auto" || t.Split(',') |> Array.forall (isInt 1)) (tr "opt.layerSplit" "auto or rising layer numbers, e.g. 36 or 16,32")
              else Result.Ok [])
-            optionOf "--port" port (fun t -> isInt 1 t && int t <= 65535) "a port number, 1 to 65535"
+            optionOf "--port" port (fun t -> isInt 1 t && int t <= 65535) (tr "opt.port" "a port number, 1 to 65535")
             Result.Ok(match hostValue () with "" -> [] | h -> [ "--host"; h ])
             Result.Ok(match trimmed apiKey with "" -> [] | k -> [ "--api-key"; k ])
-            optionOf "--vram-reserve-mib" reserve (isInt 0) "a number of MiB, 0 or more"
+            optionOf "--vram-reserve-mib" reserve (isInt 0) (tr "opt.vramReserveMib" "a number of MiB, 0 or more")
             Result.Ok(match vocabValue () with "" -> [] | v -> [ "--draft-vocab"; v ])
             Result.Ok(flag "--old-driver" oldDriver)
         ]
@@ -104,23 +105,23 @@ let private runOptions (gpus: Gpu[]) =
 /// controls and the (name, value) pairs.
 let private imageRunOptions () =
     let ditQ8, ditQ8Value =
-        choice [ "Auto: 16-bit when it fits the VRAM with its text encoder, else 8-bit", "auto"; "Always 8-bit", "on"; "Always 16-bit", "off" ] 0
+        choice [ (tr "img.auto16BitWhen" "Auto: 16-bit when it fits the VRAM with its text encoder, else 8-bit"), "auto"; (tr "img.always8Bit" "Always 8-bit"), "on"; (tr "img.always16Bit" "Always 16-bit"), "off" ] 0
     let ditKeep, ditKeepValue =
-        choice [ "Keep the one not in use in RAM (quick switch)", "on"; "Let it go (about 4.4 GB less RAM)", "off" ] 0
-    let ssdOffload = CheckBox(Content = text "Keep the image models' sizes when the RAM is short, reading what does not fit from the SSD (slower)")
+        choice [ (tr "img.keepTheOneNot" "Keep the one not in use in RAM (quick switch)"), "on"; (tr "img.letItGoAbout" "Let it go (about 4.4 GB less RAM)"), "off" ] 0
+    let ssdOffload = CheckBox(Content = text (tr "img.keepTheImageModels" "Keep the image models' sizes when the RAM is short, reading what does not fit from the SSD (slower)"))
     let policy, policyValue =
         choice
-            [ "Auto: stays when both fit, else gives VRAM back or is unloaded", "auto"
-              "Keep it loaded", "keep"
-              "Give VRAM back for the image", "shrink"
-              "Unload it, its conversation restored afterwards", "unload" ]
+            [ (tr "img.autoStaysWhenBoth" "Auto: stays when both fit, else gives VRAM back or is unloaded"), "auto"
+              (tr "img.keepItLoaded" "Keep it loaded"), "keep"
+              (tr "img.giveVramBackFor" "Give VRAM back for the image"), "shrink"
+              (tr "img.unloadItItsConversation" "Unload it, its conversation restored afterwards"), "unload" ]
             0
     let control =
         stack 10.0 [
-            field "Mage-Flow, MOSS-Image and Anima: the image model on the GPU" ditQ8
-            field "Mage-Flow: the image model not in use (the generation's or the edit's)" ditKeep
+            field (tr "img.mageFlowMossImage" "Mage-Flow, MOSS-Image and Anima: the image model on the GPU") ditQ8
+            field (tr "img.mageFlowTheImage" "Mage-Flow: the image model not in use (the generation's or the edit's)") ditKeep
             ssdOffload
-            field "The text model while an image is made" policy
+            field (tr "img.theTextModelWhile" "The text model while an image is made") policy
         ]
     let values () =
         [ "dit-q8", ditQ8Value ()
@@ -151,13 +152,14 @@ type private LogView() =
         box.Text <- String.Join("\n", lines)
         box.CaretIndex <- box.Text.Length
 
-type MainWindow() as this =
+/// `setup`: how the window reaches setup (Setup.real; the launcher's tests give canned runs instead).
+type MainWindow(setup: Setup.Access) as this =
     inherit Window(Title = "XeStrata", Width = 980.0, Height = 720.0, MinWidth = 720.0, MinHeight = 520.0)
 
     let host = ContentControl(Margin = Thickness(24.0, 16.0))
     let version = muted ""
     let updateBar = Border(IsVisible = false, Background = accentTint, CornerRadius = CornerRadius 6.0, Padding = Thickness 10.0)
-    let mutable running: Setup.Run option = None
+    let mutable running: Setup.IRun option = None
     // setup's warnings while it checked this PC: why a GPU is missing ("the engine could not list the GPUs: ...", #41)
     let mutable checkWarnings: string list = []
 
@@ -169,7 +171,7 @@ type MainWindow() as this =
             stack 14.0 [
                 heading title
                 card (coloured failBrush detail)
-                actions [ accentButton "Back" back ]
+                actions [ accentButton (tr "common.back" "Back") back ]
             ]
         )
 
@@ -187,7 +189,7 @@ type MainWindow() as this =
     let pickFile (title: string) (target: TextBox) =
         task {
             let top = TopLevel.GetTopLevel this
-            let gguf = FilePickerFileType("GGUF model files", Patterns = [| "*.gguf" |])
+            let gguf = FilePickerFileType(tr "app.ggufFiles" "GGUF model files", Patterns = [| "*.gguf" |])
             let! picked =
                 top.StorageProvider.OpenFilePickerAsync(
                     FilePickerOpenOptions(Title = title, AllowMultiple = false, FileTypeFilter = [| gguf |])
@@ -202,16 +204,16 @@ type MainWindow() as this =
     // ---------------------------------------------------------------------------------------------- the update
     let checkUpdate () =
         task {
-            let! messages, _ = Setup.collect [ "--check-update" ]
+            let! messages, _ = setup.Collect [ "--check-update" ]
             for m in messages do
                 match m with
                 | Updated u when u.Newer ->
                     ui (fun () ->
                         updateBar.Child <-
                             stack 6.0 [
-                                subheading (sprintf "XeStrata %s is out (this is %s)" u.Latest u.Current)
-                                text ("To update: " + u.How + ".")
-                                actions [ button "Release page" (fun () -> openUrl u.Url) ]
+                                subheading (trf "update.out" "XeStrata {latest} is out (this is {current})" [ "latest", box u.Latest; "current", box u.Current ])
+                                text (trf "update.how" "To update: {how}." [ "how", box u.How ])
+                                actions [ button (tr "update.releasePage" "Release page") (fun () -> openUrl u.Url) ]
                             ]
                         updateBar.IsVisible <- true)
                 | _ -> ()
@@ -224,7 +226,7 @@ type MainWindow() as this =
     /// address once it says so, `onDone` the exit code (after a failure: when the page is left).
     let runScriptPage (script: string) (title: string) (args: string list) (answer: string -> string option)
                       (onReady: string -> unit) (onDone: int -> unit) =
-        let stepText = subheading "Starting ..."
+        let stepText = subheading (tr "setup.starting" "Starting ...")
         let status = text ""
         let bar = ProgressBar(IsIndeterminate = true, Minimum = 0.0, Maximum = 1.0, Height = 6.0)
         let warnings = stack 4.0 []
@@ -232,10 +234,10 @@ type MainWindow() as this =
         question.IsVisible <- false
         let log = LogView()
         let recent = Collections.Generic.List<string>()   // the says since the last question: a question's menu
-        let details = Expander(Header = "Details", Content = log.Control, HorizontalAlignment = HorizontalAlignment.Stretch)
-        let mutable run: Setup.Run option = None
+        let details = Expander(Header = (tr "setup.details" "Details"), Content = log.Control, HorizontalAlignment = HorizontalAlignment.Stretch)
+        let mutable run: Setup.IRun option = None
         let mutable failed = false
-        let cancel = button "Cancel" (fun () -> run |> Option.iter (fun r -> r.Stop()))
+        let cancel = button (tr "setup.cancel" "Cancel") (fun () -> run |> Option.iter (fun r -> r.Stop()))
         let mutable readySeen = false
         let line (s: string) =
             log.Add s
@@ -248,7 +250,7 @@ type MainWindow() as this =
             ui (fun () ->
                 match m with
                 | Step(n, t) ->
-                    stepText.Text <- sprintf "Step %d: %s" n t
+                    stepText.Text <- trf "setup.step" "Step {n}: {step}" [ "n", box n; "step", box t ]
                     bar.IsIndeterminate <- true
                     recent.Clear()
                     log.Add("=== " + t)
@@ -264,14 +266,14 @@ type MainWindow() as this =
                     line ("[!] " + s)
                 | Fail(s, hint) ->
                     failed <- true
-                    failure "Setup stopped" (if String.IsNullOrEmpty hint then s else s + "\n\n" + hint) (fun () -> onDone 1)
+                    failure (tr "setup.stopped" "Setup stopped") (if String.IsNullOrEmpty hint then s else s + "\n\n" + hint) (fun () -> onDone 1)
                 | Progress(what, d, total) ->
                     if total > 0L then
                         bar.IsIndeterminate <- false
                         bar.Value <- float d / float total
-                        status.Text <- sprintf "%s: %s of %s" what (gb (float d / 1e9)) (gb (float total / 1e9))
+                        status.Text <- trf "setup.progressOf" "{what}: {done} of {total}" [ "what", box what; "done", box (gb (float d / 1e9)); "total", box (gb (float total / 1e9)) ]
                     else
-                        status.Text <- sprintf "%s: %s" what (gb (float d / 1e9))
+                        status.Text <- trf "setup.progress" "{what}: {done}" [ "what", box what; "done", box (gb (float d / 1e9)) ]
                 | Log s
                 | Text s -> line s
                 | Ask(q, _, _) when (answer q).IsSome -> run |> Option.iter (fun r -> r.Answer (answer q).Value)
@@ -303,7 +305,7 @@ type MainWindow() as this =
                 actions [ cancel ]
             ]
         )
-        let r = Setup.Run(script, args, onMessage, (fun code -> ui (fun () -> if not failed then onDone code)))
+        let r = setup.Start script args onMessage (fun code -> ui (fun () -> if not failed then onDone code))
         run <- Some r
         r
 
@@ -326,26 +328,26 @@ type MainWindow() as this =
                            stack 2.0 [
                                row 6.0 [
                                    yield subheading m.Title
-                                   if not m.Edits then yield badge mutedBrush "no edits"
+                                   if not m.Edits then yield badge mutedBrush (tr "img.noEdits" "no edits")
                                ]
-                               muted (sprintf "%s; download %s, needs ~%s of RAM besides the text model" m.About (gb m.DownloadGb) (gb m.RamGb))
+                               muted (trf "img.size" "{about}; download {download}, needs ~{ram} of RAM besides the text model" [ "about", box m.About; "download", box (gb m.DownloadGb); "ram", box (gb m.RamGb) ])
                            ]
                    ) |]
         // each model's size where it has several: Auto (the largest that fits the RAM) or one of them
         let sizes =
             [| for m in models ->
-                   let c = ComboBox(ItemsSource = Array.append [| "Auto" |] m.Quants, SelectedIndex = 0, MinWidth = 110.0)
+                   let c = ComboBox(ItemsSource = Array.append [| tr "img.auto" "Auto" |] m.Quants, SelectedIndex = 0, MinWidth = 110.0)
                    let was = current |> Array.tryFind (fun id -> plain id = m.Id && id.Contains ":")
-                   was |> Option.iter (fun id -> c.SelectedItem <- id.Split(':')[1])
+                   was |> Option.iter (fun id -> c.SelectedIndex <- 1 + max -1 (Array.IndexOf(m.Quants, id.Split(':')[1])))
                    c.IsVisible <- m.Quants.Length > 0
                    c |]
         let uncensored =
             CheckBox(
-                Content = text "Text encoder with its refusal direction removed (-uncensored)",
+                Content = text (tr "img.textEncoderWithIts" "Text encoder with its refusal direction removed (-uncensored)"),
                 IsChecked = Nullable(current |> Array.exists (fun c -> c.EndsWith "-uncensored"))
             )
         let defaultBox = ComboBox(MinWidth = 260.0)
-        let defaultField = field "Default image model (the others: chosen on the web page or by the API's \"model\")" defaultBox
+        let defaultField = field (tr "img.defaultImageModelThe" "Default image model (the others: chosen on the web page or by the API's \"model\")") defaultBox
         let checkedModels () = [ for i, b in Array.indexed boxes do if b.IsChecked = Nullable true then models[i] ]
         let refresh () =
             let ms = checkedModels ()
@@ -371,8 +373,8 @@ type MainWindow() as this =
                 let name (m: ImageModel) =
                     let id = if uncensored.IsChecked = Nullable true && m.Uncensored then m.Id + "-uncensored" else m.Id
                     let size = sizes[Array.findIndex (fun (x: ImageModel) -> x.Id = m.Id) models]
-                    match size.SelectedItem with
-                    | :? string as q when q <> "Auto" -> id + ":" + q
+                    match size.SelectedIndex with
+                    | i when i > 0 -> id + ":" + m.Quants[i - 1]
                     | _ -> id
                 Some(ordered |> List.map name |> String.concat ",")
         let control =
@@ -386,9 +388,9 @@ type MainWindow() as this =
 
     // ---------------------------------------------------------------------------------------------- the pages
     let rec home () =
-        show (stack 10.0 [ heading "Checking this PC ..."; ProgressBar(IsIndeterminate = true) ])
+        show (stack 10.0 [ heading (tr "home.checkingThisPc" "Checking this PC ..."); ProgressBar(IsIndeterminate = true) ])
         task {
-            let! messages, code = Setup.collect [ "--describe" ]
+            let! messages, code = setup.Collect [ "--describe" ]
             let found = messages |> List.tryPick (function Described d -> Some d | _ -> None)
             checkWarnings <- messages |> List.choose (function Warn s -> Some s | _ -> None)
             ui (fun () ->
@@ -399,7 +401,7 @@ type MainWindow() as this =
                         messages
                         |> List.choose (function Fail(t, h) -> Some(t + " " + h) | Text t | Log t -> Some t | _ -> None)
                         |> String.concat "\n"
-                    failure "XeStrata could not check this PC" (sprintf "setup.py exited with %d.\n%s" code why) home)
+                    failure (tr "home.checkFailed" "XeStrata could not check this PC") (trf "home.setupExited" "setup.py exited with {code}." [ "code", box code ] + "\n" + why) home)
         }
         |> ignore
 
@@ -412,19 +414,20 @@ type MainWindow() as this =
                 None
         let pc =
             stack 6.0 [
-                yield subheading "This PC"
+                yield subheading (tr "home.thisPc" "This PC")
                 match gpu with
-                | Some g -> yield text (sprintf "GPU: %s, %s VRAM" g.Name (gb g.VramGb))
-                | None -> yield coloured failBrush "No GPU here can run XeStrata."
+                | Some g -> yield text (trf "home.gpu" "GPU: {name}, {vram} VRAM" [ "name", box g.Name; "vram", box (gb g.VramGb) ])
+                | None -> yield coloured failBrush (tr "home.noGpuHereCan" "No GPU here can run XeStrata.")
                 for g in d.Gpus do
                     if not (isNull g.Problem) then
                         yield coloured warnBrush (sprintf "%s: %s" g.Name g.Problem)
                 for w in checkWarnings do
                     yield coloured warnBrush ("⚠ " + w)
-                yield text (sprintf "RAM: %s" (gb d.RamGb))
+                yield text (trf "home.ram" "RAM: {ram}" [ "ram", box (gb d.RamGb) ])
                 yield
                     text (
-                        sprintf "CPU: %s%s" d.Cpu.Name (if d.Cpu.Avx512 then " (AVX-512)" elif d.Cpu.Avx2 then " (AVX2)" else " (no AVX2: not supported)")
+                        trf "home.cpu" "CPU: {name}{isa}" [ "name", box d.Cpu.Name
+                                                            "isa", box (if d.Cpu.Avx512 then " (AVX-512)" elif d.Cpu.Avx2 then " (AVX2)" else tr "home.noAvx2" " (no AVX2: not supported)") ]
                     )
             ]
         let installed =
@@ -434,20 +437,20 @@ type MainWindow() as this =
                           stack 2.0 [
                               subheading m.ModelName
                               muted (
-                                  (if m.Context.HasValue then contextLabel m.Context.Value + " of context, " else "")
+                                  (if m.Context.HasValue then trf "home.context" "{tokens} of context, " [ "tokens", box (contextLabel m.Context.Value) ] else "")
                                   + sprintf "http://127.0.0.1:%d/" m.Port
-                                  + (if m.Images.Length > 0 then ", images: " + String.Join(", ", m.Images) else "")
+                                  + (if m.Images.Length > 0 then trf "home.imagesList" ", images: {list}" [ "list", box (String.Join(", ", m.Images)) ] else "")
                               )
                           ]
                       let imagesOk = d.Families |> Array.exists (fun f -> f.Id = m.Family && f.Images)
                       let buttons =
                           actions [
                               if imagesOk && d.Images.Length > 0 then
-                                  yield button "Images ..." (fun () -> imagesPage d m)
-                              yield button "Measure ..." (fun () -> benchPage d m)
-                              yield button "Tune" (fun () -> calibrateModel i m)
-                              yield button "Start with options ..." (fun () -> startOptionsPage d i m)
-                              yield accentButton "Start" (fun () -> startModel i m [] false)
+                                  yield button (tr "home.images" "Images ...") (fun () -> imagesPage d m)
+                              yield button (tr "home.measure" "Measure ...") (fun () -> benchPage d m)
+                              yield button (tr "home.tune" "Tune") (fun () -> calibrateModel i m)
+                              yield button (tr "home.startWithOptions" "Start with options ...") (fun () -> startOptionsPage d i m)
+                              yield accentButton (tr "home.start" "Start") (fun () -> startModel i m [] false)
                           ]
                       stack 8.0 [ info; buttons ]
                   )
@@ -456,14 +459,14 @@ type MainWindow() as this =
             stack 14.0 [
                 yield card pc :> Control
                 if not installed.IsEmpty then
-                    yield subheading "Installed models"
+                    yield subheading (tr "home.installedModels" "Installed models")
                     yield! installed
                 yield
                     actions [
-                        button "Inspect a model file ..." (fun () -> inspectPage d)
-                        button "Remove XeStrata's data ..." removeData
-                        button "Install from files on this PC ..." (fun () -> ownFilesPage d)
-                        (if installed.IsEmpty then accentButton else button) "Install a model ..." (fun () -> choosePage d None)
+                        button (tr "home.inspectAModelFile" "Inspect a model file ...") (fun () -> inspectPage d)
+                        button (tr "home.removeXestrataSData" "Remove XeStrata's data ...") removeData
+                        button (tr "home.installFromFilesOn" "Install from files on this PC ...") (fun () -> ownFilesPage d)
+                        (if installed.IsEmpty then accentButton else button) (tr "home.install" "Install a model ...") (fun () -> choosePage d None)
                     ]
             ]
         )
@@ -471,19 +474,19 @@ type MainWindow() as this =
     /// A model in GGUF files already on this PC (setup --gguf): setup reads their headers (--describe --gguf) and the
     /// install page then asks setup's questions for that model; the engine's verdict comes at the install.
     and ownFilesPage (d: Describe) =
-        let file = TextBox(PlaceholderText = "the model's .gguf file (the first one of a split model)", MinWidth = 420.0)
-        let name = TextBox(PlaceholderText = "(optional) a name for it; default: the file's", MinWidth = 260.0)
+        let file = TextBox(PlaceholderText = (tr "own.theModelSGguf" "the model's .gguf file (the first one of a split model)"), MinWidth = 420.0)
+        let name = TextBox(PlaceholderText = (tr "own.optionalANameFor" "(optional) a name for it; default: the file's"), MinWidth = 260.0)
         let problem = coloured failBrush ""
-        let go = accentButton "Next" ignore
+        let go = accentButton (tr "own.next" "Next") ignore
         go.Click.Add(fun _ ->
             match trimmed file with
-            | "" -> problem.Text <- "Choose the model's .gguf file."
+            | "" -> problem.Text <- tr "own.choose" "Choose the model's .gguf file."
             | path ->
                 go.IsEnabled <- false
                 problem.Text <- ""
                 task {
                     let! messages, _ =
-                        Setup.collect ([ "--describe"; "--gguf"; path ] @ (match trimmed name with "" -> [] | n -> [ "--name"; n ]))
+                        setup.Collect ([ "--describe"; "--gguf"; path ] @ (match trimmed name with "" -> [] | n -> [ "--name"; n ]))
                     let found = messages |> List.tryPick (function Described d when not (isNull (box d.Custom)) -> Some d | _ -> None)
                     ui (fun () ->
                         go.IsEnabled <- true
@@ -494,17 +497,17 @@ type MainWindow() as this =
                                 messages
                                 |> List.choose (function Fail(t, h) -> Some(if String.IsNullOrEmpty h then t else t + " " + h) | _ -> None)
                                 |> String.concat "\n"
-                            if problem.Text = "" then problem.Text <- "setup could not read this file.")
+                            if problem.Text = "" then problem.Text <- tr "own.unreadable" "setup could not read this file.")
                 }
                 |> ignore)
         show (
             stack 14.0 [
-                heading "Install from files on this PC"
-                muted "A model in GGUF files you already have, nothing downloaded: Qwen3.8-Flash-Next, or a model of the architectures XeStrata's other models have (Qwen3.5 and Qwen3.6 MoE, Qwen3.5 dense, Qwen3 MoE, GLM-5.3). Setup reads the file's headers, and the engine checks that it runs its types before anything is installed."
-                field "The model file" (row 8.0 [ file; button "Browse ..." (fun () -> pickFile "The model's GGUF file" file) ])
-                field "Name (it is installed as custom-NAME)" name
+                heading (tr "own.installFromFilesOn" "Install from files on this PC")
+                muted (tr "own.aModelInGguf" "A model in GGUF files you already have, nothing downloaded: Qwen3.8-Flash-Next, or a model of the architectures XeStrata's other models have (Qwen3.5 and Qwen3.6 MoE, Qwen3.5 dense, Qwen3 MoE, GLM-5.3). Setup reads the file's headers, and the engine checks that it runs its types before anything is installed.")
+                field (tr "own.theModelFile" "The model file") (row 8.0 [ file; button (tr "common.browse" "Browse ...") (fun () -> pickFile (tr "own.theModelSGguf2" "The model's GGUF file") file) ])
+                field (tr "own.nameItIsInstalled" "Name (it is installed as custom-NAME)") name
                 problem
-                actions [ button "Back" (fun () -> homePage d); go ]
+                actions [ button (tr "common.back" "Back") (fun () -> homePage d); go ]
             ]
         )
 
@@ -520,7 +523,7 @@ type MainWindow() as this =
                 stack 2.0 [
                     row 6.0 [
                         subheading f.Title
-                        if f.Experimental then badge warnBrush "experimental"
+                        if f.Experimental then badge warnBrush (tr "common.experimental" "experimental")
                     ]
                     muted (f.By + " - " + f.About)
                 ])
@@ -530,103 +533,104 @@ type MainWindow() as this =
                 stack 2.0 [
                     row 6.0 [
                         yield subheading m.Id
-                        if m.Recommended then yield badge okBrush "recommended"
-                        if not m.Tested then yield badge mutedBrush "untested"
-                        if m.Experimental then yield badge warnBrush "experimental"
+                        if m.Recommended then yield badge okBrush (tr "install.recommended" "recommended")
+                        if not m.Tested then yield badge mutedBrush (tr "install.untested" "untested")
+                        if m.Experimental then yield badge warnBrush (tr "common.experimental" "experimental")
                         match m.Fits with
-                        | "low-ram" -> yield badge warnBrush "low-RAM mode"
-                        | "budget" -> yield badge warnBrush "part from the SSD"
-                        | "slow" | "no" -> yield badge failBrush "does not fit the RAM"
+                        | "low-ram" -> yield badge warnBrush (tr "install.lowRamMode" "low-RAM mode")
+                        | "budget" -> yield badge warnBrush (tr "install.partFromTheSsd" "part from the SSD")
+                        | "slow" | "no" -> yield badge failBrush (tr "install.doesNotFitThe" "does not fit the RAM")
                         | _ -> ()
                     ]
-                    muted (sprintf "%s; download %s, needs ~%s of RAM" m.About (gb m.DownloadGb) (gb m.RamGb))
+                    muted (trf "install.sizeAbout" "{about}; download {download}, needs ~{ram} of RAM" [ "about", box m.About; "download", box (gb m.DownloadGb); "ram", box (gb m.RamGb) ])
                 ])
         let contexts = ComboBox(MinWidth = 160.0)
         let gpus = d.Gpus |> Array.filter (fun g -> isNull g.Problem)
         let gpuBox = ComboBox(ItemsSource = [ for g in gpus -> sprintf "%s (%s)" g.Name (gb g.VramGb) ], MinWidth = 260.0)
         gpuBox.SelectedIndex <- (if d.Gpu.HasValue then defaultArg (Array.tryFindIndex (fun g -> g.Index = d.Gpu.Value) gpus) 0 else 0)
         let dataDir = TextBox(Text = d.DataDir, MinWidth = 420.0)
-        let ggufDir = TextBox(PlaceholderText = "(optional) a folder with the model files already downloaded", MinWidth = 420.0)
+        let ggufDir = TextBox(PlaceholderText = (tr "install.optionalAFolderWith" "(optional) a folder with the model files already downloaded"), MinWidth = 420.0)
         let license = muted ""
-        let install = accentButton "Install" ignore
+        let install = accentButton (tr "install.install" "Install") ignore
         let problem = coloured failBrush ""
         // setup's other questions (step 2), each shown where setup would ask it
-        let pictures = CheckBox(IsChecked = Nullable true, Content = text "Read pictures too (screenshots, photos, scanned pages; a 0.9 GB download)")
+        let pictures = CheckBox(IsChecked = Nullable true, Content = text (tr "install.readPicturesTooScreenshots" "Read pictures too (screenshots, photos, scanned pages; a 0.9 GB download)"))
         let kv, kvValue =
             choice
-                [ "8-bit (recommended)", "int8"
-                  "4-bit: half the memory, a little less precise on long documents", "q4_0"
-                  "8-bit keys and 4-bit values: about three quarters of the memory", "k8v4"
-                  "16-bit: twice the memory of 8-bit", "fp16" ]
+                [ (tr "install.8BitRecommended" "8-bit (recommended)"), "int8"
+                  (tr "install.4BitHalfThe" "4-bit: half the memory, a little less precise on long documents"), "q4_0"
+                  (tr "install.8BitKeysAnd" "8-bit keys and 4-bit values: about three quarters of the memory"), "k8v4"
+                  (tr "install.16BitTwiceThe" "16-bit: twice the memory of 8-bit"), "fp16" ]
                 0
-        let kvField = field "KV cache precision (the model's memory of the conversation)" kv
+        let kvField = field (tr "install.kvCachePrecisionThe" "KV cache precision (the model's memory of the conversation)") kv
         // a family whose KV cache setup does not ask: 16-bit unless one of the precisions it takes is chosen
         let kvLabels =
-            dict [ "fp16", "16-bit (default)"; "int8", "8-bit"; "q4_0", "4-bit (Hadamard-rotated)"; "k8v4", "8-bit keys and 4-bit values" ]
+            dict [ "fp16", tr "install.kvFp16" "16-bit (default)"; "int8", tr "install.kvInt8" "8-bit"
+                   "q4_0", tr "install.kvQ4" "4-bit (Hadamard-rotated)"; "k8v4", tr "install.kvK8v4" "8-bit keys and 4-bit values" ]
         let plainKv = ComboBox(MinWidth = 260.0)
-        let plainKvField = field "KV cache precision (the model's memory of the conversation)" plainKv
+        let plainKvField = field (tr "install.kvCachePrecisionThe" "KV cache precision (the model's memory of the conversation)") plainKv
         let plainKvValue (f: Family) = if plainKv.SelectedIndex >= 0 then f.KvTakes[plainKv.SelectedIndex] else "fp16"
         let rope, ropeValue =
-            choice [ "yarn (keeps the trained angles on the high-frequency pairs)", "yarn"; "linear (shrinks every angle)", "linear" ] 0
-        let ropeField = field "RoPE extension: a context past the model's trained 262,144 positions rescales its rotary angles" rope
+            choice [ (tr "install.yarnKeepsTheTrained" "yarn (keeps the trained angles on the high-frequency pairs)"), "yarn"; (tr "install.linearShrinksEveryAngle" "linear (shrinks every angle)"), "linear" ] 0
+        let ropeField = field (tr "install.ropeExtensionAContext" "RoPE extension: a context past the model's trained 262,144 positions rescales its rotary angles") rope
         let projection =
             CheckBox(
                 Content =
                     stack 2.0 [
-                        text "EXPERIMENTAL - speed projection (off unless you choose it)"
-                        muted "A small control vector applied while the model runs (layers 4-44). It changes how the model answers: its package describes it as a refusal-direction projection (the model declines far fewer requests). When on, the web app can switch it off per chat. For fewer refusals, choose SC117's or huihui-ai's abliterated version as the model instead (the refusals removed in its weights)."
+                        text (tr "install.experimentalSpeedProjectionOff" "EXPERIMENTAL - speed projection (off unless you choose it)")
+                        muted (tr "install.aSmallControlVector" "A small control vector applied while the model runs (layers 4-44). It changes how the model answers: its package describes it as a refusal-direction projection (the model declines far fewer requests). When on, the web app can switch it off per chat. For fewer refusals, choose SC117's or huihui-ai's abliterated version as the model instead (the refusals removed in its weights).")
                     ]
             )
-        let vector = TextBox(PlaceholderText = "(optional) another control vector, a GGUF file", MinWidth = 420.0)
-        let vectorField = field "The speed projection's vector" vector
+        let vector = TextBox(PlaceholderText = (tr "install.optionalAnotherControlVector" "(optional) another control vector, a GGUF file"), MinWidth = 420.0)
+        let vectorField = field (tr "install.theSpeedProjectionS" "The speed projection's vector") vector
         let images, imagesValue = imagePicker d.Images d.ImageDefault
         let webSearch, webSearchValue =
             choice
-                [ "Off", "no"
-                  "DeepSeek's search API: your API key, billed by DeepSeek per search (USD 0.75 per 1,000); the search words go to DeepSeek", "deepseek"
-                  "TinyFish's search API: your API key, free up to a daily allowance (12,000 searches, 1,000 pages read); the search words and the pages found go to TinyFish", "tinyfish" ]
+                [ (tr "install.off" "Off"), "no"
+                  (tr "install.deepseekSSearchApi" "DeepSeek's search API: your API key, billed by DeepSeek per search (USD 0.75 per 1,000); the search words go to DeepSeek"), "deepseek"
+                  (tr "install.tinyfishSSearchApi" "TinyFish's search API: your API key, free up to a daily allowance (12,000 searches, 1,000 pages read); the search words and the pages found go to TinyFish"), "tinyfish" ]
                 (match d.WebSearch with "deepseek" -> 1 | "tinyfish" -> 2 | _ -> 0)
         // the search APIs' keys: (setup's --web-search value, its name, the box)
         let apiKeys =
             [ for id, who in [ "deepseek", "DeepSeek"; "tinyfish", "TinyFish" ] ->
                   id, who,
                   TextBox(PasswordChar = '*', MinWidth = 420.0,
-                          PlaceholderText = (if d.WebSearch = id then "set (type to replace)" else $"your {who} API key")) ]
+                          PlaceholderText = (if d.WebSearch = id then tr "install.keySet" "set (type to replace)" else trf "install.keyYour" "your {who} API key" [ "who", box who ])) ]
         let apiKeyFields =
-            [ for id, who, box in apiKeys -> id, field $"{who} API key (kept in your settings, never shown)" box ]
+            [ for id, who, box in apiKeys -> id, field (trf "install.keyField" "{who} API key (kept in your settings, never shown)" [ "who", who :> obj ]) box ]
         let showApiKey () =
             for id, f in apiKeyFields do f.IsVisible <- webSearchValue () = id
         showApiKey ()
         webSearch.SelectionChanged.Add(fun _ -> showApiKey ())
-        let webSearchField = field "Web search, for every model: the model searches when a request asks for it (the web page's Search switch, the API's web search tools)" webSearch
-        let imagesField = field "Image generation: models to make images with, besides the text model" images
+        let webSearchField = field (tr "install.webSearchForEvery" "Web search, for every model: the model searches when a request asks for it (the web page's Search switch, the API's web search tools)") webSearch
+        let imagesField = field (tr "install.imageGenerationModelsTo" "Image generation: models to make images with, besides the text model") images
         // the options setup takes without asking, under Advanced
         let reader, readerValue =
-            choice [ "For this GPU (on the GPU from 24 GB of VRAM, else on the CPU)", "yes"; "On the GPU (the CPU when it cannot start there)", "gpu"; "On the CPU", "cpu" ] 0
-        let readerField = field "The picture reader" reader
-        let visionTokens = TextBox(PlaceholderText = "1024 on the GPU, 300 on the CPU", MinWidth = 260.0)
-        let visionTokensField = field "The most image tokens a picture becomes (more reads small text better, and takes longer)" visionTokens
-        let ropeScale = TextBox(PlaceholderText = "the context over 262,144", MinWidth = 260.0)
-        let ropeScaleField = field "RoPE extension factor (1 or more)" ropeScale
+            choice [ (tr "install.forThisGpuOn" "For this GPU (on the GPU from 24 GB of VRAM, else on the CPU)"), "yes"; (tr "install.onTheGpuThe" "On the GPU (the CPU when it cannot start there)"), "gpu"; (tr "install.onTheCpu" "On the CPU"), "cpu" ] 0
+        let readerField = field (tr "install.thePictureReader" "The picture reader") reader
+        let visionTokens = TextBox(PlaceholderText = (tr "install.1024OnTheGpu" "1024 on the GPU, 300 on the CPU"), MinWidth = 260.0)
+        let visionTokensField = field (tr "install.theMostImageTokens" "The most image tokens a picture becomes (more reads small text better, and takes longer)") visionTokens
+        let ropeScale = TextBox(PlaceholderText = (tr "install.theContextOver262" "the context over 262,144"), MinWidth = 260.0)
+        let ropeScaleField = field (tr "install.ropeExtensionFactor1" "RoPE extension factor (1 or more)") ropeScale
         let lowRam, lowRamValue =
             choice
-                [ "Auto: when the experts do not fit the RAM", "auto"
-                  "On", "on"
-                  "Off", "off"
-                  "On, the experts the GPU does not hold copied into RAM", "resident"
-                  "On, the experts the GPU does not hold read through the OS file cache", "mmap" ]
+                [ (tr "install.autoWhenTheExperts" "Auto: when the experts do not fit the RAM"), "auto"
+                  (tr "install.on" "On"), "on"
+                  (tr "install.off" "Off"), "off"
+                  (tr "install.onTheExpertsThe" "On, the experts the GPU does not hold copied into RAM"), "resident"
+                  (tr "install.onTheExpertsThe2" "On, the experts the GPU does not hold read through the OS file cache"), "mmap" ]
                 0
-        let budget = TextBox(PlaceholderText = "setup's choice for this RAM", MinWidth = 260.0)
-        let budgetField = field "GiB of the experts kept in RAM (the rest read from the SSD)" budget
-        let ramReserve = TextBox(PlaceholderText = "(none) GiB of RAM to leave free for other programs", MinWidth = 260.0)
-        let parallelBox = TextBox(PlaceholderText = "1: one request at a time", MinWidth = 260.0)
+        let budget = TextBox(PlaceholderText = (tr "install.setupSChoiceFor" "setup's choice for this RAM"), MinWidth = 260.0)
+        let budgetField = field (tr "install.gibOfTheExperts" "GiB of the experts kept in RAM (the rest read from the SSD)") budget
+        let ramReserve = TextBox(PlaceholderText = (tr "install.noneGibOfRam" "(none) GiB of RAM to leave free for other programs"), MinWidth = 260.0)
+        let parallelBox = TextBox(PlaceholderText = (tr "install.1OneRequestAt" "1: one request at a time"), MinWidth = 260.0)
         let replicas = TextBox(PlaceholderText = "1", MinWidth = 260.0)
         let source, sourceValue =
-            choice [ "Hugging Face (default)", ""; "ModelScope (mainland China: the same files)", "modelscope" ] 0
-        let modelsDir = TextBox(PlaceholderText = "<data folder>\\models", MinWidth = 420.0)
-        let moveData = CheckBox(Content = text "Move the model files already on this PC into the data folder")
-        let rememberData = CheckBox(Content = text "Remember the data folder for later downloads without moving anything")
-        let noWarmup = CheckBox(Content = text "Skip the first start that compiles the GPU code (the first request then takes ~30 s more)")
+            choice [ (tr "install.huggingFaceDefault" "Hugging Face (default)"), ""; (tr "install.modelscopeMainlandChinaThe" "ModelScope (mainland China: the same files)"), "modelscope" ] 0
+        let modelsDir = TextBox(PlaceholderText = (tr "install.dataFolderModels" "<data folder>\\models"), MinWidth = 420.0)
+        let moveData = CheckBox(Content = text (tr "install.moveTheModelFiles" "Move the model files already on this PC into the data folder"))
+        let rememberData = CheckBox(Content = text (tr "install.rememberTheDataFolder" "Remember the data folder for later downloads without moving anything"))
+        let noWarmup = CheckBox(Content = text (tr "install.skipTheFirstStart" "Skip the first start that compiles the GPU code (the first request then takes ~30 s more)"))
         let imageOptions, imageValues = imageRunOptions ()
         let serverControl, serverArgs = runOptions gpus
         let selectedModel () =
@@ -658,7 +662,7 @@ type MainWindow() as this =
                 plainKv.ItemsSource <- [ for k in f.KvTakes -> (match kvLabels.TryGetValue k with | true, l -> l | _ -> k) ]
                 plainKv.SelectedIndex <- max 0 (Array.IndexOf(f.KvTakes, "fp16"))
                 sizes.SelectedItem <- (f.Models |> Array.tryFind (fun m -> m.Recommended) |> Option.defaultValue f.Models[0])
-                license.Text <- (if String.IsNullOrEmpty f.License then "" else "Its license: " + f.License)
+                license.Text <- (if String.IsNullOrEmpty f.License then "" else trf "install.license" "Its license: {license}" [ "license", box f.License ])
             | _ -> ()
         let sizeChanged () =
             match families.SelectedItem, selectedModel () with
@@ -697,15 +701,15 @@ type MainWindow() as this =
                 let advanced =
                     collectArgs [
                         (if m.Vision && pictures.IsChecked = Nullable true then
-                             optionOf "--vision-tokens" visionTokens (isInt 1) "a number of image tokens, 1 or more"
+                             optionOf "--vision-tokens" visionTokens (isInt 1) (tr "opt.visionTokens" "a number of image tokens, 1 or more")
                          else Result.Ok [])
-                        (if ctx > 262144 then optionOf "--rope-scale" ropeScale (isNumber 1.0 1e6) "a number, 1 or more" else Result.Ok [])
+                        (if ctx > 262144 then optionOf "--rope-scale" ropeScale (isNumber 1.0 1e6) (tr "opt.ropeScale" "a number, 1 or more") else Result.Ok [])
                         Result.Ok(match lowRamValue () with "auto" -> [] | v -> [ "--low-ram"; v ])
                         Result.Ok(if f.Kv then [] else match plainKvValue f with "fp16" -> [] | k -> [ "--kv"; k ])
-                        (if m.Budget then optionOf "--resident-budget-gib" budget (isNumber 1.0 1e6) "a number of GiB" else Result.Ok [])
-                        optionOf "--ram-reserve-gib" ramReserve (isNumber 0.0 1e6) "a number of GiB, 0 or more"
-                        optionOf "--parallel" parallelBox (isInt 1) "a number of requests, 1 or more"
-                        optionOf "--replicas" replicas (isInt 1) "a number of engines, 1 or more"
+                        (if m.Budget then optionOf "--resident-budget-gib" budget (isNumber 1.0 1e6) (tr "opt.residentBudgetGib" "a number of GiB") else Result.Ok [])
+                        optionOf "--ram-reserve-gib" ramReserve (isNumber 0.0 1e6) (tr "opt.ramReserveGib" "a number of GiB, 0 or more")
+                        optionOf "--parallel" parallelBox (isInt 1) (tr "opt.parallel" "a number of requests, 1 or more")
+                        optionOf "--replicas" replicas (isInt 1) (tr "opt.replicas" "a number of engines, 1 or more")
                         Result.Ok(match sourceValue () with "" -> [] | v -> [ "--source"; v ])
                         Result.Ok(match trimmed modelsDir with "" -> [] | p -> [ "--models-dir"; p ])
                         Result.Ok(flag "--move-data" moveData @ flag "--set-default-data-dir" rememberData @ flag "--no-warmup" noWarmup)
@@ -718,7 +722,7 @@ type MainWindow() as this =
                 | Error why -> problem.Text <- why
                 | Result.Ok _ when api.IsSome && key = "" && d.WebSearch <> webSearchValue () ->
                     let _, who, _ = api.Value
-                    problem.Text <- $"Web search with {who} needs your {who} API key."
+                    problem.Text <- trf "install.keyNeeded" "Web search with {who} needs your {who} API key." [ "who", box who ]
                 | Result.Ok more ->
                     // the key reaches setup in its environment, never on its command line (process lists show that)
                     for id, _, box in apiKeys do
@@ -739,7 +743,7 @@ type MainWindow() as this =
         families.SelectedIndex <- 0
         let advanced =
             Expander(
-                Header = "Advanced",
+                Header = (tr "common.advanced" "Advanced"),
                 HorizontalAlignment = HorizontalAlignment.Stretch,
                 Content =
                     stack 10.0 [
@@ -748,14 +752,14 @@ type MainWindow() as this =
                         ropeScaleField
                         vectorField
                         plainKvField
-                        field "Low-RAM mode: the experts read from the model files instead of all copied into RAM" lowRam
+                        field (tr "install.lowRamModeThe" "Low-RAM mode: the experts read from the model files instead of all copied into RAM") lowRam
                         budgetField
-                        field "RAM left free for other programs, in GiB (the model's mode, its experts in RAM and the image models' sizes are chosen with that much less; slower when the experts are then read from the SSD)" ramReserve
-                        field "Requests decoded together (each takes VRAM from the expert cache)" parallelBox
-                        field "With a layer split: independent engines, each on an equal group of the GPUs" replicas
+                        field (tr "install.ramLeftFreeFor" "RAM left free for other programs, in GiB (the model's mode, its experts in RAM and the image models' sizes are chosen with that much less; slower when the experts are then read from the SSD)") ramReserve
+                        field (tr "install.requestsDecodedTogetherEach" "Requests decoded together (each takes VRAM from the expert cache)") parallelBox
+                        field (tr "install.withALayerSplit" "With a layer split: independent engines, each on an equal group of the GPUs") replicas
                         if own.IsNone then
-                            field "Where the model files come from" source
-                            field "Where the model files go" (row 8.0 [ modelsDir; button "Browse ..." (fun () -> pickFolder "Model files folder" modelsDir) ])
+                            field (tr "install.whereTheModelFiles" "Where the model files come from") source
+                            field (tr "install.whereTheModelFiles2" "Where the model files go") (row 8.0 [ modelsDir; button (tr "common.browse" "Browse ...") (fun () -> pickFolder (tr "install.modelFilesFolder" "Model files folder") modelsDir) ])
                         moveData
                         rememberData
                         noWarmup
@@ -765,15 +769,15 @@ type MainWindow() as this =
             )
         show (
             stack 14.0 [
-                heading "Install a model"
-                field "Model" families
-                field "Size" sizes
+                heading (tr "install.installAModel" "Install a model")
+                field (tr "install.model" "Model") families
+                field (tr "install.size" "Size") sizes
                 license
-                field "Context: how much text the model sees at once (longer takes more VRAM)" contexts
-                if gpus.Length > 1 then field "GPU" gpuBox
-                field "Data folder: where the model files go (tens of GB)" (row 8.0 [ dataDir; button "Browse ..." (fun () -> pickFolder "Data folder" dataDir) ])
+                field (tr "install.contextHowMuchText" "Context: how much text the model sees at once (longer takes more VRAM)") contexts
+                if gpus.Length > 1 then field (tr "install.gpu" "GPU") gpuBox
+                field (tr "install.dataFolderWhereThe" "Data folder: where the model files go (tens of GB)") (row 8.0 [ dataDir; button (tr "common.browse" "Browse ...") (fun () -> pickFolder (tr "install.dataFolder" "Data folder") dataDir) ])
                 if own.IsNone then
-                    field "Model files you already have" (row 8.0 [ ggufDir; button "Browse ..." (fun () -> pickFolder "Model files" ggufDir) ])
+                    field (tr "install.modelFilesYouAlready" "Model files you already have") (row 8.0 [ ggufDir; button (tr "common.browse" "Browse ...") (fun () -> pickFolder (tr "install.modelFiles" "Model files") ggufDir) ])
                 pictures
                 kvField
                 ropeField
@@ -783,12 +787,12 @@ type MainWindow() as this =
                 yield! [ for _, f in apiKeyFields -> f :> Control ]
                 advanced
                 problem
-                actions [ button "Back" (fun () -> homePage d); install ]
+                actions [ button (tr "common.back" "Back") (fun () -> homePage d); install ]
             ]
         )
 
     and installPage (what: string) (args: string list) =
-        runPage ("Installing " + what) args (fun _ -> None) ignore (fun _ -> home ()) |> ignore
+        runPage (trf "install.installing" "Installing {what}" [ "what", box what ]) args (fun _ -> None) ignore (fun _ -> home ()) |> ignore
 
     /// An installed model's image generation: its image models chosen again (none: taken out), the files downloaded
     /// and its config rewritten by tools/image/install.py; the server takes it at its next start.
@@ -798,16 +802,16 @@ type MainWindow() as this =
         let apply () =
             let v = value () |> Option.defaultValue "no"
             let more = if v = "no" then [] else [ for name, x in optionValues () do yield! [ "--" + name; x ] ]
-            runScriptPage Places.imageInstallPy ("Image generation for " + m.ModelName)
+            runScriptPage Places.imageInstallPy (trf "images.title" "Image generation for {model}" [ "model", box m.ModelName ])
                 ([ "--config"; m.Config; "--model"; v; "--yes" ] @ more) (fun _ -> None) ignore (fun _ -> home ())
             |> ignore
         show (
             stack 14.0 [
-                heading ("Image generation for " + m.ModelName)
-                muted "Check the image models to make images with (none: image generation off). Their files are downloaded, and the model takes them at its next start."
+                heading (trf "images.title" "Image generation for {model}" [ "model", box m.ModelName ])
+                muted (tr "images.checkTheImageModels" "Check the image models to make images with (none: image generation off). Their files are downloaded, and the model takes them at its next start.")
                 picker
-                Expander(Header = "Advanced", Content = options, HorizontalAlignment = HorizontalAlignment.Stretch)
-                actions [ button "Back" (fun () -> homePage d); accentButton "Apply" apply ]
+                Expander(Header = (tr "common.advanced" "Advanced"), Content = options, HorizontalAlignment = HorizontalAlignment.Stretch)
+                actions [ button (tr "common.back" "Back") (fun () -> homePage d); accentButton (tr "images.apply" "Apply") apply ]
             ]
         )
 
@@ -816,8 +820,8 @@ type MainWindow() as this =
         let gpus = d.Gpus |> Array.filter (fun g -> isNull g.Problem)
         let control, args = runOptions gpus
         let one, oneValue =
-            choice (("As set up", "") :: [ for g in gpus -> sprintf "Only %s, this time" g.Name, string g.Index ]) 0
-        let browser = CheckBox(IsChecked = Nullable true, Content = text "Open the chat in the browser when the model is ready")
+            choice ((tr "start.asSetUp" "As set up", "") :: [ for g in gpus -> trf "start.only" "Only {gpu}, this time" [ "gpu", box g.Name ], string g.Index ]) 0
+        let browser = CheckBox(IsChecked = Nullable true, Content = text (tr "start.openTheChatIn" "Open the chat in the browser when the model is ready"))
         let problem = coloured failBrush ""
         let start () =
             match args () with
@@ -827,12 +831,12 @@ type MainWindow() as this =
                 startModel index m (gpu @ more) (browser.IsChecked = Nullable true)
         show (
             stack 14.0 [
-                yield heading ("Start " + m.ModelName) :> Control
-                if gpus.Length > 1 then yield field "GPU" one :> Control
+                yield heading (trf "start.title" "Start {model}" [ "model", box m.ModelName ]) :> Control
+                if gpus.Length > 1 then yield field (tr "start.gpu" "GPU") one :> Control
                 yield control :> Control
                 yield browser :> Control
                 yield problem :> Control
-                yield actions [ button "Back" (fun () -> homePage d); accentButton "Start" start ] :> Control
+                yield actions [ button (tr "common.back" "Back") (fun () -> homePage d); accentButton (tr "start.start" "Start") start ] :> Control
             ]
         )
 
@@ -840,19 +844,19 @@ type MainWindow() as this =
     and calibrateModel (index: int) (m: Installed) =
         let which = [ "--model"; m.Model; "--family"; m.Family ] |> fun a -> if String.IsNullOrEmpty m.Model then [] else a
         let answer (q: string) = if q.StartsWith "Tune which one" then Some(string (index + 1)) else None
-        runPage ("Tuning " + m.ModelName) ([ "--calibrate"; "--no-start" ] @ which) answer ignore (fun _ -> home ()) |> ignore
+        runPage (trf "tune.title" "Tuning {model}" [ "model", box m.ModelName ]) ([ "--calibrate"; "--no-start" ] @ which) answer ignore (fun _ -> home ()) |> ignore
 
     /// setup --bench (or upstream's benchmark mode) for an installed model: the record goes to the data folder's
     /// records/.
     and benchPage (d: Describe) (m: Installed) =
-        let verbose = CheckBox(Content = text "Where the time goes in more detail (per-stage timings, the kernels, the GPU's load)")
+        let verbose = CheckBox(Content = text (tr "bench.whereTheTimeGoes" "Where the time goes in more detail (per-stage timings, the kernels, the GPU's load)"))
         let rounds = TextBox(Text = "2", MinWidth = 120.0)
         let temperature = TextBox(Text = "0.7", MinWidth = 120.0)
-        let compat = CheckBox(Content = text "Measure the way upstream Strata's benchmark mode does, through the server's API (3-10 minutes)")
-        let long = CheckBox(Content = text "With upstream's long prompts (--long)")
+        let compat = CheckBox(Content = text (tr "bench.measureTheWayUpstream" "Measure the way upstream Strata's benchmark mode does, through the server's API (3-10 minutes)"))
+        let long = CheckBox(Content = text (tr "bench.withUpstreamSLong" "With upstream's long prompts (--long)"))
         let clients = TextBox(PlaceholderText = "1", MinWidth = 120.0)
-        let own = stack 10.0 [ verbose; field "Rounds (each case measured this many times)" rounds; field "Temperature of the sampled runs (0 to 2, 0 = greedy only)" temperature ]
-        let upstream = stack 10.0 [ long; field "Clients at once" clients ]
+        let own = stack 10.0 [ verbose; field (tr "bench.roundsEachCaseMeasured" "Rounds (each case measured this many times)") rounds; field (tr "bench.temperatureOfTheSampled" "Temperature of the sampled runs (0 to 2, 0 = greedy only)") temperature ]
+        let upstream = stack 10.0 [ long; field (tr "bench.clientsAtOnce" "Clients at once") clients ]
         let refresh () =
             own.IsVisible <- compat.IsChecked <> Nullable true
             upstream.IsVisible <- compat.IsChecked = Nullable true
@@ -865,35 +869,35 @@ type MainWindow() as this =
                 if compat.IsChecked = Nullable true then
                     collectArgs [
                         Result.Ok(which @ [ "--bench-original-compat" ] @ flag "--long" long)
-                        optionOf "--clients" clients (isInt 1) "a number of clients, 1 or more"
+                        optionOf "--clients" clients (isInt 1) (tr "opt.clients" "a number of clients, 1 or more")
                     ]
                 else
                     collectArgs [
                         Result.Ok((if verbose.IsChecked = Nullable true then [ "--bench-verbose" ] else [ "--bench" ]) @ which)
-                        optionOf "--bench-rounds" rounds (isInt 1) "a number of rounds, 1 or more"
-                        optionOf "--bench-temperature" temperature (fun t -> isNumber 0.0 2.0 t && abs (float t * 10.0 - round (float t * 10.0)) < 1e-6) "0 to 2 in steps of 0.1"
+                        optionOf "--bench-rounds" rounds (isInt 1) (tr "opt.benchRounds" "a number of rounds, 1 or more")
+                        optionOf "--bench-temperature" temperature (fun t -> isNumber 0.0 2.0 t && abs (float t * 10.0 - round (float t * 10.0)) < 1e-6) (tr "opt.benchTemperature" "0 to 2 in steps of 0.1")
                     ]
             match args with
             | Error why -> problem.Text <- why
-            | Result.Ok a -> runPage ("Measuring " + m.ModelName) a (fun _ -> None) ignore (fun _ -> home ()) |> ignore
+            | Result.Ok a -> runPage (trf "bench.running" "Measuring {model}" [ "model", box m.ModelName ]) a (fun _ -> None) ignore (fun _ -> home ()) |> ignore
         show (
             stack 14.0 [
-                heading ("Measure " + m.ModelName)
-                muted "Measures this model's speed on this PC (about 40 minutes; a running XeStrata is stopped first) and writes a record to the data folder's records/. Nothing is sent anywhere."
+                heading (trf "bench.title" "Measure {model}" [ "model", box m.ModelName ])
+                muted (tr "bench.measuresThisModelS" "Measures this model's speed on this PC (about 40 minutes; a running XeStrata is stopped first) and writes a record to the data folder's records/. Nothing is sent anywhere.")
                 compat
                 own
                 upstream
                 problem
-                actions [ button "Back" (fun () -> homePage d); accentButton "Measure" start ]
+                actions [ button (tr "common.back" "Back") (fun () -> homePage d); accentButton (tr "bench.measure" "Measure") start ]
             ]
         )
 
     /// setup --inspect: what a GGUF is and whether XeStrata runs it, from its headers only (no download).
     and inspectPage (d: Describe) =
-        let source = TextBox(PlaceholderText = "a file, a folder, a URL, hf:owner/repo or ms:owner/repo", MinWidth = 420.0)
-        let variant = TextBox(PlaceholderText = "(optional) a variant name, e.g. IQ3_XXS", MinWidth = 260.0)
+        let source = TextBox(PlaceholderText = (tr "inspect.aFileAFolder" "a file, a folder, a URL, hf:owner/repo or ms:owner/repo"), MinWidth = 420.0)
+        let variant = TextBox(PlaceholderText = (tr "inspect.optionalAVariantName" "(optional) a variant name, e.g. IQ3_XXS"), MinWidth = 260.0)
         let output = LogView()
-        let go = accentButton "Inspect" ignore
+        let go = accentButton (tr "inspect.inspect" "Inspect") ignore
         go.Click.Add(fun _ ->
             match trimmed source with
             | "" -> ()
@@ -902,7 +906,7 @@ type MainWindow() as this =
                 output.Add("> " + src)
                 task {
                     let! messages, _ =
-                        Setup.collect ([ "--inspect"; src ] @ (match trimmed variant with "" -> [] | v -> [ v ]))
+                        setup.Collect ([ "--inspect"; src ] @ (match trimmed variant with "" -> [] | v -> [ v ]))
                     ui (fun () ->
                         for msg in messages do
                             match msg with
@@ -916,21 +920,21 @@ type MainWindow() as this =
                 |> ignore)
         show (
             stack 14.0 [
-                heading "Inspect a model file"
-                muted "What a GGUF is and whether XeStrata runs it, read from its headers only (nothing is downloaded or installed)."
-                field "The model file" (row 8.0 [ source; button "Browse ..." (fun () -> pickFolder "A folder with the model files" source) ])
-                field "Variant" variant
+                heading (tr "inspect.inspectAModelFile" "Inspect a model file")
+                muted (tr "inspect.whatAGgufIs" "What a GGUF is and whether XeStrata runs it, read from its headers only (nothing is downloaded or installed).")
+                field (tr "inspect.theModelFile" "The model file") (row 8.0 [ source; button (tr "common.browse" "Browse ...") (fun () -> pickFolder (tr "inspect.aFolderWithThe" "A folder with the model files") source) ])
+                field (tr "inspect.variant" "Variant") variant
                 output.Control
-                actions [ button "Back" (fun () -> homePage d); go ]
+                actions [ button (tr "common.back" "Back") (fun () -> homePage d); go ]
             ]
         )
 
     /// setup --remove-data: the folders listed with their sizes, deleted after a yes pressed at setup's question.
     and removeData () =
-        runPage "Remove XeStrata's data" [ "--remove-data" ] (fun _ -> None) ignore (fun _ -> home ()) |> ignore
+        runPage (tr "remove.title" "Remove XeStrata's data") [ "--remove-data" ] (fun _ -> None) ignore (fun _ -> home ()) |> ignore
 
     and startModel (index: int) (m: Installed) (extra: string list) (openBrowser: bool) =
-        let stopButton = button "Stop" ignore
+        let stopButton = button (tr "running.stop" "Stop") ignore
         let page (url: string) =
             if openBrowser then openUrl (url + "/")
             show (
@@ -938,18 +942,18 @@ type MainWindow() as this =
                     heading m.ModelName
                     card (
                         stack 8.0 [
-                            coloured okBrush "Running"
-                            text ("Chat in the browser: " + url + "/")
-                            text ("API (OpenAI): " + url + "/v1   (Anthropic: " + url + "/v1/messages)")
+                            coloured okBrush (tr "running.running" "Running")
+                            text (trf "running.chat" "Chat in the browser: {url}" [ "url", box (url + "/") ])
+                            text (trf "running.api" "API (OpenAI): {url}/v1   (Anthropic: {url}/v1/messages)" [ "url", box url ])
                         ]
                     )
-                    actions [ stopButton; accentButton "Open chat" (fun () -> openUrl (url + "/")) ]
+                    actions [ stopButton; accentButton (tr "running.openChat" "Open chat") (fun () -> openUrl (url + "/")) ]
                 ]
             )
         // several installed models: setup asks which one, in describe's order (the newest first)
         let which (q: string) = if q.StartsWith "Which one" then Some(string (index + 1)) else None
         let r =
-            runPage ("Starting " + m.ModelName) ([ "--no-browser" ] @ extra) which (fun url -> page url) (fun _ ->
+            runPage (trf "running.starting" "Starting {model}" [ "model", box m.ModelName ]) ([ "--no-browser" ] @ extra) which (fun url -> page url) (fun _ ->
                 running <- None
                 home ())
         running <- Some r
@@ -974,3 +978,5 @@ type MainWindow() as this =
         this.Closing.Add(fun _ -> running |> Option.iter (fun r -> r.Stop()))
         home ()
         checkUpdate ()
+
+    new() = new MainWindow(Setup.real)

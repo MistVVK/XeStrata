@@ -486,7 +486,7 @@ Qwen3.8-Flash-Next, and takes the GPU reader on a GPU of 24 GB and more, the CPU
 Each picture reader (mmproj) is its publisher's: Ornith AI's BF16 for Ornith-1.5 (pfeifferj's GSQ-RCO files use it too),
 dealignai's for its version without refusals, Unsloth's BF16 for Qwen3.6-35B-A3B and Qwen3.5's 9B, 2B and 0.8B (each repository's own), and SC117's F16 for
 Qwen3.6-35B-A3B's version without refusals.
-Not yet: llm-jp-4.1's and GLM-5.3-Flash's images, image generation, and the options made for Qwen3.8-Flash-Next such as the low-RAM modes (GLM-5.3-Flash's KV cache is FP16 only for now).
+Not yet: llm-jp-4.1's and GLM-5.3-Flash's images, and the options made for Qwen3.8-Flash-Next such as the low-RAM modes (GLM-5.3-Flash's KV cache is FP16 only for now).
 When RAM is short of all the experts, the engine keeps the ones VRAM does not hold in RAM as far as it has room and
 reads the rest from the model file through the OS file cache (slower; setup warns of it when the RAM and the VRAM
 together are short).

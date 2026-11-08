@@ -31,8 +31,10 @@ let private logError (where: string) (e: obj) (stops: bool) =
         if stops then
             told <- e
             let what = match e with :? exn as x -> sprintf "%s: %s" (x.GetType().Name) x.Message | o -> string o
-            let text = sprintf "XeStrata's window stopped on an error:\n%s\n\n%s" what
-                           (if written then "The details are in " + path else "The details could not be written to " + path)
+            let text =
+                I18n.trf "error.stopped" "XeStrata's window stopped on an error:\n{what}" [ "what", box what ] + "\n\n"
+                + (if written then I18n.trf "error.log" "The details are in {path}" [ "path", box path ]
+                   else I18n.trf "error.noLog" "The details could not be written to {path}" [ "path", box path ])
             MessageBoxW(0n, text, "XeStrata", 0x10u) |> ignore   // MB_ICONERROR
 
 type App() =
@@ -47,8 +49,17 @@ type App() =
         | _ -> ()
         base.OnFrameworkInitializationCompleted()
 
+/// --lang CODE: the window in that language (en, de, fr, es, ja, ko, pt, ru, zh) instead of Windows' display
+/// language -> the code and the other arguments.
+let private language (argv: string[]) =
+    match Array.tryFindIndex ((=) "--lang") argv with
+    | Some i when i + 1 < argv.Length -> Some argv[i + 1], Array.append argv[.. i - 1] argv[i + 2 ..]
+    | _ -> None, argv
+
 [<EntryPoint; STAThread>]
 let main argv =
+    let lang, argv = language argv
+    lang |> Option.iter I18n.choose
     match Runtime.problem () with
     | Some why ->
         MessageBoxW(0n, why, "XeStrata", 0x10u) |> ignore   // MB_ICONERROR

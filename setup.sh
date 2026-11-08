@@ -13,8 +13,9 @@ ok_py() { "$1" -c 'import sys, venv, ensurepip; sys.exit(0 if sys.version_info >
 # --help and --check only report, with any Python 3.10+ (they need nothing beyond the standard library): they make no
 # .venv and install nothing (a user ran --help to look, on a work machine, and apt installed Python's packages)
 for arg in "$@"; do
-  case $arg in
-    -h|--help|--check)
+  case $1:$arg in
+    chat:*|images:*) ;;                # their own --help, once the venv is there
+    *:-h|*:--help|*:--check)
       for c in .venv/bin/python python3 python; do
         if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(sys.version_info < (3, 10))' 2>/dev/null
         then
@@ -72,4 +73,9 @@ if [ ! -x .venv/bin/python ]; then
     $PY -m venv .venv || { rm -rf .venv; echo "could not create .venv: sudo apt install python3-venv"; exit 1; }
   fi
 fi
+# the same subcommands as the packages' xestrata and xestrata-cli.exe: the terminal chat, image models for an install
+case $1 in
+  chat) shift; exec .venv/bin/python chat.py "$@" ;;
+  images) shift; exec .venv/bin/python tools/image/install.py "$@" ;;
+esac
 exec .venv/bin/python setup.py "$@"

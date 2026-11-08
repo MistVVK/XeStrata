@@ -26,11 +26,11 @@ let problem () =
     | [], [] -> None
     | [], dlls ->
         Some(
-            "The Microsoft Visual C++ runtime is not installed (missing: " + String.concat ", " dlls + ").\n"
-            + "Install it from " + vcRedistUrl + " and start XeStrata again."
+            I18n.trf "runtime.vc" "The Microsoft Visual C++ runtime is not installed (missing: {dlls}).\nInstall it from {url} and start XeStrata again."
+                [ "dlls", box (String.concat ", " dlls); "url", box vcRedistUrl ]
         )
     | files, _ ->
         Some(
-            "XeStrata's files are incomplete (missing: " + String.concat ", " files + ").\n"
-            + "Unpack the whole 7z again, into an empty folder."
+            I18n.trf "runtime.files" "XeStrata's files are incomplete (missing: {files}).\nUnpack the whole 7z again, into an empty folder."
+                [ "files", box (String.concat ", " files) ]
         )

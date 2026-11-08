@@ -10,6 +10,7 @@ open Avalonia.Controls
 open Avalonia.Controls.Templates
 open Avalonia.Layout
 open Avalonia.Media
+open Xestrata.Launcher.I18n
 
 let private brush (hex: string) = SolidColorBrush(Color.Parse hex) :> IBrush
 
@@ -93,6 +94,6 @@ let field (label: string) (control: Control) =
     stack 4.0 [ muted label; control ]
 
 let gb (x: float) =
-    if x >= 10.0 then sprintf "%.0f GB" x else sprintf "%.1f GB" x
+    trf "unit.gb" "{n} GB" [ "n", box (if x >= 10.0 then x.ToString("0") else x.ToString("0.0")) ]
 
-let contextLabel (tokens: int) = sprintf "%dK tokens" (tokens / 1024)
+let contextLabel (tokens: int) = trf "unit.ktokens" "{n}K tokens" [ "n", box (tokens / 1024) ]

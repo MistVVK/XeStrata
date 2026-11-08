@@ -48,9 +48,17 @@ Windows is a target as well, built natively for the MSVC ABI with intel/llvm's c
 - A change to the C++ code is also compiled for Windows on Linux with the cross build ([docs/DEVTOOLS.md](docs/DEVTOOLS.md#windows-cross-build)): at least the files it touches, and the whole build, linked, when dev is integrated. It must compile and link with no new warnings.
 - Running on Windows is checked only at milestones; until then a report marks it `unverified`.
 
-### The Windows launcher does what setup does
+### setup.py, setup.sh and the F# launchers: the same features
 
-The launcher's window (`windows/launcher/`, `xestrata.exe`) is setup's front end on Windows, and offers everything `setup.py` offers a user of the 7z:
+`setup.py`, `setup.sh` and the F# launchers (`windows/launcher/`: the window `xestrata.exe` and the console's `xestrata-cli.exe`) all keep the same features (the user's decision of 2026-11-09): what one of them can do, a user reaches through each of the others, on Linux as on Windows.
+`setup.py` is where the work is done (with `chat.py` and `tools/image/install.py`); `setup.sh` (and the packages' `xestrata`) and the launchers are its entries and do none of it themselves, so a feature is written once, in Python, and the entries pass it on:
+
+- `setup.sh`, the packages' `xestrata` and `xestrata-cli.exe` take setup's command line as it is, and the same subcommands (`chat`, `images`);
+- the window offers it on a page, as below.
+
+A feature added to one entry alone, or to setup without its way through each entry, does not go in.
+
+The launcher's window is setup's front end, and offers everything `setup.py` offers a user of the 7z:
 
 - each question setup asks (step 2 and after it: the model, its size, the context, the pictures, the KV cache, the RoPE extension, the speed projection, the image models) is a field of the install page, shown where setup would ask it, with setup's default answer;
 - each option that changes an install or a start, which setup takes without asking, is a field (under Advanced);
@@ -59,7 +67,7 @@ The launcher's window (`windows/launcher/`, `xestrata.exe`) is setup's front end
 A change to setup's questions, options or defaults changes the launcher in the same commit.
 A default lives in setup alone: `--describe` reports what the window needs to show it (which questions a family and size ask, the image models a new model is offered), and the window reads it from there.
 Left out is only what the 7z cannot run: building from the source (`--license`, `--intel-llvm*`, `--cmake-arg`, `--allow-no-xmx`, `--packages`, `--update`) and `--original-strata` (upstream's engine fetched with git and built).
-`xestrata-cli.exe` runs setup on the console as it is, with every option.
+`xestrata-cli.exe` runs setup on the console as it is, with every option (`xestrata-cli chat` and `xestrata-cli images` the chat and the image models, as `xestrata chat` and `xestrata images` on Linux).
 
 ## Free and non-free builds (Debian main)
 
@@ -213,7 +221,8 @@ The files a change touches must get no new findings; findings that were there be
 Other projects' files in `third_party/<area>/<project>/` (kept as they are; XeStrata's `patches/` there excepted) get only gitleaks and `reuse lint`.
 clang-tidy reads `compile_commands.json` from the build folder (`build/free`, or `XESTRATA_LINT_BUILD`): configure it with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
 
-Then run the existing tests the change can affect (CTest in the build folder, `python -m unittest` for `serve/` and `tools/`).
+Then run the existing tests the change can affect (CTest in the build folder, `python -m unittest` for `serve/` and `tools/`, `dotnet test windows/launcher/Tests` and `python tools/launcher_i18n.py` for the launchers).
+The launchers' window is tested without a screen there (Avalonia.Headless); on a screen (the Windows test PC, or Xvfb in a throwaway container for Linux) only at milestones.
 For memory and undefined-behavior bugs, build in a folder of its own with `-DSTRATA_SANITIZE=address,undefined` (for example `build/free-asan`) and run CTest there.
 It instruments the project's own host code only, not ggml or the SYCL device code; do not run its binaries under Intel SDE.
 

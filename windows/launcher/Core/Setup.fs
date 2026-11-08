@@ -29,6 +29,13 @@ let runOnConsole (script: string) (args: string seq) =
     p.WaitForExit()
     p.ExitCode
 
+/// A run the window follows on a page: its answers and its end.
+type IRun =
+    /// The answer to an Ask, one line.
+    abstract Answer: string -> unit
+    /// Ends the run and what it started (the server and its engine).
+    abstract Stop: unit -> unit
+
 /// setup.py --json with `args` (or `script`, another of the app's scripts that speaks setup.py's --json:
 /// tools/image/install.py): each line to `onMessage` (on a thread of its own), the exit code to `onExit` once both
 /// streams have ended.
@@ -81,6 +88,10 @@ type Run(script: string, args: string seq, onMessage: Protocol.Message -> unit, 
 
     member _.HasExited = proc.HasExited
 
+    interface IRun with
+        member this.Answer answer = this.Answer answer
+        member this.Stop() = this.Stop()
+
     new(args: string seq, onMessage: Protocol.Message -> unit, onExit: int -> unit) =
         Run(Places.setupPy, args, onMessage, onExit)
 
@@ -90,3 +101,14 @@ let collect (args: string seq) : Task<Protocol.Message list * int> =
     let messages = Collections.Concurrent.ConcurrentQueue<Protocol.Message>()
     Run(args, messages.Enqueue, (fun code -> done'.SetResult(List.ofSeq messages, code))) |> ignore
     done'.Task
+
+/// How the window reaches setup: the short runs that ask nothing, and the runs of `script` it follows on a page (the
+/// launcher's tests give canned ones).
+type Access =
+    { Collect: string list -> Task<Protocol.Message list * int>
+      Start: string -> string list -> (Protocol.Message -> unit) -> (int -> unit) -> IRun }
+
+/// setup.py itself, through the bundled Python.
+let real =
+    { Collect = collect
+      Start = fun script args onMessage onExit -> Run(script, args, onMessage, onExit) :> IRun }

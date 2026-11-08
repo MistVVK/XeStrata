@@ -54,7 +54,8 @@ ALLOWED = [
     # a heading's anchor (the headings of upstream's versions)
     r'#[\w%-]*strata-\d',
     # credits and upstream named
-    r'[Uu]pstream(?:\'s)? Strata', r'Strata(?:-GLM)? (?:[0-9]|#|v[0-9])', r'Strata\'s', r'\boriginal-strata\b',
+    r'[Uu]pstream(?:\'s)? Strata', r'upstream の Strata', r'Upstream-Strata', r'Strata en amont', r'Strata \(upstream\)',
+    r'Strata(?:-GLM)? (?:[0-9]|#|v[0-9])', r'Strata\'s', r'\boriginal-strata\b',
     r'Niko1221', r'the Strata contributors', r'Strata-GLM', r'github\.com/[\w.-]+/Strata',
     r'XeStrata', r'upstream\.name',
 ]
