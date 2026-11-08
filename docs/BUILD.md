@@ -471,9 +471,14 @@ The Containerfile and the compose files in `container/` run XeStrata in a rootle
 The image is built on the user's PC and not distributed: the contrib packages' image holds cuBLAS and oneMKL, which are not free software.
 
 - **What it holds**: the Fedora 44 image `tools/package/build.sh` uses (pinned by digest), with the release's rpm, checked against `SHA256SUMS`.
-  Then every maker's package its `BUILD.json` records in `runtime` (Level Zero, ROCm's HIP runtime, rocBLAS and hipBLASLt, cuBLAS, oneMKL)
+  Then every maker's package its `BUILD.json` records in `runtime` (Level Zero, cuBLAS, oneMKL)
   and Mesa's Vulkan drivers (`container/install.sh`).
   NVIDIA's driver libraries and `nvidia-smi` are not in it: CDI brings the host's.
+- **AMD's ROCm**: not Fedora's (7.1) but the ROCm of AMD's Radeon repository (its RHEL 10 one; 10.1 by default): its HIP runtime, rocBLAS and hipBLASLt.
+  rocBLAS's and hipBLASLt's packages go in for every AMD GPU the engine has code for (`BUILD.json`'s `hip_archs`: RDNA2 to RDNA4), so that one image runs on each generation.
+  Its hipBLASLt has code for gfx1102, 1103 and 1150 as well, which Fedora's lacks, and from 10.1 the HIP runtime gives the VRAM of memory it unmaps back to other processes.
+  The libraries keep 7.1's names (`libamdhip64.so.7`, `librocblas.so.5`, `libhipblaslt.so.1`), so the Fedora 44 package's engine runs on them as it is.
+  Where AMD's release has no package for one of `hip_archs`, Fedora's goes in instead.
 - **Build arguments**: environment variables for `podman compose build`.
 
 | Variable | Default | Meaning |
@@ -481,6 +486,7 @@ The image is built on the user's PC and not distributed: the contrib packages' i
 | `XESTRATA_VERSION` | `latest` | the release's tag (`xe0.1.43.1`, for example) |
 | `XESTRATA_VARIANT` | `contrib-cuda13.4` | the rpm's variant |
 | `XESTRATA_NONFREE` | `1` | `0` leaves out oneMKL and NVIDIA's cuBLAS and cuDNN (Intel's and NVIDIA's dense products and NVIDIA's image attention then run on XeStrata's own kernels) |
+| `XESTRATA_ROCM` | `10.1` | the ROCm version for AMD GPUs (AMD's repository's; `10.1` for now); `fedora` installs Fedora's (7.1). Both are free software, installed with `XESTRATA_NONFREE=0` as well |
 
 - **A local rpm**: one rpm in `container/rpm/` is installed instead of the release's.
   `xestrata-free`, which the Releases do not have, is made with `tools/package/build.sh fedora44 free` and put there.

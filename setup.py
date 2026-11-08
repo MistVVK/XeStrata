@@ -1795,13 +1795,25 @@ def repo_added(url: str) -> bool:
     return False
 
 
+def amd_libs_loadable() -> bool:
+    """Whether the loader finds the HIP runtime, rocBLAS and hipBLASLt the engine links, whoever installed them: AMD's
+    own packages (the Podman image's ROCm, container/install.sh) are not the distribution's that BUILD.json's runtime
+    names."""
+    try:
+        cached = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True).stdout
+    except OSError:
+        return False
+    return all(f"{lib}.so" in cached for lib in ("libamdhip64", "librocblas", "libhipblaslt"))
+
+
 def runtime_missing(makers: set) -> tuple:
     """For the package's engine: the GPU makers' packages (BUILD.json's runtime) that the GPUs of `makers` need and
     are not installed, those that would make them faster (OpenCL, which oneDNN's attention runs on; oneMKL, cuBLAS:
     contrib; pip's are linux_nvidia_libs'), and the commands that add the repositories those come from.  Empty for an
     engine without the record."""
     rt = packaged_engine().get("runtime") or {}
-    need = [n for m in ("intel", "amd") if m in makers for n in rt.get(m, []) if not pkg_installed(n)]
+    need = [n for m in ("intel", "amd") if m in makers and not (m == "amd" and amd_libs_loadable())
+            for n in rt.get(m, []) if not pkg_installed(n)]
     fast = [n for m, k in (("intel", "onednn"), ("intel", "onemkl"), ("nvidia", "cublas")) if m in makers
             for n in rt.get(k, []) if not pkg_installed(n)]
     d = distro_family()

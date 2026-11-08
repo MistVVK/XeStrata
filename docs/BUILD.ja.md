@@ -471,9 +471,14 @@ xe0.1.43.1-1 は `0.1.43.1-1`（rpm は Version が 0.1.43.1、Release が 1）�
 イメージは使う人の PC で作り、配布しません。contrib の版のイメージには、自由ソフトウェアでない cuBLAS と oneMKL が入るためです。
 
 - **中身**: `tools/package/build.sh` と同じ Fedora 44 のイメージ（ダイジェストで固定）に、Releases の rpm を `SHA256SUMS` で確かめて入れます。
-  続けて、その `BUILD.json` の `runtime` にあるメーカーのもの（Level Zero、ROCm の HIP の実行時と rocBLAS と hipBLASLt、cuBLAS、oneMKL）と
+  続けて、その `BUILD.json` の `runtime` にあるメーカーのもの（Level Zero、cuBLAS、oneMKL）と
   Mesa の Vulkan のドライバーをすべて入れます（`container/install.sh`）。
   NVIDIA のドライバーのライブラリと `nvidia-smi` は入れず、CDI でホストのものを使います。
+- **AMD の ROCm**: Fedora のもの（7.1）でなく、AMD の Radeon 向けのリポジトリ（RHEL 10 版）の ROCm（既定は 10.1）の HIP の実行時と rocBLAS と hipBLASLt を入れます。
+  rocBLAS と hipBLASLt は、エンジンがコードを持つ AMD の GPU（`BUILD.json` の `hip_archs`: RDNA2 から RDNA4 まで）ごとのパッケージを全部入れるので、1 つのイメージがどの世代でも動きます。
+  hipBLASLt は Fedora のものにない gfx1102・1103・1150 のコードも持ち、HIP の実行時は 10.1 から、外したメモリの VRAM をほかのプロセスに戻します。
+  ライブラリの名前（`libamdhip64.so.7`・`librocblas.so.5`・`libhipblaslt.so.1`）は 7.1 と同じなので、Fedora 44 のパッケージのエンジンがそのまま動きます。
+  AMD の版に `hip_archs` のどれかのパッケージがないときは、Fedora のものを入れます。
 - **ビルドの引数**: 環境変数で `podman compose build` に渡します。
 
 | 変数 | 既定 | 意味 |
@@ -481,6 +486,7 @@ xe0.1.43.1-1 は `0.1.43.1-1`（rpm は Version が 0.1.43.1、Release が 1）�
 | `XESTRATA_VERSION` | `latest` | リリースのタグ（`xe0.1.43.1` など） |
 | `XESTRATA_VARIANT` | `contrib-cuda13.4` | 入れる rpm の版 |
 | `XESTRATA_NONFREE` | `1` | `0` で oneMKL と、NVIDIA の cuBLAS・cuDNN を入れません（Intel と NVIDIA の密な積と NVIDIA の画像の注意は XeStrata の自前のカーネルになります） |
+| `XESTRATA_ROCM` | `10.1` | AMD の GPU の ROCm の版（AMD のリポジトリのもの、いまは `10.1` だけ）。`fedora` で Fedora のもの（7.1）を入れます。ROCm はどちらも自由ソフトウェアで、`XESTRATA_NONFREE=0` でも入れます |
 
 - **手元の rpm**: `container/rpm/` に rpm を 1 つ置くと、Releases から取らずにそれを入れます。
   Releases にない `xestrata-free` は、`tools/package/build.sh fedora44 free` で作ってここに置きます。

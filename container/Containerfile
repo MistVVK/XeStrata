@@ -9,10 +9,12 @@ FROM ${FEDORA}
 ARG XESTRATA_VERSION=latest
 ARG XESTRATA_VARIANT=contrib-cuda13.4
 ARG XESTRATA_NONFREE=1
+# the version of AMD's ROCm for AMD GPUs (install.sh), or fedora: Fedora's own
+ARG XESTRATA_ROCM=10.1
 # (relabel: SELinux lets the build read the folder)
 RUN --mount=type=bind,source=.,target=/ctx,relabel=shared \
     XESTRATA_VERSION="$XESTRATA_VERSION" XESTRATA_VARIANT="$XESTRATA_VARIANT" XESTRATA_NONFREE="$XESTRATA_NONFREE" \
-    sh /ctx/install.sh
+    XESTRATA_ROCM="$XESTRATA_ROCM" sh /ctx/install.sh
 # the browser is the host's: the server only listens (on the host's loopback, compose.yaml)
 ENTRYPOINT ["xestrata"]
 CMD ["--no-browser"]
