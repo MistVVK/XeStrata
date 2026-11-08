@@ -35,6 +35,11 @@ setup checks the GPU, RAM and CPU, chooses a SYCL compiler and builds the engine
 **Afterwards**, `./setup.sh` starts the model right away.
 The README's `xestrata` options work the same with `./setup.sh`. The terminal chat is `.venv/bin/python chat.py`.
 
+**The window**: `./setup.sh gui` opens the window.
+It builds `launcher/` into `build/launcher` with the .NET 10 SDK (Ubuntu: `sudo apt install dotnet-sdk-10.0`, Fedora:
+`sudo dnf install dotnet-sdk-10.0`) and opens it.
+Without the SDK it says how to install it and stops. Nothing else here uses .NET.
+
 **Updating**: run `./update.sh`. In a git checkout it runs `git pull`, then updates the engine, the Python packages and
 the model settings (it does not start the model). You can also download a new version, unpack it elsewhere and run
 `./setup.sh` there: the new copy finds `XeStrata-data` and runs with the same settings.
@@ -424,6 +429,34 @@ tools/package/build.sh windows cuda12.4      # XeStrata-<version>-windows-x64.7z
   `THIRD-PARTY-NOTICES.md` names each component, its version, license and source, and `licenses/` holds the license texts.
 - What comes out: the 7z and `BUILDINFO` in `build/pkg/windows-cuda12.4/`.
 
+### The window's package (xestrata-gui)
+
+Linux's window (`launcher/`) is built with the same `tools/package/build.sh`, in a throwaway container of the
+distribution (`tools/package/gui.sh`).
+
+```bash
+tools/package/build.sh ubuntu26.04 gui   # xestrata-gui_<version>_amd64.deb
+tools/package/build.sh fedora44 gui      # xestrata-gui-<version>.x86_64.rpm
+```
+
+- The distribution's `dotnet-sdk-10.0` (Ubuntu's archive, Fedora's updates) publishes the window for linux-x64,
+  framework-dependent.
+  The .NET runtime is not bundled: the package depends on the distribution's `dotnet-runtime-10.0`, and it is the only
+  package that depends on .NET.
+- The NuGet packages come from nuget.org only (`launcher/nuget.config`), their versions and hashes fixed in each
+  project's `packages.lock.json`.
+  The packages and the Windows 7z restore with `RestoreLockedMode`, which takes nothing the lock files do not name.
+  After a version is changed, `dotnet restore launcher/Tests --force-evaluate` writes the lock files again.
+  The packages fetched are kept in `build/pkg-cache/<distro>/nuget/`.
+- It holds `/usr/lib/xestrata/launcher/` (`xestrata-gui` and its DLLs, `libSkiaSharp.so`, `libHarfBuzzSharp.so`), the
+  menu's entry and icon, and `THIRD-PARTY-NOTICES.md` and `licenses/` in `/usr/share/doc/xestrata-gui/`
+  (`tools/package/launcher_notices.py`, which stops on a library of the window's folder that is in no component).
+- The window draws its fields from setup's `--describe`, so it depends on the main package of the same version: each
+  variant provides `xestrata-engine` at its version, and `xestrata-gui` depends on that.
+  The main package only suggests `xestrata-gui`, and depends neither on .NET nor on the window.
+- Its parts are all free software (of Adobe's DNG SDK in libSkiaSharp.so the code only, none of its documentation,
+  whose terms are not free), so the same one package goes with the free and the contrib-llvm main packages.
+
 ### What the packages hold
 
 Each variant (`xestrata-free`, `xestrata-contrib-cuda<version>`) is one package with the following.
@@ -435,7 +468,9 @@ xe0.1.43.1-1 is `0.1.43.1-1` (for rpm, Version 0.1.43.1 and Release 1).
 | the `xestrata` command (setup.py), the server, the web app, the tools setup runs, llama.cpp's gguf-py, the data files, a systemd user unit | `/usr/share/xestrata`, `/usr/bin/xestrata`, `/usr/lib/systemd/user/xestrata.service` |
 | the engine (`xestrata-engine`), the image encoders, intel/llvm's SYCL runtime (`libsycl.so.9`, UR's loader, its Level Zero and HIP (AMD) adapters and in the cuda variants its CUDA adapter, `libumf`), oneMath (its rocBLAS backend, and in the cuda variants its oneMKL and cuBLAS backends) | `<libdir>/xestrata/engine` |
 
-- The packages provide and conflict with `xestrata-engine`: one is installed at a time, and installing another replaces it.
+- The packages provide `xestrata-engine` at their version and conflict with it: one is installed at a time, and
+  installing another replaces it.
+  They only suggest the window's package `xestrata-gui` ([the window's package](#the-windows-package-xestrata-gui)).
 - Neither Ubuntu 26.04 (`dpclang` up to 6) nor Fedora 44 has libsycl 9, so the packages carry it.
   intel/llvm's `libsycl-jit` (157 MB) is opened only to compile kernels from source, which the engine does not: it is left out.
 - The dependencies are the distribution's.

@@ -2,11 +2,11 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # .claude/skills/release/scripts/build-packages.sh - a release's packages: one set of the deb and rpm variants (and in
-# the contrib set the Windows 7z) built from TAG one after another (tools/package/build.sh, a clean container each),
+# the contrib set the Windows 7z and the window's xestrata-gui deb and rpm, one for every variant) built from TAG one after another (tools/package/build.sh, a clean container each),
 # gathered into build/release/TAG/ with SHA256SUMS over every package there (the other set's included).
 #
 #   .claude/skills/release/scripts/build-packages.sh TAG contrib   # ubuntu26.04 cuda13.1, cuda12.4; fedora44 cuda13.4;
-#                                                                  # windows cuda12.4
+#                                                                  # windows cuda12.4; ubuntu26.04 gui, fedora44 gui
 #   .claude/skills/release/scripts/build-packages.sh TAG free      # ubuntu26.04 free; fedora44 free
 #
 # Run from the repository root.  The contrib set takes about two hours, the free one about an hour.  It
@@ -20,7 +20,7 @@ usage() { echo "usage: $0 TAG contrib|free" >&2; exit 2; }
 tag=$1
 set_=$2
 case $set_ in
-  contrib) variants="ubuntu26.04 cuda13.1|ubuntu26.04 cuda12.4|fedora44 cuda13.4|windows cuda12.4" ;;
+  contrib) variants="ubuntu26.04 cuda13.1|ubuntu26.04 cuda12.4|fedora44 cuda13.4|windows cuda12.4|ubuntu26.04 gui|fedora44 gui" ;;
   free) variants="ubuntu26.04 free|fedora44 free" ;;
   *) usage ;;
 esac

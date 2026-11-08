@@ -29,9 +29,10 @@ r[0-9][0-9][0-9]*/
 /container/rpm/
 /container/compose.override.yaml
 
-# the Windows launchers' build outputs (dotnet)
-windows/launcher/*/bin/
-windows/launcher/*/obj/
+# the launcher's build outputs and NuGet packages (dotnet)
+launcher/*/bin/
+launcher/*/obj/
+launcher/.nuget/
 
 # setup.py outputs (engine, downloads)
 /engine/

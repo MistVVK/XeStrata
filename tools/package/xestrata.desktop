@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# The menu's entry of the launcher's window, in the xestrata-gui package (tools/package/gui.sh).
+[Desktop Entry]
+Type=Application
+Name=XeStrata
+GenericName=Local LLM server
+Comment=Install, start and set up XeStrata's models
+Exec=xestrata gui
+Icon=xestrata
+Terminal=false
+Categories=Development;Science;
+Keywords=LLM;AI;Qwen;chat;

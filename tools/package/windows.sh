@@ -7,7 +7,7 @@
 # contrib toolchain (whose tools the next step runs), intel/llvm's SYCL runtime for Windows, the engine (the
 # contrib-llvm mode: Intel's GPUs through Level Zero, NVIDIA's through CUDA, AMD's through HIP; oneMath with its oneMKL,
 # cuBLAS and rocBLAS backends, which run where the user installed oneMKL, cuBLAS and rocBLAS), the
-# launchers (windows/launcher, .NET), and Python's embeddable distribution with the packages setup.py uses;
+# launchers (launcher, .NET), and Python's embeddable distribution with the packages setup.py uses;
 # tools/package/windows_bundle.py makes the folder, its notices and the 7z.
 set -eu
 src=/src
@@ -157,8 +157,11 @@ lap encoders
 
 # the launchers (framework-dependent: Windows' .NET 10 runtime runs them); Avalonia's build telemetry off
 export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 AVALONIA_TELEMETRY_OPTOUT=1 NUGET_PACKAGES=/cache/nuget
+# (the NuGet packages exactly as the lock files name them: launcher/Directory.Build.props)
 for p in Gui Cli; do
-  dotnet publish "$src/windows/launcher/$p/$p.fsproj" -c Release -r win-x64 --self-contained false -o /build/launcher
+  dotnet restore "$src/launcher/$p/$p.fsproj" -p:RestoreLockedMode=true
+  dotnet publish "$src/launcher/$p/$p.fsproj" --no-restore -c Release -r win-x64 --self-contained false \
+    -o /build/launcher
 done
 lap launchers
 

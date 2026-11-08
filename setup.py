@@ -330,24 +330,24 @@ MODELS: dict[str, dict[str, Any]] = {
                             "its experts come from the SSD while it answers, so it is slower than the 2-3-bit "
                             "models", "download_gb": 111.3, "ram_gb": 48, "arena_gb": 77.0,
                    "families": ("unsloth", "huihui-unsloth"), "budget": True, "experimental": True,
-                   # upstream #967: images are allowed (the same base model and image encoder as UD-IQ4_XS), with a
-                   # warning: reported working by hand upstream (#967, #971), not run with this file
-                   "vision": True, "vision_untested": True},
+                   # upstream #967: images are allowed (the same base model and image encoder as UD-IQ4_XS),
+                   # reported working upstream (#967, #971)
+                   "vision": True},
     # upstream 0.1.44 (23250b5d): Unsloth's 5-, 6- and 8-bit files, six shards each; their experts are Q5_K, Q6_K and
     # Q8_0 gate/up with Q8_0 downs, which the expert kernels read.  Not run here (the user's decision of 2026-10-14:
     # offered as they are); on a PC with less RAM than "ram_gb" a RAM budget of the experts, the rest read from the SSD.
-    "UD-Q5_K_XL": {"about": "5-bit (Unsloth Dynamic): Q5_K experts with Q8_0 downs, close to Q8_0 in quality; not "
-                            "tested in XeStrata", "download_gb": 158.3, "ram_gb": 108, "arena_gb": 98.4,
+    "UD-Q5_K_XL": {"about": "5-bit (Unsloth Dynamic): Q5_K experts with Q8_0 downs, close to Q8_0 in quality",
+                   "download_gb": 158.3, "ram_gb": 108, "arena_gb": 98.4,
                    "families": ("unsloth",), "budget": True, "experimental": True, "shards": 6,
-                   "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00006.gguf", "vision": True, "vision_untested": True},
-    "UD-Q6_K_XL": {"about": "6-bit (Unsloth Dynamic): Q6_K experts with Q8_0 downs; not tested in XeStrata",
+                   "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00006.gguf", "vision": True},
+    "UD-Q6_K_XL": {"about": "6-bit (Unsloth Dynamic): Q6_K experts with Q8_0 downs",
                    "download_gb": 169.2, "ram_gb": 118, "arena_gb": 109.2, "families": ("unsloth",), "budget": True,
                    "experimental": True, "shards": 6, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00006.gguf",
-                   "vision": True, "vision_untested": True},
-    "Q8_0": {"about": "8-bit, the reference quality (every expert Q8_0), for a 192 GB PC; not tested in XeStrata",
+                   "vision": True},
+    "Q8_0": {"about": "8-bit, the reference quality (every expert Q8_0), for a 192 GB PC",
              "download_gb": 188.2, "ram_gb": 136, "arena_gb": 128.3, "families": ("unsloth", "huihui-unsloth"),
              "budget": True, "experimental": True, "shards": 6, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00006.gguf",
-             "vision": True, "vision_untested": True},
+             "vision": True},
     # Gyro (agentionai): "ram_gb" is the RAM that holds every expert with the usual room beside them ("arena_gb" +
     # LOW_RAM_HEADROOM_GB); with less, the low-RAM mode needs RAM and VRAM together of "arena_gb" + 12 (low_ram_fits:
     # 6 GB of each for the rest).  The rest of the download is the n-gram table, read from the SSD.  Neither is anyone's
@@ -777,9 +777,10 @@ FAMILIES: dict[str, dict[str, Any]] = {
 # The models the engine runs other than Qwen3.8-Flash-Next (src/core/plain_model.cpp: `xestrata-engine --native` with
 # another architecture): one GGUF file each, its size and SHA-256 at the pinned revision (the Hub's LFS pointers), or
 # its "parts" (a model in several files: each one's path in the repository, size and SHA-256; "file" is the first, which
-# the engine is given), no pack and no PLE table.  "tested": the files this release was checked with (the rest use the
-# same tensor types, checked on those files and in the kernels' tests).  "mmproj": the picture reader's file (the
-# family reads images); "dense": a model without experts, every weight of which the engine keeps in VRAM, and
+# the engine is given), no pack and no PLE table.  "tested": the files this release was run with (the others use the
+# same tensor types, checked on those files and in the kernels' tests; tools/strata_mcp.py offers them as
+# experimental).  "mmproj": the picture reader's file (the family reads images); "dense": a model without experts,
+# every weight of which the engine keeps in VRAM, and
 # "kv_bytes": its K/V cache's bytes a token (setup sizes the model and the context by the GPU's memory).
 _ORNITH = "ornith-ai/Ornith-1.5-35B-A3B-GGUF"
 _ORNITH_GSQ = "pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF"
@@ -6658,6 +6659,128 @@ def settings_summary(cfg: dict, port=None) -> str:
     return " ".join(out) + ("; " if out else "") + "server " + ", ".join(srv)
 
 
+def server_on_port(port: int, api_key: str | None = None) -> tuple[str, list] | None:
+    """What answers GET /v1/models on this PC's `port`: None (nothing listens, or it does not answer in a few
+    seconds), ("xestrata", the ids of the models it serves) or ("other", [])."""
+    req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/models")
+    key = (api_key or "").split(",")[0].strip()
+    if key:
+        req.add_header("Authorization", f"Bearer {key}")
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            body = json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        e.close()
+        return ("other", [])                          # it answered, but not as XeStrata does to its own key
+    except (OSError, ValueError):
+        return None
+    data = body.get("data") if isinstance(body, dict) else None
+    if not isinstance(data, list) or not any(isinstance(m, dict) and m.get("owned_by") == "xestrata" for m in data):
+        return ("other", [])
+    return ("xestrata", [str(m.get("id")) for m in data if isinstance(m, dict) and m.get("id")])
+
+
+def systemd_service_active() -> bool:
+    """Whether the packages' user service (xestrata.service: the model set up last) runs for this user."""
+    if WIN or not shutil.which("systemctl"):
+        return False
+    try:
+        return subprocess.run(["systemctl", "--user", "is-active", "--quiet", "xestrata.service"],
+                              timeout=10).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def attach_running(cfg: dict, port: int, open_browser: bool) -> bool:
+    """A start where a server already listens on the model's port (the packages' systemd service, or a start in another
+    terminal): the same model served there is used, not started twice (True: setup is done); another model of
+    XeStrata's stops setup with how to free the port; something else is left to the server's own message on the busy
+    port (False).  For setup in a terminal and for the launcher's window alike."""
+    got = server_on_port(port, cfg.get("api_key"))
+    if got is None or got[0] != "xestrata":
+        return False
+    name = str(cfg.get("model_name") or "").lower()
+    if name not in [m.lower() for m in got[1]]:
+        fail(f"port {port} is serving {got[1][0] if got[1] else 'another model'} of XeStrata's",
+             "stop it (the systemd service: systemctl --user stop xestrata), or start this model on another port "
+             "with --port")
+    service = systemd_service_active()
+    url = f"http://127.0.0.1:{port}"
+    ok(f"{cfg.get('model_name')} is already running on port {port}" +
+       (" as the systemd service (to stop it: systemctl --user stop xestrata)" if service else
+        " (started elsewhere: stop it there)") + "; not started again")
+    if JSON_OUT:
+        emit({"type": "attached", "url": url, "service": service})
+    say(f"ready: {url}/v1  (already running)")
+    if open_browser and not JSON_OUT:
+        import webbrowser
+        webbrowser.open(url + "/")
+    return True
+
+
+# The launcher's window on Linux (launcher/, the xestrata-gui package): an extra, which nothing else needs.  The
+# packages put it here; ./setup.sh gui builds it into the checkout's build/launcher with the .NET 10 SDK.
+GUI_PACKAGED = Path("/usr/lib/xestrata/launcher/xestrata-gui")
+GUI_SOURCE = ROOT / "build" / "launcher" / "xestrata-gui"
+
+
+def dotnet_has(kind: str) -> bool:
+    """Whether .NET 10 or later is installed: its runtime (kind "runtime"; the window rolls forward to a later major
+    version) or its SDK ("sdk", which ./setup.sh gui builds the window with)."""
+    dotnet = shutil.which("dotnet")
+    if not dotnet:
+        return False
+    try:
+        listed = subprocess.run([dotnet, "--list-runtimes" if kind == "runtime" else "--list-sdks"],
+                                capture_output=True, text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    pattern = r"^Microsoft\.NETCore\.App (\d+)\." if kind == "runtime" else r"^(\d+)\."
+    return any(int(v) >= 10 for v in re.findall(pattern, listed, re.M))
+
+
+def gui_runtime_problem(sdk: bool = False) -> str | None:
+    """Why the launcher's window cannot open here, with what to install (None: it can): only `xestrata gui` and
+    `./setup.sh gui` ask, setup's checks never do (.NET is not needed for anything else).  `sdk`: the window is built
+    from the source first, with the SDK."""
+    if PACKAGED and not GUI_PACKAGED.is_file():
+        return ("the window is the xestrata-gui package: sudo apt install xestrata-gui (Ubuntu) or sudo dnf install "
+                "xestrata-gui (Fedora), which brings the .NET 10 runtime with it. Everything it does is also there "
+                "without it: xestrata --setup in a terminal, and the web page")
+    if dotnet_has("sdk" if sdk else "runtime"):
+        return None
+    what = "dotnet-sdk-10.0" if sdk else "dotnet-runtime-10.0"
+    family = distro_id()
+    if family == "ubuntu" or family == "fedora":
+        how = f"sudo {'apt' if family == 'ubuntu' else 'dnf'} install {what}"
+        return (f"the window needs .NET 10 ({'its SDK, to build it' if sdk else 'its runtime'}): {how}. Everything it "
+                "does is also there without it: setup in a terminal, and the web page")
+    return ("the window needs the .NET 10 runtime, which this distribution has no official package of, so the window "
+            "is not available here. Everything it does is there without it: setup in a terminal (xestrata --setup, "
+            "./setup.sh), and the web page")
+
+
+def run_gui(args: list) -> int:
+    """`xestrata gui` and `./setup.sh gui`: the launcher's window, told where setup.py and its Python are; what is
+    missing said, and 1, where it cannot open."""
+    if WIN:
+        fail("on Windows the window is xestrata.exe (xestrata-cli gui opens it)")
+    exe = GUI_PACKAGED if PACKAGED else GUI_SOURCE
+    why = gui_runtime_problem(sdk=not PACKAGED)
+    if why:
+        say(f"XeStrata's window: {why}.")
+        return 1
+    if not PACKAGED:                                   # the checkout's window, built (again) from launcher/
+        r = run(["dotnet", "publish", str(ROOT / "launcher" / "Gui" / "Gui.fsproj"), "-c", "Release", "-r",
+                 "linux-x64", "--self-contained", "false", "--nologo", "-o", str(exe.parent)], check=False, quiet=True,
+                env={**os.environ, "DOTNET_CLI_TELEMETRY_OPTOUT": "1", "AVALONIA_TELEMETRY_OPTOUT": "1"})
+        if r.returncode != 0:
+            say("XeStrata's window could not be built (dotnet publish failed, above).")
+            return 1
+    env = {**os.environ, "XESTRATA_APP_DIR": str(ROOT), "XESTRATA_PYTHON": sys.executable}
+    return subprocess.call([str(exe), *args], env=env)
+
+
 def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_browser=True, yes=False,
           layer_split=None, keep=None) -> int:
     """keep: settings given on this start that the model keeps from now on (--host, --api-key, --draft-vocab,
@@ -6704,6 +6827,8 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     cfg_path.touch()                                     # the most recently used model
     if "--mtp" in cfg["args"][:-1]:
         refresh_draft_vocab(Path(cfg["args"][cfg["args"].index("--mtp") + 1]), cfg.get("draft_vocab", "cjk"))
+    if attach_running(cfg, int(port or cfg.get("port", 8095)), open_browser):
+        return 0
     cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "xestrata", "--config", str(cfg_path),
            "--port", str(port or cfg.get("port", 8095))]
     found = gpus()
@@ -7384,16 +7509,13 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
                 f"   <- needs ~{need:.0f} GB of VRAM at {rec_ctx // 1024}K, the GPU has {gpu_gb:.0f} GB"
         else:
             fit = "" if ram + vram >= gb + 8 else f"   <- {gb:.0f} GB of weights, this PC has {ram:.0f} GB of RAM"
-        say(f"  {i}) {m:15s} {d['about']}" + ("" if d.get("custom") else f"; download {gb:.0f} GB") +
-            ("" if d.get("tested") else "   [untested]") + fit)
+        say(f"  {i}) {m:15s} {d['about']}" + ("" if d.get("custom") else f"; download {gb:.0f} GB") + fit)
     # the best quality this PC runs (recommend_size; on the CPU the family's own choice: every size runs as int8)
     cards = [gpu_info(i) for i in sel] if len(sel) > 1 else [gpu]
     rec = str(names.index(recommend_size(family, room_of(ram, cards), names)) + 1)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     d = models[model]
     own = bool(a.gguf_dir or d.get("custom"))          # the person's own files: never downloaded or marked
-    if not d.get("tested"):
-        warn(f"{model} has not been run with this release (its tensor types are checked with the tested files)")
     if not dense and ram + vram < d["size"] / 1e9 + 8:
         warn(f"{model}'s {d['size'] / 1e9:.0f} GB of weights do not fit this PC's RAM and GPU with room to spare: "
              "the engine reads the experts neither holds from the model file through the OS file cache (slower)")
@@ -8102,7 +8224,7 @@ def describe() -> dict:
                     else "yes" if size_fits(f, m, room) else "slow"
                 models.append({"id": m, "about": d["about"], "download_gb": round(gb, 1),
                                "ram_gb": DENSE_RAM_GB if fam.get("dense") else round(gb + 8),
-                               "fits": fits, "tested": bool(d.get("tested")),
+                               "fits": fits,
                                "experimental": False, "recommended": m == by_quant[size_quantizer(f, m)],
                                "quantizer": size_quantizer(f, m), "context": ctx_f,
                                "vision": bool(fam.get("mmproj")), "budget": not fam.get("dense")})
@@ -8114,7 +8236,7 @@ def describe() -> dict:
                 fits = ("budget" if d.get("budget") else "yes" if ram >= d["ram_gb"] else "low-ram" if low else
                         "no")
                 models.append({"id": m, "about": d["about"], "download_gb": d["download_gb"], "ram_gb": d["ram_gb"],
-                               "fits": fits, "tested": True, "experimental": bool(d.get("experimental")),
+                               "fits": fits, "experimental": bool(d.get("experimental")),
                                "recommended": m == by_quant[size_quantizer(f, m)], "quantizer": size_quantizer(f, m),
                                "context": min(by_vram, ram_ctx(m, ram, low)),
                                "vision": d.get("vision", fam.get("vision")) is not False,
@@ -8326,7 +8448,13 @@ def main() -> int:
                          "--clients N, --compare DIR). --bench is XeStrata's own measurement")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--image-text-encoder", help=argparse.SUPPRESS)   # removed: --images names the encoder
+    ap.add_argument("--gui", nargs=argparse.REMAINDER, metavar="ARGS",
+                    help="open the launcher's window (xestrata gui, ./setup.sh gui; on Linux the xestrata-gui package, "
+                         "or built from launcher/ with the .NET 10 SDK); ARGS go to it (--lang CODE, "
+                         "--software-render)")
     a = ap.parse_args()
+    if a.gui is not None:
+        return run_gui(a.gui)
     if a.license == "contrib-icpx":
         fail("--license contrib-icpx: the contrib-icpx mode (Intel oneAPI's icpx) was removed",
              "use --license contrib (contrib-llvm: intel/llvm, for Intel, AMD and NVIDIA GPUs), or --license free")
@@ -8876,9 +9004,6 @@ def main() -> int:
         vision = "none" if asked == "no" else images_encoder(asked, gpu)
     ok("images: " + {"none": "off", "gpu": "on (encoder on the GPU, the CPU encoder as fallback)",
                      "cpu": "on (encoder on the CPU)"}[vision])
-    if vision != "none" and MODELS[model].get("vision_untested"):
-        warn(f"images with {model} are untested: users report them working upstream, but this file has not been run "
-             "with images (upstream #967); tell us if the answers look wrong")
     if a.images is None and not a.yes and not JSON_OUT:   # asked here only interactively: --images says it, and the
         a.images = ask_images(CONF / f"xestrata-{tag.lower()}.json")   # launcher (--json) passes it
     # The low-RAM mode's two variants.  resident: the experts the GPU's cache does not hold are copied from the model

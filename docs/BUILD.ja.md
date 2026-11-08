@@ -34,6 +34,10 @@ setup は、GPU と RAM と CPU を確かめ、SYCL のコンパイラを選ん�
 **次からは** `./setup.sh` を実行すると、すぐに起動します。
 README にある `xestrata` のオプションは、`./setup.sh` でも同じです。端末での会話は `.venv/bin/python chat.py` です。
 
+**窓**: `./setup.sh gui` で窓を開きます。
+.NET 10 の SDK（Ubuntu は `sudo apt install dotnet-sdk-10.0`、Fedora は `sudo dnf install dotnet-sdk-10.0`）で `launcher/` を `build/launcher` にビルドしてから開きます。
+SDK がなければ入れ方を言って止まります。ほかの使い方では .NET を使いません。
+
 **更新**: `./update.sh` を実行します。git で取得したものなら `git pull` してから、エンジンと Python のパッケージと
 モデルの設定を更新します（モデルは起動しません）。新しい版をダウンロードして別の場所に展開し、そこで `./setup.sh` を
 実行しても構いません。新しいコピーも `XeStrata-data` を見つけて、同じ設定で動きます。
@@ -426,6 +430,25 @@ tools/package/build.sh windows cuda12.4      # XeStrata-<版>-windows-x64.7z
   `THIRD-PARTY-NOTICES.md` に部品・版・ライセンス・入手元を書き、`licenses/` にライセンスの全文を置きます。
 - 出てくるものは `build/pkg/windows-cuda12.4/` の 7z と `BUILDINFO` です。
 
+### 窓のパッケージ（xestrata-gui）
+
+Linux の窓（`launcher/`）も、同じ `tools/package/build.sh` で、そのディストリビューションの使い捨てのコンテナの中で作ります（`tools/package/gui.sh`）。
+
+```bash
+tools/package/build.sh ubuntu26.04 gui   # xestrata-gui_<版>_amd64.deb
+tools/package/build.sh fedora44 gui      # xestrata-gui-<版>.x86_64.rpm
+```
+
+- ディストリビューションの `dotnet-sdk-10.0`（Ubuntu はアーカイブ、Fedora は updates）で、窓を linux-x64 のフレームワーク依存で publish します。
+  .NET のランタイムは同梱せず、ディストリビューションの `dotnet-runtime-10.0` に依存します。.NET に依存するのはこのパッケージだけです。
+- NuGet の部品は nuget.org からだけ取り（`launcher/nuget.config`）、版とハッシュは各プロジェクトの `packages.lock.json` で固定します。
+  パッケージと Windows の 7z は `RestoreLockedMode` で復元し、ロックにない部品は取りません。版を変えたら `dotnet restore launcher/Tests --force-evaluate` でロックを作り直します。
+  取った部品は `build/pkg-cache/<distro>/nuget/` に残します。
+- 中身は `/usr/lib/xestrata/launcher/`（`xestrata-gui` と dll、`libSkiaSharp.so`・`libHarfBuzzSharp.so`）、メニューのエントリーとアイコン、`/usr/share/doc/xestrata-gui/` の `THIRD-PARTY-NOTICES.md` と `licenses/`（`tools/package/launcher_notices.py`。窓のフォルダーのライブラリがどの部品にも入っていなければ止まります）です。
+- 窓は setup の `--describe` から欄を描くので、同じ版の本体に依存します。本体の各版は `xestrata-engine` を版つきで提供し、`xestrata-gui` はそれに依存します。
+  本体は `xestrata-gui` を提案（Suggests）するだけで、.NET にも窓にも依存しません。
+- 部品はどれも自由ソフトウェアなので（libSkiaSharp.so に入る Adobe の DNG SDK はコードだけで、条項が自由でない文書は入れません）、free と contrib-llvm の本体のどちらにも同じ 1 つのパッケージです。
+
 ### パッケージの中身
 
 どの版（`xestrata-free`、`xestrata-contrib-cuda<版>`）も、1 つのパッケージに次のものを入れます。
@@ -437,7 +460,8 @@ xe0.1.43.1-1 は `0.1.43.1-1`（rpm は Version が 0.1.43.1、Release が 1）�
 | `xestrata` のコマンド（setup.py）、サーバー、Web アプリ、setup が使う道具、llama.cpp の gguf-py、データ、systemd の user unit | `/usr/share/xestrata`、`/usr/bin/xestrata`、`/usr/lib/systemd/user/xestrata.service` |
 | エンジン（`xestrata-engine`）、画像のエンコーダー、intel/llvm の SYCL の実行時（`libsycl.so.9`、UR のローダーと Level Zero と HIP（AMD）のアダプター、cuda の版では CUDA のアダプターも、`libumf`）、oneMath（rocBLAS の後端、cuda の版では oneMKL と cuBLAS の後端も） | `<libdir>/xestrata/engine` |
 
-- パッケージは `xestrata-engine` を提供し、互いに衝突します。一度に 1 つだけ入り、別のものを入れると入れ替わります。
+- パッケージは `xestrata-engine` を版つきで提供し、互いに衝突します。一度に 1 つだけ入り、別のものを入れると入れ替わります。
+  窓のパッケージ `xestrata-gui` は提案（Suggests）だけです（[窓のパッケージ](#窓のパッケージxestrata-gui)）。
 - libsycl 9 は Ubuntu 26.04（`dpclang` 6 まで）にも Fedora 44 にもないので、パッケージに同梱します。
   intel/llvm の `libsycl-jit`（157 MB）は、ソースからカーネルをコンパイルするときだけ開かれ、エンジンはそれをしないので入れません。
 - 依存は、ディストリビューションにあるものを使います。

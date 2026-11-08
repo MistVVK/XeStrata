@@ -3,13 +3,18 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 # xestrata - XeStrata's command in the deb and rpm packages: setup and start (setup.py, the same options as
 # ./setup.sh), `xestrata chat` for the terminal chat (chat.py), or `xestrata images` for image generation added to an
-# installed model (tools/image/install.py).  The Python files were compiled when the package was built; nothing is
+# installed model (tools/image/install.py), or `xestrata gui` for the launcher's window (the xestrata-gui package;
+# setup.py says what to install where it or .NET is missing).  The Python files were compiled when the package was built; nothing is
 # written next to them.
 PYTHONDONTWRITEBYTECODE=1
 export PYTHONDONTWRITEBYTECODE
 if [ "$1" = chat ]; then
   shift
   exec python3 "@CMAKE_INSTALL_FULL_DATADIR@/xestrata/chat.py" "$@"
+fi
+if [ "$1" = gui ]; then
+  shift
+  exec python3 "@CMAKE_INSTALL_FULL_DATADIR@/xestrata/setup.py" --gui "$@"
 fi
 if [ "$1" = images ]; then
   shift

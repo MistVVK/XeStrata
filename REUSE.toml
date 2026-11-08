@@ -50,7 +50,7 @@ SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
 
 [[annotations]]
 path = ["data/quant_quality/long/set.ids.json", "cmake/BUILD.json.in", ".claude/skills/**/SKILL.md", ".claude/skills/**/references/*.md", "serve/skills/**/SKILL.md",
-        "windows/launcher/Core/locales/*.json", "windows/launcher/Tests/describe.json"]
+        "launcher/Core/locales/*.json", "launcher/Tests/describe.json", "launcher/*/packages.lock.json"]
 SPDX-FileCopyrightText = "2026 MistVVK and the XeStrata contributors"
 SPDX-License-Identifier = "LGPL-3.0-or-later"
 

@@ -27,7 +27,7 @@ It is free software, and on an Intel or AMD GPU it also builds and runs with fre
   Only when even that does not fit is the conversation saved and the text model unloaded, to come back with the next request ([Sharing the GPU's memory](docs/IMAGE.md#sharing-the-gpus-memory)). Its experts stay in RAM meanwhile, so it comes back without reading the model files again.
   A chat request that comes while several images are being made is answered after the current image, and the rest are made after it.
 - **A free GPU makes the images:** when a GPU is there that the text model does not take, setup gives it to the images, and the chat goes on answering while an image is made; the text model neither gives up VRAM nor is unloaded.
-- **Everything in one install:** `xestrata --setup` (on Windows, `xestrata.exe`'s install screen) asks for the text model, whether it should read pictures and which models should make images, and downloads them together.
+- **Everything in one install:** `xestrata --setup` (in the window, its install screen) asks for the text model, whether it should read pictures and which models should make images, and downloads them together.
   For the image models, Enter installs three: Mage-Flow-Turbo, Qwen-Image-2.1-Turbo and MOSS-Image.
   Whatever is installed is used at one address, `http://127.0.0.1:8095`:
   the browser app (Chat, Images, Tools, Video, Monitor), a chat in the terminal, OpenAI- and Anthropic-compatible APIs and an image and video API (vLLM-Omni-compatible); asked in the chat, it makes images as well, and makes a video larger or finds the objects in it.
@@ -232,6 +232,16 @@ Then it downloads the model and starts it, and your browser opens `http://127.0.
 
 **Running it while you are logged in:** `systemctl --user enable --now xestrata` keeps the model set up last running
 (no browser opens). Set it up with `xestrata` once first.
+Starting that model again (`xestrata`, the window's Start) starts no second server: it connects to the one running.
+
+**The window (optional):** the window that installs, starts and sets up the models is a package of its own,
+`xestrata-gui` (Ubuntu 26.04 and Fedora 44; it goes with every variant).
+`sudo apt install ./xestrata-gui_*.deb` or `sudo dnf install ./xestrata-gui-*.rpm` installs it, with the distribution's
+.NET 10 runtime.
+`xestrata gui` or XeStrata in the menu opens it.
+Without it everything is there through `xestrata` in a terminal and the browser; only the window needs .NET.
+A distribution without an official .NET 10 package (Debian, for example) has no window: `xestrata gui` says so and
+stops.
 
 **Updating:** when a new release is out, XeStrata says so in its window and on the chat page's About tab (it checks
 at the start and every six hours while it runs; `xestrata --check-update` checks now). Download the new package from
@@ -264,7 +274,7 @@ Installing from the source with `./setup.sh` is in [docs/BUILD.md](docs/BUILD.md
 ### Windows
 
 1. Download `XeStrata-<version>-windows-x64.7z` from [GitHub's Releases](https://github.com/MistVVK/XeStrata/releases) (with `SHA256SUMS`) and unpack it into a folder of your choice.
-1. Start `xestrata.exe`. It takes you through the install (the GPU and the model, the download) and the start on screen. Setup's questions and options, tuning, measuring the speed and removing the data are on screen too. Installing from your own GGUF files (`--gguf`) is "Install from files on this PC". The window is in Windows' display language (English, German, French, Spanish, Japanese, Korean, Portuguese, Russian or Chinese; English for the others), or the one `xestrata.exe --lang ja` names; setup's steps and the models' descriptions are in English. On the console, `xestrata-cli.exe` (used as `xestrata` on Linux, `xestrata-cli chat` and `xestrata-cli images` included).
+1. Start `xestrata.exe`. It takes you through the install (the GPU and the model, the download) and the start on screen. Setup's questions and options, tuning, measuring the speed and removing the data are on screen too. Installing from your own GGUF files (`--gguf`) is "Install from files on this PC". The window is in Windows' display language (English, German, French, Spanish, Japanese, Korean, Portuguese, Russian or Chinese; English for the others), or the one `xestrata.exe --lang ja` names; setup's steps and the models' descriptions are in English. On the console, `xestrata-cli.exe` (used as `xestrata` on Linux, `xestrata-cli chat`, `xestrata-cli images` and `xestrata-cli gui` included).
 
 - **What it needs:** the [.NET 10 runtime](https://dotnet.microsoft.com/download/dotnet/10.0), the [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe) and the GPU's driver.
   Without the Visual C++ Redistributable, `xestrata.exe` says so and stops.

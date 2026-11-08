@@ -8,7 +8,7 @@
 
 The folder (XeStrata-<version>-windows-x64/):
 
-    xestrata.exe, xestrata-cli.exe and their .NET libraries   the launchers (windows/launcher)
+    xestrata.exe, xestrata-cli.exe and their .NET libraries   the launchers (launcher)
     app/                  setup.py, serve/, tools/, data/ and gguf-py, read-only, with the PACKAGED record
     app/engine/           the engine, its SYCL runtime (intel/llvm's), libjxl's cjxl.exe and djxl.exe, and BUILD.json
     python/               Python's embeddable distribution with the packages setup and the server use
@@ -28,6 +28,8 @@ import sys
 import urllib.request
 import zipfile
 from pathlib import Path
+
+import launcher_notices   # beside this script
 
 # The SYCL runtime's DLLs a Windows engine loads (sycl-jit.dll, the runtime compiler, is not: 120 MB the engine does
 # not use).  ze_loader.dll comes with Intel's driver, nvcuda.dll and nvml.dll with NVIDIA's, amdhip64_7.dll with AMD's.
@@ -55,8 +57,8 @@ WHEELS = ("numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "pillow", "p
 # URLs), the files in the folder it covers (globs relative to its top)
 COMPONENTS = [
     ("XeStrata", "version", "LGPL-3.0-or-later (with MIT parts: NOTICE)", "https://github.com/MistVVK/XeStrata",
-     [], ["xestrata.exe", "xestrata-cli.exe", "xestrata.dll", "xestrata-cli.dll", "Xestrata.Launcher.Core.dll",
-          *(f"app/engine/{e}" for e in ENGINE_EXES), f"app/engine/{AOTRITON_DLLS[0]}"]),
+     [], [*launcher_notices.own_files("win-x64"), *(f"app/engine/{e}" for e in ENGINE_EXES),
+          f"app/engine/{AOTRITON_DLLS[0]}"]),
     ("oneMath (XeStrata's fork)", "onemath", "Apache-2.0", "https://github.com/MistVVK/oneMath", ["onemath:LICENSE"],
      [f"app/engine/{d}" for d in ONEMATH_DLLS]),
     ("ROCm BLAS headers (rocBLAS, hipBLASLt and hipblas-common; compiled into onemath_blas_rocblas.dll)",
@@ -66,29 +68,7 @@ COMPONENTS = [
      "Apache-2.0 WITH LLVM-exception; UMF Apache-2.0 WITH LLVM-exception; hwloc BSD-3-Clause; zstd BSD-3-Clause; "
      "Level Zero loader headers MIT; AMD's HIP headers MIT", "https://github.com/intel/llvm", ["sycl:licenses/*"],
      [f"app/engine/{d}" for d in SYCL_DLLS]),
-    (".NET application host", "dotnet", "MIT", "https://github.com/dotnet/runtime",
-     ["https://raw.githubusercontent.com/dotnet/runtime/main/LICENSE.TXT",
-      "https://raw.githubusercontent.com/dotnet/runtime/main/THIRD-PARTY-NOTICES.TXT"], []),
-    ("Avalonia", "avalonia", "MIT", "https://github.com/AvaloniaUI/Avalonia",
-     ["https://raw.githubusercontent.com/AvaloniaUI/Avalonia/{avalonia}/licence.md"], ["Avalonia*.dll"]),
-    ("ANGLE (Avalonia's build)", "avalonia.angle.windows.natives", "BSD-3-Clause",
-     "https://github.com/AvaloniaUI/angle", ["nuget:avalonia.angle.windows.natives/LICENSE"], ["av_libglesv2.dll"]),
-    ("SkiaSharp and Skia", "skiasharp", "MIT; Skia BSD-3-Clause and others (its notices)",
-     "https://github.com/mono/SkiaSharp", ["nuget:skiasharp/LICENSE.txt",
-                                           "nuget:skiasharp.nativeassets.win32/THIRD-PARTY-NOTICES.txt"],
-     ["SkiaSharp.dll", "libSkiaSharp.dll"]),
-    ("HarfBuzzSharp and HarfBuzz", "harfbuzzsharp", "MIT; HarfBuzz MIT (its notices)",
-     "https://github.com/mono/SkiaSharp", ["nuget:harfbuzzsharp/LICENSE.txt",
-                                           "nuget:harfbuzzsharp.nativeassets.win32/THIRD-PARTY-NOTICES.txt"],
-     ["HarfBuzzSharp.dll", "libHarfBuzzSharp.dll"]),
-    ("FSharp.Core", "fsharp.core", "MIT", "https://github.com/dotnet/fsharp",
-     ["https://raw.githubusercontent.com/dotnet/fsharp/main/License.txt"],
-     ["FSharp.Core.dll", "*/FSharp.Core.resources.dll"]),
-    ("MicroCom.Runtime", "microcom.runtime", "MIT", "https://github.com/kekekeks/MicroCom",
-     ["https://raw.githubusercontent.com/kekekeks/MicroCom/master/LICENSE"], ["MicroCom.Runtime.dll"]),
-    ("Tmds.DBus.Protocol (Avalonia's Linux part, not used on Windows)", "tmds.dbus.protocol", "MIT",
-     "https://github.com/tmds/Tmds.DBus", ["https://raw.githubusercontent.com/tmds/Tmds.DBus/main/COPYING"],
-     ["Tmds.DBus.Protocol.dll"]),
+    *launcher_notices.components("win-x64"),       # the launchers' parts (shared with the xestrata-gui package)
     ("Python (embeddable distribution)", "python", "PSF-2.0 and the licenses its LICENSE.txt names",
      "https://www.python.org/", ["python:LICENSE.txt"], ["python/*.exe", "python/*.dll", "python/*.pyd"]),
     ("gguf-py (llama.cpp)", "llama.cpp", "MIT", "https://github.com/ggml-org/llama.cpp", ["llama:LICENSE"], []),
@@ -155,12 +135,7 @@ def fetch(url: str) -> bytes:
         return r.read()
 
 
-def nuget_version(nuget: Path, package: str) -> str:
-    versions = sorted((p.name for p in (nuget / package).iterdir() if p.is_dir()),
-                      key=lambda v: [int(x) if x.isdigit() else x for x in v.replace("-", ".").split(".")])
-    if not versions:
-        fail(f"no NuGet package {package} in {nuget}")
-    return versions[-1]
+nuget_version = launcher_notices.nuget_version
 
 
 def unbundle_runtime(site: Path) -> None:
@@ -277,9 +252,7 @@ def main() -> None:
     # the fork's tag the engine's build fetched (CMakeLists.txt pins it)
     m = re.search(r"tags/([\w.-]+)\.tar\.gz", (a.engine / "CMakeCache.txt").read_text())
     versions["onemath"] = m.group(1) if m else "the archive CMakeLists.txt pins"
-    for pkg in ("avalonia", "avalonia.angle.windows.natives", "skiasharp", "harfbuzzsharp", "fsharp.core",
-                "microcom.runtime", "tmds.dbus.protocol"):
-        versions[pkg] = nuget_version(a.nuget, pkg)
+    versions.update(launcher_notices.nuget_versions(a.nuget, "win-x64", a.launcher))
     roots = {"sycl": a.sycl, "python": py, "llama": a.llama, "src": a.src, "nuget": a.nuget, "rocm": a.rocm,
              "jxl": a.jxl, "onemath": a.engine / "_deps" / "strata_onemath-src"}
     rows = []
@@ -301,7 +274,7 @@ def main() -> None:
             base = roots[root]
             if root == "nuget":
                 pkg, rest = rel.split("/", 1)
-                base, rel = base / pkg / nuget_version(a.nuget, pkg), rest
+                base, rel = base / pkg / nuget_version(a.nuget, pkg, launcher_notices.published(a.launcher)), rest
             found = sorted(base.glob(rel))
             if not found:
                 fail(f"{name}: no license text {t}")

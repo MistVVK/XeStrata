@@ -50,10 +50,12 @@ Windows is a target as well, built natively for the MSVC ABI with intel/llvm's c
 
 ### setup.py, setup.sh and the F# launchers: the same features
 
-`setup.py`, `setup.sh` and the F# launchers (`windows/launcher/`: the window `xestrata.exe` and the console's `xestrata-cli.exe`) all keep the same features (the user's decision of 2026-11-09): what one of them can do, a user reaches through each of the others, on Linux as on Windows.
+`setup.py`, `setup.sh` and the F# launchers (`launcher/`: the window, `xestrata.exe` on Windows and `xestrata-gui` on Linux, and Windows' console `xestrata-cli.exe`) all keep the same features (the user's decision of 2026-11-09): what one of them can do, a user reaches through each of the others, on Linux as on Windows.
+
+On Linux the launcher's window is an extra: everything it does is there without it, through `setup.py`, `setup.sh`, the packages' `xestrata` and the web app, and nothing else needs .NET. It comes as its own package, `xestrata-gui`, the only one that depends on the .NET 10 runtime (from the distribution's official repositories, never bundled), on the distributions that have one; `xestrata gui` opens it, and where it or the runtime is missing says what to install and stops. The main package only suggests it, and setup's checks do not ask for .NET. Linux has no `xestrata-cli`: its command line is `xestrata` (setup.py). A feature still reaches every entry: on Linux the window gets it as on Windows, and a feature of the window alone does not go in.
 `setup.py` is where the work is done (with `chat.py` and `tools/image/install.py`); `setup.sh` (and the packages' `xestrata`) and the launchers are its entries and do none of it themselves, so a feature is written once, in Python, and the entries pass it on:
 
-- `setup.sh`, the packages' `xestrata` and `xestrata-cli.exe` take setup's command line as it is, and the same subcommands (`chat`, `images`);
+- `setup.sh`, the packages' `xestrata` and `xestrata-cli.exe` take setup's command line as it is, and the same subcommands (`chat`, `images`, `gui`);
 - the window offers it on a page, as below.
 
 A feature added to one entry alone, or to setup without its way through each entry, does not go in.
@@ -64,10 +66,11 @@ The launcher's window is setup's front end, and offers everything `setup.py` off
 - each option that changes an install or a start, which setup takes without asking, is a field (under Advanced);
 - each action (a start, an installed model's image models, `--calibrate`, `--bench` and `--bench-original-compat`, `--inspect`, `--remove-data`, `--check-update`) is a button, and a question setup asks during it (`--json`'s ask objects) is asked on the page.
 
-A change to setup's questions, options or defaults changes the launcher in the same commit.
+The window's fields are setup's own: each option a user sets (its label, kind, choices, default, range and where it is shown) is an entry of `OPTIONS` in `setup.py`, from which setup's command line, its questions and `--describe`'s `"options"` are made and the window draws its fields (`launcher/Gui/Fields.fs`). An option is added there, not written into the window; its translations go into the launcher's catalogs (`setup.<name>.*`, checked by `tools/launcher_i18n.py`), and it shows in English until they do.
+A change to setup's questions or defaults that `OPTIONS` does not carry changes the launcher in the same commit.
 A default lives in setup alone: `--describe` reports what the window needs to show it (which questions a family and size ask, the image models a new model is offered), and the window reads it from there.
 Left out is only what the 7z cannot run: building from the source (`--license`, `--intel-llvm*`, `--cmake-arg`, `--allow-no-xmx`, `--packages`, `--update`) and `--original-strata` (upstream's engine fetched with git and built).
-`xestrata-cli.exe` runs setup on the console as it is, with every option (`xestrata-cli chat` and `xestrata-cli images` the chat and the image models, as `xestrata chat` and `xestrata images` on Linux).
+`xestrata-cli.exe` runs setup on the console as it is, with every option (`xestrata-cli chat` and `xestrata-cli images` the chat and the image models, as `xestrata chat` and `xestrata images` on Linux; `xestrata-cli gui` the window, as `xestrata gui`).
 
 ## Free and non-free builds (Debian main)
 
@@ -221,7 +224,7 @@ The files a change touches must get no new findings; findings that were there be
 Other projects' files in `third_party/<area>/<project>/` (kept as they are; XeStrata's `patches/` there excepted) get only gitleaks and `reuse lint`.
 clang-tidy reads `compile_commands.json` from the build folder (`build/free`, or `XESTRATA_LINT_BUILD`): configure it with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
 
-Then run the existing tests the change can affect (CTest in the build folder, `python -m unittest` for `serve/` and `tools/`, `dotnet test windows/launcher/Tests` and `python tools/launcher_i18n.py` for the launchers).
+Then run the existing tests the change can affect (CTest in the build folder, `python -m unittest` for `serve/` and `tools/`, `dotnet test launcher/Tests` and `python tools/launcher_i18n.py` for the launchers).
 The launchers' window is tested without a screen there (Avalonia.Headless); on a screen (the Windows test PC, or Xvfb in a throwaway container for Linux) only at milestones.
 For memory and undefined-behavior bugs, build in a folder of its own with `-DSTRATA_SANITIZE=address,undefined` (for example `build/free-asan`) and run CTest there.
 It instruments the project's own host code only, not ggml or the SYCL device code; do not run its binaries under Intel SDE.

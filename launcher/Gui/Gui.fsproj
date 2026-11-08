@@ -1,0 +1,34 @@
+<!--
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: LGPL-3.0-or-later
+-->
+<!-- The launcher's window (Avalonia, MIT), a front end for setup.py: xestrata.exe on Windows, xestrata-gui on Linux
+     (the xestrata-gui package; ./setup.sh gui).  Framework-dependent on both: the .NET 10 runtime or a later one
+     (RollForward Major) runs it; on Linux without ICU (InvariantGlobalization: the language comes from the locale's
+     variables, Platform.culture). -->
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>xestrata</AssemblyName>
+    <AssemblyName Condition="$(RuntimeIdentifier.StartsWith('linux'))">xestrata-gui</AssemblyName>
+    <InvariantGlobalization Condition="$(RuntimeIdentifier.StartsWith('linux'))">true</InvariantGlobalization>
+    <RollForward>Major</RollForward>
+    <RootNamespace>Xestrata.Launcher</RootNamespace>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Views.fs" />
+    <Compile Include="Fields.fs" />
+    <Compile Include="MainWindow.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="12.1.4" />
+    <PackageReference Include="Avalonia.Desktop" Version="12.1.4" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.4" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Core/Core.fsproj" />
+  </ItemGroup>
+</Project>

@@ -201,7 +201,7 @@ lap engine
 # strict request is refused without it (serve/structured.py).
 depends=$python_deps
 recommends="$jxl, $pdf, $ffmpeg"
-suggests=""
+suggests="xestrata-gui"                    # the launcher's window: an extra, which needs .NET (tools/package/gui.sh)
 # the packages of the libraries the HIP adapter and oneMath's rocBLAS backend open: ROCm's HIP runtime, rocBLAS and
 # hipBLASLt
 pkg_of() {
@@ -221,7 +221,7 @@ else
     ubuntu*) mklpkg=$(dpkg -S "$mkl" | cut -d: -f1) ;;
     fedora*) mklpkg=$(rpm -qf --qf '%{NAME}' "$mkl") ;;
   esac
-  suggests="$level_zero, $opencl, $vulkan_icd${cublas:+, $cublas}, $mklpkg, $rocm"
+  suggests="$suggests, $level_zero, $opencl, $vulkan_icd${cublas:+, $cublas}, $mklpkg, $rocm"
 fi
 # the same, by GPU maker, for setup to tell what a PC lacks (BUILD.json's "runtime"): what each maker's GPUs need,
 # and in the contrib packages oneMKL and cuBLAS, which make them faster, and pip's names of NVIDIA's libraries setup

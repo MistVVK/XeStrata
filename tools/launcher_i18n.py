@@ -1,19 +1,19 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""The Windows launchers' translations: read the English text out of windows/launcher, check the catalogs.
+"""The Windows launchers' translations: read the English text out of launcher, check the catalogs.
 
     python tools/launcher_i18n.py             # check every catalog against the text in the code (exit 1 on a problem)
     python tools/launcher_i18n.py --english   # print the English text as a catalog, {"key": "text"}, for a translator
 
-The English text lives in the code (see windows/launcher/Core/I18n.fs):
+The English text lives in the code (see launcher/Core/I18n.fs):
     tr "key" "English text"
     trf "key" "English text with {name}" [ "name", box value ]
 The text must be one plain string literal, so that this reader and a translator see the same text.  The catalogs are
-windows/launcher/Core/locales/<lang>.json, built into the launchers.
+launcher/Core/locales/<lang>.json, built into the launchers.
 
 setup's options (setup.py's OPTIONS) are fields the window draws from setup's --describe, in setup's English: their
 texts are keyed setup.NAME.label, .hint, .takes, .about and .needed, and setup.NAME.choice.VALUE (VALUE "" is unset,
-a character a key does not take is _), as windows/launcher/Gui/Fields.fs looks them up.
+a character a key does not take is _), as launcher/Gui/Fields.fs looks them up.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-LAUNCHER = ROOT / "windows" / "launcher"
+LAUNCHER = ROOT / "launcher"
 LOCALES = LAUNCHER / "Core" / "locales"
 LANGUAGES = ("de", "fr", "es", "ja", "ko", "pt", "ru", "zh")
 CALL = re.compile(r'(?<![\w.])(?:I18n\.)?trf?\s+"([\w.\-]+)"\s+"((?:[^"\\]|\\.)*)"')

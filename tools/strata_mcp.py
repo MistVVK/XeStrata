@@ -90,15 +90,15 @@ FALLBACK_MODELS = {
     "UD-Q4_K_XL": {"about": "4-bit (Unsloth Dynamic v3.1), EXPERIMENTAL: the best quality, but on a 64 GB PC part of "
                             "its experts come from the SSD while it answers, so it is slower than the 2-3-bit models",
                    "download_gb": 111.3, "ram_gb": 48, "arena_gb": 77.0, "families": ("unsloth", "huihui-unsloth"),
-                   # upstream #967: images allowed (setup warns: untested)
+                   # upstream #967: images allowed (reported working upstream)
                    "budget": True, "experimental": True, "vision": True},
-    "UD-Q5_K_XL": {"about": "5-bit (Unsloth Dynamic): Q5_K experts with Q8_0 downs, close to Q8_0 in quality; not "
-                            "tested in XeStrata", "download_gb": 158.3, "ram_gb": 108, "arena_gb": 98.4,
+    "UD-Q5_K_XL": {"about": "5-bit (Unsloth Dynamic): Q5_K experts with Q8_0 downs, close to Q8_0 in quality",
+                   "download_gb": 158.3, "ram_gb": 108, "arena_gb": 98.4,
                    "families": ("unsloth",), "budget": True, "experimental": True, "vision": True},
-    "UD-Q6_K_XL": {"about": "6-bit (Unsloth Dynamic): Q6_K experts with Q8_0 downs; not tested in XeStrata",
+    "UD-Q6_K_XL": {"about": "6-bit (Unsloth Dynamic): Q6_K experts with Q8_0 downs",
                    "download_gb": 169.2, "ram_gb": 118, "arena_gb": 109.2, "families": ("unsloth",), "budget": True,
                    "experimental": True, "vision": True},
-    "Q8_0": {"about": "8-bit, the reference quality (every expert Q8_0), for a 192 GB PC; not tested in XeStrata",
+    "Q8_0": {"about": "8-bit, the reference quality (every expert Q8_0), for a 192 GB PC",
              "download_gb": 188.2, "ram_gb": 136, "arena_gb": 128.3, "families": ("unsloth", "huihui-unsloth"),
              "budget": True, "experimental": True, "vision": True},
     # Gyro (agentionai): "ram_gb" in RAM alone; with less, RAM and VRAM together of "arena_gb" + 12 (setup.py)

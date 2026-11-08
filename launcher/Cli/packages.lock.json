@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net10.0": {
+      "FSharp.Core": {
+        "type": "Direct",
+        "requested": "[10.0.113, )",
+        "resolved": "10.0.113",
+        "contentHash": "x+9djZzV154V8BsDP21XT4pXTHZIu3ZJW/+eYGNRwQnFhYGDgERFw2d97FpfZ/ByO5CaxrXTqCT6earZ3QmpDQ=="
+      },
+      "Xestrata.Launcher.Core": {
+        "type": "Project",
+        "dependencies": {
+          "FSharp.Core": "[10.0.113, )"
+        }
+      }
+    },
+    "net10.0/linux-x64": {},
+    "net10.0/win-x64": {}
+  }
+}

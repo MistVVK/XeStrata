@@ -173,7 +173,7 @@ B70 では、遅くなるのはキャッシュを仮想メモリに置いた側�
 
 ### setup の尋ね方と勧め方
 
-setup（`./setup.sh`、パッケージの `xestrata`、Windows のランチャー）は、モデル、版（元のもの、Swift 1.5、Coder、誰が拒否を外したものか）、量子化（誰が作ったファイルか）、大きさの順に尋ねます。
+setup（`./setup.sh`、パッケージの `xestrata`、ランチャーの窓）は、モデル、版（元のもの、Swift 1.5、Coder、誰が拒否を外したものか）、量子化（誰が作ったファイルか）、大きさの順に尋ねます。
 選択肢が 1 つしかない段は尋ねません。
 コマンドラインでは、段ごとに `--base`・`--variant`・`--quantizer` で選ぶか、`--family` でまとめて選びます（`--base qwen3.8-flash-next --variant sc117` は `--family sc117` と同じです）。
 `--model` は大きさです。
@@ -443,7 +443,7 @@ RAM の目安は、ダウンロードの大きさに約 8 GB を足したもの�
 Qwen3.5 の VRAM の目安は、32K の文脈で重みと KV キャッシュ（1 トークン、9B は 32 KB、2B と 0.8B は 12 KB）に約 1 GB を足したものです（拒否を外した版も同じ）。
 setup は GPU の VRAM に入る Q8_0 までで最も大きな版を勧め、入らない組み合わせは警告します。VRAM に入らない重みを RAM から流す仕組みはまだありません。
 太字は、このリリースで llama.cpp と答えを比べた版です。
-ほかの版も同じ型のテンソルでできていて、その型は太字の版とカーネルの試験で確かめています（setup は「untested」と表示します）。
+ほかの版も同じ型のテンソルでできていて、その型は太字の版とカーネルの試験で確かめています。
 
 ```sh
 ./setup.sh --setup --family ornith --model Q4_K_M
@@ -850,6 +850,20 @@ RX 9060 XT と Ryzen 7 5700X の serve（IQ3_XXS、5 回交互）では、`auto`
 ```sh
 .venv/bin/python chat.py
 ```
+
+### 窓（ランチャー）
+
+窓（Windows の `xestrata.exe`、Linux の `xestrata gui`・`./setup.sh gui`）は setup の入口で、作業はすべて setup.py がします。
+欄（KV キャッシュの精度、Web 検索、起動の設定など）は setup の `--describe` が返す項目（setup.py の `OPTIONS`）から描くので、setup に足した項目は窓にも出ます。
+欄の訳は窓のカタログにあれば出し、なければ setup の英語で出します。
+
+- **言語**: Windows は表示言語、Linux は `LC_ALL`・`LC_MESSAGES`・`LANG` の最初に設定されたものです。`--lang ja` のように選べます。
+- **Linux の画面**: X11 で動き、Wayland では XWayland を通ります。画面の倍率は `Xft.dpi` か `AVALONIA_GLOBAL_SCALE_FACTOR`（例: `AVALONIA_GLOBAL_SCALE_FACTOR=1.5 xestrata gui`）で決まります。
+  日本語などの入力には IBus か Fcitx を使います。足りない文字は Noto Sans CJK で描きます（パッケージが推奨で入れます）。
+  画面のないところ（ssh だけ、サーバー）では開かずに、端末の `xestrata --setup` とブラウザを案内します。
+- **描画**: 窓が何も残さずに落ちるときは `--software-render` で、GPU を使わずに描きます。
+- **ログ**: 窓を止めたエラーは `launcher.log` に残します（Windows は `%LOCALAPPDATA%\xestrata\state`、Linux は `~/.local/state/xestrata`）。
+- **動いているモデル**: 「Start」で起動するモデルがすでにそのポートで動いていれば（systemd のサービスなど）、それにつなぎます。窓が立てたのでないサーバーは止めず、止め方を出します。
 
 ---
 
@@ -1702,7 +1716,7 @@ DeepSeek が、何か見つかった検索 1,000 件ごとに 0.75 米ドルを�
 検索語は 128 字までで、それを超える分は切ります。ページの本文は検索の結果に入り、`fetch_page` は XeStrata が自分で読みます。
 
 **setup で用意する**: `xestrata --setup` は最初に一度（と `--setup` のたびに）「Web 検索を使うか」を尋ねます（`deepseek` は DeepSeek、`tinyfish` は TinyFish、`no`）。既定は「いいえ」で、答えなければ何もしません。
-`deepseek` と `tinyfish` なら、API キーを画面に出さずに尋ねます（`--web-search deepseek`・`--web-search tinyfish`。Windows のランチャーでは Web search の選択とキーの欄）。
+`deepseek` と `tinyfish` なら、API キーを画面に出さずに尋ねます（`--web-search deepseek`・`--web-search tinyfish`。ランチャーの窓では Web search の選択とキーの欄）。
 `--web-search no` で外します。自分で書いた `search_url` はそのまま残します。
 
 **自分で設定する**: `search_url` に検索サーバーのアドレスを書きます（例 `http://127.0.0.1:8888`）。

@@ -27,7 +27,7 @@ Ubuntu 26.04 と Fedora 44 には deb と rpm のパッケージ、Windows に�
   それでも入らないときだけ、会話を保存して文章のモデルを外し、次の要求で戻します（[GPU のメモリの分け合い](docs/IMAGE.ja.md#gpu-のメモリの分け合い)）。外す間もエキスパートは RAM に残すので、戻すときにモデルのファイルを読み直しません。
   何枚も作る途中でチャットの要求が来ると、いまの 1 枚の後にチャットに答え、そのあと残りを作ります。
 - **空いている GPU があれば画像はそちらで**: 文章のモデルが使っていない GPU があると、setup がそれを画像用にし、画像を作る間もチャットはそのまま答えます。文章のモデルは VRAM を空けず、外れもしません。
-- **1 回の入れ方で全部**: `xestrata --setup`（Windows では `xestrata.exe` の導入の画面）で、文章のモデル、画像を読むかどうか、画像を作るモデルを選び、まとめてダウンロードします。
+- **1 回の入れ方で全部**: `xestrata --setup`（窓では導入の画面）で、文章のモデル、画像を読むかどうか、画像を作るモデルを選び、まとめてダウンロードします。
   画像を作るモデルは、Enter を押せば Mage-Flow-Turbo、Qwen-Image-2.1-Turbo、MOSS-Image の 3 つを入れます。
   入れたものは、どれも同じアドレス `http://127.0.0.1:8095` で使えます。
   ブラウザの画面（Chat、Images、Tools、Video、Monitor）、端末の会話、OpenAI 互換と Anthropic 互換の API、画像と動画の API（vLLM-Omni 互換）があり、チャットで頼めば画像も作り、動画を大きくしたり動画の中の物体を探したりもします。
@@ -226,6 +226,13 @@ podman compose up -d                         # http://127.0.0.1:8095（止める
 
 **ログインしている間ずっと動かす**: `systemctl --user enable --now xestrata` で、最後に設定したモデルを起動しておきます
 （ブラウザは開きません）。先に `xestrata` で一度設定しておきます。
+そのモデルをもう一度起動すると（`xestrata`、窓の「Start」）、2 つ目のサーバーは立てずに、動いているものにつなぎます。
+
+**窓（任意）**: 導入・起動・設定を画面で行う窓は、別のパッケージ `xestrata-gui` です（Ubuntu 26.04 と Fedora 44。どの版のパッケージにも合います）。
+`sudo apt install ./xestrata-gui_*.deb` か `sudo dnf install ./xestrata-gui-*.rpm` で入れると、ディストリビューションの .NET 10 のランタイムも一緒に入ります。
+`xestrata gui` かメニューの XeStrata で開きます。
+窓がなくても、端末の `xestrata` とブラウザで全部使えます。.NET を要るのは窓だけです。
+.NET 10 の公式のパッケージがないディストリビューション（Debian など）では窓は使えず、`xestrata gui` はそう言って止まります。
 
 **更新**: 新しいリリースが出ると、起動したときと、動いている間は 6 時間ごとに調べて、端末とチャットのページの About に表示します（`xestrata --check-update` でも調べられます）。
 新しいパッケージを [Releases](https://github.com/MistVVK/XeStrata/releases) から取ってきて、インストールと同じく `sudo apt install ./<ファイル>.deb` か `sudo dnf install ./<ファイル>.rpm` で入れます。
@@ -255,7 +262,7 @@ sudo dnf remove xestrata-contrib-cuda13.4    # Fedora（同じ）
 ### Windows
 
 1. [GitHub の Releases](https://github.com/MistVVK/XeStrata/releases) から `XeStrata-<版>-windows-x64.7z` を取ってきて（`SHA256SUMS` も一緒に）、好きなフォルダーに展開します。
-1. `xestrata.exe` を起動します。導入（GPU とモデルの選択、ダウンロード）と起動を画面で進めます。setup の質問とオプション、較正、速さの計測、データの削除も画面から使えます。手元の GGUF からの導入（`--gguf`）は「Install from files on this PC」です。画面は Windows の表示言語（英語・ドイツ語・フランス語・スペイン語・日本語・韓国語・ポルトガル語・ロシア語・中国語。ほかは英語）で出し、`xestrata.exe --lang ja` のように言語を選べます。setup が出す手順やモデルの説明は英語です。端末で使うときは `xestrata-cli.exe`（Linux の `xestrata` と同じ使い方で、`xestrata-cli chat`・`xestrata-cli images` も）です。
+1. `xestrata.exe` を起動します。導入（GPU とモデルの選択、ダウンロード）と起動を画面で進めます。setup の質問とオプション、較正、速さの計測、データの削除も画面から使えます。手元の GGUF からの導入（`--gguf`）は「Install from files on this PC」です。画面は Windows の表示言語（英語・ドイツ語・フランス語・スペイン語・日本語・韓国語・ポルトガル語・ロシア語・中国語。ほかは英語）で出し、`xestrata.exe --lang ja` のように言語を選べます。setup が出す手順やモデルの説明は英語です。端末で使うときは `xestrata-cli.exe`（Linux の `xestrata` と同じ使い方で、`xestrata-cli chat`・`xestrata-cli images`・`xestrata-cli gui` も）です。
 
 - **要るもの**: [.NET 10 のランタイム](https://dotnet.microsoft.com/download/dotnet/10.0)と [Visual C++ の再頒布可能パッケージ](https://aka.ms/vs/17/release/vc_redist.x64.exe)、GPU のドライバー。
   Visual C++ の再頒布可能パッケージがなければ、`xestrata.exe` が知らせて止まります。

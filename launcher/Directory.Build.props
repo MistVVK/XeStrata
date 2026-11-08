@@ -1,0 +1,28 @@
+<!--
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: LGPL-3.0-or-later
+-->
+<!-- What every project of the launcher shares.  The NuGet packages' versions and hashes are fixed in each project's
+     packages.lock.json, for both targets (win-x64: the 7z, linux-x64: the xestrata-gui package); the builds of the
+     7z and the packages restore with -p:RestoreLockedMode=true, which refuses anything the lock files do not name
+     (`dotnet restore launcher/Tests` writes them again after a version is changed).  FSharp.Core is named here, not
+     taken from the SDK, whose implicit version differs between the distributions' SDKs (Ubuntu's 10.0.114, Fedora's
+     10.0.113) and would not match the lock files.  FSharp.Core's translations of the compiler's messages are left
+     out: the window shows none of them. -->
+<Project>
+  <PropertyGroup>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <RuntimeIdentifiers>win-x64;linux-x64</RuntimeIdentifiers>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <DisableImplicitFSharpCoreReference>true</DisableImplicitFSharpCoreReference>
+    <!-- nuget.org's packages only (nuget.config): not the SDK's own library-packs folder, a source the SDK adds -->
+    <DisableImplicitLibraryPacksFolder>true</DisableImplicitLibraryPacksFolder>
+    <!-- a folder of the launcher's own for the packages (NUGET_PACKAGES, which the package builds set, goes over it):
+         the user's ~/.nuget/packages may hold a distribution SDK's source-built package of the same version, whose
+         hash the lock files refuse -->
+    <RestorePackagesPath Condition="'$(NUGET_PACKAGES)' == ''">$(MSBuildThisFileDirectory).nuget/packages</RestorePackagesPath>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="FSharp.Core" Version="10.0.113" />
+  </ItemGroup>
+</Project>

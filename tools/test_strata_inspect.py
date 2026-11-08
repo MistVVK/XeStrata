@@ -52,12 +52,12 @@ class Verdict(unittest.TestCase):
         self.assertEqual(kind, "no")
         self.assertIn("IQ1_S", sentence)
 
-    def test_untested_names_the_new_tensors(self):   # Unsloth UD-Q2_K_XL's case: known expert types, a new head type
+    def test_unlisted_names_the_new_tensors(self):   # Unsloth UD-Q2_K_XL's case: known expert types, a new head type
         fp = self.fp("qwen/IQ3_XXS")
         fp["expert_bytes"] = {"IQ2_XS": 1, "IQ3_XXS": 2, "IQ4_NL": 3}
         fp["roles"] = {"output.weight": ["Q4_K"], "token_embd.weight": ["Q3_K"]}
         kind, sentence = SI.verdict(fp, self.table)
-        self.assertEqual(kind, "untested")
+        self.assertEqual(kind, "unlisted")
         self.assertIn("output.weight Q4_K", sentence)
         self.assertNotIn("token_embd", sentence)
 

@@ -73,9 +73,11 @@ if [ ! -x .venv/bin/python ]; then
     $PY -m venv .venv || { rm -rf .venv; echo "could not create .venv: sudo apt install python3-venv"; exit 1; }
   fi
 fi
-# the same subcommands as the packages' xestrata and xestrata-cli.exe: the terminal chat, image models for an install
+# the same subcommands as the packages' xestrata and xestrata-cli.exe: the terminal chat, image models for an install,
+# the launcher's window (built with the .NET 10 SDK, which nothing else here needs)
 case $1 in
   chat) shift; exec .venv/bin/python chat.py "$@" ;;
+  gui) shift; exec .venv/bin/python setup.py --gui "$@" ;;
   images) shift; exec .venv/bin/python tools/image/install.py "$@" ;;
 esac
 exec .venv/bin/python setup.py "$@"

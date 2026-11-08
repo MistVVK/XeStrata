@@ -1,0 +1,26 @@
+<!--
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: LGPL-3.0-or-later
+-->
+<!-- What the window and xestrata-cli.exe share: what differs between Windows and Linux, their translations, where the
+     program's parts are, the check for the VC++ runtime, and setup.py run with its JSON output (setup.py's "output"
+     section). -->
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>Xestrata.Launcher</RootNamespace>
+    <AssemblyName>Xestrata.Launcher.Core</AssemblyName>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Platform.fs" />
+    <Compile Include="I18n.fs" />
+    <Compile Include="Places.fs" />
+    <Compile Include="Runtime.fs" />
+    <Compile Include="Protocol.fs" />
+    <Compile Include="Setup.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="locales/*.json" LogicalName="locales.%(Filename).json" />
+  </ItemGroup>
+</Project>

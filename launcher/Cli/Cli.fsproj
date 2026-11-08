@@ -1,0 +1,22 @@
+<!--
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: LGPL-3.0-or-later
+-->
+<!-- xestrata-cli.exe: setup.py on the console, as `xestrata` on Linux (Windows only: Linux's command line is setup.py's
+     own `xestrata`). -->
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>xestrata-cli</AssemblyName>
+    <RollForward>Major</RollForward>
+    <RootNamespace>Xestrata.Launcher</RootNamespace>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Core/Core.fsproj" />
+  </ItemGroup>
+</Project>

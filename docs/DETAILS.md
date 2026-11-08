@@ -191,7 +191,7 @@ Unless asked, the device's reported virtual-memory granularity decides: on at 2 
 
 ### How setup asks and recommends
 
-setup (`./setup.sh`, the packages' `xestrata`, the Windows launcher) asks for the model, its version (the original, Swift 1.5, the Coder, or whose copy with the refusals removed), its quantization (whose files) and the size, in that order.
+setup (`./setup.sh`, the packages' `xestrata`, the launcher's window) asks for the model, its version (the original, Swift 1.5, the Coder, or whose copy with the refusals removed), its quantization (whose files) and the size, in that order.
 A level with one choice is not asked.
 On the command line, choose each level with `--base`, `--variant` and `--quantizer`, or all of them with `--family` (`--base qwen3.8-flash-next --variant sc117` is `--family sc117`).
 `--model` is the size.
@@ -480,8 +480,7 @@ the 0.8B) and about 1 GB more (the same for the version without refusals).
 setup recommends the largest version up to Q8_0 the GPU's VRAM holds and warns of a choice it does not; weights that do not fit
 the VRAM are not streamed from RAM yet.
 The sizes in bold are the files whose answers this release compared with llama.cpp's.
-The others are made of the same tensor types, checked on those files and in the kernels' tests (setup marks them
-"untested").
+The others are made of the same tensor types, checked on those files and in the kernels' tests.
 
 ```sh
 ./setup.sh --setup --family ornith --model Q4_K_M
@@ -910,6 +909,28 @@ wait before a 32K follow-up, but the 32K prefill read 3.2% slower, so the defaul
 ```sh
 .venv/bin/python chat.py
 ```
+
+### The window (the launcher)
+
+The window (Windows' `xestrata.exe`, Linux's `xestrata gui` and `./setup.sh gui`) is an entry to setup: setup.py does
+all the work.
+Its fields (the KV cache's precision, web search, the start's settings and the rest) are drawn from the options setup's
+`--describe` returns (setup.py's `OPTIONS`), so an option added to setup is in the window too.
+A field's text is in the window's language where its catalogs have it, else in setup's English.
+
+- **Language**: Windows' display language; on Linux the first of `LC_ALL`, `LC_MESSAGES` and `LANG` that is set.
+  `--lang ja` chooses one.
+- **Linux's screen**: it runs on X11, through XWayland under Wayland. Its scale is `Xft.dpi` or
+  `AVALONIA_GLOBAL_SCALE_FACTOR` (for example `AVALONIA_GLOBAL_SCALE_FACTOR=1.5 xestrata gui`).
+  Japanese and the other languages typed through an input method take IBus or Fcitx. Characters the theme's font lacks
+  are drawn with Noto Sans CJK (which the package recommends).
+  Where there is no screen (ssh alone, a server) it does not open, and names the terminal's `xestrata --setup` and the
+  browser instead.
+- **Drawing**: a window that closes without a trace draws without the GPU with `--software-render`.
+- **Log**: the errors that stop the window go to `launcher.log` (Windows: `%LOCALAPPDATA%\xestrata\state`, Linux:
+  `~/.local/state/xestrata`).
+- **A model already running**: when the model Start starts is already served on its port (the systemd service, for
+  example), the window connects to it. It does not stop a server it did not start, and says how to stop it.
 
 ---
 
@@ -1769,7 +1790,7 @@ The key is `tinyfish_api_key` in settings.json, kept as DeepSeek's is.
 A query is at most 128 characters; anything longer is cut. The pages' text comes with the search results, and `fetch_page` is read by XeStrata itself.
 
 **Setting it up with setup**: `xestrata --setup` asks once (and at each `--setup`) whether to use web search (`deepseek` for DeepSeek, `tinyfish` for TinyFish, `no`). The default is no, and without an answer nothing is done.
-With `deepseek` and `tinyfish` it asks for the API key without showing it (`--web-search deepseek`, `--web-search tinyfish`; the Windows launcher's Web search choice and key field).
+With `deepseek` and `tinyfish` it asks for the API key without showing it (`--web-search deepseek`, `--web-search tinyfish`; the launcher's window's Web search choice and key field).
 `--web-search no` takes it out. A `search_url` you wrote yourself is left as it is.
 
 **Setting it yourself**: write the search server's address in `search_url` (for example `http://127.0.0.1:8888`).

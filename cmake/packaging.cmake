@@ -243,7 +243,9 @@ set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS OFF)
 set(CPACK_DEBIAN_PACKAGE_DEPENDS "${STRATA_PACKAGE_DEPENDS}")
 set(CPACK_DEBIAN_PACKAGE_RECOMMENDS "${STRATA_PACKAGE_RECOMMENDS}")
 set(CPACK_DEBIAN_PACKAGE_SUGGESTS "${STRATA_PACKAGE_SUGGESTS}")
-set(CPACK_DEBIAN_PACKAGE_PROVIDES xestrata-engine)
+# xestrata-engine: the name every variant provides, which xestrata-gui depends on at the same version (its window draws
+# its fields from this setup.py); one variant at a time
+set(CPACK_DEBIAN_PACKAGE_PROVIDES "xestrata-engine (= ${XESTRATA_PACKAGE_UPSTREAM}-${XESTRATA_REVISION})")
 set(CPACK_DEBIAN_PACKAGE_CONFLICTS xestrata-engine)
 set(CPACK_DEBIAN_PACKAGE_REPLACES xestrata-engine)
 
@@ -253,7 +255,7 @@ set(CPACK_RPM_PACKAGE_RELEASE ${XESTRATA_REVISION})
 set(CPACK_RPM_PACKAGE_LICENSE "LGPL-3.0-or-later AND MIT AND Apache-2.0 AND Apache-2.0 WITH LLVM-exception AND OFL-1.1")
 set(CPACK_RPM_PACKAGE_GROUP "Applications/Engineering")
 set(CPACK_RPM_PACKAGE_REQUIRES "${STRATA_PACKAGE_DEPENDS}")
-set(CPACK_RPM_PACKAGE_PROVIDES xestrata-engine)
+set(CPACK_RPM_PACKAGE_PROVIDES "xestrata-engine = ${XESTRATA_PACKAGE_UPSTREAM}-${XESTRATA_REVISION}")
 set(CPACK_RPM_PACKAGE_CONFLICTS xestrata-engine)
 set(CPACK_RPM_PACKAGE_AUTOREQPROV ON)
 # The bundled libraries are found through the engine's own RUNPATH: they neither need nor give the system anything,
