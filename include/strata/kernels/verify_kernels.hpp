@@ -120,7 +120,8 @@ void force_token(int32_t* tok, const int32_t* force, int j, void* stream);
 /// row 0).  Graph-capturable: the row is read on the device.
 void copy_row_to_first(const int32_t* row_dev, float* a, int64_t a_n, float* b, int64_t b_n, float* c, int64_t c_n,
                        void* stream);
-/// dst row i = src row ids[i] (row_bytes each, multiple of 16), for n rows.
+/// dst row i = src row ids[i] (row_bytes each), for n rows; an id below 0 (topk's mark for an empty slot) gives a row
+/// of zeros.
 void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int64_t n, uint8_t* dst, void* stream);
 /// ids[t] = table[ids[t]] for n entries (a subset index back to a token id).
 void map_ids(int32_t* ids, const int32_t* table, int n, void* stream);

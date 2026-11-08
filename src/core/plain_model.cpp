@@ -2877,8 +2877,10 @@ void PlainModel::setup_int2() {
         if (head_.type == kBF16) k::bf16_gemv_fp32_mmvf_multi(hn_, n_in, reinterpret_cast<const uint16_t*>(r), y, m, n_in, m, 1, s);
         else k::native_mmvq(head_.type, r, xq_, y, n_in, m, 1, s);
     };
+    // the timing reads hn_ before any window has written it: cleared, so the coarse logits are numbers (left as they
+    // were, NaNs made every top-k slot empty, and an RTX 4070 start faulted 7 times in 10, 2026-11-08)
     strata::gpu::Stream s = strata::gpu::stream_create();
-    const bool on = s != nullptr &&
+    const bool on = s != nullptr && strata::gpu::memset(hn_, 0, (size_t) n_in * 4) &&
                     h->choose(hn_, static_cast<const uint8_t*>(rows), exact,
                               [&](float* out, void* st) { exact(static_cast<const uint8_t*>(rows), (int) n, out, st); },
                               logits_, s, "xestrata plain");

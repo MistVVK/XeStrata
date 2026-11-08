@@ -1102,7 +1102,8 @@ void gather_rows(const uint8_t* src, int64_t row_bytes, const int32_t* ids, int6
         const long long total = (long long) n * row_e;
         return Q(stream).parallel_for(sycl::range<1>((size_t) total), [=](sycl::id<1> id) {
             const long long i = (long long) id[0], r = i / row_e, o = i - r * row_e;
-            d[i] = s[(long long) ids[r] * row_e + o];
+            const long long at = ids[r];   // -1: no row (topk's mark for a slot it could not fill), zeros
+            d[i] = at >= 0 ? s[at * row_e + o] : E{};
         });
     };
     if (n <= 0) return;
