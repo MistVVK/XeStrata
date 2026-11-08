@@ -312,7 +312,7 @@ Context::Context() : impl_(new Impl) {
     }
 #endif
     // env, then <exe dir>/metal/ (a component package), then the compiled-in source-tree path
-    ggml_common_path = strata_metal::resource("STRATA_GGML_COMMON", "ggml-common.h", STRATA_GGML_COMMON_DEFAULT);
+    ggml_common_path = strata_metal::resource2("STRATA_GGML_COMMON", "strata-quant-common.h", "ggml-common.h", STRATA_GGML_COMMON_DEFAULT);
     kernel_dir = strata_metal::resource("STRATA_METAL_KERNELS", "kernels", STRATA_METAL_KERNELS_DEFAULT);
 }
 

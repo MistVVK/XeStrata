@@ -141,7 +141,7 @@ public:
     // Runs `ds` repeatedly for about `seconds` of wall time: lifts the GPU out of its idle clocks before a timing.
     void warm(const std::vector<Dispatch>& ds, double seconds = 0.3);
 
-    std::string ggml_common_path;                // where ggml-common.h is read from
+    std::string ggml_common_path;                // where strata-quant-common.h (formerly ggml-common.h) is read from
     std::string kernel_dir;                      // where relative kernel paths resolve
 
 private:

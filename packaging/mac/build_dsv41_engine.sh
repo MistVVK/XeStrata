@@ -15,7 +15,7 @@
 # Layout (strata-dsv41 finds these beside its own executable, metal/src/resource_path.h):
 #   <exe>/metal/kernels/*.metal         the shared Qwen kernels the DeepSeek host also compiles
 #   <exe>/metal/src/engine/msl/*.metal  ds4_init, ds4_iq, ds4_mm, ds4_quant, mtp, mtp_chain, ple
-#   <exe>/metal/ggml-common.h
+#   <exe>/metal/strata-quant-common.h   (+ <exe>/metal/ggml-common.h, the same text under the old name, kept for two releases)
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
 VERSION=0.1.58
@@ -54,7 +54,9 @@ cp "$ROOT"/metal/kernels/*.metal "$STAGE/metal/kernels/"
 for f in ds4_init ds4_iq ds4_mm ds4_quant ds4_vision ds4_vision_mpp mtp mtp_chain ple; do
   cp "$ROOT/metal/src/engine/msl/$f.metal" "$STAGE/metal/src/engine/msl/" || exit 1
 done
-cp "$ROOT/third_party/ggml/ggml-common.h" "$STAGE/metal/"
+# the quant header's TEXT (the Metal runtime reads it, it cannot follow an #include): under its new name, and for two releases also as ggml-common.h
+cp "$ROOT/third_party/strata-ggml/strata-quant-common.h" "$STAGE/metal/strata-quant-common.h"
+cp "$ROOT/third_party/strata-ggml/strata-quant-common.h" "$STAGE/metal/ggml-common.h"
 # antirez/ds4 (MIT): the Metal vision kernels follow it; its licence travels with the MSL
 cp "$ROOT/third_party/antirez-ds4/LICENSE" "$STAGE/metal/src/engine/msl/LICENSE-antirez-ds4"
 

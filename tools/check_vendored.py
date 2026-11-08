@@ -25,6 +25,7 @@ import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 TREE = os.path.join("third_party", "strata-ggml")
+GGML_RENAMED = {"strata-quant-common.h": "ggml/src/ggml-common.h"}   # the one file of third_party/strata-ggml whose upstream name differs
 # every vendored tree: (folder, maps a path in the tree to the path in the llama.cpp checkout at the pin)
 GGUF_PY_MAP = (("gguf/", "gguf-py/gguf/"), ("converter/conversion/", "conversion/"), ("converter/convert_hf_to_gguf.py", "convert_hf_to_gguf.py"),
                ("converter/LICENSE", "LICENSE"), ("LICENSE", "gguf-py/LICENSE"), ("pyproject.toml", "gguf-py/pyproject.toml"))
@@ -85,7 +86,7 @@ def parse(manifest):
 def upstream_rel(rel, upmap):
     """The path of a tree file in the llama.cpp checkout (`upmap` None: the tree keeps llama.cpp's layout)."""
     if upmap is None:
-        return rel
+        return GGML_RENAMED.get(rel, rel)
     for here, there in upmap:
         if here.endswith("/") and rel.startswith(here):
             return there + rel[len(here):]
