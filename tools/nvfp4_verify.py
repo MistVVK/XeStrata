@@ -23,9 +23,10 @@ import numpy as np
 import torch
 from safetensors import safe_open
 
-LLAMA = pathlib.Path(__file__).resolve().parents[1] / "third_party" / "llama.cpp"
-sys.path.insert(0, str(LLAMA / "gguf-py"))
-sys.path.insert(0, str(LLAMA))
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _paths import add_gguf_py, converter_dir  # noqa: E402  (the vendored gguf-py and converter, third_party/strata-gguf-py)
+add_gguf_py()
+sys.path.insert(0, converter_dir())
 from gguf import GGMLQuantizationType as Q, quants  # noqa: E402
 from conversion.base import ModelBase  # noqa: E402
 
