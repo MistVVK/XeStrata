@@ -1,0 +1,16 @@
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
+# The disposable image a release's speed tables are measured in (podman-bench.sh beside this folder): XeStrata's own
+# image (container/, the release's Fedora 44 rpm with the GPU makers' libraries it records), and on it what building
+# upstream's engines with its own setup and running ComfyUI take, so that the three run on one OS with the same GPU
+# drivers' user space.  Never pushed anywhere: podman-bench.sh clean removes it.
+ARG BASE
+FROM ${BASE}
+# the GPU makers whose toolchains go in (intel, nvidia, amd), and their versions
+ARG MAKERS
+ARG ONEAPI=2026.1
+ARG CUDA=13.4
+RUN --mount=type=bind,source=.,target=/ctx,relabel=shared \
+    MAKERS="$MAKERS" ONEAPI="$ONEAPI" CUDA="$CUDA" sh /ctx/install.sh
+ENTRYPOINT []
+CMD ["sleep", "infinity"]

@@ -7,11 +7,13 @@
 # environment of that config and the run-time switches of its sycl/serve/strata-sycl.sh (tools/bench_upstream.py
 # --sycl-setup).  stdin passes through (serve).
 #
-#   UP_TREE=DIR DATA=DIR [IDS=DIR] [UP_SELECTOR=level_zero:N] up-sycl.sh ARGS...
+#   UP_TREE=DIR DATA=DIR [IDS=DIR] [UP_SELECTOR=level_zero:N] [UP_SYCL_DIRECT=1] up-sycl.sh ARGS...
 #
 # UP_TREE: upstream's worktree (its build-sycl-aot/strata, its data/).  DATA and IDS are mounted read-only at the same
 # paths, so the arguments need no rewriting; so is the folder of any other absolute path among the arguments (writable).
-# UP_SELECTOR (default level_zero:0): the Level Zero device to take.
+# UP_SELECTOR (default level_zero:0): the Level Zero device to take.  UP_SYCL_DIRECT=1: run its strata here, with the
+# oneAPI runtime of /opt/intel/oneapi, not in its image (in the release's bench container, podman-bench.sh, where it was
+# built with that oneAPI).
 set -u
 : "${UP_TREE:?}" "${DATA:?}"
 selector=${UP_SELECTOR:-level_zero:0}
@@ -26,6 +28,15 @@ for i in "${!w[@]}"; do
   envs+=(-e "${w[$i]}")
 done
 echo "up-sycl.sh: sycl/setup_intel.py's settings: ${envs[*]} $*" >&2
+if [ -n "${UP_SYCL_DIRECT:-}" ]; then
+  kv=()
+  for ((i = 1; i < ${#envs[@]}; i += 2)); do kv+=("${envs[$i]}"); done
+  # (oneAPI's setvars.sh, which it sources, resets this script's arguments)
+  args=("$@")
+  # shellcheck source=/dev/null
+  source "$(dirname "$0")/podman/oneapi-env.sh"
+  exec env ONEAPI_DEVICE_SELECTOR="$selector" "${kv[@]}" "$UP_TREE/build-sycl-aot/strata" "${args[@]}"
+fi
 mounts=(-v "$UP_TREE:$UP_TREE:ro" -v "$DATA:$DATA:ro")
 [ -n "${IDS:-}" ] && mounts+=(-v "$IDS:$IDS:ro")
 # the folder of a file argument outside those (--spec-follow's text, a --dump-logits output), at the same path

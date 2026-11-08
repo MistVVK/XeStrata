@@ -14,7 +14,8 @@
 # it in its container); the generate options are appended.  XE_PROFILE and UP_PROFILE: each engine's shipped expert profile (its
 # data/expert-profile.bin).  DATA: the data folder (packs/qwen-iq3_xxs, models/...IQ3_XXS-0000N-of-00002.gguf,
 # mtp/rt).  IDS: the prompts of prompts.py and the continuations of follow.sh beside this script.  ROUNDS (default
-# 2): runs per arm and tier.
+# 2): runs per arm and tier.  TIERS (default the six): fewer, for a check of the scripts (TIERS=1k ROUNDS=1), not a
+# release's table.
 # OUT/runs/GPU-ARM-TIER-ROUND.txt gets each log; one discarded warm-up per arm first (JIT); the arms alternate,
 # the first arm changing from round to round.  bench-collect.py OUT reads them.
 # upstream plainly at SLOW tok/s or less (default 10) is stopped mid-run and not run again in that tier: its prompt
@@ -25,10 +26,11 @@ set -u
 out=$1; gpu=$2
 : "${XE:?}" "${UP:?}" "${DATA:?}" "${IDS:?}" "${XE_PROFILE:?}" "${UP_PROFILE:?}"
 rounds=${ROUNDS:-2}
+tiers=${TIERS:-1k 4k 32k 64k 128k 262k}
 slow=${SLOW:-10}
 P=$DATA/packs/qwen-iq3_xxs
 G=$DATA/models/Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS
-for t in 1k 4k 32k 64k 128k 262k; do
+for t in $tiers; do
   [ -s "$IDS/$t.follow" ] || { echo "no $IDS/$t.follow: write the continuations with follow.sh first" >&2; exit 2; }
 done
 mkdir -p "$out/runs"
@@ -89,7 +91,7 @@ run() {
 }
 
 for a in xe up; do run "$a" 1k "$out/runs/$gpu-$a-warmup.txt"; done
-for t in 1k 4k 32k 64k 128k 262k; do
+for t in $tiers; do
   up_slow=
   for r in $(seq 1 "$rounds"); do
     if [ $((r % 2)) -eq 1 ]; then arms="xe up"; else arms="up xe"; fi
