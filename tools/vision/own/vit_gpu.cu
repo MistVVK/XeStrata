@@ -332,15 +332,15 @@ struct VitGpuImpl {
     }
 
     ~VitGpuImpl() {
-        cudaSetDevice(device);
-        for (void* p : allocs) cudaFree(p);
-        if (d_chw) cudaFree(d_chw);
+        (void) cudaSetDevice(device);
+        for (void* p : allocs) (void) cudaFree(p);
+        if (d_chw) (void) cudaFree(d_chw);
         if (blas) cublasDestroy(blas);
     }
     template <class T> bool alloc(T*& p, size_t n, std::string& err, bool weight) {
         void* q = nullptr;
         const cudaError_t e = cudaMalloc(&q, n * sizeof(T));
-        if (e != cudaSuccess) { err = std::string("GPU memory: ") + cudaGetErrorString(e); cudaGetLastError(); return false; }
+        if (e != cudaSuccess) { err = std::string("GPU memory: ") + cudaGetErrorString(e); (void) cudaGetLastError(); return false; }
         p = (T*) q;
         allocs.push_back(q);
         bytes += n * sizeof(T);
@@ -396,9 +396,9 @@ struct VitGpuImpl {
 
     bool size_buffers(int patches, std::string& err) {
         if (patches <= cap_patches) return true;
-        cudaSetDevice(device);
+        (void) cudaSetDevice(device);
         // free the old work buffers and take new ones sized for this many patches
-        for (size_t i = allocs.size(); i > n_weight_allocs; --i) { cudaFree(allocs[i - 1]); }
+        for (size_t i = allocs.size(); i > n_weight_allocs; --i) { (void) cudaFree(allocs[i - 1]); }
         bytes -= work_bytes;
         work_bytes = 0;
         allocs.resize(n_weight_allocs);
@@ -431,7 +431,7 @@ size_t VitGpu::device_bytes() const { return impl_->bytes; }
 bool VitGpu::available(std::string& why) {
     int n = 0;
     const cudaError_t e = cudaGetDeviceCount(&n);
-    if (e != cudaSuccess || n <= 0) { why = e != cudaSuccess ? std::string("no GPU runtime: ") + cudaGetErrorString(e) : "no GPU found"; cudaGetLastError(); return false; }
+    if (e != cudaSuccess || n <= 0) { why = e != cudaSuccess ? std::string("no GPU runtime: ") + cudaGetErrorString(e) : "no GPU found"; (void) cudaGetLastError(); return false; }
     return true;
 }
 
@@ -494,10 +494,10 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
     if (!m.size_buffers(N, err)) return false;
     const size_t chw_n = img.chw.size();
     if (chw_n > m.chw_cap) {   // the picture's own buffer is small next to the work buffers; kept apart so the warm-up's size is not needed for it
-        if (m.d_chw) { cudaFree(m.d_chw); }
+        if (m.d_chw) { (void) cudaFree(m.d_chw); }
         m.d_chw = nullptr;
         void* q = nullptr;
-        if (cudaMalloc(&q, chw_n * 4) != cudaSuccess) { cudaGetLastError(); err = "GPU memory: cannot hold the picture"; return false; }
+        if (cudaMalloc(&q, chw_n * 4) != cudaSuccess) { (void) cudaGetLastError(); err = "GPU memory: cannot hold the picture"; return false; }
         m.d_chw = (float*) q;
         m.chw_cap = chw_n;
     }

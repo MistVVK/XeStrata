@@ -57,12 +57,16 @@ def main():
             return json.loads(r.read())
 
     results = {}
-    for tower in a.towers.split(","):
+    for spec in a.towers.split(","):
+        # a reader spec: name[:gpu][@tag]  (mtmd, own, mtmd:gpu, own:gpu, mtmd@2 for a second run of the same reader)
+        name, _, mode = spec.split("@")[0].partition(":")
+        gpu = a.gpu or mode == "gpu"
+        tower = spec.replace(":", "-").replace("@", "-")        # the label of this run in file names and in the report
         wrap = out / ("reader-%s.sh" % tower)
-        wrap.write_text('#!/bin/sh\nexec "%s" "$@" --tower %s\n' % (a.helper, tower))
+        wrap.write_text('#!/bin/sh\nexec "%s" "$@" --tower %s\n' % (a.helper, name))
         wrap.chmod(wrap.stat().st_mode | stat.S_IXUSR)
-        vis = {"exe": str(wrap), "mmproj": box["mmproj"], "model": box["native"], "gpu": bool(a.gpu), "max_tokens": a.max_tokens}
-        if a.threads and not a.gpu:
+        vis = {"exe": str(wrap), "mmproj": box["mmproj"], "model": box["native"], "gpu": gpu, "max_tokens": a.max_tokens}
+        if a.threads and not gpu:
             vis["threads"] = a.threads
         cfg = {"exe": box["exe"], "cwd": str(src), "tokenizer": box["tokenizer"], "model_name": "qwen3.8-flash-next-iq3",
                "log": str(out / "logs" / ("engine-%s.log" % tower)), "lib_dirs": box.get("lib_dirs", []), "port": port, "gpu": box.get("gpu", 0),
@@ -117,20 +121,24 @@ def main():
         (out / "answers.json").write_text(json.dumps(results, indent=1))
 
     towers = list(results)
-    base_t = towers[0]
-    same, diff = 0, []
-    for key, ans in results[base_t].items():
-        for t in towers[1:]:
-            other = results[t].get(key, {})
-            if other.get("text") == ans["text"] and not ans["err"] and not other.get("err"):
-                same += 1
-            else:
-                diff.append((key, base_t, ans, t, other))
-    total = sum(len(results[base_t]) for _ in towers[1:])
-    print("ANSWERS: %d of %d identical between %s and %s" % (same, total, base_t, ", ".join(towers[1:])))
-    for key, ta, x, tb, y in diff:
-        print("DIFFERS %s\n  %-5s: %r\n  %-5s: %r" % (key, ta, x["text"], tb, y.get("text")))
-    return 0 if not diff else 1
+    keys = list(results[towers[0]])
+    ok = lambda t, k: results[t].get(k) and not results[t][k]["err"]  # noqa: E731
+    print("ANSWERS, pair by pair (identical / compared):")
+    differing = []
+    for i, ta in enumerate(towers):
+        for tb in towers[i + 1:]:
+            same = sum(1 for k in keys if ok(ta, k) and ok(tb, k) and results[ta][k]["text"] == results[tb][k]["text"])
+            print("  %-14s vs %-14s %d / %d" % (ta, tb, same, len(keys)))
+    for k in keys:
+        texts = {t: (results[t][k]["text"] if ok(t, k) else "ERR " + str(results[t].get(k, {}).get("err"))) for t in towers}
+        if len(set(texts.values())) > 1:
+            differing.append(k)
+    print("%d of %d answers differ between some readers; all of them:" % (len(differing), len(keys)))
+    for k in differing:
+        print("DIFFERS %s" % k)
+        for t in towers:
+            print("  %-14s: %r" % (t, results[t][k]["text"] if ok(t, k) else "ERR " + str(results[t].get(k, {}).get("err"))))
+    return 0 if not differing else 1
 
 
 if __name__ == "__main__":
