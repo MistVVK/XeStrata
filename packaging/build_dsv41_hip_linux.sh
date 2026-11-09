@@ -5,7 +5,7 @@
 #
 #   VARIANT=rx7900     rx9070 (gfx1200 gfx1201) | rx7900 (gfx1100 gfx1101 gfx1102: built, NOT tested on a real RX 7000 card) | a name + ARCHS=
 #   ARCHS="gfx1100;gfx1101;gfx1102"   the code objects (default: the variant's); BUILD.json "archs" and the manifest list exactly these
-#   SRC=<this checkout>  LLAMA=<llama.cpp checkout at the pinned commit>  HP=<ROCm devel root>  CORE=<ROCm core root>  LIBW=<ROCm libraries root>
+#   SRC=<this checkout>  [LLAMA=<llama.cpp checkout, an override>]  HP=<ROCm devel root>  CORE=<ROCm core root>  LIBW=<ROCm libraries root>
 #   OUT=<work folder>  PKGVER=0.1.59  COMMIT=<source commit for the build id>  JOBS=16
 #   NO_PACKAGE=1       stop after the stage folder
 #
@@ -14,7 +14,8 @@
 set -u
 V=${VARIANT:?VARIANT=rx9070|rx7900|<name> with ARCHS=}
 SRC=${SRC:-$(cd "$(dirname "$0")/.." && pwd)}
-LLAMA=${LLAMA:?LLAMA=<llama.cpp checkout at the pinned commit>}
+LLAMA=${LLAMA:-}      # optional override (kept for two releases): a llama.cpp checkout to take ggml from; empty: the vendored third_party/strata-ggml
+ggml=""; [ -z "$LLAMA" ] || ggml="-DSTRATA_GGML_DIR=$LLAMA"
 HP=${HP:?HP=<ROCm devel root>}
 CORE=${CORE:-$HP}
 LIBW=${LIBW:-$HP}
@@ -44,7 +45,7 @@ st "start dsv41 $V ($ARCHS) commit $COMMIT"
 cd "$SRC" || exit 1
 rm -f "$OUT/bd/CMakeCache.txt" "$OUT/bd/strata-dsv41"      # (the build id is baked in at configure time: always configure again)
 cmake -G Ninja -S . -B "$OUT/bd" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_BUILD_TESTS=OFF \
-  -DSTRATA_BUILD_DSV41=ON -DSTRATA_NATIVE_EXPERTS=ON "-DCMAKE_HIP_ARCHITECTURES=$ARCHS" "${HIPDEFS[@]}" -DSTRATA_GGML_DIR="$LLAMA" -DSTRATA_PORTABLE=ON \
+  -DSTRATA_BUILD_DSV41=ON -DSTRATA_NATIVE_EXPERTS=ON "-DCMAKE_HIP_ARCHITECTURES=$ARCHS" "${HIPDEFS[@]}" $ggml -DSTRATA_PORTABLE=ON \
   "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath,'\$ORIGIN' -Wl,--enable-new-dtags" > "$OUT/cfg-dsv41.log" 2>&1
 chk $? "dsv41 configured"
 nice -n 10 cmake --build "$OUT/bd" --target strata-dsv41 -j "$JOBS" > "$OUT/build-dsv41.log" 2>&1

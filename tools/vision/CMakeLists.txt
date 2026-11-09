@@ -1,7 +1,8 @@
 # tools/vision - strata-vision, the image encoder for Strata's multimodal path (optional; setup.py builds it when
-# the vision encoder is chosen).  Uses llama.cpp's mtmd library at the same pinned commit as the engine's ggml.
+# the vision encoder is chosen).  Uses llama.cpp's mtmd library at the same pinned commit as the engine's ggml, from the vendored
+# third_party/strata-llama (own-stack phase 1B; phase 3 replaces this program with a native vision tower).
 #
-#   cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=third_party/llama.cpp
+#   cmake -S tools/vision -B build-vision -G Ninja -DCMAKE_BUILD_TYPE=Release [-DLLAMA_DIR=<a llama.cpp checkout: an override, kept for two releases>]
 #         [-DSTRATA_VISION_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native] [-DSTRATA_PORTABLE=OFF]
 #         [-DSTRATA_VISION_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx (oneAPI sourced; Linux)]
 #         [-DSTRATA_VISION_HIP=ON -DSTRATA_VISION_HIP_ARCHS="gfx1200;gfx1201" + the HIP compiler the engine build uses]
@@ -14,7 +15,7 @@
 cmake_minimum_required(VERSION 3.21)
 project(strata_vision C CXX)
 
-set(LLAMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/llama.cpp" CACHE PATH "llama.cpp checkout")
+set(LLAMA_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/strata-llama" CACHE PATH "llama.cpp tree: the vendored third_party/strata-llama (llama, mtmd and ggml at the pin, nothing is downloaded), or a llama.cpp checkout")
 option(STRATA_VISION_CUDA "run the vision encoder on the GPU (builds ggml-cuda)" OFF)
 option(STRATA_VISION_HIP "run the vision encoder on an AMD GPU (builds ggml-hip); the program is named strata-vision-hip" OFF)
 option(STRATA_VISION_SYCL "run the vision encoder on an Intel GPU (builds ggml-sycl, needs the oneAPI icx/icpx compilers); the program is named strata-vision-sycl" OFF)

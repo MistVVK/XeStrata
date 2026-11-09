@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify third_party/strata-ggml against its manifest (UPSTREAM.md).   python tools/check_vendored.py [--upstream <llama.cpp dir>]
+"""Verify third_party/strata-ggml and third_party/strata-gguf-py against their manifests (UPSTREAM.md).   python tools/check_vendored.py [--upstream <llama.cpp dir>]
 
 The vendored ggml / ggml-cuda sources are frozen at the llama.cpp commit named in UPSTREAM.md.  The manifest lists every file with its
 kind and sha256 (text files are hashed with LF line ends, so a Windows checkout agrees with a Linux one):
@@ -25,9 +25,14 @@ import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 TREE = os.path.join("third_party", "strata-ggml")
+IDENTITY = ()      # a tree that keeps llama.cpp's layout and has no file under another name (third_party/strata-llama): an empty map, every file `upstream`
+GGML_RENAMED = {"strata-quant-common.h": "ggml/src/ggml-common.h"}   # the one file of third_party/strata-ggml whose upstream name differs
+# every vendored tree: (folder, maps a path in the tree to the path in the llama.cpp checkout at the pin)
+GGUF_PY_MAP = (("gguf/", "gguf-py/gguf/"), ("converter/conversion/", "conversion/"), ("converter/convert_hf_to_gguf.py", "convert_hf_to_gguf.py"),
+               ("converter/LICENSE", "LICENSE"), ("LICENSE", "gguf-py/LICENSE"), ("pyproject.toml", "gguf-py/pyproject.toml"))
 BEGIN, END = "<!-- vendored-files:begin -->", "<!-- vendored-files:end -->"
 NOT_LISTED = {"UPSTREAM.md"}          # the manifest itself
-TEXT_SUFFIXES = {".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp", ".txt", ".cmake", ".in", ".md", ".inc"}
+TEXT_SUFFIXES = {".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp", ".txt", ".cmake", ".in", ".md", ".inc", ".py", ".toml", ".typed"}
 
 
 def sha(path):
@@ -79,21 +84,29 @@ def parse(manifest):
     return rows, (m.group(1) if m else None)
 
 
-def main(argv=None):
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--upstream", help="a llama.cpp tree at the pinned commit (file paths as in the manifest)")
-    ap.add_argument("--root", default=ROOT)
-    a = ap.parse_args(argv)
-    tree = os.path.join(a.root, TREE)
-    problems = []
+def upstream_rel(rel, upmap):
+    """The path of a tree file in the llama.cpp checkout (`upmap` None: the tree keeps llama.cpp's layout)."""
+    if upmap is None:
+        return GGML_RENAMED.get(rel, rel)
+    for here, there in upmap:
+        if here.endswith("/") and rel.startswith(here):
+            return there + rel[len(here):]
+        if rel == here:
+            return there
+    return rel
+
+
+def check_tree(root, tree_rel, upmap, upstream, problems):
+    """Check one vendored tree against its UPSTREAM.md; returns the one-line summary."""
+    tree = os.path.join(root, tree_rel)
     rows, pin = parse(os.path.join(tree, "UPSTREAM.md"))
-    ver = os.path.join(a.root, "third_party", "ggml", "VERSION.txt")
+    ver = os.path.join(root, "third_party", "ggml", "VERSION.txt")
     if os.path.exists(ver):
         vpin = open(ver, encoding="utf-8").read().split()[0]
         if vpin != pin:
-            problems.append("pin %s in UPSTREAM.md differs from third_party/ggml/VERSION.txt (%s)" % (pin, vpin))
+            problems.append("%s: pin %s in UPSTREAM.md differs from third_party/ggml/VERSION.txt (%s)" % (tree_rel, pin, vpin))
     if not os.path.exists(os.path.join(tree, "LICENSE")):
-        problems.append("LICENSE is missing")
+        problems.append("%s: LICENSE is missing" % tree_rel)
     listed = set()
     for kind, h, up, rel in rows:
         if kind not in ("upstream", "edited", "added", "copy", "patched"):
@@ -124,26 +137,39 @@ def main(argv=None):
                     problems.append("%s: a `copy` must equal its counterpart" % rel)
                 if kind == "patched" and (up == h or not only_added(cpp, p)):
                     problems.append("%s: a `patched` copy must differ from %s by added lines only" % (rel, cp))
-        if a.upstream and kind in ("upstream", "edited", "copy", "patched"):
-            q = os.path.join(a.upstream, counterpart(rel) if kind in ("copy", "patched") else rel)
+        if upstream and kind in ("upstream", "edited", "copy", "patched"):
+            q = os.path.join(upstream, counterpart(rel) if kind in ("copy", "patched") else upstream_rel(rel, upmap))
             if not os.path.isfile(q):
-                problems.append("%s: not in the upstream tree %s" % (rel, a.upstream))
+                problems.append("%s: not in the upstream tree %s" % (rel, upstream))
             elif sha(q) != up:
                 problems.append("%s: upstream hash in the manifest differs from %s" % (rel, q))
     for d, _dirs, files in os.walk(tree):
         for f in files:
             rel = os.path.relpath(os.path.join(d, f), tree).replace(os.sep, "/")
-            if rel in NOT_LISTED or rel == "LICENSE":
+            if rel in NOT_LISTED or (rel == "LICENSE" and upmap is None):
                 continue
             if rel not in listed:
                 problems.append("%s: in the tree but not in UPSTREAM.md" % rel)
+    n = {k: sum(1 for r in rows if r[0] == k) for k in ("upstream", "edited", "added", "copy", "patched")}
+    return "%s: %d files (%d upstream, %d edited, %d added, %d copy, %d patched), pin %s" % (
+        tree_rel.replace(os.sep, "/"), len(rows), n["upstream"], n["edited"], n["added"], n["copy"], n["patched"], (pin or "?")[:9])
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--upstream", help="a llama.cpp tree at the pinned commit (file paths as in llama.cpp; third_party/strata-gguf-py maps as in its UPSTREAM.md)")
+    ap.add_argument("--root", default=ROOT)
+    a = ap.parse_args(argv)
+    problems = []
+    summary = [check_tree(a.root, TREE, None, a.upstream, problems),
+               check_tree(a.root, os.path.join("third_party", "strata-gguf-py"), GGUF_PY_MAP, a.upstream, problems),
+               check_tree(a.root, os.path.join("third_party", "strata-llama"), IDENTITY, a.upstream, problems)]
     for p in problems:
         print("check_vendored: " + p)
     if problems:
         print("check_vendored: %d problem(s)" % len(problems))
         return 1
-    n = {k: sum(1 for r in rows if r[0] == k) for k in ("upstream", "edited", "added", "copy", "patched")}
-    print("check_vendored: ok - %d files (%d upstream, %d edited, %d added, %d copy, %d patched), pin %s" % (len(rows), n["upstream"], n["edited"], n["added"], n["copy"], n["patched"], (pin or "?")[:9]))
+    print("check_vendored: ok - " + "; ".join(summary))
     return 0
 
 

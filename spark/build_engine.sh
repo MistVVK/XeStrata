@@ -22,7 +22,8 @@ vision_dir=${BUILD_VISION_DIR:-$repo/build-vision-spark}
 jobs=${JOBS:-$(nproc)}
 py=${PYTHON:-python3}
 cmake=${CMAKE:-cmake}
-llama=${STRATA_GGML_DIR:-$repo/third_party/llama.cpp}
+llama=${STRATA_GGML_DIR:-}     # an override: a llama.cpp checkout to take ggml from (kept for two releases); empty: the vendored third_party/strata-ggml
+ggml=""; [ -z "$llama" ] || ggml="-DSTRATA_GGML_DIR=$llama"
 
 case "$(uname -s)-$(uname -m)" in
   Linux-aarch64|Linux-arm64) ;;
@@ -41,11 +42,6 @@ case "$cudafull" in
   13.*) echo "build_engine.sh: note: CUDA $cudafull has not been tried for this build; 13.0 is the release toolkit" >&2 ;;
   *) echo "build_engine.sh: needs the CUDA 13 toolkit (nvcc here: ${cudafull:-missing})" >&2; exit 2 ;;
 esac
-if [ ! -f "$llama/ggml/CMakeLists.txt" ]; then
-  # llama.cpp at the pinned commit (ggml for the engine, mtmd for pictures), exactly as setup.py fetches it
-  (cd "$repo" && "$py" -c "import setup; print(setup.get_llama_cpp())")
-  [ -f "$llama/ggml/CMakeLists.txt" ] || { echo "build_engine.sh: no llama.cpp tree at $llama after fetching it (STRATA_GGML_DIR=<tree> names another)" >&2; exit 2; }
-fi
 # the commit the DeepSeek engine prints with --version: a checkout gives it to CMake itself; a tree copy without .git needs COMMIT=<hex>
 want_dsv41=OFF; [ "${BUILD_DSV41:-1}" = 1 ] && want_dsv41=ON
 if [ "$want_dsv41" = ON ] && [ ! -e "$repo/.git" ] && [ ! -f "$repo/BUILD_ID" ]; then
@@ -59,7 +55,7 @@ cd "$repo"
 "$cmake" -G Ninja -S . -B "$build" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF \
     -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON \
     -DSTRATA_BUILD_DSV41="$want_dsv41" -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_SKIP_BUILD_RPATH=OFF '-DCMAKE_INSTALL_RPATH=$ORIGIN' \
-    "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" -DSTRATA_GGML_DIR="$llama"
+    "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" $ggml
 rm -f "$build/strata-dsv41"
 if [ "$want_dsv41" = ON ]; then
   "$cmake" --build "$build" --target strata strata_kq strata-dsv41 -j "$jobs"
@@ -68,7 +64,10 @@ else
 fi
 
 if [ "${BUILD_VISION:-1}" = 1 ]; then
-  "$cmake" -G Ninja -S tools/vision -B "$vision_dir" -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR="$llama" \
+  # strata-vision builds from the vendored third_party/strata-llama; STRATA_GGML_DIR=<llama.cpp checkout> overrides it
+  vision_llama=""; [ -z "$llama" ] || vision_llama="-DLLAMA_DIR=$llama"
+  # shellcheck disable=SC2086
+  "$cmake" -G Ninja -S tools/vision -B "$vision_dir" -DCMAKE_BUILD_TYPE=Release $vision_llama \
       -DSTRATA_VISION_CUDA=ON -DSTRATA_PORTABLE=ON -DGGML_CUDA_NCCL=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16+i8mm \
       "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual"
   "$cmake" --build "$vision_dir" --target strata-vision -j "$jobs"

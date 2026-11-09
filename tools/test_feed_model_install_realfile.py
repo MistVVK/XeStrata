@@ -5,8 +5,8 @@ second copy of the experts).
 
     python -m pytest tools/test_feed_model_install_realfile.py
 
-Needs a llama.cpp checkout for its gguf-py (env STRATA_TEST_LLAMA_CPP, or a known place) and numpy; without them the test is SKIPPED with that reason, which
-`tools/check` prints. The engine step (one request) is the gate script's own --engine option and needs a box with an engine built for the file's shape.
+Needs numpy (no llama.cpp checkout and no STRATA_TEST_LLAMA_CPP any more: gguf-py is vendored in third_party/strata-gguf-py); without it the test is SKIPPED
+with that reason, which `tools/check` prints. The engine step (one request) is the gate script's own --engine option and needs a box with an engine built for the file's shape.
 """
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ import feed_model_install_gate as gate  # noqa: E402
 class FeedModelInstallFromRealFile(unittest.TestCase):
     def test_a_small_synthetic_model_installs_through_setup(self):
         try:
-            llama = gate.find_llama(None)
+            gate.check_vendored_gguf_py()
             import numpy  # noqa: F401
         except gate.NotRun as e:
             self.skipTest(str(e))
@@ -34,7 +34,7 @@ class FeedModelInstallFromRealFile(unittest.TestCase):
         work = Path(tempfile.mkdtemp(prefix="strata-feed-install-"))
         self.addCleanup(shutil.rmtree, work, True)
         try:
-            res = gate.check(work, llama, None, gate.TINY, lambda s: None)
+            res = gate.check(work, None, gate.TINY, lambda s: None)
         except gate.NotRun as e:
             self.skipTest(str(e))
         self.assertEqual(res["problems"], [], "\n".join(res["out"].splitlines()[-30:]))

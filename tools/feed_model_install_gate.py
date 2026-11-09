@@ -18,13 +18,13 @@ What it does, in a scratch folder (nothing of the real install, %APPDATA% or the
   5. with --engine <folder of an engine built for the file's shape>: starts that engine from the run config, sends ONE chat request and checks the answer
      is finite (the file has random weights: the text is empty or noise, the usage numbers and `finish_reason` are what counts).
 
-    python tools/feed_model_install_gate.py --llama-cpp <a llama.cpp checkout (its gguf-py is read by the preparation tools)>
-    python tools/feed_model_install_gate.py --llama-cpp D --tokenizer-from <a real Flash-Next shard 1> --engine <engine folder> --full
+    python tools/feed_model_install_gate.py
+    python tools/feed_model_install_gate.py --tokenizer-from <a real Flash-Next shard 1> --engine <engine folder> --full
 
-`tools/test_feed_model_install_realfile.py` runs step 1 to 4 as a test in `python tools/check` (py-tools). It needs the llama.cpp checkout: env
-STRATA_TEST_LLAMA_CPP, or the first of .ref/llama.cpp next to the repository, ~/c2-llama, ~/llama.cpp; without one the check is SKIPPED with that reason
-(never a pass), so set the variable on the machines that run the gate (Linux test runners: `ltest.py ... --env`, or export it in the command).
-Exit codes: 0 pass, 1 a check failed, 2 not run (no llama.cpp, no numpy), 3 the engine phase failed.
+`tools/test_feed_model_install_realfile.py` runs step 1 to 4 as a test in `python tools/check` (py-tools). The preparation tools read GGUF files with the vendored
+gguf-py (third_party/strata-gguf-py), so no llama.cpp checkout, no STRATA_TEST_LLAMA_CPP and no network are needed; the check also fails if setup says it
+fetched llama.cpp. Without numpy it is SKIPPED with that reason (never a pass).
+Exit codes: 0 pass, 1 a check failed, 2 not run (no numpy, no NVIDIA card on a Windows box), 3 the engine phase failed.
 """
 from __future__ import annotations
 
@@ -68,13 +68,10 @@ class NotRun(Exception):
     pass
 
 
-def find_llama(explicit: str | None) -> Path:
-    cands = [explicit, os.environ.get("STRATA_TEST_LLAMA_CPP"), ROOT.parent / ".ref" / "llama.cpp", ROOT.parent.parent / ".ref" / "llama.cpp",
-             Path.home() / "c2-llama", Path.home() / "llama.cpp", Path.home() / "strata-fp4" / "src" / "third_party" / "llama.cpp"]
-    for c in cands:
-        if c and (Path(c) / "gguf-py").is_dir():
-            return Path(c)
-    raise NotRun("no llama.cpp checkout with gguf-py (set STRATA_TEST_LLAMA_CPP or pass --llama-cpp); the preparation tools read GGUF files with it")
+def check_vendored_gguf_py() -> None:
+    """The preparation tools read GGUF files with the vendored gguf-py (third_party/strata-gguf-py): nothing to find, nothing to fetch."""
+    if not (ROOT / "third_party" / "strata-gguf-py" / "gguf" / "__init__.py").is_file():
+        raise NotRun("third_party/strata-gguf-py is missing from this checkout")
 
 
 def free_port() -> int:
@@ -204,15 +201,6 @@ def make_entry(model: Path) -> dict:
                         "files": [{"name": FILE_NAME, "size": model.stat().st_size, "sha256": sha256_of(model)}]}]}
 
 
-def prepare_llama_stub(install: Path, llama: Path) -> None:
-    """setup.py looks for <install>/third_party/llama.cpp/{ggml/CMakeLists.txt,gguf-py}: a stub with a COPY of gguf-py (no symlink: Windows), so github.com is never asked."""
-    dst = install / "third_party" / "llama.cpp"
-    (dst / "ggml").mkdir(parents=True, exist_ok=True)
-    (dst / "ggml" / "CMakeLists.txt").write_text("# stub for the gate\n", encoding="utf-8")
-    if not (dst / "gguf-py").is_dir():
-        shutil.copytree(llama / "gguf-py", dst / "gguf-py", ignore=shutil.ignore_patterns("__pycache__", "tests", "*.pyc"))
-
-
 STUB_SMI = """#!/bin/sh
 # the gate's stand-in for nvidia-smi on a box with no NVIDIA card (setup stops at step 1 without one): one 24 GB Ada card, every other question unanswered
 case "$*" in
@@ -283,7 +271,7 @@ def newest(path: Path, pattern: str) -> list[Path]:
     return sorted(path.rglob(pattern), key=lambda p: p.stat().st_mtime) if path.is_dir() else []
 
 
-def check(work: Path, llama: Path, tokenizer_from: str | None, shape: dict, log) -> dict:
+def check(work: Path, tokenizer_from: str | None, shape: dict, log) -> dict:
     """Steps 1 to 4. Returns {"problems": [...], "config": path or None, "out": setup's text}."""
     problems: list[str] = []
     model_dir = work / "mirror" / REPO
@@ -296,7 +284,6 @@ def check(work: Path, llama: Path, tokenizer_from: str | None, shape: dict, log)
     trust = build_feed(feed, make_entry(model), work)
     install, data = work / "install", work / "data"
     install.mkdir()
-    prepare_llama_stub(install, llama)
     with Mirror(work / "mirror") as mirror:
         env = sandbox_env(work, install, feed, trust, mirror.port)
         nvidia_stub_if_needed(env, work, log)
@@ -309,6 +296,10 @@ def check(work: Path, llama: Path, tokenizer_from: str | None, shape: dict, log)
         for bad in ("Traceback", "KeyError"):
             if bad in out:
                 problems.append(f"setup printed {bad!r}")
+        if "llama.cpp source" in out or any("llama.cpp" in p or "ggml-org" in p for p in mirror.seen):
+            problems.append("setup fetched llama.cpp (the gguf-py of the preparation tools is vendored: third_party/strata-gguf-py)")
+        if (install / "third_party" / "llama.cpp").exists():
+            problems.append("setup wrote third_party/llama.cpp into the install folder")
         wrong = sorted({p for p in asked if FILE_NAME not in p})
         if wrong:                                       # F3: the Flash-Next draft layer (or anything else of another repository) was asked for
             problems.append("setup asked the model host for more than the model's file: " + ", ".join(wrong[:4]))
@@ -429,7 +420,6 @@ def start_engine(config: Path, engine: Path, work: Path, log) -> list[str]:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--llama-cpp", help="a llama.cpp checkout (its gguf-py); default: STRATA_TEST_LLAMA_CPP or a known place")
     ap.add_argument("--tokenizer-from", help="a real qwen4exp GGUF (shard 1): the synthetic file gets its tokenizer (needed by --engine)")
     ap.add_argument("--engine", type=Path, help="an engine folder built for the file's shape: step 5 starts it and sends one request (needs --full)")
     ap.add_argument("--full", action="store_true", help="the 4-layer q4_lite stand-in of the rehearsal instead of the small file (3.5 GB with a real tokenizer)")
@@ -441,7 +431,7 @@ def main(argv=None) -> int:
         return 2
     log = lambda s: print(time.strftime("%H:%M:%S"), s, flush=True)   # noqa: E731
     try:
-        llama = find_llama(a.llama_cpp)
+        check_vendored_gguf_py()
     except NotRun as e:
         print("NOT RUN:", e)
         return 2
@@ -453,7 +443,7 @@ def main(argv=None) -> int:
         work.mkdir(parents=True, exist_ok=True)
     code = 1
     try:
-        res = check(work, llama, a.tokenizer_from, FULL if a.full else TINY, log)
+        res = check(work, a.tokenizer_from, FULL if a.full else TINY, log)
         problems = res["problems"]
         if not problems and a.engine:
             ep = start_engine(res["config"], a.engine, work, log)

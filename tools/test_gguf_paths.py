@@ -13,13 +13,22 @@ import _paths  # noqa: E402
 class GgufPyLookup(unittest.TestCase):
     def test_install_dir_is_searched(self):
         with tempfile.TemporaryDirectory() as d:
-            gp = Path(d) / "third_party" / "llama.cpp" / "gguf-py"
+            gp = Path(d) / "third_party" / "strata-gguf-py"
             (gp / "gguf").mkdir(parents=True)
             env = {k: v for k, v in os.environ.items() if k != "STRATA_GGUF_PY"}
             env["STRATA_INSTALL_DIR"] = d
             with mock.patch.dict(os.environ, env, clear=True), \
                     mock.patch.object(_paths, "ENGINE", Path(d) / "nowhere" / "pkg"):
                 self.assertEqual(_paths.gguf_py(), str(gp))
+
+    def test_the_vendored_copy_is_found_without_any_download_or_setting(self):
+        """OWN-1B: third_party/strata-gguf-py ships with the sources and the Terminal/Control packages."""
+        env = {k: v for k, v in os.environ.items() if k not in ("STRATA_GGUF_PY", "STRATA_INSTALL_DIR")}
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(_paths, "_install_dirs", return_value=[]):
+            self.assertEqual(Path(_paths.gguf_py()), _paths.VENDORED)
+            self.assertTrue((_paths.VENDORED / "gguf" / "__init__.py").is_file())
+            self.assertTrue((Path(_paths.converter_dir()) / "convert_hf_to_gguf.py").is_file())
+            self.assertTrue((Path(_paths.converter_dir()) / "conversion" / "qwen4exp.py").is_file())
 
     def test_env_wins_and_message_names_it(self):
         with tempfile.TemporaryDirectory() as d:

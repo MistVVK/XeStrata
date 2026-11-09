@@ -1,5 +1,5 @@
 // Where the Metal engine finds the files it reads at run time: the .metal kernel sources it compiles when it starts,
-// ggml-common.h, and the default expert-profile / draft-vocabulary tables.
+// strata-quant-common.h (formerly ggml-common.h), and the default expert-profile / draft-vocabulary tables.
 //
 // A build used from its own source tree finds them through the paths compiled in (STRATA_*_DEFAULT). A component package
 // (strata_control/engine_component.py) is moved away from the tree that built it, so the engine also looks beside its
@@ -7,7 +7,7 @@
 //
 //     <exe dir>/metal/kernels/*.metal            the kernel sources (metal/kernels)
 //     <exe dir>/metal/engine-msl/*.metal         the engine's own kernels (metal/src/engine/msl)
-//     <exe dir>/metal/ggml-common.h
+//     <exe dir>/metal/strata-quant-common.h      (a package of an earlier release has it as <exe dir>/metal/ggml-common.h: read as the second choice)
 //     <exe dir>/metal/data/expert-profile.bin  draft_vocab.bin
 //
 // Order: the environment variable (STRATA_METAL_KERNELS, ...), then that folder when it exists, then the compiled-in
@@ -49,6 +49,22 @@ inline std::string resource(const char* env, const char* sub, const char* compil
     if (!dir.empty()) {
         const std::string beside = dir + "/metal/" + sub;
         if (exists(beside)) return beside;
+    }
+    return compiled;
+}
+
+// The same for a file that has two names (own-stack phase 1B: strata-quant-common.h, formerly ggml-common.h): the environment variable, then the new name
+// beside the executable, then the old name beside the executable (a package of an earlier release), then the compiled-in path.
+inline std::string resource2(const char* env, const char* sub, const char* old_sub, const char* compiled) {
+    if (env) {
+        if (const char* e = std::getenv(env)) return e;
+    }
+    const std::string dir = exe_dir();
+    if (!dir.empty()) {
+        const std::string beside = dir + "/metal/" + sub;
+        if (exists(beside)) return beside;
+        const std::string old_beside = dir + "/metal/" + old_sub;
+        if (exists(old_beside)) return old_beside;
     }
     return compiled;
 }

@@ -105,10 +105,6 @@ class ControlModeTests(unittest.TestCase):
 
     def test_the_engine_is_the_component_and_a_missing_one_does_not_stop_the_download(self):
         S = self.S
-        llama = self.home / "third_party" / "llama.cpp"
-        (llama / "ggml").mkdir(parents=True)
-        (llama / "ggml" / "CMakeLists.txt").write_text("", encoding="utf-8")
-        (llama / "gguf-py").mkdir()
         empty = Path(self.tmp.name) / "components"
         empty.mkdir()
         gpu = {"index": 0, "vram_gb": 12.0}
@@ -117,7 +113,8 @@ class ControlModeTests(unittest.TestCase):
                 mock.patch.object(S, "build_engine", side_effect=AssertionError("built")), \
                 mock.patch.object(S, "get_prebuilt", side_effect=AssertionError("fetched an engine")):
             found, eng, meta, libs, chosen, vision = S.engine_step(mock.Mock(build=False, prebuilt=None), gpu, False, [], 13, "gpu")
-        self.assertEqual(found.resolve(), llama.resolve())
+        self.assertIsNone(found, "no llama.cpp tree: the engine is the component, gguf-py is vendored")
+        self.assertFalse((self.home / "third_party" / "llama.cpp").exists(), "nothing is fetched into the install folder")
         self.assertEqual(libs, [])
         self.assertEqual(vision, "none")                                   # images are not in the first app release
         self.assertEqual(meta["source"], "local")

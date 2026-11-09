@@ -55,11 +55,12 @@ folder (an override kept for two releases, then removed).
    STRATA_MMQ_TAB needs no fingerprint of it for this tree. A build with `-DSTRATA_GGML_DIR=<llama.cpp>` still gets the overlay (the script reads `tq.cuh` and
    `tq-mmq-tiles.cuh` from here); it goes with that override. `third_party/ggml-tq` is gone.
 
-3. **The quant header gets Strata's name (phase 1A: a forwarder).** `strata-quant-common.h` is one line that includes `third_party/ggml/ggml-common.h` (llama.cpp's
-   `ggml/src/ggml-common.h` with one Strata edit: `GGML_COMMON_IMPL_METAL` also opens `iq1s_grid`). The text stays at the old path because the Metal runtime reads that
-   file's text under that name and the Mac package ships it as `metal/ggml-common.h`; swapping the two (the text here, a forwarder at the old path, the runtime and
-   package using the new name) is a packaging change and goes with phase 1B. `ggml/src/ggml-common.h` of this tree stays llama.cpp's own. SYCL keeps its own
-   SYCL-mode copy, `sycl/third_party/ggml/ggml-common.h`.
+3. **The quant header has Strata's name (phase 1B).** `strata-quant-common.h` holds the text: llama.cpp's `ggml/src/ggml-common.h` with one Strata edit
+   (`GGML_COMMON_IMPL_METAL` also opens `iq1s_grid`; line 1134), row `edited` below. `third_party/ggml/ggml-common.h` is now a one-line forwarder to it, kept for two
+   releases, so every `#include "ggml-common.h"` is unchanged. The Metal runtime reads this file's TEXT (`metal/src/resource_path.h`: `<exe>/metal/strata-quant-common.h`,
+   else the old name beside the executable, else the compiled-in path) and the Mac package ships `metal/strata-quant-common.h` plus a full-text copy as
+   `metal/ggml-common.h` for two releases. `ggml/src/ggml-common.h` of this tree stays llama.cpp's own (ggml-cpu includes it). The dpct-migrated SYCL-mode copy moved the same
+   way (`sycl/third_party/ggml/strata-quant-common.h`, a forwarder under the old name); the SYCL build includes the shared header, not that copy.
 
 ## Updating
 
@@ -199,6 +200,6 @@ upstream 2b6f26259bfc6768229c90b127fee770f60271e74f4513d7abecb5900fa0b112 2b6f26
 upstream 1a634ca1df25db2fbd526cba9bfe11fccd5aa9b31f819c3cac6b630be03f9f51 1a634ca1df25db2fbd526cba9bfe11fccd5aa9b31f819c3cac6b630be03f9f51 ggml/src/ggml.c
 upstream 64e6b5c8d716ae8697e45481a7153540be01f721be2dc7e753aa47b36a69c753 64e6b5c8d716ae8697e45481a7153540be01f721be2dc7e753aa47b36a69c753 ggml/src/ggml.cpp
 upstream 2293c7bd9009154da9de075c8ea49be291a9086a5d1a06984b80b80bf7a9cea9 2293c7bd9009154da9de075c8ea49be291a9086a5d1a06984b80b80bf7a9cea9 ggml/src/gguf.cpp
-added 2ff9918120a6e5a349e3737157fdde46e97b482e05010911dbfd597ce69fdaca - strata-quant-common.h
+edited 924e99cccd09e7ba249c96d7bc2db5e05c19cefa82742bb242da658941ce97a9 0061131b615c5721fc88a78feeb22c1f8c450f1c2646a317d80796a653bf595c strata-quant-common.h
 ```
 <!-- vendored-files:end -->

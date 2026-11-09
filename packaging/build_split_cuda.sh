@@ -3,7 +3,7 @@
 # so package_engine.py can ship it with `--include 'strata-split-*'` beside `strata`.  One executable per card count and one architecture
 # (the engine refuses a card of any other architecture).  RUNPATH $ORIGIN: it finds cudart/cublas beside itself.
 #
-#   SRC=<checkout> B=<build dir> CUDA=/usr/local/cuda-13.1 GG=<llama.cpp checkout> [ARCH=86] [CARDS="2"] [JOBS=8]  packaging/build_split_cuda.sh
+#   SRC=<checkout> B=<build dir> CUDA=/usr/local/cuda-13.1 [GG=<llama.cpp checkout, an override>] [ARCH=86] [CARDS="2"] [JOBS=8]  packaging/build_split_cuda.sh
 #
 # ARCH is one compute capability; 86 is the one that has been run (2 RTX A6000). CARDS lists the counts to build; 3 and 4 build but have
 # not been run with the host exchange, and the launcher keeps them off unless a tester allows them (strata_control/split_engine.py).
@@ -13,7 +13,8 @@ set -eu
 SRC=${SRC:-$(cd "$(dirname "$0")/.." && pwd)}
 B=${B:?B=<build dir>}
 CUDA=${CUDA:?CUDA=<toolkit root>}
-GG=${GG:?GG=<llama.cpp checkout at the pinned commit>}
+GG=${GG:-}      # optional override (kept for two releases): a llama.cpp checkout to take ggml from; empty: the vendored third_party/strata-ggml
+ggml=""; [ -z "$GG" ] || ggml="-DSTRATA_GGML_DIR=$GG"
 ARCH=${ARCH:-86}
 CARDS=${CARDS:-2}
 JOBS=${JOBS:-8}
@@ -21,7 +22,7 @@ export PATH=$CUDA/bin:$PATH
 rm -f "$B/CMakeCache.txt"
 cmake -G Ninja -S "$SRC" -B "$B" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_BUILD_SPLIT=ON \
   "-DSTRATA_SPLIT_CARDS=${CARDS// /;}" -DSTRATA_SPLIT_ARCH="$ARCH" "-DCMAKE_CUDA_ARCHITECTURES=$ARCH" -DCMAKE_CUDA_COMPILER="$CUDA/bin/nvcc" \
-  -DCUDAToolkit_ROOT="$CUDA" -DSTRATA_GGML_DIR="$GG" -DSTRATA_NATIVE_EXPERTS=ON -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+  -DCUDAToolkit_ROOT="$CUDA" $ggml -DSTRATA_NATIVE_EXPERTS=ON -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
   -DCMAKE_SKIP_BUILD_RPATH=OFF '-DCMAKE_INSTALL_RPATH=$ORIGIN'
 out=""
 for n in $CARDS; do

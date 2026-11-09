@@ -401,7 +401,7 @@ def step_docs(ctx):
     r.log = log
     for label, script, args in (("links", "check_links.py", ()), ("release manifest", "release_manifest.py", ("--check",)),
                                 ("capability table", "capability_table.py", ("--check",)), ("bench results index", "bench_results_index.py", ("--check",)), ("settings register", "settings_register.py", ("--check",)),
-                                ("vendored ggml (third_party/strata-ggml)", "check_vendored.py", ())):
+                                ("vendored ggml and gguf-py (third_party/strata-ggml, strata-gguf-py)", "check_vendored.py", ())):
         path = os.path.join(ROOT, "tools", script)
         if not os.path.exists(path):
             r.skipped += 1

@@ -238,7 +238,6 @@ def ms_meta(repo: str, path: str):
 
 HF = hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF")
 LLAMA_CPP_COMMIT = "3cf03257f219afbe7334045ff7c6a06ac68c627d"
-LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMIT}.zip"
 
 # The ready-made engine: <PREBUILT_URL><asset>, a zip with strata(.exe), strata-vision(.exe) and BUILD.json, built
 # by tools/make_release.py.  Set this to the GitHub release download folder when publishing, e.g.
@@ -1133,9 +1132,6 @@ def run(cmd, cwd=None, env=None, check=True, quiet=False):
                 Path(argv[1]).resolve().parent not in ((ROOT / "tools").resolve(), (ROOT / "tools" / "dsv41").resolve(), (ROOT / "metal" / "tools").resolve()):
             raise acquisition.AcquisitionRefused("the desktop app's installer only runs its bundled preparation tools; "
                                                  + " ".join(argv[:2]))
-    gguf_py = (env or {}).get("STRATA_GGUF_PY")
-    if gguf_py and not Path(gguf_py).is_dir() and Path(gguf_py).parent == home() / "third_party" / "llama.cpp":
-        get_llama_cpp()                                # the preparation tools read GGUF files with it: fetched now (the one place github.com is needed)
     say("  > " + " ".join(str(c) for c in cmd))
     env = dict(os.environ if env is None else env)
     env.setdefault("STRATA_EXIT_WITH_PARENT", "1")     # tools/mtp_fetch.py ends when setup ends (#3257: a cancel left it writing)
@@ -3862,56 +3858,48 @@ def check_shards(shards):
                  f"delete {s.name} and its .done mark and run setup again")
 
 
+#: gguf-py and llama.cpp's HF converter, vendored at the llama.cpp pin (third_party/strata-gguf-py/UPSTREAM.md): the preparation tools import
+#: them, so no llama.cpp download is needed to pack a model. The Terminal and Control packages carry this folder (packaging/package_terminal.py).
+VENDORED_GGUF_PY = ROOT / "third_party" / "strata-gguf-py"
+#: the llama.cpp sources strata-vision builds (llama, mtmd, the whole ggml), vendored at the same pin (third_party/strata-llama/UPSTREAM.md); phase 3 deletes it
+VENDORED_LLAMA = ROOT / "third_party" / "strata-llama"
+
+
+def gguf_py_dir() -> Path:
+    """The folder that holds the `gguf` package for the preparation tools (STRATA_GGUF_PY=<folder> is an override, kept as before)."""
+    own = os.environ.get("STRATA_GGUF_PY")
+    if own and (Path(own) / "gguf").is_dir():
+        return Path(own)
+    return VENDORED_GGUF_PY
+
+
+def llama_override():
+    """A llama.cpp checkout named by STRATA_GGML_DIR (an override of the vendored ggml, kept for two releases), else None: the engine then builds
+    from third_party/strata-ggml and nothing is downloaded."""
+    own = os.environ.get("STRATA_GGML_DIR")
+    return Path(own) if own and (Path(own) / "ggml" / "CMakeLists.txt").exists() else None
+
+
+def ggml_defs(llama) -> list:
+    """The CMake definition that points an engine build at a llama.cpp checkout: only for the override; the vendored tree is the default."""
+    return [f"-DSTRATA_GGML_DIR={llama}"] if llama else []
+
+
+def vision_llama(llama) -> Path:
+    """The llama.cpp tree strata-vision builds from: the override (STRATA_GGML_DIR), else the vendored third_party/strata-llama."""
+    return Path(llama) if llama else VENDORED_LLAMA
+
+
 def llama_cpp_if_here():
-    """The llama.cpp source folder, fetched only when a model has to be prepared (run() fetches it then): a PC with every file and no internet
-    starts a model that is already prepared without reaching github.com."""
-    llama = home() / "third_party" / "llama.cpp"
-    if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir():
+    """The llama.cpp override tree (None by default). gguf-py is vendored (gguf_py_dir()), so nothing is fetched to prepare a model."""
+    if (gguf_py_dir() / "gguf").is_dir():
         ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py for the preparation tools)")
-    else:
-        say("  llama.cpp source: only needed to prepare a model; it is downloaded then, if that is needed")
-    return llama
+    return llama_override()
 
 
 def get_llama_cpp():
-    """llama.cpp at the pinned commit (ggml for the build, gguf-py for the tools, mtmd for images), as a zip: no git."""
-    llama = home() / "third_party" / "llama.cpp"
-    if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir():
-        return llama
-    z = home() / "third_party" / f"llama.cpp-{LLAMA_CPP_COMMIT[:7]}.zip"
-    download(LLAMA_CPP_ZIP, z, "llama.cpp source")
-    tmp = home() / "third_party" / "_unpack"
-    shutil.rmtree(tmp, ignore_errors=True)
-    try:
-        with zipfile.ZipFile(z) as f:
-            # llama.cpp's own web UI (tools/ui) is not used, and its deep paths passed Windows' 260-character limit in a
-            # folder like Downloads\Strata-main\Strata-main (#206)
-            f.extractall(tmp, [m for m in f.namelist() if "/tools/ui/" not in m])
-    except zipfile.BadZipFile:
-        # #1797: do not let the .done mark make every later run reuse a damaged source archive.
-        try:
-            drop_archive(z)
-        except OSError as e:
-            warn(f"cannot remove damaged {z.name} ({e}): delete it and its .done mark before running setup again")
-        raise
-    top = next(tmp.iterdir())
-    shutil.rmtree(llama, ignore_errors=True)
-    # PR #63: on Windows a rename can fail with PermissionError while an antivirus scanner still holds a file of the
-    # fresh unpack; shutil.move falls back to copy-and-delete, and a few retries let the scanner finish.  The target
-    # is `llama` itself - moving into its parent would keep the zip's `llama.cpp-<sha>` folder name.
-    for attempt in range(5):
-        try:
-            shutil.move(str(top), str(llama))
-            break
-        except PermissionError:
-            if attempt == 4:
-                raise
-            shutil.rmtree(llama, ignore_errors=True)   # a partial copy from the failed attempt
-            time.sleep(2)
-    shutil.rmtree(tmp, ignore_errors=True)
-    z.unlink(missing_ok=True)
-    z.with_name(z.name + ".done").unlink(missing_ok=True)
-    return llama
+    """Kept for callers that still name it: the llama.cpp override tree (STRATA_GGML_DIR) or None. Nothing is downloaded any more."""
+    return llama_override()
 
 
 def req_name(line: str) -> str:
@@ -5245,7 +5233,7 @@ def build_engine_hip(gpu, llama, vision="none") -> Path:
                  f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}", f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
                  "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
                  f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}",
-                 f"-DSTRATA_GGML_DIR={llama}", *isa_floor_defs(floor, ROOT / "build-hip", meta)], None, "")
+                 *ggml_defs(llama), *isa_floor_defs(floor, ROOT / "build-hip", meta)], None, "")
     if stale_binary(ROOT / "build-hip" / EXE):            # #2054: no stamp for a binary of another version
         fail(f"the engine build finished without a new engine ({EXE} is version "
              f"{binary_engine_version(ROOT / 'build-hip' / EXE)}, this source is {source_version()}): "
@@ -5315,7 +5303,7 @@ def build_vision_hip(eng: Path, stamp: Path, meta: dict, llama, vsrc, archs: lis
     say("  Compiling the picture reader for your AMD GPU (a few minutes, once) ...")
     try:
         cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision-hip", "strata-vision",
-                    [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_HIP=ON", "-DSTRATA_VISION_HIP_ARCHS=" + ";".join(archs),
+                    [f"-DLLAMA_DIR={vision_llama(llama)}", "-DSTRATA_VISION_HIP=ON", "-DSTRATA_VISION_HIP_ARCHS=" + ";".join(archs),
                      "-DSTRATA_PORTABLE=OFF", f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}",
                      f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}", "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
                      f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}"], None, "")
@@ -5335,7 +5323,7 @@ def build_vision_cpu(eng: Path, stamp: Path, meta: dict, llama, vsrc) -> Path:
     if not ((eng / VEXE).exists() and meta.get("vision_src") == vsrc):
         say("  Compiling the image encoder (for the CPU) ...")
         cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision", "strata-vision",
-                    [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=OFF", "-DSTRATA_PORTABLE=OFF"],
+                    [f"-DLLAMA_DIR={vision_llama(llama)}", "-DSTRATA_VISION_CUDA=OFF", "-DSTRATA_PORTABLE=OFF"],
                     find_vcvars() if WIN else None,
                     "build-vision-cpu.bat" if WIN else "")   # #881: MSVC's environment on Windows, as the CUDA path has
         shutil.copy2(ROOT / "build-vision" / "bin" / VEXE, eng / VEXE)
@@ -5977,7 +5965,7 @@ def update_installed_engine(url_base, toolkit=None) -> None:
                     raise RuntimeError("no supported AMD GPU found")
                 # every architecture it was built for (a layer split across two families keeps both)
                 build_engine_hip({**g, "archs": [x for x in arch_names(meta.get("archs")) if x in AMD_ARCHS] or [g["arch"]]},
-                                 get_llama_cpp(), meta.get("vision") or "none")
+                                 llama_override(), meta.get("vision") or "none")
             except (Exception, SystemExit) as e:
                 warn(f"could not compile the updated engine{'' if isinstance(e, SystemExit) else f' ({e})'}: "
                      "starting the installed one")
@@ -6007,7 +5995,7 @@ def update_installed_engine(url_base, toolkit=None) -> None:
             gpu = {**gpu, "archs": sorted({int(gpu["arch"]), *arch_numbers(meta.get("archs"))})}
             if int(toolkit) == 12:                     # the cards it was compiled for (the main GPU may be newer)
                 gpu["archs"] = sorted(arch_numbers(meta.get("archs"))) or gpu["archs"]
-            build_engine(gpu, vision, False, get_llama_cpp(), toolkit=toolkit)
+            build_engine(gpu, vision, False, llama_override(), toolkit=toolkit)
         except (Exception, SystemExit) as e:
             warn(f"could not compile the updated engine{'' if isinstance(e, SystemExit) else f' ({e})'}: starting the installed one")
         return
@@ -6245,8 +6233,8 @@ def cmake_build(src, bdir, target, defs, vcvars, bat_name):
             run(build)
 
 
-ENGINE_SOURCES = ("CMakeLists.txt", "cmake", "src", "include", "third_party/ggml")
-VISION_SOURCES = ("tools/vision",)
+ENGINE_SOURCES = ("CMakeLists.txt", "cmake", "src", "include", "third_party/ggml", "third_party/strata-ggml")
+VISION_SOURCES = ("tools/vision", "third_party/strata-llama")
 
 
 def source_hash(parts) -> str:
@@ -6365,7 +6353,7 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
         cmake_build(ROOT, bdir, "strata",
                     ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_Q6K_EXPERTS=ON", "-DSTRATA_MMQ_KQUANTS=ON",
                      f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
-                     f"-DCMAKE_CUDA_COMPILER={nvcc}", *toolkit_root_defs(nvcc), f"-DSTRATA_GGML_DIR={llama}",
+                     f"-DCMAKE_CUDA_COMPILER={nvcc}", *toolkit_root_defs(nvcc), *ggml_defs(llama),
                      *host_compiler_defs(True), *engine_defs(archs, toolkit),
                      *isa_floor_defs(floor, bdir, meta)],
                     vcvars, "build-strata-cuda12.bat" if t12 else "build-strata.bat")
@@ -6380,7 +6368,7 @@ def build_engine(gpu, vision, yes, llama, toolkit=None) -> Path:
             (eng / KQ_LIB).unlink()
     if not vision_ok:
         say("  Compiling the image encoder" + (" with CUDA (10-20 minutes, once) ..." if vision == "gpu" else " ..."))
-        defs = [f"-DLLAMA_DIR={llama}", f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}",
+        defs = [f"-DLLAMA_DIR={vision_llama(llama)}", f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}",
                 "-DSTRATA_PORTABLE=OFF", *host_compiler_defs(vision == "gpu")]   # native, like the engine
         if vision == "gpu":
             defs += [f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}", f"-DCMAKE_CUDA_COMPILER={nvcc}",
@@ -8147,7 +8135,7 @@ def ensure_engine_for(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
     main = gpu_info(cards[0]["index"])
     archs = sorted(set(arch_numbers(meta.get("archs"))) | {int(g["arch"]) for g in cards})
     vision = meta.get("vision") or ("gpu" if (eng / VEXE).exists() else "none")
-    build_engine({**main, "archs": archs}, vision, yes, get_llama_cpp(), toolkit=tk)
+    build_engine({**main, "archs": archs}, vision, yes, llama_override(), toolkit=tk)
     dirs = json.loads(info.read_text(encoding="utf-8")).get("cuda_dirs") or []
     cfg["lib_dirs"] = dirs + [d for d in cfg.get("lib_dirs") or [] if d not in dirs]
     write_config(cfg_path, cfg)
@@ -8162,7 +8150,7 @@ def get_cuda12_engine(url_base, gpu, vision, yes, build=False) -> Path:
         pip_cuda_libs(12)
         if vision != "none" and not (eng / VEXE).exists():
             eng = None
-    return eng if eng is not None else build_engine(gpu, vision, yes, get_llama_cpp(), toolkit=12)
+    return eng if eng is not None else build_engine(gpu, vision, yes, llama_override(), toolkit=12)
 
 
 def engine_lib_dirs(eng: Path, toolkit=13) -> list:
@@ -8413,7 +8401,7 @@ def shape_engine_step(a, gpu, vision):
     separate component next to the Strata engine (shape_engine_fetch); the run config names it ("component:strata-q4-lite") and every start looks it up.
     Returns what engine_step returns."""
     shape = SHAPE_ENGINE["shape"]
-    llama = llama_cpp_if_here() if CONTROL else get_llama_cpp()
+    llama = llama_cpp_if_here()
     found = shape_engine_fetch(a)
     if found is None:
         return llama, home() / "engine", {"version": "99.0.0", "source": "local", "component": "missing"}, [], gpu, "none"
@@ -8433,7 +8421,7 @@ def engine_step(a, gpu, hip, amd, cuda_tk, vision):
         return shape_engine_step(a, gpu, vision)
     if CONTROL:
         return control_engine_step(gpu, vision)
-    llama = get_llama_cpp()
+    llama = llama_override()
     ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
     if hip and WIN:                                    # AMD on Windows: the ready-made HIP engine (no compiler)
         eng = None if a.build else get_prebuilt_hip(a.prebuilt, gpu)
@@ -8768,7 +8756,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     pack = data / "packs" / tag.lower()            # only the tokenizer: the engine reads the GGUF itself
     if not (pack / "tokenizer" / "vocab.json").exists():
         run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--gguf", str(gguf), "--out", str(pack)],
-            env=dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py")))
+            env=dict(os.environ, STRATA_GGUF_PY=str(gguf_py_dir())))
     ok(f"tokenizer: {pack / 'tokenizer'}")
 
     step(7, "writing the start script")
@@ -9775,9 +9763,9 @@ def prepare_pack_only(a) -> int:
         fail(*problem)
     pack = Path(a.prepare_pack)
     step(1, "preparing the model for this graphics card")
-    llama = get_llama_cpp()
+    llama = llama_override()
     ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py)")
-    env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
+    env = dict(os.environ, STRATA_GGUF_PY=str(gguf_py_dir()))
     if not (pack / "native_experts.txt").exists() or not (pack / "tokenizer" / "vocab.json").exists():
         run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(files[0]), "--out", str(pack),
              *fam.get("pack_args", [])], env=env)
@@ -9999,7 +9987,7 @@ def mac_control_setup(a) -> int:
 
     step(6, "preparing the model for Strata")
     pack = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
-    env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
+    env = dict(os.environ, STRATA_GGUF_PY=str(gguf_py_dir()))
     shards = [files[0], files[0]] if family == "gyro" else files      # Gyro: one file, the model and its n-gram table
     pack_todo = not (pack / "native_experts.txt").exists() or not (pack / "tokenizer" / "vocab.json").exists()
     prep_lock = mac_prepare_lock(native) if repacked and (pack_todo or not (native.exists() and done(native))) else None
@@ -11078,7 +11066,7 @@ def main() -> int:
     # ---- 6. the pack and the MTP draft layer
     step(6, "preparing the model for Strata")
     pack = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
-    env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
+    env = dict(os.environ, STRATA_GGUF_PY=str(gguf_py_dir()))
     prepared = bool(ready and MODELS[model].get("prepare"))
     if prepared and not prepared_done(model, models_dir):
         say("  NVIDIA's checkpoint is turned into a Strata pack on this PC (once; 20-40 minutes, reads the 102 GB, writes about")

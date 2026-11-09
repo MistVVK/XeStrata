@@ -17,7 +17,7 @@ rem                        The release packages are built one per card family: r
 rem                        rdna2 (0.2.2, RX 6000: built, not tested on a real card) = gfx1030;gfx1031; each then goes through package_engine.py --variant <name>
 rem   STRATA_ROCM_VERSION  10.2.0a20260930        STRATA_ROCM_INDEX  https://nightly.repo.amd.com/rocm/whl-next/
 rem   ROCM_VENV            <repo>\.rocm-win       BUILD_DIR          <repo>\build-hip-win     DIST_DIR  <repo>\dist
-rem   STRATA_GGML_DIR      a llama.cpp checkout at the pinned commit (default: CMake fetches it)
+rem   STRATA_GGML_DIR      optional override (kept for two releases): a llama.cpp checkout to take ggml from; default: the vendored third_party/strata-ggml
 rem   STRATA_ROCM_KEEP      1 = use the ROCM_VENV as it is (no pip install, even when its archs differ from STRATA_HIP_ARCHS)
 rem   STRATA_VISION_HIP_ARCHS  the GPU reader's archs (default: STRATA_HIP_ARCHS; about 70 MB of the zip per arch)
 rem   STRATA_NO_VISION     1 = skip the two picture readers (strata-vision.exe for the CPU, strata-vision-hip.exe for the GPU)
@@ -90,17 +90,21 @@ rem      fallback that starts on any PC) and strata-vision-hip.exe on the GPU (R
 set "VISION_ARGS="
 if not defined STRATA_VISION_HIP_ARCHS set "STRATA_VISION_HIP_ARCHS=%STRATA_HIP_ARCHS%"
 if not "%STRATA_NO_VISION%"=="1" (
-  set "LLAMA=%STRATA_GGML_DIR%"
-  if not defined LLAMA set "LLAMA=%BUILD_DIR%\_deps\strata_llamacpp-src"
-  set "LLAMA=!LLAMA:\=/!"
-  if not exist "!LLAMA!/tools/mtmd" (echo llama.cpp with tools/mtmd not found in !LLAMA! - set STRATA_GGML_DIR & exit /b 1)
+  rem llama.cpp's sources are the vendored third_party\strata-llama (tools/vision's default); STRATA_GGML_DIR names a checkout to build from instead
+  set "VLLAMA="
+  if defined STRATA_GGML_DIR (
+    set "LLAMA=%STRATA_GGML_DIR%"
+    set "LLAMA=!LLAMA:\=/!"
+    if not exist "!LLAMA!/tools/mtmd" (echo llama.cpp with tools/mtmd not found in !LLAMA! - check STRATA_GGML_DIR & exit /b 1)
+    set VLLAMA="-DLLAMA_DIR=!LLAMA!"
+  )
   if not exist "%SRC%\build-vision-cpu-win\build.ninja" (
-    cmake -G Ninja -S "%SRC%\tools\vision" -B "%SRC%\build-vision-cpu-win" -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR="!LLAMA!" ^
+    cmake -G Ninja -S "%SRC%\tools\vision" -B "%SRC%\build-vision-cpu-win" -DCMAKE_BUILD_TYPE=Release !VLLAMA! ^
       -DSTRATA_VISION_CUDA=OFF -DSTRATA_PORTABLE=ON -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl || exit /b 1
   )
   cmake --build "%SRC%\build-vision-cpu-win" --target strata-vision || exit /b 1
   if not exist "%SRC%\build-vision-hip-win\build.ninja" (
-    cmake -G Ninja -S "%SRC%\tools\vision" -B "%SRC%\build-vision-hip-win" -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR="!LLAMA!" ^
+    cmake -G Ninja -S "%SRC%\tools\vision" -B "%SRC%\build-vision-hip-win" -DCMAKE_BUILD_TYPE=Release !VLLAMA! ^
       -DSTRATA_VISION_HIP=ON "-DSTRATA_VISION_HIP_ARCHS=%STRATA_VISION_HIP_ARCHS%" -DSTRATA_PORTABLE=ON ^
       "-DCMAKE_CXX_FLAGS=--rocm-path=%ROCM_F% --rocm-device-lib-path=%BITCODE%" ^
       "-DCMAKE_C_COMPILER=%ROCM_F%/lib/llvm/bin/clang.exe" "-DCMAKE_CXX_COMPILER=%ROCM_F%/lib/llvm/bin/clang++.exe" ^

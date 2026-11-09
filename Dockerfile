@@ -32,8 +32,7 @@ ARG CUDA_ARCHITECTURES="75;80;86;89;120"
 ARG BUILD_VISION=1
 ARG ENGINE_VERSION=
 RUN python3 -m venv /venv && /venv/bin/pip install --no-cache-dir -r requirements.txt -r requirements-build.txt
-# llama.cpp at the pinned commit (ggml for the engine, mtmd for pictures), exactly as setup.py fetches it
-RUN /venv/bin/python -c "import setup; print(setup.get_llama_cpp())"
+# ggml comes from the vendored third_party/strata-ggml and strata-vision from third_party/strata-llama (llama, mtmd, ggml at the pin): nothing is downloaded
 RUN set -e; \
     real=""; for a in $(echo "$CUDA_ARCHITECTURES" | tr ';,' '  '); do real="$real;${a}-real"; done; real=${real#;}; \
     last=$(echo "$CUDA_ARCHITECTURES" | tr ';,' '  ' | awk '{print $NF}'); \
@@ -41,10 +40,10 @@ RUN set -e; \
     /venv/bin/cmake -G Ninja -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF \
         -DSTRATA_EXPERIMENTAL_SM60=$sm60 \
         -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON \
-        "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" -DSTRATA_GGML_DIR=/src/third_party/llama.cpp; \
+        "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual"; \
     /venv/bin/cmake --build build --target strata strata_kq -j "$(nproc)"; \
     if [ "$BUILD_VISION" = "1" ]; then \
-      /venv/bin/cmake -G Ninja -S tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR=/src/third_party/llama.cpp \
+      /venv/bin/cmake -G Ninja -S tools/vision -B build-vision -DCMAKE_BUILD_TYPE=Release \
           -DSTRATA_VISION_CUDA=ON -DSTRATA_PORTABLE=ON -DGGML_CUDA_NCCL=OFF "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual"; \
       /venv/bin/cmake --build build-vision --target strata-vision -j "$(nproc)"; \
     fi
@@ -78,15 +77,9 @@ RUN python3 /src/packaging/package_terminal.py --out /out --cache /cache \
  && tar -xzf /out/strata-terminal-*-linux-x86_64.tar.gz -C /opt/strata \
  && mv /opt/strata/strata-terminal-* /opt/strata/terminal \
  && /opt/strata/terminal/bin/strata --version
-# llama.cpp at the commit setup.py pins: fetched here, so the first start does not depend on GitHub. Only gguf-py (the model preparation
-# tools) and the file setup.py looks for (ggml/CMakeLists.txt) are kept: 170 MB become a few
-RUN cd /opt/strata/terminal && STRATA_CONTROL_INSTALL=1 STRATA_INSTALL_DIR=/opt/strata/seed PYTHONNOUSERSITE=1 \
-      /opt/strata/terminal/python/bin/python3 -c "import setup; print(setup.get_llama_cpp())" \
- && rm -rf /opt/strata/seed/third_party/*.zip* \
- && cd /opt/strata/seed/third_party/llama.cpp \
- && find . -mindepth 1 -maxdepth 1 ! -name gguf-py ! -name ggml ! -name 'LICENSE*' -exec rm -rf {} + \
- && find ggml -mindepth 1 -depth ! -type d ! -name CMakeLists.txt -delete && find ggml -mindepth 1 -type d -empty -delete \
- && du -sh /opt/strata/seed
+# gguf-py (the model preparation tools) is part of the Terminal archive (third_party/strata-gguf-py), so the first start fetches nothing from
+# GitHub and the image needs no llama.cpp: check that it is there
+RUN test -f /opt/strata/terminal/third_party/strata-gguf-py/gguf/__init__.py
 
 # ---- 3. the runtime image (the same as docker/Dockerfile's, FLAVOR=cuda)
 FROM ${RUNTIME_BASE}
@@ -95,7 +88,6 @@ ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates libgomp1 libatomic1 libnuma1 zlib1g \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/*
 COPY --from=terminal /opt/strata/terminal /opt/strata/terminal
-COPY --from=terminal /opt/strata/seed /opt/strata/seed
 COPY --from=engine-build /engine/ /opt/strata/components/engine/
 COPY docker/entrypoint.sh docker/healthcheck.sh /opt/strata/
 COPY docker/strata-wrapper.sh /usr/local/bin/strata

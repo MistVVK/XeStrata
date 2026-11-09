@@ -30,8 +30,8 @@ def require_gguf_py(test):
     @classmethod
     def setUpClass(cls):
         if GGUF_PY is None:
-            raise unittest.SkipTest("llama.cpp's gguf-py not found: run setup.py (it clones llama.cpp into "
-                                    "third_party/) or set STRATA_GGUF_PY")
+            raise unittest.SkipTest("gguf-py not found: third_party/strata-gguf-py is missing from this checkout "
+                                    "(or set STRATA_GGUF_PY)")
     return setUpClass
 
 

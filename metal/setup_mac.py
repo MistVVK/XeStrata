@@ -7,7 +7,7 @@ What it does, each step skipped when it is already done:
   1. checks the Mac: Apple Silicon, the chip, unified memory, macOS version, the Command Line Tools, free disk
   2. recommends a model by memory (recommend, never force: an explicit --model is kept, with what it risks)
   3. installs the Python packages into .venv (cmake and ninja come from pip, just before step 4: no Homebrew, no sudo)
-  4. builds the Metal engine from source: metal-cpp (Apple's headers) and llama.cpp's ggml at the pinned commit
+  4. builds the Metal engine from source: metal-cpp (Apple's headers) and the vendored ggml (third_party/strata-ggml)
   5. downloads the model (setup.py's downloader: resumable, the pinned revision)
   6. prepares the model: the native pack (tools/iq_pack.py) and the MTP draft layer (tools/mtp_fetch.py, mtp_pack.py)
   7. writes strata-<model>.json and run-<model>.sh with the Metal defaults (--spec 2, the Q8_0 hyper-connection
@@ -115,9 +115,9 @@ def engine_current() -> bool:
 
 def source_digest() -> str:
     """What the engine is built from: every source file's path, size and modification time (src/, include/, metal/,
-    third_party/ggml).  A git pull, an unzipped update or a local edit changes it; nothing else does."""
+    third_party/ggml, third_party/strata-ggml).  A git pull, an unzipped update or a local edit changes it; nothing else does."""
     h = hashlib.sha256()
-    for d in ("src", "include", "metal", "third_party/ggml"):
+    for d in ("src", "include", "metal", "third_party/ggml", "third_party/strata-ggml"):
         for f in sorted((ROOT / d).rglob("*")):
             if f.is_file() and f.suffix in (".cpp", ".cu", ".h", ".hpp", ".mm", ".metal", ".inc", ".txt", ".cuh"):
                 st = f.stat()
@@ -137,7 +137,7 @@ def build_engine(llama: Path, jobs: int | None = None) -> Path:
     log = BUILD_DIR / "build.log"
     env = dict(os.environ, PATH=str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""))
     cfg = [tool("cmake"), "-S", str(ROOT / "metal"), "-B", str(BUILD_DIR), "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release",
-           f"-DCMAKE_MAKE_PROGRAM={tool('ninja')}", f"-DMETAL_CPP_DIR={mcpp}", f"-DSTRATA_GGML_DIR={llama}"]
+           f"-DCMAKE_MAKE_PROGRAM={tool('ninja')}", f"-DMETAL_CPP_DIR={mcpp}", *S.ggml_defs(llama)]
     build = [tool("ninja"), "-C", str(BUILD_DIR), "strata"] + (["-j", str(jobs)] if jobs else [])
     with open(log, "w", encoding="utf-8") as f:
         for cmd in (cfg, build):
@@ -182,7 +182,7 @@ def build_vision(llama: Path) -> Path:
     log = ROOT / "build-vision.log"
     with open(log, "w", encoding="utf-8") as f:
         for cmd in ([tool("cmake"), "-S", str(ROOT / "tools" / "vision"), "-B", str(ROOT / "build-vision"), "-G", "Ninja",
-                     "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_MAKE_PROGRAM={tool('ninja')}", f"-DLLAMA_DIR={llama}",
+                     "-DCMAKE_BUILD_TYPE=Release", f"-DCMAKE_MAKE_PROGRAM={tool('ninja')}", f"-DLLAMA_DIR={S.vision_llama(llama)}",
                      "-DSTRATA_VISION_CUDA=OFF", "-DSTRATA_VISION_METAL=ON", "-DSTRATA_PORTABLE=OFF"],
                     [tool("ninja"), "-C", str(ROOT / "build-vision"), "strata-vision"]):
             if subprocess.call(cmd, stdout=f, stderr=subprocess.STDOUT, env=env) != 0:
@@ -473,7 +473,7 @@ def main(argv=None) -> int:
 
     # ---- 4. the engine
     S.step(4, "the Strata engine (Metal)")
-    llama = S.get_llama_cpp()
+    llama = S.llama_override()                         # None: ggml is the vendored third_party/strata-ggml (STRATA_GGML_DIR overrides)
     S.ok(f"llama.cpp {S.LLAMA_CPP_COMMIT[:7]} (ggml, gguf-py)")
     if a.build:
         (BUILD_DIR / "BUILD.json").unlink(missing_ok=True)
@@ -524,7 +524,7 @@ def main(argv=None) -> int:
     # ---- 6. the pack and the MTP draft layer
     S.step(6, "preparing the model for Strata")
     pack = S.find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
-    env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
+    env = dict(os.environ, STRATA_GGUF_PY=str(S.gguf_py_dir()))
     # The repack and the pack move 100+ GB through the disk and the pack's python holds up to 20 GB: no engine may run beside
     # them (an engine of 70-90 GB with a repack froze the 128 GB M5 Max twice).  A lock beside the GPU's file tells the engine
     # and start() to wait; a running engine stops setup here.

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Linux HIP engine package for the Radeon 780M (gfx1103), built on the mini PC (P2006). Needs the source tree as $HOME/split-tq/tq3-src.tar.gz
-# (git archive), the TheRock gfx110X-all SDK at $HOME/strata-poc/rocm/install and the llama.cpp sources at $GGML; edit the paths for another box.
+# (git archive; ggml is its vendored third_party/strata-ggml) and the TheRock gfx110X-all SDK at $HOME/strata-poc/rocm/install; edit the paths for another box.
 # ROCm = TheRock gfx110X-all SDK of ~/strata-poc (as the earlier P2006 builds). Shared box lock for the build; nice.
 R=$HOME/split-tq
 S=$R/build.status
@@ -9,14 +9,13 @@ SDK=$HOME/strata-poc/rocm/install
 export ROCM_PATH=$SDK HIP_PATH=$SDK HIP_PLATFORM=amd
 export PATH=$SDK/bin:$SDK/lib/llvm/bin:$PATH
 export LD_LIBRARY_PATH=$SDK/lib:$SDK/lib/rocm_sysdeps/lib:$SDK/lib/llvm/lib:${LD_LIBRARY_PATH:-}
-GGML=$HOME/144-igpu/src-c/build/_deps/strata_llamacpp-src
 mkdir -p $R; cd $R || exit 1
 : > $S
 st "start"
 rm -rf src stage components; mkdir src; tar xzf $R/tq3-src.tar.gz -C src
 cd src
 cmake -S . -B b1103 -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_PREFILL_MMQ=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_PORTABLE=ON \
-  -DFETCHCONTENT_SOURCE_DIR_STRATA_LLAMACPP=$GGML -DCMAKE_HIP_ARCHITECTURES=gfx1103 \
+  -DCMAKE_HIP_ARCHITECTURES=gfx1103 \
   -DCMAKE_HIP_COMPILER=$SDK/lib/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROOT=$SDK \
   "-DCMAKE_PREFIX_PATH=$SDK;$SDK/lib/rocm_sysdeps;$SDK/lib/llvm" \
   "-DCMAKE_HIP_FLAGS=--rocm-path=$SDK --rocm-device-lib-path=$SDK/lib/llvm/amdgcn/bitcode" > $R/cfg.log 2>&1

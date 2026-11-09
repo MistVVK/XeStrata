@@ -7,7 +7,7 @@
 # Which counts run which model is the launcher's rule (strata_control/split_engine.py: all the experts must fit in the cards' memory), not the binary's. RUNPATH $ORIGIN: it finds the ROCm libraries the engine package bundles (libamdhip64, hipblas, rocblas and its
 # Tensile data for gfx1201) beside itself, the same set `strata` uses.
 #
-#   SRC=<checkout> B=<build dir> HP=<ROCm devel root> [LIBW=<ROCm libraries root>] [ARCHS="gfx1201;gfx1200;gfx11-generic"] GG=<llama.cpp checkout at the pinned commit> [CARDS="2 3 4"] [JOBS=12]  packaging/build_split_hip.sh
+#   SRC=<checkout> B=<build dir> HP=<ROCm devel root> [LIBW=<ROCm libraries root>] [ARCHS="gfx1201;gfx1200;gfx11-generic"] [GG=<llama.cpp checkout, an override>] [CARDS="2 3 4"] [JOBS=12]  packaging/build_split_hip.sh
 #
 # After the build the script FAILS if the binary
 #   - links librccl (RCCL is loaded at run time with dlopen when FNX_PF_RCCL=1 and is optional: the split must start without it),
@@ -19,7 +19,8 @@ SRC=${SRC:-$(cd "$(dirname "$0")/.." && pwd)}
 B=${B:?B=<build dir>}
 HP=${HP:?HP=<ROCm devel root>}
 LIBW=${LIBW:-$HP}
-GG=${GG:?GG=<llama.cpp checkout at the pinned commit>}
+GG=${GG:-}      # optional override (kept for two releases): a llama.cpp checkout to take ggml from; empty: the vendored third_party/strata-ggml
+ggml=""; [ -z "$GG" ] || ggml="-DSTRATA_GGML_DIR=$GG"
 CARDS=${CARDS:-2 3 4}
 JOBS=${JOBS:-12}
 ARCHS=${ARCHS:-gfx1201;gfx1200;gfx11-generic}
@@ -28,7 +29,7 @@ SYSDEPS=""; [ -d "$HP/lib/rocm_sysdeps" ] && SYSDEPS=";$HP/lib/rocm_sysdeps"
 BC=$HP/lib/llvm/amdgcn/bitcode; [ -d "$BC" ] || BC=$HP/amdgcn/bitcode
 rm -f "$B/CMakeCache.txt"
 cmake -G Ninja -S "$SRC" -B "$B" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_BUILD_TESTS=OFF -DSTRATA_BUILD_SPLIT=ON \
-  "-DSTRATA_SPLIT_CARDS=${CARDS// /;}" "-DCMAKE_HIP_ARCHITECTURES=gfx1201" "-DSTRATA_SPLIT_HIP_ARCHS=$ARCHS" -DSTRATA_PREFILL_MMQ=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_GGML_DIR="$GG" \
+  "-DSTRATA_SPLIT_CARDS=${CARDS// /;}" "-DCMAKE_HIP_ARCHITECTURES=gfx1201" "-DSTRATA_SPLIT_HIP_ARCHS=$ARCHS" -DSTRATA_PREFILL_MMQ=ON -DSTRATA_NATIVE_EXPERTS=ON $ggml \
   -DCMAKE_HIP_COMPILER="$HP/llvm/bin/clang++" -DCMAKE_HIP_COMPILER_ROCM_ROOT="$HP" "-DCMAKE_PREFIX_PATH=$HP;$LIBW$SYSDEPS" \
   "-DCMAKE_HIP_FLAGS=--rocm-path=$HP --rocm-device-lib-path=$BC" -DSTRATA_PORTABLE=ON \
   "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath,'\$ORIGIN' -Wl,--enable-new-dtags"
