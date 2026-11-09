@@ -612,6 +612,9 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   A started reply ends as `"length"`, and a second hit on the retry returns an error. `STRATA_NAN_GUARD=0` turns the check off;
   `STRATA_NAN_INJECT=<n>[,<n>...]` flags the n-th checked window to test the path. The one-shot command line and the
   Intel (SYCL) port do not check.
+  The Apple Metal port has no device kernel for it; after each head window it scans the window's logits rows in
+  unified memory from the host (`metal_scan_rows` in `src/core/verify.cpp`) and records the same fact. On an M1 Max
+  the scan costs about 60 microseconds a decode window, 0.2% of the window.
 
 ### Context and limits
 

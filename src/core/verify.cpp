@@ -98,6 +98,7 @@ bool window_run(void* w, int T, const int32_t* tokens, int64_t pos0, bool head, 
 bool window_commit(void* w, int n_keep, std::string& err);
 bool window_copy_logits(void* w, int t, float* host);
 void window_set_sampling(void* w, const strata::kernels::SamplerParams* sp, const int32_t* hist, int hist_len);
+const float* window_logits(void* w, int t);   // row t of the last window's head logits, null past its rows (#879)
 bool window_sample_slot_row(void* w, int row, const strata::kernels::SamplerParams& sp, const int32_t* hist, int hist_len, int32_t* tok, std::string& err);
 bool window_init_slots(void* w, const std::vector<strata::core::SessionState*>& slots, std::string& err);
 bool window_run_slots(void* w, const int* rows, int S, const int32_t* tokens, const int64_t* pos, int32_t* out, std::string& err);
@@ -3238,6 +3239,39 @@ bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string
     return true;
 }
 
+#if defined(STRATA_GPU_METAL)
+// #879's device row check on the Metal port: CUDA scans every head window's logits rows in the graph
+// (logits_nonfinite_rows); the port has no such kernel, and its samplers answer the CUDA final reduction's own
+// rule for a row with no finite candidate (token 0, sampler.cu's "the serial version answered 0"), so the pick
+// cannot carry the fact.  The rows stand in unified memory after the window (window_logits): read the same fact
+// from the host before the serve loop emits anything.  The test is the CUDA kernel's, bit for bit: a value whose
+// exponent is all ones (NaN, +inf, -inf) marks the row.
+static uint32_t metal_scan_rows(void* metal, int T, int64_t n_vocab) {
+    uint32_t mask = 0;
+    const int lim = T < (int) strata::kernels::kVerifyMaxT ? T : (int) strata::kernels::kVerifyMaxT;
+    for (int t = 0; t < lim; ++t) {
+        const float* row = strata::metal_engine::window_logits(metal, t);
+        if (row == nullptr) continue;   // (a window without a head for that row checks nothing)
+        for (int64_t i = 0; i < n_vocab; ++i) {
+            uint32_t u;
+            std::memcpy(&u, &row[i], 4);
+            if ((u & 0x7f800000u) == 0x7f800000u) { mask |= 1u << t; break; }
+        }
+    }
+    return mask;
+}
+// fold a scan's rows into the note_nonfinite fact (the first flagged row wins, as the CUDA mask reads it)
+static inline void metal_fold_nf(uint32_t nf_mask, uint32_t scan, int T, const int64_t* pos_b, int64_t pos0,
+                                 uint32_t& mask_out, int& row_out, int64_t& pos_out) {
+    if (scan == 0) return;
+    mask_out |= scan;
+    row_out = -1;
+    for (int t = 0; t < T && row_out < 0; ++t)
+        if ((mask_out >> t) & 1u) row_out = t;
+    if (row_out >= 0) pos_out = pos_b != nullptr ? pos_b[row_out] : pos0 + row_out;
+}
+#endif
+
 bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err) {
     const bool measure = spec_measure_;
@@ -3268,7 +3302,17 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             strata::metal_engine::window_set_sampling(metal_, nullptr, nullptr, 0);
         }
     }
-    return strata::metal_engine::window_run(metal_, T, tokens, pos0, head_sampling_, out, err);
+    if (!strata::metal_engine::window_run(metal_, T, tokens, pos0, head_sampling_, out, err)) return false;
+    // #879 on Metal: the CUDA path records the fact with its device row check inside run(); this branch returned
+    // before note_nonfinite, so a window whose logits had gone non-finite streamed the sampler's token-0 "no
+    // candidate" answer forever.  The port has no device kernel; the head rows stand in unified memory after the
+    // window and carry the same fact (metal_scan_rows, the CUDA kernel's bit test).  note_nonfinite resets and
+    // honours the guard switch; the fold adds the scan's rows after it.
+    note_nonfinite(T, nullptr);
+    last_pos0_ = pos0;
+    const uint32_t nf_scan = nan_guard_on() && last_stage() ? metal_scan_rows(metal_, T, n_vocab_) : 0u;
+    metal_fold_nf(nf_mask_, nf_scan, T, nullptr, pos0, nf_mask_, nf_row_, nf_pos_);
+    return true;
 #endif
     using namespace strata::kernels;
     const OnDevice on_device(device_);
@@ -4721,6 +4765,11 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             if (!strata::metal_engine::window_sample_slot_row(metal_, t, sp, hist, hlen, &out[t], err)) return false;
         }
     }
+    // #879 on batch slots (Metal): the CUDA path records the row check after the run; the scan here is the same
+    // fact, and nonfinite_in(t) is what the batch serve loop already consults per row.
+    note_nonfinite(S, last_pos_b_);
+    const uint32_t nf_scan = nan_guard_on() && last_stage() ? metal_scan_rows(metal_, S, n_vocab_) : 0u;
+    metal_fold_nf(nf_mask_, nf_scan, S, last_pos_b_, 0, nf_mask_, nf_row_, nf_pos_);
     return true;
 #endif
     using namespace strata::kernels;
