@@ -12,6 +12,7 @@
 // The state is left as the windows leave it: the GDN recurrent state and conv history (the same layouts), the K/V
 // cells of the chunk's positions.  The decode then continues at the next position.
 #include "strata/core/plain_model.hpp"
+#include "strata/core/plain_cpu.hpp"
 #include "strata/core/expert_tier.hpp"
 
 #include "strata/core/gpu.hpp"
@@ -1352,6 +1353,19 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     err = std::string("plain prompt: the encoder's rows: ") + strata::gpu::last_error();
                     return false;
                 }
+            } else if (cpu_tail_ != nullptr) {   // --gpu-layers: the CPU's blocks over the chunk's rows, the head here
+                if (!strata::gpu::copy_async(hand_host_, P.x, (size_t) (T * N) * 4, cs) || !strata::gpu::stream_sync(cs)) {
+                    err = std::string("plain prompt: the rows to the CPU: ") + strata::gpu::last_error();
+                    return false;
+                }
+                if (!cpu_tail_->run_blocks(hand_host_, T, p0, err)) return false;
+                if (c0 + T >= n) {   // the last row back, for the logits
+                    if (!strata::gpu::copy_async(P.x + (T - 1) * N, hand_host_ + (T - 1) * N, (size_t) N * 4, cs)) {
+                        err = std::string("plain prompt: the rows from the CPU: ") + strata::gpu::last_error();
+                        return false;
+                    }
+                    last_logits();
+                }
             } else if (!last()) {   // the rows to the next stage
                 if (!strata::gpu::copy_async(hand, P.x, (size_t) (T * N) * 4, cs)) {
                     err = std::string("plain prompt: the rows to the next GPU: ") + strata::gpu::last_error();
@@ -1391,7 +1405,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     if (profile)
         std::fprintf(stderr, "xestrata plain: prompt experts not in VRAM %lld, of them on the CPU %lld (%lld rows)\n",
                      (long long) miss_n, (long long) cpu_n, (long long) cpu_rows);
-    if (!last()) return true;
+    if (!last() && cpu_tail_ == nullptr) return true;
     *out = ((volatile int32_t*) h_out_)[0];
     if (logits != nullptr && !strata::gpu::copy(logits, logits_, (size_t) n_vocab_ * 4)) {
         err = "plain prompt: reading the logits failed";

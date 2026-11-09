@@ -100,6 +100,10 @@ struct PlainOptions {
     /// pool's threads (0: every hardware thread)
     bool cpu = false;
     int cpu_threads = 0;
+    /// --gpu-layers N (the dense models: qwen35, plamo3): the first N blocks and the head on the GPU, the other blocks
+    /// on the CPU (PlainCpu, their K/V and states in the RAM), the rows handed between them each window and prompt
+    /// chunk; N >= the blocks: every one on the GPU; 0: the CPU alone (as --device cpu); -1: not given
+    int64_t gpu_layers = -1;
     /// --batch N (--serve): conversations decoded together, one row each in a window (plain_serve's batch slots), each
     /// slot its own copy of the per-sequence state; at most max_t, as many as take half the VRAM free before the
     /// expert tier at most.  Not GLM-5.3-Flash's nor with --vision (one table of rotary positions) for now.
@@ -901,6 +905,13 @@ private:
     std::unique_ptr<GgufModel> model_;
     // --device cpu: the forward, and the picks' constraints on the host (set_logit_bias, set_allowed, set_history)
     std::unique_ptr<PlainCpu> cpu_;
+    /// --gpu-layers not given, a dense model on one GPU: the blocks its free VRAM holds after the head, their K/V and a
+    /// reserve (opt_.gpu_layers set: all of them, N, or 0 for the CPU alone)
+    bool auto_gpu_layers(std::string& err);
+    /// --gpu-layers: the blocks after this GPU's on the CPU (null: none); the head stays here
+    std::unique_ptr<PlainCpu> cpu_tail_;
+    /// the CPU's blocks over the T rows the GPU's handed on (mapped), then the final norm and the head here
+    bool tail_and_head(int T, int64_t pos, std::string& err);
     std::vector<float> cpu_bias_, cpu_logits_;
     std::vector<uint32_t> cpu_allowed_;
     std::vector<int32_t> cpu_hist_;

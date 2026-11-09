@@ -164,6 +164,7 @@ struct PlainCpu::Impl {
     void block_attn(Layer& L, int T, int64_t pos);
     void ffn(Layer& L, int T);
     void run_chunk(const int32_t* tokens, int T, int64_t pos);
+    void blocks(int T, int64_t pos);
 };
 
 bool PlainCpu::Impl::vec(const std::string& name, uint64_t n, std::vector<float>& out, std::string& err) const {
@@ -270,7 +271,14 @@ void PlainCpu::Impl::linear(const Mat& w, const float* xin, size_t ldx, int n, f
 PlainCpu::PlainCpu() = default;
 PlainCpu::~PlainCpu() = default;
 
-bool PlainCpu::load(const GgufModel& m, const ModelSpec& s, const PlainOptions& opt, std::string& err) {
+bool PlainCpu::load(const GgufModel& m, const ModelSpec& s, const PlainOptions& opt, std::string& err, int64_t l0,
+                    int64_t l1) {
+    if (l1 < 0) l1 = s.n_layer;
+    const bool ends = l0 == 0 && l1 == s.n_layer;   // the embedding and the head too (else the GPU's)
+    if (l0 < 0 || l1 > s.n_layer || l0 >= l1) {
+        err = "plain cpu: no blocks to run";
+        return false;
+    }
     p_ = std::make_unique<Impl>();
     Impl& P = *p_;
     P.s = s;
@@ -313,7 +321,7 @@ bool PlainCpu::load(const GgufModel& m, const ModelSpec& s, const PlainOptions& 
     const char* pr = strata::env_get("CPU_PROFILE");
     P.profile = pr != nullptr && pr[0] != 0 && pr[0] != '0';
     // the embedding: rows read from the file as they are needed
-    {
+    if (ends) {
         size_t at = 0;
         const TensorInfo* t = m.find("token_embd.weight", &at);
         if (t == nullptr || t->shape.size() != 2 || (int64_t) t->shape[0] != P.N || !m.in_bounds(*t, at)) {
@@ -330,16 +338,17 @@ bool PlainCpu::load(const GgufModel& m, const ModelSpec& s, const PlainOptions& 
         }
     }
     const char* head = m.find("output.weight") != nullptr ? "output.weight" : "token_embd.weight";
-    if (!P.vec("output_norm.weight", (uint64_t) P.N, P.out_norm, err) || !P.mat({head}, P.head, P.N, err))
+    if (ends && (!P.vec("output_norm.weight", (uint64_t) P.N, P.out_norm, err) || !P.mat({head}, P.head, P.N, err)))
         return false;
-    if (P.head.q.n_out != n_vocab_) {
+    if (ends && P.head.q.n_out != n_vocab_) {
         err = std::string("plain cpu: ") + head + "'s shape";
         return false;
     }
-    P.layers.resize((size_t) s.n_layer);
+    // blocks [l0, l1): every block, or (a GPU's tail) the ones its VRAM does not hold
+    P.layers.resize((size_t) (l1 - l0));
     int64_t n_gdn = 0, n_attn = 0;
-    for (int64_t l = 0; l < s.n_layer; ++l) {
-        Layer& L = P.layers[(size_t) l];
+    for (int64_t l = l0; l < l1; ++l) {
+        Layer& L = P.layers[(size_t) (l - l0)];
         const std::string p = "blk." + std::to_string(l) + ".";
         L.rec = s.recurrent[(size_t) l];
         L.swa = s.layer_swa(l);
@@ -395,8 +404,8 @@ bool PlainCpu::load(const GgufModel& m, const ModelSpec& s, const PlainOptions& 
     // the decode from the GGUF's rows where the RAM holds them beside the int8 copy: the free RAM and the file cache
     // (the packing just read the file through it) against the rows' bytes and a reserve for everything else
     {
-        uint64_t file = P.head.file_bytes();
-        bool all = P.head.native;
+        uint64_t file = ends ? P.head.file_bytes() : 0;
+        bool all = !ends || P.head.native;
         for (const Layer& L : P.layers)
             for (const Mat* w : {&L.in, &L.out, &L.gu, &L.down}) {
                 file += w->file_bytes();
@@ -681,10 +690,15 @@ void PlainCpu::Impl::ffn(Layer& L, int T) {
 
 void PlainCpu::Impl::run_chunk(const int32_t* tokens, int T, int64_t pos) {
     x.resize((size_t) T * N);
-    hn.resize((size_t) T * N);
     pool->run(T, [&](int t) {
         kc::native_row_to_float(emb_type, emb + (size_t) tokens[t] * emb_row, x.data() + (size_t) t * N, N);
     });
+    blocks(T, pos);
+}
+
+// the blocks over the T rows in x
+void PlainCpu::Impl::blocks(int T, int64_t pos) {
+    hn.resize((size_t) T * N);
     auto norm = [&](const std::vector<float>& w) {
         const int per = std::max(1, (T + pool->size() - 1) / pool->size());
         pool->run((T + per - 1) / per, [&](int i) {
@@ -715,6 +729,22 @@ void PlainCpu::Impl::run_chunk(const int32_t* tokens, int T, int64_t pos) {
         ffn(L, T);
         add(L.ffn_post);
     }
+}
+
+bool PlainCpu::run_blocks(float* x, int64_t n, int64_t pos, std::string& err) {
+    Impl& P = *p_;
+    if (n <= 0 || pos < 0 || pos + n > P.max_cells) {
+        err = "plain cpu: the rows are past the context (" + std::to_string(P.max_cells) + " cells)";
+        return false;
+    }
+    for (int64_t done = 0; done < n;) {
+        const int T = (int) std::min<int64_t>(P.chunk, n - done);
+        P.x.assign(x + (size_t) (done * P.N), x + (size_t) ((done + T) * P.N));
+        P.blocks(T, pos + done);
+        std::memcpy(x + (size_t) (done * P.N), P.x.data(), (size_t) (T * P.N) * 4);
+        done += T;
+    }
+    return true;
 }
 
 bool PlainCpu::run(const int32_t* tokens, int64_t n, int64_t pos, int rows, float* logits, std::string& err) {

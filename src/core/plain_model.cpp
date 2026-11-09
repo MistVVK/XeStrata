@@ -62,6 +62,7 @@
 #include "strata/platform/env.hpp"
 
 #include <algorithm>
+#include <numeric>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -455,6 +456,32 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     lb_ = 0;
     le_ = at.empty() ? nl : at[0];
     dev_ = at.empty() ? -1 : split_devs_[0];
+    // --gpu-layers: a dense model's blocks after the first N on the CPU (their weights in the RAM, read from the GGUF
+    // and packed as --device cpu's), the head on the GPU; not given, from the free VRAM
+    if (opt_.gpu_layers < 0 && spec_.dense() && at.empty() && !opt_.split_auto && opt_.batch_slots == 0 &&
+        !opt_.encoder && !opt_.vision && k::cpu::cpu_avx2_ok() && !auto_gpu_layers(err))
+        return false;
+    if (opt_.gpu_layers >= 0 && opt_.gpu_layers < nl) {
+        if (!spec_.dense() || !at.empty() || opt_.split_auto || opt_.batch_slots > 0 || opt_.encoder || opt_.vision) {
+            err = "plain model: --gpu-layers splits a dense model (qwen35, plamo3) between one GPU and the CPU, with no "
+                  "layer split, --batch, pictures or encoder";
+            return false;
+        }
+        if (opt_.gpu_layers == 0) {
+            opt_.cpu = true;
+            return cpu_load(err);
+        }
+        if (!k::cpu::cpu_avx2_ok()) {
+            err = "plain model: --gpu-layers puts blocks on the CPU, which needs AVX2";
+            return false;
+        }
+        le_ = opt_.gpu_layers;
+        opt_.spec = 0;   // the MTP layer reads the last block's rows on the GPU: not with a CPU tail
+        cpu_tail_ = std::make_unique<PlainCpu>();
+        if (!cpu_tail_->load(*model_, spec_, opt_, err, le_, nl)) return false;
+        std::fprintf(stderr, "xestrata plain: blocks %lld .. %lld on the CPU (%s), the first %lld and the head on the GPU\n",
+                     (long long) le_, (long long) (nl - 1), cpu_tail_->describe().c_str(), (long long) le_);
+    }
     // --expert-cache-device1..3: the first GPUs no stage runs on, their contexts made before the experts' RAM copy is
     // registered with any GPU (RemoteExperts::preflight, as generate.cpp's)
     if (opt_.expert_cache_remote_placement != "stripe" && opt_.expert_cache_remote_placement != "layer") {
@@ -537,6 +564,52 @@ bool PlainModel::load_arch(std::string& err) {
 // Flash on a B70 and an RTX 4070 behind the chipset (Gen4 x4, 4.3x slower): a 4K prompt 100 tok/s with the 4070's
 // share by memory (11 layers), 149 with the 2 layers and the MTP layer it holds whole, 165 on the B70 alone; the
 // decode 12.0, 11.3 and 10.8 tok/s (2026-10-20).
+bool PlainModel::auto_gpu_layers(std::string& err) {
+    const ModelSpec& s = spec_;
+    const int64_t nl = s.n_layer;
+    size_t f = 0, t = 0;
+    {
+        const OnDevice on(dev_);
+        if (!strata::gpu::mem_info(&f, &t)) { err = "plain model: the device's memory is unknown"; return false; }
+    }
+    const uint64_t free_b = counted_free(f, f, opt_.vram_free_mib);   // (mem_info applies XESTRATA_VRAM_LIMIT_MIB)
+    // each block's weights; the head and the final norm; a block's K/V (a sliding-window layer's ring: the window and
+    // a prompt chunk) or recurrent state
+    std::vector<uint64_t> block((size_t) nl, 0);
+    uint64_t head = 0;
+    for (size_t i = 0; i < model_->size(); ++i)
+        for (const TensorInfo& ti : model_->shard(i).tensors()) {
+            const uint64_t b = tensor_payload_bytes(ti);
+            if (ti.name.rfind("blk.", 0) == 0) {
+                const int64_t l = std::strtoll(ti.name.c_str() + 4, nullptr, 10);
+                if (l >= 0 && l < nl) block[(size_t) l] += b;
+            } else if (ti.name == head_name() || ti.name == "output_norm.weight") {
+                head += b;
+            }
+        }
+    const int64_t nkv = std::max<int64_t>(1, s.n_head_kv.empty() ? 1 : *std::max_element(s.n_head_kv.begin(), s.n_head_kv.end()));
+    const int64_t chunk = std::max<int64_t>(opt_.prompt_chunk, opt_.max_t);
+    for (int64_t l = 0; l < nl; ++l) {
+        const int64_t cells = s.layer_swa(l) ? std::min<int64_t>(opt_.max_cells, s.swa_window + chunk) : opt_.max_cells;
+        block[(size_t) l] += s.recurrent[(size_t) l]
+                                 ? (uint64_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state + (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner) * 3) * 4
+                                 : (uint64_t) (cells * nkv * s.key_length) * 2 * (opt_.kv_int8 ? 1 : 2);
+    }
+    // the window's and the prompt's buffers and the driver's share: the layer split's reserve (split_auto_points)
+    const uint64_t reserve = opt_.reserve_mib >= 0 ? (uint64_t) opt_.reserve_mib << 20
+                             : std::clamp<uint64_t>((uint64_t) t / 32, 192ull << 20, 768ull << 20) + (1ull << 30);
+    uint64_t used = head + reserve;
+    int64_t fit = 0;
+    while (fit < nl && used + block[(size_t) fit] <= free_b) used += block[(size_t) fit++];
+    if (fit == nl) return true;   // every block on the GPU (gpu_layers stays -1)
+    opt_.gpu_layers = head + reserve > free_b ? 0 : fit;   // below the head and the reserve: the CPU alone
+    std::fprintf(stderr, "xestrata plain: %.2f GiB of VRAM free, the head and a reserve %.2f GiB, the blocks %.2f GiB: %s\n",
+                 free_b / 1073741824.0, (head + reserve) / 1073741824.0,
+                 std::accumulate(block.begin(), block.end(), uint64_t{0}) / 1073741824.0,
+                 opt_.gpu_layers == 0 ? "the CPU alone" : ("the first " + std::to_string(fit) + " blocks on the GPU").c_str());
+    return true;
+}
+
 bool PlainModel::split_auto_points(std::string& err) {
     opt_.split_at.clear();
     const int n = (int) split_devs_.size();
@@ -702,7 +775,7 @@ bool PlainModel::load_qwen(std::string& err) {
 
     const GgufModel& m = *model_;
     if (!load_embedding(err)) return false;
-    if (last()) {   // the head: the last stage's (an encoder's states end at the final norm: no head)
+    if (last() || cpu_tail_ != nullptr) {   // the head: the last stage's (an encoder's: none; a CPU tail's: here)
         if ((!opt_.encoder && !upload(m, head_name(), head_, err)) ||
             !upload_f32(m, "output_norm.weight", (uint64_t) s.n_embd, out_norm_, err))
             return false;
@@ -2525,6 +2598,7 @@ size_t PlainModel::state_bytes(int64_t tokens) const {
     size_t n = 0;
     for (const StatePart& p : state_parts(tokens)) n += p.bytes;
     for (const auto& st : next_) n += st->state_bytes(tokens);
+    if (cpu_tail_ != nullptr) n += cpu_tail_->state_bytes(tokens, true);
     return n;
 }
 
@@ -2537,7 +2611,7 @@ static void cpu_snapshot(const PlainCpu& c, int64_t tokens, bool kv, PlainModel:
 }
 
 bool PlainModel::recurrent() const {
-    if (cpu_ != nullptr) return true;
+    if (cpu_ != nullptr || (cpu_tail_ != nullptr && cpu_tail_->recurrent())) return true;
     for (const PlainModel* st : const_cast<PlainModel*>(this)->chain())
         if (!st->gdn_state_.empty() || st->ring_pages_ > 0) return true;
     return false;
@@ -2545,6 +2619,7 @@ bool PlainModel::recurrent() const {
 
 bool PlainModel::can_rewind(int64_t to, int64_t end) const {
     if (cpu_ != nullptr) return !cpu_->recurrent() && to >= 0;   // its K/V keeps every cell
+    if (cpu_tail_ != nullptr && cpu_tail_->recurrent()) return false;
     for (const PlainModel* st : const_cast<PlainModel*>(this)->chain()) {
         if (!st->gdn_state_.empty()) return false;
         if (st->ring_pages_ == 0) continue;
@@ -2561,6 +2636,20 @@ void PlainModel::ring_advance(int64_t pos, int64_t n) {
     ring_end_ = pos + n;
     // the cells written over: those a ring's length before the last written
     ring_from_ = std::max(ring_from_, ring_end_ - ring_pages_ * attn_shapes().page_size);
+}
+
+bool PlainModel::tail_and_head(int T, int64_t pos, std::string& err) {
+    if (!strata::gpu::stream_sync(cs_)) {
+        err = std::string("plain model: the window: ") + strata::gpu::last_error();
+        return false;
+    }
+    if (!cpu_tail_->run_blocks(h_hand_, T, pos, err)) return false;
+    const int64_t N = spec_.n_embd;
+    k::copy_from_mapped(x_, m_hand_, (int64_t) T * N, cs_);
+    k::native_qsa_rms_norm_weighted(x_, out_norm_, hn_, (int) N, T, (float) spec_.rms_eps, cs_);
+    head_logits(hn_, T, cs_);
+    pick(logits_, T, pos, m_out_, cs_);
+    return true;
 }
 
 bool PlainModel::save_state(int64_t tokens, Snapshot& snap, std::string& err) {
@@ -2707,13 +2796,25 @@ bool PlainModel::save_parts(int64_t tokens, bool recurrent_only, Snapshot& snap,
             }
         }
     }
+    if (cpu_tail_ != nullptr) {   // the CPU's blocks after the GPU's (their K/V cells but for a checkpoint: the RAM
+                                  // keeps every one)
+        cpu_tail_->save(tokens, !recurrent_only, snap.parts);
+        snap.typesize.resize(snap.parts.size(), 4);
+    }
     return true;
 }
 
 bool PlainModel::restore_parts(const Snapshot& snap, bool recurrent_only, std::string& err) {
     size_t i = 0, n = 0;
     for (PlainModel* st : chain()) n += st->state_parts(snap.tokens, recurrent_only).size();
-    if (n != snap.parts.size()) { err = "plain model: a state of another model"; return false; }
+    if (cpu_tail_ != nullptr) {   // the CPU's blocks' parts after the GPUs'
+        if (n > snap.parts.size()) { err = "plain model: a state of another model"; return false; }
+        const std::vector<std::vector<uint8_t>> rest(snap.parts.begin() + (std::ptrdiff_t) n, snap.parts.end());
+        if (!cpu_tail_->restore(rest, !recurrent_only, err)) return false;
+    } else if (n != snap.parts.size()) {
+        err = "plain model: a state of another model";
+        return false;
+    }
     for (PlainModel* st : chain())
         for (const StatePart& p : st->state_parts(snap.tokens, recurrent_only))
             if (p.bytes != snap.parts[i++].size()) { err = "plain model: a state of another shape"; return false; }
@@ -2752,6 +2853,7 @@ bool PlainModel::reset(std::string& err) {
         if (!st->reset(err)) return false;
     }
     if (glm_) return reset_glm5(err);
+    if (cpu_tail_ != nullptr) cpu_tail_->reset();
     bool ok = true;
     for (float* p : gdn_state_) ok = ok && (p == nullptr || strata::gpu::memset(p, 0, state_bytes_));
     for (float* p : gdn_conv_) ok = ok && (p == nullptr || strata::gpu::memset(p, 0, conv_bytes_));
@@ -3340,6 +3442,7 @@ bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const 
     if (!(eager ? run_window(T, false, err)
                 : launch_serve(exec_[(size_t) T], segs_[(size_t) T], moe_trunk_, moe_local_.data(), T, err)))
         return false;
+    if (cpu_tail_ != nullptr && !tail_and_head(T, pos, err)) return false;
     if (last()) pick(logits_, T, pos, m_out_, cs_);
     if (!strata::gpu::stream_sync(cs_)) {
         err = std::string("plain model: the window: ") + strata::gpu::last_error();

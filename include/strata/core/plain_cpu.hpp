@@ -33,7 +33,10 @@ public:
     PlainCpu& operator=(const PlainCpu&) = delete;
 
     /// Packs the model's matrices.  The caller has checked that the CPU runs AVX2 (this file is compiled for it).
-    bool load(const GgufModel& m, const ModelSpec& s, const PlainOptions& opt, std::string& err);
+    /// Blocks [l0, l1) only (l1 < 0: to the last) for a GPU's tail (PlainModel's --gpu-layers): no embedding, no head,
+    /// the rows taken from the GPU's blocks by run_blocks.
+    bool load(const GgufModel& m, const ModelSpec& s, const PlainOptions& opt, std::string& err, int64_t l0 = 0,
+              int64_t l1 = -1);
     int64_t vocab() const { return n_vocab_; }
     /// The pool's threads and the int8 product's kernel, for the start log.
     std::string describe() const;
@@ -44,6 +47,8 @@ public:
     /// Tokens [0, n) at positions pos .. pos + n - 1 (following the previous run's), in chunks; `logits` gets the last
     /// `rows` tokens' rows (rows <= n), n_vocab floats each.
     bool run(const int32_t* tokens, int64_t n, int64_t pos, int rows, float* logits, std::string& err);
+    /// A tail's blocks over n rows of n_embd floats `x` (in place), at positions pos .. pos + n - 1, in chunks.
+    bool run_blocks(float* x, int64_t n, int64_t pos, std::string& err);
     /// The state of the first `tokens` tokens as host parts (every recurrent layer's state and convolution history;
     /// with `kv`, every attention layer's K and V cells too), and back.
     void save(int64_t tokens, bool kv, std::vector<std::vector<uint8_t>>& parts) const;

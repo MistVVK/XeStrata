@@ -2238,6 +2238,7 @@ static void plain_usage(const std::string& arch) {
                  "  --device cpu|gpu     where the forward runs (default gpu; the dense Qwen3.5 models, qwen35, run on\n"
                  "                       the CPU as well, and take it when no GPU is there)\n"
                  "  --cpu-threads N      --device cpu: the threads the forward takes (default every hardware thread)\n"
+                 "  --gpu-layers N       dense models: the first N blocks and the head on the GPU, the rest on the CPU\n"
                  "  --layer-split K[,K2..]|auto  the blocks across the GPUs: the first runs the blocks before K, the\n"
                  "                       next those from K on, ..; auto: in proportion to each GPU's free memory\n"
                  "  --split-device D[,D2..]  the later GPUs (engine numbers or PCI addresses; default the other cards)\n",
@@ -2338,6 +2339,7 @@ int plain_main(int argc, char** argv) {
             device_given = true;
         }
         else if (a == "--cpu-threads") opt.cpu_threads = std::max(0, (int) std::strtol(next("--cpu-threads"), nullptr, 10));
+        else if (a == "--gpu-layers") opt.gpu_layers = std::max<int64_t>(0, std::strtoll(next("--gpu-layers"), nullptr, 10));
         else if (a == "--greedy") sp.greedy = true;
         else if (a == "--stop-eos") stop_eos = true;
         else if (a == "--eos-ids") {
