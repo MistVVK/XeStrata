@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <cfloat>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -156,15 +158,18 @@ __global__ void k_qkv_rope(const float* __restrict__ y, const float* __restrict_
 // In place: a row of n F16 scores (the scale is already in q) becomes the row of probabilities, F16.  One block (256 threads) per row; the row is held in
 // registers (at most 256 * kSoftmaxPer = 16,384 scores), read once and written once.
 constexpr int kSoftmaxThreads = 256, kSoftmaxPer = 64;
-__global__ void __launch_bounds__(kSoftmaxThreads) k_softmax_rows(uint16_t* __restrict__ S, int n) {
-    uint16_t* s = S + (size_t) blockIdx.x * n;
+// T threads and PER scores per thread (T * PER >= n): a short row (a small picture) gets a small block and a short loop, as the long loop with its
+// predicated steps cost a 93-token picture 9 of its 26 ms
+template <int T, int PER>
+__global__ void __launch_bounds__(T) k_softmax_rows(uint16_t* __restrict__ S, int n, int ld) {
+    uint16_t* s = S + (size_t) blockIdx.x * ld;
     __shared__ float red[32];
     const int lane = threadIdx.x % warpSize, wid = threadIdx.x / warpSize, nw = (blockDim.x + warpSize - 1) / warpSize;
-    float v[kSoftmaxPer];
+    float v[PER];
     float m = -FLT_MAX;
 #pragma unroll
-    for (int k = 0; k < kSoftmaxPer; ++k) {
-        const int j = threadIdx.x + k * kSoftmaxThreads;
+    for (int k = 0; k < PER; ++k) {
+        const int j = threadIdx.x + k * T;
         v[k] = j < n ? __half2float(__ushort_as_half(s[j])) : -FLT_MAX;
         m = fmaxf(m, v[k]);
     }
@@ -176,8 +181,8 @@ __global__ void __launch_bounds__(kSoftmaxThreads) k_softmax_rows(uint16_t* __re
     __syncthreads();
     float sum = 0.0f;
 #pragma unroll
-    for (int k = 0; k < kSoftmaxPer; ++k) {
-        const int j = threadIdx.x + k * kSoftmaxThreads;
+    for (int k = 0; k < PER; ++k) {
+        const int j = threadIdx.x + k * T;
         v[k] = j < n ? expf(v[k] - m) : 0.0f;
         sum += v[k];
     }
@@ -188,15 +193,24 @@ __global__ void __launch_bounds__(kSoftmaxThreads) k_softmax_rows(uint16_t* __re
     for (int o = warpSize / 2; o > 0; o >>= 1) sum += VIT_SHFL_XOR(sum, o);
     const float inv = 1.0f / sum;
 #pragma unroll
-    for (int k = 0; k < kSoftmaxPer; ++k) {
-        const int j = threadIdx.x + k * kSoftmaxThreads;
+    for (int k = 0; k < PER; ++k) {
+        const int j = threadIdx.x + k * T;
         if (j < n) s[j] = f_to_f16bits(v[k] * inv);
     }
 }
 
+// launches the short-row kernel with the smallest block and loop that hold n scores (n <= 256 * 64)
+static void softmax_rows(uint16_t* S, int n, int ld, int rows) {
+    if (n <= 128) k_softmax_rows<64, 2><<<rows, 64>>>(S, n, ld);
+    else if (n <= 512) k_softmax_rows<64, 8><<<rows, 64>>>(S, n, ld);
+    else if (n <= 1024) k_softmax_rows<128, 8><<<rows, 128>>>(S, n, ld);
+    else if (n <= 4096) k_softmax_rows<256, 16><<<rows, 256>>>(S, n, ld);
+    else k_softmax_rows<256, 64><<<rows, 256>>>(S, n, ld);
+}
+
 // The same for a row too long to hold in registers (more than 16,384 patches: a picture of 4,096 image tokens or more): three passes over the row in memory.
-__global__ void __launch_bounds__(kSoftmaxThreads) k_softmax_rows_long(uint16_t* __restrict__ S, int n) {
-    uint16_t* s = S + (size_t) blockIdx.x * n;
+__global__ void __launch_bounds__(kSoftmaxThreads) k_softmax_rows_long(uint16_t* __restrict__ S, int n, int ld) {
+    uint16_t* s = S + (size_t) blockIdx.x * ld;
     __shared__ float red[32];
     const int lane = threadIdx.x % warpSize, wid = threadIdx.x / warpSize, nw = (blockDim.x + warpSize - 1) / warpSize;
     float m = -FLT_MAX;
@@ -388,7 +402,10 @@ struct VitGpuImpl {
         d_S = nullptr;
         // attention by batched GEMMs: scores S (float32) and probabilities P (F16) of a chunk of queries for every head, at most kScoreElems each
         // (a very large picture gets at least 64 queries per chunk, so its many chunks stay few)
-        sp_elems = std::min<size_t>((size_t) g.heads * N * N, std::max<size_t>(kScoreElems, (size_t) g.heads * N * 64));
+        // a score row is padded to a multiple of 8 elements (the product's leading dimension): with an odd row length the BLAS cannot use its tensor-core
+        // kernels (a 93-token picture spent half its time there)
+        const size_t Np = (N + 7) / 8 * 8;
+        sp_elems = std::min<size_t>((size_t) g.heads * N * Np, std::max<size_t>(kScoreElems, (size_t) g.heads * Np * 64));
         const size_t R = std::min<size_t>(N, (size_t) kRows);
         // d_ctx holds, one after the other: the patch matrix, the attention context, and at the end the projector's output rows (d_out)
         const size_t ctx_elems = std::max({N * D, N * K0, (N / 4) * (size_t) g.out_dim});
@@ -478,6 +495,18 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
         if (e != cudaSuccess) { err = std::string(what) + ": " + cudaGetErrorString(e); return false; }
         return true;
     };
+    // STRATA_VIT_PROF=1 (a diagnostic, stderr only, off by default): the time of each stage, the GPU synchronised after every stage
+    static const bool prof = std::getenv("STRATA_VIT_PROF") != nullptr;
+    double pt[11] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    auto pclock = [] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    double pmark = prof ? pclock() : 0.0;
+    auto stage = [&](int i) {
+        if (!prof) return;
+        (void) cudaDeviceSynchronize();
+        const double now = pclock();
+        pt[i] += now - pmark;
+        pmark = now;
+    };
     const int K0 = 3 * P * P;
     {   // the patch matrix [N][K0], channel-major per patch, tokens in 2x2-merge order, built on the host; it lives in the context buffer (free until the first attention)
         std::vector<float> pm((size_t) N * K0);
@@ -491,12 +520,14 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
         }
         if (cudaMemcpy(m.d_ctx, pm.data(), pm.size() * 4, cudaMemcpyHostToDevice) != cudaSuccess) { err = "GPU copy failed"; return false; }
     }
+    stage(0);
     // patch embedding (float32 GEMM), then bias + position
     DevW pw_w;
     pw_w.p = m.patch_w; pw_w.kind = K_F32; pw_w.rows = D; pw_w.cols = K0;
     if (!m.gemm(pw_w, m.d_ctx, N, m.d_x, CUDA_R_32F, err)) return false;
     k_patch_post<<<N, 256>>>(m.d_x, m.patch_b, m.pos, g.pos_grid, pw, ph, nbx, D);
     if (!sync_err("patch embedding")) return false;
+    stage(1);
 
     const float theta_scale = powf(g.rope_theta, -2.0f / (float) (HD / 2));
     const float kq_scale = 1.0f / sqrtf((float) HD);
@@ -509,26 +540,32 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
             if (!m.gemm(L.qkv, a16, rows, m.d_y, VitGpuImpl::dtype(L.qkv.kind), err)) return false;
             k_qkv_rope<<<rows, 256>>>(m.d_y, L.qkv_b, r0, nbx, H, HD, theta_scale, kq_scale, m.d_q16, m.d_k16, m.d_v16);
         }
+        stage(2);
         // per chunk of queries: S = K Q^T (one batched product over the heads), softmax, O = V P (a head's matrix is a column slice of the [N][D] arrays:
         // leading dimension D, batch stride HD)
-        const int QC = (int) std::max<size_t>(1, std::min<size_t>((size_t) N, m.sp_elems / ((size_t) H * N)));
+        const int Np = (N + 7) / 8 * 8;      // the score rows' leading dimension (see size_buffers)
+        const int QC = (int) std::max<size_t>(1, std::min<size_t>((size_t) N, m.sp_elems / ((size_t) H * Np)));
         for (int q0 = 0; q0 < N; q0 += QC) {
             const int qc = std::min(QC, N - q0);
-            if (!m.bgemm(true, false, N, qc, HD, m.d_k16, CUDA_R_16F, D, HD, m.d_q16 + (size_t) q0 * D, CUDA_R_16F, D, HD, m.d_S, CUDA_R_16F, N,
-                         (long long) qc * N, H, err))
+            if (!m.bgemm(true, false, N, qc, HD, m.d_k16, CUDA_R_16F, D, HD, m.d_q16 + (size_t) q0 * D, CUDA_R_16F, D, HD, m.d_S, CUDA_R_16F, Np,
+                         (long long) qc * Np, H, err))
                 return false;
-            if (N <= kSoftmaxThreads * kSoftmaxPer) k_softmax_rows<<<H * qc, kSoftmaxThreads>>>(m.d_S, N);
-            else k_softmax_rows_long<<<H * qc, kSoftmaxThreads>>>(m.d_S, N);
-            if (!m.bgemm(false, false, HD, qc, N, m.d_v16, CUDA_R_16F, D, HD, m.d_S, CUDA_R_16F, N, (long long) qc * N, m.d_ctx + (size_t) q0 * D,
+            stage(8);
+            if (N <= kSoftmaxThreads * kSoftmaxPer) softmax_rows(m.d_S, N, Np, H * qc);
+            else k_softmax_rows_long<<<H * qc, kSoftmaxThreads>>>(m.d_S, N, Np);
+            stage(9);
+            if (!m.bgemm(false, false, HD, qc, N, m.d_v16, CUDA_R_16F, D, HD, m.d_S, CUDA_R_16F, Np, (long long) qc * Np, m.d_ctx + (size_t) q0 * D,
                          CUDA_R_32F, D, HD, H, err))
                 return false;
         }
+        stage(3);
         for (int r0 = 0; r0 < N; r0 += R) {      // the output projection in chunks: the context rows to the 16-bit input, the product, added to the residual
             const int rows = std::min(R, N - r0);
             k_cast<<<VitGpuImpl::blocks_for((size_t) rows * D), 256>>>(m.d_ctx + (size_t) r0 * D, (size_t) rows * D, a16, (int) L.o.kind);
             if (!m.gemm(L.o, a16, rows, m.d_y, VitGpuImpl::dtype(L.o.kind), err)) return false;
             k_add_bias_res<<<rows, 256>>>(m.d_x + (size_t) r0 * D, m.d_y, L.o_b, D);
         }
+        stage(4);
         for (int r0 = 0; r0 < N; r0 += R) {      // the feed-forward block in chunks: norm, up, GELU, down, added to the residual
             const int rows = std::min(R, N - r0);
             k_layernorm<<<rows, 256>>>(m.d_x + (size_t) r0 * D, L.ln2_w, L.ln2_b, g.eps, D, a16, (int) L.up.kind);
@@ -537,6 +574,7 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
             if (!m.gemm(L.down, m.d_f16, rows, m.d_y, VitGpuImpl::dtype(L.down.kind), err)) return false;
             k_add_bias_res<<<rows, 256>>>(m.d_x + (size_t) r0 * D, m.d_y, L.down_b, D);
         }
+        stage(5);
     }
     if (!sync_err("the layers")) return false;
     // post norm (into the merger's input kind), then the merger on 4-patch rows, in chunks
@@ -550,8 +588,13 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
         k_add_bias<<<rows, 256>>>(m.d_out + (size_t) r0 * g.out_dim, m.mm2_b, g.out_dim);
     }
     if (!sync_err("the projector")) return false;
+    stage(6);
     rows.resize((size_t) M * g.out_dim);
     if (cudaMemcpy(rows.data(), m.d_out, rows.size() * 4, cudaMemcpyDeviceToHost) != cudaSuccess) { err = std::string("GPU copy failed: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+    stage(7);
+    if (prof)
+        std::fprintf(stderr, "vit-prof N=%d: patch-matrix %.2f, patch-embed %.2f, ln+qkv %.2f, attention %.2f (S product %.2f, softmax %.2f), o-proj %.2f, ffn %.2f, merger %.2f, copy-out %.2f ms\n", N, pt[0], pt[1], pt[2],
+                     pt[3] + pt[8] + pt[9], pt[8], pt[9], pt[4], pt[5], pt[6], pt[7]);
     return true;
 }
 

@@ -1,6 +1,7 @@
 // tools/vision/own/own_reader.cpp - see own_reader.h
 #include "own_reader.h"
 
+#include "vit_cpu.h"
 #include "vit_ref.h"
 #ifdef STRATA_VIT_GPU
 #include "vit_gpu.h"
@@ -10,6 +11,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <thread>
@@ -66,6 +68,7 @@ int own_reader_run(const OwnReaderOptions& o) {
         return fail("cannot load the vision encoder " + o.mmproj + " (" + err + ")", 1);
     int threads = o.threads;
     std::unique_ptr<VitRef> cpu;
+    std::unique_ptr<VitCpu> fast;
 #ifdef STRATA_VIT_GPU
     std::unique_ptr<VitGpu> gpu;
     if (o.gpu) {
@@ -79,8 +82,15 @@ int own_reader_run(const OwnReaderOptions& o) {
     }
 #endif
     if (!o.gpu) {
-        cpu.reset(new VitRef());
-        if (!cpu->load(gg, geo, err)) return fail("cannot load the vision encoder " + o.mmproj + " (" + err + ")", 1);
+        // STRATA_VIT_CPU=fast selects the fast CPU tower (VitCpu); the default stays the float32 reference until the CPU gates have passed
+        const char* sel = std::getenv("STRATA_VIT_CPU");
+        if (sel && std::string(sel) == "fast") {
+            fast.reset(new VitCpu());
+            if (!fast->load(gg, geo, err)) return fail("cannot load the vision encoder " + o.mmproj + " (" + err + ")", 1);
+        } else {
+            cpu.reset(new VitRef());
+            if (!cpu->load(gg, geo, err)) return fail("cannot load the vision encoder " + o.mmproj + " (" + err + ")", 1);
+        }
         if (threads <= 0) threads = (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency() / 2));
     }
     std::fprintf(stderr, "strata-vision: own tower (%s, %d layers, width %d) loaded in %.1f s, %s\n", geo.projector.c_str(), geo.layers, geo.width,
@@ -89,6 +99,7 @@ int own_reader_run(const OwnReaderOptions& o) {
 #ifdef STRATA_VIT_GPU
         if (gpu) return gpu->encode(prep, rows, nx, ny, e);
 #endif
+        if (fast) return fast->encode(prep, threads, rows, nx, ny, e);
         return cpu->encode(prep, threads, rows, nx, ny, e);
     };
 #ifdef STRATA_VIT_GPU
@@ -131,6 +142,8 @@ int own_reader_run(const OwnReaderOptions& o) {
         }
         std::vector<float> rows;
         int nx = 0, ny = 0;
+        if (std::getenv("STRATA_VIT_PROF"))
+            std::fprintf(stderr, "vit-prof: read + decode + prepare %.2f ms\n", std::chrono::duration<double, std::milli>(clock::now() - t0).count());
         if (!encode(prep, rows, nx, ny, err)) { std::printf("ERR the vision encoder failed (%s)\n", err.c_str()); std::fflush(stdout); continue; }
         const int n = nx * ny;
         FILE* f = std::fopen(out.c_str(), "wb");
