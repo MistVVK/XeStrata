@@ -218,6 +218,14 @@ __global__ void __launch_bounds__(kSoftmaxThreads) k_softmax_rows_long(uint16_t*
     for (int j = threadIdx.x; j < n; j += blockDim.x) s[j] = f_to_f16bits(expf(__half2float(__ushort_as_half(s[j])) - m) * inv);
 }
 
+// y[i] rounded to the 16-bit kind and back (STRATA_VIT_REF_ROUND: ggml's GPU matrix product hands back its result in the weight's 16-bit type)
+__global__ void k_round(float* __restrict__ y, size_t n, int kind) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        const float v = y[i];
+        y[i] = kind == K_F16 ? __half2float(__float2half_rn(v)) : __uint_as_float((uint32_t) f_to_bf16(v) << 16);
+    }
+}
+
 // n floats to the 16-bit kind
 __global__ void k_cast(const float* __restrict__ in, size_t n, void* out, int kind) {
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) store_kind(out, i, in[i], kind);
@@ -356,8 +364,13 @@ struct VitGpuImpl {
         const cublasStatus_t s = cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, w.rows, M, w.cols, &alpha, w.p, kind_a, w.cols, A, kind_a, w.cols, &beta, y,
                                               CUDA_R_32F, w.rows, VIT_COMPUTE_32F, VIT_GEMM_DEFAULT);
         if (s != CUBLAS_STATUS_SUCCESS) { err = "the BLAS matrix product failed (status " + std::to_string((int) s) + ")"; return false; }
+        if (round_out && w.kind != K_F32) {   // the result as ggml's GPU path keeps it: 16 bits (its inputs are 16 bits here already)
+            const size_t n = (size_t) M * w.rows;
+            k_round<<<blocks_for(n), 256>>>((float*) y, n, (int) w.kind);
+        }
         return true;
     }
+    bool round_out = false;           // STRATA_VIT_REF_ROUND=1 (a diagnostic, off by default): round every matrix product's result to its weight's 16-bit type
     static int blocks_for(size_t n, int per = 256) { return (int) std::min<size_t>((n + per - 1) / per, 65535); }
 
     bool size_buffers(int patches, std::string& err) {
@@ -442,6 +455,7 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
             return false;
     }
     m.n_weight_allocs = m.allocs.size();
+    if (const char* e = std::getenv("STRATA_VIT_REF_ROUND")) m.round_out = std::atoi(e) != 0;
     if (const char* e = std::getenv("STRATA_VIT_ROWS")) { const int v = std::atoi(e); if (v >= 16) m.kRows = v; }
     if (const char* e = std::getenv("STRATA_VIT_SCORES")) { const int v = std::atoi(e); if (v >= 1) m.kScoreElems = (size_t) v << 20; }
     return m.size_buffers(std::max(max_patches, 16), err);
