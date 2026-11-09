@@ -5,318 +5,194 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 -->
 # Notes for coding agents
 
+The rules every change follows. The facts and procedures behind them are in the documents each section names.
+
 ## LOCAL.md: this machine's facts (read it first, keep it current)
 
-`LOCAL.md` in the repository root holds what is true of this machine and the machines it works with, and nothing else holds it; git ignores it.
+`LOCAL.md` in the repository root (ignored by git) holds what is true of this machine and the machines it works with, and nothing else holds it.
 
-- **Read it before any work that runs something** (a build, a test, a measurement, a container, another machine).
-- **Facts of a machine go there and only there:** host names, users, IP addresses, containers and how to run in them, paths (the data folder, the model files, the toolchains, the venvs), the GPUs' PCI addresses, what a machine lacks or needs set up, and its quirks (naming a GPU or CPU model, as everywhere, is fine).
-  Never write them into AGENTS.md, a skill, a script, a document or a commit message; these name the fact and send the reader to `LOCAL.md` (`<data>: LOCAL.md`), and scripts take such values from the environment or their arguments.
-- **Keep it current in the same turn:** a fact learned or found changed (a new container, a moved folder, something a machine lacks) goes into `LOCAL.md` before the work moves on. A fact that is missing there is looked up, and asked of the user only when it cannot be found, then written down.
-- It is written in Japanese, by machine, facts only, as it is now.
+- Read it before any work that runs something (a build, a test, a measurement, a container, another machine).
+- Facts of a machine go there only: host names, users, IP addresses, containers, paths (the data folder, models, toolchains, venvs), PCI addresses, what a machine lacks, its quirks (naming a GPU or CPU model is fine everywhere). AGENTS.md, skills, scripts, documents and commit messages name the fact and send the reader there (`<data>: LOCAL.md`); scripts take such values from the environment or their arguments.
+- Keep it current in the same turn: a fact learned or found changed goes in before the work moves on; a missing fact is looked up, asked of the user only when it cannot be found, then written down.
+- Japanese, facts only, as they are now.
 
 ## One computing engine for every model (the most important rule)
 
-Every model XeStrata runs computes through one set of shared parts: the image engine's DiTs, VAEs, text encoders and upscalers, and the LLMs (Qwen3.8's engine and `PlainModel`) alike.
-The shared parts are the attention (`flash_attn`), the products (`prefill::Gemm`, `iq_mmq`), the row operations (`dit_rows.hpp`, `rms_norm_rows`), the QK norm and RoPE (`qk_norm_rope.hpp`), the KV appends, the activations' quantization, the tiles, the VRAM budget and the warm-up.
-They were made one so that a speed-up reaches every model at once.
+Every model computes through one set of shared parts: the image engine's DiTs, VAEs, text encoders and upscalers, and the LLMs (Qwen3.8's engine and `PlainModel`) alike. The shared parts are the attention (`flash_attn`), the products (`prefill::Gemm`, `iq_mmq`, `i8_gemm`), the row operations (`dit_rows.hpp`, `rms_norm_rows`), the QK norm and RoPE (`qk_norm_rope.hpp`), the KV appends, the activations' quantization, the tiles, the VRAM budget and the warm-up, so that a speed-up reaches every model at once.
 
-- A speed-up goes into the shared part, and it is on by default on every device that has what it needs: not an opt-in flag, and not one model's private copy.
-- Each device takes its fastest path automatically, chosen from its capabilities (what it reports: its matrix combinations, sub-group sizes, memory and the rest, as the first rule below says), never from the model's name or family.
-- A model does not keep its own kernel for a role a shared part already has. A new model is built on the shared parts; a role they lack is added to them, so the other models can use it too.
-- Keep a separate implementation only when the shared one was measured slower for it, and say so with the numbers in a comment.
+- A speed-up goes into the shared part, on by default on every device that has what it needs: not an opt-in flag, not one model's private copy.
+- Each device takes its fastest path automatically, from its capabilities (the first rule below), never from the model's name or family.
+- A new model is built on the shared parts; a role they lack is added to them. A separate implementation stays only where the shared one was measured slower for it, with the numbers in a comment.
 - An opt-in (an environment variable, off by default) is only for a path that changes the answers beyond the models' checks, or one measured not faster on the three makers' GPUs; its comment says which.
-- Check a change to a shared part on every model that uses it: the images by byte match or by eye, the LLMs by KL, and the speed on the three makers' GPUs.
+- Check a change to a shared part on every model that uses it: images by byte match or by eye, LLMs by KL, speed on the three makers' GPUs.
+
+### Two engines, one set of capabilities
+
+Qwen3.8-Flash-Next (and the Gyro packs) run on `src/program/generate.cpp`, the other LLMs on the plain engine (`src/program/plain_generate.cpp`, `src/core/plain_model.cpp`); the two can do the same things (2026-10-31).
+
+- A feature, fix, speed path or engine option goes into both, written once as a shared part (`src/core/`, `src/kernels/`, `src/prefill/`, `serve/`).
+- What upstream changes in `generate.cpp` and XeStrata takes goes into the plain engine in the same work.
+- Only what rests on Qwen3.8-Flash-Next's own architecture stays with it: `kQwen38Only` in `src/program/option_scope.cpp` (PLE, QSA, the separate MTP pack). An engine option `generate.cpp` gains goes into the plain engine or into that list.
+- A speed path taken into the plain engine is measured there too, on a plain model (Ornith-1.5 or Qwen3.6-35B-A3B).
 
 ## Hardware independence (the first rule)
 
-XeStrata runs on any Intel Arc GPU and any x86-64 CPU with AVX2, not on the development machine's B70 and i7-14700.
-A GPU with matrix engines (XMX) takes the XMX paths; one without (an older Arc, an integrated GPU) takes the DP4a or plain paths and still runs.
-The contrib-llvm build (below) runs on NVIDIA GPUs as well, through the same kernels: their tensor cores take the matrix path that reads its tile shape from the device (`mma_gemm`), not Intel's.
+XeStrata runs on any Intel Arc GPU (with XMX or without: the DP4a and plain paths) and any x86-64 CPU with AVX2, not only on the development machine's B70 and i7-14700. The contrib-llvm build runs NVIDIA GPUs through the same kernels (`mma_gemm` reads its tile shape from the device).
 
-- Choose code paths from what the hardware reports: the CPUID feature bits (as `cpu_avx512_ok` does); the device's matrix combinations, sub-group sizes, GRF modes, local memory, memory size and largest allocation. Never from a vendor string, a model number, a device ID or a product name.
-- Sizes and thresholds (tile shapes, chunk sizes, ring slots, cache sizes, thread counts, memory reserves, spin bounds) are not hard-coded, as far as they can be: they are derived from those reports at run time. A value that has to be measured is measured on the three makers' GPUs the maintainer has, the Arc Pro B70, the RTX 4070 and the RX 9060 XT, not on the B70 alone; it has a fallback that works on a smaller device, and a comment says where it was measured and what it depends on.
-- A feature some devices lack (XMX, large GRF mode, a SYCL extension) is checked before use, with a working fallback.
-- Check a change on a smaller configuration as well: on the B70 with `XESTRATA_VRAM_LIMIT_MIB=8192 XESTRATA_MAX_ALLOC_MIB=4096 XESTRATA_NO_XMX=1` (the memory, the largest allocation and the matrix engines of a small card) and fewer CPU threads; at milestones also on the processor's own graphics (the UHD 770, a check only: start and a short answer). Mark what was not checked `unverified`.
+- Choose code paths from what the hardware reports: the CPUID bits (as `cpu_avx512_ok`), the device's matrix combinations, sub-group sizes, GRF modes, local memory, memory size and largest allocation. Never from a vendor string, model number, device ID or product name.
+- Derive sizes and thresholds (tiles, chunks, ring slots, caches, threads, reserves, spin bounds) from those reports at run time. A value that must be measured is measured on the three makers' GPUs (Arc Pro B70, RTX 4070, RX 9060 XT), has a fallback for a smaller device, and its comment says where it was measured and what it depends on.
+- Check a feature some devices lack (XMX, large GRF mode, a SYCL extension) before use, with a working fallback.
+- Check a change on a small configuration too: the B70 with `XESTRATA_VRAM_LIMIT_MIB=8192 XESTRATA_MAX_ALLOC_MIB=4096 XESTRATA_NO_XMX=1` and fewer CPU threads; at milestones the processor's own graphics (start and a short answer). Mark what was not checked `unverified`.
 
 ## Operating systems: Linux (main) and Windows
 
-Linux is the main platform: development, tests, measurements and the packages are on Linux.
-Windows is a target as well, built natively for the MSVC ABI with intel/llvm's clang.
+Development, tests, measurements and packages are on Linux; Windows is a target too, built for the MSVC ABI with intel/llvm's clang.
 
-- Host code that differs between the two keeps a `#if defined(_WIN32)` branch beside the Linux one, as upstream does, or goes through `src/platform/`.
-- A change to the C++ code is also compiled for Windows on Linux with the cross build ([docs/DEVTOOLS.md](docs/DEVTOOLS.md#windows-cross-build)): at least the files it touches, and the whole build, linked, when dev is integrated. It must compile and link with no new warnings.
-- Running on Windows is checked only at milestones; until then a report marks it `unverified`.
+- Host code that differs keeps a `#if defined(_WIN32)` branch beside the Linux one, or goes through `src/platform/`.
+- A C++ change is compiled for Windows with the cross build ([docs/DEVTOOLS.md](docs/DEVTOOLS.md#windows-cross-build)): the files it touches, and the whole build linked when dev is integrated, with no new warnings.
+- Running on Windows is checked at milestones; until then a report marks it `unverified`.
 
-### setup.py, setup.sh and the F# launchers: the same features
+### setup and its entries: the same features
 
-`setup.py`, `setup.sh` and the F# launchers (`launcher/`: the window, `xestrata.exe` on Windows and `xestrata-gui` on Linux, and Windows' console `xestrata-cli.exe`) all keep the same features (the user's decision of 2026-11-09): what one of them can do, a user reaches through each of the others, on Linux as on Windows.
+`setup.py` does the work (with `chat.py` and `tools/image/install.py`); `setup.sh`, the packages' `xestrata`, Windows' `xestrata-cli.exe` and the launcher's window (`launcher/`: `xestrata.exe` on Windows, `xestrata-gui` on Linux) are its entries and do none of it themselves.
 
-On Linux the launcher's window is an extra: everything it does is there without it, through `setup.py`, `setup.sh`, the packages' `xestrata` and the web app, and nothing else needs .NET. It comes as its own package, `xestrata-gui`, the only one that depends on the .NET 10 runtime (from the distribution's official repositories, never bundled), on the distributions that have one; `xestrata gui` opens it, and where it or the runtime is missing says what to install and stops. The main package only suggests it, and setup's checks do not ask for .NET. Linux has no `xestrata-cli`: its command line is `xestrata` (setup.py). A feature still reaches every entry: on Linux the window gets it as on Windows, and a feature of the window alone does not go in.
-`setup.py` is where the work is done (with `chat.py` and `tools/image/install.py`); `setup.sh` (and the packages' `xestrata`) and the launchers are its entries and do none of it themselves, so a feature is written once, in Python, and the entries pass it on:
-
-- `setup.sh`, the packages' `xestrata` and `xestrata-cli.exe` take setup's command line as it is, and the same subcommands (`chat`, `images`, `gui`);
-- the window offers it on a page, as below.
-
-A feature added to one entry alone, or to setup without its way through each entry, does not go in.
-
-The launcher's window is setup's front end, and offers everything `setup.py` offers a user of the 7z:
-
-- each question setup asks (step 2 and after it: the model, its size, the context, the pictures, the KV cache, the RoPE extension, the speed projection, the image models) is a field of the install page, shown where setup would ask it, with setup's default answer;
-- each option that changes an install or a start, which setup takes without asking, is a field (under Advanced);
-- each action (a start, an installed model's image models, `--calibrate`, `--bench` and `--bench-original-compat`, `--inspect`, `--remove-data`, `--check-update`) is a button, and a question setup asks during it (`--json`'s ask objects) is asked on the page.
-
-The window's fields are setup's own: each option a user sets (its label, kind, choices, default, range and where it is shown) is an entry of `OPTIONS` in `setup.py`, from which setup's command line, its questions and `--describe`'s `"options"` are made and the window draws its fields (`launcher/Gui/Fields.fs`). An option is added there, not written into the window; its translations go into the launcher's catalogs (`setup.<name>.*`, checked by `tools/launcher_i18n.py`), and it shows in English until they do.
-A change to setup's questions or defaults that `OPTIONS` does not carry changes the launcher in the same commit.
-A default lives in setup alone: `--describe` reports what the window needs to show it (which questions a family and size ask, the image models a new model is offered), and the window reads it from there.
-Left out is only what the 7z cannot run: building from the source (`--license`, `--intel-llvm*`, `--cmake-arg`, `--allow-no-xmx`, `--packages`, `--update`) and `--original-strata` (upstream's engine fetched with git and built).
-`xestrata-cli.exe` runs setup on the console as it is, with every option (`xestrata-cli chat` and `xestrata-cli images` the chat and the image models, as `xestrata chat` and `xestrata images` on Linux; `xestrata-cli gui` the window, as `xestrata gui`).
+- What one entry can do, a user reaches through each of the others, on Linux as on Windows (2026-11-09). A feature added to one entry alone, or to setup without its way through each entry, does not go in.
+- The command-line entries take setup's command line as it is, with the same subcommands (`chat`, `images`, `gui`).
+- The window is setup's front end for everything a 7z user can run (not building from source or `--original-strata`): setup's questions are fields of the install page, the options it takes without asking are fields under Advanced, its actions are buttons, and a question asked during one (`--json`'s ask objects) is asked on the page.
+- Each option a user sets is one entry of `OPTIONS` in `setup.py`; setup's command line, its questions and `--describe`'s `"options"` are made from it and the window draws its fields from it (`launcher/Gui/Fields.fs`). A default lives in setup alone. Add an option there, not in the window; its translations go into the launcher's catalogs (`setup.<name>.*`, checked by `tools/launcher_i18n.py`). A change to setup's questions that `OPTIONS` does not carry changes the launcher in the same commit.
+- On Linux the window is an extra: everything works without it and nothing else needs .NET. It is its own package, `xestrata-gui`, the only one depending on the distribution's .NET 10 runtime (never bundled); the main package only suggests it, setup's checks never ask for .NET, and `xestrata gui` says what to install when it is missing. Linux has no `xestrata-cli`.
 
 ## Free and non-free builds (Debian main)
 
-XeStrata builds in two modes, chosen by the CMake option `STRATA_LICENSE`, after the Debian archive's areas:
+The CMake option `STRATA_LICENSE` picks one of two modes, after the Debian archive's areas. Call them free and contrib-llvm in reports, commit messages and documents, and name a build by its mode (`build/free`, `build/contrib-llvm`), not by its compiler or an old folder name; the code's name `contrib` (`STRATA_LICENSE=contrib`, `--license contrib`, the packages `xestrata-contrib-cuda<version>`) stays.
 
-- free (`-DSTRATA_LICENSE=free`): free software only, so the program could go into Debian main. The SYCL compiler is intel/llvm's DPC++ 7 or later (its SYCL runtime libsycl 9; one built from source, or a distribution's as new). Besides XeStrata's own kernels it uses only kernels and libraries that are free software by the DFSG (what Debian main would take): oneMath with rocBLAS (ROCm) for AMD GPUs' dense matrix products, for example.
-- contrib-llvm (the default, `STRATA_LICENSE=contrib`): XeStrata's free source built with intel/llvm's CUDA target, for NVIDIA GPUs as well (`STRATA_CUDA_ARCHS` and `STRATA_ONEMKL` default to the build machine's GPUs, of every maker it has). Its dense matrix products go through oneMath (Apache-2.0; XeStrata's fork, which CMake fetches): oneMKL on Intel GPUs, cuBLAS on NVIDIA ones, rocBLAS on AMD ones (the free mode's path). It needs NVIDIA's CUDA toolkit to build and NVIDIA's driver to run, and oneMKL, none of them free software: the program could go into Debian contrib.
+- free: free software only (what Debian main would take), built with intel/llvm's DPC++ 7 or later (libsycl 9). Besides XeStrata's own kernels it uses only DFSG-free kernels and libraries (oneMath with rocBLAS for AMD GPUs, for example).
+- contrib-llvm (the default): the same free source with intel/llvm's CUDA target, for NVIDIA GPUs too (`STRATA_CUDA_ARCHS` and `STRATA_ONEMKL` default to the build machine's GPUs). It needs the CUDA toolkit, NVIDIA's driver and oneMKL, none of them free: it could go into Debian contrib.
+- Intel oneAPI's icpx is refused in both modes.
 
-Intel oneAPI's icpx is not taken in either mode: CMake refuses it. A third mode built with it, contrib-icpx, was removed on 2026-10-15 (the user's decision): intel/llvm reaches every maker's GPUs.
-
-The dense matrix products, by mode and GPU maker:
+The dense matrix products (`src/prefill/gemm.cpp`) go through oneMath (XeStrata's fork) where its backend is allowed, else through XeStrata's own kernels; every other product is XeStrata's own or a DFSG-free library's in every mode:
 
 | Mode | Intel Arc | AMD | NVIDIA |
 | --- | --- | --- | --- |
-| free | XeStrata's own kernels | AMD's runtime (rocBLAS) | — |
-| contrib-llvm | Intel's runtime (oneMKL) | AMD's runtime (rocBLAS) | NVIDIA's runtime (cuBLAS) |
+| free | XeStrata's own kernels | rocBLAS | — |
+| contrib-llvm | oneMKL | rocBLAS | cuBLAS |
 
-In reports, commit messages and documents, call the two modes free and contrib-llvm.
-Name a build by its mode, not by its compiler or a former folder name ("llvm7", "contrib", "xe"): "built and tested in the free and contrib-llvm modes". The build folders carry the modes' names: `build/free` and `build/contrib-llvm`.
-contrib-llvm is the mode the code calls `contrib` (`STRATA_LICENSE=contrib`, `--license contrib`, the packages `xestrata-contrib-cuda<version>`); those names stay as they are.
-
-Rules:
-
-- XeStrata itself stays free software, and the free mode must build, run and pass its tests. Do not write anything that only the contrib-llvm mode can build or run, other than the paths for the GPUs only that mode reaches (NVIDIA's).
-- A non-free dependency goes only on a path the contrib-llvm mode switches on, never in the free mode, and is never bundled. The free mode may be slower without it (an older free compiler, for example), never broken.
-- Keep one code path where the modes can share it: the engine's dense matrix products (`src/prefill/gemm.cpp`) go through oneMath in the contrib-llvm mode, and in the free mode where oneMath's backend for the GPU is free software (rocBLAS for AMD GPUs); elsewhere (and where oneMath has no backend for the GPU) through XeStrata's own kernels. The AMD path is the same in the free and contrib-llvm modes. Every other product is XeStrata's own kernels, or a DFSG-free library's, in every mode.
-- Build and test a change to the SYCL code with intel/llvm only, in the free and contrib-llvm modes: a free build (`build/free`, intel/llvm built from source as [docs/DEVTOOLS.md](docs/DEVTOOLS.md#intelllvm-from-source) describes) and a contrib-llvm one (`build/contrib-llvm`, `STRATA_CUDA_ARCHS`). A change that NVIDIA's device compile sees is also run on an NVIDIA GPU where one is there (else `unverified`). The compilers differ in version: an extension one of them lacks needs a fallback (as `sycl_ext_oneapi_clock` in `verify_kernels.cpp`), and a warning one of them gives counts as new.
-- `third_party/nonfree/` (below) stays optional in every mode.
-- The model itself (Qwen3.8-Flash-Next) is excluded from these rules.
-- Non-free tools a developer runs by hand, such as Intel SDE below, are allowed as long as they are not bundled and neither the build nor the tests require them.
-
-## Two engines, one set of capabilities
-
-Qwen3.8-Flash-Next (and the Gyro packs) run on `src/program/generate.cpp`; the other models (Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B, Qwen3.5-9B, GLM-5.3-Flash) on the plain engine, `src/program/plain_generate.cpp` and `src/core/plain_model.cpp`.
-The two do not differ in what they can do (the user's decision of 2026-10-31): a feature, a fix, a speed path or an engine option goes into both.
-
-- Write it once, as a shared part both engines call (`src/core/`, `src/kernels/`, `src/prefill/`, `serve/`), not as a second copy in each engine.
-- upstream's changes land in `generate.cpp`: whatever of them is taken goes into the plain engine too, in the same work ([the upstream-sync skill](.claude/skills/upstream-sync/SKILL.md)).
-- Only what rests on Qwen3.8-Flash-Next's own architecture stays with it: what `kQwen38Only` in `src/program/option_scope.cpp` lists (PLE, QSA, the separate MTP pack, their kernels and switches).
-  An engine option `generate.cpp` gains goes into the plain engine or into `kQwen38Only`.
-- A speed path taken into the plain engine is measured there as well, on a plain model (Ornith-1.5 or Qwen3.6-35B-A3B).
+- The free mode must build, run and pass its tests. Nothing may be buildable or runnable only in contrib-llvm except the NVIDIA paths.
+- A non-free dependency goes only on a path contrib-llvm switches on, never bundled; the free mode may be slower without it, never broken.
+- Build and test a SYCL change with intel/llvm only, in both modes (intel/llvm from source: [docs/DEVTOOLS.md](docs/DEVTOOLS.md#intelllvm-from-source)); a change NVIDIA's device compile sees is run on an NVIDIA GPU where there is one (else `unverified`). An extension one compiler lacks needs a fallback (as `sycl_ext_oneapi_clock` in `verify_kernels.cpp`), and a warning either gives counts as new.
+- `third_party/nonfree/` stays optional; the model (Qwen3.8-Flash-Next) is outside these rules; non-free tools a developer runs by hand (Intel SDE) are fine as long as nothing bundles or requires them.
 
 ## What goes in
 
-Every change goes in only on these two conditions, whoever writes it: the maintainer, a coding agent, a pull request, a port from upstream or another project.
-
-- It was built and tested with intel/llvm, in the free and contrib-llvm modes (above). intel/llvm is the compiler that reaches every GPU maker's devices: a change built only with another compiler (Intel oneAPI's icpx, for example), or not built, does not go in.
-- It depends on the hardware it was written on as little as it can (the first rule, above): not only no CUDA or other maker's API outside the paths only the contrib modes reach, but no value measured on one card (the B70's spin bounds or tile shapes, for example) hard-coded where it can be derived from what the device reports.
-
-A change that does not meet them, a pull request among others, does not go in as it is: it is a reference, and what it does is written again in XeStrata's code.
+Whoever writes a change (the maintainer, an agent, a pull request, a port), it goes in only when it was built and tested with intel/llvm in the free and contrib-llvm modes, and depends on the hardware it was written on as little as it can (no maker's API outside the contrib-only paths, no value measured on one card where the device's reports give it). One that does not is a reference, written again in XeStrata's code.
 
 ## Licenses
 
-XeStrata's own code is under the LGPL, version 3 or later (`COPYING.LESSER`, `COPYING`), and XeStrata as a combined work is distributed under it; the code from other projects keeps its own license (below). Copyright and license notices are in `NOTICE`.
-`NOTICE` also grants an additional permission (GPL version 3, section 7): XeStrata linked with a GPU or CPU maker's math or compute library and its runtime libraries (oneMKL, cuBLAS, the CUDA runtime), or with the C and C++ runtime libraries of the operating system or its standard compiler (Microsoft's Universal C Runtime and Visual C++ runtime), may be conveyed.
+XeStrata's own code is under the LGPL 3.0 or later (`COPYING.LESSER`, `COPYING`), and XeStrata as a combined work is distributed under it; other projects' code keeps its license. `NOTICE` holds the notices and an additional permission (GPL 3, section 7) to link with GPU and CPU makers' math libraries and the systems' C and C++ runtimes.
 
-Each file carries the license of the code in it, by where that code comes from:
+Each file carries the license of the code in it:
 
-- XeStrata's own: a file written for XeStrata is under the LGPL, with XeStrata's copyright only.
-- Mixed: a file from a project under a permissive license (Strata, ggml / llama.cpp: MIT) that XeStrata has changed, or a file of XeStrata's with code transcribed from such a project (the kernels in `src/` that follow ggml, for example).
-  The original code keeps its copyright and license; XeStrata's changes and the file as a whole are under the LGPL. The file names both copyright holders and both licenses, and keeps the original notice comment.
-- Unchanged: a file from such a project that XeStrata has not changed (Strata's files as upstream has them, upstream's data files) keeps its own license and copyright only, without XeStrata's line.
-- A file is changed when its content, apart from the SPDX header XeStrata adds, differs from the upstream version XeStrata has integrated (`STRATA_UPSTREAM_VERSION`): from upstream's file at the same path, or from a file of the same content elsewhere (a rename); a file of Strata's that upstream has removed, from the content it last had there. One that XeStrata renamed and changed is mixed; one that has none of upstream's lines (apart from blank and short ones) is XeStrata's own, written anew. An upstream sync that brings a file back to upstream's content makes it unchanged again; a change of XeStrata's to an unchanged file makes it mixed.
-- `tools/license_class.py` checks each file's header (or its `REUSE.toml` annotation) against its class, and `--fix` rewrites the headers that differ; `tools/lint/run.sh` runs the check.
-- Exceptions: XeStrata's changes to oneMath (below) and its patches to intel/llvm (`third_party/main/intel-llvm/patches/`, Apache-2.0 WITH LLVM-exception) stay under those projects' licenses, even when MistVVK writes them.
+- XeStrata's own (written for XeStrata, or with none of upstream's lines left): LGPL, XeStrata's copyright only.
+- Mixed (a file of a permissive project, Strata or ggml / llama.cpp, that XeStrata changed, or XeStrata's file with code transcribed from one): both copyright holders and both licenses, the original notice kept; the file as a whole is LGPL.
+- Unchanged (upstream's file as upstream has it, at the integrated `STRATA_UPSTREAM_VERSION`, renames included): its own license and copyright only. A sync that brings a file back to upstream's content makes it unchanged; a change of XeStrata's makes it mixed.
+- `tools/license_class.py` checks each header (or `REUSE.toml` annotation) against its class (`--fix` rewrites); `reuse lint` must pass. Files that cannot carry a comment are covered in `REUSE.toml`; the license texts are in `LICENSES/`.
+- Exceptions: XeStrata's changes to oneMath (commits in [MistVVK/oneMath](https://github.com/MistVVK/oneMath), branch `xestrata`) and its patches to intel/llvm (`third_party/main/intel-llvm/patches/`) stay under those projects' licenses (Apache-2.0; Apache-2.0 WITH LLVM-exception), even when MistVVK writes them. A oneMath file a change touches keeps its header and adds `Modified 2026 by MistVVK and the XeStrata contributors: ...`; the changes are listed in `third_party/main/README.md`.
+- Other projects' material goes into `third_party/main/<project>/` (free software) or `third_party/nonfree/<project>/` (anything else), with its license text, listed in that folder's README. XeStrata builds, runs and passes its tests without `third_party/nonfree/`.
 
-Material from other projects goes into `third_party/`, one folder per project with its license text, and is listed in that folder's README:
-
-- `third_party/main/<project>/`: free software (what Debian main would take), kept under its own license. XeStrata may build and run with it.
-- `third_party/nonfree/<project>/`: anything that is not free software.
-- XeStrata's changes to oneMath are commits in its fork ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), branch `xestrata`: oneMath's commit 6ff3a43 with XeStrata's changes on it, and oneMath's `develop` merged into it, up to 1308c5e), under oneMath's license (Apache-2.0), not the LGPL, even when MistVVK writes them; CMake fetches a tag of it. In each file a change touches, it keeps the Apache-2.0 header and adds a line saying who changed what (`Modified 2026 by MistVVK and the XeStrata contributors: ...`); a new file carries XeStrata's copyright and the Apache-2.0 header. The changes are listed in `third_party/main/README.md`.
-
-XeStrata must build, run and pass its tests without `third_party/nonfree/`: whatever is there stays optional and can be removed by deleting the folder.
-
-Every file starts with its copyright holders and license in SPDX form (the [REUSE](https://reuse.software) specification), in the file's comment syntax.
-XeStrata's own file:
+Every file starts with its SPDX header (the [REUSE](https://reuse.software) specification) in its comment syntax: XeStrata's own, mixed (code from ggml / llama.cpp adds `SPDX-FileCopyrightText: 2023-2026 The ggml authors` instead of or besides Strata's line), unchanged:
 
 <!-- REUSE-IgnoreStart: examples, not this file's own header -->
 
 ```cpp
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-```
 
-A mixed file (one from Strata that XeStrata has changed; a file with code transcribed from ggml / llama.cpp adds `SPDX-FileCopyrightText: 2023-2026 The ggml authors` instead of or besides Strata's line):
-
-```cpp
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-```
 
-An unchanged file from Strata:
-
-```cpp
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-License-Identifier: MIT
 ```
 
 <!-- REUSE-IgnoreEnd -->
 
-- Files that cannot carry a comment (data, images, JSON) are covered in `REUSE.toml`; the license texts are in `LICENSES/`.
-- `reuse lint` must pass.
+## Names
 
-## The README and the documents
-
-The README and the documents in `docs/` are written in Japanese first: `README.ja.md` and `docs/<NAME>.ja.md` are the originals, and `README.md` and `docs/<NAME>.md` their English translations.
-A change goes into the Japanese file first and then into the English one in the same commit, so the two keep the same sections and content.
-The English files keep the headings that code, records and links point to (`docs/BUILD.md#packages`, for example); a Japanese file's anchors come from its own headings.
-Where the README or a document states something that was not checked, do not add that it is unverified (`unverified`, 未検証); that mark is for reports and commit messages.
-The two stages of generation are prefill and decode, the LLM terms, in Japanese as in English (the README, the documents, the release notes): not プロンプト・出力・デコード or prompt and output speed. 推測デコード (speculative decoding) and a prompt as the text that is read stay as they are.
-
-## Model names: written out, never abbreviated
-
-A model's name is written in full everywhere, in code and in text: `HunyuanImage 3.0` in prose (the README, the documents, commit messages, release notes, comments, the engine's messages) and `hunyuanimage3` where an identifier needs it - `hunyuanimage3_dit.cpp`, `HunyuanImage3Dit`, `hunyuanimage3_layer_run`, `HUNYUANIMAGE3_VAE_DUMP`. Its abbreviations (`hy3`, `Hy3`, `HY3`) are not used: a reader of a log line or a commit message should not have to know a short form, and the short form of a model's name is how two models' files start to look alike. The same holds of every model the image engine takes.
-
-What already exists keeps its name: Qwen-Image-2.1's `qi_*` and Mage-Flow's `mf_*` parts (`qi_dit.cpp`, `QiPipeline`) stay as they are - renaming them would churn the whole image engine for no reading gain, and this rule is about names given from now on. So does everything outside the repository: the data folder's `hy3/`, the records' scripts (`hy3_conform.py`, `hy3_vae_ref.py`) and any path quoted from them; a comment that cites one of those says it is a record's or the data folder's path, so it does not read as a name for the model.
-
-## XeStrata's name, not upstream's, where a user reads it
+### XeStrata's name, not upstream's, where a user reads it
 
 <!-- upstream-name: off -->
-What a user reads says `xestrata` (`XeStrata` in prose): the messages and the log lines' heads, the usage texts, the environment variables, the programs, the API fields of XeStrata's own, the documents, the web app and setup's lines. `strata` alone is upstream's name and is not shown there.
-What a user does not read keeps upstream's name, so upstream's changes carry over: the C++ namespace `strata`, `include/strata/`, the file names, the CMake targets and options (`-DSTRATA_*`), and the API fields and markers shared with upstream (`strata_mcp`, `strata_prefix`, `/health`'s `service: "strata"` and the like).
+What a user reads says `xestrata` (`XeStrata` in prose): messages and log heads, usage texts, environment variables, programs, XeStrata's own API fields, documents, the web app, setup's lines. `strata` alone is upstream's name and is not shown there. What a user does not read keeps upstream's name, so upstream's changes carry over: the namespace `strata`, `include/strata/`, file names, CMake targets and options (`-DSTRATA_*`), and the API fields and markers shared with upstream (`strata_mcp`, `/health`'s `service: "strata"` and the like).
 
-- A new environment variable is `XESTRATA_<NAME>`, read through the one reader: `strata::env_get("<NAME>")` in C++ (`include/strata/platform/env.hpp`), `envvars.get("<NAME>")` in Python (`serve/envvars.py`). Not `std::getenv` or `os.environ` directly.
-- The F# launchers read theirs in one place (`launcher/Core/Platform.fs`); a shell script reads `$XESTRATA_<NAME>`, and the old name only for a variable that had one: `${XESTRATA_<NAME>:-${STRATA_<NAME>:-}}`.
-- The reader takes the old `STRATA_<NAME>` too, for the variables that existed before the rename; a new variable is never given a `STRATA_` name.
-- An upstream sync reads upstream's names into XeStrata's as it carries a change over (the upstream-sync skill says how).
-- `tools/lint/upstream_name.py` (in `tools/lint/run.sh`) finds `strata` where a user reads XeStrata's name: the strings of the C++, Python and F# files, the shell scripts' code, the documents and the web app.
+- A new environment variable is `XESTRATA_<NAME>`, read through the one reader: `strata::env_get("<NAME>")` in C++ (`include/strata/platform/env.hpp`), `envvars.get("<NAME>")` in Python (`serve/envvars.py`), `launcher/Core/Platform.fs` in F#; a shell script reads `$XESTRATA_<NAME>`. Never `std::getenv` or `os.environ` directly.
+- The old `STRATA_<NAME>` is read only for a variable that existed before the rename (the readers do it; a script writes `${XESTRATA_<NAME>:-${STRATA_<NAME>:-}}`); a new variable never gets a `STRATA_` name.
+- An upstream sync reads upstream's names into XeStrata's as it carries a change over (the upstream-sync skill).
+- `tools/lint/upstream_name.py` watches the strings of C++, Python and F#, the shell scripts' code, the documents and the web app.
 
 <!-- upstream-name: on -->
 
+### Model names: written out, never abbreviated
+
+A model's name is written in full in code and text: `HunyuanImage 3.0` in prose, `hunyuanimage3` in identifiers (`hunyuanimage3_dit.cpp`, `HUNYUANIMAGE3_VAE_DUMP`), never `hy3`. Names that already exist stay (Qwen-Image-2.1's `qi_*`, Mage-Flow's `mf_*`), and so do paths outside the repository (the data folder's `hy3/`, the records' scripts); a comment citing one says it is such a path.
+
+## The README and the documents
+
+- `README.ja.md` and `docs/<NAME>.ja.md` are the originals; `README.md` and `docs/<NAME>.md` their English translations. A change goes into the Japanese file first and into the English one in the same commit, keeping the same sections. The English files keep the headings that code, records and links point to.
+- Documents do not mark what was not checked (`unverified`, 未検証): that mark is for reports and commit messages.
+- The two stages of generation are prefill and decode, in Japanese as in English (not プロンプト・出力・デコード, not prompt and output speed).
+
 ## Measurement records
 
-XeStrata's own measurements (benchmarks, A/B runs, probes, the upstream-sync and release records) are not shared: they go
-into the data folder's `records/` (`<data>: LOCAL.md`) and never into git. `bench/XeStrataBenchResults` keeps only the
-measurements of XeStrata that others sent (pull requests). upstream's records (its `bench/results`, its community's
-included) are not brought in. Commit messages and documents give the numbers themselves, not a link to a record.
-
-Do not run a measurement whose result is already known. A run that gives the same result each time (greedy, the same
-binary, settings and text, on the same machine in the same state) and has been measured is read from its record, not
-run again. Measure again only what can differ: a changed binary or setting, a run at temperature, or a cell suspected
-of noise (once).
+- XeStrata's own measurements (benchmarks, A/B runs, probes, upstream-sync and release records) go into the data folder's `records/` (`<data>: LOCAL.md`), never into git. `bench/XeStrataBenchResults` holds only measurements others sent; upstream's records are not brought in. Commit messages and documents give the numbers, not a link to a record.
+- Do not measure what is already known: a run that gives the same result each time (greedy, same binary, settings, text and machine state) is read from its record. Measure again only what can differ: a changed binary or setting, a run at temperature, a cell suspected of noise (once).
 
 ## Lints
 
-Before committing, run `tools/lint/run.sh` from the repository root: without arguments it lints the files that differ from HEAD (changed or new), or the files given.
-It picks the lints by file kind, with the configurations in `tools/lint/`:
+Before committing, run `tools/lint/run.sh` from the repository root (no arguments: the files that differ from HEAD). The files a change touches get no new findings; earlier findings may stay. Its configurations are in `tools/lint/`:
 
 | Files | Lints |
 | --- | --- |
-| C++ (and SYCL) | the compiler's warnings (`-Wall -Wextra` through `strata_warnings` in `CMakeLists.txt`; `-DSTRATA_WERROR=ON` makes them errors), clang-tidy (oneAPI's, which knows SYCL), cppcheck |
+| C++ (and SYCL) | the compiler's warnings (`strata_warnings`; `-DSTRATA_WERROR=ON` makes them errors), clang-tidy (reads `compile_commands.json` from `build/free` or `XESTRATA_LINT_BUILD`), cppcheck |
 | Python | flake8, ruff, mypy |
-| Shell | shellcheck |
-| CMake | cmake-lint |
-| Markdown | mdl, lychee (`--offline`: links to files in the repository) |
+| Shell / CMake | shellcheck / cmake-lint |
+| Markdown | mdl, lychee (`--offline`) |
 | CSS / JavaScript / HTML | stylelint, eslint, tidy |
-| all text files | codespell |
-| every file | gitleaks (built-in rules, no configuration of its own) |
-| every file | `tools/license_class.py` (the license classes, see Licenses above) |
-| C++, Python, F#, shell, documents, the web app | `tools/lint/upstream_name.py` (upstream's name where a user reads XeStrata's: `xestrata`, `XESTRATA_*`) |
-| the whole repository | `reuse lint` (see Licenses above) |
+| text / every file | codespell / gitleaks, `tools/license_class.py` |
+| C++, Python, F#, shell, documents, web | `tools/lint/upstream_name.py` |
+| the repository | `reuse lint` |
 
-The files a change touches must get no new findings; findings that were there before may stay.
-Other projects' files in `third_party/<area>/<project>/` (kept as they are; XeStrata's `patches/` there excepted) get only gitleaks and `reuse lint`.
-clang-tidy reads `compile_commands.json` from the build folder (`build/free`, or `XESTRATA_LINT_BUILD`): configure it with `-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`.
-
-Then run the existing tests the change can affect (CTest in the build folder, `python -m unittest` for `serve/` and `tools/`, `dotnet test launcher/Tests` and `python tools/launcher_i18n.py` for the launchers).
-The launchers' window is tested without a screen there (Avalonia.Headless); on a screen (the Windows test PC, or Xvfb in a throwaway container for Linux) only at milestones.
-For memory and undefined-behavior bugs, build in a folder of its own with `-DSTRATA_SANITIZE=address,undefined` (for example `build/free-asan`) and run CTest there.
-It instruments the project's own host code only, not ggml or the SYCL device code; do not run its binaries under Intel SDE.
-
-Do not reformat code with clang-format or a similar tool: the code is formatted by hand, a reformat would rewrite about a quarter of the C++ lines and make Strata's changes hard to carry over. Match the style of the surrounding code.
+- Other projects' files in `third_party/<area>/<project>/` (not XeStrata's `patches/`) get only gitleaks and `reuse lint`.
+- Then run the existing tests the change can affect: CTest in the build folder, `python -m unittest` for `serve/` and `tools/` (the data folder's venv), `dotnet test launcher/Tests` and `python tools/launcher_i18n.py` for the launchers (the window headless; on a screen only at milestones).
+- For memory and undefined-behavior bugs, build in a folder of its own with `-DSTRATA_SANITIZE=address,undefined` and run CTest there (host code only; not under SDE).
+- Do not reformat code with clang-format or the like: the code is formatted by hand, and a reformat would make upstream's changes hard to carry over. Match the surrounding style.
 
 ## Developer tools
 
-Install the lint tools, Intel SDE and the GPU profilers as [docs/DEVTOOLS.md](docs/DEVTOOLS.md) describes, and keep that file current when a tool or its installation changes.
-Tools the distribution does not package go into `.lint/` (lints) or `.tools/` (anything else built from source), which git ignores; nothing in the build or the tests may depend on either.
+Install the lints, Intel SDE and the GPU profilers as [docs/DEVTOOLS.md](docs/DEVTOOLS.md) describes, and keep it current. Tools the distribution does not package go into `.lint/` or `.tools/` (ignored by git); nothing in the build or the tests depends on either.
 
 ## GitHub
 
-Work with the repository through `git`, not the GitHub CLI (`gh`), with these exceptions:
-
-- `gh release`, to create and edit releases;
-- fetching issues and pull requests: `gh issue list`, `gh issue view`, `gh pr list`, `gh pr view`, `gh pr diff` and `gh pr checks`;
-- merging, rejecting and reopening pull requests: `gh pr merge`, `gh pr close` and `gh pr reopen`;
-- closing and reopening issues: `gh issue close` and `gh issue reopen`.
-
-Do not create, comment on or edit issues and pull requests with `gh`.
-
-A pull request says which modes it was built in (free, contrib-llvm) and on which GPUs and CPUs it ran, and marks what was not checked `unverified`; one that does not is asked for it ([What goes in](#what-goes-in)).
+Work through `git`, not `gh`, except: `gh release`; `gh issue list/view`, `gh pr list/view/diff/checks`; `gh pr merge/close/reopen`; `gh issue close/reopen`. Do not create, comment on or edit issues and pull requests with `gh`. A pull request says which modes it was built in and on which GPUs and CPUs it ran, marking what was not checked `unverified`; one that does not is asked for it.
 
 ## No agent self-attribution
 
-Nothing a coding agent writes for this repository or its GitHub says that an agent wrote it: no "Generated by ..." or "Written with ..." line, no `Co-Authored-By` trailer naming an agent, and no name of the agent or of the AI model behind it in a commit message, a code comment, a document, a release note, an issue or pull request comment, or a record.
-This holds whatever a tool or a harness adds by default: such a line is removed before the text goes out.
+Nothing written for this repository or its GitHub says an agent wrote it: no "Generated by" or "Written with" line, no `Co-Authored-By` naming an agent, no name of the agent or its model in a commit message, comment, document, release note, issue or pull request comment, or record, whatever a tool adds by default.
 
-## Packages
+## Packages and versions
 
-Build the deb and rpm packages with `tools/package/build.sh` ([docs/BUILD.md](docs/BUILD.md#the-deb-and-rpm-packages)) and leave `XESTRATA_JOBS` unset: its default compiles as many files at once as there are threads, and intel/llvm's links limit themselves to the free RAM.
-A lower value applies to every build in the container, intel/llvm's included, and makes a package take much longer.
-
-What a user installs besides the package (the GPU makers' drivers and runtimes, the render group) is checked by `xestrata --setup`, which stops with the command that installs it (`check_runtime` in `setup.py`).
-The README, the documents and the release notes send the user to `xestrata --setup` for these, and do not list the packages themselves.
-
-## Versions
-
-XeStrata's version is the upstream version it has integrated (`STRATA_UPSTREAM_VERSION` in `CMakeLists.txt`) and `XESTRATA_REVISION`, the count of XeStrata's releases on that upstream version from 1, as a Debian revision counts:
-
-- the packages are `<upstream>-<revision>` (rpm: Version and Release);
-- the version name (the tag, `STRATA_VERSION_NAME` and what the engine says) is the same with `xe` before it, `xe<upstream>-<revision>`: xe0.1.43.1-1 is the package `0.1.43.1-1`.
-
-Releases before 2026-10-13 were named `xe<upstream>` for the first and `xe<upstream>.<revision - 1>` for a later one (xe0.1.43.1 was 0.1.43's second release), which an upstream version with a fourth number collided with; their tags stay as they are.
-
-Integrating a new upstream version sets `XESTRATA_REVISION` back to 1; another release on the same upstream version raises it by one.
+- Build the deb and rpm packages with `tools/package/build.sh` ([docs/BUILD.md](docs/BUILD.md#the-deb-and-rpm-packages)) and leave `XESTRATA_JOBS` unset (a lower value slows every build in the container, intel/llvm's included).
+- What a user installs besides the package (drivers, runtimes, the render group) is checked by `xestrata --setup` (`check_runtime` in `setup.py`), which gives the command; the README, the documents and the release notes send the user there and do not list the packages.
+- The version is the integrated upstream version (`STRATA_UPSTREAM_VERSION`) and `XESTRATA_REVISION` (XeStrata's releases on it, from 1, as a Debian revision): packages `<upstream>-<revision>`, the version name and tag `xe<upstream>-<revision>`. A new upstream version sets the revision back to 1. Tags from before 2026-10-13 keep their old form.
 
 ## AVX-512 code
 
-The development machine has no AVX-512, so the AVX-512 paths never run natively here.
-When a change touches them, run the affected tests under Intel SDE (installation: [docs/DEVTOOLS.md](docs/DEVTOOLS.md#intel-sde-the-avx-512-paths)) emulating an Ice Lake CPU (`-icx`: AVX-512 F/BW/VL/VNNI/VBMI, the set `cpu_avx512_ok` requires).
+The development machine has no AVX-512. A change to the AVX-512 paths runs the affected tests under Intel SDE emulating Ice Lake (`-icx`, the set `cpu_avx512_ok` requires; installation: [docs/DEVTOOLS.md](docs/DEVTOOLS.md#intel-sde-the-avx-512-paths)), and the same tests natively (the AVX2 path). SDE checks correctness, not speed.
 
-This covers:
-
-- the files compiled with AVX-512 flags: `src/kernels/cpu/expert.cpp` and `src/kernels/cpu/iq_avx512.cpp` (see `CMakeLists.txt`)
-- the run-time choice between the AVX-512 and AVX-2 kernels: `cpu_avx512_ok` and its callers (`src/kernels/cpu/expert_layout.cpp`, `src/kernels/cpu/native_expert.cpp`, `src/program/generate.cpp`)
-- the int8 product's AVX-512 VNNI copy, the one AVX-512 kernel written for XeStrata (the user's decision of 2026-11-08 for this component; the CPU kernels are otherwise AVX2 and AVX2 + AVX-VNNI): `src/kernels/cpu/i8_gemm_avx512.cpp`, chosen by `cpu_avx512vnni_ok` (F and VNNI only) in `src/kernels/cpu/i8_gemm.cpp`
-
-```sh
-sde64 -icx -- ./build/free/expert_multi_test
-sde64 -icx -- ./build/free/expert_parity --selftest   # from the repository root
-sde64 -icx -- ./build/free/pool_test --selftest       # from the repository root
-sde64 -icx -- ./build/free/cpu_i8_gemm_parity          # the int8 product's AVX-512 VNNI copy against the scalar one
-```
-
-The same tests must also still pass or skip natively, so the AVX-2 path is checked as well.
-SDE measures correctness only: its timings say nothing about the speed on real hardware.
-Whether SDE runs the tests that also use the GPU (`native_expert_parity`) is `unverified`.
+- The paths: the files built with AVX-512 flags (`src/kernels/cpu/expert.cpp`, `iq_avx512.cpp`), the run-time choice (`cpu_avx512_ok` and its callers: `expert_layout.cpp`, `native_expert.cpp`, `generate.cpp`), and the int8 product's AVX-512 VNNI copy (`i8_gemm_avx512.cpp`, chosen by `cpu_avx512vnni_ok`; the one AVX-512 kernel written for XeStrata, 2026-11-08 — CPU kernels are otherwise AVX2 and AVX2 + AVX-VNNI).
+- The tests: `sde64 -icx -- ./build/free/expert_multi_test`, `expert_parity --selftest`, `pool_test --selftest` (from the repository root), `cpu_i8_gemm_parity`.
 
 ## Intel Graphics Compiler (IGC): the GEP simplification of 2.27 to 2.30
 
-IGC 2.27.10, 2.28.4 and 2.30.1 miscompile, for Xe2 and Xe3 GPUs (the targets `bmg`, `lnl` and `ptl`: the Arc B-series, Lunar Lake, Panther Lake), a kernel that reads from one pointer at a runtime index and at constant multiples of it.
-With `const float* xt = x + base; xt[0] + xt[N] + xt[2 * N] + xt[3 * N]`, intel/llvm's optimizer writes `xt[2 * N]` and `xt[3 * N]` as byte offsets (8N and 12N bytes) from the pointer it already offset for `xt[N]`, and IGC's GEP simplification takes those byte offsets for element indices: the kernel reads `xt[8 * N]` and `xt[9 * N]`, a fault past the buffer (`DEVICE_LOST`, `Engine memory CAT error` in the kernel's log) or wrong values inside it.
-2.24.8 and earlier and 2.32.7 and later compile the reads right (each release's libigc from GitHub on the reproducer's SPIR-V, 2026-10-19); Alchemist (`dg2`) is not affected (IGC reads its buffers there another way).
-Ubuntu 26.04, Debian and Arch ship 2.28.4; Fedora 44 ships 2.24.8 and updates to 2.41.9.
-The reproducer and the checks are in the data folder's `records/igc-gep-check/` (`<data>: LOCAL.md`).
+IGC 2.27 to 2.30 miscompile, for Xe2 and Xe3 GPUs, a kernel that reads one pointer at `xt[N]` and at `xt[k * N]` with a constant k of 2 or more; the Linux runtime turns the pass off where such an IGC and GPU meet. The details, the workaround's conditions and how to read IGC's output: [docs/DEVTOOLS.md](docs/DEVTOOLS.md#intel-graphics-compiler-igc-the-gep-simplification-of-227-to-230).
 
-- The runtime sets `IGC_EnableGEPSimplification=0` in its environment before the SYCL runtime lists the devices (`engine_devices` in `src/core/device.cpp`), unless the user set the variable; IGC reads it when it first compiles a kernel, which the runtime does as it lists the devices. Off, the pass costs the B70 5 to 10% of the decode of a 1K prompt and nothing at 32K (generate, 2026-10-19), so the variable is set only where both are true: the `libigc.so.2` the loader finds is 2.25 to 2.31 by its file name (`libigc.so.2.28.4+0`), or carries no version; and a GPU on the xe driver is Xe2 or later by its graphics IP (`xe_gpu_from_xe2`: the main GT's `ip_ver_major` of `DRM_XE_DEVICE_QUERY_GT_LIST` 20 or more; 0, a GPU without GMD_ID, is Alchemist or older), asked of the kernel driver before Level Zero loads, since a variable set after the devices are listed is not read. Without such a GPU nothing is set. Linux only: Windows sets nothing and keeps its driver's compiler as it is. The start log says so (`IGC's GEP simplification is off`), the engine reports it as `INFO igc_workaround=<version>` (the web app's notice and its About page), and `xestrata --setup` (`check_igc` in `setup.py`, on the same two conditions) warns of it. The start log and the engine's report send the user to Fedora 44, whose IGC is 2.32 or later, or to the Podman container (`container/`, Fedora 44 inside: IGC is the container's, the host gives only the kernel driver); setup (`check_igc`), the documents (BUILD's packages, DETAILS's troubleshooting) and the release notes name one more way, Intel's graphics PPA (launchpad.net/~kobuk-team/+archive/ubuntu/intel-graphics, the compute-runtime project's repackaging: compute-runtime 26.31 and IGC 2.40 for Ubuntu 24.04/26.04) - with the HWE kernel straight to the PPA, from the GA kernel to the HWE kernel first (the PPA installs the driver with the IGC, and that driver is the one for the HWE kernel).  The same `xestrata --setup` (`check_level_zero`) stops the start when the Level Zero driver predates the build that stops it refusing device memory while the VRAM is free (26.22.38646.4; intel/compute-runtime #916, xe's kernel bug fixed in Linux 7.1; on XeStrata's side #34 and #15) on Ubuntu 24.04/26.04 with the HWE kernel - `--old-driver` is the explicit consent to start anyway - and, on the GA kernel and elsewhere, only says it and goes on: the GA kernel is sent to the HWE kernel and the PPA, or to Fedora 44 / Podman, the rest to a driver of 26.22 or later, or to Fedora 44 / Podman.
-- Write kernels that compile right either way: step a pointer by N from the last read (`glm5_hc_mean`), or index the stream in one product (`x[(t * HC + s) * N + n]`), not `xt[k * N]` with a constant k of 2 or more beside `xt[N]`.
-- To see what IGC makes of a kernel without running it, compile ahead for Xe2 with IGC's dumps on, `IGC_ShaderDumpEnable=1 IGC_DumpToCustomDir=dump clang++ -fsycl -fsycl-targets=intel_gpu_bmg_g31 ...`, and read `dump/*_entry_*.asm`: the miscompile shows as a scalar `mul ... 0x1C:uw` (28N: the 32N bytes of the misread `xt[8 * N]`, less the 4N of `xt[N]`) ahead of the loads; `*_beforeUnification.ll` is the IR IGC received. `IGC_EnableGEPSimplification=1 ./igc_gep_probe` runs the pattern on the GPU with room for the wrong reads and fails on an affected IGC; CTest runs it through the runtime's workaround, where it passes on every GPU.
+- Write kernels that compile right either way: step a pointer by N from the last read (`glm5_hc_mean`), or index in one product (`x[(t * HC + s) * N + n]`).

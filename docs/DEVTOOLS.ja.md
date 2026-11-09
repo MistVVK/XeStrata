@@ -293,6 +293,29 @@ chmod +x ~/.local/bin/sde64
 sde64 -version
 ```
 
+## Intel Graphics Compiler（IGC）の GEP の簡約（2.27〜2.30）
+
+IGC 2.27.10・2.28.4・2.30.1 は、Xe2 と Xe3 の GPU（ターゲット `bmg`・`lnl`・`ptl`: Arc B シリーズ、Lunar Lake、Panther Lake）向けに、1 つのポインターから実行時の添字とその定数倍で読むカーネルを誤って訳します。
+`const float* xt = x + base; xt[0] + xt[N] + xt[2 * N] + xt[3 * N]` では、intel/llvm の最適化が `xt[2 * N]` と `xt[3 * N]` を、`xt[N]` のためにずらしたポインターからのバイトのずれ（8N と 12N バイト）として書き、IGC の GEP の簡約がそれを要素の添字と取り違えます。
+カーネルは `xt[8 * N]` と `xt[9 * N]` を読み、バッファーの外を読んで止まるか（`DEVICE_LOST`、カーネルのログの `Engine memory CAT error`）、中の違う値を読みます。
+2.24.8 以前と 2.32.7 以降は正しく訳します（各リリースの libigc を再現の SPIR-V にかけて確かめた、2026-10-19）。Alchemist（`dg2`）は別の読み方をするので当たりません。
+Ubuntu 26.04・Debian・Arch は 2.28.4、Fedora 44 は 2.24.8 で、更新で 2.41.9 になります。
+再現とその確かめは、データフォルダの `records/igc-gep-check/` にあります。
+
+### エンジンの回避
+
+- ランタイムは、SYCL のランタイムが装置を並べる前に（`src/core/device.cpp` の `engine_devices`）、利用者が設定していなければ `IGC_EnableGEPSimplification=0` を設定します。IGC はこれを最初のカーネルを訳すとき（装置を並べるとき）に読むので、並べた後では効きません。
+- 切ると B70 で 1K の prompt の decode が 5〜10% 遅く、32K では変わりません（generate、2026-10-19）。そのため、ローダーが見つける `libigc.so.2` のファイル名の版が 2.25〜2.31（`libigc.so.2.28.4+0`）か版がなく、かつ xe ドライバーの GPU の graphics IP が Xe2 以降（`xe_gpu_from_xe2`: `DRM_XE_DEVICE_QUERY_GT_LIST` の主の GT の `ip_ver_major` が 20 以上。0 は GMD_ID のない Alchemist 以前。Level Zero を読む前にカーネルのドライバーに聞きます）のときだけ設定します。
+- Linux だけです。Windows は何も設定せず、ドライバーのコンパイラーをそのまま使います。
+- 起動のログ（`IGC's GEP simplification is off`）、エンジンの報告（`INFO igc_workaround=<version>`、Web の知らせと About）、`xestrata --setup`（`setup.py` の `check_igc`、同じ 2 つの条件）が知らせます。案内は Fedora 44（IGC 2.32 以降）か Podman のコンテナ（中は Fedora 44）です。setup・文書（BUILD のパッケージ、DETAILS の困ったとき）・リリースノートは、Intel の graphics PPA（compute-runtime 26.31 と IGC 2.40、Ubuntu 24.04/26.04）も挙げます。HWE カーネルならそのまま PPA、GA カーネルならまず HWE カーネルにします（PPA は IGC と一緒にドライバーも入れ、そのドライバーは HWE カーネル用です）。
+- 同じ `xestrata --setup`（`check_level_zero`）は、VRAM が空いているのにデバイスのメモリーを断る不具合を直した版（26.22.38646.4。intel/compute-runtime #916、xe のカーネルの不具合は Linux 7.1 で修正、XeStrata の #34 と #15）より古い Level Zero のドライバーで、Ubuntu 24.04/26.04 の HWE カーネルなら起動を止めます（`--old-driver` でそのまま起動）。GA カーネルとほかの環境では知らせるだけで進みます。
+
+### カーネルの書き方と確かめ方
+
+- どちらの IGC でも正しく訳されるように書きます。前に読んだ所からポインターを N ずつ進める（`glm5_hc_mean`）か、添字を 1 つの積で書く（`x[(t * HC + s) * N + n]`）。`xt[N]` と並べて、2 以上の定数 k の `xt[k * N]` を書きません。
+- 動かさずに IGC の訳を見るには、IGC のダンプを有効にして Xe2 向けに先に訳し（`IGC_ShaderDumpEnable=1 IGC_DumpToCustomDir=dump clang++ -fsycl -fsycl-targets=intel_gpu_bmg_g31 ...`）、`dump/*_entry_*.asm` を読みます。誤訳は、読みの前のスカラーの `mul ... 0x1C:uw`（28N: 読み違えた `xt[8 * N]` の 32N バイトから `xt[N]` の 4N を引いたもの）として出ます。`*_beforeUnification.ll` は IGC が受け取った IR です。
+- `IGC_EnableGEPSimplification=1 ./igc_gep_probe` は、誤った読みの分の余白を取ってこの形を GPU で動かし、当たる IGC では失敗します。CTest はランタイムの回避を通して動かすので、どの GPU でも通ります。
+
 ## GPU の測定
 
 ### 道具を足さずにできること

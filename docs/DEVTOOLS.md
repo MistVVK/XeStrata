@@ -293,6 +293,29 @@ chmod +x ~/.local/bin/sde64
 sde64 -version
 ```
 
+## Intel Graphics Compiler (IGC): the GEP simplification of 2.27 to 2.30
+
+IGC 2.27.10, 2.28.4 and 2.30.1 miscompile, for Xe2 and Xe3 GPUs (the targets `bmg`, `lnl` and `ptl`: the Arc B-series, Lunar Lake, Panther Lake), a kernel that reads from one pointer at a runtime index and at constant multiples of it.
+With `const float* xt = x + base; xt[0] + xt[N] + xt[2 * N] + xt[3 * N]`, intel/llvm's optimizer writes `xt[2 * N]` and `xt[3 * N]` as byte offsets (8N and 12N bytes) from the pointer it already offset for `xt[N]`, and IGC's GEP simplification takes those byte offsets for element indices.
+The kernel reads `xt[8 * N]` and `xt[9 * N]`: a fault past the buffer (`DEVICE_LOST`, `Engine memory CAT error` in the kernel's log) or wrong values inside it.
+2.24.8 and earlier and 2.32.7 and later compile the reads right (each release's libigc from GitHub on the reproducer's SPIR-V, 2026-10-19); Alchemist (`dg2`) is not affected (IGC reads its buffers there another way).
+Ubuntu 26.04, Debian and Arch ship 2.28.4; Fedora 44 ships 2.24.8 and updates to 2.41.9.
+The reproducer and the checks are in the data folder's `records/igc-gep-check/`.
+
+### The engine's workaround
+
+- The runtime sets `IGC_EnableGEPSimplification=0` in its environment before the SYCL runtime lists the devices (`engine_devices` in `src/core/device.cpp`), unless the user set the variable; IGC reads it when it first compiles a kernel, which the runtime does as it lists the devices.
+- Off, the pass costs the B70 5 to 10% of the decode of a 1K prompt and nothing at 32K (generate, 2026-10-19), so the variable is set only where the `libigc.so.2` the loader finds is 2.25 to 2.31 by its file name (`libigc.so.2.28.4+0`) or carries no version, and a GPU on the xe driver is Xe2 or later by its graphics IP (`xe_gpu_from_xe2`: the main GT's `ip_ver_major` of `DRM_XE_DEVICE_QUERY_GT_LIST` 20 or more; 0, a GPU without GMD_ID, is Alchemist or older; asked of the kernel driver before Level Zero loads).
+- Linux only: Windows sets nothing and keeps its driver's compiler as it is.
+- The start log says so (`IGC's GEP simplification is off`), the engine reports it as `INFO igc_workaround=<version>` (the web app's notice and its About page), and `xestrata --setup` (`check_igc` in `setup.py`, on the same two conditions) warns of it. They send the user to Fedora 44 (IGC 2.32 or later) or the Podman container (Fedora 44 inside); setup, the documents (BUILD's packages, DETAILS's troubleshooting) and the release notes name Intel's graphics PPA as well (compute-runtime 26.31 and IGC 2.40 for Ubuntu 24.04/26.04): with the HWE kernel straight to the PPA, from the GA kernel to the HWE kernel first (the PPA installs the driver with the IGC, and that driver is the one for the HWE kernel).
+- The same `xestrata --setup` (`check_level_zero`) stops the start when the Level Zero driver predates the build that stops it refusing device memory while the VRAM is free (26.22.38646.4; intel/compute-runtime #916, xe's kernel bug fixed in Linux 7.1; on XeStrata's side #34 and #15) on Ubuntu 24.04/26.04 with the HWE kernel (`--old-driver` starts anyway); on the GA kernel and elsewhere it only says so and goes on.
+
+### Writing and checking kernels
+
+- Write kernels that compile right either way: step a pointer by N from the last read (`glm5_hc_mean`), or index the stream in one product (`x[(t * HC + s) * N + n]`), not `xt[k * N]` with a constant k of 2 or more beside `xt[N]`.
+- To see what IGC makes of a kernel without running it, compile ahead for Xe2 with IGC's dumps on (`IGC_ShaderDumpEnable=1 IGC_DumpToCustomDir=dump clang++ -fsycl -fsycl-targets=intel_gpu_bmg_g31 ...`) and read `dump/*_entry_*.asm`: the miscompile shows as a scalar `mul ... 0x1C:uw` (28N: the 32N bytes of the misread `xt[8 * N]`, less the 4N of `xt[N]`) ahead of the loads; `*_beforeUnification.ll` is the IR IGC received.
+- `IGC_EnableGEPSimplification=1 ./igc_gep_probe` runs the pattern on the GPU with room for the wrong reads and fails on an affected IGC; CTest runs it through the runtime's workaround, where it passes on every GPU.
+
 ## Measuring the GPU
 
 ### What works without extra tools

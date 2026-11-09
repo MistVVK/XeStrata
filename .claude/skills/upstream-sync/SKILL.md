@@ -120,7 +120,7 @@ XeStrata's kernels are written from scratch (SYCL) and its prompt path and runti
   and the namespace `strata` stay upstream's.
   `tools/lint/upstream_name.py` (run by `tools/lint/run.sh`) reports what was missed; a use that is upstream's on
   purpose (a field shared with upstream, a mark inside a file) goes into its ALLOWED list.<!-- upstream-name: on -->
-- Once the ledger is done, set `STRATA_UPSTREAM_VERSION` in `CMakeLists.txt` to the tag and `XESTRATA_REVISION` back to 1 (AGENTS.md, "Versions"), and replace any old upstream hash a document names with the rewritten one.
+- Once the ledger is done, set `STRATA_UPSTREAM_VERSION` in `CMakeLists.txt` to the tag and `XESTRATA_REVISION` back to 1 (AGENTS.md, "Packages and versions"), and replace any old upstream hash a document names with the rewritten one.
 - Then bring the license classes (AGENTS.md, Licenses) to the new tag, in one commit (`ライセンスの表示を upstream <version> に合わせる`): `python tools/license_class.py --fix` rewrites the headers, so a file brought back to upstream's content loses XeStrata's line and goes back to MIT, and one XeStrata has changed for the first time gets XeStrata's line and `LGPL-3.0-or-later AND MIT`.
   What it reports and does not fix is fixed by hand: a `REUSE.toml` annotation (upstream's unchanged data files go under one with upstream's holders and MIT) and a file without a header. A new file of upstream's taken as it is gets a header with upstream's holders and MIT (the header is not a change); one taken and changed, both holders and `LGPL-3.0-or-later AND MIT`.
   A later commit of the run that changes an unchanged file of upstream's also changes its header; step 6's lint finds the ones missed.
