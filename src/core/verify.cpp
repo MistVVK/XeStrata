@@ -912,6 +912,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     sampling_.temperature = 0.0f;
 #if defined(STRATA_GPU_METAL)
     if (metal_ == nullptr) metal_ = strata::metal_engine::window_create();
+    // #879: last_stage() reads le_, and its default is set below only where the CUDA prepare runs; this branch
+    // returns before that line, so without it the #879 gates (note_nonfinite's, and the host row scan's
+    // nan_guard_on() && last_stage()) never open on the Mac and the guard silently stays off (#3287).
+    if (le_ < 0) le_ = g.n_layers;
     if (!strata::metal_engine::window_init(metal_, g, ss, max_t, ss.qsa_states[ss.qsa_primary()].max_cells, &n_vocab_, err)) return false;
     if (!tap_req_.empty()) {   // DFlash2: the Metal window writes the taps itself (metal/src/engine/dflash2.inc); tap_dev() is its unified-memory buffer
         const float* tp = nullptr;
