@@ -228,9 +228,9 @@ struct QiTrainer::Impl {
     void sync_views(Lora& l) {
         const int64_t r = rank;
         train::f16_copy(l.A, r * l.K, l.ad.a, s);
-        train::transpose_f16(l.ad.a, r, l.K, l.ad.at, s);
+        if (l.ad.at != nullptr) train::transpose_f16(l.ad.a, r, l.K, l.ad.at, s);
         train::f16_copy(l.B, l.N * r, l.ad.b, s);
-        train::transpose_f16(l.ad.b, l.N, r, l.ad.bt, s);
+        if (l.ad.bt != nullptr) train::transpose_f16(l.ad.b, l.N, r, l.ad.bt, s);
     }
     // ai-toolkit's QwenImage21Rope: a text row's three axes its position, the image's frame axis the text's length
     // and its height and width centred on zero; each axis's pairs at 1 / 10000^(2j / dim) (FP32, as torch.outer
@@ -319,6 +319,7 @@ bool QiTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* 
         m.s = stream;
         m.rank = rank;
         m.g = std::make_unique<GgufFile>(dit);
+        if (!m.gemm.init(stream, 1 << 20, err)) return false;   // before the adapters: their views depend on it
         int64_t N = 0, K = 0;
         m.iin = m.w16("img_in.weight", kBF16, N, K);
         m.C = N;
@@ -369,9 +370,11 @@ bool QiTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* 
                 l.ad.rank = rank;
                 l.ad.scale = 1.0f;   // alpha = rank
                 l.ad.a = m.get<uint16_t>(rank * l.K);
-                l.ad.at = m.get<uint16_t>(rank * l.K);
                 l.ad.b = m.get<uint16_t>(l.N * rank);
-                l.ad.bt = m.get<uint16_t>(l.N * rank);
+                if (!m.gemm.f16_batch_ex_ok()) {   // the transposed views, where the products cannot read the rows
+                    l.ad.at = m.get<uint16_t>(rank * l.K);
+                    l.ad.bt = m.get<uint16_t>(l.N * rank);
+                }
                 l.ad.dA = m.get<float>(rank * l.K);
                 l.ad.dB = m.get<float>(l.N * rank);
                 m.sync_views(l);
@@ -403,7 +406,6 @@ bool QiTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* 
         m.mb = m.get<float>(8 * m.C);
         m.scale_out = m.get<float>(2 * m.C);
         m.zero = m.get<float>(m.C);
-        if (!m.gemm.init(stream, 1 << 20, err)) return false;
         gpu::stream_sync(stream);
         return true;
     } catch (const std::exception& e) {
@@ -477,6 +479,9 @@ float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, 
         r.cos = m.cos;
         r.sin = m.sin;
         r.mod = m.mb;
+        // the MLP 1,024 rows a pass: its scratch at 4,035 rows 4.5 -> 2.5 GB, the B70's step the same (512: 4% slower,
+        // 2026-11-09)
+        r.mlp_rows = 1024;
         const Impl::Block& B = m.blk[(size_t) b];
         for (int i = 0; i < kQiProducts; ++i) {
             r.p[i] = B.p[i];
@@ -515,12 +520,22 @@ float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, 
     train::dgrad(m.d16, m.drs, m.pout_t, hw, kInCh, C, m.dln, m.scratch, false, m.gemm, s);
     gpu::memset_async(m.dX, 0, (size_t) (R * C) * 4, s);
     dit_rows::ln_mod_bwd(xf, m.mean, m.inv, m.scale_out, m.dln, hw, C, m.dX + nt * C, nullptr, nullptr, s);
+    // the dgrads read the weights' rows as they are where the GPU takes transposed products (no transposed copy each
+    // block each step)
+    const bool rows_ok = m.gemm.f16_batch_ex_ok();
     for (int64_t b = nb - 1; b >= 0; --b) {
         const Impl::Block& B = m.blk[(size_t) b];
         QiBlockRun r = run_of(b);
-        for (int i = 0; i < kQiProducts; ++i) {   // the dgrads' transposed weights (an int8 base's straight through)
-            if (B.p[i].w8 != nullptr) train::w8_dequant_t(B.p[i].w8, B.p[i].sw, B.p[i].N, B.p[i].K, m.w8tmp, m.wt[i], s);
-            else train::transpose_f16(B.p[i].w, B.p[i].N, B.p[i].K, m.wt[i], s);
+        for (int i = 0; i < kQiProducts; ++i) {   // the dgrads' weights (an int8 base's straight through)
+            const train::Product& pr = B.p[i];
+            if (rows_ok) {   // read as they are: the 16-bit weight itself, an int8 base's rotated back
+                if (pr.w8 != nullptr) train::w8_dequant_rows(pr.w8, pr.sw, pr.N, pr.K, m.wt[i], s);
+                r.p[i].wr = pr.w8 != nullptr ? m.wt[i] : pr.w;
+                r.p[i].wt = nullptr;
+                continue;
+            }
+            if (pr.w8 != nullptr) train::w8_dequant_t(pr.w8, pr.sw, pr.N, pr.K, m.w8tmp, m.wt[i], s);
+            else train::transpose_f16(pr.w, pr.N, pr.K, m.wt[i], s);
             r.p[i].wt = m.wt[i];
         }
         r.out = m.tmp_out;

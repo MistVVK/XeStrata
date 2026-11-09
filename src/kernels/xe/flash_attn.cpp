@@ -43,9 +43,13 @@
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 
 namespace strata::kernels {
 
@@ -55,7 +59,8 @@ namespace mx = sycl::ext::oneapi::experimental::matrix;
 namespace syclex = sycl::ext::oneapi::experimental;
 using namespace xe::attn;
 
-template<int P, int D, bool F32, int F>   // P: the tiles; D: head_dim; F32: FP32 output, else FP16; F: as above
+// P: the tiles; D: head_dim; F32: FP32 output, else FP16; F: as above; T: in place, the output scaled a tile at a time
+template<int P, int D, bool F32, int F, bool T = false>
 struct Kernel {
     using Ops = typename Path<P>::Ops;
     static constexpr bool GATHER = F >= 0;
@@ -68,9 +73,11 @@ struct Kernel {
     static constexpr int SLD = CH + 4, PLD = CH + 8;   // S's and P's row strides in local memory: rows apart in banks
     static constexpr int KLD = D + 8;              // a gathered key's row (halves; 16-byte aligned rows)
     // S [TM][SLD] FP32, which also holds Q as FP16 at the start and the output when it is scaled: in place all of it
-    // [TM][D] (a tile at a time, the RTX 4070's image attention ran 13.4 ms against 10.2, 32 heads of 4096 rows),
-    // gathered a tile [TM][TN] at a time (the room goes to the work-group's K and V)
-    static constexpr bool WHOLE = !GATHER;
+    // [TM][D], or with T a tile [TM][TN] at a time, gathered a tile at a time (the room goes to the work-group's K and
+    // V).  Neither is faster everywhere: the RTX 4070's image attention (32 heads of 4096 rows) ran 10.2 ms whole and
+    // 13.4 a tile at a time, while the B70's less local memory a sub-group, more work-groups a core, ran Qwen-Image-2.1's
+    // training attention in 0.76 of the time (2026-11-09); in_place_tiles times the two
+    static constexpr bool WHOLE = !GATHER && !T;
     static constexpr int SREG = std::max(TM * SLD, WHOLE ? TM * D : TM * D / 2);
     static_assert(SG % TM == 0 && CW % 8 == 0, "the softmax's rows split evenly over the lanes, 8 columns at a time");
     // local memory a sub-group takes: S, P, a row's m and l; a work-group's gathered K and V
@@ -595,9 +602,9 @@ int path_of(const sycl::device& d) {
 // and 32 gathered: a work-group copies each chunk once for its rows, and on the B70 8 sub-groups' 64 rows copied each
 // chunk too often (16 heads of 256 over INT8 pools, 2,048 queries after 28K cells: 294 ms at 8, 151 at 16 and more;
 // the RTX 4070's 48 KiB of local memory takes fewer either way)
-template<int P, int D, int F>
+template<int P, int D, int F, bool T = false>
 int nsg_most(const sycl::device& d) {
-    using K = Kernel<P, D, false, F>;
+    using K = Kernel<P, D, false, F, T>;
     const size_t local = d.get_info<sycl::info::device::local_mem_size>();
     const size_t wg = d.get_info<sycl::info::device::max_work_group_size>();
     int nsg = K::GATHER ? 32 : 8;
@@ -605,15 +612,15 @@ int nsg_most(const sycl::device& d) {
     return (size_t) nsg * K::SG_BYTES + K::WG_BYTES <= local ? nsg : 0;
 }
 
-template<int P, int D, int F>
+template<int P, int D, int F, bool T = false>
 int nsg_most_of(const sycl::device& d) {
     static core::PerDevice<int> per_device;
-    return per_device.get(d, [&d] { return nsg_most<P, D, F>(d); });
+    return per_device.get(d, [&d] { return nsg_most<P, D, F, T>(d); });
 }
 
-template<int P, int D, bool F32, int F>
+template<int P, int D, bool F32, int F, bool T = false>
 void launch(sycl::queue& q, const FlashAttnArgs& a, int nsg) {
-    using K = Kernel<P, D, F32, F>;
+    using K = Kernel<P, D, F32, F, T>;
     const int64_t G = a.n_head / a.n_kv;
     // in place: query rows, its tiles inside the rows; gathered: (query, head) rows of a KV head
     const int64_t row0 = K::GATHER ? a.first * G : a.first / K::TM * K::TM;
@@ -631,14 +638,70 @@ void launch(sycl::queue& q, const FlashAttnArgs& a, int nsg) {
     });
 }
 
-template<int P, int D, int F>
-bool run(sycl::queue& q, const FlashAttnArgs& a, int nsg) {
-    const int most = nsg_most_of<P, D, F>(q.get_device());
+template<int P, int D, int F, bool T = false>
+bool run_one(sycl::queue& q, const FlashAttnArgs& a, int nsg) {
+    const int most = nsg_most_of<P, D, F, T>(q.get_device());
     if (most == 0) return false;
     nsg = nsg <= 0 ? most : std::min(nsg, most);
-    if (a.out_f32) launch<P, D, true, F>(q, a, nsg);
-    else launch<P, D, false, F>(q, a, nsg);
+    if (a.out_f32) launch<P, D, true, F, T>(q, a, nsg);
+    else launch<P, D, false, F, T>(q, a, nsg);
     return true;
+}
+
+bool run_fma(sycl::queue& q, const FlashAttnArgs& a);
+
+// In place, the form that runs: the output scaled whole (0) or a tile at a time (1, Kernel's T) on the matrix engines,
+// or the FMA form (2).  XESTRATA_ATTN_FWD_FORM (whole, tiles or fma), or the fastest the first time a device takes
+// enough work (rows x keys x heads past 2^26, 32 heads of 1,450 rows; less, the whole form), each run twice there and the second run timed
+// (the call is its own: the same outputs either way).  The answer is kept a device and head size.  On the A380 the
+// FMA form ran 32 heads of 2,304 rows in 190 ms against 407 whole and 222 a tile at a time: its 8-wide tiles spill
+// about 11 KiB a thread (the output's accumulators alone fill its 128 registers of 32 bytes, 2026-11-09)
+template<int P, int D>
+bool run_in_place(sycl::queue& q, const FlashAttnArgs& a, int nsg) {
+    auto go = [&](int form) {
+        return form == 2 ? run_fma(q, a) : form == 1 ? run_one<P, D, -1, true>(q, a, nsg) : run_one<P, D, -1>(q, a, nsg);
+    };
+    if (const char* e = strata::env_get("ATTN_FWD_FORM")) {
+        const std::string f = e;
+        return go(f == "fma" ? 2 : f == "tiles" ? 1 : 0);
+    }
+    static std::mutex mu;
+    static std::unordered_map<sycl::device, int> chose;
+    const sycl::device dev = q.get_device();
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        auto it = chose.find(dev);
+        if (it != chose.end()) return go(it->second);
+    }
+    if ((double) (a.row_end - a.first) * (double) a.keys * (double) a.n_head < (double) (int64_t{1} << 26)) return go(0);
+    // a queue recording a SYCL graph cannot be waited on: the whole form, the choice left to a call outside one
+    namespace sx = sycl::ext::oneapi::experimental;
+    if (q.ext_oneapi_get_state() == sx::queue_state::recording) return go(0);
+    int best = -1;
+    double best_t = 0.0;
+    for (int form = 0; form < 3; ++form) {
+        bool ok = go(form);
+        q.wait();
+        const auto t0 = std::chrono::steady_clock::now();
+        ok = ok && go(form);
+        q.wait();
+        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        if (ok && (best < 0 || t < best_t)) {
+            best = form;
+            best_t = t;
+        }
+    }
+    if (best < 0) return false;
+    if (best != 2) go(best);   // the outputs of the form kept (the FMA form ran last)
+    std::lock_guard<std::mutex> lock(mu);
+    chose[dev] = best;
+    return true;
+}
+
+template<int P, int D, int F>
+bool run(sycl::queue& q, const FlashAttnArgs& a, int nsg) {
+    if constexpr (F < 0) return run_in_place<P, D>(q, a, nsg);
+    else return run_one<P, D, F>(q, a, nsg);
 }
 
 template<int P, int D>

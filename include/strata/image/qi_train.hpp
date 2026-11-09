@@ -47,6 +47,10 @@ struct QiBlockRun {
     /// a later call with tape_replay and dout runs the backward on it without the forward again.
     train::Arena* tape = nullptr;
     bool tape_replay = false;
+    /// The MLP's rows a pass (0: every row): its products, SwiGLU and their backwards a block of this many rows at a
+    /// time, its widest scratch (2F a row) that many rows (taken where its adapters are plain LoRAs or none and the
+    /// GPU takes the transposed products)
+    int64_t mlp_rows = 0;
 };
 
 /// One block, forwards (to out) and, given dout, backwards through its own tape: the adapters' gradients added into

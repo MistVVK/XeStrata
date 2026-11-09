@@ -66,6 +66,9 @@ uint32_t* scale_word(int k, void* stream);
 /// (null: 1) put back, added into dX or written over it.  scratch holds T * K FP32 sums.
 void dgrad(const uint16_t* dy16, const float* rsY, const uint16_t* wt, int64_t T, int64_t N, int64_t K, float* dX,
            float* scratch, bool accumulate, prefill::Gemm& gemm, void* stream);
+/// The same through W's rows [N][K] as they are (Gemm::f16_batch_ex, which the caller checked takes the GPU).
+void dgrad_rows(const uint16_t* dy16, const float* rsY, const uint16_t* w, int64_t T, int64_t N, int64_t K, float* dX,
+                float* scratch, bool accumulate, prefill::Gemm& gemm, void* stream);
 
 /// dW[N,K] = sum_t dY[t,n] X[t,k], from the two transposed FP16 views (dy16t [N,T], x16t [K,T]) times mul and the G
 /// of gbits (scaled_transpose_f16's; null: 1).
@@ -86,12 +89,13 @@ void scale_cols(float* y, const float* r, int64_t rows, int64_t cols, void* stre
 /// h16t and x16t are the transposed views the forward kept (transpose_f16 of the rows it wrote).  dy16_done and
 /// rsY_done (null: made here) are dY's FP16 rows and their scales where the caller has them already (its dgrad's).
 /// With h16 and x16, the rows themselves, and a GPU f16_batch_ex takes (Gemm::f16_batch_ex_ok), dB and dA are products
-/// that read dY's and dh's rows transposed and nothing is transposed: h16t and x16t may be null then.
+/// that read dY's and dh's rows transposed and nothing is transposed: h16t and x16t may be null then, and bt16 too
+/// with B's own rows b16 [rows][rank] (dh's product reads them as they are).
 void lora_bwd(const float* hr, const float* xr, const uint16_t* h16t, const uint16_t* x16t, const uint16_t* bt16,
               const float* dY, int64_t T, int64_t rows, int64_t cols, int64_t rank, float scale, float* dB, float* dA,
               float* scratch, uint16_t* tmp16, float* rsT, prefill::Gemm& gemm, void* stream,
               const uint16_t* dy16_done = nullptr, const float* rsY_done = nullptr, const uint16_t* h16 = nullptr,
-              const uint16_t* x16 = nullptr);
+              const uint16_t* x16 = nullptr, const uint16_t* b16 = nullptr);
 
 /// A LoKr's factors, backwards.  The delta is kron(w1, w2_a w2_b) and the step's gradient of the whole weight
 /// (dDelta [out][in], out = out_l * out_k, in = in_m * in_n) is what a wgrad of the delta's rows gives; each factor
@@ -121,9 +125,10 @@ struct Adapter {
     int64_t rank = 0;
     float scale = 0.f;                 // s * alpha / rank, folded (the request's strength times the file's alpha)
     uint16_t* a = nullptr;            // [rank][K] FP16: h = x A^T reads it (written on sync, read in the block)
-    uint16_t* at = nullptr;           // [K][rank] the same values transposed (the input gradient's dgrad reads it)
+    uint16_t* at = nullptr;           // [K][rank] the same values transposed (the input gradient's dgrad reads it; null:
+                                      // the GPU's transposed products read a's rows, Gemm::f16_batch_ex_ok)
     uint16_t* b = nullptr;            // [N][rank] FP16: delta = h B^T reads it
-    uint16_t* bt = nullptr;           // [rank][N] the same values transposed (lora_bwd reads it)
+    uint16_t* bt = nullptr;           // [rank][N] the same values transposed (lora_bwd reads it; null as at)
     float* dA = nullptr;               // [rank][K], added into
     float* dB = nullptr;               // [N][rank], added into
     const float* m = nullptr;         // [N] the DoRA magnitude (null: a plain LoRA)
@@ -171,6 +176,9 @@ struct Product {
     /// back) through wt, which w8_dequant_t writes.
     const int8_t* w8 = nullptr;
     const float* sw = nullptr;
+    /// W's rows [N][K] FP16 the dgrad reads as they are where wt is null (a GPU Gemm::f16_batch_ex takes): w itself,
+    /// or an int8 base's straight-through weight (w8_dequant_rows), with no transposed copy made
+    const uint16_t* wr = nullptr;
 };
 
 /// A weight's rows [N][K] (FP16) as a QLoRA's base: q [N][K] int8 and s [N] (Product::w8, sw).

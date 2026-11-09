@@ -400,6 +400,31 @@ int main(int argc, char** argv) {
             const double fl = 7.0 * 2.0 * (double) T * (double) T * (double) hd * (double) H;
             std::printf("attention backward %lld rows %lld heads: %.2f ms (%.1f TFLOPS of the fused form's 7 "
                         "products)\n", (long long) T, (long long) H, 1e3 * best, fl / best / 1e12);
+        } else if (op == "attnftime") {   // the attention's forward timed: rows, heads, n_causal from dims (3 floats)
+            Var dims = load(dir, "dims");
+            const int64_t T = (int64_t) dims.hf()[0], H = (int64_t) dims.hf()[1], nc = (int64_t) dims.hf()[2];
+            const int64_t hd = 128, C = H * hd, Tp = strata::image::qi_attn_rows(T);
+            std::vector<uint16_t> h16((size_t) (Tp * C));
+            uint32_t st = 12345;
+            auto rnd = [&] { st = st * 1664525u + 1013904223u; return (float) (st >> 8) / 16777216.f - 0.5f; };
+            Dev Q(Tp * C * 2), K(Tp * C * 2), V(Tp * C * 2), O(T * C * 4), L(T * H * 4);
+            for (Dev* d : {&Q, &K, &V}) {
+                for (size_t i = 0; i < h16.size(); ++i)
+                    h16[i] = i < (size_t) (T * C) ? strata::kernels::f16_from_f32(rnd() * 4.f) : 0;
+                strata::gpu::copy(d->p(), h16.data(), h16.size() * 2);
+            }
+            double best = 1e30;
+            for (int i = 0; i < 6; ++i) {
+                strata::gpu::stream_sync(s);
+                const auto t0 = std::chrono::steady_clock::now();
+                qi_attention_train(Q.ch(), K.ch(), V.ch(), T, H, hd, O.f(), L.f(), s, nc);
+                strata::gpu::stream_sync(s);
+                const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                if (i > 1) best = std::min(best, t);
+            }
+            const double fl = 4.0 * (double) T * (double) T * (double) hd * (double) H;
+            std::printf("attention forward %lld rows %lld heads: %.2f ms (%.1f TFLOPS)\n", (long long) T, (long long) H,
+                        1e3 * best, fl / best / 1e12);
         } else if (op == "gemmtime") {   // one product's time in FP16 and W8A8: rows, K, N from dims (3 floats)
             Var dims = load(dir, "dims");
             const auto [f16, w8] = dit_rows::time_w8_f16((int64_t) dims.hf()[0], (int64_t) dims.hf()[1],

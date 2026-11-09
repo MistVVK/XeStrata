@@ -21,6 +21,9 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/flash_attn.hpp"
 #include "strata/kernels/flash_attn_bwd.hpp"
+#include "strata/kernels/matrix_report.hpp"
+#include "strata/kernels/sdpa_aotriton.hpp"
+#include "strata/kernels/sdpa_onednn.hpp"
 #include "strata/prefill/gemm.hpp"
 
 #include <sycl/sycl.hpp>
@@ -34,8 +37,10 @@
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 
 #include "dit_rows.hpp"
+#include "qi_sdpa.hpp"
 
 namespace strata::image {
 
@@ -271,10 +276,8 @@ void scaled_do(const float* dO, const float* O, int64_t rows, int64_t heads, int
 // the fused backward (kernels::flash_attn_bwd) where the GPU takes it: false, nothing done, where it does not
 bool fused_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, const float* o32, const float* lse,
                const float* dO, int64_t T, int64_t H, int64_t hd, float* dQ, float* dK, float* dV, bool accumulate,
-               void* stream, int64_t n_causal) {
-    if (strata::env_get("ATTN_BWD_PRODUCTS") != nullptr || hd != 128 || dQ == nullptr || dK == nullptr ||
-        dV == nullptr)
-        return false;
+               void* stream, int64_t n_causal, int64_t q_rows = 0) {
+    if (hd != 128 || dQ == nullptr || dK == nullptr || dV == nullptr) return false;
     const int64_t Tp = qi_attn_rows(T);   // the chunks' rows, read whole: dO's past T zero, as q, k and v's are
     const size_t n16 = (size_t) (Tp * H * hd), n32 = (size_t) (H * T + H);
     const size_t bytes = 256 + n32 * 4 + n16 * 2;
@@ -327,8 +330,176 @@ bool fused_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, co
     a.dk = dK;
     a.dv = dV;
     a.accumulate = accumulate;
+    a.q_rows = q_rows;
     return kernels::flash_attn_bwd(a, stream);
 }
+
+// a stream's workspace of at least `bytes`, kept between the calls (`slot` one of a few, each its own)
+uint8_t* workspace(void* stream, int slot, size_t bytes) {
+    static std::mutex mu;
+    static std::map<std::pair<void*, int>, std::pair<uint8_t*, size_t>> kept;
+    std::lock_guard<std::mutex> lock(mu);
+    auto& [p, cap] = kept[{stream, slot}];
+    if (cap < bytes) {
+        if (p != nullptr) {
+            gpu::stream_sync(stream);
+            gpu::free(p);
+            p = nullptr;
+            cap = 0;
+        }
+        if (!gpu::alloc_device(reinterpret_cast<void**>(&p), bytes))
+            throw std::runtime_error("image engine: the attention's workspace (" + std::to_string(bytes >> 20) +
+                                     " MiB)");
+        cap = bytes;
+    }
+    return p;
+}
+
+// The GPU maker's library's attention for training (oneDNN's SDPA on Intel GPUs, cuDNN's on NVIDIA ones in the
+// contrib-llvm mode, aotriton's on AMD ones), no mask:
+// the forward into o16 FP16 and st [H][rows] (the libraries' layout), the backward into FP16 gradients in do16's unit;
+// false where none takes the GPU
+bool maker_fwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t rows, int64_t keys, int64_t H,
+               int64_t hd, uint16_t* o16, float* st, void* stream) {
+#if STRATA_ONEDNN
+    if (kernels::onednn_sdpa_train_fwd(q16, k16, v16, rows, keys, H, hd, o16, st, stream)) return true;
+#endif
+#if STRATA_CUDNN
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    if (q.get_device().get_backend() == sycl::backend::ext_oneapi_cuda && !kernels::no_xmx())
+        return sdpa::cudnn_train(q, false, q16, k16, v16, nullptr, nullptr, st, rows, keys, H, hd, o16, nullptr,
+                                 nullptr, nullptr);
+#endif
+    return kernels::aotriton_sdpa_train(false, q16, k16, v16, nullptr, nullptr, st, rows, keys, H, hd, o16, nullptr,
+                                        nullptr, nullptr, nullptr, stream);
+}
+// ws: rows * H * (hd + 1) floats of the library's own
+bool maker_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, const uint16_t* o16, float* st,
+               const uint16_t* do16, int64_t rows, int64_t keys, int64_t H, int64_t hd, uint16_t* dq16, uint16_t* dk16,
+               uint16_t* dv16, float* ws, void* stream) {
+#if STRATA_ONEDNN
+    if (kernels::onednn_sdpa_train_bwd(q16, k16, v16, o16, st, do16, rows, keys, H, hd, dq16, dk16, dv16, stream))
+        return true;
+#endif
+#if STRATA_CUDNN
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    if (q.get_device().get_backend() == sycl::backend::ext_oneapi_cuda && !kernels::no_xmx())
+        return sdpa::cudnn_train(q, true, q16, k16, v16, o16, do16, st, rows, keys, H, hd, nullptr, dq16, dk16, dv16);
+#endif
+    return kernels::aotriton_sdpa_train(true, q16, k16, v16, o16, do16, st, rows, keys, H, hd, nullptr, dq16, dk16,
+                                        dv16, ws, stream);
+}
+
+// The library's attention for training: the image rows (every key seen) through it, the text rows before them
+// (n_causal: causal) through the engine's own kernels, each the rows its own.
+
+bool library_fwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t H, int64_t hd,
+                 float* out32, float* lse, void* stream, int64_t nt) {
+    const int64_t C = H * hd, ri = T - nt;
+    if (ri <= 0) return false;
+    uint8_t* ws = workspace(stream, 1, (size_t) (ri * C) * 2 + (size_t) (ri * H) * 4);
+    auto* o16 = reinterpret_cast<uint16_t*>(ws);
+    auto* st = reinterpret_cast<float*>(ws + (size_t) (ri * C) * 2);   // the library's [H][ri]
+    if (!maker_fwd(q16 + nt * C, k16, v16, ri, T, H, hd, o16, st, stream)) return false;
+    float* o = out32 + nt * C;
+    float* l = lse + nt * H;
+    dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) (ri * C)), [=](sycl::id<1> id) {
+        o[id[0]] = kernels::f32_from_f16(o16[id[0]]);
+        if (id[0] < (size_t) (ri * H)) {   // its statistics into the engine's [rows][H]
+            const int64_t t = (int64_t) id[0] / H, h = (int64_t) id[0] % H;
+            l[id[0]] = st[h * ri + t];
+        }
+    });
+    if (nt > 0) {   // the text rows: the engine's own kernel, its rows alone
+        kernels::FlashAttnArgs a;
+        a.q = q16;
+        a.q_ld = a.kv_ld = a.out_ld = C;
+        a.k = k16;
+        a.v = v16;
+        a.n_head = a.n_kv = H;
+        a.head_dim = hd;
+        a.rows = a.keys = T;
+        a.n_causal = nt;
+        a.first = 0;
+        a.row_end = nt;
+        a.out = out32;
+        a.out_f32 = true;
+        a.lse = lse;
+        a.scale = 1.0f / std::sqrt((float) hd);
+        if (!kernels::flash_attn(a, stream)) return false;
+    }
+    return true;
+}
+
+// the image rows' gradients through the library, FP16 in the head's unit g (below), then times g into dQ, dK and dV
+// (written or, dK and dV, added into); false, nothing written, where the library refuses or a gradient came out past
+// FP16's range; the text rows' then through the fused kernel, their queries alone, added into dK and dV
+bool library_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, const float* o32, const float* lse,
+                 const float* dO, int64_t T, int64_t H, int64_t hd, float* dQ, float* dK, float* dV, bool accumulate,
+                 void* stream, int64_t nt) {
+    const int64_t C = H * hd, ri = T - nt;
+    constexpr size_t kHead = 512;   // nd [H], nv [H] and the flag
+    if (ri <= 0 || (size_t) (2 * H * 4 + 4) > kHead) return false;
+    const size_t n = (size_t) (T * C);
+    uint8_t* ws = workspace(stream, 2, kHead + (size_t) (T * H + H) * 4 + 5 * n * 2 + (size_t) (ri * H) * 4 +
+                                           (size_t) (ri * H * (hd + 1)) * 4);
+    auto* bits = reinterpret_cast<uint32_t*>(ws);   // nd [H], nv [H], the non-finite flag
+    uint32_t* bad = bits + 2 * H;
+    auto* D = reinterpret_cast<float*>(ws + kHead);
+    float* g = D + H * T;
+    auto* doh = reinterpret_cast<uint16_t*>(g + H);
+    uint16_t *o16 = doh + n, *dq16 = o16 + n, *dk16 = dq16 + n, *dv16 = dk16 + n;
+    auto* st = reinterpret_cast<float*>(dv16 + n);   // the image rows' statistics as the library takes them [H][ri]
+    float* lws = st + ri * H;                         // the library's own room
+    gpu::memset_async(bits, 0, kHead, stream);
+    head_norms(dO, v16, T, H, hd, bits, bits + H, stream);
+    // the fused kernel's g (dS within FP16's range) times 16: dS 2^-4 of it, so that the products' sums over the keys
+    // and the queries stay within it too (a sum past it is caught below).  The block's gradients came out the same
+    // from 2^-8 to 2^8 of it (Qwen-Image-2.1, 32 heads of 1,048 rows, 2026-11-09)
+    head_g(bits, bits + H, H, 1.f / std::sqrt((float) hd), g, stream);
+    dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) H), [=](sycl::id<1> id) { g[id[0]] *= 16.f; });
+    scaled_do(dO, o32, T, H, hd, g, doh, D, stream);
+    const float* li = lse + nt * H;
+    dit_rows::q_of(stream).parallel_for(sycl::range<1>(n), [=](sycl::id<1> id) {
+        o16[id[0]] = kernels::f16_from_f32(o32[id[0]]);
+        if (id[0] < (size_t) (ri * H)) {
+            const int64_t h = (int64_t) id[0] / ri, t = (int64_t) id[0] % ri;
+            st[id[0]] = li[t * H + h];
+        }
+    });
+    if (!maker_bwd(q16 + nt * C, k16, v16, o16 + nt * C, st, doh + nt * C, ri, T, H, hd, dq16, dk16, dv16, lws,
+                   stream))
+        return false;
+    // a gradient past FP16's range: nothing written, the caller's other forms take the step
+    const int64_t nq = ri * C;
+    dit_rows::q_of(stream).parallel_for(sycl::range<1>(n), [=](sycl::id<1> id) {
+        const size_t i = id[0];
+        bool ok = std::isfinite(kernels::f32_from_f16(dk16[i])) && std::isfinite(kernels::f32_from_f16(dv16[i]));
+        if ((int64_t) i < nq) ok = ok && std::isfinite(kernels::f32_from_f16(dq16[i]));
+        if (!ok) sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device>(*bad).store(1u);
+    });
+    uint32_t flag = 0;
+    gpu::stream_sync(stream);
+    if (!gpu::copy(&flag, bad, 4)) throw std::runtime_error("image engine: the attention's check read back");
+    if (flag != 0) {
+        std::fprintf(stderr, "xestrata-image: the library's attention gradients passed FP16's range; the engine's own "
+                             "kernels take the step\n");
+        return false;
+    }
+    float* dq = dQ + nt * C;
+    dit_rows::q_of(stream).parallel_for(sycl::range<1>(n), [=](sycl::id<1> id) {
+        const size_t i = id[0];
+        const float gh = g[(i % C) / hd];
+        if ((int64_t) i < nq) dq[i] = kernels::f32_from_f16(dq16[i]) * gh;
+        const float k = kernels::f32_from_f16(dk16[i]) * gh, v = kernels::f32_from_f16(dv16[i]) * gh;
+        dK[i] = accumulate ? dK[i] + k : k;
+        dV[i] = accumulate ? dV[i] + v : v;
+    });
+    if (nt > 0 && !fused_bwd(q16, k16, v16, o32, lse, dO, T, H, hd, dQ, dK, dV, true, stream, nt, nt))
+        throw std::runtime_error("image engine: the attention's text rows have no backward kernel here");
+    return true;
+}
+
 
 // P (FP16) and dS (FP16, in g's units) of a tile of n query rows from i0 for every head, from S and dP [h][n][T]
 // (FP32: Q K^T unscaled, dO / g . V^T): masked past `rows` and above a causal row's own key
@@ -456,9 +627,48 @@ void qi_attention_train(const uint16_t* q16, const uint16_t* k16, const uint16_t
     a.out_f32 = true;
     a.lse = lse;
     a.scale = 1.0f / std::sqrt((float) head_dim);
-    if (!kernels::flash_attn(a, stream))
-        throw std::runtime_error("image engine: no attention kernel takes a training step's shape (head_dim " +
-                                 std::to_string(head_dim) + ")");
+    // the engine's own kernel (0) or the GPU maker's library (1, library_fwd): XESTRATA_ATTN_TRAIN_FWD (own or
+    // library), or the faster the first time a GPU takes the shape (rows in steps of 512, heads), both run twice into
+    // the outputs then and the second runs timed (the same outputs either way).  On the B70 at 2,304 rows of 32
+    // heads oneDNN's took 2.0 ms and the engine's 3.1; on the A380 12.4 and 189 (2026-11-09)
+    auto run = [&](int form) {
+        if (form == 1) return library_fwd(q16, k16, v16, T, heads, head_dim, out32, lse, stream, n_causal);
+        return kernels::flash_attn(a, stream);
+    };
+    int form = -1;
+    if (const char* e = strata::env_get("ATTN_TRAIN_FWD")) {
+        form = std::string(e) == "library" ? 1 : 0;
+    } else {
+        static std::mutex mu;
+        static std::map<std::tuple<void*, int64_t, int64_t>, int> chose;
+        const auto k = std::make_tuple(stream, (T + 511) / 512, heads);
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            auto it = chose.find(k);
+            if (it != chose.end()) form = it->second;
+        }
+        if (form < 0) {
+            double best = 1e30;
+            form = 0;
+            for (int f = 0; f < 2; ++f) {
+                if (!run(f)) continue;
+                gpu::stream_sync(stream);
+                const auto t0 = std::chrono::steady_clock::now();
+                const bool ok = run(f);
+                gpu::stream_sync(stream);
+                const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                if (ok && t < best) {
+                    best = t;
+                    form = f;
+                }
+            }
+            std::lock_guard<std::mutex> lock(mu);
+            chose[k] = form;
+        }
+    }
+    if ((form == 1 && run(1)) || run(0)) return;
+    throw std::runtime_error("image engine: no attention kernel takes a training step's shape (head_dim " +
+                             std::to_string(head_dim) + ")");
 }
 
 namespace {
@@ -477,74 +687,77 @@ double seconds_since(std::chrono::steady_clock::time_point t0) {
 void qi_attention_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, const float* o32,
                       const float* lse, const float* dO, int64_t T, int64_t heads, int64_t head_dim, float* dQ,
                       float* dK, float* dV, bool accumulate, prefill::Gemm& gemm, void* stream, int64_t n_causal) {
-    // FlashAttention-2's fused backward on the matrix engines where the GPU has them (Intel's, NVIDIA's, AMD's), or
-    // the shared products: whichever ran faster the first time a GPU took the shape (rows in steps of 512, heads),
-    // both timed then (the products into scratch).  On the B70 the fused form took 32 heads of 1,088, 2,304 and 4,096
-    // rows in 2.6, 8.4 and 26 ms, the products in 2.8, 12 and 42 (2026-11-09); a GPU whose matrix engines or oneMath
-    // backend weigh otherwise takes the products.  XESTRATA_ATTN_BWD_PRODUCTS takes the products always, XESTRATA_ATTN_BWD_FUSED the fused form where
-    // the GPU runs it.
+    // Three forms: FlashAttention-2's fused backward on the matrix engines (Intel's, NVIDIA's, AMD's), the shared
+    // products, and the GPU maker's library (oneDNN's SDPA on Intel GPUs, the text rows the fused kernel's): whichever
+    // ran fastest the first time a GPU took the shape (rows in steps of 512, heads), each timed then into scratch.  On
+    // the B70 at 2,304 rows of 32 heads the library took 6.1 ms, the fused form 8.4 and the products 12; on the A380
+    // the products 57 ms, the library 145 and the fused form 509 (2026-11-09).  XESTRATA_ATTN_BWD_FORM (fused,
+    // products or library) takes one always where it runs.
     const auto dev = core::Runtime::get().stream(stream).get_device();
-    static std::mutex mu;
-    static std::map<std::tuple<void*, int64_t, int64_t>, bool> chose;   // (stream: its GPU, rows / 512, heads)
-    bool fused = false;
-    if (strata::env_get("ATTN_BWD_FUSED") != nullptr) {
-        fused = fused_bwd(q16, k16, v16, o32, lse, dO, T, heads, head_dim, dQ, dK, dV, accumulate, stream, n_causal);
-    } else if (strata::env_get("ATTN_BWD_PRODUCTS") == nullptr) {
-        std::unique_lock<std::mutex> lock(mu);
+    const size_t n = (size_t) (T * heads * head_dim);
+    auto run = [&](int form, float* q_, float* k_, float* v_, bool acc) {
+        switch (form) {
+        case 0: return fused_bwd(q16, k16, v16, o32, lse, dO, T, heads, head_dim, q_, k_, v_, acc, stream, n_causal);
+        case 2: return library_bwd(q16, k16, v16, o32, lse, dO, T, heads, head_dim, q_, k_, v_, acc, stream, n_causal);
+        default:
+            if (!products_v2(q16, k16, v16, o32, lse, dO, T, heads, head_dim, q_, k_, v_, acc, gemm, stream, n_causal))
+                products_bwd(q16, k16, v16, o32, lse, dO, T, heads, head_dim, q_, k_, v_, acc, gemm, stream,
+                             n_causal);
+            return true;
+        }
+    };
+    static const char* const kName[3] = {"fused", "products", "library"};
+    int form = -1;
+    if (const char* e = strata::env_get("ATTN_BWD_FORM")) {
+        for (int f = 0; f < 3; ++f)
+            if (std::string(e) == kName[f]) form = f;
+    } else {
+        static std::mutex mu;
+        static std::map<std::tuple<void*, int64_t, int64_t>, int> chose;   // (stream: its GPU, rows / 512, heads)
         const auto k = std::make_tuple(stream, (T + 511) / 512, heads);
-        auto it = chose.find(k);
-        if (it == chose.end()) {
-            lock.unlock();
-            // the fused form into the outputs; then, where it ran, both forms into scratch, each once to warm it (its
-            // kernels' first launch compiles them) and once timed
-            fused = fused_bwd(q16, k16, v16, o32, lse, dO, T, heads, head_dim, dQ, dK, dV, accumulate, stream,
-                              n_causal);
-            bool pick = fused;
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            auto it = chose.find(k);
+            if (it != chose.end()) form = it->second;
+        }
+        if (form < 0) {
+            // each form into scratch twice, the second run timed (the first compiles its kernels)
             float* tmp = nullptr;
-            const size_t n = (size_t) (T * heads * head_dim);
-            if (fused && gpu::alloc_device(&tmp, 3 * n * 4)) {
-                auto prod = [&] {
-                    if (!products_v2(q16, k16, v16, o32, lse, dO, T, heads, head_dim, tmp, tmp + n, tmp + 2 * n,
-                                     false, gemm, stream, n_causal))
-                        products_bwd(q16, k16, v16, o32, lse, dO, T, heads, head_dim, tmp, tmp + n, tmp + 2 * n,
-                                     false, gemm, stream, n_causal);
-                };
-                auto timed = [&](const auto& run) {
+            form = 1;
+            if (gpu::alloc_device(&tmp, 3 * n * 4)) {
+                double best = 1e30;
+                for (int f = 0; f < 3; ++f) {
+                    if (!run(f, tmp, tmp + n, tmp + 2 * n, false)) continue;
                     gpu::stream_sync(stream);
                     const auto t0 = std::chrono::steady_clock::now();
-                    run();
+                    const bool ok = run(f, tmp, tmp + n, tmp + 2 * n, false);
                     gpu::stream_sync(stream);
-                    return seconds_since(t0);
-                };
-                prod();
-                const double tf = timed([&] {
-                    fused_bwd(q16, k16, v16, o32, lse, dO, T, heads, head_dim, tmp, tmp + n, tmp + 2 * n, false,
-                              stream, n_causal);
-                });
-                pick = tf <= timed(prod);
+                    const double t = seconds_since(t0);
+                    if (ok && t < best) {
+                        best = t;
+                        form = f;
+                    }
+                }
                 gpu::free(tmp);
             }
-            lock.lock();
-            chose[k] = pick;
-            if (fused) return;   // the outputs are written
-        } else {
-            lock.unlock();
-            fused = it->second && fused_bwd(q16, k16, v16, o32, lse, dO, T, heads, head_dim, dQ, dK, dV, accumulate,
-                                            stream, n_causal);
+            std::lock_guard<std::mutex> lock(mu);
+            chose[k] = form;
         }
     }
+    // the form taken, or where it does not run (the library's gradients past FP16's range) the fused form, then the
+    // products
+    bool done = form >= 0 && run(form, dQ, dK, dV, accumulate);
+    int ran = form;
+    if (!done && form != 0) done = run(ran = 0, dQ, dK, dV, accumulate);
+    if (!done) run(ran = 1, dQ, dK, dV, accumulate);
     if (strata::env_get("ATTN_BWD_REPORT") != nullptr) {   // which path ran, once a process (a check's)
         static bool said = false;
         if (!said) {
-            std::fprintf(stderr, "attention backward: %s (matrix path %d)\n", fused ? "fused" : "products",
+            std::fprintf(stderr, "attention backward: %s (matrix path %d)\n", kName[ran],
                          kernels::flash_attn_path(&dev));
             said = true;
         }
     }
-    if (fused) return;
-    if (products_v2(q16, k16, v16, o32, lse, dO, T, heads, head_dim, dQ, dK, dV, accumulate, gemm, stream, n_causal))
-        return;
-    products_bwd(q16, k16, v16, o32, lse, dO, T, heads, head_dim, dQ, dK, dV, accumulate, gemm, stream, n_causal);
 }
 
 namespace {

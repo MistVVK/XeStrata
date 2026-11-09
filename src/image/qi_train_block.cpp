@@ -168,24 +168,38 @@ void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* s, train::Arena*
     auto* vamax = reinterpret_cast<uint32_t*>(pool.f(1));
     float* hsv = pool.rf(H);
 
+    // The MLP's rows a pass (QiBlockRun::mlp_rows): its products, SwiGLU and their backwards a block of RC rows at a
+    // time, so that its widest scratch (2F a row) is RC rows, not R.  Only where its adapters are plain LoRAs (or none)
+    // and the GPU takes the transposed products: the transposed views of the rows are not cut into blocks.
+    bool chunkable = gemm.f16_batch_ex_ok();
+    for (int i = kQiGateUp; i <= kQiDown; ++i)
+        chunkable = chunkable && P[i].dw == nullptr &&
+                    (run.ad[i] == nullptr || run.ad[i]->method == train::AdapterMethod::lora);
+    int64_t mlp_rows = run.mlp_rows;
+    if (const char* e = strata::env_get("TRAIN_MLP_ROWS")) mlp_rows = std::atoll(e);   // fixed, for the checks
+    const int64_t RC = chunkable && mlp_rows > 0 ? std::min(R, mlp_rows) : R;
+    auto rows_of_product = [&](int i) { return i >= kQiGateUp ? RC : R; };
+
     // ---- the adapters' transients
-    int64_t maxN = 0, maxRank = 0, maxScratch = 0, maxTmp = 0;
+    int64_t maxN = 0, maxRank = 0, maxScratch = 0, maxTmp = 0, maxRowsN = 0, maxRowsRk = 0;
     bool lokr = false;
     for (int i = 0; i < kQiProducts; ++i) {
         const train::Adapter* a = run.ad[i];
         if (a == nullptr) continue;
-        const int64_t N = P[i].N, K = P[i].K, rk = a->rank;
+        const int64_t N = P[i].N, K = P[i].K, rk = a->rank, n = rows_of_product(i);
         maxN = std::max(maxN, N);
         maxRank = std::max(maxRank, rk);
-        maxScratch = std::max(maxScratch, R * rk + R * N + N * rk + rk * K);
-        maxTmp = std::max(maxTmp, 2 * R * N + R * rk);
+        maxRowsN = std::max(maxRowsN, n * N);
+        maxRowsRk = std::max(maxRowsRk, n * rk);
+        maxScratch = std::max(maxScratch, n * rk + n * N + N * rk + rk * K);
+        maxTmp = std::max(maxTmp, 2 * n * N + n * rk);
         lokr = lokr || a->method == train::AdapterMethod::lokr;
     }
     train::AdScratch sc;
     if (maxN > 0) {
-        sc.hf = pool.rf(R * maxRank);
-        sc.y1 = pool.rf(R * maxN);
-        sc.y2 = pool.rf(R * maxN);
+        sc.hf = pool.rf(maxRowsRk);
+        sc.y1 = pool.rf(maxRowsN);
+        sc.y2 = pool.rf(maxRowsN);
         sc.fa = pool.rf(maxN);
         sc.fb = pool.rf(maxN);
         sc.scratch = pool.rf(maxScratch);
@@ -198,20 +212,34 @@ void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* s, train::Arena*
     int8_t* x8 = nullptr;
     float* sx = nullptr;
     uint16_t *x16f = nullptr, *w16f = nullptr;
+    const int64_t maxIn = std::max(R * C, RC * F);   // a product's input values: the attention's or the MLP's
     if (w8) {
-        x8 = reinterpret_cast<int8_t*>(pool.ru((R * F + 1) / 2));
+        x8 = reinterpret_cast<int8_t*>(pool.ru((maxIn + 1) / 2));
         sx = pool.rf(R);
         if (!train::w8_int8(s)) {
-            x16f = pool.ru(R * F);
+            x16f = pool.ru(maxIn);
             w16f = pool.ru(2 * F * C);
         }
     }
-    auto product = [&](int i, const uint16_t* x16, const float* rs, float* y) {
-        if (i < 3 && run.w_plain[i] != nullptr) gemm.f16(x16, run.w_plain[i], y, R, P[i].N, P[i].K);
-        else if (P[i].w8 != nullptr) train::w8_product(x16, R, P[i], y, x8, sx, x16f, w16f, gemm, s);
-        else gemm.f16(x16, P[i].w, y, R, P[i].N, P[i].K);
+    // an adapter's kept rows from row r0 on (a block of the MLP's)
+    auto keep_at = [&](int i, int64_t r0) {
+        train::AdKeep k = keep[i];
+        if (run.ad[i] != nullptr && r0 > 0) {
+            const int64_t rk = run.ad[i]->rank;
+            k.h16 += r0 * rk;
+            k.hr += r0;
+            k.h16t += r0 * rk;   // (scratch alone where the blocks are taken: no transposed view of rows is read)
+        }
+        return k;
+    };
+    // product i of n rows from row r0 (x16, rs and y already at it)
+    auto product = [&](int i, const uint16_t* x16, const float* rs, float* y, int64_t n = -1, int64_t r0 = 0) {
+        if (n < 0) n = R;
+        if (i < 3 && run.w_plain[i] != nullptr) gemm.f16(x16, run.w_plain[i], y, n, P[i].N, P[i].K);
+        else if (P[i].w8 != nullptr) train::w8_product(x16, n, P[i], y, x8, sx, x16f, w16f, gemm, s);
+        else gemm.f16(x16, P[i].w, y, n, P[i].N, P[i].K);
         mark(16);
-        train::ad_product_fwd(run.ad[i], x16, rs, y, nullptr, R, P[i].N, P[i].K, keep[i], sc, gemm, s);
+        train::ad_product_fwd(run.ad[i], x16, rs, y, nullptr, n, P[i].N, P[i].K, keep_at(i, r0), sc, gemm, s);
         mark(17);
     };
 
@@ -245,10 +273,13 @@ void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* s, train::Arena*
                          mean2 + r0, inv2 + r0);
     });
     mark(10);
-    product(kQiGateUp, ln2_16, ln2_s, gu);
-    dit_rows::rows16(dit_rows::SwiGlu{rows_of(gu, 2 * F), F}, R, F, sw16, sw_s, s);
+    for (int64_t r0 = 0; r0 < R; r0 += RC) {   // the MLP a block of RC rows at a time
+        const int64_t n = std::min(RC, R - r0);
+        product(kQiGateUp, ln2_16 + r0 * C, ln2_s + r0, gu + r0 * 2 * F, n, r0);
+        dit_rows::rows16(dit_rows::SwiGlu{rows_of(gu + r0 * 2 * F, 2 * F), F}, n, F, sw16 + r0 * F, sw_s + r0, s);
+        product(kQiDown, sw16 + r0 * F, sw_s + r0, ydn + r0 * C, n, r0);
+    }
     mark(11);
-    product(kQiDown, sw16, sw_s, ydn);
     by_range(nt, R, [&](int64_t r0, int64_t n, int row) {
         dit_rows::gate_add_to(run.out + r0 * C, h1 + r0 * C, rows_of(ydn + r0 * C, C), mod(3, row), n, C, s);
     });
@@ -258,15 +289,18 @@ void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* s, train::Arena*
 
     // ---- backward, from the output's gradient
     const int64_t W = std::max(2 * F, C);   // the widest product's rows
-    uint16_t *t16 = pool.ru(R * W), *t16t = pool.ru(R * W), *xt = pool.ru(R * F);
+    const int64_t RW = std::max(R * C, RC * W);   // a product's rows: the attention's R of C, the MLP's RC of 2F
+    uint16_t *t16 = pool.ru(RW), *t16t = pool.ru(RW), *xt = pool.ru(maxIn);
     float* trs = pool.rf(R);
-    float* sums = pool.rf(R * F + (lokr ? 4 * F * C : 0));   // a dgrad's T K (a LoKr's N K twice more)
-    float *dh1 = pool.rf(R * C), *dy = pool.rf(R * C), *dsw = pool.rf(R * F), *dgu = pool.rf(R * 2 * F);
+    float* sums = pool.rf(maxIn + (lokr ? 4 * F * C : 0));   // a dgrad's T K (a LoKr's N K twice more)
+    float *dh1 = pool.rf(R * C), *dy = pool.rf(R * C), *dsw = pool.rf(RC * F), *dgu = pool.rf(RC * 2 * F);
     float *dln = pool.rf(R * C), *dtmp = pool.rf(R * C);
-    auto backward = [&](int i, const uint16_t* x16, const float* rs, float* dY, float* dX, bool acc) {
-        if (train::ad_needs_xt(P[i], run.ad[i], gemm)) train::transpose_f16(x16, R, P[i].K, xt, s);
-        train::ad_product_bwd(P[i], run.ad[i], x16, rs, xt, dY, dX, acc, keep[i], sc, t16, trs, t16t, sums, R, gemm,
-                              s);
+    auto backward = [&](int i, const uint16_t* x16, const float* rs, float* dY, float* dX, bool acc, int64_t n = -1,
+                        int64_t r0 = 0) {
+        if (n < 0) n = R;
+        if (train::ad_needs_xt(P[i], run.ad[i], gemm)) train::transpose_f16(x16, n, P[i].K, xt, s);
+        train::ad_product_bwd(P[i], run.ad[i], x16, rs, xt, dY, dX, acc, keep_at(i, r0), sc, t16, trs, t16t, sums, n,
+                              gemm, s);
     };
     // the MLP's gated residual: dh1 is the output's gradient as it reaches the first residual's sum
     train::copy_rows(run.dout, R * C, dh1, s);
@@ -274,12 +308,15 @@ void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* s, train::Arena*
         train::mul_cols(run.dout + r0 * C, mod(3, row), n * C, C, dy + r0 * C, s);
     });
     mark(15);
-    backward(kQiDown, sw16, sw_s, dy, dsw, false);
-    mark(12);
-    dit_rows::swiglu_bwd(gu, dsw, R, F, dgu, s);
-    mark(13);
-    backward(kQiGateUp, ln2_16, ln2_s, dgu, dln, false);
-    mark(14);
+    for (int64_t r0 = 0; r0 < R; r0 += RC) {   // the MLP a block of RC rows at a time, as its forward
+        const int64_t n = std::min(RC, R - r0);
+        backward(kQiDown, sw16 + r0 * F, sw_s + r0, dy + r0 * C, dsw, false, n, r0);
+        mark(12);
+        dit_rows::swiglu_bwd(gu + r0 * 2 * F, dsw, n, F, dgu, s);
+        mark(13);
+        backward(kQiGateUp, ln2_16 + r0 * C, ln2_s + r0, dgu, dln + r0 * C, false, n, r0);
+        mark(14);
+    }
     // the second norm: its input's gradient joins the residual's own
     by_range(nt, R, [&](int64_t r0, int64_t n, int row) {
         dit_rows::ln_mod_bwd(h1 + r0 * C, mean2 + r0, inv2 + r0, mod(2, row), dln + r0 * C, n, C, dtmp + r0 * C,

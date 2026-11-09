@@ -123,6 +123,10 @@ Every copyright holder whose work is in this repository, its license and where t
   third_party/main/intel-llvm/patches/, which tools/intel_llvm_build.py applies to the release it builds. intel/llvm
   itself is not in this repository - third_party/main/intel-llvm/LICENSE.TXT, LICENSES/Apache-2.0.txt,
   LICENSES/LLVM-exception.txt
+- Copyright Intel Corporation and the oneDNN contributors
+  Apache-2.0 - oneDNN's pull requests #6468 and #6472 (https://github.com/uxlfoundation/oneDNN), backported to the tag
+  CMakeLists.txt fetches, in third_party/main/oneDNN/patches/, which CMakeLists.txt applies before it builds oneDNN.
+  oneDNN itself is not in this repository - third_party/main/oneDNN/LICENSE, LICENSES/Apache-2.0.txt
 - Copyright 2022-2026 Maxime Chambonnet, Étienne Mollier, Cordell Bloor, Xuanteng Huang, Christian Kastner, Igor Luppi, Talha Can Havadar
   Expat (MIT) - the target features tools/intel_llvm_build.py gives ROCm's device libraries' build, transcribed
   from the debian/rules of Debian's rocm-llvm package (https://salsa.debian.org/rocm-team/rocm-llvm); they stay

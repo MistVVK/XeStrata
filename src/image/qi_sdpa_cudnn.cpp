@@ -50,6 +50,8 @@ struct Cudnn {
     bool failed = false, conv_failed = false;   // conv_failed: cuDNN not opened for the convolutions
     cudnnHandle_t handle = nullptr;
     std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>, std::shared_ptr<fe::graph::Graph>> graphs;
+    // a training step's: (rows, keys, heads, hd, backward) -> its graph
+    std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, bool>, std::shared_ptr<fe::graph::Graph>> train;
     std::map<std::vector<int64_t>, std::shared_ptr<fe::graph::Graph>> convs;   // null: no plan for the shape
     void* ws = nullptr;
     int64_t ws_bytes = 0;
@@ -57,6 +59,7 @@ struct Cudnn {
 std::unordered_map<sycl::device, Cudnn> g_cudnn;
 
 constexpr int64_t kQ = 1, kK = 2, kV = 3, kO = 4;   // the tensors' ids in the variant pack
+constexpr int64_t kStats = 5, kDO = 6, kDQ = 7, kDK = 8, kDV = 9;   // a training step's
 
 // The driver's stream capture into a given CUDA graph (CUDA 12.3), from the driver the SYCL runtime has loaded
 struct Capture {
@@ -137,6 +140,41 @@ std::shared_ptr<fe::graph::Graph> cudnn_graph(cudnnHandle_t handle, int64_t rows
     (void) stats;
     O->set_output(true).set_dim({B, heads, rows, hd}).set_stride({rows * row, hd, row, 1}).set_uid(kO);
     if (!g->build(handle, {fe::HeurMode_t::A}).is_good()) throw std::runtime_error("cuDNN builds no SDPA plan");
+    return g;
+}
+
+// A training step's graph (no mask): the forward with the softmax's statistics [heads][rows] FP32, or the backward
+// from the forward's output, its gradient and the statistics into FP16 gradients; the engine's strides as they are
+std::shared_ptr<fe::graph::Graph> train_graph(cudnnHandle_t handle, int64_t rows, int64_t T, int64_t heads, int64_t hd,
+                                              bool bwd) {
+    auto g = std::make_shared<fe::graph::Graph>();
+    g->set_io_data_type(fe::DataType_t::HALF)
+        .set_intermediate_data_type(fe::DataType_t::FLOAT)
+        .set_compute_data_type(fe::DataType_t::FLOAT);
+    const int64_t row = heads * hd;
+    auto t4 = [&](const char* name, int64_t uid, int64_t n) {
+        return fe::graph::Tensor_attributes().set_name(name).set_uid(uid).set_dim({1, heads, n, hd}).set_stride(
+            {n * row, hd, row, 1});
+    };
+    auto Q = g->tensor(t4("Q", kQ, rows)), K = g->tensor(t4("K", kK, T)), V = g->tensor(t4("V", kV, T));
+    const float scale = 1.0f / std::sqrt((float) hd);
+    if (!bwd) {
+        auto opts = fe::graph::SDPA_attributes().set_name("sdpa").set_generate_stats(true).set_attn_scale(scale);
+        auto [O, stats] = g->sdpa(Q, K, V, opts);
+        O->set_output(true).set_dim({1, heads, rows, hd}).set_stride({rows * row, hd, row, 1}).set_uid(kO);
+        stats->set_output(true).set_data_type(fe::DataType_t::FLOAT).set_dim({1, heads, rows, 1}).set_stride(
+            {heads * rows, rows, 1, 1}).set_uid(kStats);
+    } else {
+        auto O = g->tensor(t4("O", kO, rows)), dO = g->tensor(t4("dO", kDO, rows));
+        auto stats = g->tensor(fe::graph::Tensor_attributes().set_name("Stats").set_uid(kStats).set_dim(
+            {1, heads, rows, 1}).set_stride({heads * rows, rows, 1, 1}).set_data_type(fe::DataType_t::FLOAT));
+        auto opts = fe::graph::SDPA_backward_attributes().set_name("sdpa_bwd").set_attn_scale(scale);
+        auto [dQ, dK, dV] = g->sdpa_backward(Q, K, V, O, dO, stats, opts);
+        dQ->set_output(true).set_uid(kDQ).set_dim({1, heads, rows, hd}).set_stride({rows * row, hd, row, 1});
+        dK->set_output(true).set_uid(kDK).set_dim({1, heads, T, hd}).set_stride({T * row, hd, row, 1});
+        dV->set_output(true).set_uid(kDV).set_dim({1, heads, T, hd}).set_stride({T * row, hd, row, 1});
+    }
+    if (!g->build(handle, {fe::HeurMode_t::A}).is_good()) throw std::runtime_error("cuDNN builds no SDPA training plan");
     return g;
 }
 
@@ -335,6 +373,49 @@ bool cudnn(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint1
         std::fprintf(stderr, "xestrata-image: cuDNN's attention is not taken on this GPU (%s): the engine's own kernel\n",
                      e.what());
         d.failed = true;
+        return false;
+    }
+}
+
+bool cudnn_train(sycl::queue& q, bool bwd, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
+                 const uint16_t* o16, const uint16_t* do16, float* stats, int64_t rows, int64_t keys, int64_t heads,
+                 int64_t hd, uint16_t* out16, uint16_t* dq16, uint16_t* dk16, uint16_t* dv16) {
+    std::lock_guard<std::mutex> lock(g_mu);
+    Cudnn& d = g_cudnn[q.get_device()];
+    if (d.failed) return false;
+    try {
+        if (d.handle == nullptr) open_cudnn(d.handle);
+        const auto key = std::make_tuple(rows, keys, heads, hd, bwd);
+        auto it = d.train.find(key);
+        if (it == d.train.end()) it = d.train.emplace(key, train_graph(d.handle, rows, keys, heads, hd, bwd)).first;
+        int64_t ws = 0;
+        if (!it->second->get_workspace_size(ws).is_good()) throw std::runtime_error("cuDNN's workspace");
+        if (ws > d.ws_bytes) {
+            q.wait();
+            if (d.ws != nullptr) {
+                sycl::free(d.ws, q);
+                core::graph_epoch_bump();
+            }
+            d.ws = sycl::malloc_device(ws, q);
+            d.ws_bytes = d.ws != nullptr ? ws : 0;
+        }
+        std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> pack = {
+            {kQ, const_cast<uint16_t*>(q16)}, {kK, const_cast<uint16_t*>(k16)}, {kV, const_cast<uint16_t*>(v16)},
+            {kStats, stats}};
+        if (!bwd) {
+            pack.emplace(kO, out16);
+        } else {
+            pack.emplace(kO, const_cast<uint16_t*>(o16));
+            pack.emplace(kDO, const_cast<uint16_t*>(do16));
+            pack.emplace(kDQ, dq16);
+            pack.emplace(kDK, dk16);
+            pack.emplace(kDV, dv16);
+        }
+        return on_queue(q, d.handle, [g = it->second, handle = d.handle, pack, ws = d.ws]() mutable {
+            if (!g->execute(handle, pack, ws).is_good()) throw std::runtime_error("cuDNN's SDPA training failed");
+        });
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "xestrata-image: cuDNN's training attention is not taken on this GPU (%s)\n", e.what());
         return false;
     }
 }

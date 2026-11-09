@@ -31,6 +31,10 @@ namespace {
 
 using AotFn = bool (*)(void*, const uint16_t*, const uint16_t*, const uint16_t*, int64_t, int64_t, int64_t, int64_t,
                        int64_t, uint16_t*, bool);   // strata_sdpa_aotriton's
+using AotTrainFn = bool (*)(void*, bool, const uint16_t*, const uint16_t*, const uint16_t*, const uint16_t*,
+                            const uint16_t*, float*, int64_t, int64_t, int64_t, int64_t, uint16_t*, uint16_t*,
+                            uint16_t*, uint16_t*, float*);   // strata_sdpa_aotriton_train's
+AotTrainFn g_train = nullptr;
 
 // The aotriton module (src/image/qi_sdpa_aotriton.cpp), opened at an AMD GPU's first attention from the engine's
 // folder or its lib/ (the packages'), with the libraries it needs beside it; null when it does not open (no HIP
@@ -60,6 +64,8 @@ AotFn aotriton_module() {
                 continue;
             }
             fn = reinterpret_cast<AotFn>(reinterpret_cast<void*>(GetProcAddress(h, "strata_sdpa_aotriton")));
+            g_train = reinterpret_cast<AotTrainFn>(
+                reinterpret_cast<void*>(GetProcAddress(h, "strata_sdpa_aotriton_train")));
 #else
             void* h = dlopen(p.c_str(), RTLD_NOW | RTLD_LOCAL);
             if (h == nullptr) {
@@ -68,6 +74,7 @@ AotFn aotriton_module() {
                 continue;
             }
             fn = reinterpret_cast<AotFn>(dlsym(h, "strata_sdpa_aotriton"));
+            g_train = reinterpret_cast<AotTrainFn>(dlsym(h, "strata_sdpa_aotriton_train"));
 #endif
             if (fn != nullptr) return;
             why = p.string() + ": no strata_sdpa_aotriton";
@@ -99,6 +106,22 @@ bool aotriton_sdpa([[maybe_unused]] const uint16_t* q16, [[maybe_unused]] const 
     if (!aotriton_sdpa_ready(stream)) return false;
     sycl::queue& q = core::Runtime::get().stream(stream);
     return aotriton_module()(&q, q16, k16, v16, rows, keys, heads, kv_heads, hd, out16, causal);
+#else
+    return false;
+#endif
+}
+
+bool aotriton_sdpa_train([[maybe_unused]] bool bwd, [[maybe_unused]] const uint16_t* q16,
+                         [[maybe_unused]] const uint16_t* k16, [[maybe_unused]] const uint16_t* v16,
+                         [[maybe_unused]] const uint16_t* o16, [[maybe_unused]] const uint16_t* do16,
+                         [[maybe_unused]] float* lse, [[maybe_unused]] int64_t rows, [[maybe_unused]] int64_t keys,
+                         [[maybe_unused]] int64_t heads, [[maybe_unused]] int64_t hd, [[maybe_unused]] uint16_t* out16,
+                         [[maybe_unused]] uint16_t* dq16, [[maybe_unused]] uint16_t* dk16,
+                         [[maybe_unused]] uint16_t* dv16, [[maybe_unused]] float* ws, [[maybe_unused]] void* stream) {
+#if STRATA_AOTRITON
+    if (!aotriton_sdpa_ready(stream) || g_train == nullptr) return false;
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    return g_train(&q, bwd, q16, k16, v16, o16, do16, lse, rows, keys, heads, hd, out16, dq16, dk16, dv16, ws);
 #else
     return false;
 #endif

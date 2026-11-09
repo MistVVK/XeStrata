@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -380,6 +381,10 @@ TOL = {"lora": 5e-4, "lokr": 1e-5, "dora": 1e-6, "qkrope": 2e-4, "attn": 5e-4, "
 # an FP16 tensor can only carry FP16's own error: an output written as FP16 is judged at two of its units
 TOL_OUT = {("attn", "o16"): 2e-3, ("attn", "o32"): 5e-4, ("attnreal", "o16"): 2e-3, ("attnreal", "o32"): 5e-4,
            ("products", "db"): 1e-3}
+# the attention through the GPU maker's library (--attn library: oneDNN's, cuDNN's or aotriton's SDPA for training),
+# whose output and gradients come out in FP16: their rounding alone is 2-3e-4 (oneDNN on the B70: dQ 6.3e-4, dK 5.1e-4,
+# dV 5.6e-4 and o32 4.3e-4 at the real shapes, 2026-11-09), so they are judged at 1e-3
+TOL_LIBRARY = {(n, o): 1e-3 for n in ("attn", "attnreal") for o in ("o32", "dQ", "dK", "dV")}
 
 
 def main() -> int:
@@ -387,7 +392,17 @@ def main() -> int:
     ap.add_argument("--probe", required=True)
     ap.add_argument("--dir", default="/tmp/mf-train")
     ap.add_argument("--op", action="append", default=[])
+    ap.add_argument("--attn", choices=["own", "library"], default="",
+                    help="the attention's forms: the engine's own kernels (the forward's, the backward's fused one) or "
+                         "the GPU maker's library (empty: whichever the probe chooses)")
     a = ap.parse_args()
+    env = dict(os.environ)
+    tol_out = dict(TOL_OUT)
+    if a.attn == "own":
+        env.update(XESTRATA_ATTN_TRAIN_FWD="own", XESTRATA_ATTN_BWD_FORM="fused")
+    elif a.attn == "library":
+        env.update(XESTRATA_ATTN_TRAIN_FWD="library", XESTRATA_ATTN_BWD_FORM="library")
+        tol_out.update(TOL_LIBRARY)
     root = Path(a.dir)
     bad = 0
     for name in (a.op or list(CASES)):
@@ -395,16 +410,16 @@ def main() -> int:
         d.mkdir(parents=True, exist_ok=True)
         want = CASES[name](d, np.random.default_rng(20261103))
         for cmd, outs in RUNS[name]:
-            out = subprocess.run([a.probe, cmd, str(d)], capture_output=True, text=True)
+            out = subprocess.run([a.probe, cmd, str(d)], capture_output=True, text=True, env=env)
             if out.returncode != 0:
                 print(f"{name} {cmd:7} FAILED to run: {out.stderr.strip()}", flush=True)
                 bad += 1
                 continue
             for o in outs:
                 e = rel(load(d, o), want[o])
-                ok = e <= TOL_OUT.get((name, o), TOL[name])
+                ok = e <= tol_out.get((name, o), TOL[name])
                 bad += 0 if ok else 1
-                print(f"{name:9} {cmd:7} {o:7} rel {e:.2e} (tol {TOL_OUT.get((name, o), TOL[name]):.0e}) "
+                print(f"{name:9} {cmd:7} {o:7} rel {e:.2e} (tol {tol_out.get((name, o), TOL[name]):.0e}) "
                       f"{'ok' if ok else 'FAIL'}",
                       flush=True)
     print(f"mf_train_ref: {bad} over tolerance")

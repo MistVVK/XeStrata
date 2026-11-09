@@ -908,8 +908,16 @@ if(STRATA_ENABLE_XE)
       endif()
       set(_strata_dnnl_lib ${_strata_onednn_dir}/lib/libdnnl.so)
     endif()
+    # XeStrata's patches (third_party/main/oneDNN/patches/, oneDNN's pull requests backported to the tag) by git apply
+    # (a build container may lack patch), kept from the build folder's own repository as comfy-kitchen's is
+    find_package(Git REQUIRED)
+    set(_strata_onednn_patches ${CMAKE_SOURCE_DIR}/third_party/main/oneDNN/patches)
     ExternalProject_Add(strata_onednn ${_strata_onednn_url} DOWNLOAD_EXTRACT_TIMESTAMP FALSE
       PREFIX ${CMAKE_BINARY_DIR}/_deps/onednn CMAKE_ARGS ${_strata_onednn_args}
+      PATCH_COMMAND ${CMAKE_COMMAND} -E env GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}/_deps ${GIT_EXECUTABLE} apply
+                    ${_strata_onednn_patches}/0001-sdpa-bwd-pack-strides.patch
+            COMMAND ${CMAKE_COMMAND} -E env GIT_CEILING_DIRECTORIES=${CMAKE_BINARY_DIR}/_deps ${GIT_EXECUTABLE} apply
+                    ${_strata_onednn_patches}/0002-sdpa-bwd-xe-hpg.patch
       BUILD_BYPRODUCTS ${_strata_dnnl_lib})
     file(MAKE_DIRECTORY ${_strata_onednn_dir}/include)
     add_library(strata_dnnl SHARED IMPORTED)
@@ -931,6 +939,7 @@ if(STRATA_ENABLE_XE)
     set_property(SOURCE src/kernels/xe/i8_gemm.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN_I8=1)
     set_property(SOURCE src/image/qi_sdpa.cpp src/kernels/xe/prompt_attn.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp
                  src/image/yolo_detect.cpp src/upscale/esrgan.cpp src/image/aux_net.cpp src/image/florence2.cpp
+                 src/image/qi_attn_train.cpp
                  APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN=1)
   endif()
   # AMD GPUs: aotriton's flash attention (MIT, https://github.com/ROCm/aotriton, release 0.14.2b): its library for the
@@ -1183,7 +1192,7 @@ if(STRATA_ENABLE_XE)
       # (not the detector's: the engine's own convolutions beat cuDNN's there, 8.3 against 9.0 ms a face on the
       # RTX 4070, 2026-11-05)
       set_property(SOURCE src/image/qi_sdpa.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp src/upscale/esrgan.cpp
-                   src/image/aux_net.cpp
+                   src/image/aux_net.cpp src/image/qi_attn_train.cpp
                    APPEND PROPERTY COMPILE_DEFINITIONS STRATA_CUDNN=1)
       target_link_libraries(strata_image PRIVATE ${CMAKE_DL_LIBS})
       set(_strata_cudnn_frontend ON)   # its license text goes with the packages
@@ -1260,8 +1269,15 @@ if(STRATA_ENABLE_XE)
       add_test(NAME mf_train_parity
                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/image/mf_train_ref.py
                --probe $<TARGET_FILE:strata-image-mf-train-probe>
-               --dir ${CMAKE_CURRENT_BINARY_DIR}/mf-train)
+               --dir ${CMAKE_CURRENT_BINARY_DIR}/mf-train --attn own)
       set_tests_properties(mf_train_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+      # the attention through the GPU maker's library (its FP16 gradients, a tolerance of their own; the engine's own
+      # kernels where the GPU has no library)
+      add_test(NAME mf_train_parity_library
+               COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/image/mf_train_ref.py
+               --probe $<TARGET_FILE:strata-image-mf-train-probe>
+               --dir ${CMAKE_CURRENT_BINARY_DIR}/mf-train-library --attn library --op attn --op attnreal)
+      set_tests_properties(mf_train_parity_library PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
       # one block against torch autograd: the same interpreter as the case above, and the script exits 77 where it
       # has no torch, so the test is always registered and skips by itself (an env-var condition here was dropped by
       # every reconfigure that ninja ran without it, and the suite quietly lost the test)

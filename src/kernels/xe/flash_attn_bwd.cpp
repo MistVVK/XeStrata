@@ -80,8 +80,9 @@ struct Bwd {
         const int g = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
         const int nsg = (int) (it.get_local_range(1) / SG);
         const int64_t h = (int64_t) it.get_group(0), H = a.n_head, R = a.rows, ld = a.ld;
+        const int64_t QR = a.q_rows > 0 && a.q_rows < R ? a.q_rows : R;   // the query rows taken
         const int64_t my0 = ((int64_t) it.get_group(1) * nsg + g) * TM;   // the sub-group's keys (dK, dV) or queries
-        if (my0 >= R) return;
+        if (my0 >= (DQ ? QR : R)) return;
         const size_t soff = (size_t) g * SG_FLOATS, doff = soff + SREG, poff = (size_t) g * TM * PLD;
         const int64_t col = h * D;
         // the sub-group's own rows' tiles in registers: Q and dO (dQ), K and V (dK), K (dV).  (Two row tiles a
@@ -101,7 +102,7 @@ struct Bwd {
         const float scale = a.scale, gh = a.g[h];
         // the chunks walked: dQ's causal rows see the keys up to their last row; the rest walk every row
         const int64_t last = std::min(R, my0 + TM) - 1;
-        const int64_t end = DQ && last < a.n_causal ? last + 1 : R;
+        const int64_t end = DQ && last < a.n_causal ? last + 1 : DQ ? R : QR;
         // the other side's operands a chunk at a time: dQ reads K and V, dK Q and dO, dV Q (then dO)
         const uint16_t* ob1 = DQ ? a.k : a.q;    // with ta: S (dK and dV: S^T)
         const uint16_t* ob2 = DQ ? a.v : a.dO;   // with tb: dP (dK: dP^T)
@@ -158,8 +159,8 @@ struct Bwd {
             if constexpr (!DQ)
                 for (int i = 0; i < CW; ++i) {
                     const int64_t qq = j0 + lane + SG * i;
-                    cl[i] = qq < R ? a.lse[qq * H + h] : 0.f;
-                    cd[i] = DP && qq < R ? a.D[h * R + qq] : 0.f;
+                    cl[i] = qq < QR ? a.lse[qq * H + h] : 0.f;
+                    cd[i] = DP && qq < QR ? a.D[h * R + qq] : 0.f;
                 }
             for (int r = 0; r < TM; ++r) {
                 for (int i = 0; i < CW; ++i) {
@@ -167,7 +168,7 @@ struct Bwd {
                     const int64_t qq = DQ ? my0 + r : j0 + c, kq = DQ ? j0 + c : my0 + r;
                     const float l = DQ ? rl[r] : cl[i], d = DQ ? rd[r] : cd[i];
                     float x = 0.f;
-                    if (qq < R && kq < R && !(qq < a.n_causal && kq > qq)) {
+                    if (qq < QR && kq < R && !(qq < a.n_causal && kq > qq)) {
                         // native::exp: P and dS go to FP16 (the forward's choice)
                         x = sycl::native::exp(st[soff + (size_t) r * SLD + c] * scale - l);
                         if constexpr (DP) x = x * (st[doff + (size_t) r * SLD + c] - d) * scale;
@@ -196,7 +197,7 @@ struct Bwd {
             sycl::group_barrier(sg);
             for (int e = lane; e < TM * TN; e += SG) {
                 const int64_t row = my0 + e / TN;
-                if (row >= R) continue;
+                if (row >= (DQ ? QR : R)) continue;
                 float* o = out + row * (H * D) + col + nt * TN + e % TN;
                 const float x = st[soff + e] * gh;
                 *o = add ? *o + x : x;

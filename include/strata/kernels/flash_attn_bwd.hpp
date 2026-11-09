@@ -25,6 +25,9 @@ struct FlashAttnBwdArgs {
     float scale = 0.0f;           ///< the scores' scale (1 / sqrt(head_dim))
     float *dq = nullptr, *dk = nullptr, *dv = nullptr;   ///< FP32 [rows][n_head * head_dim]
     bool accumulate = false;      ///< dK and dV added into (dQ is always written)
+    /// The query rows taken (0: every row): dK and dV of the queries below it alone, dQ of those rows alone (the
+    /// rest the caller's: a training step's causal text rows beside oneDNN's image rows)
+    int64_t q_rows = 0;
 };
 
 /// Launches the backward on `stream`, not waiting for it; false, nothing launched, where the GPU has no FP16 matrix

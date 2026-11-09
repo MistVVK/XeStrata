@@ -107,7 +107,7 @@ void lora_bwd(const float* hr, const float* xr, const uint16_t* h16t, const uint
                  const uint16_t* bt16, const float* dY, int64_t T, int64_t rows, int64_t cols, int64_t rank,
                  float scale, float* dB, float* dA, float* scratch, uint16_t* tmp16, float* rsT, prefill::Gemm& gemm,
                  void* stream, const uint16_t* dy16_done, const float* rsY_done, const uint16_t* h16,
-                 const uint16_t* x16) {
+                 const uint16_t* x16, const uint16_t* b16) {
     float* dh = scratch;                  // [T][rank]
     float* sums = scratch + (int64_t) T * rank;
     uint16_t* dy16 = tmp16;               // [T][rows]
@@ -124,7 +124,8 @@ void lora_bwd(const float* hr, const float* xr, const uint16_t* h16t, const uint
     // dh is written whole here (every one of its T * rank values), so it is overwritten, not added into: the
     // caller passes scratch, which the probe leaves uninitialized (fresh device pages read as zero, which is the
     // only reason adding into it ever passed parity)
-    dgrad(dy16, rsY, bt16, T, rows, rank, dh, sums, false, gemm, stream);
+    if (bt16 != nullptr) dgrad(dy16, rsY, bt16, T, rows, rank, dh, sums, false, gemm, stream);
+    else dgrad_rows(dy16, rsY, b16, T, rows, rank, dh, sums, false, gemm, stream);
     dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) T * rank), [=](sycl::id<1> id) {
         dh[id[0]] *= scale;
     });
@@ -290,14 +291,32 @@ uint32_t* scale_word(int k, void* stream) {
     return w + k;
 }
 
-void dgrad(const uint16_t* dy16, const float* rsY, const uint16_t* wt, int64_t T, int64_t N, int64_t K, float* dX,
-              float* scratch, bool accumulate, prefill::Gemm& gemm, void* stream) {
-    gemm.f16(dy16, wt, scratch, T, K, N);   // wt[K,N] holds W[N,K]'s rows: the product is dY . W, in FP32 sums
+namespace {
+
+// dX (+)= the rows' sums times their scales
+void dgrad_rows_back(const float* scratch, const float* rsY, int64_t T, int64_t K, float* dX, bool accumulate,
+                     void* stream) {
     dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) T * K), [=](sycl::id<1> id) {
         const int64_t t = static_cast<int64_t>(id[0]) / K;
         const float v = scratch[id[0]] * (rsY != nullptr ? rsY[t] : 1.f);
         dX[id[0]] = accumulate ? dX[id[0]] + v : v;
     });
+}
+
+}  // namespace
+
+void dgrad(const uint16_t* dy16, const float* rsY, const uint16_t* wt, int64_t T, int64_t N, int64_t K, float* dX,
+              float* scratch, bool accumulate, prefill::Gemm& gemm, void* stream) {
+    gemm.f16(dy16, wt, scratch, T, K, N);   // wt[K,N] holds W[N,K]'s rows: the product is dY . W, in FP32 sums
+    dgrad_rows_back(scratch, rsY, T, K, dX, accumulate, stream);
+}
+
+void dgrad_rows(const uint16_t* dy16, const float* rsY, const uint16_t* w, int64_t T, int64_t N, int64_t K, float* dX,
+                float* scratch, bool accumulate, prefill::Gemm& gemm, void* stream) {
+    // dY [T][N] . W [N][K], W as it is (a batch of one: the strides are the operands' sizes, oneMKL refuses 0)
+    if (!gemm.f16_batch_ex(false, false, dy16, w, scratch, T, K, N, 1, T * N, N * K, T * K, N, K, K, 0.f))
+        throw std::runtime_error("image engine (training): a dgrad's product on the weight's rows failed");
+    dgrad_rows_back(scratch, rsY, T, K, dX, accumulate, stream);
 }
 
 void wgrad(const uint16_t* dy16t, const uint16_t* x16t, int64_t T, int64_t N, int64_t K, const uint32_t* gbits,

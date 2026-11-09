@@ -48,8 +48,11 @@ void sdpa_free(void* ptr, const void*, const void* ctx, void* ev) {
 using Shape = std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t>;
 struct Sdpa {
     bool failed = false, failed_causal = false;   // a failure: the form not taken again on the device
+    bool failed_train = false;
     std::unique_ptr<dnnl::engine> eng;
     std::map<Shape, dg::compiled_partition> parts;
+    // a training step's: (rows, keys, heads, hd, backward) -> its partition
+    std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, bool>, dg::compiled_partition> train;
     std::list<Shape> order;   // the shapes, the last used first (a prompt's chunks each a shape of its own)
     std::map<int64_t, sycl::half*> scales;
 };
@@ -142,6 +145,99 @@ dg::compiled_partition compile(const dnnl::engine& eng, int64_t rows, int64_t ke
     return parts[0].compile(ins, {O}, eng);
 }
 
+// the training graphs' logical tensors' ids
+enum : size_t { tQ = 0, tK, tV, tScale, tO, tStats, tDO, tDQ, tDK, tDV };
+
+// A training step's graphs (oneDNN's SDPA training patterns), the engine's strides [rows][heads * hd] as they are and
+// the statistics [rows][heads]: the forward Q . K^T, the scale, the softmax with its statistics, . V; the backward P
+// again from them (exp(S scale - lse)), dV = P^T dO, dP = dO V^T, dS = P (dP - rowsum(O dO)) scale, dQ = dS K,
+// dK = dS^T Q.
+dg::compiled_partition compile_train(const dnnl::engine& eng, int64_t rows, int64_t keys, int64_t heads, int64_t hd,
+                                     bool bwd) {
+    const int64_t row = heads * hd;
+    const std::vector<int64_t> qd{1, heads, rows, hd}, qs{rows * row, hd, row, 1}, kd{1, heads, keys, hd},
+        ks{keys * row, hd, row, 1}, sd{1, heads, rows, keys}, td{1, heads, rows, 1}, ts{heads * rows, rows, 1, 1};
+    using dt = lt::data_type;
+    const auto strided = lt::layout_type::strided;
+    lt Q(tQ, dt::f16, qd, qs), K(tK, dt::f16, kd, ks), V(tV, dt::f16, kd, ks);
+    lt SC(tScale, dt::f16, std::vector<int64_t>{1}, std::vector<int64_t>{1});
+    lt O(tO, dt::f16, qd, qs), ST(tStats, dt::f32, td, ts), DO(tDO, dt::f16, qd, qs);
+    lt DQ(tDQ, dt::f16, qd, qs), DK(tDK, dt::f16, kd, ks), DV(tDV, dt::f16, kd, ks);
+    size_t id = 100;
+    dg::graph g(dnnl::engine::kind::gpu);
+    std::vector<dg::op> ops;
+    auto add = [&](dg::op::kind k, const char* name, std::vector<lt> in, std::vector<lt> out) -> dg::op& {
+        ops.emplace_back(id++, k, name);
+        ops.back().add_inputs(in);
+        ops.back().add_outputs(out);
+        return ops.back();
+    };
+    const lt S(id++, dt::f32, sd, strided), SS(id++, dt::f32, sd, strided);
+    add(dg::op::kind::MatMul, "qk", {Q, K}, {S}).set_attr<bool>(dg::op::attr::transpose_b, true);
+    add(dg::op::kind::Multiply, "scale", {S, SC}, {SS});
+    if (!bwd) {
+        const lt P(id++, dt::f16, sd, strided);
+        add(dg::op::kind::SoftMax, "softmax", {SS}, {P, ST}).set_attr<int64_t>(dg::op::attr::axis, -1);
+        add(dg::op::kind::MatMul, "pv", {P, V}, {O});
+    } else {
+        const lt D0(id++, dt::f32, sd, strided), P(id++, dt::f32, sd, strided), P16(id++, dt::f16, sd, strided);
+        const lt dP(id++, dt::f32, sd, strided), OdO(id++, dt::f32, qd, strided), Dr(id++, dt::f32, td, strided);
+        const lt dPm(id++, dt::f32, sd, strided), dS0(id++, dt::f32, sd, strided), dS(id++, dt::f32, sd, strided);
+        const lt dS16(id++, dt::f16, sd, strided);
+        add(dg::op::kind::Subtract, "sub", {SS, ST}, {D0});
+        add(dg::op::kind::Exp, "exp", {D0}, {P});
+        add(dg::op::kind::TypeCast, "p16", {P}, {P16});
+        add(dg::op::kind::MatMul, "dv", {P16, DO}, {DV}).set_attr<bool>(dg::op::attr::transpose_a, true);
+        add(dg::op::kind::MatMul, "dp", {DO, V}, {dP}).set_attr<bool>(dg::op::attr::transpose_b, true);
+        add(dg::op::kind::Multiply, "odo", {O, DO}, {OdO});
+        dg::op& rs = add(dg::op::kind::ReduceSum, "rowsum", {OdO}, {Dr});
+        rs.set_attr<std::vector<int64_t>>(dg::op::attr::axes, {-1});
+        rs.set_attr<bool>(dg::op::attr::keep_dims, true);
+        add(dg::op::kind::Subtract, "dpm", {dP, Dr}, {dPm});
+        add(dg::op::kind::Multiply, "ds0", {P, dPm}, {dS0});
+        add(dg::op::kind::Multiply, "dscale", {dS0, SC}, {dS});
+        add(dg::op::kind::TypeCast, "ds16", {dS}, {dS16});
+        add(dg::op::kind::MatMul, "dq", {dS16, K}, {DQ});
+        add(dg::op::kind::MatMul, "dk", {dS16, Q}, {DK}).set_attr<bool>(dg::op::attr::transpose_a, true);
+    }
+    for (const dg::op& o : ops) g.add_op(o);
+    g.finalize();
+    auto parts = g.get_partitions();
+    if (parts.size() != 1 || !parts[0].is_supported()) throw std::runtime_error("no fused SDPA training partition");
+    if (!bwd) return parts[0].compile({Q, K, V, SC}, {O, ST}, eng);
+    return parts[0].compile({Q, K, V, SC, O, ST, DO}, {DQ, DK, DV}, eng);
+}
+
+// the device's state for a training call: its engine, the scale, the partition of the shape (compiled the first time)
+struct TrainCall {
+    Sdpa* d = nullptr;
+    dg::compiled_partition* cp = nullptr;
+    sycl::half* sc = nullptr;
+};
+bool train_call(sycl::queue& q, int64_t rows, int64_t keys, int64_t heads, int64_t hd, bool bwd, TrainCall& tc) {
+    if (no_xmx()) return false;
+    const sycl::backend be = q.get_device().get_backend();
+    if (be != sycl::backend::ext_oneapi_level_zero && be != sycl::backend::opencl) return false;
+    Sdpa& d = g_sdpa[q.get_device()];
+    if (d.failed_train) return false;
+    if (!d.eng) {
+        const dg::allocator alloc = dg::sycl_interop::make_allocator(sdpa_malloc, sdpa_free);
+        d.eng = std::make_unique<dnnl::engine>(
+            dg::sycl_interop::make_engine_with_allocator(q.get_device(), q.get_context(), alloc));
+    }
+    const auto key = std::make_tuple(rows, keys, heads, hd, bwd);
+    auto it = d.train.find(key);
+    if (it == d.train.end()) it = d.train.emplace(key, compile_train(*d.eng, rows, keys, heads, hd, bwd)).first;
+    sycl::half*& sc = d.scales[hd];
+    if (sc == nullptr) {
+        sc = sycl::malloc_device<sycl::half>(1, q);
+        const sycl::half v = 1.0f / std::sqrt((float) hd);
+        q.memcpy(sc, &v, sizeof v).wait();
+    }
+    tc = {&d, &it->second, sc};
+    return true;
+}
+
 }  // namespace
 
 bool onednn_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t rows, int64_t keys,
@@ -221,6 +317,51 @@ void onednn_sdpa_drop_causal(void* stream) {
         } else {
             ++p;
         }
+    }
+}
+
+bool onednn_sdpa_train_fwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t rows, int64_t keys,
+                           int64_t heads, int64_t hd, uint16_t* out16, float* lse, void* stream) {
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    std::lock_guard<std::mutex> lock(g_mu);
+    TrainCall tc;
+    try {
+        if (!train_call(q, rows, keys, heads, hd, false, tc)) return false;
+        dnnl::stream strm = dnnl::sycl_interop::make_stream(*tc.d->eng, q);
+        auto t = [&](size_t id, const void* p) {
+            return dg::tensor(tc.cp->query_logical_tensor(id), *tc.d->eng, const_cast<void*>(p));
+        };
+        std::vector<dg::tensor> ins{t(tQ, q16), t(tK, k16), t(tV, v16), t(tScale, tc.sc)}, outs{t(tO, out16), t(tStats, lse)};
+        dg::sycl_interop::execute(*tc.cp, strm, ins, outs);
+        return true;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "xestrata: oneDNN's training attention is not taken on this GPU (%s)\n", e.what());
+        g_sdpa[q.get_device()].failed_train = true;
+        return false;
+    }
+}
+
+bool onednn_sdpa_train_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, const uint16_t* o16,
+                           const float* lse, const uint16_t* do16, int64_t rows, int64_t keys, int64_t heads,
+                           int64_t hd, uint16_t* dq16, uint16_t* dk16, uint16_t* dv16, void* stream) {
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    std::lock_guard<std::mutex> lock(g_mu);
+    TrainCall tc;
+    try {
+        if (!train_call(q, rows, keys, heads, hd, true, tc)) return false;
+        dnnl::stream strm = dnnl::sycl_interop::make_stream(*tc.d->eng, q);
+        auto t = [&](size_t id, const void* p) {
+            return dg::tensor(tc.cp->query_logical_tensor(id), *tc.d->eng, const_cast<void*>(p));
+        };
+        std::vector<dg::tensor> ins{t(tQ, q16), t(tK, k16), t(tV, v16), t(tScale, tc.sc),
+                                    t(tO, o16), t(tStats, lse), t(tDO, do16)};
+        std::vector<dg::tensor> outs{t(tDQ, dq16), t(tDK, dk16), t(tDV, dv16)};
+        dg::sycl_interop::execute(*tc.cp, strm, ins, outs);
+        return true;
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "xestrata: oneDNN's training attention is not taken on this GPU (%s)\n", e.what());
+        g_sdpa[q.get_device()].failed_train = true;
+        return false;
     }
 }
 

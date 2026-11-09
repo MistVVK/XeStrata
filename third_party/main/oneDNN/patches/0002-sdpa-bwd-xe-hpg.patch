@@ -1,0 +1,44 @@
+SPDX-FileCopyrightText: Intel Corporation and the oneDNN contributors
+SPDX-License-Identifier: Apache-2.0
+
+sdpa-bwd-xe-hpg: oneDNN's pull request #6472 (Barzin, open on 2026-11-09; its second commit), on v3.14.2, applied
+by CMakeLists.txt after 0001.  Its change as the pull request has it; only the context of the configurations' table
+is v3.14.2's (main has other xe2 rows there).
+
+The SDPA's fused backward on xe_hpg (Alchemist, the Arc A series), which v3.14.2 refuses ("fused SDPA BWD not
+supported for xe_hpg"), with the configurations its pull request swept on an Arc A770.  XeStrata's training step
+times it against the engine's own backward forms and takes the fastest.
+---
+diff --git a/src/gpu/intel/sdpa/configs.cpp b/src/gpu/intel/sdpa/configs.cpp
+index d125962..ccf04a6 100644
+--- a/src/gpu/intel/sdpa/configs.cpp
++++ b/src/gpu/intel/sdpa/configs.cpp
+@@ -776,6 +776,14 @@ static std::vector<bwd_config_record_t> sorted_bwd_configs = []() {
+         {{compute::gpu_arch_t::xe_hpc,  64, f32 | fma},  { 16, 32, 16, 16, 16, 32, 4, 4, 4, 4, 4, 4 }},
+         {{compute::gpu_arch_t::xe_hpc, 128, f32 | fma},  { 16, 16, 16, 32, 32, 32, 2, 4, 8, 1, 4, 2 }},
+ 
++        // xe_hpg
++        {{compute::gpu_arch_t::xe_hpg, 32},       { 8,  8,  8,  8,  8,  8, 4, 4, 4, 4, 4, 4 }},
++
++        {{compute::gpu_arch_t::xe_hpg, 64},       { 8, 16, 16,  8,  8, 32, 4, 4, 4, 4, 8, 2 }},
++        {{compute::gpu_arch_t::xe_hpg, 64, 128},  { 8,  8,  8,  8,  8, 16, 4, 8, 8, 4, 8, 4 }},
++
++        {{compute::gpu_arch_t::xe_hpg, 128},      { 8,  8, 32,  8, 32,  8, 4, 4, 4, 4, 4, 4 }},
++
+         // xe2
+         {{compute::gpu_arch_t::xe2, 32},       { 16, 16, 16, 16, 16, 16, 2, 4, 2, 2, 2, 4 }},
+         {{compute::gpu_arch_t::xe2, 32, 128},  { 16, 16, 16, 16, 16, 16, 2, 4, 2, 2, 2, 4 }},
+diff --git a/src/gpu/intel/sdpa/micro.hpp b/src/gpu/intel/sdpa/micro.hpp
+index ca16d15..df808f0 100644
+--- a/src/gpu/intel/sdpa/micro.hpp
++++ b/src/gpu/intel/sdpa/micro.hpp
+@@ -466,9 +466,6 @@ struct micro_bwd_t : public primitive_t {
+ 
+             VDISPATCH_SDPA(!is_fwd(), VERBOSE_BAD_PROPKIND);
+ 
+-            VDISPATCH_SDPA(arch_ != compute::gpu_arch_t::xe_hpg,
+-                    "fused SDPA BWD not supported for xe_hpg");
+-
+             bool is_f32 = (desc()->qry_md()->data_type == data_type::f32);
+             use_systolic_ukernel_
+                     = intel_engine->mayiuse(compute::device_ext_t::

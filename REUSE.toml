@@ -101,6 +101,11 @@ SPDX-FileCopyrightText = "2025 FlyDSL Project Contributors"
 SPDX-License-Identifier = "Apache-2.0"
 
 [[annotations]]
+path = ["third_party/main/oneDNN/patches/*.patch"]
+SPDX-FileCopyrightText = "Intel Corporation and the oneDNN contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
 path = ["third_party/main/aotriton/patches/*.patch"]
 SPDX-FileCopyrightText = ["Advanced Micro Devices, Inc.", "2026 MistVVK and the XeStrata contributors"]
 SPDX-License-Identifier = "MIT"

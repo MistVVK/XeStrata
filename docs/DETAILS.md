@@ -2229,7 +2229,7 @@ Strata's design, measurements and bottlenecks are in upstream's paper, **[docs/p
 
 XeStrata's own code is under the [LGPL-3.0-or-later](../COPYING.LESSER), and XeStrata as a combined work is distributed under it.
 The code from Strata, from ggml / llama.cpp and from Project Maya (all MIT) stays under MIT within it; their copyright and permission notices are in [NOTICE](../NOTICE).
-The exceptions stay under their own licenses: the patches to intel/llvm, the changes to oneMath, the copies in `third_party/main/` (`ggml-common.h`, `ggml-common-tq.h`, `quantscope.py`, `stb_image.h`, Outfit, KaTeX) and the patch to AOTriton, and `third_party/nonfree/` (below and [third_party/main/README.md](../third_party/main/README.md)).
+The exceptions stay under their own licenses: the patches to intel/llvm and oneDNN, the changes to oneMath, the copies in `third_party/main/` (`ggml-common.h`, `ggml-common-tq.h`, `quantscope.py`, `stb_image.h`, Outfit, KaTeX) and the patch to AOTriton, and `third_party/nonfree/` (below and [third_party/main/README.md](../third_party/main/README.md)).
 The model files are not part of it; their licenses apply to them (below).
 
 - **The original software**: [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors.

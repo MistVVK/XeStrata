@@ -241,7 +241,8 @@ void ad_product_bwd(const Product& P, const Adapter* ad, const uint16_t* x16, co
         dYb = yb;
     }
     dit_rows::rows16(dit_rows::Grad{{dYa, N}}, R, N, t16, trs, stream);
-    dgrad(t16, trs, P.wt, R, N, K, dxv, sums, accumulate, gemm, stream);
+    if (P.wt == nullptr && P.wr != nullptr) dgrad_rows(t16, trs, P.wr, R, N, K, dxv, sums, accumulate, gemm, stream);
+    else dgrad(t16, trs, P.wt, R, N, K, dxv, sums, accumulate, gemm, stream);
     if (P.dw != nullptr) {
         uint32_t* gi = scale_word(0, stream);
         scaled_transpose_f16(dYa, rsx, R, N, t16t, gi, stream);
@@ -257,12 +258,15 @@ void ad_product_bwd(const Product& P, const Adapter* ad, const uint16_t* x16, co
         // factor fb = scale * c, so it takes 1 (its dh is dL/dh either way: dh = scale * dYb B)
         const float ad_scale = ad->method == AdapterMethod::dora ? 1.0f : ad->scale;
         lora_bwd(hr, rsx, h16t, xt, ad->bt, dYb, R, N, K, ad->rank, ad_scale, ad->dB, ad->dA, lscratch,
-                    ltmp16, lrsT, gemm, stream, dYb == dYa ? t16 : nullptr, dYb == dYa ? trs : nullptr, h16, x16);
+                    ltmp16, lrsT, gemm, stream, dYb == dYa ? t16 : nullptr, dYb == dYa ? trs : nullptr, h16, x16,
+                    ad->b);
         // dh lives in lscratch; h16 and h16t are dead and take its split (the input gradient's dX is judged
         // at 3e-5, and an FP16 rounding of dh alone costs that budget)
         ad_split16(lscratch, R, ad->rank, h16, reinterpret_cast<uint16_t*>(h16t), lrsT, stream);
-        dgrad(h16, lrsT, ad->at, R, ad->rank, K, dxv, sums, true, gemm, stream);
-        dgrad(reinterpret_cast<uint16_t*>(h16t), lrsT, ad->at, R, ad->rank, K, dxv, sums, true, gemm, stream);
+        for (const uint16_t* part : {static_cast<const uint16_t*>(h16), static_cast<const uint16_t*>(h16t)}) {   // dX += dh A, A's rows as they are
+            if (ad->at != nullptr) dgrad(part, lrsT, ad->at, R, ad->rank, K, dxv, sums, true, gemm, stream);
+            else dgrad_rows(part, lrsT, ad->a, R, ad->rank, K, dxv, sums, true, gemm, stream);
+        }
         }
     }
 }

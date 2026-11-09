@@ -477,6 +477,7 @@ comes from Strata and ggml / llama.cpp (MIT) and the components listed below.
 - **Exceptions:** these, in `third_party/`, stay under their own licenses, one folder per project with its license text.
    - XeStrata's patches to intel/llvm (`third_party/main/intel-llvm/`): Apache-2.0 WITH LLVM-exception.
    - XeStrata's changes to oneMath (its fork, `third_party/main/oneMath/`): Apache-2.0.
+   - The patches to oneDNN, its pull requests backported (`third_party/main/oneDNN/`): Apache-2.0.
    - XeStrata's patch for building AOTriton for Windows (`third_party/main/aotriton/`): AOTriton's license (MIT).
    - Unmodified copies: ggml's `ggml-common.h` and agentionai's llama.cpp's `ggml-common-tq.h` (`third_party/main/ggml/`, MIT),
      `quantscope.py` (`third_party/main/quantscope/`, MIT or Apache-2.0), `stb_image.h` (`third_party/main/stb/`, MIT or the Unlicense).
