@@ -701,6 +701,7 @@ With the packages, run `xestrata` instead of `./setup.sh`: the same options, and
    384K and 512K are offered too, as experiments: past the trained length (262,144) setup adds RoPE scaling.
 1. **KV precision** (above 8K): see [above](#where-the-kv-cache-lives-and-its-precision).
 1. **Images?** (see [Images](#images)).
+1. **The translation model**: auto by default ([below](#translation-optional)).
 1. **The experimental speed projection**: off by default ([below](#experimental-speed-projection-experimental-off-by-default)).
 
 Then it chooses the SYCL compiler and builds the engine ([BUILD.md](BUILD.md#the-sycl-compiler)),
@@ -1029,6 +1030,8 @@ To switch between it and other model servers behind one address, see [LLAMA_SWAP
 | The same for Prometheus, with vLLM's metric names (`Accept: text/plain` or `?format=prometheus`) | `GET /metrics` |
 | The totals and what is running, for Prometheus with llama-server's metric names | `GET /metrics/prometheus` |
 | The MCP servers, their state and tools ([below](#tools-from-mcp-servers)) | `GET /mcp` |
+| Translation: DeepL's API ([below](#translation-optional)) | `POST /v2/translate`, `GET /v2/languages` |
+| Translation: LibreTranslate's API | `POST /translate`, `POST /detect`, `GET /languages`, `GET /frontend/settings` |
 
 `/models` and `/v1/models` list the model with its context limit and input modalities.
 It is listed before it is loaded and while it starts too, with `status` `loading` (`unloaded` when it was unloaded for idleness).
@@ -2096,6 +2099,15 @@ The image engine not only reads the LoRAs that are distributed but applies them 
 - **serve:** the listing (`serve/loras.py`) writes the DiT's target tables a second time (`TARGETS`, `_BIASED`), lists only the files and forms the model applies, and puts the others in `skipped` with their reasons. `TARGETS` against the C++ `build_lora_targets` is checked name for name on the real Qwen (264 to 264). A request's `lora` field and a prompt's tags resolve their names here; a tag's unknown name is taken out and warned of. A file the engine refuses when binding (rsLoRA, MageTrail's low-rank modulation, a text encoder's weight and the like) fails before an image is made, with the key and the reason.
 - **How it was checked:** on a small synthetic model, one step with a LoRA applied against one step of the same model with ΔW baked in gives a cosine of 0.9999 or more (Qwen-Image-2.1 0.9999999, MOSS-Image 0.9999709, Mage-Flow 0.9999955; in 8 bits 0.9999076 or more; the small configuration without XMX comes lower from the delta's FP16 rounding, and is checked by the bytes and the budget). Each form's formula matches the form's weight, built in torch from the file's tensors and applied to the base weight, within rel 2.3e-6 at a strength of 1 (OFT and `set_weight` interpolate once, so between 0 and 1 they differ from scaling the built weight's change). On the real Mage-Flow's two DiTs, each form's random adapter changes the image at a strength of 1, lies between at 0.5, and gives the bytes of no adapter at 0. There are also the bytes of an image with no adapter, the engine's end to end, the API and the web page's tests.
 - **Limits:** text encoder LoRAs are not applied. An OFT on Qwen-Image-2.1's `modulation.1` is refused (the DiT writes that weight `C` rows at a time, and a turn turns a part's rows whole).
+
+---
+
+## Translation (optional)
+
+`./setup.sh --translate auto` sets up a translation model apart from the text model (Preferred Networks' PLaMo 3 Translate: the 2B or the 0.8B by the RAM, the 8B with `--translate 8b`).
+The server translates through DeepL's API (`/v2/translate`), LibreTranslate's API (`/translate`, `/detect`) and the OpenAI-compatible API with the translation model's name as `model`, and the web page shows a Translate tab.
+The translation engine starts with the first translation and shares each GPU's VRAM ledger with the image engine (`--translate-gpu` chooses where it runs).
+Choosing a model, where it runs and the APIs' fields: [TRANSLATE.md](TRANSLATE.md).
 
 ---
 

@@ -92,10 +92,10 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
 let tab = "chat";
 let noteShown = false;
 function showTab(name) {
-  tab = ["chat", "images", "tools", "video", "monitor", "about"].includes(name) ? name : "chat";
+  tab = ["chat", "images", "tools", "video", "translate", "monitor", "about"].includes(name) ? name : "chat";
   for (const b of document.querySelectorAll(".st-header .st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
   fitHeader();                                       // on a phone the open tab shows its name: the row's room changes
-  for (const v of ["chat", "images", "tools", "video", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
+  for (const v of ["chat", "images", "tools", "video", "translate", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
   if (tab === "images") {
     $("img-prompt").focus();
     if (health.image_note && !noteShown) {   // once a page load: setup lowered the image model's size for the RAM
@@ -108,6 +108,7 @@ function showTab(name) {
   if (tab === "monitor") loadMcp();
   if (tab === "about") { loadConfig(); loadUpdate(); }
   if (tab === "video") vidJobs();
+  if (tab === "translate") { trnLoad(); $("trn-input").focus(); }
   if (lastMetrics) render(lastMetrics);
 }
 for (const b of document.querySelectorAll(".st-header .st-tab")) b.onclick = () => showTab(b.dataset.tab);
@@ -156,6 +157,8 @@ async function loadHealth() {
     imgModels();
     thinkingButtons();
     if (["#images", "#tools"].includes(location.hash) && health.image_generation) showTab(location.hash.slice(1));
+    $("tab-btn-translate").hidden = !health.translation;
+    if (location.hash === "#translate" && health.translation) showTab("translate");
   } catch (e) {
     setTimeout(loadHealth, 2000);
   }
@@ -2221,6 +2224,7 @@ async function generateReply(opts = {}) {
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
   if (settings.skills !== false && userSkillsOn()) body.xestrata_skills = true;   // the skills the user added (load_skill)
+  if (health.translation) body.xestrata_translate = true;   // translations go to the translation model (its tool)
   // and make images when the conversation asks for one: by the model the words choose (auto), by one, or none
   const ci = $("chat-images").value;
   if (health.image_generation && ci !== "off") body.xestrata_images = ci === "auto" || !ci ? true : {model: ci};
@@ -5209,3 +5213,138 @@ async function chatVideo(f) {
     toast("error", tr("vid.attach", "Video"), String(e.message || e), 10000);
   }
 }
+
+
+// ------------------------------------------------------------------ the translation page
+// The translation model's (health.translation): the text translated through /v1/chat/completions, its settings in
+// chat_template_kwargs, the translation streamed into the right pane.  The languages are the model's (/v1/models),
+// named in the page's language by the browser (Intl.DisplayNames).
+let trnModel = null, trnAbort = null, trnStarted = null;
+const trnTag = (code) => ({"zh-hans": "zh-Hans", "zh-hant": "zh-Hant"})[code] || code;
+function trnName(code) {
+  try { return new Intl.DisplayNames([StrataI18n.lang], {type: "language"}).of(trnTag(code)) || code; } catch (e) { return code; }
+}
+async function trnLoad() {
+  if (trnModel || !health.translation) return;
+  let m = null;
+  try {
+    const j = await (await fetch("v1/models", {headers: headers()})).json();
+    m = (j.data || []).find((x) => x.translation);
+  } catch (e) { /* tried again when the tab is opened again */ }
+  if (!m) return;
+  trnModel = m.id;
+  const codes = m.translation.languages || [];
+  const opts = codes.map((c) => [c, trnName(c)]).sort((a, b) => a[1].localeCompare(b[1], StrataI18n.lang));
+  const html = opts.map(([c, n]) => `<option value="${esc(c)}">${esc(n)}</option>`).join("");
+  $("trn-source").insertAdjacentHTML("beforeend", html);
+  $("trn-target").innerHTML = html;
+  // the target: the one chosen last, else the page's language (English where the page is Japanese: text in Japanese
+  // most often goes out)
+  const page = StrataI18n.lang === "zh" ? "zh-hans" : StrataI18n.lang;
+  const fallback = page === "ja" ? "en" : codes.includes(page) ? page : "ja";
+  const last = store.get("trn_target", "");
+  $("trn-target").value = codes.includes(last) ? last : fallback;
+  const src = store.get("trn_source", "");
+  $("trn-source").value = codes.includes(src) ? src : "";
+  $("trn-form").value = store.get("trn_form", "");
+  trnFormShown();
+}
+function trnFormShown() { $("trn-form-field").hidden = $("trn-target").value !== "ja"; }
+$("trn-target").onchange = () => { store.set("trn_target", $("trn-target").value); trnFormShown(); };
+$("trn-source").onchange = () => store.set("trn_source", $("trn-source").value);
+$("trn-form").onchange = () => store.set("trn_form", $("trn-form").value);
+$("trn-swap").onclick = () => {
+  const s = $("trn-source").value, t = $("trn-target").value, out = $("trn-output").textContent;
+  if (s) { $("trn-target").value = s; $("trn-source").value = t; }
+  else $("trn-source").value = t;                      // a detected source: the target becomes the source
+  if (out) { $("trn-input").value = out; $("trn-output").textContent = ""; $("trn-copy").disabled = true; }
+  store.set("trn_target", $("trn-target").value);
+  store.set("trn_source", $("trn-source").value);
+  trnFormShown();
+};
+$("trn-copy").onclick = async () => {
+  try {
+    await navigator.clipboard.writeText($("trn-output").textContent);
+    toast("success", tr("trn.copied", "Translation copied"));
+  } catch (e) { toast("warn", tr("trn.copyFailed", "Could not copy"), String(e.message || e)); }
+};
+// the glossary's lines, "source => translation" each
+function trnGlossary() {
+  const out = [];
+  for (const line of $("trn-glossary").value.split("\n")) {
+    const i = line.indexOf("=>");
+    if (i < 0) continue;
+    const a = line.slice(0, i).trim(), b = line.slice(i + 2).trim();
+    if (a && b) out.push({source: a, target: b});
+  }
+  return out;
+}
+function trnBusy(on) {
+  $("trn-go").classList.toggle("is-busy", on);
+  trnStarted = on ? performance.now() : null;
+  if (!on) return;
+  const tick = () => {
+    if (trnStarted == null) return;
+    $("trn-status").textContent = tr("img.elapsed", "{n} s", {n: Math.round((performance.now() - trnStarted) / 1000)});
+    setTimeout(tick, 500);
+  };
+  tick();
+}
+async function trnRun() {
+  const text = $("trn-input").value;
+  if (!text.trim() || !trnModel) return;
+  const kw = {target_lang: $("trn-target").value};
+  if ($("trn-source").value) kw.source_lang = $("trn-source").value;
+  if (kw.target_lang === "ja" && $("trn-form").value) kw.form = $("trn-form").value;
+  if ($("trn-context").value.trim()) kw.context = $("trn-context").value;
+  const gl = trnGlossary();
+  if (gl.length) kw.glossary = gl;
+  trnAbort = new AbortController();
+  trnBusy(true);
+  $("trn-output").textContent = "";
+  $("trn-copy").disabled = true;
+  let got = "";
+  try {
+    const r = await fetch("v1/chat/completions", {method: "POST", headers: headers(true), signal: trnAbort.signal,
+      body: JSON.stringify({model: trnModel, stream: true, messages: [{role: "user", content: text}],
+                            chat_template_kwargs: kw})});
+    if (!r.ok) {
+      let msg = `HTTP ${r.status}`;
+      try { const j = await r.json(); msg = (j.error && (j.error.message || j.error)) || j.message || msg; } catch (e) { /* the status */ }
+      throw new Error(msg);
+    }
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith("data:") || line === "data: [DONE]") continue;
+        let e;
+        try { e = JSON.parse(line.slice(5).trim()); } catch (err) { continue; }
+        const c = e.choices && e.choices[0];
+        if (c && c.delta && c.delta.content) { got += c.delta.content; $("trn-output").textContent = got; }
+        if (c && c.finish_reason === "error") throw new Error(tr("trn.failed", "The translation stopped"));
+      }
+    }
+    $("trn-status").textContent = got ? tr("trn.done", "Done in {n} s", {n: ((performance.now() - trnStarted) / 1000).toFixed(1)}) : "";
+  } catch (e) {
+    if (e.name !== "AbortError") toast("error", tr("trn.error", "Translation failed"), String(e.message || e));
+    $("trn-status").textContent = "";
+  } finally {
+    trnBusy(false);
+    trnAbort = null;
+    $("trn-copy").disabled = !got;
+  }
+}
+$("tr-form").onsubmit = (ev) => {
+  ev.preventDefault();
+  if (trnAbort) trnAbort.abort(); else trnRun();
+};
+$("trn-input").onkeydown = (ev) => {
+  if (ev.key === "Enter" && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); if (!trnAbort) trnRun(); }
+};

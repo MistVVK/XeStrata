@@ -652,6 +652,7 @@ setup はそこでファイルを見つけ、設定を書き直します。
    384K と 512K も選べますが、学習した長さ（262,144）を超えるので、RoPE の拡張を足す実験的なものです。
 1. **KV キャッシュの精度**（8K を超えるとき）: [上](#kv-キャッシュの置き場所と精度)を参照。
 1. **画像**: 使うかどうか（[画像](#画像)）。
+1. **翻訳のモデル**: 既定は auto（[下](#翻訳任意)）。
 1. **実験的な速度向上用の射影**: 既定はオフです（[下](#実験的な速度向上用の射影実験的既定はオフ)）。
 
 そのあと、SYCL のコンパイラを選んでエンジンをビルドし（[BUILD.ja.md](BUILD.ja.md#sycl-のコンパイラ)）、
@@ -962,6 +963,8 @@ server は `http://127.0.0.1:8095` で待ち受けます（setup の `--port`、
 | 同じものを Prometheus の形で（vLLM の名前、`Accept: text/plain` か `?format=prometheus`） | `GET /metrics` |
 | 合計といま動いているものを Prometheus の形で（llama-server の名前） | `GET /metrics/prometheus` |
 | MCP サーバーとその状態とツール（[下](#mcp-サーバーのツールを使う)） | `GET /mcp` |
+| 翻訳: DeepL の API（[下](#翻訳任意)） | `POST /v2/translate`、`GET /v2/languages` |
+| 翻訳: LibreTranslate の API | `POST /translate`、`POST /detect`、`GET /languages`、`GET /frontend/settings` |
 
 `/models` と `/v1/models` は、モデルを文脈の上限と入力の種類とともに示します。
 読み込む前と起動中も並び、`status` が `loading`（遊休で下ろしたときは `unloaded`）になります。
@@ -2021,6 +2024,15 @@ Web のページの Images のタブは、モデルごとの既定値（`/health
 - **serve**: 一覧（`serve/loras.py`）は、DiT の目標表を Python に写した `TARGETS` と `_BIASED` で、そのモデルが当てられるファイルと形式だけを出し、当てないファイルは理由付きで外します（`skipped`）。`TARGETS` と C++ の `build_lora_targets` の一致は、実物の Qwen で名前を突き合わせて確かめています（264 対 264）。要求の `lora` の欄とプロンプトのタグはここで名前を引き、知らないタグは外して警告にします。エンジンが結び付けで断るファイル（rsLoRA、MageTrail の低ランクの変調、テキストエンコーダーの重みなど）は、画像を作る前の失敗になり、キーと理由が付きます。
 - **確かめ方**: 合成の小モデルで、LoRA を当てた 1 ステップと ΔW を焼き込んだ同じモデルの 1 ステップの cos が 0.9999 以上（Qwen-Image-2.1 0.9999999、MOSS-Image 0.9999709、Mage-Flow 0.9999955。8 ビットでは 0.9999076 以上。XMX のない小構成ではデルタの FP16 の丸めで下がるので、バイト列と予算で確かめます）。形式ごとの式は、強さ 1 のところで、ファイルのテンソルから torch で形式ごとの重みを組んで土台の重みに当てたものと rel 2.3e-6 以下で一致します（OFT と `set_weight` は強さを 1 回だけ補間するので、0 と 1 の間では、組んだ重みの変化を強さ倍するものとは違います）。実物の Mage-Flow の 2 つの DiT に形式ごとの乱数のアダプターを当てると、強さ 1 で画像が変わり、0.5 がその間、0 が当てないのと同じバイト列になります。ほかに、当てない画像のバイト列、エンジンの端から端、API、Web の試験があります。
 - **限界**: 文章エンコーダー向けの LoRA は当てません。Qwen-Image-2.1 の `modulation.1` に当たる OFT は断ります（DiT がその重みを `C` 行ずつの帯で書き、回転は部分の行をまとめて回すため）。
+
+---
+
+## 翻訳（任意）
+
+`./setup.sh --translate auto` で、文章のモデルとは別の翻訳のモデル（Preferred Networks の PLaMo 3 Translate。RAM に合わせて 2B か 0.8B、`--translate 8b` で 8B）を入れます。
+サーバーは DeepL の API（`/v2/translate`）、LibreTranslate の API（`/translate`、`/detect`）、`model` に翻訳のモデルの名前を書いた OpenAI 互換の API で訳し、Web のページには「Translate」のタブが出ます。
+翻訳のエンジンは最初の翻訳で起動し、画像のエンジンと GPU ごとの VRAM の帳簿を分け合います（`--translate-gpu` で場所を選びます）。
+選び方、置き場所、API の項目は [TRANSLATE.ja.md](TRANSLATE.ja.md) にあります。
 
 ---
 

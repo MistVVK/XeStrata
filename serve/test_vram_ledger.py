@@ -98,6 +98,20 @@ class LedgerTest(unittest.TestCase):
         self.assertEqual(self.ledger.entries(), [])
         self.assertFalse(self.ledger.allocated(a))
 
+    def test_report_not_known(self):
+        # the translation engine's server reads no report: no limit until a base is known, then the base's term alone,
+        # and the base is not taken from it
+        self.assertIsNone(self.ledger.room(None))
+        a = self.ledger.reserve(3000, "translate", None, pid=self.other())
+        self.assertIsNotNone(a)
+        self.assertEqual(self.ledger.room(8000), 4900)          # an image job's report: 8000 - 3000 reserved - 100
+        self.ledger.remove(a)
+        time.sleep(0.6)
+        self.assertEqual(self.ledger.room(8000), 7900)          # the base: 8000
+        self.ledger.reserve(5000, "image", 8000, pid=self.other())
+        self.assertEqual(self.ledger.room(None), 2900)          # 8000 - 5000 - 100
+        self.assertIsNone(self.ledger.reserve(3000, "translate", None, pid=self.other()))
+
     def test_owner_moves_to_the_engine(self):
         a = self.ledger.reserve(1000, "translate", 8000)
         engine = self.other()

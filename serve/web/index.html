@@ -43,6 +43,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-tool"/></svg><span data-i18n="tab.tools">Tools</span></button>
     <button class="st-tab" role="tab" id="tab-btn-video" aria-controls="view-video" aria-selected="false" data-tab="video" hidden>
       <svg class="st-icon st-icon--sm" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="4" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 9V15L15 12Z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg><span data-i18n="tab.video">Video</span></button>
+    <button class="st-tab" role="tab" id="tab-btn-translate" aria-controls="view-translate" aria-selected="false" data-tab="translate" aria-label="Translate" title="Translate" data-i18n-label="tab.translate" data-i18n-title="tab.translate" hidden>
+      <svg class="st-icon st-icon--sm" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 5h10M8 3v2M5.5 5c.8 3.5 3.5 6.5 7 8M10.5 5c-.8 3.5-3.5 6.5-7 8M12.5 21l4.25-9 4.25 9M14 18h5.5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg><span data-i18n="tab.translate">Translate</span></button>
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor" aria-label="Monitor" title="Monitor" data-i18n-label="tab.monitor" data-i18n-title="tab.monitor">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg><span data-i18n="tab.monitor">Monitor</span></button>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about" aria-label="About" title="About" data-i18n-label="tab.about" data-i18n-title="tab.about">
@@ -643,6 +645,43 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
         <!-- the jobs on the server, newest first (GET /v1/videos): this page's and the API's -->
         <h3 class="vid-jobs__title" data-i18n="vid.jobs">Jobs</h3>
         <div class="vid-jobs" id="vid-jobs"><span class="composer-hint" data-i18n="vid.noJobs">No jobs yet.</span></div>
+      </div>
+    </form>
+  </section>
+
+  <!-- the translation model's page: the text translated through /v1/chat/completions (its chat_template_kwargs),
+       streamed; shown where /health says a translation model is set up -->
+  <section class="view view--translate" id="view-translate" role="tabpanel" aria-labelledby="tab-btn-translate" hidden>
+    <form class="tr-page" id="tr-form">
+      <div class="st-card tr-bar">
+        <label class="st-field"><span data-i18n="trn.from">From</span>
+          <select class="st-input" id="trn-source"><option value="" data-i18n="trn.detect">Detect the language</option></select></label>
+        <button type="button" class="st-btn st-btn--ghost tr-swap" id="trn-swap" title="Swap the languages and the texts" aria-label="Swap the languages and the texts" data-i18n-title="trn.swap" data-i18n-label="trn.swap">&#8644;</button>
+        <label class="st-field"><span data-i18n="trn.to">To</span>
+          <select class="st-input" id="trn-target"></select></label>
+        <label class="st-field" id="trn-form-field"><span data-i18n="trn.form">Style</span>
+          <select class="st-input" id="trn-form">
+            <option value="" data-i18n="trn.formAuto">As the text goes</option>
+            <option value="plain" data-i18n="trn.formPlain">Plain (da / dearu)</option>
+            <option value="polite" data-i18n="trn.formPolite">Polite (desu / masu)</option></select></label>
+      </div>
+      <div class="tr-panes">
+        <textarea class="st-input tr-text" id="trn-input" placeholder="Text to translate" data-i18n-placeholder="trn.placeholder" aria-label="Text to translate" data-i18n-label="trn.placeholder"></textarea>
+        <div class="st-card tr-out">
+          <div class="tr-text tr-result" id="trn-output" aria-live="polite"></div>
+          <div class="tr-out__foot"><span class="composer-hint" id="trn-status"></span>
+            <button type="button" class="st-btn st-btn--ghost" id="trn-copy" data-i18n="trn.copy" disabled>Copy</button></div>
+        </div>
+      </div>
+      <details class="img-neg tr-more"><summary data-i18n="trn.more">Context and glossary</summary>
+        <label class="st-field"><span data-i18n="trn.context">Context: text that helps the translation, not translated itself</span>
+          <textarea class="st-input" id="trn-context" rows="3"></textarea></label>
+        <label class="st-field"><span data-i18n="trn.glossary">Glossary: one term a line, as source =&gt; translation</span>
+          <textarea class="st-input" id="trn-glossary" rows="3" placeholder="PLaMo =&gt; PLaMo"></textarea></label>
+      </details>
+      <div class="img-go-bar tr-go-bar">
+        <button type="submit" class="st-btn st-btn--primary img-go tr-go" id="trn-go"><span class="img-go__run" data-i18n="trn.go">Translate</span>
+          <span class="img-go__stop" data-i18n="img.interrupt">Interrupt</span></button>
       </div>
     </form>
   </section>

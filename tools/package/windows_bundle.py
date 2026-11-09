@@ -108,12 +108,14 @@ COMPONENTS = [
      ["app/engine/cjxl.exe", "app/engine/djxl.exe"]),
     ("quantscope", "quantscope", "MIT OR Apache-2.0", "https://github.com/1872183316/quantscope",
      ["src:third_party/main/quantscope/LICENSE-MIT", "src:third_party/main/quantscope/LICENSE-APACHE"], []),
+    ("py3langid (the translation APIs' language detection)", "py3langid", "BSD-3-Clause",
+     "https://github.com/adbar/py3langid", ["src:third_party/main/py3langid/LICENSE"], []),
 ]
 
 # the program's files from the source tree (as cmake/packaging.cmake installs them on Linux)
 APP_FILES = ("setup.py", "chat.py", "requirements.txt")
 APP_DIRS = ("serve", "tools", "ref", "data", "third_party/main/outfit", "third_party/main/katex",
-            "third_party/main/mermaid", "third_party/main/quantscope")
+            "third_party/main/mermaid", "third_party/main/quantscope", "third_party/main/py3langid")
 APP_SKIP = ("__pycache__", "test_*", "mcp_fake_server.py", "lint", "vision", "package")
 
 
@@ -244,7 +246,7 @@ def main() -> None:
     lic = top / "licenses"
     lic.mkdir()
     versions = {"version": a.version, "dotnet": "10", "llama.cpp": "the commit setup.py pins",
-                "outfit": "third_party/main/outfit", "quantscope": "bfdf205",
+                "outfit": "third_party/main/outfit", "quantscope": "bfdf205", "py3langid": "0.4.0",
                 "python": a.python_zip.stem.split("-")[1],
                 "jxl": a.jxl.parent.name.removeprefix("jxl-")}   # windows.sh's jxl-<version>/x64-windows-static
     sycl_rec = json.loads((a.sycl / "XESTRATA.json").read_text())

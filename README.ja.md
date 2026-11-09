@@ -18,7 +18,7 @@ Ubuntu 26.04 と Fedora 44 には deb と rpm のパッケージ、Windows に�
 
 > **目次:** [All in One](#all-in-one) · [XeStrata とは](#xestrata-とは) · [必要なもの](#必要なもの) · [モデルの選び方](#モデルの選び方) ·
 > [インストール](#インストール) · [使い方](#使い方) · [困ったとき](#困ったとき) · [しくみ](#しくみ) ·
-> [開発する人へ](#開発する人へ) · [詳しい説明](docs/DETAILS.ja.md) · [画像の生成](docs/IMAGE.ja.md)
+> [開発する人へ](#開発する人へ) · [詳しい説明](docs/DETAILS.ja.md) · [画像の生成](docs/IMAGE.ja.md) · [翻訳](docs/TRANSLATE.ja.md)
 
 ## All in One
 
@@ -159,6 +159,11 @@ RAM の少ない PC では、Coder（32 GB）、Gyro（36 GB、RAM と VRAM の�
 画像のモデルには、文章のモデルとは別に 16〜20 GB の RAM が要ります（HunyuanImage 3.0 は約 50 GB）。
 選び方、使い方、API は [docs/IMAGE.ja.md](docs/IMAGE.ja.md) にあります。
 
+### 翻訳（任意）
+
+翻訳のモデル（Preferred Networks の PLaMo 3 Translate の 2B・0.8B・8B）を入れると、同じサーバーが DeepL と LibreTranslate の API、OpenAI 互換の API、Web のページの Translate のタブで訳します。`xestrata --setup` の質問で選ぶか、`--translate auto` のように指定します（既定は RAM に合わせて 2B か 0.8B）。
+選び方、使い方、API は [docs/TRANSLATE.ja.md](docs/TRANSLATE.ja.md) にあります。
+
 ## インストール
 
 ### Podman
@@ -209,6 +214,7 @@ podman compose up -d                         # http://127.0.0.1:8095（止める
 - **文脈の長さ**: 一度に覚えておける文章の量です。GPU に合った長さを勧めます。
 - **画像**: 画像も読ませるかどうか。
 - **画像を作るモデル**: どのモデルを入れるか。既定は Mage-Flow-Turbo、Qwen-Image-2.1-Turbo、MOSS-Image の 3 つ（ダウンロードは合わせて約 60 GB）で、none で入れません（[画像の生成](docs/IMAGE.ja.md)）。
+- **翻訳のモデル**: 既定は auto（RAM に合わせて PLaMo 3 Translate の 2B か 0.8B）で、no で入れません（[翻訳](docs/TRANSLATE.ja.md)）。
 - **実験的な速度向上用の射影**: 答え方が変わる実験的な機能で、既定ではオフです。使う前に
   [説明](docs/DETAILS.ja.md#実験的な速度向上用の射影実験的既定はオフ)を読んでください。
 
@@ -283,6 +289,7 @@ sudo dnf remove xestrata-contrib-cuda13.4    # Fedora（同じ）
   `xestrata chat` の `/think low`、アプリの「reasoning effort」の設定で変えられます。Off がいちばん速く、難しい質問には High が向きます。
 - **画像を読ませる**: チャットの画面では添付のボタンを押すか、画像をドロップか貼り付けします。`xestrata chat` では `/image <パス>` と入力します。アプリでは添付します。
 - **画像を作る**: Images のタブか、チャットで頼みます（[画像の生成](docs/IMAGE.ja.md)）。
+- **訳す**: Translate のタブか、DeepL・LibreTranslate の API で訳します（[翻訳](docs/TRANSLATE.ja.md)）。
 - **スマートフォンや別の PC から**: `xestrata --host 0.0.0.0 --api-key <秘密の文字列>` を実行し、
   サーバーのウィンドウに出るアドレスを開きます（[詳細](docs/DETAILS.ja.md#ストリーミングと接続)）。
 
@@ -397,6 +404,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
      Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)（[拒否を外した版](https://huggingface.co/SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF)は llmfan46 の重みを SC117 が量子化）、Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）。
    - Qwen の [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)、[Qwen3.5-2B](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF)、[Qwen3.5-0.8B](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF)（GGUF は Unsloth）と、HauhauCS による拒否を外した版の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)。
    - 画像の生成: Qwen の Qwen-Image-2.1、Microsoft の Mage-Flow、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image と編集の LoRA（chinoll の Moss-Image-Edit、akhaliq の MOSS-Image-Edit-HQ）、CircleStone Labs の Anima と Wan 2.1 の VAE、文の読み手の Qwen3-VL、Qwen3.5-9B、Qwen3-0.6B-Base、部分を直す道具の検出器の Bingsu の adetailer（Ultralytics YOLOv8 で学習）、拡大の Xintao Wang らの RealESRGAN x4plus と ByteDance Seed の SeedVR2、言葉からマスクの Meta の SAM 3.1（SAM License、同意の後だけ）と Microsoft の Florence-2、背景を消す Peng Zheng の BiRefNet、構図の制御の alibaba-pai の Qwen-Image-2.1 Fun ControlNet Union（Qwen Research License）と darask0 の MOSS-Image の色と深度のアダプターと 4 ステップのアダプター、制御の図を作る Depth Anything V2 Small・DWPose・Megvii の YOLOX-L・ControlNet 1.1 の HED・Caroline Chan の線画・NAVER の M-LSD（[IMAGE](docs/IMAGE.ja.md#ライセンス)）。
+   - 翻訳: Preferred Networks の PLaMo 3 Translate（PLaMo Community License、[TRANSLATE](docs/TRANSLATE.ja.md#ライセンス)）、言語の判定の py3langid（BSD-3-Clause）。
 
   モデルのファイルには、それぞれのライセンスが適用されます。
 - **使っている部品**:

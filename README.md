@@ -18,7 +18,7 @@ It is free software, and on an Intel or AMD GPU it also builds and runs with fre
 
 > **Contents:** [All in One](#all-in-one) · [About XeStrata](#about-xestrata) · [What you need](#what-you-need) ·
 > [Choosing a model](#choosing-a-model) · [Install](#install) · [Using it](#using-it) · [When something goes wrong](#when-something-goes-wrong) ·
-> [How it works](#how-it-works) · [For developers](#for-developers) · [All the details](docs/DETAILS.md) · [Image generation](docs/IMAGE.md)
+> [How it works](#how-it-works) · [For developers](#for-developers) · [All the details](docs/DETAILS.md) · [Image generation](docs/IMAGE.md) · [Translation](docs/TRANSLATE.md)
 
 ## All in One
 
@@ -164,6 +164,11 @@ A model that makes images (Qwen-Image-2.1, Mage-Flow, MageTrail, Tencent's Hunyu
 The image model needs 16-20 GB of RAM besides the text model's (HunyuanImage 3.0 about 50 GB).
 Choosing one, using it and the API: [docs/IMAGE.md](docs/IMAGE.md).
 
+### Translation (optional)
+
+With a translation model (Preferred Networks' PLaMo 3 Translate, 2B, 0.8B or 8B), the same server translates through DeepL's and LibreTranslate's APIs, the OpenAI-compatible API and the web page's Translate tab. Choose it in `xestrata --setup`'s questions, or name it, as in `--translate auto` (the default: the 2B or the 0.8B, by the RAM).
+Choosing one, using it and the API: [docs/TRANSLATE.md](docs/TRANSLATE.md).
+
 ## Install
 
 ### Podman
@@ -214,6 +219,7 @@ podman compose up -d                         # http://127.0.0.1:8095 (podman com
 - **The context:** how much text it can keep in mind at once. It suggests one for your GPU.
 - **Images:** whether it should also read pictures.
 - **Image models:** which models that make images to install: Mage-Flow-Turbo, Qwen-Image-2.1-Turbo and MOSS-Image by default (about 60 GB to download together), none for none ([Image generation](docs/IMAGE.md)).
+- **Translation model:** auto by default (PLaMo 3 Translate's 2B or 0.8B, by the RAM), no for none ([Translation](docs/TRANSLATE.md)).
 - **Experimental speed projection:** an experimental feature that changes how the model answers, off by default.
   Read [what it does](docs/DETAILS.md#experimental-speed-projection-experimental-off-by-default) before you turn it on.
 
@@ -296,6 +302,7 @@ Installing from the source with `./setup.sh` is in [docs/BUILD.md](docs/BUILD.md
   `/think low` in `xestrata chat`, or with your app's "reasoning effort" setting. Off is fastest; High suits hard questions.
 - **Showing it a picture:** in the chat page, press the attach button, or drop or paste the picture; in `xestrata chat`, type `/image <path>`; in apps, attach it.
 - **Making a picture:** in the Images tab, or ask in the chat ([Image generation](docs/IMAGE.md)).
+- **Translating:** in the Translate tab, or through DeepL's or LibreTranslate's API ([Translation](docs/TRANSLATE.md)).
 - **From a phone or another PC:** run `xestrata --host 0.0.0.0 --api-key <secret>` and open the address
   the server window prints ([details](docs/DETAILS.md#streaming-and-connecting)).
 
@@ -417,6 +424,7 @@ permission under GPL section 7, what goes in, and how to report).
      [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen (the [version with its refusals removed](https://huggingface.co/SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF) llmfan46's, quantized by SC117) and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth);
    - [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF), [Qwen3.5-2B](https://huggingface.co/unsloth/Qwen3.5-2B-GGUF) and [Qwen3.5-0.8B](https://huggingface.co/unsloth/Qwen3.5-0.8B-GGUF) by Qwen (GGUFs by Unsloth), and the version with its refusals removed, [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive), by HauhauCS;
    - image generation: Qwen's Qwen-Image-2.1, Microsoft's Mage-Flow, RicemanT's MageTrail with Black Forest Labs' Flux2 VAE, Tencent's HunyuanImage 3.0, OpenMOSS's MOSS-Image with its edit adapters (chinoll's Moss-Image-Edit, akhaliq's MOSS-Image-Edit-HQ), CircleStone Labs' Anima with Wan 2.1's VAE, Qwen3-VL, Qwen3.5-9B and Qwen3-0.6B-Base as the text encoders, Bingsu's adetailer (trained with Ultralytics YOLOv8) as the parts' fix's detectors, Xintao Wang et al.'s RealESRGAN x4plus and ByteDance Seed's SeedVR2 as the upscalers, Meta's SAM 3.1 (the SAM License, only once agreed to) and Microsoft's Florence-2 to find parts by words, Peng Zheng's BiRefNet to remove backgrounds, and for the composition control alibaba-pai's Qwen-Image-2.1 Fun ControlNet Union (the Qwen Research License) and darask0's MOSS-Image color and depth adapter and 4-step adapter, with Depth Anything V2 Small, DWPose, Megvii's YOLOX-L, ControlNet 1.1's HED, Caroline Chan's line art and NAVER's M-LSD to make the control maps ([IMAGE](docs/IMAGE.md#licenses)).
+   - translation: Preferred Networks' PLaMo 3 Translate (the PLaMo Community License, [TRANSLATE](docs/TRANSLATE.md#license)), and py3langid (BSD-3-Clause) to detect the languages.
 
   Each model's own license applies to its files.
 - **Parts it uses:**

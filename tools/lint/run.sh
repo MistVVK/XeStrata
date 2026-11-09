@@ -63,15 +63,25 @@ fi
 if [ ${#cpp[@]} -gt 0 ]; then
   if [ -n "$CLANG_TIDY" ] && [ -f "$BUILD/compile_commands.json" ]; then
     tidy=("$CLANG_TIDY" --quiet -p "$BUILD" --config-file="$C/clang-tidy.yaml")
-    mapfile -t cxx < <(printf '%s\n' "${cpp[@]}" | grep '\.cpp$')
+    mapfile -t tus < <(python3 -c 'import json, sys; print("\n".join(sorted({e["file"] for e in json.load(open(sys.argv[1]))})))' \
+      "$BUILD/compile_commands.json")
+    # a source this build does not compile (another GPU maker's, as the AMD-only HIP files on a build without HIP):
+    # clang-tidy would guess its command from a neighbor and report the headers it cannot find, so it is left out
+    cxx=()
+    for f in "${cpp[@]}"; do
+      [[ $f == *.cpp ]] || continue
+      if printf '%s\n' "${tus[@]}" | grep -qxF "$PWD/$f"; then
+        cxx+=("$f")
+      else
+        echo "== clang-tidy: $f skipped (not compiled in $BUILD)"
+      fi
+    done
     mapfile -t hpp < <(printf '%s\n' "${cpp[@]}" | grep '\.hpp$')
     [ ${#cxx[@]} -gt 0 ] && run clang-tidy "${tidy[@]}" "${cxx[@]}"
     # A header is checked inside a source that includes it, with that source's command: alone it gets the command of
     # whichever source's path is nearest, often one without -fsycl, and misses the macros a source defines before the
     # include (strata/kernels/device_arch_tag.hpp).  --line-filter keeps the header's findings only.
     if [ ${#hpp[@]} -gt 0 ]; then
-      mapfile -t tus < <(python3 -c 'import json, sys; print("\n".join(sorted({e["file"] for e in json.load(open(sys.argv[1]))})))' \
-        "$BUILD/compile_commands.json")
       for h in "${hpp[@]}"; do
         case "$h" in include/*) inc="[<\"]${h#include/}[>\"]" ;; *) inc="\"([^\"]*/)?${h##*/}\"" ;; esac
         tu=$(grep -l -E "^#include $inc" "${tus[@]}" 2>/dev/null | head -n 1)

@@ -210,7 +210,7 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
 .chip .st-btn--icon .st-icon { width: 14px; height: 14px; }
 
 /* ---------------------------------------------------------------- monitor */
-.view--monitor, .view--about, .view--images { overflow-y: auto; }
+.view--monitor, .view--about, .view--images, .view--translate { overflow-y: auto; }
 .monitor, .about { max-width: min(100%, 1920px); width: 100%; margin: 0 auto; padding: var(--st-s-6); display: flex; flex-direction: column;
                    gap: var(--st-s-5); }
 .state-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
@@ -769,3 +769,23 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
 .chip:has(.chip__thumb) { height: auto; min-height: 30px; padding-top: 3px; padding-bottom: 3px; border-radius: var(--st-r-md); }
 .chat-images-box .chat-images { max-width: none; width: auto; }
 .msg-image-wrap.is-marked img, a[data-gen-image].is-marked img { outline: 3px solid var(--st-accent); outline-offset: 2px; }
+
+/* the translation page: the languages above, the text and its translation side by side (one above the other on a
+   phone), context and glossary folded, the button below */
+.tr-page{display:grid;grid-template-columns:minmax(0,1fr);gap:var(--st-s-3);width:100%;max-width:1200px;margin:0 auto;
+  padding:var(--st-s-4)}
+.tr-page>*{grid-area:auto}   /* the image page's parts it borrows (img-go-bar) name areas this grid has not */
+.tr-bar{display:flex;flex-wrap:wrap;align-items:end;gap:var(--st-s-3);padding:var(--st-s-3)}
+.tr-bar .st-field{min-width:160px;flex:1}
+.tr-swap{align-self:end;min-width:44px;font-size:var(--st-fs-lg)}
+.tr-panes{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:var(--st-s-3)}
+.tr-text{min-height:240px;resize:vertical;font-size:var(--st-fs-base);line-height:1.6}
+.tr-out{display:flex;flex-direction:column;padding:var(--st-s-3)}
+.tr-result{flex:1;white-space:pre-wrap;overflow-wrap:anywhere}
+.tr-out__foot{display:flex;align-items:center;justify-content:space-between;gap:var(--st-s-2)}
+.tr-go{min-height:52px;flex-direction:row}
+@media (max-width:760px){
+  .tr-page{padding:var(--st-s-3)}
+  .tr-panes{grid-template-columns:minmax(0,1fr)}
+  .tr-text{min-height:160px}
+}

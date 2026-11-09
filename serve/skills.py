@@ -290,11 +290,12 @@ def wrap_user(s: Skill) -> str:
 
 class SkillTools:
     """load_skill for a chat request (a hub run_with_mcp runs: template_tools, routes, call, settings): its description
-    the image tools' part when they are offered (their rules, what this setup can do, their skills' list) and the user's
-    skills switched on when the request asks for them (`user`); it reads the named skills, several at once."""
+    the image tools' part when they are offered (their rules, what this setup can do, their skills' list), the built-in
+    skills of the other tools offered (`tools`: their names, as the translation tool's skill), and the user's skills
+    switched on when the request asks for them (`user`); it reads the named skills, several at once."""
 
-    def __init__(self, skills: Skills, images=None, user: bool = False):
-        self.skills, self.images, self.user = skills, images, user
+    def __init__(self, skills: Skills, images=None, user: bool = False, tools: tuple = ()):
+        self.skills, self.images, self.user, self.tools = skills, images, user, tuple(tools)
         self.settings = {"max_rounds": 4}
 
     def _index(self) -> dict[str, tuple[str, str]]:
@@ -303,6 +304,9 @@ class SkillTools:
         if self.images is not None:
             for name, kind, when in self.images.skill_index():
                 out[name] = (kind, when)
+        for s in self.skills.enabled(builtin=True):     # the other tools' own skills
+            if s.kind == "tool" and s.meta.get("tool") in self.tools:
+                out.setdefault(s.name, ("tool", s.description))
         if self.user:
             for s in self.skills.enabled(builtin=False):
                 out.setdefault(s.name, ("user", s.description))
@@ -324,6 +328,11 @@ class SkillTools:
     def routes(self) -> dict:
         return {TOOL: (None, TOOL)} if self._index() else {}
 
+    def _other(self, name: str) -> bool:
+        """A skill of a tool that is not the image tools'."""
+        s = self.skills.get(name)
+        return s is not None and s.builtin and s.meta.get("tool") in self.tools
+
     def call(self, name: str, arguments, cancel=None) -> dict:
         t0 = time.monotonic()
         index = self._index()
@@ -340,14 +349,14 @@ class SkillTools:
         for n in picked:
             s = self.skills.get(n) if index[n][0] == "tool" else None
             tool = s.meta.get("tool") if s is not None else None
-            if tool and self.images is not None and self.images.unlock(tool):
+            if tool and tool not in self.tools and self.images is not None and self.images.unlock(tool):
                 given.append(tool)
         parts = []
         for n in picked:
             if index[n][0] == "user":
                 s = self.skills.get(n)
                 parts.append(wrap_user(s) if s is not None else f"{n}: no longer here")
-            elif (text := self.images.skill_body(n)):
+            elif (text := self.skills.body(n) if self.images is None or self._other(n) else self.images.skill_body(n)):
                 parts.append(text if text.startswith("# ") else f"# {n}\n\n{text}")
         body = "\n\n".join(p for p in parts if p)
         if len(picked) > 1:

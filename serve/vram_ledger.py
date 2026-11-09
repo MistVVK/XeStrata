@@ -25,6 +25,10 @@ is gone (no such pid, or one started at another time: a reused pid) is removed w
 
 A reservation can still fail to allocate (an outsider took the memory meanwhile): the caller cancels its entry, frees
 what it got and plans again once with the room now (fewer layers on the GPU, or the CPU alone).
+
+A caller that cannot read the device's report (the server for the translation engine, which reads its own) passes
+None for it: the room is then the second term alone, or None (no limit known) while no base was ever taken, and the
+base is left as it is.
 """
 from __future__ import annotations
 
@@ -135,28 +139,35 @@ class Ledger:
             state["last_removed"] = now
         state["entries"] = kept
 
-    def _room(self, state: dict, device_free_mib: int, now: float) -> int:
+    def _room(self, state: dict, device_free_mib: int | None, now: float) -> int | None:
         entries = state["entries"]
-        if not entries and (state.get("base_mib") is None or now - float(state.get("last_removed", 0.0)) >= self.settle_s):
+        if device_free_mib is not None and not entries and (
+                state.get("base_mib") is None or now - float(state.get("last_removed", 0.0)) >= self.settle_s):
             state["base_mib"] = int(device_free_mib)
         reserved = sum(int(e["mib"]) for e in entries if e["state"] == RESERVED)
         held = sum(int(e["mib"]) for e in entries)
         base = state.get("base_mib")
-        room = int(device_free_mib) - reserved - self.margin_mib
+        terms = []
+        if device_free_mib is not None:
+            terms.append(int(device_free_mib) - reserved - self.margin_mib)
         if base is not None:
-            room = min(room, int(base) - held - self.margin_mib)
-        return max(0, room)
+            terms.append(int(base) - held - self.margin_mib)
+        return max(0, min(terms)) if terms else None
 
     # ---------------------------------------------------------------- the calls
-    def room(self, device_free_mib: int) -> int:
-        """The MiB a new entry can take now, `device_free_mib` the device's report."""
+    def room(self, device_free_mib: int | None) -> int | None:
+        """The MiB a new entry can take now, `device_free_mib` the device's report (None: not known; the room is then
+        None while no base is known)."""
         now = time.time()
         with self._locked() as state:
             self._purge(state, now)
             return self._room(state, device_free_mib, now)
 
-    def reserve(self, mib: int, purpose: str, device_free_mib: int, pid: int | None = None) -> str | None:
-        """An entry of `mib` reserved for process `pid` (this one by default), its id; None when the room is short."""
+    def reserve(self, mib: int, purpose: str, device_free_mib: int | None, pid: int | None = None,
+                until: float | None = None) -> str | None:
+        """An entry of `mib` reserved for process `pid` (this one by default), its id; None when the room is short.
+        `until`: when its owner expects to give it back (time.time(); an image job's estimate), for the others to
+        weigh waiting against making do with less."""
         now = time.time()
         pid = os.getpid() if pid is None else pid
         start = process_start(pid)
@@ -164,11 +175,12 @@ class Ledger:
             return None
         with self._locked() as state:
             self._purge(state, now)
-            if int(mib) > self._room(state, device_free_mib, now):
+            room = self._room(state, device_free_mib, now)
+            if room is not None and int(mib) > room:
                 return None
             eid = uuid.uuid4().hex
             state["entries"].append({"id": eid, "pid": pid, "start": start, "mib": int(mib), "purpose": purpose,
-                                     "state": RESERVED, "time": now})
+                                     "state": RESERVED, "time": now, "until": until})
             return eid
 
     def _set(self, eid: str, **changes) -> bool:

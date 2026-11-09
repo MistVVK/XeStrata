@@ -197,6 +197,8 @@ install(DIRECTORY third_party/main/outfit DESTINATION ${_pkg_share}/third_party/
 install(DIRECTORY third_party/main/katex DESTINATION ${_pkg_share}/third_party/main)   # the web chat's math
 install(DIRECTORY third_party/main/mermaid DESTINATION ${_pkg_share}/third_party/main)   # the web chat's flowcharts
 install(DIRECTORY third_party/main/quantscope DESTINATION ${_pkg_share}/third_party/main PATTERN "__pycache__" EXCLUDE)
+# the translation APIs' language detection
+install(DIRECTORY third_party/main/py3langid DESTINATION ${_pkg_share}/third_party/main PATTERN "__pycache__" EXCLUDE)
 install(DIRECTORY ${STRATA_GGML_DIR}/gguf-py DESTINATION ${_pkg_share}/third_party/main/llama.cpp
         PATTERN "__pycache__" EXCLUDE PATTERN "tests" EXCLUDE)
 install(FILES ${STRATA_GGML_DIR}/LICENSE DESTINATION ${_pkg_share}/third_party/main/llama.cpp)

@@ -96,6 +96,9 @@ from serve import image_controls as controls_api  # noqa: E402
 from serve import image_regions as regions_api  # noqa: E402
 from serve import videos as videos_api  # noqa: E402
 from serve import loras as lora_api  # noqa: E402
+from serve import translate as translate_mod  # noqa: E402
+from serve import translate_api  # noqa: E402
+from serve import vram_ledger  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
@@ -3166,6 +3169,266 @@ class Vision:
         shutil.rmtree(self.dir, ignore_errors=True)
 
 
+class Translation:
+    """The translation model's engine (serve/translate.py's MODELS; the config's "translate" section): the text
+    engine's program on the model's GGUF (`xestrata-engine --serve`, the same StrataEngine), started with the first
+    translation and stopped after idle_s without one.  One translation at a time, on a lock of its own: the text
+    model's engine and its FIFO are not touched.  Its card (translation_env): "auto", the image jobs' (where the
+    config has images) or else the text model's; "same", the text model's; "cpu"; or a GPU's PCI address, separate
+    from the text model's where no text engine takes it, and the text model's helper card handed over (HELPER off,
+    the borrowers counted with the image jobs') while the engine runs there.  On a GPU the engine puts the blocks the
+    free VRAM does not hold on the CPU.
+
+    The GPU's VRAM is shared with the image engine through the GPU's ledger (serve/vram_ledger.py, the image jobs'
+    GPU key): the engine starts with at most the ledger's room (--vram-free-mib; its blocks past it on the CPU) and
+    its weights are entered for it.  An engine started with blocks on the CPU for want of room is started again, all
+    on the GPU, before a translation that finds the room back (an image job ended): the move between requests, not
+    within one (2026-11-09, the user's choice).  When an image job holds the room and says when it ends (its ledger
+    entry's `until`), a translation waits for it where that ends sooner than translating with the blocks on the CPU
+    would (wait_or_split)."""
+
+    # Before the speeds are measured, a translation waits for an image job ending within this many seconds, else
+    # makes do with the room left
+    WAIT_UNMEASURED_S = 10.0
+
+    def __init__(self, cfg: dict, exe: str, log_path: str | None, env: dict | None, svc=None, helper_card: str = ""):
+        model = translate_mod.model_for(cfg.get("model"))
+        if model is None:
+            raise ValueError(f"translate.model: {cfg.get('model')!r} is not a translation model "
+                             f"({', '.join(translate_mod.MODELS)})")
+        self.model = model
+        self.path = str(cfg.get("path") or "")
+        if not os.path.isfile(self.path):
+            raise ValueError(f"translate.path: {self.path!r} is not a file")
+        self.exe = str(cfg.get("exe") or exe)
+        self.gpu = str(cfg.get("gpu") or "auto")
+        self.max_context = int(cfg.get("max_context") or 8192)
+        self.idle_s = float(cfg.get("idle_s") or 600)
+        self.threads = int(cfg.get("threads") or 0)
+        self.log_path, self.env = log_path, env
+        self.svc, self.helper_card = svc, helper_card
+        self.helper_lock = threading.Lock()              # the helper's borrowers, where no image models count them
+        self.helper_jobs = 0
+        self.borrowed = False
+        self.lock = threading.Lock()                     # one translation at a time
+        self.engine: StrataEngine | None = None
+        self.tok = None
+        self.eos: set = set()
+        self.last_used = 0.0
+        self.error: str | None = None                    # the last start's failure (status)
+        self.ledger: vram_ledger.Ledger | None = None
+        self.entry: str | None = None                    # the engine's ledger entry
+        self.entry_mib = 0
+        self.partial = False                             # started with blocks on the CPU for want of room
+        self.rates: dict = {"whole": None, "part": None}   # tokens a second (read and written), measured
+        threading.Thread(target=self._idle_stop, daemon=True, name="xestrata-translate-idle").start()
+
+    def args(self) -> list:
+        # no conversation cache: a translation is one request, never continued (the engine sized 8 GiB of RAM for it)
+        args = ["--native", self.path, "--max-context", str(self.max_context), "--conversation-cache-mib", "0"]
+        if self.gpu == "cpu":
+            args += ["--device", "cpu"]
+        if self.threads > 0:
+            args += ["--cpu-threads", str(self.threads)]
+        return args
+
+    def status(self) -> dict:
+        return {"model": self.model.id, "loaded": self.engine is not None and self.engine.alive(),
+                "gpu": self.gpu, "partial": self.partial, "error": self.error}
+
+    def need_mib(self) -> int:
+        """The VRAM the whole model takes on a GPU: its weights, a reserve for its K/V, buffers and the runtime."""
+        return self.model.file_mib + 1024
+
+    def _room_back(self) -> bool:
+        """Whether an engine started short of room would now have the room for the whole model."""
+        if not self.partial or self.ledger is None:
+            return False
+        room = self.ledger.room(None)
+        return room is None or room + self.entry_mib >= self.need_mib()
+
+    def _stop(self) -> None:
+        """The engine ended and its ledger entry given back (the caller holds the lock)."""
+        if self.ledger is not None and self.entry is not None:
+            self.ledger.releasing(self.entry)
+        if self.engine is not None:
+            with contextlib.suppress(EngineStuck):
+                self.engine.close()
+        self.engine = None
+        if self.ledger is not None and self.entry is not None:
+            self.ledger.remove(self.entry)
+        self.entry, self.entry_mib, self.partial = None, 0, False
+        if self.borrowed:
+            self.borrowed = False
+            images_api.helper_return_later(self.svc, self._helper_holder(), self._say)
+
+    def _env(self) -> dict:
+        return dict(self.env or os.environ)
+
+    def _say(self, words: str) -> None:
+        print(f"[xestrata] translation: {words}", flush=True)
+
+    def _helper_holder(self):
+        images = getattr(self.svc, "images", None)
+        return images if images is not None else self
+
+    def _tokenizer(self):
+        if self.tok is None:
+            from strata_plamo import PlamoTokenizer
+            self.tok = PlamoTokenizer.from_gguf(self.path)
+            self.eos = stop_token_ids(self.tok)
+        return self.tok
+
+    def wait_or_split(self, tokens: int, cancel: threading.Event) -> None:
+        """Before a start short of room (the caller holds the lock): where image jobs hold the room and say when they
+        end, wait for them if that and translating `tokens` (read and written) on the GPU end sooner than translating
+        them with the blocks on the CPU now, at the speeds measured (before they are, a wait of WAIT_UNMEASURED_S at
+        most).  An image engine idle on the card, kept warm after its job, is asked to let go of its VRAM."""
+        if self.gpu == "cpu" or (self.engine is not None and self.engine.alive() and not self.partial):
+            return
+        led = vram_ledger.Ledger(images_api.gpu_key(self._env()))
+        need = self.need_mib()
+        room = led.room(None)
+        own = self.entry_mib if self.engine is not None and self.engine.alive() else 0
+        if room is None or room + own >= need:
+            return
+        now = time.time()
+        ends = [float(e["until"]) for e in led.entries() if e.get("purpose") == "image" and e.get("until")]
+        imgs = self._images()
+        if ends:
+            wait = max(0.0, max(ends) - now)
+            whole, part = self.rates["whole"], self.rates["part"]
+            if whole and part:
+                go = wait + tokens / whole < tokens / part
+            else:
+                go = wait <= self.WAIT_UNMEASURED_S
+            if not go:
+                return
+            print(f"[xestrata] translation: waiting {wait:.0f} s for an image job to give the GPU's room back",
+                  flush=True)
+            deadline = time.monotonic() + wait + 30.0
+            while time.monotonic() < deadline and not cancel.is_set():
+                r = led.room(None)
+                if r is None or r + own >= need:
+                    return
+                if imgs is not None and not imgs.busy():
+                    break
+                time.sleep(0.5)
+        # an image engine idle on the card, kept warm after its job, holds the room: it lets go of it
+        if imgs is not None and not imgs.busy() and not cancel.is_set():
+            try:
+                imgs.make_room(cancel)
+            except images_api.ImageJobFailed:
+                pass
+
+    def _images(self):
+        """The server's image models when their engines run on this engine's card, else None."""
+        imgs = getattr(self.svc, "images", None) if self.svc is not None else None
+        if not isinstance(imgs, images_api.ImageModels):
+            return None
+        same = images_api.gpu_key(imgs.default.engine.env) == images_api.gpu_key(self._env())
+        return imgs if same else None
+
+    def _start(self) -> None:
+        """The tokenizer and the engine (the caller holds the lock); RuntimeError with the reason when it fails."""
+        self._tokenizer()
+        if self.engine is not None and self.engine.alive():
+            if not self._room_back():
+                return
+            print("[xestrata] translation: the GPU has room for the whole model again, starting it there", flush=True)
+            self._stop()
+        elif self.engine is not None:
+            self._stop()                                 # it ended: its entry goes
+        env = self._env()
+        args = self.args()
+        need, cap = self.need_mib(), None
+        if self.helper_card and self.svc is not None:   # the text model's helper card: closed while the engine runs
+            self.borrowed = images_api.helper_borrow(self.svc, self.helper_card, self._helper_holder(), self._say)
+        if self.gpu != "cpu":
+            self.ledger = vram_ledger.Ledger(images_api.gpu_key(env))
+            cap = self.ledger.room(None)
+            if cap is not None:
+                args += ["--vram-free-mib", str(cap)]
+            self.entry_mib = need if cap is None else min(need, cap)
+            self.entry = self.ledger.reserve(self.entry_mib, "translation", None)
+            self.partial = cap is not None and cap < need
+        print(f"[xestrata] translation: starting {self.model.name} ({self.gpu}"
+              + (f", {cap} MiB of VRAM for it" if cap is not None else "") + ") ...", flush=True)
+        try:
+            self.engine = StrataEngine(self.exe, args, log=self.log_path, env=env)
+        except (OSError, RuntimeError, EngineDied) as e:
+            self.engine = None
+            self._stop()
+            self.error = str(e)
+            raise RuntimeError(f"the translation model did not start: {e}") from None
+        if self.ledger is not None and self.entry is not None and self.engine.proc is not None:
+            self.ledger.allocated(self.entry, pid=self.engine.proc.pid)
+        self.engine.eos_ids = self.eos
+        self.error = None
+
+    def _idle_stop(self) -> None:
+        while True:
+            time.sleep(min(30.0, max(1.0, self.idle_s / 4)))
+            if self.engine is None or time.time() - self.last_used < self.idle_s:
+                continue
+            if self.lock.acquire(blocking=False):
+                try:
+                    if self.engine is not None and time.time() - self.last_used >= self.idle_s:
+                        print("[xestrata] translation: the model is idle, stopping it", flush=True)
+                        self._stop()
+                finally:
+                    self.lock.release()
+
+    def translate(self, prompts: list, sampling: dict | None = None, max_tokens: int | None = None,
+                  cancel: threading.Event | None = None, on_text=None) -> list:
+        """Each of `prompts` (PFML3 texts, the model's own) translated, in order: {"text", "prompt_tokens",
+        "completion_tokens", "finish_reason" (stop or length)}.  on_text(i, delta): each prompt's text as it comes (a
+        stream).  RuntimeError when the model cannot start, EngineDied when it ends meanwhile, ValueError for a text
+        past the context."""
+        cancel = cancel or threading.Event()
+        out: list = []
+        with self.lock:
+            tok = self._tokenizer()
+            all_ids = [tok.encode(p, parse_special=True) for p in prompts]
+            self.wait_or_split(2 * sum(len(x) for x in all_ids), cancel)
+            self._start()
+            assert self.engine is not None and self.tok is not None
+            t0, done_tokens = time.monotonic(), 0
+            for i, ids in enumerate(all_ids):
+                room = self.max_context - CTX_SLACK - len(ids)
+                if room < 1:
+                    raise ValueError(f"the text is {len(ids)} tokens, more than the translation model's context "
+                                     f"({self.max_context})")
+                want = min(int(max_tokens if max_tokens else 2 * len(ids) + 64), room)
+                toks: list = []
+                shown = ""
+                finish = "length"
+                for t in self.engine.generate(ids, want, sampling or {}, cancel):
+                    if t is None:
+                        continue
+                    if t in self.eos:
+                        finish = "stop"
+                        break
+                    toks.append(t)
+                    if on_text is not None:
+                        text = self.tok.decode(toks, errors="ignore")
+                        if len(text) > len(shown):
+                            on_text(i, text[len(shown):])
+                            shown = text
+                if finish == "length" and len(toks) < want:
+                    finish = "stop"                      # the engine ended at its own end-of-text
+                out.append({"text": self.tok.decode(toks), "prompt_tokens": len(ids), "completion_tokens": len(toks),
+                            "finish_reason": finish})
+                done_tokens += len(ids) + len(toks)
+                self.last_used = time.time()
+            took = time.monotonic() - t0
+            if took > 0.05 and done_tokens:
+                kind = "part" if self.partial else "whole"
+                was = self.rates[kind]
+                self.rates[kind] = done_tokens / took if was is None else (was + done_tokens / took) / 2
+        return out
+
+
 def gpu_list(cfg: dict) -> list[int]:
     """The config's "gpu": one card (2), or several for a layer split ([0, 2] or "0,2"), numbered as nvidia-smi
     numbers them; [] when it names none."""
@@ -3487,7 +3750,12 @@ def image_helper_card(cfg: dict) -> str:
     the first card alone (801 against 1,592 tok/s at 4K), and a helper closes in 29 ms and fills again in 1.9 s.
     "" otherwise."""
     images = cfg.get("images")
-    want = str((images or {}).get("gpu_pci") or "").lower() if isinstance(images, dict) else ""
+    return helper_card_for(cfg, str((images or {}).get("gpu_pci") or "") if isinstance(images, dict) else "")
+
+
+def helper_card_for(cfg: dict, pci: str) -> str:
+    """`pci` (lower case) when it is the text engine's helper card (image_helper_card's conditions), else ""."""
+    want = str(pci or "").lower()
     later = [str(p).lower() for p in cfg.get("split_pci") or []]
     if not want or len(later) != 1 or want != later[0] or cfg.get("replicas") or cfg.get("split_serve"):
         return ""
@@ -3517,11 +3785,34 @@ def gpu_files_missing(pci: str) -> str:
 def image_env(cfg: dict, env: dict) -> tuple[dict, bool, str]:
     """The image engine's environment, from the text engine's (`env`, child_env) -> (it, whether the image jobs have a
     card of their own (images_api.ImageModels' separate), the line the log says of it).  The "images" section's
-    "gpu_pci" (setup --image-gpu) is that card unless a text engine of the server takes it: the server's card, a layer
-    split's, the replicas' and a split serve's.  A helper GPU (--expert-cache-device1..3, by device number), an
-    environment that narrows the GPUs the runtime lists, or a card whose device files are not here (gpu_files_missing)
-    leaves the jobs on the text engine's card."""
-    want = str((cfg.get("images") or {}).get("gpu_pci") or "").lower()
+    "gpu_pci" (setup --image-gpu) is that card unless a text engine of the server takes it (card_env)."""
+    return card_env(cfg, env, str((cfg.get("images") or {}).get("gpu_pci") or ""), "image GPU", "the image jobs")
+
+
+def translation_env(cfg: dict, gpu: str) -> tuple[dict, str, str]:
+    """The translation engine's environment for its "gpu" (Translation's) -> (it, the text model's helper card when the
+    engine takes it, "" else, the log's line)."""
+    env = child_env(cfg)
+    if gpu in ("cpu", "same"):
+        return env, "", ""
+    if gpu == "auto":
+        if not cfg.get("images"):
+            return env, "", ""
+        tenv, _sep, _said = image_env(cfg, env)
+        pci = str((cfg.get("images") or {}).get("gpu_pci") or "").lower()
+        return tenv, helper_card_for(cfg, pci) if tenv is not env else "", ""
+    tenv, sep, said = card_env(cfg, env, gpu, "translation GPU", "translations")
+    return tenv, helper_card_for(cfg, gpu) if sep else "", said
+
+
+def card_env(cfg: dict, env: dict, pci: str, what: str, who: str) -> tuple[dict, bool, str]:
+    """An engine's environment on the card `pci` (the image engine's, the translation engine's), from the text
+    engine's (`env`) -> (it, whether the card is its own, the log's line; `what` and `who` name the engine in it).  The
+    card is the engine's unless a text engine of the server takes it: the server's card, a layer split's, the
+    replicas' and a split serve's (the text engine's helper card is handed over: helper_card_for).  A helper GPU
+    (--expert-cache-device1..3, by device number), an environment that narrows the GPUs the runtime lists, or a card
+    whose device files are not here (gpu_files_missing) leaves the engine on the text engine's card."""
+    want = str(pci or "").lower()
     if not want:
         return env, False, ""
     text = {str(envvars.get("GPU_PCI", env=env) or cfg.get("gpu_pci") or "").lower()}
@@ -3533,7 +3824,7 @@ def image_env(cfg: dict, env: dict) -> tuple[dict, bool, str]:
     if isinstance(ss, dict):
         text |= {str(ss.get(k) or "").lower() for k in ("prefill_gpu", "decode_gpu")}
     text.discard("")
-    if want == image_helper_card(cfg):            # the text engine's helper card, handed over for each image job
+    if want == helper_card_for(cfg, want):        # the text engine's helper card, handed over for the engine's work
         text.discard(want)
     args = [str(a) for a in cfg.get("args") or []]
     why = ("a helper GPU (--expert-cache-device1..3) is named by its device number" if any(
@@ -3542,14 +3833,14 @@ def image_env(cfg: dict, env: dict) -> tuple[dict, bool, str]:
            else "the text model takes it" if want in text else
            "no text card is named (the engine takes the first)" if not text else gpu_files_missing(want))
     if why:
-        return env, False, f"image GPU: {want} is not used ({why}); the image jobs share the text model's card"
+        return env, False, f"{what}: {want} is not used ({why}); {who} share the text model's card"
     out = dict(env, XESTRATA_GPU_PCI=want)
     if cfg.get("gpu") not in (None, ""):          # CUDA_VISIBLE_DEVICES of the text card alone would hide this one
         out.pop("CUDA_VISIBLE_DEVICES", None)
-    if want == image_helper_card(cfg):
-        return out, True, (f"image GPU: {want}, the text model's second card: a helper expert cache there is closed "
-                           "for each image job and opened again after it")
-    return out, True, f"image GPU: {want} (separate from the text model's)"
+    if want == helper_card_for(cfg, want):
+        return out, True, (f"{what}: {want}, the text model's second card: a helper expert cache there is closed "
+                           f"while {who} use it and opened again after")
+    return out, True, f"{what}: {want} (separate from the text model's)"
 
 
 def gpu_roles(cfg: dict, gpu_pci: str | None, groups: list | None = None, split_serve: dict | None = None,
@@ -3912,6 +4203,7 @@ class Service:
         # on unless the config's "tool_call_recovery" is false: tool calls in forms next to the template's
         self.tool_call_recovery = True
         self.images: Any = None                           # serve/images.py's ImageModels when the config has "images"
+        self.translation: Any = None                      # Translation when the config has "translate"
         self.video_jobs: Any = None                       # serve/videos.py's VideoJobs, made at the first video request
         self.long_job: Any = None                         # a video job's state while it holds the image engine
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
@@ -7687,6 +7979,7 @@ def make_handler(svc: Service):
                                  # a streamed chat reply can be kept past its connection (xestrata_reply)
                                  "kept_replies": True,
                                  "debug_chat_log": svc.debug_log is not None,
+                                 "translation": svc.translation.status() if svc.translation is not None else None,
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path.startswith("/v1/images/licenses/"):   # a tool's weights' license to agree to (SAM 3's)
                 if not self._authorized():
@@ -7735,6 +8028,8 @@ def make_handler(svc: Service):
                 for k in ("started", "first_token"):
                     s.pop(k, None)
                 self._json(200, s)
+            elif path in self.TRANSLATE_GET:
+                self._translate_get(path, parse_qs(urlsplit(self.path).query))
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
                     self._json(200, {"object": "list", "data": self._models()})
@@ -7803,7 +8098,234 @@ def make_handler(svc: Service):
                          for name, (method, variant) in images_api.UPSCALE_MODELS.items()]
                 # the segmenters and BiRefNet: POST /v1/images/segmentations, /v1/images/remove-background
                 data += [{**m, **common, "status": {"value": "loaded"}} for m in regions_api.models()]
+            if svc.translation is not None:              # the translation model: chat, completions, DeepL, Libre
+                tm = svc.translation.model
+                data.append({"id": tm.id, **common,
+                             "status": {"value": "loaded" if svc.translation.status()["loaded"] else "unloaded"},
+                             "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+                             "translation": {"languages": list(tm.codes())}})
             return data
+
+        # ------------------------------------------------------------------------------------------- translation
+        # DeepL's (/v2/translate, /v2/languages) and LibreTranslate's (/translate, /languages, /detect,
+        # /frontend/settings) APIs on the translation model, and OpenAI's chat and completions when a request names
+        # it: serve/translate_api.py reads the requests and builds the answers, Translation translates.  The server's
+        # one API key is taken in each API's own way as well (DeepL-Auth-Key, LibreTranslate's api_key); without a key
+        # set, all pass.
+        TRANSLATE_POST = ("/v2/translate", "/translate", "/detect")
+        TRANSLATE_GET = ("/v2/languages", "/languages", "/frontend/settings")
+
+        def _translate_error(self, path: str, status: int, message: str) -> None:
+            if path.startswith("/v2/"):
+                self._json(status, {"message": message})
+            elif path.startswith("/v1/"):
+                self._json(status, {"error": {"message": message, "type": "invalid_request_error"
+                                              if status < 500 else "server_error"}})
+            else:
+                self._json(status, {"error": message})
+
+        def _translate_key(self, params: dict | None) -> str | None:
+            """The key a translation request gives: DeepL's header, a Bearer or x-api-key header, or (LibreTranslate)
+            the body's api_key."""
+            auth = self.headers.get("Authorization", "")
+            for prefix in ("deepl-auth-key ", "bearer "):
+                if auth.lower().startswith(prefix):
+                    return auth[len(prefix):].strip()
+            if self.headers.get("x-api-key"):
+                return self.headers.get("x-api-key")
+            if params is not None:
+                k = translate_api.one(params, "api_key")
+                return k if isinstance(k, str) else None
+            return None
+
+        def _translate_allowed(self, path: str, params: dict | None) -> bool:
+            if not svc.api_key:
+                return True
+            given = self._translate_key(params)
+            if given and key_matches(given, svc.api_key):
+                return True
+            if path.startswith("/v2/"):
+                self._translate_error(path, 403, "Authorization failed. Please supply a valid DeepL-Auth-Key via the "
+                                                 "Authorization header.")
+            elif not given:
+                self._translate_error(path, 400, "Please contact the server operator to get an API key")
+            else:
+                self._translate_error(path, 403, "Invalid API key")
+            return False
+
+        def _translate_run(self, path: str, req) -> list | None:
+            """`req`'s translations (translate_api.translate_all), or None with the error answered."""
+            tr = svc.translation
+            try:
+                return translate_api.translate_all(
+                    req, lambda jobs: [r["text"] for r in tr.translate([j.prompt(tr.model) for j in jobs])])
+            except translate_api.ApiError as e:
+                self._translate_error(path, e.status, str(e))
+            except ValueError as e:                      # a text past the model's context
+                self._translate_error(path, 413 if path.startswith("/v2/") else 400, str(e))
+            except (RuntimeError, EngineDied) as e:
+                self._translate_error(path, 503, str(e))
+            return None
+
+        def _translate_post(self, path: str) -> None:
+            if svc.translation is None:
+                self._translate_error(path, 404, "no translation model is set up (xestrata --setup --translate)")
+                return
+            # _foreign_page's check, the refusal in the API's own error shape
+            origin = self.headers.get("Origin")
+            if not svc.api_key and origin:
+                if not origin_allowed(origin, self.headers.get("Host"), svc.host_names,
+                                      [*svc.trusted_origins, *svc.cors_origins]):
+                    print(f"[xestrata] refused a translation request from the web page {origin!r} (no API key)",
+                          flush=True)
+                    self._translate_error(path, 403, f"web pages of {origin} may not use this server without an "
+                                                     "API key; set \"api_key\", or add the page's host to "
+                                                     "\"allowed_hosts\"")
+                    return
+                if not self.headers.get("Content-Type", "").startswith("application/json"):
+                    self._translate_error(path, 415, "send application/json")
+                    return
+            model = svc.translation.model
+            body = self._body()
+            if path == "/v2/translate" and len(body or b"") > translate_api.DEEPL_MAX_BODY:
+                self._translate_error(path, 413, "Request Entity Too Large")
+                return
+            try:
+                params = translate_api.form_or_json(body, self.headers.get("Content-Type", ""))
+            except translate_api.ApiError as e:
+                self._translate_error(path, e.status, str(e))
+                return
+            if not self._translate_allowed(path, params):
+                return
+            try:
+                if path == "/detect":
+                    self._json(200, translate_api.libre_detect(params, model))
+                    return
+                if path == "/v2/translate":
+                    req = translate_api.deepl_request(params, model)
+                    got = self._translate_run(path, req)
+                    if got is not None:
+                        self._json(200, translate_api.deepl_answer(req, got))
+                    return
+                req, batch, detected = translate_api.libre_request(params, model)
+            except translate_api.ApiError as e:
+                self._translate_error(path, e.status, str(e))
+                return
+            got = self._translate_run(path, req)
+            if got is not None:
+                self._json(200, translate_api.libre_answer(req, got, batch, detected))
+
+        def _translate_get(self, path: str, query: dict) -> None:
+            if svc.translation is None:
+                self._translate_error(path, 404, "no translation model is set up (xestrata --setup --translate)")
+                return
+            model = svc.translation.model
+            if path == "/v2/languages":
+                if self._translate_allowed(path, None):
+                    kind = (query.get("type") or ["source"])[0]
+                    self._json(200, translate_api.deepl_languages(model, "target" if kind == "target" else "source"))
+            elif path == "/languages":
+                self._json(200, translate_api.libre_languages(model))
+            else:
+                self._json(200, translate_api.libre_settings(model, bool(svc.api_key)))
+
+        def _translate_openai(self, path: str, req: dict) -> None:
+            """OpenAI's chat (/v1/chat/completions) and completions (/v1/completions) for the translation model: the
+            chat rendered as the model's chat template renders it (chat_template_kwargs, the [plamo-translate] system
+            block), the completions' prompt as written (PFML3); streamed or not."""
+            tr = svc.translation
+            chat = path == "/v1/chat/completions"
+            try:
+                if chat:
+                    kwargs = req.get("chat_template_kwargs") or {}
+                    if not isinstance(kwargs, dict):
+                        raise translate_api.ApiError(400, "chat_template_kwargs must be an object")
+                    known = {k: kwargs[k] for k in ("target_lang", "source_lang", "form", "context", "glossary")
+                             if k in kwargs}
+                    try:
+                        prompt = translate_mod.pfml3(req.get("messages") or [], **known)
+                    except translate_mod.PfmlError as e:
+                        raise translate_api.ApiError(400, str(e)) from None
+                else:
+                    prompt = translate_api.completion_prompt(req)
+            except translate_api.ApiError as e:
+                self._translate_error(path, e.status, str(e))
+                return
+            sampling = {k: req[k] for k in ("temperature", "top_p", "top_k", "min_p", "seed") if k in req}
+            limit = req.get("max_completion_tokens") or req.get("max_tokens")
+            stops = stop_strings(req)
+            rid = ("chatcmpl-" if chat else "cmpl-") + uuid.uuid4().hex
+            created = int(time.time())
+            model_id = str(req.get("model") or tr.model.id)
+            cancel = threading.Event()
+
+            def cut(text: str) -> tuple:
+                hits = [text.find(x) for x in stops if x and x in text]
+                return (text[:min(hits)], True) if hits else (text, False)
+
+            if not req.get("stream"):
+                try:
+                    r = tr.translate([prompt], sampling, limit, cancel)[0]
+                except ValueError as e:
+                    self._translate_error(path, 400, str(e))
+                    return
+                except (RuntimeError, EngineDied) as e:
+                    self._translate_error(path, 503, str(e))
+                    return
+                text, stopped = cut(r["text"])
+                finish = "stop" if stopped else r["finish_reason"]
+                usage = {"prompt_tokens": r["prompt_tokens"], "completion_tokens": r["completion_tokens"],
+                         "total_tokens": r["prompt_tokens"] + r["completion_tokens"]}
+                if chat:
+                    choice = {"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": finish}
+                else:
+                    choice = {"index": 0, "text": text, "finish_reason": finish, "logprobs": None}
+                self._json(200, {"id": rid, "object": "chat.completion" if chat else "text_completion",
+                                 "created": created, "model": model_id, "choices": [choice], "usage": usage})
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self._cors()
+            self.end_headers()
+            obj = "chat.completion.chunk" if chat else "text_completion"
+            sent = {"text": ""}
+
+            def send(choice: dict) -> None:
+                try:
+                    self.wfile.write(("data: " + json.dumps({"id": rid, "object": obj, "created": created,
+                                                             "model": model_id, "choices": [choice]},
+                                                            ensure_ascii=False) + "\n\n").encode())
+                    self.wfile.flush()
+                except OSError:
+                    cancel.set()
+
+            def delta(_i: int, d: str) -> None:
+                whole, stopped = cut(sent["text"] + d)
+                new = whole[len(sent["text"]):]
+                sent["text"] = whole
+                if new:
+                    send({"index": 0, "delta": {"content": new}, "finish_reason": None} if chat else
+                         {"index": 0, "text": new, "finish_reason": None})
+                if stopped:
+                    cancel.set()
+
+            if chat:
+                send({"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None})
+            try:
+                r = tr.translate([prompt], sampling, limit, cancel, on_text=delta)[0]
+                finish = "stop" if cut(r["text"])[1] else r["finish_reason"]
+            except (ValueError, RuntimeError, EngineDied) as e:
+                send({"index": 0, "delta": {}, "finish_reason": "error"} if chat else
+                     {"index": 0, "text": "", "finish_reason": "error"})
+                print(f"[xestrata] translation: {e}", flush=True)
+                finish = None
+            if finish is not None:
+                send({"index": 0, "delta": {}, "finish_reason": finish} if chat else
+                     {"index": 0, "text": "", "finish_reason": finish})
+            with contextlib.suppress(OSError):
+                self.wfile.write(b"data: [DONE]\n\n")
+                self.wfile.flush()
 
         def do_POST(self):
             try:
@@ -7812,9 +8334,12 @@ def make_handler(svc: Service):
                 self._json(e.status, {"error": {"type": "invalid_request_error", "message": str(e)}})
 
         def _post(self):
+            path = own_path(self.path.split("?")[0].rstrip("/"))   # issue #55: Claude Code posts /v1/messages?beta=true
+            if path in self.TRANSLATE_POST:                # their own keys (DeepL's header, LibreTranslate's body)
+                self._translate_post(path)
+                return
             if not self._authorized():
                 return
-            path = own_path(self.path.split("?")[0].rstrip("/"))   # issue #55: Claude Code posts /v1/messages?beta=true
             if path == "/v1/images/loras" or path.startswith("/v1/images/loras/"):   # the Images view's adapters:
                 self._loras_post(path)                   # its own page checks (an upload is not JSON)
                 return
@@ -7929,6 +8454,14 @@ def make_handler(svc: Service):
                 req = json.loads(self._body() or b"{}")
                 if not isinstance(req, dict):
                     raise ValueError("send a JSON object")
+                if path in ("/v1/chat/completions", "/v1/completions") and svc.translation is not None \
+                        and translate_mod.model_for(req.get("model")) is svc.translation.model:
+                    self._translate_openai(path, req)      # the translation model's
+                    return
+                if path == "/v1/completions":              # (the text model takes its chat and Anthropic's messages)
+                    self._json(404, {"error": {"message": "POST /v1/completions is the translation model's: name it "
+                                                          "in \"model\"", "type": "invalid_request_error"}})
+                    return
                 if path.startswith("/v1/responses/"):        # retrieve/delete/cancel/compact: nothing is stored
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
@@ -9151,12 +9684,31 @@ def make_handler(svc: Service):
                 if more:
                     extra += [] if image_force else more
                     hubs.append(image_tools)
-            # load_skill (serve/skills.py): the image tools' rules and skills' list with them, and the skills the web
-            # page's user added (xestrata_skills); one tool reads them all
+            # opt-in (xestrata_translate: true, the web page's while a translation model is set up): translate, the
+            # translation model's (translate_api.TranslateTools), so that the chat hands translations to it
+            other_tools: tuple = ()
+            if own_field(req, "translate") is True and svc.translation is not None and not image_force:
+                tr = svc.translation
+
+                def run_jobs(jobs, tr=tr):
+                    try:
+                        return [r["text"] for r in tr.translate([j.prompt(tr.model) for j in jobs])]
+                    except EngineDied as e:
+                        raise RuntimeError(str(e)) from None
+
+                translate_tools = translate_api.TranslateTools(run_jobs, tr.model)
+                more = translate_tools.template_tools(exclude=own | {t["name"] for t in extra})
+                if more:
+                    extra += more
+                    hubs.append(translate_tools)
+                    other_tools = (translate_api.TOOL,)
+            # load_skill (serve/skills.py): the image tools' rules and skills' list with them, the other tools' skills,
+            # and the skills the web page's user added (xestrata_skills); one tool reads them all
             image_hub = next((h for h in hubs if isinstance(h, images_api.ImageTools)), None)
             want_skills = own_field(req, "skills") is True
-            if (image_hub is not None and not image_force) or want_skills:
-                skill_tools = skills_api.SkillTools(svc.skills, None if image_force else image_hub, user=want_skills)
+            if (image_hub is not None and not image_force) or want_skills or other_tools:
+                skill_tools = skills_api.SkillTools(svc.skills, None if image_force else image_hub, user=want_skills,
+                                                    tools=other_tools)
                 more = skill_tools.template_tools(exclude=own | {t["name"] for t in extra})
                 if more:
                     extra += more
@@ -10931,6 +11483,19 @@ def main() -> int:
             print(f"[xestrata] image generation: {svc.images.note()}", flush=True)
         import atexit
         atexit.register(svc.images.close)               # the image engine ends with the server
+    if isinstance(cfg.get("translate"), dict) and cfg["translate"].get("model"):   # the translation model, first used
+        tcfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
+                    if k in ("exe", "path") and isinstance(v, str) and not os.path.isabs(v) else v)
+                for k, v in cfg["translate"].items()}
+        try:
+            engine_exe = os.path.abspath(os.path.join(cfg.get("cwd") or ".", str(cfg.get("exe") or "")))
+            tenv, helper, said = translation_env(cfg, str(tcfg.get("gpu") or "auto"))
+            if said:
+                print(f"[xestrata] {said}", flush=True)
+            svc.translation = Translation(tcfg, engine_exe, cfg.get("log"), tenv, svc, helper)
+        except ValueError as e:
+            raise SystemExit(f"[xestrata] config: {e}")
+        print(f"[xestrata] translation: {svc.translation.model.name} starts with the first translation", flush=True)
     if cfg.get("reasoning_effort") is not None:         # #1641: the thinking level of requests that name none
         try:
             svc.config_effort = clean_shared_defaults({"reasoning_effort": cfg["reasoning_effort"]}).get(

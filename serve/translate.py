@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later
-"""serve/translate.py - translation with PLaMo 3 Translate: its prompt (PFML3) and the translation APIs' requests.
+"""serve/translate.py - the translation models: what each is (its files, its languages, its prompt) and PLaMo 3
+Translate's prompt (PFML3).  The APIs' requests and answers are translate_api.py's, the engine server.py's.
 
 PFML3 is built here and nowhere else.  `pfml3` renders a chat the way the model's GGUF chat template does (the
 template llama.cpp and vLLM render; tools/test_translate_pfml.py holds the two to the same text): leading system
@@ -11,6 +12,8 @@ Without a target language the model's own switch is rendered: Japanese and Engli
 message that is already PFML3 is passed through after the BOS.
 """
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 BOS = "<|plamo:bos|>"
 RAW_PREFIX = "<|plamo:tag|>dataset<|plamo:msg|>translation"
@@ -58,7 +61,7 @@ def pfml3(messages: list, target_lang=_UNSET, source_lang=_UNSET, form=_UNSET, c
     raw = last.get("content") if isinstance(last, dict) and last.get("role") == "user" else None
     raw = raw if isinstance(raw, str) else ""
     if raw.startswith(RAW_PREFIX):
-        if tools or documents or _calls(last):
+        if tools or documents or (isinstance(last, dict) and _calls(last)):
             raise PfmlError("Tool calls and documents are not supported.")
         return bos + raw
     sys_count = 0
@@ -75,7 +78,7 @@ def pfml3(messages: list, target_lang=_UNSET, source_lang=_UNSET, form=_UNSET, c
             raise PfmlError("Tool calls are not supported.")
         content = message.get("content")
         _check_text(content, "system message content", allow_empty=True)
-        lines = content.split("\n")
+        lines = str(content).split("\n")
         first = lines[0].strip(" \t\r")
         settings, inline = False, []
         if first.lower().startswith("[plamo-translate"):
@@ -221,3 +224,92 @@ def pfml3(messages: list, target_lang=_UNSET, source_lang=_UNSET, form=_UNSET, c
         out.append("<|plamo:key|>form<|plamo:val|>" + form)
     out.append("<|plamo:msg|>")
     return "".join(out)
+
+
+# ---------------------------------------------------------------------------------------------------- the models
+# PLaMo 3 Translate's 53 languages (its model card's table, the codes its prompt takes), in the card's order
+PLAMO3_LANGUAGES = (
+    ("ja", "Japanese"), ("en", "English"), ("zh-hans", "Chinese (Simplified)"), ("zh-hant", "Chinese (Traditional)"),
+    ("ko", "Korean"), ("ar", "Arabic"), ("az", "Azerbaijani"), ("be", "Belarusian"), ("bg", "Bulgarian"),
+    ("bn", "Bengali"), ("ca", "Catalan"), ("ceb", "Cebuano"), ("de", "German"), ("es", "Spanish"), ("et", "Estonian"),
+    ("eu", "Basque"), ("fa", "Persian"), ("fr", "French"), ("gu", "Gujarati"), ("he", "Hebrew"), ("hi", "Hindi"),
+    ("hr", "Croatian"), ("hu", "Hungarian"), ("hy", "Armenian"), ("id", "Indonesian"), ("it", "Italian"),
+    ("jv", "Javanese"), ("ka", "Georgian"), ("kk", "Kazakh"), ("km", "Khmer"), ("lt", "Lithuanian"), ("lv", "Latvian"),
+    ("ml", "Malayalam"), ("mr", "Marathi"), ("ms", "Malay"), ("my", "Burmese"), ("ne", "Nepali"), ("nl", "Dutch"),
+    ("pa", "Punjabi"), ("pl", "Polish"), ("ru", "Russian"), ("si", "Sinhala"), ("sk", "Slovak"), ("sl", "Slovenian"),
+    ("sr", "Serbian"), ("sw", "Swahili"), ("ta", "Tamil"), ("te", "Telugu"), ("th", "Thai"), ("tl", "Tagalog"),
+    ("ur", "Urdu"), ("uz", "Uzbek"), ("vi", "Vietnamese"))
+
+
+@dataclass(frozen=True)
+class TranslationModel:
+    """A translation model: what serve, setup and the web page read of it.  A model added later is another entry of
+    MODELS with its own `prompt` (and `pfml3` stays PLaMo 3 Translate's).
+
+    id: the served name (/v1/models, the requests' `model`); size: the setup choice it answers (2b, 0.8b, 8b);
+    repo, file, file_mib: its GGUF on Hugging Face (setup pins the revision); languages: (code, English name), the codes
+    its prompt takes; forms: the target languages that take a register (`form`) and its values; auto_pair: the two
+    languages it switches between when no target is given (None: a target is required); license: its license's name
+    and page (setup shows them before the download)."""
+    id: str
+    name: str
+    size: str
+    repo: str
+    file: str
+    file_mib: int
+    languages: tuple = PLAMO3_LANGUAGES
+    forms: tuple = (("ja", ("plain", "polite")),)
+    auto_pair: tuple | None = ("ja", "en")
+    license: tuple = ("PLaMo Community License", "https://plamo.preferredai.jp/info/plamo-community-license-en")
+
+    def codes(self) -> tuple:
+        return tuple(c for c, _ in self.languages)
+
+    def language_name(self, code: str) -> str | None:
+        return next((n for c, n in self.languages if c == code), None)
+
+    def form_values(self, target: str) -> tuple:
+        return next((v for t, v in self.forms if t == target), ())
+
+    def prompt(self, text: str, target: str | None, source: str | None = None, form: str | None = None,
+               context: str | None = None, glossary: list | None = None) -> str:
+        """The prompt that translates `text` (one source text, no history) into `target` (None: the model's own
+        switch); glossary: [{"source", "target"}]."""
+        kw: dict = {"target_lang": target or "auto"}
+        if source:
+            kw["source_lang"] = source
+        if form:
+            kw["form"] = form
+        if context:
+            kw["context"] = context
+        if glossary:
+            kw["glossary"] = glossary
+        return pfml3([{"role": "user", "content": text}], **kw)
+
+
+# The models setup and serve know; the first of a family is setup's default (2026-11-09: the 2B, else the 0.8B where
+# the RAM is short; the 8B by choice).  Q4_K_M: 1.81 GB, 573 MB and 5.28 GB.
+MODELS = {m.id: m for m in (
+    TranslationModel("plamo-3-translate-2b", "PLaMo 3 Translate 2B", "2b", "pfnet/plamo-3-translate-2b-GGUF",
+                     "plamo-3-translate-2b-Q4_K_M.gguf", 1724),
+    TranslationModel("plamo-3-translate-0.8b", "PLaMo 3 Translate 0.8B", "0.8b", "pfnet/plamo-3-translate-0.8b-GGUF",
+                     "plamo-3-translate-0.8b-Q4_K_M.gguf", 547),
+    TranslationModel("plamo-3-translate-8b", "PLaMo 3 Translate 8B", "8b", "pfnet/plamo-3-translate-8b-GGUF",
+                     "plamo-3-translate-8b-Q4_K_M.gguf", 5036),
+)}
+
+
+def model_by_size(size: str) -> TranslationModel | None:
+    return next((m for m in MODELS.values() if m.size == size), None)
+
+
+def model_for(name) -> TranslationModel | None:
+    """The model a request's `model` names: its served name, case aside, or its GGUF's file name (with or without
+    the .gguf, as llama-server and vLLM serve it)."""
+    if not isinstance(name, str):
+        return None
+    key = name.strip().lower()
+    for m in MODELS.values():
+        if key in (m.id, m.file.lower(), m.file.lower().removesuffix(".gguf"), m.repo.lower()):
+            return m
+    return None

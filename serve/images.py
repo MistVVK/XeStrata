@@ -150,6 +150,7 @@ from typing import Any, Callable, cast
 from serve import image_aux
 from serve import loras as lora_api
 from serve import envvars
+from serve import vram_ledger
 
 TURBO_STEPS = 8
 MAX_STEPS = 100                    # the base model's
@@ -3330,11 +3331,13 @@ class ImageGen:
             self._ready()
             return int(self.engine.ask("FREE", "FREE", 60).get("total_mib") or 0)
 
-    def fit(self) -> int:
-        """The engine's budget set to what it holds and what is free now, less the reserve -> the budget (MiB)."""
+    def fit(self, extra_mib: int = 0) -> int:
+        """The engine's budget set to what it holds and what is free now, less the reserve (and `extra_mib`: what the
+        GPU's VRAM ledger keeps for others) -> the budget (MiB)."""
         with self.lock:
             self._ready()
-            return int(self.engine.ask(f"FIT {self.reserve}", "BUDGET", 600).get("budget_mib", 0))
+            return int(self.engine.ask(f"FIT {self.reserve + max(0, int(extra_mib))}", "BUDGET", 600)
+                       .get("budget_mib", 0))
 
     def release(self, everything: bool) -> None:
         """The engine lets go of its cache (layers, activations, buffers); `everything`: its fixed weights too."""
@@ -3702,6 +3705,26 @@ class ImageModels:
             if g.engine.alive():
                 g._say(f"image model: {g.model}'s engine gives the GPU back for the model")
                 g.release(True)
+
+    def make_room(self, cancel: threading.Event | None = None) -> int:
+        """For another engine of this GPU short of room (the translation engine): every model's engine lets go of all
+        it holds, in the GPU's turn (so no job runs meanwhile; a job running waits it out) -> how many let go.  An
+        engine kept warm after its job (keep, separate with room to spare) holds the card's VRAM until the next job."""
+        n = 0
+        self.gpu.acquire(cancel)
+        try:
+            for g in self.gens.values():
+                if g.engine.alive():
+                    g._say(f"image model: {g.model}'s engine gives the GPU back for the translation model")
+                    g.release(True)
+                    n += 1
+        finally:
+            self.gpu.release()
+        return n
+
+    def busy(self) -> bool:
+        """Whether a job of one of the models runs now."""
+        return any(g.job is not None for g in self.gens.values())
 
     def missing(self) -> list[str]:
         return [f for g in self.gens.values() for f in g.missing()]
@@ -4932,6 +4955,38 @@ class ImageTools:
 
 
 # ------------------------------------------------------------------------------------------- the GPU turn
+def ledger_fit(gen: ImageGen, need: dict, job: dict | None = None) -> tuple:
+    """The image engine's budget within the GPU's VRAM ledger (serve/vram_ledger.py, shared with the translation
+    engine): what it may take besides what it holds is the ledger's room (an engine of the ledger's may hold VRAM the
+    device's report does not show yet), and that much is entered for the job, with when it should end (the speed
+    measured: ImageGen.estimate_s) -> (budget, ledger, entry id or None)."""
+    try:
+        total = gen.total_mib()
+    except ImageJobFailed:
+        total = 0
+    led = vram_ledger.Ledger(gpu_key(gen.engine.env), margin_mib=vram_ledger.device_margin_mib(total))
+    free = int(need.get("free_mib") or 0)
+    room = led.room(free)
+    extra = max(0, free - gen.reserve - room) if room is not None else 0
+    budget = gen.fit(extra)
+    take = max(0, budget - int(need.get("held_mib") or 0))
+    est = None
+    if job is not None and not job.get("aux") and not job.get("video"):
+        with contextlib.suppress(KeyError, TypeError, ValueError, ZeroDivisionError):
+            est = gen.estimate_s(job)
+    eid = led.reserve(take, "image", free, until=time.time() + est if est else None) if take else None
+    if eid is not None:
+        led.allocated(eid)
+    return budget, led, eid
+
+
+def ledger_done(led, eid) -> None:
+    """The job's ledger entry given back, after the engine let go of what it does not keep."""
+    if led is not None and eid is not None:
+        led.releasing(eid)
+        led.remove(eid)
+
+
 def resolve_policy(svc, gen: ImageGen, need: dict) -> str:
     """auto -> keep / shrink / unload for this job (see the module's docstring); a fixed policy is kept, except that
     an engine that is not running has nothing to give back (keep).  `need`: ImageGen.need's answer."""
@@ -5483,8 +5538,9 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
                                 time.sleep(0.25)
                         with svc.status_lock:
                             svc.status.update(busy=True, phase="generating an image", started=time.time())
+                led = eid = None
                 try:
-                    budget = gen.fit()
+                    budget, led, eid = ledger_fit(gen, need, job)
                     gen._say(f"image job: {policy}, the image engine's budget {budget} MiB (the DiT resident from "
                              f"{need['full_mib']} MiB, at least {need['least_mib']} MiB)")
                     gen.yield_turn = yield_turn
@@ -5492,6 +5548,7 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
                 finally:
                     gen.yield_turn = None
                     _give_back(svc, gen, policy, restore)
+                    ledger_done(led, eid)
                     with svc.status_lock:
                         svc.status["busy"] = False
                     svc.last_request_at = time.time()
@@ -5511,46 +5568,47 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
                 svc.status["queued"] -= 1
 
 
-def _helper_off(svc, gen: ImageGen, models, cancel: threading.Event | None) -> bool:
-    """Before a job on the text engine's helper card (ImageModels.helper_card): the helper closed (`HELPER off`, the
-    service's turn for that command alone), so the image engine has the card; the text engine decodes on its first
-    card meanwhile.  False where the engine runs no helper there (it chose its first card alone: the card is free)."""
-    card = getattr(models, "helper_card", "")
+def helper_borrow(svc, card: str, holder, say, cancel: threading.Event | None = None) -> bool:
+    """Before work on the text engine's helper card (`card`; an image job's, the translation engine's): the helper
+    closed (`HELPER off`, the service's turn for that command alone), so the card is the work's; the text engine
+    decodes on its first card meanwhile.  `holder` counts the borrowers (helper_lock, helper_jobs: the image models',
+    which the translation engine shares, so the helper stays closed until both are done); `say` writes a log line.
+    False where the engine runs no helper there (it chose its first card alone: the card is free)."""
     eng = svc.engine
     info = getattr(eng, "info", None) or {}
     if not card or str(info.get("helper_pci", "")).lower() != card or not hasattr(eng, "helper"):
         return False
-    with models.helper_lock:
-        models.helper_jobs += 1
+    with holder.helper_lock:
+        holder.helper_jobs += 1
     try:
         with svc._turn(cancel):
             r = eng.helper(False)
-        gen._say(f"image job: the text model's helper GPU handed over ({r.get('vram_free_mib', '?')} MiB free there, "
-                 f"{r.get('ms', '?')} ms)")
-    except Exception as e:                       # noqa: BLE001 - the job still runs, on what the card has free
-        gen._say(f"image job: the text model's helper GPU was not handed over ({e})")
+        say(f"the text model's helper GPU handed over ({r.get('vram_free_mib', '?')} MiB free there, "
+            f"{r.get('ms', '?')} ms)")
+    except Exception as e:                       # noqa: BLE001 - the work still runs, on what the card has free
+        say(f"the text model's helper GPU was not handed over ({e})")
     return True
 
 
-def _helper_on_later(svc, gen: ImageGen, models) -> None:
-    """After a job that closed the helper: open it again (`HELPER on`, the service's turn for that command, a second
-    or two to fill from RAM) once no other image job of this server has started within HELPER_REOPEN_S, so a run of
+def helper_return_later(svc, holder, say) -> None:
+    """After work that closed the helper (helper_borrow): open it again (`HELPER on`, the service's turn for that
+    command, a second or two to fill from RAM) once no other borrower has started within HELPER_REOPEN_S, so a run of
     image requests does not close and fill it each time."""
-    with models.helper_lock:
-        models.helper_jobs -= 1
+    with holder.helper_lock:
+        holder.helper_jobs -= 1
 
     def reopen():
         time.sleep(HELPER_REOPEN_S)
-        with models.helper_lock:
-            if models.helper_jobs > 0:
+        with holder.helper_lock:
+            if holder.helper_jobs > 0:
                 return
             try:
                 with svc._turn():
                     r = svc.engine.helper(True)
-                gen._say(f"image jobs done: the text model's helper GPU filled again ({r.get('experts', '?')} experts, "
-                         f"{r.get('ms', '?')} ms)")
+                say(f"the text model's helper GPU filled again ({r.get('experts', '?')} experts, "
+                    f"{r.get('ms', '?')} ms)")
             except Exception as e:               # noqa: BLE001 - the text engine decodes on its first card meanwhile
-                gen._say(f"image jobs done: the text model's helper GPU was not filled again ({e})")
+                say(f"the text model's helper GPU was not filled again ({e})")
     threading.Thread(target=reopen, daemon=True, name="helper-reopen").start()
 
 
@@ -5578,17 +5636,20 @@ def separate_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None 
             gen.totals["failed"] += 1
             raise
         check_room(need, ram_available_mib())
-        handed = _helper_off(svc, gen, models, cancel)
+        handed = helper_borrow(svc, getattr(models, "helper_card", ""), models, lambda m: gen._say("image job: " + m),
+                               cancel)
+        led = eid = None
         try:
-            budget = gen.fit()
+            budget, led, eid = ledger_fit(gen, need, job)
             gen._say(f"image job: separate, the image engine's budget {budget} MiB on its own GPU (the DiT resident "
                      f"from {need['full_mib']} MiB, at least {need['least_mib']} MiB)")
             yield "separate"
         finally:
             _give_back(svc, gen, "separate", None)
+            ledger_done(led, eid)
             svc.last_request_at = time.time()
             if handed:
-                _helper_on_later(svc, gen, models)
+                helper_return_later(svc, models, lambda m: gen._say("image jobs done: " + m))
     except BaseException as e:
         error = str(e) or type(e).__name__
         raise

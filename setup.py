@@ -77,6 +77,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
 
 from serve import envvars, kernel_check, places, release_check
+from serve import translate as translate_mod
 
 ROOT = Path(__file__).resolve().parent
 WIN = places.WIN
@@ -122,6 +123,10 @@ HF_REVISIONS = {
     "unsloth/Qwen3.5-0.8B-GGUF": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",                        # 2026-11-08
     "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": "0a41c68809d375475f954be12ba7c40efa56c2a9",  # 2026-10-26
     "AtomicChat/Qwen3.8-Flash-Next-GGUF": "f5b0b790eebb89033c48091c26abf74c1b385940",               # 2026-11-03
+    # the translation models (serve/translate.py's MODELS)
+    "pfnet/plamo-3-translate-2b-GGUF": "4f672106b847200bfdc0f6af6c321cd94eba1aed",                  # 2026-11-09
+    "pfnet/plamo-3-translate-0.8b-GGUF": "1cf96ae02133958a20074bfdfab76517bb737d00",                # 2026-11-09
+    "pfnet/plamo-3-translate-8b-GGUF": "c67efa4eefdc14d3c97bf8f4f35ee58e2ecd2f42",                  # 2026-11-09
 }
 
 
@@ -1125,6 +1130,18 @@ for _fam in PLAIN_FAMILIES.values():                 # the other models' files, 
     if _fam.get("mmproj"):
         _m = _fam["mmproj"]
         REPO_PINS.setdefault(_m["repo"], {})[_m["path"].rsplit("/", 1)[-1]] = (_m["size"], _m["sha256"])
+
+# the translation models' GGUFs (serve/translate.py's MODELS), at HF_REVISIONS' commits: file -> (bytes, sha256)
+TRANSLATE_FILES = {
+    "plamo-3-translate-2b-Q4_K_M.gguf":
+        (1807203040, "1ffd9073afcc70e35ccc942428aa2b73d7aa2b9ea779bf504b775369e0276c13"),
+    "plamo-3-translate-0.8b-Q4_K_M.gguf":
+        (573126848, "70891ec70dc7ab4205745a38307867c2881b99239f20327927633abfe4bc9ec6"),
+    "plamo-3-translate-8b-Q4_K_M.gguf":
+        (5280445728, "94e5d3f91b421f7c8900ddaac27b11a19f7441426c954bbb25a2fd60a1640187"),
+}
+for _t in translate_mod.MODELS.values():
+    REPO_PINS.setdefault(_t.repo, {})[_t.file] = TRANSLATE_FILES[_t.file]
 
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
@@ -5129,6 +5146,148 @@ def place_images(a, cfg: dict) -> None:
         ok(f"image GPU: {gpu_name(g)}, apart from the text model's: the images are made beside the chat")
 
 
+# ------------------------------------------------------------------------------------------------ translation
+# The translation model (serve/translate.py's MODELS; the run config's "translate" section, serve/server.py's
+# Translation): its own engine on its GGUF, started with the first translation, beside the text model.
+TRANSLATE_DIR = "translate"                          # its folder in the models folder
+# The RAM (GB) its engine keeps beside its file: its K/V at the 8K tokens it is started with (the 2B's and the 0.8B's
+# sliding-window layers keep a ring), the engine's buffers and the runtime's, with room to spare (an allowance, not
+# measured)
+TRANSLATE_RAM_EXTRA_GB = 2.5
+
+
+def translate_ram_gb(m) -> float:
+    return TRANSLATE_FILES[m.file][0] / 1e9 + TRANSLATE_RAM_EXTRA_GB
+
+
+def images_ram_gb(cfg: dict) -> float:
+    """The RAM (GB) the config's image models keep while one of them runs (one at a time: the largest), as image_plan
+    fitted them (qimage.ram_need_gb)."""
+    QI = _qimage()
+    by_name = {v[0]: v for v in QI.IMAGE_MODELS.values()}
+    need = 0.0
+    for s in [cfg.get("images"), *(cfg.get("image_models") or [])]:
+        if not isinstance(s, dict):
+            continue
+        model = by_name.get(s.get("model_name")) or (("", "anima-base", "anima-stock")
+                                                     if s.get("family") == "anima" else None)
+        if model is None or not s.get("quant"):
+            continue
+        _, dit, enc = model
+        try:
+            need = max(need, QI.ram_need_gb(s["quant"], enc, s.get("text_quant") or QI.default_text_quant(dit), dit,
+                                            q8=s.get("dit_q8")))
+        except KeyError:                              # a size this XeStrata does not know: the files' own
+            continue
+    return need
+
+
+def saved_config(cfg_path: Path) -> dict:
+    """The model's earlier run config, {} when there is none."""
+    try:
+        old = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return {}
+    return old if isinstance(old, dict) else {}
+
+
+def saved_translate(cfg_path: Path):
+    """The model's config's "translate" section: its dict, None for no translation (--translate no), or ... when the
+    config has none (set up before translation was, or never)."""
+    return saved_config(cfg_path).get("translate", ...)
+
+
+def translate_gpu(a, on_cpu: bool) -> str:
+    """--translate-gpu -> the "translate" section's "gpu": auto (the image jobs' card where the config has images, else
+    the text model's), same, cpu, or a usable GPU's PCI address; cpu without a GPU."""
+    want = getattr(a, "translate_gpu", None) or "auto"
+    if on_cpu:
+        if want not in ("auto", "same", "cpu"):
+            warn(f"--translate-gpu {want}: the model runs on the CPU, so translations do too")
+        return "cpu"
+    if want in ("auto", "same", "cpu"):
+        return want
+    g = next((x for x in gpus() if gpu_problem(x) is None and x["pci"].lower() == want.lower()), None)
+    if g is None:
+        fail(f"--translate-gpu {want}: no usable GPU at that PCI address",
+             "--check lists the GPUs and their PCI addresses")
+    return g["pci"]
+
+
+def translate_model(a, text_gb: float, image_gb: float):
+    """--translate's model -> (it, the size it was lowered from or None), or (None, None): no, or none fits.  auto: the
+    2B where the RAM the text and image models leave holds it, else the 0.8B, else none (the 8B only when asked)."""
+    want = a.translate
+    if want == "no":
+        return None, None
+    if want != "auto":
+        return translate_mod.model_by_size(want), None
+    left = usable_ram_gb(a) - text_gb - image_gb
+    first, small = (translate_mod.MODELS[f"plamo-3-translate-{x}"] for x in ("2b", "0.8b"))
+    for m in (first, small):
+        if translate_ram_gb(m) <= left:
+            if m is not first:
+                warn(f"translation: {m.name}, not {first.name}: the RAM the text and image models leave "
+                     f"({max(left, 0):.1f} GB) does not hold the 2B ({translate_ram_gb(first):.1f} GB); "
+                     "--translate 2b takes it all the same")
+            return m, (None if m is first else first.size)
+    warn(f"translation: not set up: the RAM the text and image models leave ({max(left, 0):.1f} GB) holds no "
+         "translation model; --translate 0.8b or 2b sets one up all the same")
+    return None, None
+
+
+def ask_translate(cfg_path: Path) -> str:
+    """--translate asked on the console, after the image models; the answer the model's config `cfg_path` was written
+    with offered."""
+    saved = saved_translate(cfg_path)
+    return ask_option("translate", False, default=(
+        "no" if saved is None else saved.get("choice", "auto") if isinstance(saved, dict) else None))
+
+
+def setup_translate(a, cfg: dict, cfg_path: Path, text_gb: float, on_cpu: bool = False) -> None:
+    """The run config's "translate" section for --translate (no, auto, 2b, 0.8b, 8b) and --translate-gpu: the model
+    downloaded and checked, its card.  Not given: asked in a terminal (the earlier answer offered), else the earlier
+    config's section kept (carry_over; its card changed by --translate-gpu), else auto (ask_translate asks in a
+    terminal beforehand).  `text_gb`: the RAM the text
+    model keeps (as image_plan's); the image models' are read of `cfg`."""
+    saved = saved_translate(cfg_path)
+    if a.translate is None:
+        if saved is ...:
+            a.translate = "auto"
+        elif isinstance(saved, dict) and getattr(a, "translate_gpu", None):
+            cfg["translate"] = {**saved, "gpu": translate_gpu(a, on_cpu)}
+            return
+        else:                                        # carried over as it is (carry_over)
+            return
+    # the image models this run set up, else the earlier ones it carries over
+    m, lowered = translate_model(a, text_gb, images_ram_gb(cfg if "images" in cfg else saved_config(cfg_path)))
+    if m is None:
+        cfg["translate"] = None
+        if a.translate == "no":
+            ok("translation: off")
+        return
+    gpu = translate_gpu(a, on_cpu)
+    size, sha = TRANSLATE_FILES[m.file]
+    lic, url = m.license
+    say()
+    say(f"  {m.name}: the translation APIs (DeepL's, LibreTranslate's, OpenAI's) and the web page's Translate tab.")
+    say(f"  Its license is the {lic}, not free software: free for personal and non-commercial use; commercial")
+    say("  use by a business with up to 1 billion yen of yearly revenue needs registering with Preferred Networks,")
+    say(f"  above that a contract of its own ({url}).")
+    say("  XeStrata does not include the model: it is downloaded now.")
+    dst = Path(a.models_dir) / TRANSLATE_DIR / m.file
+    if not (dst.exists() and done(dst)) and free_gb(Path(a.models_dir)) < size / 1e9 + 2:
+        warn(f"less than {size / 1e9 + 2:.0f} GB free for {m.name}: the download may run out of disk space")
+    download(hf(m.repo) + m.file, dst, f"translation model: {m.file}")
+    verify_sha256(dst, size, sha)
+    cfg["translate"] = {"model": m.id, "path": str(dst), "gpu": gpu, "choice": a.translate}
+    if lowered:
+        cfg["translate"]["lowered"] = lowered
+    ok(f"translation: {m.name} on " + {"auto": "the image jobs' GPU where there is one, else the text model's",
+                                       "same": "the text model's GPU", "cpu": "the CPU"}.get(gpu, f"the GPU {gpu}")
+       + " (started with the first translation)")
+
+
 # ------------------------------------------------------------------------------------------------ the data folder
 # The model files - the GGUFs, the prepared packs and the MTP layer, 70-120 GB - live in a data folder NEXT TO the
 # Strata folder (`XeStrata-data`), not inside it: updating Strata by unzipping a new copy used to give a new, empty
@@ -7780,6 +7939,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         a.images = None
     elif a.images is None and not a.yes and not JSON_OUT and not on_cpu:   # as for Qwen3.8-Flash-Next: asked only
         a.images = ask_images(CONF / f"xestrata-{tag.lower()}.json")    # interactively
+    if a.translate is None and not a.yes and not JSON_OUT:
+        a.translate = ask_translate(CONF / f"xestrata-{tag.lower()}.json")
     if a.images:   # only when given: else an earlier "images" is carried over
         # the RAM the chat model keeps, as --describe estimates it (a dense model's DENSE_RAM_GB, the others' file and
         # 8 GB); an image model's text encoder of the same file shares it (shared_text_quant)
@@ -7789,6 +7950,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         place_images(a, cfg)
         if not cfg["image_models"]:
             cfg["image_models"] = None
+    setup_translate(a, cfg, CONF / f"xestrata-{tag.lower()}.json", DENSE_RAM_GB if dense else d["size"] / 1e9 + 8,
+                    on_cpu)
     return finish_setup(a, cfg, tag, port, adopted, vision != "none")
 
 
@@ -8067,6 +8230,22 @@ OPTIONS = [
                      ["keep", "Keep it loaded"], ["shrink", "Give VRAM back for the image"],
                      ["unload", "Unload it, its conversation restored afterwards"]],
             default="auto", when=["images"]),
+    # ---- the translation model (serve/translate.py's MODELS)
+    _option("translate", "Translation: a model of its own for the translation APIs and the web page's Translate tab "
+            "(PLaMo 3 Translate, under the PLaMo Community License)",
+            "the translation model (PLaMo 3 Translate, under the PLaMo Community License: not free software, free "
+            "for personal and non-commercial use): auto (default: the 2B where the RAM the text and image models "
+            "leave holds it, else the 0.8B, else none), 2b, 0.8b, 8b, or no; not given, the earlier choice is kept",
+            choices=[["auto", "Auto: the 2B, the 0.8B where the RAM is short"],
+                     ["2b", "PLaMo 3 Translate 2B (1.8 GB)"], ["0.8b", "PLaMo 3 Translate 0.8B (0.6 GB)"],
+                     ["8b", "PLaMo 3 Translate 8B (5.3 GB)"], ["no", "No translation model"]],
+            default="auto", question="Which translation model?"),
+    _option("translate-gpu", "The GPU that translates",
+            "the translation model's GPU (default auto: the image jobs' GPU where there are image models, else the "
+            "text model's); same: the text model's GPU; cpu: the CPU; a PCI address as --check lists it: that GPU",
+            choices=[["auto", "Auto: the image models' GPU, else the text model's"],
+                     ["same", "The text model's GPU"], ["cpu", "The CPU"]],
+            default="auto", gpu_choices="pci", when=["translate!=no"], cli={"metavar": "auto|same|cpu|PCI"}),
     # ---- how a model runs: at an install, and at a start
     _option("gpu", "GPU",
             "the GPU, numbered in PCI order as --check lists them (default: the one with the most VRAM); the engine "
@@ -9062,6 +9241,8 @@ def main() -> int:
                      "cpu": "on (encoder on the CPU)"}[vision])
     if a.images is None and not a.yes and not JSON_OUT:   # asked here only interactively: --images says it, and the
         a.images = ask_images(CONF / f"xestrata-{tag.lower()}.json")   # launcher (--json) passes it
+    if a.translate is None and not a.yes and not JSON_OUT:
+        a.translate = ask_translate(CONF / f"xestrata-{tag.lower()}.json")
     # The low-RAM mode's two variants.  resident: the experts the GPU's cache does not hold are copied from the model
     # files into RAM once (--resident-experts; the engine keeps what fits the RAM it finds free and reads the rest
     # from the files).  mmap: they are read through the OS file cache.  The GPU's share: its VRAM less the dense
@@ -9433,6 +9614,7 @@ def main() -> int:
         place_images(a, cfg)
         if not cfg["image_models"]:
             cfg["image_models"] = None
+    setup_translate(a, cfg, CONF / f"xestrata-{tag.lower()}.json", text_ram_gb(cfg["args"], ram, model))
     return finish_setup(a, cfg, tag, port, adopted, vision != "none")
 
 
