@@ -252,6 +252,7 @@ private:
     void glora_weight(const uint16_t* v, const W& w, int64_t r0, int64_t n, int64_t nt, int64_t t0, float* y,
                       int64_t ldy, int64_t row0);
     std::map<std::string, std::vector<float>> norm_cache_;   // DoRA's row norms, a file's tensor (open clears them)
+    std::vector<std::vector<float>> norms32_;   // an FP16 GGUF's q/k norms widened to FP32, streamed in their place
     bool prefix_cache_ = false;   // the blocks' pk and pv hold the context's prefix (set_context; set_loras drops it)
     // activations, grown on demand
     int64_t cap_T_ = 0, mlp_cap_ = 0, mlp_rows_ = 0;

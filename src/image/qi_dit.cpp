@@ -203,6 +203,7 @@ bool QiDit::open(const std::string& path, void* stream, std::string& err, bool d
         tout_ = upload("txt_in.out_layer.weight");
         tnorm_ = upload_f32("txt_in.text_norm.weight", 1.0f);   // zero-centred: the weight is w + 1
         int64_t scratch = 0;
+        norms32_.clear();
         for (int i = 0;; ++i) {   // the blocks: spans of the mapped file, on the GPU through blocks_stream_
             const std::string p = "transformer_blocks." + std::to_string(i) + ".";
             if (find_checked(*g_, "model.diffusion_model." + p + "attn.to_q.weight") == nullptr) break;
@@ -225,7 +226,18 @@ bool QiDit::open(const std::string& path, void* stream, std::string& err, bool d
                          iv = span("attn.to_v.weight", b.v), io = span("attn.to_out.0.weight", b.o),
                          ig = span("img_mlp.gate_up.weight", b.gu), id = span("img_mlp.out.weight", b.down),
                          inq = span("attn.norm_q.weight", nq), ink = span("attn.norm_k.weight", nk);
-            if (nq.type != 0 || nk.type != 0) throw std::runtime_error("image engine: the DiT's q/k norms are not FP32");
+            // the q/k norms in FP32, as the kernels read them: an FP16 GGUF's (the F16 file the LoRA trainer reads)
+            // widened once into copies of the engine's own, which the layer streams instead of the file's bytes
+            for (const auto& [w, i] : {std::pair<const W*, size_t>{&nq, inq}, {&nk, ink}}) {
+                if (w->type == 0) continue;
+                if (w->type != 1)
+                    throw std::runtime_error("image engine: the DiT's q/k norms are neither FP32 nor FP16");
+                const auto* h = static_cast<const uint16_t*>(spans[i].host);
+                const size_t n = (size_t) (spans[i].bytes / 2);
+                std::vector<float>& v = norms32_.emplace_back(n);
+                for (size_t j = 0; j < n; ++j) v[j] = kernels::f32_from_f16(h[j]);
+                spans[i] = {v.data(), (uint64_t) n * 4, 0};
+            }
             const int layer = blocks_stream_.add(spans);
             auto off = [&](size_t k) { return blocks_stream_.offset(layer, (int) k); };
             b.q.d = reinterpret_cast<const void*>(off(iq));

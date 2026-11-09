@@ -5,7 +5,7 @@
 //
 //   strata-image --dit DIT.gguf --vae VAE.safetensors --text TEXT_ENCODER.gguf [--vision MMPROJ.gguf]
 //                [--budget-mib M] (--ids 1,2,3 [--drop N] [--width W] [--height H] [--seed S] [--sigmas 1,...,0]
-//                [--ref IMAGE]... [--mask IMAGE] [--init IMAGE] [--strength F] [--repeat N] [--lora S:F]... --out IMAGE.rgba | --serve)
+//                [--ref IMAGE]... [--mask IMAGE] [--init IMAGE] [--strength F] [--repeat N] [--lora STRENGTH:FILE]... --out IMAGE.rgba | --serve)
 //   strata-image --dit DIT.safetensors ... [--dit-q8 auto|0|1] [--edit-dit EDIT_DIT.safetensors --vision MMPROJ.gguf]
 //                [--dit-keep 0|1]
 //
@@ -2162,7 +2162,7 @@ int main(int argc, char** argv) {
             (!serving && ((out.empty() && !ratio) || (ids.empty() && r.te_rows == 0)))) {
             std::fprintf(stderr, "usage: %s --dit F --vae F --text F [--vision F] [--budget-mib M] (--ids 1,2,3 "
                          "[--drop N] [--width W] [--height H] [--seed S] [--sigmas 1,...,0] [--ref IMAGE]... "
-                         "[--mask IMAGE] [--init IMAGE] [--strength F] [--repeat N] [--lora S:F]... --out IMAGE.rgba | --serve) "
+                         "[--mask IMAGE] [--init IMAGE] [--strength F] [--repeat N] [--lora STRENGTH:FILE]... --out IMAGE.rgba | --serve) "
                          "[--dit-q8 auto|0|1] [--edit-dit F] "
                          "[--dit-keep 0|1]\n",
                          argv[0]);
