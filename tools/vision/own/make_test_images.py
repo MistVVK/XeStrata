@@ -74,6 +74,9 @@ def main():
     save(photo(1600, 1200), "photo_1600x1200.jpg", quality=90)
     save(scene(4000, 3000, "HUGE 4000x3000"), "huge_4000x3000.png")
     save(scene(8000, 500, "HUGE 8000x500"), "huge_8000x500.png")
+    # pictures for the largest image-token limit the app allows (settings: vision_tokens up to 16,384 -> 65,536 patches); not part of the usual gate list
+    save(scene(4096, 4096, "LIMIT 4096"), "limit_4096x4096.png")       # exactly 16,384 tokens at that limit
+    save(scene(7000, 5000, "LIMIT 7000x5000"), "limit_7000x5000.png")  # more than 16,384 tokens: resized down to the limit
     save(shapes, "shapes.jpg", quality=90)
     save(shapes, "shapes.bmp")
     save(shapes.convert("P", palette=Image.ADAPTIVE, colors=64), "shapes_p.gif")

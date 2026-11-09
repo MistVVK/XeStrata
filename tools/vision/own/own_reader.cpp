@@ -43,7 +43,9 @@ bool own_reader_supported(const std::string& mmproj, bool gpu, std::string& why)
     Gguf gg;
     VitGeometry g;
     if (!gg.open(mmproj, why) || !vit_geometry_from_gguf(gg, g, why)) return false;
-    return vit_geometry_supported(g, why);
+    if (!vit_geometry_supported(g, why)) return false;
+    if (gpu && g.head_dim > 96) { why = "a head size above 96 is not handled by the GPU attention"; return false; }   // `auto` then reads with mtmd
+    return true;
 }
 
 int own_reader_run(const OwnReaderOptions& o) {
@@ -70,8 +72,9 @@ int own_reader_run(const OwnReaderOptions& o) {
         std::string why;
         if (!VitGpu::available(why)) return fail("this picture reader found no GPU (" + why + ")", 3);
         gpu.reset(new VitGpu());
-        // buffers for the largest picture the limit allows (without a limit: the tower's own 4,096 tokens): claimed now, before READY
-        const int tokens = o.max_tokens > 0 ? o.max_tokens + o.max_tokens / 8 : geo.max_tokens;
+        // buffers for the warm-up picture below (2048 x 2048: 4,096 tokens at most, fewer under a lower limit): claimed now, before READY.  A larger limit
+        // (the app allows up to 16,384 image tokens) grows them when such a picture comes: slower for that picture, never an error.
+        const int tokens = std::min(o.max_tokens > 0 ? o.max_tokens : geo.max_tokens, 4096);
         if (!gpu->load(gg, geo, 0, tokens * 4, err)) return fail("cannot load the vision encoder " + o.mmproj + " (" + err + ")", 1);
     }
 #endif

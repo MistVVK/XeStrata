@@ -47,6 +47,14 @@ class Reader:
                     self.peak_mib = max(self.peak_mib, int(mem.strip()))
         except Exception:  # noqa: BLE001
             pass
+        try:   # AMD: rocm-smi's KFD process list:  PID  NAME  #GPUs  VRAM USED(B)  SDMA USED  CU OCCUPANCY
+            out = subprocess.run(["rocm-smi", "--showpids"], capture_output=True, text=True, timeout=30).stdout
+            for line in out.splitlines():
+                t = line.split()
+                if len(t) >= 6 and t[0] == str(self.p.pid) and t[-3].isdigit():
+                    self.peak_mib = max(self.peak_mib, int(t[-3]) // (1 << 20))
+        except Exception:  # noqa: BLE001
+            pass
         return self.peak_mib
 
     def enc(self, img, out):
@@ -86,12 +94,13 @@ def main():
     ap.add_argument("--min-cos", type=float, default=0.999)
     ap.add_argument("--ref-dir", default="")
     ap.add_argument("--cpu-dir", default="")
+    ap.add_argument("--skip-cpu", action="store_true", help="no mtmd-CPU run: for pictures at the largest token limit (the columns then compare the two GPU readers)")
     ap.add_argument("images", nargs="+")
     a = ap.parse_args()
     for d in ("mtmd-cpu", "mtmd-gpu", "own-gpu"):
         os.makedirs(os.path.join(a.out, d), exist_ok=True)
     mk = lambda tower, gpu, label: Reader(a.helper, tower, a.mmproj, a.model, gpu, a.max_tokens, a.threads, a.out, label)  # noqa: E731
-    r_cpu = None if a.cpu_dir else mk("mtmd", False, "mtmd-cpu")
+    r_cpu = None if (a.cpu_dir or a.skip_cpu) else mk("mtmd", False, "mtmd-cpu")
     r_mg = mk("mtmd", True, "mtmd-gpu")
     r_og = mk("own", True, "own-gpu")
 
@@ -112,12 +121,16 @@ def main():
     ok_all, main_c, floor_c = True, [], []
     for img in a.images:
         name = os.path.basename(img)
-        if a.cpu_dir:
+        if a.skip_cpu:
+            cpu_f, res_c = None, "OK"      # a picture at the largest token limit: mtmd on the CPU would take many minutes; the GPU reader of mtmd is the yardstick
+        elif a.cpu_dir:
             cpu_f, res_c = os.path.join(a.cpu_dir, name + ".sve"), "OK"
         else:
             cpu_f, _, res_c = run(r_cpu, img, name)
         mg_f, mg_ms, res_m = run(r_mg, img, name)
         og_f, og_ms, res_o = run(r_og, img, name)
+        if cpu_f is None:
+            cpu_f = mg_f
         if not (str(res_c).startswith("OK") and res_m.startswith("OK") and res_o.startswith("OK")) or mg_ms is None or og_ms is None:
             print("%-22s FAILED: cpu=%s mtmd-gpu=%s own-gpu=%s" % (name, res_c, res_m, res_o), flush=True)
             ok_all = False
@@ -131,7 +144,7 @@ def main():
             ok_all = False
             continue
         m, f = float(main["global"]), float(floor["global"])
-        passed = m >= a.min_cos and m >= f - 1e-9
+        passed = (m >= 0.99) if a.skip_cpu else (m >= a.min_cos and m >= f - 1e-9)     # --skip-cpu: no error and the two GPU readers agree (0.99); the time and memory are the point
         ok_all &= passed
         main_c.append(m)
         floor_c.append(f)
