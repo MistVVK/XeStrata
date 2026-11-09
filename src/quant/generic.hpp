@@ -2,9 +2,11 @@
 // generic C (a type with no SIMD branch for the flavour).  Weight row, activation row, n elements.
 #pragma once
 
+#include "internal.hpp"   // STRATA_RESTRICT
+
 namespace strata::quant::generic {
 
-#define STRATA_GENERIC_DOT(name) void dot_##name##_generic(int n, float* __restrict__ s, const void* __restrict__ vx, const void* __restrict__ vy)
+#define STRATA_GENERIC_DOT(name) void dot_##name##_generic(int n, float* STRATA_RESTRICT s, const void* STRATA_RESTRICT vx, const void* STRATA_RESTRICT vy)
 STRATA_GENERIC_DOT(q2_0_q8_0);
 STRATA_GENERIC_DOT(q4_0_q8_0);
 STRATA_GENERIC_DOT(q4_1_q8_1);
