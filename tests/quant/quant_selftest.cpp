@@ -55,6 +55,7 @@ int main() {
         }
         CHECK(sq::dot_kernel(ti->type, sq::Arith::Generic) != nullptr, "%s has no Generic dot", ti->name);
         CHECK(sq::checked_dot_kernel(ti->type, sq::Arith::Generic) != nullptr, "%s has no checked Generic kernel", ti->name);
+        CHECK(sq::checked_dot_kernel(ti->type, sq::default_arith()) != nullptr, "%s has no checked kernel of the default contract", ti->name);
     }
     for (sq::Type t : {sq::Type::Q8_0, sq::Type::Q8_1, sq::Type::Q8_K})
         for (sq::Arith a : {sq::Arith::Generic, sq::Arith::Avx, sq::Arith::Avx2, sq::Arith::Neon}) {
@@ -64,7 +65,7 @@ int main() {
             CHECK(sq::selfcheck(*k, &why), "%s", why.c_str());
             ++acts;
         }
-    for (sq::Type t : {sq::Type::Q8_0, sq::Type::Q8_1, sq::Type::Q8_K}) CHECK(sq::checked_act_kernel(t, sq::Arith::Generic) != nullptr, "no checked Generic activation kernel");
+    for (sq::Type t : {sq::Type::Q8_0, sq::Type::Q8_1, sq::Type::Q8_K}) { CHECK(sq::checked_act_kernel(t, sq::Arith::Generic) != nullptr, "no checked Generic activation kernel"); CHECK(sq::checked_act_kernel(t, sq::default_arith()) != nullptr, "no checked activation kernel of the default contract"); }
 
     // the Q4_0 requantizer: a ramp of 32 values 0..31 -> d = max/-8 with max = 31 -> d = -3.875, ids from the ggml rule
     float ramp[32];

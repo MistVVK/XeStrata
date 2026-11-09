@@ -19,6 +19,7 @@
 #include "ggml-cpu.h"
 #include "ggml.h"
 #include "strata/quant/act.hpp"
+#include "strata/quant/dequant.hpp"
 #include "strata/quant/dot.hpp"
 #include "strata/quant/isa.hpp"
 #include "strata/quant/types.hpp"
@@ -174,6 +175,57 @@ void test_act(sq::Type act, int rows) {
     if (g_verbose) std::printf("  act %-10s %-18s ok\n", ti->name, k->name);
 }
 
+// to_float of every type the layer dequantizes, and the Q4_0 requantizer (--mtp-q4's output), bit for bit against ggml-base
+void test_dequant(int rows) {
+    static const sq::Type kTypes[] = {sq::Type::Q2_0, sq::Type::Q4_0, sq::Type::Q4_1, sq::Type::Q5_0, sq::Type::Q5_1, sq::Type::Q8_0, sq::Type::MXFP4,
+                                      sq::Type::NVFP4, sq::Type::Q2_K, sq::Type::Q3_K, sq::Type::Q4_K, sq::Type::Q5_K, sq::Type::Q6_K, sq::Type::IQ2_XXS,
+                                      sq::Type::IQ2_XS, sq::Type::IQ2_S, sq::Type::IQ3_XXS, sq::Type::IQ3_S, sq::Type::IQ1_S, sq::Type::IQ1_M,
+                                      sq::Type::IQ4_NL, sq::Type::IQ4_XS};
+    for (sq::Type st : kTypes) {
+        const ggml_type gt = (ggml_type) (int) st;
+        const ggml_type_traits* tr = ggml_get_type_traits(gt);
+        const sq::TypeInfo* ti = sq::type_info(st);
+        if (tr == nullptr || tr->to_float == nullptr) continue;
+        if (!sq::can_dequant(st)) {
+            fail(ti->name, "the layer cannot dequantize it");
+            continue;
+        }
+        Rng r(321 + (uint64_t) st);
+        for (int nbk = 1; nbk <= 4; ++nbk) {
+            const int n = ti->blck * nbk;
+            const std::vector<uint8_t> w = make_rows(gt, n, rows, r, nbk % 2 ? 1.0f : 30.0f);
+            std::vector<float> a((size_t) n), b((size_t) n);
+            for (int row = 0; row < rows; ++row) {
+                const uint8_t* wr = w.data() + (size_t) row * ggml_row_size(gt, n);
+                tr->to_float(wr, a.data(), n);
+                if (!sq::dequant_row(st, wr, b.data(), n) || std::memcmp(a.data(), b.data(), a.size() * 4) != 0) {
+                    fail(ti->name, "dequant_row differs from ggml's to_float, n=" + std::to_string(n));
+                    break;
+                }
+            }
+            ++g_checked;
+        }
+    }
+    // Q4_0 from floats: ggml_quantize_chunk(Q4_0, no imatrix) is quantize_row_q4_0_ref
+    Rng r(99);
+    for (int nbk = 1; nbk <= 6; ++nbk) {
+        const int n = 32 * nbk;
+        std::vector<float> f((size_t) n);
+        std::vector<uint8_t> a(18 * nbk), b(18 * nbk);
+        for (int it = 0; it < rows * 4; ++it) {
+            for (float& v : f) v = r.gauss() * (it % 3 == 0 ? 1.f : (it % 3 == 1 ? 1e-3f : 200.f));
+            if (it % 9 == 0) std::memset(f.data(), 0, f.size() * 4);
+            ggml_quantize_chunk(GGML_TYPE_Q4_0, f.data(), a.data(), 0, 1, n, nullptr);
+            sq::quantize_q4_0_ref(f.data(), b.data(), n);
+            ++g_checked;
+            if (a != b) {
+                fail("q4_0", "quantize_q4_0_ref differs from ggml_quantize_chunk, n=" + std::to_string(n));
+                break;
+            }
+        }
+    }
+}
+
 void test_fp16() {
     // our software fp16 conversions against ggml's, every fp16 value and a spread of floats
     int bad = 0;
@@ -212,6 +264,7 @@ int main(int argc, char** argv) {
                 ggml_cpu_has_avx(), ggml_cpu_has_avx2(), ggml_cpu_has_fma(), ggml_cpu_has_f16c(), ggml_cpu_has_avx512(), sq::isa_name(sq::best_isa()),
                 sq::arith_name(sq::default_arith()));
     test_fp16();
+    test_dequant(rows);
     for (sq::Type a : {sq::Type::Q8_0, sq::Type::Q8_1, sq::Type::Q8_K})
         if (only == nullptr || !std::strcmp(only, sq::type_info(a)->name)) test_act(a, rows);
     static const sq::Type kTypes[] = {sq::Type::Q2_0, sq::Type::Q4_0, sq::Type::Q4_1, sq::Type::Q5_0, sq::Type::Q5_1, sq::Type::Q8_0, sq::Type::IQ4_NL,

@@ -24,7 +24,7 @@ for f in "${FLAVOURS[@]}"; do
   esac
   B="$ROOT/$f"
   echo "=== flavour $f: configure + build in $B"
-  cmake -G Ninja -S . -B "$B" -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_TESTS=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_ENABLE_HIP=OFF "${EXTRA[@]}" > "$ROOT/cfg-$f.log" 2>&1 \
+  cmake -G Ninja -S . -B "$B" -DCMAKE_BUILD_TYPE=Release -DSTRATA_BUILD_TESTS=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_ENABLE_HIP=OFF "${EXTRA[@]}" ${QUANT_CMAKE_ARGS:-} > "$ROOT/cfg-$f.log" 2>&1 \
     || { tail -30 "$ROOT/cfg-$f.log"; rc=1; continue; }
   cmake --build "$B" -j "$JOBS" --target quant_selftest quant_parity > "$ROOT/build-$f.log" 2>&1 || { grep -E "error|Error" "$ROOT/build-$f.log" | head -40; rc=1; continue; }
   echo "=== flavour $f: quant_selftest"
