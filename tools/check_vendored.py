@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify third_party/strata-ggml and third_party/strata-gguf-py against their manifests (UPSTREAM.md).   python tools/check_vendored.py [--upstream <llama.cpp dir>]
+"""Verify third_party/strata-ggml, strata-gguf-py, strata-llama and stb against their manifests (UPSTREAM.md).   python tools/check_vendored.py [--upstream <llama.cpp dir>]
 
 The vendored ggml / ggml-cuda sources are frozen at the llama.cpp commit named in UPSTREAM.md.  The manifest lists every file with its
 kind and sha256 (text files are hashed with LF line ends, so a Windows checkout agrees with a Linux one):
@@ -30,6 +30,7 @@ GGML_RENAMED = {"strata-quant-common.h": "ggml/src/ggml-common.h"}   # the one f
 # every vendored tree: (folder, maps a path in the tree to the path in the llama.cpp checkout at the pin)
 GGUF_PY_MAP = (("gguf/", "gguf-py/gguf/"), ("converter/conversion/", "conversion/"), ("converter/convert_hf_to_gguf.py", "convert_hf_to_gguf.py"),
                ("converter/LICENSE", "LICENSE"), ("LICENSE", "gguf-py/LICENSE"), ("pyproject.toml", "gguf-py/pyproject.toml"))
+STB_MAP = (("stb_image.h", "vendor/stb/stb_image.h"),)   # third_party/stb: the one header, from llama.cpp's vendor/stb
 BEGIN, END = "<!-- vendored-files:begin -->", "<!-- vendored-files:end -->"
 NOT_LISTED = {"UPSTREAM.md"}          # the manifest itself
 TEXT_SUFFIXES = {".c", ".cc", ".cpp", ".cu", ".cuh", ".h", ".hpp", ".txt", ".cmake", ".in", ".md", ".inc", ".py", ".toml", ".typed"}
@@ -163,7 +164,8 @@ def main(argv=None):
     problems = []
     summary = [check_tree(a.root, TREE, None, a.upstream, problems),
                check_tree(a.root, os.path.join("third_party", "strata-gguf-py"), GGUF_PY_MAP, a.upstream, problems),
-               check_tree(a.root, os.path.join("third_party", "strata-llama"), IDENTITY, a.upstream, problems)]
+               check_tree(a.root, os.path.join("third_party", "strata-llama"), IDENTITY, a.upstream, problems),
+               check_tree(a.root, os.path.join("third_party", "stb"), STB_MAP, a.upstream, problems)]
     for p in problems:
         print("check_vendored: " + p)
     if problems:
