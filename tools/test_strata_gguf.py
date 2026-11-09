@@ -357,6 +357,7 @@ class Container(unittest.TestCase):
                 self.assertEqual(a.tensor_type.name, b.tensor_type.name)
                 self.assertEqual((a.n_elements, a.n_bytes, a.data_offset), (b.n_elements, b.n_bytes, b.data_offset), a.name)
                 self.assertEqual([int(v) for v in a.shape], [int(v) for v in b.shape])
+                self.assertEqual((a.field.offset, a.field.name), (b.field.offset, b.field.name), a.name)
                 self.assertEqual(a.data.shape, b.data.shape, a.name)
                 self.assertEqual(a.data.dtype, b.data.dtype, a.name)
                 self.assertTrue(np.array_equal(np.asarray(a.data).view(np.uint8), np.asarray(b.data).view(np.uint8)), a.name)
@@ -394,6 +395,10 @@ class Container(unittest.TestCase):
 
 class Frozen(unittest.TestCase):
     """the outputs recorded from gguf-py (tools/strata_gguf_digests.json): the check that remains once gguf-py is not in the tree"""
+
+    def run(self, result=None):
+        with np.errstate(all="ignore"):
+            return super().run(result)
 
     def test_outputs_match_the_recorded_digests(self):
         want = json.loads(DIGESTS.read_text(encoding="utf-8"))

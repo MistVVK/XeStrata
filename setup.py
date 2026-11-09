@@ -3866,11 +3866,20 @@ VENDORED_LLAMA = ROOT / "third_party" / "strata-llama"
 
 
 def gguf_py_dir() -> Path:
-    """The folder that holds the `gguf` package for the preparation tools (STRATA_GGUF_PY=<folder> is an override, kept as before)."""
+    """The folder that holds llama.cpp's `gguf` package: STRATA_GGUF_PY=<folder> (an override, kept for two releases), else the vendored copy.
+    The preparation tools read and write GGUF with their own tools/strata_gguf.py and no longer need it; only llama.cpp's HF converter
+    (NVFP4-local) imports it, and tools/_paths.py finds the vendored copy for that."""
     own = os.environ.get("STRATA_GGUF_PY")
     if own and (Path(own) / "gguf").is_dir():
         return Path(own)
     return VENDORED_GGUF_PY
+
+
+def gguf_py_env() -> dict:
+    """The environment the preparation tools get for the GGUF library: STRATA_GGUF_PY only when the user named a gguf-py folder (then the tools
+    use llama.cpp's gguf-py instead of tools/strata_gguf.py); empty by default, so the tools use their own."""
+    own = os.environ.get("STRATA_GGUF_PY")
+    return {"STRATA_GGUF_PY": str(gguf_py_dir())} if own and (Path(own) / "gguf").is_dir() else {}
 
 
 def llama_override():
@@ -3891,7 +3900,7 @@ def vision_llama(llama) -> Path:
 
 
 def llama_cpp_if_here():
-    """The llama.cpp override tree (None by default). gguf-py is vendored (gguf_py_dir()), so nothing is fetched to prepare a model."""
+    """The llama.cpp override tree (None by default). The preparation tools have their own GGUF code, so nothing is fetched to prepare a model."""
     if (gguf_py_dir() / "gguf").is_dir():
         ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py for the preparation tools)")
     return llama_override()
@@ -8687,7 +8696,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     pack = data / "packs" / tag.lower()            # only the tokenizer: the engine reads the GGUF itself
     if not (pack / "tokenizer" / "vocab.json").exists():
         run([sys.executable, str(ROOT / "tools" / "strata_tokenizer.py"), "--gguf", str(gguf), "--out", str(pack)],
-            env=dict(os.environ, STRATA_GGUF_PY=str(gguf_py_dir())))
+            env=dict(os.environ, **gguf_py_env()))
     ok(f"tokenizer: {pack / 'tokenizer'}")
 
     step(7, "writing the start script")
@@ -9696,7 +9705,7 @@ def prepare_pack_only(a) -> int:
     step(1, "preparing the model for this graphics card")
     llama = llama_override()
     ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py)")
-    env = dict(os.environ, STRATA_GGUF_PY=str(gguf_py_dir()))
+    env = dict(os.environ, **gguf_py_env())
     if not (pack / "native_experts.txt").exists() or not (pack / "tokenizer" / "vocab.json").exists():
         run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(files[0]), "--out", str(pack),
              *fam.get("pack_args", [])], env=env)
@@ -9918,7 +9927,7 @@ def mac_control_setup(a) -> int:
 
     step(6, "preparing the model for Strata")
     pack = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
-    env = dict(os.environ, STRATA_GGUF_PY=str(gguf_py_dir()))
+    env = dict(os.environ, **gguf_py_env())
     shards = [files[0], files[0]] if family == "gyro" else files      # Gyro: one file, the model and its n-gram table
     pack_todo = not (pack / "native_experts.txt").exists() or not (pack / "tokenizer" / "vocab.json").exists()
     prep_lock = mac_prepare_lock(native) if repacked and (pack_todo or not (native.exists() and done(native))) else None
@@ -10995,7 +11004,7 @@ def main() -> int:
     # ---- 6. the pack and the MTP draft layer
     step(6, "preparing the model for Strata")
     pack = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
-    env = dict(os.environ, STRATA_GGUF_PY=str(gguf_py_dir()))
+    env = dict(os.environ, **gguf_py_env())
     prepared = bool(ready and MODELS[model].get("prepare"))
     if prepared and not prepared_done(model, models_dir):
         say("  NVIDIA's checkpoint is turned into a Strata pack on this PC (once; 20-40 minutes, reads the 102 GB, writes about")

@@ -20,11 +20,14 @@ def main():
     ap.add_argument("model")
     ap.add_argument("outdir")
     ap.add_argument("dump")
-    ap.add_argument("--gguf-py", required=True)
+    ap.add_argument("--gguf-py", help="optional: a folder that holds llama.cpp's gguf package, to compare against it (default: tools/strata_gguf.py)")
     a = ap.parse_args()
-    sys.path.insert(0, a.gguf_py)
-    import gguf
-    from gguf import quants
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tools"))
+    if a.gguf_py:
+        os.environ["STRATA_GGUF_PY"] = a.gguf_py
+    from _paths import gguf_lib
+    gguf = gguf_lib()
+    quants = gguf.quants
 
     shards = [a.model]
     import re

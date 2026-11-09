@@ -263,16 +263,18 @@ class OfflineStart(unittest.TestCase):
     """0.2.10: a PC with every file and no internet starts a model that is already prepared."""
 
     def test_preparing_a_model_never_fetches_llama_cpp(self):
-        """OWN-1B: gguf-py is vendored (third_party/strata-gguf-py), so neither starting a prepared model nor running a preparation tool reaches github.com."""
+        """OWN-1B/2B: the preparation tools have their own GGUF code (tools/strata_gguf.py), so neither starting a prepared model nor running a
+        preparation tool reaches github.com, and the tools are not told to use gguf-py unless the user set STRATA_GGUF_PY."""
         fetched = []
         env = {k: v for k, v in os.environ.items() if k not in ("STRATA_GGUF_PY", "STRATA_GGML_DIR")}
         with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(setup, "get_llama_cpp", lambda: fetched.append(1)):
             self.assertIsNone(setup.llama_cpp_if_here(), "no override tree by default")
             self.assertEqual(setup.gguf_py_dir(), setup.ROOT / "third_party" / "strata-gguf-py")
             self.assertTrue((setup.gguf_py_dir() / "gguf").is_dir())
+            self.assertEqual(setup.gguf_py_env(), {}, "the tools use their own GGUF code by default")
             with mock.patch.object(setup.subprocess, "run", lambda *a, **k: mock.Mock(returncode=0)), \
                     mock.patch.object(setup.acquisition, "require", lambda *a, **k: None), mock.patch.object(setup, "CONTROL", False):
-                setup.run([sys.executable, "tools/x.py"], env=dict(os.environ, STRATA_GGUF_PY=str(setup.gguf_py_dir())))
+                setup.run([sys.executable, "tools/x.py"], env=dict(os.environ, **setup.gguf_py_env()))
             self.assertEqual(fetched, [], "nothing is downloaded")
 
     def test_the_overrides_are_kept(self):
@@ -283,6 +285,7 @@ class OfflineStart(unittest.TestCase):
             (Path(tmp) / "ggml" / "CMakeLists.txt").write_text("", encoding="utf-8")
             with mock.patch.dict(os.environ, {"STRATA_GGUF_PY": tmp, "STRATA_GGML_DIR": tmp}):
                 self.assertEqual(setup.gguf_py_dir(), Path(tmp))
+                self.assertEqual(setup.gguf_py_env(), {"STRATA_GGUF_PY": tmp}, "the override is passed on to the tools")
                 self.assertEqual(setup.llama_override(), Path(tmp))
                 self.assertEqual(setup.ggml_defs(setup.llama_override()), [f"-DSTRATA_GGML_DIR={tmp}"])
             self.assertEqual(setup.ggml_defs(None), [], "nothing is passed by default")

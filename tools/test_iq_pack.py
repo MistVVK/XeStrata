@@ -13,12 +13,12 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # runnable from the repo root too
 
-from _paths import add_gguf_py
-import iq_pack                         # needs numpy + gguf_reader only, not gguf-py: import it unguarded
+from _paths import gguf_lib
+import iq_pack                         # needs numpy + gguf_reader only: import it unguarded
 
 try:
-    add_gguf_py()                       # llama.cpp's gguf-py: setup.py clones it; gguf_py() exits when absent
-    from gguf import GGUFWriter, GGMLQuantizationType as Q, quants
+    _gguf = gguf_lib()                  # tools/strata_gguf.py (STRATA_GGUF_PY selects llama.cpp's gguf-py; it exits when that is not a gguf-py folder)
+    GGUFWriter, Q, quants = _gguf.GGUFWriter, _gguf.GGMLQuantizationType, _gguf.quants
 except SystemExit:
     GGUF_PY = None
 else:
@@ -30,8 +30,7 @@ def require_gguf_py(test):
     @classmethod
     def setUpClass(cls):
         if GGUF_PY is None:
-            raise unittest.SkipTest("gguf-py not found: third_party/strata-gguf-py is missing from this checkout "
-                                    "(or set STRATA_GGUF_PY)")
+            raise unittest.SkipTest("STRATA_GGUF_PY does not name a gguf-py folder")
     return setUpClass
 
 
@@ -39,7 +38,7 @@ def write_gguf(path, tensors, split=None, arch=True):
     """`split` = (no, count, tensors): llama.cpp's gguf-split keys (0-based split.no)."""
     writer = GGUFWriter(path, "qwen4exp")
     if not arch:                                   # a later shard of a split: no model metadata
-        writer.kv_data[0].pop("general.architecture", None)
+        writer.remove_key("general.architecture")
     if split is not None:
         writer.add_uint16("split.no", split[0])
         writer.add_uint16("split.count", split[1])

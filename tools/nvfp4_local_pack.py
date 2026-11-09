@@ -452,10 +452,9 @@ def cmd_mtp(a) -> int:
 def cmd_slim(a) -> int:
     """Copy a converted GGUF without its routed experts (and their .scale / .input_scale tensors): the file the engine
     reads the dense weights from (--native / --native-dense-gguf), ~9 GB instead of ~74 GB, once experts.bin is cut."""
-    from _paths import add_gguf_py
-    add_gguf_py()
-    import gguf
-    from gguf import GGUFReader, GGUFWriter, GGUFValueType as VT
+    from _paths import gguf_lib
+    gguf = gguf_lib()
+    GGUFReader, GGUFWriter, VT = gguf.GGUFReader, gguf.GGUFWriter, gguf.GGUFValueType
     rd = GGUFReader(a.gguf)
     arch = rd.fields["general.architecture"].contents()
     w = GGUFWriter(a.out, arch)
@@ -516,9 +515,8 @@ class _VGguf:
 
 def experts_from_checkpoint(model, ck: Checkpoint, n_layers: int = 48, n_exp: int = 512):
     """Give an iq_pack.Model of the dense-only GGUF the routed experts of the checkpoint as virtual tensors."""
-    from _paths import add_gguf_py
-    add_gguf_py()
-    from gguf import GGMLQuantizationType as Q
+    from _paths import gguf_lib
+    Q = gguf_lib().GGMLQuantizationType
     src = next(iter(model.where.values()))[3]
     cache: dict = {}
     base = "model.language_model.layers.%d.mlp.experts.%d.%s_proj."
@@ -634,11 +632,13 @@ def cmd_prepare(a) -> int:
 
 # ------------------------------------------------------------------------------------------------------ verifying
 def cmd_verify(a) -> int:
-    """Experts: decode the checkpoint (CSF + ModelOpt definition) and compare with gguf-py's dequantization of the
+    """Experts: decode the checkpoint (CSF + ModelOpt definition) and compare with tools/strata_quants.py's dequantization of the
     GGUF's NVFP4 blocks times the scale tensor, bit for bit (zeros normalised: ggml has one zero)."""
     import torch
     import nvfp4_verify as V
-    from gguf import GGUFReader, GGMLQuantizationType as Q, quants
+    from _paths import gguf_lib
+    gguf = gguf_lib()
+    GGUFReader, Q, quants = gguf.GGUFReader, gguf.GGMLQuantizationType, gguf.quants
     ck = Checkpoint(a.model)
     rd = GGUFReader(a.gguf)
     T = {t.name: t for t in rd.tensors}

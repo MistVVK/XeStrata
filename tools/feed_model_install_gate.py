@@ -22,7 +22,7 @@ What it does, in a scratch folder (nothing of the real install, %APPDATA% or the
     python tools/feed_model_install_gate.py --tokenizer-from <a real Flash-Next shard 1> --engine <engine folder> --full
 
 `tools/test_feed_model_install_realfile.py` runs step 1 to 4 as a test in `python tools/check` (py-tools). The preparation tools read GGUF files with the vendored
-gguf-py (third_party/strata-gguf-py), so no llama.cpp checkout, no STRATA_TEST_LLAMA_CPP and no network are needed; the check also fails if setup says it
+their own GGUF code (tools/strata_gguf.py), so no gguf-py, no llama.cpp checkout, no STRATA_TEST_LLAMA_CPP and no network are needed; the check also fails if setup says it
 fetched llama.cpp. Without numpy it is SKIPPED with that reason (never a pass).
 Exit codes: 0 pass, 1 a check failed, 2 not run (no numpy, no NVIDIA card on a Windows box), 3 the engine phase failed.
 """
@@ -68,10 +68,12 @@ class NotRun(Exception):
     pass
 
 
-def check_vendored_gguf_py() -> None:
-    """The preparation tools read GGUF files with the vendored gguf-py (third_party/strata-gguf-py): nothing to find, nothing to fetch."""
-    if not (ROOT / "third_party" / "strata-gguf-py" / "gguf" / "__init__.py").is_file():
-        raise NotRun("third_party/strata-gguf-py is missing from this checkout")
+def check_gguf_tools() -> None:
+    """The preparation tools read and write GGUF files with their own code (tools/strata_gguf.py, tools/strata_quants.py): nothing to find, nothing to
+    fetch, and no gguf-py needed (this gate also runs on a copy of the tree without third_party/strata-gguf-py)."""
+    for f in ("strata_gguf.py", "strata_quants.py", "strata_quant_tables.py"):
+        if not (ROOT / "tools" / f).is_file():
+            raise NotRun("tools/%s is missing from this checkout" % f)
 
 
 def free_port() -> int:
@@ -297,7 +299,7 @@ def check(work: Path, tokenizer_from: str | None, shape: dict, log) -> dict:
             if bad in out:
                 problems.append(f"setup printed {bad!r}")
         if "llama.cpp source" in out or any("llama.cpp" in p or "ggml-org" in p for p in mirror.seen):
-            problems.append("setup fetched llama.cpp (the gguf-py of the preparation tools is vendored: third_party/strata-gguf-py)")
+            problems.append("setup fetched llama.cpp (the preparation tools have their own GGUF code: tools/strata_gguf.py)")
         if (install / "third_party" / "llama.cpp").exists():
             problems.append("setup wrote third_party/llama.cpp into the install folder")
         wrong = sorted({p for p in asked if FILE_NAME not in p})
@@ -431,7 +433,7 @@ def main(argv=None) -> int:
         return 2
     log = lambda s: print(time.strftime("%H:%M:%S"), s, flush=True)   # noqa: E731
     try:
-        check_vendored_gguf_py()
+        check_gguf_tools()
     except NotRun as e:
         print("NOT RUN:", e)
         return 2

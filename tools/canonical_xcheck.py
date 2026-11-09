@@ -582,12 +582,13 @@ def reference_values(tname: str, raw: bytes):
     Q2_0 goes through `gguf_writer.dequantize_q2_0` and everything else through gguf-py, both reached via
     `_dequant_flat`.  The three float types are the exception and have to bypass it: `_dequant_flat` handles
     them with this project's OWN `_bf16_to_f32` and numpy views, so for those the project's reference would
-    be checking itself.  gguf-py implements all three independently, so it is used directly here.
+    be checking itself.  tools/strata_quants.py (or gguf-py, with STRATA_GGUF_PY) implements all three independently of ref/load.py, so it is used directly here.
     """
     buf = np.frombuffer(raw, dtype=np.uint8)
     if tname in ("F32", "F16", "BF16"):
-        from gguf import quants, GGMLQuantizationType as Q
-        return np.asarray(quants.dequantize(buf, Q[tname]), dtype=np.float32)
+        from _paths import gguf_lib
+        g = gguf_lib()
+        return np.asarray(g.quants.dequantize(buf, g.GGMLQuantizationType[tname]), dtype=np.float32)
     return np.asarray(_dequant_flat(tname, buf), dtype=np.float32)
 
 

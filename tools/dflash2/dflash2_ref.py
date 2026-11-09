@@ -9,9 +9,11 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
-sys.path.insert(0, r"C:\Users\AI-Server\Desktop\Strata\Public\Engine\third_party\llama.cpp\gguf-py")
-import gguf
-from gguf.quants import dequantize
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+from _paths import gguf_lib
+gguf = gguf_lib()
+dequantize = gguf.quants.dequantize
 
 
 def rms(x, w, eps=1e-6):

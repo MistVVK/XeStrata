@@ -272,6 +272,7 @@ class GGUFReader:
         return [vt, et], arr.tolist()
 
     def _tensor_info(self):
+        start = self._pos
         name = self._str()
         n_dims = self._u("<I")
         if n_dims > GGML_MAX_DIMS:
@@ -279,11 +280,11 @@ class GGUFReader:
         dims = [self._u("<Q") for _ in range(n_dims)]
         raw_type = self._u("<I")
         offset = self._u("<Q")
-        return name, dims, raw_type, offset
+        return name, dims, raw_type, offset, start
 
     def _build_tensors(self, infos) -> None:
         seen = set()
-        for name, dims, raw_type, offset in infos:
+        for name, dims, raw_type, offset, info_at in infos:
             if name in seen:
                 raise ValueError(f"Found duplicated tensor with name {name}")
             seen.add(name)
@@ -308,7 +309,7 @@ class GGUFReader:
                 raise ValueError(f"tensor {name} ends at byte {start + nbytes}, past the end of the file ({self._size})")
             data = self.data[start:start + nbytes].view(dtype=item_type)[:item_count].reshape(np_dims)
             self.tensors.append(ReaderTensor(name, ggml_type, np.array(dims, dtype=np.uint64), n_elems, n_bytes, start, data,
-                                             self.fields.get(name)))
+                                             ReaderField(info_at, name, [], None)))   # .offset: where this tensor's info entry starts
 
     def get_field(self, key: str):
         return self.fields.get(key)

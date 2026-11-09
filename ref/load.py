@@ -27,10 +27,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "tools")
 from gguf_reader import GGUFFile                     # noqa: E402
 from gguf_writer import dequantize_q2_0              # noqa: E402
 
-# gguf-py names differ from our reader's names in a few places; map only what differs.
-_GGUF_PY_NAME = {"Q4_0": "Q4_0", "Q8_0": "Q8_0", "Q4_K": "Q4_K", "Q5_K": "Q5_K", "Q6_K": "Q6_K",
-                 "Q3_K": "Q3_K", "IQ4_NL": "IQ4_NL", "IQ4_XS": "IQ4_XS", "Q5_0": "Q5_0"}
-
 # (elements per block, bytes per block) - mirrors block_geometry() in src/artifact/gguf_reader.cpp
 GEOM = {"F32": (1, 4), "F16": (1, 2), "BF16": (1, 2),
         "Q4_0": (32, 18), "Q5_0": (32, 22), "Q8_0": (32, 34), "IQ4_NL": (32, 18),
@@ -41,9 +37,8 @@ GEOM = {"F32": (1, 4), "F16": (1, 2), "BF16": (1, 2),
 def _dequant_flat(type_name: str, raw: np.ndarray) -> np.ndarray:
     """One dequantization dispatch, shared by tensor()/expert()/rows().
 
-    Q2_0 is this project's own decoder because gguf-py's enum cannot represent type 42 at all;
-    everything else goes through gguf-py, which is already the reference this project validates its
-    C++ against.  Keeping one dispatch means a type added in one path cannot be forgotten in another.
+    Q2_0 is this project's own decoder (tools/gguf_writer.py); everything else goes through tools/strata_quants.py, which
+    tools/test_strata_gguf.py proves bit-identical to llama.cpp's gguf-py, the reference this project validates its C++ against.  Keeping one dispatch means a type added in one path cannot be forgotten in another.
     """
     if type_name == "Q2_0":
         return dequantize_q2_0(raw.tobytes())
@@ -53,8 +48,8 @@ def _dequant_flat(type_name: str, raw: np.ndarray) -> np.ndarray:
         return raw.view(np.float32)
     if type_name == "F16":
         return raw.view(np.float16).astype(np.float32)
-    from gguf import quants, GGMLQuantizationType as Q
-    return quants.dequantize(raw, Q[_GGUF_PY_NAME[type_name]]).astype(np.float32)
+    import strata_quants
+    return strata_quants.dequantize(raw, type_name).astype(np.float32)
 
 
 def _bf16_to_f32(raw: np.ndarray) -> np.ndarray:

@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 class IntelPack(unittest.TestCase):
-    def test_prepare_pack_uses_the_vendored_gguf_py_and_runs_the_pack_tool(self):
+    def test_prepare_pack_runs_the_pack_tool_with_its_own_gguf_code(self):
         import setup
         calls = {}
         with tempfile.TemporaryDirectory() as d:
@@ -32,8 +32,8 @@ class IntelPack(unittest.TestCase):
                     mock.patch.dict("os.environ", {k: v for k, v in __import__("os").environ.items() if k != "STRATA_GGUF_PY"}, clear=True):
                 self.assertEqual(setup.prepare_pack_only(args), 0)
         self.assertIn("iq_pack.py", " ".join(map(str, calls["cmd"])))
-        self.assertEqual(calls["env"]["STRATA_GGUF_PY"], str(setup.ROOT / "third_party" / "strata-gguf-py"))
-        self.assertEqual(fetched, [], "the vendored gguf-py needs no download")
+        self.assertNotIn("STRATA_GGUF_PY", calls["env"], "the tool uses tools/strata_gguf.py unless the user named a gguf-py")
+        self.assertEqual(fetched, [], "nothing is downloaded")
 
 
 if __name__ == "__main__":

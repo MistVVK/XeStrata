@@ -13,9 +13,9 @@ published quantizer in gguf-py (it dequantizes only), so each block combines san
 (written at the layout's scale offsets, see SCALE_OFFSETS below) with seeded index/sub-scale bytes - the
 dequantized reference covers real codebook values either way, which is what the parity compares.
 
-Dependencies: python3 and numpy, plus the repository's VENDORED gguf-py (third_party/strata-gguf-py -
-no pip install; it is put on sys.path relative to this file).  Q2_0 is this repository's own format
-(GGML type 42, which gguf-py does not carry): its codec comes from tools/gguf_writer.py.
+Dependencies: python3 and numpy (the dequantizers are tools/strata_quants.py, proven bit-identical to llama.cpp's gguf-py by
+tools/test_strata_gguf.py; STRATA_GGUF_PY=<gguf-py folder> uses gguf-py's instead).  Q2_0 is this repository's own format
+(GGML type 42): its codec comes from tools/gguf_writer.py.
 
 The kernel ids in the .bin headers are the repo's i-quant dispatch table (iq_kernels.cu is_iq /
 iq_row_bytes) and match the vendored gguf-py's enum ids one for one - the layout table below is the
@@ -31,17 +31,15 @@ from pathlib import Path
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "third_party" / "strata-gguf-py"))
 sys.path.insert(0, str(ROOT / "tools"))
 
 try:
-    import gguf
-    from gguf.quants import dequantize as gguf_dequantize
+    from _paths import gguf_lib
+    gguf = gguf_lib()                       # tools/strata_gguf.py (STRATA_GGUF_PY selects llama.cpp's gguf-py)
+    gguf_dequantize = gguf.quants.dequantize
     from gguf_writer import dequantize_q2_0, quantize_q2_0
-except ImportError as e:  # a missing numpy or vendored gguf-py must be explicit, not a traceback
-    sys.stderr.write(f"iq_fixture: missing dependency: {e}\n"
-                     "numpy and the repository's vendored gguf-py (third_party/strata-gguf-py) are "
-                     "required; the vendored copy is part of the checkout.\n")
+except ImportError as e:  # a missing numpy must be explicit, not a traceback
+    sys.stderr.write(f"iq_fixture: missing dependency: {e}\nnumpy is required.\n")
     sys.exit(3)
 
 QT = gguf.GGMLQuantizationType
