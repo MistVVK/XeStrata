@@ -9,6 +9,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/mf_trainer.hpp"
+#include "strata/image/train_loop.hpp"
 #include "strata/prefill/gemm.hpp"
 
 #include <algorithm>
@@ -30,14 +31,14 @@ void usage() {
                  "[--sigma F] [--seed N]\n"
                  "       xestrata-image-mf-train train --dit <safetensors> --data <export dir> --out <prefix> "
                  "[--method lora|lokr|dora] [--rank N] [--alpha F] [--steps N] [--lr F] [--seed N] [--accum N] "
-                 "[--checkpoint N] [--trigger S] [--title S] [--timesteps logit-normal|shifted] [--sigma-max F]\n");
+                 "[--checkpoint N] [--trigger S] [--title S] [--timesteps linear|logit-normal|shifted] [--sigma-max F] "
+                 "[--caption-dropout F] [--warmup N] [--eps F] [--weight-decay F] [--mod 1|0] [--base int8|bf16]\n");
 }
 
 // sd-scripts' truncated logit-normal (flux_train_utils, sample_truncated_logit_normal_indices): S = sigmoid(-N),
 // truncated at `cutoff`, stretched by 1 / cutoff, snapped to the T-point grid, redrawn uniform with prob `uniform`.
-// `sigmax` (0 = off) redraws a shifted sigma past it: the timestep embedder explodes past ~0.955,
-// so a run that keeps those draws pays ~half its micro-steps as no-update skips. SPEC's defaults stay unchanged;
-// the cap only trims the engine-broken tail the record already carries as a leftover.
+// `sigmax` (0 = off) redraws a shifted sigma past it (an earlier trainer's losses went non-finite past ~0.955;
+// 2026-11-10's, on the RX 7900 XTX, stays finite to 1.0).
 float sample_sigma(std::mt19937_64& rng, float logit_mean, float logit_std, float cutoff, float uniform,
                    float sigmax = 0.f) {
     std::normal_distribution<float> gauss(0.f, 1.f);
@@ -75,10 +76,15 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::string cmd = argv[1];
-    std::string dit, data, stem, method = "lora", out, trigger, title = "card-5-lora", revision = "card-5";
-    std::string timesteps = "logit-normal";   // or "shifted": SPEC v1's first draw (sample_sigma)
-    float sigma = 0.5f, lr = 1e-4f, alpha = 16.f, sigma_max = 0.f;
-    int rank = 16, steps = 1500, accum = 4, checkpoint = 250, seed = 12345;
+    std::string dit, data, stem, method = "lora", out, trigger, title, revision = "card-5";
+    // ai-toolkit's Mage-Flow defaults (its mageflow model's job): linear timesteps, rank 32 with alpha = rank,
+    // AdamW lr 1e-4 eps 1e-6 weight decay 1e-4 at a constant rate, batch 1, 3,000 steps, a save every 250, the
+    // caption dropped 5% of the time.  "logit-normal" and "shifted" are the earlier SPEC's draws.
+    std::string timesteps = "linear";
+    float sigma = 0.5f, lr = 1e-4f, alpha = 0.f, sigma_max = 0.f, adam_eps = 1e-6f, wd = 1e-4f, dropout = -1.f;
+    int rank = 32, steps = 3000, accum = 1, checkpoint = 250, seed = 12345, warmup = 0;
+    bool mod = true;
+    std::string base = "int8";   // ai-toolkit quantizes Mage-Flow's transformer (qfloat8; XeStrata's QLoRA is int8)   // ai-toolkit's targets take the modulation linears (img_mod.1, txt_mod.1) as well
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&](const char* name) -> std::string {
@@ -124,6 +130,18 @@ int main(int argc, char** argv) {
             title = val("title");
         else if (a == "--revision")
             revision = val("revision");
+        else if (a == "--caption-dropout")
+            dropout = std::stof(val("caption-dropout"));
+        else if (a == "--base")
+            base = val("base");
+        else if (a == "--mod")
+            mod = val("mod") != "0";
+        else if (a == "--warmup")
+            warmup = std::stoi(val("warmup"));
+        else if (a == "--eps")
+            adam_eps = std::stof(val("eps"));
+        else if (a == "--weight-decay")
+            wd = std::stof(val("weight-decay"));
         else {
             usage();
             return 2;
@@ -136,8 +154,16 @@ int main(int argc, char** argv) {
     void* s = strata::core::Runtime::get().create_stream();
     std::string err;
     const int64_t open_rank = (cmd == "train") ? rank : 0;
+    if (base != "int8" && base != "bf16") {
+        usage();
+        return 2;
+    }
+    if (cmd == "train" && base == "int8" && method == "dora") {
+        std::fprintf(stderr, "mf-train: DoRA reads the base's row norms: train it on --base bf16\n");
+        return 2;
+    }
     std::unique_ptr<strata::image::MfTrainModel, void (*)(strata::image::MfTrainModel*)> m(
-        strata::image::mf_trainer_open(dit, open_rank, s, err), strata::image::mf_trainer_close);
+        strata::image::mf_trainer_open(dit, open_rank, s, err, cmd == "train" && base == "int8"), strata::image::mf_trainer_close);
     if (m == nullptr) {
         std::fprintf(stderr, "mf-train: %s\n", err.c_str());
         return 1;
@@ -187,16 +213,33 @@ int main(int argc, char** argv) {
                 }
             }
             if (stems.empty()) throw std::runtime_error("no samples in " + data);
-            if (timesteps != "logit-normal" && timesteps != "shifted")
-                throw std::runtime_error("--timesteps is logit-normal or shifted, not " + timesteps);
+            if (timesteps != "linear" && timesteps != "logit-normal" && timesteps != "shifted")
+                throw std::runtime_error("--timesteps is linear, logit-normal or shifted, not " + timesteps);
+            if (alpha <= 0.f) alpha = (float) rank;   // ai-toolkit's alpha = rank (a scale of 1)
+            if (mod && m->mrank > 0) {   // MageTrail: the engine adds no adapter to its low-rank modulation
+                std::printf("train: MageTrail's low-rank modulation is not a target\n");
+                mod = false;
+            }
+            if (dropout >= 0.f) {   // the flag decides for every sample over the manifest's column
+                if (dropout > 1.f) throw std::runtime_error("--caption-dropout out of [0,1]");
+                for (float& d : drop_rates) d = dropout;
+            } else {
+                bool all0 = true;
+                for (float d : drop_rates) all0 = all0 && d == 0.f;
+                if (all0)   // data exported before the dropout column carried a rate: ai-toolkit's 5%
+                    for (float& d : drop_rates) d = 0.05f;
+            }
+            // ai-toolkit's linear timesteps: torch.linspace(1000, 1, 1000)[randint(0, 999)], sigma = t / 1000
+            const strata::image::train::Schedule lin = strata::image::train::schedule_linear();
             std::printf("train: %zu samples method %s rank %d alpha %.1f steps %d lr %.1e seed %d accum %d dropout %.3g "
-                        "timesteps %s sigmamax %.3g\n",
+                        "timesteps %s sigmamax %.3g base %s mod %d\n",
                         stems.size(), method.c_str(), rank, (double) alpha, steps, (double) lr, seed, accum,
-                        (double) drop_rates[0], timesteps.c_str(), (double) sigma_max);
+                        (double) drop_rates[0], timesteps.c_str(), (double) sigma_max, base.c_str(), (int) mod);
             std::mt19937_64 rng(seed);
             std::normal_distribution<float> gauss(0.f, 1.f);
             std::uniform_real_distribution<float> drop_uni(0.f, 1.f);
-            strata::image::mf_trainer_init_adapters(m.get(), method == "dora" ? 1 : method == "lokr" ? 2 : 0, alpha, seed);
+            strata::image::mf_trainer_init_adapters(m.get(), method == "dora" ? 1 : method == "lokr" ? 2 : 0, alpha, seed,
+                                                    mod);
             strata::prefill::Gemm gemm;
             if (!gemm.init(s, 1 << 24, err)) throw std::runtime_error(err);
             // one sample's shapes set the device buffers; buckets differ, so re-read per step (cheap host work)
@@ -250,8 +293,15 @@ int main(int argc, char** argv) {
                     smp.te = smp.uncond;
                     smp.rows = smp.uncond_rows;
                 }
-                const float sig = timesteps == "shifted" ? sample_sigma(rng, -1.09f, 0.95f, 0.95f, 0.01f, sigma_max)
-                                                         : sample_sigma_logit_normal(rng);
+                // the step's latent drawn from the posterior (ai-toolkit samples latent_dist each step)
+                if (smp.lat_sd.size() == smp.lat.size())
+                    for (size_t i = 0; i < smp.lat.size(); ++i) smp.lat[i] += smp.lat_sd[i] * gauss(rng);
+                const float sig =
+                    timesteps == "linear"
+                        ? lin.t[(size_t) strata::image::train::draw_index(rng, strata::image::train::IndexDraw::balanced)] /
+                              1000.f
+                    : timesteps == "shifted" ? sample_sigma(rng, -1.09f, 0.95f, 0.95f, 0.01f, sigma_max)
+                                             : sample_sigma_logit_normal(rng);
                 std::vector<float> eps((size_t) smp.tokens * 128);
                 for (float& v : eps) v = gauss(rng);
                 strata::image::MfTrainCond c = strata::image::mf_trainer_cond(m.get(), sig, smp.h, smp.w, gemm);
@@ -259,7 +309,6 @@ int main(int argc, char** argv) {
                 const float loss = strata::image::mf_trainer_forward_keep(m.get(), smp, c, eps.data(), sig,
                                                                           stt, gemm);
                 if (!std::isfinite(loss)) {
-                    // the timestep embedder explodes past sigma ~0.955 (SPEC's shift-6 sampling reaches there):
                     // a NaN loss would poison AdamW, so the micro-step is dropped and recorded instead
                     std::fprintf(stderr, "skip micro %d stem %s sigma %.4f loss %f (non-finite, no update)\n",
                                  step, stems[order[(size_t) step % order.size()]].c_str(), (double) sig,
@@ -276,8 +325,8 @@ int main(int argc, char** argv) {
                 if (++acc_n < accum) continue;
                 acc_n = 0;
                 ++updates;
-                float lrw = lr * std::min(1.f, (float) updates / 50.f);   // 50-step warmup, then constant
-                strata::image::mf_trainer_adamw(m.get(), lrw, 0.9f, 0.999f, 1e-8f, 0.f, accum);
+                const float lrw = warmup > 0 ? lr * std::min(1.f, (float) updates / (float) warmup) : lr;
+                strata::image::mf_trainer_adamw(m.get(), lrw, 0.9f, 0.999f, adam_eps, wd, accum);
                 if (updates % 10 == 0 || updates == 1) {
                     std::printf("step %5d loss %.6f lr %.1e\n", updates, acc_loss / accum, (double) lrw);
                     std::fflush(stdout);
@@ -288,7 +337,7 @@ int main(int argc, char** argv) {
                                                    title, trigger, seed, lr, steps);
             }
             if (acc_n > 0) {   // the tail micro-steps' gradients, averaged over what ran
-                strata::image::mf_trainer_adamw(m.get(), lr, 0.9f, 0.999f, 1e-8f, 0.f, acc_n);
+                strata::image::mf_trainer_adamw(m.get(), lr, 0.9f, 0.999f, adam_eps, wd, acc_n);
                 ++updates;
             }
             eval_avg("final");

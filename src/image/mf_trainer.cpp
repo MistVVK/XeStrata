@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/image/mf_trainer.cpp - see include/strata/image/mf_trainer.hpp.
 #include "strata/image/mf_trainer.hpp"
+#include "strata/image/train_loop.hpp"
 
 #include "strata/core/gpu.hpp"
 #include "strata/image/safetensors.hpp"
@@ -127,7 +128,7 @@ void factorization(int64_t dim, int64_t& m, int64_t& n) {
 
 }  // namespace
 
-MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* stream, std::string& err) {
+MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* stream, std::string& err, bool int8) {
     std::unique_ptr<Model> m(new Model());
     m->stream = stream;
     try {
@@ -156,6 +157,15 @@ MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* s
         load_product(m.get(), st, data, "norm_out.linear", m->nout);
         load_product(m.get(), st, data, "proj_out", m->pout);
         load_vec(m.get(), st, "txt_norm.weight", m->txt_norm, m->txt_dim);
+        // MageTrail's shared low-rank modulation (bluvoll's mageflow-lowrank-modulation-v1): SiLU(temb) to `rank`
+        // values once a step, FP32 as the file keeps it
+        if (const SafeTensor* t = st.find("modulation_down.weight"); t != nullptr) {
+            if (t->dtype != "F32" || t->shape.size() != 2 || t->shape[1] != m->C)
+                throw std::runtime_error("image engine (Mage-Flow training): modulation_down is not F32 [rank][hidden]");
+            m->mrank = t->shape[0];
+            m->mdown_w = dev_dup(m.get(), st.f32("modulation_down.weight").data(), m->mrank * m->C);
+            m->mdown_b = dev_dup(m.get(), st.f32("modulation_down.bias").data(), m->mrank);
+        }
         for (int b = 0;; ++b) {
             const std::string p = "transformer_blocks." + std::to_string(b) + ".";
             if (st.find(p + "img_mod.1.weight") == nullptr) break;
@@ -164,8 +174,35 @@ MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* s
                 load_product(m.get(), st, data, p + kTarget[0][i], blk.prod[0][i]);
                 load_product(m.get(), st, data, p + kTarget[1][i], blk.prod[1][i]);
             }
-            load_product(m.get(), st, data, p + "img_mod.1", blk.mod[0]);
-            load_product(m.get(), st, data, p + "txt_mod.1", blk.mod[1]);
+            if (m->mrank > 0) {   // MageTrail's low-rank modulation: each block's FP32 [6 C][rank] from the shared values
+                for (int q = 0; q < 2; ++q) {
+                    const std::string n = p + (q == 0 ? "img_mod.1" : "txt_mod.1");
+                    const SafeTensor* t = st.find(n + ".weight");
+                    if (t == nullptr || t->dtype != "F32" || t->shape.size() != 2 || t->shape[1] != m->mrank)
+                        throw std::runtime_error("image engine (Mage-Flow training): " + n + " is not F32 [6 hidden][rank]");
+                    blk.mod[q].N = t->shape[0];
+                    blk.mod[q].K = m->mrank;
+                    blk.modlow[q] = dev_dup(m.get(), st.f32(n + ".weight").data(), blk.mod[q].N * m->mrank);
+                    blk.mod[q].b = dev_dup(m.get(), st.f32(n + ".bias").data(), blk.mod[q].N);
+                }
+            }
+            if (int8)   // the int8 base from the 16-bit rows, which go
+                for (int q = 0; q < 2; ++q)
+                    for (int i = 0; i < 6; ++i) {
+                        MfTrainProduct& pr = blk.prod[q][i];
+                        pr.w8 = m->owned.get<int8_t>(pr.N * pr.K, stream);
+                        pr.sw = m->owned.get<float>(pr.N, stream);
+                        train::w8_quantize(pr.w, pr.N, pr.K, pr.w8, pr.sw, stream);
+                        gpu::stream_sync(stream);
+                        auto& v = m->owned.p;
+                        v.erase(std::remove(v.begin(), v.end(), (void*) pr.w), v.end());
+                        gpu::free(pr.w);
+                        pr.w = nullptr;
+                    }
+            if (m->mrank == 0) {
+                load_product(m.get(), st, data, p + "img_mod.1", blk.mod[0]);
+                load_product(m.get(), st, data, p + "txt_mod.1", blk.mod[1]);
+            }
             load_vec(m.get(), st, p + "attn.norm_q.weight", blk.nq[0], m->hd);
             load_vec(m.get(), st, p + "attn.norm_k.weight", blk.nk[0], m->hd);
             load_vec(m.get(), st, p + "attn.norm_added_q.weight", blk.nq[1], m->hd);
@@ -235,6 +272,7 @@ MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* s
                     total += m->blk[0].prod[q][i].K * m->blk[0].prod[q][i].N;
                 }
             m->wtScratch = m->owned.get<uint16_t>(total, m->stream);
+            if (int8) m->w8tmp = m->owned.get<uint16_t>(m->F * m->C, m->stream);
         }
         // the modulations' linears stay on the host: one row a step, read once
         (void) data;
@@ -279,6 +317,7 @@ MfTrainSample mf_trainer_sample(const std::string& dir, const std::string& stem,
         return v;
     };
     s.lat = read(stem + "_lat");
+    if (std::filesystem::exists(dir + "/" + stem + "_lat_sd.bin")) s.lat_sd = read(stem + "_lat_sd");
     s.te = read(stem + "_te");
     s.uncond = read(stem + "_uncond");
     // the dump lists its shape fastest dim first: [128][tokens] and [txt_dim][rows]
@@ -337,6 +376,14 @@ void rope_tables_host(int64_t h, int64_t w, int64_t hd, const std::vector<int64_
 
 }  // namespace
 
+namespace {
+void mod_lora_fwd(const float* A, const float* B, const float* x, float scale, int64_t rank, int64_t N, int64_t K,
+                  float* y, float* h, void* s);
+void mod_lora_bwd(const float* A, const float* B, const float* x, const float* dy, float scale, int64_t rank,
+                  int64_t N, int64_t K, float* dA, float* dB, float* h, float* g, void* s);
+void row_down(const float* A, const float* x, int64_t rank, int64_t K, float* h, void* s);
+}  // namespace
+
 MfTrainCond mf_trainer_cond(MfTrainModel* base, float sigma, int64_t h, int64_t w, prefill::Gemm& gemm) {
     Model* m = static_cast<Model*>(base);
     void* s = m->stream;
@@ -364,14 +411,37 @@ MfTrainCond mf_trainer_cond(MfTrainModel* base, float sigma, int64_t h, int64_t 
     gemm.f16(tsil16, m->t2.w, temb, 1, C, C);
     dit_rows::rows_back(temb, nullptr, m->t2.b, 1, C, s);
     qi_silu(temb, C, tsil16, s);   // the inference's own (mf_dit.cpp's set_time)
-    // the modulations and the norm_out pair read tsil's FP16 rows, unscaled (rows_back with no rs)
+    // the modulations and the norm_out pair read tsil's FP16 rows, unscaled (rows_back with no rs); the
+    // modulations' LoRA reads the same values, kept in FP32 for its gradient
+    c.tsil = m->owned.get<float>(C, s);
+    {
+        float* ts = c.tsil;
+        const uint16_t* t16 = tsil16;
+        dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) C),
+                                       [=](sycl::id<1> id) { ts[id[0]] = kernels::f32_from_f16(t16[id[0]]); });
+    }
+    const int64_t mrank = m->blk.empty() || m->blk[0].adap == nullptr ? 1 : m->blk[0].adap->rank;
+    float* hr = tmp.get<float>(mrank, s);
+    // MageTrail's: the shared low-rank values from SiLU(temb) in FP32 (qi_silu left it in temb), as the engine's
+    // f32_vec reads them
+    float* mlow = nullptr;
+    if (m->mrank > 0) {
+        mlow = tmp.get<float>(m->mrank, s);
+        row_down(m->mdown_w, temb, m->mrank, C, mlow, s);
+        dit_rows::rows_back(mlow, nullptr, m->mdown_b, 1, m->mrank, s);
+    }
     c.mod.resize((size_t) m->nblk * 2);
     for (int64_t b = 0; b < m->nblk; ++b) {
         for (int st = 0; st < 2; ++st) {
             float* mod = m->owned.get<float>(6 * C, s);
             const MfTrainProduct& mp = m->blk[(size_t) b].mod[st];
-            gemm.f16(tsil16, mp.w, mod, 1, 6 * C, C);
+            if (m->mrank > 0) row_down(m->blk[(size_t) b].modlow[st], mlow, 6 * C, m->mrank, mod, s);
+            else gemm.f16(tsil16, mp.w, mod, 1, 6 * C, C);
             dit_rows::rows_back(mod, nullptr, mp.b, 1, 6 * C, s);
+            const MfTrainAdapter* az = m->blk[(size_t) b].adap;
+            if (az != nullptr && az->modA[st] != nullptr)
+                mod_lora_fwd(az->modA[st], az->modB[st], c.tsil, az->alpha / (float) az->rank, az->rank, 6 * C, C,
+                             mod, hr, s);
             c.mod[(size_t) b * 2 + st] = mod;
         }
     }
@@ -397,6 +467,7 @@ void mf_trainer_free_cond(MfTrainModel* base, MfTrainCond& c) {
     drop(c.temb);
     for (float* q : c.mod) drop(q);
     drop(c.nmod);
+    drop(c.tsil);
     drop(c.cos);
     drop(c.sin);
     c = MfTrainCond();
@@ -483,7 +554,9 @@ static float forward_impl(Model* m, const MfTrainSample& s, const MfTrainCond& c
         for (int q = 0; q < 2; ++q)
             for (int i = 0; i < 6; ++i) {
                 const MfTrainProduct& pr = blk.prod[q][i];
-                train::transpose_f16(pr.w, pr.N, pr.K, m->wtScratch + m->wtOff[q][i], st);
+                if (pr.w8 != nullptr)   // the straight-through weight: the int8 values rotated back
+                    train::w8_dequant_t(pr.w8, pr.sw, pr.N, pr.K, m->w8tmp, m->wtScratch + m->wtOff[q][i], st);
+                else train::transpose_f16(pr.w, pr.N, pr.K, m->wtScratch + m->wtOff[q][i], st);
             }
         MfBlockRun run;
         run.C = C;
@@ -511,6 +584,8 @@ static float forward_impl(Model* m, const MfTrainSample& s, const MfTrainCond& c
                 w->N[i] = pr.N;
                 w->K[i] = pr.K;
                 w->w[i] = pr.w;
+                w->w8[i] = pr.w8;
+                w->sw[i] = pr.sw;
                 w->wt[i] = m->wtScratch + m->wtOff[q][i];
                 w->b[i] = pr.b;
                 w->ad[i] = (blk.adap != nullptr) ? &blk.adap->ad[q][i] : nullptr;
@@ -631,7 +706,7 @@ void rownorm_f16(const uint16_t* w, int64_t N, int64_t K, float* norms, void* s)
 
 }  // namespace
 
-void mf_trainer_init_adapters(MfTrainModel* base, int method, float alpha, uint64_t seed) {
+void mf_trainer_init_adapters(MfTrainModel* base, int method, float alpha, uint64_t seed, bool mod_targets) {
     Model* m = static_cast<Model*>(base);
     void* s = m->stream;
     std::mt19937_64 rng(seed);
@@ -668,7 +743,8 @@ void mf_trainer_init_adapters(MfTrainModel* base, int method, float alpha, uint6
                     // W2B stays zero (Owned zeroes)
                     continue;
                 }
-                rownorm_f16(blk.prod[st][i].w, N, K, az.norms, s);
+                if (blk.prod[st][i].w != nullptr)   // (an int8 base takes no DoRA: the trainer refuses the pair)
+                    rownorm_f16(blk.prod[st][i].w, N, K, az.norms, s);
                 // A kaiming-uniform (bound 1/sqrt(fan_in), the common LoRA init), B = 0 (the delta starts at nothing),
                 // m = norms (c starts at one).  A drawn N(0, 1/sqrt(rank)) instead is about 24 times larger at
                 // Mage-Flow's K of 3072: B's every step moves the delta that much more, and the run diverged at lr 1e-4
@@ -685,6 +761,25 @@ void mf_trainer_init_adapters(MfTrainModel* base, int method, float alpha, uint6
                 kernels::f32_to_f16_bulk(tz.A[st][i], az.a, rk * K, s);
                 train::transpose_f16(az.a, rk, K, az.at, s);
                 // B stays zero (Owned zeroes); its views stay zero with it
+            }
+        if (mod_targets && m->mrank == 0)   // the modulations' plain LoRA: A kaiming-uniform, B zero, as above
+                                            // (MageTrail's low-rank form takes none: the engine adds none to it)
+            for (int st = 0; st < 2; ++st) {
+                const int64_t C = m->C, rk = tz.rank;
+                tz.modA[st] = m->owned.get<float>(rk * C, s);
+                tz.modB[st] = m->owned.get<float>(6 * C * rk, s);
+                tz.dmodA[st] = m->owned.get<float>(rk * C, s);
+                tz.dmodB[st] = m->owned.get<float>(6 * C * rk, s);
+                tz.mmodA[st] = m->owned.get<float>(rk * C, s);
+                tz.vmodA[st] = m->owned.get<float>(rk * C, s);
+                tz.mmodB[st] = m->owned.get<float>(6 * C * rk, s);
+                tz.vmodB[st] = m->owned.get<float>(6 * C * rk, s);
+                const float ba = 1.f / std::sqrt((float) C);
+                std::vector<float> ha((size_t) (rk * C));
+                for (float& v : ha) v = uni(rng) * ba;
+                gpu::stream_sync(s);
+                if (!gpu::copy(tz.modA[st], ha.data(), ha.size() * 4))
+                    throw std::runtime_error("image engine (Mage-Flow training): copy");
             }
     }
     gpu::stream_sync(s);
@@ -744,6 +839,11 @@ float grad_clip_scale(Model* m, float gscale, double* norm_out) {
                     refs.push_back({az->ad[q][i].dW2b, rk * inn});
                 }
             }
+        for (int q = 0; q < 2; ++q)
+            if (az->dmodA[q] != nullptr) {
+                refs.push_back({az->dmodA[q], az->rank * m->C});
+                refs.push_back({az->dmodB[q], 6 * m->C * az->rank});
+            }
     }
     int64_t mx = 0;
     for (auto& r : refs) mx = std::max(mx, r.n);
@@ -762,6 +862,54 @@ float grad_clip_scale(Model* m, float gscale, double* norm_out) {
     const double norm = std::sqrt(total);
     if (norm_out != nullptr) *norm_out = norm;
     return (float) (norm > 1.0 ? 1.0 / norm : 1.0);
+}
+
+// h = A x for a one-row input (A [rank][K]): a work-group a rank
+void row_down(const float* A, const float* x, int64_t rank, int64_t K, float* h, void* s) {
+    constexpr int64_t WG = 256;
+    dit_rows::q_of(s).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) rank * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
+            const int64_t r = static_cast<int64_t>(it.get_group_linear_id());
+            float acc = 0.f;
+            for (auto k = static_cast<int64_t>(it.get_local_linear_id()); k < K; k += WG) acc += A[r * K + k] * x[k];
+            acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+            if (it.get_local_linear_id() == 0) h[r] = acc;
+        });
+}
+
+// a modulation linear's LoRA on its one row: y += scale B (A x), h the rank's scratch
+void mod_lora_fwd(const float* A, const float* B, const float* x, float scale, int64_t rank, int64_t N, int64_t K,
+                  float* y, float* h, void* s) {
+    row_down(A, x, rank, K, h, s);
+    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) N), [=](sycl::id<1> id) {
+        const int64_t n = static_cast<int64_t>(id[0]);
+        float acc = 0.f;
+        for (int64_t r = 0; r < rank; ++r) acc += B[n * rank + r] * h[r];
+        y[n] += scale * acc;
+    });
+}
+
+// its gradients from the modulation's dy: dB += scale dy h^T, dA += (scale B^T dy) x^T (h and g the rank's scratch)
+void mod_lora_bwd(const float* A, const float* B, const float* x, const float* dy, float scale, int64_t rank,
+                  int64_t N, int64_t K, float* dA, float* dB, float* h, float* g, void* s) {
+    constexpr int64_t WG = 256;
+    row_down(A, x, rank, K, h, s);
+    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) (N * rank)), [=](sycl::id<1> id) {
+        const int64_t i = static_cast<int64_t>(id[0]), n = i / rank, r = i - n * rank;
+        dB[i] += scale * dy[n] * h[r];
+    });
+    dit_rows::q_of(s).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) rank * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
+            const int64_t r = static_cast<int64_t>(it.get_group_linear_id());
+            float acc = 0.f;
+            for (auto n = static_cast<int64_t>(it.get_local_linear_id()); n < N; n += WG) acc += B[n * rank + r] * dy[n];
+            acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+            if (it.get_local_linear_id() == 0) g[r] = scale * acc;
+        });
+    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) (rank * K)), [=](sycl::id<1> id) {
+        const int64_t i = static_cast<int64_t>(id[0]), r = i / K, k = i - r * K;
+        dA[i] += g[r] * x[k];
+    });
 }
 
 // one AdamW step over the adapter's tensors (FP32 masters and states): g averaged over accum_n, then zeroed
@@ -812,12 +960,20 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
     float* dnxt_i = tmp.get<float>(R * C, st);
     float* dcur_t = tmp.get<float>(Rt * C, st);
     float* dnxt_t = tmp.get<float>(Rt * C, st);
+    // the modulations' gradients a block (their LoRA's), and its rank scratch
+    const MfTrainAdapter* az0 = m->blk.empty() ? nullptr : m->blk[0].adap;
+    const bool mod_on = az0 != nullptr && az0->modA[0] != nullptr;
+    float* dmod[2] = {mod_on ? tmp.get<float>(6 * C, st) : nullptr, mod_on ? tmp.get<float>(6 * C, st) : nullptr};
+    float* mh = mod_on ? tmp.get<float>(az0->rank, st) : nullptr;
+    float* mg = mod_on ? tmp.get<float>(az0->rank, st) : nullptr;
     for (int64_t b = m->nblk - 1; b >= 0; --b) {
         const MfTrainModel::Block& blk = m->blk[(size_t) b];
         for (int q = 0; q < 2; ++q)
             for (int i = 0; i < 6; ++i) {
                 const MfTrainProduct& pr = blk.prod[q][i];
-                train::transpose_f16(pr.w, pr.N, pr.K, m->wtScratch + m->wtOff[q][i], st);
+                if (pr.w8 != nullptr)   // the straight-through weight: the int8 values rotated back
+                    train::w8_dequant_t(pr.w8, pr.sw, pr.N, pr.K, m->w8tmp, m->wtScratch + m->wtOff[q][i], st);
+                else train::transpose_f16(pr.w, pr.N, pr.K, m->wtScratch + m->wtOff[q][i], st);
             }
         MfBlockRun run;
         run.C = C;
@@ -848,6 +1004,8 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
                 w->N[i] = pr.N;
                 w->K[i] = pr.K;
                 w->w[i] = pr.w;
+                w->w8[i] = pr.w8;
+                w->sw[i] = pr.sw;
                 w->wt[i] = m->wtScratch + m->wtOff[q][i];
                 w->b[i] = pr.b;
                 w->ad[i] = (blk.adap != nullptr) ? &blk.adap->ad[q][i] : nullptr;
@@ -857,6 +1015,9 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
             w->mod = c.mod[(size_t) b * 2 + q];
             w->dnq = nullptr;
             w->dnk = nullptr;
+            w->dmod = (blk.adap != nullptr && blk.adap->modA[q] != nullptr) ? dmod[q] : nullptr;
+            if (w->dmod != nullptr && !gpu::memset_async(w->dmod, 0, (size_t) (6 * C) * 4, st))
+                throw std::runtime_error("image engine (Mage-Flow training): zero");
             for (int i = 0; i < 6; ++i) {
                 w->dw[i] = nullptr;
                 w->db[i] = nullptr;
@@ -868,6 +1029,13 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
             !gpu::memset_async(dnxt_t, 0, (size_t) (Rt * C) * 4, st))
             throw std::runtime_error("image engine (Mage-Flow training): zero");
         mf_block(run, gemm, st);
+        for (int q = 0; q < 2; ++q) {
+            const MfBlockW& bw = q == 0 ? run.img_w : run.txt_w;
+            if (bw.dmod == nullptr) continue;
+            const MfTrainAdapter* az = blk.adap;
+            mod_lora_bwd(az->modA[q], az->modB[q], c.tsil, bw.dmod, az->alpha / (float) az->rank, az->rank, 6 * C, C,
+                         az->dmodA[q], az->dmodB[q], mh, mg, st);
+        }
         std::swap(dcur_i, dnxt_i);
         std::swap(dcur_t, dnxt_t);
     }
@@ -923,6 +1091,14 @@ void mf_trainer_adamw(MfTrainModel* base, float lr, float beta1, float beta2, fl
                 kernels::f32_to_f16_bulk(az->B[q][i], az->ad[q][i].b, N * rk, s);
                 train::transpose_f16(az->ad[q][i].b, N, rk, az->ad[q][i].bt, s);
             }
+        for (int q = 0; q < 2; ++q)
+            if (az->modA[q] != nullptr) {
+                const int64_t rk = az->rank, C = m->C;
+                adamw_step(az->modA[q], az->dmodA[q], az->mmodA[q], az->vmodA[q], rk * C, lr, beta1, beta2, eps, wd,
+                           bc1, bc2, gscale_eff, s);
+                adamw_step(az->modB[q], az->dmodB[q], az->mmodB[q], az->vmodB[q], 6 * C * rk, lr, beta1, beta2, eps,
+                           wd, bc1, bc2, gscale_eff, s);
+            }
     }
     gpu::stream_sync(s);
 }
@@ -931,28 +1107,27 @@ void mf_trainer_save(MfTrainModel* base, const std::string& path, const std::str
                      const std::string& trigger, uint64_t seed, float lr, int64_t max_steps) {
     Model* m = static_cast<Model*>(base);
     void* s = m->stream;
-    struct Entry {
-        std::string key, dtype;
-        std::vector<int64_t> shape;   // outer dim first
-        std::vector<char> raw;
-    };
-    std::vector<Entry> es;
+    gpu::stream_sync(s);
+    std::vector<train::Tensor> ts;
     auto blob = [&](const std::string& key, const float* dev, const std::vector<int64_t>& shape) {
-        Entry e;
-        e.key = key;
-        e.dtype = "F32";
-        e.shape = shape;
+        train::Tensor t;
+        t.key = key;
+        t.shape = shape;
         int64_t n = 1;
         for (int64_t d : shape) n *= d;
-        e.raw.resize((size_t) n * 4);
-        gpu::stream_sync(s);
-        if (!gpu::copy(e.raw.data(), dev, (size_t) n * 4))
+        t.v.resize((size_t) n);
+        if (!gpu::copy(t.v.data(), dev, (size_t) n * 4))
             throw std::runtime_error("image engine (Mage-Flow training): save readback");
-        es.push_back(std::move(e));
+        ts.push_back(std::move(t));
     };
+    std::string module = "networks.lora";
+    int64_t rank = 0;
+    float alpha = 0.f;
     for (int64_t b = 0; b < m->nblk; ++b) {
         MfTrainAdapter* az = m->blk[(size_t) b].adap;
         if (az == nullptr) continue;
+        rank = az->rank;
+        alpha = az->alpha;
         for (int st = 0; st < 2; ++st)
             for (int i = 0; i < 6; ++i) {
                 const int64_t N = m->blk[(size_t) b].prod[st][i].N, K = m->blk[(size_t) b].prod[st][i].K;
@@ -960,68 +1135,42 @@ void mf_trainer_save(MfTrainModel* base, const std::string& path, const std::str
                 const std::string t =
                     "diffusion_model.transformer_blocks." + std::to_string(b) + "." + kTarget[st][i];
                 const train::Adapter& ad = az->ad[st][i];
+                // the per-weight alpha (0-dimensional): ai-toolkit's files leave it out at alpha = rank, LyCORIS's
+                // carry it, and the engine reads it where it is
+                ts.push_back(train::Tensor{t + ".alpha", {}, {az->alpha}});
                 if (ad.method == train::AdapterMethod::lokr) {
+                    module = "networks.lokr";
                     blob(t + ".lokr_w1", az->W1[st][i], {ad.ol, ad.im});
                     blob(t + ".lokr_w2_a", az->W2A[st][i], {ad.ok, rk});
                     blob(t + ".lokr_w2_b", az->W2B[st][i], {rk, ad.inn});
-                    Entry e;
-                    e.key = t + ".alpha";
-                    e.dtype = "F32";
-                    e.shape = {};
-                    e.raw.resize(4);
-                    std::memcpy(e.raw.data(), &az->alpha, 4);
-                    es.push_back(std::move(e));
                     continue;
                 }
                 blob(t + ".lora_A.weight", az->A[st][i], {rk, K});
                 blob(t + ".lora_B.weight", az->B[st][i], {N, rk});
-                {   // the per-weight .alpha tensor (one value, 0-dimensional)
-                    Entry e;
-                    e.key = t + ".alpha";
-                    e.dtype = "F32";
-                    e.shape = {};
-                    e.raw.resize(4);
-                    std::memcpy(e.raw.data(), &az->alpha, 4);
-                    es.push_back(std::move(e));
-                }
                 if (ad.method == train::AdapterMethod::dora) blob(t + ".dora_scale", az->M[st][i], {N});
             }
+        for (int st = 0; st < 2; ++st)
+            if (az->modA[st] != nullptr) {
+                const std::string t = "diffusion_model.transformer_blocks." + std::to_string(b) +
+                                      (st == 0 ? ".img_mod.1" : ".txt_mod.1");
+                ts.push_back(train::Tensor{t + ".alpha", {}, {az->alpha}});
+                blob(t + ".lora_A.weight", az->modA[st], {az->rank, m->C});
+                blob(t + ".lora_B.weight", az->modB[st], {6 * m->C, az->rank});
+            }
     }
-    std::sort(es.begin(), es.end(), [](const Entry& a, const Entry& b) { return a.key < b.key; });
-    std::ostringstream head;
-    head << "{\"__metadata__\":{";
-    head << "\"modelspec.title\":\"" << title << "\",";
-    head << "\"modelspec.trigger_phrase\":\"" << trigger << "\",";
-    std::string module = "networks.lora";
-    for (auto& e : es)
-        if (e.key.find(".lokr_") != std::string::npos) module = "networks.lokr";
-    head << "\"ss_network_module\":\"" << module << "\",";
-    head << "\"ss_network_dim\":\"" << m->blk[0].adap->rank << "\",";
-    head << "\"ss_network_alpha\":\"" << m->blk[0].adap->alpha << "\",";
-    head << "\"ss_seed\":\"" << seed << "\",";
-    head << "\"ss_learning_rate\":\"" << lr << "\",";
-    head << "\"ss_optimizer_type\":\"AdamW\",";
-    head << "\"ss_max_steps\":\"" << max_steps << "\",";
-    head << "\"ss_model\":\"mage-flow\",";
-    head << "\"ss_xestrata_revision\":\"card-5\"";
-    head << "}";
-    int64_t off = 0;
-    for (auto& e : es) {
-        head << ",\"" << e.key << "\":{\"dtype\":\"" << e.dtype << "\",\"shape\":[";
-        for (size_t i = 0; i < e.shape.size(); ++i) head << (i ? "," : "") << e.shape[i];
-        head << "],\"data_offsets\":[" << off << "," << (off + (int64_t) e.raw.size()) << "]}";
-        off += (int64_t) e.raw.size();
-    }
-    head << "}";
-    const std::string hs = head.str();
-    std::ofstream f(path, std::ios::binary);
-    if (!f) throw std::runtime_error("image engine (Mage-Flow training): cannot write " + path);
-    const uint64_t n = hs.size();
-    f.write(reinterpret_cast<const char*>(&n), 8);
-    f.write(hs.data(), (std::streamsize) hs.size());
-    for (auto& e : es) f.write(e.raw.data(), (std::streamsize) e.raw.size());
-    f.close();
-    if (!f) throw std::runtime_error("image engine (Mage-Flow training): short write " + path);
+    // ai-toolkit's metadata (get_meta_for_safetensors: the job's name and version, the software, format pt) and
+    // what the run was, as the Qwen-Image-2.1 trainer writes them
+    const std::string name = path.substr(path.find_last_of('/') + 1);
+    std::ostringstream lrs;
+    lrs << lr;
+    train::save_safetensors_bf16(path, std::move(ts),
+                                 {{"name", title.empty() ? name : title}, {"version", "1.0"},
+                                  {"software", "{\"name\": \"XeStrata\"}"}, {"format", "pt"},
+                                  {"ss_network_module", module}, {"ss_network_dim", std::to_string(rank)},
+                                  {"ss_network_alpha", std::to_string((int64_t) alpha)},
+                                  {"ss_base_model", m->mrank > 0 ? "magetrail" : "mage-flow"}, {"ss_max_steps", std::to_string(max_steps)},
+                                  {"ss_seed", std::to_string(seed)}, {"ss_learning_rate", lrs.str()},
+                                  {"modelspec.trigger_phrase", trigger}});
 }
 
 }  // namespace strata::image

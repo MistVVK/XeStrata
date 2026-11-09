@@ -6,22 +6,25 @@ text-embedding disk caches").  The values themselves come from xestrata-image-mf
 reader on the inference's own states path); this file owns the dataset walk, the sizes and the cache shape.
 
     PY=... python tools/image/mf_pre.py --dir DIR --vae VAE.safetensors --text TEXT.gguf \
-        [--pre build/free/xestrata-image-mf-pre] [--toml set.toml] [--budget 1024] [--step 32] [--scratch DIR]
+        [--pre build/free/xestrata-image-mf-pre] [--toml set.toml] [--budget 512,768,1024] [--step 16] [--scratch DIR]
     PY=... python tools/image/mf_pre.py --check --dir DIR     # the caches beside the images: shape, keys, types
     PY=... python tools/image/mf_pre.py --golden GOLDEN_DIR --vae ... --text ...   # both paths against a golden run
 
 `--dir` walks every image the engine's own reader can open (the v1 data mixes .jpg and .png, so nothing is fixed to
 one extension); one image, one caption, read from `NN.txt` as it stands (SPEC "The caption policy").  A size goes:
 
-    budget 1024 x 1024 pixels, step 32
+    budgets 512, 768 and 1024 pixels a side (ai-toolkit's Mage-Flow resolutions), step 16; for each budget
     never enlarge - scale to the budget on the image's own ratio, floor both sides to the step,
     cover that on the same ratio and take the centre  ->  bucket, its cover size, and the crop's
     left,top,right,bottom
 
-and the cropped pixels go to the VAE.  One `.npz` per cache, beside the image, in sd-scripts' shape:
+and the cropped pixels go to the VAE, a latent a bucket (a small image's same bucket once).  One `.npz` per cache,
+beside the image, in sd-scripts' shape:
 
-    <base>_<W>x<H>_mf.npz   latents F32 [128][h][w] (the VAE's raw output), original_size I32 [2] (W,H),
-                            crop_ltrb I32 [4] (L,T,R,B of the kept part in the cover frame)
+    <base>_<W>x<H>_mf.npz   latents F32 [128][h][w] (the posterior's mean), latents_sd F32 [128][h][w] (its
+                            standard deviation: a step draws from them, as ai-toolkit samples latent_dist),
+                            original_size I32 [2] (W,H), crop_ltrb I32 [4] (L,T,R,B of the kept part in the cover
+                            frame)
     <base>_mf_te.npz        prompt_embeds U16 [L][C] (bf16 bits), attn_mask I32 [L], uncond_embeds / uncond_mask
                             (the empty prompt, always written), caption_dropout_rate F32 scalar
 
@@ -145,29 +148,40 @@ def run_pre(args, op: str, model: str, work: Path) -> None:
 
 def cache_one(args, tok, uncond: np.ndarray, img: Path, work: Path) -> tuple[str, int, int]:
     # one image's scratch: the pix dump is about 12 MB, the latent 2 MB (a tmpfs fills up with 48 of them)
-    """One image and its caption to the two caches; returns (bucket tag, latent values, embed rows)."""
+    """One image and its caption to the caches: a latent a budget's bucket (the same bucket once), the text once;
+    returns (bucket tags, latent values, embed rows)."""
     with Image.open(img) as im:
         ow, oh = im.size
-    bw, bh, cw, ch, left, t, r, b = bucket(ow, oh, args.budget, args.step)
     work.mkdir(parents=True, exist_ok=True)
-    for f in work.iterdir():
-        f.unlink()
-    dump(work, "pix", vae_input(img, bw, bh, (cw, ch), (left, t, r, b)))
-    run_pre(args, "vae", args.vae, work)
-    lat = undump(work, "latent", np.float32)
+    tags: list[str] = []
+    n = 0
+    for budget in args.budgets:
+        bw, bh, cw, ch, left, t, r, b = bucket(ow, oh, budget, args.step)
+        tag = f"{bw:04d}x{bh:04d}"
+        if tag in tags:
+            continue
+        for f in work.iterdir():
+            f.unlink()
+        dump(work, "pix", vae_input(img, bw, bh, (cw, ch), (left, t, r, b)))
+        run_pre(args, "vae", args.vae, work)
+        lat = undump(work, "latent", np.float32)
+        # the posterior's standard deviation beside the mean: a training step draws its latent from them
+        sd = {"latents_sd": undump(work, "latent_sd", np.float32)} if (work / "latent_sd.json").is_file() else {}
+        np.savez(img.parent / f"{img.stem}_{tag}{LATENT_TAG}", latents=lat, original_size=np.array([ow, oh], np.int32),
+                 crop_ltrb=np.array([left, t, r, b], np.int32), **sd)
+        tags.append(tag)
+        n += int(lat.size)
     ids = np.array(prompt_ids(tok, (img.parent / (img.stem + ".txt")).read_text().strip(), 0, "mage-flow"), np.int32)
     dump(work, "prompt_ids", ids)
     dump(work, "uncond_ids", uncond)
     run_pre(args, "text", args.text, work)
     emb = undump(work, "prompt_embeds", np.uint16)
     uemb = undump(work, "uncond_embeds", np.uint16)
-    np.savez(img.parent / f"{img.stem}_{bw:04d}x{bh:04d}{LATENT_TAG}",
-             latents=lat, original_size=np.array([ow, oh], np.int32), crop_ltrb=np.array([left, t, r, b], np.int32))
     np.savez(img.parent / f"{img.stem}{TEXT_TAG}",
              prompt_embeds=emb, attn_mask=np.ones(emb.shape[0], np.int32),
              uncond_embeds=uemb, uncond_mask=np.ones(uemb.shape[0], np.int32),
              caption_dropout_rate=np.array(args.dropout, np.float32))
-    return f"{bw:04d}x{bh:04d}", int(lat.size), int(emb.shape[0])
+    return " ".join(tags), n, int(emb.shape[0])
 
 
 def bf16_bits(a: np.ndarray) -> np.ndarray:
@@ -255,8 +269,11 @@ def golden(args, work: Path, g: Path) -> int:
     return 1 if bad else 0
 
 
-def check_dir(d: Path, budget: int, step: int) -> int:
-    """The caches beside the images: names, keys, types, and that the size and the crop recompute the same bucket."""
+def check_dir(d: Path, budgets: int | list[int], step: int) -> int:
+    """The caches beside the images: names, keys, types, and that the size and the crop recompute the same buckets
+    (one a budget, the same bucket once)."""
+    if isinstance(budgets, int):
+        budgets = [budgets]
     bad = 0
     seen: dict[str, int] = {}
     for img in sorted(p for p in d.iterdir() if p.suffix.lower() in IMG_EXT):
@@ -264,9 +281,15 @@ def check_dir(d: Path, budget: int, step: int) -> int:
         lat = [p for p in sorted(d.glob(f"{stem}_*{LATENT_TAG}"))]
         txt = d / f"{stem}{TEXT_TAG}"
         cap = d / f"{stem}.txt"
+        with Image.open(img) as im:
+            ow, oh = im.size
+        want: dict[str, tuple[int, ...]] = {}
+        for budget in budgets:
+            bk = bucket(ow, oh, budget, step)
+            want.setdefault(f"{bk[0]:04d}x{bk[1]:04d}", bk)
         why = []
-        if len(lat) != 1:
-            why.append(f"{len(lat)} latent caches")
+        if sorted(p.name[len(stem) + 1:-len(LATENT_TAG)] for p in lat) != sorted(want):
+            why.append(f"{len(lat)} latent caches, {len(want)} buckets")
         if not txt.is_file():
             why.append("no text cache")
         if not cap.is_file():
@@ -275,28 +298,28 @@ def check_dir(d: Path, budget: int, step: int) -> int:
             bad += 1
             print(f"FAIL {img.name}: " + ", ".join(why))
             continue
-        tag = lat[0].name[len(stem) + 1:-len(LATENT_TAG)]
-        with Image.open(img) as im:
-            ow, oh = im.size
-        z = np.load(lat[0])
-        a, orig, crop = z["latents"], z["original_size"], z["crop_ltrb"]
-        bw, bh = (int(x) for x in tag.split("x"))
-        wb, hb, wc, hc, left, t, r, b = bucket(ow, oh, budget, step)
         y = np.load(txt)
-        ok = (tag == f"{wb:04d}x{hb:04d}" and str(a.dtype) == "float32" and a.ndim == 3
-              and a.shape[1:] == (hb // 16, wb // 16) and list(orig) == [ow, oh]
-              and list(crop) == [left, t, r, b]
-              and int(crop[2] - crop[0]) == wb and int(crop[3] - crop[1]) == hb
-              and str(y["prompt_embeds"].dtype) == "uint16" and y["prompt_embeds"].ndim == 2
+        ok = True
+        for lf in lat:
+            tag = lf.name[len(stem) + 1:-len(LATENT_TAG)]
+            z = np.load(lf)
+            a, orig, crop = z["latents"], z["original_size"], z["crop_ltrb"]
+            wb, hb, wc, hc, left, t, r, b = want[tag]
+            sd_ok = "latents_sd" not in z or (z["latents_sd"].shape == a.shape and str(z["latents_sd"].dtype) == "float32")
+            ok = ok and (str(a.dtype) == "float32" and a.ndim == 3 and sd_ok
+                         and a.shape[1:] == (hb // 16, wb // 16) and list(orig) == [ow, oh]
+                         and list(crop) == [left, t, r, b]
+                         and int(crop[2] - crop[0]) == wb and int(crop[3] - crop[1]) == hb)
+            seen[tag] = seen.get(tag, 0) + 1
+        ok = (ok and str(y["prompt_embeds"].dtype) == "uint16" and y["prompt_embeds"].ndim == 2
               and str(y["attn_mask"].dtype) == "int32" and len(y["attn_mask"]) == y["prompt_embeds"].shape[0]
               and str(y["uncond_embeds"].dtype) == "uint16" and y["uncond_embeds"].ndim == 2
               and len(y["uncond_mask"]) == y["uncond_embeds"].shape[0]
               and str(y["caption_dropout_rate"].dtype) == "float32")
-        seen[tag] = seen.get(tag, 0) + 1
         bad += 0 if ok else 1
-        print(f"{'ok  ' if ok else 'FAIL'} {img.name} {ow}x{oh} -> {tag} latent {a.shape} "
+        print(f"{'ok  ' if ok else 'FAIL'} {img.name} {ow}x{oh} -> {' '.join(sorted(want))} latent {a.shape} "
               f"embeds {y['prompt_embeds'].shape} uncond {y['uncond_embeds'].shape}")
-    print(f"mf_pre: {sum(seen.values())} image(s) in {len(seen)} bucket(s), {bad} failure(s)")
+    print(f"mf_pre: {sum(seen.values())} latent(s) in {len(seen)} bucket(s), {bad} failure(s)")
     for tag, n in sorted(seen.items()):
         print(f"   {tag}: {n}")
     return 1 if bad else 0
@@ -444,8 +467,10 @@ def main() -> int:
     ap.add_argument("--vae", help="Mage-VAE's safetensors")
     ap.add_argument("--text", help="the text encoder's GGUF (Qwen3-VL-4B)")
     ap.add_argument("--pre", default="build/free/xestrata-image-mf-pre")
-    ap.add_argument("--budget", type=int, default=1024, help="the pixel budget's side (SPEC: 1024)")
-    ap.add_argument("--step", type=int, default=32, help="the bucket step (SPEC: 32)")
+    ap.add_argument("--budget", default="512,768,1024",
+                    help="the pixel budgets' sides, comma separated: a latent a budget's bucket (ai-toolkit's "
+                         "Mage-Flow resolutions 512, 768, 1024)")
+    ap.add_argument("--step", type=int, default=16, help="the bucket step (ai-toolkit's Mage-Flow: 16)")
     ap.add_argument("--dropout", type=float, default=0.0, help="v1's caption_dropout_rate, recorded in the cache")
     ap.add_argument("--neg", default="", help="the unconditional prompt (empty, as SPEC pins it)")
     ap.add_argument("--scratch", help="where the engine's dumps go")
@@ -475,9 +500,11 @@ def main() -> int:
         if not a.dir:
             a.dir = s.get("image_dir")
         res = s.get("resolution", a.budget)
-        a.budget = int(res[0] if isinstance(res, (list, tuple)) else res)
+        a.budget = ",".join(str(int(x)) for x in (res if isinstance(res, (list, tuple)) else [res]))
+    a.budgets = [int(x) for x in str(a.budget).split(",") if x.strip()]
+    a.budget = max(a.budgets)
     if a.check:
-        return check_dir(Path(a.dir), a.budget, a.step)
+        return check_dir(Path(a.dir), a.budgets, a.step)
     if not (a.vae and a.text):
         raise SystemExit("--vae and --text are needed")
     work = Path(a.scratch or tempfile.mkdtemp(prefix="mf-pre-")) / "w"

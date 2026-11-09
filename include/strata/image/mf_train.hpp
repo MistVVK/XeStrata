@@ -34,6 +34,8 @@ struct MfBlockW {
                                          // path reads them, and zero widths enqueue no work and fail)
     const uint16_t* w[6] = {};           // [N][K] FP16, as the file writes them
     const uint16_t* wt[6] = {};          // [K][N] FP16, the same values transposed (dgrad reads them)
+    const int8_t* w8[6] = {};            // a QLoRA's int8 base instead of w (train::Product's w8, sw; null: w)
+    const float* sw[6] = {};
     const float* b[6] = {};              // [N] FP32
     const train::Adapter* ad[6] = {};         // null: no adapter on the product
     const float *nq = nullptr, *nk = nullptr;      // [head_dim] FP32 each: the file's attn.norm_q / norm_k weight
@@ -41,6 +43,7 @@ struct MfBlockW {
     float* dw[6] = {};                   // [N][K] FP32, added into
     float* db[6] = {};                   // [N]
     float *dnq = nullptr, *dnk = nullptr;   // [head_dim] each, added into
+    float* dmod = nullptr;               // [6 C] the modulation's gradient, added into (null: not taken)
 };
 
 struct MfBlockRun {

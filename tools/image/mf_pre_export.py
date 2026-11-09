@@ -52,28 +52,17 @@ def image_files(data: Path) -> list[Path]:
     return out
 
 
-def export_one(img: Path, out: Path) -> str | None:
-    """one image's two caches into dumps; None with a printed reason when a file is missing or wrong"""
-    lat_f = te_f = None
-    for cand in sorted(img.parent.glob(f"{img.stem}_*_{CACHE_MODEL}.npz")):
-        if "_te." not in cand.name:
-            lat_f = cand
-    te_f = img.with_name(f"{img.stem}_{CACHE_MODEL}_te.npz")
-    if not te_f.exists():
+def export_one(img: Path, out: Path) -> list[str] | None:
+    """one image's caches into dumps, a manifest line a latent cache (a bucket); None with a printed reason when a
+    file is missing or wrong"""
+    lat_fs = [c for c in sorted(img.parent.glob(f"{img.stem}_*_{CACHE_MODEL}.npz")) if "_te." not in c.name]
+    te_f: Path | None = img.with_name(f"{img.stem}_{CACHE_MODEL}_te.npz")
+    if te_f is not None and not te_f.exists():
         te_f = None
-    if lat_f is None or te_f is None:
-        print(f"{img.name}: no cache ({lat_f is None}/{'te' if te_f is None else 'ok'}) - not rebuilt here",
-              file=sys.stderr)
+    if not lat_fs or te_f is None:
+        print(f"{img.name}: no cache ({'latent' if not lat_fs else 'ok'}/{'te' if te_f is None else 'ok'}) - not "
+              "rebuilt here", file=sys.stderr)
         return None
-    with np.load(lat_f) as z:
-        lat = z["latents"]                      # F32 [128][h][w], the VAE's packed mean
-        orig = z["original_size"]
-        crop = z["crop_ltrb"]
-    if lat.dtype != np.float32 or lat.ndim != 3 or lat.shape[0] != LATENT_CH:
-        print(f"{img.name}: {lat_f.name} latents are {lat.dtype} {lat.shape}, not f32 [128][h][w]",
-              file=sys.stderr)
-        return None
-    _, hh, ww = lat.shape
     with np.load(te_f) as z:
         emb = z["prompt_embeds"]                # bf16 bits as uint16, the system turn's rows dropped
         mask = z["attn_mask"]
@@ -87,17 +76,33 @@ def export_one(img: Path, out: Path) -> str | None:
     txt_dim = int(emb.shape[1])
     rows = int(np.count_nonzero(mask))          # the mask is the run of 1s, then the padding
     unc_rows = int(np.count_nonzero(umask))
-    tok = f"{img.stem}"
-    put(out, f"{tok}_lat", np.ascontiguousarray(lat.reshape(LATENT_CH, hh * ww).T))   # [tokens][128] F32
-    put(out, f"{tok}_te", bf16_to_f32(emb[:rows]))                                     # [rows][txt_dim] F32
-    put(out, f"{tok}_uncond", bf16_to_f32(unc[:unc_rows]))
     cap = img.with_suffix(".txt")
     text = cap.read_text(encoding="utf-8").strip().replace("\t", " ").replace("\n", " ") if cap.exists() else ""
     if not text:
         print(f"{img.name}: no caption beside it", file=sys.stderr)
-    return "\t".join((tok, str(ww), str(hh), str(ww * hh), str(rows), str(unc_rows), str(txt_dim),
-                      " ".join(str(int(v)) for v in crop), " ".join(str(int(v)) for v in orig),
-                      f"{drop:g}", text))
+    lines = []
+    for lat_f in lat_fs:
+        with np.load(lat_f) as z:
+            lat = z["latents"]                      # F32 [128][h][w], the posterior's mean
+            sd = z["latents_sd"] if "latents_sd" in z else None
+            orig = z["original_size"]
+            crop = z["crop_ltrb"]
+        if lat.dtype != np.float32 or lat.ndim != 3 or lat.shape[0] != LATENT_CH:
+            print(f"{img.name}: {lat_f.name} latents are {lat.dtype} {lat.shape}, not f32 [128][h][w]",
+                  file=sys.stderr)
+            return None
+        _, hh, ww = lat.shape
+        # a stem a bucket; an image with one bucket keeps its own stem, as the single-budget runs named it
+        tok = img.stem if len(lat_fs) == 1 else f"{img.stem}_{ww * 16:04d}x{hh * 16:04d}"
+        put(out, f"{tok}_lat", np.ascontiguousarray(lat.reshape(LATENT_CH, hh * ww).T))   # [tokens][128] F32
+        if sd is not None:   # the posterior's standard deviation, the trainer's draw
+            put(out, f"{tok}_lat_sd", np.ascontiguousarray(sd.reshape(LATENT_CH, hh * ww).T))
+        put(out, f"{tok}_te", bf16_to_f32(emb[:rows]))                                     # [rows][txt_dim] F32
+        put(out, f"{tok}_uncond", bf16_to_f32(unc[:unc_rows]))
+        lines.append("\t".join((tok, str(ww), str(hh), str(ww * hh), str(rows), str(unc_rows), str(txt_dim),
+                                " ".join(str(int(v)) for v in crop), " ".join(str(int(v)) for v in orig),
+                                f"{drop:g}", text)))
+    return lines
 
 
 def put(out: Path, name: str, a: np.ndarray) -> None:
@@ -109,9 +114,9 @@ def run(data: Path, out: Path) -> int:
     out.mkdir(parents=True, exist_ok=True)
     lines = []
     for img in image_files(data):
-        line = export_one(img, out)
-        if line is not None:
-            lines.append(line)
+        got = export_one(img, out)
+        if got is not None:
+            lines.extend(got)
     if not lines:
         print(f"{data}: nothing exported", file=sys.stderr)
         return 1

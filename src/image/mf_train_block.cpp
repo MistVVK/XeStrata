@@ -214,7 +214,27 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
     }
     auto keep = [&](int st, int i) { return train::AdKeep{adh16[st][i], adhr[st][i], adh16t[st][i]}; };
     auto prod = [&](const MfBlockW& W, int i) {
-        return train::Product{W.N[i], W.K[i], W.w[i], W.wt[i], W.dw[i], W.db[i]};
+        return train::Product{W.N[i], W.K[i], W.w[i], W.wt[i], W.dw[i], W.db[i], W.w8[i], W.sw[i]};
+    };
+    // the base products: FP16, or a QLoRA's int8 base (W8A8, ai-toolkit's convrot8) with the input's int8 rows as
+    // scratch, and FP16 ones where the GPU takes no int8 products
+    const bool w8 = w[0]->w8[0] != nullptr;
+    int8_t* x8 = nullptr;
+    float* sx = nullptr;
+    uint16_t *x16f = nullptr, *w16f = nullptr;
+    if (w8) {
+        const int64_t maxIn = std::max(Ri, Rt) * std::max(C, F);
+        x8 = reinterpret_cast<int8_t*>(pool.ru((maxIn + 1) / 2));
+        sx = pool.rf(std::max(Ri, Rt));
+        if (!train::w8_int8(stream)) {
+            x16f = pool.ru(maxIn);
+            w16f = pool.ru(F * C);
+        }
+    }
+    auto base = [&](int st, int i, const uint16_t* x16, float* y) {
+        const MfBlockW& W = *w[st];
+        if (W.w8[i] != nullptr) train::w8_product(x16, R[st], prod(W, i), y, x8, sx, x16f, w16f, gemm, stream);
+        else gemm.f16(x16, W.w[i], y, R[st], W.N[i], W.K[i]);
     };
 
     // ---- forward, every stage handed to the tape when the harness asked for one (null: nothing copied)
@@ -234,7 +254,7 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
         train::transpose_f16(ln1_16[st], R[st], C, ln1_t[st], stream);
         for (int i = 0; i < 3; ++i) {
             float* dst = i == 0 ? yq[st] : i == 1 ? yk[st] : yv[st];
-            gemm.f16(ln1_16[st], w[st]->w[i], dst, R[st], C, C);
+            base(st, i, ln1_16[st], dst);
             train::ad_product_fwd(w[st]->ad[i], ln1_16[st], ln1_s[st], dst, w[st]->b[i], R[st], C, C, keep(st, i), adsc,
                                   gemm, stream);
             tape_put(slice(st, kTapeQ + i), dst, R[st] * C, stream);
@@ -260,7 +280,7 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
     for (int st = 0; st < 2; ++st) {
         const float* mod = w[st]->mod;
         const int64_t off = st == 0 ? Rt : 0;
-        gemm.f16(jo + off * C, w[st]->w[3], yo[st], R[st], C, C);
+        base(st, 3, jo + off * C, yo[st]);
         train::ad_product_fwd(w[st]->ad[3], jo + off * C, vs + 1, yo[st], w[st]->b[3], R[st], C, C, keep(st, 3), adsc,
                               gemm, stream);
         tape_put(slice(st, kTapeO), yo[st], R[st] * C, stream);
@@ -270,14 +290,14 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
                          stream, mean2[st], inv2[st]);
         tape_put16(slice(st, kTapeLn2), ln2_16[st], R[st] * C, stream);
         train::transpose_f16(ln2_16[st], R[st], C, ln2_t[st], stream);
-        gemm.f16(ln2_16[st], w[st]->w[4], ym1[st], R[st], F, C);
+        base(st, 4, ln2_16[st], ym1[st]);
         train::ad_product_fwd(w[st]->ad[4], ln2_16[st], ln2_s[st], ym1[st], w[st]->b[4], R[st], F, C, keep(st, 4), adsc,
                               gemm, stream);
         tape_put(slice(st, kTapeM1), ym1[st], R[st] * F, stream);
         dit_rows::rows16(dit_rows::GeluTanh{rows_of(ym1[st], F)}, R[st], F, gelu_16[st], gelu_s[st], stream);
         tape_put16(slice(st, kTapeGelu), gelu_16[st], R[st] * F, stream);
         train::transpose_f16(gelu_16[st], R[st], F, gelu_t[st], stream);
-        gemm.f16(gelu_16[st], w[st]->w[5], ym2[st], R[st], C, F);
+        base(st, 5, gelu_16[st], ym2[st]);
         train::ad_product_fwd(w[st]->ad[5], gelu_16[st], gelu_s[st], ym2[st], w[st]->b[5], R[st], C, F, keep(st, 5),
                               adsc, gemm, stream);
         tape_put(slice(st, kTapeM2), ym2[st], R[st] * C, stream);
@@ -305,6 +325,10 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
             const float* mod = W.mod;
             // the MLP's gated residual: dh1 is the output's gradient as it reaches the first residual's sum
             train::copy_rows(dout[st], R[st] * C, dh1[st], stream);
+            // the modulation's own gradient (its LoRA's, ai-toolkit trains img_mod.1 and txt_mod.1): each gate's
+            // the gated output times the gradient over the rows, each norm's shift and scale from its backward
+            if (W.dmod != nullptr)
+                dit_rows::gate_add_bwd(ym2[st], nullptr, dout[st], R[st], C, nullptr, W.dmod + 5 * C, stream);
             train::mul_cols(dout[st], mod + 5 * C, R[st] * C, C, dym2[st], stream);
             tape_put(slice(st, kTapeDM2), dym2[st], R[st] * C, stream);
             train::ad_product_bwd(prod(W, 5), W.ad[5], gelu_16[st], gelu_s[st], gelu_t[st], dym2[st], dgelu[st], false,
@@ -316,9 +340,12 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
                                   keep(st, 4), adsc, t16, trs, t16t, sums, R[st], gemm, stream);
             tape_put(slice(st, kTapeDLn2), dln2[st], R[st] * C, stream);
             // the second norm: its input's gradient joins the residual's own
-            dit_rows::ln_mod_bwd(h1[st], mean2[st], inv2[st], mod + 4 * C, dln2[st], R[st], C, dgelu[st], nullptr, nullptr,
-                          stream);
+            dit_rows::ln_mod_bwd(h1[st], mean2[st], inv2[st], mod + 4 * C, dln2[st], R[st], C, dgelu[st],
+                                 W.dmod != nullptr ? W.dmod + 3 * C : nullptr,
+                                 W.dmod != nullptr ? W.dmod + 4 * C : nullptr, stream);
             train::add_into(dh1[st], dgelu[st], R[st] * C, stream);
+            if (W.dmod != nullptr)
+                dit_rows::gate_add_bwd(yo[st], nullptr, dh1[st], R[st], C, nullptr, W.dmod + 2 * C, stream);
             tape_put(slice(st, kTapeDH1), dh1[st], R[st] * C, stream);
             // the attention's gated residual
             train::mul_cols(dh1[st], mod + 2 * C, R[st] * C, C, dyo[st], stream);
@@ -354,8 +381,8 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
                 if (i > 0) train::add_into(dln1[st], dgelu[st], R[st] * C, stream);
             }
             tape_put(slice(st, kTapeDLn1), dln1[st], R[st] * C, stream);
-            dit_rows::ln_mod_bwd(in[st], mean1[st], inv1[st], w[st]->mod + C, dln1[st], R[st], C, dxn1[st], nullptr, nullptr,
-                          stream);
+            dit_rows::ln_mod_bwd(in[st], mean1[st], inv1[st], w[st]->mod + C, dln1[st], R[st], C, dxn1[st],
+                                 W.dmod, W.dmod != nullptr ? W.dmod + C : nullptr, stream);
             if (dIn[st] != nullptr) train::add_into(dIn[st], dxn1[st], R[st] * C, stream);
         }
     }

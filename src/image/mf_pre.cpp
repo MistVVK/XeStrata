@@ -13,19 +13,25 @@
 // {"type":"f32"|"i32"|"bf16","shape":[fastest, ...]}.  `pix` is the resized image [3][H][W] FP32 in -1 .. 1 (what
 // the encoder takes); the outputs are:
 //
-//   latent   the VAE's raw output [128][h][w] FP32 - the posterior's mean (MfVae::encode with no eps).  Mage-VAE's
-//            2 x 2 packing is inside its encoder, so this is already the DiT's latent space; there is no batch norm
-//            or statistics left for the trainer to fold in (a Flux2 VAE's raw latent is another card's).
+//   latent   the DiT's latent [128][h][w] FP32 - the posterior's mean (MfVae::encode with no eps).  Mage-VAE's
+//            2 x 2 packing is inside its encoder; the Flux2 VAE's (MageTrail's) encode packs and normalizes by its
+//            batch norm the same way, so either is already the DiT's latent space.
+//   latent_sd the posterior's standard deviation [128][h][w] FP32, Mage-VAE's only (the Flux2 VAE's encode gives
+//            the mean alone).
 //   embeds   the states after the final norm with the system turn's DROP rows dropped, as bf16 bits in uint16 (the
 //            cache's form); embeds32 is the FP32 the engine computed, so a reference can tell the cache's rounding
 //            from the engine's value.
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/mf_vae.hpp"
+#include "strata/image/moss_dit.hpp"
+#include "strata/image/moss_text.hpp"
 #include "strata/image/qi_text.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -122,9 +128,6 @@ int vae(const std::string& path, const std::string& dir) {
     std::string err;
     if (!v.open(path, s, err)) throw std::runtime_error(err);
     if (!v.open_encoder(err)) throw std::runtime_error(err);
-    if (v.flux2())
-        throw std::runtime_error("Mage-VAE only here: a Flux2 VAE's raw latent is 32 channels at 1/8, and its cache "
-                                 "is MageTrail's (card 9)");
     const Var pix = load(dir, "pix");
     if (pix.type != "f32" || pix.shape.size() != 3 || pix.dim(0) != 3)
         throw std::runtime_error("pix must be [3][H][W] FP32 (the VAE's input), not " + pix.type + " of " +
@@ -149,6 +152,26 @@ int vae(const std::string& path, const std::string& dir) {
                 (long long) H, (long long) w, (long long) h, 1e3 * seconds_since(t0),
                 (double) v.encode_scratch_bytes(h, w) / 1048576.0);
     save(dir, "latent", y.data(), (int64_t) y.size() * 4, "f32", {w, h, C});
+    // the posterior's standard deviation, exp(logvar / 2) as encode takes it: a training step draws its latent
+    // from the posterior (ai-toolkit samples latent_dist each step), the cache keeping the mean and this.  The Flux2
+    // VAE's encode (MageTrail's) gives its mean alone, so its cache has no deviation and a step reads the mean
+    if (v.flux2()) {
+        strata::gpu::free(z);
+        strata::gpu::free(src);
+        return 0;
+    }
+    float* mom = nullptr;
+    if (!strata::gpu::alloc_device(&mom, (size_t) h * w * 2 * C * 4)) throw std::runtime_error("GPU memory");
+    v.encode_moments(src, h, w, mom);
+    strata::gpu::stream_sync(s);
+    const auto m = fetch(mom, (size_t) h * w * 2 * C);
+    std::vector<float> sd((size_t) (h * w * C));
+    for (int64_t p = 0; p < h * w; ++p)
+        for (int64_t c = 0; c < C; ++c)
+            sd[(size_t) (p * C + c)] = std::exp(0.5f * std::clamp(m[(size_t) (p * 2 * C + C + c)], -20.f, 10.f));
+    const auto sdf = channels_first(sd, h * w, C);
+    save(dir, "latent_sd", sdf.data(), (int64_t) sdf.size() * 4, "f32", {w, h, C});
+    strata::gpu::free(mom);
     strata::gpu::free(z);
     strata::gpu::free(src);
     return 0;

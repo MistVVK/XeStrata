@@ -24,6 +24,8 @@ struct MfTrainProduct {
     uint16_t* w = nullptr;    // [N][K] FP16
     uint16_t* wt = nullptr;   // [K][N] FP16
     float* b = nullptr;       // [N] FP32
+    int8_t* w8 = nullptr;     // a QLoRA's int8 base instead of w (train::Product's w8, sw; null: w)
+    float* sw = nullptr;
 };
 
 /// One block's trainable side: an adapter per stream and product (null: none), with its own FP32 gradients.
@@ -45,6 +47,10 @@ struct MfTrainAdapter {
     float *mW1[2][6] = {}, *vW1[2][6] = {};   // LoKr AdamW states
     float *mW2A[2][6] = {}, *vW2A[2][6] = {};
     float *mW2B[2][6] = {}, *vW2B[2][6] = {};
+    // the modulation linears' LoRA (img_mod.1 and txt_mod.1, [6 C][C], ai-toolkit's targets): FP32 masters the
+    // one-row product reads as they are, their gradients and AdamW states (null: the modulations not trained)
+    float *modA[2] = {}, *modB[2] = {}, *dmodA[2] = {}, *dmodB[2] = {};
+    float *mmodA[2] = {}, *vmodA[2] = {}, *mmodB[2] = {}, *vmodB[2] = {};
 };
 
 /// The DiT as the trainer reads it: every block's products and head norms, the weights outside the blocks, and one
@@ -54,13 +60,17 @@ struct MfTrainModel {
     int64_t C = 0, F = 0, heads = 0, hd = 0, nblk = 0, txt_dim = 0, in_ch = 0;
     std::vector<int64_t> axes;   // the RoPE's axes (16, 56, 56)
     MfTrainProduct img_in, txt_in, t1, t2, nout, pout;
+    int64_t mrank = 0;                 // MageTrail's shared low-rank modulation's width (0: Mage-Flow's own)
+    float *mdown_w = nullptr, *mdown_b = nullptr;   // [mrank][C], [mrank] FP32
     float* txt_norm = nullptr;   // [txt_dim] FP32
     uint16_t* wtScratch = nullptr;   // one block's transposed views ([stream][product], offsets below)
+    uint16_t* w8tmp = nullptr;       // [F][C] FP16: an int8 base's rows rotated back, before their transpose
     int64_t wtOff[2][6] = {};
     uint64_t adam_step = 0;   // the optimizer's step count (bias correction reads it)
     struct Block {
         MfTrainProduct prod[2][6];   // [stream][q, k, v, o, mlp1, mlp2]
-        MfTrainProduct mod[2];       // [stream] the img_mod.1 / txt_mod.1 linears ([6C][C])
+        MfTrainProduct mod[2];       // [stream] the img_mod.1 / txt_mod.1 linears ([6C][C]; MageTrail's: the bias)
+        float* modlow[2] = {};       // [stream] MageTrail's low-rank form [6C][mrank] FP32 (null: mod's FP16 w)
         float* nq[2] = {};           // [hd] FP32 per stream
         float* nk[2] = {};
         MfTrainAdapter* adap = nullptr;   // null: the block runs plain
@@ -70,18 +80,22 @@ struct MfTrainModel {
 
 /// Open the bf16 DiT (every weight as FP16, as the engine reads it) and an adapter set of the given rank (0: none).
 /// Throws when a shape the trainer reads is not the file's (the file's own block count and widths win).
-MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* stream, std::string& err);
+/// int8 makes the blocks' products a QLoRA's base (ai-toolkit's convrot8, W8A8; the modulations stay FP16).
+MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* stream, std::string& err,
+                              bool int8 = false);
 void mf_trainer_close(MfTrainModel* m);
 /// The adapters' starting point (once, before training): A kaiming-uniform (bound 1/sqrt(fan_in)), B = 0, m = norms
 /// (method 0 plain LoRA, 1 DoRA; alpha free, default candidate rank).  The FP16 working copies sync from the masters
-/// here and after every optimizer step.
-void mf_trainer_init_adapters(MfTrainModel* m, int method, float alpha, uint64_t seed);
+/// here and after every optimizer step.  mod_targets also trains the modulation linears (img_mod.1, txt_mod.1), as
+/// ai-toolkit's Mage-Flow job does: a plain LoRA there whatever the method.
+void mf_trainer_init_adapters(MfTrainModel* m, int method, float alpha, uint64_t seed, bool mod_targets = false);
 
 /// One sample's disk form (tools/image/mf_pre_export.py): the latent [tokens][128] F32, the text [rows][txt_dim]
 /// F32 (the bf16 widened), the empty prompt's rows beside them (caption dropout reads those), and the bucket's
 /// own rows and columns (the RoPE tables read them).
 struct MfTrainSample {
-    std::vector<float> lat;      // [tokens][128]
+    std::vector<float> lat;      // [tokens][128], the posterior's mean
+    std::vector<float> lat_sd;   // [tokens][128], its standard deviation (empty: an export without it)
     std::vector<float> te;       // [rows][txt_dim]
     std::vector<float> uncond;   // [uncond_rows][txt_dim], the empty prompt
     int64_t tokens = 0, rows = 0, uncond_rows = 0, h = 0, w = 0;
@@ -97,6 +111,7 @@ struct MfTrainCond {
     float* temb = nullptr;                 // [C] FP32 (and its SiLU image below)
     std::vector<float*> mod;               // [block][stream][6 C] FP32, kept
     float* nmod = nullptr;                 // [2 C] FP32
+    float* tsil = nullptr;                 // [C] FP32: the modulations' input, as the base product read it
     float* cos = nullptr, * sin = nullptr;   // [tokens][hd / 2] FP32
 };
 MfTrainCond mf_trainer_cond(MfTrainModel* m, float sigma, int64_t h, int64_t w, prefill::Gemm& gemm);
