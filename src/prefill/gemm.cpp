@@ -21,6 +21,7 @@
 #if STRATA_ONEMATH
 #include "strata/kernels/matrix_report.hpp"
 #include <oneapi/math/blas.hpp>
+#include <chrono>
 #include <filesystem>
 #include <future>
 #include <type_traits>
@@ -66,6 +67,7 @@ struct Backend {
     bool blas = !env_on("NO_BLAS");
     bool bf16 = !strata::kernels::no_bf16_mma();
     int i8 = -1;   // whether the backend takes int8 products (Gemm::i8_usable's trial; -1 before it)
+    int own[3] = {-1, -1, -1};   // own_first's measures by Own (-1 before one)
     std::shared_future<Trial> ready;   // Gemm::prepare's trial, until it is settled
 };
 std::mutex g_mutex;
@@ -181,6 +183,89 @@ bool blas(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, 
         return false;
     }
 }
+// The dense products XeStrata's own kernels can take in place of oneMath's library: X . W^T in FP16 and in BF16, and
+// X . W with W as it is (FP16; a training step's dgrad).
+enum class Own { f16 = 0, bf16 = 1, kn = 2 };
+
+// Whether products of kind `k` on `stream`'s GPU take XeStrata's own kernels (mma_gemm) before oneMath's library: the
+// faster of the two on a 1024 x 4096 x 4096 product, measured once for the GPU, on `stream`'s queue, the first time it
+// is asked.  On an RX 7900 XTX (ROCm 10.1, 2026-11-09) rocBLAS ran FP16 products with FP32 sums at 13 TFLOPS in every
+// transpose but one, mma_gemm at 65-69.  XESTRATA_BLAS=1 keeps the library; without one (the trial failed, or
+// XESTRATA_NO_BLAS=1) the products take the own kernels anyway.
+bool own_first(void* stream, Own k) {
+    static const bool library = env_on("BLAS");
+    const XmxType t = k == Own::bf16 ? XmxType::bf16 : XmxType::f16;
+    if (library || !strata::kernels::mma_products(t, k == Own::kn)) return false;
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    const sycl::device dev = q.get_device();
+    const Backend b = backend(dev);
+    if (!b.blas || (k == Own::bf16 && !b.bf16)) return true;
+    static std::mutex measuring;
+    std::lock_guard<std::mutex> once(measuring);
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (const int v = g_backends[dev].own[(int) k]; v >= 0) return v == 1;
+    }
+    constexpr int64_t T = 1024, N = 4096, K = 4096;
+    auto* x = ::sycl::malloc_device<uint16_t>((size_t) (T * K + N * K), q);
+    auto* y = ::sycl::malloc_device<float>((size_t) (T * N), q);
+    double own_s = 0, lib_s = 0;
+    if (x != nullptr && y != nullptr) {
+        uint16_t* w = x + T * K;
+        // values of either type in [-1, 1): zeros run the matrix units at less power and read faster
+        q.parallel_for(sycl::range<1>((size_t) (T * K + N * K)), [=](sycl::id<1> i) {
+            const uint32_t h = (uint32_t) i[0] * 2654435761u;
+            x[i[0]] = (uint16_t) ((k == Own::bf16 ? 0x3f00u : 0x3800u) | (h >> 25) | ((h >> 9 & 1u) << 15));
+        });
+        const auto own = [&] {
+            if (k == Own::kn) strata::kernels::gemm_kn(x, w, N, y, T, N, K, N, stream);
+            else strata::kernels::xmx_gemm(t, x, w, y, T, N, K, N, stream);
+        };
+        const auto lib = [&] {
+            namespace om = oneapi::math;
+            if (k == Own::kn)
+                om::blas::column_major::gemm(q, om::transpose::nontrans, om::transpose::nontrans, N, T, K, 1.0f,
+                                             reinterpret_cast<const sycl::half*>(w), N,
+                                             reinterpret_cast<const sycl::half*>(x), K, 0.0f, y, N);
+            else if (k == Own::bf16) product<oneapi::math::bfloat16>(q, x, w, y, T, N, K, N, false);
+            else product<sycl::half>(q, x, w, y, T, N, K, N, false);
+        };
+        const auto time = [&](const auto& f) {
+            f();
+            q.wait_and_throw();
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < 3; ++i) f();
+            q.wait_and_throw();
+            return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / 3;
+        };
+        try {
+            own_s = time(own);
+            lib_s = time(lib);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "xestrata: measuring the dense products: %s\n", e.what());
+            own_s = lib_s = 0;
+        }
+    }
+    q.wait();
+    if (x != nullptr) ::sycl::free(x, q);
+    if (y != nullptr) ::sycl::free(y, q);
+    const bool pick = own_s > 0 && lib_s > 0 && own_s < lib_s;
+    if (own_s > 0 && lib_s > 0) {
+        const sycl::backend be = dev.get_backend();
+        const char* lib = be == sycl::backend::ext_oneapi_hip    ? "rocBLAS"
+                          : be == sycl::backend::ext_oneapi_cuda ? "cuBLAS"
+                                                                 : "oneMKL";
+        const double flop = 2.0 * T * N * K;
+        static const char* const kName[3] = {"FP16", "BF16", "FP16 (W as it is)"};
+        std::fprintf(stderr, "xestrata: dense %s products on %s: XeStrata's own kernels %.1f TFLOPS, %s %.1f\n",
+                     kName[(int) k], pick ? "XeStrata's own kernels" : lib, flop / own_s / 1e12, lib,
+                     flop / lib_s / 1e12);
+    }
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_backends[dev].own[(int) k] = pick ? 1 : 0;
+    return pick;
+}
+
 // STRATA_DENSE_F32=1 (opt-in, upstream 40ba0cf9): the FP16 products as FP32 ones on FP32 copies of both operands.
 // For FP16 operands with FP32 sums cuBLAS 12.4 has two Maxwell kernels on a Tesla P40 and picks the slow one for most
 // chunk sizes (qkv 10240 x 2560 at 7.6 TFLOPS up to T 7040, 4.3 from T 7041); its SGEMM runs at 8.4-9.8 from T 512,
@@ -348,7 +433,10 @@ const char* Gemm::path() {
     text = own;
 #if STRATA_ONEMATH
     const sycl::device dev = core::Runtime::get().device();
-    if (backend(dev).blas) {
+    if (own_first(nullptr, Own::f16)) {
+        const char* lib = dev.get_backend() == sycl::backend::ext_oneapi_hip ? "rocBLAS" : "the library";
+        text = own + ", oneMath (" + lib + ") for the shapes they do not take";
+    } else if (backend(dev).blas) {
         const sycl::backend be = dev.get_backend();
         const char* lib = be == sycl::backend::ext_oneapi_hip ? "rocBLAS"
                           : be == sycl::backend::ext_oneapi_cuda ? "cuBLAS"
@@ -465,7 +553,8 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
     if (ldy <= 0) ldy = N;
     if (!accumulate && bf16_through_f16(X, W, Y, T, N, K, ldy)) return;
 #if STRATA_ONEMATH
-    if (blas<oneapi::math::bfloat16>(X, W, Y, T, N, K, ldy, accumulate, stream_)) return;
+    const bool own = strata::kernels::xmx_gemm_ok(X, W, Y, N, K, ldy) && own_first(stream_, Own::bf16);
+    if (!own && blas<oneapi::math::bfloat16>(X, W, Y, T, N, K, ldy, accumulate, stream_)) return;
 #endif
     if (strata::kernels::xmx_gemm_ok(X, W, Y, N, K, ldy))
         strata::kernels::xmx_gemm(XmxType::bf16, X, W, Y, T, N, K, ldy, stream_, accumulate);
@@ -478,11 +567,12 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
 #if STRATA_ONEMATH
+    const bool own = strata::kernels::xmx_gemm_ok(X, W, Y, N, K, ldy) && own_first(stream_, Own::f16);
     // the FP32 copies and the half-sum path leave Y unread (or write it whole): an accumulating product keeps the
     // half GEMM's FP32 sums, as the engine's own kernels do
-    if (!accumulate && dense_f32(X, W, Y, T, N, K, ldy, stream_)) return;
-    if (half && !accumulate && half_sums(X, W, Y, T, N, K, ldy, stream_)) return;
-    if (blas<sycl::half>(X, W, Y, T, N, K, ldy, accumulate, stream_)) return;
+    if (!own && !accumulate && dense_f32(X, W, Y, T, N, K, ldy, stream_)) return;
+    if (!own && half && !accumulate && half_sums(X, W, Y, T, N, K, ldy, stream_)) return;
+    if (!own && blas<sycl::half>(X, W, Y, T, N, K, ldy, accumulate, stream_)) return;
 #else
     (void) half;
 #endif
@@ -498,7 +588,7 @@ void Gemm::f16_batch(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, 
     if (ldy <= 0) ldy = N;
 #if STRATA_ONEMATH
     sycl::queue& q = core::Runtime::get().stream(stream_);
-    if (backend(q.get_device()).blas) {
+    if (backend(q.get_device()).blas && !own_first(stream_, Own::f16)) {
         try {
             namespace om = oneapi::math;
             om::blas::column_major::gemm_batch(q, om::transpose::trans, om::transpose::nontrans, N, T, K, 1.0f,
@@ -526,6 +616,11 @@ bool Gemm::f16_batch_ex(bool x_t, bool w_nk, const uint16_t* X, const uint16_t* 
                         int64_t ldy, float beta) {
     if (T <= 0 || N <= 0 || batch <= 0) return true;
 #if STRATA_ONEMATH
+    // X [T][K] and W [K][N] as they are, one product (a training step's dgrad, dY . W): XeStrata's own kernels where
+    // they are the faster (own_first)
+    if (!x_t && !w_nk && batch == 1 && beta == 0.0f && ldx == K && own_first(stream_, Own::kn) &&
+        strata::kernels::gemm_kn(X, W, ldw, Y, T, N, K, ldy, stream_))
+        return true;
     sycl::queue& q = core::Runtime::get().stream(stream_);
     if (backend(q.get_device()).blas) {
         try {

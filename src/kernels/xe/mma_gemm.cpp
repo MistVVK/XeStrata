@@ -54,7 +54,11 @@ using bf16_t = sycl::ext::oneapi::bfloat16;
 // layouts from the A380's timings (the 2026-10-04-dg2-dp4a record): a product 4 x 8 sub-groups of 4 x 4 tiles in the
 // large register file (13.6 ms for the product above; 8 x 4: 14.4, 4 x 4: 15.4; 2 x 2 tiles in 128 registers, 8 x 8
 // sub-groups: 19 before the contiguous fragments), the groups of 160 rows 2 x 8 of 2 x 2 (6.8 ms for 16 experts of
-// 1280 x 2560; none of the large-register ones was faster).  The others untuned.
+// 1280 x 2560; none of the large-register ones was faster).  RDNA3's and RDNA4's WMMA: NVIDIA's shape with a product's
+// layout of its own, 2 x 4 sub-groups of 4 x 2 tiles (128 x 128 a work-group), from the RX 7900 XTX's timings (T 4096,
+// K 4096 and 12288, 2026-11-09): X . W^T 76-82 TFLOPS and X . W 68-74 (2 x 2 of 2 x 2, NVIDIA's: 55-67 and 54-55;
+// 4 x 2 of 2 x 4: 77-84 and 66-70; 4 x 4 of 2 x 2: 76-83 and 64-66; 4 x 4 tiles a sub-group spilled, 13-22).  The
+// others untuned.
 // A work-group's layout: wgm x wgn sub-groups, each sgm x sgn tiles, with the large register file (grf) or not.
 struct Layout {
     int wgm, wgn, sgm, sgn;
@@ -67,7 +71,8 @@ struct Shape {
 };
 constexpr Shape kShapes[] = {{8, 16, 16, 16, {2, 2, 2, 2, false}, {2, 2, 2, 2, false}, true},
                              {8, 8, 16, 8, {4, 8, 4, 4, true}, {2, 8, 2, 2, false}, true},
-                             {16, 16, 16, 32, {2, 2, 2, 2, false}, {2, 2, 2, 2, false}, false}};
+                             {16, 16, 16, 32, {2, 2, 2, 2, false}, {2, 2, 2, 2, false}, false},
+                             {16, 16, 16, 32, {2, 4, 4, 2, false}, {2, 2, 2, 2, false}, false}};
 constexpr int KC = 32;            // K a step (64 was no faster on the A380)
 
 // NVIDIA's shape from sm_80 on: the tiles read from local memory with ldmatrix and multiplied with mma.sync
@@ -89,9 +94,9 @@ constexpr int VEC = 8;            // values a work-item copies at once (16 bytes
 template<int S>
 constexpr bool built() {
 #if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
-    return S == 2 && STRATA_AMD_WMMA;
+    return S == 3 && STRATA_AMD_WMMA;
 #else
-    return kShapes[S].sg < 32 ? !STRATA_DEVICE_NOT_INTEL : true;
+    return S == 3 ? false : kShapes[S].sg < 32 ? !STRATA_DEVICE_NOT_INTEL : true;
 #endif
 }
 
@@ -151,7 +156,11 @@ inline void stage(const E* A, int64_t row0, int64_t n, int64_t K, int64_t k0, co
 // G groups of rows of X and Y (bounds[e] .. bounds[e + 1], or all T rows when bounds is null), each by its W.  A
 // functor: its members are the same in the host compile and in a device compile that leaves its body out (a lambda's
 // captures would not be).
-template<int S, typename E, bool ACC, bool GROUPED>
+// BKN (RDNA3 and RDNA4 only): W [K][N] as it is (row stride ldw) instead of W [N][K]: a training step's dgrad, dY . W,
+// without a transposed copy of W.  Its tiles stay [k][n] in local memory (row stride LDBN), 16 bytes a store, and the
+// products read them row-major (wmma::Br): stored transposed for the [n][k] reads, a value a store, the products ran
+// at 32 TFLOPS against 73 (RX 7900 XTX, 1024 x 4096 x 4096).
+template<int S, typename E, bool ACC, bool GROUPED, bool BKN = false>
 struct Kernel {
     static constexpr int TM = kShapes[S].m, TN = kShapes[S].n, TK = kShapes[S].k, SG = kShapes[S].sg;
     static constexpr bool PACKED = kShapes[S].packed;
@@ -163,7 +172,8 @@ struct Kernel {
     static constexpr int SGM = L.sgm, SGN = L.sgn;   // tiles a sub-group
     static constexpr int WM = NSGM * SGM * TM, WN = NSGN * SGN * TN;
     static constexpr int LDA = PACKED ? KC : KC + PAD, LDB = PACKED ? KC : KC + PAD;   // A's and B's row strides
-    static constexpr int ASZ = WM * LDA, BSZ = WN * LDB;           // a buffer's elements
+    static constexpr int LDBN = WN + PAD;                          // BKN: B's row stride, [k][n]
+    static constexpr int ASZ = WM * LDA, BSZ = (BKN && KC * LDBN > WN * LDB) ? KC * LDBN : WN * LDB;
     // NVIDIA's shape reads ahead into registers (PREFETCH below) and needs one buffer of each; Intel's packed shapes two
     static constexpr int NBUF = PACKED ? 2 : 1;
     static constexpr size_t LOCAL = (NBUF * ASZ + NBUF * BSZ) * sizeof(uint16_t) + (size_t) NSG * TM * TN * sizeof(float);
@@ -178,6 +188,7 @@ struct Kernel {
     sycl::local_accessor<E, 1> as;       // two buffers of the step's rows of X: WM x KC
     sycl::local_accessor<E, 1> bs;       // two buffers of the step's rows of W, as B: WN x KC
     sycl::local_accessor<float, 1> cs;   // a TM x TN tile of Y a sub-group, on its way out
+    int64_t ldw = 0;                     // BKN: W's row stride
 
     // NVIDIA's shape (B column-major): the next step's rows are read into registers before this step's products and
     // stored to local memory after them.  stage() stores what it has just read, so each step waited on its loads
@@ -195,6 +206,22 @@ struct Kernel {
             const int q = lid + i * LANES, r = q / (KC / VEC), c = q % (KC / VEC) * VEC;
             const int64_t row = row0 + r;
             v[i] = q < R * (KC / VEC) && row < n ? *reinterpret_cast<const V8*>(A + row * K + k0 + c) : V8(0);
+        }
+    }
+    void fetch_kn(const E* w, int64_t col0, int64_t n, int64_t k0, int lid, V8 (&v)[NVB]) const {
+#pragma unroll
+        for (int i = 0; i < NVB; ++i) {
+            const int q = lid + i * LANES, r = q / (WN / VEC), c = q % (WN / VEC) * VEC;
+            v[i] = q < KC * (WN / VEC) && col0 + c < n ? *reinterpret_cast<const V8*>(w + (k0 + r) * ldw + col0 + c)
+                                                      : V8(0);
+        }
+    }
+    static void put_kn(const sycl::local_accessor<E, 1>& dst, int lid, const V8 (&v)[NVB]) {
+        const auto base = dst.template get_multi_ptr<sycl::access::decorated::no>();
+#pragma unroll
+        for (int i = 0; i < NVB; ++i) {
+            const int q = lid + i * LANES, r = q / (WN / VEC), c = q % (WN / VEC) * VEC;
+            if (q < KC * (WN / VEC)) *local_as<V8>(base + r * LDBN + c) = v[i];
         }
     }
     template<int R, int LD, int NV>
@@ -234,27 +261,41 @@ struct Kernel {
             for (int i = 0; i < SGM; ++i)
                 for (int j = 0; j < SGN; ++j) wmma::fill(sg, c[i][j], 0.0f);
             stage<E, WM, LDA, false>(x, wm0, rows, K, kb, as, 0, lid, NSG * SG);
-            stage<E, WN, LDB, false>(w, wn0, N, K, kb, bs, 0, lid, NSG * SG);
-            sycl::group_barrier(it.get_group());
             V8 va[NVA], vb[NVB];
+            if constexpr (BKN) {
+                fetch_kn(w, wn0, N, kb, lid, vb);
+                put_kn(bs, lid, vb);
+            } else {
+                stage<E, WN, LDB, false>(w, wn0, N, K, kb, bs, 0, lid, NSG * SG);
+            }
+            sycl::group_barrier(it.get_group());
             for (int64_t k0 = kb; k0 < ke; k0 += KC) {
                 const bool more = k0 + KC < ke;
                 if (more) {
                     fetch<WM, NVA>(x, wm0, rows, K, k0 + KC, lid, va);
-                    fetch<WN, NVB>(w, wn0, N, K, k0 + KC, lid, vb);
+                    if constexpr (BKN) fetch_kn(w, wn0, N, k0 + KC, lid, vb);
+                    else fetch<WN, NVB>(w, wn0, N, K, k0 + KC, lid, vb);
                 }
                 for (int kk = 0; kk < KC; kk += TK) {
                     wmma::A<E> a[SGM];
-                    wmma::Bc<E> b[SGN];
                     for (int i = 0; i < SGM; ++i) wmma::load(sg, a[i], ap + (ms + i * TM) * LDA + kk, LDA);
-                    for (int j = 0; j < SGN; ++j) wmma::load(sg, b[j], bp + (ns + j * TN) * LDB + kk, LDB);
-                    for (int i = 0; i < SGM; ++i)
-                        for (int j = 0; j < SGN; ++j) wmma::mad(sg, c[i][j], a[i], b[j], c[i][j]);
+                    if constexpr (BKN) {
+                        wmma::Br<E> b[SGN];
+                        for (int j = 0; j < SGN; ++j) wmma::load(sg, b[j], bp + kk * LDBN + ns + j * TN, LDBN);
+                        for (int i = 0; i < SGM; ++i)
+                            for (int j = 0; j < SGN; ++j) wmma::mad(sg, c[i][j], a[i], b[j], c[i][j]);
+                    } else {
+                        wmma::Bc<E> b[SGN];
+                        for (int j = 0; j < SGN; ++j) wmma::load(sg, b[j], bp + (ns + j * TN) * LDB + kk, LDB);
+                        for (int i = 0; i < SGM; ++i)
+                            for (int j = 0; j < SGN; ++j) wmma::mad(sg, c[i][j], a[i], b[j], c[i][j]);
+                    }
                 }
                 if (more) {
                     sycl::group_barrier(it.get_group());
                     put<WM, LDA, NVA>(as, 0, lid, va);
-                    put<WN, LDB, NVB>(bs, 0, lid, vb);
+                    if constexpr (BKN) put_kn(bs, lid, vb);
+                    else put<WN, LDB, NVB>(bs, 0, lid, vb);
                 }
                 sycl::group_barrier(it.get_group());
             }
@@ -465,7 +506,7 @@ int shape(const sycl::queue& q, bool bf16) {
         const auto pick = [&q](mx::matrix_type in) {
             // RDNA3 and RDNA4 report no combination (see built): their WMMA takes NVIDIA's shape, FP16 and BF16
             if (amd_wmma(q.get_device()) && !(in == mx::matrix_type::bf16 && no_bf16_mma()))
-                return groups_layout_fits(2, q) ? 2 : -1;
+                return groups_layout_fits(3, q) ? 3 : -1;
             for (int i = 0; i < (int) std::size(kShapes); ++i)
                 if (reported(q.get_device(), in, kShapes[i])) return groups_layout_fits(i, q) ? i : -1;
             return -1;
@@ -501,7 +542,8 @@ bool layout_fits(const sycl::queue& q) {
 bool groups_layout_fits(int s, const sycl::queue& q) {
     if (s == 0) return layout_fits<0, true>(q);
     if (s == 1) return layout_fits<1, true>(q);
-    return layout_fits<2, true>(q);
+    if (s == 2) return layout_fits<2, true>(q);
+    return layout_fits<3, true>(q);
 }
 
 // A product's slices along K: when its tiles fill less than twice the device's compute units (its report) and it has
@@ -583,7 +625,8 @@ sycl::event by_shape(int s, sycl::queue& q, const uint16_t* X, const uint16_t* W
                      int64_t ldy, const int32_t* bounds, int G, int64_t T, int64_t N, int64_t K, bool accumulate) {
     if (s == 0) return run<0, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
     if (s == 1) return run<1, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
-    return run<2, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
+    if (s == 2) return run<2, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
+    return run<3, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
 }
 
 }  // namespace
@@ -614,6 +657,26 @@ sycl::event mma_gemm(sycl::queue& q, bool bf16, const uint16_t* X, const uint16_
 sycl::event mma_gemm_grouped(sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t w_stride, float* Y,
                              const int32_t* bounds, int G, int64_t max_rows, int64_t N, int64_t K) {
     return by_shape<sycl::half>(shape(q, false), q, X, W, w_stride, Y, N, bounds, G, max_rows, N, K, false);
+}
+
+bool mma_gemm_kn_usable(const sycl::queue& q) {
+    return amd_wmma(q.get_device()) && mma_usable(q, false) && shape(q, false) == 3 && layout_fits<3, false>(q);
+}
+
+sycl::event mma_gemm_kn(sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t ldw, float* Y, int64_t T,
+                        int64_t N, int64_t K, int64_t ldy) {
+    using KT = Kernel<3, sycl::half, false, false, true>;
+    const auto* x = reinterpret_cast<const sycl::half*>(X);
+    const auto* w = reinterpret_cast<const sycl::half*>(W);
+    const int64_t tiles_m = (T + KT::WM - 1) / KT::WM, tiles_n = (N + KT::WN - 1) / KT::WN;
+    return q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<sycl::half, 1> as(sycl::range<1>(KT::NBUF * KT::ASZ), h),
+            bs(sycl::range<1>(KT::NBUF * KT::BSZ), h);
+        sycl::local_accessor<float, 1> cs(sycl::range<1>(KT::NSG * KT::TM * KT::TN), h);
+        const size_t wg = (size_t) KT::NSG * KT::SG;
+        h.parallel_for(sycl::nd_range<1>((size_t) (tiles_m * tiles_n) * wg, wg),
+                       KT{x, w, 0, Y, ldy, nullptr, T, N, K, tiles_m, tiles_n, K, as, bs, cs, ldw});
+    });
 }
 
 }  // namespace strata::kernels::xe

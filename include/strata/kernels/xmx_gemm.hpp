@@ -23,6 +23,17 @@ bool f16_matrix_engines();
 /// products are faster through FP16 (prefill::Gemm::bf16).
 bool f16_only_matrix_engines();
 
+/// Whether xmx_gemm runs inputs of type `t` on the compute device's matrix engines through mma_gemm (the WMMA of RDNA3
+/// and RDNA4, NVIDIA's tensor cores), the kernels prefill::Gemm measures against the maker's library to pick the faster
+/// (`kn`: also gemm_kn, FP16 only).  False on Intel's GPUs (their XMX kernels) and without matrix engines.
+bool mma_products(XmxType t, bool kn = false);
+
+/// Y[T, N] (row stride ldy) = X[T, K] . W[K, N], W as it is (row stride ldw), FP16 in, FP32 out, on mma_gemm where
+/// mma_products(f16, true); false, with nothing queued, where it is not or the shape is not its (N, ldw and ldy
+/// multiples of 16, K of 32, X, W, Y 64-byte aligned).
+bool gemm_kn(const uint16_t* X, const uint16_t* W, int64_t ldw, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+             void* stream);
+
 /// The path xmx_gemm takes for inputs of type `t` on the compute device, for the startup report: "XMX", "joint_matrix"
 /// (mma_gemm, the matrix engines a GPU without the XMX kernels reports) or "DP4a".
 const char* gemm_path(XmxType t);

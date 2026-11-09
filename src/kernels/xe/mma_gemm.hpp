@@ -31,6 +31,14 @@ bool mma_shape_is(const sycl::queue& q, int m, int n, int k, int sg);
 sycl::event mma_gemm(sycl::queue& q, bool bf16, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N,
                      int64_t K, int64_t ldy, bool accumulate);
 
+/// Whether mma_gemm_kn runs on `q`'s device: an RDNA3 or RDNA4 GPU (amd_wmma) whose FP16 products mma_gemm takes.
+bool mma_gemm_kn_usable(const sycl::queue& q);
+
+/// Y[T, N] (row stride ldy) = X[T, K] . W[K, N], W as it is (row stride ldw), FP16, where mma_gemm_kn_usable: a
+/// training step's dgrad, dY . W, without a transposed copy of W.  N a multiple of 16 (ldw, ldy too), K of 32.
+sycl::event mma_gemm_kn(sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t ldw, float* Y, int64_t T,
+                        int64_t N, int64_t K, int64_t ldy);
+
 /// xmx_gemm_grouped's G experts (FP16): rows bounds[e] .. bounds[e + 1] of X and Y (ldy = N) by W + e * w_stride.
 sycl::event mma_gemm_grouped(sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t w_stride, float* Y,
                              const int32_t* bounds, int G, int64_t max_rows, int64_t N, int64_t K);

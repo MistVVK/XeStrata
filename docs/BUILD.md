@@ -113,6 +113,8 @@ On the A380 it ran 17–38% faster than DP4a, and closer to FP64 (relative error
 to imitate a GPU whose matrix engines lack the type (NVIDIA's before sm_80 have no BF16, before sm_72 no int8) on one that has it.
 With `XESTRATA_NO_BF16_MMA=1` the contrib-llvm mode does not hand the BF16 products to oneMath either; with FP16 matrix engines they take the path through FP16 below.
 `XESTRATA_NO_BLAS=1` computes the dense matrix products with the own kernels in the contrib-llvm mode too (to compare).
+On a GPU where `mma_gemm` runs on the matrix engines (RDNA3's and RDNA4's WMMA, NVIDIA's tensor cores), the dense FP16 and BF16 products, and a training step's dgrad form (W read as it is), are measured the first time they are used, a 1024 x 4096 x 4096 product on the own kernels and on the maker's library, and take the faster (said once).
+`XESTRATA_BLAS=1` takes the maker's library without measuring.
 On the RTX 4070 CTest gave the same results under each of them, and the top token of all 16 positions agreed.
 Where oneMath fails a BF16 product on the GPU (a small one is tried at start), the BF16 products alone take the own kernels.
 On a GPU whose matrix engines take FP16 and not BF16 (NVIDIA's before sm_80, Volta and Turing), the prefill path's BF16 products convert both operands to FP16 and run as FP16 products (`src/prefill/gemm.cpp`, upstream f2fb7c1 and ff6f9f1).

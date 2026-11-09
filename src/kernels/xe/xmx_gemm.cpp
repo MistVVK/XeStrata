@@ -260,6 +260,26 @@ bool f16_only_matrix_engines() {
     });
 }
 
+bool mma_products(XmxType t, bool kn) {
+    auto& q = core::Runtime::get().compute();
+    const bool bf16 = t == XmxType::bf16;
+    if (kn && (bf16 || !xe::mma_gemm_kn_usable(q))) return false;
+    return xe::mma_usable(q, bf16) && (xe::mma_forced() || !use_xmx(t));
+}
+
+bool gemm_kn(const uint16_t* X, const uint16_t* W, int64_t ldw, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+             void* stream) {
+    if (T <= 0 || N <= 0) return true;
+    const auto al = [](const void* p) { return ((uintptr_t) p & 63) == 0; };
+    if (N % 16 != 0 || K % 32 != 0 || ldw < N || ldw % 16 != 0 || ldy < N || ldy % 16 != 0 || !al(X) || !al(W) ||
+        !al(Y))
+        return false;
+    auto& q = core::Runtime::get().stream(stream);
+    if (!xe::mma_gemm_kn_usable(q)) return false;
+    finish(stream, xe::mma_gemm_kn(q, X, W, ldw, Y, T, N, K, ldy), "gemm_kn");
+    return true;
+}
+
 const char* gemm_path(XmxType t) {
     sycl::queue& q = core::Runtime::get().compute();
     if (xe::mma_usable(q, t == XmxType::bf16) && (xe::mma_forced() || !use_xmx(t)))

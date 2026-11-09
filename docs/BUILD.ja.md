@@ -114,6 +114,8 @@ A380 では DP4a より 17〜38% 速く、FP64 との相対誤差も小さくな
 行列エンジンにその型がない GPU（NVIDIA の sm_80 より前は BF16、sm_72 より前は int8 がない）を、持っている GPU で模すためのものです。
 `XESTRATA_NO_BF16_MMA=1` のときは、contrib-llvm のモードでも BF16 の積を oneMath に任せず、FP16 の行列エンジンがあれば下の FP16 を経由する経路になります。
 `XESTRATA_NO_BLAS=1` は、contrib-llvm のモードでも密な行列積を自前のカーネルで計算します（比べるためのものです）。
+`mma_gemm` が行列エンジンで動く GPU（RDNA3・RDNA4 の WMMA、NVIDIA のテンソルコア）では、密な FP16・BF16 の積と、学習の dgrad の形（W をそのまま読む積）を、最初に使うときに自前のカーネルとメーカーのライブラリーの両方で 1024 x 4096 x 4096 の積を測り、速い方を選びます（選んだ方を一度だけ表示します）。
+`XESTRATA_BLAS=1` は、測らずにメーカーのライブラリーを選びます。
 RTX 4070 で、それぞれの組み合わせでも CTest は変わらず、16 トークンの最上位はすべて一致しました。
 oneMath がある GPU の BF16 の積で失敗したとき（起動時に小さな積で試します）は、BF16 の積だけを自前のカーネルに任せます。
 行列エンジンが FP16 を扱い BF16 を扱わない GPU（NVIDIA の sm_80 より前、Volta と Turing）では、prefill の経路の BF16 の積を、両方を FP16 に変換して FP16 の積として計算します（`src/prefill/gemm.cpp`、upstream の f2fb7c1・ff6f9f1）。
