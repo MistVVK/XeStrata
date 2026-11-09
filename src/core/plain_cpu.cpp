@@ -12,6 +12,11 @@
 //               to the row's own, times sigmoid(gate); out = attn_output(.)
 //   FFN:        down(silu(gate(h)) * up(h))
 //
+// plamo3 (PLaMo 3 Translate, llama.cpp's src/models/plamo3.cpp) runs through the same code: every block an attention
+// one, [q | k | v] and [gate | up] each one matrix in the file, no output gate, the attention's and the FFN's outputs
+// rms-normed before their adds; the sliding-window layers see the last `swa_window` positions only and rotate with their
+// own base, the others with the file's YaRN (rope_scaled_angle, the GPU kernels' formula).
+//
 // Compiled with -mavx2 -mfma -mf16c (CMakeLists.txt): PlainModel::load checks cpu_avx2_ok() before it makes a
 // PlainCpu, and nothing here runs before (no initializer at namespace scope).
 #include "strata/core/plain_cpu.hpp"
@@ -19,6 +24,7 @@
 #include "strata/core/plain_model.hpp"
 #include "strata/kernels/cpu/cpu_ops.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/rope_scaling.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/platform/env.hpp"
 #include "strata/platform/memory.hpp"
@@ -94,7 +100,9 @@ struct Mat {
 
 struct Layer {
     bool rec = false;
+    bool swa = false;               ///< a sliding-window layer (plamo3)
     std::vector<float> attn_norm, post_norm;
+    std::vector<float> attn_post, ffn_post;   ///< plamo3: the norms after the attention and the FFN (empty: none)
     Mat in, out, gu, down;
     // GDN
     std::vector<float> ab;          ///< [2 HV][N]: alpha's rows, then beta's
@@ -114,6 +122,11 @@ struct PlainCpu::Impl {
     k::cpu::I8GemmIsa isa = k::cpu::I8GemmIsa::scalar;
     int64_t N = 0, NH = 0, HD = 0, NROT = 0, HK = 0, HV = 0, S = 0, ZV = 0, C = 0, FF = 0;
     float eps = 1e-6f, theta_scale = 1.0f;
+    bool gate = true;          ///< the attention's output gate: [q | gate] per head (qwen35; not plamo3)
+    int64_t window = 0;        ///< the sliding-window layers' window (plamo3)
+    // the rotations: the full-attention layers' (rope_full, scaled where the file says) and the sliding-window ones'
+    k::RopeScaling rope_full, rope_swa;
+    float theta_swa = 1.0f;
     int64_t max_cells = 0, chunk = 2048;
     std::vector<Layer> layers;
     std::vector<float> out_norm;
@@ -261,14 +274,14 @@ bool PlainCpu::load(const GgufModel& m, const ModelSpec& s, const PlainOptions& 
     Impl& P = *p_;
     P.s = s;
     P.m = &m;
-    if (s.arch != ModelArch::Qwen35) {
-        err = "plain cpu: the CPU runs the dense Qwen3.5 models (qwen35) only, not " + s.arch_name;
+    const bool plamo = s.arch == ModelArch::Plamo3;
+    if (s.arch != ModelArch::Qwen35 && !plamo) {
+        err = "plain cpu: the CPU runs the dense models (qwen35, plamo3) only, not " + s.arch_name;
         return false;
     }
-    if (!s.rope_scaling_type.empty() && s.rope_scaling_type != "none") {
-        err = "plain cpu: a rope scaling (" + s.rope_scaling_type + ") the CPU path does not apply";
-        return false;
-    }
+    if (!PlainModel::rope_scalings(s, opt, P.rope_full, P.rope_swa, err)) return false;
+    P.gate = !plamo;
+    P.window = plamo ? s.swa_window : 0;
     P.N = s.n_embd;
     P.NH = s.n_head;
     P.HD = s.key_length;
@@ -280,12 +293,13 @@ bool PlainCpu::load(const GgufModel& m, const ModelSpec& s, const PlainOptions& 
     P.C = 2 * P.HK * P.S + P.ZV;
     P.FF = s.n_ff;
     P.eps = (float) s.rms_eps;
-    if (P.S != 128 || s.ssm_d_conv != 4 || P.HV % P.HK != 0 || P.ZV != P.HV * P.S || P.HD % 8 != 0 ||
+    if ((!plamo && (P.S != 128 || s.ssm_d_conv != 4 || P.HV % P.HK != 0 || P.ZV != P.HV * P.S)) || P.HD % 8 != 0 ||
         P.NROT % 2 != 0 || P.NROT > P.HD || P.N % kBlock != 0) {
         err = "plain cpu: a shape the CPU path is not written for";
         return false;
     }
-    P.theta_scale = std::pow((float) s.rope_base, -2.0f / (float) P.NROT);
+    P.theta_scale = std::pow((float) P.rope_full.freq_base, -2.0f / (float) P.NROT);
+    P.theta_swa = std::pow((float) P.rope_swa.freq_base, -2.0f / (float) P.NROT);
     P.max_cells = opt.max_cells;
     if (opt.prompt_chunk > 0) P.chunk = opt.prompt_chunk;
     const int threads = opt.cpu_threads > 0 ? opt.cpu_threads : (int) std::max(1u, std::thread::hardware_concurrency());
@@ -323,10 +337,16 @@ bool PlainCpu::load(const GgufModel& m, const ModelSpec& s, const PlainOptions& 
         Layer& L = P.layers[(size_t) l];
         const std::string p = "blk." + std::to_string(l) + ".";
         L.rec = s.recurrent[(size_t) l];
+        L.swa = s.layer_swa(l);
         if (!P.vec(p + "attn_norm.weight", (uint64_t) P.N, L.attn_norm, err) ||
-            !P.vec(p + "post_attention_norm.weight", (uint64_t) P.N, L.post_norm, err) ||
-            !P.mat({p + "ffn_gate.weight", p + "ffn_up.weight"}, L.gu, P.N, err) ||
+            !P.vec(p + (plamo ? "ffn_norm.weight" : "post_attention_norm.weight"), (uint64_t) P.N, L.post_norm, err) ||
+            !P.mat(plamo ? std::vector<std::string>{p + "ffn_up.weight"}
+                         : std::vector<std::string>{p + "ffn_gate.weight", p + "ffn_up.weight"}, L.gu, P.N, err) ||
             !P.mat({p + "ffn_down.weight"}, L.down, P.FF, err))
+            return false;
+        // plamo3's norms after the attention and the FFN (their names carry no ".weight")
+        if (plamo && (!P.vec(p + "post_attention_norm", (uint64_t) P.N, L.attn_post, err) ||
+                      !P.vec(p + "post_ffw_norm", (uint64_t) P.N, L.ffn_post, err)))
             return false;
         if (L.gu.q.n_out != 2 * P.FF || L.down.q.n_out != P.N) {
             err = "plain cpu: block " + std::to_string(l) + "'s FFN has another shape";
@@ -352,14 +372,16 @@ bool PlainCpu::load(const GgufModel& m, const ModelSpec& s, const PlainOptions& 
             L.attn = n_attn++;
             L.nkv = s.n_head_kv[(size_t) l];
             if (L.nkv <= 0 || P.NH % L.nkv != 0 ||
-                !P.mat({p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight"}, L.in, P.N, err) ||
+                !P.mat(plamo ? std::vector<std::string>{p + "attn_qkv.weight"}
+                             : std::vector<std::string>{p + "attn_q.weight", p + "attn_k.weight", p + "attn_v.weight"},
+                       L.in, P.N, err) ||
                 !P.mat({p + "attn_output.weight"}, L.out, P.NH * P.HD, err) ||
                 !P.vec(p + "attn_q_norm.weight", (uint64_t) P.HD, L.q_norm, err) ||
                 !P.vec(p + "attn_k_norm.weight", (uint64_t) P.HD, L.k_norm, err)) {
                 if (err.empty()) err = "plain cpu: block " + std::to_string(l) + "'s attention heads";
                 return false;
             }
-            if (L.in.q.n_out != (2 * P.NH + 2 * L.nkv) * P.HD || L.out.q.n_out != P.N) {
+            if (L.in.q.n_out != ((P.gate ? 2 : 1) * P.NH + 2 * L.nkv) * P.HD || L.out.q.n_out != P.N) {
                 err = "plain cpu: block " + std::to_string(l) + "'s attention has another shape";
                 return false;
             }
@@ -529,21 +551,34 @@ void PlainCpu::Impl::block_gdn(Layer& L, int T) {
 }
 
 void PlainCpu::Impl::block_attn(Layer& L, int T, int64_t pos) {
-    const int64_t NKV = L.nkv, QW = 2 * NH * HD, W = QW + 2 * NKV * HD;
+    const int64_t NKV = L.nkv, QH = (gate ? 2 : 1) * HD, QW = NH * QH, W = QW + 2 * NKV * HD;
     big.resize((size_t) T * W);
     linear(L.in, hn.data(), (size_t) N, T, big.data(), (size_t) W);
     float* kcache = kc_[(size_t) L.attn].data();
     float* vcache = vc_[(size_t) L.attn].data();
     q.resize((size_t) T * NH * HD);
     const int64_t half = NROT / 2;
+    // the layer's rotation: a sliding-window layer's own base, else the file's (scaled where it says, as the GPU's
+    // kernels: rope_scaled_angle on the trained angle)
+    const k::RopeScaling& rs = L.swa ? rope_swa : rope_full;
+    const float ts = L.swa ? theta_swa : theta_scale;
+    const bool scaled = rs.type != k::RopeScalingType::None;
+    const k::RopeKernelArgs ka = rs.kernel_args((int) NROT);
     // q and k: rms-normed per head and rotated (NeoX halves of the first NROT dims); k and v into the cache
     auto norm_rope = [&](const float* in, const float* gamma, float* out, int64_t p) {
         const float sc = 1.0f / std::sqrt(dot(in, in, (int) HD) / (float) HD + eps);
         for (int64_t i = NROT; i < HD; ++i) out[i] = sc * in[i] * gamma[i];
         for (int64_t i = 0; i < half; ++i) {
             const float a = sc * in[i] * gamma[i], b = sc * in[i + half] * gamma[i + half];
-            const float th = (float) p * std::pow(theta_scale, (float) i);
-            const float c = std::cos(th), s = std::sin(th);
+            const float th = (float) p * std::pow(ts, (float) i);
+            float c, s;
+            if (scaled) {
+                k::rope_scaled_angle(th, ka.freq_scale, ka.corr_low, ka.corr_high, ka.ext_factor, ka.attn_factor,
+                                     (int) i, c, s);
+            } else {
+                c = std::cos(th);
+                s = std::sin(th);
+            }
             out[i] = a * c - b * s;
             out[i + half] = a * s + b * c;
         }
@@ -552,7 +587,7 @@ void PlainCpu::Impl::block_attn(Layer& L, int T, int64_t pos) {
         const float* r = big.data() + (size_t) t * W;
         const int64_t p = pos + t;
         for (int64_t h = 0; h < NH; ++h)
-            norm_rope(r + h * 2 * HD, L.q_norm.data(), q.data() + ((size_t) t * NH + h) * HD, p);
+            norm_rope(r + h * QH, L.q_norm.data(), q.data() + ((size_t) t * NH + h) * HD, p);
         for (int64_t g = 0; g < NKV; ++g) {
             norm_rope(r + QW + g * HD, L.k_norm.data(), kcache + ((size_t) p * NKV + g) * HD, p);
             std::memcpy(vcache + ((size_t) p * NKV + g) * HD, r + QW + NKV * HD + g * HD, (size_t) HD * 4);
@@ -570,15 +605,18 @@ void PlainCpu::Impl::block_attn(Layer& L, int T, int64_t pos) {
         std::vector<float> acc((size_t) nq * HD, 0.0f);
         for (int j = 0; j < nq; ++j) { mrow[j] = -std::numeric_limits<float>::infinity(); lrow[j] = 0.0f; }
         const int64_t last = pos + t1 - 1;   // the block's last query sees the cells up to its own
-        for (int64_t k0 = 0; k0 <= last; k0 += kK) {
+        // a sliding-window layer: query p sees the cells from p - window + 1 on, the block's first query the earliest
+        const int64_t win = L.swa ? window : 0;
+        const int64_t from0 = win > 0 ? std::max<int64_t>(0, pos + t0 - win + 1) : 0;
+        for (int64_t k0 = from0 / kK * kK; k0 <= last; k0 += kK) {
             const int64_t k1 = std::min(last + 1, k0 + kK);
             for (int j = 0; j < nq; ++j) {
-                const int64_t pj = pos + t0 + j;
+                const int64_t pj = pos + t0 + j, lo = win > 0 ? pj - win + 1 : 0;
                 const float* qv = q.data() + ((size_t) (t0 + j) * NH + h) * HD;
                 float mx = mrow[j];
                 for (int64_t c = k0; c < k1; ++c) {
-                    const float v = c <= pj ? dot(qv, kcache + ((size_t) c * NKV + g) * HD, (int) HD) * scale
-                                            : -std::numeric_limits<float>::infinity();
+                    const float v = c <= pj && c >= lo ? dot(qv, kcache + ((size_t) c * NKV + g) * HD, (int) HD) * scale
+                                                       : -std::numeric_limits<float>::infinity();
                     sc[j][c - k0] = v;
                     mx = std::max(mx, v);
                 }
@@ -599,14 +637,18 @@ void PlainCpu::Impl::block_attn(Layer& L, int T, int64_t pos) {
                 lrow[j] = l;
             }
         }
-        // out = attention * sigmoid(gate)
+        // out = attention, times sigmoid(gate) where the model gates it
         for (int j = 0; j < nq; ++j) {
             const int t = t0 + j;
-            const float* gate = big.data() + (size_t) t * W + h * 2 * HD + HD;
             const float inv = 1.0f / lrow[j];
             float* out = y.data() + ((size_t) t * NH + h) * HD;
             const float* a = acc.data() + (size_t) j * HD;
-            for (int64_t d = 0; d < HD; ++d) out[d] = a[d] * inv * sigm(gate[d]);
+            if (gate) {
+                const float* gv = big.data() + (size_t) t * W + h * QH + HD;
+                for (int64_t d = 0; d < HD; ++d) out[d] = a[d] * inv * sigm(gv[d]);
+            } else {
+                for (int64_t d = 0; d < HD; ++d) out[d] = a[d] * inv;
+            }
         }
     });
     mark(2);
@@ -644,10 +686,16 @@ void PlainCpu::Impl::run_chunk(const int32_t* tokens, int T, int64_t pos) {
                              (int) N, w.data(), eps);
         });
     };
-    auto add = [&] {
+    // x += mix, or (plamo3) x += rms_norm(mix) * `post`
+    auto add = [&](const std::vector<float>& post) {
         pool->run(T, [&](int t) {
             float* xr = x.data() + (size_t) t * N;
             const float* mr = mix.data() + (size_t) t * N;
+            if (!post.empty()) {
+                float* hr = hn.data() + (size_t) t * N;
+                kc::rmsnorm_rows(mr, (size_t) N, hr, (size_t) N, 1, (int) N, post.data(), eps);
+                mr = hr;
+            }
             for (int64_t i = 0; i < N; ++i) xr[i] += mr[i];
         });
     };
@@ -655,10 +703,10 @@ void PlainCpu::Impl::run_chunk(const int32_t* tokens, int T, int64_t pos) {
         norm(L.attn_norm);
         if (L.rec) block_gdn(L, T);
         else block_attn(L, T, pos);
-        add();
+        add(L.attn_post);
         norm(L.post_norm);
         ffn(L, T);
-        add();
+        add(L.ffn_post);
     }
 }
 

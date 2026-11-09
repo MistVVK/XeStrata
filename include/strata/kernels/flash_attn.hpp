@@ -47,6 +47,9 @@ struct FlashAttnArgs {
     int64_t n_causal = 0;  ///< rows t below it see keys below key_lim[t], or below pos0 + t + 1 without key_lim
     int64_t pos0 = 0;
     const int32_t* key_lim = nullptr;   ///< ascending
+    /// A sliding window (PLaMo 3's): rows t below n_causal see keys from pos0 + t + 1 - window on as well; 0: from
+    /// key 0.  Not with key_lim.
+    int64_t window = 0;
     int64_t first = 0, row_end = 0;     ///< the rows asked: first .. row_end - 1, at the output's row t - first
     void* out = nullptr;                ///< FP16 or (out_f32) FP32: row t, head h at
                                         ///< out + (t - first) * out_ld + h * head_dim

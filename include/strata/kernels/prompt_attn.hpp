@@ -24,16 +24,17 @@ namespace strata::kernels {
 /// pools `[page][kv_head][page_size][head_dim]` FP16 through `page_table`.  False, nothing launched, for a shape it is
 /// not built for (head_dim 128 with 10 query heads a KV head, 256 with 4, 8 or 12): the caller keeps the decode kernel.
 bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* page_table,
-                 int64_t pos0, int64_t T, const QsaShapes& s, float* attn, void* stream);
+                 int64_t pos0, int64_t T, const QsaShapes& s, float* attn, void* stream, int64_t window = 0);
 
 /// The same over `pools` (qsa_decode_attn.hpp): FP16 ones, INT8 codes with an FP16 scale per 64 values (--kv int8),
 /// or Q4_0 (--kv q4_0) or INT8 K with Q4_0 V (--kv k8v4), rotated as kv_q4.hpp has them (the caller rotates the queries
 /// and the output).  On the matrix engines where the device has them (Intel's XMX, NVIDIA's tensor cores from sm_70,
 /// RDNA3's and RDNA4's WMMA) through the attention the image engine shares (flash_attn.hpp: head_dim 128 or 256, the
 /// Q4_0 forms 256; any number of query heads a KV head); Q and the probabilities in FP16.  Else the FMA kernel above
-/// (FP16 pools only).  False, nothing launched, when none takes the pools or the shape.
+/// (FP16 pools only).  False, nothing launched, when none takes the pools or the shape.  `window` > 0: a sliding
+/// window, query t sees the cells from pos0 + t + 1 - window on only (both overloads).
 bool prompt_attn(const float* q, const QsaAttnPools& pools, int64_t pos0, int64_t T, const QsaShapes& s, float* attn,
-                 void* stream);
+                 void* stream, int64_t window = 0);
 
 /// Times the kernels the pools overload can take for shape `s` and pool format `pool_format` (0 FP16, 1 INT8, 2 Q4_0,
 /// 3 K8V4: the matrix engines', the FP16 kernel, and the caller's decode kernel, qsa_dense_attn_batch) on the stream's

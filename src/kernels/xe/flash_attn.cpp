@@ -104,6 +104,11 @@ struct Kernel {
     int64_t lim_of(int64_t t) const {
         return t >= a.rows ? 0 : t < a.n_causal ? (a.key_lim ? (int64_t) a.key_lim[t] : a.pos0 + t + 1) : a.keys;
     }
+    // the first key row `t` sees: a sliding window's (pos0 + t + 1 - window) for a causal row, else 0
+    int64_t from_of(int64_t t) const {
+        const int64_t f = a.window > 0 && t < a.n_causal ? a.pos0 + t + 1 - a.window : 0;
+        return f > 0 ? f : 0;
+    }
 
     // gathered: cells c0 .. c0 + CH - 1 of KV head g into the work-group's K and V as FP16 (zero from `end` on)
     void gather(sycl::nd_item<2> it, int64_t c0, int64_t end, int64_t g, sycl::half* K, sycl::half* V) const {
@@ -214,11 +219,15 @@ struct Kernel {
         for (int nt = 0; nt < NT; ++nt) Ops::zero(sg, o[nt]);
         const int r = lane / L, part = lane % L;               // the softmax's row and its lanes' share
         const int64_t lim = my0 + r < row_hi ? lim_of(query_of(my0 + r)) : 0;
+        const int64_t from = my0 + r < row_hi ? from_of(query_of(my0 + r)) : 0;
         // the keys walked: the sub-group's last row's (the limits never fall); gathered, the work-group's
         const int64_t last = GATHER ? std::min(row_hi, wg0 + (int64_t) nsg * TM) - 1 : std::min(a.rows, my0 + TM) - 1;
         const int64_t keys = lim_of(query_of(last));
+        // and from the first row's first key on (a window's: the lower bounds never fall either), in whole chunks
+        const int64_t first_row = GATHER ? wg0 : my0;
+        const int64_t j_begin = first_row < row_hi ? from_of(query_of(first_row)) / CH * CH : 0;
         sycl::group_barrier(sg);
-        for (int64_t j0 = 0; j0 < keys; j0 += CH) {
+        for (int64_t j0 = j_begin; j0 < keys; j0 += CH) {
             const uint16_t* kc0 = nullptr;
             const uint16_t* vc0 = nullptr;
             if constexpr (GATHER) {
@@ -281,7 +290,8 @@ struct Kernel {
             for (int i = 0; i < CW; i += 4) {
                 const auto v = *reinterpret_cast<const sycl::vec<float, 4>*>(&st[soff + (size_t) r * SLD + c0 + i]);
                 for (int u = 0; u < 4; ++u) {
-                    s[i + u] = j0 + c0 + i + u < lim ? v[u] * a.scale : -INFINITY;
+                    const int64_t key = j0 + c0 + i + u;
+                    s[i + u] = key < lim && key >= from ? v[u] * a.scale : -INFINITY;
                     mx_ = sycl::fmax(mx_, s[i + u]);
                 }
             }
@@ -406,6 +416,11 @@ struct WmmaKernel {
     int64_t lim_of(int64_t t) const {
         return t >= a.rows ? 0 : t < a.n_causal ? (a.key_lim ? (int64_t) a.key_lim[t] : a.pos0 + t + 1) : a.keys;
     }
+    // the first key row `t` sees: a sliding window's (pos0 + t + 1 - window) for a causal row, else 0
+    int64_t from_of(int64_t t) const {
+        const int64_t f = a.window > 0 && t < a.n_causal ? a.pos0 + t + 1 - a.window : 0;
+        return f > 0 ? f : 0;
+    }
     // 8 values of cell c's K and V of KV head g from dim dd on, as FP16 bits
     void kv8(int64_t c, int64_t g, int dd, h8& k8, h8& v8) const {
         if constexpr (F < 0) {
@@ -469,13 +484,15 @@ struct WmmaKernel {
             l[e] = 0.0f;
         }
         for (int k = 0; k < DT; ++k) o[k] = w::fv8{0, 0, 0, 0, 0, 0, 0, 0};
-        int64_t lim[8];
+        int64_t lim[8], from[8];
         for (int e = 0; e < 8; ++e) {
             const int64_t r = my0 + w::row_of(hi, e);
             lim[e] = r < row_hi ? lim_of(r / G) : 0;
+            from[e] = r < row_hi ? from_of(r / G) : 0;
         }
         const int64_t keys = lim_of((std::min(row_hi, wg0 + (int64_t) nw * 16) - 1) / G);   // the work-group's last row
-        for (int64_t c0 = 0; c0 < keys; c0 += BK) {
+        const int64_t c_begin = wg0 < row_hi ? from_of(wg0 / G) / BK * BK : 0;           // ... and its first
+        for (int64_t c0 = c_begin; c0 < keys; c0 += BK) {
             sycl::group_barrier(it.get_group());   // the last chunk's K and V are read
             for (int i = t; i < BK * D / 8; i += nt) {   // K as [cell][dim], V transposed as [dim][cell]
                 const int j = i / (D / 8), dd = (i - j * (D / 8)) * 8;
@@ -510,7 +527,7 @@ struct WmmaKernel {
                 float mx = m[e];
                 for (int ct = 0; ct < CT; ++ct) {
                     const int64_t c = c0 + ct * 16 + lo;
-                    sc[ct][e] = c < lim[e] ? sc[ct][e] * sscale : NEG;
+                    sc[ct][e] = c < lim[e] && c >= from[e] ? sc[ct][e] * sscale : NEG;
                     mx = sycl::fmax(mx, sc[ct][e]);
                 }
                 for (int x = 1; x < 16; x <<= 1) mx = sycl::fmax(mx, sycl::permute_group_by_xor(sg, mx, x));
@@ -718,6 +735,11 @@ struct FmaKernel {
     int64_t lim_of(int64_t t) const {
         return t >= a.rows ? 0 : t < a.n_causal ? (a.key_lim ? (int64_t) a.key_lim[t] : a.pos0 + t + 1) : a.keys;
     }
+    // the first key row `t` sees: a sliding window's (pos0 + t + 1 - window) for a causal row, else 0
+    int64_t from_of(int64_t t) const {
+        const int64_t f = a.window > 0 && t < a.n_causal ? a.pos0 + t + 1 - a.window : 0;
+        return f > 0 ? f : 0;
+    }
 
     void operator()(sycl::nd_item<2> it) const {
         constexpr float NEG = -std::numeric_limits<float>::infinity();
@@ -746,7 +768,7 @@ struct FmaKernel {
         for (int k = 0; k < OPT; ++k) o[k] = 0.0f;
         const int64_t keys = lim_of(sycl::min<int64_t>(qbase + BQ, a.row_end) - 1);   // the block's last query's
         const int j = t % BK, rg = t / BK;
-        for (int64_t c0 = 0; c0 < keys; c0 += BK) {
+        for (int64_t c0 = from_of(qbase) / BK * BK; c0 < keys; c0 += BK) {
             sycl::group_barrier(it.get_group());   // the last step's K, V and probabilities are read
             for (int i = t; i < BK * HD / 8; i += NT) {   // 8 halves a work-item
                 const int jj = i / (HD / 8), dd = (i - jj * (HD / 8)) * 8;
@@ -782,7 +804,7 @@ struct FmaKernel {
                 for (int k = 0; k < SR; ++k) {
                     const int r = rg + k * SG;
                     if (r >= R) break;
-                    S[r * BK + j] = c < lim_of(qbase + r / G) ? acc[k] : NEG;
+                    S[r * BK + j] = c < lim_of(qbase + r / G) && c >= from_of(qbase + r / G) ? acc[k] : NEG;
                 }
             }
             sycl::group_barrier(it.get_group());

@@ -241,6 +241,18 @@ bool PlainModel::upload_f32(const GgufModel& m, const std::string& name, uint64_
     return true;
 }
 
+PlainModel::W PlainModel::row_view(const W& all, int64_t r0, int64_t r1) {
+    // the engine's row layouts (upload) rewrite each row in place, so a row keeps its GGUF type's size
+    const int gguf = all.type == k::kNativeQ8Rows ? kQ80 : all.type == k::kNativeQ6KRows ? kQ6K : all.type;
+    const size_t row = gguf == kBF16 ? (size_t) all.n_in * 2
+                       : gguf == kF32 ? (size_t) all.n_in * 4
+                                      : k::cpu::native_row_bytes(gguf, all.n_in);
+    W v = all;
+    v.data = static_cast<const uint8_t*>(all.data) + (size_t) r0 * row;
+    v.n_out = (int) (r1 - r0);
+    return v;
+}
+
 bool PlainModel::load_block(const GgufModel& m, int64_t l, Block& b, std::string& err) {
     const ModelSpec& s = spec_;
     const bool q35 = s.arch == ModelArch::Qwen35Moe || s.arch == ModelArch::Qwen35;
@@ -249,6 +261,12 @@ bool PlainModel::load_block(const GgufModel& m, int64_t l, Block& b, std::string
     if (!upload_f32(m, p + "attn_norm.weight", N, b.attn_norm, err) ||
         !upload_f32(m, p + (q35 ? "post_attention_norm.weight" : "ffn_norm.weight"), N, b.post_norm, err))
         return false;
+    if (plamo_) {   // llama.cpp's plamo3: the norms after the attention and the FFN (their names carry no ".weight")
+        b.swa = s.layer_swa(l);
+        if (!upload_f32(m, p + "post_attention_norm", N, b.attn_post, err) ||
+            !upload_f32(m, p + "post_ffw_norm", N, b.ffn_post, err))
+            return false;
+    }
     if (b.recurrent) {
         const uint64_t C = (uint64_t) (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner);
         if (!upload(m, p + "attn_qkv.weight", b.qkv, err) || !upload(m, p + "attn_gate.weight", b.z, err) ||
@@ -267,8 +285,21 @@ bool PlainModel::load_block(const GgufModel& m, int64_t l, Block& b, std::string
         }
     } else {
         const int64_t nkv = s.n_head_kv[(size_t) l], hd = s.key_length;
-        if (!upload(m, p + "attn_q.weight", b.q, err) || !upload(m, p + "attn_k.weight", b.k, err) ||
-            !upload(m, p + "attn_v.weight", b.v, err) || !upload(m, p + "attn_output.weight", b.o, err) ||
+        if (plamo_) {   // one [q | k | v] matrix, read as its three row ranges
+            if (!upload(m, p + "attn_qkv.weight", b.qkv_all, err)) return false;
+            if (b.qkv_all.n_out != (s.n_head + 2 * nkv) * hd) {
+                err = "plain model: block " + std::to_string(l) + "'s attn_qkv has another shape";
+                return false;
+            }
+            b.q = row_view(b.qkv_all, 0, s.n_head * hd);
+            b.k = row_view(b.qkv_all, s.n_head * hd, (s.n_head + nkv) * hd);
+            b.v = row_view(b.qkv_all, (s.n_head + nkv) * hd, (s.n_head + 2 * nkv) * hd);
+            for (const W* w : {&b.q, &b.k, &b.v})
+                if (k::native_mmvq_supported(w->type)) tune_wait_.push_back(w);
+        }
+        if ((!plamo_ && (!upload(m, p + "attn_q.weight", b.q, err) || !upload(m, p + "attn_k.weight", b.k, err) ||
+                         !upload(m, p + "attn_v.weight", b.v, err))) ||
+            !upload(m, p + "attn_output.weight", b.o, err) ||
             !upload_f32(m, p + "attn_q_norm.weight", (uint64_t) hd, b.q_norm, err) ||
             !upload_f32(m, p + "attn_k_norm.weight", (uint64_t) hd, b.k_norm, err))
             return false;
@@ -280,9 +311,21 @@ bool PlainModel::load_block(const GgufModel& m, int64_t l, Block& b, std::string
         nkv_ = nkv;
     }
     if (dense_) {   // qwen35's FFN, in the shared expert's fields (the same products, without the gate or the router)
-        if (!upload(m, p + "ffn_gate.weight", b.sh_gate, err) || !upload(m, p + "ffn_up.weight", b.sh_up, err) ||
-            !upload(m, p + "ffn_down.weight", b.sh_down, err))
+        if (plamo_) {   // one [gate | up] matrix (ffn_up, 2 n_ff rows: llama.cpp's swiglu takes the first half as gate)
+            if (!upload(m, p + "ffn_up.weight", b.gu_all, err) || !upload(m, p + "ffn_down.weight", b.sh_down, err))
+                return false;
+            if (b.gu_all.n_out != 2 * s.n_ff) {
+                err = "plain model: block " + std::to_string(l) + "'s ffn_up is not 2 x feed_forward_length";
+                return false;
+            }
+            b.sh_gate = row_view(b.gu_all, 0, s.n_ff);
+            b.sh_up = row_view(b.gu_all, s.n_ff, 2 * s.n_ff);
+            for (const W* w : {&b.sh_gate, &b.sh_up})
+                if (k::native_mmvq_supported(w->type)) tune_wait_.push_back(w);
+        } else if (!upload(m, p + "ffn_gate.weight", b.sh_gate, err) || !upload(m, p + "ffn_up.weight", b.sh_up, err) ||
+                   !upload(m, p + "ffn_down.weight", b.sh_down, err)) {
             return false;
+        }
         if (b.sh_gate.n_in != s.n_embd || b.sh_gate.n_out != s.n_ff || b.sh_up.n_in != s.n_embd ||
             b.sh_up.n_out != s.n_ff || b.sh_down.n_in != s.n_ff || b.sh_down.n_out != s.n_embd) {
             err = "plain model: block " + std::to_string(l) + "'s FFN has other shapes";
@@ -582,14 +625,47 @@ bool PlainModel::split_auto_points(std::string& err) {
     return true;
 }
 
+bool PlainModel::rope_scalings(const ModelSpec& s, const PlainOptions& opt, k::RopeScaling& full, k::RopeScaling& swa,
+                               std::string& err) {
+    using RST = k::RopeScalingType;
+    k::RopeScaling rs;
+    rs.freq_base = opt.rope_freq_base > 0 ? opt.rope_freq_base : s.rope_base;
+    const std::string type = !opt.rope_scaling.empty() ? opt.rope_scaling : s.rope_scaling_type;
+    rs.type = type == "yarn" ? RST::YaRN : type == "linear" ? RST::Linear : RST::None;
+    if (rs.type != RST::None) {
+        rs.factor = opt.rope_scale > 0 ? opt.rope_scale : s.rope_scaling_factor > 1.0 ? s.rope_scaling_factor : 1.0;
+        rs.orig_ctx = opt.yarn_orig_ctx > 0 ? opt.yarn_orig_ctx
+                      : s.rope_scaling_orig_ctx >= 1 ? s.rope_scaling_orig_ctx : (double) s.context_length;
+        rs.ext_factor = opt.yarn_ext_factor >= 0 ? opt.yarn_ext_factor : rs.type == RST::YaRN ? 1.0 : 0.0;
+    }
+    rs.attn_factor = opt.yarn_attn_factor;
+    // the file's ramp bounds where it writes them (plamo3), else the options'
+    rs.beta_fast = s.yarn_beta_fast > 0 ? s.yarn_beta_fast : opt.yarn_beta_fast;
+    rs.beta_slow = s.yarn_beta_slow > 0 ? s.yarn_beta_slow : opt.yarn_beta_slow;
+    if (opt.rope_freq_scale > 0 && rs.type == RST::None) {   // llama.cpp: a linear scaling of 1 / scale
+        rs.type = RST::Linear;
+        rs.factor = 1.0 / opt.rope_freq_scale;
+    }
+    if (const char* why = k::rope_scaling_invalid(rs)) {
+        err = std::string("plain model: the rope scaling: ") + why;
+        return false;
+    }
+    full = rs;
+    swa = k::RopeScaling{};   // a sliding-window layer: its own base, not scaled
+    swa.freq_base = s.rope_base_swa > 0 ? s.rope_base_swa : rs.freq_base;
+    return true;
+}
+
 bool PlainModel::load_qwen(std::string& err) {
     const ModelSpec& s = spec_;
-    if (s.arch != ModelArch::Qwen35Moe && s.arch != ModelArch::Qwen3Moe && s.arch != ModelArch::Qwen35) {
+    if (s.arch != ModelArch::Qwen35Moe && s.arch != ModelArch::Qwen3Moe && s.arch != ModelArch::Qwen35 &&
+        s.arch != ModelArch::Plamo3) {
         err = "plain model: " + s.arch_name + " is not run by this engine yet";
         return false;
     }
     const bool q35 = s.arch == ModelArch::Qwen35Moe || s.arch == ModelArch::Qwen35;
-    dense_ = s.arch == ModelArch::Qwen35;
+    dense_ = s.dense();
+    plamo_ = s.arch == ModelArch::Plamo3;
     // a dense model's decode windows with a graph or straight onto the stream, whichever is faster on this GPU
     // (StepForm, timed in stage_forward).  The other models keep their graphs: their windows answer the CPU's rings
     // between graph segments
@@ -597,6 +673,10 @@ bool PlainModel::load_qwen(std::string& err) {
     if ((opt_.encoder || opt_.stream_blocks) &&
         (!opt_.encoder || !dense_ || !opt_.split_at.empty() || opt_.split_auto)) {
         err = "plain model: an encoder (streamed or not) is a dense model (qwen35) on one GPU";
+        return false;
+    }
+    if (plamo_ && (opt_.encoder || opt_.vision || opt_.kv_q4 != 0)) {
+        err = "plain model: plamo3 is not an encoder, has no pictures and keeps its K/V in FP16 or int8";
         return false;
     }
     if (opt_.encoder) opt_.spec = 0;   // no decode: no MTP layer, no drafts
@@ -616,31 +696,8 @@ bool PlainModel::load_qwen(std::string& err) {
     if (cs_ == nullptr) { err = "plain model: stream create failed"; return false; }
     // process constants, before any graph: the rotation (its base, and the scaling the options or the file ask for, as
     // generate.cpp resolves it), and the GDN output gate (SiLU in qwen35moe)
-    {
-        using RST = k::RopeScalingType;
-        k::RopeScaling rs;
-        rs.freq_base = opt_.rope_freq_base > 0 ? opt_.rope_freq_base : s.rope_base;
-        const std::string type = !opt_.rope_scaling.empty() ? opt_.rope_scaling : s.rope_scaling_type;
-        rs.type = type == "yarn" ? RST::YaRN : type == "linear" ? RST::Linear : RST::None;
-        if (rs.type != RST::None) {
-            rs.factor = opt_.rope_scale > 0 ? opt_.rope_scale : s.rope_scaling_factor > 1.0 ? s.rope_scaling_factor : 1.0;
-            rs.orig_ctx = opt_.yarn_orig_ctx > 0 ? opt_.yarn_orig_ctx
-                          : s.rope_scaling_orig_ctx >= 1 ? s.rope_scaling_orig_ctx : (double) s.context_length;
-            rs.ext_factor = opt_.yarn_ext_factor >= 0 ? opt_.yarn_ext_factor : rs.type == RST::YaRN ? 1.0 : 0.0;
-        }
-        rs.attn_factor = opt_.yarn_attn_factor;
-        rs.beta_fast = opt_.yarn_beta_fast;
-        rs.beta_slow = opt_.yarn_beta_slow;
-        if (opt_.rope_freq_scale > 0 && rs.type == RST::None) {   // llama.cpp: a linear scaling of 1 / scale
-            rs.type = RST::Linear;
-            rs.factor = 1.0 / opt_.rope_freq_scale;
-        }
-        if (const char* why = k::rope_scaling_invalid(rs)) {
-            err = std::string("plain model: the rope scaling: ") + why;
-            return false;
-        }
-        k::rope_scaling_set(rs);
-    }
+    if (!rope_scalings(s, opt_, rope_full_, rope_swa_, err)) return false;
+    k::rope_scaling_set(rope_full_);
     k::gdn_set_silu_gate(q35);
 
     const GgufModel& m = *model_;
@@ -2657,7 +2714,7 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
     const k::QsaShapes qs = attn_shapes();
     const int64_t NKV = qs.n_head_kv;
     const k::GdnShapes gs{S, HK, HV};
-    const k::RopeScaling& rs = k::rope_scaling();
+    const k::RopeScaling& rs = rope_of(b);
     const int32_t* pos_q = pos_;
     const int32_t* pos_k = pos_ + (size_t) opt_.max_t * NH;
     auto proj = [&](const W& w, const float* x, float* y, int ncols, bool quantize) {
@@ -2750,9 +2807,10 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
             for (int t = 0; t < T; ++t)
                 k::qsa_dense_attn_batch(qcur_ + (size_t) t * NH * HD, kv_pools((size_t) a, row_slot_[(size_t) t]),
                                         step_ + (size_t) t * k::kStepCount, opt_.max_cells, qs, attn_scratch_,
-                                        attn_ + (size_t) t * NH * HD, 1, cs);
+                                        attn_ + (size_t) t * NH * HD, 1, cs, window_of(b));
         else
-            k::qsa_dense_attn_batch(qcur_, kv_pools((size_t) a), step_, opt_.max_cells, qs, attn_scratch_, attn_, T, cs);
+            k::qsa_dense_attn_batch(qcur_, kv_pools((size_t) a), step_, opt_.max_cells, qs, attn_scratch_, attn_, T, cs,
+                                    window_of(b));
         if (opt_.kv_q4 != 0) k::fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
         if (has_gate_) {
             k::native_qsa_gate_apply(attn_, qfull_, attn32_, (int) (T * NH), (int) HD, cs);
@@ -2761,7 +2819,12 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
             proj(b.o, attn_, mix_, T, true);
         }
     }
-    k::add_inplace(x_, mix_, (int64_t) T * N, cs);
+    if (b.attn_post != nullptr) {   // plamo3: the mixer's output normed before the add
+        k::native_qsa_rms_norm_weighted(mix_, b.attn_post, hn_, (int) N, T, eps, cs);
+        k::add_inplace(x_, hn_, (int64_t) T * N, cs);
+    } else {
+        k::add_inplace(x_, mix_, (int64_t) T * N, cs);
+    }
 
     if (dense_) {   // qwen35's FFN: the shared expert's products, from the norm's q8_1 rows where the weights take them
         const bool q8 = b.sh_gate.type != kBF16 && b.sh_up.type != kBF16 && b.sh_down.type != kBF16;
@@ -2782,7 +2845,12 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
             k::native_swiglu_q8_1(sh_gate_, sh_up_, xq_, (int) FS, T, cs);
             k::native_mmvq(b.sh_down.type, b.sh_down.data, xq_, moe_out_, (int) FS, (int) N, T, cs);
         }
-        k::add_inplace(x_, moe_out_, (int64_t) T * N, cs);
+        if (b.ffn_post != nullptr) {   // plamo3: the FFN's output normed before the add
+            k::native_qsa_rms_norm_weighted(moe_out_, b.ffn_post, hn_, (int) N, T, eps, cs);
+            k::add_inplace(x_, hn_, (int64_t) T * N, cs);
+        } else {
+            k::add_inplace(x_, moe_out_, (int64_t) T * N, cs);
+        }
         steer(b, T, x_, cs);
         return true;
     }

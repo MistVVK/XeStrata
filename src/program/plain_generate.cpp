@@ -2598,8 +2598,9 @@ int plain_main(int argc, char** argv) {
         std::fprintf(stderr, "xestrata (%s): --vision is off: pictures are read for qwen35 and qwen35moe\n", arch.c_str());
         opt.vision = false;
     }
-    // the CPU: asked for, or a dense Qwen3.5 model on a PC whose SYCL runtime lists no GPU it can use
-    if (!opt.cpu && !device_given && arch == "qwen35") {
+    // the CPU: asked for, or a dense model (Qwen3.5, PLaMo 3) on a PC whose SYCL runtime lists no GPU it can use
+    const bool dense_arch = arch == "qwen35" || arch == "plamo3";
+    if (!opt.cpu && !device_given && dense_arch) {
         int gpus = 0;
         try {
             gpus = strata::core::Runtime::count();
@@ -2612,8 +2613,8 @@ int plain_main(int argc, char** argv) {
         }
     }
     if (opt.cpu) {
-        if (arch != "qwen35") {
-            std::fprintf(stderr, "xestrata (%s): --device cpu runs the dense Qwen3.5 models (qwen35) only\n", arch.c_str());
+        if (!dense_arch) {
+            std::fprintf(stderr, "xestrata (%s): --device cpu runs the dense models (qwen35, plamo3) only\n", arch.c_str());
             return 2;
         }
         if (opt.vision) {

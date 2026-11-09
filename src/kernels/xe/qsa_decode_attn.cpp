@@ -5,9 +5,11 @@
 // decode attention over the selected cells for fp16, INT8 and Q4_0 KV, then a merge of the chunk partials.
 //
 // The head size HD and the query heads per KV head G are template parameters: (256, 12) is Qwen3.8's QSA, (256, 8)
-// Ornith-1.5's and (128, 10) llm-jp-4.1's full attention, which read EVERY cell (`qsa_dense_attn_*`: no selection,
-// cell c of the cache for slot c).  A work-group has HD work-items, one per dimension in the value loop; a lane holds
-// HD/32 dimensions in the score loop.  For (256, 12) every expression is the one this file had with HD and G fixed.
+// Ornith-1.5's, (128, 10) llm-jp-4.1's and (128, 6), (128, 16) and (128, 8) PLaMo 3 Translate's (2B, 0.8B and 8B)
+// full attention, which read EVERY cell (`qsa_dense_attn_*`: no selection, cell c of the cache for slot c), or with a
+// window the last `window` cells only (cell lo + c for slot c, lo = max(0, n_kv - window): PLaMo 3's sliding-window
+// layers).  A work-group has HD work-items, one per dimension in the value loop; a lane holds HD/32 dimensions in the
+// score loop.  For (256, 12) every expression is the one this file had with HD and G fixed.
 //
 // A warp is a sub-group of 32.  CUDA used the __expf intrinsic here; this uses the precise exp.  Explicit fmaf calls
 // stay fused (sycl::fma), and the library's -ffp-contract=off leaves every other multiply-add as written.
@@ -164,7 +166,7 @@ template <int HD, int G, int KV_MODE, bool LOOP, int NC>
 sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPools p, const int32_t* ids_all,
                          const int32_t* step_all, int n_kv_heads, int page_size, float scale, float* part_acc_all,
                          float* part_m_all, float* part_l_all, int n_slots, size_t n_q, int cap,
-                         long long scratch_stride) {
+                         long long scratch_stride, int window) {
     static_assert(G >= 1 && G <= 16, "reduce12 sums at most 16 heads");
     static_assert(HD % 128 == 0 && HD <= 256, "a lane holds HD/32 dimensions inside one Q4_0 half");
     constexpr int THREADS = HD;           // one work-item per dimension in the value loop
@@ -191,7 +193,9 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
             float* part_acc = part_acc_all + z * (size_t) scratch_stride;
             float* part_m = part_m_all + z * (size_t) scratch_stride;
             float* part_l = part_l_all + z * (size_t) scratch_stride;
-            const int n_ids = dense ? step[kStepNKv] : step[kStepWidth];
+            const int n_all = dense ? step[kStepNKv] : step[kStepWidth];
+            const int lo = dense && window > 0 ? sycl::max(0, n_all - window) : 0;   // a window's first cell
+            const int n_ids = n_all - lo;
             const int first = (int) it.get_group(2), kvh = (int) it.get_group(1);
             const int t = (int) it.get_local_id(2);
             const int lane = (int) sg.get_local_linear_id(), warp = (int) sg.get_group_linear_id();
@@ -211,7 +215,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 if (t < CHUNK) {
                     long long r = -1;
                     if (t < n_here) {
-                        const int cell = dense ? c0 + t : ids[c0 + t];
+                        const int cell = dense ? lo + c0 + t : ids[c0 + t];
                         const long long page = (long long) p.page_table[cell / page_size];
                         // a block the KV streaming could not make resident keeps page -1; its cells are masked (score
                         // -FLT_MAX, weight 0) instead of being read from before the pool (upstream f3925cf)
@@ -402,13 +406,13 @@ int kv_mode_of(const QsaAttnPools& pools) {
 template <int HD, int G, bool LOOP>
 void launch_kv(int kv_mode, int nc, sycl::queue& queue, const float* q, const QsaAttnPools& pools, const int32_t* ids,
                const int32_t* steps, int nkv, int ps, float scale, float* part_acc, float* part_m, float* part_l,
-               int n_slots, size_t n_q, int cap, long long stride) {
-    if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
-    else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
-    else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
-    else if (nc == 8) launch_chunk<HD, G, 0, LOOP, 8>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
-    else if (nc == 4) launch_chunk<HD, G, 0, LOOP, 4>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
-    else launch_chunk<HD, G, 0, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
+               int n_slots, size_t n_q, int cap, long long stride, int window = 0) {
+    if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window);
+    else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window);
+    else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window);
+    else if (nc == 8) launch_chunk<HD, G, 0, LOOP, 8>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window);
+    else if (nc == 4) launch_chunk<HD, G, 0, LOOP, 4>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window);
+    else launch_chunk<HD, G, 0, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window);
 }
 
 // The cells a step of the fp16 score loop takes (NC): 2 unless qsa_dense_attn_tune timed this GPU and shape.  2, 4 and
@@ -430,7 +434,8 @@ int nc_of(sycl::queue& q) {
 
 template <int HD, int G>
 void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-               const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream) {
+               const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream,
+               int window) {
     const int kv_mode = kv_mode_of(pools);
     auto& queue = queue_for(stream);
     const int nkv = (int) s.n_head_kv, ps = (int) s.page_size;
@@ -442,10 +447,10 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
     const int nc = nc_of<HD, G>(queue);
     if (n_slots < (cap + CHUNK - 1) / CHUNK)
         launch_kv<HD, G, true>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l,
-                               n_slots, n_q, (int) cap, stride);
+                               n_slots, n_q, (int) cap, stride, window);
     else
         launch_kv<HD, G, false>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l,
-                                n_slots, n_q, (int) cap, stride);
+                                n_slots, n_q, (int) cap, stride, window);
     const auto e = launch_merge<HD, G>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, n_q, stride);
     if (!stream) core::Runtime::get().wait(e, "qsa_decode_attn");
 }
@@ -455,16 +460,19 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
 bool shape_ok(const QsaShapes& s) {
     if (s.n_head_kv <= 0 || s.n_head % s.n_head_kv) return false;
     const int64_t g = s.n_head / s.n_head_kv;
-    return (s.head_dim == 256 && (g == 12 || g == 8 || g == 4)) || (s.head_dim == 128 && g == 10);
+    return (s.head_dim == 256 && (g == 12 || g == 8 || g == 4)) || (s.head_dim == 128 && (g == 10 || g == 6 || g == 16 || g == 8));
 }
 
 void run(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-         const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream) {
+         const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream, int window = 0) {
     const int64_t g = s.n_head / s.n_head_kv;
-    if (s.head_dim == 256 && g == 12) run_shape<256, 12>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
-    else if (s.head_dim == 256 && g == 8) run_shape<256, 8>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
-    else if (s.head_dim == 256 && g == 4) run_shape<256, 4>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
-    else run_shape<128, 10>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
+    if (s.head_dim == 256 && g == 12) run_shape<256, 12>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window);
+    else if (s.head_dim == 256 && g == 8) run_shape<256, 8>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window);
+    else if (s.head_dim == 256 && g == 4) run_shape<256, 4>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window);
+    else if (g == 6) run_shape<128, 6>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window);
+    else if (g == 16) run_shape<128, 16>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window);
+    else if (g == 8) run_shape<128, 8>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window);
+    else run_shape<128, 10>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window);
 }
 
 // qsa_dense_attn_tune's timing: the fp16 score loop's NC = 2, 4 and 8 over `cells` cells of a dummy cache, as the
@@ -587,11 +595,11 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 }
 
 void qsa_dense_attn_step(const float* q, const QsaAttnPools& pools, const int32_t* step, int64_t max_cells,
-                         const QsaShapes& s, float* scratch, float* attn, void* stream) {
+                         const QsaShapes& s, float* scratch, float* attn, void* stream, int64_t window) {
     if (!shape_ok(s) || max_cells <= 0 || !scratch || !step || !pools.page_table)
         throw core::DeviceError("qsa_dense_attn: unsupported geometry (" + shape_name(s) + ") or missing buffers");
     if (!pools_ok(pools)) throw core::DeviceError("qsa_dense_attn: incomplete KV pools");
-    run(q, pools, nullptr, step, max_cells, s, scratch, attn, 1, 0, stream);
+    run(q, pools, nullptr, step, max_cells, s, scratch, attn, 1, 0, stream, (int) window);
 }
 
 void qsa_dense_attn_tune(const QsaShapes& s, int64_t max_cells, void* stream) {
@@ -601,17 +609,20 @@ void qsa_dense_attn_tune(const QsaShapes& s, int64_t max_cells, void* stream) {
     if (s.head_dim == 256 && g == 12) tune_shape<256, 12>(q, s, cells);
     else if (s.head_dim == 256 && g == 8) tune_shape<256, 8>(q, s, cells);
     else if (s.head_dim == 256 && g == 4) tune_shape<256, 4>(q, s, cells);
+    else if (g == 6) tune_shape<128, 6>(q, s, cells);
+    else if (g == 16) tune_shape<128, 16>(q, s, cells);
+    else if (g == 8) tune_shape<128, 8>(q, s, cells);
     else tune_shape<128, 10>(q, s, cells);
 }
 
 void qsa_dense_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* steps, int64_t max_cells,
-                          const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
+                          const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream, int64_t window) {
     if (n_q <= 0) return;
     if (!shape_ok(s) || max_cells <= 0 || !scratch || !steps || !pools.page_table || n_q > 65535)
         throw core::DeviceError("qsa_dense_attn_batch: unsupported geometry (" + shape_name(s) + ") or missing buffers");
     if (!pools_ok(pools)) throw core::DeviceError("qsa_dense_attn_batch: incomplete KV pools");
     run(q, pools, nullptr, steps, max_cells, s, scratch, attn, (size_t) n_q,
-        (long long) qsa_decode_attn_scratch_floats(max_cells, s), stream);
+        (long long) qsa_decode_attn_scratch_floats(max_cells, s), stream, (int) window);
 }
 
 }  // namespace strata::kernels

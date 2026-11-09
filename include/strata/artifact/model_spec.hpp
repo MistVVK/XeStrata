@@ -11,6 +11,8 @@
 //   qwen35moe  Qwen3.5 MoE (Ornith-1.5-35B-A3B): gated delta-net + full attention every 4th layer, MTP
 //   qwen35     Qwen3.5 (Qwen3.5-9B): qwen35moe's block with a dense SwiGLU FFN in place of the MoE, MTP
 //   qwen3moe   Qwen3 MoE (llm-jp-4.1-32b-a3b): full attention only, no shared expert
+//   plamo3     PLaMo 3 (PLaMo 3 Translate): full attention, sliding-window layers between every 8th, fused QKV and
+//              gate|up, RMSNorms after the attention and the FFN as well as before
 //   glm5-next  GLM-5.3-Flash: KDA + NoPE MLA with a k-pool indexer, mHC, leading dense layers, MTP.  Also spelled
 //              `glm5next` (Project Maya's quants, after unsloth's first GGUFs), with the same keys under that name.
 //
@@ -30,7 +32,7 @@
 
 namespace strata {
 
-enum class ModelArch { Qwen4Exp, Qwen35Moe, Qwen3Moe, Glm5Next, Qwen35 };
+enum class ModelArch { Qwen4Exp, Qwen35Moe, Qwen3Moe, Glm5Next, Qwen35, Plamo3 };
 
 /// llama.cpp's `llama_expert_gating_func_type`
 enum class ExpertGating : uint32_t { None = 0, Softmax = 1, Sigmoid = 2 };
@@ -55,6 +57,17 @@ struct ModelSpec {
     double rope_base = 0;
     std::string rope_scaling_type;
     double rope_scaling_factor = 0, rope_scaling_orig_ctx = 0;
+    double yarn_beta_fast = 0, yarn_beta_slow = 0;   ///< rope.scaling.yarn_beta_*: 0 when not written
+
+    // sliding-window attention (plamo3).  `swa` is per layer: true for a layer that sees the last `swa_window`
+    // positions only, rotated with `rope_base_swa` and no scaling (llama.cpp's freq_base_swa, freq_scale_swa 1).
+    int64_t swa_window = 0;
+    std::vector<bool> swa;                ///< block_count entries, all false without a window
+    double rope_base_swa = 0;
+    /// True when trunk layer `l` is a sliding-window layer.
+    bool layer_swa(int64_t l) const { return swa_window > 0 && l >= 0 && l < (int64_t) swa.size() && swa[(size_t) l]; }
+    /// A dense model: a SwiGLU FFN in every block and no experts (qwen35, plamo3)
+    bool dense() const { return arch == ModelArch::Qwen35 || arch == ModelArch::Plamo3; }
 
     // linear attention.  `recurrent` is per layer: true for a gated delta-net / KDA layer.
     std::vector<bool> recurrent;          ///< block_count entries; the MTP layers are false
@@ -142,10 +155,14 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     else if (A == "qwen35") s.arch = ModelArch::Qwen35;
     else if (A == "qwen3moe") s.arch = ModelArch::Qwen3Moe;
     else if (A == "glm5-next" || A == "glm5next") s.arch = ModelArch::Glm5Next;
-    else { err = "architecture '" + A + "' is not supported (qwen4exp, qwen35moe, qwen35, qwen3moe, glm5-next)"; return false; }
+    else if (A == "plamo3") s.arch = ModelArch::Plamo3;
+    else {
+        err = "architecture '" + A + "' is not supported (qwen4exp, qwen35moe, qwen35, qwen3moe, glm5-next, plamo3)";
+        return false;
+    }
 
-    // the keys every architecture here needs; the experts' all but the dense qwen35
-    const bool dense = s.arch == ModelArch::Qwen35;
+    // the keys every architecture here needs; the experts' all but the dense models'
+    const bool dense = s.dense();
     const char* required[] = {"block_count", "embedding_length", "attention.head_count", "expert_count",
                               "expert_used_count", "attention.layer_norm_rms_epsilon"};
     for (const char* k : required)
@@ -187,6 +204,29 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
         s.rope_scaling_type = v->s;
     s.rope_scaling_factor = spec_num(g, A, "rope.scaling.factor");
     s.rope_scaling_orig_ctx = spec_num(g, A, "rope.scaling.original_context_length");
+    s.yarn_beta_fast = spec_num(g, A, "rope.scaling.yarn_beta_fast");
+    s.yarn_beta_slow = spec_num(g, A, "rope.scaling.yarn_beta_slow");
+    // llama.cpp's plamo3.cpp: a window makes every layer a sliding-window one but each pattern-th (the pattern's
+    // last, il % n < n - 1: set_swa_pattern without dense_first), 8 when the file writes no pattern
+    s.swa.assign((size_t) n_all, false);
+    if (s.arch == ModelArch::Plamo3) {
+        s.swa_window = spec_int(g, A, "attention.sliding_window");
+        s.rope_base_swa = spec_num(g, A, "rope.freq_base_swa", 10000.0);
+        if (s.swa_window > 0) {
+            std::vector<double> pat;
+            const MetaValue* pv = spec_get(g, A, "attention.sliding_window_pattern");
+            if (pv && pv->type == MetaType::ARRAY) {
+                if (!spec_per_layer(g, A, "attention.sliding_window_pattern", n_all, pat)) {
+                    err = A + ".attention.sliding_window_pattern has another length than block_count";
+                    return false;
+                }
+                for (int64_t i = 0; i < n_all; ++i) s.swa[(size_t) i] = pat[(size_t) i] != 0;
+            } else {
+                const int64_t n = spec_int(g, A, "attention.sliding_window_pattern", 8);
+                for (int64_t i = 0; i < n_all; ++i) s.swa[(size_t) i] = n == 0 || i % n < n - 1;
+            }
+        }
+    }
 
     s.full_attention_interval = spec_int(g, A, "full_attention_interval");
     s.ssm_d_conv = spec_int(g, A, "ssm.conv_kernel");
@@ -222,6 +262,7 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
         for (int64_t i = 0; i < s.n_layer; ++i) s.recurrent[(size_t) i] = s.n_head_kv[(size_t) i] == 0;
         break;
     case ModelArch::Qwen3Moe:
+    case ModelArch::Plamo3:
         break;
     }
 
@@ -243,7 +284,7 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     s.expert_weights_scale = spec_num(g, A, "expert_weights_scale");
     spec_per_layer(g, A, "swiglu_clamp_exp", n_all, s.swiglu_clamp_exp);
     spec_per_layer(g, A, "swiglu_clamp_shexp", n_all, s.swiglu_clamp_shexp);
-    if (dense) {   // llama.cpp's qwen35: ffn_gate, ffn_up and ffn_down in every block, n_ff wide
+    if (dense) {   // llama.cpp's qwen35 and plamo3: a SwiGLU of n_ff in every block
         if (s.n_expert != 0 || s.n_ff <= 0) {
             err = A + ": expert_count " + std::to_string(s.n_expert) + ", feed_forward_length " + std::to_string(s.n_ff);
             return false;

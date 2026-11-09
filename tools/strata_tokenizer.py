@@ -293,7 +293,8 @@ class Tokenizer:
     @classmethod
     def from_dir(cls, path):
         """The tokenizer `extract` wrote into a pack's `tokenizer/` folder, with the `pre` it declared (an export
-        older than the field is Qwen3.8's, `qwen35`); a Unigram one (`model` t5: llm-jp-4.1) is strata_unigram's."""
+        older than the field is Qwen3.8's, `qwen35`); a Unigram one (`model` t5: llm-jp-4.1) is strata_unigram's, a PLaMo
+        one (`model` plamo3: PLaMo 3 Translate) strata_plamo's."""
         path = pathlib.Path(path)
         cfg_file = path / "tokenizer.json"
         cfg = json.loads(cfg_file.read_text(encoding="utf-8")) if cfg_file.exists() else {}
@@ -301,6 +302,10 @@ class Tokenizer:
             sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
             from strata_unigram import UnigramTokenizer
             return UnigramTokenizer.from_dir(path, cfg)
+        if cfg.get("model") in ("plamo2", "plamo3"):
+            sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+            from strata_plamo import PlamoTokenizer
+            return PlamoTokenizer.from_dir(path, cfg)
         vocab = json.loads((path / "vocab.json").read_text(encoding="utf-8"))
         tokens = [""] * len(vocab)
         for t, i in vocab.items():
@@ -682,6 +687,14 @@ def extract(gguf_path, out_dir) -> dict:
         if tpl:
             (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
         return cfg
+    if md.get("tokenizer.ggml.model") in ("plamo2", "plamo3"):   # PLaMo 3 Translate
+        from strata_plamo import PlamoTokenizer
+        cfg = PlamoTokenizer.from_gguf(gguf_path).write_dir(out)
+        (out / "tokenizer.json").write_text(json.dumps(cfg, ensure_ascii=False, indent=1), encoding="utf-8")
+        tpl = md.get("tokenizer.chat_template")
+        if tpl:
+            (out / "chat_template.jinja").write_text(tpl, encoding="utf-8", newline="\n")
+        return cfg
     tk = Tokenizer.from_gguf(gguf_path)
     cfg = {
         "model": "gpt2",
@@ -722,6 +735,9 @@ def main() -> int:
         print("tokenizer/: Unigram, vocab %d, specials %s" % (cfg["vocab_size"], cfg["special_ids"]))
         if args.check:   # the round trip is byte-level BPE's property: Unigram normalizes its input
             print("--check: a Unigram tokenizer has no exact round trip (its input is normalized)")
+        return 0
+    if cfg["model"] in ("plamo2", "plamo3"):
+        print("tokenizer/: PLaMo (%s), vocab %d, specials %s" % (cfg["model"], cfg["vocab_size"], cfg["special_ids"]))
         return 0
     print("tokenizer/: vocab %d, merges %d, pre %s, specials %s"
           % (cfg["vocab_size"], cfg["n_merges"], cfg["pre"], cfg["special_ids"]))

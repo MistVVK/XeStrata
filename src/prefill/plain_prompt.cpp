@@ -974,7 +974,6 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     const int64_t FS = dense_ ? s.n_ff : s.n_ff_shexp, qw = (has_gate_ ? 2 : 1) * NH * HD;
     const float eps = (float) s.rms_eps;
     const k::QsaShapes qs = attn_shapes();
-    const k::RopeScaling& rs = k::rope_scaling();
     strata::gpu::Stream cs = cs_;
     prefill::Gemm& gm = prompt_gemm().gemm;
     auto f16 = [&](const float* x, int64_t rows, int64_t cols) { kernels::f32_to_f16_bulk(x, P.x16, rows * cols, cs); };
@@ -1074,7 +1073,8 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
             // the products whose sums are read once, by the residual's add or the SwiGLU, in FP16 as they come where
             // their FP16 sums are taken (not widened into FP32 first: a pass over every sum, the RTX 4070's Qwen3.5-9B
             // prompt 75 ms of 1.0 s at 4K, 2026-11-07); y16 in the FP32 buffer's room
-            const bool half_rows = dense_half_sums_ && !hooked && T >= dense_native_rows_ && gm.half_ok(cs);
+            // (not with plamo3's norms after the mixer and the FFN: their inputs are the products' FP32 rows)
+            const bool half_rows = dense_half_sums_ && !hooked && !plamo_ && T >= dense_native_rows_ && gm.half_ok(cs);
             auto proj_h = [&](const W& w, void* y) {
                 gm.native_half(P.x16, w.type, w.data, static_cast<uint16_t*>(y), T, w.n_out, w.n_in);
             };
@@ -1191,7 +1191,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                         for (int64_t t0 = 0; t0 < T; t0 += per)
                             k::native_qsa_rms_norm_rope(in + t0 * heads * in_row, (int) in_row, gamma, out + t0 * heads * HD,
                                                         (int) (std::min(per, T - t0) * heads), (int) HD,
-                                                        (int) s.rope_dims, eps, rs, pos + t0 * heads, cs);
+                                                        (int) s.rope_dims, eps, rope_of(b), pos + t0 * heads, cs);
                     };
                     norm_rope(P.qfull, qw / NH, b.q_norm, P.qcur, NH, P.pos_q);
                     norm_rope(P.kraw, HD, b.k_norm, P.kcur, NKV, P.pos_k);
@@ -1211,11 +1211,12 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     const int64_t cap = std::min<int64_t>(opt_.max_cells, pa + T);
                     const int64_t per_q = (int64_t) k::qsa_decode_attn_scratch_floats(cap, qs);
                     const int64_t nq_max = std::max<int64_t>(1, std::min<int64_t>((int64_t) opt_.max_t * attn_scratch_floats_ / per_q, 4096));
-                    const bool batched = prompt_attn_on && k::prompt_attn(P.qcur, pools, pa, T, qs, P.attn, cs);
+                    const bool batched =
+                        prompt_attn_on && k::prompt_attn(P.qcur, pools, pa, T, qs, P.attn, cs, window_of(b));
                     for (int64_t t = 0; !batched && t < T; t += nq_max) {
                         const int nq = (int) std::min<int64_t>(nq_max, T - t);
                         k::qsa_dense_attn_batch(P.qcur + t * NH * HD, pools, P.steps + t * k::kStepCount, cap, qs,
-                                                attn_scratch_, P.attn + t * NH * HD, nq, cs);
+                                                attn_scratch_, P.attn + t * NH * HD, nq, cs, window_of(b));
                     }
                     if (opt_.kv_q4 != 0) k::fwht256_inplace_cuda(P.attn, T * NH, cs);
                     const float* ao = P.attn;
@@ -1232,8 +1233,14 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                         hook(ProductHook::kO, b.o, P.x16, P.mix);
                     }
                 }
-                if (half_rows) prefill::add_h(P.x, reinterpret_cast<const uint16_t*>(P.mix), T * N, cs);
-                else k::add_inplace(P.x, P.mix, T * N, cs);
+                if (half_rows) {
+                    prefill::add_h(P.x, reinterpret_cast<const uint16_t*>(P.mix), T * N, cs);
+                } else if (b.attn_post != nullptr) {   // plamo3: the mixer's output normed before the add
+                    k::native_qsa_rms_norm_weighted(P.mix, b.attn_post, P.hn, (int) N, (int) T, eps, cs);
+                    k::add_inplace(P.x, P.hn, T * N, cs);
+                } else {
+                    k::add_inplace(P.x, P.mix, T * N, cs);
+                }
                 mark(b.recurrent ? 0 : 4, t_mark);
 
                 if (dense_) {   // qwen35's FFN: gate and up from the normed rows, the SwiGLU, down; int8 where it can
@@ -1267,7 +1274,12 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                         proj(b.sh_down, P.moe_out, T, 0, dense_half_sums_);
                         hook(ProductHook::kDown, b.sh_down, P.x16, P.moe_out);
                     }
-                    k::add_inplace(P.x, P.moe_out, T * N, cs);
+                    if (b.ffn_post != nullptr) {   // plamo3: the FFN's output normed before the add
+                        k::native_qsa_rms_norm_weighted(P.moe_out, b.ffn_post, P.hn, (int) N, (int) T, eps, cs);
+                        k::add_inplace(P.x, P.hn, T * N, cs);
+                    } else {
+                        k::add_inplace(P.x, P.moe_out, T * N, cs);
+                    }
                     steer(b, T, P.x, cs);
                     mark(3, t_mark);
                     if (!is_mtp) unbind_block(l);

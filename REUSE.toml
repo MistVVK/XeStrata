@@ -173,3 +173,8 @@ SPDX-License-Identifier = "BSD-2-Clause"
 path = ["third_party/main/dlpack/LICENSE"]
 SPDX-FileCopyrightText = "The DLPack contributors"
 SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ["third_party/main/py3langid/**"]
+SPDX-FileCopyrightText = ["2011 Marco Lui", "2021 Adrien Barbaresi"]
+SPDX-License-Identifier = "BSD-3-Clause"

@@ -50,12 +50,14 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
 /// qwen35moe (Ornith-1.5: 16/2 heads of 256), qwen35 (Qwen3.5-9B: 16/4 heads of 256) and qwen3moe (llm-jp-4.1: 40/4
 /// heads of 128).  `max_cells` is the cache's capacity and sizes the grid (`qsa_decode_attn_scratch_floats(max_cells,
 /// s)` scratch floats per query); a grid that followed the context would be baked into a captured graph.  The shapes
-/// the kernels are built for are (head_dim 256, 12, 8 or 4 query heads per KV head) and (128, 10); any other throws,
-/// naming the shape.
+/// the kernels are built for are (head_dim 256, 12, 8 or 4 query heads per KV head) and (128, 10, 6, 16 or 8); any other
+/// throws, naming the shape.  `window` > 0 (a sliding-window layer, PLaMo 3's): the last `window` cells only, cells
+/// [max(0, n_kv - window), n_kv).
 void qsa_dense_attn_step(const float* q, const QsaAttnPools& pools, const int32_t* step, int64_t max_cells,
-                         const QsaShapes& s, float* scratch, float* attn, void* stream);
+                         const QsaShapes& s, float* scratch, float* attn, void* stream, int64_t window = 0);
 void qsa_dense_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* steps, int64_t max_cells,
-                          const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
+                          const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream,
+                          int64_t window = 0);
 /// Times the fp16 score loop's forms (the cells a step takes) for shape `s` on the stream's GPU, once a GPU and shape,
 /// over a dummy cache of up to 16K of `max_cells` cells, and keeps the fastest for qsa_dense_attn_step / _batch with an
 /// fp16 cache.  Call before a graph that holds them is recorded (it allocates and synchronizes); without it they take

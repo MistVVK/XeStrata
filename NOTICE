@@ -93,6 +93,10 @@ Every copyright holder whose work is in this repository, its license and where t
   MIT or public domain (the Unlicense), at your option - third_party/main/stb/stb_image.h (stb_image v2.30, an
   unmodified copy), which the image engine (strata-image) is compiled with - third_party/main/stb/LICENSE,
   LICENSES/MIT.txt, LICENSES/Unlicense.txt
+- Copyright (c) 2011 Marco Lui; fork Copyright (c) 2021, Adrien Barbaresi
+  BSD-3-Clause - third_party/main/py3langid/ (py3langid 0.4.0, its package and trained model, unmodified), which the
+  server's translation APIs detect a source text's language with - third_party/main/py3langid/LICENSE,
+  LICENSES/BSD-3-Clause.txt
 - Copyright 2021 The Outfit Project Authors (https://github.com/Outfitio/Outfit-Fonts)
   SIL Open Font License 1.1 - third_party/main/outfit/, the web app's font - third_party/main/outfit/OFL.txt
 - Copyright (c) 2013-2020 Khan Academy and other contributors

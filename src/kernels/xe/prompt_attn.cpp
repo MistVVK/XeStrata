@@ -48,12 +48,12 @@ using xe::attn::q4_row8;
 
 // the shared attention for the pools (below)
 bool flash_pools(sycl::queue& queue, const float* q, const QsaAttnPools& pools, int fmt, int64_t pos0, int64_t T,
-                 const QsaShapes& s, float* attn);
+                 const QsaShapes& s, float* attn, int64_t window = 0);
 
 }  // namespace
 
 bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* page_table,
-                 int64_t pos0, int64_t T, const QsaShapes& s, float* attn, void* stream) {
+                 int64_t pos0, int64_t T, const QsaShapes& s, float* attn, void* stream, int64_t window) {
     if (T <= 0) return true;
     if (s.n_head_kv <= 0 || s.n_head % s.n_head_kv != 0 || s.page_size <= 0) return false;
     sycl::queue& queue = core::Runtime::get().stream(stream);
@@ -68,7 +68,7 @@ bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
     pools.v_pool = v_pool;
     pools.page_table = page_table;
     if (!no_mma && xe::amd_wmma(queue.get_device())) {
-        if (!flash_pools(queue, q, pools, kFmtF16, pos0, T, s, attn)) return false;
+        if (!flash_pools(queue, q, pools, kFmtF16, pos0, T, s, attn, window)) return false;
     } else {
         FlashAttnArgs a;
         a.q32 = q;
@@ -83,6 +83,7 @@ bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
         a.rows = a.n_causal = a.row_end = T;
         a.keys = pos0 + T;
         a.pos0 = pos0;
+        a.window = window;
         a.out = attn;
         a.out_f32 = true;
         a.scale = 1.0f / std::sqrt((float) s.head_dim);
@@ -131,7 +132,7 @@ bool env_off(const char* name) {
 // they are, the other formats and page sizes gathered into local memory as FP16 a chunk at a time; the output kept in
 // the matrix engines' accumulators.  STRATA_PROMPT_ATTN_FLASH=0: the kernels above (A/B)
 bool flash_pools(sycl::queue& queue, const float* q, const QsaAttnPools& pools, int fmt, int64_t pos0, int64_t T,
-                 const QsaShapes& s, float* attn) {
+                 const QsaShapes& s, float* attn, int64_t window) {
     static const bool off = env_off("PROMPT_ATTN_FLASH");
     if (off) return false;
     FlashAttnArgs a;
@@ -152,6 +153,7 @@ bool flash_pools(sycl::queue& queue, const float* q, const QsaAttnPools& pools, 
     a.rows = a.n_causal = T;
     a.keys = pos0 + T;
     a.pos0 = pos0;
+    a.window = window;
     a.first = 0;
     a.row_end = T;
     a.out = attn;
@@ -312,8 +314,8 @@ void release_unpicked(sycl::queue& queue, void* stream, const Picks& p) {
 
 // the matrix engines' kernel for the pools, launched (false: none takes them on this GPU)
 bool run_mma(sycl::queue& queue, const float* q, const QsaAttnPools& pools, int fmt, int64_t pos0, int64_t T,
-             const QsaShapes& s, float* attn) {
-    return flash_pools(queue, q, pools, fmt, pos0, T, s, attn);
+             const QsaShapes& s, float* attn, int64_t window = 0) {
+    return flash_pools(queue, q, pools, fmt, pos0, T, s, attn, window);
 }
 
 // The fastest of the kernels over a dummy chunk: up to 2,048 queries after the rest of `cells` cells, zero pools
@@ -468,7 +470,7 @@ void prompt_attn_tune(const QsaShapes& s, int fmt, int64_t max_cells, void* stre
 }
 
 bool prompt_attn(const float* q, const QsaAttnPools& pools, int64_t pos0, int64_t T, const QsaShapes& s, float* attn,
-                 void* stream) {
+                 void* stream, int64_t window) {
     if (T <= 0) return true;
     if (s.n_head_kv <= 0 || s.n_head % s.n_head_kv != 0 || s.page_size <= 0 || pools.page_table == nullptr) return false;
     const int fmt = pool_format(pools);
@@ -488,17 +490,20 @@ bool prompt_attn(const float* q, const QsaAttnPools& pools, int64_t pos0, int64_
         pick = pos0 + T >= p.split ? p.long_pick : p.short_pick;
     }
     if (pick == kPickNone) return false;
+    // a sliding window (PLaMo 3's layers): the shared attention's forms, which take its lower bound; the int8 and the
+    // maker's kernels read every key
+    if (window > 0 && (pick == kPickI8 || pick == kPickMaker)) pick = kPickMma;
     if ((pick == kPickI8 && run_i8(queue, q, pools, pos0, T, s, attn, stream)) ||
         (pick == kPickMaker && run_maker(queue, q, pools, pos0, T, s, attn, stream))) {
         if (stream == nullptr) queue.wait_and_throw();
         return true;
     }
-    if (pick != kPickFp16 && run_mma(queue, q, pools, fmt, pos0, T, s, attn)) {
+    if (pick != kPickFp16 && run_mma(queue, q, pools, fmt, pos0, T, s, attn, window)) {
         if (stream == nullptr) queue.wait_and_throw();
         return true;
     }
     if (fmt != kFmtF16) return false;   // the FP32 and WMMA kernels read FP16 pools: the caller keeps the decode kernel
-    return prompt_attn(q, pools.k_pool, pools.v_pool, pools.page_table, pos0, T, s, attn, stream);
+    return prompt_attn(q, pools.k_pool, pools.v_pool, pools.page_table, pos0, T, s, attn, stream, window);
 }
 
 }  // namespace strata::kernels

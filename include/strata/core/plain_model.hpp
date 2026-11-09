@@ -232,6 +232,11 @@ public:
     /// Reads the model's shape, uploads its dense weights, opens its experts and sizes the VRAM tier from what the
     /// device has left.  False, with the reason, for a model this engine does not run.
     bool load(const PlainOptions& opt, std::string& err);
+    /// The rotations a model's layers take, from the options and the file (the GPU's and the CPU's forward alike): the
+    /// full-attention layers' (`full`, the scaling the options or the file ask for) and the sliding-window ones' (`swa`:
+    /// their own base, not scaled).  False with the reason for a scaling that cannot be.
+    static bool rope_scalings(const ModelSpec& s, const PlainOptions& opt, strata::kernels::RopeScaling& full,
+                              strata::kernels::RopeScaling& swa, std::string& err);
     const ModelSpec& spec() const { return spec_; }
     int64_t vocab() const { return n_vocab_; }
     /// The model carries a recurrent state (GDN layers): a sequence can be extended, not cut back to a prefix.
@@ -551,6 +556,12 @@ private:
         const float *conv = nullptr, *dt = nullptr, *a = nullptr, *ssm_norm = nullptr;
         W q, k, v, o;                                         // attention
         const float *q_norm = nullptr, *k_norm = nullptr;
+        /// plamo3: the RMSNorms after the attention and after the FFN (their outputs normed before the residual's add),
+        /// the fused [q | k | v] and [gate | up] matrices q, k, v, sh_gate and sh_up are row ranges of, and whether the
+        /// layer is a sliding-window one
+        const float *attn_post = nullptr, *ffn_post = nullptr;
+        W qkv_all, gu_all;
+        bool swa = false;
         const float* router = nullptr;                        // F32 [n_embd, n_expert]
         const float* sh_gate_inp = nullptr;                   // F32 [n_embd]
         W sh_gate, sh_up, sh_down;                            // the shared expert, or qwen35's dense FFN
@@ -895,7 +906,16 @@ private:
     int64_t nkv_ = 0;                ///< the attention blocks' K/V heads (the same in every one)
     bool has_gate_ = false;          ///< the attention's output gate: [q | gate] per head (qwen35moe)
     bool has_shared_ = false;        ///< the gated shared expert (qwen35moe)
-    bool dense_ = false;             ///< a dense FFN in every block and no experts (qwen35)
+    bool dense_ = false;             ///< a dense FFN in every block and no experts (qwen35, plamo3)
+    bool plamo_ = false;             ///< plamo3: fused products, norms after the mixer and the FFN, sliding windows
+    /// the rotation of the full-attention layers (the file's scaling) and of the sliding-window ones (their own base,
+    /// no scaling: llama.cpp's freq_base_swa with freq_scale_swa 1)
+    strata::kernels::RopeScaling rope_full_, rope_swa_;
+    const strata::kernels::RopeScaling& rope_of(const Block& b) const { return b.swa ? rope_swa_ : rope_full_; }
+    /// the cells a block's attention reads back from its own: a sliding-window layer's window, else 0 (every cell)
+    int64_t window_of(const Block& b) const { return b.swa ? spec_.swa_window : 0; }
+    /// rows [r0, r1) of a matrix uploaded whole (a fused product's part): the same blocks, offset by whole rows
+    static W row_view(const W& all, int64_t r0, int64_t r1);
     /// a dense model's one-row windows with a graph or straight onto the stream: timed on the first decode windows
     /// (STRATA_PLAIN_EAGER=0 / 1 fixes it).  Other models: with a graph
     StepForm step_form_{"PLAIN_EAGER"};
