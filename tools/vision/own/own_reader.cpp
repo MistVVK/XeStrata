@@ -2,12 +2,16 @@
 #include "own_reader.h"
 
 #include "vit_ref.h"
+#ifdef STRATA_VIT_GPU
+#include "vit_gpu.h"
+#endif
 
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
+#include <memory>
 #include <thread>
 
 namespace strata_vit {
@@ -28,7 +32,14 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
 }  // namespace
 
 bool own_reader_supported(const std::string& mmproj, bool gpu, std::string& why) {
-    if (gpu) { why = "this build has no GPU backend for the own tower yet"; return false; }
+    if (gpu) {
+#ifdef STRATA_VIT_GPU
+        if (!VitGpu::available(why)) return false;
+#else
+        why = "this build has no GPU backend for the own tower";
+        return false;
+#endif
+    }
     Gguf gg;
     VitGeometry g;
     if (!gg.open(mmproj, why) || !vit_geometry_from_gguf(gg, g, why)) return false;
@@ -38,29 +49,61 @@ bool own_reader_supported(const std::string& mmproj, bool gpu, std::string& why)
 int own_reader_run(const OwnReaderOptions& o) {
     using clock = std::chrono::steady_clock;
     const auto load_t0 = clock::now();
-    if (o.gpu) {
-        std::printf("ERR this build has no GPU backend for the own tower yet (use --tower mtmd)\n");
+    auto fail = [](const std::string& msg, int code) {
+        std::printf("ERR %s\n", msg.c_str());
         std::fflush(stdout);
-        return 3;
-    }
+        return code;
+    };
+#ifndef STRATA_VIT_GPU
+    if (o.gpu) return fail("this build has no GPU backend for the own tower (use --tower mtmd)", 3);
+#endif
     Gguf gg;
     VitGeometry geo;
     std::string err;
-    if (!gg.open(o.mmproj, err) || !vit_geometry_from_gguf(gg, geo, err) || !vit_geometry_supported(geo, err)) {
-        std::printf("ERR cannot load the vision encoder %s (%s)\n", o.mmproj.c_str(), err.c_str());
-        std::fflush(stdout);
-        return 1;
-    }
-    VitRef tower;
-    if (!tower.load(gg, geo, err)) {
-        std::printf("ERR cannot load the vision encoder %s (%s)\n", o.mmproj.c_str(), err.c_str());
-        std::fflush(stdout);
-        return 1;
-    }
+    if (!gg.open(o.mmproj, err) || !vit_geometry_from_gguf(gg, geo, err) || !vit_geometry_supported(geo, err))
+        return fail("cannot load the vision encoder " + o.mmproj + " (" + err + ")", 1);
     int threads = o.threads;
-    if (threads <= 0) threads = (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency() / 2));
-    std::fprintf(stderr, "strata-vision: own tower (%s, %d layers, width %d) loaded in %.1f s, on the CPU, %d threads\n", geo.projector.c_str(), geo.layers,
-                 geo.width, std::chrono::duration<double>(clock::now() - load_t0).count(), threads);
+    std::unique_ptr<VitRef> cpu;
+#ifdef STRATA_VIT_GPU
+    std::unique_ptr<VitGpu> gpu;
+    if (o.gpu) {
+        std::string why;
+        if (!VitGpu::available(why)) return fail("this picture reader found no GPU (" + why + ")", 3);
+        gpu.reset(new VitGpu());
+        // buffers for the largest picture the limit allows (without a limit: the tower's own 4,096 tokens): claimed now, before READY
+        const int tokens = o.max_tokens > 0 ? o.max_tokens + o.max_tokens / 8 : geo.max_tokens;
+        if (!gpu->load(gg, geo, 0, tokens * 4, err)) return fail("cannot load the vision encoder " + o.mmproj + " (" + err + ")", 1);
+    }
+#endif
+    if (!o.gpu) {
+        cpu.reset(new VitRef());
+        if (!cpu->load(gg, geo, err)) return fail("cannot load the vision encoder " + o.mmproj + " (" + err + ")", 1);
+        if (threads <= 0) threads = (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency() / 2));
+    }
+    std::fprintf(stderr, "strata-vision: own tower (%s, %d layers, width %d) loaded in %.1f s, %s\n", geo.projector.c_str(), geo.layers, geo.width,
+                 std::chrono::duration<double>(clock::now() - load_t0).count(), o.gpu ? "on the GPU" : ("on the CPU, " + std::to_string(threads) + " threads").c_str());
+    auto encode = [&](const PreparedImage& prep, std::vector<float>& rows, int& nx, int& ny, std::string& e) {
+#ifdef STRATA_VIT_GPU
+        if (gpu) return gpu->encode(prep, rows, nx, ny, e);
+#endif
+        return cpu->encode(prep, threads, rows, nx, ny, e);
+    };
+#ifdef STRATA_VIT_GPU
+    if (gpu) {   // warm up at the largest picture before READY: the work buffers are taken now, not at the first real picture
+        const auto w0 = clock::now();
+        ImageU8 gray;
+        gray.w = gray.h = 2048;
+        gray.rgb.assign((size_t) 2048 * 2048 * 3, 128);
+        PreparedImage wp;
+        std::vector<float> rows;
+        int nx = 0, ny = 0;
+        if (prepare_image(gray, geo, o.min_tokens, o.max_tokens, wp, err) && encode(wp, rows, nx, ny, err))
+            std::fprintf(stderr, "strata-vision: warmed up at %d image tokens in %.1f s, %.0f MiB of GPU memory\n", nx * ny,
+                         std::chrono::duration<double>(clock::now() - w0).count(), (double) gpu->device_bytes() / 1048576.0);
+        else
+            return fail("the vision encoder failed its warm-up (" + err + ")", 1);
+    }
+#endif
     std::printf("READY %d\n", geo.out_dim);
     std::fflush(stdout);
 
@@ -85,7 +128,7 @@ int own_reader_run(const OwnReaderOptions& o) {
         }
         std::vector<float> rows;
         int nx = 0, ny = 0;
-        if (!tower.encode(prep, threads, rows, nx, ny, err)) { std::printf("ERR the vision encoder failed (%s)\n", err.c_str()); std::fflush(stdout); continue; }
+        if (!encode(prep, rows, nx, ny, err)) { std::printf("ERR the vision encoder failed (%s)\n", err.c_str()); std::fflush(stdout); continue; }
         const int n = nx * ny;
         FILE* f = std::fopen(out.c_str(), "wb");
         if (!f) { std::printf("ERR cannot write %s\n", out.c_str()); std::fflush(stdout); continue; }
