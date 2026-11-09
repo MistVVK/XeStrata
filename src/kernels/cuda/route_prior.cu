@@ -61,11 +61,20 @@ __global__ void route_prior_k(const float* __restrict__ logits, const int32_t* _
             const float op = __shfl_xor_sync(0xffffffffu, bp, m, 32);
             if (ob > best || (ob == best && oe < be)) { best = ob; be = oe; bp = op; }
         }
-        if ((be & 31) == lane) s[be >> 5] = -FLT_MAX;
-        if (lane == rank) { id[rank] = be; sel_p = bp; }
+        // a fully degenerate token row (every s NaN or -inf: garbage logits) leaves be at the sentinel on every
+        // lane: be >> 5 would index far past s[16], and writing the sentinel into ids kills the request on the
+        // host's range check.  Keep the router's own pick instead - a token the prior cannot read is unrouted
+        // by it, which is exactly what "prior not applied" means.
+        if (be < 512 && (be & 31) == lane) s[be >> 5] = -FLT_MAX;
+        if (lane == rank) {
+            const int prev = id[rank];
+            id[rank] = be < 512 ? be : prev;
+            sel_p = bp;
+        }
         sel_sum += bp;                                      // the same on every lane
     }
-    if (lane < 10) w[lane] = sel_p / fmaxf(sel_sum, 1e-30f);
+    // sel_sum is 0 only for a fully degenerate token: leave the router's weights beside its own picks
+    if (lane < 10 && sel_sum > 0.0f) w[lane] = sel_p / sel_sum;
 }
 
 }  // namespace
