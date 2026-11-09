@@ -1,10 +1,10 @@
 // tests/quant/quant_bench.cpp - the layer's dot kernels and activation quantizers against ggml-cpu's, speed (links ggml-cpu: test only).
 //
-// For every dot type: R rows of 8192 elements (L2-resident chunk), one activation row; ours and ggml's alternate in interleaved rounds (ABAB...), each round
+// For every dot type: R rows of n elements (64 rows of 8192: an L2-resident chunk; --rows 4096 streams from DRAM), one activation row; ours and ggml's alternate in interleaved rounds (ABAB...), each round
 // runs every row `reps` times; the report is the median of the per-round ratio ggml_time / our_time (> 1: ours is faster) and the number of rounds ours won.
 // Bit-exactness is the oracle's job (quant_parity); this only answers "is the row faster or slower than ggml's".
 //
-// usage: quant_bench [--rounds N] [--n ELEMENTS] [--type NAME]
+// usage: quant_bench [--rounds N] [--n ELEMENTS] [--rows R] [--type NAME]
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -56,11 +56,12 @@ double median(std::vector<double> v) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    int rounds = 11, n = 8192;
+    int rounds = 11, n = 8192, R = 64;
     const char* only = nullptr;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--rounds") && i + 1 < argc) rounds = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--n") && i + 1 < argc) n = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--rows") && i + 1 < argc) R = std::atoi(argv[++i]);   // 4096+ rows stream from DRAM like the pool's experts
         else if (!std::strcmp(argv[i], "--type") && i + 1 < argc) only = argv[++i];
     }
     ggml_cpu_init();
@@ -71,7 +72,6 @@ int main(int argc, char** argv) {
                                       sq::Type::IQ1_S, sq::Type::IQ1_M, sq::Type::IQ2_XXS, sq::Type::IQ2_XS, sq::Type::IQ2_S, sq::Type::IQ3_XXS,
                                       sq::Type::IQ3_S, sq::Type::IQ4_XS};
     Rng rng;
-    const int R = 64;
     for (sq::Type st : kTypes) {
         const sq::TypeInfo* ti = sq::type_info(st);
         if (only != nullptr && std::strcmp(only, ti->name) != 0) continue;

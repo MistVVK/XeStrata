@@ -1239,7 +1239,7 @@ void dot_nvfp4_q8_0(int n, float* STRATA_RESTRICT s, const void* STRATA_RESTRICT
 #else
     for (int ib = 0; ib < nb; ++ib) {
         for (int si = 0; si < 4; ++si) {
-            const float d = ggml_ue4m3_to_fp32(x[ib].d[si]);
+            const float d = ue4m3_to_fp32(x[ib].d[si]);
             const int q8b = si / 2;
             const int q8o = (si % 2) * QK_NVFP4_SUB;
             const float dy = h2f(y[2*ib + q8b].d);
