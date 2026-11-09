@@ -53,6 +53,7 @@ sq::Arith oracle_arith() {
 }
 
 int g_fail = 0, g_checked = 0;
+bool g_info_only = false;   // the oracle is a flavour the layer does not claim (arm64 with SVE): count the differences, do not fail
 bool g_verbose = false;
 
 void fail(const char* what, const std::string& detail) {
@@ -309,6 +310,19 @@ int main(int argc, char** argv) {
     std::printf("quant_parity: oracle flavour %s (ggml avx=%d avx2=%d fma=%d f16c=%d avx512=%d), layer best isa %s, default contract %s\n", sq::arith_name(ar),
                 ggml_cpu_has_avx(), ggml_cpu_has_avx2(), ggml_cpu_has_fma(), ggml_cpu_has_f16c(), ggml_cpu_has_avx512(), sq::isa_name(sq::best_isa()),
                 sq::arith_name(sq::default_arith()));
+#if defined(__aarch64__)
+    // The Neon contract is ggml-cpu's arm64 flavour with the dot product extension (the shipped STRATA_PORTABLE build and the Mac's native build).  A ggml-cpu without it
+    // (GCC's -mcpu=native on the Spark's mixed X925 + A725 cores resolves to plain armv8-a) runs other code, and one with SVE other branches of the Q4_0 / Q8_0 /
+    // K-quant dots: those flavours are not the contract.  The first is skipped, the second is run for information and its differences do not fail the test.
+    if (!ggml_cpu_has_dotprod()) {
+        std::printf("quant_parity: SKIPPED, this ggml-cpu is built without the dot product extension (not the Neon contract)\n");
+        return 0;
+    }
+    if (ggml_cpu_has_sve()) {
+        g_info_only = true;
+        std::printf("quant_parity: this ggml-cpu is built with SVE (not the Neon contract): differences are reported, not failed\n");
+    }
+#endif
     test_fp16();
     test_dequant(rows);
     test_boundary(rows);
@@ -320,6 +334,6 @@ int main(int argc, char** argv) {
                                       sq::Type::IQ3_S, sq::Type::IQ4_XS};
     for (sq::Type t : kTypes)
         if (only == nullptr || !std::strcmp(only, sq::type_info(t)->name)) test_dot(t, rows);
-    std::printf("quant_parity: %d comparisons, %d failures -> %s\n", g_checked, g_fail, g_fail ? "FAIL" : "PASS");
-    return g_fail ? 1 : 0;
+    std::printf("quant_parity: %d comparisons, %d failures -> %s\n", g_checked, g_fail, g_fail ? (g_info_only ? "DIFFERENCES (information only)" : "FAIL") : "PASS");
+    return (g_fail && !g_info_only) ? 1 : 0;
 }

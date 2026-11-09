@@ -74,5 +74,8 @@ macro(strata_quant_layer)
     target_include_directories(quant_parity PRIVATE ${_sq}/src/quant ${_sq}/third_party/strata-ggml)
     add_test(NAME quant_parity COMMAND quant_parity)
     set_tests_properties(quant_parity PROPERTIES TIMEOUT 600)
+    # the speed of the layer's rows against ggml-cpu's (interleaved rounds); not a test
+    add_executable(quant_bench ${_sq}/tests/quant/quant_bench.cpp)
+    target_link_libraries(quant_bench PRIVATE strata_quant ggml-cpu ggml-base)
   endif()
 endmacro()
