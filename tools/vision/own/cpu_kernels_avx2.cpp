@@ -56,6 +56,25 @@ inline V vexp(V xv) {
     return _mm256_mul_ps(y, _mm256_castsi256_ps(e));
 }
 
+// 8 floats rounded to the 16-bit type and back (BF16: integer round to nearest even; F16: the hardware conversion pair, also round to nearest even)
+inline __m256 round8(__m256 x, int kind) {
+    if (kind == 2) return _mm256_cvtph_ps(_mm256_cvtps_ph(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    __m256i u = _mm256_castps_si256(x);
+    const __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(u, 16), _mm256_set1_epi32(1));
+    u = _mm256_add_epi32(u, _mm256_add_epi32(_mm256_set1_epi32(0x7fff), lsb));
+    return _mm256_castsi256_ps(_mm256_and_si256(u, _mm256_set1_epi32((int) 0xffff0000u)));
+}
+inline void round_buf(float* p, size_t n, int kind) {
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) _mm256_storeu_ps(p + i, round8(_mm256_loadu_ps(p + i), kind));
+    if (i < n) {
+        float t[8] = {0};
+        for (size_t j = i; j < n; ++j) t[j - i] = p[j];
+        _mm256_storeu_ps(t, round8(_mm256_loadu_ps(t), kind));
+        for (size_t j = i; j < n; ++j) p[j] = t[j - i];
+    }
+}
+
 inline void conv16(const void* Wm, int kind, size_t off, int n, float* out) {
     const uint16_t* p = (const uint16_t*) Wm + off;
     int i = 0;

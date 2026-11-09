@@ -29,33 +29,6 @@ struct Layer {
     Mat qkv, o, up, down;
 };
 
-inline float round_bf16(float f) {
-    uint32_t u;
-    std::memcpy(&u, &f, 4);
-    if ((u & 0x7fffffffu) > 0x7f800000u) return f;
-    u += 0x7fffu + ((u >> 16) & 1u);
-    u &= 0xffff0000u;
-    std::memcpy(&f, &u, 4);
-    return f;
-}
-
-inline float round_f16(float f) {
-    uint32_t u;
-    std::memcpy(&u, &f, 4);
-    const uint32_t sign = u & 0x80000000u;
-    const float a = std::fabs(f);
-    if (!(a < 65520.0f)) return f;
-    if (a < 6.103515625e-05f) {
-        const float q = std::nearbyint(a * 16777216.0f) / 16777216.0f;
-        return sign ? -q : q;
-    }
-    int e;
-    std::frexp(a, &e);
-    const float ulp = std::ldexp(1.0f, e - 11);
-    const float q = std::nearbyint(a / ulp) * ulp;
-    return sign ? -q : q;
-}
-
 }  // namespace
 
 struct VitCpu::Impl {
@@ -118,8 +91,8 @@ struct VitCpu::Impl {
         const size_t blk = 16384;
         const int tasks = (int) ((n + blk - 1) / blk);
         team->run(tasks, [&](int task, int) {
-            const size_t i1 = std::min(n, ((size_t) task + 1) * blk);
-            for (size_t i = (size_t) task * blk; i < i1; ++i) p[i] = kind == 1 ? round_bf16(p[i]) : round_f16(p[i]);
+            const size_t i0 = (size_t) task * blk, i1 = std::min(n, i0 + blk);
+            ops->round16(p + i0, i1 - i0, kind);
         });
     }
 
@@ -320,9 +293,7 @@ bool VitCpu::encode(const PreparedImage& img, int threads, std::vector<float>& r
                         v[j + half] = a * si + b * co;
                     }
                 }
-            if (m.act_round) {
-                for (size_t i = 0; i < D3; ++i) row[i] = round_f16(row[i]);
-            }
+            if (m.act_round) ops.round16(row, D3, 2);
             for (int i = 0; i < D; ++i) row[i] *= kq_scale;
         });
         // K transposed per head: KT[h][d][j]

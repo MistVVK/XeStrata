@@ -33,6 +33,8 @@ struct CpuOps {
     void (*layernorm)(const float* x, float* y, int D, const float* w, const float* b, float eps);
     // x[i] += y[i], i < n
     void (*add)(float* x, const float* y, size_t n);
+    // p[i] rounded to the 16-bit type and back (kind 1 BF16, 2 F16; round to nearest even): STRATA_VIT_REF_ROUND, the inputs of the products as ggml's CPU path hands them
+    void (*round16)(float* p, size_t n, int kind);
     // One key tile of the online softmax for qrows query rows: S[qrows][nkeys] (row stride lds, already scaled) becomes P = exp(S - m_new) in place, the running
     // max m[r] and sum l[r] are updated and the context rows O[r][0..hd) (row stride ldo) are rescaled by exp(m_old - m_new) (O's P*V is added afterwards).
     void (*softmax_update)(float* S, size_t lds, int qrows, int nkeys, float* m, float* l, float* O, size_t ldo, int hd);

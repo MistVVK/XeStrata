@@ -45,6 +45,24 @@ inline V vexp(V xv) {
     return _mm512_scalef_ps(y, fx);
 }
 
+inline __m512 round16v(__m512 x, int kind) {
+    if (kind == 2) return _mm512_cvtph_ps(_mm512_cvtps_ph(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    __m512i u = _mm512_castps_si512(x);
+    const __m512i lsb = _mm512_and_si512(_mm512_srli_epi32(u, 16), _mm512_set1_epi32(1));
+    u = _mm512_add_epi32(u, _mm512_add_epi32(_mm512_set1_epi32(0x7fff), lsb));
+    return _mm512_castsi512_ps(_mm512_and_si512(u, _mm512_set1_epi32((int) 0xffff0000u)));
+}
+inline void round_buf(float* p, size_t n, int kind) {
+    size_t i = 0;
+    for (; i + 16 <= n; i += 16) _mm512_storeu_ps(p + i, round16v(_mm512_loadu_ps(p + i), kind));
+    if (i < n) {
+        float t[16] = {0};
+        for (size_t j = i; j < n; ++j) t[j - i] = p[j];
+        _mm512_storeu_ps(t, round16v(_mm512_loadu_ps(t), kind));
+        for (size_t j = i; j < n; ++j) p[j] = t[j - i];
+    }
+}
+
 inline void conv16(const void* Wm, int kind, size_t off, int n, float* out) {
     const uint16_t* p = (const uint16_t*) Wm + off;
     int i = 0;

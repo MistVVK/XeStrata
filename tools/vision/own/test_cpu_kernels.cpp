@@ -103,6 +103,22 @@ static void test_conv(const CpuOps& o) {
         }
 }
 
+static void test_round(const CpuOps& o) {
+    const CpuOps& ref = cpu_ops_scalar();
+    for (int kind = 1; kind <= 2; ++kind)
+        for (size_t n : {1u, 7u, 8u, 17u, 100u, 4099u}) {
+            std::vector<float> x(n), a, b;
+            for (size_t i = 0; i < n; ++i) x[i] = (i % 5 == 0) ? rnd(-1e-4f, 1e-4f) : (i % 7 == 0) ? rnd(-3000, 3000) : rnd(-4, 4);
+            a = x;
+            b = x;
+            o.round16(a.data(), n, kind);
+            ref.round16(b.data(), n, kind);
+            size_t bad = 0;
+            for (size_t i = 0; i < n; ++i) bad += std::memcmp(&a[i], &b[i], 4) != 0;
+            check(bad == 0, kind == 1 ? "round16 BF16 equals the scalar tier bit for bit" : "round16 F16 equals the scalar tier bit for bit", o.name, (double) bad, 0.0);
+        }
+}
+
 static void test_gelu(const CpuOps& o) {
     const int rows = 3, n = 203, ld = 211;
     std::vector<float> x((size_t) rows * ld), y;
@@ -217,6 +233,7 @@ int main(int argc, char** argv) {
         test_gemm(*o);
         test_pack_values(*o);
         test_conv(*o);
+        test_round(*o);
         test_gelu(*o);
         test_layernorm(*o);
         test_add(*o);

@@ -149,6 +149,8 @@ void add(float* x, const float* y, size_t n) {
     for (; i < n; ++i) x[i] += y[i];
 }
 
+void round16(float* p, size_t n, int kind) { round_buf(p, n, kind); }
+
 void softmax_update(float* S, size_t lds, int qrows, int nkeys, float* m, float* l, float* O, size_t ldo, int hd) {
     for (int r = 0; r < qrows; ++r) {
         float* s = S + (size_t) r * lds;
@@ -184,7 +186,7 @@ void softmax_update(float* S, size_t lds, int qrows, int nkeys, float* m, float*
 }  // namespace
 
 const CpuOps& STRATA_KN_GETTER() {
-    static const CpuOps ops = {STRATA_KN_NAME, kn::MRF, kn::NR, kn::pack_w, kn::conv, kn::gemm, kn::gelu, kn::layernorm, kn::add, kn::softmax_update};
+    static const CpuOps ops = {STRATA_KN_NAME, kn::MRF, kn::NR, kn::pack_w, kn::conv, kn::gemm, kn::gelu, kn::layernorm, kn::add, kn::round16, kn::softmax_update};
     return ops;
 }
 
