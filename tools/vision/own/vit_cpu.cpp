@@ -17,11 +17,11 @@ constexpr int kTK = 256;        // keys per attention tile
 constexpr int kRowsChunk = 4096;   // rows of the activations that are live at once outside the attention
 
 struct Mat {                     // a weight matrix [rows = out][cols = in]
-    std::vector<uint16_t> h16;   // as stored when BF16 or F16
+    std::vector<uint16_t> pk;    // BF16 / F16 matrices as 16-bit panels [ceil(rows / NR)][cols][NR] (the rows past `rows` zero), made at load; the stored copy is not kept
     std::vector<float> f32;      // anything else (F32, Q8_0 expanded)
     int kind = 0;                // 0 float32, 1 BF16, 2 F16
     int rows = 0, cols = 0;
-    const void* data() const { return kind == 0 ? (const void*) f32.data() : (const void*) h16.data(); }
+    const void* data() const { return f32.data(); }       // kind 0 only (the 16-bit matrices live in pk)
 };
 
 struct Layer {
@@ -81,9 +81,19 @@ struct VitCpu::Impl {
         m.rows = (int) t->ne[1];
         const size_t n = (size_t) t->nelem();
         if (t->type == GT_F16 || t->type == GT_BF16) {
-            m.h16.resize(n);
             m.kind = t->type == GT_BF16 ? 1 : 2;
-            return gg.read_raw(*t, m.h16.data(), err);
+            std::vector<uint16_t> raw(n);
+            if (!gg.read_raw(*t, raw.data(), err)) return false;
+            // panels of NR rows, k-major inside a panel: a product task converts a [kc][NR] slice to float with one contiguous pass
+            const int NR = ops->NR;
+            const size_t ptiles = ((size_t) m.rows + NR - 1) / NR;
+            m.pk.assign(ptiles * (size_t) m.cols * NR, 0);
+            for (int r = 0; r < m.rows; ++r) {
+                const uint16_t* src = &raw[(size_t) r * m.cols];
+                uint16_t* dst = &m.pk[(size_t) (r / NR) * m.cols * NR + (size_t) (r % NR)];
+                for (int k = 0; k < m.cols; ++k) dst[(size_t) k * NR] = src[k];
+            }
+            return true;
         }
         m.kind = 0;
         m.f32.resize(n);
@@ -130,7 +140,9 @@ struct VitCpu::Impl {
                 const int kc = std::min(kKC, K - k0);
                 for (int t = 0; t < 2; ++t) {
                     const int tv = std::max(0, std::min(NR, nv - t * NR));
-                    if (tv > 0) ops->pack_w(w.data(), w.kind, (size_t) K, n0 + t * NR, tv, k0, kc, buf + (size_t) t * kKC * NR);
+                    if (tv <= 0) continue;
+                    if (w.kind == 0) ops->pack_w(w.data(), 0, (size_t) K, n0 + t * NR, tv, k0, kc, buf + (size_t) t * kKC * NR);
+                    else ops->conv(&w.pk[((size_t) (p * 2 + t) * K + (size_t) k0) * NR], w.kind, (size_t) kc * NR, buf + (size_t) t * kKC * NR);
                 }
                 for (int t = 0; t < 2; ++t) {
                     const int tv = std::max(0, std::min(NR, nv - t * NR));

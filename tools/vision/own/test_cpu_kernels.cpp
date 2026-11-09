@@ -90,6 +90,19 @@ static void test_pack_values(const CpuOps& o) {
     (void) K;
 }
 
+static void test_conv(const CpuOps& o) {
+    for (int kind = 1; kind <= 2; ++kind)
+        for (size_t n : {1u, 15u, 32u, 33u, 5000u, 8192u + 7u}) {
+            std::vector<uint16_t> w(n);
+            for (auto& v : w) v = kind == 2 ? rnd_f16bits() : rnd_bf16bits();
+            std::vector<float> d(n, -1.0f);
+            o.conv(w.data(), kind, n, d.data());
+            double worst = 0;
+            for (size_t i = 0; i < n; ++i) worst = std::max(worst, (double) std::fabs(d[i] - (kind == 1 ? quant::bf16_to_f32(w[i]) : quant::f16_to_f32(w[i]))));
+            check(worst == 0.0, kind == 1 ? "conv BF16" : "conv F16", o.name, worst, 0.0);
+        }
+}
+
 static void test_gelu(const CpuOps& o) {
     const int rows = 3, n = 203, ld = 211;
     std::vector<float> x((size_t) rows * ld), y;
@@ -203,6 +216,7 @@ int main(int argc, char** argv) {
         std::printf("tier %s (tile %d x %d)\n", o->name, o->MR, o->NR);
         test_gemm(*o);
         test_pack_values(*o);
+        test_conv(*o);
         test_gelu(*o);
         test_layernorm(*o);
         test_add(*o);

@@ -95,6 +95,10 @@ void pack_w(const void* Wm, int kind, size_t ldw, int n0, int nvalid, int k0, in
     }
 }
 
+void conv(const void* src, int kind, size_t n, float* dst) {
+    for (size_t i = 0; i < n; i += 4096) conv16(src, kind, i, (int) std::min<size_t>(4096, n - i), dst + i);
+}
+
 // ---- elementwise ----
 inline V gelu_v(V x) {
     // 0.5 x (1 + tanh(u)), u = sqrt(2/pi) x (1 + 0.044715 x^2);  tanh(u) = 1 - 2 / (exp(2u) + 1)
@@ -180,7 +184,7 @@ void softmax_update(float* S, size_t lds, int qrows, int nkeys, float* m, float*
 }  // namespace
 
 const CpuOps& STRATA_KN_GETTER() {
-    static const CpuOps ops = {STRATA_KN_NAME, kn::MRF, kn::NR, kn::pack_w, kn::gemm, kn::gelu, kn::layernorm, kn::add, kn::softmax_update};
+    static const CpuOps ops = {STRATA_KN_NAME, kn::MRF, kn::NR, kn::pack_w, kn::conv, kn::gemm, kn::gelu, kn::layernorm, kn::add, kn::softmax_update};
     return ops;
 }
 
