@@ -313,7 +313,8 @@ bool VitRef::encode(const PreparedImage& img, int threads, std::vector<float>& r
         });
         round_inplace(qkv.data(), qkv.size(), act_round_ ? 2 : 0, nth);   // (diagnostic) mtmd's flash attention holds q, k, v in F16
         // global attention, 4 queries at a time per head
-        const int QB = 4, nqb = (N + QB - 1) / QB;
+        static constexpr int QB = 4;      // static constexpr, not const: MSVC does not treat a const local used inside the lambda as a constant (C2131 at acc[QB][128])
+        const int nqb = (N + QB - 1) / QB;
         parallel_for(H * nqb, nth, [&](int task) {
             const int hh = task / nqb, q0 = (task % nqb) * QB, nq = std::min(QB, N - q0);
             std::vector<float> sc((size_t) QB * N);
