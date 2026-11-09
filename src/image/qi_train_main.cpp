@@ -266,7 +266,7 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
                     (long long) step, (double) loss, loss_avg, (double) timestep, norm, (long long) (w * 16),
                     (long long) (h * 16), own, secs / (double) step);
         std::fflush(stdout);
-        if (step % save_every == 0 || step == steps) {
+        if ((save_every > 0 && step % save_every == 0) || step == steps) {
             const std::string path = out + "_" + std::to_string(step) + ".safetensors";
             // ai-toolkit's metadata (get_meta_for_safetensors: the job's name and version, the software, format pt)
             // and what the run was
