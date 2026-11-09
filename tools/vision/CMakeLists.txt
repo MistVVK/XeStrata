@@ -98,7 +98,7 @@ add_executable(strata-vision strata_vision.cpp)
 if(MSVC)   # #3202: the ANSI code page of the process is UTF-8, so a Cyrillic model folder reaches the reader intact (see ../../CMakeLists.txt)
   target_sources(strata-vision PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/strata-utf8.manifest)
 endif()
-target_link_libraries(strata-vision PRIVATE mtmd llama)
+target_link_libraries(strata-vision PRIVATE mtmd llama strata_vit_own)
 target_compile_features(strata-vision PRIVATE cxx_std_17)
 set_target_properties(strata-vision PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 if(STRATA_VISION_HIP)
@@ -135,6 +135,16 @@ if(STRATA_VISION_SYCL AND UNIX AND NOT APPLE)
   get_filename_component(_icpx_lib "${_icpx_bin}/../lib" ABSOLUTE)
   set_target_properties(strata-vision PROPERTIES INSTALL_RPATH "$ORIGIN;${_icpx_lib}")
 endif()
+
+# our own Qwen vision tower (own-stack phase 3): tools/vision/own, no ggml or llama.cpp inside
+add_subdirectory(own)
+
+# mtmd's side of the picture-preparation check (see own/oracle_prep.cpp): the same preprocessor class mtmd_tokenize uses
+add_executable(strata-vision-prep-oracle EXCLUDE_FROM_ALL own/oracle_prep.cpp)
+target_link_libraries(strata-vision-prep-oracle PRIVATE mtmd llama)
+target_include_directories(strata-vision-prep-oracle PRIVATE ${LLAMA_DIR}/tools/mtmd ${LLAMA_DIR}/ggml/include ${LLAMA_DIR}/include)
+target_compile_features(strata-vision-prep-oracle PRIVATE cxx_std_17)
+set_target_properties(strata-vision-prep-oracle PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 # opens a GGUF that has tensor types llama.cpp does not know (a Gyro quantization's TQK6 / TQK7) for its vocabulary only
 add_executable(strata-vision-gguf-test EXCLUDE_FROM_ALL gguf_meta_test.cpp)
