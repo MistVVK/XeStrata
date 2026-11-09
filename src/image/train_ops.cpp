@@ -5,15 +5,20 @@
 #include "strata/image/train_ops.hpp"
 
 #include "strata/core/gpu.hpp"
+#include "strata/platform/env.hpp"
+#include "strata/image/qi_kernels.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <mutex>
+#include <map>
 
 #include "dit_rows.hpp"
 
@@ -64,19 +69,57 @@ inline float tensor_reduce(int64_t n, F f, bool maximum, void* s) {
     return all;
 }
 
+/// out [rows][cols] FP16 = f(i, t) / G for every value i (row t), G the power of two that puts the largest |f| within
+/// FP16's range (pow2_full, into gbits): the rows' own scales folded into a product's operand as a whole
+template <class F>
+inline void scaled_rows16(F f, int64_t rows, int64_t cols, uint16_t* out, uint32_t* gbits, void* stream) {
+    const int64_t n = rows * cols, groups = std::min<int64_t>((n + kWG - 1) / kWG, 1024);
+    gpu::memset_async(gbits, 0, 4, stream);
+    dit_rows::q_of(stream).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) (groups * kWG)), sycl::range<1>(kWG)), [=](sycl::nd_item<1> it) {
+            float m = 0.f;
+            for (int64_t i = (int64_t) it.get_global_linear_id(); i < n; i += groups * kWG)
+                m = sycl::fmax(m, sycl::fabs(f(i, i / cols)));
+            m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
+            if (it.get_local_linear_id() == 0)   // non-negative floats order as their bits
+                sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device>(*gbits).fetch_max(
+                    sycl::bit_cast<uint32_t>(m));
+        });
+    dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const int64_t i = static_cast<int64_t>(id[0]);
+        out[i] = kernels::f16_from_f32(f(i, i / cols) / dit_rows::pow2_full(sycl::bit_cast<float>(*gbits)));
+    });
+}
+
+/// dW (+)= src * mul * G, G the power of two in gbits (1 without)
+inline void add_gscaled(const float* src, int64_t n, const uint32_t* gbits, float mul, float* dW, bool accumulate,
+                        void* stream) {
+    dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const float gscale = mul * (gbits != nullptr ? dit_rows::pow2_full(sycl::bit_cast<float>(*gbits)) : 1.f);
+        const float v = src[id[0]] * gscale;
+        dW[id[0]] = accumulate ? dW[id[0]] + v : v;
+    });
+}
+
 }  // namespace
 
 void lora_bwd(const float* hr, const float* xr, const uint16_t* h16t, const uint16_t* x16t,
                  const uint16_t* bt16, const float* dY, int64_t T, int64_t rows, int64_t cols, int64_t rank,
                  float scale, float* dB, float* dA, float* scratch, uint16_t* tmp16, float* rsT, prefill::Gemm& gemm,
-                 void* stream) {
+                 void* stream, const uint16_t* dy16_done, const float* rsY_done, const uint16_t* h16,
+                 const uint16_t* x16) {
     float* dh = scratch;                  // [T][rank]
     float* sums = scratch + (int64_t) T * rank;
     uint16_t* dy16 = tmp16;               // [T][rows]
-    uint16_t* dyt16 = dy16 + (int64_t) T * rows;    // [rows][T], dY's rows scaled by hr and transposed
+    uint16_t* dyt16 = tmp16 + (int64_t) T * rows;   // [rows][T], dY's rows scaled by hr and transposed
     uint16_t* dht16 = dyt16 + (int64_t) rows * T;   // [rank][T], dh's rows scaled by xr and transposed
     float* rsY = rsT;                    // [T] dY's own row scales
-    dit_rows::rows16(dit_rows::Grad{{dY, rows}}, T, rows, dy16, rsY, stream);
+    if (dy16_done != nullptr) {   // the caller's rows of the same dY (its own dgrad read them)
+        dy16 = const_cast<uint16_t*>(dy16_done);
+        rsY = const_cast<float*>(rsY_done);
+    } else {
+        dit_rows::rows16(dit_rows::Grad{{dY, rows}}, T, rows, dy16, rsY, stream);
+    }
     // dh = scale (dY B): the same product the forward read, with B's transposed view as the weight
     // dh is written whole here (every one of its T * rank values), so it is overwritten, not added into: the
     // caller passes scratch, which the probe leaves uninitialized (fresh device pages read as zero, which is the
@@ -85,12 +128,38 @@ void lora_bwd(const float* hr, const float* xr, const uint16_t* h16t, const uint
     dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) T * rank), [=](sycl::id<1> id) {
         dh[id[0]] *= scale;
     });
+    uint32_t *g2 = scale_word(0, stream), *g1 = scale_word(1, stream);
+    if (h16 != nullptr && x16 != nullptr && gemm.f16_batch_ex_ok()) {
+        // dB = scale dY^T h from dY's own FP16 rows read transposed, dY's row scales folded into h's rows (and h's
+        // own, hr) under one power of two; dA = dh^T x the same, x's row scales folded into dh's.  Nothing of
+        // rows x T is written again: transposing dY and its product of 32 columns took 4.5 of the B70's 10.6 ms of
+        // gate_up's backward at 2,400 rows (2026-11-09)
+        uint16_t* hs = dyt16;    // [T][rank]
+        uint16_t* dhs = dht16;   // [T][rank]
+        const float* rY = rsY;
+        scaled_rows16([=](int64_t i, int64_t t) { return kernels::f32_from_f16(h16[i]) * hr[t] * rY[t]; }, T, rank,
+                      hs, g1, stream);
+        scaled_rows16([=](int64_t i, int64_t t) { return dh[i] * (xr != nullptr ? xr[t] : 1.f); }, T, rank, dhs, g2,
+                      stream);
+        float* sA = sums + (int64_t) rows * rank;
+        // (a batch of one: the strides are the operands' sizes, oneMKL refuses 0)
+        if (!gemm.f16_batch_ex(true, false, dy16, hs, sums, rows, rank, T, 1, T * rows, T * rank, rows * rank, rows,
+                               rank, rank, 0.f) ||
+            !gemm.f16_batch_ex(true, false, dhs, x16, sA, rank, cols, T, 1, T * rank, T * cols, rank * cols, rank,
+                               cols, cols, 0.f))
+            // the callers left h16t and x16t unmade (ad_needs_xt): no way back to the transposed products
+            throw std::runtime_error("image engine (training): a LoRA's transposed products failed");
+        add_gscaled(sums, rows * rank, g1, scale, dB, true, stream);
+        // dA reads dh, which already carries scale (dL/dh = scale * dY B): no second scale here
+        add_gscaled(sA, rank * cols, g2, 1.f, dA, true, stream);
+        return;
+    }
     // dB = scale dY^T h, dA = scale dh^T x: both through one global scale on the gradient's rows
-    const float g2 = scaled_transpose_f16(dh, xr, T, rank, dht16, stream);
-    const float g1 = scaled_transpose_f16(dY, hr, T, rows, dyt16, stream);
-    wgrad(dyt16, h16t, T, rows, rank, g1 * scale, dB, sums, true, gemm, stream);
+    scaled_transpose_f16(dh, xr, T, rank, dht16, g2, stream);
+    scaled_transpose_f16(dY, hr, T, rows, dyt16, g1, stream);
+    wgrad(dyt16, h16t, T, rows, rank, g1, scale, dB, sums, true, gemm, stream);
     // dA reads dh, which already carries scale (dL/dh = scale * dY B): no second scale here
-    wgrad(dht16, x16t, T, rank, cols, g2, dA, sums + (int64_t) rows * rank, true, gemm, stream);
+    wgrad(dht16, x16t, T, rank, cols, g2, 1.f, dA, sums + (int64_t) rows * rank, true, gemm, stream);
 }
 
 void lokr_partial_trace(const float* dDelta, const uint16_t* w1, const uint16_t* w2, int64_t out_l, int64_t out_k,
@@ -183,19 +252,42 @@ float flow_loss(const float* v_pred, const float* x0, const float* eps, int64_t 
     return sq / (float) n;
 }
 
-float scaled_transpose_f16(const float* g, const float* rsX, int64_t rows, int64_t cols, uint16_t* out,
-                              void* stream) {
-    const int64_t n = rows * cols;
-    const float G = dit_rows::pow2_full(
-        tensor_reduce(n,
-                  [=](int64_t i) { return sycl::fabs(g[i] * (rsX != nullptr ? rsX[i / cols] : 1.f)); }, true,
-                  stream));
+void scaled_transpose_f16(const float* g, const float* rsX, int64_t rows, int64_t cols, uint16_t* out, uint32_t* gbits,
+                          void* stream) {
+    const int64_t n = rows * cols, groups = std::min<int64_t>((n + kWG - 1) / kWG, 1024);
+    gpu::memset_async(gbits, 0, 4, stream);
+    dit_rows::q_of(stream).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) (groups * kWG)), sycl::range<1>(kWG)), [=](sycl::nd_item<1> it) {
+            float m = 0.f;
+            for (int64_t i = (int64_t) it.get_global_linear_id(); i < n; i += groups * kWG)
+                m = sycl::fmax(m, sycl::fabs(g[i] * (rsX != nullptr ? rsX[i / cols] : 1.f)));
+            m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
+            if (it.get_local_linear_id() == 0)   // non-negative floats order as their bits
+                sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device>(*gbits).fetch_max(
+                    sycl::bit_cast<uint32_t>(m));
+        });
     dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
         const int64_t i = static_cast<int64_t>(id[0]), t = i / cols, c = i - t * cols;
-        out[c * rows + t] =
-            kernels::f16_from_f32(g[i] * (rsX != nullptr ? rsX[t] : 1.f) / G);
+        const float G = dit_rows::pow2_full(sycl::bit_cast<float>(*gbits));
+        out[c * rows + t] = kernels::f16_from_f32(g[i] * (rsX != nullptr ? rsX[t] : 1.f) / G);
     });
-    return G;
+}
+
+float scale_of(const uint32_t* gbits, void* stream) {
+    uint32_t b = 0;
+    gpu::stream_sync(stream);
+    if (!gpu::copy(&b, gbits, 4)) throw std::runtime_error("image engine (training): a scale read back");
+    return dit_rows::pow2_full(sycl::bit_cast<float>(b));
+}
+
+uint32_t* scale_word(int k, void* stream) {
+    static std::mutex mu;
+    static std::map<void*, uint32_t*> words;
+    std::lock_guard<std::mutex> lock(mu);
+    uint32_t*& w = words[stream];
+    if (w == nullptr && !gpu::alloc_device(&w, 2 * sizeof(uint32_t)))
+        throw std::runtime_error("image engine (training): the scales' words");
+    return w + k;
 }
 
 void dgrad(const uint16_t* dy16, const float* rsY, const uint16_t* wt, int64_t T, int64_t N, int64_t K, float* dX,
@@ -208,13 +300,11 @@ void dgrad(const uint16_t* dy16, const float* rsY, const uint16_t* wt, int64_t T
     });
 }
 
-void wgrad(const uint16_t* dy16t, const uint16_t* x16t, int64_t T, int64_t N, int64_t K, float gscale, float* dW,
-              float* scratch, bool accumulate, prefill::Gemm& gemm, void* stream) {
-    gemm.f16(dy16t, x16t, scratch, N, K, T);   // sum_t dY[t,n] X[t,k], the rows' scales folded in as scaled_transpose_f16 did
-    dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) N * K), [=](sycl::id<1> id) {
-        const float v = scratch[id[0]] * gscale;
-        dW[id[0]] = accumulate ? dW[id[0]] + v : v;
-    });
+void wgrad(const uint16_t* dy16t, const uint16_t* x16t, int64_t T, int64_t N, int64_t K, const uint32_t* gbits,
+           float mul, float* dW, float* scratch, bool accumulate, prefill::Gemm& gemm, void* stream) {
+    // sum_t dY[t,n] X[t,k], the rows' scales folded in as scaled_transpose_f16 did
+    gemm.f16(dy16t, x16t, scratch, N, K, T);
+    add_gscaled(scratch, N * K, gbits, mul, dW, accumulate, stream);
 }
 
 void bias_bwd(const float* dy, int64_t T, int64_t N, float* db, void* stream) {
@@ -281,7 +371,150 @@ void f16_copy(const float* x, int64_t n, uint16_t* y, void* stream) {
                                         [=](sycl::id<1> id) { y[id[0]] = kernels::f16_from_f32(x[id[0]]); });
 }
 
+void w8_quantize(const uint16_t* w16, int64_t N, int64_t K, int8_t* q, float* s, void* stream) {
+    if (K % kQiRotate != 0) throw std::invalid_argument("image engine: a QLoRA base's rows are not 256-wide groups");
+    dit_rows::rows_i8(dit_rows::HalfI8<true>{w16, K}, N, K, q, s, stream);
+}
+
+bool w8_int8(void* stream) { return prefill::Gemm::i8_usable(stream); }
+
+namespace {
+
+// the regular Hadamard rotation (kron of R4 / 2, four times: orthonormal and its own inverse) of a group of 256
+// values in local memory, one stage a base-4 digit; `v` the group's values, `w` as many more, item j of 256
+template<class Acc> void regular256(Acc v, Acc w, int j, sycl::nd_item<2> it, int base) {
+    for (int stage = 0, step = 1; stage < 4; ++stage, step *= 4) {
+        const int d = (j / step) % 4, j0 = j - d * step;
+        float acc = 0.f;
+        for (int m = 0; m < 4; ++m) {
+            // R4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]]: -1 where d + m == 3
+            const float r = d + m == 3 ? -0.5f : 0.5f;
+            acc += r * v[base + j0 + m * step];
+        }
+        sycl::group_barrier(it.get_group());
+        w[base + j] = acc;
+        sycl::group_barrier(it.get_group());
+        v[base + j] = w[base + j];
+        sycl::group_barrier(it.get_group());
+    }
+}
+
+}  // namespace
+
+void w8_dequant_rows(const int8_t* q, const float* s, int64_t N, int64_t K, uint16_t* tmp, void* stream) {
+    constexpr int kG = 256, kRowsWG = 4;   // a work-group: 4 rows of one group of 256
+    const size_t gn = (size_t) ((N + kRowsWG - 1) / kRowsWG), gk = (size_t) (K / kG);
+    dit_rows::q_of(stream).submit([&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> v(sycl::range<1>(kRowsWG * kG), cgh), w(sycl::range<1>(kRowsWG * kG), cgh);
+        cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(gn * kRowsWG, gk * kG), sycl::range<2>(kRowsWG, kG)),
+                         [=](sycl::nd_item<2> it) {
+                             const int r = (int) it.get_local_id(0), j = (int) it.get_local_id(1);
+                             const int64_t n = (int64_t) it.get_global_id(0), k = (int64_t) it.get_global_id(1);
+                             v[r * kG + j] = n < N ? (float) q[n * K + k] * s[n] : 0.f;
+                             sycl::group_barrier(it.get_group());
+                             regular256(v, w, j, it, r * kG);
+                             if (n < N) tmp[n * K + k] = kernels::f16_from_f32(v[r * kG + j]);
+                         });
+    });
+}
+
+void w8_dequant_t(const int8_t* q, const float* s, int64_t N, int64_t K, uint16_t* tmp, uint16_t* wt, void* stream) {
+    w8_dequant_rows(q, s, N, K, tmp, stream);
+    transpose_f16(tmp, N, K, wt, stream);
+}
+
+void w8_product(const uint16_t* x16, int64_t T, const Product& P, float* y, int8_t* x8, float* sx, uint16_t* x16f,
+                uint16_t* w16f, prefill::Gemm& gemm, void* stream) {
+    const int64_t N = P.N, K = P.K;
+    dit_rows::rows_i8(dit_rows::HalfI8<true>{x16, K}, T, K, x8, sx, stream);
+    if (w8_int8(stream)) {
+        prefill::Gemm::i8(x8, P.w8, reinterpret_cast<int32_t*>(y), T, N, K, N, stream);
+        qi_i8_scale(y, T, N, N, sx, P.sw, nullptr, nullptr, stream);
+        return;
+    }
+    // no int8 products: the same int8 values (the input's and the weight's, both in the rotated basis) as FP16
+    const int8_t* w8 = P.w8;
+    const float* sw = P.sw;
+    dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) (T * K)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0];
+        x16f[i] = kernels::f16_from_f32((float) x8[i] * sx[i / K]);
+    });
+    dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) (N * K)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0];
+        w16f[i] = kernels::f16_from_f32((float) w8[i] * sw[i / K]);
+    });
+    gemm.f16(x16f, w16f, y, T, N, K);
+}
+
+Arena::~Arena() {
+    for (void* p : spill_) gpu::free(p);
+    if (base_ != nullptr && owned_) gpu::free(base_);
+}
+
+void Arena::attach(void* base, size_t cap) {
+    if (base_ != nullptr && owned_) gpu::free(base_);
+    base_ = static_cast<uint8_t*>(base);
+    cap_ = need_ = cap;
+    used_ = 0;
+    owned_ = false;
+    taken_.clear();
+    replay_ = false;
+}
+
+void Arena::reset(void* stream) {
+    taken_.clear();
+    replay_ = false;
+    need_ = std::max(need_, used_);
+    if (spill_.empty() && need_ <= cap_) {
+        used_ = 0;
+        return;
+    }
+    gpu::stream_sync(stream);   // the last call's kernels still read the buffers freed here
+    for (void* p : spill_) gpu::free(p);
+    spill_.clear();
+    if (!owned_ && need_ <= cap_) {   // the caller's memory: what a call took past it went to spills alone
+        used_ = 0;
+        return;
+    }
+    if (base_ != nullptr && owned_) gpu::free(base_);
+    owned_ = true;
+    base_ = nullptr;
+    cap_ = 0;
+    if (!gpu::alloc_device(reinterpret_cast<void**>(&base_), need_))
+        throw std::runtime_error("image engine: GPU memory for a training block (" + std::to_string(need_ >> 20) +
+                                 " MiB)");
+    cap_ = need_;
+    used_ = 0;
+}
+
+void Arena::rewind() {
+    replay_ = true;
+    next_ = 0;
+}
+
+void* Arena::take(size_t bytes) {
+    bytes = (bytes + 255) / 256 * 256;
+    if (replay_) {
+        if (next_ >= taken_.size() || taken_[next_].second != bytes)
+            throw std::logic_error("image engine: a training block's tape read back in another order");
+        return taken_[next_++].first;
+    }
+    void* p = nullptr;
+    if (used_ + bytes <= cap_) {
+        p = base_ + used_;
+    } else {   // past the buffer: a buffer of its own until the next reset makes the arena large enough
+        if (!gpu::alloc_device(&p, bytes))
+            throw std::runtime_error("image engine: GPU memory for a training block (" + std::to_string(bytes >> 20) +
+                                     " MiB)");
+        spill_.push_back(p);
+    }
+    used_ += bytes;
+    taken_.emplace_back(p, bytes);
+    return p;
+}
+
 Pool::~Pool() {
+    if (arena_ != nullptr) return;   // the arena keeps them for the next call
     gpu::stream_sync(s_);
     for (void* p : owned_) gpu::free(p);
 }
@@ -289,13 +522,19 @@ Pool::~Pool() {
 // the zero goes on the stream the block's kernels run on: the compute queue's own memset is not ordered against
 // them, so a buffer allocated here could be wiped after a kernel had already written it (the late zero is what a
 // gradient that reads as exactly zero, and a forward a few percent off, looked like)
-void* Pool::take(int64_t n, int64_t bytes) {
+void* Pool::take(int64_t n, int64_t bytes, bool zero) {
     void* p = nullptr;
-    if (!gpu::alloc_device(&p, (size_t) n * (size_t) bytes))
-        throw std::runtime_error("image engine: GPU memory for a training block (" +
-                                 std::to_string(((size_t) n * (size_t) bytes) >> 20) + " MiB)");
-    owned_.push_back(p);
-    if (!gpu::memset_async(p, 0, (size_t) n * (size_t) bytes, s_))
+    if (arena_ != nullptr) {
+        p = arena_->take((size_t) n * (size_t) bytes);
+    } else {
+        if (!gpu::alloc_device(&p, (size_t) n * (size_t) bytes))
+            throw std::runtime_error("image engine: GPU memory for a training block (" +
+                                     std::to_string(((size_t) n * (size_t) bytes) >> 20) + " MiB)");
+        owned_.push_back(p);
+    }
+    static const bool all_zero = strata::env_get("POOL_ZERO") != nullptr;   // a check: every buffer zeroed
+    if (arena_ != nullptr && arena_->replaying()) return p;   // the last call's values, kept
+    if ((zero || all_zero) && !gpu::memset_async(p, 0, (size_t) n * (size_t) bytes, s_))
         throw std::runtime_error("image engine: zeroing a training block's buffer");
     return p;
 }

@@ -29,9 +29,11 @@ public:
 
     /// The DiT's file and a plain LoRA of `rank` (alpha = rank: scale 1, ai-toolkit's) on every block's six products,
     /// A drawn from `seed` (train::lora_init) and B zero.
+    /// `int8`: a QLoRA, the blocks' products on ai-toolkit's convrot8 base (train::Product::w8) made from the file's
+    /// 16-bit weights, as ai-toolkit's default (quantize, qtype convrot8) trains; else the 16-bit weights themselves.
     /// `max_blocks` (0: all of them) keeps the first blocks only: a check that cuts the DiT short.
     bool open(const std::string& dit, int64_t rank, uint64_t seed, void* stream, std::string& err,
-              int64_t max_blocks = 0);
+              int64_t max_blocks = 0, bool int8 = false);
 
     /// A caption's text encoder states [n][4096] (host FP32, the system turn already dropped) through the DiT's text
     /// projection, kept on the GPU; returns its id for step().

@@ -39,8 +39,9 @@ int64_t draw_index(std::mt19937_64& rng, IndexDraw how);
 /// A LoRA's first values (peft's: A kaiming-uniform with a = sqrt(5), bound 1 / sqrt(K); B zero), host FP32.
 void lora_init(std::mt19937_64& rng, int64_t rank, int64_t K, std::vector<float>& A);
 
-/// The sum of squares of n device FP32 values (a gradient's share of the global norm), in double on the host.
-double sq_sum(const float* g, int64_t n, void* stream);
+/// The sum of squares of every device FP32 array of `parts` (pointer, count: the gradients of a global norm), in
+/// double on the host, read back once.
+double sq_sum(const std::vector<std::pair<const float*, int64_t>>& parts, void* stream);
 
 /// One AdamW step (torch's, decoupled weight decay) over n device FP32 values: g read times gscale (the clip) and
 /// zeroed after, m and v its moments; bc1 = 1 - beta1^step, bc2 = 1 - beta2^step.

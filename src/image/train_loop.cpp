@@ -12,6 +12,8 @@
 #include <cmath>
 #include <cstring>
 #include <fstream>
+#include <map>
+#include <mutex>
 #include <sstream>
 #include <stdexcept>
 
@@ -91,23 +93,38 @@ void lora_init(std::mt19937_64& rng, int64_t rank, int64_t K, std::vector<float>
     for (float& v : A) v = u(rng);
 }
 
-double sq_sum(const float* g, int64_t n, void* s) {
-    constexpr int64_t kWG = 256, kGroups = 1024;
-    float* part = nullptr;
-    if (!gpu::alloc_device(&part, (size_t) kGroups * 4)) throw std::runtime_error("image engine: the norm's sums");
-    dit_rows::q_of(s).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) (kGroups * kWG)), sycl::range<1>((size_t) kWG)),
-        [=](sycl::nd_item<1> it) {
-            float v = 0.f;
-            for (int64_t i = (int64_t) it.get_global_linear_id(); i < n; i += kGroups * kWG) v += g[i] * g[i];
-            v = sycl::reduce_over_group(it.get_group(), v, sycl::plus<float>());
-            if (it.get_local_linear_id() == 0) part[it.get_group_linear_id()] = v;
-        });
-    std::vector<float> h((size_t) kGroups);
+double sq_sum(const std::vector<std::pair<const float*, int64_t>>& parts, void* s) {
+    constexpr int64_t kWG = 256, kGroups = 64;   // a part's work-groups: each writes one partial sum
+    const size_t n_part = parts.size() * kGroups;
+    static std::mutex mu;
+    static std::map<void*, std::pair<float*, size_t>> kept;   // the partials' buffer, kept for the stream
+    std::lock_guard<std::mutex> lock(mu);
+    auto& [part, cap] = kept[s];
+    if (cap < n_part) {
+        if (part != nullptr) {
+            gpu::stream_sync(s);
+            gpu::free(part);
+        }
+        part = nullptr;
+        if (!gpu::alloc_device(&part, n_part * 4)) throw std::runtime_error("image engine: the norm's sums");
+        cap = n_part;
+    }
+    for (size_t k = 0; k < parts.size(); ++k) {
+        const float* g = parts[k].first;
+        const int64_t n = parts[k].second;
+        float* out = part + k * kGroups;
+        dit_rows::q_of(s).parallel_for(
+            sycl::nd_range<1>(sycl::range<1>((size_t) (kGroups * kWG)), sycl::range<1>((size_t) kWG)),
+            [=](sycl::nd_item<1> it) {
+                float v = 0.f;
+                for (int64_t i = (int64_t) it.get_global_linear_id(); i < n; i += kGroups * kWG) v += g[i] * g[i];
+                v = sycl::reduce_over_group(it.get_group(), v, sycl::plus<float>());
+                if (it.get_local_linear_id() == 0) out[it.get_group_linear_id()] = v;
+            });
+    }
+    std::vector<float> h(n_part);
     gpu::stream_sync(s);
-    const bool ok = gpu::copy(h.data(), part, (size_t) kGroups * 4);
-    gpu::free(part);
-    if (!ok) throw std::runtime_error("image engine: the norm's sums read back");
+    if (!gpu::copy(h.data(), part, n_part * 4)) throw std::runtime_error("image engine: the norm's sums read back");
     double t = 0.0;
     for (float v : h) t += v;
     return t;

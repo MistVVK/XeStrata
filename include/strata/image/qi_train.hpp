@@ -36,15 +36,30 @@ struct QiBlockRun {
     train::Product p[kQiProducts];             // the frozen weights: w [N][K] FP16 and wt [K][N]; dw, db null
     const train::Adapter* ad[kQiProducts] = {};   // null: no adapter on the product
     const float *nq = nullptr, *nk = nullptr;     // [hd] FP32: attn.norm_q / norm_k
+    /// An int8 base's q, k and v as FP16 rows (w8_dequant_rows) for an input that needs no gradient: the first block
+    /// of a step, whose q, k and v read rows no LoRA has touched, where ai-toolkit's convrot8 leaves the input
+    /// unquantized (null: the W8A8 products)
+    const uint16_t* w_plain[3] = {};
     float* out = nullptr;                      // [rows][C] the block's output
     const float* dout = nullptr;               // [rows][C] its gradient (null: the forward alone)
     float* dx = nullptr;                       // [rows][C] the input's gradient, written (null: not taken)
+    /// Where the forward's tape goes (null: the call's own memory): a forward alone with it keeps the tape there, and
+    /// a later call with tape_replay and dout runs the backward on it without the forward again.
+    train::Arena* tape = nullptr;
+    bool tape_replay = false;
 };
 
 /// One block, forwards (to out) and, given dout, backwards through its own tape: the adapters' gradients added into
 /// their dA and dB (train::Adapter) and the input's into dx.  A training step's checkpointed pass runs it once
 /// forwards alone and again with dout, so the second forward is the first one's, bit for bit.  The tape and every
 /// scratch buffer belong to the call.
-void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* stream);
+/// `arena` (null: the call's own memory, freed as it returns) keeps the tape and the scratch between calls.
+void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* stream, train::Arena* arena = nullptr);
+
+/// The device memory a block's tape takes (QiBlockRun::tape): its shape and adapters' alone.
+size_t qi_block_tape_bytes(const QiBlockRun& run);
+
+/// XESTRATA_TRAIN_PROFILE=1: prints the blocks' stage times summed since the last report (nothing without it).
+void qi_block_profile_report();
 
 }  // namespace strata::image

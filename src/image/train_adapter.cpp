@@ -11,6 +11,7 @@
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
+#include <stdexcept>
 
 #include "dit_rows.hpp"
 
@@ -134,9 +135,10 @@ void lokr_product_bwd(const Adapter* ad, const uint16_t* xt, const float* rsx, f
     gemm.f16(p2_16, ad->w1t, t2, R * inn, im, ol);
     lokr_dgrad_add(dxv, t2, dyrs, s, R, K, im, inn, stream);
     // the whole delta's gradient, then each factor through its partial trace (w2 splits as a product does)
-    const float g = scaled_transpose_f16(dYv, rsx, R, N, t16t, stream);
+    uint32_t* g = scale_word(0, stream);
+    scaled_transpose_f16(dYv, rsx, R, N, t16t, g, stream);
     float* dDelta = sums;
-    wgrad(t16t, xt, R, N, K, s * g, dDelta, sums + (size_t) N * K, false, gemm, stream);
+    wgrad(t16t, xt, R, N, K, g, s, dDelta, sums + (size_t) N * K, false, gemm, stream);
     float* w2f = t1;
     gemm.f16(ad->w2a, ad->w2b, w2f, ok, inn, rk);
     uint16_t* w2_16 = p2_16 + (size_t) R * inn * ol;
@@ -191,7 +193,7 @@ void ad_product_fwd(const Adapter* ad, const uint16_t* x16, const float* rsx, fl
     if (rsx != nullptr)
         dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) R),
                                             [=](sycl::id<1> id) { hr[id[0]] *= rsx[id[0]]; });
-    transpose_f16(h16, R, ad->rank, h16t, stream);
+    if (!gemm.f16_batch_ex_ok()) transpose_f16(h16, R, ad->rank, h16t, stream);   // lora_bwd's dB reads it
     gemm.f16(h16, ad->b, delta, R, N, ad->rank);
     const float* fa_use = nullptr;
     const float* fb_use = nullptr;
@@ -201,6 +203,10 @@ void ad_product_fwd(const Adapter* ad, const uint16_t* x16, const float* rsx, fl
         fb_use = fb;
     }
     ad_rows_back(y, rsx, bias, delta, hr, fa_use, fb_use, ad->scale, R, N, stream);
+}
+
+bool ad_needs_xt(const Product& P, const Adapter* ad, prefill::Gemm& gemm) {
+    return P.dw != nullptr || (ad != nullptr && (ad->method == AdapterMethod::lokr || !gemm.f16_batch_ex_ok()));
 }
 
 void ad_product_bwd(const Product& P, const Adapter* ad, const uint16_t* x16, const float* rsx, const uint16_t* xt,
@@ -218,6 +224,7 @@ void ad_product_bwd(const Product& P, const Adapter* ad, const uint16_t* x16, co
         const float* pb = nullptr;
         const float* db = nullptr;
         if (ad->dm != nullptr) {   // only a DoRA that trains its magnitude reads the rows back
+            if (P.w == nullptr) throw std::invalid_argument("image engine: a DoRA's magnitude on an int8 base");
             gemm.f16(x16, P.w, yb, R, N, K);
             dit_rows::rows_back(yb, rsx, nullptr, R, N, stream);
             gemm.f16(h16, ad->b, yd, R, N, ad->rank);
@@ -236,8 +243,9 @@ void ad_product_bwd(const Product& P, const Adapter* ad, const uint16_t* x16, co
     dit_rows::rows16(dit_rows::Grad{{dYa, N}}, R, N, t16, trs, stream);
     dgrad(t16, trs, P.wt, R, N, K, dxv, sums, accumulate, gemm, stream);
     if (P.dw != nullptr) {
-        const float gi = scaled_transpose_f16(dYa, rsx, R, N, t16t, stream);
-        wgrad(t16t, xt, R, N, K, gi, P.dw, sums, true, gemm, stream);
+        uint32_t* gi = scale_word(0, stream);
+        scaled_transpose_f16(dYa, rsx, R, N, t16t, gi, stream);
+        wgrad(t16t, xt, R, N, K, gi, 1.f, P.dw, sums, true, gemm, stream);
     }
     if (P.db != nullptr) bias_bwd(dYv, R, N, P.db, stream);   // the bias is added after
         // the row scaling, so its gradient reads the unscaled rows (dYv, not dYa; the same buffer for a plain LoRA)
@@ -249,7 +257,7 @@ void ad_product_bwd(const Product& P, const Adapter* ad, const uint16_t* x16, co
         // factor fb = scale * c, so it takes 1 (its dh is dL/dh either way: dh = scale * dYb B)
         const float ad_scale = ad->method == AdapterMethod::dora ? 1.0f : ad->scale;
         lora_bwd(hr, rsx, h16t, xt, ad->bt, dYb, R, N, K, ad->rank, ad_scale, ad->dB, ad->dA, lscratch,
-                    ltmp16, lrsT, gemm, stream);
+                    ltmp16, lrsT, gemm, stream, dYb == dYa ? t16 : nullptr, dYb == dYa ? trs : nullptr, h16, x16);
         // dh lives in lscratch; h16 and h16t are dead and take its split (the input gradient's dX is judged
         // at 3e-5, and an FP16 rounding of dh alone costs that budget)
         ad_split16(lscratch, R, ad->rank, h16, reinterpret_cast<uint16_t*>(h16t), lrsT, stream);

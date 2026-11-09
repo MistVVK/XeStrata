@@ -513,6 +513,54 @@ void Gemm::f16_batch(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, 
     for (int64_t b = 0; b < batch; ++b) f16(X + b * sx, W + b * sw, Y + b * sy, T, N, K, ldy);
 }
 
+bool Gemm::f16_batch_ex_ok() const {
+#if STRATA_ONEMATH
+    return backend(core::Runtime::get().stream(stream_).get_device()).blas;
+#else
+    return false;
+#endif
+}
+
+bool Gemm::f16_batch_ex(bool x_t, bool w_nk, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N,
+                        int64_t K, int64_t batch, int64_t sx, int64_t sw, int64_t sy, int64_t ldx, int64_t ldw,
+                        int64_t ldy, float beta) {
+    if (T <= 0 || N <= 0 || batch <= 0) return true;
+#if STRATA_ONEMATH
+    sycl::queue& q = core::Runtime::get().stream(stream_);
+    if (backend(q.get_device()).blas) {
+        try {
+            namespace om = oneapi::math;
+            // column-major: Y^T [N][T] = op(W)^T-side [N][K] . op(X)^T-side [K][T].  W [N][K] row-major is K x N
+            // column-major (transposed to N x K); W [K][N] row-major is N x K as it is.  X [T][K] row-major is K x T
+            // as it is; X [K][T] row-major is T x K (transposed to K x T)
+            om::blas::column_major::gemm_batch(q, w_nk ? om::transpose::trans : om::transpose::nontrans,
+                                               x_t ? om::transpose::trans : om::transpose::nontrans, N, T, K, 1.0f,
+                                               reinterpret_cast<const sycl::half*>(W), ldw, sw,
+                                               reinterpret_cast<const sycl::half*>(X), ldx, sx, beta, Y, ldy, sy,
+                                               batch);
+            return true;
+        } catch (const oneapi::math::exception& e) {
+            std::fprintf(stderr, "xestrata: oneMath (a batch of transposed FP16 products): %s\n", e.what());
+        }
+    }
+#else
+    (void) x_t;
+    (void) w_nk;
+    (void) X;
+    (void) W;
+    (void) Y;
+    (void) K;
+    (void) sx;
+    (void) sw;
+    (void) sy;
+    (void) ldx;
+    (void) ldw;
+    (void) ldy;
+    (void) beta;
+#endif
+    return false;
+}
+
 // Whether oneMath's backend for `stream`'s GPU has int8 products (asked of it once, by a trial).
 static bool onemath_i8(void* stream) {
 #if STRATA_ONEMATH

@@ -51,19 +51,26 @@ float flow_loss(const float* v_pred, const float* x0, const float* eps, int64_t 
 void transpose_f16(const uint16_t* in, int64_t rows, int64_t cols, uint16_t* out, void* stream);
 
 /// A gradient's rows read by a dW: out[c * rows + t] = (g[t,c] * rsX[t]) / G as FP16, G one power of two over the
-/// whole tensor (the stored X rows are divided by their own rsX, so the factors cancel and only G is left to put
-/// back).  The G used comes back as a host float: wgrad takes it by value, and reading it off the device afterwards
-/// would be a second pass over the queue for nothing.
-float scaled_transpose_f16(const float* g, const float* rsX, int64_t rows, int64_t cols, uint16_t* out, void* stream);
+/// whole tensor (dit_rows' pow2_full: the largest value into [2^13, 2^14)); the stored X rows are divided by their own
+/// rsX, so the factors cancel and only G is left to put back.  G stays on the device: *gbits (a device word) gets the
+/// largest value's bits, which wgrad reads G from, so nothing waits for the host.
+void scaled_transpose_f16(const float* g, const float* rsX, int64_t rows, int64_t cols, uint16_t* out, uint32_t* gbits,
+                          void* stream);
+/// The G a scaled_transpose_f16 used, read back (a check's).
+float scale_of(const uint32_t* gbits, void* stream);
+/// A device word for scaled_transpose_f16's G, one of two a stream (k 0 or 1: a LoRA's backward holds two at once),
+/// allocated once: the stream runs in order, so a word is free again when the next call's write to it runs.
+uint32_t* scale_word(int k, void* stream);
 
 /// dX[T,K] = dY . W read along its rows through wt[K,N] (the transposed FP16 view of W[N,K]), the rows' scales rsY
 /// (null: 1) put back, added into dX or written over it.  scratch holds T * K FP32 sums.
 void dgrad(const uint16_t* dy16, const float* rsY, const uint16_t* wt, int64_t T, int64_t N, int64_t K, float* dX,
            float* scratch, bool accumulate, prefill::Gemm& gemm, void* stream);
 
-/// dW[N,K] = sum_t dY[t,n] X[t,k], from the two transposed FP16 views (dy16t [N,T], x16t [K,T]) times gscale.
-void wgrad(const uint16_t* dy16t, const uint16_t* x16t, int64_t T, int64_t N, int64_t K, float gscale, float* dW,
-           float* scratch, bool accumulate, prefill::Gemm& gemm, void* stream);
+/// dW[N,K] = sum_t dY[t,n] X[t,k], from the two transposed FP16 views (dy16t [N,T], x16t [K,T]) times mul and the G
+/// of gbits (scaled_transpose_f16's; null: 1).
+void wgrad(const uint16_t* dy16t, const uint16_t* x16t, int64_t T, int64_t N, int64_t K, const uint32_t* gbits,
+           float mul, float* dW, float* scratch, bool accumulate, prefill::Gemm& gemm, void* stream);
 
 /// db[N] += sum over the rows of dY (FP32).
 void bias_bwd(const float* dy, int64_t T, int64_t N, float* db, void* stream);
@@ -76,10 +83,15 @@ void scale_cols(float* y, const float* r, int64_t rows, int64_t cols, void* stre
 /// gradient reaching the weight's rows [T][rows] in FP32.  dB [rows][rank] = scale dY^T h and
 /// dA [rank][cols] = dh^T x read dh = scale (dY B), the intermediate this same call's scratch starts with (dL/dh,
 /// so dA takes no second scale); dh's own rows and scale take the product's own dgrad back to the input.
-/// h16t and x16t are the transposed views the forward kept (transpose_f16 of the rows it wrote).
+/// h16t and x16t are the transposed views the forward kept (transpose_f16 of the rows it wrote).  dy16_done and
+/// rsY_done (null: made here) are dY's FP16 rows and their scales where the caller has them already (its dgrad's).
+/// With h16 and x16, the rows themselves, and a GPU f16_batch_ex takes (Gemm::f16_batch_ex_ok), dB and dA are products
+/// that read dY's and dh's rows transposed and nothing is transposed: h16t and x16t may be null then.
 void lora_bwd(const float* hr, const float* xr, const uint16_t* h16t, const uint16_t* x16t, const uint16_t* bt16,
               const float* dY, int64_t T, int64_t rows, int64_t cols, int64_t rank, float scale, float* dB, float* dA,
-              float* scratch, uint16_t* tmp16, float* rsT, prefill::Gemm& gemm, void* stream);
+              float* scratch, uint16_t* tmp16, float* rsT, prefill::Gemm& gemm, void* stream,
+              const uint16_t* dy16_done = nullptr, const float* rsY_done = nullptr, const uint16_t* h16 = nullptr,
+              const uint16_t* x16 = nullptr);
 
 /// A LoKr's factors, backwards.  The delta is kron(w1, w2_a w2_b) and the step's gradient of the whole weight
 /// (dDelta [out][in], out = out_l * out_k, in = in_m * in_n) is what a wgrad of the delta's rows gives; each factor
@@ -153,7 +165,29 @@ struct Product {
     const uint16_t* wt = nullptr;
     float* dw = nullptr;
     float* db = nullptr;
+    /// A QLoRA's base instead of w (w null): ai-toolkit's convrot8, the weight's rows times the regular Hadamard
+    /// rotation a group of 256 and then int8 with a scale a row (value = w8 sw); the product's input rotated and made
+    /// int8 a token the same way (W8A8).  The backward reads the straight-through weight (the int8 values, rotated
+    /// back) through wt, which w8_dequant_t writes.
+    const int8_t* w8 = nullptr;
+    const float* sw = nullptr;
 };
+
+/// A weight's rows [N][K] (FP16) as a QLoRA's base: q [N][K] int8 and s [N] (Product::w8, sw).
+void w8_quantize(const uint16_t* w16, int64_t N, int64_t K, int8_t* q, float* s, void* stream);
+/// The W8A8 product of x16 [T][K] FP16 rows by P's int8 base into y [T][N] FP32 (the rows as x16 holds them, before
+/// their row scales): x8 [T][K] and sx [T] its scratch.  Where the GPU takes no int8 products the same values go
+/// through FP16 ones (ai-toolkit's path without them): x16f [T][K] and w16f [N][K] FP16 scratch then, else null.
+void w8_product(const uint16_t* x16, int64_t T, const Product& P, float* y, int8_t* x8, float* sx, uint16_t* x16f,
+                uint16_t* w16f, prefill::Gemm& gemm, void* stream);
+/// Whether w8_product takes the int8 products on `stream`'s GPU (else its FP16 scratch is needed).
+bool w8_int8(void* stream);
+/// An int8 base's weight as FP16 rows [N][K], rotated back: the product an unquantized input takes with it
+/// (ai-toolkit's convrot8 when the input needs no gradient: its weight's int8 values, the input as it is).
+void w8_dequant_rows(const int8_t* q, const float* s, int64_t N, int64_t K, uint16_t* out, void* stream);
+/// The straight-through weight of an int8 base, rotated back and transposed: wt [K][N] FP16 (a dgrad's view), through
+/// tmp [N][K] FP16 (w8_dequant_rows, then transposed as transpose_f16 does).
+void w8_dequant_t(const int8_t* q, const float* s, int64_t N, int64_t K, uint16_t* tmp, uint16_t* wt, void* stream);
 
 /// What an adapted product's forward keeps for its backward: h = x A^T as FP16 rows (h16 [T][rank]) with their
 /// scales (hr [T], the input's own scale folded in) and transposed (h16t [rank][T]).
@@ -182,24 +216,70 @@ void ad_product_fwd(const Adapter* ad, const uint16_t* x16, const float* rsx, fl
 /// the input's gradient (written, or added into with `accumulate`), the base weight's own dw and db where P has them,
 /// and the adapter's factors' gradients.  x16, rsx and xt are the forward's input rows, their scales and their
 /// transposed view; t16, trs, t16t and sums the block's own temporaries (R N, R, N R and N K + R K).
+/// Whether ad_product_bwd reads the input's transposed rows (xt): a full weight's gradient and a LoKr do, and a LoRA
+/// or DoRA where the GPU has no transposed products (Gemm::f16_batch_ex_ok); elsewhere xt may be null.
+bool ad_needs_xt(const Product& P, const Adapter* ad, prefill::Gemm& gemm);
 void ad_product_bwd(const Product& P, const Adapter* ad, const uint16_t* x16, const float* rsx, const uint16_t* xt,
                     float* dYv, float* dxv, bool accumulate, const AdKeep& keep, const AdScratch& sc, uint16_t* t16,
                     float* trs, uint16_t* t16t, float* sums, int64_t R, prefill::Gemm& gemm, void* stream);
 
-/// A block's device memory for one call, each buffer zeroed on the block's own stream and all of it freed (after the
-/// stream is done) when the pool goes: the tape and the gradients of one forward and backward.
+/// Device memory a block keeps from one call to the next (a training step runs the same block shapes again and
+/// again): one buffer, handed out in order and grown when a call needed more.  The stream runs in order, so a call's
+/// buffers are free for the next call's once its kernels are queued.
+class Arena {
+public:
+    Arena() = default;
+    Arena(const Arena&) = delete;
+    Arena& operator=(const Arena&) = delete;
+    ~Arena();
+    /// A new call: what the last one handed out is free again; a call that outgrew the buffer gets a larger one.
+    void reset(void* stream);
+    /// A second call that reads what the last one wrote: its takes, of the same sizes in the same order, get the same
+    /// buffers back, untouched (a block's tape kept from its forward for its backward).
+    void rewind();
+    bool replaying() const { return replay_; }
+    void* take(size_t bytes);
+    /// The device memory it holds (its buffer, and what the last call took past it).
+    size_t held() const { return cap_ > used_ ? cap_ : used_; }
+    /// Takes from `cap` bytes at `base` (memory of the caller's, not freed here) from now on, instead of its own.
+    void attach(void* base, size_t cap);
+
+private:
+    uint8_t* base_ = nullptr;
+    size_t cap_ = 0, used_ = 0, need_ = 0;
+    std::vector<void*> spill_;   // what a call took past the buffer, freed at the next reset
+    bool owned_ = true;          // base_ is its own (not attach's)
+    std::vector<std::pair<void*, size_t>> taken_;   // what the call since the last reset took, for rewind
+    size_t next_ = 0;
+    bool replay_ = false;
+};
+
+/// A block's device memory for one call, each buffer zeroed on the block's own stream: freed (after the stream is
+/// done) when the pool goes, or, with an arena, kept in it for the next call.  The tape and the gradients of one
+/// forward and backward.
 class Pool {
 public:
-    explicit Pool(void* stream) : s_(stream) {}
+    /// `replay`: the arena's last call's buffers again (Arena::rewind), not zeroed.
+    explicit Pool(void* stream, Arena* arena = nullptr, bool replay = false) : s_(stream), arena_(arena) {
+        if (arena_ != nullptr) {
+            if (replay) arena_->rewind();
+            else arena_->reset(stream);
+        }
+    }
     Pool(const Pool&) = delete;
     Pool& operator=(const Pool&) = delete;
     ~Pool();
     float* f(int64_t n) { return static_cast<float*>(take(n, 4)); }
     uint16_t* u(int64_t n) { return static_cast<uint16_t*>(take(n, 2)); }
+    /// The same, not zeroed: a buffer the call writes whole before it reads it (a block's tape is gigabytes, and
+    /// zeroing it every call cost more than some of the products did).
+    float* rf(int64_t n) { return static_cast<float*>(take(n, 4, false)); }
+    uint16_t* ru(int64_t n) { return static_cast<uint16_t*>(take(n, 2, false)); }
 
 private:
-    void* take(int64_t n, int64_t bytes);
+    void* take(int64_t n, int64_t bytes, bool zero = true);
     void* s_;
+    Arena* arena_ = nullptr;
     std::vector<void*> owned_;
 };
 

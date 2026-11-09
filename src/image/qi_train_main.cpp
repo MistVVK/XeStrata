@@ -5,8 +5,8 @@
 //   strata-image-qi-train prep --te <Qwen3-VL GGUF> --vae <safetensors> --list <file>
 //   strata-image-qi-train train --dit <F16 GGUF> --data <items file> --out <prefix> [--rank 32] [--steps 3000]
 //                               [--lr 1e-4] [--seed 42] [--draw balanced|content|style] [--save-every 250]
-//                               [--caption-dropout 0.05]
-//   strata-image-qi-train check --dit <F16 GGUF> --dir <dir>
+//                               [--caption-dropout 0.05] [--base bf16|int8]
+//   strata-image-qi-train check --dit <F16 GGUF> --dir <dir> [--blocks N] [--base bf16|int8]
 //
 // prep is the caches ai-toolkit fills before it trains (tools/image/qi_train_prep.py writes the list and drives it):
 // a line "img <rgb8 file> <W> <H> <out>" is an image already scaled and cropped to its bucket, encoded by the VAE to
@@ -18,6 +18,9 @@
 // caption " " the dropout swaps in), and runs ai-toolkit's loop: each epoch the items in a new order, a caption
 // dropped with its probability, a posterior draw of the latent and new noise, the schedule's index drawn, one step
 // and the clipped AdamW update; the LoRA saved every --save-every steps and at the end (<prefix>_<step>.safetensors).
+//
+// --base int8 is a QLoRA: the blocks' products on ai-toolkit's convrot8 base (W8A8, made from the 16-bit file), as
+// ai-toolkit's default trains.
 //
 // check is one step on the inputs tools/image/qi_train_step_ref.py writes (states, x0, noise, the LoRA factors), its
 // loss, prediction and gradients written back for the reference to compare.
@@ -50,8 +53,8 @@ void usage() {
                  "usage: xestrata-image-qi-train prep --te <gguf> --vae <safetensors> --list <file>\n"
                  "       xestrata-image-qi-train train --dit <gguf> --data <items> --out <prefix> [--rank N] "
                  "[--steps N] [--lr F] [--seed N] [--draw balanced|content|style] [--save-every N] "
-                 "[--caption-dropout F]\n"
-                 "       xestrata-image-qi-train check --dit <gguf> --dir <dir> [--blocks N]\n");
+                 "[--caption-dropout F] [--base bf16|int8]\n"
+                 "       xestrata-image-qi-train check --dit <gguf> --dir <dir> [--blocks N] [--base bf16|int8]\n");
 }
 
 std::map<std::string, std::string> flags(int argc, char** argv, int from) {
@@ -191,9 +194,11 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
     train::IndexDraw draw;
     if (!train::parse_index_draw(opt(f, "draw", "balanced"), draw)) throw std::invalid_argument("bad --draw");
     const std::string out = need(f, "out");
+    const std::string base = opt(f, "base", "bf16");
+    if (base != "bf16" && base != "int8") throw std::invalid_argument("bad --base (bf16 or int8)");
     QiTrainer tr;
     std::string err;
-    if (!tr.open(need(f, "dit"), rank, seed, s, err)) throw std::runtime_error(err);
+    if (!tr.open(need(f, "dit"), rank, seed, s, err, 0, base == "int8")) throw std::runtime_error(err);
     std::ifstream items(need(f, "data"));
     if (!items) throw std::runtime_error("cannot read the items");
     struct Item {
@@ -251,13 +256,15 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
                 x0[dst] = it.lat.mean[src] + it.lat.sd[src] * gauss(rng);
             }
         for (float& v : nz) v = gauss(rng);
+        const auto ts = std::chrono::steady_clock::now();
         const float loss = tr.step(txt, x0.data(), nz.data(), h, w, timestep);
         const double norm = tr.update(o);
         loss_avg = step == 1 ? loss : 0.98 * loss_avg + 0.02 * loss;
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        std::printf("step %lld loss %.5f (avg %.5f) t %.1f grad %.3f %lldx%lld %.2f s/step\n", (long long) step,
-                    (double) loss, loss_avg, (double) timestep, norm, (long long) (w * 16), (long long) (h * 16),
-                    secs / (double) step);
+        const double own = std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
+        std::printf("step %lld loss %.5f (avg %.5f) t %.1f grad %.3f %lldx%lld %.2f s (%.2f s/step)\n",
+                    (long long) step, (double) loss, loss_avg, (double) timestep, norm, (long long) (w * 16),
+                    (long long) (h * 16), own, secs / (double) step);
         std::fflush(stdout);
         if (step % save_every == 0 || step == steps) {
             const std::string path = out + "_" + std::to_string(step) + ".safetensors";
@@ -283,7 +290,8 @@ int check(const std::map<std::string, std::string>& f, void* s) {
     const int64_t n = (int64_t) p[0], h = (int64_t) p[1], w = (int64_t) p[2], rank = (int64_t) p[4];
     QiTrainer tr;
     std::string err;
-    if (!tr.open(need(f, "dit"), rank, 1, s, err, std::stoll(opt(f, "blocks", "0")))) throw std::runtime_error(err);
+    if (!tr.open(need(f, "dit"), rank, 1, s, err, std::stoll(opt(f, "blocks", "0")), opt(f, "base", "bf16") == "int8"))
+        throw std::runtime_error(err);
     const int text = tr.add_text(read_all<float>(dir + "/states.bin"), n);
     // the factors in grads()' order: per block, per product, A then B
     std::vector<train::Tensor> ts = tr.grads();

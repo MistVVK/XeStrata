@@ -27,7 +27,9 @@
 
 #include "dit_rows.hpp"
 
+#include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <sstream>
@@ -213,7 +215,9 @@ int main(int argc, char** argv) {
             Var g = load(dir, "g");
             const int64_t T = g.dim(0), C = g.dim(1);
             Dev out(T * C * 2), G(g), RS(load(dir, "rsX"));
-            const float gs = train::scaled_transpose_f16(G.cf(), RS.cf(), T, C, out.h(), s);
+            uint32_t* gw = train::scale_word(0, s);
+            train::scaled_transpose_f16(G.cf(), RS.cf(), T, C, out.h(), gw, s);
+            const float gs = train::scale_of(gw, s);
             std::vector<uint16_t> ho((size_t) T * C);
             out.read(ho.data(), T * C * 2);
             std::ofstream j(dir + "/gt.json");
@@ -241,8 +245,8 @@ int main(int argc, char** argv) {
             std::string err;
             if (!gemm.init(s, 1 << 24, err)) throw std::runtime_error(err);
             Dev dw(N * K * 4), scratch(N * K * 4), DYT(dyt), XT(xt);
-            train::wgrad(DYT.ch(), XT.ch(), T, N, K, *reinterpret_cast<const float*>(gs.raw.data()), dw.f(),
-                  scratch.f(), false, gemm, s);
+            train::wgrad(DYT.ch(), XT.ch(), T, N, K, nullptr, *reinterpret_cast<const float*>(gs.raw.data()),
+                         dw.f(), scratch.f(), false, gemm, s);
             strata::gpu::stream_sync(s);
             std::vector<float> ho((size_t) N * K);
             dw.read(ho.data(), N * K * 4);
@@ -360,6 +364,49 @@ int main(int argc, char** argv) {
             save(dir, "dm", ho.data(), rows * 4);
             save(dir, "da", ho.data() + rows, rows * 4);
             save(dir, "db", ho.data() + 2 * rows, rows * 4);
+        } else if (op == "attnbtime") {   // the attention's backward timed: rows, heads, n_causal from dims (3 floats)
+            Var dims = load(dir, "dims");
+            const int64_t T = (int64_t) dims.hf()[0], H = (int64_t) dims.hf()[1], nc = (int64_t) dims.hf()[2];
+            const int64_t hd = 128, C = H * hd, Tp = strata::image::qi_attn_rows(T);
+            std::vector<uint16_t> h16((size_t) (Tp * C));
+            std::vector<float> h32((size_t) (T * C)), hl((size_t) (T * H));
+            uint32_t st = 12345;
+            auto rnd = [&] { st = st * 1664525u + 1013904223u; return (float) (st >> 8) / 16777216.f - 0.5f; };
+            Dev Q(Tp * C * 2), K(Tp * C * 2), V(Tp * C * 2), O(T * C * 4), DO(T * C * 4), L(T * H * 4);
+            Dev dQ(T * C * 4), dK(T * C * 4), dV(T * C * 4);
+            for (Dev* d : {&Q, &K, &V}) {
+                for (size_t i = 0; i < h16.size(); ++i)
+                    h16[i] = i < (size_t) (T * C) ? strata::kernels::f16_from_f32(rnd()) : 0;
+                strata::gpu::copy(d->p(), h16.data(), h16.size() * 2);
+            }
+            for (float& v : h32) v = rnd();
+            strata::gpu::copy(DO.p(), h32.data(), h32.size() * 4);
+            strata::gpu::copy(O.p(), h32.data(), h32.size() * 4);
+            for (float& v : hl) v = 5.f;
+            strata::gpu::copy(L.p(), hl.data(), hl.size() * 4);
+            strata::prefill::Gemm gemm;
+            std::string err;
+            if (!gemm.init(s, 1 << 24, err)) throw std::runtime_error(err);
+            double best = 1e30;
+            for (int i = 0; i < 5; ++i) {
+                strata::gpu::stream_sync(s);
+                const auto t0 = std::chrono::steady_clock::now();
+                qi_attention_bwd(Q.ch(), K.ch(), V.ch(), O.cf(), L.cf(), DO.cf(), T, H, hd, dQ.f(), dK.f(), dV.f(),
+                                 false, gemm, s, nc);
+                strata::gpu::stream_sync(s);
+                const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                if (i > 0) best = std::min(best, t);
+            }
+            const double fl = 7.0 * 2.0 * (double) T * (double) T * (double) hd * (double) H;
+            std::printf("attention backward %lld rows %lld heads: %.2f ms (%.1f TFLOPS of the fused form's 7 "
+                        "products)\n", (long long) T, (long long) H, 1e3 * best, fl / best / 1e12);
+        } else if (op == "gemmtime") {   // one product's time in FP16 and W8A8: rows, K, N from dims (3 floats)
+            Var dims = load(dir, "dims");
+            const auto [f16, w8] = dit_rows::time_w8_f16((int64_t) dims.hf()[0], (int64_t) dims.hf()[1],
+                                                         (int64_t) dims.hf()[2], "the probe", s);
+            const double fl = 2.0 * dims.hf()[0] * dims.hf()[1] * dims.hf()[2];
+            std::printf("FP16 %.2f ms (%.1f TFLOPS), W8A8 %.2f ms (%.1f TOPS)\n", 1e3 * f16, fl / f16 / 1e12, 1e3 * w8,
+                        fl / w8 / 1e12);
         } else if (op == "qiblock") {
             // one Qwen-Image-2.1 block (qi_block) with plain LoRAs, what tools/image/qi_train_torch_ref.py writes:
             // dims (C, heads, head_dim, F, rows, n_text), x, cos, sin, mod, nq, nk, dout FP32; w_<p> [N][K] FP16;

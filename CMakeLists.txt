@@ -414,7 +414,8 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/s2_expert_grouped.cpp
                                     src/kernels/xe/xmx_gemm.cpp src/kernels/xe/dp4a_gemm.cpp
                                     src/kernels/xe/mma_gemm.cpp src/kernels/xe/iq_mmq.cpp src/kernels/xe/prompt_attn.cpp
-                                    src/kernels/xe/flash_attn.cpp src/kernels/xe/flash_attn_i8.cpp
+                                    src/kernels/xe/flash_attn.cpp src/kernels/xe/flash_attn_bwd.cpp
+                                    src/kernels/xe/flash_attn_i8.cpp
                                     src/kernels/xe/i8_gemm.cpp src/kernels/xe/sdpa_aotriton.cpp
                                     src/kernels/xe/matrix_report.cpp src/kernels/xe/glm5.cpp
                                     src/kernels/xe/draft_head.cpp)

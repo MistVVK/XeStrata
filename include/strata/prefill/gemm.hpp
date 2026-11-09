@@ -46,6 +46,18 @@ public:
     /// one product each.
     void f16_batch(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t batch,
                    int64_t sx, int64_t sw, int64_t sy, int64_t ldy = 0);
+    /// A strided batch of FP16 products with either operand transposed, through oneMath only (false, nothing done,
+    /// where its backend does not take the GPU's FP16 products: the caller transposes and takes f16_batch).
+    /// Y + b sy [T][N] (row stride ldy) = op(X) . op(W) (+ beta Y), op(X) [T][K]: X [T][K] (row stride ldx), or with
+    /// x_t X [K][T] (row stride ldx) read transposed; op(W) [K][N]: W [N][K] read transposed as f16 reads it
+    /// (w_nk), or W [K][N] as it is (row stride ldw).  A training step's attention reads P^T dO, dS^T Q and dS K so,
+    /// without writing the transposed maps.
+    bool f16_batch_ex(bool x_t, bool w_nk, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N,
+                      int64_t K, int64_t batch, int64_t sx, int64_t sw, int64_t sy, int64_t ldx, int64_t ldw,
+                      int64_t ldy, float beta);
+    /// Whether f16_batch_ex takes this stream's GPU (oneMath's backend for it has FP16 products), so a caller can
+    /// leave the transposed operands unmade.
+    bool f16_batch_ex_ok() const;
     /// The experts' groups (FP16), one product each through oneMath: rows bounds[e] .. bounds[e + 1] (host values) of
     /// X and Y (row stride N) by W + e * w_stride, e < G.  False when oneMath does not take FP16 products on `stream`'s
     /// GPU: the caller runs kernels::xmx_gemm_grouped then.

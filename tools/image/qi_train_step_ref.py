@@ -32,6 +32,7 @@ except ImportError:   # an environment without it (the XPU torch's) reads the fi
 
 NBLOCKS = 32
 ROUND_TEXT = False
+INT8 = False
 PRODUCTS = ("attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0", "img_mlp.gate_up", "img_mlp.out")
 
 
@@ -91,6 +92,14 @@ def run(m, sd, dtype, factors, states, xt, x0, noise, t_model, h, w, device="cpu
     t0 = time.time()
     model = build(m, sd, dtype).to(device)
     model.pos_embed = m.QwenImage21Rope(theta=10000, axes_dim=[16, 56, 56])
+    if INT8:   # ai-toolkit's quantize with qtype convrot8 on the blocks' linears (its excluded modules stay as they are)
+        from toolkit.util.convrot_quant import get_convrot_quantizer
+        q = get_convrot_quantizer("convrot8")
+        for blk in model.transformer_blocks:
+            for lin in (blk.attn.to_q, blk.attn.to_k, blk.attn.to_v, blk.attn.to_out[0], blk.img_mlp.gate_up,
+                        blk.img_mlp.out):
+                q.quantize_(lin, lin.weight.detach().float())
+                lin.forward = (lambda x, lin=lin: q.forward(lin, x))
     print(f"  built the DiT in {time.time() - t0:.0f} s", flush=True)
     leaves = []
     for b, blk in enumerate(model.transformer_blocks):
@@ -143,6 +152,9 @@ def main() -> int:
                          "products read them (its weights are bf16)")
     ap.add_argument("--states", default="", help="a states cache (qi_train_prep.py's): real text rows, not noise")
     ap.add_argument("--latent", default="", help="a latent cache (qi_train_prep.py's): x0 its posterior mean")
+    ap.add_argument("--int8", action="store_true",
+                    help="a QLoRA: ai-toolkit's convrot8 on the blocks' products (its ConvRotInt8Quantizer), the "
+                         "engine's --base int8")
     ap.add_argument("--blocks", type=int, default=32, help="the DiT cut to its first blocks (both sides)")
     ap.add_argument("--jitter", type=float, default=0.0,
                     help="the bar: the FP32 reference run again on inputs moved by this relative noise")
@@ -154,8 +166,8 @@ def main() -> int:
     if a.make_index:
         Path(a.make_index).write_text(json.dumps(gguf_index(a.dit)))
         return 0
-    global NBLOCKS, ROUND_TEXT
-    NBLOCKS, ROUND_TEXT = a.blocks, a.round_text
+    global NBLOCKS, ROUND_TEXT, INT8
+    NBLOCKS, ROUND_TEXT, INT8 = a.blocks, a.round_text, a.int8
     torch.set_num_threads(os.cpu_count() or 8)
     m = aitk_transformer(Path(a.aitk))
     d = Path(a.dir)
@@ -213,8 +225,8 @@ def main() -> int:
     env = dict(os.environ)
     if os.environ.get("XS_LD_LIBRARY_PATH"):
         env["LD_LIBRARY_PATH"] = os.environ["XS_LD_LIBRARY_PATH"]
-    res = subprocess.run([a.exe, "check", "--dit", a.dit, "--dir", str(d), "--blocks", str(a.blocks)],
-                         capture_output=True, text=True, env=env)
+    res = subprocess.run([a.exe, "check", "--dit", a.dit, "--dir", str(d), "--blocks", str(a.blocks), "--base",
+                          "int8" if a.int8 else "bf16"], capture_output=True, text=True, env=env)
     print(res.stdout + res.stderr, end="")
     if res.returncode != 0:
         return 1

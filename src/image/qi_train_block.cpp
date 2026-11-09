@@ -7,11 +7,16 @@
 #include "strata/image/qi_kernels.hpp"
 
 #include "strata/core/gpu.hpp"
+#include "strata/platform/env.hpp"
 
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 
 #include "dit_rows.hpp"
@@ -37,35 +42,133 @@ template<class F> void by_range(int64_t nt, int64_t R, F f) {
     if (R > nt) f(nt, R - nt, 0);
 }
 
+// XESTRATA_TRAIN_PROFILE=1: the stages' times, summed over the calls and printed by qi_block_profile_report (each stage
+// waits for the GPU, so the sums are the stages' own and the whole runs slower)
+struct Prof {
+    bool on = strata::env_get("TRAIN_PROFILE") != nullptr;
+    double t[20] = {};
+    int64_t calls = 0;
+};
+Prof& prof() {
+    static Prof p;
+    return p;
+}
+const char* const kStage[20] = {"fwd gate", "ln2 bwd", "o bwd", "attention bwd", "qk bwd", "qkv bwd", "norm bwd",
+                                 "fwd ln1", "fwd v scale + qk rope", "fwd attention", "fwd ln2", "fwd swiglu", "down bwd",
+                                 "swiglu bwd", "gate_up bwd", "mlp gate bwd", "fwd base products", "fwd lora", "",
+                                 ""};
+
+// What a block's backward reads of its forward, taken in this order from a pool (or a Sizer)
+struct Tape {
+    uint16_t *ln1_16, *jq, *jk, *jv, *jo, *ln2_16, *sw16;
+    float *ln1_s, *mean1, *inv1, *yq, *yk, *h1, *jof, *vs, *lse, *ln2_s, *mean2, *inv2, *gu, *sw_s;
+    train::AdKeep keep[kQiProducts];
+};
+
+template<class Take> Tape take_tape(Take& t, const QiBlockRun& run) {
+    const int64_t C = run.C, F = run.F, H = run.heads, R = run.rows, Rp = qi_attn_rows(R);
+    Tape p{};
+    p.ln1_16 = t.ru(R * C);
+    p.ln1_s = t.rf(R);
+    p.mean1 = t.rf(R);
+    p.inv1 = t.rf(R);
+    p.yq = t.rf(R * C);
+    p.yk = t.rf(R * C);
+    p.h1 = t.rf(R * C);
+    // q, k and v rounded up to the shared attention's rows, zero past R as the pool leaves them
+    p.jq = t.u(Rp * C);
+    p.jk = t.u(Rp * C);
+    p.jv = t.u(Rp * C);
+    p.jo = t.ru(R * C);
+    p.jof = t.rf(R * C);   // the attention's FP32 output: the backward's D reads it
+    p.vs = t.rf(R + 1);
+    p.lse = t.rf(R * H);
+    p.ln2_16 = t.ru(R * C);
+    p.ln2_s = t.rf(R);
+    p.mean2 = t.rf(R);
+    p.inv2 = t.rf(R);
+    p.gu = t.rf(R * 2 * F);   // gate_up's output, the SwiGLU's input
+    p.sw16 = t.ru(R * F);
+    p.sw_s = t.rf(R);
+    for (int i = 0; i < kQiProducts; ++i)   // what each adapted product's forward keeps
+        if (run.ad[i] != nullptr) {
+            const int64_t rk = run.ad[i]->rank;
+            p.keep[i] = {t.ru(R * rk), t.rf(R), t.ru(R * rk)};
+        }
+    return p;
+}
+
+// the bytes take_tape asks for (an arena's 256-byte steps)
+struct Sizer {
+    size_t bytes = 0;
+    void* add(int64_t n, int64_t w) {
+        bytes += ((size_t) (n * w) + 255) / 256 * 256;
+        return nullptr;
+    }
+    float* f(int64_t n) { return static_cast<float*>(add(n, 4)); }
+    float* rf(int64_t n) { return f(n); }
+    uint16_t* u(int64_t n) { return static_cast<uint16_t*>(add(n, 2)); }
+    uint16_t* ru(int64_t n) { return u(n); }
+};
+
 }  // namespace
 
-void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* s) {
+size_t qi_block_tape_bytes(const QiBlockRun& run) {
+    Sizer z;
+    take_tape(z, run);
+    return z.bytes;
+}
+
+void qi_block_profile_report() {
+    Prof& p = prof();
+    if (!p.on || p.calls == 0) return;
+    std::fprintf(stderr, "qi_block over %lld calls:", (long long) p.calls);
+    for (int i = 0; i < 20; ++i)
+        if (kStage[i][0] != 0) std::fprintf(stderr, " %s %.2f s", kStage[i], p.t[i]);
+    std::fprintf(stderr, "\n");
+    for (double& v : p.t) v = 0;
+    p.calls = 0;
+}
+
+void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* s, train::Arena* arena) {
     const int64_t C = run.C, F = run.F, H = run.heads, hd = run.hd, R = run.rows, nt = run.n_text;
     if (C != H * hd) throw std::invalid_argument("qi_block: heads * head_dim must be the width");
     const train::Product* P = run.p;
     auto mod = [&](int k, int row) { return run.mod + ((int64_t) k * 2 + row) * C; };
-    train::Pool pool(s);
-    const int64_t Rp = qi_attn_rows(R);
+    Prof& pf = prof();
+    auto clock = std::chrono::steady_clock::now();
+    auto mark = [&](int stage) {
+        if (!pf.on) return;
+        gpu::stream_sync(s);
+        const auto now = std::chrono::steady_clock::now();
+        pf.t[stage] += std::chrono::duration<double>(now - clock).count();
+        clock = now;
+    };
+    if (pf.on) {
+        gpu::stream_sync(s);
+        clock = std::chrono::steady_clock::now();
+        ++pf.calls;
+    }
+    train::Pool pool(s, arena);
     float* zero = pool.f(C);   // LnMod's shift: Qwen-Image-2.1's norms scale only
 
-    // ---- the tape
-    uint16_t* ln1_16 = pool.u(R * C);
-    float *ln1_s = pool.f(R), *mean1 = pool.f(R), *inv1 = pool.f(R);
-    float *yq = pool.f(R * C), *yk = pool.f(R * C), *yv = pool.f(R * C), *yo = pool.f(R * C), *h1 = pool.f(R * C);
-    // q, k and v rounded up to the shared attention's rows, zero past R as the pool leaves them
-    uint16_t *jq = pool.u(Rp * C), *jk = pool.u(Rp * C), *jv = pool.u(Rp * C), *jo = pool.u(R * C);
-    float* jof = pool.f(R * C);   // the attention's FP32 output: the backward's D reads it
-    auto* vamax = reinterpret_cast<uint32_t*>(pool.f(1));
-    float *vs = pool.f(R + 1), *hsv = pool.f(H), *lse = pool.f(R * H);
-    uint16_t* ln2_16 = pool.u(R * C);
-    float *ln2_s = pool.f(R), *mean2 = pool.f(R), *inv2 = pool.f(R);
-    float* gu = pool.f(R * 2 * F);   // gate_up's output, the SwiGLU's input
-    uint16_t* sw16 = pool.u(R * F);
-    float* sw_s = pool.f(R);
-    float* ydn = pool.f(R * C);
-
-    // ---- the adapters: what each adapted product's forward keeps, and the transients they share
+    // ---- the tape (Tape, take_tape): from the call's own pool, or from run.tape, kept for the backward
+    std::optional<train::Pool> own_tape;
+    if (run.tape != nullptr) own_tape.emplace(s, run.tape, run.tape_replay);
+    const Tape tp = own_tape ? take_tape(*own_tape, run) : take_tape(pool, run);
+    uint16_t *ln1_16 = tp.ln1_16, *jq = tp.jq, *jk = tp.jk, *jv = tp.jv, *jo = tp.jo, *ln2_16 = tp.ln2_16;
+    uint16_t* sw16 = tp.sw16;
+    float *ln1_s = tp.ln1_s, *mean1 = tp.mean1, *inv1 = tp.inv1, *yq = tp.yq, *yk = tp.yk, *h1 = tp.h1;
+    float *jof = tp.jof, *vs = tp.vs, *lse = tp.lse, *ln2_s = tp.ln2_s, *mean2 = tp.mean2, *inv2 = tp.inv2;
+    float *gu = tp.gu, *sw_s = tp.sw_s;
     train::AdKeep keep[kQiProducts];
+    for (int i = 0; i < kQiProducts; ++i) keep[i] = tp.keep[i];
+    // the forward's own: v before its scale, the projections' outputs before their gates
+    float *yv = pool.rf(R * C), *yo = pool.rf(R * C), *ydn = pool.rf(R * C);
+    auto* vamax = reinterpret_cast<uint32_t*>(pool.f(1));
+    float* hsv = pool.rf(H);
+
+    // ---- the adapters' transients
     int64_t maxN = 0, maxRank = 0, maxScratch = 0, maxTmp = 0;
     bool lokr = false;
     for (int i = 0; i < kQiProducts; ++i) {
@@ -77,29 +180,50 @@ void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* s) {
         maxScratch = std::max(maxScratch, R * rk + R * N + N * rk + rk * K);
         maxTmp = std::max(maxTmp, 2 * R * N + R * rk);
         lokr = lokr || a->method == train::AdapterMethod::lokr;
-        keep[i] = {pool.u(R * rk), pool.f(R), pool.u(R * rk)};
     }
     train::AdScratch sc;
     if (maxN > 0) {
-        sc.hf = pool.f(R * maxRank);
-        sc.y1 = pool.f(R * maxN);
-        sc.y2 = pool.f(R * maxN);
-        sc.fa = pool.f(maxN);
-        sc.fb = pool.f(maxN);
-        sc.scratch = pool.f(maxScratch);
-        sc.tmp16 = pool.u(maxTmp);
-        sc.rsT = pool.f(R);
+        sc.hf = pool.rf(R * maxRank);
+        sc.y1 = pool.rf(R * maxN);
+        sc.y2 = pool.rf(R * maxN);
+        sc.fa = pool.rf(maxN);
+        sc.fb = pool.rf(maxN);
+        sc.scratch = pool.rf(maxScratch);
+        sc.tmp16 = pool.ru(maxTmp);
+        sc.rsT = pool.rf(R);
+    }
+    // a QLoRA's base (W8A8, ai-toolkit's convrot8): the input's int8 rows, and the FP16 ones where the GPU takes no
+    // int8 products
+    const bool w8 = P[0].w8 != nullptr;
+    int8_t* x8 = nullptr;
+    float* sx = nullptr;
+    uint16_t *x16f = nullptr, *w16f = nullptr;
+    if (w8) {
+        x8 = reinterpret_cast<int8_t*>(pool.ru((R * F + 1) / 2));
+        sx = pool.rf(R);
+        if (!train::w8_int8(s)) {
+            x16f = pool.ru(R * F);
+            w16f = pool.ru(2 * F * C);
+        }
     }
     auto product = [&](int i, const uint16_t* x16, const float* rs, float* y) {
-        gemm.f16(x16, P[i].w, y, R, P[i].N, P[i].K);
+        if (i < 3 && run.w_plain[i] != nullptr) gemm.f16(x16, run.w_plain[i], y, R, P[i].N, P[i].K);
+        else if (P[i].w8 != nullptr) train::w8_product(x16, R, P[i], y, x8, sx, x16f, w16f, gemm, s);
+        else gemm.f16(x16, P[i].w, y, R, P[i].N, P[i].K);
+        mark(16);
         train::ad_product_fwd(run.ad[i], x16, rs, y, nullptr, R, P[i].N, P[i].K, keep[i], sc, gemm, s);
+        mark(17);
     };
 
-    // ---- forward
+    // ---- forward (a kept tape's backward has it already)
+    if (run.tape_replay && run.dout == nullptr)
+        throw std::invalid_argument("qi_block: a kept tape is read back by the backward only");
+    if (!run.tape_replay) {
     by_range(nt, R, [&](int64_t r0, int64_t n, int row) {
         dit_rows::rows16(dit_rows::LnMod{run.x + r0 * C, zero, mod(0, row), C}, n, C, ln1_16 + r0 * C, ln1_s + r0, s,
                          mean1 + r0, inv1 + r0);
     });
+    mark(7);
     product(kQiQ, ln1_16, ln1_s, yq);
     product(kQiK, ln1_16, ln1_s, yk);
     product(kQiV, ln1_16, ln1_s, yv);
@@ -110,31 +234,37 @@ void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* s) {
     // the inference's own kernel: each head of q and k normed with its weight, then rotated in pairs (2j, 2j + 1)
     dit_rows::qk_rope16(rows_of(yq, C), rows_of(yk, C), rows_of(yv, C), run.nq, run.nk, run.cos, run.sin, hsv, R, H,
                         hd, false, jq, jk, jv, s, kEps);
+    mark(8);
     qi_attention_train(jq, jk, jv, R, H, hd, jof, lse, s, nt);
     train::f16_copy(jof, R * C, jo, s);
+    mark(9);
     product(kQiO, jo, vs + 1, yo);
     by_range(nt, R, [&](int64_t r0, int64_t n, int row) {
         dit_rows::gate_add_to(h1 + r0 * C, run.x + r0 * C, rows_of(yo + r0 * C, C), mod(1, row), n, C, s);
         dit_rows::rows16(dit_rows::LnMod{h1 + r0 * C, zero, mod(2, row), C}, n, C, ln2_16 + r0 * C, ln2_s + r0, s,
                          mean2 + r0, inv2 + r0);
     });
+    mark(10);
     product(kQiGateUp, ln2_16, ln2_s, gu);
     dit_rows::rows16(dit_rows::SwiGlu{rows_of(gu, 2 * F), F}, R, F, sw16, sw_s, s);
+    mark(11);
     product(kQiDown, sw16, sw_s, ydn);
     by_range(nt, R, [&](int64_t r0, int64_t n, int row) {
         dit_rows::gate_add_to(run.out + r0 * C, h1 + r0 * C, rows_of(ydn + r0 * C, C), mod(3, row), n, C, s);
     });
+    mark(0);
+    }
     if (run.dout == nullptr) return;
 
     // ---- backward, from the output's gradient
     const int64_t W = std::max(2 * F, C);   // the widest product's rows
-    uint16_t *t16 = pool.u(R * W), *t16t = pool.u(R * W), *xt = pool.u(R * F);
-    float* trs = pool.f(R);
-    float* sums = pool.f(R * F + (lokr ? 4 * F * C : 0));   // a dgrad's T K (a LoKr's N K twice more)
-    float *dh1 = pool.f(R * C), *dy = pool.f(R * C), *dsw = pool.f(R * F), *dgu = pool.f(R * 2 * F);
-    float *dln = pool.f(R * C), *dtmp = pool.f(R * C);
+    uint16_t *t16 = pool.ru(R * W), *t16t = pool.ru(R * W), *xt = pool.ru(R * F);
+    float* trs = pool.rf(R);
+    float* sums = pool.rf(R * F + (lokr ? 4 * F * C : 0));   // a dgrad's T K (a LoKr's N K twice more)
+    float *dh1 = pool.rf(R * C), *dy = pool.rf(R * C), *dsw = pool.rf(R * F), *dgu = pool.rf(R * 2 * F);
+    float *dln = pool.rf(R * C), *dtmp = pool.rf(R * C);
     auto backward = [&](int i, const uint16_t* x16, const float* rs, float* dY, float* dX, bool acc) {
-        if (run.ad[i] != nullptr || P[i].dw != nullptr) train::transpose_f16(x16, R, P[i].K, xt, s);   // dA's, dW's
+        if (train::ad_needs_xt(P[i], run.ad[i], gemm)) train::transpose_f16(x16, R, P[i].K, xt, s);
         train::ad_product_bwd(P[i], run.ad[i], x16, rs, xt, dY, dX, acc, keep[i], sc, t16, trs, t16t, sums, R, gemm,
                               s);
     };
@@ -143,31 +273,40 @@ void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* s) {
     by_range(nt, R, [&](int64_t r0, int64_t n, int row) {
         train::mul_cols(run.dout + r0 * C, mod(3, row), n * C, C, dy + r0 * C, s);
     });
+    mark(15);
     backward(kQiDown, sw16, sw_s, dy, dsw, false);
+    mark(12);
     dit_rows::swiglu_bwd(gu, dsw, R, F, dgu, s);
+    mark(13);
     backward(kQiGateUp, ln2_16, ln2_s, dgu, dln, false);
+    mark(14);
     // the second norm: its input's gradient joins the residual's own
     by_range(nt, R, [&](int64_t r0, int64_t n, int row) {
         dit_rows::ln_mod_bwd(h1 + r0 * C, mean2 + r0, inv2 + r0, mod(2, row), dln + r0 * C, n, C, dtmp + r0 * C,
                              nullptr, nullptr, s);
     });
     train::add_into(dh1, dtmp, R * C, s);
+    mark(1);
     // the attention's gated residual and its output projection
     by_range(nt, R, [&](int64_t r0, int64_t n, int row) {
         train::mul_cols(dh1 + r0 * C, mod(1, row), n * C, C, dy + r0 * C, s);
     });
-    float *jdo = pool.f(R * C), *jdq = pool.f(R * C), *jdk = pool.f(R * C), *jdv = pool.f(R * C);
+    float *jdo = pool.rf(R * C), *jdq = pool.rf(R * C), *jdk = pool.rf(R * C), *jdv = pool.rf(R * C);
     backward(kQiO, jo, vs + 1, dy, jdo, false);
+    mark(2);
     // the attention ran on v / vs[0]: its output's gradient comes in times vs[0] and dV leaves divided by it
     train::scale_by(jdo, R * C, vs, false, s);
     qi_attention_bwd(jq, jk, jv, jof, lse, jdo, R, H, hd, jdq, jdk, jdv, false, gemm, s, nt);
     train::scale_by(jdv, R * C, vs, true, s);
-    float *dyq = pool.f(R * C), *dyk = pool.f(R * C);
+    mark(3);
+    float *dyq = pool.rf(R * C), *dyk = pool.rf(R * C);
     dit_rows::qk_rope_bwd(yq, yk, run.nq, run.nk, run.cos, run.sin, true, jdq, jdk, R, H, hd, dyq, dyk, nullptr,
                           nullptr, s, false, kEps);
+    mark(4);
     backward(kQiQ, ln1_16, ln1_s, dyq, dln, false);
     backward(kQiK, ln1_16, ln1_s, dyk, dln, true);
     backward(kQiV, ln1_16, ln1_s, jdv, dln, true);
+    mark(5);
     if (run.dx == nullptr) return;
     by_range(nt, R, [&](int64_t r0, int64_t n, int row) {
         dit_rows::ln_mod_bwd(run.x + r0 * C, mean1 + r0, inv1 + r0, mod(0, row), dln + r0 * C, n, C, dtmp + r0 * C,
@@ -175,6 +314,7 @@ void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* s) {
     });
     train::copy_rows(dh1, R * C, run.dx, s);
     train::add_into(run.dx, dtmp, R * C, s);
+    mark(6);
 }
 
 }  // namespace strata::image
