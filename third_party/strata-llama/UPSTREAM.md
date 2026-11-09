@@ -19,9 +19,10 @@ instead (an override kept for two releases, then removed).
 ## What is here and what is not
 
 - **Here:** `src/` and `include/` (llama), `tools/mtmd` (sources, `models/`, `debug/`), `vendor/{hash,miniaudio,nlohmann,sheredom,stb}`, `ggml/` (the CMake,
-  `ggml/include`, the files of `ggml/src`, the registry, ggml-cpu for x86 and Arm, ggml-cuda and ggml-hip, ggml-sycl, ggml-metal), `cmake/`, the top
+  `ggml/include`, the files of `ggml/src`, the registry, ggml-cpu for x86 and Arm, ggml-cuda and ggml-hip, ggml-sycl, ggml-metal, and ggml-blas, which ggml turns
+  on by itself on a Mac (Accelerate): found by the macOS identity gate, a first version of this tree lacked it and the Mac reader did not configure), `cmake/`, the top
   `CMakeLists.txt`, `LICENSE`, `licenses/`.
-- **Not here:** the other backends (Vulkan, OpenCL, CANN, WebGPU, Hexagon, RPC, BLAS, ...), the CPU code of other architectures (PowerPC, s390x, RISC-V,
+- **Not here:** the other backends (Vulkan, OpenCL, CANN, WebGPU, Hexagon, RPC, ...), the CPU code of other architectures (PowerPC, s390x, RISC-V,
   LoongArch, Wasm, SpacemiT) and KleidiAI, llama.cpp's `common/`, `tools/` other than mtmd, `tests/`, `examples/`, docs and test media. The options for them are
   not supported by this tree (tools/vision/CMakeLists.txt never turns them on).
 - This is a **second copy** of ggml next to `third_party/strata-ggml` (about 4.5 MB of the files are the same): `strata-ggml` is trimmed for the engine
@@ -88,6 +89,8 @@ upstream 683e0583268e91e1f50b4ffc416b6523e0cec2dfdb3984c89792bda29e32566b 683e05
 upstream 890f527a231068c1a3f6cad4515dbeba36d4d32889f12f20fc35af7bf97c3216 890f527a231068c1a3f6cad4515dbeba36d4d32889f12f20fc35af7bf97c3216 ggml/src/ggml-backend-meta.cpp
 upstream 0f63c69ad083e0744872f57d59d049b069283303f5bbc646222907d779afe4d1 0f63c69ad083e0744872f57d59d049b069283303f5bbc646222907d779afe4d1 ggml/src/ggml-backend-reg.cpp
 upstream 2dd6a572f087a1fddaa52dbf2378b777cd21752f4b2a1292c8da3bcb05fbcfd9 2dd6a572f087a1fddaa52dbf2378b777cd21752f4b2a1292c8da3bcb05fbcfd9 ggml/src/ggml-backend.cpp
+upstream dc7028c2c7207e8c334fd61ea4556599a326710cd9b33050bace38833529df71 dc7028c2c7207e8c334fd61ea4556599a326710cd9b33050bace38833529df71 ggml/src/ggml-blas/CMakeLists.txt
+upstream d81fd424f08c47b5fc2711030b94104a487d2acad9b197783e7dd2c99caeba37 d81fd424f08c47b5fc2711030b94104a487d2acad9b197783e7dd2c99caeba37 ggml/src/ggml-blas/ggml-blas.cpp
 upstream 0061131b615c5721fc88a78feeb22c1f8c450f1c2646a317d80796a653bf595c 0061131b615c5721fc88a78feeb22c1f8c450f1c2646a317d80796a653bf595c ggml/src/ggml-common.h
 upstream ed4d3cf43377accac79bd09b4b93c10725e66f189e1ddfcd528c7c29508cf3d0 ed4d3cf43377accac79bd09b4b93c10725e66f189e1ddfcd528c7c29508cf3d0 ggml/src/ggml-cpu/CMakeLists.txt
 upstream 636d1e4b858a86ad6568100bbdb4bf9715d9dfb25d3831415d55e04e39acad86 636d1e4b858a86ad6568100bbdb4bf9715d9dfb25d3831415d55e04e39acad86 ggml/src/ggml-cpu/amx/amx.cpp
