@@ -1,6 +1,10 @@
-"""tools/_paths.py - where the tools find llama.cpp's gguf-py (for the MTP packer and the fixtures).
+"""tools/_paths.py - where the tools find a GGUF library.
 
-Order: $STRATA_GGUF_PY (a folder that holds the `gguf` package, e.g. <llama.cpp>/gguf-py), then the vendored copy
+The preparation tools use Strata's own reader/writer and quantizers (tools/strata_gguf.py, tools/strata_quants.py): gguf_lib() returns it.
+$STRATA_GGUF_PY (a folder that holds llama.cpp's `gguf` package) still selects that package instead, for two releases (the byte-identical
+A/B of the pack tools runs both); llama.cpp's HF converter (NVFP4-local) imports gguf-py itself and always uses the vendored copy.
+
+Where gguf-py is looked for (gguf_py(), add_gguf_py()), in order: $STRATA_GGUF_PY (a folder that holds the `gguf` package, e.g. <llama.cpp>/gguf-py), then the vendored copy
 <engine>/third_party/strata-gguf-py (frozen at the pinned llama.cpp commit, no download), then the development tree's
 ../../.ref/llama.cpp/gguf-py, then (#3269) the install folders: in the Control package setup.py's per-user install folder
 ($STRATA_INSTALL_DIR, else the app's folder, the Terminal's remembered installs), so a tool run by hand from the package finds it there.
@@ -41,6 +45,24 @@ def gguf_py() -> str:
             return str(c)
     sys.exit("gguf-py was not found. It ships with Strata in third_party/strata-gguf-py; set STRATA_GGUF_PY to the folder that holds the "
              "`gguf` package (for example <llama.cpp>/gguf-py) to use another copy")
+
+
+def gguf_lib():
+    """The GGUF library the preparation tools use, with gguf-py's names (GGMLQuantizationType, GGUFReader, GGUFWriter, GGUFValueType, quants):
+    llama.cpp's gguf-py when STRATA_GGUF_PY names a folder that holds it (kept for two releases), else tools/strata_gguf.py."""
+    own = os.environ.get("STRATA_GGUF_PY")
+    if own:
+        if not (Path(own) / "gguf").is_dir():
+            sys.exit("STRATA_GGUF_PY=%s does not hold a `gguf` package" % own)
+        if own not in sys.path:
+            sys.path.insert(0, own)
+        import gguf
+        return gguf
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import strata_gguf
+    return strata_gguf
 
 
 def add_gguf_py() -> None:
