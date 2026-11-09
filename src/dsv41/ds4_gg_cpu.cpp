@@ -10,9 +10,8 @@
 #include <string>
 
 #if defined(STRATA_DSV41_TQ_CPU)
-#include "ggml-cpu.h"
-#include "ggml.h"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/pool_quant.hpp"   // the quant layer (STRATA_OWN_CPU_QUANT) or ggml-cpu's type traits
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
 
@@ -26,11 +25,12 @@
 
 namespace strata::ds4::gguf {
 namespace {
+using namespace strata::kernels::cpu::pq;   // Tr, traits(), row_size_of(), type_size_of(), flavour_*(), to_float(), layer_init()
 void init_once() {
     static std::once_flag f;
-    std::call_once(f, [] { ggml_cpu_init(); });
+    std::call_once(f, [] { layer_init(); });
 }
-size_t row_size(int type, int64_t k) { return ggml_row_size((ggml_type) type, k); }
+size_t row_size(int type, int64_t k) { return row_size_of(type, k); }
 }  // namespace
 
 bool gg_cpu_type(int type) {
@@ -51,18 +51,18 @@ bool gg_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err
         err = "not ggml block types";
         return false;
     }
-    const ggml_type_traits_cpu* a = ggml_get_type_traits_cpu((ggml_type) tg);
-    const ggml_type_traits_cpu* b = ggml_get_type_traits_cpu((ggml_type) td);
-    if (a == nullptr || b == nullptr || a->vec_dot == nullptr || b->vec_dot == nullptr) {
-        err = "ggml-cpu has no row dot for these types";
+    const Tr a = traits(tg);
+    const Tr b = traits(td);
+    if (!a.has_dot() || !b.has_dot()) {
+        err = STRATA_POOL_LIB " has no row dot for these types";
         return false;
     }
     f.tg = tg;
     f.td = td;
     f.n_embd = n_embd;
     f.n_ff = n_ff;
-    f.gu_act = (int) a->vec_dot_type;
-    f.d_act = (int) b->vec_dot_type;
+    f.gu_act = a.vec_dot_type;
+    f.d_act = b.vec_dot_type;
     f.gu_row = row_size(tg, n_embd);
     f.d_row = row_size(td, n_ff);
     f.act_bytes = row_size(f.gu_act, n_embd);
@@ -74,14 +74,14 @@ bool gg_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err
 void gg_cpu_quant(int act, const float* x, int k, void* dst) {
     init_once();
     if (dbg()) std::fprintf(stderr, "gg_cpu_quant act %d k %d\n", act, k);
-    const ggml_type_traits_cpu* tc = ggml_get_type_traits_cpu((ggml_type) act);
-    if (tc != nullptr && tc->from_float != nullptr) {
-        tc->from_float(x, dst, k);
+    const Tr tc = traits(act);
+    if (tc.has_from_float()) {
+        tc.from_float(x, dst, k);
         return;
     }
-    const ggml_type_traits* t = ggml_get_type_traits((ggml_type) act);
-    if (dbg()) std::fprintf(stderr, "gg_cpu_quant: no cpu from_float, ref %p\n", (void*) (t ? t->from_float_ref : nullptr));
-    t->from_float_ref(x, dst, k);
+    // (never reached: ggml-cpu and the layer both quantize every activation format a dot takes)
+    std::fprintf(stderr, "ds4: no CPU activation quantizer for type %d\n", act);
+    std::abort();
 }
 
 // Strata's AVX2 multi-token rows for the i-quants (iq256x_rows: each 32-value chunk decoded once, every token applies it).  They
@@ -102,17 +102,17 @@ static bool own_ok(int type, int impl) {
     const int k = type & 31;
     std::call_once(once[impl][k], [&] {
         ok[impl][k] = false;
-        const ggml_type_traits_cpu* tc = ggml_get_type_traits_cpu((ggml_type) type);
-        const ggml_type_traits_cpu* q8 = tc ? ggml_get_type_traits_cpu(tc->vec_dot_type) : nullptr;
-        if (tc == nullptr || tc->vec_dot == nullptr || q8 == nullptr || q8->from_float == nullptr) return;
+        const Tr tc = traits(type);
+        const Tr q8 = traits(tc.vec_dot_type);
+        if (!tc.has_dot() || !q8.has_from_float()) return;
         const int n = 1024, rows = 7;
-        const size_t rb = ggml_row_size((ggml_type) type, n), bb = ggml_type_size((ggml_type) type), ab = ggml_row_size(tc->vec_dot_type, n);
+        const size_t rb = row_size_of(type, n), bb = type_size_of(type), ab = row_size_of(tc.vec_dot_type, n);
         uint64_t st = 0x9E3779B97F4A7C15ull + (uint64_t) type;
         auto next = [&st] { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
         std::vector<uint8_t> w(rb * rows);
         for (auto& b : w) b = (uint8_t) next();
         for (size_t o = 0; o < w.size(); o += bb) {
-            const ggml_fp16_t d = ggml_fp32_to_fp16(0.002f + 0.001f * (float) (next() % 16));
+            const uint16_t d = fp16_bits(0.002f + 0.001f * (float) (next() % 16));
             if (type == 29) {   // IQ1_M keeps its f16 in the top nibbles of the four scale words
                 uint16_t sc[4];
                 std::memcpy(sc, &w[o + 48], 8);
@@ -130,10 +130,10 @@ static bool own_ok(int type, int impl) {
             for (int t = 0; t < nt; ++t) {
                 std::vector<float> x((size_t) n);
                 for (auto& v : x) v = ((float) (next() % 2001) - 1000.0f) * 1e-3f;
-                q8->from_float(x.data(), a[(size_t) t].data(), n);
+                q8.from_float(x.data(), a[(size_t) t].data(), n);
                 ap[(size_t) t] = a[(size_t) t].data();
                 p1[(size_t) t] = o1[(size_t) t].data();
-                for (int r = 0; r < rows; ++r) tc->vec_dot(n, &o0[(size_t) t][(size_t) r], 0, w.data() + (size_t) r * rb, 0, ap[(size_t) t], 0, 1);
+                for (int r = 0; r < rows; ++r) tc.dot(n, &o0[(size_t) t][(size_t) r], w.data() + (size_t) r * rb, ap[(size_t) t]);
             }
             if (impl == 1) strata::kernels::cpu::iq512x_rows(type, w.data(), rb, n, ap.data(), nt, p1.data(), 0, rows);
             else strata::kernels::cpu::iq256x_rows(type, w.data(), rb, n, ap.data(), nt, p1.data(), 0, rows);
@@ -204,7 +204,7 @@ static int use_iq256(int type, int nt) {
     if (g_iq256 < 0) {
         const char* v = std::getenv("DS4_GG_IQ256");
         // (ggml-cpu's own answer: built with AVX2 + FMA + F16C, which is also what makes its dots the AVX2 ones these rows match)
-        const bool avx2 = ggml_cpu_has_avx2() && ggml_cpu_has_fma() && ggml_cpu_has_f16c();
+        const bool avx2 = flavour_avx2() && flavour_f16c();
         g_iq256 = !avx2 ? 0 : v == nullptr ? 2 : std::atoi(v) != 0 ? 1 : 0;
     }
     if (g_iq256 == 0) return 0;
@@ -226,10 +226,10 @@ static void dots(int type, const uint8_t* w, size_t rb, int n, const void* const
             return;
         }
     }
-    const ggml_type_traits_cpu* tc = ggml_get_type_traits_cpu((ggml_type) type);
+    const Tr tc = traits(type);
     if (dbg()) std::fprintf(stderr, "gg dots type %d n %d rows %d..%d nt %d\n", type, n, r0, r1, nt);
     for (int r = r0; r < r1; ++r)
-        for (int t = 0; t < nt; ++t) tc->vec_dot(n, &out[t][r], 0, w + (size_t) r * rb, 0, act[t], 0, 1);
+        for (int t = 0; t < nt; ++t) tc.dot(n, &out[t][r], w + (size_t) r * rb, act[t]);
 }
 
 void gg_cpu_gate_up(const IqCpu& f, const uint8_t* gate, const uint8_t* up, const void* const* act, int nt, float* const* ff, int r0,
@@ -267,11 +267,9 @@ void gg_cpu_down(const IqCpu& f, const uint8_t* down, const void* const* hq, int
 // GGUF whose dense tensors are not BF16): ggml's own to_float, then the same round-to-nearest-even to BF16 the Q8_0 path uses
 bool gg_row_to_bf16(int type, const uint8_t* row, int k, uint16_t* out) {
     init_once();
-    const ggml_type_traits* t = ggml_get_type_traits((ggml_type) type);
-    if (t == nullptr || t->to_float == nullptr) return false;
     static thread_local std::vector<float> f;
     f.resize((size_t) k);
-    t->to_float(row, f.data(), k);
+    if (!to_float(type, row, f.data(), k)) return false;
     for (int i = 0; i < k; ++i) {
         uint32_t u;
         std::memcpy(&u, &f[(size_t) i], 4);

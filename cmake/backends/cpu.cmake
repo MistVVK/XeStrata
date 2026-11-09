@@ -273,8 +273,14 @@ macro(strata_cpu_native_experts)
   elseif(STRATA_ISA_FLOOR STREQUAL "none")
     target_compile_definitions(strata_kernels_cpu PRIVATE STRATA_ISA_FLOOR_NONE=1)
   endif()
+  # ggml stays linked (its headers and, for the tests that compare against it, ggml-cpu as the oracle).  With STRATA_OWN_CPU_QUANT the pool itself calls no
+  # ggml-cpu function, so a static link of an engine pulls no ggml-cpu object into the binary (checked with nm in the gates).
   target_link_libraries(strata_kernels_cpu PUBLIC ggml-cpu ggml-base)
   target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_NATIVE_EXPERTS=1)
+  if(STRATA_OWN_CPU_QUANT)
+    target_link_libraries(strata_kernels_cpu PUBLIC strata_quant)
+    target_compile_definitions(strata_kernels_cpu PUBLIC STRATA_OWN_CPU_QUANT=1)
+  endif()
   if(STRATA_BUILD_TESTS)
     # the Q5_1 block dequantizer (a Q5_1 PLE table) against ggml's, synthetic blocks: no model, no GPU
     add_executable(dequant_q5_1_test tests/core/dequant_q5_1_test.cpp)
