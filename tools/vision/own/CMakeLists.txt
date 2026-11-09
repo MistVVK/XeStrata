@@ -43,6 +43,16 @@ if(STRATA_VIT_OWN_HIP OR STRATA_VISION_HIP)
   find_package(hipblas REQUIRED)
 endif()
 
+option(STRATA_VIT_OWN_SYCL "the own tower on an Intel GPU (vit_sycl.cpp with oneMKL; needs the oneAPI icpx compiler)" OFF)
+set(_vit_sycl OFF)
+if(STRATA_VIT_OWN_SYCL OR STRATA_VISION_SYCL)
+  if(_vit_cuda OR _vit_hip)
+    message(FATAL_ERROR "strata_vit_own: SYCL is its own program, not together with CUDA or HIP")
+  endif()
+  set(_vit_sycl ON)
+  find_package(MKL REQUIRED)        # the oneMKL ggml-sycl links too (MKL::MKL_SYCL::BLAS)
+endif()
+
 set(STB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/stb" CACHE PATH "stb_image.h (third_party/stb)")
 
 add_library(strata_vit_own STATIC gguf_lite.cpp vit_geometry.cpp image_prep.cpp vit_ref.cpp own_reader.cpp
@@ -87,6 +97,23 @@ if(_vit_hip)
   target_sources(strata_vit_own PRIVATE vit_gpu.cu)
   target_compile_definitions(strata_vit_own PUBLIC STRATA_VIT_GPU STRATA_VIT_HIP)
   target_link_libraries(strata_vit_own PUBLIC hip::host roc::hipblas)
+endif()
+
+if(_vit_sycl)
+  # only this file is SYCL code, with the precise floating-point model (as the engine's SYCL port).  No device-link options here: in the helper they would
+  # also change how mtmd's ggml-sycl kernels are linked and compiled (its numerics and start time stay as they are)
+  # An object library of its own: oneMKL's SYCL target carries -fsycl as a COMPILE option, which must not reach the other files (their x86 code, cpuid
+  # builtins included, would be compiled for the device too); the rest of the program only links oneMKL ($<LINK_ONLY:...>).
+  add_library(strata_vit_sycl OBJECT vit_sycl.cpp)
+  target_include_directories(strata_vit_sycl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_compile_features(strata_vit_sycl PRIVATE cxx_std_17)
+  target_compile_options(strata_vit_sycl PRIVATE -fsycl -fp-model=precise)
+  target_compile_definitions(strata_vit_sycl PRIVATE STRATA_VIT_GPU STRATA_VIT_SYCL)
+  target_link_libraries(strata_vit_sycl PRIVATE MKL::MKL_SYCL::BLAS)
+  target_sources(strata_vit_own PRIVATE $<TARGET_OBJECTS:strata_vit_sycl>)
+  target_compile_definitions(strata_vit_own PUBLIC STRATA_VIT_GPU STRATA_VIT_SYCL)
+  target_link_libraries(strata_vit_own INTERFACE $<LINK_ONLY:MKL::MKL_SYCL::BLAS>)     # INTERFACE + LINK_ONLY: the programs link oneMKL, nothing else compiles with its options
+  target_link_options(strata_vit_own PUBLIC -fsycl)
 endif()
 
 # the own-tower-only reader, the unit tests, and with a picture list the comparison with mtmd's preparation (oracle_prep.cpp is built in
