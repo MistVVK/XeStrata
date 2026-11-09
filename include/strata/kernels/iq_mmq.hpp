@@ -67,4 +67,18 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int ggml_type, const void* w, size_t 
                            int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst,
                            const uint8_t* const* wtab = nullptr, size_t woff = 0, int64_t rows = 0);
 
+/// One expert's product of few rows (a dense model's short prompt) split along K over more work-groups, its parts'
+/// sums added in order after: `quarters` sets the work-groups it aims for, in quarters of the GPU's compute units
+/// (0: none, the default), on the queue's GPU.  The parts' sums go into a buffer the queue reserves beforehand
+/// (iq_mmq_split_reserve: `floats` at least, kept): a product it does not hold is not split.  The plain models'
+/// calibration times the choice.
+void iq_mmq_split_set(sycl::queue& q, int quarters);
+int iq_mmq_split_get(sycl::queue& q);
+bool iq_mmq_split_reserve(sycl::queue& q, size_t floats);
+/// The queue's parts' buffer given back (the calibration chose no split).
+void iq_mmq_split_release(sycl::queue& q);
+/// The parts' floats a product of `rows` rows (at most kIqMmqSplitRows) and `n_out` outputs may take.
+constexpr int64_t kIqMmqSplitRows = 64, kIqMmqSplitMax = 8;
+constexpr size_t iq_mmq_split_floats(int64_t rows, int64_t n_out) { return (size_t) (kIqMmqSplitMax * rows * n_out); }
+
 }  // namespace strata::kernels

@@ -34,7 +34,20 @@
 namespace strata::kernels {
 namespace {
 
-constexpr int CHUNK = 64;        // cells per work-group
+constexpr int CHUNK = 64;        // cells per work-group (at most: chunk_of)
+
+// The cells a chunk takes: CHUNK, or for every cell (a dense query, no selection) on a short context fewer, so that its
+// cells spread over kShortChunks chunks of `min_chunk` cells or more: one group took a 64-cell chunk's heads in turn,
+// 11 us a layer on the RTX 4070 where llama.cpp's took 4.  From kShortChunks * CHUNK cells on, whole chunks: smaller
+// ones there cost more in partials than the groups gain (16-cell chunks: PLaMo 3 Translate 0.8B's decode after 12K
+// cells 447 -> 429 tok/s on the B70).  The selection's chunks (Qwen3.8-Flash-Next's) stay whole.
+constexpr int kShortChunks = 8;
+inline int chunk_of(bool dense, int n_ids, int n_slots, int min_chunk) {
+    if (!dense || min_chunk >= CHUNK) return CHUNK;
+    // (a slot takes one chunk at most where it keeps its partials: n_slots chunks at most)
+    const int per = sycl::max((n_ids + kShortChunks - 1) / kShortChunks, (n_ids + n_slots - 1) / n_slots);
+    return per < min_chunk ? min_chunk : per > CHUNK ? CHUNK : per;
+}
 constexpr int WARP = 32;
 
 sycl::queue& queue_for(void* stream) {
@@ -166,7 +179,7 @@ template <int HD, int G, int KV_MODE, bool LOOP, int NC>
 sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPools p, const int32_t* ids_all,
                          const int32_t* step_all, int n_kv_heads, int page_size, float scale, float* part_acc_all,
                          float* part_m_all, float* part_l_all, int n_slots, size_t n_q, int cap,
-                         long long scratch_stride, int window) {
+                         long long scratch_stride, int window, int kv_div, int min_chunk) {
     static_assert(G >= 1 && G <= 16, "reduce12 sums at most 16 heads");
     static_assert(HD % 128 == 0 && HD <= 256, "a lane holds HD/32 dimensions inside one Q4_0 half");
     constexpr int THREADS = HD;           // one work-item per dimension in the value loop
@@ -196,11 +209,15 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
             const int n_all = dense ? step[kStepNKv] : step[kStepWidth];
             const int lo = dense && window > 0 ? sycl::max(0, n_all - window) : 0;   // a window's first cell
             const int n_ids = n_all - lo;
-            const int first = (int) it.get_group(2), kvh = (int) it.get_group(1);
+            // kvh: the group's query heads (G of them); kv_div groups share a KV head (the query heads split
+            // across work-groups, each reading the KV head's cells: kv_div 1, one group a KV head)
+            const int first = (int) it.get_group(2), kvh = (int) it.get_group(1), kv_real = kvh / kv_div;
+            const int n_kv_real = n_kv_heads / kv_div;
             const int t = (int) it.get_local_id(2);
             const int lane = (int) sg.get_local_linear_id(), warp = (int) sg.get_group_linear_id();
             const int slot = kvh * n_slots + first;
-            if (first * CHUNK >= n_ids) {                         // uniform across the group
+            const int csz = chunk_of(dense, n_ids, n_slots, min_chunk);
+            if (first * csz >= n_ids) {                           // uniform across the group
                 if (t < G) { part_m[slot * G + t] = -FLT_MAX; part_l[slot * G + t] = 0.0f; }
                 return;
             }
@@ -209,9 +226,9 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
             // softmax); with one chunk a slot (n_slots the chunks) these are the chunk's own, as before
             float run_m[G], run_l[G], run_acc[G];
             for (int h = 0; h < G; ++h) { run_m[h] = -FLT_MAX; run_l[h] = 0.0f; run_acc[h] = 0.0f; }
-            for (int chunk = first; chunk * CHUNK < n_ids; chunk += n_slots) {
-                const int c0 = chunk * CHUNK;
-                const int n_here = sycl::min(CHUNK, n_ids - c0);
+            for (int chunk = first; chunk * csz < n_ids; chunk += n_slots) {
+                const int c0 = chunk * csz;
+                const int n_here = sycl::min(csz, n_ids - c0);
                 if (t < CHUNK) {
                     long long r = -1;
                     if (t < n_here) {
@@ -219,7 +236,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                         const long long page = (long long) p.page_table[cell / page_size];
                         // a block the KV streaming could not make resident keeps page -1; its cells are masked (score
                         // -FLT_MAX, weight 0) instead of being read from before the pool (upstream f3925cf)
-                        if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+                        if (page >= 0) r = (page * n_kv_real + kv_real) * page_size + (cell % page_size);
                     }
                     srow[t] = r;
                 }
@@ -227,9 +244,9 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 // scores: each sub-group takes cells warp, warp+WARPS, ...; each lane holds N of the HD dimensions.
                 // NC cells per step (warp + WARPS * (i + j)): a lane's q slice comes out of local memory once for all
                 // of them (upstream fd95405); every dot product is the same expression as for a single cell, so the
-                // scores are unchanged.  NC is the GPU's own (nc_of, timed by qsa_dense_attn_tune).
+                // scores are unchanged.  NC is the GPU's own (form_of, timed by qsa_dense_attn_tune).
                 const int hd_lane = head_of_lane(lane);
-                for (int i = 0; i < CHUNK / WARPS; i += NC) {
+                for (int i = 0; i < (n_here + WARPS - 1) / WARPS; i += NC) {
                     int cc[NC];
                     bool all_ok = true;
                     for (int j = 0; j < NC; ++j) {
@@ -290,7 +307,10 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                     constexpr int PER = CHUNK / WARP;   // the cells a lane takes
                     float mx = -FLT_MAX;
     #pragma unroll
-                    for (int k = 0; k < PER; ++k) mx = sycl::fmax(mx, sp[h * CHUNK + lane + WARP * k]);
+                    for (int k = 0; k < PER; ++k) {   // the cells past n_here hold no score of this chunk
+                        const int c = lane + WARP * k;
+                        if (c < n_here) mx = sycl::fmax(mx, sp[h * CHUNK + c]);
+                    }
                     const float m = warp_max(sg, mx);
                     float* pt = reinterpret_cast<float*>(&spt[0]);
                     float sum = 0.0f;
@@ -360,11 +380,22 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
     });
 }
 
+// steps_all (with `dense` and `window` as launch_chunk's): only the slots the query's cells reached are read (the others
+// hold no cells); null: every slot
 template <int HD, int G>
 sycl::event launch_merge(sycl::queue& queue, const float* part_acc_all, const float* part_m_all, const float* part_l_all,
-                         int n_chunks, float* attn_all, size_t n_head, size_t n_q, long long scratch_stride) {
+                         int n_slots, float* attn_all, size_t n_head, size_t n_q, long long scratch_stride,
+                         const int32_t* steps_all = nullptr, bool dense = true, int window = 0, int min_chunk = CHUNK) {
     return queue.parallel_for(sycl::nd_range<2>({n_q, n_head * HD}, {1, HD}), [=](sycl::nd_item<2> it) {
         const size_t y = it.get_group(0);
+        int n_chunks = n_slots;
+        if (steps_all != nullptr) {
+            const int32_t* step = steps_all + y * kStepCount;
+            const int n_all = dense ? step[kStepNKv] : step[kStepWidth];
+            const int n_ids = n_all - (dense && window > 0 ? sycl::max(0, n_all - window) : 0);
+            const int csz = chunk_of(dense, n_ids, n_slots, min_chunk);
+            n_chunks = sycl::min(n_slots, (n_ids + csz - 1) / csz);
+        }
         const float* part_acc = part_acc_all + y * (size_t) scratch_stride;
         const float* part_m = part_m_all + y * (size_t) scratch_stride;
         const float* part_l = part_l_all + y * (size_t) scratch_stride;
@@ -373,10 +404,10 @@ sycl::event launch_merge(sycl::queue& queue, const float* part_acc_all, const fl
         const int kvh = h / G, hl = h % G;
         const int d = (int) it.get_local_id(1);
         float M = -FLT_MAX;
-        for (int c = 0; c < n_chunks; ++c) M = sycl::fmax(M, part_m[(kvh * n_chunks + c) * G + hl]);
+        for (int c = 0; c < n_chunks; ++c) M = sycl::fmax(M, part_m[(kvh * n_slots + c) * G + hl]);
         float L = 0.0f, acc = 0.0f;
         for (int c = 0; c < n_chunks; ++c) {
-            const int slot = kvh * n_chunks + c;
+            const int slot = kvh * n_slots + c;
             const float m = part_m[slot * G + hl];
             if (m == -FLT_MAX) continue;
             const float w = sycl::exp(m - M);
@@ -406,53 +437,100 @@ int kv_mode_of(const QsaAttnPools& pools) {
 template <int HD, int G, bool LOOP>
 void launch_kv(int kv_mode, int nc, sycl::queue& queue, const float* q, const QsaAttnPools& pools, const int32_t* ids,
                const int32_t* steps, int nkv, int ps, float scale, float* part_acc, float* part_m, float* part_l,
-               int n_slots, size_t n_q, int cap, long long stride, int window = 0) {
-    if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window);
-    else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window);
-    else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window);
-    else if (nc == 8) launch_chunk<HD, G, 0, LOOP, 8>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window);
-    else if (nc == 4) launch_chunk<HD, G, 0, LOOP, 4>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window);
-    else launch_chunk<HD, G, 0, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window);
+               int n_slots, size_t n_q, int cap, long long stride, int window = 0, int kv_div = 1,
+               int min_chunk = CHUNK) {
+    if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
+    else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
+    else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
+    else if (nc == 8) launch_chunk<HD, G, 0, LOOP, 8>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
+    else if (nc == 4) launch_chunk<HD, G, 0, LOOP, 4>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
+    else launch_chunk<HD, G, 0, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
 }
 
-// The cells a step of the fp16 score loop takes (NC): 2 unless qsa_dense_attn_tune timed this GPU and shape.  2, 4 and
-// 8 are not the same on every GPU (Qwen3.5-9B's 32K decode, 2026-10-27: the RX 9060 XT 38.9 / 40.2 / 40.5 tok/s, the
-// RTX 4070 67.7 / 67.4 / 64.0, the B70 43.1 / 42.9 / 40.3), so the choice is timed rather than set.
+// The decode attention's form on a GPU, for a shape (head_dim, query heads per KV head): the cells a step of the fp16
+// score loop takes (NC) and the ways a KV head's query heads are split over work-groups (each reading the KV head's
+// cells).  2 and 1 unless qsa_dense_attn_tune timed this GPU and shape.  NC 2, 4 and 8 are not the same on every GPU
+// (Qwen3.5-9B's 32K decode, 2026-10-27: the RX 9060 XT 38.9 / 40.2 / 40.5 tok/s, the RTX 4070 67.7 / 67.4 / 64.0, the
+// B70 43.1 / 42.9 / 40.3).  The split puts more work-groups on a short context, where one group a KV head leaves the
+// GPU idle: PLaMo 3 Translate 0.8B (16 heads on 1 KV head) decoded 343 -> 504 tok/s after 64 cells on the B70 split 4
+// ways, 567 -> 593 on the RTX 4070; past a few ways the cells read again cost more than the groups gain (16 ways: 430
+// against 451 tok/s at 12K cells on the B70), and the 2B (6 heads a KV head) took 2 ways (2026-11-09).
+struct Form {
+    int nc = 2, split = 1, min_chunk = 16;   // min_chunk: chunk_of's
+};
 template <int HD, int G>
-core::PerDevice<int>& nc_store() {
-    static core::PerDevice<int> store;
+core::PerDevice<Form>& form_store() {
+    static core::PerDevice<Form> store;
     return store;
 }
 template <int HD, int G>
-int nc_of(sycl::queue& q) {
+Form form_of(sycl::queue& q) {
+    Form f = form_store<HD, G>().get(q.get_device(), [] { return Form{}; });
     if (const char* e = strata::env_get("QSA_NC")) {   // 2, 4 or 8 over the timed choice (the parity test, --bench)
         const long v = std::strtol(e, nullptr, 10);
-        if (v == 2 || v == 4 || v == 8) return (int) v;
+        if (v == 2 || v == 4 || v == 8) f.nc = (int) v;
     }
-    return nc_store<HD, G>().get(q.get_device(), [] { return 2; });
+    if (const char* e = strata::env_get("QSA_SPLIT")) {   // the ways over the timed choice (A/B), one that divides G
+        const long v = std::strtol(e, nullptr, 10);
+        if (v >= 1 && G % v == 0) f.split = (int) v;
+    }
+    if (const char* e = strata::env_get("QSA_MIN_CHUNK")) {   // the least cells a chunk (64: whole chunks), A/B
+        const long v = std::strtol(e, nullptr, 10);
+        if (v >= 4 && v <= CHUNK) f.min_chunk = (int) v;
+    }
+    return f;
 }
 
+// G: the query heads a work-group takes, the KV head's own split `split` ways
 template <int HD, int G>
 void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream,
-               int window) {
+               int window, int nc, int split, int min_chunk = CHUNK) {
     const int kv_mode = kv_mode_of(pools);
     auto& queue = queue_for(stream);
-    const int nkv = (int) s.n_head_kv, ps = (int) s.page_size;
+    const int nkv = (int) s.n_head_kv * split, ps = (int) s.page_size;
     const int n_slots = slots_for(queue, cap, nkv, n_q);
     float* part_acc = scratch;
     float* part_m = scratch + (size_t) n_slots * s.n_head * HD;
     float* part_l = part_m + (size_t) n_slots * s.n_head;
     const float scale = 1.0f / std::sqrt((float) HD);
-    const int nc = nc_of<HD, G>(queue);
     if (n_slots < (cap + CHUNK - 1) / CHUNK)
         launch_kv<HD, G, true>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l,
-                               n_slots, n_q, (int) cap, stride, window);
+                               n_slots, n_q, (int) cap, stride, window, split, min_chunk);
     else
         launch_kv<HD, G, false>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l,
-                                n_slots, n_q, (int) cap, stride, window);
-    const auto e = launch_merge<HD, G>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, n_q, stride);
+                                n_slots, n_q, (int) cap, stride, window, split, min_chunk);
+    const auto e = launch_merge<HD, G>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, n_q, stride,
+                                       steps, ids == nullptr, window, min_chunk);
     if (!stream) core::Runtime::get().wait(e, "qsa_decode_attn");
+}
+
+// `f` with G / split heads a work-group: the instantiations the splits take (a split to another count is not run)
+template <int HD>
+bool with_split(int heads_per_group, auto&& f) {
+    switch (heads_per_group) {
+    case 16: if constexpr (HD == 128) { f.template operator()<16>(); return true; } return false;
+    case 12: if constexpr (HD == 256) { f.template operator()<12>(); return true; } return false;
+    case 10: if constexpr (HD == 128) { f.template operator()<10>(); return true; } return false;
+    case 8: f.template operator()<8>(); return true;
+    case 6: if constexpr (HD == 128) { f.template operator()<6>(); return true; } return false;
+    case 4: f.template operator()<4>(); return true;
+    case 3: if constexpr (HD == 128) { f.template operator()<3>(); return true; } return false;
+    case 2: f.template operator()<2>(); return true;
+    case 1: f.template operator()<1>(); return true;
+    default: return false;
+    }
+}
+
+template <int HD, int G>
+void run_form(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
+              const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream, int window) {
+    const Form f = form_of<HD, G>(queue_for(stream));
+    const bool ok = with_split<HD>(G / f.split, [&]<int GS>() {
+        run_shape<HD, GS>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window, f.nc, f.split,
+                          f.min_chunk);
+    });
+    if (!ok) run_shape<HD, G>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window, f.nc, 1);
 }
 
 // The shapes this file is built for: (head_dim, query heads per KV head).  A model with another shape needs its line
@@ -463,23 +541,33 @@ bool shape_ok(const QsaShapes& s) {
     return (s.head_dim == 256 && (g == 12 || g == 8 || g == 4)) || (s.head_dim == 128 && (g == 10 || g == 6 || g == 16 || g == 8));
 }
 
-void run(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-         const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream, int window = 0) {
+// `f` on the shape's (head_dim, query heads per KV head)
+bool with_shape(const QsaShapes& s, auto&& f) {
     const int64_t g = s.n_head / s.n_head_kv;
-    if (s.head_dim == 256 && g == 12) run_shape<256, 12>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window);
-    else if (s.head_dim == 256 && g == 8) run_shape<256, 8>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window);
-    else if (s.head_dim == 256 && g == 4) run_shape<256, 4>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window);
-    else if (g == 6) run_shape<128, 6>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window);
-    else if (g == 16) run_shape<128, 16>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window);
-    else if (g == 8) run_shape<128, 8>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window);
-    else run_shape<128, 10>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window);
+    if (s.head_dim == 256 && g == 12) f.template operator()<256, 12>();
+    else if (s.head_dim == 256 && g == 8) f.template operator()<256, 8>();
+    else if (s.head_dim == 256 && g == 4) f.template operator()<256, 4>();
+    else if (g == 6) f.template operator()<128, 6>();
+    else if (g == 16) f.template operator()<128, 16>();
+    else if (g == 8) f.template operator()<128, 8>();
+    else if (g == 10) f.template operator()<128, 10>();
+    else return false;
+    return true;
 }
 
-// qsa_dense_attn_tune's timing: the fp16 score loop's NC = 2, 4 and 8 over `cells` cells of a dummy cache, as the
-// engine runs it (16 launches with their merge in a graph, the graphs replayed in turns, the first round a warm-up, the
-// fastest round of each kept); 2 when the buffers cannot be had
-template <int HD, int G>
-int time_nc(sycl::queue& q, const QsaShapes& s, int64_t cells) {
+void run(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
+         const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream, int window = 0) {
+    with_shape(s, [&]<int HD, int G>() {
+        run_form<HD, G>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window);
+    });
+}
+
+// The timing's dummy cache of `cells` cells (as the engine runs it: 16 launches with their merge in a graph, replayed
+// 5 times, the first a warm-up, the fastest kept): microseconds a launch with GS heads a group, the KV heads split
+// `split` ways, NC `nc`; -1 when the buffers cannot be had
+template <int HD, int GS>
+double time_form(void* stream, const QsaShapes& s, int64_t cells, int nc, int split) {
+    sycl::queue& q = queue_for(stream);
     const int64_t ps = s.page_size, pages = (cells + ps - 1) / ps;
     cells = pages * ps;
     const size_t pool = (size_t) (pages * s.n_head_kv * ps * HD), heads = (size_t) s.n_head * HD;
@@ -497,7 +585,7 @@ int time_nc(sycl::queue& q, const QsaShapes& s, int64_t cells) {
     };
     if (!k || !v || !table || !step || !qv || !scratch || !attn) {
         release();
-        return 2;
+        return -1.0;
     }
     std::vector<int32_t> pt((size_t) pages);
     for (int64_t i = 0; i < pages; ++i) pt[(size_t) i] = (int32_t) i;
@@ -512,52 +600,62 @@ int time_nc(sycl::queue& q, const QsaShapes& s, int64_t cells) {
     pools.k_pool = k;
     pools.v_pool = v;
     pools.page_table = table;
-    const int nkv = (int) s.n_head_kv, n_slots = slots_for(q, cells, nkv, 1);
-    float* part_m = scratch + (size_t) n_slots * s.n_head * HD;
-    float* part_l = part_m + (size_t) n_slots * s.n_head;
-    const float scale = 1.0f / std::sqrt((float) HD);
-    const bool loop = n_slots < (cells + CHUNK - 1) / CHUNK;
     namespace sx = sycl::ext::oneapi::experimental;
-    const int ncs[3] = {2, 4, 8};
-    std::vector<sx::command_graph<sx::graph_state::executable>> exec;
-    for (int nc : ncs) {
-        sx::command_graph<sx::graph_state::modifiable> graph(q.get_context(), q.get_device());
-        graph.begin_recording(q);
-        for (int i = 0; i < 16; ++i) {
-            if (loop)
-                launch_kv<HD, G, true>(0, nc, q, qv, pools, nullptr, step, nkv, (int) ps, scale, scratch, part_m, part_l,
-                                       n_slots, 1, (int) cells, 0);
-            else
-                launch_kv<HD, G, false>(0, nc, q, qv, pools, nullptr, step, nkv, (int) ps, scale, scratch, part_m,
-                                        part_l, n_slots, 1, (int) cells, 0);
-            launch_merge<HD, G>(q, scratch, part_m, part_l, n_slots, attn, (size_t) s.n_head, 1, 0);
-        }
-        graph.end_recording(q);
-        exec.push_back(graph.finalize());
+    sx::command_graph<sx::graph_state::modifiable> graph(q.get_context(), q.get_device());
+    graph.begin_recording(q);
+    for (int i = 0; i < 16; ++i)
+        run_shape<HD, GS>(qv, pools, nullptr, step, cells, s, scratch, attn, 1, 0, stream, 0, nc, split);
+    graph.end_recording(q);
+    auto exec = graph.finalize();
+    double best = 0.0;
+    for (int round = 0; round < 5; ++round) {
+        const auto t0 = std::chrono::steady_clock::now();
+        q.ext_oneapi_graph(exec);
+        q.wait();
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        if (round > 0 && (best == 0.0 || us < best)) best = us;
     }
-    double best[3] = {};
-    for (int round = 0; round < 5; ++round)
-        for (int i = 0; i < 3; ++i) {
-            const auto t0 = std::chrono::steady_clock::now();
-            q.ext_oneapi_graph(exec[(size_t) i]);
-            q.wait();
-            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
-            if (round > 0 && (best[i] == 0.0 || us < best[i])) best[i] = us;
-        }
     release();
-    int pick = 0;
-    for (int i = 1; i < 3; ++i)
-        if (best[i] < best[pick]) pick = i;
-    std::fprintf(stderr, "xestrata: the decode attention (%lld/%lld heads of %d) takes %d cells a step (timed at %lld "
-                         "cells: 2: %.0f us, 4: %.0f, 8: %.0f)\n", (long long) s.n_head, (long long) s.n_head_kv, HD,
-                 ncs[pick], (long long) cells, best[0] / 16, best[1] / 16, best[2] / 16);
-    return ncs[pick];
+    return best / 16;
+}
+
+// NC timed at `cells` (its old point) without a split.  The split is the least that puts 8 work-groups on a short
+// context's cells (a KV head's heads split `split` ways, n_kv * split groups), keeping 3 heads or more a group (each
+// group reads the KV head's cells again), else the most that keeps them; among those with an instantiation.  Timed
+// alone (16 launches in a graph) the splits came out slower than one group a KV head for PLaMo 3 Translate 2B (6 heads
+// a KV head, 4 KV heads), where its decode ran faster split 2 ways (B70 196 -> 203 tok/s after 64 cells, 178 -> 186
+// after 12K; RTX 4070 213 -> 216, 194 -> 197); the 0.8B (16 heads, 1 KV head) 4 ways (B70 456 -> 504 after 64 cells,
+// 404 -> 451 after 12K); Qwen3.5-0.8B and 2B (4 heads of 256 a KV head) split 4 ways decoded 5% slower after 8K cells
+// on the B70 and the RTX 4070 (one head a group), and keep one group a KV head (2026-11-09).
+int split_for(int g, int64_t n_kv, int hd) {
+    int pick = 1;
+    for (int split = 2; split <= g && n_kv * pick < 8; ++split) {
+        const int gs = g / split;
+        const bool inst = gs == 8 || gs == 4 || (hd == 128 && (gs == 16 || gs == 10 || gs == 6 || gs == 3)) ||
+                          (hd == 256 && gs == 12);
+        if (g % split == 0 && gs >= 3 && inst) pick = split;
+    }
+    return pick;
 }
 
 template <int HD, int G>
-void tune_shape(sycl::queue& q, const QsaShapes& s, int64_t cells) {
-    nc_store<HD, G>().get(q.get_device(), [&] { return time_nc<HD, G>(q, s, cells); });
+Form time_forms(void* stream, const QsaShapes& s, int64_t cells) {
+    Form f;
+    const int ncs[3] = {2, 4, 8};
+    double t[3];
+    int pick = 0;
+    for (int i = 0; i < 3; ++i) {
+        t[i] = time_form<HD, G>(stream, s, cells, ncs[i], 1);
+        if (t[i] >= 0.0 && (t[pick] < 0.0 || t[i] < t[pick])) pick = i;
+    }
+    f.nc = ncs[pick];
+    f.split = split_for(G, s.n_head_kv, HD);
+    std::fprintf(stderr, "xestrata: the decode attention (%lld/%lld heads of %d) takes %d cells a step (timed at %lld "
+                         "cells: 2: %.0f us, 4: %.0f, 8: %.0f) and splits a KV head's heads %d ways\n",
+                 (long long) s.n_head, (long long) s.n_head_kv, HD, f.nc, (long long) cells, t[0], t[1], t[2], f.split);
+    return f;
 }
+
 
 bool pools_ok(const QsaAttnPools& pools) {
     const int kv_mode = kv_mode_of(pools);
@@ -605,14 +703,10 @@ void qsa_dense_attn_step(const float* q, const QsaAttnPools& pools, const int32_
 void qsa_dense_attn_tune(const QsaShapes& s, int64_t max_cells, void* stream) {
     if (!shape_ok(s) || max_cells < CHUNK || s.page_size <= 0) return;
     auto& q = queue_for(stream);
-    const int64_t cells = std::min<int64_t>(max_cells, 16384), g = s.n_head / s.n_head_kv;
-    if (s.head_dim == 256 && g == 12) tune_shape<256, 12>(q, s, cells);
-    else if (s.head_dim == 256 && g == 8) tune_shape<256, 8>(q, s, cells);
-    else if (s.head_dim == 256 && g == 4) tune_shape<256, 4>(q, s, cells);
-    else if (g == 6) tune_shape<128, 6>(q, s, cells);
-    else if (g == 16) tune_shape<128, 16>(q, s, cells);
-    else if (g == 8) tune_shape<128, 8>(q, s, cells);
-    else tune_shape<128, 10>(q, s, cells);
+    const int64_t cells = std::min<int64_t>(max_cells, 16384);
+    with_shape(s, [&]<int HD, int G>() {
+        form_store<HD, G>().get(q.get_device(), [&] { return time_forms<HD, G>(stream, s, cells); });
+    });
 }
 
 void qsa_dense_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* steps, int64_t max_cells,

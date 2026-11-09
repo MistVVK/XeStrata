@@ -11,10 +11,13 @@ namespace strata::kernels {
 
 /// The attention of `rows` query rows over `keys` keys on the stream's GPU through aotriton: q16 and out16
 /// [rows][heads * hd], k16 and v16 [keys][kv_heads * hd], all FP16 (query head h reads KV head h / (heads /
-/// kv_heads)); scale 1 / sqrt(hd).  causal: row t sees the keys up to keys - rows + t.  False where it does not take it
-/// (not an AMD GPU, a build or a machine without the module, a failure: the caller's own kernel).
+/// kv_heads)); scale 1 / sqrt(hd).  causal: row t sees the keys up to keys - rows + t; with a `window` (causal only)
+/// the last `window` of them, from keys - rows + t + 1 - window on (keys - rows below the window: the caller passes
+/// the keys from the first row's window on).  False where it does not take it (not an AMD GPU, a build or a machine
+/// without the module, a failure: the caller's own kernel).
 bool aotriton_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t rows, int64_t keys,
-                   int64_t heads, int64_t kv_heads, int64_t hd, uint16_t* out16, void* stream, bool causal = false);
+                   int64_t heads, int64_t kv_heads, int64_t hd, uint16_t* out16, void* stream, bool causal = false,
+                   int64_t window = 0);
 /// A training step's attention through aotriton (no mask, kv_heads = heads), the strides as aotriton_sdpa's: the
 /// forward (bwd false) into out16 with lse [heads][rows] FP32, each row's log-sum-exp of its scaled scores; the
 /// backward from the forward's o16 and lse and the output's gradient do16 (FP16, in any one unit: the gradients come

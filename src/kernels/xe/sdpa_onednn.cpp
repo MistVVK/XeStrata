@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/xe/sdpa_onednn.cpp - see include/strata/kernels/sdpa_onednn.hpp: oneDNN's SDPA through its graph API on
-// Intel GPUs (Q . K^T, the scale, a causal mask, the softmax, . V fused into one partition), a partition compiled once
-// a shape and kept.
+// Intel GPUs (Q . K^T, the scale, a causal mask or a sliding window's, the softmax, . V fused into one partition), a
+// partition compiled once a shape and kept.
 
 #include "strata/kernels/sdpa_onednn.hpp"
 
@@ -44,8 +44,8 @@ void sdpa_free(void* ptr, const void*, const void* ctx, void* ev) {
 }
 
 // a device's oneDNN engine, its compiled partitions by shape, and the scale (FP16, 1 / sqrt(head_dim)) on it
-// rows, keys, heads, kv_heads, head_dim, causal, batch
-using Shape = std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t>;
+// rows, keys, heads, kv_heads, head_dim, causal, batch, window
+using Shape = std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t, int64_t>;
 struct Sdpa {
     bool failed = false, failed_causal = false;   // a failure: the form not taken again on the device
     bool failed_train = false;
@@ -55,18 +55,24 @@ struct Sdpa {
     std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, bool>, dg::compiled_partition> train;
     std::list<Shape> order;   // the shapes, the last used first (a prompt's chunks each a shape of its own)
     std::map<int64_t, sycl::half*> scales;
+    // a sliding window's masks by (rows, keys, window), the last used first (a long prompt's chunks share one shape)
+    std::list<std::pair<std::tuple<int64_t, int64_t, int64_t>, sycl::half*>> masks;
 };
 std::unordered_map<sycl::device, Sdpa> g_sdpa;
 
 // the logical tensors' ids, which execute names the inputs by
-enum : size_t { kQ = 0, kK, kV, kScale, kO, kKeys, kRows, kNegInf };
+enum : size_t { kQ = 0, kK, kV, kScale, kO, kKeys, kRows, kNegInf, kMask };
 
 // The graph of one shape, the engine's strides [rows][heads * hd] as they are.  Without groups (kv_heads == heads):
 // q [1][heads][rows][hd], k and v [1][heads][keys][hd]; with them oneDNN's 5D GQA, q [1][kv_heads][G][rows][hd], k and
 // v [1][kv_heads][1][keys][hd].  causal: the bottom-right aligned mask oneDNN generates (GenIndex), its lengths host
-// scalars as its pattern has them (its fused kernel reads the offset from the shapes).
+// scalars as its pattern has them (its fused kernel reads the offset from the shapes); with a window, an explicit
+// mask instead ([rows][keys] FP16, 0 or -inf, added to the scaled scores: the fused pattern's attention mask), which
+// GenIndex's pattern has no band for.
 dg::compiled_partition compile(const dnnl::engine& eng, int64_t rows, int64_t keys, int64_t heads, int64_t kv_heads,
-                               int64_t hd, bool causal, int64_t B) {
+                               int64_t hd, bool causal, int64_t B, int64_t window) {
+    const bool band = causal && window > 0;
+    if (band) causal = false;
     const int64_t G = heads / kv_heads, row = heads * hd, krow = kv_heads * hd;
     std::vector<int64_t> qd, kd, sd, qs, ks;
     if (G == 1) {
@@ -100,6 +106,19 @@ dg::compiled_partition compile(const dnnl::engine& eng, int64_t rows, int64_t ke
     lt KEYS(kKeys, lt::data_type::s32, 0, lt::layout_type::strided, lt::property_type::host_scalar),
         ROWS(kRows, lt::data_type::s32, 0, lt::layout_type::strided, lt::property_type::host_scalar),
         NEG(kNegInf, lt::data_type::f32, 0, lt::layout_type::strided, lt::property_type::host_scalar);
+    if (band) {
+        std::vector<int64_t> md(sd.size(), 1);
+        md[md.size() - 2] = rows;
+        md[md.size() - 1] = keys;
+        lt M(kMask, lt::data_type::f16, md, lt::layout_type::strided), MS(id++, lt::data_type::f32, sd,
+                                                                          lt::layout_type::strided);
+        dg::op add(id++, dg::op::kind::Add, "mask");
+        add.add_inputs({SS, M});
+        add.add_outputs({MS});
+        g.add_op(add);
+        soft_in = MS;
+        ins.push_back(M);
+    }
     if (causal) {   // row r sees the keys c with r + keys - rows >= c
         lt ir(id++, lt::data_type::s32, sd, lt::layout_type::strided), ic(id++, lt::data_type::s32, sd,
                                                                          lt::layout_type::strided);
@@ -240,9 +259,39 @@ bool train_call(sycl::queue& q, int64_t rows, int64_t keys, int64_t heads, int64
 
 }  // namespace
 
+namespace {
+
+// The window's mask for `rows` rows over `keys` keys: row r sees the keys c with r + keys - rows - window < c <=
+// r + keys - rows (0), the others -inf; made once a shape on the device, the last 4 kept
+sycl::half* band_mask(Sdpa& d, sycl::queue& q, int64_t rows, int64_t keys, int64_t window) {
+    const auto key = std::make_tuple(rows, keys, window);
+    for (auto it = d.masks.begin(); it != d.masks.end(); ++it)
+        if (it->first == key) {
+            d.masks.splice(d.masks.begin(), d.masks, it);
+            return d.masks.front().second;
+        }
+    if (d.masks.size() >= 4) {
+        q.wait();
+        sycl::free(d.masks.back().second, q);
+        d.masks.pop_back();
+    }
+    sycl::half* m = sycl::malloc_device<sycl::half>((size_t) (rows * keys), q);
+    if (m == nullptr) throw std::runtime_error("no GPU memory for a window's mask");
+    const int64_t off = keys - rows;
+    q.parallel_for(sycl::range<2>((size_t) rows, (size_t) keys), [=](sycl::id<2> i) {
+        const int64_t r = (int64_t) i[0], c = (int64_t) i[1], last = r + off;
+        m[r * keys + c] = c <= last && c > last - window ? sycl::half(0.0f)
+                                                          : sycl::half(-std::numeric_limits<float>::infinity());
+    });
+    d.masks.emplace_front(key, m);
+    return m;
+}
+
+}  // namespace
+
 bool onednn_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t rows, int64_t keys,
                  int64_t heads, int64_t kv_heads, int64_t hd, uint16_t* out16, void* stream, bool causal,
-                 int64_t batch) {
+                 int64_t batch, int64_t window) {
     // its kernels run on the matrix engines: STRATA_NO_XMX=1 (a GPU without them, played on one with them) leaves the
     // attention to the engine's own kernels
     if (no_xmx()) return false;
@@ -261,14 +310,15 @@ bool onednn_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, 
             d.eng = std::make_unique<dnnl::engine>(
                 dg::sycl_interop::make_engine_with_allocator(q.get_device(), q.get_context(), alloc));
         }
-        const Shape key = std::make_tuple(rows, keys, heads, kv_heads, hd, causal, batch);
+        if (!causal) window = 0;
+        const Shape key = std::make_tuple(rows, keys, heads, kv_heads, hd, causal, batch, window);
         auto it = d.parts.find(key);
         if (it == d.parts.end()) {
             if (d.parts.size() >= 64) {
                 d.parts.erase(d.order.back());
                 d.order.pop_back();
             }
-            it = d.parts.emplace(key, compile(*d.eng, rows, keys, heads, kv_heads, hd, causal, batch)).first;
+            it = d.parts.emplace(key, compile(*d.eng, rows, keys, heads, kv_heads, hd, causal, batch, window)).first;
         } else {
             d.order.remove(key);
         }
@@ -287,7 +337,9 @@ bool onednn_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, 
                                     dg::tensor(cp.query_logical_tensor(kScale), *d.eng, sc)};
         int32_t nkeys = (int32_t) keys, nrows = (int32_t) rows;
         float neg = -std::numeric_limits<float>::infinity();
-        if (causal) {
+        if (window > 0) {
+            ins.push_back(dg::tensor(cp.query_logical_tensor(kMask), *d.eng, band_mask(d, q, rows, keys, window)));
+        } else if (causal) {
             ins.push_back(dg::tensor::make_scalar_tensor(cp.query_logical_tensor(kKeys), &nkeys));
             ins.push_back(dg::tensor::make_scalar_tensor(cp.query_logical_tensor(kRows), &nrows));
             ins.push_back(dg::tensor::make_scalar_tensor(cp.query_logical_tensor(kNegInf), &neg));

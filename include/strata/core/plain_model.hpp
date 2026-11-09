@@ -816,6 +816,7 @@ private:
     void prompt_dense_calibrate();
     /// Dense products of at least this many rows go through Gemm::native, fewer in int8 (INT64_MAX: always in int8,
     /// as the MoE models' dense products)
+    bool prompt_split_reserve();   ///< prompt_dense_calibrate's split products' buffer
     int64_t dense_native_rows_ = INT64_MAX;
     /// A dense model's: Gemm::native's products from the normed rows with their sums in FP16 (measured faster at a
     /// chunk's rows by prompt_dense_calibrate: cuBLAS's HGEMM on GeForce cards; not oneMKL's on the B70)

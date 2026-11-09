@@ -5,8 +5,9 @@
 //
 //   Qwen3.8's 24/2 heads of 256, Ornith-1.5's 16/2 of 256, Qwen3.5-9B's 16/4 of 256 and llm-jp-4.1's 40/4 of 128, on
 //   FP16 pools behind a shuffled page table, with a context that ends inside a chunk;
-//   1. the output agrees with FP64 to 1e-4 of the output's scale;
-//   2. it is bit for bit `qsa_decode_attn_step` given the selection 0, 1, ..., n-1 (the same kernels, cell c in slot c);
+//   1. the output agrees with FP64 to 1e-4 of the output's scale (the short context's smaller chunks, the default);
+//   2. with whole chunks (STRATA_QSA_MIN_CHUNK=64) it is bit for bit `qsa_decode_attn_step` given the selection 0, 1,
+//      ..., n-1 (the same kernels, cell c in slot c);
 // each with the fp16 score loop's every form (STRATA_QSA_NC 2, 4 and 8: the cells a step, qsa_dense_attn_tune's choice).
 //
 //   qsa_dense_attn_parity --bench CELLS   Qwen3.5-9B's decode attention over CELLS cells, each form's time a call (no
@@ -31,14 +32,15 @@ namespace {
 namespace par = strata::parity;
 
 // the fp16 score loop's form for the calls that follow (qsa_decode_attn.cpp's STRATA_QSA_NC); "" back to its choice
-void set_nc(const char* nc) {
+void set_env(const char* name, const char* value) {
 #if defined(_WIN32)
-    _putenv_s("XESTRATA_QSA_NC", nc);
+    _putenv_s(name, value);
 #else
-    if (*nc) setenv("XESTRATA_QSA_NC", nc, 1);
-    else unsetenv("XESTRATA_QSA_NC");
+    if (*value) setenv(name, value, 1);
+    else unsetenv(name);
 #endif
 }
+void set_nc(const char* nc) { set_env("XESTRATA_QSA_NC", nc); }
 
 template <typename T> T* up(par::Device& dev, const std::vector<T>& h) {
     T* d = dev.alloc<T>(h.size() + 64 / sizeof(T));
@@ -104,15 +106,19 @@ int check(const char* name, int64_t nh, int64_t nkv, int64_t hd) {
     int bad = 0;
     for (const char* nc : {"2", "4", "8"}) {
         set_nc(nc);
+        std::vector<float> dense((size_t) (nh * hd)), whole((size_t) (nh * hd)), sel((size_t) (nh * hd));
         k::qsa_dense_attn_step(d_q, pl, d_step, max_cells, s, scratch, d_dense, nullptr);
-        k::qsa_decode_attn_step(d_q, pl, d_ids, d_step, max_cells, s, scratch, d_sel, nullptr);
-        std::vector<float> dense((size_t) (nh * hd)), sel((size_t) (nh * hd));
         par::copy_out(dense.data(), d_dense, dense.size());
+        set_env("XESTRATA_QSA_MIN_CHUNK", "64");
+        k::qsa_dense_attn_step(d_q, pl, d_step, max_cells, s, scratch, d_dense, nullptr);
+        par::copy_out(whole.data(), d_dense, whole.size());
+        set_env("XESTRATA_QSA_MIN_CHUNK", "");
+        k::qsa_decode_attn_step(d_q, pl, d_ids, d_step, max_cells, s, scratch, d_sel, nullptr);
         par::copy_out(sel.data(), d_sel, sel.size());
 
         double err = 0.0;
         for (size_t i = 0; i < dense.size(); ++i) err = std::max(err, std::fabs((double) dense[i] - ref[i]));
-        const bool same = std::memcmp(dense.data(), sel.data(), dense.size() * sizeof(float)) == 0;
+        const bool same = std::memcmp(whole.data(), sel.data(), whole.size() * sizeof(float)) == 0;
         const double rel = err / scale_out;
         std::printf("  %-34s %s cells a step: vs FP64 %.3e of the scale %s; the identity selection's bits %s\n", name,
                     nc, rel, rel <= 1e-4 ? "ok" : "FAIL", same ? "ok" : "FAIL");

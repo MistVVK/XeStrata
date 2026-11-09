@@ -40,9 +40,9 @@ std::unordered_map<sycl::device, Aot> g_aot;
 }  // namespace
 
 // `rows` query rows over `keys` keys, the keys' kv_heads heads each read by heads / kv_heads of the queries' (GQA);
-// causal: row t sees the keys up to keys - rows + t
+// causal: row t sees the keys up to keys - rows + t, with a window the last `window` of them (kernels::aotriton_sdpa)
 bool aotriton(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t rows, int64_t keys,
-              int64_t heads, int64_t kv_heads, int64_t hd, uint16_t* out16, bool causal) {
+              int64_t heads, int64_t kv_heads, int64_t hd, uint16_t* out16, bool causal, int64_t window) {
     namespace ao = aotriton;
     std::lock_guard<std::mutex> lock(g_mu);
     Aot& d = g_aot[q.get_device()];
@@ -71,11 +71,17 @@ bool aotriton(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const ui
     p.philox_offset_output = ao::TensorView<0>::get_null_tensor(ao::kUInt64);
     p.encoded_softmax = ao::TensorView<4>::get_null_tensor(ao::kFloat16);
     p.persistent_atomic_counter = ao::TensorView<0>(reinterpret_cast<intptr_t>(d.counter), ao::kInt32);
-    // causal: the windowed form (the binary kernels have no other causal), both edges the top-left aligned diagonal
-    // where the rows are the keys, else a window of every key before and keys - rows after, the bottom-right diagonal
+    // causal: the windowed form (the binary kernels have no other causal), its edges counted from the top-left
+    // diagonal (row t sees the keys t - window_left .. t + window_right): both that diagonal where the rows are the keys,
+    // else a window of every key before and keys - rows after, the bottom-right diagonal; with a sliding window
+    // window - 1 - (keys - rows) before (the caller keeps keys - rows below the window)
     p.causal_type = causal ? ao::v3::flash::CausalType::WindowedAttention : ao::v3::flash::CausalType::None;
-    const bool square = rows == keys;
-    p.window_left = !causal ? 0 : square ? ao::v3::flash::WindowValue::TopLeftAligned : (int32_t) keys;
+    if (causal && window > 0 && keys - rows >= window) return false;
+    const bool square = rows == keys && window <= 0;
+    p.window_left = !causal ? 0
+                    : square ? ao::v3::flash::WindowValue::TopLeftAligned
+                    : window > 0 ? (int32_t) (window - 1 - (keys - rows))
+                                 : (int32_t) keys;
     p.window_right = !causal ? 0 : square ? ao::v3::flash::WindowValue::TopLeftAligned : (int32_t) (keys - rows);
     p.Max_seqlen_q = (int32_t) rows;
     p.Max_seqlen_k = (int32_t) keys;
@@ -215,9 +221,9 @@ bool aotriton_train(sycl::queue& q, bool bwd, const uint16_t* q16, const uint16_
 #endif
 STRATA_SDPA_EXPORT bool strata_sdpa_aotriton(void* q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
                                              int64_t rows, int64_t keys, int64_t heads, int64_t kv_heads, int64_t hd,
-                                             uint16_t* out16, bool causal) {
+                                             uint16_t* out16, bool causal, int64_t window) {
     return strata::image::sdpa::aotriton(*static_cast<sycl::queue*>(q), q16, k16, v16, rows, keys, heads, kv_heads, hd,
-                                         out16, causal);
+                                         out16, causal, window);
 }
 STRATA_SDPA_EXPORT bool strata_sdpa_aotriton_train(void* q, bool bwd, const uint16_t* q16, const uint16_t* k16,
                                                    const uint16_t* v16, const uint16_t* o16, const uint16_t* do16,

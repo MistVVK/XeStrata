@@ -12,6 +12,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/sdpa_aotriton.hpp"
+#include "strata/kernels/sdpa_cudnn.hpp"
 #include "strata/kernels/sdpa_onednn.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/platform/env.hpp"
@@ -110,6 +111,8 @@ const char* const kPickNames[5] = {"the decode kernel", "the matrix engines'", "
 constexpr double kDecodeMargin = 0.9;   // the decode kernel's dummy time must be under this share of the others' (below)
 struct Picks {
     int short_pick = kPickUntimed, long_pick = kPickUntimed;
+    // where a sliding window cuts keys off: the fastest of those that take it (not the int8 kernel)
+    int short_window = kPickUntimed, long_window = kPickUntimed;
     int64_t split = 0;   // a chunk reaching this many cells takes long_pick
 };
 using PickKey = std::tuple<int64_t, int64_t, int64_t, int>;   // head_dim, query heads, KV heads, the pools' format
@@ -218,7 +221,7 @@ bool run_i8(sycl::queue& queue, const float* q, const QsaAttnPools& pools, int64
 }
 
 // The maker's kernel (onednn_sdpa: oneDNN's fused SDPA on Intel GPUs; aotriton_sdpa: aotriton's flash attention on AMD
-// ones) over the pools gathered into dense FP16 rows
+// ones; cudnn_sdpa: cuDNN's SDPA on NVIDIA ones) over the pools gathered into dense FP16 rows
 // (INT8 and Q4_0 decoded), the queries made FP16, its output widened into attn; false where it does not take it.  Its
 // shapes are the chunk's own, not padded: oneDNN's fused kernel takes the causal mask's offset from the shapes, not
 // from the lengths given with them (padded, the rows saw the padding's keys: the B70, oneDNN 3.12, 2026-11-07), and a
@@ -228,9 +231,10 @@ size_t maker_scratch(const QsaShapes& s, int64_t T, int64_t Tk) {
     return (size_t) (2 * Tk * s.n_head_kv * s.head_dim + 2 * T * s.n_head * s.head_dim);
 }
 
+// cells k0 .. k0 + Tk - 1 of the pools into dense FP16 rows
 template<int HD>
-void gather16(sycl::queue& queue, const QsaAttnPools& pools, int64_t page_size, int64_t KH, int64_t Tk, uint16_t* k16,
-              uint16_t* v16) {
+void gather16(sycl::queue& queue, const QsaAttnPools& pools, int64_t page_size, int64_t KH, int64_t k0, int64_t Tk,
+              uint16_t* k16, uint16_t* v16) {
     const int fmt = pool_format(pools);
     const uint16_t *kf = pools.k_pool, *vf = pools.v_pool, *ksc = pools.k_scale, *vsc = pools.v_scale;
     const int8_t *ki = pools.k_q, *vi = pools.v_q;
@@ -238,9 +242,9 @@ void gather16(sycl::queue& queue, const QsaAttnPools& pools, int64_t page_size, 
     const int32_t* tbl = pools.page_table;
     const int64_t PS = page_size, CK = KH * HD;
     queue.parallel_for(sycl::range<1>((size_t) (Tk * CK / 8)), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0] * 8, j = i / CK, g = (i - j * CK) / HD;
+        const int64_t i = (int64_t) id[0] * 8, j = i / CK, g = (i - j * CK) / HD, c = k0 + j;
         const int dd = (int) (i - j * CK - g * HD);
-        const int64_t row = ((int64_t) tbl[j / PS] * KH + g) * PS + j % PS;
+        const int64_t row = ((int64_t) tbl[c / PS] * KH + g) * PS + c % PS;
         h8 kv, vv;
         if (fmt == kFmtF16) {
             kv = *reinterpret_cast<const h8*>(kf + row * HD + dd);
@@ -254,24 +258,31 @@ void gather16(sycl::queue& queue, const QsaAttnPools& pools, int64_t page_size, 
     });
 }
 
+// A sliding window: the keys from the first row's window on (k0), the makers' band over them (the last row's keys
+// window - 1 before its own at most, which aotriton's window takes)
 bool run_maker(sycl::queue& queue, const float* q, const QsaAttnPools& pools, int64_t pos0, int64_t T,
-               const QsaShapes& s, float* attn, void* stream) {
+               const QsaShapes& s, float* attn, void* stream, int64_t window) {
     const bool aot = aotriton_sdpa_ready(stream);
-#if !STRATA_ONEDNN
+#if !STRATA_ONEDNN && !STRATA_CUDNN
     if (!aot) return false;
 #endif
-    const int64_t hd = s.head_dim, KH = s.n_head_kv, NH = s.n_head, Tk = pos0 + T;
+    const int64_t k0 = window > 0 ? std::max<int64_t>(0, pos0 + 1 - window) : 0;
+    const int64_t hd = s.head_dim, KH = s.n_head_kv, NH = s.n_head, Tk = pos0 + T - k0;
+    if (window > 0 && pos0 + T <= window) window = 0;   // no key cut off: the causal mask alone
     if (pools.page_table == nullptr || pool_format(pools) < 0 || (hd != 128 && hd != 256)) return false;
     const int64_t CK = KH * hd, CQ = NH * hd;
     uint16_t* k16 = scratch(queue, 1, maker_scratch(s, T, Tk));
     if (k16 == nullptr) return false;
     uint16_t *v16 = k16 + Tk * CK, *q16 = v16 + Tk * CK, *o16 = q16 + T * CQ;
-    if (hd == 128) gather16<128>(queue, pools, s.page_size, KH, Tk, k16, v16);
-    else gather16<256>(queue, pools, s.page_size, KH, Tk, k16, v16);
+    if (hd == 128) gather16<128>(queue, pools, s.page_size, KH, k0, Tk, k16, v16);
+    else gather16<256>(queue, pools, s.page_size, KH, k0, Tk, k16, v16);
     queue.parallel_for(sycl::range<1>((size_t) (T * CQ)), [=](sycl::id<1> i) { q16[i] = f16_gpu::f16_from_f32(q[i]); });
-    bool ok = aot && aotriton_sdpa(q16, k16, v16, T, Tk, NH, KH, hd, o16, stream, true);
+    bool ok = aot && aotriton_sdpa(q16, k16, v16, T, Tk, NH, KH, hd, o16, stream, true, window);
 #if STRATA_ONEDNN
-    ok = ok || (!aot && onednn_sdpa(q16, k16, v16, T, Tk, NH, KH, hd, o16, stream, true));
+    ok = ok || (!aot && onednn_sdpa(q16, k16, v16, T, Tk, NH, KH, hd, o16, stream, true, 1, window));
+#endif
+#if STRATA_CUDNN
+    ok = ok || (!aot && cudnn_sdpa(q16, k16, v16, T, Tk, NH, KH, hd, o16, stream, true, window));
 #endif
     if (!ok) return false;
     queue.parallel_for(sycl::range<1>((size_t) (T * CQ)),
@@ -288,11 +299,15 @@ void prepare_buffers(sycl::queue& queue, const QsaShapes& s, int64_t a, int64_t 
     const int64_t T = std::min<int64_t>(2048, std::max<int64_t>(1, a / 2));   // time_pick's rows
     for (const int64_t cells : {b, a})
         if (flash_attn_i8_causal_prepare(T, cells, s.n_head, s.n_head_kv, s.head_dim, stream)) break;
-    // a maker's kernel here: aotriton (an AMD GPU with its module) or oneDNN (an Intel GPU's Level Zero or OpenCL)
+    // a maker's kernel here: aotriton (an AMD GPU with its module), oneDNN (an Intel GPU's Level Zero or OpenCL) or
+    // cuDNN (an NVIDIA GPU's CUDA)
     const sycl::backend be = queue.get_device().get_backend();
     bool maker = aotriton_sdpa_ready(stream);
 #if STRATA_ONEDNN
     maker = maker || be == sycl::backend::ext_oneapi_level_zero || be == sycl::backend::opencl;
+#endif
+#if STRATA_CUDNN
+    maker = maker || be == sycl::backend::ext_oneapi_cuda;
 #endif
     (void) be;
     if (maker)
@@ -304,7 +319,8 @@ void release_unpicked(sycl::queue& queue, void* stream, const Picks& p) {
         flash_attn_i8_causal_release(stream);
         release_scratch(queue, 0);
     }
-    if (p.short_pick != kPickMaker && p.long_pick != kPickMaker) {
+    if (p.short_pick != kPickMaker && p.long_pick != kPickMaker && p.short_window != kPickMaker &&
+        p.long_window != kPickMaker) {
         release_scratch(queue, 1);
 #if STRATA_ONEDNN
         onednn_sdpa_drop_causal(stream);
@@ -323,7 +339,7 @@ bool run_mma(sycl::queue& queue, const float* q, const QsaAttnPools& pools, int 
 // queries as a prompt's chunk keeps the GPU as busy as the prompt does: with 512 the FMA kernel's blocks of a few
 // queries left it idle and the decode kernel (which also splits the cells) came out 29% ahead at 64K cells on a B70,
 // where the prompt ran it 3.5% behind
-int time_pick(sycl::queue& queue, const QsaShapes& s, int fmt, int64_t cells, void* stream) {
+int time_pick(sycl::queue& queue, const QsaShapes& s, int fmt, int64_t cells, void* stream, int* windowed) {
     const int64_t PS = s.page_size, nkv = s.n_head_kv, nh = s.n_head, hd = s.head_dim;
     const int64_t T = std::min<int64_t>(2048, std::max<int64_t>(1, cells / 2));
     const int64_t pos0 = cells - T, pages = (cells + PS - 1) / PS, rows = pages * nkv * PS;
@@ -377,7 +393,7 @@ int time_pick(sycl::queue& queue, const QsaShapes& s, int fmt, int64_t cells, vo
         ms[kPickMma] = timed([&](int64_t n) { return run_mma(queue, qv, pools, fmt, pos0 + T - n, n, s, out); });
         ms[kPickI8] = timed([&](int64_t n) { return run_i8(queue, qv, pools, pos0 + T - n, n, s, out, stream); });
         ms[kPickMaker] =
-            timed([&](int64_t n) { return run_maker(queue, qv, pools, pos0 + T - n, n, s, out, stream); });
+            timed([&](int64_t n) { return run_maker(queue, qv, pools, pos0 + T - n, n, s, out, stream, 0); });
         if (fmt == kFmtF16)
             ms[kPickFp16] = timed([&](int64_t n) {
                 return prompt_attn(qv, pools.k_pool, pools.v_pool, pools.page_table, pos0 + T - n, n, s, out, stream);
@@ -408,13 +424,21 @@ int time_pick(sycl::queue& queue, const QsaShapes& s, int fmt, int64_t cells, vo
         // timed alone it came out 1.3% ahead of the matrix engines' at 64K cells of Qwen3.5-9B's 16/4 heads of 256 on
         // a B70, and in the prompt (its per-query scratch beside the other layers' work) it ran 15% behind them
         // (attention 75.1 s against 65.2 of a 63K prompt)
-        double t_best = -1.0;
-        for (int k : {(int) kPickMma, (int) kPickFp16, (int) kPickI8, (int) kPickMaker})
+        double t_best = -1.0, t_win = -1.0;
+        int win = kPickNone;
+        for (int k : {(int) kPickMma, (int) kPickFp16, (int) kPickI8, (int) kPickMaker}) {
             if (ms[k] >= 0.0 && (t_best < 0.0 || ms[k] < t_best)) {
                 t_best = ms[k];
                 best = k;
             }
+            if (k != kPickI8 && ms[k] >= 0.0 && (t_win < 0.0 || ms[k] < t_win)) {
+                t_win = ms[k];
+                win = k;
+            }
+        }
         if (ms[kPickNone] >= 0.0 && (t_best < 0.0 || ms[kPickNone] < kDecodeMargin * t_best)) best = kPickNone;
+        if (ms[kPickNone] >= 0.0 && (t_win < 0.0 || ms[kPickNone] < kDecodeMargin * t_win)) win = kPickNone;
+        *windowed = win;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "xestrata: timing the prompt attention at %lld cells: %s\n", (long long) cells, e.what());
         best = kPickUntimed;
@@ -461,8 +485,9 @@ void prompt_attn_tune(const QsaShapes& s, int fmt, int64_t max_cells, void* stre
         // 8K and up to 64K cells (1 to 2 s on a B70); a cache shorter than the long point takes the short one's choice
         const int64_t a = std::min<int64_t>(max_cells, 8192), b = std::min<int64_t>(max_cells, 65536);
         prepare_buffers(queue, s, a, b, stream);
-        p.short_pick = time_pick(queue, s, fmt, a, stream);
-        p.long_pick = b > a ? time_pick(queue, s, fmt, b, stream) : p.short_pick;
+        p.short_pick = time_pick(queue, s, fmt, a, stream, &p.short_window);
+        p.long_pick = b > a ? time_pick(queue, s, fmt, b, stream, &p.long_window) : p.short_pick;
+        if (b <= a) p.long_window = p.short_window;
         p.split = (a + b) / 2;
         release_unpicked(queue, stream, p);
         return p;
@@ -487,14 +512,21 @@ bool prompt_attn(const float* q, const QsaAttnPools& pools, int64_t pos0, int64_
         pick = forced;
     } else {
         const Picks& p = picks_for(s, fmt).get(queue.get_device(), [] { return Picks{}; });
-        pick = pos0 + T >= p.split ? p.long_pick : p.short_pick;
+        const bool lng = pos0 + T >= p.split;
+        pick = lng ? p.long_pick : p.short_pick;
+        // a sliding window that cuts keys off: the fastest of the kernels that take it
+        if (window > 0 && pos0 + T > window && pick == kPickI8) {
+            const int w = lng ? p.long_window : p.short_window;
+            if (w != kPickUntimed) pick = w;
+        }
     }
     if (pick == kPickNone) return false;
-    // a sliding window (PLaMo 3's layers): the shared attention's forms, which take its lower bound; the int8 and the
-    // maker's kernels read every key
-    if (window > 0 && (pick == kPickI8 || pick == kPickMaker)) pick = kPickMma;
+    // a sliding window (PLaMo 3's layers) that cuts keys off (more keys than the window): the int8 kernel reads every
+    // key (the same keys while they are no more than the window), so the shared attention's forms, which take its
+    // lower bound; the makers' take it (run_maker)
+    if (window > 0 && pos0 + T > window && pick == kPickI8) pick = kPickMma;
     if ((pick == kPickI8 && run_i8(queue, q, pools, pos0, T, s, attn, stream)) ||
-        (pick == kPickMaker && run_maker(queue, q, pools, pos0, T, s, attn, stream))) {
+        (pick == kPickMaker && run_maker(queue, q, pools, pos0, T, s, attn, stream, window))) {
         if (stream == nullptr) queue.wait_and_throw();
         return true;
     }

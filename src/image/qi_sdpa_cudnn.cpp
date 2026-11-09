@@ -1,7 +1,8 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/image/qi_sdpa_cudnn.cpp - see qi_sdpa.hpp and qi_conv.hpp: cuDNN's SDPA and convolution through cudnn-frontend
-// on NVIDIA GPUs (contrib-llvm), cuDNN opened at the first use (the user's installation, not free software:
+// src/image/qi_sdpa_cudnn.cpp - see qi_sdpa.hpp, qi_conv.hpp and strata/kernels/sdpa_cudnn.hpp: cuDNN's SDPA and
+// convolution through cudnn-frontend on NVIDIA GPUs (contrib-llvm), built into the kernels' library (the plain models'
+// prompt shares the SDPA, as oneDNN's), cuDNN opened at the first use (the user's installation, not free software:
 // open_cudnn), on the queue's CUDA stream through a native command (a SYCL graph being recorded takes it), a cuDNN
 // graph built once a shape and kept.
 
@@ -21,6 +22,8 @@ void* cudnn_dlhandle = nullptr;
 
 #include "qi_conv.hpp"
 #include "strata/core/graph.hpp"
+#include "strata/core/runtime.hpp"
+#include "strata/kernels/sdpa_cudnn.hpp"
 #include "strata/platform/env.hpp"
 #include "qi_sdpa.hpp"
 
@@ -49,7 +52,10 @@ namespace fe = cudnn_frontend;
 struct Cudnn {
     bool failed = false, conv_failed = false;   // conv_failed: cuDNN not opened for the convolutions
     cudnnHandle_t handle = nullptr;
-    std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t>, std::shared_ptr<fe::graph::Graph>> graphs;
+    // (rows, keys, heads, kv heads, hd, batch, causal, window) -> its graph
+    std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t>,
+             std::shared_ptr<fe::graph::Graph>>
+        graphs;
     // a training step's: (rows, keys, heads, hd, backward) -> its graph
     std::map<std::tuple<int64_t, int64_t, int64_t, int64_t, bool>, std::shared_ptr<fe::graph::Graph>> train;
     std::map<std::vector<int64_t>, std::shared_ptr<fe::graph::Graph>> convs;   // null: no plan for the shape
@@ -121,21 +127,25 @@ bool on_queue(sycl::queue& q, cudnnHandle_t handle, std::function<void()> run) {
     return true;
 }
 
+// Q and O [B][rows][heads * hd], K and V [B][T][kv_heads * hd]; causal: the diagonal at the bottom right (row t sees
+// the keys up to T - rows + t), with a window (causal only) the last `window` of them: the band's left bound
 std::shared_ptr<fe::graph::Graph> cudnn_graph(cudnnHandle_t handle, int64_t rows, int64_t T, int64_t heads,
-                                              int64_t hd, int64_t B) {
+                                              int64_t kv_heads, int64_t hd, int64_t B, bool causal, int64_t window) {
     auto g = std::make_shared<fe::graph::Graph>();
     g->set_io_data_type(fe::DataType_t::HALF)
         .set_intermediate_data_type(fe::DataType_t::FLOAT)
         .set_compute_data_type(fe::DataType_t::FLOAT);
-    const int64_t row = heads * hd;
+    const int64_t row = heads * hd, kv_row = kv_heads * hd;
     auto Q = g->tensor(fe::graph::Tensor_attributes().set_name("Q").set_uid(kQ).set_dim({B, heads, rows, hd}).set_stride(
         {rows * row, hd, row, 1}));
-    auto K = g->tensor(fe::graph::Tensor_attributes().set_name("K").set_uid(kK).set_dim({B, heads, T, hd}).set_stride(
-        {T * row, hd, row, 1}));
-    auto V = g->tensor(fe::graph::Tensor_attributes().set_name("V").set_uid(kV).set_dim({B, heads, T, hd}).set_stride(
-        {T * row, hd, row, 1}));
+    auto K = g->tensor(fe::graph::Tensor_attributes().set_name("K").set_uid(kK).set_dim({B, kv_heads, T, hd}).set_stride(
+        {T * kv_row, hd, kv_row, 1}));
+    auto V = g->tensor(fe::graph::Tensor_attributes().set_name("V").set_uid(kV).set_dim({B, kv_heads, T, hd}).set_stride(
+        {T * kv_row, hd, kv_row, 1}));
     auto opts = fe::graph::SDPA_attributes().set_name("sdpa").set_generate_stats(false).set_attn_scale(
         1.0f / std::sqrt((float) hd));
+    if (causal) opts.set_causal_mask_bottom_right(true);
+    if (causal && window > 0) opts.set_diagonal_band_left_bound((int) window);
     auto [O, stats] = g->sdpa(Q, K, V, opts);
     (void) stats;
     O->set_output(true).set_dim({B, heads, rows, hd}).set_stride({rows * row, hd, row, 1}).set_uid(kO);
@@ -340,17 +350,22 @@ void open_cudnn(cudnnHandle_t& handle) {
 
 }  // namespace
 
-bool cudnn(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t q0, int64_t q1,
-                int64_t T, int64_t heads, int64_t hd, uint16_t* out16, int64_t batch) {
+namespace {
+
+// The attention of `rows` query rows over T keys (layouts as cudnn_graph's) on q's GPU; false where cuDNN does not
+// take it (not opened, no plan: the caller's own kernel), said once by `who`
+bool run_sdpa(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t rows, int64_t T,
+              int64_t heads, int64_t kv_heads, int64_t hd, uint16_t* out16, int64_t batch, bool causal,
+              int64_t window, const char* who) {
     std::lock_guard<std::mutex> lock(g_mu);
     Cudnn& d = g_cudnn[q.get_device()];
     if (d.failed) return false;
     try {
         if (d.handle == nullptr) open_cudnn(d.handle);
-        const auto key = std::make_tuple(q1 - q0, T, heads, hd, batch);
+        const auto key = std::make_tuple(rows, T, heads, kv_heads, hd, batch, causal, window);
         auto it = d.graphs.find(key);
         if (it == d.graphs.end())
-            it = d.graphs.emplace(key, cudnn_graph(d.handle, q1 - q0, T, heads, hd, batch)).first;
+            it = d.graphs.emplace(key, cudnn_graph(d.handle, rows, T, heads, kv_heads, hd, batch, causal, window)).first;
         int64_t ws = 0;
         if (!it->second->get_workspace_size(ws).is_good()) throw std::runtime_error("cuDNN's workspace");
         if (ws > d.ws_bytes) {
@@ -362,19 +377,26 @@ bool cudnn(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint1
             d.ws = sycl::malloc_device(ws, q);
             d.ws_bytes = d.ws != nullptr ? ws : 0;
         }
-        const int64_t row = heads * hd;
         std::unordered_map<fe::graph::Tensor_attributes::uid_t, void*> pack = {
-            {kQ, const_cast<uint16_t*>(q16 + q0 * row)}, {kK, const_cast<uint16_t*>(k16)},
-            {kV, const_cast<uint16_t*>(v16)}, {kO, out16}};
+            {kQ, const_cast<uint16_t*>(q16)}, {kK, const_cast<uint16_t*>(k16)}, {kV, const_cast<uint16_t*>(v16)},
+            {kO, out16}};
         return on_queue(q, d.handle, [g = it->second, handle = d.handle, pack, ws = d.ws]() mutable {
             if (!g->execute(handle, pack, ws).is_good()) throw std::runtime_error("cuDNN's SDPA failed");
         });
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "xestrata-image: cuDNN's attention is not taken on this GPU (%s): the engine's own kernel\n",
+        std::fprintf(stderr, "%s: cuDNN's attention is not taken on this GPU (%s): the engine's own kernel\n", who,
                      e.what());
         d.failed = true;
         return false;
     }
+}
+
+}  // namespace
+
+bool cudnn(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t q0, int64_t q1,
+                int64_t T, int64_t heads, int64_t hd, uint16_t* out16, int64_t batch) {
+    return run_sdpa(q, q16 + q0 * heads * hd, k16, v16, q1 - q0, T, heads, heads, hd, out16, batch, false, 0,
+                    "xestrata-image");
 }
 
 bool cudnn_train(sycl::queue& q, bool bwd, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
@@ -509,3 +531,15 @@ bool cudnn3(sycl::queue& q, const uint16_t* x, int64_t D, int64_t H, int64_t W, 
 }
 
 }  // namespace strata::image::conv
+
+namespace strata::kernels {
+
+bool cudnn_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t rows, int64_t keys, int64_t heads,
+                int64_t kv_heads, int64_t hd, uint16_t* out16, void* stream, bool causal, int64_t window) {
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    if (q.get_device().get_backend() != sycl::backend::ext_oneapi_cuda) return false;
+    return image::sdpa::run_sdpa(q, q16, k16, v16, rows, keys, heads, kv_heads, hd, out16, 1, causal, window,
+                                 "xestrata");
+}
+
+}  // namespace strata::kernels

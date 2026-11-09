@@ -142,6 +142,7 @@ struct PlainCpu::Impl {
     std::vector<std::vector<float>> gdn_state;   ///< [HV][S / 32 column groups][S rows (k)][32 cols (v)] a GDN layer
     std::vector<std::vector<float>> gdn_conv;    ///< [C][3] a GDN layer
     std::vector<std::vector<float>> kc_, vc_;    ///< [cells][nkv][HD] an attention layer
+    std::vector<float> part_m, part_l, part_acc;   ///< a decode window's attention, a span's partials
     // scratch, kept between runs
     std::vector<float> x, hn, big, ab, mix, y, q, logit_rows;
     kc::I8Rows rows;
@@ -609,64 +610,123 @@ void PlainCpu::Impl::block_attn(Layer& L, int T, int64_t pos) {
             std::memcpy(vcache + ((size_t) p * NKV + g) * HD, r + QW + NKV * HD + g * HD, (size_t) HD * 4);
         }
     });
-    // the attention: a piece is a head and a block of queries; the keys in tiles, an online softmax per query
-    constexpr int kQ = 16, kK = 64;
+    // the attention: a piece is a KV head's query heads (its cells read once for them: a full layer's 12K cells are
+    // 50 MB on PLaMo 3 Translate 2B, past the L3, and its 6 heads each read them again, 18 -> 12.7 ms a token on the
+    // i7-14700) over a block of queries and, in a decode window, a span of kSpan cells; the heads halved into groups
+    // while the pieces number fewer than kPieces (the 0.8B's 16 heads on one KV head: a piece each span left the
+    // threads idle, 2.4 -> 4.2 ms at 3K cells).  The heads and the spans by the shapes and the cells' positions, so the
+    // pieces and the answer do not depend on the threads.  The keys in tiles, an online softmax per query and head,
+    // the spans' partials merged in order.
+    constexpr int kQ = 16, kK = 64, kPieces = 16;
+    constexpr int64_t kSpan = 512;
     const int qblocks = (T + kQ - 1) / kQ;
     const float scale = 1.0f / std::sqrt((float) HD);
+    const int64_t win = L.swa ? window : 0;
+    const bool spans = T <= kQ;
+    const int64_t lo_all = win > 0 ? std::max<int64_t>(0, pos - win + 1) : 0, hi_all = pos + T - 1;
+    const int64_t s0 = spans ? lo_all / kSpan : 0, ns = spans ? hi_all / kSpan - s0 + 1 : 1;
+    const int64_t G = NH / NKV;
+    int64_t HG = G;
+    while (HG > 1 && NKV * ((G + HG - 1) / HG) * qblocks * ns < kPieces) HG = (HG + 1) / 2;
+    const int64_t hgroups = (G + HG - 1) / HG;
     y.resize((size_t) T * NH * HD);
-    pool->run((int) (NH * qblocks), [&](int i) {
-        const int64_t h = i / qblocks, g = h / (NH / NKV);
-        const int t0 = (i % qblocks) * kQ, t1 = std::min(T, t0 + kQ), nq = t1 - t0;
-        float mrow[kQ], lrow[kQ], sc[kQ][kK];
-        std::vector<float> acc((size_t) nq * HD, 0.0f);
-        for (int j = 0; j < nq; ++j) { mrow[j] = -std::numeric_limits<float>::infinity(); lrow[j] = 0.0f; }
+    if (spans) {
+        part_m.resize((size_t) (ns * T * NH));
+        part_l.resize((size_t) (ns * T * NH));
+        part_acc.resize((size_t) (ns * T * NH * HD));
+    }
+    // the output row of query t, head h, from its sums: the attention, times sigmoid(gate) where the model gates it
+    auto finish = [&](int t, int64_t h, const float* a, float l) {
+        const float inv = 1.0f / l;
+        float* out = y.data() + ((size_t) t * NH + h) * HD;
+        if (gate) {
+            const float* gv = big.data() + (size_t) t * W + h * QH + HD;
+            for (int64_t d = 0; d < HD; ++d) out[d] = a[d] * inv * sigm(gv[d]);
+        } else {
+            for (int64_t d = 0; d < HD; ++d) out[d] = a[d] * inv;
+        }
+    };
+    pool->run((int) (NKV * hgroups * qblocks * ns), [&](int i) {
+        const int64_t g = i / (hgroups * qblocks * ns), hg = i / (qblocks * ns) % hgroups, sp = i % ns;
+        const int qb = (int) (i / ns % qblocks);
+        const int64_t h0 = g * G + hg * HG, nh = std::min(HG, G - hg * HG);   // the piece's heads h0 .. h0 + nh - 1
+        const int t0 = qb * kQ, t1 = std::min(T, t0 + kQ), nq = t1 - t0, R = nq * (int) nh;
         const int64_t last = pos + t1 - 1;   // the block's last query sees the cells up to its own
         // a sliding-window layer: query p sees the cells from p - window + 1 on, the block's first query the earliest
-        const int64_t win = L.swa ? window : 0;
-        const int64_t from0 = win > 0 ? std::max<int64_t>(0, pos + t0 - win + 1) : 0;
-        for (int64_t k0 = from0 / kK * kK; k0 <= last; k0 += kK) {
-            const int64_t k1 = std::min(last + 1, k0 + kK);
-            for (int j = 0; j < nq; ++j) {
-                const int64_t pj = pos + t0 + j, lo = win > 0 ? pj - win + 1 : 0;
-                const float* qv = q.data() + ((size_t) (t0 + j) * NH + h) * HD;
-                float mx = mrow[j];
-                for (int64_t c = k0; c < k1; ++c) {
-                    const float v = c <= pj && c >= lo ? dot(qv, kcache + ((size_t) c * NKV + g) * HD, (int) HD) * scale
-                                                       : -std::numeric_limits<float>::infinity();
-                    sc[j][c - k0] = v;
-                    mx = std::max(mx, v);
+        int64_t ca = win > 0 ? std::max<int64_t>(0, pos + t0 - win + 1) : 0, cb = last + 1;
+        if (spans) {
+            ca = std::max(ca, (s0 + sp) * kSpan);
+            cb = std::min(cb, (s0 + sp + 1) * kSpan);
+        }
+        std::vector<float> mrow((size_t) R, -std::numeric_limits<float>::infinity()), lrow((size_t) R, 0.0f);
+        std::vector<float> acc((size_t) R * HD, 0.0f), sc((size_t) R * kK);
+        for (int64_t k0 = ca; k0 < cb; k0 += kK) {
+            const int64_t k1 = std::min(cb, k0 + kK);
+            for (int64_t c = k0; c < k1; ++c) {
+                const float* kr = kcache + ((size_t) c * NKV + g) * HD;
+                for (int j = 0; j < nq; ++j) {
+                    const int64_t pj = pos + t0 + j, lo = win > 0 ? pj - win + 1 : 0;
+                    const bool seen = c <= pj && c >= lo;
+                    for (int64_t hh = 0; hh < nh; ++hh) {
+                        const float* qv = q.data() + ((size_t) (t0 + j) * NH + h0 + hh) * HD;
+                        sc[(size_t) (j * nh + hh) * kK + (size_t) (c - k0)] =
+                            seen ? dot(qv, kr, (int) HD) * scale : -std::numeric_limits<float>::infinity();
+                    }
                 }
+            }
+            for (int r = 0; r < R; ++r) {
+                const float* sr = sc.data() + (size_t) r * kK;
+                float mx = mrow[(size_t) r];
+                for (int64_t c = k0; c < k1; ++c) mx = std::max(mx, sr[c - k0]);
                 if (mx == -std::numeric_limits<float>::infinity()) continue;   // no cell of this tile for it
-                const float corr = std::exp(mrow[j] - mx);
-                float* a = acc.data() + (size_t) j * HD;
+                const float corr = std::exp(mrow[(size_t) r] - mx);
+                float* a = acc.data() + (size_t) r * HD;
                 if (corr != 1.0f)
                     for (int64_t d = 0; d < HD; ++d) a[d] *= corr;
-                float l = lrow[j] * corr;
+                float l = lrow[(size_t) r] * corr;
                 for (int64_t c = k0; c < k1; ++c) {
-                    const float pw = std::exp(sc[j][c - k0] - mx);
+                    const float pw = std::exp(sr[c - k0] - mx);
                     if (pw == 0.0f) continue;
                     l += pw;
                     const float* vv = vcache + ((size_t) c * NKV + g) * HD;
                     for (int64_t d = 0; d < HD; ++d) a[d] = std::fmaf(pw, vv[d], a[d]);
                 }
-                mrow[j] = mx;
-                lrow[j] = l;
+                mrow[(size_t) r] = mx;
+                lrow[(size_t) r] = l;
             }
         }
-        // out = attention, times sigmoid(gate) where the model gates it
-        for (int j = 0; j < nq; ++j) {
-            const int t = t0 + j;
-            const float inv = 1.0f / lrow[j];
-            float* out = y.data() + ((size_t) t * NH + h) * HD;
-            const float* a = acc.data() + (size_t) j * HD;
-            if (gate) {
-                const float* gv = big.data() + (size_t) t * W + h * QH + HD;
-                for (int64_t d = 0; d < HD; ++d) out[d] = a[d] * inv * sigm(gv[d]);
-            } else {
-                for (int64_t d = 0; d < HD; ++d) out[d] = a[d] * inv;
+        for (int j = 0; j < nq; ++j)
+            for (int64_t hh = 0; hh < nh; ++hh) {
+                const int r = j * (int) nh + (int) hh, t = t0 + j;
+                const int64_t h = h0 + hh;
+                const float* a = acc.data() + (size_t) r * HD;
+                if (!spans) {
+                    finish(t, h, a, lrow[(size_t) r]);
+                    continue;
+                }
+                const size_t at = (size_t) ((sp * T + t) * NH + h);
+                part_m[at] = mrow[(size_t) r];
+                part_l[at] = lrow[(size_t) r];
+                std::memcpy(part_acc.data() + at * HD, a, (size_t) HD * 4);
             }
-        }
     });
+    if (spans)   // the spans' partials, in order
+        pool->run((int) (T * NH), [&](int i) {
+            const int t = i / (int) NH;
+            const int64_t h = i % NH;
+            float M = -std::numeric_limits<float>::infinity();
+            for (int64_t sp = 0; sp < ns; ++sp) M = std::max(M, part_m[(size_t) ((sp * T + t) * NH + h)]);
+            float a[512] = {}, l = 0.0f;
+            for (int64_t sp = 0; sp < ns; ++sp) {
+                const size_t at = (size_t) ((sp * T + t) * NH + h);
+                if (part_m[at] == -std::numeric_limits<float>::infinity()) continue;
+                const float w = std::exp(part_m[at] - M);
+                l = std::fmaf(part_l[at], w, l);
+                const float* pa = part_acc.data() + at * HD;
+                for (int64_t d = 0; d < HD; ++d) a[d] = std::fmaf(pa[d], w, a[d]);
+            }
+            finish(t, h, a, l);
+        });
     mark(2);
     mix.resize((size_t) T * N);
     linear(L.out, y.data(), (size_t) (NH * HD), T, mix.data(), (size_t) N);

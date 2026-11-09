@@ -935,8 +935,9 @@ void launch_fma(sycl::queue& q, const FlashAttnArgs& a) {
     });
 }
 
-// the shapes the FMA form is built for: heads of 128 with 1, 2, 4, 8 or 10 query heads a KV head, of 256 with 1, 2,
-// 4, 8 or 12 (BQ x G rows of 16 to 40 a work-group: within the 48 KiB of local memory every GPU gives)
+// the shapes the FMA form is built for: heads of 128 with 1, 2, 4, 6, 8, 10 or 16 query heads a KV head (6 and 16:
+// PLaMo 3 Translate's 2B and 0.8B), of 256 with 1, 2, 4, 8 or 12 (BQ x G rows of 16 to 40 a work-group: within the
+// 48 KiB of local memory every GPU gives)
 template<bool F32>
 bool run_fma_t(sycl::queue& q, const FlashAttnArgs& a) {
     const int64_t G = a.n_head / a.n_kv;
@@ -945,8 +946,10 @@ bool run_fma_t(sycl::queue& q, const FlashAttnArgs& a) {
         case 1: launch_fma<128, 1, 16, 32, F32>(q, a); return true;
         case 2: launch_fma<128, 2, 8, 32, F32>(q, a); return true;
         case 4: launch_fma<128, 4, 4, 32, F32>(q, a); return true;
+        case 6: launch_fma<128, 6, 4, 32, F32>(q, a); return true;
         case 8: launch_fma<128, 8, 2, 32, F32>(q, a); return true;
         case 10: launch_fma<128, 10, 4, 32, F32>(q, a); return true;
+        case 16: launch_fma<128, 16, 2, 32, F32>(q, a); return true;
         default: return false;
         }
     }

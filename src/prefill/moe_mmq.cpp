@@ -49,6 +49,14 @@ void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, v
                                          kernels::iq_mmq_type_dup(t));
 }
 
+void split_set(int quarters, void* stream) { kernels::iq_mmq_split_set(Q(stream), quarters); }
+int split_get(void* stream) { return kernels::iq_mmq_split_get(Q(stream)); }
+bool split_reserve(int64_t rows, int64_t n_out, void* stream) {
+    return kernels::iq_mmq_split_reserve(Q(stream), kernels::iq_mmq_split_floats(rows, n_out));
+}
+
+void split_release(void* stream) { kernels::iq_mmq_split_release(Q(stream)); }
+
 Context::Context() {}
 Context::~Context() {}
 void Context::run(const Product& p, void* stream) {

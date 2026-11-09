@@ -394,6 +394,7 @@ void PlainModel::prompt_dense_calibrate() {
     struct Chosen {
         int64_t rows;
         bool half;
+        int split;   // prefill::mmq::split_set's quarters
     };
     struct Chosens {
         std::mutex mu;
@@ -408,6 +409,7 @@ void PlainModel::prompt_dense_calibrate() {
         if (it != chosen.of.end()) {
             dense_native_rows_ = it->second.rows;
             dense_half_sums_ = it->second.half;
+            if (it->second.split > 0 && prompt_split_reserve()) prefill::mmq::split_set(it->second.split, cs_);
             return;
         }
     }
@@ -437,6 +439,34 @@ void PlainModel::prompt_dense_calibrate() {
         if (!pg.identity) {
             prefill::mmq::iota(P.identity, P.T, cs_);
             pg.identity = true;
+        }
+        // the int8 products of few rows split along K (prefill::mmq::split_set): none, or aiming at 2, 4, 8 or 16
+        // quarters of the compute units, timed at 16 and 64 rows (their sum), the fastest kept; the aim differs by
+        // GPU and model (PLaMo 3 Translate's 64-token prompt: the RTX 4070 best at 16 quarters for the 2B, the B70 at
+        // 2, where its 0.8B lost at 4 and more, 2026-11-09).  Timed first and without the split last: timed after the
+        // products below, the B70's next 64-token prompt ran 15% slower whatever it chose.
+        int split = 0;
+        if (prompt_split_reserve()) {
+            std::string tried;
+            double t_best = 1e30;
+            for (const int quarters : {2, 4, 8, 16, 0}) {
+                prefill::mmq::split_set(quarters, cs_);
+                double t = 0.0;
+                for (const int64_t T : {lo, std::min<int64_t>(k::kIqMmqSplitRows, hi)}) {
+                    P.h_dense_bounds[0] = 0;
+                    P.h_dense_bounds[1] = (int32_t) T;
+                    if (!strata::gpu::copy_async(P.dense_bounds, P.h_dense_bounds, 2 * sizeof(int32_t), cs_)) return;
+                    const double r = best([&] { prompt_dense_int8(w, P.hn, w.n_in, P.sh_gate, T, 0); });
+                    if (r < 0) return;
+                    t += r;
+                }
+                char buf[40];
+                std::snprintf(buf, sizeof buf, "%s%d: %.2f ms", tried.empty() ? "" : ", ", quarters, 1e3 * t);
+                tried += buf;
+                if (t < t_best) { t_best = t; split = quarters; }
+            }
+            std::fprintf(stderr, "xestrata plain: the int8 products of few rows split along K aiming at %d quarters "
+                                 "of the compute units (%s)\n", split, tried.c_str());
         }
         // Gemm::native with its sums in FP32 and in FP16 (h), the faster at the chunk's rows taken for the products
         // from the normed rows
@@ -480,13 +510,27 @@ void PlainModel::prompt_dense_calibrate() {
                      dense_half_sums_ ? "FP16" : "FP32",
                      dense_native_rows_ == INT64_MAX ? "no" : std::to_string(dense_native_rows_).c_str(), 1e3 * n[0],
                      1e3 * q[0], (long long) lo, 1e3 * n[1], 1e3 * q[1], (long long) hi);
+        prefill::mmq::split_set(split, cs_);
+        if (split == 0) prefill::mmq::split_release(cs_);
         std::lock_guard<std::mutex> lock(chosen.mu);
-        chosen.of[key] = {dense_native_rows_, dense_half_sums_};
+        chosen.of[key] = {dense_native_rows_, dense_half_sums_, split};
     } catch (const std::exception& e) {
         std::fprintf(stderr, "xestrata plain: timing the dense products: %s (int8 kept)\n", e.what());
         dense_native_rows_ = INT64_MAX;
         dense_half_sums_ = false;
+        prefill::mmq::split_set(0, cs_);
     }
+}
+
+// The parts' buffer the split products (prefill::mmq::split_set) take: for the widest of the dense products a block
+// takes, at their few rows
+bool PlainModel::prompt_split_reserve() {
+    int64_t n_out = spec_.n_embd;
+    const Block& b = blocks_.front();
+    for (const W* w : {&b.qkv, &b.z, &b.ssm_out, &b.q, &b.k, &b.v, &b.o, &b.qkv_all, &b.gu_all, &b.sh_gate, &b.sh_up,
+                       &b.sh_down})
+        if (w->data != nullptr) n_out = std::max<int64_t>(n_out, w->n_out);
+    return prefill::mmq::split_reserve(k::kIqMmqSplitRows, n_out, cs_);
 }
 
 bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* routes,

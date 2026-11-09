@@ -30,7 +30,7 @@ namespace strata::kernels {
 namespace {
 
 using AotFn = bool (*)(void*, const uint16_t*, const uint16_t*, const uint16_t*, int64_t, int64_t, int64_t, int64_t,
-                       int64_t, uint16_t*, bool);   // strata_sdpa_aotriton's
+                       int64_t, uint16_t*, bool, int64_t);   // strata_sdpa_aotriton's
 using AotTrainFn = bool (*)(void*, bool, const uint16_t*, const uint16_t*, const uint16_t*, const uint16_t*,
                             const uint16_t*, float*, int64_t, int64_t, int64_t, int64_t, uint16_t*, uint16_t*,
                             uint16_t*, uint16_t*, float*);   // strata_sdpa_aotriton_train's
@@ -101,11 +101,12 @@ bool aotriton_sdpa_ready([[maybe_unused]] void* stream) {
 bool aotriton_sdpa([[maybe_unused]] const uint16_t* q16, [[maybe_unused]] const uint16_t* k16,
                    [[maybe_unused]] const uint16_t* v16, [[maybe_unused]] int64_t rows, [[maybe_unused]] int64_t keys,
                    [[maybe_unused]] int64_t heads, [[maybe_unused]] int64_t kv_heads, [[maybe_unused]] int64_t hd,
-                   [[maybe_unused]] uint16_t* out16, [[maybe_unused]] void* stream, [[maybe_unused]] bool causal) {
+                   [[maybe_unused]] uint16_t* out16, [[maybe_unused]] void* stream, [[maybe_unused]] bool causal,
+                   [[maybe_unused]] int64_t window) {
 #if STRATA_AOTRITON
     if (!aotriton_sdpa_ready(stream)) return false;
     sycl::queue& q = core::Runtime::get().stream(stream);
-    return aotriton_module()(&q, q16, k16, v16, rows, keys, heads, kv_heads, hd, out16, causal);
+    return aotriton_module()(&q, q16, k16, v16, rows, keys, heads, kv_heads, hd, out16, causal, window);
 #else
     return false;
 #endif

@@ -1092,7 +1092,7 @@ bool PlainModel::load_qwen(std::string& err) {
         !dev(&vcur_, T * NKV * HD * 4) || !dev(&attn_, T * NH * HD * 4) || !dev(&attn32_, T * NH * HD * 4) ||
         !dev(&attn_scratch_, T * (uint64_t) attn_scratch_floats_ * 4) || !dev(&rlog_, T * E * 4) ||
         !dev(&ids_, T * K * 4) || !dev(&w_, T * K * 4) || !dev(&shared_, T * N * 4) || !dev(&sh_g_, (T + 4) * 4) ||
-        !dev(&sh_gate_, T * FS * 4) || !dev(&sh_up_, T * FS * 4) || !dev(&moe_out_, T * N * 4) ||
+        !dev(&sh_gate_, T * FS * 2 * 4) || !dev(&sh_up_, T * FS * 4) || !dev(&moe_out_, T * N * 4) ||
         !dev(&logits_, T * (uint64_t) n_vocab_ * 4) || (has_mtp_ && !dev(&mtp_h_, T * N * 4))) {
         err = "plain model: no VRAM for the window's buffers";
         return false;
@@ -2967,24 +2967,33 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
         proj(b.ssm_out, y_, mix_, T, true);
     } else {
         const int64_t a = b.attn;
-        proj(b.q, hn_, qfull_, T, false);
-        proj(b.k, hn_, kraw_, T, false);
-        proj(b.v, hn_, vcur_, T, false);
+        // plamo3's fused Q, K and V: one product for one row (its Q, K and V side by side in qfull_, which holds twice
+        // the queries), three for more (a row's three would interleave with the next's)
+        float *kr = kraw_, *vc = vcur_;
+        if (b.qkv_all.data != nullptr && T == 1) {
+            proj(b.qkv_all, hn_, qfull_, T, false);
+            kr = qfull_ + NH * HD;
+            vc = kr + NKV * HD;
+        } else {
+            proj(b.q, hn_, qfull_, T, false);
+            proj(b.k, hn_, kraw_, T, false);
+            proj(b.v, hn_, vcur_, T, false);
+        }
         k::native_qsa_rms_norm_rope(qfull_, (int) ((has_gate_ ? 2 : 1) * HD), b.q_norm, qcur_, (int) (T * NH), (int) HD,
                                     (int) s.rope_dims, eps, rs, pos_q, cs);
-        k::native_qsa_rms_norm_rope(kraw_, (int) HD, b.k_norm, kcur_, (int) (T * NKV), (int) HD,
+        k::native_qsa_rms_norm_rope(kr, (int) HD, b.k_norm, kcur_, (int) (T * NKV), (int) HD,
                                     (int) s.rope_dims, eps, rs, pos_k, cs);
         // --kv q4_0: K, V and the queries rotated (kv_q4.hpp); k8v4: V alone; the output back below
         if (opt_.kv_q4 == 1) {
             k::fwht256_inplace_cuda(kcur_, (int64_t) T * NKV, cs);
-            k::fwht256_inplace_cuda(vcur_, (int64_t) T * NKV, cs);
+            k::fwht256_inplace_cuda(vc, (int64_t) T * NKV, cs);
             k::fwht256_inplace_cuda(qcur_, (int64_t) T * NH, cs);
         } else if (opt_.kv_q4 == 2) {
-            k::fwht256_inplace_cuda(vcur_, (int64_t) T * NKV, cs);
+            k::fwht256_inplace_cuda(vc, (int64_t) T * NKV, cs);
         }
         for (int t = 0; t < T; ++t)
             kv_append_cells((size_t) a, rows ? row_slot_[(size_t) t] : -1, step_ + (size_t) t * k::kStepCount, 1,
-                            kcur_ + (size_t) t * NKV * HD, vcur_ + (size_t) t * NKV * HD, cs);
+                            kcur_ + (size_t) t * NKV * HD, vc + (size_t) t * NKV * HD, cs);
         if (rows)   // each row over its own slot's cells
             for (int t = 0; t < T; ++t)
                 k::qsa_dense_attn_batch(qcur_ + (size_t) t * NH * HD, kv_pools((size_t) a, row_slot_[(size_t) t]),
@@ -3018,13 +3027,17 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
             proj(b.sh_down, sh_gate_, moe_out_, T, true);
         } else {
             k::native_qsa_rms_norm_weighted_q8_1(x_, b.post_norm, hn_, xq_, (int) N, T, eps, cs);
-            if (b.sh_gate.type != b.sh_up.type ||
-                !k::native_mmvq_pair(b.sh_gate.type, b.sh_gate.data, b.sh_up.data, xq_, sh_gate_, sh_up_, (int) N,
-                                     (int) FS, T, cs)) {
+            float* up = sh_up_;
+            if (b.gu_all.data != nullptr && T == 1) {   // plamo3's fused gate and up: one product for one row
+                k::native_mmvq(b.gu_all.type, b.gu_all.data, xq_, sh_gate_, (int) N, (int) (2 * FS), T, cs);
+                up = sh_gate_ + FS;
+            } else if (b.sh_gate.type != b.sh_up.type ||
+                       !k::native_mmvq_pair(b.sh_gate.type, b.sh_gate.data, b.sh_up.data, xq_, sh_gate_, sh_up_,
+                                            (int) N, (int) FS, T, cs)) {
                 k::native_mmvq(b.sh_gate.type, b.sh_gate.data, xq_, sh_gate_, (int) N, (int) FS, T, cs);
                 k::native_mmvq(b.sh_up.type, b.sh_up.data, xq_, sh_up_, (int) N, (int) FS, T, cs);
             }
-            k::native_swiglu_q8_1(sh_gate_, sh_up_, xq_, (int) FS, T, cs);
+            k::native_swiglu_q8_1(sh_gate_, up, xq_, (int) FS, T, cs);
             k::native_mmvq(b.sh_down.type, b.sh_down.data, xq_, moe_out_, (int) FS, (int) N, T, cs);
         }
         if (b.ffn_post != nullptr) {   // plamo3: the FFN's output normed before the add

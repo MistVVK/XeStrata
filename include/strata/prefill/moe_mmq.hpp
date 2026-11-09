@@ -68,6 +68,13 @@ struct Product {
     size_t woff = 0;
 };
 
+/// A one-expert product of few rows split along K (kernels::iq_mmq_split_set): the aim in quarters of the compute
+/// units (0: none), and the parts' buffer the stream reserves for products of up to `rows` rows and `n_out` outputs.
+void split_set(int quarters, void* stream);
+int split_get(void* stream);
+bool split_reserve(int64_t rows, int64_t n_out, void* stream);
+void split_release(void* stream);
+
 /// The launch context.  One per prompt path.
 class Context {
 public:

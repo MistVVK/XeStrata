@@ -29,6 +29,7 @@
 #include "device_target.hpp"
 #include "amd_wmma.hpp"
 #include "nv_mma.hpp"
+#include "strata/core/graph.hpp"
 #include "strata/core/per_device.hpp"
 #include "iq_bits.hpp"
 #include "cuda_intrinsics.hpp"
@@ -45,6 +46,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <unordered_map>
 
 namespace strata::kernels {
 namespace {
@@ -550,10 +553,21 @@ struct Kernel {
     float* dst;
     int64_t ld_dst, tiles_m, tiles_n;
     sycl::local_accessor<uint8_t, 1> lm;
+    // K split `ksplit` ways (launch's split_k), kspan values a work-group: each part's sums into part[ks][row][col]
+    // (n_out columns), which reduce_parts adds up in order; null: one part, the sums straight into dst
+    int64_t ksplit = 1, kspan = 0;
+    float* part = nullptr;
+    int64_t total_rows = 0, n_out = 0;
+
+    void out(int64_t ks, int64_t row, int64_t col, float v) const {
+        if (part == nullptr) dst[(int64_t) ids[row] * ld_dst + col] = v;
+        else part[(ks * total_rows + row) * n_out + col] = v;
+    }
 
     void dp4a_body(sycl::nd_item<1> it) const {
         constexpr int lanes = NSG * SG, RSTEP = lanes / WN, RPT = WM / RSTEP;
-        const int64_t g = (int64_t) it.get_group(0), per = tiles_m * tiles_n, e = g / per, r = g % per;
+        const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, ks = gk % ksplit, per = tiles_m * tiles_n, e = g / per,
+                      r = g % per;
         const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
         const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
         if (m0 >= rows) return;   // the whole work-group: this expert has fewer rows than the launch
@@ -569,7 +583,7 @@ struct Kernel {
         float acc[RPT];
         for (int i = 0; i < RPT; ++i) acc[i] = 0.0f;
         const int64_t kb = K / 32;   // activation scales a row
-        for (int64_t k0 = 0; k0 < K; k0 += KC) {
+        for (int64_t k0 = ks * kspan; k0 < sycl::min(K, (ks + 1) * kspan); k0 += KC) {
             sycl::group_barrier(it.get_group());   // the last step's tiles are read
             const bool last = TAIL && k0 + KC > K;   // TAIL: a last step past K, zeros past it
             for (int v = lid; v < WM * (KC / 16); v += lanes) {
@@ -615,7 +629,7 @@ struct Kernel {
         }
         for (int i = 0; i < RPT; ++i) {
             const int64_t row = m0 + rbase + (int64_t) i * RSTEP;
-            if (row < rows) dst[(int64_t) ids[row0 + row] * ld_dst + n0 + n] = acc[i];
+            if (row < rows) out(ks, row0 + row, n0 + n, acc[i]);
         }
     }
 
@@ -631,7 +645,8 @@ struct Kernel {
         constexpr int NT = WN / IN, NSUB = NSG * SG / ISG, RG = NSUB / NT, TPS = WM / IM / RG;
         static_assert(NSUB % NT == 0 && (WM / IM) % RG == 0, "the tiles split evenly over the sub-groups");
         constexpr int LDBV = WN * 4;   // a VNNI row: 4 K values of every output
-        const int64_t g = (int64_t) it.get_group(0), per = tiles_m * tiles_n, e = g / per, r = g % per;
+        const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, ks = gk % ksplit, per = tiles_m * tiles_n, e = g / per,
+                      r = g % per;
         const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
         const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
         if (m0 >= rows) return;   // the whole work-group: this expert has fewer rows than the launch
@@ -657,7 +672,7 @@ struct Kernel {
         mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, IM, IN> ci;
 
         const int64_t kb = K / 32;   // activation scales a row
-        for (int64_t k0 = 0; k0 < K; k0 += KC) {
+        for (int64_t k0 = ks * kspan; k0 < sycl::min(K, (ks + 1) * kspan); k0 += KC) {
             sycl::group_barrier(it.get_group());   // the last step's tiles are read
             const bool last = TAIL && k0 + KC > K;   // TAIL: a last step past K, zeros past it
             for (int v = lid; v < WM * (KC / 16); v += lanes) {
@@ -726,7 +741,7 @@ struct Kernel {
         for (int t = 0; t < TPS; ++t)
             for (int i = 0; i < IM; ++i) {
                 const int64_t row = m0 + rs + (int64_t) t * IM + i;
-                if (row < rows) dst[(int64_t) ids[row0 + row] * ld_dst + n0 + cs + lane] = acc[t][i];
+                if (row < rows) out(ks, row0 + row, n0 + cs + lane, acc[t][i]);
             }
 #else
         (void) it;
@@ -742,7 +757,8 @@ struct Kernel {
             (void) it;
         } else {
 #if STRATA_IQ_MMQ_MATRIX
-            const int64_t g = (int64_t) it.get_group(0), per = tiles_m * tiles_n, e = g / per, r = g % per;
+            const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, ks = gk % ksplit, per = tiles_m * tiles_n, e = g / per,
+                      r = g % per;
             const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
             const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
             if (m0 >= rows) return;   // the whole work-group: this expert has fewer rows than the launch
@@ -773,7 +789,7 @@ struct Kernel {
                 for (int j = 0; j < SGN; ++j) mx::joint_matrix_fill(sg, acc[i][j], 0.0f);
 
             const int64_t kb = K / 32;   // activation scales a row
-            for (int64_t k0 = 0; k0 < K; k0 += KC) {
+            for (int64_t k0 = ks * kspan; k0 < sycl::min(K, (ks + 1) * kspan); k0 += KC) {
                 sycl::group_barrier(it.get_group());   // the last step's tiles are read
                 const bool last = TAIL && k0 + KC > K;   // TAIL: a last step past K, zeros past it
                 for (int v = lid; v < WM * (KC / 16); v += lanes) {
@@ -852,7 +868,7 @@ struct Kernel {
                     const int64_t rb = m0 + ms + (int64_t) i * TM, cb = n0 + ns + (int64_t) j * TN;
                     for (int q = lane; q < TM * TN; q += SG) {
                         const int64_t row = rb + q / TN;
-                        if (row < rows) dst[(int64_t) ids[row0 + row] * ld_dst + cb + q % TN] = stp[q];
+                        if (row < rows) out(ks, row0 + row, cb + q % TN, stp[q]);
                     }
                     sycl::group_barrier(sg);
                 }
@@ -862,7 +878,8 @@ struct Kernel {
             // the accumulator's rows 8 (l / 16) + e.  GFX11: each lane all 16 K values (lanes 16-31 repeat 0-15), the
             // accumulator's rows 2 e + l / 16.  The same products and scales as the joint_matrix body above, in the
             // positions those layouts give.
-            const int64_t g = (int64_t) it.get_group(0), per = tiles_m * tiles_n, e = g / per, r = g % per;
+            const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, ks = gk % ksplit, per = tiles_m * tiles_n, e = g / per,
+                      r = g % per;
             const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
             const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
             if (m0 >= rows) return;   // the whole work-group: this expert has fewer rows than the launch
@@ -889,7 +906,7 @@ struct Kernel {
                     for (int el = 0; el < 8; ++el) acc[i][j][el] = 0.0f;
 
             const int64_t kb = K / 32;   // activation scales a row
-            for (int64_t k0 = 0; k0 < K; k0 += KC) {
+            for (int64_t k0 = ks * kspan; k0 < sycl::min(K, (ks + 1) * kspan); k0 += KC) {
                 sycl::group_barrier(it.get_group());   // the last step's tiles are read
                 const bool last = TAIL && k0 + KC > K;   // TAIL: a last step past K, zeros past it
                 for (int v = lid; v < WM * (KC / 16); v += lanes) {
@@ -957,7 +974,7 @@ struct Kernel {
                     const int64_t cb = n0 + ns + (int64_t) j * TN + lo;
                     for (int el = 0; el < 8; ++el) {
                         const int64_t row = m0 + ms + (int64_t) i * TM + row_of(el);
-                        if (row < rows) dst[(int64_t) ids[row0 + row] * ld_dst + cb] = acc[i][j][el];
+                        if (row < rows) out(ks, row0 + row, cb, acc[i][j][el]);
                     }
                 }
 #endif
@@ -983,6 +1000,39 @@ struct Kernel {
     }
 };
 
+// The parts a product's K is split into (iq_mmq_split_set): where one expert's few rows (kIqMmqSplitRows at most)
+// make fewer tiles than the work-groups aimed for (quarters of the compute units), enough to reach them, at most
+// kIqMmqSplitMax and two steps a part.  A prompt's few rows (64 tokens of PLaMo 3 Translate 2B) left the RTX 4070's
+// 46 units mostly idle: 16 tiles of 64 x 128 for a 2560-output product, each running K alone (llama.cpp splits K the
+// same way, its stream-K).  The aim is timed (the units differ: the B70 reports 256 EUs, the RTX 4070 46 SMs; their
+// best were 128 and 184 work-groups).
+struct SplitState {
+    std::mutex mu;
+    int quarters = 0;
+    std::unordered_map<const sycl::queue*, std::pair<float*, size_t>> bufs;   // the parts' buffer of each queue
+};
+SplitState& split_state(sycl::queue& q) {
+    static core::PerDevice<std::shared_ptr<SplitState>> per_device;
+    return *per_device.get(q.get_device(), [] { return std::make_shared<SplitState>(); });
+}
+
+int64_t split_k(sycl::queue& q, int n, int64_t total_rows, int64_t tiles, int64_t steps) {
+    if (n != 1 || total_rows > kIqMmqSplitRows || steps < 4) return 1;
+    const int quarters = iq_mmq_split_get(q);
+    if (quarters <= 0) return 1;
+    const int64_t cu = (int64_t) q.get_device().get_info<sycl::info::device::max_compute_units>();
+    const int64_t want = (quarters * cu / 4 + tiles - 1) / tiles;
+    return std::max<int64_t>(1, std::min<int64_t>({want, kIqMmqSplitMax, steps / 2}));
+}
+
+// The queue's reserved parts' buffer when it holds `floats`, else null
+float* part_buffer(sycl::queue& q, size_t floats) {
+    SplitState& st = split_state(q);
+    std::lock_guard<std::mutex> lock(st.mu);
+    const auto it = st.bufs.find(&q);
+    return it != st.bufs.end() && it->second.second >= floats ? it->second.first : nullptr;
+}
+
 template<int TY, int SGM, int NSGM, bool DP4A, bool TAIL, int IS>
 sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, size_t woff, size_t expert_bytes,
                    int64_t w_rows, int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
@@ -993,12 +1043,31 @@ sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, si
     const auto* x8 = static_cast<const int8_t*>(xq);
     const auto* xs = reinterpret_cast<const float*>(x8 + total_rows * w_cols);
     const auto* xu = xs + total_rows * (w_cols / 32);
-    return q.submit([&](sycl::handler& h) {
+    const int64_t steps = (w_cols + KC - 1) / KC;
+    int64_t ksplit = split_k(q, n, total_rows, tiles_m * tiles_n, steps);
+    const int64_t kspan = (steps + ksplit - 1) / ksplit * KC;
+    ksplit = (steps * KC + kspan - 1) / kspan;
+    float* part = ksplit > 1 ? part_buffer(q, (size_t) (ksplit * total_rows * w_rows)) : nullptr;
+    if (part == nullptr) ksplit = 1;
+    sycl::event e = q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint8_t, 1> lm(sycl::range<1>((size_t) KT::LOCAL), h);
         const size_t wg = (size_t) KT::NSG * SG;
-        h.parallel_for(sycl::nd_range<1>((size_t) n * (size_t) (tiles_m * tiles_n) * wg, wg),
-                       KT{static_cast<const uint8_t*>(w), wtab, woff, expert_bytes, row_bytes, x8, xs, xu, w_cols, bounds, ids, dst,
-                          ld_dst, tiles_m, tiles_n, lm});
+        KT k{static_cast<const uint8_t*>(w), wtab, woff, expert_bytes, row_bytes, x8, xs, xu, w_cols, bounds, ids, dst,
+             ld_dst, tiles_m, tiles_n, lm};
+        k.ksplit = ksplit;
+        k.kspan = ksplit > 1 ? kspan : steps * KC;
+        k.part = part;
+        k.total_rows = total_rows;
+        k.n_out = w_rows;
+        h.parallel_for(sycl::nd_range<1>((size_t) n * (size_t) (tiles_m * tiles_n * ksplit) * wg, wg), k);
+    });
+    if (part == nullptr) return e;
+    // the parts added in order into dst (one expert: its rows are the ids' first total_rows)
+    return q.parallel_for(sycl::range<2>((size_t) total_rows, (size_t) w_rows), [=](sycl::id<2> i) {
+        const int64_t row = (int64_t) i[0], col = (int64_t) i[1];
+        float v = part[row * w_rows + col];
+        for (int64_t ks = 1; ks < ksplit; ++ks) v += part[(ks * total_rows + row) * w_rows + col];
+        dst[(int64_t) ids[row] * ld_dst + col] = v;
     });
 }
 
@@ -1553,6 +1622,44 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
         default: return {};
     }
 #undef STRATA_MMQ_CASE
+}
+
+void iq_mmq_split_set(sycl::queue& q, int quarters) {
+    SplitState& st = split_state(q);
+    std::lock_guard<std::mutex> lock(st.mu);
+    st.quarters = std::max(0, quarters);
+}
+
+int iq_mmq_split_get(sycl::queue& q) {
+    SplitState& st = split_state(q);
+    std::lock_guard<std::mutex> lock(st.mu);
+    return st.quarters;
+}
+
+void iq_mmq_split_release(sycl::queue& q) {
+    SplitState& st = split_state(q);
+    std::lock_guard<std::mutex> lock(st.mu);
+    const auto it = st.bufs.find(&q);
+    if (it == st.bufs.end()) return;
+    q.wait();
+    sycl::free(it->second.first, q);
+    core::graph_epoch_bump();
+    st.bufs.erase(it);
+}
+
+bool iq_mmq_split_reserve(sycl::queue& q, size_t floats) {
+    SplitState& st = split_state(q);
+    std::lock_guard<std::mutex> lock(st.mu);
+    auto& b = st.bufs[&q];
+    if (b.second >= floats) return true;
+    q.wait();
+    if (b.first != nullptr) {
+        sycl::free(b.first, q);
+        core::graph_epoch_bump();   // a recorded step may hold the old one
+    }
+    b.first = sycl::malloc_device<float>(floats, q);
+    b.second = b.first != nullptr ? floats : 0;
+    return b.first != nullptr;
 }
 
 }  // namespace strata::kernels

@@ -1177,7 +1177,8 @@ if(STRATA_ENABLE_XE)
         URL_HASH SHA256=5c8dc0e757fb55efb8145837c1c02b61c0b60c6cd5cfb38c5ca5565d3f30e700
         DOWNLOAD_EXTRACT_TIMESTAMP FALSE SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_cudnn_fe-src
         SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_cudnn_fe-subbuild)
-      target_sources(strata_image PRIVATE src/image/qi_sdpa_cudnn.cpp)
+      # built into the kernels' library: the plain models' prompt attention shares the SDPA (kernels::cudnn_sdpa)
+      target_sources(strata_kernels PRIVATE src/image/qi_sdpa_cudnn.cpp)
       # the CUDA runtime's headers cudnn.h includes: on Windows the cross build's (above, oneMath's cuBLAS), as the
       # toolkit's can sit among the build machine's C library's
       set(_strata_cudnn_cuda_inc ${_strata_cuda_root}/include)
@@ -1192,9 +1193,9 @@ if(STRATA_ENABLE_XE)
       # (not the detector's: the engine's own convolutions beat cuDNN's there, 8.3 against 9.0 ms a face on the
       # RTX 4070, 2026-11-05)
       set_property(SOURCE src/image/qi_sdpa.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp src/upscale/esrgan.cpp
-                   src/image/aux_net.cpp src/image/qi_attn_train.cpp
+                   src/image/aux_net.cpp src/image/qi_attn_train.cpp src/kernels/xe/prompt_attn.cpp
                    APPEND PROPERTY COMPILE_DEFINITIONS STRATA_CUDNN=1)
-      target_link_libraries(strata_image PRIVATE ${CMAKE_DL_LIBS})
+      target_link_libraries(strata_kernels PRIVATE ${CMAKE_DL_LIBS})
       set(_strata_cudnn_frontend ON)   # its license text goes with the packages
     else()
       message(STATUS "cuDNN's headers (cudnn.h) not found: the image attention on NVIDIA GPUs takes XeStrata's own "
