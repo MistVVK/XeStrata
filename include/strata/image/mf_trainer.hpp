@@ -3,7 +3,7 @@
 // include/strata/image/mf_trainer.hpp - Mage-Flow's smallest training loop: the model a step runs, the step's own
 // forward and backward, and the safetensors file it writes (docs/LORA_TRAIN.md, card 5).
 //
-// A step trains adapters (MfAdapter, one per block product the SPEC names) with the base weights frozen: the block
+// A step trains adapters (train::Adapter, one per block product the SPEC names) with the base weights frozen: the block
 // is mf_block run forwards and, on the way back, run again from its input's boundary rows (the tape of a whole
 // model does not fit, so every block pays one forward twice).  What the trainer reaches through prefill::Gemm is
 // the same math the inference reads (src/image/mf_dit.cpp): the sinusoidal time embedding, the modulations, the
@@ -28,9 +28,9 @@ struct MfTrainProduct {
 
 /// One block's trainable side: an adapter per stream and product (null: none), with its own FP32 gradients.
 struct MfTrainAdapter {
-    MfAdapter ad[2][6];
+    train::Adapter ad[2][6];
     int64_t rank = 0;
-    MfAdapterMethod method = MfAdapterMethod::lora;
+    train::AdapterMethod method = train::AdapterMethod::lora;
     float scale = 1.f;   // s * alpha / rank, folded (alpha free, default candidate rank)
     float alpha = 16.f;
     float *A[2][6] = {};    // [rank][K] FP32 masters, trained
@@ -72,9 +72,9 @@ struct MfTrainModel {
 /// Throws when a shape the trainer reads is not the file's (the file's own block count and widths win).
 MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* stream, std::string& err);
 void mf_trainer_close(MfTrainModel* m);
-/// The adapters' starting point (once, before training): A ~ N(0, 1/sqrt(rank)), B = 0, m = norms (method 0 plain
-/// LoRA, 1 DoRA; alpha free, default candidate rank).  The FP16 working copies sync from the masters here and after
-/// every optimizer step.
+/// The adapters' starting point (once, before training): A kaiming-uniform (bound 1/sqrt(fan_in)), B = 0, m = norms
+/// (method 0 plain LoRA, 1 DoRA; alpha free, default candidate rank).  The FP16 working copies sync from the masters
+/// here and after every optimizer step.
 void mf_trainer_init_adapters(MfTrainModel* m, int method, float alpha, uint64_t seed);
 
 /// One sample's disk form (tools/image/mf_pre_export.py): the latent [tokens][128] F32, the text [rows][txt_dim]

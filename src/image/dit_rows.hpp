@@ -198,6 +198,7 @@ template<class Op> struct Rows16 {
     int64_t T, C;
     uint16_t* y16;
     float* rs;
+    float *keep_mean = nullptr, *keep_inv = nullptr;   // the rows' statistics kept (a training step's backward)
     void operator()(sycl::nd_item<1> it) const {
         const auto sg = it.get_sub_group();
         const int64_t t = static_cast<int64_t>(it.get_group_linear_id()) * kRows + sg.get_group_linear_id();
@@ -210,17 +211,23 @@ template<class Op> struct Rows16 {
         const float sc = pow2_scale(sycl::reduce_over_group(sg, m, sycl::maximum<float>()));
         const float inv = 1.f / sc;
         for (int64_t c = lane; c < C; c += kSG) y16[t * C + c] = f16_from_f32(op.value(t, c, st) * inv);
-        if (lane == 0) rs[t] = sc;
+        if (lane == 0) {
+            if (rs != nullptr) rs[t] = sc;
+            if (keep_mean != nullptr) keep_mean[t] = st.mean;
+            if (keep_inv != nullptr) keep_inv[t] = st.inv;
+        }
     }
     auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<kSG>}; }
 };
 
-template<class Op> inline void rows16(const Op& op, int64_t T, int64_t C, uint16_t* y16, float* rs, void* s) {
+// mean and inv (null: not kept): the rows' statistics (Stats) the Op gave, which a training step's backward reads
+template<class Op> inline void rows16(const Op& op, int64_t T, int64_t C, uint16_t* y16, float* rs, void* s,
+                                      float* mean = nullptr, float* inv = nullptr) {
     if (T <= 0) return;
     sycl::queue& q = q_of(s);
     q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((T + kRows - 1) / kRows * kRows * kSG)),
                                      sycl::range<1>((size_t) (kRows * kSG))),
-                   Rows16<Op>{op, T, C, y16, rs});
+                   Rows16<Op>{op, T, C, y16, rs, mean, inv});
 }
 
 struct Stats {
@@ -354,6 +361,14 @@ struct SwiGlu {
         const float a = g.at(t, c);
         return a / (1.f + sycl::exp(-a)) * g.at(t, c + F);
     }
+};
+
+// FP32 rows [T][C] as they are, rows16's Op (a text encoder's states, a training step's gradients)
+struct Plain {
+    const float* x;
+    int64_t C;
+    template<class R> Stats stats(int64_t, int64_t, int64_t, R) const { return {}; }
+    float value(int64_t t, int64_t c, const Stats&) const { return x[t * C + c]; }
 };
 
 // GELU (tanh form) of a product's output, rows16's Op
@@ -788,6 +803,111 @@ template<class X, class G> sycl::event gate_add_by(X* x, const MfOut& h, G g, in
 // x[t] += gate * h[t] (per channel; gate null: 1)
 template<class X> inline void gate_add(X* x, const MfOut& h, const float* gate, int64_t T, int64_t C, void* s) {
     (void) gate_add_by(x, h, [=](int64_t, int64_t c) { return gate != nullptr ? gate[c] : 1.f; }, T, C, s);
+}
+
+// out[t] = x[t] + gate * h[t]: the same, x kept (a training step's backward reads it)
+inline void gate_add_to(float* out, const float* x, const MfOut& h, const float* gate, int64_t T, int64_t C, void* s) {
+    if (T <= 0) return;
+    kernels::for_rows_cols(q_of(s), T, C, [=](int64_t t, int64_t c) {
+        out[t * C + c] = x[t * C + c] + (gate != nullptr ? gate[c] : 1.f) * h.at(t, c);
+    });
+}
+
+// ---- the backward of the row operations above (a training step's), FP32 rows
+
+// out[c] += the sum over the rows of f(t, c): a work-group a column
+template <class F> inline void col_sum(int64_t rows, int64_t cols, float* out, F f, void* s) {
+    constexpr int64_t WG = 256;
+    q_of(s).parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) cols * WG), sycl::range<1>(WG)),
+                         [=](sycl::nd_item<1> it) {
+                             const int64_t c = static_cast<int64_t>(it.get_group_linear_id());
+                             float v = 0.f;
+                             for (auto t = static_cast<int64_t>(it.get_local_linear_id()); t < rows; t += WG)
+                                 v += f(t, c);
+                             v = sycl::reduce_over_group(it.get_group(), v, sycl::plus<float>());
+                             if (it.get_local_linear_id() == 0) out[c] += v;
+                         });
+}
+
+// qk_rope16's backward (kernels::qk::qk_norm_rope_bwd), FP32: dgq and dgk the gradients of the normed and rotated
+// rows (what the attention reads), dq and dk those of the products' outputs q and k ([T][heads][hd]), each head normed
+// with wq and wk and then rotated by the tables cos and sin [T][hd / 2] (rope false or cos null: normed only), pairs
+// (j, j + hd / 2) with neox, else (2j, 2j + 1).  dwq and dwk (null: not taken) add the norms' weights' gradients.
+inline void qk_rope_bwd(const float* q, const float* k, const float* wq, const float* wk, const float* cos,
+                        const float* sin, bool rope, const float* dgq, const float* dgk, int64_t T, int64_t heads,
+                        int64_t hd, float* dq, float* dk, float* dwq, float* dwk, void* s, bool neox,
+                        float eps = 1e-6f) {
+    kernels::qk::Shape sh{T, heads, heads, hd};
+    sh.wq = wq;
+    sh.wk = wk;
+    sh.eps = eps;
+    sh.neox = neox;
+    float* rs = nullptr;
+    if ((dwq != nullptr || dwk != nullptr) && !gpu::alloc_device(&rs, (size_t) (2 * T * heads) * 4))
+        throw std::runtime_error("image engine: the QK norm's backward scales");
+    if (rope && cos != nullptr)
+        kernels::qk::qk_norm_rope_bwd(q_of(s), sh, q, k, dgq, dgk, kernels::qk::Tables{cos, sin, hd / 2}, dq, dk,
+                                      dwq, dwk, rs);
+    else
+        kernels::qk::qk_norm_rope_bwd(q_of(s), sh, q, k, dgq, dgk, kernels::qk::NoRope{}, dq, dk, dwq, dwk, rs);
+    if (rs != nullptr) {
+        gpu::stream_sync(s);   // rs is freed below: the kernels above run async
+        gpu::free(rs);
+    }
+}
+
+// LnMod's: dx = inv (m - (S1 + x^ S2) / C), m = dy (1 + scale), x^ the normed row, S1 and S2 the sums over the row of m
+// and m x^ (mean and inv: the forward's statistics); dshift += dy and dscale += dy x^ over the rows (null: not taken)
+inline void ln_mod_bwd(const float* x, const float* mean, const float* inv, const float* scale, const float* dy,
+                       int64_t rows, int64_t cols, float* dx, float* dshift, float* dscale, void* s) {
+    constexpr int64_t WG = 256;
+    const float inv_c = 1.f / (float) cols;
+    q_of(s).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) rows * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
+            const int64_t t = static_cast<int64_t>(it.get_group_linear_id());
+            const float iv = inv[t], mn = mean[t];
+            float s1 = 0.f, s2 = 0.f;
+            for (auto c = static_cast<int64_t>(it.get_local_linear_id()); c < cols; c += WG) {
+                const float m = dy[t * cols + c] * (1.f + scale[c]);
+                s1 += m;
+                s2 += m * (x[t * cols + c] - mn) * iv;
+            }
+            s1 = sycl::reduce_over_group(it.get_group(), s1, sycl::plus<float>());
+            s2 = sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>());
+            for (auto c = static_cast<int64_t>(it.get_local_linear_id()); c < cols; c += WG)
+                dx[t * cols + c] = iv * (dy[t * cols + c] * (1.f + scale[c]) -
+                                         (s1 + ((x[t * cols + c] - mn) * iv) * s2) * inv_c);
+        });
+    if (dshift != nullptr) col_sum(rows, cols, dshift, [=](int64_t t, int64_t c) { return dy[t * cols + c]; }, s);
+    if (dscale != nullptr)
+        col_sum(rows, cols, dscale,
+                [=](int64_t t, int64_t c) { return dy[t * cols + c] * (x[t * cols + c] - mean[t]) * inv[t]; }, s);
+}
+
+// GeluTanh's: dv = dy gelu_tanh'(v), v the GELU's input
+inline void gelu_tanh_bwd(const float* v, const float* dy, int64_t n, float* dv, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) n),
+                         [=](sycl::id<1> id) { dv[id[0]] = dy[id[0]] * gelu_tanh_grad(v[id[0]]); });
+}
+
+// SiLU's: dy = d silu'(y), y the SiLU's input
+inline void silu_bwd(const float* y, const float* d, int64_t n, float* dy, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const float v = y[id[0]], g = 1.f / (1.f + sycl::exp(-v));
+        dy[id[0]] = d[id[0]] * g * (1.f + v * (1.f - g));
+    });
+}
+
+// gate_add's: dh = gate dx (gate null: 1) and dgate += dx h over the rows (null dh or dgate: not taken)
+inline void gate_add_bwd(const float* h, const float* gate, const float* dx, int64_t rows, int64_t cols, float* dh,
+                         float* dgate, void* s) {
+    if (dh != nullptr)
+        q_of(s).parallel_for(sycl::range<1>((size_t) (rows * cols)), [=](sycl::id<1> id) {
+            const int64_t c = static_cast<int64_t>(id[0]) % cols;
+            dh[id[0]] = (gate != nullptr ? gate[c] : 1.f) * dx[id[0]];
+        });
+    if (dgate != nullptr)
+        col_sum(rows, cols, dgate, [=](int64_t t, int64_t c) { return dx[t * cols + c] * h[t * cols + c]; }, s);
 }
 
 // The time (seconds) of one product of the DiT's FFN, T rows x K -> N, in 16 bits (prefill::Gemm::f16) and in 8

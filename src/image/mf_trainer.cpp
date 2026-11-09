@@ -6,7 +6,9 @@
 #include "strata/core/gpu.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/image/mapped_file.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/native_qsa.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -96,40 +98,11 @@ void load_vec(Model* m, SafeTensors& st, const std::string& name, float*& out, i
     out = dev_dup(m, v.data(), want);
 }
 
-void silu_rows(const float* x, int64_t n, float* y, void* s) {
-    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const float v = x[id[0]];
-        y[id[0]] = v / (1.f + sycl::exp(-v));
-    });
-}
-
-void to_f16(const float* x, int64_t n, uint16_t* y, void* s) {
-    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) n),
-                                   [=](sycl::id<1> id) { y[id[0]] = f16_from_f32(x[id[0]]); });
-}
-
 /// the v1 target names per stream and product (SPEC D1 writes them as they are, no mapping table)
 const char* const kTarget[2][6] = {{"attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0",
                                     "img_mlp.net.0.proj", "img_mlp.net.2"},
                                    {"attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj", "attn.to_add_out",
                                     "txt_mlp.net.0.proj", "txt_mlp.net.2"}};
-
-// rms norm without affine, eps 1e-6, as the text reader's rows take it (set_context's qi_rms_norm16)
-void rms_norm(const float* x, const float* w, int64_t rows, int64_t cols, float* y, void* s) {
-    constexpr int64_t kWG = 256;
-    constexpr float kEps = 1e-6f;
-    dit_rows::q_of(s).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) rows * kWG), sycl::range<1>(kWG)), [=](sycl::nd_item<1> it) {
-            const int64_t t = static_cast<int64_t>(it.get_group_linear_id());
-            float ss = 0.f;
-            for (auto c = static_cast<int64_t>(it.get_local_linear_id()); c < cols; c += kWG)
-                ss += x[t * cols + c] * x[t * cols + c];
-            const float r = 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>()) /
-                                                  (float) cols + kEps);
-            for (auto c = static_cast<int64_t>(it.get_local_linear_id()); c < cols; c += kWG)
-                y[t * cols + c] = x[t * cols + c] * r * w[c];
-        });
-}
 
 }  // namespace
 
@@ -202,9 +175,9 @@ MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* s
                 blk.adap->rank = rank;
                 for (int st = 0; st < 2; ++st)
                     for (int i = 0; i < 6; ++i) {
-                        MfAdapter& az = blk.adap->ad[st][i];
+                        train::Adapter& az = blk.adap->ad[st][i];
                         const int64_t N = blk.prod[st][i].N, K = blk.prod[st][i].K;
-                        az.method = MfAdapterMethod::lora;   // the trainer sets DoRA per product later
+                        az.method = train::AdapterMethod::lora;   // the trainer sets DoRA per product later
                         az.rank = rank;
                         int64_t ol, ok, im, inn;
                         factorization(N, ol, ok);
@@ -381,19 +354,16 @@ MfTrainCond mf_trainer_cond(MfTrainModel* base, float sigma, int64_t h, int64_t 
     }
     uint16_t* e16 = tmp.get<uint16_t>(256, s);
     float* temb = tmp.get<float>(C, s);
-    float* tsil = tmp.get<float>(C, s);
     uint16_t* tsil16 = tmp.get<uint16_t>(C, s);
     // the zero above runs on this stream; the copy below runs on the compute queue (see dev_dup)
     gpu::stream_sync(s);
     if (!gpu::copy(e16, e.data(), size_t{256} * 2)) throw std::runtime_error("image engine (Mage-Flow training): copy");
     gemm.f16(e16, m->t1.w, temb, 1, C, 256);
     dit_rows::rows_back(temb, nullptr, m->t1.b, 1, C, s);
-    silu_rows(temb, C, tsil, s);
-    to_f16(tsil, C, tsil16, s);
+    qi_silu(temb, C, tsil16, s);   // the inference's own (mf_dit.cpp's set_time)
     gemm.f16(tsil16, m->t2.w, temb, 1, C, C);
     dit_rows::rows_back(temb, nullptr, m->t2.b, 1, C, s);
-    silu_rows(temb, C, tsil, s);
-    to_f16(tsil, C, tsil16, s);
+    qi_silu(temb, C, tsil16, s);   // the inference's own (mf_dit.cpp's set_time)
     // the modulations and the norm_out pair read tsil's FP16 rows, unscaled (rows_back with no rs)
     c.mod.resize((size_t) m->nblk * 2);
     for (int64_t b = 0; b < m->nblk; ++b) {
@@ -471,24 +441,22 @@ static float forward_impl(Model* m, const MfTrainSample& s, const MfTrainCond& c
     axpby(x0, xe, 1.f - sigma, sigma, R * 128, xs, st);
     uint16_t* xs16 = tmp.get<uint16_t>(R * 128, st);
     float* xsrs = tmp.get<float>(R, st);
-    mf_rows16(xs, R, 128, xs16, xsrs, st);
+    dit_rows::rows16(dit_rows::Plain{xs, 128}, R, 128, xs16, xsrs, st);
     float* img = tmp.get<float>(R * C, st);
     gemm.f16(xs16, m->img_in.w, img, R, C, 128);
     dit_rows::rows_back(img, xsrs, m->img_in.b, R, C, st);
     // the text stream's rows: the states through their norm and projection
     float* te = tmp.get<float>(Rt * m->txt_dim, st);
-    float* ten = tmp.get<float>(Rt * m->txt_dim, st);
     // as above: the zeros run on this stream, the copy on the compute queue
     gpu::stream_sync(st);
     if (!gpu::copy(te, s.te.data(), (size_t) Rt * m->txt_dim * 4))
         throw std::runtime_error("image engine (Mage-Flow training): copy");
-    rms_norm(te, m->txt_norm, Rt, m->txt_dim, ten, st);
+    // the engines' one RMSNorm into FP16, as the inference's set_context reads the text states
     uint16_t* te16 = tmp.get<uint16_t>(Rt * m->txt_dim, st);
-    float* ters = tmp.get<float>(Rt, st);
-    mf_rows16(ten, Rt, m->txt_dim, te16, ters, st);
+    kernels::rms_norm_rows(te, m->txt_norm, 1, nullptr, te16, (int) m->txt_dim, (int) Rt, 1e-6f, st);
     float* txt = tmp.get<float>(Rt * C, st);
     gemm.f16(te16, m->txt_in.w, txt, Rt, C, m->txt_dim);
-    dit_rows::rows_back(txt, ters, m->txt_in.b, Rt, C, st);
+    dit_rows::rows_back(txt, nullptr, m->txt_in.b, Rt, C, st);
     // the boundaries: block i reads bounds[i] and writes bounds[i + 1]
     float* bounds = nullptr;
     if (keep != nullptr) {
@@ -515,7 +483,7 @@ static float forward_impl(Model* m, const MfTrainSample& s, const MfTrainCond& c
         for (int q = 0; q < 2; ++q)
             for (int i = 0; i < 6; ++i) {
                 const MfTrainProduct& pr = blk.prod[q][i];
-                mf_transpose_f16(pr.w, pr.N, pr.K, m->wtScratch + m->wtOff[q][i], st);
+                train::transpose_f16(pr.w, pr.N, pr.K, m->wtScratch + m->wtOff[q][i], st);
             }
         MfBlockRun run;
         run.C = C;
@@ -610,7 +578,7 @@ static float forward_impl(Model* m, const MfTrainSample& s, const MfTrainCond& c
     }
     gemm.f16(ln16, m->pout.w, v_pred, R, m->in_ch, C);
     dit_rows::rows_back(v_pred, lnrs, m->pout.b, R, m->in_ch, st);
-    const float loss = mf_flow_loss(v_pred, x0, xe, R * m->in_ch, keep != nullptr ? keep->dv_pred : nullptr,
+    const float loss = train::flow_loss(v_pred, x0, xe, R * m->in_ch, keep != nullptr ? keep->dv_pred : nullptr,
                                     nullptr, nullptr, st);
     gpu::stream_sync(st);
     return loss;
@@ -667,23 +635,21 @@ void mf_trainer_init_adapters(MfTrainModel* base, int method, float alpha, uint6
     Model* m = static_cast<Model*>(base);
     void* s = m->stream;
     std::mt19937_64 rng(seed);
-    std::normal_distribution<float> gauss(0.f, 1.f);
     for (int64_t b = 0; b < m->nblk; ++b) {
         MfTrainModel::Block& blk = m->blk[(size_t) b];
         if (blk.adap == nullptr) continue;
         MfTrainAdapter& tz = *blk.adap;
-        tz.method = method == 0 ? MfAdapterMethod::lora : method == 1 ? MfAdapterMethod::dora : MfAdapterMethod::lokr;
+        tz.method = method == 0 ? train::AdapterMethod::lora : method == 1 ? train::AdapterMethod::dora : train::AdapterMethod::lokr;
         tz.alpha = alpha;
-        const float std = 1.f / std::sqrt((float) tz.rank);
         tz.scale = alpha / (float) tz.rank;
         std::uniform_real_distribution<float> uni(-1.f, 1.f);
         for (int st = 0; st < 2; ++st)
             for (int i = 0; i < 6; ++i) {
                 const int64_t N = blk.prod[st][i].N, K = blk.prod[st][i].K, rk = tz.rank;
-                MfAdapter& az = tz.ad[st][i];
+                train::Adapter& az = tz.ad[st][i];
                 az.method = tz.method;
                 az.scale = tz.scale;
-                if (tz.method == MfAdapterMethod::lokr) {
+                if (tz.method == train::AdapterMethod::lokr) {
                     // LyCORIS LoKr init: w1 and w2a kaiming-uniform (bound 1/sqrt(fan_in)), w2b zero
                     // (the delta starts at nothing); the f16 views follow the masters
                     const int64_t ol = az.ol, ok = az.ok, im = az.im, inn = az.inn;
@@ -695,25 +661,29 @@ void mf_trainer_init_adapters(MfTrainModel* base, int method, float alpha, uint6
                         !gpu::copy(tz.W2A[st][i], hw2a.data(), hw2a.size() * 4))
                         throw std::runtime_error("image engine (Mage-Flow training): copy");
                     gpu::stream_sync(s);
-                    to_f16(tz.W1[st][i], ol * im, az.w1, s);
-                    mf_transpose_f16(az.w1, ol, im, az.w1t, s);
-                    to_f16(tz.W2A[st][i], ok * rk, az.w2a, s);
-                    to_f16(tz.W2B[st][i], rk * inn, az.w2b, s);
+                    kernels::f32_to_f16_bulk(tz.W1[st][i], az.w1, ol * im, s);
+                    train::transpose_f16(az.w1, ol, im, az.w1t, s);
+                    kernels::f32_to_f16_bulk(tz.W2A[st][i], az.w2a, ok * rk, s);
+                    kernels::f32_to_f16_bulk(tz.W2B[st][i], az.w2b, rk * inn, s);
                     // W2B stays zero (Owned zeroes)
                     continue;
                 }
                 rownorm_f16(blk.prod[st][i].w, N, K, az.norms, s);
-                // A ~ N(0, 1/sqrt(rank)), B = 0 (the delta starts at nothing), m = norms (c starts at one)
+                // A kaiming-uniform (bound 1/sqrt(fan_in), the common LoRA init), B = 0 (the delta starts at nothing),
+                // m = norms (c starts at one).  A drawn N(0, 1/sqrt(rank)) instead is about 24 times larger at
+                // Mage-Flow's K of 3072: B's every step moves the delta that much more, and the run diverged at lr 1e-4
+                // (2026-11-09, the base model's character run: the gradient norm 1 -> 12 at update 72)
+                const float ba = 1.f / std::sqrt((float) K);
                 std::vector<float> ha((size_t) rk * K);
-                for (float& v : ha) v = gauss(rng) * std;
+                for (float& v : ha) v = uni(rng) * ba;
                 if (!gpu::copy(tz.A[st][i], ha.data(), ha.size() * 4))
                     throw std::runtime_error("image engine (Mage-Flow training): copy");
                 gpu::stream_sync(s);
                 az.m = tz.M[st][i];
                 if (!gpu::copy(tz.M[st][i], az.norms, (size_t) N * 4))
                     throw std::runtime_error("image engine (Mage-Flow training): copy");
-                to_f16(tz.A[st][i], rk * K, az.a, s);
-                mf_transpose_f16(az.a, rk, K, az.at, s);
+                kernels::f32_to_f16_bulk(tz.A[st][i], az.a, rk * K, s);
+                train::transpose_f16(az.a, rk, K, az.at, s);
                 // B stays zero (Owned zeroes); its views stay zero with it
             }
     }
@@ -766,7 +736,7 @@ float grad_clip_scale(Model* m, float gscale, double* norm_out) {
                 refs.push_back({az->ad[q][i].dA, rk * K});
                 refs.push_back({az->ad[q][i].dB, N * rk});
                 if (az->ad[q][i].dm != nullptr) refs.push_back({az->ad[q][i].dm, N});
-                if (az->ad[q][i].method == MfAdapterMethod::lokr) {
+                if (az->ad[q][i].method == train::AdapterMethod::lokr) {
                     const int64_t ol = az->ad[q][i].ol, ok = az->ad[q][i].ok;
                     const int64_t im = az->ad[q][i].im, inn = az->ad[q][i].inn;
                     refs.push_back({az->ad[q][i].dW1, ol * im});
@@ -818,13 +788,13 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
     Owned tmp;
     // the norm and output projection backward (the base is frozen: its dgrad only, no wgrad or bias sum)
     uint16_t* pout_wt = tmp.get<uint16_t>(C * m->in_ch, st);
-    mf_transpose_f16(m->pout.w, m->in_ch, C, pout_wt, st);
+    train::transpose_f16(m->pout.w, m->in_ch, C, pout_wt, st);
     uint16_t* dv16 = tmp.get<uint16_t>(R * m->in_ch, st);
     float* dvrs = tmp.get<float>(R, st);
-    mf_rows16(s.dv_pred, R, m->in_ch, dv16, dvrs, st);
+    dit_rows::rows16(dit_rows::Plain{s.dv_pred, m->in_ch}, R, m->in_ch, dv16, dvrs, st);
     float* dln = tmp.get<float>(R * C, st);
     float* dsums = tmp.get<float>(R * C, st);
-    mf_dgrad(dv16, dvrs, pout_wt, R, m->in_ch, C, dln, dsums, false, gemm, st);
+    train::dgrad(dv16, dvrs, pout_wt, R, m->in_ch, C, dln, dsums, false, gemm, st);
     float* mean = tmp.get<float>(R, st);
     float* inv = tmp.get<float>(R, st);
     const float* last = s.bounds + (size_t) m->nblk * Rj * C;   // block 11's output (the image stream)
@@ -836,7 +806,7 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
     });
     ln_stats(last, R, C, mean, inv, st);
     float* dimg = tmp.get<float>(R * C, st);
-    mf_ln_mod_bwd(last, mean, inv, nsc, dln, R, C, dimg, nullptr, nullptr, st);
+    dit_rows::ln_mod_bwd(last, mean, inv, nsc, dln, R, C, dimg, nullptr, nullptr, st);
     // every block from its boundary input, the output's gradient ping-ponging down
     float* dcur_i = dimg;
     float* dnxt_i = tmp.get<float>(R * C, st);
@@ -847,7 +817,7 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
         for (int q = 0; q < 2; ++q)
             for (int i = 0; i < 6; ++i) {
                 const MfTrainProduct& pr = blk.prod[q][i];
-                mf_transpose_f16(pr.w, pr.N, pr.K, m->wtScratch + m->wtOff[q][i], st);
+                train::transpose_f16(pr.w, pr.N, pr.K, m->wtScratch + m->wtOff[q][i], st);
             }
         MfBlockRun run;
         run.C = C;
@@ -933,7 +903,7 @@ void mf_trainer_adamw(MfTrainModel* base, float lr, float beta1, float beta2, fl
                     adamw_step(az->M[q][i], az->ad[q][i].dm, az->mm[q][i], az->vm[q][i], N, lr, beta1, beta2,
                                eps, wd, bc1, bc2, gscale_eff, s);
                 // the FP16 working copies follow the masters
-                if (az->ad[q][i].method == MfAdapterMethod::lokr) {
+                if (az->ad[q][i].method == train::AdapterMethod::lokr) {
                     const int64_t ol = az->ad[q][i].ol, ok = az->ad[q][i].ok;
                     const int64_t im = az->ad[q][i].im, inn = az->ad[q][i].inn;
                     adamw_step(az->W1[q][i], az->ad[q][i].dW1, az->mW1[q][i], az->vW1[q][i], ol * im, lr, beta1,
@@ -942,16 +912,16 @@ void mf_trainer_adamw(MfTrainModel* base, float lr, float beta1, float beta2, fl
                                beta1, beta2, eps, wd, bc1, bc2, gscale_eff, s);
                     adamw_step(az->W2B[q][i], az->ad[q][i].dW2b, az->mW2B[q][i], az->vW2B[q][i], rk * inn, lr,
                                beta1, beta2, eps, wd, bc1, bc2, gscale_eff, s);
-                    to_f16(az->W1[q][i], ol * im, az->ad[q][i].w1, s);
-                    mf_transpose_f16(az->ad[q][i].w1, ol, im, az->ad[q][i].w1t, s);
-                    to_f16(az->W2A[q][i], ok * rk, az->ad[q][i].w2a, s);
-                    to_f16(az->W2B[q][i], rk * inn, az->ad[q][i].w2b, s);
+                    kernels::f32_to_f16_bulk(az->W1[q][i], az->ad[q][i].w1, ol * im, s);
+                    train::transpose_f16(az->ad[q][i].w1, ol, im, az->ad[q][i].w1t, s);
+                    kernels::f32_to_f16_bulk(az->W2A[q][i], az->ad[q][i].w2a, ok * rk, s);
+                    kernels::f32_to_f16_bulk(az->W2B[q][i], az->ad[q][i].w2b, rk * inn, s);
                     continue;
                 }
-                to_f16(az->A[q][i], rk * K, az->ad[q][i].a, s);
-                mf_transpose_f16(az->ad[q][i].a, rk, K, az->ad[q][i].at, s);
-                to_f16(az->B[q][i], N * rk, az->ad[q][i].b, s);
-                mf_transpose_f16(az->ad[q][i].b, N, rk, az->ad[q][i].bt, s);
+                kernels::f32_to_f16_bulk(az->A[q][i], az->ad[q][i].a, rk * K, s);
+                train::transpose_f16(az->ad[q][i].a, rk, K, az->ad[q][i].at, s);
+                kernels::f32_to_f16_bulk(az->B[q][i], az->ad[q][i].b, N * rk, s);
+                train::transpose_f16(az->ad[q][i].b, N, rk, az->ad[q][i].bt, s);
             }
     }
     gpu::stream_sync(s);
@@ -989,8 +959,8 @@ void mf_trainer_save(MfTrainModel* base, const std::string& path, const std::str
                 const int64_t rk = az->rank;
                 const std::string t =
                     "diffusion_model.transformer_blocks." + std::to_string(b) + "." + kTarget[st][i];
-                const MfAdapter& ad = az->ad[st][i];
-                if (ad.method == MfAdapterMethod::lokr) {
+                const train::Adapter& ad = az->ad[st][i];
+                if (ad.method == train::AdapterMethod::lokr) {
                     blob(t + ".lokr_w1", az->W1[st][i], {ad.ol, ad.im});
                     blob(t + ".lokr_w2_a", az->W2A[st][i], {ad.ok, rk});
                     blob(t + ".lokr_w2_b", az->W2B[st][i], {rk, ad.inn});
@@ -1014,7 +984,7 @@ void mf_trainer_save(MfTrainModel* base, const std::string& path, const std::str
                     std::memcpy(e.raw.data(), &az->alpha, 4);
                     es.push_back(std::move(e));
                 }
-                if (ad.method == MfAdapterMethod::dora) blob(t + ".dora_scale", az->M[st][i], {N});
+                if (ad.method == train::AdapterMethod::dora) blob(t + ".dora_scale", az->M[st][i], {N});
             }
     }
     std::sort(es.begin(), es.end(), [](const Entry& a, const Entry& b) { return a.key < b.key; });

@@ -365,7 +365,8 @@ def main() -> int:
     ap.add_argument("--probe", required=True)
     ap.add_argument("--dir", default="/tmp/mf-block")
     ap.add_argument("--C", type=int, default=128)
-    ap.add_argument("--heads", type=int, default=2)
+    # head_dim 128: the shared attention kernel (kernels::flash_attn) takes 128 and 256 only
+    ap.add_argument("--heads", type=int, default=1)
     ap.add_argument("--F", type=int, default=256)
     ap.add_argument("--Ri", type=int, default=64)
     ap.add_argument("--Rt", type=int, default=8)
@@ -373,9 +374,10 @@ def main() -> int:
     ap.add_argument("--skip-mlp", action="store_true", help="zero the MLP's gate: the block is norm + attention only")
     ap.add_argument("--stages", action="store_true", help="print the engine's tape against the reference's stages")
     ap.add_argument("--real", default="", help="a Mage-Flow DiT safetensors: block 0's real widths, weights and biases")
-    ap.add_argument("--grad-tol", type=float, default=3e-5,
+    ap.add_argument("--grad-tol", type=float, default=1e-4,
                     help="tolerance of the block's own output and input gradients: a LayerNorm's backward is a "
-                         "difference of the row's large terms, so a cut with rows past FP16's reach needs its own")
+                         "difference of the row's large terms, so a cut with rows past FP16's reach needs its own; "
+                         "the attention is the shared FP16 kernel, whose output carries FP16's rounding of P")
     ap.add_argument("--adapter-grad-tol", type=float, default=1e-4,
                     help="tolerance of the input gradients when adapters are on: the adapter path adds one more "
                          "FP16 rounding (h and delta through split FP16) and DoRA's row factors multiply the "

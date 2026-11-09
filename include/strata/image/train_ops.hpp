@@ -1,0 +1,206 @@
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// include/strata/image/train_ops.hpp - the parts of an image model's training step that every DiT's takes, on the GPU
+// (src/image/train_ops.cpp): a product's gradients, an adapter's (a plain LoRA's, a LoKr's, a DoRA's), the flow
+// matching loss and the transposes they read.  The forward's own parts are the inference's (dit_rows.hpp's row
+// kernels, kernels::qk_norm_rope, qi_attention_train), and their backwards sit beside them (dit_rows.hpp,
+// qk_norm_rope.hpp, qi_attention_bwd); a model's own block (mf_train.hpp's, Mage-Flow's) is put together out of these.
+//
+// The gradients themselves are FP32.  One product Y[T,N] = X[T,K] . W[N,K]^T + b has
+//
+//   dX[T,K] = dY[T,N] . W[N,K]        (dgrad, W read along its rows: the caller's transposed view wt[K,N])
+//   dW[N,K] = dY[T,N]^T . X[T,K]      (wgrad)
+//   db[N]   = sum_t dY[t,N]           (bias_bwd)
+//
+// and prefill::Gemm knows only Y = X . W^T with W row-major, so the training side keeps a transposed FP16 view of every
+// weight it takes gradients through (built when a block is opened for training) and reads a gradient's rows transposed
+// too (transpose_f16, scaled_transpose_f16).  A row's or head's power of two cancels exactly, except in dW, which sums
+// over the rows: there the row scales are folded into the FP32 gradient first and one global power of two (G, from
+// scaled_transpose_f16) is put back on the sum.
+//
+// An adapter's gradients, one weight, with s the request's strength and k = alpha / rank:
+//
+//   plain LoRA   h = x A^T, delta = s k (h B^T)   dB = s k dY^T h   dA = s k (dY B)^T x
+//   LoKr         delta = s k kron(w1, w2_a w2_b)   each factor by the partial trace of the delta's gradient
+//   DoRA         c_r = m_r / (|W_r| + eps); the rows' factors a_r = 1 + s (c_r - 1) and b_r = s c_r, and
+//                dm_r = s sum_t dY[t,r] (p[t,r] + d[t,r]) / (|W_r| + eps)   (p the base product, d the delta's)
+//
+// |W_r| is the row norm of the weight the engine reads (its own dora_norms), eps FP32's.
+//
+// The step is rectified flow (docs/LORA_TRAIN.md, "Timestep sampling and loss"): x_sigma = (1 - sigma) x0 + sigma eps,
+// the target v = eps - x0, the loss the mean of (v_pred - v)^2, so dL/dv_pred = 2 (v_pred - v) / n.
+//
+// Checked per op against NumPy and one Mage-Flow block against torch (tools/image/mf_train_ref.py,
+// tools/image/mf_train_torch_ref.py).
+#pragma once
+
+#include "strata/prefill/gemm.hpp"
+
+#include <cstdint>
+#include <vector>
+
+namespace strata::image::train {
+
+/// One step's flow loss: the mean of (v_pred - (eps - x0))^2 over n values, returned on the host, with dv_pred the
+/// gradient 2 (v_pred - v) / n.  dx0 and deps (null: not taken) are that loss's way back to the latent and the noise
+/// through the target; the noised input x_sigma = (1 - sigma) x0 + sigma eps is the step's own argument.
+float flow_loss(const float* v_pred, const float* x0, const float* eps, int64_t n, float* dv_pred, float* dx0,
+                float* deps, void* stream);
+
+/// [rows][cols] FP16 -> [cols][rows] FP16, both row-major (32 x 32 tiles through local memory).
+void transpose_f16(const uint16_t* in, int64_t rows, int64_t cols, uint16_t* out, void* stream);
+
+/// A gradient's rows read by a dW: out[c * rows + t] = (g[t,c] * rsX[t]) / G as FP16, G one power of two over the
+/// whole tensor (the stored X rows are divided by their own rsX, so the factors cancel and only G is left to put
+/// back).  The G used comes back as a host float: wgrad takes it by value, and reading it off the device afterwards
+/// would be a second pass over the queue for nothing.
+float scaled_transpose_f16(const float* g, const float* rsX, int64_t rows, int64_t cols, uint16_t* out, void* stream);
+
+/// dX[T,K] = dY . W read along its rows through wt[K,N] (the transposed FP16 view of W[N,K]), the rows' scales rsY
+/// (null: 1) put back, added into dX or written over it.  scratch holds T * K FP32 sums.
+void dgrad(const uint16_t* dy16, const float* rsY, const uint16_t* wt, int64_t T, int64_t N, int64_t K, float* dX,
+           float* scratch, bool accumulate, prefill::Gemm& gemm, void* stream);
+
+/// dW[N,K] = sum_t dY[t,n] X[t,k], from the two transposed FP16 views (dy16t [N,T], x16t [K,T]) times gscale.
+void wgrad(const uint16_t* dy16t, const uint16_t* x16t, int64_t T, int64_t N, int64_t K, float gscale, float* dW,
+           float* scratch, bool accumulate, prefill::Gemm& gemm, void* stream);
+
+/// db[N] += sum over the rows of dY (FP32).
+void bias_bwd(const float* dy, int64_t T, int64_t N, float* db, void* stream);
+
+/// y[t][c] *= r[c] (in place): a DoRA's factors of the weight's rows (dora_bwd's da/db) on a gradient's columns.
+void scale_cols(float* y, const float* r, int64_t rows, int64_t cols, void* stream);
+
+/// A plain LoRA's factors, backwards, with s the request's strength and k = alpha / rank folded into `scale`.  The
+/// forward kept h16 [T][rank] (the input through A) and the weight's own product read x16 [T][cols]; dY is the
+/// gradient reaching the weight's rows [T][rows] in FP32.  dB [rows][rank] = scale dY^T h and
+/// dA [rank][cols] = dh^T x read dh = scale (dY B), the intermediate this same call's scratch starts with (dL/dh,
+/// so dA takes no second scale); dh's own rows and scale take the product's own dgrad back to the input.
+/// h16t and x16t are the transposed views the forward kept (transpose_f16 of the rows it wrote).
+void lora_bwd(const float* hr, const float* xr, const uint16_t* h16t, const uint16_t* x16t, const uint16_t* bt16,
+              const float* dY, int64_t T, int64_t rows, int64_t cols, int64_t rank, float scale, float* dB, float* dA,
+              float* scratch, uint16_t* tmp16, float* rsT, prefill::Gemm& gemm, void* stream);
+
+/// A LoKr's factors, backwards.  The delta is kron(w1, w2_a w2_b) and the step's gradient of the whole weight
+/// (dDelta [out][in], out = out_l * out_k, in = in_m * in_n) is what a wgrad of the delta's rows gives; each factor
+/// is read through it by a partial trace:
+///   dw1[l][m] = sum_{kn} dDelta[l * out_k + k][m * in_n + n] w2[k][n]
+///   dw2[k][n] = sum_{lm} dDelta[l * out_k + k][m * in_n + n] w1[l][m]
+/// and then w2 = w2_a w2_b splits as a product does.
+void lokr_partial_trace(const float* dDelta, const uint16_t* w1, const uint16_t* w2, int64_t out_l, int64_t out_k,
+                        int64_t in_m, int64_t in_n, float* dw1, float* dw2, void* stream);
+/// dw2 [out_k][in_n] into its two factors: dw2a[o][r] = sum_n dw2[o][n] w2b[r][n] and
+/// dw2b[r][n] = sum_o w2a[r][o] dw2[o][n] (the same products the forward reads, in FP32 here - the factors are small).
+void lokr_factor_bwd(const float* dw2, const uint16_t* w2a, const uint16_t* w2b, int64_t out_k, int64_t in_n,
+                     int64_t rank, float* dw2a, float* dw2b, void* stream);
+
+/// A DoRA's magnitude m [rows], backwards, with the row norm |W_r| it was divided by (the engine's own dora_norms)
+/// and eps FP32's: dm[r] = scale * sum_t dY[t,r] (p[t,r] + d[t,r]) / (|W_r| + eps), where p is the base product's
+/// rows and d the delta's.  `da` and `db` (null: not taken) get the factors the two paths' own gradients are read by:
+/// da[r] = 1 + scale (c_r - 1) and db[r] = scale c_r, so the caller's dgrad and wgrad see dY da and dY db.
+void dora_bwd(const float* dY, const float* p, const float* d, const float* m, const float* norms, int64_t T,
+              int64_t rows, float scale, float* dm, float* da, float* db, void* stream);
+
+/// One product's adapter as a training step holds it (plain LoRA, DoRA or LoKr): the FP16 views the products read,
+/// written from the FP32 masters after each optimizer step, and the FP32 gradients added into.
+enum class AdapterMethod : int { lora = 0, dora = 1, lokr = 2 };
+struct Adapter {
+    AdapterMethod method = AdapterMethod::lora;
+    int64_t rank = 0;
+    float scale = 0.f;                 // s * alpha / rank, folded (the request's strength times the file's alpha)
+    uint16_t* a = nullptr;            // [rank][K] FP16: h = x A^T reads it (written on sync, read in the block)
+    uint16_t* at = nullptr;           // [K][rank] the same values transposed (the input gradient's dgrad reads it)
+    uint16_t* b = nullptr;            // [N][rank] FP16: delta = h B^T reads it
+    uint16_t* bt = nullptr;           // [rank][N] the same values transposed (lora_bwd reads it)
+    float* dA = nullptr;               // [rank][K], added into
+    float* dB = nullptr;               // [N][rank], added into
+    const float* m = nullptr;         // [N] the DoRA magnitude (null: a plain LoRA)
+    float* norms = nullptr;           // [N] the base weight's row norms (null: a plain LoRA; written once at open)
+    float* dm = nullptr;               // [N], added into (null: not taken)
+    // LoKr (method lokr): delta = s kron(w1, w2a w2b), N = ol * ok, K = im * inn (SPEC's factorization)
+    int64_t ol = 0, ok = 0, im = 0, inn = 0;
+    uint16_t* w1 = nullptr;           // [ol][im] FP16, whole
+    uint16_t* w1t = nullptr;          // [im][ol] transposed view (written on sync, read in the block)
+    uint16_t* w2a = nullptr;          // [ok][rank] FP16
+    uint16_t* w2b = nullptr;          // [rank][inn] FP16
+    float* dW1 = nullptr;              // [ol][im], added into
+    float* dW2a = nullptr;             // [ok][rank], added into
+    float* dW2b = nullptr;             // [rank][inn], added into
+};
+
+/// out[i] = a[i] * col[i % C] (col null: 1), n elements: a gate's or a norm's per-column factor on rows.
+void mul_cols(const float* a, const float* col, int64_t n, int64_t C, float* out, void* stream);
+/// a[i] *= k[0], or /= with `divide` (k a device scalar: v's power of two).
+void scale_by(float* a, int64_t n, const float* k, bool divide, void* stream);
+/// v's one power of two over its rows (two arrays: a two-stream DiT's streams; n1 0 for one stream), into vs[0], and
+/// every one of `rows` rows' scale set to it (vs[1 + r], the output projection's input row scales): the attention
+/// mixes the rows head by head, so they share it.  Mage-Flow's v passes FP16's 65504 at a high sigma (75176 in block
+/// 0 at sigma 1.0); inference scales it the same way (head_scale).  amax is a zeroed device word the rows' absolute
+/// maximum lands in, as bits (non-negative floats order as their bits).
+void v_scale(const float* v0, int64_t n0, const float* v1, int64_t n1, uint32_t* amax, float* vs, int64_t rows,
+             void* stream);
+
+/// FP32 rows copied, added into (a += b) and narrowed to FP16, n elements: the blocks' gradients moving between roles.
+void copy_rows(const float* a, int64_t n, float* out, void* stream);
+void add_into(float* a, const float* b, int64_t n, void* stream);
+void f16_copy(const float* x, int64_t n, uint16_t* y, void* stream);
+
+/// One frozen product a block takes gradients through: Y[T,N] = X[T,K] . W^T + b, its weight as the forward reads it
+/// (w [N][K] FP16) and transposed (wt [K][N], dgrad's view), and the base's own gradients (null: frozen, not taken).
+struct Product {
+    int64_t N = 0, K = 0;
+    const uint16_t* w = nullptr;
+    const uint16_t* wt = nullptr;
+    float* dw = nullptr;
+    float* db = nullptr;
+};
+
+/// What an adapted product's forward keeps for its backward: h = x A^T as FP16 rows (h16 [T][rank]) with their
+/// scales (hr [T], the input's own scale folded in) and transposed (h16t [rank][T]).
+struct AdKeep {
+    uint16_t* h16 = nullptr;
+    float* hr = nullptr;
+    uint16_t* h16t = nullptr;
+};
+
+/// The adapters' transients a block shares between its products (they run one at a time), sized for the largest:
+/// hf [T][rank]; y1 and y2 [T][N] (the delta, a DoRA's base and delta rows, a LoKr's maps); fa and fb [N] (a DoRA's
+/// row factors); scratch, lora_bwd's (T rank + T N + N rank + rank K); tmp16, 2 T N + T rank FP16; rsT [T].
+struct AdScratch {
+    float *hf = nullptr, *y1 = nullptr, *y2 = nullptr, *fa = nullptr, *fb = nullptr, *scratch = nullptr;
+    uint16_t* tmp16 = nullptr;
+    float* rsT = nullptr;
+};
+
+/// One product's rows with its adapter (null: the product as always), the base product's sums already in y [R][N]
+/// (still divided by the input's row scales rsx, no bias yet): the scales and the bias put back and the adapter's
+/// delta added, what the forward's next stage reads.  keep receives what the backward reads.
+void ad_product_fwd(const Adapter* ad, const uint16_t* x16, const float* rsx, float* y, const float* bias, int64_t R,
+                    int64_t N, int64_t K, const AdKeep& keep, const AdScratch& sc, prefill::Gemm& gemm, void* stream);
+
+/// The same product backwards: dYv [R][N] is the gradient reaching its rows (consumed: a DoRA scales it), dxv [R][K]
+/// the input's gradient (written, or added into with `accumulate`), the base weight's own dw and db where P has them,
+/// and the adapter's factors' gradients.  x16, rsx and xt are the forward's input rows, their scales and their
+/// transposed view; t16, trs, t16t and sums the block's own temporaries (R N, R, N R and N K + R K).
+void ad_product_bwd(const Product& P, const Adapter* ad, const uint16_t* x16, const float* rsx, const uint16_t* xt,
+                    float* dYv, float* dxv, bool accumulate, const AdKeep& keep, const AdScratch& sc, uint16_t* t16,
+                    float* trs, uint16_t* t16t, float* sums, int64_t R, prefill::Gemm& gemm, void* stream);
+
+/// A block's device memory for one call, each buffer zeroed on the block's own stream and all of it freed (after the
+/// stream is done) when the pool goes: the tape and the gradients of one forward and backward.
+class Pool {
+public:
+    explicit Pool(void* stream) : s_(stream) {}
+    Pool(const Pool&) = delete;
+    Pool& operator=(const Pool&) = delete;
+    ~Pool();
+    float* f(int64_t n) { return static_cast<float*>(take(n, 4)); }
+    uint16_t* u(int64_t n) { return static_cast<uint16_t*>(take(n, 2)); }
+
+private:
+    void* take(int64_t n, int64_t bytes);
+    void* s_;
+    std::vector<void*> owned_;
+};
+
+}  // namespace strata::image::train

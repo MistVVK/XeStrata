@@ -86,14 +86,6 @@ RmsAffineOf<uint16_t> rms_mod(const uint16_t* x, const float* w, const float* sh
     return RmsAffineOf<uint16_t>{x, w, scale, shift, C, kEps, true, alt};
 }
 
-// x as it is (the text encoder's states, for their FP16 rows' scales)
-struct Plain {
-    const float* x;
-    int64_t C;
-    template<class R> Stats stats(int64_t, int64_t, int64_t, R) const { return {}; }
-    float value(int64_t t, int64_t c, const Stats&) const { return x[t * C + c]; }
-};
-
 // SiTU of the up_gate product's sums g [T][2F] (the hidden values, then the gates): (4 tanh(g / 4) sigmoid(g)) times
 // (25 tanh(h / 25)), F values a row
 struct Situ {

@@ -55,6 +55,8 @@ struct FlashAttnArgs {
                                         ///< out + (t - first) * out_ld + h * head_dim
     int64_t out_ld = 0;
     bool out_f32 = false;
+    float* lse = nullptr;               ///< non-null: each row's log-sum-exp of its scaled scores, row t, head h at
+                                        ///< lse[(t - first) * n_head + h] (a training step's backward reads it)
     float scale = 0.0f;                 ///< the scores' scale (1 / sqrt(head_dim))
     bool fma = false;                   ///< the FMA form (FP32 FMAs) on a GPU with matrix engines too (timing it)
 };

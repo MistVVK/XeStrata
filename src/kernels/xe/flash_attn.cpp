@@ -367,6 +367,13 @@ struct Kernel {
             sycl::group_barrier(sg);
         }
         if (!active) return;
+        if (a.lse != nullptr)   // m is the row's reference (not always its largest score), l its sum against it
+            for (int rr = lane; rr < TM; rr += SG) {
+                const int64_t row = my0 + rr, tq = query_of(row);
+                if (row < row_hi && tq >= a.first && tq < a.row_end)
+                    a.lse[(tq - a.first) * a.n_head + head_of(row)] =
+                        rows[roff + rr] + sycl::log(rows[roff + TM + rr]);
+            }
         // the output through local memory: in place all of it at once, gathered a tile at a time
         constexpr int OW = WHOLE ? D : TN, PASSES = WHOLE ? 1 : NT;
         for (int pass = 0; pass < PASSES; ++pass) {
@@ -558,6 +565,12 @@ struct WmmaKernel {
             }
         }
         if (my0 >= row_hi) return;
+        if (a.lse != nullptr && lo == 0)   // a row's m and l are the same on its 16 lanes
+            for (int e = 0; e < 8; ++e) {
+                const int64_t r = my0 + w::row_of(hi, e), tq = r / G;
+                if (r < row_hi && tq >= a.first && tq < a.row_end)
+                    a.lse[(tq - a.first) * a.n_head + kvh * G + r % G] = m[e] + sycl::log(l[e]);
+            }
         for (int k = 0; k < DT; ++k)
             for (int e = 0; e < 8; ++e) {
                 const int64_t r = my0 + w::row_of(hi, e), tq = r / G;
@@ -838,6 +851,7 @@ struct FmaKernel {
             const int64_t tq = qbase + r / G;
             if (tq >= a.row_end) continue;
             const float x = o[k] / L[r];
+            if (a.lse != nullptr && d == 0) a.lse[(tq - a.first) * a.n_head + h * G + r % G] = M[r] + sycl::log(L[r]);
             const int64_t to = (tq - a.first) * a.out_ld + (h * G + r % G) * HD + d;
             if constexpr (F32) static_cast<float*>(a.out)[to] = x;
             else static_cast<sycl::half*>(a.out)[to] = sycl::half(x);

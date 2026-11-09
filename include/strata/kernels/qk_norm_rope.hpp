@@ -394,4 +394,162 @@ sycl::event qk_norm_rope(sycl::queue& q, const Shape& sh, const In in, const Ang
     return norm ? go.template operator()<false, false, true>() : go.template operator()<false, false, false>();
 }
 
+// ---- the backward (a training step's), FP32 rows [T][heads][head_dim] in and out.  Normed first (rope_first false):
+// z = x r w, y = R z, so dz = R^T dy and dx = r (dz w - x^ mean(dz w x^)) with x^ = x r, and dw += dz x^.  Rotated
+// first: z = R x, y = z r w (r the same: the rotation keeps the sum of squares), so dz = r (dy w - z^ mean(dy w z^)),
+// dx = R^T dz and dw += dy z^.  R^T turns a pair back: a = a' c + b' s, b = b' c - a' s.
+
+/// a pair's values turned forth (FWD: a' = a c - b s, b' = a s + b c) or back
+template <bool FWD> inline void qk_turn(float& a, float& b, float c, float s) {
+    const float a2 = FWD ? a * c - b * s : a * c + b * s;
+    b = FWD ? a * s + b * c : b * c - a * s;
+    a = a2;
+}
+
+/// column d's pair among the rotated columns (-1 past them), its partner and whether d is the pair's first
+template <bool NEOX> inline int qk_pair(int d, int half, int& partner, bool& first) {
+    if (d >= 2 * half) return -1;
+    const int p = NEOX ? (d < half ? d : d - half) : d / 2;
+    first = NEOX ? d < half : d % 2 == 0;
+    partner = NEOX ? (first ? d + half : d - half) : (first ? d + 1 : d - 1);
+    return p;
+}
+
+/// column d of one head's normed value (x^, or rotated first z^) and of the gradient its weight multiplies (dz, or dy)
+template <bool NEOX, bool ROPE_FIRST, class Rot>
+inline void qk_bwd_col(const float* x, const float* dy, const Rot& rot, int d, int half, float r, float& xh, float& g) {
+    int partner = 0;
+    bool first = true;
+    const int p = qk_pair<NEOX>(d, half, partner, first);
+    if (p < 0) {
+        xh = x[d] * r;
+        g = dy[d];
+        return;
+    }
+    float c, s;
+    rot(p, c, s);
+    float a = first ? x[d] : x[partner], b = first ? x[partner] : x[d];
+    float ga = first ? dy[d] : dy[partner], gb = first ? dy[partner] : dy[d];
+    if (ROPE_FIRST) qk_turn<true>(a, b, c, s);
+    else qk_turn<false>(ga, gb, c, s);
+    xh = (first ? a : b) * r;
+    g = first ? ga : gb;
+}
+
+template <bool NEOX, bool ROPE_FIRST, bool NORM, class Ang>
+sycl::event qk_norm_rope_bwd_t(sycl::queue& q, const Shape& sh, const float* xq, const float* xk, const float* dyq,
+                               const float* dyk, const Ang ang, float* dxq, float* dxk, float* dwq, float* dwk,
+                               float* rs) {
+    const int64_t hd = sh.head_dim, n_rot = sh.n_rot > 0 ? sh.n_rot : hd, half = n_rot / 2, T = sh.T;
+    const int64_t qh = sh.q_heads, kvh = sh.kv_heads, nh = std::max(qh, kvh), n = T * nh;
+    const float *wq = sh.wq, *wk = sh.wk, eps = sh.eps;
+    sycl::event e = q.parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) ((n + kJobs - 1) / kJobs * kJobs * kLanes)),
+                          sycl::range<1>((size_t) (kJobs * kLanes))),
+        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const auto sg = it.get_sub_group();
+            const int64_t job = (int64_t) it.get_group_linear_id() * kJobs + (int64_t) sg.get_group_linear_id();
+            if (job >= n) return;
+            const int64_t t = job / nh, h = job - t * nh;
+            const int lane = (int) sg.get_local_linear_id(), hdi = (int) hd, hf = (int) half;
+            const auto rot = ang.row(t);
+            for (int which = 0; which < 2; ++which) {
+                const int64_t heads = which == 0 ? qh : kvh;
+                const float* DY = which == 0 ? dyq : dyk;
+                float* DX = which == 0 ? dxq : dxk;
+                const float* w = which == 0 ? wq : wk;
+                if (h >= heads || DY == nullptr || DX == nullptr) continue;
+                const float* x = (which == 0 ? xq : xk) + (t * heads + h) * hd;
+                const float* dy = DY + (t * heads + h) * hd;
+                float* dx = DX + (t * heads + h) * hd;
+                const bool normed = NORM && w != nullptr;
+                float r = 1.f, sum = 0.f;
+                if (normed) {
+                    float ss = 0.f;
+                    for (int d = lane; d < hdi; d += (int) kLanes) ss += x[d] * x[d];
+                    r = 1.f / sycl::sqrt(sycl::reduce_over_group(sg, ss, sycl::plus<float>()) / (float) hd + eps);
+                    // the norm's mean over the head of (the weighted gradient) x^
+                    for (int d = lane; d < hdi; d += (int) kLanes) {
+                        float xh, g;
+                        qk_bwd_col<NEOX, ROPE_FIRST>(x, dy, rot, d, hf, r, xh, g);
+                        sum += g * w[d] * xh;
+                    }
+                    sum = sycl::reduce_over_group(sg, sum, sycl::plus<float>()) / (float) hd;
+                }
+                for (int p = lane; p < hf; p += (int) kLanes) {
+                    const int i0 = NEOX ? p : 2 * p, i1 = NEOX ? p + hf : 2 * p + 1;
+                    float c, s;
+                    rot(p, c, s);
+                    float da, db;
+                    if (ROPE_FIRST) {   // dz on the rotated columns, then turned back
+                        float a = x[i0], b = x[i1];
+                        qk_turn<true>(a, b, c, s);
+                        da = normed ? r * (dy[i0] * w[i0] - a * r * sum) : dy[i0];
+                        db = normed ? r * (dy[i1] * w[i1] - b * r * sum) : dy[i1];
+                        qk_turn<false>(da, db, c, s);
+                    } else {            // dy turned back, then the norm's backward
+                        float ga = dy[i0], gb = dy[i1];
+                        qk_turn<false>(ga, gb, c, s);
+                        da = normed ? r * (ga * w[i0] - x[i0] * r * sum) : ga;
+                        db = normed ? r * (gb * w[i1] - x[i1] * r * sum) : gb;
+                    }
+                    dx[i0] = da;
+                    dx[i1] = db;
+                }
+                for (int d = 2 * hf + lane; d < hdi; d += (int) kLanes)
+                    dx[d] = normed ? r * (dy[d] * w[d] - x[d] * r * sum) : dy[d];
+                if (rs != nullptr && lane == 0) rs[2 * job + which] = r;
+            }
+        });
+    if (!NORM || rs == nullptr || (dwq == nullptr && dwk == nullptr)) return e;
+    // the weights' gradients: a work-group a column of q's or k's, summed over every (row, head)
+    return q.submit([&](sycl::handler& cgh) {
+        cgh.depends_on(e);
+        constexpr int WG = 256;
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (2 * hd * WG)), sycl::range<1>(WG)),
+                         [=](sycl::nd_item<1> it) {
+                             const int which = (int) ((int64_t) it.get_group_linear_id() / hd);
+                             const int d = (int) ((int64_t) it.get_group_linear_id() % hd);
+                             float* dw = which == 0 ? dwq : dwk;
+                             const int64_t heads = which == 0 ? qh : kvh;
+                             const float* X = which == 0 ? xq : xk;
+                             const float* DY = which == 0 ? dyq : dyk;
+                             if (dw == nullptr || DY == nullptr) return;
+                             float v = 0.f;
+                             for (int64_t i = (int64_t) it.get_local_linear_id(); i < T * heads; i += WG) {
+                                 const int64_t t = i / heads, job = t * nh + (i - t * heads);
+                                 float xh, g;
+                                 qk_bwd_col<NEOX, ROPE_FIRST>(X + i * hd, DY + i * hd, ang.row(t), d, (int) half,
+                                                              rs[2 * job + which], xh, g);
+                                 v += g * xh;
+                             }
+                             v = sycl::reduce_over_group(it.get_group(), v, sycl::plus<float>());
+                             if (it.get_local_linear_id() == 0) dw[d] += v;
+                         });
+    });
+}
+
+/// The backward of qk_norm_rope for FP32 rows, `sh` as the forward's (q_heads, kv_heads, head_dim, n_rot, neox,
+/// rope_first, wq, wk, eps; v's rows are copied, so its gradient is its dy as it is): xq and xk the forward's input
+/// rows [T][q_heads or kv_heads][head_dim], dyq and dyk the gradients of its output, dxq and dxk written (a null dy or
+/// dx: that tensor not taken), dwq and dwk the norms' weights' gradients added into (null: not taken).  rs: 2 T
+/// max(q_heads, kv_heads) floats of scratch, kept until the returned event ends (null: no weights' gradients).
+template <class Ang>
+sycl::event qk_norm_rope_bwd(sycl::queue& q, const Shape& sh, const float* xq, const float* xk, const float* dyq,
+                             const float* dyk, const Ang ang, float* dxq, float* dxk, float* dwq, float* dwk,
+                             float* rs) {
+    const bool norm = sh.wq != nullptr || sh.wk != nullptr;
+    auto go = [&]<bool NEOX, bool ROPE_FIRST, bool NORM>() {
+        return qk_norm_rope_bwd_t<NEOX, ROPE_FIRST, NORM>(q, sh, xq, xk, dyq, dyk, ang, dxq, dxk, dwq, dwk, rs);
+    };
+    if (sh.neox) {
+        if (sh.rope_first) return norm ? go.template operator()<true, true, true>()
+                                       : go.template operator()<true, true, false>();
+        return norm ? go.template operator()<true, false, true>() : go.template operator()<true, false, false>();
+    }
+    if (sh.rope_first) return norm ? go.template operator()<false, true, true>()
+                                   : go.template operator()<false, true, false>();
+    return norm ? go.template operator()<false, false, true>() : go.template operator()<false, false, false>();
+}
+
 }  // namespace strata::kernels::qk

@@ -108,13 +108,6 @@ struct RmsW {
     }
 };
 
-struct Plain {
-    const float* x;
-    int64_t C;
-    template<class R> Stats stats(int64_t, int64_t, int64_t, R) const { return {}; }
-    float value(int64_t t, int64_t c, const Stats&) const { return x[t * C + c]; }
-};
-
 // GELU (erf form, PyTorch's nn.GELU()) of a product's sums
 struct GeluErf {
     MfOut x;

@@ -30,7 +30,7 @@ void usage() {
                  "[--sigma F] [--seed N]\n"
                  "       xestrata-image-mf-train train --dit <safetensors> --data <export dir> --out <prefix> "
                  "[--method lora|lokr|dora] [--rank N] [--alpha F] [--steps N] [--lr F] [--seed N] [--accum N] "
-                 "[--checkpoint N] [--trigger S] [--title S] [--sigma-max F]\n");
+                 "[--checkpoint N] [--trigger S] [--title S] [--timesteps logit-normal|shifted] [--sigma-max F]\n");
 }
 
 // sd-scripts' truncated logit-normal (flux_train_utils, sample_truncated_logit_normal_indices): S = sigmoid(-N),
@@ -59,6 +59,14 @@ float sample_sigma(std::mt19937_64& rng, float logit_mean, float logit_std, floa
     return sig;
 }
 
+// Mage-Flow's reference trainer's default (ai-toolkit's flow-match "sigmoid" timesteps): sigma = sigmoid(-N(0, 1)),
+// no shift, median 0.5.  The shifted draw above puts its median near 0.96, where a step sees almost nothing but noise
+// and a character's details are not learned (2026-11-09: a base-model run left the images as they were)
+float sample_sigma_logit_normal(std::mt19937_64& rng) {
+    std::normal_distribution<float> gauss(0.f, 1.f);
+    return 1.f / (1.f + std::exp(gauss(rng)));
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -68,6 +76,7 @@ int main(int argc, char** argv) {
     }
     const std::string cmd = argv[1];
     std::string dit, data, stem, method = "lora", out, trigger, title = "card-5-lora", revision = "card-5";
+    std::string timesteps = "logit-normal";   // or "shifted": SPEC v1's first draw (sample_sigma)
     float sigma = 0.5f, lr = 1e-4f, alpha = 16.f, sigma_max = 0.f;
     int rank = 16, steps = 1500, accum = 4, checkpoint = 250, seed = 12345;
     for (int i = 2; i < argc; ++i) {
@@ -109,6 +118,8 @@ int main(int argc, char** argv) {
             trigger = val("trigger");
         else if (a == "--sigma-max")
             sigma_max = std::stof(val("sigma-max"));
+        else if (a == "--timesteps")
+            timesteps = val("timesteps");
         else if (a == "--title")
             title = val("title");
         else if (a == "--revision")
@@ -176,9 +187,12 @@ int main(int argc, char** argv) {
                 }
             }
             if (stems.empty()) throw std::runtime_error("no samples in " + data);
-            std::printf("train: %zu samples method %s rank %d alpha %.1f steps %d lr %.1e seed %d accum %d dropout %.3g sigmamax %.3g\n",
-                        stems.size(), method.c_str(), rank, (double) alpha, steps, (double) lr, seed,
-                        accum, (double) drop_rates[0], (double) sigma_max);
+            if (timesteps != "logit-normal" && timesteps != "shifted")
+                throw std::runtime_error("--timesteps is logit-normal or shifted, not " + timesteps);
+            std::printf("train: %zu samples method %s rank %d alpha %.1f steps %d lr %.1e seed %d accum %d dropout %.3g "
+                        "timesteps %s sigmamax %.3g\n",
+                        stems.size(), method.c_str(), rank, (double) alpha, steps, (double) lr, seed, accum,
+                        (double) drop_rates[0], timesteps.c_str(), (double) sigma_max);
             std::mt19937_64 rng(seed);
             std::normal_distribution<float> gauss(0.f, 1.f);
             std::uniform_real_distribution<float> drop_uni(0.f, 1.f);
@@ -236,7 +250,8 @@ int main(int argc, char** argv) {
                     smp.te = smp.uncond;
                     smp.rows = smp.uncond_rows;
                 }
-                const float sig = sample_sigma(rng, -1.09f, 0.95f, 0.95f, 0.01f, sigma_max);
+                const float sig = timesteps == "shifted" ? sample_sigma(rng, -1.09f, 0.95f, 0.95f, 0.01f, sigma_max)
+                                                         : sample_sigma_logit_normal(rng);
                 std::vector<float> eps((size_t) smp.tokens * 128);
                 for (float& v : eps) v = gauss(rng);
                 strata::image::MfTrainCond c = strata::image::mf_trainer_cond(m.get(), sig, smp.h, smp.w, gemm);

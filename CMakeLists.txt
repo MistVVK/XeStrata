@@ -836,8 +836,8 @@ if(STRATA_ENABLE_XE)
   # the image engine (Qwen-Image-2.1's DiT, src/image/): its kernels and the DiT; strata-image-probe, one block of the
   # DiT against tools/image/qi21_ref.py's NumPy reference, and strata-image-dit-probe, the whole DiT and its sampler
   # against stable-diffusion.cpp's values, timed
-  add_library(strata_image STATIC src/image/qi_kernels.cpp src/image/qi_attn.cpp src/image/qi_dit.cpp
-                           src/image/image_lora.cpp
+  add_library(strata_image STATIC src/image/qi_kernels.cpp src/image/qi_attn.cpp src/image/qi_attn_train.cpp
+                           src/image/qi_dit.cpp src/image/image_lora.cpp
                            src/image/qi_vae.cpp src/image/qi_text.cpp src/image/qi_pipeline.cpp
                            src/image/img_start.cpp src/image/img_crop.cpp src/image/img_color.cpp
                            src/upscale/upscale.cpp src/upscale/esrgan.cpp src/upscale/seedvr2_dit.cpp
@@ -845,7 +845,7 @@ if(STRATA_ENABLE_XE)
                            src/image/cnet_prep.cpp src/image/qi_control.cpp src/image/cnet_depth.cpp
                            src/image/cnet_edges.cpp src/image/cnet_pose.cpp
                            src/image/mf_vae.cpp src/image/mf_dit.cpp
-                           src/image/mf_train.cpp
+                           src/image/mf_train.cpp src/image/train_ops.cpp src/image/train_adapter.cpp
                            src/image/mf_train_block.cpp
                            src/image/mf_pipeline.cpp src/image/moss_text.cpp src/image/moss_dit.cpp
                            src/image/moss_pipeline.cpp

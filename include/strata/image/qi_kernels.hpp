@@ -16,6 +16,10 @@ namespace strata::kernels {
 struct FlashAttnI8Stats;
 }
 
+namespace strata::prefill {
+class Gemm;
+}
+
 namespace strata::image {
 
 /// y16[t] = LayerNorm(x[t]) * (1 + mod[t < n_text][...]) (+ shift: the VAEs' modulation; no affine, eps 1e-6), FP16:
@@ -93,6 +97,22 @@ bool qi_attention_i8_prefixed(const uint16_t* q16, const uint16_t* k16, const ui
 /// qi_attention takes the int8 kernel for `rows` rows of `keys` keys on the stream's GPU (as it times it, once a shape
 /// in steps of 1024; STRATA_IMAGE_ATTN_I8 forces it): false where the GPU has no int8 kernel or matrix engines.
 bool qi_attention_i8_preferred(int64_t rows, int64_t keys, int64_t heads, void* stream);
+
+/// A training step's attention (src/image/qi_attn_train.cpp), every row from n_causal on seeing every key and a row
+/// below it the keys up to itself (Qwen-Image-2.1's text rows, the inference's prefix rule): q16, k16 and v16 are
+/// [T][heads * head_dim] FP16, their rows rounded up to qi_attn_rows(T) and zero past T, as qi_attention's.  The
+/// forward runs the shared attention kernel (kernels::flash_attn, the one inference takes) to out32 [T][heads *
+/// head_dim] FP32 and lse [T][heads], each row's log-sum-exp of its scaled scores.
+void qi_attention_train(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
+                        int64_t head_dim, float* out32, float* lse, void* stream, int64_t n_causal = 0);
+/// Its backward: dQ, dK and dV [T][heads * head_dim] FP32 from dO (the same shape, FP32), the forward's out32 and lse,
+/// through the shared products (prefill::Gemm) a head and a tile of query rows at a time, P made again from the
+/// scores and lse.  dQ is written; dK and dV are written, or added into with `accumulate`.  Null dQ, dK or dV: not
+/// taken.
+void qi_attention_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, const float* o32,
+                      const float* lse, const float* dO, int64_t T, int64_t heads, int64_t head_dim, float* dQ,
+                      float* dK, float* dV, bool accumulate, prefill::Gemm& gemm, void* stream,
+                      int64_t n_causal = 0);
 
 /// The text encoder's q and k ([T][q_heads * head_dim], [T][kv_heads * head_dim]): each head RMS-normed (wq, wk; eps
 /// 1e-6), then rotated as NEOX does (pair (j, j + head_dim / 2) by a position times theta^(-2j / head_dim)); FP16 out,

@@ -20,7 +20,11 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/mf_train.hpp"
+#include "strata/image/qi_kernels.hpp"
+#include "strata/kernels/f16_bits.hpp"
 #include "strata/prefill/gemm.hpp"
+
+#include "dit_rows.hpp"
 
 #include <cctype>
 #include <cstdlib>
@@ -34,26 +38,12 @@
 
 namespace {
 
-using strata::image::mf_bias_bwd;
+namespace dit_rows = strata::image::dit_rows;
+namespace train = strata::image::train;
 using strata::image::mf_block;
-using strata::image::mf_dgrad;
-using strata::image::mf_flow_loss;
-using strata::image::mf_dora_bwd;
-using strata::image::mf_gate_add_bwd;
-using strata::image::mf_lora_bwd;
-using strata::image::mf_lokr_factor_bwd;
-using strata::image::mf_lokr_partial_trace;
-using strata::image::mf_gelu_bwd;
-using strata::image::mf_ln_mod_bwd;
-using strata::image::mf_attn_bwd;
-using strata::image::mf_attn_fwd;
 using strata::image::mf_patch_bwd;
-using strata::image::mf_qk_norm_rope_bwd;
-using strata::image::mf_rows16;
-using strata::image::mf_silu_bwd;
-using strata::image::mf_scaled_transpose_f16;
-using strata::image::mf_transpose_f16;
-using strata::image::mf_wgrad;
+using strata::image::qi_attention_bwd;
+using strata::image::qi_attention_train;
 
 const char* const kProd[6] = {"q", "k", "v", "o", "mlp1", "mlp2"};
 
@@ -155,7 +145,7 @@ int main(int argc, char** argv) {
                 S(load(dir, "scale")), DY(dy);
             zero(dsh, C * 4, s);
             zero(dsa, C * 4, s);
-            mf_ln_mod_bwd(X.cf(), M.cf(), I.cf(), S.cf(), DY.cf(), T, C, dx.f(), dsh.f(), dsa.f(), s);
+            dit_rows::ln_mod_bwd(X.cf(), M.cf(), I.cf(), S.cf(), DY.cf(), T, C, dx.f(), dsh.f(), dsa.f(), s);
             strata::gpu::stream_sync(s);
             std::vector<float> ho((size_t) (T * C + 2 * C));
             dx.read(ho.data(), T * C * 4);
@@ -168,9 +158,9 @@ int main(int argc, char** argv) {
             Var a = load(dir, op == "gelu" ? "v" : "y"), b = load(dir, "dy");
             Dev d(a.n() * 4), A(a), B(b);
             if (op == "gelu")
-                mf_gelu_bwd(A.cf(), B.cf(), a.n(), d.f(), s);
+                dit_rows::gelu_tanh_bwd(A.cf(), B.cf(), a.n(), d.f(), s);
             else
-                mf_silu_bwd(A.cf(), B.cf(), a.n(), d.f(), s);
+                dit_rows::silu_bwd(A.cf(), B.cf(), a.n(), d.f(), s);
             strata::gpu::stream_sync(s);
             std::vector<float> ho((size_t) a.n());
             d.read(ho.data(), a.n() * 4);
@@ -180,7 +170,7 @@ int main(int argc, char** argv) {
             const int64_t T = h.dim(0), C = h.dim(1);
             Dev dh(T * C * 4), dg(C * 4), H(h), G(gt), DX(dx);
             zero(dg, C * 4, s);
-            mf_gate_add_bwd(H.cf(), gt.n() ? G.cf() : nullptr, DX.cf(), T, C, dh.f(), dg.f(), s);
+            dit_rows::gate_add_bwd(H.cf(), gt.n() ? G.cf() : nullptr, DX.cf(), T, C, dh.f(), dg.f(), s);
             strata::gpu::stream_sync(s);
             std::vector<float> ho((size_t) (T * C + C));
             dh.read(ho.data(), T * C * 4);
@@ -207,7 +197,7 @@ int main(int argc, char** argv) {
             Var vp = load(dir, "vp");
             const int64_t n = vp.n();
             Dev dv(n * 4), dx0(n * 4), de(n * 4), VP(vp), X0(load(dir, "x0")), E(load(dir, "eps"));
-            const float loss = mf_flow_loss(VP.cf(), X0.cf(), E.cf(), n, dv.f(), dx0.f(), de.f(), s);
+            const float loss = train::flow_loss(VP.cf(), X0.cf(), E.cf(), n, dv.f(), dx0.f(), de.f(), s);
             strata::gpu::stream_sync(s);
             std::vector<float> ho((size_t) (3 * n + 1));
             dv.read(ho.data(), n * 4);
@@ -222,7 +212,7 @@ int main(int argc, char** argv) {
             Var g = load(dir, "g");
             const int64_t T = g.dim(0), C = g.dim(1);
             Dev out(T * C * 2), G(g), RS(load(dir, "rsX"));
-            const float gs = mf_scaled_transpose_f16(G.cf(), RS.cf(), T, C, out.h(), s);
+            const float gs = train::scaled_transpose_f16(G.cf(), RS.cf(), T, C, out.h(), s);
             std::vector<uint16_t> ho((size_t) T * C);
             out.read(ho.data(), T * C * 2);
             std::ofstream j(dir + "/gt.json");
@@ -238,7 +228,7 @@ int main(int argc, char** argv) {
             if (!gemm.init(s, 1 << 24, err)) throw std::runtime_error(err);
             Dev dx(T * K * 4), scratch(T * K * 4), DY(dy), WT(wt), RS(load(dir, "rsY"));
             zero(dx, T * K * 4, s);
-            mf_dgrad(DY.ch(), RS.cf(), WT.ch(), T, N, K, dx.f(), scratch.f(), false, gemm, s);
+            train::dgrad(DY.ch(), RS.cf(), WT.ch(), T, N, K, dx.f(), scratch.f(), false, gemm, s);
             strata::gpu::stream_sync(s);
             std::vector<float> ho((size_t) T * K);
             dx.read(ho.data(), T * K * 4);
@@ -250,7 +240,7 @@ int main(int argc, char** argv) {
             std::string err;
             if (!gemm.init(s, 1 << 24, err)) throw std::runtime_error(err);
             Dev dw(N * K * 4), scratch(N * K * 4), DYT(dyt), XT(xt);
-            mf_wgrad(DYT.ch(), XT.ch(), T, N, K, *reinterpret_cast<const float*>(gs.raw.data()), dw.f(),
+            train::wgrad(DYT.ch(), XT.ch(), T, N, K, *reinterpret_cast<const float*>(gs.raw.data()), dw.f(),
                   scratch.f(), false, gemm, s);
             strata::gpu::stream_sync(s);
             std::vector<float> ho((size_t) N * K);
@@ -261,19 +251,26 @@ int main(int argc, char** argv) {
             const int64_t rows = qv.dim(0), dims = qv.dim(1);
             const int64_t head_dim = static_cast<int64_t>(*hdv.hf());
             const int64_t heads = dims / head_dim;
-            Dev Q(qv), K(kv), V(vv), O(rows * dims * 2), O32(rows * dims * 4);
+            Dev Q(qv), K(kv), V(vv), O32(rows * dims * 4);
             strata::prefill::Gemm gemm;
             std::string gerr;
             if (!gemm.init(s, 1 << 24, gerr)) throw std::runtime_error(gerr);
             if (op == "attnf") {
-                Dev LSE(rows * heads * 4);
-                mf_attn_fwd(Q.ch(), K.ch(), V.ch(), rows, heads, head_dim, O.h(), O32.f(), LSE.f(), gemm, s);
-                std::vector<uint16_t> ho16((size_t) rows * dims);
-                std::vector<float> hl((size_t) rows * heads), ho32((size_t) rows * dims);
+                // the shared attention reads q, k and v rounded up to qi_attn_rows, zero past `rows`
+                const int64_t rp = strata::image::qi_attn_rows(rows);
+                Dev QP(rp * dims * 2), KP(rp * dims * 2), VP(rp * dims * 2), LSE(rows * heads * 4);
+                for (Dev* d : {&QP, &KP, &VP}) zero(*d, rp * dims * 2, s);
                 strata::gpu::stream_sync(s);
-                O.read(ho16.data(), rows * dims * 2);
+                for (auto [to, from] : {std::pair{&QP, &qv}, {&KP, &kv}, {&VP, &vv}})
+                    if (!strata::gpu::copy(to->p(), from->raw.data(), from->raw.size()))
+                        throw std::runtime_error("mf_train_probe: copy");
+                qi_attention_train(QP.ch(), KP.ch(), VP.ch(), rows, heads, head_dim, O32.f(), LSE.f(), s);
+                std::vector<float> hl((size_t) rows * heads), ho32((size_t) rows * dims);
+                std::vector<uint16_t> ho16((size_t) rows * dims);
+                strata::gpu::stream_sync(s);
                 O32.read(ho32.data(), rows * dims * 4);
                 LSE.read(hl.data(), rows * heads * 4);
+                for (size_t i = 0; i < ho16.size(); ++i) ho16[i] = strata::kernels::f16_from_f32(ho32[i]);
                 std::ofstream j(dir + "/o16.json");
                 j << "{\"type\":\"f16\",\"shape\":[" << dims << "," << rows << "]}";
                 std::ofstream b(dir + "/o16.bin", std::ios::binary);
@@ -282,12 +279,10 @@ int main(int argc, char** argv) {
                 save(dir, "lse", hl.data(), rows * heads * 4);
             } else {
                 // the backward reads the FP32 output the forward summed, not the FP16 image the next product reads
-                Var ov = load(dir, "o32"), dov = load(dir, "dO");
-                Dev OO(ov), DO(dov), dQ(rows * dims * 4), dK(rows * dims * 4), dV(rows * dims * 4);
-                zero(dK, rows * dims * 4, s);
-                zero(dV, rows * dims * 4, s);
-                mf_attn_bwd(Q.ch(), K.ch(), V.ch(), OO.cf(), DO.cf(), rows, heads, head_dim, dQ.f(), dK.f(),
-                            dV.f(), false, gemm, s);
+                Var ov = load(dir, "o32"), dov = load(dir, "dO"), lv = load(dir, "lse");
+                Dev OO(ov), DO(dov), LS(lv), dQ(rows * dims * 4), dK(rows * dims * 4), dV(rows * dims * 4);
+                qi_attention_bwd(Q.ch(), K.ch(), V.ch(), OO.cf(), LS.cf(), DO.cf(), rows, heads, head_dim, dQ.f(),
+                                 dK.f(), dV.f(), false, gemm, s);
                 std::vector<float> ho((size_t) 3 * rows * dims);
                 strata::gpu::stream_sync(s);
                 dQ.read(ho.data(), rows * dims * 4);
@@ -312,7 +307,7 @@ int main(int argc, char** argv) {
             strata::prefill::Gemm gemm;
             std::string err;
             if (!gemm.init(s, 1 << 24, err)) throw std::runtime_error(err);
-            mf_lora_bwd(HR.cf(), XR.cf(), H16T.ch(), X16T.ch(), BT16.ch(), DY.cf(), T, rows, cols, rank, *SC.hf(),
+            train::lora_bwd(HR.cf(), XR.cf(), H16T.ch(), X16T.ch(), BT16.ch(), DY.cf(), T, rows, cols, rank, *SC.hf(),
                         dB.f(), dA.f(), scratch.f(), tmp16.h(), rsT.f(), gemm, s);
             std::vector<float> ho((size_t) (rows * rank + rank * cols + T * rank));
             strata::gpu::stream_sync(s);
@@ -329,7 +324,7 @@ int main(int argc, char** argv) {
                 const int64_t ol = (int64_t) parts.hf()[0], ok = (int64_t) parts.hf()[1];
                 const int64_t im = (int64_t) parts.hf()[2], inn = (int64_t) parts.hf()[3];
                 Dev DDelta(dd), W1(load(dir, "w1")), W2(load(dir, "w2")), dw1(ol * im * 4), dw2(ok * inn * 4);
-                mf_lokr_partial_trace(DDelta.cf(), W1.ch(), W2.ch(), ol, ok, im, inn, dw1.f(), dw2.f(), s);
+                train::lokr_partial_trace(DDelta.cf(), W1.ch(), W2.ch(), ol, ok, im, inn, dw1.f(), dw2.f(), s);
                 std::vector<float> ho((size_t) (ol * im + ok * inn));
                 strata::gpu::stream_sync(s);
                 dw1.read(ho.data(), ol * im * 4);
@@ -340,7 +335,7 @@ int main(int argc, char** argv) {
                 Var pf = load(dir, "parts_f"), d2 = load(dir, "dw2");
                 const int64_t ok = (int64_t) pf.hf()[0], inn = (int64_t) pf.hf()[1], rk = (int64_t) pf.hf()[2];
                 Dev DW2(d2), W2A(load(dir, "w2a")), W2B(load(dir, "w2b")), dw2a(ok * rk * 4), dw2b(rk * inn * 4);
-                mf_lokr_factor_bwd(DW2.cf(), W2A.ch(), W2B.ch(), ok, inn, rk, dw2a.f(), dw2b.f(), s);
+                train::lokr_factor_bwd(DW2.cf(), W2A.ch(), W2B.ch(), ok, inn, rk, dw2a.f(), dw2b.f(), s);
                 std::vector<float> ho((size_t) (ok * rk + rk * inn));
                 strata::gpu::stream_sync(s);
                 dw2a.read(ho.data(), ok * rk * 4);
@@ -355,7 +350,7 @@ int main(int argc, char** argv) {
                 dm(rows * 4), da(rows * 4), db(rows * 4);
             const float scale = load(dir, "scale").hf()[0];   // a host value: the device copy is not the host's to read
             zero(dm, rows * 4, s);
-            mf_dora_bwd(DY.cf(), P.cf(), D.cf(), M.cf(), N.cf(), T, rows, scale, dm.f(), da.f(), db.f(), s);
+            train::dora_bwd(DY.cf(), P.cf(), D.cf(), M.cf(), N.cf(), T, rows, scale, dm.f(), da.f(), db.f(), s);
             std::vector<float> ho((size_t) (3 * rows));
             strata::gpu::stream_sync(s);
             dm.read(ho.data(), rows * 4);
@@ -389,7 +384,7 @@ int main(int argc, char** argv) {
             };
             const int64_t N[6] = {C, C, C, C, F, C}, K[6] = {C, C, C, C, C, F};
             strata::image::MfBlockW* W[2] = {&run.img_w, &run.txt_w};
-            strata::image::MfAdapter ada[2][6];   // one product's adapter (all null: the block as always)
+            train::Adapter ada[2][6];   // one product's adapter (all null: the block as always)
             float *adA[2][6] = {}, *adB[2][6] = {}, *adm[2][6] = {};
             const char* tag[2] = {"img", "txt"};
             auto has = [&](const std::string& name) -> bool {
@@ -431,9 +426,9 @@ int main(int argc, char** argv) {
                     Dev& adt = keep.emplace_back(vat);
                     Dev& bd = keep.emplace_back(vb2);
                     Dev& bdt = keep.emplace_back(vbt);
-                    strata::image::MfAdapter& az = ada[st][i];
-                    az.method = vcfg.hf()[0] != 0.f ? strata::image::MfAdapterMethod::dora
-                                                    : strata::image::MfAdapterMethod::lora;
+                    train::Adapter& az = ada[st][i];
+                    az.method = vcfg.hf()[0] != 0.f ? train::AdapterMethod::dora
+                                                    : train::AdapterMethod::lora;
                     az.rank = rk;
                     az.scale = vcfg.hf()[2];
                     az.a = ad.h();
@@ -444,7 +439,7 @@ int main(int argc, char** argv) {
                     az.dB = fresh(N[i] * rk);
                     adA[st][i] = az.dA;
                     adB[st][i] = az.dB;
-                    if (az.method == strata::image::MfAdapterMethod::dora) {
+                    if (az.method == train::AdapterMethod::dora) {
                         Var vm = load(dir, pre + "_m"), vn = load(dir, pre + "_norms");
                         if (vm.half || vn.half || vm.n() != N[i] || vn.n() != N[i])
                             throw std::runtime_error("mf_train_probe: " + pre + " is not this DoRA's shape");
@@ -547,8 +542,8 @@ int main(int argc, char** argv) {
                 DK(rows * dims * 4), WQN(head_dim * 4), WKN(head_dim * 4);
             zero(WQN, head_dim * 4, s);
             zero(WKN, head_dim * 4, s);
-            mf_qk_norm_rope_bwd(Q.cf(), K.cf(), WQ.cf(), WK.cf(), CS.cf(), SN.cf(), rope, DGQ.cf(), DGK.cf(), rows,
-                                heads, head_dim, DQ.f(), DK.f(), WQN.f(), WKN.f(), s);
+            dit_rows::qk_rope_bwd(Q.cf(), K.cf(), WQ.cf(), WK.cf(), CS.cf(), SN.cf(), rope, DGQ.cf(), DGK.cf(), rows,
+                                heads, head_dim, DQ.f(), DK.f(), WQN.f(), WKN.f(), s, false);
             std::vector<float> ho((size_t) (2 * rows * dims + 2 * head_dim));
             strata::gpu::stream_sync(s);
             DQ.read(ho.data(), rows * dims * 4);
@@ -563,7 +558,7 @@ int main(int argc, char** argv) {
             Var y = load(dir, "y");
             const int64_t rows = y.dim(0), cols = y.dim(1);
             Dev y16(rows * cols * 2), rs(rows * 4), Y(y);
-            mf_rows16(Y.cf(), rows, cols, y16.h(), rs.f(), s);
+            dit_rows::rows16(dit_rows::Plain{Y.cf(), cols}, rows, cols, y16.h(), rs.f(), s);
             std::vector<uint16_t> ho((size_t) rows * cols);
             std::vector<float> hr((size_t) rows);
             strata::gpu::stream_sync(s);
@@ -579,7 +574,7 @@ int main(int argc, char** argv) {
             const int64_t T = dy.dim(0), N = dy.dim(1);
             Dev db(N * 4), DY(dy);
             zero(db, N * 4, s);
-            mf_bias_bwd(DY.cf(), T, N, db.f(), s);
+            train::bias_bwd(DY.cf(), T, N, db.f(), s);
             strata::gpu::stream_sync(s);
             std::vector<float> ho((size_t) N);
             db.read(ho.data(), N * 4);

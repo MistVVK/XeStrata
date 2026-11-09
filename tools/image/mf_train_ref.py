@@ -284,7 +284,7 @@ def case_qkrope(d: Path, r: np.random.Generator):
 
 def case_lora(d: Path, r: np.random.Generator):
     """One weight's plain LoRA: h = x A^T kept as FP16 rows with their power of two, delta = scale (h B^T).  The
-    gradients are read the way mf_lora_bwd reads them, from the same FP16 rows the GPU sees."""
+    gradients are read the way train::lora_bwd reads them, from the same FP16 rows the GPU sees."""
     T, rows, cols, rank = 96, 64, 48, 8
     scale = 0.7
     x = r.standard_normal((T, cols)) * 3.0
@@ -369,13 +369,16 @@ RUNS = {"lnmod": [("lnmod", ["dx", "dshift", "dscale"])], "gelu": [("gelu", ["d"
         "qkrope": [("qkrope", ["dq", "dk", "wqn", "wkn"])],
         "lora": [("lora", ["dh", "dB", "dA"])], "lokr": [("lokr", ["dw1", "dw2"]), ("lokrf", ["dw2a", "dw2b"])],
         "dora": [("dora", ["dm", "da", "db"])]}
-TOL = {"lora": 5e-4, "lokr": 1e-5, "dora": 1e-6, "qkrope": 2e-4, "attn": 2e-4, "attnreal": 2e-4,
+# the attention is the shared FP16 kernel (kernels::flash_attn, inference's) and its backward the shared FP16
+# products: P and dS are rounded to FP16 once each, so its gradients and its FP32 output carry FP16's own error
+# (dQ, dK, dV 2.7-3.4e-4 and o32 2.4e-4 measured on the B70, 2026-11-09)
+TOL = {"lora": 5e-4, "lokr": 1e-5, "dora": 1e-6, "qkrope": 2e-4, "attn": 5e-4, "attnreal": 5e-4,
        "rows16": 1e-3, "lnmod": 2e-5, "gelu": 5e-5, "silu": 5e-5, "gate": 2e-5, "patch": 1e-6, "flow": 1e-5,
        "products": 3e-3, "productsreal": 3e-3}
 
 
 # an FP16 tensor can only carry FP16's own error: an output written as FP16 is judged at two of its units
-TOL_OUT = {("attn", "o16"): 2e-3, ("attn", "o32"): 2e-5, ("attnreal", "o16"): 2e-3, ("attnreal", "o32"): 2e-5,
+TOL_OUT = {("attn", "o16"): 2e-3, ("attn", "o32"): 5e-4, ("attnreal", "o16"): 2e-3, ("attnreal", "o32"): 5e-4,
            ("products", "db"): 1e-3}
 
 
