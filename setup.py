@@ -8284,7 +8284,7 @@ def sycl_setup(argv) -> int:
 def intel_control_setup(a) -> int:
     """`--backend sycl` in the app's CONTROL mode (tools/strata_mcp.py passes it for an Intel Arc PC): what the Terminal does for an Arc
     (strata_cli/launch/runner.py adopt_prepared_files): the pack from the model's GGUF files (`--prepare-pack`'s step), then the run config
-    (strata_cli/launch/adopt.py), the engine named as the component. Nothing is downloaded but gguf-py's small helper, nothing is compiled; Intel
+    (strata_cli/launch/adopt.py), the engine named as the component. Nothing is downloaded, nothing is compiled; Intel
     cards do not download models, so the files must be on the computer (--gguf-dir, or <data folder>/models/<tag>). The older `--backend sycl`
     (a source build with oneAPI, sycl/setup_intel.py) is sycl_setup(), for a checkout; the app's bundle has no sycl/ folder."""
     from strata_cli.launch import adopt
