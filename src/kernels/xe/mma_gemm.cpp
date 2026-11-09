@@ -57,8 +57,11 @@ using bf16_t = sycl::ext::oneapi::bfloat16;
 // 1280 x 2560; none of the large-register ones was faster).  RDNA3's and RDNA4's WMMA: NVIDIA's shape with a product's
 // layout of its own, 2 x 4 sub-groups of 4 x 2 tiles (128 x 128 a work-group), from the RX 7900 XTX's timings (T 4096,
 // K 4096 and 12288, 2026-11-09): X . W^T 76-82 TFLOPS and X . W 68-74 (2 x 2 of 2 x 2, NVIDIA's: 55-67 and 54-55;
-// 4 x 2 of 2 x 4: 77-84 and 66-70; 4 x 4 of 2 x 2: 76-83 and 64-66; 4 x 4 tiles a sub-group spilled, 13-22).  The
-// others untuned.
+// 4 x 2 of 2 x 4: 77-84 and 66-70; 4 x 4 of 2 x 2: 76-83 and 64-66; 4 x 4 tiles a sub-group spilled, 13-22).  RDNA4's
+// (a shape of its own, built for GFX12 only): 2 x 4 sub-groups of 2 x 2 tiles (64 x 128), from the RX 9060 XT's (the
+// same products, ROCm 7.1.1): X . W^T 41-45 TFLOPS at K 4096 (RDNA3's layout 28-31, 2 x 2 of 2 x 2 21-22; at K 12288
+// every layout about 20) and X . W 15-22 (RDNA3's 23-27); rocBLAS ran these at 54-59, so Gemm's measure keeps it
+// there.  The others untuned.
 // A work-group's layout: wgm x wgn sub-groups, each sgm x sgn tiles, with the large register file (grf) or not.
 struct Layout {
     int wgm, wgn, sgm, sgn;
@@ -72,7 +75,8 @@ struct Shape {
 constexpr Shape kShapes[] = {{8, 16, 16, 16, {2, 2, 2, 2, false}, {2, 2, 2, 2, false}, true},
                              {8, 8, 16, 8, {4, 8, 4, 4, true}, {2, 8, 2, 2, false}, true},
                              {16, 16, 16, 32, {2, 2, 2, 2, false}, {2, 2, 2, 2, false}, false},
-                             {16, 16, 16, 32, {2, 4, 4, 2, false}, {2, 2, 2, 2, false}, false}};
+                             {16, 16, 16, 32, {2, 4, 4, 2, false}, {2, 2, 2, 2, false}, false},
+                             {16, 16, 16, 32, {2, 4, 2, 2, false}, {2, 2, 2, 2, false}, false}};
 constexpr int KC = 32;            // K a step (64 was no faster on the A380)
 
 // NVIDIA's shape from sm_80 on: the tiles read from local memory with ldmatrix and multiplied with mma.sync
@@ -94,9 +98,13 @@ constexpr int VEC = 8;            // values a work-item copies at once (16 bytes
 template<int S>
 constexpr bool built() {
 #if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
-    return S == 3 && STRATA_AMD_WMMA;
+#if defined(__GFX12__)
+    return S == 4 && STRATA_AMD_WMMA;
 #else
-    return S == 3 ? false : kShapes[S].sg < 32 ? !STRATA_DEVICE_NOT_INTEL : true;
+    return S == 3 && STRATA_AMD_WMMA;
+#endif
+#else
+    return S >= 3 ? false : kShapes[S].sg < 32 ? !STRATA_DEVICE_NOT_INTEL : true;
 #endif
 }
 
@@ -506,7 +514,10 @@ int shape(const sycl::queue& q, bool bf16) {
         const auto pick = [&q](mx::matrix_type in) {
             // RDNA3 and RDNA4 report no combination (see built): their WMMA takes NVIDIA's shape, FP16 and BF16
             if (amd_wmma(q.get_device()) && !(in == mx::matrix_type::bf16 && no_bf16_mma()))
-                return groups_layout_fits(3, q) ? 3 : -1;
+            {
+                const int s = amd_wmma_gfx12(q.get_device()) ? 4 : 3;
+                return groups_layout_fits(s, q) ? s : -1;
+            }
             for (int i = 0; i < (int) std::size(kShapes); ++i)
                 if (reported(q.get_device(), in, kShapes[i])) return groups_layout_fits(i, q) ? i : -1;
             return -1;
@@ -543,7 +554,8 @@ bool groups_layout_fits(int s, const sycl::queue& q) {
     if (s == 0) return layout_fits<0, true>(q);
     if (s == 1) return layout_fits<1, true>(q);
     if (s == 2) return layout_fits<2, true>(q);
-    return layout_fits<3, true>(q);
+    if (s == 3) return layout_fits<3, true>(q);
+    return layout_fits<4, true>(q);
 }
 
 // A product's slices along K: when its tiles fill less than twice the device's compute units (its report) and it has
@@ -626,7 +638,8 @@ sycl::event by_shape(int s, sycl::queue& q, const uint16_t* X, const uint16_t* W
     if (s == 0) return run<0, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
     if (s == 1) return run<1, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
     if (s == 2) return run<2, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
-    return run<3, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
+    if (s == 3) return run<3, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
+    return run<4, E>(q, X, W, w_stride, Y, ldy, bounds, G, T, N, K, accumulate);
 }
 
 }  // namespace
@@ -660,12 +673,16 @@ sycl::event mma_gemm_grouped(sycl::queue& q, const uint16_t* X, const uint16_t* 
 }
 
 bool mma_gemm_kn_usable(const sycl::queue& q) {
-    return amd_wmma(q.get_device()) && mma_usable(q, false) && shape(q, false) == 3 && layout_fits<3, false>(q);
+    if (!amd_wmma(q.get_device()) || !mma_usable(q, false)) return false;
+    const int s = shape(q, false);
+    return (s == 3 && layout_fits<3, false>(q)) || (s == 4 && layout_fits<4, false>(q));
 }
 
-sycl::event mma_gemm_kn(sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t ldw, float* Y, int64_t T,
-                        int64_t N, int64_t K, int64_t ldy) {
-    using KT = Kernel<3, sycl::half, false, false, true>;
+namespace {
+template<int S>
+sycl::event launch_kn(sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t ldw, float* Y, int64_t T, int64_t N,
+                      int64_t K, int64_t ldy) {
+    using KT = Kernel<S, sycl::half, false, false, true>;
     const auto* x = reinterpret_cast<const sycl::half*>(X);
     const auto* w = reinterpret_cast<const sycl::half*>(W);
     const int64_t tiles_m = (T + KT::WM - 1) / KT::WM, tiles_n = (N + KT::WN - 1) / KT::WN;
@@ -678,5 +695,12 @@ sycl::event mma_gemm_kn(sycl::queue& q, const uint16_t* X, const uint16_t* W, in
                        KT{x, w, 0, Y, ldy, nullptr, T, N, K, tiles_m, tiles_n, K, as, bs, cs, ldw});
     });
 }
+}  // namespace
 
+
+sycl::event mma_gemm_kn(sycl::queue& q, const uint16_t* X, const uint16_t* W, int64_t ldw, float* Y, int64_t T,
+                        int64_t N, int64_t K, int64_t ldy) {
+    if (shape(q, false) == 4) return launch_kn<4>(q, X, W, ldw, Y, T, N, K, ldy);
+    return launch_kn<3>(q, X, W, ldw, Y, T, N, K, ldy);
+}
 }  // namespace strata::kernels::xe

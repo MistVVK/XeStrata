@@ -33,6 +33,14 @@ inline bool amd_wmma(const sycl::device& d) {
     return a >= static_cast<uint64_t>(syclex::architecture::amd_gpu_gfx1100) && a < 0x0200000000130000ull;
 }
 
+/// Whether the device is an RDNA4 GPU (GFX12), whose WMMA takes its operands in another layout than RDNA3's (and whose
+/// products take tile layouts of their own, mma_gemm.cpp).
+inline bool amd_wmma_gfx12(const sycl::device& d) {
+    namespace syclex = sycl::ext::oneapi::experimental;
+    if (!amd_wmma(d)) return false;
+    return static_cast<uint64_t>(d.get_info<syclex::info::device::architecture>()) >= 0x0200000000120000ull;
+}
+
 #if STRATA_AMD_WMMA
 namespace wmma {
 
