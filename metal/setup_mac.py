@@ -524,7 +524,7 @@ def main(argv=None) -> int:
     # ---- 6. the pack and the MTP draft layer
     S.step(6, "preparing the model for Strata")
     pack = S.find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
-    env = dict(os.environ, STRATA_GGUF_PY=str(S.gguf_py_dir()))
+    env = dict(os.environ, **S.gguf_py_env())
     # The repack and the pack move 100+ GB through the disk and the pack's python holds up to 20 GB: no engine may run beside
     # them (an engine of 70-90 GB with a repack froze the 128 GB M5 Max twice).  A lock beside the GPU's file tells the engine
     # and start() to wait; a running engine stops setup here.

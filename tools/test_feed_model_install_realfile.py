@@ -5,7 +5,7 @@ second copy of the experts).
 
     python -m pytest tools/test_feed_model_install_realfile.py
 
-Needs numpy (no llama.cpp checkout and no STRATA_TEST_LLAMA_CPP any more: gguf-py is vendored in third_party/strata-gguf-py); without it the test is SKIPPED
+Needs numpy (no llama.cpp checkout and no STRATA_TEST_LLAMA_CPP any more: the preparation tools use tools/strata_gguf.py, not gguf-py); without it the test is SKIPPED
 with that reason, which `tools/check` prints. The engine step (one request) is the gate script's own --engine option and needs a box with an engine built for the file's shape.
 """
 from __future__ import annotations
@@ -25,7 +25,7 @@ import feed_model_install_gate as gate  # noqa: E402
 class FeedModelInstallFromRealFile(unittest.TestCase):
     def test_a_small_synthetic_model_installs_through_setup(self):
         try:
-            gate.check_vendored_gguf_py()
+            gate.check_gguf_tools()
             import numpy  # noqa: F401
         except gate.NotRun as e:
             self.skipTest(str(e))

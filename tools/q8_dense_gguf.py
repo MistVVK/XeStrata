@@ -38,16 +38,16 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _paths  # noqa: E402
 
-_paths.add_gguf_py()
-from gguf import GGUFReader, GGMLQuantizationType as QT  # noqa: E402
-from gguf.quants import dequantize, quantize  # noqa: E402
+_gguf = _paths.gguf_lib()
+GGUFReader, QT = _gguf.GGUFReader, _gguf.GGMLQuantizationType
+dequantize, quantize = _gguf.quants.dequantize, _gguf.quants.quantize
 from gguf_writer import dequantize_q2_0  # noqa: E402
 
 # what src/core/native_dense.cpp serves natively (eligible()), and the head
 SUFFIXES = (".attn_qkv.weight", ".attn_gate.weight", ".ssm_out.weight", ".attn_q.weight", ".attn_k.weight",
             ".attn_v.weight", ".attn_output.weight", ".ffn_gate_shexp.weight", ".ffn_up_shexp.weight",
             ".ffn_down_shexp.weight")
-Q2_0 = 42   # GSQ's 2-bit type: gguf-py has no member for it
+Q2_0 = 42   # GSQ's 2-bit type (gguf-py's quants cannot dequantize it; tools/gguf_writer.py can)
 
 
 def is_target(name: str) -> bool:

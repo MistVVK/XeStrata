@@ -20,9 +20,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _paths import add_gguf_py  # noqa: E402
-add_gguf_py()
-import gguf  # noqa: E402
+from _paths import gguf_lib  # noqa: E402
+gguf = gguf_lib()
 
 H, FF, NE = 2560, 640, 512
 BLOB = 3 * (H * FF * 18 // 64)

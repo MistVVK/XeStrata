@@ -31,9 +31,8 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _paths import add_gguf_py  # noqa: E402
-add_gguf_py()
-import gguf  # noqa: E402  (the pinned llama.cpp gguf-py, which knows Q2_0 = type 42)
+from _paths import gguf_lib  # noqa: E402
+gguf = gguf_lib()  # noqa: E402  (tools/strata_gguf.py; STRATA_GGUF_PY selects llama.cpp's gguf-py instead)
 
 EXPERT_TENSORS = ("mtp.layers.0.mlp.experts.gate_up_proj", "mtp.layers.0.mlp.experts.down_proj")
 
@@ -165,7 +164,7 @@ def main() -> int:
                 ref = x[e].reshape(-1)
                 got = dequant(a.experts, parts[e], ref.size)
                 errs.append(float(np.sqrt(((got - ref) ** 2).mean()) / (np.sqrt((ref ** 2).mean()) + 1e-12)))
-            # gguf-py takes the quantized bytes with the ELEMENT shape; ggml order is innermost-first.
+            # the writer takes the quantized bytes with the ELEMENT shape; ggml order is innermost-first.
             w.add_tensor(name, blob, raw_shape=list(shape[:-1]) + [shape[-1] // block * block_bytes], raw_dtype=qtype)
             report.append({"tensor": name, "format": a.experts, "bytes": int(blob.size),
                            "relative_rms_error_first_experts": round(float(np.mean(errs)), 5),

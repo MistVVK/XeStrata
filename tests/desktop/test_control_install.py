@@ -172,7 +172,8 @@ class ControlModeTests(unittest.TestCase):
         finally:
             sys.path.pop(0)
         tools = stage.local_imports(ROOT, stage.INSTALLER_TOOLS)
-        for need in ("strata_mcp", "iq_pack", "strata_pack", "canonical_xcheck", "pack_layer", "gguf_reader", "gguf_writer", "_paths"):
+        for need in ("strata_mcp", "iq_pack", "strata_pack", "canonical_xcheck", "pack_layer", "gguf_reader", "gguf_writer", "_paths",
+                     "strata_gguf", "strata_quants", "strata_quant_tables"):
             self.assertIn(need, tools)
         out = Path(self.tmp.name) / "control"
         out.mkdir()

@@ -143,7 +143,8 @@ def check_tree(root, tree_rel, upmap, upstream, problems):
                 problems.append("%s: not in the upstream tree %s" % (rel, upstream))
             elif sha(q) != up:
                 problems.append("%s: upstream hash in the manifest differs from %s" % (rel, q))
-    for d, _dirs, files in os.walk(tree):
+    for d, dirs, files in os.walk(tree):
+        dirs[:] = [x for x in dirs if x != "__pycache__"]       # bytecode written by an import of the vendored package is not a file of the tree
         for f in files:
             rel = os.path.relpath(os.path.join(d, f), tree).replace(os.sep, "/")
             if rel in NOT_LISTED or (rel == "LICENSE" and upmap is None):

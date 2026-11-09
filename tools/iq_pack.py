@@ -102,23 +102,22 @@ def needs_bf16(name: str, type_name: str) -> bool:
 
 
 def dequantize(raw: np.ndarray, type_name: str) -> np.ndarray:
-    """The tensor's values as float32 (float types exactly, quantized ones through gguf-py's dequantizer)."""
+    """The tensor's values as float32 (float types exactly, quantized ones through tools/strata_quants.py)."""
     if type_name == "F32":
         return raw.view(np.float32)
     if type_name == "F16":
         return raw.view(np.float16).astype(np.float32)
     if type_name == "BF16":
         return (raw.view(np.uint16).astype(np.uint32) << 16).view(np.float32)
-    from _paths import add_gguf_py
-    add_gguf_py()
-    from gguf import GGMLQuantizationType as Q, quants
-    return quants.dequantize(raw, Q[type_name]).astype(np.float32).reshape(-1)
+    from _paths import gguf_lib
+    gguf = gguf_lib()
+    return gguf.quants.dequantize(raw, gguf.GGMLQuantizationType[type_name]).astype(np.float32).reshape(-1)
 
 
 def bf16_bytes(raw: np.ndarray, type_name: str) -> bytes:
-    from _paths import add_gguf_py
-    add_gguf_py()
-    from gguf import GGMLQuantizationType as Q, quants
+    from _paths import gguf_lib
+    gguf = gguf_lib()
+    Q, quants = gguf.GGMLQuantizationType, gguf.quants
     values = quants.dequantize(raw, Q[type_name])
     if not np.isfinite(values).all():
         raise ValueError("cannot convert non-finite weights to BF16")

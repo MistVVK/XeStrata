@@ -93,21 +93,16 @@ def dequant(p: Pack, name: str, dev) -> torch.Tensor:
 
 
 def gq_values(raw: np.ndarray, dt: str, name: str) -> np.ndarray:
-    """ggml blocks of type dt as F32 (flat) through gguf-py's dequantisers - the installed package, else a llama.cpp
-    checkout's ($GGUF_PY, ~/llama.cpp/gguf-py)."""
+    """ggml blocks of type dt as F32 (flat) through tools/strata_quants.py (STRATA_GGUF_PY=<gguf-py folder> selects llama.cpp's)."""
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
+    from _paths import gguf_lib
+    gguf = gguf_lib()
     try:
-        try:
-            import gguf
-        except ImportError:
-            for d in (os.environ.get("GGUF_PY", ""), os.path.expanduser("~/llama.cpp/gguf-py")):
-                if d and os.path.isdir(d):
-                    sys.path.insert(0, d)
-            import gguf
-        from gguf.quants import dequantize as gq_dequant
         qt = gguf.GGMLQuantizationType[dt]
-    except (ImportError, KeyError):
-        raise SystemExit("%s: dtype %s (no gguf-py with a dequantiser for it: GGUF_PY=<llama.cpp>/gguf-py)" % (name, dt))
-    return np.ascontiguousarray(gq_dequant(raw, qt), dtype=np.float32).reshape(-1)
+        out = gguf.quants.dequantize(raw, qt)
+    except (KeyError, NotImplementedError):
+        raise SystemExit("%s: dtype %s (no dequantiser for it in tools/strata_quants.py)" % (name, dt))
+    return np.ascontiguousarray(out, dtype=np.float32).reshape(-1)
 
 
 class Hasher:

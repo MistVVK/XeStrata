@@ -336,9 +336,9 @@ def step_pytest(name, targets, extra=(), need_node=False, cwd=None):
 
 def step_optional(ctx):
     r = Result("py-optional")
-    for mod, what in (("torch", "torch"), ("gguf", "gguf (llama.cpp's gguf-py: pip install gguf)")):
+    for mod, what in (("torch", "torch"),):
         if not have_module(mod):
-            r.reason = "%s is not installed for %s (tools/dflash2 and tools/dsv41 tests need torch and gguf)" % (what, sys.executable)
+            r.reason = "%s is not installed for %s (tools/dflash2 and tools/dsv41 tests need torch)" % (what, sys.executable)
             return r
     return step_pytest("py-optional", ["tools/dflash2", "tools/dsv41", "tools/trellis"])(ctx)
 

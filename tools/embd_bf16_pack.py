@@ -10,7 +10,7 @@ out of the safetensors file - nothing decoded or rounded.
 
     python tools/embd_bf16_pack.py --gguf <model.gguf> --out <token-embd-bf16.gguf>
 
-instead dequantizes a GGUF's own token_embd.weight to BF16 (round-to-nearest-even, through gguf-py), for a file whose
+instead dequantizes a GGUF's own token_embd.weight to BF16 (round-to-nearest-even, tools/strata_quants.py), for a file whose
 embedding type has no GPU dequantizer in the engine (Agention's Gyro-S stores it as Q6_K).  That is the GGUF's values
 rounded to BF16, not the checkpoint's.
 """
@@ -57,9 +57,9 @@ def from_gguf(src, out):
     import numpy as np
     sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
     import gguf_reader as G
-    from _paths import add_gguf_py
-    add_gguf_py()
-    from gguf import GGMLQuantizationType as Q, quants
+    from _paths import gguf_lib
+    gguf = gguf_lib()
+    Q, quants = gguf.GGMLQuantizationType, gguf.quants
     g = G.GGUFFile(src)
     t = next((t for t in g.tensors if t.name == "token_embd.weight"), None)
     if t is None or len(t.shape) != 2 or t.expected_bytes() is None:
