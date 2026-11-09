@@ -113,7 +113,7 @@ const Caps& caps() noexcept {
 
 Isa best_isa() noexcept {
     const Caps& c = caps();
-    if (c.avx512) return Isa::Avx512;
+    if (c.avx512 && c.avx512_vnni) return Isa::Avx512;
     if (c.avx2) return Isa::Avx2;
     if (c.avx) return Isa::Avx1;
     if (c.neon) return Isa::Neon;
@@ -135,7 +135,7 @@ bool isa_ok(Isa i) noexcept {
         case Isa::Neon: return c.neon;
         case Isa::Avx1: return c.avx;
         case Isa::Avx2: return c.avx2;
-        case Isa::Avx512: return c.avx512;
+        case Isa::Avx512: return c.avx512 && c.avx512_vnni;
     }
     return false;
 }

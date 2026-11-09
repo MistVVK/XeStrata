@@ -20,6 +20,7 @@ macro(strata_quant_layer)
     if(MSVC)
       set_source_files_properties(src/quant/x86/dot_avx2.cpp src/quant/x86/act_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
       set_source_files_properties(src/quant/x86/dot_avx.cpp src/quant/x86/act_avx.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
+      set_source_files_properties(src/quant/x86/dot_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     else()
       # ggml-cpu is C built as gnu11, where GCC contracts a multiply and an add into an FMA wherever it can (-ffp-contract=fast), the intrinsics'
       # `_mm256_add_ps(_mm256_mul_ps(a, b), c)` patterns included; the same flag keeps this C++ (-std=c++20, an ISO mode that contracts less) summing
@@ -29,8 +30,13 @@ macro(strata_quant_layer)
       set_source_files_properties(src/quant/x86/dot_avx2.cpp src/quant/x86/act_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-ffp-contract=fast;${STRATA_QUANT_AVX2_EXTRA}")
       # AVX2, FMA and F16C explicitly off: a -march=native build host must not leak wider code into the AVX-only tier
       set_source_files_properties(src/quant/x86/dot_avx.cpp src/quant/x86/act_avx.cpp PROPERTIES COMPILE_OPTIONS "-mavx;-mno-avx2;-mno-fma;-mno-f16c;-ffp-contract=fast")
+      # the 512-bit kernels of the Avx2 contract: F/DQ/BW/VL + VNNI (what Isa::Avx512 means), called only behind caps()
+      set_source_files_properties(src/quant/x86/dot_avx512.cpp PROPERTIES COMPILE_OPTIONS
+                                  "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx512vnni;-mavx2;-mfma;-mf16c;-ffp-contract=fast")
     endif()
   endif()
+  add_executable(quant_bench tests/quant/quant_bench.cpp)   # one-thread GB/s of every kernel (no ggml); not a test
+  target_link_libraries(quant_bench PRIVATE strata_quant)
   if(STRATA_BUILD_TESTS)
     add_executable(quant_selftest tests/quant/quant_selftest.cpp)
     target_link_libraries(quant_selftest PRIVATE strata_quant)
