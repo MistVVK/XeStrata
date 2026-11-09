@@ -82,9 +82,9 @@ int own_reader_run(const OwnReaderOptions& o) {
     }
 #endif
     if (!o.gpu) {
-        // STRATA_VIT_CPU=fast selects the fast CPU tower (VitCpu); the default stays the float32 reference until the CPU gates have passed
+        // the CPU path of the own tower is the fast tower (VitCpu); STRATA_VIT_CPU=ref selects the float32 reference (VitRef: the oracle, for tests)
         const char* sel = std::getenv("STRATA_VIT_CPU");
-        if (sel && std::string(sel) == "fast") {
+        if (!(sel && std::string(sel) == "ref")) {
             fast.reset(new VitCpu());
             if (!fast->load(gg, geo, err)) return fail("cannot load the vision encoder " + o.mmproj + " (" + err + ")", 1);
         } else {
