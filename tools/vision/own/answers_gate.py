@@ -22,7 +22,10 @@ import time
 import urllib.request
 from pathlib import Path
 
-QUESTIONS = ["Describe this picture in two short sentences.", "What text is written in the picture? Answer with the text only."]
+QUESTIONS = ["What text is written in the image? Answer with the text only.",
+             "List every shape in the image with its colour, from left to right. One short line each.",
+             "Which colours do you see? List them, comma separated.",
+             "How many separate shapes are in the picture? Answer with a number."]
 
 
 def main():
@@ -58,12 +61,15 @@ def main():
 
     results = {}
     for spec in a.towers.split(","):
-        # a reader spec: name[:gpu][@tag]  (mtmd, own, mtmd:gpu, own:gpu, mtmd@2 for a second run of the same reader)
+        # a reader spec: name[+round][:gpu][@tag]  (mtmd, own, mtmd:gpu, own:gpu, mtmd@2 for a second run of the same reader,
+        # own+round and own+round:gpu with STRATA_VIT_REF_ROUND=1 in the reader's environment)
         name, _, mode = spec.split("@")[0].partition(":")
+        rounding = name.endswith("+round")
+        name = name.replace("+round", "")
         gpu = a.gpu or mode == "gpu"
-        tower = spec.replace(":", "-").replace("@", "-")        # the label of this run in file names and in the report
+        tower = spec.replace(":", "-").replace("@", "-").replace("+", "-")        # the label of this run in file names and in the report
         wrap = out / ("reader-%s.sh" % tower)
-        wrap.write_text('#!/bin/sh\nexec "%s" "$@" --tower %s\n' % (a.helper, name))
+        wrap.write_text('#!/bin/sh\n%sexec "%s" "$@" --tower %s\n' % ("export STRATA_VIT_REF_ROUND=1\n" if rounding else "", a.helper, name))
         wrap.chmod(wrap.stat().st_mode | stat.S_IXUSR)
         vis = {"exe": str(wrap), "mmproj": box["mmproj"], "model": box["native"], "gpu": gpu, "max_tokens": a.max_tokens}
         if a.threads and not gpu:
