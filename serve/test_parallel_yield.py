@@ -17,6 +17,46 @@ from serve import test_parallel as tp
 class ParallelServiceYield(tp.FakeEngineCase):
     """Requests that give way to each other, and what happens to a slot when the engine misbehaves."""
 
+    def test_cancelled_slot_keeps_its_next_owners_claim(self):
+        """The BDONE waiter may finish before the cancelled request returns from handing it the slot.
+
+        Adapted from johnfink8/sfnx#16 (MIT, Copyright (c) 2026 John Fink; license terms in LICENSE):
+        finish that wait and let the next owner claim the slot before the previous request's cleanup
+        resumes. No sleeps decide which owner wins.
+        """
+        self.start(2)
+        e = self.engine
+        e.QUARANTINE_S = 1.0                 # a broken fake protocol must not wait the production quarantine
+        with e.slot_cv:
+            e.slot_busy[1] = True
+            e.slot_claims.add(1)
+        request = e.generate_batched(list(b"LONGREPLY please"), 60, {}, threading.Event())
+        received = 0
+        for token in request:
+            received += token is not None
+            if received == 3:
+                break
+        self.assertEqual(e.slot_live[0]["state"], "decoding")
+        claimed = []
+
+        class CompleteThenClaim:
+            def __init__(self, target, daemon=None):
+                self.target = target
+
+            def start(self):
+                self.target()                         # the real waiter consumes the fake engine's BDONE
+                with e.slot_cv:
+                    claimed.append(not e.slot_busy[0])
+                    e.slot_busy[0] = True
+                    e.slot_claims.add(0)               # the waiting request takes the now-free slot
+
+        with mock.patch.object(tp.server.threading, "Thread", CompleteThenClaim):
+            request.close()
+        self.assertEqual(claimed, [True], "the stopped slot did not reach BDONE and become free")
+        self.assertIn(0, e.slot_claims, "the old request erased the new owner's claim")
+        self.assertTrue(e.slot_busy[0])
+        self.assertNotIn(0, e.slot_releasing)
+
     def test_a_long_prompt_gives_way_to_a_short_one(self):
         """#656: a long solo prompt read gives way at a chunk boundary; the short request is answered first, then the
         long one goes on (in the slot its part waited in) and is answered too."""

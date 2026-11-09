@@ -1905,7 +1905,11 @@ class StrataEngine:
             pass
         q, busy, held = self.slot_q[slot], self.slot_busy, self.slot_held   # this process's: restart() replaces them
         releasing = self.slot_releasing
-        releasing.add(slot)
+        with self.slot_cv:
+            # Transfer the claim before the waiter can free the slot. A queued BDONE may let the next request
+            # claim it immediately; the previous request must not discard that new claim afterwards.
+            releasing.add(slot)
+            self.slot_claims.discard(slot)
 
         def wait():
             end = time.monotonic() + self.QUARANTINE_S      # no-progress limit: every line of the slot starts it again
@@ -2561,7 +2565,6 @@ class StrataEngine:
                     self.slot_held[slot] = []
                     stream = list(prompt) + out[gen0:] if gen0 is not None and len(out) > gen0 else None
                     self._release_slot_when_done(slot, stream, born)    # freed at its BDONE
-                    self.slot_claims.discard(slot)                # (the BDONE wait owns it now)
                 else:
                     with self.slot_cv:
                         self.slot_busy[slot] = False
