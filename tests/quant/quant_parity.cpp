@@ -226,6 +226,52 @@ void test_dequant(int rows) {
     }
 }
 
+// Values within a few ulps of the rounding boundaries of the Q8_K quantizer (nearest_int adds the 2^23 + 2^22 magic number to iscale * x) and of the Q4_0
+// requantizer (x * id + 8.5, truncated).  A compiler that contracts the multiply and the add into one FMA gives another result on exactly these inputs, and
+// ggml-base does so on arm64 under GCC (not on x86), so random data finds the mismatch only after millions of values: this finds it in a few thousand.
+void test_boundary(int rows) {
+    Rng r(4242);
+    const sq::Arith ar = oracle_arith();
+    const sq::ActKernel* k8 = sq::act_kernel(sq::Type::Q8_K, ar);
+    const ggml_type_traits_cpu* t8 = ggml_get_type_traits_cpu(GGML_TYPE_Q8_K);
+    auto jitter = [&r](float v) {
+        for (uint32_t t = r.next() % 4; t > 0; --t) v = std::nextafter(v, r.next() & 1 ? INFINITY : -INFINITY);
+        return v;
+    };
+    if (k8 != nullptr && t8 != nullptr) {
+        std::vector<float> x(256);
+        std::vector<uint8_t> a(sq::kBlockQ8_K), b(sq::kBlockQ8_K);
+        for (int it = 0; it < rows * 300; ++it) {
+            const float dd = std::ldexp(0.5f + 0.5f * std::fabs(r.uni()), (int) (r.next() % 14) - 7);
+            const float x0 = (r.next() & 1 ? 127.f : -127.f) * dd;
+            const float step = -1.f / (-127.f / x0);
+            x[0] = x0;
+            for (int j = 1; j < 256; ++j) x[(size_t) j] = jitter(((int) (r.next() % 253) - 126 + 0.5f) * step);
+            t8->from_float(x.data(), a.data(), 256);
+            k8->fn(x.data(), b.data(), 256);
+            ++g_checked;
+            if (a != b) {
+                fail("q8_K", "boundary values: the quantizer differs from ggml's (a fused multiply-add on one side), iteration " + std::to_string(it));
+                break;
+            }
+        }
+    }
+    std::vector<float> x(32);
+    std::vector<uint8_t> a(18), b(18);
+    for (int it = 0; it < rows * 300; ++it) {
+        const float dd = std::ldexp(0.5f + 0.5f * std::fabs(r.uni()), (int) (r.next() % 14) - 7);
+        x[0] = -8.f * dd;
+        for (int j = 1; j < 32; ++j) x[(size_t) j] = jitter(((int) (r.next() % 15) + 1 - 8.5f) * dd);
+        ggml_quantize_chunk(GGML_TYPE_Q4_0, x.data(), a.data(), 0, 1, 32, nullptr);
+        sq::quantize_q4_0_ref(x.data(), b.data(), 32);
+        ++g_checked;
+        if (a != b) {
+            fail("q4_0", "boundary values: quantize_q4_0_ref differs from ggml's (a fused multiply-add on one side), iteration " + std::to_string(it));
+            break;
+        }
+    }
+}
+
 void test_fp16() {
     // our software fp16 conversions against ggml's, every fp16 value and a spread of floats
     int bad = 0;
@@ -265,6 +311,7 @@ int main(int argc, char** argv) {
                 sq::arith_name(sq::default_arith()));
     test_fp16();
     test_dequant(rows);
+    test_boundary(rows);
     for (sq::Type a : {sq::Type::Q8_0, sq::Type::Q8_1, sq::Type::Q8_K})
         if (only == nullptr || !std::strcmp(only, sq::type_info(a)->name)) test_act(a, rows);
     static const sq::Type kTypes[] = {sq::Type::Q2_0, sq::Type::Q4_0, sq::Type::Q4_1, sq::Type::Q5_0, sq::Type::Q5_1, sq::Type::Q8_0, sq::Type::IQ4_NL,

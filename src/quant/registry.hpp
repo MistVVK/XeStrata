@@ -26,4 +26,9 @@ ActTable avx2_act_table() noexcept;      // x86/act_avx2.cpp
 DotTable avx512_dot_table() noexcept;    // x86/dot_avx512.cpp   (Arith::Avx2 bits in 512-bit lanes, Isa::Avx512)
 #endif
 
+#ifdef STRATA_QUANT_ARM_TIERS
+DotTable neon_dot_table() noexcept;      // arm/dot_neon.cpp     (Arith::Neon, Isa::Neon)
+ActTable neon_act_table() noexcept;      // arm/act_neon.cpp
+#endif
+
 }  // namespace strata::quant
