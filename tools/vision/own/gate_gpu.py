@@ -8,7 +8,7 @@
 One strata-vision per reader (mtmd on the CPU unless --cpu-dir gives its files, mtmd on the GPU, own on the GPU), every picture through each.  Per picture:
   main      cosine(own GPU, mtmd CPU)              must be >= --min-cos (0.999)
   floor     cosine(mtmd GPU, mtmd CPU)             what users run today
-  no-worse  main >= floor                          our GPU tower is at least as close to mtmd-CPU as mtmd-GPU is
+  no-worse  main >= floor - 1e-4  or  main >= 0.9999   our GPU tower is at least as close to mtmd-CPU as mtmd-GPU is (the coordinator's tolerance, 11-09)
   info      cosine(own GPU, mtmd GPU), cosine(own GPU, float32 reference) (with --ref-dir)
 and the times of the two GPU readers (median of --repeat further encodes, after the first).  Exit 0 when every picture passes main and no-worse.  Standard library only.
 """
@@ -144,7 +144,7 @@ def main():
             ok_all = False
             continue
         m, f = float(main["global"]), float(floor["global"])
-        passed = (m >= 0.99) if a.skip_cpu else (m >= a.min_cos and m >= f - 1e-9)     # --skip-cpu: no error and the two GPU readers agree (0.99); the time and memory are the point
+        passed = (m >= 0.99) if a.skip_cpu else (m >= a.min_cos and (m >= f - 1e-4 or m >= 0.9999))     # rule 1: >= 0.999; rule 2: ours >= mtmd-GPU - 1e-4, or ours >= 0.9999 (coordinator, 11-09)  --skip-cpu: no error and the two GPU readers agree (0.99); the time and memory are the point
         ok_all &= passed
         main_c.append(m)
         floor_c.append(f)
