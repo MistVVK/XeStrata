@@ -20,6 +20,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/mf_train.hpp"
+#include "strata/image/qi_train.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -359,6 +360,86 @@ int main(int argc, char** argv) {
             save(dir, "dm", ho.data(), rows * 4);
             save(dir, "da", ho.data() + rows, rows * 4);
             save(dir, "db", ho.data() + 2 * rows, rows * 4);
+        } else if (op == "qiblock") {
+            // one Qwen-Image-2.1 block (qi_block) with plain LoRAs, what tools/image/qi_train_torch_ref.py writes:
+            // dims (C, heads, head_dim, F, rows, n_text), x, cos, sin, mod, nq, nk, dout FP32; w_<p> [N][K] FP16;
+            // ad_<p>_a [rank][K] and ad_<p>_b [N][rank] FP16 with ad_<p>_cfg (rank, scale) where the product has one
+            Var dims = load(dir, "dims");
+            const float* dv = dims.hf();
+            strata::image::QiBlockRun run;
+            run.C = (int64_t) dv[0];
+            run.heads = (int64_t) dv[1];
+            run.hd = (int64_t) dv[2];
+            run.F = (int64_t) dv[3];
+            run.rows = (int64_t) dv[4];
+            run.n_text = (int64_t) dv[5];
+            const int64_t C = run.C, F = run.F, R = run.rows;
+            strata::prefill::Gemm gemm;
+            std::string err;
+            if (!gemm.init(s, 1 << 24, err)) throw std::runtime_error(err);
+            std::deque<Dev> keep;
+            auto give = [&](const std::string& name) -> Dev& { return keep.emplace_back(load(dir, name)); };
+            auto fresh = [&](int64_t bytes) -> Dev& {
+                Dev& d = keep.emplace_back(Dev(bytes));
+                zero(d, bytes, s);
+                return d;
+            };
+            auto has = [&](const std::string& name) { return (bool) std::ifstream(dir + "/" + name + ".json"); };
+            run.x = give("x").cf();
+            run.cos = give("cos").cf();
+            run.sin = give("sin").cf();
+            run.mod = give("mod").cf();
+            run.nq = give("nq").cf();
+            run.nk = give("nk").cf();
+            run.dout = give("dout").cf();
+            const char* const kQi[6] = {"q", "k", "v", "o", "gate_up", "down"};
+            const int64_t N[6] = {C, C, C, C, 2 * F, C}, K[6] = {C, C, C, C, C, F};
+            train::Adapter ad[6];
+            for (int i = 0; i < 6; ++i) {
+                Dev& w = give(std::string("w_") + kQi[i]);
+                Dev& wt = fresh(N[i] * K[i] * 2);
+                train::transpose_f16(w.ch(), N[i], K[i], wt.h(), s);
+                run.p[i] = {N[i], K[i], w.ch(), wt.ch(), nullptr, nullptr};
+                const std::string pre = std::string("ad_") + kQi[i];
+                if (!has(pre + "_a")) continue;
+                Var cfg = load(dir, pre + "_cfg");
+                const int64_t rk = (int64_t) cfg.hf()[0];
+                ad[i].rank = rk;
+                ad[i].scale = cfg.hf()[1];
+                Dev& a = give(pre + "_a");
+                Dev& b = give(pre + "_b");
+                Dev& at = fresh(rk * K[i] * 2);
+                Dev& bt = fresh(rk * N[i] * 2);
+                train::transpose_f16(a.ch(), rk, K[i], at.h(), s);
+                train::transpose_f16(b.ch(), N[i], rk, bt.h(), s);
+                ad[i].a = a.h();
+                ad[i].b = b.h();
+                ad[i].at = at.h();
+                ad[i].bt = bt.h();
+                ad[i].dA = fresh(rk * K[i] * 4).f();
+                ad[i].dB = fresh(N[i] * rk * 4).f();
+                run.ad[i] = &ad[i];
+            }
+            Dev& out = fresh(R * C * 4);
+            Dev& dx = fresh(R * C * 4);
+            run.out = out.f();
+            run.dx = dx.f();
+            strata::image::qi_block(run, gemm, s);
+            strata::gpu::stream_sync(s);
+            std::vector<float> h((size_t) (R * C));
+            out.read(h.data(), R * C * 4);
+            save2(dir, "out", h.data(), R, C);
+            dx.read(h.data(), R * C * 4);
+            save2(dir, "dx", h.data(), R, C);
+            for (int i = 0; i < 6; ++i) {
+                if (run.ad[i] == nullptr) continue;
+                const int64_t rk = ad[i].rank;
+                std::vector<float> g((size_t) (rk * std::max(N[i], K[i])));
+                strata::gpu::copy(g.data(), ad[i].dA, (size_t) (rk * K[i]) * 4);
+                save2(dir, std::string("ad_") + kQi[i] + "_dA", g.data(), rk, K[i]);
+                strata::gpu::copy(g.data(), ad[i].dB, (size_t) (N[i] * rk) * 4);
+                save2(dir, std::string("ad_") + kQi[i] + "_dB", g.data(), N[i], rk);
+            }
         } else if (op == "block") {
             Var dims = load(dir, "dims");   // C, heads, head_dim, F, rows_img, rows_txt
             const int64_t C = (int64_t) dims.hf()[0], heads = (int64_t) dims.hf()[1], hd = (int64_t) dims.hf()[2];

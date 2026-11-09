@@ -134,6 +134,17 @@ inline float pow2_scale(float amax) {
     return amax > kRowLim ? sycl::exp2(sycl::ceil(sycl::log2(amax / kRowLim))) : 1.f;
 }
 
+// A training step's gradient rows, small or large: the power of two that brings the row's largest value into
+// [2^13, 2^14), up as well as down.  A gradient is often far below FP16's smallest normal value (6.1e-5: the LoRA
+// factors' gradients of Qwen-Image-2.1's real blocks sit near 1e-6), where FP16 keeps a few bits or none.
+// The exponent is read off the value's bits (a subnormal's as -127): sycl::ilogb inside this row kernel gave
+// 2^-144 for a row whose largest value was 2 (intel/llvm v7.2.0, the B70, 2026-11-09).
+inline float pow2_full(float amax) {
+    if (!(amax > 0.f)) return 1.f;
+    const int e = (int) ((sycl::bit_cast<uint32_t>(amax) >> 23) & 0xffu) - 127;
+    return sycl::bit_cast<float>((uint32_t) (sycl::clamp(e - 13, -126, 127) + 127) << 23);
+}
+
 // a BF16 tensor's values as FP16, in place, clamped to FP16's range (the DiTs' 16-bit weights)
 inline void bf16_to_f16_inplace(uint16_t* p, int64_t n, sycl::queue& q) {
     q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
@@ -208,7 +219,10 @@ template<class Op> struct Rows16 {
         const auto st = op.stats(t, lane, kSG, sum);
         float m = 0.f;
         for (int64_t c = lane; c < C; c += kSG) m = sycl::fmax(m, bound(op, t, c, st));
-        const float sc = pow2_scale(sycl::reduce_over_group(sg, m, sycl::maximum<float>()));
+        const float rmax = sycl::reduce_over_group(sg, m, sycl::maximum<float>());
+        float sc;
+        if constexpr (requires { Op::kFullRange; }) sc = pow2_full(rmax);
+        else sc = pow2_scale(rmax);
         const float inv = 1.f / sc;
         for (int64_t c = lane; c < C; c += kSG) y16[t * C + c] = f16_from_f32(op.value(t, c, st) * inv);
         if (lane == 0) {
@@ -369,6 +383,11 @@ struct Plain {
     int64_t C;
     template<class R> Stats stats(int64_t, int64_t, int64_t, R) const { return {}; }
     float value(int64_t t, int64_t c, const Stats&) const { return x[t * C + c]; }
+};
+
+// A training step's gradient rows [T][C] as they are, each at the power of two that fills FP16 (pow2_full), rows16's Op
+struct Grad : Plain {
+    static constexpr bool kFullRange = true;
 };
 
 // GELU (tanh form) of a product's output, rows16's Op
@@ -895,6 +914,17 @@ inline void silu_bwd(const float* y, const float* d, int64_t n, float* dy, void*
     q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
         const float v = y[id[0]], g = 1.f / (1.f + sycl::exp(-v));
         dy[id[0]] = d[id[0]] * g * (1.f + v * (1.f - g));
+    });
+}
+
+// SwiGlu's: g [T][2F] the fused product's output (the gate's F, then the up's F), d [T][F] the gradient of
+// silu(gate) * up; dg [T][2F] gets the gate's half d * up * silu'(gate) and the up's half d * silu(gate)
+inline void swiglu_bwd(const float* g, const float* d, int64_t T, int64_t F, float* dg, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (T * F)), [=](sycl::id<1> id) {
+        const int64_t i = static_cast<int64_t>(id[0]), t = i / F, c = i - t * F;
+        const float a = g[t * 2 * F + c], u = g[t * 2 * F + F + c], sg = 1.f / (1.f + sycl::exp(-a));
+        dg[t * 2 * F + c] = d[i] * u * sg * (1.f + a * (1.f - sg));
+        dg[t * 2 * F + F + c] = d[i] * a * sg;
     });
 }
 

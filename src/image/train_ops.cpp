@@ -76,7 +76,7 @@ void lora_bwd(const float* hr, const float* xr, const uint16_t* h16t, const uint
     uint16_t* dyt16 = dy16 + (int64_t) T * rows;    // [rows][T], dY's rows scaled by hr and transposed
     uint16_t* dht16 = dyt16 + (int64_t) rows * T;   // [rank][T], dh's rows scaled by xr and transposed
     float* rsY = rsT;                    // [T] dY's own row scales
-    dit_rows::rows16(dit_rows::Plain{dY, rows}, T, rows, dy16, rsY, stream);
+    dit_rows::rows16(dit_rows::Grad{{dY, rows}}, T, rows, dy16, rsY, stream);
     // dh = scale (dY B): the same product the forward read, with B's transposed view as the weight
     // dh is written whole here (every one of its T * rank values), so it is overwritten, not added into: the
     // caller passes scratch, which the probe leaves uninitialized (fresh device pages read as zero, which is the
@@ -186,7 +186,7 @@ float flow_loss(const float* v_pred, const float* x0, const float* eps, int64_t 
 float scaled_transpose_f16(const float* g, const float* rsX, int64_t rows, int64_t cols, uint16_t* out,
                               void* stream) {
     const int64_t n = rows * cols;
-    const float G = dit_rows::pow2_scale(
+    const float G = dit_rows::pow2_full(
         tensor_reduce(n,
                   [=](int64_t i) { return sycl::fabs(g[i] * (rsX != nullptr ? rsX[i / cols] : 1.f)); }, true,
                   stream));

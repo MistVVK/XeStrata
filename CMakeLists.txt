@@ -846,7 +846,8 @@ if(STRATA_ENABLE_XE)
                            src/image/cnet_edges.cpp src/image/cnet_pose.cpp
                            src/image/mf_vae.cpp src/image/mf_dit.cpp
                            src/image/mf_train.cpp src/image/train_ops.cpp src/image/train_adapter.cpp
-                           src/image/mf_train_block.cpp
+                           src/image/mf_train_block.cpp src/image/qi_train_block.cpp
+                           src/image/train_loop.cpp src/image/qi_trainer.cpp
                            src/image/mf_pipeline.cpp src/image/moss_text.cpp src/image/moss_dit.cpp
                            src/image/moss_pipeline.cpp
                            src/image/anima_dit.cpp src/image/anima_pipeline.cpp src/image/flow_sampler.cpp
@@ -1235,6 +1236,9 @@ if(STRATA_ENABLE_XE)
   # the smallest training loop (card 5): the model, one step, and the safetensors file it writes
   add_executable(strata-image-mf-train src/image/mf_trainer.cpp src/image/mf_train_main.cpp)
   target_link_libraries(strata-image-mf-train PRIVATE strata_image)
+  # a LoRA on Qwen-Image-2.1 as ai-toolkit trains one: its caches, its loop and one step for the reference to check
+  add_executable(strata-image-qi-train src/image/qi_train_main.cpp)
+  target_link_libraries(strata-image-qi-train PRIVATE strata_image)
   # the learning preprocessing's own tool (docs/LORA_TRAIN.md "The latent and text-embedding disk caches"):
   # Mage-VAE's encoder and the text states on the inference's path, one image at a time, for tools/image/mf_pre.py
   add_executable(strata-image-mf-pre src/image/mf_pre.cpp)
@@ -1265,15 +1269,24 @@ if(STRATA_ENABLE_XE)
                --probe $<TARGET_FILE:strata-image-mf-train-probe>
                --dir ${CMAKE_CURRENT_BINARY_DIR}/mf-block)
       set_tests_properties(mf_block_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
-      # the same block with both norms' modulations pushed past FP16's reach (Mage-Flow's own at a high sigma): every
-      # adapted product reads rows whose power of two is above 1, and v passes 65504.  The default cut keeps every
-      # row under kRowLim, so a scale an adapter drops (or v's) passes it unseen
+      # the same block with a norm's modulation pushed past FP16's reach (Mage-Flow's own at a high sigma), one norm a
+      # test: the first's makes q, k and v read rows whose power of two is above 1 and v pass 65504 (v_scale 4), the
+      # second's the MLP's rows.  The default cut keeps every row under kRowLim, so a scale an adapter drops (or v's)
+      # passes it unseen.  Both at once put the GELU's inputs near 5.5e4, where FP16's rounding of one value (about
+      # 27) moves the GELU's slope at the values near 0 and the gradients behind it by 1 to 4% in the engine and the
+      # reference alike: that is FP16's reach, not a scale's, so the two run apart (2026-11-09, B70)
       add_test(NAME mf_block_parity_rows
                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/image/mf_train_torch_ref.py
                --probe $<TARGET_FILE:strata-image-mf-train-probe>
-               --dir ${CMAKE_CURRENT_BINARY_DIR}/mf-block-rows --big-norm1 BIG1 --big-norm2 1e5 --grad-tol 1e-2
+               --dir ${CMAKE_CURRENT_BINARY_DIR}/mf-block-rows --big-norm1 1e5 --grad-tol 1e-2
                --adapter-grad-tol 1e-2)
       set_tests_properties(mf_block_parity_rows PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+      add_test(NAME mf_block_parity_rows_mlp
+               COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/image/mf_train_torch_ref.py
+               --probe $<TARGET_FILE:strata-image-mf-train-probe>
+               --dir ${CMAKE_CURRENT_BINARY_DIR}/mf-block-rows-mlp --big-norm2 1e5 --grad-tol 1e-2
+               --adapter-grad-tol 1e-2)
+      set_tests_properties(mf_block_parity_rows_mlp PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
       # the preprocessing's host side and the cache shape, no GPU and no models: the bucket rule against SPEC's three
       # worked sizes, the cover and crop bookkeeping, and the two .npz files read back through the stub tool.  The
       # engine's own values are AMD's (tools/image/mf_pre.py --golden against the inference goldens, records' §)

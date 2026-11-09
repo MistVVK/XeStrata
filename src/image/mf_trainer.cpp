@@ -791,7 +791,7 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
     train::transpose_f16(m->pout.w, m->in_ch, C, pout_wt, st);
     uint16_t* dv16 = tmp.get<uint16_t>(R * m->in_ch, st);
     float* dvrs = tmp.get<float>(R, st);
-    dit_rows::rows16(dit_rows::Plain{s.dv_pred, m->in_ch}, R, m->in_ch, dv16, dvrs, st);
+    dit_rows::rows16(dit_rows::Grad{{s.dv_pred, m->in_ch}}, R, m->in_ch, dv16, dvrs, st);
     float* dln = tmp.get<float>(R * C, st);
     float* dsums = tmp.get<float>(R * C, st);
     train::dgrad(dv16, dvrs, pout_wt, R, m->in_ch, C, dln, dsums, false, gemm, st);

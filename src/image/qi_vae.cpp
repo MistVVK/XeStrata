@@ -677,7 +677,7 @@ uint64_t QiVae::encode_scratch_bytes(int64_t H, int64_t W) const {
     return (uint64_t) n.big16 * 2 + (uint64_t) n.big32 * 4 * 3 + (uint64_t) n.keep * 4 + (uint64_t) n.col * 2;
 }
 
-bool QiVae::encode(const float* rgba, int64_t H, int64_t W, float* z) {
+bool QiVae::encode(const float* rgba, int64_t H, int64_t W, float* z, float* zstd) {
     if (!has_encoder_) return false;
     if (H % 16 != 0 || W % 16 != 0 || H <= 0 || W <= 0)
         throw std::invalid_argument("image engine (VAE): the sides must be multiples of 16");
@@ -729,6 +729,16 @@ bool QiVae::encode(const float* rgba, int64_t H, int64_t W, float* z) {
     kernels::f32_to_f16_bulk(y, a16_, H * W * eout_.out, s_);
     conv(quant_, a16_, H, W, t2_);
     norm_latent(t2_, H * W, quant_.out, pq_.in, mean_, std_, z, s_);
+    if (zstd != nullptr) {   // the posterior's log-variance: the quant conv's second half of channels
+        const float* h = t2_;
+        const int64_t HW = H * W, ch = quant_.out, C = pq_.in;
+        const float* sd = std_;
+        q_of(s_).parallel_for(sycl::range<1>((size_t) (C * HW)), [=](sycl::id<1> id) {
+            const auto i = static_cast<int64_t>(id[0]);
+            const int64_t c = i / HW, p = i - c * HW;
+            zstd[i] = sycl::exp(0.5f * sycl::clamp(h[p * ch + C + c], -30.f, 20.f)) / sd[c];
+        });
+    }
     gpu::stream_sync(s_);
     return true;
 }

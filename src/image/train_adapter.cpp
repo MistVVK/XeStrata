@@ -20,15 +20,27 @@ namespace {
 
 using kernels::f16_from_f32;
 
-// x = hi + lo to 2^-22, for an FP32 map the products read twice (the input gradient's dX is judged at 3e-5,
-// and an FP16 rounding of dh alone costs that budget)
-void ad_split16(const float* x, int64_t n, uint16_t* hi, uint16_t* lo, void* s) {
-    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const float v = x[id[0]];
-        const uint16_t h = kernels::f16_from_f32(v);
-        hi[id[0]] = h;
-        lo[id[0]] = kernels::f16_from_f32(v - kernels::f32_from_f16(h));
-    });
+// x = (hi + lo) rs[t] to 2^-22 of each row's largest value, for an FP32 gradient the products read twice (the input
+// gradient's dX is judged at 3e-5, and an FP16 rounding of dh alone costs that budget): each row at its own power of
+// two (pow2_full), so a small gradient keeps its bits in FP16 too.  A work-group a row.
+void ad_split16(const float* x, int64_t rows, int64_t cols, uint16_t* hi, uint16_t* lo, float* rs, void* s) {
+    constexpr int64_t kWG = 64;
+    dit_rows::q_of(s).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) (rows * kWG)), sycl::range<1>((size_t) kWG)),
+        [=](sycl::nd_item<1> it) {
+            const int64_t t = (int64_t) it.get_group_linear_id();
+            float m = 0.f;
+            for (int64_t c = (int64_t) it.get_local_linear_id(); c < cols; c += kWG)
+                m = sycl::fmax(m, sycl::fabs(x[t * cols + c]));
+            const float sc = dit_rows::pow2_full(sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>()));
+            for (int64_t c = (int64_t) it.get_local_linear_id(); c < cols; c += kWG) {
+                const float v = x[t * cols + c] / sc;
+                const uint16_t h = kernels::f16_from_f32(v);
+                hi[t * cols + c] = h;
+                lo[t * cols + c] = kernels::f16_from_f32(v - kernels::f32_from_f16(h));
+            }
+            if (it.get_local_linear_id() == 0) rs[t] = sc;
+        });
 }
 
 
@@ -111,7 +123,7 @@ void lokr_product_bwd(const Adapter* ad, const uint16_t* xt, const float* rsx, f
     // dY in FP16 rows with their scales, then the transposed apply: P1 = dY w2a, P2 = P1 w2b, dX = P2T w1t
     uint16_t* dy16 = tt;
     float* dyrs = trs;
-    dit_rows::rows16(dit_rows::Plain{dYv, N}, R, N, dy16, dyrs, stream);
+    dit_rows::rows16(dit_rows::Grad{{dYv, N}}, R, N, dy16, dyrs, stream);
     gemm.f16(dy16, ad->w2a, t1, R * ol, rk, ok);
     uint16_t* p1_16 = tt + (size_t) R * N;
     f16_copy(t1, R * ol * rk, p1_16, stream);
@@ -221,7 +233,7 @@ void ad_product_bwd(const Product& P, const Adapter* ad, const uint16_t* x16, co
         dYa = yd;                             // so dL/db = sum dY, not sum dYa
         dYb = yb;
     }
-    dit_rows::rows16(dit_rows::Plain{dYa, N}, R, N, t16, trs, stream);
+    dit_rows::rows16(dit_rows::Grad{{dYa, N}}, R, N, t16, trs, stream);
     dgrad(t16, trs, P.wt, R, N, K, dxv, sums, accumulate, gemm, stream);
     if (P.dw != nullptr) {
         const float gi = scaled_transpose_f16(dYa, rsx, R, N, t16t, stream);
@@ -240,10 +252,9 @@ void ad_product_bwd(const Product& P, const Adapter* ad, const uint16_t* x16, co
                     ltmp16, lrsT, gemm, stream);
         // dh lives in lscratch; h16 and h16t are dead and take its split (the input gradient's dX is judged
         // at 3e-5, and an FP16 rounding of dh alone costs that budget)
-        ad_split16(lscratch, R * ad->rank, h16, reinterpret_cast<uint16_t*>(h16t), stream);
-        dgrad(h16, nullptr, ad->at, R, ad->rank, K, dxv, sums, true, gemm, stream);
-        dgrad(reinterpret_cast<uint16_t*>(h16t), nullptr, ad->at, R, ad->rank, K, dxv, sums, true,
-                 gemm, stream);
+        ad_split16(lscratch, R, ad->rank, h16, reinterpret_cast<uint16_t*>(h16t), lrsT, stream);
+        dgrad(h16, lrsT, ad->at, R, ad->rank, K, dxv, sums, true, gemm, stream);
+        dgrad(reinterpret_cast<uint16_t*>(h16t), lrsT, ad->at, R, ad->rank, K, dxv, sums, true, gemm, stream);
         }
     }
 }

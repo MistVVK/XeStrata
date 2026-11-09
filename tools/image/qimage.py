@@ -173,6 +173,9 @@ FILES = {
                   "2ead1ee665e8ebc5fec517d287a167f5c6a7e985acbf3b1b93143437a04616ac"),
     "base-Q8_0": (_BASE, "qwen-image-2.1-Q8_0.gguf", 7_640_860_384,
                   "c0ed4b2ffd56cbe9c3df1e4a4098045256484ebe94ba5a7e4338d35ec046baa5"),
+    # the base DiT in F16 (its bf16 values, every one of which F16 holds): LoRA training's base, not inference's
+    "base-F16": (_BASE, "qwen-image-2.1-F16.gguf", 14_230_275_808,
+                 "8aa239e5ddb28d4641942231396d7171da41ad305ea401dd92a7d6410bde798d"),
     "vae": ("unsloth/Qwen-Image-2.1-FP8", "vae/qwen_image_2.1_vae_bf16.safetensors", 675_508_656,
             "71879ffd5321e6d10c3c87513e2b474b1252efa7f3dec2969214a9bf06a6dd5c"),
     # the text encoders, "llm-<encoder>-<TEXT_QUANTS>"

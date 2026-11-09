@@ -38,8 +38,10 @@ public:
 
     /// The encoder (a reference image for an edit): z [64][H / 16][W / 16] (device FP32, the DiT's latent, normalized
     /// as the decoder's input is) from rgba [4][H][W] (device FP32, 0 .. 1), H and W multiples of 16.  False when the
-    /// VAE file has no encoder.
-    bool encode(const float* rgba, int64_t H, int64_t W, float* z);
+    /// VAE file has no encoder.  zstd (null: not taken) gets the posterior's standard deviation in the same normalized
+    /// units, exp(logvar / 2) / the latent's sd, logvar clamped to [-30, 20] as diffusers' DiagonalGaussianDistribution
+    /// does: a training step draws z + zstd eps from them, as ai-toolkit's latent_dist.sample() does.
+    bool encode(const float* rgba, int64_t H, int64_t W, float* z, float* zstd = nullptr);
     bool has_encoder() const { return has_encoder_; }
     /// The GPU memory an encode of an H x W image works in.
     uint64_t encode_scratch_bytes(int64_t H, int64_t W) const;
