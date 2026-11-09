@@ -257,6 +257,7 @@ void run_bench(int mb, const std::vector<int>& nts) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    ggml_cpu_init();   // the oracle's own tables (native_fmt used to do it; the pool no longer calls ggml-cpu with STRATA_OWN_CPU_QUANT)
     bool bench = false;
     int mb = 128, cpu_pin = -1;
     std::vector<int> nts = {1, 2, 4};

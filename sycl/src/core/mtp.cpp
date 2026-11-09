@@ -49,8 +49,34 @@
 #include <immintrin.h>
 #endif
 
-#ifdef STRATA_NATIVE_EXPERTS
-#include "ggml.h"   // --mtp-q4: the head rows' and projections' formats, dequantized and requantized at load
+// --mtp-q4: the head rows' and projections' formats, dequantized and requantized at load: with the Strata quant layer (STRATA_OWN_CPU_QUANT) or, as
+// before, with ggml-base
+#if defined(STRATA_OWN_CPU_QUANT)
+#include "strata/quant/act.hpp"
+#include "strata/quant/dequant.hpp"
+#define STRATA_MTP_Q4 1
+#elif defined(STRATA_NATIVE_EXPERTS)
+#include "ggml.h"
+#define STRATA_MTP_Q4 1
+#endif
+
+#ifdef STRATA_MTP_Q4
+namespace {
+#if defined(STRATA_OWN_CPU_QUANT)
+bool mtp_to_float(int type, const void* src, float* dst, int64_t n) {
+    return strata::quant::dequant_row((strata::quant::Type) type, src, dst, n);
+}
+void mtp_quant_q4_0(const float* x, void* dst, int64_t n) { strata::quant::quantize_q4_0_ref(x, dst, n); }
+#else
+bool mtp_to_float(int type, const void* src, float* dst, int64_t n) {
+    const auto* t = ggml_get_type_traits((ggml_type) type);
+    if (t == nullptr || t->to_float == nullptr) return false;
+    t->to_float(src, dst, n);
+    return true;
+}
+void mtp_quant_q4_0(const float* x, void* dst, int64_t n) { ggml_quantize_chunk(GGML_TYPE_Q4_0, x, dst, 0, 1, n, nullptr); }
+#endif
+}  // namespace
 #endif
 
 namespace strata::core {
@@ -193,7 +219,7 @@ const void* MtpDrafter::wq(const char* name, int& type) const {
 
 // --mtp-q4: every Q8_0 tensor of dense.bin as Q4_0 (ggml's reference quantizer), in one device buffer
 bool MtpDrafter::make_q4_dense(const std::vector<uint8_t>& blob, std::string& err) {
-#ifdef STRATA_NATIVE_EXPERTS
+#ifdef STRATA_MTP_Q4
     uint64_t total = 0;
     std::vector<std::pair<const Tensor*, uint64_t>> plan;
     for (const auto& t : tensors_) {
@@ -203,14 +229,12 @@ bool MtpDrafter::make_q4_dense(const std::vector<uint8_t>& blob, std::string& er
     }
     std::vector<uint8_t> host((size_t) total);
     std::vector<float> row;
-    const auto* q8t = ggml_get_type_traits(GGML_TYPE_Q8_0);
     for (const auto& [t, off] : plan) {
         row.resize((size_t) t->cols);
         const uint64_t in_row = (uint64_t) (t->cols / 32) * 34, out_row = (uint64_t) (t->cols / 32) * 18;
         for (int64_t r = 0; r < t->rows; ++r) {
-            q8t->to_float(blob.data() + t->off + (uint64_t) r * in_row, row.data(), t->cols);
-            ggml_quantize_chunk(GGML_TYPE_Q4_0, row.data(), host.data() + off + (uint64_t) r * out_row, 0, 1, t->cols,
-                                nullptr);
+            if (!mtp_to_float(GGML_Q8_0, blob.data() + t->off + (uint64_t) r * in_row, row.data(), t->cols)) { err = "mtp: --mtp-q4 cannot read a Q8_0 projection"; return false; }
+            mtp_quant_q4_0(row.data(), host.data() + off + (uint64_t) r * out_row, t->cols);
         }
         q4_off_.push_back({t->name, off});
     }
@@ -229,10 +253,9 @@ bool MtpDrafter::make_q4_dense(const std::vector<uint8_t>& blob, std::string& er
 
 // --mtp-q4: the draft head's subset rows as Q4_0 (dequantized from the main head's format)
 bool MtpDrafter::make_q4_head(std::string& err) {
-#ifdef STRATA_NATIVE_EXPERTS
+#ifdef STRATA_MTP_Q4
     const int64_t N = g_->n_embd;
-    const auto* tt = ggml_get_type_traits((ggml_type) head_->type());
-    if (tt == nullptr || tt->to_float == nullptr || N % 32 != 0) { err = "mtp: --mtp-q4 cannot read the head's format"; return false; }
+    if (N % 32 != 0) { err = "mtp: --mtp-q4 cannot read the head's format"; return false; }
     // SYCL port: with STRATA_Q6_PLANAR the head is stored as planes, and the subset this builds from is row-major
     // only when the head is packed - the gather at load time then copies planes as if they were rows.  The result is
     // a draft head that proposes nothing at all (measured: 0 drafts, decode 73.8 -> 35.3 tok/s) with no error, so
@@ -247,8 +270,8 @@ bool MtpDrafter::make_q4_head(std::string& err) {
     catch (sycl::exception const&) { err = "mtp: reading the draft head"; return false; }
     std::vector<float> row((size_t) N);
     for (int64_t r = 0; r < n_dvocab_; ++r) {
-        tt->to_float(src.data() + (size_t) r * in_row, row.data(), N);
-        ggml_quantize_chunk(GGML_TYPE_Q4_0, row.data(), dst.data() + (size_t) r * out_row, 0, 1, N, nullptr);
+        if (!mtp_to_float(head_->type(), src.data() + (size_t) r * in_row, row.data(), N)) { err = "mtp: --mtp-q4 cannot read the head's format"; return false; }
+        mtp_quant_q4_0(row.data(), dst.data() + (size_t) r * out_row, N);
     }
     // the Q4_0 rows replace the subset in place (they are smaller)
     try { dpct::get_in_order_queue().memcpy(dhead_, dst.data(), dst.size()).wait(); }
