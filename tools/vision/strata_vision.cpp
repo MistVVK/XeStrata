@@ -21,6 +21,7 @@
 #include "llama.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "own_reader.h"
 
 #include <algorithm>
 #if !defined(_WIN32)
@@ -90,6 +91,7 @@ int main(int argc, char** argv) {
     int threads = 0, max_tokens = 0, min_tokens = 0;
     llama_flash_attn_type fa = LLAMA_FLASH_ATTN_TYPE_AUTO;
     bool fa_given = false;
+    std::string tower = "mtmd";   // --tower mtmd|own|auto: whose picture reader runs (own-stack phase 3).  mtmd stays the default until the gates pass.
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -99,6 +101,10 @@ int main(int argc, char** argv) {
         if (a == "--mmproj") mmproj = next();
         else if (a == "--model") model = next();
         else if (a == "--gpu") gpu = true;
+        else if (a == "--tower") {
+            tower = next();
+            if (tower != "mtmd" && tower != "own" && tower != "auto") { std::fprintf(stderr, "--tower takes mtmd, own or auto\n"); return 2; }
+        }
         else if (a == "--version") {
 #ifdef STRATA_VISION_HIP
             std::printf("strata-vision hip (GPU architectures: %s)\n", STRATA_VISION_HIP_ARCHS);
@@ -122,7 +128,12 @@ int main(int argc, char** argv) {
         }
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
-    if (mmproj.empty() || model.empty()) {
+    // auto: our tower where it can read this file on this backend, else mtmd
+    if (tower == "auto") {
+        std::string why;
+        tower = !mmproj.empty() && strata_vit::own_reader_supported(mmproj, gpu, why) ? "own" : "mtmd";
+    }
+    if (mmproj.empty() || (model.empty() && tower != "own")) {   // our tower needs no text model: it never tokenizes
         std::fprintf(stderr, "usage: strata-vision --mmproj <mmproj.gguf> --model <model.gguf> [--gpu] [--threads N] "
                              "[--max-tokens N] [--min-tokens N] [--flash-attn on|off|auto]\n");
         return 2;
@@ -137,6 +148,15 @@ int main(int argc, char** argv) {
         setenv("CUDA_VISIBLE_DEVICES", "-1", 1);
         setenv("HIP_VISIBLE_DEVICES", "-1", 1);
 #endif
+    }
+    if (tower == "own") {
+        strata_vit::OwnReaderOptions o;
+        o.mmproj = mmproj;
+        o.gpu = gpu;
+        o.threads = threads;
+        o.max_tokens = max_tokens;
+        o.min_tokens = min_tokens;
+        return strata_vit::own_reader_run(o);
     }
     llama_log_set(quiet_log, nullptr);
     mtmd_helper_log_set(quiet_log, nullptr);

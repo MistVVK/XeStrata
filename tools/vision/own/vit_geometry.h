@@ -34,6 +34,7 @@ struct VitGeometry {
     bool gated_ffn = false;           // an ffn_gate tensor
     bool fused_qkv = true;            // attn_qkv (else attn_q / attn_k / attn_v)
     int patch_taps = 2;               // v.patch_embd.weight and .1 (the two temporal taps of the 3D patch embed, summed for a still image)
+    bool pre_ln = false;              // a v.pre_ln.* norm before the first layer
     int window_pattern = 0;           // clip.vision.n_wa_pattern (0: every layer attends globally)
     std::vector<int> deepstack;       // layer indices that feed an extra output (clip.vision.is_deepstack_layers)
     float rope_theta = 10000.0f;

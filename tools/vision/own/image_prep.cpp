@@ -10,6 +10,7 @@
 #include <cstring>
 
 #define STBI_NO_STDIO
+#define STB_IMAGE_STATIC            // private to this file: the mtmd build of strata-vision has its own copy of stb_image
 #define STB_IMAGE_IMPLEMENTATION
 #include "stb_image.h"
 

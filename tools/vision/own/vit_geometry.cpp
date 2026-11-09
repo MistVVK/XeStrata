@@ -66,6 +66,7 @@ bool vit_geometry_from_gguf(const Gguf& gg, VitGeometry& g, std::string& err) {
     g.fused_qkv = gg.tensor(blk(0, "attn_qkv", "weight")) != nullptr;
     g.gated_ffn = gg.tensor(blk(0, "ffn_gate", "weight")) != nullptr;
     g.patch_taps = gg.tensor("v.patch_embd.weight.1") != nullptr ? 2 : 1;
+    g.pre_ln = gg.tensor("v.pre_ln.weight") != nullptr;
     std::vector<int64_t> ds;
     if (gg.get_int_array("clip.vision.is_deepstack_layers", ds))
         for (size_t i = 0; i < ds.size(); ++i) if (ds[i]) g.deepstack.push_back((int) i);
@@ -113,6 +114,7 @@ bool vit_geometry_supported(const VitGeometry& g, std::string& why) {
     if (g.gated_ffn) { why = "a gated FFN"; return false; }
     if (!g.fused_qkv) { why = "separate q/k/v projections"; return false; }
     if (g.window_pattern != 0) { why = "window attention"; return false; }
+    if (g.pre_ln) { why = "a norm before the first layer"; return false; }
     if (!g.deepstack.empty()) { why = "deepstack outputs"; return false; }
     if (g.head_dim % 4 != 0) { why = "a head size that is not a multiple of 4 (the 2D rotary splits it in 4)"; return false; }
     if (g.merge != 2) { why = "a merge size other than 2"; return false; }
