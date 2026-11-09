@@ -2,9 +2,9 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-# Strata for Linux: the first run installs everything and starts the model; later runs just start it.
-# Needs the Intel GPU driver (xe) and Intel oneAPI (DPC++, oneMKL). Python (with venv) is installed through
-# apt/dnf/pacman if it is missing (asks for sudo).
+# XeStrata for Linux: the first run installs everything and starts the model; later runs just start it.
+# Python (with venv) is installed through apt/dnf/pacman if it is missing (asks for sudo); setup.py then checks the
+# GPU makers' drivers and runtimes and says how to install what is missing.
 # NixOS (or XESTRATA_UV=1) with uv installed: uv makes the project venv; every other Linux uses the standard venv.
 cd "$(dirname "$0")" || exit 1
 # Python 3.10+ that can make a venv WITH pip: Debian/Ubuntu ship `venv` without `ensurepip` (that is the separate

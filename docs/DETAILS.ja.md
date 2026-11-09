@@ -1145,6 +1145,9 @@ print(r.choices[0].message.content)
   `max_tokens` が文脈を超える要求は、`max_tokens` を残りの余地まで縮めて受け付けます（Claude Code などのエージェントは毎回 32,000 を求めます）。思考の上限も縮めた値に従います（upstream f31b6efd6）。
   llama.cpp と同じく断る（400）には、`xestrata-<model>.json` に `"fit_max_tokens": false` を書くか、`serve/server.py` に `--no-fit-max-tokens` を渡します。
   余地がまったくないプロンプトは、いつも断ります。
+- **モデルの名前**: setup は、モデルを setup の質問と同じ段で名付けます。モデル、版（元のモデルでないとき）、量子化、大きさの順で、たとえば SC117 の Swift 1.5 の GSQ-RCO の IQ3_XXS は `qwen3.8-flash-next-swift-sc117-gsq-rco-iq3_xxs` です。
+  `/v1/models` の `id` と、応答の `model` がこの名前になります。
+  2026-11-09 より前に入れたモデルは、setup をもう一度走らせるとこの名前になり、前の名前（`qwen3.8-flash-next-iq3_xxs` など）は別名として残ります。
 - **モデルの別名**: `xestrata-<model>.json` に `"aliases": ["qwen", "local-model"]` を書くと、`/v1/models` にその名前でも並びます。
   それぞれが自分の `id` を持ち、モデルの `aliases` にも入ります（llama-server の `--alias` と同じ）。
   別名で呼ばれた要求には、その名前で答えます。

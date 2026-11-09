@@ -1210,6 +1210,9 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   A request whose `max_tokens` would run past the context is answered with `max_tokens` shortened to the room left (agents such as Claude Code ask for 32,000 on every request); the thinking budget follows the shortened cap (upstream f31b6efd6).
   For the strict llama.cpp behaviour (400), set `"fit_max_tokens": false` in `xestrata-<model>.json` or pass `--no-fit-max-tokens` to `serve/server.py`.
   A prompt that leaves no room at all is always refused.
+- **Model names.** Setup names a model by the levels of its questions: the model, the version (when it is not the original), the quantization and the size; SC117's Swift 1.5 in GSQ-RCO's IQ3_XXS, for example, is `qwen3.8-flash-next-swift-sc117-gsq-rco-iq3_xxs`.
+  The `id` in `/v1/models` and the `model` of the replies are this name.
+  A model installed before 2026-11-09 takes it when setup is run again, and its earlier name (`qwen3.8-flash-next-iq3_xxs` and the like) stays an alias.
 - **Model aliases.** `"aliases": ["qwen", "local-model"]` in `xestrata-<model>.json` lists the model under those names too in `/v1/models`
   (each with its own `id`, and in the model's `aliases`), like llama-server's `--alias`.
   A request naming one is answered under that name.

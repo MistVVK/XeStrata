@@ -719,7 +719,9 @@ def run(cfg_path: Path, data: Path, gpus: list[dict], verbose: bool = False, ori
         rec["verbose"]["kernels"] = kernel_bench(xe.cmd[0], xe.env, xe.cwd, arg_of(cfg["args"], "--pack"),
                                                  extra_dir / "kernel-bench.txt")
         rec["verbose"]["fingerprint"] = {t: [r.get("output_sha256_64") for r in runs] for t, runs in gen.items()}
-        ref = REFS / f"{cfg.get('model_name')}.csv"
+        # the model's reference, also one kept under a name it had before (its aliases)
+        ref = next((REFS / f"{x}.csv" for x in [cfg.get("model_name"), *(cfg.get("aliases") or [])]
+                    if (REFS / f"{x}.csv").exists()), REFS / f"{cfg.get('model_name')}.csv")
         if ref.exists() and not split:
             say("  The answer against the development machine's (top-1 agreement) ...")
             log = extra_dir / "reference-1k.txt"

@@ -5324,6 +5324,31 @@ def tier_of(family: str) -> tuple:
     return TIERS.get(family) or (CUSTOM, "original", "own")
 
 
+def served_name(family: str, size: str) -> str:
+    """The name the server answers to (the run config's "model_name"), by the same levels as setup's questions: the
+    model, its version where it is not the original, the quantization, the size (SC117's Swift 1.5 in GSQ-RCO's
+    IQ3_XXS: qwen3.8-flash-next-swift-sc117-gsq-rco-iq3_xxs).  A level the next one already says is left out
+    (HauhauCS's version is HauhauCS's files; a Gyro size begins with "gyro-"; of GSQ-RCO by pfeifferj only "pfeifferj"
+    comes before a "gsq-rco-" size).  A model of the user's own files keeps its family's name and the size.  The name
+    before 2026-11-09 (legacy_name) stays an alias of a config setup writes again (carry_over)."""
+    if family not in TIERS:
+        return legacy_name(family, size)
+    model, version, _ = TIERS[family]
+    quant, s = size_quantizer(family, size), size.lower()
+    parts = [BASES[model].lower()]
+    if version != "original":
+        parts.append(version)
+    if quant != version and not s.startswith(quant + "-"):
+        method = next((m for m in QUANTIZERS if quant.startswith(m + "-") and s.startswith(m + "-")), None)
+        parts.append(quant[len(method) + 1:] if method else quant)
+    return "-".join(parts + [s])
+
+
+def legacy_name(family: str, size: str) -> str:
+    """A family's served name before the levels (2026-11-09): its table's "name" and the size"""
+    return f"{FAMILIES[family]['name']}-{size.lower()}"
+
+
 def tier_families(base: str | None = None, variant: str | None = None, fams=None) -> list:
     """The families of a model (and a version), in the order setup lists them"""
     order = list(BASES)
@@ -6282,7 +6307,7 @@ def gpu_sel(value) -> list:
     return sel
 
 
-def hardware_key(cfg: dict) -> str:
+def hardware_key(cfg: dict, name: str | None = None) -> str:
     """What a calibration is valid for: this GPU, CPU and RAM, and the model with its context and images setting
     (the context's KV cache and the image encoder take VRAM from the expert cache)."""
     sel = cfg.get("gpu")
@@ -6295,7 +6320,17 @@ def hardware_key(cfg: dict) -> str:
     a = cfg.get("args", [])
     ctx = a[a.index("--max-context") + 1] if "--max-context" in a else "?"
     return "|".join([g.get("name", "?"), f"{g.get('vram_gb', 0):.0f}GB", cpu_info()[0], f"{ram_gb():.0f}GB",
-                     cfg.get("model_name", "?"), ctx, "images" if "--vision" in a else "text"])
+                     name or cfg.get("model_name", "?"), ctx, "images" if "--vision" in a else "text"])
+
+
+def saved_for(table: str, cfg: dict):
+    """What settings.json's `table` holds for this PC and model (hardware_key), also when it was kept under a name the
+    model had before (its config's aliases: setup's names before served_name)"""
+    got = load_settings().get(table) or {}
+    for name in [cfg.get("model_name"), *(cfg.get("aliases") or [])]:
+        if isinstance(name, str) and hardware_key(cfg, name) in got:
+            return got[hardware_key(cfg, name)]
+    return None
 
 
 # What the engine and setup fit to the PC by themselves, said wherever the tuning is offered or asked for
@@ -6376,7 +6411,7 @@ def bench_config(cfg_path: Path, data: Path, verbose: bool, original: str | None
 
 def saved_calibration(cfg: dict) -> dict | None:
     """The settings an earlier calibration found for this PC and model, if any."""
-    return (load_settings().get("calibration") or {}).get(hardware_key(cfg))
+    return saved_for("calibration", cfg)
 
 
 def repoint_engine(cfg_path: Path, cfg: dict) -> dict:
@@ -7081,7 +7116,7 @@ def fix_vram_free(cfg_path: Path, free_mib: int) -> None:
 def saved_vram_free(cfg: dict) -> str | None:
     """The free VRAM an earlier warm-up saw for this PC and model, less the margin (fix_vram_free), if any; not a 0 an
     engine that could not read it left (start_free_mib)."""
-    v = (load_settings().get("vram_free_mib") or {}).get(hardware_key(cfg))
+    v = saved_for("vram_free_mib", cfg)
     return v if v not in (None, "0") else None
 
 
@@ -7125,7 +7160,7 @@ def fix_prefill_share(cfg_path: Path, share: float) -> None:
 
 def saved_prefill_share(cfg: dict) -> str | None:
     """The prompt CPU share an earlier warm-up measured for this PC and model (fix_prefill_share), if any."""
-    return (load_settings().get("prefill_cpu_share") or {}).get(hardware_key(cfg))
+    return saved_for("prefill_cpu_share", cfg)
 
 
 # upstream #629: the run config's keys setup writes itself (and rewrites on every setup run); any other key is the
@@ -7192,10 +7227,29 @@ def parallel_note(asked: int | None, vram_gb: float, arena_gb: float, ctx: int, 
 
 # user's - a "sampling" or "mcp_servers" block, "cors_origins", "open_browser" - and is kept when setup runs again, as
 # are "host" and "api_key" when this run does not give them
-SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "gpu_pci",
-                        "draft_vocab", "ple_io", "vision", "custom"})
+SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "family", "log", "lib_dirs", "port",
+                        "gpu_pci", "draft_vocab", "ple_io", "vision", "custom"})
 SPLIT_KEYS = frozenset({"split_pci", "layer_split"})
 SETUP_VISION = frozenset({"exe", "mmproj", "model", "gpu", "gpu_pci", "max_tokens", "threads", "onednn", "fallback"})
+
+
+def keep_old_names(cfg: dict, old_path: Path | None) -> None:
+    """The earlier config's served names (its "model_name" when served_name changed it, and its "aliases") as this
+    config's aliases, before anything looks the model up by name: what an earlier warm-up or calibration measured is
+    kept under the name of that time (hardware_key), and clients may still ask for it."""
+    try:
+        old = json.loads(old_path.read_text(encoding="utf-8-sig")) if old_path is not None else None
+    except (OSError, ValueError):
+        old = None
+    if not isinstance(old, dict) or "aliases" in cfg:
+        return
+    names = [x for x in (old.get("aliases") or []) if isinstance(x, str)]
+    was = old.get("model_name")
+    if isinstance(was, str) and was and was != cfg.get("model_name") and was not in names:
+        names.append(was)
+        ok(f"the model's name is {cfg.get('model_name')} now; {was} stays an alias it answers to")
+    if names:
+        cfg["aliases"] = names
 
 
 def carry_over(old: dict, cfg: dict, gpus_chosen: bool = False) -> list[str]:
@@ -7682,7 +7736,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     elif a.low_ram == "resident":
         ok("low-RAM mode: the engine keeps in RAM what the GPU does not hold as far as the RAM allows (its default)")
     cfg: dict[str, Any] = {"exe": str(eng / EXE), "args": args, "cwd": str(STATE),
-                           "tokenizer": str(tok_dir / "tokenizer"), "model_name": f"{fam['name']}-{model.lower()}",
+                           "tokenizer": str(tok_dir / "tokenizer"), "model_name": served_name(family, model),
+                           "family": family,
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
         cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (XESTRATA_GPU_PCI)
@@ -7748,6 +7803,7 @@ def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images
     STATE.mkdir(parents=True, exist_ok=True)
     if getattr(a, "custom", None):                     # a model of the user's own files: what setup read of them
         cfg["custom"] = a.custom
+    keep_old_names(cfg, cfg_path if cfg_path.is_file() else adopted)
     cal = saved_calibration(cfg) if tune else None
     if cal is not None:
         sys.path.insert(0, str(ROOT / "tools"))
@@ -9323,7 +9379,7 @@ def main() -> int:
                  "--cvec-mode", "project", "--cvec-dir", "per-layer"]
     cfg: dict[str, Any] = {"exe": str(eng / EXE), "args": args, "cwd": str(STATE),
                            "tokenizer": str(pack / "tokenizer"),
-                           "model_name": f"{fam['name']}-{model.lower()}",
+                           "model_name": served_name(family, model), "family": family,
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
         cfg["gpu_pci"] = gpu["pci"]                    # the engine takes its GPU by PCI address (XESTRATA_GPU_PCI)

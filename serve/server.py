@@ -3432,7 +3432,11 @@ def learned_profile_args(cfg: dict, args: list[str]) -> list[str]:
     "expert_profile_save": false keeps the config's arguments as they are."""
     save = cfg.get("expert_profile_save")
     if save is None and "--expert-profile" in args[:-1]:
-        save = "expert-profile-" + re.sub(r"[^\w.-]", "_", str(cfg.get("model_name") or "model")) + ".bin"
+        # under the model's name, or the one an earlier name (its aliases: setup's names before 2026-11-09) saved
+        files = ["expert-profile-" + re.sub(r"[^\w.-]", "_", str(x)) + ".bin"
+                 for x in [cfg.get("model_name") or "model", *(cfg.get("aliases") or [])] if isinstance(x, str)]
+        here = cfg.get("cwd") or "."
+        save = next((f for f in files if os.path.isfile(os.path.join(here, f))), files[0])
     if not isinstance(save, str) or not save.strip() or "--expert-profile-save" in args:
         return args
     args = args + ["--expert-profile-save", save]
@@ -10625,15 +10629,16 @@ def card_family(cfg: dict) -> str | None:
     gives every qwen4exp file the set, "qwen4exp"), Qwen3.6-35B-A3B and Qwen3.5-9B ("qwen35moe"), HauhauCS's Qwen3.5-9B
     ("hauhaucs"), Ornith-1.5 ("ornith"), dealignai's Ornith-1.5 ("dealignai"), GLM-5.3-Flash ("glm5"); None for
     llm-jp (its card names no sampling), which stays greedy unless the request or the config's `sampling` block says
-    otherwise.  By the model's name, as the architecture alone does not tell Qwen3.6 from Ornith."""
+    otherwise.  By the model's name (setup's served_name, or its name before 2026-11-09), as the architecture alone
+    does not tell Qwen3.6 from Ornith."""
     name = str(cfg.get("model_name") or "qwen3.8-flash-next").lower()
     if name.startswith(("qwen3.8", "swift")) or "gyro" in name:
         return "qwen4exp"
-    if name.startswith("qwen3.5") and "uncensored" in name:
+    if name.startswith("qwen3.5") and ("uncensored" in name or "-hauhaucs-" in name):
         return "hauhaucs"
     if name.startswith(("qwen3.6", "qwen3.5")):
         return "qwen35moe"
-    if name.startswith("ornith") and "uncensored" in name:
+    if name.startswith("ornith") and ("uncensored" in name or "-dealignai-" in name):
         return "dealignai"
     if name.startswith("ornith"):
         return "ornith"

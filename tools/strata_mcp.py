@@ -618,7 +618,11 @@ class Strata:
         exact = [c for c in have if c.stem[len(CONFIG):] == m]
         if exact:
             return exact[0]
-        by_name = [c for c in have if str(self.read_config(c).get("model_name", "")).lower() == m]
+
+        def names(c):                                  # its model name and aliases (setup's names before 2026-11-09)
+            cfg = self.read_config(c)
+            return [str(x).lower() for x in [cfg.get("model_name", ""), *(cfg.get("aliases") or [])]]
+        by_name = [c for c in have if m in names(c)]
         if by_name:
             return by_name[0]
         ends = [c for c in have if c.stem.endswith("-" + m)]

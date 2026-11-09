@@ -5,9 +5,10 @@
 
 XeStrata's messages, logs, environment variables, programs, API fields and documents say xestrata (XESTRATA_*);
 strata alone is upstream's name, and an upstream sync brings it back.  This lint reads the string literals of the
-C++ and Python files, the documents (Markdown) and the web app (JavaScript, HTML, the locales), and reports a
-`strata` that is not part of `xestrata`, outside the uses ALLOWED keeps: the namespace and include paths, the file
-names, the CMake options, the API fields and markers shared with upstream, and the credits.  In the documents,
+C++, Python and F# files, the shell scripts' code (not their comments), the documents (Markdown) and the web app
+(JavaScript, HTML, the locales), and reports a `strata` that is not part of `xestrata`, outside the uses ALLOWED
+keeps: the namespace and include paths, the file names, the CMake options and targets, the API fields and markers
+shared with upstream, an old STRATA_<name> a script still reads after XESTRATA_<name>, and the credits.  In the documents,
 `Strata` is upstream's name and stays.  A line of code whose comment says upstream (or an earlier name) speaks of
 upstream's engine and is not read; a document marks what it says of the names themselves with
 <!-- upstream-name: off --> and <!-- upstream-name: on -->.  Without files it checks every tracked file it reads.
@@ -46,9 +47,12 @@ ALLOWED = [
     # the symbols a kernel module exports, read by name (dlsym)
     r'\bstrata_(?:kitchen|i8_gemm)\w*', r'(?<![\w.])strata_sdpa_aotriton(?![\w.])',
     # CMake's targets and variables, which keep upstream's names (the programs' names are xestrata-*)
-    r'--target strata\b', r'\bstrata_(?:hip_cxx|warnings)\b',
+    r'--target (?:strata[\w-]*(?:\s+|$))+', r'\bstrata_(?:hip_cxx|warnings)\b',
+    r'targets="(?:strata[\w-]*\s+)+',
+    # a shell script's old name, read after XeStrata's: ${XESTRATA_X:-${STRATA_X:-}}
+    r'\$\{STRATA_[A-Z0-9_]+:-',
     # upstream's own things: its SYCL port, a variable of its that XeStrata did not take
-    r'strata-sycl', r"f7eaf2de(?:'s| の) STRATA_EXPDEC",
+    r'strata-sycl', r'build-sycl-aot/strata\b', r"f7eaf2de(?:'s| の) STRATA_EXPDEC",
     # the old names, where a document says they are read too
     r'`STRATA_\*`',
     # a heading's anchor (the headings of upstream's versions)
@@ -62,6 +66,8 @@ ALLOWED = [
 ALLOWED_RE = re.compile('|'.join(ALLOWED))
 
 CPP = {'.cpp', '.hpp', '.h', '.cc', '.inc', '.cu'}
+FS = {'.fs', '.fsx'}
+SHELL = {'.sh'}
 DOC = {'.md'}
 WEB = {'.js', '.html', '.json'}
 
@@ -153,11 +159,26 @@ def js_lines(text: str):
         yield i, re.sub(r'(^|\s)//.*', '', ln)
 
 
+def fs_strings(text: str):
+    """(line, literal) for each string literal of an F# file: its (* ... *) comments aside, then read as C++ is (the
+    // comments, "..." strings)."""
+    text = re.sub(r'\(\*.*?\*\)', lambda m: '\n' * m.group(0).count('\n'), text, flags=re.S)
+    return cpp_strings(text)
+
+
+def sh_lines(text: str):
+    """The lines of a shell script without its comments (a # at the start of a line or after a blank; $# and ${#x}
+    are not comments)."""
+    for i, ln in enumerate(text.splitlines(), 1):
+        yield i, re.sub(r'(^|\s)#.*', '', ln)
+
+
 def skipped(path: str) -> bool:
     """Files no user reads: other projects', the tests, the lint itself, the license texts."""
     p = Path(path)
     name = p.name
-    return (path.startswith(('third_party/', 'LICENSES/', 'tests/', 'ref/', 'bench/', 'serve/fixtures/'))
+    return (path.startswith(('third_party/', 'LICENSES/', 'tests/', 'ref/', 'bench/', 'serve/fixtures/',
+                             'launcher/Tests/'))
             or name.startswith('test_') or re.search(r'_test\.(cpp|py)$', name) is not None
             or path in {'tools/lint/upstream_name.py', 'tools/bench_upstream.py'}
             or name in {'NOTICE', 'COPYING', 'COPYING.LESSER'})
@@ -178,6 +199,10 @@ def check(path: str, options: set[str]) -> list[str]:
         pieces = py_strings(text)
     elif ext == '.js':
         pieces = js_lines(text)
+    elif ext in FS:
+        pieces = fs_strings(text)
+    elif ext in SHELL:
+        pieces = sh_lines(text)
     elif ext in DOC or ext in WEB:
         pieces = lines(text)
     else:

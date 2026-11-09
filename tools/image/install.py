@@ -107,8 +107,10 @@ def main(argv=None) -> int:
     native = Path(args[args.index("--native") + 1]) if "--native" in args[:-1] else None
     name = str(cfg.get("model_name", "")).lower()
     text_gb: float | None
-    fam = next((f for f in sorted(S.PLAIN_FAMILIES.values(), key=lambda f: len(f["name"]), reverse=True)
-                if name.startswith(f["name"] + "-")), None)
+    # setup's family where the config names it; a config written before 2026-11-09 by its model name
+    fam = S.PLAIN_FAMILIES.get(str(cfg.get("family"))) or \
+        next((f for f in sorted(S.PLAIN_FAMILIES.values(), key=lambda f: len(f["name"]), reverse=True)
+              if name.startswith(f["name"] + "-")), None)
     if fam is not None and native is not None:
         text_gb = S.DENSE_RAM_GB if fam.get("dense") else \
             (native.stat().st_size / 1e9 if native.exists() else 0.0) + 8

@@ -189,6 +189,20 @@ A model's name is written in full everywhere, in code and in text: `HunyuanImage
 
 What already exists keeps its name: Qwen-Image-2.1's `qi_*` and Mage-Flow's `mf_*` parts (`qi_dit.cpp`, `QiPipeline`) stay as they are - renaming them would churn the whole image engine for no reading gain, and this rule is about names given from now on. So does everything outside the repository: the data folder's `hy3/`, the records' scripts (`hy3_conform.py`, `hy3_vae_ref.py`) and any path quoted from them; a comment that cites one of those says it is a record's or the data folder's path, so it does not read as a name for the model.
 
+## XeStrata's name, not upstream's, where a user reads it
+
+<!-- upstream-name: off -->
+What a user reads says `xestrata` (`XeStrata` in prose): the messages and the log lines' heads, the usage texts, the environment variables, the programs, the API fields of XeStrata's own, the documents, the web app and setup's lines. `strata` alone is upstream's name and is not shown there.
+What a user does not read keeps upstream's name, so upstream's changes carry over: the C++ namespace `strata`, `include/strata/`, the file names, the CMake targets and options (`-DSTRATA_*`), and the API fields and markers shared with upstream (`strata_mcp`, `strata_prefix`, `/health`'s `service: "strata"` and the like).
+
+- A new environment variable is `XESTRATA_<NAME>`, read through the one reader: `strata::env_get("<NAME>")` in C++ (`include/strata/platform/env.hpp`), `envvars.get("<NAME>")` in Python (`serve/envvars.py`). Not `std::getenv` or `os.environ` directly.
+- The F# launchers read theirs in one place (`launcher/Core/Platform.fs`); a shell script reads `$XESTRATA_<NAME>`, and the old name only for a variable that had one: `${XESTRATA_<NAME>:-${STRATA_<NAME>:-}}`.
+- The reader takes the old `STRATA_<NAME>` too, for the variables that existed before the rename; a new variable is never given a `STRATA_` name.
+- An upstream sync reads upstream's names into XeStrata's as it carries a change over (the upstream-sync skill says how).
+- `tools/lint/upstream_name.py` (in `tools/lint/run.sh`) finds `strata` where a user reads XeStrata's name: the strings of the C++, Python and F# files, the shell scripts' code, the documents and the web app.
+
+<!-- upstream-name: on -->
+
 ## Measurement records
 
 XeStrata's own measurements (benchmarks, A/B runs, probes, the upstream-sync and release records) are not shared: they go
@@ -217,7 +231,7 @@ It picks the lints by file kind, with the configurations in `tools/lint/`:
 | all text files | codespell |
 | every file | gitleaks (built-in rules, no configuration of its own) |
 | every file | `tools/license_class.py` (the license classes, see Licenses above) |
-| C++, Python, documents, the web app | `tools/lint/upstream_name.py` (upstream's name where a user reads XeStrata's: `xestrata`, `XESTRATA_*`) |
+| C++, Python, F#, shell, documents, the web app | `tools/lint/upstream_name.py` (upstream's name where a user reads XeStrata's: `xestrata`, `XESTRATA_*`) |
 | the whole repository | `reuse lint` (see Licenses above) |
 
 The files a change touches must get no new findings; findings that were there before may stay.
