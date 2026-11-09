@@ -173,12 +173,16 @@ bool VitCpu::load(const Gguf& gg, const VitGeometry& g, std::string& err) {
             !m.read_f(gg, p + "ffn_up.bias", L.up_b, err) || !m.read_m(gg, p + "ffn_down.weight", L.down, err) || !m.read_f(gg, p + "ffn_down.bias", L.down_b, err))
             return false;
     }
-    m.act_round = 0;
-    if (const char* e = std::getenv("STRATA_VIT_REF_ROUND"); e && std::atoi(e) != 0) {
-        const int k = m.layers.empty() ? 0 : m.layers[0].qkv.kind;
-        m.act_round = k;          // 1 BF16, 2 F16
-    }
+    m.act_round = vit_cpu_round_kind(m.layers.empty() ? 0 : m.layers[0].qkv.kind, std::getenv("STRATA_VIT_REF_ROUND"));
     return true;
+}
+
+int vit_cpu_round_kind(int weight_kind, const char* env) {
+    // owner's rule (11-09): BF16 weights (Qwen3.8) round to 16 bits by default (it brings code4217.png's rule-1 miss to 0.9997), F16 weights (Qwen3.6) do not;
+    // float32 or Q8_0-expanded matrices have no 16-bit type to round to.  STRATA_VIT_REF_ROUND=0 / 1 overrides in both directions.
+    if (weight_kind != 1 && weight_kind != 2) return 0;
+    if (env && *env) return std::atoi(env) != 0 ? weight_kind : 0;
+    return weight_kind == 1 ? 1 : 0;
 }
 
 bool VitCpu::encode(const PreparedImage& img, int threads, std::vector<float>& rows, int& nx, int& ny, std::string& err) {

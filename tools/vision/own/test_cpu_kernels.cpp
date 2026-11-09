@@ -2,6 +2,7 @@
 // included, and the fork-join team (every task of every run exactly once).   strata-vision-own-cpu-test
 #include "cpu_kernels.h"
 #include "cpu_team.h"
+#include "vit_cpu.h"
 
 #include <atomic>
 #include <cmath>
@@ -216,6 +217,15 @@ static void test_team() {
     }
 }
 
+// the CPU tower's rounding default by weight type (owner 11-09): BF16 on, F16 off, float32 / Q8_0-expanded none; STRATA_VIT_REF_ROUND=0/1 overrides
+static void test_round_choice() {
+    struct Case { int kind; const char* env; int want; };
+    const Case cs[] = {{1, nullptr, 1}, {2, nullptr, 0}, {0, nullptr, 0}, {1, "0", 0}, {2, "1", 2}, {1, "1", 1}, {2, "0", 0}, {0, "1", 0}, {1, "", 1}, {2, "", 0}};
+    bool ok = true;
+    for (const Case& c : cs) ok = ok && vit_cpu_round_kind(c.kind, c.env) == c.want;
+    check(ok, "rounding default per weight type and its override", "-", 0, 0);
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "team") == 0) {     // only the fork-join team (a loop under ThreadSanitizer)
         const int reps = argc > 2 ? std::atoi(argv[2]) : 1;
@@ -240,6 +250,7 @@ int main(int argc, char** argv) {
         test_attention(*o);
     }
     test_team();
+    test_round_choice();
     std::printf(g_fail ? "%d FAILED\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
