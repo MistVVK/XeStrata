@@ -1030,11 +1030,32 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
         const int64_t L = n_moe_;
         std::vector<int32_t> routes(disp_.usage.empty() ? 0 : (size_t) (L * P.T * K));
         const int64_t c_last = std::min(n, c_end);
+        if (c_last > c_begin) ring_advance(pos + c_begin, c_last - c_begin);
+        // the position after the last staging copies (an event of this call's)
+        struct Staged {
+            strata::gpu::Event* e = nullptr;
+            bool set = false;
+            ~Staged() { if (e != nullptr) strata::gpu::event_destroy(e); }
+            bool mark(strata::gpu::Stream s) {
+                if (e == nullptr && !strata::gpu::event_create(&e)) return false;
+                set = strata::gpu::event_record(e, s);
+                return set;
+            }
+            bool wait() { return !set || strata::gpu::event_sync(e); }
+        } staged;
         if (!first())   // the rows handed on, into this stage's own pinned memory (and its rows out from there)
             std::memcpy(hand_host_, hand_in, (size_t) ((c_last - c_begin) * N) * 4);
         for (int64_t c0 = c_begin; c0 < c_last; c0 += P.T) {
             const int64_t T = std::min<int64_t>(P.T, c_last - c0), p0 = pos + c0;
             float* hand = hand_host_ != nullptr ? hand_host_ + (c0 - c_begin) * N : nullptr;
+            // the staging buffers are pinned host memory the last chunk's copies read: written again only once those
+            // copies ran (a dense model's chunk has nothing else that waits on the host, and its next inputs went
+            // over the last chunk's before the GPU read them: PLaMo 3 Translate and Qwen3.5 through the FP16 and the
+            // decode kernels read garbage from the second chunk on, 2026-11-09)
+            if (!staged.wait()) {
+                err = std::string("plain prompt: staging: ") + strata::gpu::last_error();
+                return false;
+            }
             // the chunk's inputs: embedding rows (a later stage: the rows handed on), per-token step counts and rotary
             // positions
             if (first()) embed_ahead(tokens + c0, T);
@@ -1058,6 +1079,10 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
             P.h_dense_bounds[0] = 0;
             P.h_dense_bounds[1] = (int32_t) T;
             if (!strata::gpu::copy_async(P.dense_bounds, P.h_dense_bounds, 2 * sizeof(int32_t), cs)) {
+                err = std::string("plain prompt: staging: ") + strata::gpu::last_error();
+                return false;
+            }
+            if (!staged.mark(cs)) {
                 err = std::string("plain prompt: staging: ") + strata::gpu::last_error();
                 return false;
             }
@@ -1105,7 +1130,11 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                         return false;
                     }
                     k::native_qsa_rms_norm_weighted(P.hn, mtp_hnorm_, P.mix, (int) N, (int) T, eps, cs);
-                    for (int64_t t = 0; t < T; ++t) {   // the stream has synchronized since the chunk's uploads
+                    if (!staged.wait()) {   // the staging again (above)
+                        err = std::string("plain prompt: staging: ") + strata::gpu::last_error();
+                        return false;
+                    }
+                    for (int64_t t = 0; t < T; ++t) {
                         const int32_t tok = c0 + t + 1 < n ? tokens[c0 + t + 1] : tokens[n - 1];
                         if (!embed(tok, p0 + 1 + t, P.emb + t * N)) {
                             err = "plain prompt: a token is out of the vocabulary";
@@ -1118,7 +1147,8 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     if (!strata::gpu::copy_async(P.x, P.emb, (size_t) (T * N) * 4, cs) ||
                         !strata::gpu::copy_async(P.steps, P.h_steps, (size_t) (T * k::kStepCount) * 4, cs) ||
                         !strata::gpu::copy_async(P.pos_q, P.h_pos, (size_t) (T * NH) * 4, cs) ||
-                        !strata::gpu::copy_async(P.pos_k, P.h_pos + T * NH, (size_t) (T * NKV) * 4, cs)) {
+                        !strata::gpu::copy_async(P.pos_k, P.h_pos + T * NH, (size_t) (T * NKV) * 4, cs) ||
+                        !staged.mark(cs)) {
                         err = std::string("plain prompt: staging: ") + strata::gpu::last_error();
                         return false;
                     }

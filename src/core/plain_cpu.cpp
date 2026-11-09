@@ -120,6 +120,7 @@ struct PlainCpu::Impl {
     const GgufModel* m = nullptr;
     std::unique_ptr<kc::BandPool> pool;
     k::cpu::I8GemmIsa isa = k::cpu::I8GemmIsa::scalar;
+    int levels = 0;   ///< the int8 weights' levels (kc::i8_gemm_weight_levels, or eight bits where the model needs them)
     int64_t N = 0, NH = 0, HD = 0, NROT = 0, HK = 0, HV = 0, S = 0, ZV = 0, C = 0, FF = 0;
     float eps = 1e-6f, theta_scale = 1.0f;
     bool gate = true;          ///< the attention's output gate: [q | gate] per head (qwen35; not plamo3)
@@ -221,7 +222,7 @@ bool PlainCpu::Impl::mat(const std::vector<std::string>& names, Mat& out, int64_
     }
     out.native = true;
     for (const Mat::Part& p : parts) out.native = out.native && kc::native_vec_act_bytes(p.type, n_in) > 0;
-    const bool ok = kc::i8_pack_rows(*pool, (int) n_in, (int) n_out, kBlock, kc::i8_gemm_weight_levels(isa),
+    const bool ok = kc::i8_pack_rows(*pool, (int) n_in, (int) n_out, kBlock, levels,
                                      [&](int o, float* dst) {
         for (const Mat::Part& p : parts) {
             if (o < p.rows) return kc::native_row_to_float(p.type, p.src + (size_t) o * p.rb, dst, n_in);
@@ -305,6 +306,10 @@ bool PlainCpu::load(const GgufModel& m, const ModelSpec& s, const PlainOptions& 
     const int threads = opt.cpu_threads > 0 ? opt.cpu_threads : (int) std::max(1u, std::thread::hardware_concurrency());
     P.pool = std::make_unique<kc::BandPool>(threads);
     P.isa = kc::i8_gemm_isa();
+    // AVX2's seven-bit weights moved plamo3 past its checks (the user's decision, 2026-11-09: not for PLaMo 3 Translate):
+    // against llama.cpp's FP32 reference, 0.8B at 512 tokens, the 99th percentile's KL 0.135 where llama.cpp's own
+    // default is 0.0975 and the eight-bit form 0.113, the same top token 88.2% (91.2%, 89.8%); i7-14700, 2026-11-09
+    P.levels = plamo ? kc::kI8Levels : kc::i8_gemm_weight_levels(P.isa);
     const char* pr = strata::env_get("CPU_PROFILE");
     P.profile = pr != nullptr && pr[0] != 0 && pr[0] != '0';
     // the embedding: rows read from the file as they are needed
@@ -421,6 +426,8 @@ std::string PlainCpu::describe() const {
            " MiB of packed weights); the decode " +
            (p_->native ? "from the model file's rows (the RAM holds both)" : "from the int8 copy");
 }
+
+bool PlainCpu::recurrent() const { return !p_->gdn_state.empty(); }
 
 void PlainCpu::reset() {
     for (auto& v : p_->gdn_state) std::fill(v.begin(), v.end(), 0.0f);

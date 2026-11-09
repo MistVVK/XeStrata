@@ -239,8 +239,14 @@ public:
                               strata::kernels::RopeScaling& swa, std::string& err);
     const ModelSpec& spec() const { return spec_; }
     int64_t vocab() const { return n_vocab_; }
-    /// The model carries a recurrent state (GDN layers): a sequence can be extended, not cut back to a prefix.
-    bool recurrent() const { return cpu_ != nullptr || !gdn_state_.empty(); }
+    /// The model carries a recurrent state (GDN layers) or a ring of sliding-window K/V (plamo3): a sequence can be
+    /// extended, not cut back to any prefix (can_rewind says which ones it can).
+    bool recurrent() const;
+    /// Whether the state can go back to position `to` and read on from there as if the tokens before it had just been
+    /// read: no recurrent state, and each sliding-window layer's ring still holds the cells the token at `to` sees
+    /// (to - window + 1 .. to - 1).  `end` < 0: the live state, at the end of the last run; else a state of `end`
+    /// tokens put back from a snapshot (its rings: the window before `end`).
+    bool can_rewind(int64_t to, int64_t end = -1) const;
     /// The forward runs on the CPU (--device cpu): no GPU, no drafts, no pictures, no batches.
     bool on_cpu() const { return cpu_ != nullptr; }
     int64_t max_cells() const { return opt_.max_cells; }
@@ -1074,6 +1080,19 @@ private:
     strata::kernels::QsaAttnPools kv_pools(size_t a, int slot = -1) const;
     int32_t* page_table_ = nullptr;
     int64_t n_pages_ = 0;
+    /// The sliding-window layers' K/V in a ring (plamo3): ring_pages_ pages of their own, logical page p held in page
+    /// p % ring_pages_ through swa_table_ (0: no ring, those layers' pools as long as the others').  A ring holds the
+    /// window and a prompt chunk's cells, so a chunk's writes leave its first query's window in place.
+    int64_t ring_pages_ = 0;
+    int32_t* swa_table_ = nullptr;
+    std::vector<bool> attn_swa_;              ///< per attention block: a sliding-window layer's
+    int64_t ring_end_ = 0, ring_from_ = 0;    ///< the position after the last run, and the first the rings still hold
+    const int32_t* table_of(size_t a) const {
+        return swa_table_ != nullptr && a < attn_swa_.size() && attn_swa_[a] ? swa_table_ : page_table_;
+    }
+    bool ringed(size_t a) const { return ring_pages_ > 0 && a < attn_swa_.size() && attn_swa_[a]; }
+    /// a run over positions [pos, pos + n) moves the rings' ends
+    void ring_advance(int64_t pos, int64_t n);
 
     // the window's buffers (device unless noted)
     strata::gpu::Stream cs_ = nullptr;

@@ -872,6 +872,25 @@ bool PlainModel::load_qwen(std::string& err) {
     }
     n_pages_ = (opt_.max_cells + qs.page_size - 1) / qs.page_size;
     opt_.max_cells = n_pages_ * qs.page_size;
+    // the sliding-window layers' ring (plamo3): the window and the most cells a run writes at once (a prompt chunk, a
+    // window), whole pages, so that a chunk's last writes leave the cells its first query sees; none where the
+    // context is not longer than that
+    attn_swa_.assign((size_t) n_attn, false);
+    for (int64_t l = 0; l < s.n_layer; ++l)
+        if (blocks_[(size_t) l].attn >= 0) attn_swa_[(size_t) blocks_[(size_t) l].attn] = blocks_[(size_t) l].swa;
+    // XESTRATA_PLAIN_RING=0: those layers' pools as long as the others' (A/B)
+    static const bool ring_env = [] {
+        const char* v = strata::env_get("PLAIN_RING");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    if (s.swa_window > 0 && opt_.batch_slots == 0 && ring_env) {
+        const int64_t run = std::max<int64_t>(opt_.prompt_chunk, opt_.max_t);
+        const int64_t pages = (s.swa_window + run + qs.page_size - 1) / qs.page_size;
+        if (pages < n_pages_) ring_pages_ = pages;
+        if (ring_pages_ > 0 && first())
+            std::fprintf(stderr, "xestrata plain: the sliding-window layers' K/V in a ring of %lld cells (window %lld)\n",
+                         (long long) (ring_pages_ * qs.page_size), (long long) s.swa_window);
+    }
     // the decode attention's form for this GPU (an fp16 cache), timed before any graph is recorded and before the cache
     // takes its VRAM (an encoder does not decode)
     if (!opt_.kv_int8 && opt_.kv_q4 == 0 && !opt_.encoder) {
@@ -914,7 +933,7 @@ bool PlainModel::load_qwen(std::string& err) {
             if (!mine) continue;
             const size_t a = (size_t) i;
             KvPtrs p;
-            const bool ok = alloc_kv(p, cells, grow);
+            const bool ok = alloc_kv(p, ringed(a) ? (size_t) (ring_pages_ * qs.n_head_kv * qs.page_size) : cells, grow);
             k_pool_[a] = p.k_pool;
             v_pool_[a] = p.v_pool;
             k_scale_[a] = p.k_scale;
@@ -936,6 +955,15 @@ bool PlainModel::load_qwen(std::string& err) {
             return false;
         }
         allocs_.push_back(page_table_);
+        if (ring_pages_ > 0) {   // logical page p in the ring's page p % ring_pages_
+            for (int64_t i = 0; i < n_pages_; ++i) table[(size_t) i] = (int32_t) (i % ring_pages_);
+            if (!strata::gpu::alloc_device(&swa_table_, table.size() * 4) ||
+                !strata::gpu::copy(swa_table_, table.data(), table.size() * 4)) {
+                err = "plain model: the sliding-window layers' page table";
+                return false;
+            }
+            allocs_.push_back(swa_table_);
+        }
         if (grow) {   // the first cells (STRATA_KV_GROW_INIT, 16384 by default) mapped now
             const char* iv = strata::env_get("KV_GROW_INIT");
             const long long init = iv != nullptr && std::strtoll(iv, nullptr, 10) > 0 ? std::strtoll(iv, nullptr, 10) : 16384;
@@ -1902,7 +1930,8 @@ k::QsaAttnPools PlainModel::kv_pools(size_t a, int slot) const {
     pools.v_scale = p.v_scale;
     pools.k_q4 = p.k_q4;
     pools.v_q4 = p.v_q4;
-    pools.page_table = page_table_;   // the identity: a slot's pools have the live session's shape
+    pools.page_table = table_of(a);   // the identity (a ring's for a sliding-window layer): a slot's pools have the
+                                      // live session's shape
     return pools;
 }
 
@@ -2039,21 +2068,21 @@ void PlainModel::kv_append_cells(size_t a, int slot, const int32_t* steps, int n
     const k::QsaShapes qs = attn_shapes();
     const int row = (int) (qs.n_head_kv * qs.head_dim);
     if (p.k_q4 != nullptr) {
-        k::kv_append_q4_steps(p.k_q4, p.v_q4, page_table_, steps, k::kStepCount, n, kc, vc, qs, cs);
+        k::kv_append_q4_steps(p.k_q4, p.v_q4, table_of(a), steps, k::kStepCount, n, kc, vc, qs, cs);
     } else if (p.v_q4 != nullptr) {   // K8V4: K's INT8 codes and scales (one plane), V's Q4_0 (one plane)
-        k::kv_append_q8_steps(p.k_q, p.k_q, p.k_scale, p.k_scale, page_table_, steps, k::kStepCount, kc, kc, row, n, qs,
+        k::kv_append_q8_steps(p.k_q, p.k_q, p.k_scale, p.k_scale, table_of(a), steps, k::kStepCount, kc, kc, row, n, qs,
                               cs);
-        k::kv_append_q4_steps(p.v_q4, p.v_q4, page_table_, steps, k::kStepCount, n, vc, vc, qs, cs);
+        k::kv_append_q4_steps(p.v_q4, p.v_q4, table_of(a), steps, k::kStepCount, n, vc, vc, qs, cs);
     } else if (n == 1) {   // a window's row (the one-cell kernels the windows always took)
         if (p.k_q != nullptr)
-            k::kv_append_q8_step(p.k_q, p.v_q, p.k_scale, p.v_scale, page_table_, steps, kc, vc, qs, cs);
+            k::kv_append_q8_step(p.k_q, p.v_q, p.k_scale, p.v_scale, table_of(a), steps, kc, vc, qs, cs);
         else
-            k::kv_append_step(p.k_pool, p.v_pool, page_table_, steps, kc, vc, qs, cs);
+            k::kv_append_step(p.k_pool, p.v_pool, table_of(a), steps, kc, vc, qs, cs);
     } else if (p.k_q != nullptr) {
-        k::kv_append_q8_steps(p.k_q, p.v_q, p.k_scale, p.v_scale, page_table_, steps, k::kStepCount, kc, vc, row, n, qs,
+        k::kv_append_q8_steps(p.k_q, p.v_q, p.k_scale, p.v_scale, table_of(a), steps, k::kStepCount, kc, vc, row, n, qs,
                               cs);
     } else {
-        k::kv_append_steps(p.k_pool, p.v_pool, page_table_, steps, k::kStepCount, kc, vc, row, n, qs, cs);
+        k::kv_append_steps(p.k_pool, p.v_pool, table_of(a), steps, k::kStepCount, kc, vc, row, n, qs, cs);
     }
 }
 
@@ -2444,7 +2473,7 @@ std::vector<PlainModel::StatePart> PlainModel::state_parts(int64_t tokens, bool 
         parts.push_back({ss ? ss->gdn_state[g] : gdn_state_[g], state_bytes_, 4});
         parts.push_back({ss ? ss->gdn_conv[g] : gdn_conv_[g], conv_bytes_, 4});
     }
-    if (recurrent_only) return parts;
+    if (recurrent_only && ring_pages_ == 0) return parts;
     if (glm_) {   // per DSA block: its latent and indexer rows a cell, the pools that the cells close
         const int64_t KVR = s.kv_lora_rank, ID = s.idx_key_length;
         const int64_t pools = std::min<int64_t>(g_max_blocks_, tokens / s.idx_kpool + 1);
@@ -2457,12 +2486,31 @@ std::vector<PlainModel::StatePart> PlainModel::state_parts(int64_t tokens, bool 
         return parts;
     }
     // the attention layers (the MTP layer's too): the pages that hold the tokens, page by page in order (the page
-    // table is the identity)
+    // table is the identity); a sliding-window layer's ring, the pages of the window before `tokens` (the ring's
+    // state, as a recurrent layer's: a checkpoint takes it too), in the ring's order
     const k::QsaShapes qs = attn_shapes();
     const int64_t pages = std::min<int64_t>(n_pages_, (tokens + qs.page_size - 1) / qs.page_size);
     const size_t cells = (size_t) (pages * qs.n_head_kv * qs.page_size);
-    for (size_t a = 0; a < k_pool_.size(); ++a)
+    for (size_t a = 0; a < k_pool_.size(); ++a) {
+        if (ringed(a)) {
+            if (tokens <= 0) continue;
+            const int64_t lp0 = std::max<int64_t>(0, tokens - s.swa_window) / qs.page_size;
+            const int64_t lp1 = (tokens - 1) / qs.page_size;   // the window's logical pages lp0 .. lp1
+            const std::vector<StatePart> whole =
+                kv_planes(a, slot, (size_t) (ring_pages_ * qs.n_head_kv * qs.page_size));
+            for (int64_t lp = lp0; lp <= lp1;) {   // runs of the ring's pages, each to its end or the window's
+                const int64_t r0 = lp % ring_pages_, n = std::min(lp1 + 1 - lp, ring_pages_ - r0);
+                for (const StatePart& w : whole) {
+                    const size_t per = w.bytes / (size_t) ring_pages_;
+                    parts.push_back({static_cast<uint8_t*>(w.dev) + (size_t) r0 * per, (size_t) n * per, w.typesize});
+                }
+                lp += n;
+            }
+            continue;
+        }
+        if (recurrent_only) continue;
         for (const StatePart& p : kv_planes(a, slot, cells)) parts.push_back(p);
+    }
     return parts;
 }
 
@@ -2486,6 +2534,33 @@ static void cpu_snapshot(const PlainCpu& c, int64_t tokens, bool kv, PlainModel:
     snap.tokens = tokens;
     c.save(tokens, kv, snap.parts);
     snap.typesize.assign(snap.parts.size(), 4);
+}
+
+bool PlainModel::recurrent() const {
+    if (cpu_ != nullptr) return true;
+    for (const PlainModel* st : const_cast<PlainModel*>(this)->chain())
+        if (!st->gdn_state_.empty() || st->ring_pages_ > 0) return true;
+    return false;
+}
+
+bool PlainModel::can_rewind(int64_t to, int64_t end) const {
+    if (cpu_ != nullptr) return !cpu_->recurrent() && to >= 0;   // its K/V keeps every cell
+    for (const PlainModel* st : const_cast<PlainModel*>(this)->chain()) {
+        if (!st->gdn_state_.empty()) return false;
+        if (st->ring_pages_ == 0) continue;
+        const int64_t e = end < 0 ? st->ring_end_ : end;
+        const int64_t from = end < 0 ? st->ring_from_ : std::max<int64_t>(0, end - spec_.swa_window);
+        if (to > e || std::max<int64_t>(0, to - spec_.swa_window + 1) < from) return false;
+    }
+    return to >= 0;
+}
+
+void PlainModel::ring_advance(int64_t pos, int64_t n) {
+    if (ring_pages_ == 0) return;
+    if (pos == 0) ring_from_ = 0;
+    ring_end_ = pos + n;
+    // the cells written over: those a ring's length before the last written
+    ring_from_ = std::max(ring_from_, ring_end_ - ring_pages_ * attn_shapes().page_size);
 }
 
 bool PlainModel::save_state(int64_t tokens, Snapshot& snap, std::string& err) {
@@ -2660,6 +2735,9 @@ bool PlainModel::restore_parts(const Snapshot& snap, bool recurrent_only, std::s
         st->cur_ = -1;
         st->drafts_.clear();
         st->mtp_h_set_ = false;
+        // the rings hold the window before the state's tokens, and nothing older
+        st->ring_end_ = snap.tokens;
+        st->ring_from_ = std::max<int64_t>(0, snap.tokens - spec_.swa_window);
     }
     return true;
 }
@@ -2683,7 +2761,9 @@ bool PlainModel::reset(std::string& err) {
     const size_t live = kv_cells_ < 0 ? cells
                                       : (size_t) ((kv_cells_ + qs.page_size - 1) / qs.page_size * qs.n_head_kv * qs.page_size);
     for (size_t i = 0; i < k_pool_.size(); ++i)
-        for (const StatePart& p : kv_planes(i, -1, live)) ok = ok && strata::gpu::memset(p.dev, 0, p.bytes);
+        for (const StatePart& p : kv_planes(i, -1, ringed(i) ? (size_t) (ring_pages_ * qs.n_head_kv * qs.page_size) : live))
+            ok = ok && strata::gpu::memset(p.dev, 0, p.bytes);
+    ring_end_ = ring_from_ = 0;
     cur_ = -1;
     drafts_.clear();
     if (!ok) err = "plain model: resetting the state failed";
@@ -3250,6 +3330,7 @@ bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const 
                                bool defer) {
     if (!record(T, false, err) || !settle_window(err) || !stage(tokens, T, pos, err, first())) return false;
     if (hand_in != nullptr) std::memcpy(h_in_, hand_in, (size_t) T * (size_t) hand_w_ * 4);
+    ring_advance(pos, T);
     pcie_probe_before();
     const double pool0 = disp_.ms_plan + disp_.ms_actq + disp_.ms_jobs + disp_.ms_run;
     // while the form is timed, the one-row windows take the two in turns (the same tokens either way)

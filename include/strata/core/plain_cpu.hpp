@@ -39,6 +39,8 @@ public:
     std::string describe() const;
     /// Zeroes the recurrent states: the next run starts a sequence at position 0.
     void reset();
+    /// The model has recurrent layers (their state cannot go back to a prefix; the K/V cells can).
+    bool recurrent() const;
     /// Tokens [0, n) at positions pos .. pos + n - 1 (following the previous run's), in chunks; `logits` gets the last
     /// `rows` tokens' rows (rows <= n), n_vocab floats each.
     bool run(const int32_t* tokens, int64_t n, int64_t pos, int rows, float* logits, std::string& err);

@@ -1491,7 +1491,10 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             while (common < have.size() && common < (size_t) n && have[common] == keys[common]) ++common;
             const int64_t r = std::min<int64_t>((int64_t) common, n - 1);
             ck = -1;
-            if (!model.recurrent() || r == (int64_t) have.size()) return r;
+            // (a sliding-window model's rings, and a CPU's K/V, go back as far as they still hold the cells)
+            if (!model.recurrent() || r == (int64_t) have.size() ||
+                model.can_rewind(r, &have == &live ? -1 : (int64_t) have.size()))
+                return r;
             int64_t best = 0;
             for (size_t i = 0; i < cks.size(); ++i)
                 if (cks[i].len <= r && cks[i].len > best) {
