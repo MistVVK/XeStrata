@@ -5,6 +5,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
 #if defined(STRATA_VIT_HIP)
@@ -39,6 +40,7 @@
 #define VIT_COMPUTE_32F HIPBLAS_COMPUTE_32F
 #define VIT_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT
 #define cublasGemmEx hipblasGemmEx
+#define cublasGemmStridedBatchedEx hipblasGemmStridedBatchedEx
 #define VIT_SHFL_XOR(v, m) __shfl_xor((v), (m))
 #else
 #include <cublas_v2.h>
@@ -226,6 +228,31 @@ __global__ void __launch_bounds__(128) k_attention(const float* __restrict__ q, 
     }
 }
 
+// P[r][j] = softmax over j of S[r][j] * scale, one block per row of n scores; P in F16
+__global__ void k_softmax_rows(const float* __restrict__ S, int n, float scale, uint16_t* __restrict__ P) {
+    const float* s = S + (size_t) blockIdx.x * n;
+    uint16_t* p = P + (size_t) blockIdx.x * n;
+    __shared__ float red[32];
+    const int lane = threadIdx.x % warpSize, wid = threadIdx.x / warpSize, nw = (blockDim.x + warpSize - 1) / warpSize;
+    float m = -FLT_MAX;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) m = fmaxf(m, s[j] * scale);
+    for (int o = warpSize / 2; o > 0; o >>= 1) m = fmaxf(m, VIT_SHFL_XOR(m, o));
+    if (lane == 0) red[wid] = m;
+    __syncthreads();
+    m = lane < nw ? red[lane] : -FLT_MAX;
+    for (int o = warpSize / 2; o > 0; o >>= 1) m = fmaxf(m, VIT_SHFL_XOR(m, o));
+    __syncthreads();
+    float sum = 0.0f;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) sum += expf(s[j] * scale - m);
+    for (int o = warpSize / 2; o > 0; o >>= 1) sum += VIT_SHFL_XOR(sum, o);
+    if (lane == 0) red[wid] = sum;
+    __syncthreads();
+    sum = lane < nw ? red[lane] : 0.0f;
+    for (int o = warpSize / 2; o > 0; o >>= 1) sum += VIT_SHFL_XOR(sum, o);
+    const float inv = 1.0f / sum;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) p[j] = f_to_f16bits(expf(s[j] * scale - m) * inv);
+}
+
 // n floats to the 16-bit kind
 __global__ void k_cast(const float* __restrict__ in, size_t n, void* out, int kind) {
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) store_kind(out, i, in[i], kind);
@@ -288,6 +315,21 @@ struct VitGpuImpl {
     float *d_chw = nullptr, *d_im = nullptr, *d_x = nullptr, *d_y = nullptr, *d_q = nullptr, *d_k = nullptr, *d_v = nullptr, *d_ctx = nullptr, *d_out = nullptr;
     void* d_a = nullptr;            // the GEMM input in its 16-bit kind
     size_t chw_cap = 0;
+    uint16_t *d_q16 = nullptr, *d_k16 = nullptr, *d_v16 = nullptr, *d_P = nullptr;   // q, k, v and the probabilities, F16 (as ggml's flash attention holds them)
+    float* d_S = nullptr;
+    size_t sp_elems = 0;
+    static constexpr size_t kScoreElems = (size_t) 64 << 20;   // 64M scores per chunk: 256 MB of float32 + 128 MB of F16
+    bool tiled_attention = false;   // STRATA_VIT_ATTN=tiled: the one-kernel float32 attention (slower; kept as a cross-check)
+
+    // C = alpha * op(A) * op(B), batched, column-major as the BLAS wants it
+    bool bgemm(bool ta, bool tb, int m, int n, int k, const void* A, cudaDataType_t at, int lda, long long sa, const void* B, cudaDataType_t bt, int ldb,
+               long long sb, void* C, cudaDataType_t ct, int ldc, long long sc, int batch, std::string& err) {
+        const float alpha = 1.0f, beta = 0.0f;
+        const cublasStatus_t s = cublasGemmStridedBatchedEx(blas, ta ? CUBLAS_OP_T : CUBLAS_OP_N, tb ? CUBLAS_OP_T : CUBLAS_OP_N, m, n, k, &alpha, A, at, lda, sa,
+                                                            B, bt, ldb, sb, &beta, C, ct, ldc, sc, batch, VIT_COMPUTE_32F, VIT_GEMM_DEFAULT);
+        if (s != CUBLAS_STATUS_SUCCESS) { err = "the batched BLAS product failed (status " + std::to_string((int) s) + ")"; return false; }
+        return true;
+    }
 
     ~VitGpuImpl() {
         cudaSetDevice(device);
@@ -362,13 +404,19 @@ struct VitGpuImpl {
         allocs.resize(n_weight_allocs);
         const size_t N = (size_t) patches, D = (size_t) g.width, F = (size_t) std::max(g.ffn, g.merger_hidden);
         const size_t K0 = (size_t) 3 * g.patch * g.patch;
-        d_chw = d_im = d_x = d_y = d_q = d_k = d_v = d_ctx = d_out = nullptr;
+        d_im = d_x = d_y = d_q = d_k = d_v = d_ctx = d_out = nullptr;
+        d_q16 = d_k16 = d_v16 = d_P = nullptr;
+        d_S = nullptr;
         d_a = nullptr;
         const size_t a_elems = std::max(N * D, N * F);   // the 16-bit GEMM input (the float32 patch matrix is d_im)
         uint16_t* a16 = nullptr;
+        // attention by batched GEMMs: scores S (float32) and probabilities P (F16) of a chunk of queries for every head, at most kScoreElems each
+        sp_elems = std::min<size_t>((size_t) g.heads * N * N, kScoreElems);
         bool ok = alloc(d_im, N * K0, err, false) && alloc(d_x, N * D, err, false) && alloc(d_y, N * std::max<size_t>(3 * D, F), err, false) &&
                   alloc(d_q, N * D, err, false) && alloc(d_k, N * D, err, false) && alloc(d_v, N * D, err, false) && alloc(d_ctx, N * D, err, false) &&
-                  alloc(a16, a_elems, err, false) && alloc(d_out, (N / 4) * (size_t) g.out_dim, err, false);
+                  alloc(a16, a_elems, err, false) && alloc(d_out, (N / 4) * (size_t) g.out_dim, err, false) &&
+                  alloc(d_q16, N * D, err, false) && alloc(d_k16, N * D, err, false) && alloc(d_v16, N * D, err, false) &&
+                  alloc(d_S, sp_elems, err, false) && alloc(d_P, sp_elems, err, false);
         d_a = a16;
         if (!ok) { cap_patches = 0; return false; }
         cap_patches = patches;
@@ -428,6 +476,7 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
             return false;
     }
     m.n_weight_allocs = m.allocs.size();
+    if (const char* e = std::getenv("STRATA_VIT_ATTN")) m.tiled_attention = std::strcmp(e, "tiled") == 0;
     return m.size_buffers(std::max(max_patches, 16), err);
 }
 
@@ -474,7 +523,27 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
         k_layernorm<<<N, 256>>>(m.d_x, L.ln1_w, L.ln1_b, g.eps, D, m.d_a, (int) L.qkv.kind);
         if (!m.gemm(L.qkv, m.d_a, N, m.d_y, VitGpuImpl::dtype(L.qkv.kind), err)) return false;
         k_qkv_rope<<<N, 256>>>(m.d_y, L.qkv_b, pw, nbx, H, HD, theta_scale, m.d_q, m.d_k, m.d_v);
-        k_attention<<<dim3((N + BQ - 1) / BQ, H), 128, attn_smem>>>(m.d_q, m.d_k, m.d_v, N, H, HD, kq_scale, m.d_ctx);
+        if (m.tiled_attention) {
+            k_attention<<<dim3((N + BQ - 1) / BQ, H), 128, attn_smem>>>(m.d_q, m.d_k, m.d_v, N, H, HD, kq_scale, m.d_ctx);
+        } else {
+            // q, k, v as F16, then per chunk of queries: S = K Q^T (one batched product over the heads), softmax, O = V P (a head's matrix is a column
+            // slice of the [N][D] arrays: leading dimension D, batch stride HD)
+            const size_t qkv_n = (size_t) N * D;
+            k_cast<<<VitGpuImpl::blocks_for(qkv_n), 256>>>(m.d_q, qkv_n, m.d_q16, K_F16);
+            k_cast<<<VitGpuImpl::blocks_for(qkv_n), 256>>>(m.d_k, qkv_n, m.d_k16, K_F16);
+            k_cast<<<VitGpuImpl::blocks_for(qkv_n), 256>>>(m.d_v, qkv_n, m.d_v16, K_F16);
+            const int QC = (int) std::max<size_t>(1, std::min<size_t>((size_t) N, m.sp_elems / ((size_t) H * N)));
+            for (int q0 = 0; q0 < N; q0 += QC) {
+                const int qc = std::min(QC, N - q0);
+                if (!m.bgemm(true, false, N, qc, HD, m.d_k16, CUDA_R_16F, D, HD, m.d_q16 + (size_t) q0 * D, CUDA_R_16F, D, HD, m.d_S, CUDA_R_32F, N,
+                             (long long) qc * N, H, err))
+                    return false;
+                k_softmax_rows<<<H * qc, 256>>>(m.d_S, N, kq_scale, m.d_P);
+                if (!m.bgemm(false, false, HD, qc, N, m.d_v16, CUDA_R_16F, D, HD, m.d_P, CUDA_R_16F, N, (long long) qc * N, m.d_ctx + (size_t) q0 * D,
+                             CUDA_R_32F, D, HD, H, err))
+                    return false;
+            }
+        }
         k_cast<<<VitGpuImpl::blocks_for((size_t) N * D), 256>>>(m.d_ctx, (size_t) N * D, m.d_a, (int) L.o.kind);
         if (!m.gemm(L.o, m.d_a, N, m.d_y, VitGpuImpl::dtype(L.o.kind), err)) return false;
         k_add_bias_res<<<N, 256>>>(m.d_x, m.d_y, L.o_b, D);
