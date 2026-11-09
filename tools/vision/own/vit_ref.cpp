@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 
@@ -124,6 +125,43 @@ inline float dot(const float* a, const float* b, int n) {
     return s;
 }
 
+// round to nearest even to BF16 / F16 and back (the values a 16-bit GEMM input has)
+inline float round_bf16(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    if ((u & 0x7fffffffu) > 0x7f800000u) return f;
+    u += 0x7fffu + ((u >> 16) & 1u);
+    u &= 0xffff0000u;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+inline float round_f16(float f) {
+    uint32_t u;
+    std::memcpy(&u, &f, 4);
+    const uint32_t sign = u & 0x80000000u;
+    const float a = std::fabs(f);
+    if (!(a < 65520.0f)) return f;                         // inf, nan, and what rounds to inf are left alone (not met in a tower)
+    if (a < 6.103515625e-05f) {                            // subnormal half: a multiple of 2^-24
+        const float q = std::nearbyint(a * 16777216.0f) / 16777216.0f;
+        return sign ? -q : q;
+    }
+    int e;
+    std::frexp(a, &e);                                     // a = m * 2^e, m in [0.5, 1): the half's ulp is 2^(e-11)
+    const float ulp = std::ldexp(1.0f, e - 11);
+    const float q = std::nearbyint(a / ulp) * ulp;
+    return sign ? -q : q;
+}
+
+void round_inplace(float* p, size_t n, int kind, int nth) {
+    if (kind == 0) return;
+    const int blocks = (int) ((n + 8191) / 8192);
+    parallel_for(blocks, nth, [&](int bi) {
+        const size_t i0 = (size_t) bi * 8192, i1 = std::min(n, i0 + 8192);
+        for (size_t i = i0; i < i1; ++i) p[i] = kind == 1 ? round_bf16(p[i]) : round_f16(p[i]);
+    });
+}
+
 bool read_t(const Gguf& gg, const std::string& name, std::vector<float>& dst, std::string& err) {
     const GgufTensorInfo* t = gg.tensor(name);
     if (!t) { err = "the mmproj file lacks the tensor " + name; return false; }
@@ -156,6 +194,11 @@ bool VitRef::load(const Gguf& gg, const VitGeometry& g, std::string& err) {
         !read_t(gg, "mm.0.weight", mm0_w_, err) || !read_t(gg, "mm.0.bias", mm0_b_, err) ||
         !read_t(gg, "mm.2.weight", mm2_w_, err) || !read_t(gg, "mm.2.bias", mm2_b_, err))
         return false;
+    act_round_ = 0;
+    if (const char* e = std::getenv("STRATA_VIT_REF_ROUND"); e && std::atoi(e) != 0) {
+        const GgufTensorInfo* t = gg.tensor("v.blk.0.attn_qkv.weight");
+        act_round_ = t && t->type == GT_BF16 ? 1 : t && t->type == GT_F16 ? 2 : 0;
+    }
     layers_.assign((size_t) g.layers, Layer{});
     for (int il = 0; il < g.layers; ++il) {
         Layer& L = layers_[(size_t) il];
@@ -251,6 +294,7 @@ bool VitRef::encode(const PreparedImage& img, int threads, std::vector<float>& r
     const float kq_scale = 1.0f / std::sqrt((float) HD);
     for (const Layer& L : layers_) {
         layer_norm(x.data(), h.data(), N, D, L.ln1_w.data(), L.ln1_b.data(), g.eps, nth);
+        round_inplace(h.data(), h.size(), act_round_, nth);
         gemm(h.data(), (size_t) D, N, D, L.qkv_w.data(), 3 * D, L.qkv_b.data(), qkv.data(), (size_t) 3 * D, nth);
         // rotary on q and k
         parallel_for(N, nth, [&](int t) {
@@ -267,6 +311,7 @@ bool VitRef::encode(const PreparedImage& img, int threads, std::vector<float>& r
                     }
                 }
         });
+        round_inplace(qkv.data(), qkv.size(), act_round_ ? 2 : 0, nth);   // (diagnostic) mtmd's flash attention holds q, k, v in F16
         // global attention, 4 queries at a time per head
         const int QB = 4, nqb = (N + QB - 1) / QB;
         parallel_for(H * nqb, nth, [&](int task) {
@@ -300,11 +345,14 @@ bool VitRef::encode(const PreparedImage& img, int threads, std::vector<float>& r
             }
             for (int qi = 0; qi < nq; ++qi) std::memcpy(&ctx[(size_t) (q0 + qi) * D + (size_t) hh * HD], acc[qi], (size_t) HD * sizeof(float));
         });
+        round_inplace(ctx.data(), ctx.size(), act_round_, nth);
         gemm(ctx.data(), (size_t) D, N, D, L.o_w.data(), D, L.o_b.data(), tmp.data(), (size_t) D, nth);
         for (size_t i = 0; i < x.size(); ++i) x[i] += tmp[i];
         layer_norm(x.data(), h.data(), N, D, L.ln2_w.data(), L.ln2_b.data(), g.eps, nth);
+        round_inplace(h.data(), h.size(), act_round_, nth);
         gemm(h.data(), (size_t) D, N, D, L.up_w.data(), F, L.up_b.data(), up.data(), (size_t) F, nth);
         gelu_inplace(up.data(), up.size(), nth);
+        round_inplace(up.data(), up.size(), act_round_, nth);
         gemm(up.data(), (size_t) F, N, F, L.down_w.data(), D, L.down_b.data(), tmp.data(), (size_t) D, nth);
         for (size_t i = 0; i < x.size(); ++i) x[i] += tmp[i];
     }
@@ -313,9 +361,11 @@ bool VitRef::encode(const PreparedImage& img, int threads, std::vector<float>& r
     layer_norm(x.data(), h.data(), N, D, post_w_.data(), post_b_.data(), g.eps, nth);
     const int M = N / 4, Kin = 4 * D, Hid = g.merger_hidden, O = g.out_dim;
     std::vector<float> m1((size_t) M * Hid);
+    round_inplace(h.data(), h.size(), act_round_, nth);
     gemm(h.data(), (size_t) Kin, M, Kin, mm0_w_.data(), Hid, mm0_b_.data(), m1.data(), (size_t) Hid, nth);
     gelu_inplace(m1.data(), m1.size(), nth);
     rows.assign((size_t) M * O, 0.0f);
+    round_inplace(m1.data(), m1.size(), act_round_, nth);
     gemm(m1.data(), (size_t) Hid, M, Hid, mm2_w_.data(), O, mm2_b_.data(), rows.data(), (size_t) O, nth);
     return true;
 }

@@ -5,7 +5,7 @@
 #   build-own/strata-vision-own --mmproj <mmproj.gguf> [--gpu]      build-own/strata-vision-own-test [mmproj.gguf ...]
 # From tools/vision/CMakeLists.txt it is added as a subdirectory, and strata-vision links strata_vit_own (the GPU part follows STRATA_VISION_CUDA).
 cmake_minimum_required(VERSION 3.21)
-if(NOT CMAKE_PROJECT_NAME)
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
   project(strata_vision_own C CXX)
   set(STRATA_VIT_OWN_STANDALONE ON)
 endif()

@@ -35,6 +35,9 @@ private:
         std::vector<float> ln1_w, ln1_b, ln2_w, ln2_b, qkv_w, qkv_b, o_w, o_b, up_w, up_b, down_w, down_b;
     };
     VitGeometry g_;
+    // STRATA_VIT_REF_ROUND=1 (a diagnostic): each matrix product's input is rounded to its weight's 16-bit type (BF16 or F16) first, as ggml's CPU
+    // and CUDA backends do; it shows how much of a difference to mtmd is that rounding and how much is the maths.  0: no rounding (the reference).
+    int act_round_ = 0;               // 0 none, 1 BF16, 2 F16
     std::vector<float> patch_w_;      // [width][3 * patch * patch], the taps summed
     std::vector<float> patch_b_, pos_, post_w_, post_b_, mm0_w_, mm0_b_, mm2_w_, mm2_b_;
     std::vector<Layer> layers_;
