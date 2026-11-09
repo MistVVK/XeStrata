@@ -199,8 +199,10 @@ option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 # native-experts section far below, so a first configure registered four tests fewer than the second)
 option(STRATA_NATIVE_EXPERTS "Native (IQ) expert support through ggml-cpu" ON)
 # Own-stack phase 2: the CPU expert pool's dot products, activation quantizers and the --mtp-q4 requantizer come from the Strata quant layer
-# (src/quant, no ggml-cpu in the pool) instead of ggml-cpu's type traits.  OFF keeps the ggml path, selectable for two releases.  Default: ON on x86,
-# where the layer has the AVX / AVX2 tiers; OFF on arm64 until its NEON tier exists (the Generic tier alone would be slower than ggml's NEON dots).
+# (src/quant, no ggml-cpu in the pool) instead of ggml-cpu's type traits.  OFF keeps the ggml path, selectable for two releases.  Default: ON on x86 (AVX /
+# AVX2 tiers); OFF on arm64: the NEON tier is bit-exact against ggml-cpu's NEON dots (tests/quant/run_oracle.sh; Spark and Mac oracles, token gates identical,
+# RESULTS-OWN-2N.md) but the pool decode on the DGX Spark measured about 1.5% slower with it (IQ3_S gate/up, 8 + 6 interleaved pairs), and the plan's gate is the
+# same answers at least as fast.  -DSTRATA_OWN_CPU_QUANT=ON still builds it.
 if(STRATA_CPU_X86)
   option(STRATA_OWN_CPU_QUANT "CPU expert pool on the Strata quant layer (src/quant) instead of ggml-cpu's type traits" ON)
 else()

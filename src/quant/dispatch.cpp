@@ -29,6 +29,9 @@ int collect_dots(Type w, Arith a, const DotKernel** out, int cap) {
 #ifdef STRATA_QUANT_X86_TIERS
         avx_dot_table(), avx2_dot_table(), avx512_dot_table(),
 #endif
+#ifdef STRATA_QUANT_ARM_TIERS
+        neon_dot_table(),
+#endif
     };
     return gather(tables, w, a, out, cap, &DotKernel::weight);
 }
@@ -38,6 +41,9 @@ int collect_acts(Type act, Arith a, const ActKernel** out, int cap) {
         generic_act_table(),
 #ifdef STRATA_QUANT_X86_TIERS
         avx_act_table(), avx2_act_table(),
+#endif
+#ifdef STRATA_QUANT_ARM_TIERS
+        neon_act_table(),
 #endif
     };
     return gather(tables, act, a, out, cap, &ActKernel::act);

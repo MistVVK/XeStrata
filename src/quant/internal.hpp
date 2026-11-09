@@ -28,14 +28,24 @@
 namespace strata::quant {
 
 
-/// ggml's ue4m3 (NVFP4 sub-block scales) and e8m0 (MXFP4) decoders, halved as ggml does.
-inline float ue4m3_to_fp32(uint8_t x) {
+/// ggml's ue4m3 (NVFP4 sub-block scales) decoder, halved as ggml does: a 256-entry table (the NVFP4 dots decode four scales a block, and the ldexp form made them
+/// five times slower than ggml's table lookup).  The values are those of the formula in ue4m3_formula.
+inline float ue4m3_formula(uint8_t x) {
     if (x == 0 || x == 0x7F) return 0.0f;
     const int exp = (x >> 3) & 0xF;
     const int man = x & 0x7;
     const float raw = exp == 0 ? std::ldexp((float) man, -9) : std::ldexp(1.0f + (float) man / 8.0f, exp - 7);
     return raw * 0.5f;
 }
+struct Ue4m3Table {
+    float v[256];
+    Ue4m3Table() {
+        for (int i = 0; i < 256; ++i) v[i] = ue4m3_formula((uint8_t) i);
+    }
+};
+inline const Ue4m3Table g_ue4m3_table;   // built before main (ggml's ggml_table_f32_ue4m3 is a plain global table too); nothing decodes a scale during static initialization
+inline float ue4m3_to_fp32(uint8_t x) { return g_ue4m3_table.v[x]; }
+/// ggml's e8m0 (MXFP4) decoder, halved as ggml does.
 inline float e8m0_to_fp32_half(uint8_t x) {
     const uint32_t bits = x < 2 ? (0x00200000u << x) : (uint32_t) (x - 1) << 23;
     return f32_from_bits(bits);

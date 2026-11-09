@@ -116,13 +116,13 @@ Isa best_isa() noexcept {
     if (c.avx512 && c.avx512_vnni) return Isa::Avx512;
     if (c.avx2) return Isa::Avx2;
     if (c.avx) return Isa::Avx1;
-    if (c.neon) return Isa::Neon;
+    if (c.neon && c.dotprod) return Isa::Neon;   // the tier is ggml-cpu's dotprod flavour (the i8mm two-row code is not in it)
     return Isa::Scalar;
 }
 
 Arith default_arith() noexcept {
     const Caps& c = caps();
-    if (c.neon) return Arith::Neon;
+    if (c.neon) return c.dotprod ? Arith::Neon : Arith::Generic;
     if (c.avx2) return Arith::Avx2;
     if (c.avx) return Arith::Avx;
     return Arith::Generic;
@@ -132,7 +132,7 @@ bool isa_ok(Isa i) noexcept {
     const Caps& c = caps();
     switch (i) {
         case Isa::Scalar: return true;
-        case Isa::Neon: return c.neon;
+        case Isa::Neon: return c.neon && c.dotprod;
         case Isa::Avx1: return c.avx;
         case Isa::Avx2: return c.avx2;
         case Isa::Avx512: return c.avx512 && c.avx512_vnni;
