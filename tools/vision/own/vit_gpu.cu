@@ -431,6 +431,21 @@ bool VitGpu::available(std::string& why) {
     return true;
 }
 
+bool VitGpu::prefer_mtmd(std::string& why) {
+#if defined(STRATA_VIT_HIP)
+    (void) why;
+    return false;
+#else
+    cudaDeviceProp p;
+    if (cudaGetDeviceProperties(&p, 0) != cudaSuccess) { (void) cudaGetLastError(); return false; }
+    if (p.major == 6) {
+        why = "compute capability " + std::to_string(p.major) + "." + std::to_string(p.minor) + " (Pascal): the own GPU tower is slower than mtmd there";
+        return true;
+    }
+    return false;
+#endif
+}
+
 bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patches, std::string& err) {
     VitGpuImpl& m = *impl_;
     std::string why;

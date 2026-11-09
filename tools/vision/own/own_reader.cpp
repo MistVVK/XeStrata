@@ -36,7 +36,7 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
 bool own_reader_supported(const std::string& mmproj, bool gpu, std::string& why) {
     if (gpu) {
 #ifdef STRATA_VIT_GPU
-        if (!VitGpu::available(why)) return false;
+        if (!VitGpu::available(why) || VitGpu::prefer_mtmd(why)) return false;
 #else
         why = "this build has no GPU backend for the own tower";
         return false;
