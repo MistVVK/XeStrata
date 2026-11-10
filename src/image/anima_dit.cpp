@@ -596,9 +596,10 @@ MfOut AnimaDit::product(const uint16_t* x16, const float* rs, const W& w, const 
         float* sx = scales + xs_next_ * xq8_rows_;
         if (!same_input) qi_rows_i8(x16, false, T, w.k, xq8_, sx, rs, s_);
         const auto* sw = reinterpret_cast<const float*>(d + w.n * w.k);
-        // a reader's values as BF16 where the GPU takes such a product (kernels::i8_gemm_bf16): half the bytes it reads
-        if (defer && lora == nullptr && kernels::i8_gemm_bf16(xq8_, sx, reinterpret_cast<const int8_t*>(d), sw, bias,
-                                              reinterpret_cast<uint16_t*>(y), T, w.n, w.k, 0, s_)) {
+        // a reader's values as BF16 where the fused kernel is the faster (dit_rows::w8_fused): half the bytes it reads
+        if (defer && lora == nullptr && dit_rows::w8_fused(s_) &&
+            kernels::i8_gemm_bf16(xq8_, sx, reinterpret_cast<const int8_t*>(d), sw, bias,
+                                  reinterpret_cast<uint16_t*>(y), T, w.n, w.k, 0, s_)) {
             out.f = nullptr;
             out.bf = reinterpret_cast<const uint16_t*>(y);
             return out;

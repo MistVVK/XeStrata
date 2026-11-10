@@ -52,6 +52,8 @@ struct QkvIn {
         // QK kernel took the B70 twice its time, 3.3 s of an image's 6.8)
         const float* p = which == 0 ? q : which == 1 ? k : v;
         if (!i8) return p[idx];
+        if (which == 0 ? s[0].bf : which == 1 ? s[1].bf : s[2].bf)
+            return strata::kernels::f32_from_bf16(reinterpret_cast<const uint16_t*>(p)[idx]);
         const float* sx = which == 0 ? s[0].sx : which == 1 ? s[1].sx : s[2].sx;
         const float* sw = which == 0 ? s[0].sw : which == 1 ? s[1].sw : s[2].sw;
         return (float) sycl::bit_cast<int32_t>(p[idx]) * sx[t] * sw[c];
@@ -160,7 +162,16 @@ struct I8FromSwiglu {
     const int32_t* gu;
     const float *sx, *sw;
     int64_t inter;
+    bool bf;   // gu's values already scaled, as BF16
     template<int V> void load_sg(const sycl::sub_group&, int64_t r, int64_t k, float* v) const {
+        if (bf) {
+            const auto* row = reinterpret_cast<const uint16_t*>(gu) + r * 2 * inter;
+            for (int j = 0; j < V; ++j) {
+                const float g = f32_from_bf16(row[k + j]), u = f32_from_bf16(row[inter + k + j]);
+                v[j] = u * g / (1.f + sycl::exp(-g));
+            }
+            return;
+        }
         const int32_t* row = gu + r * 2 * inter;
         for (int j = 0; j < V; ++j) {
             const float g = (float) row[k + j] * sx[r] * sw[k + j];
@@ -222,7 +233,9 @@ void qi_gate_add(float* x, const float* h, const float* mod, int64_t n_text, int
     // the DiTs' gated residual (dit_rows::gate_add_by), the gate the text's or the image's row of mod, through tanh
     MfOut in;
     in.C = C;
-    if (i8 != nullptr) {
+    if (i8 != nullptr && i8->bf) {
+        in.bf = reinterpret_cast<const uint16_t*>(h);
+    } else if (i8 != nullptr) {
         in.i = reinterpret_cast<const int32_t*>(h);
         in.sx = i8->sx;
         in.sw = i8->sw;
@@ -250,10 +263,18 @@ void qi_qk_norm_rope16(const float* q, const float* k, const float* v, const flo
             // QkvIn::at's value, the row's pointers and scale taken once (the selects, not s[which]: see QkvIn)
             const int64_t c0 = h * hd;
             const float* p = (which == 0 ? in.q : which == 1 ? in.k : in.v) + t * heads * hd + c0;
-            const bool i8 = in.i8;
+            const bool bf = in.i8 && (which == 0 ? in.s[0].bf : which == 1 ? in.s[1].bf : in.s[2].bf);
+            const bool i8 = in.i8 && !bf;
             const float sxt = i8 ? (which == 0 ? in.s[0].sx : which == 1 ? in.s[1].sx : in.s[2].sx)[t] : 0.f;
             const float* sw = i8 ? (which == 0 ? in.s[0].sw : which == 1 ? in.s[1].sw : in.s[2].sw) + c0 : nullptr;
-            return [=](int64_t d) { return i8 ? (float) sycl::bit_cast<int32_t>(p[d]) * sxt * sw[d] : p[d]; };
+            // BF16 values at the same element offsets as the FP32 ones
+            const uint16_t* rb = bf ? reinterpret_cast<const uint16_t*>(
+                                          which == 0 ? in.q : which == 1 ? in.k : in.v) + t * heads * hd + c0
+                                    : nullptr;
+            return [=](int64_t d) {
+                return bf ? strata::kernels::f32_from_bf16(rb[d])
+                          : i8 ? (float) sycl::bit_cast<int32_t>(p[d]) * sxt * sw[d] : p[d];
+            };
         }
     };
     kernels::qk::Shape sh{T, heads, heads, head_dim};
@@ -320,7 +341,7 @@ bool qi_rows_i8_blocks(int type, const void* blocks, int64_t rows, int64_t K, in
 }
 
 void qi_swiglu_i8(const int32_t* gu, const QiI8& g, int64_t T, int64_t inter, int8_t* q, float* s, void* stream) {
-    qi_rows::rows_i8(qi_rows::I8FromSwiglu{gu, g.sx, g.sw, inter}, T, inter, q, s, stream);
+    qi_rows::rows_i8(qi_rows::I8FromSwiglu{gu, g.sx, g.sw, inter, g.bf}, T, inter, q, s, stream);
 }
 
 void qi_i8_scale(float* y, int64_t T, int64_t N, int64_t ldy, const float* sx, const float* sw, const float* bias,

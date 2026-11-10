@@ -406,13 +406,22 @@ bool QiDit::product(const uint16_t* x16, const W& w, float* y, int64_t T, int64_
             w8 = reinterpret_cast<const uint8_t*>(w8t_) - row0 * w.k;
             sw = s;
         }
-        prefill::Gemm::i8(x8, reinterpret_cast<const int8_t*>(w8 + row0 * w.k), reinterpret_cast<int32_t*>(y), T,
-                          rows, w.k, ldy, s_);
-        if (defer) {
-            i8_ = {sx, sw};
+        // a reader's values as BF16 where the fused kernel is the faster (dit_rows::w8_fused): scaled in its epilogue,
+        // half the bytes the reader reads
+        if (defer && col == nullptr && dit_rows::w8_fused(s_) &&
+            kernels::i8_gemm_bf16(x8, sx, reinterpret_cast<const int8_t*>(w8 + row0 * w.k), sw, nullptr,
+                                  reinterpret_cast<uint16_t*>(y), T, rows, w.k, ldy, s_)) {
+            i8_ = {nullptr, nullptr, true};
             deferred = true;
         } else {
-            qi_i8_scale(y, T, rows, ldy, sx, sw, nullptr, col, s_);
+            prefill::Gemm::i8(x8, reinterpret_cast<const int8_t*>(w8 + row0 * w.k), reinterpret_cast<int32_t*>(y), T,
+                              rows, w.k, ldy, s_);
+            if (defer) {
+                i8_ = {sx, sw};
+                deferred = true;
+            } else {
+                qi_i8_scale(y, T, rows, ldy, sx, sw, nullptr, col, s_);
+            }
         }
     } else if (w.packed) {
         const size_t need = kernels::iq_mmq_act_bytes(T, w.k);

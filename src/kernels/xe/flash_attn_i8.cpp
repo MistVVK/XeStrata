@@ -10,6 +10,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/platform/env.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/f16_gpu.hpp"
 #include "strata/kernels/matrix_report.hpp"
@@ -26,8 +27,12 @@
 #include <sycl/ext/oneapi/dot_product.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <type_traits>
@@ -155,11 +160,7 @@ inline float ex2(float x) {
 constexpr int kDotKind = 0;
 
 int jm_kind(const sycl::device& d) {
-    // not taken yet: on the B70 (IGC 2.41.16, compute-runtime 26.35, 2026-11-06) the kernel ran 9 times slower than
-    // oneDNN's 16-bit attention (its int8 B operands read column-major take a slow path; read row-major they need a
-    // VNNI transform that hung the threads), and a joint_matrix_apply of a factors' tile loaded from local memory
-    // dropped them: it waits for K and V written VNNI-packed by prep_i8
-    if (!built(0) || true) return 0;
+    if (!built(0)) return 0;
     for (const mx::combination& c : matrix_combinations(d)) {
         if (c.atype != mx::matrix_type::sint8 || c.btype != mx::matrix_type::sint8 ||
             c.ctype != mx::matrix_type::sint32 ||
@@ -290,10 +291,12 @@ void key_stats(sycl::queue& q, std::type_identity_t<const Src&> k16, std::type_i
 // attention reads at once: a dim's CH bytes Tp apart were 2% slower on the RX 9060 XT): one kernel, a work-group a head
 // and RB keys, V^T built in local memory so its rows go out RB bytes at a time; rows and keys past T up to Tp zero.
 // q16 null: the keys and values alone (make_prefix).  NvKernel's V^T (kind_of 2) holds each 16 keys in the order its
-// P operand takes them: at 4 i + j the key 2 i + (j & 1) + 8 (j >> 1).  JmKernel's (kinds 3, 4) is V^T whole,
-// [heads][D][Tp]: its B operand read column-major, a row Tp bytes long (a chunk's rows of 32 bytes were below the 64
-// a 2D block load takes, and V read row-major, which int8 takes through a VNNI transform, left the B70's threads
-// hanging; IGC 2.41.16, 2026-11-06).
+// P operand takes them: at 4 i + j the key 2 i + (j & 1) + 8 (j >> 1).  JmKernel's (kinds 3, 4) are K and V in
+// Intel's VNNI order a chunk at a time, the B operands' packed layout (4 K values of every column in a word): K
+// [heads][Tp / CH][D / 4][CH][4] (S = Q . K^T's B: a dim's group of 4, every key of the chunk) and V [heads][Tp / CH]
+// [CH / 4][D][4] (O = P . V's B: a key's group of 4, every dim).  Read column-major (K's rows, V^T whole) the B70 ran
+// the kernel 9 times slower than oneDNN's 16-bit attention, and V row-major, which int8 takes through a VNNI
+// transform, left its threads hanging (IGC 2.41.16, 2026-11-06).
 template <int HD = D, class Src = Dense>
 void prep_i8(sycl::queue& q, const uint16_t* q16, std::type_identity_t<const Src&> k16,
              std::type_identity_t<const Src&> v16, const float* mean,
@@ -303,7 +306,7 @@ void prep_i8(sycl::queue& q, const uint16_t* q16, std::type_identity_t<const Src
     static_assert(U % 4 == 0 && (U & (U - 1)) == 0, "whole words of 4 a lane, a power of 2 for the transform");
     const int kind = kind_of(q);
     // q16 null: the keys and values alone; k8 null: the queries alone (their own rows and heads: a causal attention's)
-    const bool with_q = q16 != nullptr, with_kv = k8 != nullptr, nv = kind == 2, whole = kind == 3 || kind == 4;
+    const bool with_q = q16 != nullptr, with_kv = k8 != nullptr, nv = kind == 2, packed = kind == 3 || kind == 4;
     const int64_t nc = Tp / CH;
     constexpr int RB = 128, WG = 256, TLD = RB + 4;   // V^T's rows in the tile: 4 lanes' dims a bank apart
     const int64_t C = heads * HD;
@@ -387,7 +390,20 @@ void prep_i8(sycl::queue& q, const uint16_t* q16, std::type_identity_t<const Src
                 mk = sycl::reduce_over_group(sg, mk, sycl::maximum<float>());
                 const float cq = mq > 0.f ? mq / 127.f : 1.f, ck = mk > 0.f ? mk / 127.f : 1.f;
                 if (with_q) store(q8 + base, vq, 1.f / cq);
-                if (with_kv && !nv) store(k8 + base, vk, 1.f / ck);
+                if (with_kv && packed) {   // the lane's words at their dims' groups of 4, the key's place in each
+#pragma unroll
+                    for (int w = 0; w < U / 4; ++w) {
+                        uint32_t wd = 0;
+#pragma unroll
+                        for (int u = 0; u < 4; ++u)
+                            wd |= (uint32_t) (uint8_t) (int8_t) sycl::rint(vk[4 * w + u] / ck) << (8 * u);
+                        const int64_t g = (int64_t) lane * (U / 4) + w;
+                        *reinterpret_cast<uint32_t*>(k8 + (((int64_t) hd * nc + t / CH) * (HD / 4) + g) * (CH * 4) +
+                                                     (t % CH) * 4) = wd;
+                    }
+                } else if (with_kv && !nv) {
+                    store(k8 + base, vk, 1.f / ck);
+                }
                 if (lane == 0) {
                     if (with_q) sq[t * heads + hd] = cq * qmul;
                     if (with_kv && !nv) sk[t * heads + hd] = ck;
@@ -433,8 +449,10 @@ void prep_i8(sycl::queue& q, const uint16_t* q16, std::type_identity_t<const Src
                 } else {
                     w = *reinterpret_cast<const uint32_t*>(&tile[d * TLD + tt]);
                 }
-                const int64_t at = whole ? ((int64_t) hd * HD + d) * Tp + t0 + tt
-                                         : (((int64_t) hd * nc + (t0 + tt) / CH) * HD + d) * CH + (t0 + tt) % CH;
+                const int64_t key = t0 + tt;
+                const int64_t at =
+                    packed ? (((int64_t) hd * nc + key / CH) * (CH / 4) + key % CH / 4) * (HD * 4) + (int64_t) d * 4
+                           : (((int64_t) hd * nc + key / CH) * HD + d) * CH + key % CH;
                 *reinterpret_cast<uint32_t*>(vt + at) = w;
             }
         });
@@ -1214,11 +1232,12 @@ struct DotKernel {
 // joint_matrix's int8 tiles (TM x TN x 32, s8 . s8 into s32) on SG lanes, for a GPU whose matrix engines report
 // that combination and that has no kernel above: Intel's XMX (Xe2's 8 x 16 x 32 on 16 lanes, Alchemist's 8 x 8 x 32
 // on 8).  A sub-group takes TM query rows of a head and walks its keys a layout chunk (CH) at a time: S = Q . K^T with
-// Q's tiles in registers and K's from global memory (the sub-groups of a work-group read the same keys, through the
-// caches), the scores into local memory, a row's softmax over its lanes (SG / TM of them), P in int8 against the
-// chunk's largest into local memory, O += P . V in FP32 accumulators.  A row's factors (the chunk's P scale, a moved
-// reference's correction, the second segment's V scales) reach the accumulators as a tile of them in local memory,
-// through a second joint_matrix: joint_matrix_apply gives a lane its elements but not where they sit (iq_mmq.cpp).
+// Q's tiles in registers and K's from global memory in VNNI order (prep_i8; the sub-groups of a work-group read the
+// same keys, through the caches), the scores into local memory, a row's softmax over its lanes (SG / TM of them), P in
+// int8 against the chunk's largest into local memory, O += P . V in FP32 accumulators, V in VNNI order.  A row's
+// factors (the chunk's P scale, a moved reference's correction) reach the accumulators through local memory: on
+// Intel's GPUs a lane holds its column of a TM x SG accumulator, its elements the rows in order (as iq_mmq.cpp reads
+// them); the second segment's V scales are a column's, the lane's own.
 template<int TN_, int SG_>
 struct JmKernel {
     static constexpr int TN = TN_, SG = SG_;
@@ -1226,11 +1245,11 @@ struct JmKernel {
     static constexpr int L = SG / TM, CW = CH / L;          // a row's lanes, a lane's columns of the chunk
     static constexpr int SLD = CH + 4, PLD = CH + 16, OLD = D + 4;
     static constexpr int SREG = TM * OLD > TM * SLD ? TM * OLD : TM * SLD;   // the scores, then the output
-    static_assert(SG % TM == 0 && CW % 8 == 0 && TN <= CH && CH % TN == 0 && D % TN == 0, "the tiles' shapes");
+    static_assert(SG % TM == 0 && CW % 8 == 0 && TN <= CH && CH % TN == 0 && D % TN == 0 && TN == SG && TK == CH,
+                  "the tiles' shapes (a lane a column; a chunk of keys P . V's K)");
     using A8 = mx::joint_matrix<sycl::sub_group, int8_t, mx::use::a, TM, TK, mx::layout::row_major>;
-    using B8 = mx::joint_matrix<sycl::sub_group, int8_t, mx::use::b, TK, TN, mx::layout::col_major>;
+    using B8 = mx::joint_matrix<sycl::sub_group, int8_t, mx::use::b, TK, TN, mx::layout::ext_intel_packed>;
     using C32 = mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, TM, TN>;
-    using CF = mx::joint_matrix<sycl::sub_group, float, mx::use::accumulator, TM, TN>;
 
     const int8_t *q8, *k8, *vt;
     const float *sq, *sk, *sv;
@@ -1239,7 +1258,8 @@ struct JmKernel {
     Seg b;
     sycl::local_accessor<float, 1> st;    // per sub-group: S [TM][SLD] (int32), then the output [TM][OLD]
     sycl::local_accessor<int8_t, 1> pl;   // per sub-group: P [TM][PLD]
-    sycl::local_accessor<float, 1> fl;    // per sub-group: a tile of factors [TM][TN]
+    sycl::local_accessor<float, 1> fl;    // per sub-group: a factor a row [TM]
+    sycl::local_accessor<uint32_t, 1> vl;  // the work-group's: the chunk's V [CH / 4][D][4]
 
     auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<STRATA_SUB_GROUP(SG)>}; }
 
@@ -1258,26 +1278,32 @@ struct JmKernel {
         sycl::sub_group sg = it.get_sub_group();
         const int g = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
         const int64_t h = (int64_t) it.get_group(0), C = heads * D;
-        const int64_t my0 = r0 + (int64_t) it.get_group(1) * NSG * TM + (int64_t) g * TM;
-        if (my0 >= row_end) return;   // no work-group barrier below
+        // a sub-group past the rows works on the work-group's first rows (the chunks' V through local memory take
+        // every sub-group at the work-group's barriers) and writes nothing
+        const int64_t mine = r0 + (int64_t) it.get_group(1) * NSG * TM + (int64_t) g * TM;
+        const bool active = mine < row_end;
+        const int64_t my0 = active ? mine : r0 + (int64_t) it.get_group(1) * NSG * TM;
+        const int wid = (int) it.get_local_id(1);
         float* S = &st[(size_t) g * SREG];
         int32_t* Si = reinterpret_cast<int32_t*>(S);
         int8_t* P8 = &pl[(size_t) g * TM * PLD];
-        float* F = &fl[(size_t) g * TM * TN];
+        float* F = &fl[(size_t) g * TM];
         const int r = lane / L, part = lane % L;   // the lane's row of the tile and its share of the row
-        // a row's factor into the tile of factors (every column), then into fm
-        auto factors = [&](float v, CF& fm) {
-            for (int c = part; c < TN; c += L) F[r * TN + c] = v;
+        // a row's factor into F[row] (its lanes write the same value), for every lane to read by its elements' rows
+        auto factors = [&](float v) {
             sycl::group_barrier(sg);
-            mx::joint_matrix_load(sg, fm, lp(F), TN, mx::layout::row_major);
+            if (part == 0) F[r] = v;
             sycl::group_barrier(sg);
         };
         A8 qa[D / TK];
 #pragma unroll
         for (int kk = 0; kk < D / TK; ++kk) mx::joint_matrix_load(sg, qa[kk], gp(q8 + my0 * C + h * D + kk * TK), C);
-        CF o[D / TN];
+        // the output's FP32 sums in the lane's registers: its column of each TN dims, the rows in order
+        float o[D / TN][TM];
 #pragma unroll
-        for (int nt = 0; nt < D / TN; ++nt) mx::joint_matrix_fill(sg, o[nt], 0.0f);
+        for (int nt = 0; nt < D / TN; ++nt)
+#pragma unroll
+            for (int i = 0; i < TM; ++i) o[nt][i] = 0.f;
         const float sql = sq[(my0 + r) * heads + h];
         float m = -INFINITY, l = 0.f;
         for (int segi = 0; segi < 2; ++segi) {
@@ -1287,18 +1313,28 @@ struct JmKernel {
             const int8_t* kp = sb ? b.k : k8;
             const int8_t* vp = sb ? b.vt : vt;
             const float* skp = sb ? b.sk : sk;
-            if (sb) {   // the output so far at the second segment's V scales: a dim's (a tile's column)
+            const int64_t nc = tp / CH;
+            if (sb) {   // the output so far at the second segment's V scales: a dim's, the lane's column
 #pragma unroll
                 for (int nt = 0; nt < D / TN; ++nt) {
-                    for (int e = lane; e < TM * TN; e += SG) F[e] = b.sw[h * D + nt * TN + e % TN];
-                    sycl::group_barrier(sg);
-                    CF fm;
-                    mx::joint_matrix_load(sg, fm, lp(F), TN, mx::layout::row_major);
-                    sycl::group_barrier(sg);
-                    mx::joint_matrix_apply(sg, o[nt], fm, [](float& a, float& f) { a *= f; });
+                    const float f = b.sw[h * D + nt * TN + lane];
+#pragma unroll
+                    for (int i = 0; i < TM; ++i) o[nt][i] *= f;
                 }
             }
             for (int64_t j0 = 0; j0 < keys; j0 += CH) {
+                // the chunk's V ([CH / 4][D][4], VNNI) into local memory, the work-group's, each TN dims' columns a
+                // block of their own ([D / TN][CH / 4][TN][4]: a B tile's rows TN words apart).  Its tiles read
+                // packed with rows D words apart, from global or local memory, ended the B70's threads there (IGC
+                // 2.41, 2026-11-10); and the sub-groups share it.
+                {
+                    const auto* src = reinterpret_cast<const uint32_t*>(vp + (h * nc + j0 / CH) * (CH * D));
+                    for (int w = wid; w < CH * D / 4; w += NSG * SG) {
+                        const int kr = w / D, d = w % D;
+                        vl[(d / TN) * (CH / 4 * TN) + kr * TN + d % TN] = src[w];
+                    }
+                }
+                sycl::group_barrier(it.get_group());
                 // S = Q . K^T, int32, the chunk's keys TN at a time
 #pragma unroll
                 for (int nt = 0; nt < CH / TN; ++nt) {
@@ -1307,7 +1343,9 @@ struct JmKernel {
 #pragma unroll
                     for (int kk = 0; kk < D / TK; ++kk) {
                         B8 kb;
-                        mx::joint_matrix_load(sg, kb, gp(kp + (j0 + nt * TN) * C + h * D + kk * TK), C);
+                        mx::joint_matrix_load(
+                            sg, kb, gp(kp + ((h * nc + j0 / CH) * (D / 4) + kk * (TK / 4)) * (CH * 4) + nt * TN * 4),
+                            CH * 4);
                         mx::joint_matrix_mad(sg, s, qa[kk], kb, s);
                     }
                     mx::joint_matrix_store(sg, s, lp(Si + nt * TN), SLD, mx::layout::row_major);
@@ -1333,11 +1371,14 @@ struct JmKernel {
                     m = cmx;
                 }
                 if (sycl::any_of_group(sg, corr != 1.f)) {
-                    CF fm;
-                    factors(corr, fm);
+                    factors(corr);
+                    float cf[TM];
+#pragma unroll
+                    for (int i = 0; i < TM; ++i) cf[i] = F[i];
 #pragma unroll
                     for (int nt = 0; nt < D / TN; ++nt)
-                        mx::joint_matrix_apply(sg, o[nt], fm, [](float& a, float& f) { a *= f; });
+#pragma unroll
+                        for (int i = 0; i < TM; ++i) o[nt][i] *= cf[i];
                 }
                 // P against the chunk's largest, 0 .. 127, its scale ps (as Kernel's)
                 const float ps = m == -INFINITY ? 0.f : sycl::native::exp2(cmx - m) / 127.f;
@@ -1351,33 +1392,39 @@ struct JmKernel {
                 }
                 for (int x = 1; x < L; x <<= 1) sum += sycl::permute_group_by_xor(sg, sum, x);
                 l += sum * ps;
-                CF fm;
-                factors(ps, fm);   // (its barrier also closes P's writes)
-                // O += P . V, V's B operand column-major out of V^T [heads][D][tp]
+                factors(ps);
+                // O += P . V, V's B operand in VNNI order: the chunk's [CH / 4][D][4]
                 A8 pa;
                 mx::joint_matrix_load(sg, pa, lp(P8), PLD);
+                float pf[TM];
+#pragma unroll
+                for (int i = 0; i < TM; ++i) pf[i] = F[i];
 #pragma unroll
                 for (int nt = 0; nt < D / TN; ++nt) {
                     C32 c;
                     mx::joint_matrix_fill(sg, c, 0);
                     B8 vb;
-                    mx::joint_matrix_load(sg, vb, gp(vp + (h * D + nt * TN) * tp + j0), tp);
+                    mx::joint_matrix_load(sg, vb, lp(reinterpret_cast<int8_t*>(&vl[0]) + nt * (CH * TN)), TN * 4);
                     mx::joint_matrix_mad(sg, c, pa, vb, c);
-                    CF cf;
-                    mx::joint_matrix_apply(sg, cf, c, [](float& f, int32_t& v) { f = (float) v; });
-                    mx::joint_matrix_apply(sg, cf, fm, [](float& f, float& s) { f *= s; });
-                    mx::joint_matrix_apply(sg, o[nt], cf, [](float& a, float& f) { a += f; });
+                    // the int32 sums at the row's P scale into the lane's sums: one matrix a call (an apply over an
+                    // int32 and an FP32 matrix together left the B70's threads hanging, IGC 2.41, 2026-11-10)
+                    int i = 0;
+                    mx::joint_matrix_apply(sg, c, [&](int32_t& v) {
+                        o[nt][i] = sycl::fma((float) v, pf[i], o[nt][i]);
+                        ++i;
+                    });
                 }
-                sycl::group_barrier(sg);   // S and P are read before the next chunk writes them
+                sycl::group_barrier(it.get_group());   // S, P and V are read before the next chunk writes them
             }
         }
-        // the output: O / l at V's scales
+        // the output: O / l at V's scales, the lanes' sums into local memory by row
 #pragma unroll
         for (int nt = 0; nt < D / TN; ++nt)
-            mx::joint_matrix_store(sg, o[nt], lp(S + nt * TN), OLD, mx::layout::row_major);
+#pragma unroll
+            for (int i = 0; i < TM; ++i) S[i * OLD + nt * TN + lane] = o[nt][i];
         sycl::group_barrier(sg);
         const int64_t t = my0 + r;
-        if (t < row_end && t >= first) {
+        if (active && t < row_end && t >= first) {
             const float inv = l > 0.f ? 1.f / l : 0.f;
             for (int d = part; d < D; d += L)
                 out16[(t - first) * C + h * D + d] = f16_from_f32(S[r * OLD + d] * inv * sv[h * D + d]);
@@ -1437,7 +1484,8 @@ void launch(sycl::queue& q, const Bufs& b, const float* sv, int64_t T, int64_t T
                 K k{b.q, b.k, b.vt, b.sq, b.sk, sv, out16, T, Tp, heads, r0, first, row_end, seg,
                     sycl::local_accessor<float, 1>(sycl::range<1>((size_t) (K::NSG * K::SREG)), h),
                     sycl::local_accessor<int8_t, 1>(sycl::range<1>((size_t) (K::NSG * K::TM * K::PLD)), h),
-                    sycl::local_accessor<float, 1>(sycl::range<1>((size_t) (K::NSG * K::TM * K::TN)), h)};
+                    sycl::local_accessor<float, 1>(sycl::range<1>((size_t) (K::NSG * K::TM)), h),
+                    sycl::local_accessor<uint32_t, 1>(sycl::range<1>((size_t) (CH * D / 4)), h)};
                 h.parallel_for(
                     sycl::nd_range<2>({(size_t) heads, groups * K::NSG * K::SG}, {1, (size_t) K::NSG * K::SG}), k);
             });
@@ -1578,6 +1626,47 @@ bool run_causal(sycl::queue& q, const uint16_t* q16, const Paged& k16, const Pag
 }  // namespace i8
 }  // namespace
 
+#if STRATA_HIP_KITCHEN
+// Whether comfy-kitchen's attention runs instead of XeStrata's own on q's GPU, where both run: the faster, timed once
+// a GPU at an image DiT's shape (4096 rows of 24 heads), the least of three after a warm-up of each.
+// XESTRATA_I8_ATTN_KITCHEN=0 or 1 fixes it.
+static bool kitchen_attn_first(sycl::queue& q) {
+    static core::PerDevice<int> of;
+    return of.get(q.get_device(), [&q] {
+        if (const char* e = strata::env_get("I8_ATTN_KITCHEN")) return std::atoi(e) != 0 ? 1 : 0;
+        if (i8::kind_of(q) == 0) return 1;
+        constexpr int64_t T = 4096, H = 24, C = H * D;
+        auto* x = sycl::malloc_device<uint16_t>((size_t) (4 * T * C), q);
+        if (x == nullptr) return 1;
+        // values of a few units, varied (equal ones would make every score the same)
+        q.parallel_for(sycl::range<1>((size_t) (4 * T * C)), [=](sycl::id<1> id) {
+             const uint32_t h = (uint32_t) id[0] * 2654435761u;
+             x[id[0]] = f16_from_f32((float) ((h >> 20) & 255) / 64.f - 2.f);
+         }).wait();
+        const uint16_t *q16 = x, *k16 = x + T * C, *v16 = x + 2 * T * C;
+        uint16_t* out = x + 3 * T * C;
+        auto best = [&](const std::function<bool()>& f) {
+            double t = 1e30;
+            for (int i = 0; i < 4; ++i) {
+                const auto t0 = std::chrono::steady_clock::now();
+                if (!f()) return 1e30;
+                q.wait();
+                const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+                if (i > 0) t = std::min(t, dt);
+            }
+            return t;
+        };
+        const double kit = best([&] { return hip_kitchen::attn(q, q16, k16, v16, T, H, D, 0, 0, out); });
+        const double own = best([&] { return i8::run(q, q16, k16, v16, T, H, 0, 0, T, out); });
+        sycl::free(x, q);
+        const int k = kit <= own ? 1 : 0;
+        std::fprintf(stderr, "xestrata: the int8 attention: %s (4096 rows of 24 heads: comfy-kitchen's %.2f ms, "
+                             "XeStrata's own %.2f)\n", k ? "comfy-kitchen's" : "XeStrata's own", 1e3 * kit, 1e3 * own);
+        return k;
+    }) == 1;
+}
+#endif
+
 int flash_attn_i8_kind(void* stream) { return i8::kind_of(core::Runtime::get().stream(stream)); }
 
 int flash_attn_i8_chunk() { return i8::CH; }
@@ -1588,7 +1677,7 @@ bool flash_attn_i8(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16
     sycl::queue& q = core::Runtime::get().stream(stream);
 #if STRATA_HIP_KITCHEN
     // comfy-kitchen's (AMD GPUs with WMMA): its own statistics (K smoothed by an anchor key, V's columns' scales)
-    if (hip_kitchen::attn(q, q16, k16, v16, T, heads, D, r0, first, out16)) {
+    if (kitchen_attn_first(q) && hip_kitchen::attn(q, q16, k16, v16, T, heads, D, r0, first, out16)) {
         if (!stream) q.wait();
         return true;
     }

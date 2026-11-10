@@ -30,6 +30,7 @@ void qi_ln_mod16(const float* x, const float* mod, int64_t n_text, int64_t T, in
 /// A W8A8 product's output left as its int32 sums (their bits in the FP32 array): value [t][n] = sum * sx[t] * sw[n].
 struct QiI8 {
     const float *sx = nullptr, *sw = nullptr;
+    bool bf = false;   // the product's values already scaled, as BF16 (kernels::i8_gemm_bf16): sx and sw unread
 };
 
 /// x[t] += h[t] * tanh(mod[t < n_text][...]); with i8, h holds a W8A8 product's sums.
