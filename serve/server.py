@@ -102,24 +102,11 @@ from serve import loras as lora_api  # noqa: E402
 from serve import translate as translate_mod  # noqa: E402
 from serve import translate_api  # noqa: E402
 from serve import vram_ledger  # noqa: E402
+from serve import line_process  # noqa: E402
+from serve.line_process import end_gpu_process, popen  # noqa: E402
 
 IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
-
-
-def popen(what: str, args: list, **kw):
-    """#735: subprocess.Popen, but Windows' refusal to start a program (WinError 4551, or 1260 when a policy blocks it:
-    Smart App Control on a clean Windows 11 blocks an exe that is not signed) is said in words instead of a bare
-    OSError."""
-    try:
-        return subprocess.Popen(args, **kw)
-    except OSError as e:
-        if getattr(e, "winerror", None) in (4551, 1260):
-            raise OSError(f"Windows blocked {what} ({args[0]}): Smart App Control, or an application-control policy, "
-                          "does not let a program that is not signed run. Turn Smart App Control off (Windows "
-                          "Security > App & browser control > Smart App Control settings), or - for the image encoder "
-                          "only - run setup with --vision no (see docs/TROUBLESHOOTING.md)") from e
-        raise
 
 
 def listen_problem(host: str, port: int, e: OSError) -> str:
@@ -580,24 +567,6 @@ DRAFT_HEAD_FAIL = "the draft head does not fit"
 DRAFT_HEAD_HINT = ("a smaller draft vocabulary needs less VRAM: --draft-vocab cyrillic (English, code and the Cyrillic "
                    "script) or --draft-vocab en (English and code, ~215 MiB less than the default). Run "
                    f"{SETUP_CMD} --draft-vocab en once and the model keeps it; or a smaller --context in setup.")
-
-
-def end_gpu_process(proc, grace: float = 10.0) -> None:
-    """End a GPU process the server cannot wait for: SIGTERM first, on which the engines drain their GPU queues before
-    they exit (at most 5 s: route_stop_signals in src/core/device.cpp), then SIGKILL when it is still there after
-    `grace`.  A SIGKILL alone left a copy running that read memory the exit had unmapped: on the B70 (xe) an engine
-    memory fault, a reset of the copy engine, and once a GPU wedged until a reboot."""
-    if proc is None:
-        return
-    try:
-        if proc.poll() is None:
-            proc.terminate()
-            proc.wait(timeout=grace)
-    except subprocess.TimeoutExpired:
-        with contextlib.suppress(OSError):
-            proc.kill()
-    except OSError:
-        pass
 
 
 def exit_text(rc: int | None) -> str:
@@ -1493,18 +1462,7 @@ class StrataEngine:
     @staticmethod
     def _ready_pump(proc, out: queue.Queue) -> None:
         """The engine's first lines up to READY, for a read that can time out; None when its output closed first."""
-        done = False
-        try:
-            for line in proc.stdout:
-                out.put(line)
-                if line.startswith("READY"):
-                    done = True
-                    return
-        except (OSError, ValueError):                   # the pipe closed under us (the engine was killed)
-            pass
-        finally:
-            if not done:
-                out.put(None)
+        line_process.pump_lines(proc, out, ready_only=True)
 
     def restart(self, tries: int = 3):
         """Start the engine again (the same command) after it died; the new process has its own line queue.
@@ -2689,23 +2647,8 @@ class StrataEngine:
         if self.proc is None:
             return
         try:
-            if self.proc.poll() is None:
-                try:
-                    self.proc.stdin.write("QUIT\n")
-                    self.proc.stdin.flush()
-                    self.proc.stdin.close()  # the engine's stdin reader sees EOF
-                    self.proc.wait(timeout=20)
-                except (OSError, ValueError, subprocess.TimeoutExpired):
-                    self.proc.terminate()
-                    self.proc.wait(timeout=20)
-        except subprocess.TimeoutExpired:
-            self.proc.kill()
-            try:
-                self.proc.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                raise EngineStuck("XeStrata is still releasing GPU/RAM; retry unloading after it exits") from None
-        except OSError:
-            pass
+            if not line_process.shutdown(self.proc, 20, 20, 20, close_stdin=True):
+                raise EngineStuck("XeStrata is still releasing GPU/RAM; retry unloading after it exits")
         finally:
             if self.proc.poll() is not None:
                 if self.pump is not None and self.pump.ident is not None:   # a restart can stop before starting it
@@ -2946,9 +2889,7 @@ class Vision:
 
     @staticmethod
     def _read(proc, lines):
-        for line in proc.stdout:
-            lines.put(line)
-        lines.put(None)                             # end of output: the encoder exited
+        line_process.pump_lines(proc, lines)
 
     def _line(self, timeout: float | None) -> str | None:
         """Its next line; "" when none came within `timeout` (None: wait for ever), None when it exited."""
@@ -3154,13 +3095,7 @@ class Vision:
                   flush=True)
 
     def _end(self):
-        if self.proc.poll() is None:
-            try:
-                self.proc.stdin.write("QUIT\n")
-                self.proc.stdin.flush()
-                self.proc.wait(timeout=10)
-            except Exception:
-                end_gpu_process(self.proc)
+        line_process.shutdown(self.proc, 10, 10)
         self._close_stdin()
 
     def close(self):

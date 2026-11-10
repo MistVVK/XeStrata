@@ -29,6 +29,10 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from serve import line_process  # noqa: E402
 
 ANSWERS = {"IMG": ("IMAGE",), "NEED": ("NEED",), "FREE": ("FREE",), "W8": ("W8",), "FIT": ("BUDGET",),
            "BUDGET": ("BUDGET",), "RELEASE": ("RELEASE",), "RATIO": ("RATIO",), "DETECT": ("DETECT",),
@@ -56,15 +60,12 @@ class Daemon:
         print(f"[image daemon] {text}", file=self.log, flush=True)
 
     def start(self) -> None:
-        self.proc = subprocess.Popen(self.cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
-                                     text=True, errors="replace", bufsize=1)
+        self.proc = line_process.popen(
+            "the XeStrata image engine", self.cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log,
+            text=True, errors="replace", bufsize=1)
 
-        def pump():
-            assert self.proc is not None and self.proc.stdout is not None
-            for line in self.proc.stdout:
-                self.lines.put(line.rstrip("\r\n"))
-            self.lines.put(None)
-        threading.Thread(target=pump, daemon=True).start()
+        threading.Thread(target=line_process.pump_lines, args=(self.proc, self.lines),
+                         kwargs={"strip": True}, daemon=True).start()
         t0 = time.monotonic()
         while True:
             try:
@@ -166,20 +167,7 @@ class Daemon:
         proc, self.proc = self.proc, None
         if proc is None:
             return
-        with contextlib.suppress(OSError, ValueError):
-            if proc.stdin is not None:
-                proc.stdin.write("QUIT\n")
-                proc.stdin.flush()
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            # SIGTERM first: xestrata-image drains its GPU queues on it before it exits (at most 5 s); a SIGKILL alone
-            # left a copy running that read unmapped memory (the B70: an engine memory fault and a reset)
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        line_process.shutdown(proc, 10, 10)
 
 
 def write(f, line: str) -> None:
