@@ -17,7 +17,7 @@ struct OwnReaderOptions {
 };
 
 // True when our tower can read this mmproj with this backend; otherwise `why` says what is missing (`--tower auto` falls back to mtmd then).
-bool own_reader_supported(const std::string& mmproj, bool gpu, std::string& why);
+bool own_reader_supported(const std::string& mmproj, bool gpu, int max_tokens, std::string& why);      // max_tokens: --max-tokens (0: not given)
 
 // Runs the reader on stdin/stdout; returns the process exit code (0 after QUIT or end of input).
 int own_reader_run(const OwnReaderOptions& o);

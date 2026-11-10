@@ -34,7 +34,7 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
 
 }  // namespace
 
-bool own_reader_supported(const std::string& mmproj, bool gpu, std::string& why) {
+bool own_reader_supported(const std::string& mmproj, bool gpu, int max_tokens, std::string& why) {
     if (gpu) {
 #ifdef STRATA_VIT_GPU
         bool bf16 = false;      // the layer matrices' type decides on Pascal (vit_gpu.h)
@@ -44,7 +44,7 @@ bool own_reader_supported(const std::string& mmproj, bool gpu, std::string& why)
             if (g0.open(mmproj, e0))
                 if (const GgufTensorInfo* t = g0.tensor("v.blk.0.attn_qkv.weight")) bf16 = t->type == GT_BF16;
         }
-        if (!VitGpu::available(why) || VitGpu::prefer_mtmd(bf16, why)) return false;
+        if (!VitGpu::available(why) || VitGpu::prefer_mtmd(bf16, max_tokens, why)) return false;
 #else
         why = "this build has no GPU backend for the own tower";
         return false;
