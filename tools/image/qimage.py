@@ -986,11 +986,29 @@ AUX = {
 CNET_KINDS = {"canny": (), "gray": (), "scribble": (), "scribble_xdog": (), "scribble_hed": ("cnet-hed",),
               "hed": ("cnet-hed",), "lineart": ("cnet-lineart",), "lineart_coarse": ("cnet-lineart-coarse",),
               "mlsd": ("cnet-mlsd",), "depth": ("cnet-depth",), "pose": ("cnet-yolox", "cnet-dwpose")}
+# Capabilities used by setup and the server, independent of the installed model's name.
+FAMILY_CAPABILITIES = {
+    "qwen-image": {"pipeline": "qwen", "control": "controlnet"},
+    "mage-flow": {"pipeline": "flow", "max_refs": 3, "control_reference": True, "guidance_methods": True},
+    "hunyuan-image-3": {"pipeline": "guided_token", "max_refs": HUNYUANIMAGE3_MAX_REFS, "control_reference": True},
+    "moss-image": {"pipeline": "latent_chat", "max_refs": 4, "control": "moss", "control_reference": True,
+                   "chat_text_states": True, "control_ref_resize": True},
+    "anima": {"pipeline": "dual_tokenizer"},
+}
+
+
+def family_capabilities(family: str | None) -> dict:
+    if family is None or family == "":
+        return FAMILY_CAPABILITIES["qwen-image"]
+    return FAMILY_CAPABILITIES.get(family, {}) if isinstance(family, str) else {}
+
+
 MF_DIR = "mage-flow"
 MOSS_DIR = "moss-image"
 MOSS_CFG = 3.0             # MOSS-Image's guidance scale and its schedule's shift (its pipeline's defaults)
 MOSS_SHIFT = 5.0
 ANIMA_DIR = "anima"
+ANIMA_DEFAULT_CFG = 4.0
 ANIMA_CFG = {"anima-turbo": 1.0}   # Anima's guidance scale by DiT where it is not 4
 ANIMA_SHIFT = 3.0
 ANIMA_USER = "anima:"              # a derivative's --images name: anima:<its file's name without .safetensors>
@@ -1418,7 +1436,7 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
             start["lora_block_map"] = list(ANIMA_29_MAP)
         return {**q8, "model_name": name, "family": "anima", "exe": str(exe), "quant": "bf16", **loras, **start,
                 "diffusion_model": str(user or local_path(models_dir, f"{dit}-bf16")), "steps": DITS[dit][1],
-                "schedule": "anima", "cfg_scale": ANIMA_CFG.get(dit, 4.0), "shift": ANIMA_SHIFT,
+                "schedule": "anima", "cfg_scale": ANIMA_CFG.get(dit, ANIMA_DEFAULT_CFG), "shift": ANIMA_SHIFT,
                 "sampler": "er_sde", "transparency": False, "vae": str(local_path(models_dir, "anima-vae")),
                 "llm": str(local_path(models_dir, text_file(text_encoder, text_quant))),
                 "t5_tokenizer": str(local_path(models_dir, "anima-t5-tokenizer")), "text_encoder": text_encoder,

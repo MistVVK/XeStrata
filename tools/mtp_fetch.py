@@ -33,7 +33,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # the checkout, for serve/envvars.py
-from serve import envvars  # noqa: E402
+from serve import envvars, file_lock  # noqa: E402
 
 # #214: a fixed commit of the checkpoint (its `sha` from https://huggingface.co/api/models/Qwen/Qwen3.8-Flash-Next
 # on 2026-09-30), so every install reads the same tensors; XESTRATA_MTP_REVISION overrides it (e.g. main).  When the
@@ -199,13 +199,7 @@ def lock_folder(out, wait=900.0):
     told = False
     while True:
         try:
-            if os.name == "nt":
-                import msvcrt
-                f.seek(0)
-                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            file_lock.acquire(f, rewind=True)
             return f
         except OSError:
             if time.monotonic() > end:

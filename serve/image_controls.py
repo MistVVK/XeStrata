@@ -75,12 +75,12 @@ FOLLOW = {"pose": "the pose of the person in image {i}", "depth": "the compositi
 def mode_of(cfg: dict, kind: str) -> str | None:
     """How the model of the config section `cfg` takes a control of `kind`: "controlnet", "moss", "reference" or
     None."""
-    family = cfg.get("family") or "qwen-image"
-    if family == "qwen-image":
+    caps = img._qimage().family_capabilities(cfg.get("family"))
+    if caps.get("control") == "controlnet":
         return "controlnet" if kind != "color" else None
-    if family == "moss-image" and kind in MOSS_KINDS:
+    if caps.get("control") == "moss" and kind in MOSS_KINDS:
         return "moss"
-    if family in ("mage-flow", "hunyuan-image-3", "moss-image") and img.can_edit(cfg) and kind != "color":
+    if caps.get("control_reference") and img.can_edit(cfg) and kind != "color":
         return "reference"
     return None
 
@@ -88,8 +88,7 @@ def mode_of(cfg: dict, kind: str) -> str | None:
 def capability(cfg: dict) -> str | None:
     """How the model takes its control images, as /health says it: "controlnet", "moss" (its color and depth adapter,
     the other kinds as references where it edits), "reference" or None."""
-    family = cfg.get("family") or "qwen-image"
-    if family == "moss-image":
+    if img._qimage().family_capabilities(cfg.get("family")).get("control") == "moss":
         return "moss"
     return mode_of(cfg, "canny")
 
@@ -119,10 +118,8 @@ def decode_image(v) -> bytes:
         return bytes(v)
     if not isinstance(v, str) or not v:
         raise img.ImageRequestError("control.image: a picture (base64, or a data: URL)")
-    if v.startswith("data:"):
-        v = v.split(",", 1)[-1]
     try:
-        return base64.b64decode(v, validate=True)
+        return img.decode_inline_image(v, strict=True)
     except ValueError:
         raise img.ImageRequestError("control.image: not base64") from None
 
@@ -393,7 +390,7 @@ def prepare(svc, gen, job: dict, cancel=None) -> None:
         if not refs:
             raise img.ImageRequestError("control: this image model takes the control image as a reference image")
         ref = made["image"]
-        if gen.cfg.get("family") == "moss-image":
+        if img._qimage().family_capabilities(gen.cfg.get("family")).get("control_ref_resize"):
             ref = img.moss_ref(ref)
         refs[-1] = ref
         job["refs"] = refs

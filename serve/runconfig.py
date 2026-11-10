@@ -23,6 +23,8 @@ import shutil
 import urllib.parse
 from pathlib import Path
 
+from serve import option_values, sampling, settings
+
 # (key, kind, help).  kind: "bool", "int>=0", "num>=0", ("enum", values), "names", or ("sampling", check) for a key
 # of the "sampling" block, ("arg", flag) for an engine option kept in "args".
 EDITABLE = [
@@ -39,7 +41,7 @@ EDITABLE = [
      "Anthropic requests that do not ask for thinking: think as the model does (model) or not (on_request)"),
     ("effort_position", ("enum", ["start", "end"]),
      "Where a non-default reasoning effort goes: start (the default) or end (keeps the cache when it changes)"),
-    ("script_guard", ("enum", ["off", "ja", "en", "ko", "zh-cn", "zh-tw"]),
+    ("script_guard", ("enum", [option_values.GUARD_OFF, *option_values.GUARD_LANGS]),
      "Keep other languages' characters out of the answers of requests that name none: ja, en "
      "(English and the like: no CJKV), ko, zh-cn or zh-tw; off: as the model writes"),
     ("aliases", "names", "Other model names the server lists and answers to (comma-separated)"),
@@ -56,7 +58,7 @@ EDITABLE = [
     ("open_browser", "bool", "Open the chat page in the browser when the model is ready"),
     ("vram_reserve_mib", ("arg", "--vram-reserve-mib"),
      "VRAM in MiB the engine leaves free for other programs (engine default 700)"),
-    ("search_engine", ("enum", ["searxng", "deepseek", "tinyfish"]),
+    ("search_engine", ("enum", list(option_values.SEARCH_ENGINES)),
      "Web search: searxng (the server at search_url), deepseek (DeepSeek's search API, billed per search) or "
      "tinyfish (TinyFish's search API, free up to a daily allowance)"),
     ("search_url", "url",
@@ -124,8 +126,7 @@ def view(cfg: dict, path: str | Path, settings: dict | None = None, settings_pat
 
 
 def _number(key, v, whole=False, lo=0.0, hi=None, lo_open=False):
-    if isinstance(v, bool) or not isinstance(v, (int, float)) or (whole and v != int(v)) or \
-            (v <= lo if lo_open else v < lo) or (hi is not None and v > hi):
+    if not sampling.number(v, whole=whole, lo=lo, hi=hi, lo_open=lo_open):
         rng = f"{'more than' if lo_open else 'at least'} {lo:g}" + (f" and at most {hi:g}" if hi is not None else "")
         raise ValueError(f"{key}: expected a {'whole ' if whole else ''}number, {rng}, not {v!r}")
     return int(v) if whole else v
@@ -249,29 +250,12 @@ def save(path: str | Path, cfg: dict) -> Path:
     return bak
 
 
-def save_settings(path: str | Path, settings: dict) -> None:
-    """The user's settings written whole and readable by this user only, as setup writes them (no .bak: setup keeps
-    none either)."""
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as f:
-        f.write(json.dumps(settings, indent=1))
-    os.chmod(tmp, 0o600)
-    os.replace(tmp, path)
+def save_settings(path: str | Path, data: dict) -> None:
+    settings.save(path, data)
 
 
 def load_settings(path: str | Path) -> dict:
-    """The user's settings; none yet is {}.  One that cannot be read is a ValueError (OSError), never taken for
-    empty: writing it back would lose setup's keys."""
-    try:
-        text = Path(path).read_text(encoding="utf-8-sig")
-    except FileNotFoundError:
-        return {}
-    s = json.loads(text)
-    if not isinstance(s, dict):
-        raise ValueError(f"{Path(path).name} is not a JSON object")
-    return s
+    return settings.load(path)
 
 
 def load(path: str | Path) -> dict:

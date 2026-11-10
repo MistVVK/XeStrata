@@ -76,7 +76,9 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
 
-from serve import envvars, kernel_check, model_terms, places, release_check
+from serve import envvars, hardware, kernel_check, model_terms, places, release_check, settings
+from serve import option_values as OV
+from serve.model_terms import _qimage
 from serve import translate as translate_mod
 
 ROOT = Path(__file__).resolve().parent
@@ -1665,7 +1667,7 @@ def _memory_status():
 def ram_gb():
     if WIN:
         return _memory_status().ullTotalPhys / 2**30
-    for line in open("/proc/meminfo"):
+    for line in hardware.proc_text("meminfo").splitlines():
         if line.startswith("MemTotal"):
             return int(line.split()[1]) * 1024 / 2**30
     return 0.0
@@ -1695,7 +1697,7 @@ def cpu_info():
         except (OSError, ValueError, subprocess.SubprocessError):
             return name, False, False
     try:
-        txt = open("/proc/cpuinfo").read()
+        txt = hardware.proc_text("cpuinfo")
         flags = set(re.search(r"^flags\s*:\s*(.*)$", txt, re.M).group(1).split())
         avx2 = "avx2" in flags
         avx512 = {"avx512f", "avx512bw", "avx512vl", "avx512_vnni", "avx512vbmi"} <= flags
@@ -1727,17 +1729,8 @@ def drm_memory(render: str, driver: str):
     try:
         vram = vis = 0
         if driver == "xe":
-            # struct drm_xe_device_query; DRM_XE_DEVICE_QUERY_MEM_REGIONS = 1; regions of 88 bytes after 8
-            q = bytearray(struct.pack("QIIQQQ", 0, 1, 0, 0, 0, 0))
-            req = _drm_iowr(0x40, len(q))
-            fcntl.ioctl(fd, req, q)
-            buf = ctypes.create_string_buffer(struct.unpack_from("I", q, 12)[0])
-            struct.pack_into("Q", q, 16, ctypes.addressof(buf))
-            fcntl.ioctl(fd, req, q)
-            for i in range(struct.unpack_from("I", buf, 0)[0]):
-                cls, _, _, total, _, cpu_vis, _ = struct.unpack_from("HHIQQQQ", buf, 8 + 88 * i)
-                if cls == 1:                                # DRM_XE_MEM_REGION_CLASS_VRAM
-                    vram, vis = vram + total, vis + cpu_vis
+            for total, _, cpu_vis in hardware.xe_regions(fd):
+                vram, vis = vram + total, vis + cpu_vis
         elif driver == "i915":
             # struct drm_i915_query with one DRM_I915_QUERY_MEMORY_REGIONS (4) item; regions of 88 bytes after 16
             item = ctypes.create_string_buffer(struct.pack("QiIQ", 4, 0, 0, 0))
@@ -2919,10 +2912,7 @@ def gpu_files_missing(g) -> str | None:
     nvidia-smi, which reach them."""
     if g.get("driver") not in ("xe", "i915", "nvidia", "amdgpu"):
         return None
-    need = [g.get("render") or ("/dev/nvidiactl" if g.get("vendor") == "nvidia" else "a render node")]
-    if g.get("vendor") == "amd":
-        need.append("/dev/kfd")
-    gone = [p for p in need if not Path(p).exists()]
+    gone = hardware.missing_devices(g.get("vendor"), g.get("render"))
     if not gone:
         return None
     where = ("not passed into this container" if Path("/run/.containerenv").exists() or Path("/.dockerenv").exists()
@@ -5080,13 +5070,6 @@ def remove_old_image_engine() -> None:
             ok(f"removed {rel}/: the earlier image generator (sd-cli), which XeStrata's own image engine replaced")
 
 
-def _qimage():
-    if str(ROOT / "tools" / "image") not in sys.path:
-        sys.path.insert(0, str(ROOT / "tools" / "image"))
-    import qimage
-    return qimage
-
-
 def text_ram_gb(args: list, ram: float, model: str | None = None) -> float:
     """The RAM (GB) the text model's run config keeps for itself, the OS's room included: its RAM budget and the
     OS's room (--resident-budget-gib), all of it when its experts are read through the file cache (--mmap-experts),
@@ -5629,10 +5612,7 @@ DISPLAY_RESERVE_MIB = 1500     # upstream #779: the tip for an NVIDIA card that 
 DESKTOP_RESERVE_MIB = 3072     # upstream #560 #516: what kept a KDE/Wayland desktop alive beside a full expert cache
 
 
-def linux_desktop(env=None) -> bool:
-    """A graphical session on Linux (Wayland or X)."""
-    env = os.environ if env is None else env
-    return sys.platform.startswith("linux") and bool(env.get("WAYLAND_DISPLAY") or env.get("DISPLAY"))
+linux_desktop = hardware.linux_desktop
 
 
 def desktop_reserve_note() -> list[str]:
@@ -6020,15 +6000,14 @@ def settings_path() -> Path:
 
 def load_settings() -> dict:
     try:
-        return json.loads(settings_path().read_text(encoding="utf-8"))
+        return settings.load(settings_path(), strict=False)
     except (OSError, ValueError):
         return {}
 
 
 def save_settings(s: dict) -> None:
     try:
-        settings_path().parent.mkdir(parents=True, exist_ok=True)
-        write_private(settings_path(), json.dumps(s, indent=1))
+        settings.save(settings_path(), s)
     except OSError as e:
         warn(f"could not save {settings_path()} ({e})")
 
@@ -6270,8 +6249,9 @@ def script_guard_setup(a) -> None:
 
 # the search APIs setup offers: name -> (who, the settings' key, the launcher's variable, the terms)
 WEB_SEARCH_APIS = {
-    "deepseek": ("DeepSeek", "deepseek_api_key", "XESTRATA_DEEPSEEK_API_KEY", "billed by DeepSeek per search"),
-    "tinyfish": ("TinyFish", "tinyfish_api_key", "XESTRATA_TINYFISH_API_KEY", "free up to TinyFish's daily allowance"),
+    OV.SEARCH_DEEPSEEK: ("DeepSeek", "deepseek_api_key", "XESTRATA_DEEPSEEK_API_KEY", "billed by DeepSeek per search"),
+    OV.SEARCH_TINYFISH: ("TinyFish", "tinyfish_api_key", "XESTRATA_TINYFISH_API_KEY",
+                         "free up to TinyFish's daily allowance"),
 }
 
 
@@ -8388,10 +8368,11 @@ OPTIONS = [
             "TinyFish's search API with your API key (asked without echo; free up to a daily allowance); no takes "
             "either out. A SearXNG-compatible server of your own is its address as search_url in settings.json. "
             "Without it setup asks the first time, and with --setup",
-            choices=[["no", "Off"],
-                     ["deepseek", "DeepSeek's search API: your API key, billed by DeepSeek per search (USD 0.75 per "
+            choices=[[OV.SEARCH_OFF, "Off"],
+                     [OV.SEARCH_DEEPSEEK, "DeepSeek's search API: your API key, billed by DeepSeek per search "
+                      "(USD 0.75 per "
                       "1,000); the search words go to DeepSeek"],
-                     ["tinyfish", "TinyFish's search API: your API key, free up to a daily allowance (12,000 "
+                     [OV.SEARCH_TINYFISH, "TinyFish's search API: your API key, free up to a daily allowance (12,000 "
                       "searches, 1,000 pages read); the search words and the pages found go to TinyFish"]],
             default="no", question="Use web search?"),
     _option("deepseek-api-key", "DeepSeek API key (kept in your settings, never shown)",
@@ -8512,9 +8493,9 @@ OPTIONS = [
             "what the text model does during an image job (default auto: stays loaded when both fit, else gives VRAM "
             "back or is unloaded and its conversation restored afterwards)",
             place="images",
-            choices=[["auto", "Auto: stays when both fit, else gives VRAM back or is unloaded"],
-                     ["keep", "Keep it loaded"], ["shrink", "Give VRAM back for the image"],
-                     ["unload", "Unload it, its conversation restored afterwards"]],
+            choices=[[OV.GPU_POLICIES[0], "Auto: stays when both fit, else gives VRAM back or is unloaded"],
+                     [OV.GPU_POLICIES[1], "Keep it loaded"], [OV.GPU_POLICIES[2], "Give VRAM back for the image"],
+                     [OV.GPU_POLICIES[3], "Unload it, its conversation restored afterwards"]],
             default="auto", when=["images"]),
     # ---- the translation model (serve/translate.py's MODELS)
     _option("translate", "Translation: a model of its own for the translation APIs and the web page's Translate tab "
@@ -8587,12 +8568,13 @@ OPTIONS = [
             "Chinese ones; off leaves them as the model writes. The web page and a request's own \"script_guard\" go "
             "over it. Without it setup asks the first time, and with --setup",
             place="start",
-            choices=[["ja", "Japanese: no Simplified Chinese, Hangul or Vietnamese letters in the answers"],
-                     ["en", "English and others: no CJK characters or Vietnamese letters"],
-                     ["ko", "Korean: no kana, Han characters Korean does not use, or Vietnamese letters"],
-                     ["zh-cn", "Chinese (Simplified): no kana, Hangul or Japanese-only characters"],
-                     ["zh-tw", "Chinese (Traditional): no kana, Hangul or Japanese-only characters"],
-                     ["off", "Off: answers as the model writes them"]],
+            choices=[[OV.GUARD_LANGS[0], "Japanese: no Simplified Chinese, Hangul or Vietnamese letters "
+                      "in the answers"],
+                     [OV.GUARD_LANGS[1], "English and others: no CJK characters or Vietnamese letters"],
+                     [OV.GUARD_LANGS[2], "Korean: no kana, Han characters Korean does not use, or Vietnamese letters"],
+                     [OV.GUARD_LANGS[3], "Chinese (Simplified): no kana, Hangul or Japanese-only characters"],
+                     [OV.GUARD_LANGS[4], "Chinese (Traditional): no kana, Hangul or Japanese-only characters"],
+                     [OV.GUARD_OFF, "Off: answers as the model writes them"]],
             default="en", keep=True, question="Keep other languages' characters out?"),
     _option("ple-io", "Qwen3.8-Flash-Next's n-gram table",
             "how the engine reads Qwen3.8-Flash-Next's n-gram table, kept for the model: ram = the whole table in RAM "

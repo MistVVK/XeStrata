@@ -147,17 +147,20 @@ import time
 from pathlib import Path
 from typing import Any, Callable, cast
 
+from serve import file_lock, option_values
 from serve import downgrades
 from serve import image_aux
 from serve import loras as lora_api
 from serve import envvars
 from serve import vram_ledger
+from serve.image_daemon import START_TIMEOUT_S
+from serve.model_terms import _qimage
 
-TURBO_STEPS = 8
+TURBO_STEPS = _qimage().DITS["turbo"][1]
 MAX_STEPS = 100                    # the base model's
 CFG_MAX = 30.0                     # guidance_scale / true_cfg_scale (vLLM-Omni: "typically 0.0-20.0")
 MODEL_NAME = "qwen-image-2.1-turbo"
-POLICIES = ("auto", "keep", "shrink", "unload")
+POLICIES = option_values.GPU_POLICIES
 SIZE_STEP = 16                     # the VAE's 8x and the DiT's 2x2 patches: sides made at a multiple of 16, then cut
 MIN_SIDE = 256
 MAX_N = 16                         # "max_n": the most images one request makes
@@ -264,14 +267,14 @@ MF_EDIT_HEAD = ("<|im_start|>system\nDescribe the key features of the input imag
                 "original input where appropriate.<|im_end|>\n<|im_start|>user\n")
 MF_EDIT_DROP = 64
 MF_EDIT_REF = "Image {i}: <|vision_start|><|image_pad|><|vision_end|>"
-MF_MAX_REFS = 3                    # the edit models' training takes up to three references
+MF_MAX_REFS = _qimage().FAMILY_CAPABILITIES["mage-flow"]["max_refs"]
 MF_SHIFT = 6.0                     # Mage-Flow's static time shift
 MF_NEG = " "                       # its pipeline's negative prompt when none is given
 MAGETRAIL_QUALITY = "masterpiece, best quality, very aesthetic, aesthetic"   # its README's, after the tags
 MF_SAMPLERS = ("euler", "er_sde")  # Mage-Flow's own Euler first; er_sde on request (without edits)
-HUNYUANIMAGE3_STEPS = 8            # HunyuanImage 3.0 Instruct-Distil's own (its generation_config's diff_infer_steps)
-HUNYUANIMAGE3_GUIDANCE = 2.5       # its guidance token's default (diff_guidance_scale)
-HUNYUANIMAGE3_MAX_REFS = 3         # its edits' reference images at most (each about 5,000 tokens at 1024x1024)
+HUNYUANIMAGE3_STEPS = _qimage().DITS["hunyuanimage3"][1]
+HUNYUANIMAGE3_GUIDANCE = _qimage().HUNYUANIMAGE3_GUIDANCE
+HUNYUANIMAGE3_MAX_REFS = _qimage().HUNYUANIMAGE3_MAX_REFS
 HUNYUANIMAGE3_VIT_PATCH = 16       # SigLIP2's patch, and the slots a reference's features take (its processor's)
 HUNYUANIMAGE3_VIT_SLOTS = 1024
 # MOSS-Image's prompt (its pipeline's encode_prompt: the chat template with thinking on, the user's turn alone), all of
@@ -279,9 +282,9 @@ HUNYUANIMAGE3_VIT_SLOTS = 1024
 MOSS_PROMPT_HEAD = "<|im_start|>user\n"
 MOSS_PROMPT_TAIL = "<|im_end|>\n<|im_start|>assistant\n<think>\n"
 MOSS_MAX_IDS = 4096
-MOSS_STEPS = 50                    # its pipeline's defaults: 50 steps, guidance 3, shift 5, an empty negative prompt,
-MOSS_CFG = 3.0                     # block 22 skipped by the negative pass, no skip-layer guidance (slg_scale 0)
-MOSS_SHIFT = 5.0
+MOSS_STEPS = _qimage().DITS["moss-sft"][1]
+MOSS_CFG = _qimage().MOSS_CFG       # block 22 skipped by the negative pass, no skip-layer guidance (slg_scale 0)
+MOSS_SHIFT = _qimage().MOSS_SHIFT
 MOSS_NEG = ""
 MOSS_UNCOND_SKIP = [22]
 MOSS_FEW_STEPS = 4                 # the 4-step adapter's step codes (its card: 1 to 4, 4 recommended)
@@ -293,7 +296,7 @@ MOSS_SHIFT_MAX = 20.0
 # was trained, no image to the text encoder, the references' latents to the DiT
 MOSS_EDIT_STEPS = 30
 MOSS_EDIT_CFG = 5.0
-MOSS_MAX_REFS = 4
+MOSS_MAX_REFS = _qimage().FAMILY_CAPABILITIES["moss-image"]["max_refs"]
 # the layouts edit adapters are trained in (moss_edit_format; ai-toolkit's training code and each adapter's model
 # card): chinoll's Moss-Image-Edit (the references at timestep 0, seeing only each other); ai-toolkit's (ostris), whose
 # text encoder sees the references too (each as "Picture N:" before the prompt, at most MOSS_PICTURE_PIXELS, 384 x
@@ -310,9 +313,9 @@ MOSS_EDITFMT_WORDS = {"ai-toolkit": "aitk", "ai-toolkit-no-kv": "aitk-nokv", "ap
 MOSS_EDIT_DEFAULT = "chinoll"
 MOSS_PICTURE_PIXELS = 384 * 384
 MOSS_AITK_REF_PIXELS = 524288
-ANIMA_STEPS = 30                   # the model card's 30 to 50 (Turbo: 8 to 12, its config's 10), CFG 4 to 5 (Turbo 1)
-ANIMA_CFG = 4.0
-ANIMA_SHIFT = 3.0                  # the model's sampling shift
+ANIMA_STEPS = _qimage().DITS["anima-base"][1]
+ANIMA_CFG = _qimage().ANIMA_DEFAULT_CFG
+ANIMA_SHIFT = _qimage().ANIMA_SHIFT
 ANIMA_SAMPLERS = ("er_sde", "euler")
 ANIMA_NEG = ("worst quality, low quality, score_1, score_2, score_3, 6 fingers, 6 toes, ai-generated, bad eyes, "
              "bad pupils, bad iris, bad hands, bad fingers, watermark, patreon logo")
@@ -330,7 +333,6 @@ REF_MAX_BYTES = 32 << 20
 MAX_REFS = 10                      # Qwen-Image-2.1's own limit (its model card)
 GROW_WAIT_S = 10.0                 # the expert cache's growing back after a shrink, tried again for this long
 RAM_SPARE_MIB = 2048               # RAM an image job leaves free beside its prefix cache (the OS, the server)
-START_TIMEOUT_S = 600              # the engine's start: the parts opened and a small image made (kernels built)
 
 
 class ImageRequestError(ValueError):
@@ -419,6 +421,10 @@ def _int_field(req: dict, key: str, lo: int, hi: int, default):
     return parse_number(req.get(key), key, lo, hi, default, whole=True)
 
 
+def _pipeline(family: str | None) -> str | None:
+    return _qimage().family_capabilities(family).get("pipeline")
+
+
 def model_defaults(cfg: dict) -> dict:
     """What a request leaves out gets from the image model of the config's "images" section `cfg` (parse_request and
     cfg_request take theirs from here; the web page shows them): steps (Turbo's fixed, steps_fixed; Mage-Flow's edit
@@ -431,16 +437,16 @@ def model_defaults(cfg: dict) -> dict:
     resolution buckets (buckets: [width, height] each; a request's size is made at the one whose shape is nearest).
     MOSS-Image's are its pipeline's: the shift, the blocks the negative pass skips, skip-layer guidance's fields, and
     that it takes a layout of boxes and a prompt enhanced by the chat's model."""
-    mage = cfg.get("family") == "mage-flow"
-    hunyuan = cfg.get("family") == "hunyuan-image-3"
-    moss = cfg.get("family") == "moss-image"
-    anima = cfg.get("family") == "anima"
+    mage = _pipeline(cfg.get("family")) == "flow"
+    hunyuan = _pipeline(cfg.get("family")) == "guided_token"
+    moss = _pipeline(cfg.get("family")) == "latent_chat"
+    anima = _pipeline(cfg.get("family")) == "dual_tokenizer"
     if cfg.get("schedule") == "base":
-        steps, least, fixed = int(cfg.get("steps") or 40), 2, False
+        steps, least, fixed = int(cfg.get("steps") or _qimage().DITS["base"][1]), 2, False
     elif anima:   # Anima: any count on its shift
         steps, least, fixed = int(cfg.get("steps") or ANIMA_STEPS), 1, False
     elif cfg.get("schedule") == "mage":
-        steps, least, fixed = int(cfg.get("steps") or 4), 1, False
+        steps, least, fixed = int(cfg.get("steps") or _qimage().DITS["mf-turbo"][1]), 1, False
     elif cfg.get("schedule") == "hunyuanimage3":   # HunyuanImage 3.0: any count on the engine's own shift
         steps, least, fixed = int(cfg.get("steps") or HUNYUANIMAGE3_STEPS), 1, False
     elif cfg.get("schedule") == "moss":   # MOSS-Image: any count on its static shift
@@ -611,7 +617,7 @@ def parse_request(req: dict, cfg: dict) -> dict:
     w, h = parse_size(req.get("size"), int(cfg.get("max_side") or 2048))
     bucket = None
     requested: dict = {}
-    if cfg.get("family") == "hunyuan-image-3":    # its own table: the bucket nearest the shape asked for
+    if _pipeline(cfg.get("family")) == "guided_token":    # its own table: the bucket nearest the shape asked for
         bucket = hunyuanimage3_bucket(cfg, w, h)
         if req.get("size") in (None, "auto") and cfg.get("ratio_head"):
             requested = {"choose_size": True}
@@ -658,7 +664,7 @@ def parse_request(req: dict, cfg: dict) -> dict:
     guide = guidance_request(req, cfg, job)
     if guide:
         job["guide"] = guide
-    if cfg.get("family") == "moss-image":
+    if _pipeline(cfg.get("family")) == "latent_chat":
         job.update(moss_request(req, cfg))
         if req.get("layout") is not None:
             job["layout"] = parse_layout(req["layout"])
@@ -895,7 +901,7 @@ def cfg_request(req: dict, cfg: dict | None = None) -> dict:
         v = parse_number(req.get(key), key, 0, CFG_MAX)
         if v is not None:
             out[key] = v
-    if (cfg or {}).get("family") == "hunyuan-image-3":
+    if _pipeline((cfg or {}).get("family")) == "guided_token":
         out.pop("negative_prompt", None)
         scale = out.get("guidance_scale")
         if scale is None:
@@ -904,10 +910,10 @@ def cfg_request(req: dict, cfg: dict | None = None) -> dict:
             scale = float((cfg or {}).get("guidance") or HUNYUANIMAGE3_GUIDANCE)
         out["guidance"] = float(scale)
         return out
-    if (cfg or {}).get("family") in ("mage-flow", "moss-image", "anima"):
+    if _pipeline((cfg or {}).get("family")) in ("flow", "latent_chat", "dual_tokenizer"):
         dflt = model_defaults(cfg or {})
         scale = out.get("true_cfg_scale", out.get("guidance_scale", dflt["guidance"]))
-        if scale > 1 or (scale != 1 and (cfg or {}).get("family") == "moss-image"):
+        if scale > 1 or (scale != 1 and _pipeline((cfg or {}).get("family")) == "latent_chat"):
             out["cfg"] = scale
             out.setdefault("negative_prompt", dflt["negative_prompt"])
         return out
@@ -954,7 +960,9 @@ def guidance_methods(cfg: dict) -> list[str]:
     """The guidance methods this image model's sampling takes (model_defaults' guidance_methods): Qwen-Image-2.1's
     and Mage-Flow's (MageTrail's too), each method checked on that model's sampler; none for
     the others (MOSS-Image keeps its own skip-layer guidance, slg_layers and the rest)."""
-    return list(GUIDANCE_METHODS) if cfg.get("family") in (None, "", "mage-flow") else []
+    family = cfg.get("family")
+    return list(GUIDANCE_METHODS) if family is None or family == "" or \
+        _qimage().family_capabilities(family).get("guidance_methods") else []
 
 
 def chat_guidance_methods(cfg: dict) -> list[str]:
@@ -1042,7 +1050,7 @@ def percent_sigma(cfg: dict, width: int, height: int, percent: float) -> float:
     t = min(max(1.0 - percent, 0.0), 1.0)   # the schedule's time, 1 at its start
     if t in (0.0, 1.0):
         return t
-    if cfg.get("family") == "mage-flow":
+    if _pipeline(cfg.get("family")) == "flow":
         return MF_SHIFT * t / (1.0 + (MF_SHIFT - 1.0) * t)
     seq = (width // SIZE_STEP) * (height // SIZE_STEP)
     mu = 0.5 + (0.9 - 0.5) / (8192 - 256) * (seq - 256)
@@ -1083,6 +1091,13 @@ def model_prompt(job: dict) -> str:
     return job["prompt"]
 
 
+def decode_inline_image(value: str, strict: bool) -> bytes:
+    """Decode inline image data, preserving each caller's data URL and validation rules."""
+    if value.startswith("data:"):
+        value = value.split(",", 1)[-1 if strict else 1]
+    return base64.b64decode(value, validate=strict)
+
+
 def encode_image(png: bytes, fmt: str, compression: int, opaque: bool = False) -> bytes:
     """A made image (png_rgba's PNG) in OpenAI's output_format: PNG as it is, jpeg (no alpha: on white) and webp at
     `compression` as their quality (Pillow), jxl at it as its quality, 100 lossless (cjxl); `opaque` (background
@@ -1093,16 +1108,26 @@ def encode_image(png: bytes, fmt: str, compression: int, opaque: bool = False) -
         return encode_jxl(png, compression)
     import io
     from PIL import Image
-    im = Image.open(io.BytesIO(png))
-    if fmt == "jpeg" or opaque:
+    return encode_pillow(Image.open(io.BytesIO(png)), fmt, compression, opaque)
+
+
+def encode_pillow(im, fmt: str, compression: int | None = None, opaque: bool = False) -> bytes:
+    """Encode a Pillow image; absent compression keeps the region API's lossless WebP and JPEG quality 95."""
+    import io
+    from PIL import Image
+    if (fmt == "jpeg" and im.mode in ("RGBA", "LA")) or opaque:
         bg = Image.new("RGB", im.size, (255, 255, 255))
         bg.paste(im, mask=im.split()[-1])
         im = bg
     out = io.BytesIO()
     if fmt == "jxl":
         im.save(out, format="PNG")
-        return encode_jxl(out.getvalue(), compression)
-    im.save(out, format=fmt.upper(), **({} if fmt == "png" else {"quality": compression}))
+        return encode_jxl(out.getvalue(), 100 if compression is None else compression)
+    if fmt == "jpeg":
+        im = im.convert("L" if im.mode == "L" else "RGB")
+    options = ({"lossless": True} if fmt == "webp" and compression is None else
+               {"quality": 95 if compression is None else compression} if fmt == "jpeg" or fmt == "webp" else {})
+    im.save(out, format=fmt.upper(), **options)
     return out.getvalue()
 
 
@@ -1158,15 +1183,6 @@ def image_dims(data: bytes) -> tuple[int, int]:
                 return w, h
             i += 2 + length
     raise ImageRequestError("a reference image: PNG, JPEG, GIF or BMP")
-
-
-def _qimage():
-    """tools/image/qimage.py, the one table of setup's --images choices (setup.py takes it the same way)."""
-    tools = str(Path(__file__).resolve().parent.parent / "tools" / "image")
-    if tools not in sys.path:
-        sys.path.insert(0, tools)
-    import qimage
-    return qimage
 
 
 def setup_choice(cfg: dict) -> str:
@@ -1350,10 +1366,8 @@ def upscale_request(fields: dict) -> tuple[dict, str | None]:
 def refs_limit(cfg: dict) -> int:
     """The images an edit of the model takes at most, the one it edits among them: the config's max_refs, else its
     family's own limit."""
-    family = cfg.get("family")
-    return int(cfg.get("max_refs") or (MF_MAX_REFS if family == "mage-flow" else HUNYUANIMAGE3_MAX_REFS
-                                       if family == "hunyuan-image-3" else MOSS_MAX_REFS if family == "moss-image"
-                                       else MAX_REFS))
+    caps = _qimage().family_capabilities(cfg.get("family"))
+    return int(cfg.get("max_refs") or caps.get("max_refs", MAX_REFS))
 
 
 def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | None = None) -> dict:
@@ -1369,9 +1383,9 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
     and drawn again (job["refine"], CROP_REFINE_STRENGTH).  strength (parse_strength): how much of the schedule runs
     from the first image (job["strength"] and the steps it runs, job["steps_run"], when below 1); an edit's default 1,
     an img2img's img2img_strength of its steps, or 1 with a mask."""
-    mage = cfg.get("family") == "mage-flow"
-    hunyuan = cfg.get("family") == "hunyuan-image-3"
-    moss = cfg.get("family") == "moss-image"
+    mage = _pipeline(cfg.get("family")) == "flow"
+    hunyuan = _pipeline(cfg.get("family")) == "guided_token"
+    moss = _pipeline(cfg.get("family")) == "latent_chat"
     edits = can_edit(cfg)
     strength = parse_strength(req)
     if not images:
@@ -1710,7 +1724,7 @@ def crop_gen_size(cfg: dict, w: float, h: float) -> tuple[int, int]:
     """The size the model draws a box of w x h at: HunyuanImage 3.0's bucket nearest its shape; the others' about
     1024 x 1024 pixels in its shape, sides multiples of 32 that an edit's reference keeps as they are (ref_size's
     fixed point: the reference and the latent the same size), within max_side."""
-    if cfg.get("family") == "hunyuan-image-3":
+    if _pipeline(cfg.get("family")) == "guided_token":
         b = hunyuanimage3_bucket(cfg, max(1, round(w)), max(1, round(h)))
         return int(b["width"]), int(b["height"])
     side = int(cfg.get("max_side") or 2048)
@@ -2012,12 +2026,13 @@ def prompt_ids(tok, prompt: str, refs: int = 0, family: str = "qwen-image") -> l
     an edit's MF_EDIT_HEAD, each reference "Image j: <pad>" before the instruction); MOSS-Image's in its pipeline's
     (the user's turn and the assistant's opened with <think>, MOSS_PROMPT_HEAD and MOSS_PROMPT_TAIL; Qwen3.5-9B's
     tokenizer)."""
-    if family == "moss-image":   # `refs`: an ai-toolkit edit's pictures, each "Picture N: <pad>" before the prompt
+    # ai-toolkit edit pictures each put "Picture N: <pad>" before the prompt
+    if _pipeline(family) == "latent_chat":
         head = MOSS_PROMPT_HEAD + "".join(f"Picture {i + 1}: <|vision_start|><|image_pad|><|vision_end|>"
                                           for i in range(refs))
         text = head + prompt + MOSS_PROMPT_TAIL
         return tok.encode(text, parse_special=True, plain=[(len(head), len(head) + len(prompt))])
-    if family == "mage-flow":
+    if _pipeline(family) == "flow":
         head = MF_EDIT_HEAD + "".join(MF_EDIT_REF.format(i=i + 1) for i in range(refs)) if refs else MF_PROMPT_HEAD
     else:
         head = PROMPT_HEAD + "".join(REF_PROMPT.format(sep=" " if i else "", i=i + 1) for i in range(refs))
@@ -2185,7 +2200,7 @@ def load_tokenizer(path: str, family: str = "qwen-image"):
     """The prompt's tokenizer (tools/strata_tokenizer.py): HunyuanImage 3.0's own `tokenizer.json` (a byte-level BPE,
     from_hf) or Qwen3-VL's (Anima's Qwen3's), from the text encoder's GGUF."""
     strata_tokenizer = _tokenizer_module()
-    if family == "hunyuan-image-3":
+    if _pipeline(family) == "guided_token":
         return strata_tokenizer.Tokenizer.from_hf(path)
     return strata_tokenizer.Tokenizer.from_gguf(path)
 
@@ -2194,9 +2209,9 @@ def can_edit(cfg: dict) -> bool:
     """Whether the image model of the config section `cfg` edits (takes reference images): Qwen-Image-2.1's and
     Mage-Flow's with their vision encoder (and Mage-Flow's edit model), HunyuanImage 3.0's with its vision model's
     file, MOSS-Image's with its edit adapter (edit_lora); MageTrail does not."""
-    if cfg.get("family") == "moss-image":
+    if _pipeline(cfg.get("family")) == "latent_chat":
         return bool(cfg.get("edit_lora"))
-    return bool(cfg.get("vision")) and not (cfg.get("family") == "mage-flow" and not cfg.get("edit_model"))
+    return bool(cfg.get("vision")) and not (_pipeline(cfg.get("family")) == "flow" and not cfg.get("edit_model"))
 
 
 def moss_edit_adapter(cfg: dict) -> dict:
@@ -2445,12 +2460,7 @@ class GpuTurn:
 
     def _try(self, f) -> bool:
         try:
-            if sys.platform == "win32":
-                import msvcrt
-                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            file_lock.acquire(f)
             return True
         except OSError:
             return False
@@ -2475,10 +2485,7 @@ class GpuTurn:
         if f is None:
             return
         with contextlib.suppress(OSError):
-            if sys.platform == "win32":
-                import msvcrt
-                f.seek(0)
-                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            file_lock.release(f)
         f.close()                                     # flock's lock goes with the file
 
     def daemons(self) -> list[str]:
@@ -2740,7 +2747,7 @@ class ImageGen:
         if reload not in ("lazy", "eager"):
             raise ValueError(f'images "reload" must be lazy or eager, not {reload!r}')
         self.family = self.cfg.get("family") or "qwen-image"
-        if self.family == "moss-image":   # its edit adapter, as the config or the environment chooses
+        if _pipeline(self.family) == "latent_chat":   # its edit adapter, as the config or the environment chooses
             self.cfg.update(moss_edit_adapter(self.cfg))
             # the engine opens the vision encoder where any adapter a request may name needs it (moss_pick_adapter;
             # it reads it only for a request with pictures)
@@ -2755,8 +2762,8 @@ class ImageGen:
                              "uses (run setup with --images again)")
         self.policy, self.reload = policy, reload
         # the ids the DiT does not take: the leading system turn's (HunyuanImage 3.0's DiT reads all of its own)
-        self.drop = (0 if self.family in ("hunyuan-image-3", "moss-image", "anima")
-                     else MF_DROP if self.family == "mage-flow" else DROP)
+        self.drop = (0 if _pipeline(self.family) in ("guided_token", "latent_chat", "dual_tokenizer")
+                     else MF_DROP if _pipeline(self.family) == "flow" else DROP)
         self.model = self.cfg.get("model_name") or MODEL_NAME
         self.log = log
         out = self.cfg.get("out_dir")
@@ -2868,10 +2875,10 @@ class ImageGen:
     def _file_keys(self) -> tuple[str, ...]:
         """The config keys that name this model's files: HunyuanImage 3.0's tokenizer and system prompt stand where the
         others' text encoder does."""
-        if self.family == "hunyuan-image-3":
+        if _pipeline(self.family) == "guided_token":
             return ("exe", "diffusion_model", "vae", "tokenizer", "system_prompt") + \
                 (("vision",) if self.cfg.get("vision") else ())
-        if self.family == "anima":   # its LLM adapter's queries come from the T5 tokenizer
+        if _pipeline(self.family) == "dual_tokenizer":   # its LLM adapter's queries come from the T5 tokenizer
             return ("exe", "diffusion_model", "vae", "llm", "t5_tokenizer")
         return ("exe", "diffusion_model", "vae", "llm") + (("vision",) if self.cfg.get("vision") else ())
 
@@ -2880,7 +2887,7 @@ class ImageGen:
 
     def _tokenizer_path(self) -> str:
         """HunyuanImage 3.0's tokenizer.json or Qwen3-VL's text encoder GGUF, as the config names them."""
-        return self.cfg["tokenizer"] if self.family == "hunyuan-image-3" else self.cfg["llm"]
+        return self.cfg["tokenizer"] if _pipeline(self.family) == "guided_token" else self.cfg["llm"]
 
     def system_text(self) -> str:
         """HunyuanImage 3.0's system prompt (setup's en_unified.txt), read once: the ids start with it."""
@@ -2939,13 +2946,13 @@ class ImageGen:
         if self.tok is None:
             self.tok = load_tokenizer(self._tokenizer_path(), self.family)
         if "ids" not in job:
-            if self.family == "hunyuan-image-3":   # the DiT reads the whole sequence, the image blocks in it
+            if _pipeline(self.family) == "guided_token":   # the DiT reads the whole sequence, the image blocks in it
                 bucket = job.get("bucket") or hunyuanimage3_bucket(self.cfg, job["width"], job["height"])
                 # a reference image's block names the bucket nearest its shape: the engine reads it at that size
                 job["ref_buckets"] = [hunyuanimage3_bucket(self.cfg, *image_dims(r)) for r in job.get("refs") or ()]
                 job["ids"] = hunyuanimage3_ids(self.tok, model_prompt(job), bucket, self._base_size(),
                                                self.system_text(), job["ref_buckets"])
-            elif self.family == "anima":
+            elif _pipeline(self.family) == "dual_tokenizer":
                 if self.t5 is None:
                     _tokenizer_module()   # tools/ on the path
                     import strata_unigram
@@ -2956,13 +2963,13 @@ class ImageGen:
                     job["neg_ids"], job["neg_t5"], job["neg_t5_w"] = neg_parts
             else:
                 # MOSS-Image's references are pictures of the prompt only for an ai-toolkit adapter
-                refs = (len(job.get("refs") or ()) if self.family != "moss-image" or
+                refs = (len(job.get("refs") or ()) if _pipeline(self.family) != "latent_chat" or
                         job.get("edit_format", "").startswith("ai-toolkit") else 0)
                 ids = prompt_ids(self.tok, model_prompt(job), refs, self.family)
                 neg = None
                 if job.get("cfg"):   # guidance's negative prompt, in the same form (its pads as the prompt's)
                     neg = prompt_ids(self.tok, job["negative_prompt"], refs, self.family)
-                if self.family == "moss-image":   # its pipeline's max_sequence_length
+                if _pipeline(self.family) == "latent_chat":   # its pipeline's max_sequence_length
                     for what, x in (("prompt", ids), ("negative_prompt", neg or ())):
                         if len(x) > MOSS_MAX_IDS:
                             raise ImageRequestError(f"{what}: {len(x)} tokens in MOSS-Image's form, over its "
@@ -2997,7 +3004,7 @@ class ImageGen:
 
     def drop_of(self, job: dict) -> int:
         """The system turn's ids the DiT does not take: Mage-Flow's edit form has its own."""
-        return MF_EDIT_DROP if self.family == "mage-flow" and job.get("refs") else self.drop
+        return MF_EDIT_DROP if _pipeline(self.family) == "flow" and job.get("refs") else self.drop
 
     @staticmethod
     def _moss_words(job: dict) -> str:
@@ -3447,8 +3454,8 @@ class ImageGen:
                 # HunyuanImage 3.0's sigmas are the engine's own (from the step count): its step count and the
                 # guidance token's scale go instead
                 guide = (f" STEPS:{job['steps']} GUID:{job['guidance']:g}" if sched == "hunyuanimage3" else
-                         self._moss_words(job) if self.family == "moss-image" else
-                         self._anima_words(job) if self.family == "anima" else
+                         self._moss_words(job) if _pipeline(self.family) == "latent_chat" else
+                         self._anima_words(job) if _pipeline(self.family) == "dual_tokenizer" else
                          f" SAMPLER:{job['sampler']}" if job.get("sampler") else "")
                 guide += guidance_words(job, self.cfg, mw, mh)
                 for i in range(first, job["n"]):
@@ -4129,11 +4136,11 @@ class ImageTools:
         self.user = user or {}
         if self.user.get("layout") is not None:   # the user's boxes are MOSS-Image's: a model of its, chosen or not
             every = list(images.gens.values()) if isinstance(images, ImageModels) else [gen]
-            moss = [g for g in every if g.family == "moss-image"]
+            moss = [g for g in every if _pipeline(g.family) == "latent_chat"]
             if not moss:
                 raise ImageRequestError("xestrata_images.layout: the boxes are MOSS-Image's, and no MOSS-Image model "
                                         "is installed here")
-            if self.models is None and gen.family != "moss-image":
+            if self.models is None and _pipeline(gen.family) != "latent_chat":
                 gen = moss[0]
         self.svc, self.gen, self.messages, self.load, self.normalize = svc, gen, messages, load, normalize
         # the skills: "index", the tools' short descriptions, load_skill's (serve/skills.py SkillTools) carrying
@@ -4285,15 +4292,16 @@ class ImageTools:
                     **({} if len(guided) == len(gens) else
                        {"description": f"{', '.join(g.model for g in guided)} only"})}}
                 t["parameters"] = params
-            moss = [g.model for g in gens if g.family == "moss-image"]
-            if t["name"] == "edit_image" and not any(can_edit(g.cfg) for g in gens if g.family == "moss-image"):
+            moss = [g.model for g in gens if _pipeline(g.family) == "latent_chat"]
+            if t["name"] == "edit_image" and not any(
+                    can_edit(g.cfg) for g in gens if _pipeline(g.family) == "latent_chat"):
                 params = dict(t["parameters"])   # refine is MOSS-Image's edits' alone
                 params["properties"] = {k: v for k, v in params["properties"].items() if k != "refine"}
                 t["parameters"] = params
-            adapters = {name: a for g in gens if g.family == "moss-image" and can_edit(g.cfg)
+            adapters = {name: a for g in gens if _pipeline(g.family) == "latent_chat" and can_edit(g.cfg)
                         for name, a in moss_edit_adapters(g.cfg).items()}
             if t["name"] == "edit_image" and len(adapters) > 1:   # MOSS-Image's edit adapters, named by the user
-                default = next((g.cfg.get("edit_adapter") for g in gens if g.family == "moss-image"), None)
+                default = next((g.cfg.get("edit_adapter") for g in gens if _pipeline(g.family) == "latent_chat"), None)
                 params = dict(t["parameters"])
                 params["properties"] = {**params["properties"], "edit_adapter": {
                     "type": "string",
@@ -4470,7 +4478,7 @@ class ImageTools:
     @staticmethod
     def _about(g) -> str:
         """A model the catalog does not describe: a derivative of Anima the user put in its folder."""
-        if g.family == "anima":
+        if _pipeline(g.family) == "dual_tokenizer":
             return f"a derivative of Anima ({Path(str(g.cfg.get('diffusion_model', ''))).name})"
         return ""
 
@@ -4529,7 +4537,7 @@ class ImageTools:
         if name == "control":
             gens = [g for g in gens if _controls().capability(g.cfg)]
         if args.get("layout") not in (None, "", {}):
-            gens = [g for g in gens if g.family == "moss-image"] or gens
+            gens = [g for g in gens if _pipeline(g.family) == "latent_chat"] or gens
         asked = args.get("model")
         gen = next((g for g in gens if g.model == asked), gens[0] if gens else self.gen)
         return "images", gen.model, self.may_lend(args)
@@ -4742,7 +4750,7 @@ class ImageTools:
                 version = image_regions.birefnet_version(args.get("version"))
                 bg = image_regions.parse_color(args.get("background_color"))
                 got = image_regions.matte(self.svc, gen, picture, version, None, True, cancel)
-                png = image_regions.encode(image_regions.cut_out(picture, got, bg), "png")
+                png = encode_pillow(image_regions.cut_out(picture, got, bg), "png")
                 url = f"/v1/images/files/{gen.store(png, 'png')}"
                 text = (f"The background is {'replaced' if bg else 'removed'} (BiRefNet {got['version']}, "
                         f"{got['seconds']:.1f} s"
@@ -4810,7 +4818,7 @@ class ImageTools:
                 req["size"] = f"{w}x{h}"
                 args = {**args, "layout": self.user["layout"]}
             if args.get("layout") not in (None, "", {}):   # boxes, the user's or the model's: a MOSS-Image model
-                moss = [g.model for g in self._gens() if g.family == "moss-image"]
+                moss = [g.model for g in self._gens() if _pipeline(g.family) == "latent_chat"]
                 if moss and args.get("model") not in moss:
                     args = {**args, "model": moss[0]}
             if args.get("layout") not in (None, "", {}):   # MOSS-Image's boxes
@@ -5564,7 +5572,8 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
                         if cancel is not None and cancel.is_set():
                             raise _client_gone(svc)
                         time.sleep(0.25)
-                if gen.family == "moss-image":   # its text encoder by the chat's engine, while that holds the GPU
+                if _qimage().family_capabilities(gen.family).get("chat_text_states"):
+                    # Its text encoder runs by the chat engine while that holds the GPU.
                     text_states(svc, gen, job)
                 try:
                     need = gen.need(job)
@@ -5696,7 +5705,7 @@ def separate_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None 
         held = True
         models.activate(gen)
         gen.begin(job)
-        if gen.family == "moss-image":
+        if _qimage().family_capabilities(gen.family).get("chat_text_states"):
             with svc._turn(cancel):
                 text_states(svc, gen, job)
         try:

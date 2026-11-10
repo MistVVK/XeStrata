@@ -41,6 +41,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 import qimage as QI  # noqa: E402  (beside this file)
+from serve import option_values  # noqa: E402
+import setup as S  # noqa: E402
 
 
 def main(argv=None) -> int:
@@ -48,7 +50,7 @@ def main(argv=None) -> int:
     ap.add_argument("--quant", choices=["Q4_K_M", "Q6_K", "Q8_0", *QI.HUNYUANIMAGE3_QUANTS])
     ap.add_argument("--models-dir", help="where the model files go (default: the data folder's models)")
     ap.add_argument("--config", help="a run config (xestrata-<model>.json) to write the \"images\" section into")
-    ap.add_argument("--gpu-policy", choices=["auto", "keep", "shrink", "unload"], default="auto")
+    ap.add_argument("--gpu-policy", choices=option_values.GPU_POLICIES, default=S.OPTION["image-gpu-policy"]["default"])
     ap.add_argument("--ssd-offload", choices=["on", "off"],
                     help="on: keep the size even when the RAM is short (the rest read from the SSD)")
     ap.add_argument("--model", default=QI.DEFAULT_MODEL,
@@ -75,7 +77,6 @@ def main(argv=None) -> int:
     if a.model == "no":   # image generation taken out of the config
         if not a.config:
             ap.error("--model no needs --config")
-        import setup as S
         off = Path(a.config)
         cfg = json.loads(off.read_text(encoding="utf-8-sig"))
         cfg["images"] = cfg["image_models"] = None
@@ -86,7 +87,6 @@ def main(argv=None) -> int:
         QI.parse_choices(a.model)
     except ValueError as e:
         ap.error(f"--model {a.model}: {e}")
-    import setup as S
     gpu = S.gpu_info() or {}
     if a.models_dir is None:
         data, _ = S.data_folder(None)

@@ -40,7 +40,8 @@ import urllib.request
 from pathlib import Path
 from typing import Callable
 
-from serve import model_terms
+from serve import file_lock, model_terms
+from serve.model_terms import _qimage
 
 RETRY_S = 30            # what the tool's result suggests before the chat asks again
 CONVERT_TIMEOUT_S = 600
@@ -49,14 +50,6 @@ CONVERTERS = {"yolo": "yolo_pt.py", "esrgan": "esrgan.py", "state": "state_pt.py
 
 _lock = threading.Lock()
 _jobs: dict[str, dict] = {}   # name -> its download's state, while one runs or after it failed
-
-
-def _qimage():
-    tools = str(Path(__file__).resolve().parent.parent / "tools" / "image")
-    if tools not in sys.path:
-        sys.path.insert(0, tools)
-    import qimage
-    return qimage
 
 
 def endpoint() -> str:
@@ -162,12 +155,7 @@ def _file_lock(p: Path):
     f = open(p, "a+b")
     try:
         try:
-            if os.name == "nt":
-                import msvcrt
-                getattr(msvcrt, "locking")(f.fileno(), getattr(msvcrt, "LK_NBLCK"), 1)   # Windows' only
-            else:
-                import fcntl
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            file_lock.acquire(f)
         except OSError:
             yield None
             return

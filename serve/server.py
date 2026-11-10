@@ -72,7 +72,7 @@ from serve.frontend import (CALL_START, THINK_END, ChatTemplate, Event, GlmOutpu
                             literal_tags, thinking_signature, mark_think_literals,
                             openai_to_messages, require_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
-from serve import runconfig  # noqa: E402
+from serve import hardware, runconfig, sampling  # noqa: E402
 from serve import places  # noqa: E402
 from serve import downgrades  # noqa: E402
 from serve import model_terms  # noqa: E402
@@ -697,7 +697,7 @@ def cpu_isa_words() -> tuple:
     """(text, missing): the CPU's model and which of AVX / AVX2 / FMA / F16C it reports (Linux: /proc/cpuinfo), and the
     ones of those it lacks.  ("", []) where it cannot be read."""
     try:
-        text = Path("/proc/cpuinfo").read_text(errors="replace")
+        text = hardware.proc_text("cpuinfo", errors="replace")
     except OSError:
         return "", []
     model = next((x.split(":", 1)[1].strip() for x in text.splitlines() if x.lower().startswith("model name")), "")
@@ -2980,7 +2980,7 @@ class Vision:
     def load(source: str) -> bytes:
         if source.startswith("data:"):
             try:
-                return base64.b64decode(source.split(",", 1)[1])
+                return images_api.decode_inline_image(source, strict=False)
             except (IndexError, ValueError) as e:                # no comma, or not base64
                 raise ValueError(f"the image's data: URL could not be read ({e})") from None
         if source.startswith(("http://", "https://")):
@@ -3779,12 +3779,10 @@ def gpu_files_missing(pci: str) -> str:
         vendor = (dev / "vendor").read_text().strip()
     except OSError:
         return ""
-    if vendor == "0x10de":
-        need = ["/dev/nvidiactl"]
-    else:
-        need = [f"/dev/dri/{r.name}" for r in sorted((dev / "drm").glob("renderD*"))][:1] or ["a render node"]
-        need += ["/dev/kfd"] if vendor == "0x1002" else []
-    gone = [p for p in need if not Path(p).exists()]
+    maker = "nvidia" if vendor == "0x10de" else "amd" if vendor == "0x1002" else "other"
+    nodes = [] if maker == "nvidia" else sorted((dev / "drm").glob("renderD*"))
+    render = f"/dev/dri/{nodes[0].name}" if nodes else None
+    gone = hardware.missing_devices(maker, render)
     return "its device files are not here: " + ", ".join(gone) if gone else ""
 
 
@@ -8612,11 +8610,19 @@ def make_handler(svc: Service):
                     svc.debug_end(self.debug)            # no answer started: what there was
                 svc.request_trace.debug = None
 
+        def _images_available(self) -> bool:
+            if svc.images is not None:
+                return True
+            self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
+                                       "message": images_api.not_set_up_message()}})
+            return False
+
+        def _load_image_source(self, source: str) -> bytes:
+            return svc.download(source) if source.startswith(("http://", "https://")) else Vision.load(source)
+
         def _images(self, req):
             """POST /v1/images/generations (serve/images.py): one image job in the GPU's turn."""
-            if svc.images is None:
-                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
-                                           "message": images_api.not_set_up_message()}})
+            if not self._images_available():
                 return
             gen = svc.images.pick(req.get("model"))             # the image model it names, else the default
             images_api.check_tool(gen.cfg, "generate_image")    # the config's image_tools, at every entry
@@ -8642,7 +8648,7 @@ def make_handler(svc: Service):
             if picture is None and isinstance(src, str) and not src.startswith("data:") and \
                     (src.startswith(("http://", "https://", "/", "file:")) or "." in src[-6:]):
                 self._no_local_sources([src])
-                picture = svc.download(src) if src.startswith(("http://", "https://")) else Vision.load(src)
+                picture = self._load_image_source(src)
                 if isinstance(c, dict):
                     c.pop("image", None)
             return Vision.normalize(picture) if picture else None
@@ -8652,9 +8658,7 @@ def make_handler(svc: Service):
             or image[]), or JSON (images: [{"image_url": ...}], or image: a URL or a list), one image job in the GPU's
             turn.  The images are read as a chat's are (data: URLs, http(s) URLs, local paths; formats stb_image does
             not read converted to PNG)."""
-            if svc.images is None:
-                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
-                                           "message": images_api.not_set_up_message()}})
+            if not self._images_available():
                 return
             body = self._body()
             ctype = self.headers.get("Content-Type", "") or ""
@@ -8676,7 +8680,7 @@ def make_handler(svc: Service):
                     if not isinstance(url, str) or not url:
                         raise ValueError("images: [{\"image_url\": a data: URL, an http(s) URL or a path}]")
                     self._no_local_sources([url])     # #27: as the chat routes, before anything is read
-                    files.append(svc.download(url) if url.startswith(("http://", "https://")) else Vision.load(url))
+                    files.append(self._load_image_source(url))
                 # the mask as an image is given ({"image_url": ...} or the URL), its alpha kept (not normalized)
                 mask = req.pop("mask", None)
                 if isinstance(mask, dict):
@@ -8687,7 +8691,7 @@ def make_handler(svc: Service):
                     if not isinstance(mask, str) or not mask:
                         raise ValueError("mask: {\"image_url\": a data: URL, an http(s) URL or a path}")
                     self._no_local_sources([mask])
-                    mask = svc.download(mask) if mask.startswith(("http://", "https://")) else Vision.load(mask)
+                    mask = self._load_image_source(mask)
             # the image model it names; else the default, or where that one has no edits (MageTrail), the first that
             # edits - unless the request is img2img's (a strength or a mask), which the default takes
             region = req.pop("region", None)
@@ -8729,9 +8733,7 @@ def make_handler(svc: Service):
             (image), or JSON (image: a data: URL, an http(s) URL or a path, or {"image_url": ...}), made larger by an
             upscaler and with extra_params' redraw drawn again by the image model, in the GPU's turn; the answer as
             OpenAI's images API gives one (created, data[].b64_json or url)."""
-            if svc.images is None:
-                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
-                                           "message": images_api.not_set_up_message()}})
+            if not self._images_available():
                 return
             fields, picture = self._one_image()
             req, model = images_api.upscale_request(fields)
@@ -8749,9 +8751,7 @@ def make_handler(svc: Service):
             video), written to the job's folder as it arrives.  POST /v1/videos/segmentations: its objects found
             (vLLM-Omni's answer, or a job with job true); its source the form's file, or video_url, a chat's kept
             video (/v1/videos/files/...)."""
-            if svc.images is None:
-                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
-                                           "message": images_api.not_set_up_message()}})
+            if not self._images_available():
                 return
             seg = path.endswith("/segmentations")
             sync = path.endswith("/sync")
@@ -8867,9 +8867,7 @@ def make_handler(svc: Service):
         def _videos_file(self) -> None:
             """POST /v1/videos/files: a video the chat's page attaches, a multipart form's file, kept a week
             (videos.store_file) -> its link and what ffprobe says of it."""
-            if svc.images is None:
-                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
-                                           "message": images_api.not_set_up_message()}})
+            if not self._images_available():
                 return
             jobs = self._video_jobs()
             folder = videos_api.files_dir(jobs) / f"upload-{uuid.uuid4().hex}"
@@ -8895,9 +8893,7 @@ def make_handler(svc: Service):
         def _videos_get(self, path: str) -> None:
             """GET /v1/videos (the jobs, newest first: limit, after, order), /v1/videos/{id} (its record) and
             /v1/videos/{id}/content (its file once completed)."""
-            if svc.images is None:
-                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
-                                           "message": images_api.not_set_up_message()}})
+            if not self._images_available():
                 return
             jobs = self._video_jobs()
             if path == "/v1/videos":
@@ -8995,7 +8991,7 @@ def make_handler(svc: Service):
                 if not isinstance(url, str) or not url:
                     raise ValueError("image: a data: URL, an http(s) URL or a path")
                 self._no_local_sources([url])
-                files = [svc.download(url) if url.startswith(("http://", "https://")) else Vision.load(url)]
+                files = [self._load_image_source(url)]
             if len(files) != 1:
                 raise ValueError("image: one image")
             return fields, files[0]
@@ -9021,9 +9017,7 @@ def make_handler(svc: Service):
             """POST /v1/images/segmentations (vLLM-Omni's), /v1/images/remove-background (fal's BiRefNet fields,
             vLLM-Omni's images answer) and Stability's /v2beta/stable-image/edit/remove-background (image_regions),
             synchronous, in the image jobs' GPU turn; on the image model the GPU has now (none: the default)."""
-            if svc.images is None:
-                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
-                                           "message": images_api.not_set_up_message()}})
+            if not self._images_available():
                 return
             fields, picture = self._one_image()
             picture = Vision.normalize(picture)
@@ -9064,9 +9058,7 @@ def make_handler(svc: Service):
             """POST /v1/images/controls (image_controls.preview_*): the control image a request's control would give
             the image model (canny, depth, pose...), synchronous, in the image jobs' GPU turn, on the image model the
             GPU has now (none: the default)."""
-            if svc.images is None:
-                self._json(404, {"error": {"type": "invalid_request_error", "code": "images_not_set_up",
-                                           "message": images_api.not_set_up_message()}})
+            if not self._images_available():
                 return
             fields, picture = self._one_image()
             gen = next((g for g in svc.images.gens.values() if g.engine.alive()), svc.images.default)
@@ -10068,7 +10060,7 @@ def make_handler(svc: Service):
                     if not isinstance(url, str) or not url:
                         raise ValueError('input_image_mask: {"image_url": a data: URL or an http(s) URL} (no file_id)')
                     self._no_local_sources([url])
-                    mask = svc.download(url) if url.startswith(("http://", "https://")) else Vision.load(url)
+                    mask = self._load_image_source(url)
                 self.image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load,
                                                          lambda d: Vision.normalize(d, keep_alpha=True),
                                                          spec, model=fixed, mask=mask, skills="inline")
@@ -10390,10 +10382,7 @@ DESKTOP_FREE_MIB = 2048
 DESKTOP_RESERVE_MIB = 3072       # what kept KDE/Wayland alive beside a full expert cache in both reports
 
 
-def linux_desktop(env=None) -> bool:
-    """A graphical session on Linux (Wayland or X): its compositor, browser and apps take VRAM after the model has."""
-    env = os.environ if env is None else env
-    return sys.platform.startswith("linux") and bool(env.get("WAYLAND_DISPLAY") or env.get("DISPLAY"))
+linux_desktop = hardware.linux_desktop
 
 
 def amd_card(pci) -> bool:
@@ -10711,26 +10700,25 @@ def clean_shared_defaults(d) -> dict:
     for key, value in d.items():
         if value is None or value == "":
             continue
-        number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "reasoning_effort":
             if value not in ("none", "low", "medium", "high", "xhigh", "max"):
                 raise ValueError("reasoning_effort: none, low, medium, high or max")
         elif key == "temperature":
-            if not number or not 0 <= value <= 2:
+            if not sampling.number(value, lo=0, hi=2, require=True):
                 raise ValueError("temperature: 0..2")
         elif key == "top_p":
-            if not number or not 0 < value <= 1:
+            if not sampling.number(value, lo=0, hi=1, lo_open=True, require=True):
                 raise ValueError("top_p: 0 < top_p <= 1")
         elif key == "top_k":
-            if not number or value != int(value) or not 1 <= value <= 64:
+            if not sampling.number(value, whole=True, lo=1, hi=64, require=True):
                 raise ValueError("top_k: an integer 1..64")
             value = int(value)
         elif key in ("seed", "max_tokens"):
-            if not number or value != int(value) or value <= 0:
+            if not sampling.number(value, whole=True, lo=0, lo_open=True):
                 raise ValueError(f"{key}: a positive integer")
             value = int(value)
         elif key == "reasoning_budget_tokens":                 # #123: 0 means no budget, so 0 is allowed here
-            if not number or value != int(value) or value < 0:
+            if not sampling.number(value, whole=True, lo=0):
                 raise ValueError("reasoning_budget_tokens: a whole number of tokens (0: no budget)")
             value = int(value)
         elif key == "experimental_speed_projection":
@@ -10835,44 +10823,43 @@ def sampling_defaults_from_config(cfg: dict) -> dict:
     for key, value in block.items():
         if value is None:
             continue
-        number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "temperature":
-            if not number or value < 0:
+            if not sampling.number(value, lo=0):
                 raise SystemExit(f"[xestrata] config sampling.temperature={value!r}: expected a number >= 0 "
                                  "(0 = greedy)")
             out[key] = float(value)
         elif key == "top_p":
-            if not number or not 0 < value <= 1:
+            if not sampling.number(value, lo=0, hi=1, lo_open=True, require=True):
                 raise SystemExit(f"[xestrata] config sampling.top_p={value!r}: expected 0 < top_p <= 1")
             out[key] = float(value)
         elif key == "min_p":
-            if not number or not 0 <= value <= 1:
+            if not sampling.number(value, lo=0, hi=1, require=True):
                 raise SystemExit(f"[xestrata] config sampling.min_p={value!r}: expected 0 <= min_p <= 1")
             out[key] = float(value)
         elif key == "top_k":
-            if not number or value != int(value) or not 1 <= value <= 64:
+            if not sampling.number(value, whole=True, lo=1, hi=64, require=True):
                 raise SystemExit(f"[xestrata] config sampling.top_k={value!r}: the sampled path takes an integer 1..64")
             out[key] = int(value)
         elif key == "presence_penalty":
-            if not number or value < 0:
+            if not sampling.number(value, lo=0):
                 raise SystemExit(f"[xestrata] config sampling.presence_penalty={value!r}: expected a number >= 0")
             out[key] = float(value)
         elif key == "frequency_penalty":
-            if not number or value < 0:
+            if not sampling.number(value, lo=0):
                 raise SystemExit(f"[xestrata] config sampling.frequency_penalty={value!r}: expected a number >= 0")
             out[key] = float(value)
         elif key == "repetition_penalty":
-            if not number or value <= 0:
+            if not sampling.number(value, lo=0, lo_open=True):
                 raise SystemExit(f"[xestrata] config sampling.repetition_penalty={value!r}: "
                                  "expected a number > 0 (1 = off)")
             out[key] = float(value)
         elif key == "penalty_last_n":
-            if not number or value != int(value) or value < 0:
+            if not sampling.number(value, whole=True, lo=0):
                 raise SystemExit(f"[xestrata] config sampling.penalty_last_n={value!r}: expected a non-negative "
                                  "integer")
             out[key] = int(value)
         elif key == "seed":
-            if not number or value != int(value) or value <= 0:
+            if not sampling.number(value, whole=True, lo=0, lo_open=True):
                 raise SystemExit(f"[xestrata] config sampling.seed={value!r}: expected a positive integer")
             out[key] = int(value)
         elif key == "experimental_speed_projection":
@@ -10930,7 +10917,7 @@ def check_request_sampling(req) -> None:
             if num != num or num in (float("inf"), float("-inf")):
                 raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
             req[key] = value = num
-        if isinstance(value, bool) or not isinstance(value, int if integer else (int, float)):
+        if not sampling.number(value, integer=integer):
             raise ValueError(f"{key}: {'an integer' if integer else 'a number'}")
     guard = (req or {}).get("loop_guard")          # the loop guard for this request only (serve/loop_guard.py)
     if guard is not None and not isinstance(guard, bool):

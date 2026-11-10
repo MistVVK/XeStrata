@@ -68,6 +68,21 @@ def wait_ready(port: int, proc: subprocess.Popen, timeout: float = 1800) -> None
     raise TimeoutError("server not ready")
 
 
+def start_server(config: Path, port: int, env: dict):
+    return subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "xestrata",
+                             "--config", str(config), "--port", str(port)], cwd=str(ROOT), env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def stop_server(proc) -> None:
+    proc.terminate()
+    try:
+        proc.wait(60)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    time.sleep(5)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("config")
@@ -101,9 +116,7 @@ def main() -> int:
             cpath = Path(tempfile.gettempdir()) / f"ab_{name}.json"
             cpath.write_text(json.dumps(cfg, indent=1))
             penv = dict(os.environ, **e)
-            proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "xestrata",
-                                     "--config", str(cpath), "--port", str(a.port)], cwd=str(ROOT), env=penv,
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = start_server(cpath, a.port, penv)
             try:
                 t0 = time.time()
                 wait_ready(a.port, proc)
@@ -121,12 +134,7 @@ def main() -> int:
                     print(f"  {tag:6s} decode {row['decode']} tok/s  prompt {row['prompt']} tok/s ({row['prompt_n']})  "
                           f"n {row['n']}", flush=True)
             finally:
-                proc.terminate()
-                try:
-                    proc.wait(60)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                time.sleep(5)
+                stop_server(proc)
     print("\nmedians over rounds:")
     for tag, _ in reqs:
         cells = []

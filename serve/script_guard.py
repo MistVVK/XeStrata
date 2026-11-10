@@ -37,9 +37,9 @@ from collections import defaultdict
 from pathlib import Path
 
 from serve import logit_bias as bias_api
-from serve import envvars
+from serve import envvars, option_values
 
-LANGS = ("ja", "en", "ko", "zh-cn", "zh-tw")
+LANGS = option_values.GUARD_LANGS
 REWIND_MAX = 8
 BAN = -100.0
 USAGE = ('script_guard: "off", "ja", "en", "ko", "zh-cn", "zh-tw", or {"lang": one of them, "allow_context": true | '
@@ -113,14 +113,15 @@ def parse(value, where="script_guard"):
         return None
     if isinstance(value, str):
         v = value.strip().lower()
-        if v == "off":
+        if v == option_values.GUARD_OFF:
             return "off"
         if v in LANGS:
             return {"lang": v, "allow_context": True}
     elif isinstance(value, dict) and set(value) <= {"lang", "allow_context"}:
         lang = value.get("lang")
         ctx = value.get("allow_context", True)
-        if isinstance(ctx, bool) and isinstance(lang, str) and lang.strip().lower() in ("off",) + LANGS:
+        if isinstance(ctx, bool) and isinstance(lang, str) and \
+                lang.strip().lower() in (option_values.GUARD_OFF,) + LANGS:
             lang = lang.strip().lower()
             return "off" if lang == "off" else {"lang": lang, "allow_context": ctx}
     raise ValueError(USAGE.replace("script_guard", where, 1))

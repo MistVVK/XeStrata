@@ -42,6 +42,8 @@ import time
 import uuid
 from pathlib import Path
 
+from serve import file_lock
+
 RESERVED, ALLOCATED, RELEASING = "reserved", "allocated", "releasing"
 
 # How far a device's free-memory report follows its allocations (records' 2026-11-09-translate/s0-margin, allocating and
@@ -92,26 +94,21 @@ class Ledger:
     def _locked(self):
         f = open(self.lock_path, "a+b")
         try:
-            if sys.platform == "win32":
-                import msvcrt
+            if os.name == "nt":
                 while True:
                     try:
-                        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                        file_lock.acquire(f)
                         break
                     except OSError:
                         time.sleep(0.01)
             else:
-                import fcntl
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+                file_lock.acquire(f, blocking=True)
             state = self._read()
             yield state
             self._write(state)
         finally:
-            if sys.platform == "win32":
-                with contextlib.suppress(OSError):
-                    import msvcrt
-                    f.seek(0)
-                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            with contextlib.suppress(OSError):
+                file_lock.release(f)
             f.close()
 
     def _read(self) -> dict:

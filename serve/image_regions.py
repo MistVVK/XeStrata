@@ -89,15 +89,11 @@ BIREFNET_SIZE = {"general": (1024, 1024), "lite": (1024, 1024), "portrait": (102
 DYNAMIC_SIDES = (256, 2304)  # BiRefNet_dynamic's trained range
 BIREFNET_SMALLER = {"general": "lite", "portrait": "lite", "matting": "lite", "hr": "lite-2k", "dynamic": "lite-2k",
                     "lite-2k": "lite"}
-OUTPUT_FORMATS = ("png", "webp", "gif", "jpeg")
+OUTPUT_FORMATS = ("png", "webp", "gif", "jpeg", "jxl")
 
 
 class MemoryShort(img.ImageJobFailed):
     """The engine had no room for the model on the GPU (its ERROR memory: ...)."""
-
-
-def _qimage():
-    return image_aux._qimage()
 
 
 def root_of(gen) -> Path:
@@ -626,24 +622,6 @@ def cut_out(picture: bytes, got: dict, background=None, grow: int = 0, blur: flo
     return out.convert("RGB") if background[3] == 255 else out
 
 
-def encode(im, fmt: str) -> bytes:
-    """A Pillow image in an output format: PNG; WebP lossless (its alpha exact); GIF (its transparency a palette
-    entry); JPEG (no alpha: on white)."""
-    from PIL import Image
-    buf = io.BytesIO()
-    if fmt == "jpeg":
-        if im.mode in ("RGBA", "LA"):
-            bg = Image.new("RGB", im.size, (255, 255, 255))
-            bg.paste(im, mask=im.split()[-1])
-            im = bg
-        im.convert("RGB" if im.mode != "L" else "L").save(buf, "JPEG", quality=95)
-    elif fmt == "webp":
-        im.save(buf, "WEBP", lossless=True)
-    else:
-        im.save(buf, fmt.upper())
-    return buf.getvalue()
-
-
 def mask_png(mask) -> str:
     """A bool mask as vLLM-Omni sends one: a base64 single-channel PNG, 255 inside."""
     import numpy as np
@@ -718,6 +696,8 @@ def remove_background_request(fields: dict) -> dict:
     return {"version": birefnet_version(fields.get("model")), "resolution": fields.get("operating_resolution"),
             "refine": _flag(fields, "refine_foreground", True) and not mask_only, "mask_only": mask_only,
             "output_mask": _flag(fields, "output_mask", False), "format": fmt, "response_format": rf,
+            "compression": img.parse_number(fields.get("output_compression"), "output_compression", 0, 100,
+                                            whole=True),
             "background": parse_color(fields.get("background_color")),
             "grow": int(_number(fields, "mask_grow", 0, -256, 256)), "blur": _number(fields, "mask_blur", 0.0, 0, 256)}
 
@@ -727,9 +707,10 @@ def remove_background_response(svc, gen, req: dict, picture: bytes, base_url: st
     the version, size and format, and "xestrata" figures."""
     got = matte(svc, gen, picture, req["version"], req["resolution"], req["refine"], cancel)
     im = cut_out(picture, got, req["background"], req["grow"], req["blur"], req["mask_only"])
-    files = [encode(im, req["format"])]
+    files = [img.encode_pillow(im, req["format"], req.get("compression"))]
     if req["output_mask"] and not req["mask_only"]:
-        files.append(encode(adjust_alpha(got["alpha"], req["grow"], req["blur"]), req["format"]))
+        files.append(img.encode_pillow(adjust_alpha(got["alpha"], req["grow"], req["blur"]),
+                                       req["format"], req.get("compression")))
     data = []
     for i, b in enumerate(files):
         entry = ({"url": f"{base_url}/v1/images/files/{gen.store(b, req['format'])}"} if req["response_format"] == "url"
@@ -747,8 +728,9 @@ def stability_remove_background(svc, gen, fields: dict, picture: bytes, cancel=N
     fmt = str(fields.get("output_format") or "png").lower()
     if fmt not in ("png", "webp"):
         raise img.ImageRequestError(f"output_format: png or webp, not {fmt!r}")
+    compression = img.parse_number(fields.get("output_compression"), "output_compression", 0, 100, whole=True)
     got = matte(svc, gen, picture, "general", None, True, cancel)
-    return encode(cut_out(picture, got), fmt), fmt
+    return img.encode_pillow(cut_out(picture, got), fmt, compression), fmt
 
 
 def models() -> list[dict]:

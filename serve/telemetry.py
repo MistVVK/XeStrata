@@ -26,6 +26,8 @@ import sys
 import threading
 import time
 
+from serve import hardware
+
 HISTORY = 60
 WIN = sys.platform == "win32"
 
@@ -104,39 +106,18 @@ class _Zes:
         return (total - free, total) if total else (None, None)
 
 
-# DRM_IOCTL_XE_DEVICE_QUERY (_IOWR('d', 0x40, struct drm_xe_device_query), 40 bytes) and its memory regions' query; a
-# region (struct drm_xe_mem_region, 88 bytes) holds mem_class (u16) at 0, total_size at 8 and used at 16
-_XE_DEVICE_QUERY, _XE_QUERY_MEM_REGIONS, _XE_MEM_CLASS_VRAM, _XE_REGION_BYTES = 0xC0286440, 1, 1, 88
-
-
 def _xe_vram(pci):
-    """(used, total) bytes of the VRAM of the xe driver's card at `pci`, asked of the driver itself, or (None, None):
-    sysman's zesInit fails for every card when one is not its driver's (a Coffee Lake UHD 630 beside an Arc Pro B60).
-    A driver that gives the use only to CAP_PERFMON says 0, which a card's driver never uses: unknown too."""
-    import fcntl
-    import struct
+    """(used, total) VRAM bytes, or (None, None) when unavailable or its usage is hidden."""
     for node in sorted(glob.glob(f"/sys/bus/pci/devices/{pci}/drm/renderD*")):
         try:
             fd = os.open("/dev/dri/" + os.path.basename(node), os.O_RDWR | os.O_CLOEXEC)
         except OSError:
             continue
         try:
-            q = bytearray(struct.pack("=QIIQQQ", 0, _XE_QUERY_MEM_REGIONS, 0, 0, 0, 0))
-            fcntl.ioctl(fd, _XE_DEVICE_QUERY, q)
-            size = struct.unpack_from("=I", q, 12)[0]
-            if size < 8:
-                return None, None
-            buf = ctypes.create_string_buffer(size)
-            q = bytearray(struct.pack("=QIIQQQ", 0, _XE_QUERY_MEM_REGIONS, size, ctypes.addressof(buf), 0, 0))
-            fcntl.ioctl(fd, _XE_DEVICE_QUERY, q)
-            used = total = 0
-            for i in range(min(struct.unpack_from("=I", buf.raw, 0)[0], (size - 8) // _XE_REGION_BYTES)):
-                off = 8 + i * _XE_REGION_BYTES
-                if struct.unpack_from("=H", buf.raw, off)[0] == _XE_MEM_CLASS_VRAM:
-                    total += struct.unpack_from("=Q", buf.raw, off + 8)[0]
-                    used += struct.unpack_from("=Q", buf.raw, off + 16)[0]
+            regions = hardware.xe_regions(fd, truncate=True)
+            total, used = sum(r[0] for r in regions), sum(r[1] for r in regions)
             return (used, total) if total and used else (None, None)
-        except OSError:
+        except (OSError, ValueError):
             return None, None
         finally:
             os.close(fd)
@@ -742,9 +723,9 @@ def nvidia_pci(index):
 
 def _gpu(pci=None):
     """The card the engine runs on: the Intel GPU at `pci` (or the first on the xe driver), else the AMD one (amdgpu),
-    else the NVIDIA one, else (without `pci`) the first on the i915 driver.  Without `pci` an i915 card comes last: it is
-    most often the processor's graphics beside the card the engine runs on.  On Windows: the NVIDIA one through NVML,
-    else any maker's through _WinGpu."""
+    else the NVIDIA one, else (without `pci`) the first on the i915 driver.  Without `pci` an i915 card comes last:
+    it is most often the processor's graphics beside the card the engine runs on.  On Windows: the NVIDIA one through
+    NVML, else any maker's through _WinGpu."""
     if WIN:
         n = _NvGpu(pci)
         return n if n.ok() else _WinGpu(pci)
@@ -776,7 +757,8 @@ def free_vram_mib(gpu_pci=None):
 # ------------------------------------------------------------------------------------------------ CPU / RAM
 def _cpu_name():
     if os.path.exists("/proc/cpuinfo"):
-        for line in open("/proc/cpuinfo", encoding="utf-8", errors="replace"):
+        text = hardware.proc_text("cpuinfo", encoding="utf-8", errors="replace")
+        for line in text.splitlines():
             if line.startswith("model name"):
                 return line.split(":", 1)[1].strip()
     return platform.processor() or None
@@ -805,7 +787,7 @@ class _CpuRamFallback:
     @staticmethod
     def ram():
         try:
-            info = dict(line.split(":", 1) for line in open("/proc/meminfo"))
+            info = dict(line.split(":", 1) for line in hardware.proc_text("meminfo").splitlines())
             total = int(info["MemTotal"].split()[0]) * 1024
             avail = int(info["MemAvailable"].split()[0]) * 1024
             return total - avail, total
