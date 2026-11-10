@@ -2057,7 +2057,11 @@ int pick_ww(int64_t n, int n_expert) {
     // (the PRO 6000 loses 3-7% at 80 rows), so the band above is left as it was.  The 5070 (48 SMs) is not in this branch: its uniform-routing
     // numbers above are against 128 rows at 8192 tokens and it has no real-routing row yet.  Same output bits either way (the tile only
     // groups routed rows).  STRATA_PF_TILE_DEBUG=1 prints the choice of every launch.
-    if (dev_info().s120 && dev_info().sms >= 80 && avg >= 159.9) {
+    // sm_120 with 100 to 149 SMs (the PRO 5000, 110): the 128-row tile also between the band and 159.9 rows an expert, so it is taken from 56 rows
+    // on without a gap.  Real routing, 64-row time / 128-row time, PRO 5000 (IQ3_S/IQ4_NL, IQ4_XS/IQ4_NL) at 80 / 120 / 160 rows: 1.037 / 1.023,
+    // 1.097 / 1.079, 1.101 / 1.080.  The PRO 6000 (188 SMs) is not here: 0.971 / 0.926 at 80, 1.004 / 0.960 at 120.
+    if (dev_info().s120 && dev_info().sms >= 80 &&
+        (avg >= 159.9 || (dev_info().sms >= 100 && dev_info().sms < 150 && avg > 112.0))) {
         static const bool dbg = [] { const char* v = std::getenv("STRATA_PF_TILE_DEBUG"); return v != nullptr && v[0] == '1'; }();
         if (dbg) std::fprintf(stderr, "strata: fused tile: rows %lld experts %d avg %.1f s120 yes -> ww 2\n", (long long) n, n_expert, avg);
         return 2;
