@@ -3,7 +3,9 @@
 #
 #   tests/quant/run_oracle.sh [flavour...]        flavours: avx2 (default portable build), avx (STRATA_ISA_FLOOR=avx), none (STRATA_ISA_FLOOR=none)
 #   arm64: neon (default, the contract) and native (the build host's own ggml-cpu flavour: GCC on the Spark gives plain armv8-a, no dot product, which quant_parity skips; Apple's gives the Mac's)
-#   env: QUANT_GENERATOR (default Ninja), BUILD_ROOT (default ./build-quant), JOBS, QUANT_PARITY_ARGS (e.g. "--rows 64"), QUANT_FORCE_ISA (runs the binary under STRATA_FORCE_ISA)
+#   env: QUANT_GENERATOR (default Ninja), BUILD_ROOT (default ./build-quant), JOBS, QUANT_PARITY_ARGS (e.g. "--rows 64"), QUANT_FORCE_ISA (runs the binary under STRATA_FORCE_ISA),
+#        QUANT_PARITY_LIVE_STRICT=1 (quant_parity's leg 2, ours against the ggml-cpu built here, fails too: right only where this compiler builds ggml as
+#        GCC 13 does; by default it is information and the gate is leg 1, ours against tests/quant/golden_x86.txt), CC / CXX (the compiler)
 #
 # The flavour decides which ggml-cpu is linked into quant_parity and so which arithmetic contract is checked (isa.hpp).  Any CPU with at least that
 # flavour's instructions can run it: the AVX and generic flavours run fine on an AVX2 or AVX-512 machine.  Exit status is non-zero on the first failure.
@@ -36,5 +38,11 @@ for f in "${FLAVOURS[@]}"; do
   echo "=== flavour $f: quant_parity ${QUANT_PARITY_ARGS:-}"
   if [ -n "${QUANT_FORCE_ISA:-}" ]; then STRATA_FORCE_ISA=$QUANT_FORCE_ISA "$B/quant_parity" ${QUANT_PARITY_ARGS:-} || rc=1
   else "$B/quant_parity" ${QUANT_PARITY_ARGS:-} || rc=1; fi
+  # the golden file's own check: GCC 13.x and MSVC 19.4x regenerate their lines byte for byte; any other compiler skips it (exit 77)
+  if [ -f tests/quant/golden_x86.txt ] && [ -z "${QUANT_PARITY_ARGS:-}" ]; then
+    echo "=== flavour $f: quant_parity --regen-check"
+    "$B/quant_parity" --regen-check; r=$?
+    [ $r -ne 0 ] && [ $r -ne 77 ] && rc=1
+  fi
 done
 exit $rc
