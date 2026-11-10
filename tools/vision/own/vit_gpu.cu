@@ -311,6 +311,14 @@ struct VitGpuImpl {
     size_t kScoreElems = (size_t) 8 << 20;     // scores per attention chunk, 8M: 16 MB of F16 (STRATA_VIT_SCORES, in M elements, overrides)
     size_t kScoreElemsLarge = (size_t) 512 << 20;   // the chunk above 16,384 patches: 512M scores, 1 GB of F16 (see size_buffers)
     bool scores_env = false;                   // STRATA_VIT_SCORES was given: one size for every picture
+    // Above 16,384 patches a score row is padded to a multiple of 64 elements and the queries of an attention chunk are a multiple of 64: with the
+    // picture's own row length (limit_7000x5000.png, 65,232 patches: 514 queries per chunk, rows not 128-byte aligned) the A4000 took 108.1 s against
+    // 80.3 s aligned, while 65,536 patches took 80.9 s (RESULTS-OWN-3V.md 16.2).  Up to 16,384 patches: 8 and no rounding, as before.
+    // STRATA_VIT_NPAD / STRATA_VIT_QALIGN (diagnostics) set both for every picture.
+    int n_pad = 0, q_align = 0;      // 0: the rule above
+    int pad_for(size_t n) const { return n_pad ? n_pad : n > 16384 ? 64 : 8; }
+    int align_for(size_t n) const { return q_align ? q_align : n > 16384 ? 64 : 1; }
+    size_t padded(size_t n) const { const size_t p = (size_t) pad_for(n); return (n + p - 1) / p * p; }
 
     // C = alpha * op(A) * op(B), batched, column-major as the BLAS wants it
     bool bgemm(bool ta, bool tb, int m, int n, int k, const void* A, cudaDataType_t at, int lda, long long sa, const void* B, cudaDataType_t bt, int ldb,
@@ -406,7 +414,7 @@ struct VitGpuImpl {
         // (a very large picture gets at least 64 queries per chunk, so its many chunks stay few)
         // a score row is padded to a multiple of 8 elements (the product's leading dimension): with an odd row length the BLAS cannot use its tensor-core
         // kernels (a 93-token picture spent half its time there)
-        const size_t Np = (N + 7) / 8 * 8;
+        const size_t Np = padded(N);
         // above 16,384 patches (pictures of more than 4,096 tokens) the chunk is 512M scores (1 GB): with the 16 MB chunk such a picture runs 64 queries per
         // product and the attention is launch-bound (l620, 16,384 tokens: 33.4 s, 1.17 of mtmd-GPU; with 512M 24.8 s, 0.87, at 3,398 MiB against mtmd-GPU's
         // 3,858; RESULTS-OWN-3V.md 12.11).  STRATA_VIT_SCORES sets both sizes.
@@ -511,6 +519,8 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
     if (const char* e = std::getenv("STRATA_VIT_SCORES")) { const int v = std::atoi(e); if (v >= 1) { m.kScoreElems = (size_t) v << 20; m.scores_env = true; } }
     // STRATA_VIT_SCORES_LARGE (M elements, a diagnostic): the chunk above 16,384 patches; a size the GPU cannot hold tests the fallback to the default chunk
     if (const char* e = std::getenv("STRATA_VIT_SCORES_LARGE")) { const long v = std::atol(e); if (v >= 1) m.kScoreElemsLarge = (size_t) v << 20; }
+    if (const char* e = std::getenv("STRATA_VIT_NPAD")) { const int v = std::atoi(e); if (v >= 8 && v % 8 == 0) m.n_pad = v; }
+    if (const char* e = std::getenv("STRATA_VIT_QALIGN")) { const int v = std::atoi(e); if (v >= 1) m.q_align = v; }
     return m.size_buffers(std::max(max_patches, 16), err);
 }
 
@@ -579,8 +589,10 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
         stage(2);
         // per chunk of queries: S = K Q^T (one batched product over the heads), softmax, O = V P (a head's matrix is a column slice of the [N][D] arrays:
         // leading dimension D, batch stride HD)
-        const int Np = (N + 7) / 8 * 8;      // the score rows' leading dimension (see size_buffers)
-        const int QC = (int) std::max<size_t>(1, std::min<size_t>((size_t) N, m.sp_elems / ((size_t) H * Np)));
+        const int Np = (int) m.padded((size_t) N);      // the score rows' leading dimension (see size_buffers)
+        int QC = (int) std::max<size_t>(1, std::min<size_t>((size_t) N, m.sp_elems / ((size_t) H * Np)));
+        const int qa = m.align_for((size_t) N);
+        if (qa > 1 && QC < N && QC >= qa) QC -= QC % qa;
         for (int q0 = 0; q0 < N; q0 += QC) {
             const int qc = std::min(QC, N - q0);
             if (!m.bgemm(true, false, N, qc, HD, m.d_k16, CUDA_R_16F, D, HD, m.d_q16 + (size_t) q0 * D, CUDA_R_16F, D, HD, m.d_S, CUDA_R_16F, Np,
