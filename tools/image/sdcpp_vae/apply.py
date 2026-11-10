@@ -115,6 +115,9 @@ CMAKE_NEW = """if (SD_CUDA OR SD_HIPBLAS)  # """ + MARK.lstrip("/ ") + """: src/
         set_source_files_properties(${STRATA_VAE_DIR}/wan_vae.cu PROPERTIES LANGUAGE HIP)
         add_library(strata_vae STATIC ${STRATA_VAE_DIR}/wan_vae.cu)
         target_link_libraries(strata_vae PRIVATE hip::host roc::hipblas)
+        # HIP is enabled here, after the stable-diffusion library was defined: give both targets the architectures
+        # (else CMake stops with "HIP_ARCHITECTURES is empty for target stable-diffusion")
+        set_target_properties(strata_vae ${SD_LIB} PROPERTIES HIP_ARCHITECTURES "${CMAKE_HIP_ARCHITECTURES}")
     endif()
     target_include_directories(strata_vae PRIVATE ${STRATA_VAE_DIR} ${STRATA_VAE_DIR}/include)
     target_compile_features(strata_vae PRIVATE cxx_std_17)

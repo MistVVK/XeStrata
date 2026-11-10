@@ -89,6 +89,9 @@ class Apply(unittest.TestCase):
             self.assertIn("add_library(strata_vae STATIC", cm)
             self.assertIn("target_compile_definitions(${SD_LIB} PRIVATE SD_STRATA_VAE)", cm)
             self.assertNotIn("use_fast_math", cm)
+            # HIP: the library defined before enable_language(HIP) needs the architectures too (p620, 11-10)
+            self.assertIn('set_target_properties(strata_vae ${SD_LIB} PROPERTIES HIP_ARCHITECTURES '
+                          '"${CMAKE_HIP_ARCHITECTURES}")', cm)
             self.assertLess(cm.index("if (SD_CUDA OR SD_HIPBLAS)"), cm.index(V.CMAKE_OLD))
             before = (eng, cm)
             V.apply(sd)
