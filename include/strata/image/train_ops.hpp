@@ -37,6 +37,7 @@
 #include "strata/prefill/gemm.hpp"
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace strata::image::train {
@@ -162,6 +163,34 @@ void copy_rows(const float* a, int64_t n, float* out, void* stream);
 void add_into(float* a, const float* b, int64_t n, void* stream);
 void f16_copy(const float* x, int64_t n, uint16_t* y, void* stream);
 
+/// XESTRATA_TRAIN_PROFILE=1: a training block's stages' times, summed over its calls (each mark waits for the GPU, so
+/// the sums are the stages' own and the whole runs slower).  begin() at the block's start, mark(stage) after each
+/// stage, report() prints the sums and clears them; off, every call returns at once.
+class StageTimes {
+public:
+    explicit StageTimes(const char* name);
+    bool on() const { return on_; }
+    void begin(void* stream);
+    void mark(const char* stage, void* stream);
+    void report();
+
+private:
+    const char* name_;
+    bool on_ = false;
+    int64_t calls_ = 0;
+    double last_ = 0.0;
+    std::vector<std::pair<const char*, double>> t_;
+};
+
+/// One-row products in FP32 (a modulation linear's LoRA, a low-rank modulation): h = A x (A [rank][K]); y += scale B
+/// (A x) (B [N][rank], h the rank's scratch); and that LoRA's gradients from dy: dB += scale dy h^T, dA += g x^T with
+/// g = scale B^T dy (g written, the rank's).
+void row_down(const float* A, const float* x, int64_t rank, int64_t K, float* h, void* stream);
+void row_lora_fwd(const float* A, const float* B, const float* x, float scale, int64_t rank, int64_t N, int64_t K,
+                  float* y, float* h, void* stream);
+void row_lora_bwd(const float* A, const float* B, const float* x, const float* dy, float scale, int64_t rank,
+                  int64_t N, int64_t K, float* dA, float* dB, float* h, float* g, void* stream);
+
 /// One frozen product a block takes gradients through: Y[T,N] = X[T,K] . W^T + b, its weight as the forward reads it
 /// (w [N][K] FP16) and transposed (wt [K][N], dgrad's view), and the base's own gradients (null: frozen, not taken).
 struct Product {
@@ -227,6 +256,8 @@ void ad_product_fwd(const Adapter* ad, const uint16_t* x16, const float* rsx, fl
 /// Whether ad_product_bwd reads the input's transposed rows (xt): a full weight's gradient and a LoKr do, and a LoRA
 /// or DoRA where the GPU has no transposed products (Gemm::f16_batch_ex_ok); elsewhere xt may be null.
 bool ad_needs_xt(const Product& P, const Adapter* ad, prefill::Gemm& gemm);
+/// XESTRATA_TRAIN_PROFILE=1: prints ad_product_bwd's stage times summed since the last report.
+void ad_profile_report();
 void ad_product_bwd(const Product& P, const Adapter* ad, const uint16_t* x16, const float* rsx, const uint16_t* xt,
                     float* dYv, float* dxv, bool accumulate, const AdKeep& keep, const AdScratch& sc, uint16_t* t16,
                     float* trs, uint16_t* t16t, float* sums, int64_t R, prefill::Gemm& gemm, void* stream);

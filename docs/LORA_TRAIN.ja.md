@@ -25,17 +25,18 @@ Mage-Flow で一通り通して実測し、その後 MOSS-Image、Qwen-Image-2.1
 
 | 模型 | 画像のモデル | VAE | 文の読み手 | 生成の既定 | v1 の対象モジュール |
 | --- | --- | --- | --- | --- | --- |
-| Mage-Flow | Comfy-Org の bf16 をエンジンが 16 ビットか Q8_0 で読む。12 ブロック・hidden 3072・heads 24・MLP 12288・潜在 128ch・`patch_size` 1 | Mage-VAE（32ch・1/8） | Qwen3-VL-4B | Turbo 4 step・guidance 1.0・静的 shift 6.0 | 144（12 × 12） |
+| Mage-Flow | Comfy-Org の bf16 をエンジンが 16 ビットか Q8_0 で読む。12 ブロック・hidden 3072・heads 24・MLP 12288・潜在 128ch・`patch_size` 1 | Mage-VAE（32ch・1/8） | Qwen3-VL-4B | Turbo 4 step・guidance 1.0・静的 shift 6.0 | 168（12 × 14） |
 | MageTrail | Mage-Flow を Danbooru と e621 で微調整したもの。12 ブロックで、変調を共有の低ランク射影（F32）に作り替えた形 | FLUX.2-klein-4B の VAE | Qwen3-VL-4B | 30 step・guidance 5.0・品質タグの `prompt_start` | 144（12 × 12） |
-| MOSS-Image | diffusers の 3 シャード bf16。42 ブロック・dim 3072・FFN 8192・heads 24 | FLUX.2 系（32ch・1/8）で復号の狭いもの | Qwen3.5-9B（最終層 4096） | 50 step・guidance 3.0・shift 5.0・negative 側でブロック 22 を飛ばす | 252（42 × 6） |
+| MOSS-Image | diffusers の 3 シャード bf16。42 ブロック・dim 3072・FFN 8192・heads 24 | FLUX.2 系（32ch・1/8）で復号の狭いもの | Qwen3.5-9B（最終層 4096） | 50 step・guidance 3.0・shift 5.0・negative 側でブロック 22 を飛ばす | 246（41 × 6） |
 | Qwen-Image-2.1 | GGUF（Q8_0 など）。32 ブロック・dim 4096・heads 32・MLP 12288 | Qwen-Image-2.1 の VAE（16ch・1/8） | Qwen3-VL-8B | Turbo 8 step 固定・guidance 1.0 | 224（32 × 7） |
 
 対象モジュールは各 DiT の `build_lora_targets`（`src/image/mf_dit.cpp`・`moss_dit.cpp`・`qi_dit.cpp`）が名乗る名前で、`serve/loras.py` の `TARGETS` と 1:1 です。
-v1 の既定で当てるのは**ブロック内の attention と MLP の射影**だけです。当てないもの: 変調（`img_mod.1`・`txt_mod.1`・`modulation.1`・`shared_block_modulation`）、
-ブロックの外（`img_in`・`txt_in`・`time_text_embed.*`・`norm_out.linear`・`proj_out`）、MOSS-Image の `text_embedder`、文の読み手。
+既定で当てるのは、ai-toolkit が各モデルで当てるのと同じ**ブロック内の線形層**です。ブロックの中の変調の層も当てます（Mage-Flow の `img_mod.1`・`txt_mod.1`）。
+当てないもの: ブロックの外（`img_in`・`txt_in`・`time_text_embed.*`・`norm_out.linear`・`proj_out`、Qwen-Image-2.1 の共有の `modulation.1`、MOSS-Image の
+`shared_block_modulation`）、MOSS-Image の `text_embedder`、文の読み手。
 
-- MageTrail の変調は F32 の低ランク形で、エンジンがアダプターを当てません（`mf_dit.cpp` の `set_loras` がキーと理由を返す）。一覧には出て、生成で断る形なので、v1 の既定から始めます。
-- 変調を外すのは 4 模型共通の決めにします（sd-scripts の MOSS-Image の既定も attention と FFN だけ。モデル間で当てる層の形を揃えるため）。
+- MageTrail の変調は F32 の低ランク形で、エンジンがアダプターを当てないので外します（ai-toolkit に MageTrail の項目はなく、それ以外は Mage-Flow の既定）。
+- MOSS-Image は ai-toolkit の既定どおり `layers.22` を外します（誘導の負の枝が飛ばすブロックで、そこを土台のまま残すため）。
 
 ## 保存の形（D1）
 

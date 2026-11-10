@@ -12,8 +12,11 @@
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -556,6 +559,90 @@ void* Pool::take(int64_t n, int64_t bytes, bool zero) {
     if ((zero || all_zero) && !gpu::memset_async(p, 0, (size_t) n * (size_t) bytes, s_))
         throw std::runtime_error("image engine: zeroing a training block's buffer");
     return p;
+}
+
+// h = A x for a one-row input (A [rank][K]): a work-group a rank
+void row_down(const float* A, const float* x, int64_t rank, int64_t K, float* h, void* s) {
+    constexpr int64_t WG = 256;
+    dit_rows::q_of(s).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) rank * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
+            const int64_t r = static_cast<int64_t>(it.get_group_linear_id());
+            float acc = 0.f;
+            for (auto k = static_cast<int64_t>(it.get_local_linear_id()); k < K; k += WG) acc += A[r * K + k] * x[k];
+            acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+            if (it.get_local_linear_id() == 0) h[r] = acc;
+        });
+}
+
+// a LoRA on a one-row product (a modulation linear's): y += scale B (A x), h the rank's scratch
+void row_lora_fwd(const float* A, const float* B, const float* x, float scale, int64_t rank, int64_t N, int64_t K,
+                  float* y, float* h, void* s) {
+    row_down(A, x, rank, K, h, s);
+    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) N), [=](sycl::id<1> id) {
+        const int64_t n = static_cast<int64_t>(id[0]);
+        float acc = 0.f;
+        for (int64_t r = 0; r < rank; ++r) acc += B[n * rank + r] * h[r];
+        y[n] += scale * acc;
+    });
+}
+
+// its gradients from the modulation's dy: dB += scale dy h^T, dA += (scale B^T dy) x^T (h and g the rank's scratch)
+void row_lora_bwd(const float* A, const float* B, const float* x, const float* dy, float scale, int64_t rank,
+                  int64_t N, int64_t K, float* dA, float* dB, float* h, float* g, void* s) {
+    constexpr int64_t WG = 256;
+    row_down(A, x, rank, K, h, s);
+    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) (N * rank)), [=](sycl::id<1> id) {
+        const int64_t i = static_cast<int64_t>(id[0]), n = i / rank, r = i - n * rank;
+        dB[i] += scale * dy[n] * h[r];
+    });
+    dit_rows::q_of(s).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) rank * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
+            const int64_t r = static_cast<int64_t>(it.get_group_linear_id());
+            float acc = 0.f;
+            for (auto n = static_cast<int64_t>(it.get_local_linear_id()); n < N; n += WG) acc += B[n * rank + r] * dy[n];
+            acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+            if (it.get_local_linear_id() == 0) g[r] = scale * acc;
+        });
+    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) (rank * K)), [=](sycl::id<1> id) {
+        const int64_t i = static_cast<int64_t>(id[0]), r = i / K, k = i - r * K;
+        dA[i] += g[r] * x[k];
+    });
+}
+
+StageTimes::StageTimes(const char* name) : name_(name), on_(strata::env_get("TRAIN_PROFILE") != nullptr) {}
+
+namespace {
+double now_s() {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}  // namespace
+
+void StageTimes::begin(void* stream) {
+    if (!on_) return;
+    gpu::stream_sync(stream);
+    last_ = now_s();
+    ++calls_;
+}
+
+void StageTimes::mark(const char* stage, void* stream) {
+    if (!on_) return;
+    gpu::stream_sync(stream);
+    const double t = now_s();
+    auto it = std::find_if(t_.begin(), t_.end(), [&](const auto& e) { return std::strcmp(e.first, stage) == 0; });
+    if (it == t_.end()) t_.emplace_back(stage, t - last_);
+    else it->second += t - last_;
+    last_ = t;
+}
+
+void StageTimes::report() {
+    if (!on_ || calls_ == 0) return;
+    double sum = 0.0;
+    for (const auto& e : t_) sum += e.second;
+    std::fprintf(stderr, "%s over %lld calls, %.2f s:", name_, (long long) calls_, sum);
+    for (const auto& e : t_) std::fprintf(stderr, " %s %.2f s (%.0f%%),", e.first, e.second, 100.0 * e.second / sum);
+    std::fprintf(stderr, "\n");
+    t_.clear();
+    calls_ = 0;
 }
 
 }  // namespace strata::image::train

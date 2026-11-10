@@ -171,17 +171,24 @@ def cache_one(args, tok, uncond: np.ndarray, img: Path, work: Path) -> tuple[str
                  crop_ltrb=np.array([left, t, r, b], np.int32), **sd)
         tags.append(tag)
         n += int(lat.size)
-    ids = np.array(prompt_ids(tok, (img.parent / (img.stem + ".txt")).read_text().strip(), 0, "mage-flow"), np.int32)
+    ids = np.array(prompt_ids(tok, (img.parent / (img.stem + ".txt")).read_text().strip(), 0, args.family), np.int32)
     dump(work, "prompt_ids", ids)
     dump(work, "uncond_ids", uncond)
+    if args.cache == "ms":   # MOSS-Image's text rows: every image's at once afterwards (text_cache, moss-text)
+        return " ".join(tags), n, len(ids)
     run_pre(args, "text", args.text, work)
+    return " ".join(tags), n, text_cache(args, img, work)
+
+
+def text_cache(args, img: Path, work: Path) -> int:
+    """the text cache beside the image from the states its work dir holds; returns the prompt's rows"""
     emb = undump(work, "prompt_embeds", np.uint16)
     uemb = undump(work, "uncond_embeds", np.uint16)
     np.savez(img.parent / f"{img.stem}{TEXT_TAG}",
              prompt_embeds=emb, attn_mask=np.ones(emb.shape[0], np.int32),
              uncond_embeds=uemb, uncond_mask=np.ones(uemb.shape[0], np.int32),
              caption_dropout_rate=np.array(args.dropout, np.float32))
-    return " ".join(tags), n, int(emb.shape[0])
+    return int(emb.shape[0])
 
 
 def bf16_bits(a: np.ndarray) -> np.ndarray:
@@ -485,7 +492,16 @@ def main() -> int:
                          "encoder's mean) and 3.2e-2 (the text states) on these two runs")
     ap.add_argument("--stub-pre", metavar="OP_DIR", help="act as the engine's tool without a GPU: OP DIR (test only)")
     ap.add_argument("--selftest", action="store_true", help="the host-side rules and the cache path, no GPU")
+    ap.add_argument("--cache", default="mf", choices=("mf", "mt", "ms"),
+                    help="the cache files' model tag: mf for Mage-Flow (Mage-VAE), mt for MageTrail (the Flux2 VAE), "
+                         "ms for MOSS-Image (its VAE, Qwen3.5-9B and its DiT's text embedder: --dit)")
+    ap.add_argument("--dit", help="MOSS-Image's DiT folder (--cache ms): its text embedder makes the text rows")
     a = ap.parse_args()
+    global LATENT_TAG, TEXT_TAG
+    LATENT_TAG, TEXT_TAG = f"_{a.cache}.npz", f"_{a.cache}_te.npz"
+    a.family = "moss-image" if a.cache == "ms" else "mage-flow"
+    if a.cache == "ms" and not a.check and not a.selftest and not a.dit:
+        raise SystemExit("--cache ms needs --dit (MOSS-Image's DiT folder)")
     if a.selftest:
         with tempfile.TemporaryDirectory(prefix="mf-pre-test-") as td:
             return selftest(Path(td))
@@ -513,12 +529,13 @@ def main() -> int:
     if not a.dir:
         raise SystemExit("--dir or a [datasets.subsets].image_dir is needed")
     d = Path(a.dir)
-    tok = load_tokenizer(a.text, "mage-flow")
-    uncond = np.array(prompt_ids(tok, a.neg, 0, "mage-flow"), np.int32)
+    tok = load_tokenizer(a.text, a.family)
+    uncond = np.array(prompt_ids(tok, a.neg, 0, a.family), np.int32)
     imgs = sorted(p for p in d.iterdir() if p.suffix.lower() in IMG_EXT)
     if a.limit:
         imgs = imgs[:a.limit]
     bad = 0
+    done: list[Path] = []
     for p in imgs:
         if not (d / (p.stem + ".txt")).is_file():
             print(f"FAIL {p.name}: no caption")
@@ -530,7 +547,16 @@ def main() -> int:
             print(f"FAIL {p.name}: {e}")
             bad += 1
             continue
-        print(f"ok   {p.name} {tag} latent {n} values, {rows} rows")
+        print(f"ok   {p.name} {tag} latent {n} values, {rows} {'ids' if a.cache == 'ms' else 'rows'}")
+        done.append(p)
+    if a.cache == "ms" and done:   # the text encoder and the DiT opened once for every image
+        lst = work / "moss-text.list"
+        lst.write_text("".join(f"{work / p.stem}\n" for p in done))
+        out = subprocess.run([a.pre, "moss-text", a.text, a.dit, str(lst)], capture_output=True, text=True)
+        if out.returncode != 0:
+            raise SystemExit(f"xestrata-image-mf-pre moss-text: {out.stderr.strip()}")
+        for p in done:
+            print(f"ok   {p.name} text {text_cache(a, p, work / p.stem)} rows")
     print(f"mf_pre: {len(imgs)} image(s), {bad} failure(s)")
     return 1 if bad else 0
 

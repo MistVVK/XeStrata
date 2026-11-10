@@ -390,6 +390,20 @@ struct Grad : Plain {
     static constexpr bool kFullRange = true;
 };
 
+// SiTU of the up_gate product's sums g [T][2F] (the hidden values, then the gates): (4 tanh(g / 4) sigmoid(g)) times
+// (25 tanh(h / 25)), F values a row (MOSS-Image's MLP; its backward situ_bwd)
+struct Situ {
+    MfOut g;
+    int64_t F;
+    template<class R> Stats stats(int64_t, int64_t, int64_t, R) const { return {}; }
+    float value(int64_t t, int64_t c, const Stats&) const {
+        const float h = g.at(t, c), gt = g.at(t, c + F);
+        return 4.f * sycl::tanh(gt * 0.25f) / (1.f + sycl::exp(-gt)) * (25.f * sycl::tanh(h * 0.04f));
+    }
+    // below 4 x 25 in magnitude: FP16 takes the rows as they are (their scales 1)
+    float bound(int64_t, int64_t) const { return 0.f; }
+};
+
 // GELU (tanh form) of a product's output, rows16's Op
 struct GeluTanh {
     MfOut x;
@@ -926,6 +940,41 @@ inline void swiglu_bwd(const float* g, const float* d, int64_t T, int64_t F, flo
         dg[t * 2 * F + c] = d[i] * u * sg * (1.f + a * (1.f - sg));
         dg[t * 2 * F + F + c] = d[i] * a * sg;
     });
+}
+
+// Situ's (MOSS-Image's MLP activation): g [T][2F] the fused product's output (the hidden values, then the gates), d
+// [T][F] the gradient of (4 tanh(gt / 4) sigmoid(gt)) (25 tanh(h / 25)); dg [T][2F] gets the hidden half and the gate
+// half
+inline void situ_bwd(const float* g, const float* d, int64_t T, int64_t F, float* dg, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (T * F)), [=](sycl::id<1> id) {
+        const int64_t i = static_cast<int64_t>(id[0]), t = i / F, c = i - t * F;
+        const float h = g[t * 2 * F + c], gt = g[t * 2 * F + F + c];
+        const float th = sycl::tanh(h * 0.04f), tg = sycl::tanh(gt * 0.25f), sg = 1.f / (1.f + sycl::exp(-gt));
+        const float a = 4.f * tg * sg, b = 25.f * th;
+        dg[t * 2 * F + c] = d[i] * a * (1.f - th * th);
+        dg[t * 2 * F + F + c] = d[i] * b * ((1.f - tg * tg) * sg + 4.f * tg * sg * (1.f - sg));
+    });
+}
+
+// RmsAffine's (one_plus, its weight w): y = x inv w (1 + scale) + shift, inv = 1 / sqrt(mean(x^2) + eps) from the
+// forward's statistics; dx = inv (m - n S / C), m = dy w (1 + scale), n = x inv, S the sum over the row of m n
+inline void rms_affine_bwd(const float* x, const float* inv, const float* w, const float* scale, const float* dy,
+                           int64_t rows, int64_t cols, float* dx, void* s) {
+    constexpr int64_t WG = 256;
+    const float inv_c = 1.f / (float) cols;
+    q_of(s).parallel_for(
+        sycl::nd_range<1>(sycl::range<1>((size_t) rows * WG), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
+            const int64_t t = static_cast<int64_t>(it.get_group_linear_id());
+            const float iv = inv[t];
+            float s1 = 0.f;
+            for (auto c = static_cast<int64_t>(it.get_local_linear_id()); c < cols; c += WG)
+                s1 += dy[t * cols + c] * w[c] * (scale != nullptr ? 1.f + scale[c] : 1.f) * x[t * cols + c] * iv;
+            s1 = sycl::reduce_over_group(it.get_group(), s1, sycl::plus<float>());
+            for (auto c = static_cast<int64_t>(it.get_local_linear_id()); c < cols; c += WG) {
+                const float m = dy[t * cols + c] * w[c] * (scale != nullptr ? 1.f + scale[c] : 1.f);
+                dx[t * cols + c] = iv * (m - x[t * cols + c] * iv * s1 * inv_c);
+            }
+        });
 }
 
 // gate_add's: dh = gate dx (gate null: 1) and dgate += dx h over the rows (null dh or dgate: not taken)

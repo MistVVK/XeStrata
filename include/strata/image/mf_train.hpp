@@ -117,6 +117,7 @@ int64_t mf_block_tape_elems(const MfBlockRun& run);
 ///
 /// The forward and backward in one call.  The tape and every scratch buffer belong to the call: the block is
 /// small and reading it twice is cheaper than getting an alias wrong.
-void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream);
+/// `arena` (null: the call's own memory) keeps the buffers from one call to the next.
+void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream, train::Arena* arena = nullptr);
 
 }  // namespace strata::image

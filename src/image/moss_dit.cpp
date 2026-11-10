@@ -86,20 +86,6 @@ RmsAffineOf<uint16_t> rms_mod(const uint16_t* x, const float* w, const float* sh
     return RmsAffineOf<uint16_t>{x, w, scale, shift, C, kEps, true, alt};
 }
 
-// SiTU of the up_gate product's sums g [T][2F] (the hidden values, then the gates): (4 tanh(g / 4) sigmoid(g)) times
-// (25 tanh(h / 25)), F values a row
-struct Situ {
-    MfOut g;
-    int64_t F;
-    template<class R> Stats stats(int64_t, int64_t, int64_t, R) const { return {}; }
-    float value(int64_t t, int64_t c, const Stats&) const {
-        const float h = g.at(t, c), gt = g.at(t, c + F);
-        return 4.f * sycl::tanh(gt * 0.25f) / (1.f + sycl::exp(-gt)) * (25.f * sycl::tanh(h * 0.04f));
-    }
-    // below 4 x 25 in magnitude: FP16 takes the rows as they are (their scales 1)
-    float bound(int64_t, int64_t) const { return 0.f; }
-};
-
 // RowsI8Of's ops (a W8A8 product's input without the FP16 rows): rms_mod's rows, after x += gate * add where add is a
 // deferred product (gate_add, its sums written back to x); Situ's; the attention's output times its heads' scales
 struct RmsI8 {
@@ -1134,13 +1120,11 @@ void MossDit::free_glora_scratch() {
     lora_glora_sx_ = nullptr;
 }
 
-namespace {
-
 // The RoPE's angles as the reference makes them: a coordinate (FP32) times each axis's hd / 8 frequencies
 // 1 / base^(k / (hd / 8)) (FP32), the product in FP32; its cosine and sine rounded to bf16, as the reference casts
 // them to its activations' type (and was trained with).  Row r's four coordinates from coord(r).
-void rope_rows(int64_t rows, int64_t hd, double base, const std::function<void(int64_t, float*)>& coord,
-               std::vector<float>& c, std::vector<float>& s) {
+void moss_rope_rows(int64_t rows, int64_t hd, double base, const std::function<void(int64_t, float*)>& coord,
+                    std::vector<float>& c, std::vector<float>& s) {
     const int64_t bands = hd / 8, half = hd / 2;
     std::vector<float> f((size_t) bands);
     for (int64_t k = 0; k < bands; ++k) {
@@ -1160,8 +1144,6 @@ void rope_rows(int64_t rows, int64_t hd, double base, const std::function<void(i
     }
 }
 
-}  // namespace
-
 // a context's tables: the image's rows (0, the text's length, row and column centred), then the text's (0, i, 0, 0),
 // then the references' in the stream (set_refs: index + 1, 0, row and column centred)
 void MossDit::rope_tables(Ctx& c, int64_t h, int64_t w) {
@@ -1171,7 +1153,7 @@ void MossDit::rope_tables(Ctx& c, int64_t h, int64_t w) {
         return;
     const int64_t HW = h * w, L = c.rows;
     std::vector<float> cv, sv;
-    rope_rows(HW + L + stream_rows_, hd_, rope_base_, [&](int64_t r, float* p) {
+    moss_rope_rows(HW + L + stream_rows_, hd_, rope_base_, [&](int64_t r, float* p) {
         if (r < HW) {
             const int64_t y = r / w, x = r - y * w;
             p[0] = 0.f;
@@ -1446,7 +1428,7 @@ void MossDit::set_context(int i, const float* states, int64_t rows) {
     product(x16, rs_, tproj_, nullptr, t32, rows, b_tproj_);
     prefill::to_bf16(t32, c.txt0, rows * C_, s_);
     std::vector<float> cv, sv;
-    rope_rows(rows, hd_, rope_base_, [](int64_t r, float* p) {
+    moss_rope_rows(rows, hd_, rope_base_, [](int64_t r, float* p) {
         p[0] = p[2] = p[3] = 0.f;
         p[1] = (float) r;
     }, cv, sv);
@@ -1687,7 +1669,7 @@ void MossDit::set_refs(const std::vector<RefLatent>& refs, QiRefLayout layout) {
     ensure(cap_hw_, std::max<int>(1, (int) cap_n_), cap_text_);
     // their rows through the input projection, on the rotary axes (index + 1, 0, row, column), at timestep 0
     std::vector<float> cv, sv;
-    rope_rows(R, hd_, rope_base_, [this](int64_t r, float* p) { ref_coord(r, p); }, cv, sv);
+    moss_rope_rows(R, hd_, rope_base_, [this](int64_t r, float* p) { ref_coord(r, p); }, cv, sv);
     float* dc = alloc<float>(allocs_, (int64_t) cv.size());
     float* ds = alloc<float>(allocs_, (int64_t) sv.size());
     gpu::copy(dc, cv.data(), cv.size() * 4);

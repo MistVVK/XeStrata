@@ -26,19 +26,20 @@ So one bucket is the same number of tokens on every model, and a speed compariso
 
 | Model | Its denoiser | VAE | Text reader | Generation defaults | v1's target modules |
 | --- | --- | --- | --- | --- | --- |
-| Mage-Flow | Comfy-Org's bf16, read by the engine as FP16 or Q8_0. 12 blocks, hidden 3072, 24 heads, MLP 12288, 128-channel latent, `patch_size` 1 | Mage-VAE (32 channels, 1/8) | Qwen3-VL-4B | Turbo 4 steps, guidance 1.0, static shift 6.0 | 144 (12 × 12) |
+| Mage-Flow | Comfy-Org's bf16, read by the engine as FP16 or Q8_0. 12 blocks, hidden 3072, 24 heads, MLP 12288, 128-channel latent, `patch_size` 1 | Mage-VAE (32 channels, 1/8) | Qwen3-VL-4B | Turbo 4 steps, guidance 1.0, static shift 6.0 | 168 (12 × 14) |
 | MageTrail | Mage-Flow tuned on Danbooru and e621 images. 12 blocks, with the modulation rebuilt as a shared low-rank projection (F32) | FLUX.2-klein-4B's VAE | Qwen3-VL-4B | 30 steps, guidance 5.0, the quality tags in `prompt_start` | 144 (12 × 12) |
-| MOSS-Image | diffusers' three bf16 shards. 42 blocks, dim 3072, FFN 8192, 24 heads | a FLUX.2 family VAE (32 channels, 1/8) with a narrower decoder | Qwen3.5-9B (last hidden state, 4096) | 50 steps, guidance 3.0, shift 5.0, the negative pass skips block 22 | 252 (42 × 6) |
+| MOSS-Image | diffusers' three bf16 shards. 42 blocks, dim 3072, FFN 8192, 24 heads | a FLUX.2 family VAE (32 channels, 1/8) with a narrower decoder | Qwen3.5-9B (last hidden state, 4096) | 50 steps, guidance 3.0, shift 5.0, the negative pass skips block 22 | 246 (41 × 6) |
 | Qwen-Image-2.1 | a GGUF (Q8_0 and others). 32 blocks, dim 4096, 32 heads, MLP 12288 | Qwen-Image-2.1's VAE (16 channels, 1/8) | Qwen3-VL-8B | Turbo 8 fixed steps, guidance 1.0 | 224 (32 × 7) |
 
 The target modules are the names each DiT's `build_lora_targets` (`src/image/mf_dit.cpp`, `moss_dit.cpp`, `qi_dit.cpp`) gives, 1:1 with `TARGETS` in
-`serve/loras.py`. v1's default applies adapters **inside the blocks, to the attention and the MLP projections only**. What it leaves out: the modulations
-(`img_mod.1`, `txt_mod.1`, `modulation.1`, `shared_block_modulation`), the weights outside the blocks (`img_in`, `txt_in`, `time_text_embed.*`,
-`norm_out.linear`, `proj_out`), MOSS-Image's `text_embedder`, and the text reader.
+`serve/loras.py`. The default applies adapters to **the linear layers inside the blocks**, as ai-toolkit does for each model, the modulation layers inside the
+blocks included (Mage-Flow's `img_mod.1` and `txt_mod.1`). What it leaves out: the weights outside the blocks (`img_in`, `txt_in`, `time_text_embed.*`,
+`norm_out.linear`, `proj_out`, Qwen-Image-2.1's shared `modulation.1`, MOSS-Image's `shared_block_modulation`), MOSS-Image's `text_embedder`, and the
+text reader.
 
-- MageTrail's modulation is the low-rank F32 form and the engine binds no adapter to it (`set_loras` in `mf_dit.cpp` returns the key and the reason): a file
-  with it appears in the listing and is refused when generating, so v1 leaves it out of the default.
-- Leaving the modulations out is a rule for all four models (sd-scripts' MOSS-Image default also takes attention and FFN only), so the applied layers are the same shape everywhere.
+- MageTrail's modulation is the low-rank F32 form and the engine binds no adapter to it, so it is left out (ai-toolkit has no MageTrail entry; the rest is
+  Mage-Flow's default).
+- MOSS-Image leaves `layers.22` out, as ai-toolkit's default does (the block the negative pass of guidance skips, kept as the base has it).
 
 ## The saved file (D1)
 

@@ -21,29 +21,24 @@ namespace {
 
 using kernels::f16_from_f32;
 
-// x = (hi + lo) rs[t] to 2^-22 of each row's largest value, for an FP32 gradient the products read twice (the input
-// gradient's dX is judged at 3e-5, and an FP16 rounding of dh alone costs that budget): each row at its own power of
-// two (pow2_full), so a small gradient keeps its bits in FP16 too.  A work-group a row.
-void ad_split16(const float* x, int64_t rows, int64_t cols, uint16_t* hi, uint16_t* lo, float* rs, void* s) {
-    constexpr int64_t kWG = 64;
-    dit_rows::q_of(s).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) (rows * kWG)), sycl::range<1>((size_t) kWG)),
-        [=](sycl::nd_item<1> it) {
-            const int64_t t = (int64_t) it.get_group_linear_id();
-            float m = 0.f;
-            for (int64_t c = (int64_t) it.get_local_linear_id(); c < cols; c += kWG)
-                m = sycl::fmax(m, sycl::fabs(x[t * cols + c]));
-            const float sc = dit_rows::pow2_full(sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>()));
-            for (int64_t c = (int64_t) it.get_local_linear_id(); c < cols; c += kWG) {
-                const float v = x[t * cols + c] / sc;
-                const uint16_t h = kernels::f16_from_f32(v);
-                hi[t * cols + c] = h;
-                lo[t * cols + c] = kernels::f16_from_f32(v - kernels::f32_from_f16(h));
-            }
-            if (it.get_local_linear_id() == 0) rs[t] = sc;
-        });
+// dX[t][k] += sum_r dh[t][r] A[r][k] (dh [R][rank] FP32, A [rank][K] FP16): an item a column and kTR rows, A's value
+// read once for them
+void lora_dx(const float* dh, const uint16_t* A, int64_t R, int64_t rank, int64_t K, float* dX, void* s) {
+    constexpr int64_t kTR = 16;
+    const int64_t groups = (R + kTR - 1) / kTR;
+    dit_rows::q_of(s).parallel_for(sycl::range<2>((size_t) groups, (size_t) K), [=](sycl::item<2> it) {
+        const int64_t t0 = (int64_t) it.get_id(0) * kTR, k = (int64_t) it.get_id(1);
+        const int64_t n = sycl::min(kTR, R - t0);
+        float acc[kTR] = {};
+        for (int64_t r = 0; r < rank; ++r) {
+            const float a = kernels::f32_from_f16(A[r * K + k]);
+            for (int64_t i = 0; i < kTR; ++i)
+                if (i < n) acc[i] += dh[(t0 + i) * rank + r] * a;
+        }
+        for (int64_t i = 0; i < kTR; ++i)
+            if (i < n) dX[(t0 + i) * K + k] += acc[i];
+    });
 }
-
 
 // ---- adapters: the forward keeps h16/hr/h16t (AdKeep), the backward reads them back ----
 
@@ -209,6 +204,15 @@ bool ad_needs_xt(const Product& P, const Adapter* ad, prefill::Gemm& gemm) {
     return P.dw != nullptr || (ad != nullptr && (ad->method == AdapterMethod::lokr || !gemm.f16_batch_ex_ok()));
 }
 
+namespace {
+StageTimes& ad_times() {
+    static StageTimes t("ad_product_bwd");
+    return t;
+}
+}  // namespace
+
+void ad_profile_report() { ad_times().report(); }
+
 void ad_product_bwd(const Product& P, const Adapter* ad, const uint16_t* x16, const float* rsx, const uint16_t* xt,
                     float* dYv, float* dxv, bool accumulate, const AdKeep& keep, const AdScratch& sc, uint16_t* t16,
                     float* trs, uint16_t* t16t, float* sums, int64_t R, prefill::Gemm& gemm, void* stream) {
@@ -240,9 +244,14 @@ void ad_product_bwd(const Product& P, const Adapter* ad, const uint16_t* x16, co
         dYa = yd;                             // so dL/db = sum dY, not sum dYa
         dYb = yb;
     }
+    StageTimes& tm = ad_times();
+    const char* const tag = N > K ? "N>K" : N < K ? "N<K" : "N=K";
+    tm.begin(stream);
     dit_rows::rows16(dit_rows::Grad{{dYa, N}}, R, N, t16, trs, stream);
+    tm.mark("grad rows16", stream);
     if (P.wt == nullptr && P.wr != nullptr) dgrad_rows(t16, trs, P.wr, R, N, K, dxv, sums, accumulate, gemm, stream);
     else dgrad(t16, trs, P.wt, R, N, K, dxv, sums, accumulate, gemm, stream);
+    tm.mark(tag[1] == '<' ? "base dgrad (N<K)" : tag[1] == '>' ? "base dgrad (N>K)" : "base dgrad (N=K)", stream);
     if (P.dw != nullptr) {
         uint32_t* gi = scale_word(0, stream);
         scaled_transpose_f16(dYa, rsx, R, N, t16t, gi, stream);
@@ -260,13 +269,12 @@ void ad_product_bwd(const Product& P, const Adapter* ad, const uint16_t* x16, co
         lora_bwd(hr, rsx, h16t, xt, ad->bt, dYb, R, N, K, ad->rank, ad_scale, ad->dB, ad->dA, lscratch,
                     ltmp16, lrsT, gemm, stream, dYb == dYa ? t16 : nullptr, dYb == dYa ? trs : nullptr, h16, x16,
                     ad->b);
-        // dh lives in lscratch; h16 and h16t are dead and take its split (the input gradient's dX is judged
-        // at 3e-5, and an FP16 rounding of dh alone costs that budget)
-        ad_split16(lscratch, R, ad->rank, h16, reinterpret_cast<uint16_t*>(h16t), lrsT, stream);
-        for (const uint16_t* part : {static_cast<const uint16_t*>(h16), static_cast<const uint16_t*>(h16t)}) {   // dX += dh A, A's rows as they are
-            if (ad->at != nullptr) dgrad(part, lrsT, ad->at, R, ad->rank, K, dxv, sums, true, gemm, stream);
-            else dgrad_rows(part, lrsT, ad->a, R, ad->rank, K, dxv, sums, true, gemm, stream);
-        }
+        tm.mark(tag[1] == '<' ? "lora_bwd (N<K)" : tag[1] == '>' ? "lora_bwd (N>K)" : "lora_bwd (N=K)", stream);
+        // dX += dh A in FP32 (dh lives in lscratch): the input gradient's dX is judged at 3e-5, which an FP16
+        // rounding of dh alone costs; two FP16 products of its split took a sixth of the backward's products on the
+        // B70 and the RTX 4070 at rank 32 (2026-11-10, MOSS-Image), this one pass reads A once a tile of rows
+        lora_dx(lscratch, ad->a, R, ad->rank, K, dxv, stream);
+        tm.mark("lora dX", stream);
         }
     }
 }

@@ -44,6 +44,11 @@
 
 namespace strata::image {
 
+/// The RoPE's tables [rows][hd / 2] as the reference makes them (cos and sin, bf16-rounded): row r's four
+/// coordinates from coord(r), each axis hd / 8 frequencies 1 / base^(k / (hd / 8)); the trainer's as the DiT's.
+void moss_rope_rows(int64_t rows, int64_t hd, double base, const std::function<void(int64_t, float*)>& coord,
+                    std::vector<float>& c, std::vector<float>& s);
+
 class MossDit {
 public:
     MossDit();

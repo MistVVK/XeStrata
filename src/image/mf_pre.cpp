@@ -212,6 +212,57 @@ int text(const std::string& path, const std::string& dir, int64_t drop) {
     return 0;
 }
 
+/// MOSS-Image's text rows as its DiT reads them: each listed work dir's prompt_ids and uncond_ids through the text
+/// encoder (Qwen3.5-9B, every row: MOSS-Image drops no system turn) and then the DiT's text embedder (set_context),
+/// whose output a training step takes as it is (no time in it).  Both models are opened once for the whole list, the
+/// text encoder closed before the DiT opens.
+int moss_text(const std::string& te_path, const std::string& dit_path, const std::string& list) {
+    void* s = strata::core::Runtime::get().create_stream();
+    std::vector<std::string> dirs;
+    {
+        std::ifstream f(list);
+        std::string line;
+        while (std::getline(f, line))
+            if (!line.empty()) dirs.push_back(line);
+    }
+    if (dirs.empty()) throw std::runtime_error(list + ": no work dirs");
+    std::vector<std::vector<float>> states(dirs.size() * 2);
+    std::string err;
+    {
+        strata::image::MossText te;
+        if (!te.open(te_path, 4096, err)) throw std::runtime_error(err);
+        for (size_t d = 0; d < dirs.size(); ++d)
+            for (int b = 0; b < 2; ++b) {
+                const Var ids = load(dirs[d], b == 0 ? "prompt_ids" : "uncond_ids", b == 1);
+                if (ids.raw.empty()) continue;
+                if (ids.type != "i32" || ids.shape.size() != 1) throw std::runtime_error(dirs[d] + ": ids not [n] i32");
+                const std::vector<int32_t> v(ids.i(), ids.i() + ids.dim(0));
+                states[d * 2 + b] = te.encode(v, err);
+                if (states[d * 2 + b].empty()) throw std::runtime_error(err);
+            }
+    }
+    strata::image::MossDit dit;
+    if (!dit.open(dit_path, s, err, false, false)) throw std::runtime_error(err);
+    const int64_t C = dit.hidden(), H = 4096;
+    for (size_t d = 0; d < dirs.size(); ++d)
+        for (int b = 0; b < 2; ++b) {
+            const std::vector<float>& st = states[d * 2 + b];
+            if (st.empty()) continue;
+            const int64_t rows = (int64_t) st.size() / H;
+            dit.set_context(0, st.data(), rows);
+            strata::gpu::stream_sync(s);
+            std::vector<uint16_t> bits((size_t) (rows * C));
+            if (!strata::gpu::copy(bits.data(), dit.text_rows(0), bits.size() * 2)) throw std::runtime_error("copy");
+            std::vector<float> f32(bits.size());
+            for (size_t k = 0; k < bits.size(); ++k) f32[k] = strata::kernels::f32_from_bf16(bits[k]);
+            const std::string base = b == 0 ? "prompt" : "uncond";
+            save(dirs[d], base + "_embeds", bits.data(), (int64_t) bits.size() * 2, "bf16", {C, rows});
+            save(dirs[d], base + "_embeds32", f32.data(), (int64_t) f32.size() * 4, "f32", {C, rows});
+            std::printf("%s %s: %lld rows x %lld\n", dirs[d].c_str(), base.c_str(), (long long) rows, (long long) C);
+        }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -219,10 +270,13 @@ int main(int argc, char** argv) {
     try {
         if (what == "vae" && argc == 4) return vae(argv[2], argv[3]);
         if (what == "text" && (argc == 4 || argc == 5)) return text(argv[2], argv[3], argc == 5 ? std::stoll(argv[4]) : 34);
+        if (what == "moss-text" && argc == 5) return moss_text(argv[2], argv[3], argv[4]);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "xestrata-image-mf-pre: %s\n", e.what());
         return 1;
     }
-    std::fprintf(stderr, "usage: %s vae VAE.safetensors DIR | text TEXT_ENCODER.gguf DIR [DROP]\n", argv[0]);
+    std::fprintf(stderr,
+                 "usage: %s vae VAE.safetensors DIR | text TEXT_ENCODER.gguf DIR [DROP] | "
+                 "moss-text TEXT_ENCODER.gguf DIT_DIR LIST\n", argv[0]);
     return 2;
 }

@@ -31,8 +31,8 @@ from pathlib import Path
 
 import numpy as np
 
-CACHE_MODEL = "mf"          # Mage-Flow and MageTrail share the name; their VAEs differ
-LATENT_CH = 128
+CACHE_MODEL = "mf"          # Mage-Flow's; MageTrail's caches are "mt" (--cache), their VAEs' latents differ
+LATENT_CH = 128             # a token's values (Mage-Flow's and MOSS-Image's; the caches' own count is read)
 # the cache's filter, as the card-4 record names it: area average, fixed by tools/image/mf_pre.py
 FILTER = "area"
 
@@ -87,16 +87,17 @@ def export_one(img: Path, out: Path) -> list[str] | None:
             sd = z["latents_sd"] if "latents_sd" in z else None
             orig = z["original_size"]
             crop = z["crop_ltrb"]
-        if lat.dtype != np.float32 or lat.ndim != 3 or lat.shape[0] != LATENT_CH:
-            print(f"{img.name}: {lat_f.name} latents are {lat.dtype} {lat.shape}, not f32 [128][h][w]",
+        ch = lat.shape[0] if lat.ndim == 3 else 0
+        if lat.dtype != np.float32 or lat.ndim != 3 or ch % 16 != 0:
+            print(f"{img.name}: {lat_f.name} latents are {lat.dtype} {lat.shape}, not f32 [channels][h][w]",
                   file=sys.stderr)
             return None
         _, hh, ww = lat.shape
         # a stem a bucket; an image with one bucket keeps its own stem, as the single-budget runs named it
         tok = img.stem if len(lat_fs) == 1 else f"{img.stem}_{ww * 16:04d}x{hh * 16:04d}"
-        put(out, f"{tok}_lat", np.ascontiguousarray(lat.reshape(LATENT_CH, hh * ww).T))   # [tokens][128] F32
+        put(out, f"{tok}_lat", np.ascontiguousarray(lat.reshape(ch, hh * ww).T))   # [tokens][ch] F32
         if sd is not None:   # the posterior's standard deviation, the trainer's draw
-            put(out, f"{tok}_lat_sd", np.ascontiguousarray(sd.reshape(LATENT_CH, hh * ww).T))
+            put(out, f"{tok}_lat_sd", np.ascontiguousarray(sd.reshape(ch, hh * ww).T))
         put(out, f"{tok}_te", bf16_to_f32(emb[:rows]))                                     # [rows][txt_dim] F32
         put(out, f"{tok}_uncond", bf16_to_f32(unc[:unc_rows]))
         lines.append("\t".join((tok, str(ww), str(hh), str(ww * hh), str(rows), str(unc_rows), str(txt_dim),
@@ -211,7 +212,11 @@ def main() -> int:
     ap.add_argument("--dir", default="")
     ap.add_argument("--out", default="")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--cache", default="mf", choices=("mf", "mt", "ms"),
+                    help="the caches' model tag (mf_pre.py --cache)")
     a = ap.parse_args()
+    global CACHE_MODEL
+    CACHE_MODEL = a.cache
     if a.selftest:
         return selftest()
     if not a.dir or not a.out:

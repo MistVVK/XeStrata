@@ -94,11 +94,12 @@ void mf_trainer_init_adapters(MfTrainModel* m, int method, float alpha, uint64_t
 /// F32 (the bf16 widened), the empty prompt's rows beside them (caption dropout reads those), and the bucket's
 /// own rows and columns (the RoPE tables read them).
 struct MfTrainSample {
-    std::vector<float> lat;      // [tokens][128], the posterior's mean
-    std::vector<float> lat_sd;   // [tokens][128], its standard deviation (empty: an export without it)
+    std::vector<float> lat;      // [tokens][ch], the posterior's mean
+    std::vector<float> lat_sd;   // [tokens][ch], its standard deviation (empty: an export without it)
     std::vector<float> te;       // [rows][txt_dim]
     std::vector<float> uncond;   // [uncond_rows][txt_dim], the empty prompt
     int64_t tokens = 0, rows = 0, uncond_rows = 0, h = 0, w = 0;
+    int64_t ch = 128;            // a token's latent values (Mage-Flow's and MOSS-Image's 128, Anima's 64)
 };
 
 /// Read one sample of an exported run dir by its manifest stem.

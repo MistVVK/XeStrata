@@ -848,6 +848,7 @@ if(STRATA_ENABLE_XE)
                            src/image/mf_vae.cpp src/image/mf_dit.cpp
                            src/image/mf_train.cpp src/image/train_ops.cpp src/image/train_adapter.cpp
                            src/image/mf_train_block.cpp src/image/qi_train_block.cpp
+                           src/image/moss_train_block.cpp src/image/moss_trainer.cpp
                            src/image/train_loop.cpp src/image/qi_trainer.cpp
                            src/image/mf_pipeline.cpp src/image/text_encoder.cpp src/image/moss_dit.cpp
                            src/image/moss_pipeline.cpp
@@ -1250,6 +1251,10 @@ if(STRATA_ENABLE_XE)
   # a LoRA on Qwen-Image-2.1 as ai-toolkit trains one: its caches, its loop and one step for the reference to check
   add_executable(strata-image-qi-train src/image/qi_train_main.cpp)
   target_link_libraries(strata-image-qi-train PRIVATE strata_image)
+  # a LoRA on MOSS-Image as ai-toolkit trains one, from tools/image/mf_pre.py's caches (--cache ms; the samples
+  # read as the Mage-Flow trainer's, mf_trainer_sample)
+  add_executable(strata-image-moss-train src/image/moss_train_main.cpp src/image/mf_trainer.cpp)
+  target_link_libraries(strata-image-moss-train PRIVATE strata_image)
   # the learning preprocessing's own tool (docs/LORA_TRAIN.md "The latent and text-embedding disk caches"):
   # Mage-VAE's encoder and the text states on the inference's path, one image at a time, for tools/image/mf_pre.py
   add_executable(strata-image-mf-pre src/image/mf_pre.cpp)

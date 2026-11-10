@@ -79,7 +79,7 @@ int64_t mf_block_tape_elems(const MfBlockRun& run) {
 }
 
 
-void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
+void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream, train::Arena* arena) {
     const int64_t C = run.C, F = run.F, heads = run.heads, hd = run.hd, Ri = run.rows_img, Rt = run.rows_txt;
     const int64_t Rj = Ri + Rt, R[2] = {Ri, Rt};
     const float* in[2] = {run.img, run.txt};
@@ -88,7 +88,9 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
     const float* dout[2] = {run.d_out_img, run.d_out_txt};
     float* dIn[2] = {run.dimg, run.dtxt};
     if (C % heads != 0 || C / heads != hd) throw std::invalid_argument("mf_block: heads * head_dim must be the width");
-    train::Pool pool(stream);
+    // the call's buffers from the arena (kept from call to call); a buffer written whole before it is read is not
+    // zeroed (rf, ru), as moss_block's
+    train::Pool pool(stream, arena);
 
     const int64_t nmax = std::max(C, F);   // the wider of the block's two widths: a buffer reused between roles takes it
 
@@ -115,13 +117,13 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
     float* ym2[2];
     // q, k and v rounded up to the shared attention's rows (qi_attn_rows), zero past Rj as the pool leaves them
     const int64_t Rp = qi_attn_rows(Rj);
-    uint16_t *jq = pool.u(Rp * C), *jk = pool.u(Rp * C), *jv = pool.u(Rp * C), *jo = pool.u(Rj * C);
-    float* jof = pool.f(Rj * C);   // the same output before it was rounded: the backward's D reads this
+    uint16_t *jq = pool.u(Rp * C), *jk = pool.u(Rp * C), *jv = pool.u(Rp * C), *jo = pool.ru(Rj * C);
+    float* jof = pool.rf(Rj * C);   // the same output before it was rounded: the backward's D reads this
     // v's power of two (v_scale): jv, jo and jof are the true rows divided by vs[0], and vs[1 ..] is the output
     // projection's row scale that puts it back
     uint32_t* vamax = reinterpret_cast<uint32_t*>(pool.f(1));
-    float* vs = pool.f(Rj + 1);
-    float* lse = pool.f(Rj * heads);
+    float* vs = pool.rf(Rj + 1);
+    float* lse = pool.rf(Rj * heads);
     // ---- the gradients
     float* dym2[2];
     float* dgelu[2];
@@ -131,52 +133,52 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
     float* dyo[2];
     float* dattn[2];
     uint16_t* attn_t[2];   // the attention's FP16 rows transposed ([C][rows])
-    float* jdq = pool.f(Rj * C), *jdk = pool.f(Rj * C), *jdv = pool.f(Rj * C), *jdo = pool.f(Rj * C);
+    float* jdq = pool.rf(Rj * C), *jdk = pool.f(Rj * C), *jdv = pool.f(Rj * C), *jdo = pool.rf(Rj * C);
     float* dyq[2];
     float* dyk[2];
     float* dyv[2];
     float* dln1[2];
     float* dxn1[2];
     for (int st = 0; st < 2; ++st) {
-        ln1_16[st] = pool.u(R[st] * C);
-        ln1_s[st] = pool.f(R[st]);
-        ln1_t[st] = pool.u(R[st] * C);
-        mean1[st] = pool.f(R[st]);
-        inv1[st] = pool.f(R[st]);
-        yq[st] = pool.f(R[st] * C);
-        yk[st] = pool.f(R[st] * C);
-        yv[st] = pool.f(R[st] * C);
-        yo[st] = pool.f(R[st] * C);
-        h1[st] = pool.f(R[st] * C);
-        ln2_16[st] = pool.u(R[st] * C);
-        ln2_s[st] = pool.f(R[st]);
-        ln2_t[st] = pool.u(R[st] * C);
-        mean2[st] = pool.f(R[st]);
-        inv2[st] = pool.f(R[st]);
-        ym1[st] = pool.f(R[st] * F);
-        gelu_16[st] = pool.u(R[st] * F);
-        gelu_s[st] = pool.f(R[st]);
-        gelu_t[st] = pool.u(R[st] * F);
-        ym2[st] = pool.f(R[st] * C);
-        dym2[st] = pool.f(R[st] * C);
-        dgelu[st] = pool.f(R[st] * nmax);   // the GELU's output, then a dgrad's dx: the wider of the two
-        dym1[st] = pool.f(R[st] * F);
-        dln2[st] = pool.f(R[st] * C);
-        dh1[st] = pool.f(R[st] * C);
-        dyo[st] = pool.f(R[st] * C);
-        dattn[st] = pool.f(R[st] * C);
-        attn_t[st] = pool.u(R[st] * C);
-        dyq[st] = pool.f(R[st] * C);
-        dyk[st] = pool.f(R[st] * C);
-        dyv[st] = pool.f(R[st] * C);
-        dln1[st] = pool.f(R[st] * C);
-        dxn1[st] = pool.f(R[st] * C);
+        ln1_16[st] = pool.ru(R[st] * C);
+        ln1_s[st] = pool.rf(R[st]);
+        ln1_t[st] = pool.ru(R[st] * C);
+        mean1[st] = pool.rf(R[st]);
+        inv1[st] = pool.rf(R[st]);
+        yq[st] = pool.rf(R[st] * C);
+        yk[st] = pool.rf(R[st] * C);
+        yv[st] = pool.rf(R[st] * C);
+        yo[st] = pool.rf(R[st] * C);
+        h1[st] = pool.rf(R[st] * C);
+        ln2_16[st] = pool.ru(R[st] * C);
+        ln2_s[st] = pool.rf(R[st]);
+        ln2_t[st] = pool.ru(R[st] * C);
+        mean2[st] = pool.rf(R[st]);
+        inv2[st] = pool.rf(R[st]);
+        ym1[st] = pool.rf(R[st] * F);
+        gelu_16[st] = pool.ru(R[st] * F);
+        gelu_s[st] = pool.rf(R[st]);
+        gelu_t[st] = pool.ru(R[st] * F);
+        ym2[st] = pool.rf(R[st] * C);
+        dym2[st] = pool.rf(R[st] * C);
+        dgelu[st] = pool.rf(R[st] * nmax);   // the GELU's output, then a dgrad's dx: the wider of the two
+        dym1[st] = pool.rf(R[st] * F);
+        dln2[st] = pool.rf(R[st] * C);
+        dh1[st] = pool.rf(R[st] * C);
+        dyo[st] = pool.rf(R[st] * C);
+        dattn[st] = pool.rf(R[st] * C);
+        attn_t[st] = pool.ru(R[st] * C);
+        dyq[st] = pool.rf(R[st] * C);
+        dyk[st] = pool.rf(R[st] * C);
+        dyv[st] = pool.rf(R[st] * C);
+        dln1[st] = pool.rf(R[st] * C);
+        dxn1[st] = pool.rf(R[st] * C);
     }
-    uint16_t* t16 = pool.u(Rj * nmax), *t16t = pool.u(Rj * nmax);
-    float* trs = pool.f(Rj);
+    uint16_t* t16 = pool.ru(Rj * nmax), *t16t = pool.ru(Rj * nmax);
+    float* trs = pool.rf(Rj);
     // a wgrad's sums are N*K wide (at most F*C, never the square of the wider one) and a dgrad's T*K (at most rows*C
     // or rows*F), so this is the scratch the block's eight products can actually need
-    float* sums = pool.f(C * F + Rj * nmax);
+    float* sums = pool.rf(C * F + Rj * nmax);
 
     // ---- adapters: the forward keeps h16/hr/h16t per adapted product, the backward reads them back
     uint16_t* adh16[2][6] = {};
@@ -194,23 +196,23 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
             // train::lora_bwd's scratch (dh plus the largest of its three sums) and its three transposed FP16 maps
             ad_maxScratch = std::max(ad_maxScratch, T * rk + T * N + N * rk + rk * K);
             ad_maxTmp = std::max(ad_maxTmp, 2 * T * N + T * rk);
-            adh16[st][i] = pool.u(T * rk);
-            adhr[st][i] = pool.f(T);
-            adh16t[st][i] = pool.u(T * rk);
+            adh16[st][i] = pool.ru(T * rk);
+            adhr[st][i] = pool.rf(T);
+            adh16t[st][i] = pool.ru(T * rk);
         }
     // shared transients, sized for the largest adapted product (products run one at a time): hf is h = x A^T, y1 the
     // delta then yb/yd/dYb, y2 the second map a DoRA that trains its magnitude reads beside the first
     const bool ad_any = ad_maxN > 0;
     train::AdScratch adsc;
     if (ad_any) {
-        adsc.hf = pool.f(ad_maxR * ad_maxRank);
-        adsc.y1 = pool.f(ad_maxR * ad_maxN);
-        adsc.y2 = pool.f(ad_maxR * ad_maxN);
-        adsc.fa = pool.f(ad_maxN);
-        adsc.fb = pool.f(ad_maxN);
-        adsc.scratch = pool.f(ad_maxScratch);
-        adsc.tmp16 = pool.u(ad_maxTmp);
-        adsc.rsT = pool.f(ad_maxR);
+        adsc.hf = pool.rf(ad_maxR * ad_maxRank);
+        adsc.y1 = pool.rf(ad_maxR * ad_maxN);
+        adsc.y2 = pool.rf(ad_maxR * ad_maxN);
+        adsc.fa = pool.rf(ad_maxN);
+        adsc.fb = pool.rf(ad_maxN);
+        adsc.scratch = pool.rf(ad_maxScratch);
+        adsc.tmp16 = pool.ru(ad_maxTmp);
+        adsc.rsT = pool.rf(ad_maxR);
     }
     auto keep = [&](int st, int i) { return train::AdKeep{adh16[st][i], adhr[st][i], adh16t[st][i]}; };
     auto prod = [&](const MfBlockW& W, int i) {
@@ -261,7 +263,7 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream) {
         }
     }
     train::v_scale(yv[0], R[0] * C, yv[1], R[1] * C, vamax, vs, Rj, stream);
-    float* hsv = pool.f(heads);   // v's one power of two for every head, as the shared kernel reads a head's
+    float* hsv = pool.rf(heads);   // v's one power of two for every head, as the shared kernel reads a head's
     dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) heads), [=](sycl::id<1> id) { hsv[id[0]] = vs[0]; });
     for (int st = 0; st < 2; ++st) {
         const int64_t off = st == 0 ? Rt : 0;   // the joint rows: the text's first, then the image's
