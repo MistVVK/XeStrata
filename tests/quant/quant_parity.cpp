@@ -39,7 +39,14 @@ struct Rng {
         return (uint32_t) ((s * 0x2545F4914F6CDD1Dull) >> 32);
     }
     float uni() { return (float) next() / 4294967296.0f * 2.f - 1.f; }
-    float gauss() { return (uni() + uni() + uni() + uni()) * 0.5f; }
+    // every draw in its own statement: the operands of one expression have no evaluation order in C++, and GCC and MSVC pick different ones
+    float gauss() {
+        const float a = uni();
+        const float b = uni();
+        const float c = uni();
+        const float d = uni();
+        return (a + b + c + d) * 0.5f;
+    }
 };
 
 sq::Arith oracle_arith() {
@@ -156,10 +163,21 @@ void test_act(sq::Type act, int rows) {
             if (it % 11 == 0) x[(size_t) (r.next() % n)] = 0.f;
             // ties: a block whose absolute maximum is 127 (id = 1) with half-integers elsewhere, and its negation
             if (it % 5 == 0) {
-                for (int j = 0; j < n; ++j) x[(size_t) j] = ((int) (r.next() % 255) - 127) * 0.5f + (r.next() & 1 ? 0.f : 0.5f);
-                for (int bI = 0; bI < nbk; ++bI) x[(size_t) bI * ti->blck + r.next() % ti->blck] = r.next() & 1 ? 127.f : -127.f;
+                // one draw per statement (see Rng::gauss): two r.next() in one expression gave MSVC other inputs than GCC
+                for (int j = 0; j < n; ++j) {
+                    const int q = (int) (r.next() % 255) - 127;
+                    const float half = r.next() & 1 ? 0.f : 0.5f;
+                    x[(size_t) j] = q * 0.5f + half;
+                }
+                for (int bI = 0; bI < nbk; ++bI) {
+                    const uint32_t at = r.next() % ti->blck;
+                    x[(size_t) bI * ti->blck + at] = r.next() & 1 ? 127.f : -127.f;
+                }
                 if (act == sq::Type::Q8_K) for (int bI = 0; bI < nbk; ++bI) x[(size_t) bI * ti->blck + r.next() % ti->blck] = 127.f;
             }
+            // pre-filled: Q8_K leaves an all-zero block's 16 block sums unwritten (ggml and the layer alike); without this they carry an earlier row's bytes
+            std::memset(a.data(), 0, a.size());
+            std::memset(b.data(), 0, b.size());
             tr->from_float(x.data(), a.data(), n);
             k->fn(x.data(), b.data(), n);
             ++g_checked;
@@ -243,11 +261,15 @@ void test_boundary(int rows) {
         std::vector<float> x(256);
         std::vector<uint8_t> a(sq::kBlockQ8_K), b(sq::kBlockQ8_K);
         for (int it = 0; it < rows * 300; ++it) {
-            const float dd = std::ldexp(0.5f + 0.5f * std::fabs(r.uni()), (int) (r.next() % 14) - 7);
+            const float m = 0.5f + 0.5f * std::fabs(r.uni());
+            const int e = (int) (r.next() % 14) - 7;
+            const float dd = std::ldexp(m, e);
             const float x0 = (r.next() & 1 ? 127.f : -127.f) * dd;
             const float step = -1.f / (-127.f / x0);
             x[0] = x0;
             for (int j = 1; j < 256; ++j) x[(size_t) j] = jitter(((int) (r.next() % 253) - 126 + 0.5f) * step);
+            std::memset(a.data(), 0, a.size());
+            std::memset(b.data(), 0, b.size());
             t8->from_float(x.data(), a.data(), 256);
             k8->fn(x.data(), b.data(), 256);
             ++g_checked;
@@ -260,7 +282,9 @@ void test_boundary(int rows) {
     std::vector<float> x(32);
     std::vector<uint8_t> a(18), b(18);
     for (int it = 0; it < rows * 300; ++it) {
-        const float dd = std::ldexp(0.5f + 0.5f * std::fabs(r.uni()), (int) (r.next() % 14) - 7);
+        const float m = 0.5f + 0.5f * std::fabs(r.uni());
+        const int e = (int) (r.next() % 14) - 7;
+        const float dd = std::ldexp(m, e);
         x[0] = -8.f * dd;
         for (int j = 1; j < 32; ++j) x[(size_t) j] = jitter(((int) (r.next() % 15) + 1 - 8.5f) * dd);
         ggml_quantize_chunk(GGML_TYPE_Q4_0, x.data(), a.data(), 0, 1, 32, nullptr);
