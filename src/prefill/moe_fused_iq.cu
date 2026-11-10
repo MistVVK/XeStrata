@@ -579,6 +579,49 @@ template <int T> __device__ __forceinline__ const void* grid_src() {
 // per 32 values.  The k order inside a 16-value group is permuted the same way for both operands (stored half2 word t
 // holds values 4t, 4t + 1 and word 4 + t values 4t + 2, 4t + 3), so the activations' int8 ldmatrix fragments become
 // the F16 B fragments in registers; the accumulator layout, and so the epilogues, are the int8 kernel's.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+// (CUDA, STRATA_PF_FUSED_KQ=1, A1b) a register-lean load of the K-quant gate/up sub-blocks.  The row's two decode threads (uj 0
+// and 1, adjacent lanes) read the same 32 qs bytes (Q5_K also the same 32 qh bytes) and each keeps one nibble (one bit) of every
+// byte: here each loads only its half (16 bytes: bytes 16 uj ..) and the two halves are swapped by a shuffle when the stage is
+// decoded (kq_lean_expand), so a thread holds 6 (Q4_K) / 10 (Q5_K) raw words across a stage instead of load_unit's 10 / 18.
+// The words kq_lean_expand gives are load_unit's: convert<WT> and so the arithmetic are unchanged.
+template <int T> __host__ __device__ constexpr int kq_lean_words() { return T == T_Q4_K ? 6 : 10; }
+template <int T> __device__ __forceinline__ void kq_lean_load(const uint8_t* bp, int ib, int uj, uint32_t (&w)[kq_lean_words<T>()]) {
+    constexpr int QS = T == T_Q4_K ? 16 : 48;
+    const uint8_t* q = bp + QS + 32 * (ib >> 1) + 16 * uj;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) w[k] = ld32a(q + 4 * k);
+    w[4] = ld32a(bp);
+    const uint8_t* sc = bp + 4;
+    w[5] = ib < 4 ? (uint32_t) sc[ib] | ((uint32_t) sc[ib + 4] << 8)
+                  : (uint32_t) sc[ib + 4] | ((uint32_t) sc[ib - 4] << 8) | ((uint32_t) sc[ib] << 16);
+    w[5] |= (uint32_t) ib << 24;
+    if constexpr (T == T_Q5_K) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) w[6 + k] = ld32a(bp + 16 + 16 * uj + 4 * k);   // qh
+    }
+}
+// load_unit's words from the lean ones and the partner thread's (lane ^ 1: every lane of the warp calls this)
+template <int T> __device__ __forceinline__ void kq_lean_expand(const uint32_t (&w)[kq_lean_words<T>()], int uj, uint32_t (&f)[raw_words(T)]) {
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const uint32_t o = __shfl_xor_sync(0xffffffffu, w[k], 1);
+        f[k] = uj ? o : w[k];
+        f[4 + k] = uj ? w[k] : o;
+    }
+    f[8] = w[4];
+    f[9] = w[5];
+    if constexpr (T == T_Q5_K) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t o = __shfl_xor_sync(0xffffffffu, w[6 + k], 1);
+            f[10 + k] = uj ? o : w[6 + k];
+            f[14 + k] = uj ? w[6 + k] : o;
+        }
+    }
+}
+#endif
+
 template <int NT> using BatchOf = std::conditional_t<NT == THREADS, Batch, WideBatch>;
 template <int WT, bool GU, int WW, int NT = THREADS, bool F16 = false>
 __global__ void __launch_bounds__(NT, NT == THREADS ? 1 : 2)
@@ -592,7 +635,8 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
     constexpr bool TWO_PASS = NT != THREADS;   // the two-pass loads (load_unit_l) only in the opt-in NT = 256 kernels
     static_assert(!(TWO_PASS && WT == T_Q5_0), "the NT = 256 kernels have no Q5_0 form");
     static_assert(!(TWO_PASS && has_min(WT)), "the NT = 256 kernels have no K-quant / Q5_1 form");
-    constexpr int RAW = raw_words(WT) > 5 ? raw_words(WT) : 5;   // the raw words of a sub-block: 5, Q5_0's 6
+    constexpr bool KLEAN = GU && (WT == T_Q4_K || WT == T_Q5_K);   // (A1b) the K-quant gate/up's lean loads (kq_lean_load)
+    constexpr int RAW = KLEAN ? kq_lean_words<WT>() : raw_words(WT) > 5 ? raw_words(WT) : 5;   // the raw words of a sub-block: 5, Q5_0's 6
     constexpr int NS = (GU ? GU_ROWS_K : D_ROWS_K) / 64;   // 64-value stages along K
     constexpr int NFB = (GU ? GU_ROWS_N : D_ROWS_N) / WR;          // weight-row blocks per tile
     static_assert(GU_ROWS_N % WR == 0 && D_ROWS_N % WR == 0, "the weight rows of a product are whole work items (2 n_ff and n_embd are multiples of 64 WW)");
@@ -676,6 +720,11 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
             if (!dec) return;
             uint32_t q[8];
             float s0, s1;
+            if constexpr (KLEAN) {   // load_unit's words back from the lean ones (a shuffle with the row's other thread)
+                uint32_t f[raw_words(WT)];
+                kq_lean_expand<WT>(raw, uj, f);
+                convert<WT>(f, sgrid, kv, q, s0, s1);
+            } else
             convert<WT>(raw, sgrid, kv, q, s0, s1);
             if constexpr (F16) {   // two 16-value groups of 8 half2 words (the permuted order above)
                 uint4* d = (uint4*) (wt + buf * WT_BYTES + ur * WLDX + 64 * uj);
@@ -705,9 +754,11 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
         // (the two-pass loads exist for the NT = 256 instances' formats only: no Q5_0 instance takes them)
         auto issue = [&](int s) { if constexpr (TWO_PASS) { LdIssue l{pc, 0}; uint32_t w[5]; load_unit_l<WT>(l, unit(s), sub(s), w); } };
         auto take = [&](int s) { if constexpr (TWO_PASS) { LdTake l{pc, 0}; load_unit_l<WT>(l, unit(s), sub(s), raw); } };
+        if constexpr (KLEAN) { if (dec) kq_lean_load<WT>(unit(0), sub(0), uj, raw); } else
         if (dec) load_unit<WT>(unit(0), sub(0), raw);
         if (dec && TWO_PASS && 2 < NS) issue(2);
         put(raw, 0);
+        if constexpr (KLEAN) { if (dec) kq_lean_load<WT>(unit(1), sub(1), uj, raw); } else
         if (dec) load_unit<WT>(unit(1), sub(1), raw);
         // a warp whose rows are all past the tile's end only takes part in the loads
         const bool on0 = nb0 < nrows, on1 = nb0 + 8 < nrows;
@@ -740,7 +791,10 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
 #pragma unroll
                     for (int n = 0; n < 2; ++n)
 #pragma unroll
-                        for (int cc = 0; cc < 2; ++cc) sx[n][cc] = *(const float2*) (sa + (nb0 + 8 * n + 2 * tig + cc) * AB + 72);
+                        for (int cc = 0; cc < 2; ++cc) {   // (A1b) d_x times the sum, once a stage: the minimum term is then one FMA
+                            const float2 sm = *(const float2*) (sa + (nb0 + 8 * n + 2 * tig + cc) * AB + 72);
+                            sx[n][cc] = make_float2(dx[n][cc].x * sm.x, dx[n][cc].y * sm.y);
+                        }
                 }
                 if constexpr (F16) {
 #pragma unroll
@@ -823,8 +877,7 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
                                     const float p = (q < 2 ? wa0 : wb0) * (h ? dx[n][q & 1].y : dx[n][q & 1].x);
                                     acc[i][n][q] = fmaf(p, dotf(d[q]), acc[i][n][q]);
                                     if constexpr (has_min(WT))   // w = s0 q + s1: + s1 d_x (sum of the codes), as native_w11_kernel
-                                        acc[i][n][q] = fmaf((q < 2 ? wa1 : wb1) * (h ? dx[n][q & 1].y : dx[n][q & 1].x),
-                                                            h ? sx[n][q & 1].y : sx[n][q & 1].x, acc[i][n][q]);
+                                        acc[i][n][q] = fmaf(q < 2 ? wa1 : wb1, h ? sx[n][q & 1].y : sx[n][q & 1].x, acc[i][n][q]);
                                 }
                             }
                         }
@@ -841,6 +894,7 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
                         take(s + 2);
                         if (s + 3 < NS) issue(s + 3);
                     } else {
+                        if constexpr (KLEAN) kq_lean_load<WT>(unit(s + 2), sub(s + 2), uj, raw); else
                         load_unit<WT>(unit(s + 2), sub(s + 2), raw);
                     }
                 }
