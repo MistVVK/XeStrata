@@ -3919,21 +3919,24 @@ int main(int argc, char** argv) {
 #endif
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL)
     if (o.prefill_auto_bare && o.prefill_auto_cap == 0) {
-        // NVIDIA, compute capability 8.0 and up (round 0212, owner 11-03 "after the full test suite passes on it"): a bare `--prefill auto` may reach
+        // NVIDIA, compute capability 8.0 and up, and 7.0 (Volta, lane 10, one V100: 20K +134%, 32K +111%, see nv_chunk.hpp); Turing and Pascal keep 8192
+        // (round 0212, owner 11-03 "after the full test suite passes on it"): a bare `--prefill auto` may reach
         // 32768 instead of 8192, by the gfx12 rule below.  The fit scan still picks a smaller chunk when the expert cache cannot lend the buffers, and
         // the RAM guard further down steps 32768 -> 16384 -> 8192 when the RAM available does not cover the extra loan.  An explicit --prefill N,
         // auto:N or STRATA_PREFILL_AUTO_MAX is never touched (prefill_auto_bare is false then).  STRATA_NV_CHUNK=0 or STRATA_DEFAULTS=026 keeps 8192,
         // STRATA_NV_CHUNK=16 keeps 16384.  A layer split takes 8192 back (like gfx12; STRATA_SPLIT_CHUNK16K=1 keeps the raised ceiling).
         // A6000 UD-Q4_K_XL (13.1K of 24.6K experts in VRAM): 20K +43.4%, 32K +22.5%, 64K +21.3%, 8K 0.0%; cards that hold every expert: flat.
         const int64_t top = strata::core::nv_chunk_ceiling(std::getenv("STRATA_NV_CHUNK"), strata::qwen_defaults_026());
-        int nd = 0, lo_major = 99;
+        int nd = 0, lo_major = 99, lo_minor = 99;   // the lowest compute capability of the visible cards
         if (top > 0 && cudaGetDeviceCount(&nd) == cudaSuccess && nd > 0) {
             for (int d = 0; d < nd; ++d) {
-                int m = 0;
-                if (cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d) != cudaSuccess) { lo_major = 0; break; }
-                lo_major = std::min(lo_major, (int) strata::cc_major_of(m));
+                int m = 0, n = 0;
+                if (cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d) != cudaSuccess ||
+                    cudaDeviceGetAttribute(&n, cudaDevAttrComputeCapabilityMinor, d) != cudaSuccess) { lo_major = 0; break; }
+                const int mj = (int) strata::cc_major_of(m), mn = (int) strata::cc_minor_of(n);
+                if (mj < lo_major || (mj == lo_major && mn < lo_minor)) { lo_major = mj; lo_minor = mn; }
             }
-            if (strata::core::nv_chunk_card_ok(lo_major)) {
+            if (strata::core::nv_chunk_card_ok(lo_major, lo_minor)) {
                 o.prefill_auto_max = top;
                 o.prefill_chunk = top;
                 o.prefill_gfx12_16k = true;
