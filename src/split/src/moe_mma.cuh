@@ -103,7 +103,7 @@ __device__ __forceinline__ void mm_put_k(const uint4& hd, const uint4& qv, const
     mm_store8(dst + 32, hi);
 }
 
-template <> struct MmTile<GGML_TYPE_Q4_K> {
+template <> struct MmTile<T_Q4_K> {
     uint4 hd, qv;
     bool live;
     __device__ __forceinline__ void fetch(const char* we, size_t row_a, int nrows, int row0, int k0, int) {
@@ -118,7 +118,7 @@ template <> struct MmTile<GGML_TYPE_Q4_K> {
     }
     __device__ __forceinline__ void put(int k0, int, __half* sw) const { mm_put_k<false>(hd, qv, qv, live, k0, sw); }
 };
-template <> struct MmTile<GGML_TYPE_Q5_K> {
+template <> struct MmTile<T_Q5_K> {
     uint4 hd, hv, qv;
     bool live;
     __device__ __forceinline__ void fetch(const char* we, size_t row_a, int nrows, int row0, int k0, int) {
@@ -134,7 +134,7 @@ template <> struct MmTile<GGML_TYPE_Q5_K> {
     }
     __device__ __forceinline__ void put(int k0, int, __half* sw) const { mm_put_k<true>(hd, qv, hv, live, k0, sw); }
 };
-template <> struct MmTile<GGML_TYPE_Q5_1> {
+template <> struct MmTile<T_Q5_1> {
     uint2 v[3];
     bool live, item;
     __device__ __forceinline__ void fetch(const char* we, size_t row_a, int nrows, int row0, int k0, int kc) {
@@ -177,7 +177,7 @@ template <> struct MmTile<GGML_TYPE_Q5_1> {
         mm_store8(sw + r * MM_LD + u * 32 + 16, hi);
     }
 };
-template <> struct MmTile<GGML_TYPE_Q8_0> {
+template <> struct MmTile<T_Q8_0> {
     uint16_t v[17];
     bool live, item;
     __device__ __forceinline__ void fetch(const char* we, size_t row_a, int nrows, int row0, int k0, int kc) {

@@ -25,8 +25,11 @@ if(NOT _fnx_hip AND (NOT STRATA_ENABLE_CUDA OR WIN32 OR APPLE))
   message(STATUS "STRATA_BUILD_SPLIT: needs a Linux CUDA or HIP build, skipped")
   return()
 endif()
-if(NOT _strata_ggml_root OR NOT EXISTS "${_strata_ggml_root}/ggml/src/ggml-cuda/vecdotq.cuh")
-  message(WARNING "STRATA_BUILD_SPLIT: ggml-cuda's headers are missing (third_party/strata-ggml, or the -DSTRATA_GGML_DIR checkout); strata-split skipped")
+# the quant header (block layouts, codebook tables): the split's only file from third_party/strata-ggml; its dot products are its own
+# (src/qdot.cuh, ggml vecdotq.cuh's arithmetic), so no ggml-cuda header is on its include path
+get_filename_component(_sp_quant "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/strata-ggml" ABSOLUTE)
+if(NOT EXISTS "${_sp_quant}/strata-quant-common.h")
+  message(WARNING "STRATA_BUILD_SPLIT: third_party/strata-ggml/strata-quant-common.h is missing; strata-split skipped")
   return()
 endif()
 if(_fnx_hip)
@@ -109,9 +112,8 @@ foreach(_n ${STRATA_SPLIT_CARDS})
   add_executable(${_t} ${_sp_engine} ${_sp_kparts})
   if(_fnx_hip)
     # HIP: src/hip first (cuda.h, mma.h stand-ins), the force-included fnx_hip.h after the tree's cuda_runtime.h shim
-    target_include_directories(${_t} PRIVATE ${_sp}/src/hip ${_sp}/src ${_sp}/tools ${_strata_ggml_root}/ggml/src/ggml-cuda
-                               ${_strata_ggml_root}/ggml/src ${_strata_ggml_root}/ggml/include)
-    target_compile_definitions(${_t} PRIVATE FNX_NCARD=${_n} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1 FNX_HIP=1 GGML_USE_HIP=1
+    target_include_directories(${_t} PRIVATE ${_sp}/src/hip ${_sp}/src ${_sp}/tools ${_sp_quant})
+    target_compile_definitions(${_t} PRIVATE FNX_NCARD=${_n} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1 FNX_HIP=1
                                FNX_DIR="${_sp}")
     target_compile_options(${_t} PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-include ${_sp}/src/hip/fnx_hip.h>")
     target_link_libraries(${_t} PRIVATE strata_hip_runtime ${STRATA_HIP_BLAS_TARGETS})
@@ -124,8 +126,7 @@ foreach(_n ${STRATA_SPLIT_CARDS})
     endif()
     continue()
   endif()
-  target_include_directories(${_t} PRIVATE ${_sp}/src ${_sp}/tools ${_strata_ggml_root}/ggml/src/ggml-cuda ${_strata_ggml_root}/ggml/src
-                             ${_strata_ggml_root}/ggml/include)
+  target_include_directories(${_t} PRIVATE ${_sp}/src ${_sp}/tools ${_sp_quant})
   target_compile_definitions(${_t} PRIVATE FNX_NCARD=${_n} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1 FNX_PF_JOB=${STRATA_SPLIT_PF_JOB}
                              FNX_DIR="${_sp}")
   target_compile_options(${_t} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --expt-relaxed-constexpr -Wno-deprecated-gpu-targets>)
@@ -151,9 +152,8 @@ if(_fnx_hip)
   set(_t strata-split-selftest)
   add_executable(${_t} EXCLUDE_FROM_ALL ${_sp}/tools/selftest_main.cpp ${_sp}/src/selftest.cu ${_sp}/src/moe_mma.cu ${_sp_kparts})
   set_source_files_properties(${_sp}/tools/selftest_main.cpp ${_sp}/src/selftest.cu ${_sp}/src/moe_mma.cu PROPERTIES LANGUAGE HIP)
-  target_include_directories(${_t} PRIVATE ${_sp}/src/hip ${_sp}/src ${_sp}/tools ${_strata_ggml_root}/ggml/src/ggml-cuda
-                             ${_strata_ggml_root}/ggml/src ${_strata_ggml_root}/ggml/include)
-  target_compile_definitions(${_t} PRIVATE FNX_NCARD=${_nst} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1 FNX_HIP=1 GGML_USE_HIP=1
+  target_include_directories(${_t} PRIVATE ${_sp}/src/hip ${_sp}/src ${_sp}/tools ${_sp_quant})
+  target_compile_definitions(${_t} PRIVATE FNX_NCARD=${_nst} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1 FNX_HIP=1
                              FNX_DIR="${_sp}")
   target_compile_options(${_t} PRIVATE "$<$<COMPILE_LANGUAGE:HIP>:SHELL:-include ${_sp}/src/hip/fnx_hip.h>")
   target_link_libraries(${_t} PRIVATE strata_hip_runtime ${STRATA_HIP_BLAS_TARGETS})
@@ -182,17 +182,25 @@ if(STRATA_BUILD_TESTS)
   target_link_libraries(split_convert_dump PRIVATE Threads::Threads)
   # the weight tiles of the prompt kernel run on a GPU against the file (tests/split/tile_check.py reads its output); not a ctest
   add_executable(split_moe_tile_test ${_sp}/tools/moe_tile_test.cu ${_sp}/src/gguf.cpp)
-  target_include_directories(split_moe_tile_test PRIVATE ${_sp}/src ${_sp}/tools ${_strata_ggml_root}/ggml/src/ggml-cuda ${_strata_ggml_root}/ggml/src
-                             ${_strata_ggml_root}/ggml/include)
+  target_include_directories(split_moe_tile_test PRIVATE ${_sp}/src ${_sp}/tools ${_sp_quant})
   target_compile_definitions(split_moe_tile_test PRIVATE FNX_NCARD=${_n0} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0)
   target_compile_options(split_moe_tile_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --expt-relaxed-constexpr -Wno-deprecated-gpu-targets>)
   set_target_properties(split_moe_tile_test PROPERTIES CUDA_ARCHITECTURES "${STRATA_SPLIT_ARCH}-real" CUDA_STANDARD 17 CXX_STANDARD 17)
   target_link_libraries(split_moe_tile_test PRIVATE Threads::Threads)
+  # src/qdot.cuh (the split's decode dots) against ggml-cuda's vecdotq.cuh, bit for bit, on random blocks (not a ctest: needs a GPU). The one split
+  # target that includes ggml-cuda, as the reference; it goes when the vendored tree goes (phaseA-tests/par/RESULTS-OWN-4S.md, oracle note)
+  if(NOT _fnx_hip AND _strata_ggml_root AND EXISTS "${_strata_ggml_root}/ggml/src/ggml-cuda/vecdotq.cuh")
+    add_executable(split_qdot_test ${_sp}/tools/qdot_test.cu)
+    target_include_directories(split_qdot_test PRIVATE ${_sp}/src ${_strata_ggml_root}/ggml/src/ggml-cuda ${_strata_ggml_root}/ggml/src
+                               ${_strata_ggml_root}/ggml/include ${_sp_quant})
+    target_compile_definitions(split_qdot_test PRIVATE FNX_NCARD=${_n0} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0)
+    target_compile_options(split_qdot_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --expt-relaxed-constexpr -Wno-deprecated-gpu-targets>)
+    set_target_properties(split_qdot_test PROPERTIES CUDA_ARCHITECTURES "${STRATA_SPLIT_ARCH}-real" CUDA_STANDARD 17 CXX_STANDARD 17)
+  endif()
   # FNX_PFX_GDN_TC's tensor-core chunk scan against the sub-chunk kernels it replaces, one card, random inputs (not a ctest: needs a GPU)
   if(NOT _fnx_hip)
     add_executable(split_gdn_tc_test ${_sp}/tools/gdn_tc_test.cu)
-    target_include_directories(split_gdn_tc_test PRIVATE ${_sp}/src ${_sp}/tools ${_strata_ggml_root}/ggml/src/ggml-cuda ${_strata_ggml_root}/ggml/src
-                               ${_strata_ggml_root}/ggml/include)
+    target_include_directories(split_gdn_tc_test PRIVATE ${_sp}/src ${_sp}/tools ${_sp_quant})
     target_compile_definitions(split_gdn_tc_test PRIVATE FNX_NCARD=${_n0} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0)
     target_compile_options(split_gdn_tc_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --expt-relaxed-constexpr -Wno-deprecated-gpu-targets>)
     set_target_properties(split_gdn_tc_test PROPERTIES CUDA_ARCHITECTURES "${STRATA_SPLIT_ARCH}-real" CUDA_STANDARD 17 CXX_STANDARD 17)
@@ -202,8 +210,7 @@ if(STRATA_BUILD_TESTS)
   list(REMOVE_ITEM _sp_run_src ${_sp}/tools/sfnx.cpp)
   add_executable(split_fnx_run ${_sp_run_src} ${_sp}/tools/fnx_run.cpp ${_sp_kparts})
   set_source_files_properties(${_sp}/tools/fnx_run.cpp PROPERTIES LANGUAGE CUDA)
-  target_include_directories(split_fnx_run PRIVATE ${_sp}/src ${_sp}/tools ${_strata_ggml_root}/ggml/src/ggml-cuda ${_strata_ggml_root}/ggml/src
-                             ${_strata_ggml_root}/ggml/include)
+  target_include_directories(split_fnx_run PRIVATE ${_sp}/src ${_sp}/tools ${_sp_quant})
   target_compile_definitions(split_fnx_run PRIVATE FNX_NCARD=${_n0} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1 FNX_DIR="${_sp}")
   target_compile_options(split_fnx_run PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --expt-relaxed-constexpr -Wno-deprecated-gpu-targets>)
   set_target_properties(split_fnx_run PROPERTIES CUDA_ARCHITECTURES "${STRATA_SPLIT_ARCH}-real" CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CXX_STANDARD 17)

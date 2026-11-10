@@ -10,26 +10,7 @@
 #include <stdexcept>
 #include <string>
 
-#include "ggml.h"
-#if FNX_HIP
-// the tree's hip_compat/intrinsics.hpp names these as macros; ggml's HIP vendor header defines its own: it goes first, then ours return
-#undef __vsubss4
-#undef __vsub4
-#undef __vcmpne4
-#undef __shfl_sync
-#undef __shfl_up_sync
-#undef __shfl_xor_sync
-#endif
-#include "common.cuh"
-#if FNX_HIP
-#undef __shfl_sync
-#undef __shfl_up_sync
-#undef __shfl_xor_sync
-#define __shfl_xor_sync(...) (::strata::hip_compat::shfl_xor_sync(__VA_ARGS__))
-#define __shfl_up_sync(...) (::strata::hip_compat::shfl_up_sync(__VA_ARGS__))
-#define __shfl_sync(...) (::strata::hip_compat::shfl_sync(__VA_ARGS__))
-#undef cudaFuncSetAttribute
-#endif
+#include "qdot.cuh"   // block layouts and codebook tables (strata-quant-common.h)
 
 namespace fnx {
 
@@ -57,16 +38,16 @@ void moe_mma(const DW& A, size_t sa, const BigJob* jobs, const int* njobs, int n
     if (w.ncols % 32) throw std::runtime_error("moe_mma: columns not in units of 32");
     cudaStream_t s = (cudaStream_t) st;
     switch (A.type) {
-        case T_Q4_K: mma_launch<GGML_TYPE_Q4_K>(w, jobs, njobs, njobs_cap, x, out, s); break;
-        case T_Q5_K: mma_launch<GGML_TYPE_Q5_K>(w, jobs, njobs, njobs_cap, x, out, s); break;
-        case T_Q5_1: mma_launch<GGML_TYPE_Q5_1>(w, jobs, njobs, njobs_cap, x, out, s); break;
-        case T_Q8_0: mma_launch<GGML_TYPE_Q8_0>(w, jobs, njobs, njobs_cap, x, out, s); break;
-        case T_Q4_0: mma_launch<GGML_TYPE_Q4_0>(w, jobs, njobs, njobs_cap, x, out, s); break;
-        case T_IQ4_NL: mma_launch<GGML_TYPE_IQ4_NL>(w, jobs, njobs, njobs_cap, x, out, s); break;
-        case T_IQ4_XS: mma_launch<GGML_TYPE_IQ4_XS>(w, jobs, njobs, njobs_cap, x, out, s); break;
-        case T_IQ3_S: mma_launch<GGML_TYPE_IQ3_S>(w, jobs, njobs, njobs_cap, x, out, s); break;
-        case T_IQ3_XXS: mma_launch<GGML_TYPE_IQ3_XXS>(w, jobs, njobs, njobs_cap, x, out, s); break;
-        case T_IQ2_S: mma_launch<GGML_TYPE_IQ2_S>(w, jobs, njobs, njobs_cap, x, out, s); break;
+        case T_Q4_K: mma_launch<T_Q4_K>(w, jobs, njobs, njobs_cap, x, out, s); break;
+        case T_Q5_K: mma_launch<T_Q5_K>(w, jobs, njobs, njobs_cap, x, out, s); break;
+        case T_Q5_1: mma_launch<T_Q5_1>(w, jobs, njobs, njobs_cap, x, out, s); break;
+        case T_Q8_0: mma_launch<T_Q8_0>(w, jobs, njobs, njobs_cap, x, out, s); break;
+        case T_Q4_0: mma_launch<T_Q4_0>(w, jobs, njobs, njobs_cap, x, out, s); break;
+        case T_IQ4_NL: mma_launch<T_IQ4_NL>(w, jobs, njobs, njobs_cap, x, out, s); break;
+        case T_IQ4_XS: mma_launch<T_IQ4_XS>(w, jobs, njobs, njobs_cap, x, out, s); break;
+        case T_IQ3_S: mma_launch<T_IQ3_S>(w, jobs, njobs, njobs_cap, x, out, s); break;
+        case T_IQ3_XXS: mma_launch<T_IQ3_XXS>(w, jobs, njobs, njobs_cap, x, out, s); break;
+        case T_IQ2_S: mma_launch<T_IQ2_S>(w, jobs, njobs, njobs_cap, x, out, s); break;
         default: throw std::runtime_error("moe_mma: expert type " + std::to_string(A.type) + " not handled");
     }
     ck_launch("moe_mma");

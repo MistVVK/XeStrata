@@ -61,11 +61,11 @@ struct MmTile4 {
         mq_put32(sw + r * MM_LD + u * 32, f);
     }
 };
-template <> struct MmTile<GGML_TYPE_Q4_0> : MmTile4<false> {};
-template <> struct MmTile<GGML_TYPE_IQ4_NL> : MmTile4<true> {};
+template <> struct MmTile<T_Q4_0> : MmTile4<false> {};
+template <> struct MmTile<T_IQ4_NL> : MmTile4<true> {};
 
 // IQ4_XS: 136 bytes = d (f16), scales_h (u16), scales_l[4], qs[128]; sub-block ib has 16 qs bytes at 8 + 16 ib and a 6-bit scale
-template <> struct MmTile<GGML_TYPE_IQ4_XS> {
+template <> struct MmTile<T_IQ4_XS> {
     uint32_t hd[2], q[4];
     int ib;
     bool live, item;
@@ -111,7 +111,7 @@ __device__ __forceinline__ void mq_signed4(float* y, uint32_t grid, float d, uin
 }
 
 // IQ3_S: 110 bytes = d, qs[64], qh[8], signs[32], scales[4]; sub-block ib: qs[8 ib..], qh[ib], signs[4 ib..], a 4-bit scale (1 + 2 s) d
-template <> struct MmTile<GGML_TYPE_IQ3_S> {
+template <> struct MmTile<T_IQ3_S> {
     uint32_t dq, qs[2], sg, qh, sc;   // d (low 16 bits of dq), 8 qs bytes, 4 sign bytes, qh byte, scales byte
     int ib;
     bool live, item;
@@ -152,7 +152,7 @@ template <> struct MmTile<GGML_TYPE_IQ3_S> {
 };
 
 // IQ3_XXS: 98 bytes = d, qs[96]: 64 grid indices (8 per sub-block) then per sub-block a u32 of four 7-bit sign codes and a 4-bit scale at the top
-template <> struct MmTile<GGML_TYPE_IQ3_XXS> {
+template <> struct MmTile<T_IQ3_XXS> {
     uint32_t dq, qs[2], aux;
     int ib;
     bool live, item;
@@ -190,7 +190,7 @@ template <> struct MmTile<GGML_TYPE_IQ3_XXS> {
 };
 
 // IQ2_S: 82 bytes = d, qs[32] (grid index low bytes, 4 per sub-block), signs[32] (4 per sub-block), qh[8], scales[8]; 10-bit grid index of 8 values
-template <> struct MmTile<GGML_TYPE_IQ2_S> {
+template <> struct MmTile<T_IQ2_S> {
     uint32_t dq, qs, sg, qh, sc;
     int ib;
     bool live, item;
