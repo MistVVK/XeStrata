@@ -12,6 +12,8 @@
 
 #include "strata/image/hunyuanimage3_vae.hpp"
 
+#include "qi_conv.hpp"
+
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/hunyuanimage3_kernels.hpp"
@@ -38,7 +40,6 @@ using strata::kernels::f16_from_f32;
 
 constexpr int64_t kGroups = 32;             // every GroupNorm here: nn.GroupNorm(32, C, eps = 1e-6, affine)
 constexpr float kEps = 1e-6f;
-constexpr int64_t kColBytes = 256ll << 20;  // the unfolded neighbourhoods a product at most (QiVae's bound)
 
 sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
 
@@ -390,18 +391,25 @@ void HunyuanImage3Vae::grow(int64_t elems32, int64_t elems16, int64_t col16, int
 // out [P][c.out] (FP32) = c(in16 [P][c.in]) + bias, the pixels the linear (t, y, x) index; kt 0 products
 // straight, kt 1 / 3 through the unfold's bands
 void HunyuanImage3Vae::conv(const Conv& c, const uint16_t* in16, int64_t T, int64_t H, int64_t W, float* out) {
-    const int64_t P = T * H * W;
-    if (c.kt == 0) {
-        gemm_.f16(in16, c.w, out, P, c.out, c.in);
-    } else {
-        const int64_t K = c.kt * 9 * c.in, rows = std::max<int64_t>(1, col_cap_ / K);
-        for (int64_t p0 = 0; p0 < P; p0 += rows) {
-            const int64_t n = std::min(rows, P - p0);
-            qi_im2col16(in16, T, H, W, c.in, (int) c.kt, 3, 1, 1, H, W, p0, n, col16_, s_);
-            gemm_.f16(col16_, c.w, out + p0 * c.out, n, c.out, K);
-        }
+    const int64_t frames = c.kt == 1 ? T : 1;
+    const int64_t times = c.kt == 1 ? 1 : T;
+    const int k = c.kt == 0 ? 1 : 3, kt = c.kt == 0 ? 1 : (int) c.kt, pad = k / 2;
+    const int64_t P = times * H * W, K = (int64_t) kt * k * k * c.in;
+    sycl::queue& q = core::Runtime::get().stream(s_);
+    for (int64_t t = 0; t < frames; ++t) {
+        const uint16_t* x = in16 + t * H * W * c.in;
+        float* y = out + t * H * W * c.out;
+        conv::Request r{x, H, W, c.in, c.w, c.out, k, 1, pad, pad, pad, pad};
+        r.temporal = kt;
+        r.bias = c.b;
+        r.out = y;
+        conv::drive(q, r, P, K, col_cap_, k == 1,
+            [&](int64_t p0, int64_t n) { qi_im2col16(x, times, H, W, c.in, kt, k, 1, pad, H, W, p0, n, col16_, s_); },
+            [&](int64_t p0, int64_t n, bool point) {
+                gemm_.f16(point ? x : col16_, c.w, y + p0 * c.out, n, c.out, point ? c.in : K);
+            },
+            [&] { qi_bias_add(y, c.b, P, c.out, s_); });
     }
-    qi_bias_add(out, c.b, P, c.out, s_);
 }
 
 // one GroupNorm(32, eps 1e-6) over P pixels of C channels and the swish after it (when `silu`), FP16 out
@@ -521,7 +529,7 @@ void HunyuanImage3Vae::decode(const float* z, int64_t h, int64_t w, float* rgb, 
     // the widest stage in elements: the head's grid T = 4, 16 h x 16 w of 128 channels = 131072 HW (the same
     // count at every DCAE upsample's conv output); the attention is the T = 1 grid: P = HW positions, C = 1024.
     const int64_t big32 = 131072 * HW, p_attn = HW;
-    grow(big32, big32, std::max(kColBytes / 2, p_attn * p_attn), p_attn * p_attn);
+    grow(big32, big32, std::max(conv::col_values(q_of(s_)), p_attn * p_attn), p_attn * p_attn);
     latent_tokens(z, (float) kScalingFactor, cin_.in, HW, a16_, t0_, s_);   // t0_ the FP32 tokens [HW][32]
     dump_stage(0, "tokens", t0_, HW * cin_.in);
     conv(cin_, a16_, 1, h, w, t1_);
@@ -574,7 +582,7 @@ void HunyuanImage3Vae::encode(const float* rgb, int64_t H, int64_t W, float* z, 
     // the widest stage: conv_in's four frames of 128 channels over the image = 512 HW (the decoder's widest is
     // the same count at that latent); the attention is the T = 1 grid of h x w positions
     const int64_t big32 = 512 * HW, p_attn = hw;
-    grow(big32, big32, std::max(kColBytes / 2, p_attn * p_attn), p_attn * p_attn);
+    grow(big32, big32, std::max(conv::col_values(q_of(s_)), p_attn * p_attn), p_attn * p_attn);
     int64_t T = 4;
     rgb_frames16(rgb, HW, T, ecin_.in, a16_, s_);
     conv(ecin_, a16_, T, H, W, t0_);
@@ -749,7 +757,7 @@ uint64_t HunyuanImage3Vae::encode_scratch_bytes(int64_t H, int64_t W) const {
 }
 
 uint64_t HunyuanImage3Vae::scratch_bytes(int64_t h, int64_t w) const {
-    const int64_t HW = h * w, big32 = 131072 * HW, col = std::max(kColBytes / 2, HW * HW);
+    const int64_t HW = h * w, big32 = 131072 * HW, col = std::max(conv::col_values(q_of(s_)), HW * HW);
     return (uint64_t) big32 * 4 * 3 + (uint64_t) big32 * 2 + (uint64_t) col * 2 + (uint64_t) HW * HW * 4 +
            (uint64_t) kWsFloats * 4;
 }

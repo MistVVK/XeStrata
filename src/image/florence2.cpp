@@ -282,7 +282,7 @@ void Florence2::vision(const QiRef& image) {
         auto ffn = [&](const VBlock& b) {
             aux_dwconv3_norm16(x, b.conv2.w, b.conv2.b, b.n2.w, b.n2.b, H, W, C, 0, kEps, y, h16, s_);
             std::swap(x, y);
-            product16(h16, b.fc1, g16, N, true, AuxAct::gelu);
+            product16(h16, b.fc1, g16, N, true, ImageAct::gelu);
             product(g16, b.fc2, y, N, 0, false);
             aux_residual_norm16(x, y, b.fc2.b, nullptr, nullptr, H, W, C, 0, 0, kEps, nullptr, s_);
         };

@@ -13,9 +13,7 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/prefill/gemm.hpp"
 
-#if STRATA_ONEDNN || STRATA_CUDNN
 #include "../image/qi_conv.hpp"
-#endif
 
 #include <sycl/sycl.hpp>
 
@@ -28,9 +26,7 @@ namespace strata::upscale {
 
 using image::SafeTensor;
 using image::SafeTensors;
-#if STRATA_ONEDNN || STRATA_CUDNN
 namespace conv = image::conv;
-#endif
 
 namespace {
 
@@ -39,7 +35,6 @@ using strata::kernels::f32_from_f16;
 
 constexpr float kSlope = 0.2f;              // the LeakyReLUs' negative slope
 constexpr float kResidual = 0.2f;           // the dense blocks' and the RRDBs' residual scaling
-constexpr int64_t kColBytes = 128ll << 20;  // the own path's unfolded neighbourhoods at most (a band of rows at a time)
 
 // a 3 x 3 convolution: its FP16 weights [O][3][3][C] and FP32 bias on the host, then on the GPU
 struct Layer {
@@ -182,58 +177,53 @@ struct Esrgan::Impl {
     // the form, else im2col and the engine's products a band of rows at a time
     void conv(const Layer& l, const uint16_t* x, int64_t H, int64_t W, int64_t ldx, void* y, int64_t ldy, bool y16,
               bool leaky, bool add) {
-        const int64_t O = l.O;
-#if STRATA_ONEDNN || STRATA_CUDNN
-        conv::Form f;
-        f.ldx = ldx;
-        f.ldy = ldy;
-        f.y16 = y16;
-        f.leaky = leaky ? kSlope : -1.0f;
-#endif
-#if STRATA_ONEDNN
-        if (conv::onednn(q(), x, H, W, l.C, l.dw, O, 3, 1, 1, 1, 1, 1, l.db, add, y, f)) return;
-#endif
-#if STRATA_CUDNN
-        if (conv::cudnn(q(), x, H, W, l.C, l.dw, O, 3, l.db, add, y, f)) return;
-#endif
-        if (!gemm_ready) {
-            std::string err;
-            if (!gemm.init(s, 16, err)) throw std::runtime_error("RealESRGAN: the products: " + err);
-            gemm_ready = true;
-        }
-        const int64_t K = 9 * l.C, HW = H * W;
-        const int64_t rows = std::max<int64_t>(1, std::min<int64_t>(HW, kColBytes / (K * 2)));
-        if (rows * K > col_cap) {
-            if (col != nullptr) gpu::free(col);
-            col = nullptr;
-            if (!gpu::alloc_device(&col, (size_t) (rows * K) * 2))
-                throw std::runtime_error(std::string("RealESRGAN: GPU memory (products): ") + gpu::last_error());
-            col_cap = rows * K;
-        }
-        if (rows * O > tmp_cap) {
-            if (tmp != nullptr) gpu::free(tmp);
-            tmp = nullptr;
-            if (!gpu::alloc_device(&tmp, (size_t) (rows * O) * 4))
-                throw std::runtime_error(std::string("RealESRGAN: GPU memory (products): ") + gpu::last_error());
-            tmp_cap = rows * O;
-        }
-        for (int64_t p0 = 0; p0 < HW; p0 += rows) {
-            const int64_t n = std::min(rows, HW - p0);
-            image::qi_im2col16(x, 1, H, W, l.C, 1, 3, 1, 1, H, W, p0, n, col, s, ldx);
-            if (y16) {   // a dense block's channels: LeakyReLU'd into y at ldy
-                gemm.f16(col, l.dw, tmp, n, O, K);
-                image::qi_conv_store16(tmp, n, O, O, l.db, leaky ? image::QiAct::leaky : image::QiAct::none, kSlope,
-                                       nullptr, static_cast<uint16_t*>(y) + p0 * ldy, ldy, 0, s);
-            } else if (add) {   // a residual: y += the convolution
-                gemm.f16(col, l.dw, tmp, n, O, K);
-                image::qi_bias_add(static_cast<float*>(y) + p0 * ldy, l.db, n, O, s, tmp, ldy);
-            } else {   // FP32 of the outputs' own width (conv_first, conv_last)
-                if (ldy != O) throw std::logic_error("RealESRGAN: an FP32 output wider than its convolution");
-                float* yy = static_cast<float*>(y) + p0 * O;
-                gemm.f16(col, l.dw, yy, n, O, K);
-                image::qi_bias_add(yy, l.db, n, O, s);
-            }
-        }
+        const int64_t O = l.O, K = 9 * l.C, HW = H * W, cap = conv::col_values(q());
+        conv::Request r{x, H, W, l.C, l.dw, O, 3, 1, 1, 1, 1, 1};
+        r.bias = l.db;
+        r.add = add;
+        r.out = y;
+        r.form.ldx = ldx;
+        r.form.ldy = ldy;
+        r.form.y16 = y16;
+        r.form.leaky = leaky ? kSlope : -1.0f;
+        conv::drive(q(), r, HW, K, cap, false,
+            [&](int64_t p0, int64_t n) {
+                const int64_t rows = std::min(HW, cap / K);
+                if (rows * K > col_cap) {
+                    if (col != nullptr) gpu::free(col);
+                    col = nullptr;
+                    if (!gpu::alloc_device(&col, (size_t) (rows * K) * 2))
+                        throw std::runtime_error(std::string("RealESRGAN: GPU memory (products): ") + gpu::last_error());
+                    col_cap = rows * K;
+                }
+                image::qi_im2col16(x, 1, H, W, l.C, 1, 3, 1, 1, H, W, p0, n, col, s, ldx);
+            },
+            [&](int64_t p0, int64_t n, bool) {
+                if (!gemm_ready) {
+                    std::string err;
+                    if (!gemm.init(s, 16, err)) throw std::runtime_error("RealESRGAN: the products: " + err);
+                    gemm_ready = true;
+                }
+                if (y16 || add) {
+                    if (n * O > tmp_cap) {
+                        if (tmp != nullptr) gpu::free(tmp);
+                        tmp = nullptr;
+                        if (!gpu::alloc_device(&tmp, (size_t) (n * O) * 4))
+                            throw std::runtime_error(std::string("RealESRGAN: GPU memory (products): ") + gpu::last_error());
+                        tmp_cap = n * O;
+                    }
+                    gemm.f16(col, l.dw, tmp, n, O, K);
+                    if (y16)
+                        image::qi_conv_store16(tmp, n, O, O, l.db, leaky ? image::ImageAct::leaky : image::ImageAct::none,
+                                               kSlope, nullptr, static_cast<uint16_t*>(y) + p0 * ldy, ldy, 0, s);
+                    else image::qi_bias_add(static_cast<float*>(y) + p0 * ldy, l.db, n, O, s, tmp, ldy);
+                } else {
+                    if (ldy != O) throw std::logic_error("RealESRGAN: an FP32 output wider than its convolution");
+                    float* yy = static_cast<float*>(y) + p0 * O;
+                    gemm.f16(col, l.dw, yy, n, O, K);
+                    image::qi_bias_add(yy, l.db, n, O, s);
+                }
+            }, [] {});
     }
 
     // One frame: rgba [h][w][4] (RGBA8 on the GPU) -> out [4h][4w][4] (RGBA8 on the GPU)
@@ -307,14 +297,15 @@ uint64_t Esrgan::held() const {
 
 // a frame of n = w x h pixels: the input in FP16 (8 channels); the trunk, the RRDB's and the block's inputs in FP32 and
 // the dense block's channels in FP16 (nf + 4 gc); at 2x conv_up1's output, at 4x two FP16 buffers of nf channels (the
-// 2x upsampled trunk and conv_last's FP32 output in the second); the own path's scratch (kColBytes and its outputs)
+// 2x upsampled trunk and conv_last's FP32 output in the second); the own path's scratch (the unfolded band and its outputs)
 // where the build has no library path for the GPU
 uint64_t Esrgan::clip_bytes(int64_t w, int64_t h, int64_t frames) const {
     (void) frames;   // one frame at a time
     const Impl& m = *impl_;
     const uint64_t n = (uint64_t) (w * h), nf = (uint64_t) m.nf, D = (uint64_t) m.D;
     const uint64_t low = n * (16 + 12 * nf + 2 * D), x2 = 8 * n * nf, x4 = 64 * n * nf;
-    const uint64_t own = (uint64_t) kColBytes + (uint64_t) (kColBytes / (9ll * 8 * 2)) * nf * 4;
+    const uint64_t col = (uint64_t) conv::col_values(core::Runtime::get().stream(nullptr)) * 2;
+    const uint64_t own = col + (col / (9ll * 8 * 2)) * nf * 4;
     return low + x2 + x4 + own;
 }
 
@@ -333,7 +324,7 @@ void Esrgan::run_clip(const uint8_t* in, int64_t w, int64_t h, int64_t frames, u
 }
 
 void Esrgan::Impl::run(const uint8_t* rgba, int64_t w, int64_t h, uint8_t* out) {
-    using image::QiAct;
+    using image::ImageAct;
     const int64_t n = w * h, NF = nf, DD = D;
     sycl::queue& qq = q();
     uint16_t* in16 = sc.in16;
@@ -355,7 +346,7 @@ void Esrgan::Impl::run(const uint8_t* rgba, int64_t w, int64_t h, uint8_t* out) 
     const size_t fbytes = (size_t) (n * NF) * sizeof(float);
     qq.memcpy(xr, trunk, fbytes);
     qq.memcpy(xd, trunk, fbytes);
-    image::qi_conv_store16(trunk, n, NF, NF, nullptr, QiAct::none, 0.f, nullptr, dense, DD, 0, s);
+    image::qi_conv_store16(trunk, n, NF, NF, nullptr, ImageAct::none, 0.f, nullptr, dense, DD, 0, s);
     for (int64_t r = 0; r < nb; ++r)
         for (int j = 0; j < 3; ++j) {
             const Layer* L = &rdb[(size_t) ((r * 3 + j) * 5)];
@@ -366,7 +357,7 @@ void Esrgan::Impl::run(const uint8_t* rgba, int64_t w, int64_t h, uint8_t* out) 
                 kernels::add_inplace(xr, xd, n * NF, s, kResidual);
                 qq.memcpy(xd, xr, fbytes);
             }
-            image::qi_conv_store16(xd, n, NF, NF, nullptr, QiAct::none, 0.f, nullptr, dense, DD, 0, s);
+            image::qi_conv_store16(xd, n, NF, NF, nullptr, ImageAct::none, 0.f, nullptr, dense, DD, 0, s);
         }
     conv(body, dense, h, w, DD, trunk, NF, false, false, true);   // trunk += conv_body(body(trunk))
     // the trunk at 2x and conv_up1's output at 4x (nearest) in FP16

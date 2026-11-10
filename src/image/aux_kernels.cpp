@@ -29,16 +29,6 @@ inline float f32_from_f16(uint16_t b) { return static_cast<float>(sycl::bit_cast
 
 sycl::queue& queue_for(void* stream) { return core::Runtime::get().stream(stream); }
 
-inline float act_of(AuxAct a, float v) {
-    switch (a) {
-    case AuxAct::relu: return sycl::fmax(v, 0.f);
-    case AuxAct::gelu: return 0.5f * v * (1.f + sycl::erf(v * 0.70710678118654752f));
-    case AuxAct::silu: return v / (1.f + sycl::exp(-v));
-    case AuxAct::sigmoid: return 1.f / (1.f + sycl::exp(-v));
-    case AuxAct::relu6: return sycl::clamp(v, 0.f, 6.f);
-    default: return v;
-    }
-}
 
 void finish(void* stream, const sycl::event& e, const char* what) {
     if (!stream) core::Runtime::get().wait(e, what);
@@ -784,39 +774,17 @@ void aux_rope2d_split16h(const uint16_t* qkv16, const float* bias, int64_t N, in
     rope2d_split16(qkv16, bias, N, heads, hd, grid, pscale, theta, q16, k16, v16, stream);
 }
 
-void aux_bias_act16(const uint16_t* x16, const float* bias, int64_t T, int64_t n, AuxAct act, uint16_t* y16,
+void aux_bias_act16(const uint16_t* x16, const float* bias, int64_t T, int64_t n, ImageAct act, uint16_t* y16,
                     void* stream) {
-    if (T <= 0 || n <= 0) return;
-    const auto f = [=](float v, float b) { return act_of(act, v + b); };
-    if (n % 8 == 0) {   // a work-item 8 values: one 16-byte load and store (a row's 8 at a time are 16-byte aligned)
-        using V = sycl::vec<sycl::half, 8>;
-        const int64_t chunks = T * n / 8, per_row = n / 8;
-        const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) chunks), [=](sycl::id<1> id) {
-            const auto i = static_cast<int64_t>(id[0]);
-            const int64_t c0 = (i % per_row) * 8;
-            const V in = reinterpret_cast<const V*>(x16)[i];
-            V out;
-#pragma unroll
-            for (int j = 0; j < 8; ++j) out[j] = sycl::half(f((float) in[j], bias != nullptr ? bias[c0 + j] : 0.f));
-            reinterpret_cast<V*>(y16)[i] = out;
-        });
-        finish(stream, e, "aux_bias_act16");
-        return;
-    }
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * n)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        y16[i] = f16_from_f32(f(f32_from_f16(x16[i]), bias != nullptr ? bias[i % n] : 0.f));
-    });
-    finish(stream, e, "aux_bias_act16");
+    ProductStore p;
+    p.in16 = x16; p.bias = bias; p.rows = T; p.cols = n; p.act = act; p.out16 = y16;
+    product_store(p, stream);
 }
 
 void aux_narrow_bias16(const float* y, const float* bias, int64_t T, int64_t n, uint16_t* y16, void* stream) {
-    if (T <= 0 || n <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * n)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        y16[i] = f16_from_f32(y[i] + (bias != nullptr ? bias[i % n] : 0.f));
-    });
-    finish(stream, e, "aux_narrow_bias16");
+    ProductStore p;
+    p.in = y; p.bias = bias; p.rows = T; p.cols = n; p.out16 = y16;
+    product_store(p, stream);
 }
 
 void aux_deconv2_scatter(const float* y, int64_t H, int64_t W, int64_t O, const float* bias, bool gelu, float* out,
@@ -1418,21 +1386,16 @@ void aux_mod_select16(const float* src, int64_t T, int64_t R, int64_t C, uint16_
     finish(stream, e, "aux_mod_select16");
 }
 
-void aux_map_store16(const float* y, int64_t n, int64_t O, const float* bias, AuxAct act, const uint16_t* res16,
+void aux_map_store16(const float* y, int64_t n, int64_t O, const float* bias, ImageAct act, const uint16_t* res16,
                      uint16_t* dst16, int64_t ld, int64_t off, void* stream) {
-    if (n <= 0 || O <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n * O)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t q = i / O, o = i - q * O;
-        float v = act_of(act, y[i] + (bias != nullptr ? bias[o] : 0.f));
-        if (res16 != nullptr) v += f32_from_f16(res16[i]);
-        dst16[q * ld + off + o] = f16_from_f32(v);
-    });
-    finish(stream, e, "aux_map_store16");
+    ProductStore p;
+    p.in = y; p.rows = n; p.cols = O; p.bias = bias; p.act = act; p.residual = res16;
+    p.out16 = dst16; p.out_stride = ld; p.offset = off;
+    product_store(p, stream);
 }
 
 void aux_dwconv16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, const uint16_t* w16, const float* bias, int k,
-                  int s, int p, int64_t OH, int64_t OW, AuxAct act, uint16_t* y16, void* stream) {
+                  int s, int p, int64_t OH, int64_t OW, ImageAct act, uint16_t* y16, void* stream) {
     if (OH <= 0 || OW <= 0 || C <= 0) return;
     const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (OH * OW * C)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
@@ -1447,13 +1410,14 @@ void aux_dwconv16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, const ui
                 acc += f32_from_f16(x16[(yy * W + xx) * C + c]) * f32_from_f16(w16[(c * k + dy) * k + dx]);
             }
         }
-        y16[i] = f16_from_f32(act_of(act, acc));
+        y16[i] = f16_from_f32(image_activate(act, acc));
     });
     finish(stream, e, "aux_dwconv16");
 }
 
 void aux_maxpool16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int k, int s, int p, int64_t OH, int64_t OW,
-                   uint16_t* y16, void* stream) {
+                   uint16_t* y16, void* stream, int64_t ld, int64_t off, uint16_t* copy) {
+    if (ld == 0) ld = C;
     if (OH <= 0 || OW <= 0 || C <= 0) return;
     const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (OH * OW * C)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
@@ -1464,9 +1428,66 @@ void aux_maxpool16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int k, 
                 const int64_t yy = oy * s + dy - p, xx = ox * s + dx - p;
                 if (yy >= 0 && yy < H && xx >= 0 && xx < W) m = sycl::fmax(m, f32_from_f16(x16[(yy * W + xx) * C + c]));
             }
-        y16[i] = f16_from_f32(m);
+        const uint16_t v = f16_from_f32(m);
+        y16[q * ld + off + c] = v;
+        if (copy != nullptr) copy[i] = v;
     });
     finish(stream, e, "aux_maxpool16");
+}
+
+
+void aux_letterbox16(const uint8_t* src, int64_t w, int64_t h, int64_t nw, int64_t nh, int64_t left, int64_t top,
+                     int64_t iw, int64_t ih, float ratio, bool focus, uint16_t* out, void* stream) {
+    const int64_t ow = focus ? iw / 2 : iw, oh = focus ? ih / 2 : ih, channels = focus ? 16 : 8;
+    const float sx = (float) w / (float) nw, sy = (float) h / (float) nh;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (ow * oh * channels)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t ch = i % channels, p = i / channels, y = p / ow, x = p % ow;
+        if (ch >= (focus ? 12 : 3)) { out[i] = 0; return; }
+        const int64_t g = ch / 3, color = focus ? 2 - ch % 3 : ch;
+        const int64_t u = (focus ? 2 * x + (g >= 2 ? 1 : 0) : x) - left;
+        const int64_t v = (focus ? 2 * y + (g == 1 || g == 3 ? 1 : 0) : y) - top;
+        float val = 114.f;
+        if (u >= 0 && u < nw && v >= 0 && v < nh) {
+            float fx = focus ? sycl::clamp(((float) u + 0.5f) / ratio - 0.5f, 0.f, (float) (w - 1))
+                             : ((float) u + 0.5f) * sx - 0.5f;
+            float fy = focus ? sycl::clamp(((float) v + 0.5f) / ratio - 0.5f, 0.f, (float) (h - 1))
+                             : ((float) v + 0.5f) * sy - 0.5f;
+            int64_t x0 = (int64_t) sycl::floor(fx), y0 = (int64_t) sycl::floor(fy);
+            fx -= (float) x0; fy -= (float) y0;
+            if (x0 < 0) { x0 = 0; fx = 0.f; }
+            if (y0 < 0) { y0 = 0; fy = 0.f; }
+            if (x0 >= w - 1) { x0 = w - 1; fx = 0.f; }
+            if (y0 >= h - 1) { y0 = h - 1; fy = 0.f; }
+            const int64_t x1 = sycl::min(x0 + 1, w - 1), y1 = sycl::min(y0 + 1, h - 1);
+            const int64_t stride = focus ? 3 : 4;
+            const float a = src[(y0 * w + x0) * stride + color], b = src[(y0 * w + x1) * stride + color];
+            const float c = src[(y1 * w + x0) * stride + color], d = src[(y1 * w + x1) * stride + color];
+            if (focus) val = sycl::rint((a * (1.f - fx) + b * fx) * (1.f - fy) + (c * (1.f - fx) + d * fx) * fy);
+            else {
+                const float t = a + (b - a) * fx, bt = c + (d - c) * fx;
+                val = sycl::round(t + (bt - t) * fy);
+            }
+        }
+        out[i] = f16_from_f32(focus ? val : val / 255.f);
+    });
+    finish(stream, e, "aux_letterbox16");
+}
+
+void aux_concat2_16(const uint16_t* a, int64_t ca, bool up, const uint16_t* b, int64_t cb, int64_t h, int64_t w,
+                    uint16_t* dst, void* stream) {
+    const int64_t c = ca + cb;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (h * w * c)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t q = i / c, ch = i - q * c;
+        if (ch < ca) {
+            const int64_t src = up ? ((q / w) / 2) * (w / 2) + (q % w) / 2 : q;
+            dst[i] = a[src * ca + ch];
+        } else {
+            dst[i] = b[q * cb + ch - ca];
+        }
+    });
+    finish(stream, e, "aux_concat2_16");
 }
 
 void aux_bilinear16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int64_t OH, int64_t OW, bool align_corners,
@@ -1493,14 +1514,14 @@ void aux_bilinear16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int64_
     finish(stream, e, "aux_bilinear16");
 }
 
-void aux_deconv_scatter16(const float* y, int64_t H, int64_t W, int64_t k, int64_t O, const float* bias, AuxAct act,
+void aux_deconv_scatter16(const float* y, int64_t H, int64_t W, int64_t k, int64_t O, const float* bias, ImageAct act,
                           uint16_t* y16, void* stream) {
     if (H <= 0 || W <= 0 || O <= 0) return;
     const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (k * k * H * W * O)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
         const int64_t o = i % O, q = i / O, Y = q / (k * W), X = q - Y * (k * W);
         const int64_t src = ((Y / k) * W + X / k) * k * k + (Y % k) * k + (X % k);
-        y16[i] = f16_from_f32(act_of(act, y[src * O + o] + (bias != nullptr ? bias[o] : 0.f)));
+        y16[i] = f16_from_f32(image_activate(act, y[src * O + o] + (bias != nullptr ? bias[o] : 0.f)));
     });
     finish(stream, e, "aux_deconv_scatter16");
 }
@@ -1578,13 +1599,13 @@ void channel_stats16(const uint16_t* x16, int64_t n, int64_t C, float* st, void*
 }
 }  // namespace
 
-void aux_instance_norm16(uint16_t* x16, int64_t n, int64_t C, float eps, AuxAct act, float* st, void* stream) {
+void aux_instance_norm16(uint16_t* x16, int64_t n, int64_t C, float eps, ImageAct act, float* st, void* stream) {
     if (n <= 0 || C <= 0) return;
     channel_stats16(x16, n, C, st, stream);
     const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n * C)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
         const int64_t c = i % C;
-        x16[i] = f16_from_f32(act_of(act, (f32_from_f16(x16[i]) - st[c * 2]) * sycl::rsqrt(st[c * 2 + 1] + eps)));
+        x16[i] = f16_from_f32(image_activate(act, (f32_from_f16(x16[i]) - st[c * 2]) * sycl::rsqrt(st[c * 2 + 1] + eps)));
     });
     finish(stream, e, "aux_instance_norm16");
 }

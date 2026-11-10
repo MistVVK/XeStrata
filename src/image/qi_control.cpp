@@ -34,14 +34,6 @@ inline void tokens(const float* cond, int64_t k, int64_t kp, int64_t hw, uint16_
     });
 }
 
-// y16 [n][C] = FP16 of y + b
-inline void bias16(const float* y, const float* b, int64_t n, int64_t C, uint16_t* y16, void* s) {
-    core::Runtime::get().stream(s).parallel_for(sycl::range<1>((size_t) (n * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        y16[i] = kernels::f16_from_f32(y[i] + b[i % C]);
-    });
-}
-
 // the stream as the DiT's first block takes the sequence: c = x + b, and the target's rows (from T - hw) + rows
 inline void start(float* c, const float* x, const float* b, const float* rows, int64_t T, int64_t hw, int64_t C,
                   void* s) {
@@ -264,7 +256,9 @@ void QiControl::set_input(const float* cond, int64_t h, int64_t w, float strengt
     } tmp{{tok, y, y16}, d.s_};
     qi_control_k::tokens(cond, in_k_, in_kp_, hw, tok, d.s_);
     d.gemm_.f16(tok, in_w_, y, hw, C, in_kp_);
-    qi_control_k::bias16(y, in_b_, hw, C, y16, d.s_);
+    ProductStore p;
+    p.in = y; p.bias = in_b_; p.rows = hw; p.cols = C; p.out16 = y16;
+    product_store(p, d.s_);
     bp_rows_ = scratch<float>(hw * C);
     d.gemm_.f16(y16, bp_w_, bp_rows_, hw, C, C);
     hw_ = hw;

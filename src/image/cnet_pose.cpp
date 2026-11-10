@@ -29,35 +29,6 @@ namespace cnet_pose_k {   // the kernels' names (an anonymous namespace mangles 
 
 using kernels::f16_from_f32;
 
-// rgb [H][W][3] (8 bits) resized bilinearly by r into the top left of a 640 x 640 square of 114 (the letterbox, each
-// value rounded to 8 bits), then YOLOX's Focus: out [320][320][16], channel g * 3 + c the colour c (B, G, R) of the
-// square's pixel (2 y + dy, 2 x + dx), (dy, dx) = (0, 0), (1, 0), (0, 1), (1, 1) for g = 0 .. 3, the channels past 12
-// zero
-void letterbox_focus(sycl::queue& q, const uint8_t* rgb, int64_t W, int64_t H, float r, int64_t nw, int64_t nh,
-                     uint16_t* out) {
-    q.parallel_for(sycl::range<1>((size_t) (320 * 320 * 16)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t ch = i % 16, p = i / 16, y = p / 320, x = p % 320;
-        if (ch >= 12) {
-            out[i] = 0;
-            return;
-        }
-        const int64_t g = ch / 3, c = 2 - ch % 3;   // BGR
-        const int64_t sy = 2 * y + (g == 1 || g == 3 ? 1 : 0), sx = 2 * x + (g >= 2 ? 1 : 0);
-        float v = 114.f;
-        if (sy < nh && sx < nw) {
-            const float fy = sycl::clamp(((float) sy + 0.5f) / r - 0.5f, 0.f, (float) (H - 1));
-            const float fx = sycl::clamp(((float) sx + 0.5f) / r - 0.5f, 0.f, (float) (W - 1));
-            const int64_t y0 = (int64_t) fy, x0 = (int64_t) fx, y1 = sycl::min(y0 + 1, H - 1), x1 = sycl::min(x0 + 1, W - 1);
-            const float ty = fy - (float) y0, tx = fx - (float) x0;
-            const auto at = [&](int64_t yy, int64_t xx) { return (float) rgb[(yy * W + xx) * 3 + c]; };
-            v = (at(y0, x0) * (1.f - tx) + at(y0, x1) * tx) * (1.f - ty) + (at(y1, x0) * (1.f - tx) + at(y1, x1) * tx) * ty;
-            v = sycl::rint(v);
-        }
-        out[i] = f16_from_f32(v);
-    });
-}
-
 // DWPose's crop: out [384][288][8] FP16 of the picture under the affine map a (the crop's pixel (x, y) at the
 // picture's (a0 x + a1 y + a2, a3 x + a4 y + a5)), bilinear, 0 outside, its colours BGR less mean over std; the
 // channels past 3 zero
@@ -119,13 +90,6 @@ void norm_rows(sycl::queue& q, const float* x, int64_t n, int64_t k, float g, ui
         for (int64_t j = 0; j < k; ++j) ss += v[j] * v[j];
         const float s = g / sycl::fmax(sycl::sqrt(ss / (float) k), 1e-5f);
         for (int64_t j = 0; j < k; ++j) out[r * k + j] = f16_from_f32(v[j] * s);
-    });
-}
-
-void silu(sycl::queue& q, float* x, int64_t n) {
-    q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const float v = x[id[0]];
-        x[id[0]] = v / (1.f + sycl::exp(-v));
     });
 }
 
@@ -269,13 +233,13 @@ AuxMapNet::Map YoloxNet::up2(const Map& x) {
 }
 
 AuxMapNet::Map YoloxNet::csp(const Csp& c, const Map& x) {
-    Map a = AuxMapNet::run(c.c1, x, AuxAct::silu);
-    const Map b = AuxMapNet::run(c.c2, x, AuxAct::silu);
+    Map a = AuxMapNet::run(c.c1, x, ImageAct::silu);
+    const Map b = AuxMapNet::run(c.c2, x, ImageAct::silu);
     for (const auto& [m1, m2] : c.m) {
-        const Map h = AuxMapNet::run(m1, a, AuxAct::silu);
-        a = AuxMapNet::run(m2, h, AuxAct::silu, c.shortcut ? &a : nullptr);
+        const Map h = AuxMapNet::run(m1, a, ImageAct::silu);
+        a = AuxMapNet::run(m2, h, ImageAct::silu, c.shortcut ? &a : nullptr);
     }
-    return AuxMapNet::run(c.c3, concat({a, b}), AuxAct::silu);
+    return AuxMapNet::run(c.c3, concat({a, b}), ImageAct::silu);
 }
 
 std::vector<ControlBox> YoloxNet::people(const std::vector<uint8_t>& rgb, int64_t W, int64_t H) {
@@ -287,36 +251,36 @@ std::vector<ControlBox> YoloxNet::people(const std::vector<uint8_t>& rgb, int64_
     auto* src = buf<uint8_t>(rgb.size());
     gpu::copy(src, rgb.data(), rgb.size());
     Map x = map(320, 320, 16);
-    cnet_pose_k::letterbox_focus(q, src, W, H, r, nw, nh, x.p);
-    x = AuxMapNet::run(stem_, x, AuxAct::silu);
+    aux_letterbox16(src, W, H, nw, nh, 0, 0, 640, 640, r, true, x.p, &q);
+    x = AuxMapNet::run(stem_, x, ImageAct::silu);
     Map feat[3];
     for (int i = 0; i < 4; ++i) {
-        x = AuxMapNet::run(down_[i], x, AuxAct::silu);
+        x = AuxMapNet::run(down_[i], x, ImageAct::silu);
         if (i == 3) {   // the spatial pyramid pooling: the map and its 5, 9 and 13 max pools side by side
-            const Map s = AuxMapNet::run(spp1_, x, AuxAct::silu);
+            const Map s = AuxMapNet::run(spp1_, x, ImageAct::silu);
             x = AuxMapNet::run(spp2_, concat({s, maxpool(s, 5, 1, 2), maxpool(s, 9, 1, 4), maxpool(s, 13, 1, 6)}),
-                               AuxAct::silu);
+                               ImageAct::silu);
         }
         x = csp(dark_[i], x);
         if (i >= 1) feat[i - 1] = x;   // dark3, dark4, dark5
     }
     // PAFPN: top-down, then bottom-up
-    const Map f0 = AuxMapNet::run(lateral0_, feat[2], AuxAct::silu);
+    const Map f0 = AuxMapNet::run(lateral0_, feat[2], ImageAct::silu);
     Map t = csp(p4_, concat({up2(f0), feat[1]}));
-    const Map f1 = AuxMapNet::run(reduce1_, t, AuxAct::silu);
+    const Map f1 = AuxMapNet::run(reduce1_, t, ImageAct::silu);
     const Map pan2 = csp(p3_, concat({up2(f1), feat[0]}));
-    const Map pan1 = csp(n3_, concat({AuxMapNet::run(bu2_, pan2, AuxAct::silu), f1}));
-    const Map pan0 = csp(n4_, concat({AuxMapNet::run(bu1_, pan1, AuxAct::silu), f0}));
+    const Map pan1 = csp(n3_, concat({AuxMapNet::run(bu2_, pan2, ImageAct::silu), f1}));
+    const Map pan0 = csp(n4_, concat({AuxMapNet::run(bu1_, pan1, ImageAct::silu), f0}));
     // the decoupled head of each level: the boxes (centre's offset in cells and log sizes), objectness, class 0
     std::vector<ControlBox> cand;
     const Map levels[3] = {pan2, pan1, pan0};
     const int strides[3] = {8, 16, 32};
     std::vector<std::vector<uint16_t>> outs;
     for (int k = 0; k < 3; ++k) {
-        const Map s = AuxMapNet::run(stems_[k], levels[k], AuxAct::silu);
-        const Map c = AuxMapNet::run(cls_pred_[k], AuxMapNet::run(cls_[k][1], AuxMapNet::run(cls_[k][0], s, AuxAct::silu),
-                                                                  AuxAct::silu));
-        const Map rf = AuxMapNet::run(reg_[k][1], AuxMapNet::run(reg_[k][0], s, AuxAct::silu), AuxAct::silu);
+        const Map s = AuxMapNet::run(stems_[k], levels[k], ImageAct::silu);
+        const Map c = AuxMapNet::run(cls_pred_[k], AuxMapNet::run(cls_[k][1], AuxMapNet::run(cls_[k][0], s, ImageAct::silu),
+                                                                  ImageAct::silu));
+        const Map rf = AuxMapNet::run(reg_[k][1], AuxMapNet::run(reg_[k][0], s, ImageAct::silu), ImageAct::silu);
         const Map rg = AuxMapNet::run(reg_pred_[k], rf), ob = AuxMapNet::run(obj_pred_[k], rf);
         for (const Map* m : {&c, &rg, &ob}) {
             std::vector<uint16_t> h((size_t) (m->h * m->w * m->c));
@@ -443,19 +407,19 @@ std::vector<WholeBody> DwPoseNet::run(const std::vector<uint8_t>& rgb, int64_t W
         const sycl::float8 a(k, 0.f, cx - sw / 2.f, 0.f, k, cy - sh / 2.f, 0.f, 0.f);
         Map x = map(in_h_, in_w_, 8);
         cnet_pose_k::crop(q, src, W, H, a, in_w_, in_h_, x.p);
-        for (const MConv& c : stem_) x = AuxMapNet::run(c, x, AuxAct::silu);
+        for (const MConv& c : stem_) x = AuxMapNet::run(c, x, ImageAct::silu);
         for (const Stage& st : stages_) {
-            x = AuxMapNet::run(st.down, x, AuxAct::silu);
+            x = AuxMapNet::run(st.down, x, ImageAct::silu);
             if (st.spp) {
-                const Map s = AuxMapNet::run(st.spp1, x, AuxAct::silu);
+                const Map s = AuxMapNet::run(st.spp1, x, ImageAct::silu);
                 x = AuxMapNet::run(st.spp2, concat({s, maxpool(s, 5, 1, 2), maxpool(s, 9, 1, 4), maxpool(s, 13, 1, 6)}),
-                                   AuxAct::silu);
+                                   ImageAct::silu);
             }
-            Map m = AuxMapNet::run(st.main, x, AuxAct::silu);
-            const Map sc = AuxMapNet::run(st.shortc, x, AuxAct::silu);
+            Map m = AuxMapNet::run(st.main, x, ImageAct::silu);
+            const Map sc = AuxMapNet::run(st.shortc, x, ImageAct::silu);
             for (const Block& bl : st.blocks) {
-                const Map h = AuxMapNet::run(bl.dw, AuxMapNet::run(bl.c1, m, AuxAct::silu), AuxAct::silu);
-                m = AuxMapNet::run(bl.pw, h, AuxAct::silu, st.identity ? &m : nullptr);
+                const Map h = AuxMapNet::run(bl.dw, AuxMapNet::run(bl.c1, m, ImageAct::silu), ImageAct::silu);
+                m = AuxMapNet::run(bl.pw, h, ImageAct::silu, st.identity ? &m : nullptr);
             }
             Map cat = concat({m, sc});
             // the channel attention: the channels' means through a 1 x 1 convolution and a hard sigmoid
@@ -465,7 +429,7 @@ std::vector<WholeBody> DwPoseNet::run(const std::vector<uint8_t>& rgb, int64_t W
             aux_col_mean16(cat.p, cat.h * cat.w, C, mean, s_);
             cnet_pose_k::channel_gate(q, mean, st.att_w, st.att_b, C, gate);
             aux_scale_channels16(cat.p, cat.h * cat.w, C, gate, s_);
-            x = AuxMapNet::run(st.fin, cat, AuxAct::silu);
+            x = AuxMapNet::run(st.fin, cat, ImageAct::silu);
         }
         const Map f = AuxMapNet::run(final_, x);   // [h][w][K] (K padded)
         // the head: each keypoint's map flattened and scale-normed, to D, a gated attention unit, SimCC's two
@@ -479,7 +443,9 @@ std::vector<WholeBody> DwPoseNet::run(const std::vector<uint8_t>& rgb, int64_t W
         cnet_pose_k::norm_rows(q, xk, K, D_, gau_g_, xn);
         auto* uv = buf<float>((size_t) (K * U));
         product(xn, wuv_, uv, K);
-        cnet_pose_k::silu(q, uv, K * U);
+        ProductStore p;
+        p.in = uv; p.out = uv; p.rows = K; p.cols = U; p.act = ImageAct::silu; p.add_zero = false;
+        product_store(p, s_);
         auto* att = buf<float>((size_t) (K * K));
         cnet_pose_k::gau_scores(q, uv, gamma_, beta_, K, E_, S_, att);
         auto* g = buf<uint16_t>((size_t) (K * E_));

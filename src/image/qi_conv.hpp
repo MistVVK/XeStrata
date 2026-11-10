@@ -5,9 +5,13 @@
 // take the convolution (the engine's im2col and products then).
 #pragma once
 
+#include "strata/core/device.hpp"
+
 #include <sycl/sycl.hpp>
 
+#include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 
 namespace strata::image::conv {
 
@@ -41,5 +45,84 @@ bool cudnn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, c
 /// pass for the taps, where a 2D convolution a tap writes y as many times.
 bool cudnn3(sycl::queue& q, const uint16_t* x, int64_t D, int64_t H, int64_t W, int64_t C, const uint16_t* w,
             int64_t O, int kt, int k, const float* bias, bool add, void* y, bool y16 = false);
+
+/// The common choice of a maker's convolution.  The caller supplies the actual output form; dilation and temporal
+/// taps the maker interface cannot express go through the engine's unfolded products instead.
+struct Request {
+    const uint16_t* x;
+    int64_t h, w, c;
+    const uint16_t* weights;
+    int64_t outputs;
+    int k, stride, pt, pl, pb, pr, dilation = 1, temporal = 1;
+    const float* bias = nullptr;
+    bool add = false;
+    void* out = nullptr;
+    Form form{};
+};
+
+enum class Library { none, onednn, cudnn };
+
+static inline Library library(sycl::queue& q, const Request& r, void* cudnn_out = nullptr, bool cudnn_separate = false) {
+    if (r.dilation != 1 || r.temporal != 1) return Library::none;
+    // A plain 1x1 without a residual gained nothing over a product on the B70 (2026-11-02).  An activation can make
+    // a library worthwhile because it avoids a pass; this is also the rule for every other image model.
+    if (r.k == 1 && r.stride == 1 && r.pt == 0 && r.pl == 0 && r.pb == 0 && r.pr == 0 && !r.add &&
+        r.form.leaky < 0 && !r.form.gelu) return Library::none;
+#if STRATA_ONEDNN
+    if (onednn(q, r.x, r.h, r.w, r.c, r.weights, r.outputs, r.k, r.stride, r.pt, r.pl, r.pb, r.pr, r.bias, r.add,
+               r.out, r.form)) return Library::onednn;
+#endif
+#if STRATA_CUDNN
+    // On the RTX 4070 small FP32 3x3 maps at 280 and 1120 pixels ran faster unfolded than through cuDNN:
+    // ten warm runs were 5.40 vs 5.62 ms (face) and 5.93 vs 6.25 ms (person), 2026-11-11.  The same exclusion
+    // on oneDNN slowed the B70 (face 3.5 to 4.2 ms, BiRefNet decoder 10.3 to 12.6 ms), so it applies to cuDNN only.
+    if (r.k == 3 && r.stride == 1 && r.pt == 1 && r.pl == 1 && r.pb == 1 && r.pr == 1 && !r.add &&
+        !r.form.y16 && r.form.leaky < 0 && !r.form.gelu && r.h * r.w <= 1120) return Library::none;
+    if (q.get_device().get_backend() == sycl::backend::ext_oneapi_cuda && r.stride == 1 && r.k % 2 == 1 &&
+        r.pt == r.k / 2 && r.pl == r.pt && r.pb == r.pt && r.pr == r.pt &&
+        (!cudnn_separate || cudnn_out != nullptr) &&
+        cudnn(q, r.x, r.h, r.w, r.c, r.weights, r.outputs, r.k, cudnn_separate ? nullptr : r.bias,
+              cudnn_separate ? false : r.add, cudnn_separate ? cudnn_out : r.out, r.form)) return Library::cudnn;
+#endif
+    (void) q; (void) r; (void) cudnn_out; (void) cudnn_separate;
+    return Library::none;
+}
+
+/// A small fraction of the device's memory, also bounded by its largest allocation (including the engine's limits).
+inline int64_t col_values(sycl::queue& q) {
+    const auto dev = q.get_device();
+    uint64_t total = dev.get_info<sycl::info::device::global_mem_size>();
+    uint64_t largest = dev.get_info<sycl::info::device::max_mem_alloc_size>();
+    if (const uint64_t limit = core::vram_limit_bytes()) total = std::min(total, limit);
+    if (const uint64_t limit = core::max_alloc_limit_bytes()) largest = std::min(largest, limit);
+    return (int64_t) (std::min(total / 128, largest / 8) / sizeof(uint16_t));
+}
+
+/// Shared product driver: point products read the input directly; the other convolutions unfold bands that fit the
+/// caller's allocation.  Unfolding and storing retain the different tensor forms until their own common parts exist.
+template<class Unfold, class Product, class Finish>
+void products(int64_t pixels, int64_t k, int64_t col_values, bool point, Unfold&& unfold, Product&& product,
+              Finish&& finish) {
+    if (point) product(0, pixels, true);
+    else {
+        if (col_values < k) throw std::runtime_error("image engine: convolution band cannot hold one row");
+        const int64_t rows = col_values / k;
+        for (int64_t p = 0; p < pixels; p += rows) {
+            const int64_t n = std::min(rows, pixels - p);
+            unfold(p, n);
+            product(p, n, false);
+        }
+    }
+    finish();
+}
+
+template<class Unfold, class Product, class Finish>
+static Library drive(sycl::queue& q, const Request& r, int64_t pixels, int64_t k, int64_t col_cap, bool point,
+              Unfold&& unfold, Product&& product, Finish&& finish) {
+    const Library chosen = library(q, r);
+    if (chosen == Library::none)
+        products(pixels, k, std::min(col_cap, conv::col_values(q)), point, unfold, product, finish);
+    return chosen;
+}
 
 }  // namespace strata::image::conv

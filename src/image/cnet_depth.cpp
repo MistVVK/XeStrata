@@ -272,7 +272,7 @@ std::vector<float> DepthAnything2::run(const std::vector<uint8_t>& rgb, int64_t 
         product(a16, l.o, y, T);
         aux_scale_add(x, y, l.ls1, T, C, s_);
         aux_layer_norm(x, nullptr, l.n2.w, l.n2.b, T, C, kEps, nullptr, h16, s_);
-        product16(h16, l.fc1, g16, T, true, AuxAct::gelu);
+        product16(h16, l.fc1, g16, T, true, ImageAct::gelu);
         product(g16, l.fc2, y, T);
         aux_scale_add(x, y, l.ls2, T, C, s_);
         if (li == 2 || li == 5 || li == 8 || li == 11) {   // the four taps: after layers 3, 6, 9 and 12, normed
@@ -294,8 +294,8 @@ std::vector<float> DepthAnything2::run(const std::vector<uint8_t>& rgb, int64_t 
     // where it differs), a second unit, up to the next tap's size (the last: twice) with the corners aligned, and the
     // projection
     const auto unit = [&](const Map& in, const MConv& c1, const MConv& c2) {
-        const Map h = AuxMapNet::run(c1, act(in, AuxAct::relu), AuxAct::relu);
-        return AuxMapNet::run(c2, h, AuxAct::none, &in);
+        const Map h = AuxMapNet::run(c1, act(in, ImageAct::relu), ImageAct::relu);
+        return AuxMapNet::run(c2, h, ImageAct::none, &in);
     };
     Map fused;
     for (int i = 0; i < 4; ++i) {
@@ -312,8 +312,8 @@ std::vector<float> DepthAnything2::run(const std::vector<uint8_t>& rgb, int64_t 
     }
     Map d = AuxMapNet::run(head1_, fused);
     d = resize(d, nh, nw, true);
-    d = AuxMapNet::run(head2_, d, AuxAct::relu);
-    d = AuxMapNet::run(head3_, d, AuxAct::relu);
+    d = AuxMapNet::run(head2_, d, ImageAct::relu);
+    d = AuxMapNet::run(head3_, d, ImageAct::relu);
     auto* out = buf<float>((size_t) (W * H));
     cnet_depth_k::depth_out(q, d.p, d.h, d.w, d.c, H, W, out);
     std::vector<float> host((size_t) (W * H));

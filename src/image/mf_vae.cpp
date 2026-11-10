@@ -16,9 +16,7 @@
 
 #include "dit_rows.hpp"
 #include "tile_sides.hpp"
-#if STRATA_ONEDNN || STRATA_CUDNN
 #include "qi_conv.hpp"
-#endif
 
 #include <sycl/sycl.hpp>
 
@@ -310,53 +308,18 @@ void f2_shuffle_t16(const float* in, int64_t H, int64_t W, int64_t C, int64_t Z,
 // The video form's 16-bit activations (FP16 bits, BF16's with bf) and FP32: o = 16 bits of t + bias[c] (+ o with
 // `add`), t [n / O][O]
 void act_store(const float* t, const float* bias, int64_t n, int64_t O, bool bf, bool add, uint16_t* o, void* s) {
-    const auto one = [=](float v, int64_t c, uint16_t prev) {
-        if (bias != nullptr) v += bias[c];
-        if (add) v += bf ? kernels::f32_from_bf16(prev) : f32_from_f16(prev);
-        return bf ? kernels::bf16_from_f32(v) : f16_from_f32(v);
-    };
-    if (n % 8 != 0 || O % 8 != 0) {
-        q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-            const auto i = static_cast<int64_t>(id[0]);
-            o[i] = one(t[i], i % O, add ? o[i] : uint16_t{0});
-        });
-        return;
-    }
-    // 8 values a work-item, in one load and one store of each
-    q_of(s).parallel_for(sycl::range<1>((size_t) (n / 8)), [=](sycl::id<1> id) {
-        const int64_t i = static_cast<int64_t>(id[0]) * 8, c0 = i % O;
-        const sycl::vec<float, 8> tv = *reinterpret_cast<const sycl::vec<float, 8>*>(t + i);
-        sycl::vec<uint16_t, 8> ov;
-        if (add) ov = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(o + i);
-        for (int j = 0; j < 8; ++j) ov[j] = one(tv[j], c0 + j, ov[j]);
-        *reinterpret_cast<sycl::vec<uint16_t, 8>*>(o + i) = ov;
-    });
+    ProductStore p;
+    p.in = t; p.bias = bias; p.rows = n / O; p.cols = O; p.bf = bf; p.add_zero = false;
+    p.residual = add ? o : nullptr; p.out16 = o;
+    product_store(p, s);
 }
 
 // o = FP16 of y + bias[c] (+ o with `add`), y [n / O][O] FP16 (o itself where nothing is added)
 void act_bias16(const uint16_t* y, const float* bias, int64_t n, int64_t O, bool add, uint16_t* o, void* s) {
-    if (n % 8 != 0 || O % 8 != 0) {
-        q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-            const size_t i = id[0];
-            float v = f32_from_f16(y[i]) + (bias != nullptr ? bias[i % O] : 0.f);
-            if (add) v += f32_from_f16(o[i]);
-            o[i] = f16_from_f32(v);
-        });
-        return;
-    }
-    // 8 values a work-item, in one load and one store of each
-    q_of(s).parallel_for(sycl::range<1>((size_t) (n / 8)), [=](sycl::id<1> id) {
-        const int64_t i = static_cast<int64_t>(id[0]) * 8, c0 = i % O;
-        const sycl::vec<uint16_t, 8> yv = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(y + i);
-        sycl::vec<uint16_t, 8> ov;
-        if (add) ov = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(o + i);
-        for (int j = 0; j < 8; ++j) {
-            float v = f32_from_f16(yv[j]) + (bias != nullptr ? bias[c0 + j] : 0.f);
-            if (add) v += f32_from_f16(ov[j]);
-            ov[j] = f16_from_f32(v);
-        }
-        *reinterpret_cast<sycl::vec<uint16_t, 8>*>(o + i) = ov;
-    });
+    ProductStore p;
+    p.in16 = y; p.bias = bias; p.rows = n / O; p.cols = O;
+    p.residual = add ? o : nullptr; p.out16 = o;
+    product_store(p, s);
 }
 
 // a video convolution's taps [O][kt][per] as [kt][O][per]
@@ -750,7 +713,7 @@ uint64_t MfVae::scratch_bytes(int64_t h, int64_t w) const {
     const int64_t n = h * w, band = std::min<int64_t>(n, 1024);
     return (uint64_t) n * (uint64_t) (C_ * 3 + 3 * F_ + kGroups * 2) * 4 + (uint64_t) kWinTok * C_ * 4 +
            (uint64_t) n * (uint64_t) std::max(F_, 3 * C_) * 2 +             // a16
-           (uint64_t) n * 9 * (uint64_t) C_ * 2 +                            // the unfolded neighbourhoods
+           (uint64_t) std::min(n * 9 * C_, conv::col_values(q_of(s_))) * 2 + // the unfolded neighbourhoods
            (uint64_t) (3 * kWinTok * C_ + kWinTok * kWinTok) * 2 + (uint64_t) kWinTok * kWinTok * 4 +
            (uint64_t) band * 2 * kX * kPix * 4;
 }
@@ -768,7 +731,7 @@ void MfVae::grow(int64_t h, int64_t w) {
     gn_part_ = alloc<float>(allocs_, n * kGroups * 2);
     vec_ = alloc<float>(allocs_, 4 * F_);
     a16_ = alloc<uint16_t>(allocs_, n * std::max(F_, 3 * C_));
-    col_cap_ = n * 9 * C_;
+    col_cap_ = std::min(n * 9 * C_, conv::col_values(q_of(s_)));
     col16_ = alloc<uint16_t>(allocs_, col_cap_);
     w16_ = alloc<uint16_t>(allocs_, 3 * kWinTok * C_ + kWinTok * kWinTok);
     scores_ = alloc<float>(allocs_, kWinTok * kWinTok);
@@ -804,67 +767,46 @@ void MfVae::drop_scratch() {
 }
 
 void MfVae::conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out, bool add) {
-    const int64_t HW = H * W;
-#if STRATA_ONEDNN
-    // oneDNN where it takes them (Intel GPUs), the bias and the residual within its pass: the 3 x 3 ones, and the 1 x 1
-    // ones that add to a residual (the others gained nothing over the library's product on the B70, 2026-11-02)
+    const int64_t HW = H * W, K = c.k * c.k * c.in;
     const int p = (int) c.k / 2;
-    if ((c.k == 3 || add) &&
-        conv::onednn(core::Runtime::get().stream(s_), in16, H, W, c.in, c.w, c.out, (int) c.k, 1, p, p, p, p, c.b, add,
-                     out))
-        return;
-#endif
-#if STRATA_CUDNN
-    if ((c.k == 3 || add) && conv::cudnn(core::Runtime::get().stream(s_), in16, H, W, c.in, c.w, c.out, (int) c.k, c.b, add, out)) return;
-#endif
-    if (c.k == 1) {
-        gemm_.f16(in16, c.w, out, HW, c.out, c.in, 0, false, add);
-    } else {
-        const int64_t K = 9 * c.in, rows = std::max<int64_t>(1, (f2_ ? f2_band_ : col_cap_) / K);
-        for (int64_t p0 = 0; p0 < HW; p0 += rows) {
-            const int64_t n = std::min(rows, HW - p0);
-            qi_im2col16(in16, 1, H, W, c.in, 1, 3, 1, 1, H, W, p0, n, col16_, s_);
-            gemm_.f16(col16_, c.w, out + p0 * c.out, n, c.out, K, 0, false, add);
-        }
-    }
-    if (c.b != nullptr) qi_bias_add(out, c.b, HW, c.out, s_);
+    conv::Request r{in16, H, W, c.in, c.w, c.out, (int) c.k, 1, p, p, p, p};
+    r.bias = c.b;
+    r.add = add;
+    r.out = out;
+    conv::drive(core::Runtime::get().stream(s_), r, HW, K, (f2_ ? f2_band_ : col_cap_), c.k == 1,
+        [&](int64_t p0, int64_t n) { qi_im2col16(in16, 1, H, W, c.in, 1, (int) c.k, 1, p, H, W, p0, n, col16_, s_); },
+        [&](int64_t p0, int64_t n, bool point) {
+            gemm_.f16(point ? in16 : col16_, c.w, out + p0 * c.out, n, c.out, point ? c.in : K, 0, false, add);
+        },
+        [&] { if (c.b != nullptr) qi_bias_add(out, c.b, HW, c.out, s_); });
 }
 
 void MfVae::conv_s2(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out, bool add) {
-    const int64_t HWo = (H / 2) * (W / 2), K = 9 * c.in, rows = std::max<int64_t>(1, (f2_ ? f2_band_ : col_cap_) / K);
-    for (int64_t p0 = 0; p0 < HWo; p0 += rows) {
-        const int64_t n = std::min(rows, HWo - p0);
-        qi_im2col16(in16, 1, H, W, c.in, 1, 3, 2, 0, H / 2, W / 2, p0, n, col16_, s_);
-        gemm_.f16(col16_, c.w, out + p0 * c.out, n, c.out, K, 0, false, add);
-    }
-    if (c.b != nullptr) qi_bias_add(out, c.b, HWo, c.out, s_);
+    const int64_t OH = H / 2, OW = W / 2, P = OH * OW, K = 9 * c.in;
+    conv::Request r{in16, H, W, c.in, c.w, c.out, 3, 2, 0, 0, 1, 1};
+    r.bias = c.b;
+    r.add = add;
+    r.out = out;
+    conv::drive(core::Runtime::get().stream(s_), r, P, K, f2_ ? f2_band_ : col_cap_, false,
+        [&](int64_t p0, int64_t n) { qi_im2col16(in16, 1, H, W, c.in, 1, 3, 2, 0, OH, OW, p0, n, col16_, s_); },
+        [&](int64_t p0, int64_t n, bool) { gemm_.f16(col16_, c.w, out + p0 * c.out, n, c.out, K, 0, false, add); },
+        [&] { if (c.b != nullptr) qi_bias_add(out, c.b, P, c.out, s_); });
 }
 
 bool MfVae::conv16(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, uint16_t* out16, bool add,
                    uint16_t* side) {
-#if STRATA_ONEDNN || STRATA_CUDNN
-    if (c.k != 3 && !add) return false;   // (conv's: the 1 x 1 ones without a residual through the product)
-    conv::Form f;
-    f.y16 = true;
-#endif
-#if STRATA_ONEDNN
     const int p = (int) c.k / 2;
-    if (conv::onednn(core::Runtime::get().stream(s_), in16, H, W, c.in, c.w, c.out, (int) c.k, 1, p, p, p, p, c.b, add,
-                     out16, f))
-        return true;
-#endif
-#if STRATA_CUDNN
-    // the convolution alone (cuDNN's precompiled kernels: with the bias or the residual in its pass it compiles one
-    // a shape, 0.6 s more for a tiled 1024 x 1024 decode on the RTX 4070, 2026-11-08), then the bias and the residual
-    if (uint16_t* y = add ? side : out16;
-        y != nullptr &&
-        conv::cudnn(core::Runtime::get().stream(s_), in16, H, W, c.in, c.w, c.out, (int) c.k, nullptr, false, y, f)) {
-        act_bias16(y, c.b, H * W * c.out, c.out, add, out16, s_);
-        return true;
-    }
-#endif
-    (void) c, (void) in16, (void) H, (void) W, (void) out16, (void) add, (void) side;
-    return false;
+    conv::Request r{in16, H, W, c.in, c.w, c.out, (int) c.k, 1, p, p, p, p};
+    r.bias = c.b;
+    r.add = add;
+    r.out = out16;
+    r.form.y16 = true;
+    // cuDNN without bias or residual uses precompiled kernels.  Fusing them cost 0.6 s more for a tiled 1024 x 1024
+    // decode on the RTX 4070 (2026-11-08); add them in the engine after that convolution.
+    uint16_t* y = add ? side : out16;
+    const auto chosen = conv::library(core::Runtime::get().stream(s_), r, y, true);
+    if (chosen == conv::Library::cudnn) act_bias16(y, c.b, H * W * c.out, c.out, add, out16, s_);
+    return chosen != conv::Library::none;
 }
 
 void MfVae::gn_silu16(const float* x, const float* w, const float* b, int64_t HW, int64_t C, bool silu_on,
@@ -1338,9 +1280,9 @@ uint64_t MfVae::f2_bytes(const F2Sizes& z) const {
         for (const F2Res& r : l.blocks) cmax = std::max(cmax, r.c1.in);
         cmax = std::max(cmax, l.down.in);
     }
-    const int64_t col_rows = std::min<int64_t>(z.pix, 32768);
+    const int64_t col = std::min(z.pix * 9 * cmax, conv::col_values(q_of(s_)));
     return (uint64_t) z.most * (3 * 2 + 2 + 4) +                       // x, y, t (16 bits); a16; the FP32 sums
-           (uint64_t) col_rows * 9 * cmax * 2 +                        // the unfolded neighbourhoods, a band
+           (uint64_t) col * 2 +                                          // the unfolded neighbourhoods, a band
            (uint64_t) qi_group_norm_ws_floats(z.pix) * 4 + 4 * (uint64_t) cmax * 4 +   // the group norms' sums, stats
            (uint64_t) z.mid * f2_ac_ * 3 * 2 +                         // q, k, v^T
            (uint64_t) z.rows * z.mid * (4 + 2);                        // a band's scores, probabilities
@@ -1369,7 +1311,7 @@ void MfVae::f2_grow(const F2Sizes& z) {
         for (const F2Res& r : l.blocks) cmax = std::max(cmax, r.c1.in);
     // the convolutions' bands by the decoder's widths alone, so that a decode is the same whether the encoder (wider
     // in MOSS-Image's VAE) is loaded or not
-    f2_band_ = std::min<int64_t>(n.pix, 32768) * 9 * cmax;
+    f2_band_ = std::min(n.pix * 9 * cmax, conv::col_values(q_of(s_)));
     for (const F2Down& l : f2_down_) {
         for (const F2Res& r : l.blocks) cmax = std::max(cmax, r.c1.in);
         cmax = std::max(cmax, l.down.in);
@@ -1380,7 +1322,7 @@ void MfVae::f2_grow(const F2Sizes& z) {
     vtmp_ = alloc<float>(allocs_, n.most);
     vtmp_cap_ = n.most;
     a16_ = alloc<uint16_t>(allocs_, n.most);
-    col_cap_ = std::min<int64_t>(n.pix, 32768) * 9 * cmax;
+    col_cap_ = std::min(n.pix * 9 * cmax, conv::col_values(q_of(s_)));
     col16_ = alloc<uint16_t>(allocs_, col_cap_);
     gn_part_ = alloc<float>(allocs_, qi_group_norm_ws_floats(n.pix));
     vec_ = alloc<float>(allocs_, 4 * cmax);

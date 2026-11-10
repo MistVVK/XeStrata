@@ -7,12 +7,11 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/qi_kernels.hpp"
+#include "strata/image/aux_net.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
-#if STRATA_ONEDNN
 #include "qi_conv.hpp"
-#endif
 
 #include <sycl/sycl.hpp>
 
@@ -29,7 +28,6 @@ namespace {
 using strata::kernels::f16_from_f32;
 using strata::kernels::f32_from_f16;
 
-constexpr int64_t kColBytes = 64ll << 20;   // the unfolded neighbourhoods a product takes at most
 constexpr int kInC = 8;                     // the picture's channels on the GPU: RGB and zeros (8-wide loads)
 
 sycl::queue& queue() { return core::Runtime::get().stream(nullptr); }
@@ -39,8 +37,8 @@ int64_t up8(int64_t n) { return (n + 7) / 8 * 8; }
 // a convolution with its batch norm folded in: w [outp][k][k][in] (FP16, rows past `out` zero), b [outp]
 struct ConvW {
     int64_t in = 0, out = 0, outp = 0, k = 1, s = 1;
-    uint16_t* w = nullptr;
-    float* b = nullptr;
+    const uint16_t* w = nullptr;
+    const float* b = nullptr;
     bool act = true;   // SiLU after it (the head's last 1 x 1 convolutions have none)
 };
 
@@ -53,122 +51,21 @@ struct Layer {
     std::vector<std::pair<ConvW, ConvW>> m;       // C2f's bottlenecks
 };
 
-// a buffer list reused call after call: the n-th request of a detection takes the n-th slot
-struct Pool {
-    std::vector<std::pair<void*, size_t>> slots;
-    size_t next = 0;
-    template <class T> T* get(size_t n) {
-        const size_t bytes = std::max<size_t>(n * sizeof(T), 16);
-        if (next == slots.size()) slots.emplace_back(nullptr, 0);
-        auto& s = slots[next++];
-        if (s.second < bytes) {
-            if (s.first != nullptr) gpu::free(s.first);
-            s.first = nullptr;
-            s.second = 0;
-            if (!gpu::alloc_device(&s.first, bytes))
-                throw std::runtime_error(std::string("image engine (detector): GPU memory: ") + gpu::last_error());
-            s.second = bytes;
-        }
-        return static_cast<T*>(s.first);
-    }
-    size_t bytes() const {
-        size_t n = 0;
-        for (const auto& s : slots) n += s.second;
-        return n;
-    }
-    void clear() {
-        for (auto& s : slots)
-            if (s.first != nullptr) gpu::free(s.first);
-        slots.clear();
-        next = 0;
-    }
-};
-
-// a feature map on the GPU: [h][w][c] FP16
-struct Map {
-    uint16_t* p = nullptr;
-    int64_t h = 0, w = 0, c = 0;
-};
+using Map = AuxMapNet::Map;
 
 // ---- kernels
-
-// the picture (RGBA8, W x H) letterboxed: resized to nw x nh by OpenCV's bilinear (pixel centres, the edges
-// clamped, rounded to 8 bits), placed at (left, top) of an iw x ih field of grey 114, as RGB / 255 and zeros in kInC
-void letterbox(const uint8_t* rgba, int64_t W, int64_t H, int64_t nw, int64_t nh, int64_t left, int64_t top,
-               int64_t iw, int64_t ih, uint16_t* out) {
-    const float sx = (float) W / (float) nw, sy = (float) H / (float) nh;
-    queue().parallel_for(sycl::range<2>((size_t) ih, (size_t) iw), [=](sycl::id<2> id) {
-        const auto y = static_cast<int64_t>(id[0]), x = static_cast<int64_t>(id[1]);
-        uint16_t* o = out + (y * iw + x) * kInC;
-        const int64_t u = x - left, v = y - top;
-        float c[3] = {114.f, 114.f, 114.f};
-        if (u >= 0 && u < nw && v >= 0 && v < nh) {
-            float fx = ((float) u + 0.5f) * sx - 0.5f, fy = ((float) v + 0.5f) * sy - 0.5f;
-            int64_t x0 = (int64_t) sycl::floor(fx), y0 = (int64_t) sycl::floor(fy);
-            fx -= (float) x0;
-            fy -= (float) y0;
-            if (x0 < 0) { x0 = 0; fx = 0.f; }
-            if (y0 < 0) { y0 = 0; fy = 0.f; }
-            if (x0 >= W - 1) { x0 = W - 1; fx = 0.f; }
-            if (y0 >= H - 1) { y0 = H - 1; fy = 0.f; }
-            const int64_t x1 = sycl::min(x0 + 1, W - 1), y1 = sycl::min(y0 + 1, H - 1);
-            for (int k = 0; k < 3; ++k) {
-                const float a = rgba[(y0 * W + x0) * 4 + k], b = rgba[(y0 * W + x1) * 4 + k];
-                const float d = rgba[(y1 * W + x0) * 4 + k], e = rgba[(y1 * W + x1) * 4 + k];
-                const float top_ = a + (b - a) * fx, bot = d + (e - d) * fx;
-                c[k] = sycl::round(top_ + (bot - top_) * fy);
-            }
-        }
-        for (int k = 0; k < kInC; ++k) o[k] = f16_from_f32(k < 3 ? c[k] / 255.f : 0.f);
-    });
-}
 
 // a convolution's output y [HW][ldy] (FP32) finished (qi_conv_store16, on the queue without a wait): + bias (null:
 // in y already), SiLU, + res [HW][O] (null: none), to FP16 at dst [HW][ld] from channel `off`, and its channels from
 // `from2` on also to dst2 [HW][O - from2] (null: none)
 void store(const float* y, int64_t HW, int64_t O, int64_t ldy, const float* bias, bool silu, const uint16_t* res,
            uint16_t* dst, int64_t ld, int64_t off, uint16_t* dst2, int64_t from2) {
-    qi_conv_store16(y, HW, O, ldy, bias, silu ? QiAct::silu : QiAct::none, 0.f, res, dst, ld, off,
+    qi_conv_store16(y, HW, O, ldy, bias, silu ? ImageAct::silu : ImageAct::none, 0.f, res, dst, ld, off,
                     &core::Runtime::get().compute(), dst2, from2);
 }
 
 // y [HW][O] += b [O]
 void add_bias(float* y, int64_t HW, int64_t O, const float* b) { qi_bias_add(y, b, HW, O, nullptr); }
-
-// the 5 x 5 max pool of stride 1 (padded by -inf) of x [H][W][C] to dst [HW][ld] from channel off and to dst2
-// [HW][C]
-void maxpool5(const uint16_t* x, int64_t H, int64_t W, int64_t C, uint16_t* dst, int64_t ld, int64_t off,
-              uint16_t* dst2) {
-    queue().parallel_for(sycl::range<1>((size_t) (H * W * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t q = i / C, c = i - q * C, y = q / W, xx = q % W;
-        float m = -INFINITY;
-        for (int64_t dy = -2; dy <= 2; ++dy)
-            for (int64_t dx = -2; dx <= 2; ++dx) {
-                const int64_t yy = y + dy, x2 = xx + dx;
-                if (yy >= 0 && yy < H && x2 >= 0 && x2 < W) m = sycl::fmax(m, f32_from_f16(x[(yy * W + x2) * C + c]));
-            }
-        const uint16_t h = f16_from_f32(m);
-        dst[q * ld + off + c] = h;
-        if (dst2 != nullptr) dst2[q * C + c] = h;
-    });
-}
-
-// dst [H][W][Ca + Cb] = (a, nearest 2x upsampled from H / 2 x W / 2 when `up`) and b
-void concat2(const uint16_t* a, int64_t Ca, bool up, const uint16_t* b, int64_t Cb, int64_t H, int64_t W,
-             uint16_t* dst) {
-    const int64_t C = Ca + Cb;
-    queue().parallel_for(sycl::range<1>((size_t) (H * W * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t q = i / C, c = i - q * C;
-        if (c < Ca) {
-            const int64_t src = up ? ((q / W) / 2) * (W / 2) + (q % W) / 2 : q;
-            dst[i] = a[src * Ca + c];
-        } else {
-            dst[i] = b[q * Cb + c - Ca];
-        }
-    });
-}
 
 // a 2 x 2 transposed convolution of stride 2's product y [H][W][4][O] (the kernel's place (a, b) = a * 2 + b) laid
 // out at 2H x 2W, + bias, to FP16 dst [2H][2W][O]
@@ -254,7 +151,14 @@ std::string join(const std::string& a, const std::string& b) { return a + "." + 
 
 }  // namespace
 
-struct YoloDetector::Net {
+struct YoloDetector::Net : AuxMapNet {
+    explicit Net(const std::string& path) : AuxMapNet(path, "detector") {}
+    void load_weights() override {}
+    void begin() { begin_run(); }
+    template <class T> T* get(size_t n) { return buf<T>(n); }
+    MConv read_conv(const std::string& w, const std::string& b, const std::string& bn, float eps, int64_t in_pad) {
+        return mconv(w, b, 1, 0, bn, eps, in_pad);
+    }
     std::vector<Layer> layers;
     std::vector<int> head_from;
     struct Level {
@@ -267,17 +171,8 @@ struct YoloDetector::Net {
     int64_t up_c = 0;
     float* dfl = nullptr;        // the bins' weights [reg_max]
     int reg_max = 16, nm = 0;
-    std::vector<void*> owned;
-    Pool pool;
-    ~Net() {
-        for (void* p : owned) gpu::free(p);
-        pool.clear();
-    }
     template <class T> T* upload(const std::vector<T>& v) {
-        T* p = nullptr;
-        if (!gpu::alloc_device(&p, v.size() * sizeof(T)))
-            throw std::runtime_error(std::string("image engine (detector): GPU memory: ") + gpu::last_error());
-        owned.push_back(p);
+        T* p = static_cast<T*>(alloc(v.size() * sizeof(T)));
         gpu::copy(p, v.data(), v.size() * sizeof(T));
         return p;
     }
@@ -295,42 +190,16 @@ ConvW load_conv(SafeTensors& st, YoloDetector::Net& net, const std::string& p, f
     const SafeTensor* t = st.find(wn);
     if (t == nullptr || t->shape.size() != 4 || t->shape[2] != t->shape[3])
         throw std::runtime_error("detector: no convolution " + wn);
+    const auto m = net.read_conv(wn, bn ? "" : join(p, "bias"), bn ? join(p, "bn") : "", eps, in_pad);
     ConvW c;
-    c.out = t->shape[0];
-    c.in = t->shape[1];
-    c.k = t->shape[2];
+    c.in = m.inp;
+    c.out = m.out;
+    c.outp = m.outp;
+    c.k = m.k;
     c.act = bn;
-    const int64_t inp = std::max(in_pad, c.in);
-    if (inp % 8 != 0) throw std::runtime_error("detector: " + wn + ": " + std::to_string(c.in) + " input channels");
-    c.outp = up8(c.out);
-    const std::vector<float> w = st.f32(wn);
-    std::vector<float> scale((size_t) c.out, 1.f), shift((size_t) c.out, 0.f);
-    if (bn) {
-        const auto g = st.f32(join(p, "bn.weight")), b = st.f32(join(p, "bn.bias"));
-        const auto m = st.f32(join(p, "bn.running_mean")), v = st.f32(join(p, "bn.running_var"));
-        if ((int64_t) g.size() != c.out || b.size() != g.size() || m.size() != g.size() || v.size() != g.size())
-            throw std::runtime_error("detector: " + p + ": batch norm of another size");
-        for (int64_t o = 0; o < c.out; ++o) {
-            scale[o] = g[o] / std::sqrt(v[o] + eps);
-            shift[o] = b[o] - m[o] * scale[o];
-        }
-    } else {
-        const auto b = st.f32(join(p, "bias"));
-        if ((int64_t) b.size() != c.out) throw std::runtime_error("detector: " + p + ": no bias");
-        shift = b;
-    }
-    std::vector<uint16_t> w16((size_t) (c.outp * c.k * c.k * inp), 0);
-    for (int64_t o = 0; o < c.out; ++o)
-        for (int64_t i = 0; i < c.in; ++i)
-            for (int64_t ky = 0; ky < c.k; ++ky)
-                for (int64_t kx = 0; kx < c.k; ++kx)
-                    w16[(size_t) (((o * c.k + ky) * c.k + kx) * inp + i)] =
-                        f16_from_f32(w[(size_t) (((o * c.in + i) * c.k + ky) * c.k + kx)] * scale[o]);
-    shift.resize((size_t) c.outp, 0.f);
-    c.in = inp;
-    c.w = net.upload(w16);
-    c.b = net.upload(shift);
-    bytes += w16.size() * 2 + shift.size() * 4;
+    c.w = m.w;
+    c.b = m.b;
+    bytes += (uint64_t) m.outp * m.k * m.k * m.inp * 2 + (uint64_t) m.outp * 4;
     return c;
 }
 
@@ -338,7 +207,7 @@ ConvW load_conv(SafeTensors& st, YoloDetector::Net& net, const std::string& p, f
 
 bool YoloDetector::open(const std::string& path, std::string& err) {
     try {
-        net_ = std::make_unique<Net>();
+        net_ = std::make_unique<Net>(path);
         Net& net = *net_;
         weight_bytes_ = 0;
         SafeTensors st(path);
@@ -455,11 +324,11 @@ uint64_t YoloDetector::work_bytes(int imgsz) const {
     uint64_t widest = 0;
     for (const Layer& L : net_->layers) widest = std::max<uint64_t>(widest, (uint64_t) std::max(L.conv.outp, L.cv2.in));
     const uint64_t side = (uint64_t) imgsz / 2;
-    return side * side * widest * (2 + 4) * 2 + (uint64_t) kColBytes + (seg_ ? (uint64_t) imgsz * imgsz * 64 : 0);
+    return side * side * widest * (2 + 4) * 2 + (uint64_t) conv::col_values(queue()) * 2 + (seg_ ? (uint64_t) imgsz * imgsz * 64 : 0);
 }
 
 void YoloDetector::drop_scratch() {
-    if (net_) net_->pool.clear();
+    if (net_) net_->drop_scratch();
 }
 
 std::vector<Detection> YoloDetector::detect(const QiRef& img, float conf, std::vector<std::vector<uint8_t>>* masks,
@@ -468,7 +337,7 @@ std::vector<Detection> YoloDetector::detect(const QiRef& img, float conf, std::v
     Net& net = *net_;
     const int64_t W = img.width, H = img.height;
     if (W <= 0 || H <= 0 || (int64_t) img.rgba.size() != W * H * 4) throw std::invalid_argument("detector: a picture of another size");
-    net.pool.next = 0;
+    net.begin();
     sycl::queue& q = queue();
 
     // the letterbox: the least padding to a multiple of 32, its smaller half before, grey 114 (YOLOv8's
@@ -477,17 +346,17 @@ std::vector<Detection> YoloDetector::detect(const QiRef& img, float conf, std::v
     const int64_t nw = (int64_t) std::lround((double) W * r), nh = (int64_t) std::lround((double) H * r);
     const int64_t pw = (imgsz - nw) % 32, ph = (imgsz - nh) % 32, iw = nw + pw, ih = nh + ph;
     const int64_t left = pw / 2, top = ph / 2;
-    uint8_t* src = net.pool.get<uint8_t>((size_t) (W * H * 4));
+    uint8_t* src = net.get<uint8_t>((size_t) (W * H * 4));
     q.memcpy(src, img.rgba.data(), (size_t) (W * H * 4));
-    Map x0{net.pool.get<uint16_t>((size_t) (iw * ih * kInC)), ih, iw, kInC};
-    letterbox(src, W, H, nw, nh, left, top, iw, ih, x0.p);
+    Map x0{net.get<uint16_t>((size_t) (iw * ih * kInC)), ih, iw, kInC};
+    aux_letterbox16(src, W, H, nw, nh, left, top, iw, ih, 0.f, false, x0.p, &q);
 
     float* y32 = nullptr;   // the convolutions' FP32 output, the largest one's size
     size_t y32_cap = 0;
     uint16_t* col = nullptr;
     const auto y_buf = [&](size_t n) {
         if (n > y32_cap) {
-            y32 = net.pool.get<float>(n);
+            y32 = net.get<float>(n);
             y32_cap = n;
         }
         return y32;
@@ -500,22 +369,19 @@ std::vector<Detection> YoloDetector::detect(const QiRef& img, float conf, std::v
         OH = (x.h + 2 * (int64_t) p - c.k) / c.s + 1;
         OW = (x.w + 2 * (int64_t) p - c.k) / c.s + 1;
         float* y = yout != nullptr ? yout : y_buf((size_t) (OH * OW * c.outp));
-#if STRATA_ONEDNN
-        if (c.k > 1 && conv::onednn(q, x.p, x.h, x.w, c.in, c.w, c.outp, (int) c.k, (int) c.s, p, p, p, p, c.b, false, y))
-            return true;
-#endif
-        if (c.k == 1 && c.s == 1) {
-            gemm_.f16(x.p, c.w, y, x.h * x.w, c.outp, c.in);
-            return false;
-        }
-        const int64_t K = c.k * c.k * c.in, rows = std::max<int64_t>(1, kColBytes / 2 / K), HW = OH * OW;
-        if (col == nullptr) col = net.pool.get<uint16_t>((size_t) (kColBytes / 2));
-        for (int64_t p0 = 0; p0 < HW; p0 += rows) {
-            const int64_t n = std::min(rows, HW - p0);
-            qi_im2col16(x.p, 1, x.h, x.w, c.in, 1, (int) c.k, (int) c.s, p, OH, OW, p0, n, col, nullptr);
-            gemm_.f16(col, c.w, y + p0 * c.outp, n, c.outp, K);
-        }
-        return false;
+        const int64_t K = c.k * c.k * c.in, P = OH * OW, cap = conv::col_values(q);
+        conv::Request r{x.p, x.h, x.w, c.in, c.w, c.outp, (int) c.k, (int) c.s, p, p, p, p};
+        r.bias = c.b;
+        r.out = y;
+        const auto chosen = conv::drive(q, r, P, K, cap, c.k == 1 && c.s == 1,
+            [&](int64_t p0, int64_t n) {
+                if (col == nullptr) col = net.get<uint16_t>((size_t) cap);
+                qi_im2col16(x.p, 1, x.h, x.w, c.in, 1, (int) c.k, (int) c.s, p, OH, OW, p0, n, col, nullptr);
+            },
+            [&](int64_t p0, int64_t n, bool point) {
+                gemm_.f16(point ? x.p : col, c.w, y + p0 * c.outp, n, c.outp, point ? c.in : K);
+            }, [] {});
+        return chosen != conv::Library::none;
     };
     // a Conv module: the convolution, then SiLU into a new map (and from channel `from2` on into `dst2`)
     const auto conv_map = [&](const ConvW& c, const Map& x, uint16_t* dst = nullptr, int64_t ld = 0, int64_t off = 0,
@@ -524,7 +390,7 @@ std::vector<Detection> YoloDetector::detect(const QiRef& img, float conf, std::v
         const bool biased = conv(c, x, OH, OW);
         Map out{dst, OH, OW, c.out};
         if (out.p == nullptr) {
-            out.p = net.pool.get<uint16_t>((size_t) (OH * OW * c.out));
+            out.p = net.get<uint16_t>((size_t) (OH * OW * c.out));
             ld = c.out;
             off = 0;
         }
@@ -542,24 +408,24 @@ std::vector<Detection> YoloDetector::detect(const QiRef& img, float conf, std::v
             x = conv_map(L.conv, in);
         } else if (L.mod == "C2f") {
             const int64_t c = L.cv1.out / 2, n = (int64_t) L.m.size(), Ccat = (2 + n) * c;
-            Map cat{net.pool.get<uint16_t>((size_t) (in.h * in.w * Ccat)), in.h, in.w, Ccat};
-            Map last{net.pool.get<uint16_t>((size_t) (in.h * in.w * c)), in.h, in.w, c};
+            Map cat{net.get<uint16_t>((size_t) (in.h * in.w * Ccat)), in.h, in.w, Ccat};
+            Map last{net.get<uint16_t>((size_t) (in.h * in.w * c)), in.h, in.w, c};
             conv_map(L.cv1, in, cat.p, Ccat, 0, last.p, c);
             for (int64_t j = 0; j < n; ++j) {
                 const Map t = conv_map(L.m[(size_t) j].first, last);
-                Map next{net.pool.get<uint16_t>((size_t) (in.h * in.w * c)), in.h, in.w, c};
+                Map next{net.get<uint16_t>((size_t) (in.h * in.w * c)), in.h, in.w, c};
                 conv_map(L.m[(size_t) j].second, t, cat.p, Ccat, (2 + j) * c, next.p, 0, L.shortcut ? last.p : nullptr);
                 last = next;
             }
             x = conv_map(L.cv2, cat);
         } else if (L.mod == "SPPF") {
             const int64_t c = L.cv1.out, Ccat = 4 * c;
-            Map cat{net.pool.get<uint16_t>((size_t) (in.h * in.w * Ccat)), in.h, in.w, Ccat};
-            Map a{net.pool.get<uint16_t>((size_t) (in.h * in.w * c)), in.h, in.w, c};
+            Map cat{net.get<uint16_t>((size_t) (in.h * in.w * Ccat)), in.h, in.w, Ccat};
+            Map a{net.get<uint16_t>((size_t) (in.h * in.w * c)), in.h, in.w, c};
             conv_map(L.cv1, in, cat.p, Ccat, 0, a.p, 0);
             for (int j = 1; j < 4; ++j) {
-                Map b{net.pool.get<uint16_t>((size_t) (in.h * in.w * c)), in.h, in.w, c};
-                maxpool5(a.p, in.h, in.w, c, cat.p, Ccat, j * c, b.p);
+                Map b{net.get<uint16_t>((size_t) (in.h * in.w * c)), in.h, in.w, c};
+                aux_maxpool16(a.p, in.h, in.w, c, 5, 1, 2, in.h, in.w, cat.p, &q, Ccat, j * c, b.p);
                 a = b;
             }
             x = conv_map(L.cv2, cat);
@@ -570,8 +436,8 @@ std::vector<Detection> YoloDetector::detect(const QiRef& img, float conf, std::v
             const Map& b = outs[(size_t) L.from[1]];
             const bool up = i > 0 && net.layers[i - 1].mod == "Upsample" && L.from[0] == (int) i - 1;
             if (in.h != b.h || in.w != b.w) throw std::runtime_error("detector: a Concat of maps of other sizes");
-            Map cat{net.pool.get<uint16_t>((size_t) (b.h * b.w * (in.c + b.c))), b.h, b.w, in.c + b.c};
-            concat2(in.p, in.c, up, b.p, b.c, b.h, b.w, cat.p);
+            Map cat{net.get<uint16_t>((size_t) (b.h * b.w * (in.c + b.c))), b.h, b.w, in.c + b.c};
+            aux_concat2_16(in.p, in.c, up, b.p, b.c, b.h, b.w, cat.p, &q);
             x = cat;
         } else {   // the head
             break;
@@ -583,7 +449,7 @@ std::vector<Detection> YoloDetector::detect(const QiRef& img, float conf, std::v
     const int nm = seg_ ? net.nm : 0, row = 6 + nm;
     int64_t anchors = 0;
     for (int f : net.head_from) anchors += outs[(size_t) f].h * outs[(size_t) f].w;
-    float* cand = net.pool.get<float>((size_t) (anchors * row));
+    float* cand = net.get<float>((size_t) (anchors * row));
     int64_t a0 = 0;
     for (size_t l = 0; l < net.lv.size(); ++l) {
         const Map& f = outs[(size_t) net.head_from[l]];
@@ -595,7 +461,7 @@ std::vector<Detection> YoloDetector::detect(const QiRef& img, float conf, std::v
         for (int k = 0; k < (seg_ ? 3 : 2); ++k) {
             const Map t = conv_map(chains[k][1], conv_map(chains[k][0], f));
             const ConvW& last = chains[k][2];
-            br[k] = net.pool.get<float>((size_t) (HW * last.outp));
+            br[k] = net.get<float>((size_t) (HW * last.outp));
             int64_t OH = 0, OW = 0;
             if (!conv(last, t, OH, OW, br[k])) add_bias(br[k], HW, last.outp, last.b);
             if (k == 1) ldc = last.outp;
@@ -653,9 +519,9 @@ std::vector<Detection> YoloDetector::detect(const QiRef& img, float conf, std::v
             // the prototypes from the first level's map
             const Map& f = outs[(size_t) net.head_from[0]];
             const Map a = conv_map(net.p1, f);
-            float* yu = net.pool.get<float>((size_t) (a.h * a.w * 4 * net.up_c));
+            float* yu = net.get<float>((size_t) (a.h * a.w * 4 * net.up_c));
             gemm_.f16(a.p, net.up_w, yu, a.h * a.w, 4 * net.up_c, a.c);
-            Map u{net.pool.get<uint16_t>((size_t) (4 * a.h * a.w * net.up_c)), 2 * a.h, 2 * a.w, net.up_c};
+            Map u{net.get<uint16_t>((size_t) (4 * a.h * a.w * net.up_c)), 2 * a.h, 2 * a.w, net.up_c};
             unshuffle2(yu, a.h, a.w, net.up_c, net.up_b, u.p);
             const Map pr = conv_map(net.p3, conv_map(net.p2, u));
             const int64_t N = (int64_t) dets.size(), Np = up8(N), HWp = pr.h * pr.w;
@@ -668,13 +534,13 @@ std::vector<Detection> YoloDetector::detect(const QiRef& img, float conf, std::v
                 bx[(size_t) (n * 4 + 2)] = dets[(size_t) n].x1;
                 bx[(size_t) (n * 4 + 3)] = dets[(size_t) n].y1;
             }
-            uint16_t* co_d = net.pool.get<uint16_t>(co.size());
-            float* bx_d = net.pool.get<float>(bx.size());
+            uint16_t* co_d = net.get<uint16_t>(co.size());
+            float* bx_d = net.get<float>(bx.size());
             q.memcpy(co_d, co.data(), co.size() * 2);
             q.memcpy(bx_d, bx.data(), bx.size() * 4);
-            float* lg = net.pool.get<float>((size_t) (HWp * Np));
+            float* lg = net.get<float>((size_t) (HWp * Np));
             gemm_.f16(pr.p, co_d, lg, HWp, Np, nm);
-            uint8_t* mk = net.pool.get<uint8_t>((size_t) (N * W * H));
+            uint8_t* mk = net.get<uint8_t>((size_t) (N * W * H));
             masks_kernel(lg, pr.h, pr.w, Np, N, bx_d, gain, (float) left, (float) top, (float) iw, (float) ih, W, H, mk);
             masks->assign((size_t) N, std::vector<uint8_t>((size_t) (W * H)));
             for (int64_t n = 0; n < N; ++n) q.memcpy((*masks)[(size_t) n].data(), mk + n * W * H, (size_t) (W * H));

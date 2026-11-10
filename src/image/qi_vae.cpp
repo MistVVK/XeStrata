@@ -14,9 +14,7 @@
 #include "strata/kernels/elementwise.hpp"
 
 #include "tile_sides.hpp"
-#if STRATA_ONEDNN || STRATA_CUDNN
 #include "qi_conv.hpp"
-#endif
 
 #include <sycl/sycl.hpp>
 
@@ -55,7 +53,6 @@ const float kWanMean[16] = {-0.7571f, -0.7089f, -0.9113f, 0.1075f, -0.1745f, 0.9
 const float kWanStd[16] = {2.8184f, 1.4541f, 2.3275f, 2.6558f, 1.2196f, 1.7708f, 2.6052f, 2.0743f,
                            3.2687f, 2.1526f, 2.8652f, 1.5579f, 1.6382f, 1.1253f, 2.8251f, 1.9160f};
 const bool kTemporalUp[5] = {true, true, true, false, false};   // the up blocks whose shortcut also spans time
-constexpr int64_t kColBytes = 256ll << 20;                      // the unfolded neighbourhoods a product at most
 constexpr int64_t kScoreValues = 16ll << 20;                     // the attention's scores a band of query rows at most
 
 // the attention's band of query rows over hw keys: its scores within kScoreValues
@@ -452,29 +449,18 @@ void QiVae::grow(int64_t elems16, int64_t elems32, int64_t col16) {
 }
 
 void QiVae::conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out, bool add) {
-    const int64_t HW = H * W;
-#if STRATA_ONEDNN
-    // oneDNN where it takes them (Intel GPUs), the bias and the residual within its pass: the 3 x 3 ones, and the 1 x 1
-    // ones that add to a residual (the others gained nothing over the library's product on the B70, 2026-11-02)
+    const int64_t HW = H * W, K = c.k * c.k * c.in;
     const int p = (int) c.k / 2;
-    if ((c.k == 3 || add) &&
-        conv::onednn(q_of(s_), in16, H, W, c.in, c.w, c.out, (int) c.k, 1, p, p, p, p, c.b, add, out))
-        return;
-#endif
-#if STRATA_CUDNN
-    if ((c.k == 3 || add) && conv::cudnn(q_of(s_), in16, H, W, c.in, c.w, c.out, (int) c.k, c.b, add, out)) return;
-#endif
-    if (c.k == 1) {
-        gemm_.f16(in16, c.w, out, HW, c.out, c.in, 0, false, add);
-    } else {
-        const int64_t K = 9 * c.in, rows = std::max<int64_t>(1, col_cap_ / K);
-        for (int64_t p0 = 0; p0 < HW; p0 += rows) {
-            const int64_t n = std::min(rows, HW - p0);
-            qi_im2col16(in16, 1, H, W, c.in, 1, 3, 1, 1, H, W, p0, n, col16_, s_);
-            gemm_.f16(col16_, c.w, out + p0 * c.out, n, c.out, K, 0, false, add);
-        }
-    }
-    qi_bias_add(out, c.b, HW, c.out, s_);
+    conv::Request r{in16, H, W, c.in, c.w, c.out, (int) c.k, 1, p, p, p, p};
+    r.bias = c.b;
+    r.add = add;
+    r.out = out;
+    conv::drive(q_of(s_), r, HW, K, col_cap_, c.k == 1,
+        [&](int64_t p0, int64_t n) { qi_im2col16(in16, 1, H, W, c.in, 1, (int) c.k, 1, p, H, W, p0, n, col16_, s_); },
+        [&](int64_t p0, int64_t n, bool point) {
+            gemm_.f16(point ? in16 : col16_, c.w, out + p0 * c.out, n, c.out, point ? c.in : K, 0, false, add);
+        },
+        [&] { if (c.b != nullptr) qi_bias_add(out, c.b, HW, c.out, s_); });
 }
 
 void QiVae::resblock(const Res& r, float*& x, int64_t H, int64_t W, int64_t cin) {
@@ -538,8 +524,8 @@ QiVae::Need QiVae::need(int64_t h, int64_t w) const {
         }
         c = co;
     }
-    // the convolutions unfold a band of rows at a time into at most kColBytes; the attention's probabilities, a band
-    n.col = std::max(attn_rows(h * w) * h * w, std::min(unfold, kColBytes / 2));
+    // The convolutions and attention share the allocation; each keeps its own band.
+    n.col = std::max(attn_rows(h * w) * h * w, std::min(unfold, conv::col_values(q_of(s_))));
     return n;
 }
 
@@ -668,7 +654,7 @@ QiVae::Need QiVae::encode_need(int64_t H, int64_t W) const {
     n.big32 = std::max(n.big32, h * w * std::max(3 * c, attn_rows(h * w)));
     n.big16 = std::max(n.big16, 3 * h * w * c);
     n.big32 = std::max(n.big32, h * w * std::max(eout_.out, quant_.out));
-    n.col = std::max(attn_rows(h * w) * h * w, std::min(unfold, kColBytes / 2));
+    n.col = std::max(attn_rows(h * w) * h * w, std::min(unfold, conv::col_values(q_of(s_))));
     return n;
 }
 
@@ -702,13 +688,14 @@ bool QiVae::encode(const float* rgba, int64_t H, int64_t W, float* z, float* zst
         if (d.down.out > 0) {   // zero row and column after the edge, then the 3 x 3 convolution of stride 2
             kernels::f32_to_f16_bulk(x, a16_, H * W * c, s_);
             float* y = x == t0_ ? t1_ : t0_;
-            const int64_t Ho = H / 2, Wo = W / 2, K = 9 * c, rows = std::max<int64_t>(1, col_cap_ / K);
-            for (int64_t p0 = 0; p0 < Ho * Wo; p0 += rows) {
-                const int64_t n = std::min(rows, Ho * Wo - p0);
-                qi_im2col16(a16_, 1, H, W, c, 1, 3, 2, 0, H / 2, W / 2, p0, n, col16_, s_);
-                gemm_.f16(col16_, d.down.w, y + p0 * d.down.out, n, d.down.out, K);
-            }
-            qi_bias_add(y, d.down.b, Ho * Wo, d.down.out, s_);
+            const int64_t Ho = H / 2, Wo = W / 2, P = Ho * Wo, K = 9 * c;
+            conv::Request r{a16_, H, W, c, d.down.w, d.down.out, 3, 2, 0, 0, 1, 1};
+            r.bias = d.down.b;
+            r.out = y;
+            conv::drive(q_of(s_), r, P, K, col_cap_, false,
+                [&](int64_t p0, int64_t n) { qi_im2col16(a16_, 1, H, W, c, 1, 3, 2, 0, Ho, Wo, p0, n, col16_, s_); },
+                [&](int64_t p0, int64_t n, bool) { gemm_.f16(col16_, d.down.w, y + p0 * d.down.out, n, d.down.out, K); },
+                [&] { qi_bias_add(y, d.down.b, P, d.down.out, s_); });
             x = y;
             fs = 2;
         }

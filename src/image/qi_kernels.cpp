@@ -425,22 +425,63 @@ void qi_im2col16(const uint16_t* in16, int64_t T, int64_t H, int64_t W, int64_t 
     finish(stream, e, "qi_im2col16");
 }
 
-void qi_conv_store16(const float* y, int64_t T, int64_t O, int64_t ldy, const float* bias, QiAct act, float slope,
+void product_store(const ProductStore& p, void* stream) {
+    if (p.rows <= 0 || p.cols <= 0) return;
+    const int64_t is = p.in_stride ? p.in_stride : p.cols, os = p.out_stride ? p.out_stride : p.cols;
+    const auto calculate = [=](float v, int64_t c, uint16_t residual) {
+        if (p.bias) v += p.bias[c];
+        else if (p.add_zero) v += 0.f;
+        v = image_activate(p.act, v, p.slope);
+        if (p.residual) v += p.bf ? kernels::f32_from_bf16(residual) : f32_from_f16(residual);
+        return v;
+    };
+    // Vector loads need every row and offset aligned, including the optional second destination.
+    const auto aligned = [](const void* a, uintptr_t n) { return !a || reinterpret_cast<uintptr_t>(a) % n == 0; };
+    const bool vec = p.cols % 8 == 0 && is % 8 == 0 && os % 8 == 0 && p.offset % 8 == 0 &&
+        (!p.out2 || p.from2 % 8 == 0) && aligned(p.in, 32) && aligned(p.in16, 16) &&
+        aligned(p.residual, 16) && aligned(p.out16, 16) && aligned(p.out2, 16) && aligned(p.out, 32);
+    sycl::event e;
+    if (vec) {
+        e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (p.rows * p.cols / 8)), [=](sycl::id<1> id) {
+            const int64_t k = (int64_t) id[0] * 8, r = k / p.cols, c = k % p.cols;
+            sycl::vec<float, 8> x;
+            if (p.in) x = *reinterpret_cast<const sycl::vec<float, 8>*>(p.in + r * is + c);
+            else {
+                auto h = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(p.in16 + r * is + c);
+                for (int j = 0; j < 8; ++j) x[j] = f32_from_f16(h[j]);
+            }
+            sycl::vec<uint16_t, 8> res(0), out;
+            if (p.residual) res = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(p.residual + k);
+            for (int j = 0; j < 8; ++j) {
+                const float v = calculate(x[j], c + j, res[j]);
+                if (p.out) x[j] = v;
+                if (p.out16 || p.out2) out[j] = p.bf ? kernels::bf16_from_f32(v) : f16_from_f32(v);
+            }
+            if (p.out) *reinterpret_cast<sycl::vec<float, 8>*>(p.out + r * os + p.offset + c) = x;
+            if (p.out16) *reinterpret_cast<sycl::vec<uint16_t, 8>*>(p.out16 + r * os + p.offset + c) = out;
+            if (p.out2 && c >= p.from2) *reinterpret_cast<sycl::vec<uint16_t, 8>*>(p.out2 + r * (p.cols - p.from2) + c - p.from2) = out;
+        });
+    } else {
+        e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (p.rows * p.cols)), [=](sycl::id<1> id) {
+            const int64_t k = (int64_t) id[0], r = k / p.cols, c = k % p.cols;
+            float v = p.in ? p.in[r * is + c] : f32_from_f16(p.in16[r * is + c]);
+            v = calculate(v, c, p.residual ? p.residual[k] : uint16_t{0});
+            if (p.out) p.out[r * os + p.offset + c] = v;
+            const uint16_t h = p.bf ? kernels::bf16_from_f32(v) : f16_from_f32(v);
+            if (p.out16) p.out16[r * os + p.offset + c] = h;
+            if (p.out2 && c >= p.from2) p.out2[r * (p.cols - p.from2) + c - p.from2] = h;
+        });
+    }
+    finish(stream, e, "product_store");
+}
+
+void qi_conv_store16(const float* y, int64_t T, int64_t O, int64_t ldy, const float* bias, ImageAct act, float slope,
                      const uint16_t* res, uint16_t* dst, int64_t ld, int64_t off, void* stream, uint16_t* dst2,
                      int64_t from2) {
-    if (T <= 0 || O <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * O)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t q = i / O, o = i - q * O;
-        float v = y[q * ldy + o] + (bias != nullptr ? bias[o] : 0.f);
-        if (act == QiAct::silu) v = v / (1.f + sycl::exp(-v));
-        else if (act == QiAct::leaky) v = v > 0.f ? v : v * slope;
-        if (res != nullptr) v += f32_from_f16(res[q * O + o]);
-        const uint16_t h = f16_from_f32(v);
-        if (dst != nullptr) dst[q * ld + off + o] = h;
-        if (dst2 != nullptr && o >= from2) dst2[q * (O - from2) + o - from2] = h;
-    });
-    finish(stream, e, "qi_conv_store16");
+    ProductStore p;
+    p.in = y; p.rows = T; p.cols = O; p.in_stride = ldy; p.bias = bias; p.act = act; p.slope = slope;
+    p.residual = res; p.out16 = dst; p.out_stride = ld; p.offset = off; p.out2 = dst2; p.from2 = from2;
+    product_store(p, stream);
 }
 
 namespace {

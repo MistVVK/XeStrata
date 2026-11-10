@@ -7,6 +7,8 @@
 // name ends in 16 (FP16 bits).
 #pragma once
 
+#include "strata/image/product_store.hpp"
+
 #include <cstdint>
 
 namespace strata::image {
@@ -133,9 +135,8 @@ void aux_rope2d_split16(const float* qkv, int64_t N, int64_t heads, int64_t hd, 
 /// aux_rope2d_split16 from FP16 rows (AuxNet::product16's), `bias` [3 heads hd] added where not null.
 void aux_rope2d_split16h(const uint16_t* qkv16, const float* bias, int64_t N, int64_t heads, int64_t hd, int64_t grid,
                          float pscale, float theta, uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream);
-enum class AuxAct { none, relu, gelu, silu, sigmoid, relu6 };
 /// y16 [T][n] = act(x16 + bias[n]) (no bias where null; GELU erf's); y16 may be x16.
-void aux_bias_act16(const uint16_t* x16, const float* bias, int64_t T, int64_t n, AuxAct act, uint16_t* y16,
+void aux_bias_act16(const uint16_t* x16, const float* bias, int64_t T, int64_t n, ImageAct act, uint16_t* y16,
                     void* stream);
 /// y16 [T][n] = y + bias[n] (none where null), FP32 narrowed.
 void aux_narrow_bias16(const float* y, const float* bias, int64_t T, int64_t n, uint16_t* y16, void* stream);
@@ -268,22 +269,28 @@ void aux_mod_select16(const float* src, int64_t T, int64_t R, int64_t C, uint16_
 
 /// dst16 [n][O] (row stride ld, at channel off) = act(y [n][O] + bias) (+ res16 [n][O] after the activation), each of
 /// bias and res16 none where null: a convolution's FP32 sums finished.
-void aux_map_store16(const float* y, int64_t n, int64_t O, const float* bias, AuxAct act, const uint16_t* res16,
+void aux_map_store16(const float* y, int64_t n, int64_t O, const float* bias, ImageAct act, const uint16_t* res16,
                      uint16_t* dst16, int64_t ld, int64_t off, void* stream);
 /// y16 [OH][OW][C] = act(the depthwise k x k convolution of x16 [H][W][C] of stride s and zero padding p by w16
 /// [C][k][k], + bias [C]).
 void aux_dwconv16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, const uint16_t* w16, const float* bias, int k,
-                  int s, int p, int64_t OH, int64_t OW, AuxAct act, uint16_t* y16, void* stream);
+                  int s, int p, int64_t OH, int64_t OW, ImageAct act, uint16_t* y16, void* stream);
 /// The k x k max pool of stride s and padding p (the padding never the maximum) of x16 [H][W][C] to [OH][OW][C].
 void aux_maxpool16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int k, int s, int p, int64_t OH, int64_t OW,
-                   uint16_t* y16, void* stream);
+                   uint16_t* y16, void* stream, int64_t ld = 0, int64_t off = 0, uint16_t* copy = nullptr);
+/// Letterbox RGBA to normalized RGB, or RGB to YOLOX's unnormalized BGR Focus layout.
+void aux_letterbox16(const uint8_t* src, int64_t w, int64_t h, int64_t nw, int64_t nh, int64_t left, int64_t top,
+                     int64_t iw, int64_t ih, float ratio, bool focus, uint16_t* out, void* stream);
+/// Two maps concatenated, with optional nearest-neighbour 2x upsampling of the first.
+void aux_concat2_16(const uint16_t* a, int64_t ca, bool up, const uint16_t* b, int64_t cb, int64_t h, int64_t w,
+                    uint16_t* dst, void* stream);
 /// y16 [OH][OW][C] = x16 [H][W][C] resized bilinearly (torch's interpolate, align_corners as given); `add`: added to
 /// what y16 holds.
 void aux_bilinear16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int64_t OH, int64_t OW, bool align_corners,
                     bool add, uint16_t* y16, void* stream);
 /// A transposed convolution whose kernel is its stride k, from its product y [H W][k][k][O]: y16 [k H][k W][O] =
 /// act(y + bias).
-void aux_deconv_scatter16(const float* y, int64_t H, int64_t W, int64_t k, int64_t O, const float* bias, AuxAct act,
+void aux_deconv_scatter16(const float* y, int64_t H, int64_t W, int64_t k, int64_t O, const float* bias, ImageAct act,
                           uint16_t* y16, void* stream);
 /// dst16 [n][ld] at channels off .. off + C = src16 [n][C] (a concatenation's part).
 void aux_copy_channels16(const uint16_t* src16, int64_t n, int64_t C, uint16_t* dst16, int64_t ld, int64_t off,
@@ -298,7 +305,7 @@ void aux_zero_insert16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int
                        uint16_t* y16, void* stream);
 /// x16 [n][C] instance-normalized in place (each channel by its own mean and variance over the n pixels, no affine,
 /// eps), then act; `st` scratch of 2 C floats.
-void aux_instance_norm16(uint16_t* x16, int64_t n, int64_t C, float eps, AuxAct act, float* st, void* stream);
+void aux_instance_norm16(uint16_t* x16, int64_t n, int64_t C, float eps, ImageAct act, float* st, void* stream);
 /// y16 [H + top + bottom][W + left + right][C] = x16 with zeros around it.
 void aux_pad16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int64_t top, int64_t left, int64_t bottom,
                int64_t right, uint16_t* y16, void* stream);

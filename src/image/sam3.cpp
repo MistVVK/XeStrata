@@ -422,7 +422,7 @@ void Sam3::trunk_from(const uint16_t* pix16) {
         else attention(q16, k16, v16, ws * ws, ws * ws, vit_heads_, hd, C, C, C, a16, nwin);
         product(a16, l.o, y, N, 0, false);
         aux_residual_norm16(x, y, l.o.b, l.n2.w, l.n2.b, G, G, C, win(l), 0, kVitEps, h16, s_);
-        product16(h16, l.fc1, g16, N, true, AuxAct::gelu);
+        product16(h16, l.fc1, g16, N, true, ImageAct::gelu);
         product(g16, l.fc2, y, N, 0, false);
         const VitLayer* next = li + 1 < vit_.size() ? &vit_[li + 1] : nullptr;
         aux_residual_norm16(x, y, l.fc2.b, next ? next->n1.w : nullptr, next ? next->n1.b : nullptr, G, G, C, 0,
@@ -565,7 +565,7 @@ Sam3::Detection Sam3::detect(float score_threshold) {
         attention(q16, kt16, vt16, N, T, heads_, hd, d, d, d, a16);
         product(a16, l.cross.o, h, N, 0, false);
         aux_residual_norm16(x, h, l.cross.o.b, l.n3.w, l.n3.b, G, G, d, 0, 0, kEps, h16, s_);
-        product16(h16, l.fc1, g16, N, true, AuxAct::relu);
+        product16(h16, l.fc1, g16, N, true, ImageAct::relu);
         product(g16, l.fc2, h, N, 0, false);
         aux_residual_norm16(x, h, l.fc2.b, nullptr, nullptr, G, G, d, 0, 0, kEps, nullptr, s_);
     }

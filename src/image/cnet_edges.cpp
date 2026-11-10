@@ -163,7 +163,7 @@ std::vector<uint8_t> HedNet::run(const std::vector<uint8_t>& rgb, int64_t W, int
     cnet_edges_k::Side sides[5];
     for (int b = 0; b < 5; ++b) {
         if (b > 0) x = maxpool(x, 2, 2, 0);
-        for (const MConv& c : convs_[b]) x = AuxMapNet::run(c, x, AuxAct::relu);
+        for (const MConv& c : convs_[b]) x = AuxMapNet::run(c, x, ImageAct::relu);
         const Map s = AuxMapNet::run(proj_[b], x);
         sides[b] = {s.p, s.h, s.w, s.c};
     }
@@ -210,23 +210,23 @@ std::vector<uint8_t> LineartNet::run(const std::vector<uint8_t>& rgb, int64_t W,
     Map x = map(H, W, 8);
     cnet_edges_k::input(q, src, H * W, 1.f / 255.f, nullptr, x.p);
     x = AuxMapNet::run(in_, reflect(x, 3));
-    instance_norm(x, 1e-5f, AuxAct::relu);
+    instance_norm(x, 1e-5f, ImageAct::relu);
     for (const MConv& c : down_) {
         x = AuxMapNet::run(c, x);
-        instance_norm(x, 1e-5f, AuxAct::relu);
+        instance_norm(x, 1e-5f, ImageAct::relu);
     }
     for (const auto& [c1, c2] : res_) {
         Map h = AuxMapNet::run(c1, reflect(x, 1));
-        instance_norm(h, 1e-5f, AuxAct::relu);
+        instance_norm(h, 1e-5f, ImageAct::relu);
         h = AuxMapNet::run(c2, reflect(h, 1));
-        instance_norm(h, 1e-5f, AuxAct::none);
+        instance_norm(h, 1e-5f, ImageAct::none);
         x = add(x, h);
     }
     for (const MConv& c : up_) {   // transposed 3 x 3 of stride 2, padding 1, output padding 1: twice the size
         x = run_deconv_general(c, x, 2, 1, 1);
-        instance_norm(x, 1e-5f, AuxAct::relu);
+        instance_norm(x, 1e-5f, ImageAct::relu);
     }
-    x = AuxMapNet::run(out_, reflect(x, 3), AuxAct::sigmoid);
+    x = AuxMapNet::run(out_, reflect(x, 3), ImageAct::sigmoid);
     auto* line = buf<uint8_t>((size_t) (H * W));
     cnet_edges_k::lines(q, x.p, H * W, x.c, line);
     std::vector<uint8_t> out((size_t) (H * W));
@@ -294,13 +294,13 @@ std::vector<uint8_t> MlsdNet::run(const std::vector<uint8_t>& rgb, int64_t W, in
     Map x = map(H, W, 8);
     cnet_edges_k::mlsd_input(q, src, H * W, x.p);
     // the stride-2 layers pad their right and bottom by one, none on the left and top (as the model was trained)
-    x = AuxMapNet::run(first_, pad(x, 0, 0, 1, 1), AuxAct::relu6);
+    x = AuxMapNet::run(first_, pad(x, 0, 0, 1, 1), ImageAct::relu6);
     std::vector<Map> taps;
     for (size_t i = 0; i < blocks_.size(); ++i) {
         const Inverted& b = blocks_[i];
-        Map h = b.has_expand ? AuxMapNet::run(b.expand, x, AuxAct::relu6) : x;
-        h = AuxMapNet::run(b.dw, b.tf_pad ? pad(h, 0, 0, 1, 1) : h, AuxAct::relu6);
-        x = AuxMapNet::run(b.project, h, AuxAct::none, b.residual ? &x : nullptr);
+        Map h = b.has_expand ? AuxMapNet::run(b.expand, x, ImageAct::relu6) : x;
+        h = AuxMapNet::run(b.dw, b.tf_pad ? pad(h, 0, 0, 1, 1) : h, ImageAct::relu6);
+        x = AuxMapNet::run(b.project, h, ImageAct::none, b.residual ? &x : nullptr);
         if (std::find(taps_.begin(), taps_.end(), (int) i + 1) != taps_.end()) taps.push_back(x);
         if ((int) i + 1 == taps_.back()) break;
     }
@@ -309,15 +309,15 @@ std::vector<uint8_t> MlsdNet::run(const std::vector<uint8_t>& rgb, int64_t W, in
     Map d = taps[4];
     for (int j = 0; j < 4; ++j) {
         const Map& skip = taps[(size_t) (3 - j)];
-        Map deep = AuxMapNet::run(merge_[j].deep, d, AuxAct::relu);
+        Map deep = AuxMapNet::run(merge_[j].deep, d, ImageAct::relu);
         if (merge_[j].up) deep = resize(deep, deep.h * 2, deep.w * 2, true);
-        const Map s2 = AuxMapNet::run(merge_[j].skip, skip, AuxAct::relu);
+        const Map s2 = AuxMapNet::run(merge_[j].skip, skip, ImageAct::relu);
         d = concat({s2, deep});
-        d = AuxMapNet::run(refine_[j].c1, d, AuxAct::relu, &d);
-        d = AuxMapNet::run(refine_[j].c2, d, AuxAct::relu);
+        d = AuxMapNet::run(refine_[j].c1, d, ImageAct::relu, &d);
+        d = AuxMapNet::run(refine_[j].c2, d, ImageAct::relu);
     }
-    d = AuxMapNet::run(dil_, d, AuxAct::relu);
-    d = AuxMapNet::run(c3_, d, AuxAct::relu);
+    d = AuxMapNet::run(dil_, d, ImageAct::relu);
+    d = AuxMapNet::run(c3_, d, ImageAct::relu);
     d = AuxMapNet::run(out_, d);
     // the tri-points map: channel 7 the centres' logits, 8 .. 11 the displacements of the two ends (x, y, x, y)
     const int64_t h = d.h, w = d.w, C = d.c, n = h * w;

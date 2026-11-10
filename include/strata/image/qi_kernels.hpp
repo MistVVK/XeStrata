@@ -8,6 +8,8 @@
 // Activations are FP32 [T, C] row-major; the products' inputs FP16 bits.
 #pragma once
 
+#include "strata/image/product_store.hpp"
+
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -182,8 +184,7 @@ void qi_im2col16(const uint16_t* in16, int64_t T, int64_t H, int64_t W, int64_t 
 /// [O] (null: none), the activation, + res [T][O] (FP16, null: none), into dst [T][ld] from channel `off`, and its
 /// channels from `from2` on also into dst2 [T][O - from2] (null: none).  The detector's (SiLU) and RealESRGAN's
 /// (LeakyReLU of `slope`).
-enum class QiAct { none, silu, leaky };
-void qi_conv_store16(const float* y, int64_t T, int64_t O, int64_t ldy, const float* bias, QiAct act, float slope,
+void qi_conv_store16(const float* y, int64_t T, int64_t O, int64_t ldy, const float* bias, ImageAct act, float slope,
                      const uint16_t* res, uint16_t* dst, int64_t ld, int64_t off, void* stream, uint16_t* dst2 = nullptr,
                      int64_t from2 = 0);
 

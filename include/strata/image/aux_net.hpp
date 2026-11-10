@@ -108,7 +108,7 @@ protected:
     /// (cuBLAS) 0.35 against 0.58 (2026-11-07), and a library's FP16 output can be the slower (oneDNN's in the LLM's
     /// prompt on the B70).
     void product16(const uint16_t* x16, const Lin& l, uint16_t* y16, int64_t T, bool bias = false,
-                   AuxAct act = AuxAct::none);
+                   ImageAct act = ImageAct::none);
     /// y [OH][OW][O] (+= with `add`) = the convolution of x16 [H][W][C] plus its bias; `col_slot` a scratch slot for
     /// the unfolded patches where no library takes it.
     void convolve(const Conv& c, const uint16_t* x16, int64_t H, int64_t W, float* y, int col_slot, bool add = false);
@@ -185,10 +185,10 @@ protected:
     MConv mdeconv(const std::string& w_name, const std::string& b_name, bool general);
 
     /// The convolution of x, its bias and act, plus `res` (a map of the output's shape) after them: a new map.
-    Map run(const MConv& c, const Map& x, AuxAct a = AuxAct::none, const Map* res = nullptr);
-    Map run_deconv(const MConv& c, const Map& x, AuxAct a = AuxAct::none);
-    Map run_deconv_general(const MConv& c, const Map& x, int64_t s, int64_t p, int64_t op, AuxAct a = AuxAct::none);
-    Map act(const Map& x, AuxAct a);
+    Map run(const MConv& c, const Map& x, ImageAct a = ImageAct::none, const Map* res = nullptr);
+    Map run_deconv(const MConv& c, const Map& x, ImageAct a = ImageAct::none);
+    Map run_deconv_general(const MConv& c, const Map& x, int64_t s, int64_t p, int64_t op, ImageAct a = ImageAct::none);
+    Map act(const Map& x, ImageAct a);
     Map add(const Map& a, const Map& b);
     Map reflect(const Map& x, int64_t p);
     Map resize(const Map& x, int64_t oh, int64_t ow, bool align_corners);
@@ -197,7 +197,7 @@ protected:
     Map pad(const Map& x, int64_t top, int64_t left, int64_t bottom, int64_t right);
     /// The maps side by side along the channels (each of the same h and w).
     Map concat(const std::vector<Map>& parts);
-    void instance_norm(Map& x, float eps, AuxAct a);
+    void instance_norm(Map& x, float eps, ImageAct a);
     /// The map's first channel as FP32 on the host (h w values).
     std::vector<float> host_channel0(const Map& x);
 

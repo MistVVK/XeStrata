@@ -4,9 +4,7 @@
 
 #include "strata/image/aux_net.hpp"
 
-#if STRATA_ONEDNN || STRATA_CUDNN
 #include "qi_conv.hpp"
-#endif
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/aux_kernels.hpp"
@@ -33,7 +31,6 @@ std::vector<uint16_t> f16_of(const std::vector<float>& v) {
     return h;
 }
 
-constexpr int64_t kColBytes = 64ll << 20;   // the unfolded patches' slice, where no library takes a convolution
 
 }  // namespace
 
@@ -298,27 +295,27 @@ AuxNet::Lin AuxNet::deconv2(const std::string& name) {
     return l;
 }
 
-void AuxNet::product16(const uint16_t* x16, const Lin& l, uint16_t* y16, int64_t T, bool bias, AuxAct act) {
+void AuxNet::product16(const uint16_t* x16, const Lin& l, uint16_t* y16, int64_t T, bool bias, ImageAct act) {
     const float* b = bias ? l.b : nullptr;
     const auto narrow = [&] {
         float* y = scratch(kNarrowSlot, (size_t) (T * l.n * 4));
         gemm_.f16(x16, l.w, y, T, l.n, l.k);
         aux_narrow_bias16(y, b, T, l.n, y16, s_);
-        if (act != AuxAct::none) aux_bias_act16(y16, nullptr, T, l.n, act, y16, s_);
+        if (act != ImageAct::none) aux_bias_act16(y16, nullptr, T, l.n, act, y16, s_);
     };
     const auto half = [&] {
         gemm_.native_half(x16, 1, l.w, y16, T, l.n, l.k);   // type 1: F16 rows
-        if (b != nullptr || act != AuxAct::none) aux_bias_act16(y16, b, T, l.n, act, y16, s_);
+        if (b != nullptr || act != ImageAct::none) aux_bias_act16(y16, b, T, l.n, act, y16, s_);
     };
     // a library's 1 x 1 convolution: the bias and the activation in its own pass over the sums (oneDNN's post-ops;
     // cuDNN's with ReLU only); false where it does not take the form
     const auto library = [&] {
-        if (act != AuxAct::none && act != AuxAct::relu && act != AuxAct::gelu) return false;   // the forms it takes
+        if (act != ImageAct::none && act != ImageAct::relu && act != ImageAct::gelu) return false;   // the forms it takes
 #if STRATA_ONEDNN || STRATA_CUDNN
         conv::Form f;
         f.y16 = true;
-        if (act == AuxAct::relu) f.leaky = 0.f;
-        f.gelu = act == AuxAct::gelu;
+        if (act == ImageAct::relu) f.leaky = 0.f;
+        f.gelu = act == ImageAct::gelu;
         sycl::queue& q = core::Runtime::get().stream(s_);
 #endif
 #if STRATA_ONEDNN
@@ -364,33 +361,24 @@ void AuxNet::product(const uint16_t* x16, const Lin& l, float* y, int64_t T, int
 }
 
 void AuxNet::convolve(const Conv& c, const uint16_t* x16, int64_t H, int64_t W, float* y, int col_slot, bool add) {
-    const int64_t pad = c.pad, k = c.k, stride = c.stride;
-    const int64_t OH = (H + 2 * pad - k) / stride + 1, OW = (W + 2 * pad - k) / stride + 1;
-    const int64_t P = OH * OW;
-    if (c.k == 1 && c.stride == 1 && c.pad == 0) {
-        gemm_.f16(x16, c.w, y, P, c.o, c.c, 0, false, add);
-        if (c.b != nullptr) qi_bias_add(y, c.b, P, c.o, s_);
-        return;
-    }
-#if STRATA_ONEDNN
-    if (conv::onednn(core::Runtime::get().stream(s_), x16, H, W, c.c, c.w, c.o, c.k, c.stride, c.pad, c.pad, c.pad,
-                     c.pad, c.b, add, y))
-        return;
-#endif
-#if STRATA_CUDNN
-    if (c.stride == 1 && 2 * c.pad + 1 == c.k &&
-        conv::cudnn(core::Runtime::get().stream(s_), x16, H, W, c.c, c.w, c.o, c.k, c.b, add, y))
-        return;
-#endif
-    const int64_t K = (int64_t) c.k * c.k * c.c;
-    const int64_t rows = std::max<int64_t>(1, std::min<int64_t>(P, kColBytes / (K * 2)));
-    auto* col = scratch_as<uint16_t>(col_slot, (size_t) (rows * K));
-    for (int64_t p0 = 0; p0 < P; p0 += rows) {
-        const int64_t n = std::min(rows, P - p0);
-        aux_im2col16(x16, H, W, c.c, c.k, c.stride, c.pad, OW, p0, n, col, s_);
-        gemm_.f16(col, c.w, y + p0 * c.o, n, c.o, K, 0, false, add);
-    }
-    if (c.b != nullptr) qi_bias_add(y, c.b, P, c.o, s_);
+    const int64_t OH = (H + 2 * c.pad - c.k) / c.stride + 1, OW = (W + 2 * c.pad - c.k) / c.stride + 1;
+    const int64_t P = OH * OW, K = (int64_t) c.k * c.k * c.c;
+    sycl::queue& q = core::Runtime::get().stream(s_);
+    const int64_t cap = conv::col_values(q);
+    conv::Request r{x16, H, W, c.c, c.w, c.o, c.k, c.stride, c.pad, c.pad, c.pad, c.pad};
+    r.bias = c.b;
+    r.add = add;
+    r.out = y;
+    uint16_t* col = nullptr;
+    conv::drive(q, r, P, K, cap, c.k == 1 && c.stride == 1 && c.pad == 0,
+        [&](int64_t p0, int64_t n) {
+            if (col == nullptr) col = scratch_as<uint16_t>(col_slot, (size_t) (std::min(P, cap / K) * K));
+            aux_im2col16(x16, H, W, c.c, c.k, c.stride, c.pad, OW, p0, n, col, s_);
+        },
+        [&](int64_t p0, int64_t n, bool point) {
+            gemm_.f16(point ? x16 : col, c.w, y + p0 * c.o, n, c.o, point ? c.c : K, 0, false, add);
+        },
+        [&] { if (c.b != nullptr) qi_bias_add(y, c.b, P, c.o, s_); });
 }
 
 void AuxNet::sync() { gpu::stream_sync(s_); }
@@ -415,6 +403,8 @@ AuxMapNet::MConv AuxMapNet::mconv(const std::string& w_name, const std::string& 
     if (!bn.empty()) {   // the batch norm folded in: w * g / sqrt(v + eps), (b - m) * g / sqrt(v + eps) + beta
         const auto g = host_f32(bn + ".weight"), be = host_f32(bn + ".bias");
         const auto m = host_f32(bn + ".running_mean"), v = host_f32(bn + ".running_var");
+        if ((int64_t) g.size() != out || be.size() != g.size() || m.size() != g.size() || v.size() != g.size() ||
+            (!b.empty() && b.size() != g.size())) throw std::runtime_error(path_ + ": batch norm of another size");
         if (b.empty()) b.assign((size_t) out, 0.f);
         const size_t per = w.size() / (size_t) out;
         for (int64_t o = 0; o < out; ++o) {
@@ -502,7 +492,7 @@ AuxMapNet::MConv AuxMapNet::mdeconv(const std::string& w_name, const std::string
     return c;
 }
 
-AuxMapNet::Map AuxMapNet::run(const MConv& c, const Map& x, AuxAct a, const Map* res) {
+AuxMapNet::Map AuxMapNet::run(const MConv& c, const Map& x, ImageAct a, const Map* res) {
     if (x.c != c.inp)
         throw std::runtime_error(what_ + ": a convolution of " + std::to_string(c.inp) + " inputs on " +
                                  std::to_string(x.c) + " channels");
@@ -516,56 +506,40 @@ AuxMapNet::Map AuxMapNet::run(const MConv& c, const Map& x, AuxAct a, const Map*
         return out;
     }
     const bool plain = c.k == 1 && c.s == 1 && c.pad == 0;
-#if STRATA_ONEDNN || STRATA_CUDNN
-    if (!plain && c.dil == 1) {   // the library's convolution, its bias and a ReLU in its pass where the form allows
-        sycl::queue& q = core::Runtime::get().stream(s_);
-        const bool direct = res == nullptr && (a == AuxAct::none || a == AuxAct::relu);
-        conv::Form f;
-        f.y16 = true;
-        if (a == AuxAct::relu) f.leaky = 0.f;
-        float* y = direct ? nullptr : scratch(kSumSlot, (size_t) (P * c.outp) * 4);
-#if STRATA_ONEDNN
-        if (direct ? conv::onednn(q, x.p, x.h, x.w, c.inp, c.w, c.outp, c.k, c.s, c.pad, c.pad, c.pad, c.pad, c.b,
-                                  false, out.p, f)
-                   : conv::onednn(q, x.p, x.h, x.w, c.inp, c.w, c.outp, c.k, c.s, c.pad, c.pad, c.pad, c.pad, c.b,
-                                  false, y)) {
-            if (!direct) aux_map_store16(y, P, c.outp, nullptr, a, res != nullptr ? res->p : nullptr, out.p, c.outp, 0, s_);
-            return out;
-        }
-#endif
-#if STRATA_CUDNN
-        if (c.s == 1 && 2 * c.pad + 1 == c.k &&
-            (direct ? conv::cudnn(q, x.p, x.h, x.w, c.inp, c.w, c.outp, c.k, c.b, false, out.p, f)
-                    : conv::cudnn(q, x.p, x.h, x.w, c.inp, c.w, c.outp, c.k, c.b, false, y))) {
-            if (!direct) aux_map_store16(y, P, c.outp, nullptr, a, res != nullptr ? res->p : nullptr, out.p, c.outp, 0, s_);
-            return out;
-        }
-#endif
+    const bool direct = res == nullptr && (a == ImageAct::none || a == ImageAct::relu);
+    sycl::queue& q = core::Runtime::get().stream(s_);
+    const int64_t K = (int64_t) c.k * c.k * c.inp, cap = conv::col_values(q);
+    float* y = direct ? nullptr : scratch(kSumSlot, (size_t) (P * c.outp) * 4);
+    conv::Request r{x.p, x.h, x.w, c.inp, c.w, c.outp, c.k, c.s, c.pad, c.pad, c.pad, c.pad};
+    r.dilation = c.dil;
+    r.bias = c.b;
+    r.out = direct ? static_cast<void*>(out.p) : static_cast<void*>(y);
+    if (direct) {
+        r.form.y16 = true;
+        if (a == ImageAct::relu) r.form.leaky = 0.f;
     }
-#endif
-    float* y = scratch(kSumSlot, (size_t) (P * c.outp) * 4);
-    if (plain) {
-        gemm_.f16(x.p, c.w, y, P, c.outp, c.inp);
-    } else if (c.outp <= kConvFewOut && c.dil == 1) {
-        // few outputs (an image's last layer): straight, the unfolded patches' traffic past the product's.  Line
-        // art's 7 x 7 of 64 channels to one at 768 x 512 took the RTX 4070 24 ms unfolded (2026-11-08)
-        aux_conv_few16(x.p, x.h, x.w, c.inp, c.w, c.outp, c.out, c.k, c.s, c.pad, OH, OW, y, s_);
-    } else {   // unfolded a slice of rows at a time
-        const int64_t K = (int64_t) c.k * c.k * c.inp;
-        const int64_t rows = std::max<int64_t>(1, std::min<int64_t>(P, kColBytes / (K * 2)));
-        auto* col = scratch_as<uint16_t>(kColSlot, (size_t) (rows * K));
-        for (int64_t p0 = 0; p0 < P; p0 += rows) {
-            const int64_t n = std::min(rows, P - p0);
+    uint16_t* col = nullptr;
+    // Few outputs: direct beats unfolded traffic.  Line art's 7 x 7 of 64 channels to one at 768 x 512 took the
+    // RTX 4070 24 ms unfolded (2026-11-08).
+    const bool few = !plain && c.outp <= kConvFewOut && c.dil == 1;
+    const auto chosen = conv::drive(q, r, P, K, cap, plain || few,
+        [&](int64_t p0, int64_t n) {
+            if (col == nullptr) col = scratch_as<uint16_t>(kColSlot, (size_t) (std::min(P, cap / K) * K));
             if (c.dil > 1) aux_im2col16_dilated(x.p, x.h, x.w, c.inp, c.k, c.s, c.pad, c.dil, OW, p0, n, col, s_);
             else aux_im2col16(x.p, x.h, x.w, c.inp, c.k, c.s, c.pad, OW, p0, n, col, s_);
-            gemm_.f16(col, c.w, y + p0 * c.outp, n, c.outp, K);
-        }
-    }
-    aux_map_store16(y, P, c.outp, c.b, a, res != nullptr ? res->p : nullptr, out.p, c.outp, 0, s_);
+        },
+        [&](int64_t p0, int64_t n, bool point) {
+            if (y == nullptr) y = scratch(kSumSlot, (size_t) (P * c.outp) * 4);
+            if (few) aux_conv_few16(x.p, x.h, x.w, c.inp, c.w, c.outp, c.out, c.k, c.s, c.pad, OH, OW, y, s_);
+            else gemm_.f16(point ? x.p : col, c.w, y + p0 * c.outp, n, c.outp, point ? c.inp : K);
+        },
+        [&] { aux_map_store16(y, P, c.outp, c.b, a, res != nullptr ? res->p : nullptr, out.p, c.outp, 0, s_); });
+    if (chosen != conv::Library::none && !direct)
+        aux_map_store16(y, P, c.outp, nullptr, a, res != nullptr ? res->p : nullptr, out.p, c.outp, 0, s_);
     return out;
 }
 
-AuxMapNet::Map AuxMapNet::run_deconv(const MConv& c, const Map& x, AuxAct a) {
+AuxMapNet::Map AuxMapNet::run_deconv(const MConv& c, const Map& x, ImageAct a) {
     if (x.c != c.inp) throw std::runtime_error(what_ + ": a transposed convolution on another width");
     float* y = scratch(kSumSlot, (size_t) (x.h * x.w * c.k * c.k * c.outp) * 4);
     gemm_.f16(x.p, c.w, y, x.h * x.w, (int64_t) c.k * c.k * c.outp, c.inp);
@@ -575,7 +549,7 @@ AuxMapNet::Map AuxMapNet::run_deconv(const MConv& c, const Map& x, AuxAct a) {
 }
 
 AuxMapNet::Map AuxMapNet::run_deconv_general(const MConv& c, const Map& x, int64_t s, int64_t p, int64_t op,
-                                             AuxAct a) {
+                                             ImageAct a) {
     const int64_t lo = c.k - 1 - p, hi = c.k - 1 - p + op;
     Map z = map((x.h - 1) * s + 1 + lo + hi, (x.w - 1) * s + 1 + lo + hi, x.c);
     aux_zero_insert16(x.p, x.h, x.w, x.c, s, lo, hi, z.p, s_);
@@ -585,7 +559,7 @@ AuxMapNet::Map AuxMapNet::run_deconv_general(const MConv& c, const Map& x, int64
     return run(plain, z, a);
 }
 
-AuxMapNet::Map AuxMapNet::act(const Map& x, AuxAct a) {
+AuxMapNet::Map AuxMapNet::act(const Map& x, ImageAct a) {
     Map out = map(x.h, x.w, x.c);
     aux_bias_act16(x.p, nullptr, x.h * x.w, x.c, a, out.p, s_);
     return out;
@@ -630,6 +604,10 @@ AuxMapNet::Map AuxMapNet::concat(const std::vector<Map>& parts) {
         C += m.c;
     }
     Map out = map(parts[0].h, parts[0].w, C);
+    if (parts.size() == 2) {
+        aux_concat2_16(parts[0].p, parts[0].c, false, parts[1].p, parts[1].c, out.h, out.w, out.p, s_);
+        return out;
+    }
     int64_t off = 0;
     for (const Map& m : parts) {
         aux_copy_channels16(m.p, m.h * m.w, m.c, out.p, C, off, s_);
@@ -638,7 +616,7 @@ AuxMapNet::Map AuxMapNet::concat(const std::vector<Map>& parts) {
     return out;
 }
 
-void AuxMapNet::instance_norm(Map& x, float eps, AuxAct a) {
+void AuxMapNet::instance_norm(Map& x, float eps, ImageAct a) {
     aux_instance_norm16(x.p, x.h * x.w, x.c, eps, a, buf<float>((size_t) (2 * x.c)), s_);
 }
 

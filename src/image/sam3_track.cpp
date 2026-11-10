@@ -96,7 +96,7 @@ void Sam3::mlp_run(const Mlp& m, const uint16_t* x16, int64_t rows, float* y) {
             product(in, m.l[i], y, rows);
         } else {
             uint16_t* out = h16 + (i % 2) * rows * d_;
-            product16(in, m.l[i], out, rows, true, AuxAct::relu);
+            product16(in, m.l[i], out, rows, true, ImageAct::relu);
             in = out;
         }
     }
@@ -331,7 +331,7 @@ void Sam3::two_way(const MaskDecoder& m, int64_t B, int64_t Nt, float* q, const 
         // the MLP
         {
             auto* h16 = scratch_as<uint16_t>(kSmall16, (size_t) (BT * l.fc1.n));
-            product16(x16, l.fc1, h16, BT, true, AuxAct::relu);
+            product16(x16, l.fc1, h16, BT, true, ImageAct::relu);
             product(h16, l.fc2, y, BT);
             aux_layer_norm(q, y, l.n3.w, l.n3.b, BT, d, kEps, q, nullptr, s_);
         }
@@ -404,7 +404,7 @@ void Sam3::mem_attention(const float* x, const float* pos, const uint16_t* mem16
         // the MLP
         aux_layer_norm(out, nullptr, l.n3.w, l.n3.b, BP, d, kEps, nullptr, n16, s_);
         auto* h16 = scratch_as<uint16_t>(kHid16, (size_t) (BP * l.fc1.n));
-        product16(n16, l.fc1, h16, BP, true, AuxAct::gelu);
+        product16(n16, l.fc1, h16, BP, true, ImageAct::gelu);
         product(h16, l.fc2, y, BP);
         qi_axpy(out, y, 1.f, BP * d, s_);
         host("mem_layer", out, (size_t) (BP * d));
@@ -434,12 +434,12 @@ void Sam3::mask_heads(const MaskDecoder& m, const float* qb, int64_t Nt, const f
     qi_axpy(u1, s1, 1.f, P1 * c1, s_);
     aux_layer_norm(u1, nullptr, m.ln1.w, m.ln1.b, P1, c1, kEps2d, u1, nullptr, s_);
     kernels::f32_to_f16_bulk(u1, u116, P1 * c1, s_);
-    aux_bias_act16(u116, nullptr, P1, c1, AuxAct::gelu, u116, s_);
+    aux_bias_act16(u116, nullptr, P1, c1, ImageAct::gelu, u116, s_);
     product(u116, Lin{m.up2.w, nullptr, m.up2.n, m.up2.k}, up, P1);
     aux_deconv2_scatter(up, 2 * G, 2 * G, c0, m.up2.b, false, u0, nullptr, s_);
     qi_axpy(u0, s0, 1.f, P0 * c0, s_);
     kernels::f32_to_f16_bulk(u0, u016, P0 * c0, s_);
-    aux_bias_act16(u016, nullptr, P0, c0, AuxAct::gelu, u016, s_);
+    aux_bias_act16(u016, nullptr, P0, c0, ImageAct::gelu, u016, s_);
     // each mask token through its mask's hypernetwork (the masks' t-th MLP for the t-th of an object's), then by the
     // upscaled features
     kernels::f32_to_f16_bulk(qb, tok16, Nt * d, s_);
@@ -608,7 +608,7 @@ void Sam3::encode_bucket(const float* pix, const uint16_t* mux16, const std::vec
         aux_dwconv(feat, x.dw, x.dwb, G, G, d, 7, dw, s_);
         aux_layer_norm(dw, nullptr, x.n.w, x.n.b, P, d, kEps2d, nullptr, n16, s_);
         auto* h16 = scratch_as<uint16_t>(kHid16, (size_t) (P * x.pw1.n));
-        product16(n16, x.pw1, h16, P, true, AuxAct::gelu);
+        product16(n16, x.pw1, h16, P, true, ImageAct::gelu);
         product(h16, x.pw2, dw, P);
         aux_scale_add(feat, dw, x.gamma, P, d, s_);
     }
@@ -662,10 +662,10 @@ void Sam3::mask_dense(const float* low, float* out) {
     kernels::f32_to_f16_bulk(low, up16, P0, s_);
     convolve(pe_c0_, up16, 4 * G, 4 * G, c0, kCol);
     aux_layer_norm(c0, nullptr, pe_ln0_.w, pe_ln0_.b, 4 * P, pe_c0_.o, kEps2d, nullptr, c016, s_);
-    aux_bias_act16(c016, nullptr, 4 * P, pe_c0_.o, AuxAct::gelu, c016, s_);
+    aux_bias_act16(c016, nullptr, 4 * P, pe_c0_.o, ImageAct::gelu, c016, s_);
     convolve(pe_c1_, c016, 2 * G, 2 * G, c1, kCol);
     aux_layer_norm(c1, nullptr, pe_ln1_.w, pe_ln1_.b, P, pe_c1_.o, kEps2d, nullptr, c116, s_);
-    aux_bias_act16(c116, nullptr, P, pe_c1_.o, AuxAct::gelu, c116, s_);
+    aux_bias_act16(c116, nullptr, P, pe_c1_.o, ImageAct::gelu, c116, s_);
     product(c116, pe_c2_, out, P);
 }
 
