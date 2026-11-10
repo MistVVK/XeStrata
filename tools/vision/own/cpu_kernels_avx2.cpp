@@ -67,7 +67,7 @@ inline V vexp(V xv) {
 
 // 8 floats rounded to the 16-bit type and back (BF16: integer round to nearest even; F16: the hardware conversion pair, also round to nearest even)
 inline __m256 round8(__m256 x, int kind) {
-    if (kind == 2) return _mm256_cvtph_ps(_mm256_cvtps_ph(x, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    if (kind == 2) return _mm256_cvtph_ps(_mm256_cvtps_ph(x, _MM_FROUND_TO_NEAREST_INT));
     __m256i u = _mm256_castps_si256(x);
     const __m256i lsb = _mm256_and_si256(_mm256_srli_epi32(u, 16), _mm256_set1_epi32(1));
     u = _mm256_add_epi32(u, _mm256_add_epi32(_mm256_set1_epi32(0x7fff), lsb));
