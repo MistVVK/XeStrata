@@ -417,8 +417,16 @@ struct VitGpuImpl {
         const size_t ctx_elems = std::max({N * D, N * K0, (N / 4) * (size_t) g.out_dim});
         bool ok = alloc(d_x, N * D, err, false) && alloc(d_ctx, ctx_elems, err, false) && alloc(d_y, R * std::max<size_t>(3 * D, F), err, false) &&
                   alloc(d_a, R * D, err, false) && alloc(d_f16, R * F, err, false) &&
-                  alloc(d_q16, N * D, err, false) && alloc(d_k16, N * D, err, false) && alloc(d_v16, N * D, err, false) &&
-                  alloc(d_S, sp_elems, err, false);
+                  alloc(d_q16, N * D, err, false) && alloc(d_k16, N * D, err, false) && alloc(d_v16, N * D, err, false);
+        if (ok && !alloc(d_S, sp_elems, err, false)) {
+            // no room for the large chunk (a small card, or the engine beside the reader): the 16 MB chunk instead, slower, never an error
+            ok = false;
+            if (budget != kScoreElems) {
+                err.clear();
+                sp_elems = std::min<size_t>((size_t) g.heads * N * Np, std::max<size_t>(kScoreElems, (size_t) g.heads * Np * 64));
+                ok = alloc(d_S, sp_elems, err, false);
+            }
+        }
         d_out = d_ctx;
         if (!ok) { cap_patches = 0; return false; }
         cap_patches = patches;
@@ -501,6 +509,8 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
     if (const char* e = std::getenv("STRATA_VIT_REF_ROUND")) m.round_out = std::atoi(e) != 0;
     if (const char* e = std::getenv("STRATA_VIT_ROWS")) { const int v = std::atoi(e); if (v >= 16) m.kRows = v; }
     if (const char* e = std::getenv("STRATA_VIT_SCORES")) { const int v = std::atoi(e); if (v >= 1) { m.kScoreElems = (size_t) v << 20; m.scores_env = true; } }
+    // STRATA_VIT_SCORES_LARGE (M elements, a diagnostic): the chunk above 16,384 patches; a size the GPU cannot hold tests the fallback to the default chunk
+    if (const char* e = std::getenv("STRATA_VIT_SCORES_LARGE")) { const long v = std::atol(e); if (v >= 1) m.kScoreElemsLarge = (size_t) v << 20; }
     return m.size_buffers(std::max(max_patches, 16), err);
 }
 
