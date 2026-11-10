@@ -79,6 +79,11 @@ class Apply(unittest.TestCase):
             # the fallback: the reason goes into the warning, then stable-diffusion.cpp's decoder runs (no return)
             self.assertEqual(eng.count('LOG_WARN("strata VAE decoder: %s; using stable-diffusion.cpp\'s decoder", '
                                        'strata_err.c_str());'), 2)
+            # a non-finite picture: the warning says that sd.cpp's decoder (the same f16 operands) may fail the same way
+            self.assertIn('if (strata_err.find("not finite") != std::string::npos)', eng)
+            self.assertIn("using stable-diffusion.cpp's decoder, which may fail the same way", eng)
+            cu = (ROOT / "src" / "image" / "vae" / "wan_vae.cu").read_text(encoding="utf-8")
+            self.assertIn('"wan_vae: the picture has values that are not finite', cu)      # the reason the hook looks for
             self.assertLess(eng.index("return decoded;"), eng.rindex("LOG_WARN"))
             self.assertLess(eng.rindex("LOG_WARN"), eng.index("auto tiling_params"))
             self.assertIn("add_library(strata_vae STATIC", cm)

@@ -71,7 +71,12 @@ DECODE_NEW = """    auto latents                      = first_stage_model->diffu
                          strata_stats.peak_bytes / 1048576.0);
                 return decoded;
             }
-            LOG_WARN("strata VAE decoder: %s; using stable-diffusion.cpp's decoder", strata_err.c_str());
+            if (strata_err.find("not finite") != std::string::npos) {   // sd.cpp's decoder has the same f16 operands
+                LOG_WARN("strata VAE decoder: %s; using stable-diffusion.cpp's decoder, which may fail the same way",
+                         strata_err.c_str());
+            } else {
+                LOG_WARN("strata VAE decoder: %s; using stable-diffusion.cpp's decoder", strata_err.c_str());
+            }
         }
     }
 #endif

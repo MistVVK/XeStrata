@@ -40,8 +40,8 @@ namespace strata::image {
 namespace {
 
 constexpr int PB = 8192;                  // pixels per GEMM band (fixed: see the file comment)
-constexpr float CONV_SCALE = 0.0078125f;  // 2^-7, wan_vae.hpp "Keep large VAE activations within the FP16 range"
-constexpr float CONV_UNSCALE = 128.0f;
+constexpr int CONV_SHIFT = 7;             // inputs x 2^-7: wan_vae.hpp "Keep large VAE activations within the FP16 range"
+constexpr int RANGE_BINS = 258;           // range statistics: 256 float exponents of |scaled input|, zeros, max bits
 constexpr float RMS_EPS = 1e-12f;
 constexpr int Z_DIM = 64;
 
@@ -92,7 +92,8 @@ template <int MODE>
 // own edges; a row outside the window is read as zero too, and the rows that depend on it are never used.
 __global__ void gather_kernel(const float* __restrict__ src, int Hs, int Ws, int C, int H, int W, int k,
                               int64_t p0, int64_t P, const float* __restrict__ inv, const float* __restrict__ gamma,
-                              uint16_t* __restrict__ out, int src_y0, int dst_y0) {
+                              uint16_t* __restrict__ out, int src_y0, int dst_y0, float scale,
+                              unsigned int* __restrict__ hist) {
     const int taps = k * k, c8n = C >> 3;
     const int64_t total = (int64_t) PB * taps * c8n;
     const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -103,7 +104,7 @@ __global__ void gather_kernel(const float* __restrict__ src, int Hs, int Ws, int
     const int64_t pl = rest / taps;
     const int64_t p = p0 + pl;
     uint16_t h[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-    if (p < P) {
+    if (p >= 0 && p < P) {          // rows outside the window (a band's GEMM block reaching past it) stay zero
         const int y = dst_y0 + (int) (p / W), xq = (int) (p % W);
         const int yy = y + tap / k - k / 2, xx = xq + tap % k - k / 2;
         const int ly = (MODE == G_UP2 ? (yy >> 1) : yy) - src_y0;
@@ -119,7 +120,12 @@ __global__ void gather_kernel(const float* __restrict__ src, int Hs, int Ws, int
                 float q = v[i];
                 if (MODE == G_NORM || MODE == G_NORM_SILU) q = (q * r) * gamma[c8 * 8 + i];
                 if (MODE == G_NORM_SILU) q = q / (1.0f + expf(-q));
-                q = q * CONV_SCALE;
+                q = q * scale;                       // an exact power of two (the layer's fixed shift)
+                if (hist) {                          // test-only range statistics (wan_vae_set_range_stats)
+                    const unsigned int b = __float_as_uint(q) & 0x7FFFFFFFu;
+                    atomicAdd(&hist[b ? (b >> 23) : 256], 1u);
+                    atomicMax(&hist[257], b);
+                }
                 h[i] = strata::kernels::f16_from_f32(q);
             }
         }
@@ -134,14 +140,14 @@ __global__ void gather_kernel(const float* __restrict__ src, int Hs, int Ws, int
 
 // dst[p][oc] = ((acc * 2^7 + bias) + res) + dup; dup = the DupUp3D shortcut of x0 [Hs][Ws][C0] for an output of
 // [2Hs][2Ws][OC]: channel (oc*ft*4 + (ft-1)*4 + i*2 + j) / repeats of x0's pixel (Y/2, X/2), i = Y&1, j = X&1.
-__global__ void epilogue_kernel(const float* __restrict__ acc, int OC, int64_t p0, int64_t nvalid,
+__global__ void epilogue_kernel(const float* __restrict__ acc, int OC, int64_t p0, int64_t pl_lo, int64_t nvalid,
                                 const float* __restrict__ bias, const float* res, float* dst, int W,
-                                const float* __restrict__ x0, int C0, int ft, int dst_y0, int x0_y0) {
+                                const float* __restrict__ x0, int C0, int ft, int dst_y0, int x0_y0, float unscale) {
     const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= nvalid * OC) return;
     const int oc = (int) (t % OC);
-    const int64_t pl = t / OC, p = p0 + pl;
-    float v = acc[pl * OC + oc] * CONV_UNSCALE;
+    const int64_t pl = pl_lo + t / OC, p = p0 + pl;
+    float v = acc[pl * OC + oc] * unscale;
     v = v + bias[oc];
     if (res) v = v + res[p * OC + oc];
     if (x0) {
@@ -223,7 +229,13 @@ struct Tensor {
     int64_t P() const { return (int64_t) H * W; }
 };
 
-struct Conv { int ic = 0, oc = 0, k = 0; uint16_t* w = nullptr; float* b = nullptr; };
+struct Conv {
+    int ic = 0, oc = 0, k = 0;
+    int shift = CONV_SHIFT;          // operand = input x 2^-shift (fixed per layer: conv_shift())
+    uint16_t* w = nullptr;
+    float* b = nullptr;
+    std::string name;
+};
 struct Norm { int c = 0; float* g = nullptr; };
 struct Resnet { Norm n1, n2; Conv c1, c2, sc; bool has_sc = false; };
 
@@ -244,6 +256,10 @@ struct WanVae {
     uint16_t* gbuf = nullptr;   // [PB][Kmax] f16
     float* abuf = nullptr;      // [PB][OCmax] f32
     std::function<void(const char*, const float*, int, int, int)> dump;
+    bool range_on = false;      // test-only range statistics (wan_vae_set_range_stats)
+    unsigned int* range_dev = nullptr;
+    std::map<std::string, std::vector<unsigned long long>> range;   // per conv: exponent bins, zeros, max bits, shift
+    int band_rows = 0;          // 0: STREAM_ROWS; other heights only for the identity test (wan_vae_set_band_rows)
     int stream_mode = 1;        // 1 the row-band tail (always, coordinator 11-10); 0 the one-pass reference (tests)
 };
 
@@ -284,6 +300,20 @@ struct Loader {
     }
 };
 
+// The fixed operand shift of each convolution (input x 2^-shift -> f16; output x 2^shift, both exact): stable-
+// diffusion.cpp's 2^-7 everywhere, except the layers listed here.  Fixed per layer, never from the picture's data (a
+// data-dependent scale would differ between a band and the whole picture and break the byte-identity gate).
+// Chosen from the measured ranges (strata-vae-decode --stats over the 16 gate latents, 11-10, Spark; RESULTS-OWN-5):
+// every layer whose largest input came within 16x of the f16 maximum after 2^-7 gets at least 16x headroom.
+//   decoder.up_blocks.4.resnets.0.conv_shortcut: largest input 3.48e6 (1024 p4), 2.4x headroom at shift 7;
+//     shift 11 -> 38.5x.  Share of its nonzero inputs that are f16-subnormal: 0.08% at shift 7, 1.24% at shift 11
+//     (inputs below 2^-3 against a largest input of 3.48e6; their absolute error stays under 2^-14).
+//   Next closest: up_blocks.3.upsampler.resample.1 62.8x, up_blocks.3.resnets.0.conv_shortcut 113x: kept at 7.
+int conv_shift(const std::string& name) {
+    if (name == "decoder.up_blocks.4.resnets.0.conv_shortcut") return 11;
+    return CONV_SHIFT;
+}
+
 std::string load_conv(WanVae* v, Loader& L, const std::string& name, Conv& cv) {
     std::vector<float> w, b;
     std::vector<int64_t> sh;
@@ -292,6 +322,8 @@ std::string load_conv(WanVae* v, Loader& L, const std::string& name, Conv& cv) {
     if (sh.size() != 4 || sh[2] != sh[3] || (sh[2] != 1 && sh[2] != 3) || (int64_t) b.size() != sh[0] || sh[1] % 8 != 0)
         return "wan_vae: " + name + ": unexpected shape";
     cv.oc = (int) sh[0];
+    cv.name = name;
+    cv.shift = conv_shift(name);
     cv.ic = (int) sh[1];
     cv.k = (int) sh[2];
     const int taps = cv.k * cv.k, K = taps * cv.ic;
@@ -357,26 +389,44 @@ std::string conv(WanVae* v, const Conv& cv, const Tensor& src, int mode, const N
     }
     const int K = cv.k * cv.k * cv.ic;
     const float one = 1.f, zero = 0.f;
-    for (int64_t p0 = 0; p0 < P; p0 += PB) {
+    const float scale = std::ldexp(1.0f, -cv.shift), unscale = std::ldexp(1.0f, cv.shift);   // exact powers of two
+    unsigned int* hist = v->range_on ? v->range_dev : nullptr;
+    if (hist) VAE_CUDA(cudaMemsetAsync(hist, 0, RANGE_BINS * sizeof(unsigned int), v->stream));
+    // GEMM blocks of PB pixels on the PICTURE's pixel grid (global pixel k*PB .. (k+1)*PB-1), also for a window of rows:
+    // every pixel then sits in the same row of a same-shape GEMM in the row bands as in the one-pass decode.  hipBLAS
+    // (R9700, 11-10) gives a row a different reduction order at a different row position of the call; cuBLAS did not.
+    const int64_t g0 = (int64_t) dst.y0 * W;   // the window's first pixel in the picture
+    for (int64_t p0 = (g0 / PB) * PB - g0; p0 < P; p0 += PB) {   // p0: the block's first pixel, window-local (<= 0)
         const int64_t total = (int64_t) PB * cv.k * cv.k * (cv.ic / 8);
         const unsigned blocks = (unsigned) ((total + 255) / 256);
         switch (mode) {
-            case G_PLAIN: gather_kernel<G_PLAIN><<<blocks, 256, 0, v->stream>>>(src.d, src.H, src.W, src.C, Hg, W, cv.k, p0, P, inv, nullptr, v->gbuf, src.y0, dst.y0); break;
-            case G_NORM: gather_kernel<G_NORM><<<blocks, 256, 0, v->stream>>>(src.d, src.H, src.W, src.C, Hg, W, cv.k, p0, P, inv, nrm->g, v->gbuf, src.y0, dst.y0); break;
-            case G_NORM_SILU: gather_kernel<G_NORM_SILU><<<blocks, 256, 0, v->stream>>>(src.d, src.H, src.W, src.C, Hg, W, cv.k, p0, P, inv, nrm->g, v->gbuf, src.y0, dst.y0); break;
-            default: gather_kernel<G_UP2><<<blocks, 256, 0, v->stream>>>(src.d, src.H, src.W, src.C, Hg, W, cv.k, p0, P, inv, nullptr, v->gbuf, src.y0, dst.y0); break;
+            case G_PLAIN: gather_kernel<G_PLAIN><<<blocks, 256, 0, v->stream>>>(src.d, src.H, src.W, src.C, Hg, W, cv.k, p0, P, inv, nullptr, v->gbuf, src.y0, dst.y0, scale, hist); break;
+            case G_NORM: gather_kernel<G_NORM><<<blocks, 256, 0, v->stream>>>(src.d, src.H, src.W, src.C, Hg, W, cv.k, p0, P, inv, nrm->g, v->gbuf, src.y0, dst.y0, scale, hist); break;
+            case G_NORM_SILU: gather_kernel<G_NORM_SILU><<<blocks, 256, 0, v->stream>>>(src.d, src.H, src.W, src.C, Hg, W, cv.k, p0, P, inv, nrm->g, v->gbuf, src.y0, dst.y0, scale, hist); break;
+            default: gather_kernel<G_UP2><<<blocks, 256, 0, v->stream>>>(src.d, src.H, src.W, src.C, Hg, W, cv.k, p0, P, inv, nullptr, v->gbuf, src.y0, dst.y0, scale, hist); break;
         }
         VAE_CUDA(cudaGetLastError());
         VAE_BLAS(cublasGemmEx(v->blas, CUBLAS_OP_T, CUBLAS_OP_N, cv.oc, PB, K, &one, cv.w, CUDA_R_16F, K, v->gbuf,
                               CUDA_R_16F, K, &zero, v->abuf, CUDA_R_32F, cv.oc, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-        const int64_t nvalid = (P - p0) < PB ? (P - p0) : PB;
+        const int64_t lo = p0 < 0 ? -p0 : 0;                          // the block's rows inside the window
+        const int64_t nvalid = std::min<int64_t>(PB, P - p0) - lo;
         const int64_t et = nvalid * cv.oc;
         epilogue_kernel<<<(unsigned) ((et + 255) / 256), 256, 0, v->stream>>>(
-            v->abuf, cv.oc, p0, nvalid, cv.b, res, dst.d, W, x0 ? x0->d : nullptr, x0 ? x0->C : 0, ft, dst.y0,
-            x0 ? x0->y0 : 0);
+            v->abuf, cv.oc, p0, lo, nvalid, cv.b, res, dst.d, W, x0 ? x0->d : nullptr, x0 ? x0->C : 0, ft, dst.y0,
+            x0 ? x0->y0 : 0, unscale);
         VAE_CUDA(cudaGetLastError());
     }
     if (inv) v->pool.put(inv);
+    if (hist) {
+        unsigned int h[RANGE_BINS];
+        VAE_CUDA(cudaMemcpyAsync(h, hist, sizeof(h), cudaMemcpyDeviceToHost, v->stream));
+        VAE_CUDA(cudaStreamSynchronize(v->stream));
+        auto& acc = v->range[cv.name];
+        acc.resize(RANGE_BINS + 1, 0);
+        for (int i = 0; i < 257; ++i) acc[i] += h[i];
+        acc[257] = std::max<unsigned long long>(acc[257], h[257]);
+        acc[258] = (unsigned long long) cv.shift;
+    }
     return "";
 }
 
@@ -444,8 +494,9 @@ constexpr int STREAM_HALO = 7;
 
 std::string stream_tail(WanVae* v, const Tensor& x, const Tensor& x0, float* hwc) {
     const int H = x.Hi * 2, W = x.W * 2;
-    for (int o0 = 0; o0 < H; o0 += STREAM_ROWS) {
-        const int o1 = std::min(H, o0 + STREAM_ROWS);
+    const int rows = v->band_rows > 0 ? v->band_rows : STREAM_ROWS;
+    for (int o0 = 0; o0 < H; o0 += rows) {
+        const int o1 = std::min(H, o0 + rows);
         const int a = std::max(0, o0 - STREAM_HALO), b = std::min(H, o1 + STREAM_HALO);
         Tensor u, o;
         VAE_TRY(alloc_t(v, u, b - a, W, v->resample[3].oc, a, H));
@@ -541,6 +592,8 @@ std::string decode_impl(WanVae* v, const float* latent, int h, int w, float* out
     VAE_CUDA(cudaEventElapsedTime(&ms, e0, e1));
     cudaEventDestroy(e0);
     cudaEventDestroy(e1);
+    for (float f : hwc)   // an operand outside the f16 range ends as inf or NaN: the caller falls back instead
+        if (!std::isfinite(f)) return "wan_vae: the picture has values that are not finite (an activation left the f16 range)";
     if (st) {
         st->decode_ms = ms;
         st->weight_bytes = v->weight_bytes;
@@ -649,6 +702,51 @@ void wan_vae_set_streaming(WanVae* v, bool on) {
     if (v) v->stream_mode = on ? 1 : 0;
 }
 
+void wan_vae_set_band_rows(WanVae* v, int rows) {
+    if (v) v->band_rows = rows > 0 ? rows : 0;
+}
+
+std::string wan_vae_set_range_stats(WanVae* v, bool on) {
+    if (!v) return "wan_vae: bad arguments";
+    if (on && !v->range_dev) {
+        void* d = nullptr;
+        VAE_CUDA(cudaMalloc(&d, RANGE_BINS * sizeof(unsigned int)));
+        v->range_dev = (unsigned int*) d;
+    }
+    v->range_on = on;
+    return "";
+}
+
+std::string wan_vae_range_report(WanVae* v) {
+    // per convolution: "name shift max_input nonzero sub(s=7..12)": max_input = the largest |input| before the shift
+    // (exact); sub(s) = the share of nonzero inputs that would be f16 subnormal (|input| x 2^-s < 2^-14) at shift s
+    std::string out;
+    if (!v) return out;
+    char line[512];
+    for (const auto& kv : v->range) {
+        const auto& a = kv.second;
+        const int shift = (int) a[258];
+        unsigned int mb = (unsigned int) a[257];
+        float qmax;
+        std::memcpy(&qmax, &mb, 4);
+        const double xmax = std::ldexp((double) qmax, shift);
+        unsigned long long nz = 0;
+        for (int e = 0; e < 256; ++e) nz += a[e];
+        int n = std::snprintf(line, sizeof(line), "%s shift %d max_input %.6g nonzero %llu zeros %llu headroom_now %.3g",
+                              kv.first.c_str(), shift, xmax, nz, a[256], 65504.0 / (qmax > 0 ? qmax : 1e-30));
+        for (int s = 7; s <= 12; ++s) {
+            // input exponent ex = e - 127 + shift; subnormal at shift s when |input| < 2^(s - 14), i.e. ex < s - 14
+            unsigned long long sub = 0;
+            for (int e = 1; e < 256; ++e)
+                if (e - 127 + shift < s - 14) sub += a[e];
+            n += std::snprintf(line + n, sizeof(line) - n, " sub%d %.3g%%", s, nz ? 100.0 * sub / nz : 0.0);
+        }
+        out += line;
+        out += "\n";
+    }
+    return out;
+}
+
 void wan_vae_set_dump(WanVae* v, std::function<void(const char*, const float*, int, int, int)> dump) {
     if (v) v->dump = std::move(dump);
 }
@@ -658,6 +756,7 @@ void wan_vae_close(WanVae* v) {
     if (v->stream) cudaStreamSynchronize(v->stream);
     v->pool.clear();
     for (void* p : v->weights) cudaFree(p);
+    if (v->range_dev) cudaFree(v->range_dev);
     if (v->blas) cublasDestroy(v->blas);
     if (v->stream) cudaStreamDestroy(v->stream);
     delete v;

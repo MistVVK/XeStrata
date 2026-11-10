@@ -41,6 +41,15 @@ void wan_vae_denormalize(float* latent, int h, int w);
 // off only for the one-pass reference that the byte-identity test compares against.
 void wan_vae_set_streaming(WanVae* vae, bool on);
 
+// Test hook: the row bands `rows` picture rows high instead of the default (0 = default).  The picture must not
+// change with it (tools/image/gate/vae_identity.py checks two other heights against the one-pass decode).
+void wan_vae_set_band_rows(WanVae* vae, int rows);
+
+// Test hooks for the operand ranges: collect, per convolution, the exponents and the largest of its inputs during the
+// next decodes (it does not change any value), and the report (one line per convolution, see wan_vae.cu).
+std::string wan_vae_set_range_stats(WanVae* vae, bool on);
+std::string wan_vae_range_report(WanVae* vae);
+
 // Test hook: called with each stage's output (host copy, pixel-major [H][W][C]) during the next decodes; names as in
 // tools/image/gate/vae_ref.py (conv_in, mid_attn, mid, up0..up4, out).  An empty function turns it off.
 void wan_vae_set_dump(WanVae* vae, std::function<void(const char*, const float*, int, int, int)> dump);

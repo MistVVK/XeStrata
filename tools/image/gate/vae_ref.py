@@ -2,7 +2,8 @@
 stable-diffusion.cpp 2988060 runs it for one picture (src/model/vae/wan_vae.hpp, VERSION_QWEN_IMAGE_2_1, 2D weights).
 
 It is the oracle for our own GPU decoder (src/image/vae): the per-stage values, the activation ranges (what must fit
-the f16 operands), and the f32 picture our decode is measured against besides sd.cpp's own.
+the f16 operands), and the f32 picture our decode is measured against besides sd.cpp's own.  "f16op" uses our decoder's per-layer operand
+shifts (CONV_SHIFTS; shifts=False for sd.cpp's 2^-7 everywhere).
 
 The decoder, pixel-major (HWC, float32): latent (64 ch) -> post_quant_conv 1x1 -> conv_in 3x3 (1152) -> mid block
 (resnet, attention, resnet) -> up_blocks 0..4 (1152, 1152, 576, 288, 144 channels; 3 resnets each; blocks 0-3 end in
@@ -50,6 +51,8 @@ LATENT_STD = [3.2001, 3.2936, 3.4321, 3.0091, 3.1061, 4.0379, 4.0705, 3.7910,
               3.8747, 3.7608, 3.5735, 3.1490, 3.7662, 3.6746, 3.4563, 3.8161]
 
 CONV_SCALE = np.float32(1.0 / 128.0)   # wan_vae.hpp: "Keep large VAE activations within the FP16 convolution range"
+# Strata's decoder (src/image/vae/wan_vae.cu conv_shift) uses other fixed shifts for these layers (f16 headroom)
+CONV_SHIFTS = {"decoder.up_blocks.4.resnets.0.conv_shortcut": 11}
 F16_MAX = 65504.0
 # up block i: (in, out, DupUp factor_t, has upsampler); wan_vae.hpp temperal_upsample {true, true, true, false}
 UP_BLOCKS = [(1152, 1152, 2, True), (1152, 1152, 2, True), (1152, 576, 2, True), (576, 288, 1, True), (288, 144, 1, False)]
@@ -84,9 +87,11 @@ def load_safetensors(path, prefix="") -> dict:
 
 
 class Decoder:
-    def __init__(self, weights: dict, mode: str = "f32", stats: bool = False):
+    def __init__(self, weights: dict, mode: str = "f32", stats: bool = False, shifts: bool = True):
+        """shifts: Strata's per-layer operand shifts (CONV_SHIFTS); False = sd.cpp's 2^-7 everywhere ("f16op" only
+        differs; in "f32" a power-of-two scale is exact)."""
         assert mode in ("f32", "f16op")
-        self.w, self.mode = weights, mode
+        self.w, self.mode, self.shifts = weights, mode, shifts
         self.stats = {} if stats else None
         self.cache = {}
 
@@ -110,11 +115,12 @@ class Decoder:
         """3x3 (pad 1) or 1x1 conv of x [H, W, IC] -> [H, W, OC]; the input scaled by 2^-7 like sd.cpp."""
         wm, k, bias = self._conv_w(name)
         H, W, C = x.shape
-        xs = x * CONV_SCALE
+        scale = np.float32(2.0 ** -CONV_SHIFTS.get(name, 7)) if self.shifts else CONV_SCALE
+        xs = x * scale
         self._note(name + ":in_scaled", xs)
         if self.mode == "f16op":
             if np.abs(xs).max() > F16_MAX:
-                raise OverflowError(f"{name}: conv input exceeds the f16 range after the 2^-7 scale")
+                raise OverflowError(f"{name}: conv input exceeds the f16 range after its scale")
             xs = xs.astype(np.float16).astype(np.float32)
         oc = wm.shape[1]
         out = np.empty((H, W, oc), dtype=np.float32)
@@ -128,7 +134,7 @@ class Decoder:
                 y1 = min(H, y0 + step)
                 cols = np.concatenate([pad[y0 + dy:y1 + dy, dx:dx + W] for dy in range(3) for dx in range(3)], axis=2)
                 out[y0:y1] = (cols.reshape(-1, 9 * C).astype(np.float64) @ wm).reshape(y1 - y0, W, oc)
-        out = out / CONV_SCALE          # x 2^7: exact
+        out = out / scale               # x 2^shift: exact
         out += bias
         return out
 
