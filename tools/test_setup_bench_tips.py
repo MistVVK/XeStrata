@@ -46,17 +46,20 @@ class BenchTips(unittest.TestCase):
         self.assertEqual([t for t in tips(big, ram=96) if "auto:32768" in t], [])
 
     def test_the_32768_tip_is_left_out_where_a_bare_auto_already_takes_it(self):
-        # round 0212: one NVIDIA card of compute capability 8.0+ (arch "86", "120", "121") gets a 32768 ceiling from a bare auto
+        # round 0212: one NVIDIA card of compute capability 8.0+ (arch "86", "120", "121") gets a 32768 ceiling from a bare auto; so does 7.0 (Volta, "70"),
+        # the engine's own rule (nv_chunk_card_ok in include/strata/core/nv_chunk.hpp)
         tip = lambda **k: [t for t in tips(ram=128, **k) if "auto:32768" in t]
-        for arch in ("86", "89", "120", "121"):
+        for arch in ("70", "80", "86", "89", "90", "120", "121"):
             self.assertEqual(tip(gpu={"arch": arch}), [], arch)
-        for arch in ("75", "70", "60", "gfx1201", ""):                  # older cards, AMD, unknown: the tip stays
+        for arch in ("75", "60", "61", "62", "52", "gfx1201", ""):      # Turing, Pascal, older cards, AMD, unknown: the tip stays
             self.assertTrue(tip(gpu={"arch": arch}), arch)
         self.assertTrue(tip())                                           # no GPU information: as before
         self.assertTrue(tip(gpu={"arch": "86"}, env={"STRATA_NV_CHUNK": "0"}))
         self.assertTrue(tip(gpu={"arch": "86"}, env={"STRATA_DEFAULTS": "026"}))
         self.assertTrue(tip(args=[*BASE, "--gpus", "0,1"], gpu={"arch": "86"}))      # a layer split reads 8192-token chunks
         self.assertTrue(tip(args=[*BASE, "--layer-split", "auto"], gpu={"arch": "86"}))
+        self.assertTrue(tip(gpu={"arch": "70"}, env={"STRATA_NV_CHUNK": "0"}))      # Volta follows the same switches and the same layer-split rule
+        self.assertTrue(tip(args=[*BASE, "--gpus", "0,1"], gpu={"arch": "70"}))
 
     def test_resident_headroom_on_small_ram(self):
         res = [*BASE, "--resident-experts"]
