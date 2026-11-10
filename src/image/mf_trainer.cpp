@@ -7,6 +7,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/image/mapped_file.hpp"
+#include "strata/image/qi_stream.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/native_qsa.hpp"
@@ -14,6 +15,7 @@
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -55,6 +57,17 @@ struct Model : MfTrainModel {
     Owned owned;
     prefill::Gemm gemm;
     train::Arena arena;   // the blocks' buffers, kept from block to block and step to step
+    int64_t scratch_rows = 0;   // the most rows a step has had: the arena holds what they took
+    // The blocks' twelve products through a LayerStream (Qwen-Image-2.1's trainer's): as many blocks as the memory
+    // leaves stay in VRAM, the rest are copied in from RAM a block at a time.  Their rows as the products read them
+    // (FP16 from the file's BF16, or an int8 base's rows and scales) are made once at open and kept in RAM; the
+    // pointers of blk's products are set to the block's region as it is used (bind).
+    LayerStream ws;
+    std::vector<std::vector<uint8_t>> whost;
+    std::vector<std::array<uint64_t, 12>> woff;
+    bool int8 = false, stepped = false, budget_stepped = false;
+    int64_t budget_rows = 0;
+    ~Model() { ws.drop(); }
 };
 
 float* dev_dup(Model* m, const float* host, int64_t n) {
@@ -129,6 +142,64 @@ void factorization(int64_t dim, int64_t& m, int64_t& n) {
 
 }  // namespace
 
+namespace {
+
+// Block b's products' pointers in its region `base` (ws.begin's)
+void bind(Model* m, int64_t b, const uint8_t* base) {
+    MfTrainModel::Block& blk = m->blk[(size_t) b];
+    const auto& off = m->woff[(size_t) b];
+    for (int q = 0; q < 2; ++q)
+        for (int i = 0; i < 6; ++i) {
+            MfTrainProduct& pr = blk.prod[q][i];
+            auto* at = const_cast<uint8_t*>(base) + off[(size_t) (q * 6 + i)];
+            if (m->int8) {
+                pr.w8 = reinterpret_cast<int8_t*>(at);
+                pr.sw = reinterpret_cast<float*>(at + pr.N * pr.K);
+                pr.w = nullptr;
+            } else {
+                pr.w = reinterpret_cast<uint16_t*>(at);
+            }
+        }
+}
+
+// The VRAM the blocks' products take (Qwen-Image-2.1's trainer's set_budget), set at open (no rows) and when a step
+// brings more rows than any before, and once after the first step: the free memory and what the products hold now,
+// less the step's own beside them (its boundaries in BF16 at least, the scratch's growth: train::scratch_growth,
+// before a step has shown it a guess of 24 FP32 rows of C a row for the blocks' scratch and the attention's backward;
+// 1.5 GiB of transients, 3 GiB more before the first step).
+// XESTRATA_TRAIN_WEIGHTS_MIB sets it.
+void set_budget(Model* m, int64_t Rj) {
+    if (Rj <= m->budget_rows && m->budget_stepped == m->stepped && m->ws.vram() > 0) return;
+    m->budget_rows = std::max(m->budget_rows, Rj);
+    m->budget_stepped = m->stepped;
+    const int64_t R = m->budget_rows;
+    const uint64_t all = m->ws.total();
+    uint64_t budget = all;
+    if (const char* e = strata::env_get("TRAIN_WEIGHTS_MIB")) {
+        budget = (uint64_t) std::atoll(e) << 20;
+    } else {
+        size_t free_b = 0, total = 0;
+        gpu::stream_sync(m->stream);
+        if (gpu::mem_info(&free_b, &total)) {
+            const uint64_t have = (uint64_t) free_b + m->ws.vram();
+            const uint64_t reserve = (uint64_t) ((m->nblk + 1) * R * m->C) * 2 +
+                                     train::scratch_growth(m->arena.held(), R, m->scratch_rows,
+                                                           (uint64_t) (24 * R * m->C) * 4) +
+                                     (uint64_t{3} << 29) +
+                                     (m->stepped ? 0 : uint64_t{3} << 30);
+            budget = have > reserve ? have - reserve : 0;
+        }
+    }
+    budget = std::min(all, std::max(budget, m->ws.min_budget()));
+    if (budget < all)
+        std::fprintf(stderr, "image engine (Mage-Flow training): the blocks' weights %llu of %llu MiB in VRAM, the "
+                             "rest streamed from RAM\n",
+                     (unsigned long long) (budget >> 20), (unsigned long long) (all >> 20));
+    m->ws.configure(budget, m->stream);
+}
+
+}  // namespace
+
 MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* stream, std::string& err, bool int8) {
     std::unique_ptr<Model> m(new Model());
     m->stream = stream;
@@ -167,14 +238,70 @@ MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* s
             m->mdown_w = dev_dup(m.get(), st.f32("modulation_down.weight").data(), m->mrank * m->C);
             m->mdown_b = dev_dup(m.get(), st.f32("modulation_down.bias").data(), m->mrank);
         }
+        m->int8 = int8;
+        uint16_t* q16 = nullptr;   // an int8 base's rows made on the GPU a product at a time, through these
+        int8_t* q8 = nullptr;
+        float* qs = nullptr;
+        Owned qtmp;
+        int64_t qcap = 0;
         for (int b = 0;; ++b) {
             const std::string p = "transformer_blocks." + std::to_string(b) + ".";
             if (st.find(p + "img_mod.1.weight") == nullptr) break;
             MfTrainModel::Block blk;
-            for (int i = 0; i < 6; ++i) {
-                load_product(m.get(), st, data, p + kTarget[0][i], blk.prod[0][i]);
-                load_product(m.get(), st, data, p + kTarget[1][i], blk.prod[1][i]);
-            }
+            // the products' rows into RAM (FP16, or the int8 base's rows and scales), the biases into VRAM
+            std::vector<std::vector<uint16_t>> h16(12);
+            uint64_t hbytes = 0;
+            for (int q = 0; q < 2; ++q)
+                for (int i = 0; i < 6; ++i) {
+                    const std::string name = p + kTarget[q][i];
+                    const SafeTensor* t = st.find(name + ".weight");
+                    if (t == nullptr || t->dtype != "BF16" || t->shape.size() != 2)
+                        throw std::runtime_error("image engine (Mage-Flow training): " + name +
+                                                 " is not a bf16 matrix");
+                    MfTrainProduct& pr = blk.prod[q][i];
+                    pr.N = t->shape[0];
+                    pr.K = t->shape[1];
+                    const auto* src = reinterpret_cast<const uint16_t*>(data + t->begin);
+                    auto& h = h16[(size_t) (q * 6 + i)];
+                    h.resize((size_t) (pr.N * pr.K));
+                    for (int64_t k = 0; k < pr.N * pr.K; ++k)
+                        h[(size_t) k] = f16_from_f32(dit_rows::bf16_value(src[k]));
+                    pr.b = dev_dup(m.get(), st.f32(name + ".bias").data(), pr.N);
+                    hbytes += int8 ? (uint64_t) (pr.N * pr.K + 4 * pr.N) : (uint64_t) (pr.N * pr.K) * 2;
+                }
+            m->whost.emplace_back((size_t) hbytes);
+            uint8_t* hp = m->whost.back().data();
+            std::vector<LayerStream::Span> spans;
+            for (int q = 0; q < 2; ++q)
+                for (int i = 0; i < 6; ++i) {
+                    const MfTrainProduct& pr = blk.prod[q][i];
+                    const auto& h = h16[(size_t) (q * 6 + i)];
+                    const int64_t n = pr.N * pr.K;
+                    uint64_t bytes = (uint64_t) n * 2;
+                    if (int8) {
+                        if (n > qcap) {
+                            q16 = qtmp.get<uint16_t>(n, stream);
+                            q8 = qtmp.get<int8_t>(n, stream);
+                            qs = qtmp.get<float>(std::max(m->F, 6 * m->C), stream);
+                            qcap = n;
+                        }
+                        gpu::stream_sync(stream);
+                        gpu::copy(q16, h.data(), (size_t) n * 2);
+                        train::w8_quantize(q16, pr.N, pr.K, q8, qs, stream);
+                        gpu::stream_sync(stream);
+                        gpu::copy(hp, q8, (size_t) n);
+                        gpu::copy(hp + n, qs, (size_t) pr.N * 4);
+                        bytes = (uint64_t) (n + 4 * pr.N);
+                    } else {
+                        std::memcpy(hp, h.data(), (size_t) n * 2);
+                    }
+                    spans.push_back({hp, bytes, 0});
+                    hp += bytes;
+                }
+            const int layer = m->ws.add(spans);
+            std::array<uint64_t, 12> off{};
+            for (int k = 0; k < 12; ++k) off[(size_t) k] = m->ws.offset(layer, k);
+            m->woff.push_back(off);
             if (m->mrank > 0) {   // MageTrail's low-rank modulation: each block's FP32 [6 C][rank] from the shared values
                 for (int q = 0; q < 2; ++q) {
                     const std::string n = p + (q == 0 ? "img_mod.1" : "txt_mod.1");
@@ -187,19 +314,6 @@ MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* s
                     blk.mod[q].b = dev_dup(m.get(), st.f32(n + ".bias").data(), blk.mod[q].N);
                 }
             }
-            if (int8)   // the int8 base from the 16-bit rows, which go
-                for (int q = 0; q < 2; ++q)
-                    for (int i = 0; i < 6; ++i) {
-                        MfTrainProduct& pr = blk.prod[q][i];
-                        pr.w8 = m->owned.get<int8_t>(pr.N * pr.K, stream);
-                        pr.sw = m->owned.get<float>(pr.N, stream);
-                        train::w8_quantize(pr.w, pr.N, pr.K, pr.w8, pr.sw, stream);
-                        gpu::stream_sync(stream);
-                        auto& v = m->owned.p;
-                        v.erase(std::remove(v.begin(), v.end(), (void*) pr.w), v.end());
-                        gpu::free(pr.w);
-                        pr.w = nullptr;
-                    }
             if (m->mrank == 0) {
                 load_product(m.get(), st, data, p + "img_mod.1", blk.mod[0]);
                 load_product(m.get(), st, data, p + "txt_mod.1", blk.mod[1]);
@@ -277,6 +391,7 @@ MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* s
         }
         // the modulations' linears stay on the host: one row a step, read once
         (void) data;
+        set_budget(m.get(), 0);
     } catch (const std::exception& e) {
         err = e.what();
         return nullptr;
@@ -487,6 +602,26 @@ struct KeepTmp {
 
 }  // namespace
 
+// Whether this step keeps its blocks' inputs in BF16 (XESTRATA_TRAIN_INPUTS16=0 or 1, or by the memory), as the
+// MOSS-Image trainer does: when the free memory falls short of their FP32 bytes, the arena's growth to this step's Rj
+// rows (in proportion to the most rows so far, 10% over; before a step has shown it, a guess of 12 FP32 rows' worth
+// a boundary row: the attention's backward workspace and a block's products) and 1.5 GiB of transients.  The
+// forward rounds each input to BF16 as it keeps it, so the backward reads what the forward used.
+static bool mf_inputs_half(Model* m, int64_t Rj) {
+    if (const char* e = strata::env_get("TRAIN_INPUTS16")) return std::atoi(e) != 0;
+    size_t free_b = 0, total = 0;
+    gpu::stream_sync(m->stream);
+    if (!gpu::mem_info(&free_b, &total)) return false;
+    const size_t row = (size_t) m->C * 4, held = m->arena.held();
+    const size_t scratch =
+        m->scratch_rows > 0
+            ? (size_t) (1.1 * (double) held * (double) std::max(Rj, m->scratch_rows) / (double) m->scratch_rows)
+            : held + (size_t) (12 * Rj) * row;
+    const size_t need = (size_t) ((m->nblk + 1) * Rj) * row + (scratch > held ? scratch - held : 0) +
+                        (size_t{3} << 29);
+    return free_b < need;
+}
+
 static float forward_impl(Model* m, const MfTrainSample& s, const MfTrainCond& c, const float* eps, float sigma,
                           float* v_pred, MfTrainState* keep, prefill::Gemm& gemm) {
     void* st = m->stream;
@@ -522,16 +657,31 @@ static float forward_impl(Model* m, const MfTrainSample& s, const MfTrainCond& c
     float* txt = tmp.get<float>(Rt * C, st);
     gemm.f16(te16, m->txt_in.w, txt, Rt, C, m->txt_dim);
     dit_rows::rows_back(txt, nullptr, m->txt_in.b, Rt, C, st);
-    // the boundaries: block i reads bounds[i] and writes bounds[i + 1]
+    // the boundaries: block i reads bounds[i] and writes bounds[i + 1]; where the memory is short, in BF16
+    // (mf_inputs_half), two FP32 boundaries passed between and each block's input rounded to BF16 as it is kept
     float* bounds = nullptr;
-    if (keep != nullptr) {
+    uint16_t* bounds16 = nullptr;
+    float* pass = nullptr;   // the forward's two boundaries passed between (BF16, or the forward alone)
+    set_budget(m, Rj);
+    if (keep != nullptr && mf_inputs_half(m, Rj)) {
+        bounds16 = m->owned.get<uint16_t>((m->nblk + 1) * Rj * C, st);
+        keep->bounds16 = bounds16;
+        keep->last = m->owned.get<float>(R * C, st);
+    } else if (keep != nullptr) {
         bounds = m->owned.get<float>((m->nblk + 1) * Rj * C, st);
+        keep->bounds = bounds;
+    }
+    if (bounds == nullptr) pass = tmp.get<float>(2 * Rj * C, st);
+    {
+        float* b0 = bounds != nullptr ? bounds : pass;
         // img/txt are this stream's rows; the copies below run on the compute queue: without the sync they can
         // read ahead of the kernels that wrote them
         gpu::stream_sync(st);
-        if (!gpu::copy(bounds, img, (size_t) R * C * 4) || !gpu::copy(bounds + R * C, txt, (size_t) Rt * C * 4))
+        if (!gpu::copy(b0, img, (size_t) R * C * 4) || !gpu::copy(b0 + R * C, txt, (size_t) Rt * C * 4))
             throw std::runtime_error("image engine (Mage-Flow training): bounds");
-        keep->bounds = bounds;
+        if (bounds16 != nullptr) train::bf16_keep(b0, Rj * C, bounds16, st);
+    }
+    if (keep != nullptr) {
         keep->R = R;
         keep->Rt = Rt;
         keep->x0 = x0;
@@ -541,9 +691,12 @@ static float forward_impl(Model* m, const MfTrainSample& s, const MfTrainCond& c
         v_pred = keep->v_pred;
     }
     // the twelve blocks, joint attention between the streams (the text's rows first)
-    float* bi = img;
-    float* bt = txt;
+    float* bi = bounds != nullptr ? bounds : pass;
+    float* bt = bi + R * C;
     for (int64_t b = 0; b < m->nblk; ++b) {
+        // the next block's products fetched meanwhile; past the last, the backward's second when it follows
+        const int nb = (int) m->nblk;
+        bind(m, b, keep != nullptr ? m->ws.begin((int) b, (int) (b + 1 < nb ? b + 1 : nb - 2)) : m->ws.begin((int) b));
         const MfTrainModel::Block& blk = m->blk[(size_t) b];
         for (int q = 0; q < 2; ++q)
             for (int i = 0; i < 6; ++i) {
@@ -563,8 +716,8 @@ static float forward_impl(Model* m, const MfTrainSample& s, const MfTrainCond& c
         run.txt = bt;
         run.cos = c.cos;
         run.sin = c.sin;
-        float* no = (keep != nullptr) ? bounds + ((size_t) b + 1) * Rj * C : tmp.get<float>(R * C, st);
-        float* nt = (keep != nullptr) ? bounds + ((size_t) b + 1) * Rj * C + R * C : tmp.get<float>(Rt * C, st);
+        float* no = bounds != nullptr ? bounds + ((size_t) b + 1) * Rj * C : pass + ((b + 1) % 2) * Rj * C;
+        float* nt = no + R * C;
         run.out_img = no;
         run.out_txt = nt;
         run.d_out_img = nullptr;
@@ -595,8 +748,15 @@ static float forward_impl(Model* m, const MfTrainSample& s, const MfTrainCond& c
             }
         }
         mf_block(run, gemm, st, &m->arena);
+        m->ws.end((int) b);
+        if (bounds16 != nullptr) train::bf16_keep(no, Rj * C, bounds16 + ((size_t) b + 1) * Rj * C, st);
         bi = no;
         bt = nt;
+    }
+    if (bounds16 != nullptr) {   // the head's input, and the backward's (rounded as kept)
+        gpu::stream_sync(st);
+        if (!gpu::copy(keep->last, bi, (size_t) R * C * 4))
+            throw std::runtime_error("image engine (Mage-Flow training): copy");
     }
     // the output norm and projection to the latent's channels
     float* nsh = tmp.get<float>(R * C, st);
@@ -677,6 +837,12 @@ void mf_trainer_free_state(MfTrainModel* base, MfTrainState& s) {
     drop(s.v_pred);
     drop(s.dv_pred);
     drop(s.bounds);
+    drop(s.last);
+    if (s.bounds16 != nullptr) {
+        auto& v = m->owned.p;
+        v.erase(std::remove(v.begin(), v.end(), (void*) s.bounds16), v.end());
+        gpu::free(s.bounds16);
+    }
     s = MfTrainState();
 }
 
@@ -707,6 +873,7 @@ void mf_trainer_init_adapters(MfTrainModel* base, int method, float alpha, uint6
     for (int64_t b = 0; b < m->nblk; ++b) {
         MfTrainModel::Block& blk = m->blk[(size_t) b];
         if (blk.adap == nullptr) continue;
+        bind(m, b, m->ws.begin((int) b));   // the DoRA norms below read the base's rows
         MfTrainAdapter& tz = *blk.adap;
         tz.method = method == 0 ? train::AdapterMethod::lora : method == 1 ? train::AdapterMethod::dora : train::AdapterMethod::lokr;
         tz.alpha = alpha;
@@ -775,6 +942,7 @@ void mf_trainer_init_adapters(MfTrainModel* base, int method, float alpha, uint6
                 if (!gpu::copy(tz.modA[st], ha.data(), ha.size() * 4))
                     throw std::runtime_error("image engine (Mage-Flow training): copy");
             }
+        m->ws.end((int) b);
     }
     gpu::stream_sync(s);
 }
@@ -891,7 +1059,8 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
     train::dgrad(dv16, dvrs, pout_wt, R, m->in_ch, C, dln, dsums, false, gemm, st);
     float* mean = tmp.get<float>(R, st);
     float* inv = tmp.get<float>(R, st);
-    const float* last = s.bounds + (size_t) m->nblk * Rj * C;   // block 11's output (the image stream)
+    // block 11's output (the image stream)
+    const float* last = s.bounds16 != nullptr ? s.last : s.bounds + (size_t) m->nblk * Rj * C;
     float* nsc = tmp.get<float>(R * C, st);   // the output norm's scale a row (its shift has no gradient here)
     const float* nmod = c.nmod;
     dit_rows::q_of(st).parallel_for(sycl::range<1>((size_t) R * C), [=](sycl::id<1> id) {
@@ -912,7 +1081,12 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
     float* dmod[2] = {mod_on ? tmp.get<float>(6 * C, st) : nullptr, mod_on ? tmp.get<float>(6 * C, st) : nullptr};
     float* mh = mod_on ? tmp.get<float>(az0->rank, st) : nullptr;
     float* mg = mod_on ? tmp.get<float>(az0->rank, st) : nullptr;
+    // the blocks' outputs (their forwards' again: not read) once for all of them, and a BF16 input read back
+    float* bo = tmp.get<float>(R * C, st);
+    float* bt = tmp.get<float>(Rt * C, st);
+    float* xin = s.bounds16 != nullptr ? tmp.get<float>(Rj * C, st) : nullptr;
     for (int64_t b = m->nblk - 1; b >= 0; --b) {
+        bind(m, b, m->ws.begin((int) b, (int) b - 1));   // the block below fetched meanwhile
         const MfTrainModel::Block& blk = m->blk[(size_t) b];
         for (int q = 0; q < 2; ++q)
             for (int i = 0; i < 6; ++i) {
@@ -928,15 +1102,14 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
         run.F = m->F;
         run.rows_img = R;
         run.rows_txt = Rt;
-        run.img = s.bounds + (size_t) b * Rj * C;
-        run.txt = s.bounds + (size_t) b * Rj * C + R * C;
+        if (xin != nullptr) train::bf16_load(s.bounds16 + (size_t) b * Rj * C, Rj * C, xin, st);
+        run.img = xin != nullptr ? xin : s.bounds + (size_t) b * Rj * C;
+        run.txt = run.img + R * C;
         run.cos = c.cos;
         run.sin = c.sin;
         run.out_img = nullptr;   // recomputed inside, read from the tape the forward does not keep: unused
         run.out_txt = nullptr;
-        // the block forwards and backwards in one call; its outputs land in its own Pool, its gradients below
-        float* bo = tmp.get<float>(R * C, st);
-        float* bt = tmp.get<float>(Rt * C, st);
+        // the block forwards and backwards in one call; its outputs land in bo and bt, its gradients below
         run.out_img = bo;
         run.out_txt = bt;
         run.d_out_img = dcur_i;
@@ -975,6 +1148,7 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
             !gpu::memset_async(dnxt_t, 0, (size_t) (Rt * C) * 4, st))
             throw std::runtime_error("image engine (Mage-Flow training): zero");
         mf_block(run, gemm, st, &m->arena);
+        m->ws.end((int) b);
         for (int q = 0; q < 2; ++q) {
             const MfBlockW& bw = q == 0 ? run.img_w : run.txt_w;
             if (bw.dmod == nullptr) continue;
@@ -986,6 +1160,8 @@ void mf_trainer_backward(MfTrainModel* base, const MfTrainSample& smp, const MfT
         std::swap(dcur_t, dnxt_t);
     }
     gpu::stream_sync(st);
+    m->scratch_rows = std::max(m->scratch_rows, Rj);
+    m->stepped = true;
 }
 
 void mf_trainer_adamw(MfTrainModel* base, float lr, float beta1, float beta2, float eps, float wd,

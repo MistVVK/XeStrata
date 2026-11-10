@@ -6,6 +6,7 @@
 #include "strata/image/qi_trainer.hpp"
 #include "strata/image/gelu.hpp"
 #include "strata/image/qi_kernels.hpp"
+#include "strata/image/qi_stream.hpp"
 #include "strata/image/qi_train.hpp"
 #include "strata/image/train_ops.hpp"
 
@@ -57,10 +58,20 @@ struct QiTrainer::Impl {
     prefill::Gemm gemm;
     int64_t C = 0, F = 0, H = 0, ctx = 0, rank = 0;
     struct Block {
-        train::Product p[kQiProducts];
+        train::Product p[kQiProducts];   // N, K (the weights' pointers are set as the block is used: weights_of)
+        uint64_t off[kQiProducts] = {};  // each product's place in the block's region (wstream)
         float *nq = nullptr, *nk = nullptr;
         Lora l[kQiProducts];
     };
+    // The blocks' weights through a LayerStream: as many as the memory leaves stay in VRAM, the rest are copied in
+    // a block at a time from RAM (an int8 base's rows and scales, made once at open and kept in RAM; a 16-bit base's
+    // from the file), the next one while this one computes.  A GPU with the memory keeps them all, as before.
+    LayerStream wstream;
+    std::vector<std::vector<uint8_t>> w8host;   // an int8 base: each block's rows and scales, the stream's source
+    bool int8 = false;
+    int64_t budget_rows = 0;      // the rows the weights' budget was set for (set_budget)
+    bool budget_stepped = false;  // and whether a step had run then
+    int64_t scratch_rows = 0;     // the most rows a step has had: the arena holds what they took
     std::vector<Block> blk;
     uint16_t *iin = nullptr, *tin = nullptr, *tout = nullptr;   // bf16
     float* tnorm = nullptr;                                      // the text norm's weight + 1
@@ -69,6 +80,9 @@ struct QiTrainer::Impl {
     // the step's buffers, grown with the rows
     int64_t cap = 0;
     std::vector<float*> ckpt;   // [blocks + 1][R][C]: each block's input, the last one the DiT's output
+    // where the memory is short (ensure): the inputs in BF16 instead, [blocks + 1][cap][C], ckpt the two FP32 rows'
+    // buffers the forward passes between (the backward reads an input back into the one the head left alone)
+    uint16_t* ckpt16 = nullptr;
     float *tmp_out = nullptr, *dX = nullptr, *dX2 = nullptr, *x0 = nullptr, *nz = nullptr, *pred = nullptr;
     float *dpred = nullptr, *dln = nullptr, *scratch = nullptr, *ln_rs = nullptr, *mean = nullptr, *inv = nullptr;
     float *drs = nullptr, *cos = nullptr, *sin = nullptr;
@@ -193,14 +207,87 @@ struct QiTrainer::Impl {
         gpu::copy(d, v.data(), v.size() * 4);
         return d;
     }
+    // The VRAM the blocks' weights take, set when a step brings more rows than any before (its buffers taken: ensure):
+    // the free memory and what the weights hold now, less the step's own beside them (the blocks' shared scratch's
+    // growth: train::scratch_growth, before a step has shown it 13 FP32 rows of F a row, 2.5 GB at 4,035 rows of
+    // Qwen-Image-2.1 with the MLP in passes of 1,024 rows, the B70, 2026-11-09; 1.5 GiB of transients, 3 GiB more
+    // before the first step, as tapes_kept's) - all of them where that
+    // takes them, else as many as it does and the rest streamed.  XESTRATA_TRAIN_WEIGHTS_MIB sets the budget.
+    void set_budget(int64_t R) {
+        // again after the first step (its reserve for the kernels' first runs given back)
+        if (R <= budget_rows && budget_stepped == stepped) return;
+        budget_rows = std::max(budget_rows, R);
+        R = budget_rows;
+        budget_stepped = stepped;
+        const uint64_t all = wstream.total();
+        uint64_t budget = all;
+        if (const char* e = strata::env_get("TRAIN_WEIGHTS_MIB")) {
+            budget = (uint64_t) std::atoll(e) << 20;
+        } else {
+            size_t free_b = 0, total = 0;
+            gpu::stream_sync(s);
+            if (gpu::mem_info(&free_b, &total)) {
+                const uint64_t have = (uint64_t) free_b + wstream.vram();
+                const uint64_t reserve = train::scratch_growth(arena.held(), R, scratch_rows,
+                                                               (uint64_t) (13 * R * F) * 4) +
+                                         (uint64_t{3} << 29) +
+                                         (stepped ? 0 : uint64_t{3} << 30);
+                budget = have > reserve ? have - reserve : 0;
+            }
+        }
+        budget = std::min(all, std::max(budget, wstream.min_budget()));
+        if (budget < all)
+            std::fprintf(stderr, "image engine (Qwen-Image-2.1 training): the blocks' weights %llu of %llu MiB in "
+                                 "VRAM, the rest streamed from RAM\n",
+                         (unsigned long long) (budget >> 20), (unsigned long long) (all >> 20));
+        wstream.configure(budget, s);
+    }
+    // the products' weights of block b in its region `base` (wstream.begin's)
+    void weights_of(int64_t b, const uint8_t* base, train::Product* p) const {
+        const Block& B = blk[(size_t) b];
+        for (int i = 0; i < kQiProducts; ++i) {
+            p[i] = B.p[i];
+            const uint8_t* at = base + B.off[i];
+            if (int8) {
+                p[i].w8 = reinterpret_cast<const int8_t*>(at);
+                p[i].sw = reinterpret_cast<const float*>(at + B.p[i].N * B.p[i].K);
+            } else {
+                p[i].w = reinterpret_cast<const uint16_t*>(at);
+            }
+        }
+    }
+    // Whether the blocks' inputs go in BF16 (XESTRATA_TRAIN_INPUTS16=0 or 1, or by the memory, decided as the
+    // buffers are taken for more rows): where the free memory and the weights' VRAM fall short of the inputs in FP32,
+    // every block's weights resident, the blocks' scratch (13 FP32 rows of F a row) and 1.5 GiB (3 GiB more before
+    // the first step) - the inputs halved before any weight is streamed, which costs every step its copies.  The
+    // forward rounds each input to BF16 as it keeps it, so the backward reads what the forward used.
+    bool inputs_half(int64_t R) {
+        if (const char* e = strata::env_get("TRAIN_INPUTS16")) return std::atoi(e) != 0;
+        size_t free_b = 0, total = 0;
+        gpu::stream_sync(s);
+        if (!gpu::mem_info(&free_b, &total)) return false;
+        const uint64_t have = (uint64_t) free_b + wstream.vram();
+        const uint64_t need = (uint64_t) ((int64_t) (blk.size() + 1) * R * C) * 4 + wstream.total() +
+                              (uint64_t) (13 * R * F) * 4 + (uint64_t{3} << 29) + (stepped ? 0 : uint64_t{3} << 30);
+        return have < need;
+    }
     void ensure(int64_t R, int64_t hw) {
         if (R <= cap) return;
         for (float* p : ckpt) release(p);
+        release(ckpt16);
+        ckpt16 = nullptr;
         for (void* p : {(void*) tmp_out, (void*) dX, (void*) dX2, (void*) x0, (void*) nz, (void*) pred, (void*) dpred,
                         (void*) dln, (void*) scratch, (void*) ln_rs, (void*) mean, (void*) inv, (void*) drs,
                         (void*) cos, (void*) sin, (void*) xt16, (void*) ln16, (void*) d16})
             release(p);
-        ckpt.assign(blk.size() + 1, nullptr);
+        if (inputs_half(R)) {
+            ckpt.assign(2, nullptr);
+            ckpt16 = get<uint16_t>((int64_t) (blk.size() + 1) * R * C);
+            std::fprintf(stderr, "image engine (Qwen-Image-2.1 training): the blocks' inputs in BF16 (%lld rows)\n",
+                         (long long) R);
+        } else {
+            ckpt.assign(blk.size() + 1, nullptr);
+        }
         for (float*& p : ckpt) p = get<float>(R * C);
         tmp_out = get<float>(R * C);
         dX = get<float>(R * C);
@@ -304,6 +391,7 @@ QiTrainer::QiTrainer() : m_(std::make_unique<Impl>()) {}
 
 QiTrainer::~QiTrainer() {
     if (m_->s != nullptr) gpu::stream_sync(m_->s);
+    m_->wstream.drop();
     m_->tapes.clear();
     if (m_->tape_buf != nullptr) gpu::free(m_->tape_buf);
     for (void* p : m_->owned) gpu::free(p);
@@ -338,24 +426,69 @@ bool QiTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* 
         m.pout_t = m.get<uint16_t>(N * K);
         train::transpose_f16(m.pout, N, K, m.pout_t, stream);
         std::mt19937_64 rng(seed);
+        m.int8 = int8;
+        // an int8 base's rows made on the GPU a product at a time, through these (freed after the blocks)
+        uint16_t* q16 = nullptr;
+        int8_t* q8 = nullptr;
+        float* qs = nullptr;
+        int64_t qcap = 0, scap = 0;
         for (int b = 0;; ++b) {
             const std::string p = "transformer_blocks." + std::to_string(b) + ".";
             if (m.g->find("model.diffusion_model." + p + "attn.to_q.weight") == nullptr) break;
             if (max_blocks > 0 && b >= max_blocks) break;
             Impl::Block blk;
+            std::vector<LayerStream::Span> spans;
+            const TensorInfo* ts[kQiProducts];
+            uint64_t hbytes = 0;
             for (int i = 0; i < kQiProducts; ++i) {
                 train::Product& pr = blk.p[i];
-                pr.w = m.w16(p + kProducts[i] + ".weight", kF16, pr.N, pr.K);
-                if (int8) {   // the int8 base from the 16-bit weight, which goes
-                    auto* q = m.get<int8_t>(pr.N * pr.K);
-                    float* sw = m.get<float>(pr.N);
-                    train::w8_quantize(pr.w, pr.N, pr.K, q, sw, stream);
+                const TensorInfo& t = m.tensor(p + kProducts[i] + ".weight");
+                if (t.type != kF16)
+                    throw std::runtime_error("image engine (Qwen-Image-2.1 training): " + p + kProducts[i] +
+                                             " is not F16 (a 16-bit DiT file is the training's base)");
+                ts[i] = &t;
+                pr.K = (int64_t) t.shape[0];
+                pr.N = t.shape.size() > 1 ? (int64_t) t.shape[1] : 1;
+                hbytes += (uint64_t) (pr.N * pr.K + 4 * pr.N);
+            }
+            if (int8) {   // the int8 base's rows and scales from the 16-bit weight, into RAM
+                m.w8host.emplace_back((size_t) hbytes);
+                uint8_t* h = m.w8host.back().data();
+                for (int i = 0; i < kQiProducts; ++i) {
+                    const train::Product& pr = blk.p[i];
+                    const int64_t n = pr.N * pr.K;
+                    if (n > qcap) {
+                        for (void* x : {(void*) q16, (void*) q8}) m.release(x);
+                        q16 = m.get<uint16_t>(n);
+                        q8 = m.get<int8_t>(n);
+                        qcap = n;
+                    }
+                    if (pr.N > scap) {
+                        m.release(qs);
+                        qs = m.get<float>(pr.N);
+                        scap = pr.N;
+                    }
+                    gpu::copy(q16, m.g->tensor_data(*ts[i]), (size_t) n * 2);
+                    float* sw = qs;
+                    train::w8_quantize(q16, pr.N, pr.K, q8, sw, stream);
+                    if (b == 0 && i < 3) {   // the first block's q, k and v for its unquantized input
+                        m.plain0[i] = m.get<uint16_t>(n);
+                        train::w8_dequant_rows(q8, sw, pr.N, pr.K, m.plain0[i], stream);
+                    }
                     gpu::stream_sync(stream);
-                    m.release(const_cast<uint16_t*>(pr.w));
-                    pr.w = nullptr;
-                    pr.w8 = q;
-                    pr.sw = sw;
+                    gpu::copy(h, q8, (size_t) n);
+                    gpu::copy(h + n, sw, (size_t) pr.N * 4);
+                    spans.push_back({h, (uint64_t) (n + 4 * pr.N), 0});
+                    h += n + 4 * pr.N;
                 }
+            } else {
+                for (int i = 0; i < kQiProducts; ++i)
+                    spans.push_back({m.g->tensor_data(*ts[i]), (uint64_t) (blk.p[i].N * blk.p[i].K) * 2, 0});
+            }
+            const int layer = m.wstream.add(spans);
+            for (int i = 0; i < kQiProducts; ++i) blk.off[i] = m.wstream.offset(layer, i);
+            for (int i = 0; i < kQiProducts; ++i) {
+                train::Product& pr = blk.p[i];
                 Lora& l = blk.l[i];
                 l.N = pr.N;
                 l.K = pr.K;
@@ -383,6 +516,7 @@ bool QiTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* 
             blk.nk = m.dev_vec(m.host_vec(p + "attn.norm_k.weight"));
             m.blk.push_back(blk);
         }
+        for (void* x : {(void*) q16, (void*) q8, (void*) qs}) m.release(x);
         if (m.blk.empty()) throw std::runtime_error("image engine (Qwen-Image-2.1 training): the DiT has no blocks");
         m.F = m.blk[0].p[kQiGateUp].N / 2;
         m.H = m.C / kHead;
@@ -391,14 +525,7 @@ bool QiTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* 
             m.wt[i] = m.get<uint16_t>(m.blk[0].p[i].N * m.blk[0].p[i].K);
             most = std::max(most, m.blk[0].p[i].N * m.blk[0].p[i].K);
         }
-        if (int8) {
-            m.w8tmp = m.get<uint16_t>(most);
-            for (int i = 0; i < 3; ++i) {   // the first block's q, k and v for its unquantized input
-                const train::Product& pr = m.blk[0].p[i];
-                m.plain0[i] = m.get<uint16_t>(pr.N * pr.K);
-                train::w8_dequant_rows(pr.w8, pr.sw, pr.N, pr.K, m.plain0[i], stream);
-            }
-        }
+        if (int8) m.w8tmp = m.get<uint16_t>(most);
         m.e16 = m.get<uint16_t>(2 * kTimeDim);
         m.s16 = m.get<uint16_t>(2 * m.C);
         m.temb = m.get<float>(2 * m.C);
@@ -454,6 +581,7 @@ float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, 
     void* s = m.s;
     const int64_t C = m.C, hw = h * w, nt = m.texts.at((size_t) text).second, R = nt + hw;
     m.ensure(R, hw);
+    m.set_budget(R);
     m.rope(nt, h, w);
     m.modulation(timestep);
     // the noised latent's tokens, x_t = (1 - t) x0 + t noise with t = timestep / 1000 in FP32 (ai-toolkit's
@@ -491,19 +619,26 @@ float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, 
         r.nk = B.nk;
         if (b == 0)
             for (int i = 0; i < 3; ++i) r.w_plain[i] = m.plain0[i];
-        r.x = m.ckpt[(size_t) b];
+        r.x = m.ckpt16 != nullptr ? m.ckpt[(size_t) (b % 2)] : m.ckpt[(size_t) b];
         return r;
     };
+    const bool half = m.ckpt16 != nullptr;
+    const int64_t cap = m.cap;
     const int64_t nb = (int64_t) m.blk.size();
     const int64_t first_kept = nb - m.tapes_kept(run_of(0));
     for (int64_t b = 0; b < nb; ++b) {   // the forward, each block's input kept, the last ones' tapes too
         QiBlockRun r = run_of(b);
-        r.out = m.ckpt[(size_t) b + 1];
+        // the next block's weights fetched meanwhile; past the last, the backward's second (its first is this one)
+        m.weights_of(b, m.wstream.begin((int) b, (int) (b + 1 < nb ? b + 1 : nb - 2)), r.p);
+        if (half && b == 0) train::bf16_keep(m.ckpt[0], R * C, m.ckpt16, s);
+        r.out = half ? m.ckpt[(size_t) ((b + 1) % 2)] : m.ckpt[(size_t) b + 1];
         if (b >= first_kept) r.tape = m.tapes[(size_t) b].get();
         qi_block(r, m.gemm, s, &m.arena);
+        m.wstream.end((int) b);
+        if (half) train::bf16_keep(r.out, R * C, m.ckpt16 + (b + 1) * cap * C, s);
     }
     // the final norm (the image's rows, the t row's scale) and proj_out
-    const float* xf = m.ckpt[(size_t) nb] + nt * C;
+    const float* xf = (half ? m.ckpt[(size_t) (nb % 2)] : m.ckpt[(size_t) nb]) + nt * C;
     dit_rows::rows16(dit_rows::LnMod{xf, m.zero, m.scale_out, C}, hw, C, m.ln16, m.ln_rs, s, m.mean, m.inv);
     m.gemm.f16(m.ln16, m.pout, m.pred, hw, kInCh, C);
     dit_rows::rows_back(m.pred, m.ln_rs, nullptr, hw, kInCh, s);
@@ -524,10 +659,15 @@ float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, 
     // block each step)
     const bool rows_ok = m.gemm.f16_batch_ex_ok();
     for (int64_t b = nb - 1; b >= 0; --b) {
-        const Impl::Block& B = m.blk[(size_t) b];
         QiBlockRun r = run_of(b);
+        if (half) {   // its input read back into the buffer the head did not read
+            float* xin = m.ckpt[(size_t) ((nb + 1) % 2)];
+            train::bf16_load(m.ckpt16 + b * cap * C, R * C, xin, s);
+            r.x = xin;
+        }
+        m.weights_of(b, m.wstream.begin((int) b, (int) b - 1), r.p);   // the block below fetched meanwhile
         for (int i = 0; i < kQiProducts; ++i) {   // the dgrads' weights (an int8 base's straight through)
-            const train::Product& pr = B.p[i];
+            const train::Product pr = r.p[i];
             if (rows_ok) {   // read as they are: the 16-bit weight itself, an int8 base's rotated back
                 if (pr.w8 != nullptr) train::w8_dequant_rows(pr.w8, pr.sw, pr.N, pr.K, m.wt[i], s);
                 r.p[i].wr = pr.w8 != nullptr ? m.wt[i] : pr.w;
@@ -546,10 +686,12 @@ float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, 
         r.dout = m.dX;
         r.dx = b > 0 ? m.dX2 : nullptr;
         qi_block(r, m.gemm, s, &m.arena);
+        m.wstream.end((int) b);
         std::swap(m.dX, m.dX2);
     }
     gpu::stream_sync(s);
     qi_block_profile_report();
+    m.scratch_rows = std::max(m.scratch_rows, R);
     m.stepped = true;
     if (strata::env_get("TRAIN_PROFILE") != nullptr) {   // the memory the step left
         size_t fb = 0, tb = 0, held = 0;

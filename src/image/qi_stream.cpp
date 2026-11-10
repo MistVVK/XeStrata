@@ -411,7 +411,9 @@ int LayerStream::slot_of(int i) const {
 void LayerStream::request(int i) {
     std::lock_guard<std::mutex> lk(mu_);
     if (slot_of(i) >= 0) return;
-    // the slot not holding the layer in use (the one begun last): the two alternate
+    // the slot not holding the layer in use (the one begun last): the two alternate on a walk one way, and a walk that
+    // turns back (a training step's backward after its forward) asks again for a layer whose slot is in use
+    if (in_use_ >= 0 && slots_[next_slot_].layer == in_use_) next_slot_ ^= 1;
     Slot& s = slots_[next_slot_];
     next_slot_ ^= 1;
     s.layer = i;
@@ -495,7 +497,15 @@ void LayerStream::worker() {
 }
 
 const uint8_t* LayerStream::begin(int i) {
+    // the next streamed layer, wrapping to the first streamed one (the DiT's next step)
+    int j = i + 1;
+    if (j >= (int) layers_.size()) j = resident_;
+    return begin(i, j);
+}
+
+const uint8_t* LayerStream::begin(int i, int j) {
     if (i < resident_) {
+        if (j >= resident_ && j < (int) layers_.size()) request(j);   // a streamed one after a resident one
         Layer& l = layers_[(size_t) i];
         if (!l.loaded) load_resident(i);
         return l.d;
@@ -519,6 +529,10 @@ const uint8_t* LayerStream::begin(int i) {
         }
     }
     if (k < 0 || k > 1) throw std::logic_error("image engine (layers): a begun layer has no slot");
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        in_use_ = i;
+    }
     Slot* s = &slots_[k];
     check(gpu::stream_wait_event(compute_, s->ready), "a wait");
     if (prepare_) {
@@ -548,10 +562,7 @@ const uint8_t* LayerStream::begin(int i) {
             }
         }
     }
-    // the next streamed layer, wrapping to the first streamed one (the DiT's next step)
-    int j = i + 1;
-    if (j >= (int) layers_.size()) j = resident_;
-    if (j != i && j >= resident_) request(j);
+    if (j != i && j >= resident_ && j < (int) layers_.size()) request(j);
     return s->d;
 }
 

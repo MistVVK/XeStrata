@@ -162,6 +162,15 @@ void v_scale(const float* v0, int64_t n0, const float* v1, int64_t n1, uint32_t*
 void copy_rows(const float* a, int64_t n, float* out, void* stream);
 void add_into(float* a, const float* b, int64_t n, void* stream);
 void f16_copy(const float* x, int64_t n, uint16_t* y, void* stream);
+/// What a trainer's arena (its blocks' scratch, `held` bytes now) should still grow by for a step of `rows`: in
+/// proportion to the most rows a step has had (`seen`, 0: none yet), 10% over, less what it holds; `guess` before a
+/// step has shown it.  The weights' budgets and the inputs' form read it.
+inline uint64_t scratch_growth(uint64_t held, int64_t rows, int64_t seen, uint64_t guess) {
+    if (seen <= 0) return guess;
+    const uint64_t want = (uint64_t) (1.1 * (double) held * (double) (rows > seen ? rows : seen) / (double) seen);
+    return want > held ? want - held : 0;
+}
+
 /// BF16 rows kept: x rounded to BF16 in place and its bits stored in y (what is read back is what was used), and read
 /// back into FP32, n elements: a trainer's block inputs held at half the memory where the device is short of it.
 void bf16_keep(float* x, int64_t n, uint16_t* y, void* stream);

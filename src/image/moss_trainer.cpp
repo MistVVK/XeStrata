@@ -7,6 +7,7 @@
 #include "strata/image/moss_dit.hpp"
 #include "strata/image/moss_train.hpp"
 #include "strata/image/qi_kernels.hpp"
+#include "strata/image/qi_stream.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/image/mapped_file.hpp"
 
@@ -18,9 +19,11 @@
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -77,6 +80,67 @@ struct MossTrainer::Impl {
     std::vector<std::unique_ptr<train::Arena>> tapes;
     void* tape_buf = nullptr;
     size_t tape_cap = 0;
+    // The blocks' products through a LayerStream (Qwen-Image-2.1's trainer's): as many blocks as the memory leaves
+    // stay in VRAM, the rest are copied in from RAM a block at a time; their rows as the products read them (FP16, or
+    // an int8 base's rows and scales) made once at open and kept in RAM, blk's pointers set as a block is used (bind)
+    LayerStream ws;
+    std::vector<std::vector<uint8_t>> whost;
+    std::vector<std::array<uint64_t, kMossProducts>> woff;
+    bool int8 = false, stepped = false, budget_stepped = false;
+    int64_t budget_rows = 0;
+    void bind(int64_t b, const uint8_t* base) {
+        Block& B = blk[(size_t) b];
+        for (int i = 0; i < kMossProducts; ++i) {
+            train::Product& pr = B.p[i];
+            const uint8_t* at = base + woff[(size_t) b][(size_t) i];
+            if (int8) {
+                pr.w8 = reinterpret_cast<const int8_t*>(at);
+                pr.sw = reinterpret_cast<const float*>(at + pr.N * pr.K);
+            } else {
+                pr.w = reinterpret_cast<const uint16_t*>(at);
+            }
+        }
+    }
+    // The VRAM the products take (Qwen-Image-2.1's trainer's set_budget), at open (no rows), when a step brings more
+    // rows than any before and once after the first step: the free memory and what they hold now, less the step's
+    // own beside them (its blocks' inputs in BF16 at least, the scratch's growth: train::scratch_growth, before a
+    // step has shown it 13 FP32 rows of F a row as Qwen-Image-2.1's; 1.5 GiB of transients, 3 GiB more before the
+    // first step).  XESTRATA_TRAIN_WEIGHTS_MIB sets it.
+    void set_budget(int64_t R) {
+        if (R <= budget_rows && budget_stepped == stepped && ws.vram() > 0) return;
+        budget_rows = std::max(budget_rows, R);
+        budget_stepped = stepped;
+        R = budget_rows;
+        const uint64_t all = ws.total();
+        uint64_t budget = all;
+        if (const char* e = strata::env_get("TRAIN_WEIGHTS_MIB")) {
+            budget = (uint64_t) std::atoll(e) << 20;
+        } else {
+            size_t free_b = 0, total = 0;
+            gpu::stream_sync(s);
+            if (gpu::mem_info(&free_b, &total)) {
+                const uint64_t have = (uint64_t) free_b + ws.vram() + tape_cap;
+                const uint64_t reserve = (uint64_t) ((int64_t) (blk.size() + 1) * R * C) * 2 +
+                                         train::scratch_growth(arena.held(), R, scratch_rows,
+                                                               (uint64_t) (13 * R * F) * 4) +
+                                         (uint64_t{3} << 29) +
+                                         (stepped ? 0 : uint64_t{3} << 30);
+                budget = have > reserve ? have - reserve : 0;
+            }
+        }
+        budget = std::min(all, std::max(budget, ws.min_budget()));
+        if (budget < all)
+            std::fprintf(stderr, "image engine (MOSS-Image training): the blocks' weights %llu of %llu MiB in VRAM, "
+                                 "the rest streamed from RAM\n",
+                         (unsigned long long) (budget >> 20), (unsigned long long) (all >> 20));
+        if (budget < ws.vram() + (all > budget ? ws.min_budget() : 0) && tape_cap > 0) {   // the tapes' room first
+            for (auto& t : tapes) t.reset();
+            gpu::free(tape_buf);
+            tape_buf = nullptr;
+            tape_cap = 0;
+        }
+        ws.configure(budget, s);
+    }
     int64_t scratch_rows = 0;   // the most rows a step has had: the scratch arena holds what they took         // block 0's qkv rotated back (an int8 base's unquantized input)
     // the step's device rows
     uint16_t *e16 = nullptr, *t16 = nullptr;
@@ -102,6 +166,7 @@ struct MossTrainer::Impl {
     }
     ~Impl() {
         if (s != nullptr) gpu::stream_sync(s);
+        ws.drop();
         tapes.clear();
         if (tape_buf != nullptr) gpu::free(tape_buf);
         for (void* q : owned) gpu::free(q);
@@ -281,10 +346,16 @@ bool MossTrainer::open(const std::string& dit, int64_t rank, bool int8, const st
         if (m.smod.N != 6 * m.C || m.hmod.N != 2 * m.C || m.t1.K != kFreq)
             throw std::runtime_error("image engine (MOSS-Image training): an unexpected shape");
         std::mt19937_64 rng(seed);
+        m.int8 = int8;
+        uint16_t* q16 = nullptr;   // an int8 base's rows made on the GPU a product at a time, through these
+        int8_t* q8 = nullptr;
+        float* qs = nullptr;
+        int64_t qcap = 0, scap = 0;
         for (int b = 0;; ++b) {
             const std::string p = "layers." + std::to_string(b) + ".";
             if (!f.has(p + "proj.o.weight")) break;
             Impl::Block blk;
+            std::vector<std::vector<uint8_t>> parts(kMossProducts);   // each product's bytes as the region holds them
             for (int i = 0; i < kMossProducts; ++i) {
                 train::Product& pr = blk.p[i];
                 std::vector<uint16_t> h;
@@ -300,19 +371,51 @@ bool MossTrainer::open(const std::string& dit, int64_t rank, bool int8, const st
                 }
                 pr.N = N;
                 pr.K = K;
-                uint16_t* w = m.get<uint16_t>(N * K);
-                gpu::stream_sync(m.s);
-                if (!gpu::copy(w, h.data(), h.size() * 2)) throw std::runtime_error("copy");
-                pr.w = w;
-                if (int8) {   // the int8 base from the 16-bit rows, which go
-                    auto* q = m.get<int8_t>(N * K);
-                    float* sw = m.get<float>(N);
-                    train::w8_quantize(pr.w, N, K, q, sw, stream);
-                    m.release(w);
-                    pr.w = nullptr;
-                    pr.w8 = q;
-                    pr.sw = sw;
+                auto& part = parts[(size_t) i];
+                if (int8) {   // the int8 base's rows and scales from the 16-bit rows, made on the GPU
+                    if (N * K > qcap) {
+                        for (void* x : {(void*) q16, (void*) q8}) m.release(x);
+                        q16 = m.get<uint16_t>(N * K);
+                        q8 = m.get<int8_t>(N * K);
+                        qcap = N * K;
+                    }
+                    if (N > scap) {
+                        m.release(qs);
+                        qs = m.get<float>(N);
+                        scap = N;
+                    }
+                    gpu::stream_sync(m.s);
+                    if (!gpu::copy(q16, h.data(), h.size() * 2)) throw std::runtime_error("copy");
+                    train::w8_quantize(q16, N, K, q8, qs, stream);
+                    if (b == 0 && i == kMossQkv) {   // block 0's qkv rotated back (its unquantized input)
+                        m.plain0 = m.get<uint16_t>(N * K);
+                        train::w8_dequant_rows(q8, qs, N, K, m.plain0, stream);
+                    }
+                    gpu::stream_sync(m.s);
+                    part.resize((size_t) (N * K + 4 * N));
+                    if (!gpu::copy(part.data(), q8, (size_t) (N * K)) ||
+                        !gpu::copy(part.data() + N * K, qs, (size_t) N * 4))
+                        throw std::runtime_error("copy");
+                } else {
+                    part.resize(h.size() * 2);
+                    std::memcpy(part.data(), h.data(), part.size());
                 }
+            }
+            {
+                uint64_t bytes = 0;
+                for (const auto& part : parts) bytes += part.size();
+                m.whost.emplace_back((size_t) bytes);
+                uint8_t* hp = m.whost.back().data();
+                std::vector<LayerStream::Span> spans;
+                for (const auto& part : parts) {
+                    std::memcpy(hp, part.data(), part.size());
+                    spans.push_back({hp, (uint64_t) part.size(), 0});
+                    hp += part.size();
+                }
+                const int layer = m.ws.add(spans);
+                std::array<uint64_t, kMossProducts> off{};
+                for (int i = 0; i < kMossProducts; ++i) off[(size_t) i] = m.ws.offset(layer, i);
+                m.woff.push_back(off);
             }
             blk.n1 = m.dev_vec(f.f32(p + "norm1.weight"));
             blk.n2 = m.dev_vec(f.f32(p + "norm2.weight"));
@@ -355,12 +458,9 @@ bool MossTrainer::open(const std::string& dit, int64_t rank, bool int8, const st
             m.wt[i] = m.get<uint16_t>(m.blk[0].p[i].N * m.blk[0].p[i].K);
             most = std::max(most, m.blk[0].p[i].N * m.blk[0].p[i].K);
         }
-        if (int8) {
-            m.w8tmp = m.get<uint16_t>(most);
-            const train::Product& pr = m.blk[0].p[kMossQkv];
-            m.plain0 = m.get<uint16_t>(pr.N * pr.K);
-            train::w8_dequant_rows(pr.w8, pr.sw, pr.N, pr.K, m.plain0, stream);
-        }
+        for (void* x : {(void*) q16, (void*) q8, (void*) qs}) m.release(x);
+        if (int8) m.w8tmp = m.get<uint16_t>(most);
+        m.set_budget(0);
         m.e16 = m.get<uint16_t>(kFreq);
         m.t16 = m.get<uint16_t>(2 * m.C);
         m.temb = m.get<float>(m.C);
@@ -400,6 +500,7 @@ float MossTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0, 
     // rows' buffers the forward passes between and the backward reads an input into and writes its output to)
     int64_t first_kept = nb;
     bool half = false;
+    m.set_budget(R);
     if (backward) {
         MossBlockRun z;
         z.C = C;
@@ -499,12 +600,15 @@ float MossTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0, 
     tm.mark("inputs, time, rope", s);
     // forward: every block's input kept for the backward, the last blocks' tapes as the memory takes them
     for (int64_t b = 0; b < nb; ++b) {
+        // the next block's products fetched meanwhile; past the last, the backward's second when it follows
+        m.bind(b, backward ? m.ws.begin((int) b, (int) (b + 1 < nb ? b + 1 : nb - 2)) : m.ws.begin((int) b));
         MossBlockRun r = run_of(b);
         if (b >= first_kept) r.tape = m.tapes[(size_t) b].get();
         if (half && b == 0) train::bf16_keep(bounds, R * C, bounds16, s);
         r.x = all32 ? bounds + b * R * C : bounds + (b % 2) * R * C;
         r.out = all32 ? bounds + (b + 1) * R * C : bounds + ((b + 1) % 2) * R * C;
         moss_block(r, m.gemm, s, &m.arena);
+        m.ws.end((int) b);
         if (half) train::bf16_keep(r.out, R * C, bounds16 + (b + 1) * R * C, s);
     }
     tm.mark("blocks forward", s);
@@ -537,6 +641,7 @@ float MossTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0, 
     dit_rows::rms_affine_bwd(last, inv, m.fnorm, m.head + C, dln, HW, C, dcur, s);
     tm.mark("head backward", s);
     for (int64_t b = nb - 1; b >= 0; --b) {
+        m.bind(b, m.ws.begin((int) b, (int) b - 1));   // the block below fetched meanwhile
         const Impl::Block& B = m.blk[(size_t) b];
         MossBlockRun r = run_of(b);
         for (int i = 0; i < kMossProducts; ++i) {   // the dgrads' weights (an int8 base's straight through)
@@ -557,10 +662,12 @@ float MossTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0, 
         if (b > 0 && !gpu::memset_async(dnxt, 0, (size_t) (R * C) * 4, s))
             throw std::runtime_error("image engine (MOSS-Image training): zero");
         moss_block(r, m.gemm, s, &m.arena);
+        m.ws.end((int) b);
         std::swap(dcur, dnxt);
     }
     gpu::stream_sync(s);
     m.scratch_rows = std::max(m.scratch_rows, R);
+    m.stepped = true;
     tm.mark("blocks backward", s);
     static int64_t n = 0;
     if (tm.on() && ++n % 10 == 0) {   // every 10 steps: the step's stages, then the blocks'

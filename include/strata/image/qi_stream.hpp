@@ -76,6 +76,8 @@ public:
     /// The device region of layer i for work about to be queued on the compute stream (which is made to wait for its
     /// copy), and the next streamed layer's copy started.
     const uint8_t* begin(int i);
+    /// The same with the next layer to fetch given (a walk that turns back: a training step's backward), -1 none.
+    const uint8_t* begin(int i, int next);
     /// The compute stream's work on layer i is queued: its slot (if streamed) may be reused once that work is done.
     void end(int i);
     /// Work queued on the compute stream on a layer's device region once each time it is copied there, before its
@@ -136,6 +138,7 @@ private:
     gpu::Stream compute_ = nullptr, copy_ = nullptr;
     Slot slots_[2];
     int next_slot_ = 0;
+    int in_use_ = -1;   // the streamed layer begun last: its slot is not the one a request takes
     uint8_t* relay_[2] = {};                // slot k's (relay 0 also the resident loads')
     gpu::Event* relay_free_[2] = {};
     std::mutex relay_mu_[2];                // a relay: the worker's fills and the resident loads

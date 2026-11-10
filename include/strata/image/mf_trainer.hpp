@@ -123,6 +123,10 @@ void mf_trainer_free_cond(MfTrainModel* m, MfTrainCond& c);
 struct MfTrainState {
     float *x0 = nullptr, *xe = nullptr, *v_pred = nullptr, *dv_pred = nullptr;
     float* bounds = nullptr;   // [13][tokens + rows][C]: block i reads bounds[i], writes bounds[i + 1]
+    /// Where the device's memory is short: the blocks' inputs as BF16 instead ([13][tokens + rows][C], bounds null),
+    /// and the last block's image rows in FP32 for the head
+    uint16_t* bounds16 = nullptr;
+    float* last = nullptr;
     int64_t R = 0, Rt = 0;
 };
 void mf_trainer_free_state(MfTrainModel* m, MfTrainState& s);
