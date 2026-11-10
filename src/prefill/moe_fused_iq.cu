@@ -1947,14 +1947,16 @@ bool q8d_f16_default(const DevInfo& d) {
 // of leaving the fused path for gather + FP16 dequantize + hipBLASLt (RESULTS-STRIX2.md: 24-29% of the prompt).  It needs the F16 prompt set (STRATA_PF_F16, on by
 // default there), so with STRATA_PF_F16=0 the layers keep the earlier route.  STRATA_PF_FUSED_Q50=0 (or STRATA_GFX1151_DEFAULTS=0) turns it off; =1 turns it on
 // for any gfx1151 build (Linux: opt-in).  gfx12 (RDNA4) keeps its int8 kernel (native_w11_kernel, int8 codes q - 16: its WMMA layout), reached through the same
-// switch: STRATA_PF_FUSED_Q50=1 turns it on there (opt-in; it changes the arithmetic of those layers), =0 / unset leaves the layers on gather + FP16 dequantize + hipBLASLt
-// (phaseA-tests/round0216/rdna4/q50-fused.patch).  The switch means the same on both: 1 on, 0 off, unset = the platform's default.
+// switch.  gfx12 under Linux: ON by default since 0.2.15 (owner 11-10; R9700, UD-IQ4_XS-v31: prompt x1.31 / x1.47 / x1.16 at 4K / 8K / 20K, first-token KL
+// against the FP16 path level with the default's, the neutral-writer forced-token gate PASS, first-8K reads PASS in 64 starts); gfx12 under Windows: opt-in
+// (not measured there).  STRATA_PF_FUSED_Q50=0 keeps the layers on gather + FP16 dequantize + hipBLASLt (the earlier route, kept two releases).
+// The switch means the same everywhere: 1 on, 0 off, unset = the platform's default.
 bool q50_on(const DevInfo& d) {
 #if defined(__HIPCC__)
     if (!d.w12 && !d.g1151) return false;
     static const int env = [] { const char* v = std::getenv("STRATA_PF_FUSED_Q50"); return v == nullptr || v[0] == '\0' ? -1 : (v[0] == '1' ? 1 : 0); }();
     if (env >= 0) return env == 1;
-    if (d.w12) return false;   // gfx12: opt-in (default off)
+    if (d.w12) return strata::core::kGfx12PromptDefaultsOn;   // gfx12: on by default under Linux, opt-in under Windows
 #if defined(_WIN32)
     const char* off = std::getenv("STRATA_GFX1151_DEFAULTS");
     return !(off != nullptr && off[0] == '0');

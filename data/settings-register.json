@@ -25712,9 +25712,9 @@
    "since": "v0.2.12",
    "last_commit": "e77bd43bc9",
    "last_date": "2026-11-06",
-   "status": "research",
+   "status": "rollback",
    "owner": "prefill",
-   "note": "[auto] off unless set, not documented for users",
+   "note": "[OWN-4A 11-10] Q5_0 down layers (UD-IQ4_XS-v31) on the fused prompt kernels: default ON on gfx12 under Linux (0.2.15, owner 11-10) and on gfx1151 under Windows (round 0217); =0 keeps the dequantize + FP16 GEMM route (two releases), =1 turns it on elsewhere (gfx12 Windows, Linux gfx1151)",
    "retire_after": "",
    "retired_in": ""
   },
