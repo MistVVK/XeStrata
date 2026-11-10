@@ -222,20 +222,26 @@ bool own_first(void* stream, Own k, int64_t T, int64_t N, int64_t K, bool measur
     }
     namespace sx = sycl::ext::oneapi::experimental;
     if (!measure || q.ext_oneapi_get_state() == sx::queue_state::recording) return false;
+    // each once first (its kernels' build, the library's load), then the two in turn, the fastest of each kept: the
+    // mean of three runs, one after the other, moved a shape from run to run, and the image with it (the RTX 4070,
+    // Mage-Flow's 1024 x 384 x 384: the library 13.9 or 20.0 TFLOPS from start to start, 2026-11-11)
     double own_s = 0, lib_s = 0;
     const auto time = [&](const std::function<void()>& f) {
         const auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < 3; ++i) f();
+        f();
         q.wait_and_throw();
-        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / 3;
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     };
     try {
         q.wait_and_throw();
-        own();   // each once first: its kernels' build, the library's load
+        own();
         lib();
         q.wait_and_throw();
-        own_s = time(own);
-        lib_s = time(lib);
+        own_s = lib_s = 1e30;
+        for (int i = 0; i < 5; ++i) {
+            own_s = std::min(own_s, time(own));
+            lib_s = std::min(lib_s, time(lib));
+        }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "xestrata: measuring a dense product: %s\n", e.what());
         own_s = lib_s = 0;

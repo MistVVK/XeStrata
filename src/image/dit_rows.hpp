@@ -424,9 +424,13 @@ struct GeluTanh {
 // time through Sylvester's Hadamard butterflies, times 1 / 16, then one scale a row (q8_act.hpp's Mul rule), without
 // FP16 rows and a second pass between: on the RX 9060 XT those two passes were a fifth of MOSS-Image's step
 // (2026-10-29).  A work-group a row, a sub-group of 32 a group of kQiRotate values (8 a lane, in registers), up to G
-// groups each.  A lane holds its 8 values W side by side (value j at (j / W) 32 W + lane W + j % W of the group): its
-// butterflies within the lane over j's bits and across the lanes over lane's, Sylvester's Hadamard matrix whatever W
-// is, and the same int8 values.  Op: raw(t, c), the value before the row's statistic (keep(t, c, v) writes it back
+// groups each.  A lane holds its 8 values W side by side (value j at (j / W) 32 W + lane W + j % W of the group), so a
+// bit of a value's position in the group is a bit of j or of lane by W.  The butterflies go over the position's bits
+// in one order whatever W is (bit_at), within the lane for j's and across the lanes for lane's, and the row's sum of
+// the squares is a tree over the same bits: the int8 values and the scales are the same bits for 1, 4 and 8.  Each
+// sum in the lane's own order before (W 8 its bits 0 to 7, W 1 5, 6, 7, then 0 to 4; the squares a lane at a time)
+// made the images depend on the width rows_i8_width timed (the B70, 2026-11-10: SeedVR2 7B's FP16 file, MOSS-Image
+// and Mage-Flow each two or three images from start to start).  Op: raw(t, c), the value before the row's statistic (keep(t, c, v) writes it back
 // where kKeep); where kRms, inv(sum of the squares) of the row; out(t, c, v, inv), the value given it (none: v).  Or
 // W values at once: raw_w, keep_w, out_w; or with the sub-group, load_sg (a lane's 8 values of a GGUF block, W 8).
 // row_scale(t), where the op has it: the row's own factor on its scale.  An op with kRegular rotates by the regular
@@ -453,6 +457,16 @@ template<class Op, int W, int G = 4> struct RowsI8Of {
         o.template out_w<W>(int64_t{}, int64_t{}, p, 1.f);
     };
     static constexpr bool kRegular = regular_rotation<Op>();
+    // the position's bits in the order the sums take them (W 4's bits of j, then of lane, as before: W 4 kept its
+    // rotation), and where each bit is: a mask of j's, else of lane's
+    static constexpr int kLogW = W == 1 ? 0 : W == 4 ? 2 : 3;
+    static constexpr int bit_at(int st) {
+        constexpr int order[8] = {0, 1, 7, 2, 3, 4, 5, 6};
+        return order[st];
+    }
+    static constexpr int j_mask(int b) { return b < kLogW ? 1 << b : b >= kLogW + 5 ? 1 << (b - 5) : 0; }
+    static constexpr int lane_mask(int b) { return j_mask(b) != 0 ? 0 : 1 << (b - kLogW); }
+    static_assert(V == 8 && SG == 32 && kQiRotate == 256);
     Op op;
     int64_t K, gpr, nsg;
     int8_t* q;
@@ -488,12 +502,28 @@ template<class Op, int W, int G = 4> struct RowsI8Of {
                     if constexpr (Op::kKeep) op.keep(r, k0 + off(j), v[c][j]);
                 }
             }
-            if constexpr (Op::kRms)
+            if constexpr (Op::kRms) {   // the group's sum of the squares, every lane the same tree (a + b == b + a)
+                float sq[V];
 #pragma unroll
-                for (int j = 0; j < V; ++j) ss += v[c][j] * v[c][j];
+                for (int j = 0; j < V; ++j) sq[j] = v[c][j] * v[c][j];
+                int done = 0;   // j's bits summed: the sums left at the j that have none of them
+#pragma unroll
+                for (int st = 0; st < 8; ++st) {
+                    const int b = bit_at(st), m = j_mask(b);
+#pragma unroll
+                    for (int j = 0; j < V; ++j) {
+                        if ((j & done) != 0 || (j & m) != 0) continue;
+                        sq[j] = m != 0 ? sq[j] + sq[j + m] : sq[j] + sycl::permute_group_by_xor(sg, sq[j], lane_mask(b));
+                    }
+                    done |= m;
+                }
+                ss += sq[0];
+            }
         }
         float inv = 1.f;
-        if constexpr (Op::kRms) inv = op.inv(sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>()));
+        // the sub-groups' sums (each lane's the same) once each: the work-group's tree over them whatever W is
+        if constexpr (Op::kRms)
+            inv = op.inv(sycl::reduce_over_group(it.get_group(), lane == 0 ? ss : 0.f, sycl::plus<float>()));
         float amax = 0.f;
 #pragma unroll
         for (int c = 0; c < kMaxG; ++c) {
@@ -510,24 +540,26 @@ template<class Op, int W, int G = 4> struct RowsI8Of {
 #pragma unroll
                 for (int j = 0; j < V; ++j) v[c][j] = op.out(r, k0 + off(j), v[c][j], inv);
             }
-            // Sylvester's butterflies: within the lane over j's bits, across the lanes over lane's
+            // Sylvester's butterflies over the position's bits in bit_at's order: within the lane for j's, across the
+            // lanes for lane's
             auto sylvester = [&] {
 #pragma unroll
-                for (int m = 1; m < V; m <<= 1)
-#pragma unroll
-                    for (int j = 0; j < V; ++j)
-                        if ((j & m) == 0) {
-                            const float a = v[c][j], b = v[c][j + m];
-                            v[c][j] = a + b;
-                            v[c][j + m] = a - b;
-                        }
-#pragma unroll
-                for (int l = 1; l < SG; l <<= 1)
+                for (int st = 0; st < 8; ++st) {
+                    const int b = bit_at(st), m = j_mask(b), l = lane_mask(b);
 #pragma unroll
                     for (int j = 0; j < V; ++j) {
-                        const float o = sycl::permute_group_by_xor(sg, v[c][j], l);
-                        v[c][j] = (lane & l) != 0 ? o - v[c][j] : v[c][j] + o;
+                        if (m != 0) {
+                            if ((j & m) == 0) {
+                                const float a = v[c][j], e = v[c][j + m];
+                                v[c][j] = a + e;
+                                v[c][j + m] = a - e;
+                            }
+                        } else {
+                            const float o = sycl::permute_group_by_xor(sg, v[c][j], l);
+                            v[c][j] = (lane & l) != 0 ? o - v[c][j] : v[c][j] + o;
+                        }
                     }
+                }
             };
             sylvester();
             float norm = 1.f / 16.f;
@@ -635,7 +667,8 @@ struct TimedPairI8 {
 
 // The values a lane holds side by side, the fastest of 8, 4 and 1 on the timing passes once a GPU.  MOSS-Image's step
 // (2026-10-29): the B70 754 ms with 1 (4: 781, 8: 848), the RTX 4070 874 with 4 (1: 876, 8: 979), the RX 9060 XT
-// 1474 with 4 (8: 1479, 1: 1497); the passes took 1, 4 and 8.  The int8 values are the same whichever it is.
+// 1474 with 4 (8: 1479, 1: 1497); the passes took 1, 4 and 8.  The int8 values and the scales are the same bits
+// whichever it is (RowsI8Of's bit_at), so a near tie taken one way or the other from start to start changes no image.
 inline int rows_i8_width(sycl::queue& qu) {
     static core::PerDevice<int> width;
     return width.get(qu.get_device(), [&qu] {

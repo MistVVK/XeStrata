@@ -58,7 +58,6 @@ bool split_reserve(int64_t rows, int64_t n_out, void* stream) {
     return kernels::iq_mmq_split_reserve(Q(stream), kernels::iq_mmq_split_floats(rows, n_out));
 }
 
-void split_release(void* stream) { kernels::iq_mmq_split_release(Q(stream)); }
 
 Context::Context() {}
 Context::~Context() {}

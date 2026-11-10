@@ -567,9 +567,10 @@ struct Kernel {
     float* dst;
     int64_t ld_dst, tiles_m, tiles_n;
     sycl::local_accessor<uint8_t, 1> lm;
-    // K split `ksplit` ways (launch's split_k), kspan values a work-group: each part's sums into part[ks][row][col]
-    // (n_out columns), which reduce_parts adds up in order; null: one part, the sums straight into dst
-    int64_t ksplit = 1, kspan = 0;
+    // K in nch parts of kspan values (launch's), each part's sums into part[ks][row][col] (n_out columns), which launch
+    // adds up in order; ksplit work-groups along K, cpw parts each, one after the other; part null: one part, the sums
+    // straight into dst
+    int64_t ksplit = 1, kspan = 0, nch = 1, cpw = 1;
     float* part = nullptr;
     int64_t total_rows = 0, n_out = 0;
 
@@ -578,9 +579,9 @@ struct Kernel {
         else part[(ks * total_rows + row) * n_out + col] = v;
     }
 
-    void dp4a_body(sycl::nd_item<1> it) const {
+    void dp4a_body(sycl::nd_item<1> it, int64_t ks) const {
         constexpr int lanes = NSG * SG, RSTEP = lanes / WN, RPT = WM / RSTEP;
-        const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, ks = gk % ksplit, per = tiles_m * tiles_n, e = g / per,
+        const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, per = tiles_m * tiles_n, e = g / per,
                       r = g % per;
         const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
         const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
@@ -653,13 +654,13 @@ struct Kernel {
     // column, its element i in row i (Xe's DPAS layout, as flash_attn's selection form takes it; intel_layout_ok checks it at the
     // start), so the scales are applied by element order: asking each element its coordinates cost more than the
     // products there.
-    void intel_body(sycl::nd_item<1> it) const {
+    void intel_body(sycl::nd_item<1> it, int64_t ks) const {
 #if STRATA_IQ_MMQ_INTEL
         constexpr int IM = 8, IK = 32, IN = ISG;
         constexpr int NT = WN / IN, NSUB = NSG * SG / ISG, RG = NSUB / NT, TPS = WM / IM / RG;
         static_assert(NSUB % NT == 0 && (WM / IM) % RG == 0, "the tiles split evenly over the sub-groups");
         constexpr int LDBV = WN * 4;   // a VNNI row: 4 K values of every output
-        const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, ks = gk % ksplit, per = tiles_m * tiles_n, e = g / per,
+        const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, per = tiles_m * tiles_n, e = g / per,
                       r = g % per;
         const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
         const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
@@ -759,6 +760,7 @@ struct Kernel {
             }
 #else
         (void) it;
+        (void) ks;
 #endif
     }
 
@@ -768,10 +770,10 @@ struct Kernel {
     // the B70); a type with a scale per 16 values takes two B tiles, each with the other half zeroed.  The activations'
     // tiles come from global memory or through local memory (below), their scales read by lane (row j ISG + l in
     // lane l) and given to each element by select_from_group.
-    void intel_reg_body(sycl::nd_item<1> it) const {
+    void intel_reg_body(sycl::nd_item<1> it, int64_t ks) const {
 #if STRATA_IQ_MMQ_INTEL
         constexpr int IM = 8, IK = 32, IN = ISG, TPS = WM / IM, XR = (WM + IN - 1) / IN;
-        const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, ks = gk % ksplit, per = tiles_m * tiles_n, e = g / per,
+        const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, per = tiles_m * tiles_n, e = g / per,
                       r = g % per;
         const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
         const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
@@ -864,21 +866,29 @@ struct Kernel {
             }
 #else
         (void) it;
+        (void) ks;
 #endif
     }
 
+    // the work-group's parts of K, one after the other (one: the whole K)
     void body(sycl::nd_item<1> it) const {
+        const int64_t kw = (int64_t) it.get_group(0) % ksplit;
+        for (int64_t ks = kw * cpw; ks < sycl::min(nch, (kw + 1) * cpw); ++ks) part_body(it, ks);
+    }
+
+    void part_body(sycl::nd_item<1> it, int64_t ks) const {
         if constexpr (DP4A) {
-            dp4a_body(it);
+            dp4a_body(it, ks);
         } else if constexpr (IS != 0 && REG) {
-            intel_reg_body(it);
+            intel_reg_body(it, ks);
         } else if constexpr (IS != 0) {
-            intel_body(it);
+            intel_body(it, ks);
         } else if constexpr (!built<TY>()) {
             (void) it;
+            (void) ks;
         } else {
 #if STRATA_IQ_MMQ_MATRIX
-            const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, ks = gk % ksplit, per = tiles_m * tiles_n, e = g / per,
+            const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, per = tiles_m * tiles_n, e = g / per,
                       r = g % per;
             const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
             const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
@@ -999,7 +1009,7 @@ struct Kernel {
             // the accumulator's rows 8 (l / 16) + e.  GFX11: each lane all 16 K values (lanes 16-31 repeat 0-15), the
             // accumulator's rows 2 e + l / 16.  The same products and scales as the joint_matrix body above, in the
             // positions those layouts give.
-            const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, ks = gk % ksplit, per = tiles_m * tiles_n, e = g / per,
+            const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, per = tiles_m * tiles_n, e = g / per,
                       r = g % per;
             const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
             const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
@@ -1121,8 +1131,8 @@ struct Kernel {
     }
 };
 
-// The parts a product's K is split into (iq_mmq_split_set): where one expert's few rows (kIqMmqSplitRows at most)
-// make fewer tiles than the work-groups aimed for (quarters of the compute units), enough to reach them, at most
+// The work-groups a product's K is shared among (iq_mmq_split_set): where one expert's few rows (kIqMmqSplitRows at
+// most) make fewer tiles than the work-groups aimed for (quarters of the compute units), enough to reach them, at most
 // kIqMmqSplitMax and two steps a part.  A prompt's few rows (64 tokens of PLaMo 3 Translate 2B) left the RTX 4070's
 // 46 units mostly idle: 16 tiles of 64 x 128 for a 2560-output product, each running K alone (llama.cpp splits K the
 // same way, its stream-K).  The aim is timed (the units differ: the B70 reports 256 EUs, the RTX 4070 46 SMs; their
@@ -1165,18 +1175,43 @@ sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, si
     const auto* xs = reinterpret_cast<const float*>(x8 + total_rows * w_cols);
     const auto* xu = xs + total_rows * (w_cols / 32);
     const int64_t steps = (w_cols + KC - 1) / KC;
-    int64_t ksplit = split_k(q, n, total_rows, tiles_m * tiles_n, steps);
-    const int64_t kspan = (steps + ksplit - 1) / ksplit * KC;
-    ksplit = (steps * KC + kspan - 1) / kspan;
-    float* part = ksplit > 1 ? part_buffer(q, (size_t) (ksplit * total_rows * w_rows)) : nullptr;
-    if (part == nullptr) ksplit = 1;
+    // One expert's few rows, where the queue holds the parts' buffer: K in the same parts whatever the work-groups
+    // split_k aims for (kIqMmqSplitMax, two steps a part at least), each part's sums from zero and the parts added in
+    // order after, the work-groups along K taking a run of parts each, and a pass of their own adding them (one
+    // work-group as well: adding its second part into dst as it went cost the RTX 4070's products 0.37 ms against
+    // 0.33, the read in the kernels' output; the last of a tile's work-groups adding them, a counter a tile, 0.40
+    // against 0.32, where the B70's took 0.24 against 0.29: the pass costs a short prompt 1-2 ms on the RTX 4070,
+    // Qwen3.5-9B's 52 tokens 1127 -> 1083 tok/s and PLaMo 3 Translate 2B's 64 3810 -> 3372, 2026-11-11).  Two
+    // parts: each part's sums go through memory whatever the aim, and more of them cost more than the work-groups they
+    // let run (Qwen3.5-9B Q4_K_M's FFN gate at 16 and 64 rows, the fastest aim, 2026-11-11: the B70 0.40 ms with 2
+    // parts, 0.43 with 4, 0.46 with 8, and 0.40 before, each work-group its own share; the RTX 4070 0.32, 0.34, 0.40
+    // and 0.33).  Each work-group its own share of K before (as many parts as work-groups) made the sums' order, and
+    // the bits of a prompt's states, follow the aim the plain models' calibration times, which a near tie took one way
+    // or the other from start to start (the RX 9060 XT, 2026-11-10: Mage-Flow's text encoder 0 or 16 quarters, 0.35 ms
+    // each, and another image from the same seed).
+    int64_t nch = 1, kspan = steps * KC, ksplit = 1, cpw = 1;
+    float* part = nullptr;
+    if (n == 1 && total_rows <= kIqMmqSplitRows && steps >= 4) {
+        const int64_t want = std::min<int64_t>(kIqMmqSplitMax, steps / 2);
+        const int64_t span = (steps + want - 1) / want * KC, parts = (steps * KC + span - 1) / span;
+        part = part_buffer(q, (size_t) (parts * total_rows * w_rows));
+        if (part != nullptr) {
+            nch = parts;
+            kspan = span;
+            ksplit = std::min<int64_t>(nch, split_k(q, n, total_rows, tiles_m * tiles_n, steps));
+            cpw = (nch + ksplit - 1) / ksplit;
+            ksplit = (nch + cpw - 1) / cpw;
+        }
+    }
     sycl::event e = q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint8_t, 1> lm(sycl::range<1>((size_t) KT::LOCAL), h);
         const size_t wg = (size_t) KT::LANES;
         KT k{static_cast<const uint8_t*>(w), wtab, woff, expert_bytes, row_bytes, x8, xs, xu, w_cols, bounds, ids, dst,
              ld_dst, tiles_m, tiles_n, lm};
         k.ksplit = ksplit;
-        k.kspan = ksplit > 1 ? kspan : steps * KC;
+        k.kspan = kspan;
+        k.nch = nch;
+        k.cpw = cpw;
         k.part = part;
         k.total_rows = total_rows;
         k.n_out = w_rows;
@@ -1187,7 +1222,7 @@ sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, si
     return q.parallel_for(sycl::range<2>((size_t) total_rows, (size_t) w_rows), [=](sycl::id<2> i) {
         const int64_t row = (int64_t) i[0], col = (int64_t) i[1];
         float v = part[row * w_rows + col];
-        for (int64_t ks = 1; ks < ksplit; ++ks) v += part[(ks * total_rows + row) * w_rows + col];
+        for (int64_t ks = 1; ks < nch; ++ks) v += part[(ks * total_rows + row) * w_rows + col];
         dst[(int64_t) ids[row] * ld_dst + col] = v;
     });
 }
@@ -1692,17 +1727,6 @@ int iq_mmq_split_get(sycl::queue& q) {
     SplitState& st = split_state(q);
     std::lock_guard<std::mutex> lock(st.mu);
     return st.quarters;
-}
-
-void iq_mmq_split_release(sycl::queue& q) {
-    SplitState& st = split_state(q);
-    std::lock_guard<std::mutex> lock(st.mu);
-    const auto it = st.bufs.find(&q);
-    if (it == st.bufs.end()) return;
-    q.wait();
-    sycl::free(it->second.first, q);
-    core::graph_epoch_bump();
-    st.bufs.erase(it);
 }
 
 bool iq_mmq_split_reserve(sycl::queue& q, size_t floats) {

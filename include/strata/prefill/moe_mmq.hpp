@@ -72,12 +72,11 @@ struct Product {
 /// at a few row counts (kernels::iq_mmq_choose_forms): once a GPU and shape, before the first prompt.
 void choose_forms(int ggml_type, int64_t w_rows, int64_t w_cols, int n, void* stream);
 
-/// A one-expert product of few rows split along K (kernels::iq_mmq_split_set): the aim in quarters of the compute
-/// units (0: none), and the parts' buffer the stream reserves for products of up to `rows` rows and `n_out` outputs.
+/// A one-expert product of few rows with K in parts (kernels::iq_mmq_split_set): the aim in quarters of the compute
+/// units (0: one work-group along K), and the parts' buffer the stream reserves for products of up to `rows` rows and `n_out` outputs.
 void split_set(int quarters, void* stream);
 int split_get(void* stream);
 bool split_reserve(int64_t rows, int64_t n_out, void* stream);
-void split_release(void* stream);
 
 /// The launch context.  One per prompt path.
 class Context {

@@ -421,7 +421,7 @@ void PlainModel::prompt_dense_calibrate() {
         if (it != chosen.of.end()) {
             dense_native_rows_ = it->second.rows;
             dense_half_sums_ = it->second.half;
-            if (it->second.split > 0 && prompt_split_reserve()) prefill::mmq::split_set(it->second.split, cs_);
+            if (prompt_split_reserve()) prefill::mmq::split_set(it->second.split, cs_);
             return;
         }
     }
@@ -453,7 +453,8 @@ void PlainModel::prompt_dense_calibrate() {
             pg.identity = true;
         }
         // the int8 products of few rows split along K (prefill::mmq::split_set): none, or aiming at 2, 4, 8 or 16
-        // quarters of the compute units, timed at 16 and 64 rows (their sum), the fastest kept; the aim differs by
+        // quarters of the compute units (the same sums whichever: K's parts are the product's own), timed at 16 and
+        // 64 rows (their sum), the fastest kept; the aim differs by
         // GPU and model (PLaMo 3 Translate's 64-token prompt: the RTX 4070 best at 16 quarters for the 2B, the B70 at
         // 2, where its 0.8B lost at 4 and more, 2026-11-09).  Timed first and without the split last: timed after the
         // products below, the B70's next 64-token prompt ran 15% slower whatever it chose.
@@ -522,8 +523,9 @@ void PlainModel::prompt_dense_calibrate() {
                      dense_half_sums_ ? "FP16" : "FP32",
                      dense_native_rows_ == INT64_MAX ? "no" : std::to_string(dense_native_rows_).c_str(), 1e3 * n[0],
                      1e3 * q[0], (long long) lo, 1e3 * n[1], 1e3 * q[1], (long long) hi);
+        // the parts' buffer kept whatever the aim: the products of few rows take K in its parts with any (iq_mmq.cpp's
+        // launch), and the same sums
         prefill::mmq::split_set(split, cs_);
-        if (split == 0) prefill::mmq::split_release(cs_);
         std::lock_guard<std::mutex> lock(chosen.mu);
         chosen.of[key] = {dense_native_rows_, dense_half_sums_, split};
     } catch (const std::exception& e) {
