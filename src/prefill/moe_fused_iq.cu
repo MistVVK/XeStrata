@@ -1786,6 +1786,10 @@ static int occ_blocks(bool w12, int type, bool gu) {
     if (env > 0) return env;
     // gfx11 too (gfx1151, IQ2_S gate/up: 235 VGPRs and 37,120 B of LDS leave room for 3 blocks of 8 waves per WGP; a grid of 4 per WGP
     // ran a second, lopsided wave: 16K tokens, one layer, IQ2_S / IQ4_NL 81.7 -> 76.5 ms)
+    // The K-quant kernels (Q4_K / Q5_K gate/up, Q5_1 down) reach this launch only with the trial switch STRATA_PF_KQ_OCC=1 (experts_native):
+    // 3 blocks per WGP, measured on gfx1201 (R9700, hip_prefill_fused_iq, one layer, 8,192 tokens x top 10 over 512 experts): Q4_K / Q5_1 16.57 ms
+    // on the default launch, 15.96 at 4 blocks, 15.54 at 3, 16.52 at 2; Q5_K / Q5_1 17.25 / 16.69 / 16.20 / 17.18; parity and outputs unchanged.
+    if (type == T_Q4_K || type == T_Q5_K || type == T_Q5_1) return 3;
     return gu && (type == T_IQ2_S || type == T_IQ2_XS) ? 3 : 4;
 }
 #endif
@@ -2124,9 +2128,13 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
 #ifdef STRATA_W_NO_OCC
         const bool occ_gu = false, occ_d = false;
 #else
+        // STRATA_PF_KQ_OCC=1 (a trial switch, off by default, HIP only): the K-quant kernels too (Q4_K / Q5_K gate/up, Q5_1 down) take the
+        // occupancy launch above (the H tile on the weight buffers, occ_blocks per WGP; the VGPR cap only where nw_capped says so).
+        static const bool kq_occ = [] { const char* v = std::getenv("STRATA_PF_KQ_OCC"); return v != nullptr && v[0] == '1'; }();
         const bool occ_gu = g.gu_type == T_IQ2_XXS || g.gu_type == T_IQ2_XS || g.gu_type == T_IQ2_S ||
-                            g.gu_type == T_IQ3_XXS || g.gu_type == T_IQ3_S || g.gu_type == T_IQ4_XS || g.gu_type == T_Q2_0;
-        const bool occ_d = g.d_type == T_Q2_0 || g.d_type == T_Q8_0 || g.d_type == T_IQ4_NL;
+                            g.gu_type == T_IQ3_XXS || g.gu_type == T_IQ3_S || g.gu_type == T_IQ4_XS || g.gu_type == T_Q2_0 ||
+                            (kq_occ && (g.gu_type == T_Q4_K || g.gu_type == T_Q5_K));
+        const bool occ_d = g.d_type == T_Q2_0 || g.d_type == T_Q8_0 || g.d_type == T_IQ4_NL || (kq_occ && g.d_type == T_Q5_1);
 #endif
         if (d.w12 && (reinterpret_cast<uintptr_t>(dm) & 15) != 0) {   // gfx12's down store: two float4 per lane
             std::fprintf(stderr, "prefill fused experts (native): the down rows (%p) must be 16-byte aligned\n", (void*) dm);
