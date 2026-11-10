@@ -288,6 +288,10 @@ macro(strata_cuda_mmq)
       # (this build has no Q5_0 MMQ), with the tails and tile boundaries the test adds for every Q5_0 pair (77 below sm_80)
       add_test(NAME prefill_fused_iq_test_q50 COMMAND prefill_fused_iq_test "--only=Q5_0" --no-timing)
       set_tests_properties(prefill_fused_iq_test_q50 PROPERTIES ENVIRONMENT "STRATA_PF_FUSED_Q50=1" SKIP_RETURN_CODE 77 TIMEOUT 600)
+      # the opt-in STRATA_PF_FUSED_KQ=1 (phase 4): UD-Q4_K_XL's Q4_K / Q5_K gate/up with Q5_1 down on the native kernels, against the
+      # reference and the int8 model at every shape (--edge), MMQ's K-quant library alongside (STRATA_MMQ_KQ=1; 77 below sm_80)
+      add_test(NAME prefill_fused_iq_test_kq COMMAND prefill_fused_iq_test "--only=K / Q5_1" --edge --no-timing)
+      set_tests_properties(prefill_fused_iq_test_kq PROPERTIES ENVIRONMENT "STRATA_PF_FUSED_KQ=1;STRATA_MMQ_KQ=1" SKIP_RETURN_CODE 77 TIMEOUT 600)
       # the MoE input quantized per token and scattered to its rows (mmq::quantize_scatter) against the per-row
       # gather: the same q8_1 bytes for every MMQ layout (--bench: both at 2K, 8K and 32K tokens)
       # the Unsloth v3.1 sets' expert formats through MMQ (Q5_0 down only in a STRATA_ORCA_Q4KS_MMQ build), and --bench
