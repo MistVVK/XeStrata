@@ -19,25 +19,23 @@ template <class T> inline T kmax(T a, T b) { return a < b ? b : a; }
 inline void kcopy(float* d, const float* s, int n) { for (int i = 0; i < n; ++i) d[i] = s[i]; }
 inline void kzero(float* d, int n) { for (int i = 0; i < n; ++i) d[i] = 0.0f; }
 
-struct V {
-    static constexpr int W = 16;
-    __m512 v;
-    V() : v(_mm512_setzero_ps()) {}
-    V(__m512 x) : v(x) {}
-    static V load(const float* p) { return _mm512_loadu_ps(p); }
-    void store(float* p) const { _mm512_storeu_ps(p, v); }
-    static V set1(float f) { return _mm512_set1_ps(f); }
-    static V zero() { return _mm512_setzero_ps(); }
-    static float sqrt1(float x) { return _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(x))); }     // sqrtss: the correctly rounded root, as std::sqrt
-    static V fma(V a, V b, V c) { return _mm512_fmadd_ps(a.v, b.v, c.v); }
-    static float reduce_add(V a) { return _mm512_reduce_add_ps(a.v); }
-    static float reduce_max(V a) { return _mm512_reduce_max_ps(a.v); }
-    friend V operator+(V a, V b) { return _mm512_add_ps(a.v, b.v); }
-    friend V operator-(V a, V b) { return _mm512_sub_ps(a.v, b.v); }
-    friend V operator*(V a, V b) { return _mm512_mul_ps(a.v, b.v); }
-    friend V operator/(V a, V b) { return _mm512_div_ps(a.v, b.v); }
-};
-inline V vmax(V a, V b) { return _mm512_max_ps(a.v, b.v); }
+// The vector of the elementwise code (cpu_kernels_impl.h, STRATA_KN_RAW): raw __m512 and free inline functions, no wrapper struct (as the AVX2 tier).
+#define STRATA_KN_RAW 1
+constexpr int VW = 16;
+typedef __m512 VR;
+inline VR vr_load(const float* p) { return _mm512_loadu_ps(p); }
+inline void vr_store(float* p, VR v) { _mm512_storeu_ps(p, v); }
+inline VR vr_set1(float f) { return _mm512_set1_ps(f); }
+inline VR vr_zero() { return _mm512_setzero_ps(); }
+inline VR vr_add(VR a, VR b) { return _mm512_add_ps(a, b); }
+inline VR vr_sub(VR a, VR b) { return _mm512_sub_ps(a, b); }
+inline VR vr_mul(VR a, VR b) { return _mm512_mul_ps(a, b); }
+inline VR vr_div(VR a, VR b) { return _mm512_div_ps(a, b); }
+inline VR vr_fma(VR a, VR b, VR c) { return _mm512_fmadd_ps(a, b, c); }
+inline VR vr_max(VR a, VR b) { return _mm512_max_ps(a, b); }
+inline float vr_sqrt1(float x) { return _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(x))); }     // sqrtss: the correctly rounded root, as std::sqrt
+inline float vr_hadd(VR a) { return _mm512_reduce_add_ps(a); }
+inline float vr_hmax(VR a) { return _mm512_reduce_max_ps(a); }
 
 // The product's micro-kernel on raw __m512 (as the AVX2 tier's; same operations, same order, bit-identical to the generic micro of cpu_kernels_impl.h).
 #define STRATA_KN_HAS_MICRO 1
@@ -63,8 +61,8 @@ inline void micro(const float* A, size_t lda, const float* B, size_t ldb, int K,
         for (int c = 0; c < 2; ++c) _mm512_storeu_ps(C + (size_t) r * ldc + c * 16, acc[r][c]);
 }
 
-inline V vexp(V xv) {
-    __m512 x = _mm512_min_ps(_mm512_max_ps(xv.v, _mm512_set1_ps(-87.3f)), _mm512_set1_ps(88.3f));
+inline VR vr_exp(VR xv) {
+    __m512 x = _mm512_min_ps(_mm512_max_ps(xv, _mm512_set1_ps(-87.3f)), _mm512_set1_ps(88.3f));
     __m512 fx = _mm512_roundscale_ps(_mm512_mul_ps(x, _mm512_set1_ps(1.44269504088896341f)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
     x = _mm512_fnmadd_ps(fx, _mm512_set1_ps(0.693359375f), x);
     x = _mm512_fnmadd_ps(fx, _mm512_set1_ps(-2.12194440e-4f), x);

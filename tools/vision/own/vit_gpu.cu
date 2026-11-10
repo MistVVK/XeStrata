@@ -57,7 +57,9 @@ namespace strata_vit {
 
 namespace {
 
-enum Kind { K_F32 = 0, K_F16 = 1, K_BF16 = 2 };   // the 16-bit kind a GEMM's input takes (its weight's)
+// the 16-bit kind a GEMM's input takes (its weight's).  K_BH: a BF16 matrix held as F16 (every BF16 value of the weights' and activations' range is an F16 value;
+// the activations are rounded to BF16 first, so the products see the BF16 values), for cards whose BLAS has no fast BF16 kernel (Pascal: STRATA_VIT_BF16_AS_F16)
+enum Kind { K_F32 = 0, K_F16 = 1, K_BF16 = 2, K_BH = 3 };
 
 struct DevW {            // a weight matrix [rows = out][cols = in] on the device
     void* p = nullptr;
@@ -81,8 +83,10 @@ __device__ __forceinline__ uint16_t f_to_f16bits(float f) { return __half_as_ush
 __device__ __forceinline__ void store_kind(void* out, size_t i, float v, int kind) {
     if (kind == K_F32) ((float*) out)[i] = v;
     else if (kind == K_F16) ((uint16_t*) out)[i] = f_to_f16bits(v);
+    else if (kind == K_BH) ((uint16_t*) out)[i] = f_to_f16bits(__uint_as_float((uint32_t) f_to_bf16(v) << 16));
     else ((uint16_t*) out)[i] = f_to_bf16(v);
 }
+
 
 // block-wide sum of one float per thread (blockDim.x a multiple of the warp size, at most 1024)
 __device__ float block_sum(float v) {
@@ -236,7 +240,7 @@ __global__ void __launch_bounds__(kSoftmaxThreads) k_softmax_rows_long(uint16_t*
 __global__ void k_round(float* __restrict__ y, size_t n, int kind) {
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
         const float v = y[i];
-        y[i] = kind == K_F16 ? __half2float(__float2half_rn(v)) : __uint_as_float((uint32_t) f_to_bf16(v) << 16);
+        y[i] = kind == K_F16 ? __half2float(__float2half_rn(v)) : __uint_as_float((uint32_t) f_to_bf16(v) << 16);   // K_BF16 and K_BH: BF16
     }
 }
 
@@ -311,6 +315,18 @@ struct VitGpuImpl {
     size_t kScoreElems = (size_t) 8 << 20;     // scores per attention chunk, 8M: 16 MB of F16 (STRATA_VIT_SCORES, in M elements, overrides)
     size_t kScoreElemsLarge = (size_t) 512 << 20;   // the chunk above 16,384 patches: 512M scores, 1 GB of F16 (see size_buffers)
     bool scores_env = false;                   // STRATA_VIT_SCORES was given: one size for every picture
+    // Above 16,384 patches a score row is padded to a multiple of 64 elements and the queries of an attention chunk are a multiple of 64: with the
+    // picture's own row length (limit_7000x5000.png, 65,232 patches: 514 queries per chunk, rows not 128-byte aligned) the A4000 took 108.1 s against
+    // 80.3 s aligned, while 65,536 patches took 80.9 s (RESULTS-OWN-3V.md 16.2).  Up to 16,384 patches: 8 and no rounding, as before.
+    // STRATA_VIT_NPAD / STRATA_VIT_QALIGN (diagnostics) set both for every picture.
+    int n_pad = 0, q_align = 0;      // 0: the rule above
+    int pad_for(size_t n) const { return n_pad ? n_pad : n > 16384 ? 64 : 8; }
+    int align_for(size_t n) const { return q_align ? q_align : n > 16384 ? 64 : 1; }
+    size_t padded(size_t n) const { const size_t p = (size_t) pad_for(n); return (n + p - 1) / p * p; }
+    // BF16 matrices held as F16 (K_BH): on by default on Pascal (compute capability 6.x), where cuBLAS has no fast BF16 kernel (a P100 spent 645 ms of a
+    // 1,024-token picture in magma_sgemmEx for BF16 against 497 ms with F16 inputs; the 12-token picture 44 ms against 15; RESULTS-OWN-3V.md 16.1).
+    // STRATA_VIT_BF16_AS_F16=0/1 (a diagnostic) overrides.
+    bool bf16_as_f16 = false;
 
     // C = alpha * op(A) * op(B), batched, column-major as the BLAS wants it
     bool bgemm(bool ta, bool tb, int m, int n, int k, const void* A, cudaDataType_t at, int lda, long long sa, const void* B, cudaDataType_t bt, int ldb,
@@ -352,7 +368,16 @@ struct VitGpuImpl {
         w.rows = (int) t->ne[1];
         const size_t n = (size_t) t->nelem();
         std::vector<unsigned char> raw;
-        if (t->type == GT_F16 || t->type == GT_BF16) {          // as stored
+        if (t->type == GT_BF16 && bf16_as_f16) {                 // BF16 -> F16 (K_BH)
+            std::vector<float> f(n);
+            if (!gg.read_f32(*t, f.data(), err)) return false;
+            raw.resize(n * 2);
+            w.kind = K_BH;
+            for (size_t i = 0; i < n; ++i) {
+                const uint16_t u = host_f32_to_f16(f[i]);
+                std::memcpy(&raw[i * 2], &u, 2);
+            }
+        } else if (t->type == GT_F16 || t->type == GT_BF16) {   // as stored
             raw.resize(n * 2);
             if (!gg.read_raw(*t, raw.data(), err)) return false;
             w.kind = t->type == GT_F16 ? K_F16 : K_BF16;
@@ -372,7 +397,7 @@ struct VitGpuImpl {
         w.p = dev;
         return cudaMemcpy(w.p, raw.data(), n * 2, cudaMemcpyHostToDevice) == cudaSuccess || (err = "GPU copy failed", false);
     }
-    static cudaDataType_t dtype(Kind k) { return k == K_F32 ? CUDA_R_32F : k == K_F16 ? CUDA_R_16F : CUDA_R_16BF; }
+    static cudaDataType_t dtype(Kind k) { return k == K_F32 ? CUDA_R_32F : (k == K_F16 || k == K_BH) ? CUDA_R_16F : CUDA_R_16BF; }
 
     // y[M][N] (float32) = A[M][K] (kind of w) * w^T
     bool gemm(const DevW& w, const void* A, int M, void* y, cudaDataType_t kind_a, std::string& err) {
@@ -406,7 +431,7 @@ struct VitGpuImpl {
         // (a very large picture gets at least 64 queries per chunk, so its many chunks stay few)
         // a score row is padded to a multiple of 8 elements (the product's leading dimension): with an odd row length the BLAS cannot use its tensor-core
         // kernels (a 93-token picture spent half its time there)
-        const size_t Np = (N + 7) / 8 * 8;
+        const size_t Np = padded(N);
         // above 16,384 patches (pictures of more than 4,096 tokens) the chunk is 512M scores (1 GB): with the 16 MB chunk such a picture runs 64 queries per
         // product and the attention is launch-bound (l620, 16,384 tokens: 33.4 s, 1.17 of mtmd-GPU; with 512M 24.8 s, 0.87, at 3,398 MiB against mtmd-GPU's
         // 3,858; RESULTS-OWN-3V.md 12.11).  STRATA_VIT_SCORES sets both sizes.
@@ -445,9 +470,10 @@ bool VitGpu::available(std::string& why) {
     return true;
 }
 
-bool VitGpu::prefer_mtmd(std::string& why) {
+bool VitGpu::prefer_mtmd(bool bf16_matrices, std::string& why) {
 #if defined(STRATA_VIT_HIP)
     hipDeviceProp_t p;
+    (void) bf16_matrices;
     if (hipGetDeviceProperties(&p, 0) != hipSuccess) { (void) hipGetLastError(); return false; }
     if (vit_gpu_slower_amd(p.gcnArchName)) {
         why = std::string(p.gcnArchName) + ": rocBLAS has only fallback kernels there, the own GPU tower is slower than mtmd";
@@ -457,8 +483,9 @@ bool VitGpu::prefer_mtmd(std::string& why) {
 #else
     cudaDeviceProp p;
     if (cudaGetDeviceProperties(&p, 0) != cudaSuccess) { (void) cudaGetLastError(); return false; }
-    if (vit_gpu_slower_nvidia(p.major)) {
-        why = "compute capability " + std::to_string(p.major) + "." + std::to_string(p.minor) + " (Pascal): the own GPU tower is slower than mtmd there";
+    if (vit_gpu_slower_nvidia(p.major, p.minor, bf16_matrices)) {
+        why = "compute capability " + std::to_string(p.major) + "." + std::to_string(p.minor) + " (Pascal)" + (bf16_matrices ? "" : " with F16 matrices") +
+              ": the own GPU tower is slower than mtmd there";
         return true;
     }
     return false;
@@ -471,6 +498,15 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
     if (!vit_geometry_supported(g, why)) { err = "this tower is not supported: " + why; return false; }
     m.g = g;
     m.device = device;
+#if !defined(STRATA_VIT_HIP)
+    bool pascal = false;
+    {   // Pascal (compute capability 6.x): BF16 matrices as F16 (and the larger score chunk below)
+        cudaDeviceProp p;
+        if (cudaGetDeviceProperties(&p, device) == cudaSuccess && p.major == 6) pascal = m.bf16_as_f16 = true;
+        (void) cudaGetLastError();
+    }
+#endif
+    if (const char* e = std::getenv("STRATA_VIT_BF16_AS_F16")) m.bf16_as_f16 = std::atoi(e) != 0;
     if (cudaSetDevice(device) != cudaSuccess) { err = std::string("cannot use GPU ") + std::to_string(device) + ": " + cudaGetErrorString(cudaGetLastError()); return false; }
     if (cublasCreate(&m.blas) != CUBLAS_STATUS_SUCCESS) { err = "cannot create the BLAS handle"; return false; }
     // the patch embedding: the two temporal taps summed, kept in float32 (a small matrix)
@@ -506,11 +542,19 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
             return false;
     }
     m.n_weight_allocs = m.allocs.size();
+#if !defined(STRATA_VIT_HIP)
+    // Pascal with BF16 matrices (held as F16): a 32M-score attention chunk (64 MB): the P*V product's tile is only partly used with a head size of 72, and
+    // more queries per product made a 1,024-token picture 1,242 -> 1,064 ms on a P100, at 1,362 MiB against mtmd-GPU's 1,364 (RESULTS-OWN-3V.md 16.1).
+    // Not with F16 matrices: there mtmd stays faster anyway and the chunk would cost 48 MB over mtmd-GPU's memory.
+    if (pascal && !m.layers.empty() && m.layers[0].qkv.kind == K_BH) m.kScoreElems = (size_t) 32 << 20;
+#endif
     if (const char* e = std::getenv("STRATA_VIT_REF_ROUND")) m.round_out = std::atoi(e) != 0;
     if (const char* e = std::getenv("STRATA_VIT_ROWS")) { const int v = std::atoi(e); if (v >= 16) m.kRows = v; }
     if (const char* e = std::getenv("STRATA_VIT_SCORES")) { const int v = std::atoi(e); if (v >= 1) { m.kScoreElems = (size_t) v << 20; m.scores_env = true; } }
     // STRATA_VIT_SCORES_LARGE (M elements, a diagnostic): the chunk above 16,384 patches; a size the GPU cannot hold tests the fallback to the default chunk
     if (const char* e = std::getenv("STRATA_VIT_SCORES_LARGE")) { const long v = std::atol(e); if (v >= 1) m.kScoreElemsLarge = (size_t) v << 20; }
+    if (const char* e = std::getenv("STRATA_VIT_NPAD")) { const int v = std::atoi(e); if (v >= 8 && v % 8 == 0) m.n_pad = v; }
+    if (const char* e = std::getenv("STRATA_VIT_QALIGN")) { const int v = std::atoi(e); if (v >= 1) m.q_align = v; }
     return m.size_buffers(std::max(max_patches, 16), err);
 }
 
@@ -579,8 +623,10 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
         stage(2);
         // per chunk of queries: S = K Q^T (one batched product over the heads), softmax, O = V P (a head's matrix is a column slice of the [N][D] arrays:
         // leading dimension D, batch stride HD)
-        const int Np = (N + 7) / 8 * 8;      // the score rows' leading dimension (see size_buffers)
-        const int QC = (int) std::max<size_t>(1, std::min<size_t>((size_t) N, m.sp_elems / ((size_t) H * Np)));
+        const int Np = (int) m.padded((size_t) N);      // the score rows' leading dimension (see size_buffers)
+        int QC = (int) std::max<size_t>(1, std::min<size_t>((size_t) N, m.sp_elems / ((size_t) H * Np)));
+        const int qa = m.align_for((size_t) N);
+        if (qa > 1 && QC < N && QC >= qa) QC -= QC % qa;
         for (int q0 = 0; q0 < N; q0 += QC) {
             const int qc = std::min(QC, N - q0);
             if (!m.bgemm(true, false, N, qc, HD, m.d_k16, CUDA_R_16F, D, HD, m.d_q16 + (size_t) q0 * D, CUDA_R_16F, D, HD, m.d_S, CUDA_R_16F, Np,

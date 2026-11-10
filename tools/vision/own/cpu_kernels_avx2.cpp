@@ -18,35 +18,34 @@ template <class T> inline T kmax(T a, T b) { return a < b ? b : a; }
 inline void kcopy(float* d, const float* s, int n) { for (int i = 0; i < n; ++i) d[i] = s[i]; }
 inline void kzero(float* d, int n) { for (int i = 0; i < n; ++i) d[i] = 0.0f; }
 
-struct V {
-    static constexpr int W = 8;
-    __m256 v;
-    V() : v(_mm256_setzero_ps()) {}
-    V(__m256 x) : v(x) {}
-    static V load(const float* p) { return _mm256_loadu_ps(p); }
-    void store(float* p) const { _mm256_storeu_ps(p, v); }
-    static V set1(float f) { return _mm256_set1_ps(f); }
-    static V zero() { return _mm256_setzero_ps(); }
-    static float sqrt1(float x) { return _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(x))); }     // sqrtss: the correctly rounded root, as std::sqrt
-    static V fma(V a, V b, V c) { return _mm256_fmadd_ps(a.v, b.v, c.v); }
-    static float reduce_add(V a) {
-        __m128 s = _mm_add_ps(_mm256_castps256_ps128(a.v), _mm256_extractf128_ps(a.v, 1));
-        s = _mm_add_ps(s, _mm_movehl_ps(s, s));
-        s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
-        return _mm_cvtss_f32(s);
-    }
-    static float reduce_max(V a) {
-        __m128 s = _mm_max_ps(_mm256_castps256_ps128(a.v), _mm256_extractf128_ps(a.v, 1));
-        s = _mm_max_ps(s, _mm_movehl_ps(s, s));
-        s = _mm_max_ss(s, _mm_shuffle_ps(s, s, 1));
-        return _mm_cvtss_f32(s);
-    }
-    friend V operator+(V a, V b) { return _mm256_add_ps(a.v, b.v); }
-    friend V operator-(V a, V b) { return _mm256_sub_ps(a.v, b.v); }
-    friend V operator*(V a, V b) { return _mm256_mul_ps(a.v, b.v); }
-    friend V operator/(V a, V b) { return _mm256_div_ps(a.v, b.v); }
-};
-inline V vmax(V a, V b) { return _mm256_max_ps(a.v, b.v); }
+// The vector of the elementwise code (cpu_kernels_impl.h, STRATA_KN_RAW): raw __m256 and free inline functions, no wrapper struct (MSVC kept the wrapper in
+// memory; RESULTS-OWN-3V.md 12.14 and part C item 4).
+#define STRATA_KN_RAW 1
+constexpr int VW = 8;
+typedef __m256 VR;
+inline VR vr_load(const float* p) { return _mm256_loadu_ps(p); }
+inline void vr_store(float* p, VR v) { _mm256_storeu_ps(p, v); }
+inline VR vr_set1(float f) { return _mm256_set1_ps(f); }
+inline VR vr_zero() { return _mm256_setzero_ps(); }
+inline VR vr_add(VR a, VR b) { return _mm256_add_ps(a, b); }
+inline VR vr_sub(VR a, VR b) { return _mm256_sub_ps(a, b); }
+inline VR vr_mul(VR a, VR b) { return _mm256_mul_ps(a, b); }
+inline VR vr_div(VR a, VR b) { return _mm256_div_ps(a, b); }
+inline VR vr_fma(VR a, VR b, VR c) { return _mm256_fmadd_ps(a, b, c); }
+inline VR vr_max(VR a, VR b) { return _mm256_max_ps(a, b); }
+inline float vr_sqrt1(float x) { return _mm_cvtss_f32(_mm_sqrt_ss(_mm_set_ss(x))); }     // sqrtss: the correctly rounded root, as std::sqrt
+inline float vr_hadd(VR a) {
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(a), _mm256_extractf128_ps(a, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 1));
+    return _mm_cvtss_f32(s);
+}
+inline float vr_hmax(VR a) {
+    __m128 s = _mm_max_ps(_mm256_castps256_ps128(a), _mm256_extractf128_ps(a, 1));
+    s = _mm_max_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_max_ss(s, _mm_shuffle_ps(s, s, 1));
+    return _mm_cvtss_f32(s);
+}
 
 // The product's micro-kernel on raw __m256 (no wrapper struct in the hot loop: MSVC kept the wrapper in memory, 1.46 to 1.82 of mtmd-CPU's time on Windows;
 // RESULTS-OWN-3V.md 12.14).  The same operations in the same order as the generic micro of cpu_kernels_impl.h, so the results are bit-identical.
@@ -74,8 +73,8 @@ inline void micro(const float* A, size_t lda, const float* B, size_t ldb, int K,
 }
 
 // expf (Cephes): x = n ln2 + r, exp(x) = 2^n * p(r)
-inline V vexp(V xv) {
-    __m256 x = _mm256_min_ps(_mm256_max_ps(xv.v, _mm256_set1_ps(-87.3f)), _mm256_set1_ps(88.3f));
+inline VR vr_exp(VR xv) {
+    __m256 x = _mm256_min_ps(_mm256_max_ps(xv, _mm256_set1_ps(-87.3f)), _mm256_set1_ps(88.3f));
     __m256 fx = _mm256_round_ps(_mm256_mul_ps(x, _mm256_set1_ps(1.44269504088896341f)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
     x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(0.693359375f), x);
     x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(-2.12194440e-4f), x);
