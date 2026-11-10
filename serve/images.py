@@ -1108,14 +1108,15 @@ def encode_image(png: bytes, fmt: str, compression: int, opaque: bool = False) -
         return encode_jxl(png, compression)
     import io
     from PIL import Image
-    return encode_pillow(Image.open(io.BytesIO(png)), fmt, compression, opaque)
+    return encode_pillow(Image.open(io.BytesIO(png)), fmt, compression, opaque, flatten_jpeg=True)
 
 
-def encode_pillow(im, fmt: str, compression: int | None = None, opaque: bool = False) -> bytes:
+def encode_pillow(im, fmt: str, compression: int | None = None, opaque: bool = False,
+                  flatten_jpeg: bool = False) -> bytes:
     """Encode a Pillow image; absent compression keeps the region API's lossless WebP and JPEG quality 95."""
     import io
     from PIL import Image
-    if (fmt == "jpeg" and im.mode in ("RGBA", "LA")) or opaque:
+    if (fmt == "jpeg" and (flatten_jpeg or im.mode in ("RGBA", "LA"))) or opaque:
         bg = Image.new("RGB", im.size, (255, 255, 255))
         bg.paste(im, mask=im.split()[-1])
         im = bg
@@ -1125,8 +1126,11 @@ def encode_pillow(im, fmt: str, compression: int | None = None, opaque: bool = F
         return encode_jxl(out.getvalue(), 100 if compression is None else compression)
     if fmt == "jpeg":
         im = im.convert("L" if im.mode == "L" else "RGB")
-    options = ({"lossless": True} if fmt == "webp" and compression is None else
-               {"quality": 95 if compression is None else compression} if fmt == "jpeg" or fmt == "webp" else {})
+    options: dict[str, Any] = {}
+    if fmt == "webp" and compression is None:
+        options["lossless"] = True
+    elif fmt == "jpeg" or fmt == "webp":
+        options["quality"] = 95 if compression is None else compression
     im.save(out, format=fmt.upper(), **options)
     return out.getvalue()
 

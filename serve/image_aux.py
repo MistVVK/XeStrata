@@ -225,8 +225,7 @@ def _fetch(url: str, part_of: Path, size: int, sha: str, job: dict, say, name: s
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "xestrata-serve", "Range": f"bytes={have}-"})
             with urllib.request.urlopen(req, timeout=60) as r:
-                if have and r.status != 206:
-                    have = 0
+                have = download_core.resumed_at(r, have, size, strict=False)
                 last = time.monotonic()
                 with open(part, "ab" if have else "wb") as f:
                     def report(done):

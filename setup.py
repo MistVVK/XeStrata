@@ -3751,15 +3751,11 @@ def download_single(url: str, part: Path, total: int, label: str):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "xestrata-setup", "Range": f"bytes={have}-"})
             with urllib.request.urlopen(req, timeout=60) as r:
-                if have:
-                    m = _CONTENT_RANGE.match(r.headers.get("Content-Range") or "")
-                    if r.status != 206 or not m or int(m.group(1)) != have or (total and int(m.group(3)) != total):
-                        if r.status != 200:            # another range: its bytes are not the file's; ask again from 0
-                            part.unlink(missing_ok=True)
-                            raise OSError(f"the server answered another range than bytes {have}- (HTTP {r.status})")
-                        have = 0                       # the server ignored the range, sent the whole file: start over
-                elif r.status not in (200, 206):
-                    raise OSError(f"HTTP {r.status}")
+                try:
+                    have = download_core.resumed_at(r, have, total)
+                except OSError:
+                    part.unlink(missing_ok=True)
+                    raise
                 with open(part, "ab" if have else "wb") as f:
                     last = 0.0
 

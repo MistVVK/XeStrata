@@ -681,6 +681,14 @@ def segmentation_response(svc, gen, fields: dict, picture: bytes, cancel=None) -
                          **({"fallback": got["fallback"]} if got.get("fallback") else {})}}
 
 
+def _compression(fields: dict):
+    # This endpoint previously ignored the field, including invalid values.
+    try:
+        return img.parse_number(fields.get("output_compression"), "output_compression", 0, 100, whole=True)
+    except img.ImageRequestError:
+        return None
+
+
 def remove_background_request(fields: dict) -> dict:
     """POST /v1/images/remove-background's fields -> matte's and cut_out's arguments: fal's BiRefNet model (a version
     or fal's name; default general), operating_resolution, refine_foreground (default true), mask_only, output_mask,
@@ -696,8 +704,7 @@ def remove_background_request(fields: dict) -> dict:
     return {"version": birefnet_version(fields.get("model")), "resolution": fields.get("operating_resolution"),
             "refine": _flag(fields, "refine_foreground", True) and not mask_only, "mask_only": mask_only,
             "output_mask": _flag(fields, "output_mask", False), "format": fmt, "response_format": rf,
-            "compression": img.parse_number(fields.get("output_compression"), "output_compression", 0, 100,
-                                            whole=True),
+            "compression": _compression(fields),
             "background": parse_color(fields.get("background_color")),
             "grow": int(_number(fields, "mask_grow", 0, -256, 256)), "blur": _number(fields, "mask_blur", 0.0, 0, 256)}
 
@@ -728,7 +735,7 @@ def stability_remove_background(svc, gen, fields: dict, picture: bytes, cancel=N
     fmt = str(fields.get("output_format") or "png").lower()
     if fmt not in ("png", "webp"):
         raise img.ImageRequestError(f"output_format: png or webp, not {fmt!r}")
-    compression = img.parse_number(fields.get("output_compression"), "output_compression", 0, 100, whole=True)
+    compression = _compression(fields)
     got = matte(svc, gen, picture, "general", None, True, cancel)
     return img.encode_pillow(cut_out(picture, got), fmt, compression), fmt
 

@@ -289,7 +289,7 @@ def check_range(status, content_range, start, end):
         raise IOError("range request not honoured: HTTP %s instead of 206 (a mirror or proxy that ignores the Range "
                       "header sends the whole file)" % status)
     want = "bytes %d-%d/" % (start, end)
-    if not (content_range or "").strip().startswith(want):
+    if not download_core.range_matches(content_range, start, end):
         raise IOError("range request answered with Content-Range %r, not %s..." % (content_range, want))
 
 

@@ -987,7 +987,7 @@ CNET_KINDS = {"canny": (), "gray": (), "scribble": (), "scribble_xdog": (), "scr
               "hed": ("cnet-hed",), "lineart": ("cnet-lineart",), "lineart_coarse": ("cnet-lineart-coarse",),
               "mlsd": ("cnet-mlsd",), "depth": ("cnet-depth",), "pose": ("cnet-yolox", "cnet-dwpose")}
 # Capabilities used by setup and the server, independent of the installed model's name.
-FAMILY_CAPABILITIES = {
+FAMILY_CAPABILITIES: dict[str, dict[str, object]] = {
     "qwen-image": {"pipeline": "qwen", "control": "controlnet"},
     "mage-flow": {"pipeline": "flow", "max_refs": 3, "control_reference": True, "guidance_methods": True},
     "hunyuan-image-3": {"pipeline": "guided_token", "max_refs": HUNYUANIMAGE3_MAX_REFS, "control_reference": True},

@@ -1111,7 +1111,8 @@ class Fetch:
                     if have and r.status == 206:
                         match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)",
                                              (r.headers.get("Content-Range") or "").strip())
-                        if not match or int(match[1]) != have or r.headers.get("ETag") != tag:
+                        if not match or not download_core.range_matches(r.headers.get("Content-Range"), have) or \
+                                r.headers.get("ETag") != tag:
                             tmp.unlink(missing_ok=True)
                             tag_path.unlink(missing_ok=True)
                             raise OSError("the server answered a different file or range")
@@ -1148,8 +1149,16 @@ class Fetch:
                     if self.total is not None and self.got != self.total:
                         raise OSError(f"the download ended at {self.got} of {self.total} bytes")
                     return
-            except urllib.error.HTTPError:
-                raise
+            except urllib.error.HTTPError as exc:
+                if exc.code != 416 or not have:
+                    raise
+                match = re.fullmatch(r"bytes \*/(\d+)", (exc.headers.get("Content-Range") or "").strip())
+                if match and int(match[1]) == have and exc.headers.get("ETag") == tag:
+                    self.got = self.total = have
+                    return
+                # The completed part cannot be identified as this version; fetch it again.
+                tmp.unlink(missing_ok=True)
+                tag_path.unlink(missing_ok=True)
             except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, http.client.HTTPException):
                 if attempt == 4:
                     raise
