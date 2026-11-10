@@ -696,7 +696,7 @@ int main(int argc, char** argv) {
             // the Coder IQ1_M pack's other pairs (appended: the default timing set takes pairs 0, 1, 4, 3 by index)
             {GGML_TYPE_IQ2_S, GGML_TYPE_IQ4_NL, "IQ2_S / IQ4_NL"},   {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0, "IQ3_XXS / Q2_0"},
             {GGML_TYPE_IQ3_S, GGML_TYPE_Q2_0, "IQ3_S / Q2_0"},       {GGML_TYPE_IQ4_XS, GGML_TYPE_IQ4_NL, "IQ4_XS / IQ4_NL"},
-            // UD-IQ4_XS-v31's Q5_0 down layers (HIP gfx12, STRATA_PF_FUSED_Q50=1; checked against the reference, the build has no Q5_0 MMQ)
+            // UD-IQ4_XS-v31's Q5_0 down layers (STRATA_PF_FUSED_Q50=1: HIP gfx12, and CUDA sm_80+ since phase 4 step 1; checked against the reference, the build has no Q5_0 MMQ)
             {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q5_0, "IQ3_XXS / Q5_0"},   {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_0, "IQ4_XS / Q5_0"},
             // the canonical Q2_0 pack (gate/up and down Q2_0; CUDA)
             {GGML_TYPE_Q2_0, GGML_TYPE_Q2_0, "Q2_0 / Q2_0"}};
@@ -727,7 +727,7 @@ int main(int argc, char** argv) {
                 // the Q2_0 / Q2_0 pair is the Turing opt-in's (STRATA_PF_FUSED_SM75=1; the only pair set up there) or, on sm_80+,
                 // STRATA_PF_FUSED_Q2N=1's: skip what this device does not take (--only=NAME still insists)
                 const bool turing_pair = p.gu == GGML_TYPE_Q2_0 && p.d == GGML_TYPE_Q2_0;
-                const bool q50_pair = p.d == GGML_TYPE_Q5_0;   // (gfx12 / gfx1151 only: the CUDA kernels have no Q5_0 down)
+                const bool q50_pair = p.d == GGML_TYPE_Q5_0;   // (STRATA_PF_FUSED_Q50=1 only: off by default on CUDA and gfx12)
                 int major = 0;
                 cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
                 if ((major < 8 || turing_pair || q50_pair) && !only) { std::printf("%s: not set up on this device (skipped)\n", p.name); continue; }
