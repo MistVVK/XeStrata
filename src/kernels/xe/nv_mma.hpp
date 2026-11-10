@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/xe/nv_mma.hpp - NVIDIA's matrix instructions from sm_80 on, in PTX, for the kernels that take them
-// themselves (iq_mmq.cpp, mma_gemm.cpp, flash_attn.cpp, the image engine's int8 attention): joint_matrix's CUDA loads
+// themselves (mma_gemm.cpp, flash_attn.cpp, flash_attn_i8.cpp): joint_matrix's CUDA loads
 // read a 16 x 16 tile as 32-bit generic loads (four a lane, four times the instructions of ldmatrix's), and it has
 // neither mma.sync's m16n8 tiles nor the asynchronous copies into local memory.
 //
@@ -36,13 +36,6 @@ inline void ldsm4(uint32_t (&r)[4], uint32_t addr) {
                  : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(addr));
 }
 
-/// N bytes (4, 8 or 16) global -> local without registers through L1 (.ca), the first `bytes` of them read and the
-/// rest zeros
-template<int N>
-inline void cp_async_ca(void* smem, const void* gmem, int bytes = N) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], %2, %3;" ::"r"(smem_addr(smem)), "l"(gmem), "n"(N),
-                 "r"(bytes));
-}
 /// 16 bytes global -> local through L2 only (.cg)
 inline void cp_async_cg(uint32_t smem, const void* gmem) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" ::"r"(smem), "l"(gmem));
@@ -63,13 +56,6 @@ inline void mma_s8(int* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
         "{%0, %1, %2, %3};"
         : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-/// d = c0 (in every element) + A . B
-inline void mma_s8(int* d, const uint32_t* a, uint32_t b0, uint32_t b1, int c0) {
-    asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
-        "{%10, %10, %10, %10};"
-        : "=r"(d[0]), "=r"(d[1]), "=r"(d[2]), "=r"(d[3])
-        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1), "r"(c0));
 }
 /// c + the sum of a's four bytes as unsigned (dp4a against ones)
 inline uint32_t sum_u8x4(uint32_t a, uint32_t c) {

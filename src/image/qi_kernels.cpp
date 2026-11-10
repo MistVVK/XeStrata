@@ -12,7 +12,6 @@
 #include "strata/kernels/f16_gpu.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/qk_norm_rope.hpp"
-#include "strata/kernels/q8_act.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -286,16 +285,6 @@ void qi_qk_norm_rope16(const float* q, const float* k, const float* v, const flo
                                              kernels::qk::Tables{cos, sin, head_dim / 2},
                                              kernels::qk::Rows16{q16, k16, v16, heads, heads, head_dim}),
            "qi_qk_norm_rope16");
-}
-
-void qi_quantize_q8(const uint16_t* x16, int64_t rows, int64_t cols, void* xq, void* stream) {
-    if (rows <= 0) return;
-    auto* x8 = static_cast<int8_t*>(xq);
-    auto* xs = reinterpret_cast<float*>(x8 + rows * cols);
-    const kernels::q8act::Rows<false> out{x8, xs, nullptr, cols, cols / 32};
-    finish(stream, kernels::q8act::quantize<8, kernels::q8act::Mul>(queue_for(stream), rows * (cols / 32), cols / 32,
-                                                                       kernels::q8act::HalfRows{x16, cols}, out),
-           "qi_quantize_q8");
 }
 
 void qi_rows_i8(const uint16_t* src, bool bf16, int64_t rows, int64_t K, int8_t* q, float* s, const float* rs,

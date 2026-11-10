@@ -14,8 +14,6 @@
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/iq_mmq.hpp"
-#include "strata/kernels/native_mmvq.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/native_qsa.hpp"
@@ -256,11 +254,15 @@ bool QiDit::open(const std::string& path, void* stream, std::string& err, bool d
         build_lora_targets();
         for (const W* w : {&t1_, &t2_, &mod_, &nout_, &pout_, &tin_, &tout_, &iin_})
             scratch = std::max(scratch, w->n * w->k);
-        // the blocks' products in int8 where the GPU's library takes int8 products (W8A8, prefill::Gemm::i8): each
+        // the blocks' products in int8 where the GPU's library takes int8 products and they are not clearly the
+        // slower here (W8A8, prefill::Gemm::i8; the choice every DiT makes, dit_rows::w8_at_open, once a GPU): each
         // weight dequantized to FP16 in the products' scratch and rotated and quantized again a row at a time, in
         // place, each time a block is copied to the GPU (int8 values and a scale a row take less room than any
-        // block format of 8 bits a value or more); else Q8_0's on NVIDIA's int8 tensor cores where the GPU has them
-        // (W8A8 unless it is clearly the slower here, as every DiT chooses: dit_rows::w8_at_open, once a GPU)
+        // block format of 8 bits a value or more); else in FP16 from the file's blocks (Gemm::native), as every DiT.
+        // Not Q8_0's int8 activations a scale each 32 on NVIDIA's int8 tensor cores, which
+        // this DiT took in W8A8's place until 2026-11-10: half W8A8's speed and short of FP16's (RTX 4070,
+        // Qwen-Image-2.1-Turbo Q8_0, 1024 x 1024, 8 steps: 3.43 s of sampling in W8A8, 6.85 in Q8_0's, 9.26 in
+        // FP16), and W8A8 is the faster form wherever those cores are (their int8 rate twice their FP16 rate)
         uint64_t w8t_bytes = 0;
         if (dit_rows::w8_at_open(C_, 2 * inter_, "Qwen-Image's DiT", s_) == 1) {
             for (Block& b : blocks_)
@@ -281,12 +283,6 @@ bool QiDit::open(const std::string& path, void* stream, std::string& err, bool d
                     w8_ = w8_ || w->w8;
                 }
             if (w8t_bytes > 0) weight_bytes_ += w8t_bytes + (uint64_t) (kW8tScales * w8t_rows_) * 4;
-        } else if (kernels::iq_mmq_q8_rows_usable(core::Runtime::get().stream(s_))) {
-            for (Block& b : blocks_)
-                for (W* w : {&b.q, &b.k, &b.v, &b.o, &b.gu, &b.down}) {
-                    w->packed = w->type == 8 && w->n % 128 == 0 && w->k % 256 == 0;
-                    packed_ = packed_ || w->packed;
-                }
         }
         install_prepare();
         if (dry_) return true;
@@ -332,10 +328,10 @@ int8_t* QiDit::xq8(int64_t T, int64_t K, float** sx) {
     return static_cast<int8_t*>(xq_);
 }
 
-// A block's weights as each copy of it reaches the GPU: rewritten as int8 rows (w8) or Q8_0 rows (packed), and
-// the adapters baked in (set_loras); none of it where nothing is to be done (the stream then copies them as they are)
+// A block's weights as each copy of it reaches the GPU: rewritten as int8 rows (w8), and the adapters baked in
+// (set_loras); none of it where nothing is to be done (the stream then copies them as they are)
 void QiDit::install_prepare() {
-    if (!w8_ && !packed_ && !baked_any_) {
+    if (!w8_ && !baked_any_) {
         blocks_stream_.set_prepare(nullptr);
         return;
     }
@@ -350,8 +346,6 @@ void QiDit::install_prepare() {
                     kernels::dequant_f16(w->type, p, 0, w->n, w->k, gemm_.scratch(), s_);
                 qi_rows_i8(gemm_.scratch(), false, w->n, w->k, reinterpret_cast<int8_t*>(p),
                            reinterpret_cast<float*>(p + w->n * w->k), nullptr, s_);
-            } else if (w->packed) {
-                kernels::native_q8_0_to_rows(p, (int) w->k, (int) w->n, s_);
             }
             if (w->baked)
                 w->lora->bake(w->w8 && !w->w8t ? -8 : w->type, p, w->n, w->k, gemm_, bake_tmp_, bake_at16_, s_);
@@ -410,18 +404,6 @@ bool QiDit::product(const uint16_t* x16, const W& w, float* y, int64_t T, int64_
                 qi_i8_scale(y, T, rows, ldy, sx, sw, nullptr, col, s_);
             }
         }
-    } else if (w.packed) {
-        const size_t need = kernels::iq_mmq_act_bytes(T, w.k);
-        if (need > xq_bytes_) {
-            if (xq_ != nullptr) {
-                allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), xq_), allocs_.end());
-                gpu::free(xq_);
-            }
-            xq_ = alloc<uint8_t>(allocs_, (int64_t) need);
-            xq_bytes_ = need;
-        }
-        qi_quantize_q8(x16, T, w.k, xq_, s_);
-        kernels::iq_mmq_q8_rows(core::Runtime::get().stream(s_), xq_, base, y, T, rows, w.k, ldy);
     } else if (w.type == kTypeF16) {
         gemm_.f16(x16, reinterpret_cast<const uint16_t*>(base), y, T, rows, w.k, ldy);
     } else {
@@ -867,7 +849,6 @@ uint64_t QiDit::activation_bytes(int64_t T, int64_t mlp_rows) const {
     return (uint64_t) T * (uint64_t) C_ * 4 * 4 + (uint64_t) T * (uint64_t) std::max(C_, in_ch_) * 4 +
            (uint64_t) mr * 2 * (uint64_t) inter_ * 4 + (uint64_t) T * (uint64_t) std::max(C_, inter_) * 2 +
            (uint64_t) TP * (uint64_t) C_ * 2 * 3 + (uint64_t) T * (uint64_t) C_ * 2 + (uint64_t) T * kHead * 4 +
-           (packed_ ? std::max(kernels::iq_mmq_act_bytes(T, C_), kernels::iq_mmq_act_bytes(mr, inter_)) : 0) +
            (w8_ ? (uint64_t) std::max(T * C_, mr * inter_) + (uint64_t) T * 8 : 0) +
            (lora_cols_ > 0 ? (uint64_t) std::max(T, lora_tmp_t_) * (uint64_t) lora_cols_ * 6 : 0);
 }
@@ -934,16 +915,14 @@ void QiDit::lora_scratch(int64_t T) {
 }
 
 // A GLoRA's own path's buffers: the table the weight's product of its input is added from (a band of tokens, the
-// weight's rows), and that input as a W8A8 product takes it (int8 values and a scale a row) and as a packed Q8_0 one
-// does (kernels::iq_mmq_act_bytes).  The scratch of the deltas (lora_scratch) holds the input's own two products.
+// weight's rows), and that input as a W8A8 product takes it (int8 values and a scale a row).  The scratch of the
+// deltas (lora_scratch) holds the input's own two products.
 void QiDit::lora_glora_scratch() {
     if (lora_glora_cols_ <= 0 || lora_glora_rows_ <= 0) return;
     const size_t band = (size_t) kLoraGloraRows;
     lora_glora_y_ = alloc<float>(allocs_, (int64_t) (band * (size_t) lora_glora_rows_));
     lora_glora_x8_ = alloc<int8_t>(allocs_, (int64_t) (band * (size_t) lora_glora_cols_));
     lora_glora_sx_ = alloc<float>(allocs_, (int64_t) band);
-    lora_glora_xq_bytes_ = kernels::iq_mmq_act_bytes((int64_t) band, lora_glora_cols_);
-    lora_glora_xq_ = alloc<uint8_t>(allocs_, (int64_t) lora_glora_xq_bytes_);
 }
 
 void QiDit::glora_weight(const uint16_t* v, const W& w, int64_t r0, int64_t n, int64_t nt, int64_t t0, float* y,
@@ -956,10 +935,6 @@ void QiDit::glora_weight(const uint16_t* v, const W& w, int64_t r0, int64_t n, i
         prefill::Gemm::i8(lora_glora_x8_, reinterpret_cast<const int8_t*>(d) + r0 * w.k,
                           reinterpret_cast<int32_t*>(lora_glora_y_), nt, n, w.k, n, s_);
         qi_i8_scale(lora_glora_y_, nt, n, n, lora_glora_sx_, sw, nullptr, nullptr, s_);
-    } else if (w.packed) {
-        qi_quantize_q8(v, nt, w.k, lora_glora_xq_, s_);
-        kernels::iq_mmq_q8_rows(core::Runtime::get().stream(s_), lora_glora_xq_, d + (uint64_t) r0 * w.row_bytes,
-                                lora_glora_y_, nt, n, w.k, n);
     } else if (w.type == kTypeF16) {
         gemm_.f16(v, reinterpret_cast<const uint16_t*>(d + (uint64_t) r0 * w.row_bytes), lora_glora_y_, nt, n, w.k, n);
     } else {
@@ -970,7 +945,7 @@ void QiDit::glora_weight(const uint16_t* v, const W& w, int64_t r0, int64_t n, i
 }
 
 void QiDit::free_glora_scratch() {
-    for (void* p : {(void*) lora_glora_y_, (void*) lora_glora_x8_, (void*) lora_glora_sx_, lora_glora_xq_})
+    for (void* p : {(void*) lora_glora_y_, (void*) lora_glora_x8_, (void*) lora_glora_sx_})
         if (p != nullptr) {
             gpu::stream_sync(s_);
             allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), p), allocs_.end());
@@ -979,8 +954,6 @@ void QiDit::free_glora_scratch() {
     lora_glora_y_ = nullptr;
     lora_glora_x8_ = nullptr;
     lora_glora_sx_ = nullptr;
-    lora_glora_xq_ = nullptr;
-    lora_glora_xq_bytes_ = 0;
 }
 
 void QiDit::drop_prefix() {
@@ -1167,7 +1140,7 @@ bool QiDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
         for (Block& b : blocks_)
             for (W* w : {&b.q, &b.k, &b.v, &b.o, &b.gu, &b.down})
                 if (w->lora != nullptr && w->lora->bakeable() &&
-                    (w->w8 && !w->w8t ? -8 : w->type == 1 ? 1 : w->type == 8 && !w->packed ? 8 : 0) != 0) {
+                    (w->w8 && !w->w8t ? -8 : w->type == 1 ? 1 : w->type == 8 ? 8 : 0) != 0) {
                     w->baked = true;
                     nk = std::max(nk, w->n * w->k);
                     for (const LoraPart& p : w->lora->parts) kr = std::max(kr, w->k * p.entry->rank());
@@ -1303,8 +1276,7 @@ uint64_t QiDit::lora_bytes() const {
     uint64_t n = 0;
     for (const std::unique_ptr<LoraLayer>& l : lora_layers_) n += l->bytes();
     if (lora_glora_y_ != nullptr)   // a GLoRA's own path's buffers
-        n += (uint64_t) kLoraGloraRows * ((uint64_t) lora_glora_rows_ * 4 + (uint64_t) lora_glora_cols_ + 4) +
-             lora_glora_xq_bytes_;
+        n += (uint64_t) kLoraGloraRows * ((uint64_t) lora_glora_rows_ * 4 + (uint64_t) lora_glora_cols_ + 4);
     return n;
 }
 
@@ -1347,7 +1319,7 @@ void QiDit::drop_activations() {
     for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) h_, (void*) gu_, (void*) h16_, (void*) q16_,
                     (void*) k16_, (void*) v16_, (void*) o16_, (void*) cos_, (void*) sin_, xq_,
                     (void*) xs_, (void*) lora_f32_, (void*) lora16_, (void*) lora_glora_y_, (void*) lora_glora_x8_,
-                    (void*) lora_glora_sx_, lora_glora_xq_})
+                    (void*) lora_glora_sx_})
         if (p != nullptr) {
             allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), p), allocs_.end());
             gpu::free(p);
@@ -1364,8 +1336,6 @@ void QiDit::drop_activations() {
     lora_glora_y_ = nullptr;
     lora_glora_x8_ = nullptr;
     lora_glora_sx_ = nullptr;
-    lora_glora_xq_ = nullptr;
-    lora_glora_xq_bytes_ = 0;
     cap_T_ = 0;
     rope_H_ = rope_W_ = rope_text_ = -1;
 }

@@ -46,16 +46,6 @@ sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, 
 sycl::event iq_mmq_quantize_scatter(sycl::queue& q, const float* x, const int32_t* slot, void* xq, int64_t cols,
                                     int64_t ld, int64_t tokens, int k_used, bool sums, bool dup = false);
 
-/// Whether iq_mmq_q8_rows runs on `q`'s device: an NVIDIA GPU whose device code here was compiled for sm_80 or later
-/// (asked of the device once), with the local memory and work-group size its form takes.  STRATA_NO_XMX=1 says no.
-bool iq_mmq_q8_rows_usable(sycl::queue& q);
-/// The dense product of Q8_0 weights in kNativeQ8Rows' layout (native_q8_0_to_rows: each row's K int8 values, then its
-/// K / 32 fp16 scales; 16-byte aligned) on NVIDIA's int8 tensor cores' mma.sync: Y[T, N] (row stride ldy) = X[T, K] .
-/// W[N, K]^T, xq iq_mmq_quantize's T rows (without the sums).  N a multiple of 128, K of 256 (every row 16-byte
-/// aligned).  Each block's integer sum scaled by both scales into FP32, as iq_mmq_grouped's products.
-sycl::event iq_mmq_q8_rows(sycl::queue& q, const void* xq, const void* w, float* y, int64_t T, int64_t N, int64_t K,
-                           int64_t ldy);
-
 /// n experts, one launch: expert e's weights ([w_rows, w_cols] in ggml_type's blocks) at w + e * expert_bytes, its
 /// activation rows bounds[e] .. bounds[e + 1] of xq (bounds on the device; xq holds total_rows rows), into dst rows
 /// ids[row] (ld_dst floats apart).  max_rows: the most rows an expert has.  w_rows a multiple of 128, w_cols of 32

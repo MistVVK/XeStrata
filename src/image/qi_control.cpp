@@ -12,8 +12,6 @@
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
-#include "strata/kernels/iq_mmq.hpp"
-#include "strata/kernels/native_mmvq.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -130,11 +128,9 @@ bool QiControl::open(const std::string& path, QiDit& dit, std::string& err, bool
         pair_.assign((size_t) dit.blocks(), -1);
         const int every = dit.blocks() / nb;
         for (int i = 0; i < nb; ++i) pair_[(size_t) i * (size_t) every] = i;
-        // the products in the DiT's own form (its blocks' shape): W8A8 where the DiT took it, else Q8_0's rows on
-        // the int8 tensor cores where the GPU has them, else Q8_0
+        // the products in the DiT's own form (its blocks' shape): W8A8 where the DiT took it, else Q8_0 (FP16
+        // products: QiDit's open says why not Q8_0's int8 rows)
         const bool w8 = dit.w8_;
-        const bool mma = !w8 && kernels::iq_mmq_q8_rows_usable(core::Runtime::get().stream(dit.s_));
-        bool packed_any = false;
         weight_bytes_ = 0;
         for (int b = 0; b < nb; ++b) {
             const std::string p = "control_blocks." + std::to_string(b) + ".";
@@ -159,8 +155,6 @@ bool QiControl::open(const std::string& path, QiDit& dit, std::string& err, bool
                 w.w8 = w8 && it.k % kQiRotate == 0;
                 w.type = kTypeQ8_0;
                 w.row_bytes = w.w8 ? (uint64_t) it.k : (uint64_t) (it.k / 32 * 34);
-                w.packed = mma && it.n % 128 == 0 && it.k % 256 == 0;
-                packed_any = packed_any || w.packed;
                 bytes += w.row_bytes * (uint64_t) it.n + (w.w8 ? (uint64_t) it.n * 4 : 0);
             }
             const std::string nqn = p + "attn.norm_q.weight", nkn = p + "attn.norm_k.weight",
@@ -194,7 +188,7 @@ bool QiControl::open(const std::string& path, QiDit& dit, std::string& err, bool
                         rows += t.shape[0];
                     }
                     if (src == nullptr) src = stacked.data();
-                    // W8A8's rows as qi_rows_i8 makes them, else Q8_0 (rewritten on the GPU for q8_mma_gemm: packed)
+                    // W8A8's rows as qi_rows_i8 makes them, else Q8_0
                     dit_rows::quantize_matrix(src, w.n, w.k, host.data() + at, w.w8);
                 }
                 spans.push_back({host.data() + at, wb, 0});
@@ -223,14 +217,6 @@ bool QiControl::open(const std::string& path, QiDit& dit, std::string& err, bool
             host_.push_back(std::move(host));
             blocks_.push_back(blk);
         }
-        if (packed_any)
-            stream_.set_prepare([this](int i, uint8_t* d) {
-                const Block& b = blocks_[(size_t) i];
-                for (const QiDit::W* w : {&b.q, &b.k, &b.v, &b.o, &b.gu, &b.down, &b.after})
-                    if (w->packed)
-                        kernels::native_q8_0_to_rows(d + reinterpret_cast<uintptr_t>(w->d), (int) w->k, (int) w->n,
-                                                     dit_->s_);
-            });
         // control_img_in and before_proj in FP16 (mapped once a request), their biases FP32
         weight_bytes_ = (uint64_t) (C * in_kp_ + C * C) * 2 + (uint64_t) (2 * C) * 4;
         if (dry) return true;

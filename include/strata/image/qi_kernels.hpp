@@ -115,10 +115,6 @@ void qi_attention_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* 
                       float* dK, float* dV, bool accumulate, prefill::Gemm& gemm, void* stream,
                       int64_t n_causal = 0);
 
-/// The activations of an int8 product (kernels::iq_mmq_quantize's layout, without the sums): rows x cols (a multiple of
-/// 32) of x16 as int8 with a scale for each 32.
-void qi_quantize_q8(const uint16_t* x16, int64_t rows, int64_t cols, void* xq, void* stream);
-
 /// The group a W8A8 product's operands are rotated in (qi_rows_i8): K must be a multiple of it.
 constexpr int64_t kQiRotate = 256;
 

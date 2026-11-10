@@ -162,7 +162,6 @@ private:
         int64_t n = 0, k = 0;   // n rows of k
         const void* d = nullptr;
         uint64_t row_bytes = 0;
-        bool packed = false;    // Q8_0 rewritten as rows for iq_mmq_q8_rows (native_q8_0_to_rows)
         bool w8 = false;        // rewritten as int8 rows and a scale a row (qi_rows_i8) for prefill::Gemm::i8
         bool w8t = false;       // w8 through w8t_: a block format of fewer bits than int8's rows, kept as it is and
                                 // written as int8 rows into the scratch at each product
@@ -238,13 +237,11 @@ private:
     uint16_t* lora16_ = nullptr;
     int64_t lora_tmp_t_ = 0;   // the scratch's rows
     // a GLoRA's own path: its input's columns, the weight's rows it is added over, and the buffers a band of its
-    // products takes (the rows' table, a W8A8 weight's int8 input and its scales, a Q8_0 weight's packed one)
+    // products takes (the rows' table, a W8A8 weight's int8 input and its scales)
     int64_t lora_glora_cols_ = 0, lora_glora_rows_ = 0;
     float* lora_glora_y_ = nullptr;
     int8_t* lora_glora_x8_ = nullptr;
     float* lora_glora_sx_ = nullptr;
-    void* lora_glora_xq_ = nullptr;
-    size_t lora_glora_xq_bytes_ = 0;
     void lora_glora_scratch();   // allocates them, once a set with a GLoRA is bound
     void free_glora_scratch();
     /// A GLoRA's own path: the weight's rows [r0, r0 + n) product of v (nt tokens, the first of them t0), added to
@@ -261,8 +258,6 @@ private:
     float *x_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *h_ = nullptr, *gu_ = nullptr;
     uint16_t *h16_ = nullptr, *q16_ = nullptr, *k16_ = nullptr, *v16_ = nullptr, *o16_ = nullptr;
     float *cos_ = nullptr, *sin_ = nullptr;
-    // the int8 products' activations (W::packed): xq_ for xq_bytes_
-    bool packed_ = false;   // some block's products take them
     bool w8_ = false;       // some block's products are W8A8 ones (W::w8): xq_ holds their activations
     void* xq_ = nullptr;
     size_t xq_bytes_ = 0;

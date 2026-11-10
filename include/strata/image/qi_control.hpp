@@ -14,7 +14,7 @@
 // the server maps to sigmas); at the others the DiT runs as it does without the branch, its prefix cache included.
 //
 // The weights (BF16) are quantized on the host as they are read, as Mage-Flow's DiT is: W8A8's rotated int8 rows
-// where the GPU's library takes int8 products, else Q8_0; the blocks stream through a LayerStream of their own.
+// where the DiT took that form, else Q8_0; the blocks stream through a LayerStream of their own.
 #pragma once
 
 #include "strata/image/qi_dit.hpp"

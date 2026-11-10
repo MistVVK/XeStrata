@@ -7,6 +7,8 @@
 // after it.  BF16, not FP16: some models' products leave values past FP16's range (Mage-Flow's to 4e8), and the
 // reference implementations keep these activations in BF16.  The GPU makers' libraries take no such product
 // (cuBLASLt and hipBLASLt write int8 products' sums as int32 or int8 only, 2026-11-06).
+// RTX 4070, 2026-11-10: Qwen-Image-2.1-Turbo sampling took 3.43 s with W8A8 and 6.85 s with the removed Q8_0
+// row kernel (1024 x 1024, 8 steps), so the dense int8 path uses W8A8 instead.
 #pragma once
 
 #include <cstdint>
