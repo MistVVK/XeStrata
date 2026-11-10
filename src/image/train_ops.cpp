@@ -393,6 +393,19 @@ void f16_copy(const float* x, int64_t n, uint16_t* y, void* stream) {
                                         [=](sycl::id<1> id) { y[id[0]] = kernels::f16_from_f32(x[id[0]]); });
 }
 
+void bf16_keep(float* x, int64_t n, uint16_t* y, void* stream) {
+    dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const uint16_t b = dit_rows::bf16_bits(x[id[0]]);
+        y[id[0]] = b;
+        x[id[0]] = dit_rows::resid(b);
+    });
+}
+
+void bf16_load(const uint16_t* y, int64_t n, float* x, void* stream) {
+    dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) n),
+                                        [=](sycl::id<1> id) { x[id[0]] = dit_rows::resid(y[id[0]]); });
+}
+
 void w8_quantize(const uint16_t* w16, int64_t N, int64_t K, int8_t* q, float* s, void* stream) {
     if (K % kQiRotate != 0) throw std::invalid_argument("image engine: a QLoRA base's rows are not 256-wide groups");
     dit_rows::rows_i8(dit_rows::HalfI8<true>{w16, K}, N, K, q, s, stream);

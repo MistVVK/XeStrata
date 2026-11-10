@@ -162,6 +162,10 @@ void v_scale(const float* v0, int64_t n0, const float* v1, int64_t n1, uint32_t*
 void copy_rows(const float* a, int64_t n, float* out, void* stream);
 void add_into(float* a, const float* b, int64_t n, void* stream);
 void f16_copy(const float* x, int64_t n, uint16_t* y, void* stream);
+/// BF16 rows kept: x rounded to BF16 in place and its bits stored in y (what is read back is what was used), and read
+/// back into FP32, n elements: a trainer's block inputs held at half the memory where the device is short of it.
+void bf16_keep(float* x, int64_t n, uint16_t* y, void* stream);
+void bf16_load(const uint16_t* y, int64_t n, float* x, void* stream);
 
 /// XESTRATA_TRAIN_PROFILE=1: a training block's stages' times, summed over its calls (each mark waits for the GPU, so
 /// the sums are the stages' own and the whole runs slower).  begin() at the block's start, mark(stage) after each

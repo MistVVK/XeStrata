@@ -59,7 +59,7 @@ for _p in (ROOT, ROOT / "tools", ROOT / "tools" / "image"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from serve.images import load_tokenizer, prompt_ids      # the prompt's chat form, as serve sends it  # noqa: E402
+from serve.images import anima_tokens, load_tokenizer, prompt_ids   # the prompt's form, as serve sends it  # noqa: E402
 
 IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".gif")      # what third_party/main/stb reads, so what the engine reads
 LATENT_TAG = "_mf.npz"
@@ -163,7 +163,7 @@ def cache_one(args, tok, uncond: np.ndarray, img: Path, work: Path) -> tuple[str
         for f in work.iterdir():
             f.unlink()
         dump(work, "pix", vae_input(img, bw, bh, (cw, ch), (left, t, r, b)))
-        run_pre(args, "vae", args.vae, work)
+        run_pre(args, "anima-vae" if args.cache == "an" else "vae", args.vae, work)
         lat = undump(work, "latent", np.float32)
         # the posterior's standard deviation beside the mean: a training step draws its latent from them
         sd = {"latents_sd": undump(work, "latent_sd", np.float32)} if (work / "latent_sd.json").is_file() else {}
@@ -171,7 +171,14 @@ def cache_one(args, tok, uncond: np.ndarray, img: Path, work: Path) -> tuple[str
                  crop_ltrb=np.array([left, t, r, b], np.int32), **sd)
         tags.append(tag)
         n += int(lat.size)
-    ids = np.array(prompt_ids(tok, (img.parent / (img.stem + ".txt")).read_text().strip(), 0, args.family), np.int32)
+    caption = (img.parent / (img.stem + ".txt")).read_text().strip()
+    if args.cache == "an":   # Anima's: the Qwen3 ids, and the T5 ids with their weights for the LLM adapter
+        for base, (q, t5, t5w) in (("prompt", anima_tokens(tok, args.t5tok, caption)), ("uncond", uncond)):
+            dump(work, f"{base}_ids", np.array(q, np.int32))
+            dump(work, f"{base}_t5", np.array(t5, np.int32))
+            dump(work, f"{base}_t5w", np.array(t5w, np.float32))
+        return " ".join(tags), n, 0
+    ids = np.array(prompt_ids(tok, caption, 0, args.family), np.int32)
     dump(work, "prompt_ids", ids)
     dump(work, "uncond_ids", uncond)
     if args.cache == "ms":   # MOSS-Image's text rows: every image's at once afterwards (text_cache, moss-text)
@@ -492,16 +499,23 @@ def main() -> int:
                          "encoder's mean) and 3.2e-2 (the text states) on these two runs")
     ap.add_argument("--stub-pre", metavar="OP_DIR", help="act as the engine's tool without a GPU: OP DIR (test only)")
     ap.add_argument("--selftest", action="store_true", help="the host-side rules and the cache path, no GPU")
-    ap.add_argument("--cache", default="mf", choices=("mf", "mt", "ms"),
+    ap.add_argument("--cache", default="mf", choices=("mf", "mt", "ms", "an"),
                     help="the cache files' model tag: mf for Mage-Flow (Mage-VAE), mt for MageTrail (the Flux2 VAE), "
-                         "ms for MOSS-Image (its VAE, Qwen3.5-9B and its DiT's text embedder: --dit)")
-    ap.add_argument("--dit", help="MOSS-Image's DiT folder (--cache ms): its text embedder makes the text rows")
+                         "ms for MOSS-Image (its VAE, Qwen3.5-9B and its DiT's text embedder: --dit), an for Anima "
+                         "(Wan 2.1's VAE, Qwen3-0.6B and its DiT's LLM adapter: --dit, --t5)")
+    ap.add_argument("--dit",
+                    help="MOSS-Image's DiT folder or Anima's DiT file (--cache ms, an): the text rows' last part")
+    ap.add_argument("--out", help="Qwen-Image-2.1's caches and items.txt (--cache qi)")
+    ap.add_argument("--trigger", default="", help="the trigger word --cache qi puts in a caption ([name], [trigger])")
+    ap.add_argument("--t5", help="Anima's T5 tokenizer.json (--cache an): the LLM adapter's ids")
     a = ap.parse_args()
     global LATENT_TAG, TEXT_TAG
     LATENT_TAG, TEXT_TAG = f"_{a.cache}.npz", f"_{a.cache}_te.npz"
-    a.family = "moss-image" if a.cache == "ms" else "mage-flow"
-    if a.cache == "ms" and not a.check and not a.selftest and not a.dit:
-        raise SystemExit("--cache ms needs --dit (MOSS-Image's DiT folder)")
+    a.family = {"ms": "moss-image", "an": "anima"}.get(a.cache, "mage-flow")
+    if a.cache in ("ms", "an") and not a.check and not a.selftest and not a.dit:
+        raise SystemExit(f"--cache {a.cache} needs --dit (the DiT whose text part makes the text rows)")
+    if a.cache == "an" and not a.check and not a.selftest and not a.t5:
+        raise SystemExit("--cache an needs --t5 (Anima's T5 tokenizer.json)")
     if a.selftest:
         with tempfile.TemporaryDirectory(prefix="mf-pre-test-") as td:
             return selftest(Path(td))
@@ -530,7 +544,12 @@ def main() -> int:
         raise SystemExit("--dir or a [datasets.subsets].image_dir is needed")
     d = Path(a.dir)
     tok = load_tokenizer(a.text, a.family)
-    uncond = np.array(prompt_ids(tok, a.neg, 0, a.family), np.int32)
+    if a.cache == "an":
+        import strata_unigram   # the T5 tokenizer serve reads (tools/strata_unigram.py)
+        a.t5tok = strata_unigram.UnigramTokenizer.from_hf_json(a.t5)
+        uncond = anima_tokens(tok, a.t5tok, a.neg)
+    else:
+        uncond = np.array(prompt_ids(tok, a.neg, 0, a.family), np.int32)
     imgs = sorted(p for p in d.iterdir() if p.suffix.lower() in IMG_EXT)
     if a.limit:
         imgs = imgs[:a.limit]
@@ -549,12 +568,13 @@ def main() -> int:
             continue
         print(f"ok   {p.name} {tag} latent {n} values, {rows} {'ids' if a.cache == 'ms' else 'rows'}")
         done.append(p)
-    if a.cache == "ms" and done:   # the text encoder and the DiT opened once for every image
+    if a.cache in ("ms", "an") and done:   # the text encoder and the DiT opened once for every image
         lst = work / "moss-text.list"
         lst.write_text("".join(f"{work / p.stem}\n" for p in done))
-        out = subprocess.run([a.pre, "moss-text", a.text, a.dit, str(lst)], capture_output=True, text=True)
+        op = "moss-text" if a.cache == "ms" else "anima-text"
+        out = subprocess.run([a.pre, op, a.text, a.dit, str(lst)], capture_output=True, text=True)
         if out.returncode != 0:
-            raise SystemExit(f"xestrata-image-mf-pre moss-text: {out.stderr.strip()}")
+            raise SystemExit(f"xestrata-image-mf-pre {op}: {out.stderr.strip()}")
         for p in done:
             print(f"ok   {p.name} text {text_cache(a, p, work / p.stem)} rows")
     print(f"mf_pre: {len(imgs)} image(s), {bad} failure(s)")

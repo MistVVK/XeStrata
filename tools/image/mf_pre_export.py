@@ -212,7 +212,7 @@ def main() -> int:
     ap.add_argument("--dir", default="")
     ap.add_argument("--out", default="")
     ap.add_argument("--selftest", action="store_true")
-    ap.add_argument("--cache", default="mf", choices=("mf", "mt", "ms"),
+    ap.add_argument("--cache", default="mf", choices=("mf", "mt", "ms", "an"),
                     help="the caches' model tag (mf_pre.py --cache)")
     a = ap.parse_args()
     global CACHE_MODEL

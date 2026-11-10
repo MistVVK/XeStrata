@@ -755,9 +755,8 @@ void AnimaDit::drop_kv() {
 
 // The image tokens' RoPE (VideoRopePosition3DEmb with one frame): pairs 0 .. 21 by the time (0: not turned), 22 .. 42
 // by the row, 43 .. 63 by the column, each axis's frequencies 10000^(-2k / its width) (widths 44, 42, 42 of the 128)
-void AnimaDit::rope_tables(int64_t h, int64_t w) {
-    if (rope_h_ == h && rope_w_ == w) return;
-    const int64_t half = hd_ / 2, dh = hd_ / 6 * 2, dt = hd_ - 2 * dh, nt = dt / 2, nh = dh / 2;
+void anima_rope_tables(int64_t h, int64_t w, int64_t hd, std::vector<float>& c, std::vector<float>& s) {
+    const int64_t half = hd / 2, dh = hd / 6 * 2, dt = hd - 2 * dh, nt = dt / 2, nh = dh / 2;
     std::vector<float> fr((size_t) half);
     for (int64_t j = 0; j < half; ++j) {
         const bool t = j < nt;
@@ -765,7 +764,8 @@ void AnimaDit::rope_tables(int64_t h, int64_t w) {
         const float range = (float) (2 * k) / (float) (t ? dt : dh);
         fr[(size_t) j] = 1.f / std::pow(10000.f, range);
     }
-    std::vector<float> c((size_t) (h * w * half)), s(c.size());
+    c.assign((size_t) (h * w * half), 0.f);
+    s.assign(c.size(), 0.f);
     for (int64_t y = 0; y < h; ++y)
         for (int64_t x = 0; x < w; ++x)
             for (int64_t j = 0; j < half; ++j) {
@@ -774,6 +774,12 @@ void AnimaDit::rope_tables(int64_t h, int64_t w) {
                 c[(size_t) ((y * w + x) * half + j)] = std::cos(ph);
                 s[(size_t) ((y * w + x) * half + j)] = std::sin(ph);
             }
+}
+
+void AnimaDit::rope_tables(int64_t h, int64_t w) {
+    if (rope_h_ == h && rope_w_ == w) return;
+    std::vector<float> c, s;
+    anima_rope_tables(h, w, hd_, c, s);
     gpu::copy(cos_, c.data(), c.size() * 4);
     gpu::copy(sin_, s.data(), s.size() * 4);
     rope_h_ = h;

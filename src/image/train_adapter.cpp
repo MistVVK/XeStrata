@@ -21,22 +21,46 @@ namespace {
 
 using kernels::f16_from_f32;
 
-// dX[t][k] += sum_r dh[t][r] A[r][k] (dh [R][rank] FP32, A [rank][K] FP16): an item a column and kTR rows, A's value
-// read once for them
+// dX[t][k] += sum_r dh[t][r] A[r][k] (dh [R][rank] FP32, A [rank][K] FP16): a work-group of kWG columns and a tile of
+// rows, the tile's dh in local memory, each item's column of A in registers 32 ranks at a time.  Against an item a
+// column and 16 rows reading dh and A from memory, 2.0 to 2.7 times as fast on the B70, 2.2 to 2.7 on the RTX 4070,
+// 2.6 to 2.9 on the Arc A380 and 2.7 to 4.2 on the RX 9060 XT (2255 to 4800 rows, K 2048 to 12288, rank 32;
+// 2026-11-10); 32 rows a tile were the fastest or within 5% of it on all four.  A rank too large for 32 rows of dh
+// in half the local memory takes fewer rows a tile.
 void lora_dx(const float* dh, const uint16_t* A, int64_t R, int64_t rank, int64_t K, float* dX, void* s) {
-    constexpr int64_t kTR = 16;
-    const int64_t groups = (R + kTR - 1) / kTR;
-    dit_rows::q_of(s).parallel_for(sycl::range<2>((size_t) groups, (size_t) K), [=](sycl::item<2> it) {
-        const int64_t t0 = (int64_t) it.get_id(0) * kTR, k = (int64_t) it.get_id(1);
-        const int64_t n = sycl::min(kTR, R - t0);
-        float acc[kTR] = {};
-        for (int64_t r = 0; r < rank; ++r) {
-            const float a = kernels::f32_from_f16(A[r * K + k]);
-            for (int64_t i = 0; i < kTR; ++i)
-                if (i < n) acc[i] += dh[(t0 + i) * rank + r] * a;
-        }
-        for (int64_t i = 0; i < kTR; ++i)
-            if (i < n) dX[(t0 + i) * K + k] += acc[i];
+    constexpr int64_t kWG = 128, kChunk = 32;
+    sycl::queue& q = dit_rows::q_of(s);
+    const size_t local = q.get_device().get_info<sycl::info::device::local_mem_size>();
+    int64_t tr = 32;
+    while (tr > 1 && (size_t) (tr * rank) * 4 > local / 2) tr /= 2;
+    const int64_t groups = (R + tr - 1) / tr, kg = (K + kWG - 1) / kWG;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> tile(sycl::range<1>((size_t) (tr * rank)), h);
+        h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) groups, (size_t) (kg * kWG)), sycl::range<2>(1, kWG)),
+                       [=](sycl::nd_item<2> it) {
+            const int64_t t0 = (int64_t) it.get_group(0) * tr, k = (int64_t) it.get_global_id(1);
+            const int64_t n = sycl::min(tr, R - t0);
+            for (int64_t j = (int64_t) it.get_local_id(1); j < n * rank; j += kWG) tile[j] = dh[t0 * rank + j];
+            sycl::group_barrier(it.get_group());
+            if (k >= K) return;
+            for (int64_t r0 = 0; r0 < rank; r0 += kChunk) {
+                float a[kChunk];
+#pragma unroll
+                for (int64_t r = 0; r < kChunk; ++r)
+                    a[r] = r0 + r < rank ? kernels::f32_from_f16(A[(r0 + r) * K + k]) : 0.f;
+                const int64_t m = sycl::min(kChunk, rank - r0);
+                for (int64_t i = 0; i < n; ++i) {
+                    float acc = 0.f;
+                    if (m == kChunk) {
+#pragma unroll
+                        for (int64_t r = 0; r < kChunk; ++r) acc += tile[i * rank + r0 + r] * a[r];
+                    } else {
+                        for (int64_t r = 0; r < m; ++r) acc += tile[i * rank + r0 + r] * a[r];
+                    }
+                    dX[(t0 + i) * K + k] += acc;
+                }
+            }
+        });
     });
 }
 

@@ -39,6 +39,10 @@ int64_t draw_index(std::mt19937_64& rng, IndexDraw how);
 /// A LoRA's first values (peft's: A kaiming-uniform with a = sqrt(5), bound 1 / sqrt(K); B zero), host FP32.
 void lora_init(std::mt19937_64& rng, int64_t rank, int64_t K, std::vector<float>& A);
 
+/// ai-toolkit's "weighted" timesteps (Anima's default): the loss weight of index i (0 .. 999) of the linear timesteps
+/// (src/image/flow_weighting.cpp, ai-toolkit's default_weighing_scheme).
+float flow_weight(int64_t index);
+
 /// The sum of squares of every device FP32 array of `parts` (pointer, count: the gradients of a global norm), in
 /// double on the host, read back once.
 double sq_sum(const std::vector<std::pair<const float*, int64_t>>& parts, void* stream);

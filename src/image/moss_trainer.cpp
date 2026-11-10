@@ -112,6 +112,24 @@ struct MossTrainer::Impl {
     // buffer, less the scratch's growth to this step's rows (what it holds for the most rows so far, in proportion,
     // 10% over), what the step takes of its own (step_bytes: decided before the step takes it, so a smaller step's
     // tapes are let go first) and 1.5 GiB of transients.
+    // Whether this step holds its blocks' inputs in BF16 (XESTRATA_TRAIN_INPUTS16=0 or 1, or by the memory): when the
+    // free memory and the tapes' buffer fall short of their FP32 bytes, the scratch's growth to this step's rows (in
+    // proportion to the most rows so far, 10% over; a block's tape's bytes before any step has shown it) and 1.5 GiB
+    // of transients.  The forward then rounds each input to BF16 as it keeps it, so the backward reads what the forward
+    // used (the inference keeps its residual in BF16 too); a device with the memory keeps FP32 and its numbers.
+    bool inputs_half(const MossBlockRun& r, size_t f32_bytes) {
+        if (const char* e = strata::env_get("TRAIN_INPUTS16")) return std::atoi(e) != 0;
+        size_t free_b = 0, total = 0;
+        gpu::stream_sync(s);
+        if (!gpu::mem_info(&free_b, &total)) return false;
+        free_b += tape_cap;
+        const size_t scratch =
+            scratch_rows > 0
+                ? (size_t) (1.1 * (double) arena.held() * (double) std::max(r.rows, scratch_rows) / (double) scratch_rows)
+                : moss_block_tape_bytes(r, gemm);
+        const size_t need = f32_bytes + (scratch > arena.held() ? scratch - arena.held() : 0) + (size_t{3} << 29);
+        return free_b < need;
+    }
     int64_t tapes_kept(const MossBlockRun& r, size_t step_bytes) {
         const int64_t nb = (int64_t) blk.size();
         if (tapes.size() != (size_t) nb) tapes.resize((size_t) nb);
@@ -377,9 +395,11 @@ float MossTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0, 
     if (!gpu::copy(dx0, x0.data(), x0.size() * 4) || !gpu::copy(deps, eps.data(), eps.size() * 4) ||
         !gpu::copy(dxs, xs.data(), xs.size() * 4))
         throw std::runtime_error("image engine (MOSS-Image training): copy");
-    // the tapes kept this step, decided before the step's own buffers are taken (every block's input, the backward's
-    // two gradients and its blocks' output)
+    // the blocks' inputs' form and the tapes kept this step, decided before the step's own buffers are taken (every
+    // block's input, the backward's two gradients and its blocks' output; in BF16, the inputs at half and two FP32
+    // rows' buffers the forward passes between and the backward reads an input into and writes its output to)
     int64_t first_kept = nb;
+    bool half = false;
     if (backward) {
         MossBlockRun z;
         z.C = C;
@@ -391,9 +411,16 @@ float MossTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0, 
             z.p[i] = m.blk.back().p[i];
             z.ad[i] = m.blk.back().adapted ? &m.blk.back().l[i].ad : nullptr;
         }
-        first_kept = nb - m.tapes_kept(z, (size_t) ((nb + 1 + 3) * R * C) * 4);
+        const size_t rc = (size_t) (R * C);
+        half = m.inputs_half(z, (size_t) (nb + 1 + 3) * rc * 4);
+        first_kept =
+            nb - m.tapes_kept(z, half ? (size_t) (nb + 1) * rc * 2 + 4 * rc * 4 : (size_t) (nb + 1 + 3) * rc * 4);
     }
-    float* bounds = pool.f((backward ? nb + 1 : 2) * R * C);
+    // FP32: every block's input in bounds (two of them passed between, the forward alone); BF16: bounds the two
+    // passed between, the inputs in bounds16
+    const bool all32 = backward && !half;
+    float* bounds = pool.f((all32 ? nb + 1 : 2) * R * C);
+    uint16_t* bounds16 = half ? pool.u((nb + 1) * R * C) : nullptr;
     uint16_t* x16 = pool.u(R * std::max(C, IC));
     float* rs = pool.f(R);
     kernels::f32_to_f16_bulk(dxs, x16, HW * IC, s);
@@ -474,12 +501,14 @@ float MossTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0, 
     for (int64_t b = 0; b < nb; ++b) {
         MossBlockRun r = run_of(b);
         if (b >= first_kept) r.tape = m.tapes[(size_t) b].get();
-        r.x = backward ? bounds + b * R * C : bounds + (b % 2) * R * C;
-        r.out = backward ? bounds + (b + 1) * R * C : bounds + ((b + 1) % 2) * R * C;
+        if (half && b == 0) train::bf16_keep(bounds, R * C, bounds16, s);
+        r.x = all32 ? bounds + b * R * C : bounds + (b % 2) * R * C;
+        r.out = all32 ? bounds + (b + 1) * R * C : bounds + ((b + 1) % 2) * R * C;
         moss_block(r, m.gemm, s, &m.arena);
+        if (half) train::bf16_keep(r.out, R * C, bounds16 + (b + 1) * R * C, s);
     }
     tm.mark("blocks forward", s);
-    const float* last = backward ? bounds + nb * R * C : bounds + (nb % 2) * R * C;
+    float* last = all32 ? bounds + nb * R * C : bounds + (nb % 2) * R * C;
     // the head on the image's rows: the final norm scaled and shifted by the time, the projection to the latent
     float *mean = pool.f(HW), *inv = pool.f(HW);
     dit_rows::rows16(dit_rows::RmsAffine{last, m.fnorm, m.head + C, m.head, C, kEps, true}, HW, C, x16, rs, s, mean,
@@ -500,7 +529,9 @@ float MossTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0, 
     float* dln = pool.f(HW * C);
     float* sums = pool.f(HW * C);
     train::dgrad(dv16, dvrs, fout_t, HW, IC, C, dln, sums, false, m.gemm, s);
-    float* out = pool.f(R * C);    // the blocks' outputs in the backward (its forward's again: not read)
+    // the blocks' outputs in the backward (its forward's again: not read); BF16: the forward's other buffer, and the
+    // last one (the head's, done with) the input read back into
+    float* out = half ? bounds + ((nb + 1) % 2) * R * C : pool.f(R * C);
     float* dcur = pool.f(R * C);   // the text rows' gradient from the head: none
     float* dnxt = pool.f(R * C);
     dit_rows::rms_affine_bwd(last, inv, m.fnorm, m.head + C, dln, HW, C, dcur, s);
@@ -514,7 +545,8 @@ float MossTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0, 
             else train::transpose_f16(pr.w, pr.N, pr.K, m.wt[i], s);
             r.p[i].wt = m.wt[i];
         }
-        r.x = bounds + b * R * C;
+        if (half) train::bf16_load(bounds16 + b * R * C, R * C, last, s);
+        r.x = half ? last : bounds + b * R * C;
         r.out = out;
         r.dout = dcur;
         r.dx = b > 0 ? dnxt : nullptr;   // nothing below block 0 takes a gradient

@@ -24,10 +24,14 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/mf_vae.hpp"
+#include "strata/image/anima_dit.hpp"
+#include "strata/image/anima_pipeline.hpp"
 #include "strata/image/moss_dit.hpp"
+#include "strata/image/qi_vae.hpp"
 #include "strata/image/moss_text.hpp"
 #include "strata/image/qi_text.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/f16_bits.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -263,6 +267,103 @@ int moss_text(const std::string& te_path, const std::string& dit_path, const std
     return 0;
 }
 
+/// Anima's latent (Wan 2.1's VAE, QiVae): the posterior's mean and standard deviation as the DiT's tokens of 2 x 2
+/// patches, written channels-first [64][h][w] as `latent` and `latent_sd` (the export puts them back to tokens).
+int anima_vae(const std::string& path, const std::string& dir) {
+    void* s = strata::core::Runtime::get().create_stream();
+    strata::image::QiVae v;
+    std::string err;
+    if (!v.open(path, s, err)) throw std::runtime_error(err);
+    const Var pix = load(dir, "pix");
+    if (pix.type != "f32" || pix.shape.size() != 3 || pix.dim(0) != 3)
+        throw std::runtime_error("pix must be [3][H][W] FP32 (-1 .. 1)");
+    const int64_t H = pix.dim(1), W = pix.dim(2), h = H / 16, w = W / 16, L = 16, T = 4 * L;
+    if (H % 16 != 0 || W % 16 != 0) throw std::runtime_error("pix's sides must be multiples of 16");
+    std::vector<float> rgba((size_t) (4 * H * W), 1.f);   // an opaque alpha, the encoder's 0 .. 1
+    for (int64_t i = 0; i < 3 * H * W; ++i) rgba[(size_t) i] = pix.f()[i] * 0.5f + 0.5f;
+    float* src = put(rgba);
+    float *z = nullptr, *zs = nullptr, *x = nullptr;
+    if (!strata::gpu::alloc_device(&z, (size_t) (T * h * w) * 4) || !strata::gpu::alloc_device(&zs, (size_t) (T * h * w) * 4) ||
+        !strata::gpu::alloc_device(&x, (size_t) (T * h * w) * 4))
+        throw std::runtime_error("GPU memory");
+    if (!v.encode(src, H, W, z, zs)) throw std::runtime_error("the VAE has no encoder");
+    for (int k = 0; k < 2; ++k) {
+        strata::image::anima_pipeline_detail::latent_to_tokens(k == 0 ? z : zs, h, w, L, x, s);
+        strata::gpu::stream_sync(s);
+        const auto y = channels_first(fetch(x, (size_t) (T * h * w)), h * w, T);
+        save(dir, k == 0 ? "latent" : "latent_sd", y.data(), (int64_t) y.size() * 4, "f32", {w, h, T});
+    }
+    std::printf("anima latent %lld x %lld -> %lld x %lld x %lld\n", (long long) W, (long long) H, (long long) T,
+                (long long) h, (long long) w);
+    for (float* p : {z, zs, x, src}) strata::gpu::free(p);
+    return 0;
+}
+
+/// Anima's context rows as its blocks' cross-attention reads them: each listed work dir's prompt and uncond (Qwen3 ids
+/// through the text encoder's final norm, then the DiT's LLM adapter with the T5 ids and their weights), every one of
+/// the rows the blocks take (the zero rows after the prompt's included), FP32 from the FP16 rows times their scales.
+/// The text encoder is closed before the DiT opens.
+int anima_text(const std::string& te_path, const std::string& dit_path, const std::string& list) {
+    void* s = strata::core::Runtime::get().create_stream();
+    std::vector<std::string> dirs;
+    {
+        std::ifstream f(list);
+        for (std::string line; std::getline(f, line);)
+            if (!line.empty()) dirs.push_back(line);
+    }
+    if (dirs.empty()) throw std::runtime_error(list + ": no work dirs");
+    std::vector<std::vector<float>> states(dirs.size() * 2);
+    std::string err;
+    int64_t H = 0;
+    {
+        QiText te;
+        if (!te.open(te_path, s, err)) throw std::runtime_error(err);
+        te.set_final_norm(true);
+        H = te.hidden();
+        for (size_t d = 0; d < dirs.size(); ++d)
+            for (int b = 0; b < 2; ++b) {
+                const Var ids = load(dirs[d], b == 0 ? "prompt_ids" : "uncond_ids", b == 1);
+                if (ids.raw.empty()) continue;
+                const std::vector<int32_t> v(ids.i(), ids.i() + ids.dim(0));
+                states[d * 2 + b] = te.encode(v);
+                if (states[d * 2 + b].empty()) throw std::runtime_error(dirs[d] + ": no states");
+            }
+    }
+    strata::image::AnimaDit dit;
+    if (!dit.open(dit_path, s, err, false, false)) throw std::runtime_error(err);
+    const int64_t C = dit.context_cols();
+    for (size_t d = 0; d < dirs.size(); ++d)
+        for (int b = 0; b < 2; ++b) {
+            const std::vector<float>& st = states[d * 2 + b];
+            if (st.empty()) continue;
+            const std::string base = b == 0 ? "prompt" : "uncond";
+            const Var t5 = load(dirs[d], base + "_t5");
+            const Var t5w = load(dirs[d], base + "_t5w");
+            const std::vector<int32_t> ids(t5.i(), t5.i() + t5.dim(0));
+            const std::vector<float> wts(t5w.f(), t5w.f() + t5w.dim(0));
+            dit.set_contexts({{0, st.data(), (int64_t) st.size() / H, &ids, &wts}});
+            strata::gpu::stream_sync(s);
+            const int64_t rows = dit.context_rows(0);
+            std::vector<uint16_t> c16((size_t) (rows * C));
+            std::vector<float> rs((size_t) rows);
+            if (!strata::gpu::copy(c16.data(), dit.context16(0), c16.size() * 2) ||
+                !strata::gpu::copy(rs.data(), dit.context_scales(0), rs.size() * 4))
+                throw std::runtime_error("copy");
+            std::vector<float> f32(c16.size());
+            std::vector<uint16_t> bits(c16.size());
+            for (int64_t r = 0; r < rows; ++r)
+                for (int64_t c = 0; c < C; ++c) {
+                    const size_t k = (size_t) (r * C + c);
+                    f32[k] = strata::kernels::f32_from_f16(c16[k]) * rs[(size_t) r];
+                    bits[k] = strata::kernels::bf16_from_f32(f32[k]);
+                }
+            save(dirs[d], base + "_embeds", bits.data(), (int64_t) bits.size() * 2, "bf16", {C, rows});
+            save(dirs[d], base + "_embeds32", f32.data(), (int64_t) f32.size() * 4, "f32", {C, rows});
+            std::printf("%s %s: %lld rows x %lld\n", dirs[d].c_str(), base.c_str(), (long long) rows, (long long) C);
+        }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -271,12 +372,15 @@ int main(int argc, char** argv) {
         if (what == "vae" && argc == 4) return vae(argv[2], argv[3]);
         if (what == "text" && (argc == 4 || argc == 5)) return text(argv[2], argv[3], argc == 5 ? std::stoll(argv[4]) : 34);
         if (what == "moss-text" && argc == 5) return moss_text(argv[2], argv[3], argv[4]);
+        if (what == "anima-vae" && argc == 4) return anima_vae(argv[2], argv[3]);
+        if (what == "anima-text" && argc == 5) return anima_text(argv[2], argv[3], argv[4]);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "xestrata-image-mf-pre: %s\n", e.what());
         return 1;
     }
     std::fprintf(stderr,
                  "usage: %s vae VAE.safetensors DIR | text TEXT_ENCODER.gguf DIR [DROP] | "
-                 "moss-text TEXT_ENCODER.gguf DIT_DIR LIST\n", argv[0]);
+                 "moss-text TEXT_ENCODER.gguf DIT_DIR LIST | anima-vae VAE.safetensors DIR | "
+                 "anima-text TEXT_ENCODER.gguf DIT.safetensors LIST\n", argv[0]);
     return 2;
 }

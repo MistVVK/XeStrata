@@ -32,6 +32,12 @@ namespace strata::image {
 /// The "simple" schedule of a flow model at `shift` over 1000 training steps: n sigmas from the top, then 0.
 std::vector<float> anima_sigmas(int n, float shift = 3.0f);
 
+namespace anima_pipeline_detail {
+/// The VAE's latent z [L][2 h][2 w] (device FP32) as the DiT's tokens x [h w][4 L] (a token's 2 x 2 patch, channel c of
+/// pixel (m, n) at c * 4 + m * 2 + n).
+void latent_to_tokens(const float* z, int64_t h, int64_t w, int64_t L, float* x, void* s);
+}  // namespace anima_pipeline_detail
+
 class AnimaPipeline : public ImagePipeline {
 public:
     /// `dit`: the DiT's safetensors, `vae`: Wan 2.1's VAE (Comfy-Org's qwen_image_vae.safetensors), `text`:

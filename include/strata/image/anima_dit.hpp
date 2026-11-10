@@ -53,6 +53,10 @@ namespace strata::image {
 /// a prefix.
 bool anima_is_dit(const std::string& path);
 
+/// The self-attention's 3-D RoPE tables [h w][hd / 2] (cos, sin) of one image (frame 0): the time's pairs, then the
+/// rows', then the columns', as the DiT reads them; the trainer's as the inference's.
+void anima_rope_tables(int64_t h, int64_t w, int64_t hd, std::vector<float>& c, std::vector<float>& s);
+
 class AnimaDit {
 public:
     AnimaDit();
@@ -80,6 +84,11 @@ public:
     };
     void set_contexts(const std::vector<ContextIn>& in);
     int64_t context_rows(int i) const { return ctx_[i].rows; }
+    /// Context i's rows as the blocks' cross-attention reads them: [context_rows(i)][context_cols()] FP16, each row
+    /// times its scale (context_scales), the zero rows after the prompt's included (a trainer's cache of them).
+    const uint16_t* context16(int i) const { return ctx_[i].c16; }
+    const float* context_scales(int i) const { return ctx_[i].rs; }
+    int64_t context_cols() const { return ad_C_; }
 
     /// The velocity [n][h w][64] (device FP32, the tokens' order) of the tokens x [h w][64] at sigma, for the contexts
     /// 0 .. n - 1 (n 1 or 2).

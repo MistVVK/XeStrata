@@ -84,6 +84,10 @@ Every copyright holder whose work is in this repository, its license and where t
   sigma the model is asked at, their constants and the settings' defaults), written after
   https://github.com/muerrilla/sd-webui-detail-daemon and https://github.com/Jonseed/ComfyUI-Detail-Daemon; that code
   stays under MIT, the files as a whole are under the LGPL (LGPL-3.0-or-later AND MIT) - text below
+- Copyright (c) 2024 Ostris, LLC
+  MIT - the LoRA trainer's timestep weights (src/image/flow_weighting.cpp: the 1,000 weights of ai-toolkit's
+  "weighted" timesteps, toolkit/timestep_weighing/default_weighing_scheme.py of https://github.com/ostris/ai-toolkit,
+  as they are); they stay under MIT, the file as a whole is under the LGPL (LGPL-3.0-or-later AND MIT) - text below
 - Copyright (c) 2024 ZhengPeng
   MIT - BiRefNet's foreground estimate (src/image/aux_kernels.cpp, include/strata/image/aux_kernels.hpp and
   src/image/birefnet.cpp: the blur fusion's two passes, their radii and constants), written after
