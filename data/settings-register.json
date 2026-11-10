@@ -25564,7 +25564,7 @@
    "last_date": "2026-11-05",
    "status": "opt-in",
    "owner": "prefill",
-   "note": "[reviewed] Documented: K-quant packs take fused experts only with this set. [docs/STRIX_HALO.md:228]",
+   "note": "[reviewed] Documented: K-quant packs take fused experts only with this set. [docs/STRIX_HALO.md:228] CUDA (phase 4, opt-in, default off): Q4_K / Q5_K gate/up with a Q5_1 down on the fused native kernels on any sm_80+ card instead of MMQ.",
    "retire_after": "",
    "retired_in": ""
   },

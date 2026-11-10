@@ -311,6 +311,15 @@ std::vector<int32_t> download_i(const Dev& d, size_t n) {
     return h;
 }
 
+// K-quant gate/up pairs (Q4_K / Q5_K: a minimum per 32 values) are not judged against MMQ.  MMQ takes the minimum term from its own
+// activation sums (q8_1 / DS4 per 32 values, stored as half2) and so departs from the int8 model by 3-5e-3 rel RMS behind a Q8_0 down
+// (CUDA, RTX A6000 / PRO 5000 / PRO 6000: Q4_K / Q8_0 3.9-4.8e-3, Q5_K / Q8_0 2.8-3.5e-3; gfx1201 (lane OWN-4A): Q4_K / Q8_0 3.9-4.8e-3),
+// while MMQ and the int8 model are the same distance from FP32 in every shape (within 1%; 1.07-1.10x at the 1-token shape's 10 rows).
+// Rule: the int8 model as for every pair (rel RMS 2e-3, worst row 3e-2) AND FP32 no further than MMQ's own distance times
+// kKqRms (RMS) / kKqWorst (worst row); fused against MMQ is printed as information.  The i-quant pairs keep their rule.
+constexpr double kKqRms = 1.15, kKqWorst = 1.5;
+bool kq_gu(const Pair& p) { return p.gu == GGML_TYPE_Q4_K || p.gu == GGML_TYPE_Q5_K; }
+
 // part 1: against the double-precision reference
 void reference_part(const Pair& p, cudaStream_t s, int T = 256, int E = 64, int ZERO = 77) {
     const Geo geo(p);
@@ -423,6 +432,11 @@ void reference_part(const Pair& p, cudaStream_t s, int T = 256, int E = 64, int 
     if (!mq) {   // no MMQ here: the int8 activations' own error (the IQ pairs' fused path sits at ~1e-2 rel RMS)
         if (ef.rms > 0.03 || ef.worst > 0.25)
             throw std::runtime_error(std::string(p.name) + ": the fused path's error against the reference is too large");
+        return;
+    }
+    if (kq_gu(p)) {   // the K-quant rule (kq_gu): the int8 model above, and FP32 no further than MMQ's own distance + the margin
+        if (ef.rms > kKqRms * em.rms || ef.worst > kKqWorst * em.worst)
+            throw std::runtime_error(std::string(p.name) + ": the fused path is further from the reference than MMQ (K-quant rule)");
         return;
     }
     if (ef.rms > 1.5 * em.rms || ef.worst > 2.0 * em.worst)
@@ -605,9 +619,9 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     {
         std::vector<size_t> pick;
         for (size_t i = 0; i < 96; ++i) pick.push_back((i * 2654435761u) % (size_t) rows);
-        std::vector<float> ref(pick.size() * N), ym(pick.size() * N), yf(pick.size() * N);
+        std::vector<float> ref(pick.size() * N), ref2(pick.size() * N), ym(pick.size() * N), yf(pick.size() * N);
         std::vector<uint8_t> hb(geo.bytes);
-        std::vector<float> gu, dn, h(FF);
+        std::vector<float> gu, dn, h(FF), xq(N), h2(FF), hq(FF);
         for (size_t j = 0; j < pick.size(); ++j) {
             const size_t i = pick[j];
             const int e = ids[i];
@@ -626,6 +640,22 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
                 for (int f = 0; f < FF; ++f) a += (double) wd[f] * h[(size_t) f];
                 ref[j * N + o] = (float) a;
             }
+            if (kq_gu(p)) {   // the int8-rounded model on the sample (the K-quant rule, see kq_gu)
+                quant32(xr, xq.data(), N);
+                for (int f = 0; f < FF; ++f) {
+                    double gt = 0, up = 0;
+                    const float *wg = gu.data() + (size_t) f * N, *wu = gu.data() + (size_t) (FF + f) * N;
+                    for (int k = 0; k < N; ++k) { gt += (double) wg[k] * xq[(size_t) k]; up += (double) wu[k] * xq[(size_t) k]; }
+                    h2[(size_t) f] = (float) (gt / (1.0 + std::exp(-gt)) * up);
+                }
+                quant32(h2.data(), hq.data(), FF);
+                for (int o = 0; o < N; ++o) {
+                    double a = 0;
+                    const float* wd = dn.data() + (size_t) o * FF;
+                    for (int f = 0; f < FF; ++f) a += (double) wd[f] * hq[(size_t) f];
+                    ref2[j * N + o] = (float) a;
+                }
+            }
             if (mq) std::copy_n(y_mmq.begin() + (ptrdiff_t) ((size_t) r.row_of[i] * N), N, ym.begin() + (ptrdiff_t) (j * N));
             std::copy_n(y_f.begin() + (ptrdiff_t) ((size_t) slot[i] * N), N, yf.begin() + (ptrdiff_t) (j * N));
         }
@@ -633,6 +663,14 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
         const Err em = mq ? compare(ym, id, ref, id, pick.size()) : Err{}, ef = compare(yf, id, ref, id, pick.size());
         std::printf("  sample of %zu pairs vs FP32 reference: MMQ rel RMS %.3e worst %.3e, fused rel RMS %.3e worst "
                     "%.3e\n", pick.size(), em.rms, em.worst, ef.rms, ef.worst);
+        if (kq_gu(p)) {
+            const Err e2 = compare(yf, id, ref2, id, pick.size());
+            std::printf("  sample of %zu pairs, fused vs the int8-rounded model: rel RMS %.3e worst %.3e\n", pick.size(), e2.rms, e2.worst);
+            if (e2.rms > (f16_on() ? 5e-3 : 2e-3) || e2.worst > 3e-2)
+                throw std::runtime_error(std::string(p.name) + ": the fused path differs from its own arithmetic's model (timing)");
+            if (mq && (ef.rms > kKqRms * em.rms || ef.worst > kKqWorst * em.worst))
+                throw std::runtime_error(std::string(p.name) + ": the fused path is further from the reference than MMQ (K-quant rule, timing)");
+        } else
         if (!mq ? (ef.rms > 0.03 || ef.worst > 0.25) : (ef.rms > 1.5 * em.rms || ef.worst > 2.0 * em.worst))
             throw std::runtime_error(std::string(p.name) + ": the fused path's error is not comparable to MMQ's (timing)");
     }
@@ -641,7 +679,8 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     delete mbp;
     // the two int8 paths at the real shape, every tile of the layer: R9700 rel RMS 1.3-1.9e-4, worst row 2.9e-3-8.3e-3
     // (STRATA_PF_F16=1: F16 products against MMQ's int8, gfx1151 rel RMS 2.5-2.7e-3, worst row 6.4e-3-8.8e-3)
-    if (mq && !no_mmq && (efm.rms > (f16_on() ? 5e-3 : 1e-3) || efm.worst > 2e-2))
+    // (K-quant gate/up pairs: fused against MMQ is information only, see kq_gu)
+    if (mq && !no_mmq && !kq_gu(p) && (efm.rms > (f16_on() ? 5e-3 : 1e-3) || efm.worst > 2e-2))
         throw std::runtime_error(std::string(p.name) + ": the paths disagree at the real shape");
 }
 }  // namespace
