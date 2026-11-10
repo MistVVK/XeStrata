@@ -48,6 +48,31 @@ struct V {
 };
 inline V vmax(V a, V b) { return _mm256_max_ps(a.v, b.v); }
 
+// The product's micro-kernel on raw __m256 (no wrapper struct in the hot loop: MSVC kept the wrapper in memory, 1.46 to 1.82 of mtmd-CPU's time on Windows;
+// RESULTS-OWN-3V.md 12.14).  The same operations in the same order as the generic micro of cpu_kernels_impl.h, so the results are bit-identical.
+#define STRATA_KN_HAS_MICRO 1
+template <int MR>
+inline void micro(const float* A, size_t lda, const float* B, size_t ldb, int K, float* C, size_t ldc, int init, const float* bias) {
+    __m256 acc[MR][2];
+    for (int r = 0; r < MR; ++r)
+        for (int c = 0; c < 2; ++c) {
+            __m256 v = _mm256_setzero_ps();
+            if (init != 0) v = _mm256_loadu_ps(C + (size_t) r * ldc + c * 8);
+            if (init != 1 && bias) v = _mm256_add_ps(v, _mm256_loadu_ps(bias + c * 8));
+            acc[r][c] = v;
+        }
+    for (int k = 0; k < K; ++k) {
+        const __m256 b0 = _mm256_loadu_ps(B + (size_t) k * ldb), b1 = _mm256_loadu_ps(B + (size_t) k * ldb + 8);
+        for (int r = 0; r < MR; ++r) {
+            const __m256 a = _mm256_set1_ps(A[(size_t) r * lda + k]);
+            acc[r][0] = _mm256_fmadd_ps(a, b0, acc[r][0]);
+            acc[r][1] = _mm256_fmadd_ps(a, b1, acc[r][1]);
+        }
+    }
+    for (int r = 0; r < MR; ++r)
+        for (int c = 0; c < 2; ++c) _mm256_storeu_ps(C + (size_t) r * ldc + c * 8, acc[r][c]);
+}
+
 // expf (Cephes): x = n ln2 + r, exp(x) = 2^n * p(r)
 inline V vexp(V xv) {
     __m256 x = _mm256_min_ps(_mm256_max_ps(xv.v, _mm256_set1_ps(-87.3f)), _mm256_set1_ps(88.3f));

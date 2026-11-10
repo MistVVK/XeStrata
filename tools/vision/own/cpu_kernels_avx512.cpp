@@ -39,6 +39,30 @@ struct V {
 };
 inline V vmax(V a, V b) { return _mm512_max_ps(a.v, b.v); }
 
+// The product's micro-kernel on raw __m512 (as the AVX2 tier's; same operations, same order, bit-identical to the generic micro of cpu_kernels_impl.h).
+#define STRATA_KN_HAS_MICRO 1
+template <int MR>
+inline void micro(const float* A, size_t lda, const float* B, size_t ldb, int K, float* C, size_t ldc, int init, const float* bias) {
+    __m512 acc[MR][2];
+    for (int r = 0; r < MR; ++r)
+        for (int c = 0; c < 2; ++c) {
+            __m512 v = _mm512_setzero_ps();
+            if (init != 0) v = _mm512_loadu_ps(C + (size_t) r * ldc + c * 16);
+            if (init != 1 && bias) v = _mm512_add_ps(v, _mm512_loadu_ps(bias + c * 16));
+            acc[r][c] = v;
+        }
+    for (int k = 0; k < K; ++k) {
+        const __m512 b0 = _mm512_loadu_ps(B + (size_t) k * ldb), b1 = _mm512_loadu_ps(B + (size_t) k * ldb + 16);
+        for (int r = 0; r < MR; ++r) {
+            const __m512 a = _mm512_set1_ps(A[(size_t) r * lda + k]);
+            acc[r][0] = _mm512_fmadd_ps(a, b0, acc[r][0]);
+            acc[r][1] = _mm512_fmadd_ps(a, b1, acc[r][1]);
+        }
+    }
+    for (int r = 0; r < MR; ++r)
+        for (int c = 0; c < 2; ++c) _mm512_storeu_ps(C + (size_t) r * ldc + c * 16, acc[r][c]);
+}
+
 inline V vexp(V xv) {
     __m512 x = _mm512_min_ps(_mm512_max_ps(xv.v, _mm512_set1_ps(-87.3f)), _mm512_set1_ps(88.3f));
     __m512 fx = _mm512_roundscale_ps(_mm512_mul_ps(x, _mm512_set1_ps(1.44269504088896341f)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
