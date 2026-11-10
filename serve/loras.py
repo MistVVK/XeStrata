@@ -54,6 +54,8 @@ page load.
 from __future__ import annotations
 
 import collections
+import hashlib
+import http.client
 import json
 import math
 import os
@@ -68,7 +70,8 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import quote
 
-from serve import model_terms
+from serve import download as download_core
+from serve import file_lock, model_terms
 
 MAX_LORA = 4                       # the most adapters one request stacks
 SCALE_MIN, SCALE_MAX = -2.0, 2.0   # a request's strength
@@ -1069,7 +1072,7 @@ def hf_file(url: str) -> tuple[str, str]:
         raise LoraError("a Hugging Face file's link: https://huggingface.co/<owner>/<repo>/blob/<revision>/<file>"
                         f"{' or '.join(EXTS)}")
     repo, rev, path = m.groups()
-    return f"https://huggingface.co/{repo}/resolve/{rev}/{path}", Path(path).name
+    return f"{download_core.hf_endpoint()}/{repo}/resolve/{rev}/{path}", Path(path).name
 
 
 class Fetch:
@@ -1091,39 +1094,103 @@ class Fetch:
         return {"id": self.id, "name": self.name, "state": self.state, "bytes": self.got, "total": self.total,
                 "error": self.error, "added": self.added}
 
-    def _run(self) -> None:
-        tmp = None
-        try:
-            req = urllib.request.Request(self.url, headers={"User-Agent": "XeStrata"})
-            with urllib.request.urlopen(req, timeout=60) as r:
-                total = r.headers.get("Content-Length")
-                self.total = int(total) if total and total.isdigit() else None
-                tmp = staging(self.folders, self.total)
-                with open(tmp, "wb") as out:
-                    while not self.cancel.is_set():
-                        chunk = r.read(self.CHUNK)
-                        if not chunk:
-                            break
-                        out.write(chunk)
-                        self.got += len(chunk)
-                        if self.got > ADD_MAX:
-                            raise LoraError(f"the file is over {ADD_MAX >> 20} MiB, the most an added LoRA may be")
+    def _download(self, tmp: Path, tag_path: Path) -> None:
+        for attempt in range(5):
             if self.cancel.is_set():
                 raise LoraError("cancelled")
-            if self.total is not None and self.got != self.total:
-                raise LoraError(f"the download ended at {self.got} of {self.total} bytes")
+            have = tmp.stat().st_size if tmp.exists() else 0
+            tag = tag_path.read_text(encoding="utf-8") if have and tag_path.exists() else ""
+            if not tag or tag.startswith("W/"):
+                have = 0
+            headers = {"User-Agent": "XeStrata"}
+            if have:
+                headers.update({"Range": f"bytes={have}-", "If-Range": tag})
+            try:
+                req = urllib.request.Request(self.url, headers=headers)
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    if have and r.status == 206:
+                        match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)",
+                                             (r.headers.get("Content-Range") or "").strip())
+                        if not match or int(match[1]) != have or r.headers.get("ETag") != tag:
+                            tmp.unlink(missing_ok=True)
+                            tag_path.unlink(missing_ok=True)
+                            raise OSError("the server answered a different file or range")
+                        self.total = int(match[3])
+                    elif r.status == 200:
+                        have = 0
+                        length = r.headers.get("Content-Length")
+                        self.total = int(length) if length and length.isdigit() else None
+                        tag = r.headers.get("ETag") or ""
+                        # The old bytes must be gone before a new validator can name this partial file.
+                        tmp.write_bytes(b"")
+                        if tag and not tag.startswith("W/"):
+                            tag_path.write_text(tag, encoding="utf-8")
+                        else:
+                            tag_path.unlink(missing_ok=True)
+                    else:
+                        raise OSError(f"unexpected HTTP {r.status}")
+                    if self.total is not None and self.total > ADD_MAX:
+                        raise LoraError(f"the file is {self.total >> 20} MiB; an added LoRA is at most "
+                                        f"{ADD_MAX >> 20} MiB")
+                    staging(self.folders, max(0, self.total - have) if self.total is not None else None)
+                    self.got = have
+
+                    def report(done):
+                        self.got = done
+                        if done > ADD_MAX:
+                            raise LoraError(f"the file is over {ADD_MAX >> 20} MiB, the most an added LoRA may be")
+
+                    with open(tmp, "ab" if have else "wb") as out:
+                        self.got = download_core.copy_stream(r, out, have=have, chunk=self.CHUNK,
+                                                             progress=report, stop=self.cancel.is_set)
+                    if self.cancel.is_set():
+                        raise LoraError("cancelled")
+                    if self.total is not None and self.got != self.total:
+                        raise OSError(f"the download ended at {self.got} of {self.total} bytes")
+                    return
+            except urllib.error.HTTPError:
+                raise
+            except (urllib.error.URLError, TimeoutError, ConnectionError, OSError, http.client.HTTPException):
+                if attempt == 4:
+                    raise
+                time.sleep(2 ** attempt)
+
+    def _run(self) -> None:
+        tmp = tag_path = None
+        lock = None
+        try:
+            stage = staging(self.folders)
+            key = hashlib.sha256(self.url.encode("utf-8")).hexdigest()[:32]
+            tmp = stage.parent / f".adding-{key}.part"
+            tag_path = stage.parent / f".adding-{key}.etag"
+            lock = open(stage.parent / f".adding-{key}.lock", "a+b")
+            while True:
+                try:
+                    file_lock.acquire(lock)
+                    break
+                except OSError:
+                    if self.cancel.is_set():
+                        raise LoraError("cancelled")
+                    time.sleep(0.25)
+            self._download(tmp, tag_path)
             self.added = add(self.folders, tmp, self.name)
-            # where it came from, for About > Model terms (a LoRA's terms are its maker's)
+            tag_path.unlink(missing_ok=True)
             model_terms.record_lora_source([f.dir / self.added["path"] for f in self.folders
                                             if (f.dir / self.added["path"]).is_file()], self.url)
             self.state = "done"
         except urllib.error.HTTPError as exc:
             self.state, self.error = "failed", f"Hugging Face answered {exc.code} ({exc.reason}) for {self.url}"
-        except (urllib.error.URLError, OSError, LoraError, ValueError) as exc:
+        except (urllib.error.URLError, OSError, LoraError, ValueError, http.client.HTTPException) as exc:
             self.state, self.error = "failed", str(getattr(exc, "reason", None) or exc)
         finally:
-            if tmp is not None and tmp.exists():
-                tmp.unlink()
+            if lock is not None:
+                try:
+                    file_lock.release(lock)
+                except OSError:
+                    pass
+                lock.close()
+            if tag_path is not None and (tmp is None or not tmp.exists()):
+                tag_path.unlink(missing_ok=True)
 
 
 class Fetches:

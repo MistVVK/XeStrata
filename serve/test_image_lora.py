@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import shutil
 import struct
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from serve import images, loras
 
@@ -711,14 +714,41 @@ class Added(Tree):
         self.assertEqual([p.name for p in self.d.iterdir() if p.name.startswith(".")], [])   # nothing staged is left
 
     def test_hugging_face_links(self):
-        self.assertEqual(loras.hf_file("https://huggingface.co/a/b/blob/main/style.safetensors"),
-                         ("https://huggingface.co/a/b/resolve/main/style.safetensors", "style.safetensors"))
-        self.assertEqual(loras.hf_file("https://huggingface.co/a/b/resolve/v1/sub/x.gguf?download=true"),
-                         ("https://huggingface.co/a/b/resolve/v1/sub/x.gguf", "x.gguf"))
+        with mock.patch.dict(os.environ, {"HF_ENDPOINT": ""}):
+            self.assertEqual(loras.hf_file("https://huggingface.co/a/b/blob/main/style.safetensors"),
+                             ("https://huggingface.co/a/b/resolve/main/style.safetensors", "style.safetensors"))
+            self.assertEqual(loras.hf_file("https://huggingface.co/a/b/resolve/v1/sub/x.gguf?download=true"),
+                             ("https://huggingface.co/a/b/resolve/v1/sub/x.gguf", "x.gguf"))
         for url in ("https://huggingface.co/datasets/a/b/blob/main/x.safetensors", "https://example.com/x.safetensors",
                     "https://huggingface.co/a/b/blob/main/x.bin"):
             with self.assertRaises(loras.LoraError):
                 loras.hf_file(url)
+
+    def test_mirror_and_resume(self):
+        with mock.patch.dict(os.environ, {"HF_ENDPOINT": "https://mirror.example/"}):
+            url, _ = loras.hf_file("https://huggingface.co/a/b/blob/main/x.gguf")
+        self.assertEqual(url, "https://mirror.example/a/b/resolve/main/x.gguf")
+        part, tag = self.d / "part", self.d / "etag"
+        part.write_bytes(b"abc")
+        tag.write_text('"version"', encoding="utf-8")
+        fetch = object.__new__(loras.Fetch)
+        fetch.url, fetch.folders, fetch.cancel = url, [], threading.Event()
+        fetch.got, fetch.total = 0, None
+
+        class Response(io.BytesIO):
+            status = 206
+            headers = {"ETag": '"version"', "Content-Range": "bytes 3-5/6"}
+
+        def respond(req, timeout):
+            self.assertEqual(req.get_header("Range"), "bytes=3-")
+            self.assertEqual(req.get_header("If-range"), '"version"')
+            return Response(b"def")
+
+        with mock.patch.object(loras.urllib.request, "urlopen", respond), \
+                mock.patch.object(loras, "staging", return_value=self.d / "unused"):
+            fetch._download(part, tag)
+        self.assertEqual(part.read_bytes(), b"abcdef")
+        self.assertEqual((fetch.got, fetch.total), (6, 6))
 
     def test_the_server_routes(self):
         import http.client

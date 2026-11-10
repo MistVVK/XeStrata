@@ -22,7 +22,6 @@ Content-Range is the range asked for, and every tensor of the pinned revision is
 import argparse
 import collections
 import concurrent.futures
-import hashlib
 import json
 import os
 import struct
@@ -33,6 +32,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # the checkout, for serve/envvars.py
+from serve import download as download_core  # noqa: E402
 from serve import envvars, file_lock  # noqa: E402
 
 # #214: a fixed commit of the checkpoint (its `sha` from https://huggingface.co/api/models/Qwen/Qwen3.8-Flash-Next
@@ -41,7 +41,7 @@ from serve import envvars, file_lock  # noqa: E402
 PINNED_REVISION = "de4b8e4d43b917e7706784d8bb445c9af86a3540"
 REVISION = envvars.get("MTP_REVISION") or PINNED_REVISION
 # #495: HF_ENDPOINT (a mirror, e.g. https://hf-mirror.com) serves the same revision; the SHA256 checks below still apply
-HF_ENDPOINT = (os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/") or "https://huggingface.co"
+HF_ENDPOINT = download_core.hf_endpoint()
 REPO = HF_ENDPOINT + "/Qwen/Qwen3.8-Flash-Next/resolve/%s/" % REVISION
 PINNED = HF_ENDPOINT + "/Qwen/Qwen3.8-Flash-Next/resolve/%s/" % PINNED_REVISION   # SHA256's revision
 # XESTRATA_SOURCE=modelscope (setup's --source): the same checkpoint from ModelScope.  It serves the repository's
@@ -302,11 +302,7 @@ def pinned():
 
 
 def sha256_of(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1 << 24), b""):
-            h.update(block)
-    return h.hexdigest()
+    return download_core.sha256_file(path)
 
 
 def resolve_repo():

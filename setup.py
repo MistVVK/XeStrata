@@ -76,6 +76,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
 
+from serve import download as download_core
 from serve import envvars, hardware, kernel_check, model_terms, places, release_check, settings
 from serve import option_values as OV
 from serve.model_terms import _qimage
@@ -365,13 +366,13 @@ MODEL_TERMS: dict[str, dict] = {
 }
 
 
-HF_DEFAULT = "https://huggingface.co"
+HF_DEFAULT = download_core.HF_DEFAULT
 
 
 def hf_endpoint() -> str:
     """#495: the Hugging Face host - HF_ENDPOINT as huggingface_hub reads it (a mirror, e.g. https://hf-mirror.com),
     else huggingface.co.  The pinned revisions and the SHA-256 checks are the same whichever host serves the files."""
-    return (os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/") or HF_DEFAULT
+    return download_core.hf_endpoint()
 
 
 def hf(repo: str) -> str:
@@ -1633,7 +1634,7 @@ def mark(path: Path, text=""):
     """Write the finish mark.  A folder that cannot be written (--gguf-dir on a read-only share, upstream #570) only
     costs the mark: setup says so and goes on (the step is repeated on the next run), it does not stop."""
     try:
-        path.with_name(path.name + ".done").write_text(text or time.strftime("%Y-%m-%d %H:%M"), encoding="utf-8")
+        download_core.write_done(path, text or time.strftime("%Y-%m-%d %H:%M"))
     except OSError as e:
         warn(f"the finish mark of {path.name} cannot be written ({e}): the next run does this step again")
 
@@ -3761,17 +3762,14 @@ def download_single(url: str, part: Path, total: int, label: str):
                     raise OSError(f"HTTP {r.status}")
                 with open(part, "ab" if have else "wb") as f:
                     last = 0.0
-                    while True:
-                        b = r.read(8 << 20)
-                        if not b:
-                            break
-                        if total and have + len(b) > total:
-                            raise OSError("the server sent more bytes than the file has")
-                        f.write(b)
-                        have += len(b)
+
+                    def report(done):
+                        nonlocal last
                         if time.time() - last > 2:
                             last = time.time()
-                            progress(label, have, total)
+                            progress(label, done, total)
+
+                    have = download_core.copy_stream(r, f, have=have, chunk=8 << 20, limit=total, progress=report)
                     f.flush()
                     os.fsync(f.fileno())
             progress_end()
@@ -4253,21 +4251,18 @@ def check_model(exe: Path, lib_dirs: list, gguf: Path) -> dict:
 
 
 def _hash_file(s: Path, size: int) -> str:
-    h = hashlib.sha256()
-    seen, last = 0, 0.0
-    with open(s, "rb") as f:
-        while True:
-            b = f.read(16 << 20)
-            if not b:
-                break
-            h.update(b)
-            seen += len(b)
-            if time.time() - last > 2 and size >= (1 << 30):    # hashing 60 GB takes minutes (upstream d298999c3)
-                last = time.time()
-                progress(f"checking {s.name}", seen, size)
-    if seen >= (1 << 30):
+    last = 0.0
+
+    def report(seen):
+        nonlocal last
+        if time.time() - last > 2 and size >= (1 << 30):
+            last = time.time()
+            progress(f"checking {s.name}", seen, size)
+
+    digest = download_core.sha256_file(s, progress=report)
+    if s.stat().st_size >= (1 << 30):
         progress_end()
-    return h.hexdigest()
+    return digest
 
 
 def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None, other: str | None = None) -> None:

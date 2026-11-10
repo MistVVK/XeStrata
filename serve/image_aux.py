@@ -29,7 +29,6 @@ path comes from a request: the names are AUX's keys, the host Hugging Face's (HF
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import os
 import subprocess
 import sys
@@ -40,6 +39,7 @@ import urllib.request
 from pathlib import Path
 from typing import Callable
 
+from serve import download as download_core
 from serve import file_lock, model_terms
 from serve.model_terms import _qimage
 
@@ -53,7 +53,7 @@ _jobs: dict[str, dict] = {}   # name -> its download's state, while one runs or 
 
 
 def endpoint() -> str:
-    return (os.environ.get("HF_ENDPOINT") or "").strip().rstrip("/") or "https://huggingface.co"
+    return download_core.hf_endpoint()
 
 
 def aux_dir(cfg: dict) -> Path:
@@ -229,15 +229,14 @@ def _fetch(url: str, part_of: Path, size: int, sha: str, job: dict, say, name: s
                     have = 0
                 last = time.monotonic()
                 with open(part, "ab" if have else "wb") as f:
-                    while (b := r.read(CHUNK)):
-                        if have + len(b) > size:
-                            raise OSError("the server sent more bytes than the file has")
-                        f.write(b)
-                        have += len(b)
-                        job["bytes"] = have
+                    def report(done):
+                        nonlocal last
+                        job["bytes"] = done
                         if time.monotonic() - last > 10:
                             last = time.monotonic()
-                            say(f"image tools: {name}: {have / 2**20:.0f} of {size / 2**20:.0f} MiB")
+                            say(f"image tools: {name}: {done / 2**20:.0f} of {size / 2**20:.0f} MiB")
+
+                    have = download_core.copy_stream(r, f, have=have, chunk=CHUNK, limit=size, progress=report)
                     f.flush()
                     os.fsync(f.fileno())
         except urllib.error.HTTPError:
@@ -269,12 +268,9 @@ def _convert(a: dict, src: Path, out: Path, sha: str, say, name: str) -> None:
             raise OSError(f"the conversion failed: {(r.stderr or r.stdout).strip()[-300:]}")
     elif src != out:
         os.replace(src, out)
-    out.with_name(out.name + ".done").write_text(f"{sha} {time.strftime('%Y-%m-%d %H:%M')}", encoding="utf-8")
+    digest = _sha256(out) if a.get("convert") in CONVERTERS else sha
+    download_core.write_done(out, f"sha256 {digest}")
 
 
 def _sha256(p: Path) -> str:
-    h = hashlib.sha256()
-    with open(p, "rb") as f:
-        while (b := f.read(8 << 20)):
-            h.update(b)
-    return h.hexdigest()
+    return download_core.sha256_file(p, chunk=8 << 20)
