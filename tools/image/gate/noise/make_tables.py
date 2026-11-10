@@ -1,6 +1,7 @@
-"""tools/image/gate/noise/make_tables.py - TEST-ONLY: write own5_noise_tables.inc, the Q8.120 constants of
-own5_noise.hpp (ln c_j for the log table, sin and cos of i/64 for the sin table), with Python's decimal module at 70
-digits, each rounded to the nearest unit of 2^-120.   python -I -B make_tables.py"""
+"""tools/image/gate/noise/make_tables.py - TEST-ONLY: write strata_noise_tables.inc (in tools/image/sdcpp_noise), the Q8.120 constants of
+strata_noise.hpp (ln c_j for the log table, sin and cos of i/64 for the sin table), with Python's decimal module at 70
+digits, each rounded to the nearest unit of 2^-120.   python -I -B make_tables.py [output file]"""
+import sys
 from decimal import Decimal as D, getcontext
 from pathlib import Path
 
@@ -36,4 +37,5 @@ out += ["    " + fx(sincos(D(i) / 64)[0]) + "," for i in range(52)]
 out += ["};", "static const U128 COSA[52] = {  // cos(i/64)"]
 out += ["    " + fx(sincos(D(i) / 64)[1]) + "," for i in range(52)]
 out.append("};")
-(Path(__file__).resolve().parent / "own5_noise_tables.inc").write_bytes(("\n".join(out) + "\n").encode())
+OUT = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(__file__).resolve().parents[2] / "sdcpp_noise" / "strata_noise_tables.inc"
+OUT.write_bytes(("\n".join(out) + "\n").encode())

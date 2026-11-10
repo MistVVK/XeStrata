@@ -2,7 +2,7 @@
 // 1. sd.cpp's PhiloxRNG (its header, compiled by MSVC: unqualified log/sin pick logf/sinf) for seeds 42 and 1234,
 //    with the CRT's FMA3 code paths on (default on an FMA CPU) and off (_set_FMA3_enable(0)).
 // 2. Over every reachable u and v (83,886,081 each): how often the CRT's logf(u) / sinf(v) differ from the correctly
-//    rounded float result (float(log_cr) / float(sin_cr) of own5_noise.hpp), FMA3 on and off.
+//    rounded float result (float(log_cr) / float(sin_cr) of strata_noise.hpp), FMA3 on and off.
 //   ucrt_study <dir-with-core/rng_philox.hpp is an include path at build time> [threads]
 #include <math.h>
 
@@ -16,9 +16,9 @@
 #include <vector>
 
 #include "core/rng_philox.hpp"
-#include "own5_noise.hpp"
+#include "strata_noise.hpp"
 
-using namespace own5noise;
+using namespace strata_noise;
 static const uint64_t N_INT = 1ull << 24, F_LO = 0x4B800000ull, F_HI = 0x4F800000ull;
 static const uint64_t N_DOM = N_INT + (F_HI - F_LO + 1);
 static inline float x_of(uint64_t i) {

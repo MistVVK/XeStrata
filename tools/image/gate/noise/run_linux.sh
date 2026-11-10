@@ -1,26 +1,32 @@
 #!/bin/bash
-# OWN-5 noise feasibility on a Linux box (TEST-ONLY).
-#   run_linux.sh <dir with the noise sources> <dir holding core/rng_philox.hpp> <tag> [seeds] [--make-table]
-# --make-table (x86 glibc box only): build without the exception table, list where glibc's sin is not correctly
-# rounded (check_domain glibc), make sin_exc.bin from it.  Then (always): build plain (-O3, as sd.cpp's x86
-# build) and -march=native -ffp-contract=fast variants WITH the table, run the domain check and the seed comparison.
+# The noise generator's proofs on a Linux box (TEST-ONLY).
+#   run_linux.sh <repo root> <dir holding core/rng_philox.hpp> <tag> [seeds] [--make-table]
+# <repo root> holds tools/image/gate/noise (the proof programs) and tools/image/sdcpp_noise (the generator).  Work files
+# go to ./noise-work-<tag>.  Steps: apply.py --prepare writes the generator's files and the compiled-in table source;
+# --make-table (x86 glibc box only) first builds without the table (-DSTRATA_NOISE_NO_SIN_EXC), lists where glibc's sin
+# is not correctly rounded (check_domain glibc) and makes strata_sin_exc.bin from it.  Then (always): build plain (-O3,
+# as sd.cpp's x86 build) and -march=native -ffp-contract=fast variants WITH the table, run the domain check and the
+# seed comparison.
 set -e
-cd "$1"; REF=$2; TAG=$3; NS=${4:-1000}
-mkdir -p out
+ROOT=$(cd "$1" && pwd); REF=$2; TAG=$3; NS=${4:-1000}
+GATE=$ROOT/tools/image/gate/noise; PROD=$ROOT/tools/image/sdcpp_noise
+W=$PWD/noise-work-$TAG
+mkdir -p "$W/out"; cd "$W"
 g++ --version | head -1; uname -m
 CXX="g++ -std=c++20 -O3 -DNDEBUG -pthread"
+python3 -I -B "$PROD/apply.py" --prepare "$W/inc"
 if [ "$5" = "--make-table" ]; then
   echo "== pass 1: no table, the exhaustive list of glibc sin values that are not correctly rounded"
-  $CXX check_domain.cpp -o out/check_notable
+  $CXX -DSTRATA_NOISE_NO_SIN_EXC -I"$W/inc" "$GATE/check_domain.cpp" -o out/check_notable
   time out/check_notable glibc
-  python3 -I -B make_sin_exceptions.py exc_sin.txt
+  python3 -I -B "$GATE/make_sin_exceptions.py" exc_sin.txt
+  python3 -I -B "$PROD/apply.py" --prepare "$W/inc"
 fi
-export OWN5_SIN_EXC=$PWD/sin_exc.bin
-sha256sum sin_exc.bin
-$CXX check_domain.cpp -o out/check_plain
-$CXX -march=native -ffp-contract=fast check_domain.cpp -o out/check_native
-$CXX -DWITH_REF -I"$REF" seeds.cpp -o out/seeds_plain
-$CXX -march=native -ffp-contract=fast seeds.cpp -o out/seeds_native
+sha256sum "$PROD/strata_sin_exc.bin"
+$CXX -I"$W/inc" "$GATE/check_domain.cpp" -o out/check_plain
+$CXX -march=native -ffp-contract=fast -I"$W/inc" "$GATE/check_domain.cpp" -o out/check_native
+$CXX -DWITH_REF -I"$W/inc" -I"$REF" "$GATE/seeds.cpp" -o out/seeds_plain
+$CXX -march=native -ffp-contract=fast -I"$W/inc" "$GATE/seeds.cpp" -o out/seeds_native
 if [ "$(uname -m)" = x86_64 ]; then
   echo "== domain, plain build with the table, against glibc"; time out/check_plain glibc
 else

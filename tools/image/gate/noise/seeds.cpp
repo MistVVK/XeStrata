@@ -1,4 +1,4 @@
-// seeds.cpp - TEST-ONLY (OWN-5): own5_noise against stable-diffusion.cpp's PhiloxRNG over many seeds.
+// seeds.cpp - TEST-ONLY (OWN-5): strata_noise.hpp against stable-diffusion.cpp's PhiloxRNG over many seeds.
 //   seeds <first> <count> <n> [threads]       prints one line per seed: seed, fnv64(ours), fnv64(ref), equal
 // Build with -DWITH_REF and -I<dir with sd.cpp's core/rng_philox.hpp> to include the reference; without it only
 // our hashes are printed (for platforms whose own sd.cpp stream differs, compare with the x86 reference list).
@@ -9,7 +9,7 @@
 #include <thread>
 #include <vector>
 
-#include "own5_noise.hpp"
+#include "strata_noise.hpp"
 #ifdef WITH_REF
 #include "core/rng_philox.hpp"
 #endif
@@ -22,10 +22,7 @@ static uint64_t fnvb(const std::vector<float>& v) {
 }
 
 int main(int argc, char** argv) {
-    if (const char* t = std::getenv("OWN5_SIN_EXC"); t && *t) {        // the packed glibc exception table (sin_exc.bin)
-        if (!own5noise::load_sin_exceptions(t)) { std::fprintf(stderr, "cannot read %s\n", t); return 2; }
-        std::fprintf(stderr, "sin exception table: %s, %zu entries\n", t, own5noise::sin_exc().keys.size());
-    }
+    std::fprintf(stderr, "sin exception table (compiled in): %zu entries\n", strata_noise::sin_exc().keys.size());
     const uint64_t first = std::strtoull(argv[1], nullptr, 10);
     const uint32_t count = (uint32_t) std::strtoul(argv[2], nullptr, 10);
     const uint32_t n = (uint32_t) std::strtoul(argv[3], nullptr, 10);
@@ -40,7 +37,7 @@ int main(int argc, char** argv) {
     std::vector<std::thread> th;
     for (int t = 0; t < T; ++t) th.emplace_back([&] {
         for (size_t k; (k = next++) < seeds.size();) {
-            std::vector<float> o = own5noise::randn(seeds[k], n);
+            std::vector<float> o = strata_noise::randn(seeds[k], n);
             ho[k] = fnvb(o);
 #ifdef WITH_REF
             PhiloxRNG r;
@@ -48,7 +45,7 @@ int main(int argc, char** argv) {
             std::vector<float> f = r.randn(n);
             hr[k] = fnvb(f);
             uint32_t d = 0;
-            for (uint32_t i = 0; i < n; ++i) d += own5noise::fbits(o[i]) != own5noise::fbits(f[i]);
+            for (uint32_t i = 0; i < n; ++i) d += strata_noise::fbits(o[i]) != strata_noise::fbits(f[i]);
             ndiff[k] = d;
 #endif
         }

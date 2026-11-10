@@ -1,9 +1,9 @@
-"""tools/image/gate/noise/test_noise_table.py - TEST-ONLY: the packed glibc sin exception table (sin_exc.bin).
+"""tools/image/gate/noise/test_noise_table.py - TEST-ONLY: the packed glibc sin exception table (strata_sin_exc.bin).
 
 Checks the file's sha256, that it unpacks to a sorted list of reachable v (positive floats below 6.3; repeats carry the same flag), and
 re-derives a sample of entries: the correctly rounded sin from Python's decimal module and, where this Python's
 math.sin is glibc on x86-64 (the reference platform), that glibc's double is that value one unit up or down as the
-entry says.  Also checks the tables in own5_noise_tables.inc against make_tables.py.
+entry says.  Also checks the tables in strata_noise_tables.inc against make_tables.py.
 
     python -m pytest tools/image/gate/noise/test_noise_table.py"""
 import hashlib
@@ -16,6 +16,7 @@ import unittest
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+PRODUCT = HERE.parents[1] / "sdcpp_noise"       # tools/image/sdcpp_noise: the generator, its tables and the packed sin table
 sys.path.insert(0, str(HERE))
 import make_sin_exceptions as M  # noqa: E402
 
@@ -26,7 +27,7 @@ COUNT = 109290
 class Table(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.data = (HERE / "sin_exc.bin").read_bytes()
+        cls.data = (PRODUCT / "strata_sin_exc.bin").read_bytes()
         cls.entries = M.unpack(cls.data)
 
     def test_sha256_and_size(self):
@@ -66,13 +67,11 @@ class Constants(unittest.TestCase):
     def test_tables_are_what_make_tables_writes(self):
         import subprocess
         import tempfile
-        src = (HERE / "make_tables.py").read_text()
         with tempfile.TemporaryDirectory() as d:
-            p = Path(d) / "make_tables.py"
-            p.write_text(src)
-            subprocess.run([sys.executable, "-I", "-B", str(p)], check=True)
-            self.assertEqual((Path(d) / "own5_noise_tables.inc").read_text().splitlines(),
-                             (HERE / "own5_noise_tables.inc").read_text().splitlines())
+            subprocess.run([sys.executable, "-I", "-B", str(HERE / "make_tables.py"),
+                            str(Path(d) / "strata_noise_tables.inc")], check=True)
+            self.assertEqual((Path(d) / "strata_noise_tables.inc").read_text().splitlines(),
+                             (PRODUCT / "strata_noise_tables.inc").read_text().splitlines())
 
 
 if __name__ == "__main__":

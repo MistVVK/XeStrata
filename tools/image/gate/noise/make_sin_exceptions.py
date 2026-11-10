@@ -1,15 +1,15 @@
-"""tools/image/gate/noise/make_sin_exceptions.py - TEST-ONLY: sin_exc.bin from check_domain's exc_sin.txt.
+"""tools/image/gate/noise/make_sin_exceptions.py - TEST-ONLY: strata_sin_exc.bin from check_domain's exc_sin.txt.
 
 glibc's double sin (x86-64, the library sd.cpp's Linux x86 build calls) is not correctly rounded for some inputs.
 check_domain.cpp (mode glibc) lists every reachable v where it differs from our correctly rounded value.  For each,
 the correctly rounded reference is recomputed here with Python's decimal module (50 digits) and the difference is
 checked to be exactly one unit in the last place; then the list is packed:
 
-  sin_exc.bin = b"OWN5SEX1", uint32 count (little endian), then per entry (sorted by v's float bits) one varint
+  strata_sin_exc.bin = b"OWN5SEX1", uint32 count (little endian), then per entry (sorted by v's float bits) one varint
                 (LEB128) of ((bits - previous bits) << 1 | down), down = 1 when glibc's double is one unit below ours
                 in the bit pattern (previous bits start at 0)
 
-    python -I -B make_sin_exceptions.py exc_sin.txt         (writes sin_exc.bin beside this script)"""
+    python -I -B make_sin_exceptions.py exc_sin.txt         (writes tools/image/sdcpp_noise/strata_sin_exc.bin)"""
 import struct
 import sys
 from decimal import Decimal as D, getcontext
@@ -82,7 +82,7 @@ def main():
     entries.sort()
     data = pack(entries)
     assert unpack(data) == entries
-    (Path(__file__).resolve().parent / "sin_exc.bin").write_bytes(data)
+    (Path(__file__).resolve().parents[2] / "sdcpp_noise" / "strata_sin_exc.bin").write_bytes(data)
     print(len(entries), "entries,", len(data), "bytes")
 
 
