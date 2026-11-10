@@ -5463,7 +5463,18 @@ def apply_noise_generator(src: Path) -> None:
     mod.apply(src)
 
 
-def build_image_engine(backend: str, gpu: dict, noise: bool = False) -> tuple[Path, list[str]]:
+def apply_vae_decoder(src: Path) -> None:
+    """OWN-5 step 2: Strata's VAE decoder (src/image/vae via tools/image/sdcpp_vae) into the stable-diffusion.cpp
+    source (idempotent; CUDA / HIP builds; sd-cli uses it only with --model-args strata_vae=1)."""
+    import importlib.util
+    QI = _qimage()
+    spec = importlib.util.spec_from_file_location("strata_sdcpp_vae_apply", QI.VAE_DIR / "apply.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.apply(src)
+
+
+def build_image_engine(backend: str, gpu: dict, noise: bool = False, vae: bool = False) -> tuple[Path, list[str]]:
     """Compile sd-cli for `backend` into engine-image/ (again only when the pins or the backend changed, or, with
     `noise`, the noise generator's sources) -> (its path, the library folders it runs with).  `noise`: Strata's noise
     generator is patched in (images "noise": "strata"); off, the build and its stamp are what they always were."""
@@ -5471,7 +5482,8 @@ def build_image_engine(backend: str, gpu: dict, noise: bool = False) -> tuple[Pa
     IMAGE_ENGINE.mkdir(exist_ok=True)
     exe, stamp = IMAGE_ENGINE / QI.SD_EXE, IMAGE_ENGINE / "BUILD.json"
     arch = gpu.get("arch") if backend in ("cuda", "hip") else None
-    want = QI.build_stamp(backend, arch, noise)
+    vae = vae and backend in QI.VAE_BACKENDS
+    want = QI.build_stamp(backend, arch, noise, vae)
     meta = json.loads(stamp.read_text(encoding="utf-8")) if stamp.exists() else {}
     lib_dirs = [d for d in meta.get("lib_dirs") or [] if Path(d).is_dir()]
     if exe.exists() and {k: meta.get(k) for k in want} == want:
@@ -5482,6 +5494,8 @@ def build_image_engine(backend: str, gpu: dict, noise: bool = False) -> tuple[Pa
         apply_native_runner(src)
     if noise:                                          # Strata's noise generator (inert unless the config asks for it)
         apply_noise_generator(src)
+    if vae:                                            # Strata's VAE decoder (inert unless the config asks for it)
+        apply_vae_decoder(src)
     vcvars, lib_dirs = None, []
     if backend == "cuda":
         nvcc, cuda_v = find_nvcc()
@@ -5558,7 +5572,12 @@ def setup_images(a, gpu: dict, hip: bool, models_dir: Path) -> dict | None:
     if free_gb(models_dir) < need + 5:
         warn(f"less than {need + 5:.0f} GB free for the image model: the download may run out of disk space")
     noise = getattr(a, "image_noise", None) == "on"
-    exe, lib_dirs = build_image_engine(backend, gpu or {}, noise)
+    vae = getattr(a, "image_vae", None) == "on"
+    if vae and backend not in QI.VAE_BACKENDS:         # the owner's wording, 11-11
+        warn(f"Strata's own picture decoder runs with CUDA or ROCm only; image generation on {backend} keeps "
+             "stable-diffusion.cpp's decoder")
+        vae = False
+    exe, lib_dirs = build_image_engine(backend, gpu or {}, noise, vae)
     for name in (quant, "vae", "llm"):
         repo, path, size, sha = QI.FILES[name]
         dst = QI.local_path(models_dir, name)
@@ -5566,7 +5585,7 @@ def setup_images(a, gpu: dict, hip: bool, models_dir: Path) -> dict | None:
         verify_sha256(dst, size, sha)
     cfg = QI.image_config(backend, quant, exe, models_dir, uma=QI.is_apu(gpu), lib_dirs=lib_dirs,
                           policy=a.image_gpu_policy or "auto", native=getattr(a, "image_native", None) == "on",
-                          noise=noise)
+                          noise=noise, vae=vae)
     ok(f"image generation: {quant} on {backend}, GPU policy {cfg['gpu_policy']}")
     return cfg
 
@@ -10216,6 +10235,8 @@ def main() -> int:
     ap.add_argument("--image-native", choices=["on", "off"],
                     help=argparse.SUPPRESS)
     ap.add_argument("--image-noise", choices=["on", "off"],
+                    help=argparse.SUPPRESS)
+    ap.add_argument("--image-vae", choices=["on", "off"],
                     help=argparse.SUPPRESS)
     ap.add_argument("--image-gpu-policy", choices=["auto", "keep", "shrink", "unload"],
                     help=argparse.SUPPRESS)

@@ -10376,6 +10376,9 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
         noise_problem = svc.images.noise_problem()
         if noise_problem:
             print(f"[strata] image generation: {noise_problem}", flush=True)
+        vae_problem = svc.images.vae_problem()
+        if vae_problem:
+            print(f"[strata] image generation: {vae_problem}", flush=True)
         print(f"[strata] image generation: {svc.images.model} {icfg.get('quant') or ''} on "
               f"{icfg.get('backend') or '?'} (POST /v1/images/generations; GPU policy {svc.images.policy})", flush=True)
     if cfg.get("prevent_sleep") is not None and not isinstance(cfg["prevent_sleep"], bool):

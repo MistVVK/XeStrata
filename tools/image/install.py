@@ -54,6 +54,7 @@ def main(argv=None) -> int:
     ap.add_argument("--native", choices=["on", "off"], default="off",
                     help="EXPERIMENTAL: Strata's own DiT runner on CUDA / HIP (the config's \"native\")")
     ap.add_argument("--noise", choices=["on", "off"], default="off", help=argparse.SUPPRESS)
+    ap.add_argument("--vae", choices=["on", "off"], default="off", help=argparse.SUPPRESS)
     ap.add_argument("--build-only", action="store_true", help="compile sd-cli only")
     ap.add_argument("--print", action="store_true", help="print the images section instead of writing it")
     ap.add_argument("--yes", action="store_true")
@@ -71,7 +72,7 @@ def main(argv=None) -> int:
     if backend in ("cuda", "hip") and not gpu.get("arch"):
         S.fail(f"the {backend} build needs the GPU's architecture", "pass --arch (e.g. 86 or gfx1103)")
     S.ok(f"image generation: {quant} on {backend}" + (f" ({gb:.0f} GB GPU memory)" if gb else ""))
-    exe, lib_dirs = S.build_image_engine(backend, gpu, a.noise == "on")
+    exe, lib_dirs = S.build_image_engine(backend, gpu, a.noise == "on", a.vae == "on")
     if a.build_only:
         return 0
     if a.models_dir:
@@ -86,7 +87,8 @@ def main(argv=None) -> int:
         S.download(QI.file_url(name, S.hf_endpoint()), dst, f"image model: {Path(path).name}")
         S.verify_sha256(dst, size, sha)
     section = QI.image_config(backend, quant, exe, models, uma=QI.is_apu(gpu), gpu=a.gpu, lib_dirs=lib_dirs,
-                              policy=a.gpu_policy, native=a.native == "on", noise=a.noise == "on")
+                              policy=a.gpu_policy, native=a.native == "on", noise=a.noise == "on",
+                              vae=a.vae == "on")
     if a.print or not a.config:
         print(json.dumps({"images": section}, indent=1))
         return 0

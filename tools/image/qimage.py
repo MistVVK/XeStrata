@@ -196,20 +196,45 @@ def noise_hash() -> str:
     return h.hexdigest()[:16]
 
 
-def build_stamp(backend: str, arch, noise: bool = False) -> dict:
+VAE_DIR = Path(__file__).resolve().parent / "sdcpp_vae"         # Strata's VAE decoder for sd-cli (CUDA / HIP builds)
+VAE_BACKENDS = NATIVE_BACKENDS
+
+
+def vae_hash(repo: Path | None = None) -> str:
+    """A fingerprint of the VAE decoder's sources: apply.py and every file it copies into sd-cli's tree (src/image/vae,
+    the headers, include/strata/hip_compat); a change compiles sd-cli again, for a build that has the decoder."""
+    import hashlib
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("strata_sdcpp_vae_apply_hash", VAE_DIR / "apply.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    repo = Path(repo) if repo is not None else mod.REPO
+    files = [VAE_DIR / "apply.py"] + [repo / src for src, _ in mod.FILES] + \
+        sorted(f for f in (repo / mod.HIP_COMPAT).iterdir() if f.is_file())
+    h = hashlib.sha256()
+    for f in files:
+        h.update(f.name.encode() + b"\0" + f.read_bytes().replace(b"\r\n", b"\n"))
+    return h.hexdigest()[:16]
+
+
+def build_stamp(backend: str, arch, noise: bool = False, vae: bool = False) -> dict:
     """What a built sd-cli is stamped with (BUILD.json): the pins, the backend and, where it applies, a fingerprint of
     the native runner's sources and, only when the noise generator is asked for (images "noise": "strata"), of the
-    noise generator's: nobody compiles again unasked when the noise generator is off."""
+    noise generator's, and only when Strata's VAE decoder is asked for (images "vae_decoder": "strata", CUDA / HIP), of
+    the decoder's: nobody compiles again unasked when they are off."""
     stamp = {"sd_cpp": SD_CPP_COMMIT, "ggml": SD_GGML_COMMIT, "backend": backend, "arch": str(arch or "")}
     if backend in NATIVE_BACKENDS:
         stamp["native"] = native_hash()
     if noise:
         stamp["noise"] = noise_hash()
+    if vae and backend in VAE_BACKENDS:
+        stamp["vae_decoder"] = vae_hash()
     return stamp
 
 
 def image_config(backend: str, quant: str, exe: Path, models_dir: Path, *, uma: bool = False, gpu=None,
-                 lib_dirs=(), policy: str = "auto", native: bool = False, noise: bool = False) -> dict:
+                 lib_dirs=(), policy: str = "auto", native: bool = False, noise: bool = False,
+                 vae: bool = False) -> dict:
     """The run config's "images" section (serve/images.py reads it)."""
     cfg = {"model_name": "qwen-image-2.1-turbo", "exe": str(exe), "backend": backend, "quant": quant,
            "diffusion_model": str(local_path(models_dir, quant)), "vae": str(local_path(models_dir, "vae")),
@@ -219,6 +244,8 @@ def image_config(backend: str, quant: str, exe: Path, models_dir: Path, *, uma: 
         cfg["native"] = bool(native)       # Strata's DiT runner (--model-args qwen_image_2_1_native=1)
     if noise:
         cfg["noise"] = "strata"            # Strata's noise generator (--model-args strata_noise=1); absent = "sdcpp"
+    if vae and backend in VAE_BACKENDS:
+        cfg["vae_decoder"] = "strata"      # Strata's VAE decoder (--model-args strata_vae=1); absent = "sdcpp"
     if gpu is not None:
         cfg["gpu"] = gpu
     if lib_dirs:

@@ -287,5 +287,88 @@ class Noise(unittest.TestCase):
             an.assert_not_called()
 
 
+class VaeDecoder(unittest.TestCase):
+    """OWN-5 step 2: Strata's VAE decoder for sd-cli (tools/image/sdcpp_vae, CUDA / HIP builds): off by default; nobody
+    compiles again unasked; another backend never gets it."""
+
+    def test_stamp_without_the_switch_is_what_it_was(self):
+        for backend, arch in (("cuda", 86), ("hip", "gfx1201"), ("vulkan", None), ("cpu", None)):
+            self.assertEqual(QI.build_stamp(backend, arch, False, False), QI.build_stamp(backend, arch))
+            self.assertNotIn("vae_decoder", QI.build_stamp(backend, arch, True))
+
+    def test_stamp_with_the_switch(self):
+        for backend, arch in (("cuda", 86), ("hip", "gfx1201")):
+            s = QI.build_stamp(backend, arch, False, True)
+            self.assertEqual(s["vae_decoder"], QI.vae_hash())
+            self.assertEqual({k: v for k, v in s.items() if k != "vae_decoder"}, QI.build_stamp(backend, arch))
+            self.assertEqual(QI.build_stamp(backend, arch, True, True)["noise"], QI.noise_hash())
+        for backend in ("vulkan", "cpu"):
+            self.assertEqual(QI.build_stamp(backend, None, False, True), QI.build_stamp(backend, None))
+
+    def test_vae_hash_follows_the_decoder_sources(self):
+        h = QI.vae_hash()
+        self.assertRegex(h, r"^[0-9a-f]{16}$")
+        self.assertEqual(QI.vae_hash(), h)
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("strata_sdcpp_vae_apply_qtest", QI.VAE_DIR / "apply.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        with tempfile.TemporaryDirectory() as d:
+            for src, _ in mod.FILES:
+                (Path(d) / src).parent.mkdir(parents=True, exist_ok=True)
+                (Path(d) / src).write_bytes((ROOT / src).read_bytes())
+            (Path(d) / mod.HIP_COMPAT).mkdir(parents=True, exist_ok=True)
+            for f in (ROOT / mod.HIP_COMPAT).iterdir():
+                (Path(d) / mod.HIP_COMPAT / f.name).write_bytes(f.read_bytes().replace(b"\n", b"\r\n"))
+            self.assertEqual(QI.vae_hash(Path(d)), h)                  # a CRLF checkout: the same hash
+            p = Path(d) / "src" / "image" / "vae" / "wan_vae.cu"
+            p.write_bytes(p.read_bytes() + b"// edit\n")
+            self.assertNotEqual(QI.vae_hash(Path(d)), h)
+
+    def test_config(self):
+        c = QI.image_config("cuda", "Q8_0", Path("/e/sd-cli"), Path("/m"), vae=True)
+        self.assertEqual(c["vae_decoder"], "strata")
+        self.assertTrue(c["vae"].endswith("qwen_image_2.1_vae_bf16.safetensors"))      # the file path is untouched
+        self.assertNotIn("vae_decoder", QI.image_config("cuda", "Q8_0", Path("/e/sd-cli"), Path("/m")))
+        self.assertNotIn("vae_decoder", QI.image_config("vulkan", "Q4_K_M", Path("/e/sd-cli"), Path("/m"), vae=True))
+        from serve.images import ImageGen
+        with tempfile.TemporaryDirectory() as d:
+            ImageGen({**c, "out_dir": d})                # serve accepts what setup writes
+
+    def test_flags(self):
+        self.assertRegex((ROOT / "setup.py").read_text(encoding="utf-8"), re.escape('ap.add_argument("--image-vae"'))
+        self.assertIn('warn(f"Strata\'s own picture decoder runs with CUDA or ROCm only; image generation on {backend} keeps "\n'
+                      '             "stable-diffusion.cpp\'s decoder")',
+                      (ROOT / "setup.py").read_text(encoding="utf-8"))     # the owner's wording of 11-11
+        self.assertRegex((ROOT / "tools" / "image" / "install.py").read_text(encoding="utf-8"),
+                         re.escape('ap.add_argument("--vae"'))
+
+    def test_build_decisions(self):
+        def stamp_file(d, stamp):
+            (Path(d) / QI.SD_EXE).write_bytes(b"x")
+            (Path(d) / "BUILD.json").write_text(json.dumps({**stamp, "lib_dirs": [d]}))
+
+        def build_until_nvcc(*args):
+            with mock.patch.object(setup, "get_sd_cpp"), mock.patch.object(setup, "apply_native_runner"), \
+                    mock.patch.object(setup, "apply_noise_generator"), \
+                    mock.patch.object(setup, "apply_vae_decoder") as av, \
+                    mock.patch.object(setup, "find_nvcc", return_value=(None, None)):
+                with self.assertRaises(SystemExit):      # stops at "no nvcc", after the patches
+                    quiet(setup.build_image_engine, *args)
+            return av
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup, "IMAGE_ENGINE", Path(d)):
+            stamp_file(d, QI.build_stamp("cuda", 86))           # a build made before the switch existed
+            with mock.patch.object(setup, "cmake_build") as cb:
+                quiet(setup.build_image_engine, "cuda", {"arch": 86}, False, False)
+            cb.assert_not_called()
+            build_until_nvcc("cuda", {"arch": 86}, False, True).assert_called_once()      # switched on: rebuilt
+            stamp_file(d, QI.build_stamp("cuda", 86, False, True))
+            with mock.patch.object(setup, "cmake_build") as cb:
+                quiet(setup.build_image_engine, "cuda", {"arch": 86}, False, True)
+                quiet(setup.build_image_engine, "cuda", {"arch": 86}, False, False)     # off again: kept (inert)
+            cb.assert_not_called()
+            build_until_nvcc("cuda", {"arch": 89}, False, False).assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
