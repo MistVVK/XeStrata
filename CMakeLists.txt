@@ -839,7 +839,7 @@ if(STRATA_ENABLE_XE)
   # against stable-diffusion.cpp's values, timed
   add_library(strata_image STATIC src/image/qi_kernels.cpp src/image/qi_attn.cpp src/image/qi_attn_train.cpp
                            src/image/qi_dit.cpp src/image/image_lora.cpp
-                           src/image/qi_vae.cpp src/image/qi_text.cpp src/image/qi_pipeline.cpp
+                           src/image/qi_vae.cpp src/image/qi_pipeline.cpp
                            src/image/img_start.cpp src/image/img_crop.cpp src/image/img_color.cpp
                            src/upscale/upscale.cpp src/upscale/esrgan.cpp src/upscale/seedvr2_dit.cpp
                            src/upscale/seedvr2.cpp src/image/yolo_detect.cpp
@@ -1271,6 +1271,10 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(moss_text_parity PRIVATE strata_image)
   add_test(NAME moss_text_parity COMMAND moss_text_parity)
   add_executable(moss_dit_parity src/image/moss_dit_parity.cpp)
+  # the image models' text encoder on a synthetic Qwen3-VL: the M-RoPE's sections and DeepStack against the host's FP64
+  add_executable(qwen3vl_text_parity src/image/qwen3vl_text_parity.cpp)
+  target_link_libraries(qwen3vl_text_parity PRIVATE strata_image)
+  add_test(NAME qwen3vl_text_parity COMMAND qwen3vl_text_parity)
   target_link_libraries(moss_dit_parity PRIVATE strata_image)
   add_test(NAME moss_dit_parity COMMAND moss_dit_parity)
   if(TARGET strata-image-mf-train-probe)

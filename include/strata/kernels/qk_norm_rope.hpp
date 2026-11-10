@@ -61,32 +61,25 @@ struct Angles {
     }
 };
 
-/// pos theta^(-2 f / dim): pos the row's own index, or with `pos3` (3 rows of T: time, height, width) Qwen3-VL's
-/// M-RoPE, pair j taking the height's position where j % 3 == 1 and j < 3 sec_h, the width's where j % 3 == 2 and
-/// j < 3 sec_w, the time's otherwise; with `yx` ([T][2]) two halves of 2D positions, the first `quarter` pairs the
-/// row's y and the rest its x, f counted from each half's start (Qwen3-VL's vision reader).  f = j otherwise.
+/// pos theta^(-2 f / dim): pos the row's own index, or with `yx` ([T][2]) two halves of 2D positions, the first
+/// `quarter` pairs the row's y and the rest its x, f counted from each half's start (Qwen3-VL's vision reader).
+/// f = j otherwise.
 struct Theta {
     static constexpr bool on = true;
     float theta, dim;
-    const int32_t* pos3 = nullptr;
-    int64_t T = 0;
-    int sec_h = 0, sec_w = 0;
     const int32_t* yx = nullptr;
     int64_t quarter = 0;
     auto row(int64_t t) const {
-        // the row's positions: its own index, its three M-RoPE ones, or its y and x
-        const float pt = pos3 != nullptr ? (float) pos3[t] : yx != nullptr ? (float) yx[2 * t] : (float) t;
-        const float ph = pos3 != nullptr ? (float) pos3[T + t] : yx != nullptr ? (float) yx[2 * t + 1] : (float) t;
-        const float pw = pos3 != nullptr ? (float) pos3[2 * T + t] : pt;
-        const bool m3 = pos3 != nullptr, two = yx != nullptr;
-        const int64_t qu = quarter, sh = sec_h, sw = sec_w;
+        // the row's positions: its own index, or its y and x
+        const float pt = yx != nullptr ? (float) yx[2 * t] : (float) t;
+        const float ph = yx != nullptr ? (float) yx[2 * t + 1] : (float) t;
+        const bool two = yx != nullptr;
+        const int64_t qu = quarter;
         const float th = theta, dm = dim;
         return [=](int64_t j, float& c, float& s) {
             float pos = pt;
             int64_t f = j;
-            if (m3)
-                pos = j % 3 == 1 && j < 3 * sh ? ph : j % 3 == 2 && j < 3 * sw ? pw : pt;
-            else if (two) {
+            if (two) {
                 pos = j < qu ? pt : ph;
                 f = j < qu ? j : j - qu;
             }

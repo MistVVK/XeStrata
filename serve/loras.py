@@ -397,7 +397,7 @@ def is_text_encoder(key: str) -> bool:
     return key.startswith(("lora_te", "text_encoder", "te."))
 
 
-# The models whose text encoder takes adapters (src/image/qi_text.cpp's set_loras: Qwen3-VL's and Qwen3's layers;
+# The models whose text encoder takes adapters (src/image/text_encoder.cpp's set_loras: Qwen3-VL's and Qwen3's layers;
 # text_encoder.cpp's: Qwen3.5-9B's, its GDN's projections too),
 # and its weights as image_lora's lora_text_encoder_name writes a key: the prefixes off, every underscore a dot
 TEXT_ENCODER_FAMILIES = ("qwen-image", "mage-flow", "anima", "moss-image")

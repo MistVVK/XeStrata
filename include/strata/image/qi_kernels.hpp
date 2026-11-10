@@ -115,20 +115,6 @@ void qi_attention_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* 
                       float* dK, float* dV, bool accumulate, prefill::Gemm& gemm, void* stream,
                       int64_t n_causal = 0);
 
-/// The text encoder's q and k ([T][q_heads * head_dim], [T][kv_heads * head_dim]): each head RMS-normed (wq, wk; eps
-/// 1e-6), then rotated as NEOX does (pair (j, j + head_dim / 2) by a position times theta^(-2j / head_dim)); FP16 out,
-/// v as v16.  The position: t, or with pos3 (three [T] rows: time, row, column) Qwen3-VL's interleaved M-RoPE, pair j
-/// by the row when j % 3 == 1 and j < 3 * sec_h, by the column when j % 3 == 2 and j < 3 * sec_w, else by the time.
-void qi_text_qk_rope16(const float* q, const float* k, const float* v, const float* wq, const float* wk, int64_t T,
-                       int64_t q_heads, int64_t kv_heads, int64_t head_dim, float theta, uint16_t* q16, uint16_t* k16,
-                       uint16_t* v16, void* stream, const int32_t* pos3 = nullptr, int sec_h = 0, int sec_w = 0);
-
-/// Grouped K/V heads [T][kv_heads * head_dim] (FP16) repeated to one a query head, out [T][q_heads * head_dim] (query
-/// head h's the K/V head h / (q_heads / kv_heads)): a grouped attention as qi_sdpa's plain one.
-void qi_repeat_kv16(const uint16_t* src, int64_t T, int64_t q_heads, int64_t kv_heads, int64_t head_dim, uint16_t* out,
-                    void* stream);
-
-
 /// The activations of an int8 product (kernels::iq_mmq_quantize's layout, without the sums): rows x cols (a multiple of
 /// 32) of x16 as int8 with a scale for each 32.
 void qi_quantize_q8(const uint16_t* x16, int64_t rows, int64_t cols, void* xq, void* stream);

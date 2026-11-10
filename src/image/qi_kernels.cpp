@@ -288,33 +288,6 @@ void qi_qk_norm_rope16(const float* q, const float* k, const float* v, const flo
            "qi_qk_norm_rope16");
 }
 
-void qi_text_qk_rope16(const float* q, const float* k, const float* v, const float* wq, const float* wk, int64_t T,
-                       int64_t q_heads, int64_t kv_heads, int64_t head_dim, float theta, uint16_t* q16, uint16_t* k16,
-                       uint16_t* v16, void* stream, const int32_t* pos3, int sec_h, int sec_w) {
-    if (T <= 0) return;
-    if (head_dim % 2 != 0 || head_dim > 256) throw std::invalid_argument("qi_text_qk_rope16: head_dim");
-    struct Heads {
-        const float *q, *k, *v;
-        int64_t qh, kvh, hd;
-        auto head(int which, int64_t t, int64_t h) const {
-            const float* p = which == 0 ? q + (t * qh + h) * hd : (which == 1 ? k : v) + (t * kvh + h) * hd;
-            return [p](int64_t d) { return p[d]; };
-        }
-    };
-    kernels::qk::Shape sh{T, q_heads, kv_heads, head_dim};
-    sh.wq = wq;
-    sh.wk = wk;
-    sh.eps = kEps;
-    kernels::qk::Theta ang{theta, (float) head_dim};
-    ang.pos3 = pos3;
-    ang.T = T;
-    ang.sec_h = sec_h;
-    ang.sec_w = sec_w;
-    finish(stream, kernels::qk::qk_norm_rope(queue_for(stream), sh, Heads{q, k, v, q_heads, kv_heads, head_dim}, ang,
-                                             kernels::qk::Rows16{q16, k16, v16, q_heads, kv_heads, head_dim}),
-           "qi_text_qk_rope16");
-}
-
 void qi_quantize_q8(const uint16_t* x16, int64_t rows, int64_t cols, void* xq, void* stream) {
     if (rows <= 0) return;
     auto* x8 = static_cast<int8_t*>(xq);
@@ -406,18 +379,6 @@ void qi_tokens_latent(const float* tokens, int64_t C, int64_t HW, float* latent,
 }
 
 void qi_axpy(float* x, const float* v, float a, int64_t n, void* stream) { kernels::add_inplace(x, v, n, stream, a); }
-
-void qi_repeat_kv16(const uint16_t* src, int64_t T, int64_t q_heads, int64_t kv_heads, int64_t head_dim, uint16_t* out,
-                    void* stream) {
-    if (T <= 0) return;
-    const int64_t group = q_heads / kv_heads, row = q_heads * head_dim, kvrow = kv_heads * head_dim;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * row)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / row, c = i - t * row, h = c / head_dim, d = c - h * head_dim;
-        out[i] = src[t * kvrow + (h / group) * head_dim + d];
-    });
-    finish(stream, e, "qi_repeat_kv16");
-}
 
 void qi_inpaint_blend(float* x, const float* z0, const float* noise, const float* m, float s, int64_t C, int64_t HW,
                       void* stream, bool tokens) {

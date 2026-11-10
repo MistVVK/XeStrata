@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/image/mf_pre.cpp - strata-image-mf-pre: Mage-Flow's learning preprocessing on the GPU, the two values the
 // trainer reads back from disk (docs/LORA_TRAIN.md "The latent and text-embedding disk caches").  Mage-VAE's own
-// encoder (src/image/mf_vae.cpp) and the text reader on the inference's own states path (src/image/qi_text.cpp,
+// encoder (src/image/mf_vae.cpp) and the text reader on the inference's own states path (src/image/text_encoder.cpp,
 // Qwen3-VL-4B with its final norm and plain positions) make them; nothing here recomputes either.
 //
 //   strata-image-mf-pre vae  VAE.safetensors DIR          DIR/pix.{bin,json} -> DIR/latent.{bin,json}
@@ -28,8 +28,7 @@
 #include "strata/image/anima_pipeline.hpp"
 #include "strata/image/moss_dit.hpp"
 #include "strata/image/qi_vae.hpp"
-#include "strata/image/moss_text.hpp"
-#include "strata/image/qi_text.hpp"
+#include "strata/image/text_encoder.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
@@ -48,7 +47,7 @@
 namespace {
 
 using strata::image::MfVae;
-using strata::image::QiText;
+using strata::image::TextEncoder;
 
 double seconds_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -182,16 +181,18 @@ int vae(const std::string& path, const std::string& dir) {
 }
 
 /// one prompt's states, the system turn's rows dropped: the cache's bf16 bits and the FP32 behind them
-void text_one(QiText& te, const std::string& dir, const std::string& base, int64_t drop, int64_t C) {
+void text_one(TextEncoder& te, const std::string& dir, const std::string& base, int64_t drop, int64_t C) {
     const Var ids = load(dir, base + "_ids", base != "prompt");
     if (ids.raw.empty()) return;
     if (ids.type != "i32" || ids.shape.size() != 1) throw std::runtime_error(base + "_ids must be [n] i32");
     const std::vector<int32_t> v(ids.i(), ids.i() + ids.dim(0));
     if (ids.dim(0) <= drop)
         throw std::runtime_error(base + ": no rows left after the system turn's " + std::to_string(drop));
-    te.encode(v);   // warm
+    std::string err;
+    te.encode(v, err);   // warm
     const auto t0 = std::chrono::steady_clock::now();
-    const auto h = te.encode(v);
+    const auto h = te.encode(v, err);
+    if (h.empty()) throw std::runtime_error(base + ": " + err);
     if ((int64_t) h.size() / C != (int64_t) v.size())
         throw std::runtime_error(base + ": the states are not one row per id");
     const std::vector<float> kept(h.begin() + (std::ptrdiff_t) (drop * C), h.end());
@@ -205,10 +206,9 @@ void text_one(QiText& te, const std::string& dir, const std::string& base, int64
 }
 
 int text(const std::string& path, const std::string& dir, int64_t drop) {
-    void* s = strata::core::Runtime::get().create_stream();
-    QiText te;
+    TextEncoder te;
     std::string err;
-    if (!te.open(path, s, err)) throw std::runtime_error(err);
+    if (!te.open(path, 16384, err)) throw std::runtime_error(err);
     te.set_final_norm(true);      // Mage-Flow takes the states after the final RMS norm
     te.set_flat_positions(true);  // every token's position is its index, as the reference's encoder passes them
     text_one(te, dir, "prompt", drop, te.hidden());
@@ -233,7 +233,7 @@ int moss_text(const std::string& te_path, const std::string& dit_path, const std
     std::vector<std::vector<float>> states(dirs.size() * 2);
     std::string err;
     {
-        strata::image::MossText te;
+        TextEncoder te;
         if (!te.open(te_path, 4096, err)) throw std::runtime_error(err);
         for (size_t d = 0; d < dirs.size(); ++d)
             for (int b = 0; b < 2; ++b) {
@@ -316,17 +316,16 @@ int anima_text(const std::string& te_path, const std::string& dit_path, const st
     std::string err;
     int64_t H = 0;
     {
-        QiText te;
-        if (!te.open(te_path, s, err)) throw std::runtime_error(err);
-        te.set_final_norm(true);
+        TextEncoder te;
+        if (!te.open(te_path, 4096, err)) throw std::runtime_error(err);   // Anima's longest prompt
         H = te.hidden();
         for (size_t d = 0; d < dirs.size(); ++d)
             for (int b = 0; b < 2; ++b) {
                 const Var ids = load(dirs[d], b == 0 ? "prompt_ids" : "uncond_ids", b == 1);
                 if (ids.raw.empty()) continue;
                 const std::vector<int32_t> v(ids.i(), ids.i() + ids.dim(0));
-                states[d * 2 + b] = te.encode(v);
-                if (states[d * 2 + b].empty()) throw std::runtime_error(dirs[d] + ": no states");
+                states[d * 2 + b] = te.encode(v, err);
+                if (states[d * 2 + b].empty()) throw std::runtime_error(dirs[d] + ": " + err);
             }
     }
     strata::image::AnimaDit dit;
