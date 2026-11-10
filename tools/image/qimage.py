@@ -918,14 +918,14 @@ _ESRGAN_LICENSE = ("BSD-3-Clause, Xintao Wang, Liangbin Xie, Chao Dong and Ying 
                    "(https://github.com/xinntao/Real-ESRGAN)")
 _SEEDVR2_LICENSE = ("Apache-2.0, ByteDance Seed's SeedVR2 (https://github.com/ByteDance-Seed/SeedVR), as Comfy-Org "
                     "repackaged it (https://huggingface.co/Comfy-Org/SeedVR2)")
-SAM3_LICENSE = ("the SAM License, Meta's (not an open-source license: it binds whoever uses the weights, and "
-                f"forbids some uses), https://huggingface.co/{_SAM}/blob/{REVISIONS[_SAM]}/LICENSE")
+SAM3_LICENSE = ("the SAM License, Meta's (not free software), "
+                f"https://huggingface.co/{_SAM}/blob/{REVISIONS[_SAM]}/LICENSE")
 _CLIP_LICENSE = f"MIT, OpenAI's CLIP (https://huggingface.co/{_CLIP})"
 _FLORENCE_LICENSE = f"MIT, Microsoft's Florence-2 (https://huggingface.co/{_FL})"
 _BIREFNET_LICENSE = "MIT, Peng Zheng's BiRefNet (https://github.com/ZhengPeng7/BiRefNet)"
 BIREFNET_VERSIONS = ("general", "lite", "lite-2k", "portrait", "matting", "hr", "dynamic")
-CNET_UNION_LICENSE = (f"the Qwen Research License (not a free software license: read it before you use the images "
-                      f"commercially), alibaba-pai's Qwen-Image-2.1 Fun ControlNet Union, https://huggingface.co/{_CN}")
+CNET_UNION_LICENSE = (f"the Qwen Research License (not free software), alibaba-pai's Qwen-Image-2.1 Fun ControlNet "
+                      f"Union, https://huggingface.co/{_CN}")
 _DEPTH_LICENSE = f"Apache-2.0, Depth Anything V2 Small (Lihe Yang et al.), https://huggingface.co/{_DA}"
 _HED_LICENSE = ("Apache-2.0, ControlNet 1.1's HED annotator (Lvmin Zhang), "
                 "https://github.com/lllyasviel/ControlNet-v1-1-nightly")
@@ -1164,9 +1164,10 @@ def license_note(dit: str) -> str:
                 "https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE - read it and its Acceptable "
                 "Use Policy before you use the images")
     if is_anima(dit):
-        return (f"{name} is under CircleStone Labs' non-commercial license and NVIDIA's Open Model License (it is "
-                f"built on Cosmos-Predict2): https://huggingface.co/{repo} - the model may not be used commercially; "
-                "the images it makes may be.  Its text encoder Qwen3-0.6B-Base and T5's tokenizer are under Apache 2.0")
+        return (f"{name} is under the CircleStone Labs Non-Commercial License and NVIDIA's Open Model License (it is "
+                f"built on Cosmos-Predict2; not free software): https://huggingface.co/{repo} - read them (the full "
+                "text: the web app's About > Model terms).  Its text encoder Qwen3-0.6B-Base and T5's tokenizer are "
+                "under Apache 2.0")
     if dit in MOSS_FEW_STEP:
         return (f"{name} is MOSS-Image (SFT), under the Apache 2.0 license: https://huggingface.co/{repo}, with "
                 f"darask0's 4-step adapter, under Apache 2.0 too: https://huggingface.co/{_M4}; its text encoder, "
@@ -1181,10 +1182,9 @@ def license_note(dit: str) -> str:
                 f"https://huggingface.co/{repo}; its VAE, Black Forest Labs' Flux2 VAE from FLUX.2-klein-4B, under "
                 "Apache 2.0")
     if is_mage(dit):
-        return (f"{name} is under the MIT license; Microsoft released it for research, and asks those who deploy it "
-                f"more widely to add their own safeguards (content moderation): https://github.com/{repo}")
-    return (f"{name} is under the Qwen Research License (not Apache 2.0): https://huggingface.co/{repo}/blob/main/"
-            "LICENSE - read it before you use the images commercially")
+        return f"{name} is under the MIT license: https://github.com/{repo}"
+    return (f"{name} is under the Qwen Research License (not free software): https://huggingface.co/{repo}/blob/"
+            "main/LICENSE - read it (the full text: the web app's About > Model terms)")
 
 
 def text_file(text_encoder: str, text_quant: str) -> str:

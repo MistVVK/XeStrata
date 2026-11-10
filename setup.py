@@ -5558,9 +5558,8 @@ def setup_translate(a, cfg: dict, cfg_path: Path, text_gb: float, on_cpu: bool =
     lic, url = m.license
     say()
     say(f"  {m.name}: the translation APIs (DeepL's, LibreTranslate's, OpenAI's) and the web page's Translate tab.")
-    say(f"  Its license is the {lic}, not free software: free for personal and non-commercial use; commercial")
-    say("  use by a business with up to 1 billion yen of yearly revenue needs registering with Preferred Networks,")
-    say(f"  above that a contract of its own ({url}).")
+    say(f"  Its license is the {lic}, not free software: {url}")
+    say("  (its full text: the web app's About > Model terms).  Read it before you use the model.")
     say("  XeStrata does not include the model: it is downloaded now.")
     dst = Path(a.models_dir) / TRANSLATE_DIR / m.file
     if not (dst.exists() and done(dst)) and free_gb(Path(a.models_dir)) < size / 1e9 + 2:
@@ -8520,9 +8519,10 @@ OPTIONS = [
     # ---- the translation model (serve/translate.py's MODELS)
     _option("translate", "Translation: a model of its own for the translation APIs and the web page's Translate tab "
             "(PLaMo 3 Translate, under the PLaMo Community License)",
-            "the translation model (PLaMo 3 Translate, under the PLaMo Community License: not free software, free "
-            "for personal and non-commercial use): auto (default: the 2B where the RAM the text and image models "
-            "leave holds it, else the 0.8B, else none), 2b, 0.8b, 8b, or no; not given, the earlier choice is kept",
+            "the translation model (PLaMo 3 Translate, under the PLaMo Community License, not free software: its "
+            "full text in the web app's About > Model terms): auto (default: the 2B where the RAM the text and image "
+            "models leave holds it, else the 0.8B, else none), 2b, 0.8b, 8b, or no; not given, the earlier choice is "
+            "kept",
             choices=[["auto", "Auto: the 2B, the 0.8B where the RAM is short"],
                      ["2b", "PLaMo 3 Translate 2B (1.8 GB)"], ["0.8b", "PLaMo 3 Translate 0.8B (0.6 GB)"],
                      ["8b", "PLaMo 3 Translate 8B (5.3 GB)"], ["no", "No translation model"]],

@@ -25,7 +25,7 @@ The weights are under their own licenses, which setup prints when it installs th
 license_note): Qwen-Image-2.1's under the Qwen Research License, Mage-Flow's and MageTrail's under MIT, and
 HunyuanImage 3.0's under the Tencent Hunyuan Community License Agreement, which does not apply in the European Union,
 the United Kingdom or South Korea: https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE; MOSS-Image's
-under Apache 2.0.
+under Apache 2.0.  Their full texts: the web app's About > Model terms.
 --dit-q8, --dit-keep: Mage-Flow's or MOSS-Image's image model in 8 or 16 bits, and Mage-Flow's not in use kept in RAM
 (as setup's --image-dit-q8 and --image-dit-keep).
 --gpu auto|same|PCI: the GPU of the image jobs (setup's --image-gpu); --sam3-license agree|no: Meta's SAM License for

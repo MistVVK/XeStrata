@@ -1853,7 +1853,7 @@
    "download_gb": 18.2,
    "ram_gb": 20.2,
    "edits": true,
-   "license": "Qwen-Image-2.1-Turbo is under the Qwen Research License (not Apache 2.0): https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo/blob/main/LICENSE - read it before you use the images commercially",
+   "license": "Qwen-Image-2.1-Turbo is under the Qwen Research License (not free software): https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo/blob/main/LICENSE - read it (the full text: the web app's About > Model terms)",
    "tools": [
     "generate_image",
     "edit_image",
@@ -1881,7 +1881,7 @@
    "download_gb": 18.2,
    "ram_gb": 20.2,
    "edits": true,
-   "license": "Qwen-Image-2.1 is under the Qwen Research License (not Apache 2.0): https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/LICENSE - read it before you use the images commercially",
+   "license": "Qwen-Image-2.1 is under the Qwen Research License (not free software): https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/LICENSE - read it (the full text: the web app's About > Model terms)",
    "tools": [
     "generate_image",
     "edit_image",
@@ -1909,7 +1909,7 @@
    "download_gb": 21.9,
    "ram_gb": 16.2,
    "edits": true,
-   "license": "Mage-Flow-Turbo is under the MIT license; Microsoft released it for research, and asks those who deploy it more widely to add their own safeguards (content moderation): https://github.com/microsoft/Mage",
+   "license": "Mage-Flow-Turbo is under the MIT license: https://github.com/microsoft/Mage",
    "tools": [
     "generate_image",
     "edit_image",
@@ -1936,7 +1936,7 @@
    "download_gb": 21.9,
    "ram_gb": 16.2,
    "edits": true,
-   "license": "Mage-Flow is under the MIT license; Microsoft released it for research, and asks those who deploy it more widely to add their own safeguards (content moderation): https://github.com/microsoft/Mage",
+   "license": "Mage-Flow is under the MIT license: https://github.com/microsoft/Mage",
    "tools": [
     "generate_image",
     "edit_image",
@@ -1963,7 +1963,7 @@
    "download_gb": 21.9,
    "ram_gb": 16.2,
    "edits": true,
-   "license": "Mage-Flow-Base is under the MIT license; Microsoft released it for research, and asks those who deploy it more widely to add their own safeguards (content moderation): https://github.com/microsoft/Mage",
+   "license": "Mage-Flow-Base is under the MIT license: https://github.com/microsoft/Mage",
    "tools": [
     "generate_image",
     "edit_image",
@@ -2125,7 +2125,7 @@
    "download_gb": 5.6,
    "ram_gb": 5.7,
    "edits": false,
-   "license": "Anima is under CircleStone Labs' non-commercial license and NVIDIA's Open Model License (it is built on Cosmos-Predict2): https://huggingface.co/circlestone-labs/Anima - the model may not be used commercially; the images it makes may be.  Its text encoder Qwen3-0.6B-Base and T5's tokenizer are under Apache 2.0",
+   "license": "Anima is under the CircleStone Labs Non-Commercial License and NVIDIA's Open Model License (it is built on Cosmos-Predict2; not free software): https://huggingface.co/circlestone-labs/Anima - read them (the full text: the web app's About > Model terms).  Its text encoder Qwen3-0.6B-Base and T5's tokenizer are under Apache 2.0",
    "tools": [
     "generate_image",
     "edit_image",
@@ -2152,7 +2152,7 @@
    "download_gb": 5.6,
    "ram_gb": 5.7,
    "edits": false,
-   "license": "Anima-Aesthetic is under CircleStone Labs' non-commercial license and NVIDIA's Open Model License (it is built on Cosmos-Predict2): https://huggingface.co/circlestone-labs/Anima - the model may not be used commercially; the images it makes may be.  Its text encoder Qwen3-0.6B-Base and T5's tokenizer are under Apache 2.0",
+   "license": "Anima-Aesthetic is under the CircleStone Labs Non-Commercial License and NVIDIA's Open Model License (it is built on Cosmos-Predict2; not free software): https://huggingface.co/circlestone-labs/Anima - read them (the full text: the web app's About > Model terms).  Its text encoder Qwen3-0.6B-Base and T5's tokenizer are under Apache 2.0",
    "tools": [
     "generate_image",
     "edit_image",
@@ -2179,7 +2179,7 @@
    "download_gb": 5.6,
    "ram_gb": 5.7,
    "edits": false,
-   "license": "Anima-Turbo is under CircleStone Labs' non-commercial license and NVIDIA's Open Model License (it is built on Cosmos-Predict2): https://huggingface.co/circlestone-labs/Anima - the model may not be used commercially; the images it makes may be.  Its text encoder Qwen3-0.6B-Base and T5's tokenizer are under Apache 2.0",
+   "license": "Anima-Turbo is under the CircleStone Labs Non-Commercial License and NVIDIA's Open Model License (it is built on Cosmos-Predict2; not free software): https://huggingface.co/circlestone-labs/Anima - read them (the full text: the web app's About > Model terms).  Its text encoder Qwen3-0.6B-Base and T5's tokenizer are under Apache 2.0",
    "tools": [
     "generate_image",
     "edit_image",
@@ -2206,7 +2206,7 @@
    "download_gb": 7.3,
    "ram_gb": 6.6,
    "edits": false,
-   "license": "Anima-2.9B is under CircleStone Labs' non-commercial license and NVIDIA's Open Model License (it is built on Cosmos-Predict2): https://huggingface.co/Gazingstars123/Anima-2.9B - the model may not be used commercially; the images it makes may be.  Its text encoder Qwen3-0.6B-Base and T5's tokenizer are under Apache 2.0",
+   "license": "Anima-2.9B is under the CircleStone Labs Non-Commercial License and NVIDIA's Open Model License (it is built on Cosmos-Predict2; not free software): https://huggingface.co/Gazingstars123/Anima-2.9B - read them (the full text: the web app's About > Model terms).  Its text encoder Qwen3-0.6B-Base and T5's tokenizer are under Apache 2.0",
    "tools": [
     "generate_image",
     "edit_image",
