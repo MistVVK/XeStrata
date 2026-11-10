@@ -68,6 +68,10 @@ struct Product {
     size_t woff = 0;
 };
 
+/// The faster of the products' forms timed for products of ggml_type, w_rows x w_cols, n experts (1: a dense product)
+/// at a few row counts (kernels::iq_mmq_choose_forms): once a GPU and shape, before the first prompt.
+void choose_forms(int ggml_type, int64_t w_rows, int64_t w_cols, int n, void* stream);
+
 /// A one-expert product of few rows split along K (kernels::iq_mmq_split_set): the aim in quarters of the compute
 /// units (0: none), and the parts' buffer the stream reserves for products of up to `rows` rows and `n_out` outputs.
 void split_set(int quarters, void* stream);

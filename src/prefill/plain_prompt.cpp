@@ -280,6 +280,18 @@ bool PlainModel::prompt_warm(std::string& err) {
     if (!prompt_borrow(std::min<int64_t>(opt_.prompt_chunk, 512), err)) return false;
     const bool ok = prompt_warm_products(err);
     if (ok && dense_) prompt_dense_calibrate();
+    if (ok && !dense_ && spec_.n_expert > 0 && prompt_int8()) {   // the experts' products' forms, timed for each type
+        const int64_t N = spec_.n_embd, FF = spec_.n_ff_exp;
+        for (const auto& f : k::cpu::expert_layout().fmt) {
+            if (k::cpu::native_mixed_gu(f)) {
+                prefill::mmq::choose_forms(f.gu_type, FF, N, 16, cs_);
+                prefill::mmq::choose_forms(f.up_type, FF, N, 16, cs_);
+            } else {
+                prefill::mmq::choose_forms(f.gu_type, 2 * FF, N, 16, cs_);
+            }
+            prefill::mmq::choose_forms(f.d_type, N, FF, 16, cs_);
+        }
+    }
     std::string err2;
     if (!prompt_return(err2) && ok) { err = err2; return false; }
     return ok;

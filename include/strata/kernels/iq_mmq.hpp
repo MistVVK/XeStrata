@@ -67,6 +67,13 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int ggml_type, const void* w, size_t 
                            int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst,
                            const uint8_t* const* wtab = nullptr, size_t woff = 0, int64_t rows = 0);
 
+/// Times the two forms Intel's XMX take these products in for products of ggml_type, w_rows x w_cols (the weights'
+/// own columns, as iq_mmq_row_bytes takes them), n experts (1: a dense product) of 8 to 256 rows each, and keeps the
+/// faster for each class of rows (iq_mmq_grouped then takes it; a product not timed takes the work-group form).  For
+/// the engine's warming, before its first prompt: a few milliseconds a class, once a GPU and shape.  Nothing where
+/// the GPU takes one form (not Intel's XMX).
+void iq_mmq_choose_forms(sycl::queue& q, int ggml_type, int64_t w_rows, int64_t w_cols, int n = 16);
+
 /// One expert's product of few rows (a dense model's short prompt) split along K over more work-groups, its parts'
 /// sums added in order after: `quarters` sets the work-groups it aims for, in quarters of the GPU's compute units
 /// (0: none, the default), on the queue's GPU.  The parts' sums go into a buffer the queue reserves beforehand

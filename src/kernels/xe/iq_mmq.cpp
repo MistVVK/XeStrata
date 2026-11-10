@@ -45,14 +45,20 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <chrono>
 #include <cstdlib>
+#include <functional>
+#include <map>
 #include <mutex>
+#include <tuple>
 #include <unordered_map>
+#include <vector>
 
 namespace strata::kernels {
 namespace {
 
 namespace mx = sycl::ext::oneapi::experimental::matrix;
+namespace ix = sycl::ext::intel::experimental::matrix;
 namespace syclex = sycl::ext::oneapi::experimental;
 using namespace iq_bits;
 using u32x4 = uint32_t __attribute__((ext_vector_type(4)));   // one 16-byte access (sycl::uint4 is split on NVPTX)
@@ -528,19 +534,28 @@ constexpr int up128(int b) { return (b + 127) / 128 * 128; }
 // WM / (lanes / WN) of the rows, the products by dp4a.  IS: Intel's XMX shapes (1: Xe2's 8 x 16 x 32 on 16 lanes, 2:
 // Xe-HPG's 8 x 8 x 32 on 8), the same work-group and steps (intel_body); a type with a scale per 16 values keeps two
 // copies of the activations, each with the other half of every block zeroed.
-template<int TY, int SGM, int NSGM, bool DP4A = false, bool TAIL = false, int IS = 0>
+//
+// REG (with IS): the sub-group form (intel_reg_body), a sub-group a column strip of ISG outputs down all WM rows,
+// each lane decoding its own output's blocks: no work-group barrier, each sub-group reading the block's activations
+// on its own (intel_sub_group_first chooses between the two forms).  The idea is arcint's
+// (github.com/marfrit/arcint, Apache-2.0: its int8 expert products on the Arc B60 lost 46-59% with the decoded weights
+// shared through local memory, and kept them in each lane's registers).
+template<int TY, int SGM, int NSGM, bool DP4A = false, bool TAIL = false, int IS = 0, bool REG = false>
 struct Kernel {
     static constexpr int SGN = 2, NSGN = 4, NSG = NSGM * NSGN;
     static constexpr int WM = NSGM * SGM * TM, WN = NSGN * SGN * TN;
     static constexpr bool HALF = half_scales<TY>();
     static constexpr bool MIN = has_min<TY>();
     static constexpr int ISG = IS == 1 ? 16 : IS == 2 ? 8 : SG;   // the sub-group size, and Intel's tile width
+    static constexpr int LANES = REG ? WN : NSG * SG;              // the work-group: REG, WN / ISG sub-groups
     static constexpr int A_N = IS != 0 && HALF ? 2 : 1;           // copies of the activations' tile
     // MIN: the activations' block sums as [block][row] and the weights' min terms as [block][output] after the rest
     static constexpr int A_OFF = 0, B_OFF = up128(A_OFF + A_N * WM * LDA), XS_OFF = up128(B_OFF + WN * LDB),
                          WS_OFF = up128(XS_OFF + NB * WM * 4), ST_OFF = up128(WS_OFF + 2 * NB * WN * 4),
                          XU_OFF = up128(ST_OFF + NSG * TM * TN * 4), WM_OFF = up128(XU_OFF + NB * WM * 4),
-                         LOCAL = MIN ? up128(WM_OFF + NB * WN * 4) : XU_OFF;
+                         // REG: a sub-group's B tiles, and on 8 lanes its A tiles
+                         SG_LOCAL = (HALF ? 2 : 1) * 32 * ISG + (IS == 1 ? 0 : WM * 32),
+                         LOCAL = REG ? WN / ISG * SG_LOCAL : MIN ? up128(WM_OFF + NB * WN * 4) : XU_OFF;
     const uint8_t* w;
     const uint8_t* const* wtab;   // expert e's weights at wtab[e] + woff when set, else at w + e expert_bytes
     size_t woff, expert_bytes, row_bytes;
@@ -748,9 +763,116 @@ struct Kernel {
 #endif
     }
 
+    // REG: sub-group j takes the outputs [j ISG, (j + 1) ISG) of the work-group's WN, all its WM rows as TPS tiles of
+    // 8.  Each lane decodes its own output's block of 32 (Dec) and writes its words into the sub-group's own B tile in
+    // local memory, which the sub-group loads back (no work-group barrier; a B tile written by joint_matrix_apply lost
+    // the B70); a type with a scale per 16 values takes two B tiles, each with the other half zeroed.  The activations'
+    // tiles come from global memory or through local memory (below), their scales read by lane (row j ISG + l in
+    // lane l) and given to each element by select_from_group.
+    void intel_reg_body(sycl::nd_item<1> it) const {
+#if STRATA_IQ_MMQ_INTEL
+        constexpr int IM = 8, IK = 32, IN = ISG, TPS = WM / IM, XR = (WM + IN - 1) / IN;
+        const int64_t gk = (int64_t) it.get_group(0), g = gk / ksplit, ks = gk % ksplit, per = tiles_m * tiles_n, e = g / per,
+                      r = g % per;
+        const int64_t m0 = r % tiles_m * WM, n0 = r / tiles_m * WN;
+        const int64_t row0 = bounds[e], rows = bounds[e + 1] - row0;
+        if (m0 >= rows) return;   // the whole work-group: this expert has fewer rows than the launch
+        const auto sg = it.get_sub_group();
+        const int sgid = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
+        const int64_t col = n0 + (int64_t) sgid * IN + lane;
+        const uint8_t* wx = (wtab != nullptr ? wtab[e] + woff : w + (size_t) e * expert_bytes) + (size_t) col * row_bytes;
+        constexpr int NH = HALF ? 2 : 1;   // B tiles a block
+        // the sub-group's local memory: its B tiles, then its rows' A tiles of the block (SG_LOCAL bytes)
+        const auto mine = lm.template get_multi_ptr<sycl::access::decorated::no>() + static_cast<int>(sgid * SG_LOCAL);
+        const auto bp = local_as<int8_t>(mine);
+        uint32_t* bw = local_as<uint32_t>(mine).get();
+        const auto ap = local_as<int8_t>(mine + NH * IK * IN);
+        [[maybe_unused]] u32x4* aw = local_as<u32x4>(mine + NH * IK * IN).get();
+        [[maybe_unused]] const auto gx =
+            sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(
+                const_cast<int8_t*>(xq));
+        const int64_t live = sycl::min<int64_t>(rows - m0, (int64_t) WM);   // the tile's rows of this expert
+        const int tiles = (int) ((live + IM - 1) / IM);
+
+        float acc[TPS][IM];
+        for (int t = 0; t < TPS; ++t)
+            for (int i = 0; i < IM; ++i) acc[t][i] = 0.0f;
+        mx::joint_matrix<sycl::sub_group, int32_t, mx::use::accumulator, IM, IN> ci;
+
+        const int64_t kb = K / 32;
+        const int64_t b0 = ks * kspan / 32, b1 = sycl::min(K, (ks + 1) * kspan) / 32;
+        for (int64_t b = b0; b < b1; ++b) {
+            const Sub d = Dec<TY>::get(wx, (int) b, row_bytes);
+            float xr[XR];
+            [[maybe_unused]] float xu_r[XR];
+            for (int j = 0; j < XR; ++j) {
+                const int64_t rr = (int64_t) j * IN + lane;
+                const bool in = rr < live;
+                xr[j] = in ? xs[(row0 + m0 + rr) * kb + b] : 0.0f;
+                if constexpr (MIN) xu_r[j] = in ? xu[(row0 + m0 + rr) * kb + b] : 0.0f;
+            }
+            mx::joint_matrix<sycl::sub_group, int8_t, mx::use::b, IK, IN, mx::layout::ext_intel_packed> bm[NH];
+            sycl::group_barrier(sg);   // the last block's tiles are loaded
+            for (int h = 0; h < NH; ++h)
+                for (int j = 0; j < 8; ++j) bw[(h * 8 + j) * IN + lane] = !HALF || j / 4 == h ? d.v[j] : 0u;
+            // A: on 16 lanes (Xe2) a bounds-checked tile load from global memory (zeros past the last row; Xe2's
+            // block reads: B70, llm-jp-4.1 Q4_K_M at 32 rows an expert 426 us, against 592 with a plain load and 653
+            // through local memory); on 8 (Xe-HPG), whose compile refuses the checked load (the A380: it failed the
+            // build of every int8 XMX kernel), the rows' 32 values of the block copied into local memory, 16 bytes a
+            // lane, zeros past the last row
+            if constexpr (IS != 1)
+                for (int c = lane; c < tiles * IM * 2; c += IN) {
+                    const int64_t row = row0 + m0 + c / 2;
+                    aw[c] = row < total_rows ? *reinterpret_cast<const u32x4*>(xq + row * K + b * IK + c % 2 * 16)
+                                             : u32x4{0u, 0u, 0u, 0u};
+                }
+            sycl::group_barrier(sg);
+            for (int h = 0; h < NH; ++h)
+                mx::joint_matrix_load(sg, bm[h], bp + static_cast<int>(h * 8 * IN * 4), IN * 4);
+            for (int t = 0; t < TPS; ++t) {
+                if (t >= tiles) break;
+                mx::joint_matrix<sycl::sub_group, int8_t, mx::use::a, IM, IK, mx::layout::row_major> a;
+                if constexpr (IS == 1)
+                    ix::joint_matrix_load_checked(sg, a, gx, (size_t) K, (size_t) total_rows, (size_t) K,
+                                                  (size_t) (row0 + m0 + (int64_t) t * IM), (size_t) (b * IK));
+                else
+                    mx::joint_matrix_load(sg, a, ap + static_cast<int>(t * IM * IK), IK);
+                for (int h = 0; h < NH; ++h) {
+                    const float ws = h == 1 ? d.s1 : d.s0;
+                    mx::joint_matrix_fill(sg, ci, 0);
+                    mx::joint_matrix_mad(sg, ci, a, bm[h], ci);
+                    int i = 0;
+                    mx::joint_matrix_apply(sg, ci, [&](int32_t& c) {
+                        const int rr = t * IM + i;
+                        const float x = sycl::select_from_group(sg, xr[rr / IN], rr % IN);
+                        acc[t][i] = sycl::fma(ws * x, static_cast<float>(c), acc[t][i]);
+                        ++i;
+                    });
+                }
+            }
+            if constexpr (MIN) {   // less the weights' min of the lane's column times each row's sum
+                for (int t = 0; t < TPS; ++t)
+                    for (int i = 0; i < IM; ++i) {
+                        const int rr = t * IM + i;
+                        acc[t][i] -= d.m * sycl::select_from_group(sg, xu_r[rr / IN], rr % IN);
+                    }
+            }
+        }
+        for (int t = 0; t < TPS; ++t)
+            for (int i = 0; i < IM; ++i) {
+                const int64_t row = m0 + (int64_t) t * IM + i;
+                if (row < rows) out(ks, row0 + row, col, acc[t][i]);
+            }
+#else
+        (void) it;
+#endif
+    }
+
     void body(sycl::nd_item<1> it) const {
         if constexpr (DP4A) {
             dp4a_body(it);
+        } else if constexpr (IS != 0 && REG) {
+            intel_reg_body(it);
         } else if constexpr (IS != 0) {
             intel_body(it);
         } else if constexpr (!built<TY>()) {
@@ -1033,11 +1155,11 @@ float* part_buffer(sycl::queue& q, size_t floats) {
     return it != st.bufs.end() && it->second.second >= floats ? it->second.first : nullptr;
 }
 
-template<int TY, int SGM, int NSGM, bool DP4A, bool TAIL, int IS>
+template<int TY, int SGM, int NSGM, bool DP4A, bool TAIL, int IS, bool REG = false>
 sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, size_t woff, size_t expert_bytes,
                    int64_t w_rows, int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
                    int64_t max_rows, const int32_t* ids, float* dst, int64_t ld_dst) {
-    using KT = Kernel<TY, SGM, NSGM, DP4A, TAIL, IS>;
+    using KT = Kernel<TY, SGM, NSGM, DP4A, TAIL, IS, REG>;
     const int64_t tiles_m = (max_rows + KT::WM - 1) / KT::WM, tiles_n = w_rows / KT::WN;
     const size_t row_bytes = (size_t) (w_cols / Dec<TY>::QK) * (size_t) Dec<TY>::BSZ;
     const auto* x8 = static_cast<const int8_t*>(xq);
@@ -1051,7 +1173,7 @@ sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, si
     if (part == nullptr) ksplit = 1;
     sycl::event e = q.submit([&](sycl::handler& h) {
         sycl::local_accessor<uint8_t, 1> lm(sycl::range<1>((size_t) KT::LOCAL), h);
-        const size_t wg = (size_t) KT::NSG * SG;
+        const size_t wg = (size_t) KT::LANES;
         KT k{static_cast<const uint8_t*>(w), wtab, woff, expert_bytes, row_bytes, x8, xs, xu, w_cols, bounds, ids, dst,
              ld_dst, tiles_m, tiles_n, lm};
         k.ksplit = ksplit;
@@ -1162,6 +1284,63 @@ int intel_shape_of(sycl::queue& q) {
     });
 }
 
+// Whether a product on Intel's XMX takes the sub-group form (intel_reg_body) before the work-group one (intel_body),
+// by its type, N, K, whether it is one expert's (a dense product) and the class of the rows its experts average
+// (powers of two, 8 to 256).  Neither wins everywhere: B70 (2026-11-10), 16 experts of r rows, llm-jp-4.1's Q4_K_M
+// and Qwen3.8's IQ2_XS, the sub-group form at 32 rows 425 and 256 us against 504 and 346, at 8 rows 292 and 156
+// against 209 and 194, at 64 rows 652 and 435 against 538 and 361.  So the two are timed for each class when the
+// engine warms up (iq_mmq_choose_forms), not inside a prompt, and kept for the GPU (the sub-group form 5% faster or
+// more, so that a near tie does not flip from start to start); a product not timed there takes the work-group form.
+// XESTRATA_IQ_MMQ_SUB_GROUP=1 or 0 takes one form.
+struct SgChoice {
+    std::mutex mu;
+    std::map<std::tuple<int, int, bool, int64_t, int64_t>, bool> picks;
+};
+SgChoice& sg_choice(sycl::queue& q) {
+    static core::PerDevice<std::shared_ptr<SgChoice>> per_device;
+    return *per_device.get(q.get_device(), [] { return std::make_shared<SgChoice>(); });
+}
+int rows_class(int64_t mean_rows) {
+    int r = 3;   // 8 rows and fewer
+    while (r < 8 && ((int64_t) 1 << r) < mean_rows) ++r;
+    return r;
+}
+thread_local bool t_choosing = false;   // inside iq_mmq_choose_forms: a class not chosen yet is timed
+bool intel_sub_group_first(sycl::queue& q, int ty, int64_t mean_rows, int n, int64_t N, int64_t K,
+                           const std::function<sycl::event()>& sg, const std::function<sycl::event()>& wg) {
+    static const char* const env = std::getenv("XESTRATA_IQ_MMQ_SUB_GROUP");
+    if (env != nullptr && (env[0] == '0' || env[0] == '1')) return env[0] == '1';
+    SgChoice& c = sg_choice(q);
+    const auto key = std::make_tuple(ty, rows_class(mean_rows), n == 1, N, K);
+    {
+        std::lock_guard<std::mutex> lock(c.mu);
+        if (const auto it = c.picks.find(key); it != c.picks.end()) return it->second;
+    }
+    if (!t_choosing) return false;
+    double sg_s = 0, wg_s = 0;
+    const auto time = [&](const std::function<sycl::event()>& f) {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < 3; ++i) f();
+        q.wait_and_throw();
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / 3;
+    };
+    try {
+        q.wait_and_throw();
+        sg();   // each once first: its kernel's build
+        wg();
+        q.wait_and_throw();
+        sg_s = time(sg);
+        wg_s = time(wg);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "xestrata: timing the int8 expert products' forms: %s\n", e.what());
+        sg_s = wg_s = 0;
+    }
+    const bool pick = sg_s > 0 && wg_s > 0 && sg_s * 1.05 < wg_s;
+    std::lock_guard<std::mutex> lock(c.mu);
+    c.picks[key] = pick;
+    return pick;
+}
+
 // Whether the GPU runs kernel KT with its full work-group (NSG sub-groups of SG work-items) and its local memory,
 // asked once a GPU.  The A380's 64 KiB of local memory did not hold the 128-row tile of a type with a scale per 16
 // (two copies of the activations), and the launch lost the device instead of failing.
@@ -1220,13 +1399,34 @@ sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, s
             return STRATA_MMQ_LAUNCH(2, 4, false, TAIL, IS);                                \
         return STRATA_MMQ_LAUNCH(2, 2, false, TAIL, IS);                                    \
     } while (0)
-    if (const int is = intel_shape_of(q); is == 1) {
-        if (tail) STRATA_MMQ_ROWS_INTEL(true, 1);
-        STRATA_MMQ_ROWS_INTEL(false, 1);
-    } else if (is == 2) {
-        if (tail) STRATA_MMQ_ROWS_INTEL(true, 2);
-        STRATA_MMQ_ROWS_INTEL(false, 2);
+#define STRATA_MMQ_ROWS_SG(IS)                                                                         \
+    do {                                                                                               \
+        if (max_rows <= 16) return STRATA_MMQ_LAUNCH_SG(1, 1, IS);                                     \
+        if (max_rows <= 32 || mean_rows <= 32) return STRATA_MMQ_LAUNCH_SG(2, 1, IS);                  \
+        return STRATA_MMQ_LAUNCH_SG(2, 2, IS);                                                         \
+    } while (0)
+#define STRATA_MMQ_LAUNCH_SG(SGM, NSGM, IS)                                                                          \
+    launch<TY, SGM, NSGM, false, false, IS, true>(q, w, wtab, woff, expert_bytes, w_rows, w_cols, n, xq, total_rows, \
+                                                  bounds, max_rows, ids, dst, ld_dst)
+    // the sub-group form needs no K tail of its own (it walks the blocks of 32, not the steps), nor more local memory
+    // than a few KiB
+    if (const int is = intel_shape_of(q); is != 0) {
+        const auto wg = [&]() -> sycl::event {
+            if (is == 1) {
+                if (tail) STRATA_MMQ_ROWS_INTEL(true, 1);
+                STRATA_MMQ_ROWS_INTEL(false, 1);
+            }
+            if (tail) STRATA_MMQ_ROWS_INTEL(true, 2);
+            STRATA_MMQ_ROWS_INTEL(false, 2);
+        };
+        const auto sg = [&]() -> sycl::event {
+            if (is == 1) STRATA_MMQ_ROWS_SG(1);
+            STRATA_MMQ_ROWS_SG(2);
+        };
+        return intel_sub_group_first(q, TY, mean_rows, n, w_rows, w_cols, sg, wg) ? sg() : wg();
     }
+#undef STRATA_MMQ_ROWS_SG
+#undef STRATA_MMQ_LAUNCH_SG
 #undef STRATA_MMQ_ROWS_INTEL
     if (tail) STRATA_MMQ_ROWS(false, true, 0);
     STRATA_MMQ_ROWS(false, false, 0);
@@ -1622,6 +1822,50 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
         default: return {};
     }
 #undef STRATA_MMQ_CASE
+}
+
+void iq_mmq_choose_forms(sycl::queue& q, int t, int64_t w_rows, int64_t w_cols, int n) {
+    if (!iq_mmq_type_ok(t) || intel_shape_of(q) == 0) return;   // one form only
+    if (const char* env = std::getenv("XESTRATA_IQ_MMQ_SUB_GROUP"); env != nullptr && (env[0] == '0' || env[0] == '1'))
+        return;
+    constexpr int64_t kTop = 256;   // the most rows an expert timed (the last class)
+    n = std::max(n, 1);
+    const int64_t cols = iq_mmq_type_dup(t) ? 2 * w_cols : w_cols, R = n * kTop;
+    {
+        SgChoice& c = sg_choice(q);
+        std::lock_guard<std::mutex> lock(c.mu);
+        if (c.picks.count(std::make_tuple(t, rows_class(kTop), n == 1, w_rows, cols)) != 0) return;   // timed before
+    }
+    const size_t eb = (size_t) w_rows * iq_mmq_row_bytes(t, w_cols);
+    // the products' buffers: n experts' weights (any bits are valid blocks; the values do not change the time), the
+    // rows' int8 activations (zeros) and their outputs
+    auto* w = sycl::malloc_device<uint8_t>(eb * (size_t) n, q);
+    auto* xq = sycl::malloc_device<uint8_t>(iq_mmq_act_bytes(R, cols), q);
+    auto* dst = sycl::malloc_device<float>((size_t) (R * w_rows), q);
+    auto* bounds = sycl::malloc_device<int32_t>((size_t) n + 1, q);
+    auto* ids = sycl::malloc_device<int32_t>((size_t) R, q);
+    if (w != nullptr && xq != nullptr && dst != nullptr && bounds != nullptr && ids != nullptr) {
+        t_choosing = true;
+        try {
+            q.memset(w, 0x11, eb * (size_t) n);
+            q.memset(xq, 0, iq_mmq_act_bytes(R, cols));
+            q.parallel_for(sycl::range<1>((size_t) R), [=](sycl::id<1> i) { ids[i] = (int32_t) i[0]; });
+            std::vector<int32_t> hb((size_t) n + 1);
+            for (int64_t r = 8; r <= kTop; r *= 2) {
+                for (int e = 0; e <= n; ++e) hb[(size_t) e] = (int32_t) (e * r);
+                q.memcpy(bounds, hb.data(), hb.size() * sizeof(int32_t)).wait();
+                iq_mmq_grouped(q, t, w, eb, w_rows, cols, n, xq, n * r, bounds, r, ids, dst, w_rows, nullptr, 0, n * r);
+            }
+            q.wait_and_throw();
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "xestrata: timing the int8 expert products' forms: %s\n", e.what());
+        }
+        t_choosing = false;
+    } else {
+        std::fprintf(stderr, "xestrata: no device memory to time the int8 expert products' forms: the work-group form\n");
+    }
+    for (void* p : {(void*) w, (void*) xq, (void*) dst, (void*) bounds, (void*) ids})
+        if (p != nullptr) sycl::free(p, q);
 }
 
 void iq_mmq_split_set(sycl::queue& q, int quarters) {

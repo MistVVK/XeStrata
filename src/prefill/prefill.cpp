@@ -1178,6 +1178,13 @@ const MmqPlan& mmq_plan() {
             p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
             p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
         }
+        // the products' forms timed for each layer's types (Intel's XMX take two), before the int8 and FP16 paths are
+        // timed against each other below
+        for (int64_t l = 0; l < layers; ++l)
+            if (p.layer[(size_t) l]) {
+                mmq::choose_forms(lay.fmt[(size_t) l].gu_type, 1280, N, 16, nullptr);
+                mmq::choose_forms(lay.fmt[(size_t) l].d_type, N, 640, 16, nullptr);
+            }
         if (p.any && mmq_env() < 0) {   // by the rows a layer's experts average, against this GPU's timing
             int64_t first = 0;
             while (!p.layer[(size_t) first]) ++first;

@@ -49,6 +49,9 @@ void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, v
                                          kernels::iq_mmq_type_dup(t));
 }
 
+void choose_forms(int t, int64_t w_rows, int64_t w_cols, int n, void* stream) {
+    kernels::iq_mmq_choose_forms(Q(stream), t, w_rows, w_cols, n);
+}
 void split_set(int quarters, void* stream) { kernels::iq_mmq_split_set(Q(stream), quarters); }
 int split_get(void* stream) { return kernels::iq_mmq_split_get(Q(stream)); }
 bool split_reserve(int64_t rows, int64_t n_out, void* stream) {

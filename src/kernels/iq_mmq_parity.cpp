@@ -187,6 +187,13 @@ int bench() {
         q.memset(wd, 0x11, db * G).wait();
         uint16_t* dq_gu = dev.alloc<uint16_t>((size_t) G * 2 * (size_t) (FF * N));
         uint16_t* dq_d = dev.alloc<uint16_t>((size_t) (G * N * FF));
+        if (one) {   // the forms the engine's warming chooses (iq_mmq_choose_forms)
+            k::iq_mmq_choose_forms(q, (int) c.gate, 2 * FF, N, G);
+        } else {
+            k::iq_mmq_choose_forms(q, (int) c.gate, FF, N, G);
+            k::iq_mmq_choose_forms(q, (int) c.up, FF, N, G);
+        }
+        k::iq_mmq_choose_forms(q, (int) c.down, N, FF, G);
         for (int64_t r : {8, 16, 32, 64, 128, 256}) {
             const int64_t R = G * r;
             std::vector<int32_t> bounds(G + 1), ids((size_t) R);
