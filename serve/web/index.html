@@ -776,7 +776,22 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 
   <!-- ============================ About ============================ -->
   <section class="view view--about" id="view-about" role="tabpanel" aria-labelledby="tab-btn-about" hidden>
-    <div class="about">
+    <div class="about about-head">
+      <div class="st-tabs about-tabs" id="about-tabs" role="tablist" aria-label="About" data-i18n-label="tab.about">
+        <button class="st-tab" role="tab" type="button" data-about="overview" aria-controls="about-overview" aria-selected="true" data-i18n="about.tabOverview">Overview</button>
+        <button class="st-tab" role="tab" type="button" data-about="terms" aria-controls="about-terms" aria-selected="false" data-i18n="about.tabTerms">Model terms</button>
+        <button class="st-tab" role="tab" type="button" data-about="licenses" aria-controls="about-licenses" aria-selected="false" data-i18n="about.tabLicenses">Licenses</button>
+      </div>
+    </div>
+    <div class="about" id="about-terms" role="tabpanel" hidden>
+      <p class="muted small" data-i18n="terms.note">The terms of the models this server runs now, each as its makers wrote it. The texts are kept on this PC (setup fetched them with the models).</p>
+      <div class="terms-list" id="terms-list"></div>
+    </div>
+    <div class="about" id="about-licenses" role="tabpanel" hidden>
+      <p class="muted small" data-i18n="lic.note">XeStrata and the parts from other projects this build carries or is built with, each with its license's full text.</p>
+      <div class="terms-list" id="lic-list"></div>
+    </div>
+    <div class="about" id="about-overview" role="tabpanel">
       <div class="st-card">
         <span class="card-title" data-i18n="about.engineTitle">Model and engine</span>
         <dl class="facts" id="facts-engine"></dl>

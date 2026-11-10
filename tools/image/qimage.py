@@ -121,6 +121,397 @@ REVISIONS = {                                       # the `sha` of https://huggi
     "ZhengPeng7/BiRefNet_HR": "a7a562f6fd16021180f2f4348f4de003a2d3d1e1",                          # 2026-11-07
     "ZhengPeng7/BiRefNet_dynamic": "280306042f57b7a33854319da62fd86aaa89ec4c",                     # 2026-11-07
 }
+
+# The models' terms (setup.py's MODEL_TERMS has the text models'): for each repository above, the license's name as
+# its text titles it, the model card's license field ("card"), and the pinned files that hold the terms' full text
+# (source, commit, path, bytes, SHA-256), which serve/model_terms.py fetches with the weights for About > Model terms.
+TERMS: dict[str, dict] = {
+    "unsloth/Qwen-Image-2.1-Turbo-GGUF": {
+        "license": "Qwen RESEARCH LICENSE AGREEMENT",
+        "card": "other (qwen-research)",
+        "texts": [
+            ("hf:Qwen/Qwen-Image-2.1-Turbo",
+             "fc13ba1986fcb905854dc8de2f52eee395f49b5b", "LICENSE", 7831,
+             "8dc973f024ff95966bea25866efa443fd16776dcb1001e681e3d467ea572b28d"),
+        ],
+    },
+    "unsloth/Qwen-Image-2.1-FP8": {
+        "license": "Qwen RESEARCH LICENSE AGREEMENT",
+        "card": "other (qwen-research)",
+        "texts": [
+            ("hf:Qwen/Qwen-Image-2.1",
+             "d26bb61231c349cf6b7896fa83353113880e1ba3", "LICENSE", 7831,
+             "8dc973f024ff95966bea25866efa443fd16776dcb1001e681e3d467ea572b28d"),
+        ],
+    },
+    "unsloth/Qwen3-VL-8B-Instruct-GGUF": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("gh:QwenLM/Qwen3-VL",
+             "96588727e44c78b25ba03ea03b8e12f7e64fd0da", "LICENSE", 11357,
+             "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"),
+        ],
+    },
+    "AtomicChat/Qwen-Image-2.1-Turbo-Uncensored-GGUF": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("gh:QwenLM/Qwen3-VL",
+             "96588727e44c78b25ba03ea03b8e12f7e64fd0da", "LICENSE", 11357,
+             "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"),
+            ("hf:Qwen/Qwen-Image-2.1-Turbo",
+             "fc13ba1986fcb905854dc8de2f52eee395f49b5b", "LICENSE", 7831,
+             "8dc973f024ff95966bea25866efa443fd16776dcb1001e681e3d467ea572b28d"),
+        ],
+    },
+    "unsloth/Qwen-Image-2.1-GGUF": {
+        "license": "Qwen RESEARCH LICENSE AGREEMENT",
+        "card": "other (qwen-research)",
+        "texts": [
+            ("hf:Qwen/Qwen-Image-2.1",
+             "d26bb61231c349cf6b7896fa83353113880e1ba3", "LICENSE", 7831,
+             "8dc973f024ff95966bea25866efa443fd16776dcb1001e681e3d467ea572b28d"),
+        ],
+    },
+    "Comfy-Org/Mage-Flow": {
+        "license": "MIT License",
+        "card": "mit",
+        "texts": [
+            ("gh:microsoft/Mage",
+             "ebe8581c2b28581ee204e94685b23dc5f65b3437", "LICENSE", 1066,
+             "275b4dd619de4e16a017b10d0beec72abbbbf14ee8a2fc68f8bdb398e821f623"),
+        ],
+    },
+    "RicemanT/MageTrail": {
+        "license": "MIT License",
+        "card": "mit",
+        "texts": [
+            ("gh:microsoft/Mage",
+             "ebe8581c2b28581ee204e94685b23dc5f65b3437", "LICENSE", 1066,
+             "275b4dd619de4e16a017b10d0beec72abbbbf14ee8a2fc68f8bdb398e821f623"),
+        ],
+    },
+    "black-forest-labs/FLUX.2-klein-4B": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:black-forest-labs/FLUX.2-klein-4B",
+             "e7b7dc27f91deacad38e78976d1f2b499d76a294", "LICENSE.md", 9584,
+             "ca02bc51900ab07789d1b70283329e7137f5af98f5161c23a1c81fc38a4af1fe"),
+        ],
+    },
+    "unsloth/Qwen3-VL-4B-Instruct-GGUF": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("gh:QwenLM/Qwen3-VL",
+             "96588727e44c78b25ba03ea03b8e12f7e64fd0da", "LICENSE", 11357,
+             "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"),
+        ],
+    },
+    "noctrex/Huihui-Qwen3-VL-4B-Instruct-abliterated-GGUF": {
+        "license": "Apache License",
+        "texts": [
+            ("gh:QwenLM/Qwen3-VL",
+             "96588727e44c78b25ba03ea03b8e12f7e64fd0da", "LICENSE", 11357,
+             "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"),
+        ],
+    },
+    "tencent/HunyuanImage-3.0-Instruct-Distil": {
+        "license": "TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT",
+        "card": "other",
+        "texts": [
+            ("gh:Tencent-Hunyuan/HunyuanImage-3.0",
+             "6e9113a692a27a0751d82aba3b2015a876646c03", "LICENSE", 16612,
+             "38ee960faee3ab4ca226b0b50d661a4460e4d8c1e8fbc8431d5cd69bc2c363cc"),
+        ],
+    },
+    "PedroMarinhoDev/HunyuanImage-3.0-Instruct-Distil-ComfyUI": {
+        "license": "TENCENT HUNYUAN COMMUNITY LICENSE AGREEMENT",
+        "card": "other (tencent-hunyuan-community)",
+        "texts": [
+            ("hf:PedroMarinhoDev/HunyuanImage-3.0-Instruct-Distil-ComfyUI",
+             "b57626bc1840b64b47cb8d885a61298b352acf79", "LICENSE", 16530,
+             "dc8bbc52c85d18f9a2e37921b7d843d3f314a38fb214c3311d01cbaa69c88c56"),
+            ("hf:PedroMarinhoDev/HunyuanImage-3.0-Instruct-Distil-ComfyUI",
+             "b57626bc1840b64b47cb8d885a61298b352acf79", "NOTICE", 216,
+             "4982deea7fa254c2a53880bbe5220ee21b84111bc8a7d927b2532c1ced78bf42"),
+        ],
+    },
+    "OpenMOSS-Team/MOSS-Image-SFT": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:OpenMOSS-Team/MOSS-Image-SFT",
+             "f972bd4b4b9e3852133cc5da954d87bc32cd8fb9", "LICENSE", 11358,
+             "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"),
+        ],
+    },
+    "OpenMOSS-Team/MOSS-Image-Base": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:OpenMOSS-Team/MOSS-Image-Base",
+             "85975793d8b3d432f1b6e27f352abaa4c2a4c0d3", "LICENSE", 11358,
+             "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"),
+        ],
+    },
+    "PedroMarinhoDev/Moss-Image-Edit-ComfyUI": {
+        "license": "GNU GENERAL PUBLIC LICENSE",
+        "card": "gpl-3.0",
+        "texts": [
+            ("gh:Chenkin-x/Moss-Image-Edit",
+             "d735569c936ebbfaf274bee5cbff4297c533d133", "LICENSE", 35149,
+             "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"),
+            ("hf:OpenMOSS-Team/MOSS-Image-SFT",
+             "f972bd4b4b9e3852133cc5da954d87bc32cd8fb9", "LICENSE", 11358,
+             "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"),
+        ],
+    },
+    "akhaliq/MOSS-Image-Edit-HQ": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:OpenMOSS-Team/MOSS-Image-SFT",
+             "f972bd4b4b9e3852133cc5da954d87bc32cd8fb9", "LICENSE", 11358,
+             "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"),
+        ],
+    },
+    "unsloth/Qwen3.5-9B-GGUF": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.5-9B",
+             "c202236235762e1c871ad0ccb60c8ee5ba337b9a", "LICENSE", 11544,
+             "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"),
+        ],
+    },
+    "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.5-9B",
+             "c202236235762e1c871ad0ccb60c8ee5ba337b9a", "LICENSE", 11544,
+             "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"),
+        ],
+    },
+    "circlestone-labs/Anima": {
+        "license": "CircleStone Labs Non-Commercial License v1.2",
+        "card": "other (circlestone-labs-non-commercial-license)",
+        "texts": [
+            ("hf:circlestone-labs/Anima",
+             "f973fc41ec7545364ac9776c2440285f43ff2a30", "LICENSE.md", 18259,
+             "ee956174133d7c2cdcf220440c7726187eaf4b50e8e48ee32194353a22164d15"),
+        ],
+    },
+    "Gazingstars123/Anima-2.9B": {
+        "license": "CircleStone Labs Non-Commercial License v1.2",
+        "card": "other (circlestone-labs-non-commercial-license)",
+        "texts": [
+            ("hf:Gazingstars123/Anima-2.9B",
+             "9f9cb502dbae7a616c3cc5a530633427fe735665", "LICENSE.md", 18259,
+             "ee956174133d7c2cdcf220440c7726187eaf4b50e8e48ee32194353a22164d15"),
+        ],
+    },
+    "mradermacher/Qwen3-0.6B-Base-GGUF": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3-0.6B-Base",
+             "da87bfb608c14b7cf20ba1ce41287e8de496c0cd", "LICENSE", 11343,
+             "832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e"),
+        ],
+    },
+    "google-t5/t5-base": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("gh:google-research/text-to-text-transfer-transformer",
+             "42909aa15d1fbd16c69333aa474a00ae8ed9fde4", "LICENSE", 11358,
+             "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"),
+        ],
+    },
+    "Bingsu/adetailer": {
+        "license": "GNU AFFERO GENERAL PUBLIC LICENSE",
+        "card": "apache-2.0",
+        "texts": [
+            ("gh:ultralytics/ultralytics",
+             "51ff386d3ba0accae8824723be303c3926b58ca8", "LICENSE", 34523,
+             "0d96a4ff68ad6d4b6f1f30f713b18d5184912ba8dd389f86aa7710db079abcb0"),
+        ],
+    },
+    "lllyasviel/Annotators": {
+        "license": ("multiple: BSD 3-Clause License (Real-ESRGAN); Apache License 2.0 (ControlNet); MIT License"
+                    " (informative-drawings); Apache License 2.0 (M-LSD)"),
+        "card": "other",
+        "texts": [
+            ("gh:xinntao/Real-ESRGAN",
+             "a4abfb2979a7bbff3f69f58f58ae324608821e27", "LICENSE", 1519,
+             "4a699ec4863d96a91fc265948a0c90033f7e8735d515524dcf3444736406e0c2"),
+            ("gh:lllyasviel/ControlNet",
+             "ed85cd1e25a5ed592f7d8178495b4483de0331bf", "LICENSE", 11357,
+             "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"),
+            ("gh:carolineec/informative-drawings",
+             "2349aee4daf7cb01d8de645b0bbb4f4392fd1395", "LICENSE", 1070,
+             "d12dd7d51af0afb8d6af4fdc18983a627be13559e1269422163bbe5353e3522e"),
+            ("gh:navervision/mlsd",
+             "453cafa09467d0272760578d35c1fda38e8895a5", "LICENSE", 11348,
+             "b8a6637c19443e6792ce93c37fe1faac3c745e319ffcd90ac8be0a170a9a1900"),
+        ],
+    },
+    "Comfy-Org/SeedVR2": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("gh:ByteDance-Seed/SeedVR",
+             "e4de8c24441a67e1b7df56abea10645059bb1185", "LICENSE", 11334,
+             "5967a0c153e731109b76c5d83b5e0fae2382b6aaf7b898d08ff03702eea59430"),
+        ],
+    },
+    "Comfy-Org/sam3.1": {
+        "license": "SAM License",
+        "card": "other (sam-license)",
+        "texts": [
+            ("hf:Comfy-Org/sam3.1",
+             "7bb8374780a725b4353ed31f3a9395c9742b5621", "LICENSE", 7352,
+             "bec48f70bd37bf8280a9d1ebf01642d26086f6122ba735baa08fe03c5a6e7448"),
+        ],
+    },
+    "openai/clip-vit-large-patch14": {
+        "license": "MIT License",
+        "texts": [
+            ("gh:openai/CLIP",
+             "d05afc436d78f1c48dc0dbf8e5980a9d471f35f6", "LICENSE", 1064,
+             "987e63b32f6c89ff5160e429458a872ff048e6860b590a3912e938f9da8f14db"),
+        ],
+    },
+    "microsoft/Florence-2-large": {
+        "license": "MIT License",
+        "card": "mit",
+        "texts": [
+            ("hf:microsoft/Florence-2-large",
+             "21a599d414c4d928c9032694c424fb94458e3594", "LICENSE", 1141,
+             "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"),
+        ],
+    },
+    "microsoft/Florence-2-base": {
+        "license": "MIT License",
+        "card": "mit",
+        "texts": [
+            ("hf:microsoft/Florence-2-base",
+             "5ca5edf5bd017b9919c05d08aebef5e4c7ac3bac", "LICENSE", 1141,
+             "c2cfccb812fe482101a8f04597dfc5a9991a6b2748266c47ac91b6a5aae15383"),
+        ],
+    },
+    "ZhengPeng7/BiRefNet": {
+        "license": "MIT License",
+        "card": "mit",
+        "texts": [
+            ("gh:ZhengPeng7/BiRefNet",
+             "f7079632d681ecf12161fcea8905682934e59e51", "LICENSE", 1066,
+             "92a7089e0915fc32bc40067560b398f1e6a7a5958abd7d04eda393629a5acefb"),
+        ],
+    },
+    "alibaba-pai/Qwen-Image-2.1-Fun-Controlnet-Union": {
+        "license": "Qwen RESEARCH LICENSE AGREEMENT",
+        "card": "other (qwen-research)",
+        "texts": [
+            ("hf:alibaba-pai/Qwen-Image-2.1-Fun-Controlnet-Union",
+             "8a4702014d4dabb5f896fcba917e2ee0a961465f", "LICENSE", 7831,
+             "8dc973f024ff95966bea25866efa443fd16776dcb1001e681e3d467ea572b28d"),
+        ],
+    },
+    "depth-anything/Depth-Anything-V2-Small-hf": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("gh:DepthAnything/Depth-Anything-V2",
+             "a561b849ebae10a6f5ef49e26c83cbbcd36c71bf", "LICENSE", 11357,
+             "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"),
+        ],
+    },
+    "yzd-v/DWPose": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("gh:IDEA-Research/DWPose",
+             "3dca5db79d9f9ffdd378753ddf6ec66535aace88", "LICENSE", 11996,
+             "ec5aa54eef312195c4494873a37158b19b0d523e25cec570189e6aa86289cf42"),
+        ],
+    },
+    "kadirnar/yolox_l-v0.1.1": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("gh:Megvii-BaseDetection/YOLOX",
+             "6ddff4824372906469a7fae2dc3206c7aa4bbaee", "LICENSE", 11371,
+             "0ec3668d3274bcf29e8a29e9576d5a2cd96fc78d3c5bec4387355a796e5d9088"),
+        ],
+    },
+    "darask0/MOSS-Image-color-depth-control": {
+        "license": "Apache-2.0",
+        "texts": [],
+    },
+    "darask0/MOSS-Image_4-step_adapter_lora": {
+        "license": "Apache-2.0",
+        "texts": [],
+    },
+    "ZhengPeng7/BiRefNet_lite": {
+        "license": "MIT License",
+        "card": "mit",
+        "texts": [
+            ("gh:ZhengPeng7/BiRefNet",
+             "f7079632d681ecf12161fcea8905682934e59e51", "LICENSE", 1066,
+             "92a7089e0915fc32bc40067560b398f1e6a7a5958abd7d04eda393629a5acefb"),
+        ],
+    },
+    "ZhengPeng7/BiRefNet_lite-2K": {
+        "license": "MIT License",
+        "card": "mit",
+        "texts": [
+            ("gh:ZhengPeng7/BiRefNet",
+             "f7079632d681ecf12161fcea8905682934e59e51", "LICENSE", 1066,
+             "92a7089e0915fc32bc40067560b398f1e6a7a5958abd7d04eda393629a5acefb"),
+        ],
+    },
+    "ZhengPeng7/BiRefNet-portrait": {
+        "license": "MIT License",
+        "card": "mit",
+        "texts": [
+            ("gh:ZhengPeng7/BiRefNet",
+             "f7079632d681ecf12161fcea8905682934e59e51", "LICENSE", 1066,
+             "92a7089e0915fc32bc40067560b398f1e6a7a5958abd7d04eda393629a5acefb"),
+        ],
+    },
+    "ZhengPeng7/BiRefNet-matting": {
+        "license": "MIT License",
+        "card": "mit",
+        "texts": [
+            ("gh:ZhengPeng7/BiRefNet",
+             "f7079632d681ecf12161fcea8905682934e59e51", "LICENSE", 1066,
+             "92a7089e0915fc32bc40067560b398f1e6a7a5958abd7d04eda393629a5acefb"),
+        ],
+    },
+    "ZhengPeng7/BiRefNet_HR": {
+        "license": "MIT License",
+        "card": "mit",
+        "texts": [
+            ("gh:ZhengPeng7/BiRefNet",
+             "f7079632d681ecf12161fcea8905682934e59e51", "LICENSE", 1066,
+             "92a7089e0915fc32bc40067560b398f1e6a7a5958abd7d04eda393629a5acefb"),
+        ],
+    },
+    "ZhengPeng7/BiRefNet_dynamic": {
+        "license": "MIT License",
+        "card": "mit",
+        "texts": [
+            ("gh:ZhengPeng7/BiRefNet",
+             "f7079632d681ecf12161fcea8905682934e59e51", "LICENSE", 1066,
+             "92a7089e0915fc32bc40067560b398f1e6a7a5958abd7d04eda393629a5acefb"),
+        ],
+    },
+}
 _DIT = "unsloth/Qwen-Image-2.1-Turbo-GGUF"
 _BASE = "unsloth/Qwen-Image-2.1-GGUF"
 _VL = "unsloth/Qwen3-VL-8B-Instruct-GGUF"

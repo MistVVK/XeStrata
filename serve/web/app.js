@@ -90,9 +90,12 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener("change", (e) => {
 });
 
 let tab = "chat";
+let aboutSub = "overview";   // About's own tabs: overview, terms (the models' terms), licenses (the software's)
 let noteShown = false;
 function showTab(name) {
-  tab = ["chat", "images", "tools", "video", "translate", "monitor", "about"].includes(name) ? name : "chat";
+  const [main, sub] = String(name || "").split("/");
+  tab = ["chat", "images", "tools", "video", "translate", "monitor", "about"].includes(main) ? main : "chat";
+  if (tab === "about") aboutSub = ["terms", "licenses"].includes(sub) ? sub : "overview";
   for (const b of document.querySelectorAll(".st-header .st-tab")) b.setAttribute("aria-selected", String(b.dataset.tab === tab));
   fitHeader();                                       // on a phone the open tab shows its name: the row's room changes
   for (const v of ["chat", "images", "tools", "video", "translate", "monitor", "about"]) $(`view-${v}`).hidden = v !== tab;
@@ -103,10 +106,11 @@ function showTab(name) {
       toast("info", tr("img.noteToast", "Image model size lowered"), health.image_note, 12000);
     }
   }
-  if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
+  const where = tab === "about" && aboutSub !== "overview" ? `about/${aboutSub}` : tab;   // #about/terms opens that tab
+  if (location.hash.slice(1) !== where) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${where}`);
   if (tab === "chat") $("input").focus();
   if (tab === "monitor") loadMcp();
-  if (tab === "about") { loadConfig(); loadUpdate(); }
+  if (tab === "about") { loadConfig(); loadUpdate(); showAboutSub(); }
   if (tab === "video") vidJobs();
   if (tab === "translate") { trnLoad(); $("trn-input").focus(); }
   if (lastMetrics) render(lastMetrics);
@@ -1038,6 +1042,81 @@ $("req-all").addEventListener("click", () => { reqShowAll = !reqShowAll; if (las
 
 // ------------------------------------------------------------------ a newer release (GET/POST /update)
 // The server asks GitHub (at most every six hours, or now from the button); this page never leaves this server.
+// ------------------------------------------------------------------ About > Model terms, Licenses (GET /v1/licenses/*)
+for (const b of document.querySelectorAll("#about-tabs [data-about]")) b.onclick = () => showTab(b.dataset.about === "overview" ? "about" : `about/${b.dataset.about}`);
+function showAboutSub() {
+  for (const b of document.querySelectorAll("#about-tabs [data-about]")) b.setAttribute("aria-selected", String(b.dataset.about === aboutSub));
+  for (const k of ["overview", "terms", "licenses"]) $(`about-${k}`).hidden = k !== aboutSub;
+  if (aboutSub === "terms") loadTerms();
+  if (aboutSub === "licenses") loadLicenses();
+}
+// one license text, folded: its name and where it is published
+function textBlock(t) {
+  const link = t.url ? ` · <a href="${esc(t.url)}" target="_blank" rel="noopener noreferrer">${esc(tr("terms.original", "original"))}</a>` : "";
+  return t.text != null
+    ? `<details><summary>${esc(t.name)}${t.source ? ` (${esc(t.source)})` : ""}</summary><pre>${esc(t.text)}</pre></details>${link ? `<p class="muted small">${link.slice(3)}</p>` : ""}`
+    : `<p class="muted small">${esc(t.name)}: ${esc(tr("terms.notHere", "not on this PC yet"))}${link}</p>`;
+}
+const TERM_ROLES = {model: () => tr("terms.roleModel", "Text model"), mmproj: () => tr("terms.roleMmproj", "Picture reader of the text model"),
+  image: () => tr("terms.roleImage", "Image model"), tool: () => tr("terms.roleTool", "Image tool"), lora: () => tr("terms.roleLora", "LoRA"),
+  translation: () => tr("terms.roleTranslation", "Translation model"), speed_projection: () => tr("about.projection", "Experimental speed projection")};
+let termsTimer = null;
+async function loadTerms() {
+  let got;
+  try {
+    const r = await fetch("v1/licenses/models", {headers: headers()});
+    if (!r.ok) return;
+    got = await r.json();
+  } catch (e) { return; }
+  const el = $("terms-list");
+  el.innerHTML = (got.models || []).map((m) => {
+    const role = (TERM_ROLES[m.role] || (() => m.role))();
+    if (m.own) {
+      return `<div class="st-card"><span class="card-title">${esc(role)} · ${esc(m.name)}${m.model ? ` (${esc(m.model)})` : ""}</span>
+        <p class="muted">${esc(tr("terms.own", "A file of your own: its terms are those of whoever made it."))}</p>
+        ${m.source ? `<p class="small">${esc(tr("terms.fetchedFrom", "Fetched from"))} <a href="${esc(m.source)}" target="_blank" rel="noopener noreferrer">${esc(m.source)}</a></p>` : ""}</div>`;
+    }
+    const head = [m.title, m.tool, m.model].filter(Boolean).join(" · ");
+    const rows = [
+      [tr("terms.repo", "Published as"), m.repo],
+      [tr("terms.by", "By"), m.maker || m.by],
+      [tr("terms.revision", "Revision"), m.revision ? String(m.revision).slice(0, 12) : null],
+      [tr("terms.license", "License"), m.license],
+      [tr("terms.cardLicense", "The model card's license field"), m.card_license],
+      [tr("terms.agreed", "You agreed to it"), m.agreed],
+    ].filter((r) => r[1]);
+    return `<div class="st-card"><span class="card-title">${esc(role)}${head ? ` · ${esc(head)}` : ""}</span>
+      <dl class="facts">${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl>
+      ${m.card ? `<p class="small"><a href="${esc(m.card)}" target="_blank" rel="noopener noreferrer">${esc(tr("terms.card", "The model card"))}</a></p>` : ""}
+      ${(m.texts || []).map(textBlock).join("") || `<p class="muted small">${esc(tr("terms.noText", "Its publisher gives no text of the license beside the name above."))}</p>`}</div>`;
+  }).join("") || `<p class="muted">${esc(tr("terms.none", "No model is set up."))}</p>`;
+  clearTimeout(termsTimer);
+  if (got.fetching && tab === "about" && aboutSub === "terms") termsTimer = setTimeout(loadTerms, 5000);   // the texts being fetched
+}
+let licensesLoaded = false;
+async function loadLicenses() {
+  if (licensesLoaded) return;
+  let got;
+  try {
+    const r = await fetch("v1/licenses/software", {headers: headers()});
+    if (!r.ok) return;
+    got = await r.json();
+  } catch (e) { return; }
+  licensesLoaded = true;
+  const part = (p) => {
+    const rows = [[tr("terms.version", "Version"), p.version], [tr("terms.license", "License"), p.license],
+                  [tr("lic.carried", "In this build"), p.bundled === false ? tr("lic.notCarried", "not carried: opened where you installed it, under its maker's terms") : null]]
+      .filter((r) => r[1]);
+    return `<div class="st-card"><span class="card-title">${esc(p.name)}</span>
+      <dl class="facts">${rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join("")}</dl>
+      ${p.source ? `<p class="small"><a href="${esc(p.source)}" target="_blank" rel="noopener noreferrer">${esc(p.source)}</a></p>` : ""}
+      ${(p.texts || []).map(textBlock).join("")}</div>`;
+  };
+  $("lic-list").innerHTML = part(got.xestrata) +
+    `<h3>${esc(tr("lic.free", "Free software"))}</h3>` + (got.free || []).map(part).join("") +
+    ((got.nonfree || []).length ? `<h3>${esc(tr("lic.nonfree", "Not free software"))}</h3>` + got.nonfree.map(part).join("") : "");
+}
+
 async function loadUpdate(force = false) {
   let u;
   try {

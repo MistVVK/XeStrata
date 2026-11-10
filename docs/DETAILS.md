@@ -2243,6 +2243,7 @@ XeStrata's own code is under the [LGPL-3.0-or-later](../COPYING.LESSER), and XeS
 The code from Strata, from ggml / llama.cpp and from Project Maya (all MIT) stays under MIT within it; their copyright and permission notices are in [NOTICE](../NOTICE).
 The exceptions stay under their own licenses: the patches to intel/llvm and oneDNN, the changes to oneMath, the copies in `third_party/main/` (`ggml-common.h`, `ggml-common-tq.h`, `quantscope.py`, `stb_image.h`, Outfit, KaTeX) and the patch to AOTriton, and `third_party/nonfree/` (below and [third_party/main/README.md](../third_party/main/README.md)).
 The model files are not part of it; their licenses apply to them (below).
+The web app's About > Model terms shows the full terms of the models it runs now (setup fetches them with the models), and About > Licenses those of XeStrata and of the parts its build carries or is built with (the API: `GET /v1/licenses/models` and `GET /v1/licenses/software`).
 
 - **The original software**: [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors.
 - **Models**: [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team;

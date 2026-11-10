@@ -286,6 +286,9 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
    step's state: a mark (mermaid-view.js) and these colors */
 .st-mermaid { padding: var(--st-s-3); background: var(--st-surface); overflow-x: auto; }
 .st-mermaid svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
+/* About > Model terms and Licenses: a license text, folded (before the code blocks' pre rules, by specificity) */
+.terms-list pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 60vh; overflow-y: auto; margin: var(--st-s-2) 0 0;
+                  font: 400 var(--st-fs-sm) var(--st-font-mono); color: var(--st-ink-soft); }
 .st-code--chart > pre { display: none; }
 .st-code--chart[data-show-code="true"] > pre { display: block; }
 .st-code--chart[data-show-code="true"] > .st-mermaid { display: none; }
@@ -317,6 +320,13 @@ button.chip__name:hover { color: var(--st-ink); text-decoration: underline; }
 
 /* ---------------------------------------------------------------- about */
 .about { max-width: min(100%, 1100px); }
+.about-head { padding-bottom: 0; }
+.about-tabs { align-self: flex-start; max-width: 100%; overflow-x: auto; flex-wrap: nowrap; }
+.about-tabs .st-tab { flex: none; height: auto; min-height: 36px; padding: 6px 12px; }
+.terms-list { display: flex; flex-direction: column; gap: var(--st-s-4); }
+.terms-list h3 { margin: var(--st-s-3) 0 0; font-size: var(--st-fs-md); color: var(--st-ink-muted); }
+.terms-list details { border-top: 1px solid var(--st-line); padding-top: var(--st-s-2); }
+.terms-list summary { cursor: pointer; color: var(--st-ink-soft); font-size: var(--st-fs-sm); }
 .about .st-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
 .about p { margin: 0; }
 .facts { display: grid; grid-template-columns: minmax(140px, max-content) 1fr; gap: 10px var(--st-s-6); margin: 0; font-size: var(--st-fs-md); }

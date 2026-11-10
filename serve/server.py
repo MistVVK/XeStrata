@@ -74,6 +74,8 @@ from serve.frontend import (CALL_START, THINK_END, ChatTemplate, Event, GlmOutpu
 from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import places  # noqa: E402
+from serve import model_terms  # noqa: E402
+from serve import notices  # noqa: E402
 from serve import envvars  # noqa: E402
 from serve import search as search_api  # noqa: E402
 from serve import skills as skills_api  # noqa: E402
@@ -4120,6 +4122,8 @@ class Service:
         # turn before the answer instead of the top of the prompt, so switching it keeps the cached conversation
         self.effort_end = False
         self.config_path = None                         # #564: the run config the web page's Settings view edits
+        self.engine_exe: str | None = None              # the engine's file (About > Licenses: the parts beside it)
+        self.terms_fetch = model_terms.TermsFetch()                 # About > Model terms: the texts not fetched yet
         self.config_lock = threading.Lock()
         self.settings_path = places.settings_path()     # the user's settings: GLOBAL keys for every model (runconfig)
         self.search_url: str | None = None              # web search: a SearXNG-compatible server's address
@@ -7985,6 +7989,10 @@ def make_handler(svc: Service):
                 if not self._authorized():
                     return
                 self._image_license(path[len("/v1/images/licenses/"):], None)
+            elif path in ("/v1/licenses/models", "/v1/licenses/software"):   # About > Model terms, Licenses
+                if self._authorized():
+                    self._json(200, self._model_terms() if path.endswith("/models") else
+                               notices.software(svc.engine_exe, release_check.current_version()))
             elif path == "/update":                         # whether a newer release is out (About > Updates)
                 if not self._authorized():
                     return
@@ -9072,6 +9080,22 @@ def make_handler(svc: Service):
                 self._json(200, controls_api.preview_response(svc, gen, req, f"{scheme}://{host}", cancel))
             except (images_api.AuxPending, images_api.ImageJobFailed) as e:
                 self._aux_failed(e)
+
+        def _model_terms(self) -> dict:
+            """GET /v1/licenses/models: the terms of the models this server runs (serve/model_terms.py), each text
+            whole; the texts not here yet (a model set up before setup fetched them) are fetched in the background, and
+            the page asks again."""
+            rows = model_terms.text_model_rows(svc.config_path, svc.vision is not None)
+            if svc.images is not None:
+                gens = list(svc.images.gens.values())
+                rows += model_terms.image_rows([g.cfg for g in gens], image_aux.aux_dir(svc.images.default.cfg),
+                                               [(g.model, Path(g.loras.dir) / e["path"]) for g in gens
+                                                for e in g.loras.listing()])
+            if svc.translation is not None:
+                rows += model_terms.translation_rows(svc.translation.model)
+            missing = [r["repo"] for r in rows if r.get("repo") and any(t["text"] is None for t in r.get("texts", ()))]
+            fetching = bool(missing) and svc.terms_fetch.start(missing)
+            return {"models": rows, "fetching": fetching}
 
         def _image_license(self, name: str, req: dict | None) -> None:
             """GET: a tool's weights' license (image_aux.license_text: SAM 3's, fetched to show) and whether it is
@@ -11617,6 +11641,8 @@ def main() -> int:
                               getattr(svc.images, "gpu_pci", None), getattr(svc.images, "helper_card", ""))
     if a.config:
         svc.config_path = a.config                      # #564: the web page's Settings view
+    if cfg.get("exe"):
+        svc.engine_exe = os.path.abspath(os.path.join(cfg.get("cwd") or ".", str(cfg["exe"])))
     try:                                                # the user's settings: the keys every model shares (runconfig)
         user_settings = runconfig.load_settings(svc.settings_path)
     except (OSError, ValueError) as e:

@@ -1833,6 +1833,54 @@ foreach(strata_target IN LISTS strata_targets)
   endif()
 endforeach()
 
+# The parts from other projects this build carries or is compiled with, for tools/package/engine_notices.py (the
+# packages' NOTICES.json) and the server's About > Licenses on a build from source
+set(_strata_parts "")
+# a part's name and, after it, the target that makes it or the variable set where it is built (part=target or var)
+foreach(part_cond
+        onemath=onemath onemath_rocblas=onemath_blas_rocblas onemath_cublas=onemath_blas_cublas
+        onemkl=_strata_onemkl cuda=_strata_cuda_archs hip=_strata_hip_archs onednn=strata_dnnl
+        aotriton=_strata_aotriton_lib cudnn_frontend=_strata_cudnn_frontend kitchen=_strata_kitchen
+        cutlass=_strata_cutlass xgrammar=strata_xgrammar)
+  string(REPLACE "=" ";" _strata_part_cond "${part_cond}")
+  list(GET _strata_part_cond 0 _strata_part_name)
+  list(GET _strata_part_cond 1 _strata_part_what)
+  set(_strata_part_val "${${_strata_part_what}}")
+  if(TARGET ${_strata_part_what} OR (_strata_part_val AND NOT _strata_part_val MATCHES "^(OFF|FALSE|NO|0|N|NOTFOUND)$"))
+    list(APPEND _strata_parts "\"${_strata_part_name}\"")
+  endif()
+endforeach()
+list(JOIN _strata_parts ", " _strata_parts)
+set(_strata_llama_dir "${STRATA_GGML_DIR}")
+if(NOT _strata_llama_dir)
+  set(_strata_llama_dir "${strata_llamacpp_SOURCE_DIR}")
+endif()
+file(STRINGS third_party/main/ggml/VERSION.txt _strata_llama_ver LIMIT_COUNT 1)
+string(REGEX MATCH "^[0-9a-f]+" _strata_llama_ver "${_strata_llama_ver}")
+if(STRATA_GGML_DIR)
+  execute_process(COMMAND git -C ${STRATA_GGML_DIR} rev-parse HEAD OUTPUT_VARIABLE _strata_llama_ver
+                  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+endif()
+string(REGEX MATCH "tags/([A-Za-z0-9_.-]+)\\.tar\\.gz" _strata_onemath_tag "${_strata_onemath_url}")
+set(_strata_onemath_tag "${CMAKE_MATCH_1}")
+get_filename_component(_strata_llvm_rec "${CMAKE_CXX_COMPILER}" DIRECTORY)
+set(_strata_llvm_tag "")
+if(EXISTS "${_strata_llvm_rec}/../XESTRATA.json")
+  file(READ "${_strata_llvm_rec}/../XESTRATA.json" _strata_llvm_rec)
+  string(JSON _strata_llvm_tag ERROR_VARIABLE _strata_llvm_err GET "${_strata_llvm_rec}" tag)
+endif()
+file(WRITE ${CMAKE_BINARY_DIR}/PARTS.json
+"{
+ \"license\": \"${STRATA_LICENSE}\",
+ \"parts\": [${_strata_parts}],
+ \"llama_cpp\": \"${_strata_llama_ver}\",
+ \"llama_cpp_dir\": \"${_strata_llama_dir}\",
+ \"onemath\": \"${_strata_onemath_tag}\",
+ \"onemath_dir\": \"${strata_onemath_SOURCE_DIR}\",
+ \"intel_llvm\": \"${_strata_llvm_tag}\"
+}
+")
+
 if(STRATA_PACKAGE)
   include(cmake/packaging.cmake)
 endif()

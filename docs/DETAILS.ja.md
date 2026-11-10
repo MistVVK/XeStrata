@@ -2167,6 +2167,7 @@ XeStrata のために書いたコードは [LGPL-3.0-or-later](../COPYING.LESSER
 Strata、ggml / llama.cpp と Project Maya（どれも MIT）から来たコードは、XeStrata の中でも MIT のままで、著作権表示と許諾表示は [NOTICE](../NOTICE) にあります。
 例外は、元のライセンスのままの intel/llvm と oneDNN へのパッチと oneMath への変更、`third_party/main/` の写し（`ggml-common.h`、`ggml-common-tq.h`、`quantscope.py`、`stb_image.h`、Outfit、KaTeX）と AOTriton へのパッチ、`third_party/nonfree/` です（下と [third_party/main/README.md](../third_party/main/README.md)）。
 モデルのファイルは XeStrata に含まれず、それぞれのライセンスが適用されます（下）。
+Web の「情報」の「モデルの規約」のタブには、今動かしているモデルの規約の全文（setup がモデルと一緒に取得したもの）を、「ライセンス」のタブには XeStrata と、そのビルドが含む、またはビルドに使った部品のライセンスの全文を出します（API は `GET /v1/licenses/models` と `GET /v1/licenses/software`）。
 
 - **元のソフトウェア**: Niko1221 と Strata の貢献者による [Strata](https://github.com/Niko1221/Strata)。
 - **モデル**: Qwen チームの [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)。

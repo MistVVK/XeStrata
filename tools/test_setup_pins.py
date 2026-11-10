@@ -102,14 +102,19 @@ class HuggingFacePins(unittest.TestCase):
         # the pinned Hugging Face path itself (setup's --source huggingface; auto may pick ModelScope)
         with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", urlopen), \
                 mock.patch.dict(setup.os.environ, {"XESTRATA_SOURCE": "huggingface", "XESTRATA_ALLOW_UNPINNED": "1"}), \
-                mock.patch.object(setup, "_unpinned_said", []):
+                mock.patch.object(setup, "_unpinned_said", []), mock.patch.object(setup, "_TERMS_DONE", set()):
             dst = Path(d) / "m.gguf"
             _, out = quiet(setup.download, setup.FAMILIES["qwen"]["mmproj_hf"] + "m.gguf", dst)
             self.assertEqual(dst.read_bytes(), b"model bytes")
         self.assertIn("XESTRATA_ALLOW_UNPINNED=1", out)
         self.assertIn("not at the pinned revision any more", out)
-        self.assertEqual([m for m, _ in seen], ["HEAD", "HEAD", "GET"])
-        self.assertTrue(all("/resolve/main/" in u for _, u in seen[1:]))
+        # the model's file: the pinned path, then the repository's current file
+        self.assertEqual([m for m, _ in seen[:3]], ["HEAD", "HEAD", "GET"])
+        self.assertTrue(all("/resolve/main/" in u for _, u in seen[1:3]))
+        # then its terms' text (About > Model terms), always at its pinned revision (MODEL_TERMS)
+        repo = setup.hf_repo(setup.FAMILIES["qwen"]["mmproj_hf"])
+        src, rev, path, _size, _sha = setup.MODEL_TERMS[repo]["texts"][0]
+        self.assertEqual(seen[3:], [("GET", setup.model_terms.file_url(src, rev, path))])
 
     def test_mtp_fetch_is_pinned_and_stops_when_the_revision_is_gone(self):
         import mtp_fetch

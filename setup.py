@@ -76,7 +76,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
 
-from serve import envvars, kernel_check, places, release_check
+from serve import envvars, kernel_check, model_terms, places, release_check
 from serve import translate as translate_mod
 
 ROOT = Path(__file__).resolve().parent
@@ -127,6 +127,239 @@ HF_REVISIONS = {
     "pfnet/plamo-3-translate-2b-GGUF": "4f672106b847200bfdc0f6af6c321cd94eba1aed",                  # 2026-11-09
     "pfnet/plamo-3-translate-0.8b-GGUF": "1cf96ae02133958a20074bfdfab76517bb737d00",                # 2026-11-09
     "pfnet/plamo-3-translate-8b-GGUF": "c67efa4eefdc14d3c97bf8f4f35ee58e2ecd2f42",                  # 2026-11-09
+}
+
+# The models' terms, the one place About > Model terms reads them from (serve/model_terms.py): for each repository
+# setup downloads from, the license's name as its text titles it, the model card's license field ("card", where it
+# says another or the repository has no text), and the files that hold the terms' full text, each pinned
+# (source "hf:<repo>" or "gh:<owner>/<repo>", commit, path, bytes, SHA-256): the repository's own, else its base
+# model's or the upstream project's.  setup fetches them with the model (model_terms.fetch), so they read offline.
+MODEL_TERMS: dict[str, dict] = {
+    "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": {
+        "license": "Qwen Community License 1.0",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.8-Flash-Next",
+             "812d96e10a0dd82b69d749e68693698cf6c36daa", "LICENSE", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        ],
+    },
+    "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": {
+        "license": "Swift Open License v1.0",
+        "card": "other (swift-open-license-1.0)",
+        "texts": [
+            ("hf:ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+             "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d", "LICENSE", 13323,
+             "7a3af3e6b43fcb7c486ea8167252a36a9532dcbdf02d1704a749881872ec551c"),
+            ("hf:ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+             "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d", "LICENSE-QWEN", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+            ("hf:ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+             "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d", "NOTICE", 1514,
+             "adfc6658815ecb4ddb26b1e3018c819104866b6c54f15e6b63b73827fa40c884"),
+        ],
+    },
+    "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": {
+        "license": "Qwen Community License 1.0",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.8-Flash-Next",
+             "812d96e10a0dd82b69d749e68693698cf6c36daa", "LICENSE", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        ],
+    },
+    "unsloth/Qwen3.8-Flash-Next-GGUF": {
+        "license": "Qwen Community License 1.0",
+        "card": "other (qwen-community-1.0)",
+        "texts": [
+            ("hf:Qwen/Qwen3.8-Flash-Next",
+             "812d96e10a0dd82b69d749e68693698cf6c36daa", "LICENSE", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        ],
+    },
+    "ornith-ai/Ornith-1.5-35B-A3B-GGUF": {
+        "license": "MIT",
+        "card": "mit",
+        "texts": [],
+    },
+    "pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF": {
+        "license": "MIT License",
+        "card": "mit",
+        "texts": [
+            ("hf:pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF",
+             "0bfdfe7f6c424de60481c26379c9d821469f75f1", "LICENSE", 1073,
+             "ba0b4cc44cd824e63b2aa20691ab8707ed7407a91b3772d8ed47896d8c4d9629"),
+        ],
+    },
+    "dealignai/Ornith-1.5-35B-A3B-UNCENSORED-GGUF": {
+        "license": "MIT",
+        "card": "mit",
+        "texts": [],
+    },
+    "llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf": {
+        "license": "Apache-2.0",
+        "card": "apache-2.0",
+        "texts": [],
+    },
+    "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.6-35B-A3B",
+             "345d467b117d1fd5eda9b879a5988de9ae5f47a7", "LICENSE", 11343,
+             "50cbab8a892c5f2993b8c7351a99182507472def3b1374558308605d99b86b32"),
+        ],
+    },
+    "SC117/Qwen3.6-35B-A3B-uncensored-heretic-Native-MTP-Preserved-APEX-GGUF": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.6-35B-A3B",
+             "345d467b117d1fd5eda9b879a5988de9ae5f47a7", "LICENSE", 11343,
+             "50cbab8a892c5f2993b8c7351a99182507472def3b1374558308605d99b86b32"),
+        ],
+    },
+    "unsloth/GLM-5.3-Flash-GGUF": {
+        "license": "MIT License",
+        "card": "mit",
+        "texts": [
+            ("hf:zai-org/GLM-5.3-Flash",
+             "46a050bec13002ad29ee795c16e61cf4fa3c4a9c", "LICENSE", 1070,
+             "30b85b6b9659f2e78aa259f8faf5d920a68dee7c9ced3fa6dba1f19f2bc4fca1"),
+        ],
+    },
+    "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": {
+        "license": "Qwen Community License 1.0",
+        "card": "other (qwen-community-1.0)",
+        "texts": [
+            ("hf:agentionai/Qwen3.8-Flash-Next-Gyro-GGUF",
+             "1ada08422e404aca51ab9df665f089f34c419c6b", "LICENSE", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        ],
+    },
+    "agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF": {
+        "license": "Qwen Community License 1.0",
+        "card": "other (qwen-community-1.0)",
+        "texts": [
+            ("hf:agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF",
+             "b32c7399b57f7a627b8aa9403ef06767e9a444e8", "LICENSE", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        ],
+    },
+    "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF": {
+        "license": "Qwen Community License 1.0",
+        "card": "other (qwen-community-1.0)",
+        "texts": [
+            ("hf:huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF",
+             "06a318de4011598a142ee54bcfec47c6921c958e", "LICENSE", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        ],
+    },
+    "SC117/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF": {
+        "license": "Qwen Community License 1.0",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.8-Flash-Next",
+             "812d96e10a0dd82b69d749e68693698cf6c36daa", "LICENSE", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        ],
+    },
+    "SC117/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-GGUF": {
+        "license": "Swift Open License v1.0",
+        "card": "other (swift-open-license-1.0)",
+        "texts": [
+            ("hf:ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+             "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d", "LICENSE", 13323,
+             "7a3af3e6b43fcb7c486ea8167252a36a9532dcbdf02d1704a749881872ec551c"),
+            ("hf:ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+             "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d", "LICENSE-QWEN", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+            ("hf:ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+             "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d", "NOTICE", 1514,
+             "adfc6658815ecb4ddb26b1e3018c819104866b6c54f15e6b63b73827fa40c884"),
+        ],
+    },
+    "unsloth/Qwen3.5-9B-GGUF": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.5-9B",
+             "c202236235762e1c871ad0ccb60c8ee5ba337b9a", "LICENSE", 11544,
+             "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"),
+        ],
+    },
+    "unsloth/Qwen3.5-2B-GGUF": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.5-2B",
+             "15852e8c16360a2fea060d615a32b45270f8a8fc", "LICENSE", 11544,
+             "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"),
+        ],
+    },
+    "unsloth/Qwen3.5-0.8B-GGUF": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.5-0.8B",
+             "2fc06364715b967f1860aea9cf38778875588b17", "LICENSE", 11544,
+             "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"),
+        ],
+    },
+    "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": {
+        "license": "Apache License",
+        "card": "apache-2.0",
+        "texts": [
+            ("hf:Qwen/Qwen3.5-9B",
+             "c202236235762e1c871ad0ccb60c8ee5ba337b9a", "LICENSE", 11544,
+             "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"),
+        ],
+    },
+    "AtomicChat/Qwen3.8-Flash-Next-GGUF": {
+        "license": "Qwen Community License 1.0",
+        "card": "other (qwen-community-1.0)",
+        "texts": [
+            ("hf:AtomicChat/Qwen3.8-Flash-Next-GGUF",
+             "f5b0b790eebb89033c48091c26abf74c1b385940", "LICENSE", 3235,
+             "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        ],
+    },
+    "pfnet/plamo-3-translate-2b-GGUF": {
+        "license": "PLaMo Community License Agreement",
+        "card": "other (plamo-community-license)",
+        "texts": [
+            ("hf:pfnet/plamo-3-translate-2b-GGUF",
+             "4f672106b847200bfdc0f6af6c321cd94eba1aed", "LICENSE/en", 9532,
+             "ca0c5e90f6de6799fc2d2d4f2b2647cc088444c19f286f689e525d4ad28f9ed6"),
+            ("hf:pfnet/plamo-3-translate-2b-GGUF",
+             "4f672106b847200bfdc0f6af6c321cd94eba1aed", "LICENSE/ja", 10713,
+             "7dd74339bbf9a39fe33e271a89657aacf06f452b082fcb1273fb792b8d6b7db2"),
+        ],
+    },
+    "pfnet/plamo-3-translate-0.8b-GGUF": {
+        "license": "PLaMo Community License Agreement",
+        "card": "other (plamo-community-license)",
+        "texts": [
+            ("hf:pfnet/plamo-3-translate-0.8b-GGUF",
+             "1cf96ae02133958a20074bfdfab76517bb737d00", "LICENSE/en", 9532,
+             "ca0c5e90f6de6799fc2d2d4f2b2647cc088444c19f286f689e525d4ad28f9ed6"),
+            ("hf:pfnet/plamo-3-translate-0.8b-GGUF",
+             "1cf96ae02133958a20074bfdfab76517bb737d00", "LICENSE/ja", 10713,
+             "7dd74339bbf9a39fe33e271a89657aacf06f452b082fcb1273fb792b8d6b7db2"),
+        ],
+    },
+    "pfnet/plamo-3-translate-8b-GGUF": {
+        "license": "PLaMo Community License Agreement",
+        "card": "other (plamo-community-license)",
+        "texts": [
+            ("hf:pfnet/plamo-3-translate-8b-GGUF",
+             "c67efa4eefdc14d3c97bf8f4f35ee58e2ecd2f42", "LICENSE/en", 9532,
+             "ca0c5e90f6de6799fc2d2d4f2b2647cc088444c19f286f689e525d4ad28f9ed6"),
+            ("hf:pfnet/plamo-3-translate-8b-GGUF",
+             "c67efa4eefdc14d3c97bf8f4f35ee58e2ecd2f42", "LICENSE/ja", 10713,
+             "7dd74339bbf9a39fe33e271a89657aacf06f452b082fcb1273fb792b8d6b7db2"),
+        ],
+    },
 }
 
 
@@ -1152,6 +1385,43 @@ ESP_SIZE, ESP_SHA256 = 483520, "ef0724c5b79297e481017be85769832bc26eb220c984ecba
 # the families it applies to: the Coder and Unsloth's files are the same model's residual stream (Unsloth's: the
 # user's decision of 2026-10-22)
 SPEED_PROJECTION_FAMILIES = ("qwen", "coder", "unsloth")
+
+
+def hf_repo(url: str) -> str | None:
+    """The repository of a Hugging Face URL hf() made (its folder, with or without a file), or None."""
+    m = re.match(r"https?://[^/]+/([^/]+/[^/]+)/resolve/", url or "")
+    return m.group(1) if m else None
+
+
+def family_repos(family: str, model: str | None = None) -> list[tuple[str, str]]:
+    """The repositories a family's model (`model`: its size; None: every size) and its picture reader are downloaded
+    from, as (role, repository): "model" and "mmproj".  About > Model terms reads their MODEL_TERMS."""
+    fam = FAMILIES.get(family) or {}
+    out: list[tuple[str, str]] = []
+    if fam.get("plain"):
+        for m, d in fam.get("models", {}).items():
+            if model is None or m == model:
+                out.append(("model", d["repo"]))
+        if fam.get("mmproj"):
+            out.append(("mmproj", fam["mmproj"]["repo"]))
+    else:
+        if (r := hf_repo(fam.get("hf", "").replace("{q}/", "").replace("{d}", ""))):
+            out.append(("model", r))
+        if fam.get("mmproj_hf") and (r := hf_repo(fam["mmproj_hf"])):
+            out.append(("mmproj", r))
+    return list(dict.fromkeys(out))
+
+
+def family_license(family: str) -> str | None:
+    """The license setup names for a family: its own "license" line, else its model's MODEL_TERMS (name and page)."""
+    fam = FAMILIES.get(family) or {}
+    if fam.get("license"):
+        return fam["license"]
+    repo = next((r for role, r in family_repos(family) if role == "model"), None)
+    t = MODEL_TERMS.get(repo or "")
+    return f"{t['license']}: https://huggingface.co/{repo}" if t else None
+
+
 # the versions with the refusals removed in their weights, which setup points to when the projection is chosen; the
 # projection itself is never applied to them (not in SPEED_PROJECTION_FAMILIES)
 ABLITERATED_FAMILIES = ("sc117", "sc117-swift", "huihui-swift", "huihui-unsloth")
@@ -3537,7 +3807,24 @@ def range_total(url: str) -> int:
         return 0
 
 
+_TERMS_DONE: set = set()
+
+
 def download(url, dst: Path, what=None):
+    """A model's file (download_file), and its repository's terms beside it (model_terms.fetch: About > Model terms
+    reads them offline), once a run.  The terms not fetched leave the model as it is: a warning only, and the page
+    links them instead."""
+    download_file(url, dst, what)
+    m = HF_FILE.match(str(url))
+    repo = m.group("repo") if m else None
+    if repo and repo not in _TERMS_DONE:
+        terms = {**MODEL_TERMS, **_qimage().TERMS}   # this module's table, not a second import of it
+        if repo in terms:
+            _TERMS_DONE.add(repo)
+            model_terms.fetch([repo], say=warn, timeout=30, terms=terms)
+
+
+def download_file(url, dst: Path, what=None):
     """Resumable HTTP(S) download with a progress line; `file://` and plain paths are copied (tests, mirrors).
     A finished file gets a <name>.done mark, so a later run skips it without asking the server."""
     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -8482,7 +8769,7 @@ def describe() -> dict:
                          # its place in the lists (TIERS) and the size recommended of it, whose quantization is the
                          # one the window shows first
                          "base": base, "variant": variant, "quantizer": quant, "recommended_size": rec,
-                         "license": fam.get("license"), "experimental": bool(fam.get("experimental")),
+                         "license": family_license(f), "experimental": bool(fam.get("experimental")),
                          "images": gpu is not None,                  # image generation needs a GPU (setup_plain's too)
                          # the questions setup_plain does not ask: the KV cache's precision, the speed projection
                          "kv": not fam.get("plain"), "speed_projection": f in SPEED_PROJECTION_FAMILIES,
@@ -9096,8 +9383,8 @@ def main() -> int:
         family, a.quantizer = ask_tiers(fams, halo_fam or recommend_family(fams, room), room, halo_fam, a.yes)
     fam = FAMILIES[family]
     ok(f"model: {fam['title']}")
-    if fam.get("license"):
-        say(f"  Its license: {fam['license']}")
+    if (lic := family_license(family)):
+        say(f"  Its license: {lic}")
     if fam.get("plain"):
         return setup_plain(a, family, fam, gpu, chosen, sel, found, gpu_chosen, ram, roots, elsewhere, port, adopted)
     say()

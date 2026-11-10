@@ -68,6 +68,8 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import quote
 
+from serve import model_terms
+
 MAX_LORA = 4                       # the most adapters one request stacks
 SCALE_MIN, SCALE_MAX = -2.0, 2.0   # a request's strength
 CACHE_S = 10.0                     # how long a listing is kept before the folder is read again
@@ -1111,6 +1113,9 @@ class Fetch:
             if self.total is not None and self.got != self.total:
                 raise LoraError(f"the download ended at {self.got} of {self.total} bytes")
             self.added = add(self.folders, tmp, self.name)
+            # where it came from, for About > Model terms (a LoRA's terms are its maker's)
+            model_terms.record_lora_source([f.dir / self.added["path"] for f in self.folders
+                                            if (f.dir / self.added["path"]).is_file()], self.url)
             self.state = "done"
         except urllib.error.HTTPError as exc:
             self.state, self.error = "failed", f"Hugging Face answered {exc.code} ({exc.reason}) for {self.url}"

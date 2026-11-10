@@ -40,6 +40,8 @@ import urllib.request
 from pathlib import Path
 from typing import Callable
 
+from serve import model_terms
+
 RETRY_S = 30            # what the tool's result suggests before the chat asks again
 CONVERT_TIMEOUT_S = 600
 CHUNK = 1 << 20
@@ -196,6 +198,7 @@ def _run(name: str, root: Path, job: dict, say: Callable[[str], None]) -> None:
                 break
             time.sleep(2)
         say(f"image tools: {name} is ready ({out})")
+        model_terms.fetch([repo], say=lambda m: say(f"image tools: {m}"), timeout=30)   # About > Model terms
         with _lock:
             _jobs.pop(name, None)
     except Exception as e:  # noqa: BLE001 - every failure is the download's result, told to the next caller

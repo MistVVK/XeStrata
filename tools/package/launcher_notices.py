@@ -6,7 +6,8 @@ the Windows 7z's (windows_bundle.py takes COMPONENTS from here) and the xestrata
 
     launcher_notices.py --launcher DIR --nuget DIR --version V --out DIR
 
-writes the xestrata-gui package's THIRD-PARTY-NOTICES.md and licenses/ to DIR (its /usr/share/doc/xestrata-gui/), from
+writes the xestrata-gui package's THIRD-PARTY-NOTICES.md, notices.json and licenses/ to DIR (its
+/usr/share/doc/xestrata-gui/), from
 what `dotnet publish -r linux-x64` put in the launcher's folder DIR and the NuGet cache it restored to.  Every program
 and library there must belong to a component, or it stops: nothing goes out without its notice.  The .NET runtime is
 not one of them: the distribution's dotnet-runtime-10.0 package brings it.
@@ -156,6 +157,13 @@ def main() -> None:
     for name, version, license_, source, kept in rows:
         lines.append(f"| {name} | {version} | {license_} | {source} | {', '.join(f'`{k}`' for k in kept)} |")
     (a.out / "THIRD-PARTY-NOTICES.md").write_text("\n".join(lines) + "\n")
+    # the same for the server's About > Licenses (engine_notices.py's form, the texts read in), without the launcher's
+    # own row
+    (a.out / "notices.json").write_text(json.dumps(
+        [{"name": name, "version": version, "license": license_, "source": source, "free": True, "bundled": True,
+          "texts": [{"name": Path(k).name, "text": (a.out / k).read_text(encoding="utf-8", errors="replace")}
+                    for k in kept]} for name, version, license_, source, kept in rows[1:]],
+        indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 if __name__ == "__main__":

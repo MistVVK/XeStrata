@@ -132,6 +132,8 @@ file(WRITE ${CMAKE_BINARY_DIR}/package/BUILD.json
 }
 ")
 install(FILES ${CMAKE_BINARY_DIR}/package/BUILD.json DESTINATION ${_pkg_engine})
+# the parts' notices (About > Licenses): tools/package/container.sh writes it with tools/package/engine_notices.py
+install(FILES ${CMAKE_BINARY_DIR}/package/NOTICES.json DESTINATION ${_pkg_engine})
 install(FILES third_party/main/intel-llvm/LICENSE.TXT
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.intel-llvm)
 # ROCm's device libraries: the engine's code for AMD GPUs carries parts of them (NCSA asks for the notice with binaries)
