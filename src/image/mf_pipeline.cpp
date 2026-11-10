@@ -25,6 +25,8 @@ constexpr uint64_t kMiB = 1ull << 20;
 constexpr uint64_t kScratch = 384 * kMiB;   // the products' dequantization scratch (the DiT's and the encoder's)
 constexpr int kTurboSteps = 4;              // Mage-Flow-Turbo's steps (its model card)
 constexpr int32_t kImagePad = 151655;       // Qwen3-VL's <|image_pad|>
+// the text encoder's longest prompt, the references' rows among it (its K/V cells, shared by its layers)
+constexpr int64_t kTextTokens = 16384;
 constexpr size_t kMaxRefs = 3;              // the edit models' training takes up to three references
 constexpr int64_t kVlEdge = 384;            // the vision encoder's input: its long edge at most this (training's)
 constexpr int64_t kVlFactor = 32, kVlMinPixels = 65536, kVlMaxPixels = 16777216;   // Qwen3-VL's processor
@@ -118,7 +120,7 @@ void vl_size(int64_t w, int64_t h, int64_t& cw, int64_t& ch, int64_t& vw, int64_
 struct MfPipeline::Edit {
     std::vector<QiVisionOut> vouts;
     std::vector<int32_t> ids, neg_ids;
-    std::vector<QiText::Image> te, neg_te;
+    std::vector<TextEncoder::Picture> te, neg_te;
     std::vector<std::pair<int64_t, int64_t>> sizes;
     float* z = nullptr;
     int64_t rows = 0;
@@ -147,11 +149,11 @@ bool MfPipeline::open(const std::string& dit, const std::string& vae, const std:
     keep_ = keep;
     size_t free = 0, total = 0;
     gpu::mem_info(&free, &total);
-    te_size_ = std::make_unique<QiText>();
+    te_size_ = std::make_unique<TextEncoder>();
     dit_size_ = std::make_unique<MfDit>();
     dit16_size_ = std::make_unique<MfDit>();
     vae_size_ = std::make_unique<MfVae>();
-    if (!(te_size_->open(text, s_, err, true) && dit_size_->open(dit, s_, err, true, true) &&
+    if (!(te_size_->open(text, kTextTokens, err, UINT64_MAX, true) && dit_size_->open(dit, s_, err, true, true) &&
           dit16_size_->open(dit, s_, err, true, false) && vae_size_->open(vae, s_, err, true)))
         return false;
     {   // the encoder's sizes, for a base image: a VAE file without one makes images but takes no base image
@@ -174,9 +176,10 @@ bool MfPipeline::open(const std::string& dit, const std::string& vae, const std:
 void MfPipeline::ensure_open() {
     if (vae_ && te_) return;
     std::string err;
-    te_ = std::make_unique<QiText>();
+    te_ = std::make_unique<TextEncoder>();
     vae_ = std::make_unique<MfVae>();
-    if (!(te_->open(text_path_, s_, err) && vae_->open(vae_path_, s_, err))) {
+    gpu::stream_sync(s_);   // the encoder's own stream: what the engine freed on its stream first
+    if (!(te_->open(text_path_, kTextTokens, err) && vae_->open(vae_path_, s_, err))) {
         te_.reset();
         vae_.reset();
         throw std::runtime_error(err);
@@ -275,7 +278,7 @@ QiNeed MfPipeline::need(int64_t n_text, int64_t width, int64_t height,
                         const std::vector<LoraUse>& loras) {
     const MfDit& dit = q8_ == 0 ? *dit16_size_ : *dit_size_;   // the least: Q8_0's, unless FP16 is asked for
     const MfDit& full = q8_ == 1 ? *dit_size_ : *dit16_size_;  // all resident: FP16's, unless Q8_0 is
-    const QiText& te = *te_size_;
+    const TextEncoder& te = *te_size_;
     const MfVae& vae = *vae_size_;
     const int64_t h = height / 16, w = width / 16;
     int64_t hw = h * w;
@@ -311,6 +314,17 @@ QiNeed MfPipeline::need(int64_t n_text, int64_t width, int64_t height,
               std::max({full.activation_bytes(hw, n, max_text), vae.scratch_bytes(h, w), te_act, edit});
     vram_into(nd);
     return nd;
+}
+
+std::vector<float> MfPipeline::text(const std::vector<int32_t>& ids, const std::vector<TextEncoder::Picture>& pictures) {
+    if ((int64_t) ids.size() > kTextTokens)
+        throw std::invalid_argument("image engine: the prompt and its references are longer than " +
+                                    std::to_string(kTextTokens) + " tokens");
+    gpu::stream_sync(s_);
+    std::string err;
+    std::vector<float> out = te_->encode(ids, err, pictures);
+    if (out.empty()) throw std::runtime_error(err);
+    return out;
 }
 
 void MfPipeline::te_layers() {
@@ -469,7 +483,7 @@ void MfPipeline::edit_refs(const QiRequest& r, Edit& e) {
     gpu::free(rgb);
     gpu::free(eps);
     // the prompts with each pad widened to its reference's image tokens
-    auto widen = [&](const std::vector<int32_t>& src, std::vector<int32_t>& out, std::vector<QiText::Image>& te) {
+    auto widen = [&](const std::vector<int32_t>& src, std::vector<int32_t>& out, std::vector<TextEncoder::Picture>& te) {
         size_t k = 0;
         for (const int32_t id : src) {
             if (id != kImagePad) {
@@ -479,12 +493,11 @@ void MfPipeline::edit_refs(const QiRequest& r, Edit& e) {
             if (k >= e.vouts.size())
                 throw std::invalid_argument("image engine: the negative prompt's image pads and the references differ");
             const QiVisionOut& v = e.vouts[k++];
-            QiText::Image im;
+            TextEncoder::Picture im;
             im.index = (int64_t) out.size();
-            im.rows = v.rows;
-            im.grid_h = v.grid_h;
-            im.grid_w = v.grid_w;
-            im.main = v.main.data();
+            im.nx = v.grid_w;
+            im.ny = v.grid_h;
+            im.rows = v.main.data();
             for (const auto& d : v.deepstack) im.deepstack.push_back(d.data());
             te.push_back(im);
             out.insert(out.end(), (size_t) v.rows, kImagePad);
@@ -554,11 +567,11 @@ std::vector<uint8_t> MfPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     // the states: an edit's afresh (its images are not in the ids), a generation's kept for the same prompt
     if (editing) {
         te_layers();
-        last_states_ = te_->encode(ids, e.te);
+        last_states_ = text(ids, e.te);
         last_ids_.clear();
     } else if (r.ids != last_ids_) {
         te_layers();
-        last_states_ = te_->encode(r.ids);
+        last_states_ = text(r.ids, {});
         last_ids_ = r.ids;
     } else {
         p.text_cached = true;
@@ -568,11 +581,11 @@ std::vector<uint8_t> MfPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     if (guided) {
         if (editing) {
             te_layers();
-            last_neg_states_ = te_->encode(neg_ids, e.neg_te);
+            last_neg_states_ = text(neg_ids, e.neg_te);
             last_neg_ids_.clear();
         } else if (r.neg_ids != last_neg_ids_) {
             te_layers();
-            last_neg_states_ = te_->encode(r.neg_ids);
+            last_neg_states_ = text(r.neg_ids, {});
             last_neg_ids_ = r.neg_ids;
         }
         d.set_context(1, last_neg_states_.data() + r.drop * C, n_neg);

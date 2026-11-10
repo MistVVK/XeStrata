@@ -10,7 +10,7 @@
 // (<|image_pad|>, a run of them) take those, as in the run.
 
 #include "strata/core/runtime.hpp"
-#include "strata/image/qi_text.hpp"
+#include "strata/image/text_encoder.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -53,40 +53,41 @@ int main(int argc, char** argv) {
         return 2;
     }
     try {
-        void* s = strata::core::Runtime::get().create_stream();
-        strata::image::QiText te;
+        strata::image::TextEncoder te;
         std::string err;
-        if (!te.open(argv[1], s, err)) throw std::runtime_error(err);
+        if (!te.open(argv[1], 16384, err)) throw std::runtime_error(err);
+        te.set_final_norm(false);   // Qwen-Image's context: before the final norm
         if (const char* b = std::getenv("QI_LAYER_BUDGET_MIB")) te.set_layer_budget(std::strtoull(b, nullptr, 10) << 20);
         const std::string dir = argv[2];
         const auto ids = load<int32_t>(dir + "/te_tokens_0.bin");
         const auto want = load<float>(dir + "/te_hidden_0.bin");
         // an edit's run: the image pads' run and the vision encoder's outputs
         constexpr int32_t kImagePad = 151655;
-        std::vector<strata::image::QiText::Image> images;
+        std::vector<strata::image::TextEncoder::Picture> images;
         std::vector<std::vector<float>> vit;
         const auto first = std::find(ids.begin(), ids.end(), kImagePad);
         if (first != ids.end()) {
-            strata::image::QiText::Image im;
+            strata::image::TextEncoder::Picture im;
             im.index = first - ids.begin();
-            im.rows = std::count(ids.begin(), ids.end(), kImagePad);
-            const auto side = (int64_t) std::lround(std::sqrt((double) im.rows));   // a square reference
-            im.grid_h = im.grid_w = side;
+            const int64_t pads = std::count(ids.begin(), ids.end(), kImagePad);
+            const auto side = (int64_t) std::lround(std::sqrt((double) pads));   // a square reference
+            im.nx = im.ny = side;
             for (int k = 0;; ++k) {
                 std::ifstream f(dir + "/vit_out_0_" + std::to_string(k) + ".bin");
                 if (!f) break;
                 vit.push_back(load<float>(dir + "/vit_out_0_" + std::to_string(k) + ".bin"));
             }
             if (vit.empty()) throw std::runtime_error("image pads but no vit_out_0_0");
-            im.main = vit[0].data();
+            im.rows = vit[0].data();
             for (size_t k = 1; k < vit.size(); ++k) im.deepstack.push_back(vit[k].data());
             images.push_back(im);
-            std::printf("image: %lld pads from %lld, %zu DeepStack blocks\n", (long long) im.rows, (long long) im.index,
+            std::printf("image: %lld pads from %lld, %zu DeepStack blocks\n", (long long) pads, (long long) im.index,
                         im.deepstack.size());
         }
-        te.encode(ids, images);   // a warm-up
+        te.encode(ids, err, images);   // a warm-up
         const auto t0 = std::chrono::steady_clock::now();
-        const auto got = te.encode(ids, images);
+        const auto got = te.encode(ids, err, images);
+        if (got.empty()) throw std::runtime_error(err);
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         const auto C = (size_t) te.hidden();
         compare("all", got.data(), want.data(), got.size());

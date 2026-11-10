@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/image/moss_text_probe.cpp - strata-image-moss-text-probe: MOSS-Image's text encoder (MossText) against the
+// src/image/moss_text_probe.cpp - strata-image-moss-text-probe: MOSS-Image's text encoder (TextEncoder) against the
 // reference pipeline's states of the same prompts (diffusers' MOSS-Image pipeline, its ids-NAME.npy and te-NAME.npy:
 // int32 token ids and float32 [tokens][4096] states after the final norm).
 //
@@ -11,7 +11,7 @@
 // difference, and the encoder's time; and the load's.  MOSS_LAYER_BUDGET_MIB: the blocks' VRAM (the rest streamed).
 
 #include "strata/core/runtime.hpp"
-#include "strata/image/moss_text.hpp"
+#include "strata/image/text_encoder.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -66,7 +66,7 @@ int main(int argc, char** argv) {
     for (int i = a0 + 2; i < argc; ++i) names.emplace_back(argv[i]);
     if (names.empty()) names = {"short", "text", "layout", "negative"};
     try {
-        strata::image::MossText te;
+        strata::image::TextEncoder te;
         std::string err;
         if (!files) {
             strata::core::Runtime::get();
@@ -96,7 +96,7 @@ int main(int argc, char** argv) {
             if (files) {
                 std::string p = argv[a0];
                 p.append("/").append(n).append(".ste");
-                if (!strata::image::MossText::read_states(p, got, rows, width, err)) got.clear();
+                if (!strata::image::TextEncoder::read_states(p, got, rows, width, err)) got.clear();
             } else {
                 got = te.encode(ids, err);
                 width = te.hidden();

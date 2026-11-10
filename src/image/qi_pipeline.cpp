@@ -26,6 +26,9 @@ namespace gpu = strata::gpu;
 namespace {
 
 constexpr uint64_t kMiB = 1ull << 20;
+// the text encoder's longest prompt, references' rows among it (its K/V cells, shared by its layers: 32 MiB for
+// Qwen3-VL-8B)
+constexpr int64_t kTextTokens = 16384;
 constexpr uint64_t kMargin = 512 * kMiB;      // the driver's own and the copies' room, kept free
 constexpr uint64_t kScratch = 384 * kMiB;     // the products' dequantization scratch (the DiT's and the encoder's)
 
@@ -99,10 +102,10 @@ bool QiPipeline::open(const std::string& dit, const std::string& vae, const std:
     }
     size_t free = 0, total = 0;
     gpu::mem_info(&free, &total);
-    te_size_ = std::make_unique<QiText>();
+    te_size_ = std::make_unique<TextEncoder>();
     dit_size_ = std::make_unique<QiDit>();
     vae_size_ = std::make_unique<QiVae>();
-    if (!(te_size_->open(text, s_, err, true) && dit_size_->open(dit, s_, err, true) &&
+    if (!(te_size_->open(text, kTextTokens, err, UINT64_MAX, true) && dit_size_->open(dit, s_, err, true) &&
           vae_size_->open(vae, s_, err, true)))
         return false;
     // the budget a request plans with: what was free before the parts, less a margin, within the small-card limit the
@@ -115,15 +118,17 @@ bool QiPipeline::open(const std::string& dit, const std::string& vae, const std:
 void QiPipeline::ensure_open() {
     if (dit_ && vae_ && te_) return;
     std::string err;
-    te_ = std::make_unique<QiText>();
+    te_ = std::make_unique<TextEncoder>();
     dit_ = std::make_unique<QiDit>();
     vae_ = std::make_unique<QiVae>();
-    if (!(te_->open(text_path_, s_, err) && dit_->open(dit_path_, s_, err) && vae_->open(vae_path_, s_, err))) {
+    gpu::stream_sync(s_);   // the encoder's own stream: what the engine freed on its stream first
+    if (!(te_->open(text_path_, kTextTokens, err) && dit_->open(dit_path_, s_, err) && vae_->open(vae_path_, s_, err))) {
         te_.reset();
         dit_.reset();
         vae_.reset();
         throw std::runtime_error(err);
     }
+    te_->set_final_norm(false);   // Qwen-Image's context: the last block's output before the final norm
     dit_->set_block_budget(dit_->block_min());   // nothing resident until a request plans its budget
     te_->set_layer_budget(te_->layer_min());
     dit_set_ = dit_->block_min();
@@ -142,7 +147,7 @@ QiNeed QiPipeline::need(int64_t n_text, int64_t width, int64_t height,
                         const std::vector<std::pair<int64_t, int64_t>>& refs, bool mask, int64_t n_neg,
                         const std::vector<LoraUse>& loras) {
     const QiDit& dit = *dit_size_;
-    const QiText& te = *te_size_;
+    const TextEncoder& te = *te_size_;
     const QiVae& vae = *vae_size_;
     const int64_t h = height / 16, w = width / 16;
     int64_t T = n_text + h * w, te_T = n_text + 16;   // the encoder's tokens: the system turn's too
@@ -236,6 +241,17 @@ void QiPipeline::use_loras(const QiRequest& r) {
     }
 }
 
+std::vector<float> QiPipeline::text(const std::vector<int32_t>& ids, const std::vector<TextEncoder::Picture>& pictures) {
+    if ((int64_t) ids.size() > kTextTokens)
+        throw std::invalid_argument("image engine: the prompt and its references are longer than " +
+                                    std::to_string(kTextTokens) + " tokens");
+    gpu::stream_sync(s_);
+    std::string err;
+    std::vector<float> out = te_->encode(ids, err, pictures);
+    if (out.empty()) throw std::runtime_error(err);
+    return out;
+}
+
 void QiPipeline::te_layers() {
     if (te_set_ == te_want_) return;
     te_->set_layer_budget(te_want_);
@@ -323,9 +339,9 @@ QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w, int64_t n_ids, int64_t 
 }
 
 void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::vector<QiVisionOut>& vouts,
-                           std::vector<QiText::Image>& te_images, std::vector<QiDit::Ref>& dit_refs,
+                           std::vector<TextEncoder::Picture>& te_images, std::vector<QiDit::Ref>& dit_refs,
                            std::vector<float*>& ref_z, std::vector<int32_t>& neg_ids,
-                           std::vector<QiText::Image>& neg_te, std::vector<QiDit::Ref>& neg_refs, bool vision) {
+                           std::vector<TextEncoder::Picture>& neg_te, std::vector<QiDit::Ref>& neg_refs, bool vision) {
     if (vision_path_.empty()) throw std::invalid_argument("image engine: an edit needs the vision encoder (--vision)");
     if (std::count(r.ids.begin(), r.ids.end(), kImagePad) != (int64_t) r.refs.size())
         throw std::invalid_argument("image engine: the prompt's image pads and the reference images differ in number");
@@ -416,7 +432,7 @@ void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::v
         }
     }
     // the ids with each pad widened to its reference's tokens: the prompt's, and guidance's negative prompt's
-    auto widen = [&](const std::vector<int32_t>& src, std::vector<int32_t>& out, std::vector<QiText::Image>& te,
+    auto widen = [&](const std::vector<int32_t>& src, std::vector<int32_t>& out, std::vector<TextEncoder::Picture>& te,
                      std::vector<QiDit::Ref>& refs) {
         size_t k = 0;
         for (const int32_t id : src) {
@@ -427,12 +443,11 @@ void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::v
             if (k >= vouts.size())
                 throw std::invalid_argument("image engine: the negative prompt's image pads and the references differ");
             const QiVisionOut& v = vouts[k];
-            QiText::Image im;
+            TextEncoder::Picture im;
             im.index = (int64_t) out.size();
-            im.rows = v.rows;
-            im.grid_h = v.grid_h;
-            im.grid_w = v.grid_w;
-            im.main = v.main.data();
+            im.nx = v.grid_w;
+            im.ny = v.grid_h;
+            im.rows = v.main.data();
             for (const auto& d : v.deepstack) im.deepstack.push_back(d.data());
             te.push_back(im);
             QiDit::Ref f;
@@ -464,7 +479,7 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     // an edit: its references through the vision encoder and the VAE's encoder, their pads widened to their tokens
     std::vector<int32_t> ids;
     std::vector<QiVisionOut> vouts;
-    std::vector<QiText::Image> te_images;
+    std::vector<TextEncoder::Picture> te_images;
     std::vector<QiDit::Ref> dit_refs;
     std::vector<float*> ref_z;   // the references' latents (kept_'s)
     const bool mask = !r.mask.rgba.empty();
@@ -478,7 +493,7 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     LatentStart ls;
     const bool guided = r.cfg > 1.0f && !r.neg_ids.empty();
     std::vector<int32_t> neg_ids;   // an edit's negative prompt, its pads widened
-    std::vector<QiText::Image> neg_te;
+    std::vector<TextEncoder::Picture> neg_te;
     std::vector<QiDit::Ref> neg_refs;
     // an edit whose text states are kept (the same request and references, the guidance's negative prompt too): the
     // vision encoder, which only the text encoder reads, is not run
@@ -509,7 +524,7 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     if (all_ids != last_ids_ || refs != last_refs_) {
         if (kept) throw std::logic_error("image engine: an edit's kept states do not match its request");
         te_layers();
-        last_states_ = r.refs.empty() ? te_->encode(r.ids) : te_->encode(all_ids, te_images);
+        last_states_ = text(r.refs.empty() ? r.ids : all_ids, r.refs.empty() ? std::vector<TextEncoder::Picture>{} : te_images);
         te_->drop_activations();
         last_ids_ = all_ids;
         last_refs_ = refs;
@@ -523,7 +538,8 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     if (guided) {   // the negative prompt's states (kept as the prompt's are; its references are the prompt's)
         if (neg_all != last_neg_ids_ || refs != last_neg_refs_) {
             te_layers();
-            last_neg_states_ = r.refs.empty() ? te_->encode(r.neg_ids) : te_->encode(neg_all, neg_te);
+            last_neg_states_ = text(r.refs.empty() ? r.neg_ids : neg_all,
+                                    r.refs.empty() ? std::vector<TextEncoder::Picture>{} : neg_te);
             if (kept) throw std::logic_error("image engine: an edit's kept states do not match its request");
             last_neg_ids_ = neg_all;
             last_neg_refs_ = refs;

@@ -26,9 +26,19 @@
 
 namespace strata::kernels {
 
-/// The table of the CURRENT device (a layer split sets one per device; null = the identity).
-void mrope_table_set(const int32_t* device_table);
+/// The table of the CURRENT device (a layer split sets one per device; null = the identity), and the rotation it is
+/// for: `n_rot` rotated dimensions, rope.dimension_sections' height and width counts (Qwen3.5's 64 and 11/11/10, the
+/// default; Qwen3-VL's 128 and 24/20/20).  A rotation of another width (a model's other heads, a vision reader) takes
+/// no table.
+void mrope_table_set(const int32_t* device_table, int n_rot = 64, int sec_h = 11, int sec_w = 11);
 const int32_t* mrope_table();
+
+/// The table for a rotation of `n_rot` dimensions (its tab null where none applies) and its sections.
+struct MRope {
+    const int32_t* tab = nullptr;
+    int sec_h = 0, sec_w = 0;
+};
+MRope mrope_for(int n_rot);
 
 /// Opt-in (STRATA_ROPE_TABLE=1, upstream e9f6bb9 / ab1c209): the rotation angles of a 64-wide rotary slice from the
 /// session's float64 table (build_rope_table, [max_pos][32] cos and sin in VRAM, the rope scaling inside).  Without it
@@ -55,6 +65,14 @@ __device__ __forceinline__ int mrope_pos(const int32_t* tab, int pos, int pair) 
 /// The same sector rule for the Xe kernels.
 inline int mrope_pos(const int32_t* tab, int pos, int pair) {
     return tab ? tab[(std::size_t) pos * 3 + pair % 3] : pos;
+}
+/// ggml rope_multi's interleaved rule for any sections: pair j takes the height's position where j % 3 == 1 and
+/// j < 3 sec_h, the width's where j % 3 == 2 and j < 3 sec_w, the time's otherwise (for 32 pairs and 11/11 the rule
+/// above, pair % 3).
+inline int mrope_pos(const MRope& m, int pos, int pair) {
+    if (m.tab == nullptr) return pos;
+    const int a = pair % 3 == 1 && pair < 3 * m.sec_h ? 1 : pair % 3 == 2 && pair < 3 * m.sec_w ? 2 : 0;
+    return m.tab[(std::size_t) pos * 3 + a];
 }
 /// cos and sin of rotary position p, pair `pair` (0..31) from the table; false when there is none or p lies past
 /// it (the caller then computes the angle as it always did)

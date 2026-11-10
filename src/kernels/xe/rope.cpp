@@ -38,6 +38,8 @@ sycl::queue& queue_for(void* stream) {
 // GPU's (one pointer for all made the B70 read the RTX 4070's image positions and hang at the first rotary layer)
 constexpr int kMaxDevices = 16;
 std::array<std::atomic<const int32_t*>, kMaxDevices> mrope_tab{};
+// the rotation each device's table is for: n_rot, sec_h, sec_w (set with the table, before any graph)
+std::array<std::array<int, 3>, kMaxDevices> mrope_shape{};
 int device_slot() {
     const int d = core::current_device();
     if (d < 0 || d >= kMaxDevices) throw std::runtime_error("rope tables: engine device " + std::to_string(d));
@@ -85,10 +87,18 @@ RopeTab rope_table_for(const RopeScaling& scaling) {
     return same_scaling(scaling, g_rope_tab_scaling[(size_t) d]) ? g_rope_tab[(size_t) d] : RopeTab{};
 }
 
-void mrope_table_set(const int32_t* device_table) {
-    mrope_tab[(size_t) device_slot()].store(device_table, std::memory_order_relaxed);
+void mrope_table_set(const int32_t* device_table, int n_rot, int sec_h, int sec_w) {
+    const int d = device_slot();
+    mrope_shape[(size_t) d] = {n_rot, sec_h, sec_w};
+    mrope_tab[(size_t) d].store(device_table, std::memory_order_relaxed);
 }
 const int32_t* mrope_table() { return mrope_tab[(size_t) device_slot()].load(std::memory_order_relaxed); }
+MRope mrope_for(int n_rot) {
+    const int d = device_slot();
+    const std::array<int, 3>& sh = mrope_shape[(size_t) d];
+    const int32_t* tab = mrope_tab[(size_t) d].load(std::memory_order_relaxed);
+    return tab != nullptr && n_rot == sh[0] ? MRope{tab, sh[1], sh[2]} : MRope{};
+}
 
 void build_rope_table(int n_rot, double theta, int max_pos, float* cos_tab, float* sin_tab) {
     const int half = n_rot / 2;
@@ -146,10 +156,10 @@ void rope_rows(const float* x, float* out, int64_t T, int64_t heads, int head_di
     if (T <= 0) return;
     // Match pinned host-side float powf before device powf/trigonometry.
     const float theta_scale = std::pow((float) scaling.freq_base, -2.0f / (float) n_rot);
-    // the IMRoPE sections and the float64 angle table are Qwen3.8's 64-wide rotary slice (32 pairs): a rotation over
-    // the whole head (llm-jp-4.1) computes its angles
+    // the float64 angle table is Qwen3.8's 64-wide rotary slice (32 pairs): a rotation over the whole head (llm-jp-4.1)
+    // computes its angles; the M-RoPE table applies to the rotation it was set for (mrope_for)
     const RopeTab tab = n_rot == 64 ? rope_table_for(scaling) : RopeTab{};
-    const qk::Rope ang{n_rot == 64 ? mrope_table() : nullptr, tab.cos, tab.sin, tab.max_pos, n_rot / 2, theta_scale,
+    const qk::Rope ang{mrope_for(n_rot), tab.cos, tab.sin, tab.max_pos, n_rot / 2, theta_scale,
                        scaling.type != RopeScalingType::None, scaling.kernel_args(n_rot), positions, pos0};
     rope_launch(queue_for(stream), x, out, T, heads, head_dim, ld_in, ld_out, n_rot, ang);
 }
@@ -194,7 +204,7 @@ void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma,
         throw std::invalid_argument("native_qsa_rms_norm_rope: invalid arguments");
     constexpr int BlockSize = 256;
     const float theta_scale = std::pow((float) scaling.freq_base, -2.0f / (float) n_rot);
-    const int32_t* mtab = n_rot == 64 ? mrope_table() : nullptr;   // as native_rope_apply
+    const MRope mtab = mrope_for(n_rot);   // as native_rope_apply
     const bool scaled = scaling.type != RopeScalingType::None;
     const RopeKernelArgs ka = scaling.kernel_args(n_rot);
     const RopeTab tab = n_rot == 64 ? rope_table_for(scaling) : RopeTab{};

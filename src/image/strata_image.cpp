@@ -288,11 +288,11 @@ std::vector<int> parse_blocks(const std::string& s) {
     return b;
 }
 
-// the chat engine's states file (MossText::read_states) into rows
+// the chat engine's states file (TextEncoder::read_states) into rows
 void read_states(const std::string& path, std::vector<float>& rows, int64_t& n) {
     std::string err;
     int64_t width = 0;
-    if (!si::MossText::read_states(path, rows, n, width, err)) throw std::invalid_argument(err);
+    if (!si::TextEncoder::read_states(path, rows, n, width, err)) throw std::invalid_argument(err);
 }
 
 si::QiRef read_image(const std::string& path) {

@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/image/moss_text.cpp - see include/strata/image/moss_text.hpp.
+// src/image/text_encoder.cpp - see include/strata/image/text_encoder.hpp.
 
-#include "strata/image/moss_text.hpp"
+#include "strata/image/text_encoder.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/artifact/model_spec.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/plain_model.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "strata/prefill/gemm.hpp"
 
 #include <algorithm>
@@ -24,7 +25,7 @@ namespace strata::image {
 namespace gpu = strata::gpu;
 
 // The engine's blocks from the layer stream: block l is layer l
-struct MossText::Source : core::PlainModel::BlockSource {
+struct TextEncoder::Source : core::PlainModel::BlockSource {
     LayerStream* layers = nullptr;
     const uint8_t* begin(int l) override { return layers->begin(l); }
     void end(int l) override { layers->end(l); }
@@ -32,7 +33,7 @@ struct MossText::Source : core::PlainModel::BlockSource {
 
 // The adapters after the blocks' products (PlainModel::ProductHook): a layer's product's deltas, by the layer and the
 // product
-struct MossText::Hook : core::PlainModel::ProductHook {
+struct TextEncoder::Hook : core::PlainModel::ProductHook {
     std::map<std::pair<int64_t, int>, std::unique_ptr<LoraLayer>> layers;
     std::vector<std::shared_ptr<const LoraFile>> files;
     std::string key;
@@ -57,7 +58,7 @@ struct MossText::Hook : core::PlainModel::ProductHook {
         if (T > cap_t) {
             free_scratch();
             if (!gpu::alloc_device(&f32, (size_t) (T * cols) * 4) || !gpu::alloc_device(&f16, (size_t) (T * cols) * 2))
-                throw std::runtime_error(std::string("MOSS-Image's text encoder's adapters: GPU memory: ") +
+                throw std::runtime_error(std::string("the text encoder's adapters: GPU memory: ") +
                                          gpu::last_error());
             cap_t = T;
         }
@@ -67,22 +68,48 @@ struct MossText::Hook : core::PlainModel::ProductHook {
     }
 };
 
-MossText::MossText() = default;
-MossText::~MossText() { close(); }
+// Qwen3-VL's DeepStack (PlainModel::BlockHook): after layer i, each picture's block i (on the device for this encode)
+// added to the picture's rows that lie in the chunk
+struct TextEncoder::Deep : core::PlainModel::BlockHook {
+    struct Pic {
+        int64_t index = 0, rows = 0;
+        std::vector<float*> blocks;   // [rows][hidden] each, layer by layer
+    };
+    std::vector<Pic> pics;
+    int64_t width = 0;
+    ~Deep() override { clear(); }
+    void clear() {
+        for (Pic& p : pics)
+            for (float* b : p.blocks) gpu::free(b);
+        pics.clear();
+    }
+    void after(int64_t layer, float* x, int64_t row0, int64_t T, gpu::Stream stream) override {
+        for (const Pic& p : pics) {
+            if (layer >= (int64_t) p.blocks.size()) continue;
+            const int64_t a = std::max(p.index, row0), b = std::min(p.index + p.rows, row0 + T);
+            if (b <= a) continue;
+            kernels::add_inplace(x + (a - row0) * width, p.blocks[(size_t) layer] + (a - p.index) * width,
+                                 (b - a) * width, stream);
+        }
+    }
+};
 
-const std::string& MossText::lora_key() const {
+TextEncoder::TextEncoder() = default;
+TextEncoder::~TextEncoder() { close(); }
+
+const std::string& TextEncoder::lora_key() const {
     static const std::string none;
     return hook_ ? hook_->key : none;
 }
 
-bool MossText::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
+bool TextEncoder::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
     const std::string key = lora_key_of(loras);
     if (key == lora_key()) return true;
     if (model_) model_->set_product_hook(nullptr);
     hook_.reset();
     if (key.empty()) return true;
     if (!model_) {
-        err = "MOSS-Image's text encoder is not open";
+        err = "the text encoder is not open";
         return false;
     }
     using H = core::PlainModel::ProductHook;
@@ -121,18 +148,23 @@ bool MossText::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                                                              [&](const auto& n) { return std::strcmp(n.first, rest) == 0; });
             int64_t rows = 0, cols = 0;
             if (hit == nullptr || hit == std::end(kNames) || !model_->product_shape(layer, hit->second, rows, cols)) {
-                err = "image engine: " + u.file->path() + ": " + e0.key + ": MOSS-Image's text encoder has no such weight";
+                err = "image engine: " + u.file->path() + ": " + e0.key + ": the text encoder has no such weight";
                 return false;
             }
-            if ((e0.kind != LoraKind::lora && e0.kind != LoraKind::diff) || !e0.dora.empty() || !e0.bias.empty() ||
-                e0.replaces || e0.rows != rows || e0.cols != cols) {
-                err = "image engine: " + u.file->path() + ": " + e0.key + ": MOSS-Image's text encoder takes a plain "
-                      "LoRA or a whole delta of its weight's " + std::to_string(cols) + " x " + std::to_string(rows);
+            const H::Which w = hit->second;
+            // a GDN weight's entry has its value heads reordered below: a plain LoRA or a whole delta only
+            const bool gdn = reorder && (w == H::kQkv || w == H::kZ || w == H::kAlpha || w == H::kBeta || w == H::kSsmOut);
+            const bool form = gdn ? e0.kind == LoraKind::lora || e0.kind == LoraKind::diff
+                                  : e0.kind == LoraKind::lora || e0.kind == LoraKind::diff ||
+                                        e0.kind == LoraKind::lokr || e0.kind == LoraKind::loha;
+            if (!form || !e0.dora.empty() || !e0.bias.empty() || e0.replaces || e0.rows != rows || e0.cols != cols) {
+                err = "image engine: " + u.file->path() + ": " + e0.key + ": the text encoder takes " +
+                      (gdn ? "a plain LoRA or a whole delta" : "a plain LoRA, a LoKr, a LoHa or a whole delta") +
+                      " of its weight's " + std::to_string(cols) + " x " + std::to_string(rows);
                 return false;
             }
             LoraEntry e = e0;   // the GDN's value heads in the GGUF's order
-            const H::Which w = hit->second;
-            if (reorder && (w == H::kQkv || w == H::kZ || w == H::kAlpha || w == H::kBeta || w == H::kSsmOut)) {
+            if (gdn) {
                 const int64_t first = w == H::kQkv ? 2 * HK * dk : 0, hd = (w == H::kAlpha || w == H::kBeta) ? 1 : dv;
                 const bool by_cols = w == H::kSsmOut;
                 const int64_t n = by_cols ? cols : rows, inner = e.kind == LoraKind::lora ? e.rank : (by_cols ? rows : cols);
@@ -169,19 +201,26 @@ bool MossText::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
     return true;
 }
 
-bool MossText::open(const std::string& gguf, int64_t max_tokens, std::string& err, uint64_t layer_budget) {
+bool TextEncoder::open(const std::string& gguf, int64_t max_tokens, std::string& err, uint64_t layer_budget,
+                       bool dry) {
     close();
+    try {
+        image_pad_ = (int32_t) GgufModel::open(gguf).meta().string_index("tokenizer.ggml.tokens", "<|image_pad|>");
+    } catch (const std::exception&) {
+        image_pad_ = -1;   // no such token: no pictures
+    }
     core::PlainOptions o;
     o.gguf = gguf;
     o.encoder = true;
     o.stream_blocks = true;
-    o.vision = true;   // pictures among the prompt's tokens (an ai-toolkit edit adapter's references)
-    // the prompt in one chunk of its length (the encoder's states do not depend on the chunking, its K/V cells are the
-    // prompt's), the windows of one token it never runs
+    o.vision = true;   // pictures among the prompt's tokens (Qwen-Image's and Mage-Flow's edits, MOSS-Image's adapters)
+    // the prompt in one chunk of its length (PlainModel::encode makes the buffers for it; its layers share their K/V
+    // cells), the windows of one token it never runs; the first buffers only as long as the warming's chunk
     o.max_cells = max_tokens;
-    o.prompt_chunk = max_tokens;
+    o.prompt_chunk = std::min<int64_t>(max_tokens, 512);
     o.prompt_chunk_given = true;
     o.max_t = 1;
+    o.dry = dry;   // the blocks listed and the buffers' sizes read, nothing made
     auto m = std::make_unique<core::PlainModel>();
     auto layers = std::make_unique<LayerStream>();
     auto src = std::make_unique<Source>();
@@ -195,6 +234,13 @@ bool MossText::open(const std::string& gguf, int64_t max_tokens, std::string& er
             offsets.emplace_back();
             for (size_t k = 0; k < spans.size(); ++k) offsets.back().push_back(layers->offset(i, (int) k));
         }
+        if (dry) {
+            hidden_ = m->spec().n_embd;
+            layers_ = std::move(layers);
+            model_ = std::move(m);
+            dry_ = true;
+            return true;
+        }
         core::PlainModel* mp = m.get();
         layers->set_prepare([mp](int l, uint8_t* d) { mp->prepare_block(l, d); });
         layers->configure(std::min(std::max(layer_budget, layers->min_budget()), layers->total()), m->stream());
@@ -203,101 +249,162 @@ bool MossText::open(const std::string& gguf, int64_t max_tokens, std::string& er
         // the products' kernels loaded and the dense products' forms timed, as the chat's engine does at its start
         if (!m->prompt_warm(err)) return false;
     } catch (const std::exception& e) {
-        err = std::string("MOSS-Image's text encoder: ") + e.what();
+        err = std::string("the text encoder: ") + e.what();
         return false;
     }
-    try {
-        image_pad_ = (int32_t) GgufModel::open(gguf).meta().string_index("tokenizer.ggml.tokens", "<|image_pad|>");
-    } catch (const std::exception&) {
-        image_pad_ = -1;   // no such token: no pictures
-    }
+    hidden_ = m->spec().n_embd;
+    deep_ = std::make_unique<Deep>();
+    deep_->width = hidden_;
     layers_ = std::move(layers);
     source_ = std::move(src);
     model_ = std::move(m);
+    model_->set_block_hook(deep_.get());
     return true;
 }
 
 // the layer stream first: it waits for the model's stream (its compute stream), which the model destroys with itself
-void MossText::close() {
-    if (model_) model_->set_product_hook(nullptr);
+void TextEncoder::close() {
+    if (model_) {
+        model_->set_product_hook(nullptr);
+        model_->set_block_hook(nullptr);
+    }
     hook_.reset();
+    deep_.reset();
     layers_.reset();
     source_.reset();
     model_.reset();
+    dry_ = false;
+    hidden_ = 0;
     pos_set_ = 0;
 }
 
-void MossText::set_layer_budget(uint64_t bytes) {
-    if (layers_ != nullptr)
+void TextEncoder::set_layer_budget(uint64_t bytes) {
+    if (layers_ != nullptr && model_ != nullptr && !dry_)
         layers_->configure(std::min(std::max(bytes, layers_->min_budget()), layers_->total()), model_->stream());
 }
 
-std::vector<float> MossText::encode(const std::vector<int32_t>& ids, std::string& err,
-                                    const std::vector<Picture>& pictures) {
+uint64_t TextEncoder::activation_bytes(int64_t T) const {
+    return model_ != nullptr ? model_->encoder_buffer_bytes(T) : 0;
+}
+
+void TextEncoder::drop_activations() {
+    if (model_ != nullptr && !dry_) model_->encoder_release();
+}
+
+uint64_t TextEncoder::lora_bytes() const {
+    uint64_t n = 0;
+    if (hook_)
+        for (const auto& [k, l] : hook_->layers) n += l->bytes();
+    return n;
+}
+
+std::vector<float> TextEncoder::encode(const std::vector<int32_t>& ids, std::string& err,
+                                       const std::vector<Picture>& pictures) {
     const int32_t pad = image_pad_;
-    if (model_ == nullptr) {
-        err = "MOSS-Image's text encoder is not open";
+    if (model_ == nullptr || dry_) {
+        err = "the text encoder is not open";
         return {};
     }
     const int64_t n = (int64_t) ids.size(), N = hidden();
-    // the cells' positions: the pictures' grids, the text's one after another (the identity where there are none,
-    // also over the cells an earlier prompt's pictures set)
+    // the cells' positions: the pictures' grids, the text's one after another (the identity where there are none or
+    // the positions are flat, also over the cells an earlier prompt's pictures set)
     std::vector<int32_t> pos3;
     std::vector<const float*> rows;
-    if (!pictures.empty() || pos_set_ > 0) {
+    struct Run {
+        int64_t at;
+        const Picture* pic;
+    };
+    std::vector<Run> runs;   // where each picture's rows go
+    if (!pictures.empty()) {
+        rows.assign((size_t) n, nullptr);
+        int64_t i = 0;
+        for (const Picture& pic : pictures) {
+            int64_t at = pic.index;
+            if (at < 0) {   // the next run of <|image_pad|> tokens
+                while (i < n && ids[(size_t) i] != pad) ++i;
+                at = i;
+            }
+            const int64_t cnt = pic.nx * pic.ny;
+            if (at < 0 || at + cnt > n || pic.rows == nullptr) {
+                err = "the text encoder: picture " + std::to_string(runs.size() + 1) + "'s " + std::to_string(cnt) +
+                      " rows do not fit the prompt";
+                return {};
+            }
+            if (pic.index < 0)
+                for (int64_t j = 0; j < cnt; ++j)
+                    if (ids[(size_t) (at + j)] != pad) {
+                        err = "the text encoder: picture " + std::to_string(runs.size() + 1) + " has fewer "
+                              "<|image_pad|> tokens than its " + std::to_string(cnt) + " rows";
+                        return {};
+                    }
+            for (int64_t j = 0; j < cnt; ++j) rows[(size_t) (at + j)] = pic.rows + j * N;
+            runs.push_back({at, &pic});
+            i = at + cnt;
+        }
+    }
+    const bool grids = !pictures.empty() && !flat_positions_;
+    if (grids || pos_set_ > 0) {
         const int64_t cells = std::max(n, pos_set_);
         pos3.resize((size_t) cells * 3);
-        rows.assign((size_t) n, nullptr);
-        int64_t p = 0, i = 0;
-        size_t k = 0;
-        while (i < n) {
-            if (ids[(size_t) i] != pad || k >= pictures.size()) {
-                pos3[(size_t) i * 3] = pos3[(size_t) i * 3 + 1] = pos3[(size_t) i * 3 + 2] = (int32_t) p++;
-                ++i;
-                continue;
+        auto put = [&](int64_t c, int64_t t, int64_t h, int64_t w) {
+            pos3[(size_t) c * 3] = (int32_t) t;
+            pos3[(size_t) c * 3 + 1] = (int32_t) h;
+            pos3[(size_t) c * 3 + 2] = (int32_t) w;
+        };
+        if (!grids) {   // back to the identity
+            for (int64_t c = 0; c < cells; ++c) put(c, c, c, c);
+        } else {
+            int64_t p = 0, c = 0;
+            for (const Run& r : runs) {
+                for (; c < r.at; ++c, ++p) put(c, p, p, p);
+                const Picture& pic = *r.pic;
+                for (int64_t j = 0; j < pic.nx * pic.ny; ++j) put(c + j, p, p + j / pic.nx, p + j % pic.nx);
+                c += pic.nx * pic.ny;
+                p += std::max(pic.nx, pic.ny);
             }
-            const Picture& pic = pictures[k++];
-            for (int64_t j = 0; j < pic.nx * pic.ny; ++j) {
-                if (i + j >= n || ids[(size_t) (i + j)] != pad) {
-                    err = "MOSS-Image's text encoder: picture " + std::to_string(k) + " has fewer <|image_pad|> tokens "
-                          "than its " + std::to_string(pic.nx * pic.ny) + " rows";
-                    return {};
-                }
-                pos3[(size_t) (i + j) * 3] = (int32_t) p;
-                pos3[(size_t) (i + j) * 3 + 1] = (int32_t) (p + j / pic.nx);
-                pos3[(size_t) (i + j) * 3 + 2] = (int32_t) (p + j % pic.nx);
-                rows[(size_t) (i + j)] = pic.rows + j * N;
-            }
-            i += pic.nx * pic.ny;
-            p += std::max(pic.nx, pic.ny);
+            for (; c < cells; ++c, ++p) put(c, p, p, p);
         }
-        if (k != pictures.size()) {
-            err = "MOSS-Image's text encoder: more pictures than runs of <|image_pad|> tokens";
-            return {};
-        }
-        for (int64_t c = n; c < cells; ++c, ++p) pos3[(size_t) c * 3] = pos3[(size_t) c * 3 + 1] = pos3[(size_t) c * 3 + 2] = (int32_t) p;
-        if (pictures.empty())   // back to the identity
-            for (int64_t c = 0; c < cells; ++c) pos3[(size_t) c * 3] = pos3[(size_t) c * 3 + 1] = pos3[(size_t) c * 3 + 2] = (int32_t) c;
         if (!model_->set_positions(pos3.data(), cells, err)) return {};
-        pos_set_ = pictures.empty() ? 0 : n;
+        pos_set_ = grids ? n : 0;
     }
     std::vector<float> out(ids.size() * (size_t) N);
-    try {
-        if (!pictures.empty()) model_->set_embeddings(&rows);
-        const bool ok = model_->encode(ids.data(), n, out.data(), err);
+    auto done = [&] {
         model_->set_embeddings(nullptr);
+        if (deep_) {
+            gpu::stream_sync(model_->stream());
+            deep_->clear();
+        }
+    };
+    try {
+        for (const Run& r : runs) {   // the pictures' DeepStack blocks on the device for this encode
+            if (r.pic->deepstack.empty()) continue;
+            Deep::Pic dp;
+            dp.index = r.at;
+            dp.rows = r.pic->nx * r.pic->ny;
+            for (const float* d : r.pic->deepstack) {
+                float* g = nullptr;
+                if (!gpu::alloc_device(&g, (size_t) (dp.rows * N) * 4) ||
+                    !gpu::copy(g, d, (size_t) (dp.rows * N) * 4)) {
+                    gpu::free(g);
+                    throw std::runtime_error(std::string("DeepStack's rows: ") + gpu::last_error());
+                }
+                dp.blocks.push_back(g);
+            }
+            deep_->pics.push_back(std::move(dp));
+        }
+        if (!pictures.empty()) model_->set_embeddings(&rows);
+        const bool ok = model_->encode(ids.data(), n, out.data(), err, final_norm_);
+        done();
         if (!ok) return {};
     } catch (const std::exception& e) {   // a streamed block's copy failed
-        model_->set_embeddings(nullptr);
-        err = std::string("MOSS-Image's text encoder: ") + e.what();
+        done();
+        err = std::string("the text encoder: ") + e.what();
         return {};
     }
     return out;
 }
 
-int64_t MossText::hidden() const { return model_ != nullptr ? model_->spec().n_embd : 0; }
-
-bool MossText::read_states(const std::string& path, std::vector<float>& rows, int64_t& n, int64_t& width,
+bool TextEncoder::read_states(const std::string& path, std::vector<float>& rows, int64_t& n, int64_t& width,
                            std::string& err) {
     std::ifstream f(path, std::ios::binary);
     if (!f) {

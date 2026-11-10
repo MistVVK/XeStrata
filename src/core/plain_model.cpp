@@ -106,6 +106,8 @@ PlainModel::~PlainModel() {
     if (cs_ != nullptr) strata::gpu::stream_sync(cs_);
     prompt_gemm_.reset();   // the products' state before the stream
     strata::gpu::free(prompt_host_);
+    if (opt_.encoder)   // an encoder's prompt buffers are its own (encoder_buffers)
+        for (uint8_t* p : prompt_dev_.at) strata::gpu::free(p);
     for (auto* g : exec_) strata::gpu::graph_destroy(g);
     for (auto& v : segs_)
         for (auto* g : v) strata::gpu::graph_destroy(g);
@@ -732,7 +734,7 @@ bool PlainModel::rope_scalings(const ModelSpec& s, const PlainOptions& opt, k::R
 bool PlainModel::load_qwen(std::string& err) {
     const ModelSpec& s = spec_;
     if (s.arch != ModelArch::Qwen35Moe && s.arch != ModelArch::Qwen3Moe && s.arch != ModelArch::Qwen35 &&
-        s.arch != ModelArch::Plamo3) {
+        s.arch != ModelArch::Plamo3 && s.arch != ModelArch::Qwen3) {
         err = "plain model: " + s.arch_name + " is not run by this engine yet";
         return false;
     }
@@ -745,7 +747,7 @@ bool PlainModel::load_qwen(std::string& err) {
     if (!dense_) step_form_.fix(0);
     if ((opt_.encoder || opt_.stream_blocks) &&
         (!opt_.encoder || !dense_ || !opt_.split_at.empty() || opt_.split_auto)) {
-        err = "plain model: an encoder (streamed or not) is a dense model (qwen35) on one GPU";
+        err = "plain model: an encoder (streamed or not) is a dense model (qwen35, qwen3) on one GPU";
         return false;
     }
     if (plamo_ && (opt_.encoder || opt_.vision || opt_.kv_q4 != 0)) {
@@ -810,6 +812,13 @@ bool PlainModel::load_qwen(std::string& err) {
         const std::string p = "blk." + std::to_string(s.n_layer) + ".nextn.";
         model_mtp_ = opt_.spec >= 2 && q35 && s.n_nextn == 1 && m.find(p + "eh_proj.weight") != nullptr;
         has_mtp_ = model_mtp_ && last();
+    }
+    if (opt_.dry) {   // the sizes only (encoder_buffer_bytes takes nkv_ and the blocks' shapes, read above)
+        if (!opt_.encoder || !opt_.stream_blocks) {
+            err = "plain model: a dry load is a streamed encoder's";
+            return false;
+        }
+        return true;
     }
     if (has_mtp_) {
         const std::string p = "blk." + std::to_string(s.n_layer) + ".nextn.";
@@ -1006,6 +1015,20 @@ bool PlainModel::load_qwen(std::string& err) {
             if (!mine) continue;
             const size_t a = (size_t) i;
             KvPtrs p;
+            // an encoder reads the whole prompt in one chunk (encode), so a layer's attention reads only the K/V it
+            // wrote itself: every layer shares the first's cells (Qwen3-VL-8B's 36 layers of 4096 cells: 16 MiB, not
+            // 590)
+            if (opt_.encoder && i > 0 && (k_pool_[0] != nullptr || k_q_[0] != nullptr || k_q4_[0] != nullptr)) {
+                k_pool_[a] = k_pool_[0];
+                v_pool_[a] = v_pool_[0];
+                k_scale_[a] = k_scale_[0];
+                v_scale_[a] = v_scale_[0];
+                k_q_[a] = k_q_[0];
+                v_q_[a] = v_q_[0];
+                k_q4_[a] = k_q4_[0];
+                v_q4_[a] = v_q4_[0];
+                continue;
+            }
             const bool ok = alloc_kv(p, ringed(a) ? (size_t) (ring_pages_ * qs.n_head_kv * qs.page_size) : cells, grow);
             k_pool_[a] = p.k_pool;
             v_pool_[a] = p.v_pool;
@@ -1057,7 +1080,10 @@ bool PlainModel::load_qwen(std::string& err) {
             return false;
         }
         allocs_.push_back(mrope_);
-        k::mrope_table_set(mrope_);
+        // for the file's rotation and sections (Qwen3.5's 64 and 11/11/10, Qwen3-VL's 128 and 24/20/20)
+        const auto& sec = s.rope_sections;
+        k::mrope_table_set(mrope_, (int) s.rope_dims, sec.size() >= 3 ? (int) sec[1] : 11,
+                           sec.size() >= 3 ? (int) sec[2] : 11);
     }
 
     // the window's buffers
@@ -1285,6 +1311,48 @@ bool PlainModel::alloc_prompt_dev(int64_t T, uint64_t room) {
     prompt_dev_ = std::move(p);
     prompt_dev_T_ = T;
     return true;
+}
+
+bool PlainModel::encoder_buffers(int64_t T, std::string& err) {
+    if (!prompt_dev_.at.empty() && prompt_dev_T_ >= T && enc_host_T_ >= T) return true;
+    encoder_release();
+    if (enc_host_T_ < T) {   // the pinned staging for the longer chunk too
+        uint64_t db = 0, hb = 0;
+        prompt_carve(T, pb_, nullptr, nullptr, db, hb);
+        void* h = nullptr;
+        if (!strata::gpu::alloc_host(&h, hb)) {
+            err = "plain model: no pinned memory for the encoder's " + std::to_string(T) + " tokens";
+            return false;
+        }
+        strata::gpu::free(prompt_host_);
+        prompt_host_ = h;
+        enc_host_T_ = T;
+    }
+    if (!alloc_prompt_dev(T, UINT64_MAX)) {
+        err = "plain model: no VRAM for the encoder's buffers of " + std::to_string(T) + " tokens (" +
+              std::to_string(encoder_buffer_bytes(T) >> 20) + " MiB)";
+        return false;
+    }
+    uint64_t db = 0, hb = 0;
+    prompt_carve(T, pb_, nullptr, (uint8_t*) prompt_host_, db, hb);
+    opt_.prompt_chunk = T;
+    return true;
+}
+
+void PlainModel::encoder_release() {
+    if (!opt_.encoder || prompt_dev_.at.empty()) return;
+    strata::gpu::stream_sync(cs_);
+    for (uint8_t* p : prompt_dev_.at) strata::gpu::free(p);
+    prompt_dev_ = PromptPieces();
+    prompt_dev_T_ = 0;
+}
+
+uint64_t PlainModel::encoder_buffer_bytes(int64_t T) {
+    PromptPieces p;
+    PromptBufs sized = pb_;
+    uint64_t db = 0, hb = 0;
+    prompt_carve(T, sized, nullptr, nullptr, db, hb, &p);
+    return db;
 }
 
 bool PlainModel::open_experts(std::string& err) {
@@ -1625,8 +1693,11 @@ bool PlainModel::open_dense(std::string& err) {
             uint64_t db = 0, hb = 0;
             prompt_carve(T, pb_, nullptr, nullptr, db, hb);
             if (strata::gpu::alloc_host(&prompt_host_, hb)) {
-                for (uint8_t* p : prompt_dev_.at) allocs_.push_back(p);
+                // an encoder's are its own, freed between prompts (encoder_release) and made again for the next
+                if (!opt_.encoder)
+                    for (uint8_t* p : prompt_dev_.at) allocs_.push_back(p);
                 opt_.prompt_chunk = T;
+                enc_host_T_ = T;
                 prompt_carve(T, pb_, nullptr, (uint8_t*) prompt_host_, db, hb);
                 break;
             }
@@ -3094,6 +3165,7 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
 void PlainModel::steer(const Block& b, int64_t T, float* x, strata::gpu::Stream cs) const {
     const int64_t l = &b >= blocks_.data() && &b < blocks_.data() + blocks_.size() ? &b - blocks_.data() : -1;
     if (l >= 0 && k::cvec().covers(l)) k::cvec_apply(x, l, T, spec_.n_embd, nullptr, 0, nullptr, 0, false, cs);
+    if (l >= 0 && block_hook_ != nullptr && enc_out_ != nullptr) block_hook_->after(l, x, enc_row0_, T, cs);
 }
 
 bool PlainModel::replicate_cvec(std::string& err) {

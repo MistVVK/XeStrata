@@ -95,9 +95,9 @@ bool AnimaPipeline::open(const std::string& dit, const std::string& vae, const s
     dit_size_ = std::make_unique<AnimaDit>();
     dit16_size_ = std::make_unique<AnimaDit>();
     vae_size_ = std::make_unique<QiVae>();
-    te_size_ = std::make_unique<QiText>();
+    te_size_ = std::make_unique<TextEncoder>();
     if (!(dit_size_->open(dit, s_, err, true, true) && dit16_size_->open(dit, s_, err, true, false) &&
-          vae_size_->open(vae, s_, err, true) && te_size_->open(text, s_, err, true)))
+          vae_size_->open(vae, s_, err, true) && te_size_->open(text, kMaxTokens, err, UINT64_MAX, true)))
         return false;
     if (vae_size_->latent_channels() != dit_size_->latent_channels()) {
         err = "image engine: Anima's VAE is Wan 2.1's of " + std::to_string(dit_size_->latent_channels()) +
@@ -317,10 +317,10 @@ void AnimaPipeline::open_text() {
         dit_set_ = 0;
         mlp_set_ = -1;
     }
-    auto t = std::make_unique<QiText>();
+    auto t = std::make_unique<TextEncoder>();
     std::string err;
-    if (!t->open(text_path_, s_, err)) throw std::runtime_error(err);
-    t->set_final_norm(true);
+    gpu::stream_sync(s_);   // the encoder's own stream: what the engine freed on its stream first
+    if (!t->open(text_path_, kMaxTokens, err)) throw std::runtime_error(err);
     if (!t->set_loras(te_loras_, err)) throw LoraRejected(err);
     const uint64_t r = room();
     t->set_layer_budget(std::max(t->layer_min(), std::min(t->layer_bytes(), r > want ? r : t->layer_min())));
@@ -331,9 +331,11 @@ void AnimaPipeline::encode(const std::vector<int32_t>& ids, std::vector<float>& 
     if ((int64_t) ids.size() > kMaxTokens)
         throw std::invalid_argument("image engine: Anima's prompt is longer than 4096 tokens");
     open_text();
-    out = te_->encode(ids);
+    gpu::stream_sync(s_);
+    std::string err;
+    out = te_->encode(ids, err);
     te_->drop_activations();
-    if (out.empty()) throw std::runtime_error("image engine: Anima's text encoder gave no states");
+    if (out.empty()) throw std::runtime_error("image engine: Anima's text encoder: " + err);
 }
 
 void AnimaPipeline::encode_base(const QiRequest& r, const QiRef& base, LatentStart& ls) {

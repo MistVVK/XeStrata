@@ -101,7 +101,7 @@ struct Theta {
 /// or past it) else the angle computed under the rope scaling (rope_scaling.hpp), at positions[t] or pos0 + t
 struct Rope {
     static constexpr bool on = true;
-    const int32_t* mtab;
+    MRope mtab;
     const float *cos, *sin;
     int max_pos;
     int64_t half;

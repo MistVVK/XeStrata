@@ -398,7 +398,7 @@ def is_text_encoder(key: str) -> bool:
 
 
 # The models whose text encoder takes adapters (src/image/qi_text.cpp's set_loras: Qwen3-VL's and Qwen3's layers;
-# moss_text.cpp's: Qwen3.5-9B's, its GDN's projections too),
+# text_encoder.cpp's: Qwen3.5-9B's, its GDN's projections too),
 # and its weights as image_lora's lora_text_encoder_name writes a key: the prefixes off, every underscore a dot
 TEXT_ENCODER_FAMILIES = ("qwen-image", "mage-flow", "anima", "moss-image")
 _TE_NAME = re.compile(r"^layers\.\d+\.(self\.attn\.[qkvo]\.proj|mlp\.(gate|up|down)\.proj|"

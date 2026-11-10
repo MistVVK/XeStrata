@@ -22,7 +22,7 @@
 #include "strata/image/mf_vae.hpp"
 #include "strata/image/qi_image_io.hpp"
 #include "strata/image/qi_vision.hpp"
-#include "strata/image/qi_text.hpp"
+#include "strata/image/text_encoder.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -98,9 +98,9 @@ int text(const std::string& gguf, const std::string& dir, const std::string& mmp
     constexpr int32_t kImagePad = 151655;
     const int64_t kDrop = mmproj.empty() ? 34 : 64;   // the system turn: generation's, an edit's
     void* s = strata::core::Runtime::get().create_stream();
-    strata::image::QiText te;
+    strata::image::TextEncoder te;
     std::string err;
-    if (!te.open(gguf, s, err)) throw std::runtime_error(err);
+    if (!te.open(gguf, 16384, err)) throw std::runtime_error(err);
     te.set_final_norm(true);
     te.set_flat_positions(true);
     // an edit's images (as the processor took them: their sides the grid's 16-pixel patches) through the vision encoder
@@ -149,23 +149,24 @@ int text(const std::string& gguf, const std::string& dir, const std::string& mmp
     for (int64_t len : lens) {
         std::vector<int32_t> p(ids.begin() + (long) off, ids.begin() + (long) (off + len));
         off += (size_t) len;
-        std::vector<strata::image::QiText::Image> ims;   // the prompt's runs of image pads, image by image
+        std::vector<strata::image::TextEncoder::Picture> ims;   // the prompt's runs of image pads, image by image
         for (size_t i = 0, k = 0; i < p.size(); ++i) {
             if (p[i] != kImagePad || (i > 0 && p[i - 1] == kImagePad)) continue;
             if (k >= vouts.size()) throw std::runtime_error("image pads beyond the images (pass the mmproj)");
             const auto& v = vouts[k++];
-            strata::image::QiText::Image im;
+            strata::image::TextEncoder::Picture im;
             im.index = (int64_t) i;
-            im.rows = v.rows;
-            im.grid_h = v.grid_h;
-            im.grid_w = v.grid_w;
-            im.main = v.main.data();
+            im.nx = v.grid_w;
+            im.ny = v.grid_h;
+            im.rows = v.main.data();
             for (const auto& d : v.deepstack) im.deepstack.push_back(d.data());
             ims.push_back(im);
         }
-        te.encode(p, ims);   // warm
+        strata::gpu::stream_sync(s);   // the vision encoder's work first (the text encoder runs on its own stream)
+        te.encode(p, err, ims);   // warm
         const auto t0 = std::chrono::steady_clock::now();
-        const auto h = te.encode(p, ims);
+        const auto h = te.encode(p, err, ims);
+        if (h.empty()) throw std::runtime_error(err);
         std::printf("encode %lld tokens: %.1f ms\n", (long long) len, 1e3 * seconds_since(t0));
         got.insert(got.end(), h.begin() + kDrop * C, h.end());
     }

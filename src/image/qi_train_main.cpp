@@ -26,9 +26,9 @@
 // loss, prediction and gradients written back for the reference to compare.
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
-#include "strata/image/qi_text.hpp"
 #include "strata/image/qi_trainer.hpp"
 #include "strata/image/qi_vae.hpp"
+#include "strata/image/text_encoder.hpp"
 #include "strata/image/train_loop.hpp"
 
 #include <algorithm>
@@ -165,13 +165,15 @@ int prep(const std::map<std::string, std::string>& f, void* s) {
         }
     }
     if (!txts.empty()) {
-        QiText te;
-        if (!te.open(need(f, "te"), s, err)) throw std::runtime_error(err);
-        te.set_layer_budget(UINT64_MAX);
+        TextEncoder te;
+        gpu::stream_sync(s);   // the encoder's own stream: the VAE's work first
+        if (!te.open(need(f, "te"), 16384, err)) throw std::runtime_error(err);
+        te.set_final_norm(false);   // Qwen-Image's context: before the final norm
         for (const auto& w : txts) {
             const std::vector<int32_t> ids = read_all<int32_t>(w[1]);
             const int64_t drop = std::stoll(w[2]);
-            std::vector<float> st = te.encode(ids);
+            std::vector<float> st = te.encode(ids, err);
+            if (st.empty()) throw std::runtime_error(err);
             const int64_t D = te.hidden(), n = (int64_t) ids.size() - drop;
             if (D != 4096 || n <= 0) throw std::runtime_error("the text encoder's states do not fit " + w[1]);
             std::vector<float> out((size_t) (1 + n * D));

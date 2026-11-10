@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/image/moss_pipeline.hpp - MOSS-Image's text to image on the GPU: the text encoder's states (Qwen3.5-9B,
-// every token after the final norm: MossText, or the chat's engine's through the request), the DiT's flow sampling
+// every token after the final norm: TextEncoder, or the chat's engine's through the request), the DiT's flow sampling
 // from the seed's noise (MossDit), and the Flux2 VAE's image (MfVae, MOSS-Image's narrower decoder), within a VRAM
 // budget.
 //
@@ -30,7 +30,7 @@
 #include "strata/image/img_start.hpp"
 #include "strata/image/mf_vae.hpp"
 #include "strata/image/moss_dit.hpp"
-#include "strata/image/moss_text.hpp"
+#include "strata/image/text_encoder.hpp"
 #include "strata/image/pipeline.hpp"
 #include "strata/image/qi_vision.hpp"
 
@@ -90,7 +90,7 @@ private:
     bool open_text();
     void fit_text();
     void encode(const std::vector<int32_t>& ids, std::vector<float>& out,
-                const std::vector<MossText::Picture>& pictures = {});
+                const std::vector<TextEncoder::Picture>& pictures = {});
     uint64_t text_fixed() const;
     void encode_base(const QiRequest& r, const QiRef& base, LatentStart& ls);
     /// An edit's reference image through the VAE's encoder at its own size -> its latent [h w][128] (device FP32, the
@@ -117,7 +117,7 @@ private:
     std::unique_ptr<QiVision> vision_size_;
     std::vector<std::pair<int64_t, int64_t>> pictures_;   // set_pictures_given's
     std::string last_pics_, last_neg_pics_;   // the pictures the kept states were made with (refs_key)
-    std::unique_ptr<MossText> te_;
+    std::unique_ptr<TextEncoder> te_;
     std::unique_ptr<MossDit> dit_, dit_size_, dit16_size_;
     std::vector<std::vector<uint8_t>> dit_host_;   // the closed DiT's blocks in 8 bits (release(true)), for its next open
     std::unique_ptr<MfVae> vae_, vae_size_;

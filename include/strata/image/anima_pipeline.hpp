@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/image/anima_pipeline.hpp - Anima's text to image on the GPU: Qwen3-0.6B-Base's states of the prompt
-// (QiText, every token after the final norm), the LLM adapter and the DiT's flow sampling (AnimaDit), and the image
+// (TextEncoder, every token after the final norm), the LLM adapter and the DiT's flow sampling (AnimaDit), and the image
 // through Wan 2.1's VAE (QiVae), within a VRAM budget.
 //
 // The sampler is a discrete flow model's (shift 3, the timestep the sigma itself): the "simple" schedule, then er_sde
@@ -19,8 +19,8 @@
 #include "strata/image/anima_dit.hpp"
 #include "strata/image/img_start.hpp"
 #include "strata/image/pipeline.hpp"
-#include "strata/image/qi_text.hpp"
 #include "strata/image/qi_vae.hpp"
+#include "strata/image/text_encoder.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -67,7 +67,7 @@ private:
     int q8_ = -1;
     mutable int w8_faster_ = -1;
     mutable int64_t w8_rows_ = 0;
-    std::unique_ptr<QiText> te_, te_size_;
+    std::unique_ptr<TextEncoder> te_, te_size_;
     std::unique_ptr<AnimaDit> dit_, dit_size_, dit16_size_;
     std::vector<std::vector<uint8_t>> dit_host_;
     std::vector<int> block_map_;

@@ -32,7 +32,7 @@
 
 namespace strata {
 
-enum class ModelArch { Qwen4Exp, Qwen35Moe, Qwen3Moe, Glm5Next, Qwen35, Plamo3 };
+enum class ModelArch { Qwen4Exp, Qwen35Moe, Qwen3Moe, Glm5Next, Qwen35, Plamo3, Qwen3 };
 
 /// llama.cpp's `llama_expert_gating_func_type`
 enum class ExpertGating : uint32_t { None = 0, Softmax = 1, Sigmoid = 2 };
@@ -66,8 +66,8 @@ struct ModelSpec {
     double rope_base_swa = 0;
     /// True when trunk layer `l` is a sliding-window layer.
     bool layer_swa(int64_t l) const { return swa_window > 0 && l >= 0 && l < (int64_t) swa.size() && swa[(size_t) l]; }
-    /// A dense model: a SwiGLU FFN in every block and no experts (qwen35, plamo3)
-    bool dense() const { return arch == ModelArch::Qwen35 || arch == ModelArch::Plamo3; }
+    /// A dense model: a SwiGLU FFN in every block and no experts (qwen35, plamo3, qwen3)
+    bool dense() const { return arch == ModelArch::Qwen35 || arch == ModelArch::Plamo3 || arch == ModelArch::Qwen3; }
 
     // linear attention.  `recurrent` is per layer: true for a gated delta-net / KDA layer.
     std::vector<bool> recurrent;          ///< block_count entries; the MTP layers are false
@@ -156,8 +156,11 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     else if (A == "qwen3moe") s.arch = ModelArch::Qwen3Moe;
     else if (A == "glm5-next" || A == "glm5next") s.arch = ModelArch::Glm5Next;
     else if (A == "plamo3") s.arch = ModelArch::Plamo3;
+    // Qwen3 and Qwen3-VL's language part (the image models' text encoders): every layer full attention, dense
+    else if (A == "qwen3" || A == "qwen3vl") s.arch = ModelArch::Qwen3;
     else {
-        err = "architecture '" + A + "' is not supported (qwen4exp, qwen35moe, qwen35, qwen3moe, glm5-next, plamo3)";
+        err = "architecture '" + A + "' is not supported (qwen4exp, qwen35moe, qwen35, qwen3moe, glm5-next, plamo3, "
+              "qwen3, qwen3vl)";
         return false;
     }
 
@@ -263,6 +266,7 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
         break;
     case ModelArch::Qwen3Moe:
     case ModelArch::Plamo3:
+    case ModelArch::Qwen3:
         break;
     }
 
@@ -284,7 +288,7 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     s.expert_weights_scale = spec_num(g, A, "expert_weights_scale");
     spec_per_layer(g, A, "swiglu_clamp_exp", n_all, s.swiglu_clamp_exp);
     spec_per_layer(g, A, "swiglu_clamp_shexp", n_all, s.swiglu_clamp_shexp);
-    if (dense) {   // llama.cpp's qwen35 and plamo3: a SwiGLU of n_ff in every block
+    if (dense) {   // llama.cpp's qwen35, plamo3 and qwen3: a SwiGLU of n_ff in every block
         if (s.n_expert != 0 || s.n_ff <= 0) {
             err = A + ": expert_count " + std::to_string(s.n_expert) + ", feed_forward_length " + std::to_string(s.n_ff);
             return false;

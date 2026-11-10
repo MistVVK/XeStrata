@@ -444,7 +444,7 @@ bool MossPipeline::open_text() {
                                  " MiB) is too small for MOSS-Image's text encoder");
     gpu::stream_sync(s_);
     const uint64_t before = free_vram();
-    auto t = std::make_unique<MossText>();
+    auto t = std::make_unique<TextEncoder>();
     std::string err;
     if (!t->open(text_path_, kMaxTokens, err, r - text_fixed())) throw std::runtime_error(err);
     if (te_measure_ == 0) {   // the first open alone: later ones overlap the DiT's frees, which the driver reports late
@@ -489,7 +489,7 @@ void MossPipeline::fit_text() {
 }
 
 void MossPipeline::encode(const std::vector<int32_t>& ids, std::vector<float>& out,
-                          const std::vector<MossText::Picture>& pictures) {
+                          const std::vector<TextEncoder::Picture>& pictures) {
     if ((int64_t) ids.size() > kMaxTokens)
         throw std::invalid_argument("image engine: MOSS-Image's prompt is longer than 4096 tokens");
     open_text();
@@ -698,13 +698,19 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     const std::vector<float>* st[2] = {&r.te, &r.neg_te};
     // an ai-toolkit edit's pictures through the vision encoder, where a prompt with them is encoded
     std::vector<QiVisionOut> vouts;
-    std::vector<MossText::Picture> pv;
+    std::vector<TextEncoder::Picture> pv;
     auto pictures = [&](const std::vector<int32_t>& ids) {
         if (r.pictures.empty() || std::find(ids.begin(), ids.end(), image_pad_) == ids.end())
-            return std::vector<MossText::Picture>{};
+            return std::vector<TextEncoder::Picture>{};
         if (vouts.empty()) {
             vouts = encode_pictures(r.pictures);
-            for (const QiVisionOut& v : vouts) pv.push_back({v.main.data(), v.grid_w, v.grid_h});
+            for (const QiVisionOut& v : vouts) {
+                TextEncoder::Picture pic;
+                pic.rows = v.main.data();
+                pic.nx = v.grid_w;
+                pic.ny = v.grid_h;
+                pv.push_back(pic);
+            }
         }
         return pv;
     };

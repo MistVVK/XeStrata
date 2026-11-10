@@ -849,7 +849,7 @@ if(STRATA_ENABLE_XE)
                            src/image/mf_train.cpp src/image/train_ops.cpp src/image/train_adapter.cpp
                            src/image/mf_train_block.cpp src/image/qi_train_block.cpp
                            src/image/train_loop.cpp src/image/qi_trainer.cpp
-                           src/image/mf_pipeline.cpp src/image/moss_text.cpp src/image/moss_dit.cpp
+                           src/image/mf_pipeline.cpp src/image/text_encoder.cpp src/image/moss_dit.cpp
                            src/image/moss_pipeline.cpp
                            src/image/anima_dit.cpp src/image/anima_pipeline.cpp src/image/flow_sampler.cpp
                            src/image/guidance.cpp

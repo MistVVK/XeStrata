@@ -6,14 +6,14 @@
 //
 //   1. the chat engine's encode (the server's ENCODE): its last row is what the prompt's logits are made from - the
 //      BF16 head over it on the host (FP64) gives the prompt's logits to 1e-4 of their largest (the head's FP32 sums);
-//   2. MossText with every block resident: bit for bit the chat engine's encode (the same kernels in the same order);
-//   3. MossText with only the two slots, and with some blocks resident: bit for bit 2 (the blocks are copies).
+//   2. TextEncoder with every block resident: bit for bit the chat engine's encode (the same kernels in the same order);
+//   3. TextEncoder with only the two slots, and with some blocks resident: bit for bit 2 (the blocks are copies).
 //
 // STRATA_PLAIN_DENSE_MMQ=0: every dense product through the FP16 path, so that two loads do not choose between the
 // int8 and the FP16 products by their timings.
 #include "strata/core/plain_model.hpp"
 #include "strata/core/runtime.hpp"
-#include "strata/image/moss_text.hpp"
+#include "strata/image/text_encoder.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
 #include <algorithm>
@@ -239,10 +239,10 @@ int main() {
         auto same = [&](const std::vector<float>& a, const std::vector<float>& b) {
             return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size() * sizeof(float)) == 0;
         };
-        strata::image::MossText te;
+        strata::image::TextEncoder te;
         if (!te.open(path.string(), chunk, err)) throw std::runtime_error(err);
         const std::vector<float> all = te.encode(ids, err);
-        check(te.resident_layers() == kLayers && same(all, chat), "2. MossText, every block resident: the chat's encode");
+        check(te.resident_layers() == kLayers && same(all, chat), "2. TextEncoder, every block resident: the chat's encode");
         te.set_layer_budget(te.layer_min());
         const std::vector<float> slots = te.encode(ids, err);
         check(te.resident_layers() == 0 && same(slots, all), "3. two slots, every block streamed: bit for bit");

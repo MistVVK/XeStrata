@@ -91,6 +91,9 @@ struct PlainOptions {
     /// An encoder's block matrices left in the mapped file (block_spans): a BlockSource puts each block's on the device
     /// as the prompt walks the blocks (strata-image's LayerStream, within its budget)
     bool stream_blocks = false;
+    /// A streamed encoder read for its sizes only (block_spans, encoder_buffer_bytes): the blocks listed and their
+    /// norms on the device, nothing else made; such a model cannot run.
+    bool dry = false;
     /// --vram-elastic (#533; --serve, one GPU with virtual memory): the expert slots in physical segments of
     /// vram_segment_mib that `vram` gives back to the driver and maps again between requests
     bool vram_elastic = false;
@@ -376,8 +379,23 @@ public:
     /// on one GPU: an encoder (PlainOptions::encoder), or the chat's engine, whose conversation the caller saves and
     /// restores around it.  The state is reset first and left as the prompt leaves it.  False with the reason, also
     /// when the device cannot lend the prompt's buffers.
-    bool encode(const int32_t* tokens, int64_t n, float* hidden, std::string& err);
-    /// An image model's text encoder's adapters (MossText): after each of a dense model's block products in encode,
+    /// `final_norm` false: the last block's output as it is, before the final norm (Qwen-Image's text encoder).
+    bool encode(const int32_t* tokens, int64_t n, float* hidden, std::string& err, bool final_norm = true);
+    /// An image model's text encoder's additions to a block's output (Qwen3-VL's DeepStack: the vision reader's rows
+    /// added to the picture's tokens after the first layers): in encode, after block `layer`, `after` may add to the
+    /// chunk's rows x [T][n_embd] (rows row0 .. row0 + T of the prompt), queued on `stream`.  The chat's engine sets
+    /// none.
+    struct BlockHook {
+        virtual ~BlockHook() = default;
+        virtual void after(int64_t layer, float* x, int64_t row0, int64_t T, strata::gpu::Stream stream) = 0;
+    };
+    void set_block_hook(BlockHook* hook) { block_hook_ = hook; }
+    /// An encoder's prompt buffers (PlainOptions::encoder): made by encode for the prompt's length, kept for the next
+    /// prompt as long, freed here (the image engine gives their VRAM to the DiT between prompts).  The bytes they take
+    /// for a prompt of T tokens.
+    void encoder_release();
+    uint64_t encoder_buffer_bytes(int64_t T);
+    /// An image model's text encoder's adapters (TextEncoder): after each of a dense model's block products in encode,
     /// `after` adds what the adapters change from the product's FP16 input x16 to its output y (row stride ldy); while
     /// one is set the products take their FP16 inputs (not the int8 ones, which leave no FP16 copy).  The chat's
     /// engine sets none.
@@ -546,6 +564,9 @@ private:
     /// its own, as long as its tier lends the buffers for)
     float* hand_host_ = nullptr;
     float* enc_out_ = nullptr;   ///< encode's rows (host): prompt_chunks writes every row there, normed, no logits
+    bool enc_norm_ = true;       ///< encode's rows through the final norm (else the last block's output)
+    BlockHook* block_hook_ = nullptr;   ///< an encoder's additions after a block (set_block_hook)
+    int64_t enc_row0_ = 0;       ///< the chunk's first row, for block_hook_
     ProductHook* hook_ = nullptr;   ///< an encoder's adapters (set_product_hook)
     bool in_ram_ = false;              ///< the experts in pinned RAM (an arena), else read in place
     bool level_zero_ = false;
@@ -790,6 +811,9 @@ private:
     /// model's always (open_dense; none there: the prompt runs in windows).
     PromptPieces prompt_dev_;
     int64_t prompt_dev_T_ = 0;
+    int64_t enc_host_T_ = 0;   ///< an encoder's: the chunk prompt_host_ holds (encoder_buffers)
+    /// An encoder's prompt buffers for T tokens (one chunk), made again when the last were shorter or freed.
+    bool encoder_buffers(int64_t T, std::string& err);
     /// The prompt's device buffers, carved from the tier's last slots for one prompt (prompt_borrow) and given back
     /// after it (prompt_return), with the experts that were in them put back: the tier keeps that memory between
     /// prompts.  The slots go to the layers in turn (slot s is layer s % L's), so the last ones are every layer's.

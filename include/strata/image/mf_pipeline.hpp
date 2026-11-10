@@ -30,8 +30,8 @@
 #include "strata/image/mf_dit.hpp"
 #include "strata/image/mf_vae.hpp"
 #include "strata/image/pipeline.hpp"
-#include "strata/image/qi_text.hpp"
 #include "strata/image/qi_vision.hpp"
+#include "strata/image/text_encoder.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -85,14 +85,17 @@ private:
     mutable int64_t w8_rows_ = 0;
     bool keep_ = true, edit_active_ = false;
     bool base_encoder_ = false;   // the VAE's file has the encoder a base image takes (img2img, a mask)
-    std::unique_ptr<QiText> te_;
+    /// The text encoder's states of a prompt (its pictures' rows among the tokens), the engine's stream's work done
+    /// first (the encoder runs on its own); a failure throws.
+    std::vector<float> text(const std::vector<int32_t>& ids, const std::vector<TextEncoder::Picture>& pictures);
+    std::unique_ptr<TextEncoder> te_;
     std::unique_ptr<MfDit> dit_, edit_dit_;
     // the closed DiTs' blocks in 8 bits (release(true)), for their next open
     std::vector<std::vector<uint8_t>> dit_host_, edit_host_;
     std::unique_ptr<QiVision> vision_;        // the edits' vision encoder, while the budget has room for it
     std::unique_ptr<QiVision> vision_size_;
     std::unique_ptr<MfVae> vae_;
-    std::unique_ptr<QiText> te_size_;
+    std::unique_ptr<TextEncoder> te_size_;
     std::unique_ptr<MfDit> dit_size_, dit16_size_;   // the DiT's sizes as Q8_0 and as FP16
     std::unique_ptr<MfVae> vae_size_;
     uint64_t dit_set_ = 0, te_set_ = 0;

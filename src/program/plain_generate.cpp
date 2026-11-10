@@ -1106,7 +1106,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         }
         // ENCODE <ids file> <states file> (serve/images.py: MOSS-Image's text encoder, when this engine reads the GGUF
         // it names): every prompt token's state after the final norm, from position 0, into the file - int32 'STE1',
-        // the rows and their width, then the rows (MossText::read_states).  The live conversation is set aside first
+        // the rows and their width, then the rows (TextEncoder::read_states).  The live conversation is set aside first
         // and put back after, so the next request takes it up as it would have.  ENCODED <rows> <ms>, or ERR.
         if (line.rfind("ENCODE ", 0) == 0) {
             const size_t gap = line.find(' ', 7);

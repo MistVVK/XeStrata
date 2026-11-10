@@ -847,16 +847,19 @@ bool PlainModel::product_shape(int64_t layer, ProductHook::Which which, int64_t&
     return true;
 }
 
-bool PlainModel::encode(const int32_t* tokens, int64_t n, float* hidden, std::string& err) {
+bool PlainModel::encode(const int32_t* tokens, int64_t n, float* hidden, std::string& err, bool final_norm) {
     if (!dense_ || !next_.empty() || hidden == nullptr || n <= 0 || n > opt_.max_cells) {
         err = "plain model: encode takes 1 .. max_cells tokens of a dense model on one GPU";
         return false;
     }
     if (!reset(err)) return false;
+    if (opt_.encoder && !encoder_buffers(n, err)) return false;   // the prompt in one chunk (the K/V cells are shared)
     enc_out_ = hidden;
+    enc_norm_ = final_norm;
     int32_t next = 0;
     const bool ok = prompt_one(tokens, n, 0, &next, nullptr, err);
     enc_out_ = nullptr;
+    enc_norm_ = true;
     if (!ok && err.empty()) err = "plain model: the device cannot lend the prompt's buffers";
     return ok;
 }
@@ -1091,6 +1094,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
         if (!first())   // the rows handed on, into this stage's own pinned memory (and its rows out from there)
             std::memcpy(hand_host_, hand_in, (size_t) ((c_last - c_begin) * N) * 4);
         for (int64_t c0 = c_begin; c0 < c_last; c0 += P.T) {
+            enc_row0_ = c0;   // the chunk's first row (block_hook_)
             const int64_t T = std::min<int64_t>(P.T, c_last - c0), p0 = pos + c0;
             float* hand = hand_host_ != nullptr ? hand_host_ + (c0 - c_begin) * N : nullptr;
             // the staging buffers are pinned host memory the last chunk's copies read: written again only once those
@@ -1390,10 +1394,10 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 steer(b, T, P.x, cs);
                 mark(3, t_mark);
             }
-            if (enc_out_ != nullptr) {   // encode: every row through the final norm, to the host
-                k::native_qsa_rms_norm_weighted(P.x, out_norm_, P.hn, (int) N, (int) T, eps, cs);
+            if (enc_out_ != nullptr) {   // encode: every row through the final norm (or as it is), to the host
+                if (enc_norm_) k::native_qsa_rms_norm_weighted(P.x, out_norm_, P.hn, (int) N, (int) T, eps, cs);
                 if (!strata::gpu::stream_sync(cs) ||
-                    !strata::gpu::copy(enc_out_ + (c0 - c_begin) * N, P.hn, (size_t) (T * N) * 4)) {
+                    !strata::gpu::copy(enc_out_ + (c0 - c_begin) * N, enc_norm_ ? P.hn : P.x, (size_t) (T * N) * 4)) {
                     err = std::string("plain prompt: the encoder's rows: ") + strata::gpu::last_error();
                     return false;
                 }
