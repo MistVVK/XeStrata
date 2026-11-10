@@ -37,7 +37,9 @@ static uint16_t f32_to_f16(float f) {   // good enough for the values used here 
 
 int main(int argc, char** argv) {
     // --- 0. the GPU classes where `--tower auto` keeps mtmd (vit_gpu.h) ---
-    CHECK(vit_gpu_slower_nvidia(6) && !vit_gpu_slower_nvidia(5) && !vit_gpu_slower_nvidia(7) && !vit_gpu_slower_nvidia(8) && !vit_gpu_slower_nvidia(12));
+    CHECK(vit_gpu_slower_nvidia(6, 0, false) && vit_gpu_slower_nvidia(6, 1, false) && vit_gpu_slower_nvidia(6, 1, true) && vit_gpu_slower_nvidia(6, 2, true));
+    CHECK(!vit_gpu_slower_nvidia(6, 0, true));
+    CHECK(!vit_gpu_slower_nvidia(5, 2, false) && !vit_gpu_slower_nvidia(7, 0, false) && !vit_gpu_slower_nvidia(8, 6, true) && !vit_gpu_slower_nvidia(12, 0, false));
     CHECK(vit_gpu_slower_amd("gfx1151") && vit_gpu_slower_amd("gfx1151:xnack-"));
     CHECK(!vit_gpu_slower_amd("gfx1150") && !vit_gpu_slower_amd("gfx1201") && !vit_gpu_slower_amd("gfx11510") && !vit_gpu_slower_amd("gfx115") && !vit_gpu_slower_amd(""));
     const std::string tmp = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : ".") + "/strata_own_test_" + std::to_string((long) std::rand()) + ".gguf";

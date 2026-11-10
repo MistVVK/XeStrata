@@ -414,7 +414,8 @@ bool VitGpu::available(std::string& why) {
     return pick_gpu(d, why);
 }
 
-bool VitGpu::prefer_mtmd(std::string& why) {
+bool VitGpu::prefer_mtmd(bool bf16_matrices, std::string& why) {
+    (void) bf16_matrices;
     (void) why;
     return false;
 }
