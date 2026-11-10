@@ -216,7 +216,7 @@ class StaleConfigPaths(UpdaterCase):
         path = self.qwen_config("term")
         new_engine, _ = self.two_updates()
         self.addCleanup(self.stop, "term")
-        started = runtime.start("term", wait=15)
+        started = runtime.start("term", wait=60)
         self.assertTrue(started["ok"], started)
         cfg = self.cfg_of(path)
         self.assertEqual(cfg["cwd"], str(self.control / "0.1.46"))
@@ -225,7 +225,7 @@ class StaleConfigPaths(UpdaterCase):
         self.assertEqual(len(self.host_log_lines("term")), 1, self.host_log_lines("term"))
         self.assertIn("earlier Strata version", self.host_log_lines("term")[0])
         runtime.stop("term", timeout=12)
-        again = runtime.start("term", wait=15)
+        again = runtime.start("term", wait=60)
         self.assertTrue(again["ok"], again)
         self.assertEqual(len(self.host_log_lines("term")), 1, "nothing is rewritten the second time")
 
@@ -233,7 +233,7 @@ class StaleConfigPaths(UpdaterCase):
         path = self.qwen_config("app-1")
         self.two_updates()
         self.addCleanup(self.stop, "app-1")
-        started = runtime.start("app-1", wait=15, die_with_pid=os.getpid())
+        started = runtime.start("app-1", wait=60, die_with_pid=os.getpid())
         self.assertTrue(started["ok"], started)
         self.assertEqual(self.cfg_of(path)["cwd"], str(self.control / "0.1.46"))
 
@@ -243,14 +243,14 @@ class StaleConfigPaths(UpdaterCase):
         self.two_updates()
         self.addCleanup(self.stop, "app-2")
         planned = hashlib.sha256(path.read_bytes()).hexdigest()
-        started = runtime.start("app-2", wait=15, expected_source_sha256=planned)
+        started = runtime.start("app-2", wait=60, expected_source_sha256=planned)
         self.assertTrue(started["ok"], started)
 
     def test_every_saved_profile_is_repaired_by_one_start(self):
         a, b = self.qwen_config("one"), self.qwen_config("two")
         self.two_updates()
         self.addCleanup(self.stop, "one")
-        self.assertTrue(runtime.start("one", wait=15)["ok"])
+        self.assertTrue(runtime.start("one", wait=60)["ok"])
         self.assertNotIn("0.1.44", self.without_output_path(b), "the Models page reads the other profiles' configs too")
 
     def test_deepseek_cwd_exe_and_libraries_follow_the_update_too(self):

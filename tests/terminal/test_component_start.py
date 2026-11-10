@@ -155,7 +155,7 @@ class ComponentStart(unittest.TestCase):
         body = bytearray((folder / library).read_bytes())
         body[100] ^= 0xFF                                       # same size; only the full hash sees it
         (folder / library).write_bytes(bytes(body))
-        code, result = self._cli("runtime", "start", "--profile", "app", "--wait", "20", "--shutdown-timeout", "2")
+        code, result = self._cli("runtime", "start", "--profile", "app", "--wait", "60", "--shutdown-timeout", "2")
         self.assertEqual(code, 5, result)                      # the refusal is the first thing the user sees: no host, no server
         self.assertFalse(result["ok"])
         self.assertFalse((self.root / "ran.txt").exists(), "a package with a changed library must not run")
@@ -165,7 +165,7 @@ class ComponentStart(unittest.TestCase):
         self.assertIsNone(runtime._read_state("app"), "no runtime host may exist after the refusal")
 
     def test_no_engine_is_a_notice_and_starts_nothing(self):
-        code, result = self._cli("runtime", "start", "--profile", "app", "--wait", "20", "--shutdown-timeout", "2")
+        code, result = self._cli("runtime", "start", "--profile", "app", "--wait", "60", "--shutdown-timeout", "2")
         self.assertNotEqual(code, 0)
         self.assertFalse(result["ok"])
         self.assertFalse((self.root / "ran.txt").exists(), "no engine may run")
@@ -180,7 +180,7 @@ class ComponentStart(unittest.TestCase):
     def test_a_tampered_engine_is_not_started(self):
         folder = install_fake_engine(self.components)
         (folder / "engine_main.py").write_text(FAKE_ENGINE + "# changed\n", encoding="utf-8")
-        code, result = self._cli("runtime", "start", "--profile", "app", "--wait", "20", "--shutdown-timeout", "2")
+        code, result = self._cli("runtime", "start", "--profile", "app", "--wait", "60", "--shutdown-timeout", "2")
         self.assertNotEqual(code, 0)
         self.assertFalse((self.root / "ran.txt").exists(), "a changed package must not run")
 

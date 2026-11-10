@@ -237,24 +237,56 @@ class Plan(unittest.TestCase):
         self.assertIn("strata launch --family m1 --model q4reh", launch)
         self.assertIn("strata launch --family m1 --model q4reh-m1", launch)
 
-    def test_the_templates_in_phaseA_tests_have_what_the_script_fills(self):
-        d = Path(r"C:\Users\AI-Server\Desktop\Strata\phaseA-tests\qwen4\templates")
-        if not d.is_dir():
-            self.skipTest("no templates folder")
+    def test_the_repo_templates_have_what_the_script_fills(self):
+        """The templates live in the repo (packaging/templates/model-release, the default of --templates), so this runs on every box."""
+        d = M.TEMPLATES
+        self.assertEqual(d, Path(M.__file__).resolve().parents[1] / "packaging" / "templates" / "model-release")
+        self.assertTrue((d / "RELEASE-NOTES.md").is_file() and (d / "MODEL-CARD.md").is_file())
+        self.assertFalse((d / "CHECKLIST.md").exists(), "the release checklist is an internal work list and is not in the repo")
         out = Path(self.tmp.name) / "out2"
-        code, _, err = run(self.base(self.a, "--write", str(out), "--templates", str(d), "--revision", "abc", "--hf-repo", "x/y"))
+        code, _, err = run(self.base(self.a, "--write", str(out), "--revision", "abc", "--hf-repo", "x/y"))
         self.assertNotEqual(code, 0, "case A with --write needs --min-engine (078b52563)")
         self.assertIn("case A: give --min-engine", err)
         self.assertFalse(out.exists())
-        code, _, err = run(self.base(self.a, "--write", str(out), "--templates", str(d), "--revision", "abc", "--hf-repo", "x/y", "--min-engine", "0.1.58"))
+        code, _, err = run(self.base(self.a, "--write", str(out), "--revision", "abc", "--hf-repo", "x/y", "--min-engine", "0.1.58"))
         self.assertEqual(code, 0, err)
-        for name in ("RELEASE-NOTES.md", "MODEL-CARD.md", "CHECKLIST.md"):
+        self.assertIn("no template CHECKLIST.md", err)
+        for name in ("RELEASE-NOTES.md", "MODEL-CARD.md"):
             text = (out / name).read_text(encoding="utf-8")
-            self.assertRegex(text.splitlines()[0], "DRAFT|WORKING DOCUMENT")   # the checklist is a working document (not user-facing), the other two are drafts for approval
+            self.assertRegex(text.splitlines()[0], "DRAFT")                 # drafts for the owner's approval
             self.assertNotIn("{{", text, name)                          # every key the templates use is one the script fills
         notes = (out / "RELEASE-NOTES.md").read_text(encoding="utf-8")
         self.assertTrue(notes.rstrip().endswith('height="50"></a>'))      # the coffee button is last
         self.assertIn("[FILL", notes)
+        self.assertFalse((out / "CHECKLIST.md").exists())
+
+    def test_the_private_checklist_by_path_beside_the_repo_templates(self):
+        """--checklist names the internal checklist (outside the repo) and the notes and the model card still come from the repo's default folder."""
+        priv = Path(self.tmp.name) / "private"
+        priv.mkdir()
+        (priv / "my-list.md").write_text("<!-- WORKING DOCUMENT -->\n# Runbook {{model_title}} case {{case}}\n", encoding="utf-8")
+        out = Path(self.tmp.name) / "out-checklist"
+        code, _, err = run(self.base(self.a, "--write", str(out), "--checklist", str(priv / "my-list.md"), "--revision", "abc", "--min-engine", "0.1.58"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual((out / "CHECKLIST.md").read_text(encoding="utf-8"), "<!-- WORKING DOCUMENT -->\n# Runbook Qwen3.6-35B-A3B case A\n")
+        self.assertEqual((out / "RELEASE-NOTES.md").read_text(encoding="utf-8").splitlines()[0],
+                         (M.TEMPLATES / "RELEASE-NOTES.md").read_text(encoding="utf-8").splitlines()[0])      # the repo's notes
+        self.assertTrue((out / "MODEL-CARD.md").is_file())
+        self.assertNotIn("no template CHECKLIST.md", err)
+        code, _, err = run(self.base(self.a, "--write", str(Path(self.tmp.name) / "out-missing"), "--checklist", str(priv / "nope.md"), "--min-engine", "0.1.58"))
+        self.assertNotEqual(code, 0)
+        self.assertIn("--checklist: no file", err)
+
+    def test_another_templates_folder_is_still_read(self):
+        t = Path(self.tmp.name) / "tpl-other"
+        t.mkdir()
+        for name in M.TEMPLATE_NAMES:
+            (t / name).write_text("# %s {{model_title}}\n" % name, encoding="utf-8")
+        out = Path(self.tmp.name) / "out-other"
+        code, _, err = run(self.base(self.a, "--write", str(out), "--templates", str(t), "--revision", "abc", "--min-engine", "0.1.58"))
+        self.assertEqual(code, 0, err)
+        for name in M.TEMPLATE_NAMES:
+            self.assertEqual((out / name).read_text(encoding="utf-8"), "# %s Qwen3.6-35B-A3B\n" % name)
 
 
 if __name__ == "__main__":

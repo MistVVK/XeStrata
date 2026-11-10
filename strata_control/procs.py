@@ -355,6 +355,52 @@ def end_leftovers(profile: str | None = None, *, grace: float = 8.0, settle: flo
 
 # ---------------------------------------------------------------------------- engines older versions left
 
+def _short_name(path: str) -> str | None:
+    """The 8.3 name Windows gives the file at `path` (None where there is none or it cannot be read)."""
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(32768)
+        n = ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, len(buf))
+        return os.path.basename(buf.value) if 0 < n < len(buf) else None
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _name_may_be(name: str, base: str, short: str | None) -> bool:
+    """Could a process whose image name is `name` be the engine file `base`?  Loose on purpose (same_file decides): the same name in
+    any case, the file's own 8.3 name, or any 8.3-looking name (STEM~N.EXT) whose stem starts the engine's name."""
+    n = name.lower()
+    if n == base or (short is not None and n == short):
+        return True
+    stem = n.split("~", 1)[0] if "~" in n else ""
+    return bool(stem) and base.replace(" ", "").startswith(stem)
+
+
+def _engine_candidates(engine_exe: str):
+    """psutil processes (with info pid, ppid, cmdline, create_time) that could be `engine_exe`.
+
+    Windows: reading a command line costs 30-150 ms for each protected process that refuses it (svchost, lsass ...): over 250 processes
+    that was 4-9 s at every server start. So the names come first (cheap) and only a process whose image name can be the engine's
+    file is read in full; a process whose name cannot be read is read in full as before. Elsewhere every process is read, as before
+    (a Linux name is the 15-character comm and can be a link's name)."""
+    full = ["pid", "ppid", "cmdline", "create_time"]
+    if not WINDOWS:
+        yield from psutil.process_iter(full)
+        return
+    import ntpath                                       # Windows path rules (os.path there; named so the tests can run elsewhere)
+    base = ntpath.basename(str(engine_exe)).lower()
+    short = (_short_name(engine_exe) or "").lower() or None
+    for p in psutil.process_iter(["pid", "name"]):
+        name = p.info.get("name")
+        if name and not _name_may_be(name, base, short):
+            continue
+        try:
+            p.info = p.as_dict(attrs=full)
+        except (psutil.Error, OSError):
+            continue
+        yield p
+
+
 def orphans_of(engine_exe: str) -> list[Ident]:
     """Processes that are exactly this engine executable, running ``--serve``, whose parent no longer exists.
 
@@ -370,7 +416,7 @@ def orphans_of(engine_exe: str) -> list[Ident]:
     except psutil.Error:
         pass
     found = []
-    for p in psutil.process_iter(["pid", "ppid", "cmdline", "create_time"]):
+    for p in _engine_candidates(engine_exe):
         try:
             cmd = p.info.get("cmdline") or []
             if "--serve" not in cmd or p.pid in mine:

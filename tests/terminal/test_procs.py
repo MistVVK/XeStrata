@@ -151,8 +151,9 @@ class SubreaperOrphans(unittest.TestCase):
             pass
 
         def proc(pid, name, ppid=1):
-            return mock.Mock(pid=pid, **{"name.return_value": name, "exe.return_value": "/x/engine", "info": {
-                "pid": pid, "ppid": ppid, "cmdline": ["engine", "--serve"], "create_time": 100.0}})
+            info = {"pid": pid, "ppid": ppid, "cmdline": ["engine", "--serve"], "create_time": 100.0}
+            return mock.Mock(pid=pid, **{"name.return_value": name, "exe.return_value": "/x/engine", "info": info,
+                                         "as_dict.return_value": info})
 
         me = mock.Mock(**{"parents.return_value": [proc(p, n) for p, n in ancestors]})
         engine = proc(7000, "engine", ppid=5000)
@@ -215,6 +216,109 @@ class SubreaperOrphans(unittest.TestCase):
         self.assertEqual(outcome, "ended")
         self.assertTrue(said and "still waiting for process 4243" in said[0], said)
         self.assertEqual(self.slow_exit(40.0, settle=10.0)[0], "stuck")
+
+
+class WindowsOrphanScan(unittest.TestCase):
+    """orphans_of on Windows reads names first and a command line only where the name can be the engine's file: 257 processes took
+    4-9 s at every server start when every command line was read (30-150 ms for each protected process that refuses it)."""
+
+    ENGINE = r"C:\Strata\engine\strata-vision-hip.exe"
+    OTHER = r"C:\Old\engine\strata-vision-hip.exe"
+
+    def table(self):
+        e, o = self.ENGINE, self.OTHER
+        # pid: (name or an exception, exe, cmdline or an exception)
+        return {
+            101: ("strata-vision-hip.exe", e, [e, "--serve"]),        # an orphan
+            102: ("STRATA-VISION-HIP.EXE", e, [e, "--serve"]),        # upper case
+            103: ("STRATA~1.EXE", e, [e, "--serve"]),                 # started through its 8.3 path
+            104: (PermissionError, e, [e, "--serve"]),                # the name cannot be read: read in full
+            105: ("svchost.exe", r"C:\Windows\System32\svchost.exe", PermissionError),
+            106: ("lsass.exe", r"C:\Windows\System32\lsass.exe", PermissionError),
+            107: ("strata-vision-hip.exe", o, [o, "--serve"]),        # another installation's engine
+            108: ("strata-vision-hip.exe", e, [e]),                   # not serving
+            109: ("chrome.exe", r"C:\Chrome\chrome.exe", ["chrome.exe", "--serve"]),
+        }
+
+    def fake_psutil(self, table, asked):
+        class Err(Exception):
+            pass
+
+        class NoSuch(Err):
+            pass
+
+        class Denied(Err):
+            pass
+
+        def read(pid, attr):
+            name, exe, cmd = table[pid]
+            value = {"pid": pid, "ppid": 4242, "create_time": 100.0, "name": name, "cmdline": cmd}[attr]
+            if attr == "cmdline":
+                asked.append(pid)
+            if isinstance(value, type) and issubclass(value, Exception):
+                raise Denied()
+            return value
+
+        def as_dict(pid, attrs):
+            out = {}
+            for a in attrs:
+                try:
+                    out[a] = read(pid, a)
+                except Denied:
+                    out[a] = None                                    # as psutil: a refused value is None
+            return out
+
+        def proc(pid, attrs):
+            p = mock.Mock(pid=pid, info=as_dict(pid, attrs))
+            p.as_dict.side_effect = lambda attrs=None: as_dict(pid, attrs)
+            p.exe.side_effect = lambda: table[pid][1]
+            return p
+
+        def process(pid=None):
+            if pid is None:
+                return mock.Mock(**{"parents.return_value": []})
+            raise NoSuch()                                           # every parent (4242) is gone: an orphan
+
+        fake = mock.Mock(Error=Err, NoSuchProcess=NoSuch, STATUS_ZOMBIE="zombie")
+        fake.Process.side_effect = process
+        fake.process_iter.side_effect = lambda attrs: [proc(pid, attrs) for pid in table]
+        return fake
+
+    def scan(self, windows, table=None):
+        table = table or self.table()
+        asked = []
+        same = lambda a, b: bool(a) and bool(b) and a.lower() == b.lower()   # noqa: E731
+        with mock.patch.object(procs, "psutil", self.fake_psutil(table, asked)), mock.patch.object(procs, "WINDOWS", windows), \
+                mock.patch.object(procs, "same_file", side_effect=same), mock.patch.object(procs, "_short_name", return_value=None), \
+                mock.patch.object(procs, "identify", side_effect=lambda pid: ("ident", pid)):
+            found = sorted(i[1] for i in procs.orphans_of(self.ENGINE))
+        return found, asked
+
+    def test_the_same_orphans_as_reading_every_process(self):
+        new, _ = self.scan(windows=True)
+        old, _ = self.scan(windows=False)                            # the full read, as before (and as Linux and macOS still do)
+        self.assertEqual(new, old)
+        self.assertEqual(new, [101, 102, 103, 104])
+
+    def test_a_process_that_cannot_be_the_engine_is_never_asked_for_its_command_line(self):
+        _, asked = self.scan(windows=True)
+        self.assertEqual(sorted(asked), [101, 102, 103, 104, 107, 108])
+        _, asked_before = self.scan(windows=False)
+        self.assertEqual(sorted(asked_before), sorted(self.table()))
+
+    def test_the_files_own_short_name_matches(self):
+        self.assertTrue(procs._name_may_be("SVIHIP~2.EXE", "strata-vision-hip.exe", "svihip~2.exe"))
+        self.assertTrue(procs._name_may_be("STRATA~3.EXE", "strata-vision-hip.exe", None))
+        self.assertFalse(procs._name_may_be("svchost.exe", "strata-vision-hip.exe", None))
+        self.assertFalse(procs._name_may_be("OTHER~1.EXE", "strata-vision-hip.exe", None))
+
+    def test_a_hard_link_under_another_name_is_left_to_the_full_read_only_off_windows(self):
+        # The full read matches any name that is the same file (os.path.samefile); the name filter does not. Strata never links an
+        # engine under another name (setup's links are model files under their own name), so this is a hand-made case.
+        e = self.ENGINE
+        table = {201: ("my-engine.exe", e, [e, "--serve"])}
+        self.assertEqual(self.scan(windows=False, table=table)[0], [201])
+        self.assertEqual(self.scan(windows=True, table=table)[0], [])
 
 
 if __name__ == "__main__":

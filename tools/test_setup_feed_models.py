@@ -407,6 +407,10 @@ class TerminalAndApp(Base):
     def table(self, ram=64.0):
         import strata_mcp as M
         s = M.Strata(ROOT)
+        # the PC these tests describe, not the box they run on (p1006's real Arc card sent install_plan down the Intel path)
+        s._hardware = lambda: {"os": "TestOS 1", "ram_gb": ram, "cpu": {"name": "Fake CPU", "cores": 12, "avx2": True, "avx512": False},
+                               "gpus": [{"index": 0, "name": "NVIDIA GeForce RTX 5070", "vram_gb": 11.9, "arch": "120", "vendor": "nvidia",
+                                         "problem": None, "usable": True}]}
         return s, s.model_table({"ram_gb": ram, "gpus": [{"index": 0, "name": "x", "vram_gb": 12.0, "usable": True}]})
 
     def test_without_a_list_the_table_is_the_same(self):

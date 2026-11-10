@@ -1,9 +1,10 @@
 """serve/images.py - image generation (Qwen-Image-2.1-Turbo) through stable-diffusion.cpp's sd-cli.
 
-POST /v1/images/generations takes OpenAI's request shape (prompt, size, n, response_format b64_json|url) plus Strata's
-own fields seed and steps.  Each request runs one `sd-cli` process with the arguments the model's card gives for
-stable-diffusion.cpp (8 steps, CFG 1, euler, Turbo's sigmas, --diffusion-fa) and returns the PNG files that process
-wrote, unchanged: an image from the API is byte for byte the image plain sd-cli writes with the same arguments.
+POST /v1/images/generations takes OpenAI's request shape (prompt, size, n, response_format b64_json|url, background)
+plus Strata's own fields seed and steps.  Each request runs one `sd-cli` process with the arguments the model's card
+gives for stable-diffusion.cpp (8 steps, CFG 1, euler, Turbo's sigmas, --diffusion-fa).  The model writes RGBA; by
+default each picture is put on white and returned as an 8-bit RGB PNG with sd-cli's other chunks (its "parameters"
+text) unchanged (flatten_png); background "transparent" returns the PNG exactly as sd-cli wrote it.
 
 The GPU is shared with the text engine one job at a time: an image job takes the service's turn (the FIFO every chat
 request takes), so no chat turn runs on the GPU meanwhile, and the config's "gpu_policy" says what happens to the
@@ -85,7 +86,8 @@ def _int_field(req: dict, key: str, lo: int, hi: int, default):
 
 def parse_request(req: dict, cfg: dict) -> dict:
     """The fields of one /v1/images/generations request, checked.  Unknown OpenAI fields (quality, style, user,
-    background, moderation) are accepted and ignored; an output format other than PNG is refused."""
+    moderation) are accepted and ignored; an output format other than PNG is refused.  OpenAI's background:
+    "transparent" keeps the model's own alpha; "opaque", "auto" or none puts the picture on white (flatten_png)."""
     prompt = req.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ImageRequestError("prompt: a non-empty string")
@@ -99,13 +101,17 @@ def parse_request(req: dict, cfg: dict) -> dict:
     out_fmt = req.get("output_format")
     if out_fmt not in (None, "png"):
         raise ImageRequestError("output_format: only png")
+    background = req.get("background") or "auto"
+    if background not in BACKGROUNDS:
+        raise ImageRequestError("background: transparent, opaque or auto")
     w, h = parse_size(req.get("size"), int(cfg.get("max_side") or 2048))
     n = _int_field(req, "n", 1, int(cfg.get("max_n") or 4), 1)
     steps = _int_field(req, "steps", 1, 100, int(cfg.get("steps") or TURBO_STEPS))
     seed = _int_field(req, "seed", 0, 2**62, None)
     if seed is None:
         seed = random.SystemRandom().randrange(0, 2**31)
-    return {"prompt": prompt, "width": w, "height": h, "n": n, "steps": steps, "seed": seed, "response_format": fmt}
+    return {"prompt": prompt, "width": w, "height": h, "n": n, "steps": steps, "seed": seed, "response_format": fmt,
+            "background": background}
 
 
 def write_prompt(work: Path, prompt: str) -> Path:
@@ -159,6 +165,149 @@ def image_env(cfg: dict, base: dict | None = None) -> dict:
     for k, v in (cfg.get("env") or {}).items():
         env[str(k)] = str(v)
     return env
+
+
+# ------------------------------------------------------------------------------- the model's transparency
+# Qwen-Image-2.1's VAE decodes RGBA: the model leaves some backgrounds transparent, with a flat key colour (often
+# purple) under alpha 0.  By default the picture is put on white and written as an 8-bit RGB PNG; every chunk other
+# than IHDR / IDAT (sd-cli's "parameters" text above all) is copied byte for byte.  background: "transparent" keeps
+# sd-cli's PNG unchanged.
+BACKGROUNDS = ("auto", "opaque", "transparent")
+PNG_SIG = b"\x89PNG\r\n\x1a\n"
+FLATTEN_ZLIB_LEVEL = 6      # 1024x1024: 0.03 s, 1536x1024: 0.14 s to encode, the smallest file of levels 1/3/6
+
+
+def _png_chunks(data: bytes) -> list[tuple[bytes, bytes]]:
+    """[(type, the whole chunk's bytes)] of a PNG; ValueError on anything malformed."""
+    import struct
+    import zlib
+    if data[:8] != PNG_SIG:
+        raise ValueError("not a PNG")
+    out, i = [], 8
+    while i < len(data):
+        if i + 12 > len(data):
+            raise ValueError("truncated chunk")
+        n = struct.unpack(">I", data[i:i + 4])[0]
+        end = i + 12 + n
+        if end > len(data):
+            raise ValueError("truncated chunk")
+        t = data[i + 4:i + 8]
+        if struct.unpack(">I", data[end - 4:end])[0] != zlib.crc32(data[i + 4:end - 4]) & 0xFFFFFFFF:
+            raise ValueError(f"bad CRC in {t!r}")
+        out.append((t, data[i:end]))
+        i = end
+        if t == b"IEND":
+            break
+    if not out or out[0][0] != b"IHDR" or out[-1][0] != b"IEND":
+        raise ValueError("no IHDR / IEND")
+    return out
+
+
+def _rgba_pixels(data: bytes, w: int, h: int, cs):
+    """The RGBA pixels as a uint8 array [h, w, 4]: Pillow when it imports, else zlib + numpy (PNG filters undone
+    row by row; Average / Paeth rows go pixel by pixel, about 1-3 s for a large picture)."""
+    import numpy as np
+    try:
+        import io
+        from PIL import Image
+        with Image.open(io.BytesIO(data)) as im:
+            if im.mode == "RGBA":
+                a = np.asarray(im)
+                if a.shape == (h, w, 4):
+                    return a
+    except Exception:  # noqa: BLE001 - a missing or broken Pillow: the fallback below
+        pass
+    import zlib
+    raw = zlib.decompress(b"".join(c[8:-4] for t, c in cs if t == b"IDAT"))
+    stride = w * 4
+    if len(raw) != h * (1 + stride):
+        raise ValueError("IDAT size")
+    rows = np.frombuffer(raw, np.uint8).reshape(h, 1 + stride)
+    out = np.zeros((h, stride), np.uint8)
+    prev = np.zeros(stride, np.int32)
+    for y in range(h):
+        f, line = int(rows[y, 0]), rows[y, 1:].astype(np.int32)
+        if f == 0:
+            cur = line
+        elif f == 1:
+            cur = np.cumsum(line.reshape(w, 4), axis=0).reshape(-1) & 255
+        elif f == 2:
+            cur = (line + prev) & 255
+        elif f in (3, 4):
+            ln, pv = line.tolist(), prev.tolist()
+            cl = [0] * stride
+            for x in range(stride):
+                a = cl[x - 4] if x >= 4 else 0
+                b = pv[x]
+                if f == 3:
+                    cl[x] = (ln[x] + ((a + b) >> 1)) & 255
+                else:
+                    c = pv[x - 4] if x >= 4 else 0
+                    p = a + b - c
+                    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                    cl[x] = (ln[x] + (a if pa <= pb and pa <= pc else (b if pb <= pc else c))) & 255
+            cur = np.array(cl, np.int32)
+        else:
+            raise ValueError(f"PNG filter {f}")
+        out[y] = cur
+        prev = cur
+    return out.reshape(h, w, 4)
+
+
+def png_has_alpha(data: bytes) -> bool:
+    """An alpha channel by the IHDR's colour type (4 grey + alpha, 6 RGBA); False for anything unreadable."""
+    return len(data) > 25 and data[:8] == PNG_SIG and data[12:16] == b"IHDR" and data[25] in (4, 6)
+
+
+def flatten_png(data: bytes) -> bytes:
+    """An 8-bit RGBA PNG -> the same picture on white as an 8-bit RGB PNG (round(rgb * a + 255 * (1 - a)), a in
+    [0, 1]), every chunk other than IHDR / IDAT copied byte for byte.  Any other PNG comes back unchanged.
+    Raises on a malformed PNG (the caller then keeps the original)."""
+    import struct
+    import zlib
+
+    import numpy as np
+    cs = _png_chunks(data)
+    w, h, depth, ctype, comp, filt, inter = struct.unpack(">IIBBBBB", cs[0][1][8:21])
+    if ctype != 6 or depth != 8:
+        return data                                  # RGB (or anything else): nothing to flatten
+    if comp or filt or inter:
+        raise ValueError("unsupported PNG layout")
+    rgba = _rgba_pixels(data, w, h, cs)
+    a = rgba[..., 3:4].astype(np.float64) / 255.0
+    rgb = np.floor(rgba[..., :3].astype(np.float64) * a + 255.0 * (1.0 - a) + 0.5)
+    rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+    raw = np.concatenate([np.zeros((h, 1), np.uint8), rgb.reshape(h, w * 3)], axis=1).tobytes()   # filter 0 rows
+
+    def chunk(t: bytes, d: bytes) -> bytes:
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xFFFFFFFF)
+    out, idat_done = [PNG_SIG], False
+    for t, c in cs:
+        if t == b"IHDR":
+            out.append(chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)))
+        elif t == b"IDAT":
+            if not idat_done:
+                out.append(chunk(b"IDAT", zlib.compress(raw, FLATTEN_ZLIB_LEVEL)))
+                idat_done = True
+        else:
+            out.append(c)                            # tEXt "parameters", IEND, ...: byte for byte
+    return b"".join(out)
+
+
+TIMING = re.compile(r"(get_learned_condition|sampling|decode_first_stage) completed, taking ([0-9]+(?:\.[0-9]+)?) ?(ms|s)\b")
+
+
+def log_figures(log: str) -> dict:
+    """The job's stage times from sd-cli's log: text_encode_ms, sampling_s, vae_decode_s (the last of each line).
+    stable-diffusion.cpp 2988060 (the pinned commit) prints seconds for all three ("taking 0.70s"); the "N ms" form is
+    read as well."""
+    out = {}
+    for stage, num, unit in TIMING.findall(log):
+        secs = float(num) / 1000 if unit == "ms" else float(num)
+        key, val = {"get_learned_condition": ("text_encode_ms", secs * 1000), "sampling": ("sampling_s", secs),
+                    "decode_first_stage": ("vae_decode_s", secs)}[stage]
+        out[key] = round(val, 3)
+    return out
 
 
 def need_mib(cfg: dict, width: int, height: int) -> int:
@@ -300,17 +449,28 @@ class ImageGen:
         figures = {"seconds": round(secs, 2), "steps": job["steps"], "n": job["n"],
                    "size": f"{job['width']}x{job['height']}", "seed": job["seed"],
                    "backend": self.cfg.get("backend"), "quant": self.cfg.get("quant")}
-        for key, pat in (("text_encode_ms", r"get_learned_condition completed, taking ([0-9.]+) ?ms"),
-                         ("sampling_s", r"sampling completed, taking ([0-9.]+) ?s"),
-                         ("vae_decode_s", r"decode_first_stage completed, taking ([0-9.]+) ?s")):
-            m = re.findall(pat, log)
-            if m:
-                figures[key] = float(m[-1])
+        figures.update(log_figures(log))
+        if job.get("background", "auto") != "transparent":
+            t1 = time.monotonic()
+            flat = [self._flatten(png) for png in images]
+            images = [png for png, _ in flat]
+            job["alpha_kept"] = any(kept for _, kept in flat)     # a picture went out with its alpha after all
+            figures["flatten_s"] = round(time.monotonic() - t1, 3)
         self.totals["jobs"] += 1
         self.totals["images"] += job["n"]
         self.totals["seconds"] += secs
         self.last = figures
         return images, figures
+
+    def _flatten(self, png: bytes) -> tuple[bytes, bool]:
+        """flatten_png, never failing the request -> (the picture, whether it still has an alpha channel).  On any
+        error the picture goes out as sd-cli wrote it."""
+        try:
+            out = flatten_png(png)
+            return out, png_has_alpha(out)
+        except Exception as e:  # noqa: BLE001 - numpy missing, a malformed PNG, ...: the original picture
+            self._say(f"image: the picture keeps its transparency (it could not be put on white: {e})")
+            return png, png_has_alpha(png)
 
     def store(self, data: bytes) -> str:
         """Keep one PNG for response_format url -> its file name (32 random hex digits: the name is the access)."""
@@ -329,7 +489,9 @@ class ImageGen:
                 item["b64_json"] = base64.b64encode(png).decode("ascii")
             data.append(item)
         return {"created": int(time.time()), "data": data, "model": self.model,
-                "output_format": "png", "size": f"{job['width']}x{job['height']}", "strata": figures}
+                "output_format": "png", "size": f"{job['width']}x{job['height']}", "strata": figures,
+                "background": "transparent" if job.get("background") == "transparent" or job.get("alpha_kept")
+                else "opaque"}
 
     def status(self) -> dict:
         out = {"enabled": True, "model": self.model, "backend": self.cfg.get("backend"),

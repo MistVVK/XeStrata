@@ -330,7 +330,9 @@ class RecipeTests(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             journal.run_direct("local", "runtime.stop", revision, {"wait_s": 12},
                                lambda: (_ for _ in ()).throw(KeyboardInterrupt()))
-        latest = journal.list_runs("local")[0]
+        # the interrupted run is the one that is neither of the two above (list_runs orders by file time, and three runs written
+        # within one tick of a coarse Windows clock come back in any order)
+        latest = next(r for r in journal.list_runs("local") if r["operation_id"] not in (operation_id, deadline_id))
         uncertain = journal.load("local", latest["operation_id"])
         self.assertEqual(uncertain["state"], "completion_unknown")
         with self.assertRaisesRegex(profiles.ProfileError, "unsupported fields"):

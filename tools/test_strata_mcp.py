@@ -61,7 +61,7 @@ if __name__ == "__main__":
 '''
 
 FAKE_SERVER = r'''
-import json, os, signal, sys, time
+import json, os, signal, socketserver, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 a = sys.argv
@@ -114,7 +114,13 @@ class H(BaseHTTPRequestHandler):
                           "timings": {"predicted_per_second": 61.5, "prompt_per_second": 400.0}})
         else:
             self.js(404, {})
-httpd = ThreadingHTTPServer(("127.0.0.1", port), H)
+class Srv(ThreadingHTTPServer):
+    # http.server's server_bind asks socket.getfqdn("127.0.0.1") for a name nothing here uses; on GitHub's macOS runner a fresh
+    # process waited longer for that answer than the tests wait for the server
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+httpd = Srv(("127.0.0.1", port), H)
 def term(*_):
     print("[strata] stopped (fake)", flush=True)
     os._exit(0)

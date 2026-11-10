@@ -201,5 +201,5 @@ test('two live chats in one workspace keep their messages, tool cards and saved 
   await chatStore.remove(other.id);
   await store.applyChatChange(other.id, null, true);
   assert.ok(!store.useStore((s) => s.sessions).some((s) => s.id === other.id), 'a chat the other window deleted goes here too');
-  } finally { fakeHost.restore(); rmSync(hostDir, { recursive: true, force: true }); }
+  } finally { fakeHost.restore(); rmSync(hostDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); }   // a save that lands while the folder is removed (ENOTEMPTY, seen on a macOS runner): try again
 });

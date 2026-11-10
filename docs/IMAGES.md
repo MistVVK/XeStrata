@@ -78,11 +78,14 @@ quarter overlap decodes in half the time of sd.cpp's default half overlap.
 | `response_format` | `b64_json` (default) or `url` (`/v1/images/files/<random name>.png`; the server keeps the newest 64). |
 | `seed` | Strata's: a whole number for a repeatable image. Default: random; the answer says which. |
 | `steps` | Strata's: 8 (Turbo's schedule). Another count uses stable-diffusion.cpp's own schedule, which Turbo was not made for. |
+| `background` | `auto` (default) or `opaque`: the picture on white, as an 8-bit RGB PNG. `transparent`: the model's own transparency kept (an RGBA PNG). |
 
-The answer has OpenAI's shape (`created`, `data[].b64_json` or `data[].url`, `revised_prompt` = the prompt) plus
-`data[].seed` and a `strata` object with the seconds, steps and backend. The settings are the model card's for
-stable-diffusion.cpp: 8 steps, CFG 1, euler, Turbo's own sigmas, `--diffusion-fa`. An image from the API is the PNG
-that plain `sd-cli` writes with the same arguments, byte for byte.
+The answer has OpenAI's shape (`created`, `data[].b64_json` or `data[].url`, `revised_prompt` = the prompt,
+`background`) plus `data[].seed` and a `strata` object with the seconds, steps, backend and `flatten_s` (the time
+spent putting the picture on white). The settings are the model card's for stable-diffusion.cpp: 8 steps, CFG 1, euler,
+Turbo's own sigmas, `--diffusion-fa`. The model can leave parts of a picture transparent; the API puts the picture on
+white and returns an 8-bit RGB PNG, with the PNG's text chunk (prompt and settings) unchanged. With
+`"background": "transparent"` you get the PNG exactly as plain `sd-cli` writes it, transparent areas included.
 
 ## Sharing the GPU with the text model
 

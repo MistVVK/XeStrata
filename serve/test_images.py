@@ -129,6 +129,106 @@ class Command(unittest.TestCase):
                 images_api.ImageGen(image_cfg(d, gpu_policy="sometimes"))
 
 
+class LogFigures(unittest.TestCase):
+    def test_seconds_as_the_pinned_sd_cpp_prints_them(self):
+        log = ("[I] get_learned_condition completed, taking 0.70s --- image.cpp:529\n"
+               "[I] sampling completed, taking 19.27s --- image.cpp:899\n"
+               "[I] decode_first_stage completed, taking 3.40s --- image.cpp:624\n")
+        self.assertEqual(images_api.log_figures(log),
+                         {"text_encode_ms": 700.0, "sampling_s": 19.27, "vae_decode_s": 3.4})
+
+    def test_milliseconds_form(self):
+        log = "[INFO ] get_learned_condition completed, taking 12 ms\n[INFO ] sampling completed, taking 80ms\n"
+        self.assertEqual(images_api.log_figures(log), {"text_encode_ms": 12.0, "sampling_s": 0.08})
+
+    def test_the_last_line_counts_and_other_lines_are_ignored(self):
+        log = ("generating 1 latent images completed, taking 19.27s\n"
+               "[I] sampling completed, taking 1.00s\n[I] sampling completed, taking 2.50s\n")
+        self.assertEqual(images_api.log_figures(log), {"sampling_s": 2.5})
+
+
+def png_parts(data):
+    """(IHDR fields, [every chunk other than IHDR / IDAT, as bytes]) of a PNG."""
+    cs = images_api._png_chunks(data)
+    import struct
+    ihdr = struct.unpack(">IIBBBBB", cs[0][1][8:21])
+    others = [c for t, c in cs if t not in (b"IHDR", b"IDAT")]
+    return ihdr, others
+
+
+def rgb_pixels(data):
+    """RGB pixels of an 8-bit RGB filter-0 PNG (what flatten_png writes) as a list of rows of (r, g, b)."""
+    import zlib
+    cs = images_api._png_chunks(data)
+    w = int.from_bytes(cs[0][1][8:12], "big")
+    raw = zlib.decompress(b"".join(c[8:-4] for t, c in cs if t == b"IDAT"))
+    stride = 1 + 3 * w
+    rows = [raw[i:i + stride] for i in range(0, len(raw), stride)]
+    assert all(r[0] == 0 for r in rows)
+    return [[tuple(r[1 + 3 * x:4 + 3 * x]) for x in range(w)] for r in rows]
+
+
+class Transparency(unittest.TestCase):
+    """Qwen-Image-2.1 writes RGBA; flatten_png puts it on white as 8-bit RGB, other chunks byte for byte."""
+
+    def setUp(self):
+        sys.path.insert(0, str(FAKE.parent))
+        import fake_sd_cli
+        self.fake = fake_sd_cli
+        self.src = fake_sd_cli.rgba_png(512, 512, 7, "a sloth")
+        self.r, self.g, self.b = __import__("hashlib").sha256(b"7|512x512|a sloth").digest()[:3]
+
+    def expected(self, c, a):
+        return int(c * a / 255 + 255 * (1 - a / 255) + 0.5)
+
+    def check(self, out):
+        ihdr, others = png_parts(out)
+        self.assertEqual(ihdr, (4, 4, 8, 2, 0, 0, 0))                 # 8-bit RGB, no alpha
+        _, src_others = png_parts(self.src)
+        self.assertEqual(others, src_others)                         # "parameters" (and IEND) byte for byte
+        px = rgb_pixels(out)
+        self.assertEqual(px[0], [(255, 255, 255)] * 4)               # alpha 0 over the key colour: white
+        self.assertEqual(px[1], [tuple(self.expected(c, 128) for c in (self.r, self.g, self.b))] * 4)
+        self.assertEqual(px[2], [(self.r, self.g, self.b)] * 4)      # alpha 255: unchanged
+        self.assertEqual(px[3], [tuple(self.expected(c, a) for c in (self.r, self.g, self.b)) for a in (1, 64, 254, 255)])
+
+    def test_rgba_on_white(self):
+        self.check(images_api.flatten_png(self.src))
+
+    def test_without_pillow(self):
+        with mock.patch.dict(sys.modules, {"PIL": None, "PIL.Image": None}):
+            self.check(images_api.flatten_png(self.src))
+
+    def test_rgb_passes_untouched(self):
+        rgb = self.fake.png(512, 512, 7, "a sloth")
+        self.assertIs(images_api.flatten_png(rgb), rgb)
+
+    def test_broken_png_raises_and_the_job_keeps_the_original(self):
+        bad = self.fake.rgba_png(512, 512, 7, "a sloth", broken=True)
+        with self.assertRaises(ValueError):
+            images_api.flatten_png(bad)
+        with tempfile.TemporaryDirectory() as d:
+            gen = images_api.ImageGen(image_cfg(d))
+            said = []
+            gen._say = said.append
+            self.assertEqual(gen._flatten(bad), (bad, True))          # RGBA kept: the answer says transparent
+            self.assertEqual(len(said), 1)
+            self.assertIn("keeps its transparency", said[0])
+            self.assertEqual(gen._flatten(b"not a png"), (b"not a png", False))
+            self.assertEqual(gen._flatten(self.src)[1], False)
+            rgb = self.fake.png(512, 512, 7, "a sloth")
+            self.assertEqual(gen._flatten(rgb), (rgb, False))
+
+    def test_background_field(self):
+        cfg = {}
+        for v, want in ((None, "auto"), ("auto", "auto"), ("opaque", "opaque"), ("transparent", "transparent")):
+            req = {"prompt": "x"} if v is None else {"prompt": "x", "background": v}
+            self.assertEqual(images_api.parse_request(req, cfg)["background"], want)
+        for v in ("white", "TRANSPARENT", 1, True):
+            with self.assertRaises(images_api.ImageRequestError):
+                images_api.parse_request({"prompt": "x", "background": v}, cfg)
+
+
 class FakeEngine:
     """An engine with the parts the GPU turn uses: alive/unload/restart, vram (elastic) and session files."""
 
@@ -295,6 +395,8 @@ class OverHttp(unittest.TestCase):
         self.assertEqual(body["size"], "512x768")
         self.assertEqual(body["strata"]["steps"], 8)
         self.assertEqual(body["strata"]["sampling_s"], 0.08)
+        self.assertEqual(body["strata"]["text_encode_ms"], 700.0)   # was never filled: sd.cpp prints seconds
+        self.assertEqual(body["strata"]["vae_decode_s"], 0.02)
         self.assertEqual(body["strata"]["gpu_policy"], "keep")
         self.assertEqual(self.svc.images.totals["images"], 2)
         self.assertEqual([p.name for p in Path(self.svc.images.dir).iterdir()], [])   # nothing left behind
@@ -328,6 +430,34 @@ class OverHttp(unittest.TestCase):
         self.assertEqual(self.get("/v1/images/files/" + names[0])[0], 404)   # keep_files 3: the oldest went
         self.assertEqual(self.get("/v1/images/files/../../setup.py")[0], 404)
         self.assertEqual(self.get("/v1/images/files/" + "0" * 32 + ".png")[0], 404)
+
+    def test_transparency_over_http(self):
+        sys.path.insert(0, str(FAKE.parent))
+        import fake_sd_cli
+        src = fake_sd_cli.rgba_png(512, 512, 5, "a sloth")
+        with mock.patch.dict(os.environ, {"FAKE_SD_RGBA": "1"}):
+            code, body = self.post({"prompt": "a sloth", "seed": 5, "size": "512x512"})
+            self.assertEqual(code, 200, body)
+            flat = base64.b64decode(body["data"][0]["b64_json"])
+            self.assertEqual(flat, images_api.flatten_png(src))
+            self.assertEqual(png_parts(flat)[0][3], 2)                     # RGB
+            self.assertEqual(body["background"], "opaque")
+            self.assertIn("flatten_s", body["strata"])
+            code, body = self.post({"prompt": "a sloth", "seed": 5, "size": "512x512", "response_format": "url"})
+            stored = self.get(body["data"][0]["url"][len(self.base):])[1]
+            self.assertEqual(stored, flat)                                 # the stored file is the white one
+            code, body = self.post({"prompt": "a sloth", "seed": 5, "size": "512x512", "background": "transparent"})
+            self.assertEqual(base64.b64decode(body["data"][0]["b64_json"]), src)   # sd-cli's PNG, unchanged
+            self.assertEqual(body["background"], "transparent")
+            self.assertEqual(self.post({"prompt": "x", "background": "white"})[0], 400)
+        with mock.patch.dict(os.environ, {"FAKE_SD_RGBA": "1", "FAKE_SD_BROKEN": "1"}):
+            code, body = self.post({"prompt": "a sloth", "seed": 5, "size": "512x512"})
+        self.assertEqual(code, 200, body)                                   # never fails the request
+        self.assertEqual(base64.b64decode(body["data"][0]["b64_json"]),
+                         fake_sd_cli.rgba_png(512, 512, 5, "a sloth", broken=True))
+        self.assertEqual(body["background"], "transparent")              # the picture kept its alpha
+        code, body = self.post({"prompt": "a fox", "seed": 5, "size": "512x512"})   # an RGB sd-cli picture
+        self.assertEqual(body["background"], "opaque")
 
     def test_bad_request_and_failure(self):
         self.assertEqual(self.post({"prompt": "x", "size": "999x999"})[0], 400)

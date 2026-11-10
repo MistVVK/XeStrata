@@ -32,6 +32,10 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+#: The release templates (the notes and the model card; forms with {{keys}} this script fills and [FILL: ...] left for a person). A release-staff
+#: tool's data: the Terminal, Control and app packages do not carry packaging/. --templates names another folder (one that also holds CHECKLIST.md, say).
+TEMPLATES = ROOT / "packaging" / "templates" / "model-release"
+TEMPLATE_NAMES = ("RELEASE-NOTES.md", "MODEL-CARD.md", "CHECKLIST.md")
 sys.path.insert(0, str(ROOT))                         # strata_control.shape_engine (the shape names)
 
 # artifact names in a release upload folder (phaseA-tests/rel0211/PUBLISH-PLAN.md, scripts/relfinal/expect_rc1.py)
@@ -386,7 +390,10 @@ def main(argv=None) -> int:
     ap.add_argument("--ram-gb", type=float, help="the RAM the quant needs, measured (the intake's estimate is not used)")
     ap.add_argument("--no-app", action="store_true", help="case B: no app change in this release (case A has none unless --with-app)")
     ap.add_argument("--with-app", action="store_true", help="plan the app steps (Models page text, installers) too; a case-A feed model needs none")
-    ap.add_argument("--templates", type=Path, help="the folder with RELEASE-NOTES.md, MODEL-CARD.md and CHECKLIST.md (phaseA-tests/qwen4/templates)")
+    ap.add_argument("--templates", type=Path, default=TEMPLATES,
+                    help="the folder with the templates: RELEASE-NOTES.md, MODEL-CARD.md and, if there, CHECKLIST.md (default: packaging/templates/model-release)")
+    ap.add_argument("--checklist", type=Path, help="the release checklist template by path (an internal work list, not in the repo); filled as CHECKLIST.md beside the "
+                                                    "notes and the model card, and used instead of a CHECKLIST.md in --templates")
     ap.add_argument("--write", type=Path, metavar="OUTDIR", help="also write the plan, the entry and the filled templates into this new folder")
     ap.add_argument("--json", action="store_true", help="print the plan as JSON")
     ap.add_argument("--execute", action="store_true")
@@ -394,6 +401,8 @@ def main(argv=None) -> int:
     if a.execute:
         print("REFUSED: make_model_release.py is a dry run. It signs, builds and uploads nothing; the steps that need the release key are printed for the owner.")
         return 2
+    if a.checklist is not None and not a.checklist.is_file():
+        raise SystemExit("--checklist: no file %s" % a.checklist)
     report = json.loads(a.intake.read_text(encoding="utf-8"))
     if not 0 <= a.set < len(report["sets"]):
         raise SystemExit("the report has %d set(s)" % len(report["sets"]))
@@ -427,12 +436,14 @@ def main(argv=None) -> int:
         (a.write / "models" / ("%s.model.json" % a.id)).write_text(json.dumps(p["entry"], indent=1), encoding="utf-8")
         (a.write / "models" / ("%s.entry.json" % a.id)).write_text(json.dumps(feed_entry(s, a), indent=1) + "\n", encoding="utf-8")
         vals = template_values(s, p, a)
-        for name in ("RELEASE-NOTES.md", "MODEL-CARD.md", "CHECKLIST.md"):
+        for name in TEMPLATE_NAMES:
             t = a.templates / name if a.templates else None
+            if name == "CHECKLIST.md" and a.checklist is not None:
+                t = a.checklist
             if t is not None and t.is_file():
                 (a.write / name).write_text(fill(t.read_text(encoding="utf-8"), vals), encoding="utf-8")
             else:
-                print("note: no template %s (give --templates)" % name, file=sys.stderr)
+                print("note: no template %s in %s (give --templates)" % (name, a.templates), file=sys.stderr)
         print("written to %s" % a.write, file=sys.stderr)
     return 0
 

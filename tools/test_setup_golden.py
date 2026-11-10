@@ -142,7 +142,11 @@ def install(ram, found, argv, answers=None, extra=(), avx512=False, configs=()):
                     code = setup.main()
                 except SystemExit as e:
                     code = e.code
-        written = sorted(t.glob("strata-*.json"), key=lambda p: p.stat().st_mtime)
+        # the config this run wrote: a new file or one whose bytes changed, not just the newest time (a fast run on a coarse clock, GitHub's
+        # Windows runner, wrote strata-iq3_s.json in the same tick as the strata-iq3_xxs.json put here before it, and the name order won)
+        before = {name: json.dumps(c) for name, c in configs}
+        changed = [p for p in t.glob("strata-*.json") if before.get(p.name) != p.read_text(encoding="utf-8")]
+        written = sorted(changed or t.glob("strata-*.json"), key=lambda p: p.stat().st_mtime_ns)
         cfg = None
         if written and code == 0:
             cfg = normalize(json.loads(written[-1].read_text(encoding="utf-8")), t)
