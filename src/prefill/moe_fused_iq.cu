@@ -2048,6 +2048,20 @@ int pick_ww(int64_t n, int n_expert) {
                               (long long) n, n_expert, avg, ww);
         return ww;
     }
+    // sm_120 with 80 SMs and up (the cards that take these kernels by default: RTX 5080 / 5090, PRO 5000 / 6000): 128 rows from 159.9 rows an
+    // expert on: a prompt of 8,192 tokens routes 8,191 positions = 81,910 routed rows at top 10 = 159.98 rows an expert over 512 experts, the
+    // measured case (the first measured point at or above 1.000 on every pair below), so the bound sits just under 160.  REAL routing (the replay of a UD-IQ4_XS and a UD-Q4_K_XL prompt's expert
+    // ids through tests/cuda/prefill_fused_iq_test, one layer, 64-row time / 128-row time at 8192 / 12000 / 16000 / 20000 tokens): PRO 6000
+    // IQ3_S/IQ4_NL 1.068 / 1.129 / 1.140 / 1.172, IQ4_XS/IQ4_NL 1.026 / 1.078 / 1.091 / 1.120, Q4_K/Q5_1 1.001 / 1.089 / 1.117 / 1.119; PRO 5000
+    // IQ3_S/IQ4_NL 1.101 / 1.152 / 1.181 / 1.204, IQ4_XS/IQ4_NL 1.080 / 1.126 / 1.156 / 1.176.  Below 160 rows the answer depends on the card
+    // (the PRO 6000 loses 3-7% at 80 rows), so the band above is left as it was.  The 5070 (48 SMs) is not in this branch: its uniform-routing
+    // numbers above are against 128 rows at 8192 tokens and it has no real-routing row yet.  Same output bits either way (the tile only
+    // groups routed rows).  STRATA_PF_TILE_DEBUG=1 prints the choice of every launch.
+    if (dev_info().s120 && dev_info().sms >= 80 && avg >= 159.9) {
+        static const bool dbg = [] { const char* v = std::getenv("STRATA_PF_TILE_DEBUG"); return v != nullptr && v[0] == '1'; }();
+        if (dbg) std::fprintf(stderr, "strata: fused tile: rows %lld experts %d avg %.1f s120 yes -> ww 2\n", (long long) n, n_expert, avg);
+        return 2;
+    }
     return avg > 56.0 && avg <= 112.0 ? 2 : 4;
 }
 
