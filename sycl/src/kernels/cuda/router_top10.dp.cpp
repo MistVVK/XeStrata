@@ -63,6 +63,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <utility>
+#include <vector>
 
 namespace strata::kernels {
 namespace {
@@ -427,6 +430,139 @@ runtimes. You may need to adjust the code.
 }
 
 
+/// THE SAME ROUTER IN FP32, FOR A CARD WITHOUT FP64 (Intel Arc A- and B-series: the runtime refuses a kernel that uses
+/// double there, "'double' is not supported in ... device").  The Flash-Next shapes (512 or 256 experts, top-10) take
+/// the native router and never come here; a model of another shape (Qwen4 day: top-8, 256 experts) does, and on an
+/// Arc the double kernel above ended the engine at its first routed token.  This kernel is the one above with every
+/// double made a float: the exponentials in fp32 of the same differences, the ascending serial sum with a Kahan
+/// compensation (so the total is as close to the double one as fp32 allows), the same p = e * inv, the same
+/// selection passes (stable descending, ties by index), and the renormalisation with the same 2**-14 clamp.  A card
+/// WITH fp64 keeps the double kernels, bit for bit.
+__dpct_inline__ void router_top10_f32_kernel(const float *__restrict__ logits, int n_tokens, int n_expert, int k,
+                                             int *__restrict__ ids, float *__restrict__ weights, uint8_t *dpct_local) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    auto s_raw = (unsigned char *) dpct_local;
+    const size_t taken_bytes = ((size_t) n_expert + 15u) & ~(size_t) 15u;
+    unsigned char* s_taken = s_raw;
+    float* s_ex = (float*) (s_raw + taken_bytes);
+    float* s_p = s_ex + n_expert;
+    auto &s_red = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[RT_MAX_THREADS / 32]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_rid = *sycl::ext::oneapi::group_local_memory_for_overwrite<int[RT_MAX_THREADS / 32]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &s_sum = *sycl::ext::oneapi::group_local_memory_for_overwrite<float>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_group(2);
+    if (t >= n_tokens) return;
+    const int tid = item_ct1.get_local_id(2);
+    const int nt = item_ct1.get_local_range(2);
+    const int nw = (nt + 31) >> 5;
+    const float* l = logits + (size_t) t * n_expert;
+    // the max: exact and order-independent, as above
+    float mx = -INFINITY;
+    for (int e = tid; e < n_expert; e += nt) mx = sycl::fmax(mx, l[e]);
+    for (int off = 16; off > 0; off >>= 1) mx = sycl::fmax(mx, sycl::shift_group_left(sg, mx, off));
+    if ((tid & 31) == 0) s_red[tid >> 5] = mx;
+    item_ct1.barrier();
+    if (tid < 32) {
+        float v = (tid < nw) ? s_red[tid] : -INFINITY;
+        for (int off = 16; off > 0; off >>= 1) v = sycl::fmax(v, sycl::shift_group_left(sg, v, off));
+        if (tid == 0) s_red[0] = v;
+    }
+    item_ct1.barrier();
+    mx = s_red[0];
+    for (int e = tid; e < n_expert; e += nt) s_ex[e] = sycl::exp(l[e] - mx);
+    item_ct1.barrier();
+    // the sum, ascending, on one thread (as above), compensated
+    if (tid == 0) {
+        float sum = 0.0f, c = 0.0f;
+        for (int e = 0; e < n_expert; ++e) {
+            const float y = s_ex[e] - c;
+            const float u = sum + y;
+            c = (u - sum) - y;
+            sum = u;
+        }
+        s_sum = sum;
+    }
+    item_ct1.barrier();
+    const float inv = 1.0f / s_sum;
+    for (int e = tid; e < n_expert; e += nt) { s_p[e] = s_ex[e] * inv; s_taken[e] = 0; }
+    item_ct1.barrier();
+    for (int i = 0; i < k; ++i) {
+        float bv = -INFINITY;
+        int bi = n_expert;               // a sentinel that loses to every real index
+        for (int e = tid; e < n_expert; e += nt) {
+            if (s_taken[e]) continue;
+            const float pe = s_p[e];
+            if (pe > bv) { bv = pe; bi = e; }
+        }
+        for (int off = 16; off > 0; off >>= 1) {
+            const float ov = sycl::shift_group_left(sg, bv, off);
+            const int oi = sycl::shift_group_left(sg, bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if ((tid & 31) == 0) { s_red[tid >> 5] = bv; s_rid[tid >> 5] = bi; }
+        item_ct1.barrier();
+        if (tid < 32) {
+            float v = (tid < nw) ? s_red[tid] : -INFINITY;
+            int ix = (tid < nw) ? s_rid[tid] : n_expert;
+            for (int off = 16; off > 0; off >>= 1) {
+                const float ov = sycl::shift_group_left(sg, v, off);
+                const int oi = sycl::shift_group_left(sg, ix, off);
+                if (ov > v || (ov == v && oi < ix)) { v = ov; ix = oi; }
+            }
+            if (tid == 0 && ix < n_expert) {
+                ids[(size_t) t * k + i] = ix;
+                weights[(size_t) t * k + i] = v;
+                s_taken[ix] = 1;
+            }
+        }
+        item_ct1.barrier();
+    }
+    item_ct1.barrier();
+    if (tid == 0) {                      // renormalise with ggml's lower clamp, compensated
+        float s = 0.0f, c = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            const float y = weights[(size_t) t * k + i] - c;
+            const float u = s + y;
+            c = (u - s) - y;
+            s = u;
+        }
+        const float sc = sycl::fmax(s, 6.103515625e-05f);   // 2**-14
+        for (int i = 0; i < k; ++i) weights[(size_t) t * k + i] = weights[(size_t) t * k + i] / sc;
+    }
+}
+
+/// The fp32 router's launch (router_top10_f32_kernel); `variant` 3 of router_top10_variant runs it on any card (the parity test).
+void launch_sycl_f32(sycl::queue& q, const float* logits, int n_tokens, int n_expert, int k, int* ids, float* weights) {
+    const int threads = (std::min(n_expert, RT_MAX_THREADS) + 31) & ~31;
+    const size_t taken_bytes = ((size_t) n_expert + 15u) & ~(size_t) 15u;
+    const size_t smem = taken_bytes + (size_t) n_expert * 2 * sizeof(float);
+    strata::kprof::kp(&q, __FILE__, __func__, __LINE__)->submit([&](sycl::handler& h) {
+        sycl::local_accessor<uint8_t, 1> local(sycl::range<1>(smem), h);
+        h.parallel_for<class router_top10_f32_q4ready>(
+            sycl::nd_range<3>(sycl::range<3>(1, 1, (size_t) n_tokens * threads), sycl::range<3>(1, 1, threads)),
+            [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                router_top10_f32_kernel(logits, n_tokens, n_expert, k, ids, weights,
+                                        local.get_multi_ptr<sycl::access::decorated::no>().get());
+            });
+    });
+}
+
+/// Does this queue's device run fp64 kernels? (Asked once per device; Intel Arc A- and B-series do not.)
+bool device_has_fp64(sycl::queue& q) {
+    static std::mutex mu;
+    static std::vector<std::pair<sycl::device, bool>> seen;
+    const sycl::device d = q.get_device();
+    std::lock_guard<std::mutex> lock(mu);
+    for (const auto& [dev, has] : seen)
+        if (dev == d) return has;
+    const bool has = d.has(sycl::aspect::fp64);
+    seen.emplace_back(d, has);
+    return has;
+}
+
 #if defined(STRATA_HIP_GFX906)
 // AMD (wave64): the same routing in ONE wavefront per token.  The block-wide kernel above spends its time in
 // barriers - 10 selection passes with two __syncthreads each over 8 logical warps - not in arithmetic (43 us per
@@ -653,10 +789,11 @@ bool router_top10_variant(const float* logits, int n_tokens, int n_expert, int k
     launch_generic(logits, n_tokens, n_expert, k, ids, weights, stream, variant);
     return cudaGetLastError() == cudaSuccess;
 #else
-    if (n_tokens <= 0 || n_expert <= 64 || n_expert > 512 || k <= 0 || k > 32 || variant < 0 || variant > 2)
+    if (n_tokens <= 0 || n_expert <= 64 || n_expert > 512 || k <= 0 || k > 32 || variant < 0 || variant > 3)
         return false;
     auto& q = *strata::q_of(stream);
-    if (variant == 1) launch_sycl_fast<false>(q, logits, n_tokens, n_expert, k, ids, weights);
+    if (variant == 3) launch_sycl_f32(q, logits, n_tokens, n_expert, k, ids, weights);
+    else if (variant == 1) launch_sycl_fast<false>(q, logits, n_tokens, n_expert, k, ids, weights);
     else if (variant == 2) launch_sycl_fast<true>(q, logits, n_tokens, n_expert, k, ids, weights);
     else {
         const int threads = (std::min(n_expert, RT_MAX_THREADS) + 31) & ~31;
@@ -679,6 +816,15 @@ bool router_top10_variant(const float* logits, int n_tokens, int n_expert, int k
 
 void router_top10(const float *logits, int n_tokens, int n_expert, int k,
                   int *ids, float *weights, void *stream) try {
+#if !defined(__HIPCC__)
+    // a card without fp64 (Intel Arc): the fp32 router; the double kernels below are refused at their launch there
+    if (n_tokens > 0 && n_expert > 0 && n_expert <= RT_MAX_THREADS * 64 && k > 0 && k <= 64 && !device_has_fp64(*strata::q_of(stream))) {
+        auto& q = *strata::q_of(stream);
+        launch_sycl_f32(q, logits, n_tokens, n_expert, k, ids, weights);
+        if (stream == nullptr) q.wait_and_throw();
+        return;
+    }
+#endif
     if (strata::a770_fast() && n_tokens > 0 && n_expert > 64 && n_expert <= 512 && k > 0 && k <= 32) {
         auto& q = *strata::q_of(stream);
         launch_sycl_fast<false>(q, logits, n_tokens, n_expert, k, ids, weights);

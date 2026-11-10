@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { localeTag, tr } from '../lib/i18n';
 import { useNative } from '../lib/native';
-import { changeInstalledEngine, engineMake, engineSize, modelsNeedingNewer, useEngineList, type InstalledEngine } from '../lib/engines';
+import { changeInstalledEngine, engineGroupTitle, engineMake, engineSize, modelsNeedingNewer, useEngineList, type InstalledEngine } from '../lib/engines';
 import { ApiError } from '../lib/client';
 import { Btn, Dialog, ErrorNotice, Icon } from './ui';
 
@@ -68,6 +68,7 @@ export function SettingsEngine() {
   }
 
   const needNewer = use ? modelsNeedingNewer(native, use) : [];
+  const useGroup = use ? groups.find(g => g.family === use.family) : undefined;
   return <div className="stack stack--lg native-engine-settings">
     <section className="st-card engine-list">
       <div className="section-toolbar"><h2 className="h3">{tr("Installed engines")}</h2></div>
@@ -76,7 +77,7 @@ export function SettingsEngine() {
       {failed ? <p className="small inline-error" role="alert">{tr("The installed engines couldn't be read. Try again in a moment.")}</p> : null}
       {list?.available && count === 0 ? <p className="small muted">{tr("No engine is installed on this computer yet. Update in About downloads the right one.")}</p> : null}
       {groups.map(group => <div key={group.family} className="engine-group">
-        {groups.length > 1 ? <h3 className="engine-group__title">{tr(group.title)}</h3> : null}
+        {groups.length > 1 ? <h3 className="engine-group__title">{group.title ? tr(group.title) : engineGroupTitle(group, native?.catalog?.families)}</h3> : null}
         {group.engines.map(row)}
       </div>)}
       {count > 0 ? <p className="small muted engine-total">{tr("Engines take {0} on this computer.", [engineSize(list?.total_bytes ?? 0, localeTag())])}</p> : null}
@@ -87,7 +88,8 @@ export function SettingsEngine() {
 
     <Dialog open={!!use} compact title={tr("Use engine {0}?", [use?.version ?? ''])} onClose={() => { if (!pending) setUse(null); }}
       actions={<><Btn disabled={pending} onClick={() => setUse(null)}>{tr("Cancel")}</Btn><Btn variant="primary" disabled={pending || running} onClick={() => use && void run('use', use)}>{pending ? tr("Working…") : tr("Use engine {0}", [use?.version ?? ''])}</Btn></>}>
-      <p>{tr("Models you start from now on run on engine {0}. Your models and settings stay as they are. You can switch back at any time.", [use?.version ?? ''])}</p>
+      {/* a Qwen4 model shape's engine runs only that model (owner 11-09): its own sentence, named like the group's heading */}
+      <p>{useGroup?.family.startsWith('shape:') ? tr("{0} runs on engine {1} from its next start. Your models and settings stay as they are. You can switch back at any time.", [engineGroupTitle(useGroup, native?.catalog?.families), use?.version ?? '']) : tr("Models you start from now on run on engine {0}. Your models and settings stay as they are. You can switch back at any time.", [use?.version ?? ''])}</p>
       {needNewer.length ? <p className="small muted">{tr("These models need a newer engine and may not start on it: {0}.", [needNewer.join(', ')])}</p> : null}
       {running ? <p className="small muted" role="status">{tr("A model is running. Unload it in Models first, then switch.")}</p> : null}
     </Dialog>

@@ -529,6 +529,8 @@ def config_for(inp: SetupInputs, lib) -> SetupConfig:
         if a.mtp == "off":
             cfg["mtp"] = False
             removed = draft_layer.apply(cfg)
+            if getattr(a, "feed_no_drafter", False):
+                cfg["drafting"] = "off"                # a feed model with no draft layer (its entry says drafter: none): no drafter at any start, Auto or not
             ok("the draft layer (MTP) is off for this model" + (f" ({' '.join(removed)} left out)" if removed else "") +
                ": less graphics memory and RAM, slower words per second. `--mtp on` turns it back on")
         else:

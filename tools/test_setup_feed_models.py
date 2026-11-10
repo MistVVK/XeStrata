@@ -63,6 +63,11 @@ def own_path(**kw):
     return m
 
 
+# setup.main() on a Mac runs the Metal installer (metal/setup_mac.py): the command-line tests below are about the PC flow, so on macOS
+# they run it as on Linux (on Linux and Windows this is the platform they already have)
+LINUX_PC = "linux" if sys.platform == "darwin" else sys.platform
+
+
 def fresh_setup(name="setup_under_test"):
     """setup.py loaded again under its own name, so a test's registrations never reach another test."""
     spec = importlib.util.spec_from_file_location(name, ROOT / "setup.py")
@@ -364,6 +369,7 @@ class RefusalsAndOffline(Base):
         feed = self.signed_feed("f", 1, [own_path()])
         argv = ["setup.py", "--family", "qwen35-test", "--feed", feed, "--yes"]
         with mock.patch.object(sys, "argv", argv), mock.patch.object(self.setup, "feed_engine_families", lambda: {"qwen4exp"}), \
+                mock.patch.object(self.setup.sys, "platform", LINUX_PC), \
                 contextlib.redirect_stdout(io.StringIO()) as out, self.assertRaises(SystemExit) as stop:
             self.setup.main()
         self.assertNotEqual(stop.exception.code, 0)
@@ -373,6 +379,7 @@ class RefusalsAndOffline(Base):
         feed = self.signed_feed("f", 1, [own_path()])
         argv = ["setup.py", "--family", "qwen35-test", "--model", "UD-Q4", "--feed", feed, "--check"]
         with mock.patch.object(sys, "argv", argv), mock.patch.object(self.setup, "feed_engine_families", lambda: {"qwen4exp", "qwen35moe"}), \
+                mock.patch.object(self.setup.sys, "platform", LINUX_PC), \
                 mock.patch.object(self.setup, "gather_hardware", side_effect=SystemExit(77), create=True), contextlib.redirect_stdout(io.StringIO()):
             try:
                 self.setup.main()

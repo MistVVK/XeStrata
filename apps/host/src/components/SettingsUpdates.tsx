@@ -4,10 +4,10 @@ import { useEffect, useRef, useState } from 'react';
 import { Btn, Dialog, Icon } from './ui';
 import { useStore } from '../lib/store';
 import type { SoftwareUpdate, UpdateCheckResult } from '../lib/types';
-import { nativeAction, useNative } from '../lib/native';
+import { nativeAction, useNative, type NativeJob } from '../lib/native';
 import { NativeProgress } from './NativeModels';
 import { EngineUpdateDialog } from './EngineUpdateDialog';
-import { jobErrorText } from '../lib/native-job-diagnostics';
+import { currentUpdateFailure, jobErrorText, updateFinishedAfter } from '../lib/native-job-diagnostics';
 import { appVersionLabel } from '../lib/app-version';
 import { fetchUpdateCheck, publishUpdateCheck, useInstalledVersions, useLastUpdateCheck } from '../lib/update-check';
 import { shownEngineVersion } from '../lib/engine-version';
@@ -32,6 +32,9 @@ export function SettingsUpdates() {
     useEffect(() => () => request.current?.abort(), []);
     const active = native?.jobs.find(j => j.state === 'running');
     const result = checking || error ? null : (fresh ?? last);
+    // An update that finished after the check shown makes it out of date: check again, once per update (lane 3 finding 6, 11-09).
+    const finished = updateFinishedAfter(native?.jobs ?? [], result?.checkedAt), rechecked = useRef('');
+    useEffect(() => { if (finished && !checking && rechecked.current !== finished) { rechecked.current = finished; void check(); } }, [finished, checking]);
     // Update engine with a model loaded: its own dialog (warns naming the model, stops it with the person's yes, offers to start it again).
     const withModel = (native?.instances.length ?? 0) > 0 && !!native?.capabilities.componentUpdates;
     async function operate(kind: string) {
@@ -82,7 +85,7 @@ export function SettingsUpdates() {
       <div className="settings-update-actions"><Btn size="sm" icon="refresh" disabled={checking} className={checking ? 'settings-update-checking' : undefined} onClick={() => void check()}>{tr(checking ? 'Checking…' : error || result?.strata.status === 'error' ? 'Try again' : result ? 'Check again' : 'Check for updates')}</Btn></div>
       <div className="settings-update-inline" role="status" aria-live="polite">{tr(checking ? 'Checking for new versions…' : error ? <span className="inline-error">{tr(error)}</span> : result ? <><span className="sr-only">{tr(result.strata.message)} {tr(result.engine.message)} </span>{tr("Checked at ")}{tr(checkedLabel(result.checkedAt))}</> : null)}</div>
     </div>
-    {tr(active ? <NativeProgress job={active}/> : null)}{tr(native?.jobs.filter(j => j.state === 'error' && ['update-strata', 'update-engine'].includes(j.kind)).slice(-1).map(j => <p role="alert" key={j.id} className="small inline-error">{tr(jobErrorText(j, native.jobs))}</p>))}
+    {tr(active ? <NativeProgress job={active}/> : null)}{tr([currentUpdateFailure(native?.jobs ?? [])].filter((j): j is NativeJob => !!j).map(j => <p role="alert" key={j.id} className="small inline-error">{tr(jobErrorText(j, native?.jobs ?? []))}</p>))}
     <EngineUpdateDialog open={confirm === 'update-engine' && withModel} onClose={() => setConfirm('')}/>
     <Dialog open={!!confirm && !(confirm === 'update-engine' && withModel)} compact title={tr(confirm === 'update-strata' ? 'Update Strata?' : 'Update engine?')} onClose={() => setConfirm('')} actions={<><Btn onClick={() => setConfirm('')}>{tr("Cancel")}</Btn><Btn variant="primary" disabled={!!active || (native?.instances.length ?? 0) > 0} onClick={() => void operate(confirm)}>{tr("Update")}</Btn></>}><p>{tr("The native installer updates the installation. Model files and settings are kept. Unload native models before updating.")}</p>{tr((native?.instances.length ?? 0) > 0 ? <p className="small muted">{tr("Open Models and unload the running native models first.")}</p> : null)}</Dialog>
   </>;

@@ -1,7 +1,7 @@
 import { tr } from '../lib/i18n';
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { measureScale } from '../lib/overlay-place';
+import { measureFrame } from '../lib/overlay-place';
 export function VersionMemoryTooltip({ id, anchor, text, onClose, onEnter, onLeave }: {
     id: string;
     anchor: HTMLElement;
@@ -13,11 +13,11 @@ export function VersionMemoryTooltip({ id, anchor, text, onClose, onEnter, onLea
     const ref = useRef<HTMLDivElement>(null);
     const [position, setPosition] = useState({ left: 12, top: 12 });
     useLayoutEffect(() => {
-        const scale = measureScale();
-        const rect = anchor.getBoundingClientRect(), width = Math.min(260 * scale, window.innerWidth - 24);
+        const { scale, viewport } = measureFrame();
+        const rect = anchor.getBoundingClientRect(), width = Math.min(260 * scale, viewport.width - 24);
         const height = ref.current?.getBoundingClientRect().height ?? 80 * scale;
-        const left = Math.max(12, Math.min(rect.right - width, window.innerWidth - width - 12));
-        const top = rect.bottom + height + 20 <= window.innerHeight ? rect.bottom + 8 : Math.max(12, rect.top - height - 8);
+        const left = Math.max(12, Math.min(rect.right - width, viewport.width - width - 12));
+        const top = rect.bottom + height + 20 <= viewport.height ? rect.bottom + 8 : Math.max(12, rect.top - height - 8);
         setPosition({ left: left / scale, top: top / scale });
     }, [anchor, text]);
     useEffect(() => {

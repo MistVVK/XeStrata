@@ -212,7 +212,9 @@ class CatalogRules(unittest.TestCase):
 
 class PresetStore(unittest.TestCase):
     def test_save_load_list_delete(self):
-        with Home():
+        # Windows' clock moves in ~15.6 ms ticks: on a fast PC (a CI runner) the save and touch_used can read the same time, a tie in the order
+        ticks = iter(f"2026-01-01 00:00:{s:02d}.000000" for s in range(60))
+        with Home(), mock.patch.object(store, "now_text", lambda: next(ticks)):
             s = S.LaunchSettings(name="IQ3_XXS 128K", family="qwen", model="IQ3_XXS", context=131072, api_key="sk-secret")
             store.save(s)
             store.save(S.LaunchSettings(name="Coder 64K", family="coder", model="IQ1_M", context=65536))

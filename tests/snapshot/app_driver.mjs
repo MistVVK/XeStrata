@@ -96,7 +96,9 @@ try {
   native.state();
   for (let i = 0; i < 100 && !probe; i++) await new Promise(r => setTimeout(r, 20));    // the host asks once, at its first state; the Load must start after the answer
   if (probe) { await probe.catch(() => {}); await new Promise(r => setTimeout(r, 100)); }
-  const args = which === 'models' ? { model: tag, values: { drafting: 'auto' } } : { model: tag };
+  // STRATA_SNAPSHOT_APP_ARGS (JSON): more of what the Models screen passes (resourceProfile, vision), for the tests that need it; the golden runs leave it unset
+  const extra = process.env.STRATA_SNAPSHOT_APP_ARGS ? JSON.parse(process.env.STRATA_SNAPSHOT_APP_ARGS) : {};
+  const args = { ...(which === 'models' ? { model: tag, values: { drafting: 'auto' } } : { model: tag }), ...extra };
   const job = await until(native.operation('load', args));
   if (job.state !== 'done') { console.error('Load ended in state ' + job.state + ': ' + (job.error ?? '')); exitCode = 3; }
   const fetchLog = join(root, 'shim-fetches.jsonl');

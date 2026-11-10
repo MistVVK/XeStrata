@@ -25,14 +25,19 @@ def families() -> tuple:
     return tuple(adopt.FAMILIES)
 
 
-def model_files_in(folder, family: str) -> list:
-    """The model's GGUF files in `folder` when the whole set is there (every shard; Gyro: its one file), else []."""
+def can_set_up(family: str, family_def: dict | None = None) -> bool:
+    """An Arc run config can be written for this family: one of families(), or a model of the signed feed (Qwen4 day: strata_control/feed_models.py)."""
+    return family in families() or bool((family_def or {}).get("feed"))
+
+
+def model_files_in(folder, family: str, family_def: dict | None = None) -> list:
+    """The model's GGUF files in `folder` when the whole set is there (every shard; Gyro: its one file; a feed model: its shards or its one file), else []."""
     from pathlib import Path
     from strata_cli.launch import adopt
     folder = Path(folder)
     if not folder.is_dir():
         return []
-    return adopt.find_single(folder) if family == "gyro" else adopt.find_shards(folder)
+    return adopt.model_files(folder, family, family_def)
 
 
 def supported_here(platform: str | None = None) -> bool:

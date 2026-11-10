@@ -7,7 +7,7 @@ import { TaskTree } from './TaskTree';
 import { useEffect, useId, useLayoutEffect, useRef, useState, type RefObject } from 'react';
 import { createPortal } from 'react-dom';
 import { FloatingMenu } from '../components/FloatingMenu';
-import { measureScale } from '../lib/overlay-place';
+import { measureFrame } from '../lib/overlay-place';
 import { QuitStrataDialog } from '../components/QuitStrata';
 import { useAppMode } from '../lib/app-mode';
 import { href, useLocation, type Route } from '../lib/router';
@@ -163,9 +163,9 @@ function RecentChatLink({ session, active, slot }: {
             const rect = anchor.current?.getBoundingClientRect();
             if (!rect)
                 return;
-            const scale = measureScale();
+            const { scale, viewport } = measureFrame();
             const height = tooltip.current?.getBoundingClientRect().height ?? 80 * scale;
-            setPosition({ left: (rect.right + 12) / scale, top: Math.max(12, Math.min(rect.top, window.innerHeight - height - 12)) / scale });
+            setPosition({ left: (rect.right + 12) / scale, top: Math.max(12, Math.min(rect.top, viewport.height - height - 12)) / scale });
         };
         place();
         window.addEventListener('resize', place);

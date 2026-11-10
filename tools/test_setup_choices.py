@@ -470,7 +470,10 @@ class HipVision(unittest.TestCase):
                 (bdir / "bin" / setup.VEXE).write_bytes(b"vision")
 
             with mock.patch.object(setup, "ROOT", root), mock.patch.object(setup, "cmake_build", cmake_build), \
+                    mock.patch.object(setup, "cpu_info", lambda: ("Test CPU", True, False)), \
                     mock.patch.object(setup, "source_hash", lambda paths: vsrc if paths == setup.VISION_SOURCES else src):
+                # an AVX2 CPU whatever the box has: on one without AVX2 (or one whose CPU flags cannot be read) the engine itself
+                # would be rebuilt with an ISA floor
                 quiet(setup.build_engine_hip, {"arch": "gfx1201"}, "llama", vision)
             return built, json.loads((eng / "BUILD.json").read_text()), (eng / setup.VEXE).exists()
 
@@ -694,7 +697,8 @@ class CudaVision(unittest.TestCase):
                         mock.patch.object(setup, "source_hash", lambda p: "V" if p == setup.VISION_SOURCES else "S"), \
                         mock.patch.object(setup, "install_build_tools", lambda gpu, yes: (str(root / "nvcc"), None)), \
                         mock.patch.object(setup, "gpus", lambda: []), \
-                        mock.patch.object(setup, "source_version", lambda: "test"):      # no real card of the box (#4662)
+                        mock.patch.object(setup, "cpu_info", lambda: ("Test CPU", True, False)), \
+                        mock.patch.object(setup, "source_version", lambda: "test"):      # no real card of the box (#4662), an AVX2 CPU
                     quiet(setup.build_engine, {"arch": "86"}, vision, True, "llama")
                 self.assertEqual([t for t, _ in built], ["strata-vision"])
                 self.assertIn("-DSTRATA_PORTABLE=OFF", built[0][1])

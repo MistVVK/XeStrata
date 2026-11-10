@@ -13,7 +13,7 @@ import { cx, userError } from '../lib/format';
 import { plainFailure } from '../lib/plain-errors';
 import { dismissActionError, dismissToast, holdToast, releaseToast, useStore } from '../lib/store';
 import { isTopSurface, useSurfaceFocus } from '../lib/focus';
-import { measureScale, placeAnchored } from '../lib/overlay-place';
+import { measureFrame, placeAnchored } from '../lib/overlay-place';
 /* -------------------------------------------------------------------- icon */
 export type IconName = 'pause' | 'play' | 'activity' | 'plus' | 'shield' | 'computer'
 // Authored for the shell: see docs/design-system-notes.md.
@@ -269,13 +269,13 @@ export function Select<T extends string>({ value, valueSuffix, options, onChange
         const el = triggerRef.current;
         if (!el)
             return null;
-        const scale = measureScale();
+        const { scale, viewport } = measureFrame();
         const r = el.getBoundingClientRect();
-        const width = Math.min((menuWidth ?? Math.max(r.width / scale, menuMinWidth ?? (menuSize === 'comfortable' ? 340 : 180))) * scale, window.innerWidth - 24);
+        const width = Math.min((menuWidth ?? Math.max(r.width / scale, menuMinWidth ?? (menuSize === 'comfortable' ? 340 : 180))) * scale, viewport.width - 24);
         const natural = measured
             ? measured.scrollHeight * scale + (measured.getBoundingClientRect().height - measured.clientHeight * scale)
             : (options.length * (menuSize === 'comfortable' ? 52 : 38) + 12) * scale;
-        const p = placeAnchored({ anchor: r, size: { width, height: natural }, viewport: { width: window.innerWidth, height: window.innerHeight }, scale, gapBelow: 6, gapAbove: 6 });
+        const p = placeAnchored({ anchor: r, size: { width, height: natural }, viewport, scale, gapBelow: 6, gapAbove: 6 });
         return { left: p.left, top: p.top, width: width / scale, maxHeight: p.maxHeight };
     }, [options.length, menuSize, menuMinWidth, menuWidth]);
     const openMenu = useCallback(() => {

@@ -3,6 +3,7 @@ import { tr } from '../lib/i18n';
 import { UsageDashboard } from '../components/UsageDashboard';
 import { FloatingMenu } from '../components/FloatingMenu';
 import { lazyScreen } from '../lib/lazy-screen';
+import { measureFrame } from '../lib/overlay-place';
 import { timeSkipPrompt, timeSkipTabId, type TimeSkipRun } from '../lib/time-skip';
 import { ChatToolbar } from '../components/ChatToolbar';
 import { ChatTelemetry } from '../components/TelemetryPopover';
@@ -92,7 +93,9 @@ export function ChatScreen() {
             const text = sel.toString().trim();
             if (!host || !el.contains(host) || text.length < 2) { setSelection(null); return; }
             const rect = range.getBoundingClientRect();
-            setSelection({ text, messageId: host.getAttribute('data-message-id') ?? '', role: host.classList.contains('st-msg--user') ? 'user' : 'assistant', x: Math.min(window.innerWidth - 96, Math.max(8, rect.left)), y: Math.max(8, rect.top - 40) });
+            // screen units of this engine, written back in the page's own pixels (lib/overlay-place.ts: Interface size zooms the page)
+            const { scale, viewport } = measureFrame();
+            setSelection({ text, messageId: host.getAttribute('data-message-id') ?? '', role: host.classList.contains('st-msg--user') ? 'user' : 'assistant', x: Math.min(viewport.width - 96 * scale, Math.max(8, rect.left)) / scale, y: Math.max(8, rect.top - 40 * scale) / scale });
         };
         document.addEventListener('selectionchange', read);
         return () => document.removeEventListener('selectionchange', read);

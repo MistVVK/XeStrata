@@ -5,7 +5,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { build, transform } from 'esbuild';
 
-const src = name => readFileSync(new URL(`../src/${name}`, import.meta.url), 'utf8');
+// a Windows checkout with core.autocrlf (GitHub's runners) has CRLF line ends: the source checks below match LF
+const src = name => readFileSync(new URL(`../src/${name}`, import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const locale = name => JSON.parse(readFileSync(new URL(`../src/locales/${name}.json`, import.meta.url), 'utf8'));
 const load = async name => {
   const { code } = await transform(src(name), { loader: 'ts', format: 'esm' });

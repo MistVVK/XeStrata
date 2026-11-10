@@ -23,13 +23,24 @@ import shutil
 import uuid
 from pathlib import Path
 
-from strata_control import dsv41_paths, engine_component as ec, longpath, signing
+from strata_control import dsv41_paths, engine_component as ec, longpath, shape_engine, signing
 from strata_control import updater
 from strata_control.targets import backend_supported, host_platform
 
 QWEN, DEEPSEEK = "qwen", "deepseek"
 FAMILIES = (QWEN, DEEPSEEK)
 TITLES = {QWEN: "Qwen and other models", DEEPSEEK: "DeepSeek"}
+#: The engine of a Qwen4 model shape (strata_control/shape_engine.py): family "shape:<shape>", one per installed shape, listed after the two above. The family
+#: string is an id for the app and the Terminal, never shown: the app titles the group with the model's own catalog title ("title" here is None).
+SHAPE_PREFIX = "shape:"
+
+
+def shape_of_family(family) -> str | None:
+    """shape:q4_lite -> q4_lite; None for anything else."""
+    if not isinstance(family, str) or not family.startswith(SHAPE_PREFIX):
+        return None
+    shape = family[len(SHAPE_PREFIX):]
+    return shape if shape_engine.valid(shape) else None
 
 
 def _walk_bytes(folder: Path) -> int:
@@ -88,9 +99,10 @@ def _process_uses(folder: Path) -> bool:
         return False
 
 
-def _qwen_entries(ctx: "updater.Context") -> list[dict]:
-    root = ctx.components
-    found, problems = ec.scan(root)
+def _qwen_entries(ctx: "updater.Context", root: Path | None = None, component_id: str = ec.COMPONENT_ID, family: str = QWEN) -> list[dict]:
+    """The Qwen engine's packages; with root, component_id and family those of a model shape's engine (the same package layout and checks)."""
+    root = ctx.components if root is None else root
+    found, problems = ec.scan(root, component_id)
     wanted = ctx.hardware.get("backend")
     runtime = ctx.hardware.get("runtime") or ec.runtime_version()
     target = ctx.hardware.get("platform") or host_platform()
@@ -98,7 +110,7 @@ def _qwen_entries(ctx: "updater.Context") -> list[dict]:
     driver_here = ec.nvidia_driver_version() if wanted == "cuda" else None
     hip_here = ec.hip_archs_present() if wanted == "hip" else []
     try:
-        active = ec.resolve(root, backend=wanted, full=False, runtime=ctx.hardware.get("runtime")).root.name
+        active = ec.resolve(root, backend=wanted, full=False, runtime=ctx.hardware.get("runtime"), component_id=component_id).root.name
     except ec.EngineMissing:
         active = None
     pin = ec.pinned_folder(root)
@@ -106,12 +118,12 @@ def _qwen_entries(ctx: "updater.Context") -> list[dict]:
     for item in found:
         why, code, args = _unfit(item, wanted=wanted, target=target, runtime=runtime, cuda_here=cuda_here, driver_here=driver_here,
                                  hip_here=hip_here) or (None, None, [])
-        rows.append({"family": QWEN, "folder": item.root.name, "version": item.version, "backend": item.backend, "platform": item.platform,
+        rows.append({"family": family, "folder": item.root.name, "version": item.version, "backend": item.backend, "platform": item.platform,
                      "variant": item.variant, "bytes": sum(f[2] for f in item.files), "signed": bool(item.signature), "fits": why is None,
                      "why_not": why, "why_code": code, "why_args": args, "active": item.root.name == active, "build_id": item.build_id, "path": longpath.plain(item.root)})
     for bad in problems:
         folder = Path(bad["folder"])
-        rows.append({"family": QWEN, "folder": folder.name, "version": _version_of(folder.name), "backend": "", "platform": "", "variant": "",
+        rows.append({"family": family, "folder": folder.name, "version": _version_of(folder.name), "backend": "", "platform": "", "variant": "",
                      "bytes": _walk_bytes(folder), "signed": False, "fits": False, "active": False, "build_id": "", "path": longpath.plain(folder),
                      "why_not": "Its description is missing or damaged, so it cannot be started.", "why_code": "manifest", "why_args": [],
                      "detail": bad["problem"]})
@@ -185,14 +197,30 @@ def list_engines(ctx: "updater.Context") -> dict:
     except Exception:                                   # noqa: BLE001
         serving = False
     qwen, deepseek = _qwen_entries(ctx), _ds_entries(ctx)
-    for rows in (qwen, deepseek):
+    shapes = _shape_families(ctx)
+    for rows in (qwen, deepseek, *(f["engines"] for f in shapes)):
         _decorate(rows, serving)
         rows.sort(key=lambda r: (ec._version_key(r["version"]), r["folder"]), reverse=True)
     families = [{"family": QWEN, "title": TITLES[QWEN], "engines": qwen}]
     if deepseek:
         families.append({"family": DEEPSEEK, "title": TITLES[DEEPSEEK], "engines": deepseek})
+    families += shapes                                  # none on a PC that never had a model of another shape: the list is what it was
     return {"schema_version": 1, "components_dir": str(ctx.components), "families": families,
-            "total_bytes": sum(r["bytes"] for rows in (qwen, deepseek) for r in rows), "serving": serving}
+            "total_bytes": sum(r["bytes"] for fam in families for r in fam["engines"]), "serving": serving}
+
+
+def _shape_families(ctx: "updater.Context") -> list[dict]:
+    """One family per model shape whose engine is installed here (shape_engine.py: <components>/shapes/<shape>/engine/), each with its packages."""
+    out = []
+    try:
+        shapes = shape_engine.installed_shapes(ctx.components)
+    except Exception:                                   # noqa: BLE001 - a shapes folder that cannot be read lists nothing, as before
+        return []
+    for shape in shapes:
+        rows = _qwen_entries(ctx, shape_engine.root(shape, ctx.components), shape_engine.component_id(shape), SHAPE_PREFIX + shape)
+        if rows:
+            out.append({"family": SHAPE_PREFIX + shape, "shape": shape, "title": None, "engines": rows})
+    return out
 
 
 def find_entry(listing: dict, spec: str, family: str | None = None) -> dict:
@@ -225,7 +253,8 @@ class SwitchBusy(updater.Busy):
 def use_engine(ctx: "updater.Context", family: str, folder: str, root: str | None = None) -> dict:
     """Make an installed engine the one that starts from now on. Nothing is downloaded or deleted. Waits for / refuses while a model is running
     (`updater.Busy`, exit 7); the running model keeps the engine it started with. The newest engine is selected without a pin, so it follows updates again."""
-    if family not in FAMILIES:
+    shape = shape_of_family(family)
+    if family not in FAMILIES and shape is None:
         raise updater.UpdateError("choose the Qwen or the DeepSeek engine", 2)
     if not folder or folder != Path(folder).name or folder.startswith("."):
         raise updater.UpdateError("that is not an installed engine", 2)
@@ -234,9 +263,57 @@ def use_engine(ctx: "updater.Context", family: str, folder: str, root: str | Non
             updater.wait_until_idle(ctx.serving, wait=ctx.wait, emit=ctx.emit, cancel=ctx.cancel, poll=ctx.poll)
         except updater.Busy as busy:
             raise SwitchBusy(busy.serving) from None
+        if shape is not None:
+            return _use_shape(ctx, shape, folder)
         if family == QWEN:
             return _use_qwen(ctx, folder)
         return _use_deepseek(ctx, folder, root)
+
+
+def _use_shape(ctx: "updater.Context", shape: str, folder: str) -> dict:
+    """The switch for a model shape's engine: the same pin as the Qwen engine's (``.updates/state.json`` engine.pinned), in the shape's own folder, which
+    engine_component.resolve reads at every start of a model of that shape. The newest package is selected without a pin, so it follows updates again."""
+    base, cid, family = shape_engine.root(shape, ctx.components), shape_engine.component_id(shape), SHAPE_PREFIX + shape
+    found, _ = ec.scan(base, cid)
+    target = next((item for item in found if item.root.name == folder), None)
+    if target is None:
+        raise updater.UpdateError("that engine is not installed (it may have been deleted already)", 2)
+    backend, runtime = ctx.hardware.get("backend"), ctx.hardware.get("runtime")
+
+    def picked() -> str | None:
+        try:
+            return ec.resolve(base, backend=backend, full=True, runtime=runtime, component_id=cid).root.name
+        except ec.EngineMissing:
+            return None
+    before = picked()
+    if before == folder:
+        return {"component": cid, "family": family, "status": "already", "changed": False, "to": target.version, "folder": folder}
+    try:
+        signing.ensure_component_verifier()
+        ec.verify_signature(target)
+        ec.verify(target, full=True)
+    except (ec.ComponentProblem, signing.SignatureError, OSError) as exc:
+        raise updater.UpdateError(f"engine {target.version} can no longer be used: {exc}", 5) from None
+    state = updater.State(base)
+    section = state.section("engine")
+    old_pin = section.pop("pinned", None)
+    state.save()
+    automatic = picked() == folder
+    if not automatic:
+        section["pinned"] = folder
+        state.save()
+    if picked() != folder:
+        if old_pin:
+            section["pinned"] = old_pin
+        else:
+            section.pop("pinned", None)
+        state.save()
+        raise updater.UpdateError(f"engine {target.version} can no longer be used: a start would not pick it", 5)
+    state.history({"at": (ctx.now or updater.dt.datetime.now(updater.dt.timezone.utc)).isoformat(), "action": "use-shape-engine", "shape": shape,
+                   "from": _version_of(before) if before else None, "to": target.version, "ok": True})
+    state.save()
+    return {"component": cid, "family": family, "status": "switched", "changed": True, "automatic": automatic,
+            "from": _version_of(before) if before else None, "to": target.version, "folder": folder}
 
 
 def _use_qwen(ctx: "updater.Context", folder: str) -> dict:
@@ -294,7 +371,8 @@ def _use_deepseek(ctx: "updater.Context", folder: str, root: str | None) -> dict
 def delete_engine(ctx: "updater.Context", family: str, folder: str, root: str | None = None) -> dict:
     """Delete one installed engine package. Refused (exit 2, nothing changed) for the engine in use and for one a running program uses. Models, settings
     and the other family are not touched. The folder is renamed away first, so a package that is held open is left whole, not half removed."""
-    if family not in FAMILIES:
+    shape = shape_of_family(family)
+    if family not in FAMILIES and shape is None:
         raise updater.UpdateError("choose the Qwen or the DeepSeek engine", 2)
     if not folder or folder != Path(folder).name or folder.startswith("."):
         raise updater.UpdateError("that is not an installed engine", 2)
@@ -328,9 +406,17 @@ def delete_engine(ctx: "updater.Context", family: str, folder: str, root: str | 
             state.history({"at": (ctx.now or updater.dt.datetime.now(updater.dt.timezone.utc)).isoformat(), "action": "delete-engine",
                            "from": row["version"], "to": None, "ok": True})
             state.save()
+        elif shape is not None:
+            state = updater.State(shape_engine.root(shape, ctx.components))
+            section = state.section("engine")
+            if section.get("pinned") == folder:
+                section.pop("pinned", None)
+            state.history({"at": (ctx.now or updater.dt.datetime.now(updater.dt.timezone.utc)).isoformat(), "action": "delete-shape-engine", "shape": shape,
+                           "from": row["version"], "to": None, "ok": True})
+            state.save()
         elif dsv41_paths.pinned(Path(row["root"])) is None and (Path(row["root"]) / dsv41_paths.PIN).is_file():
             dsv41_paths.set_pin(Path(row["root"]), None)       # a stale pin
-        return {"component": "engine" if family == QWEN else "dsv41", "family": family, "status": "deleted", "changed": True, "folder": folder,
+        return {"component": ("engine" if family == QWEN else shape_engine.component_id(shape) if shape is not None else "dsv41"), "family": family, "status": "deleted", "changed": True, "folder": folder,
                 "version": row["version"], "freed_bytes": row["bytes"]}
 
 

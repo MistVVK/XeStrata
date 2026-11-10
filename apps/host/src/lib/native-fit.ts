@@ -143,7 +143,19 @@ export function versionFit(v: FitInput & { on_this_pc?: string | null }, hw: Fit
 }
 
 /** A card as the installer's hardware report lists it. */
-export interface RunCard { index: number; name: string; vram_gb: number; usable?: boolean; vendor?: string; arch?: string; uma?: boolean; integrated?: boolean; unified_gb?: number }
+export interface RunCard { index: number; name: string; vram_gb: number; usable?: boolean; vendor?: string; arch?: string; uma?: boolean; integrated?: boolean; unified_gb?: number; /** a unified-memory chip: its BIOS carve-out (setup.py amd_apply_uma) */ dedicated_gb?: number }
+
+/**
+ * The graphics memory that counts for the fit label, of the largest card: strata_control/fit_label.py card_room_gb, the same rule (the Terminal and the
+ * catalog's “on_this_pc” use it). A chip that shares the PC’s memory (Strix Halo: uma) counts only its own carve-out, because its “shared” part is the
+ * RAM, already counted (QAGUI-STRIX 11-09: Q8_0, 133.8 GB, against 63.6 GB RAM + 95.8 GB carve-out-plus-shared said nothing; Control says “may run slower”
+ * against 63.6 + 64). Pinned to the Python by tests/fit-label-rule.test.mjs.
+ */
+export function cardRoomGb(cards: readonly Pick<RunCard, 'vram_gb' | 'uma' | 'dedicated_gb'>[] | null | undefined): number {
+  let best = 0;
+  for (const c of cards ?? []) best = Math.max(best, c.uma ? Number(c.dedicated_gb) || 0 : Number(c.vram_gb) || 0);
+  return best;
+}
 
 /**
  * The cards a model can be placed on: the ones this engine can drive (strata_control/gpu_fit.py `usable_cards` and `for_vendor`, same rule).

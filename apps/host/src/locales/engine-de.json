@@ -41,5 +41,6 @@
  "et40": "Die Engine wurde nicht gelöscht. Sonst wurde nichts geändert.",
  "et41": "Die Engine wurde nicht gewechselt. Es wurde nichts geändert.",
  "et42": "Wähle eine Engine aus der Liste.",
- "et43": "Auf diesem Computer ist schon eine neuere Engine. Das Update wechselt zu ihr; es wird nichts heruntergeladen."
+ "et43": "Auf diesem Computer ist schon eine neuere Engine. Das Update wechselt zu ihr; es wird nichts heruntergeladen.",
+ "et44": "{0} läuft ab dem nächsten Start mit Engine {1}. Deine Modelle und Einstellungen bleiben unverändert. Du kannst jederzeit zurückwechseln."
 }

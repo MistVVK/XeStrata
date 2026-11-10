@@ -101,20 +101,41 @@ export function placeAnchored(o: PlaceOptions): Placement {
     };
 }
 
+/** The scale and the window's size, both in the units `getBoundingClientRect()` uses on this engine. */
+export interface Frame { scale: number; viewport: Size }
+
 /**
- * Visual pixels per CSS pixel where `host` lives, found by measuring: a probe 100 CSS pixels wide is put in, read and taken out.
- * 1 when there is no zoom, 1.25 at 125%, and whatever the engine really does if it counts differently.
+ * Visual pixels per CSS pixel where `host` lives, and the window's size in the same units as the rectangles, found by measuring: a probe 100 CSS
+ * pixels wide and a fixed box over the whole window are put in, read and taken out.
+ *
+ * Chromium before 128 (WebView2 122 on a Windows 11 that was never updated: QAGUI-STRIX 11-09) does not follow the standard: under a zoomed root it
+ * reports rectangles in the page's own pixels while `window.innerWidth` stays in screen pixels. The probe then says 1 (right: the rectangles need no
+ * dividing there), but a window size taken from `innerWidth` is the zoom too large and the room below an anchor at the foot of the window looks
+ * big enough: the menu went below the sidebar's More item, off the window, at 125% and up. The fixed box is measured like every other rectangle, so
+ * the anchor and the window are always in the same units, whichever way the engine counts.
  */
-export function measureScale(host: HTMLElement = document.body): number {
+export function measureFrame(host: HTMLElement = document.body): Frame {
+    const fallback = (): Size => (typeof window === 'undefined' ? { width: 0, height: 0 } : { width: window.innerWidth, height: window.innerHeight });
     try {
         const probe = document.createElement('div');
         probe.style.cssText = 'position:fixed;left:0;top:0;width:100px;height:1px;visibility:hidden;pointer-events:none;';
+        const frame = document.createElement('div');
+        frame.style.cssText = 'position:fixed;left:0;top:0;right:0;bottom:0;visibility:hidden;pointer-events:none;';
         host.appendChild(probe);
+        host.appendChild(frame);
         const scale = probe.getBoundingClientRect().width / 100;
+        const r = frame.getBoundingClientRect();
         probe.remove();
-        return sane(scale);
+        frame.remove();
+        const viewport = r.width > 0 && r.height > 0 ? { width: r.width, height: r.height } : fallback();
+        return { scale: sane(scale), viewport };
     }
     catch {
-        return 1;
+        return { scale: 1, viewport: fallback() };
     }
+}
+
+/** Visual pixels per CSS pixel where `host` lives (see `measureFrame`). */
+export function measureScale(host: HTMLElement = document.body): number {
+    return measureFrame(host).scale;
 }

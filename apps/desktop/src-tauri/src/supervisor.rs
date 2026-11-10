@@ -224,6 +224,165 @@ pub fn describe_exit(status: &ExitStatus) -> String {
     }
 }
 
+// ------------------------------------------------------------------------------------------------ after an app update
+
+/// The shell's process id, given to the window process it starts. A window process whose parent is not that shell was started by something else: the
+/// app updater's restart (Tauri's `app.restart()` starts `$APPIMAGE --window-child` again from the window process, with the old shell's environment).
+pub const SHELL_PID_ENV: &str = "STRATA_SHELL_PID";
+
+/// Was this `--window-child` started by its shell? `shell_env` is SHELL_PID_ENV's value, `parent` this process's parent.
+pub fn started_by_shell(shell_env: Option<&str>, parent: u32) -> bool {
+    shell_env.and_then(|v| v.trim().parse::<u32>().ok()).map(|pid| pid != 0 && pid == parent).unwrap_or(false)
+}
+
+/// How long a restarted app waits for the old one (its shell stops the host and the engines first, up to HOST_STOP_SECONDS).
+pub fn old_shell_wait() -> Duration {
+    Duration::from_secs(crate::HOST_STOP_SECONDS + 20)
+}
+
+fn b64_value(c: u8) -> Option<u32> {
+    match c {
+        b'A'..=b'Z' => Some((c - b'A') as u32),
+        b'a'..=b'z' => Some((c - b'a') as u32 + 26),
+        b'0'..=b'9' => Some((c - b'0') as u32 + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+/// Standard base64 (what `base64 -w0` writes); None on anything else.
+pub fn b64_decode(text: &str) -> Option<Vec<u8>> {
+    let bytes: Vec<u8> = text.bytes().filter(|c| !c.is_ascii_whitespace()).collect();
+    let body = bytes.strip_suffix(b"==").or_else(|| bytes.strip_suffix(b"=")).unwrap_or(&bytes);
+    let mut out = Vec::with_capacity(body.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &c in body {
+        acc = (acc << 6) | b64_value(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    Some(out)
+}
+
+/// The environment a person started Strata with: the AppImage's launcher records it in STRATA_ORIGINAL_ENV (`env -0 | base64 -w0`, repack-appimage.sh) at
+/// every start. A start from inside a running Strata (the updater's restart) records Strata's own environment, which holds the first record: the innermost
+/// one is the person's. None when there is no record (an older AppImage, a package install).
+pub fn original_environment(record: Option<&str>) -> Option<Vec<(String, String)>> {
+    let mut text = record?.to_string();
+    let mut found = None;
+    for _ in 0..8 {
+        let raw = b64_decode(&text)?;
+        let vars: Vec<(String, String)> = raw
+            .split(|b| *b == 0)
+            .filter(|kv| !kv.is_empty())
+            .filter_map(|kv| {
+                let kv = String::from_utf8_lossy(kv);
+                let (k, v) = kv.split_once('=')?;
+                Some((k.to_string(), v.to_string()))
+            })
+            .collect();
+        let inner = vars.iter().find(|(k, _)| k == "STRATA_ORIGINAL_ENV").map(|(_, v)| v.clone());
+        found = Some(vars);
+        match inner {
+            Some(next) if !next.is_empty() => text = next,
+            _ => break,
+        }
+    }
+    found.map(|vars| vars.into_iter().filter(|(k, _)| k != "STRATA_ORIGINAL_ENV").collect())
+}
+
+/// The new Strata gets none of this process's files above stderr. This process got them from the window process that restarted it: the AppImage
+/// runtime's keep-alive pipe and its fd to /tmp/.mount_*, WebKit's /proc and cgroup files. A child that inherits them keeps the old AppImage's runtime and
+/// mount alive until the new app quits (seen in the 0.2.14 gate). They are closed in the child only, between fork and exec: closing them in this process
+/// would end this AppImage's own mount under it (the keep-alive pipe), which is what the first try did.
+#[cfg(unix)]
+fn close_fds_in_child(cmd: &mut Command) {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    // SAFETY: runs in the forked child before exec; close() is async-signal-safe, and nothing in the child uses these numbers (stdio is 0..=2,
+    // already set to /dev/null). A number that is not open only gives EBADF, which the drop ignores.
+    unsafe {
+        cmd.pre_exec(|| {
+            for fd in 3..4096 {
+                drop(OwnedFd::from_raw_fd(fd));
+            }
+            Ok(())
+        });
+    }
+}
+
+/// The program to start again: the AppImage file (the updater replaced it in place), else this executable.
+fn program_to_restart() -> Option<PathBuf> {
+    if let Some(image) = std::env::var_os("APPIMAGE").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(image));
+    }
+    let exe = std::env::current_exe().ok()?;
+    // a replaced executable reads as "<path> (deleted)" in /proc/self/exe
+    let text = exe.to_string_lossy();
+    Some(text.strip_suffix(" (deleted)").map(PathBuf::from).unwrap_or(exe))
+}
+
+/// A `--window-child` that its shell did not start: the app updater's restart after an update (0.2.13 and later restart this way; QAGUI-LIN 0213, scenario 12).
+/// The old shell is stopping its host and engines, because its window process ended. Wait until it is gone, then start Strata again the way a person does
+/// (a new shell, a new host), detached, and leave. If the old shell is still there after the wait, nothing is started: two Strata apps never run at once,
+/// and a person's next start joins or replaces the old one as usual. Prints nothing: the old shell owned this process's output and is gone.
+pub fn restart_after_update() -> i32 {
+    let log = Log::open();
+    let old = std::env::var(SHELL_PID_ENV).ok().and_then(|v| v.trim().parse::<u32>().ok()).filter(|p| *p != 0).or_else(|| read_session().map(|s| s.pid));
+    log.line("shell", &format!("started as the app window by the app updater, not by Strata (old app process {old:?}): restarting Strata"));
+    if let Some(pid) = old.filter(|p| *p != std::process::id()) {
+        let deadline = Instant::now() + old_shell_wait();
+        while pid_alive(pid) {
+            if Instant::now() >= deadline {
+                log.line("shell", &format!("the old Strata (process {pid}) did not stop within {} s: not starting a second one", old_shell_wait().as_secs()));
+                return 0;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    if live_session().is_some() {
+        log.line("shell", "another Strata is already running: not starting a second one");
+        return 0;
+    }
+    let Some(program) = program_to_restart() else {
+        log.line("shell", "could not tell which program to start again");
+        return 1;
+    };
+    let mut cmd = Command::new(&program);
+    match original_environment(std::env::var("STRATA_ORIGINAL_ENV").ok().as_deref()) {
+        Some(vars) => {
+            cmd.env_clear().envs(vars);
+        }
+        None => {
+            for k in ["STRATA_WINDOW_PORT", "STRATA_SHUTDOWN_TOKEN", SHELL_PID_ENV] {
+                cmd.env_remove(k);
+            }
+        }
+    }
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+        close_fds_in_child(&mut cmd);
+    }
+    match cmd.spawn() {
+        Ok(child) => {
+            log.line("shell", &format!("started {} again (process {})", program.display(), child.id()));
+            0
+        }
+        Err(e) => {
+            log.line("shell", &format!("could not start {} again: {e}", program.display()));
+            1
+        }
+    }
+}
+
 // ------------------------------------------------------------------------------------------------ the shell
 
 fn spawn_window(port: u16, token: &str) -> std::io::Result<Child> {
@@ -232,6 +391,7 @@ fn spawn_window(port: u16, token: &str) -> std::io::Result<Child> {
         .arg("--window-child")
         .env("STRATA_WINDOW_PORT", port.to_string())
         .env("STRATA_SHUTDOWN_TOKEN", token)
+        .env(SHELL_PID_ENV, std::process::id().to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -389,7 +549,7 @@ pub fn run(opts: &Options) -> i32 {
     } else {
         let started = std::env::current_exe().and_then(|exe| {
             let mut c = Command::new(exe);
-            c.arg("--window-child").env("STRATA_WINDOW_PORT", port.to_string()).env("STRATA_SHUTDOWN_TOKEN", &token).stdin(Stdio::null());
+            c.arg("--window-child").env("STRATA_WINDOW_PORT", port.to_string()).env("STRATA_SHUTDOWN_TOKEN", &token).env(SHELL_PID_ENV, me.to_string()).stdin(Stdio::null());
             spawn_logged(&mut c, "window", &window_ring, &log)
         });
         match started {
@@ -486,6 +646,61 @@ mod tests {
         assert!(read_session().is_none());
         std::env::remove_var("STRATA_APP_SESSION_FILE");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_the_shell_that_is_the_parent_counts_as_the_shell() {
+        assert!(started_by_shell(Some("4242"), 4242));
+        assert!(started_by_shell(Some(" 4242\n"), 4242));
+        // the updater's restart: the old shell's pid is inherited, but the parent is the old window process (or init once it is gone)
+        assert!(!started_by_shell(Some("4242"), 4300));
+        assert!(!started_by_shell(Some("4242"), 1));
+        // 0.2.13's shell never set it: a 0.2.14 window process started by a 0.2.13 updater restart
+        assert!(!started_by_shell(None, 4242));
+        assert!(!started_by_shell(Some("x"), 4242));
+        assert!(!started_by_shell(Some("0"), 0));
+    }
+
+    #[test]
+    fn base64_decodes_what_base64_w0_writes() {
+        assert_eq!(b64_decode("").unwrap(), b"");
+        assert_eq!(b64_decode("YQ==").unwrap(), b"a");
+        assert_eq!(b64_decode("YWI=").unwrap(), b"ab");
+        assert_eq!(b64_decode("YWJj").unwrap(), b"abc");
+        assert_eq!(b64_decode("SE9NRT0vaG9tZS91AFBBVEg9L3Vzci9iaW4A").unwrap(), b"HOME=/home/u\0PATH=/usr/bin\0");
+        assert!(b64_decode("not base64!").is_none());
+    }
+
+    fn b64_encode(data: &[u8]) -> String {
+        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for chunk in data.chunks(3) {
+            let n = chunk.iter().enumerate().fold(0u32, |acc, (i, b)| acc | (*b as u32) << (16 - 8 * i));
+            for i in 0..4 {
+                out.push(if i <= chunk.len() { T[((n >> (18 - 6 * i)) & 63) as usize] as char } else { '=' });
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_restart_gets_the_environment_the_person_started_strata_with() {
+        // the first start: AppRun records the person's environment
+        let person = b"HOME=/home/u\0PATH=/usr/bin\0STRATA_UPDATE_FEED=http://127.0.0.1:1/f.json\0";
+        let first = b64_encode(person);
+        // inside Strata (the old window process): the old AppRun's own variables plus that record; the updater's restart records THAT
+        let inside = format!("HOME=/home/u\0PATH=/tmp/.mount_old/usr/bin:/usr/bin\0APPDIR=/tmp/.mount_old\0STRATA_WINDOW_PORT=47958\0STRATA_ORIGINAL_ENV={first}\0");
+        let second = b64_encode(inside.as_bytes());
+        let env = original_environment(Some(&second)).unwrap();
+        assert_eq!(env, vec![("HOME".into(), "/home/u".into()), ("PATH".into(), "/usr/bin".into()), ("STRATA_UPDATE_FEED".into(), "http://127.0.0.1:1/f.json".into())]);
+        assert_eq!(original_environment(Some(&first)).unwrap().len(), 3);
+        assert!(original_environment(None).is_none());
+        assert!(original_environment(Some("%%%")).is_none());
+    }
+
+    #[test]
+    fn the_wait_for_the_old_app_covers_its_host_stop() {
+        assert!(old_shell_wait() > Duration::from_secs(crate::HOST_STOP_SECONDS));
     }
 
     #[test]

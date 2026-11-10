@@ -1420,9 +1420,10 @@ class Runner:
         except Exception:                                    # noqa: BLE001
             backend = None
         pack_dir = data_dir / "packs" / tag.lower()
-        if backend == "sycl" and adopt.find_shards(model_dir) and not (pack_dir / "experts.bin").exists() and not (
+        files = adopt.model_files(model_dir, s.family or "", fam) if fam.get("feed") else adopt.find_shards(model_dir)   # a feed model can be one GGUF
+        if backend == "sycl" and files and not (pack_dir / "experts.bin").exists() and not (
                 (pack_dir / "index.txt").exists() and (pack_dir / "tokenizer" / "vocab.json").exists()):
-            self.prepare_pack(model_dir, pack_dir, adopt.find_shards(model_dir))
+            self.prepare_pack(model_dir, pack_dir, files)
         cfg, problems = adopt.plan(family=s.family, model=s.model, model_dir=model_dir, data_dir=data_dir, src=cat.src,
                                    context=s.context or 32768, kv=s.kv, model_name=f"{fam.get('name', s.family)}-{s.model.lower()}", family_def=fam,
                                    log=cat.root / f"strata-{tag}.log", backend=backend,
@@ -1561,6 +1562,8 @@ class Runner:
         """modelstate.resolved_drafting for this launch: Auto where the all-cards split engine will take the start is the MTP (it runs the model's draft layer and
         nothing else), so the plan and the fetch include the draft layer and not DFlash2's drafter.  A drafter the person chose is kept."""
         from strata_control import drafting
+        if self.feed_without_draft_layer(family):            # the model list says this model has no draft layer: no drafter is planned or fetched for it (G14, APP-LIN 0.2.14)
+            return "off"
         r = modelstate.resolved_drafting(self.s.drafting, family)
         if r == "dflash2" and drafting.normalize(self.s.drafting) == "auto" and self.split_expected():
             return "mtp"
@@ -2592,10 +2595,11 @@ class Runner:
         text = "Speed: " + S.speed_words(speed[0], speed[1])
         return text + (". " + S.FASTER_NOTE if speed[0] == "faster" else "")
 
-    def feed_without_draft_layer(self) -> bool:
-        """A model of the signed feed whose entry says `drafter: none` (strata_control/feed_models.py puts it on the family): nothing drafts, whatever Auto would pick for a Flash-Next model."""
+    def feed_without_draft_layer(self, family: str | None = None) -> bool:
+        """A model of the signed feed whose entry says `drafter: none` (strata_control/feed_models.py puts it on the family): nothing drafts, whatever Auto would pick for a Flash-Next model.
+        `family`: another family than this launch's (None: this launch's)."""
         try:
-            fam = self.catalog.tables()[1].get(self.s.family) or {}
+            fam = self.catalog.tables()[1].get(family or self.s.family) or {}
             return bool(fam.get("feed")) and fam.get("drafter") == "none"
         except Exception:                                    # noqa: BLE001 - an unreadable table is only the generic plan line
             return False

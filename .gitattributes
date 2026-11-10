@@ -31,3 +31,6 @@ serve/web/vendor/** -text
 third_party/strata-ggml/** text eol=lf
 third_party/strata-gguf-py/** text eol=lf
 third_party/strata-llama/** text eol=lf
+
+# chat templates are read and hashed byte for byte (the served prompt, tools/test_qwen4_intake): LF wherever the repository is cloned
+*.jinja text eol=lf

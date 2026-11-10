@@ -20,7 +20,7 @@ import { cacheGb } from '../lib/native-fit';
 import { FirstRunLanguage } from './FirstRunLanguage';
 import { DownloadParts } from './DownloadParts';
 import { EngineWarning } from './EngineWarning';
-import { OTHER_NOTE, PICK_NOTE, recommendedVersions } from '../lib/native-fit';
+import { OTHER_NOTE, PICK_NOTE, cardRoomGb, recommendedVersions } from '../lib/native-fit';
 import { nativeCatalogModels, catalogVersionLabel, startingChoice } from '../lib/native-catalog';
 type Choices = NonNullable<NonNullable<SetupState['choices']>['onboarding']>;
 function radioKeys(event: KeyboardEvent<HTMLDivElement>) { if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key))
@@ -229,7 +229,7 @@ export function GuidedSetup() {
      <div className="onboard-version-heading"><strong>{tr("Choose a version")}</strong><span>{tr(version ? `${catalogVersionLabel(version)} selected` : '')}</span></div>
      {tr(version?.multi_file ? <DeepSeekNote version={version} plan={plan}/> : null)}
      <div className="onboard-versions" role="radiogroup" aria-label={tr("Model version")} onKeyDown={radioKeys}>{tr(cards.map(v => versionCard(v)))}</div>
-     {tr(others.length ? <div className="onboard-more-versions"><VersionPicker versions={others} selectedId={version?.id ?? ''} hardware={hardware ? { ram_gb: native?.hardware?.ram_gb ?? hardware.memory.totalGb, vram_gb: Math.max(0, ...(native?.hardware?.gpus ?? []).filter(g => g.usable !== false).map(g => g.vram_gb)) } : null} downloaded={readyIds} showRecommended={false} moreLabel="More versions" onSelect={id => { setSize(id); setPlan(null); }} onOwnGguf={() => void ownModel()}/></div> : null)}
+     {tr(others.length ? <div className="onboard-more-versions"><VersionPicker versions={others} selectedId={version?.id ?? ''} hardware={hardware ? { ram_gb: native?.hardware?.ram_gb ?? hardware.memory.totalGb, vram_gb: cardRoomGb((native?.hardware?.gpus ?? []).filter(g => g.usable !== false)) } : null} downloaded={readyIds} showRecommended={false} moreLabel="More versions" onSelect={id => { setSize(id); setPlan(null); }} onOwnGguf={() => void ownModel()}/></div> : null)}
      <div className="onboard-folder"><Icon name="folder" size={20}/><div><strong>{tr(directory ? 'Your model folder' : 'Already downloaded the model?')}</strong><small>{tr(directory || "Choose the folder and we'll start your models with Strata.")}</small></div><Btn size="sm" onClick={() => setFolderOpen(v => !v)}>{tr(folderOpen ? 'Close' : directory ? 'Change' : 'Choose folder')}</Btn></div>
      {tr(folderOpen ? <OnboardingFolder directory={folder} onChoose={(path, ggufFiles) => ggufFiles > 0 && !/strata/i.test(path.split(/[\\/]/).filter(Boolean).pop() ?? '') ? void ownModel(path) : void perform(async () => { await nativeAction('directory', { directory: path }); setDirectory(path); setFolderOpen(false); setPlan(null); })}/> : null)}
     </> : <div className="onboard-engine-connect"><Icon name="models" size={24}/><strong>{tr("Connect your Strata installation")}</strong><Btn onClick={() => void skip(false, 'Engine')}>{tr("Connect engine")}</Btn></div>)}

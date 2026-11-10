@@ -31,6 +31,8 @@ FAMILY_PREFIX = "qwen4exp_"
 SHAPE_RE = re.compile(r"[a-z][a-z0-9_]{1,21}[a-z0-9]")                    # q4_lite, q4_mid: the geometry header's name (include/strata/core/geometries/<name>.hpp)
 #: component ids that already mean something else; a shape never becomes one of them
 RESERVED = frozenset({"strata-engine", "strata-dsv41", "strata-control", "strata-vision", "strata-device", "strata-terminal", "strata-app", "strata-drafter"})
+#: The reason, inside WORDS["start_failed"]'s "...did not start correctly ({why})", when a shape engine cannot say its shape (owner, 11-09)
+NO_SHAPE_ANSWER = "it does not say which model shape it was built for"
 KEEP_VERSIONS = 2                                                           # the installed shape engine and the one before it
 #: What a person reads in the lines below where "{model}" stands: the model's title ("Q4 Lite Shape"), not the geometry's name (q4_lite). One switch: False puts the geometry
 #: name back everywhere (the owner decides; `strata components engine` and the JSON always name the shape).
@@ -194,7 +196,7 @@ def status(components: Path | None = None) -> list[dict]:
 def _test_start(exe: Path, timeout: float = 120.0, shape: str | None = None) -> tuple[bool, str]:
     """The new engine starts: ``strata --version`` runs, loads its libraries and names itself (it needs no graphics card and no model). The package's own folders go on the
     library path first, as the start path does. With `shape`, ``strata --geometry`` (engine 0.2.13 and later) must name that shape: an engine compiled for another geometry than
-    the signed manifest says is refused here, not at its first load. An engine from before the flag (it exits non-zero or prints nothing) is accepted, as before."""
+    the signed manifest says is refused here, not at its first load, and so is one that cannot answer the flag (NO_SHAPE_ANSWER, owner 11-09)."""
     import subprocess
     env = dict(os.environ)
     var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
@@ -217,15 +219,16 @@ def _test_start(exe: Path, timeout: float = 120.0, shape: str | None = None) -> 
 
 
 def check_geometry(exe: Path, shape: str, env: dict | None = None, timeout: float = 60.0) -> tuple[bool, str]:
-    """Does ``strata --geometry`` name `shape`? (True, "") when it does, or when the engine has no such flag (an older engine); (False, plain reason) when it names another."""
+    """Does ``strata --geometry`` name `shape`? (True, "") when it does; (False, plain reason) when it names another, or names none: every engine of a model shape is built
+    after the flag existed (0.2.13, and the Intel engine since 0.2.14), so one that cannot say its shape is refused (owner, 11-09). The Strata engine is never asked."""
     import subprocess
     try:
         done = subprocess.run([str(exe), "--geometry"], capture_output=True, text=True, errors="replace", timeout=timeout, cwd=str(Path(exe).parent), env=env)
     except (OSError, subprocess.SubprocessError):
-        return True, ""
+        return False, NO_SHAPE_ANSWER
     named = ((done.stdout or "").strip().splitlines() or [""])[0].strip()
     if done.returncode != 0 or not named or named.startswith("strata") or " " in named:
-        return True, ""                                   # an engine from before the flag
+        return False, NO_SHAPE_ANSWER                     # an engine that does not know the flag (or answers something else)
     if named != shape:
         return False, f"it was built for a different model shape ({named})"
     return True, ""

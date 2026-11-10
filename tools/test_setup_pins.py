@@ -394,6 +394,9 @@ class Requirements(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             if stamp is not None:
                 (Path(d) / ".strata-pip.json").write_text(json.dumps(stamp))
+                # written by this system (#3634's marker): without it the stamp is believed only when numpy/jinja2/regex/yaml import in the
+                # Python running the tests, which made these tests depend on the box
+                (Path(d) / ".strata-pip.json.os").write_text(setup.sys.platform)
             with mock.patch.object(setup.sys, "prefix", d), \
                     mock.patch.object(setup, "run", lambda cmd, **kw: ran.append(cmd)), \
                     mock.patch.object(setup, "_installed", lambda name: name in installed):

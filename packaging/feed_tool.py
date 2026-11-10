@@ -37,6 +37,8 @@ import stat
 import sys
 import tarfile
 import zipfile
+import zlib
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -122,6 +124,45 @@ def _mode(path: Path, rel: str, entrypoint: str | None) -> int:
         return 0o644
 
 
+GZIP_BLOCK = 4 << 20        # bytes of the tar per gzip member when several threads compress (_parallel_gzip)
+
+
+def gzip_threads() -> int:
+    """How many threads compress a tar.gz: 1 (the single-stream gzip, byte for byte as before) unless STRATA_PACK_THREADS asks for more. OPT-IN
+    (coordinator 11-10): a threaded archive is several gzip members, and every published client that unpacks a package must be shown to read
+    those before this may become the default."""
+    raw = os.environ.get("STRATA_PACK_THREADS", "").strip()
+    if raw.isdigit() and int(raw) >= 1:
+        return min(int(raw), 64)
+    return 1
+
+
+def _parallel_gzip(src: Path, dst: Path, threads: int, level: int = 9) -> None:
+    """`src` (a plain tar) gzipped into `dst` by `threads` threads: GZIP_BLOCK-sized pieces, each a complete gzip member (RFC 1952 allows several in one
+    file; Python's tarfile and gzip, GNU tar / gzip and bsdtar read them as one stream). zlib releases the GIL while it compresses, so the pieces run in
+    parallel. The header carries no file name and mtime 0, so the same tar always gives the same bytes."""
+    def one(block: bytes) -> bytes:
+        c = zlib.compressobj(level, zlib.DEFLATED, 31)       # wbits 31: a gzip member (header, deflate, crc32 + size trailer)
+        return c.compress(block) + c.flush()
+
+    def blocks():
+        with src.open("rb") as f:
+            while True:
+                block = f.read(GZIP_BLOCK)
+                if not block:
+                    return
+                yield block
+
+    with dst.open("wb") as out, ThreadPoolExecutor(max_workers=threads) as pool:
+        pending = []
+        for block in blocks():                               # at most 2 x threads blocks in memory
+            pending.append(pool.submit(one, block))
+            if len(pending) >= 2 * threads:
+                out.write(pending.pop(0).result())
+        for fut in pending:
+            out.write(fut.result())
+
+
 def _write_archive(files: list[tuple[str, Path]], archive: Path, fmt: str, entrypoint: str | None) -> None:
     archive.parent.mkdir(parents=True, exist_ok=True)
     if fmt == "zip":
@@ -129,7 +170,19 @@ def _write_archive(files: list[tuple[str, Path]], archive: Path, fmt: str, entry
             for rel, path in files:
                 zf.write(path, rel)
         return
-    mode = {"tar.gz": "w:gz", "tar.xz": "w:xz"}[fmt]
+    threads = gzip_threads() if fmt == "tar.gz" else 1
+    if threads > 1:                                          # the tar first (uncompressed, beside the archive), then the parallel gzip
+        plain = archive.with_name(archive.name + ".tar-part")
+        try:
+            _write_tar(files, plain, "w", entrypoint)
+            _parallel_gzip(plain, archive, threads)
+        finally:
+            plain.unlink(missing_ok=True)
+        return
+    _write_tar(files, archive, {"tar.gz": "w:gz", "tar.xz": "w:xz"}[fmt], entrypoint)
+
+
+def _write_tar(files: list[tuple[str, Path]], archive: Path, mode: str, entrypoint: str | None) -> None:
     with tarfile.open(archive, mode) as tar:
         for rel, path in files:
             info = tar.gettarinfo(str(path), arcname=rel)

@@ -31,7 +31,7 @@ WINDOWS = os.name == "nt"
 class RuntimeTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="strata-runtime-test-")
-        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(self._remove_temp)
         self.root = Path(self.temp.name)
         env = mock.patch.dict(os.environ, {"STRATA_PROFILE_DIR": str(self.root / "profiles"),
                                        "STRATA_RUNTIME_DIR": str(self.root / "runtime")})
@@ -78,6 +78,19 @@ class RuntimeTests(unittest.TestCase):
                                             "host": "127.0.0.1", "port": 0}), encoding="utf-8")
         profiles.create("local", str(self.config))
         self.addCleanup(self._stop)
+
+    def _remove_temp(self):
+        # On Windows the stopped host can still hold runtime\local.host.log for a moment while it exits (seen on a GitHub runner): retry for
+        # up to 10 s, then fail with the path that stayed open
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                self.temp.cleanup()
+                return
+            except PermissionError:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(0.25)
 
     def _stop(self):
         try:

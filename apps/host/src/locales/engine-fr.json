@@ -41,5 +41,6 @@
  "et40": "Le moteur n’a pas été supprimé. Rien d’autre n’a été modifié.",
  "et41": "Le moteur n’a pas été changé. Rien n’a été modifié.",
  "et42": "Choisissez un moteur dans la liste.",
- "et43": "Cet ordinateur a déjà un moteur plus récent. La mise à jour bascule dessus ; rien n’est téléchargé."
+ "et43": "Cet ordinateur a déjà un moteur plus récent. La mise à jour bascule dessus ; rien n’est téléchargé.",
+ "et44": "{0} fonctionnera avec le moteur {1} dès son prochain démarrage. Vos modèles et réglages restent inchangés. Vous pouvez revenir en arrière à tout moment."
 }

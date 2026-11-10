@@ -6,6 +6,7 @@ against the mock engine (no GPU, no pack).
 from __future__ import annotations
 
 import contextlib
+import errno
 import http.client
 import io
 import json
@@ -82,6 +83,13 @@ class ListenAddress(unittest.TestCase):
             self.assertEqual(httpd.address_family, socket.AF_INET6)
             c = http.client.HTTPConnection("::1", httpd.server_address[1], timeout=10)
             try:
+                try:
+                    c.connect()
+                except OSError as e:
+                    # a box whose loopback has no ::1 (IPv6 off for lo: Boston) can listen on :: but not reach ::1
+                    if e.errno in (errno.EADDRNOTAVAIL, errno.ENETUNREACH, errno.EAFNOSUPPORT):
+                        self.skipTest(f"no IPv6 loopback address (::1) on this computer: {e}")
+                    raise
                 c.request("GET", "/health")
                 r = c.getresponse()
                 self.assertEqual(r.status, 200)

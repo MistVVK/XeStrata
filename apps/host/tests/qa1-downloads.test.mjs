@@ -152,7 +152,7 @@ test('4d: picture reading is on unless the person turned it off (no saved choice
   const screen = readSource(new URL('../src/components/NativeModels.tsx', import.meta.url), 'utf8');
   // the rule lives in lib/pictures-choice.ts (GUI-FB2 item 4); the page opens a version with it the first time it sees it installed
   const choice = readSource(new URL('../src/lib/pictures-choice.ts', import.meta.url), 'utf8');
-  assert.match(choice, /installed\.visionEnabled === false && installed\.visionPrepared !== false\) return 'no'/);
+  assert.match(choice, /installed\.visionEnabled === false && \(installed\.visionPrepared !== false \|\| installed\.visionChosen === true\)\) return 'no'/);
   assert.match(screen, /shownVision\(known, installed\)/);
   assert.match(screen, /shownVision\(visionPicks\.current\.get\(selectedSize\.id\), undefined\)/, 'a version that is not downloaded starts with Read pictures on');
 });

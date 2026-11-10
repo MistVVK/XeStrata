@@ -7,6 +7,8 @@
 #   BUILD_VISION=0 spark/build_engine.sh     # text only (faster)
 #   BUILD_DSV41=0 spark/build_engine.sh      # without the DeepSeek-V4.1 engine (strata-dsv41)
 #   ARCHS="121" OUT=/tmp/eng JOBS=8 spark/build_engine.sh
+#   SHAPE=q4_lite spark/build_engine.sh      # the engine of a model shape (packaging/shape_build.sh); no DeepSeek engine unless BUILD_DSV41=1
+#   STRATA_CMAKE_EXTRA="-DSTRATA_GEOMETRY_FILE=/abs/path/geometry.hpp"   more configure arguments for the engine build
 #
 # The result is the folder setup.py keeps a ready-made engine in: copy it to Strata/engine on the Spark and run
 # ./setup.sh there (docs/DGX_SPARK_LINUX.md).  packaging/build_cuda_linux_aarch64.sh runs this and then makes the engine
@@ -43,7 +45,9 @@ case "$cudafull" in
   *) echo "build_engine.sh: needs the CUDA 13 toolkit (nvcc here: ${cudafull:-missing})" >&2; exit 2 ;;
 esac
 # the commit the DeepSeek engine prints with --version: a checkout gives it to CMake itself; a tree copy without .git needs COMMIT=<hex>
-want_dsv41=OFF; [ "${BUILD_DSV41:-1}" = 1 ] && want_dsv41=ON
+. "$repo/packaging/shape_build.sh"; shape_setup "$repo"
+dsv41_default=1; [ -n "${SHAPE:-}" ] && dsv41_default=0
+want_dsv41=OFF; [ "${BUILD_DSV41:-$dsv41_default}" = 1 ] && want_dsv41=ON
 if [ "$want_dsv41" = ON ] && [ ! -e "$repo/.git" ] && [ ! -f "$repo/BUILD_ID" ]; then
   [ -n "${COMMIT:-}" ] || { echo "build_engine.sh: $repo has no .git and no BUILD_ID: set COMMIT=<hex> so the DeepSeek engine can print its commit" >&2; exit 2; }
   printf '%s\n' "$(printf '%s' "$COMMIT" | cut -c1-9)" > "$repo/BUILD_ID"
@@ -55,7 +59,7 @@ cd "$repo"
 "$cmake" -G Ninja -S . -B "$build" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_TESTS=OFF \
     -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_PORTABLE=ON -DSTRATA_Q6K_EXPERTS=ON -DSTRATA_MMQ_KQUANTS=ON \
     -DSTRATA_BUILD_DSV41="$want_dsv41" -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON -DCMAKE_SKIP_BUILD_RPATH=OFF '-DCMAKE_INSTALL_RPATH=$ORIGIN' \
-    "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" $ggml
+    "-DCMAKE_CUDA_ARCHITECTURES=${real};${last}-virtual" $ggml ${STRATA_CMAKE_EXTRA:-} $shape_cmake
 rm -f "$build/strata-dsv41"
 if [ "$want_dsv41" = ON ]; then
   "$cmake" --build "$build" --target strata strata_kq strata-dsv41 -j "$jobs"

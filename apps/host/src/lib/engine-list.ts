@@ -3,8 +3,10 @@ import { nativeCatalogModels } from './native-catalog';
 
 /** The parts of Settings > Engine that need no React: the list's shape, sizes, makes, version order, and which models need a newer engine. */
 /** One engine package installed on this computer, as Control lists it (`strata components engines`, strata_control/engine_library.py). */
+/** qwen, deepseek, or the engine of a Qwen4 model shape: shape:<shape> (strata_control/engine_library.py SHAPE_PREFIX; an id, never shown). */
+export type EngineFamily = 'qwen' | 'deepseek' | `shape:${string}`;
 export interface InstalledEngine {
-  family: 'qwen' | 'deepseek';
+  family: EngineFamily;
   folder: string;
   version: string;
   backend: string;
@@ -26,7 +28,20 @@ export interface InstalledEngine {
   path?: string;
   root?: string;
 }
-export interface EngineGroup { family: 'qwen' | 'deepseek'; title: string; engines: InstalledEngine[] }
+export interface EngineGroup { family: EngineFamily; /** a model shape's engine: its shape (q4_lite) */ shape?: string; /** null for a shape: the page names it (engineGroupTitle) */ title: string | null; engines: InstalledEngine[] }
+
+/** The model family of the feed that runs on a shape's engine (strata_control/shape_engine.py family_of). */
+const SHAPE_FAMILY_PREFIX = 'qwen4exp_';
+/**
+ * The heading of a group in Settings > Engine: Control's title for the Qwen and DeepSeek engines; for a model shape's engine the model's own title from the
+ * catalog (as the DeepSeek group is called by its model), the shape's name when the catalog does not have it. No new words; the family id is never shown.
+ */
+export function engineGroupTitle(group: EngineGroup, catalogFamilies: readonly { family: string; title?: string | null }[] | null | undefined): string {
+  if (group.title) return group.title;
+  const shape = group.shape ?? (group.family.startsWith('shape:') ? group.family.slice(6) : '');
+  const title = (catalogFamilies ?? []).find(f => f.family === SHAPE_FAMILY_PREFIX + shape)?.title;
+  return title?.trim() || shape;
+}
 export interface EngineList { available: boolean; families: EngineGroup[]; total_bytes: number }
 
 /** The make of graphics card an engine is built for, in the words a person knows. */

@@ -33,8 +33,8 @@ test('2: pictures are on by default; a missing reader says nothing wordy and sav
   assert.match(host, /const noReader=args\.visionUnavailable===true;/);
   assert.match(host, /const visionPreferences=args\.vision!==undefined&&!noReader\?/, 'nothing is saved when the reader is missing');
   assert.match(host, /runtimeVision\(config,noReader\?'no':args\.vision\)/);
-  // An "off" that sits on a model without the picture files is not a choice of the person: it starts on.
-  assert.match(readFileSync(new URL('../src/lib/pictures-choice.ts', import.meta.url), 'utf8'), /installed\.visionEnabled === false && installed\.visionPrepared !== false\) return 'no'/);
+  // An old "off" (no marker) that sits on a model without the picture files is not a choice of the person: it starts on.
+  assert.match(readFileSync(new URL('../src/lib/pictures-choice.ts', import.meta.url), 'utf8'), /installed\.visionEnabled === false && \(installed\.visionPrepared !== false \|\| installed\.visionChosen === true\)\) return 'no'/);   // since 0.2.14 an off with the marker (ui_vision_chosen) holds too: tests/pictures-hold.test.mjs
 });
 
 test('6: the conversation context opens at 128K for every configuration, or the model largest size when that is smaller; a warning, never a refusal', async () => {

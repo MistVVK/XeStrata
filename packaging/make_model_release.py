@@ -231,7 +231,7 @@ def model_entry(s: dict, a) -> dict:
     ctx = (geo.get("keys") or {}).get("context_length")
     return {
         "_status": "DRAFT: made from the intake report by packaging/make_model_release.py; field names follow the Q4-PREP-B brief and are to be checked against strata_control/feed.py",
-        "id": a.id, "title": g.get("name") or d.get("title"), "by": d.get("by"),
+        "id": a.id, "title": a.title or g.get("name") or d.get("title"), "by": d.get("by"),
         "licence": {"name": g.get("license"), "url": g.get("license.link") or "[FILL: licence URL]"},
         "family": entry_family(s, a), "hf": {"repo": a.hf_repo or "[FILL: repository]", "revision": a.revision or "[FILL: pinned commit]"},
         "files": [{"name": f["name"], "size": f["size"], "sha256": f.get("sha256")} for f in s["files"]],
@@ -257,7 +257,7 @@ def feed_entry(s: dict, a) -> dict:
         files.append(item)
     first = s["files"][0]["name"]
     quant = a.quant or a.hf_dir or (first.rsplit("/", 1)[0] if "/" in first else "[FILL: quant name]")
-    e = {"id": a.id, "title": g.get("name") or d.get("title") or a.id, "by": a.by or d.get("by") or "[FILL: who made the model]",
+    e = {"id": a.id, "title": a.title or g.get("name") or d.get("title") or a.id, "by": a.by or d.get("by") or "[FILL: who made the model]",
          "about": a.about or "[FILL: one plain sentence]",
          "licence": a.licence or g.get("license") or "[FILL: licence]",
          "licence_url": a.licence_url or g.get("license.link") or "[FILL: https licence url]",
@@ -275,6 +275,38 @@ def feed_entry(s: dict, a) -> dict:
             if d.get(k) is not None:
                 e[k] = d[k]
     return e
+
+
+def builtin_sizes() -> set | None:
+    """The built-in size names (setup.py MODELS), which a feed size may not take: None when setup.py cannot be read here."""
+    import contextlib
+    import io
+    sys.path.insert(0, str(ROOT))
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            import setup as setup_mod
+        return set(setup_mod.MODELS)
+    except (Exception, SystemExit):                       # noqa: BLE001 - the launch line then names both possible spellings
+        return None
+
+
+def launch_lines(entry: dict, sizes: set | None) -> list[str]:
+    """The `strata launch` lines for each size of the feed entry, with the size name a person types: the quant's name, or <quant>-<id> when that
+    name is a built-in size (strata_control/feed_models.py _flash_next takes the same decision)."""
+    out = []
+    mid = entry.get("id")
+    for q in entry.get("quants") or []:
+        name = str(q.get("name"))
+        if sizes is None:
+            keys = [name, "%s-%s" % (name, mid)]
+        else:
+            keys = ["%s-%s" % (name, mid) if name in sizes else name]
+        for key in keys:
+            out.append("strata launch --family %s --model %s" % (mid, key.lower()))
+            out.append("strata launch --family %s --model %s --model-path <the folder with the files>   # files already on the computer (an Intel Arc card: always)" % (mid, key.lower()))
+    if sizes is None:
+        out.append("# setup.py could not be read here: the size is the first spelling unless its quant name is a built-in size")
+    return out
 
 
 def render_md(p: dict, a) -> str:
@@ -304,6 +336,11 @@ def render_md(p: dict, a) -> str:
     out.append("Kept from the previous release (same files, not uploaded again): %d files, %s." % (len(p["kept"]), gib(sum(k["size"] or 0 for k in p["kept"]))))
     out.append("")
     out.append("New to upload: %s in %d files; %s." % (gib(p["upload_bytes"]), len(p["changed"]), upload_minutes(p["upload_bytes"])))
+    if p.get("launch"):
+        out.append("")
+        out.append("## How a person starts it (the size name as the Terminal takes it)")
+        out.append("")
+        out += ["    " + line for line in p["launch"]]
     return "\n".join(out) + "\n"
 
 
@@ -315,7 +352,7 @@ def template_values(s: dict, p: dict, a) -> dict:
     g = s.get("general", {})
     rows = "\n".join("| %s | %s | %s |" % (f["name"], ("%.1f GB" % (f["size"] / 1e9)), (f.get("sha256") or "[FILL: sha256]")[:16] + ("..." if f.get("sha256") else ""))
                      for f in s["files"])
-    return {"model_title": g.get("name") or s["files"][0]["name"], "app_version": a.app_version, "engine_version": a.engine_version or "[FILL: engine version]",
+    return {"model_title": a.title or g.get("name") or s["files"][0]["name"], "app_version": a.app_version, "engine_version": a.engine_version or "[FILL: engine version]",
             "sequence": a.sequence, "case": p["case"], "file_rows": rows, "total_gb": "%.1f" % (s["size_bytes"] / 1e9),
             "n_files": len(s["files"]), "licence": g.get("license") or "[FILL: licence]", "licence_url": g.get("license.link") or "[FILL: licence URL]",
             "family": s.get("architecture"), "repo": a.hf_repo or "[FILL: repository]", "revision": a.revision or "[FILL: pinned commit]",
@@ -339,6 +376,7 @@ def main(argv=None) -> int:
     ap.add_argument("--hf-repo")
     ap.add_argument("--hf-dir")
     ap.add_argument("--default-context", type=int)
+    ap.add_argument("--title", help="the model's title in the feed entry and the notes (default: the file's general.name, e.g. 'Qwen3.8-Flash-Next GSQ-RCO')")
     ap.add_argument("--by", help="the feed entry's `by` (who made the model)")
     ap.add_argument("--about", help="the feed entry's one plain sentence")
     ap.add_argument("--licence", help="the licence name (default: the file's general.license)")
@@ -369,10 +407,13 @@ def main(argv=None) -> int:
             raise SystemExit("case B: give --shape, the name of the geometry the engines are compiled for (like q4_lite: lower case, digits and _); that engine ships as its own component")
     elif a.shape:
         raise SystemExit("--shape is for case B (a model of a new shape); case A runs on the engines as they are")
+    if case == "A" and a.write and not a.min_engine:
+        raise SystemExit("case A: give --min-engine, the first engine version that runs the model (the entry needs it, and build-feed refuses an entry that still says [FILL])")
     prev = scan_upload(a.prev_upload)
     if a.prev_upload is None:
         print("note: no --prev-upload, so sizes of the files that stay or get rebuilt are unknown", file=sys.stderr)
     p = plan(report, a.set, a, prev)
+    p["launch"] = launch_lines(feed_entry(s, a), builtin_sizes())
     if a.json:
         print(json.dumps(p, indent=1))
     else:

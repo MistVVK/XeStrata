@@ -83,16 +83,30 @@ def add_parsers(sp, components_sp) -> list:
     _common(engines)
     use = components_sp.add_parser("use", help="switch to an installed engine (nothing is downloaded); `newest` goes back to following updates")
     use.add_argument("engine", help="a version (0.1.54), a folder name, or newest")
-    use.add_argument("--family", choices=("qwen", "deepseek"), default=None, help="which engine family when both have that version (default: either)")
+    use.add_argument("--family", choices=_ENGINE_FAMILIES, default=None, help="which engine family when both have that version (default: either)")
     _common(use)
     remove = components_sp.add_parser("remove", help="delete an installed engine (never the one in use); models and settings are not touched")
     remove.add_argument("engine", help="a version (0.1.54) or a folder name")
-    remove.add_argument("--family", choices=("qwen", "deepseek"), default=None)
+    remove.add_argument("--family", choices=_ENGINE_FAMILIES, default=None)
     _common(remove)
     install_file = components_sp.add_parser("install-file", help="install an engine package you downloaded yourself (no network; the package's signature is checked)")
     install_file.add_argument("file", help="the engine package (.tar.gz or .zip) from the release page")
     _common(install_file)
     return [update, comp_update, rollback, install_file, engines, use, remove]
+
+
+class _EngineFamilies(tuple):
+    """The --family values of `strata components use | remove`: qwen, deepseek, and the engine of a Qwen4 model shape as shape:<shape> (what the app
+    passes, strata_control/engine_library.py SHAPE_PREFIX). Help and error texts list the two as before."""
+
+    def __contains__(self, value) -> bool:
+        if tuple.__contains__(self, value):
+            return True
+        from strata_control import engine_library
+        return engine_library.shape_of_family(value) is not None
+
+
+_ENGINE_FAMILIES = _EngineFamilies(("qwen", "deepseek"))
 
 
 def _emit_factory(a, lines: list):
@@ -412,7 +426,7 @@ def _engines_command(a, ctx, machine: bool, fail) -> int:
             return 0
         print(f"Engines on this computer ({_gb(listing['total_bytes'])} in total)")
         for family in listing["families"]:
-            print(f"\n{family['title']}")
+            print(f"\n{family['title'] or family.get('shape') or family['family']}")      # a model shape's engine: its shape's name, as shape_engine.py names it here
             for e in family["engines"]:
                 tags = ["in use" if e["active"] else "", "newest" if e["newest"] else "", "" if e["fits"] else "not for this computer"]
                 print(f"  {e['version']:<12}{_gb(e['bytes']):>9}  {e['backend'] + ('-' + e['variant'] if e['variant'] else ''):<14}{', '.join(t for t in tags if t)}")

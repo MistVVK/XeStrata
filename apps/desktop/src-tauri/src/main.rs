@@ -874,6 +874,10 @@ fn main() {
         if !options.window_child {
             std::process::exit(supervisor::run(&options));
         }
+        // A window process its shell did not start is the app updater's restart (the shell that owned the window is stopping): start Strata again normally.
+        if !supervisor::started_by_shell(std::env::var(supervisor::SHELL_PID_ENV).ok().as_deref(), std::os::unix::process::parent_id()) {
+            std::process::exit(supervisor::restart_after_update());
+        }
         run_window_process();
     }
     #[cfg(not(target_os = "linux"))]

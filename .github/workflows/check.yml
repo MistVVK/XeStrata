@@ -138,6 +138,23 @@ jobs:
           cache-dependency-path: apps/host/package-lock.json
       - name: Python packages
         run: python -m pip install -r requirements.txt -r requirements-dev.txt -r requirements-build.txt
+      # Diagnostic, not a check: what a Windows PowerShell 5.1 child returns when its parent runs under PowerShell 7 (a user who starts
+      # the app or `strata` from a PowerShell 7 window). The tests drop PowerShell 7's PSModulePath entries; the product does not yet.
+      - name: PowerShell 7 parent (diagnostic)
+        if: ${{ startsWith(matrix.only, 'host') }}
+        continue-on-error: true
+        shell: pwsh
+        env:
+          STRATA_HOME: ${{ runner.temp }}\ps7-probe
+        run: |
+          "PSModulePath: $env:PSModulePath"
+          "--- powershell.exe Get-CimInstance | Select-Object (as hardware.mjs)"
+          powershell.exe -NoProfile -NonInteractive -Command "Get-CimInstance Win32_VideoController | Select-Object Name,PNPDeviceID | ConvertTo-Json -Compress"
+          "exit $LASTEXITCODE"
+          "--- the host's hardware probe (apps/host/server/hardware.mjs detect)"
+          node -e "import('./apps/host/server/hardware.mjs').then(m => m.detect({ force: true })).then(h => console.log(JSON.stringify({ cpu: h.cpu, gpus: h.gpus })), e => console.log('ERROR', e && e.stack))"
+          "--- setup.py cpu_info (powershell Get-CimInstance Win32_Processor)"
+          python -c "import setup; print(repr(setup.cpu_info()))"
       # tools/check finds Visual Studio's compiler itself (vcvars64.bat); bash is Git for Windows' (the tester-README tests need it)
       - name: tools/check
         run: python tools/check --only "${{ matrix.only }}" --keep --scratch "$env:RUNNER_TEMP\check" --json "$env:RUNNER_TEMP\check\result.json"
@@ -182,4 +199,13 @@ jobs:
       - name: Python packages
         run: python -m pip install -r requirements.txt -r requirements-dev.txt
       - name: tools/check
-        run: python tools/check --only "${{ matrix.only }}"
+        run: python tools/check --only "${{ matrix.only }}" --keep --scratch "$RUNNER_TEMP/check" --json "$RUNNER_TEMP/check/result.json"
+      - name: Logs
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: check-macos-${{ strategy.job-index }}
+          path: |
+            ${{ runner.temp }}/check/*.log
+            ${{ runner.temp }}/check/result.json
+          retention-days: 7

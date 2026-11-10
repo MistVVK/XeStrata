@@ -3,6 +3,7 @@
 #
 #   packaging/build_sycl_linux.sh                       # the release package: GPU code JIT-compiled from SPIR-V (A-series and B-series)
 #   AOT=bmg-g21,bmg-g31 packaging/build_sycl_linux.sh   # a Battlemage-only build of your own, GPU code built ahead of time (not a release package)
+#   SHAPE=q4_lite packaging/build_sycl_linux.sh         # the engine of a model shape, its own component (packaging/shape_build.sh)
 #
 # Run it on a Linux x86_64 box with Intel oneAPI DPC++ (icx / icpx 2026.1 or newer, oneMKL) installed under $ONEAPI (default
 # /opt/intel/oneapi), `patchelf` (apt install patchelf, or pip install patchelf in a venv and put it on PATH) and, for an AOT build,
@@ -37,6 +38,7 @@ command -v icpx >/dev/null || { echo "build_sycl_linux.sh: icpx is not on PATH a
 iccver=$(icpx --version | sed -n 's/.*Compiler \([0-9][0-9.]*\).*/\1/p' | head -1)
 
 cd "$repo"
+. "$repo/packaging/shape_build.sh"; shape_setup "$repo"
 ggml=""
 # ggml is the vendored third_party/strata-ggml. STRATA_GGML_DIR=<llama.cpp checkout> (or LLAMA_CPP=, the name this script used before) builds from that
 # checkout instead: an override kept for two releases. (LLAMA_CPP used to set a FetchContent variable that the CMake files stopped reading when ggml was
@@ -45,7 +47,7 @@ override=${STRATA_GGML_DIR:-${LLAMA_CPP:-}}
 [ -z "$override" ] || ggml="-DSTRATA_GGML_DIR=$override"
 # shellcheck disable=SC2086
 cmake -S sycl -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
-    -DSTRATA_SYCL_PARITY=OFF -DSTRATA_SYCL_IQ_DECODE_FAST=${IQ_DECODE_FAST:-ON} ${aot:+"-DSTRATA_SYCL_AOT=$aot"} $ggml ${STRATA_CMAKE_EXTRA:-}   # STRATA_CMAKE_EXTRA: e.g. -DSTRATA_GEOMETRY_FILE=/abs/path/geometry.hpp
+    -DSTRATA_SYCL_PARITY=OFF -DSTRATA_SYCL_IQ_DECODE_FAST=${IQ_DECODE_FAST:-ON} ${aot:+"-DSTRATA_SYCL_AOT=$aot"} $ggml ${STRATA_CMAKE_EXTRA:-} $shape_cmake   # STRATA_CMAKE_EXTRA: e.g. -DSTRATA_GEOMETRY_FILE=/abs/path/geometry.hpp
 cmake --build "$build" --target strata -j "$jobs"
 
 ver=$(sed -n 's/^[[:space:]]*project([^)]*VERSION[[:space:]]*\([0-9][0-9.]*\).*/\1/p' CMakeLists.txt | head -1)
@@ -65,11 +67,12 @@ done
 for f in "$stage/strata" "$stage"/*.so "$stage"/*.so.*; do
   [ -f "$f" ] && [ ! -L "$f" ] && { readelf -d "$f" | grep -q 'RUNPATH.*\[\$ORIGIN\]' || { echo "build_sycl_linux.sh: $(basename "$f") has no RUNPATH \$ORIGIN" >&2; exit 1; }; }
 done
+shape_check "$stage/strata"
 if [ -n "$aot" ]; then arch_args=$(echo "$aot" | tr ',' '\n' | sed 's/^/--arch /' | tr '\n' ' '); else arch_args="--arch intel-arc"; fi
 mkdir -p "$out"
 # shellcheck disable=SC2086
 "$py" packaging/package_engine.py --src "$stage" --backend sycl --version "$ver" --out "$out" $arch_args \
-    --platform linux-x86_64 --build-id "${commit}-oneapi${iccver}" --include SYSTEM-LIBS.txt
+    --platform linux-x86_64 --build-id "${commit}-oneapi${iccver}" --include SYSTEM-LIBS.txt $shape_pkg
 for d in "$out"/*/; do
   "$py" packaging/package_engine.py --verify "$d"; "$py" packaging/binary_deps.py "$d"
   env -i "$d/strata" --version > /dev/null || { echo "build_sycl_linux.sh: env -i $d/strata --version does not run" >&2; exit 1; }

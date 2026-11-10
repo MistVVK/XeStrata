@@ -10,7 +10,7 @@ import { transform } from 'esbuild';
 
 const root = resolve(import.meta.dirname, '..');
 const { code } = await transform(readFileSync(resolve(root, 'src/lib/overlay-place.ts'), 'utf8'), { loader: 'ts', format: 'esm' });
-const { placeAnchored, measureScale, sane } = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
+const { placeAnchored, measureScale, measureFrame, sane } = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
 
 const VIEWPORTS = [[1920, 1080], [1536, 864], [1280, 720], [1024, 700], [900, 600], [640, 480], [360, 640]];
 const SCALES = [0.9, 1, 1.1, 1.25, 1.5, 1.75, 2];   // the "Interface size" choices (store.ts)
@@ -124,8 +124,11 @@ test('the scale is measured from the page itself, and a failed measure is 1', ()
 test('every anchored panel uses the scale-aware numbers', () => {
   const read = f => readFileSync(resolve(root, 'src', f), 'utf8');
   assert.match(read('components/FloatingMenu.tsx'), /placeAnchored\(/);
-  for (const f of ['components/Popover.tsx', 'components/ui.tsx', 'components/VersionMemoryTooltip.tsx', 'app/Sidebar.tsx'])
-    assert.match(read(f), /measureScale\(\)/, f);
+  for (const f of ['components/FloatingMenu.tsx', 'components/Popover.tsx', 'components/ui.tsx', 'components/VersionMemoryTooltip.tsx', 'app/Sidebar.tsx', 'screens/Chat.tsx']) {
+    assert.match(read(f), /measureFrame\(\)/, f);
+    // the window's size comes from the same measure as the rectangles (WebView2 122 counts them differently: QAGUI-STRIX 11-09)
+    assert.doesNotMatch(read(f), /window\.inner(Width|Height) - /, f);
+  }
   assert.doesNotMatch(read('components/FloatingMenu.tsx'), /calc\(100dvh - \$\{placed\.top/, 'the viewport-unit max height is gone');
 });
 
@@ -154,5 +157,42 @@ test('the Select list is placed by the shared function, with no fixed cap and no
   assert.match(ui, /maxHeight: placed\.maxHeight/);
   assert.doesNotMatch(ui, /data-up=\{placed\.up/);
   assert.doesNotMatch(ui, /Math\.min\(320, options\.length/);
+});
+
+// QAGUI-STRIX 11-09: on WebView2 122 (Chromium before 128) the More menu opened off the window at 125% and up. That engine reports rectangles in the
+// page's own pixels under a zoomed root (a 100 px probe measures 100) while innerWidth/innerHeight stay screen pixels; the current engine reports both
+// in screen pixels. A fake page of each kind: the window's size is read from a fixed box measured like any rectangle, so it matches the anchor.
+// Real engine check: Edge with --disable-blink-features=StandardizedBrowserZoom behaves as the old one (phaseA-tests/par/appwin/menus.mjs).
+function fakeEngine({ zoom, standard, inner }) {
+  const unit = standard ? zoom : 1;   // screen pixels per unit the rectangles are reported in
+  globalThis.document = { createElement: () => { const el = { style: { cssText: '' }, remove() {} };
+    el.getBoundingClientRect = () => el.style.cssText.includes('width:100px') ? { width: 100 * unit, height: unit }
+      : { width: standard ? inner.width : inner.width / zoom, height: standard ? inner.height : inner.height / zoom };
+    return el; } };
+  globalThis.window = { innerWidth: inner.width, innerHeight: inner.height };
+  return { toScreen: css => css * zoom, rect: screen => standard ? screen : screen / zoom };
+}
+
+test('WebView2 122 and the current engine: the More menu at the foot of the sidebar is inside the window at every Interface size', () => {
+  const host = { appendChild() {} };
+  try {
+    for (const standard of [true, false]) for (const [w, h] of [[1440, 920], [1024, 700], [1920, 1080]]) for (const zoom of [0.9, 1, 1.25, 1.5, 1.75]) {
+      const eng = fakeEngine({ zoom, standard, inner: { width: w, height: h } });
+      const { scale, viewport } = measureFrame(host);
+      // the More item on the screen: 12 px from the left and the bottom, 40 CSS px tall, 232 wide; the menu is 107 CSS px tall
+      const item = { left: 12 * zoom, top: h - 52 * zoom, right: 244 * zoom, bottom: h - 12 * zoom };
+      const anchor = { left: eng.rect(item.left), top: eng.rect(item.top), right: eng.rect(item.right), bottom: eng.rect(item.bottom) };
+      const p = placeAnchored({ anchor, size: { width: 232 * scale, height: 107 * scale }, viewport, scale });
+      const top = eng.toScreen(p.top), bottom = top + Math.min(107, p.maxHeight) * zoom;
+      const tag = `${standard ? 'current' : 'WebView2 122'} ${w}x${h} at ${Math.round(zoom * 100)}%`;
+      assert.ok(top >= 0 && bottom <= h, `${tag}: the menu is painted at ${top.toFixed(0)}..${bottom.toFixed(0)} in a ${h} px window`);
+      assert.ok(bottom <= item.top + 1e-6, `${tag}: it does not cover the item`);
+      // the window's size taken from innerWidth/innerHeight (before) puts it off the window on the old engine at 125% and up: the bug
+      if (!standard && zoom >= 1.25 && w === 1440) {
+        const old = placeAnchored({ anchor, size: { width: 232 * scale, height: 107 * scale }, viewport: { width: w, height: h }, scale });
+        assert.ok(eng.toScreen(old.top) + 107 * zoom > h, `${tag}: the old measure was off the window`);
+      }
+    }
+  } finally { delete globalThis.document; delete globalThis.window; }
 });
 

@@ -8,6 +8,7 @@ Runs the real script in a temporary tree with a stub for the `strata` command (P
 from __future__ import annotations
 
 import os
+import sys
 import shutil
 import signal
 import subprocess
@@ -37,7 +38,7 @@ exit 0
 """
 
 
-@unittest.skipIf(os.name == "nt" or SH is None, "needs POSIX sh")
+@unittest.skipUnless(sys.platform.startswith("linux") and SH is not None, "the container entry point runs in a Linux image (POSIX sh with GNU tools)")
 class Entrypoint(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())

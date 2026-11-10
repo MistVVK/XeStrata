@@ -3,12 +3,15 @@
  * are prepared, whether the engine has a reader) only give it its first value for a version, and never overwrite a choice made by hand (GUI feedback 2, item 4:
  * the box used to flip off while Load ran and back on afterwards, because it was re-derived from the host's report as that report changed under the load).
  */
-export interface InstalledPictures { visionEnabled?: boolean; visionPrepared?: boolean; visionDevice?: string; images?: string }
+export interface InstalledPictures { visionEnabled?: boolean; visionPrepared?: boolean; visionDevice?: string; images?: string; /** the saved choice was made with a picture reader present (ui_vision_chosen, 0.2.14) */ visionChosen?: boolean }
 
-/** The value a version opens with: off only when the person turned it off and the files exist; otherwise on (the device they chose, or Automatic). */
+/** The value a version opens with: off when the person turned it off and the files exist, or when they turned it off in 0.2.14 or later (the
+ *  marker: QAGUI-STRIX 11-09, a model set up without the picture files came back ticked after a restart and Load fetched the 866 MB reader);
+ *  otherwise on (the device they chose, or Automatic). An older off without the marker and without the files may be the one 0.2.9 saved while
+ *  the engine had no reader: it still opens on, as before. */
 export function openingVision(installed: InstalledPictures | undefined): string {
   if (!installed) return 'yes';
-  if (installed.visionEnabled === false && installed.visionPrepared !== false) return 'no';
+  if (installed.visionEnabled === false && (installed.visionPrepared !== false || installed.visionChosen === true)) return 'no';
   return installed.visionDevice ?? (installed.images && installed.images !== 'off' ? installed.images : 'yes');
 }
 

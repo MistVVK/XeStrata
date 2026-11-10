@@ -41,5 +41,6 @@
  "et40": "El motor no se eliminó. No se cambió nada más.",
  "et41": "No se cambió el motor. No se modificó nada.",
  "et42": "Elige un motor de la lista.",
- "et43": "Este equipo ya tiene un motor más reciente. Actualizar cambia a él; no se descarga nada."
+ "et43": "Este equipo ya tiene un motor más reciente. Actualizar cambia a él; no se descarga nada.",
+ "et44": "{0} funcionará con el motor {1} a partir de su próximo inicio. Tus modelos y ajustes no cambian. Puedes volver cuando quieras."
 }

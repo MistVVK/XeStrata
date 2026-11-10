@@ -172,9 +172,12 @@ export function runCli(control, args, { env = process.env, timeoutMs = 60_000, s
   });
 }
 
-const failure = (result, fallback) => new ControlError(
-  result.json?.error?.message ?? result.json?.error ?? result.json?.notice ?? (result.stderr.split(/\r?\n/).filter(Boolean).pop() || fallback),
-  { exitCode: result.code, output: result.json });
+/** Control's exit 7 means two things: an engine is serving, or another update holds the update lock (strata_control/updater.py update_lock). The lock is told by its text. */
+export const UPDATE_LOCK_HELD = /another update is already running/i;
+const failure = (result, fallback) => {
+  const message = result.json?.error?.message ?? result.json?.error ?? result.json?.notice ?? (result.stderr.split(/\r?\n/).filter(Boolean).pop() || fallback);
+  return new ControlError(message, { exitCode: result.code, output: result.json, ...(UPDATE_LOCK_HELD.test(String(message)) ? { code: 'update_busy' } : {}) });
+};
 
 /** Operations the app uses. `run` is injectable so the host's tests need no Python. */
 export function createControl({ control = findControl(), env = process.env, run = null } = {}) {
@@ -184,6 +187,18 @@ export function createControl({ control = findControl(), env = process.env, run 
   return {
     control,
     version: control.bundle?.version ?? null,
+    /**
+     * Use the newest whole Control there is now (findControl again), after an update installed one: true when it changed. Every later call runs the new one.
+     * The caller makes sure nothing of the old one is running (native-control.mjs switchControl).
+     */
+    reload({ find = findControl } = {}) {
+      const next = find({ env });
+      if (!next || resolve(next.dir) === resolve(control.dir)) return false;
+      control = next;
+      this.control = next;
+      this.version = next.bundle?.version ?? null;
+      return true;
+    },
     /**
      * The explicit update step. These are the only calls that let Control reach the network: `acquire` removes
      * STRATA_NO_ACQUIRE for that one process. Starting, serving, listing and rolling back never do.
@@ -199,7 +214,7 @@ export function createControl({ control = findControl(), env = process.env, run 
       const result = await call(args, { timeoutMs: 3 * 3600_000, acquire: true, onLine: onEvent ?? (() => {}), signal });
       if (result.json?.ok) return result.json;
       const failed = result.json?.results?.find?.(r => r.status === 'failed');
-      if (failed) throw Object.assign(new ControlError(failed.error, { exitCode: failed.exit_code ?? result.code, output: result.json }), { code: result.code === 7 ? 'engine_serving' : 'update_failed' });
+      if (failed) throw Object.assign(new ControlError(failed.error, { exitCode: failed.exit_code ?? result.code, output: result.json }), { code: result.code === 7 && !UPDATE_LOCK_HELD.test(failed.error ?? '') ? 'engine_serving' : result.code === 7 ? 'update_busy' : 'update_failed' });
       throw failure(result, 'The update failed.');
     },
     /** Install an engine package the person downloaded and chose (the offline path): no network; Control checks the package's own signature. */

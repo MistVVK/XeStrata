@@ -15,6 +15,7 @@
 #                                    strata: default 1 for the rx9070 variant (gfx1200 gfx1201; built and run on an R9700), 0 for the others
 #   SPLIT_DIR=<folder>               ship the strata-split-N-amd binaries of that folder (made by packaging/build_split_hip.sh) beside strata
 #   NO_PACKAGE=1                     stop after the stage folder
+#   SHAPE=q4_lite                    the engine of a model shape, its own component, no DeepSeek engine in it (packaging/shape_build.sh)
 #   VISION_HIP_DEFS="-DGGML_CUDA_FA=OFF"   extra cmake definitions for the GPU reader only
 #
 # Both readers get RUNPATH $ORIGIN (tools/vision/CMakeLists.txt), and every bundled library is patched to $ORIGIN, so the
@@ -40,7 +41,8 @@ case "$V" in
   *)      ARCHS=${ARCHS:?ARCHS=gfx...} ;;
 esac
 NOTE_EXTRA=""; [ "$V" = rx6000 ] && NOTE_EXTRA=" (built, not tested on a real RX 6000 card)"
-if [ -z "${DSV41:-}" ]; then DSV41=0; [ "$V" = rx9070 ] && DSV41=1; fi
+if [ -z "${DSV41:-}" ]; then DSV41=0; [ "$V" = rx9070 ] && [ -z "${SHAPE:-}" ] && DSV41=1; fi
+[ -n "${SHAPE:-}" ] && [ "$DSV41" = 1 ] && { echo "build_hip_linux.sh: SHAPE and DSV41=1 do not go together (a shape package is the Strata engine program only)" >&2; exit 2; }
 ARCHLIST=${ARCHS//;/ }
 DATAARCH=${ARCHS//;/,}
 mkdir -p "$OUT"; S=$OUT/build.status
@@ -58,12 +60,13 @@ HIPDEFS=(-DCMAKE_HIP_COMPILER=$HP/llvm/bin/clang++ -DCMAKE_HIP_COMPILER_ROCM_ROO
          "-DCMAKE_HIP_FLAGS=--rocm-path=$HP --rocm-device-lib-path=$HP/lib/llvm/amdgcn/bitcode")
 st "start $V ($ARCHS) commit $COMMIT"
 cd "$SRC" || exit 1
+. "$SRC/packaging/shape_build.sh"; shape_setup "$SRC"
 if [ -z "${VISION_ONLY:-}" ]; then
   # STRATA_CMAKE_EXTRA: more configure arguments for the engine build, e.g. -DSTRATA_GEOMETRY_FILE=/abs/path/geometry.hpp (a new model shape)
   # shellcheck disable=SC2086
   cmake -G Ninja -S . -B "$OUT/b" -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF -DSTRATA_BUILD_TESTS=OFF \
     -DSTRATA_PREFILL_MMQ=ON "-DCMAKE_HIP_ARCHITECTURES=$ARCHS" "${HIPDEFS[@]}" ${GGML[@]+"${GGML[@]}"} -DSTRATA_PORTABLE=ON \
-    "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath,'\$ORIGIN' -Wl,--enable-new-dtags" ${STRATA_CMAKE_EXTRA:-} > "$OUT/cfg.log" 2>&1
+    "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath,'\$ORIGIN' -Wl,--enable-new-dtags" ${STRATA_CMAKE_EXTRA:-} $shape_cmake > "$OUT/cfg.log" 2>&1
   chk $? "engine configured"
   nice -n 10 cmake --build "$OUT/b" --target strata -j "$JOBS" > "$OUT/build.log" 2>&1
   chk $? "engine built"
@@ -117,6 +120,7 @@ for f in "$STAGE"/*.so "$STAGE"/*.so.*; do [ -f "$f" ] && [ ! -L "$f" ] && patch
 for f in "$STAGE/strata" "$STAGE/strata-vision" "$STAGE/strata-vision-hip" $([ "$DSV41" = 1 ] && echo "$STAGE/strata-dsv41"); do
   st "RUNPATH $(basename "$f"): $(readelf -d "$f" | grep -E 'RPATH|RUNPATH' | cut -d'[' -f2 | tr -d ']' | paste -sd' ')"
 done
+if [ -n "${SHAPE:-}" ]; then shape_check "$STAGE/strata" >> "$S" 2>&1; chk $? "shape $SHAPE"; fi
 # the hipBLASLt version of this ROCm into BUILD.json, and the tuning tables of tools/hip that match it (architecture and version) into tuning/
 python3 packaging/stage_tuning.py --stage "$STAGE" --archs "$ARCHLIST" --rocm "$HP" >> "$OUT/stage_tuning.log" 2>&1
 trc=$?; st "tuning tables rc=$trc: $(tail -n 1 "$OUT/stage_tuning.log")"; [ "$trc" = 0 ] || { st "ABORT tuning tables"; exit 1; }
@@ -125,7 +129,7 @@ rm -rf "$OUT/components"; mkdir -p "$OUT/components/engine"
 ARCHARGS=""; for a in $ARCHLIST; do ARCHARGS="$ARCHARGS --arch $a"; done
 REQ=""; [ "$DSV41" = 1 ] && REQ="--require-dsv41"
 python3 packaging/package_engine.py --src "$STAGE" --backend hip --version "$PKGVER" --out "$OUT/components/engine" $ARCHARGS \
-  --variant "$V" --build-id "$COMMIT+rocm" --tree $REQ --notes "AMD $V build: engine, CPU picture reader, GPU picture reader$([ "$DSV41" = 1 ] && echo ", DeepSeek-V4.1 engine")${NOTE_EXTRA:-}" > "$OUT/package.log" 2>&1
+  --variant "$V" --build-id "$COMMIT+rocm" --tree $REQ $shape_pkg --notes "AMD $V build: engine, CPU picture reader, GPU picture reader$([ "$DSV41" = 1 ] && echo ", DeepSeek-V4.1 engine")${NOTE_EXTRA:-}" > "$OUT/package.log" 2>&1
 chk $? "packaged"
 cat "$OUT/package.log" >> "$S"
 st "BUILD-DONE"

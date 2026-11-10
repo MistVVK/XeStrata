@@ -7,6 +7,8 @@ import { plainEngineError } from './update-messages.mjs';
  */
 
 const FAMILIES = ['qwen', 'deepseek'];
+/** The engine of a Qwen4 model shape (strata_control/engine_library.py SHAPE_PREFIX, shape_engine.SHAPE_RE). */
+const SHAPE_FAMILY = /^shape:[a-z][a-z0-9_]{1,21}[a-z0-9]$/;
 
 /** { status, body } for GET /api/engines. Without Control (a source checkout) the list is not available and the page says so. */
 export async function listEngines(control) {
@@ -26,7 +28,7 @@ export async function listEngines(control) {
 export async function changeEngine(control, action, body, { modelsRunning = () => false } = {}) {
   if (typeof control?.useEngine !== 'function') return { status: 501, body: { error: 'Engines can be switched and deleted in the installed Strata app.' } };
   const family = body?.family, folder = body?.folder;
-  if (!FAMILIES.includes(family) || typeof folder !== 'string' || !/^[0-9A-Za-z][\w.+-]*$/.test(folder)) {
+  if (!(FAMILIES.includes(family) || SHAPE_FAMILY.test(String(family ?? ''))) || typeof folder !== 'string' || !/^[0-9A-Za-z][\w.+-]*$/.test(folder)) {
     return { status: 400, body: { error: 'Choose an engine from the list.' } };
   }
   if (action === 'use' && modelsRunning()) {

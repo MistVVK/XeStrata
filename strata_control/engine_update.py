@@ -316,7 +316,7 @@ class ModelGate:
         if not self.allow_stop:
             if self.ask is None:
                 raise updater.UpdateError(
-                    f"{names} {'is' if len(models) == 1 else 'are'} running, and an engine update needs "
+                    f"{names} {'is' if len(models) == 1 else 'are'} running, and the update needs "
                     f"{'it' if len(models) == 1 else 'them'} stopped, so nothing was changed. To let the update stop "
                     f"{'it' if len(models) == 1 else 'them'}: run {NEXT_STEP} again with --stop-model (add --start-again to start "
                     f"{'it' if len(models) == 1 else 'them'} again afterwards). Or stop {'it' if len(models) == 1 else 'them'} yourself first "

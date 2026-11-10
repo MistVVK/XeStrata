@@ -3,6 +3,7 @@
 # for the NVIDIA DGX Spark (GB10, sm_121).
 #
 #   COMMIT=<40 hex> packaging/build_cuda_linux_aarch64.sh
+#   SHAPE=q4_lite COMMIT=<40 hex> packaging/build_cuda_linux_aarch64.sh   # the engine of a model shape: one package, no DeepSeek (packaging/shape_build.sh)
 #
 # Run it on the Spark (arm64 Linux, CUDA 13.0 toolkit, a Python 3 venv with requirements.txt and requirements-build.txt, cmake and
 # ninja on PATH; PYTHON=<that python>).  It runs spark/build_engine.sh, then makes two packages in $OUT (default ./out-engine-cuda13-aarch64):
@@ -27,17 +28,22 @@ ver=${PKGVER:-$(sed -n 's/^[[:space:]]*project([^)]*VERSION[[:space:]]*\([0-9][0
 commit=${COMMIT:-$(git rev-parse HEAD 2>/dev/null || true)}
 [ -n "$commit" ] || { echo "build_cuda_linux_aarch64.sh: set COMMIT=<hex> (no .git here)" >&2; exit 2; }
 export COMMIT=$commit
+. "$repo/packaging/shape_build.sh"; shape_setup "$repo"
+dsv41=1; req=--require-dsv41
+if [ -n "${SHAPE:-}" ]; then dsv41=0; req=$shape_pkg; fi
 stage=$(mktemp -d "${TMPDIR:-/tmp}/strata-engine-stage.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
-OUT=$stage/engine BUILD_VISION=${BUILD_VISION:-1} BUILD_DSV41=1 sh spark/build_engine.sh
+OUT=$stage/engine BUILD_VISION=${BUILD_VISION:-1} BUILD_DSV41=$dsv41 sh spark/build_engine.sh
+shape_check "$stage/engine/strata"
 cudafull=$(sed -n 's/.*"cuda": "\([^"]*\)".*/\1/p' "$stage/engine/BUILD.json")
 id="release-${ver}-cuda13-${cudafull}-aarch64-$(printf '%s' "$commit" | cut -c1-12)"
 mkdir -p "$out/dsv41"
 # the Qwen engine package: strata and the DeepSeek engine beside it (as the Linux x86_64 cuda13 package carries it)
 "$py" packaging/package_engine.py --src "$stage/engine" --backend cuda --version "$ver" --out "$out" --arch sm_121 --arch compute_121 \
-    --min-driver nvidia=$mindriver --variant cuda13 --platform linux-aarch64 --build-id "$id" --require-dsv41 \
+    --min-driver nvidia=$mindriver --variant cuda13 --platform linux-aarch64 --build-id "$id" $req \
     --include SYSTEM-LIBS.txt --include 'libstrata_kq*'
-# the DeepSeek package on its own: its program, BUILD.json and the same CUDA libraries
+# the DeepSeek package on its own: its program, BUILD.json and the same CUDA libraries (none for the engine of a model shape)
+if [ "$dsv41" = 1 ]; then
 ds=$stage/dsv41
 mkdir -p "$ds"
 cp "$stage/engine/strata-dsv41" "$stage/engine/BUILD.json" "$stage/engine/SYSTEM-LIBS.txt" "$ds/"
@@ -45,6 +51,7 @@ for f in "$stage"/engine/*.so.*; do cp "$f" "$ds/"; done
 "$py" packaging/package_engine.py --src "$ds" --backend cuda --version "$ver" --out "$out/dsv41" --arch sm_121 --arch compute_121 \
     --min-driver nvidia=$mindriver --variant cuda13 --platform linux-aarch64 --build-id "$id" --entrypoint strata-dsv41 \
     --include SYSTEM-LIBS.txt
+fi
 for d in "$out"/*/ "$out"/dsv41/*/; do
   [ -f "$d/engine-component.json" ] || continue
   "$py" packaging/package_engine.py --verify "$d"

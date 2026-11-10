@@ -14,6 +14,8 @@ export interface FirstRunInfo {
     gpus: { name: string; vramGb: number | null }[];
     driver?: string | null;
     offer?: { version: string; bytes: number; variant: string; backend: string | null };
+    /** A newer Strata Control in the same feed: the Download takes it too (the Arc fix of 0.2.13.1 came this way). */
+    control?: { version: string; bytes: number } | null;
     message?: string | null;
     reasons?: string[];
     details?: string;
@@ -21,6 +23,8 @@ export interface FirstRunInfo {
 }
 
 export const mb = megabytes;
+/** After the size when the download also brings the newer Strata Control (owner-approved wording, 11-09). */
+export const WITH_CONTROL = " (with the Strata setup update)";
 
 /**
  * Whether this PC still needs its engine. Reads only Control's local answer (no network): the engine is missing and the engine that came
@@ -88,7 +92,7 @@ export function EngineFirstRun({ onDone }: { onDone: () => void }) {
         setProblem('');
         try {
             started.current = true;
-            setJob(await api.post<NativeJob>('/api/native/operations', { kind: 'update-engine', args: { firstRun: true } }));
+            setJob(await api.post<NativeJob>('/api/native/operations', { kind: 'update-engine', args: { firstRun: true, ...(info?.control ? { withControl: true } : {}) } }));
         }
         catch (e) {
             started.current = false;
@@ -148,7 +152,7 @@ export function EngineFirstRun({ onDone }: { onDone: () => void }) {
             : <p>{tr("Strata did not recognise a supported graphics card.")}</p>;
         let main, actions;
         if (info.status === 'offer' && info.offer) {
-            main = <>{found}<p>{tr("To run models on it, Strata needs one download:")}<br/><strong>{tr("The engine for this card")}: {mb(info.offer.bytes)} MB</strong></p>
+            main = <>{found}<p>{tr("To run models on it, Strata needs one download:")}<br/><strong>{tr("The engine for this card")}: {mb(info.offer.bytes + (info.control?.bytes ?? 0))} MB{info.control ? tr(WITH_CONTROL) : null}</strong></p>
                 {info.freeBytes !== undefined && info.freeBytes < info.offer.bytes * 2.5 ? <p className="small inline-error">{tr("The engine needs about {0} GB of free space on this drive and only {1} GB is free. Free some space, then continue.", [Math.ceil(info.offer.bytes * 2.5 / 1e9), (info.freeBytes / 1e9).toFixed(1)])}</p> : null}
                 <p className="small muted">{tr("It comes from Strata’s own update server and is checked before it is used. Your models and chats are never touched by it.")}</p></>;
             actions = <><Btn variant="primary" disabled={busy} onClick={() => void start()}>{tr(failed ? 'Continue' : 'Download the engine')}</Btn>{pick("I already have the file…")}</>;

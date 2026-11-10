@@ -126,6 +126,47 @@ int run_case(const char* name, const std::vector<float>& logits, int n_tokens, i
     return (int) (id_bad + w_bad);
 }
 
+// The fp32 router (variant 3, the one a card without fp64 runs) against the double kernel (variant 0) on the SAME inputs: ids that differ
+// and the largest relative weight difference. Needs a device that runs double (a card with fp64, or an Arc under IGC_EnableDPEmulation=1
+// OverrideDefaultFP64Settings=1); without one it says so and is skipped (the reference check above then covers the fp32 path).
+int f32_vs_double(const char* name, const std::vector<float>& logits, int n_tokens, int n_expert, int k) {
+    auto& q = dpct::get_in_order_queue();
+    if (!q.get_device().has(sycl::aspect::fp64)) {
+        std::printf("  %-26s fp32 vs double: skipped (this device runs no double)\n", name);
+        return 0;
+    }
+    float* d_l = sycl::malloc_device<float>(logits.size(), q);
+    int* d_i[2] = {sycl::malloc_device<int>((size_t) n_tokens * k, q), sycl::malloc_device<int>((size_t) n_tokens * k, q)};
+    float* d_w[2] = {sycl::malloc_device<float>((size_t) n_tokens * k, q), sycl::malloc_device<float>((size_t) n_tokens * k, q)};
+    q.memcpy(d_l, logits.data(), logits.size() * sizeof(float)).wait();
+    std::vector<int> ids[2];
+    std::vector<float> w[2];
+    const int variants[2] = {0, 3};
+    for (int v = 0; v < 2; ++v) {
+        if (!strata::kernels::router_top10_variant(d_l, n_tokens, n_expert, k, d_i[v], d_w[v], nullptr, variants[v])) {
+            std::printf("  %-26s fp32 vs double: variant %d not available\n", name, variants[v]);
+            return 1;
+        }
+        q.wait();
+        ids[v].resize((size_t) n_tokens * k);
+        w[v].resize((size_t) n_tokens * k);
+        q.memcpy(ids[v].data(), d_i[v], ids[v].size() * sizeof(int)).wait();
+        q.memcpy(w[v].data(), d_w[v], w[v].size() * sizeof(float)).wait();
+    }
+    long long id_diff = 0;
+    double worst = 0, worst_abs = 0;
+    for (size_t i = 0; i < ids[0].size(); ++i) {
+        if (ids[0][i] != ids[1][i]) { ++id_diff; continue; }
+        const double a = w[0][i], b = w[1][i];
+        worst_abs = std::max(worst_abs, std::fabs(a - b));
+        worst = std::max(worst, std::fabs(a - b) / (std::fabs(a) > 1e-30 ? std::fabs(a) : 1e-30));
+    }
+    std::printf("  %-26s fp32 vs double: ids differ %lld of %zu   weights max rel %.3e  max abs %.3e\n", name, id_diff, ids[0].size(), worst, worst_abs);
+    sycl::free(d_l, q);
+    for (int v = 0; v < 2; ++v) { sycl::free(d_i[v], q); sycl::free(d_w[v], q); }
+    return id_diff ? 1 : 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -180,6 +221,31 @@ int main(int argc, char** argv) {
 
     std::printf("\nrouter_top10: %d failures over 4 distributions x %d tokens x %d experts, top-%d\n", bad, NT, NE,
                 K);
+
+    // ---- the Qwen4 shapes (Q4-READY): 256 experts top-8 (q4_lite), 512 top-8, 256 top-10, and the fp32 router against the double one
+    // on the same inputs at each (variant 3 vs variant 0; skipped on a device that runs no double)
+    const int shapes[][2] = {{256, 8}, {512, 8}, {256, 10}, {512, 10}};
+    for (const auto& sh : shapes) {
+        const int ne = sh[0], kk = sh[1];
+        char label[64];
+        std::vector<float> r((size_t) NT * ne);
+        for (auto& v : r) v = gauss(rng);
+        std::snprintf(label, sizeof label, "random %dx top-%d", ne, kk);
+        bad += run_case(label, r, NT, ne, kk, 1e-5);
+        bad += f32_vs_double(label, r, NT, ne, kk);
+        std::vector<float> tie((size_t) NT * ne);
+        for (int t = 0; t < NT; ++t)
+            for (int e = 0; e < ne; ++e) tie[(size_t) t * ne + e] = (e < 12) ? 2.0f : gauss(rng);
+        std::snprintf(label, sizeof label, "12-way tie %dx top-%d", ne, kk);
+        bad += run_case(label, tie, NT, ne, kk, 1e-5);
+        bad += f32_vs_double(label, tie, NT, ne, kk);
+        std::vector<float> wide((size_t) NT * ne);
+        for (auto& v : wide) v = 6.0f * gauss(rng);          // a peaked router (large logit spread)
+        std::snprintf(label, sizeof label, "wide %dx top-%d", ne, kk);
+        bad += run_case(label, wide, NT, ne, kk, 1e-5);
+        bad += f32_vs_double(label, wide, NT, ne, kk);
+    }
+    std::printf("router_top10 (with the Qwen4 shapes): %d failures\n", bad);
     if (bad) return 1;
     if (selftest) std::printf("router_top10_parity OK\n");
     return 0;

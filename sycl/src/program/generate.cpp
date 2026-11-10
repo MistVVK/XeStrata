@@ -31,6 +31,7 @@
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/dma_batch.hpp"
 #include "strata/core/device.hpp"
+#include "strata/core/geometry.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/short_cache.hpp"
@@ -1775,6 +1776,18 @@ int main(int argc, char **argv) try {
     for (int i = 1; i < argc && i < 3; ++i) {
         if (std::strcmp(argv[i], "--version") == 0 || std::strcmp(argv[i], "-V") == 0) {
             std::printf("strata %s\n", STRATA_VERSION);
+            return 0;
+        }
+        // `strata --families`: the GGUF architectures this build runs (setup asks before it installs one). The Intel engine has no
+        // qwen35moe path (src/qwen35 is CUDA and HIP only), so it names Flash-Next's alone, as the CUDA build without STRATA_HAVE_QWEN35.
+        if (std::strcmp(argv[i], "--families") == 0) {
+            std::printf("qwen4exp\n");
+            return 0;
+        }
+        // `strata --geometry`: the name of the model shape the kernels are compiled for (the geometry header's kGeometryName: flash_next for the default build);
+        // Control checks it against the shape of the package's signed manifest (strata_control/shape_engine.py)
+        if (std::strcmp(argv[i], "--geometry") == 0) {
+            std::printf("%s\n", strata::core::kGeometryName);
             return 0;
         }
     }

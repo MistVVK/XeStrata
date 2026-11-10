@@ -41,5 +41,6 @@
  "et40": "The engine wasn't deleted. Nothing else was changed.",
  "et41": "The engine wasn't switched. Nothing was changed.",
  "et42": "Choose an engine from the list.",
- "et43": "A newer engine is already on this computer. Update switches to it; nothing is downloaded."
+ "et43": "A newer engine is already on this computer. Update switches to it; nothing is downloaded.",
+ "et44": "{0} runs on engine {1} from its next start. Your models and settings stay as they are. You can switch back at any time."
 }
