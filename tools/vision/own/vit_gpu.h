@@ -20,6 +20,16 @@ namespace strata_vit {
 
 struct VitGpuImpl;
 
+// The GPU classes where this tower is known to be slower than mtmd's GPU reader (VitGpu::prefer_mtmd uses these; pure functions, so the tests need no GPU).
+// NVIDIA Pascal (compute capability 6.x): no tensor cores; mtmd's F16 products accumulate in F16 at twice the float32 rate, ours in float32 (P100: 1.15 to 1.38 of
+// mtmd-GPU's time on pictures of 260 tokens or more, RESULTS-OWN-3V.md 12.1).
+inline bool vit_gpu_slower_nvidia(int cc_major) { return cc_major == 6; }
+// AMD gfx1151 (Strix Halo, Radeon 8060S): the ROCm package's rocBLAS ships only its generic "fallback" Tensile kernels for gfx1151, so every hipBLAS product runs
+// untuned (Windows, Strix: 1.73 to 3.03 of mtmd-HIP's time; the weight products alone 730 ms of a 1,024-token picture against mtmd-HIP's 690 ms for all of it;
+// RESULTS-OWN-3V.md 12.14).  Windows and Linux alike until a Linux gfx1151 box is measured.  `gfx` is the device's arch name (hipDeviceProp_t::gcnArchName,
+// possibly with feature suffixes such as ":xnack-").
+inline bool vit_gpu_slower_amd(const std::string& gfx) { return gfx.rfind("gfx1151", 0) == 0 && (gfx.size() == 7 || gfx[7] == ':'); }
+
 class VitGpu {
 public:
     VitGpu();

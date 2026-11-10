@@ -439,12 +439,17 @@ bool VitGpu::available(std::string& why) {
 
 bool VitGpu::prefer_mtmd(std::string& why) {
 #if defined(STRATA_VIT_HIP)
-    (void) why;
+    hipDeviceProp_t p;
+    if (hipGetDeviceProperties(&p, 0) != hipSuccess) { (void) hipGetLastError(); return false; }
+    if (vit_gpu_slower_amd(p.gcnArchName)) {
+        why = std::string(p.gcnArchName) + ": rocBLAS has only fallback kernels there, the own GPU tower is slower than mtmd";
+        return true;
+    }
     return false;
 #else
     cudaDeviceProp p;
     if (cudaGetDeviceProperties(&p, 0) != cudaSuccess) { (void) cudaGetLastError(); return false; }
-    if (p.major == 6) {
+    if (vit_gpu_slower_nvidia(p.major)) {
         why = "compute capability " + std::to_string(p.major) + "." + std::to_string(p.minor) + " (Pascal): the own GPU tower is slower than mtmd there";
         return true;
     }
