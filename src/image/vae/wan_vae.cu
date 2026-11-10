@@ -244,7 +244,7 @@ struct WanVae {
     uint16_t* gbuf = nullptr;   // [PB][Kmax] f16
     float* abuf = nullptr;      // [PB][OCmax] f32
     std::function<void(const char*, const float*, int, int, int)> dump;
-    int stream_mode = 0;        // 0 one pass, 1 the row-band tail (wan_vae_set_streaming)
+    int stream_mode = 1;        // 1 the row-band tail (always, coordinator 11-10); 0 the one-pass reference (tests)
 };
 
 namespace {

@@ -6,7 +6,7 @@
 // it says "w h 64 1"); it is denormalized like sd.cpp's decode_first_stage does, then decoded.  out.f32: float32
 // planar [4][16h][16w] (before sd.cpp's 0-1 scaling; tools/image/gate/vae_ref.py --png makes the picture).
 // --dump DIR writes every stage as DIR/<name>.f32 (pixel-major [H][W][C]) with DIR/<name>.shape "H W C".
-// --stream on: the small-card row-band path (same bytes, less memory).
+// --stream off: the one-pass reference decode (the product always uses the row bands; same bytes, more memory).
 // --repeat N decodes N times and checks that every run gives the same bytes (run to run), printing each time.
 // Prints one line per run: "decode <ms> ms, peak <MiB> MiB (weights+work <MiB>)".
 #include "strata/image/wan_vae.hpp"
@@ -36,7 +36,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::string vae = argv[1], lat = argv[2], outp = argv[3], dump_dir;
-    int repeat = 1, device = -1, stream = 0;
+    int repeat = 1, device = -1, stream = 1;
     for (int i = 4; i + 1 < argc; i += 2) {
         if (!std::strcmp(argv[i], "--dump")) dump_dir = argv[i + 1];
         else if (!std::strcmp(argv[i], "--repeat")) repeat = std::atoi(argv[i + 1]);
