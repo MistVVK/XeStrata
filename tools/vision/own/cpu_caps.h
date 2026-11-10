@@ -18,7 +18,7 @@
 namespace strata_vit {
 namespace quant {
 
-enum class Isa { Scalar = 0, Avx2 = 1, Avx512 = 2 };
+enum class Isa { Scalar = 0, Avx2 = 1, Avx512 = 2, Neon = 3 };   // Neon: AArch64 only (baseline Advanced SIMD); the x86 tiers are 0 .. 2
 
 struct Caps {
     bool avx2 = false, fma = false, f16c = false, avx512 = false;   // avx512: F, BW, DQ, VL (what the tower's kernels use) and the OS saves the state
@@ -67,11 +67,21 @@ inline bool isa_ok(Isa i) {
     const Caps& c = caps();
     if (i == Isa::Avx512) return c.avx512 && c.avx2 && c.fma;
     if (i == Isa::Avx2) return c.avx2 && c.fma && c.f16c;
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (i == Isa::Neon) return true;             // part of every AArch64 CPU
+#else
+    if (i == Isa::Neon) return false;
+#endif
     return true;
 }
 
-// the best tier this CPU runs, capped by STRATA_FORCE_ISA=scalar|avx2|avx512
+// the best tier this CPU runs, capped by STRATA_FORCE_ISA=scalar|avx2|avx512 (on AArch64: neon, or scalar)
 inline Isa best_isa() {
+#if defined(__aarch64__) || defined(_M_ARM64)
+    if (const char* e = std::getenv("STRATA_FORCE_ISA"))
+        if (std::string(e) == "scalar") return Isa::Scalar;
+    return Isa::Neon;
+#endif
     Isa best = isa_ok(Isa::Avx512) ? Isa::Avx512 : isa_ok(Isa::Avx2) ? Isa::Avx2 : Isa::Scalar;
     if (const char* e = std::getenv("STRATA_FORCE_ISA")) {
         const std::string s(e);
@@ -81,7 +91,7 @@ inline Isa best_isa() {
     return best;
 }
 
-inline const char* isa_name(Isa i) { return i == Isa::Avx512 ? "avx512" : i == Isa::Avx2 ? "avx2" : "scalar"; }
+inline const char* isa_name(Isa i) { return i == Isa::Neon ? "neon" : i == Isa::Avx512 ? "avx512" : i == Isa::Avx2 ? "avx2" : "scalar"; }
 
 // ---- 16-bit floats (bit exact, no hardware needed) ----
 inline float bf16_to_f32(uint16_t h) {

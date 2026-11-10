@@ -238,6 +238,7 @@ int main(int argc, char** argv) {
     std::vector<const CpuOps*> tiers = {&cpu_ops_scalar()};
     if (quant::isa_ok(quant::Isa::Avx2)) tiers.push_back(&cpu_ops_avx2());
     if (quant::isa_ok(quant::Isa::Avx512)) tiers.push_back(&cpu_ops_avx512());
+    if (quant::isa_ok(quant::Isa::Neon)) tiers.push_back(&cpu_ops_neon());
     for (const CpuOps* o : tiers) {
         std::printf("tier %s (tile %d x %d)\n", o->name, o->MR, o->NR);
         test_gemm(*o);

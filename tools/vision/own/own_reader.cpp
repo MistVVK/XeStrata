@@ -42,10 +42,10 @@ bool own_reader_supported(const std::string& mmproj, bool gpu, std::string& why)
         why = "this build has no GPU backend for the own tower";
         return false;
 #endif
-    } else if (quant::best_isa() == quant::Isa::Scalar) {
-        // only the portable kernel tier on this CPU (x86 without AVX2, every Arm CPU until a NEON tier exists): measured 2.1 to 3.7 times mtmd-CPU's time
+    } else if (quant::best_isa() == quant::Isa::Scalar || quant::best_isa() == quant::Isa::Neon) {
+        // only the portable kernel tier on this CPU (x86 without AVX2): measured 2.1 to 3.7 times mtmd-CPU's time; and Arm (the NEON tier) until its gate passes
         // (RESULTS-OWN-3V.md 12.7), so `auto` keeps mtmd here; `--tower own` still runs ours
-        why = "only the portable CPU kernels on this CPU: the own CPU tower is slower than mtmd there";
+        why = quant::best_isa() == quant::Isa::Neon ? "the own CPU tower is not gated on Arm yet" : "only the portable CPU kernels on this CPU: the own CPU tower is slower than mtmd there";
         return false;
     }
     Gguf gg;

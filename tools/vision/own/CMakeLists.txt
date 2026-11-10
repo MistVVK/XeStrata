@@ -56,14 +56,14 @@ endif()
 set(STB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/stb" CACHE PATH "stb_image.h (third_party/stb)")
 
 add_library(strata_vit_own STATIC gguf_lite.cpp vit_geometry.cpp image_prep.cpp vit_ref.cpp own_reader.cpp
-            vit_cpu.cpp cpu_ops.cpp cpu_kernels_scalar.cpp cpu_kernels_avx2.cpp cpu_kernels_avx512.cpp)
+            vit_cpu.cpp cpu_ops.cpp cpu_kernels_scalar.cpp cpu_kernels_avx2.cpp cpu_kernels_avx512.cpp cpu_kernels_neon.cpp)
 find_package(Threads REQUIRED)
 target_link_libraries(strata_vit_own PUBLIC Threads::Threads)
 if(NOT MSVC)
   # the reference's loops are written for the compiler's vectoriser: -O3, and this machine's instruction set when asked (the unit-test and
   # reference builds on the Linux boxes); the helper's portable build keeps the AVX2 baseline its other code has
   option(STRATA_VIT_OWN_NATIVE "build the reference for this CPU (-march=native)" ${STRATA_VIT_OWN_STANDALONE})
-  set_source_files_properties(vit_ref.cpp vit_cpu.cpp cpu_kernels_scalar.cpp PROPERTIES COMPILE_OPTIONS "-O3")
+  set_source_files_properties(vit_ref.cpp vit_cpu.cpp cpu_kernels_scalar.cpp cpu_kernels_neon.cpp PROPERTIES COMPILE_OPTIONS "-O3")
   if(STRATA_VIT_OWN_NATIVE)
     set_source_files_properties(vit_ref.cpp PROPERTIES COMPILE_OPTIONS "-O3;-march=native")
   elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")

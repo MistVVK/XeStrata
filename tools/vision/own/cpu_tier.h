@@ -44,6 +44,7 @@ struct CpuOps {
 const CpuOps& cpu_ops_scalar();
 const CpuOps& cpu_ops_avx2();      // defined only on x86-64 (cpu_ops_avx2 returns the scalar table elsewhere)
 const CpuOps& cpu_ops_avx512();
+const CpuOps& cpu_ops_neon();      // AArch64 only (cpu_ops_neon returns the scalar table elsewhere)
 
 // expf of the C library, out of line and compiled at the baseline (cpu_ops.cpp): the scalar tails of the tiers' softmax
 float cpu_tier_expf(float x);
