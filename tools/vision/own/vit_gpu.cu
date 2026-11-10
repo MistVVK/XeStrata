@@ -309,6 +309,8 @@ struct VitGpuImpl {
     size_t sp_elems = 0;
     int kRows = 512;      // rows per chunk of the matrix products (STRATA_VIT_ROWS overrides: a diagnostic)
     size_t kScoreElems = (size_t) 8 << 20;     // scores per attention chunk, 8M: 16 MB of F16 (STRATA_VIT_SCORES, in M elements, overrides)
+    size_t kScoreElemsLarge = (size_t) 512 << 20;   // the chunk above 16,384 patches: 512M scores, 1 GB of F16 (see size_buffers)
+    bool scores_env = false;                   // STRATA_VIT_SCORES was given: one size for every picture
 
     // C = alpha * op(A) * op(B), batched, column-major as the BLAS wants it
     bool bgemm(bool ta, bool tb, int m, int n, int k, const void* A, cudaDataType_t at, int lda, long long sa, const void* B, cudaDataType_t bt, int ldb,
@@ -405,7 +407,11 @@ struct VitGpuImpl {
         // a score row is padded to a multiple of 8 elements (the product's leading dimension): with an odd row length the BLAS cannot use its tensor-core
         // kernels (a 93-token picture spent half its time there)
         const size_t Np = (N + 7) / 8 * 8;
-        sp_elems = std::min<size_t>((size_t) g.heads * N * Np, std::max<size_t>(kScoreElems, (size_t) g.heads * Np * 64));
+        // above 16,384 patches (pictures of more than 4,096 tokens) the chunk is 512M scores (1 GB): with the 16 MB chunk such a picture runs 64 queries per
+        // product and the attention is launch-bound (l620, 16,384 tokens: 33.4 s, 1.17 of mtmd-GPU; with 512M 24.8 s, 0.87, at 3,398 MiB against mtmd-GPU's
+        // 3,858; RESULTS-OWN-3V.md 12.11).  STRATA_VIT_SCORES sets both sizes.
+        const size_t budget = (N > 16384 && !scores_env) ? kScoreElemsLarge : kScoreElems;
+        sp_elems = std::min<size_t>((size_t) g.heads * N * Np, std::max<size_t>(budget, (size_t) g.heads * Np * 64));
         const size_t R = std::min<size_t>(N, (size_t) kRows);
         // d_ctx holds, one after the other: the patch matrix, the attention context, and at the end the projector's output rows (d_out)
         const size_t ctx_elems = std::max({N * D, N * K0, (N / 4) * (size_t) g.out_dim});
@@ -489,7 +495,7 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
     m.n_weight_allocs = m.allocs.size();
     if (const char* e = std::getenv("STRATA_VIT_REF_ROUND")) m.round_out = std::atoi(e) != 0;
     if (const char* e = std::getenv("STRATA_VIT_ROWS")) { const int v = std::atoi(e); if (v >= 16) m.kRows = v; }
-    if (const char* e = std::getenv("STRATA_VIT_SCORES")) { const int v = std::atoi(e); if (v >= 1) m.kScoreElems = (size_t) v << 20; }
+    if (const char* e = std::getenv("STRATA_VIT_SCORES")) { const int v = std::atoi(e); if (v >= 1) { m.kScoreElems = (size_t) v << 20; m.scores_env = true; } }
     return m.size_buffers(std::max(max_patches, 16), err);
 }
 

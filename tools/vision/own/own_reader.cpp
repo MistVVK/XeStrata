@@ -42,12 +42,16 @@ bool own_reader_supported(const std::string& mmproj, bool gpu, std::string& why)
         why = "this build has no GPU backend for the own tower";
         return false;
 #endif
-    } else if (quant::best_isa() == quant::Isa::Scalar) {
-        // only the portable kernel tier on this CPU (x86 without AVX2, every Arm CPU until a NEON tier exists): measured 2.1 to 3.7 times mtmd-CPU's time
-        // (RESULTS-OWN-3V.md 12.7), so `auto` keeps mtmd here; `--tower own` still runs ours
+    }
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    else if (quant::best_isa() == quant::Isa::Scalar) {
+        // an x86 CPU with only the portable kernel tier (no AVX2): measured 2.1 to 3.7 times mtmd-CPU's time (RESULTS-OWN-3V.md 12.7), so `auto` keeps mtmd
+        // here; `--tower own` still runs ours.  Not on Arm: mtmd's portable Arm build has no fast BF16 path and our NEON tier is faster than mtmd-CPU on BF16
+        // and F16 weights alike (DGX Spark, 12.12)
         why = "only the portable CPU kernels on this CPU: the own CPU tower is slower than mtmd there";
         return false;
     }
+#endif
     Gguf gg;
     VitGeometry g;
     if (!gg.open(mmproj, why) || !vit_geometry_from_gguf(gg, g, why)) return false;

@@ -293,6 +293,8 @@ struct VitGpuImpl {
     // scores per attention chunk: 32M elements = 64 MB of F16 (CUDA: 8M).  oneMKL's batched products with an inner size of 72 need wide chunks to be fast
     // on the Arc (RESULTS-OWN-3V.md 11.1); 64 MB keeps the reader at or below mtmd-SYCL's memory at 1,024 tokens.  STRATA_VIT_SCORES (M elements) overrides.
     size_t kScoreElems = (size_t) 32 << 20;
+    size_t kScoreElemsLarge = (size_t) 256 << 20;   // above 16,384 patches: 256M scores (512 MB); A750, 16,384 tokens: 147.9 s at the 64-query floor, 118.3 s with 256M, 117.0 s with 512M
+    bool scores_env = false;                        // STRATA_VIT_SCORES given: one size for every picture
     bool round_out = false;
 
     ~VitGpuImpl() {
@@ -380,7 +382,8 @@ struct VitGpuImpl {
         d_a = d_f16 = d_q16 = d_k16 = d_v16 = nullptr;
         d_S = nullptr;
         const size_t Np = (N + 7) / 8 * 8;
-        sp_elems = std::min<size_t>((size_t) g.heads * N * Np, std::max<size_t>(kScoreElems, (size_t) g.heads * Np * 64));
+        const size_t budget = (N > 16384 && !scores_env) ? kScoreElemsLarge : kScoreElems;
+        sp_elems = std::min<size_t>((size_t) g.heads * N * Np, std::max<size_t>(budget, (size_t) g.heads * Np * 64));
         const size_t R = std::min<size_t>(N, (size_t) kRows);
         const size_t ctx_elems = std::max({N * D, N * K0, (N / 4) * (size_t) g.out_dim});
         bool ok = alloc(d_x, N * D, err, false) && alloc(d_ctx, ctx_elems, err, false) && alloc(d_y, R * std::max<size_t>(3 * D, F), err, false) &&
@@ -461,7 +464,7 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
         m.n_weight_allocs = m.allocs.size();
         if (const char* e = std::getenv("STRATA_VIT_REF_ROUND")) m.round_out = std::atoi(e) != 0;
         if (const char* e = std::getenv("STRATA_VIT_ROWS")) { const int v = std::atoi(e); if (v >= 16) m.kRows = v; }
-        if (const char* e = std::getenv("STRATA_VIT_SCORES")) { const int v = std::atoi(e); if (v >= 1) m.kScoreElems = (size_t) v << 20; }
+        if (const char* e = std::getenv("STRATA_VIT_SCORES")) { const int v = std::atoi(e); if (v >= 1) { m.kScoreElems = (size_t) v << 20; m.scores_env = true; } }
         return m.size_buffers(std::max(max_patches, 16), err);
     } catch (const std::exception& e) {
         err = std::string("the GPU failed while loading the vision encoder: ") + e.what();
