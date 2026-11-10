@@ -32,6 +32,7 @@
 #include "strata/image/pipeline.hpp"
 #include "strata/image/qi_vision.hpp"
 #include "strata/image/text_encoder.hpp"
+#include "strata/image/w8_choice.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -79,10 +80,7 @@ private:
     void* s_ = nullptr;
     std::string dit_path_, vae_path_, text_path_, edit_path_, vision_path_;
     int q8_ = -1;
-    /// --dit-q8 auto with both forms in the budget: the 8-bit form is the faster on this GPU (MfDit::time_forms: 1 yes,
-    /// 0 no, -1 not yet), timed at w8_rows_ image rows (again for an image of more than twice as many)
-    mutable int w8_faster_ = -1;
-    mutable int64_t w8_rows_ = 0;
+    W8Choice w8_;   // --dit-q8 auto with both forms in the budget: the faster here (MfDit::time_forms)
     bool keep_ = true, edit_active_ = false;
     bool base_encoder_ = false;   // the VAE's file has the encoder a base image takes (img2img, a mask)
     /// The text encoder's states of a prompt (its pictures' rows among the tokens), the engine's stream's work done

@@ -179,6 +179,8 @@
 // quarter of the GPU's memory stays free, and let go before the next image job (IMG, NEED, RATIO, UPS, UPSNEED).
 //   FREE                     the free VRAM, what the engine holds and the GPU's memory     -> FREE free_mib=... held_mib=...
 //                                                                                              total_mib=...
+//   W8                       whether this GPU takes the image DiTs' 8-bit form (W8A8: w8_here, timed once a GPU),
+//                            for the server to choose a weights file by      -> W8 take=<1, 0, or -1: it could not time>
 //   BUDGET <MiB>             the VRAM the engine may take (0: the free VRAM at its start)      -> BUDGET budget_mib=...
 //   FIT <MiB>                the budget: what the engine holds and the free VRAM, less <MiB>  -> BUDGET budget_mib=...
 //   RELEASE [ALL]            frees the layers, activations and buffers (the cache); ALL also the parts' fixed weights
@@ -214,6 +216,7 @@
 #include "strata/image/qi_pipeline.hpp"
 #include "strata/image/sam3.hpp"
 #include "strata/image/sam3_video.hpp"
+#include "strata/image/w8_choice.hpp"
 #include "strata/image/yolo_detect.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/upscale/upscale.hpp"
@@ -1899,6 +1902,8 @@ int serve(si::ImagePipeline& p) {
                 strata::gpu::mem_info(&free, &total);
                 std::printf("FREE free_mib=%llu held_mib=%llu total_mib=%llu\n", (unsigned long long) (free >> 20),
                             (unsigned long long) (p.held() >> 20), (unsigned long long) (total >> 20));
+            } else if (op == "W8") {
+                std::printf("W8 take=%d\n", si::w8_here(nullptr));
             } else if (op == "BUDGET") {
                 uint64_t mib = 0;
                 ls >> mib;

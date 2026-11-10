@@ -6325,3 +6325,36 @@ class ImageEditForm(unittest.TestCase):
         self.assertEqual((fields["num_inference_steps"], fields["guidance_scale"], fields["true_cfg_scale"]),
                          (4, 2.5, 2.5))
         self.assertIsInstance(fields["guidance_scale"], float)
+
+
+class SeedVR2File(unittest.TestCase):
+    def test_selection(self):
+        from serve import images
+
+        files = {f"seedvr2-{v}-{t}": (None, None, size << 20)
+                 for v, size in (("7b", 12000), ("3b", 6000)) for t in ("fp16", "int8")}
+        files["seedvr2-7b-int8"] = (None, None, 7000 << 20)
+        files["seedvr2-3b-int8"] = (None, None, 3500 << 20)
+
+        def ready(name, root):
+            return present is not None and name == f"seedvr2-7b-{present}"
+
+        for present in (None, "fp16", "int8"):
+            for takes in (True, False, None):
+                with self.subTest(present=present, takes_w8=takes):
+                    gen = SimpleNamespace(cfg={}, total_mib=lambda: 20000, takes_w8=lambda: takes,
+                                          _say=lambda message: None)
+                    with (mock.patch.object(images.image_aux, "_qimage", return_value=SimpleNamespace(FILES=files)),
+                          mock.patch.object(images.image_aux, "aux_dir", return_value="unused"),
+                          mock.patch.object(images.image_aux, "ready", side_effect=ready),
+                          mock.patch.object(images, "ram_available_mib", return_value=20000)):
+                        expected = "fp16" if present == "fp16" or (present is None and not takes) else "int8"
+                        self.assertEqual(images.seedvr2_file(gen, "7b"), f"seedvr2-7b-{expected}")
+        gen = SimpleNamespace(cfg={}, total_mib=lambda: 1000, takes_w8=lambda: False, _say=lambda message: None)
+        with (mock.patch.object(images.image_aux, "_qimage", return_value=SimpleNamespace(FILES=files)),
+              mock.patch.object(images.image_aux, "aux_dir", return_value="unused"),
+              mock.patch.object(images.image_aux, "ready", return_value=False)):
+            with mock.patch.object(images, "ram_available_mib", return_value=20000):
+                self.assertEqual(images.seedvr2_file(gen, "7b"), "seedvr2-7b-int8")
+            with mock.patch.object(images, "ram_available_mib", return_value=0):
+                self.assertEqual(images.seedvr2_file(gen, "7b"), "seedvr2-3b-int8")

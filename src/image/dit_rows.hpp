@@ -14,6 +14,7 @@
 #include "strata/image/gelu.hpp"
 #include "strata/image/mf_dit.hpp"
 #include "strata/image/qi_kernels.hpp"
+#include "strata/image/w8_choice.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/i8_gemm.hpp"
 #include "strata/platform/env.hpp"
@@ -32,6 +33,9 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <type_traits>
@@ -709,6 +713,49 @@ template<class Op> inline void rows_i8(const Op& op, int64_t T, int64_t K, int8_
     }
 }
 
+// The regular Hadamard rotation (RowsI8Of's kRegular, kron(H4, H4, H4, H4) / 16: int8_convrot's basis) of a group of
+// kQiRotate values in local memory t, by 256 work-items of a work-group (all of it, or a slice of it for each of its
+// groups), the item `lid` writing value `lid`: four butterflies on the group's base-4 digits (strides 64, 16, 4, 1),
+// each sum in the order of a single work-item's loop, and the scale 1 / 16 at the end.  Every item of the work-group
+// `g` calls it.  Returns value lid.  For FP rows out: RowsI8Of keeps its values in registers and rotates them through
+// two of Sylvester's instead, the same matrix with the sums in another order (FP rows' bits would differ).
+template<class Group> inline float regular256(float* t, int lid, const Group& g) {
+    static_assert(kQiRotate == 256);
+    float sum = 0.f;
+    for (int stride = 64; stride >= 1; stride /= 4) {
+        const int i = (lid / stride) % 4, first = lid - i * stride;
+        sycl::group_barrier(g);
+        sum = 0.f;
+        for (int j = 0; j < 4; ++j) sum += i + j == 3 ? -t[first + j * stride] : t[first + j * stride];
+        sycl::group_barrier(g);
+        t[lid] = sum;
+    }
+    return sum * (1.f / 16.f);
+}
+
+// FP16 rows [T][K] from rows [T][K] of FP16 (uint16_t) or FP32 values: every group of kQiRotate values times the
+// regular Hadamard (regular256), rounded to FP16 once, after it.  A work-group a group.
+template<class In> inline sycl::event regular_rotate16(const In* x, int64_t T, int64_t K, uint16_t* out16, void* s) {
+    static_assert(std::is_same_v<In, uint16_t> || std::is_same_v<In, float>);
+    if (K % kQiRotate != 0)
+        throw std::runtime_error("image engine: the regular rotation takes rows of a multiple of 256 values, not " +
+                                 std::to_string(K));
+    if (T <= 0) return {};
+    const int64_t gpr = K / kQiRotate;
+    return q_of(s).submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> t(sycl::range<1>((size_t) kQiRotate), h);
+        h.parallel_for(sycl::nd_range<1>((size_t) (T * K), (size_t) kQiRotate), [=](sycl::nd_item<1> it) {
+            const int64_t g = (int64_t) it.get_group(0);
+            const int lid = (int) it.get_local_id(0);
+            const int64_t at = (g / gpr) * K + (g % gpr) * kQiRotate + lid;
+            float* tp = t.get_multi_ptr<sycl::access::decorated::no>().get();
+            if constexpr (std::is_same_v<In, uint16_t>) tp[lid] = f32_from_f16(x[at]);
+            else tp[lid] = x[at];
+            out16[at] = f16_from_f32(regular256(tp, lid, it.get_group()));
+        });
+    });
+}
+
 // the attention's output o16 [T][C] times its heads' scales hs (head_dim channels a head)
 struct Heads {
     const uint16_t* o16;
@@ -1043,6 +1090,26 @@ inline std::pair<double, double> time_w8_f16(int64_t T, int64_t K, int64_t N, co
     gpu::stream_sync(s_);
     for (void* p : held) gpu::free(p);
     return {f16, w8};
+}
+
+// The choice (W8Choice) of a DiT that lays its weights out when it opens, before a request's rows are known
+// (Qwen-Image's, SeedVR2's), and the engine's word to the server (w8_here): its MLP's first product, K -> N, timed at
+// a 1024 x 1024 image's 4096 rows, once a GPU and shape -> 1 W8A8, 0 FP16, -1 neither form could be timed (no room for
+// the timing: not kept, timed again the next time)
+inline int w8_at_open(int64_t K, int64_t N, const char* what, void* s_) {
+    struct Kept {
+        std::mutex m;
+        std::map<std::pair<int64_t, int64_t>, int> of;
+    };
+    static core::PerDevice<std::shared_ptr<Kept>> per_device;
+    Kept& kept = *per_device.get(core::Runtime::get().stream(s_).get_device(), [] { return std::make_shared<Kept>(); });
+    std::lock_guard<std::mutex> lock(kept.m);
+    if (const auto it = kept.of.find({K, N}); it != kept.of.end()) return it->second;
+    const W8Choice c;
+    const int w8 = c.take(4096, what, s_, [&](int64_t rows) { return time_w8_f16(rows, K, N, what, s_); }) ? 1 : 0;
+    if (!c.decided()) return -1;
+    kept.of.emplace(std::make_pair(K, N), w8);
+    return w8;
 }
 
 // Whether the DiTs' W8A8 products go through the GPU maker's fused kernel (kernels::i8_gemm_bf16: the scales and bias

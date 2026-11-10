@@ -33,6 +33,7 @@
 #include "strata/image/text_encoder.hpp"
 #include "strata/image/pipeline.hpp"
 #include "strata/image/qi_vision.hpp"
+#include "strata/image/w8_choice.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -107,8 +108,7 @@ private:
     void* s_ = nullptr;
     std::string dit_path_, vae_path_, text_path_;
     int q8_ = -1;
-    mutable int w8_faster_ = -1;   // as MfPipeline's: the 8-bit DiT is the faster here (1 yes, 0 no, -1 not timed)
-    mutable int64_t w8_rows_ = 0;
+    W8Choice w8_;   // --dit-q8 auto with both forms in the budget: the faster here (MossDit::time_forms)
     bool base_encoder_ = false, states_given_ = false;
     int64_t ref_rows_ = 0;   // the request's references' latent rows (plan counts their kept keys and values)
     QiRefLayout ref_layout_ = QiRefLayout::MossEdit;   // and their layout (in the stream: as text rows)

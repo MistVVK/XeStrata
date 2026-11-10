@@ -10,7 +10,7 @@ serve/images.py starts it (its environment the server's engine's: the same GPU a
 server of the same image model and GPU finds it at the same address (images.daemon_address).  ADDR: a Unix socket's
 path, or on Windows a file the daemon writes its loopback port and a random token to (a client sends the token
 first).  The lines are xestrata-image's own (src/image/strata_image.cpp): on connecting a client gets READY (or ERROR,
-and the daemon ends); a request line (IMG, NEED, FREE, FIT, BUDGET, RELEASE, RATIO, DETECT, UPS, UPSNEED) waits for
+and the daemon ends); a request line (IMG, NEED, FREE, W8, FIT, BUDGET, RELEASE, RATIO, DETECT, UPS, UPSNEED) waits for
 the engine and gets its lines up to the answer (STEP lines before an IMAGE); STOP ends the client's running image after
 its step; RESUME goes on with the client's running video after its YIELD (the engine waits there for it); QUIT closes
 the connection; SHUTDOWN ends the engine (after a running request) and the daemon, and answers
@@ -30,11 +30,11 @@ import sys
 import threading
 import time
 
-ANSWERS = {"IMG": ("IMAGE",), "NEED": ("NEED",), "FREE": ("FREE",), "FIT": ("BUDGET",), "BUDGET": ("BUDGET",),
-           "RELEASE": ("RELEASE",), "RATIO": ("RATIO",), "DETECT": ("DETECT",), "UPS": ("UPSCALED",),
-           "UPSNEED": ("NEED",), "SEGMENT": ("SEGMENT",), "FLORENCE": ("FLORENCE",), "POLYMASK": ("POLYMASK",),
-           "MATTE": ("MATTE",), "AUXNEED": ("NEED",), "UPSV": ("UPSVIDEO",), "UPSVNEED": ("NEED",),
-           "SEGV": ("SEGVIDEO",), "CONTROL": ("CONTROL",),
+ANSWERS = {"IMG": ("IMAGE",), "NEED": ("NEED",), "FREE": ("FREE",), "W8": ("W8",), "FIT": ("BUDGET",),
+           "BUDGET": ("BUDGET",), "RELEASE": ("RELEASE",), "RATIO": ("RATIO",), "DETECT": ("DETECT",),
+           "UPS": ("UPSCALED",), "UPSNEED": ("NEED",), "SEGMENT": ("SEGMENT",), "FLORENCE": ("FLORENCE",),
+           "POLYMASK": ("POLYMASK",), "MATTE": ("MATTE",), "AUXNEED": ("NEED",), "UPSV": ("UPSVIDEO",),
+           "UPSVNEED": ("NEED",), "SEGV": ("SEGVIDEO",), "CONTROL": ("CONTROL",),
            "COLORMAP": ("COLORMAP",)}
 START_TIMEOUT_S = 600
 

@@ -3334,6 +3334,17 @@ class ImageGen:
             self._ready()
             return int(self.engine.ask("FREE", "FREE", 60).get("total_mib") or 0)
 
+    def takes_w8(self) -> bool | None:
+        """Whether the image GPU takes the image DiTs' 8-bit form (W8A8), as the engine times it once a GPU (W8): None
+        where it could not time it, or an engine that does not answer W8."""
+        with self.lock:
+            self._ready()
+            try:
+                take = int(self.engine.ask("W8", "W8", 120).get("take", -1))
+            except ImageJobFailed:
+                return None
+        return None if take < 0 else take == 1
+
     def fit(self, extra_mib: int = 0) -> int:
         """The engine's budget set to what it holds and what is free now, less the reserve (and `extra_mib`: what the
         GPU's VRAM ledger keeps for others) -> the budget (MiB)."""
@@ -5262,7 +5273,10 @@ def make_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = 
 def seedvr2_file(gen: ImageGen, variant: str) -> str:
     """The AUX name of SeedVR2's DiT a request takes: the variant's FP16 file where the GPU's memory holds it beside its
     work, else its int8_convrot (the blocks the VRAM does not hold read from the RAM); the 3B where the 7B's int8 fits
-    neither the VRAM nor the RAM.  A file already here is taken before one to fetch, where it fits."""
+    neither the VRAM nor the RAM.  A file already here is taken before one to fetch, where it fits.  Where the engine
+    times its 8 bits the faster on this GPU (takes_w8), a file to fetch is the int8_convrot whatever the VRAM: the
+    engine would make the FP16 file's weights 8-bit as it opens it (slower to open, the 8-bit rows kept in the RAM),
+    the int8 file holds them so in half the bytes.  An FP16 file already here is still taken (made 8-bit on opening)."""
     q = image_aux._qimage()
     root = image_aux.aux_dir(gen.cfg)
     try:   # the GPU's whole memory, not what is free now: the choice the same from request to request
@@ -5273,15 +5287,25 @@ def seedvr2_file(gen: ImageGen, variant: str) -> str:
 
     def mib(name: str) -> int:
         return q.FILES[name][2] >> 20
+
+    def int8_instead(fp16: str, which: str) -> bool:
+        """Whether the int8_convrot file is taken where the FP16 one fits: it is not here and the GPU takes 8 bits."""
+        if image_aux.ready(fp16, root) or not gen.takes_w8():
+            return False
+        gen._say(f"image job: SeedVR2 {which}'s int8_convrot file, not the FP16 one the VRAM ({vram} MiB) would hold: "
+                 "this GPU runs its DiT faster in 8 bits")
+        return True
     if variant != "3b":
         fp16, int8 = f"seedvr2-{variant}-fp16", f"seedvr2-{variant}-int8"
-        if vram >= mib(fp16) + SEEDVR2_WORK_MIB and (image_aux.ready(fp16, root) or not image_aux.ready(int8, root)):
+        if vram >= mib(fp16) + SEEDVR2_WORK_MIB and (image_aux.ready(fp16, root) or not image_aux.ready(int8, root)) \
+                and not int8_instead(fp16, variant):
             return fp16
         if vram + ram >= mib(int8) + SEEDVR2_WORK_MIB:
             return int8
         gen._say(f"image job: SeedVR2 {variant}'s 8 bits fit neither the VRAM ({vram} MiB) nor the RAM ({ram} MiB): "
                  "its 3B")
-    return "seedvr2-3b-fp16" if vram >= mib("seedvr2-3b-fp16") + SEEDVR2_WORK_MIB else "seedvr2-3b-int8"
+    fp16 = "seedvr2-3b-fp16"
+    return fp16 if vram >= mib(fp16) + SEEDVR2_WORK_MIB and not int8_instead(fp16, "3b") else "seedvr2-3b-int8"
 
 
 def seedvr2_3b_note(u: dict) -> str:

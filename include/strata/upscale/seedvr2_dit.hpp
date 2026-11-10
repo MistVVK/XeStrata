@@ -125,7 +125,9 @@ private:
     prefill::Gemm gemm_;
     std::vector<void*> allocs_, act_;
     uint64_t weight_bytes_ = 0, held_ = 0;
-    bool dry_ = false, q8_ = false, w8_ = false, v2_ = false;   // v2_: the 3B   // the file's blocks in 8 bits; taken as W8A8 (else Q8_0)
+    // q8_: the file's blocks in 8 bits (int8_convrot), taken as Q8_0 unless w8_; w8_: the blocks as W8A8 (the int8
+    // file's rows, or the FP16 file's made so); v2_: the 3B
+    bool dry_ = false, q8_ = false, w8_ = false, v2_ = false;
     int64_t scratch_ = 16;                         // the library's dequantizing scratch (values)
     int64_t C_ = 3072, heads_ = 24, hd_ = 128, F_ = 12288, L_ = 58, lat_ = 16, kin_ = 136, n_rot_ = 60;
     std::vector<float> freqs_;   // the pixel RoPE's frequencies (an axis's)

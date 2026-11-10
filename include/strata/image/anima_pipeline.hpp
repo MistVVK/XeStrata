@@ -21,6 +21,7 @@
 #include "strata/image/pipeline.hpp"
 #include "strata/image/qi_vae.hpp"
 #include "strata/image/text_encoder.hpp"
+#include "strata/image/w8_choice.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -71,8 +72,7 @@ private:
     void* s_ = nullptr;
     std::string dit_path_, vae_path_, text_path_;
     int q8_ = -1;
-    mutable int w8_faster_ = -1;
-    mutable int64_t w8_rows_ = 0;
+    W8Choice w8_;   // --dit-q8 auto with both forms in the budget: the faster here (AnimaDit::time_forms)
     std::unique_ptr<TextEncoder> te_, te_size_;
     std::unique_ptr<AnimaDit> dit_, dit_size_, dit16_size_;
     std::vector<std::vector<uint8_t>> dit_host_;

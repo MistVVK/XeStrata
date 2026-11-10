@@ -413,42 +413,20 @@ void w8_quantize(const uint16_t* w16, int64_t N, int64_t K, int8_t* q, float* s,
 
 bool w8_int8(void* stream) { return prefill::Gemm::i8_usable(stream); }
 
-namespace {
-
-// the regular Hadamard rotation (kron of R4 / 2, four times: orthonormal and its own inverse) of a group of 256
-// values in local memory, one stage a base-4 digit; `v` the group's values, `w` as many more, item j of 256
-template<class Acc> void regular256(Acc v, Acc w, int j, sycl::nd_item<2> it, int base) {
-    for (int stage = 0, step = 1; stage < 4; ++stage, step *= 4) {
-        const int d = (j / step) % 4, j0 = j - d * step;
-        float acc = 0.f;
-        for (int m = 0; m < 4; ++m) {
-            // R4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]]: -1 where d + m == 3
-            const float r = d + m == 3 ? -0.5f : 0.5f;
-            acc += r * v[base + j0 + m * step];
-        }
-        sycl::group_barrier(it.get_group());
-        w[base + j] = acc;
-        sycl::group_barrier(it.get_group());
-        v[base + j] = w[base + j];
-        sycl::group_barrier(it.get_group());
-    }
-}
-
-}  // namespace
-
 void w8_dequant_rows(const int8_t* q, const float* s, int64_t N, int64_t K, uint16_t* tmp, void* stream) {
-    constexpr int kG = 256, kRowsWG = 4;   // a work-group: 4 rows of one group of 256
+    // a work-group: 4 rows of one group of 256, each rotated back (the regular Hadamard is its own inverse)
+    constexpr int kG = 256, kRowsWG = 4;
     const size_t gn = (size_t) ((N + kRowsWG - 1) / kRowsWG), gk = (size_t) (K / kG);
     dit_rows::q_of(stream).submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> v(sycl::range<1>(kRowsWG * kG), cgh), w(sycl::range<1>(kRowsWG * kG), cgh);
+        sycl::local_accessor<float, 1> v(sycl::range<1>(kRowsWG * kG), cgh);
         cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(gn * kRowsWG, gk * kG), sycl::range<2>(kRowsWG, kG)),
                          [=](sycl::nd_item<2> it) {
                              const int r = (int) it.get_local_id(0), j = (int) it.get_local_id(1);
                              const int64_t n = (int64_t) it.get_global_id(0), k = (int64_t) it.get_global_id(1);
-                             v[r * kG + j] = n < N ? (float) q[n * K + k] * s[n] : 0.f;
-                             sycl::group_barrier(it.get_group());
-                             regular256(v, w, j, it, r * kG);
-                             if (n < N) tmp[n * K + k] = kernels::f16_from_f32(v[r * kG + j]);
+                             float* vr = v.get_multi_ptr<sycl::access::decorated::no>().get() + r * kG;
+                             vr[j] = n < N ? (float) q[n * K + k] * s[n] : 0.f;
+                             const float y = dit_rows::regular256(vr, j, it.get_group());
+                             if (n < N) tmp[n * K + k] = dit_rows::f16_from_f32(y);
                          });
     });
 }

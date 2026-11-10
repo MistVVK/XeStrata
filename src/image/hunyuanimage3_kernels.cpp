@@ -9,6 +9,8 @@
 #include "strata/image/hunyuanimage3_kernels.hpp"
 #include "strata/image/qi_kernels.hpp"
 
+#include "dit_rows.hpp"
+
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -45,69 +47,25 @@ float e4m3(uint8_t b) {
     return s ? -v : v;
 }
 
-// One group of 256 values times the normalized regular Hadamard: four butterflies on the group's base-4 digits
-// (strides 64, 16, 4, 1), H4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]], by a work-group of 256 on the values in
-// local memory, the work-item `lid` writing value `lid` (each sum in the order a single work-item's loop had them,
-// so the bits are the same).  Returns the value.
-float hadamard256_lane(float* t, int lid, const sycl::nd_item<1>& it) {
-    constexpr int h4[4][4] = {{1, 1, 1, -1}, {1, 1, -1, 1}, {1, -1, 1, 1}, {-1, 1, 1, 1}};
-    float scale = 1.0f;
-    for (int n = 256; n > 1; n /= 4) scale *= 0.5f;
-    for (int stride = 64; stride >= 1; stride /= 4) {
-        const int i = (lid / stride) % 4, first = lid - i * stride;
-        sycl::group_barrier(it.get_group());
-        float sum = 0.f;
-        for (int j = 0; j < 4; ++j) sum += (float) h4[i][j] * t[first + j * stride];
-        sycl::group_barrier(it.get_group());
-        t[lid] = sum;
-    }
-    return t[lid] * scale;
-}
-
 }  // namespace hunyuanimage3_detail
 
 using hunyuanimage3_detail::e4m3;
 using hunyuanimage3_detail::f16_from_f32;
 using hunyuanimage3_detail::f32_from_f16;
 using hunyuanimage3_detail::finish;
-using hunyuanimage3_detail::hadamard256_lane;
 using hunyuanimage3_detail::queue_for;
 
+// the rotation is the image engine's regular one (dit_rows::regular_rotate16, int8_convrot's basis as well)
 void hunyuanimage3_rotate16_from32(const float* x32, int64_t rows, int64_t K, int64_t block, uint16_t* out16, void* stream) {
     if (rows <= 0 || block <= 1) return;
     if (block != 256) throw std::runtime_error("hunyuanimage3_rotate16_from32: only the 256-wide group is implemented");
-    const int64_t groups = rows * (K / 256);
-    // a work-group a group of 256 (hadamard256_lane): one value a work-item
-    const auto e = queue_for(stream).submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> t(sycl::range<1>(256), h);
-        h.parallel_for(sycl::nd_range<1>((size_t) groups * 256, 256), [=](sycl::nd_item<1> it) {
-            const int64_t g = (int64_t) it.get_group(0);
-            const int lid = (int) it.get_local_id(0);
-            const int64_t at = (g / (K / 256)) * K + (g % (K / 256)) * 256 + lid;
-            float* tp = t.get_multi_ptr<sycl::access::decorated::no>().get();
-            tp[lid] = x32[at];
-            out16[at] = f16_from_f32(hadamard256_lane(tp, lid, it));   // the one rounding, after the spread
-        });
-    });
-    finish(stream, e, "hunyuanimage3_rotate16_from32");
+    finish(stream, dit_rows::regular_rotate16(x32, rows, K, out16, stream), "hunyuanimage3_rotate16_from32");
 }
 
 void hunyuanimage3_rotate16(const uint16_t* x16, int64_t rows, int64_t K, int64_t block, uint16_t* out16, void* stream) {
     if (rows <= 0 || block <= 1) return;
     if (block != 256) throw std::runtime_error("hunyuanimage3_rotate16: only the 256-wide group is implemented");
-    const int64_t groups = rows * (K / 256);
-    const auto e = queue_for(stream).submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> t(sycl::range<1>(256), h);
-        h.parallel_for(sycl::nd_range<1>((size_t) groups * 256, 256), [=](sycl::nd_item<1> it) {
-            const int64_t g = (int64_t) it.get_group(0);
-            const int lid = (int) it.get_local_id(0);
-            const int64_t at = (g / (K / 256)) * K + (g % (K / 256)) * 256 + lid;
-            float* tp = t.get_multi_ptr<sycl::access::decorated::no>().get();
-            tp[lid] = f32_from_f16(x16[at]);
-            out16[at] = f16_from_f32(hadamard256_lane(tp, lid, it));
-        });
-    });
-    finish(stream, e, "hunyuanimage3_rotate16");
+    finish(stream, dit_rows::regular_rotate16(x16, rows, K, out16, stream), "hunyuanimage3_rotate16");
 }
 
 void hunyuanimage3_w4a8_dequant16(const int8_t* codes, const uint8_t* s_rel, const float* s_channel, const float* codebook,
@@ -195,7 +153,7 @@ void hunyuanimage3_swiglu16_rotated(const float* gu, int64_t T, int64_t inter, u
     if (T <= 0) return;
     if (inter % 256 != 0) throw std::runtime_error("hunyuanimage3_swiglu16_rotated: the intermediate is not in 256 groups");
     const int64_t groups = T * (inter / 256);
-    // a work-group a group of 256 (hadamard256_lane): one value a work-item
+    // a work-group a group of 256 (dit_rows::regular256): one value a work-item
     const auto e = queue_for(stream).submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> v(sycl::range<1>(256), h);
         h.parallel_for(sycl::nd_range<1>((size_t) groups * 256, 256), [=](sycl::nd_item<1> it) {
@@ -205,7 +163,7 @@ void hunyuanimage3_swiglu16_rotated(const float* gu, int64_t T, int64_t inter, u
             const float gate = gu[t * 2 * inter + off], up = gu[t * 2 * inter + inter + off];
             float* vp = v.get_multi_ptr<sycl::access::decorated::no>().get();
             vp[lid] = gate * (up / (1.f + sycl::exp(-up)));     // x1 * silu(x2), the SECOND half silu'd
-            out16[t * inter + off] = f16_from_f32(hadamard256_lane(vp, lid, it));
+            out16[t * inter + off] = f16_from_f32(dit_rows::regular256(vp, lid, it.get_group()));
         });
     });
     finish(stream, e, "hunyuanimage3_swiglu16_rotated");

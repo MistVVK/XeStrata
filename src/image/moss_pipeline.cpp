@@ -255,17 +255,7 @@ bool MossPipeline::want_q8(int64_t rows, int n, int64_t max_text) {
     const uint64_t fixed = d16.weight_bytes() + d16.text_bytes() + vae_size_->weight_bytes() +
                            (te_ ? text_fixed() + te_layers_ : 0);
     if (fixed + d16.block_bytes() + d16.activation_bytes(rows, n, max_text) > budget()) return true;
-    if ((w8_faster_ < 0 || rows > 2 * w8_rows_) && prefill::Gemm::i8_usable(s_)) {
-        const auto [f16, w8] = d16.time_forms(rows);
-        if (f16 > 0.0 && w8 > 0.0) {
-            w8_faster_ = w8 < f16 * 1.05 ? 1 : 0;   // 8 bits unless clearly the slower: a near tie stays put
-            w8_rows_ = rows;
-            std::fprintf(stderr, "image engine: MOSS-Image's DiT in %s (its MLP's product at %lld rows: %.2f ms in "
-                                 "FP16, %.2f in W8A8)\n", w8_faster_ ? "8 bits" : "16 bits", (long long) rows, 1e3 * f16,
-                         1e3 * w8);
-        }
-    }
-    return w8_faster_ == 1;
+    return w8_.take(rows, "MOSS-Image's DiT", s_, [&](int64_t r) { return d16.time_forms(r); });
 }
 
 uint64_t MossPipeline::held() const {

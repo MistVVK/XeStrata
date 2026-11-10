@@ -839,7 +839,7 @@ if(STRATA_ENABLE_XE)
   # DiT against tools/image/qi21_ref.py's NumPy reference, and strata-image-dit-probe, the whole DiT and its sampler
   # against stable-diffusion.cpp's values, timed
   add_library(strata_image STATIC src/image/qi_kernels.cpp src/image/qi_attn.cpp src/image/qi_attn_train.cpp
-                           src/image/qi_dit.cpp src/image/image_lora.cpp
+                           src/image/qi_dit.cpp src/image/image_lora.cpp src/image/w8_choice.cpp
                            src/image/qi_vae.cpp src/image/qi_pipeline.cpp
                            src/image/img_start.cpp src/image/img_crop.cpp src/image/img_color.cpp
                            src/upscale/upscale.cpp src/upscale/esrgan.cpp src/upscale/seedvr2_dit.cpp
@@ -1231,6 +1231,14 @@ if(STRATA_ENABLE_XE)
   add_executable(qi_attn_parity src/image/qi_attn_parity.cpp)
   target_link_libraries(qi_attn_parity PRIVATE strata_image)
   add_test(NAME qi_attn_parity COMMAND qi_attn_parity)
+  add_executable(w8_roundtrip_parity src/image/w8_roundtrip_parity.cpp)
+  target_link_libraries(w8_roundtrip_parity PRIVATE strata_image)
+  add_test(NAME w8_roundtrip_parity COMMAND w8_roundtrip_parity)
+  set_tests_properties(w8_roundtrip_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  add_executable(seedvr2_convrot_parity src/image/seedvr2_convrot_parity.cpp)
+  target_link_libraries(seedvr2_convrot_parity PRIVATE strata_image)
+  add_test(NAME seedvr2_convrot_parity COMMAND seedvr2_convrot_parity)
+  set_tests_properties(seedvr2_convrot_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   # kernels::i8_gemm_bf16 (CUTLASS's kernels on NVIDIA GPUs, comfy-kitchen's on AMD ones) against the library's int8
   # product, every value of the image models' product shapes (skipped where the GPU takes no such kernel)
   add_executable(i8_gemm_parity src/kernels/xe/i8_gemm_parity.cpp)

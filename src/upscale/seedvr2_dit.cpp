@@ -7,7 +7,6 @@
 #include "../image/dit_rows.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
-#include "strata/image/hunyuanimage3_kernels.hpp"
 #include "strata/image/mapped_file.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
@@ -251,8 +250,12 @@ bool Seedvr2Dit::open(const std::string& path, void* stream, std::string& err, b
             if (meta.find("int8_tensorwise") == std::string::npos || meta.find("\"convrot\": true") == std::string::npos ||
                 meta.find("\"convrot_groupsize\": 256") == std::string::npos)
                 throw std::runtime_error("image engine (SeedVR2 DiT): an 8-bit form it does not take: " + meta);
-            w8_ = !dry_ && strata::env_get("NO_W8A8") == nullptr && prefill::Gemm::i8_usable(stream);
         }
+        // W8A8 where it is not clearly the slower here, as every DiT chooses (dit_rows::w8_at_open): the int8 file's
+        // rows as they are, the FP16 file's rotated and quantized on the GPU as int8_convrot's are.  Else the int8
+        // file's rows as Q8_0, the FP16 file's as they are
+        w8_ = !dry_ && C_ % kRotate == 0 && F_ % kRotate == 0 &&
+              rows::w8_at_open(C_, v2_ ? 2 * F_ : F_, "SeedVR2's DiT", stream) == 1;
         {   // the RoPE: an axis's frequencies (the 7B's pixel ones, the 3B's lang ones), as the blocks' rope buffer holds
             // them; 3 axes of them in pairs
             const auto fr = f.st.f32("blocks.0.attn.rope.rope.freqs");
@@ -328,6 +331,21 @@ bool Seedvr2Dit::open(const std::string& path, void* stream, std::string& err, b
                 outmod_ = d;
             }
         }
+        // the FP16 file's weights made W8A8 a matrix at a time through the activations' kernel (dit_rows::HalfI8 with
+        // int8_convrot's rotation: the int8 file's rows, rounding apart), in scratch freed when the blocks are read.
+        // (The 7B opens in 7.3 s so, 5.0 in FP16; quantized on the host's 16 threads it took 12.5: B70, i7-14700,
+        // 2026-11-10)
+        struct Scratch {
+            std::vector<void*> p;
+            ~Scratch() {
+                for (void* q : p) gpu::free(q);
+            }
+        } qtmp;
+        uint16_t* q16 = nullptr;
+        int8_t* q8 = nullptr;
+        float* qsc = nullptr;
+        uint8_t* stage = nullptr;   // pinned: a pageable copy back took the 7B's 8 GB 5.6 s (B70, 2026-11-10)
+        int64_t q_cap = 0, q_rows = 0;
         // the blocks: their FP16 weights from the file, and an FP32 region of their biases, head norms and modulations
         for (int i = 0;; ++i) {
             const std::string p = "blocks." + std::to_string(i) + ".";
@@ -336,6 +354,7 @@ bool Seedvr2Dit::open(const std::string& path, void* stream, std::string& err, b
             Block b;
             std::vector<image::LayerStream::Span> spans;
             std::vector<uint8_t> host;
+            if (!host_.empty()) host.reserve(host_.back().size());   // the last block's: growing it copied 8 GB again
             std::vector<std::pair<uint64_t*, int>> fixups;   // (an offset to set, its span)
             std::vector<std::pair<W*, int>> wfix, fixups_w;   // a weight's span in the file, in the host region
             std::vector<std::pair<W*, int>> sfix;   // a W8A8 weight's scales' span
@@ -353,12 +372,50 @@ bool Seedvr2Dit::open(const std::string& path, void* stream, std::string& err, b
                 const auto join = [&](size_t first) {
                     for (size_t j = first + 1; j < spans.size(); ++j) joined.push_back({(int) j - 1, (int) j});
                 };
-                if (ts[0]->dtype == "F16" && !q8_) {
+                if (ts[0]->dtype == "F16" && !q8_ && !w8_) {
                     w.type = kTypeF16;
                     const size_t first = spans.size();
                     for (const auto* t : ts) spans.push_back({f.raw(*t), (uint64_t) (t->shape[0] * w.k) * 2, 0});
                     join(first);
                     wfix.push_back({&w, (int) first});
+                    return;
+                }
+                if (ts[0]->dtype == "F16" && !q8_) {   // W8A8: the rows made int8 on the GPU, kept in the host region
+                    w.type = kTypeW8;
+                    const int64_t nk = w.n * w.k;
+                    if (nk > q_cap || w.n > q_rows) {
+                        gpu::stream_sync(s_);
+                        for (void* p : qtmp.p) gpu::free(p);
+                        qtmp.p.clear();
+                        q16 = alloc<uint16_t>(qtmp.p, nk);
+                        q8 = alloc<int8_t>(qtmp.p, nk);
+                        qsc = alloc<float>(qtmp.p, w.n);
+                        stage = static_cast<uint8_t*>(gpu::alloc_host((size_t) nk * 2));
+                        if (stage != nullptr) qtmp.p.push_back(stage);
+                        q_cap = nk;
+                        q_rows = w.n;
+                    }
+                    int64_t r0 = 0;
+                    for (const auto* t : ts) {
+                        if (t->dtype != "F16") throw std::runtime_error("image engine (SeedVR2 DiT): mixed dtypes");
+                        const size_t bytes = (size_t) (t->shape[0] * w.k) * 2;
+                        if (stage != nullptr) std::memcpy(stage + r0 * w.k * 2, f.raw(*t), bytes);
+                        else gpu::copy_async(q16 + r0 * w.k, f.raw(*t), bytes, s_);
+                        r0 += t->shape[0];
+                    }
+                    if (stage != nullptr) gpu::copy_async(q16, stage, (size_t) nk * 2, s_);
+                    rows::rows_i8(rows::HalfI8<true>{q16, w.k}, w.n, w.k, q8, qsc, s_);
+                    const size_t at = host.size();
+                    host.resize(at + (size_t) nk + (size_t) w.n * 4);
+                    uint8_t* back = stage != nullptr ? stage : host.data() + at;
+                    gpu::copy_async(back, q8, (size_t) nk, s_);
+                    gpu::copy_async(back + nk, qsc, (size_t) w.n * 4, s_);
+                    if (!gpu::stream_sync(s_)) throw std::runtime_error("image engine (SeedVR2 DiT): the W8A8 rows");
+                    if (stage != nullptr) std::memcpy(host.data() + at, stage, (size_t) nk + (size_t) w.n * 4);
+                    spans.push_back({nullptr, (uint64_t) nk, (uint64_t) at});
+                    fixups_w.push_back({&w, (int) spans.size() - 1});
+                    spans.push_back({nullptr, (uint64_t) w.n * 4, (uint64_t) (at + nk)});
+                    fixups.push_back({&w.sw, (int) spans.size() - 1});
                     return;
                 }
                 for (size_t j = 0; j < names.size(); ++j) {
@@ -564,8 +621,8 @@ uint64_t Seedvr2Dit::activation_bytes(int64_t h, int64_t w, int64_t t) const {
     const uint64_t f16 = (uint64_t) (N * kin_ + std::max(N, L_) * C_ + 3 * (N + L_) * C_ + 4 * jr * C_ + N * C_ +
                                      N * F_);
     const uint64_t tables = (uint64_t) (N * hd_ * 2) * 4 + (uint64_t) (jr * 2) * 4;
-    const uint64_t rows8 = !q8_ ? 0 : w8_ ? (uint64_t) (std::max(N, L_) * std::max(C_, F_)) + (uint64_t) std::max(N, L_) * 8
-                                          : (uint64_t) (std::max(N, L_) * std::max(C_, F_)) * 2;
+    const uint64_t rows8 = w8_ ? (uint64_t) (std::max(N, L_) * std::max(C_, F_)) + (uint64_t) std::max(N, L_) * 8
+                           : q8_ ? (uint64_t) (std::max(N, L_) * std::max(C_, F_)) * 2 : 0;
     return f32 * 4 + f16 * 2 + tables + rows8;
 }
 
@@ -619,7 +676,7 @@ void Seedvr2Dit::ensure(int64_t t, int64_t h, int64_t w) {
     jo_ = alloc<uint16_t>(act_, jr * C_);
     o16_ = alloc<uint16_t>(act_, N * C_);
     g16_ = alloc<uint16_t>(act_, N * F_);
-    if (q8_ && w8_) {
+    if (w8_) {
         xq8_ = alloc<int8_t>(act_, std::max(N, L_) * std::max(C_, F_));
         xs_ = alloc<float>(act_, std::max(N, L_));
         xs2_ = alloc<float>(act_, std::max(N, L_));
@@ -636,10 +693,11 @@ MfOut Seedvr2Dit::product_out(const uint16_t* x16, const float* rs, const W& w, 
                               int64_t T, const float* bias, bool bf16) {
     const auto* d = base != nullptr ? base + reinterpret_cast<uintptr_t>(w.d) : static_cast<const uint8_t*>(w.d);
     if (w.type == kTypeW8) {   // input's int8 rows (xq8_ and their scales xs_in_) against the file's
-        // a reader's values as BF16 where the GPU takes such a product (kernels::i8_gemm_bf16): half the bytes it reads
+        // a reader's values as BF16 where the fused kernel is the faster (dit_rows::w8_fused): half the bytes it reads
         const auto* sw = reinterpret_cast<const float*>(base + w.sw);
-        if (bf16 && kernels::i8_gemm_bf16(xq8_, xs_in_, reinterpret_cast<const int8_t*>(d), sw, bias,
-                                        reinterpret_cast<uint16_t*>(y), T, w.n, w.k, 0, s_)) {
+        if (bf16 && rows::w8_fused(s_) &&
+            kernels::i8_gemm_bf16(xq8_, xs_in_, reinterpret_cast<const int8_t*>(d), sw, bias,
+                                  reinterpret_cast<uint16_t*>(y), T, w.n, w.k, 0, s_)) {
             MfOut o;
             o.C = w.n;
             o.bf = reinterpret_cast<const uint16_t*>(y);
@@ -668,13 +726,13 @@ float* Seedvr2Dit::next_xs() {
 template<class Op16, class OpI8>
 const uint16_t* Seedvr2Dit::input(const Op16& op16, const OpI8& opi8, int64_t T, int64_t K, uint16_t* y16,
                                   float* rs) {
-    if (q8_ && w8_) {
+    if (w8_) {
         rows::rows_i8(opi8, T, K, xq8_, next_xs(), s_);
         return nullptr;
     }
     rows::rows16(op16, T, K, y16, rs, s_);
     if (!q8_) return y16;
-    image::hunyuanimage3_rotate16(y16, T, K, kRotate, rot16_, s_);   // the Q8_0 rows' basis
+    rows::regular_rotate16(y16, T, K, rot16_, s_);   // the Q8_0 rows' basis
     return rot16_;
 }
 
@@ -690,10 +748,10 @@ MfOut Seedvr2Dit::stream_attn_in(const Stream& st, const uint8_t* base, const fl
 void Seedvr2Dit::stream_out(const Stream& st, const uint8_t* base, const uint16_t* o16, float* x, int64_t T) {
     const float* mod = reinterpret_cast<const float*>(base + st.mod);
     const uint16_t* in = o16;
-    if (q8_ && w8_) {
+    if (w8_) {
         rows::rows_i8(rows::HalfI8<true>{o16, C_}, T, C_, xq8_, next_xs(), s_);
     } else if (q8_) {
-        image::hunyuanimage3_rotate16(o16, T, C_, kRotate, rot16_, s_);
+        rows::regular_rotate16(o16, T, C_, rot16_, s_);
         in = rot16_;
     }
     rows::gate_add(x, product_out(in, nullptr, st.out, base, y_, T, reinterpret_cast<const float*>(base + st.b_out)),
