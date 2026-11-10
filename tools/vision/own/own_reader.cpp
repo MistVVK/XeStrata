@@ -52,6 +52,10 @@ bool own_reader_supported(const std::string& mmproj, bool gpu, std::string& why)
         return false;
     }
 #endif
+    else if (vit_cpu_build_slower_than_mtmd()) {
+        why = "this build of the own CPU tower (MSVC, x86) is slower than mtmd's CPU reader";
+        return false;
+    }
     Gguf gg;
     VitGeometry g;
     if (!gg.open(mmproj, why) || !vit_geometry_from_gguf(gg, g, why)) return false;
