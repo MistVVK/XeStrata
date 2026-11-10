@@ -202,10 +202,10 @@ __global__ void __launch_bounds__(RR_THREADS) k_router_route(const float* __rest
 }
 
 // rows of one job: tmp[j] = W row . y[ys[j]] for j < n <= TT, G lanes per row
-template <ggml_type type, int G, int TT>
+template <GgmlType type, int G, int TT>
 __device__ __forceinline__ void job_rows(const char* wr, bool live, int ncols, int n, const block_q8_1* y, const int* ys,
                                          int y_stride, float* tmp) {
-    constexpr int qk = ggml_cuda_type_traits<type>::qk, qi = ggml_cuda_type_traits<type>::qi, vdr = vdr_of<type>();
+    constexpr int qk = qtraits<type>::qk, qi = qtraits<type>::qi, vdr = vdr_of<type>();
     constexpr int per_block = qi / vdr;
     static_assert(G >= per_block && G % per_block == 0, "G must cover a block");
     constexpr int bpi = G / per_block;
@@ -235,9 +235,9 @@ __device__ __forceinline__ void job_store(const float* tmp, int n, bool live, in
 }
 
 // one thread's dot of U columns of a weight row (its unit `u`) with one q8_1 activation row
-template <ggml_type type, int U>
+template <GgmlType type, int U>
 __device__ __forceinline__ float unit_dot(const char* wrow, int u, const block_q8_1* y) {
-    constexpr int qk = ggml_cuda_type_traits<type>::qk, qi = ggml_cuda_type_traits<type>::qi, vdr = vdr_of<type>();
+    constexpr int qk = qtraits<type>::qk, qi = qtraits<type>::qi, vdr = vdr_of<type>();
     float s = 0.f;
     if constexpr (U % qk == 0) {
 #pragma unroll
@@ -255,7 +255,7 @@ __device__ __forceinline__ float unit_dot(const char* wrow, int u, const block_q
 #include "moe_w.cuh"
 
 // gate|up: rows [0, 2 * ffs) of each job [0, *njobs)
-template <ggml_type TA, int G, int TT>
+template <GgmlType TA, int G, int TT>
 __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu(MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
                                                        const block_q8_1* __restrict__ y, float* __restrict__ out) {
     const int ji = blockIdx.y;
@@ -296,7 +296,7 @@ __global__ void k_moe_h(const float* __restrict__ gu, int ffs, int npairs) {
 
 // PRE: the pairs' h made by k_moe_h (past 8 rows: kbench 16 rows 82.9 -> 70.7 us); else each block makes its own (the
 // extra launch costs more than it saves: 5 rows 30.7 -> 31.7)
-template <ggml_type TA, bool PRE>
+template <GgmlType TA, bool PRE>
 __global__ void __launch_bounds__(DN_THREADS) k_moe_down(MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
                                                         const float* __restrict__ gu, float* __restrict__ out) {
     const int ji = blockIdx.y;
@@ -344,20 +344,20 @@ __global__ void __launch_bounds__(DN_THREADS) k_moe_down(MoeW w, const Job* __re
     }
 }
 
-template <ggml_type type> constexpr int per_block_of() { return ggml_cuda_type_traits<type>::qi / vdr_of<type>(); }
-template <ggml_type type> constexpr bool unit_ok(int U) { return U % ggml_cuda_type_traits<type>::qk == 0; }
+template <GgmlType type> constexpr int per_block_of() { return qtraits<type>::qi / vdr_of<type>(); }
+template <GgmlType type> constexpr bool unit_ok(int U) { return U % qtraits<type>::qk == 0; }
 
 // lanes per row: enough to keep every block of a row busy (as mmvq picks them)
-template <ggml_type TA> int moe_g(int ncols) {
+template <GgmlType TA> int moe_g(int ncols) {
     constexpr int pa = per_block_of<TA>();
-    const int lanes = (ncols / ggml_cuda_type_traits<TA>::qk) * pa;
+    const int lanes = (ncols / qtraits<TA>::qk) * pa;
     int G = pa;
     while (G < lanes && G < 32) G *= 2;
     return G;
 }
 
 // k_moe_gu for BigJobs: the job's pairs MAXT at a time through the row
-template <ggml_type TA, int G>
+template <GgmlType TA, int G>
 __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_big(MoeW w, const BigJob* __restrict__ jobs, const int* __restrict__ njobs,
                                                            const block_q8_1* __restrict__ y, float* __restrict__ out) {
     const int ji = blockIdx.y;
@@ -377,7 +377,7 @@ __global__ void __launch_bounds__(MMVQ_THREADS) k_moe_gu_big(MoeW w, const BigJo
 }
 
 // k_moe_down for BigJobs: per MAXT pairs, their h into shared memory, the dots, the sums
-template <ggml_type TA>
+template <GgmlType TA>
 __global__ void __launch_bounds__(DN_THREADS) k_moe_down_big(MoeW w, const BigJob* __restrict__ jobs, const int* __restrict__ njobs,
                                                             const float* __restrict__ gu, float* __restrict__ out) {
     const int ji = blockIdx.y;
@@ -418,7 +418,7 @@ __global__ void __launch_bounds__(DN_THREADS) k_moe_down_big(MoeW w, const BigJo
     }
 }
 
-template <ggml_type TA>
+template <GgmlType TA>
 void moe_launch_big(bool down, const MoeW& w, const BigJob* jobs, const int* njobs, int njobs_cap, const void* in, float* out,
                     cudaStream_t s) {
     if (down) {
@@ -443,7 +443,7 @@ void moe_launch_big(bool down, const MoeW& w, const BigJob* jobs, const int* njo
 }
 
 // the gate|up kernel for a window of T rows (a job holds at most T)
-template <ggml_type TA, int G>
+template <GgmlType TA, int G>
 void gu_launch(int T, dim3 grid, cudaStream_t s, const MoeW& w, const Job* jobs, const int* njobs, const block_q8_1* y, float* out) {
     switch (T) {
         case 1: k_moe_gu<TA, G, 1><<<grid, MMVQ_THREADS, 0, s>>>(w, jobs, njobs, y, out); break;
@@ -468,7 +468,7 @@ void gu_launch(int T, dim3 grid, cudaStream_t s, const MoeW& w, const Job* jobs,
 
 // gate|up with the shared expert's swiglu and down as extra rows of blocks (the other expert types' version of k_moe_gu_q4k's sd rows): 256-thread blocks (the shared
 // expert's q8s blocks are Q8S_THREADS wide), G lanes a row as k_moe_gu has them, so every row sums its terms in the same order and the answers are the same bits
-template <ggml_type TA, int G, int TT>
+template <GgmlType TA, int G, int TT>
 __global__ void __launch_bounds__(Q8S_THREADS) k_moe_gu_sd(MoeW w, const Job* __restrict__ jobs, const int* __restrict__ njobs,
                                                          const block_q8_1* __restrict__ y, float* __restrict__ out, const ShexpDown sd, int sd_rows) {
     if ((int) blockIdx.y < sd_rows) {
@@ -488,7 +488,7 @@ __global__ void __launch_bounds__(Q8S_THREADS) k_moe_gu_sd(MoeW w, const Job* __
     job_store<G, TT>(tmp, jb.n, live, row, jb.out, out, w.nrows);
 }
 
-template <ggml_type TA>
+template <GgmlType TA>
 void gu_sd_launch(int T, const MoeW& w, const Job* jobs, const int* njobs, int njobs_max, const block_q8_1* y, float* out, cudaStream_t s, const ShexpDown& sd) {
     if (moe_g<TA>(w.ncols) != 32) throw std::runtime_error("moe gate|up: only 32 lanes a row are compiled (rows of N columns)");
     const int gx = (w.nrows + Q8S_THREADS / 32 - 1) / (Q8S_THREADS / 32), sd_blocks = (sd.rows + Q8S_THREADS / 32 - 1) / (Q8S_THREADS / 32);
@@ -503,7 +503,7 @@ void gu_sd_launch(int T, const MoeW& w, const Job* jobs, const int* njobs, int n
 #undef FNX_GS
 }
 
-template <ggml_type TA>
+template <GgmlType TA>
 void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int njobs_max, const void* in, float* out,
                 cudaStream_t s, int T) {
     if (down) {
@@ -523,7 +523,7 @@ void moe_launch(bool down, const MoeW& w, const Job* jobs, const int* njobs, int
     }
     // gate|up rows have N columns, where every type's lanes per row come to 32: only that variant is compiled (the
     // others, never used, were 192 of the file's kernels). Q4_K's gate|up has a kernel of its own (moe_q4k.cuh)
-    if constexpr (TA == GGML_TYPE_Q4_K) {
+    if constexpr (TA == T_Q4_K) {
         throw std::runtime_error("moe gate|up: Q4_K runs gu_q4k_launch");
     } else {
         if (moe_g<TA>(w.ncols) != 32) throw std::runtime_error("moe gate|up: only 32 lanes a row are compiled (rows of N columns)");

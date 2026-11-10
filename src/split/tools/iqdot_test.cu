@@ -1,4 +1,4 @@
-// HIP: the i-quant decode dots of src/iqdot_hip.cuh against ggml's vec_dot_iq3_s / iq3_xxs / iq2_s_q8_1 on random blocks (random weight bytes, random q8_1 rows, every
+// HIP: the i-quant decode dots of src/iqdot_hip.cuh against src/qdot.cuh's vec_dot_iq3_s / iq3_xxs / iq2_s_q8_1 (ggml's arithmetic; tools/qdot_test.cu ties them to vecdotq.cuh) on random blocks (random weight bytes, random q8_1 rows, every
 // iqs the kernels use): the floats must match bit for bit. Prints one line per type and exits 1 on a mismatch.
 //   build: the same compile line as src/kernels.cu's parts (-DFNX_HIP=1 ...), see phaseA-tests/round0211/r9700split/iqdot_build.sh
 #include "kernels.hpp"
@@ -10,19 +10,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <vector>
 
-#if FNX_HIP
-#undef __vsubss4
-#undef __vsub4
-#undef __vcmpne4
-#undef __shfl_sync
-#undef __shfl_up_sync
-#undef __shfl_xor_sync
-#endif
-#include "common.cuh"
-#include "vecdotq.cuh"
+#include "qdot.cuh"
 #include "iqdot_hip.cuh"
 
 namespace {
@@ -30,18 +22,18 @@ namespace {
 template <int T> struct Dots;
 template <> struct Dots<0> {   // IQ3_S
     static constexpr int BYTES = sizeof(block_iq3_s);
-    __device__ static float ggml(const void* v, const block_q8_1* y, int k, int i) { return vec_dot_iq3_s_q8_1(v, y, k, i); }
-    __device__ static float mine(const void* v, const block_q8_1* y, int k, int i) { return fnx_vec_dot_iq3_s_q8_1(v, y, k, i); }
+    __device__ static float ref(const void* v, const block_q8_1* y, int k, int i) { return fnx::vec_dot_iq3_s_q8_1(v, y, k, i); }
+    __device__ static float mine(const void* v, const block_q8_1* y, int k, int i) { return fnx::fnx_vec_dot_iq3_s_q8_1(v, y, k, i); }
 };
 template <> struct Dots<1> {   // IQ3_XXS
     static constexpr int BYTES = sizeof(block_iq3_xxs);
-    __device__ static float ggml(const void* v, const block_q8_1* y, int k, int i) { return vec_dot_iq3_xxs_q8_1(v, y, k, i); }
-    __device__ static float mine(const void* v, const block_q8_1* y, int k, int i) { return fnx_vec_dot_iq3_xxs_q8_1(v, y, k, i); }
+    __device__ static float ref(const void* v, const block_q8_1* y, int k, int i) { return fnx::vec_dot_iq3_xxs_q8_1(v, y, k, i); }
+    __device__ static float mine(const void* v, const block_q8_1* y, int k, int i) { return fnx::fnx_vec_dot_iq3_xxs_q8_1(v, y, k, i); }
 };
 template <> struct Dots<2> {   // IQ2_S
     static constexpr int BYTES = sizeof(block_iq2_s);
-    __device__ static float ggml(const void* v, const block_q8_1* y, int k, int i) { return vec_dot_iq2_s_q8_1(v, y, k, i); }
-    __device__ static float mine(const void* v, const block_q8_1* y, int k, int i) { return fnx_vec_dot_iq2_s_q8_1(v, y, k, i); }
+    __device__ static float ref(const void* v, const block_q8_1* y, int k, int i) { return fnx::vec_dot_iq2_s_q8_1(v, y, k, i); }
+    __device__ static float mine(const void* v, const block_q8_1* y, int k, int i) { return fnx::fnx_vec_dot_iq2_s_q8_1(v, y, k, i); }
 };
 
 // one thread per (block, iqs): the two dots against q8_1 block y[block * 8 + iqs / 2... ] (the dot reads bq8_1[iqs / 2], so 8 q8_1 blocks per weight block)
@@ -50,7 +42,7 @@ __global__ void k_cmp(const char* w, const block_q8_1* y, int nblocks, unsigned*
     const int e = blockIdx.x * blockDim.x + threadIdx.x;
     if (e >= nblocks * 8) return;
     const int kbx = e / 8, iqs = (e % 8) * 2;
-    const float a = Dots<T>::ggml(w, y + (size_t) kbx * 8, kbx, iqs), b = Dots<T>::mine(w, y + (size_t) kbx * 8, kbx, iqs);
+    const float a = Dots<T>::ref(w, y + (size_t) kbx * 8, kbx, iqs), b = Dots<T>::mine(w, y + (size_t) kbx * 8, kbx, iqs);
     atomicAdd(checked, 1u);
     if (__float_as_uint(a) != __float_as_uint(b)) atomicAdd(bad, 1u);
 }

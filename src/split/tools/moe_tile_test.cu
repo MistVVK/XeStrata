@@ -17,9 +17,8 @@
 #include <string>
 #include <vector>
 
-#include "common.cuh"
-#include "ggml.h"
 #include "gguf.hpp"
+#include "qdot.cuh"   // block layouts and codebook tables
 
 namespace fnx {
 namespace {
@@ -102,16 +101,16 @@ int main(int argc, char** argv) {
                 cudaMemcpy(d_we, we, row_a * nrows, cudaMemcpyHostToDevice);
                 cudaMemset(d_out, 0xFF, (size_t) nrows * ncols * 2);
                 switch (t.type) {
-                    case T_Q4_0: run<GGML_TYPE_Q4_0>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_IQ4_NL: run<GGML_TYPE_IQ4_NL>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_IQ4_XS: run<GGML_TYPE_IQ4_XS>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_IQ3_S: run<GGML_TYPE_IQ3_S>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_IQ3_XXS: run<GGML_TYPE_IQ3_XXS>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_IQ2_S: run<GGML_TYPE_IQ2_S>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_Q4_K: run<GGML_TYPE_Q4_K>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_Q5_K: run<GGML_TYPE_Q5_K>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_Q5_1: run<GGML_TYPE_Q5_1>(d_we, row_a, nrows, ncols, d_out); break;
-                    case T_Q8_0: run<GGML_TYPE_Q8_0>(d_we, row_a, nrows, ncols, d_out); break;
+                    case T_Q4_0: run<T_Q4_0>(d_we, row_a, nrows, ncols, d_out); break;
+                    case T_IQ4_NL: run<T_IQ4_NL>(d_we, row_a, nrows, ncols, d_out); break;
+                    case T_IQ4_XS: run<T_IQ4_XS>(d_we, row_a, nrows, ncols, d_out); break;
+                    case T_IQ3_S: run<T_IQ3_S>(d_we, row_a, nrows, ncols, d_out); break;
+                    case T_IQ3_XXS: run<T_IQ3_XXS>(d_we, row_a, nrows, ncols, d_out); break;
+                    case T_IQ2_S: run<T_IQ2_S>(d_we, row_a, nrows, ncols, d_out); break;
+                    case T_Q4_K: run<T_Q4_K>(d_we, row_a, nrows, ncols, d_out); break;
+                    case T_Q5_K: run<T_Q5_K>(d_we, row_a, nrows, ncols, d_out); break;
+                    case T_Q5_1: run<T_Q5_1>(d_we, row_a, nrows, ncols, d_out); break;
+                    case T_Q8_0: run<T_Q8_0>(d_we, row_a, nrows, ncols, d_out); break;
                     default: std::printf("skip %s type %u\n", t.name.c_str(), t.type); cudaFree(d_we); cudaFree(d_out); continue;
                 }
                 if (cudaDeviceSynchronize() != cudaSuccess) throw std::runtime_error(std::string("kernel: ") + cudaGetErrorString(cudaGetLastError()));
