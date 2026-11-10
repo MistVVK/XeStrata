@@ -503,7 +503,10 @@ void dot_iq4_nl_q8_0(int n, float* STRATA_RESTRICT s, const void* STRATA_RESTRIC
             sumi1 += y[ib].qs[j+       0] * kvalues_iq4nl[x[ib].qs[j] & 0xf];
             sumi2 += y[ib].qs[j+QK4_NL/2] * kvalues_iq4nl[x[ib].qs[j] >>  4];
         }
-        { float t = d * (float) (sumi1 + sumi2); STRATA_NOFUSE(t); sumf += t; }   // ggml-cpu (GCC, gnu11, -mfma) does not fuse this tail into an FMA; our C++ would
+        // Pinned unfused (a multiply, then an add).  The contract is ggml-cpu as GCC 13.3 builds it (gnu11, -O3 -mfma), which does not fuse this tail; our C++
+        // file (-ffp-contract=fast) would.  GCC 14.3 and 15.2 DO fuse it inside ggml-cpu (55 rows of the oracle, 1-2 ulp, one Broadwell box, 11-10), MSVC 19.44
+        // does not; our result is the same bytes under all four.  So the oracle's reference is tests/quant/golden_x86.txt, not the ggml a newer GCC builds.
+        { float t = d * (float) (sumi1 + sumi2); STRATA_NOFUSE(t); sumf += t; }
     }
     *s = sumf;
 }

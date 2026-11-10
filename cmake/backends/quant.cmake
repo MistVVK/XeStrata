@@ -23,14 +23,21 @@ macro(strata_quant_layer)
                                        ${_sq}/src/quant/x86/act_avx.cpp ${_sq}/src/quant/x86/dot_avx512.cpp)
     target_compile_definitions(strata_quant PRIVATE STRATA_QUANT_X86_TIERS=1)
     if(MSVC)
+      # MSVC contracts neither ggml-cpu's C nor these files' intrinsics (measured: 0 differences from its own ggml in all three flavours); the Windows bits
+      # differ from GCC's in the Q5_K and IQ1_S dots, see below
       set_source_files_properties(${_sq}/src/quant/x86/dot_avx2.cpp ${_sq}/src/quant/x86/act_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
       set_source_files_properties(${_sq}/src/quant/x86/dot_avx.cpp ${_sq}/src/quant/x86/act_avx.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
       set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     else()
-      # ggml-cpu is C built as gnu11, where GCC contracts a multiply and an add into an FMA wherever it can (-ffp-contract=fast), the intrinsics'
-      # `_mm256_add_ps(_mm256_mul_ps(a, b), c)` patterns included; the same flag keeps this C++ (-std=c++20, an ISO mode that contracts less) summing
-      # as ggml does.  The one place ggml's GCC does NOT fuse, the IQ4_NL scalar tail, is pinned in x86_dots.inc (STRATA_NOFUSE).
-      # tests/quant/run_oracle.sh is what notices a toolchain that disagrees.
+      # What is pinned, and against what: the reference is ggml-cpu as GCC 13.3 builds it (C, gnu11, where GCC contracts a multiply and an add into an
+      # FMA wherever it can, the intrinsics' `_mm256_add_ps(_mm256_mul_ps(a, b), c)` patterns included).  -ffp-contract=fast keeps this C++ (-std=c++20,
+      # an ISO mode that contracts less) summing as that ggml does; the one place it does NOT fuse, the IQ4_NL scalar tail, is pinned unfused in
+      # x86_dots.inc (STRATA_NOFUSE), and dot_generic.cpp (Q2_0 under every contract) is -ffp-contract=off above.
+      # Measured 11-10 on one Broadwell box, all three flavours: our results are the same bytes under GCC 13.3, 14.3 and 15.2; ggml-cpu's are not
+      # (GCC 14.3 also fuses the IQ4_NL tail: 55 rows of the oracle; GCC 15.2 that and the generic Q2_0 dot: 238 rows; 1-4 ulp).  So the oracle's gate
+      # (tests/quant/quant_parity.cpp, leg 1) compares with the GCC 13.3 reference stored in tests/quant/golden_x86.txt, under any compiler; the ggml
+      # built here is compared for information.  MSVC (branch above, no pin): ours equals MSVC's ggml, which does not contract the intrinsics, so
+      # Q5_K and IQ1_S dots differ from GCC's by 1-512 ulp (the golden file's msvc lines).
       set(STRATA_QUANT_AVX2_EXTRA "" CACHE STRING "extra compile options for the AVX2 tier files (experiments), semicolon separated")
       set_source_files_properties(${_sq}/src/quant/x86/dot_avx2.cpp ${_sq}/src/quant/x86/act_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-ffp-contract=fast;${STRATA_QUANT_AVX2_EXTRA}")
       # AVX2, FMA and F16C explicitly off: a -march=native build host must not leak wider code into the AVX-only tier
@@ -78,8 +85,15 @@ macro(strata_quant_layer)
     add_executable(quant_parity ${_sq}/tests/quant/quant_parity.cpp)
     target_link_libraries(quant_parity PRIVATE strata_quant ggml-cpu ggml-base)
     target_include_directories(quant_parity PRIVATE ${_sq}/src/quant ${_sq}/third_party/strata-ggml)
+    # leg 1 of the oracle: the golden reference digests (tests/quant/quant_parity.cpp says how they are made and checked)
+    target_compile_definitions(quant_parity PRIVATE STRATA_QUANT_GOLDEN_FILE="${_sq}/tests/quant/golden_x86.txt")
     add_test(NAME quant_parity COMMAND quant_parity)
     set_tests_properties(quant_parity PROPERTIES TIMEOUT 600)
+    if(STRATA_CPU_X86 AND EXISTS ${_sq}/tests/quant/golden_x86.txt)
+      # the golden lines regenerate byte for byte from this build's ggml-cpu: run on GCC 13.x (family gcc) and MSVC 19.4x (family msvc), skipped (77) elsewhere
+      add_test(NAME quant_golden_regen COMMAND quant_parity --regen-check)
+      set_tests_properties(quant_golden_regen PROPERTIES TIMEOUT 600 SKIP_RETURN_CODE 77)
+    endif()
     # the speed of the layer's rows against ggml-cpu's (interleaved rounds); not a test
     add_executable(quant_bench_ggml ${_sq}/tests/quant/quant_bench_ggml.cpp)
     target_link_libraries(quant_bench_ggml PRIVATE strata_quant ggml-cpu ggml-base)
