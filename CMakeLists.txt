@@ -342,6 +342,12 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(share_rules_test PRIVATE include)
   add_test(NAME share_rules_test COMMAND share_rules_test)
 
+  # which work item (128 or 64 routed rows) the CUDA fused prompt kernels take, per card class (pick_ww): the pure rule, pinned at the two sides of every threshold for the
+  # measured classes and compared with the previous rule for every class that must not change (header-only, no GPU)
+  add_executable(fused_tile_rule_test tests/prefill/fused_tile_rule_test.cpp)
+  target_include_directories(fused_tile_rule_test PRIVATE include)
+  add_test(NAME fused_tile_rule_test COMMAND fused_tile_rule_test)
+
   # STRATA_SELECT_TWO_PASS: the bound between the single-pass and 3xTF32 QSA block scores and the cut-off rule that
   # keeps the selection (header-only, no GPU)
   add_executable(qsa_two_pass_test tests/prefill/qsa_two_pass_test.cpp)

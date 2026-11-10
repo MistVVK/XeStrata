@@ -21,6 +21,7 @@
 // (SwiGLU, H to int8 per 32 features; down into the per-slot rows) are moe_fused.cu's.
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/pf_fused_override.hpp"
+#include "strata/prefill/fused_tile_rule.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/emulate.hpp"
 #include "strata/core/sm120_series.hpp"
@@ -2034,39 +2035,20 @@ int pick_ww(int64_t n, int n_expert) {
         return t == 64 ? 4 : t == 128 ? 2 : 0;
     }();
     if (forced) return forced;
-    const double avg = (double) n / std::max(n_expert, 1);
-    // GB10 (sm_121, 48 SMs): the launch's average is above 112 rows an expert for every prompt size here, so the 5070's
-    // 56-112 band never fires and the 64-row tile would be chosen everywhere.  Forcing 128 rows measured +3.7% [1.030, 1.079]
-    // and +3.4% [1.030, 1.038] at 16K in two independent order-balanced block pairs (12 samples a cell) and +4.3% at 32K
-    // in the second pair, with 4K neutral-to-slightly-worse (0.989x, 0.962x, intervals spanning 1.0).  So on this part the
-    // 128-row tile is taken from 65,536 routed rows a launch (about an 11K-token prompt at six experts) up; 4K keeps 64.
-    // STRATA_PF_TILE_DEBUG=1 prints the choice of every launch.
-    if (dev_info().s121) {
+    // the rule itself (the card classes, the thresholds and the measurements behind them) is include/strata/prefill/fused_tile_rule.hpp, a pure function the unit test
+    // tests/prefill/fused_tile_rule_test.cpp pins for every measured card class.  STRATA_PF_TILE_DEBUG=1 prints the choice of every launch of a class that has its own rule.
+    const DevInfo& d = dev_info();
+    const strata::prefill::fused_tile::Pick pk = strata::prefill::fused_tile::pick({d.s120, d.s121, d.sms}, n, n_expert);
+    using strata::prefill::fused_tile::Why;
+    if (pk.why != Why::kBand) {
         static const bool dbg = [] { const char* v = std::getenv("STRATA_PF_TILE_DEBUG"); return v != nullptr && v[0] == '1'; }();
-        const int ww = n >= 65536 ? 2 : 4;
-        if (dbg) std::fprintf(stderr, "strata: fused tile: rows %lld experts %d avg %.1f s121 yes -> ww %d\n",
-                              (long long) n, n_expert, avg, ww);
-        return ww;
+        if (dbg) {
+            const double avg = (double) n / std::max(n_expert, 1);
+            const char* cls = pk.why == Why::kS121 ? "s121" : pk.why == Why::kS120Small ? "s120 small" : "s120";
+            std::fprintf(stderr, "strata: fused tile: rows %lld experts %d avg %.1f %s yes -> ww %d\n", (long long) n, n_expert, avg, cls, pk.ww);
+        }
     }
-    // sm_120 with 80 SMs and up (the cards that take these kernels by default: RTX 5080 / 5090, PRO 5000 / 6000): 128 rows from 159.9 rows an
-    // expert on: a prompt of 8,192 tokens routes 8,191 positions = 81,910 routed rows at top 10 = 159.98 rows an expert over 512 experts, the
-    // measured case (the first measured point at or above 1.000 on every pair below), so the bound sits just under 160.  REAL routing (the replay of a UD-IQ4_XS and a UD-Q4_K_XL prompt's expert
-    // ids through tests/cuda/prefill_fused_iq_test, one layer, 64-row time / 128-row time at 8192 / 12000 / 16000 / 20000 tokens): PRO 6000
-    // IQ3_S/IQ4_NL 1.068 / 1.129 / 1.140 / 1.172, IQ4_XS/IQ4_NL 1.026 / 1.078 / 1.091 / 1.120, Q4_K/Q5_1 1.001 / 1.089 / 1.117 / 1.119; PRO 5000
-    // IQ3_S/IQ4_NL 1.101 / 1.152 / 1.181 / 1.204, IQ4_XS/IQ4_NL 1.080 / 1.126 / 1.156 / 1.176.  Below 160 rows the answer depends on the card
-    // (the PRO 6000 loses 3-7% at 80 rows), so the band above is left as it was.  The 5070 (48 SMs) is not in this branch: its uniform-routing
-    // numbers above are against 128 rows at 8192 tokens and it has no real-routing row yet.  Same output bits either way (the tile only
-    // groups routed rows).  STRATA_PF_TILE_DEBUG=1 prints the choice of every launch.
-    // sm_120 with 100 to 149 SMs (the PRO 5000, 110): the 128-row tile also between the band and 159.9 rows an expert, so it is taken from 56 rows
-    // on without a gap.  Real routing, 64-row time / 128-row time, PRO 5000 (IQ3_S/IQ4_NL, IQ4_XS/IQ4_NL) at 80 / 120 / 160 rows: 1.037 / 1.023,
-    // 1.097 / 1.079, 1.101 / 1.080.  The PRO 6000 (188 SMs) is not here: 0.971 / 0.926 at 80, 1.004 / 0.960 at 120.
-    if (dev_info().s120 && dev_info().sms >= 80 &&
-        (avg >= 159.9 || (dev_info().sms >= 100 && dev_info().sms < 150 && avg > 112.0))) {
-        static const bool dbg = [] { const char* v = std::getenv("STRATA_PF_TILE_DEBUG"); return v != nullptr && v[0] == '1'; }();
-        if (dbg) std::fprintf(stderr, "strata: fused tile: rows %lld experts %d avg %.1f s120 yes -> ww 2\n", (long long) n, n_expert, avg);
-        return 2;
-    }
-    return avg > 56.0 && avg <= 112.0 ? 2 : 4;
+    return pk.ww;
 }
 
 }  // namespace
