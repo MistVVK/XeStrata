@@ -590,6 +590,8 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
     constexpr int WLDX = F16 ? WLDH : WLD;
     constexpr int WT_BYTES = WR * WLDX, WS_FLOATS = F16 ? 0 : WR * 4, ACT_STAGE = TR * AB;
     constexpr bool TWO_PASS = NT != THREADS;   // the two-pass loads (load_unit_l) only in the opt-in NT = 256 kernels
+    static_assert(!(TWO_PASS && WT == T_Q5_0), "the NT = 256 kernels have no Q5_0 form");
+    constexpr int RAW = raw_words(WT) > 5 ? raw_words(WT) : 5;   // the raw words of a sub-block: 5, Q5_0's 6
     constexpr int NS = (GU ? GU_ROWS_K : D_ROWS_K) / 64;   // 64-value stages along K
     constexpr int NFB = (GU ? GU_ROWS_N : D_ROWS_N) / WR;          // weight-row blocks per tile
     static_assert(GU_ROWS_N % WR == 0 && D_ROWS_N % WR == 0, "the weight rows of a product are whole work items (2 n_ff and n_embd are multiples of 64 WW)");
@@ -640,7 +642,7 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
         constexpr bool GU256 = GU && WT != T_Q2_0;
         auto unit = [&](int s) -> const uint8_t* {                  // the block of stage s's sub-block
             if (GU256) return wrow + (s >> 2) * BS;
-            return WT == T_IQ4_NL ? wrow + (2 * s + uj) * BS : wrow + s * BS;
+            return (WT == T_IQ4_NL || WT == T_Q5_0) ? wrow + (2 * s + uj) * BS : wrow + s * BS;   // 32-value blocks: two a stage
         };
         auto sub = [&](int s) { return GU256 ? 2 * (s & 3) + uj : uj; };
         // the weight bytes into L2 ahead of the register loads (one stage ahead only - less than a DRAM round trip):
@@ -669,7 +671,7 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
                 if (r < nrows) cp16(st + r * AB + q * 16, act + (size_t) srow[r] * ACT_LD + s * AB + q * 16);
             }
         };
-        auto put = [&](const uint32_t (&raw)[5], int buf) {
+        auto put = [&](const uint32_t (&raw)[RAW], int buf) {
             if (!dec) return;
             uint32_t q[8];
             float s0, s1;
@@ -697,10 +699,11 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
             if (s < NS) load_act(s);
             cp_commit();
         }
-        uint32_t raw[5] = {0, 0, 0, 0, 0};
+        uint32_t raw[RAW] = {};
         uint32_t pc[NP];   // stage s + 2's pieces in flight (load_unit_l)
-        auto issue = [&](int s) { LdIssue l{pc, 0}; uint32_t w[5]; load_unit_l<WT>(l, unit(s), sub(s), w); };
-        auto take = [&](int s) { LdTake l{pc, 0}; load_unit_l<WT>(l, unit(s), sub(s), raw); };
+        // (the two-pass loads exist for the NT = 256 instances' formats only: no Q5_0 instance takes them)
+        auto issue = [&](int s) { if constexpr (TWO_PASS) { LdIssue l{pc, 0}; uint32_t w[5]; load_unit_l<WT>(l, unit(s), sub(s), w); } };
+        auto take = [&](int s) { if constexpr (TWO_PASS) { LdTake l{pc, 0}; load_unit_l<WT>(l, unit(s), sub(s), raw); } };
         if (dec) load_unit<WT>(unit(0), sub(0), raw);
         if (dec && TWO_PASS && 2 < NS) issue(2);
         put(raw, 0);
@@ -1702,6 +1705,10 @@ struct DevInfo {
     int sms = 0, occ = 1;
     int occ_nt = 0;     // blocks per multiprocessor of the NT = 256 kernels (0: not set up)
     bool ws = false;    // STRATA_PF_FUSED_WS: the warp-specialized kernels are set up
+#if !defined(__HIPCC__)
+    bool q50 = false;   // sm_80+ with STRATA_PF_FUSED_Q50=1: the Q5_0 down kernels are set up (opt-in, phase 4 step 1)
+    int occ_q50 = 1;    // their blocks per multiprocessor (kept apart, so the other formats' grids do not change)
+#endif
 };
 std::mutex g_mu;
 DevInfo g_dev[32];
@@ -1718,6 +1725,12 @@ int host_astages() {
         per[dev] = strata::cc_major_of(major) < 8 ? 2 : ASTAGES;
     }
     return per[dev];
+}
+// STRATA_PF_FUSED_Q50 on CUDA: "1" sets the Q5_0 down kernels up (dev_info) and lets native_supported take the Q5_0-down layers on
+// any sm_80+ card; anything else (unset, "0") keeps those layers on the dequantize + FP16 GEMM path (the default)
+bool q50_cuda_requested() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_FUSED_Q50"); return v != nullptr && v[0] == '1'; }();
+    return on;
 }
 template <int T, bool GU, int WW, int NT = THREADS, bool F16 = false> bool setup_ww(int& occ) {
     cudaFuncAttributes fa{};
@@ -1855,6 +1868,12 @@ const DevInfo& dev_info() {
     static const bool q2n = [] { const char* v = std::getenv("STRATA_PF_FUSED_Q2N"); return v != nullptr && v[0] == '1'; }();
     if (int o2 = occ; q2n && d.ok && setup_one<T_Q2_0, true>(o2)) { d.q2n = true; occ = o2; }
     d.occ = d.ok ? occ : 1;
+    // STRATA_PF_FUSED_Q50=1 (opt-in on CUDA, off by default): the Q5_0 down projections (UD-IQ4_XS v31: 33 of 48 layers, which have
+    // no MMQ tile here and otherwise take the dequantize + FP16 GEMM path) on native_kernel - the decode is the HIP kernels'
+    // (load_unit / convert<T_Q5_0>: int8 codes q - 16, one scale per 32 values), the products the IQ4_NL down's (int8 mma.sync,
+    // FP32 scales and sums).  Their occupancy is their own (occ_q50), so the other formats' launches do not change; a failed
+    // setup leaves those layers on the FP16 path.
+    if (int o3 = 1 << 20; d.ok && q50_cuda_requested() && setup_one<T_Q5_0, false>(o3)) { d.q50 = true; d.occ_q50 = o3; }
     if (d.ok && nt256_requested()) {
         int o2 = 1 << 20;
         const bool ok2 = setup_nt<T_IQ2_XXS, true>(o2) && setup_nt<T_IQ2_XS, true>(o2) && setup_nt<T_IQ2_S, true>(o2) &&
@@ -1966,6 +1985,8 @@ bool d_covered_on(int t, const DevInfo& d) {
 #if defined(__HIPCC__)
     if (t == T_Q5_0) return d.w12 ? q50_on(d) : q50_on(d) && f16::requested();   // gfx1151 has no int8 kernel for Q5_0 down (the F16 prompt set must be on); gfx12 has only the int8 one
     if (t == T_Q8_0 && !d.w12 && (f16::requested() || q8d_f16_default(d))) return true;
+#else
+    if (t == T_Q5_0) return d.q50;   // STRATA_PF_FUSED_Q50=1 and its kernels set up (dev_info)
 #endif
     (void) d;
     return d_covered(t);
@@ -2060,6 +2081,13 @@ bool native_supported(int gu_type, int d_type) {
     if (off || env == 0 || !gu_covered(gu_type)) return false;
     if (strata::prefill::pf_fused_override().load(std::memory_order_relaxed) == 0) return false;   // the small-card prompt path (pf_fused_override.hpp)
 #if !defined(__HIPCC__)
+    // CUDA, a Q5_0 down (phase 4 step 1, opt-in): with STRATA_PF_FUSED_Q50=1 such a layer takes the fused kernels on any sm_80+ card
+    // whose Q5_0 kernels were set up, whatever the 80-SM rule below says (STRATA_PF_FUSED=0 still turns every fused kernel off, above).
+    // Not with the NT = 256 / warp-specialized opt-ins (their kernels have no Q5_0 form): those layers keep the FP16 path.
+    if (d_type == T_Q5_0) {
+        const DevInfo& d = dev_info();
+        return d.ok && d.q50 && !d.t75 && d.occ_nt <= 0 && !d.ws;
+    }
     // CUDA: unset, on by default on a compute capability 12.0 card with 80+ SMs (sm120_series.hpp, STRATA_SM120_PERF=0 off) for the gate/up
     // formats measured there - the IQ3_S pack's IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS layers with IQ4_NL / Q2_0 down (RTX PRO 5000:
     // prompt +7.0% 4K, +5.2% 20K, +3.4% 98K; teacher-forced KL against MMQ 0.0002 over 5998 positions, 0.0010 over 1760 long
@@ -2223,6 +2251,12 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         default: launch<T_IQ4_XS, true>(ww, g_gu, b, g, tb, xa, src, ha, nullptr, s); break;
     }
     if (g.d_type == T_Q2_0) launch<T_Q2_0, false>(ww, g_d, b, g, tb, ha, src, nullptr, dm, s);
+#if !defined(__HIPCC__)   // (a HIP build returns above; no Q5_0 instance of native_kernel in its code objects)
+    else if (g.d_type == T_Q5_0) {   // STRATA_PF_FUSED_Q50=1 (d_covered_on checked d.q50 above); its own occupancy
+        const unsigned g_q = (unsigned) std::min<int64_t>(tiles * (D_ROWS_N / weight_rows(ww)), (int64_t) d.sms * d.occ_q50);
+        launch<T_Q5_0, false>(ww, g_q, b, g, tb, ha, src, nullptr, dm, s);
+    }
+#endif
     else launch<T_IQ4_NL, false>(ww, g_d, b, g, tb, ha, src, nullptr, dm, s);
     ck(cudaGetLastError(), "experts_native");
 }
@@ -2233,7 +2267,12 @@ void experts_native(const WideBatch& b, const NativeGeom& g, int n_expert, int64
                     const int32_t* src, void* ha, float* dm, void* stream) {
     if (b.e1 <= b.e0 || n <= 0) return;
     const DevInfo& d = dev_info();
-    if ((d.occ_nt <= 0 && !d.ws) || !gu_covered(g.gu_type) || !d_covered_on(g.d_type, d)) {
+#if !defined(__HIPCC__)
+    const bool q50 = g.d_type == T_Q5_0;   // (no Q5_0 form of the NT = 256 kernels: native_supported keeps those layers off this path)
+#else
+    constexpr bool q50 = false;
+#endif
+    if ((d.occ_nt <= 0 && !d.ws) || !gu_covered(g.gu_type) || !d_covered_on(g.d_type, d) || q50) {
         std::fprintf(stderr, "prefill fused experts (native, NT = 256): types %d / %d are not covered here\n", g.gu_type,
                      g.d_type);
         std::exit(1);
