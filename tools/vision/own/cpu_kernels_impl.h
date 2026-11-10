@@ -5,13 +5,13 @@
 //   void conv16(const void* W, int kind, size_t off, int n, float* out)     n elements from W[off] (kind 1 BF16, 2 F16) to float
 //   STRATA_KN_MR    the rows of the register tile (NR is two vectors)
 //   STRATA_KN_NAME  the tier's name, STRATA_KN_GETTER the table getter's name
+//   KN_MIN(a, b), KN_MAX(a, b), KN_COPY(dst, src, n floats), KN_ZERO(dst, n floats), V::sqrt1(x) (a correctly rounded float square root)
+// No standard-library header and no inline library function here (cpu_tier.h says why): the wider tiers define the KN_ helpers as their own internal
+// functions; the scalar tier, compiled at the baseline, as std::min / std::max / std::memcpy / std::memset (the code GCC vectorises best there: with
+// look-alike helpers the portable product loop came out partly scalar, 2 to 3 times slower, z440 11-10).
 #pragma once
 
-#include "cpu_kernels.h"
-
-#include <algorithm>
-#include <cmath>
-#include <cstring>
+#include "cpu_tier.h"
 
 namespace strata_vit {
 namespace {      // every tier's kernels are internal to its translation unit (the vector types of the tiers share a name)
@@ -55,20 +55,20 @@ inline void tile_rows(const float* A, size_t lda, int m, const float* B, size_t 
 
 void gemm(const float* A, size_t lda, int M, const float* B, size_t ldb, int K, int N, float* C, size_t ldc, int init, const float* bias) {
     for (int j0 = 0; j0 < N; j0 += NR) {
-        const int nc = std::min(NR, N - j0);
+        const int nc = KN_MIN(NR, N - j0);
         if (nc == NR) {
             tile_rows(A, lda, M, B + j0, ldb, K, C + j0, ldc, init, bias ? bias + j0 : nullptr);
         } else {      // the last, partial column tile: through a full-width buffer
             float bb[NR] = {0}, cb[MRF][NR];
-            if (bias) std::memcpy(bb, bias + j0, (size_t) nc * sizeof(float));
+            if (bias) KN_COPY(bb, bias + j0, nc);
             for (int m0 = 0; m0 < M; m0 += MRF) {
-                const int mr = std::min(MRF, M - m0);
+                const int mr = KN_MIN(MRF, M - m0);
                 for (int r = 0; r < mr; ++r) {
-                    std::memset(cb[r], 0, sizeof cb[r]);
-                    if (init != 0) std::memcpy(cb[r], C + (size_t) (m0 + r) * ldc + j0, (size_t) nc * sizeof(float));
+                    KN_ZERO(cb[r], NR);
+                    if (init != 0) KN_COPY(cb[r], C + (size_t) (m0 + r) * ldc + j0, nc);
                 }
                 tile_rows(A + (size_t) m0 * lda, lda, mr, B + j0, ldb, K, &cb[0][0], NR, init, bias ? bb : nullptr);
-                for (int r = 0; r < mr; ++r) std::memcpy(C + (size_t) (m0 + r) * ldc + j0, cb[r], (size_t) nc * sizeof(float));
+                for (int r = 0; r < mr; ++r) KN_COPY(C + (size_t) (m0 + r) * ldc + j0, cb[r], nc);
             }
         }
     }
@@ -87,7 +87,7 @@ void pack_w(const void* Wm, int kind, size_t ldw, int n0, int nvalid, int k0, in
             for (int k = 0; k < kc; ++k) dst[(size_t) k * NR + c] = p[k];
         } else {
             for (int k = 0; k < kc; k += 1024) {
-                const int n = std::min(1024, kc - k);
+                const int n = KN_MIN(1024, kc - k);
                 conv16(Wm, kind, off + (size_t) k, n, tmp);
                 for (int i = 0; i < n; ++i) dst[(size_t) (k + i) * NR + c] = tmp[i];
             }
@@ -96,7 +96,7 @@ void pack_w(const void* Wm, int kind, size_t ldw, int n0, int nvalid, int k0, in
 }
 
 void conv(const void* src, int kind, size_t n, float* dst) {
-    for (size_t i = 0; i < n; i += 4096) conv16(src, kind, i, (int) std::min<size_t>(4096, n - i), dst + i);
+    for (size_t i = 0; i < n; i += 4096) conv16(src, kind, i, (int) KN_MIN((size_t) 4096, n - i), dst + i);
 }
 
 // ---- elementwise ----
@@ -115,9 +115,9 @@ void gelu(float* x, size_t ldx, int rows, int n) {
         for (; i + W <= n; i += W) gelu_v(V::load(p + i)).store(p + i);
         if (i < n) {
             float buf[W] = {0};
-            std::memcpy(buf, p + i, (size_t) (n - i) * sizeof(float));
+            KN_COPY(buf, p + i, n - i);
             gelu_v(V::load(buf)).store(buf);
-            std::memcpy(p + i, buf, (size_t) (n - i) * sizeof(float));
+            KN_COPY(p + i, buf, n - i);
         }
     }
 }
@@ -137,7 +137,7 @@ void layernorm(const float* x, float* y, int D, const float* w, const float* b, 
     }
     float ss = V::reduce_add(q);
     for (; i < D; ++i) { const float d = x[i] - mean; ss += d * d; }
-    const float scale = 1.0f / std::sqrt(ss / (float) D + eps);
+    const float scale = 1.0f / V::sqrt1(ss / (float) D + eps);
     const V vs = V::set1(scale);
     for (i = 0; i + W <= D; i += W) (((V::load(x + i) - vm) * vs) * V::load(w + i) + V::load(b + i)).store(y + i);
     for (; i < D; ++i) y[i] = (x[i] - mean) * scale * w[i] + b[i];
@@ -158,9 +158,9 @@ void softmax_update(float* S, size_t lds, int qrows, int nkeys, float* m, float*
         int j = 0;
         for (; j + W <= nkeys; j += W) mxv = vmax(mxv, V::load(s + j));
         float mx = V::reduce_max(mxv);
-        for (; j < nkeys; ++j) mx = std::max(mx, s[j]);
-        const float mold = m[r], mnew = std::max(mold, mx);
-        const float alpha = mold < -1.0e38f ? 0.0f : std::exp(mold - mnew);
+        for (; j < nkeys; ++j) mx = KN_MAX(mx, s[j]);
+        const float mold = m[r], mnew = KN_MAX(mold, mx);
+        const float alpha = mold < -1.0e38f ? 0.0f : cpu_tier_expf(mold - mnew);
         float* o = O + (size_t) r * ldo;
         if (alpha != 1.0f) {
             const V va = V::set1(alpha);
@@ -176,7 +176,7 @@ void softmax_update(float* S, size_t lds, int qrows, int nkeys, float* m, float*
             sv = sv + p;
         }
         float sum = V::reduce_add(sv);
-        for (; j < nkeys; ++j) { s[j] = std::exp(s[j] - mnew); sum += s[j]; }
+        for (; j < nkeys; ++j) { s[j] = cpu_tier_expf(s[j] - mnew); sum += s[j]; }
         l[r] = l[r] * alpha + sum;
         m[r] = mnew;
     }

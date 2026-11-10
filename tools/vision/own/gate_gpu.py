@@ -10,13 +10,46 @@ One strata-vision per reader (mtmd on the CPU unless --cpu-dir gives its files, 
   floor     cosine(mtmd GPU, mtmd CPU)             what users run today
   no-worse  main >= floor - 1e-4  or  main >= 0.9999   our GPU tower is at least as close to mtmd-CPU as mtmd-GPU is (the coordinator's tolerance, 11-09)
   info      cosine(own GPU, mtmd GPU), cosine(own GPU, float32 reference) (with --ref-dir)
-and the times of the two GPU readers (median of --repeat further encodes, after the first).  Exit 0 when every picture passes main and no-worse.  Standard library only.
+and the times of the two GPU readers (median of --repeat further encodes, after the first); the GPU memory (nvidia-smi, rocm-smi or Linux DRM fdinfo); whether
+our GPU tower gives byte-identical output on every encode (REPEATABLE line; information, the exit code does not depend on it).  Exit 0 when every picture passes main and no-worse.  Standard library only.
 """
 import argparse
+import hashlib
 import os
 import statistics
 import subprocess
 import sys
+
+
+def fdinfo_mib(pid):
+    """Device-local memory of a process from Linux's DRM fdinfo (/proc/<pid>/fdinfo; i915 / xe drm-total-local0 or drm-resident-local0, amdgpu
+    drm-memory-vram), the largest over its DRM files, MiB; 0 where it cannot be read (no such files, another OS)."""
+    best = 0
+    d = "/proc/%d/fdinfo" % pid
+    try:
+        fds = os.listdir(d)
+    except OSError:
+        return 0
+    for fd in fds:
+        try:
+            with open(os.path.join(d, fd)) as f:
+                txt = f.read()
+        except OSError:
+            continue
+        if "drm-driver" not in txt:
+            continue
+        for line in txt.splitlines():
+            k, _, v = line.partition(":")
+            if k.strip() not in ("drm-total-local0", "drm-resident-local0", "drm-memory-vram", "drm-total-vram0", "drm-resident-vram0"):
+                continue
+            parts = v.split()
+            if not parts:
+                continue
+            n = float(parts[0])
+            unit = parts[1] if len(parts) > 1 else ""
+            mib = {"KiB": n / 1024.0, "MiB": n, "GiB": n * 1024.0}.get(unit, n / 1048576.0)
+            best = max(best, int(mib))
+    return best
 
 
 class Reader:
@@ -55,6 +88,7 @@ class Reader:
                     self.peak_mib = max(self.peak_mib, int(t[-3]) // (1 << 20))
         except Exception:  # noqa: BLE001
             pass
+        self.peak_mib = max(self.peak_mib, fdinfo_mib(self.p.pid))   # Linux DRM: Intel (i915 / xe) and AMD report device memory per process here
         return self.peak_mib
 
     def enc(self, img, out):
@@ -104,16 +138,27 @@ def main():
     r_mg = mk("mtmd", True, "mtmd-gpu")
     r_og = mk("own", True, "own-gpu")
 
+    unrepeatable = []      # own-gpu pictures whose output bytes changed between encodes in one process
+
+    def digest(path):
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
     def run(r, img, name):
         out = os.path.join(a.out, r.label, name + ".sve")
         res = r.enc(os.path.abspath(img), out)
         if not res.startswith("OK"):
             return out, None, res
         ms = []
+        seen = {digest(out)} if r is r_og else set()
         for _ in range(a.repeat):
             again = r.enc(os.path.abspath(img), out)
             if again.startswith("OK"):
                 ms.append(float(again.split()[4]))
+                if r is r_og:
+                    seen.add(digest(out))
+        if len(seen) > 1:
+            unrepeatable.append("%s (%d different outputs in %d encodes)" % (name, len(seen), a.repeat + 1))
         return out, statistics.median(ms) if ms else float(res.split()[4]), res
 
     hdr = "%-22s %6s | %9s %9s %9s | %9s %9s | %8s %8s %6s | %s"
@@ -150,8 +195,10 @@ def main():
         floor_c.append(f)
         print(hdr % (name, main["n"], main["global"], floor["global"], info["global"], ref["global"] if ref else "-", main["tokmin"], "%.0f" % mg_ms, "%.0f" % og_ms,
                      "%.2f" % (og_ms / mg_ms), "ok" if passed else "FAIL (%s)" % ("main < %.4f" % a.min_cos if m < a.min_cos else "noisier than mtmd-GPU")), flush=True)
-    vram = "GPU memory of the reader (nvidia-smi, peak after the pictures): mtmd-gpu %d MiB, own-gpu %d MiB%s" % (
+    vram = "GPU memory of the reader (nvidia-smi / rocm-smi / DRM fdinfo, peak after the pictures): mtmd-gpu %d MiB, own-gpu %d MiB%s" % (
         r_mg.peak_mib, r_og.peak_mib, "" if r_og.peak_mib <= r_mg.peak_mib else "  (own is larger)")
+    print("REPEATABLE own-gpu: %s" % ("yes, every picture byte-identical over %d encodes" % (a.repeat + 1) if not unrepeatable else "NO: " + "; ".join(unrepeatable)),
+          flush=True)
     for r in (r_cpu, r_mg, r_og):
         if r:
             r.close()

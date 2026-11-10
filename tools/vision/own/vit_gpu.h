@@ -30,6 +30,11 @@ public:
     // True when this build has a GPU backend and a device to run it on; `why` says what is missing.
     static bool available(std::string& why);
 
+    // True on a GPU class where this tower is known to be slower than mtmd's GPU reader, so `--tower auto` keeps mtmd there (`--tower own` still runs
+    // this tower): NVIDIA Pascal (compute capability 6.x: no tensor cores; mtmd's F16 products accumulate in F16 at twice the float32 rate, ours in float32;
+    // measured on a P100, RESULTS-OWN-3V.md 12.1).  `why` says which.
+    static bool prefer_mtmd(std::string& why);
+
     // Uploads the weights to `device` and sizes the work buffers for pictures of up to `max_patches` patches (grown by encode when a picture
     // needs more).  `g` must be supported().
     bool load(const Gguf& gg, const VitGeometry& g, int device, int max_patches, std::string& err);

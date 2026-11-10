@@ -1,6 +1,7 @@
 // tools/vision/own/own_reader.cpp - see own_reader.h
 #include "own_reader.h"
 
+#include "cpu_caps.h"
 #include "vit_cpu.h"
 #include "vit_ref.h"
 #ifdef STRATA_VIT_GPU
@@ -36,11 +37,16 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
 bool own_reader_supported(const std::string& mmproj, bool gpu, std::string& why) {
     if (gpu) {
 #ifdef STRATA_VIT_GPU
-        if (!VitGpu::available(why)) return false;
+        if (!VitGpu::available(why) || VitGpu::prefer_mtmd(why)) return false;
 #else
         why = "this build has no GPU backend for the own tower";
         return false;
 #endif
+    } else if (quant::best_isa() == quant::Isa::Scalar) {
+        // only the portable kernel tier on this CPU (x86 without AVX2, every Arm CPU until a NEON tier exists): measured 2.1 to 3.7 times mtmd-CPU's time
+        // (RESULTS-OWN-3V.md 12.7), so `auto` keeps mtmd here; `--tower own` still runs ours
+        why = "only the portable CPU kernels on this CPU: the own CPU tower is slower than mtmd there";
+        return false;
     }
     Gguf gg;
     VitGeometry g;
