@@ -160,7 +160,7 @@ template <class F> int in_child(F f) {
     return WIFEXITED(st) ? WEXITSTATUS(st) : 99;
 }
 
-// the placeholder sentences, exactly as drafted for the owner (RESULTS-OWN-4S.md section 13), at the real sizes
+// the sentences in the owner's wording of 11-11, at the real sizes
 void test_words() {
     const uint64_t G = 1ull << 30;
     std::vector<LockPart> none;

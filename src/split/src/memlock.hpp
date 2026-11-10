@@ -177,8 +177,7 @@ inline std::string size_text(double bytes) {
     return b;
 }
 
-// The one line for the log when not everything is locked (empty when everything is).
-// PLACEHOLDER WORDING: these sentences are the drafts sent to the owner (phaseA-tests/par/RESULTS-OWN-4S.md section 13); the final words wait for his answer.
+// The one line for the log when not everything is locked (empty when everything is); the owner's wording of 11-11.
 inline std::string lock_line(const std::vector<LockPart>& parts, const LockOutcome& o) {
     (void) parts;
     if (o.locked >= o.want) return "";
