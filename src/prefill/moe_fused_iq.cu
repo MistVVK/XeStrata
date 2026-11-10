@@ -2049,6 +2049,21 @@ bool gfx12_iq2s_default() {
     return on;
 }
 
+#if defined(__HIPCC__)
+// IQ2_XXS / IQ2_XS gate/up on gfx12 (the IQ3_XXS pack's 19 layers that kept MMQ, and the IQ2_XS sets): ON by default under Linux since 0.2.15 (owner 11-10;
+// R9700, IQ3_XXS: prompt x1.17 / x1.14 / x1.13 at 4K / 8K / 20K, first-token KL against the FP16 path level with the default's, the neutral-writer forced-token
+// gate PASS, first-8K reads PASS).  STRATA_PF_FUSED_IQ2X=0 keeps these layers on MMQ (the earlier route, kept two releases), as does STRATA_PF_FUSED=0.
+// Windows gfx12: opt-in (STRATA_PF_FUSED=1), as before.  Like gfx12_iq2s_default, native_supported applies it to gfx12 cards only (d.w12).
+static bool gfx12_iq2x_default() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PF_FUSED_IQ2X");
+        const char* all = std::getenv("STRATA_PF_FUSED");
+        return strata::core::kGfx12PromptDefaultsOn && !(v != nullptr && v[0] == '0') && !(all != nullptr && all[0] == '0');
+    }();
+    return on;
+}
+#endif
+
 bool native_supported(int gu_type, int d_type) {
     static const bool off = [] {   // STRATA_PF_FUSED_NATIVE=0: the native packs keep MMQ under STRATA_PF_FUSED=1 (A/B)
         const char* v = std::getenv("STRATA_PF_FUSED_NATIVE");
@@ -2088,7 +2103,11 @@ bool native_supported(int gu_type, int d_type) {
     // R9700 (p620, IQ3_S, serve, 3 interleaved pairs): prompt 2K +9.7%, 8K +12.2%, 32K +8.8%; first-token KL against the MMQ default 0.017 (29 prompts of
     // 1,025 tokens, top-1 28 of 29), the answers are not the MMQ bytes.  STRATA_PF_FUSED_IQ2S=0 turns it off; STRATA_PF_FUSED=0 turns all fused kernels off.
     if (env < 0 && gu_type != T_IQ3_S && gu_type != T_IQ3_XXS && !(gu_type == T_Q2_0 && strata::core::kGfx12PromptDefaultsOn) &&
-        !(gfx12_iq2s_default() && (gu_type == T_IQ2_S || gu_type == T_IQ4_XS))) return false;
+        !(gfx12_iq2s_default() && (gu_type == T_IQ2_S || gu_type == T_IQ4_XS))
+#if defined(__HIPCC__)
+        && !(gfx12_iq2x_default() && (gu_type == T_IQ2_XXS || gu_type == T_IQ2_XS))   // (0.2.15, Linux gfx12: above)
+#endif
+        ) return false;
     const DevInfo& d = dev_info();
     if (!d.ok || !d_covered_on(d_type, d)) return false;
     if (d.t75 && (gu_type != T_Q2_0 || d_type != T_Q2_0)) return false;
