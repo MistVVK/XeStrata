@@ -131,7 +131,7 @@ int main(int argc, char** argv) {
     // auto: our tower where it can read this file on this backend, else mtmd
     if (tower == "auto") {
         std::string why;
-        tower = !mmproj.empty() && strata_vit::own_reader_supported(mmproj, gpu, why) ? "own" : "mtmd";
+        tower = !mmproj.empty() && strata_vit::own_reader_supported(mmproj, gpu, max_tokens, why) ? "own" : "mtmd";
     }
     if (mmproj.empty() || (model.empty() && tower != "own")) {   // our tower needs no text model: it never tokenizes
         std::fprintf(stderr, "usage: strata-vision --mmproj <mmproj.gguf> --model <model.gguf> [--gpu] [--threads N] "
