@@ -634,7 +634,7 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
     constexpr int WT_BYTES = WR * WLDX, WS_FLOATS = F16 ? 0 : WR * 4, ACT_STAGE = TR * AB;
     constexpr bool TWO_PASS = NT != THREADS;   // the two-pass loads (load_unit_l) only in the opt-in NT = 256 kernels
     static_assert(!(TWO_PASS && WT == T_Q5_0), "the NT = 256 kernels have no Q5_0 form");
-    static_assert(!(TWO_PASS && has_min(WT)), "the NT = 256 kernels have no K-quant / Q5_1 form");
+    static_assert(!(TWO_PASS && (has_min(WT) || WT == T_Q8_0)), "the NT = 256 kernels have no K-quant / Q5_1 / Q8_0 form");
     constexpr bool KLEAN = GU && (WT == T_Q4_K || WT == T_Q5_K);   // (A1b) the K-quant gate/up's lean loads (kq_lean_load)
     constexpr int RAW = KLEAN ? kq_lean_words<WT>() : raw_words(WT) > 5 ? raw_words(WT) : 5;   // the raw words of a sub-block: 5, Q5_0's 6
     constexpr int NS = (GU ? GU_ROWS_K : D_ROWS_K) / 64;   // 64-value stages along K
@@ -687,7 +687,7 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
         constexpr bool GU256 = GU && WT != T_Q2_0;
         auto unit = [&](int s) -> const uint8_t* {                  // the block of stage s's sub-block
             if (GU256) return wrow + (s >> 2) * BS;
-            return (WT == T_IQ4_NL || WT == T_Q5_0 || WT == T_Q5_1) ? wrow + (2 * s + uj) * BS : wrow + s * BS;   // 32-value blocks: two a stage
+            return (WT == T_IQ4_NL || WT == T_Q5_0 || WT == T_Q5_1 || WT == T_Q8_0) ? wrow + (2 * s + uj) * BS : wrow + s * BS;   // 32-value blocks: two a stage
         };
         auto sub = [&](int s) { return GU256 ? 2 * (s & 3) + uj : uj; };
         // the weight bytes into L2 ahead of the register loads (one stage ahead only - less than a DRAM round trip):
@@ -1796,6 +1796,8 @@ struct DevInfo {
     int occ_q50 = 1;    // their blocks per multiprocessor (kept apart, so the other formats' grids do not change)
     bool kq = false;    // sm_80+ with STRATA_PF_FUSED_KQ=1: the K-quant kernels (Q4_K / Q5_K gate/up, Q5_1 down) are set up (opt-in, phase 4)
     int occ_kq = 1;     // their blocks per multiprocessor (their own, as occ_q50)
+    bool kq8 = false;   // with kq: the Q8_0 down kernels are set up too (A2; UD-Q4_K_XL's five Q8_0-down layers)
+    int occ_kq8 = 1;
 #endif
 };
 std::mutex g_mu;
@@ -1971,6 +1973,9 @@ const DevInfo& dev_info() {
     if (int o4 = 1 << 20; d.ok && kq_on() && setup_one<T_Q4_K, true>(o4) && setup_one<T_Q5_K, true>(o4) && setup_one<T_Q5_1, false>(o4)) {
         d.kq = true;
         d.occ_kq = o4;
+        // (A2) the Q8_0 down behind a K-quant gate/up: int8 codes and one scale per 32 values, no minimum (load_unit / convert<T_Q8_0>);
+        // its own occupancy, and a failed setup leaves those layers on MMQ
+        if (int o5 = 1 << 20; setup_one<T_Q8_0, false>(o5)) { d.kq8 = true; d.occ_kq8 = o5; }
     }
     if (d.ok && nt256_requested()) {
         int o2 = 1 << 20;
@@ -2087,6 +2092,7 @@ bool d_covered_on(int t, const DevInfo& d) {
 #else
     if (t == T_Q5_0) return d.q50;   // STRATA_PF_FUSED_Q50=1 and its kernels set up (dev_info)
     if (t == T_Q5_1) return d.kq;    // STRATA_PF_FUSED_KQ=1 (behind a K-quant gate/up only: native_supported)
+    if (t == T_Q8_0) return d.kq8;   // STRATA_PF_FUSED_KQ=1, A2 (behind a K-quant gate/up only: native_supported)
 #endif
     (void) d;
     return d_covered(t);
@@ -2185,9 +2191,10 @@ bool native_supported(int gu_type, int d_type) {
     // kernels on any sm_80+ card whose K-quant kernels were set up, whatever the 80-SM rule says; other downs keep MMQ for now.  A Q5_1
     // down needs the code sums only the K-quant gate/up epilogue writes, so it is never taken behind another gate/up.  Not with the
     // NT = 256 / warp-specialized opt-ins (no K-quant form): MMQ.
-    if (gu_type == T_Q4_K || gu_type == T_Q5_K || d_type == T_Q5_1) {
+    if (gu_type == T_Q4_K || gu_type == T_Q5_K || d_type == T_Q5_1 || d_type == T_Q8_0) {
         const DevInfo& d = dev_info();
-        return (gu_type == T_Q4_K || gu_type == T_Q5_K) && d_type == T_Q5_1 && d.ok && d.kq && !d.t75 && d.occ_nt <= 0 && !d.ws;
+        return (gu_type == T_Q4_K || gu_type == T_Q5_K) && (d_type == T_Q5_1 || (d_type == T_Q8_0 && d.kq8)) && d.ok && d.kq && !d.t75 &&
+               d.occ_nt <= 0 && !d.ws;
     }
     // CUDA, a Q5_0 down (phase 4 step 1, opt-in): with STRATA_PF_FUSED_Q50=1 such a layer takes the fused kernels on any sm_80+ card
     // whose Q5_0 kernels were set up, whatever the 80-SM rule below says (STRATA_PF_FUSED=0 still turns every fused kernel off, above).
@@ -2353,13 +2360,16 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
     if (g.gu_type == T_Q4_K || g.gu_type == T_Q5_K) {   // STRATA_PF_FUSED_KQ=1 (gu_covered / d_covered_on checked d.kq above); their own occupancy
         const unsigned k_gu = (unsigned) std::min<int64_t>(tiles * (GU_ROWS_N / weight_rows(ww)), (int64_t) d.sms * d.occ_kq);
         const unsigned k_d = (unsigned) std::min<int64_t>(tiles * (D_ROWS_N / weight_rows(ww)), (int64_t) d.sms * d.occ_kq);
-        if (g.d_type != T_Q5_1) {
+        if (g.d_type != T_Q5_1 && !(g.d_type == T_Q8_0 && d.kq8)) {
             std::fprintf(stderr, "prefill fused experts (native): K-quant gate/up with down type %d is not covered here\n", g.d_type);
             std::exit(1);
         }
         if (g.gu_type == T_Q4_K) launch<T_Q4_K, true>(ww, k_gu, b, g, tb, xa, src, ha, nullptr, s);
         else launch<T_Q5_K, true>(ww, k_gu, b, g, tb, xa, src, ha, nullptr, s);
-        launch<T_Q5_1, false>(ww, k_d, b, g, tb, ha, src, nullptr, dm, s);
+        if (g.d_type == T_Q8_0) {   // (A2) its own occupancy
+            const unsigned k8 = (unsigned) std::min<int64_t>(tiles * (D_ROWS_N / weight_rows(ww)), (int64_t) d.sms * d.occ_kq8);
+            launch<T_Q8_0, false>(ww, k8, b, g, tb, ha, src, nullptr, dm, s);
+        } else launch<T_Q5_1, false>(ww, k_d, b, g, tb, ha, src, nullptr, dm, s);
         ck(cudaGetLastError(), "experts_native");
         return;
     }
@@ -2392,7 +2402,7 @@ void experts_native(const WideBatch& b, const NativeGeom& g, int n_expert, int64
     const DevInfo& d = dev_info();
 #if !defined(__HIPCC__)
     // (no Q5_0 / K-quant / Q5_1 form of the NT = 256 kernels: native_supported keeps those layers off this path)
-    const bool q50 = g.d_type == T_Q5_0 || g.gu_type == T_Q4_K || g.gu_type == T_Q5_K || g.d_type == T_Q5_1;
+    const bool q50 = g.d_type == T_Q5_0 || g.gu_type == T_Q4_K || g.gu_type == T_Q5_K || g.d_type == T_Q5_1 || g.d_type == T_Q8_0;
 #else
     constexpr bool q50 = false;
 #endif
