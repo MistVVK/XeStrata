@@ -641,6 +641,10 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
         throw std::invalid_argument("image engine: the mask is empty");
     if ((base != nullptr || !r.refs.empty()) && !base_encoder_)
         throw std::invalid_argument("image engine: the VAE file has no encoder for a base image");
+    if (!r.sampler.empty() && r.sampler != "euler" && r.sampler != "er_sde")
+        throw std::invalid_argument("image engine: MOSS-Image's sampler is euler or er_sde");
+    if (!r.dataspace.empty() && (r.guide.any() || r.sampler == "er_sde"))
+        throw std::invalid_argument("image engine: the few-step data-space sampler takes neither guidance nor er_sde");
     MossDit::Guide g;
     g.cfg = guided ? r.cfg : 1.0f;
     g.uncond_skip = r.uncond_skip_set ? r.uncond_skip : std::vector<int>{kUncondSkip};
@@ -852,7 +856,9 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
             if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
             r.on_preview(shown++, done, img);
         };
-        if (r.dataspace.empty()) d.sample(x, h, w, sigmas, g, first, total, step, ls.after(s_), peek);
+        if (r.dataspace.empty())
+            d.sample(x, h, w, sigmas, g, first, total, step, ls.after(s_), peek, &r.guide,
+                     r.sampler == "er_sde", r.shift > 0 ? r.shift : kShift, r.seed);
         else few_steps(r, x, h, w, step, peek);
         gpu::free(x0);
         x0 = nullptr;

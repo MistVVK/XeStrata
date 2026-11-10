@@ -1263,7 +1263,8 @@ si::QiRef control_box(const si::QiRef& control, const si::CropBox& b) {
 
 // the pipelines whose sampling takes guidance.hpp's guidance (GUIDE words)
 bool takes_guidance(si::ImagePipeline& p) {
-    return dynamic_cast<si::QiPipeline*>(&p) != nullptr || dynamic_cast<si::MfPipeline*>(&p) != nullptr;
+    return dynamic_cast<si::QiPipeline*>(&p) != nullptr || dynamic_cast<si::MfPipeline*>(&p) != nullptr ||
+           dynamic_cast<si::MossPipeline*>(&p) != nullptr || dynamic_cast<si::AnimaPipeline*>(&p) != nullptr;
 }
 
 // An upscale past the model's size (TILES:), drawn again a tile at a time: the base image at the line's size
@@ -1393,7 +1394,7 @@ int serve(si::ImagePipeline& p) {
                     throw std::invalid_argument("image engine: MCTL:, TIMEPATH: and DATASPACE: are MOSS-Image's");
                 if (r.guide.any() && !takes_guidance(p))
                     throw std::invalid_argument("image engine: this image model takes no CFGNORM:, CFGZERO, APG:, "
-                                                "DSLG: or DD: (Qwen-Image-2.1's and Mage-Flow's sampling do)");
+                                                "DSLG: or DD:");
                 // the cut (img_crop.hpp): the mask's box drawn at the line's size, the picture put back at its
                 // own; the base image is the init image, else the first reference
                 std::unique_ptr<si::CropStitch> cs;

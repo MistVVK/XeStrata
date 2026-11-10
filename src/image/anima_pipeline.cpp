@@ -359,10 +359,19 @@ void AnimaPipeline::encode_base(const QiRequest& r, const QiRef& base, LatentSta
 void AnimaPipeline::sample(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, int n, float cfg,
                            bool er, uint64_t seed, const std::function<bool(int, int)>& step,
                            const std::function<void(float*, float)>& after,
-                           const std::function<void(int, const std::function<void(float*)>&)>& peek) {
+                           const std::function<void(int, const std::function<void(float*)>&)>& peek,
+                           const GuidanceSpec& spec) {
     AnimaDit& d = *dit_;
+    for (const int b : spec.slg_layers)
+        if (b < 0 || b >= d.blocks())
+            throw std::invalid_argument("image engine: skip layer guidance's block " + std::to_string(b) +
+                                        " is not one of the model's " + std::to_string(d.blocks()));
+    Guidance g(spec, s_, h * w * d.token_values(), d.token_values(), true, cfg, sigmas);
     flow_sample(s_, [&](const float* xx, float sigma, int nn, float* out) { d.forward(xx, sigma, h, w, nn, out); }, x,
-                h * w * d.token_values(), n, sigmas, cfg, er, kShift, seed, step, after, peek);
+                h * w * d.token_values(), n, sigmas, cfg, er, kShift, seed, step, after, peek, &g,
+                [&](const float* xx, float sigma, float* out) {
+                    d.forward(xx, sigma, h, w, 1, out, &g.skip_layers());
+                });
 }
 
 std::vector<uint8_t> AnimaPipeline::generate(const QiRequest& r, QiTimes* times, QiPlan* plan_out,
@@ -497,7 +506,7 @@ std::vector<uint8_t> AnimaPipeline::generate(const QiRequest& r, QiTimes* times,
             if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
             r.on_preview(shown++, done, img);
         };
-        sample(x, h, w, sigmas, n, guided ? r.cfg : 1.0f, er, r.seed, step, ls.after(s_), peek);
+        sample(x, h, w, sigmas, n, guided ? r.cfg : 1.0f, er, r.seed, step, ls.after(s_), peek, r.guide);
         gpu::free(x0);
         x0 = nullptr;
         const auto t2 = clock::now();

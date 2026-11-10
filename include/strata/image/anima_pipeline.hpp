@@ -68,7 +68,7 @@ private:
     // the sampling: n contexts, er_sde or Euler over sigmas from x (tokens), the mask's blend after each step
     void sample(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, int n, float cfg, bool er_sde,
                 uint64_t seed, const std::function<bool(int, int)>& step, const std::function<void(float*, float)>& after,
-                const std::function<void(int, const std::function<void(float*)>&)>& peek);
+                const std::function<void(int, const std::function<void(float*)>&)>& peek, const GuidanceSpec& guide);
     void* s_ = nullptr;
     std::string dit_path_, vae_path_, text_path_;
     int q8_ = -1;

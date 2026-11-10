@@ -97,7 +97,7 @@ struct QiRequest {
     // negative prompt's; the other models leave them
     std::vector<int32_t> t5_ids, neg_t5_ids;
     std::vector<float> t5_weights, neg_t5_weights;
-    // the sampler: "euler" or "er_sde" (Anima's and Mage-Flow's; empty: the model's own)
+    // the sampler: "euler" or "er_sde"; empty selects the model's own
     std::string sampler;
     // the guidance added to the sampling (guidance.hpp: CFG norm, CFGZero*, APG, skip layer guidance,
     // Detail Daemon; strata_image's GUIDE words): Qwen-Image-2.1's and Mage-Flow's; the other models leave it

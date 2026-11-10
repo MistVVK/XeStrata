@@ -472,6 +472,8 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     if (r.width % 16 != 0 || r.height % 16 != 0 || r.width <= 0 || r.height <= 0)
         throw std::invalid_argument("image engine: the size must be a multiple of 16");
     if ((int64_t) r.ids.size() <= r.drop) throw std::invalid_argument("image engine: no prompt after the system turn");
+    if (!r.sampler.empty() && r.sampler != "euler" && r.sampler != "er_sde")
+        throw std::invalid_argument("image engine: Qwen-Image's sampler is euler or er_sde");
     const int64_t h = r.height / 16, w = r.width / 16;
     const auto t0 = clock::now();
     ensure_open();
@@ -589,7 +591,8 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
             if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
             r.on_preview(shown++, done, img);
         };
-        dit_->sample(x, h, w, sigmas, step, ls.after(s_), guided ? r.cfg : 1.0f, peek, &r.guide);
+        dit_->sample(x, h, w, sigmas, step, ls.after(s_), guided ? r.cfg : 1.0f, peek, &r.guide,
+                     r.sampler == "er_sde", r.shift > 0 ? r.shift : 1.0f, r.seed);
         dit_->drop_host_prefix();
         if (control_) {   // the conditioning and the stream are this request's
             control_->clear();

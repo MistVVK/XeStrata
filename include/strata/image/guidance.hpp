@@ -94,7 +94,4 @@ private:
     int calls_ = 0, seq_ = 0;
 };
 
-/// Euler's step from the denoised values: x += (s1 - s0) (x - den) / s0, x = den at s1 = 0.
-void guidance_euler(float* x, const float* den, float s0, float s1, int64_t n, void* stream);
-
 }  // namespace strata::image

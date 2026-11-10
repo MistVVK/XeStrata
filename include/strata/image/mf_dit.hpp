@@ -216,7 +216,7 @@ public:
                 const std::function<bool(int, int)>& step = {},
                 const std::function<void(float*, float)>& after = {},
                 const std::function<void(int, const std::function<void(float*)>&)>& peek = {},
-                const GuidanceSpec* guide = nullptr);
+                const GuidanceSpec* guide = nullptr, bool er = false, float shift = 6.0f, uint64_t seed = 0);
     /// forward of context 0 alone with `blocks` skipped (their image and text rows past them as they came: a skipped
     /// block's output is its input): skip layer guidance's pass.
     void forward_skip(const float* x, float sigma, int64_t h, int64_t w, const std::vector<int>& blocks, float* out);
@@ -280,10 +280,7 @@ public:
     const float* block0_txt() const { return b0_txt_; }
 
 private:
-    void sample_guided(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, float cfg,
-                       const std::function<bool(int, int)>& step, const std::function<void(float*, float)>& after,
-                       const std::function<void(int, const std::function<void(float*)>&)>& peek,
-                       const GuidanceSpec& spec);
+
 
     bool lora_bake_ = true, baked_any_ = false;
     float* bake_tmp_ = nullptr;      // a weight's delta [n][k], while adapters are baked

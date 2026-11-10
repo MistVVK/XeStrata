@@ -92,7 +92,8 @@ public:
 
     /// The velocity [n][h w][64] (device FP32, the tokens' order) of the tokens x [h w][64] at sigma, for the contexts
     /// 0 .. n - 1 (n 1 or 2).
-    void forward(const float* x, float sigma, int64_t h, int64_t w, int n, float* out);
+    void forward(const float* x, float sigma, int64_t h, int64_t w, int n, float* out,
+                 const std::vector<int>* skip = nullptr);
 
     int64_t hidden() const { return C_; }
     int64_t token_values() const { return 4 * lat_; }   // a token's values: 16 channels x 2 x 2

@@ -113,7 +113,8 @@ public:
     /// latent (x - sigma * v) into a buffer of x's size: a partial image's latent, the sampling itself not changed.
     void sample(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, const Guide& g, int first, int total,
                 const std::function<bool(int, int)>& step = {}, const std::function<void(float*, float)>& after = {},
-                const std::function<void(int, const std::function<void(float*)>&)>& peek = {});
+                const std::function<void(int, const std::function<void(float*)>&)>& peek = {},
+                const GuidanceSpec* guide = nullptr, bool er = false, float shift = 5.f, uint64_t seed = 0);
 
     /// The velocity [n][h w][128] (device FP32) of the latent tokens x [h w][128] (device FP32) at `timestep` (sigma
     /// times 1000, as the reference pipeline gives it), for the contexts 0 .. n - 1 (n 1 or 2).

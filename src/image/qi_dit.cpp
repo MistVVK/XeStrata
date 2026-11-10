@@ -3,6 +3,7 @@
 // src/image/qi_dit.cpp - see include/strata/image/qi_dit.hpp.
 
 #include "strata/image/qi_dit.hpp"
+#include "strata/image/flow_sampler.hpp"
 #include "strata/image/qi_control.hpp"
 #include "strata/image/qi_gguf.hpp"
 
@@ -1343,140 +1344,47 @@ void QiDit::drop_activations() {
 void QiDit::sample(float* x, int64_t H, int64_t W, const std::vector<float>& sigmas,
                    const std::function<bool(int, int)>& step, const std::function<void(float*, float)>& after,
                    float cfg, const std::function<void(int, const std::function<void(float*)>&)>& peek,
-                   const GuidanceSpec* guide) {
-    const int64_t n = in_ch_ * H * W;
-    const bool guided = cfg > 1.0f && other_.n_text > 0;
-    if (guide != nullptr && guide->any()) {
-        sample_guided(x, H, W, sigmas, step, after, guided ? cfg : 1.0f, peek, *guide);
-        return;
-    }
-    float* v = alloc<float>(allocs_, n);
-    float* vn = guided ? alloc<float>(allocs_, n) : nullptr;   // the negative prompt's velocity
-    struct Free {
-        QiDit& d;
-        float* p;
-        ~Free() {
-            if (p == nullptr) return;
-            d.allocs_.erase(std::remove(d.allocs_.begin(), d.allocs_.end(), (void*) p), d.allocs_.end());
-            gpu::free(p);
-        }
-    } free_vn{*this, vn};
-    const int steps = (int) sigmas.size() - 1;
-    bool cached = false;   // the prefix caches made (by the first step without the ControlNet branch)
-    for (int i = 0; i < steps; ++i) {
-        const float t = sigmas[(size_t) i] * 1000.0f;
-        const bool ctl = control_on(t);
-        if (guided && cached && !ctl) {   // both contexts' prefixes cached: one pass for the two (the weights read once)
-            forward_pair(x, t, H, W, v, vn);
-        } else {
-            forward(x, t, H, W, cached, v);
-        }
-        if (guided && (!cached || ctl)) {   // a step that makes each context's prefix cache: one after the other
-            swap_context();
-            forward(x, t, H, W, false, vn);
-            swap_context();
-        }
-        cached = cached || !ctl;
-        if (guided) {   // v = vn + cfg (v - vn), as v -= vn, then vn += cfg v
-            qi_axpy(v, vn, -1.0f, n, s_);
-            qi_axpy(vn, v, cfg, n, s_);
-            gpu::copy_async(v, vn, (size_t) n * 4, s_);
-        }
-        qi_axpy(x, v, sigmas[(size_t) i + 1] - sigmas[(size_t) i], n, s_);
-        if (after) after(x, sigmas[(size_t) i + 1]);
-        if (peek) {
-            const float s_next = sigmas[(size_t) i + 1];
-            peek(i + 1, [&](float* x0) {   // x0 = x - sigma v (flow matching), into the caller's buffer
-                gpu::copy_async(x0, x, (size_t) n * 4, s_);
-                qi_axpy(x0, v, -s_next, n, s_);
-            });
-        }
-        if (step) {
-            gpu::stream_sync(s_);
-            if (!step(i + 1, steps)) {
-                allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), (void*) v), allocs_.end());
-                gpu::free(v);
-                throw QiStopped();
-            }
-        }
-    }
-    gpu::stream_sync(s_);
-    allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), (void*) v), allocs_.end());
-    gpu::free(v);
-}
-
-// the sampling with guidance.hpp's guidance: each step the model asked at its sigma (Detail Daemon's), the two
-// contexts' velocities (and skip layer guidance's pass) to the guided denoised values, Euler's step from them
-void QiDit::sample_guided(float* x, int64_t H, int64_t W, const std::vector<float>& sigmas,
-                          const std::function<bool(int, int)>& step, const std::function<void(float*, float)>& after,
-                          float cfg, const std::function<void(int, const std::function<void(float*)>&)>& peek,
-                          const GuidanceSpec& spec) {
+                   const GuidanceSpec* guide, bool er, float shift, uint64_t seed) {
+    const GuidanceSpec spec = guide != nullptr ? *guide : GuidanceSpec{};
     for (const int b : spec.slg_layers)
         if (b < 0 || b >= (int) blocks_.size())
             throw std::invalid_argument("image engine: skip layer guidance's block " + std::to_string(b) +
                                         " is not one of the model's " + std::to_string(blocks_.size()));
-    const int64_t n = in_ch_ * H * W;
-    const bool guided = cfg > 1.0f && other_.n_text > 0;
-    Guidance g(spec, s_, n, in_ch_, false, cfg, sigmas);
-    std::vector<float*> mine;
-    struct Free {
-        QiDit& d;
-        std::vector<float*>& ps;
-        ~Free() {
-            gpu::stream_sync(d.s_);
-            for (float* p : ps) {
-                d.allocs_.erase(std::remove(d.allocs_.begin(), d.allocs_.end(), (void*) p), d.allocs_.end());
-                gpu::free(p);
-            }
-        }
-    } free_mine{*this, mine};
-    auto get = [&]() {
-        mine.push_back(alloc<float>(allocs_, n));
-        return mine.back();
-    };
-    float* v = get();
-    float* vn = guided ? get() : nullptr;   // the negative prompt's velocity
-    float* den = get();
-    float* k = !spec.slg_layers.empty() ? get() : nullptr;   // the skipping pass's
     if (control_ != nullptr && control_->set() && !spec.slg_layers.empty())
         throw std::invalid_argument("image engine: skip layer guidance with ControlNet is not supported (its pass skips "
                                     "blocks the branch adds to)");
-    const int steps = (int) sigmas.size() - 1;
-    bool cached = false;   // the prefix caches made (by the first step without the ControlNet branch)
-    for (int i = 0; i < steps; ++i) {
-        const float s0 = sigmas[(size_t) i], s1 = sigmas[(size_t) i + 1], sm = g.model_sigma(s0);
-        const bool ctl = control_on(sm * 1000.0f);
-        if (guided && cached && !ctl) {
-            forward_pair(x, sm * 1000.0f, H, W, v, vn);
+    const int64_t N = in_ch_ * H * W;
+    const int n = cfg > 1.0f && other_.n_text > 0 ? 2 : 1;
+    Guidance g(spec, s_, N, in_ch_, false, n == 2 ? cfg : 1.0f, sigmas);
+    bool cached = false;
+    auto forward_all = [&](const float* xx, float sigma, int nn, float* out) {
+        const float t = sigma * 1000.0f;
+        const bool ctl = control_on(t);
+        if (nn == 2 && cached && !ctl) {
+            forward_pair(xx, t, H, W, out, out + N);
         } else {
-            forward(x, sm * 1000.0f, H, W, cached, v);
-        }
-        if (guided && (!cached || ctl)) {
-            swap_context();
-            forward(x, sm * 1000.0f, H, W, false, vn);
-            swap_context();
+            forward(xx, t, H, W, cached, out);
+            if (nn == 2) {
+                swap_context();
+                try { forward(xx, t, H, W, false, out + N); }
+                catch (...) { swap_context(); throw; }
+                swap_context();
+            }
         }
         cached = cached || !ctl;
-        const bool skipping = k != nullptr && g.skip_pass(sm);
-        if (skipping) {   // the prompt's context again, its prefix cached (by this step's pass if not before)
-            skip_ = &g.skip_layers();
-            try {
-                forward(x, sm * 1000.0f, H, W, true, k);
-            } catch (...) {
-                skip_ = nullptr;
-                throw;
-            }
-            skip_ = nullptr;
-        }
-        g.denoised(x, v, vn, skipping ? k : nullptr, sm, den);
-        guidance_euler(x, den, s0, s1, n, s_);
-        if (after) after(x, s1);
-        if (peek) peek(i + 1, [&](float* x0) { gpu::copy_async(x0, den, (size_t) n * 4, s_); });
-        if (step) {
-            gpu::stream_sync(s_);
-            if (!step(i + 1, steps)) throw QiStopped();
-        }
-    }
+    };
+    auto skip = [&](const float* xx, float sigma, float* out) {
+        skip_ = &g.skip_layers();
+        try { forward(xx, sigma * 1000.0f, H, W, true, out); }
+        catch (...) { skip_ = nullptr; throw; }
+        skip_ = nullptr;
+    };
+    auto progress = [&](int done, int total) {
+        if (!step) return true;
+        gpu::stream_sync(s_);
+        return step(done, total);
+    };
+    flow_sample(s_, forward_all, x, N, n, sigmas, cfg, er, shift, seed, progress, after, peek, &g, skip, true, nullptr, true);
 }
 
 }  // namespace strata::image

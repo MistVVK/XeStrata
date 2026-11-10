@@ -85,7 +85,7 @@ public:
                 const std::function<bool(int, int)>& step = {},
                 const std::function<void(float*, float)>& after = {}, float cfg = 1.0f,
                 const std::function<void(int, const std::function<void(float*)>&)>& peek = {},
-                const GuidanceSpec* guide = nullptr);
+                const GuidanceSpec* guide = nullptr, bool er = false, float shift = 1.0f, uint64_t seed = 0);
 
     int64_t channels() const { return in_ch_; }
     int64_t hidden() const { return C_; }
@@ -192,10 +192,7 @@ private:
     /// the two side by side through each product, the attention one context at a time; out the first's velocity,
     /// out2 the other's.
     void forward_pair(const float* x, float t, int64_t H, int64_t W, float* out, float* out2);
-    void sample_guided(float* x, int64_t H, int64_t W, const std::vector<float>& sigmas,
-                       const std::function<bool(int, int)>& step, const std::function<void(float*, float)>& after,
-                       float cfg, const std::function<void(int, const std::function<void(float*)>&)>& peek,
-                       const GuidanceSpec& spec);
+
     void ensure(int64_t T, int64_t HW);
     void swap_context();   // the first context's state <-> other_'s
     /// The weights adapters may take, from the blocks and the weights outside them (open).

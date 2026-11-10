@@ -293,11 +293,4 @@ void Guidance::dump(const float* x, const float* c, const float* u, const float*
     }
 }
 
-void guidance_euler(float* x, const float* den, float s0, float s1, int64_t n, void* stream) {
-    q_of(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const size_t i = id[0];
-        x[i] = s1 == 0.0f ? den[i] : x[i] + (s1 - s0) * (x[i] - den[i]) / s0;
-    });
-}
-
 }  // namespace strata::image

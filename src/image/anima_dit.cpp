@@ -1056,7 +1056,8 @@ bool AnimaDit::fused_attention_ok() {
     return ok;
 }
 
-void AnimaDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n, float* out) {
+void AnimaDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n, float* out,
+                       const std::vector<int>* skip) {
     const int64_t HW = h * w, C = C_, R = n * HW, TV = 4 * lat_;
     for (int i = 0; i < n; ++i)
         if (ctx_[i].rows <= 0) throw std::runtime_error("image engine (Anima DiT): a context not set");
@@ -1072,6 +1073,7 @@ void AnimaDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n,
     if (cross_sdpa_ < 0) cross_sdpa_ = fused_attention_ok() ? 1 : 0;
     const bool fused = cross_sdpa_ == 1;
     for (int bi = 0; bi < (int) blocks_.size(); ++bi) {
+        if (skip != nullptr && std::find(skip->begin(), skip->end(), bi) != skip->end()) continue;
         const Block& b = blocks_[(size_t) bi];
         const uint8_t* base = blocks_stream_.begin(bi);
         auto f = [base](uint64_t o) { return reinterpret_cast<const float*>(base + o); };

@@ -3,6 +3,7 @@
 // src/image/mf_dit.cpp - see include/strata/image/mf_dit.hpp.
 
 #include "strata/image/mf_dit.hpp"
+#include "strata/image/flow_sampler.hpp"
 
 #include "dit_rows.hpp"
 
@@ -100,24 +101,6 @@ void f32_vec(const float* w, const float* x, const float* b, float* y, int64_t N
         for (int64_t k = lane; k < K; k += local) acc += row[k] * x[k];
         acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
         if (lane == 0) y[n] = acc + (b != nullptr ? b[n] : 0.f);
-    });
-}
-
-// x0 = x - sigma * v, the step's prediction of the finished latent (a partial image's), v as euler's
-void predicted(float* x0, const float* x, const float* out, int64_t n, int ctxs, float cfg, float sigma, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const float v = ctxs == 2 ? out[n + i] + cfg * (out[i] - out[n + i]) : out[i];
-        x0[i] = x[i] - sigma * v;
-    });
-}
-
-// x += ds * v, v the guided velocity: out[0] (the prompt's) alone, or out[1] + cfg (out[0] - out[1])
-void euler(float* x, const float* out, int64_t n, int ctxs, float cfg, float ds, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const float v = ctxs == 2 ? out[n + i] + cfg * (out[i] - out[n + i]) : out[i];
-        x[i] += ds * v;
     });
 }
 
@@ -1162,39 +1145,8 @@ void MfDit::forward_skip(const float* x, float sigma, int64_t h, int64_t w, cons
 void MfDit::sample(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, float cfg,
                    const std::function<bool(int, int)>& step, const std::function<void(float*, float)>& after,
                    const std::function<void(int, const std::function<void(float*)>&)>& peek,
-                   const GuidanceSpec* guide) {
-    if (guide != nullptr && guide->any()) {
-        sample_guided(x, h, w, sigmas, cfg, step, after, peek, *guide);
-        return;
-    }
-    const int n = cfg > 1.f && ctx_[1].rows > 0 ? 2 : 1;
-    const int64_t HW = h * w;
-    float* out = alloc<float>(allocs_, n * HW * in_ch_);
-    const int steps = (int) sigmas.size() - 1;
-    for (int i = 0; i < steps; ++i) {
-        forward(x, sigmas[(size_t) i], h, w, n, out);
-        euler(x, out, HW * in_ch_, n, cfg, sigmas[(size_t) i + 1] - sigmas[(size_t) i], s_);
-        if (after) after(x, sigmas[(size_t) i + 1]);
-        if (peek) {
-            const float s_next = sigmas[(size_t) i + 1];
-            peek(i + 1, [&](float* x0) { predicted(x0, x, out, HW * in_ch_, n, cfg, s_next, s_); });
-        }
-        if (step && !step(i + 1, steps)) {
-            gpu::stream_sync(s_);
-            release(allocs_, out);
-            throw QiStopped();
-        }
-    }
-    gpu::stream_sync(s_);
-    release(allocs_, out);
-}
-
-// the sampling with guidance.hpp's guidance: each step the model asked at its sigma (Detail Daemon's), the contexts'
-// velocities (and skip layer guidance's pass) to the guided denoised values, Euler's step from them
-void MfDit::sample_guided(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, float cfg,
-                          const std::function<bool(int, int)>& step, const std::function<void(float*, float)>& after,
-                          const std::function<void(int, const std::function<void(float*)>&)>& peek,
-                          const GuidanceSpec& spec) {
+                   const GuidanceSpec* guide, bool er, float shift, uint64_t seed) {
+    const GuidanceSpec spec = guide != nullptr ? *guide : GuidanceSpec{};
     for (const int b : spec.slg_layers)
         if (b < 0 || b >= (int) blocks_.size())
             throw std::invalid_argument("image engine: skip layer guidance's block " + std::to_string(b) +
@@ -1202,33 +1154,10 @@ void MfDit::sample_guided(float* x, int64_t h, int64_t w, const std::vector<floa
     const int n = cfg > 1.f && ctx_[1].rows > 0 ? 2 : 1;
     const int64_t N = h * w * in_ch_;
     Guidance g(spec, s_, N, in_ch_, true, n == 2 ? cfg : 1.f, sigmas);
-    struct Free {
-        MfDit& d;
-        std::vector<float*> ps;
-        ~Free() {
-            gpu::stream_sync(d.s_);
-            for (float* p : ps) release(d.allocs_, p);
-        }
-    } mine{*this, {}};
-    auto get = [&](int64_t count) {
-        mine.ps.push_back(alloc<float>(allocs_, count));
-        return mine.ps.back();
-    };
-    float* out = get(n * N);
-    float* den = get(N);
-    float* k = !spec.slg_layers.empty() ? get(N) : nullptr;
-    const int steps = (int) sigmas.size() - 1;
-    for (int i = 0; i < steps; ++i) {
-        const float s0 = sigmas[(size_t) i], s1 = sigmas[(size_t) i + 1], sm = g.model_sigma(s0);
-        forward(x, sm, h, w, n, out);
-        const bool skipping = k != nullptr && g.skip_pass(sm);
-        if (skipping) forward_skip(x, sm, h, w, g.skip_layers(), k);
-        g.denoised(x, out, n == 2 ? out + N : nullptr, skipping ? k : nullptr, sm, den);
-        guidance_euler(x, den, s0, s1, N, s_);
-        if (after) after(x, s1);
-        if (peek) peek(i + 1, [&](float* x0) { gpu::copy_async(x0, den, (size_t) N * 4, s_); });
-        if (step && !step(i + 1, steps)) throw QiStopped();
-    }
+    flow_sample(s_, [&](const float* xx, float sigma, int nn, float* out) { forward(xx, sigma, h, w, nn, out); },
+                x, N, n, sigmas, cfg, er, shift, seed, step, after, peek, &g,
+                [&](const float* xx, float sigma, float* out) { forward_skip(xx, sigma, h, w, g.skip_layers(), out); },
+                true);
 }
 
 }  // namespace strata::image

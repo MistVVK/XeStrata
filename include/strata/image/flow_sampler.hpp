@@ -19,6 +19,13 @@ namespace strata::image {
 /// The DiT's velocities [n][N] (device FP32) of the latent x [N] at sigma, for its n contexts.
 using FlowForward = std::function<void(const float* x, float sigma, int n, float* out)>;
 
+// MOSS-Image's original step-window SLG combines the skipped velocity differently without a negative pass.
+struct FlowStepSkip {
+    std::function<bool(int)> active;
+    std::function<void(const float*, float, float*)> forward;
+    float scale;
+};
+
 /// The sampling of x [N] (device FP32, in place) over sigmas (the steps and the terminal 0) on `stream`.  `shift`: the
 /// model's schedule's (er_sde's first sigma); `seed`: er_sde's noise; step, after and peek as the pipelines' (progress,
 /// a mask's blend at each step's next sigma, a partial image's latent: the step's denoised values).
@@ -28,6 +35,7 @@ void flow_sample(void* stream, const FlowForward& forward, float* x, int64_t N, 
                  float cfg, bool er_sde, float shift, uint64_t seed, const std::function<bool(int, int)>& step,
                  const std::function<void(float*, float)>& after,
                  const std::function<void(int, const std::function<void(float*)>&)>& peek, Guidance* guide = nullptr,
-                 const std::function<void(const float* x, float sigma, float* out)>& skip_forward = {});
+                 const std::function<void(const float* x, float sigma, float* out)>& skip_forward = {},
+                 bool velocity_euler = false, const FlowStepSkip* step_skip = nullptr, bool unfused_euler = false);
 
 }  // namespace strata::image
