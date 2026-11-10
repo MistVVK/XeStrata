@@ -978,7 +978,8 @@ def conf_for_slots(slots: int | float | None) -> float:
 def expected_slots(vram_mib: float, args: list[Any]) -> int:
     """The ENGINE slots a card of ``vram_mib`` MiB is expected to hold with the drafter on, the same arithmetic as strata_control/vram_fit.py (the card, the
     runtime's gap, the dense weights, the KV session of ``--max-context`` / ``--kv``, the prompt buffers, the reserve; the draft layer's allowance in the base
-    is the DFlash2's own now, it is the only drafter), over one slot. An estimate good to about 10% (two engine starts); the steps of CONF_STEPS are wider."""
+    is the DFlash2's own now, it is the only drafter), over one slot of the pack (pack_slot_mib). An estimate good to about 10% (two engine starts); the steps
+    of CONF_STEPS are wider."""
     from strata_control import vram_fit
     ctx = _flag_value(args, "--max-context")
     ctx = int(ctx) if ctx and ctx.isdigit() else DEFAULT_CONTEXT
@@ -991,7 +992,26 @@ def expected_slots(vram_mib: float, args: list[Any]) -> int:
     # 0.89 GiB (measured: "drafter 799 MiB" + its head's staging, 890 MiB beside the engine without one; 192 MiB less than the MTP layer): nothing more is taken off.
     free = (float(vram_mib) - vram_fit.GAP_OTHER_MIB - SLOT_BASE_MIB - vram_fit.session_mib(ctx, kv) - vram_fit.HEAD_MIB - reserve
             - (vram_fit.PROMPT_BASE_MIB + vram_fit.PROMPT_PER_TOKEN_MIB * chunk))
-    return max(0, min(MAX_SLOTS, int(free / SLOT_MIB)))
+    return max(0, min(MAX_SLOTS, int(free / pack_slot_mib(args))))
+
+
+_NATIVE_TOTAL = re.compile(r"\bn_expert (\d+), total (\d+)")
+
+
+def pack_slot_mib(args: list[Any]) -> float:
+    """MiB of one engine slot for the pack ``--pack`` names. A native-experts pack (Unsloth, i-quant, NVFP4) gives its expert bytes in the first line of
+    native_experts.txt, over n_expert per layer and one line per layer: UD-Q4_K_XL is 77,017,907,200 bytes over 512 x 48, 2.99 MiB a slot, as its engine
+    logs it ("expert cache 2710 slots, 7.90 GiB" on a 16 GB card). Any other pack, or none, is priced at SLOT_MIB (IQ3_S, the set the steps were measured on)."""
+    pack = _flag_value(args, "--pack")
+    try:
+        lines = (Path(pack) / "native_experts.txt").read_text(encoding="utf-8", errors="replace").splitlines() if pack else []
+    except OSError:
+        lines = []
+    head = _NATIVE_TOTAL.search(lines[0]) if lines else None
+    layers = sum(1 for line in lines[1:] if line.strip() and not line.startswith("#"))
+    if head is None or not layers or not int(head.group(1)):
+        return SLOT_MIB
+    return int(head.group(2)) / (int(head.group(1)) * layers) / 2 ** 20
 
 
 def slots_of(args: list[Any], vram_mib: float | None = None) -> int | None:
