@@ -107,6 +107,7 @@
 #include <cerrno>
 
 #include "strata/core/gpu.hpp"
+#include "strata/platform/downgrade.hpp"
 #include "strata/platform/env.hpp"
 
 #include <array>
@@ -9203,6 +9204,7 @@ int main(int argc, char** argv) {
         strata::core::progress_at("idle");
         strata::gpu::pin_reserve_release();   // the engine is up: the pinned memory's last reserve goes back
         strata::platform::settle_before_ready();
+        strata::platform::downgrades_say();   // the start's fallbacks (the server keeps them: /v1/status)
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -10233,6 +10235,7 @@ int main(int argc, char** argv) {
             return pmtp_settle();
         };
         for (;;) {
+            strata::platform::downgrades_say();   // a request's fallbacks, between whole lines
             if (batch_on() || (piped && pipe_inflight())) {   // the slots decode while no line waits
                 if (!try_next_line(line)) {
                     if (!(piped ? pump(true) : batch_step())) return 1;

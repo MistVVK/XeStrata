@@ -74,6 +74,7 @@ from serve.frontend import (CALL_START, THINK_END, ChatTemplate, Event, GlmOutpu
 from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import places  # noqa: E402
+from serve import downgrades  # noqa: E402
 from serve import model_terms  # noqa: E402
 from serve import notices  # noqa: E402
 from serve import envvars  # noqa: E402
@@ -1123,6 +1124,8 @@ class StrataEngine:
                 continue
             if line is None:
                 break
+            if downgrades.from_info_line(line, "text engine"):
+                continue
             if line.startswith("INFO "):
                 for kv in line.split()[1:]:
                     k, _, v = kv.partition("=")
@@ -2676,6 +2679,7 @@ class StrataEngine:
                 return {"tokens": tokens, "bytes": size, "ms": ms}
             if head == "INFO" or head == "WARN":          # engine log lines may interleave; they are not answers
                 heard = time.monotonic()
+                downgrades.from_info_line(line, "text engine")
                 continue
             raise out_of_step(line)
 
@@ -5045,6 +5049,8 @@ class Service:
             "structured_output": {"formats": ["json_object", "json_schema"], "method": "prompt_and_validate",
                                   "constrained_decoding": False, "stream_buffered": True},
             "engine": (getattr(self.engine, "info", {}) or {}).get("version"),
+            # the slower paths an engine fell back to (serve/downgrades.py): key -> the engine that reported it
+            "downgrades": downgrades.snapshot(),
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},

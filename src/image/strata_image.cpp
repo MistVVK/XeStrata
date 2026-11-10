@@ -217,6 +217,7 @@
 #include "strata/image/yolo_detect.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/upscale/upscale.hpp"
+#include "strata/platform/downgrade.hpp"
 #include "strata/platform/env.hpp"
 
 #include <algorithm>
@@ -1361,6 +1362,8 @@ int serve(si::ImagePipeline& p) {
     std::thread reader([&in] { in.run(); });
     reader.detach();   // ends with the process: a blocked read cannot be woken
     for (std::string line; in.next(line);) {
+        // the fallbacks so far (the warm-up's, the last request's), never before READY: the server reads that first
+        strata::platform::downgrades_say();
         std::istringstream ls(line);
         std::string op;
         ls >> op;

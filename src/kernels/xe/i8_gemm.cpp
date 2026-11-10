@@ -14,6 +14,7 @@
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/platform/downgrade.hpp"
 #include "device_target.hpp"
 #include "nv_mma.hpp"
 
@@ -358,8 +359,8 @@ KitchenFn kitchen_module() {
             fn = nullptr;
             why = p.string() + ": no strata_kitchen_i8_gemm";
         }
-        std::fprintf(stderr, "xestrata: comfy-kitchen's int8 product module did not open (%s): the library's product\n",
-                     why.c_str());
+        platform::downgrade("i8_gemm.kitchen", "comfy-kitchen's int8 product module did not open (" + why +
+                                               "): the library's product");
     });
     return fn;
 }

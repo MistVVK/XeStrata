@@ -33,6 +33,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/spec/suffix_drafter.hpp"
+#include "strata/platform/downgrade.hpp"
 #include "strata/platform/env.hpp"
 
 #include <algorithm>
@@ -968,6 +969,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                     cvecs.summary.c_str());
     }
     strata::platform::settle_before_ready();
+    strata::platform::downgrades_say();   // the start's fallbacks (the server keeps them: /v1/status)
     std::printf("READY %lld stop\n", (long long) ctx);
     std::fflush(stdout);
     std::string line;
@@ -975,6 +977,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     // Qwen3.8-Flash-Next's serve does (#477)
     auto saved_at = std::chrono::steady_clock::now();
     for (;;) {
+        strata::platform::downgrades_say();   // a request's fallbacks, between whole lines
         if (batch_on()) {   // the slots decode while no line waits
             if (!try_line(line)) {
                 if (!(groups > 1 ? pipe_step(err, false) : batch_step(err))) {

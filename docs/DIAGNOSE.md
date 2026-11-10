@@ -183,6 +183,7 @@ Check APIs using the actual port and authentication method, with connection and 
 HTTP 200 from `GET /health` shows the server responds; it does not prove the model loaded.
 Correlate `loaded`, `GET /v1/status`'s `engine_failure` and engine version, and `GET /v1/models`; complete a short request through the API the original operation needs.
 With lazy loading, a request loads the model, so `loaded: false` while idle alone is not a failure.
+When it is slow, read `GET /v1/status`'s `downgrades` too: each slower path an engine fell back to, because it could not take a library the build and the GPU promise (oneMath, oneDNN's or aotriton's attention, cuDNN, comfy-kitchen's int8 product), as its key (`gemm.onemath`, `attn.aotriton`, ...) and the engine that reported it; the reason is in the engine's log, its `xestrata: downgrade <key>:` line (the idea is [arcint](https://github.com/marfrit/arcint)'s counting of its degraded paths, Apache-2.0).
 Distinguish authentication, connectivity, queue waits, engine failures and request format problems.
 
 ## Recovery and verification of the cause

@@ -147,6 +147,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, cast
 
+from serve import downgrades
 from serve import image_aux
 from serve import loras as lora_api
 from serve import envvars
@@ -2656,6 +2657,8 @@ class ImageEngine:
                         pause()
                 finally:
                     self.send("RESUME")
+            elif downgrades.from_info_line(got, "image engine"):
+                pass
             elif got.startswith(want):
                 return _kv(got)
             elif got.startswith("ERROR"):

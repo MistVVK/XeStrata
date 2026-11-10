@@ -7,6 +7,7 @@
 
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/matrix_report.hpp"
+#include "strata/platform/downgrade.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -79,8 +80,8 @@ AotFn aotriton_module() {
             if (fn != nullptr) return;
             why = p.string() + ": no strata_sdpa_aotriton";
         }
-        std::fprintf(stderr, "xestrata: aotriton's attention module did not open (%s): the engine's own kernel\n",
-                     why.c_str());
+        platform::downgrade("attn.aotriton", "aotriton's attention module did not open (" + why +
+                                             "): the engine's own kernel");
     });
     return fn;
 }

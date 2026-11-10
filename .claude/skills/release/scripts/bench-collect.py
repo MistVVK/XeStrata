@@ -3,7 +3,9 @@
 """Reads bench.sh's OUT/runs/*.txt and writes OUT/matrix.json (every run) and, per GPU, the prompt and output tables
 (the median of the rounds; a cell no run finished is "-", one bench.sh stopped as too slow "too slow") as Markdown to
 stdout.  An upstream run bench.sh stopped as too slow has "stopped" (prompt or output); one stopped in its output
-takes its prompt rate from the last PP line.
+takes its prompt rate from the last PP line.  XeStrata's runs' downgrades (the engine's "xestrata: downgrade KEY:"
+lines, src/platform/downgrade.cpp: a library the build and the GPU promise that it could not take) are listed per
+GPU after the tables: a release does not go out with one it did not expect.
 
     python .claude/skills/release/scripts/bench-collect.py OUT XE_NAME UP_NAME   # e.g. OUT xe0.1.41 v0.1.41
 """
@@ -39,6 +41,7 @@ for f in sorted((out / "runs").glob("*.txt")):
         "decode_tok_s": grab(r"^decode\s+.*->\s+([\d.]+) tok/s", s),
         "spec_accept": grab(r"^speculation\s+.*\(([\d.]+)\)", s),
         "stopped": stopped,
+        "downgrades": sorted(set(re.findall(r"^xestrata: downgrade (\S+):", s, re.M))),
     })
     if stopped == "output" and pp and pp[-1][0] == pp[-1][1]:   # stopped after the prompt: its rate from PP
         rows[-1]["prefill_tok_s"] = float(pp[-1][2])
@@ -56,3 +59,8 @@ for gpu in sorted({r["gpu"] for r in rows}):
                 slow = [r for r in rows if (r["gpu"], r["engine"], r["tier"]) == (gpu, name, t) and r["stopped"]]
                 cells.append(fmt.format(statistics.median(v)) if v else "too slow" if slow else "-")
             print(f"| {name} | " + " | ".join(cells) + " |")
+
+for gpu in sorted({r["gpu"] for r in rows}):
+    keys = sorted({k for r in rows if r["gpu"] == gpu and r["engine"] == NAMES["xe"] for k in r["downgrades"]})
+    print(f"\n{gpu}: XeStrata's downgrades: " + (", ".join(keys) + " - check them before the release" if keys
+                                                 else "none"))

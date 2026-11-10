@@ -183,6 +183,7 @@ API の確認は実際のポートと認証方法を使い、接続と要求に�
 `GET /health` の HTTP 200 は server の応答を示し、モデルが読み込まれた証拠にはなりません。
 `loaded`、`GET /v1/status` の `engine_failure` と実行版、`GET /v1/models` を照合し、元の操作に必要な API で短い要求を最後まで実行します。
 遅延読み込みでは、要求時にモデルを読み込むので、待機中の `loaded: false` だけで障害と判断しないでください。
+遅いときは `GET /v1/status` の `downgrades` も見てください。ビルドと GPU が使うはずのライブラリ（oneMath、oneDNN や aotriton の注意、cuDNN、comfy-kitchen の int8 の積）を取れずにエンジンが遅い経路に落ちたものが、鍵（`gemm.onemath`、`attn.aotriton` など）とそれを報告したエンジンで並び、理由はエンジンのログの `xestrata: downgrade <鍵>:` の行にあります（考え方は [arcint](https://github.com/marfrit/arcint) の格下げの数え方、Apache-2.0）。
 認証エラー、接続エラー、キュー待ち、エンジンの失敗、要求形式の問題を区別します。
 
 ## 復旧と原因の検証

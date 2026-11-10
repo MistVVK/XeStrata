@@ -4,6 +4,7 @@
 // layouts (channels last, weights [out][k][k][in]), a primitive made once a shape and kept.
 
 #include "qi_conv.hpp"
+#include "strata/platform/downgrade.hpp"
 
 #include <oneapi/dnnl/dnnl.hpp>
 #include <oneapi/dnnl/dnnl_sycl.hpp>
@@ -99,8 +100,13 @@ bool onednn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, 
         it->second.execute(strm, args);
         return true;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "xestrata-image: oneDNN's convolution is not taken on this GPU (%s): the engine's own path\n",
-                     e.what());
+        // a failure once oneDNN's engine stood on this GPU is a fallback; no engine for it, a GPU oneDNN does not run
+        if (d.eng)
+            platform::downgrade("image.conv.onednn", std::string("oneDNN's convolution is not taken on this GPU (") +
+                                                     e.what() + "): the engine's own path");
+        else
+            std::fprintf(stderr, "xestrata-image: oneDNN's convolution is not taken on this GPU (%s): the engine's own "
+                                 "path\n", e.what());
         d.failed = true;
         return false;
     }

@@ -200,7 +200,7 @@ $s/podman-bench.sh run env XE=... UP=... XE_PROFILE=... UP_PROFILE=... DATA=<dat
 python $s/bench-collect.py $o xe<VERSION> <upstream tag>
 ```
 
-`bench.sh` runs a warm-up per engine, then each tier twice per engine with the engines alternating; `bench-collect.py` writes `matrix.json` and the tables (the medians), one pair per GPU.
+`bench.sh` runs a warm-up per engine, then each tier twice per engine with the engines alternating; `bench-collect.py` writes `matrix.json` and the tables (the medians), one pair per GPU. It also lists, per GPU, the downgrades XeStrata's runs said (`xestrata: downgrade KEY:`: a library the build and the GPU promise that the engine could not take, so it ran a slower path): a release does not go out with one nobody expected - find why first.
 A cell that does not fit the GPU's or the machine's memory stays `-` with the reason in the record; an engine that does not start at all stops the run (report it).
 `bench.sh` stops upstream once it is plainly at 10 tok/s or less; such a cell is `too slow`: not measurable, written 計測不能（低速）/ not measurable (too slow) in the notes, with a line saying upstream was stopped at 10 tok/s or less.
 

@@ -24,6 +24,7 @@ void* cudnn_dlhandle = nullptr;
 #include "strata/core/graph.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/sdpa_cudnn.hpp"
+#include "strata/platform/downgrade.hpp"
 #include "strata/platform/env.hpp"
 #include "qi_sdpa.hpp"
 
@@ -384,8 +385,8 @@ bool run_sdpa(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const ui
             if (!g->execute(handle, pack, ws).is_good()) throw std::runtime_error("cuDNN's SDPA failed");
         });
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "%s: cuDNN's attention is not taken on this GPU (%s): the engine's own kernel\n", who,
-                     e.what());
+        platform::downgrade("image.attn.cudnn", std::string(who) + ": cuDNN's attention is not taken on this GPU (" +
+                                                e.what() + "): the engine's own kernel");
         d.failed = true;
         return false;
     }
@@ -465,8 +466,8 @@ bool run_conv(sycl::queue& q, const std::vector<int64_t>& key,
     try {
         if (d.handle == nullptr) sdpa::open_cudnn(d.handle);
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "xestrata-image: cuDNN's convolution is not taken on this GPU (%s): the engine's own path\n",
-                     e.what());
+        platform::downgrade("image.conv.cudnn", std::string("cuDNN's convolution is not taken on this GPU (") + e.what() +
+                                                "): the engine's own path");
         d.conv_failed = true;
         return false;
     }

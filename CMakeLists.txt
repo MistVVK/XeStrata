@@ -212,7 +212,8 @@ target_link_libraries(strata-plan PRIVATE strata_plan)
 
 # ---- host-only platform and n-gram reader ----------------------------------
 # These never touched the GPU runtime; they sat inside the CUDA build only because their consumers did.
-add_library(strata_platform STATIC src/platform/memory.cpp src/platform/direct_file.cpp src/platform/process.cpp)
+add_library(strata_platform STATIC src/platform/memory.cpp src/platform/direct_file.cpp src/platform/process.cpp
+                                   src/platform/downgrade.cpp)
 target_include_directories(strata_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 find_package(Threads REQUIRED)
 target_link_libraries(strata_platform PUBLIC strata_warnings Threads::Threads)
@@ -1270,11 +1271,11 @@ if(STRATA_ENABLE_XE)
   add_executable(moss_text_parity src/image/moss_text_parity.cpp)
   target_link_libraries(moss_text_parity PRIVATE strata_image)
   add_test(NAME moss_text_parity COMMAND moss_text_parity)
-  add_executable(moss_dit_parity src/image/moss_dit_parity.cpp)
   # the image models' text encoder on a synthetic Qwen3-VL: the M-RoPE's sections and DeepStack against the host's FP64
   add_executable(qwen3vl_text_parity src/image/qwen3vl_text_parity.cpp)
   target_link_libraries(qwen3vl_text_parity PRIVATE strata_image)
   add_test(NAME qwen3vl_text_parity COMMAND qwen3vl_text_parity)
+  add_executable(moss_dit_parity src/image/moss_dit_parity.cpp)
   target_link_libraries(moss_dit_parity PRIVATE strata_image)
   add_test(NAME moss_dit_parity COMMAND moss_dit_parity)
   if(TARGET strata-image-mf-train-probe)

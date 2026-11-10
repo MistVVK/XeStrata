@@ -8,6 +8,7 @@
 
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/matrix_report.hpp"
+#include "strata/platform/downgrade.hpp"
 
 #include <oneapi/dnnl/dnnl_graph.hpp>
 #include <oneapi/dnnl/dnnl_graph_sycl.hpp>
@@ -348,8 +349,8 @@ bool onednn_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, 
         dg::sycl_interop::execute(cp, strm, ins, outs);
         return true;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "xestrata: oneDNN's attention is not taken on this GPU (%s): the engine's own kernel\n",
-                     e.what());
+        platform::downgrade("attn.onednn", std::string("oneDNN's attention is not taken on this GPU (") + e.what() +
+                                           "): the engine's own kernel");
         failed = true;
         return false;
     }

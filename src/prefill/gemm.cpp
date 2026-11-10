@@ -6,6 +6,7 @@
 // cuBLAS on NVIDIA ones), the free mode through XeStrata's own kernels, which also take a GPU oneMath has no backend
 // for.
 #include "strata/prefill/gemm.hpp"
+#include "strata/platform/downgrade.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/i8_gemm.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
@@ -144,12 +145,12 @@ Backend backend(const sycl::device& dev) {
     if (b.ready.valid()) {
         b.ready = {};
         if (!t.why.empty()) {
-            std::fprintf(stderr, "xestrata: oneMath: %s; the prompt's matrix products take XeStrata's own kernels\n",
-                         t.why.c_str());
+            platform::downgrade("gemm.onemath", "oneMath: " + t.why + "; the prompt's matrix products take XeStrata's own "
+                                                "kernels");
             b.blas = false;
         } else if (!t.bf16 && b.bf16) {
-            std::fprintf(stderr, "xestrata: oneMath has no BF16 product on this GPU: those take XeStrata's own "
-                                 "kernels\n");
+            platform::downgrade("gemm.onemath_bf16", "oneMath has no BF16 product on this GPU: those take XeStrata's "
+                                                     "own kernels");
             b.bf16 = false;
         }
     }
@@ -177,8 +178,8 @@ bool blas(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, 
         product<E>(q, X, W, Y, T, N, K, ldy, accumulate);
         return true;
     } catch (const oneapi::math::exception& e) {
-        std::fprintf(stderr, "xestrata: oneMath: %s; the prompt's matrix products take XeStrata's own kernels\n",
-                     e.what());
+        platform::downgrade("gemm.onemath", std::string("oneMath: ") + e.what() + "; the prompt's matrix products take "
+                                            "XeStrata's own kernels");
         std::lock_guard<std::mutex> lock(g_mutex);
         g_backends[q.get_device()].blas = false;
         return false;
@@ -280,7 +281,8 @@ bool half_out(const uint16_t* X, const uint16_t* W, uint16_t* Y16, int64_t T, in
                                      reinterpret_cast<const sycl::half*>(W), K, reinterpret_cast<const sycl::half*>(X),
                                      K, sycl::half(0.0f), reinterpret_cast<sycl::half*>(Y16), ldy);
     } catch (const oneapi::math::exception& e) {
-        std::fprintf(stderr, "xestrata: oneMath (FP16 sums): %s; the FP32 sums instead\n", e.what());
+        platform::downgrade("gemm.onemath_f16_sums", std::string("oneMath (FP16 sums): ") + e.what() +
+                                                     "; the FP32 sums instead");
         return false;
     }
     return true;
@@ -607,7 +609,8 @@ void Gemm::f16_batch(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, 
                                                reinterpret_cast<const sycl::half*>(X), K, sx, 0.0f, Y, ldy, sy, batch);
             return;
         } catch (const oneapi::math::exception& e) {
-            std::fprintf(stderr, "xestrata: oneMath (a batch of FP16 products): %s; one product each\n", e.what());
+            platform::downgrade("gemm.onemath_batch", std::string("oneMath (a batch of FP16 products): ") + e.what() +
+                                                      "; one product each");
         }
     }
 #endif
