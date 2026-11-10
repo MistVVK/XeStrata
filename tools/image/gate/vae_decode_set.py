@@ -2,7 +2,7 @@
 Strata's own VAE decoder (strata-vae-decode, src/image/vae) and write the pictures as sd-cli would, so compare.py and
 check_limits.py can put them next to sd.cpp's decode of the same latents.
 
-    python -I -B vae_decode_set.py <strata-vae-decode> <vae.safetensors> <pics root> <latent tag> <out tag> [--repeat N]
+    python -I -B vae_decode_set.py <strata-vae-decode> <vae.safetensors> <pics root> <latent tag> <out tag> [--repeat N] [--stream on]
 
 <pics root>/<latent tag>/dump_<name>/latent.bin (run_set.py --dump) -> <pics root>/<out tag>/<name>.png (RGBA, sd.cpp's
 8-bit conversion) and results.jsonl (decode ms, peak MiB, run-to-run identity when --repeat > 1).
@@ -34,6 +34,7 @@ def main(argv) -> int:
         return 2
     exe, vae, root, src, dst = argv[0], argv[1], Path(argv[2]), argv[3], argv[4]
     repeat = int(argv[argv.index("--repeat") + 1]) if "--repeat" in argv else 1
+    stream = argv[argv.index("--stream") + 1] if "--stream" in argv else "off"
     out = root / dst
     out.mkdir(parents=True, exist_ok=True)
     rc_all = 0
@@ -41,7 +42,8 @@ def main(argv) -> int:
         for d in sorted((root / src).glob("dump_p*_s*")):
             name = d.name[len("dump_"):]
             f32 = Path(tmp) / f"{name}.f32"
-            r = subprocess.run([exe, vae, str(d / "latent.bin"), str(f32), "--repeat", str(repeat)],
+            r = subprocess.run([exe, vae, str(d / "latent.bin"), str(f32), "--repeat", str(repeat),
+                                "--stream", stream],
                                capture_output=True, text=True)
             runs = [m.groups() for m in map(LINE.match, r.stdout.splitlines()) if m]
             opened = [float(m.group(1)) for m in map(OPEN.match, r.stdout.splitlines()) if m]

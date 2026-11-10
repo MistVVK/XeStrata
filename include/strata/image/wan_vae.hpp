@@ -36,6 +36,10 @@ std::string wan_vae_decode(WanVae* vae, const float* latent, int h, int w, float
 // sd.cpp's diffusion_to_vae_latents for Qwen-Image-2.1 (x * std / 1 + mean per channel).
 void wan_vae_denormalize(float* latent, int h, int w);
 
+// The small-card path: block 3's upsample, block 4 and the head computed in row bands with recomputed overlaps
+// (same bytes as the one-pass decode, less device memory).  Off by default; the rule that turns it on is the caller's.
+void wan_vae_set_streaming(WanVae* vae, bool on);
+
 // Test hook: called with each stage's output (host copy, pixel-major [H][W][C]) during the next decodes; names as in
 // tools/image/gate/vae_ref.py (conv_in, mid_attn, mid, up0..up4, out).  An empty function turns it off.
 void wan_vae_set_dump(WanVae* vae, std::function<void(const char*, const float*, int, int, int)> dump);

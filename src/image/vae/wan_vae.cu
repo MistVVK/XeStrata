@@ -87,9 +87,12 @@ __global__ void rms_inv_kernel(const float* __restrict__ x, int64_t P, int C, fl
 
 // One thread = 8 channels of one tap of one band pixel.  out: [PB][taps*C] f16 bits.
 template <int MODE>
+// Row windows (the small-card streaming): the source holds image rows [src_y0, src_y0 + Hs) of its picture, the
+// output band starts at image row dst_y0 of a conv-input grid H (image) rows high.  Zero padding only at the image's
+// own edges; a row outside the window is read as zero too, and the rows that depend on it are never used.
 __global__ void gather_kernel(const float* __restrict__ src, int Hs, int Ws, int C, int H, int W, int k,
                               int64_t p0, int64_t P, const float* __restrict__ inv, const float* __restrict__ gamma,
-                              uint16_t* __restrict__ out) {
+                              uint16_t* __restrict__ out, int src_y0, int dst_y0) {
     const int taps = k * k, c8n = C >> 3;
     const int64_t total = (int64_t) PB * taps * c8n;
     const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -101,11 +104,12 @@ __global__ void gather_kernel(const float* __restrict__ src, int Hs, int Ws, int
     const int64_t p = p0 + pl;
     uint16_t h[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     if (p < P) {
-        const int y = (int) (p / W), xq = (int) (p % W);
+        const int y = dst_y0 + (int) (p / W), xq = (int) (p % W);
         const int yy = y + tap / k - k / 2, xx = xq + tap % k - k / 2;
-        if (yy >= 0 && yy < H && xx >= 0 && xx < W) {
-            const int sy = MODE == G_UP2 ? (yy >> 1) : yy, sx = MODE == G_UP2 ? (xx >> 1) : xx;
-            const int64_t sp = (int64_t) sy * Ws + sx;
+        const int ly = (MODE == G_UP2 ? (yy >> 1) : yy) - src_y0;
+        if (yy >= 0 && yy < H && xx >= 0 && xx < W && ly >= 0 && ly < Hs) {
+            const int sx = MODE == G_UP2 ? (xx >> 1) : xx;
+            const int64_t sp = (int64_t) ly * Ws + sx;
             const float4* s4 = reinterpret_cast<const float4*>(src + sp * C + c8 * 8);
             const float4 a = s4[0], b = s4[1];
             float v[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
@@ -119,7 +123,6 @@ __global__ void gather_kernel(const float* __restrict__ src, int Hs, int Ws, int
                 h[i] = strata::kernels::f16_from_f32(q);
             }
         }
-        (void) Hs;
     }
     uint4 pk;
     pk.x = (uint32_t) h[0] | ((uint32_t) h[1] << 16);
@@ -133,7 +136,7 @@ __global__ void gather_kernel(const float* __restrict__ src, int Hs, int Ws, int
 // [2Hs][2Ws][OC]: channel (oc*ft*4 + (ft-1)*4 + i*2 + j) / repeats of x0's pixel (Y/2, X/2), i = Y&1, j = X&1.
 __global__ void epilogue_kernel(const float* __restrict__ acc, int OC, int64_t p0, int64_t nvalid,
                                 const float* __restrict__ bias, const float* res, float* dst, int W,
-                                const float* __restrict__ x0, int C0, int ft) {
+                                const float* __restrict__ x0, int C0, int ft, int dst_y0, int x0_y0) {
     const int64_t t = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (t >= nvalid * OC) return;
     const int oc = (int) (t % OC);
@@ -142,10 +145,10 @@ __global__ void epilogue_kernel(const float* __restrict__ acc, int OC, int64_t p
     v = v + bias[oc];
     if (res) v = v + res[p * OC + oc];
     if (x0) {
-        const int Y = (int) (p / W), X = (int) (p % W);
+        const int Y = dst_y0 + (int) (p / W), X = (int) (p % W);
         const int repeats = OC * ft * 4 / C0;
         const int ch = (oc * ft * 4 + (ft - 1) * 4 + (Y & 1) * 2 + (X & 1)) / repeats;
-        const int64_t sp = (int64_t) (Y >> 1) * (W >> 1) + (X >> 1);
+        const int64_t sp = (int64_t) ((Y >> 1) - x0_y0) * (W >> 1) + (X >> 1);   // x0 holds the needed rows
         v = v + x0[sp * C0 + ch];
     }
     dst[p * OC + oc] = v;
@@ -213,7 +216,12 @@ struct Pool {   // device buffers reused by size; peak = what was ever allocated
     void clear() { for (auto& b : blks) cudaFree(b.p); blks.clear(); live = 0; }
 };
 
-struct Tensor { float* d = nullptr; int H = 0, W = 0, C = 0; int64_t P() const { return (int64_t) H * W; } };
+// H rows (image rows y0 .. y0+H-1 of a picture Hi rows high; a whole tensor has y0 = 0, Hi = H) x W x C
+struct Tensor {
+    float* d = nullptr;
+    int H = 0, W = 0, C = 0, y0 = 0, Hi = 0;
+    int64_t P() const { return (int64_t) H * W; }
+};
 
 struct Conv { int ic = 0, oc = 0, k = 0; uint16_t* w = nullptr; float* b = nullptr; };
 struct Norm { int c = 0; float* g = nullptr; };
@@ -236,6 +244,7 @@ struct WanVae {
     uint16_t* gbuf = nullptr;   // [PB][Kmax] f16
     float* abuf = nullptr;      // [PB][OCmax] f32
     std::function<void(const char*, const float*, int, int, int)> dump;
+    int stream_mode = 0;        // 0 one pass, 1 the row-band tail (wan_vae_set_streaming)
 };
 
 namespace {
@@ -319,9 +328,9 @@ std::string load_resnet(WanVae* v, Loader& L, const std::string& p, Resnet& r) {
     return "";
 }
 
-std::string alloc_t(WanVae* v, Tensor& t, int H, int W, int C) {
+std::string alloc_t(WanVae* v, Tensor& t, int H, int W, int C, int y0 = 0, int Hi = -1) {
     std::string err;
-    t.H = H; t.W = W; t.C = C;
+    t.H = H; t.W = W; t.C = C; t.y0 = y0; t.Hi = Hi < 0 ? H : Hi;
     t.d = (float*) v->pool.get((size_t) H * W * C * sizeof(float), err);
     return t.d ? "" : err;
 }
@@ -332,9 +341,12 @@ std::string conv(WanVae* v, const Conv& cv, const Tensor& src, int mode, const N
                  const float* res, const Tensor* x0, int ft) {
     if (src.C != cv.ic) return "wan_vae: conv input channels differ";
     if (nrm && nrm->c != src.C) return "wan_vae: norm channels differ";
-    const int H = mode == G_UP2 ? src.H * 2 : src.H, W = mode == G_UP2 ? src.W * 2 : src.W;
-    if (dst.H != H || dst.W != W || dst.C != cv.oc) return "wan_vae: conv output shape differs";
-    const int64_t P = (int64_t) H * W;
+    // the conv-input grid's image height (zero padding at its edges) and width; dst is a window of its rows
+    const int Hg = mode == G_UP2 ? src.Hi * 2 : src.Hi, W = mode == G_UP2 ? src.W * 2 : src.W;
+    if (dst.Hi != Hg || dst.W != W || dst.C != cv.oc || dst.y0 < 0 || dst.y0 + dst.H > Hg)
+        return "wan_vae: conv output shape differs";
+    if (x0 && (x0->y0 > dst.y0 / 2 || x0->y0 + x0->H < (dst.y0 + dst.H + 1) / 2)) return "wan_vae: DupUp rows missing";
+    const int64_t P = dst.P();
     float* inv = nullptr;
     std::string err;
     if (mode == G_NORM || mode == G_NORM_SILU) {
@@ -349,10 +361,10 @@ std::string conv(WanVae* v, const Conv& cv, const Tensor& src, int mode, const N
         const int64_t total = (int64_t) PB * cv.k * cv.k * (cv.ic / 8);
         const unsigned blocks = (unsigned) ((total + 255) / 256);
         switch (mode) {
-            case G_PLAIN: gather_kernel<G_PLAIN><<<blocks, 256, 0, v->stream>>>(src.d, src.H, src.W, src.C, H, W, cv.k, p0, P, inv, nullptr, v->gbuf); break;
-            case G_NORM: gather_kernel<G_NORM><<<blocks, 256, 0, v->stream>>>(src.d, src.H, src.W, src.C, H, W, cv.k, p0, P, inv, nrm->g, v->gbuf); break;
-            case G_NORM_SILU: gather_kernel<G_NORM_SILU><<<blocks, 256, 0, v->stream>>>(src.d, src.H, src.W, src.C, H, W, cv.k, p0, P, inv, nrm->g, v->gbuf); break;
-            default: gather_kernel<G_UP2><<<blocks, 256, 0, v->stream>>>(src.d, src.H, src.W, src.C, H, W, cv.k, p0, P, inv, nullptr, v->gbuf); break;
+            case G_PLAIN: gather_kernel<G_PLAIN><<<blocks, 256, 0, v->stream>>>(src.d, src.H, src.W, src.C, Hg, W, cv.k, p0, P, inv, nullptr, v->gbuf, src.y0, dst.y0); break;
+            case G_NORM: gather_kernel<G_NORM><<<blocks, 256, 0, v->stream>>>(src.d, src.H, src.W, src.C, Hg, W, cv.k, p0, P, inv, nrm->g, v->gbuf, src.y0, dst.y0); break;
+            case G_NORM_SILU: gather_kernel<G_NORM_SILU><<<blocks, 256, 0, v->stream>>>(src.d, src.H, src.W, src.C, Hg, W, cv.k, p0, P, inv, nrm->g, v->gbuf, src.y0, dst.y0); break;
+            default: gather_kernel<G_UP2><<<blocks, 256, 0, v->stream>>>(src.d, src.H, src.W, src.C, Hg, W, cv.k, p0, P, inv, nullptr, v->gbuf, src.y0, dst.y0); break;
         }
         VAE_CUDA(cudaGetLastError());
         VAE_BLAS(cublasGemmEx(v->blas, CUBLAS_OP_T, CUBLAS_OP_N, cv.oc, PB, K, &one, cv.w, CUDA_R_16F, K, v->gbuf,
@@ -360,27 +372,29 @@ std::string conv(WanVae* v, const Conv& cv, const Tensor& src, int mode, const N
         const int64_t nvalid = (P - p0) < PB ? (P - p0) : PB;
         const int64_t et = nvalid * cv.oc;
         epilogue_kernel<<<(unsigned) ((et + 255) / 256), 256, 0, v->stream>>>(
-            v->abuf, cv.oc, p0, nvalid, cv.b, res, dst.d, W, x0 ? x0->d : nullptr, x0 ? x0->C : 0, ft);
+            v->abuf, cv.oc, p0, nvalid, cv.b, res, dst.d, W, x0 ? x0->d : nullptr, x0 ? x0->C : 0, ft, dst.y0,
+            x0 ? x0->y0 : 0);
         VAE_CUDA(cudaGetLastError());
     }
     if (inv) v->pool.put(inv);
     return "";
 }
 
-// x -> resnet(x); x is consumed (its buffer becomes the output when the channels stay, else it is freed).
-std::string resnet(WanVae* v, const Resnet& r, Tensor& x) {
+// x -> resnet(x); x is consumed (its buffer becomes the output when the channels stay, else it is freed unless
+// keep_input: then the caller still owns it).
+std::string resnet(WanVae* v, const Resnet& r, Tensor& x, bool keep_input = false) {
     Tensor h, t;
     if (r.has_sc) {
-        VAE_TRY(alloc_t(v, h, x.H, x.W, r.sc.oc));
+        VAE_TRY(alloc_t(v, h, x.H, x.W, r.sc.oc, x.y0, x.Hi));
         VAE_TRY(conv(v, r.sc, x, G_PLAIN, nullptr, h, nullptr, nullptr, 0));
     } else {
         h = x;
     }
-    VAE_TRY(alloc_t(v, t, x.H, x.W, r.c1.oc));
+    VAE_TRY(alloc_t(v, t, x.H, x.W, r.c1.oc, x.y0, x.Hi));
     VAE_TRY(conv(v, r.c1, x, G_NORM_SILU, &r.n1, t, nullptr, nullptr, 0));
     VAE_TRY(conv(v, r.c2, t, G_NORM_SILU, &r.n2, h, h.d, nullptr, 0));   // in place on h
     free_t(v, t);
-    if (r.has_sc) free_t(v, x);
+    if (r.has_sc && !keep_input) free_t(v, x);
     x = h;
     return "";
 }
@@ -420,6 +434,34 @@ std::string stage(WanVae* v, const char* name, const Tensor& t) {
     return "";
 }
 
+// The small-card path (owner decision 11-10, option A): block 3's upsample, block 4 and the head in bands of
+// STREAM_ROWS picture rows, each computed with STREAM_HALO extra rows above and below (block 4's six 3x3 convolutions
+// and conv_out each need one row more), from the complete block-3 tensors x (after its resnets) and x0 (its input).
+// Every kept pixel goes through the same operations on the same operands as in the one-pass decode (the GEMM bands
+// stay PB pixels), so the picture is the same bytes; only memory differs.  hwc: the picture, [HF][WF][4].
+constexpr int STREAM_ROWS = 128;
+constexpr int STREAM_HALO = 7;
+
+std::string stream_tail(WanVae* v, const Tensor& x, const Tensor& x0, float* hwc) {
+    const int H = x.Hi * 2, W = x.W * 2;
+    for (int o0 = 0; o0 < H; o0 += STREAM_ROWS) {
+        const int o1 = std::min(H, o0 + STREAM_ROWS);
+        const int a = std::max(0, o0 - STREAM_HALO), b = std::min(H, o1 + STREAM_HALO);
+        Tensor u, o;
+        VAE_TRY(alloc_t(v, u, b - a, W, v->resample[3].oc, a, H));
+        VAE_TRY(conv(v, v->resample[3], x, G_UP2, nullptr, u, nullptr, &x0, UP_FT[3]));
+        for (int j = 0; j < 3; ++j) VAE_TRY(resnet(v, v->up[4][j], u));
+        VAE_TRY(alloc_t(v, o, b - a, W, v->conv_out.oc, a, H));
+        VAE_TRY(conv(v, v->conv_out, u, G_NORM_SILU, &v->norm_out, o, nullptr, nullptr, 0));
+        free_t(v, u);
+        VAE_CUDA(cudaMemcpyAsync(hwc + (size_t) o0 * W * 4, o.d + (size_t) (o0 - a) * W * 4,
+                                 (size_t) (o1 - o0) * W * 4 * sizeof(float), cudaMemcpyDeviceToHost, v->stream));
+        VAE_CUDA(cudaStreamSynchronize(v->stream));
+        free_t(v, o);
+    }
+    return "";
+}
+
 std::string decode_impl(WanVae* v, const float* latent, int h, int w, float* out, WanVaeStats* st) {
     VAE_CUDA(cudaSetDevice(v->device));
     cudaEvent_t e0, e1;
@@ -448,13 +490,27 @@ std::string decode_impl(WanVae* v, const float* latent, int h, int w, float* out
     VAE_TRY(stage(v, "mid_attn", x));
     VAE_TRY(resnet(v, v->mid1, x));
     VAE_TRY(stage(v, "mid", x));
+    const bool streamed = v->stream_mode == 1;
+    const int HF = 16 * h, WF = 16 * w;                 // the picture
+    std::vector<float> hwc((size_t) HF * WF * 4);
     for (int i = 0; i < 5; ++i) {
         Tensor x0;
-        if (UP_HAS[i]) {   // keep the block's input for the DupUp shortcut
+        // keep the block's input for the DupUp shortcut: when the first resnet changes the channels it writes a new
+        // tensor anyway, so the input itself is kept; otherwise (blocks 0, 1) it works in place and x0 is a copy
+        const bool alias = UP_HAS[i] && v->up[i][0].has_sc;
+        if (alias) {
+            x0 = x;
+        } else if (UP_HAS[i]) {
             VAE_TRY(alloc_t(v, x0, x.H, x.W, x.C));
             VAE_CUDA(cudaMemcpyAsync(x0.d, x.d, (size_t) x.P() * x.C * 4, cudaMemcpyDeviceToDevice, v->stream));
         }
-        for (int j = 0; j < 3; ++j) VAE_TRY(resnet(v, v->up[i][j], x));
+        for (int j = 0; j < 3; ++j) VAE_TRY(resnet(v, v->up[i][j], x, alias && j == 0));
+        if (streamed && i == 3) {   // the rest of the picture in row bands (stream_tail), from block 3's upsample on
+            VAE_TRY(stream_tail(v, x, x0, hwc.data()));
+            free_t(v, x);
+            free_t(v, x0);
+            break;
+        }
         if (UP_HAS[i]) {
             Tensor u;
             VAE_TRY(alloc_t(v, u, x.H * 2, x.W * 2, v->resample[i].oc));
@@ -466,19 +522,21 @@ std::string decode_impl(WanVae* v, const float* latent, int h, int w, float* out
         const char* names[5] = {"up0", "up1", "up2", "up3", "up4"};
         VAE_TRY(stage(v, names[i], x));
     }
-    Tensor o;
-    VAE_TRY(alloc_t(v, o, x.H, x.W, v->conv_out.oc));
-    VAE_TRY(conv(v, v->conv_out, x, G_NORM_SILU, &v->norm_out, o, nullptr, nullptr, 0));
-    free_t(v, x);
-    VAE_TRY(stage(v, "out", o));
-    std::vector<float> hwc((size_t) o.P() * o.C);
-    VAE_CUDA(cudaMemcpyAsync(hwc.data(), o.d, hwc.size() * 4, cudaMemcpyDeviceToHost, v->stream));
+    if (!streamed) {
+        Tensor o;
+        VAE_TRY(alloc_t(v, o, x.H, x.W, v->conv_out.oc));
+        VAE_TRY(conv(v, v->conv_out, x, G_NORM_SILU, &v->norm_out, o, nullptr, nullptr, 0));
+        free_t(v, x);
+        VAE_TRY(stage(v, "out", o));
+        VAE_CUDA(cudaMemcpyAsync(hwc.data(), o.d, hwc.size() * 4, cudaMemcpyDeviceToHost, v->stream));
+        free_t(v, o);
+    }
     VAE_CUDA(cudaEventRecord(e1, v->stream));
     VAE_CUDA(cudaEventSynchronize(e1));
-    free_t(v, o);
-    const int64_t P = o.P();
-    for (int c = 0; c < o.C; ++c)
-        for (int64_t i = 0; i < P; ++i) out[(size_t) c * P + i] = hwc[(size_t) i * o.C + c];
+    if (streamed && v->dump) v->dump("out", hwc.data(), HF, WF, 4);
+    const int64_t P = (int64_t) HF * WF;
+    for (int c = 0; c < 4; ++c)
+        for (int64_t i = 0; i < P; ++i) out[(size_t) c * P + i] = hwc[(size_t) i * 4 + c];
     float ms = 0;
     VAE_CUDA(cudaEventElapsedTime(&ms, e0, e1));
     cudaEventDestroy(e0);
@@ -587,7 +645,11 @@ void wan_vae_denormalize(float* latent, int h, int w) {
         }
 }
 
-void wan_vae_set_dump(WanVae* v,std::function<void(const char*, const float*, int, int, int)> dump) {
+void wan_vae_set_streaming(WanVae* v, bool on) {
+    if (v) v->stream_mode = on ? 1 : 0;
+}
+
+void wan_vae_set_dump(WanVae* v, std::function<void(const char*, const float*, int, int, int)> dump) {
     if (v) v->dump = std::move(dump);
 }
 
