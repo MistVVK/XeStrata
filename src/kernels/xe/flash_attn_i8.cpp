@@ -1641,7 +1641,7 @@ static bool kitchen_attn_first(sycl::queue& q) {
         // values of a few units, varied (equal ones would make every score the same)
         q.parallel_for(sycl::range<1>((size_t) (4 * T * C)), [=](sycl::id<1> id) {
              const uint32_t h = (uint32_t) id[0] * 2654435761u;
-             x[id[0]] = f16_from_f32((float) ((h >> 20) & 255) / 64.f - 2.f);
+             x[id[0]] = f16_gpu::f16_from_f32((float) ((h >> 20) & 255) / 64.f - 2.f);
          }).wait();
         const uint16_t *q16 = x, *k16 = x + T * C, *v16 = x + 2 * T * C;
         uint16_t* out = x + 3 * T * C;
