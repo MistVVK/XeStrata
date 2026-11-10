@@ -586,5 +586,91 @@ class OverHttp(unittest.TestCase):
         self.assertGreaterEqual(chat_at, img_at - 0.05)
 
 
+class VaeDecoderSwitch(unittest.TestCase):
+    """images "vae_decoder" (OWN-5 step 2): "sdcpp" or absent changes nothing; "strata" adds strata_vae=1 to the one
+    --model-args string; a config that asks for it with an sd-cli built without it, or on a backend without it, is
+    refused before sd-cli starts (the owner's wording of 11-11, see serve/images.py)."""
+
+    def test_the_owners_words(self):
+        self.assertEqual(images_api.VAE_MISSING,
+                         "Image generation is set to use Strata's own picture decoder (\"vae_decoder\": \"strata\" in the "
+                         "images settings), but the image program here was built without it. Run setup again with: "
+                         "--images qwen-image --image-vae on")
+        self.assertEqual(images_api.VAE_BACKEND.format(backend="vulkan"),
+                         "Image generation is set to use Strata's own picture decoder (\"vae_decoder\": \"strata\" in the "
+                         "images settings), which needs the CUDA (NVIDIA) or ROCm (AMD) build of the image program; this "
+                         "one was built for vulkan. Set \"vae_decoder\" to \"sdcpp\" in the images settings.")
+
+    JOB = {"prompt": "a sloth", "width": 1024, "height": 768, "n": 1, "steps": 8, "seed": 42}
+    BASE = {"exe": "sd-cli", "diffusion_model": "dit.gguf", "vae": "vae.st", "llm": "te.gguf",
+            "args": ["--diffusion-fa", "--vae-tiling"]}
+
+    def test_off_leaves_the_command_line_alone(self):
+        for extra in ({}, {"vae_decoder": "sdcpp"}, {"vae_decoder": None}):
+            with self.subTest(extra=extra):
+                self.assertEqual(images_api.sd_cli_args({**self.BASE, **extra}, self.JOB, "o/img_%d.png", "o/prompt.txt"),
+                                 Command.CARD)
+
+    def test_on_is_one_model_args_string(self):
+        on = {**self.BASE, "vae_decoder": "strata"}
+        self.assertEqual(images_api.sd_cli_args(on, self.JOB, "o/img_%d.png", "o/prompt.txt"),
+                         Command.CARD + ["--model-args", "strata_vae=1"])
+        all3 = images_api.sd_cli_args({**on, "native": True, "noise": "strata"}, self.JOB, "o/img_%d.png", "o/prompt.txt")
+        self.assertEqual(all3, Command.CARD + ["--model-args", "qwen_image_2_1_native=1,strata_noise=1,strata_vae=1"])
+        self.assertEqual(all3.count("--model-args"), 1)
+
+    def test_value_is_checked(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = {"exe": "sd-cli", "diffusion_model": "d", "vae": "v", "llm": "l", "out_dir": d}
+            for ok in ("sdcpp", "strata"):
+                images_api.ImageGen({**cfg, "vae_decoder": ok})
+            for bad in ("on", "", "Strata", True, 1):
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    images_api.ImageGen({**cfg, "vae_decoder": bad})
+
+    def gen(self, d, build=None, backend="cuda"):
+        cfg = image_cfg(d, vae_decoder="strata", backend=backend)
+        exe = Path(d) / "engine-image" / "sd-cli"
+        exe.parent.mkdir(exist_ok=True)
+        exe.write_bytes(b"x")
+        cfg["exe"] = str(exe)
+        if build is not None:
+            (exe.parent / "BUILD.json").write_text(build if isinstance(build, str) else json.dumps(build))
+        return images_api.ImageGen(cfg)
+
+    def test_problem_by_build_json_and_backend(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(self.gen(d).vae_problem(), images_api.VAE_MISSING)            # no BUILD.json
+        for build in ({"sd_cpp": "x", "backend": "cuda"}, {"vae_decoder": ""}, "not json", "[1]", "{",
+                      {"noise": "0123456789abcdef"}):
+            with self.subTest(build=build), tempfile.TemporaryDirectory() as d:
+                self.assertEqual(self.gen(d, build).vae_problem(), images_api.VAE_MISSING)
+        for backend in ("cuda", "hip"):
+            with tempfile.TemporaryDirectory() as d:
+                self.assertIsNone(self.gen(d, {"vae_decoder": "0123456789abcdef"}, backend).vae_problem())
+        for backend in ("vulkan", "cpu", "metal", None):
+            with self.subTest(backend=backend), tempfile.TemporaryDirectory() as d:
+                said = self.gen(d, {"vae_decoder": "0123456789abcdef"}, backend).vae_problem()
+                self.assertEqual(said, images_api.VAE_BACKEND.format(backend=backend or "another backend"))
+                self.assertIn(f"this one was built for {backend or 'another backend'}.", said)
+
+    def test_switch_off_asks_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            for extra in ({}, {"vae_decoder": "sdcpp"}):
+                self.assertIsNone(images_api.ImageGen({**image_cfg(d), **extra}).vae_problem())
+
+    def test_a_job_is_refused_before_sd_cli_starts(self):
+        with tempfile.TemporaryDirectory() as d:
+            g = self.gen(d)
+            job = images_api.parse_request({"prompt": "a cat"}, {})
+            before = sorted(p.name for p in g.dir.iterdir())
+            with mock.patch("serve.lifeline.popen") as popen, self.assertRaises(images_api.ImageJobFailed) as cm:
+                g.run(job)
+            popen.assert_not_called()
+            self.assertEqual(str(cm.exception), images_api.VAE_MISSING)
+            self.assertEqual(sorted(p.name for p in g.dir.iterdir()), before)
+            self.assertEqual(g.totals["failed"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
