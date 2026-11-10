@@ -17,8 +17,30 @@ argmax is not the forced token.  Nothing here depends on a drafter; it serves an
         the two rules of the paper against the stock arms (>= 2 stock arms: the noise): exit 0 pass, 1 reject, 2 inconclusive
   force_check.py selftest      the statistics on synthetic rows (no engine)
 
+  THE GATE FOR A CHANGE OF THE PROMPT ARITHMETIC (a prompt kernel, an expert format's prompt path; owner 11-10), a neutral writer:
+  force_check.py cut   IDS.txt CORPUS.jsonl [--sizes 4096,8192,20000] [--n 16]
+        prompt cuts of one long id file (N windows per size at fixed offsets) -> a corpus
+  force_check.py gen-neutral SET.json --corpus CORPUS.jsonl --writer /path/llama-server --writer-model SHARD1.gguf [--writer-args "-ngl 99 --cpu-moe"]
+                             [--writer-lib DIR ...] [--per-kind 16] [--new 128]
+        the continuations written by a program that is NEITHER arm: llama.cpp's llama-server on the same GGUF, greedy, the prompt passed as token ids
+        (the ids `score` feeds the engine), the generated ids read back (return_tokens) -> SET.json marked "writer": "neutral"
+  force_check.py gate  CFG SET.json OUTDIR --cand-env K=V [--cand-env ...] [--env K=V ...] [--arg "..."]
+        scores the neutral set through stock twice (stockA, stockB) and the candidate twice (candA, candB), --path decode, then:
+        PASS = each candidate arm against the two stock arms PASSES the rate rule and the event rule (check below); REJECT if any arm is rejected;
+        otherwise INCONCLUSIVE.  The reversed direction (each stock arm against the candidate arms) is reported in gate.json, not required.
+        Exit 0 pass, 1 reject, 2 inconclusive.  Size: 48 prompts (16 each at 4K / 8K / 20K) x 128 tokens = ~6,000 scored tokens an arm.
+        Why (11-10, UD-IQ4_XS-v31 on an R9700 and an RTX A6000, IQ3_XXS on the R9700): with the STOCK engine writing the text, the
+        rule measures the distance from the writer, not quality: (1) the FP16 prompt path, the reference of the KL gates, failed it on stock's
+        text by more than the kernel under test (+1.66 points, 90% CI [+1.17, +2.15], against the kernel's +1.14 [+0.62, +1.69], 12 prompts);
+        (2) with the CANDIDATE writing the text the stock engine failed by the same margin (+1.69 [+0.52, +2.93] and +1.56, REJECT, while the
+        candidate passed against stock); (3) with llama.cpp writing, the candidate passed in every pairing (R9700 v31 -0.39 [-0.85, +0.07] and
+        -0.33; R9700 IQ3_XXS -0.16 [-0.75, +0.42] twice; A6000 v31 48 prompts +0.21 [-0.05, +0.49] and +0.16), stock vs candidate reversed
+        PASS or INCONCLUSIVE.  Stock A and stock B are never byte-identical through the decode windows.
+  The stock-written form (gen with the stock engine, score, check) stays as a DIAGNOSTIC: it measures how far a candidate's arithmetic is
+  from the engine that wrote the text, and is not the gate for prompt-arithmetic changes.
+
 An "arm" = one scored TSV.  Which engine produced the continuation and which scored it is the caller's choice:
-  - a change of the scorer (a different expert format, kernel, KV type): same SET.json, `score` with the candidate build/flags;
+  - a change of the prompt arithmetic (a prompt kernel, an expert format's prompt path): `gate` on a `gen-neutral` set (above);
   - a change of the decode path (tree verify, a drafter): `gen` with the candidate, `score` with the STOCK scorer (the paper's way).
 Stock arms = the same procedure with the stock build, at least twice (a second `gen`, or a second `score`).
 
@@ -343,6 +365,126 @@ def cmd_selftest(a):
     return 0
 
 
+# ------------------------------------------------------------------------------------------------ the neutral writer (the gate, owner 11-10)
+def cmd_cut(a):
+    """prompt cuts of one long id file (comma-separated token ids): N windows of each size at fixed offsets (the cuts kl_ab.py and the
+    11-10 gate runs used: offset = (i * 7919 + size) mod (len - size - 1)) -> a corpus for gen / gen-neutral"""
+    big = [int(x) for x in open(a.ids).read().strip().split(",") if x.strip()]
+    n = 0
+    with open(a.out, "w") as f:
+        for size in [int(s) for s in a.sizes.split(",") if s]:
+            if size >= len(big):
+                raise SystemExit("cut: the id file has %d ids, a cut of %d does not fit" % (len(big), size))
+            for i in range(a.n):
+                off = (i * 7919 + size) % max(1, len(big) - size - 1)
+                f.write(json.dumps({"id": "p%d-%d" % (size, i), "kind": "p%d" % size, "split": "held", "ids": big[off: off + size]}) + "\n")
+                n += 1
+    print("cut: %d prompts -> %s" % (n, a.out))
+    return 0
+
+
+def http_json(url, obj=None, timeout=60.0):
+    import urllib.request
+    data = None if obj is None else json.dumps(obj).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"} if data else {})
+    return json.loads(urllib.request.urlopen(req, timeout=timeout).read())
+
+
+def cmd_gen_neutral(a):
+    """greedy continuations written by a NEUTRAL program (neither arm): llama.cpp's llama-server on the same GGUF.  The prompt goes in as token
+    ids (the ids `score` feeds the engine), temperature 0 / top_k 1, no prompt cache, the generated ids back with return_tokens."""
+    import shlex, time
+    rows = [json.loads(l) for l in open(a.corpus) if l.strip()]
+    rows = [r for r in rows if r.get("split", "held") == "held"]
+    kinds = a.kinds.split(",") if a.kinds else sorted({r["kind"] for r in rows})
+    sel = []
+    for k in kinds:
+        sel += [r for r in rows if r["kind"] == k][a.offset:a.offset + a.per_kind]
+    def split(s):   # (Windows: shlex's non-POSIX mode keeps the quotes around a token)
+        return [x[1:-1] if len(x) > 1 and x[0] == x[-1] == '"' else x for x in shlex.split(s, posix=os.name != "nt")]
+    cmd = split(a.writer) + ["-m", a.writer_model, "--port", str(a.writer_port), "--host", "127.0.0.1",
+                             "-c", str(a.writer_ctx), "-np", "1"] + split(a.writer_args or "")
+    env = dict(os.environ)
+    env.update(kv_env(a.writer_env))
+    if a.writer_lib:
+        k = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
+        env[k] = os.pathsep.join(a.writer_lib + [env.get(k, "")])
+    log = open(a.out + ".writer.log", "w")
+    log.write("# " + " ".join(cmd) + "\n")
+    log.flush()
+    kw = {"creationflags": 0x00000200} if os.name == "nt" else {"start_new_session": True}
+    p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=env, **kw)
+    url = "http://127.0.0.1:%d" % a.writer_port
+    items = []
+    try:
+        t0 = time.time()
+        while True:
+            if p.poll() is not None:
+                raise SystemExit("gen-neutral: the writer ended before it was ready, see %s.writer.log" % a.out)
+            try:
+                if http_json(url + "/health", timeout=5).get("status") == "ok":
+                    break
+            except Exception:
+                pass
+            if time.time() - t0 > a.writer_wait:
+                raise SystemExit("gen-neutral: the writer was not ready after %d s" % a.writer_wait)
+            time.sleep(1.0)
+        for r in sel:
+            res = http_json(url + "/completion", {"prompt": r["ids"], "n_predict": a.new, "temperature": 0.0, "top_k": 1, "cache_prompt": False,
+                                                  "return_tokens": True, "stream": False}, timeout=3600)
+            toks = [int(x) for x in res.get("tokens", [])]
+            if not toks:
+                raise SystemExit("gen-neutral: %s: the writer returned no token ids (a llama-server without return_tokens?)" % r["id"])
+            items.append({"id": r["id"], "kind": r["kind"], "prompt": r["ids"], "cont": toks})
+            print("%s: %d prompt, %d forced tokens (writer)" % (r["id"], len(r["ids"]), len(toks)), flush=True)
+    finally:
+        try:
+            if os.name == "nt":
+                p.terminate()
+            else:
+                os.killpg(p.pid, signal.SIGTERM)
+            p.wait(timeout=60)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        log.close()
+    json.dump({"config": "writer: " + " ".join(cmd), "writer": "neutral", "env": [], "items": items}, open(a.out, "w"))
+    return 0
+
+
+def gate_report(stock, cand, delta=None):
+    """stock, cand: two (or more) scored arms each, on a NEUTRAL writer's text.  The gate: every candidate arm against the stock arms (check());
+    REJECT if any is REJECT, PASS if all PASS, else INCONCLUSIVE.  The reversed direction (every stock arm against the candidate arms) is
+    reported beside it, not required."""
+    fwd = [check(stock, c, delta) for c in cand]
+    rev = [check(cand, s, delta) for s in stock]
+    vs = [r["verdict"] for r in fwd]
+    verdict = "REJECT" if "REJECT" in vs else ("PASS" if all(v == "PASS" for v in vs) else "INCONCLUSIVE")
+    return {"verdict": verdict, "cand_vs_stock": fwd, "stock_vs_cand_reported": rev}
+
+
+def cmd_gate(a):
+    st = json.load(open(a.set))
+    if st.get("writer") != "neutral" and not a.allow_engine_writer:
+        raise SystemExit("gate: %s was not written by gen-neutral; the gate needs a neutral writer's text (an engine-written set measures the "
+                         "distance from that engine: use score + check as a diagnostic, or --allow-engine-writer)" % a.set)
+    os.makedirs(a.outdir, exist_ok=True)
+    arms = {"stockA": a.env or [], "stockB": a.env or [], "candA": (a.env or []) + a.cand_env, "candB": (a.env or []) + a.cand_env}
+    for name, env in arms.items():
+        out = os.path.join(a.outdir, name + ".tsv")
+        if os.path.exists(out) and os.path.exists(out + ".meta.json"):
+            print("%s: kept (%s exists)" % (name, out), flush=True)
+            continue
+        cmd_score(argparse.Namespace(config=a.config, set=a.set, out=out, path=a.path, env=env, arg=a.arg, min_free_gb=a.min_free_gb))
+    load = lambda n: load_arm(os.path.join(a.outdir, n + ".tsv"))
+    r = gate_report([load("stockA"), load("stockB")], [load("candA"), load("candB")], a.delta)
+    print(json.dumps(r, indent=1))
+    json.dump(r, open(os.path.join(a.outdir, "gate.json"), "w"), indent=1)
+    return {"PASS": 0, "REJECT": 1, "INCONCLUSIVE": 2}[r["verdict"]]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -355,8 +497,25 @@ def main():
     c = sp.add_parser("check"); c.add_argument("--stock", nargs="+", required=True); c.add_argument("--cand", required=True)
     c.add_argument("--delta", type=float); c.add_argument("--json")
     sp.add_parser("selftest")
+    u = sp.add_parser("cut"); u.add_argument("ids"); u.add_argument("out"); u.add_argument("--sizes", default="4096,8192,20000")
+    u.add_argument("--n", type=int, default=16)
+    w = sp.add_parser("gen-neutral"); w.add_argument("out"); w.add_argument("--corpus", required=True)
+    w.add_argument("--writer", required=True, help="the writer's command line, e.g. /path/llama-server (its -m/--port/--host/-c/-np are added)")
+    w.add_argument("--writer-model", required=True, help="the GGUF the engine reads (shard 1 of a split set)")
+    w.add_argument("--writer-args", default="", help="more writer arguments, e.g. \"-ngl 99 --cpu-moe -fa on\"")
+    w.add_argument("--writer-env", action="append"); w.add_argument("--writer-lib", action="append", default=[])
+    w.add_argument("--writer-port", type=int, default=18471); w.add_argument("--writer-ctx", type=int, default=32768)
+    w.add_argument("--writer-wait", type=int, default=900)
+    w.add_argument("--kinds", default=""); w.add_argument("--per-kind", type=int, default=16); w.add_argument("--offset", type=int, default=0)
+    w.add_argument("--new", type=int, default=128)
+    t = sp.add_parser("gate"); t.add_argument("config"); t.add_argument("set"); t.add_argument("outdir")
+    t.add_argument("--cand-env", action="append", required=True, help="the candidate's setting(s), K=V")
+    t.add_argument("--env", action="append", help="settings of both arms"); t.add_argument("--arg", action="append")
+    t.add_argument("--path", choices=["decode", "prompt"], default="decode"); t.add_argument("--delta", type=float)
+    t.add_argument("--min-free-gb", type=int, default=20); t.add_argument("--allow-engine-writer", action="store_true")
     a = ap.parse_args()
-    return {"gen": cmd_gen, "score": cmd_score, "check": cmd_check, "selftest": cmd_selftest}[a.cmd](a)
+    return {"gen": cmd_gen, "score": cmd_score, "check": cmd_check, "selftest": cmd_selftest, "cut": cmd_cut, "gen-neutral": cmd_gen_neutral,
+            "gate": cmd_gate}[a.cmd](a)
 
 
 if __name__ == "__main__":
