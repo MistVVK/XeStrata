@@ -2,6 +2,7 @@
 #include "card_check.hpp"
 #include "env.hpp"
 #include "expert_residency.hpp"
+#include "memlock.hpp"
 #include "rope_gguf.hpp"
 
 #include "store.hpp"
@@ -198,43 +199,25 @@ const float* f32_data(const Tensor& t, size_t n) {
     return (const float*) t.data;
 }
 
-// a tensor's range of the mapping locked, LOCKERS threads each faulting in a part: one thread faults a cold file in
-// readahead-sized pieces (1.1 GB/s from the NVMe), 16 side by side reached 2.3 (tools/stage_test.cpp)
-void lock_in_ram(const Tensor& t) {
-    constexpr int LOCKERS = 16;
-    constexpr uintptr_t PG = 4096;
-    const uintptr_t a = (uintptr_t) t.data / PG * PG, e = (uintptr_t) t.data + t.nbytes;
-    const uintptr_t part = ((e - a) / LOCKERS + PG - 1) / PG * PG;
-    std::vector<int> err(LOCKERS, 0);
-    std::vector<std::thread> th;
-    for (int i = 0; i < LOCKERS; ++i)
-        th.emplace_back([&, i] {
-            const uintptr_t lo = std::min(e, a + (uintptr_t) i * part), hi = std::min(e, lo + part);
-            if (hi > lo && mlock((const void*) lo, hi - lo) != 0) {
-                err[(size_t) i] = errno;
-#if FNX_HIP
-                // HIP build: a user's RLIMIT_MEMLOCK is often 8 MiB and cannot be raised without root. The table then stays in the page
-                // cache unlocked (it is a file mapping: an evicted page is read again); the 16 threads still fault it in side by side
-                volatile unsigned char sink = 0;
-                for (uintptr_t p = lo; p < hi; p += PG) sink = sink + *(const volatile unsigned char*) p;
-                (void) sink;
-#endif
-            }
-        });
-    for (auto& x : th) x.join();
-#if FNX_HIP
-    for (int en : err)
-        if (en) {
-            std::fprintf(stderr, "fnx: mlock of %s (%zu MiB) failed: %s; the table stays unlocked in the page cache (raise RLIMIT_MEMLOCK to lock it)\n",
-                         t.name.c_str(), (size_t) (t.nbytes >> 20), std::strerror(en));
-            break;
-        }
-    return;
-#endif
-    for (int en : err)
-        if (en)
-            throw std::runtime_error("fnx: mlock of " + t.name + " (" + std::to_string(t.nbytes >> 20) + " MiB) failed: " + std::strerror(en) +
-                                     "; run with RLIMIT_MEMLOCK raised (systemd-run -p LimitMEMLOCK=infinity)");
+// The host-read tables locked in RAM as far as this machine lets the engine (memlock.hpp): the memory-lock limit raised as far as the hard limit allows, the free RAM
+// respected, the parts locked in the order given, the rest read into memory by the same 16 threads. Never a failed start because of the lock. Returns the one log
+// line (empty when everything is locked); it is printed here too.
+std::string lock_tables(const std::vector<const Tensor*>& ts) {
+    std::vector<LockPart> parts;
+    uint64_t want = 0;
+    for (const Tensor* t : ts) {
+        LockPart p;
+        p.name = t->name.c_str();
+        p.data = t->data;
+        p.nbytes = t->nbytes;
+        parts.push_back(p);
+        want += lock_page_ceil(t->nbytes) + kLockPage;
+    }
+    const LockEnv env = read_lock_env(want);
+    const LockOutcome out = lock_parts(parts, env);
+    const std::string line = lock_line(parts, out);
+    if (!line.empty()) std::fprintf(stderr, "%s\n", line.c_str());
+    return line;
 }
 
 // the stager's groups for load_card: group l every tensor of layer l, group NL the output head's. The head is read
@@ -1314,8 +1297,8 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
         throw std::runtime_error("27b: output.weight is not [" + std::to_string(N) + "][" + std::to_string(vocab) + "] (token_embd's vocabulary)");
     {   // the host gathers its rows every window: a row read from the disk costs milliseconds, so keep it in RAM
         const auto t0 = std::chrono::steady_clock::now();
-        lock_in_ram(*tok_embd);
-        std::fprintf(stderr, "27b: %s (%.1f GB) locked in RAM in %.1f s\n", tok_embd->name.c_str(), tok_embd->nbytes / 1e9,
+        const bool all = lock_tables({tok_embd}).empty();
+        std::fprintf(stderr, "27b: %s (%.1f GB) %s in RAM in %.1f s\n", tok_embd->name.c_str(), tok_embd->nbytes / 1e9, all ? "locked" : "read",
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
 #else
@@ -1327,9 +1310,12 @@ Model::Model(const std::string& path, Load how, Store* store, const std::string*
     // the host gathers rows of these two every window: a row read from the disk costs milliseconds, so keep them in RAM
     {
         const auto t0 = std::chrono::steady_clock::now();
-        for (const Tensor* t : {tok_embd, ple_table}) lock_in_ram(*t);
-        std::fprintf(stderr, "fnx: %s and %s (%.1f GB) locked in RAM in %.1f s\n", tok_embd->name.c_str(), ple_table->name.c_str(),
-                     (tok_embd->nbytes + ple_table->nbytes) / 1e9, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        // the PLE table first: the host reads about 24 scattered rows of it a token against one row of the token embedding, so when only part fits it is the part
+        // that matters (measured on 2x A6000: with the unlocked pages dropped, locking the token embedding alone left prompts at 160 tokens/s, 4K, against 2,996 locked)
+        const bool all = lock_tables({ple_table, tok_embd}).empty();
+        std::fprintf(stderr, "fnx: %s and %s (%.1f GB) %s in RAM in %.1f s\n", tok_embd->name.c_str(), ple_table->name.c_str(),
+                     (tok_embd->nbytes + ple_table->nbytes) / 1e9, all ? "locked" : "read",
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     }
     for (int64_t v : g.ia(p + "ple.layer_multipliers")) ple_mult.push_back((uint64_t) v);
     for (int64_t v : g.ia(p + "ple.head_offsets")) ple_off.push_back((uint64_t) v);
