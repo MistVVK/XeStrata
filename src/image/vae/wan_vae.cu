@@ -14,6 +14,7 @@
 // VAE (it does not use flash attention there).
 #include "strata/image/wan_vae.hpp"
 
+#include "convert.hpp"
 #include "safetensors_lite.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -27,6 +28,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -259,6 +261,7 @@ struct WanVae {
     bool range_on = false;      // test-only range statistics (wan_vae_set_range_stats)
     unsigned int* range_dev = nullptr;
     std::map<std::string, std::vector<unsigned long long>> range;   // per conv: exponent bins, zeros, max bits, shift
+    double open_ms[4] = {0, 0, 0, 0};                      // read, device setup, convert, upload (wan_vae_open_report)
     int band_rows = 0;          // 0: STREAM_ROWS; other heights only for the identity test (wan_vae_set_band_rows)
     int stream_mode = 1;        // 1 the row-band tail (always, coordinator 11-10); 0 the one-pass reference (tests)
 };
@@ -268,37 +271,92 @@ namespace {
 const int UP_FT[5] = {2, 2, 2, 1, 1};          // DupUp3D temporal factor (temperal_upsample {T, T, T, F})
 const bool UP_HAS[5] = {true, true, true, true, false};
 
-std::string upload(WanVae* v, const void* host, size_t n, void** dev) {
-    VAE_CUDA(cudaMalloc(dev, n));
-    v->weights.push_back(*dev);
-    v->weight_bytes += n;
-    VAE_CUDA(cudaMemcpy(*dev, host, n, cudaMemcpyHostToDevice));
-    return "";
-}
+// Opening: the file's data section is read once (in parallel parts), every weight is converted straight from it into
+// one host staging buffer (a list of jobs split over the image program's threads), and the buffer goes to the device
+// in ONE allocation and ONE copy.  The conversions are the per-value ones of convert.hpp: the same bytes for any
+// thread count (tools/image/gate/test_vae_convert.py).
+struct Job {
+    size_t src = 0, dst = 0, n = 0;   // byte offset in the data section, byte offset in the staging buffer, values
+    int kind = 0;                     // 0: conv weight bf16 -> f16 [oc][taps*ic]; 1: bf16 -> f32; 2: f32 copy
+    int oc = 0, ic = 0, taps = 0;
+    void** slot = nullptr;            // the device pointer to fill in
+};
 
 struct Loader {
     std::string path;
     StFile file;
-    std::string floats(const std::string& name, std::vector<float>& out, std::vector<int64_t>* shape = nullptr) {
+    std::unique_ptr<unsigned char[]> data;   // the data section
+    size_t data_size = 0;
+    int threads = 1;
+    std::vector<Job> jobs;
+    size_t staging = 0;               // bytes of the staging buffer so far
+    std::string plan(const std::string& name, int kind, const std::vector<int64_t>& want_dims_or_empty,
+                     std::vector<int64_t>& shape, void** slot) {
         auto it = file.tensors.find(name);
         if (it == file.tensors.end()) return "wan_vae: tensor " + name + " missing in " + path;
-        std::vector<unsigned char> raw;
-        VAE_TRY(st_read_tensor(path, file, it->second, raw));
         const auto& t = it->second;
         size_t n = 1;
         for (auto s : t.shape) n *= (size_t) s;
-        out.resize(n);
-        if (t.dtype == "BF16" && raw.size() == n * 2) {
-            for (size_t i = 0; i < n; ++i) out[i] = strata::kernels::f32_from_bf16((uint16_t) (raw[2 * i] | (raw[2 * i + 1] << 8)));
-        } else if (t.dtype == "F32" && raw.size() == n * 4) {
-            std::memcpy(out.data(), raw.data(), n * 4);
-        } else {
-            return "wan_vae: tensor " + name + " has dtype " + t.dtype + " (bf16 or f32 expected)";
-        }
-        if (shape) *shape = t.shape;
+        const bool bf16 = t.dtype == "BF16" && t.end - t.begin == n * 2;
+        const bool f32 = t.dtype == "F32" && t.end - t.begin == n * 4;
+        if (!bf16 && !(f32 && kind != 0))
+            return "wan_vae: tensor " + name + " has dtype " + t.dtype + (kind == 0 ? " (bf16 expected)" : " (bf16 or f32 expected)");
+        if (t.end > data_size) return "wan_vae: tensor " + name + " lies past the end of " + path;
+        (void) want_dims_or_empty;
+        shape = t.shape;
+        Job j;
+        j.src = t.begin;
+        j.n = n;
+        j.kind = kind == 0 ? 0 : (bf16 ? 1 : 2);
+        j.dst = (staging + 255) & ~(size_t) 255;
+        staging = j.dst + n * (kind == 0 ? 2 : 4);
+        j.slot = slot;
+        jobs.push_back(j);
         return "";
     }
 };
+
+// Run the conversion jobs into a staging buffer and upload it in one copy; fills every job's slot.
+std::string convert_and_upload(WanVae* v, Loader& L, double* convert_ms, double* upload_ms) {
+    using clk = std::chrono::steady_clock;
+    const auto t0 = clk::now();
+    std::unique_ptr<unsigned char[]> stage(new unsigned char[L.staging]);   // not zero-filled: every byte is written
+    // work items: a conv weight in parts of rows, the small vectors whole
+    struct Item { size_t job, b, e; };
+    std::vector<Item> items;
+    for (size_t k = 0; k < L.jobs.size(); ++k) {
+        const Job& j = L.jobs[k];
+        if (j.kind == 0) {
+            const size_t rows_per = std::max<size_t>(1, (size_t) 65536 / ((size_t) j.ic * j.taps));
+            for (size_t b = 0; b < (size_t) j.oc; b += rows_per) items.push_back({k, b, std::min<size_t>(j.oc, b + rows_per)});
+        } else {
+            items.push_back({k, 0, j.n});
+        }
+    }
+    const unsigned char* data = L.data.get();
+    parallel_ranges(items.size(), L.threads, [&](size_t ib, size_t ie) {
+        for (size_t it = ib; it < ie; ++it) {
+            const Job& j = L.jobs[items[it].job];
+            if (j.kind == 0)
+                bf16_conv_to_f16_rows(data + j.src, j.ic, j.taps, items[it].b, items[it].e, (uint16_t*) (stage.get() + j.dst));
+            else if (j.kind == 1)
+                bf16_to_f32_range(data + j.src, 0, j.n, (float*) (stage.get() + j.dst));
+            else
+                std::memcpy(stage.get() + j.dst, data + j.src, j.n * 4);
+        }
+    });
+    const auto t1 = clk::now();
+    void* d = nullptr;
+    VAE_CUDA(cudaMalloc(&d, L.staging));
+    v->weights.push_back(d);
+    v->weight_bytes += L.staging;
+    VAE_CUDA(cudaMemcpy(d, stage.get(), L.staging, cudaMemcpyHostToDevice));
+    for (const Job& j : L.jobs) *j.slot = (char*) d + j.dst;
+    const auto t2 = clk::now();
+    *convert_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    *upload_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
+    return "";
+}
 
 // The fixed operand shift of each convolution (input x 2^-shift -> f16; output x 2^shift, both exact): stable-
 // diffusion.cpp's 2^-7 everywhere, except the layers listed here.  Fixed per layer, never from the picture's data (a
@@ -315,38 +373,32 @@ int conv_shift(const std::string& name) {
 }
 
 std::string load_conv(WanVae* v, Loader& L, const std::string& name, Conv& cv) {
-    std::vector<float> w, b;
-    std::vector<int64_t> sh;
-    VAE_TRY(L.floats(name + ".weight", w, &sh));
-    VAE_TRY(L.floats(name + ".bias", b));
-    if (sh.size() != 4 || sh[2] != sh[3] || (sh[2] != 1 && sh[2] != 3) || (int64_t) b.size() != sh[0] || sh[1] % 8 != 0)
+    (void) v;
+    std::vector<int64_t> sh, bs;
+    VAE_TRY(L.plan(name + ".weight", 0, {}, sh, (void**) &cv.w));
+    VAE_TRY(L.plan(name + ".bias", 1, {}, bs, (void**) &cv.b));
+    if (sh.size() != 4 || sh[2] != sh[3] || (sh[2] != 1 && sh[2] != 3) || bs.size() != 1 || bs[0] != sh[0] ||
+        sh[1] % 8 != 0)
         return "wan_vae: " + name + ": unexpected shape";
     cv.oc = (int) sh[0];
     cv.name = name;
     cv.shift = conv_shift(name);
     cv.ic = (int) sh[1];
     cv.k = (int) sh[2];
-    const int taps = cv.k * cv.k, K = taps * cv.ic;
-    std::vector<uint16_t> h((size_t) cv.oc * K);   // [oc][(ky*k+kx)*ic + ic], bf16 -> f16 round to nearest even
-    for (int o = 0; o < cv.oc; ++o)
-        for (int i = 0; i < cv.ic; ++i)
-            for (int t = 0; t < taps; ++t)
-                h[(size_t) o * K + (size_t) t * cv.ic + i] = strata::kernels::f16_from_f32(w[((size_t) o * cv.ic + i) * taps + t]);
-    void* d = nullptr;
-    VAE_TRY(upload(v, h.data(), h.size() * 2, &d));
-    cv.w = (uint16_t*) d;
-    VAE_TRY(upload(v, b.data(), b.size() * 4, &d));
-    cv.b = (float*) d;
+    Job& wj = L.jobs[L.jobs.size() - 2];
+    wj.oc = cv.oc;
+    wj.ic = cv.ic;
+    wj.taps = cv.k * cv.k;
     return "";
 }
 
 std::string load_norm(WanVae* v, Loader& L, const std::string& name, Norm& n) {
-    std::vector<float> g;
-    VAE_TRY(L.floats(name + ".gamma", g));
-    n.c = (int) g.size();
-    void* d = nullptr;
-    VAE_TRY(upload(v, g.data(), g.size() * 4, &d));
-    n.g = (float*) d;
+    (void) v;
+    std::vector<int64_t> sh;
+    VAE_TRY(L.plan(name + ".gamma", 1, {}, sh, (void**) &n.g));
+    size_t c = 1;
+    for (auto s2 : sh) c *= (size_t) s2;
+    n.c = (int) c;
     return "";
 }
 
@@ -602,14 +654,21 @@ std::string decode_impl(WanVae* v, const float* latent, int h, int w, float* out
     return "";
 }
 
-std::string open_impl(WanVae* v, const std::string& path) {
+std::string open_impl(WanVae* v, const std::string& path, int threads) {
     Loader L;
     L.path = path;
+    L.threads = threads;
+    using clk = std::chrono::steady_clock;
+    auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    const auto t0 = clk::now();
     VAE_TRY(st_read_header(path, L.file));
+    VAE_TRY(st_read_all_parallel(path, L.file, L.data, L.data_size, threads));
+    const auto t1 = clk::now();
     VAE_CUDA(cudaSetDevice(v->device));
     VAE_CUDA(cudaStreamCreateWithFlags(&v->stream, cudaStreamNonBlocking));
     VAE_BLAS(cublasCreate(&v->blas));
     VAE_BLAS(cublasSetStream(v->blas, v->stream));
+    const auto t2 = clk::now();
     VAE_TRY(load_conv(v, L, "post_quant_conv", v->post_quant));
     VAE_TRY(load_conv(v, L, "decoder.conv_in", v->conv_in));
     VAE_TRY(load_resnet(v, L, "decoder.mid_block.resnets.0", v->mid0));
@@ -624,6 +683,9 @@ std::string open_impl(WanVae* v, const std::string& path) {
     }
     VAE_TRY(load_norm(v, L, "decoder.norm_out", v->norm_out));
     VAE_TRY(load_conv(v, L, "decoder.conv_out", v->conv_out));
+    VAE_TRY(convert_and_upload(v, L, &v->open_ms[2], &v->open_ms[3]));
+    v->open_ms[0] = ms(t0, t1);
+    v->open_ms[1] = ms(t1, t2);
     if (v->post_quant.ic != Z_DIM || v->conv_in.ic != Z_DIM || v->conv_out.oc != 4)
         return "wan_vae: " + path + " is not a Qwen-Image-2.1 VAE (latent channels / output channels differ)";
     // the work buffers: the largest K and OC of any layer
@@ -648,13 +710,13 @@ std::string open_impl(WanVae* v, const std::string& path) {
 
 }  // namespace
 
-WanVae* wan_vae_open(const std::string& path, int device, std::string* err) {
+WanVae* wan_vae_open(const std::string& path, int device, std::string* err, int threads) {
     auto* v = new WanVae();
     if (device < 0) {
         if (cudaGetDevice(&device) != cudaSuccess) device = 0;
     }
     v->device = device;
-    std::string r = open_impl(v, path);
+    std::string r = open_impl(v, path, threads);
     if (!r.empty()) {
         if (err) *err = r;
         wan_vae_close(v);
@@ -700,6 +762,14 @@ void wan_vae_denormalize(float* latent, int h, int w) {
 
 void wan_vae_set_streaming(WanVae* v, bool on) {
     if (v) v->stream_mode = on ? 1 : 0;
+}
+
+std::string wan_vae_open_report(WanVae* v) {
+    if (!v) return "";
+    char line[200];
+    std::snprintf(line, sizeof(line), "read %.1f ms, device setup %.1f ms, convert %.1f ms, upload %.1f ms",
+                  v->open_ms[0], v->open_ms[1], v->open_ms[2], v->open_ms[3]);
+    return line;
 }
 
 void wan_vae_set_band_rows(WanVae* v, int rows) {

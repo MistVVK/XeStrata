@@ -24,8 +24,9 @@ struct WanVaeStats {
 };
 
 // Read the decoder of a Qwen-Image-2.1 VAE file (.safetensors, bf16) to the current device of `device` (-1: the
-// current device).  nullptr and *err on failure.
-WanVae* wan_vae_open(const std::string& path, int device, std::string* err);
+// current device).  nullptr and *err on failure.  threads: for reading and converting the weights (the image
+// program's own thread setting, not all cores; the result is the same bytes for any count).
+WanVae* wan_vae_open(const std::string& path, int device, std::string* err, int threads = 1);
 
 // latent: the VAE-space latent (after sd.cpp's diffusion_to_vae_latents), planar [64][h][w] floats on the host.
 // out: planar [4][16h][16w] floats on the host (RGBA in about [-1, 1], before sd.cpp's 0-1 scaling).
@@ -40,6 +41,9 @@ void wan_vae_denormalize(float* latent, int h, int w);
 // one-pass decode in less device memory.  ON for every card (coordinator 11-10: one path for small and big cards);
 // off only for the one-pass reference that the byte-identity test compares against.
 void wan_vae_set_streaming(WanVae* vae, bool on);
+
+// Where the open time went: "read .. ms, device setup .. ms, convert .. ms, upload .. ms".
+std::string wan_vae_open_report(WanVae* vae);
 
 // Test hook: the row bands `rows` picture rows high instead of the default (0 = default).  The picture must not
 // change with it (tools/image/gate/vae_identity.py checks two other heights against the one-pass decode).

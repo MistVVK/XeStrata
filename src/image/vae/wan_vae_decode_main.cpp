@@ -1,12 +1,13 @@
 // src/image/vae/wan_vae_decode_main.cpp - test program for Strata's VAE decoder (OWN-5 gate harness).
 //
-//   strata-vae-decode <vae.safetensors> <latent.bin> <out.f32> [--dump DIR] [--repeat N] [--device D] [--stream on|off] [--band-rows N] [--stats FILE]
+//   strata-vae-decode <vae.safetensors> <latent.bin> <out.f32> [--dump DIR] [--repeat N] [--device D] [--stream on|off] [--band-rows N] [--threads N] [--stats FILE]
 //
 // latent.bin: the diffusion-space latent as run_set.py --dump writes it (float32 planar [64][h][w], latent.shape beside
 // it says "w h 64 1"); it is denormalized like sd.cpp's decode_first_stage does, then decoded.  out.f32: float32
 // planar [4][16h][16w] (before sd.cpp's 0-1 scaling; tools/image/gate/vae_ref.py --png makes the picture).
 // --dump DIR writes every stage as DIR/<name>.f32 (pixel-major [H][W][C]) with DIR/<name>.shape "H W C".
 // --band-rows N: the row bands N picture rows high instead of the default (the identity test only).
+// --threads N: threads for reading and converting the weights at open (default 1).
 // --stats FILE: the operand range report of the decode (wan_vae_range_report) into FILE.
 // --stream off: the one-pass reference decode (the product always uses the row bands; same bytes, more memory).
 // --repeat N decodes N times and checks that every run gives the same bytes (run to run), printing each time.
@@ -38,7 +39,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     std::string vae = argv[1], lat = argv[2], outp = argv[3], dump_dir, stats_path;
-    int repeat = 1, device = -1, stream = 1, band_rows = 0;
+    int repeat = 1, device = -1, stream = 1, band_rows = 0, threads = 1;
     for (int i = 4; i + 1 < argc; i += 2) {
         if (!std::strcmp(argv[i], "--dump")) dump_dir = argv[i + 1];
         else if (!std::strcmp(argv[i], "--repeat")) repeat = std::atoi(argv[i + 1]);
@@ -46,6 +47,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--stream")) stream = !std::strcmp(argv[i + 1], "on");
         else if (!std::strcmp(argv[i], "--stats")) stats_path = argv[i + 1];
         else if (!std::strcmp(argv[i], "--band-rows")) band_rows = std::atoi(argv[i + 1]);
+        else if (!std::strcmp(argv[i], "--threads")) threads = std::atoi(argv[i + 1]);
     }
     std::string shp = lat.substr(0, lat.size() - 4) + ".shape";
     std::ifstream sf(shp);
@@ -62,12 +64,13 @@ int main(int argc, char** argv) {
     wan_vae_denormalize(latent.data(), h, w);
     std::string err;
     const auto t_open = std::chrono::steady_clock::now();
-    WanVae* v = wan_vae_open(vae, device, &err);
+    WanVae* v = wan_vae_open(vae, device, &err, threads);
     if (!v) {
         std::fprintf(stderr, "%s\n", err.c_str());
         return 3;
     }
-    std::printf("open %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_open).count());
+    std::printf("open %.1f ms (%s)\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_open).count(),
+                wan_vae_open_report(v).c_str());
     wan_vae_set_streaming(v, stream != 0);
     if (band_rows > 0) wan_vae_set_band_rows(v, band_rows);
     if (!stats_path.empty()) wan_vae_set_range_stats(v, true);

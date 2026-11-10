@@ -17,6 +17,7 @@ CXX = shutil.which("g++") or shutil.which("clang++")
 
 PROGRAM = r'''
 #include "safetensors_lite.hpp"
+#include <cstring>
 #include <cstdio>
 int main(int argc, char** argv) {
     strata::image::StFile f;
@@ -31,6 +32,17 @@ int main(int argc, char** argv) {
         std::printf(" |");
         for (auto c : b) std::printf(" %02x", c);
         std::printf("\n");
+    }
+    for (int th : {1, 3, 16}) {   // the whole data section in parallel parts: the same bytes as the tensor reads
+        std::unique_ptr<unsigned char[]> all;
+        size_t size = 0;
+        err = strata::image::st_read_all_parallel(argv[1], f, all, size, th);
+        if (!err.empty()) { std::printf("PARERR %s\n", err.c_str()); return 1; }
+        for (auto& kv : f.tensors) {
+            std::vector<unsigned char> b;
+            strata::image::st_read_tensor(argv[1], f, kv.second, b);
+            if (b.size() && std::memcmp(b.data(), all.get() + kv.second.begin, b.size()) != 0) { std::printf("PARDIFF\n"); return 1; }
+        }
     }
     return 0;
 }
@@ -50,7 +62,7 @@ class SafetensorsLite(unittest.TestCase):
         d = Path(cls.tmp.name)
         (d / "t.cpp").write_text(PROGRAM)
         cls.exe = d / "st_test"
-        subprocess.run([CXX, "-std=c++17", "-O1", "-I", str(ROOT / "src" / "image" / "vae"), str(d / "t.cpp"), "-o",
+        subprocess.run([CXX, "-std=c++17", "-O1", "-pthread", "-I", str(ROOT / "src" / "image" / "vae"), str(d / "t.cpp"), "-o",
                         str(cls.exe)], check=True)
 
     @classmethod

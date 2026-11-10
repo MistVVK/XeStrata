@@ -5,7 +5,7 @@ stable-diffusion.cpp's decoder unless it is started with --model-args strata_vae
     python tools/image/sdcpp_vae/apply.py third_party/stable-diffusion.cpp
 
 What it does:
-  * copies the decoder (src/image/vae/wan_vae.cu, safetensors_lite.hpp) and the headers it uses
+  * copies the decoder (src/image/vae/wan_vae.cu, safetensors_lite.hpp, convert.hpp) and the headers it uses
     (include/strata/image/wan_vae.hpp, include/strata/kernels/{f16,bf16}_bits.hpp, include/strata/hip_compat/*) into
     src/strata_vae/ of the checkout, unchanged;
   * CMakeLists.txt: a static library strata_vae of our own (CUDA or HIP language, its own flags: none of ggml's
@@ -28,6 +28,7 @@ MARK = "// strata: own VAE decoder"
 FILES = [
     ("src/image/vae/wan_vae.cu", "wan_vae.cu"),
     ("src/image/vae/safetensors_lite.hpp", "safetensors_lite.hpp"),
+    ("src/image/vae/convert.hpp", "convert.hpp"),
     ("include/strata/image/wan_vae.hpp", "include/strata/image/wan_vae.hpp"),
     ("include/strata/kernels/f16_bits.hpp", "include/strata/kernels/f16_bits.hpp"),
     ("include/strata/kernels/bf16_bits.hpp", "include/strata/kernels/bf16_bits.hpp"),
@@ -50,7 +51,8 @@ DECODE_NEW = """    auto latents                      = first_stage_model->diffu
         static bool strata_vae_failed            = false;
         std::string strata_err;
         if (strata_vae == nullptr && !strata_vae_failed) {
-            strata_vae        = strata::image::wan_vae_open(SAFE_STR(config_->params.vae_path), -1, &strata_err);
+            strata_vae        = strata::image::wan_vae_open(SAFE_STR(config_->params.vae_path), -1, &strata_err,
+                                                            n_threads);   // sd-cli's own thread setting
             strata_vae_failed = strata_vae == nullptr;
             if (strata_vae_failed) {
                 LOG_WARN("strata VAE decoder: %s; using stable-diffusion.cpp's decoder", strata_err.c_str());

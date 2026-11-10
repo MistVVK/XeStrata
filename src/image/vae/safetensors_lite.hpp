@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <map>
+#include <memory>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -135,6 +137,57 @@ inline std::string st_read_header(const std::string& path, StFile& out) {
         out.tensors[name] = t;
     } while (p.eat(','));
     if (!p.eat('}')) return "header: } expected at the end";
+    return "";
+}
+
+// Read the whole data section (one sequential read; the decoder converts from memory).
+inline std::string st_read_all(const std::string& path, const StFile& file, std::vector<unsigned char>& bytes) {
+    uint64_t end = 0;
+    for (const auto& kv : file.tensors) end = kv.second.end > end ? kv.second.end : end;
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return "cannot open " + path;
+    bytes.resize(end);
+#if defined(_WIN32)
+    int rc = _fseeki64(f, (long long) file.data_start, SEEK_SET);
+#else
+    int rc = fseeko(f, (off_t) file.data_start, SEEK_SET);
+#endif
+    size_t got = rc == 0 ? std::fread(bytes.data(), 1, bytes.size(), f) : 0;
+    std::fclose(f);
+    return got == bytes.size() ? "" : "short read in " + path;
+}
+
+// The same into a buffer that is not zero-filled first, read in `threads` parts at once (each part its own file
+// handle).  size = the data section's length.
+inline std::string st_read_all_parallel(const std::string& path, const StFile& file, std::unique_ptr<unsigned char[]>& buf,
+                                        size_t& size, int threads) {
+    uint64_t end = 0;
+    for (const auto& kv : file.tensors) end = kv.second.end > end ? kv.second.end : end;
+    size = (size_t) end;
+    buf.reset(new unsigned char[size ? size : 1]);
+    const int parts = threads < 1 ? 1 : (threads > 16 ? 16 : threads);
+    const size_t step = (size + parts - 1) / parts;
+    std::vector<std::string> errs((size_t) parts);
+    std::vector<std::thread> pool;
+    for (int p = 0; p < parts; ++p) {
+        pool.emplace_back([&, p]() {
+            const size_t b = (size_t) p * step, e = b + step < size ? b + step : size;
+            if (b >= e) return;
+            FILE* f = std::fopen(path.c_str(), "rb");
+            if (!f) { errs[(size_t) p] = "cannot open " + path; return; }
+#if defined(_WIN32)
+            int rc = _fseeki64(f, (long long) (file.data_start + b), SEEK_SET);
+#else
+            int rc = fseeko(f, (off_t) (file.data_start + b), SEEK_SET);
+#endif
+            size_t got = rc == 0 ? std::fread(buf.get() + b, 1, e - b, f) : 0;
+            std::fclose(f);
+            if (got != e - b) errs[(size_t) p] = "short read in " + path;
+        });
+    }
+    for (auto& t : pool) t.join();
+    for (const auto& e : errs)
+        if (!e.empty()) return e;
     return "";
 }
 
