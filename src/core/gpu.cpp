@@ -367,19 +367,30 @@ bool copies_read_mapped_files() { return rt().device().get_backend() != sycl::ba
 
 bool copy(void* dst, const void* src, size_t bytes) {
     if (bytes == 0) return true;
-    try { rt().wait(rt().compute().memcpy(dst, src, bytes), "synchronous copy"); return true; }
+    try {
+        auto& runtime = rt();
+        sycl::event event;
+        { core::Runtime::CopyWatch watch(runtime, "synchronous copy", bytes);
+          event = runtime.compute().memcpy(dst, src, bytes); }
+        runtime.wait(event, "synchronous copy"); return true;
+    }
     catch (const std::exception& e) { return fail("copy", e); }
 }
 
-bool copy_async(void* dst, const void* src, size_t bytes, Stream s) {
+bool copy_async(void* dst, const void* src, size_t bytes, Stream s, const char* what, int layer) {
     if (bytes == 0) return true;
-    try { q(s).memcpy(dst, src, bytes); return true; }
+    try {
+        auto& queue = q(s);
+        core::Runtime::CopyWatch watch(rt_of(s), what, bytes, layer);
+        queue.memcpy(dst, src, bytes); return true;
+    }
     catch (const std::exception& e) { return fail("copy_async", e); }
 }
 
 bool copy_async_after(void* dst, const void* src, size_t bytes, Stream s, const Event* after, Event* done) {
     try {
         auto& queue = q(s);
+        core::Runtime::CopyWatch watch(rt_of(s), "dependent GPU copy", bytes);
         const sycl::event e = queue.submit([&](sycl::handler& h) {
             if (after != nullptr && after->ev) h.depends_on(*after->ev);
             if (bytes > 0) h.memcpy(dst, src, bytes);

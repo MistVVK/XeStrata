@@ -67,6 +67,18 @@ public:
     sycl::event copy_async(void* dst, const void* src, uint64_t bytes,
                            const std::vector<sycl::event>& dependencies = {});
     sycl::event compute_after(const std::vector<sycl::event>& dependencies);
+    // Watches the host submission itself: some backends can block inside an asynchronous copy call.
+    // `what` must outlive the watch.
+    class CopyWatch {
+    public:
+        CopyWatch(Runtime& runtime, const char* what, uint64_t bytes, int layer = -1);
+        ~CopyWatch();
+        CopyWatch(const CopyWatch&) = delete;
+        CopyWatch& operator=(const CopyWatch&) = delete;
+    private:
+        Runtime& runtime_;
+        void* entry_;
+    };
     // `what` names the wait in the watchdog's report; it must outlive the call.
     void wait(sycl::event event, const char* what = "event");
     void finish(sycl::queue& queue);
@@ -97,6 +109,10 @@ private:
     struct Waiter {
         std::chrono::steady_clock::time_point since;
         const char* what;
+        uint64_t bytes = 0;
+        std::chrono::steady_clock::time_point reported{};
+        bool copy = false;
+        int layer = -1;
     };
     Runtime(int ordinal, const sycl::device& device);
     void check_async();
@@ -105,6 +121,7 @@ private:
     void watch();
     bool measure_marks();
     int ordinal_;
+    std::string pci_;
     std::mutex error_mutex_;
     std::exception_ptr error_;
     sycl::device device_;

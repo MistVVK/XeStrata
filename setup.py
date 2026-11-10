@@ -9236,8 +9236,8 @@ def main() -> int:
                  "add yourself to the render group (sudo usermod -aG render $USER), log out and in, and run it again")
         if gpu["bar_gb"] < gpu["vram_gb"] - 0.5:
             warn(f"Resizable BAR looks off: the card shows {gpu['bar_gb']:.1f} GB of its {gpu['vram_gb']:.0f} GB to "
-                 "the CPU. "
-                 "Copies to the GPU will be slower; turn on Re-Size BAR (and Above 4G Decoding) in the BIOS")
+                 "the CPU. Copies can be slower; AMD GPUs can appear stalled and LoRA training can fail. "
+                 "Enable Above 4G Decoding and Resizable BAR in the BIOS")
         if gpu.get("integrated") and "uma_gb" not in gpu:
             warn("the processor's own graphics: XeStrata will run, but slowly - its memory is the system RAM, and it "
                  "has no matrix engines (XMX) on most processors")

@@ -2090,6 +2090,7 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 | 症状 | すること |
 | --- | --- |
 | `no Intel GPU on the xe or i915 driver, no AMD GPU on amdgpu and no NVIDIA GPU on NVIDIA's driver found` | Intel の GPU が xe か i915 のドライバーに、AMD の GPU が amdgpu に、NVIDIA の GPU が NVIDIA のドライバーにつながっていません。`lspci -k` でドライバーを確かめます。単体の GPU なら、BIOS で Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
+| `Resizable BAR looks off` または CPU から見える VRAM が小さいという警告 | GPU へのコピーが遅くなることがあります。AMD の GPU では処理が長く止まったように見えることや、LoRA の学習が失敗することもあります。BIOS で Above 4G Decoding と Resizable BAR を有効にします。処理が止まったように見えた例では、窓の小ささが原因かは分かっていません。 |
 | `an NVIDIA GPU needs the contrib build` | `--license free` を選んでいます。NVIDIA の GPU は contrib-llvm のビルドでだけ使えるので、`--license contrib` で setup をやり直します。 |
 | `NVIDIA's CUDA toolkit is missing` | NVIDIA の GPU のコードを作る CUDA ツールキットがありません。入れてから setup をやり直します（Ubuntu: `sudo apt install nvidia-cuda-toolkit`）。 |
 | `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | contrib-llvm のビルドで、Intel の GPU の密な行列積に使う oneMKL がありません。入れる（[BUILD.ja.md](BUILD.ja.md#パッケージ)）か、`--license free` で setup をやり直します。 |

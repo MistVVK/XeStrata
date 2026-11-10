@@ -114,6 +114,20 @@ std::string pci_of(const sycl::device& d) {
     return s;
 }
 
+// The sysfs files are present only for devices whose driver reports a CPU-visible VRAM window.
+bool visible_vram(const std::string& pci, uint64_t& total, uint64_t& used) {
+#if defined(_WIN32)
+    (void) pci; (void) total; (void) used;
+    return false;
+#else
+    if (pci == "?") return false;
+    const std::string base = "/sys/bus/pci/devices/" + pci + "/";
+    if (!(std::ifstream(base + "mem_info_vis_vram_total") >> total) || total == 0) return false;
+    if (!(std::ifstream(base + "mem_info_vis_vram_used") >> used)) used = UINT64_MAX;
+    return true;
+#endif
+}
+
 // No GPU on Level Zero, CUDA or HIP at all: the GPU's driver is missing, or the SYCL runtime did not load its adapter
 // for the backend.  A user who started the engine without the libraries setup gave it (the config's lib_dirs) read
 // only "no usable GPU" and looked for the fault in the card; say what the runtime lists and which libsycl it is.
@@ -456,9 +470,22 @@ namespace {
 void settle_vram(const sycl::device& d);
 }  // namespace
 
-Runtime::Runtime(int ordinal, const sycl::device& device) : ordinal_(ordinal), device_(device), context_(device_),
+Runtime::Runtime(int ordinal, const sycl::device& device) : ordinal_(ordinal), pci_(pci_of(device)), device_(device), context_(device_),
     compute_(context_, device_, handler(), sycl::property::queue::in_order{}),
     transfer_(context_, device_, handler(), sycl::property::queue::in_order{}), watchdog_([this] { watch(); }) {
+    uint64_t visible = 0, used = 0, vram = 0;
+#if !defined(_WIN32)
+    if (visible_vram(pci_, visible, used) &&
+        (std::ifstream("/sys/bus/pci/devices/" + pci_ + "/mem_info_vram_total") >> vram) &&
+        vram > visible) {
+        std::fprintf(stderr, "Xe runtime: GPU %d CPU-visible VRAM is %llu of %llu MiB; copies can be slower, "
+                     "AMD GPUs can appear stalled and LoRA training can fail. Enable Above 4G Decoding and "
+                     "Resizable BAR in the BIOS.\n", ordinal_, (unsigned long long) (visible >> 20),
+                     (unsigned long long) (vram >> 20));
+    }
+#else
+    (void) visible; (void) used; (void) vram;
+#endif
     settle_vram(device_);
     marks_by_barrier_ = measure_marks();
 }
@@ -663,18 +690,49 @@ Runtime::~Runtime() {
     watchdog_.join();
 }
 
+Runtime::CopyWatch::CopyWatch(Runtime& runtime, const char* what, uint64_t bytes, int layer) : runtime_(runtime) {
+    std::lock_guard<std::mutex> lock(runtime_.watch_mutex_);
+    entry_ = &*runtime_.waiters_.insert(runtime_.waiters_.end(),
+        Waiter{std::chrono::steady_clock::now(), what, bytes, {}, true, layer});
+}
+
+Runtime::CopyWatch::~CopyWatch() {
+    std::lock_guard<std::mutex> lock(runtime_.watch_mutex_);
+    for (auto it = runtime_.waiters_.begin(); it != runtime_.waiters_.end(); ++it) {
+        if (&*it == entry_) { runtime_.waiters_.erase(it); break; }
+    }
+}
+
 void Runtime::watch() {
     std::unique_lock<std::mutex> lock(watch_mutex_);
     const std::chrono::seconds limit = hang_limit();
+    // A healthy copy of even a large layer is far shorter than a minute; 60 s leaves room for slow storage and
+    // paging. The observed blocked submission lasted 19 minutes. Repeat only every 5 minutes if it remains blocked.
+    constexpr auto copy_limit = std::chrono::seconds(60);
+    constexpr auto repeat = std::chrono::minutes(5);
     while (!watch_cv_.wait_for(lock, std::chrono::seconds(1), [this] { return stop_; })) {
-        if (limit.count() == 0) continue;
         const auto now = std::chrono::steady_clock::now();
-        for (const Waiter& w : waiters_) {
-            if (now - w.since < limit) continue;
-            const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(now - w.since).count();
-            std::fprintf(stderr, "Xe runtime: waiting for %s for %lld s (%zu waits in progress)\n", w.what,
-                         (long long) seconds, waiters_.size());
-            fatal("GPU wait exceeded the hang limit (XESTRATA_GPU_WAIT_LIMIT_S)");
+        for (Waiter& w : waiters_) {
+            const auto elapsed = now - w.since;
+            if (w.copy) {
+                if (elapsed < copy_limit || (w.reported != decltype(w.reported){} && now - w.reported < repeat)) continue;
+                w.reported = now;
+                uint64_t total = 0, used = 0;
+                std::fprintf(stderr, "Xe runtime: GPU %d copy submission %s", ordinal_, w.what);
+                if (w.layer >= 0) std::fprintf(stderr, " layer %d", w.layer);
+                std::fprintf(stderr, " (%llu bytes) has taken %lld s", (unsigned long long) w.bytes,
+                             (long long) std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
+                if (visible_vram(pci_, total, used)) {
+                    std::fprintf(stderr, "; CPU-visible VRAM %llu MiB", (unsigned long long) (total >> 20));
+                    if (used != UINT64_MAX) std::fprintf(stderr, ", %llu MiB used", (unsigned long long) (used >> 20));
+                }
+                std::fprintf(stderr, "\n");
+            } else if (limit.count() && elapsed >= limit) {
+                const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+                std::fprintf(stderr, "Xe runtime: waiting for %s for %lld s (%zu waits in progress)\n", w.what,
+                             (long long) seconds, waiters_.size());
+                fatal("GPU wait exceeded the hang limit (XESTRATA_GPU_WAIT_LIMIT_S)");
+            }
         }
     }
 }
@@ -687,6 +745,7 @@ void Runtime::check_async() {
 sycl::event Runtime::copy_async(void* dst, const void* src, uint64_t bytes,
                                const std::vector<sycl::event>& dependencies) {
     check_async();
+    CopyWatch watch(*this, "transfer queue", bytes);
     return transfer_.memcpy(dst, src, bytes, dependencies);
 }
 

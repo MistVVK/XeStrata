@@ -371,7 +371,7 @@ void LayerStream::load_resident(int i) {
     }
     if (home != nullptr && prepped) {   // a home a streamed pass left: the layer as it is used
         std::lock_guard<std::mutex> lk(relay_mu_[0]);
-        check(gpu::copy_async(l.d, home, l.bytes, copy_), "a layer's copy");
+        check(gpu::copy_async(l.d, home, l.bytes, copy_, "resident", i), "a layer's copy");
         check(gpu::event_record(relay_free_[0], copy_), "an event");
         check(gpu::stream_wait_event(compute_, relay_free_[0]), "a wait");
         l.loaded = true;
@@ -389,11 +389,11 @@ void LayerStream::load_resident(int i) {
     std::lock_guard<std::mutex> lk(relay_mu_[0]);
     if (from_file) {
         for (const Span& sp : l.spans)
-            check(gpu::copy_async(l.d + sp.offset, sp.host, sp.bytes, copy_), "a layer's copy");
+            check(gpu::copy_async(l.d + sp.offset, sp.host, sp.bytes, copy_, "resident", i), "a layer's copy");
     } else {
         gpu::event_sync(relay_free_[0]);
         copy_spans(relay_[0], l.spans, l.bytes);
-        check(gpu::copy_async(l.d, relay_[0], l.bytes, copy_), "a layer's copy");
+        check(gpu::copy_async(l.d, relay_[0], l.bytes, copy_, "resident", i), "a layer's copy");
     }
     check(gpu::event_record(relay_free_[0], copy_), "an event");
     // the compute stream waits for the copy where it uses the layer

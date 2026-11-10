@@ -94,7 +94,8 @@ bool copies_read_mapped_files();
 
 /// Synchronous copy, ordered after the work already on the compute queue (the CUDA legacy stream).
 bool copy(void* dst, const void* src, size_t bytes);
-bool copy_async(void* dst, const void* src, size_t bytes, Stream s);
+// `what` must outlive the call; layer is -1 when the copy has no layer number.
+bool copy_async(void* dst, const void* src, size_t bytes, Stream s, const char* what = "GPU copy", int layer = -1);
 /// stream_wait_event(s, after), copy_async and event_record(done, s) as one submission: the copy waits for `after`
 /// (null or not recorded: for nothing) and `done` marks the copy (an event without timing; null: not kept).  Three
 /// submissions a copy filled the RTX 4070's stream when the prompt path queued its ring's 384 copies, and each copy

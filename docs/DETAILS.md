@@ -2163,6 +2163,7 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
 | Symptom | What to do |
 | --- | --- |
 | `no Intel GPU on the xe or i915 driver, no AMD GPU on amdgpu and no NVIDIA GPU on NVIDIA's driver found` | The Intel GPU is not on the xe or i915 driver, the AMD GPU not on amdgpu, and the NVIDIA GPU not on NVIDIA's; check the driver with `lspci -k`. For a discrete card, enable Above 4G Decoding and Re-Size BAR and disable CSM in the BIOS. |
+| `Resizable BAR looks off` or a warning that CPU-visible VRAM is small | Copies to the GPU can be slower. On AMD GPUs, work can also appear stalled for a long time, and LoRA training can fail. Enable Above 4G Decoding and Resizable BAR in the BIOS. In the observed apparent stall, it is not known whether the small window was the cause. |
 | `an NVIDIA GPU needs the contrib build` | `--license free` is chosen. NVIDIA GPUs run in the contrib-llvm build only: run setup again with `--license contrib`. |
 | `NVIDIA's CUDA toolkit is missing` | The CUDA toolkit that makes the NVIDIA GPU's code is not installed. Install it and run setup again (Ubuntu: `sudo apt install nvidia-cuda-toolkit`). |
 | `... hands the Intel GPU's dense matrix products to oneMKL, which is not installed` | The contrib-llvm build hands the Intel GPU's dense matrix products to oneMKL, which is missing. Install it ([BUILD.md](BUILD.md#packages)), or run setup again with `--license free`. |
