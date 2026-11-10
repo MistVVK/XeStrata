@@ -16,6 +16,7 @@ child is still there.
 from __future__ import annotations
 
 from strata_control.private_files import private_mkdir as _private_mkdir
+from strata_control.childenv import quiet_crash_env
 import argparse
 import errno
 import hashlib
@@ -974,7 +975,7 @@ class Host:
                        "--owner-fd", "0" if WINDOWS else str(reader)]
         attestation_key = secrets.token_bytes(32)
         expected_attestation = launch_identity.attestation(attestation_key, source_bytes, server_args)
-        child_env = os.environ.copy()
+        child_env = quiet_crash_env(os.environ.copy())   # the server's engine and reader start no debugger on a user's machine
         child_env["STRATA_OWNER_ATTEST_KEY"] = attestation_key.hex()
         child_env["STRATA_NO_ACQUIRE"] = "1"      # a managed server never installs or downloads (acquisition.py)
         child_env["STRATA_RUNTIME_PROFILE"] = self.name   # the records of its engine say which profile they belong to
@@ -1558,6 +1559,7 @@ class Host:
 
 
 def main(argv: list[str] | None = None) -> int:
+    quiet_crash_env()                                   # the host's children inherit it (strata_control/childenv.py)
     parser = argparse.ArgumentParser(prog="strata-runtime-host")
     parser.add_argument("--host", required=True)
     parser.add_argument("--shutdown-timeout", type=float, default=30)

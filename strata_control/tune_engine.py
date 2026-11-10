@@ -37,6 +37,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Sequence
 
+from strata_control.childenv import quiet_crash_env
+
 #: A workload is fixed for the whole sweep: the same prompt, the same number of tokens to generate,
 #: the same sampling. Changing any of these between candidates invalidates the comparison.
 DEFAULT_WORKLOAD = {
@@ -431,7 +433,7 @@ class EngineHarness:
         try:
             from serve import lifeline       # the engine ends with this process, however this process ends
             self._proc = lifeline.popen(
-                self._argv(), "engine", cwd=str(self.cwd), env=self.env,
+                self._argv(), "engine", cwd=str(self.cwd), env=None if self.env is None else quiet_crash_env(dict(self.env)),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, errors="replace", bufsize=1)
         except OSError as e:

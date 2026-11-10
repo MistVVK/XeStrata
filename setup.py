@@ -10139,6 +10139,11 @@ def mac_dsv41_setup(a) -> int:
 
 
 def main() -> int:
+    try:                                               # the engine programs setup runs start no debugger on a user's machine (strata_control/childenv.py)
+        from strata_control.childenv import quiet_crash_env
+        quiet_crash_env()
+    except Exception:
+        pass
     try:                                               # files made by a run as administrator still belong to the user
         from strata_control import private_files as _pf
         _pf.adopt_user_defaults()

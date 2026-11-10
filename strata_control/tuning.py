@@ -50,6 +50,7 @@ import json
 import os
 import platform
 from strata_control import sysinfo
+from strata_control.childenv import quiet_crash_env
 import statistics
 import subprocess
 import time
@@ -197,7 +198,7 @@ def engine_env(engine: Path | str) -> dict[str, str] | None:
     if not (folder / "engine-component.json").is_file():
         return None
     var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
-    env = dict(os.environ)
+    env = quiet_crash_env(dict(os.environ))
     from strata_control import engine_component
     env[var] = os.pathsep.join(engine_component.package_lib_dirs(folder) + ([env[var]] if env.get(var) else []))
     return env

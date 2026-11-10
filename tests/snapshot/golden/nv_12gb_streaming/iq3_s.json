@@ -98,7 +98,9 @@
      "32768",
      "--vision"
     ],
-    "env_set": {},
+    "env_set": {
+     "GGML_NO_BACKTRACE": "1"
+    },
     "notes": []
    },
    "setup_says": [
@@ -195,7 +197,9 @@
      "--kv-resident",
      "32768"
     ],
-    "env_set": {},
+    "env_set": {
+     "GGML_NO_BACKTRACE": "1"
+    },
     "notes": []
    }
   },
@@ -299,7 +303,9 @@
      "--kv-resident",
      "32768"
     ],
-    "env_set": {},
+    "env_set": {
+     "GGML_NO_BACKTRACE": "1"
+    },
     "notes": []
    }
   },
@@ -404,7 +410,9 @@
      "--kv-resident",
      "32768"
     ],
-    "env_set": {},
+    "env_set": {
+     "GGML_NO_BACKTRACE": "1"
+    },
     "notes": []
    }
   }

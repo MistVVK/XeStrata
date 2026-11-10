@@ -89,7 +89,9 @@
      "--kv-resident",
      "32768"
     ],
-    "env_set": {},
+    "env_set": {
+     "GGML_NO_BACKTRACE": "1"
+    },
     "notes": []
    },
    "setup_says": [
@@ -182,7 +184,9 @@
      "--resident-budget-gib",
      "48"
     ],
-    "env_set": {},
+    "env_set": {
+     "GGML_NO_BACKTRACE": "1"
+    },
     "notes": []
    }
   },
@@ -283,7 +287,9 @@
      "--resident-budget-gib",
      "48"
     ],
-    "env_set": {},
+    "env_set": {
+     "GGML_NO_BACKTRACE": "1"
+    },
     "notes": []
    }
   },
@@ -385,7 +391,9 @@
      "--resident-budget-gib",
      "48"
     ],
-    "env_set": {},
+    "env_set": {
+     "GGML_NO_BACKTRACE": "1"
+    },
     "notes": []
    }
   }

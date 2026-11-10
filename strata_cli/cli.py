@@ -2244,6 +2244,11 @@ def _install_argv(argv: list[str]) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     try:
+        from strata_control.childenv import quiet_crash_env
+        quiet_crash_env()                        # every program Strata starts inherits it: ggml never starts gdb on a user's machine
+    except ImportError:                          # a thin bundle ships without strata_control
+        pass
+    try:
         from strata_control import private_files
         private_files.adopt_user_defaults()      # what this process creates belongs to the user even when it runs as administrator
     except ImportError:                          # a thin bundle ships without strata_control

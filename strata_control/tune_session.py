@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Protocol
 
 from strata_control import loopback, tune_machine
+from strata_control.childenv import quiet_crash_env
 
 # --------------------------------------------------------------------------- the contract
 
@@ -487,7 +488,7 @@ class WorkerSession:
             cfg.update({"api_key": key, "port": port, "host": "127.0.0.1", "open_browser": False, "log": str(engine_log)})
             cfg_path = self.workdir / f"run-{n}.json"
             cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
-            spawn_env = dict(os.environ)
+            spawn_env = quiet_crash_env(dict(os.environ))      # no debugger on a user's machine (strata_control/childenv.py)
             spawn_env.update(self.extra_env)
             spawn_env.pop("STRATA_API_KEY", None)        # the server reads this variable before the config's "api_key": the worker answers only to the key made for it (#5056)
             for k, v in env.items():

@@ -118,7 +118,9 @@
      "--vram-reserve-mib",
      "700"
     ],
-    "env_set": {},
+    "env_set": {
+     "GGML_NO_BACKTRACE": "1"
+    },
     "notes": [
      "[strata] Drafting: MTP (the DFlash2 drafter isn't downloaded yet)"
     ]
@@ -235,7 +237,9 @@
      "--draft-conf",
      "0.35"
     ],
-    "env_set": {},
+    "env_set": {
+     "GGML_NO_BACKTRACE": "1"
+    },
     "notes": [
      "[strata] drafting: DFlash2 alone (--draft dflash2, --draft-conf 0.35)"
     ]
@@ -376,7 +380,9 @@
      "--draft-conf",
      "0.35"
     ],
-    "env_set": {},
+    "env_set": {
+     "GGML_NO_BACKTRACE": "1"
+    },
     "notes": [
      "[strata] drafting: DFlash2 alone (--draft dflash2, --draft-conf 0.35)"
     ]
@@ -502,7 +508,9 @@
      "--draft-conf",
      "0.35"
     ],
-    "env_set": {},
+    "env_set": {
+     "GGML_NO_BACKTRACE": "1"
+    },
     "notes": [
      "[strata] drafting: DFlash2 alone (--draft dflash2, --draft-conf 0.35)"
     ]

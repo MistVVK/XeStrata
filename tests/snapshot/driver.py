@@ -32,11 +32,16 @@ HERE = Path(__file__).resolve().parent
 def run_cli(argv: list[str]) -> tuple[int, str, str]:
     from strata_cli.cli import main
     out, err = io.StringIO(), io.StringIO()
-    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-        try:
-            code = main(argv)
-        except SystemExit as e:
-            code = int(e.code or 0) if not isinstance(e.code, str) else 1
+    saved = dict(os.environ)            # main() sets variables on its own process for the programs it starts (GGML_NO_BACKTRACE, strata_control/childenv.py): that is
+    try:                                # the command's doing, not the machine's, so it must not become the baseline the engine's environment is compared with
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                code = main(argv)
+            except SystemExit as e:
+                code = int(e.code or 0) if not isinstance(e.code, str) else 1
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
     return code, out.getvalue(), err.getvalue()
 
 def engine_start(world: World, cfg: dict) -> dict:

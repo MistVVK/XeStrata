@@ -38,6 +38,8 @@ import threading
 import time
 from pathlib import Path
 
+from strata_control.childenv import quiet_crash_env
+
 # Qwen-Image-2.1-Turbo's own schedule (model_index.json "sample_sigmas") plus the terminal 0, as Unsloth's card passes
 # it to sd-cli; it is an 8-step schedule, so another step count leaves the schedule to sd.cpp
 TURBO_SIGMAS = "1.0,0.978453,0.95418,0.926626,0.89508,0.845148,0.704534,0.414568,0.0"
@@ -148,7 +150,7 @@ def sd_cli_args(cfg: dict, job: dict, out_pattern: str, prompt_file: str) -> lis
 def image_env(cfg: dict, base: dict | None = None) -> dict:
     """sd-cli's environment: the libraries its backend needs (ROCm's, setup's lib_dirs) first on the search path, the
     GPU to use when the config names one, and the config's own "env"."""
-    env = dict(os.environ if base is None else base)
+    env = quiet_crash_env(dict(os.environ if base is None else base))      # ggml's backtrace starts gdb: never on a user's machine
     dirs = [str(d) for d in cfg.get("lib_dirs") or [] if Path(d).is_dir()]
     if dirs:
         var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"

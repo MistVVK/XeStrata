@@ -93,7 +93,9 @@
      "--kv-resident",
      "32768"
     ],
-    "env_set": {},
+    "env_set": {
+     "GGML_NO_BACKTRACE": "1"
+    },
     "notes": []
    },
    "setup_says": [
@@ -188,7 +190,9 @@
      "--kv",
      "int8"
     ],
-    "env_set": {},
+    "env_set": {
+     "GGML_NO_BACKTRACE": "1"
+    },
     "notes": []
    }
   },
@@ -289,7 +293,9 @@
      "--kv",
      "int8"
     ],
-    "env_set": {},
+    "env_set": {
+     "GGML_NO_BACKTRACE": "1"
+    },
     "notes": []
    }
   },
@@ -391,7 +397,9 @@
      "--kv",
      "int8"
     ],
-    "env_set": {},
+    "env_set": {
+     "GGML_NO_BACKTRACE": "1"
+    },
     "notes": []
    }
   }

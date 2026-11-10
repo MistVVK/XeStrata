@@ -66,6 +66,7 @@
      "900"
     ],
     "env_set": {
+     "GGML_NO_BACKTRACE": "1",
      "STRATA_DS4_SLOT_DIR": "<REPO>/ds4-slots",
      "STRATA_DS4_SLOT_GB": "2",
      "STRATA_DS4_SLOT_KEEP": "1"
@@ -138,6 +139,7 @@
      "0.65"
     ],
     "env_set": {
+     "GGML_NO_BACKTRACE": "1",
      "STRATA_DS4_SLOT_DIR": "<ROOT>/<STATE>/launch/ds4-slots",
      "STRATA_DS4_SLOT_GB": "2",
      "STRATA_DS4_SLOT_KEEP": "1"
@@ -222,6 +224,7 @@
      "0.65"
     ],
     "env_set": {
+     "GGML_NO_BACKTRACE": "1",
      "STRATA_DS4_SLOT_DIR": "<ROOT>/install/ds4-slots",
      "STRATA_DS4_SLOT_GB": "2",
      "STRATA_DS4_SLOT_KEEP": "1"
@@ -307,6 +310,7 @@
      "0.65"
     ],
     "env_set": {
+     "GGML_NO_BACKTRACE": "1",
      "STRATA_DS4_SLOT_DIR": "<ROOT>/install/ds4-slots",
      "STRATA_DS4_SLOT_GB": "2",
      "STRATA_DS4_SLOT_KEEP": "1"
