@@ -26138,6 +26138,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PF_KQ_OCC",
+   "backends": [
+    "hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 2133,
+     "backend": "hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "off",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "e99f832715",
+   "first_date": "2026-11-10",
+   "since": null,
+   "last_commit": "e99f832715",
+   "last_date": "2026-11-10",
+   "status": "research",
+   "owner": "prefill",
+   "note": "trial switch (OWN-4A, 11-10): the K-quant fused prompt kernels on the occupancy launch, 3 blocks per WGP; HIP only, off by default",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PF_OCC",
    "backends": [
     "hip",
