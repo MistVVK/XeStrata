@@ -4,6 +4,10 @@
 //                   reduce_max(v), vexp(v) (expf, relative error below 3e-7 on [-87, 88])
 //   void conv16(const void* W, int kind, size_t off, int n, float* out)     n elements from W[off] (kind 1 BF16, 2 F16) to float
 //   STRATA_KN_MR    the rows of the register tile (NR is two vectors)
+// or, instead of struct V (STRATA_KN_RAW; the x86 tiers): the elementwise code below runs on a raw vector type VR with free inline functions VW (lanes),
+//   vr_load, vr_store(p, v), vr_set1, vr_zero, vr_add, vr_sub, vr_mul, vr_div, vr_fma(a, b, c) = a*b + c, vr_max, vr_hadd, vr_hmax, vr_exp, vr_sqrt1, and the tier
+//   brings its own micro (STRATA_KN_HAS_MICRO).  MSVC kept the wrapper struct in memory (RESULTS-OWN-3V.md 12.14); for the other tiers VR is V through the
+//   adapters below.  Both forms are the same operations in the same order, so the results are bit-identical.
 //   STRATA_KN_NAME  the tier's name, STRATA_KN_GETTER the table getter's name
 //   KN_MIN(a, b), KN_MAX(a, b), KN_COPY(dst, src, n floats), KN_ZERO(dst, n floats), V::sqrt1(x) (a correctly rounded float square root)
 // No standard-library header and no inline library function here (cpu_tier.h says why): the wider tiers define the KN_ helpers as their own internal
@@ -17,7 +21,26 @@ namespace strata_vit {
 namespace {      // every tier's kernels are internal to its translation unit (the vector types of the tiers share a name)
 namespace kn {
 
+#ifdef STRATA_KN_RAW
+constexpr int W = VW;
+#else
 constexpr int W = V::W;
+using VR = V;
+inline VR vr_load(const float* p) { return V::load(p); }
+inline void vr_store(float* p, VR v) { v.store(p); }
+inline VR vr_set1(float f) { return V::set1(f); }
+inline VR vr_zero() { return V::zero(); }
+inline VR vr_add(VR a, VR b) { return a + b; }
+inline VR vr_sub(VR a, VR b) { return a - b; }
+inline VR vr_mul(VR a, VR b) { return a * b; }
+inline VR vr_div(VR a, VR b) { return a / b; }
+inline VR vr_fma(VR a, VR b, VR c) { return V::fma(a, b, c); }
+inline VR vr_max(VR a, VR b) { return vmax(a, b); }
+inline float vr_hadd(VR a) { return V::reduce_add(a); }
+inline float vr_hmax(VR a) { return V::reduce_max(a); }
+inline VR vr_exp(VR a) { return vexp(a); }
+inline float vr_sqrt1(float x) { return V::sqrt1(x); }
+#endif
 constexpr int NR = 2 * W;
 constexpr int MRF = STRATA_KN_MR;
 
@@ -102,52 +125,52 @@ void conv(const void* src, int kind, size_t n, float* dst) {
 }
 
 // ---- elementwise ----
-inline V gelu_v(V x) {
+inline VR gelu_v(VR x) {
     // 0.5 x (1 + tanh(u)), u = sqrt(2/pi) x (1 + 0.044715 x^2);  tanh(u) = 1 - 2 / (exp(2u) + 1)
-    const V one = V::set1(1.0f), two = V::set1(2.0f);
-    const V u = V::set1(0.79788456080286535587989211986876f) * x * (one + V::set1(0.044715f) * x * x);
-    const V e = vexp(two * u);
-    return V::set1(0.5f) * x * (two - two / (e + one));      // 1 + tanh(u) = 2 - 2 / (exp(2u) + 1)
+    const VR one = vr_set1(1.0f), two = vr_set1(2.0f);
+    const VR u = vr_mul(vr_mul(vr_set1(0.79788456080286535587989211986876f), x), vr_add(one, vr_mul(vr_mul(vr_set1(0.044715f), x), x)));
+    const VR e = vr_exp(vr_mul(two, u));
+    return vr_mul(vr_mul(vr_set1(0.5f), x), vr_sub(two, vr_div(two, vr_add(e, one))));      // 1 + tanh(u) = 2 - 2 / (exp(2u) + 1)
 }
 
 void gelu(float* x, size_t ldx, int rows, int n) {
     for (int r = 0; r < rows; ++r) {
         float* p = x + (size_t) r * ldx;
         int i = 0;
-        for (; i + W <= n; i += W) gelu_v(V::load(p + i)).store(p + i);
+        for (; i + W <= n; i += W) vr_store(p + i, gelu_v(vr_load(p + i)));
         if (i < n) {
             float buf[W] = {0};
             KN_COPY(buf, p + i, n - i);
-            gelu_v(V::load(buf)).store(buf);
+            vr_store(buf, gelu_v(vr_load(buf)));
             KN_COPY(p + i, buf, n - i);
         }
     }
 }
 
 void layernorm(const float* x, float* y, int D, const float* w, const float* b, float eps) {
-    V s = V::zero();
+    VR s = vr_zero();
     int i = 0;
-    for (; i + W <= D; i += W) s = s + V::load(x + i);
-    float sum = V::reduce_add(s);
+    for (; i + W <= D; i += W) s = vr_add(s, vr_load(x + i));
+    float sum = vr_hadd(s);
     for (; i < D; ++i) sum += x[i];
     const float mean = sum / (float) D;
-    const V vm = V::set1(mean);
-    V q = V::zero();
+    const VR vm = vr_set1(mean);
+    VR q = vr_zero();
     for (i = 0; i + W <= D; i += W) {
-        const V d = V::load(x + i) - vm;
-        q = V::fma(d, d, q);
+        const VR d = vr_sub(vr_load(x + i), vm);
+        q = vr_fma(d, d, q);
     }
-    float ss = V::reduce_add(q);
+    float ss = vr_hadd(q);
     for (; i < D; ++i) { const float d = x[i] - mean; ss += d * d; }
-    const float scale = 1.0f / V::sqrt1(ss / (float) D + eps);
-    const V vs = V::set1(scale);
-    for (i = 0; i + W <= D; i += W) (((V::load(x + i) - vm) * vs) * V::load(w + i) + V::load(b + i)).store(y + i);
+    const float scale = 1.0f / vr_sqrt1(ss / (float) D + eps);
+    const VR vs = vr_set1(scale);
+    for (i = 0; i + W <= D; i += W) vr_store(y + i, vr_add(vr_mul(vr_mul(vr_sub(vr_load(x + i), vm), vs), vr_load(w + i)), vr_load(b + i)));
     for (; i < D; ++i) y[i] = (x[i] - mean) * scale * w[i] + b[i];
 }
 
 void add(float* x, const float* y, size_t n) {
     size_t i = 0;
-    for (; i + W <= n; i += W) (V::load(x + i) + V::load(y + i)).store(x + i);
+    for (; i + W <= n; i += W) vr_store(x + i, vr_add(vr_load(x + i), vr_load(y + i)));
     for (; i < n; ++i) x[i] += y[i];
 }
 
@@ -156,28 +179,28 @@ void round16(float* p, size_t n, int kind) { round_buf(p, n, kind); }
 void softmax_update(float* S, size_t lds, int qrows, int nkeys, float* m, float* l, float* O, size_t ldo, int hd) {
     for (int r = 0; r < qrows; ++r) {
         float* s = S + (size_t) r * lds;
-        V mxv = V::set1(-3.0e38f);
+        VR mxv = vr_set1(-3.0e38f);
         int j = 0;
-        for (; j + W <= nkeys; j += W) mxv = vmax(mxv, V::load(s + j));
-        float mx = V::reduce_max(mxv);
+        for (; j + W <= nkeys; j += W) mxv = vr_max(mxv, vr_load(s + j));
+        float mx = vr_hmax(mxv);
         for (; j < nkeys; ++j) mx = KN_MAX(mx, s[j]);
         const float mold = m[r], mnew = KN_MAX(mold, mx);
         const float alpha = mold < -1.0e38f ? 0.0f : cpu_tier_expf(mold - mnew);
         float* o = O + (size_t) r * ldo;
         if (alpha != 1.0f) {
-            const V va = V::set1(alpha);
+            const VR va = vr_set1(alpha);
             int d = 0;
-            for (; d + W <= hd; d += W) (V::load(o + d) * va).store(o + d);
+            for (; d + W <= hd; d += W) vr_store(o + d, vr_mul(vr_load(o + d), va));
             for (; d < hd; ++d) o[d] *= alpha;
         }
-        const V vmn = V::set1(mnew);
-        V sv = V::zero();
+        const VR vmn = vr_set1(mnew);
+        VR sv = vr_zero();
         for (j = 0; j + W <= nkeys; j += W) {
-            const V p = vexp(V::load(s + j) - vmn);
-            p.store(s + j);
-            sv = sv + p;
+            const VR p = vr_exp(vr_sub(vr_load(s + j), vmn));
+            vr_store(s + j, p);
+            sv = vr_add(sv, p);
         }
-        float sum = V::reduce_add(sv);
+        float sum = vr_hadd(sv);
         for (; j < nkeys; ++j) { s[j] = cpu_tier_expf(s[j] - mnew); sum += s[j]; }
         l[r] = l[r] * alpha + sum;
         m[r] = mnew;
