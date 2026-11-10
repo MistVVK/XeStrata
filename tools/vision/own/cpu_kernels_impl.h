@@ -21,7 +21,8 @@ constexpr int W = V::W;
 constexpr int NR = 2 * W;
 constexpr int MRF = STRATA_KN_MR;
 
-// ---- the register-tiled product ----
+// ---- the register-tiled product (a tier may bring its own `micro` with the same summation order: STRATA_KN_HAS_MICRO) ----
+#ifndef STRATA_KN_HAS_MICRO
 template <int MR>
 inline void micro(const float* A, size_t lda, const float* B, size_t ldb, int K, float* C, size_t ldc, int init, const float* bias) {
     V acc[MR][2];
@@ -43,6 +44,7 @@ inline void micro(const float* A, size_t lda, const float* B, size_t ldb, int K,
     for (int r = 0; r < MR; ++r)
         for (int c = 0; c < 2; ++c) acc[r][c].store(C + (size_t) r * ldc + c * W);
 }
+#endif
 
 // m rows (m <= MRF) of one column tile
 inline void tile_rows(const float* A, size_t lda, int m, const float* B, size_t ldb, int K, float* C, size_t ldc, int init, const float* bias) {

@@ -1,4 +1,4 @@
-// tools/vision/own/cpu_kernels_neon.cpp - the Arm NEON tier (12 x 8 register tile: 24 accumulators of the 32 vector registers).  Baseline AArch64 only (Advanced
+// tools/vision/own/cpu_kernels_neon.cpp - the Arm NEON tier (8 x 8 register tile: 16 accumulators and 8 A vectors of the 32 vector registers).  Baseline AArch64 only (Advanced
 // SIMD and the F16 conversions are in every ARMv8-A CPU), so no ISA flags; it keeps the contract of the x86 tiers anyway (cpu_tier.h: no standard-library code).
 #include "cpu_tier.h"      // only this and <arm_neon.h> (cpu_tier.h)
 
@@ -37,6 +37,46 @@ struct V {
     friend V operator/(V a, V b) { return vdivq_f32(a.v, b.v); }
 };
 inline V vmax(V a, V b) { return vmaxq_f32(a.v, b.v); }
+
+// The product's micro-kernel with lane-indexed FMAs: four k steps take one vector load of each A row instead of four scalar broadcasts.  The same
+// summation order as the generic micro of cpu_kernels_impl.h (each accumulator gets a[r][k] * b[k] in k order, fused), so the results are the same.
+#define STRATA_KN_HAS_MICRO 1
+#define KN_STEP(L)                                                                                     \
+    {                                                                                                  \
+        const float32x4_t b0 = vld1q_f32(B + (size_t) (k + L) * ldb), b1 = vld1q_f32(B + (size_t) (k + L) * ldb + 4); \
+        for (int r = 0; r < MR; ++r) {                                                                 \
+            acc[r][0] = vfmaq_laneq_f32(acc[r][0], b0, a[r], L);                                       \
+            acc[r][1] = vfmaq_laneq_f32(acc[r][1], b1, a[r], L);                                       \
+        }                                                                                              \
+    }
+template <int MR>
+inline void micro(const float* A, size_t lda, const float* B, size_t ldb, int K, float* C, size_t ldc, int init, const float* bias) {
+    float32x4_t acc[MR][2];
+    for (int r = 0; r < MR; ++r)
+        for (int c = 0; c < 2; ++c) {
+            float32x4_t v = vdupq_n_f32(0.0f);
+            if (init != 0) v = vld1q_f32(C + (size_t) r * ldc + c * 4);
+            if (init != 1 && bias) v = vaddq_f32(v, vld1q_f32(bias + c * 4));
+            acc[r][c] = v;
+        }
+    int k = 0;
+    for (; k + 4 <= K; k += 4) {
+        float32x4_t a[MR];
+        for (int r = 0; r < MR; ++r) a[r] = vld1q_f32(A + (size_t) r * lda + k);
+        KN_STEP(0) KN_STEP(1) KN_STEP(2) KN_STEP(3)
+    }
+    for (; k < K; ++k) {
+        const float32x4_t b0 = vld1q_f32(B + (size_t) k * ldb), b1 = vld1q_f32(B + (size_t) k * ldb + 4);
+        for (int r = 0; r < MR; ++r) {
+            const float32x4_t a = vdupq_n_f32(A[(size_t) r * lda + k]);
+            acc[r][0] = vfmaq_f32(acc[r][0], a, b0);
+            acc[r][1] = vfmaq_f32(acc[r][1], a, b1);
+        }
+    }
+    for (int r = 0; r < MR; ++r)
+        for (int c = 0; c < 2; ++c) vst1q_f32(C + (size_t) r * ldc + c * 4, acc[r][c]);
+}
+#undef KN_STEP
 
 // expf (Cephes), the same steps and constants as the x86 tiers: x = n ln2 + r, exp(x) = 2^n * p(r)
 inline V vexp(V xv) {
@@ -90,7 +130,7 @@ inline void conv16(const void* Wm, int kind, size_t off, int n, float* out) {
 }  // namespace
 }  // namespace strata_vit
 
-#define STRATA_KN_MR 12
+#define STRATA_KN_MR 8
 #define KN_MIN(a, b) kmin(a, b)
 #define KN_MAX(a, b) kmax(a, b)
 #define KN_COPY(d, s, n) kcopy((d), (s), (n))
