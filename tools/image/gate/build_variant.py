@@ -1,8 +1,9 @@
 """tools/image/gate/build_variant.py - TEST-ONLY (OWN-5 gate harness): build the stage-hook variant of an existing
 build_sd.py build with exactly its configure line.
 
-    python3 -I -B build_variant.py <root> <backend> <variant> [--jobs N] [--def -DNAME=VALUE ...]
-Makes <root>/sd-<variant> (stage_hooks.py applied to a copy of <root>/sd-<backend>), <root>/build-<variant> and
+    python3 -I -B build_variant.py <root> <backend> <variant> [--jobs N] [--noise] [--def -DNAME=VALUE ...]
+Makes <root>/sd-<variant> (stage_hooks.py applied to a copy of <root>/sd-<backend>; with --noise instead the product's
+noise generator, <root>/repo/tools/image/sdcpp_noise/apply.py), <root>/build-<variant> and
 <root>/build-<variant>.json (what run_set.py --build <variant> reads)."""
 import json
 import os
@@ -16,8 +17,15 @@ jobs = a[a.index("--jobs") + 1] if "--jobs" in a else "8"
 extra = [a[i + 1] for i, x in enumerate(a) if x == "--def"]      # extra CMake definitions, e.g. -DGGML_CUDA_FORCE_CUBLAS=ON
 info = json.loads((root / f"build-{backend}.json").read_text())
 here = Path(__file__).resolve().parent
-subprocess.run([sys.executable, "-I", "-B", str(here / "stage_hooks.py"), str(root / f"sd-{backend}"),
-                str(root / f"sd-{var}")], check=True)
+if "--noise" in a:       # the product's noise generator (tools/image/sdcpp_noise/apply.py from <root>/repo), no stage hooks
+    import shutil
+    if not (root / f"sd-{var}").exists():
+        shutil.copytree(root / f"sd-{backend}", root / f"sd-{var}", symlinks=True)
+    subprocess.run([sys.executable, "-I", "-B", str(root / "repo" / "tools" / "image" / "sdcpp_noise" / "apply.py"),
+                    str(root / f"sd-{var}")], check=True)
+else:
+    subprocess.run([sys.executable, "-I", "-B", str(here / "stage_hooks.py"), str(root / f"sd-{backend}"),
+                    str(root / f"sd-{var}")], check=True)
 conf = [c.replace(str(root / f"sd-{backend}"), str(root / f"sd-{var}")).replace(str(root / f"build-{backend}"),
                                                                                 str(root / f"build-{var}"))
         for c in info["configure"]] + extra
