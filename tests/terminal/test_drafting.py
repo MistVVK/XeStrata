@@ -418,6 +418,28 @@ class EngineArguments(unittest.TestCase):
             engine_args(self.cfg(drafting="dflash2"))
             self.assertEqual(drafting.take_note(), drafting.NOT_SERVED)
 
+    def test_the_intel_launcher_script_reaches_the_check_as_its_binary(self):
+        """#5138 Bug 1: on an Intel install `exe` is sycl/serve/strata-sycl.sh. Reading that shell script for the
+        engine's option strings finds nothing (FORM_NONE) and Auto lost DFlash2 on every such start. The drafting
+        check must follow the launcher to the binary it runs (serve.server.engine_binary), as effort_position does."""
+        from serve.server import engine_args
+        self.pack()
+        self.layer()
+        script = self.data / "sycl" / "serve" / "strata-sycl.sh"
+        script.parent.mkdir(parents=True)
+        script.write_text("#!/bin/sh\nexec \"$STRATA_SYCL_BIN\" \"$@\"\n", encoding="utf-8")
+        binary = self.data / "build-sycl" / "strata"
+        binary.parent.mkdir(parents=True)
+        binary.write_bytes(b"MZ\x00\x00 strata generate: --draft dflash2 drafts without the MTP layer and needs "
+                           b"--draft-model PACK, --spec 2 or more and --mtp-draft-vocab FILE (or --mtp DIR) "
+                           b"\x00--draft-fallback\x00")
+        self.assertEqual(drafting.engine_form(script), drafting.FORM_NONE, "the script itself carries no option strings")
+        c = self.cfg(env={"STRATA_SYCL_BIN": "build-sycl/strata"})
+        with mock.patch("serve.server.drafting_vram_mib", return_value=None), mock.patch.object(drafting, "data_dir_of", return_value=self.data):
+            args = engine_args(c, exe=str(script))
+        self.assertIn("--draft", args, "Auto on an Intel launcher still gets a drafter decision")
+        self.assertEqual(args[args.index("--draft") + 1], "dflash2", "the check read the binary, not the launcher script")
+
     def test_data_folder_of_an_argument_list(self):
         self.assertEqual(drafting.data_dir_of(["--pack", "/d/packs/x"]), Path("/d"))
         self.assertEqual(drafting.data_dir_of(["--mtp", "/d/mtp/rt"]), Path("/d"))
