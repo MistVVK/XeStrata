@@ -1799,6 +1799,7 @@ struct DevInfo {
     int occ_kq = 1;     // their blocks per multiprocessor (their own, as occ_q50)
     bool kq8 = false;   // with kq: the Q8_0 down kernels are set up too (A2; UD-Q4_K_XL's five Q8_0-down layers)
     int occ_kq8 = 1;
+    bool q8d = false;   // sm_80+ with STRATA_PF_FUSED_Q8D=1: the same Q8_0 down kernels behind an i-quant gate/up (opt-in, phase 4; their occupancy is occ_kq8)
 #endif
 };
 std::mutex g_mu;
@@ -1821,6 +1822,12 @@ int host_astages() {
 // any sm_80+ card; anything else (unset, "0") keeps those layers on the dequantize + FP16 GEMM path (the default)
 bool q50_cuda_requested() {
     static const bool on = [] { const char* v = std::getenv("STRATA_PF_FUSED_Q50"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+// STRATA_PF_FUSED_Q8D on CUDA: "1" sets the Q8_0 down kernels up (dev_info) and lets native_supported take a Q8_0 down behind an i-quant
+// gate/up (the pinned UD-IQ4_XS: IQ3_S / Q8_0 in 4 layers, IQ4_XS / Q8_0 in 1) on any sm_80+ card; anything else keeps those layers on MMQ
+bool q8d_cuda_requested() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_FUSED_Q8D"); return v != nullptr && v[0] == '1'; }();
     return on;
 }
 bool kq_on();   // STRATA_PF_FUSED_KQ (below): on CUDA "1" sets the K-quant kernels up (dev_info)
@@ -1978,6 +1985,10 @@ const DevInfo& dev_info() {
         // its own occupancy, and a failed setup leaves those layers on MMQ
         if (int o5 = 1 << 20; setup_one<T_Q8_0, false>(o5)) { d.kq8 = true; d.occ_kq8 = o5; }
     }
+    // STRATA_PF_FUSED_Q8D=1 (opt-in on CUDA, off by default): the Q8_0 down behind an i-quant gate/up on the same Q8_0 down instances as
+    // A2's.  The Q8_0 down reads no code sums (has_min is false), so the i-quant gate/up epilogue's H feeds it unchanged.  The occupancy is
+    // the one A2 found for the same instances (occ_kq8); a failed setup leaves those layers on MMQ.
+    if (int o6 = 1 << 20; d.ok && q8d_cuda_requested() && setup_one<T_Q8_0, false>(o6)) { d.q8d = true; d.occ_kq8 = o6; }
     if (d.ok && nt256_requested()) {
         int o2 = 1 << 20;
         const bool ok2 = setup_nt<T_IQ2_XXS, true>(o2) && setup_nt<T_IQ2_XS, true>(o2) && setup_nt<T_IQ2_S, true>(o2) &&
@@ -2093,7 +2104,7 @@ bool d_covered_on(int t, const DevInfo& d) {
 #else
     if (t == T_Q5_0) return d.q50;   // STRATA_PF_FUSED_Q50=1 and its kernels set up (dev_info)
     if (t == T_Q5_1) return d.kq;    // STRATA_PF_FUSED_KQ=1 (behind a K-quant gate/up only: native_supported)
-    if (t == T_Q8_0) return d.kq8;   // STRATA_PF_FUSED_KQ=1, A2 (behind a K-quant gate/up only: native_supported)
+    if (t == T_Q8_0) return d.kq8 || d.q8d;   // STRATA_PF_FUSED_KQ=1, A2 (behind a K-quant gate/up), or STRATA_PF_FUSED_Q8D=1 (behind an i-quant one): native_supported
 #endif
     (void) d;
     return d_covered(t);
@@ -2191,6 +2202,14 @@ bool native_supported(int gu_type, int d_type) {
     // kernels on any sm_80+ card whose K-quant kernels were set up, whatever the 80-SM rule says; other downs keep MMQ for now.  A Q5_1
     // down needs the code sums only the K-quant gate/up epilogue writes, so it is never taken behind another gate/up.  Not with the
     // NT = 256 / warp-specialized opt-ins (no K-quant form): MMQ.
+    // CUDA, a Q8_0 down behind an i-quant gate/up (phase 4, opt-in): with STRATA_PF_FUSED_Q8D=1 such a layer takes the fused kernels on
+    // any sm_80+ card whose Q8_0 down kernels were set up, whatever the 80-SM rule says (the pinned UD-IQ4_XS's five Q8_0-down layers;
+    // its other 43 layers follow their own rule).  Not behind the Q2_0 gate/up of STRATA_PF_FUSED_Q2N, not with the NT = 256 /
+    // warp-specialized opt-ins (no Q8_0 form): MMQ.
+    if (d_type == T_Q8_0 && gu_type != T_Q4_K && gu_type != T_Q5_K) {
+        const DevInfo& d = dev_info();
+        return gu_type != T_Q2_0 && d.ok && d.q8d && !d.t75 && d.occ_nt <= 0 && !d.ws;
+    }
     if (gu_type == T_Q4_K || gu_type == T_Q5_K || d_type == T_Q5_1 || d_type == T_Q8_0) {
         const DevInfo& d = dev_info();
         return (gu_type == T_Q4_K || gu_type == T_Q5_K) && (d_type == T_Q5_1 || (d_type == T_Q8_0 && d.kq8)) && d.ok && d.kq && !d.t75 &&
@@ -2388,6 +2407,9 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
     else if (g.d_type == T_Q5_0) {   // STRATA_PF_FUSED_Q50=1 (d_covered_on checked d.q50 above); its own occupancy
         const unsigned g_q = (unsigned) std::min<int64_t>(tiles * (D_ROWS_N / weight_rows(ww)), (int64_t) d.sms * d.occ_q50);
         launch<T_Q5_0, false>(ww, g_q, b, g, tb, ha, src, nullptr, dm, s);
+    } else if (g.d_type == T_Q8_0) {   // STRATA_PF_FUSED_Q8D=1 (d_covered_on checked d.q8d above); A2's instances and occupancy
+        const unsigned g8 = (unsigned) std::min<int64_t>(tiles * (D_ROWS_N / weight_rows(ww)), (int64_t) d.sms * d.occ_kq8);
+        launch<T_Q8_0, false>(ww, g8, b, g, tb, ha, src, nullptr, dm, s);
     }
 #endif
     else launch<T_IQ4_NL, false>(ww, g_d, b, g, tb, ha, src, nullptr, dm, s);

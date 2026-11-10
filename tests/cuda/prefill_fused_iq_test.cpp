@@ -738,7 +738,9 @@ int main(int argc, char** argv) {
             // UD-IQ4_XS-v31's Q5_0 down layers (STRATA_PF_FUSED_Q50=1: HIP gfx12, and CUDA sm_80+ since phase 4 step 1; checked against the reference, the build has no Q5_0 MMQ)
             {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q5_0, "IQ3_XXS / Q5_0"},   {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_0, "IQ4_XS / Q5_0"},
             // the canonical Q2_0 pack (gate/up and down Q2_0; CUDA)
-            {GGML_TYPE_Q2_0, GGML_TYPE_Q2_0, "Q2_0 / Q2_0"}};
+            {GGML_TYPE_Q2_0, GGML_TYPE_Q2_0, "Q2_0 / Q2_0"},
+            // the pinned UD-IQ4_XS's Q8_0 down layers (IQ3_S / Q8_0 4, IQ4_XS / Q8_0 1): STRATA_PF_FUSED_Q8D=1 on CUDA sm_80+ (opt-in)
+            {GGML_TYPE_IQ3_S, GGML_TYPE_Q8_0, "IQ3_S / Q8_0"},       {GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0, "IQ4_XS / Q8_0"}};
         const char* only = nullptr;   // --only=NAME: the pairs whose name contains NAME
         for (int i = 1; i < argc; ++i)
             if (std::strncmp(argv[i], "--only=", 7) == 0) only = argv[i] + 7;
@@ -762,6 +764,8 @@ int main(int argc, char** argv) {
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
         for (const Pair& p : pairs) {
             if (only ? std::string(p.name).find(only) == std::string::npos : p.gu == GGML_TYPE_Q4_K || p.gu == GGML_TYPE_Q5_K) continue;
+            // the i-quant / Q8_0 pairs run only when --only names them (ctest prefill_fused_iq_test_q8d), so every other entry runs what it ran
+            if (!only && p.d == GGML_TYPE_Q8_0 && !kq_gu(p)) continue;
             if (!fused::native_supported((int) p.gu, (int) p.d)) {
                 // the Q2_0 / Q2_0 pair is the Turing opt-in's (STRATA_PF_FUSED_SM75=1; the only pair set up there) or, on sm_80+,
                 // STRATA_PF_FUSED_Q2N=1's: skip what this device does not take (--only=NAME still insists)
