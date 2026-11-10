@@ -111,6 +111,91 @@ class Command(unittest.TestCase):
         cfg["native"] = False
         self.assertNotIn("--model-args", images_api.sd_cli_args(cfg, job, "x", "p.txt"))
 
+    CARD = ["sd-cli", "--diffusion-model", "dit.gguf", "--vae", "vae.st", "--llm", "te.gguf",
+            "--prompt-file", "o/prompt.txt",
+            "--steps", "8", "--cfg-scale", "1.0", "--sampling-method", "euler", "-W", "1024", "-H", "768",
+            "--sigmas", "1.0,0.978453,0.95418,0.926626,0.89508,0.845148,0.704534,0.414568,0.0",
+            "-s", "42", "-o", "o/img_%d.png", "--diffusion-fa", "--vae-tiling"]
+
+    def test_noise_switch_off_leaves_the_command_line_alone(self):
+        """images "noise" absent or "sdcpp" (the default): the exact argument list of before the switch existed."""
+        job = {"prompt": "a sloth", "width": 1024, "height": 768, "n": 1, "steps": 8, "seed": 42}
+        base = {"exe": "sd-cli", "diffusion_model": "dit.gguf", "vae": "vae.st", "llm": "te.gguf",
+                "args": ["--diffusion-fa", "--vae-tiling"]}
+        for extra in ({}, {"noise": "sdcpp"}, {"noise": None}, {"native": False, "noise": "sdcpp"}):
+            with self.subTest(extra=extra):
+                self.assertEqual(images_api.sd_cli_args({**base, **extra}, job, "o/img_%d.png", "o/prompt.txt"), self.CARD)
+        # and the native switch alone is still the last two arguments, as before
+        self.assertEqual(images_api.sd_cli_args({**base, "native": True}, job, "o/img_%d.png", "o/prompt.txt"),
+                         self.CARD + ["--model-args", "qwen_image_2_1_native=1"])
+
+    def test_noise_switch_on_is_one_model_args_string(self):
+        job = {"prompt": "a sloth", "width": 1024, "height": 768, "n": 1, "steps": 8, "seed": 42}
+        base = {"exe": "sd-cli", "diffusion_model": "dit.gguf", "vae": "vae.st", "llm": "te.gguf",
+                "args": ["--diffusion-fa", "--vae-tiling"]}
+        self.assertEqual(images_api.sd_cli_args({**base, "noise": "strata"}, job, "o/img_%d.png", "o/prompt.txt"),
+                         self.CARD + ["--model-args", "strata_noise=1"])
+        both = images_api.sd_cli_args({**base, "noise": "strata", "native": True}, job, "o/img_%d.png", "o/prompt.txt")
+        self.assertEqual(both, self.CARD + ["--model-args", "qwen_image_2_1_native=1,strata_noise=1"])
+        self.assertEqual(both.count("--model-args"), 1)
+
+    def test_noise_value_is_checked(self):
+        with tempfile.TemporaryDirectory() as d:
+            cfg = {"exe": "sd-cli", "diffusion_model": "d", "vae": "v", "llm": "l", "out_dir": d}
+            for ok in ("sdcpp", "strata"):
+                images_api.ImageGen({**cfg, "noise": ok})
+            for bad in ("on", "", "Strata", True, 1):
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    images_api.ImageGen({**cfg, "noise": bad})
+
+
+class NoiseRefusal(unittest.TestCase):
+    """images "noise": "strata" with an sd-cli that was built without the generator: the job is refused, in plain
+    words with one next step, instead of quietly running on stable-diffusion.cpp's noise."""
+
+    WORDS = ("Image generation is set to use Strata's own noise (\"noise\": \"strata\" in the images settings), but the "
+             "image program here was built without it. Run setup again with: --images qwen-image --image-noise on")
+
+    def gen(self, d, build=None, **kw):
+        cfg = image_cfg(d, noise="strata", **kw)
+        exe = Path(d) / "engine-image" / "sd-cli"
+        exe.parent.mkdir(exist_ok=True)
+        exe.write_bytes(b"x")
+        cfg["exe"] = str(exe)
+        if build is not None:
+            (exe.parent / "BUILD.json").write_text(build if isinstance(build, str) else json.dumps(build))
+        return images_api.ImageGen(cfg)
+
+    def test_the_words(self):
+        self.assertEqual(images_api.NOISE_MISSING, self.WORDS)
+
+    def test_problem_by_build_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            self.assertEqual(self.gen(d).noise_problem(), self.WORDS)                       # no BUILD.json
+        for build in ({"sd_cpp": "x", "backend": "cuda"}, {"noise": ""}, "not json", "[1]", "{"):
+            with self.subTest(build=build), tempfile.TemporaryDirectory() as d:
+                self.assertEqual(self.gen(d, build).noise_problem(), self.WORDS)
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(self.gen(d, {"sd_cpp": "x", "noise": "0123456789abcdef"}).noise_problem())
+
+    def test_switch_off_asks_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            for extra in ({}, {"noise": "sdcpp"}):
+                cfg = {**image_cfg(d), **extra}
+                self.assertIsNone(images_api.ImageGen(cfg).noise_problem())      # no BUILD.json needed
+
+    def test_a_job_is_refused_before_sd_cli_starts(self):
+        with tempfile.TemporaryDirectory() as d:
+            g = self.gen(d)
+            job = images_api.parse_request({"prompt": "a cat"}, {})
+            before = sorted(p.name for p in g.dir.iterdir())
+            with mock.patch("serve.lifeline.popen") as popen, self.assertRaises(images_api.ImageJobFailed) as cm:
+                g.run(job)
+            popen.assert_not_called()
+            self.assertEqual(str(cm.exception), self.WORDS)
+            self.assertEqual(sorted(p.name for p in g.dir.iterdir()), before)       # no job folder left behind
+            self.assertEqual(g.totals["failed"], 1)
+
     def test_env(self):
         env = images_api.image_env({"backend": "cuda", "gpu": 1, "env": {"X": 2}}, {"PATH": "p"})
         self.assertEqual((env["CUDA_VISIBLE_DEVICES"], env["CUDA_DEVICE_ORDER"], env["X"]), ("1", "PCI_BUS_ID", "2"))

@@ -2,9 +2,10 @@
 (serve/images.py sd_cli_args + image_env from the repo copy), one process per picture, and record time and memory.
 
     python3 -I -B run_set.py <root> <backend> <tag> <W>x<H> <quant> <models_dir> <prompt-indices e.g. 0-7> <seeds e.g. 42,1234>
-                             [--native] [--threads N] [--min-free-gb N] [--steps N] [--build NAME]
+                             [--native] [--noise] [--threads N] [--min-free-gb N] [--steps N] [--build NAME]
                              [--dump] [--cond-from TAG] [--latent-from TAG] [--noise-from DIR] [--exit-after K]
                              [--env K=V ...] [--extra-args "sd-cli args"]
+--noise: the config's images "noise" is "strata" (--model-args strata_noise=1); the build must have the generator.
 --build NAME uses <root>/build-NAME.json (e.g. a stage_hooks.py variant); --dump/--cond-from/--latent-from/
 --noise-from/--exit-after drive that variant's hooks (OWN5_* variables, see stage_hooks.py), per picture.
 
@@ -89,7 +90,7 @@ def main() -> int:
     build = json.loads((root / f"build-{bname}.json").read_text())
     md = Path(models).expanduser()
     cfg = QI.image_config(backend, quant, Path(build["exe"]), md.parent if md.name == QI.MODEL_DIR else md,
-                          native=native)
+                          native=native, noise="--noise" in a)
     if md.name != QI.MODEL_DIR:   # files sit directly in models_dir
         for k, name in (("diffusion_model", quant), ("vae", "vae"), ("llm", "llm")):
             cfg[k] = str(md / Path(QI.FILES[name][1]).name)
