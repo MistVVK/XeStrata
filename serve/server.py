@@ -7475,8 +7475,8 @@ def parse_multipart(ctype: str, body: bytes) -> tuple[dict, list[bytes]]:
     """A multipart/form-data body (OpenAI's /v1/images/edits) -> (its text fields, the bytes of its image or image[]
     files in order); the numbers the JSON request takes as numbers (n, seed, steps, num_inference_steps,
     output_compression, partial_images whole; vLLM-Omni's guidance_scale and true_cfg_scale) as numbers, stream's true
-    or false (as OpenAI's SDK writes a boolean in a form) as a bool, the mask file's bytes as "mask" and the control's
-    picture's as "control_image"."""
+    or false (as OpenAI's SDK writes a boolean in a form) as a bool, both as images.parse_number and parse_flag read
+    them, the mask file's bytes as "mask" and the control's picture's as "control_image"."""
     from email.parser import BytesParser
     from email.policy import HTTP
     msg = BytesParser(policy=HTTP).parsebytes(b"Content-Type: " + ctype.encode("latin-1") + b"\r\n\r\n" + body)
@@ -7496,17 +7496,14 @@ def parse_multipart(ctype: str, body: bytes) -> tuple[dict, list[bytes]]:
             fields["control_image"] = data
         elif isinstance(name, str) and name:
             value = data.decode("utf-8", "replace")
-            whole = name in ("n", "seed", "steps", "num_inference_steps", "output_compression", "partial_images") \
-                and value.strip().isdigit()
-            if name == "stream" and value.strip().lower() in ("true", "false"):
-                fields[name] = value.strip().lower() == "true"
-            elif name in ("guidance_scale", "true_cfg_scale"):
-                try:
-                    fields[name] = float(value)          # out of range or not finite: the request's own 400
-                except ValueError:
-                    fields[name] = value
-            else:
-                fields[name] = int(value) if whole else value
+            fields[name] = value
+            whole = name in ("n", "seed", "steps", "num_inference_steps", "output_compression", "partial_images")
+            # read as the image entries read them (out of range, or not a number or a boolean: the request's own 400)
+            with contextlib.suppress(images_api.ImageRequestError):
+                if name == "stream":
+                    fields[name] = images_api.parse_flag(value, name, value)
+                elif whole or name in ("guidance_scale", "true_cfg_scale"):
+                    fields[name] = images_api.parse_number(value, name, -math.inf, math.inf, value, whole)
     return fields, files
 
 
@@ -8777,7 +8774,7 @@ def make_handler(svc: Service):
                 fields, files = videos_api.stream_multipart(self.rfile, ctype, length, folder, limit)
                 src = next((f for f in files if f["field"] in videos_api.FILE_FIELDS), files[0] if files else None)
                 if seg:
-                    sync = not videos_api._truth(fields.get("job", False))
+                    sync = not videos_api.flag_field(fields, "job")
                     if sync and length > videos_api.SYNC_MAX_BYTES + (1 << 20):
                         raise videos_api.VideoRequestError(
                             f"the upload is past the limit of {videos_api.SYNC_MAX_BYTES >> 20} MiB", 413)

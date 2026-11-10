@@ -33,6 +33,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import math
 import os
 import re
 import shutil
@@ -230,67 +231,43 @@ def probe(path: Path) -> dict:
 
 # ------------------------------------------------------------------------------------------- the request
 def upscale_request(fields: dict, info: dict, cfg: dict, sync: bool) -> dict:
-    """An upscale's form fields and its source's probe -> the job: the upscaler (images.UPSCALE_MODELS' ids or a
-    method's name; none: auto, SeedVR2 where it fits), the output's size (size WIDTHxHEIGHT, else scale times the
-    source's, even sides), the seed, extra_params' color_correction_method, chunk_frames, temporal_overlap and
-    video_codec.  The synchronous answer's frames past SYNC_MAX_FRAMES: 400."""
-    extra = fields.get("extra_params") or {}
-    if isinstance(extra, str):
-        try:
-            extra = json.loads(extra) if extra.strip() else {}
-        except ValueError:
-            raise VideoRequestError("extra_params: a JSON object") from None
-    if not isinstance(extra, dict):
-        raise VideoRequestError("extra_params: a JSON object")
+    """An upscale's form fields and its source's probe -> the job: images.upscale_fields' (extra_params, the upscaler:
+    images.UPSCALE_MODELS' ids or a method's name, none: auto, SeedVR2 where it fits; color_correction_method), the
+    output's size (size WIDTHxHEIGHT, else scale times the source's, even sides; images.UPSCALE_MAX_SIDE a side at
+    most, as an image's upscale: the config's max_side is the drawing's, and a video is not drawn), the seed
+    (images.parse_request's), and the video's own extra_params: chunk_frames, temporal_overlap and video_codec.  The
+    synchronous answer's frames past SYNC_MAX_FRAMES: 400; every refusal a VideoRequestError."""
     if sync and info["frames"] > SYNC_MAX_FRAMES:
         raise VideoRequestError(f"the synchronous answer takes at most {SYNC_MAX_FRAMES} frames (this video has about "
                                 f"{info['frames']}); POST /v1/videos makes a job of it")
-    model = str(fields.get("model") or "auto")
-    method, variant = img.UPSCALE_MODELS.get(model, (model, None))
-    if method not in img.UPSCALE_METHODS:
-        raise VideoRequestError(f"model: an upscaler, one of {', '.join(['auto', *img.UPSCALE_MODELS])}, not {model!r}")
-    size = str(fields.get("size") or "").strip()
-    if size:
-        try:
-            w, h = (int(v) for v in size.lower().split("x"))
-        except ValueError:
-            raise VideoRequestError("size: WIDTHxHEIGHT") from None
-    else:
-        try:
-            scale = float(fields.get("scale") or extra.get("scale") or 2)
-        except (TypeError, ValueError):
-            raise VideoRequestError("scale: a number") from None
-        if not 0.25 <= scale <= 8:
-            raise VideoRequestError("scale: from 0.25 to 8")
-        w, h = round(info["width"] * scale / 2) * 2, round(info["height"] * scale / 2) * 2
-    top = int(cfg.get("max_side") or 4096)
-    if not (16 <= w <= top and 16 <= h <= top):
-        raise VideoRequestError(f"size: each side from 16 to {top}")
-    color = extra.get("color_correction_method")
-    if color is not None and color not in img.UPSCALE_COLORS:
-        raise VideoRequestError(f"color_correction_method: one of {', '.join(img.UPSCALE_COLORS)}")
-    chunk = int(extra.get("chunk_frames") or 0)
-    if chunk and (chunk < 1 or (chunk - 1) % 4):
-        raise VideoRequestError("chunk_frames: 4 n + 1 frames (1, 5, 9, 13, 17, 21 ...)")
-    overlap = int(extra.get("temporal_overlap") or 0)
-    if overlap < 0:
-        raise VideoRequestError("temporal_overlap: 0 or more latent frames")
-    codec = extra.get("video_codec")
-    if codec is not None and codec not in CODECS:
-        raise VideoRequestError(f"video_codec: one of {', '.join(CODECS)}")
     try:
-        given = fields.get("seed")
-        seed = int(str(given)) if given not in (None, "") else int.from_bytes(os.urandom(4), "big")
-    except (TypeError, ValueError):
-        raise VideoRequestError("seed: a whole number") from None
-    up = {"method": "seedvr2" if method == "auto" else method, "asked": model, "scale": None,
-          **({"variant": variant or "7b"} if method in ("seedvr2", "auto") else {}),
-          **({"color": color} if color else {})}
-    side = int(cfg.get("max_side") or 2048)   # the image upscale's base fields (parse_request), as images.py's
-    job = img.parse_request({"prompt": "upscale", "n": 1, "seed": seed, "size": f"{min(w, side)}x{min(h, side)}"}, cfg)
-    job.pop("bucket", None)
-    job.update(video=True, ups_only=True, upscaler=up, width=w, height=h, seed=seed, n=1, chunk=chunk,
-               overlap=overlap, codec=codec, source=info)
+        u = img.upscale_fields(fields)
+        extra = u["extra"]
+        size = str(fields.get("size") or "").strip()
+        if size:
+            try:
+                w, h = (int(v) for v in size.lower().split("x"))
+            except ValueError:
+                raise VideoRequestError("size: WIDTHxHEIGHT") from None
+        else:
+            scale = img.parse_number(fields.get("scale") or extra.get("scale") or None, "scale", 0.25, 8, 2.0)
+            w, h = round(info["width"] * scale / 2) * 2, round(info["height"] * scale / 2) * 2
+        top = img.UPSCALE_MAX_SIDE
+        if not (16 <= w <= top and 16 <= h <= top):
+            raise VideoRequestError(f"size: each side from 16 to {top}")
+        chunk = img.parse_number(extra.get("chunk_frames"), "chunk_frames", 0, math.inf, 0, whole=True)
+        if chunk and (chunk - 1) % 4:
+            raise VideoRequestError("chunk_frames: 4 n + 1 frames (1, 5, 9, 13, 17, 21 ...)")
+        overlap = img.parse_number(extra.get("temporal_overlap"), "temporal_overlap", 0, math.inf, 0, whole=True)
+        codec = extra.get("video_codec")
+        if codec is not None and codec not in CODECS:
+            raise VideoRequestError(f"video_codec: one of {', '.join(CODECS)}")
+        up = img.upscaler_of("seedvr2" if u["method"] == "auto" else u["method"], u["model"], u["color"],
+                             u["variant"])
+        job = img.ups_only_job({"prompt": "upscale", "seed": fields.get("seed")}, cfg, w, h, up)   # its seed too
+    except img.ImageRequestError as e:   # the video entries' 400 (explain: invalid_video)
+        raise VideoRequestError(str(e)) from None
+    job.update(video=True, chunk=chunk, overlap=overlap, codec=codec, source=info)
     return job
 
 
@@ -306,8 +283,12 @@ def _json_field(fields: dict, name: str):
     return v
 
 
-def _truth(v) -> bool:
-    return str(v).strip().lower() in ("1", "true", "yes", "on")
+def flag_field(fields: dict, name: str) -> bool:
+    """A video form's true or false (images.parse_flag's words; absent or blank: false), else a VideoRequestError."""
+    try:
+        return img.parse_flag(fields.get(name), name, False)
+    except img.ImageRequestError as e:
+        raise VideoRequestError(str(e)) from None
 
 
 def segment_request(fields: dict, info: dict, sync: bool) -> dict:
@@ -369,7 +350,7 @@ def segment_request(fields: dict, info: dict, sync: bool) -> dict:
     if sync and info["frames"] > SYNC_MAX_FRAMES:
         raise VideoRequestError(f"the synchronous answer takes at most {SYNC_MAX_FRAMES} frames (this video has about "
                                 f"{info['frames']}); job true makes a job of it")
-    return {"segment": {"words": words, "clicks": clicks, "mask_video": _truth(fields.get("mask_video", False)),
+    return {"segment": {"words": words, "clicks": clicks, "mask_video": flag_field(fields, "mask_video"),
                         "outputs": list(dict.fromkeys(outputs))},
             "width": info["width"], "height": info["height"], "n": 1, "steps": 1, "seed": 0, "source": info}
 

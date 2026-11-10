@@ -362,13 +362,61 @@ def parse_size(value, max_side: int) -> tuple[int, int]:
     return w, h
 
 
-def _int_field(req: dict, key: str, lo: int, hi: int, default):
-    v = req.get(key)
-    if v is None:
+# the words vLLM-Omni's form booleans take (pydantic's bool: t, y and the rest, any case), and enable and disable,
+# which the image tools' forms have taken
+FLAG_TRUE = ("true", "1", "yes", "on", "t", "y", "enable")
+FLAG_FALSE = ("false", "0", "no", "off", "f", "n", "disable")
+
+
+def parse_flag(v, name: str, default=None):
+    """A request's true or false, the one reading of every image and video entry's: a JSON boolean (or 1 or 0, 1.0 or
+    0.0, as pydantic's bool), or a form's word for one (FLAG_TRUE, FLAG_FALSE, any case) -> `default` when it is not
+    given (absent, null or blank text).  Any other value is an ImageRequestError, as the entries' models refuse one:
+    vLLM-Omni's form booleans and OpenAI's JSON ones (400 here, as the server's other errors in OpenAI's form; FastAPI
+    answers vLLM-Omni's 422)."""
+    if v is None or (isinstance(v, str) and not v.strip()):
         return default
-    if isinstance(v, bool) or not isinstance(v, int) or not lo <= v <= hi:
-        raise ImageRequestError(f"{key}: a whole number from {lo} to {hi}")
-    return v
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, float) and v in (0.0, 1.0):
+        return v == 1.0
+    s = str(v).strip().lower()
+    if s in FLAG_TRUE:
+        return True
+    if s in FLAG_FALSE:
+        return False
+    raise ImageRequestError(f"{name}: true or false, not {v!r}")
+
+
+def parse_number(v, name: str, lo: float, hi: float, default=None, whole: bool = False):
+    """A number from lo to hi (hi math.inf: no bound above), the one reading of every image and video entry's: a JSON
+    number, or a form's text of one (whole: an integer, as a JSON integer, a float equal to one or its text, 17.0 or
+    "17.0", as pydantic's int takes them for vLLM-Omni's fields; a fraction, 17.5, refused; a float otherwise) ->
+    `default` when it is not given (absent, null or blank text); else an ImageRequestError."""
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return default
+    span = f"{lo:g} or more" if hi == math.inf else f"from {lo} to {hi}" if whole else f"from {lo:g} to {hi:g}"
+    bad = ImageRequestError(f"{name}: a whole number {span}" if whole else f"{name}: a number {span}")
+    if isinstance(v, str):
+        s = v.strip()
+        try:
+            if whole:
+                m = re.fullmatch(r"([+-]?\d+)\.0+", s)
+                v = int(m.group(1) if m else s)
+            else:
+                v = float(s)
+        except ValueError:
+            raise bad from None
+    if whole and isinstance(v, float) and math.isfinite(v) and v.is_integer():
+        v = int(v)
+    if isinstance(v, bool) or not isinstance(v, int if whole else (int, float)) or not math.isfinite(v) \
+            or not lo <= v <= hi:
+        raise bad
+    return v if whole else float(v)
+
+
+def _int_field(req: dict, key: str, lo: int, hi: int, default):
+    return parse_number(req.get(key), key, lo, hi, default, whole=True)
 
 
 def model_defaults(cfg: dict) -> dict:
@@ -623,18 +671,7 @@ def parse_request(req: dict, cfg: dict) -> dict:
 
 
 def _number(req: dict, key: str, lo: float, hi: float, default: float) -> float:
-    """A number field (or a form field's text) from lo to hi, checked; `default` when none."""
-    v = req.get(key)
-    if v is None or v == "":
-        return default
-    if isinstance(v, str):
-        try:
-            v = float(v.strip())
-        except ValueError:
-            raise ImageRequestError(f"{key}: a number from {lo:g} to {hi:g}") from None
-    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not lo <= v <= hi:
-        raise ImageRequestError(f"{key}: a number from {lo:g} to {hi:g}")
-    return float(v)
+    return parse_number(req.get(key), key, lo, hi, default)
 
 
 def _blocks(req: dict, key: str, default: list[int]) -> list[int]:
@@ -855,12 +892,9 @@ def cfg_request(req: dict, cfg: dict | None = None) -> dict:
             raise ImageRequestError("negative_prompt: a string of at most 16000 characters")
         out["negative_prompt"] = neg
     for key in ("guidance_scale", "true_cfg_scale"):
-        v = req.get(key)
-        if v is None:
-            continue
-        if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= CFG_MAX:
-            raise ImageRequestError(f"{key}: a number from 0 to {CFG_MAX:g}")
-        out[key] = float(v)
+        v = parse_number(req.get(key), key, 0, CFG_MAX)
+        if v is not None:
+            out[key] = v
     if (cfg or {}).get("family") == "hunyuan-image-3":
         out.pop("negative_prompt", None)
         scale = out.get("guidance_scale")
@@ -1212,11 +1246,7 @@ def parse_upscale(req: dict, image: bytes, cfg: dict) -> dict:
     variant = v.get("variant") or None
     if variant is not None and variant not in SEEDVR2_VARIANTS:
         raise ImageRequestError(f"upscale.variant: SeedVR2's {', '.join(SEEDVR2_VARIANTS)}, not {variant!r}")
-    redraw = v.get("redraw", False)
-    if isinstance(redraw, str):   # a form's field
-        redraw = redraw.strip().lower() not in ("false", "0", "no", "off", "")
-    if not isinstance(redraw, bool):
-        raise ImageRequestError("upscale.redraw: true or false")
+    redraw = parse_flag(v.get("redraw"), "upscale.redraw", False)
     if not redraw and v.get("strength") is not None:
         raise ImageRequestError("upscale.strength: only with \"redraw\": true")
     w0, h0 = image_dims(image)
@@ -1226,15 +1256,12 @@ def parse_upscale(req: dict, image: bytes, cfg: dict) -> dict:
     resolved = method if method != "auto" else "realesrgan" if redraw else "seedvr2"
     if variant is not None and resolved != "seedvr2":
         raise ImageRequestError("upscale.variant: SeedVR2's alone")
-    upscaler = {"method": resolved, "asked": method, "color": color,
-                **({"variant": variant or "7b"} if resolved == "seedvr2" else {})}
-    side = int(cfg.get("max_side") or 2048)
+    upscaler = upscaler_of(resolved, method, color, variant)
     if not redraw:
-        job = parse_request({**req, "prompt": str(req.get("prompt") or "").strip() or "upscale", "n": 1,
-                             "size": f"{min(w, side)}x{min(h, side)}"}, cfg)
-        job.pop("bucket", None)
-        job.update(width=w, height=h, init=image, ups_only=True, upscaler=upscaler, n=1)
+        job = ups_only_job({**req, "prompt": str(req.get("prompt") or "").strip() or "upscale"}, cfg, w, h, upscaler)
+        job["init"] = image
         return job
+    side = int(cfg.get("max_side") or 2048)
     tiled = max(w, h) > side
     job = parse_request({**req, "size": f"{min(w, side)}x{min(h, side)}"}, cfg)
     job["width"], job["height"] = w, h
@@ -1255,35 +1282,64 @@ def parse_upscale(req: dict, image: bytes, cfg: dict) -> dict:
     return job
 
 
+def upscaler_of(method: str, asked: str, color: str | None = None, variant: str | None = None, **more) -> dict:
+    """An upscaler as the jobs carry it (job["upscaler"], job["crop_ups"]; the engine's UPS words): the method run
+    (UPSCALE_METHODS but auto), the one asked for (auto: upscaler_weights may take RealESRGAN for a SeedVR2 that does
+    not fit), its color correction (None: the method's own) and SeedVR2's variant (7b where none is asked)."""
+    return {"method": method, "asked": asked, "color": color,
+            **({"variant": variant or "7b"} if method == "seedvr2" else {}), **more}
+
+
+def ups_only_job(req: dict, cfg: dict, w: int, h: int, upscaler: dict) -> dict:
+    """An upscale without a drawing (an image's, parse_upscale's; a video's, videos.upscale_request): parse_request's
+    base fields of `req` (its prompt, seed, answer's format) at the model's size at most (max_side: no image model
+    runs, the upscaler makes w x h), one output -> the job with job["ups_only"] and `upscaler` (upscaler_of)."""
+    side = int(cfg.get("max_side") or 2048)
+    job = parse_request({**req, "n": 1, "size": f"{min(w, side)}x{min(h, side)}"}, cfg)
+    job.pop("bucket", None)
+    job.update(width=w, height=h, ups_only=True, upscaler=upscaler, n=1)
+    return job
+
+
+def upscale_fields(fields: dict) -> dict:
+    """The upscale entries' shared fields, an image's (/v1/images/upscale, LocalAI's) and a video's (/v1/videos,
+    vLLM-Omni's): extra_params (a JSON object, or a form's text of one; none or blank: {}), model (UPSCALE_MODELS' ids
+    or a method's name; none: auto) and extra_params' color_correction_method (vLLM-Omni's SeedVR2's: UPSCALE_COLORS;
+    none or blank: the upscaler's own) -> {"extra", "model", "method", "variant", "color"}; else an
+    ImageRequestError."""
+    extra = fields.get("extra_params") or {}
+    if isinstance(extra, str):   # a form's field
+        try:
+            extra = json.loads(extra) if extra.strip() else {}
+        except ValueError:
+            raise ImageRequestError("extra_params: a JSON object") from None
+    if not isinstance(extra, dict):
+        raise ImageRequestError("extra_params: a JSON object")
+    model = str(fields.get("model") or "auto")
+    method, variant = UPSCALE_MODELS.get(model, (model, None))
+    if method not in UPSCALE_METHODS:
+        raise ImageRequestError(f"model: an upscaler, one of {', '.join(['auto', *UPSCALE_MODELS])}, not {model!r}")
+    color = extra.get("color_correction_method") or None
+    if color is not None and color not in UPSCALE_COLORS:
+        raise ImageRequestError(f"color_correction_method: one of {', '.join(UPSCALE_COLORS)}, not {color!r}")
+    return {"extra": extra, "model": model, "method": method, "variant": variant, "color": color}
+
+
 def upscale_request(fields: dict) -> tuple[dict, str | None]:
     """POST /v1/images/upscale's fields (LocalAI's: model, scale; OpenAI's and vLLM-Omni's response_format,
     output_format, output_compression, seed; prompt for a redraw; extra_params: vLLM-Omni's color_correction_method,
     and redraw, redraw_strength and redraw_model, XeStrata's) -> (the edits' request with its `upscale`, the image model
     a redraw names or None).  `model` is an upscaler (UPSCALE_MODELS' ids, or a method's name; none: auto); the scale
     its own where it has one (RealESRGAN x4plus's 4), else 2; no redraw unless extra_params asks for one."""
-    extra = fields.get("extra_params") or {}
-    if isinstance(extra, str):   # a form's field
-        try:
-            extra = json.loads(extra)
-        except ValueError:
-            raise ImageRequestError("extra_params: a JSON object") from None
-    if not isinstance(extra, dict):
-        raise ImageRequestError("extra_params: a JSON object")
-    model = fields.get("model") or "auto"
-    method, variant = UPSCALE_MODELS.get(model, (model, None))
-    if method not in UPSCALE_METHODS:
-        raise ImageRequestError(f"model: an upscaler, one of {', '.join(['auto', *UPSCALE_MODELS])}, not {model!r}")
-    up: dict = {"method": method, "scale": fields.get("scale") or (4 if method == "realesrgan" else 2),
-                "redraw": extra.get("redraw", False), **({"variant": variant} if variant else {})}
-    if extra.get("color_correction_method") is not None:
-        up["color"] = extra["color_correction_method"]
+    u = upscale_fields(fields)
+    extra, method = u["extra"], u["method"]
+    # the range parse_upscale takes (above 1 it checks); 0 or none: the default, as it has been
+    scale = parse_number(fields.get("scale") or None, "scale", 1, UPSCALE_MAX_SCALE,
+                         4 if method == "realesrgan" else 2)
+    up: dict = {"method": method, "scale": scale, "redraw": extra.get("redraw", False),
+                **({"variant": u["variant"]} if u["variant"] else {}), **({"color": u["color"]} if u["color"] else {})}
     if extra.get("redraw_strength") is not None:
         up["strength"] = extra["redraw_strength"]
-    if isinstance(up["scale"], str):   # a form's field
-        try:
-            up["scale"] = float(up["scale"])
-        except ValueError:
-            raise ImageRequestError("scale: a number") from None
     req = {k: fields[k] for k in ("prompt", "negative_prompt", "response_format", "output_format",
                                   "output_compression", "seed", "steps", "num_inference_steps") if k in fields}
     req["upscale"] = up
@@ -1754,8 +1810,7 @@ def crop_upscaler(job: dict, req: dict) -> None:
     resolved = method if method != "auto" else "realesrgan" if scale >= CROP_UPS_AUTO else "lanczos"
     if resolved == "lanczos" or scale <= 1.0:
         return
-    job["crop_ups"] = {"method": resolved, "asked": method, "color": None, "scale": round(scale, 2),
-                       **({"variant": variant or "7b"} if resolved == "seedvr2" else {})}
+    job["crop_ups"] = upscaler_of(resolved, method, None, variant, scale=round(scale, 2))
 
 
 def crop_whole(cfg: dict, W: int, H: int, blend: int = CROP_BLEND) -> dict:
@@ -1857,19 +1912,6 @@ def check_tool(cfg: dict, name: str) -> None:
     conf = cfg.get("image_tools")
     if conf is not None and name not in conf:
         raise ImageRequestError(f"{name} is turned off on this server (its config's images \"image_tools\")")
-
-
-def parse_flag(v, name: str) -> bool | None:
-    """A request's true or false (a form's "on", "1", "off", "0" too) -> None when it is not given."""
-    if v is None or v == "":
-        return None
-    if isinstance(v, bool):
-        return v
-    if str(v).lower() in ("true", "on", "1"):
-        return True
-    if str(v).lower() in ("false", "off", "0"):
-        return False
-    raise ImageRequestError(f"{name}: true or false")
 
 
 def color_match_mode(req: dict, cfg: dict) -> str:

@@ -106,27 +106,11 @@ def weight_names(kind: str, mode: str | None) -> list[str]:
 
 
 def _num(v: dict, key: str, lo: float, hi: float, default: float) -> float:
-    x = v.get(key, default)
-    if isinstance(x, bool) or not isinstance(x, (int, float, str)):
-        raise img.ImageRequestError(f"control.{key}: a number from {lo:g} to {hi:g}")
-    try:
-        f = float(x)
-    except ValueError:
-        raise img.ImageRequestError(f"control.{key}: a number from {lo:g} to {hi:g}") from None
-    if not lo <= f <= hi:
-        raise img.ImageRequestError(f"control.{key}: a number from {lo:g} to {hi:g}")
-    return f
+    return img.parse_number(v.get(key), f"control.{key}", lo, hi, default)
 
 
 def _flag(v: dict, key: str, default: bool) -> bool:
-    x = v.get(key, default)
-    if isinstance(x, bool):
-        return x
-    if str(x).lower() in ("1", "true", "on", "enable", "yes"):
-        return True
-    if str(x).lower() in ("0", "false", "off", "disable", "no"):
-        return False
-    raise img.ImageRequestError(f"control.{key}: true or false")
+    return img.parse_flag(v.get(key), f"control.{key}", default)
 
 
 def decode_image(v) -> bytes:

@@ -670,30 +670,11 @@ def mask_rle(mask) -> dict:
 
 # ------------------------------------------------------------------------------------------- the entry points
 def _flag(fields: dict, name: str, default: bool) -> bool:
-    v = fields.get(name)
-    if v in (None, ""):
-        return default
-    if isinstance(v, bool):
-        return v
-    s = str(v).strip().lower()
-    if s in ("true", "1", "yes", "on"):
-        return True
-    if s in ("false", "0", "no", "off"):
-        return False
-    raise img.ImageRequestError(f"{name}: true or false, not {v!r}")
+    return img.parse_flag(fields.get(name), name, default)
 
 
 def _number(fields: dict, name: str, default: float, lo: float, hi: float) -> float:
-    v = fields.get(name)
-    if v in (None, ""):
-        return default
-    try:
-        x = float(str(v))
-    except (TypeError, ValueError):
-        raise img.ImageRequestError(f"{name}: a number from {lo:g} to {hi:g}") from None
-    if not lo <= x <= hi:
-        raise img.ImageRequestError(f"{name}: from {lo:g} to {hi:g}, not {v!r}")
-    return x
+    return img.parse_number(fields.get(name), name, lo, hi, default)
 
 
 def segmentation_response(svc, gen, fields: dict, picture: bytes, cancel=None) -> dict:

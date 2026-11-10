@@ -10,8 +10,10 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import math
 import os
 import queue
+import re
 import shutil
 import socket
 import sys
@@ -6358,3 +6360,97 @@ class SeedVR2File(unittest.TestCase):
                 self.assertEqual(images.seedvr2_file(gen, "7b"), "seedvr2-7b-int8")
             with mock.patch.object(images, "ram_available_mib", return_value=0):
                 self.assertEqual(images.seedvr2_file(gen, "7b"), "seedvr2-3b-int8")
+
+
+class ImageRequestWords(unittest.TestCase):
+    """images.parse_flag and parse_number: the one reading of the image and video entries' booleans and numbers, a
+    JSON value or a form's text of one."""
+
+    def test_flag_words(self):
+        from serve import images as images_api
+        for word in images_api.FLAG_TRUE:
+            self.assertIs(images_api.parse_flag(word.upper(), "f"), True, word)
+        for word in images_api.FLAG_FALSE:
+            self.assertIs(images_api.parse_flag(f" {word} ", "f", True), False, word)
+        self.assertIs(images_api.parse_flag(False, "f", True), False)
+        # vLLM-Omni's words (pydantic's bool) besides the long ones: t, y, f and n, and a JSON 1.0 or 0.0
+        self.assertEqual([images_api.parse_flag(w, "f") for w in ("T", "y", "f", "N", 1, 0, 1.0, 0.0)],
+                         [True, True, False, False, True, False, True, False])
+        for absent in (None, "", "  "):
+            self.assertEqual(images_api.parse_flag(absent, "f", "default"), "default")
+
+    def test_flag_other_word_is_400(self):
+        # a word that is neither is refused, as vLLM-Omni's form booleans are (FastAPI's bool), on every entry: the
+        # upscale's redraw and the videos' mask_video and job read it as true or false no more
+        from serve import images as images_api
+        from serve import videos as videos_api
+        with self.assertRaisesRegex(images_api.ImageRequestError, r"^f: true or false, not 'banana'$"):
+            images_api.parse_flag("banana", "f")
+        with self.assertRaisesRegex(images_api.ImageRequestError, r"^upscale\.redraw: true or false"):
+            images_api.parse_upscale({"upscale": {"scale": 2, "redraw": "banana"}}, b"", {})
+        with self.assertRaises(videos_api.VideoRequestError) as e:
+            videos_api.flag_field({"mask_video": "banana"}, "mask_video")
+        self.assertEqual((e.exception.status, str(e.exception)), (400, "mask_video: true or false, not 'banana'"))
+
+    def test_numbers(self):
+        from serve import images as images_api
+        n = images_api.parse_number
+        self.assertEqual((n("3", "x", 0, 9, whole=True), n(" 2.5 ", "x", 0, 9), n(4, "x", 0, 9)), (3, 2.5, 4.0))
+        # a whole number given as a float equal to one, as pydantic's int takes it (vLLM-Omni's fields): 17.0 is 17
+        self.assertEqual((n(17.0, "x", 0, 99, whole=True), n("17.0", "x", 0, 99, whole=True)), (17, 17))
+        self.assertIsInstance(n(17.0, "x", 0, 99, whole=True), int)
+        self.assertIsInstance(n(4, "x", 0, 9), float)
+        for absent in (None, "", " "):
+            self.assertEqual(n(absent, "x", 0, 9, 7), 7)
+        for bad in (True, "2.5", 2.5, 10, "nan", "17.5", 17.5, "17."):
+            with self.assertRaisesRegex(images_api.ImageRequestError, r"^x: a whole number from 0 to 9$"):
+                n(bad, "x", 0, 9, whole=True)
+        with self.assertRaisesRegex(images_api.ImageRequestError, r"^x: a number from 0 to 9$"):
+            n(float("inf"), "x", 0, 9)
+        with self.assertRaisesRegex(images_api.ImageRequestError, r"^x: a whole number 0 or more$"):
+            n(-1, "x", 0, math.inf, whole=True)
+
+
+class UpscaleRequests(unittest.TestCase):
+    """An image's upscale (/v1/images/upscale, LocalAI's) and a video's (/v1/videos, vLLM-Omni's) read their shared
+    fields (extra_params, model, color_correction_method) one way, each refusing as its own entry does."""
+
+    SOURCE = {"width": 640, "height": 360, "fps": 30.0, "vfr": False, "frames": 90, "duration": 3.0, "audio": False}
+
+    def test_same_fields_same_upscaler(self):
+        from serve import images as images_api
+        from serve import videos as videos_api
+        fields = {"model": "seedvr2-7b-sharp", "scale": "2",
+                  "extra_params": json.dumps({"color_correction_method": "wavelet"})}
+        req, _ = images_api.upscale_request(fields)
+        self.assertEqual(req["upscale"], {"method": "seedvr2", "scale": 2.0, "redraw": False, "variant": "7b-sharp",
+                                          "color": "wavelet"})
+        job = videos_api.upscale_request(fields, self.SOURCE, {}, False)
+        self.assertEqual(job["upscaler"], {"method": "seedvr2", "asked": "seedvr2-7b-sharp", "color": "wavelet",
+                                           "variant": "7b-sharp"})
+        self.assertEqual((job["width"], job["height"], job["ups_only"], job["video"]), (1280, 720, True, True))
+
+    def test_refusals(self):
+        from serve import images as images_api
+        from serve import videos as videos_api
+        for fields, message in (({"model": "esrgan"}, "model: an upscaler"),
+                                ({"extra_params": "{"}, "extra_params: a JSON object"),
+                                ({"extra_params": {"color_correction_method": "sepia"}},
+                                 "color_correction_method: one of none, lab, adain, wavelet, not 'sepia'")):
+            with self.assertRaisesRegex(images_api.ImageRequestError, "^" + re.escape(message)):
+                images_api.upscale_request(fields)
+            with self.assertRaises(videos_api.VideoRequestError) as e:   # the video entries' own 400
+                videos_api.upscale_request(fields, self.SOURCE, {}, False)
+            self.assertEqual(e.exception.status, 400)
+            self.assertTrue(str(e.exception).startswith(message), str(e.exception))
+
+    def test_video_side_limit_is_the_upscale_s(self):
+        # the config's max_side is the drawing's (an image model's), not a video upscale's: its limit is an image
+        # upscale's, UPSCALE_MAX_SIDE
+        from serve import images as images_api
+        from serve import videos as videos_api
+        top = images_api.UPSCALE_MAX_SIDE
+        job = videos_api.upscale_request({"size": f"{top}x2160"}, self.SOURCE, {"max_side": 1024}, False)
+        self.assertEqual((job["width"], job["height"]), (top, 2160))
+        with self.assertRaisesRegex(videos_api.VideoRequestError, f"^size: each side from 16 to {top}$"):
+            videos_api.upscale_request({"size": f"{top + 16}x2160"}, self.SOURCE, {}, False)
