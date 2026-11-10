@@ -23,14 +23,21 @@ macro(strata_quant_layer)
                                        ${_sq}/src/quant/x86/act_avx.cpp ${_sq}/src/quant/x86/dot_avx512.cpp)
     target_compile_definitions(strata_quant PRIVATE STRATA_QUANT_X86_TIERS=1)
     if(MSVC)
+      # MSVC contracts neither ggml-cpu's C nor these files' intrinsics (measured: 0 differences from its own ggml in all three flavours); the Windows bits
+      # differ from GCC's in the Q5_K and IQ1_S dots, see below
       set_source_files_properties(${_sq}/src/quant/x86/dot_avx2.cpp ${_sq}/src/quant/x86/act_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
       set_source_files_properties(${_sq}/src/quant/x86/dot_avx.cpp ${_sq}/src/quant/x86/act_avx.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX")
       set_source_files_properties(${_sq}/src/quant/x86/dot_avx512.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
     else()
-      # ggml-cpu is C built as gnu11, where GCC contracts a multiply and an add into an FMA wherever it can (-ffp-contract=fast), the intrinsics'
-      # `_mm256_add_ps(_mm256_mul_ps(a, b), c)` patterns included; the same flag keeps this C++ (-std=c++20, an ISO mode that contracts less) summing
-      # as ggml does.  The one place ggml's GCC does NOT fuse, the IQ4_NL scalar tail, is pinned in x86_dots.inc (STRATA_NOFUSE).
-      # tests/quant/run_oracle.sh is what notices a toolchain that disagrees.
+      # What is pinned, and against what: the reference is ggml-cpu as GCC 13.3 builds it (C, gnu11, where GCC contracts a multiply and an add into an
+      # FMA wherever it can, the intrinsics' `_mm256_add_ps(_mm256_mul_ps(a, b), c)` patterns included).  -ffp-contract=fast keeps this C++ (-std=c++20,
+      # an ISO mode that contracts less) summing as that ggml does; the one place it does NOT fuse, the IQ4_NL scalar tail, is pinned unfused in
+      # x86_dots.inc (STRATA_NOFUSE), and dot_generic.cpp (Q2_0 under every contract) is -ffp-contract=off above.
+      # Measured 11-10 on one Broadwell box, all three flavours: our results are the same bytes under GCC 13.3, 14.3 and 15.2; ggml-cpu's are not
+      # (GCC 14.3 also fuses the IQ4_NL tail: 55 rows of the oracle; GCC 15.2 that and the generic Q2_0 dot: 238 rows; 1-4 ulp).  So the oracle's gate
+      # (tests/quant/quant_parity.cpp, leg 1) compares with the GCC 13.3 reference stored in tests/quant/golden_x86.txt, under any compiler; the ggml
+      # built here is compared for information.  MSVC (branch above, no pin): ours equals MSVC's ggml, which does not contract the intrinsics, so
+      # Q5_K and IQ1_S dots differ from GCC's by 1-512 ulp (the golden file's msvc lines).
       set(STRATA_QUANT_AVX2_EXTRA "" CACHE STRING "extra compile options for the AVX2 tier files (experiments), semicolon separated")
       set_source_files_properties(${_sq}/src/quant/x86/dot_avx2.cpp ${_sq}/src/quant/x86/act_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-ffp-contract=fast;${STRATA_QUANT_AVX2_EXTRA}")
       # AVX2, FMA and F16C explicitly off: a -march=native build host must not leak wider code into the AVX-only tier

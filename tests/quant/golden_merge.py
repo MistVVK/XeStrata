@@ -59,7 +59,9 @@ def main():
                 sys.exit("%s: family gcc needs GCC 13.x, this fragment is made by %s" % (path, who))
             if fam == "msvc" and not re.match(r"MSVC 194", who):
                 sys.exit("%s: family msvc needs MSVC 19.4x, this fragment is made by %s" % (path, who))
-            made[fam].add(who.split(",")[0])
+            name = who.split(",")[0]
+            m = re.match(r"MSVC (\d{2})(\d{2})(\d{5})$", name)
+            made[fam].add("MSVC %s.%s.%s" % m.groups() if m else name)
             fl = lines[0][0]
             into[fl] = lines
     out = []
