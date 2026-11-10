@@ -8030,10 +8030,15 @@ def arg_after(args, flag):
 
 
 def bare_auto_is_32768(gpu, args, env) -> bool:
-    """Round 0212 (owner 11-03): the engine gives a bare `--prefill auto` a 32768-token ceiling on one NVIDIA card of compute capability 8.0 or up
-    (generate.cpp, nv_chunk.hpp); STRATA_NV_CHUNK=0 or STRATA_DEFAULTS=026 (the config's env or this process's) keep 8192, and a layer split reads 8192-token chunks."""
+    """Round 0212 (owner 11-03): the engine gives a bare `--prefill auto` a 32768-token ceiling on one NVIDIA card of compute capability 8.0 or up, and on
+    7.0 (Volta; include/strata/core/nv_chunk.hpp `nv_chunk_card_ok`, called from generate.cpp); Turing (7.5) and Pascal (6.x) keep 8192.  STRATA_NV_CHUNK=0
+    or STRATA_DEFAULTS=026 (the config's env or this process's) keep 8192, and a layer split reads 8192-token chunks.  `gpu` is the one card the config
+    runs on (the engine sees only the cards CUDA_VISIBLE_DEVICES names, so for a mixed PC the lowest of those decides, which is this card)."""
     arch = str((gpu or {}).get("arch", ""))
-    if not arch.isdigit() or len(arch) < 2 or int(arch[:-1]) < 8:
+    if not arch.isdigit() or len(arch) < 2:
+        return False
+    major, minor = int(arch[:-1]), int(arch[-1])     # "70" -> 7.0, "86" -> 8.6, "120" -> 12.0
+    if not (major >= 8 or (major == 7 and minor == 0)):
         return False
     if any(a in (args or []) for a in ("--gpus", "--layer-split")):
         return False

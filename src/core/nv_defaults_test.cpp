@@ -91,7 +91,11 @@ int main() {
     CHECK(nv_chunk_ceiling("0", false) == 0);          // STRATA_NV_CHUNK=0 keeps 8192
     CHECK(nv_chunk_ceiling(nullptr, true) == 0);       // STRATA_DEFAULTS=026 keeps 8192
     CHECK(nv_chunk_ceiling("16", true) == 0);
-    CHECK(!nv_chunk_card_ok(7) && !nv_chunk_card_ok(6) && nv_chunk_card_ok(8) && nv_chunk_card_ok(12));   // Volta / Turing / Pascal keep 8192
+    CHECK(nv_chunk_card_ok(7, 0));                                                    // Volta (V100): measured, takes the raise
+    CHECK(!nv_chunk_card_ok(7, 5));                                                   // Turing: not measured, keeps 8192
+    CHECK(!nv_chunk_card_ok(6, 0) && !nv_chunk_card_ok(6, 1) && !nv_chunk_card_ok(6, 2));   // Pascal: not measured, keeps 8192
+    CHECK(!nv_chunk_card_ok(5, 2) && !nv_chunk_card_ok(0, 0));
+    CHECK(nv_chunk_card_ok(8, 0) && nv_chunk_card_ok(8, 6) && nv_chunk_card_ok(9, 0) && nv_chunk_card_ok(12, 0));
     CHECK(nv_chunk_step_down(32768) == 16384 && nv_chunk_step_down(16384) == 8192 && nv_chunk_step_down(8192) == 8192);
     // the one-argument form reads STRATA_DEFAULTS
     put("STRATA_DEFAULTS", "026");
