@@ -31,10 +31,11 @@ class WindowEngine:
     THOUGHT = "Let me think step by step about two plus two. " * 4
     ANSWER = "The answer is 4."
 
-    def __init__(self, tok, windows=(3, 2, 4), overrun=True, can_hold=True, honours_hold=True, thought=None):
+    def __init__(self, tok, windows=(3, 2, 4), overrun=True, can_hold=True, honours_hold=True, thought=None, can_hold_batch=False):
         self.tok, self.max_context = tok, 4096
         self.windows, self.overrun = windows, overrun
         self.can_hold, self.honours_hold = can_hold, honours_hold
+        self.can_hold_batch = can_hold_batch   # READY says holdb: the --batch slots end at the hold too (P2b)
         self.batch = self.multi = 0
         self.thought = thought if thought is not None else self.THOUGHT
         self.start = tok.encode("<|im_start|>", parse_special=True)[0]
@@ -216,9 +217,37 @@ class ThinkingHold(HoldCase):
         self.assertEqual(len(self.engine.passes), 1)
         self.assertIsNone(self.engine.passes[0]["hold"])
 
-    def test_a_batch_engine_gets_no_hold(self):
+    def test_a_batch_engine_whose_slots_do_not_say_holdb_gets_no_hold(self):
         self.start()
         self.engine.batch = 4
+        self.assertEqual(self.chat(reasoning_budget_tokens=20), self.expected(20))
+        self.assertTrue(all(p["hold"] is None for p in self.engine.passes))
+
+    def test_new_server_old_engine_no_token_no_hold_for_a_batch_engine(self):
+        """Mixed versions, new server + old engine: an engine that says neither hold nor holdb (before P2), and one that says hold but
+        not holdb (P2 without P2b), get no key when they run --batch; the budget then cuts and STOPs as it always did."""
+        for kw in ({"can_hold": False}, {"can_hold": True}, {"can_hold": False, "can_hold_batch": True}):
+            with self.subTest(**kw):
+                self.start(**kw)
+                self.engine.batch = 4
+                self.assertEqual(self.chat(reasoning_budget_tokens=20), self.expected(20))
+                self.assertTrue(all(p["hold"] is None for p in self.engine.passes))
+
+    def test_a_batch_engine_that_says_holdb_gets_the_hold(self):
+        """P2b: a --batch engine whose slots end at the hold (READY holdb) gets the key like a solo engine: the second pass reads the last
+        reasoning token and the wrap-up, as in the solo case."""
+        self.start(can_hold_batch=True)
+        self.engine.batch = 4
+        self.assertEqual(self.chat(reasoning_budget_tokens=20), self.expected(20))
+        passes = self.engine.passes
+        self.assertEqual(len(passes), 2)
+        self.assertEqual(passes[0]["hold"], (20, self.tok.encode("</think>", parse_special=True)[0]))
+        wrap = len(self.tok.encode(REASONING_WRAP_UP, parse_special=True))
+        self.assertEqual((passes[1]["reused"], passes[1]["read"]), (passes[0]["prompt"] + 20 - 1, 1 + wrap))
+
+    def test_holdb_does_not_matter_without_batch_and_a_multi_engine_gets_none(self):
+        self.start(can_hold_batch=True)
+        self.engine.multi = 2
         self.assertEqual(self.chat(reasoning_budget_tokens=20), self.expected(20))
         self.assertTrue(all(p["hold"] is None for p in self.engine.passes))
 

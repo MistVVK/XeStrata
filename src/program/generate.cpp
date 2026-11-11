@@ -14115,7 +14115,7 @@ int main(int argc, char** argv) {
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
         strata::core::manifest::instance().write("ready");   // STRATA_MANIFEST (a no-op unless it is set)
-        std::printf("READY %lld stop hold\n", (long long) o.max_context);   // "stop": this engine honours STOP; "hold": GEN hold=N:ID
+        std::printf("READY %lld stop hold holdb\n", (long long) o.max_context);   // "stop": this engine honours STOP; "hold": GEN hold=N:ID; "holdb": the --batch slots end at the hold too (BDONE hold)
         std::fflush(stdout);
         std::string line;
         int64_t rounds = 0;
@@ -14307,6 +14307,7 @@ int main(int argc, char** argv) {
             int n_drafts = 1;              ///< STRATA_PIPED_MTP: how many of `draft` its next window checks
             int64_t p = 0;                 ///< its position
             int64_t produced = 0, max_new = 0;
+            strata::core::SlotHold hold;   ///< GEN / BGEN hold=N:ID (the server's thinking budget): the slot ends with BDONE "hold" after N emitted tokens unless ID came first
             Clock::time_point t0;
             // the slot's own conversation cache: the tokens its sessions hold (the prompt, then every token a window
             // fed).  Kept when the request ends (`cached`), so the next turn of that conversation continues from it
@@ -14630,7 +14631,7 @@ int main(int argc, char** argv) {
                     const BSlot& q = bs[(size_t) act_ids[k]];
                     int want = spare / nact + (k < spare % nact ? 1 : 0);
                     want = std::min(want, (int) strata::core::Dflash2Drafter::kDrafts);
-                    want = std::min<int>(want, (int) std::max<int64_t>(0, q.max_new - q.produced - 1));
+                    want = std::min<int>(want, (int) std::max<int64_t>(0, strata::core::slot_cap(q.max_new, q.hold) - q.produced - 1));
                     want = std::min<int>(want, (int) std::max<int64_t>(0, (int64_t) o.max_context - q.p - 2));
                     want = std::min(want, df2_cap);
                     if (q.draft_ready && df2_conf > 0.0) {   // a draft row is worth its cost where the chain so far is likely: the product of the selector's probabilities
@@ -14761,7 +14762,7 @@ int main(int argc, char** argv) {
                 int kp = 1;   // the proposals the target picked, in order: row j + 1 stands when the target's pick after row j is its token and nothing ended
                 while (batch_mtp && kp < nrow[a] && outb[i + kp - 1] == tok[i + kp] && !sl.stop &&
                        std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outb[i + kp - 1]) == o.eos_ids.end() &&
-                       sl.produced + kp + 1 <= sl.max_new && sl.p + kp + 2 <= o.max_context)
+                       sl.produced + kp + 1 <= strata::core::slot_cap(sl.max_new, sl.hold) && sl.p + kp + 2 <= o.max_context)
                     ++kp;
                 keep[b] = kp;
             }
@@ -14801,8 +14802,10 @@ int main(int argc, char** argv) {
                     sl.ids.push_back(tok[first[t] + j]);
                     std::printf("BT %d %d\n", b, (int) y);
                     ++sl.produced;
+                    strata::core::slot_hold_emitted(sl.hold, (int64_t) y);
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+                                    : strata::core::slot_hold_reached(sl.hold, sl.produced, sl.max_new) ? "hold"
                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
@@ -15106,7 +15109,9 @@ int main(int argc, char** argv) {
                     ++sl.produced;
                     ++bt_rows;
                     ++pipe_rows;
+                    strata::core::slot_hold_emitted(sl.hold, (int64_t) y);
                     const char* fin = is_eos(y) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+                                    : strata::core::slot_hold_reached(sl.hold, sl.produced, sl.max_new) ? "hold"
                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
                     sl.ids.push_back(G.tok[blk.f + j]);
                     if (fin != nullptr) {
@@ -15250,8 +15255,10 @@ int main(int argc, char** argv) {
                     ++sl.produced;
                     ++bt_rows;
                     ++pipe_rows;
+                    strata::core::slot_hold_emitted(sl.hold, (int64_t) y);
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+                                    : strata::core::slot_hold_reached(sl.hold, sl.produced, sl.max_new) ? "hold"
                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
                     sl.ids.push_back(sl.x);
                     if (fin != nullptr) {
@@ -15323,7 +15330,7 @@ int main(int argc, char** argv) {
                             G.pos[G.S] = sl.p;
                             ++G.S;
                             int nd = sl.draft_ready && !sl.stop ? sl.n_drafts : 0;
-                            nd = (int) std::min<int64_t>(nd, std::min<int64_t>(sl.max_new - sl.produced - 1,
+                            nd = (int) std::min<int64_t>(nd, std::min<int64_t>(strata::core::slot_cap(sl.max_new, sl.hold) - sl.produced - 1,
                                                                                 o.max_context - sl.p - 2));
                             for (int j = 0; j < nd; ++j) {
                                 G.rows[G.S] = b;
@@ -19510,7 +19517,8 @@ int main(int argc, char** argv) {
                 p += a + 1;
             }
             // GEN hold=N:ID reached (ID not emitted): the server wraps up the thinking or asks for more
-            if (hold_on && std::strcmp(finish, "length") == 0 && produced_n >= req_hold_n && produced_n < max_new) finish = "hold";
+            // (a --batch admission is a GEN of one token whose hold may be that one token: the slot must not start then)
+            if (hold_on && std::strcmp(finish, "length") == 0 && produced_n >= req_hold_n && (produced_n < max_new || admit_slot >= 0)) finish = "hold";
             if (!keep_sync()) { std::printf("ERR %s\n", err.c_str()); return 1; }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             if (use_df2 && o.draft_auto && bandit_key != 0 && produced_n >= 48 && decode_ms > 0.0) {
@@ -19777,6 +19785,7 @@ int main(int argc, char** argv) {
                     sl.p = p;
                     sl.produced = 1;
                     sl.max_new = admit_max_new;
+                    sl.hold = strata::core::slot_hold_from(req_hold_n, req_hold_id, hold_on);   // the thinking budget goes on in the slot's windows (hold_on: the first token was not ID)
                     sl.t0 = Clock::now();
                     sl.ids = live;
                     {   // the penalty window of the slot's decode: the reply, from the last prompt token (the first window fed it), as the solo loop counts it

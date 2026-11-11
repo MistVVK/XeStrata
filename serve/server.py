@@ -1166,6 +1166,7 @@ class StrataEngine:
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
         self.can_hold = False            # the engine takes GEN hold=N:ID (READY <ctx> ... hold)
+        self.can_hold_batch = False      # ... and its --batch slots end at the hold too, BDONE hold (READY ... holdb)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.terminal_stages: list[dict] = []  # final layer ranges from this engine start's bounded stderr log
@@ -1250,6 +1251,7 @@ class StrataEngine:
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
                 self.can_hold = "hold" in f[2:]
+                self.can_hold_batch = "holdb" in f[2:]
                 self.multi = next((int(x[6:]) for x in f[2:] if x.startswith("multi=") and x[6:].isdigit()), 0)
                 break
         loading.set()
@@ -2254,7 +2256,8 @@ class StrataEngine:
             raise EngineDied("the engine is unavailable; this request was not sent")
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
-        keys = self.sampling_keys(sampling or {})
+        hold = (sampling or {}).get(HOLD_KEY)           # the thinking budget's hold (P2b): the reasoning tokens left when this pass starts, and </think>'s id
+        keys0 = self.sampling_keys({k: v for k, v in (sampling or {}).items() if k != HOLD_KEY})   # (the hold's key goes on per leg: leg_keys below)
         # logprobs: only an admission's token can have an LP line here (the slot's "BT" lines carry none), so the
         # server refuses these requests unless max_tokens is 1.  The lines go to the request itself, through its
         # cancel Event: several requests read control lines at once, and the engine's lp_lines is one attribute.
@@ -2264,6 +2267,13 @@ class StrataEngine:
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
+
+        def leg_keys() -> str:
+            """The budget's hold counts what this pass still has: a leg that starts after `out` tokens of it holds the rest (at least one);
+            once </think> is in `out` the hold is over and no key goes."""
+            if isinstance(hold, tuple) and len(hold) == 2 and hold[0] > 0 and hold[1] >= 0 and hold[1] not in out:
+                return keys0 + f" hold={max(1, hold[0] - len(out))}:{hold[1]}"
+            return keys0
         orig_len = len(prompt)  # a leg that continues (prompt + what it generated) names where the reply began: pen_from, the penalty window's start
         reused0 = None      # the first read's reused tokens: a continued leg's count includes this request's own output
         carry = {}          # #1869: the figures of the legs that ended in a hand-back to the solo path (the final DONE adds to them)
@@ -2298,7 +2308,7 @@ class StrataEngine:
                     alone = not any(self.slot_busy) and self.waiting == 0
                 if alone and left > 1:
                     pf = self.pen_from_key(orig_len, len(prompt))
-                    head = f"GENI {left}{keys}{pf} {embeddings}" if embeddings else f"GEN {left}{keys}{pf}"
+                    head = f"GENI {left}{leg_keys()}{pf} {embeddings}" if embeddings else f"GEN {left}{leg_keys()}{pf}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
                     deadline = getattr(cancel, "_strata_queue_deadline", None)
                     if deadline is not None and time.monotonic() >= deadline:
@@ -2355,8 +2365,8 @@ class StrataEngine:
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
-                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
-                            return
+                        if cancel.is_set() or left <= 0 or finish in ("stop", "length", "hold") or (out and out[-1] in EOS_IDS):
+                            return                          # ("hold": the budget's cut: the caller wraps up or asks for more)
                         if reused0 is None:
                             reused0 = (self.last or {}).get("reused")
                         carry_leg(carry, self.last)         # #1869: the solo leg's figures; the slot's admission (a copy of
@@ -2432,7 +2442,7 @@ class StrataEngine:
                     while not sq[slot].empty():
                         sq[slot].get_nowait()
                     pf = self.pen_from_key(orig_len, len(prompt))
-                    head = f"BGENI {slot} {left}{keys}{pf} {embeddings}" if embeddings else f"BGEN {slot} {left}{keys}{pf}"
+                    head = f"BGENI {slot} {left}{leg_keys()}{pf} {embeddings}" if embeddings else f"BGEN {slot} {left}{leg_keys()}{pf}"
                     live = {"slot": slot, "request_id": getattr(cancel, "_strata_request_id", None),
                             "state": "reading", "prompt_tokens": len(prompt), "prompt_read": 0, "generated": 0,
                             "started": time.time(), "first_token": None}
@@ -6489,10 +6499,11 @@ class Service:
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
-                    # the engine stops at the budget itself (HOLD_KEY), when it can and </think> is one token: one engine
-                    # at a time (a --batch engine's slots and a multi engine take no hold)
+                    # the engine stops at the budget itself (HOLD_KEY), when it can and </think> is one token: a --batch engine
+                    # only when its slots say they hold too (READY holdb); a multi engine takes no hold
                     hold_end = None
-                    if (budget and getattr(self.engine, "can_hold", False) is True and not getattr(self.engine, "batch", 0)
+                    if (budget and getattr(self.engine, "can_hold", False) is True
+                            and (not getattr(self.engine, "batch", 0) or getattr(self.engine, "can_hold_batch", False) is True)
                             and not getattr(self.engine, "multi", 0)):
                         te = self.tok.encode(THINK_END, parse_special=True)
                         hold_end = te[0] if len(te) == 1 else None

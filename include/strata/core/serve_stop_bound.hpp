@@ -29,6 +29,34 @@ int64_t serve_hold_remaining(int accepted, int64_t produced, int64_t max_new, in
     return cap;
 }
 
+// --batch slot (P2b): the same hold for one slot of the batch windows.  A slot emits through windows of its own (one row, or one
+// row plus its accepted proposals), so the hold is a per-slot state: on until ID is emitted, n = the emitted tokens (counted from
+// the request's start, the admission's first token included) after which the slot ends with finish "hold" and its sessions at exactly
+// what it fed (all emitted tokens but the last).  The cap below is conservative for a window that might emit ID: the rows of that window
+// stop at the hold, and the next window (hold off) goes on - never more rows than the unconditional cap, never fewer than one.
+struct SlotHold {
+    bool on = false;
+    int64_t n = 0;
+    int64_t id = -1;
+};
+inline SlotHold slot_hold_from(long long hold_n, long long hold_id, bool on) {
+    SlotHold h;
+    h.on = on && hold_n > 0 && hold_id >= 0;
+    h.n = hold_n;
+    h.id = hold_id;
+    return h;
+}
+// the tokens a slot may emit in all before its next window decides again (max_new, or the hold while it is on)
+inline int64_t slot_cap(int64_t max_new, const SlotHold& h) { return h.on ? std::min(max_new, h.n) : max_new; }
+// a token y was emitted: the hold is over when it is ID
+inline void slot_hold_emitted(SlotHold& h, int64_t y) {
+    if (h.on && y == h.id) h.on = false;
+}
+// the slot reached its hold (ID not emitted, max_new not reached): BDONE says "hold"
+inline bool slot_hold_reached(const SlotHold& h, int64_t produced, int64_t max_new) {
+    return h.on && produced >= h.n && produced < max_new;
+}
+
 // #4677: the bound is on by default on every backend; STRATA_SERVE_STOP_BOUND=0 (the variable's value, passed in)
 // turns it off.  It only limits which accepted rows enter the cached conversation: the tokens a request emits are the
 // same either way.
