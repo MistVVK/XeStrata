@@ -65,4 +65,22 @@ struct Tensor {
 void save_safetensors_bf16(const std::string& path, std::vector<Tensor> ts,
                            const std::vector<std::pair<std::string, std::string>>& meta);
 
+/// What a trainer writes into a saved LoRA's metadata, the same keys from every model's (docs/LORA_TRAIN.md, "The
+/// saved file"): ai-toolkit's (name, version, software, format), modelspec.title and modelspec.trigger_phrase (where
+/// there is one), and sd-scripts' (ss_network_module, ss_network_dim, ss_network_alpha, ss_model: the run's name,
+/// ss_base_model_version, ss_steps: the steps so far, ss_max_steps, ss_seed, ss_learning_rate, ss_optimizer_type),
+/// ss_xestrata_revision, then `extra`.
+struct LoraMeta {
+    std::string name;                        // the run's (the output's file name without its folder by default)
+    std::string base;                        // the base model: "qwen-image-2.1", "moss_image", "anima", "mage-flow"
+    std::string module = "networks.lora";    // or networks.lokr
+    std::string lr;                          // the learning rate as it was given
+    std::string trigger;
+    int64_t rank = 0, steps = 0, max_steps = 0;
+    double alpha = 0.0;
+    uint64_t seed = 0;
+    std::vector<std::pair<std::string, std::string>> extra;
+};
+std::vector<std::pair<std::string, std::string>> lora_meta(const LoraMeta& m);
+
 }  // namespace strata::image::train

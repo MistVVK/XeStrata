@@ -64,6 +64,11 @@ bool anima_is_dit(const std::string& path);
 /// rows', then the columns', as the DiT reads them; the trainer's as the inference's.
 void anima_rope_tables(int64_t h, int64_t w, int64_t hd, std::vector<float>& c, std::vector<float>& s);
 
+/// The time's two FP16 rows [2][C]: the sinusoid of sigma (its C / 2 frequencies 10000^(-i / (C / 2)), rounded to
+/// bf16), then the SiLU of its RMS norm (eps 1e-6, weight `tnorm` [C], rounded to bf16) that every modulation reads:
+/// the DiT's and the trainer's.
+void anima_time_rows(float sigma, const std::vector<float>& tnorm, std::vector<uint16_t>& h);
+
 class AnimaDit {
 public:
     AnimaDit();

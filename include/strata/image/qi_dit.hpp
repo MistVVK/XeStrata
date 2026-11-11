@@ -36,6 +36,14 @@ class QiFile;
 /// uses): value i from counter (offset, 0, i, 0) and key (seed low, seed high), Box-Muller's sine half.
 std::vector<float> philox_randn(uint64_t seed, uint64_t n, uint32_t offset = 0);
 
+/// The time's sinusoid [cos(t f_i) for i < 128, sin(t f_i)], f_i = 10000^(-i / 128) (FP32, 256 values): the DiT's and
+/// the trainer's.
+void qi_time_sinusoid(float t, float* out);
+
+/// The rotary tables [T][64] (cos, sin) of T rows' three positions (frame, row, column: pos [T][3]), each axis's
+/// pairs at 1 / 10000^(2j / dim) for its 16, 56 and 56 dimensions: the DiT's and the trainer's.
+void qi_rope_rows(const std::vector<float>& pos, int64_t T, std::vector<float>& c, std::vector<float>& s);
+
 /// Qwen-Image-2.1-Turbo's own 8-step schedule (its model_index.json's sample_sigmas) and the terminal 0.
 const std::vector<float>& turbo_sigmas();
 

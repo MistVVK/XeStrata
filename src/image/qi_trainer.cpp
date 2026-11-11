@@ -7,10 +7,12 @@
 #include "strata/image/dit_file.hpp"
 #include "strata/image/gelu.hpp"
 #include "strata/image/lora_names.hpp"
+#include "strata/image/qi_dit.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/qi_stream.hpp"
 #include "strata/image/qi_train.hpp"
 #include "strata/image/train_ops.hpp"
+#include "strata/image/train_trainer.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/gpu.hpp"
@@ -40,40 +42,25 @@ namespace {
 
 constexpr uint32_t kF16 = 1, kBF16 = 30;   // GGML's type numbers
 constexpr int64_t kHead = 128, kInCh = 64, kTimeDim = 256;
-constexpr int kAxes[3] = {16, 56, 56};               // the rotation's frame, height and width pairs: 8 + 28 + 28
 static_assert(std::size(lora::kQiBlock) == kQiProducts);
 const char* const* const kProducts = lora::kQiBlock;   // the DiT's target names, in kQiProducts' order
 
-// one product's LoRA: the FP32 factors and their moments; its train::Adapter holds the FP16 views and the gradients
-struct Lora {
-    train::Adapter ad;
-    float *A = nullptr, *B = nullptr, *mA = nullptr, *vA = nullptr, *mB = nullptr, *vB = nullptr;
-    int64_t N = 0, K = 0;
-};
-
 }  // namespace
 
-struct QiTrainer::Impl {
-    void* s = nullptr;
-    std::vector<void*> owned;
+struct QiTrainer::Impl : train::Trainer {
+    Impl() : Trainer("Qwen-Image-2.1 training") {}
     std::unique_ptr<QiFile> g;
-    prefill::Gemm gemm;
     int64_t C = 0, F = 0, H = 0, ctx = 0, rank = 0;
     struct Block {
         train::Product p[kQiProducts];   // N, K (the weights' pointers are set as the block is used: weights_of)
-        uint64_t off[kQiProducts] = {};  // each product's place in the block's region (wstream)
+        uint64_t off[kQiProducts] = {};  // each product's place in the block's region (ws)
         float *nq = nullptr, *nk = nullptr;
-        Lora l[kQiProducts];
+        train::Lora* l[kQiProducts] = {};
     };
-    // The blocks' weights through a LayerStream: as many as the memory leaves stay in VRAM, the rest are copied in
-    // a block at a time from RAM (an int8 base's rows and scales, made once at open and kept in RAM; a 16-bit base's
-    // from the file), the next one while this one computes.  A GPU with the memory keeps them all, as before.
-    LayerStream wstream;
-    std::vector<std::vector<uint8_t>> w8host;   // an int8 base: each block's rows and scales, the stream's source
+    // The blocks' weights through the trainer's LayerStream: as many as the memory leaves stay in VRAM, the rest are
+    // copied in a block at a time from RAM (an int8 base's rows and scales, made once at open and kept in RAM; a 16-bit
+    // base's from the file), the next one while this one computes.  A GPU with the memory keeps them all.
     bool int8 = false;
-    int64_t budget_rows = 0;      // the rows the weights' budget was set for (set_budget)
-    bool budget_stepped = false;  // and whether a step had run then
-    int64_t scratch_rows = 0;     // the most rows a step has had: the arena holds what they took
     std::vector<Block> blk;
     uint16_t *iin = nullptr, *tin = nullptr, *tout = nullptr;   // bf16
     float* tnorm = nullptr;                                      // the text norm's weight + 1
@@ -93,85 +80,9 @@ struct QiTrainer::Impl {
     // the time's buffers: the sinusoids, the embedder's rows, the modulation [2][4C] and as the block reads it
     uint16_t *e16 = nullptr, *s16 = nullptr;
     float *temb = nullptr, *mods = nullptr, *mb = nullptr, *scale_out = nullptr, *zero = nullptr;
-    uint16_t* wt[kQiProducts] = {};   // a block's weights transposed (the backward's dgrad reads them)
-    uint16_t* w8tmp = nullptr;          // an int8 base's weight rotated back, before its transpose
     uint16_t* plain0[3] = {};           // an int8 base: block 0's q, k and v rotated back (QiBlockRun::w_plain)
-    int64_t steps = 0, last_hw = 0;
-    train::Arena arena;   // the blocks' tape and scratch, kept from block to block and step to step
-    // the last blocks' tapes kept from the forward to the backward (no forward again for them): one buffer, cut into
-    // this step's tapes, as large as the free memory takes; an arena on each piece
-    std::vector<std::unique_ptr<train::Arena>> tapes;
-    void* tape_buf = nullptr;
-    size_t tape_cap = 0;
-    bool stepped = false;   // a step ran (its kernels compiled, the shared scratch grown)
+    int64_t last_hw = 0;
 
-    template<class T> T* get(int64_t n) {
-        void* p = nullptr;
-        if (!gpu::alloc_device(&p, (size_t) n * sizeof(T)))
-            throw std::runtime_error("image engine (Qwen-Image-2.1 training): GPU memory (" +
-                                     std::to_string(((size_t) n * sizeof(T)) >> 20) + " MiB): " + gpu::last_error());
-        owned.push_back(p);
-        // zeroed on the step's stream and waited for: the weights and the host's values are copied in through the
-        // compute queue (gpu::copy), which is not ordered against s, and a zero that ran late wiped parts of the
-        // weights, a different loss each process (2026-11-09)
-        gpu::memset_async(p, 0, (size_t) n * sizeof(T), s);
-        gpu::stream_sync(s);
-        return static_cast<T*>(p);
-    }
-    // How many of the last blocks keep their tapes this step: XESTRATA_TRAIN_TAPES, or as many as the device memory
-    // takes.  The tapes' buffer is the free memory and what it holds now, less a reserve: the blocks' shared
-    // scratch's growth (its arena reached 4.9 tapes at 2,300 and 4,000 rows of Qwen-Image-2.1, rank 32) and 1.5 GiB
-    // of transients, 3 GiB more the first step (the kernels' first runs: free memory fell 2.7 GB more than the arenas
-    // took on the B70, 2026-11-09).  The buffer is made again only when it should grow or must shrink.
-    int64_t tapes_kept(const QiBlockRun& r) {
-        const int64_t nb = (int64_t) blk.size();
-        if (tapes.size() != (size_t) nb) tapes.resize((size_t) nb);
-        const size_t per = (qi_block_tape_bytes(r) + 255) / 256 * 256;
-        gpu::stream_sync(s);
-        size_t want = 0;
-        if (const char* e = strata::env_get("TRAIN_TAPES")) {
-            want = (size_t) std::clamp<int64_t>(std::atoll(e), 0, nb) * per;
-        } else {
-            size_t free_b = 0, total = 0;
-            if (gpu::mem_info(&free_b, &total)) {
-                free_b += tape_cap;
-                const size_t scratch = (size_t) (5.5 * (double) per);
-                const size_t reserve = (scratch > arena.held() ? scratch - arena.held() : 0) + (size_t{3} << 29) +
-                                       (stepped ? 0 : size_t{3} << 30);
-                want = std::min(free_b > reserve ? free_b - reserve : 0, (size_t) nb * per);
-            }
-        }
-        // grow it when this step takes more tapes than it holds, shrink it when it holds more than the memory allows
-        if (want / per > tape_cap / per || want < tape_cap) {
-            for (auto& t : tapes) t.reset();
-            if (tape_buf != nullptr) gpu::free(tape_buf);
-            tape_buf = nullptr;
-            tape_cap = 0;
-            if (want >= per && gpu::alloc_device(&tape_buf, want)) tape_cap = want;
-        }
-        const int64_t k = std::min<int64_t>(nb, (int64_t) (tape_cap / per));
-        if (strata::env_get("TRAIN_PROFILE") != nullptr) {
-            size_t fb = 0, tb = 0;
-            gpu::mem_info(&fb, &tb);
-            std::fprintf(stderr, "kept tapes %lld of %lld (%zu MiB each, %zu MiB free of %zu)\n", (long long) k,
-                         (long long) nb, per >> 20, fb >> 20, tb >> 20);
-        }
-        for (int64_t b = 0; b < nb; ++b) {
-            auto& t = tapes[(size_t) b];
-            if (b >= nb - k) {
-                if (!t) t = std::make_unique<train::Arena>();
-                t->attach(static_cast<uint8_t*>(tape_buf) + (size_t) (b - (nb - k)) * per, per);
-            } else {
-                t.reset();
-            }
-        }
-        return k;
-    }
-    void release(void* p) {
-        if (p == nullptr) return;
-        owned.erase(std::remove(owned.begin(), owned.end(), p), owned.end());
-        gpu::free(p);
-    }
     // a 16-bit weight [N][K] as the file holds it (`type`: F16 or bf16), on the GPU
     uint16_t* w16(const std::string& name, uint32_t type, int64_t& N, int64_t& K) {
         const TensorInfo& t = g->get(name);
@@ -180,51 +91,9 @@ struct QiTrainer::Impl {
                                      (type == kF16 ? "F16" : "BF16") + " (a 16-bit DiT file is the training's base)");
         K = (int64_t) t.shape[0];
         N = t.shape.size() > 1 ? (int64_t) t.shape[1] : 1;
-        uint16_t* d = get<uint16_t>(N * K);
-        gpu::copy(d, g->data(t), (size_t) (N * K) * 2);
-        return d;
+        return dev16(g->data(t), N * K);
     }
-    float* dev_vec(const std::vector<float>& v) {
-        float* d = get<float>((int64_t) v.size());
-        gpu::copy(d, v.data(), v.size() * 4);
-        return d;
-    }
-    // The VRAM the blocks' weights take, set when a step brings more rows than any before (its buffers taken: ensure):
-    // the free memory and what the weights hold now, less the step's own beside them (the blocks' shared scratch's
-    // growth: train::scratch_growth, before a step has shown it 13 FP32 rows of F a row, 2.5 GB at 4,035 rows of
-    // Qwen-Image-2.1 with the MLP in passes of 1,024 rows, the B70, 2026-11-09; 1.5 GiB of transients, 3 GiB more
-    // before the first step, as tapes_kept's) - all of them where that
-    // takes them, else as many as it does and the rest streamed.  XESTRATA_TRAIN_WEIGHTS_MIB sets the budget.
-    void set_budget(int64_t R) {
-        // again after the first step (its reserve for the kernels' first runs given back)
-        if (R <= budget_rows && budget_stepped == stepped) return;
-        budget_rows = std::max(budget_rows, R);
-        R = budget_rows;
-        budget_stepped = stepped;
-        const uint64_t all = wstream.total();
-        uint64_t budget = all;
-        if (const char* e = strata::env_get("TRAIN_WEIGHTS_MIB")) {
-            budget = (uint64_t) std::atoll(e) << 20;
-        } else {
-            size_t free_b = 0, total = 0;
-            gpu::stream_sync(s);
-            if (gpu::mem_info(&free_b, &total)) {
-                const uint64_t have = (uint64_t) free_b + wstream.vram();
-                const uint64_t reserve = train::scratch_growth(arena.held(), R, scratch_rows,
-                                                               (uint64_t) (13 * R * F) * 4) +
-                                         (uint64_t{3} << 29) +
-                                         (stepped ? 0 : uint64_t{3} << 30);
-                budget = have > reserve ? have - reserve : 0;
-            }
-        }
-        budget = std::min(all, std::max(budget, wstream.min_budget()));
-        if (budget < all)
-            std::fprintf(stderr, "image engine (Qwen-Image-2.1 training): the blocks' weights %llu of %llu MiB in "
-                                 "VRAM, the rest streamed from RAM\n",
-                         (unsigned long long) (budget >> 20), (unsigned long long) (all >> 20));
-        wstream.configure(budget, s);
-    }
-    // the products' weights of block b in its region `base` (wstream.begin's)
+    // the products' weights of block b in its region `base` (ws.begin's)
     void weights_of(int64_t b, const uint8_t* base, train::Product* p) const {
         const Block& B = blk[(size_t) b];
         for (int i = 0; i < kQiProducts; ++i) {
@@ -238,22 +107,11 @@ struct QiTrainer::Impl {
             }
         }
     }
-    // Whether the blocks' inputs go in BF16 (XESTRATA_TRAIN_INPUTS16=0 or 1, or by the memory, decided as the
-    // buffers are taken for more rows): where the free memory and the weights' VRAM fall short of the inputs in FP32,
-    // every block's weights resident, the blocks' scratch (13 FP32 rows of F a row) and 1.5 GiB (3 GiB more before
-    // the first step) - the inputs halved before any weight is streamed, which costs every step its copies.  The
-    // forward rounds each input to BF16 as it keeps it, so the backward reads what the forward used.
-    bool inputs_half(int64_t R) {
-        if (const char* e = strata::env_get("TRAIN_INPUTS16")) return std::atoi(e) != 0;
-        size_t free_b = 0, total = 0;
-        gpu::stream_sync(s);
-        if (!gpu::mem_info(&free_b, &total)) return false;
-        const uint64_t have = (uint64_t) free_b + wstream.vram();
-        const uint64_t need = (uint64_t) ((int64_t) (blk.size() + 1) * R * C) * 4 + wstream.total() +
-                              (uint64_t) (13 * R * F) * 4 + (uint64_t{3} << 29) + (stepped ? 0 : uint64_t{3} << 30);
-        return have < need;
-    }
-    void ensure(int64_t R, int64_t hw) {
+    // The step's buffers for R rows, taken before the weights' budget is set (so it sees them): the blocks' inputs
+    // in BF16 where the free memory falls short of them in FP32 beside every block's weights resident (inputs_half,
+    // the blocks' scratch 13 FP32 rows of F a row before a step has shown it) - the inputs halved before any weight
+    // is streamed, which costs every step its copies.
+    void ensure(int64_t R) {
         if (R <= cap) return;
         for (float* p : ckpt) release(p);
         release(ckpt16);
@@ -262,7 +120,8 @@ struct QiTrainer::Impl {
                         (void*) dln, (void*) scratch, (void*) ln_rs, (void*) mean, (void*) inv, (void*) drs,
                         (void*) cos, (void*) sin, (void*) xt16, (void*) ln16, (void*) d16})
             release(p);
-        if (inputs_half(R)) {
+        const uint64_t inputs = (uint64_t) ((int64_t) (blk.size() + 1) * R * C) * 4 + (ws.total() - ws.vram());
+        if (inputs_half(R, inputs, (uint64_t) (13 * F) * 4)) {
             ckpt.assign(2, nullptr);
             ckpt16 = get<uint16_t>((int64_t) (blk.size() + 1) * R * C);
             std::fprintf(stderr, "image engine (Qwen-Image-2.1 training): the blocks' inputs in BF16 (%lld rows)\n",
@@ -291,46 +150,26 @@ struct QiTrainer::Impl {
         d16 = get<uint16_t>(R * kInCh);
         cap = R;
         rope_key = {-1, -1, -1};
-        (void) hw;
-    }
-    // the FP16 views the products read, from the FP32 factors
-    void sync_views(Lora& l) {
-        const int64_t r = rank;
-        train::f16_copy(l.A, r * l.K, l.ad.a, s);
-        if (l.ad.at != nullptr) train::transpose_f16(l.ad.a, r, l.K, l.ad.at, s);
-        train::f16_copy(l.B, l.N * r, l.ad.b, s);
-        if (l.ad.bt != nullptr) train::transpose_f16(l.ad.b, l.N, r, l.ad.bt, s);
     }
     // ai-toolkit's QwenImage21Rope: a text row's three axes its position, the image's frame axis the text's length
-    // and its height and width centred on zero; each axis's pairs at 1 / 10000^(2j / dim) (FP32, as torch.outer
-    // reads the long positions)
+    // and its height and width centred on zero; the DiT's tables of those positions (qi_rope_rows)
     void rope(int64_t nt, int64_t h, int64_t w) {
         const auto key = std::make_tuple(nt, h, w);
         if (key == rope_key) return;
         const int64_t R = nt + h * w;
-        std::vector<float> c((size_t) (R * kHead / 2)), sn(c.size());
-        float inv_f[3][28];
-        for (int a = 0; a < 3; ++a)
-            for (int j = 0; j < kAxes[a] / 2; ++j)
-                inv_f[a][j] = 1.0f / std::pow(10000.0f, (float) (2 * j) / (float) kAxes[a]);
+        std::vector<float> pos((size_t) R * 3), c, sn;
         for (int64_t r = 0; r < R; ++r) {
-            int64_t pos[3];
+            float* p = &pos[(size_t) r * 3];
             if (r < nt) {
-                pos[0] = pos[1] = pos[2] = r;
+                p[0] = p[1] = p[2] = (float) r;
             } else {
                 const int64_t q = r - nt, y = q / w, x = q % w;
-                pos[0] = nt;
-                pos[1] = y - (h - h / 2);
-                pos[2] = x - (w - w / 2);
+                p[0] = (float) nt;
+                p[1] = (float) (y - (h - h / 2));
+                p[2] = (float) (x - (w - w / 2));
             }
-            int64_t col = 0;
-            for (int a = 0; a < 3; ++a)
-                for (int j = 0; j < kAxes[a] / 2; ++j, ++col) {
-                    const float ang = (float) pos[a] * inv_f[a][j];
-                    c[(size_t) (r * kHead / 2 + col)] = std::cos(ang);
-                    sn[(size_t) (r * kHead / 2 + col)] = std::sin(ang);
-                }
         }
+        qi_rope_rows(pos, R, c, sn);
         gpu::stream_sync(s);
         gpu::copy(cos, c.data(), c.size() * 4);
         gpu::copy(sin, sn.data(), sn.size() * 4);
@@ -342,14 +181,11 @@ struct QiTrainer::Impl {
         // ai-toolkit: t = timestep in bf16 / 1000 in bf16; the embedding's argument 1000 t in FP32
         const float tb = kernels::f32_from_bf16(kernels::bf16_from_f32(timestep));
         const float t = kernels::f32_from_bf16(kernels::bf16_from_f32(tb / 1000.0f)) * 1000.0f;
+        float ef[2 * kTimeDim];   // the DiT's sinusoids of t and of 0
+        qi_time_sinusoid(t, ef);
+        qi_time_sinusoid(0.0f, ef + kTimeDim);
         std::vector<uint16_t> e(2 * kTimeDim);
-        for (int i = 0; i < kTimeDim / 2; ++i) {
-            const float f = std::exp(-std::log(10000.0f) * (float) i / (float) (kTimeDim / 2));
-            e[(size_t) i] = kernels::f16_from_f32(std::cos(t * f));
-            e[(size_t) (i + kTimeDim / 2)] = kernels::f16_from_f32(std::sin(t * f));
-            e[(size_t) (kTimeDim + i)] = kernels::f16_from_f32(1.0f);
-            e[(size_t) (kTimeDim + i + kTimeDim / 2)] = kernels::f16_from_f32(0.0f);
-        }
+        for (size_t i = 0; i < e.size(); ++i) e[i] = kernels::f16_from_f32(ef[i]);
         gpu::stream_sync(s);
         gpu::copy(e16, e.data(), e.size() * 2);
         gemm.f16(e16, t1, temb, 2, C, kTimeDim);
@@ -371,13 +207,7 @@ struct QiTrainer::Impl {
 
 QiTrainer::QiTrainer() : m_(std::make_unique<Impl>()) {}
 
-QiTrainer::~QiTrainer() {
-    if (m_->s != nullptr) gpu::stream_sync(m_->s);
-    m_->wstream.drop();
-    m_->tapes.clear();
-    if (m_->tape_buf != nullptr) gpu::free(m_->tape_buf);
-    for (void* p : m_->owned) gpu::free(p);
-}
+QiTrainer::~QiTrainer() = default;
 
 int64_t QiTrainer::blocks() const { return (int64_t) m_->blk.size(); }
 int64_t QiTrainer::width() const { return m_->C; }
@@ -386,10 +216,9 @@ bool QiTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* 
                      int64_t max_blocks, bool int8) {
     Impl& m = *m_;
     try {
-        m.s = stream;
         m.rank = rank;
         m.g = std::make_unique<QiFile>(dit);
-        if (!m.gemm.init(stream, 1 << 20, err)) return false;   // before the adapters: their views depend on it
+        if (!m.init(stream, 1 << 20, err)) return false;   // before the adapters: their views depend on it
         int64_t N = 0, K = 0;
         m.iin = m.w16("img_in.weight", kBF16, N, K);
         m.C = N;
@@ -434,8 +263,8 @@ bool QiTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* 
                 hbytes += (uint64_t) (pr.N * pr.K + 4 * pr.N);
             }
             if (int8) {   // the int8 base's rows and scales from the 16-bit weight, into RAM
-                m.w8host.emplace_back((size_t) hbytes);
-                uint8_t* h = m.w8host.back().data();
+                m.whost.emplace_back((size_t) hbytes);
+                uint8_t* h = m.whost.back().data();
                 for (int i = 0; i < kQiProducts; ++i) {
                     const train::Product& pr = blk.p[i];
                     const int64_t n = pr.N * pr.K;
@@ -467,33 +296,9 @@ bool QiTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* 
                 for (int i = 0; i < kQiProducts; ++i)
                     spans.push_back({m.g->data(*ts[i]), (uint64_t) (blk.p[i].N * blk.p[i].K) * 2, 0});
             }
-            const int layer = m.wstream.add(spans);
-            for (int i = 0; i < kQiProducts; ++i) blk.off[i] = m.wstream.offset(layer, i);
-            for (int i = 0; i < kQiProducts; ++i) {
-                train::Product& pr = blk.p[i];
-                Lora& l = blk.l[i];
-                l.N = pr.N;
-                l.K = pr.K;
-                std::vector<float> A;
-                train::lora_init(rng, rank, l.K, A);
-                l.A = m.dev_vec(A);
-                l.B = m.get<float>(l.N * rank);
-                l.mA = m.get<float>(rank * l.K);
-                l.vA = m.get<float>(rank * l.K);
-                l.mB = m.get<float>(l.N * rank);
-                l.vB = m.get<float>(l.N * rank);
-                l.ad.rank = rank;
-                l.ad.scale = 1.0f;   // alpha = rank
-                l.ad.a = m.get<uint16_t>(rank * l.K);
-                l.ad.b = m.get<uint16_t>(l.N * rank);
-                if (!m.gemm.f16_batch_ex_ok()) {   // the transposed views, where the products cannot read the rows
-                    l.ad.at = m.get<uint16_t>(rank * l.K);
-                    l.ad.bt = m.get<uint16_t>(l.N * rank);
-                }
-                l.ad.dA = m.get<float>(rank * l.K);
-                l.ad.dB = m.get<float>(l.N * rank);
-                m.sync_views(l);
-            }
+            const int layer = m.ws.add(spans);
+            for (int i = 0; i < kQiProducts; ++i) blk.off[i] = m.ws.offset(layer, i);
+            for (int i = 0; i < kQiProducts; ++i) blk.l[i] = &m.add_lora(blk.p[i].N, blk.p[i].K, rank, rng);
             blk.nq = m.dev_vec(m.g->f32(p + "attn.norm_q.weight"));
             blk.nk = m.dev_vec(m.g->f32(p + "attn.norm_k.weight"));
             m.blk.push_back(blk);
@@ -502,12 +307,7 @@ bool QiTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* 
         if (m.blk.empty()) throw std::runtime_error("image engine (Qwen-Image-2.1 training): the DiT has no blocks");
         m.F = m.blk[0].p[kQiGateUp].N / 2;
         m.H = m.C / kHead;
-        int64_t most = 0;
-        for (int i = 0; i < kQiProducts; ++i) {
-            m.wt[i] = m.get<uint16_t>(m.blk[0].p[i].N * m.blk[0].p[i].K);
-            most = std::max(most, m.blk[0].p[i].N * m.blk[0].p[i].K);
-        }
-        if (int8) m.w8tmp = m.get<uint16_t>(most);
+        m.dgrad_scratch(m.blk[0].p, kQiProducts, int8);
         m.e16 = m.get<uint16_t>(2 * kTimeDim);
         m.s16 = m.get<uint16_t>(2 * m.C);
         m.temb = m.get<float>(2 * m.C);
@@ -562,8 +362,8 @@ float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, 
     Impl& m = *m_;
     void* s = m.s;
     const int64_t C = m.C, hw = h * w, nt = m.texts.at((size_t) text).second, R = nt + hw;
-    m.ensure(R, hw);
-    m.set_budget(R);
+    m.ensure(R);
+    m.set_budget(R, 0, (uint64_t) (13 * m.F) * 4);
     m.rope(nt, h, w);
     m.modulation(timestep);
     // the noised latent's tokens, x_t = (1 - t) x0 + t noise with t = timestep / 1000 in FP32 (ai-toolkit's
@@ -595,7 +395,7 @@ float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, 
         const Impl::Block& B = m.blk[(size_t) b];
         for (int i = 0; i < kQiProducts; ++i) {
             r.p[i] = B.p[i];
-            r.ad[i] = &B.l[i].ad;
+            r.ad[i] = &B.l[i]->ad;
         }
         r.nq = B.nq;
         r.nk = B.nk;
@@ -607,16 +407,16 @@ float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, 
     const bool half = m.ckpt16 != nullptr;
     const int64_t cap = m.cap;
     const int64_t nb = (int64_t) m.blk.size();
-    const int64_t first_kept = nb - m.tapes_kept(run_of(0));
+    const int64_t first_kept = nb - m.keep_tapes(nb, R, qi_block_tape_bytes(run_of(0)), 0);
     for (int64_t b = 0; b < nb; ++b) {   // the forward, each block's input kept, the last ones' tapes too
         QiBlockRun r = run_of(b);
         // the next block's weights fetched meanwhile; past the last, the backward's second (its first is this one)
-        m.weights_of(b, m.wstream.begin((int) b, (int) (b + 1 < nb ? b + 1 : nb - 2)), r.p);
+        m.weights_of(b, m.ws.begin((int) b, (int) (b + 1 < nb ? b + 1 : nb - 2)), r.p);
         if (half && b == 0) train::bf16_keep(m.ckpt[0], R * C, m.ckpt16, s);
         r.out = half ? m.ckpt[(size_t) ((b + 1) % 2)] : m.ckpt[(size_t) b + 1];
-        if (b >= first_kept) r.tape = m.tapes[(size_t) b].get();
+        if (b >= first_kept) r.tape = m.tape(b);
         qi_block(r, m.gemm, s, &m.arena);
-        m.wstream.end((int) b);
+        m.ws.end((int) b);
         if (half) train::bf16_keep(r.out, R * C, m.ckpt16 + (b + 1) * cap * C, s);
     }
     // the final norm (the image's rows, the t row's scale) and proj_out
@@ -637,9 +437,6 @@ float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, 
     train::dgrad(m.d16, m.drs, m.pout_t, hw, kInCh, C, m.dln, m.scratch, false, m.gemm, s);
     gpu::memset_async(m.dX, 0, (size_t) (R * C) * 4, s);
     dit_rows::ln_mod_bwd(xf, m.mean, m.inv, m.scale_out, m.dln, hw, C, m.dX + nt * C, nullptr, nullptr, s);
-    // the dgrads read the weights' rows as they are where the GPU takes transposed products (no transposed copy each
-    // block each step)
-    const bool rows_ok = m.gemm.f16_batch_ex_ok();
     for (int64_t b = nb - 1; b >= 0; --b) {
         QiBlockRun r = run_of(b);
         if (half) {   // its input read back into the buffer the head did not read
@@ -647,85 +444,42 @@ float QiTrainer::step(int text, const float* x0, const float* noise, int64_t h, 
             train::bf16_load(m.ckpt16 + b * cap * C, R * C, xin, s);
             r.x = xin;
         }
-        m.weights_of(b, m.wstream.begin((int) b, (int) b - 1), r.p);   // the block below fetched meanwhile
-        for (int i = 0; i < kQiProducts; ++i) {   // the dgrads' weights (an int8 base's straight through)
-            const train::Product pr = r.p[i];
-            if (rows_ok) {   // read as they are: the 16-bit weight itself, an int8 base's rotated back
-                if (pr.w8 != nullptr) train::w8_dequant_rows(pr.w8, pr.sw, pr.N, pr.K, m.wt[i], s);
-                r.p[i].wr = pr.w8 != nullptr ? m.wt[i] : pr.w;
-                r.p[i].wt = nullptr;
-                continue;
-            }
-            if (pr.w8 != nullptr) train::w8_dequant_t(pr.w8, pr.sw, pr.N, pr.K, m.w8tmp, m.wt[i], s);
-            else train::transpose_f16(pr.w, pr.N, pr.K, m.wt[i], s);
-            r.p[i].wt = m.wt[i];
-        }
+        m.weights_of(b, m.ws.begin((int) b, (int) b - 1), r.p);   // the block below fetched meanwhile
+        m.dgrad_weights(r.p, kQiProducts);   // (an int8 base's straight through)
         r.out = m.tmp_out;
         if (b >= first_kept) {   // its forward's tape: the backward alone
-            r.tape = m.tapes[(size_t) b].get();
+            r.tape = m.tape(b);
             r.tape_replay = true;
         }
         r.dout = m.dX;
         r.dx = b > 0 ? m.dX2 : nullptr;
         qi_block(r, m.gemm, s, &m.arena);
-        m.wstream.end((int) b);
+        m.ws.end((int) b);
         std::swap(m.dX, m.dX2);
     }
     gpu::stream_sync(s);
     qi_block_profile_report();
-    m.scratch_rows = std::max(m.scratch_rows, R);
-    m.stepped = true;
+    m.stepped_rows(R);
     if (strata::env_get("TRAIN_PROFILE") != nullptr) {   // the memory the step left
-        size_t fb = 0, tb = 0, held = 0;
+        size_t fb = 0, tb = 0;
         gpu::mem_info(&fb, &tb);
-        held = m.tape_cap;
-        std::fprintf(stderr, "end: free %zu MiB, tapes %zu MiB, main arena %zu MiB, R %lld\n", fb >> 20, held >> 20,
-                     m.arena.held() >> 20, (long long) R);
+        std::fprintf(stderr, "end: free %zu MiB, main arena %zu MiB, R %lld\n", fb >> 20, m.arena.held() >> 20,
+                     (long long) R);
     }
     return loss;
 }
 
-double QiTrainer::update(const train::AdamW& o) {
-    Impl& m = *m_;
-    std::vector<std::pair<const float*, int64_t>> parts;
-    for (Impl::Block& B : m.blk)
-        for (Lora& l : B.l) {
-            parts.emplace_back(l.ad.dA, m.rank * l.K);
-            parts.emplace_back(l.ad.dB, l.N * m.rank);
-        }
-    const double norm = std::sqrt(train::sq_sum(parts, m.s));
-    const float gscale = (float) std::min(1.0, 1.0 / (norm + 1e-6));   // torch's clip_grad_norm_ at 1
-    ++m.steps;
-    for (Impl::Block& B : m.blk)
-        for (Lora& l : B.l) {
-            train::adamw(l.A, l.ad.dA, l.mA, l.vA, m.rank * l.K, o, m.steps, gscale, m.s);
-            train::adamw(l.B, l.ad.dB, l.mB, l.vB, l.N * m.rank, o, m.steps, gscale, m.s);
-            m.sync_views(l);
-        }
-    gpu::stream_sync(m.s);
-    return norm;
-}
-
-namespace {
-
-std::vector<float> read_dev(const float* p, int64_t n, void* s) {
-    std::vector<float> v((size_t) n);
-    gpu::stream_sync(s);
-    if (!gpu::copy(v.data(), p, (size_t) n * 4)) throw std::runtime_error("image engine: a read back");
-    return v;
-}
-
-}  // namespace
+double QiTrainer::update(const train::AdamW& o) { return m_->update(o); }
 
 std::vector<train::Tensor> QiTrainer::grads() const {
     const Impl& m = *m_;
     std::vector<train::Tensor> out;
     for (size_t b = 0; b < m.blk.size(); ++b)
         for (int i = 0; i < kQiProducts; ++i) {
-            const Lora& l = m.blk[b].l[i];
+            const train::Lora& l = *m.blk[b].l[i];
             const std::string k = "diffusion_model.transformer_blocks." + std::to_string(b) + "." + kProducts[i];
-            out.push_back({k + ".lora_A.weight", {m.rank, l.K}, read_dev(l.ad.dA, m.rank * l.K, m.s)});
-            out.push_back({k + ".lora_B.weight", {l.N, m.rank}, read_dev(l.ad.dB, l.N * m.rank, m.s)});
+            out.push_back({k + ".lora_A.weight", {m.rank, l.K}, m.read(l.ad.dA, m.rank * l.K)});
+            out.push_back({k + ".lora_B.weight", {l.N, m.rank}, m.read(l.ad.dB, l.N * m.rank)});
         }
     return out;
 }
@@ -735,10 +489,10 @@ void QiTrainer::save(const std::string& path, const std::vector<std::pair<std::s
     std::vector<train::Tensor> ts;
     for (size_t b = 0; b < m.blk.size(); ++b)
         for (int i = 0; i < kQiProducts; ++i) {
-            const Lora& l = m.blk[b].l[i];
+            const train::Lora& l = *m.blk[b].l[i];
             const std::string k = "diffusion_model.transformer_blocks." + std::to_string(b) + "." + kProducts[i];
-            ts.push_back({k + ".lora_A.weight", {m.rank, l.K}, read_dev(l.A, m.rank * l.K, m.s)});
-            ts.push_back({k + ".lora_B.weight", {l.N, m.rank}, read_dev(l.B, l.N * m.rank, m.s)});
+            ts.push_back({k + ".lora_A.weight", {m.rank, l.K}, m.read(l.A, m.rank * l.K)});
+            ts.push_back({k + ".lora_B.weight", {l.N, m.rank}, m.read(l.B, l.N * m.rank)});
         }
     train::save_safetensors_bf16(path, std::move(ts), meta);
 }
@@ -750,7 +504,7 @@ void QiTrainer::set_factors(const std::vector<train::Tensor>& ts) {
     gpu::stream_sync(m.s);
     for (size_t b = 0; b < m.blk.size(); ++b)
         for (int i = 0; i < kQiProducts; ++i) {
-            Lora& l = m.blk[b].l[i];
+            const train::Lora& l = *m.blk[b].l[i];
             const std::string k = "diffusion_model.transformer_blocks." + std::to_string(b) + "." + kProducts[i];
             auto put = [&](const std::string& key, float* d, int64_t n) {
                 auto it = by.find(key);
@@ -761,12 +515,12 @@ void QiTrainer::set_factors(const std::vector<train::Tensor>& ts) {
             };
             put(k + ".lora_A.weight", l.A, m.rank * l.K);
             put(k + ".lora_B.weight", l.B, l.N * m.rank);
-            m.sync_views(l);
+            m.sync_views(l.ad, l.A, l.B, l.N, l.K);
         }
     gpu::stream_sync(m.s);
 }
 
-std::vector<float> QiTrainer::last_pred() const { return read_dev(m_->pred, m_->last_hw * kInCh, m_->s); }
+std::vector<float> QiTrainer::last_pred() const { return m_->read(m_->pred, m_->last_hw * kInCh); }
 
 train::Schedule qi_train_schedule(int64_t h, int64_t w) {
     return train::schedule_dynamic(h * w, 256.0, 8192.0, 0.5, 0.9, 0.02);

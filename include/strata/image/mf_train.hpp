@@ -34,6 +34,7 @@ struct MfBlockW {
                                          // path reads them, and zero widths enqueue no work and fail)
     const uint16_t* w[6] = {};           // [N][K] FP16, as the file writes them
     const uint16_t* wt[6] = {};          // [K][N] FP16, the same values transposed (dgrad reads them)
+    const uint16_t* wr[6] = {};          // [N][K] FP16 the dgrad reads as they are where wt is null (Product::wr)
     const int8_t* w8[6] = {};            // a QLoRA's int8 base instead of w (train::Product's w8, sw; null: w)
     const float* sw[6] = {};
     const float* b[6] = {};              // [N] FP32
@@ -55,6 +56,11 @@ struct MfBlockRun {
     const float *d_out_img = nullptr, *d_out_txt = nullptr;   // the gradients reaching them
     float *dimg = nullptr, *dtxt = nullptr;         // the block's inputs' gradients, added into
     float* tape = nullptr;    // the forward's stages out to the parity harness (null: not taken, see MfTapeSlice)
+    /// Where the forward's values the backward reads go (null: the call's scratch): a forward alone with it keeps
+    /// them there, and a later call with kept_replay and the outputs' gradients runs the backward on them without the
+    /// forward again.
+    train::Arena* kept = nullptr;
+    bool kept_replay = false;
 };
 
 /// The block's forward tape, widened to FP32 and copied out for tools/image/mf_train_torch_ref.py to compare stage by
@@ -115,9 +121,10 @@ int64_t mf_block_tape_elems(const MfBlockRun& run);
 /// a null dw/db skips the base weight's own wgrad and bias sum (a frozen weight takes no gradient, and a LoKr-folded
 /// one reads only dDelta through dw - the block knows no LoKr).
 ///
-/// The forward and backward in one call.  The tape and every scratch buffer belong to the call: the block is
-/// small and reading it twice is cheaper than getting an alias wrong.
+/// The forward and backward in one call, or the backward alone on a kept forward (MfBlockRun::kept).
 /// `arena` (null: the call's own memory) keeps the buffers from one call to the next.
 void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream, train::Arena* arena = nullptr);
+/// The device memory a block's kept forward takes (MfBlockRun::kept): its shape and adapters' alone.
+size_t mf_block_tape_bytes(const MfBlockRun& run, prefill::Gemm& gemm);
 
 }  // namespace strata::image

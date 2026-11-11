@@ -15,8 +15,10 @@
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cmath>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -70,6 +72,85 @@ int64_t mf_block_tape_elems(const MfBlockRun& run) {
            + 3 * Rj;                                      // and the six scale sets: three pairs
 }
 
+namespace {
+
+// What a block's backward reads of its forward (its tape), each stream's [2] and the joint attention's, taken in this
+// order from a pool or a Sizer
+struct Tape {
+    uint16_t *ln1_16[2], *ln1_t[2], *ln2_16[2], *ln2_t[2], *gelu_16[2], *gelu_t[2];
+    float *ln1_s[2], *mean1[2], *inv1[2], *yq[2], *yk[2], *yo[2], *h1[2];
+    float *ln2_s[2], *mean2[2], *inv2[2], *ym1[2], *gelu_s[2], *ym2[2];
+    uint16_t *jq, *jk, *jv, *jo;
+    float *jof, *vs, *lse;
+    train::AdKeep keep[2][6];
+};
+
+const MfBlockW& weights_of(const MfBlockRun& run, int st) { return st == 0 ? run.img_w : run.txt_w; }
+
+train::Product product_of(const MfBlockW& W, int i) {
+    return train::Product{W.N[i], W.K[i], W.w[i], W.wt[i], W.dw[i], W.db[i], W.w8[i], W.sw[i], W.wr[i]};
+}
+
+// whether the products' backwards read their inputs transposed (train::ad_needs_xt: a weight's own gradient, a LoKr,
+// a GPU without transposed products): the transposed copies are made and kept only then
+bool needs_xt(const MfBlockRun& run, prefill::Gemm& gemm) {
+    for (int st = 0; st < 2; ++st)
+        for (int i = 0; i < 6; ++i)
+            if (train::ad_needs_xt(product_of(weights_of(run, st), i), weights_of(run, st).ad[i], gemm)) return true;
+    return false;
+}
+
+template <class Take> Tape take_tape(Take& t, const MfBlockRun& run, bool xt) {
+    const int64_t C = run.C, F = run.F, R[2] = {run.rows_img, run.rows_txt}, Rj = R[0] + R[1];
+    const int64_t Rp = qi_attn_rows(Rj);
+    Tape p{};
+    // q, k and v rounded up to the shared attention's rows (qi_attn_rows), zero past Rj as the pool leaves them
+    p.jq = t.u(Rp * C);
+    p.jk = t.u(Rp * C);
+    p.jv = t.u(Rp * C);
+    p.jo = t.ru(Rj * C);
+    p.jof = t.rf(Rj * C);   // the same output before it was rounded: the backward's D reads this
+    // v's power of two (v_scale): jv, jo and jof are the true rows divided by vs[0], and vs[1 ..] is the output
+    // projection's row scale that puts it back
+    p.vs = t.rf(Rj + 1);
+    p.lse = t.rf(Rj * run.heads);
+    for (int st = 0; st < 2; ++st) {
+        p.ln1_16[st] = t.ru(R[st] * C);   // the first norm's FP16 rows (q, k and v read them)
+        p.ln1_s[st] = t.rf(R[st]);
+        p.ln1_t[st] = xt ? t.ru(R[st] * C) : nullptr;   // the same rows transposed ([C][rows])
+        p.mean1[st] = t.rf(R[st]);
+        p.inv1[st] = t.rf(R[st]);
+        p.yq[st] = t.rf(R[st] * C);
+        p.yk[st] = t.rf(R[st] * C);
+        p.yo[st] = t.rf(R[st] * C);
+        p.h1[st] = t.rf(R[st] * C);   // the first residual's output, which the second norm reads
+        p.ln2_16[st] = t.ru(R[st] * C);
+        p.ln2_s[st] = t.rf(R[st]);
+        p.ln2_t[st] = xt ? t.ru(R[st] * C) : nullptr;
+        p.mean2[st] = t.rf(R[st]);
+        p.inv2[st] = t.rf(R[st]);
+        p.ym1[st] = t.rf(R[st] * F);   // mlp1's output, before the GELU
+        p.gelu_16[st] = t.ru(R[st] * F);   // the GELU's output as mlp2's input rows
+        p.gelu_s[st] = t.rf(R[st]);
+        p.gelu_t[st] = xt ? t.ru(R[st] * F) : nullptr;
+        p.ym2[st] = t.rf(R[st] * C);
+    }
+    // adapters: the forward keeps h16, hr and h16t per adapted product, the backward reads them back
+    for (int st = 0; st < 2; ++st)
+        for (int i = 0; i < 6; ++i)
+            if (const train::Adapter* az = weights_of(run, st).ad[i]; az != nullptr)
+                p.keep[st][i] = train::AdKeep{t.ru(R[st] * az->rank), t.rf(R[st]), t.ru(R[st] * az->rank)};
+    return p;
+}
+
+}  // namespace
+
+size_t mf_block_tape_bytes(const MfBlockRun& run, prefill::Gemm& gemm) {
+    train::Sizer z;
+    take_tape(z, run, needs_xt(run, gemm));
+    return z.bytes;
+}
+
 void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream, train::Arena* arena) {
     const int64_t C = run.C, F = run.F, heads = run.heads, hd = run.hd, Ri = run.rows_img, Rt = run.rows_txt;
     const int64_t Rj = Ri + Rt, R[2] = {Ri, Rt};
@@ -79,126 +160,59 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream, train::A
     const float* dout[2] = {run.d_out_img, run.d_out_txt};
     float* dIn[2] = {run.dimg, run.dtxt};
     if (C % heads != 0 || C / heads != hd) throw std::invalid_argument("mf_block: heads * head_dim must be the width");
+    const bool backward = dout[0] != nullptr || dout[1] != nullptr;
     // the call's buffers from the arena (kept from call to call); a buffer written whole before it is read is not
     // zeroed (rf, ru), as moss_block's
     train::Pool pool(stream, arena);
-
-    const int64_t nmax = std::max(C, F);   // the wider of the block's two widths: a buffer reused between roles takes it
-
-    // ---- the tape: one buffer per value the backward reads
-    uint16_t* ln1_16[2];      // the first norm's FP16 rows (q, k and v read them)
-    float* ln1_s[2];
-    uint16_t* ln1_t[2];      // the same rows transposed ([C][rows])
-    float* mean1[2];
-    float* inv1[2];
-    float* yq[2];
-    float* yk[2];
-    float* yv[2];
-    float* yo[2];
-    float* h1[2];            // the first residual's output, which the second norm reads
-    uint16_t* ln2_16[2];
-    float* ln2_s[2];
-    uint16_t* ln2_t[2];
-    float* mean2[2];
-    float* inv2[2];
-    float* ym1[2];           // mlp1's output, before the GELU
-    uint16_t* gelu_16[2];    // the GELU's output as mlp2's input rows
-    float* gelu_s[2];
-    uint16_t* gelu_t[2];
-    float* ym2[2];
-    // q, k and v rounded up to the shared attention's rows (qi_attn_rows), zero past Rj as the pool leaves them
-    const int64_t Rp = qi_attn_rows(Rj);
-    uint16_t *jq = pool.u(Rp * C), *jk = pool.u(Rp * C), *jv = pool.u(Rp * C), *jo = pool.ru(Rj * C);
-    float* jof = pool.rf(Rj * C);   // the same output before it was rounded: the backward's D reads this
-    // v's power of two (v_scale): jv, jo and jof are the true rows divided by vs[0], and vs[1 ..] is the output
-    // projection's row scale that puts it back
+    // the forward's values the backward reads: the block's own kept tape (a kept forward's, read back by a replay),
+    // else the call's scratch
+    const bool replay = run.kept != nullptr && run.kept_replay;
+    if (replay && !backward) throw std::invalid_argument("mf_block: a kept tape is read by the backward");
+    if (replay && run.tape != nullptr) throw std::invalid_argument("mf_block: the harness's tape takes a forward");
+    std::optional<train::Pool> tpool;
+    if (run.kept != nullptr) tpool.emplace(stream, run.kept, replay);
+    const bool xt = needs_xt(run, gemm);
+    const Tape T = run.kept != nullptr ? take_tape(*tpool, run, xt) : take_tape(pool, run, xt);
+    uint16_t *jq = T.jq, *jk = T.jk, *jv = T.jv, *jo = T.jo;
+    float *jof = T.jof, *vs = T.vs, *lse = T.lse;
+    uint16_t* const* ln1_16 = T.ln1_16;
+    uint16_t* const* ln1_t = T.ln1_t;
+    uint16_t* const* ln2_16 = T.ln2_16;
+    uint16_t* const* ln2_t = T.ln2_t;
+    uint16_t* const* gelu_16 = T.gelu_16;
+    uint16_t* const* gelu_t = T.gelu_t;
+    float* const* ln1_s = T.ln1_s;
+    float* const* mean1 = T.mean1;
+    float* const* inv1 = T.inv1;
+    float* const* yq = T.yq;
+    float* const* yk = T.yk;
+    float* const* yo = T.yo;
+    float* const* h1 = T.h1;
+    float* const* ln2_s = T.ln2_s;
+    float* const* mean2 = T.mean2;
+    float* const* inv2 = T.inv2;
+    float* const* ym1 = T.ym1;
+    float* const* gelu_s = T.gelu_s;
+    float* const* ym2 = T.ym2;
+    // the forward's own: v before its scale
+    float* yv[2] = {pool.rf(Ri * C), pool.rf(Rt * C)};
     uint32_t* vamax = reinterpret_cast<uint32_t*>(pool.f(1));
-    float* vs = pool.rf(Rj + 1);
-    float* lse = pool.rf(Rj * heads);
-    // ---- the gradients
-    float* dym2[2];
-    float* dgelu[2];
-    float* dym1[2];
-    float* dln2[2];
-    float* dh1[2];
-    float* dyo[2];
-    float* dattn[2];
-    uint16_t* attn_t[2];   // the attention's FP16 rows transposed ([C][rows])
-    float* jdq = pool.rf(Rj * C), *jdk = pool.f(Rj * C), *jdv = pool.f(Rj * C), *jdo = pool.rf(Rj * C);
-    float* dyq[2];
-    float* dyk[2];
-    float* dyv[2];
-    float* dln1[2];
-    float* dxn1[2];
-    for (int st = 0; st < 2; ++st) {
-        ln1_16[st] = pool.ru(R[st] * C);
-        ln1_s[st] = pool.rf(R[st]);
-        ln1_t[st] = pool.ru(R[st] * C);
-        mean1[st] = pool.rf(R[st]);
-        inv1[st] = pool.rf(R[st]);
-        yq[st] = pool.rf(R[st] * C);
-        yk[st] = pool.rf(R[st] * C);
-        yv[st] = pool.rf(R[st] * C);
-        yo[st] = pool.rf(R[st] * C);
-        h1[st] = pool.rf(R[st] * C);
-        ln2_16[st] = pool.ru(R[st] * C);
-        ln2_s[st] = pool.rf(R[st]);
-        ln2_t[st] = pool.ru(R[st] * C);
-        mean2[st] = pool.rf(R[st]);
-        inv2[st] = pool.rf(R[st]);
-        ym1[st] = pool.rf(R[st] * F);
-        gelu_16[st] = pool.ru(R[st] * F);
-        gelu_s[st] = pool.rf(R[st]);
-        gelu_t[st] = pool.ru(R[st] * F);
-        ym2[st] = pool.rf(R[st] * C);
-        dym2[st] = pool.rf(R[st] * C);
-        dgelu[st] = pool.rf(R[st] * nmax);   // the GELU's output, then a dgrad's dx: the wider of the two
-        dym1[st] = pool.rf(R[st] * F);
-        dln2[st] = pool.rf(R[st] * C);
-        dh1[st] = pool.rf(R[st] * C);
-        dyo[st] = pool.rf(R[st] * C);
-        dattn[st] = pool.rf(R[st] * C);
-        attn_t[st] = pool.ru(R[st] * C);
-        dyq[st] = pool.rf(R[st] * C);
-        dyk[st] = pool.rf(R[st] * C);
-        dyv[st] = pool.rf(R[st] * C);
-        dln1[st] = pool.rf(R[st] * C);
-        dxn1[st] = pool.rf(R[st] * C);
-    }
-    uint16_t* t16 = pool.ru(Rj * nmax), *t16t = pool.ru(Rj * nmax);
-    float* trs = pool.rf(Rj);
-    // a wgrad's sums are N*K wide (at most F*C, never the square of the wider one) and a dgrad's T*K (at most rows*C
-    // or rows*F), so this is the scratch the block's eight products can actually need
-    float* sums = pool.rf(C * F + Rj * nmax);
 
-    // ---- adapters: the forward keeps h16/hr/h16t per adapted product, the backward reads them back
-    uint16_t* adh16[2][6] = {};
-    float* adhr[2][6] = {};
-    uint16_t* adh16t[2][6] = {};
-    auto prod = [&](const MfBlockW& W, int i) {
-        return train::Product{W.N[i], W.K[i], W.w[i], W.wt[i], W.dw[i], W.db[i], W.w8[i], W.sw[i]};
-    };
     train::Product ps[12];
     const train::Adapter* ads[12] = {};
     const train::Product* prods[12];
     for (int st = 0; st < 2; ++st)
         for (int i = 0; i < 6; ++i) {
-            const train::Adapter* az = w[st]->ad[i];
-            const int64_t T = R[st], rk = az != nullptr ? az->rank : 0;
-            if (az != nullptr) {
-                adh16[st][i] = pool.ru(T * rk);
-                adhr[st][i] = pool.rf(T);
-                adh16t[st][i] = pool.ru(T * rk);
-            }
-            ps[st * 6 + i] = prod(*w[st], i);
-            ads[st * 6 + i] = az;
+            ps[st * 6 + i] = product_of(*w[st], i);
+            ads[st * 6 + i] = w[st]->ad[i];
             prods[st * 6 + i] = &ps[st * 6 + i];
         }
+    auto prod = [&](const MfBlockW& W, int i) { return product_of(W, i); };
     // shared transients, sized for the largest adapted product (products run one at a time): hf is h = x A^T, y1 the
     // delta then yb/yd/dYb, y2 the second map a DoRA that trains its magnitude reads beside the first
     train::AdScratch adsc =
         train::take_ad_scratch(pool, train::ad_sizes(prods, ads, 12, [&](int i) { return R[i / 6]; }), true);
-    auto keep = [&](int st, int i) { return train::AdKeep{adh16[st][i], adhr[st][i], adh16t[st][i]}; };
+    auto keep = [&](int st, int i) { return T.keep[st][i]; };
     // the base products: FP16, or a QLoRA's int8 base (W8A8, ai-toolkit's convrot8) with the input's int8 rows as
     // scratch, and FP16 ones where the GPU takes no int8 products
     const bool w8 = w[0]->w8[0] != nullptr;
@@ -229,12 +243,13 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream, train::A
     auto jslice = [&](int which) -> float* {   // one slot a row set, the log-sum-exp last (`heads` wide, still one C)
         return tp == nullptr ? nullptr : tp + jbase + (int64_t)which * Rj * C;
     };
+    if (!replay) {   // a kept tape's backward has its forward already
     for (int st = 0; st < 2; ++st) {
         const float* mod = w[st]->mod;
         dit_rows::rows16(dit_rows::LnMod{in[st], mod, mod + C, C}, R[st], C, ln1_16[st], ln1_s[st], stream,
                          mean1[st], inv1[st]);
         tape_put16(slice(st, kTapeLn1), ln1_16[st], R[st] * C, stream);
-        train::transpose_f16(ln1_16[st], R[st], C, ln1_t[st], stream);
+        if (xt) train::transpose_f16(ln1_16[st], R[st], C, ln1_t[st], stream);
         for (int i = 0; i < 3; ++i) {
             float* dst = i == 0 ? yq[st] : i == 1 ? yk[st] : yv[st];
             base(st, i, ln1_16[st], dst);
@@ -272,14 +287,14 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream, train::A
         dit_rows::rows16(dit_rows::LnMod{h1[st], mod + 3 * C, mod + 4 * C, C}, R[st], C, ln2_16[st], ln2_s[st],
                          stream, mean2[st], inv2[st]);
         tape_put16(slice(st, kTapeLn2), ln2_16[st], R[st] * C, stream);
-        train::transpose_f16(ln2_16[st], R[st], C, ln2_t[st], stream);
+        if (xt) train::transpose_f16(ln2_16[st], R[st], C, ln2_t[st], stream);
         base(st, 4, ln2_16[st], ym1[st]);
         train::ad_product_fwd(w[st]->ad[4], ln2_16[st], ln2_s[st], ym1[st], w[st]->b[4], R[st], F, C, keep(st, 4), adsc,
                               gemm, stream);
         tape_put(slice(st, kTapeM1), ym1[st], R[st] * F, stream);
         dit_rows::rows16(dit_rows::GeluTanh{rows_of(ym1[st], F)}, R[st], F, gelu_16[st], gelu_s[st], stream);
         tape_put16(slice(st, kTapeGelu), gelu_16[st], R[st] * F, stream);
-        train::transpose_f16(gelu_16[st], R[st], F, gelu_t[st], stream);
+        if (xt) train::transpose_f16(gelu_16[st], R[st], F, gelu_t[st], stream);
         base(st, 5, gelu_16[st], ym2[st]);
         train::ad_product_fwd(w[st]->ad[5], gelu_16[st], gelu_s[st], ym2[st], w[st]->b[5], R[st], C, F, keep(st, 5),
                               adsc, gemm, stream);
@@ -299,10 +314,36 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream, train::A
         tape_put(tp + slot[kTapeScGeluI], gelu_s[0], wide[0], stream);
         tape_put(tp + slot[kTapeScGeluT], gelu_s[1], wide[1], stream);
     }
+    }
 
     // no output gradients: a forward-only read (the trainer's eval and kept forwards)
-    if (dout[0] != nullptr || dout[1] != nullptr) {
+    if (backward) {
     // ---- backward, from the outputs' gradients
+        const int64_t nmax = std::max(C, F);   // the wider of the block's two widths: a buffer reused between roles
+        float *dym2[2], *dgelu[2], *dym1[2], *dln2[2], *dh1[2], *dyo[2], *dattn[2], *dyq[2], *dyk[2], *dyv[2];
+        float *dln1[2], *dxn1[2];
+        uint16_t* attn_t[2];   // the attention's FP16 rows transposed ([C][rows]) where they are read
+        float *jdq = pool.rf(Rj * C), *jdk = pool.f(Rj * C), *jdv = pool.f(Rj * C), *jdo = pool.rf(Rj * C);
+        for (int st = 0; st < 2; ++st) {
+            dym2[st] = pool.rf(R[st] * C);
+            dgelu[st] = pool.rf(R[st] * nmax);   // the GELU's output, then a dgrad's dx: the wider of the two
+            dym1[st] = pool.rf(R[st] * F);
+            dln2[st] = pool.rf(R[st] * C);
+            dh1[st] = pool.rf(R[st] * C);
+            dyo[st] = pool.rf(R[st] * C);
+            dattn[st] = pool.rf(R[st] * C);
+            attn_t[st] = xt ? pool.ru(R[st] * C) : nullptr;
+            dyq[st] = pool.rf(R[st] * C);
+            dyk[st] = pool.rf(R[st] * C);
+            dyv[st] = pool.rf(R[st] * C);
+            dln1[st] = pool.rf(R[st] * C);
+            dxn1[st] = pool.rf(R[st] * C);
+        }
+        uint16_t *t16 = pool.ru(Rj * nmax), *t16t = xt ? pool.ru(Rj * nmax) : nullptr;
+        float* trs = pool.rf(Rj);
+        // a wgrad's sums are N*K wide (at most F*C, never the square of the wider one) and a dgrad's T*K (at most
+        // rows*C or rows*F), so this is the scratch the block's eight products can actually need
+        float* sums = pool.rf(C * F + Rj * nmax);
         for (int st = 0; st < 2; ++st) {
             const MfBlockW& W = *w[st];
             const float* mod = W.mod;
@@ -335,7 +376,7 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream, train::A
             tape_put(slice(st, kTapeDYo), dyo[st], R[st] * C, stream);
             if (dIn[st] != nullptr) train::add_into(dIn[st], dh1[st], R[st] * C, stream);   // the residual's own path
             const int64_t off = st == 0 ? Rt : 0;
-            train::transpose_f16(jo + off * C, R[st], C, attn_t[st], stream);
+            if (xt) train::transpose_f16(jo + off * C, R[st], C, attn_t[st], stream);
             train::ad_product_bwd(prod(W, 3), W.ad[3], jo + off * C, vs + 1, attn_t[st], dyo[st], dattn[st], false,
                                   keep(st, 3), adsc, t16, trs, t16t, sums, R[st], gemm, stream);
             train::copy_rows(dattn[st], R[st] * C, jdo + off * C, stream);

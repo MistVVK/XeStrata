@@ -52,6 +52,10 @@ class MossFile;
 void moss_rope_rows(int64_t rows, int64_t hd, double base, const std::function<void(int64_t, float*)>& coord,
                     std::vector<float>& c, std::vector<float>& s);
 
+/// The time's sinusoid [freq] as the reference makes it: cos then sin of t by freq / 2 frequencies 10000^(-i / (freq /
+/// 2)) in FP64, rounded to bf16 (its first layer's type), as FP16: the DiT's and the trainer's.
+void moss_time_sinusoid(double t, int64_t freq, std::vector<uint16_t>& e);
+
 class MossDit {
 public:
     MossDit();

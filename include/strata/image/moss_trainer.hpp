@@ -31,11 +31,12 @@ public:
     /// The DiT folder's shards (or one safetensors file), a LoRA of `rank` on every block not in `skip`.
     bool open(const std::string& dit, int64_t rank, bool int8, const std::vector<int>& skip, uint64_t seed,
               void* stream, std::string& err);
-    int64_t hidden() const;
+    /// The cached text rows' width (the DiT's hidden size).
+    int64_t text_cols() const;
     /// One micro-step at sigma: x0 the sample's latent [tokens][128] (already drawn from the posterior), eps the
-    /// noise; the loss, and with `backward` the adapters' gradients added into theirs.
+    /// noise; the loss times `weight` (a weighted timestep's), and with `backward` the adapters' gradients added.
     float step(const MfTrainSample& smp, const std::vector<float>& x0, const std::vector<float>& eps, float sigma,
-               bool backward);
+               float weight, bool backward);
     /// The optimizer's step over the summed gradients (torch's clip_grad_norm_ at 1 first): the norm before the clip.
     double adamw(const train::AdamW& o);
     /// The LoRA in ai-toolkit's form: diffusion_model.layers.N.proj.{q,k,v,o,ffn_up_gate,ffn_down}.lora_{A,B}.weight,

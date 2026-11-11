@@ -171,15 +171,17 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
         std::fflush(stdout);
         if ((save_every > 0 && step % save_every == 0) || step == steps) {
             const std::string path = out + "_" + std::to_string(step) + ".safetensors";
-            // ai-toolkit's metadata (get_meta_for_safetensors: the job's name and version, the software, format pt)
-            // and what the run was
-            const std::string name = out.substr(out.find_last_of('/') + 1);
-            tr.save(path, {{"name", name}, {"version", "1.0"}, {"software", "{\"name\": \"XeStrata\"}"},
-                           {"format", "pt"}, {"ss_network_module", "networks.lora"},
-                           {"ss_network_dim", std::to_string(rank)}, {"ss_network_alpha", std::to_string(rank)},
-                           {"ss_base_model", "qwen-image-2.1"}, {"ss_steps", std::to_string(step)},
-                           {"ss_seed", std::to_string(seed)}, {"ss_learning_rate", opt(f, "lr", "1e-4")},
-                           {"ss_content_or_style", opt(f, "draw", "balanced")}});
+            train::LoraMeta meta;
+            meta.name = out.substr(out.find_last_of('/') + 1);
+            meta.base = "qwen-image-2.1";
+            meta.lr = opt(f, "lr", "1e-4");
+            meta.rank = rank;
+            meta.alpha = (double) rank;
+            meta.steps = step;
+            meta.max_steps = steps;
+            meta.seed = seed;
+            meta.extra = {{"ss_content_or_style", opt(f, "draw", "balanced")}};
+            tr.save(path, train::lora_meta(meta));
             std::printf("saved %s\n", path.c_str());
         }
     }

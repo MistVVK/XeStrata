@@ -52,7 +52,8 @@ Mage-Flow で一通り通して実測し、その後 MOSS-Image、Qwen-Image-2.1
 - 読む側（`serve/loras.py` と `src/image/image_lora.cpp`）と 4 つの DiT はこのカードで変えません。dot 形は今日の reader と一般の dot 形の読み手が問題なく読む形です（調査 2026-11-02 の「問題なく読めたもの」）。
 - 強さは**重みごとの `.alpha` テンソル**で書き出します（形式はこれ 1 つ。メタデータの検索に頼りません）。カード 15 が `.alpha` を優先し、メタデータの `lora_alpha` は `.alpha` の無い重みにだけ効きます（一般の dot 形の読み手と同じ）。
 - v1 が書くメタデータ: `modelspec.title`、`modelspec.trigger_phrase`（トリガー語）、`ss_network_module`（`networks.lora`・`networks.lokr`）、`ss_network_dim`、`ss_network_alpha`、
-  `ss_seed`、`ss_learning_rate`、`ss_optimizer_type`、`ss_max_steps`、`ss_model`（`model_name`）、`ss_xestrata_revision`。勧める強さ（`recommended_strength*`）は書きません（1.0 のまま）。
+  `ss_seed`、`ss_learning_rate`、`ss_optimizer_type`、`ss_steps`（保存までのステップ）、`ss_max_steps`、`ss_model`（`model_name`）、`ss_base_model_version`（土台のモデル）、`ss_xestrata_revision`。
+  ai-toolkit の `name`・`version`・`software`・`format` も書きます。4 つの trainer とも同じ鍵です。勧める強さ（`recommended_strength*`）は書きません（1.0 のまま）。
 
 ### alpha（強さの掛かり方）
 

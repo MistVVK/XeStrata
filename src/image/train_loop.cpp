@@ -190,4 +190,30 @@ void save_safetensors_bf16(const std::string& path, std::vector<Tensor> ts,
     if (std::rename(tmp.c_str(), path.c_str()) != 0) throw std::runtime_error("image engine: cannot rename " + tmp);
 }
 
+std::vector<std::pair<std::string, std::string>> lora_meta(const LoraMeta& m) {
+    std::ostringstream alpha;
+    alpha << m.alpha;   // 32, or 16.5
+    std::vector<std::pair<std::string, std::string>> out = {
+        {"name", m.name},
+        {"version", "1.0"},
+        {"software", "{\"name\": \"XeStrata\"}"},
+        {"format", "pt"},
+        {"modelspec.title", m.name},
+        {"ss_model", m.name},
+        {"ss_network_module", m.module},
+        {"ss_network_dim", std::to_string(m.rank)},
+        {"ss_network_alpha", alpha.str()},
+        {"ss_base_model_version", m.base},
+        {"ss_steps", std::to_string(m.steps)},
+        {"ss_max_steps", std::to_string(m.max_steps)},
+        {"ss_seed", std::to_string(m.seed)},
+        {"ss_learning_rate", m.lr},
+        {"ss_optimizer_type", "AdamW"},
+        {"ss_xestrata_revision", STRATA_VERSION},
+    };
+    if (!m.trigger.empty()) out.emplace_back("modelspec.trigger_phrase", m.trigger);
+    out.insert(out.end(), m.extra.begin(), m.extra.end());
+    return out;
+}
+
 }  // namespace strata::image::train

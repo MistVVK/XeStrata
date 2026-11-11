@@ -334,14 +334,14 @@ int main(int argc, char** argv) {
                 acc_loss = 0;
                 if (updates % checkpoint == 0)
                     strata::image::mf_trainer_save(m.get(), out + "." + std::to_string(updates) + ".safetensors",
-                                                   title, trigger, seed, lr, steps);
+                                                   title, trigger, seed, lr, updates, steps);
             }
             if (acc_n > 0) {   // the tail micro-steps' gradients, averaged over what ran
                 strata::image::mf_trainer_adamw(m.get(), lr, 0.9f, 0.999f, adam_eps, wd, acc_n);
                 ++updates;
             }
             eval_avg("final");
-            strata::image::mf_trainer_save(m.get(), out + ".final.safetensors", title, trigger, seed, lr,
+            strata::image::mf_trainer_save(m.get(), out + ".final.safetensors", title, trigger, seed, lr, updates,
                                            steps);
             std::printf("done: saved %s (skipped %d non-finite micro-steps)\n",
                         (out + ".final.safetensors").c_str(), nskip);

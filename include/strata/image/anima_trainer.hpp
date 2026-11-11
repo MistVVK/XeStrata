@@ -29,8 +29,8 @@ public:
 
     /// The DiT's safetensors file (its names with or without `net.` or `model.diffusion_model.`), a LoRA of `rank`.
     bool open(const std::string& dit, int64_t rank, uint64_t seed, void* stream, std::string& err);
-    /// The context's width (the LLM adapter's, the cached rows').
-    int64_t context_cols() const;
+    /// The cached text rows' width (the context's: the LLM adapter's).
+    int64_t text_cols() const;
     /// One micro-step at sigma: x0 the latent tokens [tokens][64] (drawn from the posterior), eps the noise; the
     /// loss times `weight` (ai-toolkit's weighted timesteps), and with `backward` the adapters' gradients added.
     float step(const MfTrainSample& smp, const std::vector<float>& x0, const std::vector<float>& eps, float sigma,

@@ -42,16 +42,9 @@ struct MfTrainAdapter {
     float *W1[2][6] = {};   // [ol][im] FP32 LoKr masters, trained (null: not LoKr)
     float *W2A[2][6] = {};  // [ok][rank] FP32 LoKr masters, trained
     float *W2B[2][6] = {};  // [rank][inn] FP32 LoKr masters, trained
-    float *mA[2][6] = {}, *vA[2][6] = {};   // AdamW states
-    float *mB[2][6] = {}, *vB[2][6] = {};
-    float *mm[2][6] = {}, *vm[2][6] = {};
-    float *mW1[2][6] = {}, *vW1[2][6] = {};   // LoKr AdamW states
-    float *mW2A[2][6] = {}, *vW2A[2][6] = {};
-    float *mW2B[2][6] = {}, *vW2B[2][6] = {};
     // the modulation linears' LoRA (img_mod.1 and txt_mod.1, [6 C][C], ai-toolkit's targets): FP32 masters the
-    // one-row product reads as they are, their gradients and AdamW states (null: the modulations not trained)
+    // one-row product reads as they are and their gradients (null: the modulations not trained)
     float *modA[2] = {}, *modB[2] = {}, *dmodA[2] = {}, *dmodB[2] = {};
-    float *mmodA[2] = {}, *vmodA[2] = {}, *mmodB[2] = {}, *vmodB[2] = {};
 };
 
 /// The DiT as the trainer reads it: every block's products and head norms, the weights outside the blocks, and one
@@ -64,10 +57,6 @@ struct MfTrainModel {
     int64_t mrank = 0;                 // MageTrail's shared low-rank modulation's width (0: Mage-Flow's own)
     float *mdown_w = nullptr, *mdown_b = nullptr;   // [mrank][C], [mrank] FP32
     float* txt_norm = nullptr;   // [txt_dim] FP32
-    uint16_t* wtScratch = nullptr;   // one block's transposed views ([stream][product], offsets below)
-    uint16_t* w8tmp = nullptr;       // [F][C] FP16: an int8 base's rows rotated back, before their transpose
-    int64_t wtOff[2][6] = {};
-    uint64_t adam_step = 0;   // the optimizer's step count (bias correction reads it)
     struct Block {
         MfTrainProduct prod[2][6];   // [stream][q, k, v, o, mlp1, mlp2]
         MfTrainProduct mod[2];       // [stream] the img_mod.1 / txt_mod.1 linears ([6C][C]; MageTrail's: the bias)
@@ -113,7 +102,9 @@ struct MfTrainState {
     /// and the last block's image rows in FP32 for the head
     uint16_t* bounds16 = nullptr;
     float* last = nullptr;
+    float *mean = nullptr, *inv = nullptr;   // [tokens] the final norm's statistics, its backward's
     int64_t R = 0, Rt = 0;
+    int64_t first_kept = INT64_MAX;          // the blocks from here on kept their forwards for the backward
 };
 void mf_trainer_free_state(MfTrainModel* m, MfTrainState& s);
 
@@ -131,6 +122,6 @@ void mf_trainer_backward(MfTrainModel* m, const MfTrainSample& s, const MfTrainC
 void mf_trainer_adamw(MfTrainModel* m, float lr, float beta1, float beta2, float eps, float wd, int64_t accum_n);
 /// The safetensors file (SPEC D1): dot keys, per-weight .alpha, the metadata v1 writes.
 void mf_trainer_save(MfTrainModel* m, const std::string& path, const std::string& title,
-                     const std::string& trigger, uint64_t seed, float lr, int64_t max_steps);
+                     const std::string& trigger, uint64_t seed, float lr, int64_t steps, int64_t max_steps);
 
 }  // namespace strata::image

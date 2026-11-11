@@ -39,11 +39,17 @@ struct AnimaBlockRun {
     float* dx = nullptr;                                 // [rows][C] the input's gradient, added into (null: not taken)
     /// [3][C] each, added into (null: not taken): the three modulations' gradients (their adapters')
     float *dmod_sa = nullptr, *dmod_ca = nullptr, *dmod_ml = nullptr;
+    /// Where the forward's values the backward reads go (null: the call's scratch): a forward alone with it keeps
+    /// them there, and a later call with tape_replay and dout runs the backward on them without the forward again.
+    train::Arena* tape = nullptr;
+    bool tape_replay = false;
 };
 
 /// One block, forwards (to out) and, given dout, forwards again and backwards: the adapters' gradients added into
 /// their dA and dB, the input's into dx, the modulations' into dmod_*.
 /// `arena` (null: the call's own memory) keeps the buffers from one call to the next.
 void anima_block(const AnimaBlockRun& run, prefill::Gemm& gemm, void* stream, train::Arena* arena = nullptr);
+/// The device memory a block's tape takes (AnimaBlockRun::tape): its shape and adapters' alone.
+size_t anima_block_tape_bytes(const AnimaBlockRun& run, prefill::Gemm& gemm);
 
 }  // namespace strata::image

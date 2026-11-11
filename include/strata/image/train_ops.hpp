@@ -294,6 +294,10 @@ AdScratch take_ad_scratch(Pool& pool, const AdSizes& s, bool y2);
 /// One product's rows with its adapter (null: the product as always), the base product's sums already in y [R][N]
 /// (still divided by the input's row scales rsx, no bias yet): the scales and the bias put back and the adapter's
 /// delta added, what the forward's next stage reads.  keep receives what the backward reads.
+/// Not the inference's adapter path (image_lora.cpp's LoraLayer::add): that one adds a frozen adapter of any kind into
+/// a product's finished rows in one accumulating product, x A^T rounded to FP16 with the strength folded in; this one
+/// keeps h = x A^T as FP16 rows with their own scales for the backward, adds before the row scales and the bias, and
+/// reads a DoRA's magnitude and a LoKr's factors as they are trained.
 void ad_product_fwd(const Adapter* ad, const uint16_t* x16, const float* rsx, float* y, const float* bias, int64_t R,
                     int64_t N, int64_t K, const AdKeep& keep, const AdScratch& sc, prefill::Gemm& gemm, void* stream);
 

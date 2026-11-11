@@ -12,6 +12,7 @@
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/qi_stream.hpp"
 #include "strata/image/safetensors.hpp"
+#include "strata/image/train_trainer.hpp"
 
 #include "strata/core/gpu.hpp"
 #include "strata/platform/env.hpp"
@@ -36,23 +37,9 @@ namespace strata::image {
 
 namespace {
 
-constexpr float kEps = 1e-6f;
 static_assert(std::size(lora::kAnimaBlock) == kAnProducts);
 const char* const* const kProduct = lora::kAnimaBlock;   // the DiT's target names, in kAnProducts' order
 const char* const* const kMod = lora::kAnimaMod;
-
-struct Lora {
-    train::Adapter ad;
-    float *A = nullptr, *B = nullptr, *mA = nullptr, *vA = nullptr, *mB = nullptr, *vB = nullptr;
-    int64_t N = 0, K = 0;
-};
-
-// a one-row layer's LoRA (a modulation's): FP32 masters read as they are
-struct RowLora {
-    float *A = nullptr, *B = nullptr, *dA = nullptr, *dB = nullptr;
-    float *mA = nullptr, *vA = nullptr, *mB = nullptr, *vB = nullptr;
-    int64_t N = 0, K = 0;
-};
 
 // out[k] = sum_n W[n][k] d[n] (W [N][K] FP16) + sum_r A[r][k] g[r] (A [rank][K] FP32): a one-row product's input
 // gradient through its weight and its LoRA's down factor
@@ -91,11 +78,9 @@ void patch_order(const float* in, int64_t T, int64_t L, float* out, bool back, v
 
 }  // namespace
 
-struct AnimaTrainer::Impl {
-    void* s = nullptr;
-    std::vector<void*> owned;
-    prefill::Gemm gemm;
-    int64_t C = 0, F = 0, H = 0, hd = 0, lat = 0, Cc = 0, M = 0, rank = 0, steps = 0;
+struct AnimaTrainer::Impl : train::Trainer {
+    Impl() : Trainer("Anima training") {}
+    int64_t C = 0, F = 0, H = 0, hd = 0, lat = 0, Cc = 0, M = 0, rank = 0;
     struct Dense {
         uint16_t* w = nullptr;
         int64_t N = 0, K = 0;
@@ -106,114 +91,28 @@ struct AnimaTrainer::Impl {
         train::Product p[kAnProducts];
         Dense w1[3], w2[3];
         float *sqn = nullptr, *skn = nullptr, *cqn = nullptr, *ckn = nullptr;
-        Lora l[kAnProducts];
-        RowLora m1[3], m2[3];
+        train::Lora* l[kAnProducts] = {};               // null: no LoRA (rank 0)
+        train::Lora *m1[3] = {}, *m2[3] = {};           // the modulations' one-row LoRAs
     };
     std::vector<Block> blk;
-    uint16_t* wt[kAnProducts] = {};
-    train::Arena arena;   // the blocks' buffers, kept from block to block and step to step
-    int64_t scratch_rows = 0;   // the most rows a step has had: the arena holds what they took
-    // The blocks' ten products through a LayerStream (Qwen-Image-2.1's trainer's): as many blocks as the memory leaves
-    // stay in VRAM, the rest are copied in from RAM a block at a time (their FP16 rows made once at open and kept in
-    // RAM), blk's pointers set as a block is used (bind)
-    LayerStream ws;
-    std::vector<std::vector<uint8_t>> whost;
+    // The blocks' ten products through the trainer's LayerStream (their FP16 rows made once at open and kept in RAM),
+    // blk's pointers set as a block is used (bind)
     std::vector<std::array<uint64_t, kAnProducts>> woff;
-    bool stepped = false, budget_stepped = false;
-    int64_t budget_rows = 0;
     void bind(int64_t b, const uint8_t* base) {
         for (int i = 0; i < kAnProducts; ++i)
             blk[(size_t) b].p[i].w = reinterpret_cast<const uint16_t*>(base + woff[(size_t) b][(size_t) i]);
-    }
-    // The VRAM the products take (Qwen-Image-2.1's trainer's set_budget), at open (no rows), when a step brings more
-    // rows than any before and once after the first step: the free memory and what they hold now, less the step's
-    // own beside them (its blocks' inputs in BF16 at least, the scratch's growth: train::scratch_growth, before a
-    // step has shown it 13 FP32 rows of F a row as Qwen-Image-2.1's; 1.5 GiB of transients, 3 GiB more before the
-    // first step).  XESTRATA_TRAIN_WEIGHTS_MIB sets it.
-    void set_budget(int64_t R) {
-        if (R <= budget_rows && budget_stepped == stepped && ws.vram() > 0) return;
-        budget_rows = std::max(budget_rows, R);
-        budget_stepped = stepped;
-        R = budget_rows;
-        const uint64_t all = ws.total();
-        uint64_t budget = all;
-        if (const char* e = strata::env_get("TRAIN_WEIGHTS_MIB")) {
-            budget = (uint64_t) std::atoll(e) << 20;
-        } else {
-            size_t free_b = 0, total = 0;
-            gpu::stream_sync(s);
-            if (gpu::mem_info(&free_b, &total)) {
-                const uint64_t have = (uint64_t) free_b + ws.vram();
-                const uint64_t reserve = (uint64_t) ((int64_t) (blk.size() + 1) * R * C) * 2 +
-                                         train::scratch_growth(arena.held(), R, scratch_rows,
-                                                               (uint64_t) (13 * R * F) * 4) +
-                                         (uint64_t{3} << 29) +
-                                         (stepped ? 0 : uint64_t{3} << 30);
-                budget = have > reserve ? have - reserve : 0;
-            }
-        }
-        budget = std::min(all, std::max(budget, ws.min_budget()));
-        if (budget < all)
-            std::fprintf(stderr, "image engine (Anima training): the blocks' weights %llu of %llu MiB in VRAM, the "
-                                 "rest streamed from RAM\n",
-                         (unsigned long long) (budget >> 20), (unsigned long long) (all >> 20));
-        ws.configure(budget, s);
-    }
-    // Whether this step keeps its blocks' inputs in BF16 (XESTRATA_TRAIN_INPUTS16=0 or 1, or by the memory), as the
-    // MOSS-Image trainer does: when the free memory falls short of their FP32 bytes, the arena's growth to this step's
-    // rows (in proportion to the most rows so far, 10% over; before a step has shown it, 13 FP32 rows of F a row) and
-    // 1.5 GiB of transients
-    bool inputs_half(int64_t R) {
-        if (const char* e = strata::env_get("TRAIN_INPUTS16")) return std::atoi(e) != 0;
-        size_t free_b = 0, total = 0;
-        gpu::stream_sync(s);
-        if (!gpu::mem_info(&free_b, &total)) return false;
-        const size_t held = arena.held();
-        const size_t scratch =
-            scratch_rows > 0
-                ? (size_t) (1.1 * (double) held * (double) std::max(R, scratch_rows) / (double) scratch_rows)
-                : held + (size_t) (13 * R * F) * 4;
-        const size_t need = (size_t) ((int64_t) (blk.size() + 1 + 3) * R * C) * 4 +
-                            (scratch > held ? scratch - held : 0) + (size_t{3} << 29);
-        return free_b < need;
-    }
-
-    template <class T> T* get(int64_t n) {
-        void* q = nullptr;
-        if (!gpu::alloc_device(&q, (size_t) n * sizeof(T)) || !gpu::memset_async(q, 0, (size_t) n * sizeof(T), s))
-            throw std::runtime_error("image engine (Anima training): GPU memory");
-        owned.push_back(q);
-        return static_cast<T*>(q);
-    }
-    float* dev_vec(const std::vector<float>& v) {
-        float* d = get<float>((int64_t) v.size());
-        gpu::stream_sync(s);
-        if (!gpu::copy(d, v.data(), v.size() * 4)) throw std::runtime_error("image engine (Anima training): copy");
-        return d;
-    }
-    ~Impl() {
-        if (s != nullptr) gpu::stream_sync(s);
-        ws.drop();
-        for (void* q : owned) gpu::free(q);
-    }
-    void sync_views(Lora& l) {
-        train::f16_copy(l.A, rank * l.K, l.ad.a, s);
-        if (l.ad.at != nullptr) train::transpose_f16(l.ad.a, rank, l.K, l.ad.at, s);
-        train::f16_copy(l.B, l.N * rank, l.ad.b, s);
-        if (l.ad.bt != nullptr) train::transpose_f16(l.ad.b, l.N, rank, l.ad.bt, s);
     }
 };
 
 AnimaTrainer::AnimaTrainer() : m_(std::make_unique<Impl>()) {}
 AnimaTrainer::~AnimaTrainer() = default;
-int64_t AnimaTrainer::context_cols() const { return m_->Cc; }
+int64_t AnimaTrainer::text_cols() const { return m_->Cc; }
 
 bool AnimaTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* stream, std::string& err) {
     Impl& m = *m_;
     try {
-        m.s = stream;
         m.rank = rank;
-        if (!m.gemm.init(stream, 1 << 20, err)) return false;
+        if (!m.init(stream, 1 << 20, err)) return false;
         AnimaFile f(dit);
         // a matrix's rows as FP16 (BF16, F16 or F32 in the file), its first `cols` columns (0: all), in RAM
         auto rows16 = [&](const std::string& name, int64_t& N, int64_t& Kc, std::vector<uint16_t>& h) {
@@ -228,9 +127,7 @@ bool AnimaTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, voi
             std::vector<uint16_t> h;
             f.rows16(name, cols, h, d.N, K);
             d.K = cols > 0 ? cols : K;
-            d.w = m.get<uint16_t>(d.N * d.K);
-            gpu::stream_sync(m.s);
-            if (!gpu::copy(d.w, h.data(), h.size() * 2)) throw std::runtime_error("copy");
+            d.w = m.dev16(h.data(), d.N * d.K);
             return d;
         };
         m.lat = f.get("final_layer.linear.weight").shape[0] / 4;
@@ -247,43 +144,6 @@ bool AnimaTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, voi
         m.M = m.fm1.N;
         if (m.t2.N != 3 * m.C || m.fm2.N != 2 * m.C) throw std::runtime_error("image engine (Anima training): shape");
         std::mt19937_64 rng(seed);
-        auto lora = [&](Lora& l, int64_t N, int64_t K) {
-            l.N = N;
-            l.K = K;
-            std::vector<float> A;
-            train::lora_init(rng, rank, K, A);
-            l.A = m.dev_vec(A);
-            l.B = m.get<float>(N * rank);
-            l.mA = m.get<float>(rank * K);
-            l.vA = m.get<float>(rank * K);
-            l.mB = m.get<float>(N * rank);
-            l.vB = m.get<float>(N * rank);
-            l.ad.rank = rank;
-            l.ad.scale = 1.0f;   // alpha = rank
-            l.ad.a = m.get<uint16_t>(rank * K);
-            l.ad.b = m.get<uint16_t>(N * rank);
-            if (!m.gemm.f16_batch_ex_ok()) {
-                l.ad.at = m.get<uint16_t>(rank * K);
-                l.ad.bt = m.get<uint16_t>(N * rank);
-            }
-            l.ad.dA = m.get<float>(rank * K);
-            l.ad.dB = m.get<float>(N * rank);
-            m.sync_views(l);
-        };
-        auto row_lora = [&](RowLora& l, int64_t N, int64_t K) {
-            l.N = N;
-            l.K = K;
-            std::vector<float> A;
-            train::lora_init(rng, rank, K, A);
-            l.A = m.dev_vec(A);
-            l.B = m.get<float>(N * rank);
-            l.dA = m.get<float>(rank * K);
-            l.dB = m.get<float>(N * rank);
-            l.mA = m.get<float>(rank * K);
-            l.vA = m.get<float>(rank * K);
-            l.mB = m.get<float>(N * rank);
-            l.vB = m.get<float>(N * rank);
-        };
         for (int b = 0;; ++b) {
             const std::string p = "blocks." + std::to_string(b) + ".";
             if (f.find(p + "self_attn.q_proj.weight") == nullptr) break;
@@ -317,10 +177,10 @@ bool AnimaTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, voi
             B.cqn = m.dev_vec(f.f32(p + "cross_attn.q_norm.weight"));
             B.ckn = m.dev_vec(f.f32(p + "cross_attn.k_norm.weight"));
             if (rank > 0) {
-                for (int i = 0; i < kAnProducts; ++i) lora(B.l[i], B.p[i].N, B.p[i].K);
+                for (int i = 0; i < kAnProducts; ++i) B.l[i] = &m.add_lora(B.p[i].N, B.p[i].K, rank, rng);
                 for (int k = 0; k < 3; ++k) {
-                    row_lora(B.m1[k], B.w1[k].N, B.w1[k].K);
-                    row_lora(B.m2[k], B.w2[k].N, B.w2[k].K);
+                    B.m1[k] = &m.add_lora(B.w1[k].N, B.w1[k].K, rank, rng, false);
+                    B.m2[k] = &m.add_lora(B.w2[k].N, B.w2[k].K, rank, rng, false);
                 }
             }
             m.blk.push_back(B);
@@ -328,9 +188,9 @@ bool AnimaTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, voi
         if (m.blk.empty()) throw std::runtime_error("image engine (Anima training): the DiT has no blocks");
         m.F = m.blk[0].p[kAnL1].N;
         m.Cc = m.blk[0].p[kAnCk].K;
-        for (int i = 0; i < kAnProducts; ++i) m.wt[i] = m.get<uint16_t>(m.blk[0].p[i].N * m.blk[0].p[i].K);
+        m.dgrad_scratch(m.blk[0].p, kAnProducts, false);
         gpu::stream_sync(stream);
-        m.set_budget(0);
+        m.set_budget(0, 0, 0);
         return true;
     } catch (const std::exception& e) {
         err = e.what();
@@ -357,10 +217,32 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
     if (!gpu::copy(dx0, x0.data(), x0.size() * 4) || !gpu::copy(deps, eps.data(), eps.size() * 4) ||
         !gpu::copy(dxs, xs.data(), xs.size() * 4) || !gpu::copy(ctx, smp.te.data(), smp.te.size() * 4))
         throw std::runtime_error("image engine (Anima training): copy");
-    m.set_budget(HW);
+    m.set_budget(HW, (uint64_t) ((nb + 1) * C) * 2, (uint64_t) (13 * m.F) * 4);
     // every block's input in FP32 (two passed between, the forward alone), or where the memory is short in BF16
     // (inputs_half): bounds the two FP32 passed between, the inputs in bounds16, the input rounded as it is kept
-    const bool half = backward && m.inputs_half(HW);
+    // and the last blocks' tapes as the memory takes them (keep_tapes), both decided before the step's own buffers
+    // are taken (every block's input, the backward's two gradients and its blocks' output; in BF16, the inputs at half
+    // and two FP32 rows' buffers)
+    bool half = false;
+    int64_t first_kept = nb;
+    if (backward) {
+        AnimaBlockRun z;
+        z.C = C;
+        z.heads = m.H;
+        z.hd = m.hd;
+        z.F = m.F;
+        z.rows = HW;
+        z.L = L;
+        z.Cc = Cc;
+        for (int i = 0; i < kAnProducts; ++i) {
+            z.p[i] = m.blk.back().p[i];
+            z.ad[i] = rk > 0 ? &m.blk.back().l[i]->ad : nullptr;
+        }
+        const size_t rc = (size_t) (HW * C);
+        half = m.inputs_half(HW, (uint64_t) (nb + 1 + 3) * rc * 4, (uint64_t) (13 * m.F) * 4);
+        first_kept = nb - m.keep_tapes(nb, HW, anima_block_tape_bytes(z, m.gemm),
+                                       half ? (size_t) (nb + 1) * rc * 2 + 4 * rc * 4 : (size_t) (nb + 1 + 3) * rc * 4);
+    }
     const bool all32 = backward && !half;
     float* bounds = pool.f((all32 ? nb + 1 : 2) * HW * C);
     uint16_t* bounds16 = half ? pool.u((nb + 1) * HW * C) : nullptr;
@@ -379,23 +261,8 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
     float* x1 = pool.f(C);   // the modulations' input, FP32 of e16's second half
     float* alora = pool.f(3 * C);
     {
-        const int64_t half = C / 2;
-        std::vector<float> e((size_t) C);
-        for (int64_t i = 0; i < half; ++i) {
-            const float ex = std::exp(-std::log(10000.f) * (float) i / (float) half);
-            const float ph = sigma * ex;
-            e[(size_t) i] = dit_rows::round_bf16(std::cos(ph));
-            e[(size_t) (half + i)] = dit_rows::round_bf16(std::sin(ph));
-        }
-        double ss = 0.0;
-        for (const float v : e) ss += (double) v * v;
-        const float inv = 1.f / std::sqrt((float) (ss / (double) C) + kEps);
-        std::vector<uint16_t> h((size_t) (2 * C));
-        for (int64_t i = 0; i < C; ++i) {
-            h[(size_t) i] = kernels::f16_from_f32(e[(size_t) i]);
-            const float y = dit_rows::round_bf16(e[(size_t) i] * inv * m.tnorm[(size_t) i]);
-            h[(size_t) (C + i)] = kernels::f16_from_f32(y / (1.f + std::exp(-y)));
-        }
+        std::vector<uint16_t> h;
+        anima_time_rows(sigma, m.tnorm, h);
         gpu::stream_sync(s);   // e16's zero (the pool's, on this stream) before the copy (on the compute queue)
         if (!gpu::copy(e16, h.data(), h.size() * 2)) throw std::runtime_error("copy");
         float* mh = pool.f(C);
@@ -418,11 +285,11 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
                 float* mod = mods + (b * 3 + k) * 3 * C;
                 float* x2 = x2s + (b * 3 + k) * M;
                 m.gemm.f16(e16 + C, B.w1[k].w, mh, 1, M, C);
-                if (rk > 0) train::row_lora_fwd(B.m1[k].A, B.m1[k].B, x1, 1.f, rk, M, C, mh, hr, s);
+                if (rk > 0) train::row_lora_fwd(B.m1[k]->A, B.m1[k]->B, x1, 1.f, rk, M, C, mh, hr, s);
                 kernels::f32_to_f16_bulk(mh, m16, M, s);
                 to_f32(m16, M, x2, s);
                 m.gemm.f16(m16, B.w2[k].w, mod, 1, 3 * C, M);
-                if (rk > 0) train::row_lora_fwd(B.m2[k].A, B.m2[k].B, x2, 1.f, rk, 3 * C, M, mod, hr, s);
+                if (rk > 0) train::row_lora_fwd(B.m2[k]->A, B.m2[k]->B, x2, 1.f, rk, 3 * C, M, mod, hr, s);
                 train::add_into(mod, alora, 3 * C, s);
             }
         }
@@ -468,7 +335,7 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
         r.ckn = B.ckn;
         for (int i = 0; i < kAnProducts; ++i) {
             r.p[i] = B.p[i];
-            r.ad[i] = rk > 0 ? &B.l[i].ad : nullptr;
+            r.ad[i] = rk > 0 ? &B.l[i]->ad : nullptr;
         }
         return r;
     };
@@ -476,6 +343,7 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
         // the next block's products fetched meanwhile; past the last, the backward's second when it follows
         m.bind(b, backward ? m.ws.begin((int) b, (int) (b + 1 < nb ? b + 1 : nb - 2)) : m.ws.begin((int) b));
         AnimaBlockRun r = run_of(b);
+        if (b >= first_kept) r.tape = m.tape(b);
         if (half && b == 0) train::bf16_keep(bounds, HW * C, bounds16, s);
         r.x = all32 ? bounds + b * HW * C : bounds + (b % 2) * HW * C;
         r.out = all32 ? bounds + (b + 1) * HW * C : bounds + ((b + 1) % 2) * HW * C;
@@ -519,15 +387,16 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
         m.bind(b, m.ws.begin((int) b, (int) b - 1));   // the block below fetched meanwhile
         Impl::Block& B = m.blk[(size_t) b];
         AnimaBlockRun r = run_of(b);
-        for (int i = 0; i < kAnProducts; ++i) {   // the dgrads' weights, transposed
-            train::transpose_f16(B.p[i].w, B.p[i].N, B.p[i].K, m.wt[i], s);
-            r.p[i].wt = m.wt[i];
-        }
+        m.dgrad_weights(r.p, kAnProducts);
         if (half) train::bf16_load(bounds16 + b * HW * C, HW * C, last, s);
         r.x = half ? last : bounds + b * HW * C;
         r.out = bout;
         r.dout = dcur;
         r.dx = b > 0 ? dnxt : nullptr;
+        if (b >= first_kept) {   // its forward's tape: the backward alone
+            r.tape = m.tape(b);
+            r.tape_replay = true;
+        }
         if (rk > 0) {
             if (!gpu::memset_async(dmod, 0, (size_t) (9 * C) * 4, s)) throw std::runtime_error("zero");
             r.dmod_sa = dmod;
@@ -541,75 +410,37 @@ float AnimaTrainer::step(const MfTrainSample& smp, const std::vector<float>& x0,
             for (int k = 0; k < 3; ++k) {
                 const float* d = dmod + k * 3 * C;
                 const float* x2 = x2s + (b * 3 + k) * M;
-                train::row_lora_bwd(B.m2[k].A, B.m2[k].B, x2, d, 1.f, rk, 3 * C, M, B.m2[k].dA, B.m2[k].dB, hr, g, s);
-                row_dgrad(B.w2[k].w, d, 3 * C, M, B.m2[k].A, g, rk, dx2, s);
-                train::row_lora_bwd(B.m1[k].A, B.m1[k].B, x1, dx2, 1.f, rk, M, C, B.m1[k].dA, B.m1[k].dB, hr, g, s);
+                const train::Lora &l1 = *B.m1[k], &l2 = *B.m2[k];
+                train::row_lora_bwd(l2.A, l2.B, x2, d, 1.f, rk, 3 * C, M, l2.ad.dA, l2.ad.dB, hr, g, s);
+                row_dgrad(B.w2[k].w, d, 3 * C, M, l2.A, g, rk, dx2, s);
+                train::row_lora_bwd(l1.A, l1.B, x1, dx2, 1.f, rk, M, C, l1.ad.dA, l1.ad.dB, hr, g, s);
             }
         std::swap(dcur, dnxt);
     }
     gpu::stream_sync(s);
-    m.scratch_rows = std::max(m.scratch_rows, HW);
-    m.stepped = true;
+    m.stepped_rows(HW);
     return loss;
 }
 
-double AnimaTrainer::adamw(const train::AdamW& o) {
-    Impl& m = *m_;
-    const int64_t rk = m.rank;
-    std::vector<std::pair<const float*, int64_t>> parts;
-    for (const Impl::Block& B : m.blk) {
-        for (const Lora& l : B.l) {
-            parts.emplace_back(l.ad.dA, rk * l.K);
-            parts.emplace_back(l.ad.dB, l.N * rk);
-        }
-        for (int k = 0; k < 3; ++k)
-            for (const RowLora* l : {&B.m1[k], &B.m2[k]}) {
-                parts.emplace_back(l->dA, rk * l->K);
-                parts.emplace_back(l->dB, l->N * rk);
-            }
-    }
-    const double norm = std::sqrt(train::sq_sum(parts, m.s));
-    const float gscale = (float) std::min(1.0, 1.0 / (norm + 1e-6));   // torch's clip_grad_norm_ at 1
-    ++m.steps;
-    for (Impl::Block& B : m.blk) {
-        for (Lora& l : B.l) {
-            train::adamw(l.A, l.ad.dA, l.mA, l.vA, rk * l.K, o, m.steps, gscale, m.s);
-            train::adamw(l.B, l.ad.dB, l.mB, l.vB, l.N * rk, o, m.steps, gscale, m.s);
-            m.sync_views(l);
-        }
-        for (int k = 0; k < 3; ++k)
-            for (RowLora* l : {&B.m1[k], &B.m2[k]}) {
-                train::adamw(l->A, l->dA, l->mA, l->vA, rk * l->K, o, m.steps, gscale, m.s);
-                train::adamw(l->B, l->dB, l->mB, l->vB, l->N * rk, o, m.steps, gscale, m.s);
-            }
-    }
-    gpu::stream_sync(m.s);
-    return norm;
-}
+double AnimaTrainer::adamw(const train::AdamW& o) { return m_->update(o); }
 
 void AnimaTrainer::save(const std::string& path, const std::vector<std::pair<std::string, std::string>>& meta) const {
     const Impl& m = *m_;
-    auto read = [&](const float* p, int64_t n) {
-        std::vector<float> v((size_t) n);
-        gpu::stream_sync(m.s);
-        if (!gpu::copy(v.data(), p, (size_t) n * 4)) throw std::runtime_error("image engine: a read back");
-        return v;
-    };
     std::vector<train::Tensor> ts;
     for (size_t b = 0; b < m.blk.size(); ++b) {
         const Impl::Block& B = m.blk[b];
         const std::string p = "diffusion_model.blocks." + std::to_string(b) + ".";
         for (int i = 0; i < kAnProducts; ++i) {
-            const Lora& l = B.l[i];
-            ts.push_back({p + kProduct[i] + ".lora_A.weight", {m.rank, l.K}, read(l.A, m.rank * l.K)});
-            ts.push_back({p + kProduct[i] + ".lora_B.weight", {l.N, m.rank}, read(l.B, l.N * m.rank)});
+            const train::Lora& l = *B.l[i];
+            ts.push_back({p + kProduct[i] + ".lora_A.weight", {m.rank, l.K}, m.read(l.A, m.rank * l.K)});
+            ts.push_back({p + kProduct[i] + ".lora_B.weight", {l.N, m.rank}, m.read(l.B, l.N * m.rank)});
         }
         for (int k = 0; k < 3; ++k)
             for (int j = 0; j < 2; ++j) {
-                const RowLora& l = j == 0 ? B.m1[k] : B.m2[k];
+                const train::Lora& l = j == 0 ? *B.m1[k] : *B.m2[k];
                 const std::string n = p + kMod[k] + (j == 0 ? ".1" : ".2");
-                ts.push_back({n + ".lora_A.weight", {m.rank, l.K}, read(l.A, m.rank * l.K)});
-                ts.push_back({n + ".lora_B.weight", {l.N, m.rank}, read(l.B, l.N * m.rank)});
+                ts.push_back({n + ".lora_A.weight", {m.rank, l.K}, m.read(l.A, m.rank * l.K)});
+                ts.push_back({n + ".lora_B.weight", {l.N, m.rank}, m.read(l.B, l.N * m.rank)});
             }
     }
     train::save_safetensors_bf16(path, std::move(ts), meta);

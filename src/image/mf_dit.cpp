@@ -892,15 +892,13 @@ void MfDit::drop_loras() {
     }
 }
 
-// the image rows' 2D multi-scale RoPE: pairs 0 .. 7 by the frame (0 the target, j an edit's reference j), then
-// axes_[1] / 2 pairs by the row and axes_[2] / 2 by the column, each centred on its image (rows -(h - h / 2) ..
-// h / 2 - 1); the target's rows, then each reference's
-void MfDit::rope_tables(int64_t h, int64_t w) {
-    if (h == rope_h_ && w == rope_w_ && refs_gen_ == rope_refs_) return;
-    const int64_t half = hd_ / 2, a0 = axes_[0] / 2, a1 = axes_[1] / 2;
-    std::vector<std::pair<int64_t, int64_t>> images{{h, w}};
-    images.insert(images.end(), ref_sizes_.begin(), ref_sizes_.end());
-    std::vector<float> c((size_t) ((h * w + ref_rows_) * half)), s(c.size());
+void mf_rope_rows(const std::vector<std::pair<int64_t, int64_t>>& images, int64_t hd, const std::vector<int64_t>& axes,
+                  std::vector<float>& c, std::vector<float>& s) {
+    const int64_t half = hd / 2, a0 = axes[0] / 2, a1 = axes[1] / 2;
+    int64_t rows = 0;
+    for (const auto& im : images) rows += im.first * im.second;
+    c.assign((size_t) (rows * half), 0.f);
+    s.assign(c.size(), 0.f);
     size_t row = 0;
     for (size_t f = 0; f < images.size(); ++f) {
         const int64_t ih = images[f].first, iw = images[f].second;
@@ -908,14 +906,14 @@ void MfDit::rope_tables(int64_t h, int64_t w) {
         for (int64_t y = 0; y < ih; ++y)
             for (int64_t x = 0; x < iw; ++x, ++row)
                 for (int64_t j = 0; j < half; ++j) {
-                    double pos = (double) f, dim = (double) axes_[0], k = (double) j;
+                    double pos = (double) f, dim = (double) axes[0], k = (double) j;
                     if (j >= a0 && j < a0 + a1) {
                         pos = (double) (y - y0);
-                        dim = (double) axes_[1];
+                        dim = (double) axes[1];
                         k = (double) (j - a0);
                     } else if (j >= a0 + a1) {
                         pos = (double) (x - x0);
-                        dim = (double) axes_[2];
+                        dim = (double) axes[2];
                         k = (double) (j - a0 - a1);
                     }
                     const double ang = pos * std::pow(10000.0, -2.0 * k / dim);
@@ -923,6 +921,15 @@ void MfDit::rope_tables(int64_t h, int64_t w) {
                     s[row * (size_t) half + (size_t) j] = (float) std::sin(ang);
                 }
     }
+}
+
+// the target's rows' tables, then each reference's
+void MfDit::rope_tables(int64_t h, int64_t w) {
+    if (h == rope_h_ && w == rope_w_ && refs_gen_ == rope_refs_) return;
+    std::vector<std::pair<int64_t, int64_t>> images{{h, w}};
+    images.insert(images.end(), ref_sizes_.begin(), ref_sizes_.end());
+    std::vector<float> c, s;
+    mf_rope_rows(images, hd_, axes_, c, s);
     gpu::stream_sync(s_);
     gpu::copy(cos_, c.data(), c.size() * 4);
     gpu::copy(sin_, s.data(), s.size() * 4);
@@ -957,15 +964,20 @@ void MfDit::set_refs(const float* z, const std::vector<std::pair<int64_t, int64_
 // the time's embedding as the reference makes it in bf16 (it was trained with this rounding): the sinusoid of the
 // bf16 sigma by bf16 frequencies (flipped: cos then sin), rounded to bf16, through the two linear layers; then temb's
 // SiLU as FP16 (the modulations' input) at t16_ + 256 + C
-void MfDit::time_embedding(float sigma) {
+void mf_time_sinusoid(float sigma, std::vector<uint16_t>& e) {
     const float t = round_bf16(sigma);
-    std::vector<uint16_t> e(256);
+    e.assign(256, 0);
     for (int i = 0; i < 128; ++i) {
         const float f = round_bf16(std::exp(-std::log(10000.f) * (float) i / 128.f));
         const float a = 1000.f * (t * f);
         e[(size_t) i] = f16_from_f32(round_bf16(std::cos(a)));
         e[128 + (size_t) i] = f16_from_f32(round_bf16(std::sin(a)));
     }
+}
+
+void MfDit::time_embedding(float sigma) {
+    std::vector<uint16_t> e;
+    mf_time_sinusoid(sigma, e);
     gpu::copy_async(t16_, e.data(), e.size() * 2, s_);
     gpu::stream_sync(s_);   // e leaves scope
     product(t16_, nullptr, t1_, nullptr, temb_, 1, b_t1_);

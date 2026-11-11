@@ -646,9 +646,9 @@ void AnimaDit::rope_tables(int64_t h, int64_t w) {
 
 // the timestep embedder: the sinusoid of sigma rounded to bf16, its two layers (the AdaLN-LoRA term) and its RMS norm
 // (the blocks' embedding, whose SiLU every modulation reads)
-void AnimaDit::time_embedding(float sigma) {
-    const int64_t half = C_ / 2;
-    std::vector<float> e((size_t) C_);
+void anima_time_rows(float sigma, const std::vector<float>& tnorm, std::vector<uint16_t>& h) {
+    const auto C = (int64_t) tnorm.size(), half = C / 2;
+    std::vector<float> e((size_t) C);
     for (int64_t i = 0; i < half; ++i) {
         const float ex = std::exp(-std::log(10000.f) * (float) i / (float) half);
         const float ph = sigma * ex;
@@ -657,13 +657,18 @@ void AnimaDit::time_embedding(float sigma) {
     }
     double ss = 0.0;
     for (const float v : e) ss += (double) v * v;
-    const float inv = 1.f / std::sqrt((float) (ss / (double) C_) + kEps);
-    std::vector<uint16_t> h((size_t) (2 * C_));
-    for (int64_t i = 0; i < C_; ++i) {
+    const float inv = 1.f / std::sqrt((float) (ss / (double) C) + kEps);
+    h.assign((size_t) (2 * C), 0);
+    for (int64_t i = 0; i < C; ++i) {
         h[(size_t) i] = f16_from_f32(e[(size_t) i]);
-        const float y = round_bf16(e[(size_t) i] * inv * tnorm_host_[(size_t) i]);
-        h[(size_t) (C_ + i)] = f16_from_f32(y / (1.f + std::exp(-y)));
+        const float y = round_bf16(e[(size_t) i] * inv * tnorm[(size_t) i]);
+        h[(size_t) (C + i)] = f16_from_f32(y / (1.f + std::exp(-y)));
     }
+}
+
+void AnimaDit::time_embedding(float sigma) {
+    std::vector<uint16_t> h;
+    anima_time_rows(sigma, tnorm_host_, h);
     uint16_t* s16 = m16_;   // the sinusoid, then the embedding's SiLU in e16_
     gpu::copy_async(s16, h.data(), (size_t) C_ * 2, s_);
     gpu::copy_async(e16_, h.data() + C_, (size_t) C_ * 2, s_);

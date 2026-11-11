@@ -1,0 +1,142 @@
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// include/strata/image/train_trainer.hpp - what every image model's LoRA trainer holds and does the same way
+// (src/image/train_trainer.cpp): the device memory it owns, the trained factors and their clipped AdamW update, the
+// blocks' weights through a LayerStream with their VRAM budget, the blocks' shared scratch (an arena), the last blocks'
+// tapes kept from the forward to the backward, and the form the blocks' inputs are kept in.  A model's trainer
+// (qi_trainer.cpp, moss_trainer.cpp, anima_trainer.cpp, mf_trainer.cpp) derives from it and holds what is its own:
+// its DiT's edges, its blocks and its file's names.
+#pragma once
+
+#include "strata/image/qi_stream.hpp"
+#include "strata/image/train_loop.hpp"
+#include "strata/image/train_ops.hpp"
+#include "strata/prefill/gemm.hpp"
+
+#include <cstdint>
+#include <deque>
+#include <memory>
+#include <random>
+#include <string>
+#include <vector>
+
+namespace strata::image::train {
+
+/// A trained factor pair on one product [N][K]: FP32 masters A [rank][K] and B [N][rank], and `ad`, what the block
+/// reads (the FP16 views a and b, their transposed views where the GPU takes no transposed products, the gradients dA
+/// and dB).  A one-row LoRA (a modulation's, row_lora_fwd) reads the masters as they are and has no FP16 views.
+struct Lora {
+    Adapter ad;
+    float *A = nullptr, *B = nullptr;
+    int64_t N = 0, K = 0;
+    bool views = true;
+};
+
+class Trainer {
+public:
+    /// `what` names the trainer in its messages ("Qwen-Image-2.1 training").
+    explicit Trainer(std::string what);
+    virtual ~Trainer();
+    Trainer(const Trainer&) = delete;
+    Trainer& operator=(const Trainer&) = delete;
+
+    /// The step's stream and the products' Gemm (its workspace `ws_bytes`).
+    bool init(void* stream, size_t ws_bytes, std::string& err);
+
+    // ---- device memory the trainer owns, freed with it
+    /// n values, zeroed on the stream and waited for: the host's values are copied in through the compute queue
+    /// (gpu::copy), which is not ordered against the stream, and a zero that ran late wiped parts of the weights
+    /// (2026-11-09).
+    template <class T> T* get(int64_t n) { return static_cast<T*>(take((size_t) n * sizeof(T))); }
+    void release(void* p);
+    float* dev_vec(const std::vector<float>& v);
+    uint16_t* dev16(const void* v, int64_t n);   // n FP16 values
+    std::vector<float> read(const float* p, int64_t n) const;
+
+    // ---- the trained tensors
+    /// A plain LoRA of `rank` (alpha = rank: scale 1) on a product [N][K]: A drawn from rng (lora_init), B zero, both
+    /// trained; `views` false for a one-row LoRA.  The reference stays valid for the trainer's life.
+    Lora& add_lora(int64_t N, int64_t K, int64_t rank, std::mt19937_64& rng, bool views = true);
+    /// A tensor of n values the update trains (w its FP32 master, g its gradient), its AdamW moments made here.  The
+    /// global norm and the updates run in the order the tensors were added.
+    void add_param(float* w, float* g, int64_t n);
+    /// The FP16 views of a LoRA's masters (written after each update).
+    void sync_views(const Adapter& ad, const float* A, const float* B, int64_t N, int64_t K);
+    /// The optimizer's step: the global norm of every gradient times `gscale` (a gradient summed over micro-steps
+    /// averaged), torch's clip_grad_norm_ at 1 (the gradients scaled by 1 / (norm + 1e-6) past it), AdamW on every
+    /// tensor (the gradients zeroed), then the LoRAs' views; the norm before the clip.
+    double update(const AdamW& o, float gscale = 1.f);
+    /// The trained LoRAs, in the order add_lora made them.
+    const std::deque<Lora>& loras() const { return loras_; }
+
+    /// The scratch dgrad_weights writes for a block's products p[0 .. n) (every block's the same shapes), `int8` an int8
+    /// base's: none where the products read a 16-bit weight's rows as they are.
+    void dgrad_scratch(const Product* p, int n, bool int8);
+    /// The weights a block's backward reads for its products' dgrads, p[0 .. n) as the block is bound: where the GPU's
+    /// products read a transposed operand (Gemm::f16_batch_ex_ok), the rows as they are (Product::wr: w itself, an
+    /// int8 base's straight-through weight rotated back) and no transposed copy, a block each step; else transposed
+    /// (Product::wt).
+    void dgrad_weights(Product* p, int n);
+
+    // ---- the memory of a step
+    /// The VRAM the blocks' weights (ws) take, set when a step brings more rows than any before and once after the
+    /// first step (its reserve for the kernels' first runs given back): the free memory, what the weights and the
+    /// tapes hold now, less the step's own beside them - `keep_row` bytes a row it takes after the budget is set (the
+    /// blocks' inputs in BF16 at least), the arena's growth (scratch_growth, `guess_row` bytes a row before a step has
+    /// shown it), 1.5 GiB of transients and 3 GiB more before the first step (the kernels' first runs: free memory
+    /// fell 2.7 GB more than the arenas took on the B70, 2026-11-09) - all of them where that takes them, else as many
+    /// as it does and the rest streamed.  XESTRATA_TRAIN_WEIGHTS_MIB sets it.  The tapes are let go where the weights
+    /// need their memory.
+    void set_budget(int64_t rows, uint64_t keep_row, uint64_t guess_row);
+    /// Whether this step keeps its blocks' inputs in BF16 (XESTRATA_TRAIN_INPUTS16=0 or 1, or by the memory): when the
+    /// free memory and the tapes' buffer fall short of `f32_bytes` (the inputs in FP32 and what else the caller counts
+    /// beside them), the arena's growth to this step's rows (`guess_row` bytes a row before a step has shown it),
+    /// 1.5 GiB of transients and 3 GiB more before the first step.  The forward then rounds each input to BF16 as it
+    /// keeps it, so the backward reads what the forward used.
+    bool inputs_half(int64_t rows, uint64_t f32_bytes, uint64_t guess_row);
+    /// How many of the last of `nb` blocks keep their tapes this step (a tape `per` bytes, `step_bytes` what the step
+    /// takes of its own after this): XESTRATA_TRAIN_TAPES, or as many as the device memory takes once a step of as
+    /// many rows or more has shown the arena's size - none the first step, nor a step of more rows than any before (a
+    /// guess of the arena's growth ran the RX 9060 XT out of memory): the free memory and the tapes' own buffer, less
+    /// the arena's growth to this step's rows, step_bytes and 1.5 GiB of transients.  The buffer grows when a step
+    /// keeps more tapes than it holds, and shrinks only when the memory does not allow it (a smaller step's tapes fit
+    /// in it as they are).
+    int64_t keep_tapes(int64_t nb, int64_t rows, size_t per, size_t step_bytes);
+    /// Block b's kept tape (keep_tapes), null where it keeps none.
+    Arena* tape(int64_t b) const;
+    /// A step of `rows` ran: its kernels compiled and the arena grown to it.
+    void stepped_rows(int64_t rows);
+
+    void* s = nullptr;
+    prefill::Gemm gemm;
+    LayerStream ws;                              // the blocks' weights
+    std::vector<std::vector<uint8_t>> whost;     // their rows as the products read them, made at open: ws's source
+    Arena arena;                                 // the blocks' scratch, kept from block to block and step to step
+    int64_t steps = 0;                           // the optimizer's steps
+    int64_t scratch_rows = 0;                    // the most rows a step has had: the arena holds what they took
+    bool stepped = false;                        // a step ran (its kernels compiled, the arena grown)
+
+protected:
+    const std::string& what() const { return what_; }
+
+private:
+    void* take(size_t bytes);
+    void drop_tapes();
+    struct Param {
+        float *w, *g, *m, *v;
+        int64_t n;
+    };
+    std::string what_;
+    std::vector<void*> owned_;
+    std::deque<Lora> loras_;
+    std::vector<uint16_t*> dgrad_tmp_;   // dgrad_weights' [N][K] or [K][N] FP16 a product
+    uint16_t* w8tmp_ = nullptr;          // an int8 base's rows before their transpose
+    std::vector<Param> params_;
+    int64_t budget_rows_ = 0;
+    bool budget_stepped_ = false;
+    std::vector<std::unique_ptr<Arena>> tapes_;
+    void* tape_buf_ = nullptr;
+    size_t tape_cap_ = 0;
+};
+
+}  // namespace strata::image::train

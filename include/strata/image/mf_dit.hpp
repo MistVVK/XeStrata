@@ -181,6 +181,16 @@ inline MfOut rows_of(const float* p, int64_t C) {
     return m;
 }
 
+/// The time's sinusoid [256] as the reference makes it in bf16: the bf16 sigma by bf16 frequencies
+/// 10000^(-i / 128) times 1000 (flipped: cos then sin), rounded to bf16, as FP16: the DiT's and the trainer's.
+void mf_time_sinusoid(float sigma, std::vector<uint16_t>& e);
+
+/// The images' rows' 2D multi-scale RoPE [rows][hd / 2] (cos, sin): pairs 0 .. axes[0] / 2 - 1 by the image's index f
+/// (0 the target, j an edit's reference j), then axes[1] / 2 pairs by the row and axes[2] / 2 by the column, each
+/// centred on its image (rows -(h - h / 2) .. h / 2 - 1): the DiT's and the trainer's.
+void mf_rope_rows(const std::vector<std::pair<int64_t, int64_t>>& images, int64_t hd, const std::vector<int64_t>& axes,
+                  std::vector<float>& c, std::vector<float>& s);
+
 class SafeTensors;
 
 class MfDit {

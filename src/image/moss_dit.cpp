@@ -1161,6 +1161,16 @@ void MossDit::set_time_path(const std::string& path) {
     tp_path_ = path;
 }
 
+void moss_time_sinusoid(double t, int64_t freq, std::vector<uint16_t>& e) {
+    const int64_t half = freq / 2;
+    e.assign((size_t) freq, 0);
+    for (int64_t i = 0; i < half; ++i) {
+        const double ph = t * std::pow(10000.0, -(double) i / (double) half);
+        e[(size_t) i] = f16_from_f32(round_bf16((float) std::cos(ph)));
+        e[(size_t) (half + i)] = f16_from_f32(round_bf16((float) std::sin(ph)));
+    }
+}
+
 void MossDit::time_embedding(float timestep) {
     const int64_t half = freq_ / 2;
     if (!tp_path_.empty()) {   // the adapter's time path, in FP32 (its training's): the sinusoid, two layers, SiLU between
@@ -1191,12 +1201,8 @@ void MossDit::time_embedding(float timestep) {
         product(h16 + C_, nullptr, hmod_, nullptr, head_, 1, tp_hmod_b_);
         return;
     }
-    std::vector<uint16_t> e((size_t) freq_);
-    for (int64_t i = 0; i < half; ++i) {
-        const double ph = (double) timestep * std::pow(10000.0, -(double) i / (double) half);
-        e[(size_t) i] = f16_from_f32(round_bf16((float) std::cos(ph)));
-        e[(size_t) (half + i)] = f16_from_f32(round_bf16((float) std::sin(ph)));
-    }
+    std::vector<uint16_t> e;
+    moss_time_sinusoid((double) timestep, freq_, e);
     gpu::copy_async(t16_, e.data(), e.size() * 2, s_);
     gpu::stream_sync(s_);   // e leaves scope
     uint16_t* h16 = t16_ + freq_;

@@ -49,16 +49,6 @@ void put_async(void* d, const void* h, size_t bytes, void* s) {
         throw std::runtime_error(std::string("image engine: copy: ") + gpu::last_error());
 }
 
-// the sinusoidal embedding of time t: [cos(t f_i) for i < 128, sin(t f_i)], f_i = 10000^(-i / 128)
-void timestep_embedding(float t, float* out) {
-    constexpr int half = 128;
-    for (int i = 0; i < half; ++i) {
-        const float f = std::exp(-std::log(10000.0f) * (float) i / (float) half);
-        out[i] = std::cos(t * f);
-        out[half + i] = std::sin(t * f);
-    }
-}
-
 // A file's key that changes a text encoder (kohya's lora_te_, diffusers' text_encoder. prefix, the te. other tools
 // write): the image engine applies adapters to the DiT only, and says so rather than leaving it out.
 bool is_text_encoder_key(const std::string& k) {
@@ -612,8 +602,8 @@ void QiDit::drop_host_prefix() {
 
 void QiDit::step_modulation(float t) {
     std::vector<float> e((size_t) 2 * 256);
-    timestep_embedding(t, e.data());
-    timestep_embedding(0.0f, e.data() + 256);
+    qi_time_sinusoid(t, e.data());
+    qi_time_sinusoid(0.0f, e.data() + 256);
     std::vector<uint16_t> e16(e.size());
     for (size_t i = 0; i < e.size(); ++i) e16[i] = kernels::f16_from_f32(e[i]);
     put_async(small16_, e16.data(), e16.size() * 2, s_);
@@ -624,6 +614,30 @@ void QiDit::step_modulation(float t) {
     qi_silu(temb_, 2 * C_, small16_, s_);   // the time after its SiLU: the modulation's and the final norm's input
     for (int k = 0; k < 4; ++k) product(small16_, mod_, mods_ + (int64_t) k * 2 * C_, 2, C_, (int64_t) k * C_, C_);
     product(small16_, nout_, scale_, 1);
+}
+
+void qi_time_sinusoid(float t, float* out) {
+    constexpr int half = 128;
+    for (int i = 0; i < half; ++i) {
+        const float f = std::exp(-std::log(10000.0f) * (float) i / (float) half);
+        out[i] = std::cos(t * f);
+        out[half + i] = std::sin(t * f);
+    }
+}
+
+void qi_rope_rows(const std::vector<float>& pos, int64_t T, std::vector<float>& c, std::vector<float>& s) {
+    c.assign((size_t) T * kHead / 2, 0.f);
+    s.assign(c.size(), 0.f);
+    for (int64_t i = 0; i < T; ++i) {
+        int j = 0;
+        for (int a = 0; a < 3; ++a)
+            for (int f = 0; f < kAxes[a] / 2; ++f, ++j) {
+                const float omega = 1.0f / std::pow(10000.0f, (float) (2 * f) / (float) kAxes[a]);
+                const float ang = pos[(size_t) i * 3 + a] * omega;
+                c[(size_t) (i * kHead / 2 + j)] = std::cos(ang);
+                s[(size_t) (i * kHead / 2 + j)] = std::sin(ang);
+            }
+    }
 }
 
 void QiDit::rope_tables(const std::vector<float>& pre_pos, int64_t n_text, int64_t target_pos, int64_t H, int64_t W,
@@ -639,17 +653,8 @@ void QiDit::rope_tables(const std::vector<float>& pre_pos, int64_t n_text, int64
             p[1] = (float) (y - hh);
             p[2] = (float) (xx - wh);
         }
-    std::vector<float> c((size_t) T * kHead / 2), s(c.size());
-    for (int64_t i = 0; i < T; ++i) {
-        int j = 0;
-        for (int a = 0; a < 3; ++a)
-            for (int f = 0; f < kAxes[a] / 2; ++f, ++j) {
-                const float omega = 1.0f / std::pow(10000.0f, (float) (2 * f) / (float) kAxes[a]);
-                const float ang = pos[(size_t) i * 3 + a] * omega;
-                c[(size_t) (i * kHead / 2 + j)] = std::cos(ang);
-                s[(size_t) (i * kHead / 2 + j)] = std::sin(ang);
-            }
-    }
+    std::vector<float> c, s;
+    qi_rope_rows(pos, T, c, s);
     // put is a copy of its own, not ordered after the stream: the work queued with the tables before (the other
     // context's forward, under guidance) is done first
     gpu::stream_sync(s_);

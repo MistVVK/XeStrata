@@ -855,7 +855,7 @@ if(STRATA_ENABLE_XE)
                            src/image/mf_train_block.cpp src/image/qi_train_block.cpp
                            src/image/moss_train_block.cpp src/image/moss_trainer.cpp
                            src/image/anima_train_block.cpp src/image/anima_trainer.cpp src/image/flow_weighting.cpp
-                           src/image/train_loop.cpp src/image/qi_trainer.cpp
+                           src/image/train_loop.cpp src/image/train_trainer.cpp src/image/qi_trainer.cpp
                            src/image/mf_pipeline.cpp src/image/text_encoder.cpp src/image/moss_dit.cpp
                            src/image/moss_pipeline.cpp
                            src/image/anima_dit.cpp src/image/anima_pipeline.cpp src/image/flow_sampler.cpp
@@ -1299,10 +1299,12 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-image-qi-train PRIVATE strata_image)
   # a LoRA on MOSS-Image as ai-toolkit trains one, from tools/image/mf_pre.py's caches (--cache ms; the samples read
   # by train_sample.cpp's mf_trainer_sample, as the Mage-Flow trainer's are)
-  add_executable(strata-image-moss-train src/image/moss_train_main.cpp src/image/train_sample.cpp)
+  add_executable(strata-image-moss-train src/image/export_train_main.cpp src/image/train_sample.cpp)
+  target_compile_definitions(strata-image-moss-train PRIVATE STRATA_TRAIN_MODEL="moss-image")
   target_link_libraries(strata-image-moss-train PRIVATE strata_image)
-  # a LoRA on Anima as ai-toolkit trains one, from tools/image/mf_pre.py's caches (--cache an)
-  add_executable(strata-image-anima-train src/image/anima_train_main.cpp src/image/train_sample.cpp)
+  # a LoRA on Anima as ai-toolkit trains one, from tools/image/mf_pre.py's caches (--cache an): the same loop
+  add_executable(strata-image-anima-train src/image/export_train_main.cpp src/image/train_sample.cpp)
+  target_compile_definitions(strata-image-anima-train PRIVATE STRATA_TRAIN_MODEL="anima")
   target_link_libraries(strata-image-anima-train PRIVATE strata_image)
   # the learning preprocessing's own tool (docs/LORA_TRAIN.md "The latent and text-embedding disk caches"):
   # Mage-VAE's encoder and the text states on the inference's path, one image at a time, for tools/image/mf_pre.py

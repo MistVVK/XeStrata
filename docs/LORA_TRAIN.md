@@ -57,8 +57,9 @@ dotted + the role**. The trainer writes its own target names as they are: there 
 - The strength goes out as a **per-weight `.alpha` tensor**: one form, no metadata lookup. Card 15 makes `.alpha` win and applies a metadata `lora_alpha` only to
   weights that have no `.alpha` (as the common dot-form reader does).
 - The metadata v1 writes: `modelspec.title`, `modelspec.trigger_phrase` (the trigger word), `ss_network_module` (`networks.lora`, `networks.lokr`), `ss_network_dim`,
-  `ss_network_alpha`, `ss_seed`, `ss_learning_rate`, `ss_optimizer_type`, `ss_max_steps`, `ss_model` (the `model_name`) and `ss_xestrata_revision`. No recommended
-  strength (`recommended_strength*`): the listing's `scale` stays 1.0.
+  `ss_network_alpha`, `ss_seed`, `ss_learning_rate`, `ss_optimizer_type`, `ss_steps` (the steps up to the save), `ss_max_steps`, `ss_model` (the `model_name`),
+  `ss_base_model_version` (the base model) and `ss_xestrata_revision`, and ai-toolkit's `name`, `version`, `software` and `format`: the same keys from all four trainers. No
+  recommended strength (`recommended_strength*`): the listing's `scale` stays 1.0.
 
 ### alpha (how the strength is applied)
 
