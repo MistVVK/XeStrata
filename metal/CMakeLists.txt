@@ -40,8 +40,7 @@ target_compile_definitions(mtl_rt PRIVATE
 target_link_libraries(mtl_rt PUBLIC "-framework Metal" "-framework Foundation")
 
 file(GLOB STRATA_METAL_TESTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp)
-list(REMOVE_ITEM STRATA_METAL_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_hello.cpp
-                 ${CMAKE_CURRENT_SOURCE_DIR}/tests/dsu_ref_vs_ggml.cpp)   # (needs ggml: below)
+list(REMOVE_ITEM STRATA_METAL_TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_hello.cpp)
 foreach(src ${STRATA_METAL_TESTS})
   get_filename_component(t ${src} NAME_WE)
   add_executable(${t} ${src})
@@ -83,10 +82,10 @@ if(NOT EXISTS "${_strata_ggml_root}/ggml/CMakeLists.txt")
   message(FATAL_ERROR "ggml sources not found in '${_strata_ggml_root}' (third_party/strata-ggml, or the -DSTRATA_GGML_DIR checkout)")
 endif()
 strata_metal_ggml()
-# OWN-2N: the CPU expert rows, the DeepSeek CPU lane's rows and the --mtp-q4 requantizer on the Strata quant layer (src/quant, its Arm NEON tier, no ggml-cpu
+# OWN-2N: the CPU expert rows and the --mtp-q4 requantizer on the Strata quant layer (src/quant, its Arm NEON tier, no ggml-cpu
 # call from the pool) instead of ggml-cpu's type traits.  OFF by default on Metal until the layer's oracle (tests/quant/run_oracle.sh, Apple Clang) and unit tests
 # have passed on the Mac; -DSTRATA_OWN_CPU_QUANT=ON builds the engine on the layer.
-option(STRATA_OWN_CPU_QUANT "CPU expert pool, DeepSeek CPU lane and --mtp-q4 on the Strata quant layer instead of ggml-cpu's type traits" OFF)
+option(STRATA_OWN_CPU_QUANT "CPU expert pool and --mtp-q4 on the Strata quant layer instead of ggml-cpu's type traits" OFF)
 option(STRATA_BUILD_TESTS "Build the quant layer's self-test and ggml oracle test (needs STRATA_OWN_CPU_QUANT)" OFF)
 if(STRATA_OWN_CPU_QUANT)
   set(STRATA_QUANT_ROOT ${STRATA_ROOT})
@@ -94,10 +93,6 @@ if(STRATA_OWN_CPU_QUANT)
   include(${STRATA_ROOT}/cmake/backends/quant.cmake)
   strata_quant_layer()
 endif()
-# ref_quant's IQ1_S / IQ1_M / Q6_K dequantizers against ggml's own (the Unsloth sets' kernels are checked against ref_quant: dsu_parity)
-add_executable(dsu_ref_vs_ggml tests/dsu_ref_vs_ggml.cpp)
-target_include_directories(dsu_ref_vs_ggml PRIVATE ${_strata_ggml_root}/ggml/include)
-target_link_libraries(dsu_ref_vs_ggml PRIVATE mtl_rt ggml-base ggml-cpu)
 
 set(S ${STRATA_ROOT}/src)
 set(STRATA_METAL_HOST_SOURCES
@@ -111,7 +106,7 @@ set(STRATA_METAL_HOST_SOURCES
   ${S}/spec/suffix_drafter.cpp ${S}/spec/controller.cpp ${S}/spec/draft_policy.cpp ${S}/spec/draft_source.cpp
   ${S}/kernels/cpu/pool.cpp ${S}/kernels/cpu/expert_layout.cpp ${S}/kernels/cpu/native_expert.cpp
   ${S}/kernels/cpu/hadamard.cpp ${S}/kernels/cpu/tq_cpu.cpp)   # Gyro: the Hadamard rotation, the scalar trellis rows
-set_source_files_properties(${S}/core/device.cu ${S}/core/pinned.cu ${DS4}/ds4_vision.cu ${DS4}/vendor/exl3.cu ${DS4}/vendor/moe_win.cu ${DS4}/vendor/sampler.cu
+set_source_files_properties(${S}/core/device.cu ${S}/core/pinned.cu
                             PROPERTIES LANGUAGE CXX)
 
 # The kernel library: Metal implementations (src/engine/*.cpp) and, for every entry point not ported yet, a stub

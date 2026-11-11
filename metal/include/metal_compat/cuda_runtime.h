@@ -135,11 +135,6 @@ inline cudaError_t cudaDeviceEnablePeerAccess(int p, unsigned f) { return strata
 inline cudaError_t cudaDeviceDisablePeerAccess(int) { return cudaSuccess; }   // a Mac has one GPU: nothing to disable
 
 // ---- memory and copies
-// the deferred command buffer mtl_rt batches the port's dispatches into: a copy (or any host read of a device result)
-// has to commit it first, or it reads memory the GPU has not written yet.  Defined in ds4_finish.cpp.
-extern "C" void ds4_metal_flush();
-extern "C" void ds4_metal_kick();
-
 template <class T> inline cudaError_t cudaMalloc(T** p, size_t n) { return strata::gpu::malloc_device(p, n); }
 inline cudaError_t cudaFree(void* p) { return strata::gpu::free_device(p); }
 template <class T> inline cudaError_t cudaHostAlloc(T** p, size_t n, unsigned f) { return strata::gpu::host_alloc(p, n, f); }
