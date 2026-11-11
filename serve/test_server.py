@@ -2536,6 +2536,66 @@ class LearnedProfile(unittest.TestCase):
         self.assertEqual(engine_args(cfg), ["--native", "x", "--expert-profile-save", "learned.bin"])
 
 
+class DraftCosts(unittest.TestCase):
+    """Repeatable output: the engine is told where this computer's draft cost table lives (--draft-costs), in its own folder beside the saved
+    tunings, never in a real settings folder during a test (STRATA_DRAFT_COSTS_DIR)."""
+
+    def setUp(self):
+        global server
+        import serve.server as server
+        self.tmp = Path(tempfile.mkdtemp())
+        self.env = mock.patch.dict(os.environ, {"STRATA_DRAFT_COSTS_DIR": str(self.tmp / "dc")})
+        self.env.start()
+
+    def tearDown(self):
+        self.env.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_default_follows_the_module_switch(self):
+        args = ["--native", "x", "--spec", "6"]
+        new = self.tmp / "new-engine"
+        new.write_bytes(b"\x7fELF strata --spec --serve --draft-costs --draft-costs-key")
+        got = server.draft_costs_args({"model_name": "m"}, list(args), str(new))
+        if server.DRAFT_COSTS_DEFAULT:
+            self.assertIn("--draft-costs", got)
+        else:
+            self.assertEqual(got, args)
+        # by default an engine that cannot be read (or none named) is left as it is; only a config asking by name passes it blind
+        self.assertEqual(server.draft_costs_args({"model_name": "m"}, list(args)), args)
+        self.assertEqual(server.draft_costs_args({"model_name": "m"}, list(args), str(self.tmp / "missing")), args)
+
+    def test_on_gives_a_file_in_the_redirected_folder(self):
+        args = ["--native", "x", "--spec", "6"]
+        got = server.draft_costs_args({"model_name": "qwen3.8-flash-next-iq3_s", "draft_costs": True}, list(args))
+        self.assertEqual(got[:4], args)
+        path = Path(got[got.index("--draft-costs") + 1])
+        self.assertEqual(path.parent, self.tmp / "dc")
+        self.assertTrue(path.name.startswith("qwen3.8-flash-next-iq3_s-") and path.name.endswith(".costs"))
+        self.assertFalse(path.exists())                         # the engine writes it, the server never does
+
+    def test_other_settings_other_file_same_settings_same_file(self):
+        a = server.draft_costs_args({"model_name": "m", "draft_costs": True}, ["--spec", "6"])
+        b = server.draft_costs_args({"model_name": "m", "draft_costs": True}, ["--spec", "6"])
+        c = server.draft_costs_args({"model_name": "m", "draft_costs": True}, ["--spec", "8"])
+        self.assertEqual(a, b)
+        self.assertNotEqual(a[a.index("--draft-costs") + 1], c[c.index("--draft-costs") + 1])
+
+    def test_off_and_given_by_hand_are_kept(self):
+        self.assertEqual(server.draft_costs_args({"draft_costs": False}, ["--spec", "6"]), ["--spec", "6"])
+        own = ["--spec", "6", "--draft-costs", "mine.costs"]
+        self.assertEqual(server.draft_costs_args({"draft_costs": True}, list(own)), own)
+
+    def test_an_engine_without_the_option_is_not_given_it(self):
+        old = self.tmp / "old-engine"
+        old.write_bytes(b"\x7fELF strata --spec --serve")
+        new = self.tmp / "new-engine"
+        new.write_bytes(b"\x7fELF strata --spec --serve --draft-costs --draft-costs-key")
+        self.assertEqual(server.draft_costs_args({"draft_costs": True}, ["--spec", "6"], str(old)), ["--spec", "6"])
+        got = server.draft_costs_args({"draft_costs": True}, ["--spec", "6"], str(new))
+        self.assertIn("--draft-costs", got)
+        self.assertEqual(got[-2:], ["--draft-costs-key", f"engine file {new.stat().st_size} bytes"])
+
+
 class RepeatStop(unittest.TestCase):
     """#606: one token repeated repeat_stop_tokens times in a row ends the reply as "length"; 0 turns it off."""
 

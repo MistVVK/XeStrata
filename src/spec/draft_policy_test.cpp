@@ -8,7 +8,12 @@
 //   5. the policy never proposes a window beyond its cap.
 #include "strata/spec/draft_policy.hpp"
 
+#include <cstdint>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <vector>
 
 using strata::spec::DraftPolicy;
 
@@ -193,6 +198,132 @@ int main() {
             cok &= n == 0 || q.allowed(3 + n);
         }
         check(cok, "sizes: a chained window's total is an allowed size");
+    }
+    {
+        // Fixed costs: measured round times never reach the costs, so two runs that see the same tokens choose the same windows
+        // whatever their timing; the same policy without a table follows the time.
+        const double table[6] = {19.0, 29.5, 40.0, 50.5, 61.0, 71.5};
+        DraftPolicy a(6), b(6), live1(6), live2(6);
+        a.set_fixed_costs(table, 6);
+        b.set_fixed_costs(table, 6);
+        check(a.fixed() && !live1.fixed(), "fixed: only the policy given a table is fixed");
+        bool same = true;
+        for (int i = 0; i < 400; ++i) {
+            const int t = 2 + i % 5;
+            const bool lk = i % 3 == 0;
+            const int acc = (i * 7) % t;
+            const int match = lk ? 12 + (i % 30) : 0;
+            a.observe(lk, t, acc, match, cost(t));
+            b.observe(lk, t, acc, match, cost(t) * (i % 4 ? 0.3 : 5.0));   // another run's times, far off and jittering
+            live1.observe(lk, t, acc, match, cost(t));
+            live2.observe(lk, t, acc, match, cost(t) * (i % 4 ? 0.3 : 5.0));
+            const DraftPolicy::Pick pa = a.choose(4, 5, 12 + i % 30), pb = b.choose(4, 5, 12 + i % 30);
+            same &= pa.lookup == pb.lookup && pa.t == pb.t;
+            same &= a.chain(4, 0.8, 3, 20) == b.chain(4, 0.8, 3, 20);
+            DraftPolicy::ChainState sa, sb;
+            same &= a.keep_draft(sa, 0, 0.7f, 6) == b.keep_draft(sb, 0, 0.7f, 6) && sa.kept == sb.kept;
+        }
+        check(same, "fixed: different round times, the same windows, chains and kept drafts");
+        check(a.cost_ms(3) == table[2] && b.cost_ms(3) == table[2], "fixed: the table is never replaced by a measurement");
+        check(live1.cost_ms(3) != live2.cost_ms(3), "no table: the measured costs follow the round times");
+        DraftPolicy f(6);                                           // held times (gated proposals) are dropped too
+        f.set_fixed_costs(table, 6);
+        f.defer_cost(5, 4, 999.0);
+        f.apply_costs(100);
+        check(f.cost_ms(4) == table[3], "fixed: defer_cost / apply_costs leave the table alone");
+        DraftPolicy g(6), h(6);                                     // only size 4 seen: the adaptive policy probes size 6, the fixed one does not
+        for (int i = 0; i < 50; ++i) { g.observe(false, 4, 3, 0, cost(4)); h.observe(false, 4, 3, 0, cost(4)); }
+        g.set_fixed_costs(nullptr, 0);                              // fixed where it stands (no table): what was measured stays
+        check(h.choose(4, 5, 40).lookup && h.choose(4, 5, 40).t == 6, "no table: the unmeasured size is probed (as before)");
+        check(!g.choose(4, 5, 40).lookup, "fixed: no first-use probe; the table decides");
+        DraftPolicy m(6);                                           // a table set after measuring replaces the EMA
+        for (int i = 0; i < 30; ++i) m.observe(false, 4, 3, 0, 80.0);
+        m.set_fixed_costs(table, 6);
+        check(m.cost_ms(4) == table[3], "fixed: set after measuring, the table replaces the measured cost");
+    }
+    {
+        // CostLearner: plain trimmed means per size, interpolation, readiness and the disturbance checks.
+        using strata::spec::CostLearner;
+        CostLearner L;
+        for (int i = 0; i < 200; ++i) {
+            L.add(0, 1, 10.0 + (i % 3));                            // 10, 11, 12: mean 11
+            L.add(0, 4, i == 7 ? 400.0 : 20.0);                     // one capture-sized outlier: trimmed away
+            if (i < 40) L.add(0, 6, 30.0);
+        }
+        const std::vector<double> t = L.table(0, 20);
+        check(t.size() == 6, "learner: the table runs to the largest size seen");
+        check(t.size() == 6 && t[0] > 10.9 && t[0] < 11.1 && t[3] == 20.0 && t[5] == 30.0, "learner: trimmed means of the measured sizes");
+        check(t.size() == 6 && t[4] == 25.0, "learner: an unseen size between two measured ones is linear in the size");
+        check(t.size() == 6 && t[1] > 11.0 && t[1] < t[3] && t[2] > t[1] && t[2] < t[3], "learner: sizes between are ordered");
+        check(L.table(1, 20).empty(), "learner: a bucket with no rounds has no table");
+        check(!L.check(1000, 20).ready && L.check(400, 20).ready, "learner: ready only after the given number of rounds");
+        check(!L.check(400, 20).disturbed, "learner: a clean stretch is not disturbed");
+        CostLearner D;                                              // the second half twice as slow: a disturbed stretch
+        for (int i = 0; i < 200; ++i) D.add(0, 4, i < 100 ? 20.0 : 40.0);
+        const CostLearner::Verdict dv = D.check(100, 20);
+        check(dv.disturbed && !dv.why.empty(), "learner: a drift between the halves is a disturbance");
+        CostLearner S;                                              // 10 % of rounds stalled at 5x
+        for (int i = 0; i < 200; ++i) S.add(0, 4, i % 10 == 3 ? 100.0 : 20.0);
+        check(S.check(100, 20).disturbed, "learner: many spikes are a disturbance");
+        CostLearner O;                                              // a wider window measured cheaper than a narrower one
+        for (int i = 0; i < 50; ++i) { O.add(0, 2, 30.0); O.add(0, 4, 20.0); }
+        check(O.check(50, 20).disturbed, "learner: a wider window cheaper than a narrower one is a disturbance");
+        DraftPolicy p(6);                                           // the policy feeds the learner only while learning
+        p.observe(false, 4, 3, 0, 20.0);
+        check(p.learner().rounds() == 0, "learning off: nothing is collected");
+        p.set_learning(true);
+        p.observe(false, 4, 3, 0, 20.0);
+        p.observe_chain(3, 1, 2, 20, 21.0);
+        p.defer_cost(5, 2, 15.0);
+        p.apply_costs(100);
+        check(p.learner().rounds() == 3 && p.learner().samples(0, 4) == 2 && p.learner().samples(0, 2) == 1,
+              "learning on: observe, observe_chain and held times are collected");
+    }
+    {
+        // The table file: a round trip, another key, a cut-short file, a missing file, a folder that does not exist yet.
+        namespace fs = std::filesystem;
+        using strata::spec::CostFile;
+        std::error_code ec;
+        const fs::path dir = fs::temp_directory_path(ec) / ("strata-dpt-" + std::to_string((unsigned long long) (uintptr_t) &ec));
+        const std::string path = (dir / "sub" / "t.costs").string();
+        CostFile c;
+        c.key = "card A|engine 1|model m\nspec 6";
+        c.tables[0] = {15.18, 18.55, 20.69, 23.65};
+        c.tables[2] = {16.0, 19.0};
+        std::string why;
+        check(strata::spec::write_cost_file(path, c, why), "file: written, its folder made");
+        CostFile r;
+        const bool ok = strata::spec::read_cost_file(path, c.key, r, why);
+        check(ok && r.tables[0].size() == 4 && r.tables[0][3] == 23.65 && r.tables[1].empty() && r.tables[2].size() == 2,
+              "file: read back with its key, every bucket as written");
+        check(!strata::spec::read_cost_file(path, "card B|engine 1|model m spec 6", r, why) && !why.empty(), "file: another key is not loaded");
+        check(!strata::spec::read_cost_file((dir / "none.costs").string(), c.key, r, why), "file: a missing file is not loaded");
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 1\nkey x\nbucket 0 15.1,18"; }
+        check(!strata::spec::read_cost_file(path, "x", r, why), "file: a cut-short file (no end line) is not loaded");
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 1\nkey x\nbucket 0 15.1,abc\nend\n"; }
+        check(!strata::spec::read_cost_file(path, "x", r, why), "file: a malformed table is not loaded");
+        check(strata::spec::write_cost_file(path, c, why) && strata::spec::read_cost_file(path, c.key, r, why), "file: a bad file is replaced whole");
+        check(!fs::exists(fs::path(path + ".tmp"), ec), "file: no temporary file is left");
+        check(r.cpu_share < 0.0, "file: no share written, none read");
+        c.cpu_share = 0.45;
+        check(strata::spec::write_cost_file(path, c, why) && strata::spec::read_cost_file(path, c.key, r, why) && r.cpu_share == 0.45,
+              "file: the CPU prompt share is stored and read back with the table");
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 1\nkey x\nbucket 0 15.1,18\nshare 1.7\nend\n"; }
+        check(!strata::spec::read_cost_file(path, "x", r, why), "file: a share outside 0..1 is not loaded");
+        // the decode PCIe share PcieAuto settled on (repeatable output): stored and read back; a file written before it has none, and
+        // still loads (the engine then refines the share as before and writes it)
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 1\nkey x\nbucket 0 15.1,18\nshare 0.900\nend\n"; }
+        check(strata::spec::read_cost_file(path, "x", r, why) && r.cpu_share == 0.9 && r.pcie_frac < 0.0,
+              "file: a file from before the PCIe share loads, with no PCIe share");
+        c.pcie_frac = 0.15;
+        check(strata::spec::write_cost_file(path, c, why) && strata::spec::read_cost_file(path, c.key, r, why) && r.pcie_frac == 0.15 &&
+                  r.cpu_share == 0.45 && r.tables[0].size() == 4,
+              "file: the PCIe share is stored and read back with the table and the prompt share");
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 1\nkey x\nbucket 0 15.1,18\npcie -0.2\nend\n"; }
+        check(!strata::spec::read_cost_file(path, "x", r, why), "file: a PCIe share outside 0..1 is not loaded");
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 1\nkey x\nbucket 0 15.1,18\npcie 0.15x\nend\n"; }
+        check(!strata::spec::read_cost_file(path, "x", r, why), "file: a malformed PCIe share is not loaded");
+        fs::remove_all(dir, ec);
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;

@@ -66,6 +66,11 @@ int main() {
         const auto p = nv_default_env(6, 0, false), q = nv_default_env(6, 0, true);
         CHECK(!p.empty() && p == q);
         CHECK(!find(a, "STRATA_PF_FUSED") && !find(p, "STRATA_PF_FUSED"));
+        // repeatable output: sm_86 keeps ADAPT_LAG=2 but no longer turns ADAPT_NOWAIT on (option 2); sm_60 keeps both
+        CHECK(!find(a, "STRATA_ADAPT_NOWAIT"));
+        CHECK(find(a, "STRATA_ADAPT_LAG") && *find(a, "STRATA_ADAPT_LAG") == "2");
+        CHECK(find(p, "STRATA_ADAPT_NOWAIT") && *find(p, "STRATA_ADAPT_NOWAIT") == "1");
+        CHECK(find(p, "STRATA_ADAPT_LAG") && *find(p, "STRATA_ADAPT_LAG") == "2");
     }
     // round 0212: STRATA_MMQ_KQ=1 is a default for compute capability 8.0+ (owner yes 11-03), with its own off switches
     unset("STRATA_NV_KQ_DEFAULT");

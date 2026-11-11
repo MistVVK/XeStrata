@@ -4028,7 +4028,7 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
             args += ["--vram-segment-mib", str(seg)]
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
-    return learned_profile_args(cfg, args)
+    return draft_costs_args(cfg, learned_profile_args(cfg, args), exe or cfg.get("exe"))
 
 
 PARALLEL_MAX = 8      # without a layer split the engine's batch window holds at most 8 rows (kVerifyNarrowT); --batch-mtp waves more through it
@@ -4154,6 +4154,64 @@ def learned_profile_args(cfg: dict, args: list[str]) -> list[str]:
         if learned is not None and learned == base:
             args[i] = save
     return args
+
+
+DRAFT_COSTS_DEFAULT = True    # repeatable output: on by default (owner decision); "draft_costs": false in a config turns it off
+_engine_texts: dict = {}
+
+
+def engine_has_text(exe: str, needle: bytes) -> bool | None:
+    """Does the engine program contain `needle` (an option it knows)?  None when it cannot be read.  Read once per path, size and time."""
+    import mmap
+    try:
+        st = os.stat(exe)
+    except (OSError, ValueError):
+        return None
+    key = (str(exe), st.st_size, st.st_mtime_ns, needle)
+    if key not in _engine_texts:
+        try:
+            with open(exe, "rb") as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as data:
+                _engine_texts[key] = data.find(needle) >= 0
+        except (OSError, ValueError):
+            _engine_texts[key] = None
+    return _engine_texts[key]
+
+
+def draft_costs_dir() -> Path:
+    """Where the learned draft cost tables live: beside the saved tunings (strata_control/presets.py), in the user's Strata settings folder
+    (%APPDATA%\\Strata\\draft-costs, ~/.config/strata/draft-costs), which the Windows uninstaller's "remove my data" deletes with them.
+    STRATA_DRAFT_COSTS_DIR: another folder (tests and test jobs, which never write into a real settings folder)."""
+    explicit = os.environ.get("STRATA_DRAFT_COSTS_DIR")
+    if explicit:
+        return Path(explicit).expanduser()
+    from strata_control import profiles
+    return profiles.profile_dir().parent / "draft-costs"
+
+
+def draft_costs_args(cfg: dict, args: list[str], exe: str | None = None) -> list[str]:
+    """Repeatable output: the engine (0.1.60+ with --draft-costs) fixes its draft window costs to a table it learned once on this computer, so
+    the same request gives the same answer on every start; until the table exists it learns it in the background with today's policy.
+    "draft_costs": true / false in the config overrides DRAFT_COSTS_DEFAULT.  The file name follows the model and every engine argument, so
+    another model or setting gets its own table; the engine itself checks the card, the driver and its own version inside the file and
+    learns again when they changed.  An engine that does not know the flag is not given it."""
+    explicit = "draft_costs" in cfg
+    want = cfg.get("draft_costs", DRAFT_COSTS_DEFAULT)
+    if want is not True or "--draft-costs" in args:
+        return args
+    knows = engine_has_text(exe, b"--draft-costs") if exe else None
+    # by default only an engine that is seen to have the option gets it; a config that asks for it by name gets it unless the engine is seen without it
+    if knows is False or (not explicit and knows is not True):
+        return args
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(cfg.get("model_name") or "model"))[:64]
+    digest = hashlib.sha256("\0".join(map(str, args)).encode("utf-8", "replace")).hexdigest()[:12]
+    out = args + ["--draft-costs", str(draft_costs_dir() / f"{name}-{digest}.costs")]
+    try:
+        size = os.path.getsize(exe) if exe else None
+    except OSError:
+        size = None
+    if size:
+        out += ["--draft-costs-key", f"engine file {size} bytes"]
+    return out
 
 
 def hip_visible(cfg: dict) -> list[int]:

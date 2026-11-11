@@ -40,6 +40,8 @@ struct PrefillStats {
     int64_t experts_direct = 0;     ///< ...of which MMQ read in their cache slots, not gathered (STRATA_MMQ_DIRECT=1)
     int64_t experts_cpu = 0;        ///< ...computed on the CPU pool instead of streamed (STRATA_PREFILL_CPU_SHARE)
     double cpu_share = 0;           ///< ...the share of the streamed ones it took last (measured by default)
+    double cpu_share_balanced = 0;  ///< the balanced share as last measured (the default share's EMA of CPU / GPU ms per expert)
+    int64_t cpu_share_readings = 0; ///< how many measurements that balance has taken since the start
     double ms_ple = 0;
 };
 
@@ -295,6 +297,11 @@ public:
     /// STRATA_PREFILL_CPU_SHARE_BATCH=1 (batch slots beside the pool): set before each read - true while a slot decodes
     /// (its windows use the pool), so no chunk of that read takes the share; false lets the read's chunks take it.
     static void set_share_blocked(bool blocked);
+    /// --draft-costs (repeatable output): the default-armed share at a fixed value learned once on this machine (< 0: measured
+    /// again, as before).  STRATA_PREFILL_CPU_SHARE, when set, still wins.  The balance's EMA and the per-layer gate are then skipped.
+    static void fix_cpu_share(double share);
+    /// Is the share on and still balancing from measured times (armed by default, no variable, no fixed value)?
+    static bool cpu_share_balancing();
 
     /// Layer-major prefill (STRATA_PREFILL_LAYER_MAJOR=1): true while `on_chunk` reports a sub-chunk before the end of
     /// its super-chunk.  The session state is already at the super-chunk's end then, so no checkpoint may be taken.
