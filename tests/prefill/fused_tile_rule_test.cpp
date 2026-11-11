@@ -99,6 +99,37 @@ int main() {
         CHECK(pick(a4000s, 81910, E, false).ww == 4 && pick(a4000s, 81910, E, true).ww == 2);
         CHECK(pick(a4000s, 40960, E, false).ww == 2 && pick(a4000s, 20000, E, false).ww == 4 && pick(a4000s, 20000, E, true).ww == 2);   // band: 80 rows 128, 39 rows 64
     }
+    // ---- the default rule (native_supported) with the research switch STRATA_PF_FUSED_SM40: takes_by_default(card, sm40, gate_staged, down_ok)
+    {
+        using strata::prefill::fused_tile::takes_by_default;
+        const Card a4000s{false, false, 48, true}, s86at39{false, false, 39, true}, s86at40{false, false, 40, true}, s86at79{false, false, 79, true}, s86at80{false, false, 80, true},
+            s120at48{true, false, 48, false}, s120at39{true, false, 39, false}, s89{false, false, 60, false}, gb10c{true, true, 48, false};
+        // a staged-gate pair (IQ3_S / IQ4_NL, IQ3_XXS / Q2_0, ...) on 48 SMs: on with the switch, today's behaviour (off) without it
+        CHECK(takes_by_default(a4000s, true, true, true) && !takes_by_default(a4000s, false, true, true));
+        CHECK(takes_by_default(s120at48, true, true, true) && !takes_by_default(s120at48, false, true, true));
+        // IQ2_S / Q2_0 (gate/up not staged) and a down outside IQ4_NL / Q2_0: off, switch or not
+        CHECK(!takes_by_default(a4000s, true, false, true) && !takes_by_default(a4000s, true, true, false) && !takes_by_default(a4000s, true, false, false));
+        // the bound: 39 SMs off, 40 and 79 on, 80 on without the switch
+        CHECK(!takes_by_default(s86at39, true, true, true) && !takes_by_default(s120at39, true, true, true));
+        CHECK(takes_by_default(s86at40, true, true, true) && takes_by_default(s86at79, true, true, true));
+        CHECK(!takes_by_default(s86at79, false, true, true) && takes_by_default(s86at80, false, false, false));
+        // other cards: sm_89 / sm_80 (neither flag) and an unknown SM count stay off with the switch; the s121 flag is not looked at by this rule (GB10 has its own tile rule only)
+        CHECK(takes_by_default(gb10c, true, true, true) == takes_by_default(s120at48, true, true, true));
+        // switch unset: exactly today's rule (sm_86 / sm_120 with 80+ SMs) for every card flag set, SM count and launch kind
+        long long cmpd = 0, bad = 0;
+        for (int s120 = 0; s120 < 2; ++s120)
+            for (int s86 = 0; s86 < 2; ++s86)
+                for (int sms = 0; sms <= 200; ++sms)
+                    for (int g = 0; g < 2; ++g)
+                        for (int d = 0; d < 2; ++d) {
+                            ++cmpd;
+                            const Card c{s120 != 0, false, sms, s86 != 0};
+                            if (takes_by_default(c, false, g != 0, d != 0) != ((s120 || s86) && sms >= 80)) ++bad;
+                            if (sms >= 80 && takes_by_default(c, true, g != 0, d != 0) != takes_by_default(c, false, g != 0, d != 0)) ++bad;   // the switch moves nothing at 80+ SMs
+                        }
+        CHECK(bad == 0);
+        std::printf("fused_tile_rule_test: default rule with the switch unset: %lld card / launch combinations compared with 'sm_86 / sm_120, 80+ SMs' (%lld differing)\n", cmpd, bad);
+    }
     // every class, every launch size: staged = false gives the rule of commit 083b1ac82 exactly as before the argument existed, for the sm_86 cards too (the new flag does not move them)
     {
         long long cmp = 0, diff = 0;

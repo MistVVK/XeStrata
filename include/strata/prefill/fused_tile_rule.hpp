@@ -65,4 +65,16 @@ constexpr Pick pick(const Card& c, int64_t n, int n_expert, bool staged = false)
     return {avg > 56.0 && avg <= 112.0 ? 2 : 4, Why::kBand};
 }
 
+// Whether native_supported's default rule (STRATA_PF_FUSED unset; the IQ3_S pack's gate/up IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS with an IQ4_NL / Q2_0 down) takes a launch on this card, as a pure function so the
+// rule can be tested without a GPU.  Today: sm_86 / sm_120 cards with 80+ SMs.  sm40 (STRATA_PF_FUSED_SM40=1, a research switch, OFF unless set) adds the sm_86 / sm_120 cards with 40-79 SMs for the
+// launches whose gate/up kernel is a weight-staging instance (gate_staged: IQ3_XXS / IQ3_S / IQ4_XS, sw_on in src/prefill/moe_fused_iq.cu) with an IQ4_NL or Q2_0 down (down_ok).  Evidence: RTX A4000
+// (sm_86, 48 SMs) one layer, real routing, staged 128-row tile against MMQ at 2,048 / 8,192 / 20,000 / 32,768 tokens: IQ3_S / IQ4_NL 1.594 / 1.337 / 1.190 / 1.070, IQ3_XXS / IQ4_NL 1.645 / 1.373 / 1.223 /
+// 1.097, IQ4_XS / IQ4_NL 1.621 / 1.326 / 1.176 / 1.055, IQ3_S / Q2_0 1.563 / 1.338 / 1.195 / 1.078 (RESULTS-P4-SM.md S1); the same kernels give the same output bits on every card.  IQ2_S / Q2_0 is 0.95-0.97
+// of MMQ at 32K and stays out.  No end-to-end row exists below 80 SMs, and nothing below 48 SMs is measured (the bound is 40).
+constexpr bool takes_by_default(const Card& c, bool sm40, bool gate_staged, bool down_ok) {
+    if (!(c.s86 || c.s120)) return false;
+    if (c.sms >= 80) return true;
+    return sm40 && gate_staged && down_ok && c.sms >= 40;
+}
+
 }  // namespace strata::prefill::fused_tile

@@ -2609,7 +2609,11 @@ bool native_supported(int gu_type, int d_type) {
         // 12.0 and 8.6 cards with 80+ SMs only (RTX PRO 5000 / 6000, RTX 5080 / 5090; RTX A6000 / A40, RTX 3090 / 3090 Ti / 3080 Ti):
         // on an RTX 5070 (48 SMs, IQ2_XS pack, experts partly in RAM) the fused kernels were 4.7% slower on 20K prompts (0/6 pairs),
         // and the RTX A4000 (sm_86, 48 SMs) has no real-model data - they keep MMQ unless STRATA_PF_FUSED=1
-        return d.ok && (d.s120 || d.s86) && d.sms >= 80 && !d.t75 && d_covered_on(d_type, d);
+        // STRATA_PF_FUSED_SM40=1 (research, off unless set): the sm_86 / sm_120 cards with 40-79 SMs also take the launches with a staged gate/up kernel (IQ3_XXS / IQ3_S / IQ4_XS) and an IQ4_NL / Q2_0
+        // down; the rule itself is fused_tile::takes_by_default (unit-tested)
+        static const bool sm40 = [] { const char* v = std::getenv("STRATA_PF_FUSED_SM40"); return v != nullptr && v[0] == '1'; }();
+        return d.ok && strata::prefill::fused_tile::takes_by_default({d.s120, d.s121, d.sms, d.s86}, sm40, sw_on(gu_type, true), d_type == T_IQ4_NL || d_type == T_Q2_0) && !d.t75 &&
+               d_covered_on(d_type, d);
     }
     if (gu_type == T_Q2_0 && d_type != T_Q2_0) return false;   // the opt-in (STRATA_PF_FUSED=1 as well) takes the Q2_0 / Q2_0 pair only
 #endif
