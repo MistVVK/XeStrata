@@ -840,10 +840,10 @@ int main(int argc, char** argv) {
         const char* only_tq = nullptr;
         for (int i = 1; i < argc; ++i)
             if (std::strncmp(argv[i], "--only=", 7) == 0) only_tq = argv[i] + 7;
-        if (only_tq != nullptr && std::strstr("TQK6 + TQK7 TQ2_T + TQ2_T", only_tq) != nullptr) {
+        if (only_tq != nullptr && std::strstr("TQK6 + TQK7 TQ2_T + TQ2_T Q6_K + Q8_0", only_tq) != nullptr) {   // (and the Q6_K pair: STRATA_PF_FUSED_Q6K=1 is gfx12's too)
             cudaDeviceProp prop{};
             if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx12", 5) != 0) {
-                std::printf("the trellis pairs: gfx12 only on HIP (%s: skipped)\n", prop.gcnArchName);
+                std::printf("the trellis / Q6_K pairs: gfx12 only on HIP (%s: skipped)\n", prop.gcnArchName);
                 return 77;
             }
         }

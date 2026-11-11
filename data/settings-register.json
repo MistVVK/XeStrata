@@ -25753,13 +25753,20 @@
   {
    "name": "STRATA_PF_FUSED_Q6K",
    "backends": [
-    "cuda"
+    "cuda",
+    "hip"
    ],
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 1969,
+     "line": 2056,
      "backend": "cuda",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 2399,
+     "backend": "hip",
      "fn": "getenv"
     }
    ],
@@ -25779,7 +25786,7 @@
    "last_date": "",
    "status": "research",
    "owner": "prefill",
-   "note": "CUDA (phase 4, opt-in, default off): a Q6_K gate/up with a Q8_0 down (UD-Q6_K_XL's 47 layers, UD-Q5_K_XL's one Q6_K layer) on the fused native kernels on any sm_80+ card instead of MMQ.",
+   "note": "[DRAFT] CUDA and HIP gfx12 (phase 4, opt-in, default off): a Q6_K gate/up with a Q8_0 down (UD-Q6_K_XL's 47 layers, UD-Q5_K_XL's one Q6_K layer) on the fused native kernels instead of MMQ, on any sm_80+ card and on gfx1200 / gfx1201.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -25838,7 +25845,7 @@
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2390,
+     "line": 2392,
      "backend": "hip",
      "fn": "getenv"
     }
