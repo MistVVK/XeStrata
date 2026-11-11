@@ -110,6 +110,7 @@
 #include "strata/program/prefill_plan.hpp"
 #include "strata/program/draft_kv_plan.hpp"
 #include "strata/program/message_boundary.hpp"
+#include "strata/program/reply_branch.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_vocab.hpp"
 #include "strata/spec/window_rule.hpp"
@@ -16417,6 +16418,25 @@ int main(int argc, char** argv) {
                 resume == req_pin && live_ok)
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
+            // The live branch past this request's resume point is only the reply this prompt replaces: the request resumes from
+            // the live branch's own turn checkpoint and opens the same assistant turn there again (an OpenAI-style client's
+            // next turn sends the reply back without its reasoning; an edited reply; a regenerate).  That branch is not parked:
+            // no request of the client sends the reply back as it was, and its park is a copy of the whole conversation on
+            // this request's path that the next park drops as superseded (reply_branch.hpp).  A real switch (another
+            // conversation, a parked one coming back, a batch slot, a borrow, another cvec) parks as before.
+            bool reply_replaced = false;
+            if (!from_live && !incoming && !borrow && slot_source < 0 && lent_slot < 0 && live_ok && !pin_sibling &&
+                want_cvec == cvec_cached && resume > 0 && imgs_below(live_imgs, resume) == live_imgs)
+                for (const ConvCheckpoint& c : checks)
+                    if ((int64_t) c.ids.size() == resume && starts_with(c.ids, c.imgs) &&
+                        strata::program::live_tail_is_replaced_reply(live, ids, resume, o.turn_token)) {
+                        reply_replaced = true;
+                        break;
+                    }
+            if (reply_replaced)
+                std::fprintf(stderr, "strata serve: conversation cache: the reply this request replaces is not parked (%lld "
+                                     "tokens past the turn checkpoint at %lld)\n", (long long) ((int64_t) live.size() - resume),
+                             (long long) resume);
             // --conversation-cache-park-gain N: a park now would supersede the entry parked_prefix_tokens() reports (the copy
             // this conversation wrote last), so a conversation that advanced fewer than N tokens since then keeps it:
             // it still holds this conversation's prefix, and re-parking writes the whole snapshot only for the next
@@ -16461,7 +16481,7 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                 }
-            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth &&
+            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && !reply_replaced && park_worth &&
                        !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
