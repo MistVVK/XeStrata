@@ -28,7 +28,7 @@ int swiglu(void* stream, const float* gu, float* out, int T, int F);
 int attn_exact(void* stream, const float* q, int q_tstride, const void* k, const void* v, int kv_tstride, float* out,
                int H, int Lq, int Lk, int causal);
 
-// 1 when this device runs attn_fast (NVIDIA sm_80+: mma.sync; HIP gfx11: WMMA; gfx12 with STRATA_QI_GFX12_ATTN=1)
+// 1 when this device runs attn_fast (NVIDIA sm_80+: mma.sync; HIP gfx11: WMMA; gfx12 unless STRATA_QI_GFX12_ATTN=0)
 int has_fast_attn(int device);
 
 // flash attention for the image tokens: q f16 head-major, k / v f16 head-major, out f32 token-major
