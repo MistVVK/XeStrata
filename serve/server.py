@@ -9818,13 +9818,19 @@ READER_NEEDS_MIB = reader_room.READER_NEEDS_MIB     # what the GPU picture reade
 #: picture and stopped after vision.elastic_idle_s, inside a reserve of VISION_RESERVE_MIB; a start that finds no room is read by the CPU reader.
 #: Measured on an RTX A6000 as a 24 GB card (Qwen3.8-Flash-Next IQ3_S, 5 interleaved pairs): the same 20,623 expert slots and the same text speed as
 #: the reader on the card, 1.3 GB less VRAM in use between pictures.  The expert cache that gives its room (vram_elastic) held 8.5% more slots
-#: and was 2.2% slower in text (4 pairs of 5), so it stays opt-in.
+#: and was 2.2% slower in text (4 pairs of 5) in that first measurement; 11-11 it is the default (VISION_NO_RESERVE_BY_DEFAULT): on an RTX
+#: PRO 5000 held to a 32 GB card (IQ3_S streamed, 5 rotated rounds) its text was level with the processor reader (2K / 8K / 20K 0.998 /
+#: 0.997 / 0.998) and 2.9% faster than the room held back at 2K (12,719 against 12,022 slots), level when the model fits.
 VISION_ON_DEMAND_BY_DEFAULT = True
 #: AMD (HIP): the rule works there (the HIP reader starts on the first picture, +5.4 s on an R9700, and stops when idle) but is OFF by default: with no shrinking
 #: expert cache on HIP the room has to stay in the reserve, so the engine gets no more slots (R9700, Qwen UD-Q4_K_XL: 7,959 against 7,943 with the reader on the card).
 #: "elastic": true in the vision section asks for it.  Set True if the expert cache can give its room on HIP.
 VISION_ON_DEMAND_AMD_BY_DEFAULT = False
 VISION_RESERVE_MIB = 2048
+#: Owner 11-11: on NVIDIA the on-demand reader holds no room back before the first picture (apply_vision_defaults); the shrinking expert cache
+#: makes it.  In the resident RAM mode, where the cache cannot resize, the engine keeps the reader's room in its reserve itself
+#: (include/strata/core/reader_room.hpp).
+VISION_NO_RESERVE_BY_DEFAULT = True
 _ON_DEMAND_NOT_WITH = ("--kv-grow", "--batch", "--slots", "--peer-device", "--expert-cache-device1", "--expert-cache-device2",
                        "--expert-cache-device3")
 
@@ -9851,12 +9857,20 @@ def vision_on_demand_by_default(cfg: dict) -> bool:
 
 
 def apply_vision_defaults(cfg: dict) -> dict:
-    """cfg with the on-demand reader switched on (vision.elastic) where vision_on_demand_by_default says so; the same dict.  Its VRAM comes
-    from the reserve, so the reserve setup writes for a GPU reader that stays on the card (700 MiB, or none) becomes VISION_RESERVE_MIB;
-    a reserve the person or the app chose (any other number) is kept."""
+    """cfg with the on-demand reader switched on (vision.elastic) where vision_on_demand_by_default says so; the same dict.
+    NVIDIA (owner 11-11, "picture reader loaded on demand with no memory reserve": Ok): no room is held back for the reader before the first
+    picture.  The expert cache is started in segments ("vram_elastic": the engine's --vram-elastic) and makes the reader's room when a picture
+    arrives, then takes it back after vision.elastic_idle_s; the reserve setup wrote (700 MiB, or none) stays as it is.  Measured on an RTX A6000
+    (UD-Q4_K_XL partly streamed): 13,526 expert slots before any picture, as with the processor reader, against 13,077 with the room held back.
+    A config that says "vram_elastic" itself, and AMD (no shrinking expert cache on HIP), keep the room in the reserve as before: the reserve
+    setup writes for a GPU reader that stays on the card (700 MiB, or none) becomes VISION_RESERVE_MIB; a reserve the person or the app chose
+    (any other number) is kept."""
     if not vision_on_demand_by_default(cfg):
         return cfg
     cfg["vision"] = {**cfg["vision"], "elastic": True}
+    if VISION_NO_RESERVE_BY_DEFAULT and cfg.get("backend") != "hip" and "vram_elastic" not in cfg:
+        cfg["vram_elastic"] = True                     # the cache gives the reader its room when a picture comes; nothing is held back before
+        return cfg
     args = list(cfg.get("args") or [])
     if "--vram-reserve-mib" not in args[:-1]:
         args += ["--vram-reserve-mib", str(VISION_RESERVE_MIB)]
