@@ -26,8 +26,15 @@ namespace strata::prefill::fused {
 constexpr int kTileRows = 64;
 /// The compiled geometry's widths the expert kernels are written for: the hidden width (the K of gate/up, the rows of
 /// down), the expert width (the K of down, half the rows of gate/up) and the gate/up rows.  Flash-Next: 2560, 640, 1280.
+#if defined(STRATA_FUSED_GEO_N_EMBD) && defined(STRATA_FUSED_GEO_N_FF)
+// a second copy of the kernels for another model family's shape in the same binary (src/prefill/moe_fused_iq_q36.cu
+// compiles moe_fused_iq.cu again for Qwen3.6, 2048 / 512, in its own namespace); every other file takes the compiled geometry
+constexpr int kMoeEmbd = STRATA_FUSED_GEO_N_EMBD;
+constexpr int kMoeFF = STRATA_FUSED_GEO_N_FF;
+#else
 constexpr int kMoeEmbd = (int) strata::core::kCompiledGeometry.n_embd;
 constexpr int kMoeFF = (int) strata::core::kCompiledGeometry.n_ff;
+#endif
 constexpr int kMoeGuRows = 2 * kMoeFF;
 /// Experts per launch: their blob pointers travel in the launch's parameters (1 KB).
 constexpr int kMaxBatch = 128;
