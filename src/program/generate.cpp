@@ -14179,7 +14179,7 @@ int main(int argc, char** argv) {
         // a layer split's hand-off buffers hold kVerifyNarrowT rows: its windows stay at that
         if (n_stages > 1) policy.set_sizes(policy.sizes() & ((2u << strata::kernels::kVerifyNarrowT) - 1u));
         // --draft-costs: this machine's fixed window costs, or learn them in this run (draft_costs_key(), CostLearner)
-        constexpr int64_t kDraftCostRounds = 1500;   // a learning stretch: about 4,000 generated tokens
+        constexpr int64_t kDraftCostRounds = 1000;   // a learning stretch: about 3,000 generated tokens (DFlash2: 24 requests of 256 tokens = 1,215 rounds)
         constexpr int kDraftCostMinN = 20;           // a window size needs this many rounds to be measured (fewer: filled in)
         std::string dc_key;
         bool dc_learning = false;
