@@ -153,6 +153,43 @@ def vision_section(reader: Reader, base: dict) -> dict:
     return out
 
 
+def shared_memory_nvidia_host() -> bool:
+    """Linux on Arm: the DGX Spark class (GB10: the GPU shares the system RAM, 121 GB), where the NVIDIA picture reader stays loaded instead of starting with the first
+    picture (owner 2026-11-11).  Measured on a Spark (IQ3_S, two starts per arm): the first picture after a start takes 0.84-0.89 s resident against 3.0-7.1 s on demand
+    (the reader's start, and its context retry when the kernel has no free 2 MiB blocks), and again 2.2 s after every idle stop; the resident reader costs about 5 s of start
+    time and about 1 GiB of the shared RAM, and no expert slot (every expert is resident there).  The same switch as the AMD reader and the Mac's: the reader starts with the
+    server, before the engine; an explicit "elastic" key in the vision section wins either way."""
+    import platform
+    import sys
+    return sys.platform.startswith("linux") and platform.machine().lower() in ("aarch64", "arm64")
+
+
+#: A GPU reader's start that failed while it made its CUDA context on a Linux Arm machine with shared CPU / GPU memory (DGX Spark, GB10) is tried again.  Such a context needs
+#: physically contiguous memory (2 MiB blocks); when the kernel has almost none free, ggml's cudaSetDevice answers "CUDA error: out of memory ... in function
+#: ggml_cuda_init" and the reader aborts, although 20+ GiB are free.  The same start 1 to 5 s later works (the kernel compacts memory after the failed try; measured
+#: on a Spark: three to five failed spawns in a row, then success: first failure to first success 9.6 to 14.6 s; one failed spawn takes 1.4 s, the pause is 1 s).  Without the
+#: retry the picture reader falls back to the CPU for good (90 s for a large picture, 9.7 s against 2.0 s at 1,024 tokens on the card).
+#: Bounded by time and by count: a new spawn may start only while less than CONTEXT_RETRY_BUDGET_S seconds have passed since the first spawn started (about 8 spawns at
+#: 2.4 s a cycle; the five measured failures end at 12 s), and at most CONTEXT_RETRIES retries (fast attempts).  The worst wait before the CPU reader takes over is the
+#: budget plus the last failed spawn, about 19.5 to 20 s.
+CONTEXT_RETRIES = 12
+CONTEXT_RETRY_WAIT_S = 1.0
+CONTEXT_RETRY_BUDGET_S = 18.0
+
+
+def retry_gpu_start(*, linux: bool, arm: bool, hip: bool, text: str, retries_done: int, next_start_s: float = 0.0) -> bool:
+    """Should a failed GPU reader start be tried again?  Only for the context failure ("out of memory" in ggml_cuda_init / cudaSetDevice), only for the NVIDIA reader on
+    Linux on Arm, at most CONTEXT_RETRIES times, and only if the next spawn would start less than CONTEXT_RETRY_BUDGET_S seconds after the first one (`next_start_s`: that
+    time, the pause included).  A card another program filled says "cudaMalloc failed: out of memory" (a retry cannot help: reader_room reports it), every
+    other error (no device, no kernel image, busy) is not this case.  `text`: what the failed start said (its message and the tail of the reader's log)."""
+    if not linux or not arm or hip or retries_done >= CONTEXT_RETRIES or next_start_s >= CONTEXT_RETRY_BUDGET_S:
+        return False
+    t = text.lower()
+    if "out of memory" not in t or "cudamalloc failed" in t or "failed to allocate" in t:
+        return False
+    return "ggml_cuda_init" in t or "cudasetdevice" in t or "cannot use gpu" in t
+
+
 def cpu_fallback(vision_cfg: dict, same_program: bool = False) -> dict | None:
     """The same section for the CPU reader, when the GPU reader has one to fall back on; None otherwise.  AMD and Intel name it (`cpu_exe`);
     the NVIDIA reader (`strata-vision`) is the CPU reader too, without --gpu - `same_program` takes that one (the on-demand reader's
