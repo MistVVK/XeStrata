@@ -2,8 +2,7 @@
 is not counted), against the graphics memory plus the RAM.  They fit: "fits".  They do not: "may run slower".
 
     size  = the download size minus the lookup table's file (`files_gb`): the owner's literal rule, the "Needs (RAM + VRAM)" column of the Terminal list
-            (DeepSeek: the download minus its Engram file, from the plan)
-    room  = RAM + the card's memory (the largest card that counts; a chip that shares the RAM only its own carve-out; DeepSeek: every card)
+    room  = RAM + the card's memory (the largest card that counts; a chip that shares the RAM only its own carve-out)
 
 No reserve is taken off either side.  Nothing here refuses anything; a model that "may run slower" can still be started, and a computer with no card or a Mac with
 little memory gets the same two words.

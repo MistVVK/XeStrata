@@ -10,7 +10,6 @@ from serve.server import ByteTokenizer, MockEngine, Service, serve
 
 
 TEMPLATE = ChatTemplate(Path(__file__).with_name("chat_template.jinja"))
-DEEPSEEK = ChatTemplate(Path(__file__).with_name("fixtures") / "deepseek41" / "chat_template.jinja")
 
 
 def history():
@@ -46,7 +45,7 @@ class AnthropicToolResults(unittest.TestCase):
         before = copy.deepcopy(raw)
         self.assertEqual(results(raw), ["RESULT_FROM_SLOW", "RESULT_FROM_FAST"])
         self.assertEqual(raw, before)
-        for template in (TEMPLATE, DEEPSEEK):
+        for template in (TEMPLATE,):
             with self.subTest(template=str(template)):
                 prompt = template.render(normalized(raw), enable_thinking=False)
                 self.assertEqual(prompt, template.render(normalized(in_call_order()), enable_thinking=False))

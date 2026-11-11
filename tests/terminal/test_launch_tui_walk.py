@@ -1,4 +1,4 @@
-"""Release 0.2.4 TUI stability walk: every screen of `strata launch`, every key, for a Qwen and a DeepSeek-V4.1 pick, at 80x24 and a wide
+"""Release 0.2.4 TUI stability walk: every screen of `strata launch`, every key, for a Qwen pick, at 80x24 and a wide
 terminal, on several computers, with back/escape on each screen and a seeded random-key fuzz. Nothing may raise, hang or leave a blank
 screen; the app must still be alive after every key. The same file runs on Windows and Linux."""
 
@@ -22,7 +22,7 @@ HW_NOGPU = {"ram_gb": 16.0, "os": "Test OS", "cpu": {"avx2": True, "name": "test
 HW_AMD = {**HW_12, "gpus": [{"index": 0, "name": "AMD Radeon RX 9070 XT", "vram_gb": 16.0, "usable": True, "vendor": "amd"}]}
 
 SIZES = {"narrow": (80, 24), "wide": (200, 60)}
-PICKS = {"qwen": ("qwen", "IQ3_XXS"), "ds200": ("deepseek41", "IST-DAS-2.00bpw"), "ds225": ("deepseek41", "IST-DAS-2.25bpw")}
+PICKS = {"qwen": ("qwen", "IQ3_XXS")}
 # every key a person can press on any screen except q / ctrl+c (they leave on purpose and are tested on their own)
 KEYS = ["enter", "escape", "up", "down", "left", "right", "pageup", "pagedown", "home", "end", "tab", "delete", "backspace",
         "question_mark", "f1", "slash", "space", "plus", "minus", "1", "2", "3", "a", "c", "d", "e", "h", "k", "m", "n", "o", "p", "r", "t", "x"]
@@ -151,12 +151,6 @@ class Walk(unittest.TestCase):
     def test_every_key_on_every_screen_qwen(self):
         self._sweep_pick("qwen", HW_12)
 
-    def test_every_key_on_every_screen_deepseek_200(self):
-        self._sweep_pick("ds200", HW_12)
-
-    def test_every_key_on_every_screen_deepseek_225_two_cards(self):
-        self._sweep_pick("ds225", HW_2X16)
-
     # ---- 3. Seeded random keys, including the run screen
     def test_random_keys_do_not_crash(self):
         for seed in range(3):
@@ -181,9 +175,9 @@ class Walk(unittest.TestCase):
                         return True
                     self.drive(case, hw=HW_2X16 if seed % 3 == 0 else HW_12, size=size)
 
-    # ---- the Save screen says the same tuning length as the Tuning screen (DeepSeek's tune is minutes, not 20 / 2 hours)
+    # ---- the Save screen says the same tuning length as the Tuning screen
     def test_save_screen_tuning_time_matches_the_model(self):
-        for pick, want, never in (("qwen", "quick (about 20 min)", "5-10"), ("ds200", "quick (about 5-10 min)", "about 20 min")):
+        for pick, want, never in (("qwen", "quick (about 20 min)", "5-10"),):
             with self.subTest(pick=pick):
                 async def case(app, pilot, ctx):
                     await self.to_model(app, pilot, pick)
@@ -207,7 +201,7 @@ class Walk(unittest.TestCase):
                 with self.subTest(key=key, step=step):
                     async def case(app, pilot, ctx):
                         if step != "start":
-                            await self.to_model(app, pilot, "ds200")
+                            await self.to_model(app, pilot, "qwen")
                             if step in app.flow():
                                 app.goto(step)
                                 await settle(pilot, 3)
@@ -220,7 +214,7 @@ class Walk(unittest.TestCase):
     # ---- 5. Resize while on each screen
     def test_resize_on_every_screen(self):
         async def case(app, pilot, ctx):
-            await self.to_model(app, pilot, "ds225")
+            await self.to_model(app, pilot, "qwen")
             for step in app.flow():
                 app.goto(step)
                 await settle(pilot, 3)
@@ -231,9 +225,9 @@ class Walk(unittest.TestCase):
                     self.assertTrue(text_of(app).strip(), f"blank at {size} on {step}")
         self.drive(case, hw=HW_2X16)
 
-    # ---- 6. The run: success, failure and retry, stop and cancel, for Qwen and DeepSeek
+    # ---- 6. The run: success, failure and retry, stop and cancel
     def test_run_paths(self):
-        for pick in ("qwen", "ds200"):
+        for pick in ("qwen",):
             for behaviour in ("ok", "fail", "wait"):
                 with self.subTest(pick=pick, behaviour=behaviour):
                     FakeRunner.behaviour = behaviour
@@ -283,7 +277,7 @@ class ErrorPaths(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-    def run_flow(self, runner, hw=HW_12, pick="ds200", settle_s=1.0):
+    def run_flow(self, runner, hw=HW_12, pick="qwen", settle_s=1.0):
         ctx = make_ctx(hw)
         app = LaunchApp(ctx)
 

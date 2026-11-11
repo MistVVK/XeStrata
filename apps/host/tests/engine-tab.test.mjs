@@ -37,14 +37,14 @@ test('switch: asks Control for the chosen engine only, and answers at once with 
   const ok = await changeEngine(control, 'use', { family: 'qwen', folder: 'b' }, { modelsRunning: () => false });
   assert.equal(ok.status, 200);
   assert.deepEqual(calls, [['use', { family: 'qwen', folder: 'b' }]]);
-  const deleted = await changeEngine(control, 'remove', { family: 'deepseek', folder: 'c' }, { modelsRunning: () => true });
+  const deleted = await changeEngine(control, 'remove', { family: 'qwen', folder: 'c' }, { modelsRunning: () => true });
   assert.equal(deleted.status, 200, 'deleting an engine nothing uses is not stopped by a loaded model; Control refuses the one in use');
-  assert.deepEqual(calls.at(-1), ['remove', { family: 'deepseek', folder: 'c' }]);
+  assert.deepEqual(calls.at(-1), ['remove', { family: 'qwen', folder: 'c' }]);
 });
 
 test('only a family and a plain folder name from the list are accepted: a path, a hidden folder or another family is refused before Control is asked', async () => {
   const control = { useEngine: async () => assert.fail('must not be called'), removeEngine: async () => assert.fail('must not be called') };
-  for (const body of [{ family: 'x', folder: 'a' }, { family: 'qwen', folder: '../a' }, { family: 'qwen', folder: 'a/b' }, { family: 'qwen', folder: 'a\\b' }, { family: 'qwen', folder: '.rejected' }, { family: 'qwen', folder: '--force' }, { family: 'qwen', folder: '-x' }, { family: 'qwen', folder: 'a b' }, { family: 'qwen' }, {}]) {
+  for (const body of [{ family: 'x', folder: 'a' }, { family: 'deepseek', folder: 'a' }, { family: 'qwen', folder: '../a' }, { family: 'qwen', folder: 'a/b' }, { family: 'qwen', folder: 'a\\b' }, { family: 'qwen', folder: '.rejected' }, { family: 'qwen', folder: '--force' }, { family: 'qwen', folder: '-x' }, { family: 'qwen', folder: 'a b' }, { family: 'qwen' }, {}]) {
     for (const action of ['use', 'remove']) assert.equal((await changeEngine(control, action, body)).status, 400, JSON.stringify(body));
   }
   assert.equal((await changeEngine({}, 'use', { family: 'qwen', folder: 'a' })).status, 501);
@@ -82,11 +82,11 @@ test('createControl asks the same commands the Terminal runs, and none of them a
   const control = createControl({ control: { dir: '/c', python: '/p', cli: '/c/strata.py' }, env: {}, run: async (args, options) => { seen.push([args.join(' '), !!options.acquire]); return { code: 0, json: { ok: true, families: [] } }; } });
   await control.engines();
   await control.useEngine({ family: 'qwen', folder: '0.1.54-linux-x86_64-cuda-cuda13' });
-  await control.removeEngine({ family: 'deepseek', folder: '0.1.50-linux-x86_64-cuda-cuda13' });
+  await control.removeEngine({ family: 'qwen', folder: '0.1.50-linux-x86_64-cuda-cuda13' });
   assert.deepEqual(seen, [
     ['components engines --output json', false],
     ['components use 0.1.54-linux-x86_64-cuda-cuda13 --family qwen --output json', false],
-    ['components remove 0.1.50-linux-x86_64-cuda-cuda13 --family deepseek --output json', false],
+    ['components remove 0.1.50-linux-x86_64-cuda-cuda13 --family qwen --output json', false],
   ]);
 });
 
@@ -118,7 +118,6 @@ test('a switch to an older engine warns about the installed models that need a n
     catalog: { families: [{ family: 'qwen', title: 'Qwen', sizes: [{ id: 'gyro', model: 'gyro', engine_min: '0.1.45.1' }, { id: 'plain', model: 'plain', engine_min: null }] }] } };
   assert.deepEqual(modelsNeedingNewer(native, { family: 'qwen', version: '0.1.45' }), ['Gyro']);
   assert.deepEqual(modelsNeedingNewer(native, { family: 'qwen', version: '0.1.46' }), []);
-  assert.deepEqual(modelsNeedingNewer(native, { family: 'deepseek', version: '0.1.1' }), [], 'only the Qwen family has catalog minimums');
   assert.deepEqual(modelsNeedingNewer(null, { family: 'qwen', version: '0.1.1' }), []);
   const page = src('src/components/SettingsEngine.tsx');
   assert.match(page, /disabled=\{pending \|\| running\}/, 'only a loaded model stops the button; the warning does not');

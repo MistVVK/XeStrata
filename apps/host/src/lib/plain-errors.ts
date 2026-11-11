@@ -15,6 +15,11 @@ const MEMORY_NEXT = 'Close other programs and try again, or choose “Leave room
 
 /** Order matters: the first rule that matches wins. */
 const RULES: Rule[] = [
+  // A DeepSeek model of an earlier Strata (strata_control/retired.py, the owner's words of 11-11): Control's own sentences, with the model's name and where
+  // its files are and how large, filled in by Control; the next step is the third sentence. Before every other rule (its words name files and deleting).
+  // [DRAFT] translations: these sentences stay English in every language (no locale key yet) until the owner has read the wording list; then
+  // the next step and the two templated sentences get keys in the nine bundles.
+  { kind: 'deepseek-retired', match: /(\S.*? is a DeepSeek model\. This version of Strata no longer runs DeepSeek models, so it was not started\.(?: Its files are still on this computer: .+? in .+?\. Nothing was changed or deleted\.)?)/, message: m => m[1], next: 'Choose a Qwen model to run instead. If you no longer need the DeepSeek files, you can delete that folder to free the space.' },
   // The host names the files it could not find (#3478). The sentence with the names is a template in every language: tr() fills it.
   { kind: 'model-files-missing', match: /Some model files are missing: (.+?)\. Use Download/i, message: m => `These model files are missing: ${m[1]}.`, next: 'Press Download & load again to fetch them. Files that are already there are kept. If the same files are listed again, open Details and share them when you ask for help.' },
   { kind: 'tunnel-own-running', match: /Strata’s tunnel for this address is already running \(PID/i, message: 'Strata’s tunnel for this address is already running.', next: 'Stop it first, or use it as it is, then connect again here.' },

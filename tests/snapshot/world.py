@@ -31,8 +31,6 @@ CLEAR = ("STRATA_SETTINGS_FILE", "STRATA_CONNECTION_DIR", "CUDA_VISIBLE_DEVICES"
 
 
 def context_for(machine: Machine, model_set: ModelSet) -> int:
-    if model_set.multi_file:
-        return 131072
     if machine.key == "nv_12gb_streaming":
         return 65536
     if machine.key == "mac_small":
@@ -54,8 +52,8 @@ class World:
         self.pack = self.data / "packs" / mset.key
         self.mtp = self.data / "mtp" / "rt"
         self.gguf_dir = self.models / mset.model
-        self.exe = self.engine_dir / ("strata-dsv41" if mset.multi_file else "strata")
-        self.tag = (("deepseek-v4.1-flash-" if mset.multi_file else {"qwen": "", "unsloth": "unsloth-"}[mset.family]) + mset.model).lower()
+        self.exe = self.engine_dir / "strata"
+        self.tag = ({"qwen": "", "unsloth": "unsloth-"}[mset.family] + mset.model).lower()
         self.config_path = self.install / f"strata-{self.tag}.json"
         self.env = {
             "HOME": str(self.home), "USERPROFILE": str(self.home),
@@ -90,7 +88,7 @@ class World:
         """What the app driver (Node) needs to know about this world; written next to it so the two sides read the same facts."""
         m = self.machine
         platform = {"windows": "windows-x86_64", "linux": f"linux-{m.machine}", "macos": "macos-arm64"}[m.os]
-        family = "deepseek41" if self.mset.multi_file else self.mset.family
+        family = self.mset.family
         return {"tag": self.tag, "family": family, "title": family, "modelName": self.mset.model_name, "model": self.mset.model, "sizeId": self.tag,
                 "configPath": str(self.config_path), "hardware": self.hardware_report(), "backend": m.backend, "platform": platform, "exe": str(self.exe),
                 "context": context_for(m, self.mset)}
@@ -101,41 +99,30 @@ class World:
 
     # ------------------------------------------------------------------ the stand-in for setup.py's output
     def base_config(self) -> dict:
-        """What setup.py writes for this class and set, rebuilt from setup.py's own rules (the qwen block around line 10975-11200 and dsv41 around 9498).
+        """What setup.py writes for this class and set, rebuilt from setup.py's own rules (the qwen block around line 10975-11200).
         It is a STAND-IN: setup.py itself cannot be driven without a model download, an engine and a GPU probe (see RESULTS-STEP0.md), so the entry points
         that start from a saved model all start from this same file.  Differences between entry points are therefore never caused by it."""
         m, s = self.machine, self.mset
         ctx = context_for(m, s)
-        if s.multi_file:
-            args = ["--pack", str(self.pack), "--max-context", str(ctx), "--eos", "1", "--vision", "on",
-                    "--dspark", "none" if m.os == "macos" else "auto"]
-            if m.os != "macos":
-                args += ["--dspark-conf", "0.65"]
-            cfg = {"exe": str(self.exe), "args": args, "cwd": str(ROOT), "tokenizer": str(self.pack / "tokenizer"),
-                   "model_name": "deepseek-v4.1-flash", "arch": "deepseek41", "log": str(self.install / f"strata-{self.tag}.log"),
-                   "lib_dirs": [], "port": 8080, "engine_ready_s": 3600}
-            if m.unified and m.backend == "hip":
-                cfg["env"] = {"DS4_ASYNC_T": "4"}
-        else:
-            shard1 = self.gguf_dir / s.shards[0]
-            ple = self.gguf_dir / s.shards[min(1, len(s.shards) - 1)]
-            args = ["--pack", str(self.pack), "--native", str(shard1)]
-            if len(s.shards) <= 2:
-                args += ["--ple-gguf", str(ple)]
-            args += ["--expert-profile", str(ROOT / "data" / "expert-profile.bin"), "--expert-cache", "auto", "--prefill", "auto", "--spec", "4",
-                     "--spec-min-p", "0.5", "--mtp", str(self.mtp), "--max-context", str(ctx)]
-            if ctx > 8192:
-                args += ["--kv", "int8"]
-            if m.key == "dgx_spark":
-                args += ["--mmap-experts"]
-                args[args.index("--prefill") + 1] = "auto:32768"
-                args += ["--mtp-q4", "all", "--mtp-hnorm", "stream"]
-            if ctx >= 65536 and m.key == "nv_12gb_streaming":
-                args += ["--kv-resident", "32768"]
-            if s.family == "unsloth":
-                args += ["--resident-budget-gib", "24" if m.ram_gb < 100 else "48"]
-            cfg = {"exe": str(self.exe), "args": args, "cwd": str(ROOT), "tokenizer": str(self.pack / "tokenizer"),
-                   "model_name": s.model_name, "log": str(self.install / f"strata-{self.tag}.log"), "lib_dirs": [], "port": 8080}
+        shard1 = self.gguf_dir / s.shards[0]
+        ple = self.gguf_dir / s.shards[min(1, len(s.shards) - 1)]
+        args = ["--pack", str(self.pack), "--native", str(shard1)]
+        if len(s.shards) <= 2:
+            args += ["--ple-gguf", str(ple)]
+        args += ["--expert-profile", str(ROOT / "data" / "expert-profile.bin"), "--expert-cache", "auto", "--prefill", "auto", "--spec", "4",
+                 "--spec-min-p", "0.5", "--mtp", str(self.mtp), "--max-context", str(ctx)]
+        if ctx > 8192:
+            args += ["--kv", "int8"]
+        if m.key == "dgx_spark":
+            args += ["--mmap-experts"]
+            args[args.index("--prefill") + 1] = "auto:32768"
+            args += ["--mtp-q4", "all", "--mtp-hnorm", "stream"]
+        if ctx >= 65536 and m.key == "nv_12gb_streaming":
+            args += ["--kv-resident", "32768"]
+        if s.family == "unsloth":
+            args += ["--resident-budget-gib", "24" if m.ram_gb < 100 else "48"]
+        cfg = {"exe": str(self.exe), "args": args, "cwd": str(ROOT), "tokenizer": str(self.pack / "tokenizer"),
+               "model_name": s.model_name, "log": str(self.install / f"strata-{self.tag}.log"), "lib_dirs": [], "port": 8080}
         if m.backend in ("hip", "metal", "sycl"):
             cfg["backend"] = m.backend
         if m.cards > 1:

@@ -200,7 +200,9 @@ class EngineBeforeModel(unittest.TestCase):
         cat.src = ROOT
         r._catalog = cat
         r.s = S.LaunchSettings(family="qwen", model="Q2_0", context=32768)
-        with mock.patch.object(Runner, "installed_state", return_value=(None, None)), mock.patch.object(Runner, "_spawn", spawn):
+        # (not an Intel Arc launch: on a box with an Arc card intel_chosen() is true and the model would be adopted, not set up; the
+        # MagicMock catalog used to answer multi_file() with a truthy mock, which hid that before DeepSeek's branch left intel_chosen)
+        with mock.patch.object(Runner, "installed_state", return_value=(None, None)), mock.patch.object(Runner, "_spawn", spawn),                 mock.patch.object(Runner, "intel_chosen", return_value=False):
             with self.assertRaises(Boom):
                 r.ensure_model()
         self.assertEqual(seen["env"].get("STRATA_ALLOW_NO_ENGINE"), "1")

@@ -23,7 +23,7 @@ function FreeMeter({ label, total, free }: { label: string; total: number; free:
  * from the SSD, how fast it reads right now. Before anything is loaded the card says what the chosen version would take. That a version does not fit in
  * memory is said once, under the version picker ("may run slower"), not again here. (The n-gram table, which always sits on the SSD, is not counted.)
  */
-export function PcFitCard({ gpuName, ramGb, vramGb, fit, inUse = null, diskGb = null, live = null, loaded = [], selectedLoaded = false }: { gpuName?: string | null; ramGb: number | null; vramGb: number; fit: Fit | null; inUse?: { ramGb: number; vramGb: number } | null; diskGb?: number | null; live?: PcLive | null; loaded?: PcLoaded[]; selectedLoaded?: boolean }) {
+export function PcFitCard({ gpuName, ramGb, vramGb, fit, inUse = null, live = null, loaded = [], selectedLoaded = false }: { gpuName?: string | null; ramGb: number | null; vramGb: number; fit: Fit | null; inUse?: { ramGb: number; vramGb: number } | null; live?: PcLive | null; loaded?: PcLoaded[]; selectedLoaded?: boolean }) {
   const showFit = !!fit?.known && !selectedLoaded;
   const isLoaded = loaded.length > 0;
   const streamed = Math.max(0, ...loaded.map(m => (m.fit.known ? m.fit.spillGb : 0)));
@@ -38,7 +38,5 @@ export function PcFitCard({ gpuName, ramGb, vramGb, fit, inUse = null, diskGb = 
     {tr(isLoaded && streamed >= 1 && live?.diskReadGbs && live.diskReadGbs >= 0.05 ? <p className="pc-note">{tr("Reading from your SSD now: {0}", [`${live.diskReadGbs.toFixed(1)} GB/s`])}</p> : null)}
     {tr(inUse ? <p className="xs muted">{tr("Models that stay loaded use about {0} GB of RAM and {1} GB of this card’s memory.", [inUse.ramGb, inUse.vramGb])}</p> : null)}
     {tr(showFit && !isLoaded && fit!.vramUseGb + fit!.ramUseGb > 0 ? <p className="pc-note">{tr("This version would take about {0} of graphics memory and {1} of RAM.", [about(fit!.vramUseGb), about(fit!.ramUseGb)])}</p> : null)}
-    {tr(showFit && diskGb && fit!.spillGb >= 1 ? <p className="pc-note">{tr("About {0} GB will be read from the SSD, so answers can be a little slower.", [Math.round(fit!.spillGb)])}</p> : null)}
-    {tr(diskGb ? <p className="pc-note">{tr("Needs about {0} GB of free disk space. What does not fit in memory is read from your SSD.", [Math.round(diskGb)])}</p> : null)}
   </section>;
 }

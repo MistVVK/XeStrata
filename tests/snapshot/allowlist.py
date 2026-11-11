@@ -18,7 +18,6 @@ BY_DESIGN = {
 
 #: Environment variables the engine start adds, which differ by design.
 ENV_BY_DESIGN = {
-    "STRATA_DS4_SLOT_DIR": "DeepSeek's saved-conversation folder: in the app's install folder, in the Terminal's launch folder",
 }
 
 #: Intended differences of the Models-screen Load alone.

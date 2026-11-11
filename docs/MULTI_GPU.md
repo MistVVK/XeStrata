@@ -5,7 +5,7 @@ several cards. NVIDIA is described here; AMD limits and measurements are in [AMD
 
 > **On this page:** [Using it](#using-it) · [Main, Helper, Off](#main-helper-off) · [How the split works](#how-the-split-works) ·
 > [Tuning options](#tuning-options) · [Pipeline windows](#pipeline-windows) · [Two models on two cards](#two-models-on-two-cards) ·
-> [DeepSeek](#deepseek-v41-flash) · [Limits](#limits) · [History](#history--older-measurements)
+> [Limits](#limits) · [History](#history--older-measurements)
 
 ## Using it
 
@@ -205,12 +205,6 @@ for the next model, and explains a failed start on a card that is taken. Two mod
 **Measured on:** a PC with two of four Radeon AI PRO R9700 cards, Linux, AMD build, Q2_0 on one card and IQ3_XXS on the other.
 Both loaded (33 s and 59 s with the files cached, 114 s the first time) and answered chats at about 60 tokens/s each. Unloading
 one left the other answering. The same app code drives NVIDIA cards, but two models on two NVIDIA cards were not run.
-
-## DeepSeek V4.1-Flash
-
-DeepSeek V4.1-Flash runs in the app and the Terminal and spreads its experts and its dense weights over several cards. It does not use
-the Qwen layer split described above. On four Radeon AI PRO R9700 cards it reaches about 31 tokens/s. Hardware, sets and speeds:
-[MODELS.md](MODELS.md#deepseek-v41-flash).
 
 ## Small cards: what a split gives up when it is short of memory
 

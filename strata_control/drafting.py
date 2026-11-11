@@ -1116,7 +1116,7 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
     args = [str(a) for a in cfg.get("args") or []]
     if cfg.get("split_engine_note") and _flag_value(args, "--draft") == "dflash2":   # the all-cards split engine started with DFlash2 as its drafter (split_engine.split_config): its flags are its own, nothing is added or taken out
         return Decision("dflash2", "dflash2")
-    if not supported_model(cfg.get("model_name"), family):    # another model: its drafting is not this choice's business (DeepSeek, Swift, Coder, NVFP4, Qwen3.6...)
+    if not supported_model(cfg.get("model_name"), family):    # another model: its drafting is not this choice's business (Swift, Coder, NVFP4, Qwen3.6...)
         asked = normalize(cfg.get("drafting"))
         if asked == "off" or cfg.get("mtp") is False:            # no drafter for this model (its draft layer is off, or a feed model whose entry says drafter: none): say so, start none
             # "mtp": false: the server's own draft-layer step takes the layer out (and says so); "drafting": "off" alone: taken out here

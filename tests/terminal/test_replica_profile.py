@@ -106,7 +106,7 @@ class Apply(unittest.TestCase):
 
     def test_what_the_person_chose_wins(self):
         for kw in ({"replicas": 2}, {"layer_split": "13,26,39"}, {"args": ["--pack", "/p/iq3_s", "--peer-device", "1"]},
-                   {"args": ["--pack", "/p/iq3_s", "--layer-split", "20,40"]}, {"arch": "deepseek41"}):
+                   {"args": ["--pack", "/p/iq3_s", "--layer-split", "20,40"]}):
             c = cfg(**kw)
             before = dict(c)
             P.apply(cards(4), c, 251.0, platform="linux", environ={})

@@ -58,7 +58,7 @@ def model_ok(cfg: dict) -> bool:
 def applies(cards: list[dict], cfg: dict) -> bool:
     args = [str(a) for a in cfg.get("args") or []]
     return (not disabled(cfg)) and card_class(cards) and cfg.get("backend", "hip") == "hip" and model_ok(cfg) \
-        and "--peer-device" not in args and not cfg.get("replicas") and cfg.get("arch") != "deepseek41"
+        and "--peer-device" not in args and not cfg.get("replicas")
 
 
 def apply(cards: list[dict], cfg: dict, *, parallel_given: bool = False) -> list[str]:

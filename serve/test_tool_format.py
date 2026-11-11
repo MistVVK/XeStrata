@@ -114,7 +114,7 @@ class Selection(unittest.TestCase):
         self.assertIs(parser_for_template(HERMES), JsonOutputParser)
         self.assertTrue(issubclass(JsonOutputParser, OutputParser))
 
-    def test_service_picks_by_template_and_the_family_still_wins(self):
+    def test_service_picks_by_template(self):
         from serve.server import ByteTokenizer, MockEngine, Service
         with tempfile.TemporaryDirectory() as d:
             h = Path(d) / "hermes.jinja"
@@ -123,10 +123,6 @@ class Selection(unittest.TestCase):
             self.assertIs(Service(MockEngine(tok, "ok"), tok, ChatTemplate(h)).parser_cls, JsonOutputParser)
             shipped = ChatTemplate(ROOT / "serve" / "chat_template.jinja")
             self.assertIs(Service(MockEngine(tok, "ok"), tok, shipped).parser_cls, OutputParser)
-            ds = Service(MockEngine(tok, "ok"), tok, ChatTemplate(h))
-            ds.set_family("deepseek41")
-            from serve import dsml
-            self.assertIs(ds.parser_cls, dsml.DsmlOutputParser)
 
 
 class UnknownPreTokenizerAtStart(unittest.TestCase):

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Build the Qwen engine package for Apple Silicon (backend metal): `strata` + `strata-vision` + the Metal sources the engine compiles at start-up.
 # This is the repository's version of the release scripts' Mac stage (phaseA-tests/rel213/scripts/mac_rel213.sh, rel212/scripts/mac_rel212.sh), so a release
-# builds the Mac Qwen package from the tag itself. packaging/mac/build_dsv41_engine.sh makes the separate DeepSeek package.
+# builds the Mac Qwen package from the tag itself.
 #
 #   bash packaging/mac/build_engine.sh --version 0.1.59 [--work DIR] [--build-id ID] [--jobs N] [--stages "engine vision pkg"]
 #

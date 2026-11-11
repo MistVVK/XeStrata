@@ -204,15 +204,14 @@ test('a card that shares the PC memory does not hold back a fifth of the shared 
  assert.equal(discrete.vram_reserve_mib,Math.floor(82*1024*.2),'a card with its own memory keeps its fifth');
 });
 
-test('picture readiness: Qwen needs strata-vision in the engine folder, DeepSeek carries its own tower (#4772)',()=>{
+test('picture readiness: Qwen needs strata-vision in the engine folder',()=>{
  const catalog={families:[
-  {family:'flash-next',images:true,sizes:[{id:'q',images:true,multi_file:false}]},
-  {family:'deepseek-v4.1-flash',images:true,sizes:[{id:'d',images:true,multi_file:true}]},
+  {family:'flash-next',images:true,sizes:[{id:'q',images:true}]},
   {family:'text',images:false,sizes:[{id:'t',images:false}]}]};
  const without=markPictures(catalog,false).families, withReader=markPictures(catalog,true).families;
- assert.deepEqual(without.map(f=>f.sizes[0].images),[false,true,false]);
- assert.deepEqual(without.map(f=>f.sizes[0].imagesCapable),[true,true,false]);
- assert.deepEqual(without.map(f=>f.images),[false,true,false]);
- assert.deepEqual(withReader.map(f=>f.sizes[0].images),[true,true,false]);
+ assert.deepEqual(without.map(f=>f.sizes[0].images),[false,false]);
+ assert.deepEqual(without.map(f=>f.sizes[0].imagesCapable),[true,false]);
+ assert.deepEqual(without.map(f=>f.images),[false,false]);
+ assert.deepEqual(withReader.map(f=>f.sizes[0].images),[true,false]);
  assert.equal(markPictures(null,true),null);
 });

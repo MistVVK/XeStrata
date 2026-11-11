@@ -23,7 +23,7 @@ FAMILY = "shape:" + SHAPE
 class ShapeEngines(Base):
     def setUp(self):
         super().setUp()
-        for p in (mock.patch.object(lib, "_process_uses", return_value=False), mock.patch.object(lib, "_ds_entries", return_value=[])):
+        for p in (mock.patch.object(lib, "_process_uses", return_value=False),):
             p.start()
             self.addCleanup(p.stop)
 
@@ -119,7 +119,8 @@ class ShapeEngines(Base):
         self.assertIn(FAMILY, update_cmd._ENGINE_FAMILIES)
         self.assertIn("qwen", update_cmd._ENGINE_FAMILIES)
         self.assertNotIn("shape:Nope", update_cmd._ENGINE_FAMILIES)
-        self.assertEqual(list(update_cmd._ENGINE_FAMILIES), ["qwen", "deepseek"], "help and errors list the two as before")
+        self.assertEqual(list(update_cmd._ENGINE_FAMILIES), ["qwen"], "help and errors list the Qwen family")
+        self.assertIn("deepseek", update_cmd._ENGINE_FAMILIES)   # accepted, so engine_library answers it in plain words (strata_control/retired.py)
         self.install("0.1.59")
         a = mock.Mock(components_command="engines")
         out = io.StringIO()

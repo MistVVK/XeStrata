@@ -30,24 +30,10 @@ Each row is an OS, CPU ABI and backend. A row is `qualified` only after the acce
 | `windows-x86_64-hip` | NSIS `.exe` (Tauri) | `tools/hip/build_windows.bat` | Published. Strix Halo inference is recorded in [STRIX_HALO.md](../docs/STRIX_HALO.md). This does not qualify every discrete Radeon card ([AMD_HIP.md](../docs/AMD_HIP.md)). |
 | `linux-x86_64-cuda` | AppImage (Tauri) | `packaging/build_cuda_linux.sh`, built in a glibc 2.35 chroot | `cuda13` built and tested on RTX 3060 and RTX A4000 (app in the browser, a real model, a picture). `cuda12` built. |
 | `linux-x86_64-hip` | AppImage (Tauri) | `packaging/build_hip_linux.sh` | `rx9070` (gfx1200 / gfx1201) built and tested on a Radeon AI PRO R9700. `rx7900` (gfx1100 / 1101 / 1102) built, not run on an RX 7000 card. `rx6000` (gfx1030 / 1031) built, not tested on a real RX 6000 card. |
-| `linux-aarch64-cuda` | none (no AppImage for arm64) | `packaging/build_cuda_linux_aarch64.sh`, built on the DGX Spark (`cuda13`, `sm_121`) | Engine packages (Qwen with `strata-dsv41` inside, and the separate DeepSeek one) and the Terminal archive built and tested on one DGX Spark ([DGX_SPARK_LINUX.md](../docs/DGX_SPARK_LINUX.md)). Not tried on any other arm64 machine. |
+| `linux-aarch64-cuda` | none (no AppImage for arm64) | `packaging/build_cuda_linux_aarch64.sh`, built on the DGX Spark (`cuda13`, `sm_121`) | The engine package and the Terminal archive built and tested on one DGX Spark ([DGX_SPARK_LINUX.md](../docs/DGX_SPARK_LINUX.md)). Not tried on any other arm64 machine. |
 | `linux-x86_64-sycl` | none | `packaging/build_sycl_linux.sh` (one JIT package for Alchemist and Battlemage) | Engine package built and tested on an Arc A750. Battlemage is supported and untested by us. |
 | `windows-x86_64-sycl` | none | none | Gated. No native Windows SYCL path exists upstream. |
 | `macos-x86_64-*` | none | none | Unsupported. The macOS engine is Apple Silicon only. |
-
-**DeepSeek V4.1-Flash.** The signed feed's `dsv41` member carries the DeepSeek engine `strata-dsv41` as its own package: Windows
-NVIDIA `cuda13`, Linux NVIDIA `cuda13`, Linux AMD `rx9070`, and since 0.2.7 Windows AMD `rdna3` (Ryzen AI Max, gfx1151). All other
-engine packages carry no DeepSeek engine. Build `strata-dsv41` with `packaging/build_dsv41_cuda.sh` (Linux) or
-`packaging/build_dsv41_windows.bat` (Windows), then package it with `package_engine.py --require-dsv41`; or pack it as the separate
-download (`feed_tool.py pack-engine --prefix strata-dsv41`, [UPDATES.md](UPDATES.md#the-feed)).
-
-Windows AMD (gfx1151): build `strata-dsv41` with `tools\dsv41\win\build_hip_win.bat` (the ROCm venv, default `gfx1151`) and stage
-it with the ROCm runtime the Qwen Windows `rdna3` package already carries: the HIP and C++ runtime DLLs beside the program,
-`rocm/bin` (hipBLAS / rocBLAS / hipBLASLt and their imports), `rocm/bin/rocblas/library/gfx1151`,
-`rocm/bin/hipblaslt/library/gfx1151`, `rocm/.kpack/blas_lib_gfx1151.kpack`, `rocm/licenses`, and a `BUILD.json` that names
-`"lib_dirs": ["rocm/bin"]`. Package it with `package_engine.py --backend hip --platform windows-x86_64 --arch gfx1151 --entrypoint
-strata-dsv41.exe --variant rdna3` (about 240 MiB, 280 files). Strata puts the package's `lib_dirs` on the engine's library path
-(`strata_control/dsv41_engine.py lib_dirs`), so the HIP runtime is found the same way the Qwen engine finds it.
 
 Cross-compilation is not attempted for the desktop app. Tauri bundles are per OS, and the Windows installer is built on Windows.
 The Python contracts, the owner transport, the checks and the engine build recipes are portable.

@@ -83,10 +83,6 @@ public:
     bool supports_metal4() const;
     uint64_t recommended_working_set() const;
     uint64_t max_buffer_length() const;
-    // Keeps the GPU out of its low-clock idle state while dispatches keep coming (a lone kernel in a quiet GPU runs 2-3x slower:
-    // measured 205 vs 69 us for the same matvec): a spin kernel of one threadgroup on a second queue, stopped 50 ms after the
-    // last dispatch.  DS4_NO_KEEPALIVE=1: off.
-    void start_keepalive();
     // Zero-copy weights: the GPU address of host memory [p, p + bytes) (file-backed pages of the model, RAM slots) through a
     // no-copy buffer over the pages it spans, made resident.  0: not mappable (the cap on buffers is reached, or the pages are not
     // ours).  The first dispatch that reads cold pages waits for them (the buffer is wired on use).

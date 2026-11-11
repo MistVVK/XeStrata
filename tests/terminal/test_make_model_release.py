@@ -22,7 +22,7 @@ import qwen4_intake as Q  # noqa: E402
 
 PREV = {"strata-engine-0.1.57-linux-x86_64-cuda-cuda13.tar.gz": 720_000_000, "strata-engine-0.1.57-linux-x86_64-sycl.tar.gz": 187_000_000,
         "strata-engine-0.1.57-windows-x86_64-cuda-cuda13.zip": 900_000_000, "strata-engine-0.1.57-macos-arm64-metal.tar.gz": 150_000_000,
-        "strata-dsv41-0.1.57-linux-x86_64-cuda-cuda13.tar.gz": 445_000_000, "strata-control-0.1.57-linux-x86_64.tar.gz": 99_000_000,
+        "strata-control-0.1.57-linux-x86_64.tar.gz": 99_000_000,
         "Strata-0.2.11-windows-x64-setup.exe": 80_000_000, "Strata-0.2.11-windows-x64-setup.exe.sig": 400,
         "Strata-0.2.11-linux-x86_64.AppImage": 90_000_000, "Strata-0.2.11-macos-arm64.dmg": 160_000_000, "Strata.app.tar.gz": 70_000_000,
         "strata-feed.json": 9000, "strata-feed.json.sig": 200, "SHA256SUMS.txt": 5000, "latest.json": 1500, "install.sh": 9000}
@@ -79,7 +79,7 @@ class Plan(unittest.TestCase):
         self.assertFalse(names & {"latest.json", "Strata-0.2.12-windows-x64-setup.exe"})
         self.assertFalse(any("App text" in s["what"] or "Mac" in s["what"] for s in p["steps"]))
         kept = {k["name"] for k in p["kept"]}
-        self.assertTrue({n for n in PREV if n.startswith(("strata-engine-", "strata-dsv41-", "strata-control-", "Strata-"))} <= kept)
+        self.assertTrue({n for n in PREV if n.startswith(("strata-engine-", "strata-control-", "Strata-"))} <= kept)
         self.assertFalse(any("Build the Qwen engine" in s["what"] for s in p["steps"]))
         self.assertEqual(p["entry"]["family"], "qwen35moe")
         self.assertEqual(p["entry"]["hf"], {"repo": "x/y", "revision": "abc"})
@@ -112,7 +112,7 @@ class Plan(unittest.TestCase):
         self.assertFalse(any(n.startswith(("strata-engine-", "strata-control-", "strata-dsv41-")) for n in names), "the Strata engine and the Controls are not rebuilt")
         self.assertFalse(any("0.1.57" in n for n in names))
         kept = {k["name"] for k in p["kept"]}
-        self.assertTrue({n for n in PREV if n.startswith(("strata-engine-", "strata-dsv41-", "strata-control-", "Strata-"))} <= kept)
+        self.assertTrue({n for n in PREV if n.startswith(("strata-engine-", "strata-control-", "Strata-"))} <= kept)
         self.assertFalse(any("Controls: pack" in s["what"] or "App text" in s["what"] for s in p["steps"]))
         self.assertIn("strata-q4-lite-0.1.58-macos-arm64-metal.tar.gz", names)
         self.assertTrue(any("Mac" in s["what"] and s["owner_only"] for s in p["steps"]), "the owner signs the Mac shape engine")

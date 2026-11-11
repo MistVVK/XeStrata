@@ -234,7 +234,7 @@ export function createControl({ control = findControl(), env = process.env, run 
       if (result.json?.ok) return result.json;
       throw failure(result, 'The installed engines could not be read.');
     },
-    /** Switch to an installed engine (`strata components use`): nothing is downloaded. `root` is only for a DeepSeek engine that lives in more than one place. */
+    /** Switch to an installed engine (`strata components use`): nothing is downloaded. `root` is kept for older callers. */
     async useEngine({ family, folder }) {
       const result = await call(['components', 'use', folder, '--family', family, '--output', 'json'], { timeoutMs: 600_000 });
       if (result.json?.ok) return result.json;

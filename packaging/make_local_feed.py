@@ -4,12 +4,12 @@
 
     python packaging/make_local_feed.py --out FEED --terminal strata-terminal-0.1.45-linux-x86_64.tar.gz \
         --engine /path/to/components/engine/0.1.45-linux-x86_64-cuda [--engine ...] \
-        [--dsv41 /path/to/a/DeepSeek/engine/package ...] [--keys KEYDIR] [--url http://127.0.0.1:8099] [--sequence 1]
+        [--keys KEYDIR] [--url http://127.0.0.1:8099] [--sequence 1]
     python -m http.server 8099 --bind 127.0.0.1 --directory FEED         # serve it (foreground; stop it with Ctrl+C)
 
 What it writes into FEED (the folder a person would host):
     strata-feed.json + .sig        the signed feed (Ed25519, the key in KEYDIR, made once, never inside a git checkout)
-    control/*, engine/*, dsv41/*   the Terminal (as a "control" package), each engine package and each DeepSeek engine package (--dsv41), archived
+    control/*, engine/*            the Terminal (as a "control" package) and each engine package, archived
     install-manifest.txt           one line per platform for install.sh / install.ps1: platform version url sha256 size (written by feed_tool build-feed)
     install.sh, install.ps1        the one-line installers with this feed's address filled in (--url)
     test-trust.json                the PUBLIC test key: `STRATA_UPDATE_TRUSTED_KEYS=<this file>` lets this build trust the feed
@@ -56,7 +56,6 @@ def main(argv=None) -> int:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--terminal", type=Path, action="append", default=[], help="a terminal archive (.tar.gz or .zip); repeat per platform")
     ap.add_argument("--engine", type=Path, action="append", default=[], help="an engine package folder (with engine-component.json)")
-    ap.add_argument("--dsv41", type=Path, action="append", default=[], help="a DeepSeek engine package folder (the feed's dsv41 member)")
     ap.add_argument("--drafter", type=Path, action="append", default=[], help="a DFlash2 drafter file (the feed's drafters member), listed for metal, hosted flat beside the feed")
     ap.add_argument("--keys", type=Path, default=None, help="folder for the test key (default: <out>/../feed-test-keys)")
     ap.add_argument("--url", default="http://127.0.0.1:8099", help="the address this feed will be served at (baked into install.sh/.ps1)")
@@ -73,8 +72,6 @@ def main(argv=None) -> int:
     shutil.rmtree(out, ignore_errors=True)
     (out / "engine").mkdir(parents=True)
     (out / "control").mkdir(parents=True)
-    if a.dsv41:
-        (out / "dsv41").mkdir(parents=True)
     version = a.version
     with tempfile.TemporaryDirectory(prefix="strata-feed-") as tmp:
         tmpdir = Path(tmp)
@@ -97,18 +94,11 @@ def main(argv=None) -> int:
             entry = ft.pack_engine(copy, out / "engine")
             print(f"engine {entry['platform']}-{entry['backend']} {entry['version']}: {entry['size'] // 1048576} MB")
             shutil.rmtree(copy.parent, ignore_errors=True)
-        for n, pkg in enumerate(a.dsv41):
-            copy = tmpdir / f"d{n}" / pkg.name
-            shutil.copytree(pkg, copy, symlinks=True)
-            ft.sign_package(copy, key)
-            entry = ft.pack_engine(copy, out / "dsv41", url_prefix="dsv41/", prefix="strata-dsv41")
-            print(f"deepseek engine {entry['platform']}-{entry['backend']} {entry['version']}: {entry['size'] // 1048576} MB")
-            shutil.rmtree(copy.parent, ignore_errors=True)
     for pack in a.drafter:
         entry = ft.pack_drafter(pack, out / "drafters", version="1", backends=["metal"], url_prefix="drafters/")
         print(f"drafter {entry['name']}: {entry['size'] // 1048576} MB")
     ft.build_feed(out, key=key, sequence=a.sequence, channel=a.channel, engine_dir=out / "engine" if a.engine else None,
-                  control_dir=out / "control" if a.terminal else None, dsv41_dir=out / "dsv41" if a.dsv41 else None,
+                  control_dir=out / "control" if a.terminal else None,
                   drafters_dir=out / "drafters" if a.drafter else None)
     if any("linux-aarch64" in p.name for p in (out / "control").glob("*.entry.json")):       # the Linux ARM64 Terminal reads its own feed file (same bytes here)
         for suffix in ("", ".sig"):

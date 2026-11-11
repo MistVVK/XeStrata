@@ -13,14 +13,13 @@ function engine(family, version, bytes, extra = {}) {
   const folder = `${version}-windows-x86_64-${backend}${variant ? `-${variant}` : ''}`;
   return { family, folder, version, backend, platform: 'windows-x86_64', variant, bytes, signed: true, fits: true, why_not: null, why_code: null, why_args: [],
     active: false, newest: false, pinned: false, running: false, can_use: true, can_delete: true, delete_blocked: null, blocked_code: null,
-    build_id: `preview-${version}`, path: `C:\\Users\\you\\AppData\\Local\\Strata\\components\\engine\\${folder}`, ...(family === 'deepseek' ? { root: 'C:\\Users\\you\\AppData\\Local\\Strata\\engine-dsv41' } : {}), ...extra };
+    build_id: `preview-${version}`, path: `C:\\Users\\you\\AppData\\Local\\Strata\\components\\engine\\${folder}`, ...extra };
 }
 
 export function createEnginePreview(native) {
   const qwen = [engine('qwen', '0.1.55', 1.02 * GB), engine('qwen', '0.1.54', 0.98 * GB), engine('qwen', '0.1.50', 0.91 * GB),
     engine('qwen', '0.1.49', 0.88 * GB, { backend: 'hip', fits: false, why_not: 'x', why_code: 'gpu_make' })];
-  const deepseek = [engine('deepseek', '0.1.55.1', 0.64 * GB), engine('deepseek', '0.1.50', 0.6 * GB)];
-  const groups = () => [{ family: 'qwen', title: 'Qwen and other models', engines: qwen }, { family: 'deepseek', title: 'DeepSeek', engines: deepseek }];
+  const groups = () => [{ family: 'qwen', title: 'Qwen and other models', engines: qwen }];
   const latest = '0.1.56';
   let checked = false;
   const jobs = [];
@@ -39,12 +38,11 @@ export function createEnginePreview(native) {
   }
   const activeOf = list => list.find(e => e.active)?.folder;
   settle(qwen, qwen[0].folder);
-  settle(deepseek, deepseek[0].folder);
   const syncVersion = () => { native.installed = { ...(native.installed ?? {}), engine: { version: qwen.find(e => e.active)?.version ?? null } }; };
   syncVersion();
   native.capabilities = { ...(native.capabilities ?? {}), componentUpdates: true };
 
-  const total = () => [...qwen, ...deepseek].reduce((sum, e) => sum + e.bytes, 0);
+  const total = () => qwen.reduce((sum, e) => sum + e.bytes, 0);
   const loaded = () => (native.instances ?? []).some(i => i.status === 'ready' || i.status === 'loading');
 
   return {
@@ -52,7 +50,7 @@ export function createEnginePreview(native) {
     async handle(path, method, body, json) {
       if (path === '/api/engines' && method === 'GET') return json({ available: true, families: groups(), total_bytes: total(), serving: loaded() }), true;
       if ((path === '/api/engines/use' || path === '/api/engines/remove') && method === 'POST') {
-        const list = body.family === 'deepseek' ? deepseek : qwen;
+        const list = qwen;
         const row = list.find(e => e.folder === body.folder);
         if (!row) return json({ error: 'That engine is already gone. The list has been refreshed.' }, 400), true;
         await new Promise(r => setTimeout(r, 700));

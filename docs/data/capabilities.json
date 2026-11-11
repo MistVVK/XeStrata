@@ -11,21 +11,6 @@
  ],
  "families": [
   {
-   "id": "deepseek41",
-   "name": "DeepSeekV4.1-Flash-1017",
-   "asset_prefix": "strata-dsv41-",
-   "guide": "MODELS.md#deepseek-v41-flash",
-   "cells": {
-    "nvidia_win": {"supported": "yes", "hardware": "RTX 30, 40 and 50", "limits": "The package carries RTX 40 code (sm_89); we have not run an RTX 40 card.", "measured": "[README](../README.md) speed table (RTX 5070, RTX 3060); [DEEPSEEK41.md](DEEPSEEK41.md)"},
-    "nvidia_linux": {"supported": "yes", "hardware": "RTX 30, 40 and 50", "limits": "The package carries RTX 40 code (sm_89); we have not run an RTX 40 card.", "measured": "[DEEPSEEK41.md](DEEPSEEK41.md)"},
-    "nvidia_spark": {"supported": "yes", "hardware": "GB10", "limits": "", "measured": "[DGX_SPARK_LINUX.md](DGX_SPARK_LINUX.md) (2.00 bpw)"},
-    "amd_win": {"supported": "yes", "hardware": "Ryzen AI Max / Strix Halo, gfx1151", "limits": "The package is built for gfx1151. Other AMD cards on Windows: nothing is claimed.", "measured": "[STRIX_HALO.md](STRIX_HALO.md#deepseek-v41-flash)"},
-    "amd_linux": {"supported": "yes", "hardware": "Radeon AI PRO R9700", "limits": "The RX 9070 (gfx1200) uses the same package and is untested. Ryzen AI Max (Strix Halo) on Linux has no DeepSeek package.", "measured": "[README](../README.md) speed table (1 and 4 cards); [AMD_HIP.md](AMD_HIP.md)"},
-    "intel_linux": {"supported": "no", "hardware": "", "limits": "No package. DeepSeek does not run on Intel ([INTEL.md](INTEL.md)).", "measured": ""},
-    "mac": {"supported": "yes", "hardware": "64 GB or more, macOS 15 or newer", "limits": "Text; pictures only with an engine that carries the Metal picture reader (marker STRATA_DS4_METAL_VISION_V1, present in the 0.1.58 package). Nothing under 128 GB was run.", "measured": "[DEEPSEEK_MAC.md](DEEPSEEK_MAC.md) (M5 Max, 128 GB)"}
-   }
-  },
-  {
    "id": "qwen38",
    "name": "Qwen3.8-Flash-Next",
    "asset_prefix": "strata-engine-",

@@ -1,5 +1,4 @@
-"""Round 0214: Unsloth's v3.1 Qwen3.8-Flash-Next sets in the Terminal's model names.  UD-IQ1_M is also DeepSeek's set: the bare name stays DeepSeek's (as before),
-the Qwen set is --family unsloth."""
+"""Round 0214: Unsloth's v3.1 Qwen3.8-Flash-Next sets in the Terminal's model names (UD-IQ1_M: the Unsloth set, bare or with --family unsloth)."""
 from __future__ import annotations
 
 import unittest
@@ -25,9 +24,9 @@ class Names(unittest.TestCase):
             self.assertEqual(cat.resolve(m.lower()), ("unsloth", m))
         self.assertEqual(cat.resolve("ud-iq4_xs"), ("unsloth", "UD-IQ4_XS"))
 
-    def test_ud_iq1_m_bare_is_still_deepseeks_and_unsloth_by_family(self):
+    def test_ud_iq1_m_is_the_unsloth_set(self):
         cat = catalog(PC)
-        self.assertEqual(cat.resolve("ud-iq1_m"), ("deepseek41", "UD-IQ1_M"))
+        self.assertEqual(cat.resolve("ud-iq1_m"), ("unsloth", "UD-IQ1_M"))
         self.assertEqual(cat.resolve("ud-iq1_m", "unsloth"), ("unsloth", "UD-IQ1_M"))
 
 

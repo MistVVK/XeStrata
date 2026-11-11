@@ -300,13 +300,6 @@ class OfflineStart(unittest.TestCase):
             self.assertTrue(setup.done(f))
             self.assertIn("sha256 " + "a" * 64, setup.mark_text(f))
 
-    def test_every_shared_deepseek_file_has_a_pin_so_a_copy_made_by_hand_never_needs_the_network(self):
-        """The final boston gate stopped on "cannot reach huggingface.co" at a shared file (the drafter, the metadata shard) that was already
-        in the shared folder with no finish mark: the pin is what lets download() check it here."""
-        for name, base in setup.DSV41_SHARED.items():
-            pin = setup.file_pin(base + name)
-            self.assertIsNotNone(pin, name)
-            self.assertEqual(tuple(pin), tuple(setup.DSV41_ALL_FILES[name]), name)
 
 
 class VsRange(unittest.TestCase):

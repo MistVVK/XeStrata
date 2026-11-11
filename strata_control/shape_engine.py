@@ -245,12 +245,12 @@ def choose(feed, shape: str, hardware: dict, title: str | None = None):
 
 def _prune(shape_root: Path, shape: str, keep_name: str) -> list[str]:
     """Keep the newest `KEEP_VERSIONS` packages of the shape; remove the older ones unless a running engine uses them."""
-    from strata_control import dsv41_paths, longpath
+    from strata_control import folder_use, longpath
     found, _ = ec.scan(shape_root, component_id(shape))
     ordered = sorted(found, key=lambda item: (ec._version_key(item.version), item.root.name), reverse=True)
     removed = []
     for item in ordered[KEEP_VERSIONS:]:
-        if item.root.name == keep_name or dsv41_paths.in_use(item.root):
+        if item.root.name == keep_name or folder_use.in_use(item.root):
             continue
         shutil.rmtree(longpath.long_path(item.root), ignore_errors=True)
         removed.append(item.root.name)

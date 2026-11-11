@@ -21,20 +21,15 @@ class CapabilityTable(unittest.TestCase):
             self.assertTrue(ct.MARK_RE.search(text), p)
             self.assertEqual(ct.render(self.cap, self.release, text), text, p)
 
-    def test_deepseek_on_a_mac_is_packaged_and_marked_supported(self):
-        fam = {f["id"]: f for f in self.cap["families"]}["deepseek41"]
-        self.assertTrue(ct.packages(self.release, fam).get("mac"))
-        self.assertEqual(fam["cells"]["mac"]["supported"], "yes")
-
     def test_a_package_contradicts_a_no(self):
         cap = copy.deepcopy(self.cap)
-        {f["id"]: f for f in cap["families"]}["deepseek41"]["cells"]["mac"]["supported"] = "no"
+        {f["id"]: f for f in cap["families"]}["qwen38"]["cells"]["mac"]["supported"] = "no"
         problems = ct.validate(cap, self.release)
-        self.assertTrue(any("deepseek41 on mac is marked 'no'" in p for p in problems), problems)
+        self.assertTrue(any("qwen38 on mac is marked 'no'" in p for p in problems), problems)
 
     def test_a_yes_without_a_package_is_reported(self):
         cap = copy.deepcopy(self.cap)
-        {f["id"]: f for f in cap["families"]}["deepseek41"]["cells"]["intel_linux"]["supported"] = "yes"
+        {f["id"]: f for f in cap["families"]}["qwen36"]["cells"]["intel_linux"]["supported"] = "yes"
         problems = ct.validate(cap, self.release)
         self.assertTrue(any("no package for it" in p for p in problems), problems)
 

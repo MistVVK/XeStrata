@@ -15,7 +15,6 @@ import { downloadCounter, modelFolderLabel, onboardingError } from '../lib/onboa
 import { installProgress, installStage, stageText, useDownloadEta, waitingText } from '../lib/download-eta';
 import { VersionPicker } from './VersionPicker';
 import { contextIsTight, defaultContext } from '../lib/default-context';
-import { deepseekContexts } from '../lib/deepseek-context';
 import { contextCacheGb } from '../lib/native-fit';
 import { FirstRunLanguage } from './FirstRunLanguage';
 import { DownloadParts } from './DownloadParts';
@@ -26,15 +25,6 @@ type Choices = NonNullable<NonNullable<SetupState['choices']>['onboarding']>;
 function radioKeys(event: KeyboardEvent<HTMLDivElement>) { if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key))
     return; event.preventDefault(); const items = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>('[role=radio]')); const current = items.indexOf(event.target as HTMLButtonElement); const next = event.key === 'Home' ? 0 : event.key === 'End' ? items.length - 1 : (current + (['ArrowLeft', 'ArrowUp'].includes(event.key) ? -1 : 1) + items.length) % items.length; items[next]?.focus(); items[next]?.click(); }
 const steps = ['Welcome', 'Your model', 'Prepare', 'Make it yours'];
-/** What a person is told before choosing DeepSeek: the size, where it runs, how fast, what it needs. Every line is a warning or a fact; nothing here stops the download. */
-function DeepSeekNote({ version, plan }: { version: NonNullable<ReturnType<typeof nativeCatalogModels>[number]['sizes'][number]>; plan: Record<string, any> | null }) {
-    void plan;   // the plan's own disk line repeats what the version says in on_this_pc
-    return <div className="engine-warning" role="status"><Icon name="info" size={18}/><div>
-        <p>{tr("This is a very large model. The download is {0} GB and it needs about as much free disk space. It runs on NVIDIA RTX 30, 40 and 50 cards, on a Radeon AI PRO R9700 (Linux) or on a Ryzen AI Max / Strix Halo PC (Windows); how fast it is depends on the memory and card (the line below says what to expect on this computer). What does not fit in memory is read from your SSD, so an NVMe drive matters.", [Math.round(version.download_gb)])}</p>
-        {version.on_this_pc ? <p className="small muted">{version.on_this_pc}</p> : null}
-        <p className="small muted">{tr("You can stop the download and continue later; it picks up where it stopped. Strata warns you here but never blocks you.")}</p>
-    </div></div>;
-}
 export function GuidedSetup() {
     const native = useNative(), setup = useStore(s => s.setup), hardware = useStore(s => s.hardware);
     const families = nativeCatalogModels(native?.catalog?.families ?? []);
@@ -47,7 +37,7 @@ export function GuidedSetup() {
     const start = startingChoice(families, (native?.installed?.models ?? []).filter(m => m.ready).map(m => m.model), native?.catalog?.recommendation);
     const family = chosenFamily || start?.family || native?.catalog?.recommendation?.family || families[0]?.family || '';
     const size = chosenSize || start?.size || '';
-    /* 128K for every configuration unless the person picks another, on every card and for DeepSeek too (its pack's own limit allows it). The warning for a card
+    /* 128K for every configuration unless the person picks another, on every card. The warning for a card
        it leaves little room on is under the chooser; nothing is lowered. */
     const topCardGb = Math.max(0, ...(native?.hardware?.gpus ?? []).filter(g => g.usable !== false).map(g => g.vram_gb));
     const [pickedContext, setContext] = useState<number | undefined>(saved?.context), [contextTouched, setContextTouched] = useState(false);
@@ -60,7 +50,7 @@ export function GuidedSetup() {
     const selectedFamily = families.find(f => f.family === family || f.sizes.some(size => size.sourceFamily === family)) ?? families[0];
     const version = selectedFamily?.sizes.find(s => s.id === size) ?? selectedFamily?.sizes[0];
     const installed = native?.installed?.models.find(m => m.model === version?.id);
-    const contextList = version?.multi_file ? deepseekContexts(installed?.contextMax) : native?.catalog?.contexts ?? [131072];
+    const contextList = native?.catalog?.contexts ?? [131072];
     const context = pickedContext ?? defaultContext(contextList);
     const installJob = native?.jobs.find(j => j.id === installJobId) ?? (step === 3 ? native?.jobs.find(j => j.kind === 'install' && j.state === 'running' && j.guided && j.model === version?.model) : undefined), tuneJob = native?.jobs.find(j => j.id === tuneJobId) ?? (step === 4 ? native?.jobs.find(j => j.kind === 'tune' && j.state === 'running' && j.guided && j.model === version?.id) : undefined);
     const active = native?.jobs.find(j => j.state === 'running');
@@ -176,7 +166,7 @@ export function GuidedSetup() {
     }
     async function tune() {
         await perform(async () => {
-            const result = await nativeAction<NativeJob>('operations', { kind: 'tune', args: { guided: true, model: version?.id, profile, calibrate: calibrate && !version?.multi_file, vision: version?.images && vision ? 'yes' : 'no', multiple: false } });
+            const result = await nativeAction<NativeJob>('operations', { kind: 'tune', args: { guided: true, model: version?.id, profile, calibrate, vision: version?.images && vision ? 'yes' : 'no', multiple: false } });
             setTuneJobId(result.id);
             await persist(4, { tuneJobId: result.id });
         });
@@ -227,7 +217,6 @@ export function GuidedSetup() {
      {tr(contextIsTight(topCardGb, context, 'int8', version?.context_fit) ? <p className="small muted native-spill-note"><Icon name="warning" size={16}/>{tr("This much context takes about {0} GB of graphics memory and leaves little room for the model on this card. Strata will try it; if it does not start, choose a shorter context.", [contextCacheGb(context, 'int8', version?.context_fit).toFixed(1)])}</p> : null)}
      <OnboardingMemory hardware={hardware} native={native?.hardware}/>{tr(!version || version.needsNewerEngine ? <p className="small muted">{tr("This model needs a newer engine. Update your engine or import a local GGUF for this model.")}</p> : null)}
      <div className="onboard-version-heading"><strong>{tr("Choose a version")}</strong><span>{tr(version ? `${catalogVersionLabel(version)} selected` : '')}</span></div>
-     {tr(version?.multi_file ? <DeepSeekNote version={version} plan={plan}/> : null)}
      <div className="onboard-versions" role="radiogroup" aria-label={tr("Model version")} onKeyDown={radioKeys}>{tr(cards.map(v => versionCard(v)))}</div>
      {tr(others.length ? <div className="onboard-more-versions"><VersionPicker versions={others} selectedId={version?.id ?? ''} hardware={hardware ? { ram_gb: native?.hardware?.ram_gb ?? hardware.memory.totalGb, vram_gb: cardRoomGb((native?.hardware?.gpus ?? []).filter(g => g.usable !== false)) } : null} downloaded={readyIds} showRecommended={false} moreLabel="More versions" onSelect={id => { setSize(id); setPlan(null); }} onOwnGguf={() => void ownModel()}/></div> : null)}
      <div className="onboard-folder"><Icon name="folder" size={20}/><div><strong>{tr(directory ? 'Your model folder' : 'Already downloaded the model?')}</strong><small>{tr(directory || "Choose the folder and we'll start your models with Strata.")}</small></div><Btn size="sm" onClick={() => setFolderOpen(v => !v)}>{tr(folderOpen ? 'Close' : directory ? 'Change' : 'Choose folder')}</Btn></div>

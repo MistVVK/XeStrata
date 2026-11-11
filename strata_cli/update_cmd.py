@@ -96,17 +96,18 @@ def add_parsers(sp, components_sp) -> list:
 
 
 class _EngineFamilies(tuple):
-    """The --family values of `strata components use | remove`: qwen, deepseek, and the engine of a Qwen4 model shape as shape:<shape> (what the app
-    passes, strata_control/engine_library.py SHAPE_PREFIX). Help and error texts list the two as before."""
+    """The --family values of `strata components use | remove`: qwen, and the engine of a Qwen4 model shape as shape:<shape> (what the app
+    passes, strata_control/engine_library.py SHAPE_PREFIX). "deepseek" is accepted but not listed: engine_library answers it in plain words
+    (strata_control/retired.py)."""
 
     def __contains__(self, value) -> bool:
         if tuple.__contains__(self, value):
             return True
-        from strata_control import engine_library
-        return engine_library.shape_of_family(value) is not None
+        from strata_control import engine_library, retired
+        return engine_library.shape_of_family(value) is not None or retired.is_name(value)
 
 
-_ENGINE_FAMILIES = _EngineFamilies(("qwen", "deepseek"))
+_ENGINE_FAMILIES = _EngineFamilies(("qwen",))
 
 
 def _emit_factory(a, lines: list):
@@ -183,17 +184,6 @@ def _line(name: str, result: dict) -> str:
         if status == "failed":
             return f"{name:<8}{before or 'none'}   NOT changed: {result.get('error')}"
         return f"{name:<8}{before or 'none'}   {result.get('note') or status}"
-    if result.get("component") == "dsv41":
-        if status == "none-installed":
-            return f"{name:<8}no DeepSeek engine installed"
-        before, after = result.get("installed_before"), result.get("installed_after")
-        if status == "updated":
-            return f"{name:<8}{before} -> {after}   updated (tested: it starts). {result.get('note') or ''}".rstrip()
-        if status == "current":
-            return f"{name:<8}{before}   up to date"
-        if status == "failed":
-            return f"{name:<8}{before or '?'}   NOT changed: {result.get('error')}"
-        return f"{name:<8}{before or '?'}   {result.get('note') or status}"
     if result.get("shape"):                              # the engine of a model shape (strata_control/shape_engine.py)
         from strata_control import shape_engine
         if status == "failed":
@@ -242,9 +232,6 @@ def _print_check(report: dict) -> None:
         print("  Control  not part of this feed")
     else:
         print(f"  Control  {ctl['installed'] or _source_version() or '?'}: {ctl['status']}" + (f" ({ctl['offered']})" if ctl["offered"] else ""))
-    ds = report.get("dsv41") or {}
-    if ds.get("status") not in (None, "none-installed"):
-        print(f"  DeepSeek {ds.get('installed')}: " + (f"update available -> {ds['offered']} ({_mib(ds['download_bytes'])})" if ds["status"] == "available" else ds["status"]))
     if app["status"] != "not-in-feed":
         if app["status"] == "unknown-installed":
             print(f"  App      latest is {app['offered']}; this terminal cannot tell which version of the app is installed (the app checks itself)")
@@ -254,7 +241,7 @@ def _print_check(report: dict) -> None:
         from strata_control import engine_update
         names = ", ".join(m.label for m in engine_update.running_models(report["serving"]))
         print(f"  {names} is running. An update asks before it stops it, downloads while it keeps serving, and asks whether to start it again.")
-    if (eng.get("status") in ("available", "install") or ds.get("status") == "available") and not report.get("serving"):
+    if eng.get("status") in ("available", "install") and not report.get("serving"):
         print("  To update: strata update")
 
 

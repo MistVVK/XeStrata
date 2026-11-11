@@ -348,7 +348,6 @@ class SharedArena(unittest.TestCase):
             for flag in ("--mmap-experts", "--resident-experts", "--resident-budget-gib", "--shared-expert-arena"):
                 self.assertIsNone(self.plan({**self.CFG, "args": ["--pack", "/p", flag]}, tmp=d)[0], flag)
             self.assertIsNone(self.plan({**self.CFG, "replicas": [{"gpus": [0], "args": ["--mmap-experts"]}, {"gpus": [1]}]}, tmp=d)[0])
-            self.assertIsNone(self.plan({**self.CFG, "arch": "deepseek41"}, tmp=d)[0])
 
     def test_no_room_or_no_shm_says_so_and_falls_back(self):
         with tempfile.TemporaryDirectory() as d:

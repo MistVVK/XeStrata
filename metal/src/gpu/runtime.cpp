@@ -24,21 +24,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
-#if defined(STRATA_DS4_RUNTIME)
-#include <cstdlib>
-#endif
 #include <cstring>
 #include <iterator>
 #include <map>
-#if defined(STRATA_DS4_RUNTIME)
-#include <mutex>   // recursive_mutex
-#else
 #include <mutex>
-#endif
 #include <thread>
-#if defined(STRATA_DS4_RUNTIME)
-#include <algorithm>
-#endif
 #include <vector>
 
 namespace strata::gpu {
@@ -76,9 +66,6 @@ struct Op {
 struct EventImpl {
     MTL::SharedEvent* ev = nullptr;   // the recording stream's timeline
     uint64_t value = 0;               // 0: never recorded (complete, as a fresh CUDA event)
-#if defined(STRATA_DS4_RUNTIME)
-    void* token = nullptr;            // a mark on the context's queue (ds4_ctx_mark), released by the wait
-#endif
 };
 
 struct GraphImpl {
@@ -131,16 +118,8 @@ Error fail(Error e) {
     return e;
 }
 
-#if defined(STRATA_DS4_RUNTIME)
-static std::vector<StreamImpl*> g_all_streams;   // every stream's queue holds pending copies until it is committed
-static std::mutex g_all_streams_mu;
-
-#endif
 StreamImpl* make_stream() {
     auto* s = new StreamImpl;
-#if defined(STRATA_DS4_RUNTIME)
-    { std::lock_guard<std::mutex> lk(g_all_streams_mu); g_all_streams.push_back(s); }
-#endif
     s->q = rt().dev->newCommandQueue();
     s->q->addResidencySet(rt().rs);
     s->tl = rt().dev->newSharedEvent();
@@ -175,83 +154,30 @@ const Alloc* find(const void* p, size_t* off) {
     return nullptr;
 }
 
-#if defined(STRATA_DS4_RUNTIME)
-// The engine's host threads (the prompt path, the loader, the expert cache) have no autorelease pool, and metal-cpp's
-// commandBuffer() / computeCommandEncoder() / blitCommandEncoder() hand back autoreleased objects: with no pool that last reference was
-// never given back, so every command buffer and encoder stayed alive with the buffers it had named (~800 command buffers a
-// long prompt).  A pool around each creation (and, for the blits, around the whole encode) gives it back.
-struct ScopedPool {
-    NS::AutoreleasePool* p;
-    ScopedPool() : p(NS::AutoreleasePool::alloc()->init()) {}
-    ~ScopedPool() { p->release(); }
-};
-#endif
 MTL::CommandBuffer* open_cb(StreamImpl* s) {
     if (!s->cb) {
-#if defined(STRATA_DS4_RUNTIME)
-        ScopedPool pool;
-#endif
         s->cb = s->q->commandBufferWithUnretainedReferences();
         s->cb->retain();
         ++rt().stats.command_buffers;
     }
     return s->cb;
 }
-#if defined(STRATA_DS4_RUNTIME)
-// StreamImpl's encoder/command-buffer state is touched from the loader, the prefetcher and the compute path.
-// Without this lock two encoders can be open on one command buffer at once, which Metal asserts on.
-static std::recursive_mutex g_stream_mu;   // encode_copy/flush nest
-
-#endif
 void end_encoder(StreamImpl* s) {
-#if defined(STRATA_DS4_RUNTIME)
-    if (s->enc) { if (std::getenv("STRATA_GPU_TRACE")) std::fprintf(stderr, "[gpu] close compute enc %p\n", (void*) s->enc);
-        s->enc->endEncoding(); s->enc->release(); s->enc = nullptr; }
-#else
     if (s->enc) { s->enc->endEncoding(); s->enc = nullptr; }
-#endif
 }
 MTL::ComputeCommandEncoder* encoder(StreamImpl* s) {
-#if defined(STRATA_DS4_RUNTIME)
-        std::lock_guard<std::recursive_mutex> lk(g_stream_mu);
-    if (!s->enc) {
-        MTL::CommandBuffer* cb = open_cb(s);
-        { ScopedPool pool; s->enc = cb->computeCommandEncoder(); s->enc->retain(); }   // (released in end_encoder)
-        if (std::getenv("STRATA_GPU_TRACE")) std::fprintf(stderr, "[gpu] open compute enc %p (cb %p)\n", (void*) s->enc, (void*) s->cb); }   // serial dispatch: each dispatch sees the last
-#else
     if (!s->enc) s->enc = open_cb(s)->computeCommandEncoder();   // serial dispatch: each dispatch sees the last
-#endif
     return s->enc;
 }
 void flush(StreamImpl* s) {
-#if defined(STRATA_DS4_RUNTIME)
-    std::lock_guard<std::recursive_mutex> lk(g_stream_mu);
-#endif
     if (!s->cb) return;
     end_encoder(s);
-#if defined(STRATA_DS4_RUNTIME)
-    if (std::getenv("STRATA_GPU_TRACE")) std::fprintf(stderr, "[gpu] signal %llu on cb %p (enc %p)\n",
-                                 (unsigned long long) (s->submitted + 1), (void*) s->cb, (void*) s->enc);
-#endif
     s->cb->encodeSignalEvent(s->tl, ++s->submitted);
     s->cb->commit();
     s->cb->release();
     s->cb = nullptr;
     s->pending = 0;
 }
-#if defined(STRATA_DS4_RUNTIME)
-extern "C" void ds4_metal_flush();
-extern "C" bool ds4_ctx_copy(void* dst, const void* src, size_t n) __attribute__((weak_import));
-extern "C" bool ds4_ctx_fill(void* dst, int value, size_t n) __attribute__((weak_import));
-extern "C" void* ds4_ctx_mark() __attribute__((weak_import));
-extern "C" void ds4_ctx_wait(void* token) __attribute__((weak_import));
-extern "C" void ds4_ctx_drop(void* token) __attribute__((weak_import));
-static bool ctx_queue_ops() {   // DS4_STREAM_COPIES=1: the old way (a copy on a stream's own queue, a full barrier each)
-    static const bool on = ds4_ctx_copy != nullptr && std::getenv("DS4_STREAM_COPIES") == nullptr;
-    return on;
-}
-
-#endif
 Error wait_value(MTL::SharedEvent* ev, uint64_t v) {
     while (ev->signaledValue() < v) std::this_thread::yield();
     ++rt().stats.host_syncs;
@@ -269,9 +195,6 @@ void check_purged(const Alloc* a, const char* what) {
 }
 
 Error encode_copy(StreamImpl* s, void* dst, const void* src, size_t n) {
-#if defined(STRATA_DS4_RUNTIME)
-    std::lock_guard<std::recursive_mutex> lk(g_stream_mu);
-#endif
     size_t od = 0, os = 0;
     const Alloc* ad = find(dst, &od);
     const Alloc* as = find(src, &os);
@@ -279,13 +202,7 @@ Error encode_copy(StreamImpl* s, void* dst, const void* src, size_t n) {
     check_purged(as, "copy");
     if (ad && as) {   // buffer to buffer: a blit, in stream order
         end_encoder(s);
-#if defined(STRATA_DS4_RUNTIME)
-        ScopedPool pool;
-#endif
         MTL::BlitCommandEncoder* b = open_cb(s)->blitCommandEncoder();
-#if defined(STRATA_DS4_RUNTIME)
-        if (std::getenv("STRATA_GPU_TRACE")) std::fprintf(stderr, "[gpu] blit copy %zu\n", n);
-#endif
         b->copyFromBuffer(as->buf, os, ad->buf, od, n);
         b->endEncoding();
         ++rt().stats.blits;
@@ -302,17 +219,11 @@ Error encode_copy(StreamImpl* s, void* dst, const void* src, size_t n) {
 }
 
 Error encode_fill(StreamImpl* s, void* p, int value, size_t n) {
-#if defined(STRATA_DS4_RUNTIME)
-    std::lock_guard<std::recursive_mutex> lk(g_stream_mu);
-#endif
     size_t off = 0;
     const Alloc* a = find(p, &off);
     if (!a) return fail(kErrorInvalidValue);
     check_purged(a, "fill");
     end_encoder(s);
-#if defined(STRATA_DS4_RUNTIME)
-    ScopedPool pool;
-#endif
     MTL::BlitCommandEncoder* b = open_cb(s)->blitCommandEncoder();
     b->fillBuffer(a->buf, NS::Range::Make(off, n), (uint8_t) value);
     b->endEncoding();
@@ -321,9 +232,6 @@ Error encode_fill(StreamImpl* s, void* p, int value, size_t n) {
 }
 
 Error encode_dispatch(StreamImpl* s, const Op& o) {
-#if defined(STRATA_DS4_RUNTIME)
-    std::lock_guard<std::recursive_mutex> lk(g_stream_mu);
-#endif
     MTL::ComputeCommandEncoder* e = encoder(s);
     e->setComputePipelineState(o.pipe);
     if (o.big_args.empty()) e->setBytes(o.args, o.arg_bytes, 0);
@@ -369,12 +277,7 @@ void alloc_log(const char* what, size_t n) {
 
 Error new_alloc(void** p, size_t bytes, bool host) {
     Runtime& r = rt();
-#if defined(STRATA_DS4_RUNTIME)
-    const size_t pg = 16384, want = bytes ? bytes : 1;
-    const size_t n = std::getenv("DS4_NO_PAD") ? want : ((want + pg - 1) / pg) * pg;
-#else
     const size_t n = bytes ? bytes : 1;
-#endif
     MTL::Buffer* b = r.dev->newBuffer(n, MTL::ResourceStorageModeShared | MTL::ResourceHazardTrackingModeUntracked);
     if (!b) return fail(kErrorMemoryAllocation);
     Alloc a{b, b->gpuAddress(), (uint8_t*) b->contents(), n, host};
@@ -396,9 +299,6 @@ Error free_alloc(void* p) {
     size_t off = 0;
     const Alloc* a = find(p, &off);
     if (!a || off != 0) return fail(kErrorInvalidValue);
-#if defined(STRATA_DS4_RUNTIME)
-    if (std::getenv("DS4_TRACE_FREE")) std::fprintf(stderr, "gpu free %zu bytes (host=%d) at %p\n", a->bytes, (int) a->host, p);
-#endif
     device_synchronize();   // as cudaFree: the GPU is done with it
     std::lock_guard<std::mutex> lk(r.mu);
     MTL::Buffer* b = a->buf;
@@ -414,22 +314,6 @@ Error free_alloc(void* p) {
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------------- runtime.hpp
-#if defined(STRATA_DS4_RUNTIME)
-void* buffer_for_cpu_impl(const void* cpu, size_t bytes, size_t* off) {
-    Runtime& r = rt();
-    std::lock_guard<std::mutex> lk(r.mu);
-    auto ic = r.by_cpu.upper_bound((uintptr_t) cpu);
-    if (ic == r.by_cpu.begin()) return nullptr;
-    --ic;
-    const Alloc& a = r.by_gpu[ic->second];
-    if ((uintptr_t) cpu < ic->first || (uintptr_t) cpu + bytes > ic->first + a.bytes) return nullptr;
-    *off = (uintptr_t) cpu - ic->first;
-    return (void*) a.buf;
-}
-
-MTL::ResidencySet* residency_set_impl() { return rt().rs; }
-
-#endif
 void* host_view(const void* p) {
     size_t off = 0;
     const Alloc* a = find(p, &off);
@@ -474,9 +358,6 @@ Error get_device(int* dev) { *dev = 0; return kSuccess; }
 Error set_device(int dev) { return dev == 0 ? kSuccess : fail(kErrorInvalidValue); }
 Error device_count(int* n) { *n = rt().dev ? 1 : 0; return kSuccess; }
 Error device_synchronize() {
-#if defined(STRATA_DS4_RUNTIME)
-    ds4_metal_flush();
-#endif
     Runtime& r = rt();
     StreamImpl* s = S(nullptr);
     flush(s);
@@ -546,30 +427,7 @@ Error host_device_pointer_raw(void** dev, void* host) {
     *dev = (void*) (uintptr_t) (a->gpu + off);
     return kSuccess;
 }
-#if defined(STRATA_DS4_RUNTIME)
-// A synchronising call is a barrier for BOTH queues: the dispatches deferred in mtl_rt's command buffer have to run before
-// the host reads or overwrites what they touch (a window's last layers still pending while the next window's embedding rows
-// are copied over the buffer its embed reads, measured: window 2's residual stream was window 1's stale tail).
-// commit every stream's pending copies/fills, then wait for all of them (commit first: a stream may wait on another's event)
-extern "C" void ds4_gpu_sync_all_streams() {
-    std::vector<StreamImpl*> v;
-    { std::lock_guard<std::mutex> lk(g_all_streams_mu); v = g_all_streams; }
-    for (StreamImpl* s : v) if (!s->rec) flush(s);
-    for (StreamImpl* s : v) if (!s->rec) wait_value(s->tl, s->submitted);
-}
-static thread_local bool t_in_barrier = false;
-static void both_queues_barrier() {
-    if (t_in_barrier) return;
-    t_in_barrier = true;
-    ds4_metal_flush();
-    t_in_barrier = false;
-}
-
-#endif
 Error memset_device(void* p, int value, size_t bytes) {
-#if defined(STRATA_DS4_RUNTIME)
-    both_queues_barrier();
-#endif
     StreamImpl* s = S(nullptr);
     const Error e = encode_fill(s, p, value, bytes);
     flush(s);
@@ -577,13 +435,6 @@ Error memset_device(void* p, int value, size_t bytes) {
     return e;
 }
 Error memset_async(void* p, int value, size_t bytes, Stream st) {
-#if defined(STRATA_DS4_RUNTIME)
-    if (!S(st)->rec && ctx_queue_ops() && bytes > 0) {
-        size_t o1 = 0;
-        if (find(p, &o1) && ds4_ctx_fill(p, value, bytes)) return kSuccess;
-    }
-    if (!S(st)->rec && !std::getenv("DS4_NO_QBARRIER")) both_queues_barrier();
-#endif
     StreamImpl* s = S(st);
     if (s->rec) {
         Op o;
@@ -595,9 +446,6 @@ Error memset_async(void* p, int value, size_t bytes, Stream st) {
 }
 
 Error memcpy_sync(void* dst, const void* src, size_t bytes, CopyKind) {
-#if defined(STRATA_DS4_RUNTIME)
-    both_queues_barrier();
-#endif
     StreamImpl* s = S(nullptr);
     const Error e = encode_copy(s, dst, src, bytes);
     flush(s);
@@ -616,13 +464,6 @@ Error memcpy_peer_async(void* dst, int dst_dev, const void* src, int src_dev, si
     return memcpy_async(dst, src, bytes, kDeviceToDevice, st);
 }
 Error memcpy_async(void* dst, const void* src, size_t bytes, CopyKind, Stream st) {
-#if defined(STRATA_DS4_RUNTIME)
-    if (!S(st)->rec && ctx_queue_ops() && bytes > 0) {
-        size_t o1 = 0, o2 = 0;
-        if (find(dst, &o1) && find(src, &o2) && ds4_ctx_copy(dst, src, bytes)) return kSuccess;
-    }
-    if (!S(st)->rec && !std::getenv("DS4_NO_QBARRIER")) both_queues_barrier();
-#endif
     StreamImpl* s = S(st);
     if (s->rec) {
         Op o;
@@ -638,19 +479,12 @@ Error stream_destroy(Stream s) {
     if (!s) return kSuccess;
     flush(s);
     wait_value(s->tl, s->submitted);
-#if defined(STRATA_DS4_RUNTIME)
-    { std::lock_guard<std::mutex> lk(g_all_streams_mu);
-      g_all_streams.erase(std::remove(g_all_streams.begin(), g_all_streams.end(), s), g_all_streams.end()); }
-#endif
     s->tl->release();
     s->q->release();
     delete s;
     return kSuccess;
 }
 Error stream_synchronize(Stream st) {
-#if defined(STRATA_DS4_RUNTIME)
-    both_queues_barrier();
-#endif
     StreamImpl* s = S(st);
     flush(s);
     return wait_value(s->tl, s->submitted);
@@ -683,22 +517,10 @@ Error launch_host_func(Stream st, HostFn fn, void* arg) {
 
 Error event_create(Event* e, unsigned) { *e = new EventImpl; return kSuccess; }
 Error event_destroy(Event e) {
-#if defined(STRATA_DS4_RUNTIME)
-    if (e && e->token && ds4_ctx_drop) { ds4_ctx_drop(e->token); e->token = nullptr; }   // (a mark nobody waited for holds its command buffer)
-#endif
     delete e;
     return kSuccess;
 }
 Error event_record(Event e, Stream st) {
-#if defined(STRATA_DS4_RUNTIME)
-    if (ctx_queue_ops() && !S(st)->rec) {   // the work the event follows is in the context's command buffer: end it, wait later
-        if (e->token && ds4_ctx_drop) ds4_ctx_drop(e->token);   // (recorded again before it was waited for: the earlier mark would leak its command buffer)
-        e->token = ds4_ctx_mark();
-        e->ev = nullptr;
-        e->value = 0;
-        return kSuccess;
-    }
-#endif
     StreamImpl* s = S(st);
     if (s->rec) {
         Op o;
@@ -708,24 +530,8 @@ Error event_record(Event e, Stream st) {
     }
     return record_event(e, s);
 }
-#if defined(STRATA_DS4_RUNTIME)
-Error event_query(Event e) {
-    if (e->token) return kNotReady;   // (a mark waits for its wait)
-    return !e->ev || e->ev->signaledValue() >= e->value ? kSuccess : kNotReady;
-}
-Error event_synchronize(Event e) {
-    if (e->token) {
-        void* t = e->token;
-        e->token = nullptr;
-        ds4_ctx_wait(t);
-        return kSuccess;
-    }
-    return e->ev ? wait_value(e->ev, e->value) : kSuccess;
-}
-#else
 Error event_query(Event e) { return !e->ev || e->ev->signaledValue() >= e->value ? kSuccess : kNotReady; }
 Error event_synchronize(Event e) { return e->ev ? wait_value(e->ev, e->value) : kSuccess; }
-#endif
 Error event_elapsed_ms(float* ms, Event, Event) { *ms = 0.0f; return fail(kErrorUnsupported); }
 
 Error begin_capture(Stream st) {
@@ -835,23 +641,3 @@ Stats stats() { return rt().stats; }
 
 }  // namespace metal
 }  // namespace strata::gpu
-
-#if defined(STRATA_DS4_RUNTIME)
-extern "C" void* ds4_gpu_buffer_for_cpu(const void* cpu, size_t bytes, size_t* off) {
-    return strata::gpu::buffer_for_cpu_impl(cpu, bytes, off);
-}
-
-// The residency set every strata::gpu stream queue carries: the Context's queue (mtl_rt) needs it too, because kernels
-// dereference raw gpuAddresses (weights, ring buffers, job arrays) that no setBuffer names, and memory that is not resident
-// reads as zeros.
-extern "C" void* ds4_gpu_residency_set() { return (void*) strata::gpu::residency_set_impl(); }
-
-// bytes from `cpu` to the end of the allocation that holds it (0: not an allocation)
-extern "C" size_t ds4_gpu_alloc_remaining(const void* cpu) {
-    size_t off = 0;
-    void* b = strata::gpu::buffer_for_cpu_impl(cpu, 1, &off);
-    if (!b) return 0;
-    return ((MTL::Buffer*) b)->length() - off;
-}
-
-#endif

@@ -8,7 +8,6 @@
 | --- | --- |
 | Install or update | [Desktop app and Terminal](INSTALL.md) |
 | Choose a model and check memory | [Models and quantizations](MODELS.md) |
-| Run DeepSeek V4.1-Flash (app and Terminal) | [DeepSeek V4.1-Flash](MODELS.md#deepseek-v41-flash) |
 | See which model runs on which hardware | [Model and hardware table](CAPABILITIES.md) |
 | Start from the command line | [Terminal launch](TERMINAL_LAUNCH.md) |
 | Connect a coding tool | [Tool connections](TERMINAL_LAUNCH.md#connect-your-apps-strata-connect) |

@@ -2,7 +2,7 @@
 
 Setup writes absolute paths into the run config: ``cwd`` and ``--expert-profile`` into the Control bundle that ran it
 (``<components>/control/<version>/...``), the picture reader and library folders into an engine package
-(``<components>/engine/<version>-<platform>-<backend>/...``), the DeepSeek engine into ``engine-dsv41/<version>-.../``.  An update puts the new version
+(``<components>/engine/<version>-<platform>-<backend>/...``).  An update puts the new version
 beside the old one and removes the versions older than the one before, so the second update after a model was set up deleted the folders its config
 names: the model showed as "not installed" and a start failed (#4891; "Qwen breaks each time Strata is updated").
 
@@ -13,7 +13,7 @@ One resolver, used by both sides:
 * ``repair(configs)`` (runtime.start calls it for the profile being started and every saved profile): the same, written once into the file, one plain
   line for each file it changed.
 
-Only paths in Strata's own folders are touched (``components/control``, ``components/engine``, ``engine-dsv41``), and only when the version folder they
+Only paths in Strata's own folders are touched (``components/control``, ``components/engine``), and only when the version folder they
 name is GONE; a path the person typed themselves, a model or pack folder, or a version folder that still exists is left exactly as it is.  A path whose
 file is nowhere in the current version either is not guessed: ``unresolved`` names it.
 """
@@ -26,7 +26,6 @@ from pathlib import Path
 
 _SEP = r"[\\/]"
 _COMPONENT = re.compile(rf"^(?P<head>.*?{_SEP}components{_SEP})(?P<kind>control|engine){_SEP}(?P<ver>[^\\/]+)(?P<rest>(?:{_SEP}.*)?)$", re.S)
-_DSV41 = re.compile(rf"^(?P<head>.*?{_SEP}engine-dsv41{_SEP})(?P<ver>[^\\/]+)(?P<rest>(?:{_SEP}.*)?)$", re.S)
 _VERSION = re.compile(r"^\d+(?:\.\d+)+")
 SKIP_KEYS = ("log",)                      # paths the engine writes, not reads
 SKIP_FLAGS = ("--expert-profile-save",)
@@ -71,22 +70,14 @@ def resolve_path(value: str) -> tuple[str, bool] | None:
     if not isinstance(value, str) or len(value) < 8 or "\n" in value:
         return None
     m = _COMPONENT.match(value)
-    if m:
-        old = Path(m["head"] + m["kind"] + os.sep + m["ver"])
-        if old.exists() or not _VERSION.match(m["ver"]):
-            return None
-        root = _components() / m["kind"]
-        current = _active_control(root) if m["kind"] == "control" else _newest(root, _kind_of(m["ver"]))
-        rest = m["rest"].lstrip("\\/")
-    else:
-        m = _DSV41.match(value)
-        if not m:
-            return None
-        old = Path(m["head"] + m["ver"])
-        if old.exists() or not _VERSION.match(m["ver"]):
-            return None
-        current = _newest(Path(m["head"]), _kind_of(m["ver"]))
-        rest = m["rest"].lstrip("\\/")
+    if not m:
+        return None
+    old = Path(m["head"] + m["kind"] + os.sep + m["ver"])
+    if old.exists() or not _VERSION.match(m["ver"]):
+        return None
+    root = _components() / m["kind"]
+    current = _active_control(root) if m["kind"] == "control" else _newest(root, _kind_of(m["ver"]))
+    rest = m["rest"].lstrip("\\/")
     if current is None:
         return value, False
     new = current / rest if rest else current
@@ -120,6 +111,19 @@ def resolve_config(cfg: dict) -> tuple[dict, list, list]:
     return _walk(cfg, found, lost), found, [(old, "") for old, _ in lost]
 
 
+def saved_configs() -> list[Path]:
+    """The run config of every saved profile (app-1, app-2, launch-...): the files a start reads."""
+    from strata_control import profiles
+    out = []
+    try:
+        for p in profiles.list_profiles():
+            if isinstance(p.get("source_config"), str):
+                out.append(Path(p["source_config"]))
+    except Exception:                                    # noqa: BLE001 - informational
+        pass
+    return out
+
+
 def repair(configs) -> tuple[list[str], list[str]]:
     """For a START: every run config in `configs` is resolved and, when a path changed, written once (atomically, nothing else changed).
     Returns (one plain line for each file changed, one plain line for each path that exists nowhere).  Never raises."""
@@ -137,6 +141,9 @@ def repair(configs) -> tuple[list[str], list[str]]:
             continue
         if not isinstance(cfg, dict):
             continue
+        from strata_control import retired
+        if retired.config_reason(cfg) or retired.config_file_reason(c):
+            continue                                     # a DeepSeek config is never written: this Strata does not run it (retired.py)
         new, found, lost = resolve_config(cfg)
         for old, _ in lost:
             problems.append(f"{c.name}: {old} was removed by an update and no file of that name is in the current version; run setup again for this model")

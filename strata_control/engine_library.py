@@ -3,14 +3,9 @@
 One truth for the app (Settings > Engine) and the Terminal (`strata components engines | use | remove | rollback`). Updates keep every older
 engine (strata_control/updater.py), so a person can go back to an older engine to test something and return to the newest later.
 
-Two families, two mechanisms, one list:
-
-* the Qwen engine (and every model but DeepSeek): packages in ``<components>/engine/<version>-<platform>-<backend>[-<variant>]/``. What a start runs
-  is the pinned package (``.updates/state.json`` engine.pinned), else the newest that fits this PC (engine_component.resolve).
-* the DeepSeek engine (strata-dsv41): packages in ``engine-dsv41/``. A saved profile's run config names its program; the person's choice is the
-  ``.chosen`` file in that folder (dsv41_paths.PIN), which every place that picks a package reads, and the saved configs are pointed at it.
-
-The two never touch each other's files or state: switching or deleting one family leaves the other as it was.
+The Qwen engine (every model): packages in ``<components>/engine/<version>-<platform>-<backend>[-<variant>]/``. What a start runs is the pinned
+package (``.updates/state.json`` engine.pinned), else the newest that fits this PC (engine_component.resolve).  The engine of a model shape has the
+same mechanism in its own folder.  (DeepSeek's engine-dsv41/ folder, from Strata 0.2.13 and earlier, is not listed and never touched here.)
 
 A switch warns, it does not refuse, wherever the engine can run at all. What cannot be switched to is a package this computer cannot run (another
 operating system or make of graphics card, a driver that is too old, damaged files, a Strata that is too old for it). The engine in use cannot be
@@ -23,13 +18,13 @@ import shutil
 import uuid
 from pathlib import Path
 
-from strata_control import dsv41_paths, engine_component as ec, longpath, shape_engine, signing
+from strata_control import engine_component as ec, folder_use, longpath, retired, shape_engine, signing
 from strata_control import updater
 from strata_control.targets import backend_supported, host_platform
 
-QWEN, DEEPSEEK = "qwen", "deepseek"
-FAMILIES = (QWEN, DEEPSEEK)
-TITLES = {QWEN: "Qwen and other models", DEEPSEEK: "DeepSeek"}
+QWEN = "qwen"
+FAMILIES = (QWEN,)
+TITLES = {QWEN: "Qwen and other models"}
 #: The engine of a Qwen4 model shape (strata_control/shape_engine.py): family "shape:<shape>", one per installed shape, listed after the two above. The family
 #: string is an id for the app and the Terminal, never shown: the app titles the group with the model's own catalog title ("title" here is None).
 SHAPE_PREFIX = "shape:"
@@ -94,7 +89,7 @@ def _unfit(item: ec.EngineComponent, *, wanted: str | None, target: str, runtime
 
 def _process_uses(folder: Path) -> bool:
     try:
-        return dsv41_paths.in_use(folder)
+        return folder_use.in_use(folder)
     except Exception:                                   # noqa: BLE001 - unknown means not blocked by this check
         return False
 
@@ -135,45 +130,6 @@ def _qwen_entries(ctx: "updater.Context", root: Path | None = None, component_id
     return rows
 
 
-# ----------------------------------------------------------------------------------------------- DeepSeek engine
-
-def _ds_roots(ctx: "updater.Context") -> list[Path]:
-    try:
-        roots, _configs = updater._dsv41_installs(ctx)
-    except Exception:                                   # noqa: BLE001
-        return []
-    return [r for r in roots if Path(r).is_dir()]
-
-
-def _ds_entries(ctx: "updater.Context") -> list[dict]:
-    wanted = ctx.hardware.get("backend")
-    target = ctx.hardware.get("platform") or host_platform()
-    rows = []
-    for root in _ds_roots(ctx):
-        exes = dsv41_paths.installed(root)
-        by_kind: dict[str, list[Path]] = {}
-        for exe in exes:
-            by_kind.setdefault(dsv41_paths.kind_of(exe.parent.name), []).append(exe)
-        for kind, group in by_kind.items():
-            parts = kind.split("-")
-            platform = "-".join(parts[:2])
-            backend = parts[2] if len(parts) > 2 else ""
-            variant = "-".join(parts[3:])
-            picked = dsv41_paths.chosen(root, kind)
-            fits = (not platform or platform == target) and (not wanted or not backend or backend == wanted)
-            code = None if fits else ("os" if platform and platform != target else "gpu_make")
-            why = None if fits else ("It was made for a different operating system." if code == "os"
-                                     else "It was made for a different kind of graphics card than this computer has.")
-            newest = group[-1]
-            for exe in group:
-                folder = exe.parent
-                rows.append({"family": DEEPSEEK, "folder": folder.name, "root": str(root), "version": _version_of(folder.name), "backend": backend,
-                             "platform": platform, "variant": variant, "bytes": _walk_bytes(folder), "signed": False, "fits": fits, "why_not": why, "why_code": code, "why_args": [],
-                             "active": picked == exe, "newest": exe == newest and fits, "pinned": dsv41_paths.pinned(root) == folder.name,
-                             "build_id": "", "path": longpath.plain(folder)})
-    return rows
-
-
 # ----------------------------------------------------------------------------------------------- the list
 
 def _decorate(rows: list[dict], serving: bool) -> None:
@@ -196,14 +152,12 @@ def list_engines(ctx: "updater.Context") -> dict:
         serving = bool(ctx.serving())
     except Exception:                                   # noqa: BLE001
         serving = False
-    qwen, deepseek = _qwen_entries(ctx), _ds_entries(ctx)
+    qwen = _qwen_entries(ctx)
     shapes = _shape_families(ctx)
-    for rows in (qwen, deepseek, *(f["engines"] for f in shapes)):
+    for rows in (qwen, *(f["engines"] for f in shapes)):
         _decorate(rows, serving)
         rows.sort(key=lambda r: (ec._version_key(r["version"]), r["folder"]), reverse=True)
     families = [{"family": QWEN, "title": TITLES[QWEN], "engines": qwen}]
-    if deepseek:
-        families.append({"family": DEEPSEEK, "title": TITLES[DEEPSEEK], "engines": deepseek})
     families += shapes                                  # none on a PC that never had a model of another shape: the list is what it was
     return {"schema_version": 1, "components_dir": str(ctx.components), "families": families,
             "total_bytes": sum(r["bytes"] for fam in families for r in fam["engines"]), "serving": serving}
@@ -254,8 +208,10 @@ def use_engine(ctx: "updater.Context", family: str, folder: str, root: str | Non
     """Make an installed engine the one that starts from now on. Nothing is downloaded or deleted. Waits for / refuses while a model is running
     (`updater.Busy`, exit 7); the running model keeps the engine it started with. The newest engine is selected without a pin, so it follows updates again."""
     shape = shape_of_family(family)
+    if retired.is_name(family):
+        raise updater.UpdateError(retired.NOT_OFFERED, 2)
     if family not in FAMILIES and shape is None:
-        raise updater.UpdateError("choose the Qwen or the DeepSeek engine", 2)
+        raise updater.UpdateError("choose the Qwen engine", 2)
     if not folder or folder != Path(folder).name or folder.startswith("."):
         raise updater.UpdateError("that is not an installed engine", 2)
     with updater.update_lock(ctx.components):
@@ -265,9 +221,7 @@ def use_engine(ctx: "updater.Context", family: str, folder: str, root: str | Non
             raise SwitchBusy(busy.serving) from None
         if shape is not None:
             return _use_shape(ctx, shape, folder)
-        if family == QWEN:
-            return _use_qwen(ctx, folder)
-        return _use_deepseek(ctx, folder, root)
+        return _use_qwen(ctx, folder)
 
 
 def _use_shape(ctx: "updater.Context", shape: str, folder: str) -> dict:
@@ -339,41 +293,16 @@ def use_qwen_unlocked(ctx: "updater.Context", state: "updater.State", folder: st
     return {**out, "family": QWEN, "changed": True, "status": "switched"}
 
 
-def _use_deepseek(ctx: "updater.Context", folder: str, root: str | None) -> dict:
-    roots = _ds_roots(ctx)
-    chosen_root = next((r for r in roots if str(r) == root), None) if root else (roots[0] if len(roots) == 1 else None)
-    if chosen_root is None:
-        raise updater.UpdateError("that DeepSeek engine is not installed here", 2)
-    exe = Path(chosen_root) / folder / dsv41_paths.exe_name()
-    if not exe.is_file():
-        raise updater.UpdateError("that engine is not installed (it may have been deleted already)", 2)
-    kind = dsv41_paths.kind_of(folder)
-    before = dsv41_paths.chosen(chosen_root, kind)
-    if before == exe:
-        return {"component": "dsv41", "family": DEEPSEEK, "status": "already", "changed": False, "to": _version_of(folder), "folder": folder}
-    ok, why = dsv41_paths.test_start(exe)
-    if not ok:
-        raise updater.UpdateError(f"DeepSeek engine {_version_of(folder)} can no longer be used: {why}", 5)
-    newest = dsv41_paths.installed(chosen_root, kind)[-1]
-    automatic = exe == newest
-    dsv41_paths.set_pin(chosen_root, None if automatic else folder)
-    moved = dsv41_paths.repoint_all(updater._dsv41_installs(ctx)[1], exe)
-    state = updater.State(ctx.components)
-    state.history({"at": (ctx.now or updater.dt.datetime.now(updater.dt.timezone.utc)).isoformat(), "action": "use-dsv41",
-                   "from": _version_of(before.parent.name) if before else None, "to": _version_of(folder), "ok": True})
-    state.save()
-    return {"component": "dsv41", "family": DEEPSEEK, "status": "switched", "changed": True, "automatic": automatic,
-            "from": _version_of(before.parent.name) if before else None, "to": _version_of(folder), "folder": folder, "profiles_repointed": moved}
-
-
 # ----------------------------------------------------------------------------------------------- delete
 
 def delete_engine(ctx: "updater.Context", family: str, folder: str, root: str | None = None) -> dict:
     """Delete one installed engine package. Refused (exit 2, nothing changed) for the engine in use and for one a running program uses. Models, settings
     and the other family are not touched. The folder is renamed away first, so a package that is held open is left whole, not half removed."""
     shape = shape_of_family(family)
+    if retired.is_name(family):
+        raise updater.UpdateError(retired.NOT_OFFERED, 2)
     if family not in FAMILIES and shape is None:
-        raise updater.UpdateError("choose the Qwen or the DeepSeek engine", 2)
+        raise updater.UpdateError("choose the Qwen engine", 2)
     if not folder or folder != Path(folder).name or folder.startswith("."):
         raise updater.UpdateError("that is not an installed engine", 2)
     with updater.update_lock(ctx.components):
@@ -414,9 +343,7 @@ def delete_engine(ctx: "updater.Context", family: str, folder: str, root: str | 
             state.history({"at": (ctx.now or updater.dt.datetime.now(updater.dt.timezone.utc)).isoformat(), "action": "delete-shape-engine", "shape": shape,
                            "from": row["version"], "to": None, "ok": True})
             state.save()
-        elif dsv41_paths.pinned(Path(row["root"])) is None and (Path(row["root"]) / dsv41_paths.PIN).is_file():
-            dsv41_paths.set_pin(Path(row["root"]), None)       # a stale pin
-        return {"component": ("engine" if family == QWEN else shape_engine.component_id(shape) if shape is not None else "dsv41"), "family": family, "status": "deleted", "changed": True, "folder": folder,
+        return {"component": ("engine" if family == QWEN else shape_engine.component_id(shape)), "family": family, "status": "deleted", "changed": True, "folder": folder,
                 "version": row["version"], "freed_bytes": row["bytes"]}
 
 

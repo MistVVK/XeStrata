@@ -1,8 +1,8 @@
 """#4891 ("Qwen breaks each time Strata is updated"): a saved run config names folders of one version of Strata's own components (the Control bundle that
-ran setup: cwd, --expert-profile; an engine package: the picture reader, library folders; the DeepSeek package).  The update keeps the new Control and
+ran setup: cwd, --expert-profile; an engine package: the picture reader, library folders).  The update keeps the new Control and
 the one before it, so the SECOND update after setup removes the folder the config names; the model then showed as "not installed" and a start failed.
 
-The updates here are real (`updater.run_update(control=True)` unpacks and prunes Control folders; `prune_engines` / `dsv41_paths.prune` remove the
+The updates here are real (`updater.run_update(control=True)` unpacks and prunes Control folders; `prune_engines` removes the
 older engine packages); the starts are real `runtime.start` calls with a fake engine, the way the app (with --die-with-pid) and the Terminal start.
 """
 from __future__ import annotations
@@ -13,10 +13,9 @@ import shutil
 import sys
 import unittest
 from pathlib import Path
-from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from strata_control import cfg_paths, doctor, dsv41_paths, engine_component as ec, profiles, runtime, updater  # noqa: E402
+from strata_control import cfg_paths, doctor, engine_component as ec, profiles, runtime, updater  # noqa: E402
 from tests.terminal.test_updater import PLATFORM, UpdaterCase  # noqa: E402
 
 WINDOWS = os.name == "nt"
@@ -35,16 +34,14 @@ class StaleConfigPaths(UpdaterCase):
         super().setUp()
         self.control = self.components / "control"
         self.engine_root = self.components / "engine"
-        self.ds_root = self.root / "data" / "engine-dsv41"
         self.sequence = 0
         # Control 0.1.44 is what ran setup: its data/ holds the shipped expert profile
         self.install_control("0.1.44")
         (self.control / "active.json").write_text(json.dumps({"version": "0.1.44", "folder": "0.1.44", "sha256": "0" * 64}))
-        # the engine package that setup (or an earlier update) wrote into the config, and the DeepSeek package
+        # the engine package that setup (or an earlier update) wrote into the config
         self.engine_kind = f"{PLATFORM}-cuda-cuda13"
         (self.root / "packs" / "iq3_s").mkdir(parents=True)
         self.old_engine = self.make_engine_folder(self.engine_root, "0.1.44")
-        self.old_ds = self.make_ds_folder("0.1.49")
         self.tokenizer = str(self.root / "tokenizer")
         self.mine = self.root / "mine" / "my-profile.bin"   # a path the person typed themselves
         self.configs = {}
@@ -70,13 +67,6 @@ class StaleConfigPaths(UpdaterCase):
         (folder / "strata-vision").write_bytes(b"reader " + version.encode())
         return folder
 
-    def make_ds_folder(self, version):
-        folder = self.ds_root / f"{version}-{self.engine_kind}"
-        folder.mkdir(parents=True)
-        (folder / dsv41_paths.exe_name()).write_bytes(b"deepseek " + version.encode())
-        (folder / dsv41_paths.exe_name()).chmod(0o755)
-        return folder
-
     def engine_exe(self, folder):
         return folder / ("engine.cmd" if WINDOWS else "engine.py")
 
@@ -100,8 +90,8 @@ class StaleConfigPaths(UpdaterCase):
         self.assertEqual(out["results"][0]["status"], "updated", out)
 
     def two_updates(self):
-        """Setup ran on Control 0.1.44.  Two updates later (0.1.45, then 0.1.46) Control keeps 0.1.46 and 0.1.45, and the engine and DeepSeek packages
-        are replaced the way their updates do it."""
+        """Setup ran on Control 0.1.44.  Two updates later (0.1.45, then 0.1.46) Control keeps 0.1.46 and 0.1.45, and the engine package
+        is replaced the way its update does it."""
         self.update_to("0.1.45")
         self.assertTrue((self.control / "0.1.44").is_dir(), "one update keeps the folder before it")
         self.update_to("0.1.46")
@@ -109,11 +99,7 @@ class StaleConfigPaths(UpdaterCase):
         new_engine = self.make_engine_folder(self.engine_root, "0.1.46")
         updater.prune_engines(self.components, {new_engine.name})
         self.assertFalse(self.old_engine.exists())
-        new_ds = self.make_ds_folder("0.1.50")
-        with mock.patch.object(dsv41_paths, "in_use", return_value=False):
-            dsv41_paths.prune(self.ds_root, new_ds / dsv41_paths.exe_name())
-        self.assertFalse(self.old_ds.exists())
-        return new_engine, new_ds
+        return new_engine, None
 
     def qwen_config(self, name, vision=False, **extra):
         cfg = {"exe": str(self.engine_exe(self.old_engine)), "backend": "cuda", "tokenizer": self.tokenizer,
@@ -134,9 +120,11 @@ class StaleConfigPaths(UpdaterCase):
         return path
 
     def deepseek_config(self, name):
-        exe = self.old_ds / dsv41_paths.exe_name()
+        """A DeepSeek config of Strata 0.2.13: its engine in engine-dsv41/, its cwd in the Control that ran setup."""
+        old_ds = self.root / "data" / "engine-dsv41" / f"0.1.49-{self.engine_kind}"
+        exe = old_ds / "strata-dsv41"
         cfg = {"exe": str(exe), "arch": "deepseek41", "backend": "cuda", "tokenizer": self.tokenizer, "cwd": str(self.control / "0.1.44"),
-               "model_name": "deepseek", "host": "127.0.0.1", "port": 0, "lib_dirs": [str(self.old_ds)],
+               "model_name": "deepseek", "host": "127.0.0.1", "port": 0, "lib_dirs": [str(old_ds)],
                "args": ["--pack", str(self.root / "packs" / "ds"), "--max-context", "8192"]}
         path = self.root / "run" / f"{name}.json"
         path.parent.mkdir(exist_ok=True)
@@ -253,30 +241,17 @@ class StaleConfigPaths(UpdaterCase):
         self.assertTrue(runtime.start("one", wait=60)["ok"])
         self.assertNotIn("0.1.44", self.without_output_path(b), "the Models page reads the other profiles' configs too")
 
-    def test_deepseek_cwd_exe_and_libraries_follow_the_update_too(self):
+    def test_a_deepseek_config_is_left_exactly_as_it_was(self):
+        """This Strata runs no DeepSeek model (strata_control/retired.py): neither the repair nor a start writes its config, which may still
+        serve the Strata it came from; the start says why it stops."""
         path = self.deepseek_config("ds")
-        _, new_ds = self.two_updates()
-        report = doctor.inspect(path)
-        self.assertEqual([c for c in report["components"] if c["name"] == "engine" and c["status"] != "ok"], [])
-        notes, problems = cfg_paths.repair([path])
-        self.assertEqual(problems, [])
-        self.assertEqual(len(notes), 1)
-        cfg = self.cfg_of(path)
-        self.assertEqual(cfg["exe"], str(new_ds / dsv41_paths.exe_name()))
-        self.assertEqual(cfg["lib_dirs"], [str(new_ds)])
-        self.assertEqual(cfg["cwd"], str(self.control / "0.1.46"))
-        self.assertEqual(cfg["args"], ["--pack", str(self.root / "packs" / "ds"), "--max-context", "8192"])
-
-    def test_deepseek_start_goes_through_the_same_repair(self):
-        path = self.deepseek_config("ds-app")
         self.two_updates()
-        with mock.patch.object(runtime, "_check_start_candidate", side_effect=RuntimeError("stop after the repair")), \
-                mock.patch.object(runtime, "_engine_preflight"):
-            with self.assertRaises(RuntimeError):
-                runtime.start("ds-app", wait=1, die_with_pid=os.getpid())
-        cfg = self.cfg_of(path)
-        self.assertIn("0.1.50", cfg["exe"])
-        self.assertEqual(cfg["cwd"], str(self.control / "0.1.46"))
+        before = Path(path).read_bytes()
+        self.assertEqual(cfg_paths.repair([path]), ([], []))
+        with self.assertRaises(profiles.ProfileError) as caught:
+            runtime.start("ds", wait=1, die_with_pid=os.getpid())
+        self.assertIn("is a DeepSeek model. This version of Strata no longer runs DeepSeek models, so it was not started.", str(caught.exception))
+        self.assertEqual(Path(path).read_bytes(), before)
 
     # ------------------------------------------------------------------ a file that is nowhere
 

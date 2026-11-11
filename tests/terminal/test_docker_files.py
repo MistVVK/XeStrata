@@ -61,7 +61,7 @@ class Scripts(unittest.TestCase):
             for node in pt.body:
                 if isinstance(node, ast.Assign) and any(getattr(t, "id", "") in ("INSTALLER_TOOLS", "INSTALLER_SCRIPTS") for t in node.targets):
                     tools.update(ast.literal_eval(node.value))
-            self.assertTrue({"dsv41/pack_gguf", "dsv41/tune"} <= tools)          # the nested ones this assertion exists for
+            self.assertTrue(tools, "package_terminal.py names its installer tools")
             for name in sorted(tools):
                 self.assertTrue((ctx / "terminal-src" / "tools" / f"{name}.py").is_file(), f"build.sh did not copy tools/{name}.py into the context")
             # the Mac repack scripts the bundle carries (the v0.2.11 image build stopped at "No such file ... metal/tools/metal_repack.py")

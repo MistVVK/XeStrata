@@ -161,8 +161,8 @@ def _mem_available() -> int:
 def shared_arena_plan(cfg: dict, n_replicas: int, *, shm: str = "/dev/shm", platform: str | None = None,
                       environ=None, free_bytes=None, use_memfd: bool | None = None) -> tuple[str | None, str]:
     """(the file for --shared-expert-arena or None, a line for the log).  Opt-in: "replica_shared_arena": true (or
-    STRATA_REPLICA_SHARED_ARENA=1).  Only on Linux (the engine's MAP_SHARED backing), for Qwen's arena (not DeepSeek,
-    not the mapped or budgeted RAM modes, which have no arena), and with room in /dev/shm.  The engine checks the real
+    STRATA_REPLICA_SHARED_ARENA=1).  Only on Linux (the engine's MAP_SHARED backing), for Qwen's arena (not
+    the mapped or budgeted RAM modes, which have no arena), and with room in /dev/shm.  The engine checks the real
     size and reserves it before it loads (a tmpfs that is too small is an error at start, not a bus error later)."""
     environ = os.environ if environ is None else environ
     platform = sys.platform if platform is None else platform
@@ -183,7 +183,7 @@ def shared_arena_plan(cfg: dict, n_replicas: int, *, shm: str = "/dev/shm", plat
         for e in cfg["replicas"]:
             if isinstance(e, dict):
                 args += [str(a) for a in e.get("args") or []]
-    if cfg.get("arch") == "deepseek41" or any(a in args for a in ARENA_INCOMPATIBLE):
+    if any(a in args for a in ARENA_INCOMPATIBLE):
         return None, "shared expert arena: this model/config has no private expert arena to share; each replica as before"
     if use_memfd is None:
         use_memfd = hasattr(os, "memfd_create") and str(cfg.get("replica_shared_arena")).lower() != "devshm"

@@ -79,20 +79,6 @@ def python_failure(lines: list[str]) -> str | None:
     return None
 
 
-DEEPSEEK_ENGINE_LINE = re.compile(r"(A newer DeepSeek engine (?:is available|may be available)[^\r\n]*|DeepSeek engine updated from [^\r\n]*)")
-
-
-def deepseek_engine_note(line: str) -> tuple[str, str] | None:
-    """setup's line about the DeepSeek engine upgrade ("A newer DeepSeek engine is available but could not be installed: ...; still using X",
-    or "DeepSeek engine updated from X to Y"): ("warn" | "info", the sentence), None for any other line. The failure line must reach the
-    person: the model starts with the engine they have, and they should know there is a newer one."""
-    found = DEEPSEEK_ENGINE_LINE.search(line)
-    if not found:
-        return None
-    text = found.group(1).strip()
-    return ("info" if text.startswith("DeepSeek engine updated") else "warn", text)
-
-
 def argparse_failure(lines: list[str]) -> str:
     """setup.py's own refusal of an option ("setup.py: error: argument --kv: invalid choice: ..."), which is neither an [X] line nor a
     traceback (#3785): the words after "error:" are the cause."""
@@ -323,10 +309,7 @@ def apply_choices(cfg: dict, s: S.LaunchSettings) -> dict:
     kv = s.kv or ("int8" if (s.context or 32768) > 8192 else "fp16")
     if "--kv" in args or s.kv:
         put("--kv", kv)
-    if cfg.get("arch") == "deepseek41":                      # the engine's own tower: --vision on / off is its whole picture setting
-        if s.vision:
-            put("--vision", "off" if s.vision == "off" else "on")
-    elif s.vision == "off":
+    if s.vision == "off":
         args = [a for a in args if a != "--vision"]
         cfg.pop("vision", None)                              # the picture reader's own settings: the server adds --vision for them
     elif s.vision and "--vision" not in args:
@@ -367,12 +350,11 @@ def apply_cards(cfg: dict, gpus: "list[int] | dict | None") -> None:
 
 def installed_cards(base: dict | None, usable: list[dict] | None = None) -> list[int] | None:
     """The cards the installed model's own config names after a choice (setup --gpu / --gpus, the app's card pick: "gpus_asked"), in its order;
-    None when it names none or was never asked, or when setup picked them itself (strata_control/gpu_pick.py: a DeepSeek config of setup 0.2.8
-    and earlier marks setup's one-card pick as asked; `usable`: the cards that count on this PC, needed to tell the two apart)."""
+    None when it names none or was never asked, or when setup picked them itself ("gpus_by": "setup").  `usable` is not used any more (it told a
+    DeepSeek config's own pick apart) and is kept for the callers."""
     if not isinstance(base, dict) or not (base.get("gpus_asked") or base.get("gpu_roles")):
         return None
-    from strata_control import gpu_pick
-    if not gpu_pick.chosen_by_person(base, usable):
+    if not base.get("gpu_roles") and base.get("gpus_by") == "setup":
         return None
     g = base.get("gpu")
     if g is None or g == "":
@@ -412,46 +394,10 @@ def cards_for_launch(s: S.LaunchSettings, catalog, ram_gb: float | None = None, 
         if len(comp.usable_gpus) < 2:
             return None
         cards = gpu_roles.rows(comp.gpus, comp.engine_vendor)
-        if comp.engine_vendor == "amd" and ((isinstance(base, dict) and base.get("arch") == "deepseek41")
-                                            or getattr(s, "family", None) == "deepseek41"):
-            # DeepSeek on AMD: the cards setup and `--plan` use (strata_control/dsv41_fit.run_cards): one card on Windows, only cards the engine
-            # package runs, no integrated chip beside a card with memory of its own
-            from strata_control import dsv41_fit
-            ids = [int(c["index"]) for c in dsv41_fit.run_cards(comp.usable_gpus, comp.engine_vendor)[0]]
-            if len(ids) < 2:
-                return ids or None                           # pinned to that card, exactly as setup pins it
-            cards = [c for c in cards if int(c.get("index", 0)) in ids]
         rec = gpu_roles.recommend(cards, comp.engine_vendor)["roles"]
         return gpu_roles.order(rec, cards) or None
     except Exception:                                        # noqa: BLE001 - never block a launch over the choice of cards
         return None
-
-
-EXPERTS_MIN_ENGINE = (0, 1, 50)      # the first DeepSeek engine that accepts --experts (0.1.49.2, the one shipped before, does not)
-
-
-def dsv41_engine_version(exe) -> tuple:
-    """The version of a DeepSeek engine: from its package folder's name ("0.1.50-windows-x86_64-cuda-cuda13"), else what `--version` prints;
-    () when neither says."""
-    if not exe:
-        return ()
-    from strata_control import dsv41_engine
-    folder = Path(str(exe)).parent.name
-    version = dsv41_engine.version_key(folder) if folder[:1].isdigit() else ()
-    if version:
-        return version
-    try:
-        done = subprocess.run([str(exe), "--version"], capture_output=True, text=True, errors="replace", timeout=10, stdin=subprocess.DEVNULL)
-        found = re.search(r"(\d+\.\d+\.\d+(?:\.\d+)?)", (done.stdout or "") + (done.stderr or ""))
-        return tuple(int(x) for x in found.group(1).split(".")) if found else ()
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return ()
-
-
-def engine_takes_experts(exe) -> bool:
-    """Does this DeepSeek engine accept --experts (0.1.50 or newer)? An engine whose version cannot be told counts as not: nothing is passed,
-    nothing is shown, no error."""
-    return dsv41_engine_version(exe) >= EXPERTS_MIN_ENGINE
 
 
 def used_cards(computer, s: "S.LaunchSettings") -> list:
@@ -467,64 +413,15 @@ def used_cards(computer, s: "S.LaunchSettings") -> list:
     return cards
 
 
-def used_vram_gb(computer, s: "S.LaunchSettings") -> float:
-    """Graphics memory (GiB) of the cards this launch uses, summed as the engine sums it."""
-    return sum(float(c.get("vram_gb") or 0) for c in used_cards(computer, s))
-
-
 def uses_integrated_gpu(computer, s: "S.LaunchSettings") -> bool:
     """Does the launch run on an integrated / unified-memory GPU (Strix Halo, gfx1151, Radeon 8060S: the hardware probe marks it uma, integrated or
-    unified_memory)? A Mac is left out: DeepSeek is not on the Mac."""
+    unified_memory)? A Mac is left out."""
     for c in used_cards(computer, s):
         if str(c.get("vendor")) == "apple" or c.get("unified_gb"):
             continue
         if c.get("integrated") or c.get("uma") or c.get("unified_memory"):
             return True
     return False
-
-
-def faster_by_default(computer, s: "S.LaunchSettings") -> bool:
-    """The engine's `--experts auto` rule: Faster (5 experts) on an integrated GPU, on a single RDNA4 card, or when the cards used total 16 GiB or less."""
-    cards = used_cards(computer, s)
-    if uses_integrated_gpu(computer, s) or S.single_rdna4(cards) or S.faster_default(used_vram_gb(computer, s)):
-        return True
-    if len(cards) < 2 or not s.model:
-        return False
-    from strata_control import dsv41_fit                 # several RDNA4 cards: the engine's other rule (they hold half of the experts), the plan's numbers
-    try:
-        return dsv41_fit.rdna4_faster(cards, s.model, getattr(computer, "engine_vendor", None), named=bool(s.gpus or s.gpu_roles))
-    except Exception:                                    # noqa: BLE001 - the screens' words must not break a launch; the engine says what it did
-        return False
-
-
-EXPERTS_LINE = re.compile(r"experts per word: (\d+)")
-
-
-def experts_from_log(path) -> int | None:
-    """The engine's own answer, read back from its startup line "experts per word: N" (the last one in the log), None when it is not there."""
-    try:
-        data = Path(path).read_bytes()[-262144:].decode("utf-8", "replace")
-    except (OSError, TypeError, ValueError):
-        return None
-    found = EXPERTS_LINE.findall(data)
-    return int(found[-1]) if found else None
-
-
-def apply_experts(cfg: dict, experts: int | None) -> None:
-    """DeepSeek's speed choice as the engine flag: --experts 5 (Faster) or --experts 6 (Full quality), replacing one already in the saved args."""
-    if experts is None or not isinstance(cfg.get("args"), list):
-        return
-    args, out, i = [str(x) for x in cfg["args"]], [], 0
-    while i < len(args):
-        if args[i] == "--experts":
-            i += 2
-            continue
-        if args[i].startswith("--experts="):
-            i += 1
-            continue
-        out.append(args[i])
-        i += 1
-    cfg["args"] = out + ["--experts", str(int(experts))]
 
 
 _SETUP_LOG_NAME = re.compile(r"^strata-[A-Za-z0-9_.-]+\.log$")
@@ -540,7 +437,7 @@ def own_log_path(base: dict) -> str | None:
 
 
 def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str], log: str | None = None, gpus: "list[int] | dict | None" = None,
-                  experts: int | None = None, prev: dict | None = None) -> dict:
+                  prev: dict | None = None) -> dict:
     """The private run config of this launch: the installed one plus the choices that are not setup's (host, port, key, cards, advanced).
     `prev` is the config this launch wrote last time: its calibrated values and hand edits are kept (strata_control/arg_layers.py: explicit
     launch values, then persisted overrides, then calibrated values, then Auto)."""
@@ -554,7 +451,7 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
         cfg["api_key"] = "none"                              # served without a key on purpose (the server warns once at start)
     else:
         cfg.pop("api_key", None)
-    chosen = None if s.family == "deepseek41" else s.drafting   # DeepSeek has its own DSpark and no MTP or DFlash2: a Drafting choice left from another model is not written
+    chosen = s.drafting
     if chosen:                                               # strata_control/drafting.py: serve/server.py applies it at every start
         cfg["drafting"] = chosen
     if s.split_engine:                                       # strata_control/split_engine.py: read by apply_split_engine; "off" survives every update
@@ -578,16 +475,12 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
         from strata_control import intel_spec                # own choices (user_args, an extra option below) come after it and win
         intel_spec.apply_for_launch(cfg)
     word_flags = S.WORD_VALUE_FLAGS
-    if cfg.get("arch") == "deepseek41":                      # strata-dsv41 takes --mmap-experts on|off|auto: "off" must reach it as a word (#5027)
-        bool_flags = bool_flags - tune_knobs.DSV41_WORD_FLAGS
-        word_flags = word_flags | tune_knobs.DSV41_WORD_FLAGS
     a_changes, e_changes = S.as_argv_changes(s.extra, bool_flags, word_flags) if s.extra else ({}, {})
     arg_layers.layer(cfg, a_changes, prev, bool_flags)       # the one place that decides which value an option has
     if e_changes:
         cfg["env"] = tune_knobs.apply_to_env(dict(cfg.get("env") or {}), e_changes)
     from strata_control import draft_layer
     draft_layer.apply(cfg)                                   # "mtp": false (from the installed config too) never sits beside --mtp in the saved args (B10)
-    apply_experts(cfg, experts)
     return cfg
 
 
@@ -668,7 +561,6 @@ class Runner:
         self.hardware_override = hardware
         self.children: list[subprocess.Popen] = []
         self.notices: list[str] = []
-        self._engine_notes: set[str] = set()
         self.identity_notes: list[str] = []
         self.tune_result: dict | None = None
         self.config_path: Path | None = None
@@ -745,9 +637,6 @@ class Runner:
     # ---- 1. the engine
     def ensure_engine(self) -> None:
         self.warn_wsl_amd()
-        if self.multi_file():                                # DeepSeek: its own engine package (setup fetches it); the Strata engine is not used
-            self.emit("engine", "DeepSeek runs on its own engine package, so the Strata engine is not downloaded for it.", 100)
-            return
         shape = self.model_shape()
         if shape:                                            # a Qwen4 model of its own shape: its engine is a separate component (strata_control/shape_engine.py)
             self.ensure_shape_engine(shape)
@@ -1021,9 +910,7 @@ class Runner:
         if s.model_path:
             p = Path(s.model_path)
             args += ["--gguf-dir", str(p if p.is_dir() else p.parent)]
-        if s.dsv41_package and s.family == "deepseek41":
-            args += ["--dsv41-package", s.dsv41_package]
-        if self.feed:                                     # --feed / STRATA_UPDATE_FEED: setup fetches the DeepSeek engine from it too
+        if self.feed:                                     # --feed / STRATA_UPDATE_FEED: setup reads the signed feed from there too
             args += ["--feed", str(self.feed)]
         if s.gpu_roles:
             args += ["--gpu-roles", ",".join(f"{k}={v}" for k, v in sorted(s.gpu_roles.items(), key=lambda kv: int(kv[0])))]
@@ -1034,7 +921,7 @@ class Runner:
         if sys.platform == "darwin":
             # a Mac's setup (Control mode, strata_control/mac_fit.py) takes fewer options (no --kv, --gpu, speed projection)
             keep = {"--yes", "--no-start", "--family", "--model", "--context", "--vision", "--data-dir", "--gguf-dir", "--move-data",
-                    "--set-default-data-dir", "--feed", "--dsv41-package"}   # (the last two: the DeepSeek engine package, 0.2.7.1)
+                    "--set-default-data-dir", "--feed"}
             flags = ("--yes", "--no-start", "--move-data", "--set-default-data-dir")
             out, i = [], 0
             while i < len(args):
@@ -1277,15 +1164,14 @@ class Runner:
         if not (s.family and s.model):
             raise LaunchError("No model was chosen.", "Choose a model, or use --model NAME (strata launch --help lists them).", 2)
         path, desc = self.installed_state()
-        if path is not None and desc is not None and desc_matches(desc, s) and not files_present(read_config(path)) \
-                and not self.dsv41_engine_missing(read_config(path)):
+        if path is not None and desc is not None and desc_matches(desc, s) and not files_present(read_config(path)):
             if self.installed_serves_request(path):
                 self.emit("model", f"{s.family} {s.model} is already installed with these choices.", 100)
                 return path
             self.emit("model", "The model already installed here is somewhere else than the folder you gave, so Strata uses the folder you gave "
                                "and points this launch at it.", 0)
         title = f"{s.family} {s.model}"
-        try:                                                 # the name on screen (DeepSeek's sets are ISTA-DAS there, their ids keep the first spelling)
+        try:                                                 # the name on screen
             title = next((r.title for r in self.catalog.rows() if r.family == s.family and r.model == s.model), title)
         except Exception:                                    # noqa: BLE001 - a label only
             pass
@@ -1316,7 +1202,7 @@ class Runner:
         env.pop("STRATA_NEED_ENGINE", None)
         if self.engine_problem:
             env["STRATA_ALLOW_NO_ENGINE"] = "1"              # the person said go on: setup warns about the engine instead of stopping
-        elif not self.multi_file():                          # (DeepSeek does not use the Strata engine: nothing to require)
+        else:
             env["STRATA_NEED_ENGINE"] = "1"
         for k in ("PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV"):
             env.pop(k, None)
@@ -1342,12 +1228,6 @@ class Runner:
                 continue
             lines.append(line)
             lines[:] = lines[-1500:]
-            note = deepseek_engine_note(line)
-            if note and note[1] not in self._engine_notes:   # setup's DeepSeek engine lines are shown, not condensed away (0.2.5 list)
-                self._engine_notes.add(note[1])
-                if note[0] == "warn":
-                    self.notices.append(note[1])
-                self.emit("model", note[1], None, level=note[0], step=step_seen)
             prog = cat.mcp.install_progress(lines)
             prog = cat.mcp.combined_progress(prog, job)
             dl, phase, label = prog.get("download"), prog.get("phase"), prog.get("label")
@@ -1432,7 +1312,7 @@ class Runner:
     def intel_chosen(self) -> bool:
         """The engine for this launch is the Intel Arc one (chosen with --backend intel, saved, or the only make here), and the model is one
         the built-in downloader sets up for NVIDIA and AMD only: Strata prepares the model files itself instead (adopt_prepared_files)."""
-        if self.multi_file() or sys.platform == "darwin" or WINDOWS:
+        if sys.platform == "darwin" or WINDOWS:
             return False
         try:
             from strata_control import engine_component
@@ -1518,69 +1398,6 @@ class Runner:
         self.emit("model", f"Used your prepared model files and wrote the run settings ({path.name}); this card is not one the built-in downloader sets up.", 100, level="warn")
         return path
 
-    @staticmethod
-    def deepseek_set_in(mod, model_path, prefer: str | None = None):
-        """(set name, its catalog entry, the folder) when `model_path` (a folder, the folder above the set's own folder, or one shard) holds shards
-        of an official DeepSeek-V4.1-Flash set - recognised by the pinned shard names (the first release's names too), never by the generic GGUF
-        fingerprint table, which does not know DeepSeek (its shard 8 is a table, not a layer: "could not be read", #3914) - else None."""
-        fam = getattr(mod, "MULTI_FILE_FAMILIES", {}).get("deepseek41")
-        if fam is None or not model_path:
-            return None
-        p = Path(model_path)
-        legacy = getattr(mod, "DSV41_LEGACY_NAMES", {})
-        order = ([prefer] if prefer in fam["models"] else []) + [m for m in fam["models"] if m != prefer]
-        for m in order:
-            d = fam["models"][m]
-            subs = [d.get("subdir"), d.get("legacy_subdir"), m]
-            folders = [p, *[p / x for x in subs if x]] if p.is_dir() else [p.parent]
-            names = [n for s in d["shards"] for n in (s, legacy.get(s)) if n] + list(d.get("shards6") or [])      # (+ the six-shard layout of 2026-10-27)
-            sizes = getattr(mod, "DSV41_ALL_FILES", {})
-
-            def there(f, n):      # a set whose files have generic names (model-00002-of-00004.gguf: the ISTA-DAS Coder's) is only claimed by files of the pinned size
-                if not (f / n).exists():
-                    return False
-                return not d.get("generic_names") or ((f / n).is_file() and n in sizes and (f / n).stat().st_size == sizes[n][0])
-            folder = next((f for f in folders if any(there(f, n) for n in names)), None)
-            if folder is not None:
-                return m, d, folder
-        return None
-
-    def deepseek_files(self) -> bool:
-        """--model-path names DeepSeek-V4.1-Flash's shards (a folder, the repository's folder with the set's own folder inside - UD-Q8_K_XL,
-        2.00bpw, 2.25bpw - or one shard): they are that model, whatever the fingerprint table of the Flash-Next files says.  True when it did
-        (s.family / s.model / s.model_path set); a shard missing from the folder is said now, in plain words, before an engine or a download
-        is touched."""
-        s = self.s
-        try:
-            mod = self.catalog.strata.setup_module()
-            fam = getattr(mod, "MULTI_FILE_FAMILIES", {}).get("deepseek41")
-            if fam is None or not s.model_path:
-                return False
-            found = self.deepseek_set_in(mod, s.model_path, s.model)
-        except Exception:                                    # noqa: BLE001 - not DeepSeek's: the usual check goes on
-            return False
-        if found is None:
-            return False
-        model, d, folder = found
-        from strata_control import dsv41_fit
-        if dsv41_fit.not_here(model):     # Mac: no Metal IQ1_S kernel yet; DGX Spark: never run; said before an engine or a download is touched
-            raise LaunchError(dsv41_fit.not_here(model),
-                              "Use the 2.00 or 2.25 files (--model ist-das-2.00bpw or --model ist-das-2.25bpw, or --model-path to those files). "
-                              "Nothing was downloaded or changed.", 2)
-        if s.family and s.family != "deepseek41":
-            raise LaunchError(f"These are DeepSeek-V4.1-Flash's files, not {s.family} {s.model}'s.",
-                              "Leave --model out, or use --model " + model + ".", 2)
-        _layout, others, missing = mod.dsv41_parts(d, lambda n: (folder / n).exists())      # the pinned four-shard layout, or ISTA's six-shard one (0.2.8.1)
-        if missing:
-            parts = {4: "four", 5: "five", 9: "nine"}.get(len(others), str(len(others)))
-            raise LaunchError(f"DeepSeek-V4.1-Flash {d.get('label', model)} is in {parts} parts and {len(missing)} of them are not in {folder} "
-                              f"(first missing: {missing[0]}).",
-                              "Put every part in the folder (or drop --model-path and let Strata download them). "
-                              "Nothing was downloaded or changed.", 5)
-        s.family, s.model, s.model_path = "deepseek41", model, str(folder)
-        self.emit("model", f"These files are DeepSeek-V4.1-Flash {d.get('label', model)}; they are used where they are.", None)
-        return True
-
     def check_own_files(self) -> None:
         """The person's own model files, looked at once: a path that is not there or holds no model is said in plain words first, and the
         files are matched to the catalog model (resolve_own_files). Nothing else is done with a path that was already checked."""
@@ -1597,8 +1414,9 @@ class Runner:
         problem = models.own_path_problem(s.model_path)
         if problem:                                          # before the engine or setup are touched, with the path as typed
             raise LaunchError(problem[0], problem[1], 2)
-        if self.deepseek_files():
-            return
+        from strata_control import retired
+        if retired.folder_reason(models.absolute(s.model_path)):   # DeepSeek files: named, never used (strata_control/retired.py)
+            raise LaunchError(retired.own_files(models.absolute(s.model_path)), "", 2)
         given = bool(s.family and s.model)
         try:
             plan = models.plan_import(models.absolute(s.model_path))
@@ -1666,7 +1484,7 @@ class Runner:
         try:
             from strata_control import split_engine as SE
             s = self.s
-            if s.family in modelstate.HELPER_FAMILIES and not self.multi_file() and not self.intel_chosen():
+            if s.family in modelstate.HELPER_FAMILIES and not self.intel_chosen():
                 base = dict(cfg or {})
                 if s.split_engine:
                     base["split_engine"] = s.split_engine
@@ -1815,15 +1633,9 @@ class Runner:
         cfg = derive_config(base, self.s, bool_flags=tune_knobs.BOOL_FLAGS,
                             log=str(launch_dir() / f"{self.name}.engine.log"), gpus=cards_for_launch(self.s, self.catalog, base=base),
                             prev=previous)
-        if self.s.gpus and not self.s.gpu_roles:             # a DeepSeek model on AMD keeps the card the person names from now on (strata_control/gpu_pick.py)
-            from strata_control import gpu_pick
-            gpu_pick.remember(base_path, [int(g) for g in self.s.gpus])
         self.say_remembered_cards(base)
         self.apply_four_card(cfg)
-        self.use_own_dsv41_engine(cfg)
         self.apply_split_engine(cfg)
-        self.gate_parallel(cfg)
-        apply_experts(cfg, self.experts_flag(cfg.get("exe")))   # after the engine is settled: only a 0.1.50+ engine is given --experts
         wait = self.start_wait()
         if wait > 600 and not cfg.get("engine_ready_s"):     # the server's own wait for the engine (900 s) must not end before the start's
             cfg["engine_ready_s"] = wait + 60
@@ -1839,7 +1651,7 @@ class Runner:
         strata_control/split_engine.py's rule, never when the run config says "split_engine": "off" (`--split-engine off`, STRATA_SPLIT_ENGINE=0).
         In auto a "no" is silent and the config stays as it is; with "on" it gets one plain line. It never stops a launch."""
         from strata_control import split_engine as SE
-        if cfg.get("arch") == "deepseek41" or SE.mode(cfg) == "off":
+        if SE.mode(cfg) == "off":
             return
         exe_for = SE.exe_finder(cfg)                         # strata-split-N beside the run config's engine (shared with the app's start)
 
@@ -1895,21 +1707,6 @@ class Runner:
         self.notices.append(text)
         self.emit("config", text, None)
 
-    def gate_parallel(self, cfg: dict) -> None:
-        """DeepSeek `--parallel N` and the engine this launch will run (settled just above, a self-upgrade included): an engine package from before the
-        flag stops at its start on it, so it is asked (`--help` names the flag) and, when it cannot, the launch goes on one at a time and says so in
-        one line.  The choice stays in the preset.  Unknown (the engine could not be asked): the flag is passed on, as for any engine."""
-        self.parallel_dropped = False
-        if cfg.get("arch") != "deepseek41" or not (self.s.parallel and self.s.parallel > 1):
-            return
-        from strata_control import dsv41_flags
-        if dsv41_flags.takes_parallel(cfg.get("exe")) is False:
-            self.parallel_dropped = True
-            text = (f"This DeepSeek engine ({Path(str(cfg.get('exe'))).parent.name or 'installed'}) is from before --parallel, so it answers one request at "
-                    f"a time and --parallel {self.s.parallel} is not used. Update the engine with `strata update` and start again to answer several at once.")
-            self.notices.append(text)
-            self.emit("config", text, None, level="warn")
-
     def apply_four_card(self, cfg: dict) -> None:
         """Four Radeon AI PRO R9700 cards and Qwen3.8-Flash-Next IQ3_S: the measured serving profile (strata_control/amd_four_card.py), filled
         in where the person chose nothing. Never stops a launch."""
@@ -1933,8 +1730,6 @@ class Runner:
         from strata_control import profiles
         name = self.profile
         parallel = self.s.parallel if self.s.parallel else (getattr(self, "four_card_parallel", None) or self.catalog_parallel())
-        if getattr(self, "parallel_dropped", False):         # DeepSeek: the engine in use is from before the flag (gate_parallel)
-            parallel = None
         if parallel and not self.s.parallel and self.one_request_for_dflash2(config):
             parallel = None                                  # the slots Strata fills in by itself would keep the MTP: DFlash2 answers one request at a time
         if parallel and self.run_config_owns_slots(config):
@@ -1971,16 +1766,7 @@ class Runner:
             return False
         return "--batch" in args or "--slots" in args
 
-    def multi_file(self) -> bool:
-        """The chosen model is DeepSeek-V4.1-Flash (setup.py MULTI_FILE_FAMILIES): nine shards, its own engine; its own short tuner, and several conversations at once only when --parallel N is asked for."""
-        try:
-            return bool(self.s.family and self.catalog.strata.multi_family(self.s.family))
-        except Exception:                                    # noqa: BLE001
-            return False
-
     def catalog_parallel(self) -> int | None:
-        if self.multi_file():                                # DeepSeek: one at a time unless --parallel N is asked for (never fitted to the card; and never --batch)
-            return None
         try:
             comp = self.catalog.computer()
             return S.fit_parallel(comp.main_vram_gb) if comp.usable_gpus else None
@@ -1988,55 +1774,9 @@ class Runner:
             return None
 
     # ---- 4. tuning
-    def tune_deepseek(self) -> None:
-        """DeepSeek-V4.1-Flash has its own short tuner (tools/dsv41/tune.py: the drafter on or off, the CPU threads; the RAM store sizes itself):
-        a few test runs of the engine, a result written into this launch's config, and the standard settings on any failure."""
-        s = self.s
-        cfg = getattr(self, "config_path", None)
-        if cfg is None:
-            self.emit("tune", "There are no DeepSeek settings to tune yet, so it starts with the standard ones.", 100, level="warn")
-            return
-        mode = "thorough" if s.tune == "thorough" else "quick"
-        argv = [sys.executable, str(Path(__file__).resolve().parents[2] / "tools" / "dsv41" / "tune.py"), "--config", str(cfg), "--mode", mode,
-                "--output", "json"]
-        self.emit("tune", "Tuning DeepSeek: it times a short question with your standard settings, then with the DSpark drafter on (and, if that helps, a shorter "
-                          "draft block) and the CPU threads set to your physical cores; each run loads the model once. It keeps only a clear gain. Close other heavy programs.", 0)
-        try:
-            p = self._spawn(argv)
-        except Exception as e:                           # noqa: BLE001 - a tune never stops a launch
-            self.emit("tune", f"The DeepSeek tuner could not start ({type(e).__name__}), so the standard settings run.", 100, level="warn")
-            return
-        lines: list[str] = []
-        reader = threading.Thread(target=lambda: lines.extend(p.stdout.readlines()), daemon=True)   # type: ignore[union-attr]
-        reader.start()
-        while p.poll() is None:
-            if self.cancel.is_set():
-                self._stop_children()
-                raise Cancelled()
-            time.sleep(1.0)
-        reader.join(timeout=3)
-        result = None
-        for line in reversed(lines):
-            try:
-                result = json.loads(line).get("result")
-                break
-            except (ValueError, AttributeError):
-                continue
-        if result is None:
-            self.tune_word = "failed"
-            self.emit("tune", "The DeepSeek tuner did not finish, so the standard settings run. Nothing was changed.", 100, level="warn")
-            return
-        self.tune_result = result
-        self.tune_word = "faster" if result.get("changed") else "already fastest"
-        s.tuned_at = time.strftime("%Y-%m-%d")
-        self.emit("tune", " ".join(result.get("lines") or ["Tuning finished."]), 100, level="info", word=self.tune_word)
-
     def tune(self) -> None:
         s = self.s
         if s.tune == "skip":
-            return
-        if self.multi_file():
-            self.tune_deepseek()
             return
         from strata_control import presets
         if not self.retune:
@@ -2503,29 +2243,8 @@ class Runner:
         intel = self.intel_chosen()
         if intel:                                            # the Intel route builds the pack from the files and fetches no draft layer, picture reader or drafter
             parts = [p for p in parts if p["kind"] not in ("mtp", "mmproj", "dflash2")]
-        if self.multi_file() and st.own_files and s.model:
-            # DeepSeek with the person's own shards: setup still fetches the shared files that are not here (the Engram, the DSpark drafter, the picture file); count
-            # them with the same search setup makes (setup.dsv41_shared_missing), so the plan is the download (0.2.9.1: "Nothing to download" and then 8 GB)
-            try:
-                mod = self.catalog.strata.setup_module()
-                data = Path(s.data_dir) if s.data_dir else (self.existing_data_dir() or self.catalog.data_dir())
-                labels = {getattr(mod, "DSV41_DSPARK", ""): "the DSpark drafter", getattr(mod, "DSV41_ISTA_ENGRAM", ""): "the n-gram table",
-                          getattr(mod, "DSV41_MMPROJ", ""): "the picture reader"}
-                for name, size in mod.dsv41_shared_missing(s.model, Path(data) / "models", s.model_path, vision=s.vision not in ("off", "no")):
-                    if size >= 5e7:
-                        parts.append({"kind": "shared", "label": labels.get(name, name), "gb": round(size / 1e9, 1)})
-            except Exception:                                # noqa: BLE001 - the plan still shows the rest
-                pass
         gb = round(sum(p["gb"] for p in parts), 1)
         engine, here = True, []
-        if self.multi_file():                                # DeepSeek does not use the Strata engine: nothing about it in the plan (its own package is in the placement)
-            return {"gb": gb, "parts": parts, "engine_missing": False, "engine_usable": True, "own_files": st.own_files,
-                    "text": ("Nothing to download: your model files are used where they are." if gb < 0.05 and st.own_files else
-                             "Nothing to download: the model is already on this computer." if gb < 0.05 else
-                             f"About {gb:.1f} GB to download" + (": " + ", ".join(f"{p['label']} ({p['gb']:.1f} GB)" for p in parts if p["kind"] == "shared") + "."
-                                                                  if any(p["kind"] == "shared" for p in parts) and st.own_files else ".")
-                             + (" The drafter is part of the model's prepared data and is fetched even with --dspark off."
-                                if any(p["label"] == "the DSpark drafter" for p in parts) else ""))}
         try:
             report = engine_component.status(Path(self.components_dir) if self.components_dir else None)
             engine = bool(report.get("usable"))
@@ -2551,8 +2270,6 @@ class Runner:
                 text += (f" This is a ready-made pack, and setup takes it from its own folder ({gap['folder']}), not from where your files are. "
                          "Copy or link your pack there to use it as it is" +
                          (f"; only {gap['free_gb']:.0f} GB are free on that drive, so choose a bigger drive with --data-dir" if gap.get("free_gb") is not None and gap["free_gb"] < gap["gb"] else "") + ".")
-            if any(p["label"] == "the DSpark drafter" for p in parts if p["kind"] == "shared"):
-                text += " The drafter is part of the model's prepared data and is fetched even with --dspark off."
             if any(p["kind"] == "mmproj" for p in parts):
                 text += " To skip the picture reader (the model then answers text only), add --vision off; or put its mmproj file next to your model files."
             if any(p["kind"] == "mtp" for p in parts):
@@ -2630,61 +2347,8 @@ class Runner:
         model = {"title": title, "family": s.family, "model": s.model, "model_gb": row.download_gb if row is not None else None,
                  "own_files": bool(s.model_path), "folder": s.model_path}
         out = {"profile": self.profile, "settings": s.to_dict(with_key=False), "warnings": warns,
-               "flags": S.flags_text(s), "steps": list(STAGES), "model": model, "download": download, "drafting": self.drafting_plan_line(),
-               "speed": self.speed_line()}
-        if self.multi_file():
-            out["placement"] = self.placement()
-            if self.s.parallel and self.s.parallel > 1:      # only when asked for: a plan without --parallel is what it was
-                out["parallel"] = self.parallel_plan()
+               "flags": S.flags_text(s), "steps": list(STAGES), "model": model, "download": download, "drafting": self.drafting_plan_line()}
         return out
-
-    def parallel_plan(self) -> dict:
-        """DeepSeek `--parallel N` for --plan: how many conversations at once, and in plain words what it does with the measured numbers
-        (strata_control/dsv41_parallel.py).  Nothing is changed."""
-        from strata_control import dsv41_parallel
-        return {"requested": self.s.parallel, "conversations": dsv41_parallel.clamp(self.s.parallel),
-                "lines": dsv41_parallel.explain(self.s.parallel, self.s.context)}
-
-    def resolved_speed(self) -> tuple[str, bool] | None:
-        """DeepSeek's speed: ("faster" | "full", whether it is the default for this PC); None for any other model. The default is the engine's own
-        rule (`--experts auto`: 5 when the cards used total 16 GiB or less); only an explicit choice is written as --experts."""
-        if not self.multi_file() or not self.speed_engine_ok():
-            return None
-        try:
-            default = faster_by_default(self.catalog.computer(), self.s)
-        except Exception:                                    # noqa: BLE001 - when the cards cannot be read, the engine's own default stands
-            default = False
-        if self.s.speed in S.SPEED_MODES:
-            return self.s.speed, (self.s.speed == "faster") == default
-        return ("faster" if default else "full"), True
-
-    def speed_engine_ok(self, exe=None) -> bool:
-        """The DeepSeek engine this launch will run takes --experts (0.1.50 or newer; the self-upgrade normally brings it first, but nothing relies
-        on that). `exe`: the engine a config names; else the one launch finds. No engine yet, or an older one: False, and the Speed choice stays out."""
-        if exe is None:
-            try:
-                exe = self.dsv41_engine_found()[0]
-            except Exception:                                # noqa: BLE001
-                exe = None
-        return engine_takes_experts(exe)
-
-    def experts_flag(self, exe=None) -> int | None:
-        """The engine's --experts for this launch: 5 or 6 only when the person chose and the engine takes it; None (nothing is passed, the engine's
-        `--experts auto` decides) when they did not, for an engine that is too old, and for a model that has no such choice."""
-        if not self.multi_file() or self.s.speed not in S.SPEED_MODES or not self.speed_engine_ok(exe):
-            return None
-        return 5 if self.s.speed == "faster" else 6
-
-    def speed_line(self, engine_experts: int | None = None) -> str:
-        """The speed line of --plan and of the summary, in plain words, with the quality note when it is Faster. `engine_experts`: what the
-        running engine said at its start ("experts per word: N"); it wins over the rule above, so the words are always the engine's."""
-        speed = self.resolved_speed()
-        if speed is None:
-            return ""
-        if engine_experts is not None and not self.s.speed:
-            speed = ("faster" if engine_experts < 6 else "full", True)
-        text = "Speed: " + S.speed_words(speed[0], speed[1])
-        return text + (". " + S.FASTER_NOTE if speed[0] == "faster" else "")
 
     def feed_without_draft_layer(self, family: str | None = None) -> bool:
         """A model of the signed feed whose entry says `drafter: none` (strata_control/feed_models.py puts it on the family): nothing drafts, whatever Auto would pick for a Flash-Next model.
@@ -2700,10 +2364,6 @@ class Runner:
         from strata_control import drafting
         if self.feed_without_draft_layer():                  # the model list says this model has no draft layer: setup fetches none and the engine starts without a drafter
             return drafting.summary_line(drafting.Decision("off", "off"))
-        if self.multi_file():                                # DeepSeek drafts with its own DSpark drafter (the --dspark auto the config writes), not MTP
-            if sys.platform == "darwin":
-                return "Drafting: off (DeepSeek's drafter was not faster on a Mac)"
-            return "Drafting: DSpark (used when it speeds up answers on this computer)"
         try:
             base, cfg = self.installed_state()
             want = self.drafting_inputs(cfg or {})
@@ -2717,147 +2377,6 @@ class Runner:
             return drafting.summary_line(drafting.decide(**want, **sig))
         except Exception:                                    # noqa: BLE001
             return ""
-
-    def dsv41_engine_missing(self, cfg: dict) -> bool:
-        """An installed DeepSeek model whose config names an engine that is gone (an older package folder an update removed, or another install's) while
-        this install has no DeepSeek engine package either: not 'already installed' - setup runs, which fetches the package through the feed or says in
-        one plain line what to do (--dsv41-package, or the engine-dsv41 folder), instead of the start failing on a missing file."""
-        if cfg.get("arch") != "deepseek41":
-            return False
-        exe = str(cfg.get("exe") or "")
-        if exe and Path(exe).is_file():
-            return False
-        return self.dsv41_engine_found()[0] is None
-
-    def use_own_dsv41_engine(self, cfg: dict) -> None:
-        """DeepSeek: the run config's engine is the DeepSeek engine package of THIS install (engine-dsv41/ here), not the path the installed model's
-        config was written with: that config can come from another Strata install on this computer (the model is shared between installs) or name
-        an older package folder that an update has replaced.  Only when this install has no package does the config's own path stay."""
-        if cfg.get("arch") != "deepseek41":
-            return
-        found, _known = self.dsv41_engine_found()
-        if found is None:
-            return
-        found = self.upgrade_dsv41_engine(found)
-        old = str(cfg.get("exe") or "")
-        choice = getattr(self, "dsv41_choice", None)
-        if choice and choice[0] == str(found):
-            self.emit("engine", f"DeepSeek engine: {found} ({choice[1]}).", None)
-        if os.path.normcase(os.path.normpath(old)) != os.path.normcase(os.path.normpath(str(found))):
-            cfg["exe"] = str(found)
-            if old:
-                self.notices.append("DeepSeek runs on this install's own engine package, not the one the model's earlier settings named.")
-        libs = [d for d in (cfg.get("lib_dirs") or []) if "engine-dsv41" not in str(d)]
-        from strata_control import dsv41_engine
-        cfg["lib_dirs"] = [*libs, *dsv41_engine.lib_dirs(found)]     # its own folder, and rocm/bin for a Windows HIP package
-
-    def upgrade_dsv41_engine(self, found: Path) -> Path:
-        """The installed DeepSeek engine stays as it is: a launch never reaches the update feed and never installs, replaces or removes an engine
-        (owner, 11-01: an engine update is the person's choice, `strata update`, and never beside a loaded model; test_no_acquisition). What it
-        does is local: when the last check found a newer DeepSeek engine, one quiet line says so."""
-        try:
-            from strata_control import engine_update
-            line = engine_update.notice_line(None, "Update with `strata update` when no model is running.")
-            found_notice = engine_update.notice(None)
-            if line and found_notice and found_notice.get("dsv41") and line not in self.notices:
-                self.notices.append(line)
-        except Exception:                                    # noqa: BLE001 - a nicety
-            pass
-        return found
-
-    def dsv41_engine_found(self) -> tuple[Path | None, bool | None]:
-        """(strata-dsv41 already installed, or None; whether the engine can be told at all).  Looks where setup puts DeepSeek's own engine package
-        (engine-dsv41/ beside the engine, in Strata's own folder, and in the data folder), and at STRATA_DSV41_EXE (a build of your own)."""
-        from strata_control import dsv41_engine
-        own = (os.environ.get("STRATA_DSV41_EXE") or "").strip()
-        if own:
-            return (Path(own) if Path(own).is_file() else None), True
-        # The install this Terminal RUNS from (STRATA_INSTALL_DIR, else the folder its strata_cli comes from) and the install the model's settings live in
-        # (catalog.root: the first remembered install, which after an update or on a computer with several installs can be an older one) can both hold a
-        # DeepSeek engine package: the NEWEST version wins, the running Terminal's own on a tie, and the answer is logged.
-        roots: list[Path] = []
-        for r in (os.environ.get("STRATA_INSTALL_DIR"), self.catalog.src, self.catalog.root):
-            if r and not any(os.path.normcase(os.path.normpath(str(r))) == os.path.normcase(os.path.normpath(str(x))) for x in roots):
-                roots.append(Path(r))
-        picks = []
-        for i, r in enumerate(roots):
-            exe = dsv41_engine.find(r / dsv41_engine.DIR)
-            if exe is not None:
-                picks.append((dsv41_engine.version_key(exe.parent.name), -i, exe, r))
-        if picks:
-            best = max(picks, key=lambda t: (t[0], t[1]))
-            why = ("this Terminal's own folder" if best[3] == roots[0] or best[3] == Path(self.catalog.src) else "the install the model's settings came from")
-            if len(picks) > 1:
-                why += f", the newest of {len(picks)} packages"
-            self.dsv41_choice = (str(best[2]), why)
-            return best[2], True
-        folders: list[Path] = [Path(self.catalog.root) / dsv41_engine.DIR]       # (nothing there: the older places, as before)
-        try:
-            from strata_control import engine_component as ec
-            rep = ec.status()
-            exe = (rep.get("engine") or {}).get("exe") if rep.get("usable") else None
-            if exe:
-                folder = Path(str(exe)).parent
-                folders += [folder.parent / dsv41_engine.DIR]
-                try:
-                    folders.append(self.catalog.strata.setup_module().dsv41_engine_dir(folder))
-                except Exception:                            # noqa: BLE001
-                    pass
-                known = True
-            else:
-                known = None
-        except Exception:                                    # noqa: BLE001
-            known = None
-        try:                                                 # where the setup this Terminal runs puts it (its own engine folder, or Strata's folder)
-            mod = self.catalog.strata.setup_module()
-            folders += [Path(self.catalog.root) / dsv41_engine.DIR,      # setup runs here in the app's installer mode: its home() is this folder
-                        mod.dsv41_engine_dir(Path(mod.ROOT) / "engine"), Path(mod.home()) / dsv41_engine.DIR]
-        except Exception:                                    # noqa: BLE001
-            pass
-        try:
-            folders.append((Path(self.s.data_dir) if self.s.data_dir else self.catalog.data_dir()) / dsv41_engine.DIR)
-        except Exception:                                    # noqa: BLE001
-            pass
-        for f in folders:
-            found = dsv41_engine.find(f)
-            if found is not None:
-                return found, True
-        for f in folders[:1]:                                # the engine's own folder: an all-in-one package carries it
-            for n in ("strata-dsv41", "strata-dsv41.exe"):
-                if (f.parent / n).is_file():
-                    return f.parent / n, True
-        return None, known
-
-    def dsv41_engine(self) -> bool | None:
-        """Whether the installed engine carries strata-dsv41 (True / False); None when no engine is installed yet or it cannot be told."""
-        found, known = self.dsv41_engine_found()
-        return True if found is not None else (False if known else None)
-
-    def placement(self) -> dict:
-        """Where DeepSeek-V4.1-Flash would go on this computer's cards (strata_control/dsv41_fit.py): the cards this launch names, else every
-        card that counts; the real numbers in plain words, with the n-gram table's SSD note and the RAM / disk warnings (never a refusal)."""
-        s = self.s
-        hw = self.catalog.hardware()
-        try:
-            data = Path(s.data_dir) if s.data_dir else self.catalog.data_dir()
-            free = None if (s.model_path or self.model_state().remaining_gb < 1) else self.catalog.disk_free(data)
-        except Exception:                                    # noqa: BLE001 - a plan that cannot read the disk still shows the rest
-            free = None
-        p = self.catalog.strata.dsv41_plan(hw, free, s.gpus, model=s.model)
-        warnings = list(p["warnings"])
-        found, known = self.dsv41_engine_found()
-        engine = True if found is not None else (False if known else None)
-        if found is not None:
-            ver = next((part for part in (found.parent.name.split("-")[0], ) if part[:1].isdigit()), "")
-            p["lines"].append("DeepSeek engine: installed" + (f", {ver}" if ver else "") + ".")
-        if engine is False:
-            warnings.append("DeepSeek runs on its own engine package (about 430 MB, separate from the Strata engine): setup downloads it first. "
-                            "If it cannot be fetched, setup stops with a message before the model is downloaded.")
-        return {"verdict": p["verdict"], "lines": p["lines"], "warnings": warnings, "cards": p["cards"], "args": p["args"],
-                "engine_has_dsv41": engine,
-                "experts_in_vram": p["experts_in_vram"], "experts_total": p["experts_total"], "vram_experts_gb": p["vram_experts_gb"],
-                "cpu_experts_gb": p["cpu_experts_gb"], "ram_needed_gb": p.get("ram_needed_gb"), "engram_gb": p["engram_gb"],
-                "download_gb": p["download_gb"], "measured": p["measured"]}
 
     def run(self, *, start: bool = True) -> Result:
         self.restart_after = start

@@ -8,7 +8,7 @@ Inputs: docs/data/capabilities.json (what the docs commit to) and docs/data/rele
 "packaged" column is read from the release's package names, never typed.  Checks:
   * a family marked "yes" or "untested" on some hardware has a package for it in the release, and one marked "no" has none;
   * every package of a family lands in a column of the table;
-  * docs/CAPABILITIES.md and every `<!-- cap:... -->` block in AI_SETUP, AI_REFERENCE and MEDIA_KIT are what the
+  * docs/CAPABILITIES.md and every `<!-- cap:... -->` block in AI_SETUP and AI_REFERENCE are what the
     generator would write (so a page cannot keep a sentence the table contradicts).
 Block syntax in a page:  <!-- cap:summary:FAMILY -->text<!-- /cap -->   <!-- cap:cell:FAMILY:COLUMN -->text<!-- /cap -->
 Standard library only.
@@ -26,7 +26,7 @@ ROOT = doc_pages.ROOT
 DATA = os.path.join(ROOT, "docs", "data", "capabilities.json")
 RELEASE = os.path.join(ROOT, "docs", "data", "release.json")
 OUT = "docs/CAPABILITIES.md"
-PAGES = ["docs/AI_SETUP.md", "docs/AI_REFERENCE.md", "docs/MEDIA_KIT.md"]
+PAGES = ["docs/AI_SETUP.md", "docs/AI_REFERENCE.md"]
 
 ASSET_RE = re.compile(r"^strata-(engine|dsv41)-(\d+(?:\.\d+)*)-(windows|linux|macos)-(x86_64|aarch64|arm64)-(cuda|hip|sycl|metal)(?:-(.+?))?\.(?:tar\.gz|zip)$")
 COLUMN_OF = {("windows", "cuda"): "nvidia_win", ("linux", "cuda", "x86_64"): "nvidia_linux", ("linux", "cuda", "aarch64"): "nvidia_spark",

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { autostartModel } from './autostart.mjs';
 import { engineProgressMark } from './agent/engine-progress.mjs';
 import './system-ca.mjs';        // #3722: the operating system's certificates, before any HTTPS request
 import { createCloudflare } from './cloudflare.mjs';
@@ -257,7 +258,8 @@ function runtimeState(){
   return runtimeModels.state();
 }
 
-const startupModelId = process.env.STRATA_REAL_ENGINE === '1' ? (store.get().loaded ?? store.get().current) : null;
+/* A remembered DeepSeek model (Strata 0.2.13 and earlier) is not started and is not cleared: server/autostart.mjs logs the refusal and writes nothing. */
+const startupModelId = autostartModel(store.get());
 if (startupModelId) {
   monitor.setModel(startupModelId);
   const lastId = startupModelId;

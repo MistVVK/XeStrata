@@ -304,44 +304,15 @@ class FeedTool(unittest.TestCase):
 
 
 class DeepSeekEnginePackages(FeedChecks):
-    """The ``dsv41`` feed member: the DeepSeek engine is its own download, never one of the ``engine`` packages."""
+    """The ``dsv41`` feed member stays in the feed, frozen, for Strata 0.2.13 and earlier (their DeepSeek engine); this Control runs no
+    DeepSeek model and does not read it (strata_control/retired.py)."""
 
-    def test_the_member_is_parsed_apart_from_the_engine_list(self):
+    def test_the_member_is_ignored_and_is_never_an_engine_package(self):
         ds = entry(version="0.1.49", variant="cuda13", url="dsv41/strata-dsv41-0.1.49-linux-x86_64-cuda-cuda13.tar.gz")
         feed = self.load(*signed(document(dsv41={"packages": [ds]}), self.key))
-        self.assertEqual([p.label for p in feed.dsv41], ["0.1.49 linux-x86_64-cuda-cuda13"])
+        self.assertFalse(hasattr(feed, "dsv41"))
         self.assertEqual([p.version for p in feed.engine], ["0.1.46"], "a DeepSeek package is not an engine package")
-
-    def test_a_feed_without_the_member_has_none_and_a_malformed_member_is_an_error(self):
-        self.assertEqual(self.load(*signed(document(), self.key)).dsv41, ())
-        with self.assertRaises(feedmod.FeedError):
-            self.load(*signed(document(dsv41={"packages": "x"}), self.key))
-        with self.assertRaises(feedmod.FeedError):
-            self.load(*signed(document(dsv41={"packages": [entry(), entry()]}), self.key))
-
-    def test_the_selection_is_made_from_the_dsv41_list_only(self):
-        ds = entry(version="0.1.49", archs=("sm_86", "sm_120"))
-        feed = self.load(*signed(document(dsv41={"packages": [ds]}), self.key))
-        hw = {"platform": "linux-x86_64", "gpus": [{"vendor": "nvidia", "arch": "sm_86", "driver": "590.0"}]}
-        try:
-            picked, _ = feedmod.select_engine(feed.dsv41, hw)
-        except Exception:                                   # noqa: BLE001 - the hardware dict shape is Control's; only the list matters here
-            return
-        self.assertTrue(picked is None or picked.version == "0.1.49")
-
-    def test_the_tool_packs_with_the_prefix_and_writes_the_member(self):
-        from feed_tool import build_feed, keygen
-        with tempfile.TemporaryDirectory() as folder:
-            keygen(Path(folder) / "keys")
-            key = json.loads((Path(folder) / "keys" / "feed-key.json").read_text())
-            d = Path(folder) / "dsv41"
-            d.mkdir()
-            (d / "x.entry.json").write_text(json.dumps(entry(version="0.1.49")), encoding="utf-8")
-            release = Path(folder) / "release"
-            doc = build_feed(release, key=key, sequence=3, dsv41_dir=d)
-            self.assertEqual(len(doc["dsv41"]["packages"]), 1)
-            self.assertNotIn("engine", doc)
-
+        self.assertEqual(feed.skipped, ())
 
 class AppPlatform(unittest.TestCase):
     """`feed_tool.py set-app-platform`: the signed Mac archive goes into the Tauri updater json, and only if it verifies."""

@@ -37,7 +37,6 @@ class Class(unittest.TestCase):
                 self.assertFalse(F.applies(CARDS, fresh(model_name=name, args=["--pack", "/p/x"])))
         self.assertTrue(F.applies(CARDS, fresh()))
         self.assertFalse(F.applies(CARDS, fresh(backend="cuda")))
-        self.assertFalse(F.applies(CARDS, fresh(arch="deepseek41")))
         self.assertFalse(F.applies(CARDS, fresh(args=CFG["args"] + ["--peer-device", "1"])))
 
 

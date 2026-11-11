@@ -1,7 +1,7 @@
 # Strata Engine - top-level build.
 #
 # One project builds the engine for every backend: CUDA (STRATA_ENABLE_CUDA), HIP (STRATA_ENABLE_HIP; the layer-split
-# and DeepSeek engines are the STRATA_BUILD_SPLIT / STRATA_BUILD_DSV41 options), the CPU-only build, and the test
+# engine is the STRATA_BUILD_SPLIT option), the CPU-only build, and the test
 # programs.  The Intel Arc (SYCL) engine is a separate project in sycl/ (STRATA_ENABLE_SYCL), and the Metal engine
 # one in metal/.  CMakePresets.json has the CPU check preset (`cmake --preset cpu-check`) and the compile-only
 # backend presets used by tools/check and the CI workflows; the release scripts in packaging/ pass their own flags.
@@ -629,13 +629,6 @@ endif()
 
 # ---- HIP gfx906: every CUDA source of the tree (and the ggml-cuda MMQ sources) is compiled as HIP ----
 strata_hip_gfx906_sources()
-
-# ---- DeepSeek-V4.1 on a box with no GPU toolkit ------------------------------------------------
-# The whole DSV41 block above lives inside if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP), so with neither backend on
-# -DSTRATA_BUILD_DSV41=ON was silently unused and the host-side benchmark could not be built at all (found on p1004,
-# 2026-10-23: the CPU lane is exactly what a box without a usable GPU needs to measure).  This branch builds the one target
-# that has no device code, so the CPU-lane A/B runs anywhere.
-strata_cpu_dsv41_host_bench()
 
 # ---- strata-split: the opt-in engine that splits every layer across 2-4 NVIDIA cards (src/split, from sFNX, MIT, John Fink) ----
 # OFF by default, Linux + CUDA or HIP only, no other target depends on it; see src/split/CMakeLists.txt and docs/SPLIT_ENGINE.md.

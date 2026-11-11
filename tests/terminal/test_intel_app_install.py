@@ -142,11 +142,6 @@ class InstallPlan(unittest.TestCase):
         self.assertNotIn("--gguf-dir", args)
         self.assertTrue(plan["partly_downloaded"])
 
-    def test_a_model_the_run_config_cannot_be_written_for_is_refused(self):
-        with self.assertRaises(M.ToolError) as raised:
-            self.plan([A750], family="deepseek41", model="IST-DAS-2.00bpw", gguf_dir=None)
-        self.assertIn("Intel Arc", str(raised.exception))
-
     def test_nvidia_and_amd_requests_are_byte_identical_to_before(self):
         with tempfile.TemporaryDirectory() as t:
             folder = Path(t) / "Q2_0"

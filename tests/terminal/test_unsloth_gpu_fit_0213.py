@@ -1,6 +1,6 @@
 """0.2.13 (owner, 2026-11-08): one fit label for every family.  The model's files, download size MINUS the n-gram / PLE / Engram lookup table's file (the
 "Needs (RAM + VRAM)" column), against the graphics memory plus the RAM: "fits", else "may run slower".  Nothing else is said on those rows (no "SSD N GB", no
-"too big", no RAM floor), also with no card or a Mac with little memory; DeepSeek keeps only its disk message.
+"too big", no RAM floor), also with no card or a Mac with little memory.
 
 The screenshot PC: a Tesla V100-PCIE-32GB with 31 GB of RAM (63 GB together): every set up to 63 GB of weights said "fits"; the Unsloth sets said "too big" while
 IQ3_S, with the same 50 GB of experts, said "fits, a bit slower".
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import unittest
 
-from strata_cli.launch.catalog import FITS, NO, SLOWER, TIGHT, verdict
+from strata_cli.launch.catalog import FITS, NO, SLOWER, verdict
 from strata_control import fit_label
 from tests.terminal.launch_support import HW_12, Home, catalog
 
@@ -49,8 +49,6 @@ class TheTerminalMenu(unittest.TestCase):
     def test_the_v100_screenshot(self):
         rows = self.rows(HW_V100_31)
         for (family, model), r in rows.items():
-            if family == "deepseek41":
-                continue
             want = FITS if r.fit_gb <= 63.0 else SLOWER
             self.assertEqual((r.verdict, r.words), (want, "fits" if want == FITS else "may run slower"), (family, model, r.fit_gb))
         for m in ("UD-IQ1_M", "UD-Q2_0", "UD-IQ2_XS", "UD-Q2_K_XL", "UD-IQ3_XXS", "UD-Q3_K_XL"):         # the Unsloth sets that were "too big", 39 to 61 GB
@@ -61,11 +59,6 @@ class TheTerminalMenu(unittest.TestCase):
         self.assertEqual(rows[("qwen", "IQ3_S")].words, rows[("unsloth", "UD-IQ3_XXS")].words)             # same size, same word
         self.assertEqual({rows[("nvfp4", m)].words for m in ("NVFP4", "NVFP4-NVIDIA", "NVFP4-QAD")}, {"may run slower"})      # QAD too: the pack that runs is 76.8 GB
         self.assertEqual({round(rows[("nvfp4", m)].fit_gb, 1) for m in ("NVFP4", "NVFP4-NVIDIA", "NVFP4-QAD")}, {76.8})
-        for key, r in rows.items():
-            if key[0] == "deepseek41":                                    # the whole size (download minus the 110.6 / 202.8 GB Engram file) is the "Needs" figure
-                self.assertGreater(r.fit_gb, 70, key)
-                self.assertEqual(r.words, "may run slower", key)
-        self.assertEqual(round(rows[("deepseek41", "IST-DAS-2.00bpw")].fit_gb, 1), 146.2)                  # 256.8 - 110.6, not the CPU's 40 GB share
 
     def test_no_row_uses_the_old_words(self):
         for hw in (HW_V100_31, HW_12, {**HW_12, "ram_gb": 16.0, "gpus": []}):
@@ -73,20 +66,13 @@ class TheTerminalMenu(unittest.TestCase):
                 self.assertNotEqual(r.verdict, NO, key)                    # nothing is "too big" any more
                 for old in ("too big", "fits, a bit slower", "fits, part read from SSD", "much read from SSD", "does not fit", "slow here"):
                     self.assertNotIn(old, r.words, (key, r.words))
-                self.assertIn(r.words, ("fits", "may run slower", "tight: needs more disk space"), key)
+                self.assertIn(r.words, ("fits", "may run slower"), key)
 
     def test_a_64_gb_pc_with_a_12_gb_card(self):
         rows = self.rows({**HW_12, "disk_free_gb": 5000.0})                # 76 GB together
         self.assertEqual(rows[("unsloth", "UD-IQ4_XS-v31")].words, "fits")                    # 64.9 GB
         self.assertEqual(rows[("unsloth", "UD-Q4_K_XL")].words, "may run slower")           # 82.5 GB
         self.assertEqual(rows[("nvfp4", "NVFP4")].words, "may run slower")                    # 76.8 GB against 75.9
-
-    def test_deepseek_keeps_the_two_messages_that_are_not_about_memory(self):
-        rows = self.rows({**HW_V100_31, "disk_free_gb": 100.0})
-        self.assertEqual((rows[("deepseek41", "IST-DAS-2.00bpw")].verdict, rows[("deepseek41", "IST-DAS-2.00bpw")].words), (TIGHT, "tight: needs more disk space"))
-        no_card = self.rows({**HW_V100_31, "gpus": []})                                       # no card: the same two words, not "too big"
-        self.assertEqual((no_card[("deepseek41", "IST-DAS-2.00bpw")].verdict, no_card[("deepseek41", "IST-DAS-2.00bpw")].words), (SLOWER, "may run slower"))
-        self.assertEqual(no_card[("qwen", "IQ3_S")].words, "may run slower")                  # 54.8 GB against 31 GB of RAM
 
     def test_the_catalog_words(self):
         with Home():

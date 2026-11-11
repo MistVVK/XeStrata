@@ -177,6 +177,14 @@ def _summary(model_id: str, path: Path, raw: bytes, cfg: dict, report: dict) -> 
 
 def _inspect_one(model_id: str, path: Path) -> tuple[dict, dict]:
     raw, cfg = _read(path)
+    from strata_control import retired
+    if retired.config_reason(cfg) or retired.config_file_reason(path):
+        # DeepSeek: listed so the person sees it and where its files are, never inspected, started or written (strata_control/retired.py)
+        report = {"ok": False, "issues": []}
+        summary = _summary(model_id, path, raw, cfg, report)
+        summary.update(component_status="retired", retired="deepseek", name=retired.title(cfg, path), retired_line=retired.row_line(cfg),
+                       refusal=retired.refusal(cfg, retired.title(cfg, path)), execution_compatibility="retired")
+        return summary, report
     try:
         report = inspect_components(path)
         after, _ = _read(path)
@@ -340,8 +348,6 @@ def _already_set_up(shards: list[Path], candidate: dict | None) -> dict | None:
 
 
 ISSUE_WORDS = {
-    "not_on_this_mac": "Unsloth's UD-IQ1_M set doesn't run on a Mac yet; the UD-IQ1_S, 2.00 and 2.25 sets do",
-    "not_on_this_spark": "Unsloth's 1-bit DeepSeek sets were not tested on a DGX Spark yet; the 2.00 and 2.25 sets were",
     "multiple_model_groups": "the folder holds more than one model",
     "incomplete_or_invalid_shard_set": "some parts of the model are missing",
     "unrecognized_or_unsupported_model_variant": "this is not a model size Strata knows",
@@ -370,11 +376,6 @@ _REASON_WORDS = (
     ("unsupported_architecture", "this model type is not supported by the Strata engine (add it as a Custom model API with llama-server instead)"),
     ("symlink", "this is a shortcut (symbolic link) that cannot be followed"),
 )
-
-
-def _not_here(model: str) -> str | None:
-    from strata_control import dsv41_fit
-    return dsv41_fit.not_here(model)
 
 
 def plain_issue(code: str) -> str:
@@ -620,107 +621,6 @@ def own_path_problem(picked: str) -> tuple[str, str] | None:
     return None
 
 
-def _dsv41_files(folder: Path) -> dict[str, int]:
-    """{name: bytes} of the .gguf files in one folder (a link to a file is followed)."""
-    found: dict[str, int] = {}
-    try:
-        with os.scandir(folder) as entries:
-            for entry in entries:
-                if not entry.name.lower().endswith(".gguf"):
-                    continue
-                try:
-                    found[entry.name] = entry.stat().st_size
-                except OSError:
-                    continue
-    except OSError:
-        pass
-    return found
-
-
-def _dsv41_plan(path: Path, details) -> dict | None:
-    """The preview of a folder (or one file) of an official DeepSeek-V4.1-Flash set: the ISTA-DAS 1.75 / 2.00 / 2.25 shards, under their
-    official names or the first release's, with or without the n-gram table (Engram). Recognised from the pinned names and sizes
-    (strata_control/dsv41_sets.py); None when nothing here is a DeepSeek file, so every other preview is exactly what it was."""
-    from strata_control import dsv41_sets
-    picked = path if stat.S_ISREG(details.st_mode) else None
-    if picked is not None and not picked.name.lower().endswith(".gguf"):
-        return None
-    if dsv41_sets.tables() is None:
-        return None
-    places = [path.parent] if picked is not None else [path]
-    found: list[tuple[Path, dict]] = []
-    for place in places:
-        for row in dsv41_sets.match(_dsv41_files(place)):
-            if picked is None or picked.name in row["present"] or picked.name == row["engram"]:
-                found.append((place, row))
-    if not found and picked is None:
-        try:
-            for place in _folders_with_models(path)[:8]:
-                for row in dsv41_sets.match(_dsv41_files(place)):
-                    found.append((place, row))
-        except OSError:
-            pass
-    if not found:
-        return None
-    complete = [(place, row) for place, row in found if row["complete"]]
-    issues: list[str] = []
-    messages: list[str] = []
-    folder_holds: list[dict] = []
-    missing_shards: list[str] = []
-    candidate = None
-    place, row = (complete[0] if complete else found[0])
-    if len(complete) > 1:
-        issues.append("multiple_model_groups")
-        folder_holds = [{"file": r["present"][0], "files": len(r["present"]), "folder": str(p), "family": dsv41_sets.FAMILY, "model": r["model"]}
-                        for p, r in complete]
-        names = [f"DeepSeek-V4.1-Flash {r['label']} ({r['present'][0]})" for _p, r in complete]
-        messages.append(f"The folder holds {len(complete)} DeepSeek sets: " + "; ".join(names) +
-                        ". Choose the .gguf file of the one you want.")
-    elif not complete:
-        issues.append("incomplete_or_invalid_shard_set")
-        missing_shards = list(row["missing"]) + list(row["wrong_size"])
-    else:
-        candidate = {"family": dsv41_sets.FAMILY, "model": row["model"], "basis": "known_names_and_sizes", "expected_expert_types": [],
-                     "expected_tensor_count": None,
-                     "setup_args_hint": ["--family", dsv41_sets.FAMILY, "--model", row["model"], "--gguf-dir", str(place)]}
-        line = _not_here(row["model"])
-        if line:       # recommend, never force: say what does work and stop before anything is copied or packed (Mac: no Metal IQ1_S kernel; DGX Spark: never run)
-            issues.append("not_on_this_mac" if sys.platform == "darwin" else "not_on_this_spark")
-            candidate = None
-            messages.append(line)
-        messages.append(f"This is DeepSeek-V4.1-Flash, {row['label']}: all {len(row['present'])} model files are here"
-                        + (", and the n-gram table." if row["engram"] else "."))
-        if not row["engram"]:
-            messages.append("The n-gram table (111 GB) is not in this folder: setup downloads it, or put engram-IQ4_NL.gguf beside the model files.")
-        if row["legacy"]:
-            messages.append("These are the file names of the first release; Strata uses them as they are.")
-        if row.get("layout") == "six":
-            messages.append("These are ISTA-DASLab's six-shard files of 27 October 2026 (the Engram is the sixth part); Strata uses them as they are.")
-        if row.get("newer_first"):
-            messages.append("The first part is the version ISTA-DASLab re-published on 26 October 2026 (a larger chat template); Strata uses it as it is.")
-        messages.append("Strata checks the files once when it sets them up (about 5 minutes on a fast drive); nothing is copied or downloaded for them.")
-    sizes = _dsv41_files(place)
-    wanted = list(row["present"]) + ([row["engram"]] if row["engram"] else [])
-    files = [{"name": n, "path": str(place / n), "bytes": sizes.get(n, 0), "gguf_version": None} for n in sorted(wanted)]
-    shards = [place / n for n in sorted(row["present"])]
-    already = None
-    if candidate is not None and shards:
-        try:
-            already = _already_set_up(shards, candidate)
-        except Exception:                               # noqa: BLE001 - only a convenience for the screen
-            already = None
-    return {"source": str(path), "model_dir": str(place), "scope": "local_gguf_candidate", "files": files, "file_count": len(files),
-            "total_bytes": sum(item["bytes"] for item in files), "metadata": None, "candidate_selection": candidate,
-            "plain_issues": list(dict.fromkeys((missing_words(missing_shards) if (i == "incomplete_or_invalid_shard_set" and missing_shards)
-                                                else plain_issue(i)) for i in issues)),
-            "observed_expert_types": [], "observed_tensor_count": 0, "ignored_auxiliary_files": [], "projectors": [], "messages": messages,
-            "already_set_up": already, "reads_pictures": False, "folder_holds": folder_holds, "missing_shards": missing_shards,
-            "file_set_status": "plausible" if not issues else "invalid_or_incomplete", "issues": issues,
-            "adoption_status": "requires_name_size_sha256_and_engine_checks", "execution_compatibility": "unverified", "would_write": False,
-            "notes": ["The names and sizes are the pinned ones of the official sets; setup checks every SHA-256 once before it adopts them",
-                      "No model is adopted or copied by this preview"]}
-
-
 def plan_import(raw_path: str) -> dict:
     """Inspect a local candidate without copying, parsing tensors or adopting it.
 
@@ -735,9 +635,9 @@ def plan_import(raw_path: str) -> dict:
         details = path.stat()
     except OSError:
         raise ProfileError("model import path does not exist (or is a link to something that is gone)", 5) from None
-    official_deepseek = _dsv41_plan(path, details)         # ISTA-DAS sets under their official or first-release names
-    if official_deepseek is not None:
-        return official_deepseek
+    from strata_control import retired
+    if retired.folder_reason(path):                    # DeepSeek files: named, never set up (strata_control/retired.py)
+        raise ProfileError(retired.own_files(path), 5)
     notes: list[str] = []
     folder_holds: list[dict] = []
     issues: list[str] = []

@@ -308,7 +308,6 @@ class OnDemandByDefault(unittest.TestCase):
         self.assertFalse(f(self.cfg(args=["--vision", "--kv-grow"])))
         self.assertTrue(f(self.cfg(args=["--vision", "--resident-budget-gib", "30"])))   # no cache to shrink is needed
         self.assertFalse(f(self.cfg(parallel=4)))
-        self.assertFalse(f(self.cfg(arch="deepseek41")))
         c = self.cfg()
         c.pop("vision")
         self.assertFalse(f(c))

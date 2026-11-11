@@ -71,24 +71,16 @@ class ByPathToolsAreBundled(unittest.TestCase):
     def tearDownClass(cls):
         cls.temp.cleanup()
 
-    def test_the_scan_finds_the_deepseek_scripts(self):
+    def test_the_scan_finds_the_by_path_tools(self):
         # (a scan that finds nothing would make the next test pass for the wrong reason)
         refs = referenced_tools()
-        for name in ("tools/dsv41/pack_gguf.py", "tools/dsv41/smoke.py", "tools/dsv41/tune.py", "tools/iq_pack.py", "tools/mtp_fetch.py"):
+        for name in ("tools/iq_pack.py", "tools/mtp_fetch.py"):
             self.assertIn(name, refs)
         self.assertGreaterEqual(len(refs), 12)
 
     def test_every_file_run_by_path_is_in_the_bundle(self):
         missing = {p: sorted(by) for p, by in referenced_tools().items() if p not in NOT_BUNDLED and not (self.root / p).is_file()}
         self.assertEqual(missing, {}, f"run by path, absent from the packaged Terminal: {missing}")
-
-    def test_the_deepseek_scripts_start_from_the_bundle_alone(self):
-        env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH",)}
-        for rel in ("tools/dsv41/pack_gguf.py", "tools/dsv41/smoke.py", "tools/dsv41/tune.py"):
-            with tempfile.TemporaryDirectory() as cwd:
-                done = subprocess.run([sys.executable, str(self.root / rel), "--help"], capture_output=True, text=True, cwd=cwd, env=env, timeout=120)
-            self.assertEqual(done.returncode, 0, f"{rel} --help from the bundle: {done.stderr[-400:]}")
-
 
 if __name__ == "__main__":
     unittest.main()

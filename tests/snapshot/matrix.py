@@ -59,7 +59,6 @@ class ModelSet:
     model: str                    # setup.py's --model
     model_name: str               # the run config's model_name
     shards: tuple[str, ...]
-    multi_file: bool = False
 
 
 MODEL_SETS: tuple[ModelSet, ...] = (
@@ -71,8 +70,6 @@ MODEL_SETS: tuple[ModelSet, ...] = (
     ModelSet("ud_iq4_xs_v31", "unsloth", "UD-IQ4_XS-v31", "qwen3.8-flash-next-unsloth-ud-iq4_xs-v31",
              ("Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00004.gguf", "Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00004.gguf",
               "Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00004.gguf", "Qwen3.8-Flash-Next-UD-IQ4_XS-00004-of-00004.gguf")),
-    ModelSet("deepseek", "deepseek41", "IST-DAS-2.00bpw", "deepseek-v4.1-flash",
-             ("DeepSeek-V4.1-Flash-IQ2_XXS-00001-of-00004.gguf",), multi_file=True),
 )
 
 #: setup is listed so the table has its row; see driver.drive_setup for why it is not driven today.

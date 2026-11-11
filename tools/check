@@ -7,7 +7,7 @@ Runs, each in its own step with its own timeout, in a scratch folder (build tree
   py-tests        pytest tests/   (without tests/snapshot, which has its own step)
   py-serve        pytest serve/
   py-tools        pytest tools/test_*.py
-  py-optional     tools/dflash2, tools/dsv41, tools/trellis tests; need torch and are skipped without it
+  py-optional     tools/dflash2, tools/trellis tests; need torch and are skipped without it
   host-typecheck  apps/host: npm run typecheck
   host-test       apps/host: npm test (a per-test timeout, so a hang fails one test instead of the run)
   host-build      apps/host: npm run build
@@ -338,9 +338,9 @@ def step_optional(ctx):
     r = Result("py-optional")
     for mod, what in (("torch", "torch"),):
         if not have_module(mod):
-            r.reason = "%s is not installed for %s (tools/dflash2 and tools/dsv41 tests need torch)" % (what, sys.executable)
+            r.reason = "%s is not installed for %s (tools/dflash2 tests need torch)" % (what, sys.executable)
             return r
-    return step_pytest("py-optional", ["tools/dflash2", "tools/dsv41", "tools/trellis"])(ctx)
+    return step_pytest("py-optional", ["tools/dflash2", "tools/trellis"])(ctx)
 
 
 def npm_cmd():

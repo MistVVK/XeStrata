@@ -52,36 +52,6 @@
 
 </details>
 
-<details>
-<summary><img src="docs/media/models/deepseek.svg" width="22" alt="" align="middle"> &nbsp;<b>DeepSeekV4.1-Flash-1017</b></summary>
-
-可在**桌面应用**和**终端**中使用。内存放不下的部分会从 SSD 读取，所以需要大量空闲磁盘空间。
-
-| 版本（ISTA-DAS） | 下载大小 | 所需空闲磁盘 |
-| --- | ---: | ---: |
-| 1.75 bpw | 239 GB | 约245 GB |
-| 2.00 bpw | 257 GB | 约265 GB |
-| 2.25 bpw | 274 GB | 约280 GB |
-
-支持 NVIDIA RTX 30、40 和 50 系列（Windows 和 Linux）、AMD Radeon AI PRO R9700（Linux）、AMD Ryzen AI Max — Strix Halo（Windows），以及内存 64 GB 或以上的 Apple 芯片 Mac（[Mac](docs/DEEPSEEK_MAC.md)）。安装程序会下载模型文件和 DeepSeek 引擎，然后启动模型。
-
-```sh
-strata launch --family deepseek41 --model ist-das-2.00bpw --plan
-```
-
-以下为 Strata 0.2.5 上 2.00 bpw 版本的实测结果。“输出”是回答的速度，“提示词”是 Strata 读取你输入内容的速度。
-
-| 硬件 | 输出 | 提示词 |
-| --- | ---: | ---: |
-| RTX 5070 12 GB, 64 GB 内存 | 4 到 6 tokens/s | 约 110 tokens/s（4K） |
-| RTX 3060 12 GB, 46 GB 内存 | 9 到 11 tokens/s | 约 155 tokens/s（4K） |
-| 1x Radeon AI PRO R9700, 251 GB 内存 | 21 到 25 tokens/s | 320 到 360 tokens/s (8K) |
-| 4x Radeon AI PRO R9700 | 74 到 77 tokens/s | 400 到 450 tokens/s (8K) |
-
-[内存、磁盘和详细信息](docs/DEEPSEEK41.md) · [发行说明](https://github.com/Niko1221/Strata/releases)
-
-</details>
-
 <a id="the-other-sizes"></a>
 
 不确定哪个放得下？[为你的电脑选择模型](docs/MODELS.md#pick-by-memory)。

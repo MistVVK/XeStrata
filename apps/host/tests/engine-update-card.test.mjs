@@ -7,12 +7,12 @@ const src = name => read(new URL(`../${name}`, import.meta.url), 'utf8');
 test('the host passes the kept update check to the app without asking the network', () => {
   const host = src('server/native-control.mjs');
   assert.match(host, /updateAvailable:engine\.update_available\?\?null/, 'the snapshot carries what `components engine` kept');
-  assert.match(src('src/lib/native.ts'), /updateAvailable\?:\{engine\?:string\|null;dsv41\?:string\|null;app\?:string\|null\}\|null/);
+  assert.match(src('src/lib/native.ts'), /updateAvailable\?:\{engine\?:string\|null;app\?:string\|null\}\|null/);
 });
 
-test('one card, one button, only when an engine (Qwen or DeepSeek) is offered, and it runs the existing Update engine job', () => {
+test('one card, one button, only when an engine is offered, and it runs the existing Update engine job', () => {
   const card = src('src/components/EngineUpdateCard.tsx');
-  assert.match(card, /offer && \(offer\.engine \|\| offer\.dsv41\)/);
+  assert.match(card, /offer && offer\.engine\)/);
   assert.match(card, /nativeAction\('operations', \{ kind: 'update-engine' \}\)/);
   assert.equal((card.match(/<Btn /g) ?? []).length, 1, 'one button');
   assert.doesNotMatch(card, /fetch\(|api\.get|api\.post|XMLHttpRequest/, 'showing the card reads no network: only the kept state');
@@ -27,7 +27,7 @@ test('the card is on the Models screen once and nowhere else', () => {
   assert.doesNotMatch(src('src/components/GuidedSetup.tsx'), /EngineUpdateCard/);
 });
 
-test('an updated DeepSeek engine is reported as an engine, not as "Strata is updated"', () => {
+test('an updated engine is reported as an engine, not as "Strata is updated"', () => {
   const host = src('server/native-control.mjs');
-  assert.match(host, /x\.component==='engine'\|\|x\.component==='dsv41'\?'The engine is updated and ready\.'/);
+  assert.match(host, /x\.component==='engine'\?'The engine is updated and ready\.'/);
 });

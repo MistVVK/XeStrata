@@ -82,14 +82,13 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
     g.add_argument("--preset", metavar="NAME", help="start a saved preset (other flags change it for this start)")
     g.add_argument("--model", metavar="NAME", help="the model size, e.g. iq3_xxs, q2_0, ud-q4_k_xl (any case)")
     g.add_argument("--family", metavar="NAME", help="the model family when a size is offered by several (qwen, swift, coder, ...)")
-    g.add_argument("--dsv41-package", metavar="FILE", help="DeepSeek: the engine package you downloaded from the release page (.tar.gz or .zip); "
-                                                          "it is checked and installed instead of being fetched")
+    g.add_argument("--dsv41-package", metavar="FILE", help=argparse.SUPPRESS)        # DeepSeek (no longer run): accepted, answered in plain words
     g.add_argument("--model-path", metavar="PATH", help="use model files you already have: a folder of shards or one .gguf file")
     g.add_argument("--data-dir", metavar="DIR", help="where downloaded model files are stored (default: Strata's data folder)")
     g.add_argument("--move-data", action="store_true",
                    help="with --data-dir: move the models you already have into the new folder. Without it nothing is moved: your models stay "
                         "where they are and stay usable, and the new folder gets the new downloads")
-    g.add_argument("--context", type=_context, metavar="SIZE", help="how much text it remembers at once: 32k, 64k, 128k, 256k or a number of tokens (DeepSeek-V4.1-Flash: up to 512k and 1m)")
+    g.add_argument("--context", type=_context, metavar="SIZE", help="how much text it remembers at once: 32k, 64k, 128k, 256k or a number of tokens")
     g.add_argument("--kv", type=_choice("a memory format", S.KV_MODES), metavar="FORMAT", help="conversation memory format: int8 (default), q4_0 (half the memory), k8v4, fp16")
     g.add_argument("--vision", type=_choice("a picture setting", S.VISION_MODES), metavar="off|on|gpu|cpu",
                    help="let the model read pictures. Default: on when the model can read pictures and the engine has the picture reader. "
@@ -107,10 +106,8 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
                    help="NVIDIA, two or more cards: the engine that splits every layer across the cards (faster answers). auto (the default) uses it by itself "
                         "where it is supported and starts the normal layer split everywhere else; on asks for it and says in one line why it cannot run; "
                         "off never uses it. Your choice is saved with the preset")
-    g.add_argument("--speed", type=_choice("a speed", S.SPEED_MODES), metavar="faster|full",
-                   help="DeepSeek: faster uses 5 of 6 experts per word (a small quality change, usually not noticeable; the default on a PC with 16 GB "
-                        "of graphics memory or less, and on a single Radeon RX 9000 / AI PRO R9700 card, or several that hold half of the experts), full uses all 6")
-    g.add_argument("--full-quality", action="store_true", help="DeepSeek: all 6 experts per word (the same as --speed full), for scripts")
+    g.add_argument("--speed", metavar="WORD", help=argparse.SUPPRESS)                # DeepSeek (no longer run): accepted, answered in plain words
+    g.add_argument("--full-quality", action="store_true", help=argparse.SUPPRESS)    # DeepSeek (no longer run): accepted, answered in plain words
     g.add_argument("--gpu", metavar="LIST", help="graphics card numbers to use, e.g. 0 or 0,1 (default: the engine's choice). "
                    "With more than one card the engine decides which is the Main card; --gpu-roles (instead of --gpu) sets the roles yourself.")
     g.add_argument("--backend", metavar="nvidia|amd|intel|auto",
@@ -120,9 +117,7 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
                    "Main does the last steps of every answer; a helper holds part of the model")
     g.add_argument("--tune", type=_choice("a tuning mode", S.TUNE_MODES), metavar="quick|thorough|skip", help="find the fastest settings first (default: skip here; the guided screens suggest quick the first time)")
     g.add_argument("--tune-allow-small", action="store_true", help="let the tuner also try settings that can change answers very slightly")
-    g.add_argument("--dspark", type=_choice("a DSpark mode", ("on", "off", "auto", "none")), metavar="on|off|auto|none",
-                   help="DeepSeek: the DSpark drafter that guesses ahead (auto loads it only where it helps; off still loads it on some cards). "
-                        "The same as --set dspark=<word>")
+    g.add_argument("--dspark", metavar="WORD", help=argparse.SUPPRESS)               # DeepSeek (no longer run): accepted, answered in plain words
     g.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                    help="an advanced engine setting or STRATA_* variable, e.g. prefill=65536 (repeat); unknown names get a warning, not a refusal")
     g.add_argument("--pool-cores", metavar="LIST",
@@ -215,12 +210,16 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
     s = store.load(a.preset) if a.preset else S.LaunchSettings()
     if a.preset:
         s.name = s.name or a.preset
-    if getattr(a, "dsv41_package", None):
-        s.dsv41_package = str(Path(a.dsv41_package).expanduser())
     if a.model_path:
         s.model_path = str(Path(a.model_path).expanduser())
         if not a.model:
             s.family = s.model = None
+    from strata_control import retired
+    if any(getattr(a, k, None) for k in ("dsv41_package", "speed", "full_quality", "dspark")):
+        raise ValueError(retired.NOT_OFFERED)                       # a DeepSeek-only flag (an old script, a saved shortcut): DeepSeek is no longer run
+    if retired.is_name(a.family) or (a.model and retired.is_name(a.model) and (not a.family or retired.is_name(a.family))) or (
+            not a.model and (retired.is_name(s.family) or retired.is_name(s.model))):
+        raise ValueError(retired.NOT_OFFERED)                       # DeepSeek: typed, or in a saved preset (strata_control/retired.py)
     if a.model:
         if catalog is None:
             raise ValueError("The model list is not available in this Terminal; run it from the full Terminal install.")
@@ -249,12 +248,6 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
         s.drafting = a.drafting
     if getattr(a, "split_engine", None):
         s.split_engine = a.split_engine
-    if getattr(a, "full_quality", False):
-        if getattr(a, "speed", None) == "faster":
-            notices.append(S.Notice("warn", "--full-quality and --speed faster were both given; full quality is used.", ""))
-        s.speed = "full"
-    elif getattr(a, "speed", None):
-        s.speed = a.speed
     if a.gpu and getattr(a, "gpu_roles", None):
         raise ValueError("Use --gpu (which cards) or --gpu-roles (a role for each card), not both.")
     if a.gpu:
@@ -291,11 +284,6 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
         s.no_key = False
     if a.set:
         s.extra = {**s.extra, **S.settings_from_pairs(a.set)}
-    if a.dspark:
-        s.extra = {**s.extra, "--dspark": a.dspark}
-        if a.dspark == "on" and sys.platform == "darwin":
-            notices.append(S.Notice("warn", "DeepSeek's drafter (DSpark) is not supported on a Mac yet, so --dspark on will probably stop the engine.",
-                                    "Leave it out: on a Mac the drafter is off and answers are as fast without it."))
     if a.pool_cores:
         text = a.pool_cores.replace(" ", "")
         if not re.fullmatch(r"\d+(-\d+(:\d+)?)?(,\d+(-\d+(:\d+)?)?)*", text):
@@ -308,43 +296,9 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
     return s, notices
 
 
-def _placement_lines(placement: dict | None) -> None:
-    """DeepSeek-V4.1-Flash's plan: the cards, the experts in graphics memory and on the CPU, the n-gram table on the SSD, the warnings."""
-    if not placement:
-        return
-    import textwrap
-    _say("  placement")
-    for line in placement.get("lines") or []:
-        wrapped = textwrap.wrap(line, 94) or [""]
-        _say("    - " + wrapped[0])
-        for w in wrapped[1:]:
-            _say("      " + w)
-    for line in placement.get("warnings") or []:
-        wrapped = textwrap.wrap(line, 90) or [""]
-        _say("  [!] " + wrapped[0])
-        for w in wrapped[1:]:
-            _say("      " + w)
-
-
 def _parallel_word(plan: dict, s: S.LaunchSettings) -> str:
-    """The plan's parallel word: DeepSeek is one at a time unless --parallel 2 to 8; other models fit to the card unless a number was given."""
-    if plan.get("placement"):
-        k = (plan.get("parallel") or {}).get("conversations")
-        return f"{k} conversations at the same time" if k else "one at a time"
+    """The plan's parallel word: fit to the card unless a number was given."""
     return str(s.parallel or "fit to your card")
-
-
-def _parallel_lines(info: dict | None) -> None:
-    """DeepSeek `--parallel N` in --plan: what it does, in plain words with the measured numbers (only when it was asked for)."""
-    if not info or not info.get("conversations"):
-        return
-    import textwrap
-    _say("  parallel")
-    for line in info.get("lines") or []:
-        wrapped = textwrap.wrap(line, 94) or [""]
-        _say("    - " + wrapped[0])
-        for w in wrapped[1:]:
-            _say("      " + w)
 
 
 def _broken_nvidia_note(comp) -> str | None:
@@ -402,12 +356,6 @@ def apply_defaults(s: S.LaunchSettings, catalog) -> tuple[S.LaunchSettings, list
         rows = [r for r in catalog.rows(hw) if r.family == s.family and r.model == s.model]
         if rows:
             r = rows[0]
-            if s.model_path and s.family == "deepseek41" and r.words == "tight: needs more disk space":
-                # (the person's own files stay where they are: no download, so the free disk space of Strata's folder is not the question)
-                try:
-                    r.verdict, r.words = catalog.own_files_verdict(hw, s.model)
-                except Exception:                                # noqa: BLE001 - keep the menu row's words when the memory words cannot be read
-                    pass
             if r.verdict == "no":
                 notices.append(S.Notice("warn", f"{r.title} does not fit this computer.", "It can still start; expect it to be slow or to run out of memory."))
             elif r.verdict == "slower":
@@ -425,16 +373,7 @@ def apply_defaults(s: S.LaunchSettings, catalog) -> tuple[S.LaunchSettings, list
                 if s.vision == "off" and r.images and catalog.reader_state() == "missing":
                     notices.append(S.Notice("warn", "The engine installed here has no picture reader, so pictures are off.",
                                             "Update the engine to read pictures, or add --vision off to silence this."))
-        if catalog.strata.multi_family(s.family):           # DeepSeek-V4.1-Flash: one request at a time unless --parallel N, no tuning
-            if s.parallel and s.parallel > 1:               # off by default; asked for: passed on, with what it does and what was run (never refused)
-                notices += parallel_notices(s, comp)
-            # pictures: on unless the person chose off - the engine reads them with its own vision tower, no separate reader
-            s.vision = "off" if s.vision == "off" else "on"   # (tuning is DeepSeek's own short tune: tools/dsv41/tune.py, run by the launch)
-        elif s.speed:
-            notices.append(S.Notice("warn", "--speed and --full-quality are for DeepSeek; this model uses all its experts, so they are not used.", ""))
-            s.speed = None
-        deepseek = bool(catalog.strata.multi_family(s.family))
-        notices += S.check_context(s, max_fit_tokens=None, deepseek=deepseek, pack_limit=catalog.pack_limit(s.family, s.model) if deepseek else None)
+        notices += S.check_context(s, max_fit_tokens=None)
     if s.access != "local" and not s.api_key and not s.no_key:
         from strata_cli.launch import access
         kept = access.kept_key(s.name or f"{s.model or 'model'} {S.context_label(s.context)}")
@@ -448,8 +387,7 @@ def apply_defaults(s: S.LaunchSettings, catalog) -> tuple[S.LaunchSettings, list
     notices += gpu_notices(s, comp)
     notices += S.check_access(s)
     vram = comp.main_vram_gb or None
-    if not (s.family and catalog.strata.multi_family(s.family)):     # (DeepSeek's own words are parallel_notices above: Qwen's card table does not apply)
-        notices += S.check_parallel(s, vram_gb=vram)
+    notices += S.check_parallel(s, vram_gb=vram)
     return s, notices
 
 
@@ -457,20 +395,6 @@ def _host_platform() -> tuple[str, str]:
     """(sys.platform, sysinfo.machine()) of this computer, in one place the tests can replace."""
     from strata_control import sysinfo
     return sys.platform, sysinfo.machine()
-
-
-def parallel_notices(s: S.LaunchSettings, comp) -> list[S.Notice]:
-    """DeepSeek `--parallel N` asked for: a warning for each way this pick goes beyond what was run (strata_control/dsv41_parallel.py), never a refusal.
-    The explanation itself is in `--plan` (and the engine prints the memory it took)."""
-    from strata_control import dsv41_fit, dsv41_parallel
-    try:
-        cards = dsv41_fit.run_cards(comp.usable_gpus, comp.engine_vendor, named=bool(s.gpus or s.gpu_roles))[0]
-    except Exception:                                        # noqa: BLE001 - the notes must never stop a launch
-        cards = list(getattr(comp, "usable_gpus", None) or [])
-    if s.gpus:
-        cards = [c for c in cards if int(c.get("index", -1)) in {int(g) for g in s.gpus}] or cards
-    return [S.Notice("warn", what, todo) for what, todo in dsv41_parallel.warnings(
-        s.parallel, cards=cards, context=s.context, os_name=_host_platform()[0], machine=_host_platform()[1], vendor=comp.engine_vendor)]
 
 
 def roles_line(s: S.LaunchSettings, catalog) -> str | None:
@@ -492,9 +416,6 @@ def roles_line(s: S.LaunchSettings, catalog) -> str | None:
         return gpu_roles.describe(roles, cards, card_numbers=True)
     except Exception:                                        # noqa: BLE001 - a summary line must never stop a launch
         return None
-
-
-DEEPSEEK_RX7000_NOTE = "DeepSeek has not been tested on RX 7000 cards yet; please report how it runs."
 
 
 def gpu_notices(s: S.LaunchSettings, comp) -> list[S.Notice]:
@@ -532,8 +453,6 @@ def gpu_notices(s: S.LaunchSettings, comp) -> list[S.Notice]:
     new_card = comp.new_card_note
     if new_card:
         out.append(S.Notice("warn", new_card[0], new_card[1]))
-    if s.family == "deepseek41" and comp.rx7000_card:
-        out.append(S.Notice("warn", DEEPSEEK_RX7000_NOTE, "If something fails, tell us at https://github.com/Niko1221/Strata/issues (attach the engine log)."))
     return out
 
 
@@ -881,7 +800,7 @@ def run_launch(a: argparse.Namespace) -> int:
             notices.append(S.Notice("warn", backend_note, ""))
         if not machine:
             _interrupted_move_notice()
-        have_choices = bool(a.preset or a.model or a.model_path or a.context or a.vision or a.parallel or a.access or a.tune or a.drafting or getattr(a, "split_engine", None) or getattr(a, "speed", None) or getattr(a, "full_quality", False))
+        have_choices = bool(a.preset or a.model or a.model_path or a.context or a.vision or a.parallel or a.access or a.tune or a.drafting or getattr(a, "split_engine", None))
         interactive = sys.stdin.isatty() and sys.stdout.isatty() and not a.no_tui and not machine and not a.plan
         plain_questions = False
         no_screens_package = None
@@ -946,10 +865,6 @@ def run_launch(a: argparse.Namespace) -> int:
                 _say(f"  download  {(plan.get('download') or {}).get('text', '')}")
                 if plan.get("drafting"):
                     _say(f"  drafting  {plan['drafting'].replace('Drafting: ', '', 1)}")
-                if plan.get("speed"):
-                    _say(f"  speed     {plan['speed'].replace('Speed: ', '', 1)}")
-                _placement_lines(plan.get("placement"))
-                _parallel_lines(plan.get("parallel"))
                 _say(f"  tuning    {s.tune}    access {S.ACCESS_WORDS[s.access]}, port {s.port}"
                      + ("    API key on" if s.api_key else ""))
                 for n in notes:
@@ -963,8 +878,6 @@ def run_launch(a: argparse.Namespace) -> int:
         for n in notes:
             if not machine:
                 _say(f"[!] {n.line()}")
-        if not machine and runner.multi_file() and s.parallel and s.parallel > 1:
-            _parallel_lines(runner.parallel_plan())          # at launch too: what it does and the numbers (the plan says the same)
         if not machine:
             line = roles_line(s, catalog)
             if line:
@@ -1028,14 +941,6 @@ def run_launch(a: argparse.Namespace) -> int:
             from strata_cli.launch import access
             _say(f"  {'API key':<14} {access.mask_key(result.key)}   (show it: strata launch --show-key"
                  + (f" --preset \"{s.name}\")" if (a.preset or a.save_preset) else ")"))
-        speed_line = ""
-        if hasattr(runner, "speed_line"):
-            from strata_cli.launch.runner import experts_from_log
-            speed_line = runner.speed_line(experts_from_log(_engine_log_of(result.config) or None))
-            if not isinstance(speed_line, str):
-                speed_line = ""
-        if speed_line:
-            _say(f"  {'Speed':<14} {speed_line.replace('Speed: ', '', 1)}")
         engine_log = _engine_log_of(result.config)
         if engine_log:
             _say(f"  {'Engine log':<14} {engine_log}   (follow it: strata logs --follow)")

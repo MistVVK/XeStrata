@@ -10,9 +10,9 @@ engines have to be rebuilt for its shape; case C is refused) and prints the plan
 
     case A  the feed (a `models` entry, the feed re-signed at the next sequence). No app rebuild: the app lists feed models
             from the feed (the Settings update check is enough). `--with-app` adds the app steps when a release has app text anyway.
-            Engines, DeepSeek packages and Controls stay as they are: same files, same names.
+            Engines and Controls stay as they are: same files, same names.
     case B  the engine of the model's shape, as its own component (`--shape`, package_engine.py --shape, feed member shape_engines: strata_control/shape_engine.py),
-            plus the feed. The Strata engine, the DeepSeek packages, the Controls and the app are not rebuilt: a Control of 0.2.13 or later already installs and runs
+            plus the feed. The Strata engine, the Controls and the app are not rebuilt: a Control of 0.2.13 or later already installs and runs
             a shape engine, and the model's family `qwen4exp_<shape>` makes it fetch it.
 
 Each step shows where it runs, a rough time, the command (printed, never run) and its outputs with sizes.  Sizes are those of the
@@ -40,7 +40,6 @@ sys.path.insert(0, str(ROOT))                         # strata_control.shape_eng
 
 # artifact names in a release upload folder (phaseA-tests/rel0211/PUBLISH-PLAN.md, scripts/relfinal/expect_rc1.py)
 ENGINE_RE = re.compile(r"^strata-engine-(?P<v>\d[\d.]*)-(?P<plat>.+?)\.(?:tar\.gz|zip)$")
-DSV41_RE = re.compile(r"^strata-dsv41-(?P<v>\d[\d.]*)-(?P<plat>.+?)\.(?:tar\.gz|zip)$")
 CONTROL_RE = re.compile(r"^strata-control-(?P<v>\d[\d.]*)-(?P<plat>.+?)\.(?:tar\.gz|zip)$")
 APP_RE = re.compile(r"^(Strata-\d[\d.]*-(windows-x64-setup\.exe|linux-x86_64\.AppImage|macos-arm64\.dmg)(\.sig)?|Strata\.app\.tar\.gz(\.sig)?)$")
 FEED_NAMES = ["strata-feed.json", "strata-feed.json.sig", "strata-feed-linux-aarch64.json", "strata-feed-linux-aarch64.json.sig"]
@@ -70,14 +69,14 @@ def box_for(plat: str) -> str:
 
 
 def scan_upload(folder: Path | None) -> dict:
-    out = {"engine": [], "dsv41": [], "control": [], "app": [], "feed": [], "small": [], "other": []}
+    out = {"engine": [], "control": [], "app": [], "feed": [], "small": [], "other": []}
     if folder is None:
         return out
     for p in sorted(folder.iterdir()):
         if not p.is_file():
             continue
         n, size = p.name, p.stat().st_size
-        for key, rx in (("engine", ENGINE_RE), ("dsv41", DSV41_RE), ("control", CONTROL_RE), ("app", APP_RE)):
+        for key, rx in (("engine", ENGINE_RE), ("control", CONTROL_RE), ("app", APP_RE)):
             m = rx.match(n)
             if m:
                 out[key].append({"name": n, "size": size, "plat": m.groupdict().get("plat", ""), "version": m.groupdict().get("v", "")})
@@ -138,7 +137,6 @@ def plan(report: dict, set_index: int, a, prev: dict) -> dict:
                 new = renamed(e["name"], e["version"], a.engine_version).replace("strata-engine-", comp + "-", 1)
                 changed.append({"name": new, "size": e["size"], "est": True, "why": "the engine of the shape %s, its own component" % shape})
         kept += [{"name": e["name"], "size": e["size"], "why": "the Strata engine is not touched: Flash-Next and every other model keep it"} for e in prev["engine"]]
-        kept += [{"name": e["name"], "size": e["size"], "why": "DeepSeek packages are not touched (check that no shared kernel header changed)"} for e in prev["dsv41"]]
         kept += [{"name": e["name"], "size": e["size"], "why": "no Control rebuild: a Control of 0.2.13 or later already knows shape engines"} for e in prev["control"]]
         by_box: dict[str, list] = {}
         for e in prev["engine"]:
@@ -164,7 +162,7 @@ def plan(report: dict, set_index: int, a, prev: dict) -> dict:
              [comp + "-%s-macos-arm64-metal.tar.gz" % a.engine_version], owner=True,
              note="a Mac installs a model of its own shape like every other platform (Terminal and app): the Mac engine of the shape is part of the release; after the Mac package exists and before build-feed")
     else:
-        kept += [{"name": e["name"], "size": e["size"], "why": "same file, same name; the feed entry is reused"} for e in prev["engine"] + prev["dsv41"] + prev["control"]]
+        kept += [{"name": e["name"], "size": e["size"], "why": "same file, same name; the feed entry is reused"} for e in prev["engine"] + prev["control"]]
 
     step("%d" % n, "The model's feed entry (a `models` member entry, DRAFT)", "owner PC, python only", 2,
          ["python packaging/make_model_release.py --intake <report> --id %s ... --write <OUTDIR>   # writes models/%s.entry.json (the feed's schema; build-feed refuses every [FILL: ...] left in it) and models/%s.model.json (the older draft)" % (a.id, a.id, a.id)],
@@ -188,7 +186,7 @@ def plan(report: dict, set_index: int, a, prev: dict) -> dict:
              ["bash sign-and-notarize.sh Strata-%s-macos-arm64.dmg%s --updater-archive --out signed" % (a.app_version, mac_extra)],
              ["the signed folder (dmg, Strata.app.tar.gz and its .sig)"], owner=True)
         n += 1
-    feed_cmd = ("python packaging/feed_tool.py build-feed --out <RELEASE> --key <FEED-KEY> --sequence %d --engine <engine-entries> --dsv41 <dsv41-entries> "
+    feed_cmd = ("python packaging/feed_tool.py build-feed --out <RELEASE> --key <FEED-KEY> --sequence %d --engine <engine-entries> --carry-dsv41 <the last strata-feed.json> --carry-dsv41-base https://github.com/Niko1221/Strata/releases/download/<DSV41-TAG>/ "
                 "--drafters <drafter-entries> --models <models-folder> --control <control-entries>%s%s   # OWNER'S KEY; `--models` is Q4-PREP-B's change"
                 % (a.sequence, " --shapes <shape-entries>" if case == "B" else "", " --app-json latest.json" if with_app else ""))
     step("%d" % n, "Sign the feeds at sequence %d (the shared one and linux-aarch64)" % a.sequence, "owner PC, with the owner's key at that moment", 3,

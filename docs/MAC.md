@@ -3,9 +3,6 @@
 This page is for people with an Apple Silicon Mac (M1 or newer). Strata runs there on its own Metal engine: the NVIDIA kernels
 are replaced by Metal ones (`metal/`), and the host code and the server are the PC's. Intel Macs cannot run it.
 
-DeepSeek V4.1-Flash runs on a Mac with 64 GB of memory or more, and reads pictures too: [DEEPSEEK_MAC.md](DEEPSEEK_MAC.md). It has its
-own engine, separate from the Qwen one described on this page.
-
 > **On this page:** [What you need](#what-you-need) · [Install](#install) · [Defaults](#defaults-and-options) ·
 > [Gyro](#gyro-s-and-gyro-m-agentionais-trellis-experts) · [Measured](#measured-m5-max-128-gb) · [Limits](#limits-this-version) ·
 > [Switches](#switches) · [How it works](#how-it-works) · [History](#history--older-measurements)

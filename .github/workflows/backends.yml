@@ -5,7 +5,7 @@ name: Backend compile checks
 #   CUDA 12.9 and 13.0   nvidia/cuda devel container   targets strata, strata_kq          (CMake preset cuda-compile)
 #   HIP (ROCm 7.2)       rocm/dev container            target strata                      (CMake preset hip-compile)
 #   SYCL (oneAPI 2026.1) ubuntu + Intel's apt repo     target strata of sycl/             (the commands of packaging/build_sycl_linux.sh)
-#   Metal                macOS runner                  targets strata and strata_ds4      (metal/; metal-build.yml keeps its own strata build)
+#   Metal                macOS runner                  target strata                      (metal/; metal-build.yml keeps its own strata build)
 # ggml comes from the vendored third_party/strata-ggml (frozen at llama.cpp's pin), the same tree the release builds use: nothing is downloaded.
 # Architectures are fewer than the release package's (compile time); the flags that decide which sources and defines are built are the release's.
 
@@ -161,7 +161,7 @@ jobs:
         run: ccache -s | head -8
 
   metal:
-    name: Metal strata + strata_ds4
+    name: Metal strata
     # the macOS 26 SDK: metal/src/mtl_rt.mm names MTLGPUFamilyMetal4 behind @available (a run-time check); the names must be in the SDK
     runs-on: macos-26
     timeout-minutes: 60
@@ -190,5 +190,5 @@ jobs:
           cmake -S metal -B build-metal -G Ninja -DCMAKE_BUILD_TYPE=Release \
             -DMETAL_CPP_DIR="$PWD/_mcpp/metal-cpp" \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-      - name: Build and link strata and strata_ds4
-        run: cmake --build build-metal --target strata strata_ds4
+      - name: Build and link strata
+        run: cmake --build build-metal --target strata

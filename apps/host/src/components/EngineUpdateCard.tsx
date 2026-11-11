@@ -3,12 +3,12 @@ import { tr } from '../lib/i18n';
 import { Btn, Icon } from './ui';
 import { nativeAction, type NativeState } from '../lib/native';
 
-/** Strata Control's last check found a newer engine than the one installed (the Qwen engine, the DeepSeek engine, or both): its numbers come from the
+/** Strata Control's last check found a newer engine than the one installed: its numbers come from the
  *  check kept on this PC (`update_available` of `strata components engine`), so showing the card reads no network. After an app or Control update this is how a
  *  person with an older engine is told (#4848). */
 export const engineUpdateOffered = (native: NativeState | null | undefined) => {
   const offer = native?.engine?.updateAvailable;
-  return !!(offer && (offer.engine || offer.dsv41));
+  return !!(offer && offer.engine);
 };
 
 /** One card, plain words, one button. The update itself is the existing "Update engine" job (its progress shows where every job's does); models are not touched. */

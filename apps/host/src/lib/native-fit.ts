@@ -6,7 +6,7 @@
  * about 10 GB left for the system; whatever is left is read from the SSD. The same rules setup uses to choose its low-RAM mode
  * (setup.py: low_ram_gpu_gb, LOW_RAM_HEADROOM_GB), so the page and the engine agree.
  */
-export interface FitInput { ram_needed_gb?: number; experts_gb?: number | null; memory_gb?: number; mem_total?: boolean; /** the weight files without the lookup table, when the catalog states them (DeepSeek: `memory_gb` is the CPU's share) */ fit_gb?: number | null; /** Qwen3.6: its own context rule (below) */ context_fit?: ContextFit | null }
+export interface FitInput { ram_needed_gb?: number; experts_gb?: number | null; memory_gb?: number; mem_total?: boolean; /** the weight files without the lookup table, when the catalog states them */ fit_gb?: number | null; /** Qwen3.6: its own context rule (below) */ context_fit?: ContextFit | null }
 export interface FitHardware { ram_gb?: number | null; vram_gb?: number | null }
 export interface Fit {
   /** RAM + VRAM the version needs (the n-gram table not counted). */
