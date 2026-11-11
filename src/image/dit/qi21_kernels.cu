@@ -15,6 +15,8 @@
 #include <cuda_runtime.h>
 #endif
 
+#include "strata/kernels/f16_bits.hpp"
+
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -24,6 +26,11 @@ namespace strata::image::qi21 {
 namespace {
 
 constexpr int QI_D = 128;
+
+// an output element: float as computed, or f16 bits rounded from that float by f16_from_f32 (round to nearest even),
+// the rounding dit_gemm's conversion pass applies, so an f16 store gives the bytes the conversion gave
+__device__ __forceinline__ void qi_put(float* p, size_t i, float v) { p[i] = v; }
+__device__ __forceinline__ void qi_put(uint16_t* p, size_t i, float v) { p[i] = strata::kernels::f16_from_f32(v); }
 
 __device__ __forceinline__ float qi_block_sum(float v, float* red) {
     // blockDim.x is a multiple of 32 and <= 1024
@@ -42,9 +49,9 @@ __device__ __forceinline__ float qi_block_sum(float v, float* red) {
     return red[0];
 }
 
-template <bool RES, bool LN>
+template <bool RES, bool LN, typename OT>
 __global__ void __launch_bounds__(256) k_res_ln_mod(float* __restrict__ x, const float* __restrict__ h,
-                                                   const float* __restrict__ g, float* __restrict__ out,
+                                                   const float* __restrict__ g, OT* __restrict__ out,
                                                    const float* __restrict__ m, int C, float eps) {
     __shared__ float red[32];
     const size_t row = blockIdx.x;
@@ -67,7 +74,7 @@ __global__ void __launch_bounds__(256) k_res_ln_mod(float* __restrict__ x, const
     for (int i = 0; i < n; ++i) q += (v[i] - mean) * (v[i] - mean);
     const float inv = rsqrtf(qi_block_sum(q, red) / C + eps);
     n = 0;
-    for (int c = threadIdx.x; c < C; c += blockDim.x) out[row * C + c] = (v[n++] - mean) * inv * (1.f + m[c]);
+    for (int c = threadIdx.x; c < C; c += blockDim.x) qi_put(out, row * C + c, (v[n++] - mean) * inv * (1.f + m[c]));
 }
 
 template <typename QT>
@@ -115,18 +122,20 @@ __global__ void __launch_bounds__(256) k_qkv_post_w(const float* __restrict__ q,
     qi_store4<half>(vo + ((size_t) hh * kv_tstride + kv_off + t) * QI_D + d, vv.x, vv.y, vv.z, vv.w);
 }
 
-__global__ void k_swiglu(const float* __restrict__ gu, float* __restrict__ out, int F, int64_t n) {
+template <typename OT>
+__global__ void k_swiglu(const float* __restrict__ gu, OT* __restrict__ out, int F, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     const int64_t t = i / F, c = i % F;
     const float g = gu[t * 2 * F + c], u = gu[t * 2 * F + F + c];
-    out[i] = u * (g / (1.f + expf(-g)));
+    qi_put(out, (size_t) i, u * (g / (1.f + expf(-g))));
 }
 
 // grid (Lq, H), block 128, dynamic smem Lk floats.  causal: query i sees keys 0..i.
+template <typename OT>
 __global__ void __launch_bounds__(QI_D) k_attn_causal(const float* __restrict__ q, int q_tstride,
                                                      const half* __restrict__ k, const half* __restrict__ v,
-                                                     int kv_tstride, float* __restrict__ out, int H, int Lk,
+                                                     int kv_tstride, OT* __restrict__ out, int H, int Lk,
                                                      int causal, float scale) {
     extern __shared__ float s[];
     __shared__ float red[32];
@@ -158,7 +167,7 @@ __global__ void __launch_bounds__(QI_D) k_attn_causal(const float* __restrict__ 
     sum = qi_block_sum(sum, red);
     float acc = 0.f;
     for (int j = 0; j < n; ++j) acc += s[j] * __half2float(v[((size_t) hh * kv_tstride + j) * QI_D + d]);
-    out[(size_t) i * H * QI_D + hh * QI_D + d] = acc / sum;
+    qi_put(out, (size_t) i * H * QI_D + hh * QI_D + d, acc / sum);
 }
 
 #if defined(QI_HIP)
@@ -195,9 +204,10 @@ __device__ __forceinline__ qi_h16 qi_ld16(const _Float16* p, int hi) {
 #endif
 }
 
+template <typename OT>
 __global__ void __launch_bounds__(FA_NW * 32) k_attn_wmma(const _Float16* __restrict__ Q, int q_tstride,
                                                          const _Float16* __restrict__ K, const _Float16* __restrict__ V,
-                                                         int kv_tstride, float* __restrict__ O, int H, int nq, int nkv,
+                                                         int kv_tstride, OT* __restrict__ O, int H, int nq, int nkv,
                                                          float scale_log2) {
 #if defined(QI_RDNA3) || defined(QI_RDNA4)
     __shared__ __align__(16) _Float16 sK[FA_BKV][FA_KLD];
@@ -279,7 +289,7 @@ __global__ void __launch_bounds__(FA_NW * 32) k_attn_wmma(const _Float16* __rest
     for (int c = 0; c < QI_D / 16; ++c)
         for (int i = 0; i < 8; ++i) {
             const int row = q0 + QI_ROW(i, hi);
-            if (row < nq) O[(size_t) row * H * QI_D + head * QI_D + c * 16 + l16] = o[c][i] / l[i];
+            if (row < nq) qi_put(O, (size_t) row * H * QI_D + head * QI_D + c * 16 + l16, o[c][i] / l[i]);
         }
 #else
     __builtin_trap();
@@ -328,9 +338,20 @@ __device__ __forceinline__ void qi_cp16(half* dst, const half* src, bool ok) {
 #endif
 }
 
+__device__ __forceinline__ void qi_put2(float* p, size_t i, float a, float b) {
+    *reinterpret_cast<float2*>(p + i) = make_float2(a, b);
+}
+// the hardware's round-to-nearest-even pair conversion (the same bits as f16_from_f32 for every finite value and
+// infinity) and one 4-byte store: f16_from_f32's integer code here doubled the kernel's time (spills in the epilogue)
+__device__ __forceinline__ void qi_put2(uint16_t* p, size_t i, float a, float b) {
+    half2 h = __floats2half2_rn(a, b);
+    *reinterpret_cast<uint32_t*>(p + i) = *reinterpret_cast<uint32_t*>(&h);
+}
+
+template <typename OT>
 __global__ void __launch_bounds__(MF_NW * 32) k_attn_mma(const half* __restrict__ Q, int q_tstride,
                                                         const half* __restrict__ K, const half* __restrict__ V,
-                                                        int kv_tstride, float* __restrict__ O, int H, int nq, int nkv,
+                                                        int kv_tstride, OT* __restrict__ O, int H, int nq, int nkv,
                                                         float scale_log2) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
     extern __shared__ __align__(16) half qi_smem[];
@@ -438,12 +459,8 @@ __global__ void __launch_bounds__(MF_NW * 32) k_attn_mma(const half* __restrict_
     }
     const int row0 = q0 + r, row1 = q0 + r + 8;
     for (int n = 0; n < QI_D / 8; ++n) {
-        if (row0 < nq)
-            *reinterpret_cast<float2*>(O + (size_t) row0 * H * QI_D + head * QI_D + n * 8 + c2) =
-                make_float2(o[n][0] / l0, o[n][1] / l0);
-        if (row1 < nq)
-            *reinterpret_cast<float2*>(O + (size_t) row1 * H * QI_D + head * QI_D + n * 8 + c2) =
-                make_float2(o[n][2] / l1, o[n][3] / l1);
+        if (row0 < nq) qi_put2(O, (size_t) row0 * H * QI_D + head * QI_D + n * 8 + c2, o[n][0] / l0, o[n][1] / l0);
+        if (row1 < nq) qi_put2(O, (size_t) row1 * H * QI_D + head * QI_D + n * 8 + c2, o[n][2] / l1, o[n][3] / l1);
     }
 #else
     __trap();
@@ -490,15 +507,27 @@ inline unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
 }  // namespace
 
-int res_ln_mod(void* stream, float* x, const float* h, const float* g, float* out, const float* m, int T, int C, float eps) {
+namespace {
+template <typename OT>
+int res_ln_mod_t(void* stream, float* x, const float* h, const float* g, OT* out, const float* m, int T, int C, float eps) {
     if (C > 32 * 256 || T <= 0) return T <= 0 ? 0 : 1;
     if (h != nullptr && out != nullptr)
-        k_res_ln_mod<true, true><<<T, 256, 0, qs(stream)>>>(x, h, g, out, m, C, eps);
+        k_res_ln_mod<true, true, OT><<<T, 256, 0, qs(stream)>>>(x, h, g, out, m, C, eps);
     else if (h != nullptr)
-        k_res_ln_mod<true, false><<<T, 256, 0, qs(stream)>>>(x, h, g, out, m, C, eps);
+        k_res_ln_mod<true, false, OT><<<T, 256, 0, qs(stream)>>>(x, h, g, out, m, C, eps);
     else
-        k_res_ln_mod<false, true><<<T, 256, 0, qs(stream)>>>(x, h, g, out, m, C, eps);
+        k_res_ln_mod<false, true, OT><<<T, 256, 0, qs(stream)>>>(x, h, g, out, m, C, eps);
     return launched();
+}
+}  // namespace
+
+int res_ln_mod(void* stream, float* x, const float* h, const float* g, float* out, const float* m, int T, int C, float eps) {
+    return res_ln_mod_t<float>(stream, x, h, g, out, m, T, C, eps);
+}
+
+int res_ln_mod_f16(void* stream, float* x, const float* h, const float* g, uint16_t* out, const float* m, int T, int C,
+                   float eps) {
+    return res_ln_mod_t<uint16_t>(stream, x, h, g, out, m, T, C, eps);
 }
 
 int qkv_post(void* stream, const float* q, const float* k, const float* v, int ld, const float* wq, const float* wk,
@@ -519,18 +548,37 @@ int qkv_post(void* stream, const float* q, const float* k, const float* v, int l
 
 int swiglu(void* stream, const float* gu, float* out, int T, int F) {
     const int64_t n = (int64_t) T * F;
-    k_swiglu<<<blocks(n), 256, 0, qs(stream)>>>(gu, out, F, n);
+    k_swiglu<float><<<blocks(n), 256, 0, qs(stream)>>>(gu, out, F, n);
     return launched();
 }
 
-int attn_exact(void* stream, const float* q, int q_tstride, const void* k, const void* v, int kv_tstride, float* out,
-               int H, int Lq, int Lk, int causal) {
+int swiglu_f16(void* stream, const float* gu, uint16_t* out, int T, int F) {
+    const int64_t n = (int64_t) T * F;
+    k_swiglu<uint16_t><<<blocks(n), 256, 0, qs(stream)>>>(gu, out, F, n);
+    return launched();
+}
+
+namespace {
+template <typename OT>
+int attn_exact_t(void* stream, const float* q, int q_tstride, const void* k, const void* v, int kv_tstride, OT* out, int H,
+                 int Lq, int Lk, int causal) {
     const size_t smem = (size_t) Lk * sizeof(float);
     if (smem > 48 * 1024) return 1;
-    k_attn_causal<<<dim3(Lq, H), QI_D, smem, qs(stream)>>>(q, q_tstride, static_cast<const half*>(k),
-                                                           static_cast<const half*>(v), kv_tstride, out, H, Lk, causal,
-                                                           1.f / sqrtf((float) QI_D));
+    k_attn_causal<OT><<<dim3(Lq, H), QI_D, smem, qs(stream)>>>(q, q_tstride, static_cast<const half*>(k),
+                                                               static_cast<const half*>(v), kv_tstride, out, H, Lk, causal,
+                                                               1.f / sqrtf((float) QI_D));
     return launched();
+}
+}  // namespace
+
+int attn_exact(void* stream, const float* q, int q_tstride, const void* k, const void* v, int kv_tstride, float* out,
+               int H, int Lq, int Lk, int causal) {
+    return attn_exact_t<float>(stream, q, q_tstride, k, v, kv_tstride, out, H, Lq, Lk, causal);
+}
+
+int attn_exact_f16(void* stream, const float* q, int q_tstride, const void* k, const void* v, int kv_tstride,
+                   uint16_t* out, int H, int Lq, int Lk, int causal) {
+    return attn_exact_t<uint16_t>(stream, q, q_tstride, k, v, kv_tstride, out, H, Lq, Lk, causal);
 }
 
 int has_fast_attn(int device) {
@@ -548,25 +596,38 @@ int has_fast_attn(int device) {
 #endif
 }
 
-int attn_fast(void* stream, const void* q, int q_tstride, const void* k, const void* v, int kv_tstride, float* out, int H,
-              int nq, int nkv) {
+namespace {
+template <typename OT>
+int attn_fast_t(void* stream, const void* q, int q_tstride, const void* k, const void* v, int kv_tstride, OT* out, int H,
+                int nq, int nkv) {
     const float sl = (float) (1.0 / std::sqrt((double) QI_D) * 1.4426950408889634);
 #if defined(QI_HIP)
-    k_attn_wmma<<<dim3((nq + FA_BQ - 1) / FA_BQ, H), FA_NW * 32, 0, qs(stream)>>>(
+    k_attn_wmma<OT><<<dim3((nq + FA_BQ - 1) / FA_BQ, H), FA_NW * 32, 0, qs(stream)>>>(
         static_cast<const _Float16*>(q), q_tstride, static_cast<const _Float16*>(k), static_cast<const _Float16*>(v),
         kv_tstride, out, H, nq, nkv, sl);
 #else
     static bool attr = false;
     if (!attr) {
-        if (cudaFuncSetAttribute(k_attn_mma, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) MF_SMEM) != cudaSuccess)
+        if (cudaFuncSetAttribute(k_attn_mma<OT>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) MF_SMEM) != cudaSuccess)
             return 2;
         attr = true;
     }
-    k_attn_mma<<<dim3((nq + MF_BQ - 1) / MF_BQ, H), MF_NW * 32, MF_SMEM, qs(stream)>>>(
+    k_attn_mma<OT><<<dim3((nq + MF_BQ - 1) / MF_BQ, H), MF_NW * 32, MF_SMEM, qs(stream)>>>(
         static_cast<const half*>(q), q_tstride, static_cast<const half*>(k), static_cast<const half*>(v), kv_tstride, out,
         H, nq, nkv, sl);
 #endif
     return launched();
+}
+}  // namespace
+
+int attn_fast(void* stream, const void* q, int q_tstride, const void* k, const void* v, int kv_tstride, float* out, int H,
+              int nq, int nkv) {
+    return attn_fast_t<float>(stream, q, q_tstride, k, v, kv_tstride, out, H, nq, nkv);
+}
+
+int attn_fast_f16(void* stream, const void* q, int q_tstride, const void* k, const void* v, int kv_tstride, uint16_t* out,
+                  int H, int nq, int nkv) {
+    return attn_fast_t<uint16_t>(stream, q, q_tstride, k, v, kv_tstride, out, H, nq, nkv);
 }
 
 int timestep_embedding(void* stream, const float* t, float* emb, int n, int dim, float max_period) {

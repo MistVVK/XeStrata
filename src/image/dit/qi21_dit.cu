@@ -93,7 +93,8 @@ struct Qi21Dit {
     std::vector<std::string> unused;
     // work, sized for t_cap image tokens and l_cap text tokens
     int64_t t_cap = 0, l_cap = 0;
-    float *x = nullptr, *h = nullptr, *att = nullptr, *gu = nullptr, *mlp = nullptr, *q16 = nullptr;
+    float *x = nullptr, *h = nullptr, *gu = nullptr, *q16 = nullptr;
+    uint16_t *h16 = nullptr, *a16 = nullptr, *m16 = nullptr;   // GEMM inputs, written f16 by the kernels before them
     uint16_t *kw = nullptr, *vw = nullptr, *pk = nullptr, *pv = nullptr;
     float *pe_img = nullptr, *pe_txt = nullptr, *latent = nullptr, *outp = nullptr, *ctx_in = nullptr;
     float *tin = nullptr, *emb = nullptr, *te1 = nullptr, *te2 = nullptr, *mod = nullptr, *scale = nullptr;
@@ -270,9 +271,10 @@ std::string alloc(Qi21Dit* d, int64_t T, int64_t L) {
     const size_t f4 = sizeof(float), h2 = sizeof(uint16_t);
     DIT_TRY(get(d->x, R * C * f4));
     DIT_TRY(get(d->h, R * C * f4));
-    DIT_TRY(get(d->att, R * C * f4));
     DIT_TRY(get(d->gu, R * std::max<int64_t>({2 * F, 3 * C, d->ctx_dim}) * f4));
-    DIT_TRY(get(d->mlp, R * F * f4));
+    DIT_TRY(get(d->h16, R * C * h2));
+    DIT_TRY(get(d->a16, R * C * h2));
+    DIT_TRY(get(d->m16, R * F * h2));
     DIT_TRY(get(d->q16, H * R * HD * f4));
     DIT_TRY(get(d->kw, H * (d->l_cap + d->t_cap) * HD * h2));
     DIT_TRY(get(d->vw, H * (d->l_cap + d->t_cap) * HD * h2));
@@ -299,6 +301,11 @@ std::string mm(Qi21Dit* d, const W2& w, const float* x, int64_t ldx, int64_t n, 
     return dit_gemm(d->stream, w.type, wp(d, w), w.K, w.N, x, ldx, n, y, ldy);
 }
 
+// the same with f16 rows (row stride ldx elements) written by the kernel before the GEMM
+std::string mm16(Qi21Dit* d, const W2& w, const uint16_t* x16, int64_t ldx, int64_t n, float* y, int64_t ldy) {
+    return dit_gemm_x16(d->stream, w.type, wp(d, w), w.K, w.N, x16, ldx, n, y, ldy);
+}
+
 // the 32 blocks over rows [0, n) of x; prefix: the text (mod row 1, causal, K / V into the prefix cache); otherwise the
 // image tokens (mod row 0) attending [cached text K / V of the block (L rows); their own].
 std::string blocks_pass(Qi21Dit* d, int64_t n, bool prefix, const float* pe, int64_t L) {
@@ -311,19 +318,19 @@ std::string blocks_pass(Qi21Dit* d, int64_t n, bool prefix, const float* pe, int
     float* X = d->x;
     float* Hh = d->h;
     const size_t hb = sizeof(uint16_t);
-    DIT_K(qi21::res_ln_mod(s, X, nullptr, nullptr, Hh, m0, (int) n, (int) C, EPS));
+    DIT_K(qi21::res_ln_mod_f16(s, X, nullptr, nullptr, d->h16, m0, (int) n, (int) C, EPS));
     for (int i = 0; i < d->n_layer; ++i) {
         const Block& B = d->blocks[i];
         const float *qs = d->gu, *ks = d->gu + C, *vs = d->gu + 2 * C;
         int64_t ld = 3 * C;
         if (B.fused) {
-            DIT_TRY(mm(d, B.qkv, Hh, C, n, d->gu, 3 * C));
+            DIT_TRY(mm16(d, B.qkv, d->h16, C, n, d->gu, 3 * C));
         } else {
             W2 q = B.qkv;
             q.N = C;
-            DIT_TRY(mm(d, q, Hh, C, n, d->gu, 3 * C));
-            DIT_TRY(mm(d, B.k, Hh, C, n, d->gu + C, 3 * C));
-            DIT_TRY(mm(d, B.v, Hh, C, n, d->gu + 2 * C, 3 * C));
+            DIT_TRY(mm16(d, q, d->h16, C, n, d->gu, 3 * C));
+            DIT_TRY(mm16(d, B.k, d->h16, C, n, d->gu + C, 3 * C));
+            DIT_TRY(mm16(d, B.v, d->h16, C, n, d->gu + 2 * C, 3 * C));
         }
         DIT_K(qi21::qkv_post(s, qs, ks, vs, (int) ld, d->d_norm + B.nq, d->d_norm + B.nk, pe, d->q16, fast ? 1 : 0,
                              (int) n, d->kw, d->vw, (int) kvt, (int) (prefix ? 0 : L), (int) n, (int) H, EPS));
@@ -337,7 +344,7 @@ std::string blocks_pass(Qi21Dit* d, int64_t n, bool prefix, const float* pe, int
                 DIT_CUDA(cudaMemcpyAsync(pvl + hh * n * D, d->vw + hh * kvt * D, n * D * hb, cudaMemcpyDeviceToDevice,
                                          d->stream));
             }
-            DIT_K(qi21::attn_exact(s, d->q16, (int) n, d->kw, d->vw, (int) kvt, d->att, (int) H, (int) n, (int) n, 1));
+            DIT_K(qi21::attn_exact_f16(s, d->q16, (int) n, d->kw, d->vw, (int) kvt, d->a16, (int) H, (int) n, (int) n, 1));
         } else {
             for (int64_t hh = 0; hh < H && L > 0; ++hh) {
                 DIT_CUDA(cudaMemcpyAsync(d->kw + hh * kvt * D, pkl + hh * L * D, pbytes, cudaMemcpyDeviceToDevice,
@@ -346,18 +353,18 @@ std::string blocks_pass(Qi21Dit* d, int64_t n, bool prefix, const float* pe, int
                                          d->stream));
             }
             if (fast)
-                DIT_K(qi21::attn_fast(s, d->q16, (int) n, d->kw, d->vw, (int) kvt, d->att, (int) H, (int) n, (int) kvt));
+                DIT_K(qi21::attn_fast_f16(s, d->q16, (int) n, d->kw, d->vw, (int) kvt, d->a16, (int) H, (int) n, (int) kvt));
             else
-                DIT_K(qi21::attn_exact(s, d->q16, (int) n, d->kw, d->vw, (int) kvt, d->att, (int) H, (int) n, (int) kvt,
+                DIT_K(qi21::attn_exact_f16(s, d->q16, (int) n, d->kw, d->vw, (int) kvt, d->a16, (int) H, (int) n, (int) kvt,
                                        0));
         }
-        DIT_TRY(mm(d, B.out, d->att, C, n, Hh, C));
-        DIT_K(qi21::res_ln_mod(s, X, Hh, m1, Hh, m2, (int) n, (int) C, EPS));
-        DIT_TRY(mm(d, B.gate_up, Hh, C, n, d->gu, 2 * F));
-        DIT_K(qi21::swiglu(s, d->gu, d->mlp, (int) n, (int) F));
-        DIT_TRY(mm(d, B.down, d->mlp, F, n, Hh, C));
+        DIT_TRY(mm16(d, B.out, d->a16, C, n, Hh, C));
+        DIT_K(qi21::res_ln_mod_f16(s, X, Hh, m1, d->h16, m2, (int) n, (int) C, EPS));
+        DIT_TRY(mm16(d, B.gate_up, d->h16, C, n, d->gu, 2 * F));
+        DIT_K(qi21::swiglu_f16(s, d->gu, d->m16, (int) n, (int) F));
+        DIT_TRY(mm16(d, B.down, d->m16, F, n, Hh, C));
         const bool last = i + 1 == d->n_layer;
-        DIT_K(qi21::res_ln_mod(s, X, Hh, m3, last ? nullptr : Hh, m0, (int) n, (int) C, EPS));
+        DIT_K(qi21::res_ln_mod_f16(s, X, Hh, m3, last ? nullptr : d->h16, m0, (int) n, (int) C, EPS));
     }
     return std::string();
 }
@@ -399,9 +406,9 @@ std::string step_impl(Qi21Dit* d, const float* latent, int W, int Hd, const floa
         DIT_CUDA(cudaMemcpyAsync(d->ctx_in, cond, (size_t) L * d->ctx_dim * sizeof(float), cudaMemcpyHostToDevice,
                                  d->stream));
         DIT_K(qi21::rms_norm_w1(s, d->ctx_in, d->d_norm + d->text_norm, d->gu, L, d->ctx_dim, EPS));
-        DIT_TRY(mm(d, d->txt_in1, d->gu, d->ctx_dim, L, d->att, C));
-        DIT_K(qi21::gelu_tanh(s, d->att, (int64_t) L * C));
-        DIT_TRY(mm(d, d->txt_in2, d->att, C, L, d->x, C));
+        DIT_TRY(mm(d, d->txt_in1, d->gu, d->ctx_dim, L, d->h, C));
+        DIT_K(qi21::gelu_tanh(s, d->h, (int64_t) L * C));
+        DIT_TRY(mm(d, d->txt_in2, d->h, C, L, d->x, C));
         DIT_TRY(blocks_pass(d, L, true, d->pe_txt, 0));
         d->prefix_key = key;
         d->prefix_len = L;
@@ -418,8 +425,8 @@ std::string step_impl(Qi21Dit* d, const float* latent, int W, int Hd, const floa
     }
     DIT_TRY(blocks_pass(d, T, false, d->pe_img, L));
     // head: LN(x) (1 + scale) -> proj_out
-    DIT_K(qi21::res_ln_mod(s, d->x, nullptr, nullptr, d->h, d->scale, (int) T, (int) C, EPS));
-    DIT_TRY(mm(d, d->proj_out, d->h, C, T, d->outp, d->out_ch));
+    DIT_K(qi21::res_ln_mod_f16(s, d->x, nullptr, nullptr, d->h16, d->scale, (int) T, (int) C, EPS));
+    DIT_TRY(mm16(d, d->proj_out, d->h16, C, T, d->outp, d->out_ch));
     DIT_CUDA(cudaEventRecord(d->ev[2], d->stream));
     std::vector<float> o((size_t) T * d->out_ch);
     DIT_CUDA(cudaMemcpyAsync(o.data(), d->outp, o.size() * sizeof(float), cudaMemcpyDeviceToHost, d->stream));

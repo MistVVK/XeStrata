@@ -53,8 +53,11 @@ std::string grow(uint16_t*& p, size_t& cap, size_t elems) {
 
 }  // namespace
 
-std::string dit_gemm(void* stream, uint32_t type, const void* w, int64_t K, int64_t N, const float* x, int64_t ldx,
-                     int64_t n, float* y, int64_t ldy) {
+namespace {
+
+// x (f32 rows, converted here) or x16 (f16 rows, used in place)
+std::string gemm_impl(void* stream, uint32_t type, const void* w, int64_t K, int64_t N, const float* x,
+                      const uint16_t* x16, int64_t ldx, int64_t n, float* y, int64_t ldy) {
     if (n <= 0) return std::string();
     State& s = st();
     std::lock_guard<std::mutex> lock(s.mu);
@@ -66,23 +69,46 @@ std::string dit_gemm(void* stream, uint32_t type, const void* w, int64_t K, int6
         if (cublasCreate(&s.blas) != CUBLAS_STATUS_SUCCESS) return "dit_gemm: cannot create the BLAS handle";
         s.device = dev;
     }
-    std::string err = grow(s.w16, s.w_cap, (size_t) N * (size_t) K);
-    if (err.empty()) err = grow(s.x16, s.x_cap, (size_t) n * (size_t) K);
+    std::string err;
+    if (type != TE_F16) err = grow(s.w16, s.w_cap, (size_t) N * (size_t) K);
+    if (err.empty() && x16 == nullptr) err = grow(s.x16, s.x_cap, (size_t) n * (size_t) K);
     if (!err.empty()) return err;
     cudaStream_t cs = static_cast<cudaStream_t>(stream);
-    err = te_dequant_f16(type, w, K, N, s.w16, stream);
-    if (!err.empty()) return "dit_gemm: " + err;
-    const int64_t total = n * K;
-    const int64_t blocks = (total + 255) / 256;
-    rows_to_f16<<<(unsigned) (blocks < 65535 * 8 ? blocks : 65535 * 8), 256, 0, cs>>>(x, ldx, K, n, s.x16);
-    if (cudaGetLastError() != cudaSuccess) return "dit_gemm: the f16 conversion kernel failed";
+    const uint16_t* wa = static_cast<const uint16_t*>(w);
+    if (type != TE_F16) {
+        err = te_dequant_f16(type, w, K, N, s.w16, stream);
+        if (!err.empty()) return "dit_gemm: " + err;
+        wa = s.w16;
+    }
+    const uint16_t* xa = x16;
+    int64_t lda = ldx;
+    if (x16 == nullptr) {
+        const int64_t total = n * K;
+        const int64_t blocks = (total + 255) / 256;
+        rows_to_f16<<<(unsigned) (blocks < 65535 * 8 ? blocks : 65535 * 8), 256, 0, cs>>>(x, ldx, K, n, s.x16);
+        if (cudaGetLastError() != cudaSuccess) return "dit_gemm: the f16 conversion kernel failed";
+        xa = s.x16;
+        lda = K;
+    }
     if (cublasSetStream(s.blas, cs) != CUBLAS_STATUS_SUCCESS) return "dit_gemm: cublasSetStream failed";
     const float one = 1.f, zero = 0.f;
-    const auto r = cublasGemmEx(s.blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) n, (int) K, &one, s.w16, CUDA_R_16F,
-                                (int) K, s.x16, CUDA_R_16F, (int) K, &zero, y, CUDA_R_32F, (int) ldy, CUBLAS_COMPUTE_32F,
+    const auto r = cublasGemmEx(s.blas, CUBLAS_OP_T, CUBLAS_OP_N, (int) N, (int) n, (int) K, &one, wa, CUDA_R_16F,
+                                (int) K, xa, CUDA_R_16F, (int) lda, &zero, y, CUDA_R_32F, (int) ldy, CUBLAS_COMPUTE_32F,
                                 CUBLAS_GEMM_DEFAULT);
     if (r != CUBLAS_STATUS_SUCCESS) return "dit_gemm: GemmEx status " + std::to_string((int) r);
     return std::string();
+}
+
+}  // namespace
+
+std::string dit_gemm(void* stream, uint32_t type, const void* w, int64_t K, int64_t N, const float* x, int64_t ldx,
+                     int64_t n, float* y, int64_t ldy) {
+    return gemm_impl(stream, type, w, K, N, x, nullptr, ldx, n, y, ldy);
+}
+
+std::string dit_gemm_x16(void* stream, uint32_t type, const void* w, int64_t K, int64_t N, const uint16_t* x16,
+                         int64_t ldx, int64_t n, float* y, int64_t ldy) {
+    return gemm_impl(stream, type, w, K, N, nullptr, x16, ldx, n, y, ldy);
 }
 
 size_t dit_gemm_buffer_bytes() {

@@ -35,6 +35,16 @@ int has_fast_attn(int device);
 int attn_fast(void* stream, const void* q, int q_tstride, const void* k, const void* v, int kv_tstride, float* out, int H,
               int nq, int nkv);
 
+// the same with the output as f16 bits (f16_from_f32 of the float the f32 version stores: the bytes dit_gemm's
+// conversion pass made of that float), for the kernels whose output only feeds a GEMM
+int res_ln_mod_f16(void* stream, float* x, const float* h, const float* g, uint16_t* out, const float* m, int T, int C,
+                   float eps);
+int swiglu_f16(void* stream, const float* gu, uint16_t* out, int T, int F);
+int attn_exact_f16(void* stream, const float* q, int q_tstride, const void* k, const void* v, int kv_tstride,
+                   uint16_t* out, int H, int Lq, int Lk, int causal);
+int attn_fast_f16(void* stream, const void* q, int q_tstride, const void* k, const void* v, int kv_tstride, uint16_t* out,
+                  int H, int nq, int nkv);
+
 // emb[n][dim] = [cos(t * f_j) | sin(t * f_j)], f_j = exp(-ln(max_period) * j / (dim / 2))  (ggml_timestep_embedding)
 int timestep_embedding(void* stream, const float* t, float* emb, int n, int dim, float max_period);
 

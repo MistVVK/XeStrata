@@ -87,6 +87,7 @@ int main(int argc, char** argv) {
         }
         const int oc = qi21_dit_out_channels(dit);
         std::vector<float> vel((size_t) oc * W * H), first;
+        std::vector<double> later;   // step times of runs 2.. (the text prefix reused, as in sampling steps 2..8)
         for (int r = 0; r < repeat; ++r) {
             Qi21DitStats st;
             err = qi21_dit_step(dit, x.data(), W, H, cond.data(), L, t[0], vel.data(), &st);
@@ -96,6 +97,7 @@ int main(int argc, char** argv) {
                 break;
             }
             peak = std::max(peak, st.peak_bytes);
+            if (r > 0) later.push_back(st.step_ms);
             std::printf("%s run %d: %dx%d latent, %d text tokens, t %.4f: step %.1f ms%s; weights %.3f GB, work %.3f GB, "
                         "peak %.3f GB (GGUF %.3f GB)\n",
                         tag.c_str(), r + 1, W, H, L, t[0], st.step_ms,
@@ -107,6 +109,11 @@ int main(int argc, char** argv) {
                 std::printf("%s run %d: DIFFERS from run 1\n", tag.c_str(), r + 1);
                 ++bad;
             }
+        }
+        if (!later.empty()) {
+            std::sort(later.begin(), later.end());
+            std::printf("%s: median step of runs 2..%d: %.1f ms (min %.1f, max %.1f)\n", tag.c_str(), repeat,
+                        later[later.size() / 2], later.front(), later.back());
         }
         const fs::path od = fs::path(argv[2]) / d.parent_path().filename() / d.filename();
         fs::create_directories(od);
