@@ -252,9 +252,9 @@ private:
     float *x_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *a_ = nullptr, *g_ = nullptr, *o32_ = nullptr;
     float *rs_ = nullptr, *rs2_ = nullptr, *rs_o_ = nullptr, *hs_ = nullptr, *vpart_ = nullptr;
     // the int8 attention's statistics (kernels::FlashAttnI8Stats): a context's V scales, K's mean a block and context
-    // (kmean_ [blocks][2][C], kready_ whether this image's steps made it yet, a sigma above the last starting one)
-    float *vsv_ = nullptr, *kmean_ = nullptr;
-    std::vector<char> kready_;
+    // (kmean_ [blocks][2][C], a sigma above the last starting one resets it)
+    float *vsv_ = nullptr;
+    I8Means kmean_;
     float last_sigma_ = 0.f;
     float *cos_ = nullptr, *sin_ = nullptr;   // the image tokens' RoPE [h w][64]
     float *sc_ = nullptr;                     // the products form's scores [Tq][Tk]

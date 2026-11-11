@@ -344,9 +344,9 @@ private:
     // the attention's output's), the v heads' scales (hs_, a context's heads) and their rows' maxima
     float *rs_ = nullptr, *rs2_ = nullptr, *rs_o_ = nullptr, *hs_ = nullptr, *vpart_ = nullptr;
     // the int8 attention's statistics (kernels::FlashAttnI8Stats): a context's V scales, K's mean a block and context
-    // (kmean_ [blocks][2][C], kready_ whether this image's steps made it yet); cur_c0_ the first context run_block runs
-    float *vsv_ = nullptr, *kmean_ = nullptr;
-    std::vector<char> kready_;
+    // (kmean_ [blocks][2][C], a new image resets it); cur_c0_ the first context run_block runs
+    float *vsv_ = nullptr;
+    I8Means kmean_;
     int cur_c0_ = 0;
     uint16_t *h16_ = nullptr, *jq16_ = nullptr, *jk16_ = nullptr, *jv16_ = nullptr, *jo16_ = nullptr,
              *o16_ = nullptr, *t16_ = nullptr;

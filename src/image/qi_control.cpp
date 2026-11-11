@@ -277,12 +277,12 @@ void QiControl::clear() {
 }
 
 void QiControl::drop_activations() {
-    if (c_ != nullptr) {
-        if (dit_ != nullptr) gpu::stream_sync(dit_->s_);
-        gpu::free(c_);
-    }
+    if (dit_ != nullptr) gpu::stream_sync(dit_->s_);
+    if (c_ != nullptr) gpu::free(c_);
     c_ = nullptr;
     c_rows_ = 0;
+    if (kmean_.buf != nullptr) gpu::free(kmean_.buf);
+    kmean_.clear();
 }
 
 void QiControl::begin(int64_t T) {
@@ -291,6 +291,11 @@ void QiControl::begin(int64_t T) {
         drop_activations();
         c_ = scratch<float>(T * d.C_);
         c_rows_ = T;
+    }
+    if (kmean_.buf == nullptr) {   // the int8 attention's K means, a block and context (zero until a step makes one)
+        const int64_t n = (int64_t) blocks_.size() * 2;
+        kmean_.init(scratch<float>(n * d.C_), n, d.C_);
+        gpu::memset_async(kmean_.buf, 0, (size_t) (n * d.C_) * 4, d.s_);
     }
     qi_control_k::start(c_, d.x_, bp_b_, bp_rows_, T, hw_, d.C_, d.s_);
 }
@@ -329,8 +334,11 @@ void QiControl::run_block(int k, int64_t T) {
     qkv[2] = d.i8_;
     qi_qk_norm_rope16(d.q_, d.k_, d.v_, nq, nk, d.cos_, d.sin_, T, d.heads_, hd, d.q16_, d.k16_, d.v16_, d.s_,
                       i8 ? qkv : nullptr);
+    const int64_t slot = (int64_t) k * 2 + d.ctx_i_;
+    const auto st = kmean_.stats(slot);
     qi_attention(d.q16_, d.k16_, d.v16_, T, d.heads_, hd, nt, d.o16_, d.s_, d.key_lim_, 0, true,
-                 d.key_lim_ != nullptr ? &d.ref_spans_ : nullptr);
+                 d.key_lim_ != nullptr ? &d.ref_spans_ : nullptr, &st);
+    kmean_.mark(slot);
     const bool od = d.product(d.o16_, wo, d.h_, T, 0, 0, -1, false, true);
     qi_gate_add(c_, d.h_, mod(1), nt, T, C, d.s_, od ? &d.i8_ : nullptr);
     for (int64_t m0 = 0; m0 < T; m0 += d.mlp_rows_) {

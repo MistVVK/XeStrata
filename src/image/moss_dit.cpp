@@ -690,9 +690,8 @@ void MossDit::ensure(int64_t hw, int n, int64_t max_text) {
     // the int8 attention's statistics: a context's V scales, and K's mean a block and context (zero, no smoothing,
     // until a step makes it)
     vsv_ = alloc<float>(allocs_, C_);
-    kmean_ = alloc<float>(allocs_, (int64_t) blocks_.size() * 2 * C_);
-    gpu::memset_async(kmean_, 0, (size_t) blocks_.size() * 2 * C_ * 4, s_);
-    kready_.assign(blocks_.size() * 2, 0);
+    kmean_.init(alloc<float>(allocs_, (int64_t) blocks_.size() * 2 * C_), (int64_t) blocks_.size() * 2, C_);
+    gpu::memset_async(kmean_.buf, 0, (size_t) blocks_.size() * 2 * C_ * 4, s_);
     vpart_ = alloc<float>(allocs_, std::max(rw.ctx * heads_, kColSlices * C_));   // head_max's, col_max's
     if (w8_) {   // W8A8's int8 input: the most rows of the widest input, then two arrays of a scale a row
         xq8_rows_ = std::max(R, mlp_rows_);
@@ -719,14 +718,14 @@ void MossDit::drop_activations() {
     gpu::stream_sync(s_);
     for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) a_, (void*) gu_, (void*) h16_, (void*) rs_,
                     (void*) rs2_, (void*) rs_o_, (void*) hs_, (void*) vpart_, (void*) xq8_, (void*) pend_sw_,
-                    (void*) vsv_, (void*) kmean_,
+                    (void*) vsv_, (void*) kmean_.buf,
                     (void*) jq16_, (void*) jk16_, (void*) jv16_, (void*) jo16_, (void*) o16_,
                     (void*) b0_, (void*) lora_f32_, (void*) lora16_, (void*) lora_glora_y_,
                     (void*) lora_glora_x8_, (void*) lora_glora_sx_})
         release(allocs_, p);
-    q_ = k_ = v_ = a_ = gu_ = rs_ = rs2_ = rs_o_ = hs_ = vpart_ = pend_sw_ = vsv_ = kmean_ = nullptr;
+    q_ = k_ = v_ = a_ = gu_ = rs_ = rs2_ = rs_o_ = hs_ = vpart_ = pend_sw_ = vsv_ = nullptr;
     x_ = b0_ = nullptr;
-    kready_.clear();
+    kmean_.clear();
     h16_ = jq16_ = jk16_ = jv16_ = jo16_ = o16_ = nullptr;
     xq8_ = nullptr;
     lora_f32_ = nullptr;
@@ -1362,11 +1361,11 @@ void MossDit::run_block(const W* const* w, const float* const* bias, const float
                                           ref_hs_ + cur_block_ * heads_, hs_, jo16_, s_))
                 throw std::runtime_error("image engine: the attention's int8 buffers do not fit");
         } else {
-            const size_t ki = (size_t) cur_block_ * 2 + (size_t) (cur_c0_ + (int) i);
-            kernels::FlashAttnI8Stats st{vsv_, kmean_ + (int64_t) ki * C, kready_[ki] != 0};
+            const int64_t slot = (int64_t) cur_block_ * 2 + (cur_c0_ + (int) i);
+            const auto st = kmean_.stats(slot, vsv_);
             qi_attention(jq16_ + o, jk16_ + o, jv16_ + o, TT, heads_, hd_, 0, jo16_, s_, nullptr, P, true, nullptr,
                          P == 0 ? &st : nullptr);
-            if (P == 0) kready_[ki] = 1;
+            if (P == 0) kmean_.mark(slot);
         }
         if (i8) rows_i8(HeadsI8{Heads{jo16_, hs_, C, hd_}}, T, C, xq8_ + r0 * C, so + r0, s_);
         else rows16(Heads{jo16_, hs_, C, hd_}, T, C, o16_ + r0 * C, rs_o_ + r0, s_);
@@ -1721,7 +1720,7 @@ void MossDit::sample(float* x, int64_t h, int64_t w, const std::vector<float>& s
                                         " is not one of the model's " + std::to_string(blocks_.size()));
     const int64_t N = h * w * in_ch_;
     Guidance guidance(spec, s_, N, in_ch_, true, n == 2 ? g.cfg : 1.f, sigmas);
-    std::fill(kready_.begin(), kready_.end(), 0);
+    kmean_.reset();
     const std::vector<int> before = ctx_[1].skip;
     int at_step = -1;
     auto active = [&](int i) {

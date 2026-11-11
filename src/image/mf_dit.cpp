@@ -534,9 +534,8 @@ void MfDit::ensure(int64_t hw, int n, int64_t max_text) {
     vpart_ = alloc<float>(allocs_, std::max((hw + max_text) * heads_, kColSlices * C_));   // head_max's, col_max's
     // the int8 attention's statistics: a context's V scales, K's mean a block and context (zero until a step makes it)
     vsv_ = alloc<float>(allocs_, C_);
-    kmean_ = alloc<float>(allocs_, (int64_t) blocks_.size() * 2 * C_);
-    gpu::memset_async(kmean_, 0, (size_t) blocks_.size() * 2 * C_ * 4, s_);
-    kready_.assign(blocks_.size() * 2, 0);
+    kmean_.init(alloc<float>(allocs_, (int64_t) blocks_.size() * 2 * C_), (int64_t) blocks_.size() * 2, C_);
+    gpu::memset_async(kmean_.buf, 0, (size_t) blocks_.size() * 2 * C_ * 4, s_);
     gu_ = alloc<float>(allocs_, mlp_rows_ * F_);
     h16_ = alloc<uint16_t>(allocs_, std::max(X * C_, mlp_rows_ * F_));
     if (w8_) {   // W8A8's int8 input: the most rows of the widest input, then a scale a row
@@ -572,10 +571,10 @@ void MfDit::ensure(int64_t hw, int n, int64_t max_text) {
 void MfDit::drop_activations() {
     gpu::stream_sync(s_);
     for (void* p : {(void*) tq_, (void*) tk_, (void*) tv_, (void*) rs_, (void*) rs2_, (void*) rs_io_, (void*) rs_to_,
-                    (void*) hs_, (void*) vpart_, (void*) vsv_, (void*) kmean_})
+                    (void*) hs_, (void*) vpart_, (void*) vsv_, (void*) kmean_.buf})
         release(allocs_, p);
-    tq_ = tk_ = tv_ = rs_ = rs2_ = rs_io_ = rs_to_ = hs_ = vpart_ = vsv_ = kmean_ = nullptr;
-    kready_.clear();
+    tq_ = tk_ = tv_ = rs_ = rs2_ = rs_io_ = rs_to_ = hs_ = vpart_ = vsv_ = nullptr;
+    kmean_.clear();
     for (void* p : {(void*) img_, (void*) txt_, (void*) q_, (void*) k_, (void*) v_, (void*) a_, (void*) gu_,
                     (void*) h16_, (void*) jq16_, (void*) jk16_, (void*) jv16_, (void*) jo16_, (void*) io16_,
                     (void*) to16_, (void*) cos_, (void*) sin_, (void*) cos_id_, (void*) sin_id_,
@@ -1024,7 +1023,7 @@ void MfDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n, fl
         maxL = std::max(maxL, ctx_[i].rows);
     }
     ensure(HW, n, std::max(maxL, cap_text_));
-    if (sigma > last_sigma_) std::fill(kready_.begin(), kready_.end(), 0);   // a new image: K's means made again
+    if (sigma > last_sigma_) kmean_.reset();   // a new image: K's means made again
     last_sigma_ = sigma;
     rope_tables(h, w);
     const int64_t TP = qi_attn_rows(HW + cap_text_);
@@ -1086,11 +1085,12 @@ void MfDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n, fl
                       hd_, false, jq16_ + o + Lt * C, jk16_ + o + Lt * C, jv16_ + o + Lt * C, s_);
             // every row sees every key (the text rows too: Mage-Flow's joint attention has no mask), so all of
             // them go to the GPU maker's attention where there is one
-            const size_t ki = (size_t) bi * 2 + (size_t) i;   // (two contexts at most kept: a third makes its own)
-            kernels::FlashAttnI8Stats st{vsv_, i < 2 ? kmean_ + (int64_t) ki * C : nullptr, i < 2 && kready_[ki] != 0};
+            // (two contexts at most kept: a third makes its own mean)
+            const int64_t slot = i < 2 ? (int64_t) bi * 2 + i : kmean_.slots;
+            const auto st = kmean_.stats(slot, vsv_);
             qi_attention(jq16_ + o, jk16_ + o, jv16_ + o, Lt + HW, heads_, hd_, 0, jo16_, s_, nullptr, 0, true, nullptr,
                          &st);
-            if (i < 2) kready_[ki] = 1;
+            kmean_.mark(slot);
             rows16(Heads{jo16_, hs_ + i * heads_, C, hd_}, Lt, C, to16_ + t0, rs_to_ + toff[(size_t) i], s_);
             rows16(Heads{jo16_ + Lt * C, hs_ + i * heads_, C, hd_}, HW, C, io16_ + i * HW * C, rs_io_ + i * HW, s_);
         }

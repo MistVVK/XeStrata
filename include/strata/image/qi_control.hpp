@@ -69,6 +69,8 @@ public:
     void begin(int64_t T);
     void after_block(int bi, int64_t T);
     void drop_activations();
+    /// A new image (the DiT's t above its last): the branch's K means made again.
+    void reset_means() { kmean_.reset(); }
 
 private:
     struct Block {
@@ -94,6 +96,7 @@ private:
     float* bp_rows_ = nullptr;   // before_proj(control_img_in(cond)) [hw][C] (its bias not in it)
     float* c_ = nullptr;         // the stream [T][C]
     int64_t hw_ = 0, c_rows_ = 0;
+    I8Means kmean_;              // the int8 attention's K means, a block and context (the DiT resets on a new image)
     float strength_ = 1.f, sigma_lo_ = 0.f, sigma_hi_ = 1.f;
 };
 

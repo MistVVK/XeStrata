@@ -13,6 +13,7 @@
 #pragma once
 
 #include "strata/image/image_lora.hpp"
+#include "strata/image/i8_means.hpp"
 #include "strata/image/pipeline.hpp"
 #include "strata/image/qi_stream.hpp"
 #include "strata/image/qi_kernels.hpp"
@@ -252,6 +253,11 @@ private:
     int64_t cap_T_ = 0, mlp_cap_ = 0, mlp_rows_ = 0;
     const std::vector<int>* skip_ = nullptr;   // the blocks a forward with the prefix cached skips (skip layer guidance)
     int64_t dirty_T_ = 0;   // the most rows q16_, k16_ and v16_ were written to (the padding past a shorter T is zeroed)
+    // the int8 attention's K means kept from the last step (a block and context), reset on a new image (t above the
+    // last); ctx_i_ the context forward runs (swap_context turns it, forward_pair uses both slots)
+    I8Means kmean_;
+    int ctx_i_ = 0;
+    float last_t_ = -1.f;
     float *x_ = nullptr, *q_ = nullptr, *k_ = nullptr, *v_ = nullptr, *h_ = nullptr, *gu_ = nullptr;
     uint16_t *h16_ = nullptr, *q16_ = nullptr, *k16_ = nullptr, *v16_ = nullptr, *o16_ = nullptr;
     float *cos_ = nullptr, *sin_ = nullptr;

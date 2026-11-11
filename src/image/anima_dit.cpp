@@ -640,9 +640,8 @@ void AnimaDit::ensure(int64_t hw, int n) {
     vpart_ = alloc<float>(allocs_, std::max(hw * heads_, kColSlices * C_));   // head_max's, col_max's
     // the int8 attention's statistics: a context's V scales, K's mean a block and context (zero until a step makes it)
     vsv_ = alloc<float>(allocs_, C_);
-    kmean_ = alloc<float>(allocs_, (int64_t) blocks_.size() * 2 * C_);
-    gpu::memset_async(kmean_, 0, (size_t) blocks_.size() * 2 * C_ * 4, s_);
-    kready_.assign(blocks_.size() * 2, 0);
+    kmean_.init(alloc<float>(allocs_, (int64_t) blocks_.size() * 2 * C_), (int64_t) blocks_.size() * 2, C_);
+    gpu::memset_async(kmean_.buf, 0, (size_t) blocks_.size() * 2 * C_ * 4, s_);
     if (w8_) {
         xq8_rows_ = std::max(Rk, mlp_rows_);
         xq8_cols_ = std::max(C_, F_);
@@ -669,13 +668,13 @@ void AnimaDit::drop_activations() {
     gpu::stream_sync(s_);
     for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) a_, (void*) o32_, (void*) g_, (void*) h16_,
                     (void*) rs_, (void*) rs2_, (void*) rs_o_, (void*) hs_, (void*) vpart_, (void*) xq8_,
-                    (void*) vsv_, (void*) kmean_,
+                    (void*) vsv_, (void*) kmean_.buf,
                     (void*) jq16_, (void*) jk16_, (void*) jv16_, (void*) jo16_, (void*) o16_, (void*) qh16_,
                     (void*) sc_, (void*) p16_, (void*) cos_, (void*) sin_, (void*) lora_f32_,
                     (void*) lora16_, (void*) lora_glora_y_, (void*) lora_glora_x8_, (void*) lora_glora_sx_})
         release(allocs_, p);
-    x_ = q_ = k_ = v_ = a_ = o32_ = g_ = rs_ = rs2_ = rs_o_ = hs_ = vpart_ = sc_ = cos_ = sin_ = vsv_ = kmean_ = nullptr;
-    kready_.clear();
+    x_ = q_ = k_ = v_ = a_ = o32_ = g_ = rs_ = rs2_ = rs_o_ = hs_ = vpart_ = sc_ = cos_ = sin_ = vsv_ = nullptr;
+    kmean_.clear();
     h16_ = jq16_ = jk16_ = jv16_ = jo16_ = o16_ = qh16_ = p16_ = nullptr;
     xq8_ = nullptr;
     lora_f32_ = nullptr;
@@ -1030,7 +1029,7 @@ void AnimaDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n,
     product(h16_, nullptr, xemb_, nullptr, x_, HW, nullptr);
     for (int i = 1; i < n; ++i) gpu::copy_async(x_ + i * HW * C, x_, (size_t) (HW * C) * 4, s_);
     time_embedding(sigma);
-    if (sigma > last_sigma_) std::fill(kready_.begin(), kready_.end(), 0);   // a new image: K's means made again
+    if (sigma > last_sigma_) kmean_.reset();   // a new image: K's means made again
     last_sigma_ = sigma;
     // the cross-attention's form, once: the shared entry where the GPU has FP16 matrix engines, the products a head
     // at a time where it has none (the shared kernel's FMA form measured slower there, attn_q's numbers)
@@ -1061,10 +1060,11 @@ void AnimaDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n,
             col_scale(vpart_, C, heads_, hd_, hs_, vsv_, s_);
             qk_rope16(q.from(r0), k.from(r0), v.from(r0), f(b.sqn), f(b.skn), cos_, sin_, hs_, HW, heads_, hd_, true,
                       jq16_, jk16_, jv16_, s_);
-            const size_t ki = (size_t) bi * 2 + (size_t) i;   // (two contexts at most kept: a third makes its own)
-            kernels::FlashAttnI8Stats st{vsv_, i < 2 ? kmean_ + (int64_t) ki * C : nullptr, i < 2 && kready_[ki] != 0};
+            // (two contexts at most kept: a third makes its own mean)
+            const int64_t slot = i < 2 ? (int64_t) bi * 2 + i : kmean_.slots;
+            const auto st = kmean_.stats(slot, vsv_);
             qi_attention(jq16_, jk16_, jv16_, HW, heads_, hd_, 0, jo16_, s_, nullptr, 0, true, nullptr, &st);
-            if (i < 2) kready_[ki] = 1;
+            kmean_.mark(slot);
             rows16(Heads{jo16_, hs_, C, hd_}, HW, C, o16_ + r0 * C, rs_o_ + r0, s_);
         }
         gate_add(x_, product(o16_, rs_o_, b.so, base, a_, R, nullptr, false, true), mod_ + 2 * C, R, C, s_);

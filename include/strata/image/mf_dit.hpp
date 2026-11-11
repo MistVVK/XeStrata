@@ -40,6 +40,7 @@
 #pragma once
 
 #include "strata/image/guidance.hpp"
+#include "strata/image/i8_means.hpp"
 #include "strata/image/image_lora.hpp"
 #include "strata/image/qi_stream.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -361,9 +362,9 @@ private:
     // attention's v heads' scales (hs_, a context's heads) and their rows' maxima
     float *rs_ = nullptr, *rs2_ = nullptr, *rs_io_ = nullptr, *rs_to_ = nullptr, *hs_ = nullptr, *vpart_ = nullptr;
     // the int8 attention's statistics (kernels::FlashAttnI8Stats): a context's V scales, K's mean a block and context
-    // (kmean_ [blocks][2][C], kready_ whether this image's steps made it yet, a sigma above the last starting one)
-    float *vsv_ = nullptr, *kmean_ = nullptr;
-    std::vector<char> kready_;
+    // (kmean_ [blocks][2][C], a sigma above the last starting one resets it)
+    float *vsv_ = nullptr;
+    I8Means kmean_;
     float last_sigma_ = 0.f;
     uint16_t *h16_ = nullptr, *jq16_ = nullptr, *jk16_ = nullptr, *jv16_ = nullptr, *jo16_ = nullptr,
              *io16_ = nullptr, *to16_ = nullptr, *t16_ = nullptr;

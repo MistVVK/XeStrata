@@ -447,7 +447,8 @@ void QiDit::mlp(const W& wgu, const W& wdown, float* x, const float* gate, int64
 void QiDit::ensure(int64_t T, int64_t HW) {
     if (T > cap_T_) {
         for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) h_, (void*) gu_, (void*) h16_,
-                        (void*) q16_, (void*) k16_, (void*) v16_, (void*) o16_, (void*) cos_, (void*) sin_})
+                        (void*) q16_, (void*) k16_, (void*) v16_, (void*) o16_, (void*) cos_, (void*) sin_,
+                        (void*) kmean_.buf})
             if (p != nullptr) {
                 allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), p), allocs_.end());
                 gpu::free(p);
@@ -467,6 +468,9 @@ void QiDit::ensure(int64_t T, int64_t HW) {
         o16_ = alloc<uint16_t>(allocs_, T * C_);
         cos_ = alloc<float>(allocs_, T * kHead / 2);
         sin_ = alloc<float>(allocs_, T * kHead / 2);
+        // the int8 attention's K means, a block and context (zero until a step makes one)
+        kmean_.init(alloc<float>(allocs_, (int64_t) blocks_.size() * 2 * C_), (int64_t) blocks_.size() * 2, C_);
+        gpu::memset_async(kmean_.buf, 0, (size_t) blocks_.size() * 2 * C_ * 4, s_);
         // the plain attention's FP32 output: only where the matrix engines' path is not taken
         cap_T_ = T;
         dirty_T_ = 0;
@@ -489,6 +493,7 @@ void QiDit::swap_context() {
         std::swap(blocks_[i].pv, other_.pv[i]);
     }
     rope_H_ = rope_W_ = rope_text_ = -1;   // the rotary tables are the context's positions
+    ctx_i_ ^= 1;   // the other context's K means slot
 }
 
 void QiDit::drop_second_context() {
@@ -674,6 +679,11 @@ void QiDit::forward(const float* x, float t, int64_t H, int64_t W, bool prefix, 
         rope_text_ = n_text_;
     }
     step_modulation(t);
+    if (t > last_t_) {   // a new image: the K means made again (the ControlNet branch's too)
+        kmean_.reset();
+        if (control_ != nullptr) control_->reset_means();
+    }
+    last_t_ = t;
     // a step after the first one of a context reads its prefix from the cache (set_loras drops it); a step with the
     // ControlNet branch on computes it again and leaves the cache as the steps without the branch made it
     const bool ctl = control_on(t);
@@ -734,8 +744,10 @@ void QiDit::forward(const float* x, float t, int64_t H, int64_t W, bool prefix, 
             }
         }
         // the queries from r0 on: a cached prefix's rows are not asked again (an edit's references: most of them)
+        const auto st = kmean_.stats((int64_t) bi * 2 + ctx_i_);
         qi_attention(q16_, k16_, v16_, T, heads_, kHead, n_text_, o16_ + r0 * C, s_, key_lim_, r0, true,
-                     key_lim_ != nullptr ? &ref_spans_ : nullptr);
+                     key_lim_ != nullptr ? &ref_spans_ : nullptr, &st);
+        kmean_.mark((int64_t) bi * 2 + ctx_i_);
         const bool od = product(o16_ + r0 * C, wo, h_, Tr, 0, 0, -1, false, wo.lora == nullptr);
         qi_gate_add(xr, h_, mod(1), ntr, Tr, C, s_, od ? &i8_ : nullptr);
         for (int64_t m0 = 0; m0 < Tr; m0 += mlp_rows_) {   // the MLP a band of rows at a time (its 2 x inter wide product)
@@ -781,6 +793,11 @@ void QiDit::forward_pair(const float* x, float t, int64_t H, int64_t W, float* o
         o.rope_text = nb;
     }
     step_modulation(t);
+    if (t > last_t_) {   // a new image: the K means made again (the ControlNet branch's too)
+        kmean_.reset();
+        if (control_ != nullptr) control_->reset_means();
+    }
+    last_t_ = t;
     // the image's rows twice, one copy a context: [0, HW) the first's, [HW, 2 HW) the other's
     qi_latent_tokens16(x, in_ch_, HW, h16_, s_);
     product(h16_, iin_, x_, HW);
@@ -828,8 +845,12 @@ void QiDit::forward_pair(const float* x, float t, int64_t H, int64_t W, float* o
             gpu::copy_async(k16b, o.pk[(size_t) bi], bytes_b, s_);
             gpu::copy_async(v16b, o.pv[(size_t) bi], bytes_b, s_);
         }
-        qi_attention(q16_, k16_, v16_, Ta, heads_, kHead, na, o16_, s_, key_lim_, na, true);
-        qi_attention(q16b, k16b, v16b, Tb, heads_, kHead, nb, o16_ + HW * C, s_, o.key_lim, nb, true);
+        const auto sta = kmean_.stats((int64_t) bi * 2);
+        qi_attention(q16_, k16_, v16_, Ta, heads_, kHead, na, o16_, s_, key_lim_, na, true, nullptr, &sta);
+        kmean_.mark((int64_t) bi * 2);
+        const auto stb = kmean_.stats((int64_t) bi * 2 + 1);
+        qi_attention(q16b, k16b, v16b, Tb, heads_, kHead, nb, o16_ + HW * C, s_, o.key_lim, nb, true, nullptr, &stb);
+        kmean_.mark((int64_t) bi * 2 + 1);
         const bool od = product(o16_, wo, h_, R, 0, 0, -1, false, wo.lora == nullptr);
         qi_gate_add(x_, h_, mod(1), 0, R, C, s_, od ? &i8_ : nullptr);
         for (int64_t m0 = 0; m0 < R; m0 += mlp_rows_) {   // the MLP a band of rows at a time
@@ -1320,7 +1341,7 @@ void QiDit::drop_activations() {
     for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) h_, (void*) gu_, (void*) h16_, (void*) q16_,
                     (void*) k16_, (void*) v16_, (void*) o16_, (void*) cos_, (void*) sin_, xq_,
                     (void*) xs_, (void*) lora_f32_, (void*) lora16_, (void*) lora_glora_y_, (void*) lora_glora_x8_,
-                    (void*) lora_glora_sx_})
+                    (void*) lora_glora_sx_, (void*) kmean_.buf})
         if (p != nullptr) {
             allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), p), allocs_.end());
             gpu::free(p);
@@ -1338,6 +1359,7 @@ void QiDit::drop_activations() {
     lora_glora_x8_ = nullptr;
     lora_glora_sx_ = nullptr;
     cap_T_ = 0;
+    kmean_.clear();
     rope_H_ = rope_W_ = rope_text_ = -1;
 }
 
@@ -1353,6 +1375,8 @@ void QiDit::sample(float* x, int64_t H, int64_t W, const std::vector<float>& sig
     if (control_ != nullptr && control_->set() && !spec.slg_layers.empty())
         throw std::invalid_argument("image engine: skip layer guidance with ControlNet is not supported (its pass skips "
                                     "blocks the branch adds to)");
+    ctx_i_ = 0;   // the first context's K means slot (guidance's swap_context turns it)
+    last_t_ = -1.f;
     const int64_t N = in_ch_ * H * W;
     const int n = cfg > 1.0f && other_.n_text > 0 ? 2 : 1;
     Guidance g(spec, s_, N, in_ch_, false, n == 2 ? cfg : 1.0f, sigmas);
