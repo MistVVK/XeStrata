@@ -63,7 +63,7 @@ bool own_reader_supported(const std::string& mmproj, bool gpu, int max_tokens, s
 #endif
     }
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-    else if (quant::best_isa() == quant::Isa::Scalar) {
+    else if ((int) quant::best_isa() < (int) quant::Isa::Avx2) {      // every x86 tier below AVX2 (scalar, sse41, avx): unchanged by those tiers until gated
         // an x86 CPU with only the portable kernel tier (no AVX2): measured 2.1 to 3.7 times mtmd-CPU's time (RESULTS-OWN-3V.md 12.7), so `auto` keeps mtmd
         // here; `--tower own` still runs ours.  Not on Arm: mtmd's portable Arm build has no fast BF16 path and our NEON tier is faster than mtmd-CPU on BF16
         // and F16 weights alike (DGX Spark, 12.12)

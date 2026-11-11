@@ -195,6 +195,59 @@ static void test_attention(const CpuOps& o) {
     check(worst <= 2e-5, "online softmax + P*V", o.name, worst, 2e-5);
 }
 
+// the rotary of one token row and the position add against double
+static void test_rope_pos(const CpuOps& o) {
+    const int H = 3, HD = 72, D = H * HD, half = HD / 2, quarter = HD / 4;
+    std::vector<float> row((size_t) 2 * D + 16), c1(quarter), s1(quarter), c2(quarter), s2(quarter);
+    for (auto& v : row) v = rnd(-2, 2);
+    for (int j = 0; j < quarter; ++j) { c1[j] = std::cos(0.3f * j); s1[j] = std::sin(0.3f * j); c2[j] = std::cos(0.7f * j + 1); s2[j] = std::sin(0.7f * j + 1); }
+    std::vector<float> got = row;
+    o.rope_row(got.data(), (size_t) D, H, HD, c1.data(), s1.data(), c2.data(), s2.data());
+    double worst = 0;
+    for (int part = 0; part < 2; ++part)
+        for (int hh = 0; hh < H; ++hh)
+            for (int j = 0; j < half; ++j) {
+                const size_t i0 = (size_t) part * D + (size_t) hh * HD + j, i1 = i0 + half;
+                const double co = j < quarter ? c1[j] : c2[j - quarter], si = j < quarter ? s1[j] : s2[j - quarter];
+                worst = std::max(worst, std::fabs((double) row[i0] * co - (double) row[i1] * si - got[i0]));
+                worst = std::max(worst, std::fabs((double) row[i0] * si + (double) row[i1] * co - got[i1]));
+            }
+    for (size_t i = (size_t) 2 * D; i < row.size(); ++i) if (got[i] != row[i]) worst = 1e9;
+    check(worst <= 2e-6, "rope_row", o.name, worst, 2e-6);
+    const int n = 1152;
+    std::vector<float> x(n), a(n), b(n), c(n), d(n);
+    for (int i = 0; i < n; ++i) { x[i] = rnd(-1, 1); a[i] = rnd(-1, 1); b[i] = rnd(-1, 1); c[i] = rnd(-1, 1); d[i] = rnd(-1, 1); }
+    std::vector<float> y = x;
+    const float dx = 0.37f, dy = 0.81f;
+    o.pos_add(y.data(), a.data(), b.data(), c.data(), d.data(), dx, dy, n);
+    worst = 0;
+    for (int i = 0; i < n; ++i) {
+        const double want = x[i] + a[i] * (1.0 - dx) * (1.0 - dy) + b[i] * (double) dx * (1.0 - dy) + c[i] * (1.0 - dx) * dy + d[i] * (double) dx * dy;
+        worst = std::max(worst, std::fabs(want - y[i]));
+    }
+    check(worst <= 2e-6, "pos_add", o.name, worst, 2e-6);
+}
+// The SSE4.1 tier multiplies then adds in the scalar tier's k order, so on x86 its products equal the scalar tier's bit for bit (cpu_kernels_sse41.cpp)
+static void test_gemm_equals_scalar(const CpuOps& o) {
+    const CpuOps& ref = cpu_ops_scalar();
+    size_t bad = 0;
+    for (int M : {1, 7, 13, 50})
+        for (int K : {1, 72, 300})
+            for (int N : {3, 8, 21, 72})
+                for (int init = 0; init < 3; ++init) {
+                    const int lda = K + 1, ldb = (N + 63) / 64 * 64 + 64, ldc = N + 3;
+                    std::vector<float> A((size_t) M * lda), B((size_t) K * ldb + 128), C((size_t) M * ldc), bias((size_t) N);
+                    for (auto& v : A) v = rnd(-1, 1);
+                    for (auto& v : B) v = rnd(-1, 1);
+                    for (auto& v : C) v = rnd(-1, 1);
+                    for (auto& v : bias) v = rnd(-1, 1);
+                    std::vector<float> C2 = C;
+                    o.gemm(A.data(), (size_t) lda, M, B.data(), (size_t) ldb, K, N, C.data(), (size_t) ldc, init, bias.data());
+                    ref.gemm(A.data(), (size_t) lda, M, B.data(), (size_t) ldb, K, N, C2.data(), (size_t) ldc, init, bias.data());
+                    for (size_t i = 0; i < C.size(); ++i) bad += std::memcmp(&C[i], &C2[i], 4) != 0;
+                }
+    check(bad == 0, "gemm equals the scalar tier bit for bit", o.name, (double) bad, 0.0);
+}
 static void test_team() {
     for (int nth : {1, 2, 7, 16}) {
         Team t(nth);
@@ -234,10 +287,15 @@ int main(int argc, char** argv) {
         return g_fail ? 1 : 0;
     }
     const quant::Caps& c = quant::caps();
-    std::printf("cpu: avx2 %d fma %d f16c %d avx512 %d; best tier %s\n", c.avx2, c.fma, c.f16c, c.avx512, quant::isa_name(quant::best_isa()));
+    std::printf("cpu: sse41 %d avx %d avx2 %d fma %d f16c %d avx512 %d; best tier %s\n", c.sse41, c.avx, c.avx2, c.fma, c.f16c, c.avx512,
+                quant::isa_name(quant::best_isa()));
+    // every tier this CPU runs, capped by STRATA_FORCE_ISA as in the tower (an emulated older CPU never reaches a wider tier); NEON on Arm
+    const int cap = (int) quant::best_isa();
     std::vector<const CpuOps*> tiers = {&cpu_ops_scalar()};
-    if (quant::isa_ok(quant::Isa::Avx2)) tiers.push_back(&cpu_ops_avx2());
-    if (quant::isa_ok(quant::Isa::Avx512)) tiers.push_back(&cpu_ops_avx512());
+    if (cap >= (int) quant::Isa::Sse41 && cap != (int) quant::Isa::Neon && quant::isa_ok(quant::Isa::Sse41)) tiers.push_back(&cpu_ops_sse41());
+    if (cap >= (int) quant::Isa::Avx && cap != (int) quant::Isa::Neon && quant::isa_ok(quant::Isa::Avx)) tiers.push_back(&cpu_ops_avx());
+    if (cap >= (int) quant::Isa::Avx2 && cap != (int) quant::Isa::Neon && quant::isa_ok(quant::Isa::Avx2)) tiers.push_back(&cpu_ops_avx2());
+    if (cap == (int) quant::Isa::Avx512 && quant::isa_ok(quant::Isa::Avx512)) tiers.push_back(&cpu_ops_avx512());
     if (quant::isa_ok(quant::Isa::Neon)) tiers.push_back(&cpu_ops_neon());
     for (const CpuOps* o : tiers) {
         std::printf("tier %s (tile %d x %d)\n", o->name, o->MR, o->NR);
@@ -249,6 +307,10 @@ int main(int argc, char** argv) {
         test_layernorm(*o);
         test_add(*o);
         test_attention(*o);
+        test_rope_pos(*o);
+#if defined(__x86_64__) || defined(_M_X64)
+        if (std::strcmp(o->name, "sse41") == 0) test_gemm_equals_scalar(*o);
+#endif
     }
     test_team();
     test_round_choice();
