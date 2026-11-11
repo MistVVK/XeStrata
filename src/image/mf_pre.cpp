@@ -38,6 +38,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -363,6 +364,90 @@ int anima_text(const std::string& te_path, const std::string& dit_path, const st
     return 0;
 }
 
+/// Qwen-Image-2.1's caches, as its trainer reads them back (qi_train_latent, qi_train_states): the list's cut images
+/// through the VAE's encoder (the posterior's mean and standard deviation) and its prompts through the text encoder
+/// (the states before its final norm, the system turn's rows dropped), each to the flat file the list names.
+int qi_prep(const std::string& vae_path, const std::string& te_path, const std::string& list_path) {
+    std::ifstream list(list_path);
+    if (!list) throw std::runtime_error("cannot read " + list_path);
+    std::vector<std::vector<std::string>> imgs, txts;
+    for (std::string line; std::getline(list, line);) {
+        std::istringstream ls(line);
+        std::vector<std::string> w;
+        for (std::string t; ls >> t;) w.push_back(t);
+        if (w.empty()) continue;
+        if (w[0] == "img" && w.size() == 5) imgs.push_back(w);
+        else if (w[0] == "txt" && w.size() == 4) txts.push_back(w);
+        else throw std::runtime_error("bad list line: " + line);
+    }
+    void* s = strata::core::Runtime::get().create_stream();
+    std::string err;
+    if (!imgs.empty()) {   // the VAE first, then the text encoder: one of them on the GPU at a time
+        strata::image::QiVae vae;
+        if (!vae.open(vae_path, s, err)) throw std::runtime_error(err);
+        for (const auto& w : imgs) {
+            const int64_t W = std::stoll(w[2]), H = std::stoll(w[3]), HW = W * H;
+            std::vector<uint8_t> px;
+            {
+                std::ifstream f(w[1], std::ios::binary);
+                px.assign((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+            }
+            if ((int64_t) px.size() != HW * 3) throw std::runtime_error("bad image file " + w[1]);
+            std::vector<float> rgba((size_t) (4 * HW), 1.0f);   // an opaque alpha, as ai-toolkit gives an RGB image
+            for (int64_t q = 0; q < HW; ++q)
+                for (int c = 0; c < 3; ++c) rgba[(size_t) (c * HW + q)] = (float) px[(size_t) (q * 3 + c)] / 255.f;
+            const int64_t n = 64 * HW / 256;
+            float *d = nullptr, *z = nullptr, *sd = nullptr;
+            if (!strata::gpu::alloc_device(&d, rgba.size() * 4) || !strata::gpu::alloc_device(&z, (size_t) n * 4) ||
+                !strata::gpu::alloc_device(&sd, (size_t) n * 4))
+                throw std::runtime_error("GPU memory for an image");
+            strata::gpu::copy(d, rgba.data(), rgba.size() * 4);
+            if (!vae.encode(d, H, W, z, sd)) throw std::runtime_error("the VAE has no encoder");
+            std::vector<float> out((size_t) (2 + 2 * n));
+            out[0] = (float) (W / 16);
+            out[1] = (float) (H / 16);
+            strata::gpu::copy(out.data() + 2, z, (size_t) n * 4);
+            strata::gpu::copy(out.data() + 2 + n, sd, (size_t) n * 4);
+            strata::gpu::free(d);
+            strata::gpu::free(z);
+            strata::gpu::free(sd);
+            vae.drop_scratch();
+            std::ofstream o(w[4], std::ios::binary);
+            o.write(reinterpret_cast<const char*>(out.data()), (std::streamsize) (out.size() * 4));
+            if (!o) throw std::runtime_error("cannot write " + w[4]);
+            std::printf("img %s %lldx%lld\n", w[4].c_str(), (long long) W, (long long) H);
+        }
+    }
+    if (!txts.empty()) {
+        strata::image::TextEncoder te;
+        strata::gpu::stream_sync(s);   // the encoder's own stream: the VAE's work first
+        if (!te.open(te_path, 16384, err)) throw std::runtime_error(err);
+        te.set_final_norm(false);   // Qwen-Image's context: before the final norm
+        for (const auto& w : txts) {
+            std::vector<int32_t> ids;
+            {
+                std::ifstream f(w[1], std::ios::binary);
+                const auto bytes = (size_t) std::filesystem::file_size(w[1]);
+                ids.resize(bytes / 4);
+                f.read(reinterpret_cast<char*>(ids.data()), (std::streamsize) bytes);
+            }
+            const int64_t drop = std::stoll(w[2]);
+            std::vector<float> st = te.encode(ids, err);
+            if (st.empty()) throw std::runtime_error(err);
+            const int64_t D = te.hidden(), n = (int64_t) ids.size() - drop;
+            if (D != 4096 || n <= 0) throw std::runtime_error("the text encoder's states do not fit " + w[1]);
+            std::vector<float> out((size_t) (1 + n * D));
+            out[0] = (float) n;
+            std::copy(st.begin() + drop * D, st.end(), out.begin() + 1);
+            std::ofstream o(w[3], std::ios::binary);
+            o.write(reinterpret_cast<const char*>(out.data()), (std::streamsize) (out.size() * 4));
+            if (!o) throw std::runtime_error("cannot write " + w[3]);
+            std::printf("txt %s %lld rows\n", w[3].c_str(), (long long) n);
+        }
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -373,6 +458,7 @@ int main(int argc, char** argv) {
         if (what == "moss-text" && argc == 5) return moss_text(argv[2], argv[3], argv[4]);
         if (what == "anima-vae" && argc == 4) return anima_vae(argv[2], argv[3]);
         if (what == "anima-text" && argc == 5) return anima_text(argv[2], argv[3], argv[4]);
+        if (what == "qi-prep" && argc == 5) return qi_prep(argv[2], argv[3], argv[4]);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "xestrata-image-mf-pre: %s\n", e.what());
         return 1;
@@ -380,6 +466,6 @@ int main(int argc, char** argv) {
     std::fprintf(stderr,
                  "usage: %s vae VAE.safetensors DIR | text TEXT_ENCODER.gguf DIR [DROP] | "
                  "moss-text TEXT_ENCODER.gguf DIT_DIR LIST | anima-vae VAE.safetensors DIR | "
-                 "anima-text TEXT_ENCODER.gguf DIT.safetensors LIST\n", argv[0]);
+                 "anima-text TEXT_ENCODER.gguf DIT.safetensors LIST | qi-prep VAE TEXT_ENCODER.gguf LIST\n", argv[0]);
     return 2;
 }

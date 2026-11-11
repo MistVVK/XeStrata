@@ -36,6 +36,7 @@
 
 #include "strata/prefill/gemm.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -256,6 +257,40 @@ struct AdScratch {
     float* rsT = nullptr;
 };
 
+/// The largest of the adapters' transients, over the products i < n whose adapter is not null: the rows product i
+/// takes (rows_of_product(i)), its width and input width, and the adapter's rank; `plain` while every one is a plain
+/// LoRA (its delta takes y1 alone: no y2).
+struct AdSizes {
+    int64_t rows = 0, n = 0, rank = 0, scratch = 0, tmp = 0;
+    bool plain = true;
+};
+
+template <class Rows>
+AdSizes ad_sizes(const Product* const* p, const Adapter* const* ad, int n, Rows rows_of_product) {
+    AdSizes s;
+    for (int i = 0; i < n; ++i) {
+        const Adapter* a = ad[i];
+        if (a == nullptr) continue;
+        const int64_t T = rows_of_product(i), N = p[i]->N, K = p[i]->K, rk = a->rank;
+        s.rows = std::max(s.rows, T);
+        s.n = std::max(s.n, N);
+        s.rank = std::max(s.rank, rk);
+        s.scratch = std::max(s.scratch, T * rk + T * N + N * rk + rk * K);
+        s.tmp = std::max(s.tmp, 2 * T * N + T * rk);
+        s.plain = s.plain && a->method == AdapterMethod::lora;
+    }
+    return s;
+}
+
+class Pool;
+
+/// AdSizes taken from a block's pool: every buffer null where no product is adapted.  `y2`: take the second map's
+/// transient even where the block's adapter method does not read it (DoRA's and LoKr's do).  What is taken moves the
+/// buffers after it in the arena, and Mage-Flow's trainer (its base int8) measured its eval a 1e-6 apart between the
+/// two layouts on the RX 7900 XTX (2026-11-11): the two blocks that always took it (qi's and mf's) keep taking it, so
+/// that a step's memory is where it was.
+AdScratch take_ad_scratch(Pool& pool, const AdSizes& s, bool y2);
+
 /// One product's rows with its adapter (null: the product as always), the base product's sums already in y [R][N]
 /// (still divided by the input's row scales rsx, no bias yet): the scales and the bias put back and the adapter's
 /// delta added, what the forward's next stage reads.  keep receives what the backward reads.
@@ -333,6 +368,19 @@ private:
     void* s_;
     Arena* arena_ = nullptr;
     std::vector<void*> owned_;
+};
+
+/// The bytes a block's tape asks for: take_tape's takes in the same order, without a pool (an arena's 256-byte steps)
+struct Sizer {
+    size_t bytes = 0;
+    void* add(int64_t n, int64_t w) {
+        bytes += ((size_t) (n * w) + 255) / 256 * 256;
+        return nullptr;
+    }
+    float* f(int64_t n) { return static_cast<float*>(add(n, 4)); }
+    float* rf(int64_t n) { return f(n); }
+    uint16_t* u(int64_t n) { return static_cast<uint16_t*>(add(n, 2)); }
+    uint16_t* ru(int64_t n) { return u(n); }
 };
 
 }  // namespace strata::image::train

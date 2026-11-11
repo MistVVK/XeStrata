@@ -15,6 +15,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import shutil
 import struct
 import subprocess
@@ -1125,6 +1126,51 @@ console.log(JSON.stringify({chips: chips(), picker: picker(), stored: stored()})
         self.assertEqual(out["chips"], [])
         self.assertEqual([o["value"] for o in out["picker"]], ["", "style/gouache"])
         self.assertEqual(out["stored"], {"xestrata.img_loras.qwen-image-2.1-turbo": "[]"})
+
+
+def _table(header: str, name: str) -> list[str]:
+    """A C++ table's names, in order (include/strata/image/lora_names.hpp's `inline constexpr const char* kName[]`)."""
+    at = header.index(name)
+    body = header[header.index("{", at): header.index("};", at)]
+    return re.findall(r'"([^"]*)"', body)
+
+
+class TargetNames(unittest.TestCase):
+    """serve/loras.py's TARGETS are the DiTs' build_lora_targets names (include/strata/image/lora_names.hpp's tables):
+    a file's key the engine takes is one this model may carry, whichever of the two sides names it."""
+
+    def test_every_models_targets_are_the_names_the_dits_build(self):
+        header = (Path(__file__).resolve().parents[1] / "include/strata/image/lora_names.hpp").read_text(
+            encoding="utf-8")
+
+        def block(path: str, names: list[str]) -> set[str]:
+            return {path + n for n in names}
+
+        def tables(*names: str) -> list[str]:
+            out: list[str] = []
+            for n in names:
+                out += _table(header, n)
+            return out
+
+        qi_outside = set(_table(header, "kQiOutside"))
+        qi_block = block("transformer_blocks.{b}.", tables("kQiBlock", "kQiGateHalf"))
+        moss_outside = set(_table(header, "kMossOutside"))
+        moss_text = block("text_embedder.blocks.{b}.", tables("kMossTextBlock", "kMossTextUpGate"))
+        moss_block = block("layers.{b}.", set(tables("kMossBlock", "kMossQkv", "kMossUpGate")))
+        mage_outside = set(_table(header, "kMageOutside"))
+        mage_block = block("transformer_blocks.{b}.", tables("kMageMod", "kMageBlock"))
+        anima_outside = set(_table(header, "kAnimaOutside"))
+        anima_block = block("blocks.{b}.", tables("kAnimaBlock"))
+        anima_mod = block("blocks.{b}.", [f"{n}.{j}" for n in _table(header, "kAnimaMod") for j in (1, 2)])
+        anima_adapter = block("llm_adapter.blocks.{b}.", tables("kAnimaAdapter"))
+        expected = {
+            "qwen-image": qi_outside | qi_block,
+            "moss-image": moss_outside | moss_text | moss_block,
+            "mage-flow": mage_outside | mage_block,
+            "anima": anima_outside | anima_block | anima_mod | anima_adapter,
+        }
+        for family, names in expected.items():
+            self.assertEqual(sorted(names), sorted(set(loras.TARGETS[family])), family)
 
 
 if __name__ == "__main__":

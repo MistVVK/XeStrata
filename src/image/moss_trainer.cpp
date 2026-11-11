@@ -4,6 +4,8 @@
 // inference's (MossDit::forward, time_embedding, rope_tables and the head), frozen: the input projection, the time's
 // two layers, the shared modulation and the head's, the final norm and projection.
 #include "strata/image/moss_trainer.hpp"
+#include "strata/image/dit_file.hpp"
+#include "strata/image/lora_names.hpp"
 #include "strata/image/moss_dit.hpp"
 #include "strata/image/moss_train.hpp"
 #include "strata/image/qi_kernels.hpp"
@@ -39,7 +41,8 @@ namespace {
 
 constexpr float kEps = 1e-6f;
 constexpr int64_t kFreq = 256;   // the time's sinusoid
-const char* const kProduct[kMossProducts] = {"proj.qkv", "proj.o", "proj.ffn_up_gate", "proj.ffn_down"};
+static_assert(std::size(lora::kMossBlock) == kMossProducts);
+const char* const* const kProduct = lora::kMossBlock;   // the DiT's target names, in kMossProducts' order
 
 struct Lora {
     train::Adapter ad;
@@ -250,62 +253,6 @@ struct MossTrainer::Impl {
     }
 };
 
-namespace {
-
-// the DiT's shards: a name looked up in each
-struct Shards {
-    std::vector<std::unique_ptr<SafeTensors>> st;
-    std::vector<std::unique_ptr<platform::MappedFile>> mf;
-    explicit Shards(const std::string& path) {
-        std::vector<std::string> files;
-        if (std::filesystem::is_directory(path)) {
-            for (const auto& e : std::filesystem::directory_iterator(path))
-                if (e.path().extension() == ".safetensors") files.push_back(e.path().string());
-            std::sort(files.begin(), files.end());
-        } else {
-            files.push_back(path);
-        }
-        if (files.empty()) throw std::runtime_error(path + ": no safetensors");
-        for (const std::string& f : files) {
-            st.push_back(std::make_unique<SafeTensors>(f));
-            mf.push_back(std::make_unique<platform::MappedFile>(f));
-        }
-    }
-    int at(const std::string& name) const {
-        for (size_t i = 0; i < st.size(); ++i)
-            if (st[i]->find(name) != nullptr) return (int) i;
-        return -1;
-    }
-    bool has(const std::string& name) const { return at(name) >= 0; }
-    const SafeTensor& bf16(const std::string& name) const {
-        const int i = at(name);
-        if (i < 0) throw std::runtime_error("image engine (MOSS-Image training): no " + name);
-        const SafeTensor& t = *st[(size_t) i]->find(name);
-        if (t.dtype != "BF16") throw std::runtime_error("image engine (MOSS-Image training): " + name + " is not bf16");
-        return t;
-    }
-    // a bf16 matrix's rows as FP16 bits (host), appended to out
-    void rows16(const std::string& name, std::vector<uint16_t>& out, int64_t& N, int64_t& K) const {
-        const SafeTensor& t = bf16(name);
-        if (t.shape.size() != 2) throw std::runtime_error("image engine (MOSS-Image training): " + name + " is not 2D");
-        N = t.shape[0];
-        K = t.shape[1];
-        const int i = at(name);
-        const auto* src = reinterpret_cast<const uint16_t*>(mf[(size_t) i]->data() + st[(size_t) i]->data_base() +
-                                                            t.begin);
-        const size_t o = out.size();
-        out.resize(o + (size_t) (N * K));
-        for (int64_t k = 0; k < N * K; ++k) out[o + (size_t) k] = kernels::f16_from_f32(dit_rows::bf16_value(src[k]));
-    }
-    std::vector<float> f32(const std::string& name) const {
-        const int i = at(name);
-        if (i < 0) throw std::runtime_error("image engine (MOSS-Image training): no " + name);
-        return st[(size_t) i]->f32(name);
-    }
-};
-
-}  // namespace
-
 MossTrainer::MossTrainer() : m_(std::make_unique<Impl>()) {}
 MossTrainer::~MossTrainer() = default;
 int64_t MossTrainer::hidden() const { return m_->C; }
@@ -317,7 +264,7 @@ bool MossTrainer::open(const std::string& dit, int64_t rank, bool int8, const st
         m.s = stream;
         m.rank = rank;
         if (!m.gemm.init(stream, 1 << 20, err)) return false;
-        const Shards f(dit);
+        const MossFile f(dit);
         if (std::filesystem::is_directory(dit)) {   // config.json's rope_base, where it differs from 10000
             std::ifstream cf(std::filesystem::path(dit) / "config.json");
             const std::string cfg((std::istreambuf_iterator<char>(cf)), std::istreambuf_iterator<char>());
@@ -724,7 +671,7 @@ void MossTrainer::save(const std::string& path, const std::vector<std::pair<std:
             const std::vector<float> A = read(l.A, m.rank * l.K), Bv = read(l.B, l.N * m.rank);
             if (i == kMossQkv) {   // q, k and v: the fused A each, B's rows split in three
                 const int64_t n = l.N / 3;
-                const char* nm[3] = {"proj.q", "proj.k", "proj.v"};
+                const char* const* nm = lora::kMossQkv;   // q, k and v's names: the fused one is kMossQkv[3]
                 for (int j = 0; j < 3; ++j) {
                     ts.push_back({p + nm[j] + ".lora_A.weight", {m.rank, l.K}, A});
                     ts.push_back({p + nm[j] + ".lora_B.weight", {n, m.rank},

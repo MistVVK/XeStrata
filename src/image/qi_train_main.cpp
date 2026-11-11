@@ -2,17 +2,13 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/image/qi_train_main.cpp - strata-image-qi-train: a LoRA on Qwen-Image-2.1, as ai-toolkit trains one.
 //
-//   strata-image-qi-train prep --te <Qwen3-VL GGUF> --vae <safetensors> --list <file>
 //   strata-image-qi-train train --dit <F16 GGUF> --data <items file> --out <prefix> [--rank 32] [--steps 3000]
 //                               [--lr 1e-4] [--seed 42] [--draw balanced|content|style] [--save-every 250]
 //                               [--caption-dropout 0.05] [--base bf16|int8]
 //   strata-image-qi-train check --dit <F16 GGUF> --dir <dir> [--blocks N] [--base bf16|int8]
 //
-// prep is the caches ai-toolkit fills before it trains (tools/image/qi_train_prep.py writes the list and drives it):
-// a line "img <rgb8 file> <W> <H> <out>" is an image already scaled and cropped to its bucket, encoded by the VAE to
-// <out> (W / 16, H / 16, then the posterior's mean and standard deviation, normalized, [64][h][w] FP32 each); a line
-// "txt <int32 ids file> <drop> <out>" is a caption's chat template's ids, its text encoder states past the first
-// `drop` (the system turn) written to <out> (n, then [n][4096] FP32).
+// The caches the trainer reads are ai-toolkit's, made before it trains by tools/image/mf_pre.py --cache qi (the list's
+// images through the VAE, its prompts through the text encoder; the reader is train_sample.hpp).
 //
 // train reads an items file, a line "<latent cache> <states cache>" each and a first line "empty <states cache>" (the
 // caption " " the dropout swaps in), and runs ai-toolkit's loop: each epoch the items in a new order, a caption
@@ -27,8 +23,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/qi_trainer.hpp"
-#include "strata/image/qi_vae.hpp"
-#include "strata/image/text_encoder.hpp"
+#include "strata/image/train_sample.hpp"
 #include "strata/image/train_loop.hpp"
 
 #include <algorithm>
@@ -50,8 +45,7 @@ namespace gpu = strata::gpu;
 
 void usage() {
     std::fprintf(stderr,
-                 "usage: xestrata-image-qi-train prep --te <gguf> --vae <safetensors> --list <file>\n"
-                 "       xestrata-image-qi-train train --dit <gguf> --data <items> --out <prefix> [--rank N] "
+                 "usage: xestrata-image-qi-train train --dit <gguf> --data <items> --out <prefix> [--rank N] "
                  "[--steps N] [--lr F] [--seed N] [--draw balanced|content|style] [--save-every N] "
                  "[--caption-dropout F] [--base bf16|int8]\n"
                  "       xestrata-image-qi-train check --dit <gguf> --dir <dir> [--blocks N] [--base bf16|int8]\n");
@@ -93,99 +87,6 @@ template<class T> void write_all(const std::string& path, const T* p, size_t n) 
     if (!f) throw std::runtime_error("cannot write " + path);
 }
 
-// a latent cache: h, w, then the mean and the standard deviation [64][h][w]
-struct Latent {
-    int64_t h = 0, w = 0;
-    std::vector<float> mean, sd;
-};
-
-Latent read_latent(const std::string& path) {
-    std::vector<float> v = read_all<float>(path);
-    if (v.size() < 2) throw std::runtime_error("short latent cache " + path);
-    Latent l;
-    l.w = (int64_t) v[0];
-    l.h = (int64_t) v[1];
-    const size_t n = (size_t) (64 * l.h * l.w);
-    if (v.size() != 2 + 2 * n) throw std::runtime_error("latent cache of the wrong size " + path);
-    l.mean.assign(v.begin() + 2, v.begin() + 2 + (long) n);
-    l.sd.assign(v.begin() + 2 + (long) n, v.end());
-    return l;
-}
-
-std::vector<float> read_states(const std::string& path, int64_t& n) {
-    std::vector<float> v = read_all<float>(path);
-    if (v.empty()) throw std::runtime_error("empty states cache " + path);
-    n = (int64_t) v[0];
-    if ((int64_t) v.size() != 1 + n * 4096) throw std::runtime_error("states cache of the wrong size " + path);
-    return {v.begin() + 1, v.end()};
-}
-
-int prep(const std::map<std::string, std::string>& f, void* s) {
-    std::ifstream list(need(f, "list"));
-    if (!list) throw std::runtime_error("cannot read the list");
-    std::vector<std::vector<std::string>> imgs, txts;
-    for (std::string line; std::getline(list, line);) {
-        std::istringstream ls(line);
-        std::vector<std::string> w;
-        for (std::string t; ls >> t;) w.push_back(t);
-        if (w.empty()) continue;
-        if (w[0] == "img" && w.size() == 5) imgs.push_back(w);
-        else if (w[0] == "txt" && w.size() == 4) txts.push_back(w);
-        else throw std::runtime_error("bad list line: " + line);
-    }
-    std::string err;
-    if (!imgs.empty()) {   // the VAE first, then the text encoder: one of them on the GPU at a time
-        QiVae vae;
-        if (!vae.open(need(f, "vae"), s, err)) throw std::runtime_error(err);
-        for (const auto& w : imgs) {
-            const int64_t W = std::stoll(w[2]), H = std::stoll(w[3]), HW = W * H;
-            std::vector<uint8_t> px = read_all<uint8_t>(w[1]);
-            if ((int64_t) px.size() != HW * 3) throw std::runtime_error("bad image file " + w[1]);
-            std::vector<float> rgba((size_t) (4 * HW), 1.0f);   // an opaque alpha, as ai-toolkit gives an RGB image
-            for (int64_t q = 0; q < HW; ++q)
-                for (int c = 0; c < 3; ++c) rgba[(size_t) (c * HW + q)] = (float) px[(size_t) (q * 3 + c)] / 255.f;
-            const int64_t n = 64 * HW / 256;
-            float *d = nullptr, *z = nullptr, *sd = nullptr;
-            if (!gpu::alloc_device(&d, rgba.size() * 4) || !gpu::alloc_device(&z, (size_t) n * 4) ||
-                !gpu::alloc_device(&sd, (size_t) n * 4))
-                throw std::runtime_error("GPU memory for an image");
-            gpu::copy(d, rgba.data(), rgba.size() * 4);
-            if (!vae.encode(d, H, W, z, sd)) throw std::runtime_error("the VAE has no encoder");
-            std::vector<float> out((size_t) (2 + 2 * n));
-            out[0] = (float) (W / 16);
-            out[1] = (float) (H / 16);
-            gpu::copy(out.data() + 2, z, (size_t) n * 4);
-            gpu::copy(out.data() + 2 + n, sd, (size_t) n * 4);
-            gpu::free(d);
-            gpu::free(z);
-            gpu::free(sd);
-            vae.drop_scratch();
-            write_all(w[4], out.data(), out.size());
-            std::printf("img %s %lldx%lld\n", w[4].c_str(), (long long) W, (long long) H);
-        }
-    }
-    if (!txts.empty()) {
-        TextEncoder te;
-        gpu::stream_sync(s);   // the encoder's own stream: the VAE's work first
-        if (!te.open(need(f, "te"), 16384, err)) throw std::runtime_error(err);
-        te.set_final_norm(false);   // Qwen-Image's context: before the final norm
-        for (const auto& w : txts) {
-            const std::vector<int32_t> ids = read_all<int32_t>(w[1]);
-            const int64_t drop = std::stoll(w[2]);
-            std::vector<float> st = te.encode(ids, err);
-            if (st.empty()) throw std::runtime_error(err);
-            const int64_t D = te.hidden(), n = (int64_t) ids.size() - drop;
-            if (D != 4096 || n <= 0) throw std::runtime_error("the text encoder's states do not fit " + w[1]);
-            std::vector<float> out((size_t) (1 + n * D));
-            out[0] = (float) n;
-            std::copy(st.begin() + drop * D, st.end(), out.begin() + 1);
-            write_all(w[3], out.data(), out.size());
-            std::printf("txt %s %lld rows\n", w[3].c_str(), (long long) n);
-        }
-    }
-    return 0;
-}
-
 int train_cmd(const std::map<std::string, std::string>& f, void* s) {
     const int64_t rank = std::stoll(opt(f, "rank", "32")), steps = std::stoll(opt(f, "steps", "3000"));
     const int64_t save_every = std::stoll(opt(f, "save-every", "250"));
@@ -204,7 +105,7 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
     std::ifstream items(need(f, "data"));
     if (!items) throw std::runtime_error("cannot read the items");
     struct Item {
-        Latent lat;
+        QiTrainLatent lat;
         int text = -1;
     };
     std::vector<Item> all;
@@ -214,7 +115,7 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
         auto it = text_of.find(path);
         if (it != text_of.end()) return it->second;
         int64_t n = 0;
-        std::vector<float> st = read_states(path, n);
+        std::vector<float> st = qi_train_states(path, n);
         return text_of[path] = tr.add_text(st, n);
     };
     for (std::string line; std::getline(items, line);) {
@@ -222,7 +123,7 @@ int train_cmd(const std::map<std::string, std::string>& f, void* s) {
         std::string a, b;
         if (!(ls >> a >> b)) continue;
         if (a == "empty") empty = text(b);
-        else all.push_back({read_latent(a), text(b)});
+        else all.push_back({qi_train_latent(a), text(b)});
     }
     if (all.empty() || empty < 0) throw std::runtime_error("the items file needs its \"empty\" line and an item");
     std::printf("qwen-image-2.1 lora: %zu items, rank %lld, %lld steps, lr %g, %s\n", all.size(), (long long) rank,
@@ -331,7 +232,6 @@ int main(int argc, char** argv) {
         const std::string op = argv[1];
         const auto f = flags(argc, argv, 2);
         void* s = strata::core::Runtime::get().create_stream();
-        if (op == "prep") return prep(f, s);
         if (op == "train") return train_cmd(f, s);
         if (op == "check") return check(f, s);
         usage();

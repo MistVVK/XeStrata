@@ -27,13 +27,10 @@
 #include <string>
 #include <vector>
 
-namespace strata {
-class GgufFile;
-}
-
 namespace strata::image {
 
 class QiControl;
+class QiFile;
 
 /// Philox 4x32-10 normal values as PyTorch's CUDA randn gives them for `seed` (the generator stable-diffusion.cpp
 /// uses): value i from counter (offset, 0, i, 0) and key (seed low, seed high), Box-Muller's sine half.
@@ -203,7 +200,7 @@ private:
     /// The context's prefix let go: its text rows, and both contexts' K and V caches (an adapter change).
     void drop_prefix();
 
-    std::unique_ptr<GgufFile> g_;
+    std::unique_ptr<QiFile> g_;
     void* s_ = nullptr;
     prefill::Gemm gemm_;
     std::vector<void*> allocs_;

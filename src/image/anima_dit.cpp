@@ -3,6 +3,8 @@
 // src/image/anima_dit.cpp - see include/strata/image/anima_dit.hpp.
 
 #include "strata/image/anima_dit.hpp"
+#include "strata/image/dit_file.hpp"
+#include "strata/image/lora_names.hpp"
 
 #include "dit_rows.hpp"
 #include "img_out.hpp"
@@ -174,13 +176,6 @@ template<class Op> void rows16_plain(const Op& op, int64_t T, int64_t C, uint16_
 // x[t] += y[t] (the adapter's residuals)
 void add_rows(float* x, const float* y, int64_t n, void* s) { qi_axpy(x, y, 1.0f, n, s); }
 
-uint16_t bf16_of(float f) {
-    uint32_t u = 0;
-    std::memcpy(&u, &f, 4);
-    if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t) ((u >> 16) | 0x40u);   // NaN stays NaN
-    return (uint16_t) ((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
-}
-
 // an F8 E4M3 byte (the scaled fp8 saves': no inf, 0x7f / 0xff NaN)
 float e4m3(uint8_t b) {
     const int s = b >> 7, e = (b >> 3) & 15, m = b & 7;
@@ -212,66 +207,7 @@ void rope_1d(const std::vector<int64_t>& rows, int64_t half, std::vector<float>&
 
 using namespace anima_dit_detail;
 
-// the DiT's file: its tensors by their names without the prefix, BF16 in place or converted
-struct AnimaDit::File {
-    SafeTensors st;
-    platform::MappedFile map;
-    std::string pre;
-    explicit File(const std::string& path) : st(path), map(path) {
-        for (const char* p : {"", "net.", "model.diffusion_model.", "diffusion_model."})
-            if (st.find(std::string(p) + "llm_adapter.embed.weight") != nullptr) {
-                pre = p;
-                return;
-            }
-        throw std::runtime_error("image engine (Anima DiT): " + path + " has no llm_adapter.embed.weight");
-    }
-    const SafeTensor* find(const std::string& name) const { return st.find(pre + name); }
-    const SafeTensor& get(const std::string& name) const {
-        const SafeTensor* t = find(name);
-        if (t == nullptr) throw std::runtime_error("image engine (Anima DiT): no " + name);
-        return *t;
-    }
-    const uint8_t* raw(const SafeTensor& t) const { return map.data() + st.data_base() + t.begin; }
-    // a tensor's values as bf16: the mapping itself for a BF16 one, else converted into tmp
-    const uint16_t* bf16(const std::string& name, std::vector<uint16_t>& tmp) {
-        const SafeTensor& t = get(name);
-        if (t.dtype == "BF16") return reinterpret_cast<const uint16_t*>(raw(t));
-        const std::vector<float> v = f32(name);
-        tmp.resize(v.size());
-        for (size_t i = 0; i < v.size(); ++i) tmp[i] = bf16_of(v[i]);
-        return tmp.data();
-    }
-    std::vector<float> f32(const std::string& name) {
-        const SafeTensor& t = get(name);
-        if (t.dtype != "F8_E4M3") return st.f32(pre + name);
-        // scaled fp8: the weight times its scale_weight (one value), where the file has one
-        float scale = 1.f;
-        const std::string base = name.size() > 7 && name.compare(name.size() - 7, 7, ".weight") == 0
-                                     ? name.substr(0, name.size() - 7) : name;
-        if (find(base + ".scale_weight") != nullptr) scale = st.f32(pre + base + ".scale_weight").at(0);
-        const uint8_t* p = raw(t);
-        std::vector<float> out((size_t) t.elements());
-        for (size_t i = 0; i < out.size(); ++i) out[i] = e4m3(p[i]) * scale;
-        return out;
-    }
-    void drop_cache(const std::string& name) const {
-        if (const SafeTensor* t = find(name); t != nullptr) map.drop_cache(st.data_base() + t->begin, t->end - t->begin);
-    }
-};
-
-bool anima_is_dit(const std::string& path) {
-    if (path.size() < 12 || path.compare(path.size() - 12, 12, ".safetensors") != 0) return false;
-    try {
-        SafeTensors st(path);
-        for (const char* p : {"", "net.", "model.diffusion_model.", "diffusion_model."})
-            if (st.find(std::string(p) + "llm_adapter.embed.weight") != nullptr &&
-                st.find(std::string(p) + "x_embedder.proj.1.weight") != nullptr)
-                return true;
-    } catch (const std::exception&) {
-        return false;   // not a safetensors file this engine reads: not Anima's
-    }
-    return false;
-}
+bool anima_is_dit(const std::string& path) { return AnimaFile::is_dit(path); }
 
 AnimaDit::AnimaDit() = default;
 
@@ -287,8 +223,8 @@ bool AnimaDit::open(const std::string& path, void* stream, std::string& err, boo
         s_ = stream;
         dry_ = dry;
         norm_cache_.clear();
-        file_ = std::make_unique<File>(path);
-        File& f = *file_;
+        file_ = std::make_unique<AnimaFile>(path);
+        AnimaFile& f = *file_;
         // a file whose blocks are not bf16 has no bytes the GPU could rewrite in place: 8 bits
         q8_ = q8 || f.get("blocks.0.self_attn.q_proj.weight").dtype != "BF16";
         w8_ = q8_ && strata::env_get("NO_W8A8") == nullptr && prefill::Gemm::i8_usable(stream);
@@ -406,7 +342,7 @@ bool AnimaDit::open(const std::string& path, void* stream, std::string& err, boo
 // a part outside the blocks as FP16 (its first `cols` columns when given), its bias FP32
 AnimaDit::W AnimaDit::dense(const std::string& name, bool biased, const float** bias, std::vector<void*>& owned,
                             uint64_t& bytes, int64_t cols) {
-    File& f = *file_;
+    AnimaFile& f = *file_;
     const SafeTensor& t = f.get(name + ".weight");
     W w;
     w.type = kTypeF16;
@@ -1133,46 +1069,49 @@ void AnimaDit::build_lora_targets() {
         if (w.n <= 0 || w.k <= 0) return;
         lora_slots_.push_back({std::move(name), &w, 0, w.n, 0, biased});
     };
-    add("x_embedder.proj.1", xemb_, false);
-    add("t_embedder.1.linear_1", t1_, false);
-    add("t_embedder.1.linear_2", t2_, false);
-    add("final_layer.linear", flin_, false);
-    add("final_layer.adaln_modulation.1", fm1_, false);
-    add("final_layer.adaln_modulation.2", fm2_, false);
+    const char* const* out = lora::kAnimaOutside;
+    add(out[0], xemb_, false);
+    add(out[1], t1_, false);
+    add(out[2], t2_, false);
+    add(out[3], flin_, false);
+    add(out[4], fm1_, false);
+    add(out[5], fm2_, false);
+    const char* const* ad = lora::kAnimaAdapter;
     for (int i = 0; i < (int) ablocks_.size(); ++i) {
         const std::string p = "llm_adapter.blocks." + std::to_string(i) + ".";
         AdapterBlock& b = ablocks_[(size_t) i];
-        add(p + "self_attn.q_proj", b.sq, false);
-        add(p + "self_attn.k_proj", b.sk, false);
-        add(p + "self_attn.v_proj", b.sv, false);
-        add(p + "self_attn.o_proj", b.so, false);
-        add(p + "cross_attn.q_proj", b.cq, false);
-        add(p + "cross_attn.k_proj", b.ck, false);
-        add(p + "cross_attn.v_proj", b.cv, false);
-        add(p + "cross_attn.o_proj", b.co, false);
-        add(p + "mlp.0", b.m0, true);
-        add(p + "mlp.2", b.m2, true);
+        add(p + ad[0], b.sq, false);
+        add(p + ad[1], b.sk, false);
+        add(p + ad[2], b.sv, false);
+        add(p + ad[3], b.so, false);
+        add(p + ad[4], b.cq, false);
+        add(p + ad[5], b.ck, false);
+        add(p + ad[6], b.cv, false);
+        add(p + ad[7], b.co, false);
+        add(p + ad[8], b.m0, true);
+        add(p + ad[9], b.m2, true);
     }
-    if (aout_.n > 0) add("llm_adapter.out_proj", aout_, true);
+    add(out[6], aout_, true);
+    const char* const* n = lora::kAnimaBlock;
     for (int bi = 0; bi < (int) blocks_.size(); ++bi) {
         const std::string p = "blocks." + std::to_string(bi) + ".";
         Block& b = blocks_[(size_t) bi];
-        add(p + "self_attn.q_proj", b.sq, false);
-        add(p + "self_attn.k_proj", b.sk, false);
-        add(p + "self_attn.v_proj", b.sv, false);
-        add(p + "self_attn.output_proj", b.so, false);
-        add(p + "cross_attn.q_proj", b.cq, false);
-        add(p + "cross_attn.k_proj", b.ck, false);
-        add(p + "cross_attn.v_proj", b.cv, false);
-        add(p + "cross_attn.output_proj", b.co, false);
-        add(p + "mlp.layer1", b.l1, false);
-        add(p + "mlp.layer2", b.l2, false);
-        add(p + "adaln_modulation_self_attn.1", b.msa1, false);
-        add(p + "adaln_modulation_self_attn.2", b.msa2, false);
-        add(p + "adaln_modulation_cross_attn.1", b.mca1, false);
-        add(p + "adaln_modulation_cross_attn.2", b.mca2, false);
-        add(p + "adaln_modulation_mlp.1", b.mml1, false);
-        add(p + "adaln_modulation_mlp.2", b.mml2, false);
+        add(p + n[0], b.sq, false);
+        add(p + n[1], b.sk, false);
+        add(p + n[2], b.sv, false);
+        add(p + n[3], b.so, false);
+        add(p + n[4], b.cq, false);
+        add(p + n[5], b.ck, false);
+        add(p + n[6], b.cv, false);
+        add(p + n[7], b.co, false);
+        add(p + n[8], b.l1, false);
+        add(p + n[9], b.l2, false);
+        for (int k = 0; k < 3; ++k)
+            for (int j = 0; j < 2; ++j) {
+                W* m = k == 0 ? (j == 0 ? &b.msa1 : &b.msa2)
+                              : k == 1 ? (j == 0 ? &b.mca1 : &b.mca2) : (j == 0 ? &b.mml1 : &b.mml2);
+                add(p + lora::kAnimaMod[k] + (j == 0 ? ".1" : ".2"), *m, false);
+            }
     }
 }
 

@@ -28,14 +28,6 @@ namespace {
 
 constexpr float kEps = 1e-6f;    // the LayerNorm's eps, as mf_dit.cpp takes it
 
-// FP32 rows [T][C] as the shared row kernels read a product's output
-MfOut rows_of(const float* p, int64_t C) {
-    MfOut m;
-    m.f = p;
-    m.C = C;
-    return m;
-}
-
 using kernels::f32_from_f16;
 
 // one stage of the forward out to the parity harness's tape: null (no tape) pays nothing
@@ -77,7 +69,6 @@ int64_t mf_block_tape_elems(const MfBlockRun& run) {
            kTapeLse * Rj * run.C + Rj * run.heads          // the eight row sets and the statistics
            + 3 * Rj;                                      // and the six scale sets: three pairs
 }
-
 
 void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream, train::Arena* arena) {
     const int64_t C = run.C, F = run.F, heads = run.heads, hd = run.hd, Ri = run.rows_img, Rt = run.rows_txt;
@@ -184,40 +175,30 @@ void mf_block(const MfBlockRun& run, prefill::Gemm& gemm, void* stream, train::A
     uint16_t* adh16[2][6] = {};
     float* adhr[2][6] = {};
     uint16_t* adh16t[2][6] = {};
-    int64_t ad_maxR = 0, ad_maxN = 0, ad_maxRank = 0, ad_maxScratch = 0, ad_maxTmp = 0;
-    for (int st = 0; st < 2; ++st)
-        for (int i = 0; i < 6; ++i) {
-            const train::Adapter* az = w[st]->ad[i];
-            if (az == nullptr) continue;
-            const int64_t T = R[st], N = w[st]->N[i], K = w[st]->K[i], rk = az->rank;
-            ad_maxR = std::max(ad_maxR, T);
-            ad_maxN = std::max(ad_maxN, N);
-            ad_maxRank = std::max(ad_maxRank, rk);
-            // train::lora_bwd's scratch (dh plus the largest of its three sums) and its three transposed FP16 maps
-            ad_maxScratch = std::max(ad_maxScratch, T * rk + T * N + N * rk + rk * K);
-            ad_maxTmp = std::max(ad_maxTmp, 2 * T * N + T * rk);
-            adh16[st][i] = pool.ru(T * rk);
-            adhr[st][i] = pool.rf(T);
-            adh16t[st][i] = pool.ru(T * rk);
-        }
-    // shared transients, sized for the largest adapted product (products run one at a time): hf is h = x A^T, y1 the
-    // delta then yb/yd/dYb, y2 the second map a DoRA that trains its magnitude reads beside the first
-    const bool ad_any = ad_maxN > 0;
-    train::AdScratch adsc;
-    if (ad_any) {
-        adsc.hf = pool.rf(ad_maxR * ad_maxRank);
-        adsc.y1 = pool.rf(ad_maxR * ad_maxN);
-        adsc.y2 = pool.rf(ad_maxR * ad_maxN);
-        adsc.fa = pool.rf(ad_maxN);
-        adsc.fb = pool.rf(ad_maxN);
-        adsc.scratch = pool.rf(ad_maxScratch);
-        adsc.tmp16 = pool.ru(ad_maxTmp);
-        adsc.rsT = pool.rf(ad_maxR);
-    }
-    auto keep = [&](int st, int i) { return train::AdKeep{adh16[st][i], adhr[st][i], adh16t[st][i]}; };
     auto prod = [&](const MfBlockW& W, int i) {
         return train::Product{W.N[i], W.K[i], W.w[i], W.wt[i], W.dw[i], W.db[i], W.w8[i], W.sw[i]};
     };
+    train::Product ps[12];
+    const train::Adapter* ads[12] = {};
+    const train::Product* prods[12];
+    for (int st = 0; st < 2; ++st)
+        for (int i = 0; i < 6; ++i) {
+            const train::Adapter* az = w[st]->ad[i];
+            const int64_t T = R[st], rk = az != nullptr ? az->rank : 0;
+            if (az != nullptr) {
+                adh16[st][i] = pool.ru(T * rk);
+                adhr[st][i] = pool.rf(T);
+                adh16t[st][i] = pool.ru(T * rk);
+            }
+            ps[st * 6 + i] = prod(*w[st], i);
+            ads[st * 6 + i] = az;
+            prods[st * 6 + i] = &ps[st * 6 + i];
+        }
+    // shared transients, sized for the largest adapted product (products run one at a time): hf is h = x A^T, y1 the
+    // delta then yb/yd/dYb, y2 the second map a DoRA that trains its magnitude reads beside the first
+    train::AdScratch adsc =
+        train::take_ad_scratch(pool, train::ad_sizes(prods, ads, 12, [&](int i) { return R[i / 6]; }), true);
+    auto keep = [&](int st, int i) { return train::AdKeep{adh16[st][i], adhr[st][i], adh16t[st][i]}; };
     // the base products: FP16, or a QLoRA's int8 base (W8A8, ai-toolkit's convrot8) with the input's int8 rows as
     // scratch, and FP16 ones where the GPU takes no int8 products
     const bool w8 = w[0]->w8[0] != nullptr;

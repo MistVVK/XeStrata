@@ -150,8 +150,8 @@ def main() -> int:
     ap.add_argument("--round-text", action="store_true",
                     help="round the text projection's inputs to bf16 in the reference too, as the engine's bf16 "
                          "products read them (its weights are bf16)")
-    ap.add_argument("--states", default="", help="a states cache (qi_train_prep.py's): real text rows, not noise")
-    ap.add_argument("--latent", default="", help="a latent cache (qi_train_prep.py's): x0 its posterior mean")
+    ap.add_argument("--states", default="", help="a states cache (mf_pre.py --cache qi's): real text rows, not noise")
+    ap.add_argument("--latent", default="", help="a latent cache (mf_pre.py --cache qi's): x0 its posterior mean")
     ap.add_argument("--int8", action="store_true",
                     help="a QLoRA: ai-toolkit's convrot8 on the blocks' products (its ConvRotInt8Quantizer), the "
                          "engine's --base int8")

@@ -4,7 +4,9 @@
 // shared modulation, the text projection, img_in, the final norm and proj_out) as ai-toolkit's
 // QwenImage21Transformer2DModel.forward takes them, around the shared training block (qi_block).
 #include "strata/image/qi_trainer.hpp"
+#include "strata/image/dit_file.hpp"
 #include "strata/image/gelu.hpp"
+#include "strata/image/lora_names.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/qi_stream.hpp"
 #include "strata/image/qi_train.hpp"
@@ -23,7 +25,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <random>
@@ -36,11 +38,11 @@ namespace strata::image {
 
 namespace {
 
-constexpr uint32_t kF32 = 0, kF16 = 1, kBF16 = 30;   // GGML's type numbers
+constexpr uint32_t kF16 = 1, kBF16 = 30;   // GGML's type numbers
 constexpr int64_t kHead = 128, kInCh = 64, kTimeDim = 256;
 constexpr int kAxes[3] = {16, 56, 56};               // the rotation's frame, height and width pairs: 8 + 28 + 28
-const char* const kProducts[kQiProducts] = {"attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0",
-                                            "img_mlp.gate_up", "img_mlp.out"};
+static_assert(std::size(lora::kQiBlock) == kQiProducts);
+const char* const* const kProducts = lora::kQiBlock;   // the DiT's target names, in kQiProducts' order
 
 // one product's LoRA: the FP32 factors and their moments; its train::Adapter holds the FP16 views and the gradients
 struct Lora {
@@ -54,7 +56,7 @@ struct Lora {
 struct QiTrainer::Impl {
     void* s = nullptr;
     std::vector<void*> owned;
-    std::unique_ptr<GgufFile> g;
+    std::unique_ptr<QiFile> g;
     prefill::Gemm gemm;
     int64_t C = 0, F = 0, H = 0, ctx = 0, rank = 0;
     struct Block {
@@ -170,37 +172,17 @@ struct QiTrainer::Impl {
         owned.erase(std::remove(owned.begin(), owned.end(), p), owned.end());
         gpu::free(p);
     }
-    const TensorInfo& tensor(const std::string& name) const {
-        const TensorInfo* t = g->find("model.diffusion_model." + name);
-        if (t == nullptr) throw std::runtime_error("image engine (Qwen-Image-2.1 training): the DiT has no " + name);
-        return *t;
-    }
     // a 16-bit weight [N][K] as the file holds it (`type`: F16 or bf16), on the GPU
     uint16_t* w16(const std::string& name, uint32_t type, int64_t& N, int64_t& K) {
-        const TensorInfo& t = tensor(name);
+        const TensorInfo& t = g->get(name);
         if (t.type != type)
             throw std::runtime_error("image engine (Qwen-Image-2.1 training): " + name + " is not " +
                                      (type == kF16 ? "F16" : "BF16") + " (a 16-bit DiT file is the training's base)");
         K = (int64_t) t.shape[0];
         N = t.shape.size() > 1 ? (int64_t) t.shape[1] : 1;
         uint16_t* d = get<uint16_t>(N * K);
-        gpu::copy(d, g->tensor_data(t), (size_t) (N * K) * 2);
+        gpu::copy(d, g->data(t), (size_t) (N * K) * 2);
         return d;
-    }
-    std::vector<float> host_vec(const std::string& name) const {
-        const TensorInfo& t = tensor(name);
-        const int64_t n = (int64_t) t.shape[0];
-        std::vector<float> v((size_t) n);
-        const uint8_t* p = g->tensor_data(t);
-        for (int64_t i = 0; i < n; ++i) {
-            if (t.type == kF32) std::memcpy(&v[(size_t) i], p + 4 * i, 4);
-            else {
-                uint16_t b;
-                std::memcpy(&b, p + 2 * i, 2);
-                v[(size_t) i] = t.type == kF16 ? kernels::f32_from_f16(b) : kernels::f32_from_bf16(b);
-            }
-        }
-        return v;
     }
     float* dev_vec(const std::vector<float>& v) {
         float* d = get<float>((int64_t) v.size());
@@ -406,7 +388,7 @@ bool QiTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* 
     try {
         m.s = stream;
         m.rank = rank;
-        m.g = std::make_unique<GgufFile>(dit);
+        m.g = std::make_unique<QiFile>(dit);
         if (!m.gemm.init(stream, 1 << 20, err)) return false;   // before the adapters: their views depend on it
         int64_t N = 0, K = 0;
         m.iin = m.w16("img_in.weight", kBF16, N, K);
@@ -415,7 +397,7 @@ bool QiTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* 
         m.tin = m.w16("txt_in.in_layer.weight", kBF16, N, K);
         m.ctx = K;
         m.tout = m.w16("txt_in.out_layer.weight", kBF16, N, K);
-        std::vector<float> tn = m.host_vec("txt_in.text_norm.weight");
+        std::vector<float> tn = m.g->f32("txt_in.text_norm.weight");
         for (float& v : tn) v += 1.0f;   // zero-centred: the scale is weight + 1
         m.tnorm = m.dev_vec(tn);
         m.t1 = m.w16("time_text_embed.timestep_embedder.linear_1.weight", kF16, N, K);
@@ -434,7 +416,7 @@ bool QiTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* 
         int64_t qcap = 0, scap = 0;
         for (int b = 0;; ++b) {
             const std::string p = "transformer_blocks." + std::to_string(b) + ".";
-            if (m.g->find("model.diffusion_model." + p + "attn.to_q.weight") == nullptr) break;
+            if (m.g->find(p + "attn.to_q.weight") == nullptr) break;
             if (max_blocks > 0 && b >= max_blocks) break;
             Impl::Block blk;
             std::vector<LayerStream::Span> spans;
@@ -442,7 +424,7 @@ bool QiTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* 
             uint64_t hbytes = 0;
             for (int i = 0; i < kQiProducts; ++i) {
                 train::Product& pr = blk.p[i];
-                const TensorInfo& t = m.tensor(p + kProducts[i] + ".weight");
+                const TensorInfo& t = m.g->get(p + kProducts[i] + ".weight");
                 if (t.type != kF16)
                     throw std::runtime_error("image engine (Qwen-Image-2.1 training): " + p + kProducts[i] +
                                              " is not F16 (a 16-bit DiT file is the training's base)");
@@ -468,7 +450,7 @@ bool QiTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* 
                         qs = m.get<float>(pr.N);
                         scap = pr.N;
                     }
-                    gpu::copy(q16, m.g->tensor_data(*ts[i]), (size_t) n * 2);
+                    gpu::copy(q16, m.g->data(*ts[i]), (size_t) n * 2);
                     float* sw = qs;
                     train::w8_quantize(q16, pr.N, pr.K, q8, sw, stream);
                     if (b == 0 && i < 3) {   // the first block's q, k and v for its unquantized input
@@ -483,7 +465,7 @@ bool QiTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* 
                 }
             } else {
                 for (int i = 0; i < kQiProducts; ++i)
-                    spans.push_back({m.g->tensor_data(*ts[i]), (uint64_t) (blk.p[i].N * blk.p[i].K) * 2, 0});
+                    spans.push_back({m.g->data(*ts[i]), (uint64_t) (blk.p[i].N * blk.p[i].K) * 2, 0});
             }
             const int layer = m.wstream.add(spans);
             for (int i = 0; i < kQiProducts; ++i) blk.off[i] = m.wstream.offset(layer, i);
@@ -512,8 +494,8 @@ bool QiTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, void* 
                 l.ad.dB = m.get<float>(l.N * rank);
                 m.sync_views(l);
             }
-            blk.nq = m.dev_vec(m.host_vec(p + "attn.norm_q.weight"));
-            blk.nk = m.dev_vec(m.host_vec(p + "attn.norm_k.weight"));
+            blk.nq = m.dev_vec(m.g->f32(p + "attn.norm_q.weight"));
+            blk.nk = m.dev_vec(m.g->f32(p + "attn.norm_k.weight"));
             m.blk.push_back(blk);
         }
         for (void* x : {(void*) q16, (void*) q8, (void*) qs}) m.release(x);

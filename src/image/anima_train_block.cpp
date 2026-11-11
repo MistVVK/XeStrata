@@ -25,13 +25,6 @@ namespace {
 
 constexpr float kEps = 1e-6f;   // the LayerNorms' and the head norms' eps, as anima_dit.cpp takes them
 
-MfOut rows_of(const float* p, int64_t C) {
-    MfOut m;
-    m.f = p;
-    m.C = C;
-    return m;
-}
-
 // GELU (erf form) of a product's sums, rows16's Op (anima_dit.cpp's GeluErf)
 struct GeluErf {
     MfOut x;
@@ -55,32 +48,17 @@ void anima_block(const AnimaBlockRun& run, prefill::Gemm& gemm, void* stream, tr
 
     // ---- the adapters' kept rows and shared scratch
     train::AdKeep keep[kAnProducts];
-    int64_t mx_T = 0, mx_N = 0, mx_rank = 0, mx_scratch = 0, mx_tmp = 0;
+    auto rows_of_product = [&](int i) { return i == kAnCk || i == kAnCv ? L : R; };
+    const train::Product* prods[kAnProducts];
+    for (int i = 0; i < kAnProducts; ++i) prods[i] = &run.p[i];
     for (int i = 0; i < kAnProducts; ++i) {
         const train::Adapter* az = run.ad[i];
         if (az == nullptr) continue;
-        const int64_t T = (i == kAnCk || i == kAnCv) ? L : R, N = run.p[i].N, K = run.p[i].K, rk = az->rank;
-        mx_T = std::max(mx_T, T);
-        mx_N = std::max(mx_N, N);
-        mx_rank = std::max(mx_rank, rk);
-        mx_scratch = std::max(mx_scratch, T * rk + T * N + N * rk + rk * K);
-        mx_tmp = std::max(mx_tmp, 2 * T * N + T * rk);
+        const int64_t T = rows_of_product(i), rk = az->rank;
         keep[i] = train::AdKeep{pool.ru(T * rk), pool.rf(T), pool.ru(T * rk)};
     }
-    train::AdScratch adsc;
-    if (mx_N > 0) {
-        adsc.hf = pool.rf(mx_T * mx_rank);
-        adsc.y1 = pool.rf(mx_T * mx_N);
-        bool plain = true;   // a plain LoRA's delta takes y1 alone; DoRA's and LoKr's maps take y2 beside it
-        for (const train::Adapter* az : run.ad)
-            plain = plain && (az == nullptr || az->method == train::AdapterMethod::lora);
-        adsc.y2 = plain ? nullptr : pool.rf(mx_T * mx_N);
-        adsc.fa = pool.rf(mx_N);
-        adsc.fb = pool.rf(mx_N);
-        adsc.scratch = pool.rf(mx_scratch);
-        adsc.tmp16 = pool.ru(mx_tmp);
-        adsc.rsT = pool.rf(mx_T);
-    }
+    train::AdScratch adsc =
+        train::take_ad_scratch(pool, train::ad_sizes(prods, run.ad, kAnProducts, rows_of_product), false);
     // product i of T rows: the base's sums, then its row scales, no bias, and its adapter's delta
     auto fwd = [&](int i, const uint16_t* x16, const float* rs, float* y, int64_t T) {
         const train::Product& P = run.p[i];

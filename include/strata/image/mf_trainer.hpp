@@ -11,6 +11,7 @@
 #pragma once
 
 #include "strata/image/mf_train.hpp"
+#include "strata/image/train_sample.hpp"
 
 #include <cstdint>
 #include <string>
@@ -89,21 +90,6 @@ void mf_trainer_close(MfTrainModel* m);
 /// here and after every optimizer step.  mod_targets also trains the modulation linears (img_mod.1, txt_mod.1), as
 /// ai-toolkit's Mage-Flow job does: a plain LoRA there whatever the method.
 void mf_trainer_init_adapters(MfTrainModel* m, int method, float alpha, uint64_t seed, bool mod_targets = false);
-
-/// One sample's disk form (tools/image/mf_pre_export.py): the latent [tokens][128] F32, the text [rows][txt_dim]
-/// F32 (the bf16 widened), the empty prompt's rows beside them (caption dropout reads those), and the bucket's
-/// own rows and columns (the RoPE tables read them).
-struct MfTrainSample {
-    std::vector<float> lat;      // [tokens][ch], the posterior's mean
-    std::vector<float> lat_sd;   // [tokens][ch], its standard deviation (empty: an export without it)
-    std::vector<float> te;       // [rows][txt_dim]
-    std::vector<float> uncond;   // [uncond_rows][txt_dim], the empty prompt
-    int64_t tokens = 0, rows = 0, uncond_rows = 0, h = 0, w = 0;
-    int64_t ch = 128;            // a token's latent values (Mage-Flow's and MOSS-Image's 128, Anima's 64)
-};
-
-/// Read one sample of an exported run dir by its manifest stem.
-MfTrainSample mf_trainer_sample(const std::string& dir, const std::string& stem, int64_t txt_dim);
 
 /// The step's constants from its sigma: the time embedding, the modulations of every block and stream, and the
 /// norm_out pair, on the device (the caller keeps them for the backward).  Computed through the products, the same

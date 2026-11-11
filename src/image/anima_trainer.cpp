@@ -5,6 +5,8 @@
 // time's two layers and its norm, the final layer's modulation and projection.
 #include "strata/image/anima_trainer.hpp"
 #include "strata/image/anima_dit.hpp"
+#include "strata/image/dit_file.hpp"
+#include "strata/image/lora_names.hpp"
 #include "strata/image/anima_train.hpp"
 #include "strata/platform/mapped_file.hpp"
 #include "strata/image/qi_kernels.hpp"
@@ -24,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <iterator>
 #include <random>
 #include <stdexcept>
 
@@ -34,11 +37,9 @@ namespace strata::image {
 namespace {
 
 constexpr float kEps = 1e-6f;
-const char* const kProduct[kAnProducts] = {"self_attn.q_proj",  "self_attn.k_proj",  "self_attn.v_proj",
-                                           "self_attn.output_proj", "cross_attn.q_proj", "cross_attn.k_proj",
-                                           "cross_attn.v_proj", "cross_attn.output_proj", "mlp.layer1",
-                                           "mlp.layer2"};
-const char* const kMod[3] = {"adaln_modulation_self_attn", "adaln_modulation_cross_attn", "adaln_modulation_mlp"};
+static_assert(std::size(lora::kAnimaBlock) == kAnProducts);
+const char* const* const kProduct = lora::kAnimaBlock;   // the DiT's target names, in kAnProducts' order
+const char* const* const kMod = lora::kAnimaMod;
 
 struct Lora {
     train::Adapter ad;
@@ -213,62 +214,26 @@ bool AnimaTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, voi
         m.s = stream;
         m.rank = rank;
         if (!m.gemm.init(stream, 1 << 20, err)) return false;
-        SafeTensors st(dit);
-        platform::MappedFile file(dit);
-        std::string pre;
-        for (const char* p : {"", "net.", "model.diffusion_model."})
-            if (st.find(std::string(p) + "blocks.0.self_attn.q_proj.weight") != nullptr) pre = p;
-        auto find = [&](const std::string& name) -> const SafeTensor& {
-            const SafeTensor* t = st.find(pre + name);
-            if (t == nullptr) throw std::runtime_error("image engine (Anima training): no " + name);
-            return *t;
-        };
+        AnimaFile f(dit);
         // a matrix's rows as FP16 (BF16, F16 or F32 in the file), its first `cols` columns (0: all), in RAM
         auto rows16 = [&](const std::string& name, int64_t& N, int64_t& Kc, std::vector<uint16_t>& h) {
-            const SafeTensor& t = find(name + ".weight");
-            if (t.shape.size() != 2) throw std::runtime_error("image engine (Anima training): " + name + " is not 2D");
-            N = t.shape[0];
-            const int64_t K = t.shape[1];
+            int64_t K = 0;
+            f.rows16(name, 0, h, N, K);
             Kc = K;
-            const uint8_t* src = file.data() + st.data_base() + t.begin;
-            h.resize((size_t) (N * Kc));
-            for (int64_t n = 0; n < N; ++n)
-                for (int64_t k = 0; k < Kc; ++k) {
-                    const size_t i = (size_t) (n * K + k);
-                    float v;
-                    if (t.dtype == "BF16") v = dit_rows::bf16_value(reinterpret_cast<const uint16_t*>(src)[i]);
-                    else if (t.dtype == "F16") v = kernels::f32_from_f16(reinterpret_cast<const uint16_t*>(src)[i]);
-                    else if (t.dtype == "F32") v = reinterpret_cast<const float*>(src)[i];
-                    else throw std::runtime_error("image engine (Anima training): " + name + " is " + t.dtype);
-                    h[(size_t) (n * Kc + k)] = kernels::f16_from_f32(v);
-                }
         };
-        // a matrix's rows as FP16 on the GPU (BF16, F16 or F32 in the file), its first `cols` columns (0: all)
+        // the same rows on the GPU
         auto dense = [&](const std::string& name, int64_t cols = 0) {
-            const SafeTensor& t = find(name + ".weight");
-            if (t.shape.size() != 2) throw std::runtime_error("image engine (Anima training): " + name + " is not 2D");
             Impl::Dense d;
-            d.N = t.shape[0];
-            const int64_t K = t.shape[1];
+            int64_t K = 0;
+            std::vector<uint16_t> h;
+            f.rows16(name, cols, h, d.N, K);
             d.K = cols > 0 ? cols : K;
-            const uint8_t* src = file.data() + st.data_base() + t.begin;
-            std::vector<uint16_t> h((size_t) (d.N * d.K));
-            for (int64_t n = 0; n < d.N; ++n)
-                for (int64_t k = 0; k < d.K; ++k) {
-                    const size_t i = (size_t) (n * K + k);
-                    float v;
-                    if (t.dtype == "BF16") v = dit_rows::bf16_value(reinterpret_cast<const uint16_t*>(src)[i]);
-                    else if (t.dtype == "F16") v = kernels::f32_from_f16(reinterpret_cast<const uint16_t*>(src)[i]);
-                    else if (t.dtype == "F32") v = reinterpret_cast<const float*>(src)[i];
-                    else throw std::runtime_error("image engine (Anima training): " + name + " is " + t.dtype);
-                    h[(size_t) (n * d.K + k)] = kernels::f16_from_f32(v);
-                }
             d.w = m.get<uint16_t>(d.N * d.K);
             gpu::stream_sync(m.s);
             if (!gpu::copy(d.w, h.data(), h.size() * 2)) throw std::runtime_error("copy");
             return d;
         };
-        m.lat = find("final_layer.linear.weight").shape[0] / 4;
+        m.lat = f.get("final_layer.linear.weight").shape[0] / 4;
         m.xemb = dense("x_embedder.proj.1", 4 * m.lat);   // the padding mask's columns left out (all zero)
         m.C = m.xemb.N;
         m.t1 = dense("t_embedder.1.linear_1");
@@ -276,8 +241,8 @@ bool AnimaTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, voi
         m.flin = dense("final_layer.linear");
         m.fm1 = dense("final_layer.adaln_modulation.1");
         m.fm2 = dense("final_layer.adaln_modulation.2");
-        m.tnorm = st.f32(pre + "t_embedding_norm.weight");
-        m.hd = find("blocks.0.self_attn.q_norm.weight").shape[0];
+        m.tnorm = f.f32("t_embedding_norm.weight");
+        m.hd = f.get("blocks.0.self_attn.q_norm.weight").shape[0];
         m.H = m.C / m.hd;
         m.M = m.fm1.N;
         if (m.t2.N != 3 * m.C || m.fm2.N != 2 * m.C) throw std::runtime_error("image engine (Anima training): shape");
@@ -321,7 +286,7 @@ bool AnimaTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, voi
         };
         for (int b = 0;; ++b) {
             const std::string p = "blocks." + std::to_string(b) + ".";
-            if (st.find(pre + p + "self_attn.q_proj.weight") == nullptr) break;
+            if (f.find(p + "self_attn.q_proj.weight") == nullptr) break;
             Impl::Block B;
             {   // the products' FP16 rows into RAM, the stream's source
                 std::vector<std::vector<uint16_t>> h(kAnProducts);
@@ -347,10 +312,10 @@ bool AnimaTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, voi
                 B.w1[k] = dense(p + kMod[k] + ".1");
                 B.w2[k] = dense(p + kMod[k] + ".2");
             }
-            B.sqn = m.dev_vec(st.f32(pre + p + "self_attn.q_norm.weight"));
-            B.skn = m.dev_vec(st.f32(pre + p + "self_attn.k_norm.weight"));
-            B.cqn = m.dev_vec(st.f32(pre + p + "cross_attn.q_norm.weight"));
-            B.ckn = m.dev_vec(st.f32(pre + p + "cross_attn.k_norm.weight"));
+            B.sqn = m.dev_vec(f.f32(p + "self_attn.q_norm.weight"));
+            B.skn = m.dev_vec(f.f32(p + "self_attn.k_norm.weight"));
+            B.cqn = m.dev_vec(f.f32(p + "cross_attn.q_norm.weight"));
+            B.ckn = m.dev_vec(f.f32(p + "cross_attn.k_norm.weight"));
             if (rank > 0) {
                 for (int i = 0; i < kAnProducts; ++i) lora(B.l[i], B.p[i].N, B.p[i].K);
                 for (int k = 0; k < 3; ++k) {

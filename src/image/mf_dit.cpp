@@ -4,6 +4,7 @@
 
 #include "strata/image/mf_dit.hpp"
 #include "strata/image/flow_sampler.hpp"
+#include "strata/image/lora_names.hpp"
 
 #include "dit_rows.hpp"
 
@@ -585,22 +586,24 @@ void MfDit::build_lora_targets() {
         lora_slots_.push_back({std::move(name), &w, 0, w.n, 0});
     };
     // the weights outside the blocks (the norms are norms, not linear products: unchanged)
-    add("img_in", img_in_);
-    add("txt_in", txt_in_);
-    add("time_text_embed.timestep_embedder.linear_1", t1_);
-    add("time_text_embed.timestep_embedder.linear_2", t2_);
-    add("norm_out.linear", nout_);
-    add("proj_out", pout_);
+    const char* const* out = lora::kMageOutside;
+    add(out[0], img_in_);
+    add(out[1], txt_in_);
+    add(out[2], t1_);
+    add(out[3], t2_);
+    add(out[4], nout_);
+    add(out[5], pout_);
     // the blocks: the two streams' modulations, the attention's projections and the MLPs
     for (int i = 0; i < (int) blocks_.size(); ++i) {
         const std::string p = "transformer_blocks." + std::to_string(i) + ".";
         Block& b = blocks_[(size_t) i];
         const std::pair<const char*, W*> items[] = {
-            {"img_mod.1", &b.imod}, {"txt_mod.1", &b.tmod}, {"attn.to_q", &b.q}, {"attn.to_k", &b.k},
-            {"attn.to_v", &b.v}, {"attn.add_q_proj", &b.tq}, {"attn.add_k_proj", &b.tk},
-            {"attn.add_v_proj", &b.tv}, {"attn.to_out.0", &b.o}, {"attn.to_add_out", &b.to},
-            {"img_mlp.net.0.proj", &b.imlp1}, {"img_mlp.net.2", &b.imlp2}, {"txt_mlp.net.0.proj", &b.tmlp1},
-            {"txt_mlp.net.2", &b.tmlp2}};
+            {lora::kMageMod[0], &b.imod}, {lora::kMageMod[1], &b.tmod},
+            {lora::kMageBlock[0][0], &b.q}, {lora::kMageBlock[0][1], &b.k}, {lora::kMageBlock[0][2], &b.v},
+            {lora::kMageBlock[1][0], &b.tq}, {lora::kMageBlock[1][1], &b.tk}, {lora::kMageBlock[1][2], &b.tv},
+            {lora::kMageBlock[0][3], &b.o}, {lora::kMageBlock[1][3], &b.to},
+            {lora::kMageBlock[0][4], &b.imlp1}, {lora::kMageBlock[0][5], &b.imlp2},
+            {lora::kMageBlock[1][4], &b.tmlp1}, {lora::kMageBlock[1][5], &b.tmlp2}};
         for (const auto& item : items) add(p + item.first, *item.second);
     }
 }

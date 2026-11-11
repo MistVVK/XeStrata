@@ -173,6 +173,14 @@ struct MfOut {
     }
 };
 
+/// FP32 rows [T][C] as the shared row kernels read a product's output (a block's tape or scratch)
+inline MfOut rows_of(const float* p, int64_t C) {
+    MfOut m;
+    m.f = p;
+    m.C = C;
+    return m;
+}
+
 class SafeTensors;
 
 class MfDit {

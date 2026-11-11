@@ -3,7 +3,9 @@
 // src/image/qi_dit.cpp - see include/strata/image/qi_dit.hpp.
 
 #include "strata/image/qi_dit.hpp"
+#include "strata/image/dit_file.hpp"
 #include "strata/image/flow_sampler.hpp"
+#include "strata/image/lora_names.hpp"
 #include "strata/image/qi_control.hpp"
 #include "strata/image/qi_gguf.hpp"
 
@@ -113,7 +115,7 @@ QiDit::~QiDit() {
 }
 
 QiDit::W QiDit::upload(const std::string& name) {
-    const TensorInfo* t = find_checked(*g_, "model.diffusion_model." + name);
+    const TensorInfo* t = find_checked(g_->gguf(), "model.diffusion_model." + name);
     if (t == nullptr) throw std::runtime_error("image engine: the DiT has no " + name);
     W w;
     w.k = (int64_t) t->shape[0];
@@ -128,7 +130,7 @@ QiDit::W QiDit::upload(const std::string& name) {
     }
     if ((int) t->type == kTypeF32 && w.n > 1) {   // a matrix in FP32 goes to the GPU as FP16 (the products take it)
         std::vector<uint16_t> h((size_t) (w.n * w.k));
-        const auto* f = reinterpret_cast<const float*>(g_->tensor_data(*t));
+        const auto* f = reinterpret_cast<const float*>(g_->data(*t));
         for (size_t i = 0; i < h.size(); ++i) h[i] = kernels::f16_from_f32(f[i]);
         uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size(), "image engine");
         put(d, h.data(), h.size() * 2);
@@ -143,13 +145,13 @@ QiDit::W QiDit::upload(const std::string& name) {
     weight_bytes_ += bytes;
     if (dry_) return w;
     uint8_t* d = alloc<uint8_t>(allocs_, (int64_t) bytes, "image engine");
-    put(d, g_->tensor_data(*t), bytes);
+    put(d, g_->data(*t), bytes);
     w.d = d;
     return w;
 }
 
 const float* QiDit::upload_f32(const std::string& name, float add) {
-    const TensorInfo* t = find_checked(*g_, "model.diffusion_model." + name);
+    const TensorInfo* t = find_checked(g_->gguf(), "model.diffusion_model." + name);
     if (t == nullptr) throw std::runtime_error("image engine: the DiT has no " + name);
     const auto n = (int64_t) t->elements();
     if (dry_) {
@@ -157,7 +159,7 @@ const float* QiDit::upload_f32(const std::string& name, float add) {
         return nullptr;
     }
     std::vector<float> h((size_t) n);
-    const uint8_t* src = g_->tensor_data(*t);
+    const uint8_t* src = g_->data(*t);
     if ((int) t->type == kTypeF32) std::memcpy(h.data(), src, (size_t) n * 4);
     else if ((int) t->type == kTypeBF16)
         for (int64_t i = 0; i < n; ++i) h[(size_t) i] = kernels::f32_from_bf16(reinterpret_cast<const uint16_t*>(src)[i]);
@@ -173,7 +175,7 @@ bool QiDit::open(const std::string& path, void* stream, std::string& err, bool d
     try {
         s_ = stream;
         dry_ = dry;
-        g_ = std::make_unique<GgufFile>(path);
+        g_ = std::make_unique<QiFile>(path);
         iin_ = upload("img_in.weight");
         in_ch_ = iin_.k;
         C_ = iin_.n;
@@ -189,19 +191,19 @@ bool QiDit::open(const std::string& path, void* stream, std::string& err, bool d
         norms32_.clear();
         for (int i = 0;; ++i) {   // the blocks: spans of the mapped file, on the GPU through blocks_stream_
             const std::string p = "transformer_blocks." + std::to_string(i) + ".";
-            if (find_checked(*g_, "model.diffusion_model." + p + "attn.to_q.weight") == nullptr) break;
+            if (find_checked(g_->gguf(), "model.diffusion_model." + p + "attn.to_q.weight") == nullptr) break;
             Block b;
             std::vector<LayerStream::Span> spans;
             auto span = [&](const std::string& name, W& w) {
                 const std::string full = std::string(p).append(name);
-                const TensorInfo* t = find_checked(*g_, std::string("model.diffusion_model.").append(full));
+                const TensorInfo* t = find_checked(g_->gguf(), std::string("model.diffusion_model.").append(full));
                 if (t == nullptr) throw std::runtime_error(std::string("image engine: the DiT has no ").append(full));
                 w.type = (int) t->type;
                 w.k = (int64_t) t->shape[0];
                 w.n = t->shape.size() > 1 ? (int64_t) t->shape[1] : 1;
                 const uint64_t bytes = tensor_payload_bytes(*t);
                 w.row_bytes = bytes / (uint64_t) w.n;
-                spans.push_back({g_->tensor_data(*t), bytes, 0});
+                spans.push_back({g_->data(*t), bytes, 0});
                 return spans.size() - 1;
             };
             W nq, nk;
@@ -882,26 +884,28 @@ void QiDit::build_lora_targets() {
         lora_slots_.push_back({std::move(name), &w, row0, rows});
     };
     // the weights outside the blocks (the text projection's norm is a norm, not a linear product: unchanged)
-    add("img_in", iin_, 0, iin_.n);
-    add("time_text_embed.timestep_embedder.linear_1", t1_, 0, t1_.n);
-    add("time_text_embed.timestep_embedder.linear_2", t2_, 0, t2_.n);
-    add("modulation.1", mod_, 0, mod_.n);
-    add("norm_out.linear", nout_, 0, nout_.n);
-    add("proj_out", pout_, 0, pout_.n);
-    add("txt_in.in_layer", tin_, 0, tin_.n);
-    add("txt_in.out_layer", tout_, 0, tout_.n);
+    const char* const* out = lora::kQiOutside;
+    add(out[0], iin_, 0, iin_.n);
+    add(out[1], t1_, 0, t1_.n);
+    add(out[2], t2_, 0, t2_.n);
+    add(out[3], mod_, 0, mod_.n);
+    add(out[4], nout_, 0, nout_.n);
+    add(out[5], pout_, 0, pout_.n);
+    add(out[6], tin_, 0, tin_.n);
+    add(out[7], tout_, 0, tout_.n);
+    const char* const* n = lora::kQiBlock;
     for (int bi = 0; bi < (int) blocks_.size(); ++bi) {
         const std::string p = "transformer_blocks." + std::to_string(bi) + ".";
         Block& b = blocks_[(size_t) bi];
-        add(p + "attn.to_q", b.q, 0, b.q.n);
-        add(p + "attn.to_k", b.k, 0, b.k.n);
-        add(p + "attn.to_v", b.v, 0, b.v.n);
-        add(p + "attn.to_out.0", b.o, 0, b.o.n);
+        add(p + n[0], b.q, 0, b.q.n);
+        add(p + n[1], b.k, 0, b.k.n);
+        add(p + n[2], b.v, 0, b.v.n);
+        add(p + n[3], b.o, 0, b.o.n);
         // the MLP's first weight is one [gate | up] on the GPU: a file may hold it fused, or as diffusers' two halves
-        add(p + "img_mlp.gate_up", b.gu, 0, b.gu.n);
-        add(p + "img_mlp.gate_layer", b.gu, 0, inter_);
-        add(p + "img_mlp.proj", b.gu, inter_, b.gu.n - inter_);
-        add(p + "img_mlp.out", b.down, 0, b.down.n);
+        add(p + n[4], b.gu, 0, b.gu.n);
+        add(p + lora::kQiGateHalf[0], b.gu, 0, inter_);
+        add(p + lora::kQiGateHalf[1], b.gu, inter_, b.gu.n - inter_);
+        add(p + n[5], b.down, 0, b.down.n);
     }
 }
 
@@ -1174,13 +1178,13 @@ bool QiDit::tensor_norms(const std::string& key, const std::vector<float>*& out,
         out = &it->second;
         return true;
     }
-    const TensorInfo* t = g_->find(key);
+    const TensorInfo* t = g_->gguf().find(key);
     if (t == nullptr || t->shape.size() != 2) {
         err = "image engine: the DiT has no " + key;
         return false;
     }
     const int64_t k = (int64_t) t->shape[0], rows = (int64_t) t->shape[1];
-    const uint8_t* p = g_->tensor_data(*t);
+    const uint8_t* p = g_->data(*t);
     std::vector<float> norms((size_t) rows);
     if (t->type == kTypeF32) {
         const auto* f = reinterpret_cast<const float*>(p);

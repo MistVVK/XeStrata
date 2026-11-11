@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/image/mf_trainer.cpp - see include/strata/image/mf_trainer.hpp.
 #include "strata/image/mf_trainer.hpp"
+#include "strata/image/lora_names.hpp"
 #include "strata/image/train_loop.hpp"
 
 #include "strata/core/gpu.hpp"
@@ -114,10 +115,7 @@ void load_vec(Model* m, SafeTensors& st, const std::string& name, float*& out, i
 }
 
 /// the v1 target names per stream and product (SPEC D1 writes them as they are, no mapping table)
-const char* const kTarget[2][6] = {{"attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0",
-                                    "img_mlp.net.0.proj", "img_mlp.net.2"},
-                                   {"attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj", "attn.to_add_out",
-                                    "txt_mlp.net.0.proj", "txt_mlp.net.2"}};
+constexpr auto& kTarget = lora::kMageBlock;
 
 }  // namespace
 
@@ -402,64 +400,6 @@ MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* s
 void mf_trainer_close(MfTrainModel* base) {
     std::unique_ptr<Model> m(static_cast<Model*>(base));
     for (auto& b : m->blk) delete b.adap;
-}
-
-MfTrainSample mf_trainer_sample(const std::string& dir, const std::string& stem, int64_t txt_dim) {
-    MfTrainSample s;
-    auto read = [&](const std::string& name) -> std::vector<float> {
-        std::ifstream f(dir + "/" + name + ".bin", std::ios::binary);
-        if (!f) throw std::runtime_error("image engine (Mage-Flow training): no " + name);
-        std::stringstream js;
-        std::ifstream j(dir + "/" + name + ".json");
-        js << j.rdbuf();
-        const std::string t = js.str();
-        const size_t b = t.find("\"shape\"");
-        std::vector<int64_t> sh;
-        if (b != std::string::npos) {
-            const size_t o = t.find('[', b), c = t.find(']', o);
-            std::stringstream ns(t.substr(o + 1, c - o - 1));
-            std::string tok;
-            while (std::getline(ns, tok, ',')) sh.push_back(std::stoll(tok));
-        }
-        std::vector<float> v((size_t) (std::filesystem::file_size(dir + "/" + name + ".bin") / 4));
-        if (!f.read(reinterpret_cast<char*>(v.data()), (std::streamsize) (v.size() * 4)))
-            throw std::runtime_error("image engine (Mage-Flow training): short " + name);
-        if (t.find("\"f16\"") != std::string::npos) {
-            std::vector<float> w(v.size());
-            const auto* h = reinterpret_cast<const uint16_t*>(v.data());
-            for (size_t i = 0; i < v.size(); ++i) w[i] = f32_from_f16(h[i]);
-            return w;
-        }
-        return v;
-    };
-    s.lat = read(stem + "_lat");
-    if (std::filesystem::exists(dir + "/" + stem + "_lat_sd.bin")) s.lat_sd = read(stem + "_lat_sd");
-    s.te = read(stem + "_te");
-    s.uncond = read(stem + "_uncond");
-    // the bucket's own rows and columns come from the manifest
-    std::ifstream mf(dir + "/manifest.tsv");
-    std::string line;
-    while (std::getline(mf, line)) {
-        std::stringstream ls(line);
-        std::string tok;
-        std::getline(ls, tok, '\t');
-        if (tok != stem) continue;
-        std::getline(ls, tok, '\t');
-        s.w = std::stoll(tok);
-        std::getline(ls, tok, '\t');
-        s.h = std::stoll(tok);
-    }
-    if (s.w <= 0 || s.h <= 0)
-        throw std::runtime_error("image engine (Mage-Flow training): " + stem + " is not in the manifest");
-    // the dump lists its shape fastest dim first: [ch][tokens] and [txt_dim][rows]
-    s.tokens = s.w * s.h;
-    s.ch = (int64_t) s.lat.size() / s.tokens;
-    s.rows = (int64_t) (s.te.size() / (size_t) txt_dim);
-    s.uncond_rows = (int64_t) (s.uncond.size() / (size_t) txt_dim);
-    if ((int64_t) s.lat.size() != s.tokens * s.ch || (int64_t) s.te.size() != s.rows * txt_dim ||
-        (int64_t) s.uncond.size() != s.uncond_rows * txt_dim)
-        throw std::runtime_error("image engine (Mage-Flow training): " + stem + " is not this model's shape");
-    return s;
 }
 
 namespace {

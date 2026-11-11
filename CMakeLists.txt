@@ -841,7 +841,8 @@ if(STRATA_ENABLE_XE)
   # DiT against tools/image/qi21_ref.py's NumPy reference, and strata-image-dit-probe, the whole DiT and its sampler
   # against stable-diffusion.cpp's values, timed
   add_library(strata_image STATIC src/image/qi_kernels.cpp src/image/qi_attn.cpp src/image/qi_attn_train.cpp
-                           src/image/qi_dit.cpp src/image/image_lora.cpp src/image/w8_choice.cpp
+                           src/image/qi_dit.cpp src/image/dit_file.cpp src/image/image_lora.cpp
+                           src/image/w8_choice.cpp
                            src/image/qi_vae.cpp src/image/qi_pipeline.cpp
                            src/image/img_start.cpp src/image/img_crop.cpp src/image/img_color.cpp
                            src/image/tile_sides.cpp src/image/img_out.cpp
@@ -1290,17 +1291,18 @@ if(STRATA_ENABLE_XE)
   add_executable(strata-image-mf-train-probe src/image/mf_train_probe.cpp)
   target_link_libraries(strata-image-mf-train-probe PRIVATE strata_image)
   # the smallest training loop (card 5): the model, one step, and the safetensors file it writes
-  add_executable(strata-image-mf-train src/image/mf_trainer.cpp src/image/mf_train_main.cpp)
+  add_executable(strata-image-mf-train src/image/mf_trainer.cpp src/image/train_sample.cpp
+                 src/image/mf_train_main.cpp)
   target_link_libraries(strata-image-mf-train PRIVATE strata_image)
   # a LoRA on Qwen-Image-2.1 as ai-toolkit trains one: its caches, its loop and one step for the reference to check
-  add_executable(strata-image-qi-train src/image/qi_train_main.cpp)
+  add_executable(strata-image-qi-train src/image/qi_train_main.cpp src/image/train_sample.cpp)
   target_link_libraries(strata-image-qi-train PRIVATE strata_image)
-  # a LoRA on MOSS-Image as ai-toolkit trains one, from tools/image/mf_pre.py's caches (--cache ms; the samples
-  # read as the Mage-Flow trainer's, mf_trainer_sample)
-  add_executable(strata-image-moss-train src/image/moss_train_main.cpp src/image/mf_trainer.cpp)
+  # a LoRA on MOSS-Image as ai-toolkit trains one, from tools/image/mf_pre.py's caches (--cache ms; the samples read
+  # by train_sample.cpp's mf_trainer_sample, as the Mage-Flow trainer's are)
+  add_executable(strata-image-moss-train src/image/moss_train_main.cpp src/image/train_sample.cpp)
   target_link_libraries(strata-image-moss-train PRIVATE strata_image)
   # a LoRA on Anima as ai-toolkit trains one, from tools/image/mf_pre.py's caches (--cache an)
-  add_executable(strata-image-anima-train src/image/anima_train_main.cpp src/image/mf_trainer.cpp)
+  add_executable(strata-image-anima-train src/image/anima_train_main.cpp src/image/train_sample.cpp)
   target_link_libraries(strata-image-anima-train PRIVATE strata_image)
   # the learning preprocessing's own tool (docs/LORA_TRAIN.md "The latent and text-embedding disk caches"):
   # Mage-VAE's encoder and the text states on the inference's path, one image at a time, for tools/image/mf_pre.py

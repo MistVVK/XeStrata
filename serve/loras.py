@@ -93,8 +93,8 @@ FAMILY_NAMES = {"qwen-image": "Qwen-Image-2.1", "moss-image": "MOSS-Image", "mag
 _QWEN_BLOCKS = ("attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0", "img_mlp.gate_up", "img_mlp.gate_layer",
                 "img_mlp.proj", "img_mlp.out")
 _MOSS_TEXT_BLOCKS = ("qkv", "proj", "ffn_up_gate", "ffn_up", "ffn_gate", "ffn_down")
-_MOSS_BLOCKS = ("proj.q", "proj.k", "proj.v", "proj.o", "proj.ffn_up_gate", "proj.ffn_up", "proj.ffn_gate",
-                "proj.ffn_down")
+_MOSS_BLOCKS = ("proj.q", "proj.k", "proj.v", "proj.qkv", "proj.o", "proj.ffn_up_gate", "proj.ffn_up",
+                "proj.ffn_gate", "proj.ffn_down")
 _MOSS_OUTSIDE = ("video_embedder", "time_embedding.0", "time_embedding.2", "shared_block_modulation",
                  "video_head_modulation", "final_linear_video", "text_embedder.proj")
 _MAGE_BLOCKS = ("attn.to_q", "attn.to_k", "attn.to_v", "attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj",

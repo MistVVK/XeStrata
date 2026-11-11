@@ -49,6 +49,13 @@
 
 namespace strata::image {
 
+class AnimaFile;
+
+namespace anima_dit_detail {
+/// An F8 E4M3 byte's value (a scaled fp8 save's weight; no inf, 0x7f / 0xff NaN)
+float e4m3(uint8_t b);
+}  // namespace anima_dit_detail
+
 /// The path is a safetensors file of Anima's DiT (its LLM adapter beside Cosmos-Predict2's blocks), with or without
 /// a prefix.
 bool anima_is_dit(const std::string& path);
@@ -175,7 +182,6 @@ private:
         std::vector<int64_t> kv_lp;  // the padded rows each block's was allocated for
         std::vector<char> kv_ok;     // each block's made from these rows (a new prompt keeps the buffers, not this)
     };
-    struct File;
     W dense(const std::string& name, bool biased, const float** bias, std::vector<void*>& owned, uint64_t& bytes,
             int64_t cols = 0);
     const float* vec(const std::string& name, std::vector<void*>& owned, uint64_t& bytes);
@@ -213,7 +219,7 @@ private:
     void free_glora_scratch();
     void drop_kv();
 
-    std::unique_ptr<File> file_;
+    std::unique_ptr<AnimaFile> file_;
     std::vector<std::vector<uint8_t>> host_;
     void* s_ = nullptr;
     prefill::Gemm gemm_;

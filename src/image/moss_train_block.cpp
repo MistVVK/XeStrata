@@ -27,13 +27,6 @@ constexpr float kEps = 1e-6f;   // the RMSNorms' eps, as moss_dit.cpp takes it
 // scratch (2F = 16384 values a row) is this many rows, not the image's (Qwen-Image-2.1's block takes the same 1024)
 constexpr int64_t kMlpRows = 1024;
 
-MfOut rows_of(const float* p, int64_t C) {
-    MfOut m;
-    m.f = p;
-    m.C = C;
-    return m;
-}
-
 // [R][3C] (q, k, v side by side) <-> three [R][C]
 void split3(const float* qkv, int64_t R, int64_t C, float* q, float* k, float* v, void* s) {
     dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) (R * C)), [=](sycl::id<1> id) {
@@ -101,18 +94,6 @@ template <class Take> Tape take_tape(Take& t, const MossBlockRun& run, bool xt) 
     return p;
 }
 
-// the bytes take_tape asks for (an arena's 256-byte steps)
-struct Sizer {
-    size_t bytes = 0;
-    void* add(int64_t n, int64_t w) {
-        bytes += ((size_t) (n * w) + 255) / 256 * 256;
-        return nullptr;
-    }
-    float* rf(int64_t n) { return static_cast<float*>(add(n, 4)); }
-    uint16_t* u(int64_t n) { return static_cast<uint16_t*>(add(n, 2)); }
-    uint16_t* ru(int64_t n) { return u(n); }
-};
-
 train::StageTimes& times() {
     static train::StageTimes t("moss_block");
     return t;
@@ -123,7 +104,7 @@ train::StageTimes& times() {
 void moss_block_profile_report() { times().report(); }
 
 size_t moss_block_tape_bytes(const MossBlockRun& run, prefill::Gemm& gemm) {
-    Sizer z;
+    train::Sizer z;
     take_tape(z, run, needs_xt(run, gemm));
     return z.bytes;
 }
@@ -161,31 +142,10 @@ void moss_block(const MossBlockRun& run, prefill::Gemm& gemm, void* stream, trai
     auto rows_of_product = [&](int i) { return i == kMossUpGate || i == kMossDown ? Bm : R; };
 
     // ---- the adapters' shared scratch, sized for the largest product's rows
-    int64_t mx_TN = 0, mx_Trk = 0, mx_scratch = 0, mx_tmp = 0, mx_N = 0;
-    for (int i = 0; i < kMossProducts; ++i) {
-        const train::Adapter* az = run.ad[i];
-        if (az == nullptr) continue;
-        const int64_t T = rows_of_product(i), N = run.p[i].N, K = run.p[i].K, rk = az->rank;
-        mx_N = std::max(mx_N, N);
-        mx_TN = std::max(mx_TN, T * N);
-        mx_Trk = std::max(mx_Trk, T * rk);
-        mx_scratch = std::max(mx_scratch, T * rk + T * N + N * rk + rk * K);
-        mx_tmp = std::max(mx_tmp, 2 * T * N + T * rk);
-    }
-    train::AdScratch adsc;
-    if (mx_N > 0) {
-        adsc.hf = pool.rf(mx_Trk);
-        adsc.y1 = pool.rf(mx_TN);
-        bool plain = true;   // a plain LoRA's delta takes y1 alone; DoRA's and LoKr's maps take y2 beside it
-        for (const train::Adapter* az : run.ad)
-            plain = plain && (az == nullptr || az->method == train::AdapterMethod::lora);
-        adsc.y2 = plain ? nullptr : pool.rf(mx_TN);
-        adsc.fa = pool.rf(mx_N);
-        adsc.fb = pool.rf(mx_N);
-        adsc.scratch = pool.rf(mx_scratch);
-        adsc.tmp16 = pool.ru(mx_tmp);
-        adsc.rsT = pool.rf(R);
-    }
+    const train::Product* prods[kMossProducts];
+    for (int i = 0; i < kMossProducts; ++i) prods[i] = &run.p[i];
+    train::AdScratch adsc =
+        train::take_ad_scratch(pool, train::ad_sizes(prods, run.ad, kMossProducts, rows_of_product), false);
     // a QLoRA's int8 base: the input's int8 rows, and FP16 ones where the GPU takes no int8 products
     const bool w8 = run.p[0].w8 != nullptr;
     int8_t* x8 = nullptr;

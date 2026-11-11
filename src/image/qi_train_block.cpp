@@ -12,8 +12,6 @@
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
-#include <chrono>
-#include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <optional>
@@ -27,14 +25,6 @@ namespace {
 
 constexpr float kEps = 1e-6f;   // the q and k norms' eps, as the inference takes it
 
-// FP32 rows [T][C] as the shared row kernels read a product's output
-MfOut rows_of(const float* p, int64_t C) {
-    MfOut m;
-    m.f = p;
-    m.C = C;
-    return m;
-}
-
 // The two row ranges a modulation tells apart: the text's rows [0, nt) take row 1 of a [2][C] modulation (t = 0), the
 // image's [nt, R) row 0 (the step's t).  f(r0, n, row) runs one range.
 template<class F> void by_range(int64_t nt, int64_t R, F f) {
@@ -42,21 +32,17 @@ template<class F> void by_range(int64_t nt, int64_t R, F f) {
     if (R > nt) f(nt, R - nt, 0);
 }
 
-// XESTRATA_TRAIN_PROFILE=1: the stages' times, summed over the calls and printed by qi_block_profile_report (each stage
-// waits for the GPU, so the sums are the stages' own and the whole runs slower)
-struct Prof {
-    bool on = strata::env_get("TRAIN_PROFILE") != nullptr;
-    double t[20] = {};
-    int64_t calls = 0;
-};
-Prof& prof() {
-    static Prof p;
-    return p;
-}
+// XESTRATA_TRAIN_PROFILE=1: the stages' times (train::StageTimes), summed over the calls and printed by
+// qi_block_profile_report (each stage waits for the GPU, so the sums are the stages' own and the whole runs slower)
 const char* const kStage[20] = {"fwd gate", "ln2 bwd", "o bwd", "attention bwd", "qk bwd", "qkv bwd", "norm bwd",
                                  "fwd ln1", "fwd v scale + qk rope", "fwd attention", "fwd ln2", "fwd swiglu", "down bwd",
                                  "swiglu bwd", "gate_up bwd", "mlp gate bwd", "fwd base products", "fwd lora", "",
                                  ""};
+
+train::StageTimes& times() {
+    static train::StageTimes t("qi_block");
+    return t;
+}
 
 // What a block's backward reads of its forward, taken in this order from a pool (or a Sizer)
 struct Tape {
@@ -98,57 +84,24 @@ template<class Take> Tape take_tape(Take& t, const QiBlockRun& run) {
     return p;
 }
 
-// the bytes take_tape asks for (an arena's 256-byte steps)
-struct Sizer {
-    size_t bytes = 0;
-    void* add(int64_t n, int64_t w) {
-        bytes += ((size_t) (n * w) + 255) / 256 * 256;
-        return nullptr;
-    }
-    float* f(int64_t n) { return static_cast<float*>(add(n, 4)); }
-    float* rf(int64_t n) { return f(n); }
-    uint16_t* u(int64_t n) { return static_cast<uint16_t*>(add(n, 2)); }
-    uint16_t* ru(int64_t n) { return u(n); }
-};
-
 }  // namespace
 
 size_t qi_block_tape_bytes(const QiBlockRun& run) {
-    Sizer z;
+    train::Sizer z;
     take_tape(z, run);
     return z.bytes;
 }
 
-void qi_block_profile_report() {
-    Prof& p = prof();
-    if (!p.on || p.calls == 0) return;
-    std::fprintf(stderr, "qi_block over %lld calls:", (long long) p.calls);
-    for (int i = 0; i < 20; ++i)
-        if (kStage[i][0] != 0) std::fprintf(stderr, " %s %.2f s", kStage[i], p.t[i]);
-    std::fprintf(stderr, "\n");
-    for (double& v : p.t) v = 0;
-    p.calls = 0;
-}
+void qi_block_profile_report() { times().report(); }
 
 void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* s, train::Arena* arena) {
     const int64_t C = run.C, F = run.F, H = run.heads, hd = run.hd, R = run.rows, nt = run.n_text;
     if (C != H * hd) throw std::invalid_argument("qi_block: heads * head_dim must be the width");
     const train::Product* P = run.p;
     auto mod = [&](int k, int row) { return run.mod + ((int64_t) k * 2 + row) * C; };
-    Prof& pf = prof();
-    auto clock = std::chrono::steady_clock::now();
-    auto mark = [&](int stage) {
-        if (!pf.on) return;
-        gpu::stream_sync(s);
-        const auto now = std::chrono::steady_clock::now();
-        pf.t[stage] += std::chrono::duration<double>(now - clock).count();
-        clock = now;
-    };
-    if (pf.on) {
-        gpu::stream_sync(s);
-        clock = std::chrono::steady_clock::now();
-        ++pf.calls;
-    }
+    train::StageTimes& tm = times();
+    tm.begin(s);
+    auto mark = [&](int stage) { tm.mark(kStage[stage], s); };
     train::Pool pool(s, arena);
     float* zero = pool.f(C);   // LnMod's shift: Qwen-Image-2.1's norms scale only
 
@@ -181,31 +134,13 @@ void qi_block(const QiBlockRun& run, prefill::Gemm& gemm, void* s, train::Arena*
     auto rows_of_product = [&](int i) { return i >= kQiGateUp ? RC : R; };
 
     // ---- the adapters' transients
-    int64_t maxN = 0, maxRank = 0, maxScratch = 0, maxTmp = 0, maxRowsN = 0, maxRowsRk = 0;
+    const train::Product* prods[kQiProducts];
+    for (int i = 0; i < kQiProducts; ++i) prods[i] = &P[i];
+    train::AdScratch sc =
+        train::take_ad_scratch(pool, train::ad_sizes(prods, run.ad, kQiProducts, rows_of_product), true);
     bool lokr = false;
-    for (int i = 0; i < kQiProducts; ++i) {
-        const train::Adapter* a = run.ad[i];
-        if (a == nullptr) continue;
-        const int64_t N = P[i].N, K = P[i].K, rk = a->rank, n = rows_of_product(i);
-        maxN = std::max(maxN, N);
-        maxRank = std::max(maxRank, rk);
-        maxRowsN = std::max(maxRowsN, n * N);
-        maxRowsRk = std::max(maxRowsRk, n * rk);
-        maxScratch = std::max(maxScratch, n * rk + n * N + N * rk + rk * K);
-        maxTmp = std::max(maxTmp, 2 * n * N + n * rk);
-        lokr = lokr || a->method == train::AdapterMethod::lokr;
-    }
-    train::AdScratch sc;
-    if (maxN > 0) {
-        sc.hf = pool.rf(maxRowsRk);
-        sc.y1 = pool.rf(maxRowsN);
-        sc.y2 = pool.rf(maxRowsN);
-        sc.fa = pool.rf(maxN);
-        sc.fb = pool.rf(maxN);
-        sc.scratch = pool.rf(maxScratch);
-        sc.tmp16 = pool.ru(maxTmp);
-        sc.rsT = pool.rf(R);
-    }
+    for (const train::Adapter* a : run.ad)
+        lokr = lokr || (a != nullptr && a->method == train::AdapterMethod::lokr);
     // a QLoRA's base (W8A8, ai-toolkit's convrot8): the input's int8 rows, and the FP16 ones where the GPU takes no
     // int8 products
     const bool w8 = P[0].w8 != nullptr;

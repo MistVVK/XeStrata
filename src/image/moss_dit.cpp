@@ -3,7 +3,9 @@
 // src/image/moss_dit.cpp - see include/strata/image/moss_dit.hpp.
 
 #include "strata/image/moss_dit.hpp"
+#include "strata/image/dit_file.hpp"
 #include "strata/image/flow_sampler.hpp"
+#include "strata/image/lora_names.hpp"
 
 #include "dit_rows.hpp"
 
@@ -197,55 +199,6 @@ void ref_values(const uint16_t* v16, const float* from, const float* to, int64_t
 
 using namespace moss_dit_detail;
 
-// the transformer's shards (a folder's *.safetensors, or one file), each mapped
-struct MossDit::Shards {
-    struct Shard {
-        std::unique_ptr<SafeTensors> st;
-        std::unique_ptr<platform::MappedFile> map;
-    };
-    std::vector<Shard> s;
-    explicit Shards(const std::string& path) {
-        std::vector<std::string> files;
-        if (std::filesystem::is_directory(path)) {
-            for (const auto& e : std::filesystem::directory_iterator(path))
-                if (e.path().extension() == ".safetensors") files.push_back(e.path().string());
-            std::sort(files.begin(), files.end());
-        } else {
-            files.push_back(path);
-        }
-        if (files.empty()) throw std::runtime_error("image engine (MOSS-Image DiT): no .safetensors in " + path);
-        for (const auto& f : files) s.push_back({std::make_unique<SafeTensors>(f), std::make_unique<platform::MappedFile>(f)});
-    }
-    // the tensor and its shard, or null
-    const SafeTensor* find(const std::string& name, const Shard** at = nullptr) const {
-        for (const Shard& x : s)
-            if (const SafeTensor* t = x.st->find(name); t != nullptr) {
-                if (at != nullptr) *at = &x;
-                return t;
-            }
-        return nullptr;
-    }
-    // a bf16 tensor: its bytes in the mapping
-    const SafeTensor& bf16(const std::string& name, const uint8_t** data) const {
-        const Shard* at = nullptr;
-        const SafeTensor* t = find(name, &at);
-        if (t == nullptr) throw std::runtime_error("image engine (MOSS-Image DiT): no " + name);
-        if (t->dtype != "BF16") throw std::runtime_error("image engine (MOSS-Image DiT): " + name + " is not bf16");
-        if (data != nullptr) *data = at->map->data() + at->st->data_base() + t->begin;
-        return *t;
-    }
-    std::vector<float> f32(const std::string& name) const {
-        const Shard* at = nullptr;
-        if (find(name, &at) == nullptr) throw std::runtime_error("image engine (MOSS-Image DiT): no " + name);
-        return at->st->f32(name);
-    }
-    void drop_cache(const std::string& name) const {
-        const Shard* at = nullptr;
-        if (const SafeTensor* t = find(name, &at); t != nullptr)
-            at->map->drop_cache(at->st->data_base() + t->begin, t->end - t->begin);
-    }
-};
-
 MossDit::MossDit() = default;
 
 MossDit::~MossDit() {
@@ -263,8 +216,8 @@ bool MossDit::open(const std::string& path, void* stream, std::string& err, bool
         q8_ = q8;
         norm_cache_.clear();
         w8_ = q8 && strata::env_get("NO_W8A8") == nullptr && prefill::Gemm::i8_usable(stream);
-        files_ = std::make_unique<Shards>(path);
-        const Shards& f = *files_;
+        files_ = std::make_unique<MossFile>(path);
+        const MossFile& f = *files_;
         if (std::filesystem::is_directory(path)) {   // config.json's rope_base, where it differs from 10000
             std::ifstream cf(std::filesystem::path(path) / "config.json");
             const std::string cfg((std::istreambuf_iterator<char>(cf)), std::istreambuf_iterator<char>());
@@ -378,7 +331,7 @@ bool MossDit::open(const std::string& path, void* stream, std::string& err, bool
 // their bytes added to `bytes`)
 MossDit::W MossDit::dense(const std::vector<std::string>& names, bool biased, const float** bias,
                           std::vector<void*>& owned, uint64_t& bytes) {
-    const Shards& f = *files_;
+    const MossFile& f = *files_;
     W w;
     w.type = kTypeF16;
     std::vector<const uint8_t*> src;
@@ -738,44 +691,48 @@ void MossDit::build_lora_targets() {
         lora_slots_.push_back({std::move(name), &w, row0, rows, src_row, biased});
     };
     // the weights outside the blocks (the norms are norms, not linear products: unchanged)
-    add("video_embedder", vin_, 0, vin_.n, 0, true);
-    add("time_embedding.0", t1_, 0, t1_.n, 0, true);
-    add("time_embedding.2", t2_, 0, t2_.n, 0, true);
-    add("shared_block_modulation", smod_, 0, smod_.n, 0, true);
-    add("video_head_modulation", hmod_, 0, hmod_.n, 0, true);
-    add("final_linear_video", fout_, 0, fout_.n, 0, false);
+    const char* const* out = lora::kMossOutside;
+    add(out[0], vin_, 0, vin_.n, 0, true);
+    add(out[1], t1_, 0, t1_.n, 0, true);
+    add(out[2], t2_, 0, t2_.n, 0, true);
+    add(out[3], smod_, 0, smod_.n, 0, true);
+    add(out[4], hmod_, 0, hmod_.n, 0, true);
+    add(out[5], fout_, 0, fout_.n, 0, false);
     // the text embedder: its projection and its blocks.  Its q, k and v rows are three weights on the GPU (b.q, b.k,
     // b.v) out of one qkv on the file's side (q the entry's rows [0, C), k [C, 2C), v [2C, 3C)); ffn_up and ffn_gate
     // are the two halves of the one [up | gate] the products take.  These products add biases; the blocks' below do not.
-    add("text_embedder.proj", tproj_, 0, tproj_.n, 0, true);
+    add(out[6], tproj_, 0, tproj_.n, 0, true);
+    const char* const* tb = lora::kMossTextBlock;
     for (int i = 0; i < (int) tblocks_.size(); ++i) {
         const std::string p = "text_embedder.blocks." + std::to_string(i) + ".";
         TextBlock& b = tblocks_[(size_t) i];
-        add(p + "qkv", b.q, 0, b.q.n, 0, true);
-        add(p + "qkv", b.k, 0, b.k.n, b.q.n, true);
-        add(p + "qkv", b.v, 0, b.v.n, b.q.n + b.k.n, true);
-        add(p + "proj", b.o, 0, b.o.n, 0, true);
-        add(p + "ffn_up_gate", b.up_gate, 0, b.up_gate.n, 0, true);
-        add(p + "ffn_up", b.up_gate, 0, b.up_gate.n / 2, 0, true);
-        add(p + "ffn_gate", b.up_gate, b.up_gate.n / 2, b.up_gate.n / 2, 0, true);
-        add(p + "ffn_down", b.down, 0, b.down.n, 0, true);
+        add(p + tb[0], b.q, 0, b.q.n, 0, true);
+        add(p + tb[0], b.k, 0, b.k.n, b.q.n, true);
+        add(p + tb[0], b.v, 0, b.v.n, b.q.n + b.k.n, true);
+        add(p + tb[1], b.o, 0, b.o.n, 0, true);
+        add(p + tb[2], b.up_gate, 0, b.up_gate.n, 0, true);
+        add(p + lora::kMossTextUpGate[1], b.up_gate, 0, b.up_gate.n / 2, 0, true);
+        add(p + lora::kMossTextUpGate[2], b.up_gate, b.up_gate.n / 2, b.up_gate.n / 2, 0, true);
+        add(p + tb[3], b.down, 0, b.down.n, 0, true);
     }
     // the 42 blocks: proj.q, proj.k, proj.v (or one proj.qkv, its rows q's, k's and v's, as a trainer that fuses them
     // writes it), proj.o, the [up | gate] of proj.ffn_up_gate, proj.ffn_down
+    const char* const* qkv = lora::kMossQkv;
+    const char* const* ug = lora::kMossUpGate;
     for (int bi = 0; bi < (int) blocks_.size(); ++bi) {
-        const std::string p = "layers." + std::to_string(bi) + ".proj.";
+        const std::string p = "layers." + std::to_string(bi) + ".";
         Block& b = blocks_[(size_t) bi];
-        add(p + "q", b.q, 0, b.q.n, 0, false);
-        add(p + "k", b.k, 0, b.k.n, 0, false);
-        add(p + "v", b.v, 0, b.v.n, 0, false);
-        add(p + "qkv", b.q, 0, b.q.n, 0, false);
-        add(p + "qkv", b.k, 0, b.k.n, b.q.n, false);
-        add(p + "qkv", b.v, 0, b.v.n, b.q.n + b.k.n, false);
-        add(p + "o", b.o, 0, b.o.n, 0, false);
-        add(p + "ffn_up_gate", b.up_gate, 0, b.up_gate.n, 0, false);
-        add(p + "ffn_up", b.up_gate, 0, b.up_gate.n / 2, 0, false);
-        add(p + "ffn_gate", b.up_gate, b.up_gate.n / 2, b.up_gate.n / 2, 0, false);
-        add(p + "ffn_down", b.down, 0, b.down.n, 0, false);
+        add(p + qkv[0], b.q, 0, b.q.n, 0, false);
+        add(p + qkv[1], b.k, 0, b.k.n, 0, false);
+        add(p + qkv[2], b.v, 0, b.v.n, 0, false);
+        add(p + qkv[3], b.q, 0, b.q.n, 0, false);
+        add(p + qkv[3], b.k, 0, b.k.n, b.q.n, false);
+        add(p + qkv[3], b.v, 0, b.v.n, b.q.n + b.k.n, false);
+        add(p + lora::kMossBlock[1], b.o, 0, b.o.n, 0, false);
+        add(p + ug[0], b.up_gate, 0, b.up_gate.n, 0, false);
+        add(p + ug[1], b.up_gate, 0, b.up_gate.n / 2, 0, false);
+        add(p + ug[2], b.up_gate, b.up_gate.n / 2, b.up_gate.n / 2, 0, false);
+        add(p + lora::kMossBlock[3], b.down, 0, b.down.n, 0, false);
     }
 }
 

@@ -602,6 +602,21 @@ void row_lora_bwd(const float* A, const float* B, const float* x, const float* d
 
 StageTimes::StageTimes(const char* name) : name_(name), on_(strata::env_get("TRAIN_PROFILE") != nullptr) {}
 
+AdScratch take_ad_scratch(Pool& pool, const AdSizes& s, bool y2) {
+    AdScratch sc;
+    if (s.n == 0) return sc;
+    sc.hf = pool.rf(s.rows * s.rank);
+    sc.y1 = pool.rf(s.rows * s.n);
+    sc.y2 = y2 || !s.plain ? pool.rf(s.rows * s.n) : nullptr;
+    sc.fa = pool.rf(s.n);
+    sc.fb = pool.rf(s.n);
+    sc.scratch = pool.rf(s.scratch);
+    sc.tmp16 = pool.ru(s.tmp);
+    sc.rsT = pool.rf(s.rows);
+    return sc;
+}
+
+
 namespace {
 double now_s() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();

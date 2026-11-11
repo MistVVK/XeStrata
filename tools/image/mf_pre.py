@@ -8,6 +8,8 @@ reader on the inference's own states path); this file owns the dataset walk, the
     PY=... python tools/image/mf_pre.py --dir DIR --vae VAE.safetensors --text TEXT.gguf \
         [--pre build/free/xestrata-image-mf-pre] [--toml set.toml] [--budget 512,768,1024] [--step 16] [--scratch DIR]
     PY=... python tools/image/mf_pre.py --check --dir DIR     # the caches beside the images: shape, keys, types
+    PY=... python tools/image/mf_pre.py --cache qi --dir DATA --out DIR --vae VAE --text TE.gguf [--trigger WORD]
+        # Qwen-Image-2.1's set, cut as ai-toolkit does it: DIR holds the caches and items.txt its trainer reads
     PY=... python tools/image/mf_pre.py --golden GOLDEN_DIR --vae ... --text ...   # both paths against a golden run
 
 `--dir` walks every image the engine's own reader can open (the v1 data mixes .jpg and .png, so nothing is fixed to
@@ -50,6 +52,7 @@ import numpy as np
 
 try:
     from PIL import Image
+    from PIL.ImageOps import exif_transpose
 except ImportError:            # CTest's mf_pre_cache skips where the image library is not the interpreter's own
     sys.stderr.write("mf_pre: no PIL in this interpreter (CTest skips on exit 77)\n")
     sys.exit(77)
@@ -59,7 +62,8 @@ for _p in (ROOT, ROOT / "tools", ROOT / "tools" / "image"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-from serve.images import anima_tokens, load_tokenizer, prompt_ids   # the prompt's form, as serve sends it  # noqa: E402
+from serve.images import DROP as GENERATION_DROP  # noqa: E402  (the generation prompt's system turn)
+from serve.images import PROMPT_HEAD, PROMPT_TAIL, anima_tokens, load_tokenizer, prompt_ids  # noqa: E402
 
 IMG_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".gif")      # what third_party/main/stb reads, so what the engine reads
 LATENT_TAG = "_mf.npz"
@@ -120,6 +124,101 @@ def area_resize(px: np.ndarray, n_h: int, n_w: int) -> np.ndarray:
     y, x = _area_w(h, n_h), _area_w(w, n_w)
     out = np.einsum("ih,hwc,jw->ijc", y, px.astype(np.float32), x, optimize=True)
     return np.clip(np.rint(out), 0.0, 255.0).astype(np.uint8)
+
+
+QI_EXTS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")   # what PIL opens of ai-toolkit's datasets
+QI_DIVISIBILITY = 32   # ai-toolkit's Qwen-Image-2.1 get_bucket_divisibility
+
+
+def qi_bucket(width: int, height: int, resolution: int) -> tuple[int, int]:
+    """ai-toolkit's get_bucket_for_image_size: the resolution's pixels at most, sides of 32, no enlargement."""
+    total = width * height
+    max_pixels = resolution * resolution
+    target = min(total, max_pixels)
+    scaler = (target / total) ** 0.5
+    w_raw, h_raw = width * scaler / QI_DIVISIBILITY, height * scaler / QI_DIVISIBILITY
+    candidates = [(math.floor(w_raw) * QI_DIVISIBILITY, math.floor(h_raw) * QI_DIVISIBILITY),
+                  (math.floor(w_raw) * QI_DIVISIBILITY, math.ceil(h_raw) * QI_DIVISIBILITY),
+                  (math.ceil(w_raw) * QI_DIVISIBILITY, math.floor(h_raw) * QI_DIVISIBILITY),
+                  (math.ceil(w_raw) * QI_DIVISIBILITY, math.ceil(h_raw) * QI_DIVISIBILITY)]
+    capped = [(w, h) for w, h in candidates if w > 0 and h > 0 and w * h <= max_pixels]
+    if not capped:
+        capped = [(max(QI_DIVISIBILITY, math.floor(w_raw) * QI_DIVISIBILITY),
+                   max(QI_DIVISIBILITY, math.floor(h_raw) * QI_DIVISIBILITY))]
+    return min(capped, key=lambda wh: abs(wh[0] * wh[1] - target))
+
+
+def qi_cut(img: Image.Image, resolution: int) -> Image.Image:
+    """ai-toolkit's setup_buckets and load_and_process_image: scaled to cover the bucket (PIL's bicubic), the centre cut
+    out."""
+    bw, bh = qi_bucket(img.width, img.height, resolution)
+    f = max(bw / img.width, bh / img.height)
+    sw, sh = int(math.ceil(img.width * f)), int(math.ceil(img.height * f))
+    x, y = int((sw - bw) / 2), int((sh - bh) / 2)
+    return img.resize((sw, sh), Image.BICUBIC).crop((x, y, x + bw, y + bh))
+
+
+def qi_caption(raw: str, trigger: str) -> str:
+    """ai-toolkit's inject_trigger_into_prompt: [name] and [trigger] are the word, and it leads a caption without it."""
+    out = raw.replace("[name]", trigger).replace("[trigger]", trigger)
+    if trigger.strip() and out.count(trigger) == 0:
+        out = trigger + " " + out
+    return out
+
+
+def qi_prep(a) -> int:
+    """Qwen-Image-2.1's training set, cut and cached as ai-toolkit's DataLoader does it: every image once a resolution
+    (the pixel sides of --budget), EXIF-turned, RGB, its caption read from the .txt beside it with the trigger word in
+    it.  The cut images and the captions' ids go to xestrata-image-mf-pre qi-prep (the VAE's posterior mean and
+    standard deviation, the text encoder's states before its final norm), and the caches it writes are the items
+    file's lines, as qi_trainer reads them (train_sample.hpp)."""
+    import strata_tokenizer   # tools/strata_tokenizer.py: Qwen3-VL's tokenizer from the GGUF
+
+    out = Path(a.out)
+    (out / "img").mkdir(parents=True, exist_ok=True)
+    (out / "txt").mkdir(parents=True, exist_ok=True)
+    tok = strata_tokenizer.Tokenizer.from_gguf(a.text)
+    files = sorted(p for p in Path(a.dir).iterdir() if p.suffix.lower() in QI_EXTS)
+    if a.limit:
+        files = files[:a.limit]
+    if not files:
+        raise SystemExit(f"mf_pre: no images in {a.dir}")
+    lines, items = [], []
+
+    def text(name: str, caption: str) -> Path:
+        # ai-toolkit's prompt encoder: an empty prompt reads as " ", the chat template parsed for special tokens
+        # (a <|im_end|> written in a caption is that token, as its processor reads it)
+        ids = np.array(tok.encode(PROMPT_HEAD + (caption if caption else " ") + PROMPT_TAIL, parse_special=True),
+                       np.int32)
+        ids_path, states = out / "txt" / f"{name}.ids", out / "txt" / f"{name}.states"
+        ids.tofile(ids_path)
+        lines.append(f"txt {ids_path} {GENERATION_DROP} {states}")
+        return states
+
+    empty = text("_dropout", qi_caption("", a.trigger))   # get_dropout_caption: "WORD " with a trigger word
+    for f in files:
+        cap = f.with_suffix(".txt")
+        raw = cap.read_text(encoding="utf-8") if cap.is_file() else ""   # ai-toolkit reads no caption as ""
+        states = text(f.stem, qi_caption(raw, a.trigger))
+        with Image.open(f) as im:
+            img = exif_transpose(im).convert("RGB")
+        for res in a.budgets:
+            c = qi_cut(img, res)
+            rgb = out / "img" / f"{f.stem}-{res}.rgb"
+            np.asarray(c, np.uint8).tofile(rgb)
+            lat = out / "img" / f"{f.stem}-{res}.lat"
+            lines.append(f"img {rgb} {c.width} {c.height} {lat}")
+            items.append(f"{lat} {states}")
+        print(f"ok   {f.name} {len(a.budgets)} resolution(s)")
+    (out / "list.txt").write_text("\n".join(lines) + "\n")
+    r = subprocess.run([a.pre, "qi-prep", a.vae, a.text, str(out / "list.txt")])
+    if r.returncode != 0:
+        raise SystemExit(r.returncode)
+    (out / "items.txt").write_text(f"empty {empty}\n" + "\n".join(items) + "\n")
+    for p in (out / "img").glob("*.rgb"):
+        p.unlink()
+    print(f"mf_pre: {len(items)} items in {out / 'items.txt'}")
+    return 0
 
 
 def dump(d: Path, name: str, a: np.ndarray) -> None:
@@ -499,12 +598,11 @@ def main() -> int:
                          "encoder's mean) and 3.2e-2 (the text states) on these two runs")
     ap.add_argument("--stub-pre", metavar="OP_DIR", help="act as the engine's tool without a GPU: OP DIR (test only)")
     ap.add_argument("--selftest", action="store_true", help="the host-side rules and the cache path, no GPU")
-    ap.add_argument("--cache", default="mf", choices=("mf", "mt", "ms", "an"),
+    ap.add_argument("--cache", default="mf", choices=("mf", "mt", "ms", "an", "qi"),
                     help="the cache files' model tag: mf for Mage-Flow (Mage-VAE), mt for MageTrail (the Flux2 VAE), "
                          "ms for MOSS-Image (its VAE, Qwen3.5-9B and its DiT's text embedder: --dit), an for Anima "
                          "(Wan 2.1's VAE, Qwen3-0.6B and its DiT's LLM adapter: --dit, --t5)")
-    ap.add_argument("--dit",
-                    help="MOSS-Image's DiT folder or Anima's DiT file (--cache ms, an): the text rows' last part")
+    ap.add_argument("--dit", help="MOSS-Image's DiT folder or Anima's DiT file (--cache ms, an): the text rows' last part")
     ap.add_argument("--out", help="Qwen-Image-2.1's caches and items.txt (--cache qi)")
     ap.add_argument("--trigger", default="", help="the trigger word --cache qi puts in a caption ([name], [trigger])")
     ap.add_argument("--t5", help="Anima's T5 tokenizer.json (--cache an): the LLM adapter's ids")
@@ -535,6 +633,10 @@ def main() -> int:
     a.budget = max(a.budgets)
     if a.check:
         return check_dir(Path(a.dir), a.budgets, a.step)
+    if a.cache == "qi":
+        if not (a.dir and a.out and a.vae and a.text):
+            raise SystemExit("--cache qi needs --dir, --out, --vae and --text")
+        return qi_prep(a)
     if not (a.vae and a.text):
         raise SystemExit("--vae and --text are needed")
     work = Path(a.scratch or tempfile.mkdtemp(prefix="mf-pre-")) / "w"

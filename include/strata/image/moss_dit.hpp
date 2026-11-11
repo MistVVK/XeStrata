@@ -44,6 +44,9 @@
 
 namespace strata::image {
 
+class MossFile;
+
+
 /// The RoPE's tables [rows][hd / 2] as the reference makes them (cos and sin, bf16-rounded): row r's four
 /// coordinates from coord(r), each axis hd / 8 frequencies 1 / base^(k / (hd / 8)); the trainer's as the DiT's.
 void moss_rope_rows(int64_t rows, int64_t hd, double base, const std::function<void(int64_t, float*)>& coord,
@@ -264,8 +267,7 @@ private:
                    const float* nk, const uint8_t* base, const float* mod, uint16_t* x, const std::vector<int64_t>& seg,
                    const std::vector<const float*>& cos, const std::vector<const float*>& sin);
 
-    struct Shards;
-    std::unique_ptr<Shards> files_;
+    std::unique_ptr<MossFile> files_;
     std::vector<std::vector<uint8_t>> host_;   // the blocks' quantized weights and FP32 vectors, when not in place
     void* s_ = nullptr;
     prefill::Gemm gemm_;
