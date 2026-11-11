@@ -24503,7 +24503,7 @@
    "last_date": "",
    "status": "research",
    "owner": "prefill",
-   "note": "[DRAFT] CUDA and HIP gfx12 (phase 4, opt-in, default off): the Gyro trellis experts (TQK6 / TQK7, TQ2_T / TQ2_T), Hadamard-folded layers included, on the fused native kernels instead of MMQ, on any sm_80+ card and on gfx1200 / gfx1201.",
+   "note": "[DRAFT] CUDA and HIP gfx12 (phase 4): the Gyro trellis experts (TQK6 / TQK7, TQ2_T / TQ2_T), Hadamard-folded layers included, on the fused native kernels instead of MMQ. CUDA, unset: Gyro-S (TQK6 / TQK7) on compute capability 8.6 cards with 80+ SMs (RTX A6000 class; include/strata/prefill/fused_tq_default.hpp, tests/prefill/fused_tq_default_test.cpp), a diagnostic switch for bug reports, not a user setting; =1: Gyro-S and Gyro-M (TQ2_T / TQ2_T, no gate series) on any sm_80+ card and, on HIP, on gfx1200 / gfx1201 (HIP stays opt-in, default off); =0: MMQ again. STRATA_PF_FUSED_SM86=0 turns the sm_86 default off too. Goes with MMQ in release C.",
    "retire_after": "",
    "retired_in": ""
   },
