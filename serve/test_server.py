@@ -2553,11 +2553,16 @@ class DraftCosts(unittest.TestCase):
 
     def test_default_follows_the_module_switch(self):
         args = ["--native", "x", "--spec", "6"]
-        got = server.draft_costs_args({"model_name": "m"}, list(args))
+        new = self.tmp / "new-engine"
+        new.write_bytes(b"\x7fELF strata --spec --serve --draft-costs --draft-costs-key")
+        got = server.draft_costs_args({"model_name": "m"}, list(args), str(new))
         if server.DRAFT_COSTS_DEFAULT:
             self.assertIn("--draft-costs", got)
         else:
             self.assertEqual(got, args)
+        # by default an engine that cannot be read (or none named) is left as it is; only a config asking by name passes it blind
+        self.assertEqual(server.draft_costs_args({"model_name": "m"}, list(args)), args)
+        self.assertEqual(server.draft_costs_args({"model_name": "m"}, list(args), str(self.tmp / "missing")), args)
 
     def test_on_gives_a_file_in_the_redirected_folder(self):
         args = ["--native", "x", "--spec", "6"]

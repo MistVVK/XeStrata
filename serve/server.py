@@ -4153,10 +4153,13 @@ def draft_costs_args(cfg: dict, args: list[str], exe: str | None = None) -> list
     "draft_costs": true / false in the config overrides DRAFT_COSTS_DEFAULT.  The file name follows the model and every engine argument, so
     another model or setting gets its own table; the engine itself checks the card, the driver and its own version inside the file and
     learns again when they changed.  An engine that does not know the flag is not given it."""
+    explicit = "draft_costs" in cfg
     want = cfg.get("draft_costs", DRAFT_COSTS_DEFAULT)
     if want is not True or "--draft-costs" in args:
         return args
-    if exe and engine_has_text(exe, b"--draft-costs") is False:
+    knows = engine_has_text(exe, b"--draft-costs") if exe else None
+    # by default only an engine that is seen to have the option gets it; a config that asks for it by name gets it unless the engine is seen without it
+    if knows is False or (not explicit and knows is not True):
         return args
     name = re.sub(r"[^A-Za-z0-9._-]+", "-", str(cfg.get("model_name") or "model"))[:64]
     digest = hashlib.sha256("\0".join(map(str, args)).encode("utf-8", "replace")).hexdigest()[:12]
