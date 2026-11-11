@@ -39,6 +39,11 @@ struct CpuOps {
     // One key tile of the online softmax for qrows query rows: S[qrows][nkeys] (row stride lds, already scaled) becomes P = exp(S - m_new) in place, the running
     // max m[r] and sum l[r] are updated and the context rows O[r][0..hd) (row stride ldo) are rescaled by exp(m_old - m_new) (O's P*V is added afterwards).
     void (*softmax_update)(float* S, size_t lds, int qrows, int nkeys, float* m, float* l, float* O, size_t ldo, int hd);
+    // The two loops of the tower whose floating-point result depends on the compiler's multiply-add contraction, so they are compiled with each tier's flags
+    // (vit_cpu.cpp itself is compiled for the baseline CPU, RESULTS-OWN-3V.md PART H): the rotary of one token row (q at row[0 .. heads*hd), k at
+    // row[kstride ..); pair j of a head turns by (c1, s1)[j] for j < hd/4, else by (c2, s2)[j - hd/4]), and the position table's bilinear add of one row.
+    void (*rope_row)(float* row, size_t kstride, int heads, int hd, const float* c1, const float* s1, const float* c2, const float* s2);
+    void (*pos_add)(float* xr, const float* a, const float* b, const float* c, const float* d, float dx, float dy, int D);
 };
 
 const CpuOps& cpu_ops_scalar();
