@@ -1,6 +1,7 @@
 // The Tesla P100 prompt-expert default (gp100_prompt_default.hpp): the FP16 path only with STRATA_PREFILL_MMQ unset, every visible card
 // cc 6.0, and nothing in force that needs MMQ (STRATA_MMQ_WS=1, STRATA_EXPERT_NIBBLE=1, --peer-device).  Header-only, no GPU.
 #include <cstdio>
+#include <initializer_list>
 
 #include "strata/prefill/gp100_prompt_default.hpp"
 
