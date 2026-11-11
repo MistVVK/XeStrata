@@ -365,7 +365,8 @@ int64_t g_ring_small_max = 0;
 // 8192 to 6144, but more experts stay resident).  A native pack likewise when the native kernels (moe_fused_iq.hpp)
 // take any of its layers: IQ2_XS, 4K / 32K, their first version at 384 slots -3% / -6% against MMQ, at 512 +8% / 0%.
 inline bool fused_ring() {
-    if (strata::prefill::pf_fused_override().load(std::memory_order_relaxed) == 0) return false;   // the small-card prompt path decided on MMQ's layout
+    if (const int ov = strata::prefill::pf_fused_override().load(std::memory_order_relaxed); ov == 0 || ov == strata::prefill::kPfFusedKernelsOnly)
+        return false;   // the small-card prompt path decided on MMQ's layout
     if (core::peer_portable()) return false;   // multi-GPU: --peer-device keeps the MMQ path and its buffer sizes
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
     // the Q2_0 pack: fused::enabled().  A native pack: native_supported() alone - it implies enabled() wherever the Q2_0
@@ -1298,6 +1299,7 @@ struct Prefill::Impl {
         void* dev = nullptr;                 // the one device allocation the pointers below are carved from
         float *mixed = nullptr, *acc = nullptr, *inj = nullptr, *R = nullptr, *w = nullptr;
         uint16_t* mixed_h = nullptr;         // the FFN half's FP16 rows (the FP16 path's inputs, port 2026-10-24)
+        uint8_t* xa = nullptr;               // the FFN half's int8 rows per token (fused::quantize_act_native), when a layer's groups run fused
         int32_t *ids = nullptr, *tab = nullptr;
         size_t tab_n = 0;
         float* R_host = nullptr;
@@ -6607,6 +6609,25 @@ constexpr int64_t kLmDefaultOnTokens = 32768;
 // u_rows (rows) | u_w (rows), E = the most entries a layer can split into
 int64_t lm_entries_max(int64_t rows, int64_t G) { return NE + rows / std::max<int64_t>(G, 1) + 2; }
 int64_t lm_table_ints(int64_t rows, int64_t G) { return 5 * rows + 3 * lm_entries_max(rows, G); }
+// The walk's groups of layer l on the fused int8 kernels (P4-SMALL): one launch pair per gathered group (fused::group_bounds from the group's
+// bounds, experts_native on the experts where they are, the rows' tokens from row_tok) in place of MMQ's quantize, gate/up, SwiGLU,
+// quantize and down.  A native layer MMQ takes in the walk, whose formats the kernels cover on this device (native_supported: the card
+// rule and the formats), not a Hadamard-folded or NVFP4 one (lm_prepare declines those anyway).  The walk's MMQ buffers hold what it
+// needs: the tables in GU, the int8 H in H, the down rows in Dm; the per-token int8 rows are the super-chunk's own (LmBufs::xa).  CUDA
+// (the HIP walk is opt-in and not measured with it); not with STRATA_PF_GROUP_SCRATCH's one-group GU / H.
+bool lm_fused_layer(int64_t l, bool group_scratch) {
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+    (void) l; (void) group_scratch;
+    return false;
+#else
+    const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+    const MmqPlan& mp = mmq_plan();
+    if (group_scratch || !lay.native || l < 0 || l >= (int64_t) mp.layer.size() || l >= (int64_t) lay.fmt.size() || !mp.layer[(size_t) l]) return false;
+    const auto& f = lay.fmt[(size_t) l];
+    if (f.had_gu || f.had_d || f.tail_off) return false;
+    return fused::native_supported(f.gu_type, f.d_type);
+#endif
+}
 }  // namespace
 
 void Prefill::lm_release() {
@@ -6619,6 +6640,7 @@ void Prefill::lm_release() {
     m.lm.dev = nullptr;
     m.lm.mixed = m.lm.acc = m.lm.inj = m.lm.R = m.lm.w = m.lm.R2 = nullptr;
     m.lm.mixed_h = nullptr;
+    m.lm.xa = nullptr;
     m.lm.ids = m.lm.tab = nullptr;
     m.lm.S = 0;
 }
@@ -6703,10 +6725,12 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
         S = std::min(S, cap);
     }
     const int64_t G = m.T * K;
+    bool fz = false;   // a layer's groups run on the fused kernels: the super-chunk's int8 rows (LmBufs::xa)
+    for (int64_t l = 0; l < g.n_layers && !fz; ++l) fz = lm_fused_layer(l, m.group_cap > 0);
     const auto dev_bytes = [&](int64_t s, bool r_dev) {
         const uint64_t per = (uint64_t) (2 * N + HC + 2 * K) * 4 + (uint64_t) N * 2 + (r_dev ? (uint64_t) D * 4 : 0);
         return (uint64_t) s * per + (uint64_t) lm_table_ints(s * K, G) * 4 + 4096 +
-               (r_dev ? 0 : (uint64_t) m.T * D * 4 + 256);
+               (r_dev ? 0 : (uint64_t) m.T * D * 4 + 256) + (fz ? (uint64_t) fused::act_bytes(s, N) + 256 : 0);
     };
     size_t free_b = 0, total_b = 0;
     cudaMemGetInfo(&free_b, &total_b);
@@ -6771,6 +6795,7 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
     lb.tab = (int32_t*) carve_b(tab * 4);
     lb.tab_n = tab;
     lb.R2 = r_dev ? nullptr : (float*) carve_b((size_t) m.T * D * 4);
+    lb.xa = fz ? carve_b(fused::act_bytes(s_use, N)) : nullptr;
     for (int b = 0; b < 2; ++b)
         for (cudaEvent_t* e : {&lb.ev_in[b], &lb.ev_done[b], &lb.ev_out[b]})
             if (*e == nullptr && cudaEventCreateWithFlags(e, cudaEventDisableTiming) != cudaSuccess) {
@@ -7050,7 +7075,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
         Stager* st;
         ~StagerStop() { if (st) st->finish(); }   // an early return in a layer's attention halves
     } stager_stop{m.stager.get()};
-    int64_t lm_streamed = 0, lm_resident = 0, lm_groups = 0, lm_supers = 0, lm_groups_f16 = 0;
+    int64_t lm_streamed = 0, lm_resident = 0, lm_groups = 0, lm_supers = 0, lm_groups_f16 = 0, lm_groups_fz = 0;
     uint64_t lm_bytes = 0;
     const int64_t G = m.T * K;   // the MoE buffers' rows (Xq, GU, H, Hq, Dm): a group's most
 
@@ -7211,13 +7236,18 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
             if (j == 0 || ents[j - 1].e != ents[j].e) last_ent.push_back(j);
             else last_ent.back() = j;
         }
+        // P4-SMALL: a fused layer's group reads its staged experts where they landed (no gather), so their slots stay held until the group's
+        // launch: STAGE_GRP slots, staged no further ahead than the open group allows (as the staged walk's resident groups, STAGE_GRP's note)
+        const bool fz_l = lb.xa != nullptr && lm_fused_layer(l, m.group_cap > 0);
+        const int stage_n = fz_l ? STAGE_GRP : STAGE;
+        const size_t ahead = fz_l ? (size_t) (STAGE_GRP - MMQ_GROUP - 1) : (size_t) STAGE - 1;
         int stage_next = 0;
         auto stage_one = [&](size_t u) -> bool {
             const int32_t e = uniq[u];
             if (resident(e)) return true;
             if (m.src == nullptr) { err = "prefill (layer-major): an expert is neither resident nor in a source"; return false; }
             const int sl = stage_next;
-            stage_next = (stage_next + 1) % STAGE;
+            stage_next = (stage_next + 1) % stage_n;
             const auto tq = Clock::now();
             const bool pinned = m.src->pinned(l, e);
             const uint8_t* b = pinned ? m.src->blob_stable(l, e) : nullptr;
@@ -7252,11 +7282,21 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
         const uint8_t* blob_dev = nullptr;
         size_t gi = 0;
         int dq = -1;   // FP16 path: the dequant slot of the current expert
+        // fused: the open group's expert pointers and the staged slots its launch gives back; the super-chunk's rows to int8 once per layer
+        const uint8_t* fz_blob[MMQ_GROUP] = {};
+        int fz_rel[MMQ_GROUP] = {};
+        int fz_nrel = 0;
+        fused::NativeGeom fz_geom{};
+        if (fz_l) {
+            const auto& f = lay.fmt[(size_t) l];
+            fz_geom = fused::NativeGeom{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
+            fused::quantize_act_native(lb.mixed, Sn, N, lb.xa, cs);
+        }
         for (size_t j = 0; j < ents.size(); ++j) {
             const int32_t e = ents[j].e;
             if (j == 0 || ents[j - 1].e != e) {   // the next expert: staged ahead, waited for, its blob located
                 if (j > 0) ++u;
-                while (staged < uniq.size() && staged <= u + (size_t) STAGE - 1) {
+                while (staged < uniq.size() && staged <= u + ahead) {
                     if (!stage_one(staged)) return false;
                     ++staged;
                 }
@@ -7304,6 +7344,32 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
                                 d_u_w + gp.r0, gp.nu, lb.acc, cs);
                 ++lm_groups;
                 ++lm_groups_f16;
+                ++gi;
+                core::progress_beat();
+                continue;
+            }
+            if (fz_l) {   // P4-SMALL: the group's experts where they are; its two products and SwiGLU in one launch pair at its last entry
+                fz_blob[q] = blob_dev;
+                if (j == last_ent[u] && stage_of[u] >= 0) fz_rel[fz_nrel++] = stage_of[u];
+                if (j + 1 < gp.j1) continue;
+                const int ngx = (int) (gp.j1 - gp.j0);
+                pt.mark(kPfGemmGU, cs);
+                fused::group_bounds(d_bounds + gp.b_at, ngx, m.GU, cs);
+                fused::Batch fb;
+                fb.e0 = 0;
+                fb.e1 = ngx;
+                for (int i = 0; i < ngx; ++i) fb.blob[i] = fz_blob[i];
+                fused::want_dm_f16(false);
+                fused::experts_native(fb, fz_geom, ngx, gp.nr, m.GU, lb.xa, d_row_tok + gp.r0, m.H, m.Dm, cs);
+                for (int i = 0; i < fz_nrel; ++i) {   // the group's staged blobs are read: their slots are free
+                    cudaEventRecord(m.used[fz_rel[i]], cs);
+                    m.used_of[fz_rel[i]] = fz_rel[i];
+                }
+                fz_nrel = 0;
+                pt.mark(kPfCombine, cs);
+                moe_scatter_add(m.Dm, d_u_tok + gp.u_at, d_u_off + gp.uo_at, d_u_rows + gp.r0, d_u_w + gp.r0, gp.nu, lb.acc, cs);
+                ++lm_groups;
+                ++lm_groups_fz;
                 ++gi;
                 core::progress_beat();
                 continue;
@@ -7888,13 +7954,13 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
     }
     stats_.ms_total += ms_since(t_start);
     std::fprintf(stderr, "strata prefill: layer-major (layers %lld..%lld): %lld tokens in %lld super-chunk(s) of up to %lld (R in %s, %lld MiB VRAM free before), "
-                         "%lld expert blobs streamed (%.1f MB), %lld resident, %lld expert groups (%lld on the FP16 path); %.0f ms (host: "
+                         "%lld expert blobs streamed (%.1f MB), %lld resident, %lld expert groups (%lld on the FP16 path, %lld fused); %.0f ms (host: "
                          "enqueueing the attention halves %.0f, the experts %.0f: waiting for the attention halves "
                          "%.0f, the routing tables %.0f)\n",
                  (long long) LB, (long long) LE, (long long) n, (long long) lm_supers, (long long) S,
                  lb.r_dev ? "VRAM" : "pinned RAM", (long long) lb.free_mib,
                  (long long) lm_streamed, (double) lm_bytes / 1e6, (long long) lm_resident, (long long) lm_groups,
-                 (long long) lm_groups_f16, ms_since(t_start), ms_attn, ms_experts, ms_wait_a, ms_host_tables);
+                 (long long) lm_groups_f16, (long long) lm_groups_fz, ms_since(t_start), ms_attn, ms_experts, ms_wait_a, ms_host_tables);
     if (pt.on) {
         pt.fold();
         double total = 0.0;
