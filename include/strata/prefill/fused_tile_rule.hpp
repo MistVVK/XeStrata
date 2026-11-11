@@ -25,7 +25,7 @@ struct Card {
     bool s86 = false;    // compute capability 8.6 (appended last: the aggregate initializers {s120, s121, sms} of the callers and the test stay valid)
 };
 
-enum class Why { kBand, kS121, kS120Large, kS120Mid, kS120Small, kStaged };
+enum class Why { kBand, kS121, kS120Large, kS120Mid, kS120Small, kStaged, kS86Small };
 
 struct Pick {
     int ww;     // 2 (128 routed rows) or 4 (64)
@@ -36,8 +36,8 @@ constexpr double kS120LargeAvg = 159.9;   // sm_120, 80+ SMs: a prompt of 8,192 
 constexpr double kS120MidAvg = 112.0;     // sm_120, 100-149 SMs (PRO 5000): from above the band, continuous with it
 constexpr double kS120SmallAvg = 119.9;   // sm_120, 40-79 SMs (RTX 5070): a prompt of 6,144 tokens routes 6,143 positions = 119.98 an expert
 
-// staged: the launch's gate/up kernel is a weight-staging instance (sw_on in src/prefill/moe_fused_iq.cu).  Default false = the rule as it was.
-constexpr Pick pick(const Card& c, int64_t n, int n_expert, bool staged = false) {
+// staged: the launch's gate/up kernel is a weight-staging instance (sw_on in src/prefill/moe_fused_iq.cu).  wide: the launch's gate/up is Q6_K or Q8_0 (the pair class below).  Defaults false = the rule as it was.
+constexpr Pick pick(const Card& c, int64_t n, int n_expert, bool staged = false, bool wide = false) {
     const double avg = (double) n / (double) (n_expert > 1 ? n_expert : 1);
     // GB10 (sm_121, 48 SMs): the launch's average is above 112 rows an expert for every prompt size here, so the 56-112 band never fires and the 64-row tile would be
     // chosen everywhere.  Forcing 128 rows measured +3.7% [1.030, 1.079] and +3.4% [1.030, 1.038] at 16K in two independent order-balanced block pairs (12 samples a
@@ -62,6 +62,12 @@ constexpr Pick pick(const Card& c, int64_t n, int n_expert, bool staged = false)
     // everything else (sm_80 / 86 / 89, sm_120 outside the classes above, HIP builds): 128 rows when an expert has about one such tile (56 to 112 rows on average), else 64.
     // Measured on the RTX 5070 with uniform routing (tests/cuda/prefill_fused_iq_test, a layer of 2048 / 3584 / 8192 tokens, ms, 64 -> 128): IQ2_S 5.2 -> 6.7, 9.5 -> 9.3, 17.5 -> 19.5;
     // IQ2_XXS 4.2 -> 5.8, 7.4 -> 7.6, 13.6 -> 16.5; IQ3_S 5.6 -> 6.6, 10.2 -> 8.8, 18.4 -> 19.0; IQ3_XXS 5.1 -> 6.3, 9.1 -> 8.3, 16.5 -> 17.5 (256 rows was slower still).
+    // sm_86 with 40 to 79 SMs, a Q6_K or Q8_0 gate/up (Q6_K + Q8_0, Q8_0 / Q8_0; CUDA opt-ins), above 112 rows an expert: 128 rows.  Measured on the RTX A4000 (sm_86, 48 SMs, one layer, ms, tile 64 -> tile 128, output bits
+    // equal): Qwen3.6's shape (256 experts, top 8; lane P4-Q36, z440-20261111-2126-783b) Q6_K + Q8_0 4,096 / 8,192 / 20,000 tokens 17.65 -> 13.14, 31.91 -> 22.78, 73.46 -> 55.80 (MMQ 13.58 / 20.05 / 38.12);
+    // Qwen3.8-Flash-Next's shape (512 experts, top 10, real routing, RESULTS-P4-SM.md S0) at 8,192 / 20,000 / 32,768 tokens: Q6_K + Q8_0 64.97 -> 52.56, 142.17 -> 110.45, 241.14 -> 173.50; Q8_0 / Q8_0
+    // 50.64 -> 42.02, 109.88 -> 89.91, 186.36 -> 140.29.  The class is narrow on purpose: the same cards run the 64-row tile faster above 112 rows for the unstaged IQ2_S / Q2_0 pair at 8K (33.80 against 35.05) and
+    // for Q2_0 / Q2_0 (26.52 against 28.56 at 8K), so the line does not take every pair.  Staging these two formats (planned) takes 128 rows at every size through the staged rule above.
+    if (wide && c.s86 && c.sms >= 40 && c.sms < 80 && avg > 112.0) return {2, Why::kS86Small};
     return {avg > 56.0 && avg <= 112.0 ? 2 : 4, Why::kBand};
 }
 
