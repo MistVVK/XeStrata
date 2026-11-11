@@ -6151,39 +6151,6 @@
    "retired_in": ""
   },
   {
-   "name": "STRATA_DS4_METAL_CTX",
-   "backends": [
-    "metal"
-   ],
-   "reads": [
-    {
-     "file": "metal/src/engine/ds4_ctx.cpp",
-     "line": 30,
-     "backend": "metal",
-     "fn": "getenv"
-    }
-   ],
-   "parse": "flag",
-   "default_state": "off",
-   "code_default": null,
-   "engine_sets": [],
-   "engine_defaults": [],
-   "launch_files": [],
-   "launch_sets": [],
-   "launch_reads": [],
-   "doc_mentions": [],
-   "first_commit": "15f1fe0548",
-   "first_date": "2026-10-23",
-   "since": "v0.2.7.1",
-   "last_commit": "15f1fe0548",
-   "last_date": "2026-10-23",
-   "status": "research",
-   "owner": "metal/engine",
-   "note": "[auto] off unless set, not documented for users",
-   "retire_after": "",
-   "retired_in": ""
-  },
-  {
    "name": "STRATA_DUMMY_NODES",
    "backends": [
     "cuda-hip"
@@ -10030,57 +9997,6 @@
    "status": "research",
    "owner": "sycl/prefill",
    "note": "[auto] off unless set, not documented for users",
-   "retire_after": "",
-   "retired_in": ""
-  },
-  {
-   "name": "STRATA_GPU_TRACE",
-   "backends": [
-    "metal"
-   ],
-   "reads": [
-    {
-     "file": "metal/src/gpu/runtime.cpp",
-     "line": 208,
-     "backend": "metal",
-     "fn": "getenv"
-    },
-    {
-     "file": "metal/src/gpu/runtime.cpp",
-     "line": 220,
-     "backend": "metal",
-     "fn": "getenv"
-    },
-    {
-     "file": "metal/src/gpu/runtime.cpp",
-     "line": 233,
-     "backend": "metal",
-     "fn": "getenv"
-    },
-    {
-     "file": "metal/src/gpu/runtime.cpp",
-     "line": 287,
-     "backend": "metal",
-     "fn": "getenv"
-    }
-   ],
-   "parse": "flag",
-   "default_state": null,
-   "code_default": null,
-   "engine_sets": [],
-   "engine_defaults": [],
-   "launch_files": [],
-   "launch_sets": [],
-   "launch_reads": [],
-   "doc_mentions": [],
-   "first_commit": "45cbb451e7",
-   "first_date": "2026-10-23",
-   "since": "v0.2.7.1",
-   "last_commit": "45cbb451e7",
-   "last_date": "2026-10-23",
-   "status": "research",
-   "owner": "metal/gpu",
-   "note": "[auto] diagnostic / trace / measurement switch by name or by code, not documented for users",
    "retire_after": "",
    "retired_in": ""
   },
