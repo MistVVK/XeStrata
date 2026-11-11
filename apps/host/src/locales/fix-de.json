@@ -85,5 +85,9 @@
  "fx84": "Die Datei wurde heruntergeladen. „Weiter“ versucht die Installation erneut.",
  "fx85": "Unter „Details“ steht der Grund.",
  "fxec1": "Für diesen Computer gibt es eine neuere Engine. Ihre Modelle und Einstellungen bleiben unverändert.",
- "fxec2": "Beenden Sie zuerst Ihre laufenden Modelle."
+ "fxec2": "Beenden Sie zuerst Ihre laufenden Modelle.",
+ "fxpr1": "Bildleser",
+ "fxpr2": "Der von Strata (empfohlen)",
+ "fxpr3": "Der von llama.cpp",
+ "fxpr4": "Welches Programm Bilder in etwas umwandelt, das das Modell lesen kann. Der von Strata ist auf den meisten Computern schneller und liest auch sehr große Bilder richtig; auf einigen Grafikkarten, auf denen er noch langsamer ist, nimmt Strata von selbst den von llama.cpp. Wählen Sie den von llama.cpp, wenn Bilder falsch gelesen werden."
 }

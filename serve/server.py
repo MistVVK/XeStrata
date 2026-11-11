@@ -3245,6 +3245,7 @@ class Vision:
         self.fallback = (self.reader_args(cpu), log, env) if cpu else None
         self.gpu_spawn, self.cpu_spawn = self.spawn, self.fallback   # an on-demand reader tries the GPU one again at every start
         self.on_cpu = False                             # the CPU reader is what runs (the GPU one did not start, or there was no room)
+        self.reader = None                              # "own" (Strata's) or "mtmd" (llama.cpp's) from the READY line; None for an older reader
         self.proc = None
         self.stopped = True
         self.lock = threading.Lock()
@@ -3346,6 +3347,12 @@ class Vision:
                 code = getattr(proc, "returncode", None)
             raise RuntimeError(vision_start_error(line, log, code))
         self.stopped = False
+        # "READY <n_embd> <reader> [fallback]": the reader that runs (own: Strata's, mtmd: llama.cpp's; an older strata-vision says only "READY <n_embd>"),
+        # and "fallback" when Strata's reader did not start and llama.cpp's took its place (strata-vision wrote the reason to the log)
+        words = line.split()
+        self.reader = words[2] if len(words) > 2 else None
+        if "fallback" in words[3:]:
+            print("[strata] Strata's picture reader did not start; pictures are read with llama.cpp's reader. Details are in the log.", flush=True)
 
     def _readline(self, timeout: float, what: str) -> str:
         """One line from the encoder, waiting at most `timeout` s (#1317).  On a timeout the encoder is killed, so the

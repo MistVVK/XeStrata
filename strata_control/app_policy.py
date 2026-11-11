@@ -33,6 +33,10 @@ def table() -> list[dict]:
         row = {"id": s.id, "label": s.label, "hint": s.effect, "default": s.default, "env": _entries(s.env)}
         if s.legacy:
             row["legacy"] = _entries(s.legacy)
+        if s.group != "Speed":
+            row["group"] = s.group
+        if s.words:
+            row["words"] = _entries(s.words)
         out.append(row)
     return out
 
@@ -62,7 +66,9 @@ _CARDS = {
     "arc": {"name": "Intel(R) Arc(TM) A750", "vendor": "intel", "vram_gb": 8.0},
     "nameonly3060": {"name": "GeForce RTX 3060", "vram_gb": 12.0},
 }
-_MODELS = {"qwen": {}, "qwen36": {"arch": "qwen35moe"}, "deepseek": {"arch": "deepseek41"}, "deepseek_exe": {"exe": "C:/x/strata-dsv41.exe"}}
+_MODELS = {"qwen": {}, "qwen36": {"arch": "qwen35moe"}, "deepseek": {"arch": "deepseek41"}, "deepseek_exe": {"exe": "C:/x/strata-dsv41.exe"},
+           "qwen_pictures": {"vision": {"exe": "strata-vision"}}, "qwen36_pictures": {"arch": "qwen35moe", "vision": {"exe": "strata-vision"}},
+           "deepseek_pictures": {"arch": "deepseek41", "vision": {"exe": "strata-vision"}}}
 _NAMES = ["qwen3.8-flash-next", "qwen3.8-flash-next-iq3_s", "qwen3.8-flash-next-Q2_0", "qwen3.8-flash-next-unsloth-ud-q4_k_xl", "qwen3.8-flash-next-unsloth-ud-iq4_xs-v31",
           "qwen3.8-flash-next-gyro-iq4", "qwen3.8-flash-next-coder-iq1_m", "qwen3.8-flash-next-swift-iq3_s", "swift-1.5-iq3_s", "qwen3.6-35b-a3b-ud-q4_k_xl", "deepseek-v4.1-flash", ""]
 

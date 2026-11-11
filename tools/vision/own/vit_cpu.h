@@ -23,18 +23,6 @@ namespace strata_vit {
 // 2 F16, anything else: none).  Default: on for BF16 weights, off for F16; env (STRATA_VIT_REF_ROUND's value, may be null) "0" / "1" overrides.
 int vit_cpu_round_kind(int weight_kind, const char* env);
 
-// True when this build of the CPU tower is known to be slower than mtmd's CPU reader, so `--tower auto` keeps mtmd (`--tower own` still runs ours): an x86 build
-// compiled by MSVC.  Measured (owner PC, Ryzen 5 7600, MSVC 19.44 /O2): 33.4 s against mtmd-CPU's 18.5 s for a 1,024-token picture (1.46 to 1.82 over the pictures),
-// while the same kernels built by GCC take 0.80 to 0.95 of mtmd-CPU's time on Zen 4 (RESULTS-OWN-3V.md 12.14).  Keyed on the compiler, not the OS: a GCC or clang
-// build for Windows does not have the problem.
-constexpr bool vit_cpu_build_slower_than_mtmd() {
-#if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
-    return true;
-#else
-    return false;
-#endif
-}
-
 class VitCpu {
 public:
     VitCpu();
