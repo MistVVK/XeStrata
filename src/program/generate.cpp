@@ -11237,7 +11237,7 @@ int main(int argc, char** argv) {
         // kernel has free (cudaMemGetInfo equals MemFree, not MemAvailable), so the picture reader's CUDA start found
         // ~1 GiB and fell back to the CPU (91 s for a 2048x1536 picture against about 0.5 s on the card).  The engine gives
         // those pages back; the experts of the slots the prompt path borrows keep theirs (their refill reads them).  The
-        // cache holds the same bytes either way, so no output bit changes.  STRATA_UMA_DROP_PAGES=0 keeps the pages.
+        // cache holds the same bytes either way, so no output bit changes.  STRATA_UMA_DROP_PAGES=0 keeps the pages (the A/B arm).
         if (srcp == &src && gpu_holds_all && !multi_gpu && stages.empty() && [] {
                 const char* v = std::getenv("STRATA_UMA_DROP_PAGES");
                 return v == nullptr || v[0] != '0';
@@ -11253,11 +11253,15 @@ int main(int argc, char** argv) {
                     return sl != strata::core::kNotResident && sl >= keep_from;
                 });
                 (void) cudaMemGetInfo(&f1, &tb);
-                std::fprintf(stderr, "strata serve: this GPU shares the system RAM and holds every expert: the model file's cached "
-                                     "pages of %.2f GiB of experts are given back (%.1f ms; the experts the prompt path borrows "
-                                     "keep theirs); free on the GPU %.2f -> %.2f GiB (STRATA_UMA_DROP_PAGES=0 keeps them)\n",
-                             (double) freed / 1073741824.0, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
-                             (double) f0 / 1073741824.0, (double) f1 / 1073741824.0);
+                // [DRAFT]: the owner words this line (par/OWNER-WORDING-1111.md, SPARK)
+                std::fprintf(stderr, "[DRAFT] strata serve: this GPU shares the system memory and holds every expert, so the "
+                                     "model file's cached copy of them is given back.\n");
+                const char* tr = std::getenv("STRATA_UMA_DROP_PAGES");   // 2: the numbers too (research)
+                if (tr != nullptr && tr[0] == '2')
+                    std::fprintf(stderr, "strata serve: STRATA_UMA_DROP_PAGES: %.2f GiB of expert pages given back in %.1f ms; "
+                                         "free on the GPU %.2f -> %.2f GiB\n",
+                                 (double) freed / 1073741824.0, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                                 (double) f0 / 1073741824.0, (double) f1 / 1073741824.0);
             } else {
                 (void) cudaGetLastError();
             }

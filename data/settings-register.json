@@ -40146,6 +40146,45 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_UMA_DROP_PAGES",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 11242,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/program/generate.cpp",
+     "line": 11259,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "on",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "3220dbc0e0",
+   "first_date": "2026-11-11",
+   "since": null,
+   "last_commit": "3220dbc0e0",
+   "last_date": "2026-11-11",
+   "status": "research",
+   "owner": "core",
+   "note": "[reviewed] The A/B switch of the shared-memory page drop (lane SPARK, gate on the DGX Spark): a GPU that shares the system RAM (cudaDevAttrIntegrated) and holds every expert gives the GGUF's cached expert pages back after the prompt path is set up. 0 keeps the pages (the old behaviour); 2 also prints the bytes and the free memory. Not documented for users.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_UMA_HEADROOM_GIB",
    "backends": [
     "cuda-hip",
