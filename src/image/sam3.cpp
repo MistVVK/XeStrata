@@ -745,14 +745,14 @@ void Sam3::mask_prep() {
     float* f0 = scratch(kF0, (size_t) (16 * N * d * 4));
     float* c1 = scratch(kPix0, (size_t) (4 * N * d * 4));
     auto* t16 = scratch_as<uint16_t>(kInst16, (size_t) (16 * N * d));
-    float* part = scratch(kPart, (size_t) (3 * 8 * 64 * 4));
+    float* part = scratch(kPart, (size_t) qi_group_norm_ws_floats(16 * N, 8) * sizeof(float));
     aux_up_add16(x, G, G, f1, 2 * G, 2 * G, d, t16, s_);
     convolve(pix_conv_[0], t16, 2 * G, 2 * G, c1, kCol);
-    aux_group_norm(c1, 4 * N, d, 8, pix_gn_[0].w, pix_gn_[0].b, kEps, true, c1, nullptr, part, s_);
+    image_group_norm(c1, nullptr, 4 * N, d, 8, pix_gn_[0].w, pix_gn_[0].b, kEps, ImageAct::relu, c1, nullptr, part, s_);
     aux_up_add16(c1, 2 * G, 2 * G, f0, 4 * G, 4 * G, d, t16, s_);
     float* c0 = scratch(kMasks, (size_t) (16 * N * d * 4));
     convolve(pix_conv_[1], t16, 4 * G, 4 * G, c0, kCol);
-    aux_group_norm(c0, 16 * N, d, 8, pix_gn_[1].w, pix_gn_[1].b, kEps, true, nullptr, t16, part, s_);
+    image_group_norm(c0, nullptr, 16 * N, d, 8, pix_gn_[1].w, pix_gn_[1].b, kEps, ImageAct::relu, nullptr, t16, part, s_);
     // the instance projection (1 x 1), FP16 for the masks' product
     auto* p16 = scratch_as<uint16_t>(kProj16, (size_t) (16 * N * d));
     product16(t16, inst_, p16, 16 * N, true);

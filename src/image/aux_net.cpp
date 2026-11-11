@@ -373,7 +373,7 @@ void AuxNet::convolve(const Conv& c, const uint16_t* x16, int64_t H, int64_t W, 
     conv::drive(q, r, P, K, cap, c.k == 1 && c.stride == 1 && c.pad == 0,
         [&](int64_t p0, int64_t n) {
             if (col == nullptr) col = scratch_as<uint16_t>(col_slot, (size_t) (std::min(P, cap / K) * K));
-            aux_im2col16(x16, H, W, c.c, c.k, c.stride, c.pad, OW, p0, n, col, s_);
+            qi_im2col16(x16, 1, H, W, c.c, 1, c.k, c.stride, c.pad, OH, OW, p0, n, col, s_);
         },
         [&](int64_t p0, int64_t n, bool point) {
             gemm_.f16(point ? x16 : col, c.w, y + p0 * c.o, n, c.o, point ? c.c : K, 0, false, add);
@@ -525,8 +525,7 @@ AuxMapNet::Map AuxMapNet::run(const MConv& c, const Map& x, ImageAct a, const Ma
     const auto chosen = conv::drive(q, r, P, K, cap, plain || few,
         [&](int64_t p0, int64_t n) {
             if (col == nullptr) col = scratch_as<uint16_t>(kColSlot, (size_t) (std::min(P, cap / K) * K));
-            if (c.dil > 1) aux_im2col16_dilated(x.p, x.h, x.w, c.inp, c.k, c.s, c.pad, c.dil, OW, p0, n, col, s_);
-            else aux_im2col16(x.p, x.h, x.w, c.inp, c.k, c.s, c.pad, OW, p0, n, col, s_);
+            qi_im2col16(x.p, 1, x.h, x.w, c.inp, 1, c.k, c.s, c.pad, OH, OW, p0, n, col, s_, 0, c.dil);
         },
         [&](int64_t p0, int64_t n, bool point) {
             if (y == nullptr) y = scratch(kSumSlot, (size_t) (P * c.outp) * 4);
@@ -617,7 +616,8 @@ AuxMapNet::Map AuxMapNet::concat(const std::vector<Map>& parts) {
 }
 
 void AuxMapNet::instance_norm(Map& x, float eps, ImageAct a) {
-    aux_instance_norm16(x.p, x.h * x.w, x.c, eps, a, buf<float>((size_t) (2 * x.c)), s_);
+    image_group_norm(nullptr, x.p, x.h * x.w, x.c, x.c, nullptr, nullptr, eps, a, nullptr, x.p,
+                     buf<float>((size_t) qi_group_norm_ws_floats(x.h * x.w, x.c)), s_);
 }
 
 std::vector<float> AuxMapNet::host_channel0(const Map& x) {

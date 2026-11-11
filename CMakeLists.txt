@@ -1239,6 +1239,12 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(rows_i8_width_parity PRIVATE strata_image)
   add_test(NAME rows_i8_width_parity COMMAND rows_i8_width_parity)
   set_tests_properties(rows_i8_width_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+  # the image engine's one unfold (qi_im2col16) against a host loop: the 8-channel form, the one-value form a 3-channel
+  # patch embedding is left with, a dilated convolution's taps, a row wider than the layer and the 3D VAEs' frames
+  add_executable(im2col_parity src/image/im2col_parity.cpp)
+  target_link_libraries(im2col_parity PRIVATE strata_image)
+  add_test(NAME im2col_parity COMMAND im2col_parity)
+  set_tests_properties(im2col_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
   add_executable(seedvr2_convrot_parity src/image/seedvr2_convrot_parity.cpp)
   target_link_libraries(seedvr2_convrot_parity PRIVATE strata_image)
   add_test(NAME seedvr2_convrot_parity COMMAND seedvr2_convrot_parity)

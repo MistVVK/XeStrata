@@ -17,11 +17,6 @@ namespace strata::image {
 void aux_rgb_norm16(const uint8_t* rgba, int64_t W, int64_t H, const float* mean, const float* std, uint16_t* y16,
                     void* stream);
 
-/// The rows p0 .. p0 + n - 1 of a k x k convolution's patches (stride `stride`, zero padding `pad` on every side) of
-/// x16 [H][W][C], to col16 [n][k][k][C] (the weights' [O][k][k][C] order); OW the output's width.
-void aux_im2col16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int k, int stride, int pad, int64_t OW,
-                  int64_t p0, int64_t n, uint16_t* col16, void* stream);
-
 /// y [OH][OW][O] (FP32, no bias) = the k x k convolution (stride `stride`, zero padding `pad`) of x16 [H][W][C] by
 /// w16 [O][k][k][C], each output pixel's sums at once (O <= kConvFewOut; the outputs past `real` 0, the padding's): a
 /// convolution with few outputs, whose unfolded patches would be read for a product of O columns only.
@@ -29,10 +24,28 @@ constexpr int64_t kConvFewOut = 8;
 void aux_conv_few16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, const uint16_t* w16, int64_t O,
                     int64_t real, int k, int stride, int pad, int64_t OH, int64_t OW, float* y, void* stream);
 
-/// y = x + the depthwise 3 x 3 convolution of x (zero padding 1, w [C][9], bias b [C]): DaViT's position encoding
-/// with its residual.  x and y [H][W][C], not the same buffer.
-void aux_dwconv3_add(const float* x, const float* w, const float* b, int64_t H, int64_t W, int64_t C, float* y,
-                     void* stream);
+// Depthwise convolution on channels-last rows, with optional bias, activation and residual.
+// Exactly one of x / x16 and w / w16 is set; output has the same type as the input.
+// norm_w selects the fused FP32 3 x 3, stride 1, pad 1 residual and row LayerNorm, with an FP16 second output;
+// window selects that output's window order. The ordinary residual also requires FP32 input.
+struct Depthwise {
+    const float* x = nullptr;
+    const float* w = nullptr;
+    const uint16_t* x16 = nullptr;
+    const uint16_t* w16 = nullptr;
+    const float* bias = nullptr;
+    const float* norm_w = nullptr;
+    const float* norm_b = nullptr;
+    float* out = nullptr;
+    uint16_t* out16 = nullptr;
+    int64_t h = 0, wdim = 0, c = 0, oh = 0, ow = 0;
+    int k = 3, stride = 1, pad = 1, dilation = 1;
+    int64_t window = 0;
+    float eps = 0.f;
+    ImageAct act = ImageAct::none;
+    bool residual = false;
+};
+void image_depthwise(const Depthwise& d, void* stream);
 
 /// LayerNorm of x (+ r, where r is not null) per row of C, affine w, b: to y (FP32, may be x) and y16 (FP16), each
 /// where not null.
@@ -149,11 +162,6 @@ void aux_deconv2_scatter(const float* y, int64_t H, int64_t W, int64_t O, const 
 /// y16 [H][W][C] = feat + prev [h][w][C] resized to H x W by the nearest pixel (torch's `nearest`: floor(i * h / H)).
 void aux_up_add16(const float* prev, int64_t h, int64_t w, const float* feat, int64_t H, int64_t W, int64_t C,
                   uint16_t* y16, void* stream);
-
-/// GroupNorm of x [N][C] (G groups of C / G channels over all N pixels, eps), affine w, b, then ReLU with `relu`: to
-/// y (FP32, may be x) and y16, each where not null.  `part` scratch of 3 * G * 64 floats.
-void aux_group_norm(const float* x, int64_t N, int64_t C, int64_t G, const float* w, const float* b, float eps,
-                    bool relu, float* y, uint16_t* y16, float* part, void* stream);
 
 /// masks [K][H][W] = 255 where the sigmoid of logits [K][h][w], resized to H x W bilinearly (torch's
 /// align_corners=False; the probabilities resized, or with `as_logits` the logits themselves, as SAM 3's video
@@ -303,15 +311,9 @@ void aux_pad_reflect16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int
 /// zero rows and columns before and `hi` after.
 void aux_zero_insert16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int64_t s, int64_t lo, int64_t hi,
                        uint16_t* y16, void* stream);
-/// x16 [n][C] instance-normalized in place (each channel by its own mean and variance over the n pixels, no affine,
-/// eps), then act; `st` scratch of 2 C floats.
-void aux_instance_norm16(uint16_t* x16, int64_t n, int64_t C, float eps, ImageAct act, float* st, void* stream);
 /// y16 [H + top + bottom][W + left + right][C] = x16 with zeros around it.
 void aux_pad16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int64_t top, int64_t left, int64_t bottom,
                int64_t right, uint16_t* y16, void* stream);
-/// aux_im2col16 of a convolution whose taps are `dil` pixels apart (a dilated one).
-void aux_im2col16_dilated(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int k, int stride, int pad, int dil,
-                          int64_t OW, int64_t p0, int64_t n, uint16_t* col16, void* stream);
 /// x16 [n][C] *= gate [C] (a channel attention's weights, FP32), in place.
 void aux_scale_channels16(uint16_t* x16, int64_t n, int64_t C, const float* gate, void* stream);
 /// mean [C] (FP32) = the average of x16 [n][C] over its n pixels.

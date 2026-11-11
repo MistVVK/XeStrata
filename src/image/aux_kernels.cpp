@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -48,20 +49,6 @@ void aux_rgb_norm16(const uint8_t* rgba, int64_t W, int64_t H, const float* mean
         y16[3 * i + 2] = f16_from_f32(((float) rgba[4 * i + 2] / 255.f - m2) * s2);
     });
     finish(stream, e, "aux_rgb_norm16");
-}
-
-void aux_im2col16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int k, int stride, int pad, int64_t OW,
-                  int64_t p0, int64_t n, uint16_t* col16, void* stream) {
-    const int64_t K = (int64_t) k * k * C;
-    if (n <= 0 || K <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n * K)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t r = i / K, q = i - r * K, tap = q / C, c = q - tap * C;
-        const int64_t p = p0 + r, oy = p / OW, ox = p - oy * OW;
-        const int64_t y = oy * stride - pad + tap / k, x = ox * stride - pad + tap % k;
-        col16[i] = y >= 0 && y < H && x >= 0 && x < W ? x16[(y * W + x) * C + c] : (uint16_t) 0;
-    });
-    finish(stream, e, "aux_im2col16");
 }
 
 void aux_conv_few16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, const uint16_t* w16, int64_t O,
@@ -111,26 +98,64 @@ void aux_conv_few16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, const 
     finish(stream, e, "aux_conv_few16");
 }
 
-void aux_dwconv3_add(const float* x, const float* w, const float* b, int64_t H, int64_t W, int64_t C, float* y,
-                     void* stream) {
-    const int64_t n = H * W * C;
-    if (n <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t c = i % C, p = i / C, py = p / W, px = p - py * W;
-        float s = b[c];
-        for (int64_t dy = -1; dy <= 1; ++dy) {
-            const int64_t yy = py + dy;
-            if (yy < 0 || yy >= H) continue;
-            for (int64_t dx = -1; dx <= 1; ++dx) {
-                const int64_t xx = px + dx;
-                if (xx < 0 || xx >= W) continue;
-                s += w[c * 9 + (dy + 1) * 3 + dx + 1] * x[(yy * W + xx) * C + c];
-            }
+namespace {
+// One tap loop for all depthwise users, including the row-reduction fusion below.
+template <typename I, bool Half>
+inline float depthwise_value(const Depthwise& d, I oy, I ox, I c) {
+    float acc = d.bias ? d.bias[c] : 0.f;
+    for (I ky = 0; ky < d.k; ++ky) {
+        const I yy = oy * d.stride + ky * d.dilation - d.pad;
+        if (yy < 0 || yy >= d.h) continue;
+        for (I kx = 0; kx < d.k; ++kx) {
+            const I xx = ox * d.stride + kx * d.dilation - d.pad;
+            if (xx < 0 || xx >= d.wdim) continue;
+            const I xi = (yy * (I) d.wdim + xx) * (I) d.c + c;
+            const I wi = (c * d.k + ky) * d.k + kx;
+            if constexpr (Half) acc += f32_from_f16(d.x16[xi]) * f32_from_f16(d.w16[wi]);
+            else acc += d.w[wi] * d.x[xi];
         }
-        y[i] = x[i] + s;
-    });
-    finish(stream, e, "aux_dwconv3_add");
+    }
+    return acc;
+}
+
+template <typename I>
+void depthwise_norm_launch(const Depthwise& d, void* stream);
+
+template <typename I, bool Half>
+void depthwise_launch(const Depthwise& d, void* stream) {
+    const auto e = queue_for(stream).parallel_for(
+        sycl::range<3>((size_t) d.oh, (size_t) d.ow, (size_t) d.c), [=](sycl::id<3> id) {
+            const I oy = (I) id[0], ox = (I) id[1], c = (I) id[2];
+            const I i = (oy * (I) d.ow + ox) * (I) d.c + c;
+            float v = image_activate(d.act, depthwise_value<I, Half>(d, oy, ox, c));
+            if (d.residual) v = d.x[i] + v;
+            if constexpr (Half) d.out16[i] = f16_from_f32(v);
+            else d.out[i] = v;
+        });
+    finish(stream, e, "image_depthwise");
+}
+}  // namespace
+
+void image_depthwise(const Depthwise& d, void* stream) {
+    if (d.oh <= 0 || d.ow <= 0 || d.c <= 0) return;
+    if (d.h <= 0 || d.wdim <= 0 || d.k <= 0 || d.stride <= 0 || d.dilation <= 0 || d.pad < 0)
+        throw std::invalid_argument("image_depthwise: invalid dimensions");
+    // The 3D launch removes per-output division. The former 1D form took 0.7 ms on B70 at 72 x 72 x 256.
+    // Keep wide indices for tensors and padded coordinates that do not fit in a signed 32-bit index.
+    const int64_t limit = std::numeric_limits<int>::max();
+    const bool narrow = d.h <= limit / d.wdim / d.c && d.oh <= limit / d.ow / d.c &&
+                        d.c <= limit / d.k / d.k &&
+                        d.oh <= (limit - (int64_t) d.k * d.dilation - d.pad) / d.stride &&
+                        d.ow <= (limit - (int64_t) d.k * d.dilation - d.pad) / d.stride;
+    if (d.norm_w) {
+        depthwise_norm_launch<int64_t>(d, stream);
+    } else if (d.x16) {
+        if (narrow) depthwise_launch<int, true>(d, stream);
+        else depthwise_launch<int64_t, true>(d, stream);
+    } else {
+        if (narrow) depthwise_launch<int, false>(d, stream);
+        else depthwise_launch<int64_t, false>(d, stream);
+    }
 }
 
 namespace {
@@ -143,7 +168,8 @@ int64_t row_items(int64_t C) { return std::clamp<int64_t>((C / 4 + 31) / 32 * 32
 bool row_vals(int64_t C) { return C <= kRowVals * row_items(C); }
 
 // The mean and the inverse deviation of a row's values held as above (two passes: the variance about the mean)
-inline sycl::float2 row_stats(const sycl::nd_item<1>& it, const float (&v)[kRowVals], int64_t l, int64_t L, int64_t C,
+template <int N>
+inline sycl::float2 row_stats(const sycl::nd_item<N>& it, const float (&v)[kRowVals], int64_t l, int64_t L, int64_t C,
                               float eps) {
     float s = 0.f;
 #pragma unroll
@@ -158,8 +184,15 @@ inline sycl::float2 row_stats(const sycl::nd_item<1>& it, const float (&v)[kRowV
 }
 }  // namespace
 
-void aux_dwconv3_norm16(const float* x, const float* w, const float* b, const float* nw, const float* nb, int64_t H,
-                        int64_t W, int64_t C, int64_t o_ws, float eps, float* y, uint16_t* y16, void* stream) {
+namespace {
+// A channel reduction requires one work-group per pixel. Keep its 1D mapping: the 3D mapping changed Florence-2
+// outputs on RTX 4070 (stage0 mean absolute difference 4.35e-5, max 0.00175) and took 45.6 vs 44.2 ms in vision.
+template <typename I>
+void depthwise_norm_launch(const Depthwise& d, void* stream) {
+    const auto x = d.x; const auto w = d.w; const auto b = d.bias;
+    const auto nw = d.norm_w; const auto nb = d.norm_b;
+    const auto H = d.h, W = d.wdim, C = d.c, o_ws = d.window;
+    const auto eps = d.eps; auto y = d.out; auto y16 = d.out16;
     const int64_t T = H * W;
     if (T <= 0) return;
     const bool regs = row_vals(C);
@@ -168,19 +201,11 @@ void aux_dwconv3_norm16(const float* x, const float* w, const float* b, const fl
         sycl::nd_range<1>(sycl::range<1>((size_t) (T * L)), sycl::range<1>((size_t) L)), [=](sycl::nd_item<1> it) {
             const auto t = static_cast<int64_t>(it.get_group_linear_id());
             const auto l = static_cast<int64_t>(it.get_local_linear_id());
-            const int64_t py = t / W, px = t - py * W;
+            const I py = t / W, px = t - py * W;
             float* yr = y + t * C;
             const auto conv = [&](int64_t c) {
-                float v = b[c];
-                for (int64_t dy = -1; dy <= 1; ++dy) {
-                    const int64_t yy = py + dy;
-                    if (yy < 0 || yy >= H) continue;
-                    for (int64_t dx = -1; dx <= 1; ++dx) {
-                        const int64_t xx = px + dx;
-                        if (xx >= 0 && xx < W) v += w[c * 9 + (dy + 1) * 3 + dx + 1] * x[(yy * W + xx) * C + c];
-                    }
-                }
-                return v + x[t * C + c];
+                Depthwise conv; conv.x = x; conv.w = w; conv.bias = b; conv.h = H; conv.wdim = W; conv.c = C;
+                return depthwise_value<I, false>(conv, py, px, (I) c) + x[t * C + c];
             };
             const int64_t o = o_ws > 0 ? ((py / o_ws) * (W / o_ws) + px / o_ws) * o_ws * o_ws + (py % o_ws) * o_ws +
                                              px % o_ws
@@ -218,6 +243,15 @@ void aux_dwconv3_norm16(const float* x, const float* w, const float* b, const fl
             for (int64_t c = l; c < C; c += L) y16[o * C + c] = f16_from_f32((yr[c] - mean) * inv * nw[c] + nb[c]);
         });
     finish(stream, e, "aux_dwconv3_norm16");
+}
+}  // namespace
+
+void aux_dwconv3_norm16(const float* x, const float* w, const float* b, const float* nw, const float* nb, int64_t H,
+                        int64_t W, int64_t C, int64_t o_ws, float eps, float* y, uint16_t* y16, void* stream) {
+    Depthwise d; d.x = x; d.w = w; d.bias = b; d.norm_w = nw; d.norm_b = nb;
+    d.out = y; d.out16 = y16; d.h = d.oh = H; d.wdim = d.ow = W; d.c = C;
+    d.window = o_ws; d.eps = eps; d.residual = true;
+    image_depthwise(d, stream);
 }
 
 namespace {
@@ -817,68 +851,6 @@ void aux_up_add16(const float* prev, int64_t h, int64_t w, const float* feat, in
     finish(stream, e, "aux_up_add16");
 }
 
-void aux_group_norm(const float* x, int64_t N, int64_t C, int64_t G, const float* w, const float* b, float eps,
-                    bool relu, float* y, uint16_t* y16, float* part, void* stream) {
-    if (N <= 0 || G <= 0) return;
-    constexpr int64_t P = 64;      // chunks of the pixels a group's statistics are gathered over
-    constexpr size_t L = 256;
-    const int64_t Cg = C / G, chunk = (N + P - 1) / P;
-    auto& q = queue_for(stream);
-    // each chunk's count, mean and squared deviations about it (two passes over its values)
-    auto e = q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (G * P) * L), sycl::range<1>(L)),
-                            [=](sycl::nd_item<1> it) {
-        const auto gid = static_cast<int64_t>(it.get_group_linear_id());
-        const auto l = static_cast<int64_t>(it.get_local_linear_id());
-        const int64_t g = gid / P, ch = gid - g * P, p0 = ch * chunk, p1 = sycl::min(N, p0 + chunk);
-        const int64_t cnt = p1 > p0 ? (p1 - p0) * Cg : 0;
-        float s = 0.f;
-        for (int64_t k = l; k < cnt; k += (int64_t) L) s += x[(p0 + k / Cg) * C + g * Cg + k % Cg];
-        const float tot = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
-        const float mean = cnt > 0 ? tot / (float) cnt : 0.f;
-        float s2 = 0.f;
-        for (int64_t k = l; k < cnt; k += (int64_t) L) {
-            const float d = x[(p0 + k / Cg) * C + g * Cg + k % Cg] - mean;
-            s2 += d * d;
-        }
-        const float m2 = sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>());
-        if (l == 0) {
-            part[3 * gid] = (float) cnt;
-            part[3 * gid + 1] = mean;
-            part[3 * gid + 2] = m2;
-        }
-    });
-    if (!stream) core::Runtime::get().wait(e, "aux_group_norm");
-    // each group's chunks combined once (Chan et al.'s pairwise update), its mean and 1 / deviation into its first
-    // chunk's slots (each group's own: the items do not meet); the pass over the values reads those two (combining
-    // them for every value took the B70 9.7 ms of SAM 3's 82,944 x 256, 2026-11-07)
-    e = q.parallel_for(sycl::range<1>((size_t) G), [=](sycl::id<1> id) {
-        const auto g = static_cast<int64_t>(id[0]);
-        float cnt = 0.f, mean = 0.f, m2 = 0.f;
-        for (int64_t ch = 0; ch < P; ++ch) {
-            const float nb = part[3 * (g * P + ch)];
-            if (nb <= 0.f) continue;
-            const float mb = part[3 * (g * P + ch) + 1], d = mb - mean, tot = cnt + nb;
-            mean += d * nb / tot;
-            m2 += part[3 * (g * P + ch) + 2] + d * d * cnt * nb / tot;
-            cnt = tot;
-        }
-        part[3 * g * P] = mean;
-        part[3 * g * P + 1] = 1.f / sycl::sqrt(m2 / cnt + eps);
-    });
-    if (!stream) core::Runtime::get().wait(e, "aux_group_norm");
-    const int64_t n = N * C;
-    e = q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t c = i % C, g = c / Cg;
-        const float mean = part[3 * g * P], inv = part[3 * g * P + 1];
-        float v = (x[i] - mean) * inv * w[c] + b[c];
-        if (relu) v = sycl::fmax(v, 0.f);
-        if (y != nullptr) y[i] = v;
-        if (y16 != nullptr) y16[i] = f16_from_f32(v);
-    });
-    finish(stream, e, "aux_group_norm");
-}
-
 void aux_mask_resize(const float* logits, int64_t K, int64_t h, int64_t w, int64_t H, int64_t W, bool as_logits,
                      float threshold, uint8_t* masks, void* stream) {
     const int64_t n = K * H * W;
@@ -1228,26 +1200,9 @@ void aux_box_refine(float* boxes, const float* delta, int64_t n, void* stream) {
 
 void aux_dwconv(const float* x, const float* w, const float* b, int64_t H, int64_t W, int64_t C, int k, float* y,
                 void* stream) {
-    if (H * W * C <= 0) return;
-    // a 3D range and 32-bit indices: no 64-bit division by C and W an output (the B70 0.7 ms a 72 x 72 x 256 in the
-    // 1D form, 2026-11-07)
-    const int h = (int) H, wd = (int) W, ch = (int) C, r = k / 2;
-    const auto e = queue_for(stream).parallel_for(sycl::range<3>((size_t) H, (size_t) W, (size_t) C), [=](sycl::id<3> id) {
-        const int py = (int) id[0], px = (int) id[1], c = (int) id[2];
-        float s = b != nullptr ? b[c] : 0.f;
-        const float* wc = w + c * k * k;
-        for (int dy = -r; dy <= r; ++dy) {
-            const int yy = py + dy;
-            if (yy < 0 || yy >= h) continue;
-            for (int dx = -r; dx <= r; ++dx) {
-                const int xx = px + dx;
-                if (xx < 0 || xx >= wd) continue;
-                s += wc[(dy + r) * k + dx + r] * x[(yy * wd + xx) * ch + c];
-            }
-        }
-        y[(py * wd + px) * ch + c] = s;
-    });
-    finish(stream, e, "aux_dwconv");
+    Depthwise d; d.x = x; d.w = w; d.bias = b; d.out = y;
+    d.h = d.oh = H; d.wdim = d.ow = W; d.c = C; d.k = k; d.pad = k / 2;
+    image_depthwise(d, stream);
 }
 
 void aux_scale_add(float* x, const float* y, const float* g, int64_t n, int64_t C, void* stream) {
@@ -1396,23 +1351,10 @@ void aux_map_store16(const float* y, int64_t n, int64_t O, const float* bias, Im
 
 void aux_dwconv16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, const uint16_t* w16, const float* bias, int k,
                   int s, int p, int64_t OH, int64_t OW, ImageAct act, uint16_t* y16, void* stream) {
-    if (OH <= 0 || OW <= 0 || C <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (OH * OW * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t c = i % C, q = i / C, oy = q / OW, ox = q - oy * OW;
-        float acc = bias != nullptr ? bias[c] : 0.f;
-        for (int dy = 0; dy < k; ++dy) {
-            const int64_t yy = oy * s + dy - p;
-            if (yy < 0 || yy >= H) continue;
-            for (int dx = 0; dx < k; ++dx) {
-                const int64_t xx = ox * s + dx - p;
-                if (xx < 0 || xx >= W) continue;
-                acc += f32_from_f16(x16[(yy * W + xx) * C + c]) * f32_from_f16(w16[(c * k + dy) * k + dx]);
-            }
-        }
-        y16[i] = f16_from_f32(image_activate(act, acc));
-    });
-    finish(stream, e, "aux_dwconv16");
+    Depthwise d; d.x16 = x16; d.w16 = w16; d.bias = bias; d.out16 = y16;
+    d.h = H; d.wdim = W; d.c = C; d.oh = OH; d.ow = OW;
+    d.k = k; d.stride = s; d.pad = p; d.act = act;
+    image_depthwise(d, stream);
 }
 
 void aux_maxpool16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int k, int s, int p, int64_t OH, int64_t OW,
@@ -1573,43 +1515,6 @@ void aux_zero_insert16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int
     finish(stream, e, "aux_zero_insert16");
 }
 
-namespace {
-// st [C][2] = each channel's mean and variance over x16 [n][C]: a work-group a channel
-void channel_stats16(const uint16_t* x16, int64_t n, int64_t C, float* st, void* stream) {
-    sycl::queue& q = queue_for(stream);
-    const size_t wg = std::min<size_t>(256, q.get_device().get_info<sycl::info::device::max_work_group_size>());
-    const auto e = q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) C * wg), sycl::range<1>(wg)),
-                                  [=](sycl::nd_item<1> it) {
-        const auto c = static_cast<int64_t>(it.get_group(0));
-        float s = 0.f, s2 = 0.f;
-        for (auto p = static_cast<int64_t>(it.get_local_id(0)); p < n; p += (int64_t) wg) {
-            const float v = f32_from_f16(x16[p * C + c]);
-            s += v;
-            s2 += v * v;
-        }
-        s = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
-        s2 = sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>());
-        if (it.get_local_id(0) == 0) {
-            const float m = s / (float) n;
-            st[c * 2] = m;
-            st[c * 2 + 1] = sycl::fmax(s2 / (float) n - m * m, 0.f);
-        }
-    });
-    finish(stream, e, "aux_channel_stats16");
-}
-}  // namespace
-
-void aux_instance_norm16(uint16_t* x16, int64_t n, int64_t C, float eps, ImageAct act, float* st, void* stream) {
-    if (n <= 0 || C <= 0) return;
-    channel_stats16(x16, n, C, st, stream);
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t c = i % C;
-        x16[i] = f16_from_f32(image_activate(act, (f32_from_f16(x16[i]) - st[c * 2]) * sycl::rsqrt(st[c * 2 + 1] + eps)));
-    });
-    finish(stream, e, "aux_instance_norm16");
-}
-
 void aux_scale_channels16(uint16_t* x16, int64_t n, int64_t C, const float* gate, void* stream) {
     if (n <= 0 || C <= 0) return;
     const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n * C)), [=](sycl::id<1> id) {
@@ -1644,20 +1549,6 @@ void aux_pad16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int64_t top
         y16[i] = y >= 0 && y < H && x >= 0 && x < W ? x16[(y * W + x) * C + c] : (uint16_t) 0;
     });
     finish(stream, e, "aux_pad16");
-}
-
-void aux_im2col16_dilated(const uint16_t* x16, int64_t H, int64_t W, int64_t C, int k, int stride, int pad, int dil,
-                          int64_t OW, int64_t p0, int64_t n, uint16_t* col16, void* stream) {
-    const int64_t K = (int64_t) k * k * C;
-    if (n <= 0 || K <= 0) return;
-    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (n * K)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t r = i / K, q = i - r * K, tap = q / C, c = q - tap * C;
-        const int64_t p = p0 + r, oy = p / OW, ox = p - oy * OW;
-        const int64_t y = oy * stride - pad + (tap / k) * dil, x = ox * stride - pad + (tap % k) * dil;
-        col16[i] = y >= 0 && y < H && x >= 0 && x < W ? x16[(y * W + x) * C + c] : (uint16_t) 0;
-    });
-    finish(stream, e, "aux_im2col16_dilated");
 }
 
 }  // namespace strata::image

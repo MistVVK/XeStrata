@@ -7,6 +7,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/qi_kernels.hpp"
+#include "strata/image/aux_kernels.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/image/gelu.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -112,18 +113,9 @@ void ln_mod16(const float* x, const float* shift, const float* scale, int64_t HW
 
 // out = GELU(depthwise 3 x 3 convolution of t (zero outside) + bias), the exact (erf) GELU
 void dw3x3_gelu(const float* t, const float* w, const float* b, int64_t H, int64_t W, int64_t C, float* out, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (H * W * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t p = i / C, c = i - p * C, y = p / W, x = p % W;
-        float a = b[c];
-        for (int64_t dy = -1; dy <= 1; ++dy)
-            for (int64_t dx = -1; dx <= 1; ++dx) {
-                const int64_t yy = y + dy, xx = x + dx;
-                if (yy >= 0 && yy < H && xx >= 0 && xx < W)
-                    a += w[c * 9 + (dy + 1) * 3 + dx + 1] * t[(yy * W + xx) * C + c];
-            }
-        out[i] = gelu_erf(a);
-    });
+    Depthwise d; d.x = t; d.w = w; d.bias = b; d.out = out;
+    d.h = d.oh = H; d.wdim = d.ow = W; d.c = C; d.act = ImageAct::gelu;
+    image_depthwise(d, s);
 }
 
 // ca[o] = sigmoid(b[o] + w[o] . mean of x's channels over the pixels): the channel attention's gate

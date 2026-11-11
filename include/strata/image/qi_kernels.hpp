@@ -172,13 +172,16 @@ void qi_noise_mix(float* x, const float* z0, const float* noise, float s, int64_
 
 // --- the vision encoder (Qwen3-VL's ViT, src/image/qi_vision.cpp)
 
-/// The image engine's one unfold for its convolutions: col16[r][(dt k k + dy k + dx) C + c] = in16[t + dt - 1][oy s + dy -
-/// pad][ox s + dx - pad][c] (0 outside), output pixel p0 + r = (t OH + oy) OW + ox, in16 [T][H][W][C], kt 1 or 3
-/// frames (3: the frames before and after, the 3D VAE's), k x k taps of stride s; C a multiple of 8.  `ldx`: in16's
-/// elements between two pixels where it is wider than C (the first C channels read: RealESRGAN's dense blocks; 0: C),
-/// a multiple of 8.
+/// The image engine's one unfold for its convolutions: col16[r][(dt k k + dy k + dx) C + c] = in16[t + dt dil -
+/// 1][oy s + dy dil - pad][ox s + dx dil - pad][c] (0 outside), output pixel p0 + r = (t OH + oy) OW + ox, in16
+/// [T][H][W][C], kt 1 or 3 frames (3: the frames before and after, the 3D VAE's), k x k taps of stride s spaced
+/// `dil` apart (1: next to one another, a dilated convolution's spacing the line art uses).  Eight channels a work
+/// item where C and `ldx` are both a multiple of 8 (every map the aux nets unfold and the engine's own tensors are),
+/// one value a work item where they are not (a picture's 3-channel patch embedding).  `ldx`: in16's elements between
+/// two pixels where it is wider than C (the first C channels read: RealESRGAN's dense blocks; 0: C).
 void qi_im2col16(const uint16_t* in16, int64_t T, int64_t H, int64_t W, int64_t C, int kt, int k, int s, int pad,
-                 int64_t OH, int64_t OW, int64_t p0, int64_t rows, uint16_t* col16, void* stream, int64_t ldx = 0);
+                 int64_t OH, int64_t OW, int64_t p0, int64_t rows, uint16_t* col16, void* stream, int64_t ldx = 0,
+                 int dil = 1);
 
 /// The image engine's one convolution output: y [T][ldy] (FP32, an im2col product's or a library's) to FP16, + bias
 /// [O] (null: none), the activation, + res [T][O] (FP16, null: none), into dst [T][ld] from channel `off`, and its
@@ -193,19 +196,23 @@ void qi_conv_store16(const float* y, int64_t T, int64_t O, int64_t ldy, const fl
 void qi_up2x16(const float* x, int64_t H, int64_t W, int64_t C, uint16_t* out16, void* stream);
 void qi_up2x16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, uint16_t* out16, void* stream);
 
-/// The image engine's one GroupNorm(32): y16[p][c] = FP16(v), v = (x - mean[g]) * inv[g] * w[c] + b[c] over P
-/// positions of C channels (g = c / (C / 32), the statistics over every position and the group's channels: one
+/// GroupNorm: y16[p][c] = FP16(v), v = (x - mean[g]) * inv[g] * w[c] + b[c] over P
+/// positions of C channels (g = c / (C / groups), the statistics over every position and the group's channels: one
 /// pass of Chan's merges where a pixel's channels fit a work-group, two Kahan-folded passes past that), then
 /// v * (1 + scale[c]) + shift[c] with `scale` (a ResBlock's embedding), then silu;
-/// `lo16`: FP16(v - y16) too.  `ws`: qi_group_norm_ws_floats(P) floats, [0, 32) the means and [32, 64) the inverse
-/// deviations after.
-int64_t qi_group_norm_ws_floats(int64_t P);
+/// `lo16`: FP16(v - y16) too. `ws`: qi_group_norm_ws_floats(P, groups) floats, the means then inverse deviations.
+int64_t qi_group_norm_ws_floats(int64_t P, int64_t groups = 32);
 void qi_group_norm16(const float* x, int64_t P, int64_t C, const float* w, const float* b, float eps, bool silu,
                      uint16_t* y16, float* ws, void* stream, const float* scale = nullptr, const float* shift = nullptr,
-                     uint16_t* lo16 = nullptr);
+                     uint16_t* lo16 = nullptr, int64_t groups = 32);
 /// The same of 16-bit x16 (FP16 bits, BF16's with `bf16`), its statistics in FP32 as the FP32 form's.
 void qi_group_norm16(const uint16_t* x16, bool bf16, int64_t P, int64_t C, const float* w, const float* b, float eps,
-                     bool silu, uint16_t* y16, float* ws, void* stream);
+                     bool silu, uint16_t* y16, float* ws, void* stream, int64_t groups = 32);
+
+/// GroupNorm over [P][C], one input and one or both outputs, optional affine and activation. FP16 may be in-place.
+/// C must be divisible by groups; workspace has qi_group_norm_ws_floats(P, groups) floats.
+void image_group_norm(const float* x, const uint16_t* x16, int64_t P, int64_t C, int64_t groups, const float* w,
+                      const float* b, float eps, ImageAct act, float* y, uint16_t* y16, float* ws, void* stream);
 
 /// p16[r][:ld] = FP16(softmax(scale sc[r][:n])) and zero past n, rows ld apart (0: n), FP32 statistics: a sub-group
 /// of 32 a row up to 1,024 columns (8 rows a work-group), a work-group of 256 a row past them.  The image engine's one
