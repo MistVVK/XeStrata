@@ -422,6 +422,42 @@ std::vector<int32_t> download_i(const Dev& d, size_t n) {
 constexpr double kKqRms = 1.15, kKqWorst = 1.5;
 bool kq_gu(const Pair& p) { return p.gu == GGML_TYPE_Q4_K || p.gu == GGML_TYPE_Q5_K; }
 
+// A build WITHOUT MMQ (mmq::built() false) has no MMQ distance to measure against.  Its rule, for every pair:
+//   (a) the fused path against the int8-rounded model: as above (2e-3 rel RMS, 3e-2 worst row; 5e-3 RMS with STRATA_PF_F16=1);
+//   (b) the int8-rounded model's own distance to FP32 stays under the ceiling of the pair's class (a broken model cannot pass relative to itself);
+//   (c) the fused path's distance to FP32 is at most kOwnRel (RMS) / kOwnRelWorst (worst row) times the model's, plus kOwnAbs.
+// (MMQ and the model are the same distance from FP32 within 1% on every shape; the fused path equals the model to 1.001 x.)  Builds with MMQ keep
+// the rules above and below, unchanged.  The inputs come from the standard library's distributions, so the numbers differ between platforms
+// (libstdc++ on Linux, MSVC on Windows); the ceilings are the larger of the two plus a margin of about 1.5 to 1.75.
+// The model's distance to FP32, rel RMS / worst row, the largest over the shapes of the ctest entries (11-11, P4-SPLIT; RTX PRO 5000 sm_120 and
+// RTX A4000 sm_86 give the same numbers on Linux, RTX 5070 sm_120 on Windows):
+//   i-quant gate/up (base, nt256, f16, q50, q8d entries), Q6_K, Q8_0 / Q8_0:  Linux 1.60e-2 / 2.97e-2, Windows 1.60e-2 / 2.96e-2   -> kCeilDense
+//   Q2_0 / Q2_0, reference part: Linux 1.09e-2 / 4.69e-2, Windows 1.14e-2 / 4.50e-2                                        -> kCeilQ2
+//   Q2_0 / Q2_0, the 96-pair timing sample: Linux 2.71e-2 / 1.09e-1, Windows 2.42e-2 / 2.41e-1                            -> kCeilQ2Sample
+//   Q4_K / Q5_K gate/up (kq entry): Linux 1.49e-2 / 1.70e-1, Windows 3.68e-2 / 2.13e-1 (MMQ itself 3.70e-2 / 2.19e-1)    -> kCeilKq
+//   trellis (tq, tqh entries): Linux 2.20e-2 / 4.02e-2, Windows 2.19e-2 / 4.61e-2                                         -> kCeilTq
+// Against MMQ (kq entry, MMQ build): fused / MMQ at most 1.097 (RMS) and 1.23 (worst row) on Linux, 1.037 and 1.17 on Windows.
+constexpr double kOwnRel = 1.15, kOwnRelWorst = 1.5, kOwnAbs = 1e-3;
+struct Ceiling {
+    double rms, worst;
+};
+constexpr Ceiling kCeilDense{2.5e-2, 5.0e-2}, kCeilQ2{2.0e-2, 8.0e-2}, kCeilQ2Sample{4.5e-2, 3.6e-1}, kCeilKq{6.0e-2, 3.5e-1}, kCeilTq{3.5e-2, 7.5e-2};
+Ceiling model_ceiling(const Pair& p, bool sample) {
+    if (tq_type(p.gu)) return kCeilTq;
+    if (kq_gu(p)) return kCeilKq;
+    if (p.gu == GGML_TYPE_Q2_0 && p.d == GGML_TYPE_Q2_0) return sample ? kCeilQ2Sample : kCeilQ2;
+    return kCeilDense;
+}
+// ev: the int8-rounded model against FP32, ef: the fused path against FP32 (the same rows)
+void own_only_check(const Pair& p, const Err& ev, const Err& ef, bool sample) {
+    const std::string where = sample ? " (timing)" : "";
+    const Ceiling c = model_ceiling(p, sample);
+    if (ev.rms > c.rms || ev.worst > c.worst)
+        throw std::runtime_error(std::string(p.name) + ": the int8-rounded model is further from FP32 than the ceiling of its class (no-MMQ rule)" + where);
+    if (ef.rms > kOwnRel * ev.rms + kOwnAbs || ef.worst > kOwnRelWorst * ev.worst + kOwnAbs)
+        throw std::runtime_error(std::string(p.name) + ": the fused path is further from FP32 than the int8-rounded model (no-MMQ rule)" + where);
+}
+
 // part 1: against the double-precision reference
 void reference_part(const Pair& p, cudaStream_t s, int T = 256, int E = 64, int ZERO = 77) {
     const Geo geo(p);
@@ -541,6 +577,12 @@ void reference_part(const Pair& p, cudaStream_t s, int T = 256, int E = 64, int 
             zmax = std::max(zmax, (double) std::fabs(y_f[(size_t) slot[(size_t) (ZERO * K + k)] * N + o]));
     if (zmax != 0) throw std::runtime_error(std::string(p.name) + ": the all-zero token's outputs are not zero");
     if (!mq) {   // no MMQ here: the int8 activations' own error (the IQ pairs' fused path sits at ~1e-2 rel RMS)
+        if (!mmq::built()) {   // a build without MMQ at all: the rule of kOwnRel (the int8 model's own distance, with a ceiling per class)
+            const Err ev = compare(ref2, pair, ref, pair, (size_t) rows);
+            std::printf("  int8-rounded model vs FP32 reference: rel RMS %.3e  worst row max rel %.3e\n", ev.rms, ev.worst);
+            own_only_check(p, ev, ef, false);
+            return;
+        }
         if (ef.rms > 0.03 || ef.worst > 0.25)
             throw std::runtime_error(std::string(p.name) + ": the fused path's error against the reference is too large");
         return;
@@ -735,6 +777,7 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
         std::vector<float> ref(pick.size() * N), ref2(pick.size() * N), ym(pick.size() * N), yf(pick.size() * N);
         std::vector<uint8_t> hb(geo.bytes);
         std::vector<float> gu, dn, h(FF), xq(N), h2(FF), hq(FF);
+        const bool own_model = !mmq::built() && !tq_type(p.gu);   // (the sample's int8 model reads the plain weights: not the trellis codebook)
         for (size_t j = 0; j < pick.size(); ++j) {
             const size_t i = pick[j];
             const int e = ids[i];
@@ -754,7 +797,7 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
                 for (int f = 0; f < FF; ++f) a += (double) wd[f] * h[(size_t) f];
                 ref[j * N + o] = (float) a;
             }
-            if (kq_gu(p)) {   // the int8-rounded model on the sample (the K-quant rule, see kq_gu)
+            if (kq_gu(p) || own_model) {   // the int8-rounded model on the sample (the K-quant rule, see kq_gu; a build without MMQ: every pair but the trellis ones)
                 quant32(xr, xq.data(), N);
                 for (int f = 0; f < FF; ++f) {
                     double gt = 0, up = 0;
@@ -777,6 +820,14 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
         const Err em = mq ? compare(ym, id, ref, id, pick.size()) : Err{}, ef = compare(yf, id, ref, id, pick.size());
         std::printf("  sample of %zu pairs vs FP32 reference: MMQ rel RMS %.3e worst %.3e, fused rel RMS %.3e worst "
                     "%.3e\n", pick.size(), em.rms, em.worst, ef.rms, ef.worst);
+        if (own_model) {   // a build without MMQ: the rule of kOwnRel on the sample
+            const Err e2 = compare(yf, id, ref2, id, pick.size()), ev = compare(ref2, id, ref, id, pick.size());
+            std::printf("  sample of %zu pairs, fused vs the int8-rounded model: rel RMS %.3e worst %.3e; the model vs FP32: rel RMS %.3e worst %.3e\n",
+                        pick.size(), e2.rms, e2.worst, ev.rms, ev.worst);
+            if (e2.rms > (f16_on() ? 5e-3 : 2e-3) || e2.worst > 3e-2)
+                throw std::runtime_error(std::string(p.name) + ": the fused path differs from its own arithmetic's model (timing)");
+            own_only_check(p, ev, ef, true);
+        } else
         if (kq_gu(p)) {
             const Err e2 = compare(yf, id, ref2, id, pick.size());
             std::printf("  sample of %zu pairs, fused vs the int8-rounded model: rel RMS %.3e worst %.3e\n", pick.size(), e2.rms, e2.worst);
