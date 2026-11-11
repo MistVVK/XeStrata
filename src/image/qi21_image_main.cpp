@@ -4,7 +4,7 @@
 //
 //   strata-image --te <Qwen3-VL text encoder .gguf> --dit <qwen-image-2.1 DiT .gguf> --vae <VAE .safetensors>
 //                --prompt TEXT -o OUT.png [--width 1024] [--height 1024] [--seed 42] [--steps 8]
-//                [--dump DIR] [--report FILE.json] [--threads N]
+//                [--dump DIR] [--report FILE.json] [--threads N] [--plan auto|resident|te-released] [--te-mode auto|resident|streamed]
 //
 // The pipeline, part by part (each a tested piece of its own):
 //   tokens      Qwen2Tok + qwen_image_tokens (src/image/te/qwen2_tok.cpp; ids identical to sd.cpp's)
@@ -19,7 +19,9 @@
 //   24 GB and up   "resident": the text encoder, the DiT and the VAE opened at the start and kept to the end;
 //   under 24 GB    "te-released": the text encoder opened, used and closed before the DiT and the VAE are opened
 //                  (under 14 GiB the text encoder itself streams its layers, its own auto mode).
-// Only the GB10 row is measured so far; discrete cards are owed.
+// --plan resident / te-released forces one plan (a measurement switch for the memory rows of smaller cards on a big
+// one; the pictures do not depend on it); --te-mode the text encoder's own mode (streamed = the under-14-GiB layout).
+// Only the GB10 row and the plans forced on one card are measured so far.
 //
 // Prints one line per stage (open, encode, steps, decode, png): wall time, the stage's own GPU time where a part
 // measures it, the parts' own device memory at the stage's end (each live part's peak so far), the device memory in
@@ -165,15 +167,15 @@ int usage() {
     std::fprintf(stderr,
                  "usage: strata-image --te TE.gguf --dit DIT.gguf --vae VAE.safetensors --prompt TEXT -o OUT.png\n"
                  "                    [--width 1024] [--height 1024] [--seed 42] [--steps 8] [--dump DIR] [--report FILE]\n"
-                 "                    [--threads N]\n");
+                 "                    [--threads N] [--plan auto|resident|te-released] [--te-mode auto|resident|streamed]\n");
     return 2;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string te_path, dit_path, vae_path, prompt, out_png, dump_dir, report_path;
-    int width = 1024, height = 1024, steps = 8, threads = 8;
+    std::string te_path, dit_path, vae_path, prompt, out_png, dump_dir, report_path, plan_arg = "auto";
+    int width = 1024, height = 1024, steps = 8, threads = 8, te_mode = 0;
     uint64_t seed = 42;
     bool have_prompt = false;
     for (int i = 1; i < argc; ++i) {
@@ -192,6 +194,9 @@ int main(int argc, char** argv) {
         else if (a == "--dump" && (v = next())) dump_dir = v;
         else if (a == "--report" && (v = next())) report_path = v;
         else if (a == "--threads" && (v = next())) threads = std::max(1, std::atoi(v));
+        else if (a == "--plan" && (v = next())) plan_arg = v;
+        else if (a == "--te-mode" && (v = next()))
+            te_mode = !std::strcmp(v, "resident") ? 1 : !std::strcmp(v, "streamed") ? 2 : !std::strcmp(v, "auto") ? 0 : -1;
         else return usage();
     }
     if (te_path.empty() || dit_path.empty() || vae_path.empty() || !have_prompt || out_png.empty()) return usage();
@@ -216,10 +221,11 @@ int main(int argc, char** argv) {
     std::vector<Stage> stages;
     MemSampler mem;
     const size_t total = mem.total();
-    const bool resident = total >= (size_t) 24 * 1000 * 1000 * 1000;
+    if ((plan_arg != "auto" && plan_arg != "resident" && plan_arg != "te-released") || te_mode < 0) return usage();
+    const bool resident = plan_arg == "auto" ? total >= (size_t) 24 * 1000 * 1000 * 1000 : plan_arg == "resident";
     const char* plan = resident ? "resident" : "te-released";
-    std::printf("strata-image: %dx%d, seed %llu, %d steps; device memory %.1f GB total -> plan %s\n", width, height,
-                (unsigned long long) seed, steps, total / 1e9, plan);
+    std::printf("strata-image: %dx%d, seed %llu, %d steps; device memory %.1f GB total -> plan %s%s\n", width, height,
+                (unsigned long long) seed, steps, total / 1e9, plan, plan_arg == "auto" ? "" : " (forced by --plan)");
 
     std::string err;
     Qwen3VlTe* te = nullptr;
@@ -264,7 +270,7 @@ int main(int argc, char** argv) {
     auto t_open = clk::now();
     std::unique_ptr<Qwen2Tok> tok = Qwen2Tok::from_gguf(te_path, &err);
     if (!tok) return fail("tokenizer: " + err);
-    te = qwen3vl_te_open(te_path, -1, &err, 0, threads);
+    te = qwen3vl_te_open(te_path, -1, &err, te_mode, threads);
     if (!te) return fail("text encoder: " + err);
     te_live = true;
     open_ms += ms_since(t_open);
