@@ -130,7 +130,7 @@ def switch_params(applicable: list[Any]) -> list[Param]:
     """The rows of the speed switches that apply to this launch (strata_control/speed_switches.py): the environment each one writes outside its default,
     shown as the default ("off" for Faster long prompts, "on" for the others) until the person types the value. The same features as the app's Expert settings."""
     from strata_control import speed_switches as sw
-    return [Param(name=name, kind="env", description=sw.env_words(name), help_default=switch.default, full=sw.env_words(name))
+    return [Param(name=name, kind="env", description=sw.env_words(name), help_default=switch.terminal_default or switch.default, full=sw.env_words(name))
             for switch in applicable for name, _ in switch.env]
 
 

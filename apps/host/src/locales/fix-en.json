@@ -85,5 +85,9 @@
  "fx84": "The file was downloaded. Continue tries the install again.",
  "fx85": "Open Details to see why.",
  "fxec1": "A newer engine is available for this computer. Your models and settings stay as they are.",
- "fxec2": "Unload your running models first."
+ "fxec2": "Unload your running models first.",
+ "fxpr1": "Picture reader",
+ "fxpr2": "Strata's own (recommended)",
+ "fxpr3": "llama.cpp's",
+ "fxpr4": "Which program turns pictures into something the model can read. Strata's own is faster on most computers and reads very large pictures correctly; on a few graphics cards where it is still slower, Strata uses llama.cpp's by itself. Choose llama.cpp's if pictures look misread."
 }

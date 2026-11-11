@@ -25,9 +25,11 @@ ENV = {      # what each switch writes outside its default
     "faster_radeon_9000": {"STRATA_PCIE_FRAC_DEFAULT": "old"},
     "deepseek_speedups": {"DS4_DEFAULTS": "026", "DS4_FAST_ATTN": "0", "DS4_ATTN_SLAB": "0", "DS4_COPY_PIN": "0", "DS4_COPY_HUGETLB": "0",
                           "DS4_STORE_SPARE": "0", "DS4_STORE_PUT": "0"},
+    "picture_reader": {"STRATA_VISION_TOWER": "mtmd"},       # llama.cpp's picture reader instead of Strata's own (owner 11-11)
     "qwen_defaults_026": {"STRATA_DEFAULTS": "026"},         # the Terminal's troubleshooting switch: not in the app
 }
-DEFAULT = {"faster_long_prompts": "off", "faster_12gb_nvidia": "off", "faster_radeon_9000": "on", "deepseek_speedups": "on", "qwen_defaults_026": "off"}
+DEFAULT = {"faster_long_prompts": "off", "faster_12gb_nvidia": "off", "faster_radeon_9000": "on", "deepseek_speedups": "on", "picture_reader": "on",
+           "qwen_defaults_026": "off"}
 SIX = ("DS4_FAST_ATTN", "DS4_ATTN_SLAB", "DS4_COPY_PIN", "DS4_COPY_HUGETLB", "DS4_STORE_SPARE", "DS4_STORE_PUT")
 RTX3060 = {"name": "NVIDIA GeForce RTX 3060", "vendor": "nvidia", "arch": "86", "vram_gb": 12.0}
 RTX4070S = {"name": "NVIDIA GeForce RTX 4070 SUPER", "vendor": "nvidia", "arch": "89", "vram_gb": 12.0}
@@ -56,7 +58,9 @@ class Contract(unittest.TestCase):
 
     def test_an_effect_text_says_what_the_feature_does_in_plain_words(self):
         for s in W.SWITCHES:
-            if not s.terminal_only:
+            if s.words:                                       # a choice between two named options: the text names the other one
+                self.assertIn("Choose " + dict(s.words)["off"], s.effect, s.id)
+            elif not s.terminal_only:
                 self.assertRegex(s.effect, r"Off by default" if s.default == "off" else r"[Tt]urn off", s.id)
             self.assertNotRegex(s.effect, r"STRATA_|DS4_|--|env", s.id)
         self.assertEqual(W.SWITCHES[0].effect, "Reads very long prompts faster by approximating part of the work. Off by default: answers about long documents can miss or mix up details.")
@@ -239,11 +243,49 @@ class Terminal(unittest.TestCase):
         self.assertEqual({W.env_names()[n].id for n in ENV["deepseek_speedups"]}, {"deepseek_speedups"})
 
 
+class PictureReader(unittest.TestCase):
+    """The picture reader (owner 11-11: "Our tower, the other selectable"): Strata's own by default, llama.cpp's chosen in the settings.  The choice is the run
+    config's env entry STRATA_VISION_TOWER=mtmd, which the server hands to strata-vision (an older reader ignores it); a default file carries nothing."""
+    PICS = {**QWEN, "vision": {"exe": "strata-vision", "mmproj": "mm.gguf", "model": "m.gguf", "gpu": True}}
+
+    def test_it_is_offered_for_every_qwen_model_that_reads_pictures_and_only_there(self):
+        for backend, gpus in (("cuda", [RTX]), ("hip", [R9700]), ("hip", [STRIX]), ("sycl", []), ("metal", []), ("cpu", []), (None, [])):
+            self.assertIn("picture_reader", ids({**self.PICS, "backend": backend}, gpus), backend)
+        self.assertIn("picture_reader", ids({**QWEN36, "vision": self.PICS["vision"]}, [RTX]), "Qwen3.6 reads pictures with the same reader")
+        self.assertNotIn("picture_reader", ids(QWEN, [RTX]), "pictures off: no reader to choose")
+        self.assertNotIn("picture_reader", ids({**DEEPSEEK, "vision": self.PICS["vision"]}, [RTX]), "DeepSeek reads pictures inside its own engine")
+
+    def test_the_app_shows_it_in_image_reading_with_two_named_options(self):
+        sw = W.BY_ID["picture_reader"]
+        self.assertEqual((sw.label, sw.group, sw.default, dict(sw.words)), ("Picture reader", "Image reading", "on",
+                                                                            {"on": "Strata's own (recommended)", "off": "llama.cpp's"}))
+        self.assertTrue(all(s.group == "Speed" for s in W.SWITCHES if s.id != "picture_reader"))
+        self.assertLess(len(sw.effect), 300)   # the owner's approved help line (11-11) is 275 characters; the other switches keep 260
+
+    def test_llama_cpps_reader_writes_one_entry_and_the_default_writes_none(self):
+        self.assertEqual(W.set_switch({"PATH": "/bin"}, "picture_reader", False), {"PATH": "/bin", "STRATA_VISION_TOWER": "mtmd"})
+        self.assertEqual(W.set_switch({"PATH": "/bin", "STRATA_VISION_TOWER": "mtmd"}, "picture_reader", True), {"PATH": "/bin"})
+        self.assertTrue(W.is_on({}, "picture_reader"))
+        self.assertFalse(W.is_on({"STRATA_VISION_TOWER": "mtmd"}, "picture_reader"))
+        cfg = derive_config(self.PICS, S.LaunchSettings(extra=S.settings_from_pairs(["STRATA_VISION_TOWER=mtmd"])), bool_flags=frozenset())
+        self.assertEqual(cfg["env"], {**QWEN["env"], "STRATA_VISION_TOWER": "mtmd"})
+        back = derive_config(cfg, S.LaunchSettings(extra=S.settings_from_pairs(["STRATA_VISION_TOWER=off"])), bool_flags=frozenset())
+        self.assertEqual(back["env"], QWEN["env"], "off puts the default back")
+        self.assertEqual(derive_config(self.PICS, S.LaunchSettings(), bool_flags=frozenset())["env"], QWEN["env"], "a default launch carries nothing")
+
+    def test_the_terminal_row_names_both_readers_and_its_default(self):
+        rows = P.build_rows(None, self.PICS["args"], None, self.PICS["env"], None, {}, P.switch_params(W.applicable(self.PICS, [RTX])))
+        row = next(r for r in rows if r.name == "STRATA_VISION_TOWER")
+        self.assertEqual((row.default, row.yours, row.known), ("auto", "", True))
+        self.assertIn("Picture reader (Strata's own by default; set mtmd to use llama.cpp's).", row.description)
+        self.assertIn("Choose llama.cpp's if pictures look misread.", row.description)
+
+
 class SameAsTheApp(unittest.TestCase):
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_the_apps_table_has_the_same_names_and_words(self):
         script = ("import {SPEED_SWITCHES} from './apps/host/server/native-settings.mjs';"
-                  "console.log(JSON.stringify(SPEED_SWITCHES.map(s=>({id:s.id,label:s.label,hint:s.hint,default:s.default,env:s.env,legacy:s.legacy??{}}))))")
+                  "console.log(JSON.stringify(SPEED_SWITCHES.map(s=>({id:s.id,label:s.label,hint:s.hint,default:s.default,env:s.env,legacy:s.legacy??{},group:s.group,words:s.words??{}}))))")
         out = subprocess.run(["node", "--input-type=module", "-e", script], cwd=ROOT, capture_output=True, text=True, timeout=60, check=True).stdout
         app = json.loads(out)
         self.assertEqual([a["id"] for a in app], [s.id for s in W.app_switches()], "the Terminal-only switch is not in the app's table")
@@ -253,6 +295,8 @@ class SameAsTheApp(unittest.TestCase):
             self.assertEqual(a["env"], dict(s.env), s.id)
             self.assertEqual(a["default"], s.default, s.id)
             self.assertEqual(a["legacy"], dict(s.legacy), s.id)
+            self.assertEqual(a["group"], s.group, s.id)
+            self.assertEqual(a["words"], dict(s.words), s.id)
 
 
 if __name__ == "__main__":

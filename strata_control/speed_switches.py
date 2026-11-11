@@ -32,6 +32,9 @@ class Switch:
     default: str = "on"           # "on" | "off": what a launch without the entries does
     legacy: tuple[tuple[str, str], ...] = ()    # entries an earlier 0.2.7 test build wrote for the same state: they read as the switch being set, and are removed with it
     terminal_only: bool = False   # shown in the Terminal's Advanced table only, never in the app
+    group: str = "Speed"          # the app's group of Expert settings the row is shown in
+    words: tuple[tuple[str, str], ...] = ()   # ("on", ...), ("off", ...): the app's two option names instead of On / Off (the default one says "(recommended)")
+    terminal_default: str = ""    # the Terminal's Default cell for the row, when "on" / "off" would not say it
 
 
 SWITCHES: tuple[Switch, ...] = (
@@ -53,6 +56,15 @@ SWITCHES: tuple[Switch, ...] = (
             ("DS4_STORE_SPARE", "0"), ("DS4_STORE_PUT", "0")), "deepseek",
            legacy=(("DS4_FAST_ATTN", "0"), ("DS4_ATTN_SLAB", "0"), ("DS4_COPY_PIN", "0"), ("DS4_COPY_HUGETLB", "0"),
                    ("DS4_STORE_SPARE", "0"), ("DS4_STORE_PUT", "0"))),
+    # The picture reader (owner 11-11: "Our tower, the other selectable"): Strata's own by default (strata-vision's `auto`: ours where it was measured no slower
+    # and correct, llama.cpp's by itself where it was measured slower or does not start); STRATA_VISION_TOWER=mtmd picks llama.cpp's mtmd reader.  The server
+    # hands the run config's env to the reader, and an older strata-vision ignores the name.  Label, options and help line approved by the owner 11-11 morning
+    # (par/OWNER-WORDING-1111.md); the Terminal row's frame (env_words) is still [DRAFT].
+    Switch("picture_reader", "Picture reader",
+           "Which program turns pictures into something the model can read. Strata's own is faster on most computers and reads very large pictures correctly; "
+           "on a few graphics cards where it is still slower, Strata uses llama.cpp's by itself. Choose llama.cpp's if pictures look misread.",
+           (("STRATA_VISION_TOWER", "mtmd"),), "qwen-pictures", group="Image reading",
+           words=(("on", "Strata's own (recommended)"), ("off", "llama.cpp's")), terminal_default="auto"),
     # Troubleshooting only, in the Terminal's Advanced table and nowhere else: every Qwen 0.2.7 default back to its 0.2.6 behaviour.
     Switch("qwen_defaults_026", "Qwen: 0.2.6 behaviour",
            "Starts every Qwen speed setting new in 0.2.7 the way 0.2.6 did, for troubleshooting. Use it if something that worked before no longer does.",
@@ -104,6 +116,9 @@ def applies(switch: Switch | str, cfg: Mapping[str, Any] | None, gpus: Iterable[
         return False
     if sw.only == "qwen-any":
         return True
+    if sw.only == "qwen-pictures":
+        # a Qwen run config that reads pictures (its "vision" section starts strata-vision); DeepSeek reads them inside its own engine
+        return bool((cfg or {}).get("vision"))
     backend = (cfg or {}).get("backend") or backend
     if sw.only == "qwen-gpu":
         # KVA was measured on the Qwen3.8-Flash-Next shape (48 layers, 512 experts); the engine declines any other.  Setup writes "arch" only for the
@@ -167,6 +182,10 @@ def env_words(name: str) -> str:
     sw = env_names()[name]
     value = dict(sw.env)[name]
     together = f"; all {len(sw.env)} speed-up rows go together" if len(sw.env) > 1 else ""
+    if sw.words:
+        names = {state: word.replace(" (recommended)", "") for state, word in sw.words}
+        other = "off" if sw.default == "on" else "on"
+        return f"{sw.label} ({names[sw.default]} by default; set {value} to use {names[other]}). {sw.effect}"   # [DRAFT] frame, not yet seen by the owner
     if sw.default == "off":
         return f"{sw.label} (off by default; set {value} to turn on{together}). {sw.effect}"
     return f"{sw.label} (on by default; set {value} to turn off{together}). {sw.effect}"

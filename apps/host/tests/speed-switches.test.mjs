@@ -16,16 +16,17 @@ const ENV = {      // what each switch writes outside its default
   faster_12gb_nvidia: { STRATA_ROUTE_PRIOR: '1.5' },
   faster_radeon_9000: { STRATA_PCIE_FRAC_DEFAULT: 'old' },
   deepseek_speedups: { DS4_DEFAULTS: '026', DS4_FAST_ATTN: '0', DS4_ATTN_SLAB: '0', DS4_COPY_PIN: '0', DS4_COPY_HUGETLB: '0', DS4_STORE_SPARE: '0', DS4_STORE_PUT: '0' },
+  picture_reader: { STRATA_VISION_TOWER: 'mtmd' },
 };
 const SIX = ['DS4_FAST_ATTN', 'DS4_ATTN_SLAB', 'DS4_COPY_PIN', 'DS4_COPY_HUGETLB', 'DS4_STORE_SPARE', 'DS4_STORE_PUT'];
-const DEFAULT = { faster_long_prompts: 'off', faster_12gb_nvidia: 'off', faster_radeon_9000: 'on', deepseek_speedups: 'on' };
+const DEFAULT = { faster_long_prompts: 'off', faster_12gb_nvidia: 'off', faster_radeon_9000: 'on', deepseek_speedups: 'on', picture_reader: 'on' };
 const RTX3060 = { index: 0, name: 'NVIDIA GeForce RTX 3060', vendor: 'nvidia', arch: '86', vram_gb: 12 };
 const R9700 = { index: 0, name: 'AMD Radeon AI PRO R9700', vendor: 'amd', arch: 'gfx1201', vram_gb: 32 };
 const RX7900 = { index: 0, name: 'AMD Radeon RX 7900 XTX', vendor: 'amd', arch: 'gfx1100', vram_gb: 24 };
 const RTX = { index: 0, name: 'NVIDIA GeForce RTX 4090', vendor: 'nvidia', arch: '89', vram_gb: 24 };
 const STRIX = { index: 0, name: 'AMD Radeon 8060S', vendor: 'amd', arch: 'gfx1151', vram_gb: 96, uma: true };
 
-test('there are exactly four switches in the app (the Terminal has one more); each writes the engine names of the contract and has its default (KVA and the 12 GB routing off, the other two on)', () => {
+test('there are exactly five switches in the app, the picture reader among them (the Terminal has one more); each writes the engine names of the contract and has its default (KVA and the 12 GB routing off, the other two on)', () => {
   assert.deepEqual(SPEED_SWITCHES.map(s => s.id), Object.keys(ENV));
   for (const sw of SPEED_SWITCHES) {
     assert.deepEqual(sw.env, ENV[sw.id], sw.id);
@@ -156,6 +157,20 @@ test('Faster long prompts is for Qwen3.8-Flash-Next only: no row for Qwen3.6-35B
   assert.equal(speedSwitchApplies('faster_long_prompts', { backend: 'cuda', gpus: [RTX], arch: 'qwen35moe' }), false);
 });
 
+test('the picture reader: offered for a Qwen model that reads pictures, in the Image reading group, with Strata\'s own and llama.cpp\'s as the two options', () => {
+  const ids = context => speedSwitchRows({}, context).map(r => r.id);
+  for (const backend of ['cuda', 'hip', 'sycl', 'metal', 'cpu', null]) assert.ok(ids({ backend, gpus: [R9700], vision: true }).includes('picture_reader'), `${backend}`);
+  assert.ok(!ids({ backend: 'cuda', gpus: [RTX] }).includes('picture_reader'), 'pictures off');
+  assert.ok(!ids({ deepseek: true, backend: 'cuda', gpus: [RTX], vision: true }).includes('picture_reader'), 'DeepSeek reads pictures in its own engine');
+  const sw = SPEED_SWITCHES.find(s => s.id === 'picture_reader');
+  assert.deepEqual([sw.group, sw.default, sw.words], ['Image reading', 'on', { on: 'Strata\'s own (recommended)', off: 'llama.cpp\'s' }]);
+  assert.deepEqual(setSpeedSwitch({ PATH: '/bin' }, 'picture_reader', false), { PATH: '/bin', STRATA_VISION_TOWER: 'mtmd' });
+  assert.deepEqual(setSpeedSwitch({ PATH: '/bin', STRATA_VISION_TOWER: 'mtmd' }, 'picture_reader', true), { PATH: '/bin' });
+  const screen = read('../src/components/NativeSettings.tsx');
+  assert.match(screen, /options=\{sw\.words \? \[\{ value: sw\.default, label: sw\.words\[sw\.default\] \}/, 'the two option names, the default first');
+  assert.match(screen, /\{tr\(switchRows\.filter\(sw => switchGroup\(sw\) === group\)\.map\(switchRow\)\)\}<\/section>/, 'a switch of a field group is shown in that group');
+});
+
 test('the environment names round-trip through the validator, the public view and the restore, and other names stay untouched', () => {
   const all = Object.assign({}, ...Object.values(ENV));
   assert.deepEqual(validateNativeSettings({ env: all }), { env: all });
@@ -253,7 +268,7 @@ test('the Expert settings show the rows in the existing row layout with an On / 
   assert.match(screen, /if \(write\) env\[name\] = value; else delete env\[name\];/, 'the default removes the entries');
   const languages = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr'];
   const catalog = lang => JSON.parse(read(`../src/locales/fix-${lang}.json`));
-  const words = [...SPEED_SWITCHES.flatMap(s => [s.label, s.hint]), 'On (recommended)', 'Off (recommended)'];
+  const words = [...SPEED_SWITCHES.flatMap(s => [s.label, s.hint, ...Object.values(s.words ?? {})]), 'On (recommended)', 'Off (recommended)'];
   const english = Object.values(catalog('en'));
   for (const word of words) assert.ok(english.includes(word), `English catalog: ${word}`);
   for (const lang of languages.slice(1)) {
@@ -270,8 +285,8 @@ test('the Expert settings show the rows in the existing row layout with an On / 
 
 test('the effect texts say what the feature does and what the other choice costs, in plain words', () => {
   for (const sw of SPEED_SWITCHES) {
-    assert.ok(sw.default === 'off' ? /Off by default/.test(sw.hint) : /[Tt]urn off/.test(sw.hint), sw.id);
-    assert.ok(sw.hint.length < 260, sw.id);
+    assert.ok(sw.words ? sw.hint.includes(`Choose ${sw.words.off}`) : sw.default === 'off' ? /Off by default/.test(sw.hint) : /[Tt]urn off/.test(sw.hint), sw.id);
+    assert.ok(sw.hint.length < (sw.id === 'picture_reader' ? 300 : 260), sw.id);   // the picture reader: the owner's approved help line (11-11), 275 characters
     assert.ok(!/STRATA_|DS4_|env|--/.test(sw.hint), 'no flags or variable names for a non-technical reader');
   }
   assert.equal(SPEED_SWITCHES[0].hint, 'Reads very long prompts faster by approximating part of the work. Off by default: answers about long documents can miss or mix up details.');
