@@ -467,6 +467,11 @@ void Sam3::neck(const std::vector<Fpn>& set, float* const lv[3]) {
     }
 }
 
+void Sam3::drop_scratch() {
+    AuxNet::drop_scratch();
+    text_ids_.clear();
+}
+
 void Sam3::text(const std::vector<int32_t>& ids) {
     if (ids == text_ids_) return;   // the same words as the last call's: their states are still there (a clip's)
     const auto hit = text_cache_.find(ids);

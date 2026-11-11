@@ -38,7 +38,7 @@ public:
     uint64_t file_bytes() const { return file_bytes_; }
     bool loaded() const { return loaded_; }
     /// Frees the scratch (the weights stay).
-    void drop_scratch();
+    virtual void drop_scratch();
     /// Waits for the work queued on its stream (what a caller reads of its results is there after).
     void sync();
     /// Frees everything on the GPU (the next run loads the weights again).

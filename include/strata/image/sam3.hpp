@@ -53,6 +53,9 @@ class Sam3 : public AuxNet {
 public:
     explicit Sam3(const std::string& path);
 
+    /// The last words live in scratch; keep the host cache but invalidate the GPU shortcut.
+    void drop_scratch() override;
+
     struct Times {
         double vision = 0, text = 0, detect = 0, masks = 0;
     };
