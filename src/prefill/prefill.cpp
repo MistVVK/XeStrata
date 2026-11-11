@@ -114,8 +114,9 @@ bool ple_batch_enabled() {
 #include <utility>
 #include <vector>
 
-#ifndef STRATA_PREFILL_MMQ
-// A build without the llama.cpp sources (no STRATA_NATIVE_EXPERTS): no MMQ, the FP16 expert path everywhere.
+#if !defined(STRATA_PREFILL_MMQ) && !defined(STRATA_PREFILL_FUSED)
+// A build without the llama.cpp sources (no STRATA_NATIVE_EXPERTS): no MMQ, the FP16 expert path everywhere.  (P4-SPLIT: a build with
+// Strata's own prompt kernels but no MMQ, -DSTRATA_MMQ=OFF, has the real helpers and src/prefill/mmq_absent.cpp instead.)
 #include "strata/core/geometry.hpp"
 
 namespace strata::prefill::mmq {

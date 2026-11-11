@@ -838,7 +838,7 @@ int main(int argc, char** argv) {
                 return 77;
             }
         }
-        if (!mmq::built()) { std::printf("no MMQ in this build\n"); return 1; }
+        if (!mmq::built()) std::printf("no MMQ in this build: the fused path against the references alone\n");
         const std::vector<Pair> pairs = {
             {GGML_TYPE_IQ2_S, GGML_TYPE_Q2_0, "IQ2_S / Q2_0"},       {GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_0, "IQ2_XXS / Q2_0"},
             {GGML_TYPE_IQ2_XS, GGML_TYPE_IQ4_NL, "IQ2_XS / IQ4_NL"}, {GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, "IQ3_XXS / IQ4_NL"},

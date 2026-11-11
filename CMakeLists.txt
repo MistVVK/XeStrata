@@ -103,6 +103,11 @@ if(STRATA_HIP_GFX906)
 endif()
 option(STRATA_ENABLE_HIP "Build the HIP targets for wave32 AMD GPUs (gfx1100, gfx1201; gfx1012/gfx1030 unvalidated)" OFF)
 option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP" OFF)
+# P4-SPLIT: llama.cpp's MMQ prompt kernels (strata_mmq, strata_mmq_w4a4, strata_kq) are built on CUDA, and on HIP with STRATA_PREFILL_MMQ=ON
+# (what setup builds); -DSTRATA_MMQ=OFF leaves them out of either.  Strata's own prompt kernels (strata_pf_own: the fused experts and their
+# helpers) are built either way; without MMQ the prompt path takes them where they cover a layer and the FP16 path elsewhere.  A name of its own
+# rather than STRATA_PREFILL_MMQ for CUDA: every CUDA build folder configured before has STRATA_PREFILL_MMQ=OFF in its cache.
+option(STRATA_MMQ "Build llama.cpp's MMQ prompt kernels (CUDA; HIP together with STRATA_PREFILL_MMQ)" ON)
 # The community-made AMD changes (include/strata/core/amd_community.hpp): on by default.  This option is the build half of the one
 # switch STRATA_AMD_COMMUNITY_TUNING: OFF compiles the portable signed-byte dot for gfx1010 again (the SDWA sequence of #4855).
 # The rocBLAS tables are switched at run time (STRATA_AMD_COMMUNITY_TUNING=0).
@@ -452,10 +457,19 @@ if(STRATA_NATIVE_EXPERTS)
   if(STRATA_ORCA_Q4KS_MMQ)
     list(APPEND _strata_mmq_types q5_0)
   endif()
-  if(STRATA_ENABLE_CUDA)
+  if(STRATA_ENABLE_CUDA AND STRATA_MMQ)
     strata_cuda_mmq()
-  elseif(STRATA_PREFILL_MMQ)
+  elseif(STRATA_ENABLE_CUDA)
+    strata_cuda_pf_own()   # P4-SPLIT: no MMQ, Strata's own prompt kernels only
+  elseif(STRATA_PREFILL_MMQ AND STRATA_MMQ)
     strata_hip_mmq()
+  elseif(STRATA_ENABLE_HIP)
+    strata_hip_pf_own()
+  endif()
+  if(STRATA_ENABLE_CUDA)
+    strata_cuda_prompt_tests()
+  elseif(STRATA_ENABLE_HIP)
+    strata_hip_prompt_tests()
   endif()
   if(STRATA_ENABLE_HIP)
     # Optional real-model diagnostic: pass the GGUF shard containing the native PLE key.
