@@ -6,6 +6,9 @@
 // ORACLE NOTE (own-stack plan): this is the one file of the split engine that still includes ggml-cuda (vecdotq.cuh, as the reference). When the
 // vendored ggml tree is removed, this test goes with it: by then qdot.cuh has been proved equal on CUDA and HIP and the engine's identity runs
 // guard it (the proposal in phaseA-tests/par/RESULTS-OWN-4S.md; frozen reference vectors are the alternative if the coordinator wants a test left).
+// That alternative is taken: split_qdot_test --write-golden <file> writes the digests of qdot_golden.cuh's inputs (only when every dot equals ggml's),
+// --regen-golden <file> checks the stored file comes out byte for byte again, and split_qdot_golden (qdot_golden.cu, no ggml) checks qdot.cuh against
+// the file: that test stays when this one goes.
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
@@ -32,6 +35,7 @@
 #endif
 
 #include "qdot.cuh"
+#include "qdot_golden.cuh"
 
 namespace {
 
@@ -122,9 +126,83 @@ bool run(const char* name, int B, std::vector<int> h16, int nblocks, unsigned se
     return ok;
 }
 
+// --write-golden / --regen-golden: ggml's dots on qdot_golden.cuh's inputs, in its order (the oracle side of the stored digests)
+template <GgmlType T> __global__ void k_ggml(const char* w, const block_q8_1* y, int nblocks, float* out) {
+    constexpr int qk = qtraits<T>::qk, per = qtraits<T>::qi / Pair<T>::vdr;
+    const int e = blockIdx.x * blockDim.x + threadIdx.x;
+    if (e >= nblocks * per) return;
+    const int kbx = e / per, iqs = Pair<T>::vdr * (e % per);
+    out[e] = Pair<T>::ggml(w, y + (size_t) kbx * (qk / QK8_1), kbx, iqs);
+}
+struct Writer {
+    std::string text;
+    int differ = 0, lines = 0;
+    template <GgmlType T> bool operator()(const fnx_golden::Format& f, const fnx_golden::Inputs& in) {
+        static_assert(Pair<T>::vdr == fnx_golden::Dot<T>::vdr, "the same VDR on both sides");
+        const std::vector<float> ours = fnx_golden::run_ours<T>(in, f.nblocks);
+        std::vector<float> ref(ours.size());
+        char* dw = nullptr;
+        block_q8_1* dy = nullptr;
+        float* dout = nullptr;
+        bool ok = !ours.empty() && cudaMalloc(&dw, in.w.size()) == cudaSuccess &&
+                  cudaMalloc(&dy, in.y.size() * sizeof(block_q8_1)) == cudaSuccess && cudaMalloc(&dout, ref.size() * 4) == cudaSuccess;
+        if (ok) {
+            cudaMemcpy(dw, in.w.data(), in.w.size(), cudaMemcpyHostToDevice);
+            cudaMemcpy(dy, in.y.data(), in.y.size() * sizeof(block_q8_1), cudaMemcpyHostToDevice);
+            k_ggml<T><<<((int) ref.size() + 255) / 256, 256>>>(dw, dy, f.nblocks, dout);
+            ok = cudaDeviceSynchronize() == cudaSuccess && cudaMemcpy(ref.data(), dout, ref.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+        }
+        cudaFree(dw); cudaFree(dy); cudaFree(dout);
+        if (!ok) { std::printf("%-8s cuda error\n", f.name); ++differ; return false; }
+        int bad = 0;
+        for (size_t i = 0; i < ours.size(); ++i) bad += std::memcmp(&ours[i], &ref[i], 4) != 0;
+        differ += bad;
+        const std::vector<fnx_golden::Line> g = fnx_golden::group_lines("cuda", f.name, in, ours);
+        for (const fnx_golden::Line& l : g) text += fnx_golden::line_text(l) + "\n";
+        lines += (int) g.size();
+        std::printf("%-8s %7zu dots against ggml: %d differ, %zu groups\n", f.name, ours.size(), bad, g.size());
+        return bad == 0;
+    }
+};
+int golden(const char* mode, const char* path) {
+    Writer wr;
+    wr.text = fnx_golden::kHeader;
+    const bool same = fnx_golden::for_each_format(wr);
+    if (!same || wr.differ) { std::printf("qdot.cuh differs from ggml on %d dots: nothing written\n", wr.differ); return 1; }
+    if (std::strcmp(mode, "--write-golden") == 0) {
+        FILE* f = std::fopen(path, "wb");
+        if (!f || std::fwrite(wr.text.data(), 1, wr.text.size(), f) != wr.text.size()) { std::printf("cannot write %s\n", path); return 1; }
+        std::fclose(f);
+        std::printf("wrote %s: %d groups, %zu bytes\n", path, wr.lines, wr.text.size());
+        return 0;
+    }
+    // --regen-golden: the cuda lines and the header must come out byte for byte as stored (lines of other families are kept as they are)
+    std::string stored;
+    if (FILE* f = std::fopen(path, "rb")) {
+        char b[4096];
+        size_t k;
+        while ((k = std::fread(b, 1, sizeof b, f)) > 0) stored.append(b, k);
+        std::fclose(f);
+    } else { std::printf("cannot read %s\n", path); return 1; }
+    std::string kept;   // the stored text without other families' lines
+    for (size_t p = 0; p < stored.size();) {
+        size_t e = stored.find('\n', p);
+        e = e == std::string::npos ? stored.size() : e + 1;
+        const std::string ln = stored.substr(p, e - p);
+        if (ln.rfind("hip ", 0) != 0) kept += ln;
+        p = e;
+    }
+    const bool eq = kept == wr.text;
+    std::printf("regenerated %d groups, %zu bytes: %s the stored file (%zu bytes without other families' lines)\n", wr.lines, wr.text.size(),
+                eq ? "byte for byte equal to" : "DIFFERENT FROM", kept.size());
+    return eq ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
+    // split_qdot_test --write-golden <file> | --regen-golden <file>: the digests of qdot_golden.cuh (see there); otherwise the comparison below
+    if (argc > 2 && (std::strcmp(argv[1], "--write-golden") == 0 || std::strcmp(argv[1], "--regen-golden") == 0)) return golden(argv[1], argv[2]);
     const int n = argc > 1 ? std::atoi(argv[1]) : 1 << 18;
     bool ok = true;
     ok &= run<T_Q4_0>("Q4_0", sizeof(block_q4_0), {0}, n * 8, 1, VDR_Q4_0);
