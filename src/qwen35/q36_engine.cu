@@ -24,6 +24,8 @@
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
 #include "strata/prefill/gemm.hpp"
+#include "strata/prefill/moe_fused.hpp"
+#include "strata/prefill/moe_fused_q36.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/qwen35/engine.hpp"
 #include "strata/qwen35/sampling.hpp"
@@ -64,6 +66,8 @@ namespace {
 
 namespace K = strata::kernels;
 namespace MMQ = strata::prefill::mmq;
+namespace PF = strata::prefill::fused;          // the grouping and the int8 sizes (shape-free)
+namespace FQ = strata::prefill::fused_q36;      // the fused kernels for Qwen3.6's shape (CUDA)
 
 #define CK(x)                                                                                                          \
     do {                                                                                                               \
@@ -1182,6 +1186,14 @@ struct Engine {
     __half* att_p16 = nullptr;         // the probabilities in FP16 (kAttScoreFloats halves)
     __half *k16 = nullptr, *v16 = nullptr, *q16 = nullptr;   // the prompt attention's FP16 operands
     size_t kAttScoreFloats = (size_t) 64 << 20;   // 256 MB (16 M floats when the experts' fit is close)
+    // the prompt's experts on Strata's fused int8 kernels (moe_fused_iq_q36.cu, CUDA): per layer (fused_on), the rest on MMQ
+    // where it has a tile, else the native grouped kernels.  use_pf: every layer's prompt chunks have one of the two, so the
+    // hybrid mode streams each layer's experts for a chunk (the strategy MMQ had alone before)
+    std::vector<char> fused_on;   // by state index (the MTP block last)
+    bool use_pf = false;
+    void* f_scr = nullptr;        // the grouping tables (fused::group_bytes)
+    void *f_xq = nullptr, *f_ha = nullptr;   // the layer's input and H in the kernels' int8 form (fused::act_bytes)
+    int32_t *f_slot = nullptr, *f_src = nullptr;
     // the prompt's MMQ experts
     bool use_mmq = false;
     std::unique_ptr<MMQ::Context> mctx;
@@ -1371,22 +1383,58 @@ struct Engine {
         k16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
         v16 = dalloc_t<__half>((size_t) g.n_head_kv * ctx * g.head_dim);
         q16 = dalloc_t<__half>(T * g.n_head * g.head_dim);
-        use_mmq = MMQ::built() && std::getenv("STRATA_Q36_NO_MMQ") == nullptr;
+        const bool mmq_avail = MMQ::built() && std::getenv("STRATA_Q36_NO_MMQ") == nullptr;
         auto mmq_ok = [&](const Layer& L) {
             return MMQ::supported(L.L.gu_type) && MMQ::supported(L.L.d_type) && MMQ::fits(L.L.gu_type, 2 * g.n_ff) &&
                    MMQ::fits(L.L.d_type, g.n_embd);
         };
-        for (const Layer& L : m->layers) use_mmq = use_mmq && mmq_ok(L);
-        if (m->has_mtp) use_mmq = use_mmq && mmq_ok(m->mtp);
-        if (use_mmq) {
+        const size_t n_state = m->layers.size() + (m->has_mtp ? 1 : 0);
+        fused_on.assign(n_state, 0);
+#if !defined(__HIPCC__)
+        // Strata's fused kernels where they cover the layer's pair on this card (STRATA_PF_FUSED=0: none, as for Flash-Next)
+        if (const char* pf = std::getenv("STRATA_PF_FUSED"); !(pf != nullptr && pf[0] == '0') && g.n_embd == FQ::kQ36Embd &&
+                                                             g.n_ff == FQ::kQ36FF)
+            for (size_t i = 0; i < n_state; ++i) {
+                const Layer& L = layer_at((int) i);
+                fused_on[i] = FQ::native_supported(L.L.gu_type, L.L.d_type) ? 1 : 0;
+            }
+#endif
+        use_pf = true;
+        bool any_mmq = false;
+        size_t n_fused = 0;
+        for (size_t i = 0; i < n_state; ++i) {
+            const bool mq = !fused_on[i] && mmq_avail && mmq_ok(layer_at((int) i));
+            use_pf = use_pf && (fused_on[i] || mq);
+            any_mmq = any_mmq || mq;
+            n_fused += fused_on[i] ? 1 : 0;
+        }
+        if (!use_pf) {   // a layer has neither: every prompt chunk on the native grouped kernels, as before
+            std::fill(fused_on.begin(), fused_on.end(), 0);
+            n_fused = 0;
+            any_mmq = false;
+        }
+        use_mmq = use_pf && any_mmq;
+        if (use_pf) {
             const int64_t ne = (int64_t) T * Kp;
-            mctx = std::make_unique<MMQ::Context>();
             rcnt = dalloc_t<int32_t>((size_t) g.n_expert);
             rcur = dalloc_t<int32_t>((size_t) g.n_expert);
             rbounds = dalloc_t<int32_t>((size_t) g.n_expert + 1);
             rmax = dalloc_t<int32_t>(1);
-            ident = dalloc_t<int32_t>((size_t) ne);
             rinv = dalloc_t<int32_t>((size_t) ne);
+#if !defined(__HIPCC__)
+            if (n_fused > 0) {
+                CK(cudaMalloc(&f_scr, PF::group_bytes(ne, (int) g.n_expert)));
+                CK(cudaMalloc(&f_xq, PF::act_bytes((int64_t) T, g.n_embd)));
+                CK(cudaMalloc(&f_ha, PF::act_bytes(ne, g.n_ff)));
+                f_slot = dalloc_t<int32_t>((size_t) ne);
+                f_src = dalloc_t<int32_t>((size_t) ne);
+            }
+#endif
+        }
+        if (use_mmq) {
+            const int64_t ne = (int64_t) T * Kp;
+            mctx = std::make_unique<MMQ::Context>();
+            ident = dalloc_t<int32_t>((size_t) ne);
             CK(cudaDeviceSynchronize());   // ident's cudaMemset (legacy stream) before the iota on the non-blocking stream
             MMQ::iota(ident, ne, st);
             CK(cudaMalloc(&mq_x, MMQ::q8_bytes(ne, g.n_embd)));
@@ -1394,7 +1442,13 @@ struct Engine {
             mq_gu = dalloc((size_t) ne * 2 * FF);
             mq_h = dalloc((size_t) ne * FF);
         }
-        std::fprintf(stderr, "strata-q36: prompt experts on %s\n", use_mmq ? "MMQ (int8)" : "the native grouped kernels");
+        if (n_fused == n_state)
+            std::fprintf(stderr, "strata-q36: [DRAFT] prompt experts on the fused int8 kernels\n");
+        else if (n_fused > 0)
+            std::fprintf(stderr, "strata-q36: [DRAFT] prompt experts on the fused int8 kernels (%zu of %zu layers), the rest on MMQ (int8)\n",
+                         n_fused, n_state);
+        else
+            std::fprintf(stderr, "strata-q36: prompt experts on %s\n", use_mmq ? "MMQ (int8)" : "the native grouped kernels");
         {
             std::string gerr;
             int64_t big = 0;
@@ -2010,44 +2064,72 @@ struct Engine {
         // the hybrid rows path: a batch of up to hybrid_t rows; when only the MTP block is hybrid, its every batch
         // (its prompt pass too: no staging buffers then)
         const bool hy_rows = lhy(li) && (T <= hybrid_t || !main_hybrid);
-        const bool mmq_rows = !hy_rows && T > kGemmT && use_mmq;
+        const bool mmq_rows = !hy_rows && T > kGemmT && use_pf;
         if (!(!mmq_rows && route_group(L, hy_rows ? hy[li].slot_of_d : nullptr, T, ext ? (int) g.n_expert + 1 : (int) g.n_expert)))
             K::native_router_topk(logits_r, ids, ewts, (int) g.n_expert, Kp, T, st);
         const int64_t n_ent = (int64_t) T * Kp;
         const int32_t* prow = nullptr;
         if (hy_rows) {
             moe_hybrid_gpu(L, li, T);
-        } else if (T > kGemmT && use_mmq) {
-            // a prompt chunk: the experts on llama.cpp's MMQ (int8, the weights read once per expert): the entries
-            // sorted by expert on the device, gate+up as one [2 FF] product per expert, SwiGLU, down into rows the
-            // combine reads through entry -> sorted row
+        } else if (T > kGemmT && use_pf) {
+            // a prompt chunk: each expert's weights read once for all its rows, on Strata's fused int8 kernels where they
+            // cover the layer (fused_on), else on llama.cpp's MMQ.  In the hybrid mode the layer's experts come streamed
+            // (stream_take); the routing counts feed the slots' scores there
             const int ne = (int) g.n_expert;
-            CK(cudaMemsetAsync(rcnt, 0, (size_t) ne * 4, st));
-            k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, rcnt);
-            k_route_scan<<<1, 32, 0, st>>>(rcnt, ne, rbounds, rcur, rmax);
-            k_route_scatter<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, Kp, rcur, ent_dst, ent_tok, rinv);
-            CK(cudaMemcpyAsync(hpin + 10, rmax, 4, cudaMemcpyDeviceToHost, st));
+            const bool fz = fused_on[li] != 0;
+            int64_t maxr = 0;
+            if (!fz || lhy(li)) {
+                CK(cudaMemsetAsync(rcnt, 0, (size_t) ne * 4, st));
+                k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, rcnt);
+            }
+            if (!fz) {
+                // MMQ: the entries sorted by expert on the device, gate+up as one [2 FF] product per expert, SwiGLU, down
+                // into rows the combine reads through entry -> sorted row
+                k_route_scan<<<1, 32, 0, st>>>(rcnt, ne, rbounds, rcur, rmax);
+                k_route_scatter<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, Kp, rcur, ent_dst, ent_tok, rinv);
+                CK(cudaMemcpyAsync(hpin + 10, rmax, 4, cudaMemcpyDeviceToHost, st));
+            }
             if (lhy(li)) CK(cudaMemcpyAsync(h_cnt + li * g.n_expert, rcnt, (size_t) ne * 4, cudaMemcpyDeviceToHost, st));
-            CK(cudaStreamSynchronize(st));
-            if (lhy(li))
-                for (int x = 0; x < ne; ++x) hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
-            const int64_t maxr = hpin[10];
+            if (!fz || lhy(li)) {
+                CK(cudaStreamSynchronize(st));
+                if (lhy(li))
+                    for (int x = 0; x < ne; ++x) hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
+                maxr = hpin[10];
+            }
             const uint8_t* wbase = lhy(li) ? stream_take((int) li) : L.blobs;
-            MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_ent, st);
-            MMQ::Product gu;
-            gu.w = wbase; gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = L.stride;
-            gu.n = ne; gu.xq = mq_x; gu.bounds = rbounds; gu.ids = ident; gu.total_rows = n_ent; gu.max_rows = maxr;
-            gu.dst = mq_gu; gu.ld_dst = 2 * FF;
-            mctx->run(gu, st);
-            MMQ::swiglu(mq_gu, mq_h, n_ent, FF, false, st);
-            MMQ::quantize(mq_h, nullptr, mq_hq, L.L.d_type, FF, FF, n_ent, st);
-            MMQ::Product dn;
-            dn.w = wbase + L.L.down_off; dn.type = L.L.d_type; dn.w_rows = N; dn.w_cols = FF;
-            dn.expert_bytes = L.stride; dn.n = ne; dn.xq = mq_hq; dn.bounds = rbounds; dn.ids = ident;
-            dn.total_rows = n_ent; dn.max_rows = maxr; dn.dst = eparts; dn.ld_dst = N;
-            mctx->run(dn, st);
+            if (fz) {
+#if !defined(__HIPCC__)
+                // the layer's input to int8 once per token, the rows of each expert grouped on the device (no host wait),
+                // then per batch of experts gate/up + SwiGLU + H to int8 + down into the entries' rows (f_slot)
+                FQ::quantize_act_native(h, T, N, f_xq, st);
+                PF::group(ids, n_ent, Kp, ne, f_scr, f_slot, f_src, st);
+                const FQ::NativeGeom ng{L.L.gu_type, L.L.d_type, L.L.gu_row, L.L.d_row, L.L.up_off, L.L.down_off};
+                for (int e = 0; e < ne; e += FQ::kQ36MaxBatch) {
+                    FQ::Batch b;
+                    b.e0 = e;
+                    b.e1 = std::min(ne, e + FQ::kQ36MaxBatch);
+                    for (int x = b.e0; x < b.e1; ++x) b.blob[x - b.e0] = wbase + (size_t) x * L.stride;
+                    FQ::experts_native(b, ng, ne, n_ent, f_scr, f_xq, f_src, f_ha, eparts, st);
+                }
+                prow = f_slot;
+#endif
+            } else {
+                MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_ent, st);
+                MMQ::Product gu;
+                gu.w = wbase; gu.type = L.L.gu_type; gu.w_rows = 2 * FF; gu.w_cols = N; gu.expert_bytes = L.stride;
+                gu.n = ne; gu.xq = mq_x; gu.bounds = rbounds; gu.ids = ident; gu.total_rows = n_ent; gu.max_rows = maxr;
+                gu.dst = mq_gu; gu.ld_dst = 2 * FF;
+                mctx->run(gu, st);
+                MMQ::swiglu(mq_gu, mq_h, n_ent, FF, false, st);
+                MMQ::quantize(mq_h, nullptr, mq_hq, L.L.d_type, FF, FF, n_ent, st);
+                MMQ::Product dn;
+                dn.w = wbase + L.L.down_off; dn.type = L.L.d_type; dn.w_rows = N; dn.w_cols = FF;
+                dn.expert_bytes = L.stride; dn.n = ne; dn.xq = mq_hq; dn.bounds = rbounds; dn.ids = ident;
+                dn.total_rows = n_ent; dn.max_rows = maxr; dn.dst = eparts; dn.ld_dst = N;
+                mctx->run(dn, st);
+                prow = rinv;
+            }
             if (lhy(li)) stream_done();
-            prow = rinv;
         } else {
             group_entries(L, nullptr, T);
             if (!xq_post) quant(h, N, T, xq);   // the experts' and the shared expert's input
@@ -2081,7 +2163,7 @@ struct Engine {
     void forward(int T, int64_t p0, int heads, bool graph_mode, bool verify) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
-        if (main_hybrid && T > hybrid_t && use_mmq) {
+        if (main_hybrid && T > hybrid_t && use_pf) {
             std::vector<int> seq;
             for (size_t l = 0; l < m->layers.size(); ++l)
                 if (lhy(l)) seq.push_back((int) l);
@@ -2137,7 +2219,7 @@ struct Engine {
     void forward_mtp(int T, int64_t p0, const float* seeds, bool draft, bool graph_mode) {
         const auto& g = m->g;
         const int N = (int) g.n_embd;
-        if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_mmq) stream_begin({(int) m->layers.size()});
+        if (main_hybrid && lhy(m->layers.size()) && T > hybrid_t && use_pf) stream_begin({(int) m->layers.size()});
         K::iq_embed_rows(m->embd_type, m->embd, m->embd_row, tok_m, T, N, y, st);
         if (map_on) k_put_rows<<<T, kThreads, 0, st>>>(y, d_img, d_map, N);
         k_rms_ld<<<T, kThreads, 0, st>>>(y, N, m->mtp_enorm, mtp_cat, 2 * N, N, m->eps);              // [e | ...]
@@ -2895,8 +2977,8 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
     if (E.main_hybrid) E.use_graph = false;   // the host takes part in every layer
     E.mtp_graph = false;                      // the MTP block's layer is hybrid either way
     E.hybrid_t = std::max(1, std::min(hybrid_t, E.use_mmq ? E.tmax : E.tmax));
-    if (!E.use_mmq) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
-    const size_t staging = E.use_mmq && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
+    if (!E.use_pf) E.hybrid_t = E.tmax;   // no streamed prompt path: every batch on slots + the pool
+    const size_t staging = E.use_pf && E.main_hybrid ? 2 * (max_layer + kMmqTail) : 0;
     size_t slot_bytes = budget2 > staging ? budget2 - staging : 0;
     if (slot_bytes + staging + ((size_t) 256 << 20) > fr) slot_bytes = fr > staging + ((size_t) 512 << 20) ? fr - staging - ((size_t) 512 << 20) : 0;
     // --expert-slots: that many per layer (tests: the same split with and without the MTP block)
@@ -3797,6 +3879,15 @@ int strata::qwen35::run(int argc, char** argv) {
     if (std::getenv("STRATA_Q8_PACKED") == nullptr) _putenv_s("STRATA_Q8_PACKED", "1");   // as on Linux (it was missing here)
     if (std::getenv("CUDA_MODULE_LOADING") == nullptr) _putenv_s("CUDA_MODULE_LOADING", "EAGER");
 #endif
+    // Strata's fused prompt kernels for this family's formats (moe_fused_iq_q36.cu): the K-quant, Q6_K and Q8_0 gate/up
+    // instances are opt-in for Flash-Next's packs; this engine sets them up by default (=0 keeps a format on MMQ)
+    for (const char* v : {"STRATA_PF_FUSED_KQ", "STRATA_PF_FUSED_Q6K", "STRATA_PF_FUSED_Q8GU"}) {
+#if !defined(_WIN32)
+        setenv(v, "1", 0);
+#else
+        if (std::getenv(v) == nullptr) _putenv_s(v, "1");
+#endif
+    }
     if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "strata-q36: --mtp takes 0 .. 7 drafts\n"); return 2; }
     if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-q36: bad --chunk / --max-context\n"); return 2; }
     Model m;
