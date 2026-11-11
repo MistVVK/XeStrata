@@ -138,7 +138,7 @@ int main(int argc, char** argv) {
     bool own_may_fall_back = false, own_fell_back = false;
     if (tower == "auto") {
         std::string why;
-        tower = !mmproj.empty() && strata_vit::own_reader_supported(mmproj, gpu, max_tokens, why) ? "own" : "mtmd";
+        tower = strata_vit::vision_tower_resolve(tower, !mmproj.empty() && strata_vit::own_reader_supported(mmproj, gpu, max_tokens, why));
         own_may_fall_back = tower == "own" && !model.empty();   // mtmd needs the text model's header
         if (tower == "mtmd" && !why.empty()) std::fprintf(stderr, "strata-vision: llama.cpp's reader (%s)\n", why.c_str());
     }

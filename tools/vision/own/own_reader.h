@@ -4,6 +4,9 @@
 //   The output file is int32 {0x31455653 'SVE1', n_tokens, nx, ny, n_embd} then float32 [n_tokens][n_embd] (row i at x = i % nx, y = i / nx).
 #pragma once
 
+#include "cpu_caps.h"
+#include "vit_geometry.h"
+
 #include <string>
 
 namespace strata_vit {
@@ -32,6 +35,13 @@ bool own_reader_inject_failure(const char* point);
 
 // True when our tower can read this mmproj with this backend; otherwise `why` says what is missing (`--tower auto` falls back to mtmd then).
 bool own_reader_supported(const std::string& mmproj, bool gpu, int max_tokens, std::string& why);      // max_tokens: --max-tokens (0: not given)
+
+// The CPU half of that decision, for a tower of geometry `g` on a CPU whose best kernel tier is `isa`: true for every tier (the no-AVX2 exception is gone), false
+// only when the tower itself uses an operation this code does not have (`why`).
+bool own_cpu_reader_supported(const VitGeometry& g, quant::Isa isa, std::string& why);
+
+// The reader a tower setting gives: "mtmd" and "own" as asked (an explicit setting is never overruled), "auto" gives "own" when `own_ok`, else "mtmd".
+std::string vision_tower_resolve(const std::string& tower, bool own_ok);
 
 // Runs the reader on stdin/stdout; returns the process exit code (0 after QUIT or end of input).
 int own_reader_run(const OwnReaderOptions& o);
