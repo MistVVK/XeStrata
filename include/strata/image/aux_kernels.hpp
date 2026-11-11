@@ -97,19 +97,27 @@ void aux_channel_merge16(const float* yg, int64_t N, int64_t C, int64_t G, uint1
 void aux_channel_split(const float* qkv, int64_t N, int64_t C, int64_t G, float scale, uint16_t* qT16, uint16_t* kT16,
                        uint16_t* v16, void* stream);
 
-/// p16 [rows][cols] = softmax of each row of s.
-void aux_softmax16(const float* s, int64_t rows, int64_t cols, uint16_t* p16, void* stream);
+/// The softmax of attention scores s [batch][heads][rows][cols] times `scale`, with optional additive terms: `bias`
+/// [heads][rows][cols] (every batch's), `mask` [mask_n][rows][cols] (batch b's b % mask_n), and SAM 3's grid box bias
+/// `grid` [rows - skip][2 G][heads] (key y G + x adds its y-th and its G + x-th terms, rows below `skip` none) -> p16,
+/// FP16.  A null term is absent.
+void aux_softmax_attn16(const float* s, int64_t batch, int64_t heads, int64_t rows, int64_t cols, float scale,
+                        const float* bias, const float* mask, int64_t mask_n, const float* grid, int64_t G,
+                        int64_t skip, uint16_t* p16, void* stream);
 /// An attention's heads apart: x [rows][ld] (head h's hd channels at h * hd) -> y [heads][rows][hd], or (transpose)
 /// [heads][hd][rows] (a product's keys' values); FP16.
 void aux_heads16(const uint16_t* x, int64_t rows, int64_t heads, int64_t hd, int64_t ld, bool transpose, uint16_t* y,
                  void* stream);
+/// The batched heads apart: x [batch][rows][ld] (batch stride xbatch) -> y [batch][heads][rows][hd], or (transpose)
+/// [batch][heads][hd][rows]; FP16.
+void aux_heads_batch16(const uint16_t* x, int64_t batch, int64_t rows, int64_t heads, int64_t hd, int64_t ld,
+                       int64_t xbatch, bool transpose, uint16_t* y, void* stream);
 /// The heads' outputs together: o [heads][rows][hd] (FP32) -> y [rows][heads hd] (FP16).
 void aux_heads_merge16(const float* o, int64_t rows, int64_t heads, int64_t hd, uint16_t* y, void* stream);
-/// The softmax of scores s [heads][rows][G G] times `scale`, plus a bias over the grid of keys that is a row's term
-/// plus a column's (rows from `skip` on: grid [rows - skip][2 G][heads], key y G + x its y-th and its G + x-th) -> p16,
-/// FP16.
-void aux_softmax_grid16(const float* s, int64_t heads, int64_t rows, int64_t G, float scale, const float* grid,
-                        int64_t skip, uint16_t* p16, void* stream);
+/// The batched heads' outputs together: o [batch][heads][rows][hd] (FP32) -> y [batch][rows][ld] (head h's hd at
+/// h * hd, batch stride ybatch); FP16.
+void aux_heads_merge_batch16(const float* o, int64_t batch, int64_t rows, int64_t heads, int64_t hd, int64_t ld,
+                             int64_t ybatch, uint16_t* y, void* stream);
 
 /// y [n][C] = tok[ids[i]] * scale + pos[pos_ids[i]] (FP16 tables); tok null: y += pos[pos_ids[i]].
 void aux_embed(const int32_t* ids, const int32_t* pos_ids, const uint16_t* tok, const uint16_t* pos, int64_t n,
@@ -173,7 +181,7 @@ void aux_mask_resize(const float* logits, int64_t K, int64_t h, int64_t w, int64
 /// SAM 3's box relative position bias: for each of Q boxes (xyxy in [0, 1]), the rows' and the columns' distances
 /// to its edges (i / H - y0, i / H - y1; j / W - x0, j / W - x1), times 8, as sign * log2(|d| + 1) / 3, through two
 /// MLPs (2 -> hidden, ReLU, -> heads; `mlp`: the rows' w1 [hidden][2], b1, w2 [heads][hidden], b2, then the
-/// columns'), into tmp [Q][H + W][heads] (the rows' terms, then the columns': aux_softmax_grid16's grid), and, where
+/// columns'), into tmp [Q][H + W][heads] (the rows' terms, then the columns': aux_softmax_attn16's grid), and, where
 /// `bias` is given, summed into bias [heads][Q + 1][H * W] (its row 0, the presence token's, zero).
 void aux_box_bias(const float* boxes, int64_t Q, int64_t H, int64_t W, const float* mlp, int64_t hidden, int64_t heads,
                   float* tmp, float* bias, void* stream);

@@ -1810,6 +1810,20 @@ int refs_cmd(const std::string& dit_file, const std::string& vae_file, const std
             report("  padded rows", a2, b2);
         }
     }
+    // the same run once more, timed: the first run on a shape warms the device's caches and lets the shared
+    // attention pick its kernel by timing it (qi_attention's choice), so the second run is the steady cost to
+    // compare binaries with
+    {
+        std::vector<float> again(out.size());
+        t0 = std::chrono::steady_clock::now();
+        if (!vision.rows(pix.f32.data(), ph, pw, again.data(), err)) {
+            std::fprintf(stderr, "xestrata-image-hunyuanimage3-probe: SigLIP2: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("  SigLIP2 + aligner (again) %.2f s%s\n",
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                    again == out ? "" : ", different output than the first run");
+    }
 
     // --- the engine's own copies of the picture against the golden's (the reference's PIL resize and crop)
     if (!image.empty()) {

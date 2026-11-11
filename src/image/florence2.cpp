@@ -10,6 +10,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/aux_kernels.hpp"
+#include "strata/image/aux_attn.hpp"
 #include "strata/image/img_crop.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/qi_sdpa_ex.hpp"
@@ -327,12 +328,11 @@ void Florence2::vision(const QiRef& image) {
                 aux_channel_split(big, N, C, G, 1.f / std::sqrt((float) N), qT, kT, v16, s_);
             }
             float* sc = scratch(kS, (size_t) (G * Cg * Cg * 4));
-            gemm_.f16_batch(qT, kT, sc, Cg, Cg, N, G, Cg * N, Cg * N, Cg * Cg);
             auto* p16 = reinterpret_cast<uint16_t*>(big);   // big is free again
-            aux_softmax16(sc, G * Cg, Cg, p16, s_);
-            // each group's out [N][Cg] after the last (a library's batch takes no interleaved outputs), merged into
-            // the tokens' rows as they are narrowed
-            gemm_.f16_batch(v16, p16, y, N, Cg, Cg, G, N * Cg, Cg * Cg, N * Cg);
+            // the channels attend to each other over the tokens (v . p^T), the shared matrix-engine attention; the
+            // scale 1/sqrt(N) is folded into q by the split.  Each group's out [N][Cg] merged into the tokens' rows
+            aux_attn_matrix(gemm_, qT, kT, v16, G, 1, Cg, Cg, N, N, Cg, true, 1.f, nullptr, nullptr, 1, nullptr, 0, 0,
+                            sc, p16, y, s_);
             aux_channel_merge16(y, N, C, G, a16, s_);
             product(a16, cb.proj, y, N, 0, false);
             aux_residual_norm16(x, y, cb.proj.b, nullptr, nullptr, H, W, C, 0, 0, kEps, nullptr, s_);

@@ -863,7 +863,7 @@ if(STRATA_ENABLE_XE)
                            src/image/hunyuanimage3_vae.cpp src/image/hunyuanimage3_entry_exit.cpp
                            src/image/hunyuanimage3_pipeline.cpp src/image/hunyuanimage3_refs.cpp
                            src/image/hunyuanimage3_vision.cpp
-                           src/image/qi_sdpa_ex.cpp src/image/aux_kernels.cpp src/image/aux_net.cpp
+                           src/image/qi_sdpa_ex.cpp src/image/aux_kernels.cpp src/image/aux_attn.cpp src/image/aux_net.cpp
                            src/image/sam3.cpp src/image/sam3_track.cpp src/image/sam3_video.cpp src/image/birefnet.cpp src/image/florence2.cpp)
   target_include_directories(strata_image PUBLIC include)
   # The image attention's vendors' kernels (src/image/qi_sdpa.cpp), the engine's own kernel where none takes it.

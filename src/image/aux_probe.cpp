@@ -102,11 +102,13 @@ bool sdpa_case(const char* name, si::QiSdpa a, int64_t kv_batches, bool use_klen
     a.scale = 1.f / std::sqrt((float) a.hd);
     double worst = 0.0;
     bool ok = true;
-    for (int path = 0; path < 2; ++path) {
+    for (int path = 0; path < 3; ++path) {
         if (path == 0) {
             si::qi_sdpa_ex(a, nullptr);
-        } else if (!si::qi_sdpa_ex_library(a, nullptr)) {
-            continue;
+        } else if (path == 1) {
+            if (!si::qi_sdpa_ex_library(a, nullptr)) continue;
+        } else {
+            si::qi_sdpa_ex_own(a, nullptr);   // the own kernel forced (the matrix paths, not the library's choice)
         }
         gpu::device_sync();
         gpu::copy(out.data(), a.out, out.size() * 2);
@@ -142,8 +144,8 @@ bool sdpa_case(const char* name, si::QiSdpa a, int64_t kv_batches, bool use_klen
                 }
         // FP16 out of values about 1: its half ulp (5e-4) and the scores' rounding
         const bool pass = worst < 4e-3;
-        std::printf("sdpa %-34s %s max|err| %.2e%s\n", name, path == 0 ? "own/any" : "library", worst,
-                    pass ? "" : "  FAIL");
+        std::printf("sdpa %-34s %s max|err| %.2e%s\n", name, path == 0 ? "own/any" : path == 1 ? "library" : "own/forced",
+                    worst, pass ? "" : "  FAIL");
         ok = ok && pass;
         worst = 0.0;
     }
@@ -160,6 +162,11 @@ int sdpa_selftest() {
     // the encoders: one batch, no mask (the library's shape)
     a.batch = 1, a.heads = 12, a.lq = a.lk = 97, a.hd = 64;
     ok = sdpa_case("encoder 97x97 h12 d64", a, 1, false, false, false, rng) && ok;
+    // a large unmasked encoder (the shared flash_attn, the head dim padded to 128) and a large biased shape
+    a = {}, a.batch = 1, a.heads = 8, a.lq = a.lk = 1500, a.hd = 64;
+    ok = sdpa_case("encoder 1500x1500 h8 d64", a, 1, false, false, false, rng) && ok;
+    a = {}, a.batch = 2, a.heads = 4, a.lq = 300, a.lk = 300, a.hd = 64, a.mask_n = 2;
+    ok = sdpa_case("biased 2x300 h4 d64", a, 2, false, true, true, rng) && ok;
     // DaViT's windows: 9 batches of 144, heads of 32
     a = {}, a.batch = 9, a.heads = 4, a.lq = a.lk = 144, a.hd = 32;
     ok = sdpa_case("windows 9x144 h4 d32", a, 9, false, false, false, rng) && ok;

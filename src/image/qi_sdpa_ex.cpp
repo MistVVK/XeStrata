@@ -11,10 +11,14 @@
 
 #include "strata/image/qi_kernels.hpp"
 
+#include "strata/image/aux_attn.hpp"
+#include "strata/image/aux_kernels.hpp"
 #include "strata/core/graph.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/timed_choice.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/kernels/flash_attn.hpp"
+#include "strata/prefill/gemm.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -170,13 +174,13 @@ void split_combine(const QiSdpa& a, int64_t S, int64_t HDP, const float* part, v
 }
 
 // rows_kernel over S parts of the keys, then joined
-// the keys' parts of S parts a row, (stride + 2) floats each: a buffer kept per queue, grown to the largest
-float* parts(const QiSdpa& a, int64_t S, int64_t stride, void* stream) {
+// A buffer of `need` floats kept per queue, grown to the largest (null when it does not fit).  The keys' parts and
+// the matrix-engine paths' scratch share it: a call uses one or the other, never both at once.
+float* queue_scratch(size_t need, void* stream) {
     sycl::queue& q = queue_for(stream);
     struct Buf { float* p = nullptr; size_t n = 0; };
     static std::mutex mu;
     static std::unordered_map<const sycl::queue*, Buf> bufs;
-    const size_t need = (size_t) (a.batch * a.heads * a.lq * S * (stride + 2));
     std::lock_guard<std::mutex> lock(mu);
     Buf& c = bufs[&q];
     if (c.n < need) {
@@ -188,8 +192,98 @@ float* parts(const QiSdpa& a, int64_t S, int64_t stride, void* stream) {
         c.p = sycl::malloc_device<float>(need, q);
         c.n = c.p != nullptr ? need : 0;
     }
-    if (c.p == nullptr) throw std::runtime_error("qi_sdpa_ex: no GPU memory for the keys' parts");
     return c.p;
+}
+
+float* parts(const QiSdpa& a, int64_t S, int64_t stride, void* stream) {
+    float* p = queue_scratch((size_t) (a.batch * a.heads * a.lq * S * (stride + 2)), stream);
+    if (p == nullptr) throw std::runtime_error("qi_sdpa_ex: no GPU memory for the keys' parts");
+    return p;
+}
+
+// The matrix engines' Gemm for the biased attention, one a queue (init once: f16_batch needs no dequant scratch)
+prefill::Gemm& matrix_gemm(void* stream) {
+    sycl::queue& q = queue_for(stream);
+    static std::mutex mu;
+    static std::unordered_map<const sycl::queue*, std::unique_ptr<prefill::Gemm>> gemms;
+    std::lock_guard<std::mutex> lock(mu);
+    auto& g = gemms[&q];
+    if (g == nullptr) {
+        g = std::make_unique<prefill::Gemm>();
+        std::string err;
+        if (!g->init(stream, 0, err)) throw std::runtime_error("qi_sdpa_ex: " + err);
+    }
+    return *g;
+}
+
+// The biased large shapes on the matrix engines: the shared Gemm attention (aux_attn_matrix), the heads split apart
+// and the scores held in the queue's scratch.  False (the caller keeps the FMA kernel) for the small heads (hd < 32)
+// or few query rows (lq < 256, BiRefNet's 144-row windows measured slower on the B70) or where the scores would not
+// fit: the FMA kernel holds none, this one holds [batch heads][lq][lk].  Each batch its own keys (kv_div 1), no
+// key_len or causal (a row's key count the scores' softmax here does not mask).
+bool matrix_biased(const QiSdpa& a, void* stream) {
+    const int64_t B = a.batch * a.heads, lq = a.lq, lk = a.lk, hd = a.hd;
+    // the small heads and the few query rows keep the FMA kernel: the heads' split/merge and the scores this form
+    // holds outweigh the matrix product there.  BiRefNet's Swin (hd 32, 144-row windows) measured slower on the B70
+    // (backbone 0.124 -> 0.127 s over 5 warms, 2026-11-11); the RTX 4070 was faster (0.200 -> 0.186 s) but the form
+    // is chosen by shape, not by maker, so the small windows stay FMA on every GPU.
+    if (hd < 32 || lq < 256) return false;
+    const int64_t h16 = (B * lq * hd + 1) / 2 + (B * lk * hd + 1) / 2 + (B * hd * lk + 1) / 2;
+    const int64_t need = h16 + B * lq * lk + (B * lq * lk + 1) / 2 + B * lq * hd;   // qh,kh,vt; sc; p16; o (floats)
+    if (need > (int64_t) (128 << 20) / 4) return false;   // a 128 MiB scratch bound
+    float* buf = queue_scratch((size_t) need, stream);
+    if (buf == nullptr) return false;
+    auto* qh = reinterpret_cast<uint16_t*>(buf);
+    auto* kh = qh + B * lq * hd;
+    auto* vt = kh + B * lk * hd;
+    auto* sc = reinterpret_cast<float*>(vt + B * hd * lk);
+    auto* p16 = reinterpret_cast<uint16_t*>(sc + B * lq * lk);
+    auto* o = reinterpret_cast<float*>(p16 + B * lq * lk);
+    aux_heads_batch16(a.q, a.batch, lq, a.heads, hd, a.q_row, a.q_batch, false, qh, stream);
+    aux_heads_batch16(a.k, a.batch, lk, a.heads, hd, a.k_row, a.k_batch, false, kh, stream);
+    aux_heads_batch16(a.v, a.batch, lk, a.heads, hd, a.v_row, a.v_batch, true, vt, stream);
+    aux_attn_matrix(matrix_gemm(stream), qh, kh, vt, a.batch, a.heads, lq, lk, hd, lq, hd, false, a.scale, a.bias,
+                    a.mask, std::max<int64_t>(a.mask_n, 1), nullptr, 0, 0, sc, p16, o, stream);
+    aux_heads_merge_batch16(o, a.batch, lq, a.heads, hd, a.o_row, a.o_batch, a.out, stream);
+    return true;
+}
+
+// The unmasked large shape of one batch on the matrix engines: the shared flash_attn, the head dim padded to 128
+// (the channels past hd zero, so the scores are the head's own; the scale stays 1/sqrt(hd)).  False where flash_attn
+// takes it not (the caller keeps the FMA kernel).  The maker's library still competes through qi_sdpa_ex's choice.
+bool flash_padded(const QiSdpa& a, void* stream) {
+    const int64_t lq = a.lq, lk = a.lk, heads = a.heads, hd = a.hd;
+    if (a.o_row != heads * hd) return false;   // the unpad writes contiguous rows
+    const int64_t Tp = qi_attn_rows(lq), Kp = qi_attn_rows(lk), C = heads * 128;
+    const int64_t need = (Tp * C + Kp * C + Kp * C + Tp * C + 1) / 2;   // q,k,v,out FP16 (floats)
+    float* buf = queue_scratch((size_t) need, stream);
+    if (buf == nullptr) return false;
+    auto* qp = reinterpret_cast<uint16_t*>(buf);
+    auto* kp = qp + Tp * C;
+    auto* vp = kp + Kp * C;
+    auto* op = vp + Kp * C;
+    gpu::memset_async(qp, 0, (size_t) need * 4, stream);   // the rows past lq / lk zero (whole chunks read)
+    qi_pad_heads16(a.q, lq, heads, hd, a.q_row, qp, stream);
+    qi_pad_heads16(a.k, lk, heads, hd, a.k_row, kp, stream);
+    qi_pad_heads16(a.v, lk, heads, hd, a.v_row, vp, stream);
+    kernels::FlashAttnArgs fa;
+    fa.q = qp;
+    fa.q_ld = C;
+    fa.k = kp;
+    fa.v = vp;
+    fa.kv_ld = C;
+    fa.n_head = fa.n_kv = heads;
+    fa.head_dim = 128;
+    fa.rows = lq;
+    fa.keys = lk;
+    fa.first = 0;
+    fa.row_end = lq;
+    fa.out = op;
+    fa.out_ld = C;
+    fa.scale = a.scale;
+    if (!kernels::flash_attn(fa, stream)) return false;
+    qi_unpad_heads16(op, lq, heads, hd, a.out, stream);
+    return true;
 }
 
 template <int HD> void rows_split(const QiSdpa& a, int64_t qb, int64_t S, void* stream) {
@@ -311,6 +405,17 @@ void qi_sdpa_ex_own(const QiSdpa& a, void* stream) {
             } else {
                 few_kernel(a, L, stream);
             }
+            return;
+        }
+    }
+    // the large shapes on a GPU with matrix engines: the biased through the shared Gemm attention, the unmasked of
+    // one batch through the shared flash_attn (the head dim padded to 128).  Else (no matrix engines, or a shape these
+    // do not take) the FMA kernel below.  The maker's library, where it takes the shape, is still chosen by
+    // qi_sdpa_ex's measuring against this own path.
+    if (kernels::flash_attn_path(&dev) >= 0 && a.key_len == nullptr && !a.causal) {
+        if (a.bias != nullptr || a.mask != nullptr) {
+            if (a.kv_div == 1 && matrix_biased(a, stream)) return;
+        } else if (a.batch == 1 && flash_padded(a, stream)) {
             return;
         }
     }

@@ -36,5 +36,8 @@ struct QiSdpa {
 void qi_sdpa_ex(const QiSdpa& a, void* stream);
 /// The library part alone: false where qi_sdpa does not take the shape (the parity probe's check of both paths).
 bool qi_sdpa_ex_library(const QiSdpa& a, void* stream);
+/// The engine's own kernels alone (the matrix-engine paths where they take the shape, else the FMA kernels): the
+/// parity probe's check of the own path forced, without the library's choice.
+void qi_sdpa_ex_own(const QiSdpa& a, void* stream);
 
 }  // namespace strata::image

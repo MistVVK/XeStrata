@@ -9,6 +9,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/aux_kernels.hpp"
+#include "strata/image/aux_attn.hpp"
 #include "strata/image/img_crop.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/qi_sdpa_ex.hpp"
@@ -323,9 +324,9 @@ void Sam3::attention(const uint16_t* q, const uint16_t* k, const uint16_t* v, in
 }
 
 // The decoder's queries over the patches with the box bias (a row's term and a column's of the grid, the presence
-// token's row none), by products: each head's scores through the Gemm, their softmax with the bias, by the values.  The
-// scores of 201 rows over 5,184 keys are few enough to hold, and the products take the GPU's matrix engines, which
-// qi_sdpa_ex's own kernels for a biased attention do not (the B70: 8 ms a frame in those, 2026-11-07)
+// token's row none), through the shared matrix-engine attention (aux_attn_matrix): each head's scores through the
+// Gemm, their softmax with the bias, by the values.  The scores of 201 rows over 5,184 keys are few enough to hold
+// (the B70: 8 ms a frame in qi_sdpa_ex's old FMA kernels for a biased attention, 2026-11-07)
 void Sam3::grid_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t lq, const float* grid,
                           uint16_t* out) {
     const int64_t G = grid_, N = G * G, d = d_, H = heads_, hd = d / H;
@@ -338,9 +339,8 @@ void Sam3::grid_attention(const uint16_t* q16, const uint16_t* k16, const uint16
     aux_heads16(q16, lq, H, hd, d, false, qh, s_);
     aux_heads16(k16, N, H, hd, d, false, kh, s_);
     aux_heads16(v16, N, H, hd, d, true, vt, s_);
-    gemm_.f16_batch(qh, kh, sc, lq, N, hd, H, lq * hd, N * hd, lq * N);
-    aux_softmax_grid16(sc, H, lq, G, 1.f / std::sqrt((float) hd), grid, 1, p16, s_);
-    gemm_.f16_batch(p16, vt, o, lq, hd, N, H, lq * N, hd * N, lq * hd);
+    aux_attn_matrix(gemm_, qh, kh, vt, 1, H, lq, N, hd, lq, hd, false, 1.f / std::sqrt((float) hd), nullptr, nullptr,
+                    1, grid, G, 1, sc, p16, o, s_);
     aux_heads_merge16(o, lq, H, hd, out, s_);
 }
 

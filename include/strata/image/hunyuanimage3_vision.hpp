@@ -15,7 +15,9 @@
 //   residual; LayerNorm, MLP 1152 -> 4304 -> 1152 with GELU's tanh form, residual) -> post LayerNorm -> the aligner:
 //   Linear(1152 -> 4096), GELU (erf), Linear(4096 -> 4096) -> rows [1024][4096]
 //
-// The products are prefill::Gemm's FP16 ones with the head_dim padded to 80 and the keys to a multiple of 32, the
+// The attention is the shared one qi_vision's reader takes (qi_attention_cross: the heads padded to 128, the GPU
+// maker's kernel and the engine's own timed once a GPU and a shape), q scaled by sqrt(128 / head_dim) so the
+// shared scale 1 / sqrt(128) is the model's 1 / sqrt(head_dim).  The products are prefill::Gemm's FP16 ones, the
 // norms, the softmax and the residual stream FP32 (the reference runs it in BF16; `probe refs` holds this to the
 // golden's FP32 features).  The weights come from the model's own bf16 shard (the `vision_model.*` tensors) and the
 // quantized file (`vision_aligner.*`, BF16), as FP16 on the device: 0.86 GB.
@@ -93,17 +95,18 @@ private:
     Norm post_;
     Lin al0_, al2_;
     // the buffers
-    uint16_t *patches16_ = nullptr, *a16_ = nullptr, *q16_ = nullptr, *k16_ = nullptr, *vt16_ = nullptr,
-             *p16_ = nullptr, *mlp16_ = nullptr, *al16_ = nullptr;
-    float *x32_ = nullptr, *qkv32_ = nullptr, *scores_ = nullptr, *o32_ = nullptr, *tmp32_ = nullptr,
-          *mlp32_ = nullptr, *al32_ = nullptr, *out32_ = nullptr, *pos32_ = nullptr;
+    uint16_t *patches16_ = nullptr, *a16_ = nullptr, *q16_ = nullptr, *k16_ = nullptr, *v16_ = nullptr,
+             *out16_ = nullptr, *mlp16_ = nullptr, *al16_ = nullptr;
+    float *x32_ = nullptr, *qkv32_ = nullptr, *tmp32_ = nullptr, *mlp32_ = nullptr, *al32_ = nullptr,
+          *out32_ = nullptr, *pos32_ = nullptr;
     int64_t pos_ph_ = 0, pos_pw_ = 0;   // the grid pos32_ holds
     std::vector<float> last_hidden_;
 
     static constexpr int64_t kPatch = 16, kMaxPatches = 1024;   // the model's vit_processor (config.json)
     static constexpr int64_t kHeads = 16;                       // its vit.num_attention_heads
-    static constexpr int64_t kHeadPad = 80;                     // head_dim 72 padded for the products
-    static constexpr int64_t kKeyRound = 32;                    // the keys padded to a multiple of this
+    static constexpr int64_t kHeadPad = 128;                    // the shared attention's head_dim (the head's 72
+                                                                // channels, the rest zero); kMaxPatches key rows
+                                                                // cover any n rounded up to a multiple of 64
     static constexpr float kEps = 1e-6f;                        // its layer_norm_eps
 };
 

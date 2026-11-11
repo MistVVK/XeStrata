@@ -253,5 +253,9 @@ void qi_vit_qkv_rope16(const float* qkv, const int32_t* yx, int64_t T, int64_t h
 
 /// out16 [T][heads * hd] = the first hd channels of each head of in16 [T][heads][128].
 void qi_unpad_heads16(const uint16_t* in16, int64_t T, int64_t heads, int64_t hd, uint16_t* out16, void* stream);
+/// out16 [T][heads][128] = in16 [T][heads * hd] widened to 128 a head, the channels past hd zero (the shared
+/// attention's head dim).  `ld` the input row's stride (0: heads * hd).
+void qi_pad_heads16(const uint16_t* in16, int64_t T, int64_t heads, int64_t hd, int64_t ld, uint16_t* out16,
+                    void* stream);
 
 }  // namespace strata::image

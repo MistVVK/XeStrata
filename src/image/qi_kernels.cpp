@@ -944,4 +944,16 @@ void qi_unpad_heads16(const uint16_t* in16, int64_t T, int64_t heads, int64_t hd
     finish(stream, e, "qi_unpad_heads16");
 }
 
+void qi_pad_heads16(const uint16_t* in16, int64_t T, int64_t heads, int64_t hd, int64_t ld, uint16_t* out16,
+                    void* stream) {
+    if (T <= 0) return;
+    if (ld == 0) ld = heads * hd;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * heads * 128)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t t = i / (heads * 128), r = i % (heads * 128), h = r / 128, d = r % 128;
+        out16[i] = d < hd ? in16[t * ld + h * hd + d] : (uint16_t) 0;
+    });
+    finish(stream, e, "qi_pad_heads16");
+}
+
 }  // namespace strata::image

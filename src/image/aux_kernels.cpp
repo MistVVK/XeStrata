@@ -557,24 +557,41 @@ void aux_channel_merge16(const float* yg, int64_t N, int64_t C, int64_t G, uint1
     finish(stream, e, "aux_channel_merge16");
 }
 
-void aux_softmax16(const float* s, int64_t rows, int64_t cols, uint16_t* p16, void* stream) {
-    if (rows <= 0) return;
-    constexpr size_t L = 128;
+void aux_softmax_attn16(const float* s, int64_t batch, int64_t heads, int64_t rows, int64_t cols, float scale,
+                        const float* bias, const float* mask, int64_t mask_n, const float* grid, int64_t G,
+                        int64_t skip, uint16_t* p16, void* stream) {
+    if (batch * heads * rows <= 0) return;
+    constexpr size_t L = 256;
+    const int64_t hr = heads * rows;
     const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) rows * L), sycl::range<1>(L)), [=](sycl::nd_item<1> it) {
-            const auto r = static_cast<int64_t>(it.get_group_linear_id());
+        sycl::nd_range<1>(sycl::range<1>((size_t) (batch * hr) * L), sycl::range<1>(L)), [=](sycl::nd_item<1> it) {
+            const auto g = static_cast<int64_t>(it.get_group_linear_id());
             const auto l = static_cast<int64_t>(it.get_local_linear_id());
-            const float* x = s + r * cols;
+            const int64_t b = g / hr, h = (g / rows) % heads, i = g % rows;
+            const float* x = s + g * cols;
+            const float* bb = bias != nullptr ? bias + (h * rows + i) * cols : nullptr;
+            const float* mb = mask != nullptr ? mask + ((b % mask_n) * rows + i) * cols : nullptr;
+            const float* gb = grid != nullptr && i >= skip ? grid + (i - skip) * 2 * G * heads : nullptr;
+            const auto at = [&](int64_t c) {
+                float v = x[c] * scale;
+                if (bb != nullptr) v += bb[c];
+                if (mb != nullptr) v += mb[c];
+                if (gb != nullptr) {
+                    const int64_t y = c / G;
+                    v += gb[y * heads + h] + gb[(G + c - y * G) * heads + h];
+                }
+                return v;
+            };
             float m = -INFINITY;
-            for (int64_t c = l; c < cols; c += (int64_t) L) m = sycl::fmax(m, x[c]);
+            for (int64_t c = l; c < cols; c += (int64_t) L) m = sycl::fmax(m, at(c));
             m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
             float z = 0.f;
-            for (int64_t c = l; c < cols; c += (int64_t) L) z += sycl::exp(x[c] - m);
+            for (int64_t c = l; c < cols; c += (int64_t) L) z += sycl::exp(at(c) - m);
             z = sycl::reduce_over_group(it.get_group(), z, sycl::plus<float>());
             const float inv = 1.f / z;
-            for (int64_t c = l; c < cols; c += (int64_t) L) p16[r * cols + c] = f16_from_f32(sycl::exp(x[c] - m) * inv);
+            for (int64_t c = l; c < cols; c += (int64_t) L) p16[g * cols + c] = f16_from_f32(sycl::exp(at(c) - m) * inv);
         });
-    finish(stream, e, "aux_softmax16");
+    finish(stream, e, "aux_softmax_attn16");
 }
 
 void aux_heads16(const uint16_t* x, int64_t rows, int64_t heads, int64_t hd, int64_t ld, bool transpose, uint16_t* y,
@@ -589,6 +606,19 @@ void aux_heads16(const uint16_t* x, int64_t rows, int64_t heads, int64_t hd, int
     finish(stream, e, "aux_heads16");
 }
 
+void aux_heads_batch16(const uint16_t* x, int64_t batch, int64_t rows, int64_t heads, int64_t hd, int64_t ld,
+                       int64_t xbatch, bool transpose, uint16_t* y, void* stream) {
+    const int64_t n = batch * heads * rows * hd;
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);   // the destination's order: batch, head, row, channel
+        const int64_t d = i % hd, r = (i / hd) % rows, h = (i / (hd * rows)) % heads, b = i / (hd * rows * heads);
+        const uint16_t v = x[b * xbatch + r * ld + h * hd + d];
+        y[transpose ? ((b * heads + h) * hd + d) * rows + r : i] = v;
+    });
+    finish(stream, e, "aux_heads_batch16");
+}
+
 void aux_heads_merge16(const float* o, int64_t rows, int64_t heads, int64_t hd, uint16_t* y, void* stream) {
     const int64_t n = heads * rows * hd;
     if (n <= 0) return;
@@ -600,36 +630,16 @@ void aux_heads_merge16(const float* o, int64_t rows, int64_t heads, int64_t hd, 
     finish(stream, e, "aux_heads_merge16");
 }
 
-void aux_softmax_grid16(const float* s, int64_t heads, int64_t rows, int64_t G, float scale, const float* grid,
-                        int64_t skip, uint16_t* p16, void* stream) {
-    if (heads * rows <= 0) return;
-    constexpr size_t L = 256;
-    const int64_t cols = G * G;
-    const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) (heads * rows) * L), sycl::range<1>(L)), [=](sycl::nd_item<1> it) {
-            const auto hr = static_cast<int64_t>(it.get_group_linear_id());
-            const auto l = static_cast<int64_t>(it.get_local_linear_id());
-            const int64_t h = hr / rows, r = hr - h * rows;
-            const float* x = s + hr * cols;
-            const float* gb = r >= skip ? grid + (r - skip) * 2 * G * heads : nullptr;
-            const auto at = [&](int64_t c) {
-                float v = x[c] * scale;
-                if (gb != nullptr) {
-                    const int64_t y = c / G;
-                    v += gb[y * heads + h] + gb[(G + c - y * G) * heads + h];
-                }
-                return v;
-            };
-            float m = -INFINITY;
-            for (int64_t c = l; c < cols; c += (int64_t) L) m = sycl::fmax(m, at(c));
-            m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
-            float z = 0.f;
-            for (int64_t c = l; c < cols; c += (int64_t) L) z += sycl::exp(at(c) - m);
-            z = sycl::reduce_over_group(it.get_group(), z, sycl::plus<float>());
-            const float inv = 1.f / z;
-            for (int64_t c = l; c < cols; c += (int64_t) L) p16[hr * cols + c] = f16_from_f32(sycl::exp(at(c) - m) * inv);
-        });
-    finish(stream, e, "aux_softmax_grid16");
+void aux_heads_merge_batch16(const float* o, int64_t batch, int64_t rows, int64_t heads, int64_t hd, int64_t ld,
+                             int64_t ybatch, uint16_t* y, void* stream) {
+    const int64_t n = batch * heads * rows * hd;
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);   // the source's order: batch, head, row, channel
+        const int64_t d = i % hd, r = (i / hd) % rows, h = (i / (hd * rows)) % heads, b = i / (hd * rows * heads);
+        y[b * ybatch + r * ld + h * hd + d] = f16_from_f32(o[i]);
+    });
+    finish(stream, e, "aux_heads_merge_batch16");
 }
 
 void aux_embed(const int32_t* ids, const int32_t* pos_ids, const uint16_t* tok, const uint16_t* pos, int64_t n,
