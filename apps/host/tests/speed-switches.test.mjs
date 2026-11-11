@@ -18,6 +18,8 @@ const ENV = {      // what each switch writes outside its default
   deepseek_speedups: { DS4_DEFAULTS: '026', DS4_FAST_ATTN: '0', DS4_ATTN_SLAB: '0', DS4_COPY_PIN: '0', DS4_COPY_HUGETLB: '0', DS4_STORE_SPARE: '0', DS4_STORE_PUT: '0' },
   picture_reader: { STRATA_VISION_TOWER: 'mtmd' },
 };
+/* The fixture's run configs read pictures ("vision"), so a Qwen model also gets the picture reader row (Image reading); the Speed tests below leave it out. */
+const speed = rows => rows.filter(s => s.id !== 'picture_reader');
 const SIX = ['DS4_FAST_ATTN', 'DS4_ATTN_SLAB', 'DS4_COPY_PIN', 'DS4_COPY_HUGETLB', 'DS4_STORE_SPARE', 'DS4_STORE_PUT'];
 const DEFAULT = { faster_long_prompts: 'off', faster_12gb_nvidia: 'off', faster_radeon_9000: 'on', deepseek_speedups: 'on', picture_reader: 'on' };
 const RTX3060 = { index: 0, name: 'NVIDIA GeForce RTX 3060', vendor: 'nvidia', arch: '86', vram_gb: 12 };
@@ -196,8 +198,8 @@ test('through the host: the settings answer lists the switches that apply, and K
     await f.control.refresh();
     const before = readFileSync(path, 'utf8');
     const first = f.control.settings('iq2_xs');
-    assert.deepEqual(first.speedSwitches.map(s => [s.id, s.on]), [['faster_long_prompts', false], ['faster_radeon_9000', true]]);
-    assert.deepEqual(first.speedSwitches.map(s => [s.default, s.env]), [['off', ENV.faster_long_prompts], ['on', ENV.faster_radeon_9000]], 'the client writes what the host says');
+    assert.deepEqual(speed(first.speedSwitches).map(s => [s.id, s.on]), [['faster_long_prompts', false], ['faster_radeon_9000', true]]);
+    assert.deepEqual(speed(first.speedSwitches).map(s => [s.default, s.env]), [['off', ENV.faster_long_prompts], ['on', ENV.faster_radeon_9000]], 'the client writes what the host says');
     assert.equal('STRATA_KVA' in first.values.env, false, 'default: nothing in the environment');
 
     // the client turns "Faster long prompts" on: it sends the environment with the entry added
@@ -207,13 +209,13 @@ test('through the host: the settings answer lists the switches that apply, and K
     assert.equal(file.env.PATH, '/native/bin');
     assert.equal(file.env.STRATA_TOKEN, 'private', 'a credential is kept, not lost behind its mask');
     assert.equal('STRATA_PCIE_FRAC_DEFAULT' in file.env, false);
-    assert.deepEqual(off.speedSwitches.map(s => [s.id, s.on]), [['faster_long_prompts', true], ['faster_radeon_9000', true]]);
+    assert.deepEqual(speed(off.speedSwitches).map(s => [s.id, s.on]), [['faster_long_prompts', true], ['faster_radeon_9000', true]]);
 
     // and Off again: the entry is gone and the file is as it was
     const env = { ...off.values.env };
     delete env.STRATA_KVA;
     const on = f.control.save('iq2_xs', { values: { env } });
-    assert.deepEqual(on.speedSwitches.map(s => s.on), [false, true]);
+    assert.deepEqual(speed(on.speedSwitches).map(s => s.on), [false, true]);
     const after = JSON.parse(readFileSync(path, 'utf8'));
     assert.deepEqual(after, JSON.parse(before));
     assert.equal(JSON.stringify(after.env), JSON.stringify(JSON.parse(before).env), 'the same environment, same order');
@@ -245,8 +247,28 @@ test('through the host: Qwen3.6-35B-A3B (its run config has an arch) gets no Fas
     setConfig(f, 'iq2_xs', { backend: 'cuda' });
     setConfig(f, 'iq3_s', { backend: 'cuda', arch: 'qwen35moe', model_name: 'qwen3.6-35b-a3b-ud-q4_k_xl' });
     await f.control.refresh();
-    assert.deepEqual(f.control.settings('iq2_xs').speedSwitches.map(s => s.id), ['faster_long_prompts']);
-    assert.deepEqual(f.control.settings('iq3_s').speedSwitches, []);
+    assert.deepEqual(f.control.settings('iq2_xs').speedSwitches.map(s => s.id), ['faster_long_prompts', 'picture_reader']);
+    assert.deepEqual(f.control.settings('iq3_s').speedSwitches.map(s => s.id), ['picture_reader'], 'Qwen3.6 reads pictures with the same reader');
+  } finally { await f.cleanup(); }
+});
+
+test('through the host: choosing llama.cpp\'s picture reader writes STRATA_VISION_TOWER=mtmd into the model\'s file, and Strata\'s own again gives back the same file', async () => {
+  const f = nativeFixture();
+  try {
+    f.setHardware({ ram_gb: 64, gpus: [RTX] });
+    const path = setConfig(f, 'iq2_xs', { backend: 'cuda' });
+    await f.control.refresh();
+    const before = readFileSync(path, 'utf8');
+    const first = f.control.settings('iq2_xs');
+    const row = first.speedSwitches.find(s => s.id === 'picture_reader');
+    assert.deepEqual([row.on, row.group, row.words.on, row.words.off], [true, 'Image reading', 'Strata\'s own (recommended)', 'llama.cpp\'s']);
+    const picked = f.control.save('iq2_xs', { values: { env: { ...first.values.env, ...ENV.picture_reader } } });
+    assert.equal(JSON.parse(readFileSync(path, 'utf8')).env.STRATA_VISION_TOWER, 'mtmd');
+    assert.equal(picked.speedSwitches.find(s => s.id === 'picture_reader').on, false);
+    const env = { ...picked.values.env };
+    delete env.STRATA_VISION_TOWER;
+    f.control.save('iq2_xs', { values: { env } });
+    assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')), JSON.parse(before));
   } finally { await f.cleanup(); }
 });
 
@@ -256,7 +278,7 @@ test('through the host: a Qwen model on a PC the engine cannot speed up offers n
     f.setHardware({ ram_gb: 32, gpus: [{ index: 0, name: 'Intel Arc A750', vendor: 'intel', vram_gb: 8 }] });
     setConfig(f, 'iq2_xs', { backend: 'sycl' });
     await f.control.refresh();
-    assert.deepEqual(f.control.settings('iq2_xs').speedSwitches, []);
+    assert.deepEqual(f.control.settings('iq2_xs').speedSwitches.map(s => s.id), ['picture_reader'], 'no speed switch; the picture reader row is there for a model that reads pictures');
   } finally { await f.cleanup(); }
 });
 
