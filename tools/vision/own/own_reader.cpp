@@ -34,6 +34,18 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
 
 }  // namespace
 
+std::string vision_tower_default(const char* env, std::string& note) {
+    const std::string v = env ? env : "";
+    if (v == "mtmd" || v == "own" || v == "auto") return v;
+    if (!v.empty()) note = "STRATA_VISION_TOWER=" + v + " is not mtmd, own or auto; using auto";
+    return "auto";
+}
+
+bool own_reader_inject_failure(const char* point) {
+    const char* v = std::getenv("STRATA_VIT_TEST_FAIL");
+    return v && point && std::string(v) == point;
+}
+
 bool own_reader_supported(const std::string& mmproj, bool gpu, int max_tokens, std::string& why) {
     if (gpu) {
 #ifdef STRATA_VIT_GPU
@@ -59,10 +71,7 @@ bool own_reader_supported(const std::string& mmproj, bool gpu, int max_tokens, s
         return false;
     }
 #endif
-    else if (vit_cpu_build_slower_than_mtmd()) {
-        why = "this build of the own CPU tower (MSVC, x86) is slower than mtmd's CPU reader";
-        return false;
-    }
+    // (an MSVC x86 build kept mtmd here until 11-11; since 54f9cc3c0 it is 0.986 of mtmd-CPU's time at 1,024 tokens, RESULTS-OWN-3V.md D2, so that rule is gone)
     Gguf gg;
     VitGeometry g;
     if (!gg.open(mmproj, why) || !vit_geometry_from_gguf(gg, g, why)) return false;
@@ -74,11 +83,17 @@ bool own_reader_supported(const std::string& mmproj, bool gpu, int max_tokens, s
 int own_reader_run(const OwnReaderOptions& o) {
     using clock = std::chrono::steady_clock;
     const auto load_t0 = clock::now();
-    auto fail = [](const std::string& msg, int code) {
+    // every return before READY goes through here: under `auto` the reason goes back to strata-vision, which starts mtmd's reader (nothing on stdout yet)
+    auto fail = [&o](const std::string& msg, int code) {
+        if (o.start_error) {
+            *o.start_error = msg;
+            return kOwnStartFailed;
+        }
         std::printf("ERR %s\n", msg.c_str());
         std::fflush(stdout);
         return code;
     };
+    const std::string injected = " (injected for a test: STRATA_VIT_TEST_FAIL)";
 #ifndef STRATA_VIT_GPU
     if (o.gpu) return fail("this build has no GPU backend for the own tower (use --tower mtmd)", 3);
 #endif
@@ -94,12 +109,14 @@ int own_reader_run(const OwnReaderOptions& o) {
     std::unique_ptr<VitGpu> gpu;
     if (o.gpu) {
         std::string why;
+        if (own_reader_inject_failure("gpu")) return fail("this picture reader found no GPU" + injected, 3);
         if (!VitGpu::available(why)) return fail("this picture reader found no GPU (" + why + ")", 3);
         gpu.reset(new VitGpu());
         // buffers for the warm-up picture below (2048 x 2048: 4,096 tokens at most, fewer under a lower limit): claimed now, before READY.  A larger limit
         // (the app allows up to 16,384 image tokens) grows them when such a picture comes: slower for that picture, never an error.
         const int tokens = std::min(o.max_tokens > 0 ? o.max_tokens : geo.max_tokens, 4096);
         if (!gpu->load(gg, geo, 0, tokens * 4, err)) return fail("cannot load the vision encoder " + o.mmproj + " (" + err + ")", 1);
+        if (own_reader_inject_failure("load")) return fail("cannot load the vision encoder " + o.mmproj + injected, 1);   // after the load: its memory is freed on return
     }
 #endif
     if (!o.gpu) {
@@ -112,6 +129,7 @@ int own_reader_run(const OwnReaderOptions& o) {
             cpu.reset(new VitRef());
             if (!cpu->load(gg, geo, err)) return fail("cannot load the vision encoder " + o.mmproj + " (" + err + ")", 1);
         }
+        if (own_reader_inject_failure("load")) return fail("cannot load the vision encoder " + o.mmproj + injected, 1);
         if (threads <= 0) threads = (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency() / 2));
     }
     std::fprintf(stderr, "strata-vision: own tower (%s, %d layers, width %d) loaded in %.1f s, %s\n", geo.projector.c_str(), geo.layers, geo.width,
@@ -132,14 +150,16 @@ int own_reader_run(const OwnReaderOptions& o) {
         PreparedImage wp;
         std::vector<float> rows;
         int nx = 0, ny = 0;
-        if (prepare_image(gray, geo, o.min_tokens, o.max_tokens, wp, err) && encode(wp, rows, nx, ny, err))
+        err.clear();
+        if (own_reader_inject_failure("warmup")) err = "out of GPU memory" + injected;
+        if (err.empty() && prepare_image(gray, geo, o.min_tokens, o.max_tokens, wp, err) && encode(wp, rows, nx, ny, err))
             std::fprintf(stderr, "strata-vision: warmed up at %d image tokens in %.1f s, %.0f MiB of GPU memory\n", nx * ny,
                          std::chrono::duration<double>(clock::now() - w0).count(), (double) gpu->device_bytes() / 1048576.0);
         else
             return fail("the vision encoder failed its warm-up (" + err + ")", 1);
     }
 #endif
-    std::printf("READY %d\n", geo.out_dim);
+    std::printf("READY %d own\n", geo.out_dim);   // the third word names the reader (a server reads only the start: "READY")
     std::fflush(stdout);
 
     std::string line;

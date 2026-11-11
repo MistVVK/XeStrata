@@ -7,10 +7,11 @@ import { SPEED_SWITCH_TABLE, DRAFTING_FAMILIES, DFLASH2_MODEL_PATTERN } from '..
 import { transform } from 'esbuild';
 import * as S from '../server/native-settings.mjs';
 
-test('the speed switches of the settings are the generated table, with the Speed group added', () => {
-  assert.deepEqual(S.SPEED_SWITCHES.map(({ group, ...rest }) => rest), SPEED_SWITCH_TABLE);
-  assert.ok(S.SPEED_SWITCHES.every(s => s.group === 'Speed'));
-  assert.deepEqual(SPEED_SWITCH_TABLE.map(s => s.id), ['faster_long_prompts', 'faster_12gb_nvidia', 'faster_radeon_9000', 'deepseek_speedups']);
+test('the speed switches of the settings are the generated table, with the Speed group added where the table names none', () => {
+  assert.deepEqual(S.SPEED_SWITCHES.map(({ group, ...rest }) => rest), SPEED_SWITCH_TABLE.map(({ group, ...rest }) => rest));
+  assert.ok(S.SPEED_SWITCHES.every(s => s.group === (SPEED_SWITCH_TABLE.find(t => t.id === s.id).group ?? 'Speed')));
+  assert.deepEqual(SPEED_SWITCH_TABLE.map(s => s.id), ['faster_long_prompts', 'faster_12gb_nvidia', 'faster_radeon_9000', 'deepseek_speedups', 'picture_reader']);
+  assert.equal(S.SPEED_SWITCHES.find(s => s.id === 'picture_reader').group, 'Image reading');
 });
 
 test('the drafting families and the model-name rule are the generated ones', () => {
@@ -37,7 +38,7 @@ test('the host shows the speed switches strata_control shows, for every card, en
   assert.ok(V.switches.length > 100);
   for (const row of V.switches) {
     const model = V.models[row.model];
-    const context = { deepseek: model.arch === 'deepseek41' || /strata-dsv41/i.test(model.exe ?? ''), backend: row.backend, gpus: [V.cards[row.card]], arch: model.arch ?? null };
+    const context = { deepseek: model.arch === 'deepseek41' || /strata-dsv41/i.test(model.exe ?? ''), backend: row.backend, gpus: [V.cards[row.card]], arch: model.arch ?? null, vision: !!model.vision };
     const shown = S.SPEED_SWITCHES.filter(s => S.speedSwitchApplies(s.id, context)).map(s => s.id).sort();
     assert.deepEqual(shown, row.shows, `${row.model} on ${row.backend} with ${row.card}`);
   }

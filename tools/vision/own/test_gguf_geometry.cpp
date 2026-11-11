@@ -3,6 +3,7 @@
 //   strata-vision-own-test [mmproj.gguf ...]
 // Exit 0 when every check passes.  A real mmproj given on the command line is parsed and its geometry printed; the two known Qwen
 // towers (27 layers, width 1152, out 2560 or 2048) are also checked against the numbers read from their headers.
+#include "own_reader.h"
 #include "vit_geometry.h"
 #include "vit_gpu.h"
 
@@ -48,6 +49,35 @@ int main(int argc, char** argv) {
     }
     CHECK(vit_gpu_slower_amd("gfx1151") && vit_gpu_slower_amd("gfx1151:xnack-"));
     CHECK(!vit_gpu_slower_amd("gfx1150") && !vit_gpu_slower_amd("gfx1201") && !vit_gpu_slower_amd("gfx11510") && !vit_gpu_slower_amd("gfx115") && !vit_gpu_slower_amd(""));
+    CHECK(vit_gpu_hip_windows_not_measured(true) && !vit_gpu_hip_windows_not_measured(false));   // Windows HIP keeps mtmd under auto; Linux HIP does not
+    {   // the default tower (no --tower): auto, or STRATA_VISION_TOWER's value when it is a known one
+        std::string note;
+        CHECK(vision_tower_default(nullptr, note) == "auto" && note.empty());
+        CHECK(vision_tower_default("", note) == "auto" && note.empty());
+        CHECK(vision_tower_default("mtmd", note) == "mtmd" && vision_tower_default("own", note) == "own" && vision_tower_default("auto", note) == "auto" && note.empty());
+        CHECK(vision_tower_default("llama", note) == "auto" && note.find("STRATA_VISION_TOWER=llama") != std::string::npos);
+    }
+    {   // a start failure under auto comes back as kOwnStartFailed with its reason (nothing on stdout), so strata-vision can start mtmd's reader
+        OwnReaderOptions o;
+        o.mmproj = "/nonexistent/strata-own-test-mmproj.gguf";
+        std::string why;
+        o.start_error = &why;
+        CHECK(own_reader_run(o) == kOwnStartFailed && why.find("cannot load the vision encoder") != std::string::npos);
+    }
+    {   // the test hook names one point at a time
+#ifdef _WIN32
+        _putenv_s("STRATA_VIT_TEST_FAIL", "load");
+#else
+        setenv("STRATA_VIT_TEST_FAIL", "load", 1);
+#endif
+        CHECK(own_reader_inject_failure("load") && !own_reader_inject_failure("gpu") && !own_reader_inject_failure("warmup"));
+#ifdef _WIN32
+        _putenv_s("STRATA_VIT_TEST_FAIL", "");
+#else
+        unsetenv("STRATA_VIT_TEST_FAIL");
+#endif
+        CHECK(!own_reader_inject_failure("load"));
+    }
     const std::string tmp = std::string(std::getenv("TMPDIR") ? std::getenv("TMPDIR") : ".") + "/strata_own_test_" + std::to_string((long) std::rand()) + ".gguf";
 
     // --- 1. a file with every value kind and the four tensor types ---

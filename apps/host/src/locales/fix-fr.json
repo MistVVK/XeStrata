@@ -85,5 +85,9 @@
  "fx84": "Le fichier est téléchargé. « Continuer » relance l’installation.",
  "fx85": "Ouvrez « Détails » pour voir la raison.",
  "fxec1": "Un moteur plus récent est disponible pour cet ordinateur. Vos modèles et vos réglages ne changent pas.",
- "fxec2": "Déchargez d’abord vos modèles en cours d’exécution."
+ "fxec2": "Déchargez d’abord vos modèles en cours d’exécution.",
+ "fxpr1": "Lecteur d’images",
+ "fxpr2": "Celui de Strata (recommandé)",
+ "fxpr3": "Celui de llama.cpp",
+ "fxpr4": "Le programme qui transforme les images en quelque chose que le modèle peut lire. Celui de Strata est plus rapide sur la plupart des ordinateurs et lit correctement les très grandes images ; sur quelques cartes graphiques où il est encore plus lent, Strata utilise de lui-même celui de llama.cpp. Choisissez celui de llama.cpp si les images sont mal lues."
 }

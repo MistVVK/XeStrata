@@ -3297,6 +3297,7 @@ class Vision:
         self.gpu_spawn, self.cpu_spawn = self.spawn, self.fallback   # an on-demand reader tries the GPU one again at every start
         self.on_cpu = False                             # the CPU reader is what runs (the GPU one did not start, or there was no room)
         self.cpu_note = None                            # why, in words for the person (strata_control/reader_room.py), when the card had no room
+        self.reader = None                              # "own" (Strata's) or "mtmd" (llama.cpp's) from the READY line; None for an older reader
         self.proc = None
         self.stopped = True
         self.lock = threading.Lock()
@@ -3424,6 +3425,12 @@ class Vision:
             room = reader_room.find((line + chr(10) + chr(10).join(strays) + chr(10) + vision_log_tail(log, since=since)).splitlines())
             raise (VisionNoRoom(message, room) if room else RuntimeError(message))
         self.stopped = False
+        # "READY <n_embd> <reader> [fallback]": the reader that runs (own: Strata's, mtmd: llama.cpp's; an older strata-vision says only "READY <n_embd>"),
+        # and "fallback" when Strata's reader did not start and llama.cpp's took its place (strata-vision wrote the reason to the log)
+        words = line.split()
+        self.reader = words[2] if len(words) > 2 else None
+        if "fallback" in words[3:]:
+            print("[strata] Strata's picture reader did not start; pictures are read with llama.cpp's reader. Details are in the log.", flush=True)
 
     #: how long a reader that has already ended may still hold its output pipe open (a debugger attached to it, a child it started) before the start is
     #: judged: the pipe's end does not come, the process's end is what counts.

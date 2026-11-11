@@ -85,5 +85,9 @@
  "fx84": "O arquivo foi baixado. «Continuar» tenta a instalação de novo.",
  "fx85": "Abra «Detalhes» para ver o motivo.",
  "fxec1": "Há um motor mais recente para este computador. Seus modelos e configurações permanecem como estão.",
- "fxec2": "Descarregue primeiro os modelos em execução."
+ "fxec2": "Descarregue primeiro os modelos em execução.",
+ "fxpr1": "Leitor de imagens",
+ "fxpr2": "O do Strata (recomendado)",
+ "fxpr3": "O do llama.cpp",
+ "fxpr4": "Qual programa transforma as imagens em algo que o modelo consegue ler. O do Strata é mais rápido na maioria dos computadores e lê corretamente imagens muito grandes; em algumas placas de vídeo onde ainda é mais lento, o Strata usa sozinho o do llama.cpp. Escolha o do llama.cpp se as imagens forem lidas de forma errada."
 }
