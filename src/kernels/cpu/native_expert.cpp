@@ -626,12 +626,17 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
         const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
         for (int t = 0; t < nt; ++t) {
+            // g and u are read back after both calls (so the up row's dot starts while the gate row's result is still on its way)
+            // and each with its own 4-byte load: GCC on arm64 put them side by side and read both with one 8-byte ldp, a load
+            // that the two dots' separate 4-byte stores cannot forward to, so every row pair stalled until the stores drained
+            // (OWN-2N2: 2% of the Spark's gate/up time with the quant layer's 4-argument dot).  A volatile access is never
+            // paired.  The same arithmetic, the same bits.
             float g = 0.f, u = 0.f;
             dot.dot(n, &g, gr, act[t]);
             dot.dot(n, &u, ur, act[t]);
-            g *= sg;
-            u *= su;
-            ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+            const float gs = *static_cast<volatile const float*>(&g) * sg;
+            const float us = *static_cast<volatile const float*>(&u) * su;
+            ff[t][r] = (gs / (1.f + std::exp(-gs))) * us;
         }
     }
 }
