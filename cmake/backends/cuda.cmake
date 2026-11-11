@@ -116,7 +116,7 @@ macro(strata_cuda_mmq)
     # P4-SPLIT: Strata's own prompt kernels (the fused int8 experts) are a library of their own, strata_pf_own, so that a
     # build without llama.cpp's MMQ keeps them.  With MMQ they are compiled with strata_mmq's command line (strata_pf_own_mirror
     # below) and strata_mmq hands them on (PUBLIC): every target that links strata_mmq gets the same objects as before.
-    add_library(strata_pf_own STATIC src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu)
+    add_library(strata_pf_own STATIC src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu src/prefill/moe_helpers.cu)
     if(STRATA_EXPERIMENTAL_SM60 AND NOT STRATA_HIP_GFX906)
       # GP100 (sm_60): a resident layer's experts weight-stationary, one launch per product (moe_ws.hpp; opt-in at
       # run time, STRATA_MMQ_WS=1, and only where every visible GPU is cc 6.0)

@@ -48,7 +48,8 @@ macro(strata_hip_mmq)
     set(_strata_pf_own_sources
       src/prefill/moe_fused.cu
       src/prefill/moe_fused_iq.cu
-      src/prefill/moe_f16_kq.cu)
+      src/prefill/moe_f16_kq.cu
+      src/prefill/moe_helpers.cu)   # the gathers, SwiGLU passes and row table (cut from moe_mmq.cu)
     if(STRATA_MMQ_KQUANTS)
       # the same K-quant instances as the CUDA branch: on HIP they serve the dense GGUF projections
       # of Gemm::native (STRATA_DENSE_MMQ=1), the mixed-quant packs' attention/PLE tensors
