@@ -11238,6 +11238,10 @@ int main(int argc, char** argv) {
         // ~1 GiB and fell back to the CPU (91 s for a 2048x1536 picture against about 0.5 s on the card).  The engine gives
         // those pages back; the experts of the slots the prompt path borrows keep theirs (their refill reads them).  The
         // cache holds the same bytes either way, so no output bit changes.  STRATA_UMA_DROP_PAGES=0 keeps the pages (the A/B arm).
+        // Linux CUDA builds only: an AMD APU (HIP maps the attribute to hipDeviceAttributeIntegrated) is not measured with it, the
+        // gfx906 layer has no such attribute, Metal reports every Mac as integrated, and Windows has no page drop
+        // (tools/test_uma_drop_guard.py checks this guard).
+#if defined(__linux__) && !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)   // SPARK-UMA-DROP
         if (srcp == &src && gpu_holds_all && !multi_gpu && stages.empty() && [] {
                 const char* v = std::getenv("STRATA_UMA_DROP_PAGES");
                 return v == nullptr || v[0] != '0';
@@ -11253,9 +11257,10 @@ int main(int argc, char** argv) {
                     return sl != strata::core::kNotResident && sl >= keep_from;
                 });
                 (void) cudaMemGetInfo(&f1, &tb);
-                // [DRAFT]: the owner words this line (par/OWNER-WORDING-1111.md, SPARK)
-                std::fprintf(stderr, "[DRAFT] strata serve: this GPU shares the system memory and holds every expert, so the "
-                                     "model file's cached copy of them is given back.\n");
+                // [DRAFT]: the owner words this line (par/OWNER-WORDING-1111.md, SPARK); only when pages were given back
+                if (freed > 0)
+                    std::fprintf(stderr, "[DRAFT] strata serve: this GPU shares the system memory and holds every expert, so the "
+                                         "model file's cached copy of them is given back.\n");
                 const char* tr = std::getenv("STRATA_UMA_DROP_PAGES");   // 2: the numbers too (research)
                 if (tr != nullptr && tr[0] == '2')
                     std::fprintf(stderr, "strata serve: STRATA_UMA_DROP_PAGES: %.2f GiB of expert pages given back in %.1f ms; "
@@ -11266,6 +11271,7 @@ int main(int argc, char** argv) {
                 (void) cudaGetLastError();
             }
         }
+#endif   // SPARK-UMA-DROP
         rss_probe("the prompt path set up");
         // layer split across GPUs: a prompt path per stage, each handing its chunk's rows to the next.
         // THE CHUNK STEPS DOWN INSTEAD OF EXITING.  A split's stage caches are sized after the arena is registered, and
