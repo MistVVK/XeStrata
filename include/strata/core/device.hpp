@@ -58,6 +58,23 @@ void apply_uma_limit(uint64_t& free);
 /// A discrete GPU's free memory on Windows: at most what the OS's budget for this process leaves it
 /// (platform::gpu_local_memory_budget), for the GPU at the PCI address `pci`.  Elsewhere `free` stays as it is.
 void apply_os_budget(const std::string& pci, uint64_t& free);
+/// The room on a device no plan counts: what the driver and the runtime keep for themselves, the copies' staging
+/// and the buffers allocated after the plan is made.  One rule for every engine and every stage (AGENTS.md, the
+/// first rule: from the device's report, never its name): a 32nd of the memory the engine sees for the device
+/// (`total_bytes`: gpu::mem_info's, STRATA_VRAM_LIMIT_MIB applied), kept between `least_b` and `most_b`, of which
+/// the caller keeps one `parts`th.
+///
+/// The bounds are each caller's own measure.  The defaults, 512 MiB up to 768, are the room the image pipelines
+/// and SeedVR2 keep for the driver's own and the copies' room on every card they were run on; the share reaches
+/// that on a 16 GiB card (16304 / 32 = 509 MiB) and passes 512 MiB past 16 GiB of memory, up to 768.  The plain
+/// engine passes its measured 192 MiB (src/core/plain_model.cpp, 2026-10-12: under STRATA_VRAM_LIMIT_MIB=4096 the
+/// peak stayed below the card with 128 MiB, where 768 MiB of before left 700 MiB of it unused) and counts the
+/// libraries and graphs it allocates after the tier beside it; Qwen3.8 passes 700 MiB, the room its graphs, hit
+/// scratch and head measured.  A stage that runs beside a plan which already keeps the whole room asks for a part
+/// of it: `parts` 2, 4 and 8 are SeedVR2's VAE, MOSS-Image's decode and its encoders, whose 256, 128 and 64 MiB
+/// on the 16 GiB card are a half, a quarter and an eighth of that room.
+uint64_t vram_room(uint64_t total_bytes, uint64_t parts = 1, uint64_t least_b = 512ull << 20,
+                   uint64_t most_b = 768ull << 20);
 /// The VRAM to leave unused for the runtime's and the driver's own allocations, where the driver's free memory shows
 /// no use at all: i915 gives a process without CAP_PERFMON the whole VRAM as free (an A380's 5783 MiB however much is
 /// allocated), so the engine counts what it holds itself, and this is what that count lacks.  0 for a GPU whose report

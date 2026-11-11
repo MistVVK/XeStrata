@@ -30,7 +30,6 @@ constexpr uint64_t kMiB = 1ull << 20;
 // the text encoder's longest prompt, references' rows among it (its K/V cells, shared by its layers: 32 MiB for
 // Qwen3-VL-8B)
 constexpr int64_t kTextTokens = 16384;
-constexpr uint64_t kMargin = 512 * kMiB;      // the driver's own and the copies' room, kept free
 constexpr uint64_t kScratch = 384 * kMiB;     // the products' dequantization scratch (the DiT's and the encoder's)
 
 uint64_t clampu(uint64_t v, uint64_t lo, uint64_t hi) { return std::max(lo, std::min(v, hi)); }
@@ -50,6 +49,15 @@ uint64_t free_vram() {
     size_t free = 0, total = 0;
     gpu::mem_info(&free, &total);
     return free;
+}
+
+// The room this device's driver and runtime keep for themselves, and the copies' staging: the one rule every
+// engine and stage sizes by (core::vram_room), of the memory the engine sees for this device.  `parts`: the part
+// of it a stage keeps beside a plan that already keeps the whole room (MOSS-Image's slack beside its estimates).
+uint64_t vram_room(uint64_t parts) {
+    size_t free = 0, total = 0;
+    gpu::mem_info(&free, &total);
+    return core::vram_room(total, parts);
 }
 
 // The device's memory in use past this process's own allocations (gpu::device_held): the runtime's and the libraries'
@@ -85,8 +93,9 @@ void ImagePipeline::vram_into(QiNeed& n) const {
 }
 
 uint64_t vram_cap(uint64_t total) {
-    uint64_t cap = total > kMargin ? total - kMargin : 0;
-    if (const uint64_t l = core::vram_limit_bytes(); l > 0) cap = std::min(cap, l > kMargin ? l - kMargin : 0);
+    const uint64_t margin = vram_room();
+    uint64_t cap = total > margin ? total - margin : 0;
+    if (const uint64_t l = core::vram_limit_bytes(); l > 0) cap = std::min(cap, l > margin ? l - margin : 0);
     return cap;
 }
 

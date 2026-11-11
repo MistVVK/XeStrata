@@ -233,6 +233,10 @@ protected:
 uint64_t vram_cap(uint64_t total);
 /// The device's free VRAM now (gpu::mem_info).
 uint64_t free_vram();
+/// The room this device's driver and runtime keep for themselves and the copies' staging takes: core::vram_room of
+/// the memory the engine sees for the device (gpu::mem_info's total, STRATA_VRAM_LIMIT_MIB applied).  `parts`: the
+/// part of it a stage keeps beside a plan that already keeps the whole room (MOSS-Image's and SeedVR2's slack).
+uint64_t vram_room(uint64_t parts = 1);
 /// The device's memory in use past this process's own allocations (gpu::device_held).
 int64_t vram_other();
 

@@ -54,6 +54,11 @@ uint64_t vae_video_need(const image::MfVae& vae, int64_t th, int64_t tw, int64_t
 // the tiles video_begin tries after the frame whole, largest first
 constexpr int64_t kVaeTiles[] = {64, 48, 40, 32, 24, 16};
 
+// the room this device keeps free beside the plan (image::vram_room, D5): the whole of it is the plan's margin,
+// half of it what a VAE call leaves while the other parts hold their place - the 512 and 256 MiB those measured
+// on the 16 GiB card, where the room is 512 MiB
+uint64_t room_margin(uint64_t parts = 1) { return image::vram_room(parts); }
+
 // a frame's RGB in -1 .. 1, [3][H][W] FP32, from RGBA8 [H][W][4]
 void rgb_of(const uint8_t* rgba, int64_t HW, float* rgb, void* s) {
     q_of(s).parallel_for(sycl::range<1>((size_t) (3 * HW)), [=](sycl::id<1> id) {
@@ -347,7 +352,7 @@ void Seedvr2::video_begin(int64_t w, int64_t h, int64_t frames, uint64_t seed, i
     // chunk's DiT activations and the VAE's slice (they take the room in turns), the rest the DiT's resident blocks.
     // The chunk (0: the largest that fits) and the VAE's tiles (the largest that fit: the frame whole where it does)
     // from it
-    const uint64_t margin = 512ull << 20;
+    const uint64_t margin = room_margin();
     const auto fixed = [&](int64_t cl) {
         return m.vae_bytes + m.dit->weight_bytes() + m.dit->block_min() + (uint64_t) (cl * n) * 4 * 7 +
                (uint64_t) HW * 4 * 3 + margin;
@@ -561,7 +566,7 @@ void Seedvr2::run_clip(const uint8_t* in, int64_t w, int64_t h, int64_t frames, 
         // else the VAE's passes take their room whole first and the blocks what is left (two slots at least), the
         // encoder's tiles (each the whole encoder over its part) costing more than the blocks' streaming
         const int64_t th0 = h / 16, tw0 = w / 16;
-        const uint64_t own = (uint64_t) (3 * w * h + 4 * th0 * tw0 * 64 + 4 * w * h) * 4, margin = 512ull << 20;
+        const uint64_t own = (uint64_t) (3 * w * h + 4 * th0 * tw0 * 64 + 4 * w * h) * 4, margin = room_margin();
         const uint64_t fixed = m.vae_bytes + m.dit->weight_bytes() + own + margin;
         const uint64_t act = m.dit->activation_bytes(th0, tw0), enc = m.vae->encode_scratch_bytes(th0, tw0);
         const uint64_t vae_least = std::max(m.vae->least_scratch_bytes(th0, tw0),
@@ -592,7 +597,7 @@ void Seedvr2::run_clip(const uint8_t* in, int64_t w, int64_t h, int64_t frames, 
         {   // the encoder in the VRAM that is free now (in tiles where the whole does not fit), a margin kept
             size_t free = 0, total = 0;
             gpu::mem_info(&free, &total);
-            const uint64_t margin = 256ull << 20;
+            const uint64_t margin = room_margin(/*parts*/ 2);
             m.vae->encode(rgb, th, tw, nullptr, cond, free > margin ? (uint64_t) free - margin : 0);
         }
         kernels::scale_inplace(cond, n, kScaling, m.s);
@@ -610,7 +615,7 @@ void Seedvr2::run_clip(const uint8_t* in, int64_t w, int64_t h, int64_t frames, 
         {   // the decoder in the VRAM that is free now (in tiles where the whole does not fit), a margin kept
             size_t free = 0, total = 0;
             gpu::mem_info(&free, &total);
-            const uint64_t margin = 256ull << 20;
+            const uint64_t margin = room_margin(/*parts*/ 2);
             m.vae->decode(cond, th, tw, planes, free > margin ? (uint64_t) free - margin : 0);
         }
         rgba8_of(planes, fin, HW, out + f * HW * 4, m.s);

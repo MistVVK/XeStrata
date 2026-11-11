@@ -349,8 +349,13 @@ struct Options {
     bool no_publish_kernel = false;    ///< plan v0.3 P3 A/B: memcpy nodes for the doorbell and QSA step
     bool no_fused_gdn = false;         ///< plan v0.3 P3 A/B: llama.cpp-layout GDN step + separate out norm
     /// Plan v0.3 P4: `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session
-    /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.
-    int vram_reserve_mib = 700;
+    /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.  -1 (the default, unless
+    /// --vram-reserve-mib says otherwise) takes the room the device reports (core::vram_room, D5), never under the
+    /// 700 MiB those measured on the B70 and the RTX 4070: the rule the image pipelines and the plain engine size
+    /// their own room by, with this engine's measured room as its floor.
+    int vram_reserve_mib = -1;
+    /// The room --expert-cache auto keeps when --vram-reserve-mib is not given and the device's memory is unknown.
+    static constexpr int kVramReserveFloorMib = 700;
     /// --vram-free-mib: the free VRAM at the start the auto expert cache counts at most (setup writes what its warm-up
     /// saw, less a margin; -1: what is free)
     int64_t vram_free_mib = -1;
@@ -2917,14 +2922,24 @@ int main(int argc, char** argv) {
     size_t start_free_b = 0;
     {
         size_t total_b = 0;
-        if (strata::gpu::mem_info(&start_free_b, &total_b))
+        if (strata::gpu::mem_info(&start_free_b, &total_b)) {
+            // the auto cache's reserve, from this device's memory: the one rule every engine and stage sizes its
+            // room by (core::vram_room, D5), floored at the room this engine measured for its graphs, the hit
+            // scratch and the head.  A --vram-reserve-mib on the command line keeps its own value (#496).
+            if (!o.vram_reserve_given)
+                o.vram_reserve_mib =
+                    (int) (strata::core::vram_room(total_b, /*parts*/ 1,
+                                                   (uint64_t) Options::kVramReserveFloorMib << 20) >> 20);
             std::fprintf(stderr, "xestrata generate: %llu MiB of VRAM free at the start%s\n",
                          (unsigned long long) (start_free_b >> 20),
                          o.vram_free_mib >= 0 ? (" (the cache counts at most " + std::to_string(o.vram_free_mib) +
                                                  ": --vram-free-mib)").c_str() : "");
-        else
+        } else {
+            // the device's memory unknown: the room measured on the smallest card it has to fit
+            if (!o.vram_reserve_given) o.vram_reserve_mib = Options::kVramReserveFloorMib;
             std::fprintf(stderr, "xestrata generate: the VRAM free at the start is unknown (%s)\n",
                          strata::gpu::last_error());
+        }
     }
     strata::core::progress_at("starting: building the GPU kernels (on a thread beside the load)");
     strata::core::Runtime::get().preload_kernels();   // beside the model's loading

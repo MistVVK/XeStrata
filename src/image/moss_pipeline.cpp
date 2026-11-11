@@ -37,6 +37,12 @@ constexpr int64_t kMaxTokens = 4096;  // its text encoder's longest prompt
 // (Qwen3.5-9B Q4_K_M, 2026-10-28): 1805 MiB in all, 1260 past token_embd; the first open measures it on this GPU and
 // that replaces it.
 constexpr uint64_t kTextWork = 1280 * kMiB;
+// the room a stage keeps beside the plan it was given, for the device's own use past what held() counts: an
+// eighth of the device's room (core::vram_room, D5; the 64 MiB measured here on the 16 GiB card, where the
+// room is 512).
+uint64_t stage_slack() { return vram_room(/*parts*/ 8); }
+// ... and a quarter for a whole frame's VAE work: the 128 MiB the RTX 4070's refused 64 MiB buffer measured
+uint64_t frame_slack() { return vram_room(/*parts*/ 4); }
 
 uint64_t clampu(uint64_t v, uint64_t lo, uint64_t hi) { return std::max(lo, std::min(v, hi)); }
 
@@ -446,7 +452,7 @@ void MossPipeline::fit_text() {
     if (!te_) return;
     auto room = [&]() -> uint64_t {
         const uint64_t others = held() - te_->layers_vram(), on_device = free_vram() + te_->layers_vram(),
-                       slack = (uint64_t) 64 << 20;
+                       slack = stage_slack();
         return std::min<uint64_t>(budget() > others ? budget() - others : 0, on_device > slack ? on_device - slack : 0);
     };
     if (room() < te_set_ && vae_) vae_->drop_scratch();
@@ -487,7 +493,7 @@ void MossPipeline::encode_base(const QiRequest& r, const QiRef& base, LatentStar
     // the encoder's room by the device's own count as well: the last request's parts may hold more than held() counts
     // (an edit after an edit on the RTX 4070's 12 GB held 11525 MiB of an 11215 MiB budget, and the encode was refused)
     const uint64_t enc = vae_->encode_scratch_bytes(h, w) + (uint64_t) (3 * r.width * r.height) * 4 +
-                         (vae_->has_encoder() ? 0 : vae_->encoder_bytes()) + (64ull << 20);
+                         (vae_->has_encoder() ? 0 : vae_->encoder_bytes()) + stage_slack();
     if (held() + more > budget() || free_vram() < enc) release(false);
     std::string err;
     if (!vae_->open_encoder(err)) throw std::runtime_error(err);
@@ -521,7 +527,7 @@ std::vector<QiVisionOut> MossPipeline::encode_pictures(const std::vector<QiRef>&
         if (!size.open(vision_path_, s_, err, true)) throw std::runtime_error(err);
         int64_t most = 0;
         for (const QiRef& f : pictures) most = std::max<int64_t>(most, (f.height / 16) * (f.width / 16));
-        const uint64_t need = size.weight_bytes() + size.scratch_bytes(most) + (64ull << 20);
+        const uint64_t need = size.weight_bytes() + size.scratch_bytes(most) + stage_slack();
         auto room = [&]() -> uint64_t {
             const uint64_t h = held();
             return std::min(budget() > h ? budget() - h : 0, free_vram());
@@ -747,7 +753,7 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
                 enc = std::max(enc, vae_->encode_scratch_bytes(f.height / 16, f.width / 16) +
                                         (uint64_t) (3 * f.width * f.height) * 4 +
                                         (uint64_t) (d.latent_channels() * (f.height / 16) * (f.width / 16)) * 4);
-            enc += (vae_->has_encoder() ? 0 : vae_->encoder_bytes()) + (64ull << 20);
+            enc += (vae_->has_encoder() ? 0 : vae_->encoder_bytes()) + stage_slack();
             if (free_vram() < enc) d.drop_activations();
             if (free_vram() < enc && te_ && te_->layers_vram() > te_->layer_min()) {
                 te_->set_layer_budget(te_->layer_min());
@@ -872,7 +878,8 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
             if (budget() > others) room = std::max(room, budget() - others);
         }
         room = std::min(room, free_vram() + vae_->scratch_held());
-        room -= std::min(room, (uint64_t) 128 << 20);
+        const uint64_t slack = frame_slack();
+        room -= std::min(room, slack);
         vae_->decode(x, h, w, rgba, room);
         p.vae_tiled = vae_->last_tiled();
         if (vae_->scratch_bytes(h, w) > p.vae) vae_->drop_scratch();

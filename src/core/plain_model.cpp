@@ -81,6 +81,11 @@ namespace {
 
 namespace k = strata::kernels;
 
+// The plain engine's floor for the room no plan counts (core::vram_room, D5): under STRATA_VRAM_LIMIT_MIB=4096 on
+// the RX 9060 XT the peak stayed below the card with 128 MiB kept free - llm-jp Q4_K_M, Ornith Q4_K_M and
+// GSQ-RCO 3bit, 2026-10-12 - where the 768 MiB of before left 700 MiB of the card unused.
+constexpr uint64_t kTierRoomLeast = 192ull << 20;
+
 constexpr int kQ6K = 14;
 constexpr int kQ80 = 8;
 constexpr int kBF16 = 30;   // a BF16 file's projections: bf16_gemv_fp32_mmvf_multi on the FP32 rows
@@ -601,8 +606,10 @@ bool PlainModel::auto_gpu_layers(std::string& err) {
                                  : (uint64_t) (cells * nkv * s.key_length) * 2 * (opt_.kv_int8 ? 1 : 2);
     }
     // the window's and the prompt's buffers and the driver's share: the layer split's reserve (split_auto_points)
-    const uint64_t reserve = opt_.reserve_mib >= 0 ? (uint64_t) opt_.reserve_mib << 20
-                             : std::clamp<uint64_t>((uint64_t) t / 32, 192ull << 20, 768ull << 20) + (1ull << 30);
+    // - the device's room, core::vram_room, plus the 1 GiB this stage's windows and prompt path take
+    const uint64_t reserve = opt_.reserve_mib >= 0
+                                 ? (uint64_t) opt_.reserve_mib << 20
+                                 : core::vram_room(t, /*parts*/ 1, kTierRoomLeast) + (1ull << 30);
     uint64_t used = head + reserve;
     int64_t fit = 0;
     while (fit < nl && used + block[(size_t) fit] <= free_b) used += block[(size_t) fit++];
@@ -642,8 +649,8 @@ bool PlainModel::split_auto_points(std::string& err) {
         size_t f = 0, t = 0;
         if (!strata::gpu::mem_info(&f, &t)) { err = "plain model: a GPU's memory is unknown"; return false; }
         const uint64_t free_b = f, total_b = t;   // (mem_info applies STRATA_VRAM_LIMIT_MIB)
-        const uint64_t reserve = std::clamp<uint64_t>(total_b / 32, 192ull << 20, 768ull << 20) + (1ull << 30) +
-                                 (d == n - 1 ? head : 0);
+        const uint64_t reserve =
+            core::vram_room(total_b, /*parts*/ 1, kTierRoomLeast) + (1ull << 30) + (d == n - 1 ? head : 0);
         room[(size_t) d] = free_b > reserve ? (double) (free_b - reserve) : 0.0;
         // the link: the best of three 64 MiB copies from pinned host memory
         constexpr size_t kProbe = 64ull << 20;
@@ -1508,12 +1515,10 @@ bool PlainModel::open_experts(std::string& err) {
     }
     const uint64_t window_b = (uint64_t) opt_.max_t * (uint64_t) s.n_expert_used * (uint64_t) s.n_embd * 4 * 3 +
                               16 * lay.max_blob + (64ull << 20);
-    // what is allocated after the tier (the products' libraries, the graphs) and the driver's margin: a 32nd of the
-    // memory, 192 to 768 MiB.  Under STRATA_VRAM_LIMIT_MIB=4096 on the RX 9060 XT the peak stayed below 4 GiB with
-    // 128 MiB (llm-jp Q4_K_M, Ornith Q4_K_M and GSQ-RCO 3bit, 2026-10-12), where the 768 MiB of before left 700 MiB
-    // of the card unused; 768 stays above 24 GiB.
+    // what is allocated after the tier (the products' libraries, the graphs) and the driver's margin: the room of
+    // the device's memory (core::vram_room, D5; its floor kTierRoomLeast above, its 768 MiB ceiling past 24 GiB)
     const uint64_t reserve = opt_.reserve_mib >= 0 ? (uint64_t) opt_.reserve_mib << 20
-                                                   : std::clamp<uint64_t>(total_b_ / 32, 192ull << 20, 768ull << 20);
+                                                   : core::vram_room(total_b_, /*parts*/ 1, kTierRoomLeast);
     const uint64_t room = free_b > window_b + reserve ? free_b - window_b - reserve : 0;
     uint64_t per_layer_b = 0;
     for (int64_t l : moe_local_) per_layer_b += lay.bytes[(size_t) l];
@@ -1706,7 +1711,7 @@ bool PlainModel::open_dense(std::string& err) {
     }
     // what is allocated after (the products' libraries, the graphs) and the driver's margin, as open_experts leaves
     const uint64_t reserve = opt_.reserve_mib >= 0 ? (uint64_t) opt_.reserve_mib << 20
-                                                   : std::clamp<uint64_t>(total_b_ / 32, 192ull << 20, 768ull << 20);
+                                                   : core::vram_room(total_b_, /*parts*/ 1, kTierRoomLeast);
     const uint64_t room = free_b > reserve ? free_b - reserve : 0;
     if (opt_.prompt_chunk > 0) {
         const int64_t asked = opt_.prompt_chunk;
@@ -2192,7 +2197,8 @@ bool PlainModel::kv_grow_to(int64_t cells, std::string& err) {
     const auto t0 = std::chrono::steady_clock::now();
     const int64_t slots0 = cache_.slots();
     if (cache_.segmented()) {   // the tier gives up its last segments for them, beside its usual reserve
-        const int64_t reserve = opt_.reserve_mib >= 0 ? opt_.reserve_mib : (int64_t) (total_b_ >> 20) / 32;
+        const int64_t reserve = opt_.reserve_mib >= 0 ? opt_.reserve_mib
+                                                       : (int64_t) (core::vram_room(total_b_, 1, kTierRoomLeast) >> 20);
         std::string answer;
         if (!vram(reserve + (int64_t) (need >> 20) + 1, answer, err)) return false;
     }
@@ -2267,7 +2273,9 @@ bool PlainModel::vram(int64_t reserve_mib, std::string& answer, std::string& err
         err = "VRAM needs an engine started with --vram-elastic (--serve, one GPU with virtual memory)";
         return false;
     }
-    if (reserve_mib < 0) reserve_mib = opt_.reserve_mib >= 0 ? opt_.reserve_mib : (int64_t) (total_b_ >> 20) / 32;
+    if (reserve_mib < 0)
+        reserve_mib = opt_.reserve_mib >= 0 ? opt_.reserve_mib
+                                            : (int64_t) (core::vram_room(total_b_, 1, kTierRoomLeast) >> 20);
     if (!settle_swaps(true, err)) return false;   // the adaptive tier's copies land first
     if (!strata::gpu::device_sync()) { err = std::string("VRAM: ") + strata::gpu::last_error(); return false; }
     const auto t0 = std::chrono::steady_clock::now();

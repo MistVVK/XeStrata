@@ -1049,6 +1049,14 @@ void apply_vram_limit(uint64_t& free, uint64_t& total, uint64_t held) {
     free = lim > used ? lim - used : 0;
 }
 
+// The room no plan counts, of any device's memory: see the declaration.  A caller that cannot read the device's
+// memory (total 0) gets its own floor, the room measured on the smallest card.
+uint64_t vram_room(uint64_t total_bytes, uint64_t parts, uint64_t least_bytes, uint64_t most_bytes) {
+    const uint64_t floor_b = std::min(least_bytes, most_bytes);
+    const uint64_t room = std::clamp<uint64_t>(total_bytes / 32, floor_b, std::max(floor_b, most_bytes));
+    return parts > 1 ? room / parts : room;
+}
+
 uint64_t unreported_vram_margin(const std::string& pci, uint64_t total) {
     static std::mutex mu;
     static std::vector<std::pair<std::string, bool>> seen;   // the driver of each card asked once

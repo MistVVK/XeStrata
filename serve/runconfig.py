@@ -57,7 +57,8 @@ EDITABLE = [
      "Debug chat log: the most MiB its folder keeps; the oldest go first (default 1024)"),
     ("open_browser", "bool", "Open the chat page in the browser when the model is ready"),
     ("vram_reserve_mib", ("arg", "--vram-reserve-mib"),
-     "VRAM in MiB the engine leaves free for other programs (engine default 700)"),
+     ("VRAM in MiB the engine leaves free for other programs (engine default: a 32nd of the card's memory, "
+      "between 700 and 768 MiB)")),
     ("search_engine", ("enum", list(option_values.SEARCH_ENGINES)),
      "Web search: searxng (the server at search_url), deepseek (DeepSeek's search API, billed per search) or "
      "tinyfish (TinyFish's search API, free up to a daily allowance)"),

@@ -713,7 +713,7 @@ About の「Check now」と `./setup.sh --check-update`（パッケージでは 
 ### ほかのプログラムのために VRAM を空ける
 
 XeStrata は、GPU の空いている VRAM をエキスパートで埋め（エキスパートのキャッシュ）、`--vram-reserve-mib` MiB だけを空けておきます。
-既定は 700 です。
+既定は機器のメモリの 32 分の 1 で、700 MiB から 768 MiB の間です（16 GiB のカードでは 700 MiB、24 GiB 以上では 768 MiB）。画像のエンジンと SeedVR2 も、同じ式で自分の余白を決めます（`core::vram_room`）。
 ゲーム、3D のプログラム、別のモデルを横で動かすなら、もっと空けます（upstream #493）。
 
 - `./setup.sh --vram-reserve-mib 2048` は、その値をモデルの `xestrata-<model>.json` に書いてから起動します。

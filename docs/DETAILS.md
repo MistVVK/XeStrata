@@ -763,7 +763,7 @@ About's "Check now" and `./setup.sh --check-update` (`xestrata --check-update` w
 
 ### Leaving VRAM for other programs
 
-XeStrata fills the GPU's free VRAM with experts (the expert cache) and leaves `--vram-reserve-mib` MiB free: 700 by default.
+XeStrata fills the GPU's free VRAM with experts (the expert cache) and leaves `--vram-reserve-mib` MiB free: by default a 32nd of the device's memory, between 700 MiB and 768 MiB (700 on a 16 GiB card, 768 past 24 GiB). The image engine and SeedVR2 size their own room by the same rule (`core::vram_room`).
 For a game, a 3D program or another model beside it, leave more (upstream #493).
 
 - `./setup.sh --vram-reserve-mib 2048` writes it into the model's `xestrata-<model>.json` and starts it.

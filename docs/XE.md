@@ -644,7 +644,7 @@ On the development machine it happened 3 times in about 120 starts.
 
 ### The VRAM reserve on a small card
 
-On a small card (upstream #496), the default 700 MiB reserve can leave the cache too few slots to lend the prefill path a 256-token chunk.
+The default reserve is a 32nd of the device's memory, between 700 MiB and 768 MiB (the same expression as the plain engine's: core::vram_room; a 16 GiB card takes the 700 MiB floor, a card past 24 GiB the 768 MiB ceiling). On a small card (upstream #496) that 700 MiB can leave the cache too few slots to lend the prefill path a 256-token chunk.
 The engine then lowers the reserve to what leaves that many:
 down to 300 MiB, and not below a reserve given with `--vram-reserve-mib`.
 When even that is not enough, the start stops and says how many MiB are short and what makes room.
@@ -761,6 +761,6 @@ XeStrata uses them as they are; only some have been tuned on Xe.
 | `src/program/generate.cpp` | Native missed-expert PCIe share 0.55 (canonical 0.2), scaled by min(1, link GB/s / 20), the link read as the best of four 256 MiB bursts | On the new development machine 0.15 was 2–4% faster and every larger share slower; the measurement does not support 0.55 |
 | `tools/calibrate.py` | Baseline Ryzen 5 7600 + RTX 5070; PCIe candidates 0/0.2/0.35/0.55/0.75, draft floor 0.3/0.5/0.7, worker candidates; interleaved confirmation requires >3% gain | Candidates and baseline unchanged from upstream |
 | `setup.py` | `--spec 4`, `--spec-min-p 0.5`, `--expert-cache auto`, `--prefill auto` | `--prefill auto` now picks chunks up to 32768 tokens; a chunk that does not fit with the default ring takes a 96-slot ring (upstream #583; IQ3_S on the B70 limited to 8 GB: 8K and 32K prompts 1.5-2x); one that still does not fit is planned again with the int8 products' group scratch (GU, H, Hq) sized for one group's rows instead of the chunk's (RTX 4070, IQ3_XXS 32K: the chunk 8192 -> 16384, prefill 1,194 -> 2,058 tok/s; a group's tile shape rounds its sums, so the answer can differ a little from the uncapped run's); the window's size comes from the output per ms at the measured window times and the corrected probabilities, not from the `--spec-min-p` floor (`--spec-window auto`, [DETAILS](DETAILS.md#tuning-for-your-pc---calibrate)); the rest as upstream |
-| `src/program/generate.cpp` | 700 MiB VRAM reserve (down to 300 on a small card); prefill borrowing and chunk selection; cache adaptation every 4 rounds and up to 96 swaps | As upstream |
+| `src/program/generate.cpp` | the VRAM reserve (a 32nd of the device's memory, 700 to 768 MiB; down to 300 on a small card); prefill borrowing and chunk selection; cache adaptation every 4 rounds and up to 96 swaps | the reserve's size now comes from the device's report (upstream keeps it at a fixed 700 MiB); the rest as upstream |
 | `src/program/generate.cpp` and the CPU pool | Physical-core worker heuristic plus host worker; cache-hit pokes and graph/doorbell scheduling | The worker count was measured on the new machine: 7 to 19 workers decode equally fast, so the default stays |
 | `src/kernels/cpu/iq_avx512.cpp` | Software prefetch distance and AVX-512-specific tuning | Not measured: the development machine has no AVX-512 |
