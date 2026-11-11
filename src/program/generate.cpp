@@ -16439,15 +16439,18 @@ int main(int argc, char** argv) {
             // conversation, a parked one coming back, a batch slot, a borrow, another cvec) parks as before.
             bool reply_replaced = false;
             if (!from_live && !incoming && !borrow && slot_source < 0 && lent_slot < 0 && live_ok && !pin_sibling &&
-                want_cvec == cvec_cached && resume > 0 && imgs_below(live_imgs, resume) == live_imgs)
+                want_cvec == cvec_cached && resume > 0) {
+                std::vector<int64_t> live_pictures;
+                for (const ImgKey& k : live_imgs) live_pictures.push_back((int64_t) k.start);
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == resume && starts_with(c.ids, c.imgs) &&
-                        strata::program::live_tail_is_replaced_reply(live, ids, resume, o.turn_token)) {
+                        strata::program::live_tail_is_replaced_reply(live, ids, resume, o.turn_token, live_pictures)) {
                         reply_replaced = true;
                         break;
                     }
+            }
             if (reply_replaced)
-                std::fprintf(stderr, "strata serve: conversation cache: the reply this request replaces is not parked (%lld "
+                std::fprintf(stderr, "[DRAFT] strata serve: conversation cache: the reply this request replaces is not parked (%lld "
                                      "tokens past the turn checkpoint at %lld)\n", (long long) ((int64_t) live.size() - resume),
                              (long long) resume);
             // --conversation-cache-park-gain N: a park now would supersede the entry parked_prefix_tokens() reports (the copy

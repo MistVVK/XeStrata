@@ -23,11 +23,14 @@ namespace strata::program {
 //     ids[resume + 1] == live[resume + 1]): the same assistant turn, re-sent or opened again;
 //   - live and the prompt agree on [0, resume) (the caller resumes from a checkpoint of exactly those tokens; checked
 //     here again so the rule stands alone).
-// Pictures are the caller's: it asks only when the live branch has none at or past `resume`.
+//   - the live branch has no picture at or past `resume` (`live_pictures`: where each of its pictures starts): a branch
+//     whose tail holds a picture is parked as before (a chat request's reply holds none, so this is a guard).
 template<class LiveTok, class PromptTok>
 bool live_tail_is_replaced_reply(const std::vector<LiveTok>& live, const std::vector<PromptTok>& ids, int64_t resume,
-                                 int64_t turn_token) {
+                                 int64_t turn_token, const std::vector<int64_t>& live_pictures = {}) {
     if (turn_token < 0 || resume < 1) return false;
+    for (const int64_t at : live_pictures)
+        if (at >= resume) return false;
     const auto r = static_cast<std::size_t>(resume);
     if (live.size() < r + 2 || ids.size() < r + 2) return false;
     if (static_cast<int64_t>(live[r]) != turn_token || static_cast<int64_t>(ids[r]) != turn_token) return false;

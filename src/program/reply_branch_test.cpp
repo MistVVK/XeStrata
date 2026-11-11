@@ -63,6 +63,11 @@ int main() {
     assert(!live_tail_is_replaced_reply(to32(cat({history, {S}})), cat({history, head}), turn, S)); ++cases;
     // the prompt ends right at the turn opening (one token past resume): no role to compare
     assert(!live_tail_is_replaced_reply(live, cat({history, {S}}), turn, S)); ++cases;
+    // picture_at_or_past_checkpoint_parks: the live branch has a picture at or past resume: parked as before
+    assert(!live_tail_is_replaced_reply(live, cat({history, head}), turn, S, {turn})); ++cases;
+    assert(!live_tail_is_replaced_reply(live, cat({history, head}), turn, S, {2, turn + 3})); ++cases;
+    // a picture before the checkpoint (in the reused history) does not stop the rule
+    assert(live_tail_is_replaced_reply(live, cat({history, head}), turn, S, {2})); ++cases;
     // no turn token configured, resume 0
     assert(!live_tail_is_replaced_reply(live, cat({history, head}), turn, -1)); ++cases;
     assert(!live_tail_is_replaced_reply(live, cat({history, head}), 0, S)); ++cases;
