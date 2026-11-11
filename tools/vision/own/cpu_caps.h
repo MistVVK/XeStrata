@@ -69,8 +69,8 @@ inline const Caps& caps() {
     return c;
 }
 
-inline bool isa_ok(Isa i) {
-    const Caps& c = caps();
+// the same two questions for any feature set (the tests give the sets of the CPU classes; the program asks caps())
+inline bool isa_ok_for(const Caps& c, Isa i) {
     if (i == Isa::Avx512) return c.avx512 && c.avx2 && c.fma;
     if (i == Isa::Avx2) return c.avx2 && c.fma && c.f16c;
     if (i == Isa::Avx) return c.avx && c.sse41;
@@ -83,21 +83,27 @@ inline bool isa_ok(Isa i) {
     return true;
 }
 
-// the best tier this CPU runs, capped by STRATA_FORCE_ISA=scalar|sse41|avx|avx2|avx512 (on AArch64: neon, or scalar)
-inline Isa best_isa() {
+inline bool isa_ok(Isa i) { return isa_ok_for(caps(), i); }
+
+// the best tier a CPU with feature set `c` runs, capped by `force` (STRATA_FORCE_ISA's value, may be null): scalar|sse41|avx|avx2|avx512 (on AArch64: neon, or scalar)
+inline Isa best_isa_for(const Caps& c, const char* force) {
 #if defined(__aarch64__) || defined(_M_ARM64)
-    if (const char* e = std::getenv("STRATA_FORCE_ISA"))
-        if (std::string(e) == "scalar") return Isa::Scalar;
+    (void) c;
+    if (force && std::string(force) == "scalar") return Isa::Scalar;
     return Isa::Neon;
-#endif
-    Isa best = isa_ok(Isa::Avx512) ? Isa::Avx512 : isa_ok(Isa::Avx2) ? Isa::Avx2 : isa_ok(Isa::Avx) ? Isa::Avx : isa_ok(Isa::Sse41) ? Isa::Sse41 : Isa::Scalar;
-    if (const char* e = std::getenv("STRATA_FORCE_ISA")) {
-        const std::string s(e);
+#else
+    Isa best = isa_ok_for(c, Isa::Avx512) ? Isa::Avx512 : isa_ok_for(c, Isa::Avx2) ? Isa::Avx2 : isa_ok_for(c, Isa::Avx) ? Isa::Avx : isa_ok_for(c, Isa::Sse41) ? Isa::Sse41 : Isa::Scalar;
+    if (force) {
+        const std::string s(force);
         const Isa cap = s == "scalar" ? Isa::Scalar : s == "sse41" ? Isa::Sse41 : s == "avx" ? Isa::Avx : s == "avx2" ? Isa::Avx2 : Isa::Avx512;
         if ((int) cap < (int) best) best = cap;
     }
     return best;
+#endif
 }
+
+// the best tier this CPU runs, capped by STRATA_FORCE_ISA
+inline Isa best_isa() { return best_isa_for(caps(), std::getenv("STRATA_FORCE_ISA")); }
 
 inline const char* isa_name(Isa i) {
     return i == Isa::Neon ? "neon" : i == Isa::Avx512 ? "avx512" : i == Isa::Avx2 ? "avx2" : i == Isa::Avx ? "avx" : i == Isa::Sse41 ? "sse41" : "scalar";

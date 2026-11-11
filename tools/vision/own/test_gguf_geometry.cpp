@@ -74,6 +74,52 @@ int main(int argc, char** argv) {
         CHECK(vision_tower_default("mtmd", note) == "mtmd" && vision_tower_default("own", note) == "own" && vision_tower_default("auto", note) == "auto" && note.empty());
         CHECK(vision_tower_default("llama", note) == "auto" && note.find("STRATA_VISION_TOWER=llama") != std::string::npos);
     }
+    {   // `--tower auto` on the CPU path by CPU class (owner 11-11: ours below AVX2 too), for both reader files' geometry; the explicit settings are never overruled
+        VitGeometry g38;      // the Qwen3.8 tower (projection 2560) and the Qwen3.6 tower (2048): the two public mmproj files' numbers
+        g38.projector = "qwen3vl_merger"; g38.layers = 27; g38.width = 1152; g38.heads = 16; g38.head_dim = 72; g38.ffn = 4304; g38.patch = 16; g38.merge = 2;
+        g38.image_size = 768; g38.pos_grid = 48; g38.out_dim = 2560; g38.patch_taps = 2; g38.merger_in = 4608; g38.merger_hidden = 4608;
+        VitGeometry g36 = g38;
+        g36.out_dim = 2048;
+        quant::Caps none_;                                               // an x86-64 CPU older than SSE4.1: the scalar tier
+        quant::Caps nehalem = none_;  nehalem.sse41 = true;              // no AVX: Nehalem, Westmere
+        quant::Caps sandy = nehalem;  sandy.avx = true;                  // AVX, no F16C: Sandy Bridge
+        quant::Caps ivy = sandy;      ivy.f16c = true;                   // AVX with F16C: Ivy Bridge
+        quant::Caps haswell = ivy;    haswell.avx2 = true; haswell.fma = true;
+        quant::Caps skylake_x = haswell; skylake_x.avx512 = true;
+        struct Cls { const char* name; const quant::Caps* c; quant::Isa tier; };
+        const Cls classes[] = {{"no SSE4.1", &none_, quant::Isa::Scalar}, {"no AVX", &nehalem, quant::Isa::Sse41}, {"AVX without F16C", &sandy, quant::Isa::Avx},
+                               {"AVX with F16C", &ivy, quant::Isa::Avx}, {"AVX2", &haswell, quant::Isa::Avx2}, {"AVX-512", &skylake_x, quant::Isa::Avx512}};
+        VitGeometry g_rms = g38;
+        g_rms.norm = NormKind::RMSNorm;      // a tower this code cannot run: `auto` keeps mtmd on every tier
+        for (const Cls& k : classes) {
+            std::string why;
+#if defined(__x86_64__) || defined(_M_X64)
+            const quant::Isa tier = quant::best_isa_for(*k.c, nullptr);
+            if (tier != k.tier) { std::printf("FAIL tier of the %s class: %s\n", k.name, quant::isa_name(tier)); ++g_fail; }
+#else
+            const quant::Isa tier = k.tier;
+#endif
+            for (const VitGeometry* g : {&g38, &g36}) {
+                CHECK(own_cpu_reader_supported(*g, tier, why));          // ours on every tier, both reader files
+                CHECK(vision_tower_resolve("auto", own_cpu_reader_supported(*g, tier, why)) == "own");
+            }
+            CHECK(!own_cpu_reader_supported(g_rms, tier, why) && !why.empty());
+            CHECK(vision_tower_resolve("auto", own_cpu_reader_supported(g_rms, tier, why)) == "mtmd");
+        }
+#if defined(__x86_64__) || defined(_M_X64)
+        // the tier mask (STRATA_FORCE_ISA) caps the tier a CPU runs, never raises it
+        CHECK(quant::best_isa_for(skylake_x, "sse41") == quant::Isa::Sse41 && quant::best_isa_for(skylake_x, "avx") == quant::Isa::Avx && quant::best_isa_for(skylake_x, "avx2") == quant::Isa::Avx2);
+        CHECK(quant::best_isa_for(skylake_x, "scalar") == quant::Isa::Scalar && quant::best_isa_for(sandy, "avx2") == quant::Isa::Avx && quant::best_isa_for(nehalem, "avx512") == quant::Isa::Sse41);
+        CHECK(quant::isa_ok_for(ivy, quant::Isa::Avx) && !quant::isa_ok_for(ivy, quant::Isa::Avx2) && !quant::isa_ok_for(nehalem, quant::Isa::Avx) && !quant::isa_ok_for(none_, quant::Isa::Sse41));
+#endif
+        // the explicit settings, both ways, whatever `own_ok` says
+        CHECK(vision_tower_resolve("mtmd", true) == "mtmd" && vision_tower_resolve("mtmd", false) == "mtmd");
+        CHECK(vision_tower_resolve("own", true) == "own" && vision_tower_resolve("own", false) == "own");
+        CHECK(vision_tower_resolve("auto", true) == "own" && vision_tower_resolve("auto", false) == "mtmd");
+        std::string note;
+        CHECK(vision_tower_resolve(vision_tower_default("mtmd", note), true) == "mtmd" && vision_tower_resolve(vision_tower_default("own", note), false) == "own");
+        CHECK(vision_tower_resolve(vision_tower_default(nullptr, note), true) == "own");     // no setting at all: auto
+    }
     {   // a start failure under auto comes back as kOwnStartFailed with its reason (nothing on stdout), so strata-vision can start mtmd's reader
         OwnReaderOptions o;
         o.mmproj = "/nonexistent/strata-own-test-mmproj.gguf";
