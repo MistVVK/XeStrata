@@ -1391,8 +1391,9 @@ struct Engine {
         const size_t n_state = m->layers.size() + (m->has_mtp ? 1 : 0);
         fused_on.assign(n_state, 0);
 #if !defined(__HIPCC__)
-        // Strata's fused kernels where they cover the layer's pair on this card (STRATA_PF_FUSED=0: none, as for Flash-Next)
-        if (const char* pf = std::getenv("STRATA_PF_FUSED"); !(pf != nullptr && pf[0] == '0') && g.n_embd == FQ::kQ36Embd &&
+        // Strata's fused kernels where they cover the layer's pair on this card: opt-in (STRATA_PF_FUSED=1), as for Flash-Next's packs
+        // below 80 SMs; unset or 0 keeps every layer on MMQ (the default is not changed until the gate for it is passed)
+        if (const char* pf = std::getenv("STRATA_PF_FUSED"); pf != nullptr && pf[0] == '1' && g.n_embd == FQ::kQ36Embd &&
                                                              g.n_ff == FQ::kQ36FF)
             for (size_t i = 0; i < n_state; ++i) {
                 const Layer& L = layer_at((int) i);
