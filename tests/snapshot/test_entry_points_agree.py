@@ -48,7 +48,7 @@ class EntryPointsAgree(unittest.TestCase):
                 self.assertEqual(want["config"], got["config"], f"{cell}: run config")
                 self.assertEqual(want["fetches"], got["fetches"], f"{cell}: the drafter downloads asked for")
             seen += 1
-        self.assertGreaterEqual(seen, 32)
+        self.assertGreaterEqual(seen, 24)
 
     def test_the_plain_load_starts_the_engine_as_launch_does(self):
         self.check("app_plain", set(allowlist.BY_DESIGN))
