@@ -53,6 +53,22 @@ if(STRATA_VIT_OWN_SYCL OR STRATA_VISION_SYCL)
   find_package(MKL REQUIRED)        # the oneMKL ggml-sycl links too (MKL::MKL_SYCL::BLAS)
 endif()
 
+option(STRATA_VIT_OWN_METAL "the own tower on a Mac's GPU (vit_metal.mm, Metal; macOS only)" OFF)
+set(_vit_metal OFF)
+if(APPLE AND (STRATA_VIT_OWN_METAL OR STRATA_VISION_METAL))
+  if(_vit_cuda OR _vit_hip OR _vit_sycl)
+    message(FATAL_ERROR "strata_vit_own: Metal is its own program, not together with CUDA, HIP or SYCL")
+  endif()
+  set(_vit_metal ON)
+  # the kernels are embedded in the program as strings and compiled when the reader starts (nothing to ship beside it; the Command Line Tools have no
+  # offline `metal` compiler): a header generated at configure time, redone when a .metal file changes
+  file(READ ${CMAKE_CURRENT_SOURCE_DIR}/vit_metal.metal _vit_msl)
+  file(READ ${CMAKE_CURRENT_SOURCE_DIR}/vit_metal_mpp.metal _vit_msl_mpp)
+  file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/vit_metal_src.h
+       "// generated from vit_metal.metal and vit_metal_mpp.metal by tools/vision/own/CMakeLists.txt\nstatic const char kVitMetalSrc[] = R\"VITMSL(${_vit_msl})VITMSL\";\nstatic const char kVitMetalMppSrc[] = R\"VITMSL(${_vit_msl_mpp})VITMSL\";\n")
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/vit_metal.metal ${CMAKE_CURRENT_SOURCE_DIR}/vit_metal_mpp.metal)
+endif()
+
 set(STB_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../third_party/stb" CACHE PATH "stb_image.h (third_party/stb)")
 
 add_library(strata_vit_own STATIC gguf_lite.cpp vit_geometry.cpp image_prep.cpp vit_ref.cpp own_reader.cpp
@@ -114,6 +130,15 @@ if(_vit_sycl)
   target_compile_definitions(strata_vit_own PUBLIC STRATA_VIT_GPU STRATA_VIT_SYCL)
   target_link_libraries(strata_vit_own INTERFACE $<LINK_ONLY:MKL::MKL_SYCL::BLAS>)     # INTERFACE + LINK_ONLY: the programs link oneMKL, nothing else compiles with its options
   target_link_options(strata_vit_own PUBLIC -fsycl)
+endif()
+
+if(_vit_metal)
+  target_sources(strata_vit_own PRIVATE vit_metal.mm)
+  # compiled as C++ with the Objective-C++ switch (an OBJCXX language enabled only in this subdirectory leaves the helper's build without its rules)
+  set_source_files_properties(vit_metal.mm PROPERTIES LANGUAGE CXX COMPILE_OPTIONS "-xobjective-c++;-fobjc-arc;-O2")
+  target_include_directories(strata_vit_own PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
+  target_compile_definitions(strata_vit_own PUBLIC STRATA_VIT_GPU STRATA_VIT_METAL)
+  target_link_libraries(strata_vit_own PUBLIC "-framework Metal" "-framework Foundation")
 endif()
 
 # the own-tower-only reader, the unit tests, and with a picture list the comparison with mtmd's preparation (oracle_prep.cpp is built in

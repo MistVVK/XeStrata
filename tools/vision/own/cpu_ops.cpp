@@ -2,6 +2,7 @@
 #include "cpu_kernels.h"
 
 #include <cmath>
+#include <cstdlib>
 
 namespace strata_vit {
 
@@ -13,5 +14,10 @@ const CpuOps& cpu_ops(quant::Isa isa) {
 }
 
 float cpu_tier_expf(float x) { return std::exp(x); }
+
+bool cpu_tier_one_vector_tail() {
+    static const bool on = [] { const char* e = std::getenv("STRATA_VIT_CPU_TAIL1"); return !(e && std::atoi(e) == 0); }();
+    return on;
+}
 
 }  // namespace strata_vit

@@ -49,4 +49,8 @@ const CpuOps& cpu_ops_neon();      // AArch64 only (cpu_ops_neon returns the sca
 // expf of the C library, out of line and compiled at the baseline (cpu_ops.cpp): the scalar tails of the tiers' softmax
 float cpu_tier_expf(float x);
 
+// false when STRATA_VIT_CPU_TAIL1=0 (a diagnostic): the raw-vector tiers then take a last column tile of one vector or less through the two-vector product as
+// before; out of line, compiled at the baseline (cpu_ops.cpp), read once
+bool cpu_tier_one_vector_tail();
+
 }  // namespace strata_vit

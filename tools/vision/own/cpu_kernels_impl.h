@@ -78,12 +78,56 @@ inline void tile_rows(const float* A, size_t lda, int m, const float* B, size_t 
     for (; r < m; ++r) micro<1>(A + (size_t) r * lda, lda, B, ldb, K, C + (size_t) r * ldc, ldc, init, bias);
 }
 
+#ifdef STRATA_KN_RAW
+// The same product for a column tile of ONE vector (a last tile of at most W columns: the attention's P*V with a head size of 72 has 8 left over): each
+// column's sum is the same FMA chain in the same order as in micro (one lane of the same intrinsics), so the results are bit-identical; half the work of a
+// two-vector tile.  Only in the raw-vector tiers (AVX2, AVX-512), where vr_fma is the micro's own FMA intrinsic.
+template <int MR>
+inline void micro1(const float* A, size_t lda, const float* B, size_t ldb, int K, float* C, size_t ldc, int init, const float* bias) {
+    VR acc[MR];
+    for (int r = 0; r < MR; ++r) {
+        VR v = vr_zero();
+        if (init != 0) v = vr_load(C + (size_t) r * ldc);
+        if (init != 1 && bias) v = vr_add(v, vr_load(bias));
+        acc[r] = v;
+    }
+    for (int k = 0; k < K; ++k) {
+        const VR b0 = vr_load(B + (size_t) k * ldb);
+        for (int r = 0; r < MR; ++r) acc[r] = vr_fma(vr_set1(A[(size_t) r * lda + k]), b0, acc[r]);
+    }
+    for (int r = 0; r < MR; ++r) vr_store(C + (size_t) r * ldc, acc[r]);
+}
+inline void tile_rows1(const float* A, size_t lda, int m, const float* B, size_t ldb, int K, float* C, size_t ldc, int init, const float* bias) {
+    int r = 0;
+    for (; r + MRF <= m; r += MRF) micro1<MRF>(A + (size_t) r * lda, lda, B, ldb, K, C + (size_t) r * ldc, ldc, init, bias);
+    for (; r + 4 <= m; r += 4) micro1<4>(A + (size_t) r * lda, lda, B, ldb, K, C + (size_t) r * ldc, ldc, init, bias);
+    for (; r + 2 <= m; r += 2) micro1<2>(A + (size_t) r * lda, lda, B, ldb, K, C + (size_t) r * ldc, ldc, init, bias);
+    for (; r < m; ++r) micro1<1>(A + (size_t) r * lda, lda, B, ldb, K, C + (size_t) r * ldc, ldc, init, bias);
+}
+#endif
+
 void gemm(const float* A, size_t lda, int M, const float* B, size_t ldb, int K, int N, float* C, size_t ldc, int init, const float* bias) {
     for (int j0 = 0; j0 < N; j0 += NR) {
         const int nc = KN_MIN(NR, N - j0);
         if (nc == NR) {
             tile_rows(A, lda, M, B + j0, ldb, K, C + j0, ldc, init, bias ? bias + j0 : nullptr);
-        } else {      // the last, partial column tile: through a full-width buffer
+        }
+#ifdef STRATA_KN_RAW
+        else if (nc <= W && cpu_tier_one_vector_tail()) {      // a last tile of one vector or less: the one-vector product, through a one-vector buffer
+            float bb[W] = {0}, cb[MRF][W];
+            if (bias) KN_COPY(bb, bias + j0, nc);
+            for (int m0 = 0; m0 < M; m0 += MRF) {
+                const int mr = KN_MIN(MRF, M - m0);
+                for (int r = 0; r < mr; ++r) {
+                    KN_ZERO(cb[r], W);
+                    if (init != 0) KN_COPY(cb[r], C + (size_t) (m0 + r) * ldc + j0, nc);
+                }
+                tile_rows1(A + (size_t) m0 * lda, lda, mr, B + j0, ldb, K, &cb[0][0], W, init, bias ? bb : nullptr);
+                for (int r = 0; r < mr; ++r) KN_COPY(C + (size_t) (m0 + r) * ldc + j0, cb[r], nc);
+            }
+        }
+#endif
+        else {      // the last, partial column tile: through a full-width buffer
             float bb[NR] = {0}, cb[MRF][NR];
             if (bias) KN_COPY(bb, bias + j0, nc);
             for (int m0 = 0; m0 < M; m0 += MRF) {

@@ -52,6 +52,28 @@ def fdinfo_mib(pid):
     return best
 
 
+def mac_footprint_mib(pid):
+    """macOS: the process's physical footprint (what Activity Monitor calls Memory; on unified memory it includes the GPU buffers), MiB, from the
+    `footprint` tool (no root needed for our own process); 0 elsewhere or when it cannot be read."""
+    if sys.platform != "darwin":
+        return 0
+    try:
+        out = subprocess.run(["footprint", "-p", str(pid)], capture_output=True, text=True, timeout=60).stdout
+    except Exception:  # noqa: BLE001
+        return 0
+    for line in out.splitlines():
+        low = line.lower()
+        if "phys_footprint:" in low or low.strip().startswith("footprint:"):
+            t = line.split(":", 1)[1].split()
+            if len(t) >= 2:
+                try:
+                    n = float(t[0])
+                except ValueError:
+                    continue
+                return int({"KB": n / 1024.0, "MB": n, "GB": n * 1024.0}.get(t[1].upper(), 0))
+    return 0
+
+
 class Reader:
     def __init__(self, exe, tower, mmproj, model, gpu, max_tokens, threads, out, label):
         args = [exe, "--mmproj", mmproj, "--model", model, "--tower", tower]
@@ -89,6 +111,7 @@ class Reader:
         except Exception:  # noqa: BLE001
             pass
         self.peak_mib = max(self.peak_mib, fdinfo_mib(self.p.pid))   # Linux DRM: Intel (i915 / xe) and AMD report device memory per process here
+        self.peak_mib = max(self.peak_mib, mac_footprint_mib(self.p.pid))   # a Mac: the whole footprint (unified memory)
         return self.peak_mib
 
     def enc(self, img, out):
@@ -195,7 +218,7 @@ def main():
         floor_c.append(f)
         print(hdr % (name, main["n"], main["global"], floor["global"], info["global"], ref["global"] if ref else "-", main["tokmin"], "%.0f" % mg_ms, "%.0f" % og_ms,
                      "%.2f" % (og_ms / mg_ms), "ok" if passed else "FAIL (%s)" % ("main < %.4f" % a.min_cos if m < a.min_cos else "noisier than mtmd-GPU")), flush=True)
-    vram = "GPU memory of the reader (nvidia-smi / rocm-smi / DRM fdinfo, peak after the pictures): mtmd-gpu %d MiB, own-gpu %d MiB%s" % (
+    vram = "GPU memory of the reader (nvidia-smi / rocm-smi / DRM fdinfo / macOS footprint, peak after the pictures): mtmd-gpu %d MiB, own-gpu %d MiB%s" % (
         r_mg.peak_mib, r_og.peak_mib, "" if r_og.peak_mib <= r_mg.peak_mib else "  (own is larger)")
     print("REPEATABLE own-gpu: %s" % ("yes, every picture byte-identical over %d encodes" % (a.repeat + 1) if not unrepeatable else "NO: " + "; ".join(unrepeatable)),
           flush=True)
