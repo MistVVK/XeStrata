@@ -22,6 +22,7 @@
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/pf_fused_override.hpp"
 #include "strata/prefill/fused_tile_rule.hpp"
+#include "strata/prefill/fused_tq_default.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/emulate.hpp"
 #include "strata/core/sm120_series.hpp"
@@ -2003,7 +2004,7 @@ struct DevInfo {
     int occ_q8gu = 1;   // the Q8_0 gate/up kernels' blocks per multiprocessor (the down keeps occ_kq8)
     bool q6k = false;   // sm_80+ with STRATA_PF_FUSED_Q6K=1: the Q6_K gate/up kernels, and the Q8_0 down ones behind them (opt-in, phase 4)
     int occ_q6k = 1;    // the Q6_K gate/up kernels' blocks per multiprocessor (the down keeps occ_kq8)
-    bool tq = false;    // sm_80+ with STRATA_PF_FUSED_TQ=1: the trellis kernels (TQK6 / TQ2_T gate/up, TQK7 / TQ2_T down) are set up (opt-in, phase 4)
+    bool tq = false;    // the trellis kernels (TQK6 / TQ2_T gate/up, TQK7 / TQ2_T down) are set up: by default on sm_86 with 80+ SMs, STRATA_PF_FUSED_TQ=1 on any sm_80+ (fused_tq_default.hpp)
     int occ_tq_gu = 1, occ_tq_d = 1;   // their blocks per multiprocessor (their own)
 #endif
 };
@@ -2047,11 +2048,13 @@ bool q6k_cuda_requested() {
     static const bool on = [] { const char* v = std::getenv("STRATA_PF_FUSED_Q6K"); return v != nullptr && v[0] == '1'; }();
     return on;
 }
-// STRATA_PF_FUSED_TQ on CUDA: "1" sets the trellis kernels up (dev_info) and lets native_supported take Gyro-S's TQK6 / TQK7 and Gyro-M's TQ2_T /
-// TQ2_T layers on any sm_80+ card (layers whose experts are Hadamard-folded are still declined by the prompt path); anything else: MMQ
-bool tq_cuda_requested() {
-    static const bool on = [] { const char* v = std::getenv("STRATA_PF_FUSED_TQ"); return v != nullptr && v[0] == '1'; }();
-    return on;
+// STRATA_PF_FUSED_TQ on CUDA (the rule is include/strata/prefill/fused_tq_default.hpp, pinned by tests/prefill/fused_tq_default_test.cpp): unset = the trellis kernels are
+// set up (dev_info) and native_supported takes Gyro-S's TQK6 / TQK7 layers on a compute capability 8.6 card with 80+ SMs (RTX A6000 class; the A6000 gate series is
+// Gyro-S); "1" takes them on any sm_80+ card, and Gyro-M's TQ2_T / TQ2_T layers too (no gate series: they are never taken by default); any other value ("0") and every other card: MMQ.  The Hadamard rotations of a folded layer run inside
+// experts_native (set_down_rotation), the gate/up input arrives rotated.
+int tq_env() {
+    static const int v = strata::prefill::fused_tq::env_value();
+    return v;
 }
 bool kq_on();   // STRATA_PF_FUSED_KQ (below): on CUDA "1" sets the K-quant kernels up (dev_info)
 template <int T, bool GU, int WW, int NT = THREADS, bool F16 = false> bool setup_ww(int& occ) {
@@ -2229,10 +2232,10 @@ const DevInfo& dev_info() {
         d.occ_q6k = o9;
         d.occ_kq8 = o10;
     }
-    // STRATA_PF_FUSED_TQ=1 (opt-in on CUDA, off by default): the trellis experts (Gyro-S TQK6 gate/up + TQK7 down, Gyro-M TQ2_T both) on native_kernel:
+    // the trellis experts (Gyro-S TQK6 gate/up + TQK7 down, Gyro-M TQ2_T both) on native_kernel, by default on sm_86 with 80+ SMs, STRATA_PF_FUSED_TQ=1 on any sm_80+ card, =0 off:
     // the decode is MMQ's (tq.cuh: 15-bit states, the int8 codebook tq_lut_i8, one scale d * TQ_LUT_I8_SCALE a 128-value block), the products the int8
     // mma.sync path.  All four instance pairs set up or none; their own occupancy.
-    if (int og = 1 << 20, od = 1 << 20; d.ok && tq_cuda_requested() && setup_one<T_TQK6, true>(og) && setup_one<T_TQ2_T, true>(og) &&
+    if (int og = 1 << 20, od = 1 << 20; d.ok && strata::prefill::fused_tq::on(tq_env(), d.s86, d.sms) && setup_one<T_TQK6, true>(og) && setup_one<T_TQ2_T, true>(og) &&
                                        setup_one<T_TQK7, false>(od) && setup_one<T_TQ2_T, false>(od)) {
         d.tq = true;
         d.occ_tq_gu = og;
@@ -2293,7 +2296,7 @@ bool gu_covered(int t) {
            || ((t == T_Q4_K || t == T_Q5_K) && dev_info().kq)       // STRATA_PF_FUSED_KQ=1 and its kernels set up
            || (t == T_Q8_0 && dev_info().q8gu)                      // STRATA_PF_FUSED_Q8GU=1 and its kernels set up
            || (t == T_Q6_K && dev_info().q6k)                       // STRATA_PF_FUSED_Q6K=1 and its kernels set up
-           || ((t == T_TQK6 || t == T_TQ2_T) && dev_info().tq)      // STRATA_PF_FUSED_TQ=1 and its kernels set up
+           || ((t == T_TQK6 || t == T_TQ2_T) && dev_info().tq)      // the trellis kernels set up (default on sm_86 with 80+ SMs, or STRATA_PF_FUSED_TQ=1)
 #endif
 #if defined(__HIPCC__)
            || (t == T_Q2_0 && dev_info().w12)   // gfx12: the native Q2_0 pack's gate/up on native_w11_kernel (64-value blocks)
@@ -2469,7 +2472,7 @@ bool native_supported(int gu_type, int d_type) {
         const DevInfo& d = dev_info();
         return d_type == T_Q8_0 && d.ok && d.q6k && !d.t75 && d.occ_nt <= 0 && !d.ws;
     }
-    // The trellis pairs (phase 4, opt-in STRATA_PF_FUSED_TQ=1): Gyro-S's TQK6 / TQK7 and Gyro-M's TQ2_T / TQ2_T only, same conditions.  (A trellis
+    // The trellis pairs (phase 4; default on sm_86 with 80+ SMs, STRATA_PF_FUSED_TQ=1 on any sm_80+ card; d.tq): Gyro-S's TQK6 / TQK7 and Gyro-M's TQ2_T / TQ2_T only, same conditions.  (A trellis
     // down behind any other gate/up, or the reverse: MMQ.)
     if (is_tq(gu_type) || is_tq(d_type)) {
         // the compiled geometry must suit the trellis path: whole 128-value blocks along both K, and (a folded down) the FP32 H of a row,
@@ -2477,7 +2480,8 @@ bool native_supported(int gu_type, int d_type) {
         // 1,100 and n_embd down to 1,024, so a geometry that breaks it declines the trellis fused path (MMQ) instead of overrunning the row
         constexpr bool geo_ok = D_ROWS_K <= D_ROWS_N && D_ROWS_K % 128 == 0 && GU_ROWS_K % 128 == 0;
         const DevInfo& d = dev_info();
-        const bool pair = (gu_type == T_TQK6 && d_type == T_TQK7) || (gu_type == T_TQ2_T && d_type == T_TQ2_T);
+        // Gyro-S's pair follows the default rule (d.tq); Gyro-M's TQ2_T / TQ2_T has no gate series yet: only with STRATA_PF_FUSED_TQ=1 (fused_tq::gyro_m_on)
+        const bool pair = (gu_type == T_TQK6 && d_type == T_TQK7) || (gu_type == T_TQ2_T && d_type == T_TQ2_T && strata::prefill::fused_tq::gyro_m_on(tq_env()));
         return geo_ok && pair && d.ok && d.tq && !d.t75 && d.occ_nt <= 0 && !d.ws;
     }
     if (d_type == T_Q8_0 && gu_type != T_Q4_K && gu_type != T_Q5_K) {

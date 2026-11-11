@@ -25960,7 +25960,7 @@
    "last_date": "",
    "status": "research",
    "owner": "prefill",
-   "note": "CUDA (phase 4, opt-in, default off): the Gyro trellis experts (TQK6 / TQK7, TQ2_T / TQ2_T) on the fused native kernels on any sm_80+ card instead of MMQ; Hadamard-folded layers are still declined by the prompt path.",
+   "note": "CUDA (phase 4): the Gyro trellis experts on the fused native kernels instead of MMQ (Hadamard rotations of the folded layers inside the fused path). Unset: Gyro-S (TQK6 / TQK7) on compute capability 8.6 cards with 80+ SMs (RTX A6000 class; include/strata/prefill/fused_tq_default.hpp, tests/prefill/fused_tq_default_test.cpp), a diagnostic switch for bug reports, not a user setting; =1: Gyro-S and Gyro-M (TQ2_T / TQ2_T, no gate series) on any sm_80+ card; =0: MMQ again. STRATA_PF_FUSED_SM86=0 turns the sm_86 default off too. Goes with MMQ in release C.",
    "retire_after": "",
    "retired_in": ""
   },
