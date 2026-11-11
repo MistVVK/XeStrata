@@ -210,6 +210,13 @@ bool read_cost_file(const std::string& path, const std::string& key, CostFile& o
             out.cpu_share = s;
             continue;
         }
+        if (line.rfind("pcie ", 0) == 0) {
+            char* e = nullptr;
+            const double s = std::strtod(line.c_str() + 5, &e);
+            if (e == line.c_str() + 5 || *e != '\0' || !(s >= 0.0) || !(s <= 1.0)) { why = "a malformed PCIe share"; return false; }
+            out.pcie_frac = s;
+            continue;
+        }
         int b = -1, used = 0;
         if (std::sscanf(line.c_str(), "bucket %d %n", &b, &used) < 1 || used == 0 || b < 0 || b >= CostLearner::kCtxBuckets) {
             why = "a malformed line";
@@ -259,6 +266,10 @@ bool write_cost_file(const std::string& path, const CostFile& c, std::string& wh
         }
         if (c.cpu_share >= 0.0) {
             std::snprintf(b, sizeof b, "share %.3f\n", std::min(c.cpu_share, 1.0));
+            f << b;
+        }
+        if (c.pcie_frac >= 0.0) {
+            std::snprintf(b, sizeof b, "pcie %.3f\n", std::min(c.pcie_frac, 1.0));
             f << b;
         }
         f << "end\n";

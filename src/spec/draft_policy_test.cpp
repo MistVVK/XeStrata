@@ -310,6 +310,19 @@ int main() {
               "file: the CPU prompt share is stored and read back with the table");
         { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 1\nkey x\nbucket 0 15.1,18\nshare 1.7\nend\n"; }
         check(!strata::spec::read_cost_file(path, "x", r, why), "file: a share outside 0..1 is not loaded");
+        // the decode PCIe share PcieAuto settled on (repeatable output): stored and read back; a file written before it has none, and
+        // still loads (the engine then refines the share as before and writes it)
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 1\nkey x\nbucket 0 15.1,18\nshare 0.900\nend\n"; }
+        check(strata::spec::read_cost_file(path, "x", r, why) && r.cpu_share == 0.9 && r.pcie_frac < 0.0,
+              "file: a file from before the PCIe share loads, with no PCIe share");
+        c.pcie_frac = 0.15;
+        check(strata::spec::write_cost_file(path, c, why) && strata::spec::read_cost_file(path, c.key, r, why) && r.pcie_frac == 0.15 &&
+                  r.cpu_share == 0.45 && r.tables[0].size() == 4,
+              "file: the PCIe share is stored and read back with the table and the prompt share");
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 1\nkey x\nbucket 0 15.1,18\npcie -0.2\nend\n"; }
+        check(!strata::spec::read_cost_file(path, "x", r, why), "file: a PCIe share outside 0..1 is not loaded");
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 1\nkey x\nbucket 0 15.1,18\npcie 0.15x\nend\n"; }
+        check(!strata::spec::read_cost_file(path, "x", r, why), "file: a malformed PCIe share is not loaded");
         fs::remove_all(dir, ec);
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");

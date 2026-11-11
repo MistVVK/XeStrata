@@ -12922,6 +12922,18 @@ int main(int argc, char** argv) {
                              gs.link_gbps, gs.pcie_frac);
             }
         };
+        // --draft-costs (repeatable output): PcieAuto's value comes from measured pool time, and a start that settles one reading later decodes
+        // its windows in between with another share (one more or one fewer missed expert of a layer computed on the GPU instead of the CPU,
+        // which round differently: on an RTX A6000 2 of 18 starts gave other tokens, 0 of 12 with the share fixed).  So the settled share is
+        // stored with the table and a later start runs with it fixed.  One GPU only (a layer split keeps PcieAuto's per-stage refinement).
+        const bool dc_pcie_ok = pcie_auto.on && n_stages == 1;
+        auto fix_pcie_share = [&](double f) {
+            pcie_auto.on = false;
+            o.pcie_frac = f;
+            drive.d.pcie_num = std::max(0, std::min(256, (int) (f * 256.0 + 0.5)));
+            split_drive.pcie_num[0] = drive.d.pcie_num;
+            split_drive_b.pcie_num[0] = drive.d.pcie_num;
+        };
         // the serial windows of one GPU, where the pool can admit (expert_pool_dispatch_multi's fetch_on)
         const char* fetch_off = d_res == nullptr ? "no residency table" : o.spec_split ? "--spec-split"
                               : multi_gpu || !stages.empty() ? "a layer split" : peer.valid() ? "--peer-device"
@@ -14183,6 +14195,8 @@ int main(int argc, char** argv) {
         constexpr int kDraftCostMinN = 20;           // a window size needs this many rounds to be measured (fewer: filled in)
         std::string dc_key;
         bool dc_learning = false;
+        bool dc_pcie_pending = false;    // a loaded table without a PCIe share: written into it once PcieAuto has settled
+        strata::spec::CostFile dc_file;  // that table, as loaded
         if (!o.draft_costs.empty() && !policy.fixed()) {
             dc_key = draft_costs_key(argc, argv, o.draft_costs_key, spec_cost);
             strata::spec::CostFile cf;
@@ -14195,9 +14209,17 @@ int main(int argc, char** argv) {
                         sizes += (sizes.empty() ? "" : ", ") + std::to_string(cf.tables[(size_t) k].size());
                     }
                 if (cf.cpu_share >= 0.0) strata::prefill::Prefill::fix_cpu_share(cf.cpu_share);
+                std::string extra = cf.cpu_share >= 0.0 ? "; CPU prompt share " + std::to_string(cf.cpu_share).substr(0, 4) : "";
+                if (dc_pcie_ok && cf.pcie_frac >= 0.0) {   // PcieAuto's settled share: fixed, no refinement in this run
+                    fix_pcie_share(cf.pcie_frac);
+                    extra += "; PCIe share " + std::to_string(cf.pcie_frac).substr(0, 4);
+                } else if (dc_pcie_ok) {   // a file from before the stored PCIe share: refined as before, then written into the file
+                    dc_pcie_pending = true;
+                    dc_file = cf;
+                    extra += "; PCIe share: refined in this run, then stored";
+                }
                 std::fprintf(stderr, "strata serve: draft costs: this machine's table is used (%s; window sizes %s%s): the same request "
-                                     "gives the same tokens on every start\n", o.draft_costs.c_str(), sizes.c_str(),
-                             cf.cpu_share >= 0.0 ? ("; CPU prompt share " + std::to_string(cf.cpu_share).substr(0, 4)).c_str() : "");
+                                     "gives the same tokens on every start\n", o.draft_costs.c_str(), sizes.c_str(), extra.c_str());
             } else {
                 policy.set_learning(true);
                 dc_learning = true;
@@ -19561,9 +19583,13 @@ int main(int argc, char** argv) {
                         const double s = pst.cpu_share_readings > 0 ? pst.cpu_share_balanced : 0.5;
                         cf.cpu_share = std::clamp(std::round(s * 20.0) / 20.0, 0.05, 0.9);
                     }
+                    // the decode PCIe share as PcieAuto has it now (its third reading, or what it had reached by this request's end);
+                    // fixed from now on like the table
+                    if (dc_pcie_ok) cf.pcie_frac = o.pcie_frac;
                     std::string why;
                     const bool saved = strata::spec::write_cost_file(o.draft_costs, cf, why);
                     if (cf.cpu_share >= 0.0) strata::prefill::Prefill::fix_cpu_share(cf.cpu_share);
+                    if (cf.pcie_frac >= 0.0) fix_pcie_share(cf.pcie_frac);
                     for (int k = 0; k < strata::spec::CostLearner::kCtxBuckets; ++k)
                         if (!cf.tables[(size_t) k].empty())
                             policy.set_fixed_costs(cf.tables[(size_t) k].data(), (int) cf.tables[(size_t) k].size(), k);
@@ -19580,9 +19606,26 @@ int main(int argc, char** argv) {
                         std::snprintf(b, sizeof b, "; CPU prompt share %.2f", cf.cpu_share);
                         t0 += b;
                     }
+                    if (cf.pcie_frac >= 0.0) {
+                        std::snprintf(b, sizeof b, "; PCIe share %.2f", cf.pcie_frac);
+                        t0 += b;
+                    }
                     std::fprintf(stderr, "strata serve: draft costs: this machine's table is learned (%s); it is fixed from the next request "
                                          "on%s%s\n", t0.c_str(), saved ? "" : " (not saved: ", saved ? "" : (why + "; the next start learns again)").c_str());
                 }
+            }
+            // --draft-costs with a table from before the stored PCIe share: once PcieAuto has settled (three readings, or it gave up), its
+            // share goes into the file beside the table and is fixed from the next request; the next start loads it
+            if (dc_pcie_pending && !pcie_auto.on) {
+                dc_pcie_pending = false;
+                strata::spec::CostFile cf = dc_file;
+                cf.key = dc_key;
+                cf.pcie_frac = o.pcie_frac;
+                std::string why;
+                const bool saved = strata::spec::write_cost_file(o.draft_costs, cf, why);
+                fix_pcie_share(cf.pcie_frac);
+                std::fprintf(stderr, "strata serve: draft costs: the PCIe share settled at %.2f; it is %s and fixed from the next request on\n",
+                             cf.pcie_frac, saved ? "stored with this machine's table" : ("not stored (" + why + ")").c_str());
             }
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
             if (!ver.wait_commit(err)) {

@@ -74,11 +74,13 @@ private:
 ///   key <one line>
 ///   bucket <0..2> <ms of T1>,<ms of T2>,...
 ///   share <0..1>              (optional: the CPU prompt share learned on this machine, src/prefill/prefill.cpp)
+///   pcie <0..1>               (optional: the decode PCIe share PcieAuto settled on, src/program/generate.cpp)
 ///   end
 struct CostFile {
     std::string key;
     std::array<std::vector<double>, CostLearner::kCtxBuckets> tables{};
     double cpu_share = -1.0;   ///< < 0: none stored
+    double pcie_frac = -1.0;   ///< the decode PCIe share PcieAuto settled on; < 0: none stored (a file from before it: refined, then written)
 };
 /// false (with `why` for the log) when the file is missing, unreadable, malformed or truncated, or was learned under another key: the caller
 /// then learns a new table.  Never throws.
