@@ -38,9 +38,9 @@ static uint16_t f32_to_f16(float f) {   // good enough for the values used here 
 
 int main(int argc, char** argv) {
     // --- 0. the GPU classes where `--tower auto` keeps mtmd (vit_gpu.h) ---
-    for (int mt : {0, 300, 1024}) {      // at or below the default limit: the speed rule (Pascal keeps mtmd, except cc 6.0 with BF16 matrices)
-        CHECK(vit_gpu_slower_nvidia(6, 0, false, mt) && vit_gpu_slower_nvidia(6, 1, false, mt) && vit_gpu_slower_nvidia(6, 1, true, mt) && vit_gpu_slower_nvidia(6, 2, true, mt));
-        CHECK(!vit_gpu_slower_nvidia(6, 0, true, mt));
+    for (int mt : {0, 300, 1024}) {      // at or below the default limit: Pascal 6.1 / 6.2 keep mtmd (not measured); cc 6.0 takes ours with F16 and BF16 files
+        CHECK(vit_gpu_slower_nvidia(6, 1, false, mt) && vit_gpu_slower_nvidia(6, 1, true, mt) && vit_gpu_slower_nvidia(6, 2, false, mt) && vit_gpu_slower_nvidia(6, 2, true, mt));
+        CHECK(!vit_gpu_slower_nvidia(6, 0, true, mt) && !vit_gpu_slower_nvidia(6, 0, false, mt));
         CHECK(!vit_gpu_slower_nvidia(5, 2, false, mt) && !vit_gpu_slower_nvidia(7, 0, false, mt) && !vit_gpu_slower_nvidia(8, 6, true, mt) && !vit_gpu_slower_nvidia(12, 0, false, mt));
     }
     for (int mt : {1025, 4096, 16384}) {   // above it: ours on every CUDA class

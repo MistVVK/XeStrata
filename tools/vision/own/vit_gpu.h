@@ -21,17 +21,18 @@ namespace strata_vit {
 struct VitGpuImpl;
 
 // The GPU classes where this tower is known to be slower than mtmd's GPU reader (VitGpu::prefer_mtmd uses these; pure functions, so the tests need no GPU).
-// NVIDIA Pascal (compute capability 6.x): no tensor cores; mtmd's products of F16 matrices accumulate in F16 at twice the float32 rate, ours in float32 (an
-// F16-accumulating variant of ours was as fast but missed rule 1: 0.9972), so with F16 matrices (Qwen3.6) ours stays slower (P100: at best 1.10 of mtmd-GPU,
-// RESULTS-OWN-3V.md 16.1).  With BF16 matrices (Qwen3.8) mtmd multiplies in float32 too, and ours (BF16 held as F16, the larger score chunk) passes the whole
-// gate on a P100 (cc 6.0: 0.31 to 0.99 of mtmd-GPU's time, 16.1).  Other Pascal chips (6.1, 6.2: GTX 10xx, Jetson TX2) are not measured: mtmd stays there.
+// NVIDIA Pascal, compute capability 6.0 (P100): our tower is the default under auto for F16 and BF16 reader files alike (owner 11-11: our own code is the
+// default where its accuracy gates pass, even where it is somewhat slower).  P100, 1,024-token picture: Qwen3.8 BF16 1,068 against mtmd-GPU's 1,073 ms; Qwen3.6
+// F16 1,064 against 916 ms (mtmd's F16 products sum in F16 at twice the float32 rate, ours in float32), while ours stays at rule 1 0.999865 against mtmd-CPU
+// where mtmd-GPU reads 0.982913 (RESULTS-OWN-3V.md 16.1, PART G).  Other Pascal chips (6.1, 6.2: GTX 10xx, Jetson TX2) are not measured: F16 arithmetic runs
+// at a small fraction of the float32 rate there, so the comparison may differ, and mtmd stays there up to the default limit.
 // Above the default GPU limit of 1,024 image tokens the speed rule gives way to correctness: mtmd's GPU reader drifts from mtmd's CPU path as pictures
 // grow (global cosine 0.983 at 2,116 tokens, 0.81 to 0.83 at 16,384 on the A4000, RTX PRO 5000 and P100), ours stays at 0.9996 to 0.99998 (RESULTS-OWN-3V.md
 // 16.7), so a reader started with --max-tokens above 1,024 takes our tower on every CUDA class, however slow (P100 at 16,384 tokens: 196.6 s against 129.0 s).
 // max_tokens 0 (not given) counts as the default.
 constexpr int kVitGpuDefaultLimit = 1024;
-inline bool vit_gpu_slower_nvidia(int cc_major, int cc_minor, bool bf16_matrices, int max_tokens) {
-    return max_tokens <= kVitGpuDefaultLimit && cc_major == 6 && !(cc_minor == 0 && bf16_matrices);
+inline bool vit_gpu_slower_nvidia(int cc_major, int cc_minor, bool /*bf16_matrices*/, int max_tokens) {
+    return max_tokens <= kVitGpuDefaultLimit && cc_major == 6 && cc_minor != 0;
 }
 // AMD gfx1151 (Strix Halo, Radeon 8060S) takes our tower under `auto` (owner 11-11: "For Strix - use our reader, even if its a bit slower ... Our priority is to
 // get off ggml and llama.cpp").  The ROCm package's rocBLAS has tuned gfx1151 kernels for 16-bit results only (BF16 / F16 -> F32 is fallback-only), so on
@@ -54,9 +55,8 @@ public:
     // True when this build has a GPU backend and a device to run it on; `why` says what is missing.
     static bool available(std::string& why);
 
-    // True on a GPU class where this tower is known to be slower than mtmd's GPU reader, so `--tower auto` keeps mtmd there (`--tower own` still runs
-    // this tower): NVIDIA Pascal (compute capability 6.x: no tensor cores; mtmd's F16 products accumulate in F16 at twice the float32 rate, ours in float32;
-    // measured on a P100, RESULTS-OWN-3V.md 12.1).  `why` says which.
+    // True on a GPU class where `--tower auto` keeps mtmd (`--tower own` still runs this tower): NVIDIA Pascal 6.1 / 6.2 up to the default limit (not
+    // measured; see vit_gpu_slower_nvidia), Windows HIP cards other than gfx1151 (not measured).  `why` says which.
     static bool prefer_mtmd(bool bf16_matrices, int max_tokens, std::string& why);      // bf16_matrices: the mmproj's layer matrices are BF16; max_tokens: --max-tokens (0: not given)
 
     // Uploads the weights to `device` and sizes the work buffers for pictures of up to `max_patches` patches (grown by encode when a picture
