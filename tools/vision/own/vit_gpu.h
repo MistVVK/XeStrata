@@ -42,6 +42,16 @@ inline bool vit_gpu_slower_amd(const std::string& gfx) { return gfx.rfind("gfx11
 // fallback-only, and no other card has been measured with that package, so `auto` keeps mtmd's reader on Windows HIP.  Not measured on Windows HIP; remove when
 // one RX 9000 / RX 7000 run on Windows is in.  Linux HIP (gfx12 measured on the R9700) is not affected.
 inline bool vit_gpu_hip_windows_not_measured(bool windows) { return windows; }
+// Starting the GPU context on a GPU that shares the system RAM (DGX Spark GB10, cudaDevAttrIntegrated): a new CUDA context needs physically contiguous memory
+// (blocks of 2 MiB and up); when the kernel has almost none free, cudaSetDevice fails with "out of memory" although tens of GiB are free, and the same call 1 to 5 s
+// later succeeds (the kernel compacts memory in between; RESULTS-SPARK.md, 11-11: a probe context failed at 5 of 6 starts, every retry within 5 s succeeded).
+// So VitGpu::load tries again, up to kVitCtxRetries times, kVitCtxWaitMs apart, and only for that error, on an integrated GPU, in a Linux CUDA build (an AMD APU under
+// HIP and a Mac report "integrated" too; they are not this case).  After the last retry it fails as before and the reader falls back as before.  Pure function so the test needs no GPU.
+constexpr int kVitCtxRetries = 8;
+constexpr int kVitCtxWaitMs = 1000;
+inline bool vit_gpu_retry_context(bool linux_cuda_build, bool integrated_gpu, bool out_of_memory, int retries_done) {
+    return linux_cuda_build && integrated_gpu && out_of_memory && retries_done >= 0 && retries_done < kVitCtxRetries;
+}
 
 class VitGpu {
 public:

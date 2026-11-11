@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 
 #if defined(STRATA_VIT_HIP)
 #include <hip/hip_fp16.h>
@@ -459,6 +460,32 @@ struct VitGpuImpl {
     }
 };
 
+// cudaSetDevice, which makes the context.  On an integrated GPU in a Linux CUDA build a "out of memory" is tried again (vit_gpu.h, vit_gpu_retry_context); anywhere
+// else this is the one call it was.  Returns the error of the last call; the runtime's own error state is cleared after each failure.
+static cudaError_t set_device_retrying(int device) {
+    int retries = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (;;) {
+        const cudaError_t e = cudaSetDevice(device);
+        if (e == cudaSuccess) {
+            if (retries > 0 && std::getenv("STRATA_VIT_PROF"))
+                std::fprintf(stderr, "vit-prof: GPU context made after %d retries, %.2f s\n", retries, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            return e;
+        }
+        (void) cudaGetLastError();
+#if defined(__linux__) && !defined(STRATA_VIT_HIP)   // SPARK-CTX-RETRY
+        int integrated = 0;
+        if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, device) != cudaSuccess) { integrated = 0; (void) cudaGetLastError(); }
+        if (vit_gpu_retry_context(true, integrated != 0, e == cudaErrorMemoryAllocation, retries)) {
+            ++retries;
+            std::this_thread::sleep_for(std::chrono::milliseconds(kVitCtxWaitMs));
+            continue;
+        }
+#endif
+        return e;
+    }
+}
+
 VitGpu::VitGpu() : impl_(new VitGpuImpl()) {}
 VitGpu::~VitGpu() = default;
 size_t VitGpu::device_bytes() const { return impl_->bytes; }
@@ -517,7 +544,10 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
     }
 #endif
     if (const char* e = std::getenv("STRATA_VIT_BF16_AS_F16")) m.bf16_as_f16 = std::atoi(e) != 0;
-    if (cudaSetDevice(device) != cudaSuccess) { err = std::string("cannot use GPU ") + std::to_string(device) + ": " + cudaGetErrorString(cudaGetLastError()); return false; }
+    {
+        const cudaError_t se = set_device_retrying(device);
+        if (se != cudaSuccess) { err = std::string("cannot use GPU ") + std::to_string(device) + ": " + cudaGetErrorString(se); return false; }
+    }
     if (cublasCreate(&m.blas) != CUBLAS_STATUS_SUCCESS) { err = "cannot create the BLAS handle"; return false; }
     // the patch embedding: the two temporal taps summed, kept in float32 (a small matrix)
     {
