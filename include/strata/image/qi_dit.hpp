@@ -12,6 +12,8 @@
 // pinned RAM and copied in at each step (an edit with many or large reference images).
 #pragma once
 
+#include "strata/image/dit_loras.hpp"
+#include "strata/image/dit_product.hpp"
 #include "strata/image/image_lora.hpp"
 #include "strata/image/i8_means.hpp"
 #include "strata/image/pipeline.hpp"
@@ -112,7 +114,7 @@ public:
     void drop_block_homes() { blocks_stream_.drop_homes(); }
     /// The adapters folded into the blocks' weights where they are plain LoRAs (the default), else added to each
     /// product: false keeps the weights as the file has them.
-    void set_lora_bake(bool on) { lora_bake_ = on; }
+    void set_lora_bake(bool on) { loras_.bake = on; }
     /// Frees the activations (grown again on use).
     void drop_activations();
     /// The GPU memory the activations of a T-token sequence take, the MLP computed `mlp_rows` rows at a time (0: all).
@@ -131,10 +133,7 @@ public:
 
     /// An adapter as a file names it: a weight of the DiT, and the rows of the weight a file's entry of that name
     /// changes (a fused weight's halves by their own names: img_mlp.gate_layer is gate_up's rows [0, inter)).
-    struct LoraTarget {
-        std::string name;
-        int64_t row0 = 0, rows = 0, cols = 0;
-    };
+    using LoraTarget = DitLoraTarget;
     /// The weights adapters may change: what a file's keys are matched against (the probe's map, the server's list).
     std::vector<LoraTarget> lora_targets() const;
 
@@ -144,11 +143,11 @@ public:
     /// other adapters'.  The same set again (its files and strengths) changes nothing.
     bool set_loras(const std::vector<LoraUse>& loras, std::string& err);
     /// The set bound, as its files' paths and strengths (empty: none).
-    const std::string& lora_key() const { return lora_key_; }
+    const std::string& lora_key() const { return loras_.key(); }
     /// The bound entries' A and B on the GPU.
     uint64_t lora_bytes() const;
     /// The adapter files bound (a set whose strengths are all 0 binds none).
-    int lora_count() const { return (int) lora_files_.size(); }
+    int lora_count() const { return loras_.count(); }
     void drop_loras();
 
     /// The ControlNet branch the sampling runs beside the blocks (qi_control.hpp; null: none): in a step it is on for,
@@ -159,21 +158,8 @@ private:
     friend class QiControl;
     QiControl* control_ = nullptr;
     bool control_on(float t) const;   // the branch on for the step at time t (sigma x 1000)
-    bool lora_bake_ = true, baked_any_ = false;
-    float* bake_tmp_ = nullptr;      // a weight's delta [n][k], while adapters are baked
-    uint16_t* bake_at16_ = nullptr;  // an adapter's A^T
     void install_prepare();
-    struct W {
-        int type = 0;
-        int64_t n = 0, k = 0;   // n rows of k
-        const void* d = nullptr;
-        uint64_t row_bytes = 0;
-        bool w8 = false;        // rewritten as int8 rows and a scale a row (kernels::rows_i8) for prefill::Gemm::i8
-        bool w8t = false;       // w8 through w8t_: a block format of fewer bits than int8's rows, kept as it is and
-                                // written as int8 rows into the scratch at each product
-        LoraLayer* lora = nullptr;   // the adapters' deltas for its products (null: none: the product is unchanged)
-        bool baked = false;          // its adapters folded into the block's copy of it (set_loras), not added to products
-    };
+    using W = DitW;   // type: the file's GGUF type; w8 and w8t its int8 forms
     struct Block {
         W q, k, v, o, gu, down;   // d: the offset within the block's region (LayerStream)
         uint64_t nq = 0, nk = 0;  // the FP32 norms' offsets
@@ -203,8 +189,6 @@ private:
     void swap_context();   // the first context's state <-> other_'s
     /// The weights adapters may take, from the blocks and the weights outside them (open).
     void build_lora_targets();
-    /// The products' scratch: T rows of the largest bound rank, FP32 and FP16 (grown on use).
-    void lora_scratch(int64_t T);
     /// The context's prefix let go: its text rows, and both contexts' K and V caches (an adapter change).
     void drop_prefix();
 
@@ -220,37 +204,13 @@ private:
     const float* tnorm_ = nullptr;
     std::vector<Block> blocks_;
     LayerStream blocks_stream_;
-    // the adapters: the weights a file's keys land on, the layers the weights hold, and the products' scratch
-    struct LoraSlot {
-        std::string name;
-        W* w = nullptr;
-        int64_t row0 = 0, rows = 0;
-    };
+    // the adapters: a weight and the rows of a file's entry it takes (dit_loras.hpp)
+    using LoraSlot = DitLoraSlot;
     /// A DoRA's row norms: the norms of a slot's weight, one a row of it, from the file's tensor (a fused weight's
     /// gate_layer and proj are its gate_up's rows), cached a tensor (open drops the cache).
     bool dora_norms(const LoraSlot& slot, std::vector<float>& out, std::string& err);
     /// One of the file's tensors' row norms, FP32, cached (`key`: the GGUF's own name).
     bool tensor_norms(const std::string& key, const std::vector<float>*& out, std::string& err);
-    std::vector<LoraSlot> lora_slots_;
-    std::vector<std::unique_ptr<LoraLayer>> lora_layers_;
-    std::vector<std::shared_ptr<const LoraFile>> lora_files_;
-    std::string lora_key_;
-    int64_t lora_cols_ = 0;   // the deltas' scratch's columns (the largest lora_scratch_cols of the bound entries)
-    float* lora_f32_ = nullptr;
-    uint16_t* lora16_ = nullptr;
-    int64_t lora_tmp_t_ = 0;   // the scratch's rows
-    // a GLoRA's own path: its input's columns, the weight's rows it is added over, and the buffers a band of its
-    // products takes (the rows' table, a W8A8 weight's int8 input and its scales)
-    int64_t lora_glora_cols_ = 0, lora_glora_rows_ = 0;
-    float* lora_glora_y_ = nullptr;
-    int8_t* lora_glora_x8_ = nullptr;
-    float* lora_glora_sx_ = nullptr;
-    void lora_glora_scratch();   // allocates them, once a set with a GLoRA is bound
-    void free_glora_scratch();
-    /// A GLoRA's own path: the weight's rows [r0, r0 + n) product of v (nt tokens, the first of them t0), added to
-    /// the product's output y at the rows' place in it (the weight's own path, as product takes it).
-    void glora_weight(const uint16_t* v, const W& w, int64_t r0, int64_t n, int64_t nt, int64_t t0, float* y,
-                      int64_t ldy, int64_t row0);
     std::map<std::string, std::vector<float>> norm_cache_;   // DoRA's row norms, a file's tensor (open clears them)
     std::vector<std::vector<float>> norms32_;   // an FP16 GGUF's q/k norms widened to FP32, streamed in their place
     bool prefix_cache_ = false;   // the blocks' pk and pv hold the context's prefix (set_context; set_loras drops it)
@@ -272,7 +232,7 @@ private:
     float* xs_ = nullptr;    // W8A8: two arrays of xs_rows_ scales, taken in turn (xs_next_), so that a product's
     int64_t xs_rows_ = 0;    // deferred sums keep theirs while the next input is quantized
     int xs_next_ = 0;
-    QiI8 i8_;                // the last deferred product's scales
+    DitOut i8_;              // the last deferred product's output (its sums' scales, or its BF16 values)
     // W::w8t: a weight's int8 rows (the largest weight's), and kW8tScales arrays of its row scales taken in turn (a
     // deferred product's scales are read after up to two more products: q, k and v)
     static constexpr int kW8tScales = 4;
@@ -301,6 +261,10 @@ private:
     float *scale_ = nullptr;          // [2][C]: the final norm's scale (row 0)
     float *temb_ = nullptr;           // [2][C] the time embeddings (t, 0), after their SiLU
     uint16_t *small16_ = nullptr;     // [2][C] FP16 operands of the time path
+    // the products (the deltas' buffers; the W8A8 input is xq_'s)
+    DitProducts prod_{&gemm_, &allocs_, &s_, "image engine"};
+    // the adapters bound (their table built at open, build_lora_targets)
+    DitLoras loras_{&prod_.lora, &allocs_, &s_, "image engine"};
 };
 
 }  // namespace strata::image

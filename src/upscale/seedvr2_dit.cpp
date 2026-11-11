@@ -35,7 +35,7 @@ namespace strata::upscale {
 // anonymous namespace mangles the same in every file)
 namespace seedvr2_dit_detail {
 
-using image::MfOut;
+using image::DitOut;
 namespace rows = image::dit_rows;
 using image::q_of;
 using image::alloc;
@@ -253,6 +253,7 @@ bool Seedvr2Dit::open(const std::string& path, void* stream, std::string& err, b
         const auto dense = [&](const std::string& name, int64_t kpad, const float** bias) {
             const image::SafeTensor& t = f.get(name + ".weight");
             W w;
+            w.type = kTypeF16;
             w.n = t.shape[0];
             const int64_t K = t.shape[1];
             w.k = std::max(kpad, K);
@@ -675,31 +676,35 @@ void Seedvr2Dit::ensure(int64_t t, int64_t h, int64_t w) {
     held_ = activation_bytes(h, w, t);
 }
 
-MfOut Seedvr2Dit::product_out(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y,
-                              int64_t T, const float* bias, bool bf16) {
-    const auto* d = base != nullptr ? base + reinterpret_cast<uintptr_t>(w.d) : static_cast<const uint8_t*>(w.d);
+image::DitProduct Seedvr2Dit::operands(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base,
+                                       float* y, int64_t T, const float* bias) const {
+    image::DitProduct p;
+    p.w = &w;
+    p.d = base != nullptr ? base + reinterpret_cast<uintptr_t>(w.d) : static_cast<const uint8_t*>(w.d);
+    p.x16 = x16;
     if (w.type == kTypeW8) {   // input's int8 rows (xq8_ and their scales xs_in_) against the file's
-        // a reader's values as BF16 where the fused kernel is the faster (prefill::Gemm::w8a8): half the bytes it reads
-        const auto* sw = reinterpret_cast<const float*>(base + w.sw);
-        if (prefill::Gemm::w8a8(xq8_, xs_in_, reinterpret_cast<const int8_t*>(d), sw, bias, y, T, w.n, w.k, w.n, bf16,
-                                s_)) {
-            MfOut o;
-            o.C = w.n;
-            o.bf = reinterpret_cast<const uint16_t*>(y);
-            return o;
-        }
-        return MfOut{nullptr, reinterpret_cast<const int32_t*>(y), nullptr, xs_in_, sw, bias, w.n};
+        p.x8 = xq8_;
+        p.sx = xs_in_;
+        p.w8 = reinterpret_cast<const int8_t*>(p.d);
+        p.sw = reinterpret_cast<const float*>(base + w.sw);
     }
-    if (w.type == kTypeQ8_0) gemm_.native(x16, kTypeQ8_0, d, y, T, w.n, w.k);
-    else gemm_.f16(x16, reinterpret_cast<const uint16_t*>(d), y, T, w.n, w.k);
-    return MfOut{y, nullptr, rs, nullptr, nullptr, bias, w.n};
+    p.rs = rs;
+    p.bias = bias;
+    p.y = y;
+    p.T = T;
+    return p;
+}
+
+DitOut Seedvr2Dit::product_out(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y,
+                               int64_t T, const float* bias) {
+    image::DitProduct p = operands(x16, rs, w, base, y, T, bias);
+    p.defer = true;
+    return prod_.run(p);
 }
 
 void Seedvr2Dit::product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
                          const float* bias) {
-    const MfOut o = product_out(x16, rs, w, base, y, T, bias, false);
-    if (o.i != nullptr) kernels::i8_scale(y, T, w.n, w.n, o.sx, o.sw, bias, nullptr, s_);
-    else if (rs != nullptr || bias != nullptr) rows::rows_back(y, rs, bias, T, w.n, s_);
+    prod_.run(operands(x16, rs, w, base, y, T, bias));
 }
 
 float* Seedvr2Dit::next_xs() {
@@ -721,7 +726,7 @@ const uint16_t* Seedvr2Dit::input(const Op16& op16, const OpI8& opi8, int64_t T,
 }
 
 // a stream's attention input: RMSNorm(x) * scale + shift (the block's attn modulation), its q, k, v product
-MfOut Seedvr2Dit::stream_attn_in(const Stream& st, const uint8_t* base, const float* x, int64_t T, float* qkv) {
+DitOut Seedvr2Dit::stream_attn_in(const Stream& st, const uint8_t* base, const float* x, int64_t T, float* qkv) {
     const float* mod = reinterpret_cast<const float*>(base + st.mod);
     const uint16_t* in = input(rows::RmsAffine{x, nullptr, mod + C_, mod, C_, kNormEps},
                                rows::RmsAffineI8<true>{x, mod + C_, mod, C_, kNormEps}, T, C_, a16_, rs_);
@@ -747,13 +752,13 @@ void Seedvr2Dit::stream_mlp(const Stream& st, const uint8_t* base, float* x, int
     const float* mod = reinterpret_cast<const float*>(base + st.mod);
     const uint16_t* in = input(rows::RmsAffine{x, nullptr, mod + 4 * C_, mod + 3 * C_, C_, kNormEps},
                                rows::RmsAffineI8<true>{x, mod + 4 * C_, mod + 3 * C_, C_, kNormEps}, T, C_, a16_, rs_);
-    MfOut y;
+    DitOut y;
     if (v2_) {   // the 3B's SwiGLU: the gate's and the input's product as one, no biases
-        const MfOut g = product_out(in, rs_, st.in, base, hid_, T, nullptr);
+        const DitOut g = product_out(in, rs_, st.in, base, hid_, T, nullptr);
         in = input(rows::SwiGlu{g, F_}, rows::SwiGluI8<true>{g, F_}, T, F_, g16_, rs2_);
         y = product_out(in, rs2_, st.fc, base, y_, T, nullptr);
     } else {
-        const MfOut hid = product_out(in, rs_, st.in, base, hid_, T, reinterpret_cast<const float*>(base + st.b_in));
+        const DitOut hid = product_out(in, rs_, st.in, base, hid_, T, reinterpret_cast<const float*>(base + st.b_in));
         in = input(rows::GeluTanh{hid}, rows::GeluTanhI8<true>{hid}, T, F_, g16_, rs2_);
         y = product_out(in, rs2_, st.fc, base, y_, T, reinterpret_cast<const float*>(base + st.b_fc));
     }
@@ -775,8 +780,8 @@ void Seedvr2Dit::forward(const float* noise, const float* cond, int64_t h, int64
         // q, k, v of both streams: the video's rotated by its tokens' window-local RoPE, the text's not.  A product is
         // read as it stands (its rows' scales and bias applied by its reader), so the video's is read before the
         // text's input takes the scales' buffer
-        const auto part = [&](const MfOut& o, int64_t k) {
-            MfOut p = o;
+        const auto part = [&](const DitOut& o, int64_t k) {
+            DitOut p = o;
             if (p.f != nullptr) p.f += k * C;
             if (p.i != nullptr) p.i += k * C;
             if (p.bf != nullptr) p.bf += k * C;
@@ -784,11 +789,11 @@ void Seedvr2Dit::forward(const float* noise, const float* cond, int64_t h, int64
             if (p.b != nullptr) p.b += k * C;
             return p;
         };
-        const MfOut qv = stream_attn_in(b.v, base, x_, N, qkv_);
+        const DitOut qv = stream_attn_in(b.v, base, x_, N, qkv_);
         rows::qk_rope16(part(qv, 0), part(qv, 1), part(qv, 2), reinterpret_cast<const float*>(base + b.v.nq),
                         reinterpret_cast<const float*>(base + b.v.nk), l.cos, l.sin, nullptr, N, heads_, hd_, false,
                         q16_, k16_, v16_, s_, kNormEps, n_rot_);
-        const MfOut qt = stream_attn_in(b.t, base, t_, L, qkt_);
+        const DitOut qt = stream_attn_in(b.t, base, t_, L, qkt_);
         rows::qk_rope16(part(qt, 0), part(qt, 1), part(qt, 2), reinterpret_cast<const float*>(base + b.t.nq),
                         reinterpret_cast<const float*>(base + b.t.nk), tcos_, tsin_, nullptr, L, heads_, hd_,
                         false, q16_ + N * C, k16_ + N * C, v16_ + N * C, s_, kNormEps, n_rot_);

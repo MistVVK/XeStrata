@@ -40,13 +40,19 @@ void finish(void* stream, const sycl::event& e, const char* what) {
 
 constexpr float kEps = 1e-6f;
 
+// a W8A8 product's scales as the kernel reads them (DitOut's sx and sw; bf: its values already scaled, as BF16)
+struct I8Scales {
+    const float *sx = nullptr, *sw = nullptr;
+    bool bf = false;
+};
+
 // qi_qk_norm_rope16 a sub-group of 32 a head (t, h), HEADS heads a work-group
 // q, k and v as FP32, or (i8) a W8A8 product's int32 sums with their scales (s[0], s[1], s[2]: q's, k's and v's,
 // the activations' shared)
 struct QkvIn {
     const float *q, *k, *v;
     bool i8;
-    QiI8 s[3];
+    I8Scales s[3];
     float at(int which, int64_t t, int64_t idx, int64_t c) const {
         // the three by selects, not s[which]: a run-time index into the array puts it in private memory (Qwen-Image's
         // QK kernel took the B70 twice its time, 3.3 s of an image's 6.8)
@@ -121,11 +127,11 @@ void qi_ln_mod16(const float* x, const float* mod, int64_t n_text, int64_t T, in
 }
 
 void qi_gate_add(float* x, const float* h, const float* mod, int64_t n_text, int64_t T, int64_t C, void* stream,
-                 const QiI8* i8) {
+                 const DitOut* i8) {
     // the DiTs' gated residual (dit_rows::gate_add_by), the gate the text's or the image's row of mod, through tanh
-    MfOut in;
+    DitOut in;
     in.C = C;
-    if (i8 != nullptr && i8->bf) {
+    if (i8 != nullptr && i8->bf != nullptr) {
         in.bf = reinterpret_cast<const uint16_t*>(h);
     } else if (i8 != nullptr) {
         in.i = reinterpret_cast<const int32_t*>(h);
@@ -141,10 +147,10 @@ void qi_gate_add(float* x, const float* h, const float* mod, int64_t n_text, int
 
 void qi_qk_norm_rope16(const float* q, const float* k, const float* v, const float* wq, const float* wk,
                        const float* cos, const float* sin, int64_t T, int64_t heads, int64_t head_dim,
-                       uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream, const QiI8* i8) {
+                       uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream, const DitOut* i8) {
     QkvIn in{q, k, v, i8 != nullptr, {}};
     if (i8 != nullptr)
-        for (int j = 0; j < 3; ++j) in.s[j] = i8[j];
+        for (int j = 0; j < 3; ++j) in.s[j] = I8Scales{i8[j].sx, i8[j].sw, i8[j].bf != nullptr};
     if (T <= 0) return;
     if (head_dim % 2 != 0 || head_dim > 256) throw std::invalid_argument("qi_qk_norm_rope16: head_dim");
     // the rows [T][heads][head_dim], their pairs (2j, 2j + 1)
@@ -180,8 +186,8 @@ void qi_qk_norm_rope16(const float* q, const float* k, const float* v, const flo
            "qi_qk_norm_rope16");
 }
 
-void qi_swiglu_i8(const int32_t* gu, const QiI8& g, int64_t T, int64_t inter, int8_t* q, float* s, void* stream) {
-    kernels::rows_i8_of(qi_rows::I8FromSwiglu{gu, g.sx, g.sw, inter, g.bf}, T, inter, q, s, stream);
+void qi_swiglu_i8(const int32_t* gu, const DitOut& g, int64_t T, int64_t inter, int8_t* q, float* s, void* stream) {
+    kernels::rows_i8_of(qi_rows::I8FromSwiglu{gu, g.sx, g.sw, inter, g.bf != nullptr}, T, inter, q, s, stream);
 }
 
 void qi_rows_scale(float* y, int64_t T, int64_t N, int64_t ldy, const float* col, void* stream) {

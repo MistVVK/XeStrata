@@ -125,11 +125,7 @@ void AnimaPipeline::use_loras(const QiRequest& r) {
         ctx_key_[0] = {};
         ctx_key_[1] = {};
     }
-    if (lora_key_of(te_loras_) != te_lora_) {   // the states kept were the encoder's with the other adapters
-        last_ids_.clear();
-        last_neg_ids_.clear();
-        te_lora_ = lora_key_of(te_loras_);
-    }
+    te_loras_now(lora_key_of(te_loras_));   // the states kept were the encoder's with the other adapters
 }
 
 void AnimaPipeline::ensure_open(bool q8) {
@@ -247,15 +243,10 @@ QiPlan AnimaPipeline::plan(int64_t hw, int n, bool text) {
               vae_->weight_bytes();
     p.lora = d.lora_bytes();
     p.lora_n = d.lora_count();
-    if (p.budget <= p.fixed)
-        throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
-                                 " MiB) is below the weights that always stay");
-    const uint64_t avail = p.budget - p.fixed, dit_min = d.block_min();
+    const uint64_t avail = plan_avail(p), dit_min = d.block_min();
     const int64_t mlp = mlp_bands(avail, hw > 0, p.activations,
                                   [&](int64_t rows) { return d.activation_bytes(hw, n, rows); });
-    if (avail < p.activations + dit_min)
-        throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
-                                 " MiB) is too small for this image");
+    if (avail < p.activations + dit_min) plan_too_small(p);
     uint64_t te_need = te_ ? te_->layer_bytes() + te_->activation_bytes(512) : 0;
     if (te_ && avail < p.activations + d.block_bytes() + te_need) {   // the encoder goes: its states are made
         gpu::stream_sync(s_);
@@ -263,21 +254,12 @@ QiPlan AnimaPipeline::plan(int64_t hw, int n, bool text) {
         te_need = 0;
     }
     p.blocks = clampu(avail - p.activations - te_need, dit_min, d.block_bytes());
-    if (p.blocks != dit_set_) {
-        d.set_block_budget(p.blocks);
-        dit_set_ = p.blocks;
-    }
+    plan_blocks(d, p.blocks);
     if (te_) {
         p.layers = te_->layer_bytes();
         p.resident_layers = te_->resident_layers();
     }
-    p.mlp_rows = mlp;
-    if (hw > 0 && mlp != mlp_set_) {
-        d.set_mlp_rows(mlp);
-        mlp_set_ = mlp;
-    }
-    if (hw == 0) d.drop_activations();
-    p.resident_blocks = d.resident_blocks();
+    plan_rows(p, d, hw > 0, mlp);
     p.vae = avail - p.blocks - te_need;
     return p;
 }
@@ -456,7 +438,7 @@ std::vector<uint8_t> AnimaPipeline::generate(const QiRequest& r, QiTimes* times,
     const auto noise = torch_cpu_randn(r.seed, (uint64_t) N);
     std::vector<float> tokens((size_t) N);
     noise_to_tokens(noise.data(), L, 2 * h, 2 * w, 2, tokens.data());
-    float *x = nullptr, *rgba = nullptr, *x0 = nullptr, *z = nullptr;
+    float *x = nullptr, *rgba = nullptr, *z = nullptr;
     if (!gpu::alloc_device(&x, (size_t) N * 4) || !gpu::alloc_device(&rgba, (size_t) (4 * HW) * 4) ||
         !gpu::alloc_device(&z, (size_t) N * 4)) {
         gpu::free(x);
@@ -473,35 +455,26 @@ std::vector<uint8_t> AnimaPipeline::generate(const QiRequest& r, QiTimes* times,
         gpu::copy(x, tokens.data(), (size_t) N * 4);
         if (r.strength < 1.0) ls.start(x, sigmas[0], s_);
         if (stage) stage("sampling");
-        int shown = 0;
-        auto peek = [&](int done, const std::function<void(float*)>& make) {
-            if (!r.on_preview || std::find(r.preview.begin(), r.preview.end(), done) == r.preview.end()) return;
-            const uint64_t room = p.vae > p.activations ? p.vae - p.activations : 0;
-            if (x0 == nullptr && !gpu::alloc_device(&x0, (size_t) N * 4)) return;
-            make(x0);
-            try {
+        // partial images (r.preview)
+        PreviewDecode preview(
+            r, p, N,
+            [&](float* x0, uint64_t room) {
                 tokens_to_latent(x0, h, w, L, z, s_);
                 vae_->decode(z, 2 * h, 2 * w, rgba, room);
-            } catch (const std::exception&) {
-                vae_->drop_scratch();
-                return;
-            }
-            vae_->drop_scratch();
-            gpu::copy(out.data(), rgba, out.size() * 4);
-            std::vector<uint8_t> img = rgba8(out, HW);
-            if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
-            r.on_preview(shown++, done, img);
-        };
+            },
+            [&] { vae_->drop_scratch(); },
+            [&] {
+                gpu::copy(out.data(), rgba, out.size() * 4);
+                std::vector<uint8_t> img = rgba8(out, HW);
+                if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
+                return img;
+            });
+        auto peek = [&](int done, const std::function<void(float*)>& make) { preview(done, make); };
         sample(x, h, w, sigmas, n, guided ? r.cfg : 1.0f, er, r.seed, step, ls.after(s_), peek, r.guide);
-        gpu::free(x0);
-        x0 = nullptr;
+        preview.release();
         const auto t2 = clock::now();
         if (stage) stage("decode");
-        uint64_t room = p.vae > p.activations ? p.vae - p.activations : 0;
-        if (vae_->scratch_bytes(2 * h, 2 * w) > room) {
-            d.drop_activations();
-            room = p.vae;
-        }
+        uint64_t room = decode_room(p, d, vae_->scratch_bytes(2 * h, 2 * w));
         if (vae_->scratch_bytes(2 * h, 2 * w) > room && te_) {
             room += te_->layers_vram();
             te_.reset();
@@ -526,7 +499,6 @@ std::vector<uint8_t> AnimaPipeline::generate(const QiRequest& r, QiTimes* times,
         }
     } catch (...) {
         gpu::free(x);
-        gpu::free(x0);
         gpu::free(rgba);
         gpu::free(z);
         throw;

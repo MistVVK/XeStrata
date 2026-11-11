@@ -35,6 +35,7 @@
 // set_context, and drop_text gives their VRAM back.
 #pragma once
 
+#include "strata/image/dit_loras.hpp"
 #include "strata/image/image_lora.hpp"
 #include "strata/image/mf_dit.hpp"
 #include "strata/image/qi_stream.hpp"
@@ -136,10 +137,7 @@ public:
 
     /// As MossDit's: the weights adapters may change, the set bound (set_loras), its key, bytes and files.  A set that
     /// changes drops the contexts' kept keys and values.
-    struct LoraTarget {
-        std::string name;
-        int64_t row0 = 0, rows = 0, cols = 0, src_row = 0;
-    };
+    using LoraTarget = DitLoraTarget;
     std::vector<LoraTarget> lora_targets() const;
     bool set_loras(const std::vector<LoraUse>& loras, std::string& err);
     /// An expanded DiT's blocks that the release's are (the 2.9B's: its 40 blocks, 12 of them inserted between the
@@ -148,27 +146,15 @@ public:
     void set_lora_block_map(std::vector<int> map) { block_map_ = std::move(map); }
     /// The adapters folded into the blocks' weights where they are plain LoRAs (the default), else added to each
     /// product: false keeps the weights as the file has them.
-    void set_lora_bake(bool on) { lora_bake_ = on; }
-    const std::string& lora_key() const { return lora_key_; }
+    void set_lora_bake(bool on) { loras_.bake = on; }
+    const std::string& lora_key() const { return loras_.key(); }
     uint64_t lora_bytes() const;
-    int lora_count() const { return (int) lora_files_.size(); }
+    int lora_count() const { return loras_.count(); }
     void drop_loras();
 
 private:
-    struct W {
-        int type = 0;            // 8 Q8_0, 1 F16, -8 W8A8's int8 rows and their scales
-        int64_t n = 0, k = 0;    // n rows of k
-        const void* d = nullptr; // a block's: its offset in the block's region; else a device pointer
-        uint64_t row_bytes = 0;
-        LoraLayer* lora = nullptr;
-        bool baked = false;      // its adapters folded into the block's copy of it (set_loras), not added to products
-    };
-    struct LoraSlot {
-        std::string name;
-        W* w = nullptr;
-        int64_t row0 = 0, rows = 0, src_row = 0;
-        bool biased = false;
-    };
+    using W = DitW;
+    using LoraSlot = DitLoraSlot;
     struct Block {
         W sq, sk, sv, so, cq, ck, cv, co, l1, l2, msa1, msa2, mca1, mca2, mml1, mml2;
         uint64_t sqn = 0, skn = 0, cqn = 0, ckn = 0;   // the FP32 norms' offsets
@@ -192,17 +178,18 @@ private:
     const float* vec(const std::string& name, std::vector<void*>& owned, uint64_t& bytes);
     void load_text();
     void build_lora_targets();
-    void lora_scratch(int64_t T);
-    bool dora_norms(const LoraSlot& slot, std::vector<float>& out, std::string& err);
     bool tensor_norms(const std::string& name, const std::vector<float>*& out, std::string& err);
-    // defer: a W8A8 product's int32 sums left for its reader to scale (MfOut::at), no pass of its own
-    MfOut product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
-                  const float* bias, bool same_input = false, bool defer = false);
+    // the shared product (DitProducts::run); defer: a W8A8 product's int32 sums left for its reader to scale
+    // (DitOut::at), no pass of its own (a 16-bit weight's sums are scaled here: Anima's readers take them as FP32)
+    DitOut product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
+                   const float* bias, bool same_input = false, bool defer = false) {
+        return prod_.run(x16, rs, w, base, y, T, bias, same_input, defer && w.type == kDitW8);
+    }
     void ensure(int64_t hw, int n);
     // the cross-attention's products form (a GPU without FP16 matrix engines): the keys and values head-major, then a
     // head at a time the scores, their softmax and the weighted values through the shared products, out [Tq][C] FP32
-    void attn_kv(const MfOut& k, const MfOut& v, int64_t Tk, int64_t heads, int64_t hd, const float* wk, uint16_t* kv);
-    void attn_q(const MfOut& q, int64_t Tq, int64_t heads, int64_t hd, const float* wq, const uint16_t* kv, int64_t Tk,
+    void attn_kv(const DitOut& k, const DitOut& v, int64_t Tk, int64_t heads, int64_t hd, const float* wk, uint16_t* kv);
+    void attn_q(const DitOut& q, int64_t Tq, int64_t heads, int64_t hd, const float* wq, const uint16_t* kv, int64_t Tk,
                 float* out);
     void rope_tables(int64_t h, int64_t w);
     void time_embedding(float sigma);
@@ -216,12 +203,6 @@ private:
         const std::vector<float>* t5w;
     };
     void adapter(const std::vector<AdapterIn>& in);
-    void glora_weight(const uint16_t* v, const W& w, const uint8_t* d, int64_t r0, int64_t n, int64_t nt, int64_t t0,
-                      float* y);
-    void add_glora(const LoraLayer* lora, const uint16_t* x16, const float* rs, const W& w, const uint8_t* d,
-                   int64_t T, float* y);
-    void lora_glora_scratch();
-    void free_glora_scratch();
     void drop_kv();
 
     std::unique_ptr<AnimaFile> file_;
@@ -231,19 +212,13 @@ private:
     std::vector<void*> allocs_, text_allocs_;
     uint64_t weight_bytes_ = 0, text_bytes_ = 0;
     int64_t scratch_ = 0;
-    std::vector<LoraSlot> lora_slots_;
-    std::vector<std::unique_ptr<LoraLayer>> lora_layers_;
-    std::vector<std::shared_ptr<const LoraFile>> lora_files_;
-    std::string lora_key_;
     std::vector<int> block_map_;
-    int64_t lora_cols_ = 0, lora_tmp_t_ = 0;
+    bool lora_remap_ = false;   // the file being bound names its blocks through block_map_
     std::map<std::string, std::vector<float>> norm_cache_;
-    float* lora_f32_ = nullptr;
-    uint16_t* lora16_ = nullptr;
-    int64_t lora_glora_cols_ = 0, lora_glora_rows_ = 0;
-    float* lora_glora_y_ = nullptr;
-    int8_t* lora_glora_x8_ = nullptr;
-    float* lora_glora_sx_ = nullptr;
+    // the products (W8A8's input, the deltas' buffers)
+    DitProducts prod_{&gemm_, &allocs_, &s_, "image engine (Anima DiT)"};
+    // the adapters bound (their table built at open, build_lora_targets)
+    DitLoras loras_{&prod_.lora, &allocs_, &s_, "image engine (Anima DiT)"};
     bool dry_ = false, q8_ = true, w8_ = false, text_loaded_ = false;
     int64_t C_ = 2048, F_ = 8192, heads_ = 16, hd_ = 128, lat_ = 16, src_dim_ = 1024, mod_dim_ = 256;
     int64_t ad_C_ = 1024, ad_heads_ = 16, ad_hd_ = 64, ad_F_ = 4096, vocab_ = 32128;
@@ -273,14 +248,8 @@ private:
              *o16_ = nullptr, *qh16_ = nullptr, *p16_ = nullptr;
     int64_t jrows_ = 0;
     int64_t dirty_[2] = {0, 0};
-    bool lora_bake_ = true, baked_any_ = false;
-    float* bake_tmp_ = nullptr;      // a weight's delta [n][k], while adapters are baked
-    uint16_t* bake_at16_ = nullptr;  // an adapter's A^T
     void install_prepare();
     int cross_form_ = -1;   // the cross-attention: unknown, the shared entry, the products (no matrix engines)
-    int8_t* xq8_ = nullptr;
-    int64_t xq8_rows_ = 0, xq8_cols_ = 0;
-    int xs_next_ = 0;
     // the time's parts: the embedding's SiLU (FP16), the AdaLN-LoRA term, a modulation's hidden values and its output
     uint16_t *e16_ = nullptr, *m16_ = nullptr;
     // the adapter's working buffers, one region kept between prompts (grown on use, freed with the adapter's weights)

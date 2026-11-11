@@ -93,7 +93,7 @@ int main() {
         float* sxd = dev.upload(sx);
         float* gwd = dev.upload(gw);
         float* kept = dev.alloc<float>((size_t) (T * K));
-        strata::image::MfOut yo;
+        strata::image::DitOut yo;
         yo.i = yd;
         yo.sx = sxd;
         yo.sw = gwd;

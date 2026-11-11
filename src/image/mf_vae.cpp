@@ -126,7 +126,7 @@ void scale16(const float* x, const float* ca, int64_t HW, int64_t C, uint16_t* y
 
 // x += gate * u (per channel): dit_rows' gate_add
 void gate_add(float* x, const float* u, const float* gate, int64_t HW, int64_t C, void* s) {
-    MfOut h;
+    DitOut h;
     h.f = u;
     h.C = C;
     dit_rows::gate_add(x, h, gate, HW, C, s);

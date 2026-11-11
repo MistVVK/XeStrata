@@ -49,24 +49,6 @@ void put_async(void* d, const void* h, size_t bytes, void* s) {
         throw std::runtime_error(std::string("image engine: copy: ") + gpu::last_error());
 }
 
-// A file's key that changes a text encoder (kohya's lora_te_, diffusers' text_encoder. prefix, the te. other tools
-// write): the image engine applies adapters to the DiT only, and says so rather than leaving it out.
-bool is_text_encoder_key(const std::string& k) {
-    return k.rfind("lora_te", 0) == 0 || k.rfind("text_encoder", 0) == 0 || k.rfind("te.", 0) == 0;
-}
-
-// Six of the names, then "and N more": the errors' list of a file's keys the DiT does not take.
-std::string name_list(const std::vector<std::string>& names) {
-    std::string out;
-    const size_t n = std::min<size_t>(names.size(), 6);
-    for (size_t i = 0; i < n; ++i) {
-        if (i > 0) out += ", ";
-        out += names[i];
-    }
-    if (names.size() > n) out += " (and " + std::to_string(names.size() - n) + " more)";
-    return out;
-}
-
 }  // namespace
 
 std::vector<float> philox_randn(uint64_t seed, uint64_t n, uint32_t offset) {
@@ -98,7 +80,37 @@ const std::vector<float>& turbo_sigmas() {
     return s;
 }
 
-QiDit::QiDit() = default;
+QiDit::QiDit() {
+    DitLoraHooks& h = loras_.hooks;
+    h.drop = [this] { drop_loras(); };
+    h.dora_norms = [this](const DitLoraSlot& slot, std::vector<float>& out, std::string& err) {
+        return dora_norms(slot, out, err);
+    };
+    h.refuse = [this](const DitLoraSlot& slot, const LoraEntry& e, std::string& why) {
+        if (e.kind == LoraKind::bias || !e.bias.empty()) {
+            // no place for it: the DiT's products add no bias (its blocks' modulation does the shift), so a file's
+            // bias's delta would change nothing while it was asked for
+            why = "a bias's delta (diff_b/b_norm), and the DiT's weights add no bias (Qwen-Image-2.1's DiT has none)";
+            return true;
+        }
+        if (e.kind == LoraKind::oft && slot.name == "modulation.1") {
+            // the DiT writes that weight a band of C_ rows at a time (step_modulation), and a rotation turns the
+            // part's rows whole (LoraLayer::add): bound, it would be skipped on every band
+            why = "an OFT of the modulation, which the DiT writes " + std::to_string(C_) +
+                  " rows at a time: the engine does not turn it";
+            return true;
+        }
+        return false;
+    };
+    h.block_weights = [this](std::vector<DitW*>& ws) {
+        for (Block& b : blocks_)
+            for (W* w : {&b.q, &b.k, &b.v, &b.o, &b.gu, &b.down}) ws.push_back(w);
+    };
+    h.reprepare = [this] {
+        blocks_stream_.reload();   // the queued work drained before the prepare changes
+        install_prepare();
+    };
+}
 
 QiDit::~QiDit() {
     for (void* p : allocs_) gpu::free(p);
@@ -309,7 +321,7 @@ int8_t* QiDit::xq8(int64_t T, int64_t K, float** sx) {
 // A block's weights as each copy of it reaches the GPU: rewritten as int8 rows (w8), and the adapters baked in
 // (set_loras); none of it where nothing is to be done (the stream then copies them as they are)
 void QiDit::install_prepare() {
-    if (!w8_ && !baked_any_) {
+    if (!w8_ && !loras_.baked_any()) {
         blocks_stream_.set_prepare(nullptr);
         return;
     }
@@ -326,7 +338,8 @@ void QiDit::install_prepare() {
                            reinterpret_cast<float*>(p + w->n * w->k), nullptr, s_);
             }
             if (w->baked)
-                w->lora->bake(w->w8 && !w->w8t ? -8 : w->type, p, w->n, w->k, gemm_, bake_tmp_, bake_at16_, s_);
+                w->lora->bake(w->w8 && !w->w8t ? -8 : w->type, p, w->n, w->k, gemm_, loras_.bake_tmp(),
+                              loras_.bake_at16(), s_);
         }
     });
 }
@@ -334,16 +347,19 @@ void QiDit::install_prepare() {
 bool QiDit::product(const uint16_t* x16, const W& w, float* y, int64_t T, int64_t ldy, int64_t row0, int64_t rows,
                     bool same_input, bool defer) {
     if (rows < 0) rows = w.n;
-    LoraLayer* lora = w.baked ? nullptr : w.lora;
-    if (lora != nullptr) defer = false;   // a delta is FP32: the int32 sums are scaled into y first
     if (ldy <= 0) ldy = rows;
-    // a DoRA's factor of the weight's rows row0 .. row0 + rows - 1: the base product's, then the delta's own
-    const float* col = lora != nullptr && lora->has_base() ? lora->base() + row0 : nullptr;
-    const auto* base = static_cast<const uint8_t*>(w.d) + (uint64_t) row0 * w.row_bytes;
-    bool deferred = false;
+    DitProduct p;
+    p.w = &w;
+    p.d = static_cast<const uint8_t*>(w.d);
+    p.x16 = x16;
+    p.y = y;
+    p.T = T;
+    p.ldy = ldy;
+    p.row0 = row0;
+    p.rows = rows;
+    p.defer = defer && w.w8;   // (a 16-bit weight's sums are FP32 as they are)
     if (w.w8) {
-        // the activations rotated and quantized as the weights (their int8 values, a scale a token), the int32 sums
-        // into y and scaled there, or by their reader (defer)
+        // the activations rotated and quantized as the weights (their int8 values, a scale a token)
         float* sx = nullptr;
         int8_t* x8 = nullptr;
         if (same_input) {
@@ -353,51 +369,24 @@ bool QiDit::product(const uint16_t* x16, const W& w, float* y, int64_t T, int64_
             x8 = xq8(T, w.k, &sx);
             kernels::rows_i8(x16, false, T, w.k, x8, sx, nullptr, s_);
         }
-        const auto* w8 = static_cast<const uint8_t*>(w.d);
-        const float* sw = reinterpret_cast<const float*>(w8 + w.n * w.k) + row0;
+        p.x8 = x8;
+        p.sx = sx;
         if (w.w8t) {   // the weight's rows as int8 into the scratch, as install_prepare writes a w8 weight's
+            const auto* blocks = p.d + (uint64_t) row0 * w.row_bytes;
             float* s = w8t_s_ + w8t_next_ * w8t_rows_;
             w8t_next_ = (w8t_next_ + 1) % kW8tScales;
-            if (!kernels::rows_i8_blocks(w.type, base, rows, w.k, w8t_, s, s_)) {
-                kernels::dequant_f16(w.type, base, 0, rows, w.k, gemm_.scratch(), s_);
+            if (!kernels::rows_i8_blocks(w.type, blocks, rows, w.k, w8t_, s, s_)) {
+                kernels::dequant_f16(w.type, blocks, 0, rows, w.k, gemm_.scratch(), s_);
                 kernels::rows_i8(gemm_.scratch(), false, rows, w.k, w8t_, s, nullptr, s_);
             }
-            w8 = reinterpret_cast<const uint8_t*>(w8t_) - row0 * w.k;
-            sw = s;
+            p.w8 = w8t_;
+            p.sw = s;
         }
-        // a reader's values as BF16 where the fused kernel is the faster (prefill::Gemm::w8a8): scaled in its
-        // epilogue, half the bytes the reader reads
-        if (prefill::Gemm::w8a8(x8, sx, reinterpret_cast<const int8_t*>(w8 + row0 * w.k), sw, nullptr, y, T, rows,
-                                w.k, ldy, defer && col == nullptr, s_)) {
-            i8_ = {nullptr, nullptr, true};
-            deferred = true;
-        } else {
-            if (defer) {
-                i8_ = {sx, sw};
-                deferred = true;
-            } else {
-                kernels::i8_scale(y, T, rows, ldy, sx, sw, nullptr, col, s_);
-            }
-        }
-    } else if (w.type == kTypeF16) {
-        gemm_.f16(x16, reinterpret_cast<const uint16_t*>(base), y, T, rows, w.k, ldy);
-    } else {
-        gemm_.native(x16, w.type, base, y, T, rows, w.k, ldy);
     }
-    if (deferred) return true;
-    if (lora != nullptr) {
-        lora_scratch(T);
-        // a DoRA's base product, its rows scaled before the delta adds to them (the int8 ones were scaled above)
-        if (col != nullptr && !w.w8) qi_rows_scale(y, T, rows, ldy, col, s_);
-        // the delta is the input's own (not the rotated int8 one): no row scale to put back on it
-        lora->add(x16, T, y, ldy, row0, rows, nullptr, gemm_, lora_f32_, lora16_, s_);
-        if (lora->has_glora())   // a GLoRA's own path: the weight's product of its input, a band of the tokens at a time
-            lora->add_glora(x16, T, row0, rows, nullptr, gemm_, lora_f32_, lora16_, s_,
-                            [&](const uint16_t* v, int64_t t0, int64_t nt, int64_t r0, int64_t n2) {
-                                glora_weight(v, w, r0, n2, nt, t0, y, ldy, row0);
-                            });
-    }
-    return false;
+    const DitOut out = prod_.run(p);
+    if (out.bf == nullptr && out.i == nullptr) return false;
+    i8_ = out;   // the reader scales the sums (or takes the BF16 values)
+    return true;
 }
 
 void QiDit::mlp(const W& wgu, const W& wdown, float* x, const float* gate, int64_t n_text, int64_t mr) {
@@ -713,7 +702,7 @@ void QiDit::forward(const float* x, float t, int64_t H, int64_t W, bool prefix, 
         qi_ln_mod16(xr, mod(0), ntr, Tr, C, h16_, s_);
         // W8A8: the sums scaled as qi_qk_norm_rope16 reads them (an adapter's delta is FP32: those products are not
         // deferred, and the sums are scaled here)
-        QiI8 qkv[3];
+        DitOut qkv[3];
         const bool i8 = wq.w8 && wk.w8 && wv.w8 && wq.lora == nullptr && wk.lora == nullptr && wv.lora == nullptr;
         product(h16_, wq, q_ + r0 * C, Tr, 0, 0, -1, false, i8);
         qkv[0] = i8_;
@@ -813,7 +802,7 @@ void QiDit::forward_pair(const float* x, float t, int64_t H, int64_t W, float* o
         const auto* nk = reinterpret_cast<const float*>(base + b.nk);
         qi_ln_mod16(x_, mod(0), 0, R, C, h16_, s_);
         // W8A8: the sums scaled as qi_qk_norm_rope16 reads them (the second context's rows from HW on)
-        QiI8 qkv[3], qkv2[3];
+        DitOut qkv[3], qkv2[3];
         const bool i8 = wq.w8 && wk.w8 && wv.w8 && wq.lora == nullptr && wk.lora == nullptr && wv.lora == nullptr;
         product(h16_, wq, q_, R, 0, 0, -1, false, i8);
         qkv[0] = i8_;
@@ -821,7 +810,10 @@ void QiDit::forward_pair(const float* x, float t, int64_t H, int64_t W, float* o
         qkv[1] = i8_;
         product(h16_, wv, v_, R, 0, 0, -1, wk.w8, i8);
         qkv[2] = i8_;
-        for (int j = 0; j < 3; ++j) qkv2[j] = {qkv[j].sx + HW, qkv[j].sw};
+        for (int j = 0; j < 3; ++j) {
+            qkv2[j].sx = qkv[j].sx + HW;
+            qkv2[j].sw = qkv[j].sw;
+        }
         qi_qk_norm_rope16(q_, k_, v_, nq, nk, cos_ + na * kHead / 2, sin_ + na * kHead / 2, HW, heads_, kHead,
                           q16_ + na * C, k16_ + na * C, v16_ + na * C, s_, i8 ? qkv : nullptr);
         qi_qk_norm_rope16(q_ + HW * C, k_ + HW * C, v_ + HW * C, nq, nk, o.cos + nb * kHead / 2,
@@ -862,7 +854,7 @@ uint64_t QiDit::activation_bytes(int64_t T, int64_t mlp_rows) const {
            (uint64_t) mr * 2 * (uint64_t) inter_ * 4 + (uint64_t) T * (uint64_t) std::max(C_, inter_) * 2 +
            (uint64_t) TP * (uint64_t) C_ * 2 * 3 + (uint64_t) T * (uint64_t) C_ * 2 + (uint64_t) T * kHead * 4 +
            (w8_ ? (uint64_t) std::max(T * C_, mr * inter_) + (uint64_t) T * 8 : 0) +
-           (lora_cols_ > 0 ? (uint64_t) std::max(T, lora_tmp_t_) * (uint64_t) lora_cols_ * 6 : 0);
+           prod_.lora.bytes(T);
 }
 
 void QiDit::set_mlp_rows(int64_t rows) {
@@ -872,18 +864,13 @@ void QiDit::set_mlp_rows(int64_t rows) {
     }
 }
 
-std::vector<QiDit::LoraTarget> QiDit::lora_targets() const {
-    std::vector<LoraTarget> out;
-    out.reserve(lora_slots_.size());
-    for (const LoraSlot& s : lora_slots_) out.push_back({s.name, s.row0, s.rows, s.w->k});
-    return out;
-}
+std::vector<QiDit::LoraTarget> QiDit::lora_targets() const { return loras_.targets(); }
 
 void QiDit::build_lora_targets() {
-    lora_slots_.clear();
+    loras_.clear_slots();
+    // (no weight of the DiT adds a bias: its blocks' modulation does the shift)
     auto add = [this](std::string name, W& w, int64_t row0, int64_t rows) {
-        if (w.n <= 0 || w.k <= 0 || rows <= 0 || row0 + rows > w.n) return;
-        lora_slots_.push_back({std::move(name), &w, row0, rows});
+        loras_.add(std::move(name), w, row0, rows);
     };
     // the weights outside the blocks (the text projection's norm is a norm, not a linear product: unchanged)
     const char* const* out = lora::kQiOutside;
@@ -911,64 +898,6 @@ void QiDit::build_lora_targets() {
     }
 }
 
-void QiDit::lora_scratch(int64_t T) {
-    if (lora_cols_ <= 0 || T <= 0) return;
-    // a GLoRA's own path's buffers are a band's, not the tokens': the activations' drop frees them, this gives them back
-    if (lora_glora_cols_ > 0 && lora_glora_y_ == nullptr) lora_glora_scratch();
-    if (lora_f32_ != nullptr && T <= lora_tmp_t_) return;
-    gpu::stream_sync(s_);   // the old buffers may still be read
-    for (void** p : {reinterpret_cast<void**>(&lora_f32_), reinterpret_cast<void**>(&lora16_)})
-        if (*p != nullptr) {
-            allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), *p), allocs_.end());
-            gpu::free(*p);
-            *p = nullptr;
-        }
-    lora_f32_ = alloc<float>(allocs_, T * lora_cols_, "image engine");
-    lora16_ = alloc<uint16_t>(allocs_, T * lora_cols_, "image engine");
-    lora_tmp_t_ = T;
-}
-
-// A GLoRA's own path's buffers: the table the weight's product of its input is added from (a band of tokens, the
-// weight's rows), and that input as a W8A8 product takes it (int8 values and a scale a row).  The scratch of the
-// deltas (lora_scratch) holds the input's own two products.
-void QiDit::lora_glora_scratch() {
-    if (lora_glora_cols_ <= 0 || lora_glora_rows_ <= 0) return;
-    const size_t band = (size_t) kLoraGloraRows;
-    lora_glora_y_ = alloc<float>(allocs_, (int64_t) (band * (size_t) lora_glora_rows_), "image engine");
-    lora_glora_x8_ = alloc<int8_t>(allocs_, (int64_t) (band * (size_t) lora_glora_cols_), "image engine");
-    lora_glora_sx_ = alloc<float>(allocs_, (int64_t) band, "image engine");
-}
-
-void QiDit::glora_weight(const uint16_t* v, const W& w, int64_t r0, int64_t n, int64_t nt, int64_t t0, float* y,
-                         int64_t ldy, int64_t row0) {
-    const auto* d = static_cast<const uint8_t*>(w.d);
-    if (w.w8 && !w.w8t) {   // a w8t weight's blocks take the native path below
-        // the input's own int8 quantization (its buffer, not the product's: that one's is the other products' input)
-        kernels::rows_i8(v, false, nt, w.k, lora_glora_x8_, lora_glora_sx_, nullptr, s_);
-        const auto* sw = reinterpret_cast<const float*>(d + w.n * w.k) + r0;
-        prefill::Gemm::w8a8(lora_glora_x8_, lora_glora_sx_, reinterpret_cast<const int8_t*>(d) + r0 * w.k, sw, nullptr,
-                            lora_glora_y_, nt, n, w.k, n, false, s_);
-        kernels::i8_scale(lora_glora_y_, nt, n, n, lora_glora_sx_, sw, nullptr, nullptr, s_);
-    } else if (w.type == kTypeF16) {
-        gemm_.f16(v, reinterpret_cast<const uint16_t*>(d + (uint64_t) r0 * w.row_bytes), lora_glora_y_, nt, n, w.k, n);
-    } else {
-        gemm_.native(v, w.type, d + (uint64_t) r0 * w.row_bytes, lora_glora_y_, nt, n, w.k, n);
-    }
-    // the product's rows are the weight's [r0, r0 + n), written to y's rows [row0, row0 + rows): the rows' place in it
-    lora_output_add(y + t0 * ldy, nt, ldy, r0 - row0, lora_glora_y_, n, s_);
-}
-
-void QiDit::free_glora_scratch() {
-    for (void* p : {(void*) lora_glora_y_, (void*) lora_glora_x8_, (void*) lora_glora_sx_})
-        if (p != nullptr) {
-            gpu::stream_sync(s_);
-            allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), p), allocs_.end());
-            gpu::free(p);
-        }
-    lora_glora_y_ = nullptr;
-    lora_glora_x8_ = nullptr;
-    lora_glora_sx_ = nullptr;
-}
 
 void QiDit::drop_prefix() {
     const auto free_dev = [this](void* p) {
@@ -1007,171 +936,10 @@ void QiDit::drop_prefix() {
 }
 
 bool QiDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
-    // the set as the same again (its files and strengths): nothing to bind
-    std::string key;
-    for (const LoraUse& u : loras) {
-        if (!u.file) continue;
-        char num[32];
-        std::snprintf(num, sizeof num, "%.7g", (double) u.scale);
-        key += u.file->path();
-        key += ':';
-        key += num;
-        key += ';';
-    }
-    if (key == lora_key_) return true;
-    drop_loras();
-    if (key.empty()) return true;
-    std::vector<std::string> unknown, text_encoder;
-    for (const LoraUse& u : loras) {
-        if (!u.file) continue;
-        for (const LoraEntry& entry : u.file->entries()) {
-            if (is_text_encoder_key(entry.key)) {
-                text_encoder.push_back(entry.key);
-                continue;
-            }
-            const LoraSlot* slot = nullptr;
-            for (const LoraSlot& s : lora_slots_)
-                if (lora_key_names(entry.key, s.name)) {
-                    slot = &s;
-                    break;
-                }
-            if (slot == nullptr) {
-                unknown.push_back(entry.key);
-                continue;
-            }
-            // a GLoRA's four tensors may fit both of its readings: the weight's rows and columns say which
-            LoraEntry alt;
-            const LoraEntry& e = *lora_glora_for_weight(entry, slot->rows, slot->w->k, alt);
-            if (e.kind == LoraKind::bias || !e.bias.empty()) {
-                // no place for it: the DiT's products add no bias (its blocks' modulation does the shift), so a file's
-                // bias's delta would change nothing while it was asked for
-                err = "image engine: " + u.file->path() + ": " + e.key +
-                      ": a bias's delta (diff_b/b_norm), and the DiT's weights add no bias (Qwen-Image-2.1's DiT has "
-                      "none)";
-                drop_loras();
-                return false;
-            }
-            const bool oft = e.kind == LoraKind::oft;
-            const bool glora = e.kind == LoraKind::glora;
-            if (e.rows != slot->rows || (oft ? e.cols != 0 : e.cols != slot->w->k)) {
-                err = "image engine: " + u.file->path() + ": " + e.key + " is " + std::to_string(e.cols) + " x " +
-                      std::to_string(e.rows) + ", not the DiT's " + std::to_string(slot->w->k) + " x " +
-                      std::to_string(slot->rows);
-                drop_loras();
-                return false;
-            }
-            if (oft && slot->name == "modulation.1") {
-                // the DiT writes that weight a band of C_ rows at a time (step_modulation), and a rotation turns the
-                // part's rows whole (LoraLayer::add): bound, it would be skipped on every band
-                err = "image engine: " + u.file->path() + ": " + e.key + ": an OFT of the modulation, which the DiT "
-                      "writes " + std::to_string(C_) + " rows at a time: the engine does not turn it";
-                drop_loras();
-                return false;
-            }
-            const float scale = u.scale * e.scale();
-            // a strength of 0 changes nothing: the weight keeps its product's path (an alpha of 0 leaves a DoRA's base
-            // factors, as a DoRA's decomposition scales the weight with no delta)
-            if (u.scale == 0.0f || (scale == 0.0f && e.dora.empty())) continue;
-            std::vector<float> coef, base;   // a DoRA's: the delta's rows' c, the base product's factors
-            if (!e.dora.empty()) {
-                std::vector<float> norms;
-                if (!dora_norms(*slot, norms, err)) {
-                    drop_loras();
-                    return false;
-                }
-                std::string why;
-                if (!lora_dora_rows(e, 0, slot->row0, slot->rows, norms, u.scale, coef, base, why)) {
-                    err = "image engine: ";
-                    err += u.file->path();
-                    err += ": ";
-                    err += e.key;
-                    err += ": ";
-                    err += why;
-                    drop_loras();
-                    return false;
-                }
-            }
-            if (const LoraPart* clash = lora_dora_overlap(slot->w->lora, slot->row0, slot->rows, !coef.empty(), oft,
-                                                          glora, e.replaces)) {
-                err = "image engine: " + u.file->path() + ": " + e.key + ": the weight's rows " +
-                      std::to_string(slot->row0) + " .. " + std::to_string(slot->row0 + slot->rows) +
-                      " are another adapter's, and " + lora_patch_clash_why(*clash, oft, glora, e.replaces);
-                drop_loras();
-                return false;
-            }
-            if (e.replaces)   // a set_weight: the weight interpolates to the file's, W + s (S - W)
-                base.assign((size_t) slot->rows, 1.0f - u.scale);
-            auto dev = std::make_shared<LoraDeviceEntry>();
-            if (!dev->upload(e, s_, err, coef.empty() ? nullptr : coef.data())) {
-                drop_loras();
-                return false;
-            }
-            if (slot->w->lora == nullptr) {
-                lora_layers_.push_back(std::make_unique<LoraLayer>());
-                slot->w->lora = lora_layers_.back().get();
-            }
-            LoraPart part;
-            part.entry = dev;
-            part.row0 = slot->row0;
-            part.n = slot->rows;
-            part.scale = scale;
-            part.dora = !coef.empty();
-            part.oft = oft;
-            part.glora = glora;
-            part.replaces = e.replaces;
-            part.base = std::move(base);
-            slot->w->lora->parts.push_back(std::move(part));
-            lora_cols_ = std::max(lora_cols_, lora_scratch_cols(e));
-            if (glora) {
-                lora_glora_cols_ = std::max(lora_glora_cols_, e.cols);
-                lora_glora_rows_ = std::max(lora_glora_rows_, e.rows);
-            }
-        }
-    }
-    if (!text_encoder.empty()) {
-        err = "image engine: a text encoder's adapter: the image engine applies adapters to the DiT only (" +
-              name_list(text_encoder) + ")";
-        drop_loras();
-        return false;
-    }
-    if (!unknown.empty()) {
-        err = "image engine: the DiT takes no adapter for " + name_list(unknown);
-        drop_loras();
-        return false;
-    }
-    if (lora_layers_.empty()) {   // every strength 0: as no adapter at all (the products are untouched)
-        drop_loras();
-        return true;
-    }
-    for (const LoraSlot& slot : lora_slots_)   // the base products' row factors, once every part is bound
-        if (slot.w->lora != nullptr && !slot.w->lora->build_base(slot.w->n, s_, err)) {
-            drop_loras();
-            return false;
-        }
-    if (lora_glora_cols_ > 0) lora_glora_scratch();   // a GLoRA's own path's buffers, once every part is bound
-    if (lora_bake_) {   // the blocks' plain LoRAs folded into their weights as the blocks come back to the GPU
-        int64_t nk = 0, kr = 0;
-        for (Block& b : blocks_)
-            for (W* w : {&b.q, &b.k, &b.v, &b.o, &b.gu, &b.down})
-                if (w->lora != nullptr && w->lora->bakeable() &&
-                    (w->w8 && !w->w8t ? -8 : w->type == 1 ? 1 : w->type == 8 ? 8 : 0) != 0) {
-                    w->baked = true;
-                    nk = std::max(nk, w->n * w->k);
-                    for (const LoraPart& p : w->lora->parts) kr = std::max(kr, w->k * p.entry->rank());
-                }
-        if (nk > 0) {
-            bake_tmp_ = alloc<float>(allocs_, nk, "image engine");
-            bake_at16_ = alloc<uint16_t>(allocs_, kr, "image engine");
-            baked_any_ = true;
-            blocks_stream_.reload();   // the queued work drained before the prepare changes
-            install_prepare();
-        }
-    }
-    for (const LoraUse& u : loras)
-        if (u.file) lora_files_.push_back(u.file);
-    lora_key_ = key;
-    drop_prefix();   // the prefix's rows and K and V were the other adapters'
-    return true;
+    bool changed = false;
+    const bool ok = loras_.set(loras, err, changed);
+    if (ok && changed && loras_.count() > 0) drop_prefix();   // the prefix's rows and K and V were the other adapters'
+    return ok;
 }
 
 bool QiDit::tensor_norms(const std::string& key, const std::vector<float>*& out, std::string& err) {
@@ -1277,63 +1045,22 @@ bool QiDit::dora_norms(const LoraSlot& slot, std::vector<float>& out, std::strin
         name += "gate_up";
     }
     const std::vector<float>* norms = nullptr;
-    if (!tensor_norms("model.diffusion_model." + name + ".weight", norms, err)) return false;
-    if ((int64_t) norms->size() < slot.w->n) {
-        err = "image engine: " + slot.name + ": the file's rows are fewer than the weight's";
-        return false;
-    }
-    out.assign(norms->begin(), norms->begin() + slot.w->n);
-    return true;
+    return tensor_norms("model.diffusion_model." + name + ".weight", norms, err) &&
+           dit_slot_norms(slot, *norms, out, err, "image engine");
 }
 
-uint64_t QiDit::lora_bytes() const {
-    uint64_t n = 0;
-    for (const std::unique_ptr<LoraLayer>& l : lora_layers_) n += l->bytes();
-    if (lora_glora_y_ != nullptr)   // a GLoRA's own path's buffers
-        n += (uint64_t) kLoraGloraRows * ((uint64_t) lora_glora_rows_ * 4 + (uint64_t) lora_glora_cols_ + 4);
-    return n;
-}
+uint64_t QiDit::lora_bytes() const { return loras_.bytes(); }
 
 void QiDit::drop_loras() {
-    const bool had = !lora_key_.empty();
-    for (LoraSlot& s : lora_slots_) {
-        s.w->lora = nullptr;
-        s.w->baked = false;
-    }
-    if (baked_any_) {   // the weights as the file has them again: the blocks copied anew, without the bake
-        baked_any_ = false;
-        blocks_stream_.reload();
-        install_prepare();
-        for (void** p : {reinterpret_cast<void**>(&bake_tmp_), reinterpret_cast<void**>(&bake_at16_)})
-            if (*p != nullptr) {
-                release(allocs_, *p);
-                *p = nullptr;
-            }
-    }
-    lora_layers_.clear();
-    lora_files_.clear();
-    lora_key_.clear();
-    lora_cols_ = 0;
-    lora_glora_cols_ = lora_glora_rows_ = 0;
-    if (lora_f32_ != nullptr || lora16_ != nullptr) {
-        gpu::stream_sync(s_);
-        for (void** p : {reinterpret_cast<void**>(&lora_f32_), reinterpret_cast<void**>(&lora16_)})
-            if (*p != nullptr) {
-                allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), *p), allocs_.end());
-                gpu::free(*p);
-                *p = nullptr;
-            }
-        lora_tmp_t_ = 0;
-    }
-    free_glora_scratch();
+    const bool had = !loras_.key().empty();
+    loras_.drop();
     if (had) drop_prefix();
 }
 
 void QiDit::drop_activations() {
     for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) h_, (void*) gu_, (void*) h16_, (void*) q16_,
                     (void*) k16_, (void*) v16_, (void*) o16_, (void*) cos_, (void*) sin_, xq_,
-                    (void*) xs_, (void*) lora_f32_, (void*) lora16_, (void*) lora_glora_y_, (void*) lora_glora_x8_,
-                    (void*) lora_glora_sx_, (void*) kmean_.buf})
+                    (void*) xs_, (void*) kmean_.buf})
         if (p != nullptr) {
             allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), p), allocs_.end());
             gpu::free(p);
@@ -1344,12 +1071,7 @@ void QiDit::drop_activations() {
     xs_ = nullptr;
     xs_rows_ = 0;
     h16_ = q16_ = k16_ = v16_ = o16_ = nullptr;
-    lora_f32_ = nullptr;
-    lora16_ = nullptr;
-    lora_tmp_t_ = 0;
-    lora_glora_y_ = nullptr;
-    lora_glora_x8_ = nullptr;
-    lora_glora_sx_ = nullptr;
+    prod_.lora.drop_buffers(allocs_);
     cap_T_ = 0;
     kmean_.clear();
     rope_H_ = rope_W_ = rope_text_ = -1;

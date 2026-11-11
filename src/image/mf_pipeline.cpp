@@ -190,11 +190,7 @@ void MfPipeline::use_loras(const QiRequest& r) {
     lora_split(r.loras, dit_part, te);
     dit().set_lora_bake(lora_bake_);
     if (!dit().set_loras(dit_part, err) || !te_->set_loras(te, err)) throw LoraRejected(err);
-    if (te_->lora_key() != te_lora_) {   // the states kept were the encoder's with the other adapters
-        last_ids_.clear();
-        last_neg_ids_.clear();
-        te_lora_ = te_->lora_key();
-    }
+    te_loras_now(te_->lora_key());   // the states kept were the encoder's with the other adapters
 }
 
 QiNeed MfPipeline::need(int64_t n_text, int64_t width, int64_t height,
@@ -314,24 +310,15 @@ QiPlan MfPipeline::plan(int64_t hw, int n, int64_t max_text, int64_t n_ids) {
             p.fixed += vw;
         }
     }
-    if (p.budget <= p.fixed)
-        throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
-                                 " MiB) is below the weights that always stay");
-    const uint64_t avail = p.budget - p.fixed, dit_min = d.block_min(), te_min = te_->layer_min();
+    const uint64_t avail = plan_avail(p), dit_min = d.block_min(), te_min = te_->layer_min();
     // the DiT's activations, the MLP in bands of rows when the whole takes more than a third of what is there
     const int64_t mlp = mlp_bands(avail, hw > 0, p.activations,
                                   [&](int64_t rows) { return d.activation_bytes(hw, n, max_text, rows); });
     const uint64_t work = std::max(p.activations, te_->activation_bytes(n_ids));
-    if (avail < work + dit_min + te_min)
-        throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
-                                 " MiB) is too small for this image");
+    if (avail < work + dit_min + te_min) plan_too_small(p);
     p.blocks = clampu(avail - work - te_min, dit_min, d.block_bytes());
     p.layers = clampu(avail - work - p.blocks, te_min, te_->layer_bytes());
-    p.mlp_rows = mlp;
-    if (p.blocks != dit_set_) {
-        d.set_block_budget(p.blocks);
-        dit_set_ = p.blocks;
-    }
+    plan_blocks(d, p.blocks);
     // the encoder's layers: fewer at once (their room is the DiT's now), more only when it encodes (te_layers), as
     // QiPipeline's: a prompt whose states are kept does not run it
     te_want_ = p.layers;
@@ -339,12 +326,7 @@ QiPlan MfPipeline::plan(int64_t hw, int n, int64_t max_text, int64_t n_ids) {
         te_->set_layer_budget(p.layers);
         te_set_ = p.layers;
     }
-    if (hw > 0 && mlp != mlp_set_) {
-        d.set_mlp_rows(mlp);
-        mlp_set_ = mlp;
-    }
-    if (hw == 0) d.drop_activations();
-    p.resident_blocks = d.resident_blocks();
+    plan_rows(p, d, hw > 0, mlp);
     p.resident_layers = te_->resident_layers();
     p.vae = avail - p.blocks - p.layers;
     return p;
@@ -531,7 +513,7 @@ std::vector<uint8_t> MfPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     const auto noise = philox_randn(r.seed, (uint64_t) n);
     std::vector<float> tokens((size_t) n);
     noise_to_tokens(noise.data(), Cl, h, w, 1, tokens.data());
-    float *x = nullptr, *rgba = nullptr, *x0 = nullptr;
+    float *x = nullptr, *rgba = nullptr;
     if (!gpu::alloc_device(&x, (size_t) n * 4) || !gpu::alloc_device(&rgba, (size_t) (4 * HW) * 4)) {
         gpu::free(x);
         d.set_refs(nullptr, {});
@@ -549,26 +531,17 @@ std::vector<uint8_t> MfPipeline::generate(const QiRequest& r, QiTimes* times, Qi
         gpu::copy(x, tokens.data(), (size_t) n * 4);
         if (r.strength < 1.0) ls.start(x, sigmas[0], s_);   // img2img: from the base image's latent at that time
         if (stage) stage("sampling");
-        // partial images (r.preview): the step's x0 decoded in the room the VAE has beside the DiT now, nothing given
-        // up for it; a step whose decode does not fit there is left out
-        int shown = 0;
-        auto peek = [&](int done, const std::function<void(float*)>& make) {
-            if (!r.on_preview || std::find(r.preview.begin(), r.preview.end(), done) == r.preview.end()) return;
-            const uint64_t room = p.vae > p.activations ? p.vae - p.activations : 0;
-            if (x0 == nullptr && !gpu::alloc_device(&x0, (size_t) n * 4)) return;
-            make(x0);
-            try {
-                vae_->decode(x0, h, w, rgba, room);
-            } catch (const std::exception&) {
-                vae_->drop_scratch();
-                return;
-            }
-            vae_->drop_scratch();
-            gpu::copy(out.data(), rgba, out.size() * 4);
-            std::vector<uint8_t> img = rgba8(out, HW);
-            if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
-            r.on_preview(shown++, done, img);
-        };
+        // partial images (r.preview)
+        PreviewDecode preview(
+            r, p, n, [&](float* x0, uint64_t room) { vae_->decode(x0, h, w, rgba, room); },
+            [&] { vae_->drop_scratch(); },
+            [&] {
+                gpu::copy(out.data(), rgba, out.size() * 4);
+                std::vector<uint8_t> img = rgba8(out, HW);
+                if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
+                return img;
+            });
+        auto peek = [&](int done, const std::function<void(float*)>& make) { preview(done, make); };
         d.sample(x, h, w, sigmas, guided ? r.cfg : 1.0f, step, ls.after(s_), peek, &r.guide,
                  r.sampler == "er_sde", r.shift > 0 ? r.shift : 6.0f, r.seed);
         d.set_refs(nullptr, {});
@@ -576,11 +549,7 @@ std::vector<uint8_t> MfPipeline::generate(const QiRequest& r, QiTimes* times, Qi
         if (stage) stage("decode");
         // the VAE beside the DiT's activations when it fits there; else they give way to it, then the encoder's
         // layers (the next prompt streams them back); what still does not fit, the Flux2 VAE decodes in tiles
-        uint64_t room = p.vae > p.activations ? p.vae - p.activations : 0;
-        if (vae_->scratch_bytes(h, w) > room) {
-            d.drop_activations();
-            room = p.vae;
-        }
+        uint64_t room = decode_room(p, d, vae_->scratch_bytes(h, w));
         if (vae_->scratch_bytes(h, w) > room && te_->layers_vram() > 0) {
             room += te_->layers_vram();
             te_->drop_layers();
@@ -599,12 +568,10 @@ std::vector<uint8_t> MfPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     } catch (...) {
         d.set_refs(nullptr, {});
         gpu::free(x);
-        gpu::free(x0);
         gpu::free(rgba);
         throw;
     }
     gpu::free(x);
-    gpu::free(x0);
     gpu::free(rgba);
     if (plan_out != nullptr) *plan_out = p;
     std::vector<uint8_t> img = rgba8(out, HW);

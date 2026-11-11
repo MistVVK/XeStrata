@@ -41,6 +41,8 @@
 
 #include "strata/image/guidance.hpp"
 #include "strata/image/i8_means.hpp"
+#include "strata/image/dit_loras.hpp"
+#include "strata/image/dit_product.hpp"
 #include "strata/image/image_lora.hpp"
 #include "strata/image/qi_stream.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -58,12 +60,6 @@ namespace strata::platform { class MappedFile; }
 
 namespace strata::image {
 
-/// W values side by side, aligned to their size: a work-item's load or store of them in one access (vec<T, W> of
-/// SYCL, whose header this one does not take)
-template<class T, int W> struct alignas(sizeof(T) * W) Packed {
-    T v[W];
-};
-
 /// The rows of a block's run that take their modulation from another set, alt floats past the step's (0 for every row:
 /// none): [r0, e0) and [r1, ...) of the run, read t0 rows on (MossDit's references in the stream: the last rows of
 /// each context's, at timestep 0).
@@ -79,107 +75,6 @@ struct AltRows {
         return r;
     }
 };
-
-/// A product's output [T][C] as its readers take it: FP32 sums (f) times the rows' scales (rs, null: 1), or a W8A8
-/// product's int32 sums (i) times the activations' scales (sx, a row) and the weights' (sw, a column); plus the bias
-/// (b, null: none).  Or a W8A8 product's values as they are (bf, BF16: kernels::i8_gemm_bf16 scaled them and added
-/// the bias), half the bytes of the sums.
-struct MfOut {
-    const float* f = nullptr;
-    const int32_t* i = nullptr;
-    const float *rs = nullptr, *sx = nullptr, *sw = nullptr, *b = nullptr;
-    int64_t C = 0;
-    const uint16_t* bf = nullptr;
-    float at(int64_t t, int64_t c) const {
-        if (bf != nullptr) return kernels::f32_from_bf16(bf[t * C + c]);
-        const float v = i != nullptr ? (float) i[t * C + c] * sx[t] * sw[c]
-                                     : (rs != nullptr ? f[t * C + c] * rs[t] : f[t * C + c]);
-        return b != nullptr ? v + b[c] : v;
-    }
-    /// at(t, c0 + d) as r(d), the row's offsets taken once (the per-head kernels' reads: qk_norm_rope.hpp); r.r2(d, a,
-    /// b) reads d and d + 1 in one access (d even, c0 and C too)
-    struct Row {
-        const uint16_t* bp16;
-        const int32_t* ip;
-        const float *fp, *swp, *bp;
-        float sxt, rst;
-        bool scaled;
-        float operator()(int64_t d) const {
-            if (bp16 != nullptr) return kernels::f32_from_bf16(bp16[d]);
-            const float v = ip != nullptr ? (float) ip[d] * sxt * swp[d] : (scaled ? fp[d] * rst : fp[d]);
-            return bp != nullptr ? v + bp[d] : v;
-        }
-        void r2(int64_t d, float& v0, float& v1) const {
-            if (bp16 != nullptr) {
-                const Packed<uint16_t, 2> h = *reinterpret_cast<const Packed<uint16_t, 2>*>(bp16 + d);
-                v0 = kernels::f32_from_bf16(h.v[0]);
-                v1 = kernels::f32_from_bf16(h.v[1]);
-                return;
-            }
-            if (ip != nullptr) {
-                const Packed<int32_t, 2> iv = *reinterpret_cast<const Packed<int32_t, 2>*>(ip + d);
-                const Packed<float, 2> wv = *reinterpret_cast<const Packed<float, 2>*>(swp + d);
-                v0 = (float) iv.v[0] * sxt * wv.v[0];
-                v1 = (float) iv.v[1] * sxt * wv.v[1];
-            } else {
-                const Packed<float, 2> fv = *reinterpret_cast<const Packed<float, 2>*>(fp + d);
-                v0 = scaled ? fv.v[0] * rst : fv.v[0];
-                v1 = scaled ? fv.v[1] * rst : fv.v[1];
-            }
-            if (bp != nullptr) {
-                const Packed<float, 2> bv = *reinterpret_cast<const Packed<float, 2>*>(bp + d);
-                v0 += bv.v[0];
-                v1 += bv.v[1];
-            }
-        }
-    };
-    Row row(int64_t t, int64_t c0) const {
-        const int64_t o = t * C + c0;
-        return Row{bf != nullptr ? bf + o : nullptr, i != nullptr ? i + o : nullptr, f != nullptr ? f + o : nullptr,
-                   sw != nullptr ? sw + c0 : nullptr, b != nullptr ? b + c0 : nullptr, i != nullptr ? sx[t] : 0.f,
-                   rs != nullptr ? rs[t] : 1.f, rs != nullptr};
-    }
-    /// at(t, c + p) for p below W, read W side by side (c and C multiples of W)
-    template<int W> void at_w(int64_t t, int64_t c, float* o) const {
-        if (bf != nullptr) {
-            const Packed<uint16_t, W> hv = *reinterpret_cast<const Packed<uint16_t, W>*>(bf + t * C + c);
-            for (int p = 0; p < W; ++p) o[p] = kernels::f32_from_bf16(hv.v[p]);
-            return;
-        }
-        if (i != nullptr) {
-            const Packed<int32_t, W> iv = *reinterpret_cast<const Packed<int32_t, W>*>(i + t * C + c);
-            const Packed<float, W> wv = *reinterpret_cast<const Packed<float, W>*>(sw + c);
-            const float st = sx[t];
-            for (int p = 0; p < W; ++p) o[p] = (float) iv.v[p] * st * wv.v[p];
-        } else {
-            const Packed<float, W> fv = *reinterpret_cast<const Packed<float, W>*>(f + t * C + c);
-            const float r = rs != nullptr ? rs[t] : 1.f;
-            for (int p = 0; p < W; ++p) o[p] = rs != nullptr ? fv.v[p] * r : fv.v[p];
-        }
-        if (b != nullptr) {
-            const Packed<float, W> bv = *reinterpret_cast<const Packed<float, W>*>(b + c);
-            for (int p = 0; p < W; ++p) o[p] += bv.v[p];
-        }
-    }
-    /// the rows from r on
-    MfOut from(int64_t r) const {
-        MfOut o = *this;
-        if (f != nullptr) o.f += r * C;
-        if (i != nullptr) o.i += r * C;
-        if (bf != nullptr) o.bf += r * C;
-        if (rs != nullptr) o.rs += r;
-        if (sx != nullptr) o.sx += r;
-        return o;
-    }
-};
-
-/// FP32 rows [T][C] as the shared row kernels read a product's output (a block's tape or scratch)
-inline MfOut rows_of(const float* p, int64_t C) {
-    MfOut m;
-    m.f = p;
-    m.C = C;
-    return m;
-}
 
 /// The time's sinusoid [256] as the reference makes it in bf16: the bf16 sigma by bf16 frequencies
 /// 10000^(-i / 128) times 1000 (flipped: cos then sin), rounded to bf16, as FP16: the DiT's and the trainer's.
@@ -260,7 +155,7 @@ public:
     void drop_block_homes() { blocks_stream_.drop_homes(); }
     /// The adapters folded into the blocks' weights where they are plain LoRAs (the default), else added to each
     /// product: false keeps the weights as the file has them.
-    void set_lora_bake(bool on) { lora_bake_ = on; }
+    void set_lora_bake(bool on) { loras_.bake = on; }
     uint64_t weight_bytes() const { return weight_bytes_; }   // what stays on the GPU besides the blocks
     /// The working buffers n contexts of hw image rows (an edit's references' included) take (text rows up to
     /// max_text a context), with the MLP a band of mlp_rows image rows at a time (0: all).
@@ -273,10 +168,7 @@ public:
 
     /// An adapter as a file names it: a weight of the DiT, the rows of the weight a file's entry changes, and the rows
     /// of the entry they are (one name a weight here: no weight is fused or split).
-    struct LoraTarget {
-        std::string name;
-        int64_t row0 = 0, rows = 0, cols = 0, src_row = 0;
-    };
+    using LoraTarget = DitLoraTarget;
     /// The weights adapters may change: what a file's keys are matched against (the probe's map, the server's list).
     std::vector<LoraTarget> lora_targets() const;
 
@@ -286,11 +178,11 @@ public:
     /// next forward.  The same set again (its files and strengths) changes nothing.
     bool set_loras(const std::vector<LoraUse>& loras, std::string& err);
     /// The set bound, as its files' paths and strengths (empty: none).
-    const std::string& lora_key() const { return lora_key_; }
+    const std::string& lora_key() const { return loras_.key(); }
     /// The bound entries' A and B on the GPU.
     uint64_t lora_bytes() const;
     /// The adapter files bound (a set whose strengths are all 0 binds none).
-    int lora_count() const { return (int) lora_files_.size(); }
+    int lora_count() const { return loras_.count(); }
     void drop_loras();
 
     /// The image and text streams after block 0 of the last forward's context 0 (device FP32 [h w][C], [rows][C]), for
@@ -302,48 +194,28 @@ public:
 private:
 
 
-    bool lora_bake_ = true, baked_any_ = false;
-    float* bake_tmp_ = nullptr;      // a weight's delta [n][k], while adapters are baked
-    uint16_t* bake_at16_ = nullptr;  // an adapter's A^T
     void install_prepare();
-    struct W {
-        int type = 0;            // 8 Q8_0, 1 F16, 32 F32 (the low-rank modulations)
-        int64_t n = 0, k = 0;    // n rows of k
-        const void* d = nullptr; // a block's: its offset in the block's region; else a device pointer
-        uint64_t row_bytes = 0;
-        LoraLayer* lora = nullptr;   // the adapters' deltas for its products (null: none: the product is unchanged)
-        bool baked = false;          // its adapters folded into the block's copy of it (set_loras), not added to products
-    };
+    using W = DitW;
     struct Block {
         W imod, tmod, q, k, v, tq, tk, tv, o, to, imlp1, imlp2, tmlp1, tmlp2;
         uint64_t b_imod = 0, b_tmod = 0, b_q = 0, b_k = 0, b_v = 0, b_tq = 0, b_tk = 0, b_tv = 0, b_o = 0, b_to = 0,
                  b_imlp1 = 0, b_imlp2 = 0, b_tmlp1 = 0, b_tmlp2 = 0;   // the FP32 biases' offsets
         uint64_t nq = 0, nk = 0, ntq = 0, ntk = 0;                     // the FP32 q / k norms' offsets
     };
-    /// A weight and the rows of a file's entry it takes (Mage-Flow's DiT has no fused or split weight: one name is one
-    /// weight, all of them with a bias, which an entry's bias's delta is added beside).
-    struct LoraSlot {
-        std::string name;
-        W* w = nullptr;
-        int64_t row0 = 0, rows = 0, src_row = 0;
-    };
+    using LoraSlot = DitLoraSlot;
     struct Ctx {
         int64_t rows = 0;
         float* txt0 = nullptr;   // [rows][C]: txt_in(txt_norm(states))
     };
-    // y [T][w.n] = (x16 [T][w.k], rows scaled down by rs) . w^T, the rows times rs again, plus bias (rs, bias null:
-    // none).  same_input: x16 is the previous product's, which was W8A8 too (its int8 input is taken again).  defer:
-    // y is left the product's sums, for the reader to scale and add the bias to as the view says.
-    MfOut product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
-                  const float* bias, bool same_input = false, bool defer = false);
+    // the shared product (DitProducts::run)
+    DitOut product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
+                   const float* bias, bool same_input = false, bool defer = false) {
+        return prod_.run(x16, rs, w, base, y, T, bias, same_input, defer);
+    }
     // a block's modulation y [w.n] = SiLU(temb) . w^T + bias (tsil: its FP16 copy, for a 16-bit w); an F32 w (the
     // low-rank form) reads the shared projection mlow_ instead
     void modulation(const uint16_t* tsil, const W& w, const uint8_t* base, float* y, const float* bias);
     void build_lora_targets();
-    void lora_scratch(int64_t T);
-    /// A DoRA's row norms: the norms of a slot's weight, one a row of it, from the file's tensor, cached a tensor
-    /// (open drops the cache).
-    bool dora_norms(const LoraSlot& slot, std::vector<float>& out, std::string& err);
     /// One of the file's tensors' row norms, FP32, cached (`name`: the file's own name).
     bool tensor_norms(const std::string& name, const std::vector<float>*& out, std::string& err);
     void ensure(int64_t hw, int n, int64_t max_text);
@@ -388,11 +260,6 @@ private:
     uint16_t *h16_ = nullptr, *jq16_ = nullptr, *jk16_ = nullptr, *jv16_ = nullptr, *jo16_ = nullptr,
              *io16_ = nullptr, *to16_ = nullptr, *t16_ = nullptr;
     float *cos_ = nullptr, *sin_ = nullptr, *cos_id_ = nullptr, *sin_id_ = nullptr;
-    // W8A8's input (w8_): xq8_rows_ rows of up to xq8_cols_ int8 values, then two arrays of their scales, taken in
-    // turn (xs_next_), so that the deferred sums of one input keep theirs while the next input is quantized
-    int8_t* xq8_ = nullptr;
-    int64_t xq8_rows_ = 0, xq8_cols_ = 0;
-    int xs_next_ = 0;
     float *b0_img_ = nullptr, *b0_txt_ = nullptr;
     int64_t rope_h_ = -1, rope_w_ = -1, rope_refs_ = -1;
     // an edit's references
@@ -400,30 +267,11 @@ private:
     int64_t ref_rows_ = 0, refs_gen_ = 0;
     std::vector<std::pair<int64_t, int64_t>> ref_sizes_;
     float* xin_ = nullptr;    // the image rows' input [hw + ref_rows_][in_ch_]
-    // the adapters bound
-    std::vector<LoraSlot> lora_slots_;
-    std::vector<std::unique_ptr<LoraLayer>> lora_layers_;
-    std::vector<std::shared_ptr<const LoraFile>> lora_files_;
-    std::string lora_key_;
-    int64_t lora_cols_ = 0, lora_tmp_t_ = 0;   // the deltas' scratch's columns and rows (the largest lora_scratch_cols)
     std::map<std::string, std::vector<float>> norm_cache_;   // DoRA's row norms, a file's tensor (open clears them)
-    float* lora_f32_ = nullptr;
-    uint16_t* lora16_ = nullptr;
-    // a GLoRA's own path: its input's columns, the weight's rows it is added over, and the buffers a band of its
-    // products takes (the rows' table, a W8A8 weight's int8 input and its scales)
-    int64_t lora_glora_cols_ = 0, lora_glora_rows_ = 0;
-    float* lora_glora_y_ = nullptr;
-    int8_t* lora_glora_x8_ = nullptr;
-    float* lora_glora_sx_ = nullptr;
-    void lora_glora_scratch();   // allocates them, once a set with a GLoRA is bound
-    void free_glora_scratch();
-    /// A GLoRA's own path: the weight's rows [r0, r0 + n) product of v (nt tokens, the first of them t0), added to
-    /// the product's output y at those rows (the weight's own path, as product takes it).
-    void glora_weight(const uint16_t* v, const W& w, const uint8_t* d, int64_t r0, int64_t n, int64_t nt, int64_t t0,
-                      float* y);
-    /// The layer's GLoRAs on the product's T rows of y (none: nothing), through glora_weight.
-    void add_glora(const LoraLayer* lora, const uint16_t* x16, const float* rs, const W& w, const uint8_t* d,
-                   int64_t T, float* y);
+    // the products (W8A8's input, the deltas' buffers)
+    DitProducts prod_{&gemm_, &allocs_, &s_, "image engine (Mage-Flow DiT)"};
+    // the adapters bound (their table built at open, build_lora_targets)
+    DitLoras loras_{&prod_.lora, &allocs_, &s_, "image engine (Mage-Flow DiT)"};
 };
 
 }  // namespace strata::image

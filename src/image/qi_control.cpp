@@ -324,7 +324,7 @@ void QiControl::run_block(int k, int64_t T) {
     const auto* ab = reinterpret_cast<const float*>(base + b.after_b);
     auto mod = [&](int i) { return d.mods_ + (int64_t) i * 2 * C; };
     qi_ln_mod16(c_, mod(0), nt, T, C, d.h16_, d.s_);
-    QiI8 qkv[3];
+    DitOut qkv[3];
     const bool i8 = wq.w8 && wk.w8 && wv.w8;
     d.product(d.h16_, wq, d.q_, T, 0, 0, -1, false, i8);
     qkv[0] = d.i8_;

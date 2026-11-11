@@ -84,6 +84,38 @@ void ImagePipeline::fit(uint64_t reserve) {
     set_budget(have > reserve ? have - reserve : 0);
 }
 
+uint64_t ImagePipeline::plan_avail(const QiPlan& p) {
+    if (p.budget <= p.fixed)
+        throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
+                                 " MiB) is below the weights that always stay");
+    return p.budget - p.fixed;
+}
+
+void ImagePipeline::plan_too_small(const QiPlan& p) {
+    throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
+                             " MiB) is too small for this image");
+}
+
+void PreviewDecode::operator()(int done, const std::function<void(float*)>& make) {
+    if (!r_.on_preview || std::find(r_.preview.begin(), r_.preview.end(), done) == r_.preview.end()) return;
+    const uint64_t room = vae_beside(p_);
+    if (x0_ == nullptr && !gpu::alloc_device(&x0_, (size_t) values_ * 4)) return;
+    make(x0_);
+    try {
+        decode_(x0_, room);
+    } catch (const std::exception&) {
+        drop_();
+        return;
+    }
+    drop_();
+    r_.on_preview(shown_++, done, image_());
+}
+
+void PreviewDecode::release() {
+    gpu::free(x0_);
+    x0_ = nullptr;
+}
+
 void ImagePipeline::vram_into(QiNeed& n) const {
     size_t free = 0, total = 0;
     gpu::mem_info(&free, &total);
@@ -244,11 +276,7 @@ void QiPipeline::use_loras(const QiRequest& r) {
     lora_split(r.loras, dit, te);
     dit_->set_lora_bake(lora_bake_);
     if (!dit_->set_loras(dit, err) || !te_->set_loras(te, err)) throw LoraRejected(err);
-    if (te_->lora_key() != te_lora_) {   // the states kept were the encoder's with the other adapters
-        last_ids_.clear();
-        last_neg_ids_.clear();
-        te_lora_ = te_->lora_key();
-    }
+    te_loras_now(te_->lora_key());   // the states kept were the encoder's with the other adapters
 }
 
 std::vector<float> QiPipeline::text(const std::vector<int32_t>& ids, const std::vector<TextEncoder::Picture>& pictures) {
@@ -285,9 +313,7 @@ QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w, int64_t n_ids, int64_t 
     if (ctl != nullptr) p.fixed += ctl->weight_bytes() + (uint64_t) (h * w * dit_->hidden()) * 4;
     // the activations: guidance's both sequences side by side after the first step (forward_pair)
     if (T > 0 && n_neg_pre > 0) T = qi_attn_rows(T) + qi_attn_rows(n_neg_pre + h * w);
-    if (p.budget <= p.fixed) throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
-                                                      " MiB) is below the weights that always stay");
-    const uint64_t avail = p.budget - p.fixed, te_min = te_->layer_min(),
+    const uint64_t avail = plan_avail(p), te_min = te_->layer_min(),
                    dit_min = dit_->block_min() + (ctl != nullptr ? ctl->block_min() : 0);
     // the DiT's activations, the MLP in bands of rows when the whole takes more than a third of what is there
     const uint64_t stream = ctl != nullptr ? (uint64_t) (T * dit_->hidden()) * 4 : 0;
@@ -296,9 +322,7 @@ QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w, int64_t n_ids, int64_t 
     // the room after the layers: the DiT's activations, and later the VAE's least (they take it in turn)
     // the encoder's buffers too: they come and go before the DiT's (generate frees them after the encode)
     const uint64_t work = std::max({p.activations, vae_->scratch_min(), te_->activation_bytes(n_ids)});
-    if (avail < work + dit_min + te_min)
-        throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
-                                 " MiB) is too small for this image");
+    if (avail < work + dit_min + te_min) plan_too_small(p);
     // the prefix cache first: a block's that is not in VRAM is copied in at every step with the compute waiting (the
     // blocks' weights stream beside it); then the DiT's blocks (8 or more uses an image), then the encoder's layers
     const uint64_t kv = dit_->prefix_kv_bytes(n_pre) + dit_->prefix_kv_bytes(n_neg_pre),
@@ -309,7 +333,6 @@ QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w, int64_t n_ids, int64_t 
     const uint64_t ctl_bytes = ctl != nullptr ? ctl->block_bytes() : 0;
     p.blocks = clampu(avail - work - te_min - p.prefix_kv, dit_min, dit_->block_bytes() + ctl_bytes);
     p.layers = clampu(avail - work - p.blocks - p.prefix_kv, te_min, te_->layer_bytes());
-    p.mlp_rows = mlp;
     uint64_t dit_blocks = p.blocks;
     if (ctl != nullptr) {   // the blocks' room shared by their bytes, each at least its two slots
         const uint64_t cb = clampu((uint64_t) ((double) p.blocks * (double) ctl_bytes /
@@ -321,10 +344,7 @@ QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w, int64_t n_ids, int64_t 
             control_set_ = cb;
         }
     }
-    if (dit_blocks != dit_set_) {
-        dit_->set_block_budget(dit_blocks);
-        dit_set_ = dit_blocks;
-    }
+    plan_blocks(*dit_, dit_blocks);
     // the encoder's layers: fewer at once (their room is the DiT's now), more only when it encodes (te_layers): the
     // decode gives them to the VAE, and a prompt whose states are kept does not run it (RX 9060 XT: 163 ms an image
     // to take 6300 MiB back for nothing)
@@ -333,12 +353,7 @@ QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w, int64_t n_ids, int64_t 
         te_->set_layer_budget(p.layers);
         te_set_ = p.layers;
     }
-    if (T > 0 && mlp != mlp_set_) {
-        dit_->set_mlp_rows(mlp);
-        mlp_set_ = mlp;
-    }
-    if (T == 0) dit_->drop_activations();   // a budget change between requests: the activations come back on use
-    p.resident_blocks = dit_->resident_blocks();
+    plan_rows(p, *dit_, T > 0, mlp);
     p.resident_layers = te_->resident_layers();
     // the VAE: what the layers leave, the DiT's activations' share included (freed if it needs it), in tiles when even
     // that is short
@@ -563,7 +578,7 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     const auto t1 = clock::now();
     const int64_t n = dit_->channels() * h * w, HW = r.width * r.height;
     const auto noise = philox_randn(r.seed, (uint64_t) n);
-    float *x = nullptr, *rgba = nullptr, *x0 = nullptr;
+    float *x = nullptr, *rgba = nullptr;
     if (!gpu::alloc_device(&x, (size_t) n * 4) || !gpu::alloc_device(&rgba, (size_t) (4 * HW) * 4))
         throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
     std::vector<float> out((size_t) (4 * HW));
@@ -578,26 +593,17 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
         gpu::copy(x, noise.data(), (size_t) n * 4);
         if (r.strength < 1.0) ls.start(x, sigmas[0], s_);   // img2img: from the base image's latent at that time
         if (stage) stage("sampling");
-        // partial images (r.preview): the step's x0 decoded in the room the VAE has beside the DiT now, nothing given
-        // up for it; a step whose decode does not fit there is left out
-        int shown = 0;
-        auto peek = [&](int done, const std::function<void(float*)>& make) {
-            if (!r.on_preview || std::find(r.preview.begin(), r.preview.end(), done) == r.preview.end()) return;
-            const uint64_t room = p.vae > p.activations ? p.vae - p.activations : 0;
-            if (x0 == nullptr && !gpu::alloc_device(&x0, (size_t) n * 4)) return;
-            make(x0);
-            try {
-                vae_->decode(x0, h, w, rgba, room);
-            } catch (const std::exception&) {
-                vae_->drop_scratch();
-                return;
-            }
-            vae_->drop_scratch();
-            gpu::copy(out.data(), rgba, out.size() * 4);
-            std::vector<uint8_t> img = rgba8(out, HW);
-            if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
-            r.on_preview(shown++, done, img);
-        };
+        // partial images (r.preview)
+        PreviewDecode preview(
+            r, p, n, [&](float* x0, uint64_t room) { vae_->decode(x0, h, w, rgba, room); },
+            [&] { vae_->drop_scratch(); },
+            [&] {
+                gpu::copy(out.data(), rgba, out.size() * 4);
+                std::vector<uint8_t> img = rgba8(out, HW);
+                if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
+                return img;
+            });
+        auto peek = [&](int done, const std::function<void(float*)>& make) { preview(done, make); };
         dit_->sample(x, h, w, sigmas, step, ls.after(s_), guided ? r.cfg : 1.0f, peek, &r.guide,
                      r.sampler == "er_sde", r.shift > 0 ? r.shift : 1.0f, r.seed);
         dit_->drop_host_prefix();
@@ -608,11 +614,7 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
         const auto t2 = clock::now();
         if (stage) stage("decode");
         // the VAE beside the DiT's activations when it fits there; else they give way to it
-        uint64_t vae_room = p.vae > p.activations ? p.vae - p.activations : 0;
-        if (vae_->scratch_bytes(h, w) > vae_room) {
-            dit_->drop_activations();
-            vae_room = p.vae;
-        }
+        uint64_t vae_room = decode_room(p, *dit_, vae_->scratch_bytes(h, w));
         if (vae_->scratch_bytes(h, w) > vae_room && p.layers > 0) {
             // the encoder's layers too, or their room if they have not taken it (the next prompt that encodes takes it
             // back; the same prompt's states are kept)
@@ -645,12 +647,10 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     } catch (...) {
         dit_->drop_host_prefix();
         gpu::free(x);
-        gpu::free(x0);
         gpu::free(rgba);
         throw;
     }
     gpu::free(x);
-    gpu::free(x0);
     gpu::free(rgba);
     if (plan_out != nullptr) *plan_out = p;
     std::vector<uint8_t> img = rgba8(out, HW);

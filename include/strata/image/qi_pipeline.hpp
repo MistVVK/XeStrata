@@ -114,14 +114,10 @@ private:
     std::unique_ptr<QiControl> control_, control_size_;   // the ControlNet branch, and one read for its sizes
     bool control_on_ = false;                              // the request has the branch
     uint64_t control_set_ = 0;                             // its blocks' budget
-    uint64_t dit_set_ = 0, te_set_ = 0;
+    uint64_t te_set_ = 0;
     uint64_t te_want_ = 0;   // the encoder's layers the plan gives them: taken when it encodes (te_layers)
-    int64_t mlp_set_ = -1;
-    std::vector<int32_t> last_ids_;
-    std::string te_lora_;   // the text encoder's adapters the kept states were made with (lora_key_of)
     std::vector<float> last_neg_states_;   // the last negative prompt's states (guidance), for the same ids again
-    std::vector<int32_t> last_neg_ids_;   // the last prompt, and its text states (host)
-    std::vector<float> last_states_;
+    std::vector<float> last_states_;       // the last prompt's text states (host)
     /// The references the last states read (img_start.hpp's refs_key; empty, none): an edit's states are kept for the
     /// same prompt and the same references, as a generation's for the same prompt
     std::string last_refs_, last_neg_refs_;

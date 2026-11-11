@@ -36,6 +36,7 @@
 // activations rotated in FP16.
 #pragma once
 
+#include "strata/image/dit_product.hpp"
 #include "strata/image/mf_dit.hpp"
 #include "strata/image/qi_stream.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -76,12 +77,7 @@ public:
     void drop_activations();
 
 private:
-    struct W {
-        int type = 1;              // 1 F16, 8 Q8_0, -8 W8A8's int8 rows (and their scales at `sw`)
-        int64_t n = 0, k = 0;
-        const void* d = nullptr;   // a block's: its offset in the block's region; else a device pointer
-        uint64_t sw = 0;           // W8A8: its rows' scales' offset in the region
-    };
+    using W = image::DitW;   // type 1 F16, 8 Q8_0, -8 W8A8's int8 rows (and their scales at `sw`)
     struct Stream {   // one of a block's two streams (video, text)
         W qkv, out, in, fc;                       // proj_qkv, proj_out, mlp.proj_in, mlp.proj_out
         uint64_t b_out = 0, b_in = 0, b_fc = 0;   // their biases (FP32), offsets in the region
@@ -107,15 +103,18 @@ private:
     void product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
                  const float* bias);
     // the same product as its reader takes it, the rows' scales and the bias not applied (y FP32, or W8A8's int32 sums
-    // with their input's scales xs_in_ and the weights'; with bf16 W8A8's values as BF16 where the GPU makes them)
-    image::MfOut product_out(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y,
-                             int64_t T, const float* bias, bool bf16 = true);
+    // with their input's scales xs_in_ and the weights', or W8A8's values as BF16 where the GPU makes them)
+    image::DitOut product_out(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y,
+                              int64_t T, const float* bias);
+    // the shared product's operands (image::DitProducts::run)
+    image::DitProduct operands(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y,
+                               int64_t T, const float* bias) const;
     float* next_xs();   // W8A8: the other of xs_ and xs2_, made xs_in_ (the next int8 rows' scales)
     // a product's input rows by the weights' form: FP16 rows (op16, into y16 with their scales rs), W8A8's int8 rows
     // (opi8), or the FP16 rows rotated for Q8_0 -> the FP16 rows' pointer (null for W8A8)
     template<class Op16, class OpI8>
     const uint16_t* input(const Op16& op16, const OpI8& opi8, int64_t T, int64_t K, uint16_t* y16, float* rs);
-    image::MfOut stream_attn_in(const Stream& st, const uint8_t* base, const float* x, int64_t T, float* qkv);
+    image::DitOut stream_attn_in(const Stream& st, const uint8_t* base, const float* x, int64_t T, float* qkv);
     void stream_out(const Stream& st, const uint8_t* base, const uint16_t* o16, float* x, int64_t T);
     void stream_mlp(const Stream& st, const uint8_t* base, float* x, int64_t T);
 
@@ -147,6 +146,7 @@ private:
              *jv_ = nullptr, *jo_ = nullptr, *o16_ = nullptr, *g16_ = nullptr, *in16_ = nullptr, *rot16_ = nullptr;
     int8_t* xq8_ = nullptr;   // W8A8: a product's int8 rows [T][K] and their scales xs_in_, xs_ or xs2_ by turns
     float *xs_ = nullptr, *xs2_ = nullptr, *xs_in_ = nullptr;   // (a product's sums read with the scales they came from)
+    image::DitProducts prod_{&gemm_, &allocs_, &s_, "image engine (SeedVR2 DiT)"};
 };
 
 }  // namespace strata::upscale

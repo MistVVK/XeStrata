@@ -28,6 +28,7 @@
 // set_context reads them again from the file.
 #pragma once
 
+#include "strata/image/dit_loras.hpp"
 #include "strata/image/image_lora.hpp"
 #include "strata/image/mf_dit.hpp"
 #include "strata/image/pipeline.hpp"
@@ -161,7 +162,7 @@ public:
     void drop_block_homes() { blocks_stream_.drop_homes(); }
     /// The adapters folded into the blocks' weights where they are plain LoRAs (the default), else added to each
     /// product: false keeps the weights as the file has them.
-    void set_lora_bake(bool on) { lora_bake_ = on; }
+    void set_lora_bake(bool on) { loras_.bake = on; }
     uint64_t weight_bytes() const { return weight_bytes_; }   // what stays on the GPU besides the blocks and the text's
     uint64_t text_bytes() const { return text_bytes_; }       // the text embedder's weights
     bool text_loaded() const { return text_loaded_; }
@@ -187,10 +188,7 @@ public:
     /// An adapter as a file names it: a weight of the DiT, the rows of the weight a file's entry changes, and the rows
     /// of the entry they are (the text embedder's fused qkv is three weights on the GPU: q takes the entry's rows
     /// [0, C), k [C, 2C), v [2C, 3C); the text embedder's ffn_up and ffn_gate are halves of one [up | gate]).
-    struct LoraTarget {
-        std::string name;
-        int64_t row0 = 0, rows = 0, cols = 0, src_row = 0;
-    };
+    using LoraTarget = DitLoraTarget;
     /// The weights adapters may change: what a file's keys are matched against (the probe's map, the server's list).
     std::vector<LoraTarget> lora_targets() const;
 
@@ -200,35 +198,17 @@ public:
     /// next forward.  The same set again (its files and strengths) changes nothing.
     bool set_loras(const std::vector<LoraUse>& loras, std::string& err);
     /// The set bound, as its files' paths and strengths (empty: none).
-    const std::string& lora_key() const { return lora_key_; }
+    const std::string& lora_key() const { return loras_.key(); }
     /// The bound entries' A and B on the GPU.
     uint64_t lora_bytes() const;
     /// The adapter files bound (a set whose strengths are all 0 binds none).
-    int lora_count() const { return (int) lora_files_.size(); }
+    int lora_count() const { return loras_.count(); }
     void drop_loras();
 
 private:
-    bool lora_bake_ = true, baked_any_ = false;
-    float* bake_tmp_ = nullptr;      // a weight's delta [n][k], while adapters are baked
-    uint16_t* bake_at16_ = nullptr;  // an adapter's A^T
     void install_prepare();
-    struct W {
-        int type = 0;            // 8 Q8_0, 1 F16, -8 W8A8's int8 rows and their scales
-        int64_t n = 0, k = 0;    // n rows of k
-        const void* d = nullptr; // a block's: its offset in the block's region; else a device pointer
-        uint64_t row_bytes = 0;
-        LoraLayer* lora = nullptr;   // the adapters' deltas for its products (null: none: the product is unchanged)
-        bool baked = false;          // its adapters folded into the block's copy of it (set_loras), not added to products
-    };
-    /// A weight and the rows of a file's entry it takes (a fused weight's range, or one of the three weights of the
-    /// text embedder's qkv split).  `biased`: the weight adds a bias of its own rows, where an entry's bias's delta is
-    /// added (the MOSS-Image blocks' products add none: their modulation does the shift).
-    struct LoraSlot {
-        std::string name;
-        W* w = nullptr;
-        int64_t row0 = 0, rows = 0, src_row = 0;
-        bool biased = false;
-    };
+    using W = DitW;
+    using LoraSlot = DitLoraSlot;
     struct Block {
         W q, k, v, o, up_gate, down;
         uint64_t n1 = 0, n2 = 0, nq = 0, nk = 0;   // the FP32 norms' offsets
@@ -253,15 +233,16 @@ private:
     /// The weights adapters may take, from the blocks, the text embedder and the weights outside them (open, and a
     /// later load_text).
     void build_lora_targets();
-    /// The products' scratch: T rows of the largest bound rank, FP32 and FP16 (grown on use).
-    void lora_scratch(int64_t T);
     /// A DoRA's row norms: the norms of a slot's weight, one a row of it, from the file's tensors (the text embedder's
     /// up_gate is ffn_up's rows and then ffn_gate's), cached a tensor (open drops the cache).
     bool dora_norms(const LoraSlot& slot, std::vector<float>& out, std::string& err);
     /// One of the file's tensors' row norms, FP32, cached (`name`: the file's own name).
     bool tensor_norms(const std::string& name, const std::vector<float>*& out, std::string& err);
-    MfOut product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
-                  const float* bias, bool same_input = false, bool defer = false);
+    // the shared product (DitProducts::run)
+    DitOut product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
+                   const float* bias, bool same_input = false, bool defer = false) {
+        return prod_.run(x16, rs, w, base, y, T, bias, same_input, defer);
+    }
     void ensure(int64_t hw, int n, int64_t max_text);
     void rope_tables(Ctx& c, int64_t h, int64_t w);
     void time_embedding(float timestep);
@@ -278,31 +259,11 @@ private:
     std::vector<void*> allocs_, text_allocs_;
     uint64_t weight_bytes_ = 0, text_bytes_ = 0;
     int64_t scratch_ = 0;
-    // the adapters: the weights' table, the bound layers (the parts keep the entries' A and B on the GPU) and the
-    // products' scratch
-    std::vector<LoraSlot> lora_slots_;
-    std::vector<std::unique_ptr<LoraLayer>> lora_layers_;
-    std::vector<std::shared_ptr<const LoraFile>> lora_files_;
-    std::string lora_key_;
-    int64_t lora_cols_ = 0, lora_tmp_t_ = 0;   // the deltas' scratch's columns and rows (the largest lora_scratch_cols)
     std::map<std::string, std::vector<float>> norm_cache_;   // DoRA's row norms, a file's tensor (open clears them)
-    float* lora_f32_ = nullptr;
-    uint16_t* lora16_ = nullptr;
-    // a GLoRA's own path: its input's columns, the weight's rows it is added over, and the buffers a band of its
-    // products takes (the rows' table, a W8A8 weight's int8 input and its scales)
-    int64_t lora_glora_cols_ = 0, lora_glora_rows_ = 0;
-    float* lora_glora_y_ = nullptr;
-    int8_t* lora_glora_x8_ = nullptr;
-    float* lora_glora_sx_ = nullptr;
-    void lora_glora_scratch();   // allocates them, once a set with a GLoRA is bound
-    void free_glora_scratch();
-    /// A GLoRA's own path: the weight's rows [r0, r0 + n) product of v (nt tokens, the first of them t0), added to
-    /// the product's output y at those rows (the weight's own path, as product takes it).
-    void glora_weight(const uint16_t* v, const W& w, const uint8_t* d, int64_t r0, int64_t n, int64_t nt, int64_t t0,
-                      float* y);
-    /// The layer's GLoRAs on the product's T rows of y (none: nothing), through glora_weight.
-    void add_glora(const LoraLayer* lora, const uint16_t* x16, const float* rs, const W& w, const uint8_t* d,
-                   int64_t T, float* y);
+    // the products (W8A8's input, the deltas' buffers)
+    DitProducts prod_{&gemm_, &allocs_, &s_, "image engine (MOSS-Image DiT)"};
+    // the adapters bound (their table built at open, build_lora_targets)
+    DitLoras loras_{&prod_.lora, &allocs_, &s_, "image engine (MOSS-Image DiT)"};
     bool dry_ = false, q8_ = true, w8_ = false, keep0_ = false, text_loaded_ = false;
     int64_t C_ = 3072, F_ = 8192, heads_ = 24, hd_ = 128, in_ch_ = 128, txt_dim_ = 4096, freq_ = 256;
     double rope_base_ = 10000.0;
@@ -357,19 +318,12 @@ private:
     uint16_t *h16_ = nullptr, *jq16_ = nullptr, *jk16_ = nullptr, *jv16_ = nullptr, *jo16_ = nullptr,
              *o16_ = nullptr, *t16_ = nullptr;
     int64_t jrows_ = 0;   // the rows of jq16_ .. jv16_ a context (qi_attn_rows of its rows at most)
-    // W8A8's input (w8_): xq8_rows_ rows of up to xq8_cols_ int8 values, then two arrays of their scales, taken in turn
-    int8_t* xq8_ = nullptr;
-    int64_t xq8_rows_ = 0, xq8_cols_ = 0;
-    int xs_next_ = 0;
-    // the other of the two arrays of scales, made the current one (what product's same_input reads)
-    float* i8_slot() {
-        xs_next_ ^= 1;
-        return reinterpret_cast<float*>(xq8_ + xq8_rows_ * xq8_cols_) + xs_next_ * xq8_rows_;
-    }
+    // the other of the W8A8 input's two arrays of scales, made the current one (what product's same_input reads)
+    float* i8_slot() { return prod_.in.slot(); }
     // the last block's MLP output not yet added to x: the next block's first kernel adds it where it runs over the
     // same rows (rows_i8's RmsI8), else flush_pending; its weights' scales copied to pend_sw_
     struct Pending {
-        MfOut add;
+        DitOut add;
         const float* gate = nullptr;
         uint16_t* x = nullptr;
         int64_t R = 0;

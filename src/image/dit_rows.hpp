@@ -156,17 +156,17 @@ inline void bf16_to_f16_inplace(uint16_t* p, int64_t n, sycl::queue& q) {
 // (Qwen-Image's heirs: MOSS-Image, Anima) or (2j, 2j + 1) (Mage-Flow, SeedVR2), the first n_rot channels of a head (0:
 // all of them; SeedVR2 7B's 60), the rest normed only; v divided by its head's scale hs (null: as it is)
 // (qk_norm_rope.hpp)
-inline void qk_rope16(const MfOut& q, const MfOut& k, const MfOut& v, const float* wq, const float* wk,
+inline void qk_rope16(const DitOut& q, const DitOut& k, const DitOut& v, const float* wq, const float* wk,
                       const float* cos, const float* sin, const float* hs, int64_t T, int64_t heads, int64_t hd,
                       bool neox, uint16_t* q16, uint16_t* k16, uint16_t* v16, void* s, float eps = 1e-6f,
                       int64_t n_rot = 0) {
     if (T <= 0) return;
     struct Heads {
-        MfOut q, k, v;
+        DitOut q, k, v;
         const float* hs;
         int64_t hd;
         struct Head {
-            MfOut::Row r;
+            DitOut::Row r;
             float inv;   // v's 1 / hs, else 1
             float operator()(int64_t d) const { return r(d) * inv; }
             void r2(int64_t d, float& a, float& b) const {
@@ -195,11 +195,11 @@ inline void qk_rope16(const MfOut& q, const MfOut& k, const MfOut& v, const floa
 // One tensor's heads RMS-normed over the head (w; null: the values copied as they are) into FP16 rows
 // [T][heads * hd], not rotated: a cross-attention's q, k and v, each its own row count (qk_rope16 norms q, k and v of
 // one count together).  The same kernel as qk_rope16's, its k and v heads left out.
-inline void qk_norm16(const MfOut& x, const float* w, int64_t T, int64_t heads, int64_t hd, uint16_t* out, void* s,
+inline void qk_norm16(const DitOut& x, const float* w, int64_t T, int64_t heads, int64_t hd, uint16_t* out, void* s,
                       float eps = 1e-6f) {
     if (T <= 0) return;
     struct In {
-        MfOut x;
+        DitOut x;
         int64_t hd;
         auto head(int, int64_t t, int64_t h) const { return x.row(t, h * hd); }
     };
@@ -303,7 +303,7 @@ template<bool R> struct RmsAffineI8 {
 };
 template<bool R> struct GeluTanhI8 {
     static constexpr bool kRms = false, kKeep = false, kRegular = R;
-    MfOut x;
+    DitOut x;
     float raw(int64_t t, int64_t c) const { return gelu_tanh(x.at(t, c)); }
     void keep(int64_t, int64_t, float) const {}
     float inv(float) const { return 1.f; }
@@ -327,7 +327,7 @@ template<bool R> struct FloatI8 {
 
 template<bool R> struct SwiGluI8 {
     static constexpr bool kRms = false, kKeep = false, kRegular = R;
-    MfOut g;
+    DitOut g;
     int64_t F;
     float raw(int64_t t, int64_t c) const {
         const float a = g.at(t, c);
@@ -339,7 +339,7 @@ template<bool R> struct SwiGluI8 {
 
 // SwiGLU of a fused product's output g [T][2F]: SiLU of the first F (the gate) times the second F, rows16's Op
 struct SwiGlu {
-    MfOut g;
+    DitOut g;
     int64_t F;
     template<class R> Stats stats(int64_t, int64_t, int64_t, R) const { return {}; }
     float value(int64_t t, int64_t c, const Stats&) const {
@@ -364,7 +364,7 @@ struct Grad : Plain {
 // SiTU of the up_gate product's sums g [T][2F] (the hidden values, then the gates): (4 tanh(g / 4) sigmoid(g)) times
 // (25 tanh(h / 25)), F values a row (MOSS-Image's MLP; its backward situ_bwd)
 struct Situ {
-    MfOut g;
+    DitOut g;
     int64_t F;
     template<class R> Stats stats(int64_t, int64_t, int64_t, R) const { return {}; }
     float value(int64_t t, int64_t c, const Stats&) const {
@@ -377,7 +377,7 @@ struct Situ {
 
 // GELU (tanh form) of a product's output, rows16's Op
 struct GeluTanh {
-    MfOut x;
+    DitOut x;
     template<class R> Stats stats(int64_t, int64_t, int64_t, R) const { return {}; }
     float value(int64_t t, int64_t c, const Stats&) const { return gelu_tanh(x.at(t, c)); }
     // |GELU(v)| <= v for v >= 0 and below 0.17 for v < 0: the row's scale without a tanh more a value
@@ -391,7 +391,7 @@ struct GeluTanh {
 struct TimedI8 {
     static constexpr bool kRms = true, kKeep = true;
     float* x;
-    MfOut y;
+    DitOut y;
     const float* w;   // the norm's weights, then the modulation's scale and shift
     int64_t C;
     float raw(int64_t t, int64_t c) const { return x[t * C + c] + w[c] * y.at(t, c); }
@@ -410,7 +410,7 @@ struct TimedHalfI8 {
 };
 struct TimedPairI8 {
     static constexpr bool kRms = false, kKeep = false;
-    MfOut y;
+    DitOut y;
     int64_t F;
     float raw(int64_t t, int64_t c) const { return y.at(t, c) * sycl::tanh(y.at(t, c + F)); }
     void keep(int64_t, int64_t, float) const {}
@@ -436,7 +436,7 @@ inline int rows_i8_width(sycl::queue& qu) {
             qu.fill(x, 1.f, (size_t) (T * C));
             qu.fill(y, 1, (size_t) (TF * 2 * F));
             qu.fill(sxw, 1e-3f, (size_t) (T + 2 * F + 3 * C)).wait();
-            MfOut yc, yf;
+            DitOut yc, yf;
             yc.i = yf.i = y;
             yc.sx = yf.sx = sxw;
             yc.sw = yf.sw = sxw + T;
@@ -556,7 +556,7 @@ struct Heads {
 
 // part[r][h] = the largest |v| of row r's head h, rows of a ([na][C]) then b ([nb][C])
 struct HeadMax {
-    MfOut a, b;
+    DitOut a, b;
     int64_t na, nb, heads, hd;
     float* part;
     void operator()(sycl::nd_item<1> it) const {
@@ -573,7 +573,7 @@ struct HeadMax {
     auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<kSG>}; }
 };
 
-inline void head_max(const MfOut& a, int64_t na, const MfOut& b, int64_t nb, int64_t heads, int64_t hd, float* part,
+inline void head_max(const DitOut& a, int64_t na, const DitOut& b, int64_t nb, int64_t heads, int64_t hd, float* part,
               void* s) {
     const int64_t n = (na + nb) * heads;
     if (n <= 0) return;
@@ -592,7 +592,7 @@ inline void head_max(const MfOut& a, int64_t na, const MfOut& b, int64_t nb, int
 // of 3072, 2026-11-06) took 0.12 ms read a column a work-item over 32 slices, at 40% of the memory's bandwidth
 constexpr int64_t kColSlices = 128;
 
-inline void col_max(const MfOut& a, int64_t na, const MfOut& b, int64_t nb, int64_t C, float* part, void* s) {
+inline void col_max(const DitOut& a, int64_t na, const DitOut& b, int64_t nb, int64_t C, float* part, void* s) {
     const int64_t n = na + nb;
     if (n <= 0) return;
     auto run = [&]<int W>() {
@@ -662,7 +662,7 @@ inline void rows_back(float* y, const float* rs, const float* b, int64_t T, int6
 inline void bias_add(float* y, const float* b, int64_t T, int64_t N, void* s) { qi_bias_add(y, b, T, N, s); }
 
 // The DiTs' gated residual: x[t][c] += g(t, c) h[t][c]
-template<class X, class G> sycl::event gate_add_by(X* x, const MfOut& h, G g, int64_t T, int64_t C, void* s) {
+template<class X, class G> sycl::event gate_add_by(X* x, const DitOut& h, G g, int64_t T, int64_t C, void* s) {
     if (T <= 0) return {};
     return kernels::for_rows_cols(q_of(s), T, C, [=](int64_t t, int64_t c) {
         x[t * C + c] = resid_of<X>(resid(x[t * C + c]) + g(t, c) * h.at(t, c));
@@ -670,12 +670,12 @@ template<class X, class G> sycl::event gate_add_by(X* x, const MfOut& h, G g, in
 }
 
 // x[t] += gate * h[t] (per channel; gate null: 1)
-template<class X> inline void gate_add(X* x, const MfOut& h, const float* gate, int64_t T, int64_t C, void* s) {
+template<class X> inline void gate_add(X* x, const DitOut& h, const float* gate, int64_t T, int64_t C, void* s) {
     (void) gate_add_by(x, h, [=](int64_t, int64_t c) { return gate != nullptr ? gate[c] : 1.f; }, T, C, s);
 }
 
 // out[t] = x[t] + gate * h[t]: the same, x kept (a training step's backward reads it)
-inline void gate_add_to(float* out, const float* x, const MfOut& h, const float* gate, int64_t T, int64_t C, void* s) {
+inline void gate_add_to(float* out, const float* x, const DitOut& h, const float* gate, int64_t T, int64_t C, void* s) {
     if (T <= 0) return;
     kernels::for_rows_cols(q_of(s), T, C, [=](int64_t t, int64_t c) {
         out[t * C + c] = x[t * C + c] + (gate != nullptr ? gate[c] : 1.f) * h.at(t, c);

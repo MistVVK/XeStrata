@@ -199,11 +199,7 @@ void MossPipeline::use_loras(const QiRequest& r) {
     dit_->set_lora_bake(lora_bake_ && r.dataspace.empty());
     if (!dit_->set_loras(dit, err)) throw LoraRejected(err);
     if (te_ && !te_->set_loras(te_loras_, err)) throw LoraRejected(err);
-    if (lora_key_of(te_loras_) != te_lora_) {   // the states kept were the encoder's with the other adapters
-        last_ids_.clear();
-        last_neg_ids_.clear();
-        te_lora_ = lora_key_of(te_loras_);
-    }
+    te_loras_now(lora_key_of(te_loras_));   // the states kept were the encoder's with the other adapters
     if (dit_->lora_key() != before) {   // the contexts' text rows were made with the other adapters' weights
         ctx_states_[0].clear();
         ctx_states_[1].clear();
@@ -359,10 +355,7 @@ QiPlan MossPipeline::plan(int64_t hw, int n, int64_t max_text, bool text) {
               (in_stream(ref_layout_) ? d.stream_bytes(ref_rows_) : d.ref_bytes(ref_rows_));
     p.lora = d.lora_bytes();
     p.lora_n = d.lora_count();
-    if (p.budget <= p.fixed)
-        throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
-                                 " MiB) is below the weights that always stay");
-    const uint64_t avail = p.budget - p.fixed, dit_min = d.block_min();
+    const uint64_t avail = plan_avail(p), dit_min = d.block_min();
     // an edit's references: their pass over the blocks takes the activations' rows too (set_refs; activation_bytes);
     // in the stream, they are rows after each context's text instead
     const bool stream = in_stream(ref_layout_);
@@ -370,9 +363,7 @@ QiPlan MossPipeline::plan(int64_t hw, int n, int64_t max_text, bool text) {
     if (stream && hw > 0) max_text += ref_rows_;
     const int64_t mlp = mlp_bands(avail, hw > 0, p.activations,
                                   [&](int64_t rows) { return d.activation_bytes(hw, n, max_text, rows, kept); });
-    if (avail < p.activations + dit_min)
-        throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
-                                 " MiB) is too small for this image");
+    if (avail < p.activations + dit_min) plan_too_small(p);
     uint64_t te_fixed = te_ ? text_fixed() : 0;
     const uint64_t te_min = te_ ? te_->layer_min() : 0;
     // the encoder stays only beside every block of the DiT: a streamed block costs every step (the RTX 4070's link at
@@ -384,10 +375,7 @@ QiPlan MossPipeline::plan(int64_t hw, int n, int64_t max_text, bool text) {
         te_fixed = 0;
     }
     p.blocks = clampu(avail - p.activations - te_fixed - te_min, dit_min, d.block_bytes());
-    if (p.blocks != dit_set_) {
-        d.set_block_budget(p.blocks);
-        dit_set_ = p.blocks;
-    }
+    plan_blocks(d, p.blocks);
     if (te_) {
         p.layers = clampu(avail - p.activations - p.blocks - te_fixed, te_min, te_->layer_bytes());
         if (p.layers != te_set_) {
@@ -396,13 +384,7 @@ QiPlan MossPipeline::plan(int64_t hw, int n, int64_t max_text, bool text) {
         }
         p.resident_layers = te_->resident_layers();
     }
-    p.mlp_rows = mlp;
-    if (hw > 0 && mlp != mlp_set_) {
-        d.set_mlp_rows(mlp);
-        mlp_set_ = mlp;
-    }
-    if (hw == 0) d.drop_activations();
-    p.resident_blocks = d.resident_blocks();
+    plan_rows(p, d, hw > 0, mlp);
     p.vae = avail - p.blocks - p.layers - te_fixed;
     return p;
 }
@@ -813,7 +795,7 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     std::vector<float> tokens((size_t) N);
     for (int64_t c = 0; c < Cl; ++c)
         for (int64_t q = 0; q < h * w; ++q) tokens[(size_t) (q * Cl + c)] = noise[(size_t) (c * h * w + q)];
-    float *x = nullptr, *rgba = nullptr, *x0 = nullptr;
+    float *x = nullptr, *rgba = nullptr;
     if (!gpu::alloc_device(&x, (size_t) N * 4) || !gpu::alloc_device(&rgba, (size_t) (4 * HW) * 4)) {
         gpu::free(x);
         throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
@@ -828,40 +810,26 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
         gpu::copy(x, tokens.data(), (size_t) N * 4);
         if (r.strength < 1.0) ls.start(x, sigmas[0], s_);   // img2img: from the base image's latent at that time
         if (stage) stage("sampling");
-        // partial images (r.preview): the step's x0 decoded in the room the VAE has beside the DiT now, nothing given
-        // up for it; a step whose decode does not fit there is left out
-        int shown = 0;
-        auto peek = [&](int done, const std::function<void(float*)>& make) {
-            if (!r.on_preview || std::find(r.preview.begin(), r.preview.end(), done) == r.preview.end()) return;
-            const uint64_t room = p.vae > p.activations ? p.vae - p.activations : 0;
-            if (x0 == nullptr && !gpu::alloc_device(&x0, (size_t) N * 4)) return;
-            make(x0);
-            try {
-                vae_->decode(x0, h, w, rgba, room);
-            } catch (const std::exception&) {
-                vae_->drop_scratch();
-                return;
-            }
-            vae_->drop_scratch();
-            gpu::copy(out.data(), rgba, out.size() * 4);
-            std::vector<uint8_t> img = rgba8(out, HW);
-            if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
-            r.on_preview(shown++, done, img);
-        };
+        // partial images (r.preview)
+        PreviewDecode preview(
+            r, p, N, [&](float* x0, uint64_t room) { vae_->decode(x0, h, w, rgba, room); },
+            [&] { vae_->drop_scratch(); },
+            [&] {
+                gpu::copy(out.data(), rgba, out.size() * 4);
+                std::vector<uint8_t> img = rgba8(out, HW);
+                if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
+                return img;
+            });
+        auto peek = [&](int done, const std::function<void(float*)>& make) { preview(done, make); };
         if (r.dataspace.empty())
             d.sample(x, h, w, sigmas, g, first, total, step, ls.after(s_), peek, &r.guide,
                      r.sampler == "er_sde", r.shift > 0 ? r.shift : kShift, r.seed);
         else few_steps(r, x, h, w, step, peek);
-        gpu::free(x0);
-        x0 = nullptr;
+        preview.release();
         const auto t2 = clock::now();
         if (stage) stage("decode");
         // the VAE beside the DiT's activations when it fits there; else they give way to it, then the encoder's layers
-        uint64_t room = p.vae > p.activations ? p.vae - p.activations : 0;
-        if (vae_->scratch_bytes(h, w) > room) {
-            d.drop_activations();
-            room = p.vae;
-        }
+        uint64_t room = decode_room(p, d, vae_->scratch_bytes(h, w));
         if (vae_->scratch_bytes(h, w) > room && te_ && te_->layers_vram() > te_->layer_min()) {
             room += te_->layers_vram() - te_->layer_min();
             te_->set_layer_budget(te_->layer_min());
@@ -892,7 +860,6 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
         }
     } catch (...) {
         gpu::free(x);
-        gpu::free(x0);
         gpu::free(rgba);
         throw;
     }

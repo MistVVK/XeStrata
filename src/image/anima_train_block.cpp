@@ -29,7 +29,7 @@ constexpr float kEps = 1e-6f;   // the LayerNorms' and the head norms' eps, as a
 
 // GELU (erf form) of a product's sums, rows16's Op (anima_dit.cpp's GeluErf)
 struct GeluErf {
-    MfOut x;
+    DitOut x;
     template<class R> dit_rows::Stats stats(int64_t, int64_t, int64_t, R) const { return {}; }
     float value(int64_t t, int64_t c, const dit_rows::Stats&) const { return gelu_erf(x.at(t, c)); }
     float bound(int64_t t, int64_t c) const { return sycl::fmax(x.at(t, c), 0.17f); }

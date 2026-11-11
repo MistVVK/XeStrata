@@ -135,11 +135,8 @@ private:
     // first open and first encode (0: not yet; te_measure_ 0 neither, 1 the open, 2 both)
     uint64_t te_layers_ = 0, te_layer_max_ = 0, te_other_ = 0, te_fixed_ = 0;
     int te_measure_ = 0;
-    uint64_t dit_set_ = 0, te_set_ = 0;
-    int64_t mlp_set_ = -1;
-    std::vector<int32_t> last_ids_, last_neg_ids_;
+    uint64_t te_set_ = 0;
     std::vector<LoraUse> te_loras_;   // the request's text encoder adapters, bound as the encoder opens
-    std::string te_lora_;             // those the kept states were made with (lora_key_of)
     std::vector<float> last_states_, last_neg_states_;
     std::vector<float> ctx_states_[2];   // the states the DiT's contexts were set from
 };

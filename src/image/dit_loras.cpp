@@ -1,0 +1,279 @@
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// src/image/dit_loras.cpp - the DiTs' one adapter binder (dit_loras.hpp), which each DiT had its own copy of.
+#include "strata/image/dit_loras.hpp"
+
+#include "strata/core/gpu.hpp"
+#include "strata/image/gpu_buf.hpp"
+#include "strata/kernels/bf16_bits.hpp"
+
+#include <algorithm>
+#include <cmath>
+
+namespace strata::image {
+
+namespace {
+
+// A file's key that changes a text encoder (kohya's lora_te_, diffusers' text_encoder. prefix, the te. other tools
+// write): the image engine applies adapters to the DiT only, and says so rather than leaving it out.
+bool is_text_encoder_key(const std::string& k) {
+    return k.rfind("lora_te", 0) == 0 || k.rfind("text_encoder", 0) == 0 || k.rfind("te.", 0) == 0;
+}
+
+// Six of the names, then "and N more": the errors' list of a file's keys the DiT does not take.
+std::string name_list(const std::vector<std::string>& names) {
+    std::string out;
+    const size_t n = std::min<size_t>(names.size(), 6);
+    for (size_t i = 0; i < n; ++i) {
+        if (i > 0) out += ", ";
+        out += names[i];
+    }
+    if (names.size() > n) out += " (and " + std::to_string(names.size() - n) + " more)";
+    return out;
+}
+
+// a weight's blocks' copy the bake rewrites: its form as LoraLayer::bake takes it (0: none it takes)
+int bake_type(const DitW& w) {
+    if (w.w8 && !w.w8t) return kDitW8;
+    return w.type == kDitF16 || w.type == kDitQ8_0 || w.type == kDitW8 ? w.type : 0;
+}
+
+}  // namespace
+
+void DitLoras::add(std::string name, DitW& w, int64_t row0, int64_t rows, int64_t src_row, bool biased) {
+    if (w.n <= 0 || w.k <= 0 || rows <= 0 || row0 + rows > w.n) return;
+    slots_.push_back({std::move(name), &w, row0, rows, src_row, biased});
+}
+
+std::vector<DitLoraTarget> DitLoras::targets() const {
+    std::vector<DitLoraTarget> out;
+    out.reserve(slots_.size());
+    for (const DitLoraSlot& s : slots_) out.push_back({s.name, s.row0, s.rows, s.w->k, s.src_row});
+    return out;
+}
+
+bool DitLoras::set(const std::vector<LoraUse>& loras, std::string& err, bool& changed) {
+    changed = false;
+    // the set as the same again (its files and strengths): nothing to bind
+    const std::string key = lora_key_of(loras);
+    if (key == key_) return true;
+    changed = true;
+    hooks.drop();
+    if (key.empty()) return true;
+    const auto fail = [this]() {
+        hooks.drop();
+        return false;
+    };
+    void* const s = *s_;
+    std::vector<std::string> unknown, text_encoder;
+    for (const LoraUse& u : loras) {
+        if (!u.file) continue;
+        if (hooks.file) hooks.file(*u.file);
+        for (const LoraEntry& raw : u.file->entries()) {
+            LoraEntry moved;
+            const LoraEntry* ep = &raw;
+            std::string renamed;
+            if (hooks.rename && hooks.rename(raw, renamed)) {
+                moved = raw;   // the key changes, the entry's tensors do not
+                moved.key = std::move(renamed);
+                ep = &moved;
+            }
+            const LoraEntry& entry = *ep;
+            if (is_text_encoder_key(entry.key)) {
+                text_encoder.push_back(entry.key);
+                continue;
+            }
+            // the slots of the entry's name: one weight, or the weights a fused one is split into
+            std::vector<const DitLoraSlot*> slots;
+            for (const DitLoraSlot& sl : slots_)
+                if (lora_key_names(entry.key, sl.name)) slots.push_back(&sl);
+            if (slots.empty()) {
+                unknown.push_back(entry.key);
+                continue;
+            }
+            int64_t rows = 0;   // the entry's rows the weight takes
+            for (const DitLoraSlot* sl : slots) rows = std::max(rows, sl->src_row + sl->rows);
+            // a GLoRA's four tensors may fit both of its readings: the weight's rows and columns say which
+            LoraEntry alt;
+            const LoraEntry& e = *lora_glora_for_weight(entry, rows, slots[0]->w->k, alt);
+            const bool oft = e.kind == LoraKind::oft;
+            const bool glora = e.kind == LoraKind::glora;
+            const std::string at = "image engine: " + u.file->path() + ": " + e.key;
+            if (oft && (slots.size() != 1 || slots[0]->src_row != 0)) {
+                // a rotation is one weight's rows, block by block: a name the DiT splits across weights' rows takes none
+                err = at + ": an OFT, and the DiT's rows of that name are several weights or a part of one";
+                return fail();
+            }
+            std::string why;
+            if (hooks.refuse && hooks.refuse(*slots[0], e, why)) {
+                err = at + ": " + why;
+                return fail();
+            }
+            if (e.kind == LoraKind::bias) {   // a bias's delta alone: its rows are the bias's, its columns none
+                if (e.rows != rows) {
+                    err = at + ": a bias's delta (diff_b/b_norm) of " + std::to_string(e.rows) +
+                          " values, not the weight's " + std::to_string(rows) + " rows";
+                    return fail();
+                }
+            } else if (e.rows != rows || (oft ? e.cols != 0 : e.cols != slots[0]->w->k)) {
+                err = at + " is " + std::to_string(e.cols) + " x " + std::to_string(e.rows) + ", not the DiT's " +
+                      std::to_string(slots[0]->w->k) + " x " + std::to_string(rows);
+                return fail();
+            }
+            if (!e.bias.empty()) {   // a bias's delta is added where the weight adds its bias: the weight must have one
+                for (const DitLoraSlot* sl : slots)
+                    if (!sl->biased) {
+                        err = at + ": a bias's delta (diff_b/b_norm), and the DiT's weight adds no bias (its block's "
+                                   "modulation does the shift)";
+                        return fail();
+                    }
+            }
+            const float scale = u.scale * e.scale();
+            // a strength of 0 changes nothing: the weight keeps its product's path (an alpha of 0 leaves the bias's
+            // delta and a DoRA's base factors, as a DoRA's decomposition scales the weight with no delta)
+            if (u.scale == 0.0f || (scale == 0.0f && e.bias.empty() && e.dora.empty())) continue;
+            // a DoRA's: the entry's rows' delta factors (its B's, by the entry's rows), and each part's base factors
+            const bool dora = !e.dora.empty();
+            std::vector<float> coef((size_t) e.rows, 1.0f);
+            std::vector<std::vector<float>> bases(slots.size());
+            for (size_t i = 0; i < slots.size(); ++i) {
+                const DitLoraSlot* slot = slots[i];
+                std::vector<float> norms;
+                if (dora && !hooks.dora_norms(*slot, norms, err)) return fail();
+                if (dora) {
+                    std::vector<float> c;
+                    if (!lora_dora_rows(e, slot->src_row, slot->row0, slot->rows, norms, u.scale, c, bases[i], why)) {
+                        err = at + ": " + why;
+                        return fail();
+                    }
+                    for (int64_t j = 0; j < slot->rows; ++j) coef[(size_t) (slot->src_row + j)] = c[(size_t) j];
+                }
+                if (e.replaces)   // a set_weight: the weight interpolates to the file's, W + s (S - W)
+                    bases[i].assign((size_t) slot->rows, 1.0f - u.scale);
+                if (const LoraPart* clash = lora_dora_overlap(slot->w->lora, slot->row0, slot->rows, dora, oft, glora,
+                                                              e.replaces)) {
+                    err = at + ": the weight's rows " + std::to_string(slot->row0) + " .. " +
+                          std::to_string(slot->row0 + slot->rows) + " are another adapter's, and " +
+                          lora_patch_clash_why(*clash, oft, glora, e.replaces);
+                    return fail();
+                }
+            }
+            auto dev = std::make_shared<LoraDeviceEntry>();
+            if (!dev->upload(e, s, err, dora ? coef.data() : nullptr)) return fail();
+            for (size_t i = 0; i < slots.size(); ++i) {
+                const DitLoraSlot* slot = slots[i];
+                if (slot->w->lora == nullptr) {
+                    layers_.push_back(std::make_unique<LoraLayer>());
+                    slot->w->lora = layers_.back().get();
+                }
+                LoraPart part;
+                part.entry = dev;
+                part.row0 = slot->row0;
+                part.n = slot->rows;
+                part.src_row = slot->src_row;
+                part.scale = scale;
+                part.bias_scale = u.scale;   // a diff patch has no alpha: the request's strength only
+                part.dora = dora;
+                part.oft = oft;
+                part.glora = glora;
+                part.replaces = e.replaces;
+                part.base = std::move(bases[i]);
+                slot->w->lora->parts.push_back(std::move(part));
+            }
+            scratch_->cols = std::max(scratch_->cols, lora_scratch_cols(e));
+            if (glora) {
+                scratch_->glora_cols = std::max(scratch_->glora_cols, e.cols);
+                scratch_->glora_rows = std::max(scratch_->glora_rows, e.rows);
+            }
+        }
+    }
+    if (!text_encoder.empty()) {
+        err = "image engine: a text encoder's adapter: the image engine applies adapters to the DiT only (" +
+              name_list(text_encoder) + ")";
+        return fail();
+    }
+    if (!unknown.empty()) {
+        err = "image engine: the DiT takes no adapter for " + name_list(unknown);
+        return fail();
+    }
+    if (layers_.empty()) {   // every strength 0: as no adapter at all (the products are untouched)
+        hooks.drop();
+        return true;
+    }
+    for (const DitLoraSlot& slot : slots_)   // the base products' row factors, once every part is bound
+        if (slot.w->lora != nullptr && !slot.w->lora->build_base(slot.w->n, s, err)) return fail();
+    // a GLoRA's own path's buffers, once every part is bound
+    if (scratch_->glora_cols > 0) scratch_->glora_alloc(*owned_, what_);
+    if (bake) {   // the blocks' plain LoRAs folded into their weights as the blocks come back to the GPU
+        std::vector<DitW*> ws;
+        hooks.block_weights(ws);
+        int64_t nk = 0, kr = 0;
+        for (DitW* w : ws)
+            if (w->lora != nullptr && w->lora->bakeable() && bake_type(*w) != 0) {
+                w->baked = true;
+                nk = std::max(nk, w->n * w->k);
+                for (const LoraPart& p : w->lora->parts) kr = std::max(kr, w->k * p.entry->rank());
+            }
+        if (nk > 0) {
+            bake_tmp_ = alloc<float>(*owned_, nk, what_);
+            bake_at16_ = alloc<uint16_t>(*owned_, kr, what_);
+            baked_any_ = true;
+            hooks.reprepare();   // the queued work drained before the prepare changes
+        }
+    }
+    for (const LoraUse& u : loras)
+        if (u.file) files_.push_back(u.file);
+    key_ = key;
+    return true;
+}
+
+void DitLoras::drop() {
+    for (DitLoraSlot& sl : slots_) {
+        sl.w->lora = nullptr;
+        sl.w->baked = false;
+    }
+    if (baked_any_) {   // the weights as the file has them again: the blocks copied anew, without the bake
+        baked_any_ = false;
+        hooks.reprepare();
+        for (void** p : {reinterpret_cast<void**>(&bake_tmp_), reinterpret_cast<void**>(&bake_at16_)})
+            if (*p != nullptr) {
+                release(*owned_, *p);
+                *p = nullptr;
+            }
+    }
+    layers_.clear();
+    files_.clear();
+    key_.clear();
+    scratch_->drop(*owned_, *s_);
+}
+
+uint64_t DitLoras::bytes() const {
+    uint64_t n = 0;
+    for (const std::unique_ptr<LoraLayer>& l : layers_) n += l->bytes();
+    return n + scratch_->glora_bytes();   // a GLoRA's own path's buffers
+}
+
+bool dit_slot_norms(const DitLoraSlot& slot, const std::vector<float>& norms, std::vector<float>& out,
+                    std::string& err, const char* what) {
+    if ((int64_t) norms.size() < slot.src_row + slot.w->n) {
+        err = std::string(what) + ": " + slot.name + ": the file's rows are fewer than the weight's";
+        return false;
+    }
+    out.assign(norms.begin() + slot.src_row, norms.begin() + slot.src_row + slot.w->n);
+    return true;
+}
+
+std::vector<float> dit_bf16_row_norms(const uint16_t* h, int64_t rows, int64_t k) {
+    std::vector<float> norms((size_t) rows);
+    for (int64_t r = 0; r < rows; ++r) {
+        double s = 0;
+        for (int64_t c = 0; c < k; ++c) {
+            const float v = kernels::f32_from_bf16(h[r * k + c]);
+            s += (double) v * (double) v;
+        }
+        norms[(size_t) r] = (float) std::sqrt(s);
+    }
+    return norms;
+}
+
+}  // namespace strata::image

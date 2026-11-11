@@ -30,22 +30,19 @@ namespace strata::image {
 void qi_ln_mod16(const float* x, const float* mod, int64_t n_text, int64_t T, int64_t C, uint16_t* y16, void* stream,
                  const float* shift = nullptr);
 
-/// A W8A8 product's output left as its int32 sums (their bits in the FP32 array): value [t][n] = sum * sx[t] * sw[n].
-struct QiI8 {
-    const float *sx = nullptr, *sw = nullptr;
-    bool bf = false;   // the product's values already scaled, as BF16 (kernels::i8_gemm_bf16): sx and sw unread
-};
+struct DitOut;
 
-/// x[t] += h[t] * tanh(mod[t < n_text][...]); with i8, h holds a W8A8 product's sums.
+/// x[t] += h[t] * tanh(mod[t < n_text][...]); with i8 (a W8A8 product's DitOut), h holds its int32 sums (their bits in
+/// the FP32 array: value [t][n] = sum * i8->sx[t] * i8->sw[n]), or its values as BF16 (i8->bf set).
 void qi_gate_add(float* x, const float* h, const float* mod, int64_t n_text, int64_t T, int64_t C, void* stream,
-                 const QiI8* i8 = nullptr);
+                 const DitOut* i8 = nullptr);
 
 /// For each token and head: q and k RMS-normed over the head (weights wq, wk; eps 1e-6), then rotated pairwise
 /// (2j, 2j + 1) by cos[t][j], sin[t][j] (rope tables [T][head_dim / 2]); written as FP16 q16, k16, and v as v16, all
 /// [T][heads * head_dim].  With i8 (three: q's, k's and v's), q, k and v hold W8A8 products' sums.
 void qi_qk_norm_rope16(const float* q, const float* k, const float* v, const float* wq, const float* wk,
                        const float* cos, const float* sin, int64_t T, int64_t heads, int64_t head_dim,
-                       uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream, const QiI8* i8 = nullptr);
+                       uint16_t* q16, uint16_t* k16, uint16_t* v16, void* stream, const DitOut* i8 = nullptr);
 
 /// The rows q16, k16 and v16 must hold for qi_attention: T rounded up to a multiple of 128, the rows past T zero.
 constexpr int64_t qi_attn_rows(int64_t T) { return (T + 127) / 128 * 128; }
@@ -137,7 +134,7 @@ constexpr int64_t kQiRotate = kernels::kI8Rotate;
 
 /// kernels::rows_i8 of the SwiGLU's values (prefill::swiglu_pair's), from the gate_up product's int32 sums gu [T][2 inter]
 /// (scaled by g): the down product's int8 input in one pass.
-void qi_swiglu_i8(const int32_t* gu, const QiI8& g, int64_t T, int64_t inter, int8_t* q, float* s, void* stream);
+void qi_swiglu_i8(const int32_t* gu, const DitOut& g, int64_t T, int64_t inter, int8_t* q, float* s, void* stream);
 
 /// y [T][N] (row stride ldy) *= col[n], in place: a dense product's rows, scaled where a DoRA's c is not 1 (col is
 /// the weight's rows' factors, y's rows the weight's row0 on).

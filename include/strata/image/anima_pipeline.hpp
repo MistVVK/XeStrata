@@ -81,11 +81,7 @@ private:
     std::vector<std::vector<uint8_t>> dit_host_;
     std::vector<int> block_map_;
     std::unique_ptr<QiVae> vae_, vae_size_;
-    uint64_t dit_set_ = 0;
-    int64_t mlp_set_ = -1;
-    std::vector<int32_t> last_ids_, last_neg_ids_;
     std::vector<LoraUse> te_loras_;   // the request's text encoder adapters, bound as the encoder opens
-    std::string te_lora_;             // those the kept states were made with (lora_key_of)
     std::vector<float> last_states_, last_neg_states_;
     // what the DiT's contexts were set from: the states and the T5 ids and weights
     struct CtxKey {
