@@ -32637,7 +32637,7 @@
     }
    ],
    "parse": "flag",
-   "default_state": "off",
+   "default_state": "on",
    "code_default": null,
    "engine_sets": [],
    "engine_defaults": [],
@@ -32652,7 +32652,7 @@
    "last_date": "2026-11-11",
    "status": "research",
    "owner": "image",
-   "note": "[reviewed] Test switch of the image test programs (strata-dit-step, strata-image) and of the opt-in native DiT runner patch for sd-cli (tools/image/sdcpp_native): 1 turns on Strata's own WMMA attention for the Qwen-Image DiT on gfx1200 / gfx1201 (RDNA4), where it is not measured yet. Off by default; no shipped default sets it.",
+   "note": "[DRAFT] Switch of Strata's own WMMA attention in the image DiT code (strata-dit-step, strata-image) on gfx1200 / gfx1201 (RDNA4): on by default there, 0 turns it off. Measured on an R9700 at 1024 x 1024, 8 steps: 6.93 s with it, 27.75 s without; the pictures are 54.1 dB (worst 35.2 dB) from the ones without it. The opt-in native DiT runner patch for sd-cli (tools/image/sdcpp_native) reads this name too and keeps its own default: there 1 turns it on.",
    "retire_after": "",
    "retired_in": ""
   },

@@ -590,7 +590,9 @@ int has_fast_attn(int device) {
         if (std::strncmp(arch, p, 7) == 0) return 1;
     const char* g12 = std::getenv("STRATA_QI_GFX12_ATTN");
     const bool rdna4 = std::strncmp(arch, "gfx1200", 7) == 0 || std::strncmp(arch, "gfx1201", 7) == 0;
-    return rdna4 && g12 != nullptr && g12[0] == '1' ? 1 : 0;
+    // gfx1200 / gfx1201: on by default (R9700: 8 steps 27.75 s -> 6.93 s at 1024, pictures 54 dB from the exact-attention ones);
+    // STRATA_QI_GFX12_ATTN=0 turns it off
+    return rdna4 && !(g12 && g12[0] == '0') ? 1 : 0;
 #else
     return prop.major >= 8 ? 1 : 0;
 #endif
