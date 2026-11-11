@@ -3981,6 +3981,9 @@ int main(int argc, char** argv) {
             // So its expert arena stays unregistered.  STRATA_UMA_REGISTER=1 (or STRATA_ARENA_PIN_GIB=0) registers it as before.
             if (strata::core::igpu_uma_arena_default(ad.gcnArchName, all_igpu, win_host))
                 strata::core::arena_uma_no_register_flag().store(true);
+            // and on Linux the arena asks for no transparent huge pages there (arch_defaults.hpp, igpu_arena_no_thp_default)
+            if (strata::core::igpu_arena_no_thp_default(ad.gcnArchName, all_igpu, win_host))
+                strata::core::arena_no_thp_flag().store(true);
             // gfx1151 on Windows (#1630 capped a bare `--prefill auto` at 6144 for a 7900 XTX's commit charge): the Strix Halo has its
             // 8192 chunk back.  IQ3_S, 8K prompt: 691 -> 787 tok/s (one chunk streams 1,785 experts instead of 2,782), 64K 713 -> 748;
             // 4K is one chunk already.  STRATA_GFX1151_CHUNK=0 (or STRATA_GFX1151_DEFAULTS=0) keeps 6144.

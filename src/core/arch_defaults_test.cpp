@@ -408,6 +408,25 @@ int main() {
         put("STRATA_GFX1151_DEFAULTS", "0");   // back to the state this block found (the 026 checks below rely on it)
     }
 #endif
+    // the registered arena asks for no transparent huge pages on an integrated gfx11 GPU under Linux (780M, 880M / 890M, Strix Halo),
+    // detected from the device (integrated + arch), with or without the target-feature suffix; never on Windows, never on a discrete card
+    for (const char* g : {"gfx1103", "gfx1150", "gfx1151", "gfx1103:sramecc-:xnack-", "gfx1151:sramecc+:xnack-"}) {
+        CHECK(igpu_arena_no_thp_default(g, true, false));
+        CHECK(!igpu_arena_no_thp_default(g, true, true));     // Windows: unchanged
+        CHECK(!igpu_arena_no_thp_default(g, false, false));   // not integrated
+    }
+    for (const char* g : {"gfx1152", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1036", "gfx11030", "gfx11031", "", "gfx90a"})
+        CHECK(!igpu_arena_no_thp_default(g, true, false));
+    // STRATA_NO_ARENA_THP: unset = the device rule decides; "0" = ask for the huge pages (also on such a device); any other value = skip them
+    CHECK(arena_skip_thp_request(nullptr, false, true));      // integrated gfx11, nothing set: skipped
+    CHECK(!arena_skip_thp_request(nullptr, false, false));    // any other device, nothing set: requested (as before)
+    CHECK(!arena_skip_thp_request("0", false, true));         // the user asks for them on the integrated gfx11
+    CHECK(!arena_skip_thp_request("0", false, false));
+    CHECK(arena_skip_thp_request("1", false, false));         // =1 skips on any device (as before)
+    CHECK(arena_skip_thp_request("1", false, true));
+    CHECK(arena_skip_thp_request("", false, false));          // set but empty: skipped, as before
+    CHECK(arena_skip_thp_request(nullptr, true, false));      // THP "always": never requested (#771)
+    CHECK(arena_skip_thp_request("0", true, true));
     // 021-minipc: UMA mode is NOT a default (slower, resets not fixed): off with nothing asked; the logic below runs with on=true
     CHECK(!kIgpuUmaArenaDefaultOn);
     CHECK(!igpu_uma_arena_default("gfx1103", true, false));

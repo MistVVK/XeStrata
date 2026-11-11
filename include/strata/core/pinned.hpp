@@ -38,6 +38,12 @@ inline std::atomic<bool>& arena_uma_no_register_flag() {
     static std::atomic<bool> f{false};
     return f;
 }
+/// the engine sets this on an integrated gfx11 GPU under Linux (arch_defaults.hpp, igpu_arena_no_thp_default): the arena
+/// then asks for no transparent huge pages (as STRATA_NO_ARENA_THP=1), unless STRATA_NO_ARENA_THP=0 asks for them.
+inline std::atomic<bool>& arena_no_thp_flag() {
+    static std::atomic<bool> f{false};
+    return f;
+}
 /// True when the arena is to stay unregistered: STRATA_ARENA_PIN_GIB=none always, otherwise the flag above unless the user set
 /// STRATA_ARENA_PIN_GIB to a number (STRATA_ARENA_PIN_GIB=0 registers the whole arena as before).
 bool arena_no_register();
