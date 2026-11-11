@@ -4875,12 +4875,23 @@ int main(int argc, char** argv) {
         }
         strata::kernels::cpu::cpu_require_expert_support();
     } else if (!strata::kernels::cpu::cpu_vnni_ok())
+#if defined(__aarch64__)
+        // arm64: every x86 test above is false, so say which expert pool this build links (the line is a [DRAFT]
+        // until the owner words it, par\OWNER-WORDING-1111.md "ARM POOL")
+        std::fprintf(stderr, "strata generate: [DRAFT] CPU expert kernels: %s\n",
+#if defined(STRATA_OWN_CPU_QUANT)
+                     "the Strata quant layer (NEON)");
+#else
+                     "ggml-cpu (NEON)");
+#endif
+#else
         std::fprintf(stderr, "strata generate: CPU expert kernels: %s\n",
                      !strata::kernels::cpu::cpu_avx2_ok()
                          ? (strata::kernels::cpu::cpu_avx1_ok() && std::getenv("STRATA_NO_IQ128") == nullptr
                             ? "AVX1 (older-CPU build)"
                             : "ggml-cpu (older-CPU build)")
                      : std::getenv("STRATA_NO_IQ256") == nullptr ? "AVX-2" : "ggml-cpu (STRATA_NO_IQ256 set)");
+#endif
     // the compiled shape; a native model's file replaces it below with its own metadata (read_geometry), which a
     // pruned variant (GSQ-RCO Coder, fewer than 512 experts) differs from
     strata::core::ModelGeometry g = strata::core::kCompiledGeometry;
