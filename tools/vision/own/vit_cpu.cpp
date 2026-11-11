@@ -2,7 +2,9 @@
 #include "vit_cpu.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <thread>
@@ -12,7 +14,9 @@ namespace strata_vit {
 namespace {
 
 constexpr int kKC = 256;        // the k block of a matrix product: a packed weight panel is kKC x (2 tiles) floats
-constexpr int kQB = 48;         // query rows of an attention task (a multiple of every tier's MR)
+constexpr int kQB = 48;         // the unit of query rows of an attention task (a multiple of every tier's MR)
+constexpr int kQBDefault = 96;  // query rows of an attention task: every task streams all of a head's K and V once, so 96 halves that traffic against 48
+                                // (MSVC, Ryzen 5 7600, big1024: 0.988 of mtmd-CPU's time against 1.000 with 48 in the same session; RESULTS-OWN-3V.md D2)
 constexpr int kTK = 256;        // keys per attention tile
 constexpr int kRowsChunk = 4096;   // rows of the activations that are live at once outside the attention
 
@@ -195,6 +199,17 @@ bool VitCpu::encode(const PreparedImage& img, int threads, std::vector<float>& r
     int nth = threads > 0 ? threads : (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency() / 2));
     if (!m.team || m.team_threads != nth) { m.team.reset(new Team(nth)); m.team_threads = nth; }
     const CpuOps& ops = *m.ops;
+    // STRATA_VIT_PROF=1 (a diagnostic, stderr only, off by default): the time of each stage (every stage ends with its team run, so no extra wait)
+    static const bool prof = std::getenv("STRATA_VIT_PROF") != nullptr;
+    double pt[12] = {0};
+    auto pclock = [] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    double pmark = prof ? pclock() : 0.0;
+    auto stage = [&](int s) {
+        if (!prof) return;
+        const double t = pclock();
+        pt[s] += t - pmark;
+        pmark = t;
+    };
     const int pw = img.w / P, ph = img.h / P, N = pw * ph, nbx = pw / 2;
     nx = pw / 2;
     ny = ph / 2;
@@ -261,6 +276,7 @@ bool VitCpu::encode(const PreparedImage& img, int threads, std::vector<float>& r
             for (int j = 0; j < quarter; ++j) { const float a = (float) p * inv[(size_t) j]; cc[(size_t) p * quarter + j] = std::cos(a); cs[(size_t) p * quarter + j] = std::sin(a); }
     }
     const float kq_scale = 1.0f / std::sqrt((float) HD);
+    stage(0);
 
     // ---- the layers ----
     const size_t slack = 256;                                    // the product with V reads up to a tile past a head's columns
@@ -269,8 +285,14 @@ bool VitCpu::encode(const PreparedImage& img, int threads, std::vector<float>& r
     std::vector<float> KT((size_t) H * HD * Np, 0.0f);
     std::vector<float> hbuf((size_t) R * D), up((size_t) R * F);
     const int OD = (HD + 15) / 16 * 16;
-    const int attn_tasks_q = (N + kQB - 1) / kQB;
-    std::vector<std::vector<float>> sscr((size_t) nth, std::vector<float>((size_t) kQB * kTK + (size_t) kQB * OD + 2 * kQB));
+    // Attention layout (RESULTS-OWN-3V.md D2): V packed per head (VP[h][j][d], rows of HD floats) instead of read in place from the qkv rows (a 3,456-float
+    // stride: one cache line used per row and key); and queries per task. Both change only addresses and the grouping of query rows (every query row's
+    // sums run in the same order), so the results are bit-identical.  STRATA_VIT_CPU_VPACK=0 / STRATA_VIT_CPU_QB=<multiple of 48>: diagnostics.
+    static const bool vpack = [] { const char* e = std::getenv("STRATA_VIT_CPU_VPACK"); return !(e && std::atoi(e) == 0); }();
+    static const int QB = [] { const char* e = std::getenv("STRATA_VIT_CPU_QB"); const int v = e ? std::atoi(e) : 0; return v >= kQB && v % kQB == 0 ? v : kQBDefault; }();
+    const int attn_tasks_q = (N + QB - 1) / QB;
+    std::vector<float> VP(vpack ? (size_t) H * N * HD + slack : 0);
+    std::vector<std::vector<float>> sscr((size_t) nth, std::vector<float>((size_t) QB * kTK + (size_t) QB * OD + 2 * QB));
     const size_t D3 = (size_t) 3 * D;
 
     for (const Layer& L : m.layers) {
@@ -281,6 +303,7 @@ bool VitCpu::encode(const PreparedImage& img, int threads, std::vector<float>& r
             m.round_inplace(hbuf.data(), (size_t) rn * D, m.act_round);
             m.linear(L.qkv, hbuf.data(), (size_t) D, rn, qkv.data() + (size_t) r0 * D3, D3, 0, L.qkv_b.data(), false, scratch);
         }
+        stage(1);
         m.rows_par(N, [&](int t) {       // the rotary on q and k (with the attention's scale on q, after the optional 16-bit rounding)
             float* row = qkv.data() + (size_t) t * D3;
             const float* c1 = &rc[(size_t) ty[(size_t) t] * quarter];
@@ -309,45 +332,59 @@ bool VitCpu::encode(const PreparedImage& img, int threads, std::vector<float>& r
                     const float* kr = qkv.data() + (size_t) j * D3 + D + (size_t) hh * HD;
                     float* kt = KT.data() + (size_t) hh * HD * Np + j;
                     for (int d = 0; d < HD; ++d) kt[(size_t) d * Np] = kr[d];
+                    if (vpack) std::memcpy(VP.data() + ((size_t) hh * N + j) * HD, kr + D, sizeof(float) * (size_t) HD);   // v follows k in the row
                 }
             });
         }
+        stage(2);
         // tiled attention with an online softmax: a task is a head and a block of kQB queries
         m.team->run(H * attn_tasks_q, [&](int task, int thr) {
-            const int hh = task / attn_tasks_q, q0 = (task % attn_tasks_q) * kQB, qr = std::min(kQB, N - q0);
+            const int hh = task / attn_tasks_q, q0 = (task % attn_tasks_q) * QB, qr = std::min(QB, N - q0);
             float* S = sscr[(size_t) thr].data();
-            float* O = S + (size_t) kQB * kTK;
-            float* mx = O + (size_t) kQB * OD;
-            float* ls = mx + kQB;
-            std::memset(O, 0, sizeof(float) * (size_t) kQB * OD);
-            for (int r = 0; r < kQB; ++r) { mx[r] = -3.0e38f; ls[r] = 0.0f; }
+            float* O = S + (size_t) QB * kTK;
+            float* mx = O + (size_t) QB * OD;
+            float* ls = mx + QB;
+            std::memset(O, 0, sizeof(float) * (size_t) QB * OD);
+            for (int r = 0; r < QB; ++r) { mx[r] = -3.0e38f; ls[r] = 0.0f; }
+            double ta = 0.0, tb = 0.0, tc = 0.0;
+            const bool pa = prof && thr == 0;      // the split of the attention, sampled on the calling thread's tasks
+            double t0 = pa ? pclock() : 0.0;
             const float* Q = qkv.data() + (size_t) q0 * D3 + (size_t) hh * HD;
             const float* KTh = KT.data() + (size_t) hh * HD * Np;
-            const float* Vh = qkv.data() + 2 * (size_t) D + (size_t) hh * HD;
+            const float* Vh = vpack ? VP.data() + (size_t) hh * N * HD : qkv.data() + 2 * (size_t) D + (size_t) hh * HD;
+            const size_t ldv = vpack ? (size_t) HD : D3;
             for (int j0 = 0; j0 < N; j0 += kTK) {
                 const int tk = std::min(kTK, N - j0);
                 ops.gemm(Q, D3, qr, KTh + j0, (size_t) Np, HD, tk, S, (size_t) kTK, 0, nullptr);
+                if (pa) { const double t = pclock(); ta += t - t0; t0 = t; }
                 ops.softmax_update(S, (size_t) kTK, qr, tk, mx, ls, O, (size_t) OD, HD);
-                ops.gemm(S, (size_t) kTK, qr, Vh + (size_t) j0 * D3, D3, tk, HD, O, (size_t) OD, 1, nullptr);
+                if (pa) { const double t = pclock(); tb += t - t0; t0 = t; }
+                ops.gemm(S, (size_t) kTK, qr, Vh + (size_t) j0 * ldv, ldv, tk, HD, O, (size_t) OD, 1, nullptr);
+                if (pa) { const double t = pclock(); tc += t - t0; t0 = t; }
             }
+            if (pa) { pt[8] += ta; pt[9] += tb; pt[10] += tc; pt[11] += 1.0; }
             for (int r = 0; r < qr; ++r) {
                 const float inv = 1.0f / ls[r];
                 float* dst = ctx.data() + (size_t) (q0 + r) * D + (size_t) hh * HD;
                 for (int d = 0; d < HD; ++d) dst[d] = O[(size_t) r * OD + d] * inv;
             }
         });
+        stage(3);
         m.round_inplace(ctx.data(), ctx.size(), m.act_round);
         for (int r0 = 0; r0 < N; r0 += R) {      // x += o(ctx)
             const int rn = std::min(R, N - r0);
             m.linear(L.o, ctx.data() + (size_t) r0 * D, (size_t) D, rn, x.data() + (size_t) r0 * D, (size_t) D, 2, L.o_b.data(), false, scratch);
         }
+        stage(4);
         for (int r0 = 0; r0 < N; r0 += R) {      // x += down(gelu(up(LN2 x)))
             const int rn = std::min(R, N - r0);
             m.rows_par(rn, [&](int i) { ops.layernorm(x.data() + (size_t) (r0 + i) * D, hbuf.data() + (size_t) i * D, D, L.ln2_w.data(), L.ln2_b.data(), g.eps); });
             m.round_inplace(hbuf.data(), (size_t) rn * D, m.act_round);
             m.linear(L.up, hbuf.data(), (size_t) D, rn, up.data(), (size_t) F, 0, L.up_b.data(), true, scratch);
             m.round_inplace(up.data(), (size_t) rn * F, m.act_round);
+            stage(5);
             m.linear(L.down, up.data(), (size_t) F, rn, x.data() + (size_t) r0 * D, (size_t) D, 2, L.down_b.data(), false, scratch);
+            stage(6);
         }
     }
 
@@ -365,6 +402,11 @@ bool VitCpu::encode(const PreparedImage& img, int threads, std::vector<float>& r
         m.round_inplace(m1.data(), (size_t) rn * Hid, m.act_round);
         m.linear(m.mm2, m1.data(), (size_t) Hid, rn, rows.data() + (size_t) r0 * O, (size_t) O, 0, m.mm2_b.data(), false, scratch);
     }
+    stage(7);
+    if (prof)
+        std::fprintf(stderr, "vit-cpu-prof N=%d threads=%d isa=%s: patch+pos %.1f, ln+qkv %.1f, rope+KT %.1f, attention %.1f (thread 0, %d tasks: QK %.1f, softmax %.1f, PV %.1f), "
+                             "o-proj %.1f, ln+up+gelu %.1f, down %.1f, post+merger %.1f ms\n",
+                     N, nth, ops.name, pt[0], pt[1], pt[2], pt[3], (int) pt[11], pt[8], pt[9], pt[10], pt[4], pt[5], pt[6], pt[7]);
     return true;
 }
 
