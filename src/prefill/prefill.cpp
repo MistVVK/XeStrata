@@ -114,8 +114,9 @@ bool ple_batch_enabled() {
 #include <utility>
 #include <vector>
 
-#ifndef STRATA_PREFILL_MMQ
-// A build without the llama.cpp sources (no STRATA_NATIVE_EXPERTS): no MMQ, the FP16 expert path everywhere.
+#if !defined(STRATA_PREFILL_MMQ) && !defined(STRATA_PREFILL_FUSED)
+// A build without the llama.cpp sources (no STRATA_NATIVE_EXPERTS): no MMQ, the FP16 expert path everywhere.  (P4-SPLIT: a build with
+// Strata's own prompt kernels but no MMQ, -DSTRATA_MMQ=OFF, has the real helpers and src/prefill/mmq_absent.cpp instead.)
 #include "strata/core/geometry.hpp"
 
 namespace strata::prefill::mmq {
@@ -173,6 +174,39 @@ void experts_native(const WideBatch&, const NativeGeom&, int, int64_t, const voi
 void set_down_rotation(bool, const float*) {}
 void hadamard128_rows(float*, int64_t, int64_t, const float*, void*) {}
 }  // namespace strata::prefill::fused
+#endif
+#if defined(STRATA_PREFILL_FUSED) && !defined(STRATA_PREFILL_MMQ)
+// P4-SPLIT: built with Strata's own prompt kernels and without llama.cpp's MMQ (-DSTRATA_MMQ=OFF, or HIP without STRATA_PREFILL_MMQ)
+#define STRATA_PF_OWN_ONLY 1
+namespace {
+// Such an engine takes Strata's fused kernels wherever they exist for the card and the layer's formats, so the opt-in switches of those
+// kernels are on by default here (a switch the user set, either value, is kept); every other layer takes the FP16 path.  Set before main(),
+// so the first reader of each (the engine's start-up rules, the kernels' own static reads) sees it.  Listed once in the prompt path's line.
+std::vector<std::string>& own_only_switches() {
+    static std::vector<std::string> set;
+    return set;
+}
+const bool g_own_only_defaults = [] {
+#if defined(STRATA_USE_HIP) || defined(__HIPCC__)
+    static const char* const kOn[] = {"STRATA_PF_FUSED", "STRATA_PF_FUSED_Q50", "STRATA_PF_FUSED_KQ"};
+#else
+    // (not STRATA_PF_FUSED_Q2N: the GGUF Q2_0 / Q2_0 pair on sm_80+ misses its worst-row bound against MMQ at 20K / 32K tokens on sm_86,
+    // not explained yet; those layers take the FP16 path here unless the user sets it)
+    static const char* const kOn[] = {"STRATA_PF_FUSED", "STRATA_PF_FUSED_Q50", "STRATA_PF_FUSED_Q8D", "STRATA_PF_FUSED_Q8GU",
+                                      "STRATA_PF_FUSED_Q6K", "STRATA_PF_FUSED_KQ", "STRATA_PF_FUSED_TQ", "STRATA_PF_FUSED_SM75"};
+#endif
+    for (const char* k : kOn) {
+        if (std::getenv(k) != nullptr) continue;
+#if defined(_WIN32)
+        _putenv_s(k, "1");
+#else
+        setenv(k, "1", 0);
+#endif
+        own_only_switches().push_back(k);
+    }
+    return true;
+}();
+}  // namespace
 #endif
 #ifndef STRATA_PREFILL_WS
 // the weight-stationary experts (moe_ws.hpp) are in the CUDA STRATA_EXPERIMENTAL_SM60 build only
@@ -1526,7 +1560,7 @@ struct MmqPlan {
 // q8_1, so the answers differ from the default).  Only when EVERY visible CUDA card is compute capability 7.0 or
 // newer: the tiles need tensor cores, and a Volta + Pascal rig (one process, one decision) keeps MMQ.
 bool pf_wmma() {
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) || defined(STRATA_PF_OWN_ONLY)   // (P4-SPLIT: its layers ride MMQ's grouping)
     return false;
 #else
     static const bool on = [] {
@@ -1548,7 +1582,11 @@ const MmqPlan& mmq_plan() {
         MmqPlan p;
         const auto& lay = strata::kernels::cpu::expert_layout();
         const char* env = std::getenv("STRATA_PREFILL_MMQ");
+#if defined(STRATA_PF_OWN_ONLY)
+        const bool on = fused::built() && (env == nullptr || std::atoi(env) != 0);   // P4-SPLIT: no MMQ tile anywhere, the fused-only layers below
+#else
         const bool on = mmq::built() && (env == nullptr || std::atoi(env) != 0);
+#endif
         const int64_t layers = lay.native ? (int64_t) lay.fmt.size() : lay.n_layers;
         p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);
         p.fo.assign(p.layer.size(), 0);
@@ -1576,6 +1614,9 @@ const MmqPlan& mmq_plan() {
                 p.fallback = true;
                 // the fused path's buffers (Xq, H) exist for it; a chunk it does not take (a small one) keeps the FP16 path
                 if (on && lay.native && fused::native_supported(gt, dt)) { p.fo[(size_t) l] = 1; p.any = true; }
+#if defined(STRATA_PF_OWN_ONLY)
+                if (on && !lay.native && fused::enabled()) { p.fo[(size_t) l] = 1; p.any = true; }   // the Strata Q2_0 pack (moe_fused.cu)
+#endif
                 if (mf) {
                     const bool fo = p.fo[(size_t) l] != 0;
                     const std::string why = std::string(!mmq::fits(gt, kFF2) ? "no MMQ tile for the gate/up format on every visible GPU" : "no MMQ tile for the down format on every visible GPU") +
@@ -1605,6 +1646,18 @@ const MmqPlan& mmq_plan() {
                                                         k.substr(a + 1, b - a - 1), kind + ", " + std::to_string(n) + " layers");
             }
         }
+#if defined(STRATA_PF_OWN_ONLY)
+        {   // [DRAFT] wording: the owner's to word (P4-SPLIT); one line per process, the plan is made once
+            int64_t nf = 0;
+            for (char c : p.fo) nf += c != 0;
+            std::string sw;
+            for (const std::string& k : own_only_switches()) sw += (sw.empty() ? "" : " ") + k;
+            std::fprintf(stderr, "strata: [DRAFT] this engine was built without llama.cpp's MMQ prompt kernels. Prompt experts use Strata's own "
+                                 "kernels for %lld of %lld layers; the other layers, prompt pieces under %lld tokens and --peer-device use the "
+                                 "slower FP16 path. Switched on for this: %s (a switch you set is kept).\n",
+                         (long long) nf, (long long) layers, (long long) stream_all_min(), sw.empty() ? "none" : sw.c_str());
+        }
+#endif
         // STRATA_MMQ_DIRECT=1: a native layer's resident experts are read in place when the pointer-table MMQ covers
         // both products, gate/up reads nothing past its matrix, the down over-read fits the slot guard, and the blob
         // is exactly [gate | up | down] in MMQ's matrix sizes (the bytes a gather would copy)
@@ -2502,6 +2555,9 @@ bool Prefill::set_stage_helper(Prefill* helper, std::string& err) {
     if (helper == nullptr || helper == this || !split_help_env()) return true;
     const Impl& h = *helper->impl_;
     if (m.device < 0 || h.device < 0 || h.device == m.device || !mmq_plan().any) return true;
+#if defined(STRATA_PF_OWN_ONLY)
+    return true;   // (P4-SPLIT: the helper stage computes on MMQ only)
+#endif
     auto pp = std::make_unique<PeerPrefill>();
     pp->peer = nullptr;   // stream-only: it holds no experts, it streams a share of this stage's
     pp->compact = true;
@@ -2609,6 +2665,10 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     // (STRATA_PF_PEER_HOST=0: refuse as before, the prompt path then stays on the primary)
     const bool host_route_ok = [] { const char* v = std::getenv("STRATA_PF_PEER_HOST"); return v == nullptr || std::atoi(v) != 0; }();
     if (!peer->p2p() && !host_route_ok) { err = "prefill peer: the two GPUs cannot access each other (no P2P)"; return false; }
+#if defined(STRATA_PF_OWN_ONLY)
+    err = "prefill peer: needs the MMQ prompt path (this engine was built without it)";
+    return false;
+#endif
     if (!mmq_plan().any) { err = "prefill peer: needs the MMQ prompt path"; return false; }
     {   // NVFP4: the peer's MMQ products have no per-expert scales (grp_tail, row_sd); its decode rows do
         const auto& lay = strata::kernels::cpu::expert_layout();
@@ -4777,7 +4837,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                          (!had_gu || m.Xr != nullptr);
                     const bool fused_nat = (use_mmq || fused_only) && stream_all && no_peer && lay.native && ((!had_gu && !had_d) || fold_ok) &&
                                            fused::native_supported(mmq_gt, mmq_dt);
+#if defined(STRATA_PF_OWN_ONLY)
+                    const bool fused_l = ((use_mmq || fused_only) && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
+#else
                     const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
+#endif
                     bool dm16_used = false;   // STRATA_PF_DM16: this layer's down rows are FP16 (fused::dm_f16_used() after the experts)
                     bool fz_staged_l = false;   // P4-SMALL: this staged chunk's groups ran on the fused kernels (GU / H hold their tables and int8 rows)
                     if (m.group_cap > 0 && (fused_l || !use_mmq)) {   // GU / H / Hq are one group's size

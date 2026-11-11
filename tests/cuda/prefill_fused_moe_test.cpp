@@ -275,7 +275,8 @@ void reference_part(cudaStream_t s) {
     // the uploads (legacy stream) must land before the non-blocking stream reads them (S20 found the kernels could run
     // on all-zero routing otherwise - every pair on one expert: fast and wrong)
     ck(cudaDeviceSynchronize(), "uploads");
-    run_mmq(ctx, mb, r, x_dev.as<float>(), src_dev.as<int32_t>(), blob, rows, s);
+    const bool mq = mmq::built();   // (P4-SPLIT: a build without MMQ checks the fused path against the reference alone)
+    if (mq) run_mmq(ctx, mb, r, x_dev.as<float>(), src_dev.as<int32_t>(), blob, rows, s);
     FusedBufs fb(T, rows, E);
     ck(cudaMemcpy(fb.ids.p, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice), "ids");
     ck(cudaMemset(fb.dm.p, 0xff, (size_t) rows * N * 4), "sentinel");   // an unwritten row is NaN
@@ -320,17 +321,21 @@ void reference_part(cudaStream_t s) {
     auto pair = [](size_t i) { return (int64_t) i; };
     auto mrow = [&](size_t i) { return (int64_t) r.row_of[i]; };
     auto frow = [&](size_t i) { return (int64_t) slot[i]; };
-    const Err em = compare(y_mmq, mrow, ref, pair, (size_t) rows);
+    const Err em = mq ? compare(y_mmq, mrow, ref, pair, (size_t) rows) : Err{};
     const Err ef = compare(y_f, frow, ref, pair, (size_t) rows);
-    const Err efm = compare(y_f, frow, y_mmq, mrow, (size_t) rows);
-    std::printf("  MMQ   vs FP32 reference: rel RMS %.3e  worst row max rel %.3e\n", em.rms, em.worst);
+    const Err efm = mq ? compare(y_f, frow, y_mmq, mrow, (size_t) rows) : Err{};
+    if (mq) std::printf("  MMQ   vs FP32 reference: rel RMS %.3e  worst row max rel %.3e\n", em.rms, em.worst);
     std::printf("  fused vs FP32 reference: rel RMS %.3e  worst row max rel %.3e\n", ef.rms, ef.worst);
-    std::printf("  fused vs MMQ           : rel RMS %.3e  worst row max rel %.3e\n", efm.rms, efm.worst);
+    if (mq) std::printf("  fused vs MMQ           : rel RMS %.3e  worst row max rel %.3e\n", efm.rms, efm.worst);
     double zmax = 0;
     for (int k = 0; k < K; ++k)
         for (int o = 0; o < N; ++o)
             zmax = std::max(zmax, (double) std::fabs(y_f[(size_t) slot[(size_t) (ZERO * K + k)] * N + o]));
     if (zmax != 0) throw std::runtime_error("the all-zero token's outputs are not zero");
+    if (!mq) {   // no MMQ here: the int8 activations' own error, prefill_fused_iq_test's bound for the same case
+        if (ef.rms > 0.03 || ef.worst > 0.25) throw std::runtime_error("the fused path's error against the reference is too large");
+        return;
+    }
     if (ef.rms > 1.5 * em.rms || ef.worst > 2.0 * em.worst)
         throw std::runtime_error("the fused path's error is not comparable to MMQ's");
 }
@@ -380,7 +385,8 @@ void timing_part(cudaStream_t s) {
         return ms[ms.size() / 2];
     };
     // the engine's batches: up to 128 experts per launch (the streamed ring decides; 4 launches here)
-    const float t_mmq = time([&] { run_mmq(ctx, mb, r, x_dev.as<float>(), src_dev.as<int32_t>(), blob, rows, s); });
+    const bool mq = mmq::built();   // (P4-SPLIT: without MMQ the fused times alone)
+    const float t_mmq = mq ? time([&] { run_mmq(ctx, mb, r, x_dev.as<float>(), src_dev.as<int32_t>(), blob, rows, s); }) : 0.0f;
     const float t_f = time([&] { run_fused(fb, x_dev.as<float>(), T, E, {0, E}, blob, s); });
     const float t_f1 = time([&] {   // one launch per 16 experts, MMQ's group size
         std::vector<int> cuts;
@@ -399,7 +405,7 @@ void timing_part(cudaStream_t s) {
     std::printf("  fused vs MMQ: rel RMS %.3e  worst row max rel %.3e\n", efm.rms, efm.worst);
     cudaEventDestroy(a);
     cudaEventDestroy(b);
-    if (efm.rms > 0.05) throw std::runtime_error("the paths disagree at the real shape");
+    if (mq && efm.rms > 0.05) throw std::runtime_error("the paths disagree at the real shape");
 }
 }  // namespace
 
@@ -408,7 +414,7 @@ int main(int argc, char** argv) {
         int n = 0;
         if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) { std::printf("no CUDA device: skipped\n"); return 77; }
         if (!fused::available()) { std::printf("the fused kernels need sm_80 or newer: skipped\n"); return 77; }
-        if (!mmq::built()) { std::printf("no MMQ in this build\n"); return 1; }
+        if (!mmq::built()) std::printf("no MMQ in this build: the fused path against the FP32 reference alone\n");
         cudaStream_t s = nullptr;
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
         reference_part(s);

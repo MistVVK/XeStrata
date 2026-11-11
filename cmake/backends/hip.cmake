@@ -42,11 +42,14 @@ macro(strata_hip_mmq)
     # Aurora: moe_fused.cu's gfx11 and moe_fused_iq.cu's gfx11 / gfx12 WMMA kernels for the prompt experts (opt-in STRATA_PF_FUSED=1)
     set(_strata_mmq_sources
       src/prefill/moe_mmq.cu
+      src/prefill/ggml_cuda_host.cu
+      "${_strata_quantize_cu}")
+    # P4-SPLIT: Strata's own prompt kernels in a library of their own (strata_pf_own, as on CUDA)
+    set(_strata_pf_own_sources
       src/prefill/moe_fused.cu
       src/prefill/moe_fused_iq.cu
       src/prefill/moe_f16_kq.cu
-      src/prefill/ggml_cuda_host.cu
-      "${_strata_quantize_cu}")
+      src/prefill/moe_helpers.cu)   # the gathers, SwiGLU passes and row table (cut from moe_mmq.cu)
     if(STRATA_MMQ_KQUANTS)
       # the same K-quant instances as the CUDA branch: on HIP they serve the dense GGUF projections
       # of Gemm::native (STRATA_DENSE_MMQ=1), the mixed-quant packs' attention/PLE tensors
@@ -60,11 +63,12 @@ macro(strata_hip_mmq)
         list(APPEND _strata_mmq_sources "${_strata_tq_overlay_dir}/template-instances/mmq-instance-${_t}.cu")
       endforeach()
     endif()
-    set_source_files_properties(${_strata_mmq_sources} PROPERTIES LANGUAGE HIP)
+    set_source_files_properties(${_strata_mmq_sources} ${_strata_pf_own_sources} PROPERTIES LANGUAGE HIP)
     # moe_fused.cu is Strata's own CUDA-shaped source: it takes the HIP compat headers, ggml's MMQ sources do not
-    set_source_files_properties(src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu src/prefill/moe_f16_kq.cu
+    set_source_files_properties(${_strata_pf_own_sources}
                                 PROPERTIES INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
     add_library(strata_mmq STATIC ${_strata_mmq_sources})
+    add_library(strata_pf_own STATIC ${_strata_pf_own_sources})
     target_include_directories(strata_mmq
       PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
       PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -85,18 +89,54 @@ macro(strata_hip_mmq)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_TQP=1)
     endif()
     target_link_libraries(strata_mmq PUBLIC ggml-base hip::host roc::hipblas)
+    strata_pf_own_mirror()
+    target_link_libraries(strata_pf_own PUBLIC ggml-base hip::host roc::hipblas)
+    target_link_libraries(strata_mmq PUBLIC strata_pf_own)
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1 STRATA_PREFILL_FUSED=1)
+    set(_strata_pf_tests_lib strata_mmq)
+endmacro()
+
+# P4-SPLIT, HIP without llama.cpp's MMQ (STRATA_PREFILL_MMQ off, or -DSTRATA_MMQ=OFF): Strata's own prompt kernels alone (strata_pf_own, with
+# mmq_absent.cpp for the MMQ half of moe_mmq.hpp), compiled as strata_hip_mmq compiles them, with the ggml-base headers only
+macro(strata_hip_pf_own)
+    set(_strata_gg "${_strata_ggml_root}/ggml")
+    set(_strata_pf_own_sources
+      src/prefill/moe_fused.cu
+      src/prefill/moe_fused_iq.cu
+      src/prefill/moe_f16_kq.cu
+      src/prefill/moe_helpers.cu)
+    set_source_files_properties(${_strata_pf_own_sources} PROPERTIES LANGUAGE HIP INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
+    add_library(strata_pf_own STATIC ${_strata_pf_own_sources} src/prefill/mmq_absent.cpp)
+    target_include_directories(strata_pf_own PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_definitions(strata_pf_own PRIVATE GGML_USE_HIP=1)
+    target_link_libraries(strata_pf_own PUBLIC ggml-base hip::host roc::hipblas)
+    target_link_libraries(strata_prefill PUBLIC strata_pf_own)
+    target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_FUSED=1)
+    set(_strata_pf_tests_lib strata_pf_own)
+    message(STATUS "Strata: no llama.cpp MMQ prompt kernels (HIP): Strata's own prompt kernels and the FP16 path")
+endmacro()
+
+# the prompt kernels' tests on HIP: the fused experts' (linked to ${_strata_pf_tests_lib}) and, with MMQ, MMQ's own
+macro(strata_hip_prompt_tests)
+    if(NOT TARGET strata_mmq)
+      # P4-SPLIT: the engine and Strata's prompt library hold none of llama.cpp's MMQ (names in the bytes, nm; tools/check_no_mmq.py)
+      find_package(Python3 QUIET COMPONENTS Interpreter)
+      if(Python3_Interpreter_FOUND)
+        add_test(NAME no_mmq_symbols COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_no_mmq.py $<TARGET_FILE:strata> $<TARGET_FILE:strata_pf_own>)
+        set_tests_properties(no_mmq_symbols PROPERTIES TIMEOUT 900)
+      endif()
+    endif()
     # Aurora: the gfx11 fused experts against the FP64 reference and MMQ (tests/cuda's test; exit 77 off gfx11)
     add_executable(hip_prefill_fused_moe tests/cuda/prefill_fused_moe_test.cpp)
     target_include_directories(hip_prefill_fused_moe PRIVATE "${_strata_gg}/include")
-    target_link_libraries(hip_prefill_fused_moe PRIVATE strata_mmq ggml-base strata_hip_runtime)
+    target_link_libraries(hip_prefill_fused_moe PRIVATE ${_strata_pf_tests_lib} ggml-base strata_hip_runtime)
     add_test(NAME hip_prefill_fused_moe COMMAND hip_prefill_fused_moe)
     set_tests_properties(hip_prefill_fused_moe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     list(APPEND _strata_hip_tests hip_prefill_fused_moe)
     add_executable(hip_prefill_fused_iq tests/cuda/prefill_fused_iq_test.cpp)
     target_include_directories(hip_prefill_fused_iq PRIVATE "${_strata_gg}/include")
-    target_link_libraries(hip_prefill_fused_iq PRIVATE strata_mmq ggml-base strata_hip_runtime)
+    target_link_libraries(hip_prefill_fused_iq PRIVATE ${_strata_pf_tests_lib} ggml-base strata_hip_runtime)
     add_test(NAME hip_prefill_fused_iq COMMAND hip_prefill_fused_iq)
     set_tests_properties(hip_prefill_fused_iq PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     # the same binary on F16 weights (gfx11: the covered formats take moe_f16_kq.cu / native_f16_kernel; elsewhere it is the default run again)
@@ -122,14 +162,15 @@ macro(strata_hip_mmq)
     # (moe_fused_iq.cu's decode compiled as strata_mmq compiles it: its include directories, definitions and options; exit 77 without a card)
     set_source_files_properties(tests/cuda/prefill_decode_golden.cu PROPERTIES LANGUAGE HIP INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
     add_executable(hip_prefill_decode_golden tests/cuda/prefill_decode_golden.cu)
-    target_include_directories(hip_prefill_decode_golden PRIVATE $<TARGET_PROPERTY:strata_mmq,INCLUDE_DIRECTORIES>)
-    target_compile_definitions(hip_prefill_decode_golden PRIVATE $<TARGET_PROPERTY:strata_mmq,COMPILE_DEFINITIONS>)
-    target_compile_options(hip_prefill_decode_golden PRIVATE $<TARGET_PROPERTY:strata_mmq,COMPILE_OPTIONS>)
+    target_include_directories(hip_prefill_decode_golden PRIVATE $<TARGET_PROPERTY:strata_pf_own,INCLUDE_DIRECTORIES>)
+    target_compile_definitions(hip_prefill_decode_golden PRIVATE $<TARGET_PROPERTY:strata_pf_own,COMPILE_DEFINITIONS>)
+    target_compile_options(hip_prefill_decode_golden PRIVATE $<TARGET_PROPERTY:strata_pf_own,COMPILE_OPTIONS>)
     target_link_libraries(hip_prefill_decode_golden PRIVATE ggml-base strata_hip_runtime)
     add_test(NAME hip_prefill_decode_golden COMMAND hip_prefill_decode_golden ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda/prefill_decode_golden.txt)
     set_tests_properties(hip_prefill_decode_golden PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
     list(APPEND _strata_hip_tests hip_prefill_decode_golden)
 
+    if(TARGET strata_mmq)   # (P4-SPLIT: MMQ's own)
     # Numerical diagnostic: synthetic layouts by default, optional first-expert IQ3_XXS/IQ4_NL check with a pack.
     add_executable(hip_prefill_mmq_parity tests/hip/prefill_mmq_parity.cpp)
     target_include_directories(hip_prefill_mmq_parity PRIVATE "${_strata_gg}/include")
@@ -137,6 +178,7 @@ macro(strata_hip_mmq)
     add_test(NAME hip_prefill_mmq_parity COMMAND hip_prefill_mmq_parity)
     set_tests_properties(hip_prefill_mmq_parity PROPERTIES TIMEOUT 120)
     list(APPEND _strata_hip_tests hip_prefill_mmq_parity)
+    endif()
 endmacro()
 
 # HIP gfx906: every CUDA source of the tree (and the ggml-cuda MMQ sources) compiled as HIP
@@ -148,6 +190,7 @@ if(STRATA_HIP_GFX906)
     file(GLOB _strata_mmq_cu ${_strata_mmq}/*.cu ${_strata_mmq}/template-instances/*.cu)
     list(APPEND _strata_cu ${_strata_mmq_cu})
     target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP)
+    target_compile_definitions(strata_pf_own PRIVATE GGML_USE_HIP)   # (P4-SPLIT: the files that were in strata_mmq keep its definitions)
     # #3172: strata_mmq_w4a4 is built from llama.cpp's headers too; without GGML_USE_HIP its common.cuh took the CUDA vendor header
     # (cuda.h, cuda_bf16.h: not found). Here it only reports that W4A4 (RTX 50's FP4 MMA) is not available.
     if(TARGET strata_mmq_w4a4)
@@ -164,7 +207,7 @@ if(STRATA_HIP_GFX906)
       endforeach()
       list(APPEND _strata_cu ${_strata_tq_hip})
     endif()
-    target_sources(strata_mmq PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_f16_kq.cu)
+    target_sources(strata_pf_own PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_f16_kq.cu)   # (Strata's own: beside moe_fused_iq.cu)
   endif()
   set_source_files_properties(${_strata_cu} PROPERTIES LANGUAGE HIP)
 endif()
