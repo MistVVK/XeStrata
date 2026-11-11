@@ -25786,13 +25786,20 @@
   {
    "name": "STRATA_PF_FUSED_Q8D",
    "backends": [
-    "cuda"
+    "cuda",
+    "hip"
    ],
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 1957,
+     "line": 2034,
      "backend": "cuda",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 2360,
+     "backend": "hip",
      "fn": "getenv"
     }
    ],
@@ -25812,7 +25819,7 @@
    "last_date": "",
    "status": "research",
    "owner": "prefill",
-   "note": "CUDA (phase 4, opt-in, default off): a Q8_0 down behind an i-quant gate/up (the pinned UD-IQ4_XS's five Q8_0-down layers) on the fused native kernels on any sm_80+ card instead of MMQ.",
+   "note": "[DRAFT] CUDA and HIP gfx12 (phase 4, opt-in, default off): a Q8_0 down behind an i-quant gate/up (the pinned UD-IQ4_XS's five Q8_0-down layers) on the fused native kernels instead of MMQ, on any sm_80+ card and on gfx1200 / gfx1201.",
    "retire_after": "",
    "retired_in": ""
   },

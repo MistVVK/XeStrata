@@ -2351,10 +2351,21 @@ bool q50_on(const DevInfo& d) {
     return false;
 #endif
 }
+#if defined(__HIPCC__)
+// STRATA_PF_FUSED_Q8D on HIP (phase 4, opt-in, gfx12 only): "1" lets a Q8_0 down behind an i-quant gate/up (the pinned UD-IQ4_XS's five Q8_0-down layers:
+// IQ3_S / Q8_0 4, IQ4_XS / Q8_0 1) take native_w11_kernel's Q8_0 down instead of MMQ, without STRATA_PF_FUSED_KQ (whose meaning is the K-quant experts).
+// The same switch as CUDA's.  No new kernel: the gfx12 int8 Q8_0 down instances exist for the K-quant route.  gfx11 keeps its own rules (q8d_f16_default,
+// STRATA_PF_F16): not measured with this switch.
+bool q8d_hip_requested() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_FUSED_Q8D"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+#endif
 bool d_covered_on(int t, const DevInfo& d) {
 #if defined(__HIPCC__)
     if (t == T_Q5_0) return d.w12 ? q50_on(d) : q50_on(d) && f16::requested();   // gfx1151 has no int8 kernel for Q5_0 down (the F16 prompt set must be on); gfx12 has only the int8 one
     if (t == T_Q8_0 && !d.w12 && (f16::requested() || q8d_f16_default(d))) return true;
+    if (t == T_Q8_0 && d.w12 && q8d_hip_requested()) return true;   // (behind an i-quant gate/up only: native_supported)
 #else
     if (t == T_Q5_0) return d.q50;   // STRATA_PF_FUSED_Q50=1 and its kernels set up (dev_info)
     if (t == T_Q5_1) return d.kq;    // STRATA_PF_FUSED_KQ=1 (behind a K-quant gate/up only: native_supported)
@@ -2541,6 +2552,11 @@ bool native_supported(int gu_type, int d_type) {
 #endif
         ) return false;
     const DevInfo& d = dev_info();
+#if defined(__HIPCC__)
+    // STRATA_PF_FUSED_Q8D=1 on gfx12 covers the Q8_0 down behind an i-quant gate/up only (as on CUDA): a Q2_0 gate/up with a Q8_0 down keeps MMQ there
+    // unless STRATA_PF_FUSED_KQ=1 (the K-quant route's wider rule, unchanged; gfx11's rules unchanged)
+    if (d.w12 && gu_type == T_Q2_0 && d_type == T_Q8_0 && !kq_on()) return false;
+#endif
     if (!d.ok || !d_covered_on(d_type, d)) return false;
     if (d.t75 && (gu_type != T_Q2_0 || d_type != T_Q2_0)) return false;
     if (env < 0) return d.w12;
