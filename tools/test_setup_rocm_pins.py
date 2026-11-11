@@ -80,7 +80,7 @@ class RocmPick(unittest.TestCase):
 
     def test_unreadable_index_keeps_the_preferred_version(self):
         self.assertEqual(setup.rocm_pick([], "7.10.0a20251120"), ("7.10.0a20251120", None))
-        with mock.patch.object(setup.urllib.request, "urlopen", side_effect=OSError("offline")):
+        with mock.patch.object(setup.netpolicy, "urlopen", side_effect=OSError("offline")):
             self.assertEqual(setup.rocm_wanted(setup.ROCM_INDEXES["gfx1030"]), ("7.13.0a20260515", None))
 
     def test_the_index_page_is_read_from_the_rocm_folder(self):
@@ -94,13 +94,13 @@ class RocmPick(unittest.TestCase):
         def fake(req, timeout=0):
             seen.append(req.full_url)
             return Resp()
-        with mock.patch.object(setup.urllib.request, "urlopen", fake):
+        with mock.patch.object(setup.netpolicy, "urlopen", fake):
             self.assertEqual(setup.rocm_wanted(setup.ROCM_INDEXES["gfx1030"])[0], "7.13.0a20260515")
         self.assertEqual(seen, ["https://rocm.nightlies.amd.com/v2/gfx103X-all/rocm/"])
 
     def test_the_override_is_exact_and_not_looked_up(self):
         with mock.patch.object(setup, "ROCM_VERSION_OVERRIDE", "7.12.0a20260311"), \
-                mock.patch.object(setup.urllib.request, "urlopen", side_effect=AssertionError("no lookup")):
+                mock.patch.object(setup.netpolicy, "urlopen", side_effect=AssertionError("no lookup")):
             self.assertEqual(setup.rocm_wanted(setup.ROCM_INDEXES["gfx1030"]), ("7.12.0a20260311", None))
         with mock.patch.object(setup, "ROCM_VERSION_OVERRIDE", "7.10.0a20251120"):      # forced, but still warned about
             version, note = setup.rocm_wanted(setup.ROCM_INDEXES["gfx1151"])

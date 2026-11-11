@@ -28,7 +28,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 
-from strata_control import shape_engine, signing, transfer
+from strata_control import netpolicy, shape_engine, signing, transfer
 from strata_control.targets import BACKEND_MATRIX, host_platform
 
 SCHEMA_VERSION = 1
@@ -53,6 +53,10 @@ class FeedError(RuntimeError):
     def __init__(self, message: str, exit_code: int = 5):
         super().__init__(message)
         self.exit_code = exit_code
+
+
+class FeedUnreachable(FeedError):
+    """The feed's host did not answer, or this computer is offline (strata_control/netpolicy.py's words): a check that runs by itself stays silent."""
 
 
 class FeedDowngrade(FeedError):
@@ -697,7 +701,7 @@ def feed_name(platform: str | None = None) -> str:
     return AARCH64_FEED_NAME if platform == "linux-aarch64" else FEED_NAME
 
 
-def fetch(source: str, trusted: dict[str, bytes], *, timeout: float = 30, **guards) -> Feed:
+def fetch(source: str, trusted: dict[str, bytes], *, timeout: float = 30, say=None, **guards) -> Feed:
     """Read the feed and its signature from `source` (an https URL, a loopback http URL, a file URL or a folder/file path)."""
     if not trusted:
         raise FeedError("this build trusts no update key (update_keys.json is empty and STRATA_UPDATE_TRUSTED_KEYS is not set), "
@@ -712,8 +716,12 @@ def fetch(source: str, trusted: dict[str, bytes], *, timeout: float = 30, **guar
     elif transfer.kind_of(source) in ("http", "https") and not source.rsplit("/", 1)[-1].endswith(".json"):
         location = source.rstrip("/") + "/" + feed_name()
     try:
-        payload = transfer.read_small(location, timeout=timeout)
-        signature = transfer.read_small(location + SIGNATURE_SUFFIX, timeout=timeout)
+        payload = transfer.read_small(location, timeout=timeout, say=say)
+        signature = transfer.read_small(location + SIGNATURE_SUFFIX, timeout=timeout, say=say)
+    except transfer.Unreachable as exc:
+        f = exc.failure                                  # the network rule (W7 and its two companions): the host, and that nothing installed is lost
+        key = {"offline": "update_offline", "again": "update_again"}.get(f.kind, "update_no_answer")
+        raise FeedUnreachable(netpolicy.WORDS[key].format(host=f.host, seconds=max(1, int(round(f.seconds)))), 6) from None
     except transfer.TransferError as exc:
         raise FeedError(f"the update feed could not be read: {exc}", 6) from None
     guards.setdefault("server_now", transfer.server_date())

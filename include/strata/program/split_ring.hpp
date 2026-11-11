@@ -33,4 +33,17 @@ inline int64_t split_lend_slots(int64_t slots, int64_t bytes, const uint64_t* of
     return max_blob == 0 ? 0 : (int64_t) ((need + max_blob - 1) / max_blob);
 }
 
+/// A figure about one participant of a layer split's prompt path (its Prefill::bytes_needed, which the lend is sized
+/// from): `fn()`, evaluated with device `dev` current (-1: CUDA0's own part, the device is left as it is).
+/// `on_device(dev)` returns a guard that makes `dev` current and puts the previous one back (strata::core::OnDevice in
+/// the engine; the CPU test fakes it).  #5722: bytes_needed answers for the CURRENT device (the fused layout and its
+/// smaller MoE buffers are decided per card, prefill.cpp fused_ring), and each stage's init carves on its own device,
+/// so a stage priced while CUDA0 was current was lent CUDA0's figure: on an RTX 5080 + RTX 4090 split the 4090's loan
+/// was 2882 MiB for buffers that take 3014 MiB there.  On like cards every device answers the same, so nothing changes.
+template <class OnDev, class Fn>
+auto split_part_figure(OnDev&& on_device, int dev, Fn&& fn) {
+    [[maybe_unused]] auto guard = on_device(dev);
+    return fn();
+}
+
 }  // namespace strata::program

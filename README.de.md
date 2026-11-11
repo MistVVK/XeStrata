@@ -115,13 +115,13 @@ Lieber im Terminal? Installiere Strata und starte dann **`strata launch`**.
 **Linux / Mac**
 
 ```sh
-curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
+curl -fsSL --connect-timeout 15 --max-time 120 https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
 ```
 
 **Windows PowerShell**
 
 ```powershell
-irm https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
+irm -TimeoutSec 120 https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
 ```
 
 Öffne unter Windows danach ein neues Terminal. Dann:

@@ -336,7 +336,7 @@ def fetch(config_path: str | Path, *, engine_dir: str | Path, asked: str = "yes"
         out.parent.mkdir(parents=True, exist_ok=True)
         partial = out.with_name(out.name + ".part")
         try:
-            transfer.download(url, partial, size=projector.size, sha256=projector.sha256, cancel=cancel,
+            transfer.download(url, partial, size=projector.size, sha256=projector.sha256, cancel=cancel, what="the picture reader",
                               progress=lambda d, s: report("Downloading the picture files…", d, s))
         except transfer.ChecksumMismatch:
             raise PicturesError("checksum", f"{WORDS['checksum']} Try again.") from None

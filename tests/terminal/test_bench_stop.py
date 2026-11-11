@@ -48,6 +48,18 @@ def alive(pid: int) -> bool:
         return not Path("/proc").is_dir()
 
 
+def describe(pid: int) -> str:
+    """What is left of a process, for a failure message: state, parent, start time and command line, read from /proc."""
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()      # fields[0] is the state (field 3 of the file), fields[1] the parent, fields[19] the start (field 22)
+        boot = next(int(line.split()[1]) for line in Path("/proc/stat").read_text().splitlines() if line.startswith("btime"))
+        started = time.strftime("%H:%M:%S", time.localtime(boot + int(fields[19]) / os.sysconf("SC_CLK_TCK")))
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()[:160]
+        return "pid %d state %s, parent %s, started %s, command line %r" % (pid, fields[0], fields[1], started, command)
+    except (OSError, IndexError, ValueError, StopIteration, AttributeError):
+        return "pid %d: nothing readable in /proc (gone, or no /proc on this system)" % pid
+
+
 class StopEngine(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="strata-benchstop-")
@@ -103,12 +115,17 @@ class StopEngine(unittest.TestCase):
         self.procs.append(outsider)
         self.assertTrue(alive(kid))
         self.assertIsNone(bench_standard.stop_engine(proc))
-        deadline = time.monotonic() + 30                                  # a loaded box can take seconds to deliver and reap
+        t_stop = time.monotonic()
+        deadline = t_stop + 30                                            # a loaded box can take seconds to deliver and reap
         while alive(kid) and time.monotonic() < deadline:
             time.sleep(0.1)
-        self.assertFalse(alive(proc.pid), "the engine's server survived")
-        self.assertFalse(alive(kid), "what the engine's server started survived")
-        self.assertIsNone(outsider.poll(), "a process of the same program that this run did not start was ended")
+        # three checks; a failure says which one it is and, for what survived, what it is (state, parent, start, command line)
+        if alive(proc.pid):
+            self.fail("check 1 of 3: the engine's server survived: " + describe(proc.pid))
+        if alive(kid):
+            self.fail("check 2 of 3: what the engine's server started survived (%.1f s after stop_engine returned): %s" % (time.monotonic() - t_stop, describe(kid)))
+        if outsider.poll() is not None:
+            self.fail("check 3 of 3: a process of the same program that this run did not start was ended (exit code %s)" % outsider.poll())
 
     @unittest.skipUnless(WINDOWS, "Windows: a refused taskkill")
     def test_a_refused_taskkill_does_not_leave_the_tree_running(self):

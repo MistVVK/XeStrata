@@ -11,6 +11,7 @@ import contextlib
 import hashlib
 import io
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -177,6 +178,7 @@ class Base(unittest.TestCase):
             self.runs.append([str(x) for x in cmd])
 
         patches = [
+            mock.patch.dict(os.environ, {"STRATA_FEED_MODELS": "0"}),       # the feed's model list is not read from the real feed (the test guard in conftest.py)
             mock.patch.object(setup, "ROOT", self.t),
             mock.patch.object(setup, "GPU_PICK", None),
             mock.patch.object(setup, "data_folder", lambda d, *a, **k: (self.t / "data", [])),

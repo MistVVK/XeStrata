@@ -245,19 +245,10 @@ class EngineUpdate(UpdaterCase):
         self.install_current()
         self.publish(("0.1.46", fx.GOOD_ENGINE, {"padding": 3_000_000}))
         self.server.cut[".tar.gz"] = 700_000
-        first = updater.run_update(self.ctx(), control=False)
-        self.assertEqual((first["exit_code"], first["results"][0]["status"]), (6, "failed"))
-        self.assertIn("resumes it", first["results"][0]["error"])
-        self.assertEqual(self.resolved(), "0.1.45", "an interrupted update keeps the old engine working")
-        partial = list((self.components / ".updates" / "partial").iterdir())
-        self.assertEqual(len(partial), 1)
-        kept = partial[0].stat().st_size
-        self.assertTrue(0 < kept <= 700_000, kept)
-        second = updater.run_update(self.ctx(), control=False)
-        self.assertEqual(second["results"][0]["status"], "updated", second)
+        first = updater.run_update(self.ctx(), control=False)          # the connection broke part-way: the same run continues from the byte it reached
+        self.assertEqual((first["exit_code"], first["results"][0]["status"]), (0, "updated"), first)
         ranges = [r[2] for r in self.archive_requests()]
-        self.assertEqual(ranges[0], None)
-        self.assertEqual(ranges[1], f"bytes={kept}-", "the second try asked only for the missing bytes")
+        self.assertEqual(ranges, [None, "bytes=700000-"], "exactly one more request, from the byte the cut reached: no byte twice (the SHA-256 is checked by the update)")
         self.assertEqual(self.resolved(), "0.1.46")
 
     def test_a_download_that_is_not_the_signed_hash_is_refused(self):

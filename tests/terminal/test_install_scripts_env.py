@@ -123,5 +123,5 @@ class InstallShFailsVisibly(unittest.TestCase):
             self.skipTest("no curl or wget")
         r, home = self.run_sh(SH.read_text(encoding="utf-8"), STRATA_FEED="http://127.0.0.1:9")
         self.assertEqual(r.returncode, 1)
-        self.assertIn("could not read", r.stderr)
+        self.assertIn("127.0.0.1 did not answer (or this computer is offline), so the installer could not start.", r.stderr)   # lane NET W10
         self.assertFalse((home / "bin" / "strata").exists())

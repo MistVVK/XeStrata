@@ -565,7 +565,7 @@ def _interrupted_move_notice() -> None:
 
 def _printer(quiet: bool = False):
     """An emit callback that prints readable lines: new text once, progress in steps of 10% when not on a terminal."""
-    state = {"last": None, "pct": -10, "stage": None}
+    state = {"last": None, "pct": -10, "stage": None, "key": None}
     isatty = sys.stdout.isatty()
 
     def emit(ev) -> None:
@@ -577,9 +577,10 @@ def _printer(quiet: bool = False):
                 sys.stdout.write(f"\r  {text}  {ev.pct:.0f}%   " + ("\n" if ev.pct >= 100 else ""))
                 sys.stdout.flush()
                 return
-            if ev.pct < 100 and ev.pct < state["pct"] + 10 and state["stage"] == ev.stage:
+            key = text.rsplit(":", 1)[0]                     # the sentence without its figure: a new sentence is always shown
+            if ev.pct < 100 and ev.pct < state["pct"] + 10 and state["stage"] == ev.stage and key == state["key"]:
                 return
-            state["pct"] = ev.pct
+            state["pct"], state["key"] = ev.pct, key
         if ev.stage == "start" and ev.text.startswith("Loading the model") and state["stage"] == "start" and not isatty:
             n = int("".join(ch for ch in ev.text.split("…")[-1] if ch.isdigit()) or 0)
             if n % 15:

@@ -1,6 +1,6 @@
 # Strata Terminal: one-line installer for Windows (PowerShell 5.1 or newer).
 #
-#     irm https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
+#     irm -TimeoutSec 120 https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
 #
 # What it does, in order (and nothing else):
 #   1. finds out which computer this is (Windows, processor, graphics card);
@@ -28,6 +28,48 @@ try { if ([Net.WebRequest]::DefaultWebProxy) { [Net.WebRequest]::DefaultWebProxy
 
 $feed = if ($env:STRATA_FEED) { $env:STRATA_FEED } else { 'https://github.com/Niko1221/Strata/releases/latest/download' }
 $feed = $feed.TrimEnd('/')
+$feedHost = try { ([Uri]$feed).Host } catch { '' }
+if (-not $feedHost) { $feedHost = $feed }
+
+# The network rule (strata_control/netpolicy.py): a server that does not answer is given up after 15 s and one more try; once it answers,
+# the download stops only when no byte comes for 60 s (no total cap: a slow line that works is never cut). A refused connection or no DNS
+# answer fails at once. HttpWebRequest works the same in Windows PowerShell 5.1 and PowerShell 7 and never shows a sign-in dialog.
+function Fetch([string]$url, [string]$out) {
+    for ($try = 1; ; $try++) {
+        try {
+            $req = [Net.WebRequest]::Create($url)
+            $req.Timeout = 15000                                   # the connection, TLS and the server's answer (its headers)
+            if ($req -is [Net.HttpWebRequest]) {
+                $req.ReadWriteTimeout = 60000                      # no byte for 60 s ends the download
+                $req.UserAgent = 'strata-installer'
+                if ([Net.WebRequest]::DefaultWebProxy) { $req.Proxy = [Net.WebRequest]::DefaultWebProxy }   # with the Windows sign-in (set above)
+            }
+            $resp = $req.GetResponse()
+            try {
+                $in = $resp.GetResponseStream()
+                $fs = [IO.File]::Create($out)
+                try {
+                    $buf = New-Object byte[] 1048576
+                    while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) { $fs.Write($buf, 0, $n) }
+                }
+                finally { $fs.Dispose(); $in.Dispose() }
+            }
+            finally { $resp.Dispose() }
+            return
+        }
+        catch {
+            $e = $_.Exception
+            $timedOut = $false
+            while ($e) {
+                if (($e -is [Net.WebException] -and $e.Status -eq [Net.WebExceptionStatus]::Timeout) -or ($e -is [TimeoutException]) -or
+                    ($e -is [IO.IOException] -and $e.Message -match 'timed out|time out|timeout')) { $timedOut = $true }
+                $e = $e.InnerException
+            }
+            if ($try -lt 2 -and $timedOut) { Start-Sleep -Seconds 2; continue }   # one more try, only after a timeout
+            throw
+        }
+    }
+}
 if (-not $feed) {
     Die 'this installer does not know where the Strata release folder is. Set $env:STRATA_FEED to its address and run it again, for example: $env:STRATA_FEED=''https://example.org/strata'''
 }
@@ -47,8 +89,11 @@ $data = if ($env:STRATA_DATA_DIR) { $env:STRATA_DATA_DIR } else { Join-Path $env
 $work = Join-Path ([IO.Path]::GetTempPath()) ("strata-install-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
 New-Item -ItemType Directory -Path $work | Out-Null
 try {
-    try { Invoke-WebRequest -UseBasicParsing -Uri "$feed/install-manifest.txt" -OutFile (Join-Path $work 'manifest.txt') }
-    catch { Die "could not read $feed/install-manifest.txt ($($_.Exception.Message)). Check the address and your internet connection; behind a company proxy or firewall, ask for the release folder to be allowed." }
+    try { Fetch "$feed/install-manifest.txt" (Join-Path $work 'manifest.txt') }
+    catch {
+        [Console]::Error.WriteLine("    $($_.Exception.Message)")   # the reason, as curl prints its own
+        Die "$feedHost did not answer (or this computer is offline), so the installer could not start. Check that this computer can open https://$feedHost, then run the same line again. Nothing was installed. If this PC is behind a company proxy or firewall, ask for the release folder to be allowed."
+    }
     $line = Get-Content (Join-Path $work 'manifest.txt') | Where-Object { $_ -match "^$platform\s" } | Select-Object -First 1
     if (-not $line) { Die "this release has no Terminal for $platform." }
     $f = -split $line
@@ -56,8 +101,11 @@ try {
     Write-Host "  Terminal $version ($([math]::Round([double]$size / 1MB)) MB)"
     Write-Host 'Downloading...'
     $zip = Join-Path $work 'terminal.zip'
-    try { Invoke-WebRequest -UseBasicParsing -Uri "$feed/$rel" -OutFile $zip }
-    catch { Die "the download failed ($($_.Exception.Message)). Check your internet connection and run this again; nothing was installed." }
+    try { Fetch "$feed/$rel" $zip }
+    catch {
+        [Console]::Error.WriteLine("    $($_.Exception.Message)")
+        Die "the download stopped: $feedHost did not answer, or no data came for 60 seconds. Run the same line again; nothing was installed."
+    }
     $got = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
     if ($got -ne $want) { Die "the download does not match the release's checksum (got $got, wanted $want). It was not installed; try again." }
     Write-Host '  Checksum ok.'
@@ -103,7 +151,7 @@ try {
 
     if ($env:STRATA_INSTALL_TEST_TRUST -eq '1') {
         $trust = Join-Path $work 'test-trust.json'
-        try { Invoke-WebRequest -UseBasicParsing -Uri "$feed/test-trust.json" -OutFile $trust } catch { Remove-Item -Recurse -Force $incoming; Die 'the test feed has no test-trust.json' }
+        try { Fetch "$feed/test-trust.json" $trust } catch { Remove-Item -Recurse -Force $incoming; Die 'the test feed has no test-trust.json' }
         $env:STRATA_UPDATE_TRUSTED_KEYS = $trust
     }
     Write-Host "Checking the release's signature..."

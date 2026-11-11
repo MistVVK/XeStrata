@@ -541,7 +541,12 @@ class ComponentStore:
         request = urllib.request.Request(artifact.url, headers=headers)
         mode = "ab" if have else "wb"
         try:
-            with urllib.request.urlopen(request, timeout=120) as response:
+            from strata_control import netpolicy        # the network rule: 12 s, one retry with 30 s, clear failures at once; reads stall out after 60 s
+            try:
+                answer = netpolicy.open_url(netpolicy.urlopen, request)
+            except netpolicy.NetFailure as failure:
+                raise ComponentError(failure.headline("the " + artifact.name) + " " + failure.next_step()) from None
+            with answer as response:
                 if have and response.status != 206:
                     # The server ignored the range, so start again rather than appending to a prefix
                     # and producing a corrupt file that would fail verification much later.

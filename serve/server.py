@@ -2881,11 +2881,15 @@ class StrataEngine:
                     raise ValueError(line[4:].strip())
         finally:
             if not done:                                  # the consumer stopped early: stop the engine, drain to DONE
-                if self.can_stop:
+                # the engine can be ended or restarted on another thread meanwhile: Engine.close() closes stdin (a
+                # write then raises ValueError) before it clears `proc` (None then) - the STOP has nobody to reach, and
+                # the request's own outcome must not be replaced by that error
+                proc = self.proc
+                if self.can_stop and proc is not None:
                     try:
-                        self.proc.stdin.write(stop_line)
-                        self.proc.stdin.flush()
-                    except OSError:
+                        proc.stdin.write(stop_line)
+                        proc.stdin.flush()
+                    except (OSError, ValueError):
                         pass
                 # #481: never an untimed wait here - it holds the request FIFO, and an engine that lost step never
                 # answers.  An engine that honours STOP gets the current allowance in all (a STOP during a prompt
@@ -4281,16 +4285,15 @@ def ordered_gpus(cfg: dict, scores=None, vrams=None, archs=None) -> list[int]:
     sc = scores if scores is not None else (hip_speed_scores(gl) if hip else gpu_speed_scores(gl))
     if not sc or any(i not in sc for i in gl):
         return gl
-    if max(sc[i] for i in gl) < 1.05 * min(sc[i] for i in gl):
-        return gl     # #1760: cards within 5% of each other are the same card (two 5070 Ti read 1.2% apart on the clock): keep the order
-    out = sorted(gl, key=lambda i: sc[i])
-    if out != gl:
-        vram = vrams if vrams is not None else (None if scores is not None else gpu_vram_mib(gl, hip))
-        if vram is not None and all(i in vram for i in gl) and vram[out[-1]] < vram[gl[-1]]:
-            print(f"[strata] layer split: keeping card order {','.join(map(str, gl))} - the faster card has "
-                  f"less VRAM than the one the split ends on ({vram[out[-1]]} vs {vram[gl[-1]]} MiB, #1576)",
-                  flush=True)
-            return gl
+    # the decision itself (5% rule #1760, faster card last #1352, VRAM guard #1576) is strata_control/gpu_roles.speed_stage_order, which `strata launch --plan`
+    # calls too (gpu_roles.from_legacy), so the plan names the same Main card as this start
+    out, why, seen = gpu_roles.speed_stage_order(
+        gl, sc, vrams if vrams is not None else (None if scores is not None else (lambda: gpu_vram_mib(gl, hip))))
+    if why == "kept-vram":
+        print(f"[strata] layer split: keeping card order {','.join(map(str, gl))} - the faster card has "
+              f"less VRAM than the one the split ends on ({seen[0]} vs {seen[1]} MiB, #1576)",
+              flush=True)
+    elif why == "faster-last":
         print(f"[strata] layer split: card order {','.join(map(str, out))} (the faster card last; "
               f'"gpu_order": "as_given" keeps {",".join(map(str, gl))}, #1352)', flush=True)
     return out

@@ -405,6 +405,51 @@ def mtp_layer_in(*folders: "str | os.PathLike[str] | None") -> Path | None:
     return None
 
 
+def in_hf_cache(path: str | os.PathLike[str], environ=None) -> bool:
+    """Whether `path` is inside a Hugging Face cache (a `models--<org>--<name>` folder with its snapshots/ and blobs/, or the cache folder
+    itself: HF_HUB_CACHE, HF_HOME/hub, ~/.cache/huggingface). Strata never writes there: the cache is the hub library's, and a
+    file added beside a snapshot's links confuses it."""
+    environ = os.environ if environ is None else environ
+    p = Path(path).expanduser()
+    try:
+        p = p.resolve()
+    except OSError:
+        pass
+    if any(part.lower().startswith("models--") for part in p.parts):
+        return True
+    roots = [environ.get("HF_HUB_CACHE"), environ.get("HUGGINGFACE_HUB_CACHE"), environ.get("HF_HOME"),
+             str(Path("~/.cache/huggingface").expanduser())]
+    for r in roots:
+        if not r:
+            continue
+        try:
+            root = Path(r).expanduser().resolve()
+        except OSError:
+            continue
+        if p == root or root in p.parents:
+            return True
+    try:
+        return p.is_dir() and any(c.name.lower().startswith("models--") for c in p.iterdir())     # a cache folder of another name
+    except OSError:
+        return False
+
+
+def writable_beside(gguf: Path | None) -> Path | None:
+    """The data folder guessed from where the person's own model file sits (`prepared_beside`'s "data_dir": the folder above a `models`
+    folder), only when Strata may keep its own files there: it can write to it and neither it nor its models/ is inside a Hugging Face
+    cache. None: use the data folder every command agrees on instead (the model files are still used where they are)."""
+    if gguf is None:
+        return None
+    found = prepared_beside(gguf)["data_dir"]
+    if found is None:
+        return None
+    found = Path(found)
+    if in_hf_cache(found) or in_hf_cache(found / "models"):
+        return None
+    from strata_control import folders
+    return None if folders.problem(str(found)) else found
+
+
 def prepared_beside(gguf: Path, data_dirs: Iterable[str | os.PathLike[str] | None] = ()) -> dict:
     """What was already prepared for a model file that sits in ``<data>/Models/<tag>/`` (or ``<data>/models/<tag>/``): its pack, the draft
     layer and the picture reader, found by the layout setup and the desktop app both use. Reads only; absent items are None.

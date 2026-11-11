@@ -86,7 +86,7 @@ class Plain(unittest.TestCase):
         import setup
         request = types.SimpleNamespace(full_url="https://github.com/x/y")
         with mock.patch.object(setup.acquisition, "require", lambda *a, **k: None), \
-                mock.patch.object(setup.urllib.request, "urlopen", side_effect=cert_error()):
+                mock.patch.object(setup.netpolicy, "urlopen", side_effect=cert_error()):
             with self.assertRaises(tls.CertificateProblem) as cm:
                 setup._urlopen(request)
         self.assertIn("github.com", str(cm.exception))
@@ -96,7 +96,7 @@ class Plain(unittest.TestCase):
         import setup
         refused = urllib.error.URLError(ConnectionRefusedError())
         with mock.patch.object(setup.acquisition, "require", lambda *a, **k: None), \
-                mock.patch.object(setup.urllib.request, "urlopen", side_effect=refused):
+                mock.patch.object(setup.netpolicy, "urlopen", side_effect=refused):
             with self.assertRaises(urllib.error.URLError):
                 setup._urlopen(types.SimpleNamespace(full_url="https://github.com/x"))
 

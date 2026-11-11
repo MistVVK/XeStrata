@@ -378,6 +378,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(expert_cache_segmented_test PRIVATE strata_engine)
     add_test(NAME expert_cache_segmented_test COMMAND expert_cache_segmented_test)
     set_tests_properties(expert_cache_segmented_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    # #5708: a failed free-memory query is said with its error, not passed off as "0.00 GiB free" (no device: no GPU needed)
+    add_executable(device_free_error_test tests/core/device_free_error_test.cpp)
+    target_link_libraries(device_free_error_test PRIVATE strata_engine)
+    add_test(NAME device_free_error_test COMMAND device_free_error_test)
+    set_tests_properties(device_free_error_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60
+                         ENVIRONMENT "CUDA_VISIBLE_DEVICES=-1;HIP_VISIBLE_DEVICES=-1")
     # STRATA_MMQ_DIRECT: slot_guard / slot_room / slot_tail on the uniform and the sized cache, and the default
     # (no guard) sized layout unchanged
     add_executable(expert_cache_slot_guard_test tests/core/expert_cache_slot_guard_test.cpp)

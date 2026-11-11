@@ -99,7 +99,7 @@ class FetchCase(unittest.TestCase):
         self.tmp.cleanup()
 
     def fetch(self, mirror):
-        with mock.patch.object(M.urllib.request, "urlopen", mirror), contextlib.redirect_stdout(io.StringIO()), \
+        with mock.patch.object(M.netpolicy, "urlopen", mirror), contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()) as err:
             M.fetch(str(self.out), None)
         return err.getvalue()
@@ -117,7 +117,7 @@ class Ranges(FetchCase):
 
     def test_a_mirror_that_ignores_range_is_refused(self):
         for cut in (False, True):                 # the whole file, or cut to the asked length (#327's proxy)
-            with self.subTest(cut=cut), mock.patch.object(M.urllib.request, "urlopen", Mirror(True, cut)), \
+            with self.subTest(cut=cut), mock.patch.object(M.netpolicy, "urlopen", Mirror(True, cut)), \
                     contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(IOError, "not honoured"):
                 M.get(M.REPO + "model-1.safetensors", 8, 15)
 
@@ -160,7 +160,7 @@ class Ranges(FetchCase):
             return r
 
         M._cdn.clear()
-        with mock.patch.object(M.urllib.request, "urlopen", opener):
+        with mock.patch.object(M.netpolicy, "urlopen", opener):
             for a in (0, 100, 200):
                 M.get("https://hf.example/f", a, a + 99)
             self.assertEqual(asked, ["https://hf.example/f"] + ["https://cdn.example/x?sig=1"] * 2)
@@ -172,7 +172,7 @@ class Ranges(FetchCase):
                     raise IOError("expired")
                 return opener(req, timeout)
 
-            with mock.patch.object(M.urllib.request, "urlopen", flaky), mock.patch.object(M.time, "sleep", lambda s: None),                     contextlib.redirect_stderr(io.StringIO()):
+            with mock.patch.object(M.netpolicy, "urlopen", flaky), mock.patch.object(M.time, "sleep", lambda s: None),                     contextlib.redirect_stderr(io.StringIO()):
                 M.get("https://hf.example/f", 300, 399)
             self.assertEqual(asked, ["https://hf.example/f"])               # the cached address failed: the original is asked again
         M._cdn.clear()

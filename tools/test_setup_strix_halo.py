@@ -404,7 +404,7 @@ class WindowsZip(unittest.TestCase):
                   mock.patch.object(setup, "say", lambda *a, **k: None), mock.patch.object(setup, "ok", lambda *a, **k: None),
                   mock.patch.object(setup, "download", self.fake_download),
                   mock.patch.object(setup, "engine_digest", self.fake_digest),
-                  mock.patch.object(setup.urllib.request, "urlopen", lambda *a, **k: io.BytesIO(b"")),
+                  mock.patch.object(setup.netpolicy, "urlopen", lambda *a, **k: io.BytesIO(b"")),
                   mock.patch.object(setup, "hip_runtime_beside_exe", lambda eng: None)):
             p.start()
             self.addCleanup(p.stop)

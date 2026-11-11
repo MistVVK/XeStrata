@@ -362,7 +362,7 @@ def upgrade(dest: Path, source: str, *, installed: Path | None = None, hardware:
         try:
             feed = updater.open_feed(ctx, state)
         except feedmod.FeedError as exc:
-            if "could not be read" in str(exc):
+            if "could not be read" in str(exc) or isinstance(exc, feedmod.FeedUnreachable):
                 return None                                       # no network, no feed here: silent, the launch goes on
             emit(f"A newer DeepSeek engine may be available but could not be checked: {exc}; still using {shown}.")
             return None

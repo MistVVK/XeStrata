@@ -1,7 +1,7 @@
 #!/bin/sh
 # Strata Terminal: one-line installer for Linux (x86_64, and ARM64 on the NVIDIA DGX Spark) and macOS (Apple silicon).
 #
-#     curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
+#     curl -fsSL --connect-timeout 15 --max-time 120 https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
 #
 # What it does, in order (and nothing else):
 #   1. finds out which computer this is (system, processor, graphics card) so it can fetch the right archive;
@@ -34,10 +34,16 @@ die() { printf 'strata installer: %s\n' "$*" >&2; exit 1; }
 # Everything below is one function, called on the last line: a download that stops half-way is a syntax error (nothing runs), not a half installer.
 main() {
   # ---- tools
+  # The network rule (strata_control/netpolicy.py): a server that does not answer is given up after 15 s and one more try, and a download stops
+  # only when no data comes for 60 s (a slow line that works is never cut). A refused connection or no DNS answer fails at once.
   if command -v curl >/dev/null 2>&1; then
-    fetch() { curl -fsSL --retry 3 -o "$2" "$1"; }
+    fetch() { curl -fsSL --connect-timeout 15 --speed-limit 1 --speed-time 60 --retry 1 --retry-delay 2 -o "$2" "$1"; }
   elif command -v wget >/dev/null 2>&1; then
-    fetch() { wget -q -O "$2" "$1"; }
+    if wget --help 2>&1 | grep -q -- '--connect-timeout'; then      # GNU wget
+      fetch() { wget -q --dns-timeout=15 --connect-timeout=15 --read-timeout=60 --tries=2 --waitretry=2 -O "$2" "$1"; }
+    else                                                            # BusyBox wget: one read timeout only
+      fetch() { wget -q -T 60 -O "$2" "$1"; }
+    fi
   else
     die "neither curl nor wget is installed, so nothing can be downloaded. Install one (for example: sudo apt install curl) and run this again."
   fi
@@ -87,14 +93,16 @@ main() {
   # ---- 2. download and check
   work=$(mktemp -d "${TMPDIR:-/tmp}/strata-install.XXXXXX") || die "cannot make a temporary folder"
   trap 'rm -rf "$work"' EXIT INT TERM
-  fetch "$FEED/install-manifest.txt" "$work/manifest.txt" || die "could not read $FEED/install-manifest.txt. Check the address and your internet connection."
+  host=$(printf '%s' "$FEED" | sed -n 's#^[A-Za-z][A-Za-z0-9+.-]*://\([^/:]*\).*#\1#p')
+  host=${host:-$FEED}
+  fetch "$FEED/install-manifest.txt" "$work/manifest.txt" || die "$host did not answer (or this computer is offline), so the installer could not start. Check that this computer can open https://$host, then run the same line again. Nothing was installed."
   line=$(awk -v p="$platform" '$1 == p { print; exit }' "$work/manifest.txt")
   [ -n "$line" ] || die "this release has no Terminal for $platform."
   set -- $line
   version=$2; rel=$3; want=$4
   say "  Terminal $version ($(( ${5:-0} / 1048576 )) MB)"
   say "Downloading…"
-  fetch "$FEED/$rel" "$work/terminal.tar.gz" || die "the download failed. Check your internet connection and run this again; nothing was installed."
+  fetch "$FEED/$rel" "$work/terminal.tar.gz" || die "the download stopped: $host did not answer, or no data came for 60 seconds. Run the same line again; nothing was installed."
   got=$(sha "$work/terminal.tar.gz")
   [ "$got" = "$want" ] || die "the download does not match the release's checksum (got $got, wanted $want). It was not installed; try again, and if it repeats the release folder is damaged."
   say "  Checksum ok."

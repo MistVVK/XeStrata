@@ -125,7 +125,7 @@ class DownloadChecksThePin(unittest.TestCase):
                 return Response(b"", length=length)
             return Response(body, status=200)
 
-        return seen, mock.patch.object(setup.urllib.request, "urlopen", urlopen)
+        return seen, mock.patch.object(setup.netpolicy, "urlopen", urlopen)
 
     def run_download(self, name, served, pinned, length=None):
         seen, patch = self.serve(served, length if length is not None else len(served))
@@ -177,7 +177,7 @@ class NotFoundOnThePinnedCommit(unittest.TestCase):
     def test_it_stops_with_a_plain_message(self):
         seen = []
         out = io.StringIO()
-        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", self.urlopen(seen)), \
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.netpolicy, "urlopen", self.urlopen(seen)), \
                 mock.patch.dict(setup.os.environ, {"STRATA_SOURCE": "huggingface"}), contextlib.redirect_stdout(out):
             setup.os.environ.pop("STRATA_ALLOW_UNPINNED", None)
             dst = Path(d) / "t.gguf"
@@ -190,7 +190,7 @@ class NotFoundOnThePinnedCommit(unittest.TestCase):
 
     def test_the_opt_out_takes_the_current_file_and_says_so(self):
         seen = []
-        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", self.urlopen(seen)), \
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.netpolicy, "urlopen", self.urlopen(seen)), \
                 mock.patch.dict(setup.os.environ, {"STRATA_SOURCE": "huggingface", "STRATA_ALLOW_UNPINNED": "1"}), \
                 mock.patch.object(setup, "_unpinned_said", []):
             dst = Path(d) / "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf"
@@ -214,7 +214,7 @@ class InstalledModelsNeedNoNetwork(unittest.TestCase):
         def urlopen(req, timeout=None):
             raise AssertionError("network used for an installed file: " + req.full_url)
 
-        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", urlopen), \
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.netpolicy, "urlopen", urlopen), \
                 mock.patch.dict(setup.os.environ, {"HF_ENDPOINT": "http://127.0.0.1:9", "STRATA_SOURCE": "auto"}):
             dst = Path(d) / "Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf"
             dst.write_bytes(b"installed by an earlier setup")       # no hash in its mark (installed before the pins)
@@ -227,7 +227,7 @@ class InstalledModelsNeedNoNetwork(unittest.TestCase):
         def urlopen(req, timeout=None):
             raise urllib.error.URLError("no route to host")
 
-        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", urlopen), \
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.netpolicy, "urlopen", urlopen), \
                 mock.patch.object(setup.time, "sleep", lambda s: None), \
                 mock.patch.dict(setup.os.environ, {"STRATA_SOURCE": "huggingface"}):
             with self.assertRaises(SystemExit):

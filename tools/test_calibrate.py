@@ -342,6 +342,28 @@ class Calibrate(unittest.TestCase):
         own = BASE + ["--layer-split", ""]                                       # the config's own value wins
         self.assertEqual(CAL.engine_args({"args": own, "gpu": [0, 1]}), own)
 
+    def test_engine_args_name_the_engine_program_5720(self):
+        # #5720: the drafter pack follows the engine program (a selector-Q4 pack only for a program that reads it,
+        # strata_control/drafting.py pack_path); the calibration must pass the program as the server does, or its
+        # sweep engines start with another pack than the server's
+        from serve import server
+        seen = []
+
+        def fake_apply(shaped, **kw):
+            seen.append(kw.get("engine"))
+            pack = "q4_0-selq4.pack" if kw.get("engine") else "q4_0.pack"
+            shaped["args"] = shaped["args"] + ["--draft", "dflash2", "--draft-model", pack]
+            return mock.Mock(note=None, flags=[], drafter="dflash2")
+
+        cfg = {"args": list(BASE), "exe": "/opt/strata/engine/strata", "drafting": "dflash2"}
+        with mock.patch.object(server.drafting, "apply", side_effect=fake_apply), \
+                mock.patch.object(server.drafting, "detect_hardware", return_value=("cuda", ["120"])):
+            want = server.engine_args(dict(cfg), cfg["exe"])
+            got = CAL.engine_args(dict(cfg))
+        self.assertEqual(seen, [cfg["exe"], cfg["exe"]])
+        self.assertEqual(got, want)
+        self.assertEqual(CAL.arg_value(got, "--draft-model"), "q4_0-selq4.pack")
+
     def test_run_measures_with_the_servers_args(self):
         with tempfile.TemporaryDirectory() as d:
             tok = Path(d)

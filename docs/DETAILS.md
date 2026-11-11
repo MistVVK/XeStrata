@@ -266,7 +266,8 @@ When the RAM cannot hold them beside the system (the experts plus about 10 GB), 
 - Several GPUs: setup recommends one GPU in the low-RAM mode and asks. `--gpus 0,1` shares the model across both cards
   ([MULTI_GPU.md](MULTI_GPU.md#using-it)). `--yes` keeps one GPU.
 - With a page-locked copy the GPU also takes its share of the misses over PCIe (`--pcie-frac`). `--pcie-frac 0` (or
-  `STRATA_RESIDENT_PIN=0`) gives the mapped mode's exact tokens.
+  `STRATA_RESIDENT_PIN=0`) gives the mapped mode's exact tokens. `STRATA_RESIDENT_PIN=0` applies to `--resident-experts`,
+  `--resident-budget-gib N` and the RAM copy the engine makes on its own when the expert arena does not fit.
 - Linux, opt-in: `STRATA_ARENA_MMAP=1` maps a native pack's expert arena read-only from `experts.bin` instead of reading
   it into locked RAM (for example 2x 16 GB GPUs with 32 GB of RAM). Run it with `--pcie-frac 0`.
 - Windows, opt-in: `STRATA_FILE_RELEASE=1` trims the file-backed pages of experts after their GPU uploads. It is a
@@ -763,6 +764,9 @@ in a RAM copy, as much as the RAM available at the start allows after a headroom
   the safety headroom. The explicit modes (`--resident-budget-gib N`, `--resident-experts`) leave `max(W, their own 4 GiB)`.
 - The app's "Leave 20% for my work" passes W = clamp(ceil(0.2 x RAM in GB), 5, 8) as `STRATA_RAM_KEEP_GIB` in the run config's env (not as the flag, so an older engine chosen in the Engine tab, which ignores an env variable, still starts); `strata serve` and full performance pass nothing.
 - `STRATA_ARENA_FALLBACK_RESIDENT=0` keeps the plain file source for the fallback (testers).
+- The RAM copy is page-locked. `STRATA_RESIDENT_PIN=0` keeps it in ordinary pageable memory, as with `--resident-budget-gib`. Under a
+  tight memory limit the system can then swap part of it out: with a 51.75 GiB limit on an R9700 PC (explicit 45.24 GiB budget, one run)
+  prompts read at 920 against 1,754 tok/s and decoding ran at 77.7 against 83.3 tok/s.
 
 Snapshots hold running state, checkpoints, used K/V pages and draft-layer K/V. They add host RAM, not VRAM. Oldest parked entries
 are evicted first. A new conversation that starts at a checkpoint inside a parked one (sub-agents that share a system prompt)

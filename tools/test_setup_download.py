@@ -30,15 +30,19 @@ import strata_mcp  # noqa: E402
 
 CHUNK = 64 << 10                                       # the tests' piece size (setup uses 32 MiB)
 DATA = bytes((i * 7 + (i >> 8)) & 0xFF for i in range(CHUNK * 40 + 12345))       # 40 whole pieces and a short last one
+BIG = (bytes((i * 11 + (i >> 9)) & 0xFF for i in range(1 << 16)) * 170)[:(10 << 20) + 12345]     # 10 MiB and a bit: longer than the one-stream read
 NAME = "t.gguf"
 
 
 class Server:
     """A threaded HTTP server for one file.  `faults(path, start, end, nth)` may answer a request with an error."""
 
-    def __init__(self, data=DATA, ranges=True, length=True, redirect=False, delay=0.002, faults=None):
+    def __init__(self, data=DATA, ranges=True, length=True, redirect=False, delay=0.002, faults=None, hold_from=None):
         self.data, self.ranges, self.length, self.redirect, self.delay = data, ranges, length, redirect, delay
         self.faults = faults
+        # hold_from: a body byte at this file offset or later is not sent until the "release" event is set (the headers and every byte before it are):
+        # a client is at a known place, with no timing in it, until the test lets go (a kill test; release.set() also frees the handlers)
+        self.hold_from, self.release = hold_from, threading.Event()
         self.lock = threading.Lock()
         self.gets, self.heads, self.redirects = [], 0, 0           # gets: (start, end) of every ranged GET
         self.active = self.max_active = 0
@@ -127,6 +131,8 @@ class Server:
             cut = fault[1] if fault and fault[0] == "cut" else None
             try:
                 for i in range(0, len(body), 16384):
+                    if self.hold_from is not None and start + i >= self.hold_from:
+                        self.release.wait(120)
                     if cut is not None and i >= cut:
                         h.connection.shutdown(2)           # the connection drops in the middle of the body
                         return
@@ -307,25 +313,38 @@ class Resume(unittest.TestCase):
             self.assertEqual(again | done, set(range(41)))
             self.assertEqual(files(d), [NAME, NAME + ".done"])
 
-    def test_a_killed_download_continues(self):
+    def killed_download_continues(self, one_stream):
+        """Kill setup.download in a subprocess once 12 pieces are on disk, then run it again: it continues and fetches none of them again.
+        No timing decides this: the test server sends nothing from file offset HOLD on until the test has killed the runner (Server.hold_from), so the
+        runner is always found part-way, however slow or fast the machine is. one_stream: the range probe fails in the runner, so setup reads the
+        file in one stream (parallel_download returns False), whose .part is an unbroken run from the start."""
+        # The parallel path saves every finished piece, so 13 whole pieces may arrive and 12 are on disk before the kill. The one-stream path writes
+        # what it reads in blocks of 8 MiB (setup.download_single), so its file must be longer than that: 8 MiB land on disk, then the server holds.
+        data = BIG if one_stream else DATA
+        HOLD = 9 << 20 if one_stream else 13 * CHUNK
+        pin = (len(data), hashlib.sha256(data).hexdigest())
+        probe = "setup._probe_ranges = lambda *a, **k: False\n" if one_stream else ""
         runner = (
             "import sys; sys.path[:0] = [%r, %r]\n"
             "import setup\n"
             "setup.DL_CHUNK = %d; setup.DL_MIN_PARALLEL = 0; setup.DL_SAVE_EVERY = 0.05; setup.DL_CONNECTIONS = 4\n"
+            "%s"
             "pin = (%d, %r)\n"
             "setup.file_pin = lambda u: pin\n"
             "setup.download(sys.argv[1], __import__('pathlib').Path(sys.argv[2]) / %r, 'the model')\n"
-            % (str(ROOT), str(ROOT / "tools"), CHUNK, len(DATA), hashlib.sha256(DATA).hexdigest(), NAME))
-        with small_pieces(), Server(delay=0.05) as srv, tempfile.TemporaryDirectory() as d:
+            % (str(ROOT), str(ROOT / "tools"), CHUNK, probe, pin[0], pin[1], NAME))
+        with small_pieces(), Server(data=data, hold_from=HOLD) as srv, tempfile.TemporaryDirectory() as d:
+            self.addCleanup(srv.release.set)                    # never leave a handler thread waiting
             env = dict(os.environ, STRATA_SOURCE="huggingface")
-            err = Path(d) / "runner.err"                         # kept for the message below: CI saw the sidecar missing once (11-09)
+            err = Path(d) / "runner.err"
             with open(err, "wb") as err_file:
                 proc = subprocess.Popen([sys.executable, "-c", runner, srv.url, d], env=env,
                                         stdout=subprocess.DEVNULL, stderr=err_file)
+            side = Path(d) / (NAME + ".part.chunks")
+            part = Path(d) / (NAME + ".part")
+            started = time.time()
+            deadline = started + 60
             try:
-                deadline = time.time() + 60
-                side = Path(d) / (NAME + ".part.chunks")
-                part = Path(d) / (NAME + ".part")
                 while time.time() < deadline and proc.poll() is None:
                     try:
                         if side.is_file():
@@ -335,12 +354,16 @@ class Resume(unittest.TestCase):
                             break
                     except (OSError, ValueError, KeyError):
                         pass
-                    time.sleep(0.05)
+                    threading.Event().wait(0.02)                # (not time.sleep: small_pieces() makes that a no-op)
             finally:
                 code = proc.poll()
                 proc.kill()
                 proc.wait()
-            self.assertTrue((Path(d) / (NAME + ".part")).exists(), "the download finished before it was killed")
+                srv.release.set()
+            state = "the runner %s after %.1f s; its stderr: %s" % (
+                "was still running" if code is None else "had already ended with exit code %s" % code, time.time() - started,
+                err.read_text(errors="replace")[-2000:] or "(empty)")
+            self.assertTrue(part.exists(), "the .part file is missing at the kill: " + state)
             if side.exists():
                 saved = json.loads(side.read_text())
                 done = {i for a, b in saved["done"] for i in range(a, b)}
@@ -349,14 +372,19 @@ class Resume(unittest.TestCase):
                 # unbroken run from the start and has no piece list, which the next run reads as finished pieces (_load_pieces).
                 # Seen on GitHub's Linux and macOS runners (run 42699343686); both ways must continue without fetching them again.
                 done = set(range(part.stat().st_size // CHUNK))
-            self.assertGreaterEqual(len(done), 12, "%d pieces after %.1f s; the runner %s; its stderr: %s" % (
-                len(done), time.time() - (deadline - 60), "was still running" if code is None else "ended with %s" % code,
-                err.read_text(errors="replace")[-2000:] or "(empty)"))
+            self.assertGreaterEqual(len(done), 12, "%d pieces at the kill; %s" % (len(done), state))
+            srv.hold_from = None                                # the second run is not held
             srv.gets.clear()
-            code, out = run(srv, d)
+            code, out = run(srv, d, pin=pin)
             self.assertIsNone(code, out)
-            self.assertEqual((Path(d) / NAME).read_bytes(), DATA)
+            self.assertEqual((Path(d) / NAME).read_bytes(), data)
             self.assertFalse(set(asked(srv)) & done, "pieces that were finished before the kill are fetched again")
+
+    def test_a_killed_download_continues(self):
+        self.killed_download_continues(one_stream=False)
+
+    def test_a_killed_one_stream_download_continues(self):
+        self.killed_download_continues(one_stream=True)
 
     def test_a_part_from_one_stream_continues_after_its_last_whole_piece(self):
         with small_pieces(), Server() as srv, tempfile.TemporaryDirectory() as d:
@@ -705,7 +733,7 @@ class WholeMarkNeedsThePin(unittest.TestCase):
         shard.write_bytes(b"x" * 8)
         pin = (8, "ab" * 32)                                                  # a pin of this file's size, so the "full length" branch is the one taken
         calls = []
-        with mock.patch.dict(setup.REPO_PINS[self.repo], {self.name: pin}), mock.patch.object(setup, "range_total", return_value=8),                 mock.patch.object(setup, "_urlopen", lambda *a, **k: type("R", (), {"headers": {"Content-Length": "8"}})()),                 mock.patch.object(setup, "verify_sha256", lambda *a, **k: calls.append(a)):
+        with mock.patch.dict(setup.REPO_PINS[self.repo], {self.name: pin}), mock.patch.object(setup, "range_total", return_value=8),                 mock.patch.object(setup, "_urlopen", lambda *a, **k: type("R", (), {"headers": {"Content-Length": "8"}, "__enter__": lambda s: s, "__exit__": lambda s, *e: False, "close": lambda s: None})()),                 mock.patch.object(setup, "verify_sha256", lambda *a, **k: calls.append(a)):
             setup.mark_whole_unless_pinned([shard], self.hf, own=False)
             self.assertFalse(setup.done(shard))
             setup.download(self.hf + self.name, shard)

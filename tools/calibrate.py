@@ -251,9 +251,11 @@ def engine_args(cfg: dict) -> list[str]:
     """The arguments the server starts this config's engine with (serve.server.engine_args), so the tuning measures
     the engine as it runs.  #447: this used to read any "gpu" list as a layer split and add --layer-split auto, which
     broke a one-card config with a helper card for the expert tier ("gpu": [0] + --expert-cache-device1: the engine
-    refuses a split that leaves no card without a stage), missed the "0,2" spelling, and ignored split_skip_if_fits."""
+    refuses a split that leaves no card without a stage), missed the "0,2" spelling, and ignored split_skip_if_fits.
+    #5720: with the engine program, as the server passes it: the drafter pack follows the program (a selector-Q4 pack
+    only for one that reads it), so without it the sweep engines started with another pack than the server's."""
     from serve.server import engine_args as server_args
-    return server_args(cfg)
+    return server_args(cfg, cfg.get("exe"))
 
 
 def engine_error(log: str | None, since: int = 0) -> str | None:

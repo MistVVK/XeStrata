@@ -17,20 +17,38 @@ import test_setup_unsloth as U  # noqa: E402
 
 
 class FetchMtp(unittest.TestCase):
-    def run_with(self, codes):
+    def run_with(self, codes, grow=True):
+        """grow: each run writes a few bytes into the folder (a run that moved data); the network rule runs it again only then (lane NET)."""
+        import tempfile
         calls = []
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        mtp = pathlib.Path(tmp.name) / "mtp"
 
         def fake_run(cmd, cwd=None, env=None, check=True, quiet=False):
             calls.append((cmd, env, check))
+            if grow:
+                mtp.mkdir(exist_ok=True)
+                (mtp / f"part{len(calls)}").write_bytes(b"x")
             return mock.Mock(returncode=codes[min(len(calls) - 1, len(codes) - 1)])
         with mock.patch.object(setup, "run", fake_run), mock.patch.object(setup.time, "sleep", lambda s: None), \
                 mock.patch.object(setup, "say", lambda *a, **k: None), mock.patch.object(setup, "warn", lambda *a, **k: None):
             try:
-                setup.fetch_mtp(pathlib.Path("mtp"), {"A": "1"})
+                setup.fetch_mtp(mtp, {"A": "1"})
                 result = "ok"
             except SystemExit as e:
                 result = e.code
         return result, calls
+
+    def test_a_run_that_moved_no_bytes_is_not_run_again(self):
+        out = []
+        with mock.patch.object(setup, "fail", lambda msg, hint=None: out.append((msg, hint)) or (_ for _ in ()).throw(SystemExit(1))):
+            result, calls = self.run_with([1], grow=False)
+        self.assertEqual((result, len(calls)), (1, 1))
+
+    def test_a_server_that_does_not_answer_stops_at_once_with_the_fetchs_own_reason(self):
+        result, calls = self.run_with([4])
+        self.assertEqual((result, len(calls)), (1, 1))
 
     def test_a_stopped_download_is_run_again_and_continues(self):
         result, calls = self.run_with([1, 1, 0])

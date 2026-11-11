@@ -64,6 +64,7 @@ from pathlib import Path
 
 from strata_control import acquisition
 from strata_control import tls
+from strata_control import netpolicy
 
 tls.install()      # #3722: HTTPS checks the server against the operating system's certificates (what Chrome and curl.exe do)
 from strata_control import atomic
@@ -1116,11 +1117,27 @@ def _urlopen(req, timeout=None):
     (strata_control/acquisition.py), only an explicit setup, update or install does."""
     acquisition.require("a download")
     try:
-        return urllib.request.urlopen(req, timeout=timeout)
+        # strata_control/netpolicy.py: `timeout` bounds the connection phase (lookup, connect, TLS, the answer's headers); a read after
+        # the answer that gets no byte for netpolicy.STALL_S ends the connection
+        return netpolicy.urlopen(req, timeout=timeout)
     except urllib.error.URLError as e:
         if tls.is_certificate_error(e):               # not the raw urlopen text, and never a way to skip the check
             raise tls.CertificateProblem(tls.host_of(req.full_url if hasattr(req, "full_url") else str(req))) from None
         raise
+
+
+def _open_net(req, check_memory: bool = True):
+    """One request under the network rule (strata_control/netpolicy.py): 12 s, then one retry with 30 s, a line naming the host after
+    5 s, and a host that did not answer is not asked again in this run. Raises netpolicy.NetFailure, HTTPError or CertificateProblem."""
+    return netpolicy.open_url(_urlopen, req, say=lambda line: say(f"  {line} ..."), check_memory=check_memory)
+
+
+def net_fail(e: "netpolicy.NetFailure", url: str, what=None):
+    """setup's stop for a host that cannot be reached: the plain sentence, the one next step, then the proxy and ModelScope hints."""
+    extra = "".join(" " + h[2:3].upper() + h[3:] + "." for h in (proxy_hint(), source_hint(url)) if h)
+    if e.detail():
+        say(f"  ({e.host}: {e.detail()})")             # the raw reason, for the log
+    fail(e.headline(netpolicy.what_words(what)), e.next_step() + extra)
 
 
 def run(cmd, cwd=None, env=None, check=True, quiet=False):
@@ -1150,11 +1167,22 @@ def fetch_mtp(mtp: Path, env: dict, tries: int = 3):
     it is run again, and each run continues where the last one stopped.  The progress lines it prints are what the app shows."""
     cmd = [sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "fetch", "--out", str(mtp)]
     env = {**env, "STRATA_SOURCE": model_source()}
+    def on_disk() -> int:
+        try:
+            return sum(f.stat().st_size for f in Path(mtp).rglob("*") if f.is_file())
+        except OSError:
+            return 0
     for n in range(1, tries + 1):
+        before = on_disk()
         r = run(cmd, env=env, check=False)
         rc = 0 if r is None else r.returncode              # (a test double answers None)
         if rc == 0:
             return
+        if rc == 4:                                        # tools/mtp_fetch.py NO_ANSWER: its [X] lines above name the host and the next step
+            say("\nSetup stopped. Fix the item above and run it again - everything already done is kept and skipped.")
+            sys.exit(1)
+        if r is not None and on_disk() <= before:          # the network rule: run again only when the last run moved bytes
+            break
         if n < tries:
             warn(f"the draft layer's download stopped (exit {rc}); trying again, it continues where it stopped "
                  f"({n + 1} of {tries})")
@@ -1182,6 +1210,27 @@ def _kept_mark(path: Path) -> Path | None:
     return ROOT / "marks" / (hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:24] + ".done")
 
 
+_OWN_DIRS: list = []                                   # --gguf-dir: folders of the person's own model files (a Hugging Face cache, a share)
+
+
+def own_files_in(folder) -> None:
+    """Strata writes nothing beside the person's own model files (lane NET item 5): their finish marks are kept in marks/ (_kept_mark)."""
+    try:
+        _OWN_DIRS.append(Path(folder).expanduser().resolve())
+    except OSError:
+        _OWN_DIRS.append(Path(folder).expanduser())
+
+
+def _is_own_file(path: Path) -> bool:
+    if not _OWN_DIRS:
+        return False
+    try:
+        parent = Path(path).expanduser().absolute().parent.resolve()
+    except OSError:
+        return False
+    return any(parent == d for d in _OWN_DIRS)
+
+
 def mark_text(path: Path) -> str | None:
     """The text of the finish mark of `path` (beside it, else the kept one), or None when it has none."""
     for m in (path.with_name(path.name + ".done"), _kept_mark(path)):
@@ -1203,11 +1252,13 @@ def mark(path: Path, text=""):
     in Strata's own folder instead (marks/), so a 110 GB Engram is hashed once, not on every launch; only when that cannot be written either
     does setup say so and go on (the step is repeated on the next run), it does not stop."""
     text = text or time.strftime("%Y-%m-%d %H:%M")
-    try:
-        path.with_name(path.name + ".done").write_text(text, encoding="utf-8")
-        return
-    except OSError as e:
-        beside = e
+    beside: BaseException | str = "a folder of the person's own model files"
+    if not _is_own_file(path):
+        try:
+            path.with_name(path.name + ".done").write_text(text, encoding="utf-8")
+            return
+        except OSError as e:
+            beside = e
     kept = _kept_mark(path)
     try:
         if kept is not None:
@@ -2598,7 +2649,7 @@ DL_RUN = 4                      # pieces one request asks for (4 x 32 MiB): a ne
                                 # in TCP slow start (measured: 8 connections 66 MB/s with a request per piece, 73 with 128 MiB)
 DL_MIN_PARALLEL = 256 << 20     # smaller files are one stream
 DL_CHUNK_TRIES = 5              # tries per request (1, 2, 4, 8 s apart) before the round is given up and run again
-DL_ROUNDS = 30                  # rounds (10 s apart) before the download is given up, like the 30 tries of one stream
+DL_ROUNDS = 30                  # rounds in a row without a new byte (10 s apart) before the download is given up; and 5 minutes without one (netpolicy)
 DL_BACKOFF = 1.0                # seconds before the second try of a request, doubled each time (tests set 0)
 DL_SAVE_EVERY = 5.0             # seconds between writes of the progress file
 
@@ -2713,7 +2764,7 @@ class _Source:
             if stale is not None and self.final is not None and self.final != stale:
                 return self.final                        # another connection already got a fresh address
             req = urllib.request.Request(self.url, headers={"User-Agent": "strata-setup", "Range": "bytes=0-0"})
-            with _urlopen(req, timeout=60) as r:
+            with _urlopen(req, timeout=netpolicy.RETRY_CONNECT_S) as r:
                 cr = (r.headers.get("Content-Range") or "").strip()
                 if r.status != 206 or cr != f"bytes 0-0/{self.total}":
                     raise _NoRange(f"HTTP {r.status}, Content-Range {cr!r}")
@@ -2906,7 +2957,7 @@ def _fetch_run(src: _Source, st: _Pieces, f, run: list):
         try:
             url = src.get()
             req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={pos}-{end}"})
-            with _urlopen(req, timeout=60) as r:
+            with _urlopen(req, timeout=netpolicy.RETRY_CONNECT_S) as r:
                 _check_ranged(r, pos, end, st.total, src.etag)
                 while pos <= end:
                     if st.stop.is_set():
@@ -3069,10 +3120,20 @@ def parallel_download(url: str, part: Path, total: int, label: str, conns: int, 
             last_save = now
             _save_pieces(part, total, st.snapshot())
 
+    # the network rule: rounds go on while bytes keep coming (no cap on how many); DL_ROUNDS rounds in a row without a new byte, or 5 minutes
+    # without one, end it
+    clock = netpolicy.StallClock()
+    idle_rounds, before = 0, -1
     try:
-        for rnd in range(DL_ROUNDS):
+        while True:
             todo = [i for i in range(st.n) if i not in st.done]
             if not todo:
+                break
+            now_have = st.have()
+            clock.progress(now_have)
+            idle_rounds = 0 if now_have > before else idle_rounds + 1
+            before = now_have
+            if clock.expired() or idle_rounds >= DL_ROUNDS:
                 break
             st.abort_round.clear()
             st.errors.clear()
@@ -3112,6 +3173,8 @@ def parallel_download(url: str, part: Path, total: int, label: str, conns: int, 
     if len(st.done) < st.n:
         _save_pieces(part, total, st.snapshot())
         have = st.have()
+        if clock.expired():                             # no new byte for 5 minutes (W6)
+            fail(*clock.words(netpolicy.what_words(label), have, total))
         fail(f"could not finish downloading {name}: {have:,} of {total:,} bytes",
              "check your internet connection and run it again (the download resumes where it stopped)")
     try:
@@ -3137,7 +3200,7 @@ def _repair_piece(src: _Source, st: _Pieces, f, i: int, stats: dict):
         try:
             url = src.get()
             req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={pos}-{end}"})
-            with _urlopen(req, timeout=60) as r:
+            with _urlopen(req, timeout=netpolicy.RETRY_CONNECT_S) as r:
                 _check_ranged(r, pos, end, st.total, src.etag)
                 while pos <= end:
                     if st.stop.is_set():
@@ -3242,13 +3305,22 @@ def download_single(url: str, part: Path, total: int, label: str):
     """One stream with a Range resume from the size of `part` (the way every download worked before parallel pieces).
     A resumed answer is used only when it is a 206 that starts at the byte asked for; anything else starts the file over."""
     _single_ready(part)
-    for attempt in range(30):
+    # the network rule: tried again while bytes keep coming (no cap on how often); 30 tries in a row without a new byte, or 5 minutes without one, end it
+    clock = netpolicy.StallClock()
+    idle, before = 0, -1
+    while True:
         have = part.stat().st_size if part.exists() else 0
+        clock.progress(have)
+        idle, before = (0 if have > before else idle + 1), have
+        if clock.expired():
+            fail(*clock.words(netpolicy.what_words(label), have, total))
+        if idle >= 30:
+            break
         if total and have >= total:                    # stopped after the last byte, before the rename: nothing to
             break                                      # ask for (a range past the end is a 416, retried 30 times)
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={have}-"})
-            with _urlopen(req, timeout=60) as r:
+            with _urlopen(req, timeout=netpolicy.RETRY_CONNECT_S) as r:
                 if have:
                     m = _CONTENT_RANGE.match(r.headers.get("Content-Range") or "")
                     if r.status != 206 or not m or int(m.group(1)) != have or (total and int(m.group(3)) != total):
@@ -3290,7 +3362,7 @@ def range_total(url: str) -> int:
     (ModelScope's: #1915); 0 when it does not say.  With the length known the file comes over several connections."""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": "bytes=0-0"})
-        with _urlopen(req, timeout=60) as r:
+        with _urlopen(req, timeout=netpolicy.RETRY_CONNECT_S) as r:
             m = re.match(r"\s*bytes 0-0/(\d+)\s*$", r.headers.get("Content-Range") or "")
             return int(m.group(1)) if r.status == 206 and m else 0
     except (OSError, http.client.HTTPException):
@@ -3332,7 +3404,7 @@ def download(url, dst: Path, what=None):
         return
     ms = ms_file(url) if model_source() == "modelscope" else None
     if ms is not None:
-        if reachable(ms_url(*ms), timeout=30):
+        if reachable(ms_url(*ms), timeout=netpolicy.FIRST_CONNECT_S):
             url = ms_url(*ms)
         else:
             warn(f"{what or dst.name}: ModelScope does not answer; downloading it from {hf_endpoint()}")
@@ -3341,10 +3413,11 @@ def download(url, dst: Path, what=None):
     total = 0
     # the file's pinned size and SHA-256, when it has them (ModelScope's copy is checked against the same pin)
     pin = REPO_PINS.get(ms[0], {}).get(ms[1].rsplit("/", 1)[-1]) if ms is not None else file_pin(url)
-    for attempt in range(5):
+    for _unpinned in range(2):                         # the size: one request under the network rule (no more 5 x 60 s in silence)
         try:
             req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "strata-setup"})
-            total = int(_urlopen(req, timeout=60).headers.get("Content-Length", 0))
+            with _open_net(req) as r:
+                total = int(r.headers.get("Content-Length", 0) or 0)
             break
         except urllib.error.HTTPError as e:
             if e.code == 404 and hf_unpinned(url) != url:  # the pinned revision is gone from the repository
@@ -3356,17 +3429,15 @@ def download(url, dst: Path, what=None):
                 url = hf_unpinned(url)
                 pin = None
                 continue
-            if attempt == 4:
-                fail(f"cannot reach {url.split('/')[2]} ({e})",
-                     "check your internet connection and run it again" + proxy_hint() + source_hint(url))
-            time.sleep(5)
-        except tls.CertificateProblem as e:           # the same answer five times: no retry
+            fail(f"cannot reach {url.split('/')[2]} ({e})",
+                 "check your internet connection and run it again" + proxy_hint() + source_hint(url))
+        except tls.CertificateProblem as e:           # the same answer every time: no retry
             fail(f"cannot download from {url.split('/')[2]}: its security certificate was not accepted", str(e))
-        except OSError as e:
-            if attempt == 4:
-                fail(f"cannot reach {url.split('/')[2]} ({e})",
-                     "check your internet connection and run it again" + proxy_hint() + source_hint(url))
-            time.sleep(5)
+        except netpolicy.NetFailure as e:
+            net_fail(e, url, what)
+        except (OSError, http.client.HTTPException) as e:
+            fail(f"cannot reach {url.split('/')[2]} ({e})",
+                 "check your internet connection and run it again" + proxy_hint() + source_hint(url))
     if not total:
         total = range_total(url)
     meta = ms_meta(*ms) if ms is not None else None
@@ -6283,12 +6354,52 @@ def fresh_if_other_generator(bdir: Path, generator: str = "Ninja") -> bool:
     return True
 
 
+def cmake_cache_entries(bdir: Path) -> dict:
+    """The entries of a build folder's CMakeCache.txt as {name: value} (the type dropped); {} when it was never configured."""
+    out = {}
+    try:
+        text = (Path(bdir) / "CMakeCache.txt").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        if line and not line.startswith(("#", "//")) and "=" in line:
+            key, value = line.split("=", 1)
+            out[key.split(":", 1)[0].strip()] = value.strip()
+    return out
+
+
+CUDA_CACHE_GLOBS = ("CUDA_*", "CUDAToolkit_*")      # FindCUDAToolkit's cached library paths and toolkit folders
+
+
+def toolkit_change_undefs(bdir: Path, defs) -> list:
+    """#5717: FindCUDAToolkit keeps the library paths of the toolkit a folder was first configured with (CUDA_cudart_LIBRARY
+    and about 60 more); a new -DCUDAToolkit_ROOT does not search them again, so after a CUDA update that removed the old
+    toolkit, ninja stopped on the old libcudart.so.  When the toolkit changed - another CUDAToolkit_ROOT than the cached one,
+    or a cached CUDA path that is gone - the configure drops those entries (-U, before the new -D) and CMake detects the CUDA
+    compiler again; the compiled objects stay, so only what changed is rebuilt.  [] for an unchanged or a new folder."""
+    cache = cmake_cache_entries(bdir)
+    if not cache:
+        return []
+    want = next((str(d).split("=", 1)[1] for d in defs if str(d).startswith("-DCUDAToolkit_ROOT=")), None)
+    had = cache.get("CUDAToolkit_ROOT")
+    moved = bool(want and had) and Path(had) != Path(want)
+    gone = any(not Path(part).exists()
+               for name, value in cache.items() if name.startswith(("CUDA_", "CUDAToolkit_"))
+               for part in value.split(";")
+               if part and not part.endswith("-NOTFOUND") and Path(part).is_absolute())
+    if not (moved or gone):
+        return []
+    for f in (Path(bdir) / "CMakeFiles").glob("*/CMakeCUDACompiler.cmake"):
+        f.unlink(missing_ok=True)
+    return [f"-U{g}" for g in CUDA_CACHE_GLOBS]
+
+
 def cmake_build(src, bdir, target, defs, vcvars, bat_name):
     acquisition.require("a compile (cmake)")
     cmake, ninja = ensure_build_tools()
     fresh_if_other_generator(bdir)
     conf = [cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(src), "-B", str(bdir),
-            "-DCMAKE_BUILD_TYPE=Release", *defs]
+            *toolkit_change_undefs(bdir, defs), "-DCMAKE_BUILD_TYPE=Release", *defs]
     build = [cmake, "--build", str(bdir), "--target", target, "-j", str(max(2, (os.cpu_count() or 4) // 2))]
     # A failed build is tried once more: CUDA 13.0's ptxas now and then fails to parse a PTX file it just wrote, and
     # the same command then gets past it (issue #45); a second attempt only compiles what is still missing.
@@ -7334,6 +7445,84 @@ def mmproj_beside(gguf_dir, name: str, size: int | None = None):
         except OSError:
             continue
     return None
+
+
+# A picture reader the person may already have instead of the pinned one: Unsloth's mmproj-F16.gguf for Flash-Next (the same vision tower in F16;
+# lane 14: 58 of 72 answers word for word with the pinned BF16 file on the same card, none of the differences wrong about the picture; embeddings 0.9998
+# mean / 0.998 worst).  Accepted ONLY when it is already there, with this size and this SHA-256 (Unsloth rev 38bb39ee97821de2c9009abb7e93950eec396e66),
+# and only when no pinned file is found: pinned name -> (file name, bytes, sha256).  It is never downloaded.
+ALT_READERS = {MMPROJ: ("mmproj-F16.gguf", 904004000, "1f7b7f0b984cf065c604360c29c8098362ed61b290db0ff12c6f360bb1a8a980")}
+_ALT_MARK = re.compile(r"alt-reader sha256 ([0-9a-f]{64})")
+
+
+def alt_reader_places(pinned: str, models_dir, roots, gguf_dir) -> list:
+    """Where the alternative reader of `pinned` is looked for: the same places as the pinned one (the data folder's models/, an earlier install's
+    models/, and a person's own GGUF folder: beside the shards, the folder above and that folder's models/)."""
+    alt = ALT_READERS.get(pinned)
+    if alt is None:
+        return []
+    places = [Path(models_dir) / alt[0]] + [Path(r) / "models" / alt[0] for r in roots or []]
+    if gguf_dir:
+        base = Path(gguf_dir)
+        places += [base / alt[0], base.parent / alt[0], base.parent / "models" / alt[0]]
+    return places
+
+
+def accepted_alt_reader(pinned: str, places, *, start: bool = True):
+    """The first file in `places` that is the alternative reader of `pinned` (name, size and SHA-256 all as pinned in ALT_READERS), else None. Anything
+    else with that name is ignored (never deleted, never renamed). The SHA-256 (0.9 GB, a few seconds) is remembered in a mark in Strata's own
+    marks/ folder, never beside the person's file; the mark is keyed by the real path, size and modification time (_kept_mark), so a file that was
+    replaced is hashed again. start=True is the setup run (says what it does, writes the mark); start=False is the plan (the same answer, says
+    nothing, writes nothing)."""
+    alt = ALT_READERS.get(pinned)
+    if alt is None:
+        return None
+    name, size, sha = alt
+    for p in places:
+        p = Path(p)
+        try:
+            if p.name != name or not p.is_file() or p.stat().st_size != size:
+                continue                                   # absent, another name or another size: ignored exactly as before
+        except OSError:
+            continue
+        digest = None
+        kept = _kept_mark(p)
+        try:
+            found = _ALT_MARK.match(kept.read_text(encoding="utf-8", errors="replace")) if kept is not None and kept.exists() else None
+            digest = found.group(1) if found else None
+        except OSError:
+            digest = None
+        if digest is None:
+            if start:
+                say(f"  checking {p.name} (SHA-256, {size / 1e9:.1f} GB) ...")
+            digest = _hash_file(p, size)
+            if start and kept is not None:
+                try:
+                    kept.parent.mkdir(parents=True, exist_ok=True)
+                    kept.write_text(f"alt-reader sha256 {digest}\n", encoding="utf-8")
+                except OSError:
+                    pass                                   # (not remembered: the next run hashes again; nothing else changes)
+        if digest == sha:
+            return p
+        if start:
+            say(f"  note: {p} has the name of Unsloth's picture reader but is a different file, so it is not used. "
+                "The picture reader is downloaded (0.9 GB).")
+    return None
+
+
+def resolve_reader(pinned: str, mmproj: Path, models_dir, roots, gguf_dir, size):
+    """Which picture reader this run uses: (kind, path). `mmproj` is where the pinned file would be (the data folder's models/, or an earlier
+    install's copy when there is one). kind "fetch": the pinned file at `mmproj` (it exists, or it is downloaded); "near": the pinned file in the
+    person's own folder (mmproj_beside); "alt": a verified Unsloth mmproj-F16.gguf the person already has (only when no pinned file is anywhere)."""
+    if mmproj.exists():
+        return "fetch", mmproj
+    near = mmproj_beside(gguf_dir, pinned, size)
+    if near is not None:
+        return "near", near
+    alt = accepted_alt_reader(pinned, alt_reader_places(pinned, models_dir, roots, gguf_dir), start=True)
+    if alt is not None:
+        return "alt", alt
+    return "fetch", mmproj
 
 
 def share_sibling_file(dst: Path, parent: Path, name: str, size: int) -> bool:
@@ -8591,7 +8780,8 @@ def feed_models_setup(feed: str | None = None, fetch: bool = True) -> None:
             source = update_cmd._feed_source(argparse.Namespace(feed=feed), home())
         except Exception:                              # noqa: BLE001 - no feed address: the cached list only
             source = None
-    loaded = feed_models.load(source, fetch=source is not None)
+    # the read is optional (the last verified list stays): no failure sentence, but a server that does not answer is named after 5 s (W1)
+    loaded = feed_models.load(source, fetch=source is not None, say=lambda line: say(f"  {line} ..."))
     if loaded.models:
         feed_models.apply(_SetupTables(), loaded.models, feed_engine_families())
 
@@ -10062,14 +10252,12 @@ def mac_control_setup(a) -> int:
         mmproj = Path(models_root) / fam["mmproj"]
         if not mmproj.exists():                        # an earlier install's copy (the same file for every family)
             mmproj = find_in(roots, f"models/{fam['mmproj']}") or mmproj
-        near = None if mmproj.exists() else mmproj_beside(a.gguf_dir, fam["mmproj"], (ISTA_FILES.get(fam["mmproj"]) or (None,))[0])
-        if near is not None:
-            mmproj = near
-        elif not (mmproj.exists() and done(mmproj)):
+        kind, mmproj = resolve_reader(fam["mmproj"], mmproj, models_root, roots, a.gguf_dir, (ISTA_FILES.get(fam["mmproj"]) or (None,))[0])
+        if kind == "fetch" and not (mmproj.exists() and done(mmproj)):
             download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
-        if fam["mmproj"] in ISTA_FILES:
+        if fam["mmproj"] in ISTA_FILES and kind != "alt":       # (a verified Unsloth F16 file was checked against its own pin)
             verify_sha256(mmproj, *ISTA_FILES[fam["mmproj"]])
-        ok(f"vision encoder: {mmproj}")
+        ok(f"vision encoder: {mmproj}" + (" (Unsloth's mmproj-F16.gguf, SHA-256 checked)" if kind == "alt" else ""))
 
     step(6, "preparing the model for Strata")
     pack = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
@@ -10353,6 +10541,8 @@ def main() -> int:
                          "sycl = Intel Arc, EXPERIMENTAL: Linux, built from source (docs/INTEL_ARC.md)")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    if getattr(a, "gguf_dir", None):                   # the person's own files: their finish marks go to Strata's marks/, never beside them
+        own_files_in(a.gguf_dir)
     if a.model and a.model not in MODELS and a.family not in PREVIEW_FAMILIES and a.family not in MULTI_FILE_FAMILIES:
         ap.error(f"--model {a.model} is a size of " + ", ".join(f"--family {f}" for f, d in {**PREVIEW_FAMILIES, **MULTI_FILE_FAMILIES}.items()
                                                               if a.model in d["models"]))
@@ -11147,14 +11337,15 @@ def main() -> int:
     if not mmproj.exists():                            # an earlier install's copy (the same file for every family)
         mmproj = find_in(roots, f"models/{fam.get('mmproj', MMPROJ)}") or mmproj      # a feed model without a picture reader has no fam["mmproj"]
     if vision != "none":
-        near = None if mmproj.exists() else mmproj_beside(a.gguf_dir, fam["mmproj"], (fam.get("mmproj_sha256") or ISTA_FILES.get(fam["mmproj"]) or (None,))[0])
-        if near is not None:                           # the person's own folder (or the one above it) has the picture file: used where it is
-            mmproj = near
-        else:
+        # the person's own folder (or the one above it) has the pinned picture file: used where it is ('near'); a verified Unsloth mmproj-F16.gguf they
+        # already have is used when no pinned file is anywhere ('alt'); else the pinned file is downloaded
+        kind, mmproj = resolve_reader(fam["mmproj"], mmproj, a.models_dir, roots, a.gguf_dir,
+                                      (fam.get("mmproj_sha256") or ISTA_FILES.get(fam["mmproj"]) or (None,))[0])
+        if kind == "fetch":
             download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
-        if fam.get("mmproj_sha256"):                   # the NVFP4 family pins it by size and SHA-256 too
+        if fam.get("mmproj_sha256") and kind != "alt":   # the NVFP4 family pins it by size and SHA-256 too
             verify_sha256(mmproj, *fam["mmproj_sha256"])
-        ok(f"vision encoder: {mmproj}")
+        ok(f"vision encoder: {mmproj}" + (" (Unsloth's mmproj-F16.gguf, SHA-256 checked)" if kind == "alt" else ""))
         if vision == "cpu" and "BF16" in mmproj.name:       # a tip only (recommend, never force; #625)
             say("       tip: on the CPU a Q8_0 copy of this encoder is a third smaller and about as exact (embedding "
                 "cosine 0.999 vs BF16); see 'A Q8_0 encoder' in docs/DETAILS.md")

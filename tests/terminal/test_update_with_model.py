@@ -187,8 +187,7 @@ class WithAModel(ModelCase):
         self.assertEqual(self.resolved(), "0.1.45")
 
     def test_a_download_that_fails_never_stops_the_model(self):
-        name = next((self.release / "engine").glob("*.tar.gz")).name
-        self.server.cut[name] = 200
+        (next((self.release / "engine").glob("*.tar.gz"))).unlink()     # the server answers 404 for the archive (a cut connection is resumed in the same run now)
         out = self.update(self.gate(True, True))
         self.assertEqual(out["exit_code"], 6, out)
         self.assertEqual(self.state(), "ready", "the model was not stopped for a download that failed")
@@ -261,7 +260,8 @@ class WithAModel(ModelCase):
         for dead in ("http://127.0.0.1:9/strata-feed.json", str(self.root / "no-such-feed")):
             with self.assertRaises(Exception) as caught:
                 self.update(self.gate(True, True), source=dead)
-            self.assertIn("could not be read", str(caught.exception))
+            self.assertTrue("could not be read" in str(caught.exception) or "so the update check could not run" in str(caught.exception),
+                            str(caught.exception))            # a folder that is gone: the old sentence; a host nobody answers for: the network rule's (W7)
             self.assertEqual(self.state(), "ready", dead)
         self.assertEqual(self.resolved(), "0.1.45")
 
@@ -274,7 +274,8 @@ class WithAModel(ModelCase):
         with self.assertRaises(Exception) as caught:
             self.update(self.gate(True, True), source=f"http://127.0.0.1:{hang.getsockname()[1]}/strata-feed.json", feed_timeout=1.0)
         self.assertLess(time.monotonic() - started, 20)
-        self.assertIn("could not be read", str(caught.exception))
+        self.assertIn("did not answer within", str(caught.exception))       # the network rule (W7): the host, and that nothing was changed
+        self.assertIn("so the update check could not run", str(caught.exception))
         self.assertEqual((self.state(), self.resolved()), ("ready", "0.1.45"))
 
     def test_nothing_to_update_asks_nothing_and_leaves_the_model_alone(self):

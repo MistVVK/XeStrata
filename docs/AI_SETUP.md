@@ -39,13 +39,13 @@ installs into the user's home folder. The engine and model are acquired during l
 **Linux / Mac:**
 
 ```sh
-curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
+curl -fsSL --connect-timeout 15 --max-time 120 https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
 ```
 
 **Windows PowerShell:**
 
 ```powershell
-irm https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
+irm -TimeoutSec 120 https://github.com/Niko1221/Strata/releases/latest/download/install.ps1 | iex
 ```
 
 Open a new terminal on Windows. On Linux and Mac, use the full executable path printed by the installer if

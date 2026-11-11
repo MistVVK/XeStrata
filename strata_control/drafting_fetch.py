@@ -196,7 +196,7 @@ def tuned_from_feed(*, feed: str | None = None, backend: str | None = None, size
     try:
         loaded = feedmod.fetch(source, signing.load_trusted_keys(), timeout=FEED_TIMEOUT, channel="stable")
     except feedmod.FeedError as exc:
-        if exc.exit_code == 6 or "trusts no update key" in str(exc):
+        if isinstance(exc, feedmod.FeedUnreachable) or exc.exit_code == 6 or "trusts no update key" in str(exc):
             return None
         raise DraftingError(f"The update feed could not be trusted: {exc}") from None
     for entry in loaded.drafters:
@@ -259,8 +259,10 @@ def ensure_tuned(data_dir: str | Path, *, progress: Progress | None = None, canc
     out.parent.mkdir(parents=True, exist_ok=True)
     partial = out.with_name(out.name + ".part")
     try:
-        transfer.download(location, partial, size=want_size, sha256=want_sha, cancel=cancel,
+        transfer.download(location, partial, size=want_size, sha256=want_sha, cancel=cancel, what="the tuned DFlash2 drafter",
                           progress=lambda d, _s: report("Downloading the tuned DFlash2 drafter…", d, want_size))
+    except transfer.Unreachable as exc:
+        raise DraftingError(str(exc)) from None          # the network rule's sentence: the host, what to check, what still works
     except transfer.ChecksumMismatch:
         raise DraftingError("The tuned DFlash2 drafter did not pass the safety check, so it was deleted.") from None
     except transfer.Cancelled:
@@ -334,8 +336,10 @@ def ensure(data_dir: str | Path, *, progress: Progress | None = None, cancel: th
             base = done_before
             partial = src / (name + ".part")
             try:
-                transfer.download((base_url or drafting.BASE_URL) + name, partial, size=size, sha256=sha, cancel=cancel,
+                transfer.download((base_url or drafting.BASE_URL) + name, partial, size=size, sha256=sha, cancel=cancel, what="the DFlash2 drafter",
                                   progress=lambda d, _s, base=base: report("Downloading the DFlash2 drafter…", base + d, total))
+            except transfer.Unreachable as exc:
+                raise DraftingError(str(exc)) from None  # the network rule's sentence: the host, what to check, what still works
             except transfer.ChecksumMismatch:
                 raise DraftingError("The downloaded DFlash2 file did not pass the safety check, so it was deleted. Try again; if it keeps "
                                     "happening, use MTP for now.") from None

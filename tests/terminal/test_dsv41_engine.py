@@ -98,12 +98,10 @@ class Dsv41Engine(unittest.TestCase):
         name = next((self.release / "dsv41").glob("*.tar.gz")).name
         self.server.cut[name] = 800_000
         lines = []
-        self.assertIsNone(self.install(lines))                       # the connection broke part-way: said plainly, the partial file is kept
-        self.assertIn("resumes", " ".join(lines))
-        exe = self.install(lines)                                    # the next try continues from the byte it reached
-        self.assertIsNotNone(exe, lines)
-        ranges = [r for r in self.server.requests if r[1].endswith(".tar.gz") and r[2] and r[2] != "bytes=0-"]
-        self.assertTrue(ranges, self.server.requests)
+        exe = self.install(lines)                                    # the connection broke part-way: the same run continues from the byte it reached
+        self.assertIsNotNone(exe, lines)                             # (the network rule: resumed while bytes come, strata_control/netpolicy.py)
+        ranges = [r[2] for r in self.server.requests if r[1].endswith(".tar.gz")]
+        self.assertEqual(ranges, [None, "bytes=800000-"], "exactly one more request, from the byte the cut reached: no byte twice")
         self.assertEqual(self.tree(self.eng), self.before)
 
     def test_no_package_for_this_pc_is_a_plain_line_not_a_crash(self):

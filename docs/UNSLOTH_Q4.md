@@ -203,7 +203,7 @@ same top 20 per position.
 | `STRATA_KQ256=1` | Multi-token AVX2 kernels for the Q4_K / Q5_1 / Q8_0 experts. Bit-exact with ggml's, but measured no faster, so off. |
 | `STRATA_PARTIAL_PIN=1` | Registers the hottest part of the RAM budget (up to `STRATA_PARTIAL_PIN_GIB`, default 24) with the GPU driver, so the GPU computes a share of the misses over PCIe (`--pcie-frac`). Measured no faster, and it changes the numerics of those experts, so off. |
 | `STRATA_FETCH_THREADS=N` | Threads that read the experts from the GGUF while it answers (default 8). The prompt path has its own: `STRATA_STAGER_THREADS` (default 32 here) and `STRATA_STAGER_RING` (128). |
-| `STRATA_RESIDENT_PIN=0` | Ordinary pageable memory for the RAM budget (see above). |
+| `STRATA_RESIDENT_PIN=0` | Ordinary pageable memory for the RAM budget, also for the RAM copy the engine makes on its own (see above). |
 
 ## UD-IQ4_XS
 

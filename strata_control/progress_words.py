@@ -18,6 +18,12 @@ from dataclasses import dataclass
 STEP_RE = re.compile(r"=== Step (\d+): (.+?) ===")
 CHECKING_RE = re.compile(r"^\s*checking\b.*\bSHA-256\b", re.I)
 PROGRESS_RE = re.compile(r"\s*(\S.*?): +([\d.]+) / ([\d.]+) GB \((\d+)%\)")
+try:                                                     # the network rule's own line and words (one place for them)
+    from strata_control.netpolicy import WAITING_RE, WORDS as _NET_WORDS
+    WAITING_WORDS = _NET_WORDS["waiting"]
+except ImportError:                                      # an older strata_control beside a newer reader: never waiting
+    WAITING_RE = re.compile(r"(?!)")
+    WAITING_WORDS = ""
 
 
 @dataclass(frozen=True)
@@ -51,6 +57,10 @@ def describe(step: int | None, lines: list[str], download: dict | None = None) -
     download figure in them (`{"file": ..., "percent": ...}` or None)."""
     recent = _after_last_step(lines)
     dl_file = str((download or {}).get("file", "")).lower()
+    last_line = next((ln for ln in reversed(recent) if ln.strip()), "")
+    waiting = WAITING_RE.match(last_line)
+    if waiting:                                          # a server has not answered yet (strata_control/netpolicy.py prints this line)
+        return Words("waiting", WAITING_WORDS.format(host=waiting.group("host"), seconds=waiting.group("seconds")))
     if step is None:
         return Words("working", "Getting your model ready")
     if step <= 2:

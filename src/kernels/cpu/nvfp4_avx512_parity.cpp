@@ -100,7 +100,16 @@ int report(const std::vector<std::vector<float>>& mine, const std::vector<std::v
 int verdict(const Kern& k, const char* what, double worst, int rows, int nt, int bad, int differ) {
     std::printf("%-7s %-36s worst |mine - ggml| / max|ggml| = %.2e over %d rows x 1..%d tokens, %d beyond 1e-5, "
                 "%d not bit-equal\n", k.name, what, worst, rows, nt, bad, differ);
+#if defined(STRATA_TEST_GGML_WITHOUT_AVX2)
+    // an older-CPU build (STRATA_ISA_FLOOR): ggml-cpu has no AVX2/FMA there, so its dot is not the AVX2 one these rows
+    // follow; only the 1e-5 check counts
+    if (k.exact)
+        std::printf("%-7s %-36s bit-equality not required (STRATA_ISA_FLOOR build: ggml-cpu without AVX2/FMA)\n",
+                    k.name, what);
+    return bad;
+#else
     return bad + (k.exact ? differ : 0);
+#endif
 }
 
 // plain rows: `rows` rows of `n` values, `row_bytes` apart

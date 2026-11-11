@@ -265,7 +265,14 @@ int check_gate_up(int type) {
         }
         std::printf("  %-8s exact singleton vs ggml: %zu of %zu expert outputs differ bitwise\n",
                     type_name(type), different, (size_t) kMaxT * R);
+#if defined(STRATA_TEST_GGML_WITHOUT_AVX2)
+        // an older-CPU build (STRATA_ISA_FLOOR): ggml-cpu has no AVX2/FMA there, so its dot is not the AVX2 one these
+        // rows follow; the tolerance check above still applies
+        std::printf("  %-8s exact singleton vs ggml: bit-equality not required (STRATA_ISA_FLOOR build: ggml-cpu "
+                    "without AVX2/FMA)\n", type_name(type));
+#else
         if (different) ++failures;
+#endif
     }
     for (int v : subsets(gu_variants())) {
         size_t differ = 0;

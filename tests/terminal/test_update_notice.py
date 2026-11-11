@@ -163,8 +163,9 @@ class Offline(UpdaterCase):
     def run_check(self, feed, join=60.0, env=None):
         out, err = io.StringIO(), io.StringIO()
         before = time.monotonic()
+        from tests.terminal import net_dead
         with mock.patch.dict(os.environ, env or {}), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), \
-                self.assertNoLogs(level=logging.INFO):
+                self.assertNoLogs(level=logging.INFO), net_dead.no_name_resolution():          # (no real name service: the offline PC is faked)
             thread = engine_update.start_daily_check(root=self.components, feed=feed)
             started_in = time.monotonic() - before
             thread.join(join)

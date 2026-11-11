@@ -30,7 +30,7 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from strata_control import tls  # noqa: E402
+from strata_control import netpolicy, tls  # noqa: E402
 
 tls.install()       # #3722: the operating system's certificates
 
@@ -51,6 +51,7 @@ if (os.environ.get("STRATA_SOURCE") or "").strip().lower() in ("ms", "modelscope
     REPO = PINNED = MS_ENDPOINT + "/models/Qwen/Qwen3.8-Flash-Next/resolve/master/"
 DTYPE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "I64": 8, "I32": 4}
 BAD = 3                                             # `verify`'s exit code: a tensor is missing or corrupt
+NO_ANSWER = 4                                       # the server did not answer or this computer is offline (the [X] lines say which; setup does not run it again)
 
 # #327: sha256 of every MTP tensor's bytes at PINNED_REVISION (two independent fetches agree, and 29 of them were read
 # again from that revision; the two expert tensors' first and last 16 MiB), so a mirror that ignored the
@@ -135,14 +136,26 @@ def _final(url):
     return hit[0] if hit and hit[1] > time.monotonic() else url
 
 
+_ANY_BYTES = [False]        # an answer has come in this run: from then on a server that stops answering is retried, not given up at once
+
+
+def _say_waiting(line):
+    print("  %s ..." % line, file=sys.stderr, flush=True)
+
+
 def get(url, start=None, end=None, retries=6):
+    """One range under the network rule (strata_control/netpolicy.py): each try waits at most 12 s, then 30 s, for the server's answer;
+    a server that never answered in this run, or a computer that is offline, stops the fetch at once (NetFailure, with the plain sentence);
+    after that a failed range is tried `retries` times."""
     for attempt in range(retries):
         try:
             used = _final(url)
             req = urllib.request.Request(used, headers={"User-Agent": "strata-mtp-fetch"})
             if start is not None:
                 req.add_header("Range", "bytes=%d-%d" % (start, end))
-            with urllib.request.urlopen(req, timeout=120) as r:
+            answer = netpolicy.open_url(netpolicy.urlopen, req, say=_say_waiting,
+                                        check_memory=not _ANY_BYTES[0])
+            with answer as r:
                 if start is not None:
                     check_range(r.status, r.headers.get("Content-Range"), start, end)
                 data = r.read()
@@ -152,10 +165,13 @@ def get(url, start=None, end=None, retries=6):
             if used == url and landed and landed != url:
                 with _cdn_lock:
                     _cdn[url] = (landed, time.monotonic() + CDN_TTL)
+            _ANY_BYTES[0] = True
             return data
         except Exception as e:  # network errors are retried, then surfaced
             with _cdn_lock:
                 _cdn.pop(url, None)
+            if isinstance(e, netpolicy.NetFailure) and (e.kind == "offline" or not _ANY_BYTES[0]):
+                raise                                   # nothing came in this run, or no connection at all: say so now
             if attempt == retries - 1:
                 raise
             time.sleep(min(2 ** attempt, 16))
@@ -311,7 +327,7 @@ def resolve_repo():
     try:
         req = urllib.request.Request(REPO + "model.safetensors.index.json", method="HEAD",
                                      headers={"User-Agent": "strata-mtp-fetch"})
-        urllib.request.urlopen(req, timeout=120).close()
+        netpolicy.open_url(netpolicy.urlopen, req, say=_say_waiting).close()
     except urllib.error.HTTPError as e:
         if e.code == 404 and "/resolve/%s/" % REVISION in REPO:
             if (os.environ.get("STRATA_ALLOW_UNPINNED") or "").strip() != "1":
@@ -485,8 +501,13 @@ def main():
         sys.exit(BAD if bad else 0)
     exit_with_parent()
     lock = lock_folder(a.out) if a.cmd == "fetch" else None
-    resolve_repo()
-    inventory(a.out) if a.cmd == "inventory" else fetch(a.out, a.only)
+    try:
+        resolve_repo()
+        inventory(a.out) if a.cmd == "inventory" else fetch(a.out, a.only)
+    except netpolicy.NetFailure as e:                # the server did not answer, or no connection: one plain sentence, not a traceback
+        print("  [X]  " + e.headline("the draft layer"), file=sys.stderr)
+        print("       " + e.next_step(), file=sys.stderr)
+        sys.exit(NO_ANSWER)
     if lock:
         lock.close()
 

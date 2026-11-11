@@ -330,6 +330,14 @@ class Fetch(Base):
         with mock.patch.dict("os.environ", {"STRATA_UPDATE_TRUSTED_KEYS": ""}), mock.patch("strata_control.signing.load_trusted_keys", return_value={}):
             self.assertIsNone(drafting_fetch.ensure_tuned(self.data, feed=str(feed)))
 
+    def test_a_feed_nobody_answers_for_is_silent_offline_refused_or_never_answering(self):
+        from tests.terminal import net_dead
+        for kind in net_dead.KINDS:                                   # no network at all / a refused port / a server that never answers
+            with net_dead.dead_feed(kind) as dead:
+                self.assertIsNone(drafting_fetch.ensure_tuned(self.data, feed=dead), kind)
+                self.assertIsNone(drafting_fetch.tuned_from_feed(feed=dead), kind)
+            self.assertFalse(drafting.tuned_path(self.data).exists(), kind)
+
     def test_a_launch_that_got_nothing_does_not_ask_again_for_twelve_hours_but_setup_always_asks(self):
         nofeed = str(self.root / "no-feed-here")
         self.assertIsNone(drafting_fetch.ensure_tuned(self.data, feed=nofeed, throttle=True))
@@ -377,9 +385,9 @@ class Fetch(Base):
         calls = []
         real = transfer._transfer
 
-        def spy(location, part, have, size, progress, cancel, timeout):
+        def spy(location, part, have, size, progress, cancel, timeout, **more):
             calls.append(have)
-            return real(location, part, have, size, progress, cancel, timeout)
+            return real(location, part, have, size, progress, cancel, timeout, **more)
         with mock.patch.object(transfer, "_transfer", spy):
             drafting_fetch.ensure_tuned(self.data, url=self.url)
         self.assertEqual(calls, [99], "it continued at byte 99, not from the start")
@@ -860,7 +868,8 @@ class SetupOnAMac(Base):
         self.assertIn("Downloading the DFlash2 drafter (0.34 GB, once)", self.said[0][1])
 
     def test_offline_it_says_nothing(self):
-        with mock.patch.object(drafting_fetch, "online", return_value=False):
+        from tests.terminal import net_dead
+        with mock.patch.object(drafting_fetch, "online", return_value=False), net_dead.no_name_resolution():     # (the feed lookup is offline too)
             self.assertIsNone(self.mac.fetch_drafter(Q4, self.data))
         self.assertEqual(self.said, [])
 

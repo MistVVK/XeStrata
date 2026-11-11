@@ -436,7 +436,8 @@ class TestInterruptedTransfer(StoreCase):
         # partial is discarded and the ranged request then fails on the unreachable host.
         object.__setattr__(artifact, "url", "https://example.invalid/e.tar.gz")
         object.__setattr__(artifact, "bytes", 100)
-        with self.assertRaises(C.ComponentError):
+        from tests.terminal import net_dead
+        with net_dead.no_name_resolution(), self.assertRaises(C.ComponentError):               # (no real name service: the host is unreachable)
             self.store._fetch(artifact)
         self.assertFalse(partial.exists(), "a stale partial is removed, not appended to")
 
@@ -454,8 +455,9 @@ class TestInterruptedTransfer(StoreCase):
             def __exit__(self_inner, *a):
                 return False
 
-        original = urllib.request.urlopen
-        urllib.request.urlopen = lambda *a, **k: FakeResponse(body)
+        from strata_control import netpolicy           # the download's own seam (strata_control/netpolicy.py)
+        original = netpolicy.urlopen
+        netpolicy.urlopen = lambda *a, **k: FakeResponse(body)
         try:
             component, _ = self.payload(tar_bytes([("a", b"x")]))
             artifact = component.artifacts[0]
@@ -464,18 +466,18 @@ class TestInterruptedTransfer(StoreCase):
                 self.store._fetch(artifact)
             self.assertIn("resume", str(ctx.exception))
         finally:
-            urllib.request.urlopen = original
+            netpolicy.urlopen = original
         self.assertTrue((self.store.root / "partial" / "engine.tar.gz").exists(),
                         "the partial bytes must be kept for a resume")
 
     def test_an_unreachable_url_is_reported_as_an_interruption_not_a_crash(self):
-        import urllib.request
-        original = urllib.request.urlopen
+        from strata_control import netpolicy           # the download's own seam (strata_control/netpolicy.py)
+        original = netpolicy.urlopen
 
         def boom(*a, **k):
             raise OSError("network unreachable")
 
-        urllib.request.urlopen = boom
+        netpolicy.urlopen = boom
         try:
             component, _ = self.payload(tar_bytes([("a", b"x")]))
             artifact = component.artifacts[0]
@@ -484,7 +486,7 @@ class TestInterruptedTransfer(StoreCase):
                 self.store._fetch(artifact)
             self.assertIn("interrupted", str(ctx.exception))
         finally:
-            urllib.request.urlopen = original
+            netpolicy.urlopen = original
 
     def test_a_crash_during_install_leaves_no_complete_entry(self):
         """The `.complete` marker is written last, so a partial directory is never trusted."""

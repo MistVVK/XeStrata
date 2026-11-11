@@ -222,6 +222,7 @@ class StartNeverAcquiresTests(unittest.TestCase):
             st.enter_context(mock.patch.object(setup, "ROOT", self.root))
             st.enter_context(mock.patch.object(sys, "argv", ["setup.py", *argv]))
             st.enter_context(mock.patch.object(urllib.request, "urlopen", rec.urlopen))
+            st.enter_context(mock.patch.object(setup.netpolicy, "urlopen", rec.urlopen))
             for n in ("run", "call", "Popen", "check_call", "check_output"):
                 st.enter_context(mock.patch.object(subprocess, n, rec.program))
             st.enter_context(mock.patch.object(setup, "gpus", lambda: gpus or []))
@@ -292,7 +293,7 @@ class StartNeverAcquiresTests(unittest.TestCase):
             lambda: setup.cmake_build(self.root, self.root / "b", "strata", [], None, ""),
             lambda: setup.pip_cuda_libs(13),
         ]
-        with mock.patch.object(urllib.request, "urlopen", rec.urlopen), \
+        with mock.patch.object(urllib.request, "urlopen", rec.urlopen), mock.patch.object(setup.netpolicy, "urlopen", rec.urlopen), \
                 mock.patch.object(subprocess, "run", rec.program), mock.patch.object(subprocess, "Popen", rec.program):
             with acquisition.forbidden():
                 for i, call in enumerate(calls):

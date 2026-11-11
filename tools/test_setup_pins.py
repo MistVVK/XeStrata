@@ -102,7 +102,7 @@ class HuggingFacePins(unittest.TestCase):
             seen.append((req.get_method(), req.full_url))
             raise not_found(req.full_url)
 
-        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", urlopen),                 mock.patch.dict(setup.os.environ, {"STRATA_SOURCE": "huggingface"}):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.netpolicy, "urlopen", urlopen),                 mock.patch.dict(setup.os.environ, {"STRATA_SOURCE": "huggingface"}):
             setup.os.environ.pop("STRATA_ALLOW_UNPINNED", None)
             dst = Path(d) / "m.gguf"
             with self.assertRaises(SystemExit):
@@ -122,7 +122,7 @@ class HuggingFacePins(unittest.TestCase):
             return Response(b"model bytes", status=200)
 
         # the pinned Hugging Face path itself (setup's --source huggingface; auto may pick ModelScope)
-        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", urlopen),                 mock.patch.dict(setup.os.environ, {"STRATA_SOURCE": "huggingface", "STRATA_ALLOW_UNPINNED": "1"}),                 mock.patch.object(setup, "_unpinned_said", []):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.netpolicy, "urlopen", urlopen),                 mock.patch.dict(setup.os.environ, {"STRATA_SOURCE": "huggingface", "STRATA_ALLOW_UNPINNED": "1"}),                 mock.patch.object(setup, "_unpinned_said", []):
             dst = Path(d) / "m.gguf"
             _, out = quiet(setup.download, setup.FAMILIES["qwen"]["mmproj_hf"] + "m.gguf", dst)
             self.assertEqual(dst.read_bytes(), b"model bytes")
@@ -142,7 +142,7 @@ class HuggingFacePins(unittest.TestCase):
                 return Response(b"model bytes")
             raise urllib.error.HTTPError(req.full_url, 416, "Range Not Satisfiable", {}, None)
 
-        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", urlopen), \
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.netpolicy, "urlopen", urlopen), \
                 mock.patch.object(setup.time, "sleep", lambda s: None):
             dst = Path(d) / "m.gguf"
             dst.with_name("m.gguf.part").write_bytes(b"model bytes")
@@ -161,12 +161,12 @@ class HuggingFacePins(unittest.TestCase):
             raise not_found(req.full_url)
 
         try:
-            with mock.patch.object(mtp_fetch.urllib.request, "urlopen", urlopen),                     mock.patch.dict(mtp_fetch.os.environ, {"STRATA_ALLOW_UNPINNED": ""}):
+            with mock.patch.object(mtp_fetch.netpolicy, "urlopen", urlopen),                     mock.patch.dict(mtp_fetch.os.environ, {"STRATA_ALLOW_UNPINNED": ""}):
                 with self.assertRaises(SystemExit) as stop:
                     mtp_fetch.resolve_repo()
                 self.assertIn("no longer on Hugging Face", str(stop.exception))
                 self.assertEqual(mtp_fetch.REPO, pinned)
-            with mock.patch.object(mtp_fetch.urllib.request, "urlopen", urlopen),                     mock.patch.dict(mtp_fetch.os.environ, {"STRATA_ALLOW_UNPINNED": "1"}),                     contextlib.redirect_stderr(io.StringIO()) as err:
+            with mock.patch.object(mtp_fetch.netpolicy, "urlopen", urlopen),                     mock.patch.dict(mtp_fetch.os.environ, {"STRATA_ALLOW_UNPINNED": "1"}),                     contextlib.redirect_stderr(io.StringIO()) as err:
                 self.assertEqual(mtp_fetch.resolve_repo(), "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/")
             self.assertIn("STRATA_ALLOW_UNPINNED=1", err.getvalue())
         finally:
@@ -265,7 +265,7 @@ class Engine(unittest.TestCase):
                 raise not_found(req.full_url)
             return Response()
 
-        with mock.patch.object(setup.urllib.request, "urlopen", urlopen), \
+        with mock.patch.object(setup.netpolicy, "urlopen", urlopen), \
                 mock.patch.object(setup, "download", self.fake_download(got, wrote)), \
                 mock.patch.object(setup, "engine_digest", self.fake_digest(wrote)):
             eng, out = quiet(setup.get_prebuilt, setup.PREBUILT_URL, {"arch": 89}, "gpu")
@@ -304,7 +304,7 @@ class Engine(unittest.TestCase):
                         z.writestr(setup.EXE, b"engine")
                     setup.mark(dst)
 
-                with mock.patch.object(setup.urllib.request, "urlopen", lambda req, timeout=None: Response()), \
+                with mock.patch.object(setup.netpolicy, "urlopen", lambda req, timeout=None: Response()), \
                         mock.patch.object(setup, "download", download), \
                         mock.patch.object(setup, "engine_digest", self.fake_digest(wrote)):
                     eng, _ = quiet(setup.get_prebuilt, setup.PREBUILT_URL, {"arch": 89}, "gpu")
@@ -336,7 +336,7 @@ class Engine(unittest.TestCase):
         def urlopen(req, timeout=None):
             raise AssertionError("asked the network for an installed engine")
 
-        with mock.patch.object(setup.urllib.request, "urlopen", urlopen):
+        with mock.patch.object(setup.netpolicy, "urlopen", urlopen):
             eng, out = quiet(setup.get_prebuilt, setup.PREBUILT_URL, {"arch": 89}, "gpu")
         self.assertEqual(eng, self.root / "engine")
         self.assertEqual((self.root / "engine" / setup.EXE).read_bytes(), b"old")

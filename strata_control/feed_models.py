@@ -107,7 +107,8 @@ class Loaded:
     notes: list = field(default_factory=list)
 
 
-def load(source: str | None = None, *, fetch: bool = True, root=None, trusted: dict | None = None, timeout: float = FETCH_TIMEOUT) -> Loaded:
+def load(source: str | None = None, *, fetch: bool = True, root=None, trusted: dict | None = None, timeout: float = FETCH_TIMEOUT,
+         say=None) -> Loaded:
     """The feed's models: the feed itself when it can be read now (and verifies, and is not older than the cached one), else the cache. Silent either way:
     nothing is printed and no error is raised. ``fetch=False`` reads the cache only (the Terminal and app lists)."""
     if os.environ.get(ENV_OFF, "").strip() == "0":
@@ -122,7 +123,8 @@ def load(source: str | None = None, *, fetch: bool = True, root=None, trusted: d
     cached = _read_cache(root, trusted)
     if fetch and source:
         try:
-            got = feedmod.fetch(source, trusted, timeout=timeout, channel="stable", last_sequence=cached.sequence if cached else None)
+            got = feedmod.fetch(source, trusted, timeout=timeout, channel="stable", last_sequence=cached.sequence if cached else None,
+                                say=say)
         except feedmod.FeedError as exc:                 # offline, expired, a downgrade, a bad signature: the last verified list stays
             _log.info("the update feed's model list could not be refreshed: %s", exc)
         except Exception as exc:                         # noqa: BLE001

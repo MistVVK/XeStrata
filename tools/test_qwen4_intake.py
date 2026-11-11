@@ -20,6 +20,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 HERE = pathlib.Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -424,6 +425,11 @@ class Output(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get("STRATA_LIVE_HF") == "1", "set STRATA_LIVE_HF=1 to read real headers from Hugging Face")
 class LiveHuggingFace(unittest.TestCase):
+    def setUp(self):
+        p = mock.patch.dict(os.environ, {"STRATA_TEST_ALLOW_NETWORK": "1"})      # a live test: the tests' network guard (conftest.py) lets it through
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_a_repo_directory_in_under_a_minute(self):
         t0 = time.time()
         out = pathlib.Path(_TMP.name) / "live.json"

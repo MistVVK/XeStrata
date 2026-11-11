@@ -64,6 +64,10 @@ export function installStage(install: { parts?: { kind?: string; state?: string;
   const count = Number(now.files_total) > 1 ? Number(now.files_total) : undefined;
   return { kind, ...(count ? { index: Math.min(count, Number(now.files_done ?? 0) + 1), count } : {}) };
 }
+/** While a download server has not answered yet (setup's waiting phase, strata_control/netpolicy.py): setup's own line, translated (net-<lang>.json); undefined otherwise. */
+export function waitingText(install: { phase?: string; label?: string } | undefined): string | undefined {
+  return install?.phase === 'waiting' && install.label ? tr(install.label) : undefined;
+}
 /** The sentence for it, in plain words. */
 export function stageText(stage: InstallStage | undefined): string {
   if (!stage) return tr('Downloading model files…');

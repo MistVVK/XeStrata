@@ -259,7 +259,7 @@ from 100 to 14 tok/s with only a few hundred slots too many. Use `--expert-cache
 
 **A low-RAM PC (about 32 GB) stalls with `--resident-budget-gib N` (#649).**
 The budget is pinned (locked) in RAM, which leaves the OS and the CPU workers little room. `STRATA_RESIDENT_PIN=0` keeps
-it pageable; a smaller budget works too.
+it pageable (also the RAM copy the engine makes on its own when the expert arena does not fit); a smaller budget works too.
 
 **Decode got slower in 0.1.40 on a 32 GB PC with `--resident-budget-gib N`, and the drive is read hard (#1194, #1116, #1085).**
 The start line "the file tier reads unbuffered" means the experts outside the RAM copy are read straight from the drive.

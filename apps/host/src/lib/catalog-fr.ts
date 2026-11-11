@@ -14,4 +14,5 @@ import r3 from '../locales/r3-fr.json';
 import pic from '../locales/pic-fr.json';
 import gui from '../locales/gui-fr.json';
 import sav from '../locales/sav-fr.json';
-export default {...base,...tune,...tools,...fix,...gh,...ui,...engine,...pick,...df2,...upd,...r3,...pic,...gui,...sav} as Record<string,string>;
+import net from '../locales/net-fr.json';
+export default {...base,...tune,...tools,...fix,...gh,...ui,...engine,...pick,...df2,...upd,...r3,...pic,...gui,...sav,...net} as Record<string,string>;

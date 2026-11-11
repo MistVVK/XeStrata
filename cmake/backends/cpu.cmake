@@ -341,6 +341,11 @@ macro(strata_cpu_native_experts)
   # round 0216: the CPU pool's part of a decode window replayed without a GPU (per-layer format pairs, calibrated expert and row counts, cold DRAM)
   add_executable(kq_window_bench src/kernels/cpu/kq_window_bench.cpp)
   target_link_libraries(kq_window_bench PRIVATE strata_kernels_cpu)
+  # an older-CPU build (STRATA_ISA_FLOOR avx / none) builds ggml-cpu without AVX2 and FMA, so ggml's dot rounds
+  # differently from the AVX2 path our rows copy step for step: the tests skip only their bit-equality leg there
+  if(STRATA_ISA_FLOOR)
+    target_compile_definitions(iq_avx2_parity PRIVATE STRATA_TEST_GGML_WITHOUT_AVX2=1)
+  endif()
   if(STRATA_BUILD_TESTS)
     add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
     add_test(NAME iq_avx2_parity_iq3s_mt1 COMMAND ${CMAKE_COMMAND} -E env STRATA_IQ3S_MT1=1 $<TARGET_FILE:iq_avx2_parity>)

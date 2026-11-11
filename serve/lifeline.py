@@ -290,12 +290,11 @@ def popen(args, role: str = "engine", **kw) -> subprocess.Popen:
         parent, then = os.getpid(), kw.pop("preexec_fn", None)
         kw["preexec_fn"] = _die_with_parent(parent, then)
         child = _the_anchor().call(lambda: subprocess.Popen(args, **kw))
+    elif how == "job":
+        child = winjob.start_contained(args, **kw)   # in the job before it runs, so nothing it starts slips out
     else:
         child = subprocess.Popen(args, **kw)
-        if how == "job":
-            winjob.contain(child)
-        else:
-            _watch(child)
+        _watch(child)
     if isinstance(child, _REAL_POPEN):
         with _children_lock:
             _children.add(child)

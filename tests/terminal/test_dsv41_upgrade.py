@@ -81,7 +81,15 @@ class Upgrade(Dsv41Engine):
         self.assertGreater(key("0.1.49.1-x"), key("0.1.49-x"))
 
     def test_an_unreachable_feed_is_silent_and_the_installed_engine_stays(self):
-        for dead in ("http://127.0.0.1:9/strata-feed.json", str(self.root / "no-such-feed")):       # nothing answers / the folder is gone
+        from tests.terminal import net_dead
+        for kind in net_dead.KINDS:                                   # no network at all / a refused port / a server that never answers
+            with net_dead.dead_feed(kind) as dead:
+                lines = []
+                with mock.patch.object(dsv41_engine, "_test_start", return_value=(True, "x")):
+                    self.assertIsNone(dsv41_engine.upgrade(self.dest, dead, installed=self.old, hardware=self.hw, emit=lines.append))
+                self.assertEqual(lines, [], (kind, dead))
+                self.assertEqual(self.folders(), ["0.1.49"])
+        for dead in (str(self.root / "no-such-feed"),):               # the folder is gone
             lines = []
             with mock.patch.object(dsv41_engine, "_test_start", return_value=(True, "x")):
                 self.assertIsNone(dsv41_engine.upgrade(self.dest, dead, installed=self.old, hardware=self.hw, emit=lines.append))

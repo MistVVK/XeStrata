@@ -348,8 +348,9 @@ class Install(Base):
         self.server.cut[next((self.release / "shapes").glob("*.tar.gz")).name] = 800_000
         lines = []
         with mock.patch.object(shape_engine, "_test_start", return_value=(True, "x")):
-            self.assertIsNone(self.ensure(lines))
-            self.assertIsNotNone(self.ensure(lines), lines)
+            self.assertIsNotNone(self.ensure(lines), lines)           # cut part-way: the same run continues from the byte it reached
+        ranges = [r[2] for r in self.server.requests if r[1].endswith(".tar.gz")]
+        self.assertEqual(ranges, [None, "bytes=800000-"], "exactly one more request, from the byte the cut reached: no byte twice")
         self.assertEqual(self.strata_before, tree(self.comp / "engine"))
 
     def test_the_feed_has_no_engine_for_the_shape(self):
@@ -534,14 +535,18 @@ class Update(Base):
         self.assertEqual(lines, [])
 
     def test_an_unreachable_feed_leaves_an_installed_engine_alone_and_says_nothing(self):
+        from tests.terminal import net_dead
         self.installed("0.1.59")
-        lines = []
-        exe = shape_engine.ensure(SHAPE, "http://127.0.0.1:9/strata-feed.json", components=self.comp, hardware=self.hw, emit=lines.append)
-        self.assertTrue(exe.is_file())
-        self.assertEqual(lines, [])
-        lines = []
-        self.assertIsNone(shape_engine.ensure("q4_mid", "http://127.0.0.1:9/strata-feed.json", components=self.comp, hardware=self.hw, emit=lines.append))
-        self.assertTrue(any("could not be downloaded" in line for line in lines), lines)
+        for kind in net_dead.KINDS:                                   # no network at all / a refused port / a server that never answers
+            with net_dead.dead_feed(kind) as dead:
+                lines = []
+                exe = shape_engine.ensure(SHAPE, dead, components=self.comp, hardware=self.hw, emit=lines.append)
+                self.assertTrue(exe.is_file(), kind)
+                self.assertEqual(lines, [], kind)
+        with net_dead.dead_feed("refused") as dead:                   # a shape with no engine yet has nothing to fall back on: that one is said
+            lines = []
+            self.assertIsNone(shape_engine.ensure("q4_mid", dead, components=self.comp, hardware=self.hw, emit=lines.append))
+            self.assertTrue(any("could not be downloaded" in line for line in lines), lines)
 
     def test_the_explicit_update_has_a_step_only_for_an_installed_shape(self):
         self.publish("0.1.59")
