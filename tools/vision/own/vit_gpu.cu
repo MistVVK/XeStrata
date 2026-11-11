@@ -263,6 +263,125 @@ __global__ void k_widen16(const uint16_t* __restrict__ in, size_t n, float* __re
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
         out[i] = kind == K_F16 ? __half2float(__ushort_as_half(in[i])) : __uint_as_float((uint32_t) in[i] << 16);
 }
+
+// The fused attention for gfx11 (RDNA3 / RDNA3.5: gfx1100-1103, gfx1150, gfx1151; STRATA_VIT_FA=1): S = Q K^T, the softmax and O = P V of a chunk of queries for
+// every head in one launch, flash-attention style, with the gfx11 WMMA instruction (16x16x16, F16 in, float32 accumulate, wave32).  One block = 4 waves =
+// 64 queries of one head; each wave owns 16 queries and walks the keys in tiles of kFaKeys.  Per tile: the scores of the wave's 16 queries (float32, never
+// rounded to 16 bits), an online softmax in float32 (running row maximum and sum, expf), P rounded to F16 for the second product, O += P V in float32
+// registers.  The head size is padded with zeros to NT * 16 (72 -> 80).  O / row sum goes to ctx in float32.  No atomics, a fixed key order: the result is
+// the same on every run.  q is already scaled by 1 / sqrt(head size) (k_qkv_rope).  The WMMA fragment layouts (wave32): A: lane l holds row l % 16, 16
+// consecutive K values; B: lane l holds column l % 16, 16 consecutive K values; C / D (float32): lane l holds column l % 16, rows 2 * e + l / 16, e = 0..7.
+constexpr int kFaQ = 64, kFaKeys = 64;
+#if defined(__GFX11__)
+typedef _Float16 vit_half16 __attribute__((ext_vector_type(16)));
+typedef float vit_float8 __attribute__((ext_vector_type(8)));
+// 16 consecutive F16 values from a 16-byte aligned address, as two 128-bit loads
+__device__ __forceinline__ vit_half16 fa_ld16(const _Float16* p) {
+    const uint4 x0 = *(const uint4*) p, x1 = *(const uint4*) (p + 8);
+    vit_half16 r;
+    __builtin_memcpy(&r, &x0, 16);
+    __builtin_memcpy((char*) &r + 16, &x1, 16);
+    return r;
+}
+#endif
+// Tuning round 1 (11-11): K and V reach LDS by 128-bit global loads (8 F16 values; the head size must be a multiple of 8), the fragments leave LDS by
+// 128-bit loads (LDS rows padded by 8 values to stay 16-byte aligned and to shift the banks), 64-key tiles, exp2f with log2(e) folded into the scores,
+// and the P exchange inside a wave (a wave barrier with LDS fences, not a block barrier).
+template <int NT>
+__global__ void __launch_bounds__(128) k_attn_fa_gfx11(const uint16_t* __restrict__ q, const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
+                                                       float* __restrict__ ctx, int N, int q0, int qc, int D, int hd) {
+#if defined(__GFX11__)
+    constexpr int DP = NT * 16, SKP = DP + 8, KP = kFaKeys + 8, CH = DP / 8;
+    constexpr float kLog2e = 1.4426950408889634f;
+    __shared__ __attribute__((aligned(16))) _Float16 sK[kFaKeys][SKP];      // the key tile, row = key
+    __shared__ __attribute__((aligned(16))) _Float16 sVt[DP][KP];           // the value tile transposed, row = head dimension
+    __shared__ __attribute__((aligned(16))) _Float16 sP[4][16][KP];         // each wave's probabilities, row = query
+    const int h = blockIdx.y, wave = threadIdx.x / 32, lane = threadIdx.x % 32, l16 = lane % 16, hi = lane / 16;
+    const int qw = q0 + blockIdx.x * kFaQ + wave * 16;           // this wave's first query
+    const size_t hoff = (size_t) h * hd;
+    // the wave's Q as NT A fragments: row l16 = query qw + l16, columns 16 * s .. 16 * s + 15 of the head
+    vit_half16 qa[NT];
+    {
+        const int qi = qw + l16;
+        const bool ok = qi < q0 + qc;
+        const _Float16* qr = (const _Float16*) q + (size_t) qi * D + hoff;
+        for (int s = 0; s < NT; ++s)
+            for (int e = 0; e < 16; ++e) {
+                const int d = s * 16 + e;
+                qa[s][e] = (ok && d < hd) ? qr[d] : (_Float16) 0.0f;
+            }
+    }
+    vit_float8 o[NT];
+    for (int t = 0; t < NT; ++t) o[t] = vit_float8{0, 0, 0, 0, 0, 0, 0, 0};
+    float mrow[8], lrow[8];                          // rows 2 * e + hi of the wave's 16 queries; the maximum in log2 units
+    for (int e = 0; e < 8; ++e) { mrow[e] = -INFINITY; lrow[e] = 0.0f; }
+    for (int k0 = 0; k0 < N; k0 += kFaKeys) {
+        __syncthreads();                             // the previous tile is used up
+        for (int i = threadIdx.x; i < kFaKeys * CH; i += blockDim.x) {
+            const int key = i / CH, d = (i % CH) * 8, kk = k0 + key;
+            uint4 kx = make_uint4(0, 0, 0, 0), vx = make_uint4(0, 0, 0, 0);
+            if (kk < N && d < hd) {
+                const size_t g = (size_t) kk * D + hoff + d;
+                kx = *(const uint4*) (k + g);
+                vx = *(const uint4*) (v + g);
+            }
+            *(uint4*) &sK[key][d] = kx;
+            _Float16 vv[8];
+            __builtin_memcpy(vv, &vx, 16);
+            for (int e = 0; e < 8; ++e) sVt[d + e][key] = vv[e];
+        }
+        __syncthreads();
+        // the scores of the wave's 16 queries against the tile's keys, in 16-key quarters, times log2(e)
+        vit_float8 sc[kFaKeys / 16];
+        for (int j = 0; j < kFaKeys / 16; ++j) {
+            vit_float8 acc = vit_float8{0, 0, 0, 0, 0, 0, 0, 0};
+            for (int s = 0; s < NT; ++s) acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qa[s], fa_ld16(&sK[j * 16 + l16][s * 16]), acc);
+            const bool valid = k0 + j * 16 + l16 < N;
+            for (int e = 0; e < 8; ++e) sc[j][e] = valid ? acc[e] * kLog2e : -INFINITY;
+        }
+        // online softmax per query row: this lane holds rows 2 * e + hi of one key column per quarter; the row's other keys are in the 16 lanes of its half
+        for (int e = 0; e < 8; ++e) {
+            float mx = sc[0][e];
+            for (int j = 1; j < kFaKeys / 16; ++j) mx = fmaxf(mx, sc[j][e]);
+            for (int off = 8; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off, 16));
+            const float mnew = fmaxf(mrow[e], mx);
+            const float corr = exp2f(mrow[e] - mnew);
+            float sum = 0.0f;
+            for (int j = 0; j < kFaKeys / 16; ++j) {
+                const float pr = exp2f(sc[j][e] - mnew);
+                sum += pr;
+                sP[wave][2 * e + hi][j * 16 + l16] = (_Float16) pr;
+            }
+            for (int off = 8; off > 0; off >>= 1) sum += __shfl_xor(sum, off, 16);
+            lrow[e] = lrow[e] * corr + sum;
+            mrow[e] = mnew;
+            for (int t = 0; t < NT; ++t) o[t][e] *= corr;
+        }
+        // sP is this wave's own: every lane's writes before any lane's reads, inside the wave
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+        // O += P V: A = P (row = query l16, 16 keys), B = V (16 keys, column = head dimension t * 16 + l16)
+        for (int j = 0; j < kFaKeys / 16; ++j) {
+            const vit_half16 pa = fa_ld16(&sP[wave][l16][j * 16]);
+            for (int t = 0; t < NT; ++t) o[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, fa_ld16(&sVt[t * 16 + l16][j * 16]), o[t]);
+        }
+    }
+    // O / row sum to the context rows: lane column = head dimension t * 16 + l16, rows 2 * e + hi
+    for (int e = 0; e < 8; ++e) {
+        const int qi = qw + 2 * e + hi;
+        if (qi >= q0 + qc) continue;
+        const float inv = 1.0f / lrow[e];
+        float* out = ctx + (size_t) qi * D + hoff;
+        for (int t = 0; t < NT; ++t) {
+            const int d = t * 16 + l16;
+            if (d < hd) out[d] = o[t][e] * inv;
+        }
+    }
+#else
+    (void) q; (void) k; (void) v; (void) ctx; (void) N; (void) q0; (void) qc; (void) D; (void) hd;
+#endif
+}
 #endif
 
 // x[r] += y[r] + bias
@@ -492,6 +611,13 @@ struct VitGpuImpl {
     // phaseA-tests\par\RESULTS-COVER.md); mtmd's reader asks for the 16-bit result there.  STRATA_VIT_HPA16_ATT=1: the same for the attention's P*V product
     // (F16 -> F16, float32 accumulation; the score product S is F16 -> F16 already).  The result is the float32 sum rounded once to 16 bits.
     bool hpa16 = false, hpa16_att = false;
+    // [DRAFT, status: research] STRATA_VIT_FA (on by default on gfx1151 only, see VitGpu::load; =1 asks for it on another gfx11 card, =0 turns it off): the fused attention
+    // k_attn_fa_gfx11 on gfx11 cards (wave32).  A launch takes at most fa_units query x key x head
+    // triples (STRATA_VIT_FA_UNITS overrides): 2^29, measured on the 780M with the first version at about 1.4 TFLOP/s as about 110 ms, so far
+    // from the Windows GPU timeout of 2 s on any gfx11 card, also at the 16,384-token limit (65,232 patches: about 130 launches a layer).  With STRATA_VIT_PROF the longest launch of an encode is printed.
+    bool fa = false;
+    long long fa_units = 1LL << 29;
+    double fa_longest_ms = 0.0;
     uint16_t *d_y16 = nullptr, *d_pv16 = nullptr;     // the 16-bit results (sized with the work buffers when the switch is on)
     size_t y16_elems = 0, pv16_elems = 0;
 #endif
@@ -713,6 +839,9 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
     if (!vit_geometry_supported(g, why)) { err = "this tower is not supported: " + why; return false; }
     m.g = g;
     m.device = device;
+#if defined(STRATA_VIT_HIP)
+    bool fa_default = false;      // the fused attention is the default on gfx1151 (below); STRATA_VIT_FA overrides it either way
+#endif
 #if !defined(STRATA_VIT_HIP)
     bool pascal = false;
     {   // Pascal (compute capability 6.x): BF16 matrices as F16 (and the larger score chunk below)
@@ -725,8 +854,15 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
         // HH_HPA kernels (F16 results, 10-bit mantissa).  Strix, 18 pictures at 1,024 tokens: Qwen3.8 0.54-0.83 of mtmd-HIP's time (median 0.66), Qwen3.6
         // 0.57-0.91 (median 0.67), rule 1 and 2 pass on both, byte-identical in and across processes; the BF16 results of BB_HPA missed rule 1 on 3 of the
         // Qwen3.8 pictures and rule 2 on 3 (RESULTS-OWN-3V.md PART F2/F3).  STRATA_VIT_HPA16, STRATA_VIT_HPA16_ATT and STRATA_VIT_BF16_AS_F16 = 0 turn each off.
+        // The fused attention k_attn_fa_gfx11 is on by default there too (Strix, RESULTS-OWN-3V.md PART F8): attention 0.50 of the default's time on the 1,024-token
+        // picture, the whole picture 0.84-0.90, rule 1 and 2 on 18 of 18 pictures on both models, byte-identical in and across processes, longest launch 6 ms
+        // (17 ms at 65,536 patches, which read 0.999693 against mtmd-CPU).  STRATA_VIT_FA=0 turns it off.  gfx1151 only: gfx1103 and the other gfx11 cards keep it off
+        // until they have their own gate.
         hipDeviceProp_t p;
-        if (hipGetDeviceProperties(&p, device) == hipSuccess && vit_gpu_is_gfx1151(p.gcnArchName)) m.bf16_as_f16 = m.hpa16 = m.hpa16_att = true;
+        if (hipGetDeviceProperties(&p, device) == hipSuccess && vit_gpu_is_gfx1151(p.gcnArchName)) {
+            m.bf16_as_f16 = m.hpa16 = m.hpa16_att = true;
+            fa_default = p.warpSize == 32 && g.head_dim <= 96 && g.head_dim % 8 == 0;
+        }
         (void) hipGetLastError();
     }
 #endif
@@ -742,6 +878,16 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
     if (m.hpa16 || m.hpa16_att)
         std::fprintf(stderr, "vit-hpa16: 16-bit results with float32 accumulation for %s%s%s\n", m.hpa16 ? "the weight products" : "",
                      m.hpa16 && m.hpa16_att ? " and " : "", m.hpa16_att ? "the attention's P*V product" : "");
+    bool want_fa = fa_default;
+    if (const char* e = std::getenv("STRATA_VIT_FA")) want_fa = std::atoi(e) != 0;
+    if (want_fa) {
+        hipDeviceProp_t p;
+        if (hipGetDeviceProperties(&p, device) == hipSuccess && std::string(p.gcnArchName).rfind("gfx11", 0) == 0 && p.warpSize == 32 && g.head_dim <= 96 && g.head_dim % 8 == 0)
+            m.fa = true;
+        (void) hipGetLastError();
+        std::fprintf(stderr, "vit-fa: fused attention %s\n", m.fa ? "on (gfx11 WMMA)" : "asked for but not available on this card (gfx11, wave32, head size <= 96 and a multiple of 8 only)");
+    }
+    if (const char* e = std::getenv("STRATA_VIT_FA_UNITS")) { const long long u = std::atoll(e); if (u >= (1LL << 20)) m.fa_units = u; }
 #endif
     // the patch embedding: the two temporal taps summed, kept in float32 (a small matrix)
     {
@@ -862,6 +1008,31 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
         int QC = (int) std::max<size_t>(1, std::min<size_t>((size_t) N, m.sp_elems / ((size_t) H * Np)));
         const int qa = m.align_for((size_t) N);
         if (qa > 1 && QC < N && QC >= qa) QC -= QC % qa;
+#if defined(STRATA_VIT_HIP)
+        if (m.fa) {      // the fused attention, in launches of at most fa_units query x key x head triples (multiples of 64 queries)
+            long long qf = std::max<long long>(kFaQ, m.fa_units / ((long long) N * H));
+            qf = std::min<long long>((qf / kFaQ) * kFaQ, ((long long) N + kFaQ - 1) / kFaQ * kFaQ);
+            const int NT = (HD + 15) / 16;
+            for (int q0 = 0; q0 < N; q0 += (int) qf) {
+                const int qc = (int) std::min<long long>(qf, N - q0);
+                const dim3 grid((unsigned) ((qc + kFaQ - 1) / kFaQ), (unsigned) H);
+                const double t0 = prof ? pclock() : 0.0;
+                switch (NT) {
+                    case 1: k_attn_fa_gfx11<1><<<grid, 128>>>(m.d_q16, m.d_k16, m.d_v16, m.d_ctx, N, q0, qc, D, HD); break;
+                    case 2: k_attn_fa_gfx11<2><<<grid, 128>>>(m.d_q16, m.d_k16, m.d_v16, m.d_ctx, N, q0, qc, D, HD); break;
+                    case 3: k_attn_fa_gfx11<3><<<grid, 128>>>(m.d_q16, m.d_k16, m.d_v16, m.d_ctx, N, q0, qc, D, HD); break;
+                    case 4: k_attn_fa_gfx11<4><<<grid, 128>>>(m.d_q16, m.d_k16, m.d_v16, m.d_ctx, N, q0, qc, D, HD); break;
+                    case 5: k_attn_fa_gfx11<5><<<grid, 128>>>(m.d_q16, m.d_k16, m.d_v16, m.d_ctx, N, q0, qc, D, HD); break;
+                    default: k_attn_fa_gfx11<6><<<grid, 128>>>(m.d_q16, m.d_k16, m.d_v16, m.d_ctx, N, q0, qc, D, HD); break;
+                }
+                if (prof) {
+                    (void) cudaDeviceSynchronize();
+                    m.fa_longest_ms = std::max(m.fa_longest_ms, pclock() - t0);
+                }
+            }
+            if (!sync_err("the fused attention")) return false;
+        } else
+#endif
         for (int q0 = 0; q0 < N; q0 += QC) {
             const int qc = std::min(QC, N - q0);
             if (!m.bgemm(true, false, N, qc, HD, m.d_k16, CUDA_R_16F, D, HD, m.d_q16 + (size_t) q0 * D, CUDA_R_16F, D, HD, m.d_S, CUDA_R_16F, Np,
@@ -912,6 +1083,12 @@ bool VitGpu::encode(const PreparedImage& img, std::vector<float>& rows, int& nx,
     if (prof)
         std::fprintf(stderr, "vit-prof N=%d: patch-matrix %.2f, patch-embed %.2f, ln+qkv %.2f, attention %.2f (S product %.2f, softmax %.2f), o-proj %.2f, ffn %.2f, merger %.2f, copy-out %.2f ms\n", N, pt[0], pt[1], pt[2],
                      pt[3] + pt[8] + pt[9], pt[8], pt[9], pt[4], pt[5], pt[6], pt[7]);
+#if defined(STRATA_VIT_HIP)
+    if (prof && m.fa) {
+        std::fprintf(stderr, "vit-prof fa: longest fused-attention launch %.2f ms (STRATA_VIT_FA_UNITS %lld)\n", m.fa_longest_ms, m.fa_units);
+        m.fa_longest_ms = 0.0;
+    }
+#endif
     return true;
 }
 
