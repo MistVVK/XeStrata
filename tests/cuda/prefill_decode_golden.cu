@@ -93,14 +93,11 @@ const Fmt kFormats[] = {
     {T_Q8_0, "Q8_0", true},       {T_Q6_K, "Q6_K", true},     {T_TQ2_T, "TQ2_T", false},  {T_TQK6, "TQK6", false},
     {T_TQK7, "TQK7", false}};
 
-// the formats whose decode this build compiles (the trellis decode is CUDA-only until the HIP port)
+// the formats whose decode this build compiles: every one (the trellis decode on HIP too since the gfx12 port; the check keeps the list
+// so that a build without one says so instead of failing)
 bool built_here(int t) {
-#if defined(__HIPCC__)
-    return !is_tq(t);
-#else
     (void) t;
     return true;
-#endif
 }
 
 template <int T> void launch_probe(const uint8_t* blocks, int nblk, uint32_t* out) {
@@ -123,11 +120,9 @@ void run_probe(int t, const uint8_t* blocks, int nblk, uint32_t* out) {
         case T_Q5_1: launch_probe<T_Q5_1>(blocks, nblk, out); break;
         case T_Q8_0: launch_probe<T_Q8_0>(blocks, nblk, out); break;
         case T_Q6_K: launch_probe<T_Q6_K>(blocks, nblk, out); break;
-#if !defined(__HIPCC__)
         case T_TQ2_T: launch_probe<T_TQ2_T>(blocks, nblk, out); break;
         case T_TQK6: launch_probe<T_TQK6>(blocks, nblk, out); break;
         case T_TQK7: launch_probe<T_TQK7>(blocks, nblk, out); break;
-#endif
         default: throw std::runtime_error("no probe for this type in this build");
     }
 }

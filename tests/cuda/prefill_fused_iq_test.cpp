@@ -831,6 +831,20 @@ int main(int argc, char** argv) {
             std::printf("--no-kq: the i-quant / Q8_0 pairs are not covered here without STRATA_PF_FUSED_KQ (skipped)\n");
             return 77;
         }
+#if defined(__HIPCC__)
+        // the trellis pairs on HIP are gfx12's (STRATA_PF_FUSED_TQ=1): another AMD card skips the _tq / _tqh entries instead of failing; on gfx12
+        // the pairs must be covered (a host rule that does not take them fails below)
+        const char* only_tq = nullptr;
+        for (int i = 1; i < argc; ++i)
+            if (std::strncmp(argv[i], "--only=", 7) == 0) only_tq = argv[i] + 7;
+        if (only_tq != nullptr && std::strstr("TQK6 + TQK7 TQ2_T + TQ2_T", only_tq) != nullptr) {
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx12", 5) != 0) {
+                std::printf("the trellis pairs: gfx12 only on HIP (%s: skipped)\n", prop.gcnArchName);
+                return 77;
+            }
+        }
+#endif
         // with STRATA_PF_FUSED unset nothing is set up below sm_80 (Turing's pair is STRATA_PF_FUSED=1 STRATA_PF_FUSED_SM75=1's)
         if (unset_pf) {
             int major = 0;

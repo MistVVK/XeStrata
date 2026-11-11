@@ -25792,13 +25792,13 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2034,
+     "line": 2042,
      "backend": "cuda",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2360,
+     "line": 2372,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -25940,13 +25940,20 @@
   {
    "name": "STRATA_PF_FUSED_TQ",
    "backends": [
-    "cuda"
+    "cuda",
+    "hip"
    ],
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 1975,
+     "line": 2060,
      "backend": "cuda",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 2379,
+     "backend": "hip",
      "fn": "getenv"
     }
    ],
@@ -25966,7 +25973,7 @@
    "last_date": "",
    "status": "research",
    "owner": "prefill",
-   "note": "CUDA (phase 4, opt-in, default off): the Gyro trellis experts (TQK6 / TQK7, TQ2_T / TQ2_T) on the fused native kernels on any sm_80+ card instead of MMQ; Hadamard-folded layers are still declined by the prompt path.",
+   "note": "[DRAFT] CUDA and HIP gfx12 (phase 4, opt-in, default off): the Gyro trellis experts (TQK6 / TQK7, TQ2_T / TQ2_T), Hadamard-folded layers included, on the fused native kernels instead of MMQ, on any sm_80+ card and on gfx1200 / gfx1201.",
    "retire_after": "",
    "retired_in": ""
   },
