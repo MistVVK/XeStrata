@@ -271,6 +271,12 @@ macro(strata_cuda_mmq)
       target_link_libraries(prefill_fused_iq_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
       add_test(NAME prefill_fused_iq_test COMMAND prefill_fused_iq_test)
       set_tests_properties(prefill_fused_iq_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+      # the same kernels at Qwen3.6's expert shape (n_embd 2048, n_ff 512: the copy moe_fused_iq_q36.cu compiles): UD-Q6_K_XL's and the
+      # Q8_0 file's pairs against the reference, the int8 model and MMQ (77 below sm_80)
+      add_executable(prefill_fused_q36_test tests/cuda/prefill_fused_q36_test.cpp)
+      target_link_libraries(prefill_fused_q36_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
+      add_test(NAME prefill_fused_q36_test COMMAND prefill_fused_q36_test)
+      set_tests_properties(prefill_fused_q36_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
       # the opt-in STRATA_PF_FUSED_Q2N=1 on its own (the test leaves STRATA_PF_FUSED unset): the native Q2_0 pack's Q2_0 / Q2_0
       # layers on sm_80+ (77 below sm_80 and without a card)
       add_test(NAME prefill_fused_iq_test_q2n COMMAND prefill_fused_iq_test "--only=Q2_0 / Q2_0" --unset-pf-fused)
