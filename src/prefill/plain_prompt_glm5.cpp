@@ -255,7 +255,7 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
                     const float scale = s.expert_weights_scale > 0 ? (float) s.expert_weights_scale : 1.0f;
                     k::glm5_router_sigmoid(P.rlog, b.router_b, (int) T, (int) E, (int) K, s.expert_weights_norm, scale,
                                            P.ids, P.w, cs);
-                    if (!P.int8) kernels::f32_to_f16_bulk(P.hn, P.x16, T * N, cs);   // the FP16 path's routed rows
+                    if (P.f16) kernels::f32_to_f16_bulk(P.hn, P.x16, T * N, cs);   // the FP16 path's routed rows
                     const int64_t ml = s.moe_index(l);
                     if (!prompt_routed(ml, T, cpu_share, routes.empty() ? nullptr : routes.data() + ml * P.T * K,
                                        [&](int stage) { mark(stage == 1 ? 2 : 3); }, rst, err))

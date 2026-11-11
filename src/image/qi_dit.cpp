@@ -365,16 +365,13 @@ bool QiDit::product(const uint16_t* x16, const W& w, float* y, int64_t T, int64_
             w8 = reinterpret_cast<const uint8_t*>(w8t_) - row0 * w.k;
             sw = s;
         }
-        // a reader's values as BF16 where the fused kernel is the faster (dit_rows::w8_fused): scaled in its epilogue,
-        // half the bytes the reader reads
-        if (defer && col == nullptr && dit_rows::w8_fused(s_) &&
-            kernels::i8_gemm_bf16(x8, sx, reinterpret_cast<const int8_t*>(w8 + row0 * w.k), sw, nullptr,
-                                  reinterpret_cast<uint16_t*>(y), T, rows, w.k, ldy, s_)) {
+        // a reader's values as BF16 where the fused kernel is the faster (prefill::Gemm::w8a8): scaled in its
+        // epilogue, half the bytes the reader reads
+        if (prefill::Gemm::w8a8(x8, sx, reinterpret_cast<const int8_t*>(w8 + row0 * w.k), sw, nullptr, y, T, rows,
+                                w.k, ldy, defer && col == nullptr, s_)) {
             i8_ = {nullptr, nullptr, true};
             deferred = true;
         } else {
-            prefill::Gemm::i8(x8, reinterpret_cast<const int8_t*>(w8 + row0 * w.k), reinterpret_cast<int32_t*>(y), T,
-                              rows, w.k, ldy, s_);
             if (defer) {
                 i8_ = {sx, sw};
                 deferred = true;
@@ -949,8 +946,8 @@ void QiDit::glora_weight(const uint16_t* v, const W& w, int64_t r0, int64_t n, i
         // the input's own int8 quantization (its buffer, not the product's: that one's is the other products' input)
         qi_rows_i8(v, false, nt, w.k, lora_glora_x8_, lora_glora_sx_, nullptr, s_);
         const auto* sw = reinterpret_cast<const float*>(d + w.n * w.k) + r0;
-        prefill::Gemm::i8(lora_glora_x8_, reinterpret_cast<const int8_t*>(d) + r0 * w.k,
-                          reinterpret_cast<int32_t*>(lora_glora_y_), nt, n, w.k, n, s_);
+        prefill::Gemm::w8a8(lora_glora_x8_, lora_glora_sx_, reinterpret_cast<const int8_t*>(d) + r0 * w.k, sw, nullptr,
+                            lora_glora_y_, nt, n, w.k, n, false, s_);
         qi_i8_scale(lora_glora_y_, nt, n, n, lora_glora_sx_, sw, nullptr, nullptr, s_);
     } else if (w.type == kTypeF16) {
         gemm_.f16(v, reinterpret_cast<const uint16_t*>(d + (uint64_t) r0 * w.row_bytes), lora_glora_y_, nt, n, w.k, n);

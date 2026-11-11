@@ -11,7 +11,6 @@
 #include "strata/platform/mapped_file.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
-#include "strata/kernels/i8_gemm.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/platform/env.hpp"
@@ -680,17 +679,15 @@ MfOut Seedvr2Dit::product_out(const uint16_t* x16, const float* rs, const W& w, 
                               int64_t T, const float* bias, bool bf16) {
     const auto* d = base != nullptr ? base + reinterpret_cast<uintptr_t>(w.d) : static_cast<const uint8_t*>(w.d);
     if (w.type == kTypeW8) {   // input's int8 rows (xq8_ and their scales xs_in_) against the file's
-        // a reader's values as BF16 where the fused kernel is the faster (dit_rows::w8_fused): half the bytes it reads
+        // a reader's values as BF16 where the fused kernel is the faster (prefill::Gemm::w8a8): half the bytes it reads
         const auto* sw = reinterpret_cast<const float*>(base + w.sw);
-        if (bf16 && rows::w8_fused(s_) &&
-            kernels::i8_gemm_bf16(xq8_, xs_in_, reinterpret_cast<const int8_t*>(d), sw, bias,
-                                  reinterpret_cast<uint16_t*>(y), T, w.n, w.k, 0, s_)) {
+        if (prefill::Gemm::w8a8(xq8_, xs_in_, reinterpret_cast<const int8_t*>(d), sw, bias, y, T, w.n, w.k, w.n, bf16,
+                                s_)) {
             MfOut o;
             o.C = w.n;
             o.bf = reinterpret_cast<const uint16_t*>(y);
             return o;
         }
-        prefill::Gemm::i8(xq8_, reinterpret_cast<const int8_t*>(d), reinterpret_cast<int32_t*>(y), T, w.n, w.k, w.n, s_);
         return MfOut{nullptr, reinterpret_cast<const int32_t*>(y), nullptr, xs_in_, sw, bias, w.n};
     }
     if (w.type == kTypeQ8_0) gemm_.native(x16, kTypeQ8_0, d, y, T, w.n, w.k);

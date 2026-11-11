@@ -12,6 +12,10 @@
 #include <cstddef>
 #include <cstdint>
 
+namespace strata::kernels::cpu {
+struct NativeFmt;
+}
+
 namespace strata::prefill::mmq {
 
 /// The GPU runs these products (iq_mmq_usable).
@@ -106,6 +110,12 @@ bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_byt
 /// h[r, k] = silu(gate) * up of GU rows [2 n_ff wide]: interleaved (gate 2k, up 2k+1: the Strata pack) or split
 /// (gate k, up n_ff + k: GGUF).  FP32 out (the down product's quantizer reads floats).
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream);
+
+/// From how many rows an expert (a layer's rows over the experts it routes to) the FP16 path - the experts dequantized
+/// to FP16 and their grouped products - beats the int8 products on the current GPU, for experts of format `f` (`blob`
+/// bytes each): timed the first time a GPU and format are asked, and kept.  INT64_MAX: int8 at every size; 0: FP16 at
+/// every size; `fallback` where the timing cannot run.  Both engines' prompts choose a chunk's layer by it.
+int64_t int8_rows_below(const kernels::cpu::NativeFmt& f, size_t blob, int64_t fallback);
 
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);

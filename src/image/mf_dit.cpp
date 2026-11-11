@@ -15,7 +15,6 @@
 #include "strata/image/pipeline.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
-#include "strata/kernels/i8_gemm.hpp"
 #include "strata/kernels/flash_attn.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -368,16 +367,13 @@ MfOut MfDit::product(const uint16_t* x16, const float* rs, const W& w, const uin
         float* sx = scales + xs_next_ * xq8_rows_;
         if (!same_input) qi_rows_i8(x16, false, T, w.k, xq8_, sx, rs, s_);
         const auto* sw = reinterpret_cast<const float*>(d + w.n * w.k);
-        // a reader's values as BF16 where the fused kernel is the faster (dit_rows::w8_fused): half the bytes it reads
-        if (defer && dit_rows::w8_fused(s_) &&
-            kernels::i8_gemm_bf16(xq8_, sx, reinterpret_cast<const int8_t*>(d), sw, bias,
-                                  reinterpret_cast<uint16_t*>(y), T, w.n, w.k, 0, s_)) {
+        // a reader's values as BF16 where the fused kernel is the faster (prefill::Gemm::w8a8): half the bytes it reads
+        if (prefill::Gemm::w8a8(xq8_, sx, reinterpret_cast<const int8_t*>(d), sw, bias, y, T, w.n, w.k, w.n, defer,
+                                s_)) {
             out.f = nullptr;
             out.bf = reinterpret_cast<const uint16_t*>(y);
             return out;
         }
-        prefill::Gemm::i8(xq8_, reinterpret_cast<const int8_t*>(d), reinterpret_cast<int32_t*>(y), T, w.n, w.k, w.n,
-                          s_);
         if (defer) {
             out.f = nullptr;
             out.i = reinterpret_cast<const int32_t*>(y);
@@ -441,8 +437,8 @@ void MfDit::glora_weight(const uint16_t* v, const W& w, const uint8_t* d, int64_
         // the input's own int8 quantization (its buffer, not the product's: that one's is the other products' input)
         qi_rows_i8(v, false, nt, w.k, lora_glora_x8_, lora_glora_sx_, nullptr, s_);
         const auto* sw = reinterpret_cast<const float*>(d + w.n * w.k) + r0;
-        prefill::Gemm::i8(lora_glora_x8_, reinterpret_cast<const int8_t*>(d) + r0 * w.k,
-                          reinterpret_cast<int32_t*>(lora_glora_y_), nt, n, w.k, n, s_);
+        prefill::Gemm::w8a8(lora_glora_x8_, lora_glora_sx_, reinterpret_cast<const int8_t*>(d) + r0 * w.k, sw, nullptr,
+                            lora_glora_y_, nt, n, w.k, n, false, s_);
         qi_i8_scale(lora_glora_y_, nt, n, n, lora_glora_sx_, sw, nullptr, nullptr, s_);
     } else if (w.type == kTypeF16) {
         gemm_.f16(v, reinterpret_cast<const uint16_t*>(d) + r0 * w.k, lora_glora_y_, nt, n, w.k, n);

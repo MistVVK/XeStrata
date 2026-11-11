@@ -24,6 +24,7 @@
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_moe.hpp"
@@ -562,7 +563,6 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
     const int64_t N = spec_.n_embd, E = spec_.n_expert, K = spec_.n_expert_used, FF = spec_.n_ff_exp;
     strata::gpu::Stream cs = cs_;
     PromptGemm& pg = prompt_gemm();
-    const bool use_mmq = P.int8;
     // the routed experts grouped by expert, on the host from this layer's ids (and the normed rows, for the
     // CPU's share)
     if ((cpu_share && !strata::gpu::copy_async(P.h_hn, P.hn, (size_t) (T * N) * 4, cs)) ||
@@ -578,6 +578,12 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
         heat_[(size_t) (ml * E + e)] += 1.0;
     }
     dump_routes(ml, P.h_ids, T, K);
+    // the int8 products while the experts this layer routes to average fewer rows than this GPU measured them faster
+    // at (int8_below, prefill::mmq::int8_rows_below: Qwen3.8-Flash-Next's rule), else the FP16 path
+    int64_t routed = 0;
+    for (int64_t e = 0; e < E; ++e) routed += count[(size_t) e] > 0;
+    const bool use_mmq =
+        P.int8 && (!P.f16 || P.int8_below == INT64_MAX || T * K < P.int8_below * std::max<int64_t>(routed, 1));
     if (routes != nullptr) std::copy(P.h_ids, P.h_ids + T * K, routes);
     const auto& f = lay.fmt[(size_t) ml];
     // the CPU's share of the missed experts (after Project Maya's CPU lane, as the windows split them): of
@@ -608,17 +614,37 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
             --want;
         }
     }
-    // rows in expert order, the GPU's experts first (their bounds one run), the CPU's after them
+    // The FP16 path's resident experts of at most kIqGemmTileRows rows: their products iq_gemm_grouped_f16 takes straight
+    // from their GGUF blocks in the cache (dequantized in local memory to the same FP16 values: the same bits as
+    // dequantizing and multiplying, without writing the dequantized weights), as Qwen3.8-Flash-Next's prompt does
+    // (prefill.cpp); more rows than one work-group's would decode the weights again per group.  Gate and up of one type,
+    // the rows of up right after gate's; XMX (or tensor cores) for FP16.  STRATA_PREFILL_FUSED=0: every expert
+    // dequantized.
+    static const bool fused_on = [] {
+        const char* v = strata::env_get("PREFILL_FUSED");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    const bool fuse_res = fused_on && !use_mmq && !k::cpu::native_mixed_gu(f) && f.up_off == (size_t) FF * f.gu_row &&
+                          k::xmx_available(k::XmxType::f16) && k::iq_gemm_grouped_ok(f.gu_type, 2 * FF, N) &&
+                          k::iq_gemm_grouped_ok(f.d_type, N, FF);
+    auto fusable = [&](int64_t e) {
+        return fuse_res && count[(size_t) e] <= k::kIqGemmTileRows && res_[(size_t) (ml * E + e)] >= 0;
+    };
+    // rows in expert order, the GPU's experts first (their bounds one run; the fusable ones before the others), the
+    // CPU's after them
     std::vector<int32_t> experts, start((size_t) E, 0);
     int64_t gpu_rows = 0;
+    size_t nf = 0;   // experts' first nf: the fusable
     {
         int32_t at = 0;
-        for (int pass = 0; pass < 2; ++pass)
+        for (int pass = 0; pass < 3; ++pass)
             for (int64_t e = 0; e < E; ++e)
-                if (count[(size_t) e] > 0 && on_cpu[(size_t) e] == pass) {
+                if (count[(size_t) e] > 0 && (pass == 2 ? on_cpu[(size_t) e] != 0
+                                                        : on_cpu[(size_t) e] == 0 && fusable(e) == (pass == 0))) {
                     start[(size_t) e] = at;
                     at += count[(size_t) e];
-                    if (pass == 0) experts.push_back((int32_t) e);
+                    if (pass < 2) experts.push_back((int32_t) e);
+                    if (pass == 0) ++nf;
                 }
         for (int32_t e : experts) gpu_rows += count[(size_t) e];
     }
@@ -646,9 +672,12 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
     // blocks differently (Q2_K against another type)
     const int up_type = k::cpu::native_mixed_gu(f) ? f.up_type : f.gu_type;
     const bool up_xq2 = k::iq_mmq_type_dup(up_type) != k::iq_mmq_type_dup(f.gu_type);
-    if (use_mmq) prefill::mmq::quantize(P.hn, P.src, P.xq, f.gu_type, N, N, T * K, cs);
-    if (use_mmq && up_xq2) prefill::mmq::quantize(P.hn, P.src, P.xq2, up_type, N, N, T * K, cs);
-    else prefill::gather_rows16(P.x16, P.src, P.xs16, T * K, N, cs);
+    if (use_mmq) {
+        prefill::mmq::quantize(P.hn, P.src, P.xq, f.gu_type, N, N, T * K, cs);
+        if (up_xq2) prefill::mmq::quantize(P.hn, P.src, P.xq2, up_type, N, N, T * K, cs);
+    } else {
+        prefill::gather_rows16(P.x16, P.src, P.xs16, T * K, N, cs);
+    }
     mark(1);
     // whether a missed expert's blob is assembled into a short-lived buffer, asked of each: with a RAM copy of part
     // of the layer the first expert says nothing of the others (as the read-ahead below)
@@ -658,8 +687,6 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
             transient = true;
             break;
         }
-    int64_t max_rows = 0;
-    for (int32_t e : experts) max_rows = std::max<int64_t>(max_rows, count[(size_t) e]);
     // a source that assembles its experts from the files (transient: GGUF read in place): each group's missed experts
     // read ahead on the source's threads (prefetch, its page faults side by side), the next group's while this one is
     // copied and multiplied.  Group gi of the loop below takes the gi-th kGroup of the missed experts in order.
@@ -790,7 +817,33 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
     st.cpu_n += (int64_t) cpu_experts.size();
     for (int32_t e : cpu_experts) st.cpu_rows += count[(size_t) e];
     for (int64_t e = 0; e < E; ++e) st.miss_n += count[(size_t) e] > 0 && res_[(size_t) (ml * E + e)] < 0;
-    for (size_t g0 = 0; !use_mmq && g0 < experts.size(); g0 += PromptBufs::kGroup) {
+    // A layer the int8 products could take (their types) has its gate and up rows dequantized interleaved, with down's,
+    // in one launch an expert (iq_dequant_expert_f16, Qwen3.8-Flash-Next's layout and launch; three launches an expert
+    // before), the SwiGLU reading them so; else gate rows then up rows (the GGUF order)
+    const bool il = P.int8 && !k::cpu::native_mixed_gu(f) && N % 256 == 0;
+    // the fusable experts, kIqGemmGroup a launch, from their cache slots
+    std::vector<const void*> fgu, fd;
+    for (size_t j0 = 0; !use_mmq && j0 < nf; j0 += (size_t) k::kIqGemmGroup) {
+        const size_t j1 = std::min(nf, j0 + (size_t) k::kIqGemmGroup);
+        fgu.clear();
+        fd.clear();
+        int64_t maxr = 0;
+        for (size_t j = j0; j < j1; ++j) {
+            const int32_t e = experts[j];
+            const uint8_t* blob = cache_.device_slot(res_[(size_t) (ml * E + e)]);
+            fgu.push_back(blob);
+            fd.push_back(blob + f.down_off);
+            maxr = std::max<int64_t>(maxr, count[(size_t) e]);
+        }
+        const int G = (int) (j1 - j0);
+        const int64_t r0 = P.h_bounds[j0], r1 = P.h_bounds[j1];
+        k::iq_gemm_grouped_f16(f.gu_type, P.xs16, fgu.data(), il ? FF : 0, P.gu, 2 * FF, P.bounds + j0, G, maxr, 2 * FF,
+                               N, cs);
+        prefill::mmq::swiglu(P.gu + r0 * 2 * FF, P.hh + r0 * FF, r1 - r0, FF, il, cs);
+        kernels::f32_to_f16_bulk(P.hh + r0 * FF, P.h16 + r0 * FF, (r1 - r0) * FF, cs);
+        k::iq_gemm_grouped_f16(f.d_type, P.h16, fd.data(), 0, P.dm, N, P.bounds + j0, G, maxr, N, FF, cs);
+    }
+    for (size_t g0 = nf; !use_mmq && g0 < experts.size(); g0 += PromptBufs::kGroup) {
         const int G = (int) std::min<size_t>(PromptBufs::kGroup, experts.size() - g0);
         if (transient && !strata::gpu::stream_sync(cs)) {   // the staging's last readers are done
             err = std::string("plain prompt: ") + strata::gpu::last_error();
@@ -811,24 +864,33 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
                 blob = dst;
             }
             uint16_t* dq = P.dq_gu + (size_t) q * P.gu_elems;
+            uint16_t* dqd = P.dq_d + (size_t) q * P.d_elems;
+            if (il) {
+                k::iq_dequant_expert_f16(f.gu_type, blob, blob + f.up_off, FF, N, dq, f.d_type, blob + f.down_off, dqd,
+                                         cs);
+                continue;
+            }
             if (k::cpu::native_mixed_gu(f)) {   // gate and up of different types: each by its own
                 k::dequant_f16(f.gu_type, blob, 0, FF, N, dq, cs);
                 k::dequant_f16(f.up_type, blob + f.up_off, 0, FF, N, dq + FF * N, cs);
             } else {
                 k::dequant_f16(f.gu_type, blob, 0, 2 * FF, N, dq, cs);
             }
-            k::dequant_f16(f.d_type, blob + f.down_off, 0, N, FF, P.dq_d + (size_t) q * P.d_elems, cs);
+            k::dequant_f16(f.d_type, blob + f.down_off, 0, N, FF, dqd, cs);
         }
         const int32_t* hbnd = P.h_bounds + g0;
         const int32_t* dbnd = P.bounds + g0;
         const int64_t r0 = hbnd[0], r1 = hbnd[G];
+        // the launch for the group's own largest expert (Qwen3.8-Flash-Next's): the layer's largest padded every group
+        int64_t maxr = 0;
+        for (int q = 0; q < G; ++q) maxr = std::max<int64_t>(maxr, count[(size_t) experts[g0 + (size_t) q]]);
         if (!prefill::Gemm::f16_groups(P.xs16, P.dq_gu, P.gu_elems, P.gu, hbnd, G, 2 * FF, N, cs))
-            k::xmx_gemm_grouped(P.xs16, P.dq_gu, P.gu_elems, P.gu, dbnd, G, max_rows, 2 * FF, N, cs);
-        // gate rows then up rows (the GGUF order): h = silu(gate) * up, then FP16 for the down product
-        prefill::mmq::swiglu(P.gu + r0 * 2 * FF, P.hh + r0 * FF, r1 - r0, FF, /*interleaved=*/false, cs);
+            k::xmx_gemm_grouped(P.xs16, P.dq_gu, P.gu_elems, P.gu, dbnd, G, maxr, 2 * FF, N, cs);
+        // h = silu(gate) * up, then FP16 for the down product
+        prefill::mmq::swiglu(P.gu + r0 * 2 * FF, P.hh + r0 * FF, r1 - r0, FF, il, cs);
         kernels::f32_to_f16_bulk(P.hh + r0 * FF, P.h16 + r0 * FF, (r1 - r0) * FF, cs);
         if (!prefill::Gemm::f16_groups(P.h16, P.dq_d, P.d_elems, P.dm, hbnd, G, N, FF, cs))
-            k::xmx_gemm_grouped(P.h16, P.dq_d, P.d_elems, P.dm, dbnd, G, max_rows, N, FF, cs);
+            k::xmx_gemm_grouped(P.h16, P.dq_d, P.d_elems, P.dm, dbnd, G, maxr, N, FF, cs);
     }
     mark(2);
     // routing entry i's output into row i, then the weighted sum (and the gated shared expert)
@@ -1059,8 +1121,8 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
         gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy, half_sums);
     };
     // the routed experts in their quantized blocks (int8 products, iq_mmq: on the matrix engines, else by dp4a where the
-    // FP16 products have none either) where every layer's types are theirs (prompt_int8, decided with the buffers),
-    // else dequantized to FP16
+    // FP16 products have none either) where every layer's types are theirs (prompt_int8, decided with the buffers) and
+    // a chunk's layer has few enough rows an expert (prompt_routed), else dequantized to FP16
     const bool use_mmq = P.int8;
     // the CPU's share of the missed experts needs the split's times (measured at load from pinned RAM, on the decode
     // window's kernels: the int8 and the FP16 path take them alike); STRATA_PLAIN_CPU_SHARE=0, or

@@ -71,6 +71,14 @@ public:
     /// oneDNN; only where i8_usable says yes.
     static void i8(const int8_t* X, const int8_t* W, int32_t* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                    void* stream);
+    /// The int8 products' one entry (W8A8: X [T, K] and W [N, K] int8 row-major, sx[t] and sw[n] their row scales):
+    /// with `bf16_out`, Y [T, N] (BF16, row stride ldy, 0: N) = (X . W^T) sx[t] sw[n] + bias[n] (null: none) through the GPU
+    /// maker's fused kernel (kernels::i8_gemm_bf16), where it takes the shape and is the faster on the GPU (timed once
+    /// a GPU against the library's sums; XESTRATA_W8_FUSED=0 or 1 fixes it): true.  Otherwise the int32
+    /// sums X . W^T into Y (row stride ldy) through i8, for the reader to scale (sx, sw and bias unread): false.  Only
+    /// where i8_usable or kernels::i8_gemm_ok says yes.
+    static bool w8a8(const int8_t* X, const float* sx, const int8_t* W, const float* sw, const float* bias, void* Y,
+                     int64_t T, int64_t N, int64_t K, int64_t ldy, bool bf16_out, void* stream);
     /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16; `half_sums` as
     /// f16's.
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,

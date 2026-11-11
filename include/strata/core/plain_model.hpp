@@ -427,8 +427,12 @@ public:
     /// layouts of Q6_K and Q8_0, as upload makes them).
     void prepare_block(int64_t l, uint8_t* region);
     strata::gpu::Stream stream() const { return cs_; }
-    /// Whether every MoE layer's experts take the int8 products on this GPU (iq_mmq; STRATA_PLAIN_MMQ=0: no).
+    /// Whether every MoE layer's experts can take the int8 products on this GPU (iq_mmq; STRATA_PLAIN_MMQ=0: no).
     bool prompt_int8() const;
+    /// From how many rows an expert a chunk's MoE layer takes the FP16 path instead of the int8 products (where
+    /// prompt_int8): prefill::mmq::int8_rows_below on the first MoE layer's format, as Qwen3.8-Flash-Next's prompt
+    /// chooses.  INT64_MAX: int8 at every size (STRATA_PLAIN_MMQ=1, or the timing could not run); 0: FP16 at every size.
+    int64_t prompt_int8_below() const;
 
     /// Drafts a window can check (0: no speculative decoding): spec - 1 when the model has its MTP layer.
     int drafts() const { return tail().has_mtp_ ? tail().n_mtp_ : 0; }
@@ -732,7 +736,11 @@ private:
     struct PromptBufs {
         static constexpr int kGroup = 8;   ///< experts dequantized and multiplied in one grouped product
         int64_t T = 0, gu_elems = 0, d_elems = 0, gemm_elems = 0;
-        bool int8 = false;                 ///< every MoE layer's experts through the int8 products (no FP16 buffers)
+        bool int8 = false;                 ///< the MoE layers' experts can take the int8 products (prompt_int8)
+        /// a chunk's layer takes them while its experts average fewer rows than this (prompt_int8_below), the FP16
+        /// path from there: INT64_MAX, int8 at every size
+        int64_t int8_below = INT64_MAX;
+        bool f16 = false;                  ///< the FP16 path's buffers are carved (a chunk's layer may take it)
         float *x = nullptr, *hn = nullptr, *mix = nullptr;
         uint16_t* x16 = nullptr;           ///< T rows of the widest projection input, FP16
         float *qkv = nullptr, *z = nullptr, *ab = nullptr, *gate = nullptr, *beta = nullptr, *h = nullptr, *y = nullptr;

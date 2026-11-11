@@ -1152,6 +1152,14 @@ bool PlainModel::prompt_int8() const {
     return true;
 }
 
+int64_t PlainModel::prompt_int8_below() const {
+    // STRATA_PLAIN_MMQ=1: the int8 products at every size, untimed
+    if (const char* v = strata::env_get("PLAIN_MMQ"); v != nullptr && v[0] != '\0') return INT64_MAX;
+    const auto& lay = k::cpu::expert_layout();
+    if (dense_ || spec_.n_expert <= 0 || !lay.native || lay.fmt.empty()) return INT64_MAX;
+    return prefill::mmq::int8_rows_below(lay.fmt.front(), (size_t) lay.blob_bytes(0), INT64_MAX);
+}
+
 void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* host, uint64_t& dev_bytes,
                               uint64_t& host_bytes, PromptPieces* pieces) const {
     const ModelSpec& s = spec_;
@@ -1173,6 +1181,11 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
     b.gu_elems = (int64_t) (2 * FF * N);
     b.d_elems = (int64_t) (N * FF);
     b.int8 = prompt_int8();
+    b.int8_below = b.int8 ? prompt_int8_below() : INT64_MAX;
+    if (b.int8_below == 0) {   // FP16 at every size
+        b.int8 = false;
+        b.int8_below = INT64_MAX;
+    }
     // the largest dense weight, dequantized at once (Gemm::native slices past 2^25 values)
     b.gemm_elems = (int64_t) mtp_eh_.n_in * mtp_eh_.n_out;   // 0 without the MTP layer
     std::vector<const Block*> all;
@@ -1223,8 +1236,12 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
     take(b.rlog, U * E * 4); take(b.ids, TK * 4); take(b.w, TK * 4); take(b.shared, U * N * 4);
     take(b.sh_g, (U + 4) * 4); take(b.sh_gate, U * FS * 4); take(b.sh_up, U * FS * 4);
     // the FP16 path's: the routed rows and the SwiGLU in FP16, kGroup experts' FP16 weights, the down product's rows
-    // in grouped order (the int8 one writes them in routing order, straight into parts)
-    const uint64_t f16 = b.int8 ? 0 : 1;
+    // in grouped order (the int8 one writes them in routing order, straight into parts); beside the int8 products'
+    // where a chunk of T tokens reaches int8_below rows an expert spread over every expert.  They are 0.9 GB at 8192
+    // tokens of Qwen3.6-35B-A3B, and taken where a layer could not reach it they halved the chunk the tier lends (the
+    // RTX 4070, 32K: 16384 -> 8192 tokens, its missed experts read 1.4 times as often, 2622 -> 1963 tok/s)
+    b.f16 = !b.int8 || (b.int8_below != INT64_MAX && (int64_t) TK >= b.int8_below * (int64_t) E);
+    const uint64_t f16 = b.f16 ? 1 : 0;
     take(b.xs16, f16 * TK * N * 2); take(b.gu, TK * 2 * FF * 4); take(b.hh, TK * FF * 4); take(b.h16, f16 * TK * FF * 2);
     take(b.dm, f16 * TK * N * 4); take(b.parts, TK * N * 4); take(b.moe_out, U * N * 4);
     take(b.src, TK * 4); take(b.slot, TK * 4); take(b.bounds, (E + 1) * 4); take(b.entry, TK * 4);

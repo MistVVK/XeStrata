@@ -736,6 +736,106 @@ void Gemm::i8(const int8_t* X, const int8_t* W, int32_t* Y, int64_t T, int64_t N
 #endif
 }
 
+namespace {
+// Whether the W8A8 products whose readers take BF16 go through the GPU maker's fused kernel (kernels::i8_gemm_bf16: the
+// scales and bias in its epilogue, BF16 out; oneDNN's on Intel, CUTLASS's on NVIDIA, comfy-kitchen's on RDNA3 and
+// RDNA4) or the library's int32 sums (Gemm::i8, scaled by their reader): timed once a GPU over an image DiT's three
+// shapes at 4096 rows (3072 x 3072, 12288 x 3072, 3072 x 12288) through core::timed_choice (each form run once before
+// its timings, the two in turn), the fused kernel kept unless the library is 5% faster.  The image DiTs chose so in
+// their own code before (dit_rows::w8_fused, the least of three after a warm-up): the B70 took the library in the first
+// start after a build and the fused kernel after.  Timed a shape at a time as the products came instead (2026-11-12),
+// the choice moved from start to start with the small shapes' noise (the B70's Mage-Flow at 512 x 512, its 54-row
+// products, at a margin of 15%), and the product's own time favours the library: the fused kernel's BF16 values save
+// the reader half the bytes (the RTX 4070's Qwen-Image-2.1, the library 7 to 10.5% faster alone at four of its shapes:
+// taken, the sampling ran 1.997 -> 2.025 s).  A queue recording a graph (which cannot wait), or a timing around this
+// product (core::timing_depth), takes the library until the GPU is timed.  XESTRATA_W8_FUSED=0 or 1 fixes it.
+bool w8_fused(void* stream) {
+    static const int fixed = [] {
+        const char* e = strata::env_get("W8_FUSED");
+        return e == nullptr ? -1 : std::strtol(e, nullptr, 10) != 0 ? 1 : 0;
+    }();
+    if (fixed >= 0) return fixed == 1;
+    if (!strata::kernels::i8_gemm_ok(stream)) return false;
+    if (!Gemm::i8_usable(stream)) return true;
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    struct Kept {
+        std::mutex m;
+        int of = -1;
+    };
+    static core::PerDevice<std::shared_ptr<Kept>> per_device;
+    Kept& kept = *per_device.get(q.get_device(), [] { return std::make_shared<Kept>(); });
+    std::lock_guard<std::mutex> lock(kept.m);
+    if (kept.of >= 0) return kept.of == 1;
+    namespace sx = sycl::ext::oneapi::experimental;
+    if (core::timing_depth > 0 || q.ext_oneapi_get_state() == sx::queue_state::recording) return false;
+    constexpr int64_t T = 4096;
+    const int64_t shapes[3][2] = {{3072, 3072}, {12288, 3072}, {3072, 12288}};
+    std::vector<void*> held;
+    auto get = [&](size_t bytes) -> void* {
+        void* p = nullptr;
+        if (!strata::gpu::alloc_device(&p, bytes)) return nullptr;
+        held.push_back(p);
+        strata::gpu::memset_async(p, 1, bytes, stream);
+        return p;
+    };
+    double fused = -1, lib = -1;
+    try {
+        auto* x8 = static_cast<int8_t*>(get((size_t) (T * 12288)));
+        auto* w8 = static_cast<int8_t*>(get((size_t) (12288 * 3072)));
+        void* y = get((size_t) (T * 12288) * 4);
+        auto* sx = static_cast<float*>(get((size_t) T * 4));
+        auto* sw = static_cast<float*>(get((size_t) 12288 * 4));
+        if (x8 == nullptr || w8 == nullptr || y == nullptr || sx == nullptr || sw == nullptr) throw std::bad_alloc();
+        const auto measured = core::timed_choice(
+            {{[&] {
+                 for (const auto& sh : shapes)
+                     if (!strata::kernels::i8_gemm_bf16(x8, sx, w8, sw, nullptr, static_cast<uint16_t*>(y), T, sh[0],
+                                                        sh[1], 0, stream))
+                         return false;
+                 return true;
+             }},
+             {[&] {
+                 for (const auto& sh : shapes) Gemm::i8(x8, w8, static_cast<int32_t*>(y), T, sh[0], sh[1], sh[0], stream);
+                 return true;
+             }}},
+            [&] { q.wait_and_throw(); }, 3);   // three timings each, as before: five took the B70's Anima 11 ms more
+        fused = measured.seconds[0];
+        lib = measured.seconds[1];
+        kept.of = measured.pick == 0 ? 1 : 0;
+    } catch (const std::exception& e) {
+        // as before: the fused kernel (a product it does not take goes to the library at the call)
+        std::fprintf(stderr, "xestrata: timing the int8 products: %s\n", e.what());
+        kept.of = 1;
+    }
+    strata::gpu::stream_sync(stream);
+    for (void* p : held) strata::gpu::free(p);
+    std::fprintf(stderr, "xestrata: int8 products through %s (an image DiT's three at 4096 rows: the fused kernel %.2f ms, "
+                         "the library %.2f)\n", kept.of == 1 ? "the fused kernel" : "the library",
+                 fused > 0 ? 1e3 * fused : -1.0, lib > 0 ? 1e3 * lib : -1.0);
+    return kept.of == 1;
+}
+}  // namespace
+
+// The LLMs' dense prompt products do not come here yet: they take native (the GGUF blocks dequantized to FP16, the FP16
+// product), whose readers take FP32 rows.  Timed against this entry on synthetic data (2026-11-11, the rows to int8
+// with qi_rows_i8's rotation, the best of five after a warm-up), Qwen3.8-Flash-Next's attn_qkv (2560 -> 10240, IQ4_XS)
+// at 8192 rows: the RTX 4070 6.93 ms native, 2.36 with the weight made int8 at each call and BF16 out, 3.50 with FP32
+// out; at 1024 rows 1.07, 0.81, 0.45 resident.  The B70: 2.76 native, 1.84 made at each call (BF16 out), 1.47 with the
+// int8 weight resident, 2.47 with FP32 out; at 1024 rows 0.72 native, 0.73 made at each call.  Narrow products
+// (Qwen3.8's shared expert, 2560 -> 640) were slower in W8A8 from 4096 rows on the B70.  Taking it needs the rotated
+// rows' quantizer (image::qi_rows_i8) where the prompt paths reach it, the choice timed a shape at a time for the LLMs'
+// products only (a DiT's FP16 form stays FP16), and the answers checked by KL: the answers change.
+bool Gemm::w8a8(const int8_t* X, const float* sx, const int8_t* W, const float* sw, const float* bias, void* Y,
+                int64_t T, int64_t N, int64_t K, int64_t ldy, bool bf16_out, void* stream) {
+    if (T <= 0 || N <= 0) return false;
+    auto* y16 = static_cast<uint16_t*>(Y);
+    auto* y32 = static_cast<int32_t*>(Y);
+    if (bf16_out && w8_fused(stream) && strata::kernels::i8_gemm_bf16(X, sx, W, sw, bias, y16, T, N, K, ldy, stream))
+        return true;
+    i8(X, W, y32, T, N, K, ldy, stream);
+    return false;
+}
+
 bool Gemm::f16_groups(const uint16_t* X, const uint16_t* W, int64_t w_stride, float* Y, const int32_t* bounds, int G,
                       int64_t N, int64_t K, void* stream) {
 #if STRATA_ONEMATH

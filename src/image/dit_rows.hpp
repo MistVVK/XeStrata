@@ -17,7 +17,6 @@
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/w8_choice.hpp"
 #include "strata/prefill/gemm.hpp"
-#include "strata/kernels/i8_gemm.hpp"
 #include "strata/platform/env.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_to_f16.hpp"
@@ -1033,8 +1032,10 @@ inline void gate_add_bwd(const float* h, const float* gate, const float* dx, int
 }
 
 // The time (seconds) of one product of the DiT's FFN, T rows x K -> N, in 16 bits (prefill::Gemm::f16) and in 8
-// (the rows to int8, Gemm::i8, the scales back), the least of three after a warm-up: what a DiT chooses its form by
-// (0: the form does not run here).  `what` names the DiT in the message of a form the library could not run.
+// (the rows to int8, the product as the DiT's reader takes it - Gemm::w8a8: the fused kernel's BF16 where it is the
+// faster on the GPU, else the library's sums and the scales back), the least of three after a warm-up: what a DiT
+// chooses its form by (0: the form does not run here).  `what` names the DiT in the message of a form the library
+// could not run.
 inline std::pair<double, double> time_w8_f16(int64_t T, int64_t K, int64_t N, const char* what, void* s_) {
     if (T <= 0 || K <= 0 || N <= 0) return {0.0, 0.0};
     std::vector<void*> held;
@@ -1072,8 +1073,8 @@ inline std::pair<double, double> time_w8_f16(int64_t T, int64_t K, int64_t N, co
             if (x8 != nullptr && w8p != nullptr && sx != nullptr && sw != nullptr)
                 w8 = best([&] {
                     qi_rows_i8(x16, false, T, K, x8, sx, nullptr, s_);
-                    prefill::Gemm::i8(x8, w8p, reinterpret_cast<int32_t*>(y), T, N, K, N, s_);
-                    qi_i8_scale(y, T, N, N, sx, sw, nullptr, nullptr, s_);
+                    if (!prefill::Gemm::w8a8(x8, sx, w8p, sw, nullptr, y, T, N, K, N, true, s_))
+                        qi_i8_scale(y, T, N, N, sx, sw, nullptr, nullptr, s_);
                 });
         }
     } catch (const std::exception& e) {   // a form the library could not run: the 8-bit one is not chosen
@@ -1103,69 +1104,6 @@ inline int w8_at_open(int64_t K, int64_t N, const char* what, void* s_) {
     if (!c.decided()) return -1;
     kept.of.emplace(std::make_pair(K, N), w8);
     return w8;
-}
-
-// Whether the DiTs' W8A8 products go through the GPU maker's fused kernel (kernels::i8_gemm_bf16: the scales and bias
-// in its epilogue, BF16 out; oneDNN's on Intel, CUTLASS's on NVIDIA, comfy-kitchen's on RDNA3 and RDNA4) or the
-// library's int8 product (prefill::Gemm::i8: int32 sums, scaled by their reader): the faster, timed once a GPU over an
-// image DiT's three shapes at 4096 rows (3072 x 3072, 12288 x 3072, 3072 x 12288), the least of three after a warm-up
-// of each.  XESTRATA_W8_FUSED=0 or 1 fixes it.
-inline bool w8_fused(void* s_) {
-    static core::PerDevice<int> of;
-    return of.get(core::Runtime::get().stream(s_).get_device(), [s_] {
-        if (const char* e = strata::env_get("W8_FUSED")) return std::atoi(e) != 0 ? 1 : 0;
-        if (!kernels::i8_gemm_ok(s_)) return 0;
-        if (!prefill::Gemm::i8_usable(s_)) return 1;
-        constexpr int64_t T = 4096;
-        const int64_t shapes[3][2] = {{3072, 3072}, {12288, 3072}, {3072, 12288}};
-        std::vector<void*> held;
-        auto get = [&](size_t bytes) -> void* {
-            void* p = nullptr;
-            if (!gpu::alloc_device(&p, bytes)) return nullptr;
-            held.push_back(p);
-            gpu::memset_async(p, 1, bytes, s_);
-            return p;
-        };
-        auto best = [&](const std::function<bool()>& run) {
-            double t = 1e30;
-            for (int i = 0; i < 4; ++i) {
-                const auto t0 = std::chrono::steady_clock::now();
-                if (!run() || !gpu::stream_sync(s_)) return 1e30;
-                const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                if (i > 0) t = std::min(t, dt);
-            }
-            return t;
-        };
-        double fused = 0.0, lib = 0.0;
-        try {
-            auto* x8 = static_cast<int8_t*>(get((size_t) (T * 12288)));
-            auto* w8 = static_cast<int8_t*>(get((size_t) (12288 * 3072)));
-            auto* y = get((size_t) (T * 12288) * 4);
-            auto* sx = static_cast<float*>(get((size_t) T * 4));
-            auto* sw = static_cast<float*>(get((size_t) 12288 * 4));
-            if (x8 == nullptr || w8 == nullptr || y == nullptr || sx == nullptr || sw == nullptr)
-                throw std::bad_alloc();
-            for (const auto& sh : shapes) {
-                const int64_t N = sh[0], K = sh[1];
-                fused += best([&] {
-                    return kernels::i8_gemm_bf16(x8, sx, w8, sw, nullptr, static_cast<uint16_t*>(y), T, N, K, 0, s_);
-                });
-                lib += best([&] {
-                    prefill::Gemm::i8(x8, w8, static_cast<int32_t*>(y), T, N, K, N, s_);
-                    return true;
-                });
-            }
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "image engine: timing the int8 products: %s\n", e.what());
-        }
-        gpu::stream_sync(s_);
-        for (void* p : held) gpu::free(p);
-        const int f = fused < 1e29 && (lib <= 0.0 || lib >= 1e29 || fused <= lib) ? 1 : 0;
-        std::fprintf(stderr, "image engine: int8 products through %s (an image DiT's three at 4096 rows: the fused "
-                             "kernel %.2f ms, the library %.2f)\n", f ? "the fused kernel" : "the library",
-                     fused < 1e29 ? 1e3 * fused : -1.0, lib < 1e29 ? 1e3 * lib : -1.0);
-        return f;
-    }) == 1;
 }
 
 }  // namespace strata::image::dit_rows

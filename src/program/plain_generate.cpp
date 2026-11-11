@@ -2535,10 +2535,13 @@ int plain_main(int argc, char** argv) {
                      strata::prefill::Gemm::path(),
                      strata::prefill::mmq::chosen() ? strata::prefill::mmq::path() : "none (FP16 for all)");
     } else if (opt.prompt_chunk > 0) {
-        const char* experts = model.prompt_int8() ? strata::prefill::mmq::path() : nullptr;
-        std::fprintf(stderr, "xestrata (%s): prompt matrix products on %s; the experts' in %s%s%s\n", arch.c_str(),
+        const int64_t below = model.prompt_int8() ? model.prompt_int8_below() : 0;
+        const char* experts = below > 0 ? strata::prefill::mmq::path() : nullptr;
+        const std::string from = below > 0 && below != INT64_MAX
+            ? " below " + std::to_string(below) + " rows an expert, FP16 above" : std::string();
+        std::fprintf(stderr, "xestrata (%s): prompt matrix products on %s; the experts' in %s%s%s%s\n", arch.c_str(),
                      strata::prefill::Gemm::path(), experts ? "int8 (" : "FP16", experts ? experts : "",
-                     experts ? ")" : "");
+                     experts ? ")" : "", from.c_str());
     }
     if (cache.budget < 0) {   // from the RAM free now that the model is loaded, as generate.cpp's (#3493)
         const int64_t mib = serve && cache.slots > 0
