@@ -507,17 +507,3 @@ if(STRATA_BUILD_TESTS)
   add_test(NAME aux_cpus_test COMMAND aux_cpus_test)
 endif()
 endmacro()
-
-# the DeepSeek CPU-lane benchmark on a box with no GPU toolkit
-macro(strata_cpu_dsv41_host_bench)
-if(STRATA_BUILD_DSV41 AND NOT STRATA_ENABLE_CUDA AND NOT STRATA_ENABLE_HIP AND NOT STRATA_HIP_GFX906)
-  message(STATUS "STRATA_BUILD_DSV41: no GPU backend, building the host-side benchmark only (ds4_gg_bench)")
-  if(STRATA_NATIVE_EXPERTS)
-    add_executable(ds4_gg_bench tests/dsv41/gg_dot_bench.cpp src/dsv41/ds4_gg_cpu.cpp)
-    target_include_directories(ds4_gg_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/dsv41
-                               ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
-    target_link_libraries(ds4_gg_bench PRIVATE strata_kernels_cpu Threads::Threads)
-    target_compile_definitions(ds4_gg_bench PRIVATE STRATA_DSV41_TQ_CPU=1)
-  endif()
-endif()
-endmacro()

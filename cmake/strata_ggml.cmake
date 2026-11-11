@@ -34,13 +34,6 @@ macro(strata_ggml_configure_root)
     foreach(_f GGML_AVX GGML_AVX2 GGML_FMA GGML_F16C GGML_BMI2)
       set(${_f} ON CACHE BOOL "" FORCE)
     endforeach()
-    # The DeepSeek engine (STRATA_BUILD_DSV41) builds ggml-cpu with BMI2 OFF: ggml's IQ1_S / IQ1_M dots use _pdep_u64 with it, and AMD
-    # Zen 1/2 run PDEP in microcode (EPYC 7452, IQ1_M one-token dot 1.8 GB/s against 32 GB/s without it; IQ1_S 2.3 against 37). The
-    # results are bit-identical either way (ds4_gg_bench --dump, types 19 and 29, 1-16 tokens). Other engines keep BMI2 until their
-    # next rebuild is looked at: no Qwen package changes with this commit.
-    if(STRATA_BUILD_DSV41)
-      set(GGML_BMI2 OFF CACHE BOOL "" FORCE)
-    endif()
   elseif(STRATA_ISA_FLOOR)
     # the experimental older-CPU build (STRATA_ISA_FLOOR above): one ggml-cpu for the floor, ggml's "sandybridge"
     # feature set (SSE4.2 + AVX) or SSE4.2 alone - not the build host's, which may be newer than the PC it runs on.
