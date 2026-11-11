@@ -28,8 +28,13 @@ struct Qi21DitStats {
     size_t peak_bytes = 0;       // weight_bytes + work_bytes at their largest so far
 };
 
+// QI21_DIT_F16_RESIDENT: a MEASUREMENT switch for the test program, not a default and not a memory plan (that is D5's,
+// and waits for the cards): every 2-D weight decoded once to f16 at open (about 2x the Q8_0 bytes on the device), the
+// GEMMs read the f16 weights in place instead of decoding them on every call.  Same f16 values, same GEMMs.
+enum : int { QI21_DIT_F16_RESIDENT = 1 };
+
 // device < 0: the current device.  nullptr on failure (*err says why).
-Qi21Dit* qi21_dit_open(const std::string& gguf_path, int device, std::string* err);
+Qi21Dit* qi21_dit_open(const std::string& gguf_path, int device, std::string* err, int flags = 0);
 
 int qi21_dit_in_channels(const Qi21Dit* dit);
 int qi21_dit_out_channels(const Qi21Dit* dit);

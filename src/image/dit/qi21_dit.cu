@@ -95,6 +95,8 @@ struct Qi21Dit {
     int64_t t_cap = 0, l_cap = 0;
     float *x = nullptr, *h = nullptr, *gu = nullptr, *q16 = nullptr;
     uint16_t *h16 = nullptr, *a16 = nullptr, *m16 = nullptr;   // GEMM inputs, written f16 by the kernels before them
+    bool f16_resident = false;                                // weights decoded to f16 once at open (measurement)
+    double decode_ms = 0;
     uint16_t *kw = nullptr, *vw = nullptr, *pk = nullptr, *pv = nullptr;
     float *pe_img = nullptr, *pe_txt = nullptr, *latent = nullptr, *outp = nullptr, *ctx_in = nullptr;
     float *tin = nullptr, *emb = nullptr, *te1 = nullptr, *te2 = nullptr, *mod = nullptr, *scale = nullptr;
@@ -156,6 +158,48 @@ std::string upload(Qi21Dit* d, uint8_t* dst, const uint8_t* src, size_t n, uint8
         DIT_CUDA(cudaEventRecord(pin_ev[b], d->stream));
         done += c;
     }
+    return std::string();
+}
+
+// QI21_DIT_F16_RESIDENT (a measurement for cards with room, not a memory plan): every 2-D weight decoded once to f16
+// into its own buffer (the same f16 values dit_gemm decodes on every call), the raw blocks freed; the GEMMs then
+// read the f16 weights in place.
+std::string to_f16_resident(Qi21Dit* d) {
+    const auto t0 = std::chrono::steady_clock::now();
+    std::vector<W2*> ws;
+    for (Block& B : d->blocks) {
+        ws.push_back(&B.qkv);
+        if (!B.fused) {
+            ws.push_back(&B.k);
+            ws.push_back(&B.v);
+        }
+        ws.push_back(&B.out);
+        ws.push_back(&B.gate_up);
+        ws.push_back(&B.down);
+    }
+    for (W2* w : {&d->img_in, &d->txt_in1, &d->txt_in2, &d->lin1, &d->lin2, &d->modw, &d->norm_out, &d->proj_out})
+        ws.push_back(w);
+    size_t total = 0;
+    for (const W2* w : ws) total += ((size_t) w->K * (size_t) w->N * sizeof(uint16_t) + 255) / 256 * 256;
+    uint8_t* f16 = nullptr;
+    DIT_CUDA(cudaMalloc((void**) &f16, total));
+    size_t off = 0;
+    for (W2* w : ws) {
+        const std::string e = te_dequant_f16(w->type, d->d_w + w->off, w->K, w->N,
+                                             reinterpret_cast<uint16_t*>(f16 + off), d->stream);
+        if (!e.empty()) {
+            cudaFree(f16);
+            return "qi21_dit: " + e;
+        }
+        w->type = TE_F16;
+        w->off = off;
+        off += ((size_t) w->K * (size_t) w->N * sizeof(uint16_t) + 255) / 256 * 256;
+    }
+    DIT_CUDA(cudaStreamSynchronize(d->stream));
+    DIT_CUDA(cudaFree(d->d_w));
+    d->d_w = f16;
+    d->weight_bytes = total;
+    d->decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return std::string();
 }
 
@@ -245,6 +289,7 @@ std::string open_impl(Qi21Dit* d, const std::string& path, int device) {
         if (pinned[i]) cudaFreeHost(pinned[i]);
         if (pin_ev[i]) cudaEventDestroy(pin_ev[i]);
     }
+    if (err.empty() && d->f16_resident) err = to_f16_resident(d);
     d->open_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return err;
 }
@@ -451,8 +496,9 @@ std::string step_impl(Qi21Dit* d, const float* latent, int W, int Hd, const floa
 
 }  // namespace
 
-Qi21Dit* qi21_dit_open(const std::string& gguf_path, int device, std::string* err) {
+Qi21Dit* qi21_dit_open(const std::string& gguf_path, int device, std::string* err, int flags) {
     auto* d = new Qi21Dit();
+    d->f16_resident = (flags & QI21_DIT_F16_RESIDENT) != 0;
     std::string e;
     try {
         e = open_impl(d, gguf_path, device);
@@ -489,6 +535,10 @@ std::string qi21_dit_open_report(const Qi21Dit* d) {
                   d->unused.size());
     std::string r = b;
     for (size_t i = 0; i < d->unused.size() && i < 8; ++i) r += (i ? ", " : ": ") + d->unused[i];
+    if (d->f16_resident) {
+        std::snprintf(b, sizeof b, "; weights f16-resident (decoded once at open, %.0f ms)", d->decode_ms);
+        r += b;
+    }
     return r;
 }
 

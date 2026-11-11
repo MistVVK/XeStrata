@@ -1,7 +1,7 @@
 // src/image/dit/qi21_dit_step_main.cpp - test program strata-dit-step (not shipped): one Qwen-Image-2.1 DiT step in
 // Strata's own code (include/strata/image/qi21_dit.hpp) on the inputs stable-diffusion.cpp gave its DiT.
 //
-//   strata-dit-step <dit.gguf> <out dir> <dump dir> [<dump dir> ...] [--repeat N] [--call K]
+//   strata-dit-step <dit.gguf> <out dir> <dump dir> [<dump dir> ...] [--repeat N] [--call K] [--f16-resident]
 //
 // Each dump dir holds the stage-hook dumps of one picture (tools/image/gate/stage_hooks.py): dit_x_<K> (the latent,
 // shape "W H C 1"), dit_t_<K> (the timestep) and cond (shape "context L").  Writes <out dir>/<dump parent name>/<dump name>/vel.bin, the
@@ -49,16 +49,17 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: strata-dit-step <dit.gguf> <out dir> <dump dir> [...] [--repeat N] [--call K]\n");
         return 2;
     }
-    int repeat = 1, call = 0;
+    int repeat = 1, call = 0, flags = 0;
     std::vector<fs::path> dumps;
     for (int i = 3; i < argc; ++i) {
         if (std::strcmp(argv[i], "--repeat") == 0 && i + 1 < argc) repeat = std::max(1, std::atoi(argv[++i]));
         else if (std::strcmp(argv[i], "--call") == 0 && i + 1 < argc) call = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--f16-resident") == 0) flags |= QI21_DIT_F16_RESIDENT;
         else dumps.emplace_back(argv[i]);
     }
     const unsigned long long gguf_bytes = fs::file_size(argv[1]);
     std::string err;
-    Qi21Dit* dit = qi21_dit_open(argv[1], -1, &err);
+    Qi21Dit* dit = qi21_dit_open(argv[1], -1, &err, flags);
     if (!dit) {
         std::fprintf(stderr, "%s\n", err.c_str());
         std::printf("DIT-STEP FAIL\n");
