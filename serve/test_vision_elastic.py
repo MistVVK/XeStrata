@@ -245,6 +245,12 @@ class OnDemandByDefault(unittest.TestCase):
     BASE = {"args": ["--max-context", "8192", "--vision"], "gpu": 0,
             "vision": {"exe": "/e/strata-vision", "mmproj": "m", "model": "t", "gpu": True, "max_tokens": 1024}}
 
+    def setUp(self):
+        # these tests describe a PC (x86); the Spark class (Linux on Arm) has its own tests below, so a test run on a Spark does not change them
+        p = mock.patch("platform.machine", return_value="x86_64")
+        p.start()
+        self.addCleanup(p.stop)
+
     def cfg(self, **over):
         import copy
         c = copy.deepcopy(self.BASE)
@@ -254,6 +260,45 @@ class OnDemandByDefault(unittest.TestCase):
             else:
                 c[k] = v
         return c
+
+    def test_the_spark_class_keeps_the_reader_loaded_by_default(self):
+        """Linux on Arm with an NVIDIA GPU reader on one GPU (a DGX Spark): resident, as the AMD reader and the Mac's are (owner 2026-11-11)."""
+        import sys
+        from serve.server import apply_vision_defaults, vision_on_demand_by_default as f
+        for machine in ("aarch64", "arm64", "AARCH64"):
+            with self.subTest(machine=machine), mock.patch("platform.machine", return_value=machine), mock.patch.object(sys, "platform", "linux"):
+                self.assertFalse(f(self.cfg()))
+                c = apply_vision_defaults(self.cfg(args=["--vision", "--vram-reserve-mib", "700"]))
+                self.assertNotIn("elastic", c["vision"])                                    # no key written: the reader starts with the server
+                self.assertEqual(c["args"][c["args"].index("--vram-reserve-mib") + 1], "700")   # the resident path's reserve, not 2,048
+                self.assertFalse(f(self.cfg(vision={"exe": "component:engine/strata-vision"})))
+                self.assertFalse(f(self.cfg(backend="cuda")))
+
+    def test_the_spark_class_still_takes_an_explicit_elastic_key_either_way(self):
+        import sys
+        from serve.server import apply_vision_defaults
+        with mock.patch("platform.machine", return_value="aarch64"), mock.patch.object(sys, "platform", "linux"):
+            c = apply_vision_defaults(self.cfg(vision={"elastic": True}))
+            self.assertIs(c["vision"]["elastic"], True)                                     # the old behaviour is still reachable
+            self.assertEqual(c["args"], self.BASE["args"])
+            c = apply_vision_defaults(self.cfg(vision={"elastic": False}))
+            self.assertIs(c["vision"]["elastic"], False)
+
+    def test_other_hosts_keep_the_on_demand_default(self):
+        import sys
+        from serve.server import vision_on_demand_by_default as f
+        for system, machine in (("linux", "x86_64"), ("linux", "AMD64"), ("win32", "AMD64"), ("win32", "ARM64")):    # a PC, and Windows on Arm (not this rule)
+            with self.subTest(system=system, machine=machine), mock.patch("platform.machine", return_value=machine), mock.patch.object(sys, "platform", system):
+                self.assertTrue(f(self.cfg()))
+        with mock.patch("platform.machine", return_value="arm64"), mock.patch.object(sys, "platform", "darwin"):
+            self.assertFalse(f(self.cfg()))                                                # a Mac was never on demand
+
+    def test_the_spark_class_does_not_change_the_amd_rule(self):
+        import sys
+        import serve.server as S
+        with mock.patch("platform.machine", return_value="aarch64"), mock.patch.object(sys, "platform", "linux"), \
+                mock.patch.object(S, "VISION_ON_DEMAND_AMD_BY_DEFAULT", True):
+            self.assertTrue(S.vision_on_demand_by_default(self.cfg(vision={"exe": "/e/strata-vision-hip", "cpu_exe": "/e/strata-vision"}, backend="hip")))
 
     def test_the_plain_nvidia_config_is_on_demand(self):
         from serve.server import apply_vision_defaults, vision_on_demand_by_default
