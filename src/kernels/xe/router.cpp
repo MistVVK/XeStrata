@@ -22,10 +22,11 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace strata::kernels {
 
-class RouterPublishKernel;   // asked for its work-group (work_group_upto_1024_of)
+template <int NPL> class RouterPublishKernel;   // asked for its work-group (work_group_upto_1024_of)
 
 namespace {
 
@@ -167,32 +168,25 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
     if (!stream) core::Runtime::get().wait(e, "router_top10");
 }
 
-void native_router_top10_publish(const float* logits, int32_t* ids, float* weights, int n_tok, const float* x,
-                                 int64_t n_x, float* x_out, int32_t* ids_out, float* weights_out, uint32_t* d_seq,
-                                 void* stream, int n_expert) {
-    require_shape(n_expert, "native router (publish)");
-    if (!stream || n_tok < 1 || !valid(logits, (size_t) n_tok * n_expert * 4) || !valid(ids, (size_t) n_tok * 10 * 4) ||
-        !valid(weights, (size_t) n_tok * 10 * 4))
-        throw std::invalid_argument("native router (publish) requires a stream and aligned [n,E]/[n,10] buffers");
-    sycl::queue& q = queue_for(stream, true);
-    const int wg = xe::work_group_upto_1024_of<RouterPublishKernel>(q);
-    if (n_tok * WARP > wg) throw std::invalid_argument("native router (publish): more tokens than the work-group's sub-groups");
+namespace {
+// router_publish's one launch for NPL values a lane: one work-group, the first n_tok sub-groups route a token each (as
+// router_top10), every work-item copies the rows, and after the fence and the barrier one work-item rings the host (as
+// doorbell_publish)
+template <int NPL>
+bool router_publish_launch(sycl::queue& q, const float* logits, int32_t* ids, float* weights, int n_tok, int n_expert,
+                           int k, const float* x, int64_t n_x, float* x_out, int32_t* ids_out, float* weights_out,
+                           uint32_t* d_seq) {
+    const int wg = xe::work_group_upto_1024_of<RouterPublishKernel<NPL>>(q);
+    if (n_tok * WARP > wg) return false;
     const int ni = (int) n_x;
-    // one work-group: the first n_tok sub-groups route a token each (as native_router_top10_multi), every work-item
-    // copies the rows, and after the fence and the barrier one work-item rings the host (as doorbell_publish)
-    q.parallel_for<RouterPublishKernel>(sycl::nd_range<1>((size_t) wg, (size_t) wg),
-                                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+    q.parallel_for<RouterPublishKernel<NPL>>(sycl::nd_range<1>((size_t) wg, (size_t) wg),
+                                             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const int t = (int) it.get_local_id(0);
         const int tok = (int) sg.get_group_linear_id();
-        if (tok < n_tok) {
-            if (n_expert == 512)
-                top10_token<16>(sg, logits + (size_t) tok * 512, ids + (size_t) tok * 10, weights + (size_t) tok * 10,
-                                ids_out + (size_t) tok * 10, weights_out + (size_t) tok * 10);
-            else
-                top10_token<8>(sg, logits + (size_t) tok * 256, ids + (size_t) tok * 10, weights + (size_t) tok * 10,
-                               ids_out + (size_t) tok * 10, weights_out + (size_t) tok * 10);
-        }
+        if (tok < n_tok)
+            top10_token<NPL>(sg, logits + (size_t) tok * n_expert, ids + (size_t) tok * k, weights + (size_t) tok * k,
+                             ids_out + (size_t) tok * k, weights_out + (size_t) tok * k, n_expert, k);
         for (int i = t; i < ni; i += wg) x_out[i] = x[i];
         sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
         sycl::group_barrier(it.get_group());
@@ -201,6 +195,27 @@ void native_router_top10_publish(const float* logits, int32_t* ids, float* weigh
             bump_host(d_seq);
         }
     });
+    return true;
+}
+}  // namespace
+
+bool router_publish(const float* logits, int32_t* ids, float* weights, int n_tok, int n_expert, int k, const float* x,
+                    int64_t n_x, float* x_out, int32_t* ids_out, float* weights_out, uint32_t* d_seq, void* stream) {
+    if (n_tok < 1 || k < 1 || k > 32 || k >= n_expert || n_expert > 1024) return false;
+    if (!stream || !valid(logits, (size_t) n_tok * n_expert * 4) || !valid(ids, (size_t) n_tok * k * 4) ||
+        !valid(weights, (size_t) n_tok * k * 4))
+        throw std::invalid_argument("router (publish) requires a stream and aligned [n,E]/[n,k] buffers");
+    sycl::queue& q = queue_for(stream, true);
+    const auto go = [&](auto npl) {
+        return router_publish_launch<decltype(npl)::value>(q, logits, ids, weights, n_tok, n_expert, k, x, n_x, x_out,
+                                                          ids_out, weights_out, d_seq);
+    };
+    if (n_expert <= 32) return go(std::integral_constant<int, 1>{});
+    if (n_expert <= 64) return go(std::integral_constant<int, 2>{});
+    if (n_expert <= 128) return go(std::integral_constant<int, 4>{});
+    if (n_expert <= 256) return go(std::integral_constant<int, 8>{});
+    if (n_expert <= 512) return go(std::integral_constant<int, 16>{});
+    return go(std::integral_constant<int, 32>{});
 }
 
 bool native_router_takes(int n_expert, int k) { return (n_expert == 512 || n_expert == 256) && k == 10; }

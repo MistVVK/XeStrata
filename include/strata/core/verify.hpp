@@ -28,6 +28,7 @@
 
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
+#include "strata/core/moe_window.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
 
@@ -44,8 +45,7 @@ namespace strata::core {
 class NativeHead;
 
 /// The CPU pool for a window: x_f (n_tok, n_embd), ids (n_tok, k) -> out (n_tok * k, n_embd), hit rows zeroed.
-using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
-                             int64_t layer);
+using PoolMultiFn = MoePoolFn;
 
 struct VerifyHits {
     const int32_t* d_res = nullptr;      ///< device [n_layers * n_expert] slot or -1
@@ -388,7 +388,7 @@ public:
 
     /// The GPU plan the pool writes each layer (VRAM hits + the PCIe share of the misses); give it to the
     /// dispatch (`ExpertDispatch::plan`) before the first `run`.
-    GpuPlanSink* plan_sink() { return &sink_; }
+    GpuPlanSink* plan_sink() { return win_.sink(); }
     /// Plan v0.3 P6: split the window into two token groups and pipeline the CPU experts of one with the GPU work
     /// of the other (default on).  Set before the first `run`.
     void set_split(bool on) { split_ = on; }
@@ -396,7 +396,7 @@ public:
     /// beside the CPU; best when the CPU is compute-bound, the i-quants), 1 = the grouped kernel reads the mapped
     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
     /// the CPU is RAM-bound, Q2_0).  Set before the first `run`.
-    void set_pcie_mode(int mode) { sink_.pcie_mode = mode; }
+    void set_pcie_mode(int mode) { win_.sink()->pcie_mode = mode; }
     /// Whether the window reads the PCIe share beside its VRAM hits (STRATA_FETCH_BRANCH), for the split's estimate.
     bool fetch_branch() const { return fetch_branch_; }
     /// the pool never plans a PCIe share (--pcie-frac 0): the window skips that path.  Before the first run.
@@ -428,8 +428,6 @@ private:
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     unsigned long long* rr_stats_ = nullptr;   ///< STRATA_ROUTE_RESIDENT: this GPU's counters (nullptr: none)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
-    uint32_t* skip_ = nullptr;            ///< E-6: per group, the ring whose plan the device built (0: the host's)
-    unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
     // Every expert of the verifier's layers resident (hits.h_res): the window runs as one graph that plans each
     // layer's experts on the device and never asks the host - no doorbell, flag waits, PCIe or CPU share (upstream
     // cfd3b72's zero-doorbell graph).  STRATA_VERIFY_RESIDENT_GRAPH=0: off.
@@ -532,10 +530,6 @@ private:
     size_t graph_bytes_max_ = 0;   ///< the most VRAM a window's capture and first run have taken
     size_t graph_free0_ = 0;       ///< the VRAM free before the capture of the window run() is running, else 0
     strata::gpu::Graph* commit_exec_ = nullptr;
-    // A device whose running kernels do not see the host's writes (doorbell_visible: the UHD 770) runs a window as
-    // segments the host launches one after another, cut before each layer group's experts; no kernel waits on a
-    // flag.  STRATA_VERIFY_SEGMENTED=1 / 0 forces it either way.
-    bool segmented_ = false;
     std::vector<strata::gpu::Graph*> segs_[9];
     std::vector<strata::gpu::Graph*>* seg_out_ = nullptr;   // the segments of the window being captured
 
@@ -551,8 +545,6 @@ private:
     int64_t nf_pos_ = -1;                 ///< nonfinite_pos()
     uint32_t nf_mask_ = 0;                ///< nonfinite_in(): bit t = row t
     void note_nonfinite(int T, const int64_t* pos_b);   ///< the window's flags (+ STRATA_NAN_INJECT) -> nf_row_
-    float* h_x_ = nullptr;       float* m_x_ = nullptr;         // doorbell payload: T * n_embd
-    int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
     int32_t* h_route_ = nullptr; int32_t* m_route_ = nullptr;   // n_layers * T * k: each layer's ids (add_routing)
     bool route_rec_ = false;
     // STRATA_ROUTE_DUMP / STRATA_ROUTE_REPLAY (verify.cpp's RouteTrace): the routed weights beside h_route_'s ids, the
@@ -563,27 +555,14 @@ private:
     bool rt_dump_ = false, rt_replay_ = false;
     int rt_req_ = -1;
     int64_t rt_pos0_ = INT64_MAX;
-    float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
-    uint32_t* h_seq_ = nullptr;  uint32_t* m_seq_ = nullptr;
-    uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;
-    uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
-    uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
     strata::gpu::Event* commit_done_ = nullptr;   // recorded after an async commit (set_commit_async)
     bool commit_pending_ = false;
-    strata::gpu::Stream copy_ = nullptr;                                 // the copy engine's stream (DMA of missed experts)
-    struct FlagSet { uint32_t* flag; uint32_t value; };
-    FlagSet flag_sets_[2 * 64 * 2] = {};                          // host-function arguments, one per (layer, group)
-    static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);
-    static void raise_flag(uint32_t* flag, uint32_t value);
-    int32_t* h_plan_ = nullptr;  int32_t* m_plan_ = nullptr;     // counts | start | dst | tok | ptr (as int32 pairs)
-    int64_t plan_i32_ = 0;                                        // int32 words in the plan block
-    GpuPlanSink sink_;
-    uint32_t cur_layer_ = 0;
-    static void publish_plan(void* ctx);
-    void set_plan_slot(int grp);
+    // the routed experts' protocol with the host: the mapped doorbell, ids, weights, CPU rows, flags and plans, the
+    // copy engine's stream, the experts' device rows (moe_window.hpp, the plain engine's too).  A device whose running
+    // kernels do not see the host's writes runs a window as segments the host launches (win_.segmented()).
+    MoeWindow win_;
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
     int groups_[9] = {};
-    float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 
     // device
     void* arena_ = nullptr;
@@ -597,20 +576,12 @@ private:
     float *qidx_ = nullptr, *scores_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr, *attn_scratch_ = nullptr;
     float* tail_snap_ = nullptr;                              // per QSA layer
     int32_t* sel_ = nullptr;
-    float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *hit_out_ = nullptr;
-    int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr;
-    int32_t* plan_ = nullptr;                                     // device copy of the plan block
-    uint8_t* staging_ = nullptr;                                  // VRAM slots for the PCIe share of the misses
-    static constexpr int64_t kStagingBlobs = 16;
-    static constexpr int64_t kPcieGroupRows = 4;                  // the PCIe call's groups side by side (of <= 16)
-    uint8_t* hit_xq_ = nullptr;
-    uint8_t* nat_xq_ = nullptr;   // plan v0.3 P6: q8_1 activations for a native pack's grouped experts
+    float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr;
+    int32_t* ids_ = nullptr;
     float* nat_xr_ = nullptr;     // APR: the Hadamard-rotated expert input (the shared expert and the CPU keep xm); nullptr
                                   // without a folded gate/up
     const float* had_sx_ = nullptr;   // APR: this device's sign vectors of the expert input (n_embd) and of h (n_ff)
     const float* had_sh_ = nullptr;
-    float* hit_xs_ = nullptr;
-    void* hit_scratch_ = nullptr;
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
     int32_t* one_ = nullptr;
     float* ple_key_ = nullptr;   ///< the window rows' PLE key and value projections (ple_batch)

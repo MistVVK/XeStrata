@@ -121,6 +121,8 @@ PlainModel::~PlainModel() {
     for (auto& v : segs_)
         for (auto* g : v) strata::gpu::graph_destroy(g);
     for (auto* g : mexec_) strata::gpu::graph_destroy(g);
+    for (auto* m : {&rexec_, &mrexec_})
+        for (auto* g : *m) strata::gpu::graph_destroy(g);
     for (auto& v : msegs_)
         for (auto* g : v) strata::gpu::graph_destroy(g);
     for (auto* m : {&bexec_, &mbexec_})
@@ -131,7 +133,7 @@ PlainModel::~PlainModel() {
     for (auto& h : helpers_) h.reset();   // (their streams before the memory below)
     for (void* p : allocs_) strata::gpu::free(p);
     for (void* p : {(void*) h_emb_, (void*) h_step_, (void*) h_pos_, (void*) h_out_, (void*) h_prob_, (void*) fill_tmp_,
-                    (void*) hand_host_})
+                    (void*) hand_host_, (void*) h_rroute_})
         strata::gpu::free(p);
     if (swap_ev_ != nullptr) strata::gpu::event_destroy(swap_ev_);
     if (swap_cs_ != nullptr) strata::gpu::stream_destroy(swap_cs_);
@@ -1141,6 +1143,8 @@ bool PlainModel::load_qwen(std::string& err) {
     segs_.assign((size_t) opt_.max_t + 1, {});
     mexec_.assign((size_t) opt_.max_t + 1, nullptr);
     msegs_.assign((size_t) opt_.max_t + 1, {});
+    rexec_.assign((size_t) opt_.max_t + 1, nullptr);
+    mrexec_.assign((size_t) opt_.max_t + 1, nullptr);
     return true;
 }
 
@@ -1605,16 +1609,41 @@ bool PlainModel::open_experts(std::string& err) {
         return false;
     }
 
+    for (size_t l = 0; lay.native && l < lay.fmt.size(); ++l)
+        if (lay.fmt[l].had_gu || lay.fmt[l].had_d) {   // APR: only Qwen3.8's verify window rotates its experts' input
+            err = "plain model: Hadamard-folded experts (hadamard.txt) are not supported for this model";
+            return false;
+        }
+    if (n_slots_ <= 0) {
+        err = "plain model: the decode windows need the VRAM expert tier";
+        return false;
+    }
     MoeWindowShape ws;
     ws.n_embd = s.n_embd;
     ws.n_expert = E;
     ws.k = s.n_expert_used;
     ws.max_t = opt_.max_t;
     MoeWindowTier tier;
-    tier.cache_base = n_slots_ > 0 ? cache_.device_slot(0) : nullptr;
+    tier.cache_base = cache_.device_slot(0);
     tier.blob = (int64_t) lay.max_blob;
+    tier.slot_off = cache_.slot_offsets();
+    tier.n_slots = n_slots_;
     if (!win_.init(ws, tier, err)) return false;
     win_.sink()->pcie_mode = 2;   // the PCIe share staged by the copy kernel inside the window (the split's timing)
+    // the windows with every routed expert in VRAM run without the host (resident_plan), as Qwen3.8-Flash-Next's:
+    // the residency table on the device, and the ids the host counts after the window (res_count)
+    if (win_.device_plans() && MoeWindow::resident_graph_on() && (int64_t) opt_.max_t * s.n_expert_used <= 128) {
+        void* d = nullptr;
+        if (strata::gpu::alloc_device(&d, res_.size() * 4) &&
+            mapped((uint64_t) L * (uint64_t) opt_.max_t * (uint64_t) s.n_expert_used * 4, (void**) &h_rroute_,
+                   (void**) &m_rroute_)) {
+            allocs_.push_back(d);
+            res_d_ = (int32_t*) d;
+            res_shadow_.assign(res_.size(), -2);   // differs from every slot: the first window uploads the table
+        } else if (d != nullptr) {
+            strata::gpu::free(d);
+        }
+    }
 
     disp_.pool = pool_;
     disp_.src = src_;
@@ -2983,7 +3012,7 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
                               strata::gpu::Stream cs, std::string& err) {
     const ModelSpec& s = spec_;
     const int64_t N = s.n_embd, NH = s.n_head, HD = s.key_length, HV = s.ssm_dt_rank, HK = s.ssm_n_group;
-    const int64_t ZV = s.ssm_d_inner, S = s.ssm_d_state, C = 2 * HK * S + ZV, E = s.n_expert, K = s.n_expert_used;
+    const int64_t ZV = s.ssm_d_inner, S = s.ssm_d_state, C = 2 * HK * S + ZV, E = s.n_expert;
     const int64_t FS = dense_ ? s.n_ff : s.n_ff_shexp;
     const float eps = (float) s.rms_eps;
     const k::QsaShapes qs = attn_shapes();
@@ -3148,9 +3177,7 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
     if (sh_q8) k::native_qsa_rms_norm_weighted_q8_1(x_, b.post_norm, hn_, xq_, (int) N, T, eps, cs);
     else k::native_qsa_rms_norm_weighted(x_, b.post_norm, hn_, (int) N, T, eps, cs);
     k::f32_gemv_fp32_mmvf_multi(hn_, N, b.router, rlog_, E, N, E, T, cs);
-    k::router_top10(rlog_, T, (int) E, (int) K, ids_, w_, cs);
-    ++ring;
-    win_.publish(ring, 0, 0, T, hn_, ids_, w_, cs);
+    moe_ring(ml, T, ring, rlog_, cs);
     if (has_shared_ && !sh_q8) {   // in FP32 between the products
         proj(b.sh_gate, hn_, sh_gate_, T, true);
         proj(b.sh_up, hn_, sh_up_, T, false);
@@ -3167,7 +3194,35 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
         k::native_mmvq(b.sh_down.type, b.sh_down.data, xq_, shared_, (int) FS, (int) N, T, cs);
         k::f32_gemv_fp32_mmvf_multi(hn_, N, b.sh_gate_inp, sh_g_, 1, N, 1, T, cs);
     }
-    if (win_.segmented()) {   // a graph ends where the host must answer the ring
+    if (!moe_experts(ml, T, ring, segs, cs, err)) return false;
+    win_.combine(0, 0, T, w_, has_shared_ ? shared_ : nullptr, moe_out_, has_shared_ ? sh_g_ : nullptr, cs);
+    k::add_inplace(x_, moe_out_, (int64_t) T * N, cs);
+    steer(b, T, x_, cs);
+    return true;
+}
+
+// A MoE layer's routing for the window's ring: published to the host (its CPU experts and plan) or, in the window's
+// graph for every routed expert in VRAM (res_rec_), the plan built on the device and the ids kept for the host's counts
+// (res_count); then the experts' input rows.  `rlog`: the router's logits, routed here (the softmax top k, with the
+// doorbell in the same launch where that takes the shape); null: ids_ / w_ routed already (GLM's sigmoid router).
+void PlainModel::moe_ring(int64_t ml, int T, uint32_t& ring, const float* rlog, strata::gpu::Stream cs) {
+    const int64_t E = spec_.n_expert, K = spec_.n_expert_used;
+    ++ring;
+    if (res_rec_) {
+        if (rlog != nullptr) k::router_top10(rlog, T, (int) E, (int) K, ids_, w_, cs);
+        win_.resident_plan(res_d_ + ml * E, 0, T, ids_, ring, cs);
+        k::copy_i32_from_mapped(m_rroute_ + (size_t) (ring - 1) * (size_t) (opt_.max_t * K), ids_, (int64_t) T * K, cs);
+    } else if (rlog == nullptr || !win_.route_publish(0, T, rlog, ids_, w_, hn_, cs)) {
+        if (rlog != nullptr) k::router_top10(rlog, T, (int) E, (int) K, ids_, w_, cs);
+        win_.doorbell(0, T, hn_, ids_, w_, cs);
+    }
+    win_.expert_input(0, T, hn_, cs);
+}
+
+// The ring's experts into win_.parts() (a segmented window's graph ends first, where the host answers the ring)
+bool PlainModel::moe_experts(int64_t ml, int T, uint32_t ring, std::vector<strata::gpu::Graph*>& segs,
+                             strata::gpu::Stream cs, std::string& err) {
+    if (win_.segmented() && !res_rec_) {
         strata::gpu::Graph* g = nullptr;
         if (!strata::gpu::end_capture(cs, &g)) {
             err = std::string("plain model: segment capture: ") + strata::gpu::last_error();
@@ -3176,12 +3231,9 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
         segs.push_back(g);
         if (!strata::gpu::begin_capture(cs)) { err = "plain model: begin capture failed"; return false; }
     }
-    if (!win_.experts(ml, ring, 0, 0, T, cs, err)) return false;
-    k::native_moe_combine_multi(win_.parts(), w_, has_shared_ ? shared_ : nullptr, moe_out_, N, K, T, cs,
-                                has_shared_ ? sh_g_ : nullptr);
-    k::add_inplace(x_, moe_out_, (int64_t) T * N, cs);
-    steer(b, T, x_, cs);
-    return true;
+    MoeExpertsMode mode;
+    mode.resident = res_rec_;
+    return win_.experts(ml, ring, 0, 1, 0, T, cs, err, mode);
 }
 
 void PlainModel::steer(const Block& b, int64_t T, float* x, strata::gpu::Stream cs) const {
@@ -3380,7 +3432,7 @@ bool PlainModel::capture(int T, bool mtp, strata::gpu::Graph*& exec, std::vector
         err = std::string("plain model: end capture: ") + strata::gpu::last_error();
         return false;
     }
-    if (win_.segmented()) segs.push_back(g);
+    if (win_.segmented() && !res_rec_) segs.push_back(g);
     else exec = g;
     return true;
 }
@@ -3417,6 +3469,71 @@ bool PlainModel::stage(const int32_t* tokens, int T, int64_t pos, std::string& e
     return true;
 }
 
+// Every routed expert of `rings` MoE layers layers[0 ..] in VRAM: the device's residency table brought up to the host's
+// first (a fill, a swap or an eviction since the last window changes it; the table is small, the compare a few us)
+bool PlainModel::all_resident(int64_t rings, const int64_t* layers, std::string& err) {
+    if (res_d_ == nullptr) return false;
+    if (res_shadow_ != res_) {
+        if (!strata::gpu::copy(res_d_, res_.data(), res_.size() * 4)) {
+            err = std::string("plain model: the residency table: ") + strata::gpu::last_error();
+            return false;
+        }
+        res_shadow_ = res_;
+    }
+    const int64_t E = spec_.n_expert;
+    for (int64_t r = 0; r < rings; ++r)
+        for (int64_t e = 0; e < E; ++e)
+            if (res_[(size_t) (layers[r] * E + e)] < 0) return false;
+    return true;
+}
+
+bool PlainModel::capture_res(int T, bool mtp, strata::gpu::Graph*& exec, std::string& err) {
+    if (exec != nullptr) return true;
+    std::vector<strata::gpu::Graph*> none;   // the resident graph is never cut into segments
+    res_rec_ = true;
+    const bool ok = capture(T, mtp, exec, none, err);
+    res_rec_ = false;
+    return ok;
+}
+
+// What the pool would have counted for the window that ran without it (pool_fn's counts, expert_pool_count)
+void PlainModel::res_count() {
+    if (res_rings_.empty()) return;
+    const int64_t E = spec_.n_expert, K = spec_.n_expert_used;
+    for (size_t r = 0; r < res_rings_.size(); ++r) {
+        const int64_t layer = res_rings_[r];
+        const int32_t* ids = h_rroute_ + r * (size_t) (opt_.max_t * K);
+        for (int64_t i = 0; i < (int64_t) res_t_ * K; ++i)
+            if (ids[i] >= 0 && ids[i] < E) heat_[(size_t) (layer * E + ids[i])] += 1.0;
+        dump_routes(layer, ids, res_t_, K);
+        disp_.layers = layer;
+        expert_pool_count(disp_, ids, res_t_, K);
+        disp_.cache_hits += (int64_t) res_t_ * K;   // every routed entry a VRAM hit, as the pool's plan counts them
+    }
+    res_rings_.clear();
+}
+
+// Whether this window runs its graph without the host: every routed expert of its MoE layers in VRAM (as
+// Qwen3.8-Flash-Next's verify window; STRATA_VERIFY_RESIDENT_GRAPH=0: never).  Asked before the window's graph is
+// recorded, so a window records only the form it runs: recording both cost the short decodes more than the graph
+// without the host saved (B70, 32 tokens after a 4K prompt: Qwen3.6-35B-A3B 120 -> 114 tok/s with both recorded,
+// 123 with one; 2026-11-12).
+bool PlainModel::res_window(int64_t rings, const int64_t* layers, std::string& err) {
+    return !dense_ && MoeWindow::resident_graph_on() && all_resident(rings, layers, err);
+}
+
+bool PlainModel::launch_res(int T, bool mtp, strata::gpu::Graph*& exec, int64_t rings, const int64_t* layers,
+                            std::string& err) {
+    if (!capture_res(T, mtp, exec, err)) return false;
+    if (!strata::gpu::graph_launch(exec, cs_)) {
+        err = std::string("plain model: launch: ") + strata::gpu::last_error();
+        return false;
+    }
+    res_rings_.assign(layers, layers + rings);
+    res_t_ = T;
+    return true;
+}
+
 bool PlainModel::launch_serve(strata::gpu::Graph* g, std::vector<strata::gpu::Graph*>& segs, int64_t rings,
                               const int64_t* layers, int T, std::string& err) {
     if (dense_) {   // no rings to answer: the window's graph alone
@@ -3433,7 +3550,7 @@ bool PlainModel::launch_serve(strata::gpu::Graph* g, std::vector<strata::gpu::Gr
     (void) strata::gpu::stream_idle(cs_);
     std::vector<int> grps((size_t) rings, 0), tbs((size_t) rings, 0), ns((size_t) rings, T);
     if (seg) win_.set_segments(&segs);
-    return win_.serve(rings, layers, grps.data(), tbs.data(), ns.data(), &PlainModel::pool_fn, this, cs_, err);
+    return win_.serve(rings, layers, grps.data(), 1, tbs.data(), ns.data(), &PlainModel::pool_fn, this, cs_, err);
 }
 
 bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out, float* logits, std::string& err,
@@ -3537,7 +3654,7 @@ bool PlainModel::forward_run(const int32_t* tokens, int64_t n, int64_t pos, int3
 
 bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const float* hand_in, std::string& err,
                                bool defer) {
-    if (!record(T, false, err) || !settle_window(err) || !stage(tokens, T, pos, err, first())) return false;
+    if (!settle_window(err) || !stage(tokens, T, pos, err, first())) return false;
     if (hand_in != nullptr) std::memcpy(h_in_, hand_in, (size_t) T * (size_t) hand_w_ * 4);
     ring_advance(pos, T);
     pcie_probe_before();
@@ -3545,9 +3662,12 @@ bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const 
     // while the form is timed, the one-row windows take the two in turns (the same tokens either way)
     const bool timing = step_form_.form() == -1 && T == 1;
     const bool eager = step_form_.form() == 1 || (timing && step_form_.straight());
+    const bool res = !eager && res_window(moe_trunk_, moe_local_.data(), err);
+    if (!err.empty() || (!res && !record(T, false, err))) return false;
     const auto t0 = std::chrono::steady_clock::now();
     if (!(eager ? run_window(T, false, err)
-                : launch_serve(exec_[(size_t) T], segs_[(size_t) T], moe_trunk_, moe_local_.data(), T, err)))
+                : res ? launch_res(T, false, rexec_[(size_t) T], moe_trunk_, moe_local_.data(), err)
+                      : launch_serve(exec_[(size_t) T], segs_[(size_t) T], moe_trunk_, moe_local_.data(), T, err)))
         return false;
     if (cpu_tail_ != nullptr && !tail_and_head(T, pos, err)) return false;
     if (last()) pick(logits_, T, pos, m_out_, cs_);
@@ -3555,6 +3675,7 @@ bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const 
         err = std::string("plain model: the window: ") + strata::gpu::last_error();
         return false;
     }
+    res_count();
     const double win_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (timing) step_form_.timed(win_ms, "xestrata plain", "the decode windows");
     pcie_probe_after(win_ms, T);
@@ -3917,10 +4038,14 @@ void PlainModel::pcie_probe_after(double ms, int T) {
 }
 
 bool PlainModel::mtp_run(int T, const int32_t* tokens, int64_t pos, int32_t* draft, std::string& err) {
-    if (!record(T, true, err) || !stage(tokens, T, pos, err)) return false;   // the swaps: settle_window
+    if (!stage(tokens, T, pos, err)) return false;   // the swaps: settle_window
     const int64_t ml = n_moe_ - 1;
-    if (!(step_form_.form() == 1 ? run_window(T, true, err)
-                                 : launch_serve(mexec_[(size_t) T], msegs_[(size_t) T], 1, &ml, T, err)))
+    const bool eager = step_form_.form() == 1;
+    const bool res = !eager && res_window(1, &ml, err);
+    if (!err.empty() || (!res && !record(T, true, err))) return false;
+    if (!(eager ? run_window(T, true, err)
+                : res ? launch_res(T, true, mrexec_[(size_t) T], 1, &ml, err)
+                      : launch_serve(mexec_[(size_t) T], msegs_[(size_t) T], 1, &ml, T, err)))
         return false;
     // the drafts are greedy; --coupled-draft samples them as the window will (row t at position p + t draws with
     // counter p + t): the draft from the row at pos + T - 1 is checked by the window row at that position, with the
@@ -3943,6 +4068,7 @@ bool PlainModel::mtp_run(int T, const int32_t* tokens, int64_t pos, int32_t* dra
         err = std::string("plain model: the MTP layer: ") + strata::gpu::last_error();
         return false;
     }
+    res_count();
     if (disp_.failed) {
         err = std::string("plain model: the CPU experts: ") + (disp_.fail ? disp_.fail : "failed");
         return false;

@@ -1,9 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/core/moe_window.cpp - the routed experts of a window, for any MoE model (moe_window.hpp).
-//
-// The steps, their order and their kernels are Verifier::record_window's pre/post and Verifier::run's (verify.cpp),
-// so a model that uses this window computes its experts exactly as Qwen3.8's verify window does.
+// src/core/moe_window.cpp - the routed experts of a decode window, for every MoE model (moe_window.hpp).
 #include "strata/core/moe_window.hpp"
 
 #include "strata/core/device.hpp"
@@ -11,6 +8,8 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/native_moe.hpp"
+#include "strata/kernels/native_router.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
 #include "strata/kernels/verify_kernels.hpp"
@@ -53,31 +52,32 @@ int64_t plan_ptr_off(int64_t cap) { return ((4 + (cap + 1) + 2 * cap) + 1) & ~1l
 }  // namespace
 
 MoeWindow::~MoeWindow() {
+    if (copy_ != nullptr) {
+        strata::gpu::stream_sync(copy_);
+        strata::gpu::stream_destroy(copy_);
+    }
     for (void* p : {(void*) h_x_, (void*) h_ids_, (void*) h_w_, (void*) h_ymiss_, (void*) h_seq_, (void*) h_flag_,
-                    (void*) h_flagA_, (void*) h_flagB_, (void*) h_plan_, arena_})
-        strata::gpu::free(p);
-    if (copy_ != nullptr) strata::gpu::stream_destroy(copy_);
+                    (void*) h_flagA_, (void*) h_flagB_, (void*) h_plan_, arena_, (void*) skip_, (void*) slot_off_d_})
+        if (p != nullptr) strata::gpu::free(p);
+}
+
+bool MoeWindow::resident_graph_on() {
+    static const bool on = [] {
+        const char* v = strata::env_get("VERIFY_RESIDENT_GRAPH");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    return on;
 }
 
 bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std::string& err) {
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (shape.n_embd <= 0 || shape.n_embd % 256 || shape.n_expert <= 0 || shape.k < 1 || shape.k > 64 ||
-        shape.max_t < 1 || shape.max_t > strata::kernels::kVerifyMaxT || shape.max_t > strata::kernels::cpu::MAXT ||
-        (shape.groups != 1 && shape.groups != 2)) {
+        shape.max_t < 1 || shape.max_t > strata::kernels::kVerifyMaxT || shape.max_t > strata::kernels::cpu::MAXT) {
         err = "moe window: the shape is out of range";
         return false;
     }
     if (lay.n_expert != shape.n_expert || lay.n_layers <= 0) {
         err = "moe window: the expert layout is not this model's";
-        return false;
-    }
-    for (size_t l = 0; lay.native && l < lay.fmt.size(); ++l)
-        if (lay.fmt[l].had_gu || lay.fmt[l].had_d) {   // APR: only Qwen3.8's verify window rotates its experts' input
-            err = "moe window: Hadamard-folded experts (hadamard.txt) are not supported for this model";
-            return false;
-        }
-    if (tier.cache_base == nullptr || tier.blob <= 0) {
-        err = "moe window: needs the VRAM expert tier";
         return false;
     }
     sh_ = shape;
@@ -99,7 +99,7 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
               mapped(64, (void**) &h_flagB_, (void**) &m_flagB_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "moe window: mapped staging allocation failed"; return false; }
-    {
+    {   // a plan for each of the two token groups a window may be cut into
         const int64_t cap = (int64_t) (T * K);
         plan_i32_ = plan_ptr_off(cap) + 4 * cap + (cap + 1) + 1;
         if (!mapped((size_t) plan_i32_ * 4 * 2 + 64, (void**) &h_plan_, (void**) &m_plan_)) {
@@ -134,8 +134,26 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
     Bump real;
     real.base = (uint8_t*) arena_;
     carve(real);
-    set_plan_slot(0);
-    copy_ = strata::gpu::stream_create();
+    set_plan_slot(0, 1);
+    // the plan built on the device (resident_plan): its skip flags and the tier's slot offsets there
+    if (tier.cache_base != nullptr) {
+        bool ok2 = strata::gpu::alloc_device((void**) &skip_, 64) && strata::gpu::memset(skip_, 0, 64);
+        if (ok2 && tier.slot_off != nullptr && tier.n_slots > 0)
+            ok2 = strata::gpu::alloc_device((void**) &slot_off_d_, (size_t) tier.n_slots * sizeof(unsigned long long)) &&
+                  strata::gpu::copy(slot_off_d_, tier.slot_off, (size_t) tier.n_slots * sizeof(unsigned long long));
+        if (!ok2) {
+            if (skip_ != nullptr) strata::gpu::free(skip_);
+            if (slot_off_d_ != nullptr) strata::gpu::free(slot_off_d_);
+            skip_ = nullptr;
+            slot_off_d_ = nullptr;
+        }
+    }
+    // STRATA_COPY_PRIO=1: the copy stream at high priority (upstream 728097fb6, opt-in)
+    static const bool copy_prio = [] {
+        const char* v = strata::env_get("COPY_PRIO");
+        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+    }();
+    copy_ = strata::gpu::stream_create(copy_prio);
     if (!copy_) { err = "moe window: copy stream create failed"; return false; }
     strata::gpu::Stream probe = strata::gpu::stream_create();
     if (!probe) { err = "moe window: stream create failed"; return false; }
@@ -150,7 +168,7 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
     return true;
 }
 
-void MoeWindow::set_plan_slot(int grp) {
+void MoeWindow::set_plan_slot(int grp, int groups) {
     const int64_t cap = sink_.cap;
     int32_t* base = h_plan_ + (size_t) grp * (size_t) plan_i32_;
     const int64_t ptr_off = plan_ptr_off(cap);
@@ -161,7 +179,7 @@ void MoeWindow::set_plan_slot(int grp) {
     sink_.ptr = reinterpret_cast<unsigned long long*>(base + ptr_off);
     sink_.ptr2 = sink_.ptr + cap;
     sink_.start2 = base + ptr_off + 4 * cap;
-    const int64_t per = sh_.groups == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+    const int64_t per = groups == 2 ? kStagingBlobs / 2 : kStagingBlobs;   // a split window's groups halve staging
     sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
     sink_.staging_cap = per;
 }
@@ -173,12 +191,12 @@ void MoeWindow::raise_flag(uint32_t* flag, uint32_t value) {
 }
 
 // The PCIe share by DMA: the copy engine moves the blobs while the CPU computes its share and the GPU its VRAM
-// experts; a host function raises flag B when they have landed.
+// experts; a host function raises flag B when they have landed (the graph waits for it before the PCIe groups).
 void MoeWindow::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes) {
     MoeWindow* w = (MoeWindow*) ctx;
     const uint32_t want = w->cur_ring_;
     if (n <= 0) { raise_flag(w->h_flagB_, want); return; }
-    uint8_t* stage = (uint8_t*) w->sink_.staging;
+    uint8_t* stage = (uint8_t*) w->sink_.staging;   // this group's half in a split window
     for (int i = 0; i < n; ++i) strata::gpu::copy_async(stage + (size_t) i * bytes, src[i], bytes, w->copy_);
     FlagSet& fs = w->flag_sets_[want % (sizeof w->flag_sets_ / sizeof w->flag_sets_[0])];
     fs.flag = w->h_flagB_;
@@ -193,28 +211,75 @@ void MoeWindow::publish_plan(void* ctx) {
     *(volatile uint32_t*) w->h_flagA_ = w->cur_ring_;
 }
 
-void MoeWindow::publish(uint32_t ring, int grp, int tb, int n, const float* x, const int32_t* ids, const float* w,
-                        strata::gpu::Stream cs) {
-    (void) ring;
-    (void) grp;
-    using namespace strata::kernels;
+// ---------------------------------------------------------------- recorded
+
+void MoeWindow::doorbell(int tb, int n, const float* x, const int32_t* ids, const float* w, strata::gpu::Stream cs) {
     const int64_t N = sh_.n_embd, K = sh_.k;
-    doorbell_publish(x, ids, w, (int64_t) n * N, (int64_t) n * K, m_x_ + (size_t) tb * N, m_ids_ + (size_t) tb * K,
-                     m_w_ + (size_t) tb * K, m_seq_, cs);
-    if (cpu::expert_layout().native) quantize_q8_1_rows(x, n, N, nat_xq_ + (size_t) tb * (N / 32) * 36, cs);
-    else quantize_q8_0_scaled(x, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N, cs);
+    strata::kernels::doorbell_publish(x, ids, w, (int64_t) n * N, (int64_t) n * K, m_x_ + (size_t) tb * N,
+                                      m_ids_ + (size_t) tb * K, m_w_ + (size_t) tb * K, m_seq_, cs);
+}
+
+bool MoeWindow::route_publish(int tb, int n, const float* logits, int32_t* ids, float* w, const float* x,
+                              strata::gpu::Stream cs) {
+    static const bool on = [] {   // STRATA_ROUTER_PUBLISH=0: the router and the doorbell apart
+        const char* v = strata::env_get("ROUTER_PUBLISH");
+        return v == nullptr || *v != '0';
+    }();
+    if (!on) return false;
+    const int64_t N = sh_.n_embd, K = sh_.k;
+    return strata::kernels::router_publish(logits, ids, w, n, (int) sh_.n_expert, (int) K, x, (int64_t) n * N,
+                                           m_x_ + (size_t) tb * N, m_ids_ + (size_t) tb * K, m_w_ + (size_t) tb * K,
+                                           m_seq_, cs);
+}
+
+void MoeWindow::expert_input(int tb, int n, const float* x, strata::gpu::Stream cs, bool q8_ready) {
+    using namespace strata::kernels;
+    const int64_t N = sh_.n_embd;
+    if (cpu::expert_layout().native) {
+        if (!q8_ready) quantize_q8_1_rows(x, n, N, nat_xq(tb), cs);
+    } else {
+        quantize_q8_0_scaled(x, hit_xq_ + (size_t) tb * (N / 32) * 34, hit_xs_ + (size_t) tb * (N / 32), (int64_t) n * N,
+                             cs);
+    }
     if (bf16_) copy_from_mapped(nat_xf_ + (size_t) tb * N, x, (int64_t) n * N, cs);   // the BF16 experts' FP32 rows
 }
 
-bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int tb, int n, strata::gpu::Stream cs, std::string& err) {
+void MoeWindow::publish(int tb, int n, const float* x, const int32_t* ids, const float* w, strata::gpu::Stream cs) {
+    doorbell(tb, n, x, ids, w, cs);
+    expert_input(tb, n, x, cs);
+}
+
+void MoeWindow::resident_plan(const int32_t* res_layer, int grp, int n, const int32_t* ids, uint32_t ring,
+                              strata::gpu::Stream cs) {
+    strata::kernels::resident_plan(ids, n * (int) sh_.k, (int) sh_.k, res_layer, (int) sh_.n_expert, tier_.cache_base,
+                                   slot_off_d_, (long long) tier_.blob, plan_dev(grp), (long long) sh_.max_t * sh_.k,
+                                   skip_ + grp, ring, cs);
+}
+
+bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int tb, int n, strata::gpu::Stream cs,
+                        std::string& err, const MoeExpertsMode& mode) {
     using namespace strata::kernels;
     const auto& lay = cpu::expert_layout();
     if (layer < 0 || layer >= lay.n_layers) { err = "moe window: the MoE layer is out of range"; return false; }
     const int64_t N = sh_.n_embd, K = sh_.k;
     const int64_t cap = (int64_t) n * K, capx = (int64_t) sh_.max_t * K;
-    int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
-    if (!segmented_) wait_flag_ge(m_flagA_, ring, cs);   // the pool published this group's GPU plan
-    copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
+    const auto stamp = [&](int i) { if (mode.stamp) mode.stamp(i); };
+    int32_t* pl = plan_dev(grp);
+    uint32_t* skip = skip_ != nullptr ? skip_ + grp : nullptr;
+    const bool dp = mode.device_plan && skip != nullptr;
+    if (mode.resident) {
+        // the plan resident_plan built
+    } else if (segmented_) {   // the host launched this segment after the plan was published
+        if (dp) copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip, ring, cs);
+        else copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
+    } else if (dp) {           // skipped when the device planned this group (all its experts resident)
+        wait_flag_ge_or(m_flagA_, ring, skip, cs);
+        copy_i32_from_mapped_unless(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, skip, ring, cs);
+    } else {
+        wait_flag_ge(m_flagA_, ring, cs);   // the pool published this group's GPU plan
+        copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
+    }
+    stamp(19);
     const int32_t* p_counts = pl;
     const int32_t* p_start = pl + 4;
     const int32_t* p_dst = p_start + capx + 1;
@@ -223,44 +288,113 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int tb, int n, st
     const auto* p_ptr = reinterpret_cast<const unsigned long long*>(pl + ptr_off);
     const unsigned long long* p_ptr2 = p_ptr + capx;
     const int32_t* p_start2 = pl + ptr_off + 4 * capx;
+    float* parts = parts_ + (size_t) tb * K * N;
     float* hit_out = hit_out_ + (size_t) tb * K * N;
-    try {
-        // the VRAM groups now; the PCIe groups once the copy engine has landed them in staging
-        auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t grid_groups) {
-            if (lay.native) {
-                const auto& f = lay.fmt[(size_t) layer];
-                const NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type);
-                if (f.gu_type == 30)
-                    native_expert_grouped_bf16(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xf_ + (size_t) tb * N,
-                                               hit_scratch_, hit_out, cs, grid_groups);
-                else
-                    native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xq_ + (size_t) tb * (N / 32) * 36,
-                                          hit_scratch_, hit_out, cs, grid_groups);
-            } else {
-                moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
-                               hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
+    const float* ymiss = m_ymiss_ + (size_t) tb * K * N;
+    const auto* fp = lay.native ? &lay.fmt[(size_t) layer] : nullptr;
+    if (fp != nullptr && fp->had_d && mode.had_signs == nullptr) {
+        err = "moe window: a Hadamard-folded expert layer without its signs";
+        return false;
+    }
+    // the VRAM groups now; the PCIe groups once the copy engine has landed them in staging.  grid_groups: the VRAM call
+    // a row per possible group, the PCIe call kPcieGroupRows (it rarely has any group, and its rows stride over them)
+    auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t grid_groups) {
+        if (fp != nullptr) {   // the layer's GGUF formats
+            const auto& f = *fp;
+            NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type);
+            if (f.gu_type == 30) {
+                native_expert_grouped_bf16(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xf_ + (size_t) tb * N,
+                                           hit_scratch_, hit_out, cs, grid_groups);
+                return;
             }
-        };
-        grouped(p_ptr, p_start, p_counts, cap);
-        if (!segmented_) wait_flag_ge(m_flagB_, ring, cs);   // the PCIe share is in staging (DMA) or mapped
-        if (sink_.pcie_mode == 2) {                          // stage it with a copy kernel, then point at staging
-            const int64_t per = sh_.groups == 2 ? kStagingBlobs / 2 : kStagingBlobs;
-            uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
-            fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(layer), (int) per, cs);
-            rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(layer), cs);
+            if (f.had_d) { L.had_block = f.had_block; L.d_signs = mode.had_signs; }   // APR: h is rotated in there
+            native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xq(tb), hit_scratch_, hit_out, cs,
+                                  grid_groups);
+        } else {
+            moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
+                           hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
         }
+    };
+    // the PCIe share: its flag, and in the kernel mode the copy into staging
+    auto pcie_share = [&](strata::gpu::Stream on) {
+        if (segmented_) {}                                  // landed before the host launched this segment
+        else if (dp) wait_flag_ge_or(m_flagB_, ring, skip, on);
+        else wait_flag_ge(m_flagB_, ring, on);              // the PCIe share is in staging (DMA) or mapped
+        if (sink_.pcie_mode == 2) {                         // stage it with a copy kernel, then point at staging
+            const int64_t per = groups == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+            uint8_t* stage = staging_ + (size_t) (grp * per) * lay.max_blob;
+            fetch_blobs(p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(layer), (int) per, on);
+            rebase_ptrs((unsigned long long*) p_ptr2, p_counts + 2, stage, (int64_t) lay.blob_bytes(layer), on);
+        }
+    };
+    try {
+        // on a side branch beside the VRAM hits: the fetch waits on the link, the hits on the GPU (the fetch kernel
+        // leaves the hits their work-groups)
+        const bool fb = mode.fetch_side != nullptr && !mode.resident;
+        if (fb) {
+            if (!strata::gpu::stream_fork(cs, mode.fetch_side)) {
+                err = std::string("moe window fetch branch: ") + strata::gpu::last_error();
+                return false;
+            }
+            pcie_share(mode.fetch_side);
+        }
+        grouped(p_ptr, p_start, p_counts, cap);
+        stamp(20);
+        if (mode.resident) {   // no PCIe share and no CPU share: the CPU's rows are zeros
+            copy_or_zero_from_mapped(parts, ymiss, (long long) n * K * N, skip, ring, cs);
+            return true;
+        }
+        if (fb) {
+            if (!strata::gpu::stream_join(cs, mode.fetch_side)) {
+                err = std::string("moe window fetch branch: ") + strata::gpu::last_error();
+                return false;
+            }
+        } else {
+            pcie_share(cs);
+        }
+        stamp(21);
         grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows);
-        if (!segmented_) wait_flag_ge(m_flag_, ring, cs);    // the CPU's share is in the mapped rows
-        // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
-        copy_rows_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N, p_dst,
-                              p_counts + 1, cs);
-        moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
+        stamp(22);
+        if (dp) {   // no CPU share when the device planned the group: its rows are zeros
+            if (!segmented_) wait_flag_ge_or(m_flag_, ring, skip, cs);
+            copy_or_zero_from_mapped(parts, ymiss, (long long) n * K * N, skip, ring, cs);
+        } else {
+            if (!segmented_) wait_flag_ge(m_flag_, ring, cs);   // the CPU's share is in the mapped rows
+            stamp(23);
+            if (mode.rows_only)   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
+                copy_rows_from_mapped(parts, ymiss, (int64_t) n * K, N, p_dst, p_counts + 1, cs);
+            else
+                copy_from_mapped(parts, ymiss, (int64_t) n * K * N, cs);
+        }
     } catch (const std::exception& e) {
         err = "moe window, MoE layer " + std::to_string(layer) + ": " + e.what();
         return false;
     }
     return true;
 }
+
+void MoeWindow::add_hits(int grp, int tb, int n, strata::gpu::Stream cs) {
+    const int64_t N = sh_.n_embd, K = sh_.k, capx = (int64_t) sh_.max_t * K;
+    const int32_t* pl = plan_dev(grp);
+    const int32_t* p_dst = pl + 4 + capx + 1;
+    strata::kernels::moe_hit_add(parts(tb), hit_out(tb), p_dst, pl + 1, (int64_t) n * K, N, cs);
+}
+
+void MoeWindow::combine(int grp, int tb, int n, const float* w, const float* shared, float* out,
+                        const float* shared_gate, strata::gpu::Stream cs) {
+    using namespace strata::kernels;
+    const int64_t N = sh_.n_embd, K = sh_.k, capx = (int64_t) sh_.max_t * K;
+    const int32_t* pl = plan_dev(grp);
+    const int32_t* p_dst = pl + 4 + capx + 1;
+    if (native_moe_fuse_hits()) {   // the hit rows added inside the combine (the same bits, a launch fewer)
+        native_moe_combine_multi_hits(parts(tb), hit_out(tb), p_dst, pl + 1, w, shared, out, N, K, n, cs, shared_gate);
+        return;
+    }
+    moe_hit_add(parts(tb), hit_out(tb), p_dst, pl + 1, (int64_t) n * K, N, cs);
+    native_moe_combine_multi(parts(tb), w, shared, out, N, K, n, cs, shared_gate);
+}
+
+// ---------------------------------------------------------------- the host
 
 void MoeWindow::reset() {
     *(volatile uint32_t*) h_seq_ = 0;
@@ -270,86 +404,125 @@ void MoeWindow::reset() {
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
-bool MoeWindow::serve(int64_t rings, const int64_t* layers, const int* grps, const int* tbs, const int* ns,
+bool MoeWindow::wait_ring(uint32_t want, strata::gpu::Stream cs, const char* who, int64_t layer,
+                          std::string& err) const {
+    volatile const uint32_t* const seq = h_seq_;
+    if (segmented_ && !strata::gpu::stream_sync(cs)) {   // the segment that rings `want` has run
+        err = std::string(who) + ": the segment of layer " + std::to_string(layer) + ": " + strata::gpu::last_error();
+        return false;
+    }
+    const Clock::time_point a = Clock::now();
+    auto last_flush = a;
+    uint32_t spins = 0;
+    while (*seq < want) {
+        _mm_pause();
+        if ((++spins & 1023u) != 0) continue;
+        const auto now = Clock::now();
+        if (now - last_flush > std::chrono::microseconds(2000)) {
+            last_flush = now;
+            const strata::gpu::Status st = strata::gpu::stream_status(cs);
+            if (st == strata::gpu::Status::Failed) {
+                err = std::string(who) + ": layer " + std::to_string(layer) + ": " + strata::gpu::last_error();
+                return false;
+            }
+            if (st == strata::gpu::Status::Done && *seq < want) {
+                err = std::string(who) + ": layer " + std::to_string(layer) + " never rang (the graph finished)";
+                return false;
+            }
+        }
+        if (now - a > std::chrono::seconds(20)) {
+            err = std::string(who) + ": timed out at layer " + std::to_string(layer);
+            return false;
+        }
+    }
+    return true;
+}
+
+void MoeWindow::answer(uint32_t want, int grp, int groups, int tb, int n, int64_t layer, MoePoolFn pool, void* user) {
+    cur_ring_ = want;
+    set_plan_slot(grp, groups);
+    if (pool != nullptr)
+        pool(user, h_x_ + (size_t) tb * sh_.n_embd, h_ids_ + (size_t) tb * sh_.k, n, sh_.k,
+             h_ymiss_ + (size_t) tb * sh_.k * sh_.n_embd, layer);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    _mm_sfence();
+    if (*(volatile uint32_t*) h_flagA_ != want) {   // the pool did not publish a plan: an empty one
+        sink_.counts[0] = 0;
+        sink_.counts[1] = 0;
+        sink_.counts[2] = 0;
+        sink_.start[0] = 0;
+        sink_.start2[0] = 0;
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        *(volatile uint32_t*) h_flagA_ = want;
+        raise_flag(h_flagB_, want);
+    }
+    *(volatile uint32_t*) h_flag_ = want;
+}
+
+bool MoeWindow::next_segment(uint32_t want, strata::gpu::Graph* next, strata::gpu::Stream cs, const char* who,
+                             int64_t layer, std::string& err) {
+    if (!strata::gpu::stream_sync(copy_) || *(volatile uint32_t*) h_flagB_ < want) {
+        err = std::string(who) + ": the PCIe share of layer " + std::to_string(layer) + " did not land";
+        return false;
+    }
+    if (next == nullptr || !strata::gpu::graph_launch(next, cs)) {
+        err = std::string(who) + ": launch segment: " + strata::gpu::last_error();
+        return false;
+    }
+    return true;
+}
+
+void MoeWindow::release(strata::gpu::Stream cs) {
+    sink_.counts[0] = sink_.counts[1] = sink_.counts[2] = 0;
+    sink_.start[0] = sink_.start2[0] = 0;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    *(volatile uint32_t*) h_flagA_ = UINT32_MAX;
+    raise_flag(h_flagB_, UINT32_MAX);
+    *(volatile uint32_t*) h_flag_ = UINT32_MAX;
+    strata::gpu::stream_sync(cs);
+    strata::gpu::stream_sync(copy_);
+}
+
+bool MoeWindow::sync_copies() { return strata::gpu::stream_sync(copy_); }
+
+strata::gpu::Status MoeWindow::copies_status() { return strata::gpu::stream_status(copy_); }
+
+void MoeWindow::diag(uint32_t& at, uint32_t& rang, uint32_t& served, uint32_t& a, uint32_t& b) const {
+    auto rd = [](const uint32_t* p) { return p ? *(const volatile uint32_t*) p : 0u; };
+    at = cur_ring_;
+    rang = rd(h_seq_);
+    served = rd(h_flag_);
+    a = rd(h_flagA_);
+    b = rd(h_flagB_);
+}
+
+bool MoeWindow::serve(int64_t rings, const int64_t* layers, const int* grps, int groups, const int* tbs, const int* ns,
                       MoePoolFn pool, void* user, strata::gpu::Stream cs, std::string& err) {
-    volatile uint32_t* const seq = h_seq_;
     // STRATA_WINDOW_TIMES=1 (measuring): the host's time per ring, waiting for it (the GPU's work up to the layer's
     // experts) and answering it (the plan, the CPU's experts and the flags), summed over the run and printed every
     // 64 windows
     static const bool times = strata::env_get("WINDOW_TIMES") != nullptr;
     static double t_wait = 0.0, t_answer = 0.0, t_tail = 0.0;
     static int64_t n_rings = 0, n_windows = 0;
-    const Clock::time_point w0 = Clock::now();
-    Clock::time_point last_answer = w0;
+    Clock::time_point last_answer = Clock::now();
     for (int64_t r = 0; r < rings; ++r) {
         const uint32_t want = (uint32_t) (r + 1);
         const Clock::time_point a = Clock::now();
-        auto last_flush = a;
-        uint32_t spins = 0;
-        if (segmented_ && !strata::gpu::stream_sync(cs)) {   // the segment that rings `want` has run
-            err = std::string("moe window: segment ") + std::to_string(r) + ": " + strata::gpu::last_error();
-            return false;
-        }
-        while (*seq < want) {
-            _mm_pause();
-            if ((++spins & 1023u) != 0) continue;
-            const auto now = Clock::now();
-            if (now - last_flush > std::chrono::microseconds(2000)) {
-                last_flush = now;
-                const strata::gpu::Status st = strata::gpu::stream_status(cs);
-                if (st == strata::gpu::Status::Failed) {
-                    err = "moe window: ring " + std::to_string(want) + ": " + strata::gpu::last_error();
-                    return false;
-                }
-                if (st == strata::gpu::Status::Done && *seq < want) {
-                    err = "moe window: ring " + std::to_string(want) + " never rang (the graph finished)";
-                    return false;
-                }
-            }
-            if (now - a > std::chrono::seconds(20)) {
-                err = "moe window: timed out at ring " + std::to_string(want);
-                return false;
-            }
-        }
-        const Clock::time_point rung = Clock::now();
-        cur_ring_ = want;
-        set_plan_slot(grps[r]);
-        const int tb = tbs[r], n = ns[r];
-        if (pool != nullptr)
-            pool(user, h_x_ + (size_t) tb * sh_.n_embd, h_ids_ + (size_t) tb * sh_.k, n, sh_.k,
-                 h_ymiss_ + (size_t) tb * sh_.k * sh_.n_embd, layers[r]);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        _mm_sfence();
-        if (*(volatile uint32_t*) h_flagA_ != want) {   // the pool did not publish a plan: an empty one
-            sink_.counts[0] = 0;
-            sink_.counts[1] = 0;
-            sink_.counts[2] = 0;
-            sink_.start[0] = 0;
-            sink_.start2[0] = 0;
-            std::atomic_thread_fence(std::memory_order_seq_cst);
-            *(volatile uint32_t*) h_flagA_ = want;
-            raise_flag(h_flagB_, want);
-        }
-        *(volatile uint32_t*) h_flag_ = want;
+        if (!wait_ring(want, cs, "moe window", layers[r], err)) return false;
+        const Clock::time_point rung_at = Clock::now();
+        answer(want, grps[r], groups, tbs[r], ns[r], layers[r], pool, user);
         if (times) {
             last_answer = Clock::now();
-            t_wait += std::chrono::duration<double, std::milli>(rung - a).count();
-            t_answer += std::chrono::duration<double, std::milli>(last_answer - rung).count();
+            t_wait += std::chrono::duration<double, std::milli>(rung_at - a).count();
+            t_answer += std::chrono::duration<double, std::milli>(last_answer - rung_at).count();
             ++n_rings;
         }
-        if (segmented_) {   // the PCIe share's copies too, then the next segment
-            if (!strata::gpu::stream_sync(copy_) || *(volatile uint32_t*) h_flagB_ < want) {
-                err = "moe window: the PCIe share of ring " + std::to_string(want) + " did not land";
-                return false;
-            }
-            if (segs_ == nullptr || (size_t) r + 1 >= segs_->size() ||
-                !strata::gpu::graph_launch((*segs_)[(size_t) r + 1], cs)) {
-                err = std::string("moe window: launch segment: ") + strata::gpu::last_error();
-                return false;
-            }
-        }
+        if (segmented_ && !next_segment(want, segs_ != nullptr && (size_t) r + 1 < segs_->size() ? (*segs_)[(size_t) r + 1]
+                                                                                                  : nullptr,
+                                        cs, "moe window", layers[r], err))
+            return false;
     }
-    if (!strata::gpu::stream_sync(copy_)) {   // no host function of this window may raise flag B in the next one
+    if (!sync_copies()) {   // no host function of this window may raise flag B in the next one
         err = std::string("moe window: the expert copies: ") + strata::gpu::last_error();
         return false;
     }

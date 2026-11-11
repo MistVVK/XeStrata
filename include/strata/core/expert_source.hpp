@@ -31,6 +31,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstddef>
 #include <condition_variable>
@@ -538,6 +539,32 @@ bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, doub
 /// earlier than the CPU taking all `f` (the times are measured alone and on few experts: a split by a thin margin
 /// lost on the B70 with the VRAM of a small card); else 0.
 int pcie_split_m(const PcieSplitTimes& t, bool overlap, int f, int h);
+/// The prompt's CPU share measured on its own layers: the CPU's ms per expert and the GPU's per streamed expert of the
+/// layers that shared, each a running mean (weight 0.25 of the newest), and the share g / (c + g) they give, in
+/// [0.05, 0.9] (0.5 before any reading).
+struct CpuShareMeter {
+    double c_ms = 0.0, g_ms = 0.0, share = 0.5;
+    void add(double cpu_ms, int64_t n_cpu, double gpu_ms, int64_t n_gpu) {
+        if (n_cpu <= 0 || n_gpu <= 0) return;
+        constexpr double a = 0.25;
+        const double c = cpu_ms / (double) n_cpu, g = gpu_ms / (double) n_gpu;
+        c_ms = c_ms > 0 ? c_ms + a * (c - c_ms) : c;
+        g_ms = g_ms > 0 ? g_ms + a * (g - g_ms) : g;
+        share = std::clamp(g_ms / (c_ms + g_ms), 0.05, 0.9);
+    }
+};
+
+/// How many of a prompt chunk's layer's `missed` experts the CPU takes (both engines' rule): `fixed` of them where it is
+/// >= 0 (--prefill-cpu-share), else the share `meter` measured on the prompt's layers, else what the decode's split
+/// times (`split`, after Project Maya's CPU lane) leave the CPU beside `hits` VRAM hits, else none.
+inline int64_t cpu_share_count(int64_t missed, int64_t hits, double fixed, const CpuShareMeter* meter,
+                               const PcieSplitTimes* split) {
+    if (missed <= 0) return 0;
+    if (fixed >= 0.0) return std::llround(fixed * (double) missed);
+    if (meter != nullptr) return std::llround(meter->share * (double) missed);
+    if (split != nullptr) return missed - pcie_split_m(*split, true, (int) missed, (int) hits);
+    return 0;
+}
 /// All of `t`, measured once at start on the window's own kernels: the CPU's side (measure_cpu_expert_ms), the GPU
 /// computing experts from its memory, the PCIe fetch of experts in RAM, and the CPU's and the link's sides beside each
 /// other from the rate the memory serves.  False, with `why`, when a side cannot be timed (too few experts in RAM).
@@ -557,6 +584,9 @@ int tail_skip_rank();
 void set_tail_skip_rank(int r);
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out);
+/// The routing counts expert_pool_dispatch_multi keeps for layer d.layers (d.usage, or d.route_rec by window), for a
+/// window whose experts ran without the pool (every one in VRAM: MoeWindow::resident_plan).
+void expert_pool_count(ExpertDispatch& d, const int32_t* ids, int64_t n_tok, int64_t k);
 
 /// **THE HITS, LAUNCHED AFTER THE MISSES ARE STAGED AND BEFORE `post[l]`.**  Same shape as `PoolFn` and for the
 /// same reason: `session_loop` owns the ORDER and this owns the work, so the loop needs to know nothing about

@@ -545,8 +545,7 @@ bool PlainModel::record_moe(const GBlock& b, int64_t ml, int T, uint32_t& ring, 
     k::f32_gemv_fp32_mmvf_multi(hn_, N, b.router, rlog_, E, N, E, T, cs);
     const float scale = s.expert_weights_scale > 0 ? (float) s.expert_weights_scale : 1.0f;
     k::glm5_router_sigmoid(rlog_, b.router_b, T, (int) E, (int) K, s.expert_weights_norm, scale, ids_, w_, cs);
-    ++ring;
-    win_.publish(ring, 0, 0, T, hn_, ids_, w_, cs);
+    moe_ring(ml, T, ring, nullptr, cs);
     {   // the shared expert while the host serves: gate / up from hn_'s q8_1, the clamp, down
         const int FW = b.ffn_gate.n_out;
         if (b.ffn_gate.type != b.ffn_up.type ||
@@ -558,17 +557,8 @@ bool PlainModel::record_moe(const GBlock& b, int64_t ml, int T, uint32_t& ring, 
         k::glm5_swiglu_clamp(g_ffg_, g_ffu_, g_ffg_, (int64_t) T * FW, b.clamp, cs);
         gproj(b.ffn_down, g_ffg_, shared_, T, false, cs);
     }
-    if (win_.segmented()) {   // a graph ends where the host must answer the ring
-        strata::gpu::Graph* g = nullptr;
-        if (!strata::gpu::end_capture(cs, &g)) {
-            err = std::string("plain model: segment capture: ") + strata::gpu::last_error();
-            return false;
-        }
-        segs.push_back(g);
-        if (!strata::gpu::begin_capture(cs)) { err = "plain model: begin capture failed"; return false; }
-    }
-    if (!win_.experts(ml, ring, 0, 0, T, cs, err)) return false;
-    k::native_moe_combine_multi(win_.parts(), w_, shared_, moe_out_, N, K, T, cs);
+    if (!moe_experts(ml, T, ring, segs, cs, err)) return false;
+    win_.combine(0, 0, T, w_, shared_, moe_out_, nullptr, cs);
     return true;
 }
 

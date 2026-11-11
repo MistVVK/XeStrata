@@ -703,6 +703,17 @@ private:
     /// Launches a window's graph (or its segments) and answers its `rings` rings, MoE layers layers[0 ..].
     bool launch_serve(strata::gpu::Graph* g, std::vector<strata::gpu::Graph*>& segs, int64_t rings,
                       const int64_t* layers, int T, std::string& err);
+    /// The window's graph for every routed expert in VRAM (rexec_ / mrexec_, `mtp` the MTP layer's), recorded as first
+    /// needed: where res_window says so, in place of launch_serve; the host counts after the window (res_count).
+    bool res_window(int64_t rings, const int64_t* layers, std::string& err);
+    bool launch_res(int T, bool mtp, strata::gpu::Graph*& exec, int64_t rings, const int64_t* layers, std::string& err);
+    bool all_resident(int64_t rings, const int64_t* layers, std::string& err);
+    bool capture_res(int T, bool mtp, strata::gpu::Graph*& exec, std::string& err);
+    void res_count();
+    /// A MoE layer's ring and its experts in the window's graph (record_block, record_moe)
+    void moe_ring(int64_t ml, int T, uint32_t& ring, const float* rlog, strata::gpu::Stream cs);
+    bool moe_experts(int64_t ml, int T, uint32_t ring, std::vector<strata::gpu::Graph*>& segs, strata::gpu::Stream cs,
+                     std::string& err);
     /// The MTP layer over T rows at positions pos .. pos + T - 1 (tokens[t] the token at pos + t, mtp_h_'s row t the
     /// trunk's row before it): the greedy draft after the last.
     bool mtp_run(int T, const int32_t* tokens, int64_t pos, int32_t* draft, std::string& err);
@@ -1149,6 +1160,13 @@ private:
     std::vector<strata::gpu::Graph*> exec_;                      ///< per T: the whole window
     std::vector<std::vector<strata::gpu::Graph*>> segs_;         ///< per T: the segments (MoeWindow::segmented)
     std::vector<strata::gpu::Graph*> mexec_;                     ///< per T: the MTP layer
+    std::vector<strata::gpu::Graph*> rexec_, mrexec_;            ///< per T: the two with every routed expert in VRAM
+    bool res_rec_ = false;                                       ///< recording rexec_ / mrexec_
+    int32_t* res_d_ = nullptr;                                   ///< res_ on the device (null: no resident graphs)
+    std::vector<int32_t> res_shadow_;                            ///< res_ as res_d_ holds it
+    int32_t *h_rroute_ = nullptr, *m_rroute_ = nullptr;          ///< mapped: a resident window's ids, max_t x k a ring
+    std::vector<int64_t> res_rings_;                             ///< the MoE layers of the resident window to count
+    int res_t_ = 0;
     std::vector<std::vector<strata::gpu::Graph*>> msegs_;
     float *h_emb_ = nullptr, *m_emb_ = nullptr;                  ///< mapped: T rows of n_embd
     int32_t *h_step_ = nullptr, *m_step_ = nullptr;              ///< mapped: T x kStepCount

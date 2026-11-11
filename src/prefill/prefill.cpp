@@ -675,7 +675,7 @@ struct Prefill::Impl {
     std::vector<strata::kernels::cpu::NativeAct> cpu_nact;
     std::vector<strata::kernels::cpu::ExpertJobMulti> cpu_jobs;
     // the measured share: running means of the CPU's ms per expert and the GPU's per streamed expert
-    double cpu_c_ms = 0, cpu_g_ms = 0, cpu_share_now = 0.5;
+    strata::core::CpuShareMeter cpu_meter;
     strata::gpu::Event* cpu_ev[2] = {};   // the GPU's expert work of the last CPU-sharing layer
     bool cpu_pend = false;
     double pend_cpu_ms = 0;
@@ -2685,13 +2685,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (m.cpu_pend) {   // auto: the last CPU-sharing layer's GPU time is final now
                         m.cpu_pend = false;
                         float g_ms = 0;
-                        if (strata::gpu::event_elapsed_ms(&g_ms, m.cpu_ev[0], m.cpu_ev[1])) {
-                            constexpr double a = 0.25;
-                            const double c = m.pend_cpu_ms / (double) m.pend_n_cpu, gm = g_ms / (double) m.pend_n_gpu;
-                            m.cpu_c_ms = m.cpu_c_ms > 0 ? m.cpu_c_ms + a * (c - m.cpu_c_ms) : c;
-                            m.cpu_g_ms = m.cpu_g_ms > 0 ? m.cpu_g_ms + a * (gm - m.cpu_g_ms) : gm;
-                            m.cpu_share_now = std::clamp(m.cpu_g_ms / (m.cpu_c_ms + m.cpu_g_ms), 0.05, 0.9);
-                        }
+                        if (strata::gpu::event_elapsed_ms(&g_ms, m.cpu_ev[0], m.cpu_ev[1]))
+                            m.cpu_meter.add(m.pend_cpu_ms, m.pend_n_cpu, g_ms, m.pend_n_gpu);
                     }
                     if (cpu_maybe) {   // the rows buffer, once, at its largest (an expert takes at most MAXT tokens' rows)
                         const size_t cap = (size_t) std::min<int64_t>(T * K, (int64_t) strata::kernels::cpu::MAXT * m.g->n_expert) * N;
@@ -2782,8 +2777,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             helped);
                         const std::vector<std::pair<int32_t, int32_t>>& cand = cc.cand;   // (tokens, expert)
                         n_stream = cc.missed;
-                        const double share = cpu_share_env() >= 0.0 ? cpu_share_env() : cpu_arm ? m.cpu_share_now : 0.0;
-                        const size_t take = std::min(cand.size(), (size_t) std::llround(share * (double) n_stream));
+                        // how many: core's rule (the share measured on this prompt's layers; the gate's arm without
+                        // the share takes none)
+                        const int64_t take = std::min<int64_t>(
+                            (int64_t) cand.size(),
+                            cpu_share_env() < 0.0 && !cpu_arm
+                                ? 0
+                                : strata::core::cpu_share_count(n_stream, 0, cpu_share_env(), &m.cpu_meter, nullptr));
                         // the MoE input for the CPU's experts, only when it takes some (a layer whose experts all have
                         // more rows than the CPU takes, MAXT, copied the whole input for nothing: 323 MB at 32K tokens)
                         if (take > 0 && (!strata::gpu::copy_async(m.cpu_x, m.mixed, (size_t) T * N * sizeof(float), m.cs) ||
@@ -2791,20 +2791,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             err = std::string("prefill: the CPU share's input: ") + strata::gpu::last_error();
                             return false;
                         }
-                        // an expert without a blob stays on the GPU
-                        for (size_t i = 0; i < cand.size() && n_cpu < (int64_t) take; ++i) {
-                            const int32_t e = cand[i].second;
-                            const uint8_t* b = m.src->blob(l, e);
-                            if (b == nullptr) continue;
-                            if (on_cpu.empty()) {
-                                on_cpu.assign((size_t) m.g->n_expert, 0);
-                                cpu_blob.assign((size_t) m.g->n_expert, nullptr);
-                            }
-                            on_cpu[(size_t) e] = 1;
-                            cpu_blob[(size_t) e] = b;
-                            rows_cpu += cand[i].first;
-                            ++n_cpu;
-                        }
+                        n_cpu = strata::core::cpu_share_take(
+                            cand, take, INT64_MAX, [&](int32_t e) { return m.src->blob(l, e); },
+                            [&](int32_t e, int32_t rows, const uint8_t* b) {
+                                if (on_cpu.empty()) {
+                                    on_cpu.assign((size_t) m.g->n_expert, 0);
+                                    cpu_blob.assign((size_t) m.g->n_expert, nullptr);
+                                }
+                                on_cpu[(size_t) e] = 1;
+                                cpu_blob[(size_t) e] = b;
+                                rows_cpu += rows;
+                            });
                     }
                     auto gpu_side = [&](int32_t e) { return (on_cpu.empty() || !on_cpu[(size_t) e]) && !helped(e); };
                     // The experts, in id order: resident ones from VRAM, the others through the staging ring.  F8:
@@ -3476,7 +3473,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             m.pend_n_cpu = n_cpu;
                             m.pend_n_gpu = n_stream - n_cpu;
                         }
-                        stats_.cpu_share = cpu_share_env() >= 0.0 ? cpu_share_env() : m.cpu_share_now;
+                        stats_.cpu_share = cpu_share_env() >= 0.0 ? cpu_share_env() : m.cpu_meter.share;
                         strata::gpu::copy_async(m.Dm + (size_t) rows_gpu * N, m.cpu_rows, (size_t) rows_cpu * N * sizeof(float),
                                                 m.cs);
                         stats_.experts_cpu += n_cpu;

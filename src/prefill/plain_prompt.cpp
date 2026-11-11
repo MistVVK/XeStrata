@@ -593,26 +593,23 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
     std::vector<char> on_cpu((size_t) E, 0);
     std::vector<int32_t> cpu_experts;
     if (cpu_share && f.gu_type != 42) {
-        int hits = 0;
+        int64_t hits = 0;
         for (int64_t e = 0; e < E; ++e) hits += count[(size_t) e] > 0 && res_[(size_t) (ml * E + e)] >= 0;
-        // the candidates (core/expert_tier, as Qwen3.8-Flash-Next's prompt path takes them)
+        // the candidates and how many of them (core/expert_tier, as Qwen3.8-Flash-Next's prompt path takes them)
         const CpuShareCandidates cc = cpu_share_candidates(
             count.data(), E, ml, *src_, [&](int32_t e) { return res_[(size_t) (ml * E + e)] >= 0; },
             [](int32_t) { return false; });
-        const std::vector<std::pair<int32_t, int32_t>>& missed = cc.cand;
-        const int n_missed = (int) cc.missed;
-        // a fixed share (--prefill-cpu-share S) gives the CPU S of the missed experts, else the times decide
+        // a fixed share (--prefill-cpu-share S) gives the CPU S of the missed experts, else the decode's split times:
+        // the share measured on the prompt's layers (Qwen3.8-Flash-Next's) was no faster here.  Qwen3.6-35B-A3B
+        // UD-Q4_K_XL on the RTX 4070 (2026-11-12, 2 rounds): the same with the split measured; with --pcie-frac 0, where
+        // no split is measured and the CPU took none, 1K 519 -> 645 tok/s, 4K 1284 -> 1304, 32K 2651 -> 2371
         const double fixed = strata::prefill::cpu_share_setting();
-        int want = fixed > 0.0 ? (int) std::lround(fixed * (double) n_missed)
-                               : n_missed - pcie_split_m(split_, true, n_missed, hits);
-        int64_t rows = 0;
-        for (const auto& [c, e] : missed) {
-            if (want <= 0 || c > k::cpu::MAXT || rows + c > P.cpu_cap) break;
-            on_cpu[(size_t) e] = 1;
-            cpu_experts.push_back(e);
-            rows += c;
-            --want;
-        }
+        const int64_t want = cpu_share_count(cc.missed, hits, fixed > 0.0 ? fixed : -1.0, nullptr, &split_);
+        cpu_share_take(cc.cand, want, P.cpu_cap, [&](int32_t e) { return src_->blob(ml, e); },
+                       [&](int32_t e, int32_t, const uint8_t*) {
+                           on_cpu[(size_t) e] = 1;
+                           cpu_experts.push_back(e);
+                       });
     }
     // The FP16 path's resident experts of at most kIqGemmTileRows rows: their products iq_gemm_grouped_f16 takes straight
     // from their GGUF blocks in the cache (dequantized in local memory to the same FP16 values: the same bits as

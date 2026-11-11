@@ -279,6 +279,24 @@ CpuShareCandidates cpu_share_candidates(const int32_t* counts, int64_t n_expert,
     return r;
 }
 
+/// Of `cand` (cpu_share_candidates, fewest rows first), the first `want` the CPU can take: `blob(e)` non-null (the
+/// expert's bytes where the CPU reads them), their rows `row_cap` at most together; `take(e, rows, blob)` for each.
+/// The experts taken.
+template <class Blob, class Take>
+int64_t cpu_share_take(const std::vector<std::pair<int32_t, int32_t>>& cand, int64_t want, int64_t row_cap, Blob blob,
+                       Take take) {
+    int64_t n = 0, rows = 0;
+    for (const auto& [c, e] : cand) {
+        if (n >= want || rows + c > row_cap) break;
+        const uint8_t* b = blob(e);
+        if (b == nullptr) continue;   // an expert without a blob stays on the GPU
+        take(e, c, b);
+        rows += c;
+        ++n;
+    }
+    return n;
+}
+
 // The resident RAM mode and the adaptive tier.  A swap copies `in` (held in RAM) into the slot of `out` (held only
 // by that slot).  Before the slot is overwritten, `out`'s bytes are copied back from it into an exchange buffer, so
 // the CPU computes `out` from RAM while the swap is in flight; when the swap has landed, `commit_exchanges` moves
