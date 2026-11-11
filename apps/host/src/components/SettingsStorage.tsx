@@ -19,7 +19,7 @@ export function SettingsStorage() {
     const library = state.library;
     const versions = library ? pickerGroups(library).flatMap(group => group.versions) : [];
     // ONE list and ONE total: the optimized models (sizes from their real files, shared files counted once) and the other local models together.
-    const nativeModels = (native?.installed?.models ?? []).filter(m => m.ready || (m.diskGb ?? 0) > 0);      // a model whose files are all gone (an old config) is not a 0.0 GB download
+    const nativeModels = (native?.installed?.models ?? []).filter(m => !m.retired && (m.ready || (m.diskGb ?? 0) > 0));      // a model whose files are all gone (an old config) is not a 0.0 GB download
     const sharedGb = (native?.installed?.usage?.shared_bytes ?? 0) / 1e9;
     const nativeGb = native?.installed?.usage ? native.installed.usage.total_gb : nativeModels.reduce((n, m) => n + (m.diskGb ?? 0), 0);
     const totalGb = nativeGb + versions.reduce((n, v) => n + (v.diskGb ?? 0), 0);

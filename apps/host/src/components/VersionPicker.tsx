@@ -68,8 +68,8 @@ export function VersionPicker({ versions, selectedId, hardware, onSelect, onOwnG
 
   const need = (v: CatalogVersion, technical: boolean) => {
     const size = typeof v.fit_gb === 'number' && Number.isFinite(v.fit_gb) ? v.fit_gb : fitOn(v, hardware, true, cache).memoryGb;       // the files without the lookup table: the figure the label uses
-    if (technical) return v.multi_file && v.disk_gb ? tr("{0} RAM + VRAM, plus about {1} GB of disk", [gb(size), Math.round(v.disk_gb)]) : tr("{0} RAM + VRAM", [gb(size)]);
-    return v.multi_file && v.disk_gb ? tr("Needs {0} of memory and about {1} GB of disk", [whole(size), Math.round(v.disk_gb)]) : tr("Needs {0} of memory", [whole(size)]);
+    if (technical) return tr("{0} RAM + VRAM", [gb(size)]);
+    return tr("Needs {0} of memory", [whole(size)]);
   };
   const row = (v: CatalogVersion) => {
     const on = v.id === selectedId, have = !!downloaded?.has(v.id);

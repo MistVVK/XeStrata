@@ -45,10 +45,10 @@ test('the recommended versions from us come first, in order, then the downloaded
   assert.deepEqual(ids(top), ['iq3_s', 'gyro-gyro-s', 'swift-iq2_xs', 'unsloth-ud-q4_k_xl', 'coder-iq1_m']);
   assert.equal(top.length + more.length, qwen38.length, 'none lost');
   assert.ok(!more.some(x => ids(top).includes(x.id)), 'none twice');
-  // A base model whose versions are not in the fixed list (DeepSeek) still shows the engine's own pick.
-  const ds = [{ id: 'ist-das-1.75bpw', sourceFamily: 'deepseek41', model: 'IST-DAS-1.75bpw', download_gb: 50 }, { id: 'ist-das-2.00bpw', sourceFamily: 'deepseek41', model: 'IST-DAS-2.00bpw', download_gb: 60 }];
-  assert.deepEqual(recommendedVersions(ds, { family: 'deepseek41', model: 'IST-DAS-2.00bpw' }).map(r => r.v.id), ['ist-das-2.00bpw']);
-  assert.deepEqual(recommendedVersions(ds, null), [], 'no pick and no fixed picks: nothing is recommended');
+  // A base model whose versions are not in the fixed list still shows the engine's own pick.
+  const other = [{ id: 'other-a', sourceFamily: 'other', model: 'A', download_gb: 50 }, { id: 'other-b', sourceFamily: 'other', model: 'B', download_gb: 60 }];
+  assert.deepEqual(recommendedVersions(other, { family: 'other', model: 'B' }).map(r => r.v.id), ['other-b']);
+  assert.deepEqual(recommendedVersions(other, null), [], 'no pick and no fixed picks: nothing is recommended');
 });
 
 test('no downloads and no pick: everything is in the one list below, and the first-run page leaves out what it shows elsewhere', () => {
@@ -79,7 +79,7 @@ test("one rule (owner 2026-11-08): the weight files without the lookup table aga
   assert.equal(versionFit({ id: 'u', download_gb: 84, memory_gb: 51.3 }, { ram_gb: 31, vram_gb: 32 }), 'fits', 'UD-IQ3_XXS / IQ3_S there: 51 GB');
   assert.equal(versionFit({ id: 'x', download_gb: 1, memory_gb: 63 }, { ram_gb: 31, vram_gb: 32 }), 'fits', 'exactly as much as there is');
   assert.equal(versionFit({ id: 'x', download_gb: 1, memory_gb: 63.1 }, { ram_gb: 31, vram_gb: 32 }), 'ssd');
-  assert.equal(versionFit({ id: 'x', download_gb: 1, memory_gb: 40, fit_gb: 150 }, { ram_gb: 64, vram_gb: 24 }), 'ssd', "DeepSeek: the set's files, not the CPU's share");
+  assert.equal(versionFit({ id: 'x', download_gb: 1, memory_gb: 40, fit_gb: 150 }, { ram_gb: 64, vram_gb: 24 }), 'ssd', "the catalog's own files size, not the CPU's share");
   assert.equal(versionFit({ id: 'x', download_gb: 1, memory_gb: 40, fit_gb: 60 }, { ram_gb: 64, vram_gb: 24 }), 'fits');
   assert.equal(versionFit({ ...nvfp4, on_this_pc: 'does not fit' }, { ram_gb: 32, vram_gb: 24 }), 'ssd', 'a smaller PC still runs it, slower');
   assert.equal(versionFit({ ...nvfp4, on_this_pc: 'tight' }, { ram_gb: 128, vram_gb: 32 }), 'fits');

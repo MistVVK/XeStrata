@@ -46,7 +46,7 @@ test('withoutDraftLayer takes out --mtp, --spec-min-p and --batch-mtp and keeps 
 
 test('"Draft layer (MTP)" is a setting of the app, not frozen, and "MTP per request" is not frozen either', async () => {
   assert.ok(NATIVE_FIELDS.some(f => f.id === 'mtp' && f.type === 'boolean'));
-  assert.deepEqual(APP_OWNED_FIELDS.sort(), ['batchMtp', 'drafting', 'ds_experts', 'mtp']);
+  assert.deepEqual(APP_OWNED_FIELDS.sort(), ['batchMtp', 'drafting', 'mtp']);
   const f = fixture();
   try {
     await f.native.refresh(true);

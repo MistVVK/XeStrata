@@ -1,7 +1,6 @@
 {
  "vp01": "Téléchargement de {0}",
  "vp02": "Nécessite {0} de mémoire",
- "vp03": "Nécessite {0} de mémoire et environ {1} Go de disque",
  "vp04": "Tient",
  "vp05": "Tient avec streaming depuis le SSD",
  "vp06": "Ne tient pas",

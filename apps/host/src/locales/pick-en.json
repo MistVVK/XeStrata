@@ -1,7 +1,6 @@
 {
  "vp01": "{0} download",
  "vp02": "Needs {0} of memory",
- "vp03": "Needs {0} of memory and about {1} GB of disk",
  "vp04": "Fits",
  "vp05": "Fits with SSD streaming",
  "vp06": "Doesn't fit",

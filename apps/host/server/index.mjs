@@ -257,7 +257,14 @@ function runtimeState(){
   return runtimeModels.state();
 }
 
-const startupModelId = process.env.STRATA_REAL_ENGINE === '1' ? (store.get().loaded ?? store.get().current) : null;
+let startupModelId = process.env.STRATA_REAL_ENGINE === '1' ? (store.get().loaded ?? store.get().current) : null;
+/* A remembered DeepSeek model (Strata 0.2.13 and earlier; strata_control/retired.py): never started again. The remembered choice is cleared and the
+   approved sentence goes to the host log, as every autostart failure does (the Models screen names its folder and size from Control's list). */
+if (startupModelId && /deepseek/i.test(String(startupModelId))) {
+  console.error(`autostart failed: ${startupModelId} is a DeepSeek model. This version of Strata no longer runs DeepSeek models, so it was not started.`);
+  store.update({ loaded: null, current: null });
+  startupModelId = null;
+}
 if (startupModelId) {
   monitor.setModel(startupModelId);
   const lastId = startupModelId;

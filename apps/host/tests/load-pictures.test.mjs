@@ -54,7 +54,7 @@ function fixture({ layout = 'own', vision = null, arch = undefined, onFetch = nu
     async installedModels() {
       const gone = vision && !existsSync(mmproj);
       return { install_dir: install, models: [{ id: 'iq3_s', name: 'qwen3.8-flash-next-iq3_s', source_config: configPath, context_tokens: 8192, backend: 'cuda',
-        component_status: gone ? 'missing_or_invalid' : 'present', ...(gone ? { missing: [{ part: 'vision/mmproj', file: 'mmproj-Qwen3.8-Flash-Next-BF16.gguf', status: 'missing' }], issue_codes: ['COMPONENT_MISSING'] } : { missing: [], issue_codes: [] }) }] };
+        component_status: String(arch ?? '').startsWith('deepseek') ? 'retired' : gone ? 'missing_or_invalid' : 'present', ...(String(arch ?? '').startsWith('deepseek') ? { retired: 'deepseek', retired_line: 'DeepSeek - no longer supported.', refusal: 'DeepSeek-V4.1-Flash ISTA-DAS 2.00 bpw is a DeepSeek model. This version of Strata no longer runs DeepSeek models, so it was not started. Choose a Qwen model to run instead. If you no longer need the DeepSeek files, you can delete that folder to free the space.' } : {}), ...(gone ? { missing: [{ part: 'vision/mmproj', file: 'mmproj-Qwen3.8-Flash-Next-BF16.gguf', status: 'missing' }], issue_codes: ['COMPONENT_MISSING'] } : { missing: [], issue_codes: [] }) }] };
     },
     async engine() { return { usable: true, backend: 'cuda', components_dir: join(root, 'c'), engine: { version: '0.1.55', platform: 'linux-x86_64', backend: 'cuda', exe: join(root, 'engine', 'strata'), root: engineRoot ?? join(root, 'engine') } }; },
     async saveProfile(name, path) { calls.push(['saveProfile', name]); saved.push(JSON.parse(readFileSync(path, 'utf8'))); return {}; },
@@ -248,9 +248,18 @@ test('nothing is downloaded unless the Load asked for pictures, and never for a 
   // prepared, the file is there
   f = fixture({ vision: true, mmprojFile: true });
   try { await f.native.refresh(true); assert.equal((await finish(f.native, loadOp(f, { vision: 'yes' }).id)).state, 'done'); assert.equal(f.fetches().length, 0); assert.ok(f.saved[0].vision); } finally { await f.native.close(); f.cleanup(); }
-  // DeepSeek reads pictures with its own files
+  // a DeepSeek model of an earlier Strata (Control: retired): the load stops with Control's own words, fetches nothing and writes nothing
   f = fixture({ arch: 'deepseek41' });
-  try { await f.native.refresh(true); await finish(f.native, loadOp(f, { vision: 'yes' }).id); assert.equal(f.fetches().length, 0); } finally { await f.native.close(); f.cleanup(); }
+  try {
+    const m = (await f.native.refresh(true)).installed.models[0];
+    assert.deepEqual(m.retired, { line: 'DeepSeek - no longer supported.', refusal: 'DeepSeek-V4.1-Flash ISTA-DAS 2.00 bpw is a DeepSeek model. This version of Strata no longer runs DeepSeek models, so it was not started. Choose a Qwen model to run instead. If you no longer need the DeepSeek files, you can delete that folder to free the space.' });
+    assert.equal(m.ready, false);
+    const job = await finish(f.native, loadOp(f, { vision: 'yes' }).id);
+    assert.equal(job.state, 'error');
+    assert.match(String(job.error), /is a DeepSeek model\. This version of Strata no longer runs DeepSeek models, so it was not started\./);
+    assert.equal(f.fetches().length, 0);
+    assert.equal(f.saved.length, 0, 'no profile is saved');
+  } finally { await f.native.close(); f.cleanup(); }
 });
 
 test('the picture file was deleted after the model was prepared: the model is not "missing files"; Load fetches it again, a restart goes on without pictures', async () => {
@@ -368,8 +377,7 @@ test('the Models page sends a plain Load, not the installer, when the only gap i
   const built = await build({ stdin: { contents: "export * from './src/lib/native-catalog';", resolveDir: process.cwd() }, bundle: true, write: false, format: 'esm', platform: 'node', loader: { '.json': 'json' } });
   const { fetchesPictures, PICTURE_FETCH_FAMILIES } = await import(`data:text/javascript;base64,${Buffer.from(built.outputFiles[0].text).toString('base64')}`);
   for (const family of ['qwen', 'coder', 'unsloth', 'gyro', 'swift']) assert.equal(fetchesPictures({ sourceFamily: family }, true), true, family);
-  for (const family of ['nvfp4', 'qwen36', 'deepseek41', undefined]) assert.equal(fetchesPictures({ sourceFamily: family }, true), false, `${family} keeps the installer`);
-  assert.equal(fetchesPictures({ sourceFamily: 'qwen', multi_file: true }, true), false, 'DeepSeek reads pictures with its own files');
+  for (const family of ['nvfp4', 'qwen36', undefined]) assert.equal(fetchesPictures({ sourceFamily: family }, true), false, `${family} keeps the installer`);
   assert.equal(fetchesPictures({ sourceFamily: 'qwen' }, false), false, 'a source checkout has no Control to fetch them');
   assert.equal(fetchesPictures({ sourceFamily: 'qwen' }, undefined), false);
   assert.equal(fetchesPictures(undefined, true), false);

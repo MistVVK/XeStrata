@@ -104,11 +104,6 @@ test('the recommended four come first; the others are what the "More versions" l
   assert.deepEqual(lib.recommendedVersions([v('qwen36', 'UD-Q4_K_XL')]), [], 'Qwen3.6 has no recommended set: its versions are all shown');
 });
 
-test("the DeepSeek versions have their names, the ISTA-DAS Coder under the owner's spelling", () => {
-  lib.setTranslationLanguage('en');
-  assert.deepEqual(['IST-DAS-1.75bpw', 'IST-DAS-2.00bpw', 'IST-DAS-2.25bpw', 'ISTA-DAS-Coder'].map(m => lib.nativeVersionLabel(m)), ['Smallest', 'Balanced', 'Best quality', 'ISTA-DAS Coder']);
-});
-
 test('the three NVFP4 versions have clear names and one line that tells them apart', () => {
   lib.setTranslationLanguage('en');
   const names = ['NVFP4', 'NVFP4-NVIDIA', 'NVFP4-QAD'].map(m => lib.nativeVersionLabel(m));

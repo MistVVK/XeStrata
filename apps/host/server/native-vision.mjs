@@ -11,12 +11,11 @@ export function runtimeVision(config,requested){
 
 /**
  * The catalog with each picture-capable size marked as ready (`images`) or not (`imagesCapable` stays true either way). The Qwen engines
- * read pictures with a separate program (strata-vision) that has to sit in the engine folder; DeepSeek-V4.1-Flash (`multi_file`, its own
- * engine) carries its own picture tower, so it is ready whatever that folder holds (#4772: it was told to update an engine that was fine).
+ * read pictures with a separate program (strata-vision) that has to sit in the engine folder.
  */
 export function markPictures(catalog,visionReader){
  if(!catalog||!Array.isArray(catalog.families))return catalog;
- const ready=(s)=>!!s.images&&(s.multi_file===true||visionReader===true);
+ const ready=(s)=>!!s.images&&visionReader===true;
  return {...catalog,families:catalog.families.map(f=>{
   const sizes=(f.sizes??[]).map(s=>({...s,imagesCapable:!!s.images,images:ready(s)}));
   return {...f,imagesCapable:!!f.images,images:sizes.length?sizes.some(s=>s.images):!!f.images&&visionReader===true,sizes};

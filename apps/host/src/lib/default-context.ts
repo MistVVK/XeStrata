@@ -24,8 +24,6 @@ export function defaultContext(choices: readonly number[] | null | undefined): n
 export function openingContext(saved: number | null | undefined, choices: readonly number[] | null | undefined, chosen = false, oldDefaults: readonly number[] = [OLD_DEFAULT_CONTEXT]): number {
   return saved && saved > 0 && (chosen || !oldDefaults.includes(saved)) ? saved : defaultContext(choices);
 }
-/** What DeepSeek-V4.1-Flash used to open with (the one context its engine was checked at): an unmarked saved 8K is that default, not a choice. */
-export const OLD_DEEPSEEK_CONTEXT = 8192;
 
 /**
  * Graphics memory left for the model's own data after the conversation memory of this context (the app's estimate, the same figures as the This

@@ -12,9 +12,8 @@ const { engineGroupTitle } = await import(`data:text/javascript;base64,${Buffer.
 
 const catalog = [{ family: 'qwen', title: 'Qwen3.8-Flash-Next' }, { family: 'qwen4exp_q4_lite', title: 'Qwen4 Lite' }];
 
-test('the group heading: Control\'s title for Qwen and DeepSeek, the model\'s catalog title for a shape, the shape\'s name without one; never the family id', () => {
+test('the group heading: Control\'s title for Qwen, the model\'s catalog title for a shape, the shape\'s name without one; never the family id', () => {
   assert.equal(engineGroupTitle({ family: 'qwen', title: 'Qwen and other models', engines: [] }, catalog), 'Qwen and other models');
-  assert.equal(engineGroupTitle({ family: 'deepseek', title: 'DeepSeek', engines: [] }, catalog), 'DeepSeek');
   assert.equal(engineGroupTitle({ family: 'shape:q4_lite', shape: 'q4_lite', title: null, engines: [] }, catalog), 'Qwen4 Lite');
   assert.equal(engineGroupTitle({ family: 'shape:q4_mid', shape: 'q4_mid', title: null, engines: [] }, catalog), 'q4_mid');
   assert.equal(engineGroupTitle({ family: 'shape:q4_mid', title: null, engines: [] }, null), 'q4_mid', 'no shape field: from the family, no catalog');
@@ -38,7 +37,7 @@ test('the page: Control\'s title when it has one (no change for an install witho
   assert.match(page, /\{groups\.length > 1 \? <h3 className="engine-group__title">\{group\.title \? tr\(group\.title\) : engineGroupTitle\(group, native\?\.catalog\?\.families\)\}<\/h3> : null\}/);
 });
 
-test('the Use dialog (owner 11-09): a shape group says "{model} runs on engine {version} from its next start." with the group title; Strata and DeepSeek keep their sentence', () => {
+test('the Use dialog (owner 11-09): a shape group says "{model} runs on engine {version} from its next start." with the group title; Strata keeps its sentence', () => {
   const page = read(new URL('../src/components/SettingsEngine.tsx', import.meta.url), 'utf8');
   assert.match(page, /const useGroup = use \? groups\.find\(g => g\.family === use\.family\) : undefined;/);
   assert.match(page, /useGroup\?\.family\.startsWith\('shape:'\) \? tr\("\{0\} runs on engine \{1\} from its next start\. Your models and settings stay as they are\. You can switch back at any time\.", \[engineGroupTitle\(useGroup, native\?\.catalog\?\.families\), use\?\.version \?\? ''\]\) : tr\("Models you start from now on run on engine \{0\}\. Your models and settings stay as they are\. You can switch back at any time\."/);
@@ -56,5 +55,5 @@ test('the Use dialog (owner 11-09): a shape group says "{model} runs on engine {
     const rest = use.slice(use.search(/[。.]\s*/) + use.match(/[。.]\s*/)[0].length);
     assert.ok(rest.length > 5 && t.endsWith(rest), lang + ': ' + t);
   }
-  assert.ok(Object.values(en).includes('Models you start from now on run on engine {0}. Your models and settings stay as they are. You can switch back at any time.'), 'the Strata / DeepSeek sentence is unchanged');
+  assert.ok(Object.values(en).includes('Models you start from now on run on engine {0}. Your models and settings stay as they are. You can switch back at any time.'), 'the Strata sentence is unchanged');
 });

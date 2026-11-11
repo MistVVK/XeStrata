@@ -52,6 +52,21 @@ for (const [raw, kind, message] of cases) {
   });
 }
 
+test('a DeepSeek model of an earlier Strata: Control’s own words, the folder and size kept, the next step apart (English only until the owner approves translations)', () => {
+  const d1 = 'DeepSeek-V4.1-Flash ISTA-DAS 2.00 bpw is a DeepSeek model. This version of Strata no longer runs DeepSeek models, so it was not started.';
+  const files = ' Its files are still on this computer: 257 GB in /home/me/Strata-data/models/deepseek-v4.1-flash-ist-das-2.00bpw. Nothing was changed or deleted.';
+  const next = 'Choose a Qwen model to run instead. If you no longer need the DeepSeek files, you can delete that folder to free the space.';
+  for (const message of [d1, d1 + files]) {
+    const f = plainFailure(message + ' ' + next);
+    assert.equal(f.kind, 'deepseek-retired');
+    assert.equal(f.message, message);
+    assert.equal(f.next, next);
+    assert.equal(plainFailure(JSON.stringify({ error: message + ' ' + next })).message, message, 'a wrapped error body too');
+  }
+  assert.notEqual(plainFailure('server_exited').kind, 'deepseek-retired');
+  assert.notEqual(plainFailure('The agent component (DeepSeek Harness) is not installed.').kind, 'deepseek-retired');
+});
+
 test('an ordinary sentence is left as it is and gets no Details', () => {
   const f = plainFailure('Some model files are missing. Use Download / repair to restore them.');
   assert.equal(f.kind, 'plain');

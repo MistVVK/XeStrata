@@ -6,7 +6,7 @@ import { plainEngineError } from './update-messages.mjs';
  * Nothing here downloads: a switch uses what is installed.
  */
 
-const FAMILIES = ['qwen', 'deepseek'];
+const FAMILIES = ['qwen'];
 /** The engine of a Qwen4 model shape (strata_control/engine_library.py SHAPE_PREFIX, shape_engine.SHAPE_RE). */
 const SHAPE_FAMILY = /^shape:[a-z][a-z0-9_]{1,21}[a-z0-9]$/;
 
