@@ -271,19 +271,31 @@ __global__ void k_widen16(const uint16_t* __restrict__ in, size_t n, float* __re
 // registers.  The head size is padded with zeros to NT * 16 (72 -> 80).  O / row sum goes to ctx in float32.  No atomics, a fixed key order: the result is
 // the same on every run.  q is already scaled by 1 / sqrt(head size) (k_qkv_rope).  The WMMA fragment layouts (wave32): A: lane l holds row l % 16, 16
 // consecutive K values; B: lane l holds column l % 16, 16 consecutive K values; C / D (float32): lane l holds column l % 16, rows 2 * e + l / 16, e = 0..7.
-constexpr int kFaQ = 64, kFaKeys = 32;
+constexpr int kFaQ = 64, kFaKeys = 64;
 #if defined(__GFX11__)
 typedef _Float16 vit_half16 __attribute__((ext_vector_type(16)));
 typedef float vit_float8 __attribute__((ext_vector_type(8)));
+// 16 consecutive F16 values from a 16-byte aligned address, as two 128-bit loads
+__device__ __forceinline__ vit_half16 fa_ld16(const _Float16* p) {
+    const uint4 x0 = *(const uint4*) p, x1 = *(const uint4*) (p + 8);
+    vit_half16 r;
+    __builtin_memcpy(&r, &x0, 16);
+    __builtin_memcpy((char*) &r + 16, &x1, 16);
+    return r;
+}
 #endif
+// Tuning round 1 (11-11): K and V reach LDS by 128-bit global loads (8 F16 values; the head size must be a multiple of 8), the fragments leave LDS by
+// 128-bit loads (LDS rows padded by 8 values to stay 16-byte aligned and to shift the banks), 64-key tiles, exp2f with log2(e) folded into the scores,
+// and the P exchange inside a wave (a wave barrier with LDS fences, not a block barrier).
 template <int NT>
 __global__ void __launch_bounds__(128) k_attn_fa_gfx11(const uint16_t* __restrict__ q, const uint16_t* __restrict__ k, const uint16_t* __restrict__ v,
                                                        float* __restrict__ ctx, int N, int q0, int qc, int D, int hd) {
 #if defined(__GFX11__)
-    constexpr int DP = NT * 16;
-    __shared__ _Float16 sK[kFaKeys][DP];            // the key tile, row = key
-    __shared__ _Float16 sVt[DP][kFaKeys];           // the value tile transposed, row = head dimension
-    __shared__ _Float16 sP[4][16][kFaKeys];         // each wave's probabilities, row = query
+    constexpr int DP = NT * 16, SKP = DP + 8, KP = kFaKeys + 8, CH = DP / 8;
+    constexpr float kLog2e = 1.4426950408889634f;
+    __shared__ __attribute__((aligned(16))) _Float16 sK[kFaKeys][SKP];      // the key tile, row = key
+    __shared__ __attribute__((aligned(16))) _Float16 sVt[DP][KP];           // the value tile transposed, row = head dimension
+    __shared__ __attribute__((aligned(16))) _Float16 sP[4][16][KP];         // each wave's probabilities, row = query
     const int h = blockIdx.y, wave = threadIdx.x / 32, lane = threadIdx.x % 32, l16 = lane % 16, hi = lane / 16;
     const int qw = q0 + blockIdx.x * kFaQ + wave * 16;           // this wave's first query
     const size_t hoff = (size_t) h * hd;
@@ -301,58 +313,58 @@ __global__ void __launch_bounds__(128) k_attn_fa_gfx11(const uint16_t* __restric
     }
     vit_float8 o[NT];
     for (int t = 0; t < NT; ++t) o[t] = vit_float8{0, 0, 0, 0, 0, 0, 0, 0};
-    float mrow[8], lrow[8];                          // rows 2 * e + hi of the wave's 16 queries
+    float mrow[8], lrow[8];                          // rows 2 * e + hi of the wave's 16 queries; the maximum in log2 units
     for (int e = 0; e < 8; ++e) { mrow[e] = -INFINITY; lrow[e] = 0.0f; }
     for (int k0 = 0; k0 < N; k0 += kFaKeys) {
         __syncthreads();                             // the previous tile is used up
-        for (int i = threadIdx.x; i < kFaKeys * DP; i += blockDim.x) {
-            const int key = i / DP, d = i % DP, kk = k0 + key;
-            const bool ok = kk < N && d < hd;
-            const size_t g = (size_t) kk * D + hoff + d;
-            sK[key][d] = ok ? ((const _Float16*) k)[g] : (_Float16) 0.0f;
-            sVt[d][key] = ok ? ((const _Float16*) v)[g] : (_Float16) 0.0f;
+        for (int i = threadIdx.x; i < kFaKeys * CH; i += blockDim.x) {
+            const int key = i / CH, d = (i % CH) * 8, kk = k0 + key;
+            uint4 kx = make_uint4(0, 0, 0, 0), vx = make_uint4(0, 0, 0, 0);
+            if (kk < N && d < hd) {
+                const size_t g = (size_t) kk * D + hoff + d;
+                kx = *(const uint4*) (k + g);
+                vx = *(const uint4*) (v + g);
+            }
+            *(uint4*) &sK[key][d] = kx;
+            _Float16 vv[8];
+            __builtin_memcpy(vv, &vx, 16);
+            for (int e = 0; e < 8; ++e) sVt[d + e][key] = vv[e];
         }
         __syncthreads();
-        // the scores of the wave's 16 queries against the tile's keys, two 16-key halves
+        // the scores of the wave's 16 queries against the tile's keys, in 16-key quarters, times log2(e)
         vit_float8 sc[kFaKeys / 16];
         for (int j = 0; j < kFaKeys / 16; ++j) {
             vit_float8 acc = vit_float8{0, 0, 0, 0, 0, 0, 0, 0};
-            for (int s = 0; s < NT; ++s) {
-                vit_half16 b;
-                for (int e = 0; e < 16; ++e) b[e] = sK[j * 16 + l16][s * 16 + e];     // B = K^T: column = key j * 16 + l16
-                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qa[s], b, acc);
-            }
+            for (int s = 0; s < NT; ++s) acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(qa[s], fa_ld16(&sK[j * 16 + l16][s * 16]), acc);
             const bool valid = k0 + j * 16 + l16 < N;
-            for (int e = 0; e < 8; ++e) sc[j][e] = valid ? acc[e] : -INFINITY;
+            for (int e = 0; e < 8; ++e) sc[j][e] = valid ? acc[e] * kLog2e : -INFINITY;
         }
-        // online softmax per query row: this lane holds rows 2 * e + hi of one key column per half; the row's other keys are in the 16 lanes of its half
+        // online softmax per query row: this lane holds rows 2 * e + hi of one key column per quarter; the row's other keys are in the 16 lanes of its half
         for (int e = 0; e < 8; ++e) {
             float mx = sc[0][e];
             for (int j = 1; j < kFaKeys / 16; ++j) mx = fmaxf(mx, sc[j][e]);
             for (int off = 8; off > 0; off >>= 1) mx = fmaxf(mx, __shfl_xor(mx, off, 16));
             const float mnew = fmaxf(mrow[e], mx);
-            const float corr = expf(mrow[e] - mnew);
+            const float corr = exp2f(mrow[e] - mnew);
             float sum = 0.0f;
             for (int j = 0; j < kFaKeys / 16; ++j) {
-                const float p = expf(sc[j][e] - mnew);
-                sum += p;
-                sP[wave][2 * e + hi][j * 16 + l16] = (_Float16) p;
+                const float pr = exp2f(sc[j][e] - mnew);
+                sum += pr;
+                sP[wave][2 * e + hi][j * 16 + l16] = (_Float16) pr;
             }
             for (int off = 8; off > 0; off >>= 1) sum += __shfl_xor(sum, off, 16);
             lrow[e] = lrow[e] * corr + sum;
             mrow[e] = mnew;
             for (int t = 0; t < NT; ++t) o[t][e] *= corr;
         }
-        __syncthreads();                             // sP written by every lane of the wave before any lane reads its row
+        // sP is this wave's own: every lane's writes before any lane's reads, inside the wave
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
         // O += P V: A = P (row = query l16, 16 keys), B = V (16 keys, column = head dimension t * 16 + l16)
         for (int j = 0; j < kFaKeys / 16; ++j) {
-            vit_half16 pa;
-            for (int e = 0; e < 16; ++e) pa[e] = sP[wave][l16][j * 16 + e];
-            for (int t = 0; t < NT; ++t) {
-                vit_half16 b;
-                for (int e = 0; e < 16; ++e) b[e] = sVt[t * 16 + l16][j * 16 + e];
-                o[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, b, o[t]);
-            }
+            const vit_half16 pa = fa_ld16(&sP[wave][l16][j * 16]);
+            for (int t = 0; t < NT; ++t) o[t] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(pa, fa_ld16(&sVt[t * 16 + l16][j * 16]), o[t]);
         }
     }
     // O / row sum to the context rows: lane column = head dimension t * 16 + l16, rows 2 * e + hi
@@ -600,10 +612,10 @@ struct VitGpuImpl {
     // (F16 -> F16, float32 accumulation; the score product S is F16 -> F16 already).  The result is the float32 sum rounded once to 16 bits.
     bool hpa16 = false, hpa16_att = false;
     // STRATA_VIT_FA=1 (off by default): the fused attention k_attn_fa_gfx11 on gfx11 cards (wave32).  A launch takes at most fa_units query x key x head
-    // triples (STRATA_VIT_FA_UNITS overrides): 2^32 is planned as about 100 ms on a Radeon 8060S, far from the Windows GPU timeout of 2 s, also at the
-    // 16,384-token limit (65,232 patches: about 16 launches a layer).  With STRATA_VIT_PROF the longest launch of an encode is printed.
+    // triples (STRATA_VIT_FA_UNITS overrides): 2^29, measured on the 780M with the first version at about 1.4 TFLOP/s as about 110 ms, so far
+    // from the Windows GPU timeout of 2 s on any gfx11 card, also at the 16,384-token limit (65,232 patches: about 130 launches a layer).  With STRATA_VIT_PROF the longest launch of an encode is printed.
     bool fa = false;
-    long long fa_units = 1LL << 32;
+    long long fa_units = 1LL << 29;
     double fa_longest_ms = 0.0;
     uint16_t *d_y16 = nullptr, *d_pv16 = nullptr;     // the 16-bit results (sized with the work buffers when the switch is on)
     size_t y16_elems = 0, pv16_elems = 0;
@@ -858,10 +870,10 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
                      m.hpa16 && m.hpa16_att ? " and " : "", m.hpa16_att ? "the attention's P*V product" : "");
     if (const char* e = std::getenv("STRATA_VIT_FA"); e && std::atoi(e) != 0) {
         hipDeviceProp_t p;
-        if (hipGetDeviceProperties(&p, device) == hipSuccess && std::string(p.gcnArchName).rfind("gfx11", 0) == 0 && p.warpSize == 32 && g.head_dim <= 96)
+        if (hipGetDeviceProperties(&p, device) == hipSuccess && std::string(p.gcnArchName).rfind("gfx11", 0) == 0 && p.warpSize == 32 && g.head_dim <= 96 && g.head_dim % 8 == 0)
             m.fa = true;
         (void) hipGetLastError();
-        std::fprintf(stderr, "vit-fa: fused attention %s\n", m.fa ? "on (gfx11 WMMA)" : "asked for but not available on this card (gfx11, wave32, head size <= 96 only)");
+        std::fprintf(stderr, "vit-fa: fused attention %s\n", m.fa ? "on (gfx11 WMMA)" : "asked for but not available on this card (gfx11, wave32, head size <= 96 and a multiple of 8 only)");
     }
     if (const char* e = std::getenv("STRATA_VIT_FA_UNITS")) { const long long u = std::atoll(e); if (u >= (1LL << 20)) m.fa_units = u; }
 #endif
