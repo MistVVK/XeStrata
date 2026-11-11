@@ -24107,6 +24107,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PARK_SEGPOOL_MIB",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 404,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": "0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "",
+   "since": null,
+   "last_commit": "",
+   "last_date": "",
+   "status": "research",
+   "owner": "core",
+   "note": "[reviewed] Research switch of lane PARK-POOL (not documented for users): N MiB (at most an eighth of the conversation cache) of host memory is reserved once and made resident in the background, and the K/V buffers of parked conversations (segments of 512 KiB and more) are taken from it, so a park no longer pays the first touch of fresh pages. Its idle bytes count against --conversation-cache-mib and are given back before an image or the RAM floor would suffer. Linux only. Off unless set to a number above 0.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PARK_TRACE",
    "backends": [
     "cuda-hip"
