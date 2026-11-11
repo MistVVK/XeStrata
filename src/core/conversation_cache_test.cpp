@@ -745,5 +745,72 @@ int main() {
         check(cache.drop_superseded(slot_ids, {}, slot_chain, true) == 1 && cache.size() == 0,
               "the slot's chain supersedes the richer copy");
     }
+    {
+        // STRATA_PARK_SEGPOOL_MIB: the segment pool's idle bytes count against the budget beside the images, are given back
+        // first, and never change what the cache evicts, refuses or parks
+        struct FakePool final : SegmentPoolBudget {
+            size_t idle = 0, shrinks = 0, shrunk = 0;
+            size_t idle_bytes() const override { return idle; }
+            size_t shrink(size_t want) override { ++shrinks; const size_t g = std::min(want, idle); idle -= g; shrunk += g; return g; }
+        };
+        auto sized = [](int32_t id, size_t bytes) { SavedConversation s = image({id}); s.live.gdn.resize(bytes, 7); return s; };
+        {
+            FakePool pool;
+            ConversationCache cache(10000, 8);
+            cache.set_pool(&pool);
+            check(cache.put(sized(1, 4000)) && cache.put(sized(2, 4000)), "two images of about 4000 bytes");
+            const size_t images = cache.bytes();
+            pool.idle = 1800;
+            check(cache.bytes() == images && cache.pool_idle_bytes() == 1800 && cache.resident_bytes() == images + 1800,
+                  "bytes() is the images'; resident_bytes() adds the pool's idle bytes");
+            check(images + 1800 <= 10000, "(the images and the idle bytes fit the budget)");
+            const size_t room = 10000 - images - 400;   // an incoming image that fits beside the images only if idle bytes go
+            check(cache.make_room(room) && cache.size() == 2 && cache.evictions() == 0, "an image that fits beside the images needs no eviction, the idle bytes are the ones that go");
+            check(pool.shrinks >= 1 && pool.shrunk == 1800 - 400 && pool.idle == 400, "the pool gave back exactly the excess");
+            check(cache.resident_bytes() + room <= 10000, "images + idle + the incoming image fit the budget");
+            pool.idle = 9000;   // far more idle than the budget leaves: all of it is shrinkable, nothing else is touched
+            check(cache.make_room(500) && cache.size() == 2 && cache.evictions() == 0 && cache.resident_bytes() + 500 <= 10000,
+                  "a pool holding more than the budget leaves is trimmed to fit, no image goes");
+            check(cache.make_room(5500) && cache.size() == 1 && cache.evictions() == 1,
+                  "an incoming image that does not fit beside the images evicts the oldest, as without a pool");
+        }
+        {
+            // the same random workload against a cache with no pool and one whose pool holds a different idle amount before every step:
+            // every answer, size, eviction count and byte count is the same, and the pool's bytes never push the total past the budget
+            struct Lcg { uint64_t s; uint64_t next() { s = s * 6364136223846793005ull + 1442695040888963407ull; return s >> 33; } };
+            Lcg rng{12345};
+            const size_t budget = 24000;
+            ConversationCache plain(budget, 5), pooled(budget, 5);
+            FakePool pool;
+            pooled.set_pool(&pool);
+            int32_t id = 100;
+            size_t refused = 0, evicted_any = 0;
+            for (int step = 0; step < 4000; ++step) {
+                pool.idle = size_t(rng.next() % (budget / 2));
+                const uint64_t op = rng.next() % 4;
+                if (op <= 1) {
+                    const size_t n = 300 + size_t(rng.next() % 9000);
+                    const bool a = plain.put(sized(id, n)), b = pooled.put(sized(id, n));
+                    ++id;
+                    check(a == b, "put answers the same with and without a pool");
+                    refused += !a;
+                } else if (op == 2) {
+                    const size_t incoming = size_t(rng.next() % (budget + 3000)), held = size_t(rng.next() % 3) == 0 ? size_t(rng.next() % 4000) : 0;
+                    const bool a = plain.make_room(incoming, held), b = pooled.make_room(incoming, held);
+                    check(a == b, "make_room answers the same with and without a pool");
+                    refused += !a;
+                    if (b) check(pooled.resident_bytes() + incoming + held <= budget, "a successful make_room leaves images + idle + incoming inside the budget");
+                } else if (plain.size() > 0) {
+                    const size_t at = size_t(rng.next() % plain.size());
+                    SavedConversation x = plain.take(at), y = pooled.take(at);
+                    check(x.live.ids == y.live.ids, "take returns the same entry");
+                }
+                check(plain.size() == pooled.size() && plain.evictions() == pooled.evictions() && plain.bytes() == pooled.bytes(),
+                      "entries, evictions and bytes are the same with and without a pool");
+                evicted_any += plain.evictions() > 0;
+            }
+            check(refused > 0 && evicted_any > 0 && pool.shrinks > 0, "the workload refused, evicted and trimmed the pool at least once");
+        }
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }
