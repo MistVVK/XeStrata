@@ -720,7 +720,7 @@ template <int T> __device__ __forceinline__ const void* grid_src() {
     else return nullptr;
 }
 #endif
-
+#if !defined(STRATA_FUSED_DECODE_ONLY)   // (tests/cuda/prefill_decode_golden.cu: the decode above only)
 // One work item = (TR routed rows of expert e - one or two of group()'s 64-row tiles -, a block of WR weight rows);
 // a persistent grid walks the batch's items.  GU: gate/up rows of WR / 2 features (format WT) against the rows'
 // tokens' activations, SwiGLU, H to int8 per 32 features into `out`.  !GU: down rows (format WT) against H, FP32 into
@@ -2422,9 +2422,9 @@ int pick_ww(int64_t n, int n_expert) {
     }
     return pk.ww;
 }
-
+#endif
 }  // namespace
-
+#if !defined(STRATA_FUSED_DECODE_ONLY)
 bool gfx12_iq2s_default() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_PF_FUSED_IQ2S");
@@ -2799,5 +2799,5 @@ void experts_native(const WideBatch& b, const NativeGeom& g, int n_expert, int64
     else launch<T_IQ4_NL, false>(ws, g_d, b, g, tb, ha, src, nullptr, dm, s);
     ck(cudaGetLastError(), "experts_native (NT = 256)");
 }
-
+#endif
 }  // namespace strata::prefill::fused
