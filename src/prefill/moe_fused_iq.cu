@@ -1987,6 +1987,7 @@ struct DevInfo {
     bool q2n = false;   // sm_80+ with STRATA_PF_FUSED_Q2N=1: the native Q2_0 pack's Q2_0 gate/up is set up as well (opt-in)
     bool s120 = false;  // compute capability 12.0 (sm120_series.hpp): the default for the formats measured there
     bool s121 = false;  // GB10 (sm_121, DGX Spark): 128-row tiles win from 65,536 routed rows a launch up (pick_ww)
+    bool s86 = false;   // compute capability 8.6 (RTX A6000 / A40 / RTX 3090 class): the same default as s120 with 80+ SMs (STRATA_PF_FUSED_SM86=0 off)
     int sms = 0, occ = 1;
     int occ_nt = 0;     // blocks per multiprocessor of the NT = 256 kernels (0: not set up)
     bool ws = false;    // STRATA_PF_FUSED_WS: the warp-specialized kernels are set up
@@ -2166,6 +2167,9 @@ const DevInfo& dev_info() {
     cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
     d.s120 = strata::sm120_default(major, minor);   // (takes the raw attributes, as is_sm120 does)
     d.s121 = major == 12 && minor == 1;             // GB10 (DGX Spark): its own tile threshold, see pick_ww
+    // sm_86 (raw attributes, as s120): STRATA_PF_FUSED_SM86=0 is a diagnostic for bug reports (MMQ on these cards again); it goes with MMQ
+    static const bool sm86_off = [] { const char* v = std::getenv("STRATA_PF_FUSED_SM86"); return v != nullptr && v[0] == '0'; }();
+    d.s86 = major == 8 && minor == 6 && !sm86_off;
     major = strata::cc_major_of(major);   // STRATA_EMULATE_CC counts (tests)
     minor = strata::cc_minor_of(minor);
     cudaDeviceGetAttribute(&d.sms, cudaDevAttrMultiProcessorCount, dev);
@@ -2497,15 +2501,19 @@ bool native_supported(int gu_type, int d_type) {
     // prompt +7.0% 4K, +5.2% 20K, +3.4% 98K; teacher-forced KL against MMQ 0.0002 over 5998 positions, 0.0010 over 1760 long
     // ones; first-token KL against the FP16 prompt path 0.01181 vs MMQ's 0.01236 over 48 prompts; HumanEval, reasoning,
     // agent, needles, CJK and tool calls the same).  IQ2_XXS / IQ2_XS gate/up (the IQ3_XXS and IQ2_XS packs) keep MMQ until
-    // measured.  Every other CUDA card: opt-in as before.
+    // measured.  The same on a compute capability 8.6 card with 80+ SMs (RTX A6000, 84 SMs, IQ3_S pack, 11-11: prompt +6.7% 4K, +3.6% 8K,
+    // +1.0% 20K, 5/5 each; first-token KL against the FP16 prompt path at or below MMQ's at 2,048 / 4K / 8K / 20K; neutral-writer
+    // forced-token gate PASS over 48 prompts; small chunks, agent, first 8K read, backstop as MMQ; STRATA_PF_FUSED_SM86=0 off).
+    // Every other CUDA card: opt-in as before.
     if (env < 0) {
         // the native Q2_0 pack's Q2_0 / Q2_0 layers: only with STRATA_PF_FUSED_Q2N=1 (d.q2n), on any sm_80+ card
         if (gu_type == T_Q2_0) { const DevInfo& d = dev_info(); return d.ok && d.q2n && d_type == T_Q2_0 && d_covered_on(d_type, d); }
         if (gu_type != T_IQ2_S && gu_type != T_IQ3_XXS && gu_type != T_IQ3_S && gu_type != T_IQ4_XS) return false;
         const DevInfo& d = dev_info();
-        // 12.0 cards with 80+ SMs only (RTX PRO 5000 / 6000, RTX 5080 / 5090): on an RTX 5070 (48 SMs, IQ2_XS pack, experts
-        // partly in RAM) the fused kernels were 4.7% slower on 20K prompts (0/6 pairs) - it keeps MMQ unless STRATA_PF_FUSED=1
-        return d.ok && d.s120 && d.sms >= 80 && !d.t75 && d_covered_on(d_type, d);
+        // 12.0 and 8.6 cards with 80+ SMs only (RTX PRO 5000 / 6000, RTX 5080 / 5090; RTX A6000 / A40, RTX 3090 / 3090 Ti / 3080 Ti):
+        // on an RTX 5070 (48 SMs, IQ2_XS pack, experts partly in RAM) the fused kernels were 4.7% slower on 20K prompts (0/6 pairs),
+        // and the RTX A4000 (sm_86, 48 SMs) has no real-model data - they keep MMQ unless STRATA_PF_FUSED=1
+        return d.ok && (d.s120 || d.s86) && d.sms >= 80 && !d.t75 && d_covered_on(d_type, d);
     }
     if (gu_type == T_Q2_0 && d_type != T_Q2_0) return false;   // the opt-in (STRATA_PF_FUSED=1 as well) takes the Q2_0 / Q2_0 pair only
 #endif
