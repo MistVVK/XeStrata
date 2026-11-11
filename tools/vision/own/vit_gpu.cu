@@ -714,10 +714,11 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
     }
     m.n_weight_allocs = m.allocs.size();
 #if !defined(STRATA_VIT_HIP)
-    // Pascal with BF16 matrices (held as F16): a 32M-score attention chunk (64 MB): the P*V product's tile is only partly used with a head size of 72, and
-    // more queries per product made a 1,024-token picture 1,242 -> 1,064 ms on a P100, at 1,362 MiB against mtmd-GPU's 1,364 (RESULTS-OWN-3V.md 16.1).
-    // Not with F16 matrices: there mtmd stays faster anyway and the chunk would cost 48 MB over mtmd-GPU's memory.
-    if (pascal && !m.layers.empty() && m.layers[0].qkv.kind == K_BH) m.kScoreElems = (size_t) 32 << 20;
+    // Pascal with 16-bit matrices (F16, or BF16 held as F16): a 32M-score attention chunk (64 MB): the P*V product's tile is only partly used with a head
+    // size of 72, and more queries per product made a 1,024-token picture 1,242 -> 1,064 ms on a P100 (BF16 file: at 1,362 MiB against mtmd-GPU's 1,364;
+    // RESULTS-OWN-3V.md 16.1).  F16 file (Qwen3.6) on a P100: 1,243 -> 1,064 ms, 270 -> 263 ms at 350 tokens, rule 1 unchanged (min / mean 0.999865 / 0.999969 on 18 pictures)
+    // (RESULTS-OWN-3V.md PART G), 48 MB more than the 16 MB chunk.
+    if (pascal && !m.layers.empty() && (m.layers[0].qkv.kind == K_BH || m.layers[0].qkv.kind == K_F16)) m.kScoreElems = (size_t) 32 << 20;
 #endif
     if (const char* e = std::getenv("STRATA_VIT_REF_ROUND")) m.round_out = std::atoi(e) != 0;
     if (const char* e = std::getenv("STRATA_VIT_ROWS")) { const int v = std::atoi(e); if (v >= 16) m.kRows = v; }
