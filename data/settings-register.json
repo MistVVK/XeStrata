@@ -32512,6 +32512,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_QI_GFX12_ATTN",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/image/dit/qi21_kernels.cu",
+     "line": 591,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "off",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "1705c8b9f0",
+   "first_date": "2026-11-11",
+   "since": null,
+   "last_commit": "1705c8b9f0",
+   "last_date": "2026-11-11",
+   "status": "research",
+   "owner": "image",
+   "note": "[reviewed] Test switch of the image test programs (strata-dit-step, strata-image) and of the opt-in native DiT runner patch for sd-cli (tools/image/sdcpp_native): 1 turns on Strata's own WMMA attention for the Qwen-Image DiT on gfx1200 / gfx1201 (RDNA4), where it is not measured yet. Off by default; no shipped default sets it.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_QSA_CLUSTER",
    "backends": [
     "cuda-hip",
