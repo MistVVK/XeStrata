@@ -220,6 +220,10 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
         s.model_path = str(Path(a.model_path).expanduser())
         if not a.model:
             s.family = s.model = None
+    from strata_control import retired
+    if retired.is_name(a.family) or (a.model and retired.is_name(a.model) and (not a.family or retired.is_name(a.family))) or (
+            not a.model and (retired.is_name(s.family) or retired.is_name(s.model))):
+        raise ValueError(retired.NOT_OFFERED)                       # DeepSeek: typed, or in a saved preset (strata_control/retired.py)
     if a.model:
         if catalog is None:
             raise ValueError("The model list is not available in this Terminal; run it from the full Terminal install.")

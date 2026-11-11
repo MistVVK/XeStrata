@@ -177,6 +177,14 @@ def _summary(model_id: str, path: Path, raw: bytes, cfg: dict, report: dict) -> 
 
 def _inspect_one(model_id: str, path: Path) -> tuple[dict, dict]:
     raw, cfg = _read(path)
+    from strata_control import retired
+    if retired.config_reason(cfg) or retired.config_file_reason(path):
+        # DeepSeek: listed so the person sees it and where its files are, never inspected, started or written (strata_control/retired.py)
+        report = {"ok": False, "issues": []}
+        summary = _summary(model_id, path, raw, cfg, report)
+        summary.update(component_status="retired", retired="deepseek", name=retired.title(cfg, path), retired_line=retired.row_line(cfg),
+                       refusal=retired.refusal(cfg, retired.title(cfg, path)), execution_compatibility="retired")
+        return summary, report
     try:
         report = inspect_components(path)
         after, _ = _read(path)
@@ -735,6 +743,9 @@ def plan_import(raw_path: str) -> dict:
         details = path.stat()
     except OSError:
         raise ProfileError("model import path does not exist (or is a link to something that is gone)", 5) from None
+    from strata_control import retired
+    if retired.folder_reason(path):                    # DeepSeek files: named, never set up (strata_control/retired.py)
+        raise ProfileError(retired.own_files(path), 5)
     official_deepseek = _dsv41_plan(path, details)         # ISTA-DAS sets under their official or first-release names
     if official_deepseek is not None:
         return official_deepseek

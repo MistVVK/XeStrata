@@ -18,8 +18,9 @@ from typing import Any, Iterable, Mapping
 #: the family and arch names setup and the server used for DeepSeek-V4.1-Flash
 FAMILY = "deepseek41"
 ENGINE_NAMES = ("strata-dsv41", "strata-dsv41.exe")
-#: the model sizes setup and `strata launch` offered under --family deepseek41 (lower case); "UD-IQ1_M" is not here: it is also a Qwen size
-MODEL_NAMES = frozenset({"ist-das-2.00bpw", "ist-das-2.25bpw", "ist-das-1.75bpw", "ista-das-coder", "ud-q8_k_xl", "ud-iq1_s",
+#: the model sizes setup and `strata launch` offered under --family deepseek41 (lower case); "UD-IQ1_M" and "UD-IQ1_S" are not here: they are also
+#: Unsloth Qwen names
+MODEL_NAMES = frozenset({"ist-das-2.00bpw", "ist-das-2.25bpw", "ist-das-1.75bpw", "ista-das-coder", "ud-q8_k_xl",
                          "deepseek-v4.1-flash", "deepseek41", "deepseek"})
 #: the config file stem setup wrote (strata-deepseek-v4.1-flash-<size>.json) and the model_name in it
 TAG = "deepseek-v4.1-flash"
@@ -252,6 +253,20 @@ def size_words(n: int) -> str:
 
 
 # ----------------------------------------------------------------------------------------------------------------- words
+_LABELS = {"ist-das-2.00bpw": "ISTA-DAS 2.00 bpw", "ist-das-2.25bpw": "ISTA-DAS 2.25 bpw", "ist-das-1.75bpw": "ISTA-DAS 1.75 bpw",
+           "ista-das-coder": "ISTA-DAS Coder", "ud-q8_k_xl": "Unsloth UD-Q8_K_XL", "ud-iq1_s": "Unsloth UD-IQ1_S", "ud-iq1_m": "Unsloth UD-IQ1_M"}
+
+
+def title(cfg: Mapping | None = None, path: Any = None) -> str:
+    """The model's name as setup showed it ("DeepSeek-V4.1-Flash ISTA-DAS 2.00 bpw"), from the config file's name when it has setup's form."""
+    stem = Path(str(path)).stem.lower() if path else ""
+    head = "strata-" + TAG + "-"
+    if stem.startswith(head):
+        size = stem[len(head):]
+        return "DeepSeek-V4.1-Flash " + _LABELS.get(size, size.upper())
+    return "DeepSeek-V4.1-Flash"
+
+
 def refusal(cfg: Mapping | None, name: str | None = None) -> str:
     """D1: the whole refusal for a saved DeepSeek model: what happened, where its files are and how large (when that can be read), the
     next step."""

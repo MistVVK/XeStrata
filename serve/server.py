@@ -10118,6 +10118,11 @@ def _main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> i
     config_bytes = Path(a.config).read_bytes() if a.config else b""
     cfg = parse_config_text(config_bytes.decode("utf-8-sig"), a.config) if a.config else {}   # Notepad adds a BOM
     split_joined_args(cfg)
+    from strata_control import retired
+    _ds = retired.config_reason(cfg) if a.config else None
+    if _ds:                                             # DeepSeek: this Strata no longer runs it; stop before the engine starts (retired.py)
+        print(retired.server_line(_ds), flush=True)
+        return 2
     if a.config and a.engine == "strata":
         cfg = apply_saved_tuning(cfg)
     attestation_key = os.environ.pop("STRATA_OWNER_ATTEST_KEY", None)

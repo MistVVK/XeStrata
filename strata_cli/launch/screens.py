@@ -548,6 +548,10 @@ class ModelScreen(Base):
         if problem:
             self.say(f"{problem[0]} {problem[1]}", True)
             return
+        from strata_control import retired
+        if retired.folder_reason(models.absolute(path)):   # DeepSeek files: named, never used (strata_control/retired.py)
+            self.say(retired.own_files(models.absolute(path)), True)
+            return
         if self.check_own_deepseek(path):
             return
         try:

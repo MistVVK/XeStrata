@@ -1596,6 +1596,9 @@ class Runner:
         problem = models.own_path_problem(s.model_path)
         if problem:                                          # before the engine or setup are touched, with the path as typed
             raise LaunchError(problem[0], problem[1], 2)
+        from strata_control import retired
+        if retired.folder_reason(models.absolute(s.model_path)):   # DeepSeek files: named, never used (strata_control/retired.py)
+            raise LaunchError(retired.own_files(models.absolute(s.model_path)), "", 2)
         if self.deepseek_files():
             return
         given = bool(s.family and s.model)

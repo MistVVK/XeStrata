@@ -558,6 +558,20 @@ def _repair_config_paths(name: str) -> tuple[str | None, str | None]:
         return None, None
 
 
+def _refuse_deepseek(name: str) -> None:
+    """Before a start: a saved profile whose run config is a DeepSeek one stops here with the plain refusal (the model's folder and size
+    when they can be read; strata_control/retired.py).  Nothing is written, no process is started; a local, bounded check."""
+    from strata_control import retired
+    try:
+        profile, _ = profiles.load(name)
+        source = profile.get("source_config")
+    except Exception:                                    # noqa: BLE001 - the usual checks below say what is wrong with the profile
+        return
+    cfg = retired.read_config(source)
+    if retired.config_reason(cfg) or retired.config_file_reason(source):
+        raise ProfileError(retired.refusal(cfg, retired.title(cfg, source)), 6)
+
+
 def _repair_dsv41_paths(name: str) -> None:
     """Before a start: a saved profile that runs the DeepSeek engine from an engine-dsv41/ folder an update has replaced is pointed at the newest
     installed package of its own kind (every saved profile's run config, so the next start of another one is repaired too).  Local only: it never
@@ -613,6 +627,7 @@ def start(name: str, *, wait: float = 300, shutdown_timeout: float = 30,
     if expected_source_sha256 is not None and (not isinstance(expected_source_sha256, str) or
             not re.fullmatch(r"[0-9a-f]{64}", expected_source_sha256)):
         raise ProfileError("expected source digest must be 64 lowercase hex characters")
+    _refuse_deepseek(name)                             # before anything is written or started (strata_control/retired.py)
     changed_from, changed_to = _repair_config_paths(name)
     if changed_from is not None and expected_source_sha256 == changed_from:
         expected_source_sha256 = changed_to              # (the caller planned on the file as it was; Strata rewrote it, the caller did not)

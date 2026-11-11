@@ -137,6 +137,9 @@ def repair(configs) -> tuple[list[str], list[str]]:
             continue
         if not isinstance(cfg, dict):
             continue
+        from strata_control import retired
+        if retired.config_reason(cfg) or retired.config_file_reason(c):
+            continue                                     # a DeepSeek config is never written: this Strata does not run it (retired.py)
         new, found, lost = resolve_config(cfg)
         for old, _ in lost:
             problems.append(f"{c.name}: {old} was removed by an update and no file of that name is in the current version; run setup again for this model")

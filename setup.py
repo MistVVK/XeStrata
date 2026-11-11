@@ -7350,7 +7350,8 @@ def previous_config(elsewhere_first: list, settings: dict):
     cands = []
     for folder in [*elsewhere_first, *other_installs(settings)]:
         cands += model_config_files(folder)
-    cands = [c for c in dict.fromkeys(cands) if c.is_file()]
+    from strata_control import retired
+    cands = [c for c in dict.fromkeys(cands) if c.is_file() and not retired.config_file_reason(c)]   # never set up like a DeepSeek model
     return next((c for c in sorted(cands, key=lambda p: p.stat().st_mtime, reverse=True) if readable_config(c)), None)
 
 
@@ -7568,8 +7569,17 @@ def model_config(path: Path) -> bool:
 
 
 def installed_configs():
+    """The model configs of this install, newest first; a DeepSeek one is not among them (this Strata does not run, check, tune or rewrite it:
+    retired_configs, strata_control/retired.py)."""
+    from strata_control import retired
     return [p for p in sorted(model_config_files(home()), key=lambda p: p.stat().st_mtime, reverse=True)
-            if model_config(p)]
+            if model_config(p) and not retired.config_file_reason(p)]
+
+
+def retired_configs() -> list:
+    """The DeepSeek model configs of this install: left exactly as they are."""
+    from strata_control import retired
+    return [p for p in sorted(model_config_files(home())) if model_config(p) and retired.config_file_reason(p)]
 
 
 def source_version() -> str:
@@ -10381,6 +10391,11 @@ def main() -> int:
         return mac_setup(sys.argv[1:])
     _peek = lambda flag: next((v.split("=", 1)[1] if v.startswith(flag + "=") else sys.argv[i + 2] if i + 2 < len(sys.argv) else None   # noqa: E731
                                for i, v in enumerate(sys.argv[1:]) if v == flag or v.startswith(flag + "=")), None)
+    from strata_control import retired
+    if retired.is_name(_peek("--family")) or (_peek("--model") and retired.is_name(_peek("--model"))
+                                              and (not _peek("--family") or retired.is_name(_peek("--family")))):
+        say("  " + retired.NOT_OFFERED)                # DeepSeek: no longer offered (strata_control/retired.py)
+        return 2
     if (_peek("--family") and _peek("--family") not in {**FAMILIES, **OWN_PATH_FAMILIES, **MULTI_FILE_FAMILIES}) \
             or (_peek("--model") and not _peek("--family") and model_alias(_peek("--model")) not in MODELS
                 and not any(model_alias(_peek("--model")) in f["models"] for f in (*OWN_PATH_FAMILIES.values(), *MULTI_FILE_FAMILIES.values()))):
@@ -10598,6 +10613,10 @@ def main() -> int:
                        OWN_PATH_FAMILIES[a.family]["title"] if a.family in OWN_PATH_FAMILIES else "Qwen3.8-Flash-Next")
         + " on a normal PC (a GPU + system RAM + CPU)")
     have = installed_configs()
+    if a.update or not (a.setup or a.model or a.family or a.check or a.no_start or a.calibrate or a.rollback_engine):
+        from strata_control import retired
+        for c in retired_configs():                    # DeepSeek: named, left as it is
+            say("  " + retired.left_as_is(retired.title(None, c)))
     # A plain start of an installed model finds everything where it already is: it creates, moves and copies nothing
     # (the model paths are in the run config; the data folder is the one settings.json remembers).  Setting up, checking,
     # tuning and updating look for and gather the model files (data_folder).
