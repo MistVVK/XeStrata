@@ -4115,7 +4115,7 @@ def learned_profile_args(cfg: dict, args: list[str]) -> list[str]:
     return args
 
 
-DRAFT_COSTS_DEFAULT = False   # repeatable output: off until the owner's decision (the default flip is its own commit)
+DRAFT_COSTS_DEFAULT = True    # repeatable output: on by default (owner decision); "draft_costs": false in a config turns it off
 _engine_texts: dict = {}
 
 
