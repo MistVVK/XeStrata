@@ -778,6 +778,12 @@ struct Options {
     /// `expert_profile_save_min` minutes between requests.  Empty (the default): nothing is counted or written.
     std::string expert_profile_save;
     double expert_profile_save_min = 10.0;
+    /// --serve, --draft-costs FILE (the server passes it; empty = off, the policy measures as before): the draft policy's window costs are
+    /// a table learned once on this machine and then fixed, so the same request gives the same answer on every start.  A file learned
+    /// under another key (card, driver, engine, model, settings; draft_costs_key()) or a missing / broken one: this run learns a new one
+    /// with today's adaptive policy and writes it once the stretch is long enough (strata/spec/draft_policy.hpp, CostLearner).
+    /// --draft-costs-key TEXT: more of the key from the server (the engine file's identity, say).
+    std::string draft_costs, draft_costs_key;
     /// R4.2d: **ON by default**, because the measurement is unambiguous and the alternative is known-broken.
     /// Without it, 17 of 10,562 layers had the hit work done when the pool returned; with it, 9,190.  The
     /// A/B arm is `--no-hit-poke`.
@@ -2000,6 +2006,57 @@ bool adapt_overlap() {
         return e && e[0] == '1';
     }();
     return v;
+}
+
+/// --draft-costs: what a learned draft cost table is valid for.  The engine version and backend, every visible card (name, compute
+/// capability, memory), the driver and runtime versions, the adaptive tier's timing switches and the cost-aware window, and the
+/// engine's own command line (a file argument by its name and size, so a moved install keeps its table and another model file does
+/// not), without the table's own flags.  Any change re-learns the table once; nothing in it changes from start to start.
+std::string draft_costs_key(int argc, char** argv, const std::string& extra, bool spec_cost) {
+    std::string k = "engine " STRATA_VERSION;
+#if defined(STRATA_GPU_METAL)
+    k += "|metal";
+#elif defined(STRATA_USE_HIP)
+    k += "|hip";
+#else
+    k += "|cuda";
+#endif
+    int n = 0;
+    if (cudaGetDeviceCount(&n) != cudaSuccess) { n = 0; (void) cudaGetLastError(); }
+    k += "|cards " + std::to_string(n);
+    for (int d = 0; d < n; ++d) {
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, d) != cudaSuccess) { (void) cudaGetLastError(); continue; }
+        k += std::string("|") + prop.name + " cc " + std::to_string(prop.major) + "." + std::to_string(prop.minor) + " " +
+             std::to_string((unsigned long long) (prop.totalGlobalMem >> 20)) + " MiB";
+    }
+#if !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    int drv = 0, rt = 0;
+    if (cudaDriverGetVersion(&drv) != cudaSuccess) { drv = 0; (void) cudaGetLastError(); }
+    if (cudaRuntimeGetVersion(&rt) != cudaSuccess) { rt = 0; (void) cudaGetLastError(); }
+    k += "|driver " + std::to_string(drv) + " runtime " + std::to_string(rt);
+#endif
+    k += std::string("|nowait ") + (adapt_nowait() ? "1" : "0") + " lag " + std::to_string(adapt_lag()) + " spec_cost " + (spec_cost ? "1" : "0");
+    k += "|args";
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--draft-costs" || a == "--draft-costs-key") { ++i; continue; }
+        std::error_code ec;
+        const std::filesystem::path p(std::u8string(a.begin(), a.end()));
+        const size_t cut = a.find_last_of("/\\");
+        std::string base = cut == std::string::npos ? a : a.substr(cut + 1);
+        if (base.empty() && cut != std::string::npos) base = a;   // a path ending in a separator: keep it whole
+        if (a.size() > 1 && a[0] != '-' && std::filesystem::is_regular_file(p, ec)) {
+            const auto sz = std::filesystem::file_size(p, ec);
+            k += " " + base + ":" + std::to_string(ec ? 0ull : (unsigned long long) sz);
+        } else if (a.size() > 1 && a[0] != '-' && std::filesystem::is_directory(p, ec)) {
+            k += " " + base + "/";
+        } else {
+            k += " " + a;
+        }
+    }
+    if (!extra.empty()) k += "|server " + extra;
+    return k;
 }
 
 /// STRATA_ADAPT_FETCH (opt-in): 1 = the PCIe share also admits into the VRAM tier (ExpertDispatch::fetch_admit), beside
@@ -3735,6 +3792,8 @@ int main(int argc, char** argv) {
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
         else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
         else if (a == "--expert-profile-save") o.expert_profile_save = next("--expert-profile-save");
+        else if (a == "--draft-costs") o.draft_costs = next("--draft-costs");
+        else if (a == "--draft-costs-key") o.draft_costs_key = next("--draft-costs-key");
         else if (a == "--expert-profile-save-every")
             o.expert_profile_save_min = std::atof(next("--expert-profile-save-every"));
         else if (a == "--gpu-stages") o.gpu_stages = true;
@@ -14119,6 +14178,31 @@ int main(int argc, char** argv) {
         policy.set_sizes(lookup_size_mask(o));
         // a layer split's hand-off buffers hold kVerifyNarrowT rows: its windows stay at that
         if (n_stages > 1) policy.set_sizes(policy.sizes() & ((2u << strata::kernels::kVerifyNarrowT) - 1u));
+        // --draft-costs: this machine's fixed window costs, or learn them in this run (draft_costs_key(), CostLearner)
+        constexpr int64_t kDraftCostRounds = 1500;   // a learning stretch: about 4,000 generated tokens
+        constexpr int kDraftCostMinN = 20;           // a window size needs this many rounds to be measured (fewer: filled in)
+        std::string dc_key;
+        bool dc_learning = false;
+        if (!o.draft_costs.empty() && !policy.fixed()) {
+            dc_key = draft_costs_key(argc, argv, o.draft_costs_key, spec_cost);
+            strata::spec::CostFile cf;
+            std::string why;
+            if (strata::spec::read_cost_file(o.draft_costs, dc_key, cf, why)) {
+                std::string sizes;
+                for (int k = 0; k < strata::spec::CostLearner::kCtxBuckets; ++k)
+                    if (!cf.tables[(size_t) k].empty()) {
+                        policy.set_fixed_costs(cf.tables[(size_t) k].data(), (int) cf.tables[(size_t) k].size(), k);
+                        sizes += (sizes.empty() ? "" : ", ") + std::to_string(cf.tables[(size_t) k].size());
+                    }
+                std::fprintf(stderr, "strata serve: draft costs: this machine's table is used (%s; window sizes %s): the same request "
+                                     "gives the same tokens on every start\n", o.draft_costs.c_str(), sizes.c_str());
+            } else {
+                policy.set_learning(true);
+                dc_learning = true;
+                std::fprintf(stderr, "strata serve: draft costs: learning this machine's table (%s: %s); it is written after about "
+                                     "%lld timed rounds and used from then on\n", o.draft_costs.c_str(), why.c_str(), (long long) kDraftCostRounds);
+            }
+        }
         if (o.lookup_max_t > 0)
             std::fprintf(stderr, "strata serve: --lookup-max-t %d: MTP windows up to %d tokens, window sizes %s\n",
                          o.lookup_max_t, S_mtp, size_list(policy.sizes(), S).c_str());
@@ -19455,6 +19539,36 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata draft: request %lld drafter=%s window<=%d tokens=%lld rounds=%lld decode_ms=%.1f keep_ms=%.1f (%.3f per round)\n",
                              (long long) ++draft_req_count, req_df2 ? "dflash2" : "mtp", S_mtp, (long long) produced_n, (long long) (rounds - rounds_at_start),
                              decode_ms, keep_ms, rounds > rounds_at_start ? keep_ms / (double) (rounds - rounds_at_start) : 0.0);
+            // --draft-costs: at a request's end, a learning stretch that is long enough becomes this machine's table (from the next request
+            // on); one that looks disturbed (a load beside the engine, a stall) is dropped and learned again
+            if (dc_learning && policy.learning()) {
+                const strata::spec::CostLearner::Verdict v = policy.learner().check(kDraftCostRounds, kDraftCostMinN);
+                if (v.ready && v.disturbed) {
+                    std::fprintf(stderr, "strata serve: draft costs: the learning stretch looks disturbed (%s): it is learned again\n", v.why.c_str());
+                    policy.learner().reset();
+                } else if (v.ready) {
+                    strata::spec::CostFile cf;
+                    cf.key = dc_key;
+                    for (int k = 0; k < strata::spec::CostLearner::kCtxBuckets; ++k)
+                        cf.tables[(size_t) k] = policy.learner().table(k, kDraftCostMinN);
+                    std::string why;
+                    const bool saved = strata::spec::write_cost_file(o.draft_costs, cf, why);
+                    for (int k = 0; k < strata::spec::CostLearner::kCtxBuckets; ++k)
+                        if (!cf.tables[(size_t) k].empty())
+                            policy.set_fixed_costs(cf.tables[(size_t) k].data(), (int) cf.tables[(size_t) k].size(), k);
+                    policy.set_learning(false);
+                    policy.learner().reset();
+                    dc_learning = false;
+                    std::string t0;
+                    char b[24];
+                    for (size_t i = 0; i < cf.tables[0].size(); ++i) {
+                        std::snprintf(b, sizeof b, "%s%.2f", i ? "," : "", cf.tables[0][i]);
+                        t0 += b;
+                    }
+                    std::fprintf(stderr, "strata serve: draft costs: this machine's table is learned (%s); it is fixed from the next request "
+                                         "on%s%s\n", t0.c_str(), saved ? "" : " (not saved: ", saved ? "" : (why + "; the next start learns again)").c_str());
+                }
+            }
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
             if (!ver.wait_commit(err)) {
                 exit_if_gpu_fatal(err);
