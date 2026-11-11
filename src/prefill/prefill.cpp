@@ -169,6 +169,8 @@ void experts_native(const Batch&, const NativeGeom&, int, int64_t, const void*, 
 bool native_wide() { return false; }
 void experts_native(const WideBatch&, const NativeGeom&, int, int64_t, const void*, const void*, const int32_t*, void*,
                     float*, void*) {}
+void set_down_rotation(bool, const float*) {}
+void hadamard128_rows(float*, int64_t, int64_t, const float*, void*) {}
 }  // namespace strata::prefill::fused
 #endif
 #ifndef STRATA_PREFILL_WS
@@ -4745,7 +4747,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // fused_ring() sized the ring and the buffers for it
                     const bool no_peer = !core::peer_portable();
                     const bool fused_only = mmq_plan().any && mmq_plan().fo[(size_t) l];
-                    const bool fused_nat = (use_mmq || fused_only) && stream_all && no_peer && lay.native && !had_gu && !had_d &&
+                    // a Hadamard-folded layer (APR / Gyro) on the fused kernels: only the trellis pairs (CUDA, STRATA_PF_FUSED_TQ=1: native_supported
+                    // answers for them only with it), block 128: the gate/up input rotated into m.Xr as the MMQ path does, the down input
+                    // rotated inside experts_native (fused::set_down_rotation); every other folded layer keeps MMQ
+                    const bool fold_ok = had_block == 128 && ((mmq_gt == 145 && mmq_dt == 146) || (mmq_gt == 144 && mmq_dt == 144)) &&
+                                         (!had_gu || m.Xr != nullptr);
+                    const bool fused_nat = (use_mmq || fused_only) && stream_all && no_peer && lay.native && ((!had_gu && !had_d) || fold_ok) &&
                                            fused::native_supported(mmq_gt, mmq_dt);
                     const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
                     bool dm16_used = false;   // STRATA_PF_DM16: this layer's down rows are FP16 (fused::dm_f16_used() after the experts)
@@ -4789,8 +4796,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         pt.mark(kPfGather, cs);
                         // the layer's input to int8 once per token; the rows of each expert from the router's ids
-                        if (fused_nat) fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
+                        if (fused_nat && had_gu) {   // (a folded trellis gate/up: its input rotated, as the MMQ path's xsrc = m.Xr)
+                            strata::kernels::hadamard_rows(m.mixed, m.Xr, T, N, had_block, had_sx, m.cs);
+                            fused::quantize_act_native(m.Xr, T, N, m.Xq, m.cs);
+                        } else if (fused_nat) fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
                         else fused::quantize_act(m.mixed, T, N, m.Xq, m.cs);
+                        // (a folded trellis down: H rotated inside experts_native; off again after the layer's launches)
+                        if (fused_nat && had_d) fused::set_down_rotation(true, had_sh);
                         fused::group(m.ids, T * K, (int) K, (int) m.g->n_expert, m.GU, m.slot_dev, m.src_dev, m.cs);
                         // launches over the experts in id order, each at most kMaxBatch experts (STRATA_PF_BATCH: below)
                         // of which at most a third of the ring streamed: the next batch's blobs arrive while one computes.
@@ -4862,6 +4874,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 give_back(consumed);
                             }
                         }
+                        if (fused_nat && had_d) fused::set_down_rotation(false, nullptr);
                     } else {
                         // group the (token, k) pairs by expert on the host
                         pt.mark(kPfHostGroup, cs);

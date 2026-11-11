@@ -25726,7 +25726,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 1874,
+     "line": 1969,
      "backend": "cuda",
      "fn": "getenv"
     }
@@ -25759,7 +25759,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 1862,
+     "line": 1957,
      "backend": "cuda",
      "fn": "getenv"
     }
@@ -25792,7 +25792,7 @@
    "reads": [
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 1868,
+     "line": 1963,
      "backend": "cuda",
      "fn": "getenv"
     }
@@ -25895,6 +25895,39 @@
    "status": "research",
    "owner": "prefill",
    "note": "[reviewed] Tile tuning: nothing on sm_86, auto stays. [phaseA-tests/notes-144-pfiq.md:12]",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_PF_FUSED_TQ",
+   "backends": [
+    "cuda"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 1975,
+     "backend": "cuda",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "",
+   "since": "",
+   "last_commit": "",
+   "last_date": "",
+   "status": "research",
+   "owner": "prefill",
+   "note": "CUDA (phase 4, opt-in, default off): the Gyro trellis experts (TQK6 / TQK7, TQ2_T / TQ2_T) on the fused native kernels on any sm_80+ card instead of MMQ; Hadamard-folded layers are still declined by the prompt path.",
    "retire_after": "",
    "retired_in": ""
   },

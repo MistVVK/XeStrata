@@ -97,7 +97,10 @@ bool run(const char* name, int B, std::vector<int> h16, int nblocks, unsigned se
     std::vector<block_q8_1> y((size_t) nblocks * (qk / QK8_1));
     for (auto& b : y) {
         for (int i = 0; i < 32; ++i) b.qs[i] = (int8_t) (int) (rng() % 255 - 127);
-        b.ds = make_half2(__float2half((float) (rng() % 1000) / 500.0f), __float2half((float) ((int) (rng() % 200) - 100)));
+        // s drawn first, then d (qdot_golden.cuh make_inputs: the same draws, a fixed order on every compiler)
+        const float s = (float) ((int) (rng() % 200) - 100);
+        const float d = (float) (rng() % 1000) / 500.0f;
+        b.ds = make_half2(__float2half(d), __float2half(s));
     }
     char* dw;
     block_q8_1* dy;

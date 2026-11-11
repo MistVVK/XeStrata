@@ -36,6 +36,15 @@
 #include <thread>
 #include <vector>
 
+// the trellis types' codebooks (CUDA STRATA_PF_FUSED_TQ=1 pairs): the fp16 one (the format definition, ggml-common-tq.h, host data in a C++ file)
+// for the reference, and the int8 one the kernels read (tq_lut_i8.cuh, a __device__ table there: read here as host data) for the int8 model
+#pragma push_macro("__device__")
+#undef __device__
+#define __device__
+#include "../../third_party/ggml/ggml-common-tq.h"   // (a HIP build compiles this file as HIP: the empty __device__ keeps both tables host data)
+#include "../../src/kernels/cuda/tq_lut_i8.cuh"
+#pragma pop_macro("__device__")
+
 namespace {
 namespace mmq = strata::prefill::mmq;
 namespace fused = strata::prefill::fused;
@@ -63,11 +72,91 @@ struct Pair {
 // MMQ covers this pair (the HIP build has no Q4_K / Q5_K / Q5_1 MMQ: those pairs are checked against the reference only)
 bool mmq_ok(const Pair& p) { return mmq::supported((int) p.gu) && mmq::supported((int) p.d); }
 
+// The trellis types (Gyro: TQ2_T 144, TQK6 145, TQK7 146; agentionai's ids) are outside the pinned ggml's type table: their sizes and their
+// dequantization here, from the format definition (third_party/ggml/ggml-common-tq.h's header comment), not from the kernels' code.
+bool tq_type(ggml_type t) { return (int) t >= 144 && (int) t <= 146; }
+size_t type_size(ggml_type t) { return (int) t == 144 ? 34 : (int) t == 145 ? 26 : (int) t == 146 ? 30 : ggml_type_size(t); }
+int64_t blck_size(ggml_type t) { return tq_type(t) ? 128 : ggml_blck_size(t); }
+size_t row_size(ggml_type t, int64_t n) { return (size_t) (n / blck_size(t)) * type_size(t); }
+float fp16_bits(uint16_t h) {   // IEEE half -> float
+    const uint32_t s = (uint32_t) (h >> 15) << 31, e = (h >> 10) & 31, m = h & 1023;
+    uint32_t f;
+    if (e == 0) return (h >> 15 ? -1.0f : 1.0f) * std::ldexp((float) m, -24);   // zero and subnormals
+    if (e == 31) f = s | 0x7f800000u | (m << 13);
+    else f = s | ((e + 112) << 23) | (m << 13);
+    float v;
+    std::memcpy(&v, &f, 4);
+    return v;
+}
+// one 128-weight trellis block: step t (32 steps, 4 weights each) has a 15-bit state; TQ2_T: qs[(t + 31) % 32] << 8 | qs[t]; TQK (K = 6 / 7):
+// the 16 stream bits from bit (31 - t) K of the circular stream of 32 K bits, LSB first.  x = state * 0x9e3779b1, points x >> 21 and
+// (x >> 10) & 2047, two weights each.  int8cb: the int8 codebook times TQ_LUT_I8_SCALE (what the kernels and MMQ read) instead of the fp16 one.
+void tq_block(int t, const uint8_t* b, float* out, bool int8cb) {
+    uint16_t dh;
+    std::memcpy(&dh, b, 2);
+    const float d = fp16_bits(dh);
+    const uint8_t* qs = b + 2;
+    const int K = t == 145 ? 6 : t == 146 ? 7 : 8, nbits = 32 * K;
+    auto bit = [&](int i) { i %= nbits; return (qs[i >> 3] >> (i & 7)) & 1; };
+    for (int st = 0; st < 32; ++st) {
+        uint32_t s = 0;
+        if (t == 144) s = ((uint32_t) qs[(st + 31) % 32] << 8) | qs[st];
+        else for (int k = 0; k < 16; ++k) s |= (uint32_t) bit((31 - st) * K + k) << k;
+        const uint32_t x = (s & 0x7fffu) * 0x9e3779b1u;
+        const uint32_t pt[2] = {x >> 21, (x >> 10) & 2047u};
+        for (int h = 0; h < 2; ++h)
+            for (int c = 0; c < 2; ++c)
+                out[4 * st + 2 * h + c] = int8cb ? d * TQ_LUT_I8_SCALE * (float) (int8_t) (tq_lut_i8[pt[h]] >> (8 * c))
+                                                 : d * fp16_bits(tq_lut_f16[2 * pt[h] + c]);
+    }
+}
+
+// --folded (trellis pairs): the Gyro packs' Hadamard-folded experts (include/strata/kernels/cpu/hadamard.hpp): the weights are taken as stored
+// (W' = W diag(s) H^T), so every activation entering them is rotated first, y = H_128 (s * x) / sqrt(128) per 128 values, with random signs.
+// The reference rotates on the host (this function, from the definition); the fused path's H rotation is set_down_rotation, MMQ's is
+// hadamard128_rows (the same device code: the reference is the independent side); the gate/up input is rotated on the host for every path.
+bool g_folded = false;
+void rot128(float* x, int n, const float* signs) {
+    for (int b = 0; b < n; b += 128) {
+        double v[128];
+        for (int i = 0; i < 128; ++i) v[i] = (double) x[b + i] * (signs ? signs[b + i] : 1.0f);
+        for (int st = 1; st < 128; st <<= 1)
+            for (int i = 0; i < 128; ++i)
+                if (!(i & st)) { const double a = v[i], c = v[i + st]; v[i] = a + c; v[i + st] = a - c; }
+        for (int i = 0; i < 128; ++i) x[b + i] = (float) (v[i] / std::sqrt(128.0));
+    }
+}
+const float* g_rot_signs_dev = nullptr;   // the down input's signs on the device while a folded pair runs
+bool g_rot_on = false;
+struct Folded {   // a folded trellis pair's signs (host and device); inactive for every other pair
+    bool on = false;
+    std::vector<float> sx, sh;
+    std::unique_ptr<struct Dev> dsh;
+    Folded(bool tq, int64_t rows) {
+        (void) rows;
+        if (!g_folded || !tq) return;
+        on = true;
+        std::mt19937 rs(20261111);   // (its own generator: every other draw of the test is unchanged)
+        sx.resize((size_t) N);
+        sh.resize((size_t) FF);
+        for (float& v : sx) v = (rs() & 1) ? 1.0f : -1.0f;
+        for (float& v : sh) v = (rs() & 1) ? 1.0f : -1.0f;
+        dsh = std::make_unique<Dev>(sh.size() * 4);
+        ck(cudaMemcpy(dsh->p, sh.data(), sh.size() * 4, cudaMemcpyHostToDevice), "signs");
+        g_rot_signs_dev = dsh->as<float>();
+        g_rot_on = true;
+    }
+    ~Folded() { g_rot_signs_dev = nullptr; g_rot_on = false; }
+    void rotate_x(std::vector<float>& x) const {   // the gate/up input, every token, on the host (all paths read the rotated rows)
+        if (on) for (size_t t = 0; t < x.size() / N; ++t) rot128(x.data() + t * N, N, sx.data());
+    }
+};
+
 struct Geo {
     size_t gu_row, d_row, up_off, down_off, bytes;
     explicit Geo(const Pair& p) {
-        gu_row = ggml_row_size(p.gu, N);
-        d_row = ggml_row_size(p.d, FF);
+        gu_row = row_size(p.gu, N);
+        d_row = row_size(p.d, FF);
         up_off = gu_row * FF;
         down_off = 2 * up_off;
         bytes = down_off + d_row * N;
@@ -92,11 +181,12 @@ bool f16_on() {
 
 // that the weights' typical size is that of a 2-3 bit expert (a few hundredths)
 void fill_matrix(uint8_t* m, ggml_type t, int64_t rows, int64_t cols, std::mt19937& rng) {
-    const size_t bs = ggml_type_size(t), nb = (size_t) rows * (size_t) (cols / ggml_blck_size(t));
+    const size_t bs = type_size(t), nb = (size_t) rows * (size_t) (cols / blck_size(t));
     std::uniform_int_distribution<int> byte(0, 255);
     const float lo = t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K ? 0.00004f : t == GGML_TYPE_Q5_1 ? 0.0006f
                    : t == GGML_TYPE_Q8_0 ? 0.0001f : t == GGML_TYPE_IQ3_S ? 0.0004f : t == GGML_TYPE_IQ4_XS ? 0.00005f
-                   : t == GGML_TYPE_IQ4_NL ? 0.0002f : t == GGML_TYPE_Q2_0 ? 0.004f : t == GGML_TYPE_Q6_K ? 0.000005f : 0.0008f;
+                   : t == GGML_TYPE_IQ4_NL ? 0.0002f : t == GGML_TYPE_Q2_0 ? 0.004f : t == GGML_TYPE_Q6_K ? 0.000005f
+                   : tq_type(t) ? 0.003f : 0.0008f;
     std::uniform_real_distribution<float> sc(lo, 6.0f * lo);
     for (size_t i = 0; i < nb * bs; ++i) m[i] = (uint8_t) byte(rng);
     for (size_t b = 0; b < nb; ++b) {
@@ -116,11 +206,20 @@ std::vector<uint8_t> make_blob(const Pair& p, const Geo& g, std::mt19937& rng) {
 }
 
 // ggml's dequantized weights: gate [FF][N], up [FF][N], down [N][FF]
-void dequant(const Pair& p, const Geo& g, const std::vector<uint8_t>& b, std::vector<float>& gu, std::vector<float>& dn) {
-    const auto* tg = ggml_get_type_traits(p.gu);
-    const auto* td = ggml_get_type_traits(p.d);
+// (the trellis types: tq_block above; int8cb = the int8 codebook the kernels read, for the int8 model)
+void dequant(const Pair& p, const Geo& g, const std::vector<uint8_t>& b, std::vector<float>& gu, std::vector<float>& dn, bool int8cb = false) {
     gu.resize((size_t) 2 * FF * N);
     dn.resize((size_t) N * FF);
+    if (tq_type(p.gu) || tq_type(p.d)) {
+        if (!tq_type(p.gu) || !tq_type(p.d)) throw std::runtime_error("a trellis pair needs both formats trellis");
+        for (int r = 0; r < 2 * FF; ++r)
+            for (int k = 0; k < N; k += 128) tq_block((int) p.gu, b.data() + (size_t) r * g.gu_row + (size_t) (k / 128) * type_size(p.gu), gu.data() + (size_t) r * N + k, int8cb);
+        for (int r = 0; r < N; ++r)
+            for (int k = 0; k < FF; k += 128) tq_block((int) p.d, b.data() + g.down_off + (size_t) r * g.d_row + (size_t) (k / 128) * type_size(p.d), dn.data() + (size_t) r * FF + k, int8cb);
+        return;
+    }
+    const auto* tg = ggml_get_type_traits(p.gu);
+    const auto* td = ggml_get_type_traits(p.d);
     for (int r = 0; r < 2 * FF; ++r) tg->to_float(b.data() + (size_t) r * g.gu_row, gu.data() + (size_t) r * N, N);
     for (int r = 0; r < N; ++r) td->to_float(b.data() + g.down_off + (size_t) r * g.d_row, dn.data() + (size_t) r * FF, FF);
 }
@@ -227,6 +326,7 @@ void run_mmq(const Pair& p, const Geo& geo, mmq::Context& ctx, MmqBufs& b, const
         gu.total_rows = rows; gu.max_rows = maxr; gu.dst = b.gu.as<float>(); gu.ld_dst = FF2;
         ctx.run(gu, s);
         mmq::swiglu(b.gu.as<float>() + r0 * FF2, b.h.as<float>() + r0 * FF, nr, FF, false, s);
+        if (g_rot_on) fused::hadamard128_rows(b.h.as<float>() + r0 * FF, nr, FF, g_rot_signs_dev, s);   // (--folded: the down input rotated)
         mmq::quantize(b.h.as<float>() + r0 * FF, nullptr, b.hq.p, (int) p.d, FF, FF, nr, s);
         mmq::Product dn;
         dn.w = direct ? (const void*) (b0 + geo.down_off) : b.grp_d.p; dn.type = (int) p.d; dn.w_rows = N; dn.w_cols = FF;
@@ -252,6 +352,8 @@ void run_fused(const Pair& p, const Geo& geo, FusedBufs& b, const float* x_dev, 
     const fused::NativeGeom ng = geo.native(p);
     fused::quantize_act_native(x_dev, T, N, b.xa.p, s);
     fused::group(b.ids.as<int32_t>(), rows, K, E, b.scratch.p, b.slot.as<int32_t>(), b.src.as<int32_t>(), s);
+    fused::set_down_rotation(g_rot_on, g_rot_signs_dev);   // (--folded trellis pairs; off for every other pair)
+    struct Off { ~Off() { fused::set_down_rotation(false, nullptr); } } off_at_end;
     for (size_t c = 0; c + 1 < cuts.size(); ++c) {
         for (int e0 = cuts[c]; e0 < cuts[c + 1]; e0 += fused::kMaxBatch) {
             fused::Batch bt;
@@ -334,10 +436,13 @@ void reference_part(const Pair& p, cudaStream_t s, int T = 256, int E = 64, int 
         ck(cudaMemcpy(q, host[(size_t) e].data(), geo.bytes, cudaMemcpyHostToDevice), "blob");
         blob[(size_t) e] = q;
     }
-    const std::vector<float> x = make_x(T, rng, ZERO);
+    std::vector<float> x = make_x(T, rng, ZERO);
     const std::vector<int32_t> ids = make_ids(T, E, rng, 2, E >= 64 ? 4 : 4);   // experts 0, 1 hot (several tiles), the last 4 unused
     const int64_t rows = (int64_t) T * K;
     const Routing r = sort_rows(ids, E);
+    const Folded fo(tq_type(p.gu), rows);   // (--folded trellis pairs: the signs, the H scratch; x rotated for every path and the reference)
+    fo.rotate_x(x);
+    if (fo.on) std::printf("%s - folded: the gate/up input and H rotated per 128 values with random signs\n", p.name);
     std::printf("%s - reference part: %d tokens, %d experts, rows per expert: max %d, experts without rows %d\n", p.name,
                 T, E, *std::max_element(r.cnt.begin(), r.cnt.end()), (int) std::count(r.cnt.begin(), r.cnt.end(), 0));
 
@@ -370,10 +475,14 @@ void reference_part(const Pair& p, cudaStream_t s, int T = 256, int E = 64, int 
     const int nth = std::max(1, std::min(16, (int) std::thread::hardware_concurrency()));
     for (int w = 0; w < nth; ++w)
         th.emplace_back([&, w] {
-            std::vector<float> gu, dn, h(FF), h2(FF), hq(FF), xq(N);
+            std::vector<float> gu, dn, gu8, dn8, h(FF), h2(FF), hq(FF), xq(N);
+            const bool tq = tq_type(p.gu);
             for (int e = w; e < E; e += nth) {
                 if (r.cnt[(size_t) e] == 0) continue;
                 dequant(p, geo, host[(size_t) e], gu, dn);
+                if (tq) dequant(p, geo, host[(size_t) e], gu8, dn8, true);   // (trellis: the int8 model reads the int8 codebook, as the kernels do)
+                const std::vector<float>& gm = tq ? gu8 : gu;
+                const std::vector<float>& dmw = tq ? dn8 : dn;
                 for (int64_t i = 0; i < rows; ++i) {
                     if (ids[(size_t) i] != e) continue;
                     const float* xr = x.data() + (size_t) (i / K) * N;
@@ -383,6 +492,7 @@ void reference_part(const Pair& p, cudaStream_t s, int T = 256, int E = 64, int 
                         for (int k = 0; k < N; ++k) { gt += (double) wg[k] * xr[k]; up += (double) wu[k] * xr[k]; }
                         h[(size_t) f] = (float) (gt / (1.0 + std::exp(-gt)) * up);
                     }
+                    if (fo.on) rot128(h.data(), FF, fo.sh.data());   // (--folded: the down input rotated)
                     for (int o = 0; o < N; ++o) {
                         double a = 0;
                         const float* wd = dn.data() + (size_t) o * FF;
@@ -392,14 +502,15 @@ void reference_part(const Pair& p, cudaStream_t s, int T = 256, int E = 64, int 
                     quant32(xr, xq.data(), N);
                     for (int f = 0; f < FF; ++f) {
                         double gt = 0, up = 0;
-                        const float *wg = gu.data() + (size_t) f * N, *wu = gu.data() + (size_t) (FF + f) * N;
+                        const float *wg = gm.data() + (size_t) f * N, *wu = gm.data() + (size_t) (FF + f) * N;
                         for (int k = 0; k < N; ++k) { gt += (double) wg[k] * xq[(size_t) k]; up += (double) wu[k] * xq[(size_t) k]; }
                         h2[(size_t) f] = (float) (gt / (1.0 + std::exp(-gt)) * up);
                     }
+                    if (fo.on) rot128(h2.data(), FF, fo.sh.data());
                     quant32(h2.data(), hq.data(), FF);
                     for (int o = 0; o < N; ++o) {
                         double a = 0;
-                        const float* wd = dn.data() + (size_t) o * FF;
+                        const float* wd = dmw.data() + (size_t) o * FF;
                         for (int f = 0; f < FF; ++f) a += (double) wd[f] * hq[(size_t) f];
                         ref2[(size_t) i * N + o] = (float) a;
                     }
@@ -451,8 +562,8 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     const int64_t rows = (int64_t) T * K;
     // 512 distinct blobs - the products read each once per tile, as the engine does
     // at a stride of whole blocks of both formats (MMQ's expert stride counts blocks), + MMQ's read past the end
-    size_t unit = ggml_type_size(p.gu);
-    while (unit % ggml_type_size(p.d) != 0 || unit % 16 != 0) unit += ggml_type_size(p.gu);
+    size_t unit = type_size(p.gu);
+    while (unit % type_size(p.d) != 0 || unit % 16 != 0) unit += type_size(p.gu);
     const size_t stride = (geo.bytes + unit - 1) / unit * unit;
     Dev blobs((size_t) E * stride + 4096);
     ck(cudaMemset(blobs.p, 0, (size_t) E * stride + 4096), "zero");
@@ -466,7 +577,9 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     }
     std::vector<const uint8_t*> blob((size_t) E);
     for (int e = 0; e < E; ++e) blob[(size_t) e] = blobs.as<uint8_t>() + (size_t) e * stride;
-    const std::vector<float> x = make_x(T, rng, -1);
+    std::vector<float> x = make_x(T, rng, -1);
+    const Folded fo(tq_type(p.gu), rows);   // (--folded trellis pairs: rotated input, the H rotation on both paths, inside their times)
+    fo.rotate_x(x);
     const std::vector<int32_t> ids = make_ids(T, E, rng, 0, 0);
     const Routing r = sort_rows(ids, E);
     Dev x_dev(x.size() * 4), src_dev((size_t) rows * 4);
@@ -634,6 +747,7 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
                 for (int k = 0; k < N; ++k) { gt += (double) wg[k] * xr[k]; up += (double) wu[k] * xr[k]; }
                 h[(size_t) f] = (float) (gt / (1.0 + std::exp(-gt)) * up);
             }
+            if (fo.on) rot128(h.data(), FF, fo.sh.data());   // (--folded)
             for (int o = 0; o < N; ++o) {
                 double a = 0;
                 const float* wd = dn.data() + (size_t) o * FF;
@@ -745,7 +859,10 @@ int main(int argc, char** argv) {
             {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, "Q8_0 / Q8_0"},
             // UD-Q6_K_XL's layers (and UD-Q5_K_XL's one Q6_K layer): STRATA_PF_FUSED_Q6K=1 on CUDA sm_80+ (opt-in); MMQ = the K-quant library.
             // Named with "+" so the _kq entry's --only="K / Q" does not take it
-            {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, "Q6_K + Q8_0"}};
+            {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, "Q6_K + Q8_0"},
+            // Gyro-S (TQK6 gate/up, TQK7 down) and Gyro-M (TQ2_T both): STRATA_PF_FUSED_TQ=1 on CUDA sm_80+ (opt-in); MMQ = the overlay's trellis
+            // instances; the ids are agentionai's (the pinned ggml.h has no enumerators for them)
+            {(ggml_type) 145, (ggml_type) 146, "TQK6 + TQK7"},       {(ggml_type) 144, (ggml_type) 144, "TQ2_T + TQ2_T"}};
         const char* only = nullptr;   // --only=NAME: the pairs whose name contains NAME
         for (int i = 1; i < argc; ++i)
             if (std::strncmp(argv[i], "--only=", 7) == 0) only = argv[i] + 7;
@@ -756,6 +873,7 @@ int main(int argc, char** argv) {
             if (std::strcmp(argv[i], "--no-timing") == 0) timing = false;
             if (std::strcmp(argv[i], "--no-ref") == 0) ref = false;
             if (std::strcmp(argv[i], "--edge") == 0) edge = true;
+            if (std::strcmp(argv[i], "--folded") == 0) g_folded = true;   // (the trellis pairs as Hadamard-folded experts: see g_folded)
             if (std::strncmp(argv[i], "--chunks=", 9) == 0) {
                 chunks.clear();
                 for (const char* c = argv[i] + 9; *c;) {
@@ -771,7 +889,7 @@ int main(int argc, char** argv) {
             if (only ? std::string(p.name).find(only) == std::string::npos : p.gu == GGML_TYPE_Q4_K || p.gu == GGML_TYPE_Q5_K) continue;
             // the i-quant / Q8_0 and Q8_0 / Q8_0 pairs run only when --only names them (ctest prefill_fused_iq_test_q8d / _q8gu), so every
             // other entry runs what it ran
-            if (!only && p.d == GGML_TYPE_Q8_0 && !kq_gu(p)) continue;
+            if (!only && ((p.d == GGML_TYPE_Q8_0 && !kq_gu(p)) || tq_type(p.gu))) continue;   // (and the trellis pairs: _tq)
             if (!fused::native_supported((int) p.gu, (int) p.d)) {
                 // the Q2_0 / Q2_0 pair is the Turing opt-in's (STRATA_PF_FUSED_SM75=1; the only pair set up there) or, on sm_80+,
                 // STRATA_PF_FUSED_Q2N=1's: skip what this device does not take (--only=NAME still insists)

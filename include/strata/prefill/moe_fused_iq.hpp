@@ -46,6 +46,14 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
 /// down runs on an F16 kernel; dm_f16_used() says which form the last call wrote (false on every other path), for moe_combine16.
 void want_dm_f16(bool on);
 bool dm_f16_used();
+/// (CUDA, STRATA_PF_FUSED_TQ=1) a Hadamard-folded down for the next experts_native calls of a trellis pair: the gate/up writes H as FP32
+/// into the first n_ff floats of each row's own down-output row in `dm` (no other buffer), which is rotated there (y = H_128 (signs * h) /
+/// sqrt(128) per 128 features; signs nullptr = identity, else n_ff values on the device) and quantized into `ha` before the down product
+/// rewrites the row.  Off by default; set_down_rotation(false, nullptr) after the layer.
+void set_down_rotation(bool on, const float* signs);
+/// (CUDA) the same rotation in place on `rows` FP32 rows of `cols` values (a multiple of 128), on `stream`: a folded gate/up's input before
+/// quantize_act_native, or (tests) MMQ's H.
+void hadamard128_rows(float* x, int64_t rows, int64_t cols, const float* signs, void* stream);
 /// The NT = 256 kernels (STRATA_PF_FUSED_NT=256 or _F16=1) or the warp-specialized kernel (STRATA_PF_FUSED_WS=1) are
 /// set up on the current device: experts_native takes a WideBatch (STRATA_PF_BATCH up to kBatchRoom experts a launch).
 bool native_wide();
