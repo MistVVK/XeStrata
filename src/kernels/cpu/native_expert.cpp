@@ -626,12 +626,16 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
         const uint8_t* gr = blob + (size_t) r * f.gu_row;
         const uint8_t* ur = blob + f.up_off + (size_t) r * f.gu_row;
         for (int t = 0; t < nt; ++t) {
+            // g is read back before the up row's call, never together with u: GCC on arm64 put g and u side by side and read
+            // both with one 8-byte load after the second call, a load that two separate 4-byte stores (one per dot) cannot
+            // forward to, so every row pair stalled until the stores drained (OWN-2N2: 2% of the Spark's gate/up time with the
+            // quant layer's 4-argument dot; the same arithmetic, the same bits).
             float g = 0.f, u = 0.f;
             dot.dot(n, &g, gr, act[t]);
+            const float gs = g * sg;
             dot.dot(n, &u, ur, act[t]);
-            g *= sg;
-            u *= su;
-            ff[t][r] = (g / (1.f + std::exp(-g))) * u;
+            const float us = u * su;
+            ff[t][r] = (gs / (1.f + std::exp(-gs))) * us;
         }
     }
 }
