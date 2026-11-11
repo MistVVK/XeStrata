@@ -401,9 +401,9 @@ size_t ckpt_pool_ready_env() {
 // how many dropped checkpoints the pool keeps (a batch admission drops and takes about two): 2, or more when STRATA_CKPT_POOL_READY asks
 size_t ckpt_pool_cap_env() { return std::max<size_t>(2, ckpt_pool_ready_env()); }
 // STRATA_PARK_SEGPOOL_MIB=N (read once; Linux only, inert where the OS layer is not written - Windows, macOS): the host buffers of parked
-// conversations (K/V segments of 512 KiB and more) come from one arena of N MiB (at most an eighth of the conversation cache) that a
+// conversations (K/V segments of 512 KiB and more) come from one arena of N MiB (at most a quarter of the conversation cache) that a
 // background thread makes resident, so a park's first touch of fresh pages is paid once at start instead of at every park (include/
-// strata/core/conversation_segment_pool.hpp).  Unset: the engine's default, min(1 GiB, an eighth of the cache) in 64 MiB steps
+// strata/core/conversation_segment_pool.hpp).  Unset: the engine's default, min(2 GiB, a quarter of the cache) in 64 MiB steps
 // (park_pool_policy.hpp); 0: off (a diagnostic switch).  Its idle bytes count against --conversation-cache-mib and are given back
 // before any parked conversation is evicted and before the RAM floor is reached.  Every byte a park writes is the same; only where
 // the buffers live differs.  -1: unset.
@@ -12129,7 +12129,7 @@ int main(int argc, char** argv) {
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
         // The park pools (park_pool_policy.hpp): memory held idle between parks so a park does not pay the first touch of fresh pages.
         //   * the segment pool: one arena for the K/V buffers of parked conversations (STRATA_PARK_SEGPOOL_MIB=N sets its size, 0 turns it
-        //     off; unset: min(1 GiB, an eighth of the cache); Linux only, the OS layer of Windows and macOS is not written yet: inert there);
+        //     off; unset: min(2 GiB, a quarter of the cache); Linux only, the OS layer of Windows and macOS is not written yet: inert there);
         //   * the checkpoint pool with ready checkpoints (STRATA_CKPT_POOL=0 turns it off; STRATA_CKPT_POOL_READY=N sets the count; unset:
         //     as many as fit in a twelfth of the cache, at most 4; a single-stage serve only, not in the Metal build).
         // Both count against the cache's budget (ConversationCache::set_pool) and are given back before any parked conversation is evicted
@@ -12171,7 +12171,7 @@ int main(int argc, char** argv) {
             const size_t want_mib = env_mib >= 0 ? (size_t) env_mib : park_plan.segpool_mib;
             if (want_mib > 0 && conversations.enabled()) {
                 const size_t budget = (size_t) o.conversation_cache_mib * 1024 * 1024;
-                const size_t bytes = std::min(want_mib * 1024 * 1024, budget / 8);   // never more than an eighth of the cache
+                const size_t bytes = std::min(want_mib * 1024 * 1024, budget / 4);   // never more than a quarter of the cache
                 segpool = new strata::core::SegmentPool(strata::core::segment_pool_os(), bytes);
                 if (segpool->active() && strata::core::segment_pool_install(segpool)) {
                     pools_budget = ParkPoolsBudget(segpool, &ckpt_pool);

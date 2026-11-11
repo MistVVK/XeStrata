@@ -15,19 +15,19 @@ struct ParkPoolPlan {
     size_t ckpt_ready = 0;    ///< checkpoints kept ready for the next save (0: none ahead of time)
 };
 
-constexpr size_t kSegpoolMaxMib = 1024;          ///< the arena never exceeds 1 GiB
+constexpr size_t kSegpoolMaxMib = 2048;          ///< the arena never exceeds 2 GiB (l620, 11-12: a 55K-token park 283 ms with 1 GiB, 117 ms with 2 GiB)
 constexpr size_t kSegpoolMinMib = 128;           ///< below this an arena does not hold even an 8K image: none
 constexpr size_t kCkptReadyMax = 4;              ///< a park needs the live state plus one copy per checkpoint (up to 3 seen at 55K): 4
 
 /// `cache_mib`: the conversation cache's budget (--conversation-cache-mib, or the automatic size);
 /// `ckpt_bytes`: one ready checkpoint (the running state of the model: ~112 MB on Qwen3.8-Flash-Next).
-/// segpool = min(1 GiB, an eighth of the cache) in whole 64 MiB steps, none under 128 MiB;
+/// segpool = min(2 GiB, a quarter of the cache) in whole 64 MiB steps, none under 128 MiB;
 /// ckpt_ready = as many checkpoints as fit in a twelfth of the cache, at most 4.
-/// Together they hold at most 21% of the cache idle (18-19% at the usual 7-8 GiB caches).
+/// Together they hold at most a third of the cache idle (30% at the usual 7-8 GiB caches); idle memory is given back first.
 inline ParkPoolPlan park_pool_plan(uint64_t cache_mib, uint64_t ckpt_bytes) {
     ParkPoolPlan p;
     if (cache_mib == 0) return p;
-    const size_t seg = std::min<uint64_t>(kSegpoolMaxMib, cache_mib / 8) / 64 * 64;
+    const size_t seg = std::min<uint64_t>(kSegpoolMaxMib, cache_mib / 4) / 64 * 64;
     p.segpool_mib = seg >= kSegpoolMinMib ? seg : 0;
     if (ckpt_bytes > 0) p.ckpt_ready = (size_t) std::min<uint64_t>(kCkptReadyMax, (cache_mib << 20) / 12 / ckpt_bytes);
     return p;
