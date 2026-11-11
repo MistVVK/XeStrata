@@ -98,7 +98,9 @@ macro(strata_cuda_mmq)
     endif()
     # #136: the Q2_0 pack's prompt experts on Strata's own int8 kernels (moe_fused.cu, opt-in STRATA_PF_FUSED=1; CUDA
     # only: the HIP branch below keeps MMQ, and an sm_75 device or an sm_75-only build reports them unavailable)
+    # (moe_fused_iq_q36.cu: the same kernels again for Qwen3.6's expert shape, for src/qwen35/q36_engine.cu)
     add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_iq4_w4a8.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
+                src/prefill/moe_fused_iq_q36.cu
                 src/prefill/mmq_nvfp4_w4a8.cu
                 src/prefill/ggml_cuda_host.cu ${_strata_quantize_cu})
     if(STRATA_EXPERIMENTAL_SM60 AND NOT STRATA_HIP_GFX906)
