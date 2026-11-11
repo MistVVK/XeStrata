@@ -115,13 +115,13 @@ void transpose_batch(const uint16_t* in, int64_t si, int64_t rows, int64_t cols,
 
 // a tile's dS over dP in place for every head, from S (Q K^T, unscaled) and dP (dO16 V^T, at dO's power of two):
 // P = exp(S scale - lse) (0 past a causal row's own key), dS = P (dP / g - D) scale, each head's largest |dS| as bits
-// into tb[h]
-void tile_ds(const float* S, float* dP, const float* lse, const float* D, int64_t i0, int64_t n, int64_t keys,
-             int64_t heads, float scale, int64_t n_causal, const uint32_t* gbits, uint32_t* tb, void* s) {
+// into tb[h]; D [heads][rows], a cross-attention's rows not its keys
+void tile_ds(const float* S, float* dP, const float* lse, const float* D, int64_t i0, int64_t n, int64_t rows,
+             int64_t keys, int64_t heads, float scale, int64_t n_causal, const uint32_t* gbits, uint32_t* tb, void* s) {
     dit_rows::q_of(s).parallel_for(
         sycl::nd_range<1>(sycl::range<1>((size_t) (heads * n) * kWG), sycl::range<1>(kWG)), [=](sycl::nd_item<1> it) {
             const int64_t g = static_cast<int64_t>(it.get_group_linear_id()), h = g / n, r = g % n;
-            const float l = lse[(i0 + r) * heads + h], dd = D[h * keys + i0 + r], ig = g_of(gbits + h);
+            const float l = lse[(i0 + r) * heads + h], dd = D[h * rows + i0 + r], ig = g_of(gbits + h);
             const int64_t lim = i0 + r < n_causal ? i0 + r + 1 : keys;   // a causal row's keys: itself and before
             const float* Sr = S + (h * n + r) * keys;
             float* dPr = dP + (h * n + r) * keys;
@@ -519,16 +519,17 @@ bool library_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, 
 }
 
 
-// P (FP16) and dS (FP16, in g's units) of a tile of n query rows from i0 for every head, from S and dP [h][n][T]
-// (FP32: Q K^T unscaled, dO / g . V^T): masked past `rows` and above a causal row's own key
-void tile_pds(const float* S, const float* dP, const float* lse, const float* D, int64_t i0, int64_t n, int64_t T,
-              int64_t H, float scale, int64_t n_causal, uint16_t* p16, uint16_t* ds16, void* s) {
-    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) (H * n * T)), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0], h = i / (n * T), r = (i / T) % n, j = i % T, q = i0 + r;
+// P (FP16) and dS (FP16, in g's units) of a tile of n query rows from i0 for every head, from S and dP [h][n][keys]
+// (FP32: Q K^T unscaled, dO / g . V^T): masked above a causal row's own key; D [H][rows], a cross-attention's rows
+// not its keys
+void tile_pds(const float* S, const float* dP, const float* lse, const float* D, int64_t i0, int64_t n, int64_t rows,
+              int64_t keys, int64_t H, float scale, int64_t n_causal, uint16_t* p16, uint16_t* ds16, void* s) {
+    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) (H * n * keys)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0], h = i / (n * keys), r = (i / keys) % n, j = i % keys, q = i0 + r;
         float p = 0.f, ds = 0.f;
         if (!(q < n_causal && j > q)) {
             p = sycl::exp(S[i] * scale - lse[q * H + h]);
-            ds = p * (dP[i] - D[h * T + q]) * scale;
+            ds = p * (dP[i] - D[h * rows + q]) * scale;
         }
         p16[i] = kernels::f16_from_f32(p);
         ds16[i] = kernels::f16_from_f32(ds);
@@ -608,7 +609,7 @@ bool products_v2(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, 
         if (!gemm.f16_batch_ex(false, true, q16 + i0 * C, k16, S, n, keys, hd, H, hd, hd, n * keys, C, C, keys, 0.f) ||
             !gemm.f16_batch_ex(false, true, doh + i0 * C, v16, dP, n, keys, hd, H, hd, hd, n * keys, C, C, keys, 0.f))
             return false;   // (the first product: before anything was written)
-        tile_pds(S, dP, lse, D, i0, n, keys, H, scale, n_causal, p16, ds16, stream);
+        tile_pds(S, dP, lse, D, i0, n, T, keys, H, scale, n_causal, p16, ds16, stream);
         // dQ = dS K, dV += P^T dO, dK += dS^T Q: each head's output a block of its own ([H][rows][hd]: oneMKL takes
         // no batch whose outputs interleave)
         if (!gemm.f16_batch_ex(false, false, ds16, k16, dq, n, hd, keys, H, n * keys, hd, n * hd, keys, C, hd, 0.f) ||
@@ -859,7 +860,7 @@ void products_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
         uint32_t* tb = bits + H * (1 + ti);
         gemm.f16_batch(qh + i0 * hd, kh, S, n, keys, hd, H, T * hd, keys * hd, n * keys);    // S = Q K^T
         gemm.f16_batch(doh + i0 * hd, vh, dP, n, keys, hd, H, T * hd, keys * hd, n * keys);  // dP = dO V^T (dO's scale)
-        tile_ds(S, dP, lse, D, i0, n, keys, H, scale, n_causal, bits, tb, stream);
+        tile_ds(S, dP, lse, D, i0, n, T, keys, H, scale, n_causal, bits, tb, stream);
         tile_maps(S, dP, lse, i0, n, keys, H, scale, n_causal, tb, ds16, ds16t, pt16, stream);
         gemm.f16_batch(ds16, kt, dq, n, hd, keys, H, n * keys, hd * keys, n * hd);           // dQ = dS K
         scatter(dq, i0, n, H, hd, dQ, false, tb, stream);

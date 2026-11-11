@@ -101,6 +101,21 @@ inline int64_t col_values(sycl::queue& q) {
     return (int64_t) (std::min(total / 64, largest / 2) / sizeof(uint16_t));
 }
 
+/// The rows of a convolution's band, at most `most`: the pixels split into equal bands of a multiple of 64 rows, so
+/// that the last band is not a short remainder.  On the RX 9060 XT bands of `most` rows and a remainder took the warm
+/// 512-square decodes of MOSS-Image 144 ms, Anima 120 ms and Qwen-Image 257 ms, and SeedVR2's 1024-square decode
+/// 798 ms; these bands 96, 82, 197 and 561 ms, at half and twice this `most` as well (2026-11-11).  Equal bands not of
+/// a multiple of 64 left SeedVR2 at 782 ms; multiples of 256 and 1024 rows took as long as 64.  A band is at least
+/// (n - 1) / n of `most`, so the wide bands the RX 7900 XTX gained from (col_values) stay about as wide.
+inline int64_t band_rows(int64_t pixels, int64_t most) {
+    constexpr int64_t kAlign = 64;
+    if (most >= pixels || most < kAlign) return most;
+    for (int64_t n = (pixels + most - 1) / most;; ++n) {
+        const int64_t rows = ((pixels + n - 1) / n + kAlign - 1) / kAlign * kAlign;
+        if (rows <= most) return rows;
+    }
+}
+
 /// Shared product driver: point products read the input directly; the other convolutions unfold bands that fit the
 /// caller's allocation.  Unfolding and storing retain the different tensor forms until their own common parts exist.
 template<class Unfold, class Product, class Finish>
@@ -109,7 +124,7 @@ void products(int64_t pixels, int64_t k, int64_t col_values, bool point, Unfold&
     if (point) product(0, pixels, true);
     else {
         if (col_values < k) throw std::runtime_error("image engine: convolution band cannot hold one row");
-        const int64_t rows = col_values / k;
+        const int64_t rows = band_rows(pixels, col_values / k);
         for (int64_t p = 0; p < pixels; p += rows) {
             const int64_t n = std::min(rows, pixels - p);
             unfold(p, n);

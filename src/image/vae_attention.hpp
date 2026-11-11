@@ -72,8 +72,13 @@ struct Attention {
     float *scores = nullptr, *out = nullptr, *window_out = nullptr;
 };
 
+// The kernels below are templates on the caller's projection (Tag), so that each VAE's source holds its own copy and
+// its decode runs them from its own device image.  As plain inline functions one copy served every VAE from another
+// VAE's image (HunyuanImage 3.0's, Qwen-Image's), which Mage-Flow's first decode then loaded: 317 KB more, its first
+// 512-square decode on the RX 9060 XT 38 to 40 ms and its img2img 22 to 25 ms (2026-11-11).
 // The 256-lane form preserves the reduction order of the 16-bit VAE path.
-inline void softmax(const float* scores, int64_t rows, int64_t n, float scale, uint16_t* p, bool group, void* s) {
+template<class Tag>
+void softmax(const float* scores, int64_t rows, int64_t n, float scale, uint16_t* p, bool group, void* s) {
     if (!group) { qi_softmax16(scores, rows, n, scale, p, s); return; }
     constexpr int64_t local = 256;
     core::Runtime::get().stream(s).parallel_for(
@@ -93,7 +98,8 @@ inline void softmax(const float* scores, int64_t rows, int64_t n, float scale, u
         });
 }
 
-inline void calculate(const Attention& a, prefill::Gemm& gemm, void* s) {
+template<class Tag>
+void calculate(const Attention& a, prefill::Gemm& gemm, void* s) {
     const int64_t H = a.h, W = a.w, C = a.c, win = a.window;
     const int64_t T = win ? win * win : H * W;
     const int64_t ny = win ? (H + win - 1) / win : 1, nx = win ? (W + win - 1) / win : 1;
@@ -118,7 +124,7 @@ inline void calculate(const Attention& a, prefill::Gemm& gemm, void* s) {
         for (int64_t r = 0; r < T; r += a.rows) {
             const int64_t n = std::min(a.rows, T - r);
             gemm.f16(a.q + r * C, a.k, a.scores, n, T, C);
-            softmax(a.scores, n, T, 1.f / std::sqrt((float) C), a.p, a.group_softmax, s);
+            softmax<Tag>(a.scores, n, T, 1.f / std::sqrt((float) C), a.p, a.group_softmax, s);
             gemm.f16(a.p, a.vt, out + r * C, n, C, T);
         }
         if (win) {
@@ -142,7 +148,7 @@ void run(const Attention& a, prefill::Gemm& gemm, void* s, ProjectQkv project_qk
                                     a.normalized, a.norm_workspace, s);
     else qi_group_norm16(a.x, pixels, a.c, a.weight, a.bias, a.eps, false, a.normalized, a.norm_workspace, s);
     project_qkv();
-    calculate(a, gemm, s);
+    calculate<ProjectQkv>(a, gemm, s);
     ProductStore p; p.in = a.out; p.out16 = a.normalized; p.rows = pixels; p.cols = a.c; p.add_zero = false;
     product_store(p, s);
     project_out();

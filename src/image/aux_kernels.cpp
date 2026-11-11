@@ -7,6 +7,8 @@
 
 #include "strata/core/runtime.hpp"
 
+#include "row_norm.hpp"
+
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
@@ -19,6 +21,11 @@
 #include <vector>
 
 namespace strata::image {
+
+using rows::kRowVals;
+using rows::row_items;
+using rows::row_stats;
+using rows::row_vals;
 
 namespace {
 
@@ -97,154 +104,6 @@ void aux_conv_few16(const uint16_t* x16, int64_t H, int64_t W, int64_t C, const 
     });
     finish(stream, e, "aux_conv_few16");
 }
-
-namespace {
-// One tap loop for all depthwise users, including the row-reduction fusion below.
-template <typename I, bool Half>
-inline float depthwise_value(const Depthwise& d, I oy, I ox, I c) {
-    float acc = d.bias ? d.bias[c] : 0.f;
-    for (I ky = 0; ky < d.k; ++ky) {
-        const I yy = oy * d.stride + ky * d.dilation - d.pad;
-        if (yy < 0 || yy >= d.h) continue;
-        for (I kx = 0; kx < d.k; ++kx) {
-            const I xx = ox * d.stride + kx * d.dilation - d.pad;
-            if (xx < 0 || xx >= d.wdim) continue;
-            const I xi = (yy * (I) d.wdim + xx) * (I) d.c + c;
-            const I wi = (c * d.k + ky) * d.k + kx;
-            if constexpr (Half) acc += f32_from_f16(d.x16[xi]) * f32_from_f16(d.w16[wi]);
-            else acc += d.w[wi] * d.x[xi];
-        }
-    }
-    return acc;
-}
-
-template <typename I>
-void depthwise_norm_launch(const Depthwise& d, void* stream);
-
-template <typename I, bool Half>
-void depthwise_launch(const Depthwise& d, void* stream) {
-    const auto e = queue_for(stream).parallel_for(
-        sycl::range<3>((size_t) d.oh, (size_t) d.ow, (size_t) d.c), [=](sycl::id<3> id) {
-            const I oy = (I) id[0], ox = (I) id[1], c = (I) id[2];
-            const I i = (oy * (I) d.ow + ox) * (I) d.c + c;
-            float v = image_activate(d.act, depthwise_value<I, Half>(d, oy, ox, c));
-            if (d.residual) v = d.x[i] + v;
-            if constexpr (Half) d.out16[i] = f16_from_f32(v);
-            else d.out[i] = v;
-        });
-    finish(stream, e, "image_depthwise");
-}
-}  // namespace
-
-void image_depthwise(const Depthwise& d, void* stream) {
-    if (d.oh <= 0 || d.ow <= 0 || d.c <= 0) return;
-    if (d.h <= 0 || d.wdim <= 0 || d.k <= 0 || d.stride <= 0 || d.dilation <= 0 || d.pad < 0)
-        throw std::invalid_argument("image_depthwise: invalid dimensions");
-    // The 3D launch removes per-output division. The former 1D form took 0.7 ms on B70 at 72 x 72 x 256.
-    // Keep wide indices for tensors and padded coordinates that do not fit in a signed 32-bit index.
-    const int64_t limit = std::numeric_limits<int>::max();
-    const bool narrow = d.h <= limit / d.wdim / d.c && d.oh <= limit / d.ow / d.c &&
-                        d.c <= limit / d.k / d.k &&
-                        d.oh <= (limit - (int64_t) d.k * d.dilation - d.pad) / d.stride &&
-                        d.ow <= (limit - (int64_t) d.k * d.dilation - d.pad) / d.stride;
-    if (d.norm_w) {
-        depthwise_norm_launch<int64_t>(d, stream);
-    } else if (d.x16) {
-        if (narrow) depthwise_launch<int, true>(d, stream);
-        else depthwise_launch<int64_t, true>(d, stream);
-    } else {
-        if (narrow) depthwise_launch<int, false>(d, stream);
-        else depthwise_launch<int64_t, false>(d, stream);
-    }
-}
-
-namespace {
-// A row's norm by a work-group of L items, each holding its kRowVals channels c = l + k L in registers: L about a
-// quarter of the channels (32 to 256), so a narrow row is not 256 items of one channel and two group reductions (the
-// B70's Florence-2 large vision, 2026-11-07: its 256-channel rows' fused depthwise convolution and norm 476 us at
-// 256 items, at 170 GB/s).  Rows wider than kRowVals x 256 channels take the loops over memory (row_vals() 0).
-constexpr int64_t kRowVals = 8;
-int64_t row_items(int64_t C) { return std::clamp<int64_t>((C / 4 + 31) / 32 * 32, 32, 256); }
-bool row_vals(int64_t C) { return C <= kRowVals * row_items(C); }
-
-// The mean and the inverse deviation of a row's values held as above (two passes: the variance about the mean)
-template <int N>
-inline sycl::float2 row_stats(const sycl::nd_item<N>& it, const float (&v)[kRowVals], int64_t l, int64_t L, int64_t C,
-                              float eps) {
-    float s = 0.f;
-#pragma unroll
-    for (int64_t k = 0; k < kRowVals; ++k)
-        if (l + k * L < C) s += v[k];
-    const float mean = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) / (float) C;
-    float s2 = 0.f;
-#pragma unroll
-    for (int64_t k = 0; k < kRowVals; ++k)
-        if (l + k * L < C) s2 += (v[k] - mean) * (v[k] - mean);
-    return {mean, 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>()) / (float) C + eps)};
-}
-}  // namespace
-
-namespace {
-// A channel reduction requires one work-group per pixel. Keep its 1D mapping: the 3D mapping changed Florence-2
-// outputs on RTX 4070 (stage0 mean absolute difference 4.35e-5, max 0.00175) and took 45.6 vs 44.2 ms in vision.
-template <typename I>
-void depthwise_norm_launch(const Depthwise& d, void* stream) {
-    const auto x = d.x; const auto w = d.w; const auto b = d.bias;
-    const auto nw = d.norm_w; const auto nb = d.norm_b;
-    const auto H = d.h, W = d.wdim, C = d.c, o_ws = d.window;
-    const auto eps = d.eps; auto y = d.out; auto y16 = d.out16;
-    const int64_t T = H * W;
-    if (T <= 0) return;
-    const bool regs = row_vals(C);
-    const int64_t L = regs ? row_items(C) : 256;
-    const auto e = queue_for(stream).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) (T * L)), sycl::range<1>((size_t) L)), [=](sycl::nd_item<1> it) {
-            const auto t = static_cast<int64_t>(it.get_group_linear_id());
-            const auto l = static_cast<int64_t>(it.get_local_linear_id());
-            const I py = t / W, px = t - py * W;
-            float* yr = y + t * C;
-            const auto conv = [&](int64_t c) {
-                Depthwise conv; conv.x = x; conv.w = w; conv.bias = b; conv.h = H; conv.wdim = W; conv.c = C;
-                return depthwise_value<I, false>(conv, py, px, (I) c) + x[t * C + c];
-            };
-            const int64_t o = o_ws > 0 ? ((py / o_ws) * (W / o_ws) + px / o_ws) * o_ws * o_ws + (py % o_ws) * o_ws +
-                                             px % o_ws
-                                       : t;
-            if (regs) {
-                float v[kRowVals];
-#pragma unroll
-                for (int64_t k = 0; k < kRowVals; ++k) {
-                    const int64_t c = l + k * L;
-                    v[k] = c < C ? conv(c) : 0.f;
-                    if (c < C) yr[c] = v[k];
-                }
-                const sycl::float2 st = row_stats(it, v, l, L, C, eps);
-#pragma unroll
-                for (int64_t k = 0; k < kRowVals; ++k) {
-                    const int64_t c = l + k * L;
-                    if (c < C) y16[o * C + c] = f16_from_f32((v[k] - st[0]) * st[1] * nw[c] + nb[c]);
-                }
-                return;
-            }
-            float s = 0.f;
-            for (int64_t c = l; c < C; c += L) {   // each item its own channels: written, then read back
-                const float v = conv(c);
-                yr[c] = v;
-                s += v;
-            }
-            const float mean = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) / (float) C;
-            float s2 = 0.f;
-            for (int64_t c = l; c < C; c += L) {
-                const float d = yr[c] - mean;
-                s2 += d * d;
-            }
-            const float inv =
-                1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>()) / (float) C + eps);
-            for (int64_t c = l; c < C; c += L) y16[o * C + c] = f16_from_f32((yr[c] - mean) * inv * nw[c] + nb[c]);
-        });
-    finish(stream, e, "aux_dwconv3_norm16");
-}
-}  // namespace
 
 void aux_dwconv3_norm16(const float* x, const float* w, const float* b, const float* nw, const float* nb, int64_t H,
                         int64_t W, int64_t C, int64_t o_ws, float eps, float* y, uint16_t* y16, void* stream) {
