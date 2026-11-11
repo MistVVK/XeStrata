@@ -24307,6 +24307,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PF_FUSED_SM40",
+   "backends": [
+    "cuda"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 2614,
+     "backend": "cuda",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "",
+   "since": "",
+   "last_commit": "",
+   "last_date": "",
+   "status": "research",
+   "owner": "prefill",
+   "note": "[DRAFT] CUDA research switch, off unless set, not a user setting: =1 lets compute capability 8.6 and 12.0 cards with 40-79 SMs take the fused prompt kernels by default for the IQ3_S pack's IQ3_XXS / IQ3_S / IQ4_XS gate/up layers with an IQ4_NL or Q2_0 down (those cards keep MMQ otherwise; one-layer rows on an RTX A4000). Goes away with MMQ (release C) or becomes the default.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PF_FUSED_SM75",
    "backends": [
     "cuda-hip"

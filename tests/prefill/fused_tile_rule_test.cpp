@@ -73,6 +73,76 @@ int main() {
     // ---- no experts: the average is rows themselves, never a division by zero
     CHECK(pick(rtx5070, 0, 0).ww == 4 && pick(rtx5070, 120, 0).ww == 2);
 
+    // ---- staged launches (weight staging, both kernels of the launch staged): 128 rows from every size on sm_86 / sm_120 cards with 1 to 79 SMs
+    {
+        const Card a4000s{false, false, 48, true}, rtx3060{false, false, 28, true}, s86at79{false, false, 79, true}, s86at80{false, false, 80, true}, a6000s{false, false, 84, true},
+            s120at79{true, false, 79, false}, s120at80{true, false, 80, false}, s89{false, false, 60, false}, unknown{false, false, 0, true};
+        for (int64_t n : {int64_t(0), int64_t(1), int64_t(10000), int64_t(28672), int64_t(40960), int64_t(57344), int64_t(61388), int64_t(81910), int64_t(200000), int64_t(700000)}) {
+            for (const Card& c : {a4000s, rtx3060, s86at79, rtx5070, rtx5070ti, s120at79, Card{true, false, 40, false}}) {
+                CHECK(pick(c, n, E, true).ww == 2 && pick(c, n, E, true).why == Why::kStaged);
+            }
+            // the same cards, unstaged: today's rule, byte for byte (the default argument is `false`)
+            for (const Card& c : {a4000s, rtx3060, s86at79, rtx5070, rtx5070ti, s120at79}) {
+                CHECK(pick(c, n, E, false).ww == pick(c, n, E).ww && pick(c, n, E, false).why == pick(c, n, E).why);
+                CHECK(pick(c, n, E).why != Why::kStaged);
+            }
+            // outside the class a staged launch keeps the rule: 80+ SMs, sm_121, a card with neither flag (sm_89 / sm_80: not measured), an unknown SM count
+            for (const Card& c : {s86at80, a6000s, s120at80, rtx5080, pro5000, pro6000, rtx5090, gb10, Card{true, true, 48, true}, s89, unknown}) {
+                CHECK(pick(c, n, E, true).ww == pick(c, n, E, false).ww && pick(c, n, E, true).why == pick(c, n, E, false).why);
+            }
+        }
+        // the edges: 79 SMs in the class, 80 out of it
+        CHECK(pick(s86at79, 40960, E, true).why == Why::kStaged && pick(s86at80, 40960, E, true).why == Why::kBand);
+        CHECK(pick(s120at79, 40960, E, true).why == Why::kStaged && pick(s120at80, 40960, E, true).why == Why::kBand);
+        // the cases the 5070 class refuses unstaged (below 119.9 rows an expert) are 128 when staged; the A4000 (sm_86) had no rule of its own below 80 SMs
+        CHECK(pick(rtx5070, 40960, E, false).ww == 4 && pick(rtx5070, 40960, E, true).ww == 2);
+        CHECK(pick(a4000s, 81910, E, false).ww == 4 && pick(a4000s, 81910, E, true).ww == 2);
+        CHECK(pick(a4000s, 40960, E, false).ww == 2 && pick(a4000s, 20000, E, false).ww == 4 && pick(a4000s, 20000, E, true).ww == 2);   // band: 80 rows 128, 39 rows 64
+    }
+    // ---- the default rule (native_supported) with the research switch STRATA_PF_FUSED_SM40: takes_by_default(card, sm40, gate_staged, down_ok)
+    {
+        using strata::prefill::fused_tile::takes_by_default;
+        const Card a4000s{false, false, 48, true}, s86at39{false, false, 39, true}, s86at40{false, false, 40, true}, s86at79{false, false, 79, true}, s86at80{false, false, 80, true},
+            s120at48{true, false, 48, false}, s120at39{true, false, 39, false}, s89{false, false, 60, false}, gb10c{true, true, 48, false};
+        // a staged-gate pair (IQ3_S / IQ4_NL, IQ3_XXS / Q2_0, ...) on 48 SMs: on with the switch, today's behaviour (off) without it
+        CHECK(takes_by_default(a4000s, true, true, true) && !takes_by_default(a4000s, false, true, true));
+        CHECK(takes_by_default(s120at48, true, true, true) && !takes_by_default(s120at48, false, true, true));
+        // IQ2_S / Q2_0 (gate/up not staged) and a down outside IQ4_NL / Q2_0: off, switch or not
+        CHECK(!takes_by_default(a4000s, true, false, true) && !takes_by_default(a4000s, true, true, false) && !takes_by_default(a4000s, true, false, false));
+        // the bound: 39 SMs off, 40 and 79 on, 80 on without the switch
+        CHECK(!takes_by_default(s86at39, true, true, true) && !takes_by_default(s120at39, true, true, true));
+        CHECK(takes_by_default(s86at40, true, true, true) && takes_by_default(s86at79, true, true, true));
+        CHECK(!takes_by_default(s86at79, false, true, true) && takes_by_default(s86at80, false, false, false));
+        // other cards: sm_89 / sm_80 (neither flag) and an unknown SM count stay off with the switch; the s121 flag is not looked at by this rule (GB10 has its own tile rule only)
+        CHECK(takes_by_default(gb10c, true, true, true) == takes_by_default(s120at48, true, true, true));
+        // switch unset: exactly today's rule (sm_86 / sm_120 with 80+ SMs) for every card flag set, SM count and launch kind
+        long long cmpd = 0, bad = 0;
+        for (int s120 = 0; s120 < 2; ++s120)
+            for (int s86 = 0; s86 < 2; ++s86)
+                for (int sms = 0; sms <= 200; ++sms)
+                    for (int g = 0; g < 2; ++g)
+                        for (int d = 0; d < 2; ++d) {
+                            ++cmpd;
+                            const Card c{s120 != 0, false, sms, s86 != 0};
+                            if (takes_by_default(c, false, g != 0, d != 0) != ((s120 || s86) && sms >= 80)) ++bad;
+                            if (sms >= 80 && takes_by_default(c, true, g != 0, d != 0) != takes_by_default(c, false, g != 0, d != 0)) ++bad;   // the switch moves nothing at 80+ SMs
+                        }
+        CHECK(bad == 0);
+        std::printf("fused_tile_rule_test: default rule with the switch unset: %lld card / launch combinations compared with 'sm_86 / sm_120, 80+ SMs' (%lld differing)\n", cmpd, bad);
+    }
+    // every class, every launch size: staged = false gives the rule of commit 083b1ac82 exactly as before the argument existed, for the sm_86 cards too (the new flag does not move them)
+    {
+        long long cmp = 0, diff = 0;
+        for (const Card& c : {a6000, a4000, Card{false, false, 48, true}, Card{false, false, 84, true}, Card{false, false, 28, true}, pro6000, pro5000, rtx5090, rtx5080, gb10, hip})
+            for (int ne : {1, 64, 256, 512, 1024})
+                for (int64_t n = 0; n <= 700000; n += 13) {
+                    ++cmp;
+                    if (pick(c, n, ne, false).ww != legacy(c, n, ne)) ++diff;
+                }
+        CHECK(diff == 0);
+        std::printf("fused_tile_rule_test: staged = false: %lld launches compared against the previous rule (%lld differing)\n", cmp, diff);
+    }
+
     // ---- "nothing changes": every class except the 40-79 SM one gives, for every launch size, what the rule of commit 083b1ac82 gave
     long long compared = 0, differing = 0;
     for (const Card& c : {pro6000, rtx5090, rtx5080, pro5000, a6000, a4000, gb10, hip, rtx5060ti, Card{true, false, 39}, Card{true, false, 80}, Card{true, false, 99},
