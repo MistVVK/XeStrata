@@ -26,6 +26,7 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/prefill/moe_fused_q36.hpp"
+#include "strata/prefill/mmq_ids_margin.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/qwen35/engine.hpp"
 #include "strata/qwen35/sampling.hpp"
@@ -1435,9 +1436,17 @@ struct Engine {
         if (use_mmq) {
             const int64_t ne = (int64_t) T * Kp;
             mctx = std::make_unique<MMQ::Context>();
-            ident = dalloc_t<int32_t>((size_t) ne);
+            // The row table (ids) is read past its end by llama.cpp's MMQ: mul_mat_q copies ids_dst[col_low + jt*J + j] for a whole J-column tile before it
+            // compares the tile with the expert's rows, and its stream-k fixup does the same for every tile up to roundup(max_rows, J) from an expert's first row,
+            // which can be the table's last (mmq.cuh; J goes to 128).  mmq_ids_table_rows adds roundup(max_rows, 128) + 128 entries, max_rows <= T (an expert takes at
+            // most one row per token): the margin the Flash-Next prompt path already uses (prefill.cpp mmq_ids_rows, PR #5108).  An exact table of ne ints (64 KB at the
+            // default chunk) was read past its end: compute-sanitizer on the same size in the Qwen3.6 one-layer test (z440-20261111-2224-d478), 311 invalid reads of size 4
+            // in mul_mat_q<Q8_0, 96>, 29 to 57+ bytes after a 65,536-byte allocation.  The identity is written over the whole table, as there.
+            const int64_t ids_rows = (int64_t) MMQ::mmq_ids_table_rows((uint64_t) ne, (uint64_t) T);
+            if (ids_rows <= 0) { std::fprintf(stderr, "strata-q36: the MMQ row table does not fit\n"); std::exit(1); }
+            ident = dalloc_t<int32_t>((size_t) ids_rows);
             CK(cudaDeviceSynchronize());   // ident's cudaMemset (legacy stream) before the iota on the non-blocking stream
-            MMQ::iota(ident, ne, st);
+            MMQ::iota(ident, ids_rows, st);
             CK(cudaMalloc(&mq_x, MMQ::q8_bytes(ne, g.n_embd)));
             CK(cudaMalloc(&mq_hq, MMQ::q8_bytes(ne, g.n_ff)));
             mq_gu = dalloc((size_t) ne * 2 * FF);
