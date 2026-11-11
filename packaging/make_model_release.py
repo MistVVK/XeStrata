@@ -186,7 +186,7 @@ def plan(report: dict, set_index: int, a, prev: dict) -> dict:
              ["bash sign-and-notarize.sh Strata-%s-macos-arm64.dmg%s --updater-archive --out signed" % (a.app_version, mac_extra)],
              ["the signed folder (dmg, Strata.app.tar.gz and its .sig)"], owner=True)
         n += 1
-    feed_cmd = ("python packaging/feed_tool.py build-feed --out <RELEASE> --key <FEED-KEY> --sequence %d --engine <engine-entries> "
+    feed_cmd = ("python packaging/feed_tool.py build-feed --out <RELEASE> --key <FEED-KEY> --sequence %d --engine <engine-entries> --carry-dsv41 <the last strata-feed.json> --carry-dsv41-base https://github.com/Niko1221/Strata/releases/download/<DSV41-TAG>/ "
                 "--drafters <drafter-entries> --models <models-folder> --control <control-entries>%s%s   # OWNER'S KEY; `--models` is Q4-PREP-B's change"
                 % (a.sequence, " --shapes <shape-entries>" if case == "B" else "", " --app-json latest.json" if with_app else ""))
     step("%d" % n, "Sign the feeds at sequence %d (the shared one and linux-aarch64)" % a.sequence, "owner PC, with the owner's key at that moment", 3,
