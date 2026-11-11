@@ -18,8 +18,8 @@ ACCEPTED = {"temperature", "top_p", "top_k", "min_p", "penalty_repeat", "penalty
 # (refuse_for_split, logit_bias.validate_request)
 DROPPED = {"pen_from"}
 REFUSED = {"logprobs", "allowed", "logit_bias"}
-# keys only other engines are sent: the DeepSeek engine's restore points (STRATA_DS4_RESTORE_POINTS), the prefill-only request of serve/split.py, rid for several writers
-OTHER_ENGINES = {"marks", "tail", "shared", "prefill", "rid"}
+# keys only other engines are sent: the prefill-only request of serve/split.py
+OTHER_ENGINES = {"prefill"}
 
 
 def server_keys() -> set[str]:
@@ -29,9 +29,7 @@ def server_keys() -> set[str]:
     for tup in re.findall(r'for k in \(((?:"\w+",? ?)+)\):\n\s+v = tune\.get\(k\)', text):
         keys |= set(re.findall(r'"(\w+)"', tup))
     keys |= set(re.findall(r'f" (pen_from)=', text))
-    keys |= set(re.findall(r'f" (rid)=', text))
     keys |= set(re.findall(r'" (prefill)=1', text))
-    keys |= set(re.findall(r'(marks|tail|shared)=', text.split("def restore_keys", 1)[1].split("def projection_key", 1)[0]))
     keys |= set(re.findall(r'f" (cvec)=', text))
     keys |= set(re.findall(r'"(logit_bias)="', (ROOT / "serve" / "logit_bias.py").read_text(encoding="utf-8")))
     keys |= set(re.findall(r'" (\w+)=" \+', (ROOT / "serve" / "logit_bias.py").read_text(encoding="utf-8")))
@@ -72,7 +70,7 @@ class SplitGenKeys(unittest.TestCase):
         from serve import server
 
         for exe, want in (("/x/strata-split-4-amd", True), ("/x/strata-split-2-sm86", True), ("C:/x/strata-split-2", True), ("/x/strata", False),
-                          ("/x/strata-dsv41", False)):
+                          ("/x/strata-vision", False)):
             e = object.__new__(server.StrataEngine)
             e.split_engine = __import__("os").path.basename(exe).startswith("strata-split")
             self.assertEqual(e.split_engine, want, exe)

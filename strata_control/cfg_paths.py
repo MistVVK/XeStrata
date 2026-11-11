@@ -111,6 +111,19 @@ def resolve_config(cfg: dict) -> tuple[dict, list, list]:
     return _walk(cfg, found, lost), found, [(old, "") for old, _ in lost]
 
 
+def saved_configs() -> list[Path]:
+    """The run config of every saved profile (app-1, app-2, launch-...): the files a start reads."""
+    from strata_control import profiles
+    out = []
+    try:
+        for p in profiles.list_profiles():
+            if isinstance(p.get("source_config"), str):
+                out.append(Path(p["source_config"]))
+    except Exception:                                    # noqa: BLE001 - informational
+        pass
+    return out
+
+
 def repair(configs) -> tuple[list[str], list[str]]:
     """For a START: every run config in `configs` is resolved and, when a path changed, written once (atomically, nothing else changed).
     Returns (one plain line for each file changed, one plain line for each path that exists nowhere).  Never raises."""

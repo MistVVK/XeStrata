@@ -158,7 +158,6 @@ class CatalogRules(unittest.TestCase):
         self.assertEqual(verdict("tight")[0], "tight")
         self.assertEqual(verdict("fits"), ("fits", "fits"))
         self.assertEqual(verdict("may run slower"), ("slower", "may run slower"))
-        self.assertEqual(verdict("tight: it needs about 300 GB of free disk space (the rest of the download) and this computer has 20 GB free (may run slower)")[1], "tight: needs more disk space")
 
     def test_resolve_names_and_closest(self):
         with Home():

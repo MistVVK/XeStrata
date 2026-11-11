@@ -23,7 +23,7 @@ FAMILY = "shape:" + SHAPE
 class ShapeEngines(Base):
     def setUp(self):
         super().setUp()
-        for p in (mock.patch.object(lib, "_process_uses", return_value=False), mock.patch.object(lib, "_ds_entries", return_value=[])):
+        for p in (mock.patch.object(lib, "_process_uses", return_value=False),):
             p.start()
             self.addCleanup(p.stop)
 
