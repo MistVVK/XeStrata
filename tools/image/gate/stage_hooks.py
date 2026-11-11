@@ -13,7 +13,9 @@ pinned stable-diffusion.cpp tree with stage dump / replace hooks, driven by envi
                         prompt_template_encode_start_idx (the system tokens cond drops)
   OWN5_EXIT_AFTER_TOKENS=1  exit(0) right after that dump (no model is loaded or run: the tokenizer gate)
   (with OWN5_DUMP_DIR)  also dit_x_<k>.bin / dit_t_<k>.bin: the DiT's input latent and timestep of model call k, and
-                        pe_stock_<k>.bin / pe_native_<k>.bin: the RoPE table the Qwen-Image-2.1 runner built for it
+                        pe_stock_<k>.bin / pe_native_<k>.bin: the RoPE table the Qwen-Image-2.1 runner built for it,
+                        vae_in.bin (what the VAE decoder gets: the final latent after diffusion_to_vae_latents) and
+                        vae_out.bin (the decoded float picture before tensor_to_sd_image makes it 8-bit)
 
 Without the variables the copy behaves like the original.  Usage: python3 stage_hooks.py <src tree> <dst tree>"""
 import shutil
@@ -131,7 +133,8 @@ def main():
          '            own5::tensor_hook(noise, "noise", "OWN5_NOISE_IN_UNUSED");\n')
     edit(img, "                sd::Tensor<float> image = sd->decode_first_stage(final_latents[i]);\n",
          '                own5::tensor_hook(const_cast<sd::Tensor<float>&>(final_latents[i]), "latent", "OWN5_LATENT_IN");\n'
-         "                sd::Tensor<float> image = sd->decode_first_stage(final_latents[i]);\n")
+         "                sd::Tensor<float> image = sd->decode_first_stage(final_latents[i]);\n"
+         '                if (!image.empty()) own5::dump("vae_out", image.data(), (size_t) image.numel(), image.shape());\n')
     eng = dst / "src" / "pipeline" / "diffusion_engine.cpp"
     edit(eng, '#include "core/rng.hpp"\n', '#include "core/rng.hpp"\n#include "own5_hooks.hpp"\n')
     edit(eng, "            auto output_opt = work_diffusion_model->compute(n_threads, diffusion_params);\n"
@@ -140,6 +143,10 @@ def main():
          "            auto output_opt = work_diffusion_model->compute(n_threads, diffusion_params);\n"
          "            own5::vel_hook(output_opt);\n"
          "            if (output_opt.empty()) {\n")
+    # the tensor the VAE decoder gets (the final latent after diffusion_to_vae_latents)
+    edit(eng, "    auto latents                      = first_stage_model->diffusion_to_vae_latents(x);\n",
+         "    auto latents                      = first_stage_model->diffusion_to_vae_latents(x);\n"
+         '    own5::dump("vae_in", latents.data(), (size_t) latents.numel(), latents.shape());\n')
     # the RoPE tables the DiT runners build (stock: Rope::embed_nd + finish_rope_pe; the native runner: the same calls)
     q21 = dst / "src" / "model" / "diffusion" / "qwen_image_2_1.hpp"
     edit(q21, '#include "model/diffusion/qwen_image.hpp"\n',

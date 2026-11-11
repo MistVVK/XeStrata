@@ -19,7 +19,8 @@ FILES = {
                            "                sd::Tensor<float> image = sd->decode_first_stage(final_latents[i]);\n"),
     "pipeline/diffusion_engine.cpp": ('#include "core/rng.hpp"\n'
                                       "            auto output_opt = work_diffusion_model->compute(n_threads, diffusion_params);\n"
-                                      "            if (output_opt.empty()) {\n"),
+                                      "            if (output_opt.empty()) {\n"
+                                      "    auto latents                      = first_stage_model->diffusion_to_vae_latents(x);\n"),
     "conditioning/conditioner.hpp": ('#include "core/util.h"\n'
                                      "        auto hidden_states = llm->compute(n_threads,\n"
                                      "                                          input_ids,\n"
@@ -56,6 +57,9 @@ class StageHooks(unittest.TestCase):
             eng = (dst / "src" / "pipeline" / "diffusion_engine.cpp").read_bytes().decode()
             self.assertEqual(eng.count("own5::dit_in_hook(diffusion_params.x, diffusion_params.timesteps);\n"
                                        "            auto output_opt"), 1)
+            self.assertEqual(eng.count('own5::dump("vae_in", latents.data()'), 1)
+            img = (dst / "src" / "pipeline" / "image.cpp").read_bytes().decode()
+            self.assertEqual(img.count('own5::dump("vae_out", image.data()'), 1)
             q21 = (dst / "src" / "model" / "diffusion" / "qwen_image_2_1.hpp").read_bytes().decode()
             self.assertEqual(q21.count('own5::pe_hook(pe_data, "stock");'), 1)
             nat = (dst / "src" / "model" / "diffusion" / "qwen_image_2_1_native.hpp").read_bytes().decode()
