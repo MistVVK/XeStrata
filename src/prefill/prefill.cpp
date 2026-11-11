@@ -5801,7 +5801,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         int gg_nslots = 0;   // ring slots gathered by the next flush
                         size_t cur_entry = 0;   // the streamed walk: the entry compute() is given
                         // P4-SMALL (fz_staged): the open group's expert pointers and the layer's native geometry
-                        const uint8_t* fz_blob[MMQ_GROUP] = {};
+                        // The layer's tables are built once (fused::group_bounds over every routed expert's rows, below); the experts then
+                        // launch in batches: the open batch (fz_b, local experts [fz_j0, ..)) closes at kMaxBatch experts, at MMQ_GROUP experts
+                        // from the staging ring (their slots stay held until the launch; the ring has STAGE_GRP), or at the layer's last expert.
+                        // Resident experts take no slot, so a layer whose experts all sit in the cache launches ceil(n / kMaxBatch) pairs.
+                        fused::Batch fz_b;
+                        size_t fz_j0 = 0;
                         fused::NativeGeom fz_geom{};
                         if (fz_staged) {
                             const auto& f = lay.fmt[(size_t) l];
@@ -5868,32 +5873,27 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                 : "the MMQ group buffers are not the blob's [gate | up] and down");
 #endif
                             pt.mark(kPfDequant, cs);
-                            if (fz_staged) {   // P4-SMALL: the group's experts where they are; its two products and SwiGLU at its last expert
-                                const size_t q = j % MMQ_GROUP;
-                                fz_blob[q] = blob_dev;
+                            if (fz_staged) {   // P4-SMALL: the batch's experts where they are; its two products and SwiGLU at its last expert
+                                fz_b.blob[j - fz_j0] = blob_dev;
                                 if (slot >= 0) { gg_ents[gg_nslots] = cur_entry; gg_slots[gg_nslots++] = slot; }
-                                if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
+                                if (j + 1 - fz_j0 < (size_t) fused::kMaxBatch && gg_nslots < MMQ_GROUP && j + 1 < order.size()) return true;
                                 if (gg_nslots > 0) {   // the copies land in order: the last one covers the others
                                     pt.mark(kPfWaitCopy, cs);
                                     wait_copied(gg_ents[gg_nslots - 1], (size_t) gg_slots[gg_nslots - 1]);
                                 }
-                                const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
-                                const int ngx = (int) (q + 1);
-                                const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
+                                fz_b.e0 = (int) fz_j0;
+                                fz_b.e1 = (int) (j + 1);
                                 pt.mark(kPfGemmGU, cs);
-                                fused::group_bounds(m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1), ngx, m.GU, m.cs);
-                                fused::Batch fb;
-                                fb.e0 = 0;
-                                fb.e1 = ngx;
-                                for (int i = 0; i < ngx; ++i) fb.blob[i] = fz_blob[i];
                                 fused::want_dm_f16(false);
-                                fused::experts_native(fb, fz_geom, ngx, nr, m.GU, m.Xq, m.src_dev + r0, m.H, m.Dm + r0 * N, m.cs);
-                                if (gg_nslots > 0) {   // the group's staged blobs are read: one event releases their slots
+                                // the layer's tables (group_bounds, before the walk) and rows: the batch's experts are local indices of them
+                                fused::experts_native(fz_b, fz_geom, (int) order.size(), T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
+                                if (gg_nslots > 0) {   // the batch's staged blobs are read: one event releases their slots
                                     const int rel = gg_slots[gg_nslots - 1];
                                     cudaEventRecord(m.used[rel], m.cs);
                                     for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel;
                                 }
                                 gg_nslots = 0;
+                                fz_j0 = j + 1;
                                 return true;
                             }
                             if (use_mmq) {
@@ -6123,6 +6123,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         } else if (!stream_all) {
                             size_t staged = 0;
                             size_t pending = 0;
+                            // P4-SMALL: the layer's tables from the routed experts' row bounds (absolute, uploaded above), once; every
+                            // batch of experts below reads its own experts' tiles out of them (the streamed path's fused::group, from bounds)
+                            if (fz_staged && !order.empty()) fused::group_bounds(m.bounds_dev, (int) order.size(), m.GU, m.cs);
                             const bool stream_ahead = stream_ahead_enabled();
                             const size_t lookahead = group_resident ? (size_t) (STAGE_GRP - MMQ_GROUP - 1) : STAGE - 1;
                             for (size_t j = 0; j < order.size(); ++j) {

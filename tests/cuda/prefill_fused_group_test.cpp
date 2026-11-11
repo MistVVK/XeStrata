@@ -216,6 +216,36 @@ void run_case(const Pair& p, const Case& c, mmq::Context& ctx, cudaStream_t s, u
         for (int e = b.e0; e < b.e1; ++e) b.blob[e - b.e0] = blob(e);
         fused::experts_native(b, ng, E, rows, scrB.p, xa.p, src.as<int32_t>(), haB.p, dmB.as<float>(), s);
     }
+    // (D) the staged walk's call: the layer's tables ONCE from the routed experts' absolute row bounds (group_bounds over every routed expert),
+    // then experts_native on batches of experts (local indices of those tables, the whole layer's rows as `n`), batch sizes of every kind:
+    // a full kMaxBatch, 16 (the staging ring's share), odd sizes and 1
+    std::vector<int32_t> order, abs_b;
+    {
+        std::vector<int32_t> cnt((size_t) E, 0);
+        for (int32_t e : ids) ++cnt[(size_t) e];
+        int32_t acc = 0;
+        for (int e = 0; e < E; ++e)
+            if (cnt[(size_t) e] > 0) { order.push_back(e); abs_b.push_back(acc); acc += cnt[(size_t) e]; }
+        abs_b.push_back(acc);
+    }
+    const int nord = (int) order.size();
+    Dev absD(abs_b.size() * 4), scrD(fused::group_bytes(rows, nord)), haD(fused::act_bytes(rows, FF)), dmD((size_t) rows * N * 4);
+    ck(cudaMemcpy(absD.p, abs_b.data(), abs_b.size() * 4, cudaMemcpyHostToDevice), "abs bounds");
+    ck(cudaMemsetAsync(dmD.p, 0xff, (size_t) rows * N * 4, s), "dmD nan");
+    fused::group_bounds(absD.as<int32_t>(), nord, scrD.p, s);
+    {
+        const int sizes[] = {fused::kMaxBatch, 16, 37, 1, 5, fused::kMaxBatch, 16, 16};
+        int j0 = 0, si = 0;
+        while (j0 < nord) {
+            const int j1 = std::min(nord, j0 + sizes[si++ % 8]);
+            fused::Batch b;
+            b.e0 = j0;
+            b.e1 = j1;
+            for (int j = j0; j < j1; ++j) b.blob[j - j0] = blob(order[(size_t) j]);
+            fused::experts_native(b, ng, nord, rows, scrD.p, xa.p, row_tok_dev.as<int32_t>(), haD.p, dmD.as<float>(), s);
+            j0 = j1;
+        }
+    }
     // (C) MMQ in the walk
     const size_t gub = mmq::matrix_bytes((int) p.gu, FF2, N), db = mmq::matrix_bytes((int) p.d, N, FF);
     Dev xq(mmq::q8_bytes(cap, N)), gu((size_t) cap * FF2 * 4), h((size_t) cap * FF * 4), hq(mmq::q8_bytes(cap, FF)),
@@ -244,19 +274,21 @@ void run_case(const Pair& p, const Case& c, mmq::Context& ctx, cudaStream_t s, u
         ctx.run(pd, s);
     }
     ck(cudaStreamSynchronize(s), "sync");
-    std::vector<float> a((size_t) rows * N), b((size_t) rows * N), m((size_t) rows * N);
+    std::vector<float> a((size_t) rows * N), b((size_t) rows * N), m((size_t) rows * N), dd((size_t) rows * N);
     std::vector<int32_t> sl((size_t) rows);
+    ck(cudaMemcpy(dd.data(), dmD.p, dd.size() * 4, cudaMemcpyDeviceToHost), "d");
     ck(cudaMemcpy(a.data(), dmA.p, a.size() * 4, cudaMemcpyDeviceToHost), "a");
     ck(cudaMemcpy(b.data(), dmB.p, b.size() * 4, cudaMemcpyDeviceToHost), "b");
     ck(cudaMemcpy(m.data(), dmC.p, m.size() * 4, cudaMemcpyDeviceToHost), "m");
     ck(cudaMemcpy(sl.data(), slot.p, sl.size() * 4, cudaMemcpyDeviceToHost), "slot");
-    int64_t differ = 0, nonfinite = 0;
+    int64_t differ = 0, nonfinite = 0, differ_d = 0;
     double e2a = 0, e2b = 0, r2 = 0, worst_a = 0, worst_b = 0;
     for (int64_t i = 0; i < rows; ++i) {
         const float* ya = a.data() + (size_t) w.row_of[(size_t) i] * N;
         const float* yb = b.data() + (size_t) sl[(size_t) i] * N;
         const float* ym = m.data() + (size_t) w.row_of[(size_t) i] * N;
         if (std::memcmp(ya, yb, (size_t) N * 4) != 0) ++differ;
+        if (std::memcmp(dd.data() + (size_t) w.row_of[(size_t) i] * N, yb, (size_t) N * 4) != 0) ++differ_d;
         double mea = 0, meb = 0, mr = 0;
         for (int o = 0; o < N; ++o) {
             if (!std::isfinite(ya[o])) { ++nonfinite; break; }
@@ -275,6 +307,9 @@ void run_case(const Pair& p, const Case& c, mmq::Context& ctx, cudaStream_t s, u
                 "vs MMQ in the walk: rel RMS %.3e (layer path %.3e), worst row %.3e (%.3e)\n",
                 p.name, T, E, cap, w.grps.size(), w.ents.size(), (long long) differ, (long long) rows, (long long) nonfinite, rms_a, rms_b,
                 worst_a, worst_b);
+    std::printf("%-18s   staged walk's batched call (%d experts, group_bounds once, batches of 128 / 16 / 37 / 1 / 5): %lld of %lld rows differ from the layer fused path\n",
+                p.name, nord, (long long) differ_d, (long long) rows);
+    if (differ_d) throw std::runtime_error(std::string(p.name) + ": the staged walk's batched call differs from the layer's fused path");
     if (nonfinite) throw std::runtime_error(std::string(p.name) + ": a row of the group entry is not finite (unwritten or overflowed)");
     if (differ) throw std::runtime_error(std::string(p.name) + ": the group entry's rows differ from the layer's fused path");
     if (!(rms_a < 0.1) || !(worst_a < 0.5)) throw std::runtime_error(std::string(p.name) + ": far from MMQ in the walk");
