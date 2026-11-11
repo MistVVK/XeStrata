@@ -144,7 +144,33 @@ std::string launch(const void* src, size_t rb, int64_t ne0, int64_t rows, uint16
     return e == cudaSuccess ? std::string() : std::string("te_dequant: launch: ") + cudaGetErrorString(e);
 }
 
+struct Geo { int elems, bytes; };
+bool geo(uint32_t type, Geo& g) {
+    switch (type) {
+    case TE_F32: g = {1, 4}; return true;
+    case TE_F16: g = {1, 2}; return true;
+    case TE_BF16: g = {1, 2}; return true;
+    case TE_Q8_0: g = {32, 34}; return true;
+    case TE_Q4_K: g = {256, 144}; return true;
+    case TE_Q5_K: g = {256, 176}; return true;
+    case TE_Q6_K: g = {256, 210}; return true;
+    case TE_IQ4_XS: g = {256, 136}; return true;
+    default: return false;
+    }
+}
+
 }  // namespace
+
+bool te_type_supported(uint32_t type) {
+    Geo g;
+    return geo(type, g);
+}
+
+size_t te_row_bytes(uint32_t type, int64_t ne0) {
+    Geo g;
+    if (!geo(type, g) || ne0 <= 0 || ne0 % 32 != 0 || ne0 % g.elems != 0) return 0;   // the device path decodes groups of 32
+    return (size_t) (ne0 / g.elems) * (size_t) g.bytes;
+}
 
 std::string te_dequant_f16(uint32_t type, const void* d_src, int64_t ne0, int64_t rows, uint16_t* d_dst, void* stream) {
     const size_t rb = te_row_bytes(type, ne0);

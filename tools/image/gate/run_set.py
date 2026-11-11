@@ -4,7 +4,7 @@
     python3 -I -B run_set.py <root> <backend> <tag> <W>x<H> <quant> <models_dir> <prompt-indices e.g. 0-7> <seeds e.g. 42,1234>
                              [--native] [--noise] [--threads N] [--min-free-gb N] [--steps N] [--build NAME]
                              [--dump] [--cond-from TAG] [--latent-from TAG] [--noise-from DIR] [--exit-after K]
-                             [--env K=V ...] [--extra-args "sd-cli args"]
+                             [--env K=V ...] [--extra-args "sd-cli args"] [--model-arg K=V ...]
 --noise: the config's images "noise" is "strata" (--model-args strata_noise=1); the build must have the generator.
 --build NAME uses <root>/build-NAME.json (e.g. a stage_hooks.py variant); --dump/--cond-from/--latent-from/
 --noise-from/--exit-after drive that variant's hooks (OWN5_* variables, see stage_hooks.py), per picture.
@@ -117,6 +117,13 @@ def main() -> int:
             work.mkdir()
             pf = IM.write_prompt(work, job["prompt"])
             cmd = IM.sd_cli_args(cfg, job, str(work / "img_%d.png"), str(pf)) + extra_args
+            for i, x in enumerate(a):                       # --model-arg K=V: into the one --model-args string
+                if x == "--model-arg":
+                    if "--model-args" in cmd:
+                        j = cmd.index("--model-args") + 1
+                        cmd[j] = cmd[j] + "," + a[i + 1]
+                    else:
+                        cmd += ["--model-args", a[i + 1]]
             env = dict(base_env)
             key = f"p{pi}_s{seed}"
             if "--dump" in a:                                   # stage hooks (stage_hooks.py builds only)

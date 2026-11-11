@@ -17,7 +17,9 @@ The model (read from the pinned tree):
   (LN: no affine, eps 1e-6; no linear has a bias)
 
 Modes: "f32" (weights dequantized exactly, every GEMM and the attention in float64 rounded to float32) and "f16op"
-(step 4's arithmetic: f16 weights and GEMM inputs, exact accumulation, Q / K / V and the probabilities f16).
+(f16 weights and GEMM inputs, exact accumulation, Q / K / V and the probabilities f16) and "f16acc32" (as f16op but
+every GEMM sums in float32, as the GPU does; the stage rule's comparison since 11-11, coordinator: on prompt 5 the
+exact-sum emulation moves 1.6x from inputs 3e-6 apart; the nine-case table: dit_acc32_cases.py).
 
     python -I -B dit_ref.py <dit.gguf> --dumps D [D ...] [--call 0] [--mode f32,f16op] [--out-dir O]
                             [--cmp NAME=<file with {dump}>]  e.g. --cmp stock={dump}/vel_0.bin
@@ -139,6 +141,28 @@ class Mode:
         return (xi.astype(np.float64) @ W64.T).astype(F32)
 
 
+class ModeAcc32(Mode):
+    """"f16acc32": f16 weights and GEMM inputs, FLOAT32 accumulation (numpy float32 matmul, the BLAS's summation
+    order), as cuBLAS GemmEx with compute 32F sums; everything else as "f16op"."""
+    def __init__(self):
+        super().__init__(True)
+
+    def w(self, m: np.ndarray) -> np.ndarray:
+        return f16r(m).astype(F32)
+
+    def gemm(self, x: np.ndarray, W: np.ndarray) -> np.ndarray:
+        return (f16r(x).astype(F32) @ W.astype(F32, copy=False).T).astype(F32)
+
+
+MODES = ("f32", "f16op", "f16acc32")
+
+
+def make_mode(name: str) -> Mode:
+    if name not in MODES:
+        raise SystemExit(f"dit_ref: unknown mode {name!r} (known: {', '.join(MODES)})")
+    return ModeAcc32() if name == "f16acc32" else Mode(name == "f16op")
+
+
 def attention(q, k, v, L: int, f16: bool) -> np.ndarray:
     """q k v [n, H, D] (after norms and rope); rows < L (text) causal over the text, the rest over all n."""
     n, H, D = q.shape
@@ -175,7 +199,8 @@ def prelude(Wt: DitWeights, m: Mode, t: float, cond: np.ndarray, x: np.ndarray):
     return mod, scale, np.concatenate([txt, img], 0)
 
 
-def block(Wt: DitWeights, m: Mode, i: int, xj: np.ndarray, rows: np.ndarray, mods, L: int, c, s, wcache=None):
+def block(Wt: DitWeights, m: Mode, i: int, xj: np.ndarray, rows: np.ndarray, mods, L: int, c, s, wcache=None, mx=None,
+          cap=None):
     p = f"transformer_blocks.{i}."
     C = xj.shape[1]
     H, D = C // 128, 128
@@ -188,17 +213,31 @@ def block(Wt: DitWeights, m: Mode, i: int, xj: np.ndarray, rows: np.ndarray, mod
     m0, m1, m2, m3 = (mods[:, k * C:(k + 1) * C][rows] for k in range(4))   # per token rows
     h = (layer_norm(xj) * (F32(1) + m0)).astype(F32)
     n = xj.shape[0]
-    q = rms_norm(m.gemm(h, W["attn.to_q"]).reshape(n, H, D), W["nq"])
-    k = rms_norm(m.gemm(h, W["attn.to_k"]).reshape(n, H, D), W["nk"])
+    qr, kr = m.gemm(h, W["attn.to_q"]), m.gemm(h, W["attn.to_k"])
+    q = rms_norm(qr.reshape(n, H, D), W["nq"])
+    k = rms_norm(kr.reshape(n, H, D), W["nk"])
     v = m.gemm(h, W["attn.to_v"]).reshape(n, H, D)
     q, k = apply_rope(q, c, s), apply_rope(k, c, s)
     a = attention(q, k, v, L, m.f16).reshape(n, C)
+    if mx is not None:                                   # largest |value| of every GEMM / attention input, text and image rows
+        for nm, arr in (("qkv_in", h), ("q", q), ("k", k), ("v", v), ("to_out_in", a)):
+            mx[f"txt {i} {nm}"] = float(np.abs(arr[:L]).max())
+            mx[f"img {i} {nm}"] = float(np.abs(arr[L:]).max())
     xj = (xj + (m.gemm(a, W["attn.to_out.0"]) * np.tanh(m1.astype(np.float64)).astype(F32))).astype(F32)
     h = (layer_norm(xj) * (F32(1) + m2)).astype(F32)
+    if cap is not None:                                   # one block in detail (image rows; K / V over all rows)
+        cap.update(qkv=np.concatenate([qr, kr, v.reshape(n, C)], 1)[L:], q16=q[L:], k16=k, v16=v, att=a[L:],
+                   x_mid=xj[L:].copy(), ln2=h[L:])
     gu = m.gemm(h, W["img_mlp.gate_up"])
     F = gu.shape[1] // 2
     act = (gu[:, F:] * silu(gu[:, :F])).astype(F32)
+    if mx is not None:
+        for nm, arr in (("gate_up_in", h), ("out_in", act)):
+            mx[f"txt {i} {nm}"] = float(np.abs(arr[:L]).max())
+            mx[f"img {i} {nm}"] = float(np.abs(arr[L:]).max())
     xj = (xj + (m.gemm(act, W["img_mlp.out"]) * np.tanh(m3.astype(np.float64)).astype(F32))).astype(F32)
+    if cap is not None:
+        cap.update(act=act[L:])
     return xj
 
 
@@ -206,6 +245,26 @@ def head(Wt: DitWeights, m: Mode, xj: np.ndarray, L: int, scale: np.ndarray, Hh:
     img = (layer_norm(xj[L:]) * (F32(1) + scale)).astype(F32)
     out = m.gemm(img, m.w(Wt.mat("proj_out.weight")))                     # [T, 64]
     return out.T.reshape(-1, Hh, Ww).astype(F32)
+
+
+TRACE: dict = {}
+MAXIMA: dict = {}
+STATES: dict = {}
+CAPS: dict = {}
+
+
+def trace_cmp(pat: str, d: Path, mode: str, stage: str, parts: dict, normalise: bool = False) -> None:
+    """rel L2 of our run (the trace files) against this mode's value at the same stage, kept in TRACE."""
+    tdir = Path(pat.replace("{name}", d.name))
+    for part, (ref, fname) in parts.items():
+        f = tdir / fname
+        if not f.is_file():
+            continue
+        ours = np.fromfile(f, dtype="<f4").reshape(ref.shape)
+        if normalise:
+            ours = layer_norm(ours)
+        r = compare(ours, ref)
+        TRACE.setdefault((d.name, stage, part), {})[mode] = r["rel_l2"]
 
 
 def load_dump(d: Path, name: str):
@@ -223,6 +282,8 @@ def main(argv=None) -> int:
     ap.add_argument("--out-dir")
     ap.add_argument("--cmp", action="append", default=[])
     ap.add_argument("--layers", type=int, default=0)
+    ap.add_argument("--trace-block", type=int, default=-1, help="with --trace: compare the inside of this block (image rows)")
+    ap.add_argument("--trace", help="per-stage comparison with a STRATA_DIT_TRACE_DIR dump; {name} = the dump dir name")
     a = ap.parse_args(argv)
     Wt = DitWeights(Path(a.gguf))
     modes = a.mode.split(",")
@@ -237,21 +298,41 @@ def main(argv=None) -> int:
     state = {}
     t0 = time.time()
     for mname in modes:
-        m = Mode(mname == "f16op")
+        m = make_mode(mname)
         for d, j in jobs.items():
             mods, scale, xj = prelude(Wt, m, j["t"], j["cond"], j["x"])
             L = j["cond"].shape[0]
             c, s = rope_table(layout_positions(L, j["H"], j["W"]))
             rows = np.array([1] * L + [0] * (xj.shape[0] - L))
             state[(d, mname)] = [mods, scale, xj, L, c, s, rows]
+            if a.trace:
+                trace_cmp(a.trace, d, mname, "prelude", {"mod": (mods, "mod.bin"), "scale": (scale[None, :], "scale.bin"),
+                                                         "txt_in": (xj[:L], "txtin.bin"), "img_in": (xj[L:], "imgin.bin")})
     nl = a.layers or Wt.n_layer
     for i in range(nl):
         for mname in modes:
-            m = Mode(mname == "f16op")
+            m = make_mode(mname)
             wc = {}
             for d in jobs:
                 st = state[(d, mname)]
-                st[2] = block(Wt, m, i, st[2], st[6], st[0], st[3], st[4], st[5], wc)
+                mx = MAXIMA.setdefault((d.name, mname), {}) if a.trace else None
+                cap = CAPS.setdefault((d.name, mname), {}) if (a.trace and i == a.trace_block) else None
+                st[2] = block(Wt, m, i, st[2], st[6], st[0], st[3], st[4], st[5], wc, mx, cap)
+                if a.trace:
+                    L = st[3]
+                    trace_cmp(a.trace, d, mname, f"block {i:02d}", {"txt": (st[2][:L], f"txt_{i:02d}.bin"),
+                                                                      "img": (st[2][L:], f"img_{i:02d}.bin")})
+                    # what the next step reads of the stream is LayerNorm(x): the same comparison per token-normalised
+                    trace_cmp(a.trace, d, mname, f"block {i:02d}", {"txt LN": (layer_norm(st[2][:L]), f"txt_{i:02d}.bin"),
+                                                                      "img LN": (layer_norm(st[2][L:]), f"img_{i:02d}.bin")},
+                              normalise=True)
+                    STATES[(d.name, mname, i)] = st[2].copy()
+        if a.trace and "f32" in modes and "f16op" in modes:      # the emulation against the reference, same stage
+            for d in jobs:
+                L = state[(d, "f32")][3]
+                for part, sl in (("txt", slice(0, L)), ("img", slice(L, None))):
+                    TRACE.setdefault((d.name, f"block {i:02d}", part), {})["emu_vs_f32"] = \
+                        compare(state[(d, "f16op")][2][sl], state[(d, "f32")][2][sl])["rel_l2"]
         print(f"block {i} done {time.time() - t0:.0f} s", flush=True)
     res = {}
     out = Path(a.out_dir) if a.out_dir else None
@@ -262,7 +343,9 @@ def main(argv=None) -> int:
         vel = {}
         for mname in modes:
             st = state[(d, mname)]
-            vel[mname] = head(Wt, Mode(mname == "f16op"), st[2], st[3], st[1], j["H"], j["W"])
+            vel[mname] = head(Wt, make_mode(mname), st[2], st[3], st[1], j["H"], j["W"])
+            if a.trace:
+                trace_cmp(a.trace, d, mname, "head", {"velocity": (vel[mname].reshape(64, -1).T, "out.bin")})
             if out:
                 np.save(out / f"{d.name}_{mname}.npy", vel[mname])
         if "f32" in vel and "f16op" in vel:
@@ -285,6 +368,64 @@ def main(argv=None) -> int:
               f"{max(x['rel_l2'] for x in rows):.6f} cos min {min(x['cos'] for x in rows):.8f}")
     if out:
         (out / "dit_ref.json").write_text(json.dumps(res, indent=1))
+    if a.trace:
+        for dn in sorted({k[0] for k in TRACE}):
+            print(f"TRACE {dn}: stage | part | ours vs f32 | ours vs f16op | f16op vs f32")
+            for (n, stage, part), v in TRACE.items():
+                if n == dn:
+                    f = lambda key: f"{v[key]:.6f}" if key in v else "-"   # noqa: E731
+                    print(f"TRACE {dn} | {stage} | {part} | {f('f32')} | {f('f16op')} | {f('emu_vs_f32')}")
+        # alignment check: our block-i dump against the reference after blocks i-1, i, i+1 (f32 mode, image rows)
+        for dn in sorted({k[0] for k in STATES}):
+            tdir = Path(a.trace.replace("{name}", dn))
+            for i in (0, 1, 2, 5, 15, 30):
+                f = tdir / f"img_{i:02d}.bin"
+                if not f.is_file() or (dn, "f32", i) not in STATES:
+                    continue
+                L = next(st[3] for (dd, mm), st in state.items() if dd.name == dn and mm == "f32")
+                ours = np.fromfile(f, dtype="<f4").reshape(-1, STATES[(dn, "f32", i)].shape[1])
+                cells = []
+                for j in (i - 1, i, i + 1):
+                    if (dn, "f32", j) in STATES:
+                        cells.append(f"ref after block {j}: {compare(ours, STATES[(dn, 'f32', j)][L:])['rel_l2']:.5f}")
+                print(f"ALIGN {dn} ours img after block {i}: " + "; ".join(cells))
+        for (dn, mname), cp in sorted(CAPS.items()):
+            if mname != "f32" or not cp:
+                continue
+            tdir = Path(a.trace.replace("{name}", dn))
+            emu = CAPS.get((dn, "f16op"), {})
+            n = cp["att"].shape[0]
+            Hh, D = cp["q16"].shape[1], cp["q16"].shape[2]
+            def ours(name, shape, dt="<f4"):
+                f = tdir / name
+                return np.fromfile(f, dtype=dt).astype(np.float32).reshape(shape) if f.is_file() else None
+            q16 = ours("blk_q16.bin", (Hh, n, D), "<f2")
+            kvt = cp["k16"].shape[0]
+            got = {"qkv": ours("blk_qkv.bin", (n, -1)), "q16": None if q16 is None else q16.transpose(1, 0, 2),
+                   "k16": ours("blk_k16.bin", (Hh, kvt, D), "<f2"), "v16": ours("blk_v16.bin", (Hh, kvt, D), "<f2"),
+                   "att": ours("blk_att.bin", (n, -1)), "x_mid": ours("blk_x_mid.bin", (n, -1)), "ln2": ours("blk_ln2.bin", (n, -1)),
+                   "act": ours("blk_act.bin", (n, -1))}
+            for key in ("k16", "v16"):
+                if got[key] is not None:
+                    got[key] = got[key].transpose(1, 0, 2)
+            print(f"BLOCK {a.trace_block} {dn} | stage | ours vs f32 | ours vs f16op | f16op vs f32")
+            for key in ("qkv", "q16", "k16", "v16", "att", "x_mid", "ln2", "act"):
+                g = got[key]
+                if g is None:
+                    continue
+                r = cp[key].reshape(g.shape[0], -1)
+                gg = g.reshape(g.shape[0], -1)
+                e = emu[key].reshape(g.shape[0], -1) if key in emu else None
+                f = lambda x, y: "%.6f" % compare(x, y)["rel_l2"]   # noqa: E731
+                ge = f(gg, e) if e is not None else "-"
+                er = f(e, r) if e is not None else "-"
+                print(f"BLOCK {a.trace_block} {dn} | {key} | {f(gg, r)} | {ge} | {er}")
+        for (dn, mname), mx in MAXIMA.items():
+            if mname == "f32":
+                print(f"MAXIMA {dn} f32 " + json.dumps({k: round(x, 4) for k, x in mx.items()}))
+        if out:
+            (out / "trace.json").write_text(json.dumps({"trace": {" | ".join(k): v for k, v in TRACE.items()},
+                                                        "maxima": {" | ".join(k): v for k, v in MAXIMA.items()}}))
     return 0
 
 
