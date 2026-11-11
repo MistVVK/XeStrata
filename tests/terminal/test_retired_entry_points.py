@@ -169,7 +169,7 @@ class Setup(unittest.TestCase):
                 self.assertIsNone(setup.previous_config([Path(d)], {"installs": []}))     # never set up "like" the DeepSeek model
             self.assertEqual(sha(path), before)
             self.assertEqual(retired.left_as_is(retired.title(None, path)),
-                             "[DRAFT] DeepSeek-V4.1-Flash ISTA-DAS 2.00 bpw: a DeepSeek model, left as it is (this version of Strata no longer "
+                             "DeepSeek-V4.1-Flash ISTA-DAS 2.00 bpw: a DeepSeek model, left as it is (this version of Strata no longer "
                              "runs DeepSeek models).")
 
 

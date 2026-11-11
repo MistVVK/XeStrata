@@ -29,28 +29,28 @@ _FILE = re.compile(r"^(?:dspark-)?DeepSeek-V4[._]?1-Flash[-_].*\.gguf$", re.I)
 _DIR_ENTRIES = 200            # entries looked at in one folder: a bounded look, never a walk
 _GGUF_HEAD = 1 << 20          # bytes of a GGUF read to find general.architecture
 
-DRAFT = "[DRAFT] "            # the sentences marked with it wait for the owner's words (par/OWNER-WORDING-1111.md)
 
-#: D1: a start of a saved DeepSeek model (the app, `strata start`, a saved launch); approved by the owner 11-11 (par/OWNER-WORDING-1111.md)
+# Every sentence below is the owner's approved wording of 11-11 (par/OWNER-WORDING-1111.md): change none without him.
+#: D1: a start of a saved DeepSeek model (the app, `strata start`, a saved launch)
 REFUSED = "{name} is a DeepSeek model. This version of Strata no longer runs DeepSeek models, so it was not started."
 FILES_STAY = "Its files are still on this computer: {size} in {folder}. Nothing was changed or deleted."
 NEXT = ("Choose a Qwen model to run instead. If you no longer need the DeepSeek files, you can delete that folder "
-                "to free the space.")
+        "to free the space.")
 #: D2: the model list's line for a DeepSeek row
-ROW = DRAFT + "DeepSeek - no longer supported."
-ROW_FILES = DRAFT + "DeepSeek - no longer supported. {size} in {folder}."
+ROW = "DeepSeek - no longer supported."
+ROW_FILES = "DeepSeek - no longer supported. {size} in {folder}."
 #: D3: DeepSeek asked for by name (`strata launch --model`, `--family deepseek41`, setup, a DeepSeek-only flag)
-NOT_OFFERED = DRAFT + "Strata no longer offers DeepSeek models. Run `strata launch` to choose one of the Qwen models."
+NOT_OFFERED = "Strata no longer offers DeepSeek models. Run `strata launch` to choose one of the Qwen models."
 #: D4: the person's own DeepSeek files (`strata launch --model-path`, the own-files screen, `strata models import`)
-OWN_FILES = DRAFT + ("These are DeepSeek model files ({size} in {folder}). This version of Strata no longer runs DeepSeek models; "
-                     "nothing in the folder was changed. Choose a Qwen model instead.")
-OWN_FILES_NOSIZE = DRAFT + ("These are DeepSeek model files (in {folder}). This version of Strata no longer runs DeepSeek models; "
-                            "nothing in the folder was changed. Choose a Qwen model instead.")
+OWN_FILES = ("These are DeepSeek model files ({size} in {folder}). This version of Strata no longer runs DeepSeek models; "
+             "nothing in the folder was changed. Choose a Qwen model instead.")
+OWN_FILES_NOSIZE = ("These are DeepSeek model files (in {folder}). This version of Strata no longer runs DeepSeek models; "
+                    "nothing in the folder was changed. Choose a Qwen model instead.")
 #: D5: the server started directly with a DeepSeek config or tokenizer
-SERVER = DRAFT + ("[strata] this config runs a DeepSeek model ({why}). This version of Strata no longer runs DeepSeek models, so the "
-                  "server stops here. The model files were not changed.")
+SERVER = ("[strata] this config runs a DeepSeek model ({why}). This version of Strata no longer runs DeepSeek models, so the "
+          "server stops here. The model files were not changed.")
 #: D6: setup's update and its list of installed models
-LEFT_AS_IS = DRAFT + "{name}: a DeepSeek model, left as it is (this version of Strata no longer runs DeepSeek models)."
+LEFT_AS_IS = "{name}: a DeepSeek model, left as it is (this version of Strata no longer runs DeepSeek models)."
 
 WHY = {"arch": "arch deepseek41", "engine": "engine strata-dsv41", "tokenizer": "DeepSeek tokenizer", "gguf": "DeepSeek model file",
        "name": "DeepSeek model name"}
