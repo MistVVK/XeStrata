@@ -2637,6 +2637,43 @@ bool FileExpertSource::drop_mapping(std::string& why) {
 #endif
 }
 
+uint64_t FileExpertSource::drop_cached_pages(const std::function<bool(int64_t, int64_t)>& keep) {
+#if defined(__linux__)
+    if (unmapped_) return 0;
+    const uint64_t page = (uint64_t) sysconf(_SC_PAGESIZE);
+    uint64_t released = 0;
+    // the whole pages of [p, p + n): a page that also holds a neighbouring blob stays (that neighbour may be kept)
+    auto drop = [&](const uint8_t* p, uint64_t n, int fd, uint64_t off) {
+        const uint64_t a = ((uint64_t) (uintptr_t) p + page - 1) & ~(page - 1);
+        const uint64_t b = ((uint64_t) (uintptr_t) p + n) & ~(page - 1);
+        if (p == nullptr || b <= a) return;
+        if (madvise((void*) (uintptr_t) a, (size_t) (b - a), MADV_DONTNEED) != 0) return;
+        if (fd >= 0) (void) posix_fadvise(fd, (off_t) (off + (a - (uint64_t) (uintptr_t) p)), (off_t) (b - a), POSIX_FADV_DONTNEED);
+        released += b - a;
+    };
+    for (int64_t l = 0; l < n_layers_; ++l)
+        for (int64_t e = 0; e < n_expert_; ++e) {
+            if (keep && keep(l, e)) continue;
+            if (!role_ptr_.empty()) {
+                for (int r = 0; r < 3; ++r) {
+                    const size_t i = (size_t) (3 * l + r);
+                    const uint64_t per = role_bytes_[i];
+                    const uint8_t* p = role_ptr_[i] + (size_t) ((uint64_t) e * per);
+                    const size_t f = (size_t) role_file_[i];
+                    if (f >= maps_.size() || maps_[f].closed) continue;
+                    drop(p, per, maps_[f].fd, (uint64_t) (p - maps_[f].base));
+                }
+            } else if (const uint8_t* b = mapped_blob(l, e)) {
+                drop(b, layer_blob_bytes_[(size_t) l], fd_, (uint64_t) (b - base_));
+            }
+        }
+    return released;
+#else
+    (void) keep;
+    return 0;
+#endif
+}
+
 bool FileExpertSource::begin_startup_unbuffered(std::string& why) {
 #if defined(_WIN32)
     if (const char* v = std::getenv("STRATA_STARTUP_UNBUFFERED"); v != nullptr && v[0] != '\0' && std::atoi(v) == 0) {

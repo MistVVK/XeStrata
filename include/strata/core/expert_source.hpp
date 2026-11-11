@@ -913,6 +913,16 @@ public:
     /// 32 measured 2.35 GB/s with experts.bin mapped and 3.57 GB/s without.  After this every file read goes through
     /// read_direct (mapped_blob answers nullptr).  Returns whether the view was closed; `why` says why not.
     bool drop_mapping(std::string& why);
+    /// A GPU that shares the system RAM (cudaDevAttrIntegrated: the DGX Spark's GB10) and holds every expert in its cache
+    /// reads nothing from the files again, and the pages the start read from them are a second copy of the cache's bytes.
+    /// CUDA counts only the RAM the kernel has free (MemFree, not the page cache it could reclaim), so with those pages
+    /// kept a second CUDA program (the picture reader) found no room.  Gives them back, expert by expert:
+    /// madvise(MADV_DONTNEED) on the blob's pages in this source's mappings, then posix_fadvise(DONTNEED) on the same
+    /// file range (clean pages, no root needed; only whole pages inside the blob, a page shared with a neighbour stays).
+    /// `keep(layer, expert)` true keeps that expert's pages (the experts of the slots the prompt path borrows: their
+    /// refill reads them again).  The mappings stay; a later read faults the bytes in from the file.  Returns the bytes
+    /// released (0: nothing, or not Linux).
+    uint64_t drop_cached_pages(const std::function<bool(int64_t, int64_t)>& keep);
     /// Windows, experts.bin, a file tier that reads through the file cache (--resident-experts): the startup reads -
     /// the GPU cache's fill from the profile and the RAM copy (pin_cache_complement) - go unbuffered (read_direct)
     /// with the view closed meanwhile.  Through the mapping they put the file's pages in the working set beside the

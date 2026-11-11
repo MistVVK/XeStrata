@@ -11232,6 +11232,36 @@ int main(int argc, char** argv) {
         } else {
             std::fprintf(stderr, "strata serve: the prompt path allocates its own buffers (too few cache slots to borrow)\n");
         }
+        // A GPU that shares the system RAM (cudaDevAttrIntegrated: the DGX Spark's GB10) with every expert in its cache: the
+        // pages the start read from the GGUF are a second copy of the cache's bytes, and CUDA there counts only the RAM the
+        // kernel has free (cudaMemGetInfo equals MemFree, not MemAvailable), so the picture reader's CUDA start found
+        // ~1 GiB and fell back to the CPU (91 s for a 2048x1536 picture against about 0.5 s on the card).  The engine gives
+        // those pages back; the experts of the slots the prompt path borrows keep theirs (their refill reads them).  The
+        // cache holds the same bytes either way, so no output bit changes.  STRATA_UMA_DROP_PAGES=0 keeps the pages.
+        if (srcp == &src && gpu_holds_all && !multi_gpu && stages.empty() && [] {
+                const char* v = std::getenv("STRATA_UMA_DROP_PAGES");
+                return v == nullptr || v[0] != '0';
+            }()) {
+            int dev = 0, integ = 0;
+            if (cudaGetDevice(&dev) == cudaSuccess && cudaDeviceGetAttribute(&integ, cudaDevAttrIntegrated, dev) == cudaSuccess && integ) {
+                size_t f0 = 0, f1 = 0, tb = 0;
+                (void) cudaMemGetInfo(&f0, &tb);
+                const int32_t keep_from = borrow != nullptr && lend_first >= 0 ? lend_first : INT32_MAX;
+                const auto t0 = Clock::now();
+                const uint64_t freed = src.drop_cached_pages([&](int64_t l, int64_t e) {
+                    const int32_t sl = xcache.slot_of(l, e);
+                    return sl != strata::core::kNotResident && sl >= keep_from;
+                });
+                (void) cudaMemGetInfo(&f1, &tb);
+                std::fprintf(stderr, "strata serve: this GPU shares the system RAM and holds every expert: the model file's cached "
+                                     "pages of %.2f GiB of experts are given back (%.1f ms; the experts the prompt path borrows "
+                                     "keep theirs); free on the GPU %.2f -> %.2f GiB (STRATA_UMA_DROP_PAGES=0 keeps them)\n",
+                             (double) freed / 1073741824.0, std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
+                             (double) f0 / 1073741824.0, (double) f1 / 1073741824.0);
+            } else {
+                (void) cudaGetLastError();
+            }
+        }
         rss_probe("the prompt path set up");
         // layer split across GPUs: a prompt path per stage, each handing its chunk's rows to the next.
         // THE CHUNK STEPS DOWN INSTEAD OF EXITING.  A split's stage caches are sized after the arena is registered, and
