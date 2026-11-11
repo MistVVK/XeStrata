@@ -103,6 +103,17 @@ macro(strata_hip_mmq)
     add_test(NAME hip_prefill_fused_iq_f16 COMMAND hip_prefill_fused_iq)
     set_tests_properties(hip_prefill_fused_iq_f16 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 ENVIRONMENT "STRATA_PF_F16=1;STRATA_PF_F16_KQ=1")
     list(APPEND _strata_hip_tests hip_prefill_fused_iq)
+    # the fused prompt kernels' weight decode against the digests CUDA wrote (tests/cuda/prefill_decode_golden.cu): the same file on every vendor
+    # (moe_fused_iq.cu's decode compiled as strata_mmq compiles it: its include directories, definitions and options; exit 77 without a card)
+    set_source_files_properties(tests/cuda/prefill_decode_golden.cu PROPERTIES LANGUAGE HIP INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
+    add_executable(hip_prefill_decode_golden tests/cuda/prefill_decode_golden.cu)
+    target_include_directories(hip_prefill_decode_golden PRIVATE $<TARGET_PROPERTY:strata_mmq,INCLUDE_DIRECTORIES>)
+    target_compile_definitions(hip_prefill_decode_golden PRIVATE $<TARGET_PROPERTY:strata_mmq,COMPILE_DEFINITIONS>)
+    target_compile_options(hip_prefill_decode_golden PRIVATE $<TARGET_PROPERTY:strata_mmq,COMPILE_OPTIONS>)
+    target_link_libraries(hip_prefill_decode_golden PRIVATE ggml-base strata_hip_runtime)
+    add_test(NAME hip_prefill_decode_golden COMMAND hip_prefill_decode_golden ${CMAKE_CURRENT_SOURCE_DIR}/tests/cuda/prefill_decode_golden.txt)
+    set_tests_properties(hip_prefill_decode_golden PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+    list(APPEND _strata_hip_tests hip_prefill_decode_golden)
 
     # Numerical diagnostic: synthetic layouts by default, optional first-expert IQ3_XXS/IQ4_NL check with a pack.
     add_executable(hip_prefill_mmq_parity tests/hip/prefill_mmq_parity.cpp)
