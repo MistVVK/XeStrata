@@ -272,6 +272,34 @@ class Fallback(unittest.TestCase):
         self.assertEqual(len(started), 1)
         self.assertEqual(log, "")
 
+    def test_the_ready_line_names_the_reader_and_older_readers_still_start(self):
+        """strata-vision says which reader runs ("READY <n> own" / "READY <n> mtmd"); an older one says "READY <n>" and starts as before."""
+        cpu = {"exe": "/e/strata-vision", "gpu": False, "mmproj": "/m/mm.gguf", "model": "/m/t.gguf"}
+        for line, reader in (("READY 2560 own\n", "own"), ("READY 2560 mtmd\n", "mtmd"), ("READY 2048\n", None)):
+            v, started, log, err = self.run_start({"strata-vision": line}, cpu)
+            self.assertIsNone(err, line)
+            self.assertEqual(v.reader, reader, line)
+            self.assertEqual(log, "", line)                              # nothing said when the chosen reader started
+
+    def test_a_fallback_to_llama_cpps_reader_is_said_once(self):
+        cpu = {"exe": "/e/strata-vision", "gpu": False, "mmproj": "/m/mm.gguf", "model": "/m/t.gguf"}
+        v, started, log, err = self.run_start({"strata-vision": "READY 2560 mtmd fallback\n"}, cpu)
+        self.assertIsNone(err)
+        self.assertEqual((v.reader, len(started)), ("mtmd", 1))           # the same process: no second start
+        self.assertEqual(log.count("[strata] Strata's picture reader did not start; pictures are read with llama.cpp's reader."), 1)
+
+    def test_the_reader_choice_reaches_the_reader_through_the_run_configs_env(self):
+        """The settings write STRATA_VISION_TOWER=mtmd into the model's run config "env" (strata_control/speed_switches.py picture_reader); the server
+        hands that env to the picture reader as to the engine, so no reader argument changes (an older reader ignores the variable)."""
+        cfg = {"env": {"STRATA_VISION_TOWER": "mtmd"}, "vision": {"exe": "/e/strata-vision", "mmproj": "/m/mm.gguf", "model": "/m/t.gguf"}}
+        env = server.vision_env(cfg, server.child_env(cfg))
+        self.assertEqual(env.get("STRATA_VISION_TOWER"), "mtmd")
+        self.assertNotIn("--tower", server.Vision.reader_args(cfg["vision"]))
+        with mock.patch.dict("os.environ", {}, clear=False):
+            import os
+            os.environ.pop("STRATA_VISION_TOWER", None)
+            self.assertNotIn("STRATA_VISION_TOWER", server.vision_env({}, server.child_env({})))   # a default file carries nothing
+
     def test_cpu_config_is_unchanged(self):
         cfg = {"exe": "/e/strata-vision", "gpu": False, "mmproj": "/m/mm.gguf", "model": "/m/t.gguf"}
         v, started, log, err = self.run_start({"strata-vision": "READY 2048\n"}, cfg)
