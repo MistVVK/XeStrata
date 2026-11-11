@@ -611,7 +611,8 @@ struct VitGpuImpl {
     // phaseA-tests\par\RESULTS-COVER.md); mtmd's reader asks for the 16-bit result there.  STRATA_VIT_HPA16_ATT=1: the same for the attention's P*V product
     // (F16 -> F16, float32 accumulation; the score product S is F16 -> F16 already).  The result is the float32 sum rounded once to 16 bits.
     bool hpa16 = false, hpa16_att = false;
-    // STRATA_VIT_FA=1 (off by default): the fused attention k_attn_fa_gfx11 on gfx11 cards (wave32).  A launch takes at most fa_units query x key x head
+    // [DRAFT, status: research] STRATA_VIT_FA (on by default on gfx1151 only, see VitGpu::load; =1 asks for it on another gfx11 card, =0 turns it off): the fused attention
+    // k_attn_fa_gfx11 on gfx11 cards (wave32).  A launch takes at most fa_units query x key x head
     // triples (STRATA_VIT_FA_UNITS overrides): 2^29, measured on the 780M with the first version at about 1.4 TFLOP/s as about 110 ms, so far
     // from the Windows GPU timeout of 2 s on any gfx11 card, also at the 16,384-token limit (65,232 patches: about 130 launches a layer).  With STRATA_VIT_PROF the longest launch of an encode is printed.
     bool fa = false;
@@ -839,6 +840,9 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
     if (!vit_geometry_supported(g, why)) { err = "this tower is not supported: " + why; return false; }
     m.g = g;
     m.device = device;
+#if defined(STRATA_VIT_HIP)
+    bool fa_default = false;      // the fused attention is the default on gfx1151 (below); STRATA_VIT_FA overrides it either way
+#endif
 #if !defined(STRATA_VIT_HIP)
     bool pascal = false;
     {   // Pascal (compute capability 6.x): BF16 matrices as F16 (and the larger score chunk below)
@@ -851,8 +855,15 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
         // HH_HPA kernels (F16 results, 10-bit mantissa).  Strix, 18 pictures at 1,024 tokens: Qwen3.8 0.54-0.83 of mtmd-HIP's time (median 0.66), Qwen3.6
         // 0.57-0.91 (median 0.67), rule 1 and 2 pass on both, byte-identical in and across processes; the BF16 results of BB_HPA missed rule 1 on 3 of the
         // Qwen3.8 pictures and rule 2 on 3 (RESULTS-OWN-3V.md PART F2/F3).  STRATA_VIT_HPA16, STRATA_VIT_HPA16_ATT and STRATA_VIT_BF16_AS_F16 = 0 turn each off.
+        // The fused attention k_attn_fa_gfx11 is on by default there too (Strix, RESULTS-OWN-3V.md PART F8): attention 0.50 of the default's time on the 1,024-token
+        // picture, the whole picture 0.84-0.90, rule 1 and 2 on 18 of 18 pictures on both models, byte-identical in and across processes, longest launch 6 ms
+        // (17 ms at 65,536 patches, which read 0.999693 against mtmd-CPU).  STRATA_VIT_FA=0 turns it off.  gfx1151 only: gfx1103 and the other gfx11 cards keep it off
+        // until they have their own gate.
         hipDeviceProp_t p;
-        if (hipGetDeviceProperties(&p, device) == hipSuccess && vit_gpu_is_gfx1151(p.gcnArchName)) m.bf16_as_f16 = m.hpa16 = m.hpa16_att = true;
+        if (hipGetDeviceProperties(&p, device) == hipSuccess && vit_gpu_is_gfx1151(p.gcnArchName)) {
+            m.bf16_as_f16 = m.hpa16 = m.hpa16_att = true;
+            fa_default = p.warpSize == 32 && g.head_dim <= 96 && g.head_dim % 8 == 0;
+        }
         (void) hipGetLastError();
     }
 #endif
@@ -868,7 +879,9 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
     if (m.hpa16 || m.hpa16_att)
         std::fprintf(stderr, "vit-hpa16: 16-bit results with float32 accumulation for %s%s%s\n", m.hpa16 ? "the weight products" : "",
                      m.hpa16 && m.hpa16_att ? " and " : "", m.hpa16_att ? "the attention's P*V product" : "");
-    if (const char* e = std::getenv("STRATA_VIT_FA"); e && std::atoi(e) != 0) {
+    bool want_fa = fa_default;
+    if (const char* e = std::getenv("STRATA_VIT_FA")) want_fa = std::atoi(e) != 0;
+    if (want_fa) {
         hipDeviceProp_t p;
         if (hipGetDeviceProperties(&p, device) == hipSuccess && std::string(p.gcnArchName).rfind("gfx11", 0) == 0 && p.warpSize == 32 && g.head_dim <= 96 && g.head_dim % 8 == 0)
             m.fa = true;
