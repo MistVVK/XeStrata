@@ -40,11 +40,9 @@
 #define GGML_COMMON_DECL_CUDA
 #define GGML_COMMON_IMPL_CUDA
 #include "ggml-common.h"
-#if !defined(__HIPCC__)
-// (CUDA, STRATA_PF_FUSED_TQ=1) the trellis types' int8 codebook, the same table the decode kernels and the trellis MMQ tiles read
-// (tq.cuh's tq_lane_to_q8): the fused kernels take MMQ's int8 weight values exactly
+// (STRATA_PF_FUSED_TQ=1: CUDA sm_80+, HIP gfx12) the trellis types' int8 codebook, the same table the decode kernels and the trellis MMQ tiles
+// read (tq.cuh's tq_lane_to_q8): the fused kernels take MMQ's int8 weight values exactly
 #include "../kernels/cuda/tq_lut_i8.cuh"
-#endif
 
 #include <algorithm>
 #include <cstdio>
@@ -173,8 +171,7 @@ __global__ void quant_act_nat_kernel(const float* __restrict__ x, int64_t nblk, 
     if (lane == 0) *(float4*) (out + 64) = make_float4(a0 / 127.0f, a1 / 127.0f, (float) s0, (float) s1);
 }
 
-#if !defined(__HIPCC__)
-// (CUDA, STRATA_PF_FUSED_TQ=1) the block-Hadamard rotation of a Hadamard-folded expert's input (include/strata/kernels/cpu/hadamard.hpp):
+// (STRATA_PF_FUSED_TQ=1: CUDA sm_80+, HIP gfx12, wave32) the block-Hadamard rotation of a Hadamard-folded expert's input (include/strata/kernels/cpu/hadamard.hpp):
 // y = H_128 (s * x) / sqrt(128) per block of 128 values, H the Sylvester-Walsh-Hadamard matrix.  One warp a block: lane l holds values
 // 32 k + l (k = 0..3); the in-place fast transform's butterflies over strides 1-16 by shuffles, 32 and 64 between the registers.
 __device__ __forceinline__ void fwht128_warp(float (&v)[4], int lane) {
@@ -236,7 +233,6 @@ __global__ void rot_quant_h_kernel(const float* __restrict__ hf, const int32_t* 
         if (lane == 0) { *(float*) (o + 64 + 4 * hh) = am / 127.0f; *(float*) (o + 72 + 4 * hh) = (float) cs; }
     }
 }
-#endif
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void cp16(void* dst, const void* src) {
@@ -461,24 +457,22 @@ template <int T, int NW> __device__ __forceinline__ void load_unit(const uint8_t
         for (int k = 0; k < 8; ++k) w[8 + k] = ld32(bp + 128 + 32 * n + 4 * k);
         w[16] = ld16(bp + 208) | (ld16(bp + 192 + 8 * n + 2 * r) << 16);
         w[17] = (uint32_t) r;
-#if !defined(__HIPCC__)
     } else if constexpr (T == T_TQ2_T) {
-        // (CUDA, STRATA_PF_FUSED_TQ=1) sub-block ib = steps 8 ib .. 8 ib + 7 of the block {fp16 d; qs[32]}: step t's state is
+        // (STRATA_PF_FUSED_TQ=1) sub-block ib = steps 8 ib .. 8 ib + 7 of the block {fp16 d; qs[32]}: step t's state is
         // qs[(t + 31) % 32] << 8 | qs[t] (tq.cuh tq_states4), so the 8 bytes qs[8 ib ..] and the byte before them (circular)
         w[0] = ld32(bp + 2 + 8 * ib); w[1] = ld32(bp + 6 + 8 * ib); w[2] = bp[2 + ((8 * ib + 31) & 31)]; w[3] = ld16(bp);
     } else if constexpr (T == T_TQK6 || T == T_TQK7) {
-        // (CUDA, STRATA_PF_FUSED_TQ=1) {fp16 d; qs[4 K]}, qs a circular stream of 32 K bits (2 K u16 words, LSB first); step t's state is the 16
+        // (STRATA_PF_FUSED_TQ=1) {fp16 d; qs[4 K]}, qs a circular stream of 32 K bits (2 K u16 words, LSB first); step t's state is the 16
         // bits from stream bit (31 - t) K (tq.cuh tq_states4).  Steps 8 ib .. 8 ib + 7 lie in the 8 K + 15 bits from bit (24 - 8 ib) K: six u16
         // words from word (24 - 8 ib) K / 16, wrapped modulo 2 K, into w[0..2]; w[3] = d, w[4] = the start bit inside the first word
-        constexpr int K = tq_k(T), NW = 2 * K;
+        constexpr int K = tq_k(T), NWD = 2 * K;   // (the u16 words of qs; NWD: NW is the template parameter)
         const int s0 = (24 - 8 * ib) * K, wb = s0 >> 4;
         uint32_t h[6];
 #pragma unroll
-        for (int k = 0; k < 6; ++k) h[k] = ld16(bp + 2 + 2 * ((wb + k) % NW));
+        for (int k = 0; k < 6; ++k) h[k] = ld16(bp + 2 + 2 * ((wb + k) % NWD));
         w[0] = h[0] | (h[1] << 16); w[1] = h[2] | (h[3] << 16); w[2] = h[4] | (h[5] << 16);
         w[3] = ld16(bp);
         w[4] = (uint32_t) (s0 & 15);
-#endif
     } else {   // Q2_0
         w[0] = ld32(bp + 2 + 8 * ib); w[1] = ld32(bp + 6 + 8 * ib); w[2] = ld16(bp);
     }
@@ -588,9 +582,8 @@ __device__ __forceinline__ void convert(const uint32_t (&w)[NW], const uint8_t* 
         const float d = half_at(w[16]);
         s0 = d * (float) (int8_t) (w[16] >> 16);
         s1 = d * (float) (int8_t) (w[16] >> 24);
-#if !defined(__HIPCC__)
     } else if constexpr (is_tq(T)) {
-        // (CUDA, STRATA_PF_FUSED_TQ=1) the 8 steps' 15-bit states, each x = s * 0x9e3779b1 -> codebook points x >> 21 and (x >> 10) & 2047, two
+        // (STRATA_PF_FUSED_TQ=1) the 8 steps' 15-bit states, each x = s * 0x9e3779b1 -> codebook points x >> 21 and (x >> 10) & 2047, two
         // int8 each (tq_lut_i8 in shared memory): 4 weights a step, in weight order, as tq.cuh's tq_lane_to_q8 packs them for MMQ; one scale
         // d * TQ_LUT_I8_SCALE for the block
         const uint16_t* lut = (const uint16_t*) grid;
@@ -619,7 +612,6 @@ __device__ __forceinline__ void convert(const uint32_t (&w)[NW], const uint8_t* 
             q[j] = (uint32_t) lut[x >> 21] | ((uint32_t) lut[(x >> 10) & 2047u] << 16);
         }
         s0 = s1 = half_at(w[3]) * TQ_LUT_I8_SCALE;
-#endif
     } else if constexpr (T == T_IQ2_XXS) {
         const uint2* g = (const uint2*) grid;
 #pragma unroll
@@ -714,13 +706,11 @@ template <int T> __device__ __forceinline__ const void* grid_src() {
     else if constexpr (T == T_IQ2_S) return iq2s_grid;
     else if constexpr (T == T_IQ3_XXS) return iq3xxs_grid;
     else if constexpr (T == T_IQ3_S) return iq3s_grid;
-#if !defined(__HIPCC__)
-    else if constexpr (is_tq(T)) return tq_lut_i8;   // (CUDA, STRATA_PF_FUSED_TQ=1)
-#endif
+    else if constexpr (is_tq(T)) return tq_lut_i8;   // (STRATA_PF_FUSED_TQ=1)
     else return nullptr;
 }
 #endif
-
+#if !defined(STRATA_FUSED_DECODE_ONLY)   // (tests/cuda/prefill_decode_golden.cu: the decode above only)
 // One work item = (TR routed rows of expert e - one or two of group()'s 64-row tiles -, a block of WR weight rows);
 // a persistent grid walks the batch's items.  GU: gate/up rows of WR / 2 features (format WT) against the rows'
 // tokens' activations, SwiGLU, H to int8 per 32 features into `out`.  !GU: down rows (format WT) against H, FP32 into
@@ -1645,11 +1635,13 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
         const int rbase = fb * NW_ROWS;
         const uint8_t* wrow = GU ? blob + ((ur & 1) ? geo.up_off : 0) + (size_t) (fb * (NW_ROWS / 2) + (ur >> 1)) * geo.gu_row
                                  : blob + geo.down_off + (size_t) (rbase + ur) * geo.d_row;
+        constexpr bool B128 = is_tq(WT);   // (STRATA_PF_FUSED_TQ=1, gfx12) 128-value blocks, gate/up and down: a block per two stages, sub-blocks 0-3
         auto unit = [&](int s) -> const uint8_t* {
+            if constexpr (B128) return wrow + (s >> 1) * BS;
             if (GU && WT != T_Q2_0) return wrow + (s >> 2) * BS;   // (Q2_0 gate/up: 64-value blocks, one a stage, like its down)
             return (WT == T_IQ4_NL || WT == T_Q5_0 || WT == T_Q5_1 || WT == T_Q8_0) ? wrow + (2 * s + uj) * BS : wrow + s * BS;
         };
-        auto sub = [&](int s) { return GU && WT != T_Q2_0 ? 2 * (s & 3) + uj : uj; };
+        auto sub = [&](int s) { return B128 ? 2 * (s & 1) + uj : GU && WT != T_Q2_0 ? 2 * (s & 3) + uj : uj; };
         auto put = [&](const uint32_t (&raw)[raw_words(WT)], int buf) {
             uint32_t q[8];
             float s0, s1;
@@ -1796,6 +1788,22 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
                     }
             }
             __syncthreads();
+            if constexpr (is_tq(WT)) {
+                // (STRATA_PF_FUSED_TQ=1, gfx12, a Hadamard-folded down: set_down_rotation) H as FP32, n_ff values at the start of the row's own
+                // down-output row in `dm` (n_embd floats a row; the down product rewrites it only after rot_quant_h_kernel has read it), as
+                // CUDA's native_kernel does (the dm-row invariant: RESULTS-OWN-4X section 8): rotated and quantized there before the down product
+                if (dm != nullptr) {
+                    if (tid < 2 * kTileRows) {
+                        const int r = tid >> 1, hh = tid & 1;
+                        if (r < nrows) {
+                            float* o = dm + (size_t) (row0 + r) * kMoeEmbd + (NW_ROWS / 2) * fb + 32 * hh;
+#pragma unroll 8
+                            for (int j = 0; j < 32; ++j) o[j] = hs[r][32 * hh + j];
+                        }
+                    }
+                    continue;   // (the next work item: its first barrier orders these reads of hs before the buffers are reused)
+                }
+            }
             // H block fb (features 64 fb ..) to int8 per 32, natural order: a thread per (tile row, half)
             if (tid < 2 * kTileRows) {
                 const int r = tid >> 1, hh = tid & 1;
@@ -2121,6 +2129,10 @@ static int occ_blocks(bool w12, int type, bool gu) {
     if (env > 0) return env;
     // gfx11 too (gfx1151, IQ2_S gate/up: 235 VGPRs and 37,120 B of LDS leave room for 3 blocks of 8 waves per WGP; a grid of 4 per WGP
     // ran a second, lopsided wave: 16K tokens, one layer, IQ2_S / IQ4_NL 81.7 -> 76.5 ms)
+    // The K-quant kernels (Q4_K / Q5_K gate/up, Q5_1 down) reach this launch only with the trial switch STRATA_PF_KQ_OCC=1 (experts_native):
+    // 3 blocks per WGP, measured on gfx1201 (R9700, hip_prefill_fused_iq, one layer, 8,192 tokens x top 10 over 512 experts): Q4_K / Q5_1 16.57 ms
+    // on the default launch, 15.96 at 4 blocks, 15.54 at 3, 16.52 at 2; Q5_K / Q5_1 17.25 / 16.69 / 16.20 / 17.18; parity and outputs unchanged.
+    if (type == T_Q4_K || type == T_Q5_K || type == T_Q5_1) return 3;
     return gu && (type == T_IQ2_S || type == T_IQ2_XS) ? 3 : 4;
 }
 #endif
@@ -2286,6 +2298,9 @@ bool f16_gu(int t) {
     return t == T_IQ2_XXS || t == T_IQ2_XS || t == T_IQ2_S || t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS;
 }
 bool f16_d(int t) { return t == T_Q2_0 || t == T_IQ4_NL || t == T_Q8_0 || t == T_Q5_0; }
+#if defined(__HIPCC__)
+bool tq_hip_requested();   // (STRATA_PF_FUSED_TQ on HIP: below)
+#endif
 bool gu_covered(int t) {
     return t == T_IQ2_XXS || t == T_IQ2_XS || t == T_IQ2_S || t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS
 #if !defined(__HIPCC__)
@@ -2298,6 +2313,7 @@ bool gu_covered(int t) {
 #if defined(__HIPCC__)
            || (t == T_Q2_0 && dev_info().w12)   // gfx12: the native Q2_0 pack's gate/up on native_w11_kernel (64-value blocks)
            || ((t == T_Q4_K || t == T_Q5_K) && kq_on())   // the gfx11 kernels only
+           || ((t == T_TQK6 || t == T_TQ2_T) && dev_info().w12 && tq_hip_requested())   // STRATA_PF_FUSED_TQ=1 on gfx12
 #endif
         ;
 }
@@ -2330,14 +2346,16 @@ bool q8d_f16_default(const DevInfo& d) {
 // of leaving the fused path for gather + FP16 dequantize + hipBLASLt (RESULTS-STRIX2.md: 24-29% of the prompt).  It needs the F16 prompt set (STRATA_PF_F16, on by
 // default there), so with STRATA_PF_F16=0 the layers keep the earlier route.  STRATA_PF_FUSED_Q50=0 (or STRATA_GFX1151_DEFAULTS=0) turns it off; =1 turns it on
 // for any gfx1151 build (Linux: opt-in).  gfx12 (RDNA4) keeps its int8 kernel (native_w11_kernel, int8 codes q - 16: its WMMA layout), reached through the same
-// switch: STRATA_PF_FUSED_Q50=1 turns it on there (opt-in; it changes the arithmetic of those layers), =0 / unset leaves the layers on gather + FP16 dequantize + hipBLASLt
-// (phaseA-tests/round0216/rdna4/q50-fused.patch).  The switch means the same on both: 1 on, 0 off, unset = the platform's default.
+// switch.  gfx12 under Linux: ON by default since 0.2.15 (owner 11-10; R9700, UD-IQ4_XS-v31: prompt x1.31 / x1.47 / x1.16 at 4K / 8K / 20K, first-token KL
+// against the FP16 path level with the default's, the neutral-writer forced-token gate PASS, first-8K reads PASS in 64 starts); gfx12 under Windows: opt-in
+// (not measured there).  STRATA_PF_FUSED_Q50=0 keeps the layers on gather + FP16 dequantize + hipBLASLt (the earlier route, kept two releases).
+// The switch means the same everywhere: 1 on, 0 off, unset = the platform's default.
 bool q50_on(const DevInfo& d) {
 #if defined(__HIPCC__)
     if (!d.w12 && !d.g1151) return false;
     static const int env = [] { const char* v = std::getenv("STRATA_PF_FUSED_Q50"); return v == nullptr || v[0] == '\0' ? -1 : (v[0] == '1' ? 1 : 0); }();
     if (env >= 0) return env == 1;
-    if (d.w12) return false;   // gfx12: opt-in (default off)
+    if (d.w12) return strata::core::kGfx12PromptDefaultsOn;   // gfx12: on by default under Linux, opt-in under Windows
 #if defined(_WIN32)
     const char* off = std::getenv("STRATA_GFX1151_DEFAULTS");
     return !(off != nullptr && off[0] == '0');
@@ -2349,10 +2367,29 @@ bool q50_on(const DevInfo& d) {
     return false;
 #endif
 }
+#if defined(__HIPCC__)
+// STRATA_PF_FUSED_Q8D on HIP (phase 4, opt-in, gfx12 only): "1" lets a Q8_0 down behind an i-quant gate/up (the pinned UD-IQ4_XS's five Q8_0-down layers:
+// IQ3_S / Q8_0 4, IQ4_XS / Q8_0 1) take native_w11_kernel's Q8_0 down instead of MMQ, without STRATA_PF_FUSED_KQ (whose meaning is the K-quant experts).
+// The same switch as CUDA's.  No new kernel: the gfx12 int8 Q8_0 down instances exist for the K-quant route.  gfx11 keeps its own rules (q8d_f16_default,
+// STRATA_PF_F16): not measured with this switch.
+bool q8d_hip_requested() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_FUSED_Q8D"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+// STRATA_PF_FUSED_TQ on HIP (phase 4, opt-in, gfx12 only): "1" lets Gyro-S's TQK6 / TQK7 and Gyro-M's TQ2_T / TQ2_T layers take native_w11_kernel's
+// trellis instances instead of MMQ (the decode is CUDA's: 15-bit states, MMQ's int8 codebook tq_lut_i8, one scale a 128-value block; Hadamard-folded
+// downs through the FP32-H epilogue and rot_quant_h_kernel, as on CUDA).  The same switch as CUDA's.  gfx11: not measured, keeps MMQ.
+bool tq_hip_requested() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_FUSED_TQ"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+#endif
 bool d_covered_on(int t, const DevInfo& d) {
 #if defined(__HIPCC__)
     if (t == T_Q5_0) return d.w12 ? q50_on(d) : q50_on(d) && f16::requested();   // gfx1151 has no int8 kernel for Q5_0 down (the F16 prompt set must be on); gfx12 has only the int8 one
     if (t == T_Q8_0 && !d.w12 && (f16::requested() || q8d_f16_default(d))) return true;
+    if (t == T_Q8_0 && d.w12 && q8d_hip_requested()) return true;   // (behind an i-quant gate/up only: native_supported)
+    if (t == T_TQK7 || t == T_TQ2_T) return d.w12 && tq_hip_requested();   // STRATA_PF_FUSED_TQ=1 (behind a trellis gate/up only: native_supported)
 #else
     if (t == T_Q5_0) return d.q50;   // STRATA_PF_FUSED_Q50=1 and its kernels set up (dev_info)
     if (t == T_Q5_1) return d.kq;    // STRATA_PF_FUSED_KQ=1 (behind a K-quant gate/up only: native_supported)
@@ -2420,9 +2457,9 @@ int pick_ww(int64_t n, int n_expert) {
     }
     return pk.ww;
 }
-
+#endif
 }  // namespace
-
+#if !defined(STRATA_FUSED_DECODE_ONLY)
 bool gfx12_iq2s_default() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_PF_FUSED_IQ2S");
@@ -2433,6 +2470,21 @@ bool gfx12_iq2s_default() {
     }();
     return on;
 }
+
+#if defined(__HIPCC__)
+// IQ2_XXS / IQ2_XS gate/up on gfx12 (the IQ3_XXS pack's 19 layers that kept MMQ, and the IQ2_XS sets): ON by default under Linux since 0.2.15 (owner 11-10;
+// R9700, IQ3_XXS: prompt x1.17 / x1.14 / x1.13 at 4K / 8K / 20K, first-token KL against the FP16 path level with the default's, the neutral-writer forced-token
+// gate PASS, first-8K reads PASS).  STRATA_PF_FUSED_IQ2X=0 keeps these layers on MMQ (the earlier route, kept two releases), as does STRATA_PF_FUSED=0.
+// Windows gfx12: opt-in (STRATA_PF_FUSED=1), as before.  Like gfx12_iq2s_default, native_supported applies it to gfx12 cards only (d.w12).
+static bool gfx12_iq2x_default() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PF_FUSED_IQ2X");
+        const char* all = std::getenv("STRATA_PF_FUSED");
+        return strata::core::kGfx12PromptDefaultsOn && !(v != nullptr && v[0] == '0') && !(all != nullptr && all[0] == '0');
+    }();
+    return on;
+}
+#endif
 
 bool native_supported(int gu_type, int d_type) {
     static const bool off = [] {   // STRATA_PF_FUSED_NATIVE=0: the native packs keep MMQ under STRATA_PF_FUSED=1 (A/B)
@@ -2517,13 +2569,33 @@ bool native_supported(int gu_type, int d_type) {
     }
     if (gu_type == T_Q2_0 && d_type != T_Q2_0) return false;   // the opt-in (STRATA_PF_FUSED=1 as well) takes the Q2_0 / Q2_0 pair only
 #endif
+#if defined(__HIPCC__)
+    // The trellis pairs on gfx12 (opt-in STRATA_PF_FUSED_TQ=1; gu_covered checked it above): Gyro-S's TQK6 / TQK7 and Gyro-M's TQ2_T / TQ2_T only, with
+    // CUDA's geometry rule (whole 128-value blocks along both K; a folded down's FP32 H row inside the row's own n_embd-float output row).  Any other
+    // pairing with a trellis format: MMQ.
+    if (is_tq(gu_type) || is_tq(d_type)) {
+        constexpr bool geo_ok = D_ROWS_K <= D_ROWS_N && D_ROWS_K % 128 == 0 && GU_ROWS_K % 128 == 0;
+        const DevInfo& d = dev_info();
+        const bool pair = (gu_type == T_TQK6 && d_type == T_TQK7) || (gu_type == T_TQ2_T && d_type == T_TQ2_T);
+        return geo_ok && pair && d.ok && d.w12 && tq_hip_requested();
+    }
+#endif
     // default: only these three; the Q2_0 one (148-amd) is on Linux only: on Windows it is opt-in (STRATA_PF_FUSED=1) until tested there.
     // AMD-Q (owner decision 10-31): the IQ2_S and IQ4_XS gate/up layers too (the IQ3_S pack's 21 layers that kept MMQ), Linux only like the Q2_0 entry.
     // R9700 (p620, IQ3_S, serve, 3 interleaved pairs): prompt 2K +9.7%, 8K +12.2%, 32K +8.8%; first-token KL against the MMQ default 0.017 (29 prompts of
     // 1,025 tokens, top-1 28 of 29), the answers are not the MMQ bytes.  STRATA_PF_FUSED_IQ2S=0 turns it off; STRATA_PF_FUSED=0 turns all fused kernels off.
     if (env < 0 && gu_type != T_IQ3_S && gu_type != T_IQ3_XXS && !(gu_type == T_Q2_0 && strata::core::kGfx12PromptDefaultsOn) &&
-        !(gfx12_iq2s_default() && (gu_type == T_IQ2_S || gu_type == T_IQ4_XS))) return false;
+        !(gfx12_iq2s_default() && (gu_type == T_IQ2_S || gu_type == T_IQ4_XS))
+#if defined(__HIPCC__)
+        && !(gfx12_iq2x_default() && (gu_type == T_IQ2_XXS || gu_type == T_IQ2_XS))   // (0.2.15, Linux gfx12: above)
+#endif
+        ) return false;
     const DevInfo& d = dev_info();
+#if defined(__HIPCC__)
+    // STRATA_PF_FUSED_Q8D=1 on gfx12 covers the Q8_0 down behind an i-quant gate/up only (as on CUDA): a Q2_0 gate/up with a Q8_0 down keeps MMQ there
+    // unless STRATA_PF_FUSED_KQ=1 (the K-quant route's wider rule, unchanged; gfx11's rules unchanged)
+    if (d.w12 && gu_type == T_Q2_0 && d_type == T_Q8_0 && !kq_on()) return false;
+#endif
     if (!d.ok || !d_covered_on(d_type, d)) return false;
     if (d.t75 && (gu_type != T_Q2_0 || d_type != T_Q2_0)) return false;
     if (env < 0) return d.w12;
@@ -2547,17 +2619,11 @@ static const float* g_rot_signs = nullptr;
 static bool g_rot_on = false;
 void set_down_rotation(bool on, const float* signs) { g_rot_on = on; g_rot_signs = on ? signs : nullptr; }
 void hadamard128_rows(float* x, int64_t rows, int64_t cols, const float* signs, void* stream) {
-#if !defined(__HIPCC__)
     if (rows <= 0) return;
     if (cols % 128 != 0) { std::fprintf(stderr, "hadamard128_rows: %lld columns are not whole 128-value blocks\n", (long long) cols); std::exit(1); }
     const int64_t nblk = rows * (cols / 128);
     hadamard128_kernel<<<blocks(nblk, 8), 256, 0, (cudaStream_t) stream>>>(x, nblk, (int) cols, signs);
     ck(cudaGetLastError(), "hadamard128_rows");
-#else
-    (void) x; (void) rows; (void) cols; (void) signs; (void) stream;
-    std::fprintf(stderr, "hadamard128_rows: not built for HIP\n");
-    std::exit(1);
-#endif
 }
 
 void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa,
@@ -2582,9 +2648,13 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
 #ifdef STRATA_W_NO_OCC
         const bool occ_gu = false, occ_d = false;
 #else
+        // STRATA_PF_KQ_OCC=1 (a trial switch, off by default, HIP only): the K-quant kernels too (Q4_K / Q5_K gate/up, Q5_1 down) take the
+        // occupancy launch above (the H tile on the weight buffers, occ_blocks per WGP; the VGPR cap only where nw_capped says so).
+        static const bool kq_occ = [] { const char* v = std::getenv("STRATA_PF_KQ_OCC"); return v != nullptr && v[0] == '1'; }();
         const bool occ_gu = g.gu_type == T_IQ2_XXS || g.gu_type == T_IQ2_XS || g.gu_type == T_IQ2_S ||
-                            g.gu_type == T_IQ3_XXS || g.gu_type == T_IQ3_S || g.gu_type == T_IQ4_XS || g.gu_type == T_Q2_0;
-        const bool occ_d = g.d_type == T_Q2_0 || g.d_type == T_Q8_0 || g.d_type == T_IQ4_NL;
+                            g.gu_type == T_IQ3_XXS || g.gu_type == T_IQ3_S || g.gu_type == T_IQ4_XS || g.gu_type == T_Q2_0 ||
+                            (kq_occ && (g.gu_type == T_Q4_K || g.gu_type == T_Q5_K));
+        const bool occ_d = g.d_type == T_Q2_0 || g.d_type == T_Q8_0 || g.d_type == T_IQ4_NL || (kq_occ && g.d_type == T_Q5_1);
 #endif
         if (d.w12 && (reinterpret_cast<uintptr_t>(dm) & 15) != 0) {   // gfx12's down store: two float4 per lane
             std::fprintf(stderr, "prefill fused experts (native): the down rows (%p) must be 16-byte aligned\n", (void*) dm);
@@ -2635,6 +2705,9 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
             case T_Q2_0: STRATA_NW_GU(T_Q2_0); break;
             case T_Q4_K: STRATA_NW_GU(T_Q4_K); break;
             case T_Q5_K: STRATA_NW_GU(T_Q5_K); break;
+            // (STRATA_PF_FUSED_TQ=1, gfx12) the trellis gate/up: the plain launch; a folded down (set_down_rotation) takes H as FP32 rows in dm
+            case T_TQK6: native_w11_kernel<T_TQK6, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, g_rot_on ? dm : nullptr); break;
+            case T_TQ2_T: native_w11_kernel<T_TQ2_T, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, g_rot_on ? dm : nullptr); break;
             default: STRATA_NW_GU(T_IQ4_XS); break;
         }
 #undef STRATA_NW_GU
@@ -2645,6 +2718,14 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
             else if (g.d_type == T_Q8_0) STRATA_F16_LAUNCH(T_Q8_0, false, f16::D_NFB, ha8, nullptr, dm);
             else if (g.d_type == T_Q5_0) STRATA_F16_LAUNCH(T_Q5_0, false, f16::D_NFB, ha8, nullptr, dm);
             else STRATA_F16_LAUNCH(T_IQ4_NL, false, f16::D_NFB, ha8, nullptr, dm);
+        }
+        else if (g.d_type == T_TQK7 || g.d_type == T_TQ2_T) {   // (STRATA_PF_FUSED_TQ=1, gfx12; d_covered_on checked it above)
+            if (g_rot_on) {   // a folded down: the FP32 H rows of this call's experts (in dm), rotated and quantized into ha, as on CUDA
+                const int64_t nw = n * (D_ROWS_K / 128);
+                rot_quant_h_kernel<<<blocks(nw, 8), 256, 0, s>>>(dm, tb.off, b.e0, b.e1, n, g_rot_signs, ha8);
+            }
+            if (g.d_type == T_TQK7) native_w11_kernel<T_TQK7, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm);
+            else native_w11_kernel<T_TQ2_T, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm);
         }
         else if (g.d_type == T_Q2_0) STRATA_NW_D(T_Q2_0);
         else if (g.d_type == T_Q5_0) STRATA_NW_D(T_Q5_0);
@@ -2778,5 +2859,5 @@ void experts_native(const WideBatch& b, const NativeGeom& g, int n_expert, int64
     else launch<T_IQ4_NL, false>(ws, g_d, b, g, tb, ha, src, nullptr, dm, s);
     ck(cudaGetLastError(), "experts_native (NT = 256)");
 }
-
+#endif
 }  // namespace strata::prefill::fused

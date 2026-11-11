@@ -803,14 +803,19 @@ int main(int argc, char** argv) {
     try {
         // --unset-pf-fused: STRATA_PF_FUSED unset, as the engine's default (the ctest entry for the opt-in STRATA_PF_FUSED_Q2N=1,
         // whose Q2_0 / Q2_0 pair the engine takes with the old variable unset or at 1)
-        bool unset_pf = false;
-        for (int i = 1; i < argc; ++i)
+        // --no-kq: STRATA_PF_FUSED_KQ left as it is (HIP: the ctest entry for STRATA_PF_FUSED_Q8D=1 on gfx12, which must cover the i-quant / Q8_0
+        // pairs without the K-quant switch that also covers them there)
+        bool unset_pf = false, no_kq = false;
+        for (int i = 1; i < argc; ++i) {
             if (std::strcmp(argv[i], "--unset-pf-fused") == 0) unset_pf = true;
+            if (std::strcmp(argv[i], "--no-kq") == 0) no_kq = true;
+        }
 #ifdef _WIN32
         if (unset_pf) _putenv_s("STRATA_PF_FUSED", ""); else _putenv_s("STRATA_PF_FUSED", "1");   // (an empty value removes it)
+        (void) no_kq;   // (Windows: the K-quant switch is not set here)
 #else
         if (unset_pf) unsetenv("STRATA_PF_FUSED"); else setenv("STRATA_PF_FUSED", "1", 1);
-        setenv("STRATA_PF_FUSED_KQ", "1", 1);   // (the HIP build's Q4_K / Q5_K / Q5_1 / Q8_0 pairs)
+        if (!no_kq) setenv("STRATA_PF_FUSED_KQ", "1", 1);   // (the HIP build's Q4_K / Q5_K / Q5_1 / Q8_0 pairs)
         setenv("STRATA_PF_FUSED_Q50", "1", 1);  // (gfx12's Q5_0 down pairs)
 #endif
         int n = 0;
@@ -820,6 +825,26 @@ int main(int argc, char** argv) {
             std::printf("the fused kernels need sm_80 or newer (or gfx11 / gfx12 matrix cores): skipped\n");
             return 77;
         }
+        // --no-kq (the STRATA_PF_FUSED_Q8D entry): a device or build where the i-quant / Q8_0 pairs are not covered without the K-quant switch
+        // (gfx11, or the switch unset) skips instead of failing
+        if (no_kq && !fused::native_supported(GGML_TYPE_IQ3_S, GGML_TYPE_Q8_0)) {
+            std::printf("--no-kq: the i-quant / Q8_0 pairs are not covered here without STRATA_PF_FUSED_KQ (skipped)\n");
+            return 77;
+        }
+#if defined(__HIPCC__)
+        // the trellis pairs on HIP are gfx12's (STRATA_PF_FUSED_TQ=1): another AMD card skips the _tq / _tqh entries instead of failing; on gfx12
+        // the pairs must be covered (a host rule that does not take them fails below)
+        const char* only_tq = nullptr;
+        for (int i = 1; i < argc; ++i)
+            if (std::strncmp(argv[i], "--only=", 7) == 0) only_tq = argv[i] + 7;
+        if (only_tq != nullptr && std::strstr("TQK6 + TQK7 TQ2_T + TQ2_T", only_tq) != nullptr) {
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx12", 5) != 0) {
+                std::printf("the trellis pairs: gfx12 only on HIP (%s: skipped)\n", prop.gcnArchName);
+                return 77;
+            }
+        }
+#endif
         // with STRATA_PF_FUSED unset nothing is set up below sm_80 (Turing's pair is STRATA_PF_FUSED=1 STRATA_PF_FUSED_SM75=1's)
         if (unset_pf) {
             int major = 0;
