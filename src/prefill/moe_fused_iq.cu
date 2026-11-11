@@ -2493,7 +2493,7 @@ void check_staged_blobs(const Batch& b, const NativeGeom& g) {
     }
 }
 #endif
-// `staged`: both of the launch's kernels (gate/up and down) are weight-staging instances (sw_on); the rule then takes 128 rows from every size on the sm_86 / sm_120 cards under 80 SMs.
+// `staged`: the launch's gate/up kernel is a weight-staging instance (sw_on); the rule then takes 128 rows from every size on the sm_86 / sm_120 cards under 80 SMs.
 int pick_ww(int64_t n, int n_expert, bool staged) {
     static const int forced = [] {
         const char* v = std::getenv("STRATA_PF_FUSED_TILE");
@@ -2761,9 +2761,11 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         experts_native(w, g, n_expert, n, scratch, xa, src, ha, dm, stream);
         return;
     }
-    const bool staged = sw_on(g.gu_type, true) && sw_on(g.d_type, false);
+    // the launch's gate/up kernel is a staging instance: the tile rule then takes 128 rows (the gate/up is about two thirds of the layer; a down that is not staged, Q2_0 or Q8_0 or Q5_0,
+    // still ran faster in the 128-row tile with it: IQ3_S / Q2_0 on the RTX A4000, RESULTS-P4-SM.md S1).  Either kernel staged: the blob check.
+    const bool staged = sw_on(g.gu_type, true);
 #if !defined(__HIPCC__)
-    if (staged) check_staged_blobs(b, g);
+    if (staged || sw_on(g.d_type, false)) check_staged_blobs(b, g);
 #endif
     const int ww = pick_ww(n, n_expert, staged);
     // the most 64-row tiles the batch can have (every row in it, plus a partial tile per expert) - the items of the
