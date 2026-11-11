@@ -122,18 +122,21 @@ bool qi_attention_i8_preferred(int64_t rows, int64_t keys, int64_t heads, void* 
 void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
                   int64_t head_dim, int64_t n_text, uint16_t* out16, void* stream,
                   const int32_t* key_lim, int64_t first, bool int8,
-                  const std::vector<std::pair<int64_t, int64_t>>* spans, const kernels::FlashAttnI8Stats* i8_stats) {
+                  const std::vector<std::pair<int64_t, int64_t>>* spans, const kernels::FlashAttnI8Stats* i8_stats,
+                  int64_t keys) {
     if (T <= first) return;
     if (head_dim != D) throw std::invalid_argument("qi_attention: head_dim 128");
+    if (keys <= 0) keys = T;   // the rows' own keys (a self-attention), else a cross-attention's
     // the image rows (they see every key) through the int8 kernel where it is the faster, else the GPU maker's kernel
     // where there is one; the prefix's own rows, a few dozen, by the kernel below
     int64_t row_end = T;
     const int64_t r0 = std::max(first, n_text);
     // the int8 kernel: STRATA_IMAGE_ATTN_I8=1 always, 0 never; else the image rows timed in it and in the 16-bit kernel
     // that would take them (the GPU maker's, else the engine's own), once a GPU and a shape (rows, keys and heads),
-    // from 2048 image rows on (fewer: not taken). A generation's and an edit's shapes differ.
+    // from 2048 image rows on (fewer: not taken). A generation's and an edit's shapes differ.  The int8 kernel reads
+    // the rows as their own keys, so a cross-attention's rows never take it.
     bool i8_done = false;
-    if (int8 && T - r0 >= 256) {
+    if (int8 && keys == T && T - r0 >= 256) {
         sycl::queue& qq = core::Runtime::get().stream(stream);
         const int forced = forced_i8();
         Choices& ch = choices_of();
@@ -174,16 +177,17 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
         if (g_no_sdpa) return false;
         sycl::queue& qq = core::Runtime::get().stream(stream);
         Choices& ch = sdpa_choices_of();
-        const auto key = std::make_tuple(T - r0, T, heads);
+        const auto key = std::make_tuple(T - r0, keys, heads);
         if (const auto found = ch.get(qq.get_device(), key)) return *found;
         if (qq.ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording) return true;
         auto run_maker = [&] {
-            return qi_sdpa(q16, k16, v16, r0, T, T, heads, head_dim,
+            return qi_sdpa(q16, k16, v16, r0, T, keys, heads, head_dim,
                            out16 + (r0 - first) * heads * head_dim, stream);
         };
         auto run_own = [&] {
             struct Guard { Guard() { g_no_sdpa = true; } ~Guard() { g_no_sdpa = false; } } guard;
-            qi_attention(q16, k16, v16, T, heads, head_dim, n_text, out16, stream, key_lim, first);
+            qi_attention(q16, k16, v16, T, heads, head_dim, n_text, out16, stream, key_lim, first, false, nullptr,
+                         nullptr, keys);
             return true;
         };
         const auto measured = core::timed_choice({{run_maker}, {run_own}}, [&] { qq.wait_and_throw(); });
@@ -193,11 +197,11 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
             std::fprintf(stderr,
                          "xestrata-image: the attention's image rows by %s at %lld rows of %lld keys (the maker's %.2f "
                          "ms, the engine's own %.2f ms)\n",
-                         use ? "the maker's kernel" : "the engine's own", (long long) (T - r0), (long long) T, mk, own);
+                         use ? "the maker's kernel" : "the engine's own", (long long) (T - r0), (long long) keys, mk, own);
         return use;
     };
     // the image rows went through the int8 kernel or else the maker's 16-bit one; the text rows are left
-    if (i8_done || (T - r0 >= 256 && maker() && qi_sdpa(q16, k16, v16, r0, T, T, heads, head_dim,
+    if (i8_done || (T - r0 >= 256 && maker() && qi_sdpa(q16, k16, v16, r0, T, keys, heads, head_dim,
                                                         out16 + (r0 - first) * heads * head_dim, stream))) {
         if (first >= n_text) {
             if (!stream) core::Runtime::get().stream(stream).wait();
@@ -218,7 +222,8 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
         a.kv_ld = heads * D;
         a.n_head = a.n_kv = heads;
         a.head_dim = D;
-        a.rows = a.keys = T;
+        a.rows = T;
+        a.keys = keys;
         a.n_causal = n_text;
         a.key_lim = key_lim;
         a.first = f;
@@ -252,6 +257,14 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
     if (!done && !run(first, row_end, true))
         throw std::invalid_argument("qi_attention: no form of the attention takes the shape");
     if (!stream) q.wait();
+}
+
+// A cross-attention (Anima's blocks): the rows over another count of keys, every row seeing every key.  The same
+// entry as the image rows', so the maker's kernel and the engine's own are chosen and timed as they are; no int8
+// (its kernel reads the rows as their own keys) and no prefix rows.
+void qi_attention_cross(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t Tq, int64_t Tk,
+                        int64_t heads, int64_t head_dim, uint16_t* out16, void* stream) {
+    qi_attention(q16, k16, v16, Tq, heads, head_dim, 0, out16, stream, nullptr, 0, false, nullptr, nullptr, Tk);
 }
 
 }  // namespace strata::image

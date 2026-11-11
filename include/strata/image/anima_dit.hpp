@@ -188,16 +188,15 @@ private:
     MfOut product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
                   const float* bias, bool same_input = false, bool defer = false);
     void ensure(int64_t hw, int n);
+    // the cross-attention's products form (a GPU without FP16 matrix engines): the keys and values head-major, then a
+    // head at a time the scores, their softmax and the weighted values through the shared products, out [Tq][C] FP32
+    void attn_kv(const MfOut& k, const MfOut& v, int64_t Tk, int64_t heads, int64_t hd, const float* wk, uint16_t* kv);
+    void attn_q(const MfOut& q, int64_t Tq, int64_t heads, int64_t hd, const float* wq, const uint16_t* kv, int64_t Tk,
+                float* out);
     void rope_tables(int64_t h, int64_t w);
     void time_embedding(float sigma);
     // a modulation's 6144 values (or the final layer's 4096): SiLU(emb) through w1 and w2, plus the AdaLN-LoRA term
     void modulation(const W& w1, const W& w2, const uint8_t* base, float* out);
-    // a multi-head attention of q [Tq][C] (rows scaled by qrs) over keys and values made by attn_kv: each head's
-    // scores, their softmax and the weighted values through the library's products, out [Tq][C] FP32
-    void attn_kv(const MfOut& k, const MfOut& v, int64_t Tk, int64_t heads, int64_t hd, const float* wk, const float* cos,
-                 const float* sin, uint16_t* kv);
-    void attn_q(const MfOut& q, int64_t Tq, int64_t heads, int64_t hd, const float* wq, const float* cos,
-                const float* sin, const uint16_t* kv, int64_t Tk, float* out);
     struct AdapterIn {
         Ctx* c;
         const float* states;
@@ -206,7 +205,6 @@ private:
         const std::vector<float>* t5w;
     };
     void adapter(const std::vector<AdapterIn>& in);
-    bool fused_attention_ok();
     void glora_weight(const uint16_t* v, const W& w, const uint8_t* d, int64_t r0, int64_t n, int64_t nt, int64_t t0,
                       float* y);
     void add_glora(const LoraLayer* lora, const uint16_t* x16, const float* rs, const W& w, const uint8_t* d,
@@ -259,7 +257,7 @@ private:
     std::vector<char> kready_;
     float last_sigma_ = 0.f;
     float *cos_ = nullptr, *sin_ = nullptr;   // the image tokens' RoPE [h w][64]
-    float *sc_ = nullptr;                     // a head's scores [Tq][Tk]
+    float *sc_ = nullptr;                     // the products form's scores [Tq][Tk]
     uint16_t *h16_ = nullptr, *jq16_ = nullptr, *jk16_ = nullptr, *jv16_ = nullptr, *jo16_ = nullptr,
              *o16_ = nullptr, *qh16_ = nullptr, *p16_ = nullptr;
     int64_t jrows_ = 0;
@@ -268,7 +266,7 @@ private:
     float* bake_tmp_ = nullptr;      // a weight's delta [n][k], while adapters are baked
     uint16_t* bake_at16_ = nullptr;  // an adapter's A^T
     void install_prepare();
-    int cross_sdpa_ = -1;   // the cross-attention through the fused attention: unknown, no, yes (fused_attention_ok)
+    int cross_form_ = -1;   // the cross-attention: unknown, the shared entry, the products (no matrix engines)
     int8_t* xq8_ = nullptr;
     int64_t xq8_rows_ = 0, xq8_cols_ = 0;
     int xs_next_ = 0;

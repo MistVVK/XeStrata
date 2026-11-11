@@ -11,6 +11,7 @@
 #include "strata/image/mapped_file.hpp"
 #include "strata/image/pipeline.hpp"
 #include "strata/image/qi_kernels.hpp"
+#include "strata/image/qi_sdpa_ex.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/image/gelu.hpp"
 #include "strata/kernels/i8_gemm.hpp"
@@ -43,7 +44,6 @@ using namespace dit_rows;
 constexpr int kTypeF16 = 1, kTypeQ8_0 = 8, kTypeW8 = -8;
 constexpr float kEps = 1e-6f;
 constexpr int64_t kCtxRows = 512;   // the context's rows at least: the adapter's output padded with zero rows
-constexpr int64_t kKeyPad = 32;     // the keys of a library product's attention padded to a multiple of this
 
 template<class T> T* alloc(std::vector<void*>& owned, int64_t n, bool zero = false) {
     T* p = nullptr;
@@ -60,8 +60,6 @@ void release(std::vector<void*>& owned, void* p) {
     owned.erase(std::remove(owned.begin(), owned.end(), p), owned.end());
     gpu::free(p);
 }
-
-int64_t pad_keys(int64_t n) { return (n + kKeyPad - 1) / kKeyPad * kKeyPad; }
 
 bool is_text_encoder_key(const std::string& k) {
     return k.rfind("lora_te", 0) == 0 || k.rfind("text_encoder", 0) == 0 || k.rfind("te.", 0) == 0;
@@ -121,8 +119,8 @@ struct GeluErf {
 
 // A head-major copy for the library's products: row t's head h RMS-normed over the head (w; null: not normed) and
 // rotated in pairs (j, j + hd / 2) by cos[t][j], sin[t][j] (null: not rotated), into out [heads][Tp][hd] (rows past T
-// left as they are: zero), or with `rows` into out [T][heads hd] (the fused attention's layout).  qk_norm_rope.hpp's kernel, the head's
-// values clamped to FP16's range.
+// left as they are: zero), or with `rows` into out [T][heads hd] (the shared attention's layout).  qk_norm_rope.hpp's
+// kernel, the head's values clamped to FP16's range.
 void heads16(const MfOut& x, int64_t T, int64_t Tp, int64_t heads, int64_t hd, const float* w, const float* cos,
              const float* sin, uint16_t* out, void* s, bool rows = false) {
     if (T <= 0) return;
@@ -158,7 +156,7 @@ void values16(const MfOut& v, int64_t T, int64_t C, uint16_t* out, void* s) {
     });
 }
 
-// out [heads][hd][Tp] = v's row t, head h, transposed (the weighted values' product reads V^T's rows)
+// out [heads][hd][Tp] = v's row t, head h, transposed (the products form's weighted values read V^T's rows)
 void values_t16(const MfOut& v, int64_t T, int64_t Tp, int64_t heads, int64_t hd, uint16_t* out, void* s) {
     if (T <= 0) return;
     q_of(s).parallel_for(sycl::range<1>((size_t) (T * heads * hd)), [=](sycl::id<1> id) {
@@ -183,60 +181,6 @@ template<class Op> void rows16_plain(const Op& op, int64_t T, int64_t C, uint16_
         const auto st = op.stats(t, lane, (int64_t) kLocal, sum);
         for (int64_t c = lane; c < C; c += (int64_t) kLocal)
             y16[t * C + c] = f16_from_f32(sycl::clamp(op.value(t, c, st), -65504.f, 65504.f));
-    });
-}
-
-// The adapter's attention of a few rows (the ids over the ids or the states) for one or two contexts in a row,
-// every head in one kernel: a work-group a query row's head, its lanes over the keys for the scores (kept in local
-// memory), then over the head's dimensions for the weighted values.  The rows before q0 are the first context's and
-// see the keys before k0, the rest the keys from k0.  q [heads][Tq][hd] and k [heads][Tk][hd] as heads16 writes them,
-// v the values' product [Tk][heads hd], out [Tq][heads hd] FP32.  (A work-item a row, the softmax online in
-// registers, took 0.8 ms on the RX 9060 XT for 31 rows over 31 keys: its 2 HD values spilled.)
-template<int HD> void small_attention(const uint16_t* q, const uint16_t* k, const MfOut v, int64_t Tq, int64_t q0,
-                                      int64_t Tk, int64_t k0, int64_t heads, float scale, float* out, void* s) {
-    constexpr int kLocal = 64;
-    const int64_t most = std::max(k0, Tk - k0);
-    q_of(s).submit([&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> qs(sycl::range<1>(HD), h), ps(sycl::range<1>((size_t) most), h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (heads * Tq * kLocal)), sycl::range<1>(kLocal)),
-                       [=](sycl::nd_item<1> it) {
-            const auto g = static_cast<int64_t>(it.get_group_linear_id());
-            const auto lane = static_cast<int>(it.get_local_linear_id());
-            const int64_t hh = g / Tq, t = g - hh * Tq;
-            const int64_t ks = t < q0 ? 0 : k0, n = t < q0 ? k0 : Tk - k0;
-            for (int d = lane; d < HD; d += kLocal) qs[d] = kernels::f32_from_f16(q[(hh * Tq + t) * HD + d]) * scale;
-            sycl::group_barrier(it.get_group());
-            float m = -INFINITY;
-            for (int64_t j = lane; j < n; j += kLocal) {
-                // a key's row in 16-byte pieces
-                const auto* kr = reinterpret_cast<const sycl::vec<uint32_t, 4>*>(k + (hh * Tk + ks + j) * HD);
-                float sc = 0.f;
-                for (int c = 0; c < HD / 8; ++c) {
-                    const sycl::vec<uint32_t, 4> p = kr[c];
-                    for (int e = 0; e < 4; ++e) {
-                        const uint32_t u = p[e];
-                        sc += qs[c * 8 + 2 * e] * kernels::f32_from_f16((uint16_t) (u & 0xffffu)) +
-                              qs[c * 8 + 2 * e + 1] * kernels::f32_from_f16((uint16_t) (u >> 16));
-                    }
-                }
-                ps[j] = sc;
-                m = sycl::fmax(m, sc);
-            }
-            m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
-            float sum = 0.f;
-            for (int64_t j = lane; j < n; j += kLocal) {
-                const float e = sycl::exp(ps[j] - m);
-                ps[j] = e;
-                sum += e;
-            }
-            const float inv = 1.f / sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
-            sycl::group_barrier(it.get_group());
-            for (int d = lane; d < HD; d += kLocal) {
-                float acc = 0.f;
-                for (int64_t j = 0; j < n; ++j) acc += ps[j] * v.at(ks + j, hh * HD + d);
-                out[t * heads * HD + hh * HD + d] = acc * inv;
-            }
-        });
     });
 }
 
@@ -655,19 +599,19 @@ void AnimaDit::glora_weight(const uint16_t* v, const W& w, const uint8_t* d, int
 }
 
 uint64_t AnimaDit::activation_bytes(int64_t hw, int n, int64_t mlp_rows) const {
-    const int64_t R = n * hw, L = pad_keys(kCtxRows), TP = qi_attn_rows(hw), Rk = std::max(R, L);
+    const int64_t R = n * hw, L = qi_attn_rows(kCtxRows), TP = qi_attn_rows(hw), Rk = std::max(R, L);
     const int64_t band = mlp_rows > 0 ? std::min(R, mlp_rows) : R;
-    return (uint64_t) R * C_ * 4 * 3 +                          // x, q, the attention's FP32 output
+    return (uint64_t) R * C_ * 4 * 3 +                          // x, q, the products form's FP32 output
            (uint64_t) Rk * C_ * 4 * 3 +                         // k, v, a
            (uint64_t) band * F_ * 4 +                           // the MLP's first sums
            (uint64_t) std::max(R * C_, band * F_) * 2 +         // the products' FP16 input
            (uint64_t) TP * C_ * 2 * 4 +                         // the self-attention's q, k, v, output
-           (uint64_t) R * C_ * 2 * 2 +                          // the attention's FP16 output, the heads' q
+           (uint64_t) Rk * C_ * 2 * 2 +                         // the attention's FP16 output, the heads' q
+           (uint64_t) hw * L * 6 +                              // the products form's scores and probabilities
            (uint64_t) hw * hd_ * 4 +                            // the rotary tables
            (uint64_t) (blocks_.size() * 2 + 1) * C_ * 4 +        // the int8 attention's K means and V scales
            (uint64_t) kColSlices * C_ * 4 +                     // col_max's parts (vpart_ at least)
-           (uint64_t) hw * L * 6 +                              // a head's scores and their probabilities
-           (uint64_t) TP * C_ * 4 +                             // the plain attention's scratch
+           (uint64_t) TP * C_ * 4 +                             // the attention's scratch
            (uint64_t) n * blocks_.size() * L * C_ * 2 * 2 +     // the contexts' kept keys and values
            (w8_ ? (uint64_t) std::max(Rk, band) * std::max(C_, F_) + (uint64_t) std::max(Rk, band) * 8 : 0) +
            (lora_cols_ > 0 ? (uint64_t) std::max(Rk, lora_tmp_t_) * (uint64_t) lora_cols_ * 6 : 0);
@@ -679,7 +623,7 @@ void AnimaDit::ensure(int64_t hw, int n) {
     hw = std::max(hw, cap_hw_);
     n = std::max<int>(n, (int) cap_n_);
     drop_activations();
-    const int64_t R = n * hw, L = pad_keys(std::max(kCtxRows, cap_L_)), TP = qi_attn_rows(hw), Rk = std::max(R, L);
+    const int64_t R = n * hw, L = qi_attn_rows(std::max(kCtxRows, cap_L_)), TP = qi_attn_rows(hw), Rk = std::max(R, L);
     mlp_rows_ = mlp_cap_ > 0 ? std::min(R, mlp_cap_) : R;
     x_ = alloc<float>(allocs_, R * C_);
     q_ = alloc<float>(allocs_, Rk * C_);
@@ -823,18 +767,26 @@ void AnimaDit::modulation(const W& w1, const W& w2, const uint8_t* base, float* 
     add_rows(out, alora_, w2.n, s_);
 }
 
+// The cross-attention's keys and values for the products form: K [heads][Tp][hd] normed a head, V^T [heads][hd][Tp],
+// the rows past Tk zero (the products read Tp of them)
 void AnimaDit::attn_kv(const MfOut& k, const MfOut& v, int64_t Tk, int64_t heads, int64_t hd, const float* wk,
-                       const float* cos, const float* sin, uint16_t* kv) {
-    const int64_t Tp = pad_keys(Tk);
+                       uint16_t* kv) {
+    const int64_t Tp = qi_attn_rows(Tk);
     gpu::memset_async(kv, 0, (size_t) (2 * heads * Tp * hd) * 2, s_);
-    heads16(k, Tk, Tp, heads, hd, wk, cos, sin, kv, s_);
+    heads16(k, Tk, Tp, heads, hd, wk, nullptr, nullptr, kv, s_, false);
     values_t16(v, Tk, Tp, heads, hd, kv + heads * Tp * hd, s_);
 }
 
-void AnimaDit::attn_q(const MfOut& q, int64_t Tq, int64_t heads, int64_t hd, const float* wq, const float* cos,
-                      const float* sin, const uint16_t* kv, int64_t Tk, float* out) {
-    const int64_t Tp = pad_keys(Tk), C = heads * hd;
-    heads16(q, Tq, Tq, heads, hd, wq, cos, sin, qh16_, s_);
+// The products form: a head at a time, the scores, their softmax and the weighted values through the shared products,
+// out [Tq][C] FP32.  Kept for a GPU without FP16 matrix engines, where the shared attention's FMA form measured slower
+// (Anima, XESTRATA_NO_XMX=1, warm then one run, 2026-11-11: the B70 0.132 -> 0.157 s/step at 512x512 and 1.044 ->
+// 1.146 at 1024x1024 over 16 steps, the RTX 4070 0.170 -> 0.184 and 1.060 -> 1.120).  With matrix engines the shared
+// entry takes it (qi_attention_cross): the maker's kernel 0.21 ms against the engine's own 0.98 at 4096 rows of 512
+// keys on the B70, and the products a head at a time took 51 ms of a 421 ms step there (2026-11-02).
+void AnimaDit::attn_q(const MfOut& q, int64_t Tq, int64_t heads, int64_t hd, const float* wq, const uint16_t* kv,
+                      int64_t Tk, float* out) {
+    const int64_t Tp = qi_attn_rows(Tk), C = heads * hd;
+    heads16(q, Tq, Tq, heads, hd, wq, nullptr, nullptr, qh16_, s_, false);
     const float scale = 1.f / std::sqrt((float) hd);
     for (int64_t h = 0; h < heads; ++h) {
         gemm_.f16(qh16_ + h * Tq * hd, kv + h * Tp * hd, sc_, Tq, Tp, hd);
@@ -864,7 +816,7 @@ void AnimaDit::adapter(const std::vector<AdapterIn>& in) {
     const int64_t W = std::max(C, ad_F_), RT = std::max<int64_t>(64, std::max(LT, LQ)), half = ad_hd_ / 2;
     const uint64_t sizes[] = {(uint64_t) (RT * C) * 4,     (uint64_t) (RT * src_dim_) * 4, (uint64_t) (RT * src_dim_) * 2,
                               (uint64_t) (RT * W) * 2,     (uint64_t) (RT * C) * 4 * 3,    (uint64_t) (RT * W) * 4,
-                              (uint64_t) (2 * RT * C) * 2, (uint64_t) RT * 4,              (uint64_t) (4 * RT * half) * 4};
+                              (uint64_t) (3 * RT * C) * 2, (uint64_t) RT * 4,              (uint64_t) (4 * RT * half) * 4};
     uint64_t need = 0;
     for (const uint64_t b : sizes) need += (b + 255) / 256 * 256;
     if (need > ad_bytes_) {
@@ -884,6 +836,7 @@ void AnimaDit::adapter(const std::vector<AdapterIn>& in) {
     float* o = reinterpret_cast<float*>(take(sizes[5]));
     uint16_t* qh = reinterpret_cast<uint16_t*>(take(sizes[6]));
     uint16_t* kh = qh + RT * C;
+    uint16_t* vh = kh + RT * C;
     float* wrow = reinterpret_cast<float*>(take(sizes[7]));
     float* ropes = reinterpret_cast<float*>(take(sizes[8]));
     // the ids' embedding rows from the file, their weights and the states, each context's after the other's
@@ -925,10 +878,35 @@ void AnimaDit::adapter(const std::vector<AdapterIn>& in) {
     // the attention of the rows' q over k and v, each context's over its own
     const auto attend = [&](const MfOut& mq, const float* wq, const float* cq, const float* sq, const MfOut& mk,
                             const MfOut& mv, const float* wk, const float* ck, const float* sk, int64_t Tk, int64_t k0) {
-        heads16(mq, LT, LT, ad_heads_, ad_hd_, wq, cq, sq, qh, s_);
-        heads16(mk, Tk, Tk, ad_heads_, ad_hd_, wk, ck, sk, kh, s_);
-        if (ad_hd_ == 64) small_attention<64>(qh, kh, mv, LT, t0, Tk, k0, ad_heads_, scale, o, s_);
-        else small_attention<128>(qh, kh, mv, LT, t0, Tk, k0, ad_heads_, scale, o, s_);
+        heads16(mq, LT, LT, ad_heads_, ad_hd_, wq, cq, sq, qh, s_, true);
+        heads16(mk, Tk, Tk, ad_heads_, ad_hd_, wk, ck, sk, kh, s_, true);
+        values16(mv, Tk, C, vh, s_);
+        // the shared attention of the auxiliary models (qi_sdpa_ex): the GPU maker's kernel where it is the faster,
+        // else the engine's own.  Its FP16 rows are the next product's input.
+        QiSdpa a;
+        a.q = qh;
+        a.k = kh;
+        a.v = vh;
+        a.out = x16;
+        a.heads = ad_heads_;
+        a.hd = ad_hd_;
+        a.q_row = a.k_row = a.v_row = a.o_row = C;
+        a.scale = scale;
+        if (in.size() > 1) {   // each context's rows over its own keys: an attention each
+            a.lq = t0;
+            a.lk = k0;
+            qi_sdpa_ex(a, s_);
+            a.q = qh + t0 * C;
+            a.k = kh + k0 * C;
+            a.v = vh + k0 * C;
+            a.out = x16 + t0 * C;
+            a.lq = LT - t0;
+            a.lk = Tk - k0;
+        } else {
+            a.lq = LT;
+            a.lk = Tk;
+        }
+        qi_sdpa_ex(a, s_);
     };
     rows16_plain(Plain{src, src_dim_}, LQ, src_dim_, s16, s_);
     for (const AdapterBlock& b : ablocks_) {
@@ -938,7 +916,6 @@ void AnimaDit::adapter(const std::vector<AdapterIn>& in) {
         const MfOut mk = product(x16, nullptr, b.sk, nullptr, k, LT, nullptr);
         const MfOut mv = product(x16, nullptr, b.sv, nullptr, v, LT, nullptr);
         attend(mq, b.sqn, dct, dst, mk, mv, b.skn, dct, dst, LT, t0);
-        rows16_plain(Plain{o, C}, LT, C, x16, s_);
         product(x16, nullptr, b.so, nullptr, q, LT, nullptr);
         add_rows(xa, q, LT * C, s_);
         // cross-attention to the states, each side rotated by its own positions
@@ -947,7 +924,6 @@ void AnimaDit::adapter(const std::vector<AdapterIn>& in) {
         const MfOut ck = product(s16, nullptr, b.ck, nullptr, k, LQ, nullptr);
         const MfOut cv = product(s16, nullptr, b.cv, nullptr, v, LQ, nullptr);
         attend(cq, b.cqn, dct, dst, ck, cv, b.ckn, dcc, dsc, LQ, q0);
-        rows16_plain(Plain{o, C}, LT, C, x16, s_);
         product(x16, nullptr, b.co, nullptr, q, LT, nullptr);
         add_rows(xa, q, LT * C, s_);
         // the MLP
@@ -1015,7 +991,7 @@ void AnimaDit::set_contexts(const std::vector<ContextIn>& in) {
     if (!text_loaded_) load_text();
     adapter(run);
     bool longer = false;
-    for (const AdapterIn& a : run) longer = longer || pad_keys(a.c->rows) > pad_keys(kCtxRows);
+    for (const AdapterIn& a : run) longer = longer || qi_attn_rows(a.c->rows) > qi_attn_rows(kCtxRows);
     if (longer && cap_hw_ > 0) {   // a longer context: the scores' buffers again
         const int64_t hw = cap_hw_, n = cap_n_;
         drop_activations();
@@ -1042,20 +1018,6 @@ void AnimaDit::install_prepare() {
     });
 }
 
-// The cross-attention through the GPU maker's fused attention (qi_sdpa: oneDNN, cuDNN, aotriton) where the build and
-// the GPU have one: a probe of a few rows.  Per head, the library's products and a softmax took the B70 51 ms of a
-// 421 ms step (2026-11-02), an eighth of the self-attention's work in half its time.
-bool AnimaDit::fused_attention_ok() {
-    const int64_t rows = 16, C = heads_ * hd_;
-    uint16_t* t = nullptr;
-    if (!gpu::alloc_device(&t, (size_t) (4 * rows * C) * 2)) return false;
-    gpu::memset_async(t, 0, (size_t) (4 * rows * C) * 2, s_);
-    const bool ok = qi_sdpa(t, t + rows * C, t + 2 * rows * C, 0, rows, rows, heads_, hd_, t + 3 * rows * C, s_);
-    gpu::stream_sync(s_);
-    gpu::free(t);
-    return ok;
-}
-
 void AnimaDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n, float* out,
                        const std::vector<int>* skip) {
     const int64_t HW = h * w, C = C_, R = n * HW, TV = 4 * lat_;
@@ -1070,8 +1032,13 @@ void AnimaDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n,
     time_embedding(sigma);
     if (sigma > last_sigma_) std::fill(kready_.begin(), kready_.end(), 0);   // a new image: K's means made again
     last_sigma_ = sigma;
-    if (cross_sdpa_ < 0) cross_sdpa_ = fused_attention_ok() ? 1 : 0;
-    const bool fused = cross_sdpa_ == 1;
+    // the cross-attention's form, once: the shared entry where the GPU has FP16 matrix engines, the products a head
+    // at a time where it has none (the shared kernel's FMA form measured slower there, attn_q's numbers)
+    if (cross_form_ < 0) {
+        const sycl::device dev = q_of(s_).get_device();
+        cross_form_ = kernels::flash_attn_path(&dev) < 0 ? 1 : 0;
+    }
+    const bool products = cross_form_ == 1;
     for (int bi = 0; bi < (int) blocks_.size(); ++bi) {
         if (skip != nullptr && std::find(skip->begin(), skip->end(), bi) != skip->end()) continue;
         const Block& b = blocks_[(size_t) bi];
@@ -1105,7 +1072,7 @@ void AnimaDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n,
         // queries: their products' input scales would take the deferred queries' slot)
         for (int i = 0; i < n; ++i) {
             Ctx& c = ctx_[i];
-            const int64_t L = c.rows, Lp = pad_keys(L);
+            const int64_t L = c.rows, Lp = qi_attn_rows(L);
             uint16_t*& kv = c.kv[(size_t) bi];
             if (kv != nullptr && c.kv_lp[(size_t) bi] != Lp) {   // a longer or shorter context than it was made for
                 gpu::stream_sync(s_);
@@ -1114,17 +1081,22 @@ void AnimaDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n,
             }
             if (kv == nullptr) {
                 kv = alloc<uint16_t>(allocs_, 2 * heads_ * Lp * hd_);
+                // the rows past L zero (the shared kernel reads whole chunks of keys, the products form whole Tp):
+                // async, as a synchronous memset here stalled the step's queue once a block (28 of them, +0.11 s)
+                gpu::memset_async(kv, 0, (size_t) (2 * heads_ * Lp * hd_) * 2, s_);
                 c.kv_lp[(size_t) bi] = Lp;
                 c.kv_ok[(size_t) bi] = 0;
             }
             if (!c.kv_ok[(size_t) bi]) {
                 const MfOut ck = product(c.c16, c.rs, b.ck, base, k_, L, nullptr);
                 const MfOut cv = product(c.c16, c.rs, b.cv, base, v_, L, nullptr, b.ck.type == kTypeW8);
-                if (fused) {   // K [L][C] normed, V [L][C]
-                    heads16(ck, L, L, heads_, hd_, f(b.ckn), nullptr, nullptr, kv, s_, true);
-                    values16(cv, L, C, kv + L * C, s_);
+                if (products) {
+                    attn_kv(ck, cv, L, heads_, hd_, f(b.ckn), kv);
                 } else {
-                    attn_kv(ck, cv, L, heads_, hd_, f(b.ckn), nullptr, nullptr, kv);
+                    // the shared attention's rows: K [Lp][C] normed a head, V [Lp][C] (its own kernel reads the keys
+                    // in whole chunks of 64, the rows past L masked)
+                    heads16(ck, L, Lp, heads_, hd_, f(b.ckn), nullptr, nullptr, kv, s_, true);
+                    values16(cv, L, C, kv + Lp * C, s_);
                 }
                 c.kv_ok[(size_t) bi] = 1;
             }
@@ -1132,21 +1104,23 @@ void AnimaDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n,
         modulation(b.mca1, b.mca2, base, mod_);
         rows16(LnMod{x_, mod_, mod_ + C, C}, R, C, h16_, rs_, s_);
         const MfOut cq = product(h16_, rs_, b.cq, base, q_, R, nullptr, false, true);
-        if (fused) {   // each context's rows through the GPU maker's fused attention, FP16 out
+        if (products) {   // each context's rows through the products, a head at a time (attn_q's numbers)
+            for (int i = 0; i < n; ++i)
+                attn_q(cq.from(i * HW), HW, heads_, hd_, f(b.cqn), ctx_[i].kv[(size_t) bi], ctx_[i].rows,
+                       o32_ + i * HW * C);
+            rows16(Plain{o32_, C}, R, C, o16_, rs_o_, s_);
+            gate_add(x_, product(o16_, rs_o_, b.co, base, a_, R, nullptr, false, true), mod_ + 2 * C, R, C, s_);
+        } else {
+            // each context's rows through the shared cross-attention (qi_attention_cross): the GPU maker's kernel
+            // where it is the faster, else the engine's own on the matrix engines
             for (int i = 0; i < n; ++i) {
                 const Ctx& c = ctx_[i];
                 heads16(cq.from(i * HW), HW, HW, heads_, hd_, f(b.cqn), nullptr, nullptr, jq16_, s_, true);
                 const uint16_t* kv = c.kv[(size_t) bi];
-                if (!qi_sdpa(jq16_, kv, kv + c.rows * C, 0, HW, c.rows, heads_, hd_, o16_ + i * HW * C, s_))
-                    throw std::runtime_error("image engine (Anima DiT): the fused attention failed");
+                qi_attention_cross(jq16_, kv, kv + c.kv_lp[(size_t) bi] * C, HW, c.rows, heads_, hd_,
+                                   o16_ + i * HW * C, s_);
             }
             gate_add(x_, product(o16_, nullptr, b.co, base, a_, R, nullptr, false, true), mod_ + 2 * C, R, C, s_);
-        } else {
-            for (int i = 0; i < n; ++i)
-                attn_q(cq.from(i * HW), HW, heads_, hd_, f(b.cqn), nullptr, nullptr, ctx_[i].kv[(size_t) bi],
-                       ctx_[i].rows, o32_ + i * HW * C);
-            rows16(Plain{o32_, C}, R, C, o16_, rs_o_, s_);
-            gate_add(x_, product(o16_, rs_o_, b.co, base, a_, R, nullptr, false, true), mod_ + 2 * C, R, C, s_);
         }
         // the MLP, a band of rows at a time
         modulation(b.mml1, b.mml2, base, mod_);

@@ -194,30 +194,38 @@ void add_heads(float* dst, const float* src, int64_t heads, int64_t per, const u
     });
 }
 
-// a head's largest dO and V row norms (FP32, V's FP16 rows widened) as bits into nd[h] and nv[h]
+// a head's largest dO and V row norms (FP32, V's FP16 rows widened) as bits into nd[h] and nv[h].  `vrows`: V's rows,
+// where they are not the queries' own (a cross-attention's keys; 0: rows)
 void head_norms(const float* dO, const uint16_t* v16, int64_t rows, int64_t heads, int64_t hd, uint32_t* nd,
-                uint32_t* nv, void* s) {
+                uint32_t* nv, void* s, int64_t vrows = 0) {
     // a work-group takes kNormRows rows of one head, a sub-group a row at a time (its lanes along the row), and adds
     // its largest norms into the head's with one atomic each (one a row a head was 1.6 ms of the B70's 2,304 rows)
     constexpr int64_t kNormRows = 64;
-    const int64_t blocks = (rows + kNormRows - 1) / kNormRows;
+    if (vrows <= 0) vrows = rows;
+    const int64_t blocks = (std::max(rows, vrows) + kNormRows - 1) / kNormRows;
     dit_rows::q_of(s).parallel_for(
         sycl::nd_range<1>(sycl::range<1>((size_t) (blocks * heads) * 128), sycl::range<1>(128)),
         [=](sycl::nd_item<1> it) {
             const int64_t gi = static_cast<int64_t>(it.get_group_linear_id()), h = gi % heads;
-            const int64_t r0 = gi / heads * kNormRows, r1 = sycl::min(rows, r0 + kNormRows);
+            const int64_t r0 = gi / heads * kNormRows, r1 = sycl::min(rows, r0 + kNormRows),
+                        v1 = sycl::min(vrows, r0 + kNormRows);
             const sycl::sub_group sg = it.get_sub_group();
             const int64_t lane = sg.get_local_linear_id(), w = sg.get_local_linear_range();
             float ma = 0.f, mb = 0.f;
             for (int64_t r = r0 + sg.get_group_linear_id(); r < r1; r += sg.get_group_linear_range()) {
-                float a = 0.f, b = 0.f;
+                float a = 0.f;
                 for (int64_t d = lane; d < hd; d += w) {
                     const float x = dO[(r * heads + h) * hd + d];
-                    const float y = kernels::f32_from_f16(v16[(r * heads + h) * hd + d]);
                     a += x * x;
-                    b += y * y;
                 }
                 ma = sycl::fmax(ma, sycl::reduce_over_group(sg, a, sycl::plus<float>()));
+            }
+            for (int64_t r = r0 + sg.get_group_linear_id(); r < v1; r += sg.get_group_linear_range()) {
+                float b = 0.f;
+                for (int64_t d = lane; d < hd; d += w) {
+                    const float y = kernels::f32_from_f16(v16[(r * heads + h) * hd + d]);
+                    b += y * y;
+                }
                 mb = sycl::fmax(mb, sycl::reduce_over_group(sg, b, sycl::plus<float>()));
             }
             ma = sycl::reduce_over_group(it.get_group(), ma, sycl::maximum<float>());
@@ -277,8 +285,10 @@ void scaled_do(const float* dO, const float* O, int64_t rows, int64_t heads, int
 // the fused backward (kernels::flash_attn_bwd) where the GPU takes it: false, nothing done, where it does not
 bool fused_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, const float* o32, const float* lse,
                const float* dO, int64_t T, int64_t H, int64_t hd, float* dQ, float* dK, float* dV, bool accumulate,
-               void* stream, int64_t n_causal, int64_t q_rows = 0) {
-    if (hd != 128 || dQ == nullptr || dK == nullptr || dV == nullptr) return false;
+               void* stream, int64_t n_causal, int64_t q_rows = 0, int64_t keys = 0) {
+    // the fused kernel walks the rows as their own keys: a cross-attention's keys are another count (the products or
+    // the maker's library take it)
+    if (hd != 128 || dQ == nullptr || dK == nullptr || dV == nullptr || (keys > 0 && keys != T)) return false;
     const int64_t Tp = qi_attn_rows(T);   // the chunks' rows, read whole: dO's past T zero, as q, k and v's are
     const size_t n16 = (size_t) (Tp * H * hd), n32 = (size_t) (H * T + H);
     const size_t bytes = 256 + n32 * 4 + n16 * 2;
@@ -397,13 +407,14 @@ bool maker_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, co
 // (n_causal: causal) through the engine's own kernels, each the rows its own.
 
 bool library_fwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t H, int64_t hd,
-                 float* out32, float* lse, void* stream, int64_t nt) {
+                 float* out32, float* lse, void* stream, int64_t nt, int64_t keys) {
     const int64_t C = H * hd, ri = T - nt;
     if (ri <= 0) return false;
+    if (keys <= 0) keys = T;
     uint8_t* ws = workspace(stream, 1, (size_t) (ri * C) * 2 + (size_t) (ri * H) * 4);
     auto* o16 = reinterpret_cast<uint16_t*>(ws);
     auto* st = reinterpret_cast<float*>(ws + (size_t) (ri * C) * 2);   // the library's [H][ri]
-    if (!maker_fwd(q16 + nt * C, k16, v16, ri, T, H, hd, o16, st, stream)) return false;
+    if (!maker_fwd(q16 + nt * C, k16, v16, ri, keys, H, hd, o16, st, stream)) return false;
     float* o = out32 + nt * C;
     float* l = lse + nt * H;
     dit_rows::q_of(stream).parallel_for(sycl::range<1>((size_t) (ri * C)), [=](sycl::id<1> id) {
@@ -439,23 +450,24 @@ bool library_fwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, 
 // FP16's range; the text rows' then through the fused kernel, their queries alone, added into dK and dV
 bool library_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, const float* o32, const float* lse,
                  const float* dO, int64_t T, int64_t H, int64_t hd, float* dQ, float* dK, float* dV, bool accumulate,
-                 void* stream, int64_t nt) {
+                 void* stream, int64_t nt, int64_t keys) {
     const int64_t C = H * hd, ri = T - nt;
     constexpr size_t kHead = 512;   // nd [H], nv [H] and the flag
     if (ri <= 0 || (size_t) (2 * H * 4 + 4) > kHead) return false;
-    const size_t n = (size_t) (T * C);
-    uint8_t* ws = workspace(stream, 2, kHead + (size_t) (T * H + H) * 4 + 5 * n * 2 + (size_t) (ri * H) * 4 +
-                                           (size_t) (ri * H * (hd + 1)) * 4);
+    if (keys <= 0) keys = T;
+    const size_t n = (size_t) (T * C), nk = (size_t) (keys * C), nc = std::max(n, nk);
+    uint8_t* ws = workspace(stream, 2, kHead + (size_t) (T * H + H) * 4 + (3 * n + 2 * nk) * 2 +
+                                           (size_t) (ri * H) * 4 + (size_t) (ri * H * (hd + 1)) * 4);
     auto* bits = reinterpret_cast<uint32_t*>(ws);   // nd [H], nv [H], the non-finite flag
     uint32_t* bad = bits + 2 * H;
     auto* D = reinterpret_cast<float*>(ws + kHead);
     float* g = D + H * T;
     auto* doh = reinterpret_cast<uint16_t*>(g + H);
-    uint16_t *o16 = doh + n, *dq16 = o16 + n, *dk16 = dq16 + n, *dv16 = dk16 + n;
-    auto* st = reinterpret_cast<float*>(dv16 + n);   // the image rows' statistics as the library takes them [H][ri]
+    uint16_t *o16 = doh + n, *dq16 = o16 + n, *dk16 = dq16 + n, *dv16 = dk16 + nk;
+    auto* st = reinterpret_cast<float*>(dv16 + nk);   // the image rows' statistics as the library takes them [H][ri]
     float* lws = st + ri * H;                         // the library's own room
     gpu::memset_async(bits, 0, kHead, stream);
-    head_norms(dO, v16, T, H, hd, bits, bits + H, stream);
+    head_norms(dO, v16, T, H, hd, bits, bits + H, stream, keys);
     // the fused kernel's g (dS within FP16's range) times 16: dS 2^-4 of it, so that the products' sums over the keys
     // and the queries stay within it too (a sum past it is caught below).  The block's gradients came out the same
     // from 2^-8 to 2^8 of it (Qwen-Image-2.1, 32 heads of 1,048 rows, 2026-11-09)
@@ -470,15 +482,16 @@ bool library_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, 
             st[id[0]] = li[t * H + h];
         }
     });
-    if (!maker_bwd(q16 + nt * C, k16, v16, o16 + nt * C, st, doh + nt * C, ri, T, H, hd, dq16, dk16, dv16, lws,
+    if (!maker_bwd(q16 + nt * C, k16, v16, o16 + nt * C, st, doh + nt * C, ri, keys, H, hd, dq16, dk16, dv16, lws,
                    stream))
         return false;
     // a gradient past FP16's range: nothing written, the caller's other forms take the step
     const int64_t nq = ri * C;
-    dit_rows::q_of(stream).parallel_for(sycl::range<1>(n), [=](sycl::id<1> id) {
+    dit_rows::q_of(stream).parallel_for(sycl::range<1>(nc), [=](sycl::id<1> id) {
         const size_t i = id[0];
-        bool ok = std::isfinite(kernels::f32_from_f16(dk16[i])) && std::isfinite(kernels::f32_from_f16(dv16[i]));
-        if ((int64_t) i < nq) ok = ok && std::isfinite(kernels::f32_from_f16(dq16[i]));
+        bool ok = true;
+        if (i < nk) ok = std::isfinite(kernels::f32_from_f16(dk16[i])) && std::isfinite(kernels::f32_from_f16(dv16[i]));
+        if (ok && (int64_t) i < nq) ok = std::isfinite(kernels::f32_from_f16(dq16[i]));
         if (!ok) sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device>(*bad).store(1u);
     });
     uint32_t flag = 0;
@@ -490,13 +503,15 @@ bool library_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, 
         return false;
     }
     float* dq = dQ + nt * C;
-    dit_rows::q_of(stream).parallel_for(sycl::range<1>(n), [=](sycl::id<1> id) {
+    dit_rows::q_of(stream).parallel_for(sycl::range<1>(nc), [=](sycl::id<1> id) {
         const size_t i = id[0];
         const float gh = g[(i % C) / hd];
         if ((int64_t) i < nq) dq[i] = kernels::f32_from_f16(dq16[i]) * gh;
-        const float k = kernels::f32_from_f16(dk16[i]) * gh, v = kernels::f32_from_f16(dv16[i]) * gh;
-        dK[i] = accumulate ? dK[i] + k : k;
-        dV[i] = accumulate ? dV[i] + v : v;
+        if (i < nk) {
+            const float k = kernels::f32_from_f16(dk16[i]) * gh, v = kernels::f32_from_f16(dv16[i]) * gh;
+            dK[i] = accumulate ? dK[i] + k : k;
+            dV[i] = accumulate ? dV[i] + v : v;
+        }
     });
     if (nt > 0 && !fused_bwd(q16, k16, v16, o32, lse, dO, T, H, hd, dQ, dK, dV, true, stream, nt, nt))
         throw std::runtime_error("image engine: the attention's text rows have no backward kernel here");
@@ -538,16 +553,17 @@ void put_scaled(const float* sum, const float* g, int64_t r0, int64_t n, int64_t
 // and read by the three products.  False, nothing done, where oneMath does not take them.
 bool products_v2(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, const float* o32, const float* lse,
                  const float* dO, int64_t T, int64_t H, int64_t hd, float* dQ, float* dK, float* dV, bool accumulate,
-                 prefill::Gemm& gemm, void* stream, int64_t n_causal) {
+                 prefill::Gemm& gemm, void* stream, int64_t n_causal, int64_t keys) {
     if (strata::env_get("ATTN_BWD_MAPS") != nullptr || dQ == nullptr || dK == nullptr || dV == nullptr ||
         2 * H * 4 > 256)
         return false;
+    if (keys <= 0) keys = T;
     const int64_t C = H * hd;
     // a tile's query rows: S and dP FP32, P and dS FP16 (12 bytes a key a row a head) within kMaps
-    const int64_t tile = std::clamp<int64_t>(kMaps / (12 * H * std::max<int64_t>(T, 1)) / kT * kT, kT,
+    const int64_t tile = std::clamp<int64_t>(kMaps / (12 * H * std::max<int64_t>(keys, 1)) / kT * kT, kT,
                                              (T + kT - 1) / kT * kT);
-    const size_t maps = (size_t) (H * tile * T);
-    const size_t bytes = 256 + ((size_t) (H * T + H) + 2 * (size_t) (T * C) + 2 * maps + (size_t) (tile * C)) * 4 +
+    const size_t maps = (size_t) (H * tile * keys);
+    const size_t bytes = 256 + ((size_t) (H * T + H) + 2 * (size_t) (keys * C) + 2 * maps + (size_t) (tile * C)) * 4 +
                          (size_t) (T * C) * 2 + 2 * maps * 2;
     static std::mutex mu;
     static std::map<void*, std::pair<uint8_t*, size_t>> kept;
@@ -573,8 +589,8 @@ bool products_v2(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, 
     auto* D = reinterpret_cast<float*>(ws + 256);
     float* g = D + H * T;
     float* dk_sum = g + H;
-    float* dv_sum = dk_sum + T * C;
-    float* S = dv_sum + T * C;
+    float* dv_sum = dk_sum + keys * C;
+    float* S = dv_sum + keys * C;
     float* dP = S + maps;
     float* dq = dP + maps;   // a tile's dQ [H][tile][hd]
     auto* doh = reinterpret_cast<uint16_t*>(dq + tile * C);
@@ -582,37 +598,38 @@ bool products_v2(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, 
     uint16_t* ds16 = p16 + maps;
     const float scale = 1.f / std::sqrt((float) hd);
     gpu::memset_async(bits, 0, 256, stream);
-    head_norms(dO, v16, T, H, hd, bits, bits + H, stream);
+    head_norms(dO, v16, T, H, hd, bits, bits + H, stream, keys);
     head_g(bits, bits + H, H, scale, g, stream);
     scaled_do(dO, o32, T, H, hd, g, doh, D, stream);
     for (int64_t i0 = 0; i0 < T; i0 += tile) {
         const int64_t n = std::min(tile, T - i0);
         const float beta = i0 == 0 ? 0.f : 1.f;
-        // S = Q K^T and dP = dO V^T: [h][n][T]
-        if (!gemm.f16_batch_ex(false, true, q16 + i0 * C, k16, S, n, T, hd, H, hd, hd, n * T, C, C, T, 0.f) ||
-            !gemm.f16_batch_ex(false, true, doh + i0 * C, v16, dP, n, T, hd, H, hd, hd, n * T, C, C, T, 0.f))
+        // S = Q K^T and dP = dO V^T: [h][n][keys]
+        if (!gemm.f16_batch_ex(false, true, q16 + i0 * C, k16, S, n, keys, hd, H, hd, hd, n * keys, C, C, keys, 0.f) ||
+            !gemm.f16_batch_ex(false, true, doh + i0 * C, v16, dP, n, keys, hd, H, hd, hd, n * keys, C, C, keys, 0.f))
             return false;   // (the first product: before anything was written)
-        tile_pds(S, dP, lse, D, i0, n, T, H, scale, n_causal, p16, ds16, stream);
+        tile_pds(S, dP, lse, D, i0, n, keys, H, scale, n_causal, p16, ds16, stream);
         // dQ = dS K, dV += P^T dO, dK += dS^T Q: each head's output a block of its own ([H][rows][hd]: oneMKL takes
         // no batch whose outputs interleave)
-        if (!gemm.f16_batch_ex(false, false, ds16, k16, dq, n, hd, T, H, n * T, hd, n * hd, T, C, hd, 0.f) ||
-            !gemm.f16_batch_ex(true, false, p16, doh + i0 * C, dv_sum, T, hd, n, H, n * T, hd, T * hd, T, C, hd,
-                               beta) ||
-            !gemm.f16_batch_ex(true, false, ds16, q16 + i0 * C, dk_sum, T, hd, n, H, n * T, hd, T * hd, T, C, hd,
-                               beta))
+        if (!gemm.f16_batch_ex(false, false, ds16, k16, dq, n, hd, keys, H, n * keys, hd, n * hd, keys, C, hd, 0.f) ||
+            !gemm.f16_batch_ex(true, false, p16, doh + i0 * C, dv_sum, keys, hd, n, H, n * keys, hd, keys * hd, keys,
+                               C, hd, beta) ||
+            !gemm.f16_batch_ex(true, false, ds16, q16 + i0 * C, dk_sum, keys, hd, n, H, n * keys, hd, keys * hd, keys,
+                               C, hd, beta))
             throw std::runtime_error(
                 "image engine: oneMath failed in the attention's backward after its first product");
         put_scaled(dq, g, i0, n, H, hd, dQ, false, stream);   // dQ in g's units: out to its rows
     }
-    put_scaled(dk_sum, g, 0, T, H, hd, dK, accumulate, stream);
-    put_scaled(dv_sum, g, 0, T, H, hd, dV, accumulate, stream);
+    put_scaled(dk_sum, g, 0, keys, H, hd, dK, accumulate, stream);
+    put_scaled(dv_sum, g, 0, keys, H, hd, dV, accumulate, stream);
     return true;
 }
 
 }  // namespace
 
 void qi_attention_train(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
-                        int64_t head_dim, float* out32, float* lse, void* stream, int64_t n_causal) {
+                        int64_t head_dim, float* out32, float* lse, void* stream, int64_t n_causal, int64_t keys) {
+    if (keys <= 0) keys = T;
     kernels::FlashAttnArgs a;
     a.q = q16;
     a.q_ld = heads * head_dim;
@@ -621,7 +638,8 @@ void qi_attention_train(const uint16_t* q16, const uint16_t* k16, const uint16_t
     a.kv_ld = heads * head_dim;
     a.n_head = a.n_kv = heads;
     a.head_dim = head_dim;
-    a.rows = a.keys = T;
+    a.rows = T;
+    a.keys = keys;
     a.n_causal = n_causal;
     a.first = 0;
     a.row_end = T;
@@ -633,11 +651,11 @@ void qi_attention_train(const uint16_t* q16, const uint16_t* k16, const uint16_t
     // Keep the original training choice: the common multi-sample trial and sub-group tuning raised four-step
     // Qwen-Image training from 2.17 to 2.29 s/step on the B70 and 3.88 to 4.06 s/step on the RTX 4070 (2026-11-11).
     // the engine's own kernel (0) or the GPU maker's library (1, library_fwd): XESTRATA_ATTN_TRAIN_FWD (own or
-    // library), or the faster the first time a GPU takes the shape (rows in steps of 512, heads), both run twice into
-    // the outputs then and the second runs timed (the same outputs either way).  On the B70 at 2,304 rows of 32
-    // heads oneDNN's took 2.0 ms and the engine's 3.1; on the A380 12.4 and 189 (2026-11-09)
+    // library), or the faster the first time a GPU takes the shape (rows in steps of 512, keys, heads), both run
+    // twice into the outputs then and the second runs timed (the same outputs either way).  On the B70 at 2,304 rows
+    // of 32 heads oneDNN's took 2.0 ms and the engine's 3.1; on the A380 12.4 and 189 (2026-11-09)
     auto run = [&](int form) {
-        if (form == 1) return library_fwd(q16, k16, v16, T, heads, head_dim, out32, lse, stream, n_causal);
+        if (form == 1) return library_fwd(q16, k16, v16, T, heads, head_dim, out32, lse, stream, n_causal, keys);
         return kernels::flash_attn(a, stream);
     };
     int form = -1;
@@ -645,8 +663,8 @@ void qi_attention_train(const uint16_t* q16, const uint16_t* k16, const uint16_t
         form = std::string(e) == "library" ? 1 : 0;
     } else {
         static std::mutex mu;
-        static std::map<std::tuple<void*, int64_t, int64_t>, int> chose;
-        const auto k = std::make_tuple(stream, (T + 511) / 512, heads);
+        static std::map<std::tuple<void*, int64_t, int64_t, int64_t>, int> chose;
+        const auto k = std::make_tuple(stream, (T + 511) / 512, keys, heads);
         {
             std::lock_guard<std::mutex> lock(mu);
             auto it = chose.find(k);
@@ -681,7 +699,7 @@ namespace {
 // the shared products' backward (below): every head at once, a tile of query rows at a time
 void products_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, const float* o32, const float* lse,
                   const float* dO, int64_t T, int64_t heads, int64_t head_dim, float* dQ, float* dK, float* dV,
-                  bool accumulate, prefill::Gemm& gemm, void* stream, int64_t n_causal);
+                  bool accumulate, prefill::Gemm& gemm, void* stream, int64_t n_causal, int64_t keys);
 
 double seconds_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -691,23 +709,29 @@ double seconds_since(std::chrono::steady_clock::time_point t0) {
 
 void qi_attention_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, const float* o32,
                       const float* lse, const float* dO, int64_t T, int64_t heads, int64_t head_dim, float* dQ,
-                      float* dK, float* dV, bool accumulate, prefill::Gemm& gemm, void* stream, int64_t n_causal) {
+                      float* dK, float* dV, bool accumulate, prefill::Gemm& gemm, void* stream, int64_t n_causal,
+                      int64_t keys) {
     // Three forms: FlashAttention-2's fused backward on the matrix engines (Intel's, NVIDIA's, AMD's), the shared
     // products, and the GPU maker's library (oneDNN's SDPA on Intel GPUs, the text rows the fused kernel's): whichever
-    // ran fastest the first time a GPU took the shape (rows in steps of 512, heads), each timed then into scratch.  On
-    // the B70 at 2,304 rows of 32 heads the library took 6.1 ms, the fused form 8.4 and the products 12; on the A380
-    // the products 57 ms, the library 145 and the fused form 509 (2026-11-09).  XESTRATA_ATTN_BWD_FORM (fused,
-    // products or library) takes one always where it runs.
+    // ran fastest the first time a GPU took the shape (rows in steps of 512, keys, heads), each timed then into
+    // scratch.  On the B70 at 2,304 rows of 32 heads the library took 6.1 ms, the fused form 8.4 and the products 12;
+    // on the A380 the products 57 ms, the library 145 and the fused form 509 (2026-11-09).  XESTRATA_ATTN_BWD_FORM
+    // (fused, products or library) takes one always where it runs.  A cross-attention (keys not the rows' own) has no
+    // fused form: its kernel walks the rows as their own keys.
+    if (keys <= 0) keys = T;
     const auto dev = core::Runtime::get().stream(stream).get_device();
-    const size_t n = (size_t) (T * heads * head_dim);
+    const size_t n = (size_t) (T * heads * head_dim), nk = (size_t) (keys * heads * head_dim);
     auto run = [&](int form, float* q_, float* k_, float* v_, bool acc) {
         switch (form) {
-        case 0: return fused_bwd(q16, k16, v16, o32, lse, dO, T, heads, head_dim, q_, k_, v_, acc, stream, n_causal);
-        case 2: return library_bwd(q16, k16, v16, o32, lse, dO, T, heads, head_dim, q_, k_, v_, acc, stream, n_causal);
+        case 0: return fused_bwd(q16, k16, v16, o32, lse, dO, T, heads, head_dim, q_, k_, v_, acc, stream, n_causal, 0,
+                                 keys);
+        case 2: return library_bwd(q16, k16, v16, o32, lse, dO, T, heads, head_dim, q_, k_, v_, acc, stream, n_causal,
+                                   keys);
         default:
-            if (!products_v2(q16, k16, v16, o32, lse, dO, T, heads, head_dim, q_, k_, v_, acc, gemm, stream, n_causal))
+            if (!products_v2(q16, k16, v16, o32, lse, dO, T, heads, head_dim, q_, k_, v_, acc, gemm, stream, n_causal,
+                             keys))
                 products_bwd(q16, k16, v16, o32, lse, dO, T, heads, head_dim, q_, k_, v_, acc, gemm, stream,
-                             n_causal);
+                             n_causal, keys);
             return true;
         }
     };
@@ -718,8 +742,8 @@ void qi_attention_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* 
             if (std::string(e) == kName[f]) form = f;
     } else {
         static std::mutex mu;
-        static std::map<std::tuple<void*, int64_t, int64_t>, int> chose;   // (stream: its GPU, rows / 512, heads)
-        const auto k = std::make_tuple(stream, (T + 511) / 512, heads);
+        static std::map<std::tuple<void*, int64_t, int64_t, int64_t>, int> chose;   // (stream: its GPU, rows / 512, keys, heads)
+        const auto k = std::make_tuple(stream, (T + 511) / 512, keys, heads);
         {
             std::lock_guard<std::mutex> lock(mu);
             auto it = chose.find(k);
@@ -729,13 +753,13 @@ void qi_attention_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* 
             // each form into scratch twice, the second run timed (the first compiles its kernels)
             float* tmp = nullptr;
             form = 1;
-            if (gpu::alloc_device(&tmp, 3 * n * 4)) {
+            if (gpu::alloc_device(&tmp, (n + 2 * nk) * 4)) {
                 double best = 1e30;
                 for (int f = 0; f < 3; ++f) {
-                    if (!run(f, tmp, tmp + n, tmp + 2 * n, false)) continue;
+                    if (!run(f, tmp, tmp + n, tmp + n + nk, false)) continue;
                     gpu::stream_sync(stream);
                     const auto t0 = std::chrono::steady_clock::now();
-                    const bool ok = run(f, tmp, tmp + n, tmp + 2 * n, false);
+                    const bool ok = run(f, tmp, tmp + n, tmp + n + nk, false);
                     gpu::stream_sync(stream);
                     const double t = seconds_since(t0);
                     if (ok && t < best) {
@@ -769,20 +793,21 @@ namespace {
 
 void products_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, const float* o32, const float* lse,
                   const float* dO, int64_t T, int64_t heads, int64_t head_dim, float* dQ, float* dK, float* dV,
-                  bool accumulate, prefill::Gemm& gemm, void* stream, int64_t n_causal) {
+                  bool accumulate, prefill::Gemm& gemm, void* stream, int64_t n_causal, int64_t keys) {
     const int64_t hd = head_dim, H = heads;
+    if (keys <= 0) keys = T;
     // a tile's query rows: its maps (S and dP FP32, dS, dS^T and P^T FP16: 14 bytes a key a row a head) within kMaps
-    int64_t tile = std::clamp<int64_t>(kMaps / (14 * H * std::max<int64_t>(T, 1)) / kT * kT, kT,
+    int64_t tile = std::clamp<int64_t>(kMaps / (14 * H * std::max<int64_t>(keys, 1)) / kT * kT, kT,
                                        (T + kT - 1) / kT * kT);
     // XESTRATA_ATTN_BWD_TILE: the tile's rows set (a multiple of 32), so a check with few rows takes several tiles
     if (const char* e = strata::env_get("ATTN_BWD_TILE")) tile = std::max<int64_t>(kT, std::atoll(e) / kT * kT);
     const int64_t ntiles = (T + tile - 1) / tile;
     const float scale = 1.f / std::sqrt((float) hd);
-    // every head's Q, K, V, dO (FP16 [H][T][hd]) and K^T ([H][hd][T]), D [H][T], dK and dV sums and a tile's parts
-    // ([H][T][hd] FP32), a tile's maps, Q^T and dO^T ([H][hd][tile]) and dQ ([H][tile][hd]); the powers of two: dO's a
-    // head, then dS's a head and tile
-    const int64_t n16 = 5 * H * T * hd + 3 * H * tile * T + 2 * H * hd * tile;
-    const int64_t n32 = H * T + 4 * H * T * hd + 2 * H * tile * T + H * tile * hd;
+    // every head's Q and dO (FP16 [H][T][hd]), K, V and K^T ([H][keys][hd], K^T [H][hd][keys]), D [H][T], dK and dV
+    // sums and a tile's parts ([H][keys][hd] FP32), a tile's maps, Q^T and dO^T ([H][hd][tile]) and dQ
+    // ([H][tile][hd]); the powers of two: dO's a head, then dS's a head and tile
+    const int64_t n16 = 2 * H * T * hd + 3 * H * keys * hd + 3 * H * tile * keys + 2 * H * hd * tile;
+    const int64_t n32 = H * T + 4 * H * keys * hd + 2 * H * tile * keys + H * tile * hd;
     const size_t bits_bytes = (size_t) (H * (1 + ntiles)) * 4;
     const size_t bytes = (bits_bytes + 255) / 256 * 256 + (size_t) n32 * 4 + (size_t) n16 * 2;
     // the workspace, kept for the stream's next call (every block of a step takes the same shape): the stream runs in
@@ -811,41 +836,42 @@ void products_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
     auto* f = reinterpret_cast<float*>(ws + (bits_bytes + 255) / 256 * 256);
     float* D = f;
     float* dk_sum = D + H * T;
-    float* dv_sum = dk_sum + H * T * hd;
-    float* kpart = dv_sum + H * T * hd;
-    float* vpart = kpart + H * T * hd;
-    float* S = vpart + H * T * hd;
-    float* dP = S + H * tile * T;
-    float* dq = dP + H * tile * T;
+    float* dv_sum = dk_sum + H * keys * hd;
+    float* kpart = dv_sum + H * keys * hd;
+    float* vpart = kpart + H * keys * hd;
+    float* S = vpart + H * keys * hd;
+    float* dP = S + H * tile * keys;
+    float* dq = dP + H * tile * keys;
     auto* h16 = reinterpret_cast<uint16_t*>(dq + H * tile * hd);
-    uint16_t *qh = h16, *kh = qh + H * T * hd, *vh = kh + H * T * hd, *doh = vh + H * T * hd, *kt = doh + H * T * hd;
-    uint16_t *ds16 = kt + H * T * hd, *ds16t = ds16 + H * tile * T, *pt16 = ds16t + H * tile * T;
-    uint16_t *qt = pt16 + H * tile * T, *dot = qt + H * hd * tile;
+    uint16_t *qh = h16, *kh = qh + H * T * hd, *vh = kh + H * keys * hd, *doh = vh + H * keys * hd,
+             *kt = doh + H * T * hd;
+    uint16_t *ds16 = kt + H * keys * hd, *ds16t = ds16 + H * tile * keys, *pt16 = ds16t + H * tile * keys;
+    uint16_t *qt = pt16 + H * tile * keys, *dot = qt + H * hd * tile;
     gpu::memset_async(bits, 0, bits_bytes, stream);
     gather16(q16, T, H, hd, qh, stream);
-    gather16(k16, T, H, hd, kh, stream);
-    gather16(v16, T, H, hd, vh, stream);
+    gather16(k16, keys, H, hd, kh, stream);
+    gather16(v16, keys, H, hd, vh, stream);
     head_dot(dO, o32, T, H, hd, D, bits, stream);
     gather_do16(dO, T, H, hd, bits, doh, stream);
-    transpose_batch(kh, T * hd, T, hd, H, kt, hd * T, stream);
+    transpose_batch(kh, keys * hd, keys, hd, H, kt, hd * keys, stream);
     for (int64_t ti = 0; ti < ntiles; ++ti) {
         const int64_t i0 = ti * tile, n = std::min(tile, T - i0);
         uint32_t* tb = bits + H * (1 + ti);
-        gemm.f16_batch(qh + i0 * hd, kh, S, n, T, hd, H, T * hd, T * hd, n * T);    // S = Q K^T
-        gemm.f16_batch(doh + i0 * hd, vh, dP, n, T, hd, H, T * hd, T * hd, n * T);  // dP = dO V^T (dO's scale)
-        tile_ds(S, dP, lse, D, i0, n, T, H, scale, n_causal, bits, tb, stream);
-        tile_maps(S, dP, lse, i0, n, T, H, scale, n_causal, tb, ds16, ds16t, pt16, stream);
-        gemm.f16_batch(ds16, kt, dq, n, hd, T, H, n * T, hd * T, n * hd);           // dQ = dS K
+        gemm.f16_batch(qh + i0 * hd, kh, S, n, keys, hd, H, T * hd, keys * hd, n * keys);    // S = Q K^T
+        gemm.f16_batch(doh + i0 * hd, vh, dP, n, keys, hd, H, T * hd, keys * hd, n * keys);  // dP = dO V^T (dO's scale)
+        tile_ds(S, dP, lse, D, i0, n, keys, H, scale, n_causal, bits, tb, stream);
+        tile_maps(S, dP, lse, i0, n, keys, H, scale, n_causal, tb, ds16, ds16t, pt16, stream);
+        gemm.f16_batch(ds16, kt, dq, n, hd, keys, H, n * keys, hd * keys, n * hd);           // dQ = dS K
         scatter(dq, i0, n, H, hd, dQ, false, tb, stream);
         transpose_batch(qh + i0 * hd, T * hd, n, hd, H, qt, hd * n, stream);
         transpose_batch(doh + i0 * hd, T * hd, n, hd, H, dot, hd * n, stream);
-        gemm.f16_batch(pt16, dot, vpart, T, hd, n, H, T * n, hd * n, T * hd);       // dV's part: P^T dO
-        add_heads(dv_sum, vpart, H, T * hd, nullptr, ti == 0, stream);              // (dO's scale)
-        gemm.f16_batch(ds16t, qt, kpart, T, hd, n, H, T * n, hd * n, T * hd);       // dK's part: dS^T Q
-        add_heads(dk_sum, kpart, H, T * hd, tb, ti == 0, stream);                   // (the tile's scale out)
+        gemm.f16_batch(pt16, dot, vpart, keys, hd, n, H, keys * n, hd * n, keys * hd);       // dV's part: P^T dO
+        add_heads(dv_sum, vpart, H, keys * hd, nullptr, ti == 0, stream);              // (dO's scale)
+        gemm.f16_batch(ds16t, qt, kpart, keys, hd, n, H, keys * n, hd * n, keys * hd);       // dK's part: dS^T Q
+        add_heads(dk_sum, kpart, H, keys * hd, tb, ti == 0, stream);                   // (the tile's scale out)
     }
-    scatter(dk_sum, 0, T, H, hd, dK, accumulate, nullptr, stream);
-    scatter(dv_sum, 0, T, H, hd, dV, accumulate, bits, stream);
+    scatter(dk_sum, 0, keys, H, hd, dK, accumulate, nullptr, stream);
+    scatter(dv_sum, 0, keys, H, hd, dV, accumulate, bits, stream);
 }
 
 }  // namespace

@@ -16,6 +16,7 @@
 //
 //   qi_attn_parity --bench T [N_TEXT]   times both on T rows' image rows (no reference; not a CTest case)
 #include "strata/image/qi_kernels.hpp"
+#include "strata/prefill/gemm.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "../kernels/parity_device.hpp"
 
@@ -292,6 +293,133 @@ int check() {
     return fails ? 1 : 0;
 }
 
+// A cross-attention (Anima's blocks): 320 query rows over 512 keys, every row seeing every key, through the shared
+// entry (qi_attention_cross) and the training pair (qi_attention_train, qi_attention_bwd), against FP64.  The query
+// rows are not a multiple of 128: the padding the kernels read whole is part of what this checks.
+int check_cross(par::Device& dev) {
+    const int64_t Tq = 320, Tk = 512, Cq = Tq * C, Ck = Tk * C;
+    std::mt19937 rng(1203);  // NOLINT(bugprone-random-generator-seed): reproducible inputs.
+    std::normal_distribution<float> nd(0.f, 1.f);
+    std::vector<uint16_t> qh((size_t) Cq), kh((size_t) Ck), vh((size_t) Ck), doh((size_t) Cq);
+    for (auto& x : qh) x = k::f16_from_f32(nd(rng));
+    for (auto& x : kh) x = k::f16_from_f32(nd(rng));
+    for (auto& x : vh) x = k::f16_from_f32(nd(rng));
+    for (auto& x : doh) x = k::f16_from_f32(nd(rng));
+    const int64_t qp = si::qi_attn_rows(Tq), kp = si::qi_attn_rows(Tk);
+    std::vector<uint16_t> qpad((size_t) (qp * C), 0), kpad((size_t) (kp * C), 0), vpad((size_t) (kp * C), 0);
+    std::copy(qh.begin(), qh.end(), qpad.begin());
+    std::copy(kh.begin(), kh.end(), kpad.begin());
+    std::copy(vh.begin(), vh.end(), vpad.begin());
+    // FP64: the probabilities, the output and the three gradients
+    std::vector<double> P((size_t) (Tq * Tk * H)), O((size_t) Cq), dQ((size_t) Cq), dK((size_t) Ck), dV((size_t) Ck);
+    const double scale = 1.0 / std::sqrt((double) D);
+    for (int64_t t = 0; t < Tq; ++t)
+        for (int64_t h = 0; h < H; ++h) {
+            double m = -1e300;
+            for (int64_t j = 0; j < Tk; ++j) {
+                double d = 0.0;
+                for (int64_t i = 0; i < D; ++i)
+                    d += (double) k::f32_from_f16(qh[(size_t) (t * C + h * D + i)]) *
+                         k::f32_from_f16(kh[(size_t) (j * C + h * D + i)]);
+                P[(size_t) ((t * Tk + j) * H + h)] = d * scale;
+                m = std::max(m, d * scale);
+            }
+            double l = 0.0;
+            for (int64_t j = 0; j < Tk; ++j) {
+                double& p = P[(size_t) ((t * Tk + j) * H + h)];
+                p = std::exp(p - m);
+                l += p;
+            }
+            for (int64_t j = 0; j < Tk; ++j) P[(size_t) ((t * Tk + j) * H + h)] /= l;
+            for (int64_t i = 0; i < D; ++i) {
+                double o = 0.0;
+                for (int64_t j = 0; j < Tk; ++j)
+                    o += P[(size_t) ((t * Tk + j) * H + h)] * k::f32_from_f16(vh[(size_t) (j * C + h * D + i)]);
+                O[(size_t) (t * C + h * D + i)] = o;
+            }
+        }
+    for (int64_t t = 0; t < Tq; ++t)
+        for (int64_t h = 0; h < H; ++h) {
+            double Dsum = 0.0;
+            for (int64_t i = 0; i < D; ++i)
+                Dsum += (double) k::f32_from_f16(doh[(size_t) (t * C + h * D + i)]) * O[(size_t) (t * C + h * D + i)];
+            for (int64_t j = 0; j < Tk; ++j) {
+                const double p = P[(size_t) ((t * Tk + j) * H + h)];
+                double dp = 0.0;
+                for (int64_t i = 0; i < D; ++i)
+                    dp += (double) k::f32_from_f16(doh[(size_t) (t * C + h * D + i)]) *
+                          k::f32_from_f16(vh[(size_t) (j * C + h * D + i)]);
+                const double ds = p * (dp - Dsum) * scale;
+                for (int64_t i = 0; i < D; ++i) {
+                    dQ[(size_t) (t * C + h * D + i)] += ds * k::f32_from_f16(kh[(size_t) (j * C + h * D + i)]);
+                    dK[(size_t) (j * C + h * D + i)] += ds * k::f32_from_f16(qh[(size_t) (t * C + h * D + i)]);
+                    dV[(size_t) (j * C + h * D + i)] += p * k::f32_from_f16(doh[(size_t) (t * C + h * D + i)]);
+                }
+            }
+        }
+    auto rel = [](const std::vector<double>& got, const std::vector<double>& ref) {
+        double e = 0.0, r = 0.0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            const double d = got[i] - ref[i];
+            e += d * d;
+            r += ref[i] * ref[i];
+        }
+        return std::sqrt(e / std::max(r, 1e-30));
+    };
+    uint16_t *q = up(dev, qpad), *kd = up(dev, kpad), *v = up(dev, vpad);
+    uint16_t* out = dev.alloc<uint16_t>((size_t) Cq);
+    int fails = 0;
+    si::qi_attention_cross(q, kd, v, Tq, Tk, H, D, out, nullptr);
+    std::vector<uint16_t> g((size_t) Cq);
+    par::copy_out(g.data(), out, g.size());
+    std::vector<double> got((size_t) Cq);
+    for (size_t i = 0; i < g.size(); ++i) got[i] = k::f32_from_f16(g[i]);
+    const double e = rel(got, O);
+    std::printf("  cross-attention (%lld rows of %lld keys) RMS error %.3e of the output's (at most 1e-02) %s\n",
+                (long long) Tq, (long long) Tk, e, e <= 1e-2 ? "ok" : "FAIL");
+    fails += e > 1e-2;
+    // the training pair: the FP32 output and the three gradients (the products' FP16 maps widen the bound)
+    strata::prefill::Gemm gemm;
+    std::string err;
+    if (!gemm.init(nullptr, 1 << 24, err)) {
+        std::printf("  cross-attention: the products' engine did not open (%s)\n", err.c_str());
+        return 1;
+    }
+    float* o32 = dev.alloc<float>((size_t) Cq);
+    float* lse = dev.alloc<float>((size_t) (Tq * H));
+    si::qi_attention_train(q, kd, v, Tq, H, D, o32, lse, nullptr, 0, Tk);
+    std::vector<float> ho((size_t) Cq);
+    par::copy_out(ho.data(), o32, ho.size());
+    got.assign(ho.begin(), ho.end());
+    const double ef = rel(got, O);
+    std::printf("  cross-attention, training forward  RMS error %.3e (at most 1e-02) %s\n", ef, ef <= 1e-2 ? "ok" : "FAIL");
+    fails += ef > 1e-2;
+    float* dO = dev.alloc<float>((size_t) Cq);
+    {
+        std::vector<float> f((size_t) Cq);
+        for (size_t i = 0; i < f.size(); ++i) f[i] = k::f32_from_f16(doh[i]);
+        par::copy_in(dO, f.data(), f.size());
+    }
+    float* dq = dev.alloc<float>((size_t) Cq);
+    float* dk = dev.alloc<float>((size_t) Ck);
+    float* dv = dev.alloc<float>((size_t) Ck);
+    si::qi_attention_bwd(q, kd, v, o32, lse, dO, Tq, H, D, dq, dk, dv, false, gemm, nullptr, 0, Tk);
+    const char* names[3] = {"dQ", "dK", "dV"};
+    float* bufs[3] = {dq, dk, dv};
+    const std::vector<double>* refs[3] = {&dQ, &dK, &dV};
+    const int64_t sizes[3] = {Cq, Ck, Ck};
+    for (int i = 0; i < 3; ++i) {
+        std::vector<float> h((size_t) sizes[i]);
+        par::copy_out(h.data(), bufs[i], h.size());
+        got.assign(h.begin(), h.end());
+        const double eb = rel(got, *refs[i]);
+        std::printf("  cross-attention, training %-3s      RMS error %.3e (at most 3e-02) %s\n", names[i], eb,
+                    eb <= 3e-2 ? "ok" : "FAIL");
+        fails += eb > 3e-2;
+    }
+    return fails;
+}
+
 int bench(int64_t T, int64_t n_text) {
     par::Device dev;
     std::vector<uint16_t> qh, kh, vh;
@@ -340,5 +468,8 @@ int main(int argc, char** argv) {
     if (argc >= 3 && std::strcmp(argv[1], "--bench") == 0)
         return bench(std::strtoll(argv[2], nullptr, 10), argc >= 4 ? std::strtoll(argv[3], nullptr, 10) : 0);
     std::printf("qi_attn: Qwen-Image's 32 heads of 128, 64 text rows and 512 image rows (and long rows, 8192 keys), against FP64\n");
-    return check();
+    par::Device dev;
+    const int fails = check();
+    std::printf("qi_attn: a cross-attention's 320 rows of 512 keys, forward and backward, against FP64\n");
+    return fails + check_cross(dev);
 }

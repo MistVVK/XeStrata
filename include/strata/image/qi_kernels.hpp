@@ -53,7 +53,8 @@ constexpr int64_t qi_attn_rows(int64_t T) { return (T + 127) / 128 * 128; }
 /// tokens up to itself, or with key_lim the first key_lim[t] (never falling from row to row: an edit's reference
 /// image sees all of itself), an image token every token.  On the GPU's matrix engines where it has them
 /// (src/image/qi_attn.cpp, flash_attn.hpp), FP16 out16 [T - first][heads * head_dim]: the query rows from `first` on
-/// (the rows before it, a cached prefix's, are not asked); else the same kernel's FMA form.  `int8`: the rows that see every key
+/// (the rows before it, a cached prefix's, are not asked); else the same kernel's FMA form.  `keys`: the keys the
+/// rows read, where they are not the rows' own (a cross-attention, qi_attention_cross; 0: T).  `int8`: the rows that see every key
 /// may take flash_attn's int8 path where it is the faster on this GPU (qi_attention_i8; every image model passes it:
 /// on the RTX 4070 Anima's, Mage-Flow Turbo's and Qwen-Image's images stay as good, 2026-11-06).  `spans`: prefix rows [a, b) that see
 /// keys 0 .. b - 1 and no others (an edit's references, as key_lim says on the GPU): they take the image rows' kernels,
@@ -63,7 +64,15 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
                   int64_t head_dim, int64_t n_text, uint16_t* out16, void* stream,
                   const int32_t* key_lim = nullptr, int64_t first = 0, bool int8 = false,
                   const std::vector<std::pair<int64_t, int64_t>>* spans = nullptr,
-                  const kernels::FlashAttnI8Stats* i8_stats = nullptr);
+                  const kernels::FlashAttnI8Stats* i8_stats = nullptr, int64_t keys = 0);
+
+/// A cross-attention: `Tq` query rows over `Tk` keys, every row seeing every key (no mask, no int8), FP16 out16
+/// [Tq][heads * head_dim], through qi_attention's own choice of the GPU maker's kernel and the engine's own (timed
+/// once a GPU and shape, as its image rows are).  q16's rows rounded up to qi_attn_rows(Tq) and zero past Tq, k16 and
+/// v16 [Tk][heads * head_dim] rounded up to a multiple of 64 and zero past Tk: the engine's own kernel reads its keys
+/// in whole chunks of 64.  head_dim 128, as qi_attention's.  Anima's cross-attention, generation and training alike.
+void qi_attention_cross(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t Tq, int64_t Tk,
+                        int64_t heads, int64_t head_dim, uint16_t* out16, void* stream);
 
 /// The path qi_attention takes on the current GPU, for the report.
 const char* qi_attention_path();
@@ -105,17 +114,22 @@ bool qi_attention_i8_preferred(int64_t rows, int64_t keys, int64_t heads, void* 
 /// below it the keys up to itself (Qwen-Image-2.1's text rows, the inference's prefix rule): q16, k16 and v16 are
 /// [T][heads * head_dim] FP16, their rows rounded up to qi_attn_rows(T) and zero past T, as qi_attention's.  The
 /// forward runs the shared attention kernel (kernels::flash_attn, the one inference takes) to out32 [T][heads *
-/// head_dim] FP32 and lse [T][heads], each row's log-sum-exp of its scaled scores.
+/// head_dim] FP32 and lse [T][heads], each row's log-sum-exp of its scaled scores.  `keys`: the keys the rows read,
+/// where they are not the rows' own (a cross-attention: k16 and v16 [keys][heads * head_dim], their rows rounded up
+/// to qi_attn_rows(keys) and zero past keys, n_causal 0; 0: T).
 void qi_attention_train(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
-                        int64_t head_dim, float* out32, float* lse, void* stream, int64_t n_causal = 0);
+                        int64_t head_dim, float* out32, float* lse, void* stream, int64_t n_causal = 0,
+                        int64_t keys = 0);
 /// Its backward: dQ, dK and dV [T][heads * head_dim] FP32 from dO (the same shape, FP32), the forward's out32 and lse,
 /// through the shared products (prefill::Gemm) a head and a tile of query rows at a time, P made again from the
 /// scores and lse.  dQ is written; dK and dV are written, or added into with `accumulate`.  Null dQ, dK or dV: not
-/// taken.
+/// taken.  `keys` as qi_attention_train's: dK and dV are [keys][heads * head_dim] then.  The fused backward
+/// (kernels::flash_attn_bwd) walks the rows as their own keys, so a cross-attention takes the products or the maker's
+/// library.
 void qi_attention_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, const float* o32,
                       const float* lse, const float* dO, int64_t T, int64_t heads, int64_t head_dim, float* dQ,
                       float* dK, float* dV, bool accumulate, prefill::Gemm& gemm, void* stream,
-                      int64_t n_causal = 0);
+                      int64_t n_causal = 0, int64_t keys = 0);
 
 /// The group a W8A8 product's operands are rotated in (qi_rows_i8): K must be a multiple of it.
 constexpr int64_t kQiRotate = 256;

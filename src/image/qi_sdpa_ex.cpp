@@ -36,6 +36,16 @@ using strata::kernels::f32_from_f16;
 
 sycl::queue& queue_for(void* stream) { return core::Runtime::get().stream(stream); }
 
+// Few query rows (more than a decoder step's): the engine's own work-group-a-row kernel, and no maker's kernel
+// measured against it.  A maker's kernel builds a plan a shape (cuDNN ~40 ms a small one on the RTX 4070, oneDNN
+// ~6 ms on the B70), paid once a shape a process; a few rows' attention is under a millisecond, so a shape run once
+// (Anima's adapter, a prompt's ids over the states) never earns the plan back.  Anima's adapter_s: the maker's choice
+// took the B70 0.011->0.017 s and the RTX 4070 0.014->0.053 s (single), 0.019->0.094 s (guided); the own kernel alone
+// restores it (0.011 / 0.014, 2026-11-11).  A decoder step (lq <= 4) is excepted: it runs every generated token, so
+// its plan amortizes and the maker is the faster (Florence-2's decoder, 64 steps: skipping the maker took its
+// decoder_s 0.165->0.210 s on the B70 and 0.167->0.209 s on the RTX 4070).
+constexpr int64_t kFewRows = 64;
+
 void finish(void* stream, const sycl::event& e, const char* what) {
     if (!stream) core::Runtime::get().wait(e, what);
 }
@@ -286,8 +296,10 @@ void qi_sdpa_ex_own(const QiSdpa& a, void* stream) {
     // a step's few rows: a work-group each, its items over the keys (more of the GPU than a block of rows would use),
     // and the keys in parts, a work-group's L at least, while the groups are fewer than 16 a compute unit (Florence-2
     // large's decoder, 3 beams of 16 heads over up to 1,025 keys: the RTX 4070 4.87 s in one part, 3.98 at 4 groups a
-    // unit, 3.46 at 16; the B70 6.45 s, 3.97 from 2 on, 2026-11-07)
-    if (a.lq <= 4) {
+    // unit, 3.46 at 16; the B70 6.45 s, 3.97 from 2 on, 2026-11-07).  A work-item a row (below) spills its 2 hd
+    // registers at hd 64-128: Anima's 31 rows over 31 keys took 0.8 ms on the RX 9060 XT that way, so the few rows
+    // take this work-group form (kFewRows).
+    if (a.lq <= kFewRows) {
         const int64_t L = std::min<int64_t>(wg, 128);
         if (a.hd <= L) {
             const int64_t rows = a.batch * a.heads * a.lq;
@@ -321,8 +333,9 @@ void qi_sdpa_ex_own(const QiSdpa& a, void* stream) {
 
 void qi_sdpa_ex(const QiSdpa& a, void* stream) {
     if (a.batch <= 0 || a.lq <= 0 || a.heads <= 0) return;
-    if (a.hd <= 0 || a.hd > 128 || a.lk <= 0 || a.key_len || a.bias || a.mask) {
-        qi_sdpa_ex_own(a, stream);
+    if (a.hd <= 0 || a.hd > 128 || a.lk <= 0 || a.key_len || a.bias || a.mask ||
+        (a.lq > 4 && a.lq <= kFewRows)) {
+        qi_sdpa_ex_own(a, stream);   // the few rows past a decoder step: the own kernel, no maker's plan (kFewRows)
         return;
     }
     sycl::queue& q = queue_for(stream);

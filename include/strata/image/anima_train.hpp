@@ -9,8 +9,8 @@
 // (q and k RMS-normed a head and rotated by the 3-D tables, pairs (j, j + hd / 2)), cross-attention to the context's
 // rows (q and k RMS-normed a head, not rotated; the context's keys and values through the block's own products), and
 // a GELU (erf) MLP, each on a LayerNorm (no affine, eps 1e-6) times 1 + its scale plus its shift, added back through
-// its gate.  The cross-attention is the inference's own form: a head at a time, the scores, their softmax and the
-// values through the shared products, its probabilities kept for the backward.
+// its gate.  Both attentions run the shared attention (qi_attention_train and qi_attention_bwd), the cross-attention's
+// keys the context's rows: its probabilities are made again from the scores and the log-sum-exp, not kept.
 #pragma once
 #include "strata/image/train_ops.hpp"
 #include "strata/prefill/gemm.hpp"

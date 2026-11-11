@@ -201,6 +201,25 @@ inline void qk_rope16(const MfOut& q, const MfOut& k, const MfOut& v, const floa
     else kernels::qk::qk_norm_rope(q_of(s), sh, in, kernels::qk::NoRope{}, out);
 }
 
+// One tensor's heads RMS-normed over the head (w; null: the values copied as they are) into FP16 rows
+// [T][heads * hd], not rotated: a cross-attention's q, k and v, each its own row count (qk_rope16 norms q, k and v of
+// one count together).  The same kernel as qk_rope16's, its k and v heads left out.
+inline void qk_norm16(const MfOut& x, const float* w, int64_t T, int64_t heads, int64_t hd, uint16_t* out, void* s,
+                      float eps = 1e-6f) {
+    if (T <= 0) return;
+    struct In {
+        MfOut x;
+        int64_t hd;
+        auto head(int, int64_t t, int64_t h) const { return x.row(t, h * hd); }
+    };
+    kernels::qk::Shape sh{T, heads, 0, hd};
+    sh.wq = w;
+    sh.values = false;
+    sh.eps = eps;
+    const kernels::qk::Rows16 o{out, nullptr, nullptr, heads, 0, hd};
+    kernels::qk::qk_norm_rope(q_of(s), sh, In{x, hd}, kernels::qk::NoRope{}, o);
+}
+
 // A row-wise kernel writing FP16 with each row's scale: Op (LnMod, Gelu, Heads below) gives a row's statistics and its
 // values; a sub-group of 32 a row, 8 rows a work-group (every engine GPU has them: core/device.cpp).
 constexpr int64_t kSG = 32, kRows = 8;

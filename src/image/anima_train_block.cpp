@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/image/anima_train_block.cpp - see include/strata/image/anima_train.hpp's anima_block.  One Anima block forwards
-// and backwards, out of the shared row kernels and products; the cross-attention a head at a time through the shared
-// products, as the inference's attn_q runs it.
+// and backwards, out of the shared row kernels and products; both attentions through the shared attention
+// (qi_attention_train and qi_attention_bwd), the cross-attention's keys the context's rows.
 #include "strata/image/anima_train.hpp"
 #include "strata/image/gelu.hpp"
 #include "strata/image/qi_kernels.hpp"
@@ -39,136 +39,6 @@ struct GeluErf {
     float value(int64_t t, int64_t c, const dit_rows::Stats&) const { return gelu_erf(x.at(t, c)); }
     float bound(int64_t t, int64_t c) const { return sycl::fmax(x.at(t, c), 0.17f); }
 };
-
-// x [T][heads hd] -> out [heads][T][hd] FP16, each head RMS-normed with w (null: copied as it is)
-void heads_fwd(const float* x, int64_t T, int64_t heads, int64_t hd, const float* w, uint16_t* out, void* s) {
-    constexpr int64_t WG = 128;
-    dit_rows::q_of(s).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) (T * heads * WG)), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
-            const int64_t g = static_cast<int64_t>(it.get_group_linear_id()), t = g / heads, h = g - t * heads;
-            const float* r = x + t * heads * hd + h * hd;
-            float ss = 0.f;
-            for (auto d = static_cast<int64_t>(it.get_local_linear_id()); d < hd; d += WG) ss += r[d] * r[d];
-            ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
-            const float inv = w != nullptr ? 1.f / sycl::sqrt(ss / (float) hd + kEps) : 1.f;
-            for (auto d = static_cast<int64_t>(it.get_local_linear_id()); d < hd; d += WG)
-                out[(h * T + t) * hd + d] =
-                    kernels::f16_from_f32(sycl::clamp(r[d] * inv * (w != nullptr ? w[d] : 1.f), -65504.f, 65504.f));
-        });
-}
-
-// heads_fwd's backward (w given): dy [T][heads hd] the gradient of the normed rows, dx [T][heads hd] written
-void heads_bwd(const float* x, const float* w, const float* dy, int64_t T, int64_t heads, int64_t hd, float* dx,
-               void* s) {
-    constexpr int64_t WG = 128;
-    dit_rows::q_of(s).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) (T * heads * WG)), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
-            const int64_t g = static_cast<int64_t>(it.get_group_linear_id()), t = g / heads, h = g - t * heads;
-            const int64_t o = t * heads * hd + h * hd;
-            float ss = 0.f, sm = 0.f;
-            for (auto d = static_cast<int64_t>(it.get_local_linear_id()); d < hd; d += WG) {
-                ss += x[o + d] * x[o + d];
-                sm += dy[o + d] * w[d] * x[o + d];
-            }
-            ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
-            sm = sycl::reduce_over_group(it.get_group(), sm, sycl::plus<float>());
-            const float inv = 1.f / sycl::sqrt(ss / (float) hd + kEps);
-            for (auto d = static_cast<int64_t>(it.get_local_linear_id()); d < hd; d += WG)
-                dx[o + d] = inv * (dy[o + d] * w[d] - x[o + d] * inv * inv * sm / (float) hd);
-        });
-}
-
-// one head's softmax of the scores sc [T][L] times scale: P [T][L] FP32 and FP16
-void softmax_rows(const float* sc, int64_t T, int64_t L, float scale, float* P, uint16_t* P16, void* s) {
-    constexpr int64_t WG = 256;
-    dit_rows::q_of(s).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) (T * WG)), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
-            const int64_t t = static_cast<int64_t>(it.get_group_linear_id());
-            const float* r = sc + t * L;
-            float mx = -INFINITY;
-            for (auto j = static_cast<int64_t>(it.get_local_linear_id()); j < L; j += WG) mx = sycl::fmax(mx, r[j] * scale);
-            mx = sycl::reduce_over_group(it.get_group(), mx, sycl::maximum<float>());
-            float sum = 0.f;
-            for (auto j = static_cast<int64_t>(it.get_local_linear_id()); j < L; j += WG) sum += sycl::exp(r[j] * scale - mx);
-            sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
-            for (auto j = static_cast<int64_t>(it.get_local_linear_id()); j < L; j += WG) {
-                const float p = sycl::exp(r[j] * scale - mx) / sum;
-                P[t * L + j] = p;
-                P16[t * L + j] = kernels::f16_from_f32(p);
-            }
-        });
-}
-
-// The cross-attention's gradients in FP16 at a power of two a head (dit_rows::pow2_full): dS sits far below FP16's
-// smallest normal value (its largest 7e-6 in block 13 of a real step, its median 1e-11), where rounding it lost 22% of
-// dQ and dK (against FP64, 2026-11-10); dO is held the same way.
-
-// each head's largest |x| of rows [T][C] (heads of hd columns) as bits into bits[h] (zeroed)
-void heads_amax(const float* x, int64_t T, int64_t heads, int64_t hd, uint32_t* bits, void* s) {
-    constexpr int64_t WG = 128;
-    const int64_t C = heads * hd;
-    dit_rows::q_of(s).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) (T * heads * WG)), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
-            const int64_t g = static_cast<int64_t>(it.get_group_linear_id()), t = g / heads, h = g - t * heads;
-            float m = 0.f;
-            for (auto d = static_cast<int64_t>(it.get_local_linear_id()); d < hd; d += WG)
-                m = sycl::fmax(m, sycl::fabs(x[t * C + h * hd + d]));
-            m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
-            if (it.get_local_linear_id() == 0)   // non-negative floats order as their bits
-                sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device>(bits[h]).fetch_max(
-                    sycl::bit_cast<uint32_t>(m));
-        });
-}
-
-// dS = P (dP G_o - D) scale in FP32 over dP (dP from dO / G_o, D = rowsum(dO o O) over the head's values), its
-// largest |dS| as bits into *sbits (zeroed)
-void softmax_bwd(const float* P, float* dP, const float* dO, const float* O, int64_t T, int64_t L, int64_t hd,
-                 int64_t C, float scale, const uint32_t* obits, uint32_t* sbits, void* s) {
-    constexpr int64_t WG = 256;
-    dit_rows::q_of(s).parallel_for(
-        sycl::nd_range<1>(sycl::range<1>((size_t) (T * WG)), sycl::range<1>(WG)), [=](sycl::nd_item<1> it) {
-            const int64_t t = static_cast<int64_t>(it.get_group_linear_id());
-            const float Go = dit_rows::pow2_full(sycl::bit_cast<float>(*obits));
-            float D = 0.f;
-            for (auto d = static_cast<int64_t>(it.get_local_linear_id()); d < hd; d += WG)
-                D += dO[t * C + d] * O[t * C + d];
-            D = sycl::reduce_over_group(it.get_group(), D, sycl::plus<float>());
-            float m = 0.f;
-            for (auto j = static_cast<int64_t>(it.get_local_linear_id()); j < L; j += WG) {
-                const float v = P[t * L + j] * (dP[t * L + j] * Go - D) * scale;
-                dP[t * L + j] = v;
-                m = sycl::fmax(m, sycl::fabs(v));
-            }
-            m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
-            if (it.get_local_linear_id() == 0)
-                sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device>(*sbits).fetch_max(
-                    sycl::bit_cast<uint32_t>(m));
-        });
-}
-
-// x [n] FP32 / G (G from bits) -> FP16
-void f16_at(const float* x, int64_t n, const uint32_t* bits, uint16_t* out, void* s) {
-    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        out[id[0]] = kernels::f16_from_f32(x[id[0]] / dit_rows::pow2_full(sycl::bit_cast<float>(*bits)));
-    });
-}
-
-// a head's columns of [T][C] FP32 rows / G (G from bits) -> [T][hd] FP16
-void head_cols16(const float* x, int64_t T, int64_t C, int64_t hd, const uint32_t* bits, uint16_t* out, void* s) {
-    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) (T * hd)), [=](sycl::id<1> id) {
-        const int64_t i = static_cast<int64_t>(id[0]), t = i / hd, d = i - t * hd;
-        const float G = dit_rows::pow2_full(sycl::bit_cast<float>(*bits));
-        out[i] = kernels::f16_from_f32(sycl::clamp(x[t * C + d] / G, -65504.f, 65504.f));
-    });
-}
-
-// rows [T][heads hd]: head h's columns times its G (from bits[h])
-void heads_times(float* x, int64_t T, int64_t heads, int64_t hd, const uint32_t* bits, void* s) {
-    dit_rows::q_of(s).parallel_for(sycl::range<1>((size_t) (T * heads * hd)), [=](sycl::id<1> id) {
-        const int64_t i = static_cast<int64_t>(id[0]), h = (i % (heads * hd)) / hd;
-        x[i] *= dit_rows::pow2_full(sycl::bit_cast<float>(bits[h]));
-    });
-}
 
 }  // namespace
 
@@ -254,25 +124,15 @@ void anima_block(const AnimaBlockRun& run, prefill::Gemm& gemm, void* stream, tr
     fwd(kAnCq, b16, b_s, ycq, R);
     fwd(kAnCk, run.ctx16, run.ctx_rs, yck, L);
     fwd(kAnCv, run.ctx16, run.ctx_rs, ycv, L);
-    uint16_t *qh = pool.ru(H * R * hd), *kh = pool.ru(H * L * hd), *vh = pool.ru(H * L * hd);
-    uint16_t *kht = pool.ru(H * hd * L), *vht = pool.ru(H * hd * L);
-    heads_fwd(ycq, R, H, hd, run.cqn, qh, stream);
-    heads_fwd(yck, L, H, hd, run.ckn, kh, stream);
-    heads_fwd(ycv, L, H, hd, nullptr, vh, stream);
-    for (int64_t h = 0; h < H; ++h) {
-        train::transpose_f16(kh + h * L * hd, L, hd, kht + h * hd * L, stream);
-        train::transpose_f16(vh + h * L * hd, L, hd, vht + h * hd * L, stream);
-    }
-    const float scale = 1.f / std::sqrt((float) hd);
-    float* Pf = pool.rf(H * R * L);
-    uint16_t* P16 = pool.ru(H * R * L);
-    float* sc = pool.rf(R * L);
+    // the shared attention's rows (qi_attention_train): q [Rp][C], k and v [Lp][C], the rows past R and L zero
+    const int64_t Lp = qi_attn_rows(L);
+    uint16_t *cq16 = pool.u(Rp * C), *ck16 = pool.u(Lp * C), *cv16 = pool.u(Lp * C);
+    dit_rows::qk_norm16(rows_of(ycq, C), run.cqn, R, H, hd, cq16, stream, kEps);
+    dit_rows::qk_norm16(rows_of(yck, C), run.ckn, L, H, hd, ck16, stream, kEps);
+    dit_rows::qk_norm16(rows_of(ycv, C), nullptr, L, H, hd, cv16, stream, kEps);
     float* o32 = pool.rf(R * C);
-    for (int64_t h = 0; h < H; ++h) {
-        gemm.f16(qh + h * R * hd, kh + h * L * hd, sc, R, L, hd);
-        softmax_rows(sc, R, L, scale, Pf + h * R * L, P16 + h * R * L, stream);
-        gemm.f16(P16 + h * R * L, vht + h * hd * L, o32 + h * hd, R, hd, L, C);
-    }
+    float* lse_c = pool.rf(R * H);
+    qi_attention_train(cq16, ck16, cv16, R, H, hd, o32, lse_c, stream, 0, L);
     uint16_t *o16 = pool.ru(R * C), *o_t = pool.ru(R * C);
     float* o_s = pool.rf(R);
     dit_rows::rows16(dit_rows::Plain{o32, C}, R, C, o16, o_s, stream);
@@ -332,32 +192,14 @@ void anima_block(const AnimaBlockRun& run, prefill::Gemm& gemm, void* stream, tr
     train::mul_cols(dh2, mca + 2 * C, R * C, C, dy, stream);
     float* do32 = pool.rf(R * C);
     bwd(kAnCo, o16, o_s, o_t, dy, do32, R, false);
-    float *dq32 = pool.rf(R * C), *dk32 = pool.rf(L * C), *dv32 = pool.rf(L * C), *dP = pool.rf(R * L);
-    uint16_t *dO16 = pool.ru(R * hd), *dOt = pool.ru(hd * R), *dS16 = pool.ru(R * L), *dSt = pool.ru(L * R);
-    uint16_t *Pt = pool.ru(L * R), *qht = pool.ru(hd * R);
-    uint32_t* obits = reinterpret_cast<uint32_t*>(pool.f(2 * H));   // each head's dO's and dS's largest, zeroed
-    uint32_t* sbits = obits + H;
-    heads_amax(do32, R, H, hd, obits, stream);
-    for (int64_t h = 0; h < H; ++h) {
-        head_cols16(do32 + h * hd, R, C, hd, obits + h, dO16, stream);
-        gemm.f16(dO16, vh + h * L * hd, dP, R, L, hd);   // dP = dO V^T (over G_o)
-        softmax_bwd(Pf + h * R * L, dP, do32 + h * hd, o32 + h * hd, R, L, hd, C, scale, obits + h, sbits + h, stream);
-        f16_at(dP, R * L, sbits + h, dS16, stream);
-        gemm.f16(dS16, kht + h * hd * L, dq32 + h * hd, R, hd, L, C);   // dQ = dS K
-        train::transpose_f16(dS16, R, L, dSt, stream);
-        train::transpose_f16(qh + h * R * hd, R, hd, qht, stream);
-        gemm.f16(dSt, qht, dk32 + h * hd, L, hd, R, C);   // dK = dS^T Q
-        train::transpose_f16(P16 + h * R * L, R, L, Pt, stream);
-        train::transpose_f16(dO16, R, hd, dOt, stream);
-        gemm.f16(Pt, dOt, dv32 + h * hd, L, hd, R, C);   // dV = P^T dO
-    }
-    // each head's columns back from their powers of two
-    heads_times(dq32, R, H, hd, sbits, stream);
-    heads_times(dk32, L, H, hd, sbits, stream);
-    heads_times(dv32, L, H, hd, obits, stream);
+    float *dq32 = pool.rf(R * C), *dk32 = pool.rf(L * C), *dv32 = pool.rf(L * C);
+    qi_attention_bwd(cq16, ck16, cv16, o32, lse_c, do32, R, H, hd, dq32, dk32, dv32, false, gemm, stream, 0, L);
     float *dycq = pool.rf(R * C), *dyck = pool.rf(L * C), *dctx = pool.rf(L * Cc);
-    heads_bwd(ycq, run.cqn, dq32, R, H, hd, dycq, stream);
-    heads_bwd(yck, run.ckn, dk32, L, H, hd, dyck, stream);
+    // the norms' backward (the shared kernel, one tensor at a time: q's rows and k's are not the same count)
+    dit_rows::qk_rope_bwd(ycq, nullptr, run.cqn, nullptr, nullptr, nullptr, false, dq32, nullptr, R, H, hd, dycq,
+                          nullptr, nullptr, nullptr, stream, true, kEps);
+    dit_rows::qk_rope_bwd(yck, nullptr, run.ckn, nullptr, nullptr, nullptr, false, dk32, nullptr, L, H, hd, dyck,
+                          nullptr, nullptr, nullptr, stream, true, kEps);
     bwd(kAnCk, run.ctx16, run.ctx_rs, run.ctx16t, dyck, dctx, L, false);
     bwd(kAnCv, run.ctx16, run.ctx_rs, run.ctx16t, dv32, dctx, L, false);
     bwd(kAnCq, b16, b_s, b_t, dycq, dy, R, false);
