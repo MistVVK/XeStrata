@@ -47,6 +47,8 @@ struct CpuOps {
 };
 
 const CpuOps& cpu_ops_scalar();
+const CpuOps& cpu_ops_sse41();     // x86-64 only (both return the scalar table elsewhere): the tiers for CPUs without AVX2, multiply then add (no FMA)
+const CpuOps& cpu_ops_avx();
 const CpuOps& cpu_ops_avx2();      // defined only on x86-64 (cpu_ops_avx2 returns the scalar table elsewhere)
 const CpuOps& cpu_ops_avx512();
 const CpuOps& cpu_ops_neon();      // AArch64 only (cpu_ops_neon returns the scalar table elsewhere)
