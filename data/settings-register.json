@@ -23830,6 +23830,34 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PF_FEWROWS",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/prefill.cpp",
+     "line": 5830,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "string",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "research",
+   "owner": "prefill",
+   "note": "[reviewed] Research switch, off unless set (\"0\" off, anything else on; src/prefill/fewrows.hpp): on the FP16 prompt path an expert with 1..12 rows runs on the quantized grouped kernels (no dequantize) instead of dequantize + FP16 GEMMs; native packs without APR only. Tesla P100 numbers in phaseA-tests/par/RESULTS-P4-FALLBACK.md. Not documented for users",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PF_FUSED",
    "backends": [
     "cuda-hip",

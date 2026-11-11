@@ -8,6 +8,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/prefill/pf_fused_override.hpp"
 #include "strata/prefill/staged_group_rule.hpp"
+#include "strata/prefill/fewrows.hpp"
 #if defined(STRATA_HAVE_DFLASH2)
 #include "strata/kernels/dflash2.hpp"
 #endif
@@ -1296,6 +1297,12 @@ struct Prefill::Impl {
     size_t grp_n = 0, grp_tk = 0;        // int32s allocated; T_max * K (the offset of slot, and of src past it)
     uint16_t* dq_gu[DQ] = {};
     uint16_t* dq_d[DQ] = {};
+    // Few-row experts on the FP16 path (fewrows.hpp, STRATA_PF_FEWROWS): fr_xq: the layer's T rows as q8_1 (the grouped
+    // kernels' activations); fr_rec: one plan record per expert position of the layer; fr_scr: the grouped kernels' scratch.
+    void* fr_xq = nullptr;
+    uint8_t* fr_rec = nullptr;
+    void* fr_scr = nullptr;
+    int64_t fr_xq_rows = 0;
     uint8_t* stage_dev[RING_MAX] = {};
     int ring = STAGE;                        // the slots of this layout's ring (ring_slots)
     // THE PROMPT ROOM's resolved counts for this layout (carve): the rule's ring, the room's first slot (past the
@@ -1482,6 +1489,9 @@ void Prefill::release() {
         if (b == 0 && impl_->ple_raw_dev) { (void) cudaFree(impl_->ple_raw_dev); impl_->ple_raw_dev = nullptr; }
     }
     if (impl_->copy) cudaStreamDestroy(impl_->copy);
+    if (impl_->fr_xq) cudaFree(impl_->fr_xq);
+    if (impl_->fr_rec) cudaFree(impl_->fr_rec);
+    if (impl_->fr_scr) cudaFree(impl_->fr_scr);
     if (impl_->kv_copy) cudaStreamDestroy(impl_->kv_copy);
     if (impl_->ple_copy) (void) cudaStreamDestroy(impl_->ple_copy);
     if (impl_->ple_raw_free) (void) cudaEventDestroy(impl_->ple_raw_free);
@@ -5953,6 +5963,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // one expert's products from its blob on the device; `slot` (a ring slot, or -1 for a resident
                         // expert) is released once the blob is read; `cslot`: the expert-cache slot the blob is in (-1:
                         // a ring slot or the peer's), which STRATA_MMQ_DIRECT reads in place
+                        // Few-row experts (fewrows.hpp): research switch STRATA_PF_FEWROWS, off unless set
+                        static const bool fr_env = fewrows_switch(std::getenv("STRATA_PF_FEWROWS"), false);
+                        bool fr_q_done = false;   // the layer's rows quantized to q8_1 (once per layer)
                         auto compute = [&](size_t j, const uint8_t* blob_dev, int slot, int32_t cslot) -> bool {
                             const int32_t e = order[j];
 #if STRATA_EXPERT_NIBBLE_BUILT
@@ -6169,6 +6182,40 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     ns = 0;
                                 }
                                 return true;
+                            }
+                            // few rows: the quantized grouped kernels on the GGUF blob, no dequantize (fewrows.hpp)
+                            if (fr_env) {
+                                const int64_t fo0 = m.off[(size_t) e], fne = m.cnt[(size_t) e];
+                                if (fewrows_takes(fr_env, !use_mmq, lay.native, had_gu || had_d, fne)) {
+                                    const auto& f = lay.fmt[(size_t) l];
+                                    if (m.fr_rec == nullptr || m.fr_xq_rows < T) {
+                                        if (m.fr_xq) cudaFree(m.fr_xq);
+                                        m.fr_xq = nullptr;
+                                        const size_t xb = (size_t) T * (size_t) (N / 32) * 36;
+                                        if (cudaMalloc(&m.fr_xq, xb) != cudaSuccess ||
+                                            (m.fr_rec == nullptr && cudaMalloc((void**) &m.fr_rec, (size_t) m.g->n_expert * kFewRowsRecBytes) != cudaSuccess) ||
+                                            (m.fr_scr == nullptr && cudaMalloc(&m.fr_scr, strata::kernels::native_expert_scratch_bytes(kFewRows, f.n_ff)) != cudaSuccess)) {
+                                            err = "prefill: few-row experts: no memory";
+                                            return false;
+                                        }
+                                        m.fr_xq_rows = T;
+                                        fr_q_done = false;
+                                    }
+                                    if (!fr_q_done) {   // the layer's T rows as q8_1, once
+                                        strata::kernels::quantize_q8_1_rows(m.mixed, T, N, m.fr_xq, m.cs);
+                                        fr_q_done = true;
+                                    }
+                                    uint8_t* rec = m.fr_rec + j * kFewRowsRecBytes;
+                                    fewrows_record(rec, blob_dev, (int) fne, (int) fo0, m.cs);
+                                    const strata::kernels::NativeExpertLayout FL =
+                                        strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+                                    pt.mark(kPfGemmGU, cs);
+                                    strata::kernels::native_expert_grouped(FL, (const unsigned long long*) rec, (const int32_t*) (rec + 8),
+                                                                           (const int32_t*) (rec + 16), (const int32_t*) (rec + 24),
+                                                                           m.src_dev + fo0, 1, fne, m.fr_xq, m.fr_scr, m.Dm, m.cs, 1);
+                                    if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
+                                    return true;
+                                }
                             }
                             const int q = (int) (j % DQ);
                             if (lay.native) {
