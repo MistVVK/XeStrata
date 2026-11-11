@@ -12,25 +12,8 @@ App and Terminal 0.2.13, Control and engines 0.1.59. App, Control and engine ver
 
 | Model | NVIDIA on Windows | NVIDIA on Linux | NVIDIA DGX Spark | AMD on Windows | AMD on Linux | Intel Arc on Linux | Apple silicon |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| [DeepSeekV4.1-Flash-1017](#deepseek41) | yes | yes | yes | yes | yes | no | yes |
 | [Qwen3.8-Flash-Next](#qwen38) | yes | yes | yes | yes | yes | yes | yes |
 | [Qwen3.6-35B-A3B](#qwen36) | yes | yes | untested | yes | yes | no | no |
-
-<a id="deepseek41"></a>
-
-## DeepSeekV4.1-Flash-1017
-
-Model guide: [MODELS.md](MODELS.md#deepseek-v41-flash).
-
-| Hardware | Packaged | Supported | Limits | Measured |
-| --- | --- | --- | --- | --- |
-| NVIDIA on Windows | `cuda-cuda13` | supported: RTX 30, 40 and 50 | The package carries RTX 40 code (sm_89); we have not run an RTX 40 card. | [README](../README.md) speed table (RTX 5070, RTX 3060); [DEEPSEEK41.md](DEEPSEEK41.md) |
-| NVIDIA on Linux | `cuda-cuda13` | supported: RTX 30, 40 and 50 | The package carries RTX 40 code (sm_89); we have not run an RTX 40 card. | [DEEPSEEK41.md](DEEPSEEK41.md) |
-| NVIDIA DGX Spark | `cuda-cuda13` | supported: GB10 | - | [DGX_SPARK_LINUX.md](DGX_SPARK_LINUX.md) (2.00 bpw) |
-| AMD on Windows | `hip-rdna3` | supported: Ryzen AI Max / Strix Halo, gfx1151 | The package is built for gfx1151. Other AMD cards on Windows: nothing is claimed. | [STRIX_HALO.md](STRIX_HALO.md#deepseek-v41-flash) |
-| AMD on Linux | `hip-rx9070` | supported: Radeon AI PRO R9700 | The RX 9070 (gfx1200) uses the same package and is untested. Ryzen AI Max (Strix Halo) on Linux has no DeepSeek package. | [README](../README.md) speed table (1 and 4 cards); [AMD_HIP.md](AMD_HIP.md) |
-| Intel Arc on Linux | none | does not run | No package. DeepSeek does not run on Intel ([INTEL.md](INTEL.md)). | - |
-| Apple silicon | `metal` | supported: 64 GB or more, macOS 15 or newer | Text; pictures only with an engine that carries the Metal picture reader (marker STRATA_DS4_METAL_VISION_V1, present in the 0.1.58 package). Nothing under 128 GB was run. | [DEEPSEEK_MAC.md](DEEPSEEK_MAC.md) (M5 Max, 128 GB) |
 
 <a id="qwen38"></a>
 

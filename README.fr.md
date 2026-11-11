@@ -52,36 +52,6 @@ Nous recommandons **d'abord ISTA-DASLab**, puis **Unsloth** et d'autres fourniss
 
 </details>
 
-<details>
-<summary><img src="docs/media/models/deepseek.svg" width="22" alt="" align="middle"> &nbsp;<b>DeepSeekV4.1-Flash-1017</b></summary>
-
-Dans l'**application de bureau** et dans le **Terminal**. Ce qui ne tient pas en mémoire est lu depuis votre SSD : il faut donc beaucoup d'espace disque libre.
-
-| Jeu (ISTA-DAS) | Téléchargement | Espace disque libre nécessaire |
-| --- | ---: | ---: |
-| 1.75 bpw | 239 GB | environ 245 GB |
-| 2.00 bpw | 257 GB | environ 265 GB |
-| 2.25 bpw | 274 GB | environ 280 GB |
-
-Fonctionne sur les NVIDIA RTX 30, 40 et 50 (Windows et Linux), l'AMD Radeon AI PRO R9700 (Linux), l'AMD Ryzen AI Max — Strix Halo (Windows) et les Mac Apple Silicon avec 64 Go ou plus ([Mac](docs/DEEPSEEK_MAC.md)). L'installation télécharge les fichiers et le moteur DeepSeek, puis démarre le modèle.
-
-```sh
-strata launch --family deepseek41 --model ist-das-2.00bpw --plan
-```
-
-Mesuré avec le jeu 2.00 bpw sur Strata 0.2.5. « Sortie » est la vitesse de la réponse, « Prompt » la vitesse à laquelle Strata lit votre texte.
-
-| Matériel | Sortie | Prompt |
-| --- | ---: | ---: |
-| RTX 5070 12 GB, 64 GB de RAM | 4 à 6 tokens/s | environ 110 tokens/s (4K) |
-| RTX 3060 12 GB, 46 GB de RAM | 9 à 11 tokens/s | environ 155 tokens/s (4K) |
-| 1x Radeon AI PRO R9700, 251 GB de RAM | 21 à 25 tokens/s | 320 à 360 tokens/s (8K) |
-| 4x Radeon AI PRO R9700 | 74 à 77 tokens/s | 400 à 450 tokens/s (8K) |
-
-[Mémoire, disque et détails](docs/DEEPSEEK41.md) · [Notes de version](https://github.com/Niko1221/Strata/releases)
-
-</details>
-
 <a id="the-other-sizes"></a>
 
 Vous ne savez pas ce qui tient ? [Choisir un modèle pour votre ordinateur](docs/MODELS.md#pick-by-memory).

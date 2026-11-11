@@ -211,7 +211,7 @@ def use_engine(ctx: "updater.Context", family: str, folder: str, root: str | Non
     if retired.is_name(family):
         raise updater.UpdateError(retired.NOT_OFFERED, 2)
     if family not in FAMILIES and shape is None:
-        raise updater.UpdateError("[DRAFT] choose the Qwen engine", 2)
+        raise updater.UpdateError("choose the Qwen engine", 2)
     if not folder or folder != Path(folder).name or folder.startswith("."):
         raise updater.UpdateError("that is not an installed engine", 2)
     with updater.update_lock(ctx.components):
@@ -302,7 +302,7 @@ def delete_engine(ctx: "updater.Context", family: str, folder: str, root: str | 
     if retired.is_name(family):
         raise updater.UpdateError(retired.NOT_OFFERED, 2)
     if family not in FAMILIES and shape is None:
-        raise updater.UpdateError("[DRAFT] choose the Qwen engine", 2)
+        raise updater.UpdateError("choose the Qwen engine", 2)
     if not folder or folder != Path(folder).name or folder.startswith("."):
         raise updater.UpdateError("that is not an installed engine", 2)
     with updater.update_lock(ctx.components):

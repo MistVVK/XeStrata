@@ -114,8 +114,7 @@ Report it with the CPU model.
 Large models need time to check files, prepare packs and fill memory. A first launch can take many minutes; there is
 no fixed startup time. The engine reads 34-55 GB into RAM, and the second start is faster while the files are in the OS
 cache. Watch progress and the engine log. If memory pressure is high, close memory-heavy programs and try a
-smaller model or context. DeepSeek V4.1-Flash needs 46 GB of RAM at least ([model page](MODELS.md#deepseek-v41-flash));
-`strata launch --plan --family deepseek41 --model ist-das-2.00bpw` shows what your computer is missing.
+smaller model or context.
 Started from Task Scheduler, a start can be 24x slower: see [Running it at startup](DETAILS.md#running-it-at-startup-task-scheduler).
 On Linux the engine asks the kernel to read the model files ahead (a cold start went from ~920 s to 70 s on one PC);
 `STRATA_READ_AHEAD=0` turns that off. With transparent huge pages on `always`, the arena does not ask for `MADV_HUGEPAGE`

@@ -93,7 +93,7 @@ strata launch --show-key
 | `--context SIZE` | `32k`, `64k`, `128k`, `256k` or a number of tokens. |
 | `--kv FORMAT` | Conversation memory format: `int8` (default), `q4_0` (half the memory), `k8v4`, `fp16`. |
 | `--vision off\|on\|gpu\|cpu` | Picture reading. Default: on when the model and the engine can. |
-| `--parallel N` | Requests answered at the same time, 1 to 8. Default: fit to your card; DeepSeek: one at a time. |
+| `--parallel N` | Requests answered at the same time, 1 to 8. Default: fit to your card. |
 | `--mtp on\|off` | The draft layer. `off` saves about 1 GB of graphics memory and is slower. Default: on. |
 | `--drafting auto\|mtp\|dflash2\|off` | Which drafter guesses ahead. `dflash2` is for Qwen3.8-Flash-Next only and downloads its drafter once (0.34 GB for the models that have a tuned drafter, 0.52 GB on Intel Arc, else 1.2 GB). If it cannot run, MTP is used and the start says why. |
 | `--gpu LIST`, `--gpu-roles LIST` | Which cards to use, and a role per card. |
@@ -131,30 +131,6 @@ The Auto drafter policy rebuilds its options at every start and keeps only layer
 (another context, pictures, access, or another model on the same port) make the screens ask once, "Restart the model with these
 settings? Answers in progress stop." With `--no-tui` the command refuses with one line naming the running model, its port and settings. Add
 `--restart` or run `strata launch --stop` first. A different `--port` runs beside the first server; two big models may not fit in graphics memory together, and the launch says so.
-
-## DeepSeek V4.1-Flash
-
-DeepSeek V4.1-Flash runs in the Terminal and in the app, on NVIDIA RTX 30, 40 and 50 (Windows and Linux) and on the Radeon AI PRO R9700 (Linux). Hardware, sizes and speeds are in [MODELS.md](MODELS.md#deepseek-v41-flash).
-
-```sh
-strata launch --plan --family deepseek41 --model ist-das-2.00bpw
-strata launch --family deepseek41 --model ist-das-2.00bpw
-```
-
-| Model name | Download |
-| --- | ---: |
-| `ist-das-1.75bpw` | 239 GB |
-| `ist-das-2.00bpw` | 257 GB |
-| `ist-das-2.25bpw` | 274 GB |
-| `ud-q8_k_xl` | 508 GB |
-
-- The context is 8192 tokens (8K), the size the engine was checked at.
-- `--speed faster|full` picks how many of the model's 6 experts it uses per word. Faster uses 5 (a small quality change, usually not noticeable) and is the default on a PC with 16 GB of graphics memory or less and on PCs whose graphics share the computer's memory. Full uses all 6. `--full-quality` is the same as `--speed full`. Both need DeepSeek engine 0.1.50 or newer, which `strata launch` fetches. The engine's own flag is `--experts N`.
-- It answers one request at a time. `--parallel 2` to `8` answers that many conversations at the same time (off unless you ask); `--plan --parallel 4` says what it does and the numbers it was measured with, and [DEEPSEEK41.md](DEEPSEEK41.md#several-conversations-at-once---parallel) has the rest.
-- It reads pictures (on by default) with the engine's own vision tower, loaded with the model; `--vision off` turns them off. Setup fetches the tower's weights (mmproj-BF16.gguf, 1 GB) with the other shared files and packs them with the model.
-- `--tune` runs DeepSeek's own short tuner (drafter on or off, CPU threads), not the Qwen tuner.
-- `--model-path DIR` starts from the shards you already have.
-- `--plan` shows where the model goes on your cards and how much is held in RAM.
 
 ## After the start: the monitor
 

@@ -42,9 +42,6 @@ runs are not supported. Use the [package table](#ready-made-packages) to match y
 Strix Point (890M / 880M, gfx1150) and Krackan (860M / 840M, gfx1152) are named and not supported by setup. RDNA1
 (gfx1012) builds by hand: [OLDER_GPUS.md](OLDER_GPUS.md#amd-building-gfx906-and-gfx1012).
 
-DeepSeek V4.1-Flash runs on the Radeon AI PRO R9700 on Linux, in the app and in the Terminal. The RX 9070 (gfx1200) engine package
-carries it but it is untested. Details: [MODELS.md](MODELS.md#deepseek-v41-flash).
-
 <a id="ready-made-packages-023"></a>
 ## Ready-made packages
 

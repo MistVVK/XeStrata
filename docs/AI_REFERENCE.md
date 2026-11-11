@@ -24,16 +24,15 @@ holds the technical context behind the short [README](../README.md). Use [AI_SET
 
 ## Model families
 
-Treat these as the three top-level families. Coder, Swift, Gyro, NVFP4 and OrcaRouter are Flash-Next variants,
+Treat these as the two top-level families. Coder, Swift, Gyro, NVFP4 and OrcaRouter are Flash-Next variants,
 not additional top-level families.
 
 | Family | Availability evidence | Catalog and limits |
 | --- | --- | --- |
-| DeepSeekV4.1-Flash-1017 | `deepseek41` in `MULTI_FILE_FAMILIES` in [setup.py](../setup.py); Terminal since 0.2.4, desktop app since 0.2.5 | [MODELS.md](MODELS.md#deepseek-v41-flash): ISTA-DAS 1.75 bpw (239 GB), 2.00 bpw (257 GB) and 2.25 bpw (274 GB), 8K context, a Speed choice (Faster or Full quality). <!-- cap:summary:deepseek41 -->DeepSeekV4.1-Flash-1017 runs in the desktop app and in the Terminal. Hardware: NVIDIA on Windows (RTX 30, 40 and 50); NVIDIA on Linux (RTX 30, 40 and 50); NVIDIA DGX Spark (GB10); AMD on Windows (Ryzen AI Max / Strix Halo, gfx1151); AMD on Linux (Radeon AI PRO R9700); Apple silicon (64 GB or more, macOS 15 or newer). Does not run on: Intel Arc on Linux. Per-hardware limits and measurements: [CAPABILITIES.md](CAPABILITIES.md#deepseek41).<!-- /cap --> |
 | Qwen3.8-Flash-Next | Catalog entries in [setup.py](../setup.py), model guides and backend documentation | [MODELS.md](MODELS.md), [QUANTS.md](QUANTS.md), [GYRO.md](GYRO.md), [NVFP4.md](NVFP4.md), [ORCA.md](ORCA.md). <!-- cap:summary:qwen38 -->Qwen3.8-Flash-Next runs in the desktop app and in the Terminal. Hardware: NVIDIA on Windows; NVIDIA on Linux; NVIDIA DGX Spark (GB10); AMD on Windows (RX 6000, 7000 and 9000, Ryzen AI Max); AMD on Linux (RX 6000, 7000 and 9000, Radeon AI PRO R9700, Ryzen AI Max); Intel Arc on Linux (Arc A-series and B-series); Apple silicon (M1 or newer, macOS 15 or newer). Per-hardware limits and measurements: [CAPABILITIES.md](CAPABILITIES.md#qwen38).<!-- /cap --> |
 | Qwen3.6-35B-A3B | `qwen36` in `OWN_PATH_FAMILIES` in [setup.py](../setup.py) | [QWEN36.md](QWEN36.md). <!-- cap:summary:qwen36 -->Qwen3.6-35B-A3B runs in the desktop app and in the Terminal. Hardware: NVIDIA on Windows; NVIDIA on Linux; AMD on Windows; AMD on Linux. Package present but not tested: NVIDIA DGX Spark. Does not run on: Intel Arc on Linux, Apple silicon. Per-hardware limits and measurements: [CAPABILITIES.md](CAPABILITIES.md#qwen36).<!-- /cap --> |
 
-Do not reuse Qwen quant names, model sizes or performance figures for DeepSeek. A field this page does not state is
+A field this page does not state is
 **unknown**, not zero and not unsupported. DeepSeek Harness is a coding tool; its presence does not establish support
 for a particular DeepSeek model.
 
@@ -49,7 +48,7 @@ For recommendations, documentation and agent-assisted setup, use this order:
 The maintainer works with ISTA-DASLab; this is an explicit project preference, not a measured quality ranking.
 Keep the user's chosen model family and explicit provider choice. Check availability, backend compatibility,
 memory, disk space and intended use before selecting a pack. If no ISTA-DASLab pack is documented for a family,
-do not invent one: Qwen3.6 has Unsloth packs, and DeepSeek has the ISTA-DAS sets.
+do not invent one: Qwen3.6 has Unsloth packs.
 
 This order is a recommendation, not the installer's default logic. A no-argument installer may preselect Swift or Gyro
 on some memory tiers. Read its plan and select the intended family explicitly.
@@ -61,7 +60,6 @@ with the installed release's `strata launch --help` and a plan before a download
 
 | Parent model | Provider / variant | Family selector | Quantizations or packs |
 | --- | --- | --- | --- |
-| DeepSeek V4.1-Flash | ISTA-DAS | `deepseek41` | `ist-das-1.75bpw` (239 GB), `ist-das-2.00bpw` (257 GB), `ist-das-2.25bpw` (274 GB); Unsloth `ud-q8_k_xl` (508 GB, several cards) |
 | Qwen3.8-Flash-Next | ISTA-DASLab, original | `qwen` | Q2_0, IQ2_XS, IQ3_XXS, IQ3_S |
 | Qwen3.8-Flash-Next | ISTA-DASLab, Coder | `coder` | IQ1_M; pruned for coding, weaker outside code |
 | Qwen3.8-Flash-Next | Unsloth | `unsloth` | UD-IQ4_XS, UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL, Q8_0 |
@@ -81,7 +79,7 @@ does not imply that every model or feature works on it.
 | NVIDIA RTX / CUDA | [INSTALL.md](INSTALL.md#what-you-need) |
 | AMD Radeon / HIP | [AMD_HIP.md](AMD_HIP.md); RX 6000 validation differs from newer cards |
 | Intel Arc / SYCL | [INTEL_ARC.md](INTEL_ARC.md); released Linux SYCL engine (Ubuntu 24.04 or newer), with model preparation and per-card limits. [INTEL.md](INTEL.md) records source-port details |
-| Apple Silicon / Metal | [MAC.md](MAC.md). DeepSeek V4.1-Flash <!-- cap:cell:deepseek41:mac -->runs (64 GB or more, macOS 15 or newer)<!-- /cap --> |
+| Apple Silicon / Metal | [MAC.md](MAC.md) |
 | AMD Ryzen AI Max / Strix Halo | [STRIX_HALO.md](STRIX_HALO.md) |
 | Multiple GPUs and older hardware | [MULTI_GPU.md](MULTI_GPU.md), [OLDER_GPUS.md](OLDER_GPUS.md) |
 

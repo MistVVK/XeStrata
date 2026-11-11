@@ -31,14 +31,14 @@ and the notarytool profile (`strata-notary`); `SIGN_ID` and `NOTARY_PROFILE` ove
 
 A trial run that signs ad-hoc and sends nothing to Apple: add `--dry-run` (no certificate needed).
 
-## The DeepSeek engine for the Mac
+## An engine package from the update feed
 
-The Mac DeepSeek engine (`strata-dsv41` with its `metal/` sources and `engine-component.json`) comes from the update feed, not from
-the app, so it is signed here as its own input: `--engine strata-dsv41-0.1.53-macos-arm64-metal-unsigned-folder.tar.gz`, alone or
+An engine package from the update feed (the engine of a model shape: its program with its `metal/`
+sources and `engine-component.json`) is signed here as its own input: `--engine <component>-<version>-macos-arm64-metal-unsigned-folder.tar.gz`, alone or
 together with `--terminal` in one run. The script signs every program in the folder with the same identity and options as the
 engine inside the app (hardened runtime, timestamp, no entitlements), writes the new SHA-256 and size into `engine-component.json`,
 runs `codesign --verify --strict`, starts the signed program once (no model), sends a zip of the folder to Apple and waits, and
-writes `signed/strata-dsv41-0.1.53-macos-arm64-metal-folder.tar.gz` (also listed in `signed/SHA256SUMS.txt`). On the PC, sign that
+writes `signed/<component>-<version>-macos-arm64-metal-folder.tar.gz` (also listed in `signed/SHA256SUMS.txt`). On the PC, sign that
 folder with the feed key (this adds the release signature to the manifest) and build the feed from it; the unsigned folder must not be published.
 `--dry-run` signs ad-hoc and skips Apple, as for everything else.
 

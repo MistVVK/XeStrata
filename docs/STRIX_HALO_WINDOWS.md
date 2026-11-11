@@ -1,9 +1,8 @@
 # Strix Halo (Ryzen AI Max, gfx1151) on Windows: install, what you get, what to know
 
 This page is for a Windows PC with a Ryzen AI Max "Strix Halo" chip (Radeon 8060S / 8050S, `gfx1151`). It says what Strata does there out
-of the box, what speed to expect with Qwen3.8-Flash-Next IQ3_S and with DeepSeek V4.1-Flash, and the traps on this hardware. The Linux
-build, the toolchain and the opt-in switches are on [STRIX_HALO.md](STRIX_HALO.md); the DeepSeek details are in
-[DEEPSEEK41.md](DEEPSEEK41.md).
+of the box, what speed to expect with Qwen3.8-Flash-Next IQ3_S, and the traps on this hardware. The Linux
+build, the toolchain and the opt-in switches are on [STRIX_HALO.md](STRIX_HALO.md).
 
 The structure of this page comes from the first Windows guide for this PC, written by HaiYunChuang (pull request #3029). It measured
 engines 0.1.41 to 0.1.47 with a hand-made configuration (`--mmap-experts`, a list of switches, a batch file). Since then the app and
@@ -28,23 +27,8 @@ the engine's own timings; the model is loaded before the clock starts). The numb
 | 32K prompt | **792 tok/s** (40.6 s) |
 | Coding-agent session, 6 turns | 69% of the prompt came from the conversation cache; answers 47 tok/s; 4.5 s to the first token per turn |
 
-**DeepSeek V4.1-Flash 2.00 bpw** (`strata launch --family deepseek41 --model ist-das-2.00bpw`, Faster mode, the drafter on; the 4K row is
-the default 8K context, the others 64K context with `--context 64k`):
-
-| Test | Result |
-| --- | --- |
-| Short chat, answer speed | **12.1 to 13.6 tok/s** |
-| 4K prompt | **214 to 234 tok/s** (about 18 s to the first token) |
-| 16K prompt | **326 tok/s** (51 s) |
-| 32K prompt | **342 tok/s** (97 s) |
-| Coding-agent session, 6 turns | 70% from the conversation cache; answers 14.2 tok/s; 17 to 31 s to the first token per turn |
-
-The prompt rows use the word-list prompt of `tools/strata_bench.py`; ordinary text is costlier for the experts and reads slower (124 to 164 tok/s on 3 to 5K-token pieces of prose). Measured again on the final build, the 4K row reads 229 to 234 tok/s warm. These are speed measurements. They say nothing about answer quality, and the short-chat range depends on the text. The DeepSeek 2.25 bpw set
-and the other Qwen sizes were not measured for this page.
-
-The DeepSeek 4K prompt here (214 to 234 tok/s) is higher than the 87 tok/s on [STRIX_HALO.md](STRIX_HALO.md), which was measured on 2026-10-25 with an
-earlier build. The 0.2.7 DeepSeek defaults explain most of the gap (the same build with `DS4_DEFAULTS=026` reads 133 to 139 tok/s); the table there
-changes one thing at a time.
+The prompt rows use the word-list prompt of `tools/strata_bench.py`; ordinary text is costlier for the experts and reads slower (124 to 164 tok/s on 3 to 5K-token pieces of prose). These are speed measurements. They say nothing about answer quality, and the short-chat range depends on the text. The other Qwen sizes
+were not measured for this page.
 
 ## 2. Memory and the BIOS
 
@@ -75,9 +59,6 @@ What `strata launch` wrote for IQ3_S, with no switches of mine (these are the se
 --max-context 131072 --kv int8 --vision --vram-reserve-mib 700   (backend hip, GPU picture reader)
 ```
 
-and for DeepSeek 2.00 bpw: `--max-context 8192 --dspark auto --dspark-conf 0.65 --prefill-chunk 16384`, with `DS4_ASYNC_T=4` in the
-environment and the package's `rocm/bin` folder on the library path.
-
 ## 4. What is on by default
 
 - On `gfx1151` the engine turns on exact speed switches by itself (19 on Linux, 18 on Windows, which leaves `STRATA_SH_STREAM` out, see below; the start line lists them; `STRATA_GFX1151_DEFAULTS=0` turns them all
@@ -104,7 +85,6 @@ environment and the package's `rocm/bin` folder on the library path.
   about 12.8 GiB of prompt buffers.
 - `--mmap-experts` is not needed. The first Windows guide found that without it the pinned expert arena used up the graphics memory
   budget and decode fell to 28 tok/s on engine 0.1.41; the engine on this page sizes the cache from the shared pool and reaches every slot.
-- DeepSeek runs in "Faster" mode here: 5 of 6 experts per word. The app and `strata launch` say so; the quality change is small.
 
 **`STRATA_SH_STREAM` (the shared expert on its own stream) is off by default on Windows `gfx1151` in 0.2.7, because it is slower there.** It stays
 on by default on Linux `gfx1151`, where it was measured to help ([STRIX_HALO.md](STRIX_HALO.md)). The first Windows guide found the Windows
@@ -129,14 +109,13 @@ token ids were identical in all four runs for every prompt.
 
 What 0.2.7 does: on Windows `gfx1151` the engine no longer turns the switch on by itself. To turn it back on, use `strata launch ...
 --set STRATA_SH_STREAM=1` (or put `STRATA_SH_STREAM=1` in the environment of an engine you start by hand); a value you set is always kept.
-`STRATA_DEFAULTS=026` brings back everything 0.2.6 did, including the switch on. This is one model, one PC and short answers; DeepSeek was
-not tested with it, and Linux `gfx1151` has not been measured against it.
+`STRATA_DEFAULTS=026` brings back everything 0.2.6 did, including the switch on. This is one model, one PC and short answers; Linux `gfx1151` has not been measured against it.
 
 ## 5. Traps
 
 1. **Keep RAM free.** Qwen IQ3_S held 49 GB of 63.6 GB. A browser with many tabs, or a second model, is enough to push the PC into paging.
 2. **Do not run two engines.** One model at a time on this PC; `strata launch --status` shows what is serving, `strata launch --stop` ends it.
-3. **The graphics driver.** The 2025-03 driver failed at 32K context for DeepSeek. The measured driver is Adrenalin 26.10.1 (32.0.32015.7029).
+3. **The graphics driver.** The measured driver is Adrenalin 26.10.1 (32.0.32015.7029).
 4. **If Windows resets the driver** (screen flicker, the engine dies mid-answer), see the driver-reset entry in
    [TROUBLESHOOTING.md](TROUBLESHOOTING.md#amd-cards).
 5. **Other tuning from the first guide** (a longer `--prefill`, `STRATA_PF_*` switches, `--lookup-chain`): those results are for engines
@@ -149,7 +128,6 @@ strata launch --family qwen --model iq3_s            # then, from a source check
 python tools/strata_bench.py --url http://127.0.0.1:8080 --runs 3 --long
 ```
 
-`--long` adds the 32K prompt. For DeepSeek add `--context 64k` to `strata launch` first; the default 8K context skips the 16K prompt and
-the agent session.
+`--long` adds the 32K prompt.
 
 

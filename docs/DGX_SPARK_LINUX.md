@@ -1,14 +1,14 @@
 # Strata on the NVIDIA DGX Spark (Linux, ARM64)
 
 The DGX Spark is a small desktop box with a GB10 chip: a Blackwell GPU (compute capability 12.1, 48 SMs) and 20 Arm CPU cores that share
-128 GB of memory. Strata 0.2.7.1 runs Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash on it. This page says what works, how to install it, what
+128 GB of memory. Strata 0.2.7.1 runs Qwen3.8-Flash-Next on it. This page says what works, how to install it, what
 the Spark does with its memory, and how the speeds were measured. It was tested on one Spark (Ubuntu 24.04, driver 580.173, CUDA 13.0).
 Nothing here is known to work on another ARM machine.
 
 ## What works, and what does not
 
-- **Works:** Qwen3.8-Flash-Next IQ3_S and the NVFP4 GPTQ pack (64K context, every expert in the GPU's cache), DeepSeek-V4.1-Flash 2.00 bpw
-  (a short chat), the Terminal (`strata launch`, `strata update`, `strata serve`) and the engine packages of the signed feed.
+- **Works:** Qwen3.8-Flash-Next IQ3_S and the NVFP4 GPTQ pack (64K context, every expert in the GPU's cache),
+  the Terminal (`strata launch`, `strata update`, `strata serve`) and the engine packages of the signed feed.
 - **Not built for ARM:** the desktop app (no AppImage; use the Terminal), the HIP, SYCL and CPU-only engines, and the Q2_0 and Gyro packs,
   whose CPU kernels are x86-only (the engine refuses them at start). Picture reading is compiled in and was not tried on the Spark.
 - **Not tested:** contexts above 128K, more than eight chat slots (four and eight were measured: "Several chats at once" below), a long soak. `strata doctor --live` lists the GB10 with no memory
@@ -23,7 +23,7 @@ strata launch
 
 `install.sh` unpacks the Terminal into `~/.local/share/strata` (no administrator rights) and checks the release's signed feed. `strata launch`
 fetches the `linux-aarch64` engine package, shows what each model needs, downloads the one you choose and starts it. Pick Qwen3.8-Flash-Next
-IQ3_S (84 GB download) or the NVFP4 pack, or DeepSeek-V4.1-Flash 2.00 bpw (257 GB). The engine package needs glibc 2.39 or newer
+IQ3_S (84 GB download) or the NVFP4 pack. The engine package needs glibc 2.39 or newer
 (Ubuntu 24.04, DGX OS 7) and NVIDIA driver 580.65 or newer.
 
 ## Install from a source checkout
@@ -60,9 +60,9 @@ PATH="$PWD/.venv-build/bin:/usr/local/cuda/bin:$PATH" PYTHON="$PWD/.venv-build/b
 cp -r out-spark/engine ./engine
 ```
 
-About 3 minutes for the Qwen engine and 6 with the DeepSeek engine and the picture reader (the first run also fetches llama.cpp at the
-pinned commit). `out-spark/engine/` holds `strata`, `strata-dsv41`, `strata-vision`, `libstrata_kq.so`, the CUDA libraries and a `BUILD.json`.
-`BUILD_VISION=0` and `BUILD_DSV41=0` leave a part out. `packaging/build_cuda_linux_aarch64.sh` runs this build and makes the engine packages
+About 3 minutes for the engine (the first run also fetches llama.cpp at the
+pinned commit). `out-spark/engine/` holds `strata`, `strata-vision`, `libstrata_kq.so`, the CUDA libraries and a `BUILD.json`.
+`BUILD_VISION=0` leaves the picture reader out. `packaging/build_cuda_linux_aarch64.sh` runs this build and makes the engine package
 for the feed ([packaging/README.md](../packaging/README.md)). A model on a Q2_0 pack cannot run: its CPU kernels need AVX-512.
 
 ## What the Spark does with its memory
@@ -81,10 +81,6 @@ file's pages, which the GPU cache uses.
 The NVFP4 table does not fit in RAM beside the page cache the 68 GB expert file needs. Locking it measured 137 tok/s on a 4K prompt and 26 tok/s
 decode, against 1,252 and 39 without. Leave it on the SSD (setup does).
 
-DeepSeek-V4.1-Flash 2.00 bpw places 12,163 of its 15,744 experts in the GPU's share and runs the rest on the CPU lane from the model's files.
-The engine sizes that from the memory Linux can still give back (`MemAvailable` less 6 GiB, `DS4_UMA_HEADROOM_GIB`), because the model files' page
-cache is most of the memory `cudaMemGetInfo` calls used.
-
 ## Speeds
 
 Measured on the release-candidate engine package of 0.2.7.1 with `tools/dgx_bench.py`: fresh 4K, 16K and 32K prompts at temperature 0, 256-token
@@ -101,10 +97,6 @@ answers, 64K context, the model's own run config, four samples a cell in two blo
 The table makes prompts faster: IQ3_S 1.20x over the three sizes (90% interval 1.12 to 1.31; 1.08x at 4K, 1.19x at 16K, 1.36x at 32K), NVFP4
 1.24x (1.14 to 1.36). It does not change decode speed in this check: 0.996x (0.97 to 1.02) on IQ3_S, with the 4K cell 0.94x, and 1.02x (1.00 to
 1.05) on NVFP4. The first run of the port (26 October) had measured +5% each for the two decode switches; this check did not see it.
-
-DeepSeek-V4.1-Flash 2.00 bpw, 8K context, the default Faster mode (5 of 6 experts per word), 11,187 of 15,744 experts in the GPU's share: a
-short chat answers at 13 to 18 tok/s (the first answer after a start is the slowest). Full quality (`--experts 6`) places more of them and was
-measured at 17 to 23 tok/s on a 1.7K-token chat in the first run.
 
 Several chats at once (`"parallel"` is 4 on a Spark for `strata launch`; the setup script leaves it off): IQ3_S, 2K-token prompts, 128-token cap,
 the aggregate tokens per second over all clients: 8 clients 35.6, 16 clients 41.7, 32 clients 47.3 at 4 slots; 32 clients 54.2 at 8 slots. With
