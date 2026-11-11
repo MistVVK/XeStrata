@@ -2468,9 +2468,13 @@ bool native_supported(int gu_type, int d_type) {
     // The trellis pairs (phase 4, opt-in STRATA_PF_FUSED_TQ=1): Gyro-S's TQK6 / TQK7 and Gyro-M's TQ2_T / TQ2_T only, same conditions.  (A trellis
     // down behind any other gate/up, or the reverse: MMQ.)
     if (is_tq(gu_type) || is_tq(d_type)) {
+        // the compiled geometry must suit the trellis path: whole 128-value blocks along both K, and (a folded down) the FP32 H of a row,
+        // n_ff floats, inside the row's own n_embd-float down-output row (set_down_rotation's invariant); the geometry checks allow n_ff up to
+        // 1,100 and n_embd down to 1,024, so a geometry that breaks it declines the trellis fused path (MMQ) instead of overrunning the row
+        constexpr bool geo_ok = D_ROWS_K <= D_ROWS_N && D_ROWS_K % 128 == 0 && GU_ROWS_K % 128 == 0;
         const DevInfo& d = dev_info();
         const bool pair = (gu_type == T_TQK6 && d_type == T_TQK7) || (gu_type == T_TQ2_T && d_type == T_TQ2_T);
-        return pair && d.ok && d.tq && !d.t75 && d.occ_nt <= 0 && !d.ws;
+        return geo_ok && pair && d.ok && d.tq && !d.t75 && d.occ_nt <= 0 && !d.ws;
     }
     if (d_type == T_Q8_0 && gu_type != T_Q4_K && gu_type != T_Q5_K) {
         const DevInfo& d = dev_info();
