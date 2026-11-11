@@ -14,6 +14,7 @@
 // Exit 77 without a CUDA device of sm_80 or newer.
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/prefill/moe_fused_q36.hpp"
+#include "strata/prefill/mmq_ids_margin.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 
 #include "ggml.h"
@@ -56,6 +57,7 @@ struct Dev {
 struct Pair {
     ggml_type gu, d;
     const char* name;
+    bool optional = false;   // a pair this build may not cover yet: skipped with a printed line instead of failing (UD-Q4_K_XL's K-quant downs)
 };
 bool mmq_ok(const Pair& p) { return mmq::supported((int) p.gu) && mmq::supported((int) p.d); }
 size_t row_size(ggml_type t, int64_t n) { return (size_t) (n / ggml_blck_size(t)) * ggml_type_size(t); }
@@ -160,13 +162,19 @@ Routing sort_rows(const std::vector<int32_t>& ids, int E) {
     return r;
 }
 
+// MMQ's row table (the identity ids) is read past its end by llama.cpp's mul_mat_q and its stream-k fixup (a whole J-column tile from an expert's first row, J up
+// to 128): the table takes mmq_ids_table_rows(rows, max_rows) entries, max_rows <= the tokens of the layer (an expert takes at most one row per token).  An exact
+// table of rows * 4 = 64 KB ended a cudaMalloc chunk and faulted in compute-sanitizer's and the plain run (z440-20261111-2224-d478: 311 invalid reads of size 4 in
+// mul_mat_q<Q8_0, 96>, 29 to 57+ bytes after the 65,536-byte allocation).
+size_t ids_table_rows(int64_t rows) { return (size_t) mmq::mmq_ids_table_rows((uint64_t) rows, (uint64_t) (rows / K)); }
+
 // MMQ, as prefill.cpp runs a native layer: per group of 16 routed experts a gather, gate/up, SwiGLU (gate rows, then up rows), q8_1 of H,
 // down.  Returns Dm [rows][N] in sorted-row order.
 struct MmqBufs {
     Dev xq, gu, h, hq, dm, ident, bounds, grp_gu, grp_d;
     MmqBufs(const Pair& p, int64_t rows, int E)
         : xq(mmq::q8_bytes(rows, N)), gu((size_t) rows * FF2 * 4), h((size_t) rows * FF * 4),
-          hq(mmq::q8_bytes(rows, FF)), dm((size_t) rows * N * 4), ident((size_t) rows * 4),
+          hq(mmq::q8_bytes(rows, FF)), dm((size_t) rows * N * 4), ident(ids_table_rows(rows) * 4),   // (the margin llama.cpp's kernels read past the table: see ids_table_rows)
           bounds((size_t) (2 * (E + E / GROUP + 2)) * 4), grp_gu(GROUP * mmq::matrix_bytes(p.gu, FF2, N) + 4096),
           grp_d(GROUP * mmq::matrix_bytes(p.d, N, FF) + 4096) {}
 };
@@ -184,7 +192,7 @@ void run_mmq(const Pair& p, const Geo& geo, mmq::Context& ctx, MmqBufs& b, const
         for (size_t i = 0; i <= GROUP; ++i)
             bh[n + 1 + g * (GROUP + 1) + i] = bh[std::min(n, g * GROUP + i)] - bh[g * GROUP];
     ck(cudaMemcpyAsync(b.bounds.p, bh.data(), bh.size() * 4, cudaMemcpyHostToDevice, s), "bounds");
-    mmq::iota(b.ident.as<int32_t>(), rows, s);
+    mmq::iota(b.ident.as<int32_t>(), (int64_t) ids_table_rows(rows), s);
     mmq::quantize(x_dev, src_dev, b.xq.p, (int) p.gu, N, N, rows, s);
     for (size_t j = 0; j < n; ++j) {
         const size_t q = j % GROUP;
@@ -581,7 +589,11 @@ int main(int argc, char** argv) {
         const std::vector<Pair> pairs = {
             // UD-Q6_K_XL: 40 layers Q6_K / Q8_0 and one Q8_0 / Q8_0; the Q8_0 file: Q8_0 / Q8_0 on all 41
             {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, "Q6_K + Q8_0"},
-            {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, "Q8_0 / Q8_0"}};
+            {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, "Q8_0 / Q8_0"},
+            // UD-Q4_K_XL: Q4_K gate/up with a Q5_K down on 38 layers, Q4_K / Q6_K on 2, Q5_K / Q6_K on 1 (K-quant downs: K = 512 is two 256-value super-blocks)
+            {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, "Q4_K / Q5_K", true},
+            {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, "Q4_K / Q6_K", true},
+            {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, "Q5_K / Q6_K", true}};
         const char* only = nullptr;   // --only=NAME: the pairs whose name contains NAME
         bool timing = true, ref = true;
         std::vector<int> chunks = {2048, 8192};   // --chunks=A,B: the timing part's chunk sizes
@@ -602,7 +614,10 @@ int main(int argc, char** argv) {
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
         for (const Pair& p : pairs) {
             if (only && std::string(p.name).find(only) == std::string::npos) continue;
-            if (!fq::native_supported((int) p.gu, (int) p.d)) throw std::runtime_error(std::string(p.name) + ": not covered by the Qwen3.6 copy of the kernels");
+            if (!fq::native_supported((int) p.gu, (int) p.d)) {
+                if (p.optional) { std::printf("%s: not covered by this build of the Qwen3.6 kernels (skipped)\n", p.name); continue; }
+                throw std::runtime_error(std::string(p.name) + ": not covered by the Qwen3.6 copy of the kernels");
+            }
             if (ref) {
                 reference_part(p, s);
                 // the tails and tile edges: a handful of tokens, one token, 130 and 517 tokens (the counts follow the routing)
