@@ -87,7 +87,7 @@ chk $? "gpu reader built"
 STAGE=$OUT/stage; rm -rf "$STAGE"; mkdir -p "$STAGE"
 ARCHJSON=$(for a in $ARCHLIST; do printf '"%s", ' "$a"; done | sed 's/, $//')
 cat > "$STAGE/BUILD.json" <<EOJ
-{"version": "$PKGVER", "source": "f-amd-vision $COMMIT", "variant": "$V", "archs": [$ARCHJSON], "portable": true, "vision": "gpu", "vision_cpu": "strata-vision", "vision_gpu": "strata-vision-hip", "vision_archs": [$ARCHJSON], "dsv41": $([ "$DSV41" = 1 ] && echo true || echo false)}
+{"version": "$PKGVER", "source": "f-amd-vision $COMMIT", "variant": "$V", "archs": [$ARCHJSON], "portable": true, "vision": "gpu", "vision_cpu": "strata-vision", "vision_gpu": "strata-vision-hip", "vision_archs": [$ARCHJSON]}
 EOJ
 # the libraries the engine and the GPU reader load (the CPU reader needs only the system's), collected from the build outputs
 DATA=(--data "$LIBW/lib/rocblas/library=rocblas/library" --data "$LIBW/lib/hipblaslt/library=hipblaslt/library" --data-arch "$DATAARCH")
