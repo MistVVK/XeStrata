@@ -638,16 +638,12 @@ bool VitGpu::prefer_mtmd(bool bf16_matrices, int max_tokens, std::string& why) {
     (void) bf16_matrices;
     (void) max_tokens;
     if (hipGetDeviceProperties(&p, 0) != hipSuccess) { (void) hipGetLastError(); return false; }
-    if (vit_gpu_slower_amd(p.gcnArchName)) {
-        why = std::string(p.gcnArchName) + ": rocBLAS has only fallback kernels there, the own GPU tower is slower than mtmd";
-        return true;
-    }
 #ifdef _WIN32
     const bool windows = true;
 #else
     const bool windows = false;
 #endif
-    if (vit_gpu_hip_windows_not_measured(windows)) {
+    if (vit_gpu_hip_windows_not_measured(windows, p.gcnArchName)) {
         why = std::string(p.gcnArchName) + " on Windows: the own HIP tower is not measured with the Windows ROCm package yet, mtmd stays";
         return true;
     }

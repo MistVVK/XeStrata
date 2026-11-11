@@ -47,9 +47,12 @@ int main(int argc, char** argv) {
         CHECK(!vit_gpu_slower_nvidia(6, 0, false, mt) && !vit_gpu_slower_nvidia(6, 1, false, mt) && !vit_gpu_slower_nvidia(6, 1, true, mt) && !vit_gpu_slower_nvidia(6, 2, true, mt));
         CHECK(!vit_gpu_slower_nvidia(6, 0, true, mt) && !vit_gpu_slower_nvidia(8, 6, true, mt) && !vit_gpu_slower_nvidia(12, 0, false, mt));
     }
-    CHECK(vit_gpu_slower_amd("gfx1151") && vit_gpu_slower_amd("gfx1151:xnack-"));
-    CHECK(!vit_gpu_slower_amd("gfx1150") && !vit_gpu_slower_amd("gfx1201") && !vit_gpu_slower_amd("gfx11510") && !vit_gpu_slower_amd("gfx115") && !vit_gpu_slower_amd(""));
-    CHECK(vit_gpu_hip_windows_not_measured(true) && !vit_gpu_hip_windows_not_measured(false));   // Windows HIP keeps mtmd under auto; Linux HIP does not
+    CHECK(vit_gpu_is_gfx1151("gfx1151") && vit_gpu_is_gfx1151("gfx1151:xnack-"));
+    CHECK(!vit_gpu_is_gfx1151("gfx1150") && !vit_gpu_is_gfx1151("gfx1201") && !vit_gpu_is_gfx1151("gfx11510") && !vit_gpu_is_gfx1151("gfx115") && !vit_gpu_is_gfx1151(""));
+    // Windows HIP keeps mtmd under auto except on gfx1151 (Strix, measured with that package; owner 11-11); Linux HIP never
+    CHECK(!vit_gpu_hip_windows_not_measured(true, "gfx1151") && !vit_gpu_hip_windows_not_measured(true, "gfx1151:xnack-"));
+    CHECK(vit_gpu_hip_windows_not_measured(true, "gfx1201") && vit_gpu_hip_windows_not_measured(true, "gfx1100") && vit_gpu_hip_windows_not_measured(true, "gfx1150"));
+    CHECK(!vit_gpu_hip_windows_not_measured(false, "gfx1151") && !vit_gpu_hip_windows_not_measured(false, "gfx1201"));
     {   // the default tower (no --tower): auto, or STRATA_VISION_TOWER's value when it is a known one
         std::string note;
         CHECK(vision_tower_default(nullptr, note) == "auto" && note.empty());
