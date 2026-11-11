@@ -4,6 +4,7 @@
 
 // src/core/layer.cpp - the GDN layer, composed.  See the header for the operation order and its traps.
 #include "strata/core/layer.hpp"
+#include "strata/core/kv_elastic.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/native_head.hpp"
@@ -453,8 +454,7 @@ std::vector<std::unique_ptr<ElasticPool>>& pools() {
 }
 
 int64_t pool_chunks(const ElasticPool& p, size_t a, int64_t slots) {
-    const uint64_t G = strata::core::vmm_granularity();
-    return (int64_t) (((uint64_t) slots * p.per_slot[a] + G - 1) / G);
+    return strata::core::kv_elastic_chunks((uint64_t) slots * p.per_slot[a]);
 }
 int64_t pool_slots(const ElasticPool& p, int64_t cells) {
     return std::min<int64_t>(p.n_slots, std::max<int64_t>((cells + p.page_size - 1) / p.page_size, 1));
@@ -477,22 +477,11 @@ bool pool_grow(ElasticPool& p, int64_t cells, const std::function<strata::core::
     const int64_t slots = pool_slots(p, cells);
     for (size_t a = 0; a < p.off.size(); ++a) {
         const int64_t c0 = (int64_t) (p.off[a] / G), c1 = c0 + pool_chunks(p, a, slots);
-        std::vector<int64_t> fresh;
-        for (int64_t c = c0; c < c1; ++c)
-            if (!p.range.mapped(c)) fresh.push_back(c);
-        if (fresh.empty()) continue;
-        if (!p.range.map_range(c0, c1, take)) {
-            std::fprintf(stderr, "xestrata: the elastic K/V could not map %zu chunks (the driver has no VRAM left)\n",
-                         fresh.size());
+        if (!strata::core::kv_elastic_map(p.range, c0, c1, take)) {
+            std::fprintf(stderr, "xestrata: the elastic K/V could not map or clear chunks: %s\n",
+                         strata::gpu::last_error());
             return false;
         }
-        // what the chunk held before (another pool's cells, an expert) is not K/V: zeroed, as a new session is
-        for (const int64_t c : fresh)
-            if (!strata::gpu::memset(p.range.base() + (uint64_t) c * G, 0, (size_t) G)) {
-                std::fprintf(stderr, "xestrata: the elastic K/V could not clear a chunk: %s\n",
-                             strata::gpu::last_error());
-                return false;
-            }
     }
     return true;
 }
@@ -515,7 +504,7 @@ int64_t qsa_kv_elastic_need(int64_t cells) {
         const int64_t slots = pool_slots(*p, cells);
         for (size_t a = 0; a < p->off.size(); ++a) {
             const int64_t c0 = (int64_t) (p->off[a] / G), c1 = c0 + pool_chunks(*p, a, slots);
-            for (int64_t c = c0; c < c1; ++c) n += !p->range.mapped(c);
+            n += strata::core::kv_elastic_need(p->range, c0, c1);
         }
     }
     return n;
@@ -533,8 +522,7 @@ int64_t qsa_kv_elastic_shrink(int64_t cells, const std::function<void(strata::co
         for (size_t a = 0; a < p->off.size(); ++a) {
             const int64_t c0 = (int64_t) (p->off[a] / G), c1 = c0 + pool_chunks(*p, a, slots);
             const int64_t end = a + 1 < p->off.size() ? (int64_t) (p->off[a + 1] / G) : p->range.chunks();
-            for (int64_t c = c1; c < end; ++c)
-                if (const strata::core::VmmChunk h = p->range.unmap(c)) { give(h); ++n; }
+            n += strata::core::kv_elastic_unmap(p->range, c1, end, give);
         }
     }
     return n;

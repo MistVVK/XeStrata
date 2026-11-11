@@ -18,6 +18,7 @@
 // whole head; the MoE without the shared expert; the second norm named ffn_norm.  qwen35's (Qwen3.5-9B,
 // src/models/qwen35.cpp at de7fa0a3) is qwen35moe's with the MoE replaced by a dense SwiGLU, down(silu(gate(h)) * up(h)),
 // in every block and in the MTP layer: no experts, so none of the tiers, the CPU pool or the window protocol.
+#include "strata/core/kv_elastic.hpp"
 #include "strata/core/plain_model.hpp"
 #include "strata/core/constraint_upload.hpp"
 
@@ -2167,8 +2168,7 @@ bool PlainModel::kv_map(int64_t cells, std::string& err) {
         while (lo < r.chunks() && r.mapped(lo)) ++lo;
         const int64_t hi = std::min<int64_t>(r.chunks(), (int64_t) ((pages * kv_vmm_page_bytes_[i] + G - 1) / G));
         if (hi <= lo) continue;
-        if (!r.map_range(lo, hi, [] { return (VmmChunk) 0; }) ||
-            !strata::gpu::memset(r.base() + lo * G, 0, (size_t) ((hi - lo) * (int64_t) G))) {
+        if (!kv_elastic_map(r, lo, hi, [] { return (VmmChunk) 0; })) {
             err = std::string("plain model: no VRAM for the K/V's ") + std::to_string((long long) cells) + " cells (" +
                   strata::gpu::last_error() + ")";
             return false;
@@ -2185,7 +2185,7 @@ constexpr int64_t kKvGrowStep = 8192;
 
 bool PlainModel::kv_grow_to(int64_t cells, std::string& err) {
     if (kv_cells_ < 0 || cells <= kv_cells_) return true;
-    const int64_t target = std::min<int64_t>(opt_.max_cells, (cells + kKvGrowStep - 1) / kKvGrowStep * kKvGrowStep);
+    const int64_t target = std::min<int64_t>(opt_.max_cells, kv_elastic_target(cells, kKvGrowStep));
     const k::QsaShapes qs = attn_shapes();
     const uint64_t G = vmm_granularity();
     const int64_t pages = (target + qs.page_size - 1) / qs.page_size;
@@ -2212,7 +2212,7 @@ bool PlainModel::kv_grow_to(int64_t cells, std::string& err) {
 
 bool PlainModel::kv_trim(int64_t cells, std::string& err) {
     if (kv_cells_ < 0) return true;
-    const int64_t target = std::max<int64_t>(kKvGrowStep, (cells + kKvGrowStep - 1) / kKvGrowStep * kKvGrowStep);
+    const int64_t target = kv_elastic_target(cells, kKvGrowStep);
     if (kv_cells_ < target + 2 * kKvGrowStep) return true;
     if (!settle_swaps(true, err)) return false;
     if (!strata::gpu::device_sync()) { err = std::string("plain model: ") + strata::gpu::last_error(); return false; }
@@ -2222,8 +2222,7 @@ bool PlainModel::kv_trim(int64_t cells, std::string& err) {
     for (size_t i = 0; i < kv_vmm_.size(); ++i) {
         VmmRange& r = *kv_vmm_[i];
         const int64_t keep = (int64_t) ((pages * kv_vmm_page_bytes_[i] + G - 1) / G);
-        for (int64_t c = keep; c < r.chunks(); ++c)
-            if (const VmmChunk h = r.unmap(c)) vmm_chunk_free(h);
+        kv_elastic_unmap(r, keep, r.chunks(), [](VmmChunk h) { vmm_chunk_free(h); });
     }
     const int64_t from = kv_cells_, slots0 = cache_.slots();
     kv_cells_ = pages * qs.page_size;

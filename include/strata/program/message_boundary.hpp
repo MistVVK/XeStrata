@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #pragma once
 
 #include <cstddef>
@@ -7,6 +8,29 @@
 #include <vector>
 
 namespace strata::program {
+
+template <typename T>
+inline int64_t last_turn_boundary(const std::vector<T>& ids, int64_t resume, int64_t turn, int64_t tail_role) {
+    if (turn < 0) return -1;
+    int64_t found = -1;
+    for (int64_t i = int64_t(ids.size()) - 1; i > resume; --i)
+        if (ids[std::size_t(i)] == turn) { found = i; break; }
+    if (found > 0 && tail_role >= 0)
+        for (int64_t i = found - 1; i > resume; --i)
+            if (ids[std::size_t(i)] == turn) {
+                if (ids[std::size_t(i + 1)] == tail_role) found = i;
+                break;
+            }
+    return found;
+}
+
+template <typename T>
+inline int64_t root_turn_boundary(const std::vector<T>& ids, int64_t last, int64_t turn, int64_t minimum) {
+    if (turn < 0 || minimum <= 0) return -1;
+    for (int64_t i = 1; i < last; ++i)
+        if (ids[std::size_t(i)] == turn) return i >= minimum ? i : -1;
+    return -1;
+}
 
 inline int64_t message_checkpoint_boundary(const std::vector<int64_t>& ids, int64_t resume,
         int64_t turn_at, int64_t turn_token, int64_t min_prefix = 8192, int64_t max_tail = 1024) {

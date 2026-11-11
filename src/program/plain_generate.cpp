@@ -9,6 +9,8 @@
 // drafts, the accepted ones emitted together).  stdout gets one line,
 // `tokens: a,b,c`, the generated ids; --dump-logits writes the logits each generated token was chosen from, n_vocab
 // floats a row.  The report goes to stderr.
+#include "strata/program/message_boundary.hpp"
+#include "strata/program/conv_cache.hpp"
 #include "strata/program/plain_generate.hpp"
 #include "strata/program/batch_groups.hpp"
 #include "strata/program/option_scope.hpp"
@@ -19,6 +21,7 @@
 #include "strata/program/shared_options.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
+#include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_disk.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -973,7 +976,12 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                         const auto avail = strata::core::available_host_bytes();
                         return !avail || (int64_t) *avail - need <= cache.min_free;
                     };
-                    while (short_of() && cache.save_reclaim && !cache.parked.empty()) cache.parked.pop_back();
+                    if (cache.save_reclaim)
+                        strata::core::session_reclaim_until(short_of, [] { return false; }, [&] {
+                            if (cache.parked.empty()) return false;
+                            cache.parked.pop_back();
+                            return true;
+                        }, [] { return false; });
                     if (short_of()) {
                         refuse("memory", "not enough free RAM for the conversation's copy (" + std::to_string(need >> 20) +
                                          " MiB)" + (cache.save_reclaim ? "" : "; --session-save-reclaim lets the parked ones go"));
@@ -1622,26 +1630,10 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         struct Cut { int64_t to; bool root, pin, tail = false; };
         std::vector<Cut> cuts;
         if (cache.checkpoints > 0) {
-            int64_t turn_at = -1, root_at = -1, pin_at = -1;
-            if (cache.turn >= 0)
-                for (int64_t i = n - 1; i > resume; --i)
-                    if (ids[(size_t) i] == cache.turn) { turn_at = i; break; }
-            // --tail-role-token (#458): a short turn of that role right before the new assistant turn (the server's
-            // trailing effort turn) stays out of the checkpoint, so the next request finds the conversation without it
-            if (turn_at > 0 && cache.tail_role >= 0)
-                for (int64_t i = turn_at - 1; i > resume; --i)
-                    if (ids[(size_t) i] == cache.turn) {
-                        if (i + 1 < n && ids[(size_t) i + 1] == cache.tail_role) turn_at = i;
-                        break;
-                    }
-            // a prompt read from token 0 stops at its first turn boundary too, the end of the system prompt (with the
-            // tools) every new chat of the client shares; kept for good, as Qwen3.8-Flash-Next's root
-            if (cache.turn >= 0 && cache.root > 0 && resume == 0)
-                for (int64_t i = 1; i < turn_at; ++i)
-                    if (ids[(size_t) i] == cache.turn) {
-                        if (i >= cache.root) root_at = i;
-                        break;
-                    }
+            int64_t turn_at = strata::program::last_turn_boundary(ids, resume, cache.turn, cache.tail_role);
+            const int64_t root_at = resume == 0
+                ? strata::program::root_turn_boundary(ids, turn_at, cache.turn, cache.root) : -1;
+            int64_t pin_at = -1;
             if (req_pin > 0) {
                 if (cache.checkpoints < 3 || !req_ckpt)
                     std::fprintf(stderr, "xestrata (%s): pin=%lld ignored: %s\n", arch.c_str(), (long long) req_pin,
@@ -1711,37 +1703,30 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                              checks.end());
             checks.push_back({L, std::move(snap), ++check_clock, root, pin, tail, reply});
             while ((int) checks.size() > cache.checkpoints) {
-                auto evictable = [](const Checkpoint& c) { return !c.root && !c.pinned; };
-                auto drop = checks.end();
-                for (auto it = checks.begin(); drop == checks.end() && it != checks.end(); ++it)   // the tail one first
-                    if (it->tail && evictable(*it)) drop = it;
-                if (drop == checks.end() && cache.spread) {
-                    // --prompt-cache-spread: the one whose leaving opens the smallest gap for its distance back from
-                    // the newest, so the kept ones thin out geometrically (the newest stays)
-                    int64_t newest = 0;
-                    for (const Checkpoint& c : checks) newest = std::max(newest, c.len);
-                    double best = INFINITY;
-                    for (auto it = checks.begin(); it != checks.end(); ++it) {
-                        if (!evictable(*it) || it->len == newest) continue;
-                        int64_t below = 0, above = newest;
-                        for (const Checkpoint& c : checks) {
-                            if (c.len < it->len) below = std::max(below, c.len);
-                            if (c.len > it->len) above = std::min(above, c.len);
-                        }
-                        const double cost = (double) (above - below) / (double) (newest - it->len);
-                        if (cost < best) {
-                            best = cost;
-                            drop = it;
-                        }
-                    }
+                // The shared policy takes a chain in token order, root first.
+                const size_t count = checks.size();
+                std::vector<size_t> order(count);
+                for (size_t i = 0; i < count; ++i) order[i] = i;
+                std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+                    return checks[a].root != checks[b].root ? checks[a].root : checks[a].len < checks[b].len;
+                });
+                std::vector<int64_t> lens(count);
+                std::vector<uint64_t> stamps(count);
+                auto tail = std::make_unique<bool[]>(count);
+                auto pinned = std::make_unique<bool[]>(count);
+                for (size_t i = 0; i < count; ++i) {
+                    const auto& c = checks[order[i]];
+                    lens[i] = c.len;
+                    stamps[i] = c.used;
+                    tail[i] = c.tail;
+                    pinned[i] = c.pinned || c.root;
                 }
-                for (auto it = checks.begin(); drop == checks.end() && it != checks.end(); ++it)   // the LRU
-                    if (evictable(*it)) drop = it;
-                if (drop != checks.end() && !drop->tail && !cache.spread)
-                    for (auto it = checks.begin(); it != checks.end(); ++it)
-                        if (evictable(*it) && it->used < drop->used) drop = it;
-                if (drop == checks.end()) drop = checks.begin();   // all kept for good: the oldest
-                checks.erase(drop);
+                const size_t victim = cache.spread
+                    ? strata::program::conv_cache::spread_victim(lens.data(), stamps.data(), count, cache.checkpoints,
+                                                                 tail.get(), pinned.get())
+                    : strata::program::conv_cache::eviction_victim(stamps.data(), count, cache.checkpoints,
+                                                                   tail.get(), pinned.get());
+                checks.erase(checks.begin() + (std::ptrdiff_t) order[victim]);
             }
         };
         if (geni) model.set_embeddings(&row_ptr);   // the pictures' rows for the prompt's cells
