@@ -11,6 +11,7 @@
 //     prefill_mmq_v31_test --bench [--reps N]       Q5_0 down: MMQ against the dequantize-to-FP16 + cuBLAS route
 //                                                    (what a build without the instance runs), per expert-group size
 #include "strata/kernels/dequant_bf16.hpp"
+#include "strata/prefill/mmq_ids_margin.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 
 #include "ggml.h"
@@ -94,11 +95,16 @@ void product(mmq::Context& ctx, cudaStream_t s, const char* name, ggml_type t, i
         ws.push_back(make_matrix(t, out_rows, cols, e, trial));
         std::copy(ws.back().begin(), ws.back().end(), w.begin() + (ptrdiff_t) ((size_t) e * eb));
     }
-    Dev dx(x.size() * 4), dsrc((size_t) rows * 4), ddst((size_t) rows * 4), db(bounds.size() * 4), dw(w.size()),
+    // llama.cpp's mul_mat_q and its stream-k fixup read the row-id table up to a J-column tile (J <= 128) past the last row, up to roundup(max_rows, J)
+    // from an expert's first row (mmq_ids_margin.hpp): the table has the margin, its extra entries hold row index 0 (valid; they are read, never used)
+    const size_t ids_rows = (size_t) mmq::mmq_ids_table_rows((uint64_t) rows, (uint64_t) *std::max_element(counts.begin(), counts.end()));
+    std::vector<int32_t> dst_table(dst);
+    dst_table.resize(ids_rows, 0);
+    Dev dx(x.size() * 4), dsrc((size_t) rows * 4), ddst(ids_rows * 4), db(bounds.size() * 4), dw(w.size()),
         dxq(mmq::q8_bytes(rows, cols)), dy((size_t) rows * (size_t) out_rows * 4);
     ck(cudaMemcpy(dx.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
     ck(cudaMemcpy(dsrc.p, src.data(), src.size() * 4, cudaMemcpyHostToDevice), "src");
-    ck(cudaMemcpy(ddst.p, dst.data(), dst.size() * 4, cudaMemcpyHostToDevice), "dst");
+    ck(cudaMemcpy(ddst.p, dst_table.data(), dst_table.size() * 4, cudaMemcpyHostToDevice), "dst");
     ck(cudaMemcpy(db.p, bounds.data(), bounds.size() * 4, cudaMemcpyHostToDevice), "bounds");
     ck(cudaMemcpy(dw.p, w.data(), w.size(), cudaMemcpyHostToDevice), "w");
     ck(cudaMemset(dy.p, 0xff, (size_t) rows * (size_t) out_rows * 4), "sentinel");
@@ -198,7 +204,8 @@ void bench(ggml_type t, int reps) {
     for (int per : {16, 64, 256, 1024}) {
         const int rows = per * NE;
         const std::vector<float> x = make_x(rows, FF, 3);
-        std::vector<int32_t> bounds((size_t) NE + 1), iota((size_t) rows);
+        const size_t ids_rows = (size_t) mmq::mmq_ids_table_rows((uint64_t) rows, (uint64_t) per);   // (the identity over the whole table: mmq_ids_margin.hpp)
+        std::vector<int32_t> bounds((size_t) NE + 1), iota(ids_rows);
         for (int e = 0; e <= NE; ++e) bounds[(size_t) e] = e * per;
         std::iota(iota.begin(), iota.end(), 0);
         Dev dx(x.size() * 4), db(bounds.size() * 4), di(iota.size() * 4), dxq(mmq::q8_bytes(rows, FF)),

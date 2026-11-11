@@ -3,6 +3,7 @@
 // It compares GGML's MMQ result (with its intended q8_1 activation rounding) to a CPU FP32 product using
 // GGML's own dequantizer for the exact same weight blocks. The tolerances screen layout/stride/bounds errors;
 // they do not assert bitwise or FP16 parity.
+#include "strata/prefill/mmq_ids_margin.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "ggml.h"
 #include <hip/hip_runtime.h>
@@ -129,14 +130,19 @@ Metrics run_product(Context & ctx, hipStream_t stream, const std::string & name,
 
     DeviceBuffer dx(x.size() * sizeof(float));
     DeviceBuffer dsrc(src_ids.size() * sizeof(int32_t));
-    DeviceBuffer ddst(dst_ids.size() * sizeof(int32_t));
+    // llama.cpp's mul_mat_q and its stream-k fixup read the row-id table up to a J-column tile (J <= 128) past the last row, up to roundup(max_rows, J) from an
+    // expert's first row (mmq_ids_margin.hpp): the table has the margin, its extra entries hold row index 0 (valid; they are read, never used)
+    const size_t ids_rows = (size_t) strata::prefill::mmq::mmq_ids_table_rows((uint64_t) rows, (uint64_t) *std::max_element(counts.begin(), counts.end()));
+    std::vector<int32_t> dst_table(dst_ids);
+    dst_table.resize(ids_rows, 0);
+    DeviceBuffer ddst(dst_table.size() * sizeof(int32_t));
     DeviceBuffer dbounds(bounds.size() * sizeof(int32_t));
     DeviceBuffer dw(w.size());
     DeviceBuffer dxq(q8_bytes(rows, cols));
     DeviceBuffer dy((size_t) rows * (size_t) out_rows * sizeof(float));
     hip_check(hipMemcpy(dx.p, x.data(), x.size() * sizeof(float), hipMemcpyHostToDevice), "copy x");
     hip_check(hipMemcpy(dsrc.p, src_ids.data(), src_ids.size() * sizeof(int32_t), hipMemcpyHostToDevice), "copy src ids");
-    hip_check(hipMemcpy(ddst.p, dst_ids.data(), dst_ids.size() * sizeof(int32_t), hipMemcpyHostToDevice), "copy dst ids");
+    hip_check(hipMemcpy(ddst.p, dst_table.data(), dst_table.size() * sizeof(int32_t), hipMemcpyHostToDevice), "copy dst ids");
     hip_check(hipMemcpy(dbounds.p, bounds.data(), bounds.size() * sizeof(int32_t), hipMemcpyHostToDevice), "copy bounds");
     hip_check(hipMemcpy(dw.p, w.data(), w.size(), hipMemcpyHostToDevice), "copy weights and zero tail");
     // On the product's stream: a plain hipMemset runs on the null stream, which a non-blocking stream does not wait
