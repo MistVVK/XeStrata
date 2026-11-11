@@ -17,6 +17,7 @@
 // Activations are random rows; the reference dequantizes the weights with ggml's own NVFP4 decode and sums in double.
 // Reported per product: relative Frobenius error and the worst element relative to the row's largest output.
 // 8-bit activations land near 0.5%; FP4 activations near 10% - the difference between the two modes.
+#include "strata/prefill/mmq_ids_margin.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 
 #include "ggml.h"
@@ -82,11 +83,12 @@ int product(const uint8_t* w_host, int64_t rows, int64_t cols, int T, const char
     ck(cudaMalloc(&dq, mmq::q8_bytes(T, cols)), "xq");
     ck(cudaMalloc(&dys, T * sizeof(float)), "yscale");
     ck(cudaMalloc(&dd, (size_t) T * rows * sizeof(float)), "dst");
-    ck(cudaMalloc(&dids, T * sizeof(int32_t)), "ids");
+    const size_t ids_rows = (size_t) mmq::mmq_ids_table_rows((uint64_t) T, (uint64_t) T);   // (mul_mat_q reads the row table past its last row: mmq_ids_margin.hpp)
+    ck(cudaMalloc(&dids, ids_rows * sizeof(int32_t)), "ids");
     ck(cudaMalloc(&dbounds, 2 * sizeof(int32_t)), "bounds");
     const int32_t bounds[2] = {0, T};
     ck(cudaMemcpy(dbounds, bounds, sizeof bounds, cudaMemcpyHostToDevice), "bounds");
-    mmq::iota(dids, T, nullptr);
+    mmq::iota(dids, (int64_t) ids_rows, nullptr);
     mmq::quantize(dx, nullptr, dq, GGML_TYPE_NVFP4, cols, cols, T, nullptr, dys);
     mmq::Context ctx;
     mmq::Product p;
@@ -188,10 +190,11 @@ int group(const char* path) {
     ck(cudaMalloc(&ddn, (size_t) std::max(nB, 1) * N * 4), "dn");
     ck(cudaMalloc(&dxq, mmq::q8_bytes(T, N)), "xq"); ck(cudaMalloc(&dhq, mmq::q8_bytes(std::max(nB, 1), FF)), "hq");
     ck(cudaMalloc(&dys, T * 4), "ys"); ck(cudaMalloc(&dhs, std::max(nB, 1) * 4), "hs");
-    ck(cudaMalloc(&dids, T * 4), "ids"); ck(cudaMalloc(&dbounds, (E + 1) * 4), "b"); ck(cudaMalloc(&drel, 5 * 4), "rel");
+    const size_t ids_rows = (size_t) mmq::mmq_ids_table_rows((uint64_t) T, (uint64_t) T);   // (mul_mat_q reads the row table past its last row: mmq_ids_margin.hpp)
+    ck(cudaMalloc(&dids, ids_rows * 4), "ids"); ck(cudaMalloc(&dbounds, (E + 1) * 4), "b"); ck(cudaMalloc(&drel, 5 * 4), "rel");
     ck(cudaMemcpy(dbounds, bounds.data(), (E + 1) * 4, cudaMemcpyHostToDevice), "b");
     ck(cudaMemcpy(drel, relB.data(), 5 * 4, cudaMemcpyHostToDevice), "rel");
-    mmq::iota(dids, T, nullptr);
+    mmq::iota(dids, (int64_t) ids_rows, nullptr);
     const bool fp4 = mmq::fp4_activations(GGML_TYPE_NVFP4);
     mmq::quantize(dx, nullptr, dxq, GGML_TYPE_NVFP4, N, N, T, nullptr, dys);
     mmq::Context ctx;
