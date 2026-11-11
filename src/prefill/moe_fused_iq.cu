@@ -648,6 +648,33 @@ template <int T> __device__ __forceinline__ void kq_lean_expand(const uint32_t (
         }
     }
 }
+// (CUDA, STRATA_PF_FUSED_Q6K=1) the same for the Q6_K gate/up: the row's two decode threads take sub-blocks 2 k and 2 k + 1 of a stage,
+// whose low nibbles are different ql bytes (each loads its own 32) but whose two high bits come from the same 32 qh bytes: each loads
+// half of them (bytes 16 uj ..) and the halves are swapped when the stage is decoded.  14 raw words across a stage instead of 18; the
+// words kq_lean_expand gives are load_unit<T_Q6_K>'s, so convert and the arithmetic are unchanged.  (Explicit specializations: the
+// Q4_K / Q5_K forms above are not touched.)
+template <> __host__ __device__ constexpr int kq_lean_words<T_Q6_K>() { return 14; }
+template <> __device__ __forceinline__ void kq_lean_load<T_Q6_K>(const uint8_t* bp, int ib, int uj, uint32_t (&w)[14]) {
+    const int n = ib >> 2, r = ib & 3;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) w[k] = ld32(bp + 64 * n + 32 * (r & 1) + 4 * k);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) w[8 + k] = ld32(bp + 128 + 32 * n + 16 * uj + 4 * k);
+    w[12] = ld16(bp + 208) | (ld16(bp + 192 + 8 * n + 2 * r) << 16);
+    w[13] = (uint32_t) r;
+}
+template <> __device__ __forceinline__ void kq_lean_expand<T_Q6_K>(const uint32_t (&w)[14], int uj, uint32_t (&f)[raw_words(T_Q6_K)]) {
+#pragma unroll
+    for (int k = 0; k < 8; ++k) f[k] = w[k];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const uint32_t o = __shfl_xor_sync(0xffffffffu, w[8 + k], 1);
+        f[8 + k] = uj ? o : w[8 + k];
+        f[12 + k] = uj ? w[8 + k] : o;
+    }
+    f[16] = w[12];
+    f[17] = w[13];
+}
 #endif
 
 template <int NT> using BatchOf = std::conditional_t<NT == THREADS, Batch, WideBatch>;
@@ -663,7 +690,7 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
     constexpr bool TWO_PASS = NT != THREADS;   // the two-pass loads (load_unit_l) only in the opt-in NT = 256 kernels
     static_assert(!(TWO_PASS && WT == T_Q5_0), "the NT = 256 kernels have no Q5_0 form");
     static_assert(!(TWO_PASS && (has_min(WT) || WT == T_Q8_0 || WT == T_Q6_K)), "the NT = 256 kernels have no K-quant / Q5_1 / Q8_0 / Q6_K form");
-    constexpr bool KLEAN = GU && (WT == T_Q4_K || WT == T_Q5_K);   // (A1b) the K-quant gate/up's lean loads (kq_lean_load)
+    constexpr bool KLEAN = GU && (WT == T_Q4_K || WT == T_Q5_K || WT == T_Q6_K);   // (A1b) the K-quant gate/up's lean loads (kq_lean_load)
     constexpr int RAW = KLEAN ? kq_lean_words<WT>() : raw_words(WT) > 5 ? raw_words(WT) : 5;   // the raw words of a sub-block: 5, Q5_0's 6
     constexpr int NS = (GU ? GU_ROWS_K : D_ROWS_K) / 64;   // 64-value stages along K
     constexpr int NFB = (GU ? GU_ROWS_N : D_ROWS_N) / WR;          // weight-row blocks per tile
