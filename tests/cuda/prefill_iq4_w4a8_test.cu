@@ -15,6 +15,7 @@
 // some products of both types.  Exit 0: identical; 1: a difference; 77: no CUDA device, or a GPU the kernel does not
 // run on (it covers sm_80..sm_88; elsewhere it declines every product and MMQ runs as before).
 #include "strata/prefill/moe_iq4_w4a8.hpp"
+#include "strata/prefill/mmq_ids_margin.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 
 #include "ggml.h"
@@ -153,8 +154,9 @@ Result run_case(int64_t T, double sigma, bool tab, int wide, bool bench) {
     int32_t *bounds_dev, *ids;
     ck(cudaMalloc(&bounds_dev, bounds_abs.size() * 4), "bounds");
     ck(cudaMemcpy(bounds_dev, bounds_abs.data(), bounds_abs.size() * 4, cudaMemcpyHostToDevice), "bounds");
-    ck(cudaMalloc(&ids, (size_t) TK * 4), "ids");
-    mmq::iota(ids, TK, nullptr);
+    const size_t ids_rows = (size_t) mmq::mmq_ids_table_rows((uint64_t) TK, (uint64_t) TK);   // (mul_mat_q reads the row table past its last row: mmq_ids_margin.hpp)
+    ck(cudaMalloc(&ids, ids_rows * 4), "ids");
+    mmq::iota(ids, (int64_t) ids_rows, nullptr);
     float *gu_a, *dm_a, *gu_b, *dm_b;
     const size_t ngu = (size_t) TK * 2 * NFF, ndm = (size_t) TK * N;
     ck(cudaMalloc(&gu_a, ngu * 4), "gu_a");
