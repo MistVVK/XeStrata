@@ -46,12 +46,12 @@ class StageHooks(unittest.TestCase):
                 p.write_bytes(text.encode())
             self.run_hooks(src, dst)
             cond = (dst / "src" / "conditioning" / "conditioner.hpp").read_bytes().decode()
-            self.assertEqual(cond.count("own5::dump_ids(tokens, prompt_template_encode_start_idx);\n" + S.TE_CALL), 1)
+            self.assertEqual(cond.count("own5::dump_ids(tokens, weights, prompt_template_encode_start_idx);\n" + S.TE_CALL), 1)
             self.assertEqual(cond.count('#include "own5_hooks.hpp"'), 1)
             # the other llm->compute call (no attention mask) is left alone
             self.assertEqual(cond.count("own5::dump_ids"), 1)
             hooks = (dst / "src" / "own5_hooks.hpp").read_text()
-            self.assertIn("inline void dump_ids(const std::vector<int>& ids, int start)", hooks)
+            self.assertIn("inline void dump_ids(const std::vector<int>& ids, const std::vector<float>& weights, int start)", hooks)
             before = {p: p.read_bytes() for p in dst.rglob("*") if p.is_file()}
             self.run_hooks(src, dst)
             after = {p: p.read_bytes() for p in dst.rglob("*") if p.is_file()}

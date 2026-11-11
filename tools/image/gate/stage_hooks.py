@@ -9,7 +9,9 @@ pinned stable-diffusion.cpp tree with stage dump / replace hooks, driven by envi
   OWN5_LATENT_IN=<file> replace the final latent by this file before VAE decode (same shape)
   OWN5_EXIT_AFTER=<k>   exit(0) right after model call k was dumped (no picture)
   (with OWN5_DUMP_DIR)  also tokens.bin: the text encoder's input token ids (int32) as LLMEmbedder::encode_prompt
-                        builds them, and tokens.start: prompt_template_encode_start_idx (the system tokens cond drops)
+                        builds them, tokens.weights (float32, the prompt-weight of each id) and tokens.start:
+                        prompt_template_encode_start_idx (the system tokens cond drops)
+  OWN5_EXIT_AFTER_TOKENS=1  exit(0) right after that dump (no model is loaded or run: the tokenizer gate)
 
 Without the variables the copy behaves like the original.  Usage: python3 stage_hooks.py <src tree> <dst tree>"""
 import shutil
@@ -36,12 +38,14 @@ inline void dump(const char* name, const float* p, size_t n, const std::vector<i
         std::fclose(f);
     }
 }
-inline void dump_ids(const std::vector<int>& ids, int start) {
+inline void dump_ids(const std::vector<int>& ids, const std::vector<float>& weights, int start) {
     const char* d = env("OWN5_DUMP_DIR");
     if (!d) return;
     std::string base = std::string(d) + "/tokens";
     if (FILE* f = std::fopen((base + ".bin").c_str(), "wb")) { std::fwrite(ids.data(), sizeof(int), ids.size(), f); std::fclose(f); }
+    if (FILE* f = std::fopen((base + ".weights").c_str(), "wb")) { std::fwrite(weights.data(), sizeof(float), weights.size(), f); std::fclose(f); }
     if (FILE* f = std::fopen((base + ".start").c_str(), "w")) { std::fprintf(f, "%d\n", start); std::fclose(f); }
+    if (env("OWN5_EXIT_AFTER_TOKENS")) { std::fprintf(stderr, "OWN5: exit after the token dump\n"); std::fflush(nullptr); std::exit(0); }
 }
 inline void load(const char* file, float* p, size_t n, const char* what) {
     FILE* f = std::fopen(file, "rb");
@@ -125,7 +129,7 @@ def main():
          "            if (output_opt.empty()) {\n")
     cond = dst / "src" / "conditioning" / "conditioner.hpp"
     edit(cond, '#include "core/util.h"\n', '#include "core/util.h"\n#include "own5_hooks.hpp"\n')
-    edit(cond, TE_CALL, "        own5::dump_ids(tokens, prompt_template_encode_start_idx);\n" + TE_CALL)
+    edit(cond, TE_CALL, "        own5::dump_ids(tokens, weights, prompt_template_encode_start_idx);\n" + TE_CALL)
     print("stage hooks applied:", dst)
 
 
