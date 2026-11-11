@@ -4,7 +4,7 @@
 //
 // No FMA on these CPUs: a product term is a multiply then an add (two roundings), in the same k order as every tier, so the products are bit-identical to
 // the scalar tier's on x86 (whose struct V also multiplies then adds) and differ from the AVX2 tier's FMA by the second rounding (within rule 1).
-// F16 weights are converted without F16C (bit exact, integer code), exp is the Cephes polynomial of the AVX2 tier with separate multiply and add.
+// F16 weights are converted without F16C (bit exact, integer code), exp is the C library's expf per lane, as in the scalar tier.
 #include "cpu_tier.h"      // only this and the intrinsics headers: no standard-library code may be compiled with this file's ISA flags (cpu_tier.h)
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -68,21 +68,13 @@ inline void micro(const float* A, size_t lda, const float* B, size_t ldb, int K,
         for (int c = 0; c < 2; ++c) _mm_storeu_ps(C + (size_t) r * ldc + c * 4, acc[r][c]);
 }
 
-// expf (Cephes, the AVX2 tier's constants), multiply and add separately
+// expf of the C library per lane (an out-of-line call per element), with the scalar tier's clamp [-87, 88]: the scalar tier's exp, so this tier's output is
+// byte-identical to the scalar tier's (a polynomial exp here gave Qwen3.8 code4217 a cosine of 0.998928 against llama.cpp's reader, under the 0.999 bar)
 inline VR vr_exp(VR xv) {
-    __m128 x = _mm_min_ps(_mm_max_ps(xv, _mm_set1_ps(-87.3f)), _mm_set1_ps(88.3f));
-    const __m128 fx = _mm_round_ps(_mm_mul_ps(x, _mm_set1_ps(1.44269504088896341f)), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
-    x = _mm_sub_ps(x, _mm_mul_ps(fx, _mm_set1_ps(0.693359375f)));
-    x = _mm_sub_ps(x, _mm_mul_ps(fx, _mm_set1_ps(-2.12194440e-4f)));
-    __m128 y = _mm_set1_ps(1.9875691500e-4f);
-    y = _mm_add_ps(_mm_mul_ps(y, x), _mm_set1_ps(1.3981999507e-3f));
-    y = _mm_add_ps(_mm_mul_ps(y, x), _mm_set1_ps(8.3334519073e-3f));
-    y = _mm_add_ps(_mm_mul_ps(y, x), _mm_set1_ps(4.1665795894e-2f));
-    y = _mm_add_ps(_mm_mul_ps(y, x), _mm_set1_ps(1.6666665459e-1f));
-    y = _mm_add_ps(_mm_mul_ps(y, x), _mm_set1_ps(5.0000001201e-1f));
-    y = _mm_add_ps(_mm_mul_ps(y, _mm_mul_ps(x, x)), _mm_add_ps(x, _mm_set1_ps(1.0f)));
-    const __m128i e = _mm_slli_epi32(_mm_add_epi32(_mm_cvtps_epi32(fx), _mm_set1_epi32(127)), 23);
-    return _mm_mul_ps(y, _mm_castsi128_ps(e));
+    alignas(16) float t[4];
+    _mm_store_ps(t, xv);
+    for (int i = 0; i < 4; ++i) t[i] = cpu_tier_expf(t[i] < -87.0f ? -87.0f : t[i] > 88.0f ? 88.0f : t[i]);
+    return _mm_load_ps(t);
 }
 
 // 4 floats rounded to the 16-bit type and back, bit for bit as the scalar tier's round_one: BF16 round to nearest even (a NaN stays), F16 round to nearest
