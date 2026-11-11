@@ -18,8 +18,11 @@ ACCEPTED = {"temperature", "top_p", "top_k", "min_p", "penalty_repeat", "penalty
 # (refuse_for_split, logit_bias.validate_request)
 DROPPED = {"pen_from"}
 REFUSED = {"logprobs", "allowed", "logit_bias"}
-# keys only other engines are sent: the prefill-only request of serve/split.py
-OTHER_ENGINES = {"prefill"}
+# keys only other engines are sent: the prefill-only request of serve/split.py, and hold (the thinking budget's GEN hold=N:ID): the server sends it only to an
+# engine whose READY line says "hold", which is the single-card engine (src/program/generate.cpp prints "READY <ctx> stop hold"); the split engine says
+# "READY <ctx> stop" (sfnx.cpp), so it is never sent it, and the server also refuses it for a split engine by name (Service._run).  Sent to a split engine anyway,
+# parse_gen would end the request with "GEN: unknown key hold".
+OTHER_ENGINES = {"prefill", "hold"}
 
 
 def server_keys() -> set[str]:
@@ -50,6 +53,19 @@ class SplitGenKeys(unittest.TestCase):
         self.assertEqual(sorted(sent - known), [], "a GEN key the server sends that nobody classified for the split engine")
         for must in ("pen_from", "logprobs", "allowed", "temperature", "penalty_last_n", "seed"):
             self.assertIn(must, sent, f"{must}: the parse of serve/server.py no longer finds it (update this test)")
+
+    def test_hold_is_only_for_an_engine_that_says_hold_and_the_split_engine_never_does(self):
+        """The server sends `hold` only to an engine whose READY line says "hold"; the split engine's READY line does not, and its parser does not know
+        the key (it would end the request: "GEN: unknown key hold")."""
+        split = (ROOT / "src" / "split" / "tools" / "sfnx.cpp").read_text(encoding="utf-8")
+        readys = re.findall(r'say\("READY "[^;]*;', split)
+        self.assertTrue(readys, "the split engine's READY line is no longer found (update this test)")
+        for line in readys:
+            self.assertNotIn("hold", line)
+        self.assertNotIn("hold", parser_keys())
+        gen = (ROOT / "src" / "program" / "generate.cpp").read_text(encoding="utf-8")
+        self.assertIn('"READY %lld stop hold', gen)      # the engine that does take it says so
+        self.assertIn('"hold" in f[2:]', (ROOT / "serve" / "server.py").read_text(encoding="utf-8"))   # and the server reads the word, not the engine's name
 
     def test_the_keys_sent_to_a_split_engine_are_accepted_by_its_parser(self):
         parser = parser_keys()

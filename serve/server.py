@@ -6364,7 +6364,8 @@ class Service:
                     # at a time (a --batch engine's slots and a multi engine take no hold)
                     hold_end = None
                     if (budget and getattr(self.engine, "can_hold", False) is True and not getattr(self.engine, "batch", 0)
-                            and not getattr(self.engine, "multi", 0)):
+                            and not getattr(self.engine, "multi", 0)
+                            and getattr(self.engine, "split_engine", False) is not True):   # (the split engine's parser refuses the key: tests/split/test_split_gen_keys.py)
                         te = self.tok.encode(THINK_END, parse_special=True)
                         hold_end = te[0] if len(te) == 1 else None
                     for ev in opening:
@@ -6372,10 +6373,14 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
-                        pass_sampling = {k: v for k, v in (sampling or {}).items() if k != HOLD_KEY}
                         held = hold_end is not None and budget is not None
                         if held:   # the reasoning tokens left before the budget (at least one: a cut not yet clean)
+                            pass_sampling = {k: v for k, v in (sampling or {}).items() if k != HOLD_KEY}   # (a copy: the hold is this pass's own)
                             pass_sampling[HOLD_KEY] = (max(1, int(budget) - thought), int(hold_end))
+                        elif sampling and HOLD_KEY in sampling:   # (never a client's: strip it from a copy)
+                            pass_sampling = {k: v for k, v in sampling.items() if k != HOLD_KEY}
+                        else:
+                            pass_sampling = sampling   # no hold: the engine gets the caller's own sampler object, as before P2
                         gen = self.engine.generate(prompt, max_new - n, pass_sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, pass_sampling, cancel)
                         recover_prompt = None
