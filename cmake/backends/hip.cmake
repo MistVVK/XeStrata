@@ -107,6 +107,9 @@ macro(strata_hip_mmq)
     # off gfx12 the pairs are not covered without STRATA_PF_FUSED_KQ and the test skips (77, as without a card)
     add_test(NAME hip_prefill_fused_iq_q8d COMMAND hip_prefill_fused_iq "--only=S / Q8_0" --edge --no-timing --no-kq)
     set_tests_properties(hip_prefill_fused_iq_q8d PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 ENVIRONMENT "STRATA_PF_FUSED_Q8D=1")
+    # STRATA_PF_FUSED_Q8GU=1 (gfx12, opt-in): the Q8_0 set's Q8_0 / Q8_0 pair (UD-Q6_K_XL's one Q8_0 layer), as CUDA's _q8gu; --no-kq: the K-quant switch stays unset
+    add_test(NAME hip_prefill_fused_iq_q8gu COMMAND hip_prefill_fused_iq "--only=Q8_0 / Q8_0" --edge --no-timing --no-kq)
+    set_tests_properties(hip_prefill_fused_iq_q8gu PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 ENVIRONMENT "STRATA_PF_FUSED_Q8GU=1")
     # STRATA_PF_FUSED_TQ=1 (gfx12, opt-in): the Gyro trellis pairs (TQK6 + TQK7, TQ2_T + TQ2_T), plain and Hadamard-folded (--folded), as CUDA's _tq / _tqh
     add_test(NAME hip_prefill_fused_iq_tq COMMAND hip_prefill_fused_iq "--only=+ T" --edge --no-timing)
     set_tests_properties(hip_prefill_fused_iq_tq PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900 ENVIRONMENT "STRATA_PF_FUSED_TQ=1")

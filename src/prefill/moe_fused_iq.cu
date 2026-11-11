@@ -1636,12 +1636,14 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
         const uint8_t* wrow = GU ? blob + ((ur & 1) ? geo.up_off : 0) + (size_t) (fb * (NW_ROWS / 2) + (ur >> 1)) * geo.gu_row
                                  : blob + geo.down_off + (size_t) (rbase + ur) * geo.d_row;
         constexpr bool B128 = is_tq(WT);   // (STRATA_PF_FUSED_TQ=1, gfx12) 128-value blocks, gate/up and down: a block per two stages, sub-blocks 0-3
+        // (STRATA_PF_FUSED_Q8GU=1, gfx12) a Q8_0 gate/up has 32-value blocks, two a stage, like its down: not a 256-value superblock
+        constexpr bool GU256 = GU && WT != T_Q2_0 && WT != T_Q8_0;
         auto unit = [&](int s) -> const uint8_t* {
             if constexpr (B128) return wrow + (s >> 1) * BS;
-            if (GU && WT != T_Q2_0) return wrow + (s >> 2) * BS;   // (Q2_0 gate/up: 64-value blocks, one a stage, like its down)
+            if (GU256) return wrow + (s >> 2) * BS;   // (Q2_0 gate/up: 64-value blocks, one a stage, like its down)
             return (WT == T_IQ4_NL || WT == T_Q5_0 || WT == T_Q5_1 || WT == T_Q8_0) ? wrow + (2 * s + uj) * BS : wrow + s * BS;
         };
-        auto sub = [&](int s) { return B128 ? 2 * (s & 1) + uj : GU && WT != T_Q2_0 ? 2 * (s & 3) + uj : uj; };
+        auto sub = [&](int s) { return B128 ? 2 * (s & 1) + uj : GU256 ? 2 * (s & 3) + uj : uj; };
         auto put = [&](const uint32_t (&raw)[raw_words(WT)], int buf) {
             uint32_t q[8];
             float s0, s1;
@@ -2296,6 +2298,7 @@ bool f16_gu(int t) {
 bool f16_d(int t) { return t == T_Q2_0 || t == T_IQ4_NL || t == T_Q8_0 || t == T_Q5_0; }
 #if defined(__HIPCC__)
 bool tq_hip_requested();   // (STRATA_PF_FUSED_TQ on HIP: below)
+bool q8gu_hip_requested();   // (STRATA_PF_FUSED_Q8GU on HIP: below)
 #endif
 bool gu_covered(int t) {
     return t == T_IQ2_XXS || t == T_IQ2_XS || t == T_IQ2_S || t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS
@@ -2310,6 +2313,7 @@ bool gu_covered(int t) {
            || (t == T_Q2_0 && dev_info().w12)   // gfx12: the native Q2_0 pack's gate/up on native_w11_kernel (64-value blocks)
            || ((t == T_Q4_K || t == T_Q5_K) && kq_on())   // the gfx11 kernels only
            || ((t == T_TQK6 || t == T_TQ2_T) && dev_info().w12 && tq_hip_requested())   // STRATA_PF_FUSED_TQ=1 on gfx12
+           || (t == T_Q8_0 && dev_info().w12 && q8gu_hip_requested())   // STRATA_PF_FUSED_Q8GU=1 on gfx12
 #endif
         ;
 }
@@ -2379,12 +2383,19 @@ bool tq_hip_requested() {
     static const bool on = [] { const char* v = std::getenv("STRATA_PF_FUSED_TQ"); return v != nullptr && v[0] == '1'; }();
     return on;
 }
+// STRATA_PF_FUSED_Q8GU on HIP (phase 4, opt-in, gfx12 only): "1" lets a Q8_0 gate/up with a Q8_0 down (the Q8_0 set's 48 layers, UD-Q6_K_XL's one Q8_0
+// layer) take native_w11_kernel's Q8_0 gate/up instance instead of MMQ (32-value blocks, two a stage, like the Q8_0 down; the same decode as CUDA's).  The
+// same switch as CUDA's.  gfx11: not measured, keeps MMQ.
+bool q8gu_hip_requested() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_FUSED_Q8GU"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
 #endif
 bool d_covered_on(int t, const DevInfo& d) {
 #if defined(__HIPCC__)
     if (t == T_Q5_0) return d.w12 ? q50_on(d) : q50_on(d) && f16::requested();   // gfx1151 has no int8 kernel for Q5_0 down (the F16 prompt set must be on); gfx12 has only the int8 one
     if (t == T_Q8_0 && !d.w12 && (f16::requested() || q8d_f16_default(d))) return true;
-    if (t == T_Q8_0 && d.w12 && q8d_hip_requested()) return true;   // (behind an i-quant gate/up only: native_supported)
+    if (t == T_Q8_0 && d.w12 && (q8d_hip_requested() || q8gu_hip_requested())) return true;   // (behind an i-quant gate/up with Q8D, behind a Q8_0 one with Q8GU: native_supported)
     if (t == T_TQK7 || t == T_TQ2_T) return d.w12 && tq_hip_requested();   // STRATA_PF_FUSED_TQ=1 (behind a trellis gate/up only: native_supported)
 #else
     if (t == T_Q5_0) return d.q50;   // STRATA_PF_FUSED_Q50=1 and its kernels set up (dev_info)
@@ -2571,6 +2582,11 @@ bool native_supported(int gu_type, int d_type) {
         const bool pair = (gu_type == T_TQK6 && d_type == T_TQK7) || (gu_type == T_TQ2_T && d_type == T_TQ2_T);
         return geo_ok && pair && d.ok && d.w12 && tq_hip_requested();
     }
+    // A Q8_0 gate/up on gfx12 (opt-in STRATA_PF_FUSED_Q8GU=1; gu_covered checked it above): with a Q8_0 down only.
+    if (gu_type == T_Q8_0) {
+        const DevInfo& d = dev_info();
+        return d_type == T_Q8_0 && d.ok && d.w12 && q8gu_hip_requested();
+    }
 #endif
     // default: only these three; the Q2_0 one (148-amd) is on Linux only: on Windows it is opt-in (STRATA_PF_FUSED=1) until tested there.
     // AMD-Q (owner decision 10-31): the IQ2_S and IQ4_XS gate/up layers too (the IQ3_S pack's 21 layers that kept MMQ), Linux only like the Q2_0 entry.
@@ -2587,6 +2603,9 @@ bool native_supported(int gu_type, int d_type) {
     // STRATA_PF_FUSED_Q8D=1 on gfx12 covers the Q8_0 down behind an i-quant gate/up only (as on CUDA): a Q2_0 gate/up with a Q8_0 down keeps MMQ there
     // unless STRATA_PF_FUSED_KQ=1 (the K-quant route's wider rule, unchanged; gfx11's rules unchanged)
     if (d.w12 && gu_type == T_Q2_0 && d_type == T_Q8_0 && !kq_on()) return false;
+    // d_covered_on takes a Q8_0 down on gfx12 for STRATA_PF_FUSED_Q8GU=1 too (behind a Q8_0 gate/up, returned above): an i-quant / K-quant gate/up
+    // keeps its own rule (STRATA_PF_FUSED_Q8D=1 or the K-quant route's)
+    if (d.w12 && d_type == T_Q8_0 && !kq_on() && !q8d_hip_requested()) return false;
 #endif
     if (!d.ok || !d_covered_on(d_type, d)) return false;
     if (d.t75 && (gu_type != T_Q2_0 || d_type != T_Q2_0)) return false;
@@ -2698,6 +2717,8 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
             case T_Q4_K: STRATA_NW_GU(T_Q4_K); break;
             case T_Q5_K: STRATA_NW_GU(T_Q5_K); break;
             // (STRATA_PF_FUSED_TQ=1, gfx12) the trellis gate/up: the plain launch; a folded down (set_down_rotation) takes H as FP32 rows in dm
+            // (STRATA_PF_FUSED_Q8GU=1, gfx12) the Q8_0 gate/up (a Q8_0 down behind it): the plain launch
+            case T_Q8_0: native_w11_kernel<T_Q8_0, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr); break;
             case T_TQK6: native_w11_kernel<T_TQK6, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, g_rot_on ? dm : nullptr); break;
             case T_TQ2_T: native_w11_kernel<T_TQ2_T, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, g_rot_on ? dm : nullptr); break;
             default: STRATA_NW_GU(T_IQ4_XS); break;

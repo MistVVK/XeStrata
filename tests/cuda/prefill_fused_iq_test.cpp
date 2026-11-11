@@ -827,8 +827,11 @@ int main(int argc, char** argv) {
         }
         // --no-kq (the STRATA_PF_FUSED_Q8D entry): a device or build where the i-quant / Q8_0 pairs are not covered without the K-quant switch
         // (gfx11, or the switch unset) skips instead of failing
-        if (no_kq && !fused::native_supported(GGML_TYPE_IQ3_S, GGML_TYPE_Q8_0)) {
-            std::printf("--no-kq: the i-quant / Q8_0 pairs are not covered here without STRATA_PF_FUSED_KQ (skipped)\n");
+        // (with STRATA_PF_FUSED_Q8GU=1 the probe is the Q8_0 / Q8_0 pair: the Q8GU entry asks the same of its own switch)
+        const char* q8gu_env = std::getenv("STRATA_PF_FUSED_Q8GU");
+        const bool probe_q8gu = q8gu_env != nullptr && q8gu_env[0] == '1';
+        if (no_kq && !fused::native_supported(probe_q8gu ? GGML_TYPE_Q8_0 : GGML_TYPE_IQ3_S, GGML_TYPE_Q8_0)) {
+            std::printf("--no-kq: the %s pairs are not covered here without STRATA_PF_FUSED_KQ (skipped)\n", probe_q8gu ? "Q8_0 / Q8_0" : "i-quant / Q8_0");
             return 77;
         }
 #if defined(__HIPCC__)
