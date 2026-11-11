@@ -1,7 +1,8 @@
 """tools/image/gate/build_variant.py - TEST-ONLY (OWN-5 gate harness): build the stage-hook variant of an existing
 build_sd.py build with exactly its configure line.
 
-    python3 -I -B build_variant.py <root> <backend> <variant> [--jobs N] [--noise] [--vae REPO] [--def -DNAME=VALUE ...]
+    python3 -I -B build_variant.py <root> <backend> <variant> [--jobs N] [--noise] [--vae REPO] [--dit REPO] [--def -DNAME=VALUE ...]
+--dit REPO: also Strata's DiT GEMMs in the native runner (REPO/tools/image/sdcpp_dit/apply.py; --model-args strata_dit_gemm=1).
 --vae REPO: the stage hooks plus Strata's VAE decoder from REPO/tools/image/sdcpp_vae/apply.py (a repo copy).
 Makes <root>/sd-<variant> (stage_hooks.py applied to a copy of <root>/sd-<backend>; with --noise instead the product's
 noise generator, <root>/repo/tools/image/sdcpp_noise/apply.py), <root>/build-<variant> and
@@ -31,7 +32,11 @@ else:
         vrepo = Path(a[a.index("--vae") + 1]).expanduser().resolve()
         subprocess.run([sys.executable, "-I", "-B", str(vrepo / "tools" / "image" / "sdcpp_vae" / "apply.py"),
                         str(root / f"sd-{var}")], check=True)
-conf = [c.replace(str(root / f"sd-{backend}"), str(root / f"sd-{var}")).replace(str(root / f"build-{backend}"),
+    if "--dit" in a:     # plus Strata's DiT GEMMs in the native runner (tools/image/sdcpp_dit/apply.py of that repo copy)
+        drepo = Path(a[a.index("--dit") + 1]).expanduser().resolve()
+        subprocess.run([sys.executable, "-I", "-B", str(drepo / "tools" / "image" / "sdcpp_dit" / "apply.py"),
+                        str(root / f"sd-{var}")], check=True)
+conf =[c.replace(str(root / f"sd-{backend}"), str(root / f"sd-{var}")).replace(str(root / f"build-{backend}"),
                                                                                 str(root / f"build-{var}"))
         for c in info["configure"]] + extra
 env = dict(os.environ, PATH=info["env_path"])

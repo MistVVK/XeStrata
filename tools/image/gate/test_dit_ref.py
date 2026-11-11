@@ -32,6 +32,23 @@ class Layout(unittest.TestCase):
         self.assertTrue(np.array_equal(y[0], x[0]))
 
 
+class Modes(unittest.TestCase):
+    def test_three_modes(self):
+        rng = np.random.default_rng(5)
+        x = rng.standard_normal((6, 256)).astype(np.float32)
+        Wm = rng.standard_normal((32, 256)).astype(np.float32)
+        f32, ex, acc = (R.make_mode(n) for n in ("f32", "f16op", "f16acc32"))
+        self.assertFalse(f32.f16)
+        self.assertTrue(ex.f16 and acc.f16)                                 # both emulations round Q / K / V and P
+        y32, yex, yacc = f32.gemm(x, f32.w(Wm)), ex.gemm(x, ex.w(Wm)), acc.gemm(x, acc.w(Wm))
+        x16, w16 = R.f16r(x).astype(np.float64), R.f16r(Wm).astype(np.float64)
+        self.assertTrue(np.array_equal(yex, (x16 @ w16.T).astype(np.float32)))    # exact sums, rounded once
+        self.assertTrue(np.allclose(yacc, yex, rtol=1e-5, atol=1e-5))            # float32 sums: same up to rounding
+        self.assertFalse(np.allclose(y32, yex, rtol=1e-5, atol=1e-5))            # f16 operands change the result
+        with self.assertRaises(SystemExit):
+            R.make_mode("f16")
+
+
 class Pieces(unittest.TestCase):
     def test_timestep_embedding(self):
         e = R.timestep_embedding(np.array([0.0, 500.0], dtype=np.float32))
