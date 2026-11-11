@@ -53,6 +53,20 @@ int main(int argc, char** argv) {
     CHECK(!vit_gpu_hip_windows_not_measured(true, "gfx1151") && !vit_gpu_hip_windows_not_measured(true, "gfx1151:xnack-"));
     CHECK(vit_gpu_hip_windows_not_measured(true, "gfx1201") && vit_gpu_hip_windows_not_measured(true, "gfx1100") && vit_gpu_hip_windows_not_measured(true, "gfx1150"));
     CHECK(!vit_gpu_hip_windows_not_measured(false, "gfx1151") && !vit_gpu_hip_windows_not_measured(false, "gfx1201"));
+    {   // the context retry (vit_gpu.h): only "out of memory", only an integrated GPU, only a Linux CUDA build, at most kVitCtxRetries times
+        CHECK(kVitCtxRetries == 12 && kVitCtxWaitMs == 1000);
+        for (int done = 0; done < kVitCtxRetries; ++done) CHECK(vit_gpu_retry_context(true, true, true, done));
+        CHECK(!vit_gpu_retry_context(true, true, true, kVitCtxRetries) && !vit_gpu_retry_context(true, true, true, kVitCtxRetries + 5) && !vit_gpu_retry_context(true, true, true, -1));
+        CHECK(!vit_gpu_retry_context(false, true, true, 0));    // HIP, Windows, Metal: no retry
+        CHECK(!vit_gpu_retry_context(true, false, true, 0));    // a discrete card: the failure is real
+        CHECK(!vit_gpu_retry_context(true, true, false, 0));    // any other error (no device, driver too old): no retry
+        int tries = 0;                                          // a start that fails 3 times and then works waits 3 times; one that never works gives up after 8
+        for (int fails = 3; vit_gpu_retry_context(true, true, true, tries) && tries < fails; ) ++tries;
+        CHECK(tries == 3);
+        tries = 0;
+        while (vit_gpu_retry_context(true, true, true, tries)) ++tries;
+        CHECK(tries == kVitCtxRetries);
+    }
     {   // the default tower (no --tower): auto, or STRATA_VISION_TOWER's value when it is a known one
         std::string note;
         CHECK(vision_tower_default(nullptr, note) == "auto" && note.empty());
