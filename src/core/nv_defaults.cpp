@@ -28,7 +28,11 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
         t = {
             // 148-nv, RTX 3060 + RTX A4000 (IQ3_XXS, default flags, 8 pairs): the stack +9.6% / +14.6% (8/8 each), identity gate IDENTICAL.
             // Each is in because removing it from the full stack cost speed on a card (drop-one, 4 rounds) and saved none on the other.
-            {"STRATA_ADAPT_NOWAIT", "1"},        // A4000 -6.3 points when removed (with ADAPT_LAG), 3060 -0.8
+            // Repeatable output (0.2.15, option 2 of phaseA-tests/par/RESULTS-REPEAT.md (d)): STRATA_ADAPT_NOWAIT=1 is no longer a default here.
+            // With it, a verify window ran a swapped-in expert on the GPU or the CPU by its copy's timing, and two starts of the same request
+            // differed (RTX A6000, fixed draft table: 7 of 24 requests identical; without it 24 of 24 in 3 of 3 starts).  Its cost there:
+            // decode 0.988 [0.969, 1.002] over 3 pairs.  It was in the stack for "A4000 -6.3 points when removed (with ADAPT_LAG), 3060 -0.8";
+            // ADAPT_LAG=2 stays, so the copies still get two windows to land.  STRATA_ADAPT_NOWAIT=1 brings it back.
             {"STRATA_ADAPT_LAG", "2"},
             {"STRATA_CPU_IQ_ALL_EXACT1", "1"},   // A4000 -3.3, 3060 -0.6
             {"STRATA_SIDE_MIXER", "2"},          // A4000 -1.2, 3060 -2.3

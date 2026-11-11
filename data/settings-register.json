@@ -556,13 +556,13 @@
    "engine_defaults": [
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 32,
+     "line": 36,
      "value": "2",
      "arch": "sm_86"
     },
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 46,
+     "line": 50,
      "value": "2",
      "arch": "sm_60"
     }
@@ -617,13 +617,7 @@
    "engine_defaults": [
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 31,
-     "value": "1",
-     "arch": "sm_86"
-    },
-    {
-     "file": "src/core/nv_defaults.cpp",
-     "line": 45,
+     "line": 49,
      "value": "1",
      "arch": "sm_60"
     }
@@ -1536,7 +1530,7 @@
    "engine_defaults": [
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 35,
+     "line": 39,
      "value": "1",
      "arch": "sm_86"
     }
@@ -1963,13 +1957,13 @@
    "engine_defaults": [
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 39,
+     "line": 43,
      "value": "1",
      "arch": "sm_86"
     },
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 49,
+     "line": 53,
      "value": "1",
      "arch": "sm_60"
     }
@@ -3509,7 +3503,7 @@
    "engine_defaults": [
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 33,
+     "line": 37,
      "value": "1",
      "arch": "sm_86"
     }
@@ -9640,7 +9634,7 @@
    "engine_defaults": [
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 50,
+     "line": 54,
      "value": "1",
      "arch": "sm_60"
     }
@@ -9783,7 +9777,7 @@
    "engine_defaults": [
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 48,
+     "line": 52,
      "value": "2",
      "arch": "sm_60"
     }
@@ -12342,13 +12336,13 @@
    "engine_defaults": [
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 36,
+     "line": 40,
      "value": "1",
      "arch": "sm_86"
     },
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 51,
+     "line": 55,
      "value": "1",
      "arch": "sm_60"
     }
@@ -12658,7 +12652,7 @@
    "engine_defaults": [
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 37,
+     "line": 41,
      "value": "1",
      "arch": "sm_86"
     }
@@ -13202,7 +13196,7 @@
     },
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 72,
+     "line": 76,
      "value": "1",
      "arch": "sm_121"
     }
@@ -20500,7 +20494,7 @@
    "engine_defaults": [
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 124,
+     "line": 128,
      "value": "1",
      "arch": "NVIDIA cc>=8"
     }
@@ -23683,7 +23677,7 @@
    "reads": [
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 121,
+     "line": 125,
      "backend": "cuda",
      "fn": "getenv"
     }
@@ -25423,7 +25417,7 @@
     },
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 62,
+     "line": 66,
      "value": "1",
      "arch": "sm_121"
     }
@@ -30141,7 +30135,7 @@
    "engine_defaults": [
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 67,
+     "line": 71,
      "value": "w4a4",
      "arch": "sm_121"
     }
@@ -32748,7 +32742,7 @@
    "engine_defaults": [
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 38,
+     "line": 42,
      "value": "1",
      "arch": "sm_86"
     }
@@ -35610,19 +35604,19 @@
    "engine_defaults": [
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 34,
+     "line": 38,
      "value": "2",
      "arch": "sm_86"
     },
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 47,
+     "line": 51,
      "value": "2",
      "arch": "sm_60"
     },
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 76,
+     "line": 80,
      "value": "2",
      "arch": "sm_121"
     }
@@ -36252,7 +36246,7 @@
    "engine_defaults": [
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 156,
+     "line": 160,
      "value": "2",
      "arch": "sm_86"
     }
@@ -36280,7 +36274,7 @@
    "reads": [
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 154,
+     "line": 158,
      "backend": "cuda",
      "fn": "getenv"
     }
@@ -36325,7 +36319,7 @@
    "engine_defaults": [
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 156,
+     "line": 160,
      "value": "200",
      "arch": "sm_86"
     }
@@ -36371,7 +36365,7 @@
    "engine_defaults": [
     {
      "file": "src/core/nv_defaults.cpp",
-     "line": 80,
+     "line": 84,
      "value": "1",
      "arch": "sm_121"
     }
