@@ -94,8 +94,8 @@ def resolved_drafting(drafting: str | None, family: str | None) -> str:
 
 
 def drafting_for_family(choice: str | None, family: str | None) -> str | None:
-    """The Drafting choice to keep when the model changes to `family`: DFlash2/MTP/Off belong to Qwen3.8-Flash-Next (qwen, gyro, unsloth); any other model (DeepSeek, which has its
-    own DSpark and no MTP or DFlash2; Coder; Swift; NVFP4) goes back to Auto (None), so a choice made for one model never rides along to another. An unknown family keeps it."""
+    """The Drafting choice to keep when the model changes to `family`: DFlash2/MTP/Off belong to Qwen3.8-Flash-Next (qwen, gyro, unsloth); any other model (Coder;
+    Swift; NVFP4) goes back to Auto (None), so a choice made for one model never rides along to another. An unknown family keeps it."""
     from strata_control import drafting as _d
     return choice if (not family or family in _d.SUPPORTED_FAMILIES) else None
 
@@ -141,10 +141,7 @@ def assess(catalog, family: str | None, model: str | None, *, vision: str = "off
     mtp = mtp_choice(mtp, drafting)
     row = next((r for r in (rows if rows is not None else catalog.rows()) if r.family == family and r.model == model), None) if (family and model) else None
     st.total_gb = float(row.download_gb) if row else 0.0
-    # DeepSeek reads pictures with its own engine's tower: nothing separate to fetch or to start (the tower's file is part of its setup)
-    multi = getattr(getattr(catalog, "strata", None), "multi_family", None)
-    own_tower = bool(family) and multi is not None and bool(multi(family))
-    wants_pictures = vision != "off" and (row is None or row.images) and not own_tower
+    wants_pictures = vision != "off" and (row is None or row.images)
     data = Path(data_dir) if data_dir else None
     if model_path:
         st.own_files = True

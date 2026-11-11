@@ -286,7 +286,7 @@ def fit_start(cfg: dict, args: list, vram_mib: float | None, backend: str | None
     n = n if isinstance(n, int) and not isinstance(n, bool) and n >= 2 else 0
     if not vram_mib or backend in (None, "", "metal"):
         return args, None, ""
-    if (cfg.get("arch") or "") == "deepseek41" or cfg.get("layer_split") or "--layer-split" in args:
+    if cfg.get("layer_split") or "--layer-split" in args:
         return args, None, ""
 
     def flag(name):

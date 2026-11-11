@@ -97,17 +97,6 @@ class ShareSibling(unittest.TestCase):
         self.assertFalse(dst.with_name(dst.name + ".copying").exists())
 
 
-class MacPicturesPlan(unittest.TestCase):
-    def test_a_dropped_picture_file_leaves_the_download_total_and_nothing_is_fetched_before(self):
-        src = (Path(setup.__file__).resolve()).read_text(encoding="utf-8")
-        i = src.index('ok(f"engine: {exe}")\n    if mac and ds_vision == "on":')
-        j = src.index("step(5, f\"downloading {fam['title']} {model}\")", i)
-        block = src[i:j]
-        self.assertIn("is not fetched", block)                    # the corrected figure is said
-        self.assertIn("left = max(left -", block)
-        self.assertNotIn("download(", block)                      # nothing is fetched between the plan and the drop
-        self.assertNotIn("download(", src[src.index("def install_dsv41"):i])
-
 
 if __name__ == "__main__":
     unittest.main()

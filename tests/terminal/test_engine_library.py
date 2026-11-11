@@ -3,19 +3,17 @@
 The same stub packages the updater tests use (real schema-2 packages, a real test start). Proves: an update keeps every older engine; the list shows
 size, the engine in use and the newest; a switch to an older engine and back to the newest holds across a fresh read (a restart); the newest is
 selected without a pin; the engine in use and an engine a program uses cannot be deleted; a running model stops a switch with one plain answer;
-a package this computer cannot run is shown with its reason and cannot be switched to; the DeepSeek family is listed and switched with its own pin
-and the two families never touch each other's state."""
+a package this computer cannot run is shown with its reason and cannot be switched to; a DeepSeek engine folder of Strata 0.2.13 is neither listed nor
+touched, and the deepseek family is answered in plain words (strata_control/retired.py)."""
 import json
 import os
 import shutil
-import stat
 import unittest
-from pathlib import Path
 from unittest import mock
 
-from strata_control import dsv41_engine, dsv41_paths, engine_component as ec, engine_library as lib, preset_marks, updater
+from strata_control import engine_component as ec, engine_library as lib, preset_marks, retired, updater
 from tests.terminal import update_fixture as fx
-from tests.terminal.test_updater import PLATFORM, WINDOWS, UpdaterCase
+from tests.terminal.test_updater import PLATFORM, UpdaterCase
 
 
 def folder_of(version):
@@ -49,7 +47,7 @@ class Library(UpdaterCase):
             self.assertTrue(row["fits"] and row["why_not"] is None)
         listing = self.listing()
         self.assertEqual(listing["total_bytes"], sum(r["bytes"] for r in rows.values()))
-        self.assertEqual([f["family"] for f in listing["families"]], ["qwen"], "no DeepSeek engine installed: no DeepSeek group")
+        self.assertEqual([f["family"] for f in listing["families"]], ["qwen"])
         self.assertEqual(rows["0.1.46"]["delete_blocked"], "This is the engine in use. Switch to another one first.")
         self.assertTrue(rows["0.1.45"]["can_delete"] and rows["0.1.45"]["can_use"])
 
@@ -227,92 +225,40 @@ class Cli(UpdaterCase):
         self.assertEqual(self.engine_folders(), [folder_of("0.1.46")])
 
 
-@unittest.skipIf(WINDOWS, "the DeepSeek stub is a shell script")
-class DeepSeek(UpdaterCase):
-    """Two DeepSeek packages beside the Qwen ones. The family has its own folder (engine-dsv41/) and its own choice (.chosen)."""
+class DeepSeekFolder(UpdaterCase):
+    """Strata 0.2.13 and earlier put the DeepSeek engine in engine-dsv41/; this Strata runs no DeepSeek model."""
 
     def setUp(self):
         super().setUp()
         self.install_current("0.1.45")
-        self.dest = self.components.parent / dsv41_paths.DIR
-        for version in ("0.1.55.1", "0.1.56"):
-            folder = self.dest / f"{version}-{PLATFORM}-cuda-cuda13"
-            folder.mkdir(parents=True)
-            exe = folder / dsv41_paths.exe_name()
-            exe.write_text(f"#!/bin/sh\necho 'strata-dsv41 {version}'\n")
-            exe.chmod(exe.stat().st_mode | stat.S_IXUSR)
-        self.config = self.root / "ds-run.json"
-        self.config.write_text(json.dumps({"exe": str(self.dest / f"0.1.56-{PLATFORM}-cuda-cuda13" / dsv41_paths.exe_name()), "args": [], "lib_dirs": []}))
-        for target, name, value in ((dsv41_paths, "saved_configs", [self.config]), (lib, "_process_uses", False)):
-            patch = mock.patch.object(target, name, return_value=value)
-            patch.start()
-            self.addCleanup(patch.stop)
+        self.dest = self.components.parent / "engine-dsv41"
+        folder = self.dest / f"0.1.56-{PLATFORM}-cuda-cuda13"
+        folder.mkdir(parents=True)
+        self.exe = folder / "strata-dsv41"
+        self.exe.write_text("#!/bin/sh\necho 'strata-dsv41 0.1.56'\n")
+        (self.dest / ".chosen").write_text(folder.name + "\n")
+        patch = mock.patch.object(lib, "_process_uses", return_value=False)
+        patch.start()
+        self.addCleanup(patch.stop)
 
-    def exe_in_config(self):
-        return Path(json.loads(self.config.read_text())["exe"]).parent.name.split("-")[0]
+    def snapshot(self):
+        return sorted((str(p.relative_to(self.dest)), p.read_bytes()) for p in self.dest.rglob("*") if p.is_file())
 
-    def deepseek(self):
-        return {e["version"]: e for e in lib.rows_of(lib.list_engines(self.ctx()), lib.DEEPSEEK)}
-
-    def test_both_families_are_listed_each_with_its_engine_in_use(self):
+    def test_it_is_not_listed_and_nothing_in_it_changes(self):
+        before = self.snapshot()
         listing = lib.list_engines(self.ctx())
-        self.assertEqual([f["family"] for f in listing["families"]], ["qwen", "deepseek"])
-        rows = self.deepseek()
-        self.assertEqual(sorted(rows), ["0.1.55.1", "0.1.56"])
-        self.assertTrue(rows["0.1.56"]["active"] and rows["0.1.56"]["newest"] and not rows["0.1.55.1"]["active"])
-        self.assertEqual(rows["0.1.56"]["delete_blocked"], "This is the engine in use. Switch to another one first.")
-        self.assertTrue(lib.rows_of(listing, "qwen")[0]["active"], "the Qwen engine in use is its own")
+        self.assertEqual([f["family"] for f in listing["families"]], ["qwen"])
+        self.assertNotIn("engine-dsv41", json.dumps(listing))
+        self.assertEqual(self.snapshot(), before)
 
-    def qwen_section(self):
-        return json.loads(json.dumps(updater.State(self.components).section("engine")))
-
-    def test_switching_deepseek_does_not_touch_the_qwen_engine_and_the_other_way_round(self):
-        qwen_before = self.qwen_section()
-        out = lib.use_engine(self.ctx(), "deepseek", f"0.1.55.1-{PLATFORM}-cuda-cuda13", str(self.dest))
-        self.assertEqual((out["status"], out["from"], out["to"], out["profiles_repointed"]), ("switched", "0.1.56", "0.1.55.1", 1))
-        self.assertEqual(self.exe_in_config(), "0.1.55.1")
-        self.assertEqual((self.dest / dsv41_paths.PIN).read_text().strip(), f"0.1.55.1-{PLATFORM}-cuda-cuda13")
-        self.assertEqual(dsv41_engine.find(self.dest).parent.name.split("-")[0], "0.1.55.1", "a launch from the Terminal follows the choice")
-        self.assertEqual(self.resolved(), "0.1.45", "the Qwen engine is as it was")
-        self.assertEqual(self.qwen_section(), qwen_before, "no Qwen state was written")
-        # Qwen: switch and delete leave the DeepSeek folder and choice alone
-        before = sorted(p.name for p in self.dest.iterdir())
-        self.install_current("0.1.44")
-        lib.use_engine(self.ctx(), "qwen", folder_of("0.1.44"))
-        lib.delete_engine(self.ctx(), "qwen", folder_of("0.1.45"))
-        self.assertEqual(sorted(p.name for p in self.dest.iterdir()), before)
-        self.assertEqual(self.exe_in_config(), "0.1.55.1")
-        self.assertEqual((self.dest / dsv41_paths.PIN).read_text().strip(), f"0.1.55.1-{PLATFORM}-cuda-cuda13")
-
-    def test_back_to_the_newest_drops_the_choice(self):
-        lib.use_engine(self.ctx(), "deepseek", f"0.1.55.1-{PLATFORM}-cuda-cuda13", str(self.dest))
-        out = lib.use_engine(self.ctx(), "deepseek", f"0.1.56-{PLATFORM}-cuda-cuda13", str(self.dest))
-        self.assertTrue(out["automatic"])
-        self.assertFalse((self.dest / dsv41_paths.PIN).exists())
-        self.assertEqual(self.exe_in_config(), "0.1.56")
-
-    def test_a_launch_upgrade_does_not_replace_a_chosen_package(self):
-        lib.use_engine(self.ctx(), "deepseek", f"0.1.55.1-{PLATFORM}-cuda-cuda13", str(self.dest))
-        with mock.patch("strata_control.updater.open_feed", side_effect=AssertionError("must not look at the feed")):
-            self.assertIsNone(dsv41_engine.upgrade(self.dest, "http://127.0.0.1:1/none"))
-
-    def test_deepseek_delete_blocks_the_one_in_use_and_frees_an_older_one(self):
-        with self.assertRaisesRegex(updater.UpdateError, "engine in use"):
-            lib.delete_engine(self.ctx(), "deepseek", f"0.1.56-{PLATFORM}-cuda-cuda13", str(self.dest))
-        out = lib.delete_engine(self.ctx(), "deepseek", f"0.1.55.1-{PLATFORM}-cuda-cuda13", str(self.dest))
-        self.assertEqual(out["status"], "deleted")
-        self.assertEqual(sorted(self.deepseek()), ["0.1.56"])
-
-    def test_a_stale_choice_is_ignored(self):
-        (self.dest / dsv41_paths.PIN).write_text("0.0.1-gone\n")
-        self.assertEqual(dsv41_engine.find(self.dest).parent.name.split("-")[0], "0.1.56")
-        self.assertTrue(self.deepseek()["0.1.56"]["active"])
-
-    def test_a_running_model_stops_a_deepseek_switch(self):
-        with self.assertRaises(updater.Busy):
-            lib.use_engine(self.ctx(serving=lambda: [{"profile": "app-1"}]), "deepseek", f"0.1.55.1-{PLATFORM}-cuda-cuda13", str(self.dest))
-        self.assertEqual(self.exe_in_config(), "0.1.56")
-
+    def test_the_deepseek_family_is_answered_in_plain_words(self):
+        before = self.snapshot()
+        for call in (lib.use_engine, lib.delete_engine):
+            with self.assertRaises(updater.UpdateError) as caught:
+                call(self.ctx(), "deepseek", f"0.1.56-{PLATFORM}-cuda-cuda13", str(self.dest))
+            self.assertEqual(str(caught.exception), retired.NOT_OFFERED)
+            self.assertEqual(caught.exception.exit_code, 2)
+        self.assertEqual(self.snapshot(), before)
 
 if __name__ == "__main__":
     unittest.main()

@@ -151,23 +151,23 @@ class SetupArguments(unittest.TestCase):
             self.assertNotIn("--gpu-roles", a)
 
     def test_a_remembered_single_card_is_said_when_the_pc_has_more(self):
-        # NVIDIA, DeepSeek: after `--gpu 0` the next launch with nothing named stayed on one card without a word (boston, 2x A6000)
-        base = {"exe": "x", "args": [], "gpu": 0, "gpus_asked": True, "arch": "deepseek41"}
+        # NVIDIA: after `--gpu 0` the next launch with nothing named stayed on one card without a word (boston, 2x A6000)
+        base = {"exe": "x", "args": [], "gpu": 0, "gpus_asked": True}
         with Home():
-            two = Runner(S.LaunchSettings(family="deepseek41", model="IST-DAS-2.25bpw"), catalog=catalog(HW_2X16))
+            two = Runner(S.LaunchSettings(family="qwen", model="IQ3_XXS"), catalog=catalog(HW_2X16))
             two.say_remembered_cards(base)
             self.assertEqual(len(two.notices), 1)
             self.assertIn("stays on card 0", two.notices[0])
             self.assertIn("strata launch --gpu 0,1", two.notices[0])
             self.assertIn("remembered", two.notices[0])
-            one = Runner(S.LaunchSettings(family="deepseek41", model="IST-DAS-2.25bpw"), catalog=catalog(HW_12))
+            one = Runner(S.LaunchSettings(family="qwen", model="IQ3_XXS"), catalog=catalog(HW_12))
             one.say_remembered_cards(base)                                                     # one card in the PC: nothing to say
             self.assertEqual(one.notices, [])
-            both = Runner(S.LaunchSettings(family="deepseek41", model="IST-DAS-2.25bpw"), catalog=catalog(HW_2X16))
+            both = Runner(S.LaunchSettings(family="qwen", model="IQ3_XXS"), catalog=catalog(HW_2X16))
             both.say_remembered_cards({**base, "gpu": [0, 1]})                                 # all cards are used: nothing to say
             both.say_remembered_cards({**base, "gpus_asked": False})                           # setup's own pick is not a choice
             self.assertEqual(both.notices, [])
-            named = Runner(S.LaunchSettings(family="deepseek41", model="IST-DAS-2.25bpw", gpus=[0]), catalog=catalog(HW_2X16))
+            named = Runner(S.LaunchSettings(family="qwen", model="IQ3_XXS", gpus=[0]), catalog=catalog(HW_2X16))
             named.say_remembered_cards(base)                                                   # named on this launch: the person knows
             self.assertEqual(named.notices, [])
 

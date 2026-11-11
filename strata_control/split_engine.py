@@ -670,7 +670,7 @@ def apply_run_config(cfg: dict, *, allow_untested: bool = False, exe_for_cards=N
     Auto and a "no" (also a missing draft layer or engine package): nothing changes and no line. "on" and a "no": one line. Never raises. `facts` are the
     hooks of apply_to_config (system, probe, ram, scan, data_dir), replaceable for tests."""
     m = mode(cfg)
-    if cfg.get("arch") == "deepseek41" or m == "off":
+    if m == "off":
         return Decision(False, ["the all-cards split engine is turned off"], quiet=True), "", False
     args = [str(a) for a in cfg.get("args") or []]
     mtp_dir = _flag(args, "--mtp")

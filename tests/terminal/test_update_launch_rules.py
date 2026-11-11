@@ -3,7 +3,6 @@ engine without asking").  An engine update is the person's choice, and never bes
 
 * Qwen: `strata launch` with an engine older than the model needs warns and goes on; it updates only on a yes (--yes, or the answer on the screens),
   and never with a model loaded.  No engine installed at all is still fetched (nothing runs on it yet).
-* DeepSeek: `strata launch` and setup (which the app runs for a model download) never reach the feed, install, replace or remove an engine package.
 * The app's model download for Qwen never fetches an engine (control_engine_step), as before.
 """
 from __future__ import annotations
@@ -18,8 +17,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from strata_cli.launch import settings as S  # noqa: E402
 from strata_cli.launch.runner import Runner  # noqa: E402
-from strata_control import dsv41_engine, engine_component as ec, engine_update, updater  # noqa: E402
-from tests.terminal.test_dsv41_engine import Dsv41Engine  # noqa: E402
+from strata_control import engine_component as ec, engine_update, updater  # noqa: E402
 from tests.terminal.test_launch_engine_first import FakeProc, qwen_catalog, update_events  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -87,57 +85,6 @@ class QwenStaleEngine(unittest.TestCase):
         self.assertTrue(any("will ask before updating it" in w for w in words), words)
 
 
-class DeepSeekLaunch(Dsv41Engine):
-    test_downloads_verifies_installs_beside_the_engine = None
-    test_a_cut_download_resumes = None
-    test_no_package_for_this_pc_is_a_plain_line_not_a_crash = None
-    test_a_feed_signed_with_another_key_is_refused = None
-
-    def setUp(self):
-        super().setUp()
-        self.dest = self.root / "data" / "engine-dsv41"
-        self.publish("0.1.49")
-        self.old = self.install()
-        self.publish("0.1.49.1")
-
-    def runner(self):
-        r = Runner.__new__(Runner)
-        r.s = mock.Mock(dsv41_package=None)
-        r.feed = self.server.url + "/strata-feed.json"
-        r.emit = lambda *a, **k: None
-        r.notices = []
-        return r
-
-    def test_a_launch_reaches_no_feed_and_changes_no_engine_whatever_is_loaded(self):
-        before = len(self.server.requests)
-        tree = sorted(p.name for p in self.dest.iterdir())
-        for serving in ([], RUNNING):
-            with mock.patch.object(updater, "serving_now", return_value=serving), \
-                    mock.patch.object(dsv41_engine, "_test_start", return_value=(True, "strata-dsv41 0.1.49.1")):
-                self.assertEqual(self.runner().upgrade_dsv41_engine(self.old), self.old)
-        self.assertEqual(len(self.server.requests), before, "no request of any kind")
-        self.assertEqual(sorted(p.name for p in self.dest.iterdir()), tree)
-
-    def test_a_newer_engine_found_by_an_earlier_check_is_one_quiet_line(self):
-        r = self.runner()
-        with mock.patch.object(ec, "cached_offers", return_value={"engine": None, "dsv41": "0.1.49.1", "app": None}), \
-                mock.patch.object(ec, "_installed_dsv41_version", return_value="0.1.49"):
-            r.upgrade_dsv41_engine(self.old)
-        self.assertEqual(len(r.notices), 1)
-        self.assertIn("DeepSeek engine 0.1.49.1 (you have 0.1.49) is available", r.notices[0])
-        self.assertIn("strata update", r.notices[0])
-
-    def test_the_package_a_loaded_model_runs_from_survives_a_manual_package_install_too(self):
-        """install_package (the file the person downloaded) used to remove every other folder; a folder a running engine uses is never removed."""
-        busy = self.dest / self.old.parent.name
-        with mock.patch("strata_control.dsv41_paths.in_use", side_effect=lambda f: Path(f).name == busy.name):
-            self.publish("0.1.49.2")
-            from strata_control import dsv41_paths  # noqa: F401
-            exe = self.install()
-        self.assertIsNotNone(exe)
-        self.assertTrue(self.old.is_file(), "the engine a loaded model runs from was not removed")
-
-
 class SourceRules(unittest.TestCase):
     def calls(self, path, function):
         tree = ast.parse((ROOT / path).read_text(encoding="utf-8"))
@@ -150,21 +97,10 @@ class SourceRules(unittest.TestCase):
                         names.add(f.attr if isinstance(f, ast.Attribute) else f.id if isinstance(f, ast.Name) else "")
         return names
 
-    def test_setup_never_upgrades_an_installed_deepseek_engine(self):
-        """setup.py runs from a model download in the app and from `strata launch`: step 4 must not call the upgrade (#4823)."""
-        tree = ast.parse((ROOT / "setup.py").read_text(encoding="utf-8"))
-        callers = [n.lineno for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", getattr(n.func, "attr", "")) == "upgrade_dsv41_engine"]
-        self.assertEqual(callers, [], f"setup.py calls upgrade_dsv41_engine at {callers}")
-
     def test_the_apps_qwen_model_download_never_fetches_an_engine(self):
         names = self.calls("setup.py", "control_engine_step")
         for forbidden in ("engine_from_feed", "get_prebuilt", "get_prebuilt_hip", "update_installed_engine", "run", "urlopen", "check_call", "Popen"):
             self.assertNotIn(forbidden, names)
-
-    def test_a_launch_never_calls_the_deepseek_upgrade_or_install_of_an_installed_engine(self):
-        names = self.calls("strata_cli/launch/runner.py", "upgrade_dsv41_engine")
-        self.assertNotIn("upgrade", names)
-        self.assertNotIn("source_reachable", names)
 
 
 if __name__ == "__main__":

@@ -197,7 +197,7 @@ def _skip(result: Applied, model, why: str) -> None:
 
 
 def _taken_tags(setup) -> list[str]:
-    tags = [d.get("tag", "") for d in (*setup.FAMILIES.values(), *setup.OWN_PATH_FAMILIES.values(), *setup.MULTI_FILE_FAMILIES.values())]
+    tags = [d.get("tag", "") for d in (*setup.FAMILIES.values(), *setup.OWN_PATH_FAMILIES.values())]
     return [t for t in tags if t]
 
 
@@ -217,7 +217,7 @@ def apply(setup, models, engine_families=None) -> Applied:
             if model.id not in setup.FEED_UNAVAILABLE:
                 result.registered.append(model.id)
             continue
-        if model.id in setup.FAMILIES or model.id in setup.OWN_PATH_FAMILIES or model.id in setup.MULTI_FILE_FAMILIES:
+        if model.id in setup.FAMILIES or model.id in setup.OWN_PATH_FAMILIES:
             _skip(result, model, "its id is the name of a built-in model")
             continue
         tag = model.id + "-"

@@ -2,7 +2,6 @@
 three ways: no network at all, a refused port, a server that never answers (tests/terminal/net_dead.py). The callers that need a fixture of their own
 have their test beside their other tests:
 
-  dsv41_engine.upgrade   tests/terminal/test_dsv41_upgrade.py   test_an_unreachable_feed_is_silent_and_the_installed_engine_stays
   shape_engine.ensure    tests/terminal/test_shape_engine.py     test_an_unreachable_feed_leaves_an_installed_engine_alone_and_says_nothing
   drafting_fetch         tests/terminal/test_drafting_tuned.py   test_a_feed_nobody_answers_for_is_silent_offline_refused_or_never_answering
   the daily check        tests/terminal/test_update_notice.py    test_dns_is_blocked / test_a_proxy_that_refuses / test_a_connection_that_never_answers

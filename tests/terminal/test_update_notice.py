@@ -43,7 +43,7 @@ class Cached(UpdaterCase):
     def remember(self, **offers):
         state = self.components / ".updates" / "state.json"
         state.parent.mkdir(parents=True, exist_ok=True)
-        last = {"at": dt.datetime.now(dt.timezone.utc).isoformat(), "engine": None, "app": None, "dsv41": None,
+        last = {"at": dt.datetime.now(dt.timezone.utc).isoformat(), "engine": None, "app": None,
                 "control": ec.runtime_version(), "engine_installed": ec.newest_installed_version(self.components), **offers}
         state.write_text(json.dumps({"schema_version": 1, "last_check": last}))
 

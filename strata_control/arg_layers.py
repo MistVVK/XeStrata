@@ -76,7 +76,7 @@ def layer(cfg: dict, explicit: Mapping[str, Any] | None = None, prev: Mapping[st
           bool_flags: frozenset[str] = tune_knobs.BOOL_FLAGS) -> dict:
     """Put the four sources over each other in ``cfg`` (in place; ``cfg["args"]`` is the generated layer on entry).
     ``explicit``: the launch's own options as ``tune_knobs.apply_to_argv`` changes (value, True for present, None for off).
-    ``prev``: the config this launch wrote last time (or None). ``bool_flags``: the engine's valueless switches (DeepSeek's --mmap-experts takes a word). Returns {"calibrated": bool, "persisted": [...], "explicit": [...]}."""
+    ``prev``: the config this launch wrote last time (or None). ``bool_flags``: the engine's valueless switches. Returns {"calibrated": bool, "persisted": [...], "explicit": [...]}."""
     explicit = dict(explicit or {})
     args = [str(a) for a in cfg.get("args") or []]
     # 3. calibrated values over the generated ones

@@ -1,4 +1,4 @@
-"""The `setup` entry point: `strata_control.setup_config.config_for` (and `dsv41_config_for`) called with what setup would have decided on a simulated machine.
+"""The `setup` entry point: `strata_control.setup_config.config_for` called with what setup would have decided on a simulated machine.
 
 `setup.py` main() cannot run without a GPU, an engine and a model.  Its last stretch (the engine arguments, the speed switches, the cards, the vision section) is
 now `config_for(inputs, lib)`.  Here the inputs are built from the machine class and the model set by calling setup's OWN decision functions where they are pure
@@ -128,32 +128,9 @@ def _qwen(setup, world: World, lib: ProbeLib, say) -> tuple[dict, dict]:
     return built.cfg, summary
 
 
-def _dsv41(setup, world: World, lib: ProbeLib, say) -> tuple[dict, dict]:
-    from strata_control import dsv41_fit, setup_config
-    m, s = world.machine, world.mset
-    hip = m.backend == "hip"
-    fam = setup.MULTI_FILE_FAMILIES["deepseek41"]
-    model = s.model
-    md = fam["models"][model]
-    gpu = _gpu(setup, world)
-    cards = [gpu]
-    ctx = context_for(m, s)
-    ram = m.ram_gb
-    a = _args(world, ctx)
-    with contextlib.redirect_stdout(say):
-        plan = dsv41_fit.plan([{**c, "vram_gb": float(c.get("vram_gb") or 0)} for c in cards], ram, None, ctx, model=model, named=True)
-    inp = setup_config.Dsv41Inputs(a=a, cards=cards, ctx=ctx, cuda_tk=13, ds_vision="on", exe=world.exe, fam=fam, hip=hip, lib_dirs=[], mac=False, md=md,
-                                   named=False, pack=world.pack, plan=plan, port=8080, ram=ram, tag=fam["tag"] + model)
-    summary = {"family": "deepseek41", "model": model, "ram_gb": ram, "gpu": {k: gpu[k] for k in sorted(gpu) if k not in ("driver",)}, "context": ctx,
-               "vision": "on", "plan_verdict": plan.get("verdict")}
-    with contextlib.redirect_stdout(say):
-        built = setup_config.dsv41_config_for(inp, lib)
-    return built.cfg, summary
-
-
 def drive_setup(world: World) -> dict:
     from .driver import engine_start
-    command = f"strata setup --family {'deepseek41' if world.mset.multi_file else world.mset.family} --model {world.mset.model} --yes --no-start"
+    command = f"strata setup --family {world.mset.family} --model {world.mset.model} --yes --no-start"
     if world.machine.key in NOT_DRIVEN:
         return {"entry": "setup", "command": command, "not_driven": NOT_DRIVEN[world.machine.key]}
     if str(ROOT) not in sys.path:
@@ -164,7 +141,7 @@ def drive_setup(world: World) -> dict:
     # not a hybrid CPU (setup adds --pool-workers on one: Boston's 8 P + 16 E cores changed 12 goldens): the class decides, not the host
     with world.patched(), mock.patch.object(os, "cpu_count", lambda: 16), mock.patch.object(setup, "cpu_cores", lambda: None), \
             mock.patch.object(setup, "WIN", lib.WIN),             mock.patch.object(setup, "EXE", lib.EXE), mock.patch.object(setup, "VEXE", lib.VEXE):     # setup's own helpers read these globals: the class decides, not the host
-        cfg, summary = (_dsv41 if world.mset.multi_file else _qwen)(setup, world, lib, notes)
+        cfg, summary = _qwen(setup, world, lib, notes)
         eng = engine_start(world, dict(cfg))
     return {"entry": "setup", "command": command, "inputs": summary, "config_file": cfg, "engine": eng,
             "setup_says": [l.strip() for l in notes.getvalue().splitlines() if l.strip()]}

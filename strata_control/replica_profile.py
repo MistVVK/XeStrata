@@ -79,7 +79,7 @@ def applies(cards: list[dict], cfg: dict, ram_gb: float, *, platform: str | None
     if not requested(cfg, environ):
         return False, ""
     args = [str(a) for a in cfg.get("args") or []]
-    if cfg.get("replicas") or cfg.get("arch") == "deepseek41" or "--peer-device" in args:
+    if cfg.get("replicas") or "--peer-device" in args:
         return False, "replica profile: the config already names replicas, a peer device or another model family"
     if str(cfg.get("layer_split") or "auto") != "auto" or "--layer-split" in args:
         return False, "replica profile: you chose a layer split; kept"

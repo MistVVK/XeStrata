@@ -152,9 +152,6 @@ STRATA_PROGRAMS = {
     "strata_control/tune_session.py": 1,  # tuning worker (quiet_crash_env)
     "strata_control/tuning.py": 1,     # engine --help (engine_env)
     "strata_control/shape_engine.py": 2,  # engine --version / --geometry (inherit)
-    "strata_control/dsv41_engine.py": 1,  # --version (inherits)
-    "strata_control/dsv41_flags.py": 1,   # --help (inherits)
-    "strata_control/dsv41_paths.py": 1,   # --version (inherits)
     "strata_control/updater.py": 3,       # --version probes (inherit)
     "strata_cli/bench_standard.py": 2,    # `strata.py serve` (inherits: cli.main sets it) + taskkill
     "strata_cli/launch/runner.py": 2,     # setup.py and the other children (_env)

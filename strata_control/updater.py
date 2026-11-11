@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from strata_control import acquisition, components, dsv41_paths, engine_component as ec, feed as feedmod, longpath, preset_marks, signing, transfer
+from strata_control import acquisition, components, engine_component as ec, feed as feedmod, folder_use, longpath, preset_marks, signing, transfer
 from strata_control.targets import host_platform
 from strata_control import atomic as _atomic_mod
 
@@ -675,7 +675,7 @@ def check(ctx: Context) -> dict:
         report = {"feed": {"source": ctx.source, "sequence": feed.sequence, "channel": feed.channel, "key_id": feed.key_id,
                            "generated_at": feed.generated_at, "trusted_by": "test key file" if signing.extra_keys_in_effect(ctx.environ) else "built-in keys"},
                   "engine": decide_engine(feed, ctx, state), "control": decide_control(feed, ctx, state),
-                  "app": decide_app(feed, ctx), "dsv41": decide_dsv41(feed, ctx), "serving": _serving_or_empty(ctx), "hardware": ctx.hardware}
+                  "app": decide_app(feed, ctx), "serving": _serving_or_empty(ctx), "hardware": ctx.hardware}
         state.data["last_check"] = _last_check(ctx, report)
         state.save()
         return report
@@ -688,8 +688,6 @@ def _last_check(ctx: Context, report: dict, control_version: str | None = None) 
         "at": (ctx.now or dt.datetime.now(dt.timezone.utc)).isoformat(),
         "engine": report["engine"]["offered"]["version"] if report["engine"]["status"] in ("available", "install") and report["engine"]["offered"] else None,
         "app": report["app"]["offered"] if report["app"]["status"] == "available" else None,
-        "dsv41": report["dsv41"]["offered"] if report["dsv41"]["status"] == "available" else None,
-        "dsv41_installed": report["dsv41"]["installed"],
         # the versions this result is for, so a later Control, engine or app change drops the cached notice
         "control": control_version or ec.runtime_version(), "engine_installed": ec.newest_installed_version(ctx.components)}
 
@@ -753,31 +751,17 @@ def stage_engine(ctx: Context, feed: feedmod.Feed, pkg: feedmod.EnginePackage, a
         raise
 
 
-def _runs_on_dsv41_engine(config) -> bool:
-    """True for a DeepSeek run config. The test start swaps the engine for the one being updated (the Strata engine), and a DeepSeek model
-    runs on strata-dsv41, which has its own package: the Strata engine rejects its options ('unknown argument: --eos') and a good engine
-    would be refused. Unreadable configs count as not DeepSeek, so they are tried as before."""
-    try:
-        cfg = json.loads(Path(config).read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return False
-    if not isinstance(cfg, dict):
-        return False
-    exe = cfg.get("exe")
-    return cfg.get("arch") == "deepseek41" or (isinstance(exe, str) and "strata-dsv41" in exe.replace("\\", "/").rsplit("/", 1)[-1].lower())
-
-
 def discover_run_config(environ=None) -> Path | None:
     """A saved model's run config for the test start: the one a saved profile uses if its files are all present, otherwise any
-    installed model whose files are present. DeepSeek models are left out (they run on strata-dsv41, not on the engine under test).
+    installed model whose files are present. DeepSeek models are left out (strata_control/retired.py: this Strata does not run them).
     None when no model can be used (the first run)."""
-    from strata_control import models, profiles
+    from strata_control import models, profiles, retired
     try:
         listed = models.list_installed()
     except Exception:                                   # noqa: BLE001 - discovery is best effort
         return None
     ready = [m for m in listed.get("models", []) if m.get("component_status") == "present" and m.get("source_config")
-             and not _runs_on_dsv41_engine(m["source_config"])]
+             and not retired.config_file_reason(m["source_config"])]
     if not ready:
         return None
     try:
@@ -1463,109 +1447,6 @@ def _failed_mark_is_old(mark: dict, ctx: Context, hours: float = 24.0) -> bool:
         return False
 
 
-def _dsv41_installs(ctx: Context) -> tuple[list[Path], list[Path]]:
-    """(the engine-dsv41 folders in use, the saved run configs that may name a package in them).  A saved profile's run config says where the
-    DeepSeek engine is; the install folder the app or Terminal runs from (STRATA_INSTALL_DIR) is looked at too, with its model run configs."""
-    configs = dsv41_paths.saved_configs()
-    install = ctx.environ.get("STRATA_INSTALL_DIR")
-    if install and Path(install).is_dir():
-        configs += sorted(Path(install).glob("strata-*.json"))
-    roots = dsv41_paths.roots_of(configs)
-    for extra in ([Path(install) / dsv41_paths.DIR] if install else []) + [ctx.components.parent / dsv41_paths.DIR]:
-        if extra.is_dir() and extra not in roots and dsv41_paths.installed(extra):
-            roots.append(extra)
-    return roots, configs
-
-
-def _dsv41_offer(feed: feedmod.Feed, ctx: Context, newest: Path) -> tuple[feedmod.EnginePackage | None, list[str]]:
-    """The feed's DeepSeek package of the SAME kind (platform, backend, variant) as the installed `newest`, if it fits this PC."""
-    kind = dsv41_paths.kind_of(newest.parent.name)
-    same = [p for p in feed.dsv41 if dsv41_paths.kind_of(folder_name(p)) == kind]
-    if not same:
-        return None, []
-    parts = kind.split("-")
-    hardware = {**ctx.hardware, "backend": parts[2] if len(parts) > 2 else ctx.hardware.get("backend"), "backend_source": "requested"}
-    return feedmod.select_engine(same, hardware)
-
-
-def decide_dsv41(feed: feedmod.Feed, ctx: Context) -> dict:
-    """What an update would do for the installed DeepSeek engine: nothing is downloaded.  ``status``: none-installed, current, available, none-for-this-pc."""
-    roots, _ = _dsv41_installs(ctx)
-    report = {"component": "dsv41", "status": "none-installed", "installed": None, "offered": None, "download_bytes": 0}
-    for root in roots:
-        found = dsv41_paths.installed(root)
-        if not found:
-            continue
-        newest = found[-1]
-        report.update(status="current", installed=newest.parent.name.split("-")[0], root=str(root))
-        pkg, reasons = _dsv41_offer(feed, ctx, newest)
-        if pkg is None:
-            report.update(status="none-for-this-pc", reasons=reasons)
-        else:
-            report.update(offered=pkg.version, download_bytes=pkg.size)
-            if feedmod.version_key(pkg.version) > feedmod.version_key(report["installed"]):
-                report["status"] = "available"
-        if report["status"] == "available":
-            break
-    return report
-
-
-def update_dsv41(ctx: Context, feed: feedmod.Feed, state: State) -> dict:
-    """The explicit update of an installed DeepSeek engine package (the app's "Update engine", `strata update`): the signed feed's newer package of
-    the same kind is downloaded, checked (signature and every file), unpacked NEXT TO the old one, started once (`--version`), and only then every saved
-    run config is pointed at it.  Older package folders stay (Settings > Engine switches between them and deletes them).  Nothing installed: nothing
-    happens.  The engine that is serving is not touched, so nothing waits for it.  Starting never does any of this (strata_control/dsv41_paths.py)."""
-    roots, configs = _dsv41_installs(ctx)
-    result = {"component": "dsv41", "status": "none-installed", "changed": False}
-    for root in roots:
-        found = dsv41_paths.installed(root)
-        if not found:
-            continue
-        newest = found[-1]
-        before = newest.parent.name.split("-")[0]
-        result.update(status="current", installed_before=before)
-        pkg, reasons = _dsv41_offer(feed, ctx, newest)
-        if pkg is None:
-            result.update(status="none-for-this-pc", note="; ".join(reasons[:2]) or "the feed has no DeepSeek engine for this PC")
-            continue
-        if feedmod.version_key(pkg.version) <= feedmod.version_key(before):
-            result["note"] = "The DeepSeek engine is up to date."
-            continue
-        _free_space_check(root, pkg.size + pkg.installed_bytes, ctx, pkg.sha256, "dsv41")
-        archive = _download(ctx, "dsv41", pkg.url, pkg.size, pkg.sha256, f"the DeepSeek engine {pkg.version}", feed)
-        idle_gate(ctx)                                   # the person agreed to stop the model (or there is none) before anything is put in place
-        stage_root = None
-        try:
-            stage_root, _staged = stage_engine(ctx, feed, pkg, archive)
-            folder = stage_root / "engine" / folder_name(pkg)
-            target = root / folder.name
-            root.mkdir(parents=True, exist_ok=True)
-            if target.exists():
-                shutil.rmtree(longpath.long_path(target), ignore_errors=True)
-            _move_dir(folder, target)
-            if os.name != "nt":
-                (target / dsv41_paths.exe_name()).chmod(0o755)
-            ctx.say("test", f"Test-starting the DeepSeek engine {pkg.version} before switching to it", component="dsv41")
-            ok, why = dsv41_paths.test_start(target / dsv41_paths.exe_name())
-            if not ok:
-                shutil.rmtree(longpath.long_path(target), ignore_errors=True)       # (never the installed one)
-                raise TestStartFailed(f"DeepSeek engine {pkg.version}", why)
-            new_exe = target / dsv41_paths.exe_name()
-            dsv41_paths.set_pin(root, None)                 # an explicit update goes to the newest again
-            moved = dsv41_paths.repoint_all(configs, new_exe)
-            kept = [d.parent.name for d in dsv41_paths.installed(root) if d.parent.name != new_exe.parent.name and dsv41_paths.in_use(d.parent)]
-            archive.unlink(missing_ok=True)
-            result.update(status="updated", changed=True, installed_after=pkg.version, profiles_repointed=moved, kept_in_use=kept,
-                          note="Models you start from now on use the new DeepSeek engine. The older one stays installed; Settings > Engine can switch back or delete it."
-                               + (" The one that is running now keeps the old engine until it is stopped." if kept else ""))
-            state.history({"at": (ctx.now or dt.datetime.now(dt.timezone.utc)).isoformat(), "action": "update-dsv41", "from": before, "to": pkg.version, "ok": True})
-            return result
-        finally:
-            if stage_root is not None:
-                shutil.rmtree(longpath.long_path(stage_root), ignore_errors=True)
-    return result
-
-
 def update_control(ctx: Context, feed: feedmod.Feed, state: State) -> dict:
     """Stage a newer Control bundle beside the running one, run it once (`--version`), and only then point the app and the
     terminal at it (``components/control/active.json``). The running Control is never modified."""
@@ -1605,7 +1486,7 @@ def update_control(ctx: Context, feed: feedmod.Feed, state: State) -> dict:
         _atomic_mod.replace(temp, pointer)
         keep = {pkg.version} | ({previous["folder"]} if previous else set())
         for entry_dir in control_dir(root).iterdir():
-            if entry_dir.is_dir() and entry_dir.name not in keep and not dsv41_paths.in_use(entry_dir):      # (never the Control a running server runs from)
+            if entry_dir.is_dir() and entry_dir.name not in keep and not folder_use.in_use(entry_dir):      # (never the Control a running server runs from)
                 shutil.rmtree(longpath.long_path(entry_dir), ignore_errors=True)
         state.history({"at": (ctx.now or dt.datetime.now(dt.timezone.utc)).isoformat(), "action": "update-control",
                        "from": decision["installed"], "to": pkg.version, "ok": True})
@@ -1705,9 +1586,6 @@ def pending_changes(feed: feedmod.Feed, ctx: Context, state: State, *, engine: b
             offered = (decision.get("offered") or {}).get("version")
             have = (decision.get("installed") or {}).get("version")
             out.append(f"engine {have} -> {offered}" if have else f"engine {offered}")
-        ds = decide_dsv41(feed, ctx)
-        if ds["status"] == "available":
-            out.append(f"DeepSeek engine {ds['installed']} -> {ds['offered']}")
     if control:
         decision = decide_control(feed, ctx, state)
         if decision["status"] == "available":
@@ -1753,7 +1631,7 @@ def run_update(ctx: Context, *, engine: bool = True, control: bool = True, app: 
         state.save()
         _model_check(ctx, feed, state, engine=engine, control=control)
         steps = ([("engine", lambda: update_engine(ctx, feed, state))] if engine else []) + \
-                ([("dsv41", lambda: update_dsv41(ctx, feed, state))] if engine else []) +                 _shape_steps(ctx, feed, engine) + \
+                _shape_steps(ctx, feed, engine) + \
                 ([("control", lambda: update_control(ctx, feed, state))] if control else []) + \
                 ([("app", lambda: update_app(ctx, feed))] if app else [])
         for name, step in steps:
@@ -1765,12 +1643,9 @@ def run_update(ctx: Context, *, engine: bool = True, control: bool = True, app: 
                 failure = failure or exc
         if any(r.get("component") == "engine" and r.get("status") == "updated" for r in results):
             state.data.get("last_check", {}).pop("engine", None)
-        if any(r.get("component") == "dsv41" and r.get("status") == "updated" for r in results):
-            state.data.get("last_check", {}).pop("dsv41", None)
         try:                                              # the feed was read for this update: what it offers that is still newer is kept for the app's one card
             now_control = next((r.get("installed_after") for r in results if r.get("component") == "control" and r.get("status") == "updated"), None)
-            state.data["last_check"] = _last_check(ctx, {"engine": decide_engine(feed, ctx, state), "app": decide_app(feed, ctx),
-                                                         "dsv41": decide_dsv41(feed, ctx)}, now_control)
+            state.data["last_check"] = _last_check(ctx, {"engine": decide_engine(feed, ctx, state), "app": decide_app(feed, ctx)}, now_control)
         except Exception:                                 # noqa: BLE001 - only a hint for the app
             pass
         state.save()

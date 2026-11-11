@@ -77,7 +77,7 @@ def fresh_setup(name="setup_under_test"):
 
 
 def tables(mod) -> str:
-    return json.dumps({k: getattr(mod, k) for k in ("MODELS", "FAMILIES", "OWN_PATH_FAMILIES", "MULTI_FILE_FAMILIES", "REPO_PINS", "HF_REVISIONS")},
+    return json.dumps({k: getattr(mod, k) for k in ("MODELS", "FAMILIES", "OWN_PATH_FAMILIES", "REPO_PINS", "HF_REVISIONS")},
                       sort_keys=True, default=str) + repr(sorted(mod.REV_PINS)) + repr(getattr(mod, "FEED_MODELS", None))
 
 
@@ -200,7 +200,7 @@ class FlashNextModel(Base):
 
     def test_a_built_in_id_or_tag_is_never_replaced(self):
         before = copy.deepcopy(self.setup.FAMILIES["swift"])
-        for clash in ("swift", "qwen", "unsloth", "qwen36", "deepseek41", "coder-x", "unsloth-2"):
+        for clash in ("swift", "qwen", "unsloth", "qwen36", "coder-x", "unsloth-2"):
             result = feed_models.apply(self.setup, parsed(flash_next(id=clash)), None)
             self.assertEqual(result.registered, [], clash)
             self.assertEqual(len(result.skipped), 1, clash)
@@ -415,7 +415,7 @@ class TerminalAndApp(Base):
 
     def test_without_a_list_the_table_is_the_same(self):
         s, rows = self.table()
-        self.assertEqual([r["family"] for r in rows], [f for f in fresh_setup("setup_reference").FAMILIES] + ["qwen36", "deepseek41"])
+        self.assertEqual([r["family"] for r in rows], [f for f in fresh_setup("setup_reference").FAMILIES] + ["qwen36"])
         self.assertTrue(all("available" not in r for r in rows))
 
     def test_a_cached_list_adds_its_sizes_after_the_built_in_ones_and_hides_what_cannot_run(self):

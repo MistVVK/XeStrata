@@ -197,6 +197,24 @@ class Launch(unittest.TestCase):
                 cmd.settings_from_args(self.parse("--preset", "big"), catalog=object())
         self.assertEqual(str(caught.exception), retired.NOT_OFFERED)
 
+    def test_each_dropped_deepseek_flag(self):
+        """--dsv41-package, --speed, --full-quality and --dspark stay accepted (an old script, a saved shortcut) and answer D3."""
+        from strata_cli.launch import cmd
+        for argv in (("--model", "IQ3_S", "--dsv41-package", "x.tar.gz"), ("--model", "IQ3_S", "--speed", "faster"),
+                     ("--model", "IQ3_S", "--full-quality"), ("--model", "IQ3_S", "--dspark", "on")):
+            with self.assertRaises(ValueError) as caught:
+                cmd.settings_from_args(self.parse(*argv), catalog=object())
+            self.assertEqual(str(caught.exception), retired.NOT_OFFERED, argv)
+
+    def test_the_dropped_flags_are_not_in_the_help(self):
+        from strata_cli.launch import cmd
+        ap = argparse.ArgumentParser()
+        sub = ap.add_subparsers(dest="command")
+        cmd.add_parsers(sub)
+        text = sub.choices["launch"].format_help()
+        for flag in ("--dsv41-package", "--speed", "--full-quality", "--dspark"):
+            self.assertNotIn(flag, text)
+
     def test_own_files(self):
         from strata_cli.launch import runner
         with tempfile.TemporaryDirectory() as d:

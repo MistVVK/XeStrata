@@ -215,7 +215,6 @@ class Feed(Base):
         loaded = feedmod.fetch(self.url, signing.load_trusted_keys())
         self.assertEqual([(p.shape, p.version) for p in loaded.shape_engines], [(SHAPE, "0.1.59")])
         self.assertEqual(loaded.engine, ())
-        self.assertEqual(loaded.dsv41, ())
         self.assertTrue(loaded.shape_engines[0].url.startswith("shapes/strata-q4-lite-0.1.59-"))
         self.assertEqual(loaded.shape_engines[0].to_dict()["shape"], SHAPE)
 
@@ -502,7 +501,7 @@ class Update(Base):
         self.assertIn("updated from 0.1.59 to 0.1.60", " ".join(lines))
         self.assertEqual(Path(ec.expand("component:strata-q4-lite", {"backend": "cuda"})), exe)
         self.publish("0.1.59", "0.1.60", "0.1.61", sequence=3)
-        with mock.patch.object(shape_engine, "_test_start", return_value=(True, "x")), mock.patch("strata_control.dsv41_paths.in_use", return_value=False):
+        with mock.patch.object(shape_engine, "_test_start", return_value=(True, "x")), mock.patch("strata_control.folder_use.in_use", return_value=False):
             self.ensure()
         self.assertEqual(self.folders(), ["0.1.60", "0.1.61"])
         self.assertEqual(self.strata_before, tree(self.comp / "engine"))
@@ -571,8 +570,7 @@ class Update(Base):
         self.publish("0.1.59", "0.1.60", sequence=2)
         ctx = updater.Context(components=self.comp, source=self.url, trusted=signing.load_trusted_keys(), hardware=self.hw)
         with mock.patch.object(shape_engine, "_test_start", return_value=(True, "x")), \
-                mock.patch.object(updater, "update_engine", return_value={"component": "engine", "status": "current", "changed": False}), \
-                mock.patch.object(updater, "update_dsv41", return_value={"component": "dsv41", "status": "none-installed", "changed": False}):
+                mock.patch.object(updater, "update_engine", return_value={"component": "engine", "status": "current", "changed": False}):
             out = updater.run_update(ctx, control=False)
         row = next(r for r in out["results"] if r.get("component") == COMP)
         self.assertEqual((row["status"], row["installed_after"]), ("updated", "0.1.60"))

@@ -223,46 +223,6 @@ def flag_list(engine: str | Path | None) -> list[str] | None:
     except Exception:                                        # noqa: BLE001
         return None
 
-
-#: strata-dsv41's settings in plain words (its own --help is one bracketed usage line, which the Qwen engine's list parser cannot read).
-DSV41_FLAGS = {
-    "--pack": ("DIR", "The folder with the model's prepared data."),
-    "--max-context": ("N", "How much text the model remembers at once."),
-    "--eos": ("ID", "The token that ends an answer (1 for DeepSeek)."),
-    "--dspark": ("on|off|none|auto", "The DSpark drafter that guesses ahead to speed up answers (auto loads it only where it helps)."),
-    "--dspark-conf": ("F", "How sure a DSpark guess must be to be used (0 to 1)."),
-    "--dspark-block": ("N", "The most words DSpark guesses in one round."),
-    "--expert-profile": ("FILE|none", "A table of which experts are used most, to decide what is kept in memory first."),
-    "--ssd-cache": ("GB", "How much RAM keeps the most used experts so they are not read from the SSD again (sizes itself when absent)."),
-    "--ssd-policy": ("lru|lfu|lfulru", "Which experts the RAM store drops first."),
-    "--prefill-chunk": ("N", "How many prompt words are read at once (the fast prompt path)."),
-    "--threads": ("on|off", "Read long prompts layer by layer on all CPU threads."),
-    "--cpu-threads": ("N", "How many CPU threads compute the experts the graphics card does not hold."),
-    "--tp": ("N", "Share each layer between this many graphics cards."),
-    "--gpus": ("LIST", "Which graphics cards to use together."),
-    "--reserve-mib": ("N", "Graphics memory (in MiB) kept free for other programs."),
-    "--vram-experts": ("F", "How many experts to keep in graphics memory."),
-    "--mmap-experts": ("on|off|auto", "Read the experts in place from the model's files."),
-    "--no-expert-cache": ("", "Do not keep the most used experts in graphics memory."),
-    "--vision": ("on|off", "Let the model read pictures."),
-    "--verbose": ("", "Print more about what the engine does."),
-}
-
-
-def dsv41_help_text(engine: str | Path | None) -> str:
-    """A list of strata-dsv41's settings the Advanced screen can read: ours in plain words, plus any flag its own --help names that we do not
-    describe.  Works before the engine is installed too (the plain words are static)."""
-    lines = [f"  {flag} {meta}  {desc}" if meta else f"  {flag}  {desc}" for flag, (meta, desc) in DSV41_FLAGS.items()]
-    if engine:
-        import subprocess
-        try:
-            proc = subprocess.run([str(engine), "--help"], capture_output=True, text=True, errors="replace", timeout=20)
-            seen = set(re.findall(r"--[a-z][a-z0-9-]*", (proc.stdout or "") + " " + (proc.stderr or "")))
-            lines += [f"  {f}  An engine setting (the engine's help has no sentence for it)." for f in sorted(seen) if f not in DSV41_FLAGS]
-        except Exception:                                    # noqa: BLE001 - the static list stands
-            pass
-    return "\n".join(lines) + "\n"
-
 def engine_help_text(engine: str | Path | None) -> str | None:
     if not engine:
         return None

@@ -255,11 +255,10 @@ class FitStart(unittest.TestCase):
         self.assertEqual(V.fit_start(self.cfg(parallel=1), list(self.ARGS), 8192, "sycl"), (self.ARGS, None, ""))
         self.assertEqual(V.fit_start({"model_name": FN}, list(self.ARGS), 8192, "sycl"), (self.ARGS, None, ""))
 
-    def test_nothing_without_one_cards_memory_or_on_a_split_or_deepseek_or_metal(self):
+    def test_nothing_without_one_cards_memory_or_on_a_split_or_metal(self):
         self.assertEqual(V.fit_start(self.cfg(), list(self.ARGS), None, "sycl"), (self.ARGS, None, ""))
         self.assertEqual(V.fit_start(self.cfg(), list(self.ARGS), 8192, "metal"), (self.ARGS, None, ""))
         self.assertEqual(V.fit_start(self.cfg(layer_split="auto"), list(self.ARGS), 8192, "sycl"), (self.ARGS, None, ""))
-        self.assertEqual(V.fit_start(self.cfg(arch="deepseek41"), list(self.ARGS), 8192, "sycl"), (self.ARGS, None, ""))
 
     def test_a_start_that_cannot_fit_keeps_its_requests_and_its_context(self):
         tight = [a if a != "1024" else "1500" for a in self.ARGS]

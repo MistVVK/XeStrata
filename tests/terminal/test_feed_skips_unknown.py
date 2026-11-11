@@ -42,9 +42,9 @@ class UnknownEntriesAreSkipped(unittest.TestCase):
                       dsv41={"packages": [engine(url="d"), engine(platform="plan9-mips", url="u2")]},
                       control={"version": "0.1.53", "packages": [control(), control(platform="linux-m68k", url="c2")]}))
         self.assertEqual([p.platform for p in f.engine], ["linux-x86_64"])
-        self.assertEqual([p.platform for p in f.dsv41], ["linux-x86_64"])
+        self.assertFalse(hasattr(f, "dsv41"))                     # the member (frozen, for Strata 0.2.13 and earlier) is not read
         self.assertEqual([p.platform for p in f.control], ["linux-x86_64"])
-        self.assertEqual(len(f.skipped), 3)
+        self.assertEqual(len(f.skipped), 2)
         for line in f.skipped:
             self.assertNotIn("\n", line)
             self.assertIn("skipped", line)

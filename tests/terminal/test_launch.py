@@ -109,9 +109,6 @@ class CatalogRules(unittest.TestCase):
             models, families, contexts, source = cat.tables()
             self.assertEqual(source, "setup.py")                       # the same tables setup.py and the app read
             for r in rows:
-                if r.family == "deepseek41":                           # its sizes are in MULTI_FILE_FAMILIES (shards + shared files), not in MODELS
-                    self.assertAlmostEqual(r.download_gb, {"UD-Q8_K_XL": 508.4, "IST-DAS-2.00bpw": 256.8, "IST-DAS-2.25bpw": 273.8, "IST-DAS-1.75bpw": 239.3, "ISTA-DAS-Coder": 190.7, "UD-IQ1_S": 241.0, "UD-IQ1_M": 258.4}[r.model], delta=0.1)
-                    continue
                 self.assertAlmostEqual(r.download_gb, models[r.model]["download_gb"])
             rec = [r for r in rows if r.recommended]
             self.assertEqual([(r.family, r.model) for r in rec], [("qwen", "IQ3_S")])      # 64 + 12 GB: the 64 GB tier
@@ -141,22 +138,12 @@ class CatalogRules(unittest.TestCase):
     def test_a_mac_is_judged_by_unified_memory_and_the_words_follow(self):
         hw = {"ram_gb": 32.0, "disk_free_gb": 5000.0, "os": "Darwin", "cpu": {"avx2": None, "name": "Apple M4"}, "mac": {"chip": "Apple M4", "macos": "27.2", "unified_gb": 32.0},
               "gpus": [{"index": 0, "name": "Apple M4", "vendor": "apple", "vram_gb": 0.0, "unified_gb": 32.0, "usable": True}]}
-        with Home() as h:
+        with Home():
             cat = catalog(hw)
-            eng = h.base / "strata-dsv41"
-            eng.write_bytes(b"engine without the Metal picture tower")      # an installed DeepSeek engine without STRATA_DS4_METAL_VISION_V1: text only (with it: pictures)
-            patcher = mock.patch.object(type(cat.strata), "dsv41_engine_exe", lambda self_: eng)
-            patcher.start()
-            self.addCleanup(patcher.stop)
             rows = {r.model: r for r in cat.rows()}
-            self.assertEqual(set(rows), {"Q2_0", "IQ3_XXS", "IQ3_S", "Gyro-S", "Gyro-M", "IST-DAS-2.00bpw", "IST-DAS-2.25bpw", "ISTA-DAS-Coder", "UD-IQ1_S", "UD-IQ1_M",
-                                "UD-Q2_0", "UD-IQ2_XS", "UD-Q2_K_XL", "UD-IQ3_XXS", "UD-Q3_K_XL", "UD-IQ4_XS-v31", "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL"})   # DeepSeek (0.2.7.1): the two ISTA; Unsloth's sets (round 0214: the Mac app repacks them; UD-IQ1_M is also DeepSeek's name)-DAS sets run on a Mac, UD-IQ1_S since f-039; the Coder and UD-IQ1_M are offered with a "not run yet" line
+            self.assertEqual(set(rows), {"Q2_0", "IQ3_XXS", "IQ3_S", "Gyro-S", "Gyro-M", "UD-IQ1_M",
+                                "UD-Q2_0", "UD-IQ2_XS", "UD-Q2_K_XL", "UD-IQ3_XXS", "UD-Q3_K_XL", "UD-IQ4_XS-v31", "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL"})   # Unsloth's sets (round 0214: the Mac app repacks them)
             self.assertEqual([r.model for r in rows.values() if r.recommended], ["Q2_0"])
-            for name in ("IST-DAS-2.00bpw", "IST-DAS-2.25bpw"):            # a 32 GB Mac: said plainly (mostly read from the SSD), never refused
-                self.assertEqual(rows[name].family, "deepseek41")
-                self.assertEqual((rows[name].verdict, rows[name].words), ("slower", "may run slower"))
-                self.assertFalse(rows[name].images)
-                self.assertGreater(rows[name].spill_gb, 100)
             self.assertEqual((rows["Q2_0"].verdict, rows["Q2_0"].words), ("slower", "may run slower"))
             self.assertEqual(rows["IQ3_S"].verdict, "slower")
             self.assertGreater(rows["IQ3_S"].spill_gb, 10)
@@ -421,26 +408,6 @@ class SetupArgs(unittest.TestCase):
                     self.assertIn("new to Strata", text)
                     self.assertIn("--vision off", nxt)
                     self.assertIn("github.com/Niko1221/Strata/issues", nxt)
-
-    def test_deepseek_on_an_rx_7000_card_says_once_that_it_is_untested(self):
-        """The 0.2.9 update adds a DeepSeek package for gfx1100-1102; it was built and never run on a real RX 7000 card, and the Terminal and the app say so
-        the way they say it for an Arc B-series card (one warn line, how to report)."""
-        from strata_cli.launch import cmd
-        from strata_cli.launch.catalog import Computer
-        line = "DeepSeek has not been tested on RX 7000 cards yet; please report how it runs."
-        cases = (("AMD Radeon RX 7900 XTX", "gfx1100", "deepseek41", True), ("AMD Radeon RX 7800 XT", "gfx1101", "deepseek41", True),
-                 ("AMD Radeon RX 7600", "gfx1102", "deepseek41", True), ("AMD Radeon RX 7900 XTX", "", "deepseek41", True),
-                 ("AMD Radeon RX 7900 XTX", "gfx1100", "qwen", False), ("AMD Radeon AI PRO R9700", "gfx1201", "deepseek41", False),
-                 ("AMD Radeon RX 6800 XT", "gfx1030", "deepseek41", False))
-        for name, arch, family, expect in cases:
-            card = {"index": 0, "name": name, "vendor": "amd", "vram_gb": 24.0, "usable": True, **({"arch": arch} if arch else {})}
-            hw = {"ram_gb": 64.0, "os": "Linux", "cpu": {"avx2": True, "name": "x"}, "gpus": [card]}
-            comp = Computer(ram_gb=64.0, gpus=hw["gpus"], disk_free_gb=500.0, os="Linux", avx2=True, raw=hw, engine_vendor="amd")
-            notes = [n for n in cmd.gpu_notices(S.LaunchSettings(family=family), comp) if n.text == line]
-            self.assertEqual(len(notes), 1 if expect else 0, (name, arch, family))
-            if expect:
-                self.assertEqual(notes[0].level, "warn")
-                self.assertIn("github.com/Niko1221/Strata/issues", notes[0].next)
 
     def test_a_mac_defaults_pictures_to_the_metal_reader_whatever_its_memory(self):
         for gb in (16.0, 32.0, 128.0):
@@ -922,37 +889,6 @@ class FlagsCommand(unittest.TestCase):
         p = self.plan("--model", "q2_0", "--pool-cores", "two,four")        # a list that cannot be read: a warning, never a refusal
         self.assertNotIn("--pool-cores", p["settings"]["extra"])
         self.assertTrue(any("pool-cores" in w for w in p["warnings"]))
-
-    def test_dspark_on_a_mac_is_warned_about_and_not_refused(self):
-        # the drafter has no Metal kernels yet: --dspark on is passed on as asked, with a plain warning (recommend, never force)
-        import sys
-        from unittest import mock
-        with mock.patch.object(sys, "platform", "darwin"):
-            p = self.plan("--model", "q2_0", "--dspark", "on")
-        self.assertEqual(p["settings"]["extra"].get("--dspark"), "on")
-        self.assertTrue(any("DSpark" in w and "Mac" in w for w in p["warnings"]), p["warnings"])
-        p = self.plan("--model", "q2_0", "--dspark", "auto")
-        self.assertFalse(any("DSpark" in w and "Mac" in w for w in p["warnings"]))
-
-    def test_dspark_takes_a_word_and_the_word_reaches_the_engine_line(self):
-        # --set dspark=on used to start strata-dsv41 with a lone "--dspark" ("--dspark needs a value", #3959)
-        from strata_cli.launch import settings as S
-        from strata_control import tune_knobs
-        base = ["--pack", "p", "--max-context", "262144"]
-        for word in ("on", "off", "auto", "none"):
-            a, _ = S.as_argv_changes({"--dspark": word}, tune_knobs.BOOL_FLAGS)
-            self.assertEqual(a, {"--dspark": word})
-            out = tune_knobs.apply_to_argv(base + ["--dspark", "auto"], a)
-            self.assertEqual(out[out.index("--dspark") + 1], word, word)
-            self.assertEqual(out.count("--dspark"), 1)
-        a, _ = S.as_argv_changes({"--dspark": "ON", "--dspark-conf": "0.7"}, tune_knobs.BOOL_FLAGS)
-        self.assertEqual(a, {"--dspark": "on", "--dspark-conf": "0.7"})
-        self.assertEqual(S.as_argv_changes({"--dspark": ""}, tune_knobs.BOOL_FLAGS)[0], {})
-        code, out, _err = run_cli(["launch", "--help"])
-        self.assertIn("--dspark", out)
-        p = self.plan("--model", "q2_0", "--dspark", "on")
-        self.assertEqual(p["settings"]["extra"], {"--dspark": "on"})
-        self.assertIn("--set dspark=on", p["flags"])
 
     def test_api_key_flags(self):
         p = self.plan("--model", "q2_0", "--access", "lan", "--api-key", "sk-mine")

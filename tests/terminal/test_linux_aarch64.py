@@ -115,28 +115,6 @@ class ReleaseTools(unittest.TestCase):
         self.assertIn(b"-DSTRATA_PORTABLE=ON", raw)
 
 
-class GB10DeepSeekPlan(unittest.TestCase):
-    def test_the_plan_for_a_gb10_speaks_of_one_pool_and_the_system_not_windows_and_a_bios(self):
-        from strata_control import dsv41_fit
-        card = {"index": 0, "name": "NVIDIA GB10", "vram_gb": 115.6, "shared_gb": 115.6, "dedicated_gb": 0.0, "uma": True}
-        plan = dsv41_fit.plan([card], 121.6, 400, 8192, model="IST-DAS-2.00bpw")
-        text = " ".join(plan["lines"])
-        self.assertNotIn("Windows", text)
-        self.assertNotIn("BIOS", text)
-        self.assertIn("DGX Spark", plan["measured"])
-        self.assertIn("one pool of 122 GB", text)
-        self.assertGreater(plan["experts_in_vram"], 11000)          # the engine placed 12,163 of 15,744 on the Spark itself
-
-    def test_the_windows_strix_halo_plan_is_unchanged(self):
-        from strata_control import dsv41_fit
-        card = {"index": 0, "name": "AMD Radeon(TM) 8060S Graphics", "vram_gb": 96.0, "shared_gb": 32.0, "dedicated_gb": 64.0, "uma": True}
-        plan = dsv41_fit.plan([card], 64.0, 400, 8192, model="IST-DAS-2.00bpw")
-        text = " ".join(plan["lines"])
-        self.assertIn("BIOS carve-out", text)
-        self.assertIn("kept for Windows", text)
-        self.assertEqual(plan["measured"], dsv41_fit.UMA_MEASURED)
-
-
 class GB10Probes(unittest.TestCase):
     """nvidia-smi gives a GB10's memory.total as [N/A]: the probes the Terminal reads must neither drop the card nor invent a size."""
     LINE = "0, NVIDIA GB10, GPU-0a1b2c3d-0000-1111-2222-333344445555, [N/A], 580.173.02\n"
