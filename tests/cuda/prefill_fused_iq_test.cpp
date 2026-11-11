@@ -13,7 +13,7 @@
 // different expert ranges.  Part 2 (timing): one layer at the engine's chunks (2048, 3584, 8192 tokens; 512 experts,
 // top 10) on both paths and on MMQ's products alone (no gathers), for the IQ2_XS, IQ3_XXS and IQ3_S packs' most
 // common layers, with the grouping checked and a sample of rows against the reference.  --no-ref, --no-timing,
-// --only=NAME, --edge, --chunks=A,B, --unset-pf-fused (STRATA_PF_FUSED left unset instead of set to 1: the engine's default, for the
+// --only=NAME, --edge, --chunks=A,B, --blob-shift=N, --unset-pf-fused (STRATA_PF_FUSED left unset instead of set to 1: the engine's default, for the
 // STRATA_PF_FUSED_Q2N=1 ctest entry).  Exit 77 without a CUDA device of sm_80 or newer.
 #include "strata/core/emulate.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
@@ -115,6 +115,7 @@ void tq_block(int t, const uint8_t* b, float* out, bool int8cb) {
 // (W' = W diag(s) H^T), so every activation entering them is rotated first, y = H_128 (s * x) / sqrt(128) per 128 values, with random signs.
 // The reference rotates on the host (this function, from the definition); the fused path's H rotation is set_down_rotation, MMQ's is
 // hadamard128_rows (the same device code: the reference is the independent side); the gate/up input is rotated on the host for every path.
+int g_blob_shift = 0;   // --blob-shift=N (even, 0-14; the timing part): every expert blob starts N bytes past its 16-byte aligned place, as in the engine's cache slots (stage-ring and slot offsets are only 2-byte aligned); use it with S20_NOMMQ=1 (MMQ wants aligned blobs)
 bool g_folded = false;
 void rot128(float* x, int n, const float* signs) {
     for (int b = 0; b < n; b += 128) {
@@ -571,12 +572,12 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
         std::vector<uint8_t> b = make_blob(p, geo, rng);
         for (int e = 0; e < E; ++e) {
             b[4 + (size_t) (e % 16)] ^= (uint8_t) e;   // not all equal (inside the first block, not its scale)
-            ck(cudaMemcpy(blobs.as<uint8_t>() + (size_t) e * stride, b.data(), geo.bytes, cudaMemcpyHostToDevice),
+            ck(cudaMemcpy(blobs.as<uint8_t>() + (size_t) e * stride + g_blob_shift, b.data(), geo.bytes, cudaMemcpyHostToDevice),
                "blob");
         }
     }
     std::vector<const uint8_t*> blob((size_t) E);
-    for (int e = 0; e < E; ++e) blob[(size_t) e] = blobs.as<uint8_t>() + (size_t) e * stride;
+    for (int e = 0; e < E; ++e) blob[(size_t) e] = blobs.as<uint8_t>() + (size_t) e * stride + g_blob_shift;
     std::vector<float> x = make_x(T, rng, -1);
     const Folded fo(tq_type(p.gu), rows);   // (--folded trellis pairs: rotated input, the H rotation on both paths, inside their times)
     fo.rotate_x(x);
@@ -873,6 +874,7 @@ int main(int argc, char** argv) {
             if (std::strcmp(argv[i], "--no-timing") == 0) timing = false;
             if (std::strcmp(argv[i], "--no-ref") == 0) ref = false;
             if (std::strcmp(argv[i], "--edge") == 0) edge = true;
+            if (std::strncmp(argv[i], "--blob-shift=", 13) == 0) g_blob_shift = std::atoi(argv[i] + 13);
             if (std::strcmp(argv[i], "--folded") == 0) g_folded = true;   // (the trellis pairs as Hadamard-folded experts: see g_folded)
             if (std::strncmp(argv[i], "--chunks=", 9) == 0) {
                 chunks.clear();

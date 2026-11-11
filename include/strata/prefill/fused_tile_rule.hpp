@@ -22,9 +22,10 @@ struct Card {
     bool s120 = false;   // compute capability 12.0 (sm120_series.hpp: STRATA_SM120_PERF not 0)
     bool s121 = false;   // GB10 (DGX Spark)
     int sms = 0;
+    bool s86 = false;    // compute capability 8.6 (appended last: the aggregate initializers {s120, s121, sms} of the callers and the test stay valid)
 };
 
-enum class Why { kBand, kS121, kS120Large, kS120Mid, kS120Small };
+enum class Why { kBand, kS121, kS120Large, kS120Mid, kS120Small, kStaged };
 
 struct Pick {
     int ww;     // 2 (128 routed rows) or 4 (64)
@@ -35,13 +36,20 @@ constexpr double kS120LargeAvg = 159.9;   // sm_120, 80+ SMs: a prompt of 8,192 
 constexpr double kS120MidAvg = 112.0;     // sm_120, 100-149 SMs (PRO 5000): from above the band, continuous with it
 constexpr double kS120SmallAvg = 119.9;   // sm_120, 40-79 SMs (RTX 5070): a prompt of 6,144 tokens routes 6,143 positions = 119.98 an expert
 
-constexpr Pick pick(const Card& c, int64_t n, int n_expert) {
+// staged: both kernels of the launch are weight-staging instances (sw_on in src/prefill/moe_fused_iq.cu).  Default false = the rule as it was.
+constexpr Pick pick(const Card& c, int64_t n, int n_expert, bool staged = false) {
     const double avg = (double) n / (double) (n_expert > 1 ? n_expert : 1);
     // GB10 (sm_121, 48 SMs): the launch's average is above 112 rows an expert for every prompt size here, so the 56-112 band never fires and the 64-row tile would be
     // chosen everywhere.  Forcing 128 rows measured +3.7% [1.030, 1.079] and +3.4% [1.030, 1.038] at 16K in two independent order-balanced block pairs (12 samples a
     // cell) and +4.3% at 32K in the second pair, with 4K neutral-to-slightly-worse (0.989x, 0.962x, intervals spanning 1.0).  So on this part the 128-row tile is taken from
     // 65,536 routed rows a launch (about an 11K-token prompt at six experts) up; 4K keeps 64.
     if (c.s121) return {n >= 65536 ? 2 : 4, Why::kS121};
+    // Staged launches (weight staging: the gate/up i-quants IQ3_XXS / IQ3_S / IQ4_XS and the IQ4_NL down) on an sm_86 or sm_120 card under 80 SMs: 128 rows from every size.  The
+    // staged 128-row kernels (RTX A4000, sm_86, 48 SMs, one layer, REAL routing, ms) against the unstaged 64-row ones at 2,048 / 8,192 / 20,000 tokens, IQ3_S / IQ4_NL
+    // 11.64 / 29.59 / 63.58 against 12.77 / 35.10 / 78.09, IQ3_XXS / IQ4_NL 11.38 / 29.20 / 63.11 against 11.88 / 33.47 / 75.40, IQ4_XS / IQ4_NL 11.69 / 30.39 / 65.60 against
+    // 13.10 / 36.27 / 80.69 (RESULTS-P4-SM.md S0.2).  Nothing below 48 SMs is measured, and no sm_120 card under 80 SMs with staging.  sm_89 / sm_80 are not in the class
+    // (no DevInfo flag, not measured); unstaged formats and every other class keep the rules below.
+    if (staged && (c.s86 || c.s120) && c.sms > 0 && c.sms < 80) return {2, Why::kStaged};
     // sm_120 with 80 SMs and up (the cards that take these kernels by default: RTX 5080 / 5090, PRO 5000 / 6000): 128 rows from 159.9 rows an expert on, the first
     // measured point at or above 1.000 on every pair of the PRO 5000 and PRO 6000 rows above.  Below it the answer depends on the card (the PRO 6000 loses 3-7% at 80
     // rows), so the 56-112 band below is left as it was.  A card with 100 to 149 SMs (PRO 5000) also takes 128 rows above the band, so from 56 rows on without a gap.
