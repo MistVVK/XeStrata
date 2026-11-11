@@ -8,8 +8,8 @@ Card sets (speed = multiprocessors x max clock):
   B        card 0 = 16 GB, speed 150; card 1 = 24 GB, speed 171: the faster card has MORE memory
   C        card 0 = 12 GB, card 1 = 16 GB, both speed 150: equal speed, different memory
 Before the fix the plan named card 0 in A typed 0,1 while the start ended on card 1 (the #1576 guard lives only in the start).
-Not covered here (the owner's decision, see the write-up): a typed --gpu after an earlier launch with roles keeps that launch's "gpu_order": "as_given"
-(runner.apply_cards does not pop it); the start then keeps the typed order where the plan re-sorts.
+A typed --gpu after an earlier launch with roles (a saved "gpu_order": "as_given") means the same as on a fresh home: the engine decides
+(owner 11-11, "Ok for --gpu list"; before, apply_cards kept the old key and the start kept the typed order where the plan re-sorted).
 """
 
 from __future__ import annotations
@@ -63,9 +63,10 @@ def plan_main(cards, typed):
     return int(m.group(1)), line
 
 
-def start_main(cards, typed):
-    """The saved config of a typed --gpu on a fresh home (no earlier gpu_order), then the order the engine stages the cards in."""
-    cfg = {"layer_split": "auto"}
+def start_main(cards, typed, base=None):
+    """The saved config of a typed --gpu on a fresh home (no earlier gpu_order) or on `base` (a config an earlier launch saved), then the
+    order the engine stages the cards in."""
+    cfg = dict(base) if base else {"layer_split": "auto"}
     runner.apply_cards(cfg, list(typed))
     scores = {c["index"]: c["speed"] for c in cards}
     vrams = {c["index"]: int(c["vram_gb"] * 1024) for c in cards}
@@ -87,6 +88,35 @@ class PlanNamesTheRunsMain(unittest.TestCase):
                 s, order, _ = start_main(SETS[name], typed)
                 self.assertEqual(s, want, f"the start's Main changed ({order})")
                 self.assertEqual(p, s, f"the plan says '{line}', the start ends on card {s} ({order})")
+
+    def test_a_typed_list_after_a_roles_launch_means_the_same_as_on_a_fresh_home(self):
+        for (name, typed), want in START_MAIN.items():
+            n = len(SETS[name])
+            roles = {"gpu": list(range(n)), "gpu_order": "as_given", "layer_split": "auto",
+                     "gpu_roles": {str(i): ("main" if i == n - 1 else "helper") for i in range(n)}}
+            with self.subTest(cards=name, typed=typed):
+                s, order, _ = start_main(SETS[name], typed, base=roles)
+                p, line = plan_main(SETS[name], typed)
+                self.assertEqual(s, want, f"the start's Main after a roles launch ({order})")
+                self.assertEqual(p, s, f"the plan says '{line}', the start ends on card {s} ({order})")
+        cfg = {"gpu": [0, 1], "gpu_order": "as_given", "gpu_roles": {"0": "helper", "1": "main"}}
+        runner.apply_cards(cfg, [1, 0])
+        self.assertNotIn("gpu_order", cfg)
+        self.assertNotIn("gpu_roles", cfg)
+
+    def test_roles_still_keep_their_order(self):
+        cfg = {"gpu": [1, 0]}
+        runner.apply_cards(cfg, {"gpu": [1, 0], "gpu_order": "as_given", "gpu_roles": {"0": "main", "1": "helper"}})
+        self.assertEqual(cfg.get("gpu_order"), "as_given")
+
+    def test_the_help_line_says_who_picks_the_main_card(self):
+        import argparse
+        parsers = launch_cmd.add_parsers(argparse.ArgumentParser().add_subparsers())
+        helps = [a.help for p in parsers for a in p._actions if "--gpu" in a.option_strings]
+        self.assertTrue(helps)
+        text = helps[0]
+        self.assertEqual(text, "graphics card numbers to use, e.g. 0 or 0,1 (default: the engine's choice). With more than one card the engine "
+                               "decides which is the Main card; --gpu-roles (instead of --gpu) sets the roles yourself.")
 
     def test_the_vram_guard_message_is_unchanged(self):
         _, order, said = start_main(SETS["A"], (0, 1))

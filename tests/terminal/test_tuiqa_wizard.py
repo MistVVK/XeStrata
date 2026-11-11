@@ -97,6 +97,61 @@ class SaveChoices(Base):
         self.run_app(case)
 
 
+def path_of(n: int) -> str:
+    """A storage path of exactly `n` characters, starting with /home/ana/ and ending with /Strata-data."""
+    head, tail = "/home/ana/", "/Strata-data"
+    p = head + ("models-and-more-" * 20)[: n - len(head) - len(tail)] + tail
+    assert len(p) == n
+    return p
+
+
+class StoragePath(Base):
+    """A storage folder longer than the row used to wrap and push "Save the preset and stop here" off an 80x24 screen (RULES.md, --keep scratch
+    path length); it is now shortened in the middle to one row, and every choice stays on screen for any length."""
+
+    def test_every_choice_stays_on_an_80x24_screen_for_any_path_length(self):
+        choices = ("Save as a preset and launch", "Launch without saving", "Save the preset and stop here")
+        for n in (36, 80, 200):
+            ctx = make_ctx()
+            path = path_of(n)
+
+            async def case(app, pilot, ctx, path=path, n=n):
+                await press(pilot, *("enter",) * 7, "n", "enter")
+                ctx.settings.data_dir = path
+                app.screen.paint()
+
+                def check():
+                    shown = text_of(app)
+                    for choice in choices:
+                        self.assertIn(choice, shown, (n, shown))
+                    body, menu = app.screen.query_one("#body"), app.screen.menu()
+                    self.assertLessEqual(menu.region.bottom, body.region.bottom, n)
+                    rows = [r for r in shown.split("\n") if "Storage" in r]
+                    self.assertEqual(len(rows), 1, (n, shown))
+                    row = rows[0].strip()
+                    self.assertTrue(row.startswith("Storage   /home/ana/"), (n, row))
+                    self.assertTrue(row.endswith("/Strata-data"), (n, row))
+                    self.assertLessEqual(len(rows[0]), 80, (n, row))
+                    if n <= 60:
+                        self.assertIn(path, row, "a path that fits is shown whole")
+                    else:
+                        self.assertIn("\u2026", row, "a long path is shortened in the middle")
+                await settled(pilot, check)
+                check()
+            self.run_app(case, ctx=ctx, size=(80, 24))
+
+    def test_middle_shorten(self):
+        from strata_cli.launch.screens import middle_shorten
+        self.assertEqual(middle_shorten("C:/a/b", 10), "C:/a/b")
+        p = "C:\\Users\\Ana\\Documents\\Strata\\a-very-long-folder-name-for-models\\Strata-data"
+        s = middle_shorten(p, 40)
+        self.assertEqual(len(s), 40)
+        self.assertEqual(s, "C:\\Users\\Ana\\Do\u2026e-for-models\\Strata-data")          # 2/5 of the room for the start, the rest for the end
+        self.assertEqual(middle_shorten(p, 40, "..."), "C:\\Users\\Ana\\D...-for-models\\Strata-data")
+        self.assertEqual(middle_shorten(p, 3), p[0] + "\u2026" + p[-1])            # the smallest: one character on each side
+        self.assertEqual(middle_shorten("/home/\u6a21\u578b\u6a21\u578b\u6a21\u578b/data", 12), "/hom\u2026\u578b/data")   # wide characters count as two cells
+
+
 class AdvancedLayout(Base):
     HELP = "  --prefill N          prompt chunk size (default 2048)\n  --kv fp16|int8       KV storage\n"
 

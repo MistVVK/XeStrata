@@ -1210,6 +1210,54 @@ def _kept_mark(path: Path) -> Path | None:
     return ROOT / "marks" / (hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:24] + ".done")
 
 
+def _change_time_ns(path: Path, st: os.stat_result) -> int:
+    """The time of the file's last change of content or metadata, in ns.  It moves on every write and on every setting of the modification time,
+    so a file rewritten in place that keeps its size and modification time still shows a new value.  Linux and Mac: st_ctime_ns.  Windows: os.stat's
+    ctime is the creation time there (an in-place rewrite keeps it), so the file system's own ChangeTime is read (GetFileInformationByHandleEx,
+    FileBasicInfo); if that cannot be read, st_ctime_ns is used."""
+    if os.name != "nt":
+        return st.st_ctime_ns
+    try:
+        from ctypes import wintypes
+
+        class _BasicInfo(ctypes.Structure):
+            _fields_ = [("CreationTime", ctypes.c_longlong), ("LastAccessTime", ctypes.c_longlong), ("LastWriteTime", ctypes.c_longlong),
+                        ("ChangeTime", ctypes.c_longlong), ("FileAttributes", wintypes.DWORD)]
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD,
+                                    wintypes.HANDLE]
+        k32.GetFileInformationByHandleEx.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        # FILE_READ_ATTRIBUTES, share read / write / delete, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (a folder opens too)
+        h = k32.CreateFileW(str(path), 0x80, 0x7, None, 3, 0x02000000, None)
+        if h is None or h == ctypes.c_void_p(-1).value:
+            return st.st_ctime_ns
+        try:
+            info = _BasicInfo()
+            if not k32.GetFileInformationByHandleEx(h, 0, ctypes.byref(info), ctypes.sizeof(info)):      # 0 = FileBasicInfo
+                return st.st_ctime_ns
+            return int(info.ChangeTime) * 100                    # 100 ns steps since 1601; only compared, never shown
+        finally:
+            k32.CloseHandle(h)
+    except (OSError, AttributeError, ValueError):
+        return st.st_ctime_ns
+
+
+def _alt_reader_mark(path: Path) -> Path | None:
+    """The mark that remembers the SHA-256 of an alternative picture reader (accepted_alt_reader).  Its own key: the real path, size, modification
+    time AND change time (_change_time_ns), so a file rewritten in place with its size and modification time kept is hashed again.  Only this
+    mark has the change time in its key: every other kept mark (_kept_mark, a 110 GB Engram's too) keeps its key and stays valid."""
+    try:
+        real = path.resolve()
+        st = real.stat()
+        key = f"alt-reader|{real}|{st.st_size}|{st.st_mtime_ns}|{_change_time_ns(real, st)}"
+    except OSError:
+        return None
+    return ROOT / "marks" / (hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:24] + ".done")
+
+
 _OWN_DIRS: list = []                                   # --gguf-dir: folders of the person's own model files (a Hugging Face cache, a share)
 
 
@@ -7471,9 +7519,9 @@ def alt_reader_places(pinned: str, models_dir, roots, gguf_dir) -> list:
 def accepted_alt_reader(pinned: str, places, *, start: bool = True):
     """The first file in `places` that is the alternative reader of `pinned` (name, size and SHA-256 all as pinned in ALT_READERS), else None. Anything
     else with that name is ignored (never deleted, never renamed). The SHA-256 (0.9 GB, a few seconds) is remembered in a mark in Strata's own
-    marks/ folder, never beside the person's file; the mark is keyed by the real path, size and modification time (_kept_mark), so a file that was
-    replaced is hashed again. start=True is the setup run (says what it does, writes the mark); start=False is the plan (the same answer, says
-    nothing, writes nothing)."""
+    marks/ folder, never beside the person's file; the mark is keyed by the real path, size, modification time and change time
+    (_alt_reader_mark), so a file that was replaced, also in place with its size and modification time kept, is hashed again. start=True is
+    the setup run (says what it does, writes the mark); start=False is the plan (the same answer, says nothing, writes nothing)."""
     alt = ALT_READERS.get(pinned)
     if alt is None:
         return None
@@ -7486,7 +7534,7 @@ def accepted_alt_reader(pinned: str, places, *, start: bool = True):
         except OSError:
             continue
         digest = None
-        kept = _kept_mark(p)
+        kept = _alt_reader_mark(p)
         try:
             found = _ALT_MARK.match(kept.read_text(encoding="utf-8", errors="replace")) if kept is not None and kept.exists() else None
             digest = found.group(1) if found else None
@@ -8786,10 +8834,22 @@ def feed_models_setup(feed: str | None = None, fetch: bool = True) -> None:
         feed_models.apply(_SetupTables(), loaded.models, feed_engine_families())
 
 
-def own_path_context(fam: dict, vram_gb: float) -> int:
-    """The recommended context for an own-path family: its KV cache (VRAM) beside the dense weights and the most-used
-    experts - 32K up to 16 GB, 64K up to 24 GB, 128K above."""
-    return 131072                                      # 128K on every card (owner, 2026-11-01)
+def own_path_contexts() -> list:
+    """The context sizes the own-path menu offers: up to the model's trained 262,144 (no rope scaling on this path yet)."""
+    return [c for c in CONTEXTS if c <= 262144]
+
+
+def own_path_context(fam: dict, vram_gb: float, model: str | None = None) -> int:
+    """The recommended context for an own-path family: 128K (owner, 2026-11-01), or on a card where 128K does not fit the largest
+    size that does (#5715, strata_control/own_path_fit.py; the smallest when none fits).  A recommendation only: any size can be chosen."""
+    from strata_control import own_path_fit
+    return own_path_fit.recommended(own_path_fit.inputs(fam.get("name"), model), vram_gb, own_path_contexts())
+
+
+def own_path_context_warning(fam: dict, model: str, vram_gb: float, ctx: int) -> str | None:
+    """The sentence said when the chosen context does not fit the card (#5715); None when it fits or cannot be said."""
+    from strata_control import own_path_fit
+    return own_path_fit.warning(own_path_fit.inputs(fam.get("name"), model), vram_gb, ctx, own_path_contexts())
 
 
 def own_path_size(fam: dict, ram: float) -> str:
@@ -8938,11 +8998,11 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
         warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
     ok(f"size: {model}")
     tag = fam["tag"] + model
-    rec_ctx = own_path_context(fam, gpu.get("vram_gb", 0.0))
+    rec_ctx = own_path_context(fam, gpu.get("vram_gb", 0.0), model)
     if a.context:
         ctx = a.context
     else:
-        ctxs = [c for c in CONTEXTS if c <= 262144]   # the model's trained length; no rope scaling on this path yet
+        ctxs = own_path_contexts()                     # the model's trained length; no rope scaling on this path yet
         say()
         say("  Context length = how much text the model can see at once. Its cache takes "
             f"{fam['kv_bytes_per_token'] * 32768 / 2**30:.1f} GB of VRAM per 32K tokens, room the experts would use:")
@@ -8953,6 +9013,9 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     if ctx > 262144:
         warn(f"{ctx // 1024}K is past {fam['title']}'s trained 262,144 positions and this engine path has no rope "
              "scaling yet: kept as you chose, but answers past 256K are untested")
+    too_big = own_path_context_warning(fam, model, float(gpu.get("vram_gb", 0.0)), ctx)
+    if too_big:                                        # #5715: said before the start; the choice is kept (recommend, never force)
+        warn(too_big)
     ok(f"context: {ctx} tokens")
     vision = own_path_vision(a, fam, gpu, hip)
     ok("images: " + {"none": "off", "gpu": "on", "cpu": "on (encoder on the CPU)"}[vision])

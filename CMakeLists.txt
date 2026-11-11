@@ -288,6 +288,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(stream_watch_test tests/core/stream_watch_test.cpp)
   target_include_directories(stream_watch_test PRIVATE include)
   add_test(NAME stream_watch_test COMMAND stream_watch_test)
+  # AMD on Linux: how long the driver paused this process's GPU work (a fake KFD tree; the stall and request lines)
+  add_executable(gpu_pause_time_test tests/core/gpu_pause_time_test.cpp)
+  target_include_directories(gpu_pause_time_test PRIVATE include)
+  add_test(NAME gpu_pause_time_test COMMAND gpu_pause_time_test)
   add_executable(logit_bias_test src/core/logit_bias_test.cpp)
   target_include_directories(logit_bias_test PRIVATE include)
   add_test(NAME logit_bias_test COMMAND logit_bias_test)
@@ -352,6 +356,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(prefill_plan_test tests/program/prefill_plan_test.cpp)
   target_include_directories(prefill_plan_test PRIVATE include)
   add_test(NAME prefill_plan_test COMMAND prefill_plan_test)
+
+  # #5715: strata-q36's one-session context check (the reporter's 12 GB card from its log): header-only, no GPU
+  add_executable(q36_context_fit_test tests/program/q36_context_fit_test.cpp)
+  target_include_directories(q36_context_fit_test PRIVATE include)
+  add_test(NAME q36_context_fit_test COMMAND q36_context_fit_test)
 
   # the default CPU prefill share is not armed when every expert is resident (#1595): header-only rule, no GPU
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)

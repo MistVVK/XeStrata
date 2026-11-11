@@ -353,7 +353,7 @@ def apply_cards(cfg: dict, gpus: "list[int] | dict | None") -> None:
         return
     if not gpus:
         return
-    for k in ("gpu_roles", "gpu_cards", "gpu_none"):          # a plain card list replaces an earlier roles choice
+    for k in ("gpu_roles", "gpu_cards", "gpu_none", "gpu_order"):   # a plain card list replaces an earlier roles choice; the engine orders it
         cfg.pop(k, None)
     gpus = [int(g) for g in gpus]
     cfg["gpu"] = gpus[0] if len(gpus) == 1 else gpus

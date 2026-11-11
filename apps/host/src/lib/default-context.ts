@@ -1,4 +1,4 @@
-import { BASE_CONTEXT, cacheGb, DENSE_GB, MTP_VRAM_GB } from './native-fit';
+import { BASE_CONTEXT, cacheGb, DENSE_GB, MTP_VRAM_GB, ownPathFits, type ContextFit } from './native-fit';
 
 /**
  * The conversation context a model opens with: 128K for every configuration, unless the person picks another (owner, 11-01). Where the
@@ -35,8 +35,11 @@ export function roomAfterContext(vramGb: number, context: number, kv = 'int8'): 
   const dense = Math.max(DENSE_GB - cacheGb(BASE_CONTEXT), 0) + cacheGb(context, kv);
   return vramGb - dense - MTP_VRAM_GB;
 }
-/** A context past 32K that leaves a card under 1 GB for the model (the 32K default would leave more). Said as a warning; nothing is refused or lowered. */
-export function contextIsTight(vramGb: number | null | undefined, context: number, kv = 'int8'): boolean {
+/** A context past 32K that leaves a card under 1 GB for the model (the 32K default would leave more); for Qwen3.6 (`fit`, from the catalog), a context
+ *  that does not fit the card by its own rule (#5715, strata_control/own_path_fit.py). Said as a warning; nothing is refused or lowered. */
+export function contextIsTight(vramGb: number | null | undefined, context: number, kv = 'int8', fit?: ContextFit | null): boolean {
   const vram = Number(vramGb);
-  return Number.isFinite(vram) && vram > 0 && context > BASE_CONTEXT && roomAfterContext(vram, context, kv) < 1;
+  if (!Number.isFinite(vram) || vram <= 0) return false;
+  if (fit) return !ownPathFits(fit, vram, context);
+  return context > BASE_CONTEXT && roomAfterContext(vram, context, kv) < 1;
 }

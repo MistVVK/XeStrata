@@ -75,8 +75,30 @@ class Qwen36Entries(unittest.TestCase):
 
     def test_context_recommendation(self):
         fam = setup.OWN_PATH_FAMILIES["qwen36"]
-        for vram in (12.0, 16.0, 24.0, 32.0):   # 128K on every card (owner, 2026-11-01; strata_control/default_context.py)
-            self.assertEqual(setup.own_path_context(fam, vram), 131072, vram)
+        # 128K (owner, 2026-11-01) where it fits the card; else the largest size that does (#5715); the smallest when none does
+        want = {("UD-Q4_K_XL", 11.94): 32768, ("UD-Q4_K_XL", 15.93): 131072, ("UD-Q4_K_XL", 23.99): 131072, ("UD-Q4_K_XL", 32.0): 131072,
+                ("UD-Q6_K_XL", 11.94): 32768, ("UD-Q6_K_XL", 15.93): 65536, ("Q8_0", 15.93): 65536, ("UD-Q6_K_XL", 23.99): 131072,
+                ("UD-Q4_K_XL", 8.0): 8192, ("Q8_0", 10.0): 8192}
+        for (model, vram), ctx in want.items():
+            self.assertEqual(setup.own_path_context(fam, vram, model), ctx, (model, vram))
+        self.assertEqual(setup.own_path_context(fam, 0.0, "UD-Q4_K_XL"), 131072)        # no card known: as before
+        self.assertEqual(setup.own_path_context(fam, 12.0), 131072)                      # no size: as before
+        self.assertEqual(setup.own_path_context({**fam, "name": "another-model"}, 12.0, "UD-Q4_K_XL"), 131072)   # a feed model: as before
+
+    def test_the_menu_is_the_rules_menu(self):
+        from strata_control import own_path_fit
+        self.assertEqual(setup.own_path_contexts(), own_path_fit.MENU)
+
+    def test_context_warning(self):
+        fam = setup.OWN_PATH_FAMILIES["qwen36"]
+        self.assertEqual(setup.own_path_context_warning(fam, "UD-Q4_K_XL", 11.94, 131072),
+                         "At 128K, this model's conversation memory needs about 5.8 GB of graphics memory. With the model itself that is more than "
+                         "this card's 12 GB, so it will probably not start. 32K fits on this card: choose 32K or less.")
+        self.assertTrue(setup.own_path_context_warning(fam, "UD-Q6_K_XL", 15.93, 131072).endswith(
+            "this card's 16 GB, so it will probably not start. 64K fits on this card: choose 64K or less."))
+        self.assertIsNone(setup.own_path_context_warning(fam, "UD-Q4_K_XL", 11.94, 32768))      # fits
+        self.assertIsNone(setup.own_path_context_warning(fam, "UD-Q4_K_XL", 8.0, 131072))       # nothing fits: no sentence (none approved for it)
+        self.assertIsNone(setup.own_path_context_warning(fam, "UD-Q4_K_XL", 0.0, 131072))       # no card known
 
 
 class InstallOwnPath(unittest.TestCase):
@@ -207,6 +229,29 @@ class InstallOwnPath(unittest.TestCase):
         a = self.cfg["args"]
         self.assertEqual(a[a.index("--max-context") + 1], "131072")
 
+    def test_a_12gb_card_gets_the_size_that_fits_and_a_bigger_choice_is_kept_with_the_warning(self):
+        # #5715: RTX 5070 12 GB; the menu marks 32K, --yes takes it
+        with mock.patch.object(setup, "ask", lambda question, choices, default, yes: default):     # Enter at every question
+            rc, out = self.install(model="UD-Q4_K_XL", vram=11.94, vision="no", yes=False)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("2) 32K tokens   (recommended for your GPU)", out)
+        self.assertIn("4) 128K tokens\n", out)
+        a = self.cfg["args"]
+        self.assertEqual(a[a.index("--max-context") + 1], "32768")
+        self.assertNotIn("will probably not start", out)
+        # a bigger choice is kept, with the sentence before the start
+        for ctx in (65536, 131072):
+            rc, out = self.install(model="UD-Q4_K_XL", vram=11.94, vision="no", context=ctx)
+            self.assertEqual(rc, 0, out)
+            a = self.cfg["args"]
+            self.assertEqual(a[a.index("--max-context") + 1], str(ctx))
+            self.assertIn(f"At {ctx // 1024}K, this model's conversation memory needs about", out)
+            self.assertIn("32K fits on this card: choose 32K or less.", out)
+        # a card where nothing fits: the smallest size is marked, no sentence
+        rc, out = self.install(model="UD-Q4_K_XL", vram=8.0, vision="no", context=131072)
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("will probably not start", out)
+
     def test_images_by_default_on_a_24gb_plus_nvidia_card_use_the_gpu_encoder(self):
         rc, out = self.install(model="UD-Q4_K_XL", vram=24.0)               # --yes: the question's default answer (yes)
         self.assertEqual(rc, 0, out)
@@ -308,7 +353,7 @@ class InstallOwnPath(unittest.TestCase):
         self.assertEqual(self.cfg["parallel"], 6)
         self.assertIn("recommended for this card: 4", out)
         self.assertIn("kept as you chose", out)
-        rc, out = self.install(model="UD-Q4_K_XL", vram=8.0, vision="no", parallel=4)
+        rc, out = self.install(model="UD-Q4_K_XL", vram=8.0, vision="no", parallel=4, context=131072)   # (8K, the 8 GB card's mark since #5715, has room for 2)
         self.assertEqual(self.cfg["parallel"], 4)
         self.assertIn("recommended for this card: one at a time", out)
         self.assertIn("kept as you chose", out)
@@ -339,7 +384,7 @@ class InstallOwnPath(unittest.TestCase):
         # a card with no room for a second session is not asked
         asked.clear()
         with mock.patch.object(setup, "ask", ask):
-            rc, out = self.install(model="UD-Q4_K_XL", vram=8.0, vision="no", yes=False)
+            rc, out = self.install(model="UD-Q4_K_XL", vram=8.0, vision="no", yes=False, context=131072)
         self.assertEqual(asked, [])
         self.assertNotIn("parallel", self.cfg)
 

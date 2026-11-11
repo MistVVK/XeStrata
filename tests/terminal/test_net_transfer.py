@@ -5,6 +5,7 @@ after bytes came is resumed; a link that trickles is never cut; 5 minutes (scale
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import os
 import tempfile
@@ -248,14 +249,14 @@ class Destination(Scaled):
     it had before the network rule ("... (PermissionError: ...)" / "(OSError: [Errno 28] No space left on device)"), not retried for 5 minutes;
     what was written stays, so freeing the space and fetching again resumes it."""
 
-    def fast_failure(self, url):
+    def fast_failure(self, url, end="); the partial file is kept and the next try resumes it", **kw):
         t0 = time.monotonic()
         with self.assertRaises(transfer.TransferError) as cm:
-            self.fetch(url)
+            self.fetch(url, **kw)
         self.assertLess(time.monotonic() - t0, 1.0)
         self.assertIs(type(cm.exception), transfer.TransferError, "a plain TransferError, as before: not an Interrupted that is retried")
         self.assertTrue(cm.exception.resumable)
-        self.assertTrue(str(cm.exception).endswith("); the partial file is kept and the next try resumes it"), str(cm.exception))
+        self.assertTrue(str(cm.exception).endswith(end), str(cm.exception))
         return str(cm.exception)
 
     def test_a_part_file_that_may_not_be_opened_fails_at_once(self):
@@ -319,13 +320,121 @@ class Destination(Scaled):
             return Full(f) if path.name == "f.part" else f
 
         with mock.patch.object(Path, "open", full_part):
-            said = self.fast_failure(srv.url("/e"))
+            said = self.fast_failure(srv.url("/e"), end="(OSError: [Errno 28] No space left on device)", what="the engine 0.1.59 (cuda)")
         kept = (self.dir / "f.part").read_bytes()
         self.assertTrue(0 < len(kept) < len(BODY), len(kept))
         self.assertEqual(kept, BODY[:len(kept)], "what was written is kept")
-        self.assertIn(f"after {len(kept)} of 10240 bytes (OSError: [Errno 28] No space left on device)", said)
+        self.assertTrue(said.startswith(f"The drive that holds {self.dir} is full, so the engine 0.1.59 (cuda) stopped downloading after 1 MB of "
+                                        "1 MB. It needs about 1 MB more there ("), said)
+        self.assertIn(" is free now). Free up space on that drive, then try again; the part already downloaded is kept and the next try "
+                      "continues from there.\n(OSError: [Errno 28] No space left on device)", said)
         self.assertEqual(self.fetch(srv.url("/e")).read_bytes(), BODY)       # room again: the next try resumes
         self.assertEqual(st["ranges"][-1], f"bytes={len(kept)}-")
+
+    def failing_write(self, err):
+        """Path.open for f.part that takes the first write and then raises OSError(err)."""
+        real_open = Path.open
+
+        class Fails:
+            def __init__(self, f):
+                self.f, self.n = f, 0
+
+            def write(self, data):
+                if self.n:
+                    raise OSError(err, os.strerror(err))
+                self.n += len(data)
+                return self.f.write(data)
+
+            def flush(self):
+                self.f.flush()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.f.close()
+
+        return lambda path, *a, **k: Fails(real_open(path, *a, **k)) if path.name == "f.part" else real_open(path, *a, **k)
+
+    @unittest.skipUnless(hasattr(errno, "EDQUOT"), "no EDQUOT here")
+    def test_a_used_up_quota_fails_at_once_in_plain_words(self):
+        srv = Server(ranged(chunk=2000, every=0.01)[0])
+        self.addCleanup(srv.close)
+        with mock.patch.object(Path, "open", self.failing_write(errno.EDQUOT)):
+            said = self.fast_failure(srv.url("/e"), end=f"(OSError: [Errno {errno.EDQUOT}] {os.strerror(errno.EDQUOT)})",
+                                     what="the picture reader")
+        self.assertTrue(said.startswith(f"Your storage quota on the drive that holds {self.dir} is used up, so the picture reader stopped "
+                                        "downloading after 1 MB of 1 MB. It needs about 1 MB more there. Delete files you no longer need, or ask "
+                                        "whoever looks after this computer for a larger quota, then try again; the part already downloaded is kept "
+                                        "and the next try continues from there.\n("), said)
+        self.assertGreater((self.dir / "f.part").stat().st_size, 0)
+
+    def test_a_read_only_drive_fails_at_once_in_plain_words_also_at_the_open(self):
+        srv = Server(ranged()[0])
+        self.addCleanup(srv.close)
+        real_open = Path.open
+
+        def ro(path, *a, **k):
+            if path.name == "f.part":
+                raise OSError(errno.EROFS, "Read-only file system")
+            return real_open(path, *a, **k)
+
+        with mock.patch.object(Path, "open", ro):           # before: an OSError at the open was an Interrupted, retried for 5 minutes
+            said = self.fast_failure(srv.url("/e"), end=f"(OSError: [Errno {errno.EROFS}] Read-only file system)")
+        self.assertTrue(said.startswith(f"The drive that holds {self.dir} can only be read right now, not written, so the file e could not be "
+                                        "saved there. Restart the computer and try again; if the drive stays read-only, check it for errors. "
+                                        f"Nothing was saved yet.\n(OSError: [Errno {errno.EROFS}] "), said)
+
+    def test_permission_keeps_its_words(self):
+        e = PermissionError(errno.EACCES, "Permission denied")
+        self.assertIsNone(transfer.no_room_words(e, self.dir / "f.part", 5, 10, "x"))
+        self.assertIsNone(transfer.no_room_words(OSError(errno.EIO, "I/O error"), self.dir / "f.part", 5, 10, "x"))
+        self.assertIsNone(transfer.no_room_words(ValueError("no"), self.dir / "f.part", 5, 10, "x"))
+
+
+class NoRoomWords(unittest.TestCase):
+    """The sentences themselves, with real-sized numbers (no transfer)."""
+    PART = Path("/home/ana/.local/share/strata/updates/partial/1f2e3d4c5b6a7980.part")
+
+    def words(self, err, got, size, free=None, what="the engine 0.1.59 (cuda)", **kw):
+        usage = mock.Mock(free=free) if free is not None else None
+        with mock.patch.object(transfer.shutil, "disk_usage", return_value=usage, side_effect=None if usage else OSError("gone")) as du:
+            said = transfer.no_room_words(OSError(err, os.strerror(err)), self.PART, got, size, what, **kw)
+        if err == errno.ENOSPC:
+            du.assert_called_once_with(str(self.PART.parent))
+        return said
+
+    def test_full(self):
+        self.assertEqual(self.words(errno.ENOSPC, 412_300_000, 1_930_000_000, free=0),
+                         f"The drive that holds {self.PART.parent} is full, so the engine 0.1.59 (cuda) stopped downloading after 412 MB of 1.9 GB. "
+                         "It needs about 1.5 GB more there (0 MB is free now). Free up space on that drive, then try again; the part already "
+                         f"downloaded is kept and the next try continues from there.\n(OSError: [Errno {errno.ENOSPC}] {os.strerror(errno.ENOSPC)})")
+
+    def test_full_free_space_unreadable_and_nothing_written_yet(self):
+        said = self.words(errno.ENOSPC, 0, 22_850_000_000)
+        self.assertIn("after 0 MB of 22.9 GB. It needs about 22.9 GB more there. Free up space on that drive, then try again; nothing was "
+                      "saved yet.\n(OSError:", said)
+
+    def test_windows_disk_full_codes(self):
+        for code in (112, 39):
+            e = OSError(errno.ENOSPC, "There is not enough space on the disk")
+            e.winerror = code
+            self.assertTrue(transfer.no_room_words(e, self.PART, 1, 2, "x").startswith("The drive that holds"))
+
+    @unittest.skipUnless(hasattr(errno, "EDQUOT"), "no EDQUOT here")
+    def test_quota(self):
+        said = self.words(errno.EDQUOT, 3_000_000_000, 5_200_000_000)
+        self.assertTrue(said.startswith(f"Your storage quota on the drive that holds {self.PART.parent} is used up, so the engine 0.1.59 (cuda) "
+                                        "stopped downloading after 3.0 GB of 5.2 GB. It needs about 2.2 GB more there."), said)
+
+    def test_read_only_with_a_kept_part(self):
+        said = self.words(errno.EROFS, 700_000_000, 1_930_000_000)
+        self.assertIn("so the engine 0.1.59 (cuda) could not be saved there. Restart the computer and try again; if the drive stays read-only, "
+                      "check it for errors. The part already downloaded is kept and the next try continues from there.\n(OSError:", said)
+
+    def test_the_generic_name_becomes_the_file_name(self):
+        said = self.words(errno.ENOSPC, 1, 2, what="the download", location="https://example.org/a/b/strata-0.1.59-cuda.zip")
+        self.assertIn(" is full, so the file strata-0.1.59-cuda.zip stopped downloading after ", said)
 
 
 if __name__ == "__main__":

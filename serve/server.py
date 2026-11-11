@@ -3889,6 +3889,20 @@ def drafting_vram_mib(cfg: dict, backend: str | None, archs) -> float | None:
         return None
 
 
+def own_path_context_warning(cfg: dict, args: list, vram_mib: float | None) -> str | None:
+    """The sentence for a Qwen3.6 start whose --max-context does not fit its one card (strata_control/own_path_fit.py, the rule setup's menu
+    uses); None for any other model, a context that fits, or a card that is not known.  Nothing about the start changes."""
+    try:
+        from strata_control import own_path_fit
+        fit = own_path_fit.from_model_name(cfg.get("model_name"))
+        if not fit or not vram_mib or "--max-context" not in args:
+            return None
+        ctx = int(args[args.index("--max-context") + 1])
+        return own_path_fit.warning(fit, float(vram_mib) / 1024, ctx, own_path_fit.MENU)
+    except Exception:                                        # noqa: BLE001 - an estimate that fails says nothing; the engine still says what does not fit
+        return None
+
+
 def mtp_retry_args(cfg: dict, exe: str | None, extra: list[str] | None = None) -> list[str] | None:
     """The arguments to start again with when an Auto start that picked DFlash2 ends before the engine is ready: the same start with the MTP (or no drafter, when
     the MTP layer is not on this computer). None when there is nothing to retry: the person named DFlash2 themselves (that start fails with its reason, as it
@@ -3963,6 +3977,10 @@ def engine_args(cfg: dict, exe: str | None = None, *, announce: bool = True) -> 
         fit_parallel, fit_note = None, ""
     if fit_note and announce:                                # (announce=False builds the arguments without any line)
         print(f"[strata] {fit_note}", flush=True)
+    if announce:                                             # #5715: Qwen3.6 with a context its card cannot hold: said before the start, nothing changed
+        too_big = own_path_context_warning(cfg, args, drafting_vram_mib(cfg, backend, archs))
+        if too_big:
+            print(f"[strata] {too_big}", flush=True)
     if fit_parallel is not None:
         cfg = {**cfg, "parallel": fit_parallel}
     # "mtp": false (the Models settings, `strata launch --mtp off`, or by hand): no draft layer, whatever the args say.  A setup run

@@ -6,7 +6,7 @@
  * about 10 GB left for the system; whatever is left is read from the SSD. The same rules setup uses to choose its low-RAM mode
  * (setup.py: low_ram_gpu_gb, LOW_RAM_HEADROOM_GB), so the page and the engine agree.
  */
-export interface FitInput { ram_needed_gb?: number; experts_gb?: number | null; memory_gb?: number; mem_total?: boolean; /** the weight files without the lookup table, when the catalog states them (DeepSeek: `memory_gb` is the CPU's share) */ fit_gb?: number | null }
+export interface FitInput { ram_needed_gb?: number; experts_gb?: number | null; memory_gb?: number; mem_total?: boolean; /** the weight files without the lookup table, when the catalog states them (DeepSeek: `memory_gb` is the CPU's share) */ fit_gb?: number | null; /** Qwen3.6: its own context rule (below) */ context_fit?: ContextFit | null }
 export interface FitHardware { ram_gb?: number | null; vram_gb?: number | null }
 export interface Fit {
   /** RAM + VRAM the version needs (the n-gram table not counted). */
@@ -44,12 +44,20 @@ export const BASE_CONTEXT = 32768;
 export function cacheGb(context: number, kv = 'int8'): number {
   return (121 + context * KV_LAYERS * (KV_BYTES[String(kv).toLowerCase()] ?? KV_BYTES.int8) * KV_FACTOR / 2 ** 20) / 1024;   // 121 MiB fixed per session
 }
+/** Qwen3.6-35B-A3B (its own engine path, #5715): the catalog's figures from strata_control/own_path_fit.py, the rule setup's context menu uses. Its cache
+ *  is fp32 for 11 layers, about 2.6x the Flash-Next int8 figure above, and fits a card when the fixed part plus the cache is at most the card's memory.
+ *  Pinned to the Python by tests/own-path-fit.test.mjs. */
+export interface ContextFit { bytes_per_token: number; fixed_gb: number }
+export function ownPathCacheGb(fit: ContextFit, context: number): number { return context * fit.bytes_per_token / 2 ** 30; }
+export function ownPathFits(fit: ContextFit, vramGb: number, context: number): boolean { return fit.fixed_gb + ownPathCacheGb(fit, context) <= vramGb; }
+/** The conversation cache of this model at this context: its own rule where the catalog gives one, else the Flash-Next figure. */
+export function contextCacheGb(context: number, kv = 'int8', fit?: ContextFit | null): number { return fit ? ownPathCacheGb(fit, context) : cacheGb(context, kv); }
 export interface CacheChoice { context: number; kv?: string; /** the drafter this run loads (resolveDrafter in lib/drafting.ts); absent: the MTP, as the `mtp` argument says */ drafter?: string }
 
 export function fitOn(v: FitInput, hw: FitHardware | null | undefined, mtp = true, cache?: CacheChoice | null): Fit {
   const memoryGb = memoryNeeded(v);
   // DENSE_GB already holds a 32K cache in the default format; the person's context and format replace it (#3832).
-  const denseGb = cache && cache.context > 0 ? Math.max(DENSE_GB - cacheGb(BASE_CONTEXT), 0) + cacheGb(cache.context, cache.kv) : DENSE_GB;
+  const denseGb = cache && cache.context > 0 ? Math.max(DENSE_GB - cacheGb(BASE_CONTEXT), 0) + contextCacheGb(cache.context, cache.kv, v.context_fit) : DENSE_GB;
   const ram = Number(hw?.ram_gb), vram = Number(hw?.vram_gb) || 0;
   if (!Number.isFinite(ram) || ram <= 0) return { memoryGb, vramUseGb: 0, ramUseGb: 0, spillGb: 0, known: false };
   const experts = Math.max(0, memoryNeeded(v) - DENSE_EXTRA_GB);

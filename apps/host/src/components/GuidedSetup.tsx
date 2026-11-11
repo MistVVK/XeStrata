@@ -16,7 +16,7 @@ import { installProgress, installStage, stageText, useDownloadEta, waitingText }
 import { VersionPicker } from './VersionPicker';
 import { contextIsTight, defaultContext } from '../lib/default-context';
 import { deepseekContexts } from '../lib/deepseek-context';
-import { cacheGb } from '../lib/native-fit';
+import { contextCacheGb } from '../lib/native-fit';
 import { FirstRunLanguage } from './FirstRunLanguage';
 import { DownloadParts } from './DownloadParts';
 import { EngineWarning } from './EngineWarning';
@@ -224,7 +224,7 @@ export function GuidedSetup() {
    {tr(step === 2 ? <div className="onboard-model-stage">
     {tr(selectedFamily ? <>
      <div className="onboard-model-top"><div className="onboard-model-picker"><span className="onboard-control-label">{tr("Model")}</span><div><span className="onboard-model-symbol"><Icon name="models" size={23}/></span><Select ariaLabel={tr("Setup model")} value={selectedFamily.family} options={families.map(f => ({ value: f.family, label: f.title }))} onChange={value => chooseNative(value, '')}/></div></div><div className="onboard-context"><span className="onboard-control-label">{tr("Conversation context")}</span><Select ariaLabel={tr("Setup conversation context")} value={String(context)} options={contextList.map(n => ({ value: String(n), label: `${n / 1024}K` }))} onChange={value => { setContextTouched(true); setContext(Number(value)); }}/></div></div>
-     {tr(contextIsTight(topCardGb, context) ? <p className="small muted native-spill-note"><Icon name="warning" size={16}/>{tr("This much context takes about {0} GB of graphics memory and leaves little room for the model on this card. Strata will try it; if it does not start, choose a shorter context.", [cacheGb(context).toFixed(1)])}</p> : null)}
+     {tr(contextIsTight(topCardGb, context, 'int8', version?.context_fit) ? <p className="small muted native-spill-note"><Icon name="warning" size={16}/>{tr("This much context takes about {0} GB of graphics memory and leaves little room for the model on this card. Strata will try it; if it does not start, choose a shorter context.", [contextCacheGb(context, 'int8', version?.context_fit).toFixed(1)])}</p> : null)}
      <OnboardingMemory hardware={hardware} native={native?.hardware}/>{tr(!version || version.needsNewerEngine ? <p className="small muted">{tr("This model needs a newer engine. Update your engine or import a local GGUF for this model.")}</p> : null)}
      <div className="onboard-version-heading"><strong>{tr("Choose a version")}</strong><span>{tr(version ? `${catalogVersionLabel(version)} selected` : '')}</span></div>
      {tr(version?.multi_file ? <DeepSeekNote version={version} plan={plan}/> : null)}

@@ -18,7 +18,8 @@ const DESIGN_VERSIONS = [
 const DESIGN_FAMILIES = [
  {id:'qwen38',family:'Qwen3.8-Flash-Next',params:30.5,contextMax:1048576,layerCount:48,experts:128,kvKbPerToken:24},
  // Architecture metadata follows Qwen's config; file sizes and speeds remain illustrative.
- {id:'qwen36',family:'Qwen3.6-35B-A3B',params:35,contextMax:262144,layerCount:40,experts:256,kvKbPerToken:20},
+ // kvKbPerToken: 47,104 B per token (strata_control/own_path_fit.py BYTES_PER_TOKEN: fp32 K / V of 11 layers + the fp16 copy, #5715)
+ {id:'qwen36',family:'Qwen3.6-35B-A3B',params:35,contextMax:262144,layerCount:40,experts:256,kvKbPerToken:46},
 ];
 const BUILT_IN_VARIANTS = process.env.STRATA_REAL_ENGINE === '1' ? REAL_VARIANTS : DESIGN_FAMILIES.flatMap(f=>DESIGN_VERSIONS.map(([quant,name,bits])=>{
  const diskGb=Math.round(f.params*bits/8*10)/10;

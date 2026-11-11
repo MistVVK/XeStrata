@@ -59,13 +59,13 @@ test('6: the conversation context opens at 128K for every configuration, or the 
   assert.match(models, /useKept\('models\.context', DEFAULT_CONTEXT\)/);
   assert.ok(!/rec\.context/.test(models), 'the engine recommendation is not what the page opens with');
   assert.match(models, /setContext\(defaultContext\(first\?\.multi_file \? deepseekContexts\(\) : native\.catalog\.contexts\)\)/, 'DeepSeek too, from its own list');
-  assert.match(models, /contextIsTight\(fitHardware\.vram_gb, context, kv\) \? <p className="small muted native-spill-note"><Icon name="warning"/);
+  assert.match(models, /contextIsTight\(fitHardware\.vram_gb, context, kv, selectedSize\?\.context_fit\) \? <p className="small muted native-spill-note"><Icon name="warning"/);
   assert.ok(!/setContext\([^)]*contextIsTight/.test(models), 'the warning never changes the context');
   assert.match(models, /cache=\{\{ context, kv, drafter: fitDrafter \}\}/, 'the version list follows the chosen context, as the card does');
   const guided = read('src/components/GuidedSetup.tsx');
   assert.match(guided, /const context = pickedContext \?\? defaultContext\(contextList\)/, 'first-run opens at 128K on every card too');
   assert.ok(!/OLD_DEFAULT_CONTEXT|contextIsTight\(topCardGb, DEFAULT_CONTEXT/.test(guided), 'no fallback to 32K on a tight card');
-  assert.match(guided, /contextIsTight\(topCardGb, context\) \? <p className="small muted native-spill-note">/, 'the same inline warning, nothing lowered');
+  assert.match(guided, /contextIsTight\(topCardGb, context, 'int8', version\?\.context_fit\) \? <p className="small muted native-spill-note">/, 'the same inline warning, nothing lowered');
 });
 
 test('7 and 8: Model files has no explanatory sentence and holds "Other local models..." beside Storage settings', () => {

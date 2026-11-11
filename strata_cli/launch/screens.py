@@ -31,6 +31,27 @@ STEPS = (("model", "Model"), ("cards", "Cards"), ("folder", "Folder"), ("context
 STEP_LABELS = {**dict(STEPS), "speed": "Speed", "drafting": "Drafting"}
 
 
+def middle_shorten(text: str, width: int, dots: str = "…") -> str:
+    """`text` in at most `width` terminal cells: when longer, its start and its end with `dots` between them (the drive and the folder's own
+    name stay readable). Unchanged when it fits; at least the dots and one character on each side."""
+    from rich.cells import cell_len
+    if cell_len(text) <= width:
+        return text
+    room = max(2, width - cell_len(dots))
+    head_n = max(1, room * 2 // 5)
+    tail_n = max(1, room - head_n)
+    head, tail = "", ""
+    for ch in text:                                  # by cells, so wide characters count twice
+        if cell_len(head + ch) > head_n:
+            break
+        head += ch
+    for ch in reversed(text):
+        if cell_len(ch + tail) > tail_n:
+            break
+        tail = ch + tail
+    return head + dots + tail
+
+
 def speed_choice_available(ctx) -> bool:
     """The Speed step is an active choice only when the DeepSeek engine launch will run takes --experts (0.1.50 or newer); otherwise it is not
     there, with no error. Asked once per run of the screens (the engine files are looked up once)."""
@@ -1697,6 +1718,8 @@ class SaveScreen(Base):
             t.append("  Name   ")
             t.append("(type below)\n", style=MUTE)
             for k, v in lines:
+                if k == "Storage":   # one row: a long folder wrapped and pushed the last choice off an 80x24 screen
+                    v = middle_shorten(v, self.width() - 14, "…" if self.g.unicode else "...")
                 t.append(f"  {k:<10}{v}\n")
             for n in warnings:
                 t.append(f"  ! {n}\n", style=WARN)

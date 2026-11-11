@@ -625,7 +625,16 @@ class Strata:
         return {"about": d["models"][model]["about"], "download_gb": round(size_gb, 1), "ram_gb": d["models"][model]["ram_gb"],
                 # the routed experts are ~93% of the file (setup.own_path_parallel_fits_all); the dense part and buffers ~1 GB more
                 "arena_gb": round(size_gb * 0.93, 1), "vision": bool(d.get("vision", True)),
-                "engine": OWN_PATH_ENGINE, "families": (family,)}
+                "engine": OWN_PATH_ENGINE, "families": (family,), "context_fit": self.own_context_fit(d, model)}
+
+    @staticmethod
+    def own_context_fit(fam: dict, model) -> dict | None:
+        """Which context fits a card for this own-path size (#5715): strata_control/own_path_fit.py's inputs, the figures the app's estimate uses."""
+        try:
+            from strata_control import own_path_fit
+            return own_path_fit.inputs(fam.get("name"), model)
+        except ImportError:
+            return None
 
     def sizes_of(self, models, family) -> list:
         """The family's sizes as setup lists them: an experimental one last (never the default)."""
@@ -1415,6 +1424,9 @@ class Strata:
                               # with the update step when the installed one is older. None: any engine that setup accepts.
                               "engine_min": ".".join(map(str, d["engine"])) if d.get("engine") else None,
                               "memory_gb": memory_gb, "fit_gb": fit_gb,
+                              # Qwen3.6: the conversation memory per token and what the card holds before it (strata_control/own_path_fit.py,
+                              # #5715): the app's context estimate and its warning use these; absent for every other model
+                              **({"context_fit": d["context_fit"]} if d.get("context_fit") else {}),
                               "on_this_pc": verdict, "installed": tag in have, "id": tag,
                               # DeepSeek only: does the engine's `--experts auto` give 5 here? (strata_control/dsv41_fit.py rdna4_faster: one RDNA4 card, or
                               # several holding half of the experts); the app's Speed label says so. None: the app's own rules (16 GiB, integrated) decide.
@@ -2446,6 +2458,9 @@ class Tools:
             usable = s.engine_gpus(hw)
             vram = max((g["vram_gb"] for g in usable), default=12)
             context = 131072                          # 128K on every card (owner, 2026-11-01; strata_control/default_context.py)
+            own = (getattr(s.setup_module(), "OWN_PATH_FAMILIES", None) or {}).get(family)
+            if own:                                   # Qwen3.6: the largest size that fits the card when 128K does not (#5715, setup's own rule)
+                context = s.setup_module().own_path_context(own, max((g["vram_gb"] for g in usable), default=0.0), model)
         if vision in ("yes", "gpu", "cpu") and md.get("vision", families[family].get("vision")) is False:
             raise ToolError(f"images are not available with {families[family]['title']} {model} yet: use vision=no")
         if vision is None:

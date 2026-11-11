@@ -25,6 +25,7 @@
 #include "strata/kernels/native_router.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/qwen35/context_fit.hpp"
 #include "strata/qwen35/engine.hpp"
 #include "strata/qwen35/sampling.hpp"
 #include "q36_kernels.cuh"
@@ -1467,6 +1468,26 @@ struct Engine {
                              "free): use fewer slots (\"parallel\" / --batch) or a shorter --max-context\n", n_sess, ctx,
                              (double) per / (1 << 30), (double) fr0 / (1 << 30));
                 std::exit(1);
+            }
+            if (n_sess == 1) {   // #5715: one session whose context cannot fit, said in words before the allocation fails
+                const size_t shared_tok = (size_t) g.n_head_kv * g.head_dim * 2 * 2;   // the fp16 K / V copy (k16 / v16 above)
+                const size_t kv_tok = (size_t) (g.n_head_kv * g.head_dim * 2 * 4) * n_attn;
+                const size_t ne = (size_t) g.n_expert;
+                size_t total_main = 0, max_layer = 0, packed = 0;
+                for (const Layer& L : m->layers) {
+                    total_main += L.stride * ne + kMmqTail;
+                    max_layer = std::max(max_layer, L.stride * ne);
+                }
+                if (m->has_mtp) max_layer = std::max(max_layer, m->mtp.stride * ne);
+                for (const auto& pk : m->packed) packed += std::get<2>(pk);
+                const strata::qwen35::OneSessionFit f = strata::qwen35::one_session_fit(
+                    {(size_t) ctx, kv_tok, shared_tok, per - kv_tok * (size_t) ctx, fr0, total_main, packed,
+                     kAttScoreFloats > ((size_t) 16 << 20) ? (kAttScoreFloats - ((size_t) 16 << 20)) * 6 : 0,
+                     use_mmq ? 2 * (max_layer + kMmqTail) : 0, T * Kp * N * 4 + T * Kp * 4});
+                if (f.refuse) {   // the old ending: the bare cudaMalloc line in alloc_session, or the hybrid buffers' text in place_experts
+                    std::fprintf(stderr, "strata-q36: %s\n", strata::qwen35::one_session_fit_line(ctx, f).c_str());
+                    std::exit(1);
+                }
             }
         }
         for (Sess& ss : sess) alloc_session(ss);

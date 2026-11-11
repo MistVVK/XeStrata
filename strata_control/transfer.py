@@ -16,6 +16,7 @@ import http.client
 import ipaddress
 import os
 import re
+import shutil
 import threading
 import time
 import email.utils
@@ -43,6 +44,68 @@ _DEST_OPEN_ERRORS = (PermissionError, IsADirectoryError, NotADirectoryError, Fil
 def _destination(exc: BaseException) -> BaseException:
     exc.strata_destination = True        # read in _transfer: a plain TransferError, not an Interrupted
     return exc
+
+
+# The sentence for a .part file that cannot be written because its drive is full, over quota or read-only (owner 11-11: plain words, which
+# folder, how much more, that the part is kept). The error's own words stay at the end in brackets, as before, for a report.
+# Owner-approved wording (11-11, par\OWNER-WORDING-1111.md): no word changes without a new approval.
+NO_ROOM_WORDS = {
+    "full": "The drive that holds {folder} is full, so {what} stopped downloading after {got} of {size}. It needs about {need} more there{free}. "
+            "Free up space on that drive, then try again; {kept}.",
+    "free": " ({free} is free now)",
+    "quota": "Your storage quota on the drive that holds {folder} is used up, so {what} stopped downloading after {got} of {size}. It needs about "
+             "{need} more there. Delete files you no longer need, or ask whoever looks after this computer for a larger quota, then try again; "
+             "{kept}.",
+    "read_only": "The drive that holds {folder} can only be read right now, not written, so {what} could not be saved there. Restart the computer "
+                 "and try again; if the drive stays read-only, check it for errors. {kept_cap}.",
+    "kept": "the part already downloaded is kept and the next try continues from there",
+    "none_kept": "nothing was saved yet",
+}
+
+
+def _size_words(n: int) -> str:
+    """Bytes for a person: "1.9 GB", "412 MB"; "1 MB" for any non-zero amount below it, "0 MB" for none."""
+    if n <= 0:
+        return "0 MB"
+    return f"{n / 1e9:.1f} GB" if n >= 1e9 else f"{max(1, round(n / 1e6))} MB"
+
+
+def _no_room_kind(exc: BaseException) -> str | None:
+    """"full", "quota" or "read_only" for a destination error that has its own sentence; None for any other (no permission keeps its words)."""
+    if not isinstance(exc, OSError):
+        return None
+    if exc.errno == errno.ENOSPC or getattr(exc, "winerror", None) in (112, 39):    # ERROR_DISK_FULL, ERROR_HANDLE_DISK_FULL
+        return "full"
+    if getattr(errno, "EDQUOT", None) is not None and exc.errno == errno.EDQUOT:
+        return "quota"
+    if exc.errno == errno.EROFS:
+        return "read_only"
+    return None
+
+
+def no_room_words(exc: BaseException, partial: Path, got: int, size: int, what: str, location: str = "") -> str | None:
+    """The plain sentence for a full / over-quota / read-only destination, ending with the error's own words; None for any other error.
+    `what` names the file ("the engine 0.1.59 (cuda)"); the generic "the download" becomes "the file <name>". The free space is read once,
+    here, and left out when it cannot be read."""
+    kind = _no_room_kind(exc)
+    if kind is None:
+        return None
+    folder = str(Path(partial).parent)
+    if not what or what == "the download":
+        name = urllib.parse.urlparse(location).path.rsplit("/", 1)[-1] if location else ""
+        what = f"the file {name}" if name else "the download"
+    free = ""
+    if kind == "full":
+        try:
+            free = NO_ROOM_WORDS["free"].format(free=_size_words(shutil.disk_usage(folder).free))
+        except (OSError, ValueError):
+            free = ""
+    kept = NO_ROOM_WORDS["kept" if got > 0 else "none_kept"]
+    said = NO_ROOM_WORDS[kind].format(folder=folder, what=what, got=_size_words(got), size=_size_words(size),
+                                      need=_size_words(max(0, size - got)), free=free, kept=kept, kept_cap=kept[:1].upper() + kept[1:])
+    return f"{said}\n({type(exc).__name__}: {exc})"      # on a line of its own: a terminal never breaks it in two
+
+
 SMALL_LIMIT = 8 << 20
 ENV_ALLOW_HTTP = "STRATA_UPDATE_ALLOW_HTTP"
 
@@ -351,6 +414,7 @@ def _transfer(location, partial: Path, have: int, size: int, progress, cancel, t
         said = (f"the download of {location} was interrupted after {got} of {size} bytes "
                 f"({type(exc).__name__}: {reason}); the partial file is kept and the next try resumes it")
         if getattr(exc, "strata_destination", False):     # the .part cannot be written (a full disk, no permission): at once, as before
+            said = no_room_words(exc, partial, got, size, what, location) or said     # full / quota / read-only: in plain words
             raise TransferError(said, resumable=True) from None
         raise Interrupted(said, resumable=True) from None
 
@@ -375,6 +439,10 @@ def _copy(source, partial: Path, mode: str, done: int, size: int, progress, canc
         opened = partial.open(mode)
     except _DEST_OPEN_ERRORS as exc:                       # the .part cannot be written here at all
         raise _destination(exc)
+    except OSError as exc:                                 # nor on a full or read-only drive (EROFS at the open was retried for 5 minutes)
+        if exc.errno in _DEST_ERRNOS or _no_room_kind(exc):
+            raise _destination(exc)
+        raise
 
     def put(out, data) -> None:
         try:

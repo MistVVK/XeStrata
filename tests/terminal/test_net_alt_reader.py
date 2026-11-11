@@ -3,8 +3,8 @@
 The rule (setup.ALT_READERS, setup.accepted_alt_reader, setup.resolve_reader; the plan asks the same function through modelstate.reader_present):
   * only a file named mmproj-F16.gguf with the pinned size AND SHA-256, in a place where setup already looks for the pinned reader;
   * only when no pinned BF16 file is found anywhere (the pinned file always wins); anything else with that name is ignored, as before;
-  * never downloaded, never deleted, never given a mark beside it: the SHA-256 is remembered in Strata's marks/ (keyed by real path, size and
-    modification time, so a replaced file is hashed again);
+  * never downloaded, never deleted, never given a mark beside it: the SHA-256 is remembered in Strata's marks/ (keyed by real path, size,
+    modification time and change time, so a replaced file is hashed again, also one rewritten in place with size and time kept);
   * the plan hashes without writing a mark and says nothing.
 The tests use a small stand-in file and patch the pin; one test holds the real pin."""
 
@@ -15,6 +15,7 @@ import hashlib
 import io
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -185,6 +186,46 @@ class Replaced(Base):
         self.assertIn("is a different file", said)
         self.assertEqual(hashed, [ALT], "hashed again")
         self.assertEqual(self.plan(), (False, ""))
+
+    def test_a_rewrite_in_place_that_keeps_size_and_modification_time_is_hashed_again_and_refused(self):
+        f = self.own / ALT
+        f.write_bytes(GOOD)
+        self.assertEqual(self.start()[0], "alt")
+        self.assertEqual(len(self.marks()), 1)
+        hashed = self.hashes()
+        stat = f.stat()
+        time.sleep(0.05)                                         # past the file system clock step (a kernel tick on Linux)
+        with open(f, "r+b") as fh:                               # the same file, rewritten in place (no new file, no rename)
+            fh.write(BAD)
+        os.utime(f, ns=(stat.st_atime_ns, stat.st_mtime_ns))     # the old modification time put back
+        self.assertEqual((f.stat().st_size, f.stat().st_mtime_ns), (stat.st_size, stat.st_mtime_ns), "size and modification time as before")
+        kind, _path, said = self.start()
+        self.assertEqual(kind, "fetch")
+        self.assertIn("is a different file", said)
+        self.assertEqual(hashed, [ALT], "hashed again")
+        self.assertEqual(self.plan(), (False, ""))
+
+    def test_the_change_time_moves_on_such_a_rewrite_on_this_system(self):
+        f = self.own / ALT
+        f.write_bytes(GOOD)
+        st = f.stat()
+        before = self.mod._change_time_ns(f, st)
+        time.sleep(0.05)                                         # past the file system clock step (a kernel tick on Linux)
+        with open(f, "r+b") as fh:
+            fh.write(BAD)
+        os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.assertNotEqual(self.mod._change_time_ns(f, f.stat()), before)
+        if os.name == "nt":                                      # Windows: the file system's ChangeTime, not os.stat's ctime (the creation time)
+            self.assertNotEqual(self.mod._change_time_ns(f, f.stat()), f.stat().st_ctime_ns)
+
+    def test_other_kept_marks_keep_their_key(self):
+        f = self.own / "model-00001-of-00002.gguf"
+        f.write_bytes(b"shard")
+        st = f.stat()
+        key = f"{f.resolve()}|{st.st_size}|{st.st_mtime_ns}"
+        self.assertEqual(self.mod._kept_mark(f).name, hashlib.sha1(key.encode()).hexdigest()[:24] + ".done",
+                         "the key of every other kept mark (an Engram's too) is unchanged, so no mark made before is lost")
+        self.assertNotEqual(self.mod._alt_reader_mark(f), self.mod._kept_mark(f))
 
     def test_a_changed_size_has_no_mark_either(self):
         f = self.own / ALT
