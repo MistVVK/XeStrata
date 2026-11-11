@@ -2,7 +2,11 @@
 #include "strata/spec/draft_policy.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 
 namespace strata::spec {
 namespace {
@@ -26,10 +30,255 @@ constexpr int kProbes = 3;       // a lookup window size is tried this often bef
 // one stretch (a prompt's cache refill, say) and, priced high, it would never be measured again (#1252)
 constexpr double kStaleRounds = 300.0;
 
+// STRATA_SPEC_FIXED=1 and STRATA_SPEC_FIXED_TABLE="T1,T2,.." (round ms of windows of 1, 2, .. rows): an expert's fixed table for every
+// context bucket, read once per process (the measured table of --draft-costs is the normal source).
+struct FixedEnv {
+    bool on = false;
+    double ms[DraftPolicy::kMaxT] = {};
+    int n = 0;
+};
+const FixedEnv& fixed_env() {
+    static const FixedEnv cfg = [] {
+        FixedEnv c;
+        const char* e = std::getenv("STRATA_SPEC_FIXED");
+        c.on = e != nullptr && e[0] == '1';
+        if (const char* tab = std::getenv("STRATA_SPEC_FIXED_TABLE"); c.on && tab != nullptr && tab[0] != '\0') {
+            for (const char* q = tab; *q != '\0' && c.n < DraftPolicy::kMaxT;) {
+                c.ms[c.n++] = std::atof(q);
+                while (*q != '\0' && *q != ',') ++q;
+                if (*q == ',') ++q;
+            }
+        }
+        return c;
+    }();
+    return cfg;
+}
+
+double trimmed_mean(std::vector<float> v) {
+    std::sort(v.begin(), v.end());
+    const size_t k = (size_t) ((double) v.size() * CostLearner::kTrim);
+    double s = 0.0;
+    size_t n = 0;
+    for (size_t i = k; i + k < v.size(); ++i, ++n) s += v[i];
+    if (n == 0) {
+        for (const float x : v) s += x;
+        n = v.size();
+    }
+    return n > 0 ? s / (double) n : 0.0;
+}
+
+double median_of(std::vector<float> v) {
+    if (v.empty()) return 0.0;
+    std::nth_element(v.begin(), v.begin() + (std::ptrdiff_t) (v.size() / 2), v.end());
+    return v[v.size() / 2];
+}
+
 }  // namespace
 
+// ---------------------------------------------------------------------------------------------------- CostLearner
+
+static_assert(CostLearner::kMaxT == DraftPolicy::kMaxT && CostLearner::kCtxBuckets == DraftPolicy::kCtxBuckets, "one table shape");
+
+void CostLearner::add(int bucket, int t, double ms) {
+    if (!(ms > 0.0) || !std::isfinite(ms)) return;
+    bucket = std::clamp(bucket, 0, kCtxBuckets - 1);
+    t = std::clamp(t, 1, kMaxT);
+    ++rounds_;
+    auto& v = s_[(size_t) bucket][(size_t) t];
+    if ((int) v.size() < kKeep) v.push_back((float) ms);
+}
+
+void CostLearner::reset() {
+    for (auto& b : s_)
+        for (auto& v : b) v.clear();
+    rounds_ = 0;
+}
+
+int CostLearner::samples(int bucket, int t) const {
+    if (bucket < 0 || bucket >= kCtxBuckets || t < 1 || t > kMaxT) return 0;
+    return (int) s_[(size_t) bucket][(size_t) t].size();
+}
+
+std::vector<double> CostLearner::table(int bucket, int min_n) const {
+    std::vector<double> out;
+    if (bucket < 0 || bucket >= kCtxBuckets) return out;
+    const auto& b = s_[(size_t) bucket];
+    int top = 0;
+    std::array<double, kMaxT + 1> got{};
+    std::vector<int> seen;
+    for (int t = 1; t <= kMaxT; ++t) {
+        if (!b[(size_t) t].empty()) top = t;
+        if ((int) b[(size_t) t].size() >= std::max(1, min_n)) {
+            got[(size_t) t] = trimmed_mean(b[(size_t) t]);
+            seen.push_back(t);
+        }
+    }
+    if (top == 0 || seen.empty()) return out;
+    for (int t = 1; t <= top; ++t) {
+        if (got[(size_t) t] > 0.0) {
+            out.push_back(got[(size_t) t]);
+            continue;
+        }
+        int lo = 0, hi = 0;
+        for (const int u : seen) {
+            if (u < t) lo = u;
+            if (u > t && hi == 0) hi = u;
+        }
+        if (lo > 0 && hi > 0) out.push_back(got[(size_t) lo] + (got[(size_t) hi] - got[(size_t) lo]) * (t - lo) / (double) (hi - lo));
+        else {
+            const int u = hi > 0 ? hi : lo;
+            out.push_back(got[(size_t) u] * kShape[t] / kShape[u]);
+        }
+    }
+    return out;
+}
+
+CostLearner::Verdict CostLearner::check(int64_t min_rounds, int min_n) const {
+    Verdict v;
+    char b[160];
+    bool any = false, every_bucket_ok = true;
+    for (int k = 0; k < kCtxBuckets; ++k) {
+        bool has = false, measured = false;
+        double prev_ms = 0.0;
+        int prev_t = 0;
+        for (int t = 1; t <= kMaxT; ++t) {
+            const auto& s = s_[(size_t) k][(size_t) t];
+            has = has || !s.empty();
+            if ((int) s.size() < std::max(1, min_n)) continue;
+            measured = true;
+            const double tm = trimmed_mean(s);
+            if (prev_t > 0 && tm < prev_ms * (1.0 - kOrderSlack) && v.why.empty()) {
+                std::snprintf(b, sizeof b, "bucket %d: T%d %.2f ms below T%d %.2f ms", k, t, tm, prev_t, prev_ms);
+                v.disturbed = true;
+                v.why = b;
+            }
+            prev_ms = tm;
+            prev_t = t;
+            if ((int) s.size() < 2 * std::max(1, min_n)) continue;
+            const size_t h = s.size() / 2;
+            const double a = trimmed_mean(std::vector<float>(s.begin(), s.begin() + (std::ptrdiff_t) h));
+            const double c = trimmed_mean(std::vector<float>(s.begin() + (std::ptrdiff_t) h, s.end()));
+            if (a > 0.0 && std::fabs(c - a) / a > kDriftMax && v.why.empty()) {
+                std::snprintf(b, sizeof b, "bucket %d: T%d first half %.2f ms, second half %.2f ms", k, t, a, c);
+                v.disturbed = true;
+                v.why = b;
+            }
+            const double med = median_of(s);
+            size_t spikes = 0;
+            for (const float x : s) spikes += x > 2.0 * med ? 1 : 0;
+            if ((double) spikes > kSpikeMax * (double) s.size() && v.why.empty()) {
+                std::snprintf(b, sizeof b, "bucket %d: T%d %zu of %zu rounds above twice the median %.2f ms", k, t, spikes, s.size(), med);
+                v.disturbed = true;
+                v.why = b;
+            }
+        }
+        any = any || measured;
+        if (has && !measured) every_bucket_ok = false;
+    }
+    v.ready = rounds_ >= min_rounds && any && every_bucket_ok;
+    return v;
+}
+
+// ---------------------------------------------------------------------------------------------------- the table file
+
+namespace {
+constexpr const char* kCostFileHead = "strata-draft-costs 1";
+// the path as UTF-8 (the server passes it so); on Windows a plain std::string would be read in the ANSI code page
+std::filesystem::path utf8_path(const std::string& s) { return std::filesystem::path(std::u8string(s.begin(), s.end())); }
+std::string one_line(std::string s) {
+    for (char& c : s)
+        if (c == '\n' || c == '\r') c = ' ';
+    return s;
+}
+}  // namespace
+
+bool read_cost_file(const std::string& path, const std::string& key, CostFile& out, std::string& why) {
+    out = CostFile{};
+    std::ifstream f(utf8_path(path), std::ios::binary);
+    if (!f) { why = "no table file yet"; return false; }
+    std::string line;
+    if (!std::getline(f, line) || line != kCostFileHead) { why = "not a table file of this format"; return false; }
+    if (!std::getline(f, line) || line.rfind("key ", 0) != 0) { why = "the file has no key"; return false; }
+    if (line.substr(4) != one_line(key)) { why = "learned on another machine or with other settings"; return false; }
+    bool ended = false, any = false;
+    while (std::getline(f, line)) {
+        if (line == "end") { ended = true; break; }
+        int b = -1, used = 0;
+        if (std::sscanf(line.c_str(), "bucket %d %n", &b, &used) < 1 || used == 0 || b < 0 || b >= CostLearner::kCtxBuckets) {
+            why = "a malformed line";
+            return false;
+        }
+        std::vector<double> v;
+        const char* q = line.c_str() + used;
+        while (*q != '\0') {
+            char* e = nullptr;
+            const double x = std::strtod(q, &e);
+            if (e == q || !(x > 0.0) || !(x < 1e5)) { why = "a malformed table"; return false; }
+            v.push_back(x);
+            q = e;
+            if (*q == ',') ++q;
+            else if (*q != '\0') { why = "a malformed table"; return false; }
+        }
+        if (v.empty() || (int) v.size() > CostLearner::kMaxT) { why = "a table of the wrong length"; return false; }
+        out.tables[(size_t) b] = std::move(v);
+        any = true;
+    }
+    if (!ended || !any) { why = "the file is cut short"; return false; }
+    out.key = key;
+    return true;
+}
+
+bool write_cost_file(const std::string& path, const CostFile& c, std::string& why) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path p = utf8_path(path);
+    if (p.has_parent_path()) fs::create_directories(p.parent_path(), ec);
+    if (ec) { why = "could not make the folder (" + ec.message() + ")"; return false; }
+    fs::path tmp = p;
+    tmp += ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) { why = "could not write the file"; return false; }
+        f << kCostFileHead << "\nkey " << one_line(c.key) << "\n";
+        char b[32];
+        for (int k = 0; k < CostLearner::kCtxBuckets; ++k) {
+            if (c.tables[(size_t) k].empty()) continue;
+            f << "bucket " << k << " ";
+            for (size_t i = 0; i < c.tables[(size_t) k].size(); ++i) {
+                std::snprintf(b, sizeof b, "%s%.3f", i ? "," : "", c.tables[(size_t) k][i]);
+                f << b;
+            }
+            f << "\n";
+        }
+        f << "end\n";
+        f.flush();
+        if (!f) { why = "could not write the file"; fs::remove(tmp, ec); return false; }
+    }
+    fs::rename(tmp, p, ec);   // replaces an older file whole (MoveFileEx with REPLACE_EXISTING on Windows)
+    if (ec) { why = "could not replace the file (" + ec.message() + ")"; fs::remove(tmp, ec); return false; }
+    return true;
+}
+
+// ---------------------------------------------------------------------------------------------------- DraftPolicy
+
 DraftPolicy::DraftPolicy(int max_t, double margin)
-    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin) {}
+    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin) {
+    const FixedEnv& f = fixed_env();
+    if (f.on)
+        for (int k = 0; k < kCtxBuckets; ++k) set_fixed_costs(f.n > 0 ? f.ms : nullptr, f.n, k);
+}
+
+void DraftPolicy::set_fixed_costs(const double* ms, int n, int bucket) {
+    fixed_ = true;
+    held_.clear();
+    if (ms == nullptr || n <= 0) return;
+    bucket = std::clamp(bucket, 0, kCtxBuckets - 1);
+    for (int t = 1; t <= kMaxT; ++t) {   // the table replaces what was measured; sizes past its end scale from it (cost_ms)
+        const bool in = t <= n && ms[t - 1] > 0.0;
+        cost_[bucket][t] = in ? ms[t - 1] : 0.0;
+        cost_n_[bucket][t] = in ? 1e6 : 0.0;
+    }
+}
 
 void DraftPolicy::set_sizes(unsigned mask) { sizes_ = mask | 2u; }
 
@@ -127,7 +376,7 @@ std::string DraftPolicy::cost_table_text() const {
     return out;
 }
 
-bool DraftPolicy::stale(int t) const { return cost_n_[bk_][t] > 0 && rounds_ - last_[bk_][t] > kStaleRounds; }
+bool DraftPolicy::stale(int t) const { return !fixed_ && cost_n_[bk_][t] > 0 && rounds_ - last_[bk_][t] > kStaleRounds; }
 
 double DraftPolicy::mtp_tokens(int t) const {
     if (mtp_n_[t] > 0) return mtp_tok_[t];
@@ -159,7 +408,7 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
     }
     // a guessed cost can keep the policy from ever measuring a size: the first few times a confident lookup would
     // need a size not measured yet, it is tried (verification keeps the output; only the one round's speed is at stake)
-    if (t_full > p.t && t_full > 1 && (cost_n_[bk_][t_full] - delayed_n_[bk_][t_full] + tried_[bk_][t_full] < kProbes || stale(t_full)) && q >= 0.85) {
+    if (!fixed_ && t_full > p.t && t_full > 1 && (cost_n_[bk_][t_full] - delayed_n_[bk_][t_full] + tried_[bk_][t_full] < kProbes || stale(t_full)) && q >= 0.85) {
         p.lookup = true;
         p.t = t_full;
     }
@@ -168,7 +417,8 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
 
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
     t = std::clamp(t, 1, kMaxT);
-    if (round_ms > 0) {
+    if (learning_ && round_ms > 0) learner_.add(bk_, t, round_ms);
+    if (round_ms > 0 && !fixed_) {
         round_ms = clamp_sample(t, round_ms);
         const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
         cost_[bk_][t] = cost_n_[bk_][t] > 0 ? (1.0 - alpha) * cost_[bk_][t] + alpha * round_ms : round_ms;
@@ -204,7 +454,7 @@ void DraftPolicy::observe_committed(bool lookup, int t, int accepted, int match)
 }
 
 void DraftPolicy::defer_cost(int64_t end, int t, double round_ms) {
-    if (round_ms > 0) held_.push_back({end, bk_, std::clamp(t, 1, kMaxT), round_ms});
+    if (round_ms > 0 && (learning_ || !fixed_)) held_.push_back({end, bk_, std::clamp(t, 1, kMaxT), round_ms});
 }
 
 void DraftPolicy::apply_costs(int64_t committed) {
@@ -212,6 +462,8 @@ void DraftPolicy::apply_costs(int64_t committed) {
     const int bucket_now = bk_;
     for (; n < held_.size() && held_[n].end < committed; ++n) {
         const HeldCost& h = held_[n];
+        if (learning_) learner_.add(h.bucket, h.t, h.ms);
+        if (fixed_) continue;
         bk_ = h.bucket;   // observe()'s update, in the bucket the round ran in
         const double ms = clamp_sample(h.t, h.ms);
         const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][h.t] + 1.0)) : kCostAlpha;
@@ -265,14 +517,14 @@ bool DraftPolicy::keep_draft(ChainState& st, int idx, float p, int cap) const {
             st.best_rows = rows;
         }
         // a width not measured yet is tried a few times when the chain is likely to hold that far
-        if (cost_n_[bk_][rows] < kProbes && st.q >= 0.15) st.best_rows = rows;
+        if (!fixed_ && cost_n_[bk_][rows] < kProbes && st.q >= 0.15) st.best_rows = rows;
     }
     st.kept = st.best_rows - 1;
     if (rows + 1 > cap) return false;                       // no row left for another draft
     // one or two more drafts, each as likely to hold as this one did, could they beat the best width so far?
     const double v1 = (st.e + st.q * a) / cost_ms(rows + 1);
     const double v2 = rows + 2 <= cap ? (st.e + st.q * a + st.q * a * a) / cost_ms(rows + 2) : 0.0;
-    return std::max(v1, v2) > st.best_v * (1.0 + margin_ / 3.0) || (cost_n_[bk_][rows + 1] < kProbes && st.q * a >= 0.15);
+    return std::max(v1, v2) > st.best_v * (1.0 + margin_ / 3.0) || (!fixed_ && cost_n_[bk_][rows + 1] < kProbes && st.q * a >= 0.15);
 }
 
 double DraftPolicy::chain_rate(int match) const {
@@ -304,13 +556,14 @@ int DraftPolicy::chain(int t_mtp, double p_mtp, int k_avail, int match) const {
         return best_k;
     }
     // as choose(): a size whose cost is only guessed is tried a few times when the continuation looks likely
-    if (k_full > 0 && (cost_n_[bk_][t_full] < kProbes || stale(t_full)) && p_mtp * c >= 0.6) return k_full;
+    if (!fixed_ && k_full > 0 && (cost_n_[bk_][t_full] < kProbes || stale(t_full)) && p_mtp * c >= 0.6) return k_full;
     return 0;
 }
 
 void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, double round_ms) {
     const int t = std::clamp(t_mtp + k, 1, kMaxT);
-    if (round_ms > 0) {
+    if (learning_ && round_ms > 0) learner_.add(bk_, t, round_ms);
+    if (round_ms > 0 && !fixed_) {
         round_ms = clamp_sample(t, round_ms);
         const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
         cost_[bk_][t] = cost_n_[bk_][t] > 0 ? (1.0 - alpha) * cost_[bk_][t] + alpha * round_ms : round_ms;

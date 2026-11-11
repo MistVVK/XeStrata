@@ -17,6 +17,13 @@
 // Window sizes: every size from 1 to max_t is allowed unless set_sizes() narrows them. A size the verifier cannot
 // hold (its window graph found no VRAM) is dropped with disable(); a lookup or chain then takes the largest allowed
 // size that fits its proposal (--lookup-max-t: a few long lookup sizes, each its own window graph).
+//
+// Fixed costs (repeatable output): a different window is a different batch for the verifier, so two runs whose measured
+// round times differ can choose different windows and print different tokens.  set_fixed_costs() replaces the measured
+// costs by a table that never changes (no EMA update, no first-use probe, no stale-size retry); the token statistics keep
+// learning, so the same tokens give the same windows on every run.  The table comes from CostLearner: plain trimmed means
+// of the round times of one learning stretch on this machine (the EMA follows the last ~10-20 rounds and moved 5-20 %
+// between requests of one run; whole-run means of three runs agreed within 0.3-1.8 %, phaseA-tests/par/RESULTS-REPEAT.md).
 #pragma once
 
 #include <array>
@@ -25,6 +32,57 @@
 #include <vector>
 
 namespace strata::spec {
+
+/// The round times of a learning stretch, by context bucket and window size, for a fixed cost table.  Keeps up to kKeep
+/// samples per (bucket, size) in arrival order.
+class CostLearner {
+public:
+    static constexpr int kMaxT = 16;
+    static constexpr int kCtxBuckets = 3;
+    static constexpr int kKeep = 4096;
+    void add(int bucket, int t, double ms);
+    void reset();
+    int64_t rounds() const { return rounds_; }
+    int samples(int bucket, int t) const;
+    /// The table of `bucket` for windows 1..n (n = the largest size seen in that bucket; empty when the bucket has none):
+    /// the trimmed mean (the lowest and highest kTrim share dropped) of each size with at least `min_n` samples; the other
+    /// sizes are filled between measured neighbours (linear in the size) or, outside them, by the policy's prior shape.
+    std::vector<double> table(int bucket, int min_n) const;
+    struct Verdict {
+        bool ready = false;          ///< enough rounds, and every bucket with data has a size with min_n samples
+        bool disturbed = false;      ///< the stretch looks disturbed: do not keep a table from it (start learning again)
+        std::string why;             ///< what was seen (for the log)
+    };
+    /// Ready after `min_rounds` timed rounds.  Disturbed (each check per size with at least 2 x min_n samples):
+    /// (1) its trimmed means of the first and the second half of its samples differ by more than kDriftMax;
+    /// (2) more than kSpikeMax of its samples are above twice its median;
+    /// (3) a measured size is cheaper than a measured smaller one by more than kOrderSlack (a round of more rows cannot be cheaper).
+    Verdict check(int64_t min_rounds, int min_n) const;
+    static constexpr double kTrim = 0.1;
+    static constexpr double kDriftMax = 0.15;
+    static constexpr double kSpikeMax = 0.05;
+    static constexpr double kOrderSlack = 0.10;
+
+private:
+    std::array<std::array<std::vector<float>, kMaxT + 1>, kCtxBuckets> s_{};
+    int64_t rounds_ = 0;
+};
+
+/// The per-machine table file of --draft-costs: text, one table per context bucket, valid only for the `key` it was learned under
+/// (card, driver, engine, model, drafter and the settings that move a round's cost; the engine builds it).
+///   strata-draft-costs 1
+///   key <one line>
+///   bucket <0..2> <ms of T1>,<ms of T2>,...
+///   end
+struct CostFile {
+    std::string key;
+    std::array<std::vector<double>, CostLearner::kCtxBuckets> tables{};
+};
+/// false (with `why` for the log) when the file is missing, unreadable, malformed or truncated, or was learned under another key: the caller
+/// then learns a new table.  Never throws.
+bool read_cost_file(const std::string& path, const std::string& key, CostFile& out, std::string& why);
+/// Writes the file whole or not at all (a temporary file beside it, then renamed over it); makes the folder.  Never throws.
+bool write_cost_file(const std::string& path, const CostFile& f, std::string& why);
 
 class DraftPolicy {
 public:
@@ -79,6 +137,18 @@ public:
     /// round) counts as a tenth of a sample, so one capture cannot price a width out of use.  Off: the cost EMA as it always was.
     void set_robust(bool on) { robust_ = on; }
 
+    /// Fixed costs for `bucket` (round ms of the windows of 1..n rows): they replace whatever was measured, and from now on no round time
+    /// changes any cost, no size is probed for its cost and no size goes stale (see the file comment).  Call once per bucket that has a table;
+    /// a bucket without one takes the nearest bucket's table at set_context (as before), and that copy is fixed too.  ms == nullptr or n <= 0:
+    /// fixed at the built-in shape.  STRATA_SPEC_FIXED=1 (+ STRATA_SPEC_FIXED_TABLE="T1,T2,...", every bucket) applies it in the constructor.
+    void set_fixed_costs(const double* ms, int n, int bucket = 0);
+    bool fixed() const { return fixed_; }
+    /// Learning a fixed table: every timed round also goes to learner() (raw round time, in its context bucket).  Off by default.
+    void set_learning(bool on) { learning_ = on; }
+    bool learning() const { return learning_; }
+    CostLearner& learner() { return learner_; }
+    const CostLearner& learner() const { return learner_; }
+
     /// The window sizes a lookup or chained window may use, as a bit mask (bit t = size t; bit 1 is always kept).
     void set_sizes(unsigned mask);
     void disable(int t);                   // drop one size (its window graph did not fit)
@@ -121,6 +191,9 @@ private:
     std::array<double, kBuckets> cok_{}, cbad_{};          // chained lookup drafts, the same (reached rounds only)
     double rounds_ = 0;                                    // rounds observed so far
     bool robust_ = false;
+    bool fixed_ = false;                                   // set_fixed_costs: no round time changes a cost
+    bool learning_ = false;                                // set_learning: round times also go to learner_
+    CostLearner learner_;
     double clamp_sample(int t, double ms) const;
     static constexpr int kPBuckets = 8;
     std::array<double, kPBuckets> pa_ok_{}, pa_n_{};       // MTP drafts reached / accepted by probability bucket (decayed)
