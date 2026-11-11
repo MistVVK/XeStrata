@@ -1,0 +1,51 @@
+[
+ {
+  "text_tokens": 29,
+  "H": 32,
+  "W": 32,
+  "sha256": "a8e14ef30f1aeeb2c3b94a7f5b6adbce34166021cb31b942a2a27fa9fde2d013",
+  "from": "d0_stock_512/dump_p0_s42"
+ },
+ {
+  "text_tokens": 25,
+  "H": 32,
+  "W": 32,
+  "sha256": "bd21e04b08722512f8e4cdff5198de7057bc0a3064ea7733346073a169bfe4dc",
+  "from": "d0_stock_512/dump_p1_s42"
+ },
+ {
+  "text_tokens": 32,
+  "H": 32,
+  "W": 32,
+  "sha256": "d76088fad82b4b76cdde0d8df65e11e78639881bcf9ecd4d667a769ba05350bd",
+  "from": "d0_stock_512/dump_p2_s42"
+ },
+ {
+  "text_tokens": 27,
+  "H": 32,
+  "W": 32,
+  "sha256": "24944cd7b26a9d35f713a18866868d50749f3b801d7dad4314e68d2e6940a451",
+  "from": "d0_stock_512/dump_p3_s42"
+ },
+ {
+  "text_tokens": 29,
+  "H": 64,
+  "W": 64,
+  "sha256": "933f93b8a92c802a887649f2ad0801538e8c093b9787d1b46a50acd14c119299",
+  "from": "d0_stock_1024/dump_p0_s42"
+ },
+ {
+  "text_tokens": 29,
+  "H": 64,
+  "W": 96,
+  "sha256": "f41d00c050848fea868ef5d311e3cc2db88eb6c2144eb5b791b7e2c27318acbe",
+  "from": "d0_stock_1536/dump_p0_s42"
+ },
+ {
+  "text_tokens": 1011,
+  "H": 64,
+  "W": 64,
+  "sha256": "bc7a30b91343421982e96c10dfbbde07eab074ec38ccac3fb157c996b13f6ab1",
+  "from": "d0_stock_long/dump_l1000_s42"
+ }
+]
