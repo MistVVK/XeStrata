@@ -42,6 +42,7 @@ class WindowEngine:
         self.think_end = tok.encode("</think>", parse_special=True)[0]
         self.end = tok.encode("<|im_end|>", parse_special=True)
         self.wrap = tok.encode(REASONING_WRAP_UP, parse_special=True)
+        self.sampling_objects: list = []   # the sampling object each pass was handed (identity, as test_reasoning_loop_recovery reads it)
         self.live: list[int] = []
         self.checkpoints: list[int] = []
         self.turn: list[int] | None = None
@@ -67,6 +68,7 @@ class WindowEngine:
         else:
             reused = max([c for c in self.checkpoints if c <= len(ids) - 1 and c <= len(self.live)
                           and ids[:c] == self.live[:c]] or [0])
+        self.sampling_objects.append(sampling)
         hold = (sampling or {}).get(HOLD_KEY) if self.honours_hold else None
         row = {"prompt": len(ids), "reused": reused, "read": len(ids) - reused, "hold": hold}
         self.passes.append(row)
@@ -131,6 +133,7 @@ class HoldCase(unittest.TestCase):
         self.tok = ThinkTokenizer()
         self.engine = WindowEngine(self.tok, **kw)
         svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        self.svc = svc
         self.httpd = serve(svc, port=0)
         self.addCleanup(self.httpd.server_close)
         self.addCleanup(self.httpd.shutdown)
@@ -233,6 +236,15 @@ class ThinkingHold(HoldCase):
                 self.assertEqual(self.chat(reasoning_budget_tokens=20), self.expected(20))
                 self.assertTrue(all(p["hold"] is None for p in self.engine.passes))
 
+    def test_a_split_engine_never_gets_the_hold_even_if_its_ready_said_hold(self):
+        """The split engine's parser ends a request that carries a key it does not know ("GEN: unknown key hold"): the server also keeps the hold
+        from an engine it knows is a split engine by name, whatever READY said."""
+        self.start(can_hold=True, can_hold_batch=True)
+        self.engine.split_engine = True
+        self.engine.batch = 4
+        self.assertEqual(self.chat(reasoning_budget_tokens=20), self.expected(20))
+        self.assertTrue(all(p["hold"] is None for p in self.engine.passes))
+
     def test_a_batch_engine_that_says_holdb_gets_the_hold(self):
         """P2b: a --batch engine whose slots end at the hold (READY holdb) gets the key like a solo engine: the second pass reads the last
         reasoning token and the wrap-up, as in the solo case."""
@@ -250,6 +262,65 @@ class ThinkingHold(HoldCase):
         self.engine.multi = 2
         self.assertEqual(self.chat(reasoning_budget_tokens=20), self.expected(20))
         self.assertTrue(all(p["hold"] is None for p in self.engine.passes))
+
+
+class SamplerObject(HoldCase):
+    """The engine is handed the caller's own sampling object on every pass unless this pass adds (or must strip) the hold, and the caller's dict is
+    never mutated (serve/test_reasoning_loop_recovery.py::test_frozen_cohort_sampler_is_unchanged_during_recovery reads the identity; found by round 18's
+    py-serve run: be101072b made every pass hand the engine a copy)."""
+
+    def run_it(self, sampling, **kw):
+        import copy
+        import threading
+        self.start(**kw)
+        ids = self.tok.encode("<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n", parse_special=True)
+        before = copy.deepcopy(sampling)
+        events = list(self.svc.run(ids, True, [], 400, sampling, threading.Event()))
+        self.assertEqual(sampling, before, "the caller's dict was mutated")
+        self.assertEqual(events[-1][0], "done")
+        return self.engine.sampling_objects
+
+    def test_no_hold_the_engine_gets_the_callers_own_object_on_every_pass(self):
+        for kw in ({"can_hold": False}, {"can_hold": True, "honours_hold": True, "batch_engine": True}):
+            with self.subTest(**kw):
+                batch = kw.pop("batch_engine", False)
+                sampling = {"temperature": 0.0, "reasoning_budget_tokens": 20}
+                self.start(**kw)
+                self.engine.batch = 4 if batch else 0   # (a --batch engine without holdb: no hold is sent either)
+                import threading
+                ids = self.tok.encode("<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n", parse_special=True)
+                list(self.svc.run(ids, True, [], 400, sampling, threading.Event()))
+                objs = self.engine.sampling_objects
+                self.assertEqual(len(objs), 2)   # the budget's two passes
+                self.assertTrue(all(o is sampling for o in objs))
+                self.assertNotIn(HOLD_KEY, sampling)
+
+    def test_no_budget_one_pass_the_callers_own_object(self):
+        sampling = {"temperature": 0.0}
+        objs = self.run_it(sampling)
+        self.assertEqual(len(objs), 1)
+        self.assertIs(objs[0], sampling)
+
+    def test_a_hold_is_added_to_a_copy_and_the_callers_dict_keeps_no_key(self):
+        sampling = {"temperature": 0.0, "reasoning_budget_tokens": 20}
+        objs = self.run_it(sampling)
+        self.assertEqual(len(objs), 2)
+        self.assertIsNot(objs[0], sampling)
+        self.assertIn(HOLD_KEY, objs[0])              # the first pass carries the hold
+        self.assertNotIn(HOLD_KEY, objs[1])           # the answer pass: the budget is spent
+        self.assertNotIn(HOLD_KEY, sampling)
+        self.assertEqual({k: v for k, v in objs[0].items() if k != HOLD_KEY}, sampling)
+
+    def test_a_hold_key_in_the_callers_dict_is_stripped_from_a_copy(self):
+        """The hold is the server's own key, never a client's: a caller's dict that carries one is not mutated and the engine does not see it
+        when this pass adds none."""
+        sampling = {"temperature": 0.0, "reasoning_budget_tokens": 20, HOLD_KEY: (3, 5)}
+        objs = self.run_it(sampling, can_hold=False)
+        self.assertEqual(len(objs), 2)
+        for o in objs:
+            self.assertIsNot(o, sampling)
+            self.assertNotIn(HOLD_KEY, o)
+        self.assertEqual(sampling[HOLD_KEY], (3, 5))
 
 
 class HoldKey(unittest.TestCase):
