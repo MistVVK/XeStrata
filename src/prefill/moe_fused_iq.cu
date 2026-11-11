@@ -173,6 +173,71 @@ __global__ void quant_act_nat_kernel(const float* __restrict__ x, int64_t nblk, 
     if (lane == 0) *(float4*) (out + 64) = make_float4(a0 / 127.0f, a1 / 127.0f, (float) s0, (float) s1);
 }
 
+#if !defined(__HIPCC__)
+// (CUDA, STRATA_PF_FUSED_TQ=1) the block-Hadamard rotation of a Hadamard-folded expert's input (include/strata/kernels/cpu/hadamard.hpp):
+// y = H_128 (s * x) / sqrt(128) per block of 128 values, H the Sylvester-Walsh-Hadamard matrix.  One warp a block: lane l holds values
+// 32 k + l (k = 0..3); the in-place fast transform's butterflies over strides 1-16 by shuffles, 32 and 64 between the registers.
+__device__ __forceinline__ void fwht128_warp(float (&v)[4], int lane) {
+#pragma unroll
+    for (int st = 1; st < 32; st <<= 1) {
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float o = __shfl_xor_sync(0xffffffffu, v[k], st);
+            v[k] = (lane & st) ? o - v[k] : v[k] + o;
+        }
+    }
+    const float a0 = v[0] + v[1], a1 = v[0] - v[1], a2 = v[2] + v[3], a3 = v[2] - v[3];
+    v[0] = (a0 + a2) * 0.08838834764831845f; v[1] = (a1 + a3) * 0.08838834764831845f;   // (1 / sqrt(128))
+    v[2] = (a0 - a2) * 0.08838834764831845f; v[3] = (a1 - a3) * 0.08838834764831845f;
+}
+// in place, rows x cols (cols a multiple of 128): every row's blocks rotated (signs: nullptr = identity)
+__global__ void hadamard128_kernel(float* __restrict__ x, int64_t nblk, int cols, const float* __restrict__ signs) {
+    const int64_t w = (int64_t) blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (w >= nblk) return;
+    float* p = x + w * 128;
+    const int c0 = (int) ((w * 128) % cols);
+    float v[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) v[k] = p[32 * k + lane] * (signs ? signs[c0 + 32 * k + lane] : 1.0f);
+    fwht128_warp(v, lane);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) p[32 * k + lane] = v[k];
+}
+// the FP32 H rows the trellis gate/up wrote (a folded down; n_ff values at the start of each row's n_embd-float down-output row): rotated,
+// then int8 per 32 values into the down product's activation layout (quant_act_nat_kernel's: 64 codes, the two scales, the two code sums
+// per 80 bytes), for the rows of experts e0..e1 only (tb.off on the device)
+__global__ void rot_quant_h_kernel(const float* __restrict__ hf, const int32_t* __restrict__ off, int e0, int e1, int64_t n,
+                                   const float* __restrict__ signs, uint8_t* __restrict__ ha) {
+    constexpr int BLK = D_ROWS_K / 128;   // Hadamard blocks a row (5 for n_ff 640)
+    const int64_t w = (int64_t) blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32;
+    const int lane = threadIdx.x & 31;
+    if (w >= n * BLK) return;
+    const int64_t row = w / BLK;
+    const int b = (int) (w % BLK);
+    if (row < off[e0] || row >= off[e1]) return;
+    const float* p = hf + row * D_ROWS_N + 128 * b;
+    float v[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) v[k] = p[32 * k + lane] * (signs ? signs[128 * b + 32 * k + lane] : 1.0f);
+    fwht128_warp(v, lane);
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {   // value 128 b + 32 k + lane: AB block (128 b + 32 k) / 64, half k & 1
+        float am = fabsf(v[k]);
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
+        const int code = am > 0.0f ? __float2int_rn(v[k] * (127.0f / am)) : 0;
+        int cs = code;
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) cs += __shfl_xor_sync(0xffffffffu, cs, o);
+        uint8_t* o = ha + row * H_ROW_BYTES + ((128 * b + 32 * k) / 64) * AB;
+        const int hh = k & 1;
+        o[32 * hh + lane] = (uint8_t) (int8_t) code;
+        if (lane == 0) { *(float*) (o + 64 + 4 * hh) = am / 127.0f; *(float*) (o + 72 + 4 * hh) = (float) cs; }
+    }
+}
+#endif
+
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 __device__ __forceinline__ void cp16(void* dst, const void* src) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"((unsigned) __cvta_generic_to_shared(dst)),
@@ -1044,6 +1109,18 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
                     for (int o = 4; o < 32; o <<= 1) am = fmaxf(am, __shfl_xor_sync(0xffffffffu, am, o));
                     const float inv = am > 0.0f ? 127.0f / am : 0.0f;
                     const int r = nb0 + 8 * n + 2 * tig + c;
+                    if constexpr (is_tq(WT)) {
+                        // (CUDA, STRATA_PF_FUSED_TQ=1, a Hadamard-folded down: set_down_rotation) H as FP32, n_ff values at the start of the row's
+                        // own down-output row in `dm` (n_embd floats a row; the down product rewrites it only after rot_quant_h_kernel has read
+                        // it): rotated and quantized there before the down product (the rotation needs the whole 128-feature block of the row)
+                        if (dm != nullptr) {
+                            if (r < nrows) {
+#pragma unroll
+                                for (int i = 0; i < 4; ++i) dm[(size_t) (row0 + r) * D_ROWS_N + (WR / 2) * fb + 32 * wf + 8 * i + g] = h[i];
+                            }
+                            continue;
+                        }
+                    }
                     if constexpr (has_min(WT)) {
                         // (K-quant gate/up, STRATA_PF_FUSED_KQ=1, CUDA) the down formats with a minimum (Q5_1) read the codes' sum
                         // per 32 values from the H block's spare bytes 72-79, as quant_act_nat_kernel writes them for the
@@ -2453,6 +2530,24 @@ static bool g_dm16_want = false, g_dm16_used = false;
 void want_dm_f16(bool on) { g_dm16_want = on; }
 bool dm_f16_used() { return g_dm16_used; }
 
+// (CUDA, STRATA_PF_FUSED_TQ=1) a Hadamard-folded down (set_down_rotation): on, and the down input's sign vector
+static const float* g_rot_signs = nullptr;
+static bool g_rot_on = false;
+void set_down_rotation(bool on, const float* signs) { g_rot_on = on; g_rot_signs = on ? signs : nullptr; }
+void hadamard128_rows(float* x, int64_t rows, int64_t cols, const float* signs, void* stream) {
+#if !defined(__HIPCC__)
+    if (rows <= 0) return;
+    if (cols % 128 != 0) { std::fprintf(stderr, "hadamard128_rows: %lld columns are not whole 128-value blocks\n", (long long) cols); std::exit(1); }
+    const int64_t nblk = rows * (cols / 128);
+    hadamard128_kernel<<<blocks(nblk, 8), 256, 0, (cudaStream_t) stream>>>(x, nblk, (int) cols, signs);
+    ck(cudaGetLastError(), "hadamard128_rows");
+#else
+    (void) x; (void) rows; (void) cols; (void) signs; (void) stream;
+    std::fprintf(stderr, "hadamard128_rows: not built for HIP\n");
+    std::exit(1);
+#endif
+}
+
 void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa,
                     const int32_t* src, void* ha, float* dm, void* stream) {
     g_dm16_used = false;
@@ -2600,11 +2695,11 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
             break;
         case T_TQK6:   // (STRATA_PF_FUSED_TQ=1, gu_covered checked d.tq above; native_supported pairs it with a TQK7 down)
             launch<T_TQK6, true>(ww, (unsigned) std::min<int64_t>(tiles * (GU_ROWS_N / weight_rows(ww)), (int64_t) d.sms * d.occ_tq_gu), b, g, tb,
-                                 xa, src, ha, nullptr, s);
+                                 xa, src, ha, g_rot_on ? dm : nullptr, s);   // (a folded down: the FP32 H rows into dm; else H as int8, as every format)
             break;
         case T_TQ2_T:   // (the same; with a TQ2_T down)
             launch<T_TQ2_T, true>(ww, (unsigned) std::min<int64_t>(tiles * (GU_ROWS_N / weight_rows(ww)), (int64_t) d.sms * d.occ_tq_gu), b, g, tb,
-                                  xa, src, ha, nullptr, s);
+                                  xa, src, ha, g_rot_on ? dm : nullptr, s);
             break;
 #endif
         default: launch<T_IQ4_XS, true>(ww, g_gu, b, g, tb, xa, src, ha, nullptr, s); break;
@@ -2618,6 +2713,10 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         const unsigned g8 = (unsigned) std::min<int64_t>(tiles * (D_ROWS_N / weight_rows(ww)), (int64_t) d.sms * d.occ_kq8);
         launch<T_Q8_0, false>(ww, g8, b, g, tb, ha, src, nullptr, dm, s);
     } else if (g.d_type == T_TQK7 || g.d_type == T_TQ2_T) {   // STRATA_PF_FUSED_TQ=1 (d_covered_on checked d.tq above); their own occupancy
+        if (g_rot_on) {   // a folded down (set_down_rotation): the FP32 H rows of this call's experts (in dm), rotated and quantized into ha
+            const int64_t nw = n * (D_ROWS_K / 128);
+            rot_quant_h_kernel<<<blocks(nw, 8), 256, 0, s>>>(dm, tb.off, b.e0, b.e1, n, g_rot_signs, (uint8_t*) ha);
+        }
         const unsigned gt = (unsigned) std::min<int64_t>(tiles * (D_ROWS_N / weight_rows(ww)), (int64_t) d.sms * d.occ_tq_d);
         if (g.d_type == T_TQK7) launch<T_TQK7, false>(ww, gt, b, g, tb, ha, src, nullptr, dm, s);
         else launch<T_TQ2_T, false>(ww, gt, b, g, tb, ha, src, nullptr, dm, s);

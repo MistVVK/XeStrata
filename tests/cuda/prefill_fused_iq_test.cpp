@@ -111,6 +111,47 @@ void tq_block(int t, const uint8_t* b, float* out, bool int8cb) {
     }
 }
 
+// --folded (trellis pairs): the Gyro packs' Hadamard-folded experts (include/strata/kernels/cpu/hadamard.hpp): the weights are taken as stored
+// (W' = W diag(s) H^T), so every activation entering them is rotated first, y = H_128 (s * x) / sqrt(128) per 128 values, with random signs.
+// The reference rotates on the host (this function, from the definition); the fused path's H rotation is set_down_rotation, MMQ's is
+// hadamard128_rows (the same device code: the reference is the independent side); the gate/up input is rotated on the host for every path.
+bool g_folded = false;
+void rot128(float* x, int n, const float* signs) {
+    for (int b = 0; b < n; b += 128) {
+        double v[128];
+        for (int i = 0; i < 128; ++i) v[i] = (double) x[b + i] * (signs ? signs[b + i] : 1.0f);
+        for (int st = 1; st < 128; st <<= 1)
+            for (int i = 0; i < 128; ++i)
+                if (!(i & st)) { const double a = v[i], c = v[i + st]; v[i] = a + c; v[i + st] = a - c; }
+        for (int i = 0; i < 128; ++i) x[b + i] = (float) (v[i] / std::sqrt(128.0));
+    }
+}
+const float* g_rot_signs_dev = nullptr;   // the down input's signs on the device while a folded pair runs
+bool g_rot_on = false;
+struct Folded {   // a folded trellis pair's signs (host and device); inactive for every other pair
+    bool on = false;
+    std::vector<float> sx, sh;
+    std::unique_ptr<struct Dev> dsh;
+    Folded(bool tq, int64_t rows) {
+        (void) rows;
+        if (!g_folded || !tq) return;
+        on = true;
+        std::mt19937 rs(20261111);   // (its own generator: every other draw of the test is unchanged)
+        sx.resize((size_t) N);
+        sh.resize((size_t) FF);
+        for (float& v : sx) v = (rs() & 1) ? 1.0f : -1.0f;
+        for (float& v : sh) v = (rs() & 1) ? 1.0f : -1.0f;
+        dsh = std::make_unique<Dev>(sh.size() * 4);
+        ck(cudaMemcpy(dsh->p, sh.data(), sh.size() * 4, cudaMemcpyHostToDevice), "signs");
+        g_rot_signs_dev = dsh->as<float>();
+        g_rot_on = true;
+    }
+    ~Folded() { g_rot_signs_dev = nullptr; g_rot_on = false; }
+    void rotate_x(std::vector<float>& x) const {   // the gate/up input, every token, on the host (all paths read the rotated rows)
+        if (on) for (size_t t = 0; t < x.size() / N; ++t) rot128(x.data() + t * N, N, sx.data());
+    }
+};
+
 struct Geo {
     size_t gu_row, d_row, up_off, down_off, bytes;
     explicit Geo(const Pair& p) {
@@ -285,6 +326,7 @@ void run_mmq(const Pair& p, const Geo& geo, mmq::Context& ctx, MmqBufs& b, const
         gu.total_rows = rows; gu.max_rows = maxr; gu.dst = b.gu.as<float>(); gu.ld_dst = FF2;
         ctx.run(gu, s);
         mmq::swiglu(b.gu.as<float>() + r0 * FF2, b.h.as<float>() + r0 * FF, nr, FF, false, s);
+        if (g_rot_on) fused::hadamard128_rows(b.h.as<float>() + r0 * FF, nr, FF, g_rot_signs_dev, s);   // (--folded: the down input rotated)
         mmq::quantize(b.h.as<float>() + r0 * FF, nullptr, b.hq.p, (int) p.d, FF, FF, nr, s);
         mmq::Product dn;
         dn.w = direct ? (const void*) (b0 + geo.down_off) : b.grp_d.p; dn.type = (int) p.d; dn.w_rows = N; dn.w_cols = FF;
@@ -310,6 +352,8 @@ void run_fused(const Pair& p, const Geo& geo, FusedBufs& b, const float* x_dev, 
     const fused::NativeGeom ng = geo.native(p);
     fused::quantize_act_native(x_dev, T, N, b.xa.p, s);
     fused::group(b.ids.as<int32_t>(), rows, K, E, b.scratch.p, b.slot.as<int32_t>(), b.src.as<int32_t>(), s);
+    fused::set_down_rotation(g_rot_on, g_rot_signs_dev);   // (--folded trellis pairs; off for every other pair)
+    struct Off { ~Off() { fused::set_down_rotation(false, nullptr); } } off_at_end;
     for (size_t c = 0; c + 1 < cuts.size(); ++c) {
         for (int e0 = cuts[c]; e0 < cuts[c + 1]; e0 += fused::kMaxBatch) {
             fused::Batch bt;
@@ -392,10 +436,13 @@ void reference_part(const Pair& p, cudaStream_t s, int T = 256, int E = 64, int 
         ck(cudaMemcpy(q, host[(size_t) e].data(), geo.bytes, cudaMemcpyHostToDevice), "blob");
         blob[(size_t) e] = q;
     }
-    const std::vector<float> x = make_x(T, rng, ZERO);
+    std::vector<float> x = make_x(T, rng, ZERO);
     const std::vector<int32_t> ids = make_ids(T, E, rng, 2, E >= 64 ? 4 : 4);   // experts 0, 1 hot (several tiles), the last 4 unused
     const int64_t rows = (int64_t) T * K;
     const Routing r = sort_rows(ids, E);
+    const Folded fo(tq_type(p.gu), rows);   // (--folded trellis pairs: the signs, the H scratch; x rotated for every path and the reference)
+    fo.rotate_x(x);
+    if (fo.on) std::printf("%s - folded: the gate/up input and H rotated per 128 values with random signs\n", p.name);
     std::printf("%s - reference part: %d tokens, %d experts, rows per expert: max %d, experts without rows %d\n", p.name,
                 T, E, *std::max_element(r.cnt.begin(), r.cnt.end()), (int) std::count(r.cnt.begin(), r.cnt.end(), 0));
 
@@ -445,6 +492,7 @@ void reference_part(const Pair& p, cudaStream_t s, int T = 256, int E = 64, int 
                         for (int k = 0; k < N; ++k) { gt += (double) wg[k] * xr[k]; up += (double) wu[k] * xr[k]; }
                         h[(size_t) f] = (float) (gt / (1.0 + std::exp(-gt)) * up);
                     }
+                    if (fo.on) rot128(h.data(), FF, fo.sh.data());   // (--folded: the down input rotated)
                     for (int o = 0; o < N; ++o) {
                         double a = 0;
                         const float* wd = dn.data() + (size_t) o * FF;
@@ -458,6 +506,7 @@ void reference_part(const Pair& p, cudaStream_t s, int T = 256, int E = 64, int 
                         for (int k = 0; k < N; ++k) { gt += (double) wg[k] * xq[(size_t) k]; up += (double) wu[k] * xq[(size_t) k]; }
                         h2[(size_t) f] = (float) (gt / (1.0 + std::exp(-gt)) * up);
                     }
+                    if (fo.on) rot128(h2.data(), FF, fo.sh.data());
                     quant32(h2.data(), hq.data(), FF);
                     for (int o = 0; o < N; ++o) {
                         double a = 0;
@@ -528,7 +577,9 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     }
     std::vector<const uint8_t*> blob((size_t) E);
     for (int e = 0; e < E; ++e) blob[(size_t) e] = blobs.as<uint8_t>() + (size_t) e * stride;
-    const std::vector<float> x = make_x(T, rng, -1);
+    std::vector<float> x = make_x(T, rng, -1);
+    const Folded fo(tq_type(p.gu), rows);   // (--folded trellis pairs: rotated input, the H rotation on both paths, inside their times)
+    fo.rotate_x(x);
     const std::vector<int32_t> ids = make_ids(T, E, rng, 0, 0);
     const Routing r = sort_rows(ids, E);
     Dev x_dev(x.size() * 4), src_dev((size_t) rows * 4);
@@ -696,6 +747,7 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
                 for (int k = 0; k < N; ++k) { gt += (double) wg[k] * xr[k]; up += (double) wu[k] * xr[k]; }
                 h[(size_t) f] = (float) (gt / (1.0 + std::exp(-gt)) * up);
             }
+            if (fo.on) rot128(h.data(), FF, fo.sh.data());   // (--folded)
             for (int o = 0; o < N; ++o) {
                 double a = 0;
                 const float* wd = dn.data() + (size_t) o * FF;
@@ -821,6 +873,7 @@ int main(int argc, char** argv) {
             if (std::strcmp(argv[i], "--no-timing") == 0) timing = false;
             if (std::strcmp(argv[i], "--no-ref") == 0) ref = false;
             if (std::strcmp(argv[i], "--edge") == 0) edge = true;
+            if (std::strcmp(argv[i], "--folded") == 0) g_folded = true;   // (the trellis pairs as Hadamard-folded experts: see g_folded)
             if (std::strncmp(argv[i], "--chunks=", 9) == 0) {
                 chunks.clear();
                 for (const char* c = argv[i] + 9; *c;) {

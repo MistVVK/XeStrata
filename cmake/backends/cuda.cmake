@@ -308,6 +308,10 @@ macro(strata_cuda_mmq)
       # from the format definition (fp16 codebook), the int8 model (the int8 codebook) and the overlay's trellis MMQ at every shape (--edge; 77 below sm_80)
       add_test(NAME prefill_fused_iq_test_tq COMMAND prefill_fused_iq_test "--only=+ T" --edge --no-timing)
       set_tests_properties(prefill_fused_iq_test_tq PROPERTIES ENVIRONMENT "STRATA_PF_FUSED_TQ=1" SKIP_RETURN_CODE 77 TIMEOUT 900)
+      # the same pairs as Hadamard-folded experts (the Gyro packs' form): the gate/up input and H rotated per 128 values with random signs; the
+      # fused path's H rotation (set_down_rotation) against the host-side rotation of the reference and MMQ with its H rotated on the device
+      add_test(NAME prefill_fused_iq_test_tqh COMMAND prefill_fused_iq_test "--only=+ T" --folded --edge --no-timing)
+      set_tests_properties(prefill_fused_iq_test_tqh PROPERTIES ENVIRONMENT "STRATA_PF_FUSED_TQ=1" SKIP_RETURN_CODE 77 TIMEOUT 900)
       # the MoE input quantized per token and scattered to its rows (mmq::quantize_scatter) against the per-row
       # gather: the same q8_1 bytes for every MMQ layout (--bench: both at 2K, 8K and 32K tokens)
       # the Unsloth v3.1 sets' expert formats through MMQ (Q5_0 down only in a STRATA_ORCA_Q4KS_MMQ build), and --bench
