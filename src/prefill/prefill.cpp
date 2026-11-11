@@ -232,6 +232,15 @@ constexpr int STAGE = 8;           // host->device expert staging ring (chunks b
 // the group that read it was gathered (the walk stages at most STAGE_GRP - MMQ_GROUP - 1 entries ahead)
 constexpr int STAGE_GRP = 32;
 constexpr int kSplitHelpRing = 48;  // layer split help: the helper stage's ring slots it streams through (at most)
+// STRATA_PREFILL_GROUP_GATHER (unset or not 0): the staged walk's resident groups (read again here for P4-SMALL's fused groups, which
+// need that staging: the same variable, the same answer)
+inline bool staged_group_gather() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PREFILL_GROUP_GATHER");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    return on;
+}
 // STRATA_PREFILL_STREAM_AHEAD=0 keeps the previous routed-only upload schedule (A/B).
 inline bool stream_ahead_enabled() {
     static const bool on = [] {
@@ -4759,6 +4768,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                            fused::native_supported(mmq_gt, mmq_dt);
                     const bool fused_l = (use_mmq && stream_all && no_peer && !lay.native && fused::enabled()) || fused_nat;
                     bool dm16_used = false;   // STRATA_PF_DM16: this layer's down rows are FP16 (fused::dm_f16_used() after the experts)
+                    bool fz_staged_l = false;   // P4-SMALL: this staged chunk's groups ran on the fused kernels (GU / H hold their tables and int8 rows)
                     if (m.group_cap > 0 && (fused_l || !use_mmq)) {   // GU / H / Hq are one group's size
                         err = "prefill: STRATA_PF_GROUP_SCRATCH needs MMQ on every layer (a layer took the fused or FP16 path)";
                         return false;
@@ -5247,9 +5257,28 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         bool ws_layer = false;   // STRATA_MMQ_WS: this layer's products weight-stationary (below)
                         ws::Layer wl;
                         pt.mark(kPfGather, cs);
+                        // P4-SMALL: a staged chunk's (below stream_all_min()) MMQ groups of a native layer the fused kernels cover on this device
+                        // run as the gathered-group entry (fused::group_bounds + experts_native on each expert where it is: its cache slot or its
+                        // staging slot), in place of MMQ's per-row quantize, gather, gate/up, SwiGLU, quantize and down.  The activations go to int8
+                        // ONCE PER TOKEN (quantize_act_native into Xq, where MMQ wrote a q8_1 copy for each of a token's K rows); the rows' tokens are
+                        // src_dev, the groups' relative bounds MMQ's own, H into H, the down rows into Dm at the group's rows (the combine is MMQ's).
+                        // The staging is the resident groups' (STAGE_GRP slots held until the group's launch).  Not with the CPU share, a peer,
+                        // STRATA_MMQ_DIRECT / _WS, the WMMA tiles, STRATA_PF_GROUP_SCRATCH, NVFP4 tails, Hadamard-folded or nibble layers.
+                        const bool fz_staged = !stream_all && use_mmq && lay.native && !fused_l && !wmma_l && !had_gu && !had_d && rows_cpu == 0 &&
+                                               on_peer.empty() && !m.pp && m.group_cap == 0 && !lay.fmt[(size_t) l].tail_off && ws::mode() == 0 &&
+                                               !(m.cache && mmq_plan().direct[(size_t) l]) && staged_group_gather() &&
+                                               MMQ_GROUP <= mmq::kGatherGroupMax && MMQ_GROUP <= fused::kMaxBatch &&
+#if STRATA_EXPERT_NIBBLE_BUILT
+                                               !nib_l.on &&
+#endif
+                                               fused::native_supported(mmq_gt, mmq_dt);
                         // the routed experts' input: `mixed`, or (APR) its rotated copy, which the peer / the layer
                         // split's helper also take (one rotation for both cards; `mixed` itself feeds the shared expert)
                         const float* xsrc = m.mixed;
+                        if (fz_staged) {
+                            fz_staged_l = true;
+                            fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
+                        }
                         if (use_mmq) {
                             // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed` (APR:
                             // from its rotated copy `Xr`): each token quantized once and written to its K rows
@@ -5263,7 +5292,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     strata::kernels::hadamard_rows(m.mixed, m.Xr, T, N, had_block, had_sx, m.cs);
                                     xsrc = m.Xr;
                                 }
-                                if (mmq::fp4_activations(mmq_gt))
+                                if (fz_staged) {
+                                    // (P4-SMALL: Xq already holds the per-token int8 rows, above)
+                                } else if (mmq::fp4_activations(mmq_gt))
                                     mmq::quantize(xsrc, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs, m.Xscale);
                                 else
                                     mmq::quantize_scatter(xsrc, m.slot_dev, m.src_dev, m.Xq, mmq_gt, N, N, T, (int) K, m.cs);
@@ -5769,6 +5800,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         size_t gg_ents[MMQ_GROUP];   // the streamed walk: their entries (wait_copied)
                         int gg_nslots = 0;   // ring slots gathered by the next flush
                         size_t cur_entry = 0;   // the streamed walk: the entry compute() is given
+                        // P4-SMALL (fz_staged): the open group's expert pointers and the layer's native geometry
+                        const uint8_t* fz_blob[MMQ_GROUP] = {};
+                        fused::NativeGeom fz_geom{};
+                        if (fz_staged) {
+                            const auto& f = lay.fmt[(size_t) l];
+                            fz_geom = fused::NativeGeom{f.gu_type, f.d_type, f.gu_row, f.d_row, f.up_off, f.down_off};
+                        }
                         // STRATA_MMQ_DIRECT=1: a resident expert with guard room in its slot is not gathered - the
                         // group's pointer tables give MMQ each expert's own address (group position q), the others are
                         // gathered at compact positions c = 0..ns-1 of the group buffers, as before (same bytes)
@@ -5830,6 +5868,34 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                 : "the MMQ group buffers are not the blob's [gate | up] and down");
 #endif
                             pt.mark(kPfDequant, cs);
+                            if (fz_staged) {   // P4-SMALL: the group's experts where they are; its two products and SwiGLU at its last expert
+                                const size_t q = j % MMQ_GROUP;
+                                fz_blob[q] = blob_dev;
+                                if (slot >= 0) { gg_ents[gg_nslots] = cur_entry; gg_slots[gg_nslots++] = slot; }
+                                if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
+                                if (gg_nslots > 0) {   // the copies land in order: the last one covers the others
+                                    pt.mark(kPfWaitCopy, cs);
+                                    wait_copied(gg_ents[gg_nslots - 1], (size_t) gg_slots[gg_nslots - 1]);
+                                }
+                                const size_t j0 = j - q, g = j0 / MMQ_GROUP, n = order.size();
+                                const int ngx = (int) (q + 1);
+                                const int64_t r0 = m.bounds_host[j0], nr = m.bounds_host[j + 1] - r0;
+                                pt.mark(kPfGemmGU, cs);
+                                fused::group_bounds(m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1), ngx, m.GU, m.cs);
+                                fused::Batch fb;
+                                fb.e0 = 0;
+                                fb.e1 = ngx;
+                                for (int i = 0; i < ngx; ++i) fb.blob[i] = fz_blob[i];
+                                fused::want_dm_f16(false);
+                                fused::experts_native(fb, fz_geom, ngx, nr, m.GU, m.Xq, m.src_dev + r0, m.H, m.Dm + r0 * N, m.cs);
+                                if (gg_nslots > 0) {   // the group's staged blobs are read: one event releases their slots
+                                    const int rel = gg_slots[gg_nslots - 1];
+                                    cudaEventRecord(m.used[rel], m.cs);
+                                    for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel;
+                                }
+                                gg_nslots = 0;
+                                return true;
+                            }
                             if (use_mmq) {
                                 // gather the expert into its group slot (GGUF blocks, unchanged or converted)
                                 const size_t q = j % MMQ_GROUP;
@@ -6177,9 +6243,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // (fused: GU and H hold the grouping tables and int8 rows, not floats)
                         // (the CPU's rows, the last rows_cpu of GU and H, are never written by the GPU: not checked)
                         const int64_t gpu_rows = T * K - rows_cpu;
-                        const int64_t bgu = fused_l || m.group_cap > 0 ? 0 : bad(m.GU, gpu_rows * kFF2), bdm = bad(m.Dm, T * K * N),
+                        const int64_t bgu = fused_l || fz_staged_l || m.group_cap > 0 ? 0 : bad(m.GU, gpu_rows * kFF2), bdm = bad(m.Dm, T * K * N),
                                       bbo = bad(m.bo, T * N), bsh = bad(m.shared, T * N), bsg = bad(m.sg, T), bw = bad(m.w, T * K);
-                        const int64_t bh = m.H && !fused_l && m.group_cap == 0 ? bad(m.H, gpu_rows * kFF) : -1;   // (group scratch: the last range's rows)
+                        const int64_t bh = m.H && !fused_l && !fz_staged_l && m.group_cap == 0 ? bad(m.H, gpu_rows * kFF) : -1;   // (group scratch: the last range's rows)
                         static int64_t reported = -1;
                         if ((bgu || bdm || bbo || bsh || bsg || bw || bh > 0) && reported != stats_.chunks) {
                             reported = stats_.chunks;
