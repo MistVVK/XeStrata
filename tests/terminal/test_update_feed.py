@@ -314,20 +314,6 @@ class DeepSeekEnginePackages(FeedChecks):
         self.assertEqual([p.version for p in feed.engine], ["0.1.46"], "a DeepSeek package is not an engine package")
         self.assertEqual(feed.skipped, ())
 
-    def test_the_tool_packs_with_the_prefix_and_writes_the_member(self):
-        from feed_tool import build_feed, keygen
-        with tempfile.TemporaryDirectory() as folder:
-            keygen(Path(folder) / "keys")
-            key = json.loads((Path(folder) / "keys" / "feed-key.json").read_text())
-            d = Path(folder) / "dsv41"
-            d.mkdir()
-            (d / "x.entry.json").write_text(json.dumps(entry(version="0.1.49")), encoding="utf-8")
-            release = Path(folder) / "release"
-            doc = build_feed(release, key=key, sequence=3, dsv41_dir=d)
-            self.assertEqual(len(doc["dsv41"]["packages"]), 1)
-            self.assertNotIn("engine", doc)
-
-
 class AppPlatform(unittest.TestCase):
     """`feed_tool.py set-app-platform`: the signed Mac archive goes into the Tauri updater json, and only if it verifies."""
 

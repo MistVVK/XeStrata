@@ -223,7 +223,7 @@ def pack_engine(folder: Path, out: Path, fmt: str = "tar.gz", *, url_prefix: str
         prefix = component.id
     files = _tree(folder)
     installed = sum(p.stat().st_size for _, p in files)
-    name = f"{prefix}-{folder.name}.{fmt}"        # prefix strata-dsv41 for the separate DeepSeek engine packages
+    name = f"{prefix}-{folder.name}.{fmt}"
     archive = Path(out) / name
     _write_archive(files, archive, fmt, component.entrypoint)
     entry = {"version": component.version, "platform": component.platform, "backend": component.backend,
@@ -278,7 +278,7 @@ def model_files(paths: list[Path], repo_dir: str = "") -> list[dict]:
 
 def build_feed(out: Path, *, key: dict, sequence: int, channel: str = "stable", engine_dir: Path | None = None,
                control_dir: Path | None = None, app_json: Path | None = None, expires_days: int | None = None,
-               now: dt.datetime | None = None, dsv41_dir: Path | None = None, drafters_dir: Path | None = None, models_dir: Path | None = None,
+               now: dt.datetime | None = None, drafters_dir: Path | None = None, models_dir: Path | None = None,
                shapes_dir: Path | None = None) -> dict:
     now = now or dt.datetime.now(dt.timezone.utc)
     install_manifest = ""
@@ -288,9 +288,6 @@ def build_feed(out: Path, *, key: dict, sequence: int, channel: str = "stable", 
     if engine_dir:
         document["engine"] = {"packages": [json.loads(p.read_text(encoding="utf-8"))
                                            for p in sorted(Path(engine_dir).glob("*.entry.json"))]}
-    if dsv41_dir:
-        document["dsv41"] = {"packages": [json.loads(p.read_text(encoding="utf-8"))
-                                          for p in sorted(Path(dsv41_dir).glob("*.entry.json"))]}
     if shapes_dir:                                # the engines of model shapes (feed member shape_engines): each entry must name a shape
         entries = []
         for p in sorted(Path(shapes_dir).glob("*.entry.json")):
@@ -431,7 +428,7 @@ def main(argv: list[str] | None = None) -> int:
     pe.add_argument("--out", type=Path, required=True)
     pe.add_argument("--format", choices=feedmod.FORMATS, default="tar.gz")
     pe.add_argument("--url-prefix", default="engine/", help='where the archive sits relative to the feed ("" for flat GitHub release assets)')
-    pe.add_argument("--prefix", default="strata-engine", help="archive name prefix (strata-dsv41 for the DeepSeek engine packages)")
+    pe.add_argument("--prefix", default="strata-engine", help="archive name prefix")
     pd = sub.add_parser("pack-drafter", help="a DFlash2 drafter file as a feed entry (feed member drafters)")
     pd.add_argument("pack", type=Path)
     pd.add_argument("--out", type=Path, required=True)
@@ -456,7 +453,6 @@ def main(argv: list[str] | None = None) -> int:
     bf.add_argument("--sequence", type=int, required=True)
     bf.add_argument("--channel", default="stable")
     bf.add_argument("--engine", type=Path)
-    bf.add_argument("--dsv41", type=Path, help="folder of the DeepSeek engine packages' .entry.json files (feed member dsv41)")
     bf.add_argument("--shapes", type=Path, help="folder of the model-shape engines' .entry.json files (feed member shape_engines; pack-engine writes them for a package made with package_engine.py --shape)")
     bf.add_argument("--models", type=Path, help="folder of the models' <id>.entry.json files (feed member models: the model list setup and the screens show after the built-in ones)")
     bf.add_argument("--drafters", type=Path, help="folder of the DFlash2 drafters' .entry.json files (feed member drafters; pack-drafter writes them)")
@@ -496,9 +492,9 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({k: entry[k] for k in ("version", "platform", "size", "sha256")}, indent=1))
     elif a.cmd == "build-feed":
         doc = build_feed(a.out, key=_load_key(a.key), sequence=a.sequence, channel=a.channel, engine_dir=a.engine,
-                         control_dir=a.control, app_json=a.app_json, expires_days=a.expires_days, dsv41_dir=a.dsv41, drafters_dir=a.drafters, models_dir=a.models, shapes_dir=a.shapes)
+                         control_dir=a.control, app_json=a.app_json, expires_days=a.expires_days, drafters_dir=a.drafters, models_dir=a.models, shapes_dir=a.shapes)
         print(f"wrote {a.out / feedmod.FEED_NAME} (+ .sig); engines {len((doc.get('engine') or {}).get('packages', []))}, "
-              f"deepseek engines {len((doc.get('dsv41') or {}).get('packages', []))}, shape engines {len((doc.get('shape_engines') or {}).get('packages', []))}, drafters {len((doc.get('drafters') or {}).get('packages', []))}, models {len((doc.get('models') or {}).get('packages', []))}, control {'yes' if 'control' in doc else 'no'}, app {'yes' if 'app' in doc else 'no'}")
+              f"shape engines {len((doc.get('shape_engines') or {}).get('packages', []))}, drafters {len((doc.get('drafters') or {}).get('packages', []))}, models {len((doc.get('models') or {}).get('packages', []))}, control {'yes' if 'control' in doc else 'no'}, app {'yes' if 'app' in doc else 'no'}")
     elif a.cmd == "set-app-platform":
         url = a.url or f"https://github.com/Niko1221/Strata/releases/latest/download/{a.archive.name}"
         entry = set_app_platform(a.app_json, target=a.target, archive=a.archive, signature_file=a.sig, url=url, version=a.version,

@@ -127,10 +127,9 @@ INSTALLER_FILES = ("setup.py", "ref/load.py")   # ref/load.py: strata_pack.py (t
 INSTALLER_TOOLS = ("strata_mcp", "iq_pack", "strata_pack", "pack_index", "mtp_fetch", "mtp_pack", "mtp_rt", "draft_vocab",
                    "strata_tokenizer", "gguf_reader", "calibrate")
 #: tools run BY PATH (`python tools/.../x.py`) by setup.py, strata_cli or strata_control: no import names them, so setup_tool_imports() cannot find
-#: them.  DeepSeek's setup and launch run dsv41/pack_gguf.py (the model folder), dsv41/smoke.py (the engine's first answer) and dsv41/tune.py
-#: (the short tune); setup.py's other by-path tools (nvfp4_local_pack, strata_bench, strata_inspect) were missing from the bundle the same way.
+#: them.  setup.py's by-path tools (nvfp4_local_pack, strata_bench, strata_inspect) were missing from the bundle once.
 #: tests/terminal/test_bundle_tools_paths.py reads the by-path references out of the source and fails when one is missing from the bundle.
-INSTALLER_SCRIPTS = ("dsv41/pack_gguf", "dsv41/smoke", "dsv41/tune", "nvfp4_local_pack", "strata_bench", "strata_inspect")
+INSTALLER_SCRIPTS = ("nvfp4_local_pack", "strata_bench", "strata_inspect")
 INSTALLER_DATA = "data"           # draft vocabularies, expert profiles: 2 MB
 #: gguf-py and llama.cpp's HF converter at the llama.cpp pin (third_party/strata-gguf-py, 1.8 MB, MIT): the preparation tools import them, so
 #: no llama.cpp download is needed to prepare a model (before 0.2.15 the installed Terminal fetched the 170 MB zip for this)
@@ -262,7 +261,7 @@ def local_imports(folder: Path, entry: tuple[str, ...]) -> list[str]:
         source = folder / "tools" / f"{name}.py"
         if not source.exists():
             raise SystemExit(f"installer tool missing: tools/{name}.py")
-        sub = name.rsplit("/", 1)[0] + "/" if "/" in name else ""     # (tools/dsv41/tune.py imports its neighbour smoke.py)
+        sub = name.rsplit("/", 1)[0] + "/" if "/" in name else ""     # (a nested tool imports its neighbours first)
         for node in ast.walk(ast.parse(source.read_text(encoding="utf-8-sig"))):
             names = [a.name.split(".")[0] for a in node.names] if isinstance(node, ast.Import) else                 [node.module.split(".")[0]] if isinstance(node, ast.ImportFrom) and node.module and node.level == 0 else []
             for m in names:

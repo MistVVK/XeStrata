@@ -61,8 +61,8 @@ commit=${STRATA_BUILD_COMMIT:-$(git -C "$repo" rev-parse HEAD 2>/dev/null || tru
 case "$commit" in *[!0-9a-f]*|"") commit="" ;; esac
 
 # 1. the Terminal's sources: exactly what packaging/package_terminal.py copies (the working tree, so local edits are in the image)
-# tools/: every .py at any depth, because the bundle's DeepSeek scripts are nested (INSTALLER_SCRIPTS in package_terminal.py names dsv41/*:
-# the Dockerfile's terminal stage stops at "installer tool missing: tools/dsv41/tune.py" when only the top-level modules are in the context)
+# tools/: every .py at any depth (package_terminal.py may name a nested tool; the Dockerfile's terminal stage stops at "installer tool missing"
+# when one is not in the context)
 cd "$repo"
 # metal/tools/: the two repack scripts the bundle carries (INSTALLER_METAL_TOOLS in package_terminal.py; without them the terminal stage
 # stops at "No such file or directory: '/src/metal/tools/metal_repack.py'", as the v0.2.11 image build did)
@@ -71,7 +71,7 @@ if git rev-parse --git-dir >/dev/null 2>&1; then
   # shellcheck disable=SC2086
   { git ls-files -z -- $paths ':(glob)tools/**/*.py'; } | tar --null -T - -cf - | tar -xf - -C "$ctx/terminal-src"
 else
-  tools_py=$(find tools -name '*.py')          # nested too: the bundle's dsv41 scripts live in tools/dsv41/
+  tools_py=$(find tools -name '*.py')          # nested too
   # shellcheck disable=SC2086
   tar -cf - --exclude='__pycache__' $paths $tools_py | tar -xf - -C "$ctx/terminal-src"
 fi

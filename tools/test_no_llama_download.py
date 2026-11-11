@@ -15,9 +15,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 SCRIPTS = ["packaging/build_cuda_linux.sh", "packaging/build_cuda_linux_aarch64.sh", "packaging/build_hip_linux.sh", "packaging/build_hip_gfx1103.sh",
-           "packaging/build_sycl_linux.sh", "packaging/build_split_cuda.sh", "packaging/build_split_hip.sh", "packaging/build_dsv41_cuda.sh",
-           "packaging/build_dsv41_hip_linux.sh", "packaging/build_dsv41_windows.bat", "packaging/build_vision_windows.bat", "packaging/build_vision_mac.sh",
-           "packaging/mac/build_dsv41_engine.sh", "packaging/mac/build_engine.sh", "spark/build_engine.sh", "tools/dsv41/build_hip_linux.sh", "tools/dsv41/win/build_hip_win.bat",
+           "packaging/build_sycl_linux.sh", "packaging/build_split_cuda.sh", "packaging/build_split_hip.sh",
+           "packaging/build_vision_windows.bat", "packaging/build_vision_mac.sh",
+           "packaging/mac/build_engine.sh", "spark/build_engine.sh",
            "tools/hip/build_windows.bat", "Dockerfile", "docker/Dockerfile", "docker/entrypoint.sh", ".github/workflows/backends.yml",
            ".github/workflows/metal-build.yml", "metal/setup_mac.py", "sycl/setup_intel.py"]
 # a download of llama.cpp: its git remote or archive URL, setup's fetch function, the downloaded folder as a requirement
