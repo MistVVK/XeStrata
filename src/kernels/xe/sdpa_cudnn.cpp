@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/image/qi_sdpa_cudnn.cpp - see qi_sdpa.hpp, qi_conv.hpp and strata/kernels/sdpa_cudnn.hpp: cuDNN's SDPA and
+// src/kernels/xe/sdpa_cudnn.cpp - see sdpa_cudnn_internal.hpp, qi_conv.hpp and strata/kernels/sdpa_cudnn.hpp: cuDNN's SDPA and
 // convolution through cudnn-frontend on NVIDIA GPUs (contrib-llvm), built into the kernels' library (the plain models'
 // prompt shares the SDPA, as oneDNN's), cuDNN opened at the first use (the user's installation, not free software:
 // open_cudnn), on the queue's CUDA stream through a native command (a SYCL graph being recorded takes it), a cuDNN
@@ -20,13 +20,13 @@ void* cudnn_dlhandle = nullptr;
 }
 #endif
 
-#include "qi_conv.hpp"
+#include "../../image/qi_conv.hpp"
 #include "strata/core/graph.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/sdpa_cudnn.hpp"
 #include "strata/platform/downgrade.hpp"
 #include "strata/platform/env.hpp"
-#include "qi_sdpa.hpp"
+#include "strata/kernels/sdpa_cudnn_internal.hpp"
 
 #include <sycl/sycl.hpp>
 

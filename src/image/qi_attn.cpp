@@ -9,8 +9,8 @@
 #include "strata/image/qi_kernels.hpp"
 
 #include "strata/core/gpu.hpp"
-#include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/timed_choice.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/flash_attn.hpp"
 #include "strata/kernels/f16_gpu.hpp"
@@ -22,18 +22,11 @@
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
-#include <atomic>
-#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <functional>
-#include <map>
-#include <memory>
-#include <mutex>
 #include <stdexcept>
-#include <string>
-#include <type_traits>
+#include <tuple>
 #include <utility>
 
 namespace strata::image {
@@ -57,19 +50,10 @@ namespace {
 thread_local bool g_no_i8 = false;   // the 16-bit path's run while the int8 one is timed against it
 thread_local bool g_no_sdpa = false;   // the engine's own kernel's run while the maker's is timed against it
 
-// qi_attention's choices of the int8 kernel, a GPU's: (image rows, keys) / 1024 -> int8
-struct Choices {
-    std::mutex mu;
-    std::map<std::pair<int64_t, int64_t>, bool> of;
-};
-Choices& choices_of(sycl::queue& q) {
-    static core::PerDevice<std::shared_ptr<Choices>> of;
-    return *of.get(q.get_device(), [] { return std::make_shared<Choices>(); });
-}
-Choices& sdpa_choices_of(sycl::queue& q) {   // the maker's kernel (true) or the engine's own, as choices_of
-    static core::PerDevice<std::shared_ptr<Choices>> of;
-    return *of.get(q.get_device(), [] { return std::make_shared<Choices>(); });
-}
+using ChoiceShape = std::tuple<int64_t, int64_t, int64_t>;
+using Choices = core::TimedCache<sycl::device, ChoiceShape, bool>;
+Choices& choices_of() { static Choices choices; return choices; }
+Choices& sdpa_choices_of() { static Choices choices; return choices; }
 int forced_i8() {   // STRATA_IMAGE_ATTN_I8: 1 always, 0 never, else -1 (timed)
     static const int forced = [] {
         const char* v = strata::env_get("IMAGE_ATTN_I8");
@@ -107,12 +91,9 @@ bool qi_attention_i8_preferred(int64_t rows, int64_t keys, int64_t heads, void* 
     if (forced_i8() >= 0) return forced_i8() == 1;
     rows = std::max<int64_t>(rows, 2048);   // qi_attention times from 2048 rows on
     keys = std::max(keys, rows);
-    Choices& ch = choices_of(q);
-    const auto key = std::make_pair((rows + 1023) / 1024, (keys + 1023) / 1024);
-    {
-        std::lock_guard<std::mutex> lock(ch.mu);
-        if (const auto it = ch.of.find(key); it != ch.of.end()) return it->second;
-    }
+    Choices& ch = choices_of();
+    const auto key = std::make_tuple(rows, keys, heads);
+    if (const auto found = ch.get(dev, key)) return *found;
     // not timed yet: qi_attention times it, on rows of zeros (the kernels' speed does not ask what the values are)
     const int64_t C = heads * D, TP = qi_attn_rows(keys);
     uint16_t *qkv = nullptr, *out = nullptr;
@@ -127,9 +108,7 @@ bool qi_attention_i8_preferred(int64_t rows, int64_t keys, int64_t heads, void* 
         qi_attention(qkv, qkv + TP * C, qkv + 2 * TP * C, keys, heads, D, 0, out, stream, nullptr,
                      keys - rows, true);
         q.wait();
-        std::lock_guard<std::mutex> lock(ch.mu);
-        const auto it = ch.of.find(key);
-        use = it != ch.of.end() && it->second;
+        use = ch.get(dev, key).value_or(false);
     } catch (...) {
         strata::gpu::free(qkv);
         strata::gpu::free(out);
@@ -151,48 +130,34 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
     int64_t row_end = T;
     const int64_t r0 = std::max(first, n_text);
     // the int8 kernel: STRATA_IMAGE_ATTN_I8=1 always, 0 never; else the image rows timed in it and in the 16-bit kernel
-    // that would take them (the GPU maker's, else the engine's own), once a GPU and a shape (the rows and the keys, in
-    // steps of 1024: a generation's and an edit's differ), from 2048 image rows on (fewer: not taken)
+    // that would take them (the GPU maker's, else the engine's own), once a GPU and a shape (rows, keys and heads),
+    // from 2048 image rows on (fewer: not taken). A generation's and an edit's shapes differ.
     bool i8_done = false;
     if (int8 && T - r0 >= 256) {
         sycl::queue& qq = core::Runtime::get().stream(stream);
         const int forced = forced_i8();
-        Choices& ch = choices_of(qq);
-        const auto key = std::make_pair((T - r0 + 1023) / 1024, (T + 1023) / 1024);
+        Choices& ch = choices_of();
+        const auto key = std::make_tuple(T - r0, T, heads);
         auto run_i8 = [&] {
             return kernels::flash_attn_i8(q16, k16, v16, T, heads, r0, first, out16, stream, i8_stats);
         };
         int use = forced;
         if (use < 0) {
-            std::lock_guard<std::mutex> lock(ch.mu);
-            const auto it = ch.of.find(key);
-            if (it != ch.of.end()) use = it->second;
-            else if (T - r0 >= 2048 && kernels::flash_attn_i8_kind(stream) != 0) {
-                auto timed = [&](const std::function<bool()>& f) {
-                    if (!f()) return -1.0;
-                    qq.wait();
-                    const auto t0 = std::chrono::steady_clock::now();
-                    f();
-                    qq.wait();
-                    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            const auto found = ch.get(qq.get_device(), key);
+            if (found) use = *found;
+            else if (T - r0 >= 2048 && kernels::flash_attn_i8_kind(stream) != 0 &&
+                     qq.ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording) {
+                auto run_f16 = [&] {
+                    if (qi_sdpa(q16, k16, v16, r0, T, T, heads, head_dim,
+                                out16 + (r0 - first) * heads * head_dim, stream)) return true;
+                    struct Guard { Guard() { g_no_i8 = true; } ~Guard() { g_no_i8 = false; } } guard;
+                    qi_attention(q16, k16, v16, T, heads, head_dim, n_text, out16, stream, key_lim, first);
+                    return true;
                 };
-                const double i8ms = timed(run_i8);
-                double f16ms = timed([&] {   // the maker's kernel on the image rows, else the engine's on all asked
-                    return qi_sdpa(q16, k16, v16, r0, T, T, heads, head_dim, out16 + (r0 - first) * heads * head_dim,
-                                   stream);
-                });
-                if (f16ms < 0.0) {
-                    g_no_i8 = true;
-                    f16ms = timed([&] {
-                        qi_attention(q16, k16, v16, T, heads, head_dim, n_text, out16, stream, key_lim, first);
-                        return true;
-                    });
-                    g_no_i8 = false;
-                }
-                // int8 unless it is clearly the slower: a near tie (the RX 9060 XT, Qwen-Image's 4096 rows, 2026-10-29:
-                // 6.58 against 6.66 ms) picked one or the other from start to start, and with it the image
-                use = i8ms > 0.0 && i8ms < f16ms * 1.05;
-                ch.of[key] = use;
+                const auto measured = core::timed_choice({{run_i8}, {run_f16}}, [&] { qq.wait_and_throw(); });
+                const double i8ms = measured.seconds[0] * 1000, f16ms = measured.seconds[1] * 1000;
+                use = measured.pick == 0;
+                use = ch.put(qq.get_device(), key, use != 0);
                 std::fprintf(stderr, "xestrata-image: the attention's image rows %s at %lld rows of %lld keys (int8 "
                                      "%.2f ms, 16-bit %.2f ms)\n", use ? "in int8" : "in 16 bits", (long long) (T - r0),
                              (long long) T, i8ms, f16ms);
@@ -203,42 +168,27 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
         if (use == 1 && !g_no_i8) i8_done = run_i8();
     }
     // the maker's 16-bit kernel (qi_sdpa) or the engine's own, once a GPU and a shape (as the int8 kernel's choice) on
-    // the first attention of 2048 image rows or more, timed both ways: the maker's unless the engine's own is clearly
+    // the first attention of a shape, timed both ways: the maker's unless the engine's own is clearly
     // the faster (5%: a near tie taken one way or the other from start to start would change the image with it)
     auto maker = [&] {
         if (g_no_sdpa) return false;
-        if (T - r0 < 2048) return true;
         sycl::queue& qq = core::Runtime::get().stream(stream);
-        Choices& ch = sdpa_choices_of(qq);
-        const auto key = std::make_pair((T - r0 + 1023) / 1024, (T + 1023) / 1024);
-        {
-            std::lock_guard<std::mutex> lock(ch.mu);
-            const auto it = ch.of.find(key);
-            if (it != ch.of.end()) return it->second;
-        }
-        auto timed = [&](const std::function<bool()>& f) {
-            if (!f()) return -1.0;
-            qq.wait();
-            const auto t0 = std::chrono::steady_clock::now();
-            f();
-            qq.wait();
-            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        Choices& ch = sdpa_choices_of();
+        const auto key = std::make_tuple(T - r0, T, heads);
+        if (const auto found = ch.get(qq.get_device(), key)) return *found;
+        if (qq.ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording) return true;
+        auto run_maker = [&] {
+            return qi_sdpa(q16, k16, v16, r0, T, T, heads, head_dim,
+                           out16 + (r0 - first) * heads * head_dim, stream);
         };
-        const double mk = timed([&] {
-            return qi_sdpa(q16, k16, v16, r0, T, T, heads, head_dim, out16 + (r0 - first) * heads * head_dim, stream);
-        });
-        double own = -1.0;
-        if (mk >= 0.0) {
-            g_no_sdpa = true;
-            own = timed([&] {
-                qi_attention(q16, k16, v16, T, heads, head_dim, n_text, out16, stream, key_lim, first);
-                return true;
-            });
-            g_no_sdpa = false;
-        }
-        const bool use = mk >= 0.0 && !(own >= 0.0 && own < mk * 0.95);
-        std::lock_guard<std::mutex> lock(ch.mu);
-        ch.of[key] = use;
+        auto run_own = [&] {
+            struct Guard { Guard() { g_no_sdpa = true; } ~Guard() { g_no_sdpa = false; } } guard;
+            qi_attention(q16, k16, v16, T, heads, head_dim, n_text, out16, stream, key_lim, first);
+            return true;
+        };
+        const auto measured = core::timed_choice({{run_maker}, {run_own}}, [&] { qq.wait_and_throw(); });
+        const double mk = measured.seconds[0] * 1000, own = measured.seconds[1] * 1000;
+        const bool use = ch.put(qq.get_device(), key, measured.pick == 0);
         if (mk >= 0.0)
             std::fprintf(stderr,
                          "xestrata-image: the attention's image rows by %s at %lld rows of %lld keys (the maker's %.2f "
@@ -258,14 +208,8 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
     sycl::queue& q = core::Runtime::get().stream(stream);
     const sycl::device dev = q.get_device();
     const int p = kernels::flash_attn_path(&dev);
-    // The sub-groups a work-group: more share the keys' tiles in the caches, fewer leave the GPU freer to overlap
-    // work-groups.  The fastest of the most that fit, a half and a quarter of it, timed once a GPU on the first
-    // attention of 2048 rows or more (the images' own inputs; a small first image would not show it): 1024 x 1024
-    // block, the B70 4 (11.88 -> 11.44 ms), the RTX 4070 2 (11.55 -> 10.53 ms).  Until then, the most.
-    static core::PerDevice<std::shared_ptr<std::atomic<int>>> tuned_of;
-    std::atomic<int>& tuned = *tuned_of.get(q.get_device(), [] { return std::make_shared<std::atomic<int>>(0); });
     // rows f .. e - 1 by the shared kernel (flash_attn.hpp), the dense layout; `fma`: its FMA form (no matrix engines)
-    auto run = [&](int nsg, int64_t f, int64_t e, bool fma = false) {
+    auto run = [&](int64_t f, int64_t e, bool fma = false) {
         kernels::FlashAttnArgs a;
         a.q = q16;
         a.q_ld = heads * D;
@@ -283,7 +227,7 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
         a.out_ld = heads * D;
         a.scale = 1.0f / std::sqrt((float) D);
         a.fma = fma;
-        return kernels::flash_attn(a, stream, nsg);
+        return kernels::flash_attn_tuned(a, stream);
     };
     // The references' rows (spans) as image rows past a context of b keys, through the image rows' kernels (the int8
     // one or the GPU maker's, timed as the image rows' are; an edit's 4096 rows of a reference, 4104 keys: 22.8 ms a
@@ -302,33 +246,10 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
         if (row_end > f) segs.emplace_back(f, row_end);
     }
     const int most = p >= 0 ? kernels::flash_attn_nsg_most(&dev, D) : 0;
-    int nsg = tuned.load();
-    const auto big = std::max_element(segs.begin(), segs.end(), [](const auto& x, const auto& y) {
-        return x.second - x.first < y.second - y.first;
-    });
-    if (most > 0 && nsg == 0 && big != segs.end() && big->second - big->first >= 2048) {
-        q.wait();
-        double best = 1e30;
-        std::string said;
-        for (int n = most; n >= std::max(1, most / 4); n /= 2) {
-            run(n, big->first, big->second);   // its kernel built, its caches warm
-            q.wait();
-            const auto t0 = std::chrono::steady_clock::now();
-            run(n, big->first, big->second);
-            q.wait();
-            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            said += (said.empty() ? "" : ", ") + std::to_string(n) + ": " + std::to_string(ms).substr(0, 5) + " ms";
-            if (ms < best) { best = ms; nsg = n; }
-        }
-        tuned.store(nsg);
-        std::fprintf(stderr, "xestrata-image: the attention takes %d sub-groups a work-group (timed at %lld rows of %lld "
-                             "keys: %s)\n", nsg, (long long) (big->second - big->first), (long long) T, said.c_str());
-    }
-    if (nsg == 0) nsg = most;
     bool done = most > 0;
     for (const auto& [f, end] : segs)
-        if (done) done = run(nsg, f, end);
-    if (!done && !run(0, first, row_end, true))
+        if (done) done = run(f, end);
+    if (!done && !run(first, row_end, true))
         throw std::invalid_argument("qi_attention: no form of the attention takes the shape");
     if (!stream) q.wait();
 }

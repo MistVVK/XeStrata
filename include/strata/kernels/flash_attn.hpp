@@ -75,6 +75,9 @@ int flash_attn_nsg_most(const void* sycl_device, int64_t head_dim);
 /// 4, 8 and 10 or 12 query heads a KV head).
 bool flash_attn(const FlashAttnArgs& a, void* stream, int nsg = 0);
 
+/// Choose the sub-group count by device and shape on substantial matrix-engine work.
+bool flash_attn_tuned(const FlashAttnArgs& a, void* stream);
+
 // The int8 path (flash_attn_i8.cpp, SageAttention's scheme): rows that see every key, head_dim 128, Q, K and V FP16
 // [rows][heads * 128] (the rows past T up to a multiple of flash_attn_i8_chunk zero).  Q . K^T and P . V on the int8
 // matrix instructions: RDNA3's and RDNA4's WMMA (comfy-kitchen's kernels where the build carries them, with their own

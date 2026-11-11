@@ -1059,7 +1059,7 @@ if(STRATA_ENABLE_XE)
     if(_strata_aot_libs)
       # a module of its own, which the image engine opens on an AMD GPU only (it needs AMD's HIP runtime, which a
       # machine with other makers' GPUs need not have), beside the engine, the same on Linux and Windows
-      add_library(strata_sdpa_aotriton SHARED src/image/qi_sdpa_aotriton.cpp)
+      add_library(strata_sdpa_aotriton SHARED src/kernels/xe/sdpa_aotriton_module.cpp)
       # aotriton's headers as a system folder: on Windows they put dllimport on its enums, which clang ignores
       target_include_directories(strata_sdpa_aotriton SYSTEM PRIVATE ${_strata_aot_dir}/include)
       target_include_directories(strata_sdpa_aotriton PRIVATE ${_strata_hip_inc})
@@ -1181,18 +1181,18 @@ if(STRATA_ENABLE_XE)
         DOWNLOAD_EXTRACT_TIMESTAMP FALSE SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_cudnn_fe-src
         SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_cudnn_fe-subbuild)
       # built into the kernels' library: the plain models' prompt attention shares the SDPA (kernels::cudnn_sdpa)
-      target_sources(strata_kernels PRIVATE src/image/qi_sdpa_cudnn.cpp)
+      target_sources(strata_kernels PRIVATE src/kernels/xe/sdpa_cudnn.cpp)
       # the CUDA runtime's headers cudnn.h includes: on Windows the cross build's (above, oneMath's cuBLAS), as the
       # toolkit's can sit among the build machine's C library's
       set(_strata_cudnn_cuda_inc ${_strata_cuda_root}/include)
       if(WIN32 AND EXISTS "${STRATA_CUDA_WINDOWS_LIBS}/include/cuda_runtime_api.h")
         set(_strata_cudnn_cuda_inc ${STRATA_CUDA_WINDOWS_LIBS}/include)
       endif()
-      set_property(SOURCE src/image/qi_sdpa_cudnn.cpp APPEND PROPERTY INCLUDE_DIRECTORIES
+      set_property(SOURCE src/kernels/xe/sdpa_cudnn.cpp APPEND PROPERTY INCLUDE_DIRECTORIES
                    ${strata_cudnn_fe_SOURCE_DIR}/include ${_strata_cudnn_inc} ${_strata_cudnn_cuda_inc})
-      set_property(SOURCE src/image/qi_sdpa_cudnn.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+      set_property(SOURCE src/kernels/xe/sdpa_cudnn.cpp APPEND PROPERTY COMPILE_DEFINITIONS
                    NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING CUDNN_FRONTEND_SKIP_JSON_LIB)
-      set_property(SOURCE src/image/qi_sdpa_cudnn.cpp APPEND PROPERTY COMPILE_OPTIONS -w)   # its headers' warnings
+      set_property(SOURCE src/kernels/xe/sdpa_cudnn.cpp APPEND PROPERTY COMPILE_OPTIONS -w)   # its headers' warnings
       set_property(SOURCE src/image/qi_sdpa.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp src/image/yolo_detect.cpp
                    src/image/hunyuanimage3_vae.cpp src/upscale/esrgan.cpp
                    src/image/aux_net.cpp src/image/qi_attn_train.cpp src/kernels/xe/prompt_attn.cpp

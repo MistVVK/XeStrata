@@ -25,6 +25,7 @@
 
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/timed_choice.hpp"
 #include "attn_parts.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/kv_q4.hpp"
@@ -43,11 +44,12 @@
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
 #include <mutex>
+#include <map>
+#include <tuple>
 #include <string>
 #include <unordered_map>
 
@@ -665,37 +667,35 @@ bool run_in_place(sycl::queue& q, const FlashAttnArgs& a, int nsg) {
         const std::string f = e;
         return go(f == "fma" ? 2 : f == "tiles" ? 1 : 0);
     }
-    static std::mutex mu;
-    static std::unordered_map<sycl::device, int> chose;
+    using Shape = std::tuple<int64_t, int64_t, int64_t, int64_t, bool, int64_t, int64_t>;
+    static core::TimedCache<sycl::device, Shape, int> chose;
     const sycl::device dev = q.get_device();
-    {
-        std::lock_guard<std::mutex> lock(mu);
-        auto it = chose.find(dev);
-        if (it != chose.end()) return go(it->second);
-    }
+    // Paged prompts keep the old device/head-size choice and one sample. Fourfold key classes still slowed the
+    // Qwen3.5-9B 32K prefill: B70 12.79 -> 26.83 s, RTX 4070 12.26 -> 20.85 s (2026-11-11). Dense image and
+    // non-training dense shapes use the fourfold key class and the full trial.
+    // Training also keeps its previous form trial: four steps on the B70 took 2.17 -> 2.29 s/step, and on the
+    // RTX 4070 3.88 -> 4.06 s/step, with the common multi-sample trial and sub-group tuning (2026-11-11).
+    const bool legacy = a.page_table != nullptr || a.pools_format >= 0 || a.lse != nullptr;
+    const Shape shape = legacy ? Shape{} : Shape{a.row_end - a.first, core::timed_key_class(a.keys), a.n_head, a.n_kv,
+                                                a.out_f32, a.n_causal != 0, a.window != 0};
+    if (const auto found = chose.get(dev, shape)) return go(*found);
+    if (core::timing_depth > 0) return go(0);
     if ((double) (a.row_end - a.first) * (double) a.keys * (double) a.n_head < (double) (int64_t{1} << 26)) return go(0);
-    // a queue recording a SYCL graph cannot be waited on: the whole form, the choice left to a call outside one
+    // A recording queue cannot be waited on. Defer the choice until a call outside a graph.
     namespace sx = sycl::ext::oneapi::experimental;
     if (q.ext_oneapi_get_state() == sx::queue_state::recording) return go(0);
-    int best = -1;
-    double best_t = 0.0;
-    for (int form = 0; form < 3; ++form) {
-        bool ok = go(form);
-        q.wait();
-        const auto t0 = std::chrono::steady_clock::now();
-        ok = ok && go(form);
-        q.wait();
-        const double t = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        if (ok && (best < 0 || t < best_t)) {
-            best = form;
-            best_t = t;
-        }
+    const auto measured = core::timed_choice({{[&] { return go(0); }}, {[&] { return go(1); }},
+                                              {[&] { return go(2); }}}, [&] { q.wait_and_throw(); }, legacy ? 1 : 5);
+    int best = measured.pick;
+    if (legacy) {
+        best = -1;
+        for (size_t i = 0; i < measured.seconds.size(); ++i)
+            if (measured.seconds[i] >= 0 && (best < 0 || measured.seconds[i] < measured.seconds[(size_t) best]))
+                best = (int) i;
     }
     if (best < 0) return false;
-    if (best != 2) go(best);   // the outputs of the form kept (the FMA form ran last)
-    std::lock_guard<std::mutex> lock(mu);
-    chose[dev] = best;
-    return true;
+    best = chose.put(dev, shape, best);
+    return go(best);
 }
 
 template<int P, int D, int F>
@@ -2083,6 +2083,37 @@ bool flash_attn(const FlashAttnArgs& a, void* stream, int nsg) {
     if (a.head_dim == 128) return run_path<128>(q, a, nsg, p);
     if (a.head_dim == 256) return run_path<256>(q, a, nsg, p);
     return false;
+}
+
+bool flash_attn_tuned(const FlashAttnArgs& a, void* stream) {
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    const auto dev = q.get_device();
+    const int most = flash_attn_nsg_most(&dev, a.head_dim);
+    // The paged prompt's subgroup trial contributed to the 32K regression above. Keep its former most-count path.
+    if (a.fma || a.sel_ids || a.page_table || a.pools_format >= 0 || most <= 1 || a.row_end - a.first < 2048)
+        return flash_attn(a, stream);
+    using Shape = std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int, bool, int64_t, int64_t>;
+    static core::TimedCache<sycl::device, Shape, int> choices;
+    const Shape shape{a.row_end - a.first, core::timed_key_class(a.keys), a.n_head, a.n_kv, a.head_dim,
+                      a.pools_format, a.out_f32, a.n_causal != 0, a.window != 0};
+    int nsg = choices.get(dev, shape).value_or(0);
+    namespace sx = sycl::ext::oneapi::experimental;
+    if (nsg == 0 && core::timing_depth == 0 && q.ext_oneapi_get_state() != sx::queue_state::recording) {
+        // Settle the whole / tiled / FMA choice first, so every subgroup candidate uses the same form.
+        if (!flash_attn(a, stream, most)) return false;
+        q.wait_and_throw();
+        std::vector<int> counts;
+        std::vector<core::TimedCandidate> candidates;
+        for (int n = most; n >= std::max(1, most / 4); n /= 2) {
+            counts.push_back(n);
+            candidates.push_back({[&, n] { return flash_attn(a, stream, n); }});
+        }
+        const auto measured = core::timed_choice(candidates, [&] { q.wait_and_throw(); });
+        if (measured.pick < 0) return false;
+        nsg = counts[(size_t) measured.pick];
+        nsg = choices.put(dev, shape, nsg);
+    }
+    return flash_attn(a, stream, nsg);
 }
 
 bool flash_attn_select(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/kernels/sdpa_aotriton.hpp - aotriton's flash attention on AMD GPUs (src/kernels/xe/sdpa_aotriton.cpp
-// opens its module, src/image/qi_sdpa_aotriton.cpp, where the build has it): the image attention (qi_sdpa) and the
+// opens its module, src/kernels/xe/sdpa_aotriton_module.cpp, where the build has it): the image attention (qi_sdpa) and the
 // plain models' causal prompt (prompt_attn).
 #pragma once
 

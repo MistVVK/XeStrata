@@ -88,14 +88,17 @@ static inline Library library(sycl::queue& q, const Request& r, void* cudnn_out 
     return Library::none;
 }
 
-/// A small fraction of the device's memory, also bounded by its largest allocation (including the engine's limits).
+/// A small fraction of device memory, bounded by half its largest allocation (including the engine's limits), so the
+/// scratch never exceeds that allocation.  On RX 7900 XTX the former /8 allocation bound split a 3456-wide product
+/// at 19,418 rows instead of the earlier 32,768-row band; this bound gives 58,216 and brought MOSS-Image decode from
+/// 68 to 51 ms and Anima from 58 to 43 ms (512 square, 2026-11-11).  The actual band follows the device and room.
 inline int64_t col_values(sycl::queue& q) {
     const auto dev = q.get_device();
     uint64_t total = dev.get_info<sycl::info::device::global_mem_size>();
     uint64_t largest = dev.get_info<sycl::info::device::max_mem_alloc_size>();
     if (const uint64_t limit = core::vram_limit_bytes()) total = std::min(total, limit);
     if (const uint64_t limit = core::max_alloc_limit_bytes()) largest = std::min(largest, limit);
-    return (int64_t) (std::min(total / 128, largest / 8) / sizeof(uint16_t));
+    return (int64_t) (std::min(total / 64, largest / 2) / sizeof(uint16_t));
 }
 
 /// Shared product driver: point products read the input directly; the other convolutions unfold bands that fit the

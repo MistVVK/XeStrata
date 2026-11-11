@@ -15,6 +15,7 @@
 
 #include "tile_sides.hpp"
 #include "qi_conv.hpp"
+#include "vae_attention.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -25,7 +26,6 @@
 namespace strata::image {
 
 namespace gpu = strata::gpu;
-namespace syclex = sycl::ext::oneapi::experimental;
 
 namespace {
 
@@ -84,40 +84,6 @@ void unnorm_tokens16(const float* z, const float* mean, const float* sd, int64_t
     });
 }
 
-// rms16 a sub-group of 32 a pixel, PIX pixels a work-group
-struct Rms16 {
-    static constexpr int64_t SG = 32, PIX = 8, LANES = SG * PIX;
-    const float *x, *g;
-    int64_t HW, C;
-    bool silu;
-    uint16_t* out16;
-    void operator()(sycl::nd_item<1> it) const {
-        const auto sg = it.get_sub_group();
-        const int64_t p = static_cast<int64_t>(it.get_group_linear_id()) * PIX + sg.get_group_linear_id();
-        const int64_t lane = sg.get_local_linear_id();
-        if (p >= HW) return;   // the whole sub-group
-        const float* r = x + p * C;
-        float ss = 0.f;
-        for (int64_t c = lane; c < C; c += SG) ss += r[c] * r[c];
-        const float inv = 1.f / sycl::sqrt(sycl::reduce_over_group(sg, ss, sycl::plus<float>()) / (float) C + 1e-12f);
-        for (int64_t c = lane; c < C; c += SG) {
-            float v = r[c] * inv * g[c];
-            if (silu) v = v / (1.f + sycl::exp(-v));
-            out16[p * C + c] = f16_from_f32(v);
-        }
-    }
-    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<SG>}; }
-};
-
-// out16[p] = RMS-normed x[p] over the channels times g (SiLU after it when `silu`): a sub-group of 32 a pixel, the
-// sum within it (a work-group a pixel and its sum through local memory and barriers took the RX 9060 XT 14.8 ms a
-// call on average in a 1024 x 1024 decode)
-void rms16(const float* x, const float* g, int64_t HW, int64_t C, bool silu, uint16_t* out16, void* s) {
-    q_of(s).parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((HW + Rms16::PIX - 1) / Rms16::PIX * Rms16::LANES)),
-                                           sycl::range<1>((size_t) Rms16::LANES)),
-                         Rms16{x, g, HW, C, silu, out16});
-}
-
 // y [2H][2W][cout] += the up block's input xin [H][W][cin] spread: channel c of pixel (2h + a, 2w + b) is the input
 // channel ((c * ft + ft - 1) * 4 + 2a + b) / rep of pixel (h, w), rep = cout * ft * 4 / cin (one frame, the first
 // chunk's last of its ft)
@@ -129,17 +95,6 @@ void dupup_add(float* y, const float* xin, int64_t H, int64_t W, int64_t cin, in
         const int64_t a = Y % 2, bb = X % 2;
         const int64_t src = ((c * ft + ft - 1) * 4 + 2 * a + bb) / rep;
         y[i] += xin[((Y / 2) * W + X / 2) * cin + src];
-    });
-}
-
-// qkv [HW][3C] -> q16, k16 [HW][C] and vt16 [C][HW]
-void split_qkv16(const float* qkv, int64_t HW, int64_t C, uint16_t* q16, uint16_t* k16, uint16_t* vt16, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (HW * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t p = i / C, c = i - p * C;
-        q16[i] = f16_from_f32(qkv[p * 3 * C + c]);
-        k16[i] = f16_from_f32(qkv[p * 3 * C + C + c]);
-        vt16[c * HW + p] = f16_from_f32(qkv[p * 3 * C + 2 * C + c]);
     });
 }
 
@@ -466,9 +421,9 @@ void QiVae::conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, floa
 void QiVae::resblock(const Res& r, float*& x, int64_t H, int64_t W, int64_t cin) {
     const int64_t HW = H * W, cout = r.c1.out;
     float* tmp = t2_;
-    rms16(x, r.g1, HW, cin, true, a16_, s_);
+    vae_mid::rms16(x, r.g1, HW, cin, true, a16_, s_);
     conv(r.c1, a16_, H, W, tmp);
-    rms16(tmp, r.g2, HW, cout, true, a16_, s_);
+    vae_mid::rms16(tmp, r.g2, HW, cout, true, a16_, s_);
     if (r.sc.w != nullptr) {
         float* y = x == t0_ ? t1_ : t0_;   // the block's output: the shortcut's channels are not x's
         conv(r.c2, a16_, H, W, y);
@@ -483,22 +438,16 @@ void QiVae::resblock(const Res& r, float*& x, int64_t H, int64_t W, int64_t cin)
 void QiVae::attention(float* x, int64_t H, int64_t W, int64_t C, const float* g, const Conv& qkv_w, const Conv& proj) {
     const int64_t HW = H * W;
     float* qkv = x == t0_ ? t1_ : t0_;
-    rms16(x, g, HW, C, false, a16_, s_);
-    conv(qkv_w, a16_, H, W, qkv);
-    uint16_t *q16 = a16_, *k16 = a16_ + HW * C, *vt16 = a16_ + 2 * HW * C;
-    split_qkv16(qkv, HW, C, q16, k16, vt16, s_);
-    // a band of query rows at a time (their scores in t2_, probabilities in col16_), O into qkv's rows, which the
-    // split has copied: the whole [hw][hw] scores took a 1248 x 1872 image's decode 5 GB a buffer, and tiles
-    float* sc = t2_;
-    uint16_t* p16 = col16_;
-    for (int64_t r0 = 0, rows = attn_rows(HW); r0 < HW; r0 += rows) {
-        const int64_t n = std::min(rows, HW - r0);
-        gemm_.f16(q16 + r0 * C, k16, sc, n, HW, C);
-        qi_softmax16(sc, n, HW, 1.0f / std::sqrt((float) C), p16, s_);
-        gemm_.f16(p16, vt16, qkv + r0 * C, n, C, HW);   // O = P . V (V^T's rows are V's columns)
-    }
-    kernels::f32_to_f16_bulk(qkv, a16_, HW * C, s_);
-    conv(proj, a16_, H, W, x, true);
+    vae_mid::Attention a{H, W, C, attn_rows(HW)};
+    a.norm = vae_mid::Norm::rms; a.x = x; a.weight = g; a.normalized = a16_;
+    a.qkv = qkv;
+    a.q = a16_; a.k = a16_ + HW * C; a.vt = a16_ + 2 * HW * C;
+    a.p = col16_; a.scores = t2_; a.out = qkv;
+    vae_mid::run(a, gemm_, s_,
+        [&] { conv(qkv_w, a16_, H, W, qkv); },
+        [&] {
+            conv(proj, a16_, H, W, x, true);
+        });
 }
 
 QiVae::Need QiVae::need(int64_t h, int64_t w) const {
@@ -625,7 +574,7 @@ void QiVae::decode_piece(const float* z, int64_t h, int64_t w, float* rgba) {
             c = u.up.out;   // Wan 2.1's upsampler halves the channels
         }
     }
-    rms16(x, gout_, H * W, c, true, a16_, s_);
+    vae_mid::rms16(x, gout_, H * W, c, true, a16_, s_);
     float* out = x == t0_ ? t1_ : t0_;
     conv(cout_, a16_, H, W, out);
     to_rgba(out, H * W, cout_.out, rgba, s_);
@@ -710,7 +659,7 @@ bool QiVae::encode(const float* rgba, int64_t H, int64_t W, float* z, float* zst
     resblock(emid0_, x, H, W, c);
     attention(x, H, W, c, eag_, eaqkv_, eaproj_);
     resblock(emid1_, x, H, W, c);
-    rms16(x, egout_, H * W, c, true, a16_, s_);
+    vae_mid::rms16(x, egout_, H * W, c, true, a16_, s_);
     float* y = x == t0_ ? t1_ : t0_;
     conv(eout_, a16_, H, W, y);
     kernels::f32_to_f16_bulk(y, a16_, H * W * eout_.out, s_);

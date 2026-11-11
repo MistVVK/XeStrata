@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// include/strata/kernels/sdpa_cudnn.hpp - cuDNN's SDPA on NVIDIA GPUs (src/image/qi_sdpa_cudnn.cpp, built with
+// include/strata/kernels/sdpa_cudnn.hpp - cuDNN's SDPA on NVIDIA GPUs (src/kernels/xe/sdpa_cudnn.cpp, built with
 // STRATA_CUDNN in the contrib-llvm mode, cuDNN opened at the first use): the plain models' causal prompt (prompt_attn),
 // as the image attention's.
 #pragma once

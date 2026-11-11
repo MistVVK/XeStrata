@@ -15,6 +15,7 @@
 #include "strata/core/graph.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/timed_choice.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/rows_cols.hpp"
 #include "strata/platform/env.hpp"
@@ -22,7 +23,6 @@
 #if STRATA_ONEMATH
 #include "strata/kernels/matrix_report.hpp"
 #include <oneapi/math/blas.hpp>
-#include <chrono>
 #include <filesystem>
 #include <future>
 #include <map>
@@ -189,8 +189,8 @@ bool blas(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, 
 // X . W with W as it is (FP16; a training step's dgrad).
 enum class Own { f16 = 0, bf16 = 1, kn = 2 };
 
-// own_first's choices: by GPU, then by the product's kind, its rows' power-of-two class, N and K (under g_mutex)
-std::unordered_map<sycl::device, std::map<std::tuple<int, int, int64_t, int64_t>, bool>> g_own;
+// own_first's choices: by GPU, then by the product's kind, its rows' power-of-two class, N and K (in the process-local timed cache)
+core::TimedCache<sycl::device, std::tuple<int, int, int64_t, int64_t>, bool> g_own;
 
 // Whether a product of kind `k` and shape T x N x K on `stream`'s GPU takes XeStrata's own kernels (mma_gemm) before
 // oneMath's library: the faster of the two, `own` and `lib` (each runs the product itself, into its own output), timed
@@ -215,47 +215,26 @@ bool own_first(void* stream, Own k, int64_t T, int64_t N, int64_t K, bool measur
     int rows = 0;
     while (((int64_t) 1 << rows) < T) ++rows;
     const auto key = std::make_tuple((int) k, rows, N, K);
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        auto& m = g_own[dev];
-        if (const auto it = m.find(key); it != m.end()) return it->second;
-    }
+    if (const auto found = g_own.get(dev, key)) return *found;
     namespace sx = sycl::ext::oneapi::experimental;
     if (!measure || q.ext_oneapi_get_state() == sx::queue_state::recording) return false;
     // each once first (its kernels' build, the library's load), then the two in turn, the fastest of each kept: the
     // mean of three runs, one after the other, moved a shape from run to run, and the image with it (the RTX 4070,
     // Mage-Flow's 1024 x 384 x 384: the library 13.9 or 20.0 TFLOPS from start to start, 2026-11-11)
     double own_s = 0, lib_s = 0;
-    const auto time = [&](const std::function<void()>& f) {
-        const auto t0 = std::chrono::steady_clock::now();
-        f();
-        q.wait_and_throw();
-        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    };
     try {
-        q.wait_and_throw();
-        own();
-        lib();
-        q.wait_and_throw();
-        own_s = lib_s = 1e30;
-        for (int i = 0; i < 5; ++i) {
-            own_s = std::min(own_s, time(own));
-            lib_s = std::min(lib_s, time(lib));
-        }
+        const auto measured = core::timed_choice({{[&] { own(); return true; }}, {[&] { lib(); return true; }}},
+                                                 [&] { q.wait_and_throw(); });
+        own_s = measured.seconds[0];
+        lib_s = measured.seconds[1];
     } catch (const std::exception& e) {
         std::fprintf(stderr, "xestrata: measuring a dense product: %s\n", e.what());
         own_s = lib_s = 0;
     }
     // the own kernels only where they are 5% faster or more: a near tie stays with the library, so that the noise of a
     // trial does not flip a shape from run to run (as the image engine's W8A8 and FP16 forms are chosen)
-    const bool pick = own_s > 0 && lib_s > 0 && own_s * 1.05 < lib_s;
-    bool first = false;
-    {
-        std::lock_guard<std::mutex> lock(g_mutex);
-        auto& m = g_own[dev];
-        first = std::none_of(m.begin(), m.end(), [&](const auto& e) { return std::get<0>(e.first) == (int) k; });
-        m[key] = pick;
-    }
+    const auto [pick, first] = g_own.put_first(dev, key, own_s > 0 && lib_s > 0 && own_s * 1.05 < lib_s,
+                                              [&](const auto& shape) { return std::get<0>(shape) == (int) k; });
     if (own_s > 0 && lib_s > 0 && (first || strata::env_get("TRACE") != nullptr)) {
         const sycl::backend be = dev.get_backend();
         const char* name = be == sycl::backend::ext_oneapi_hip    ? "rocBLAS"

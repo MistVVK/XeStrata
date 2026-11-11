@@ -13,6 +13,7 @@
 
 #include "strata/core/graph.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/timed_choice.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
 #include <sycl/sycl.hpp>
@@ -20,6 +21,8 @@
 #include <algorithm>
 #include <cmath>
 #include <mutex>
+#include <map>
+#include <tuple>
 #include <unordered_map>
 #include <stdexcept>
 #include <string>
@@ -273,11 +276,10 @@ bool qi_sdpa_ex_library(const QiSdpa& a, void* stream) {
     return true;
 }
 
-void qi_sdpa_ex(const QiSdpa& a, void* stream) {
+void qi_sdpa_ex_own(const QiSdpa& a, void* stream) {
     if (a.batch <= 0 || a.lq <= 0 || a.heads <= 0) return;
     if (a.hd <= 0 || a.hd > 128) throw std::invalid_argument("qi_sdpa_ex: head size " + std::to_string(a.hd));
     if (a.lk <= 0) throw std::invalid_argument("qi_sdpa_ex: no keys");
-    if (qi_sdpa_ex_library(a, stream)) return;
     const sycl::device dev = queue_for(stream).get_device();
     const auto wg = (int64_t) dev.get_info<sycl::info::device::max_work_group_size>();
     const auto units = (int64_t) dev.get_info<sycl::info::device::max_compute_units>();
@@ -315,6 +317,36 @@ void qi_sdpa_ex(const QiSdpa& a, void* stream) {
     if (a.hd <= 32) rows_kernel<32>(a, qb, stream);
     else if (a.hd <= 64) rows_kernel<64>(a, qb, stream);
     else rows_kernel<128>(a, qb, stream);
+}
+
+void qi_sdpa_ex(const QiSdpa& a, void* stream) {
+    if (a.batch <= 0 || a.lq <= 0 || a.heads <= 0) return;
+    if (a.hd <= 0 || a.hd > 128 || a.lk <= 0 || a.key_len || a.bias || a.mask) {
+        qi_sdpa_ex_own(a, stream);
+        return;
+    }
+    sycl::queue& q = queue_for(stream);
+    const auto dev = q.get_device();
+    using Shape = std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                             int64_t, int64_t, int64_t, int64_t, int64_t, bool, int64_t, int64_t, float>;
+    const Shape key{a.batch, a.lq, a.lk, a.heads, a.hd, a.q_row, a.k_row, a.v_row, a.o_row,
+                    a.q_batch, a.k_batch, a.v_batch, a.o_batch, a.causal, a.kv_div, a.causal_off, a.scale};
+    static core::TimedCache<sycl::device, Shape, bool> choices;
+    const auto cached = choices.get(dev, key);
+    int maker = cached ? (int) *cached : -1;
+    namespace sx = sycl::ext::oneapi::experimental;
+    if (maker < 0 && q.ext_oneapi_get_state() == sx::queue_state::recording) {
+        if (!qi_sdpa_ex_library(a, stream)) qi_sdpa_ex_own(a, stream);
+        return;
+    }
+    if (maker < 0) {
+        const auto measured = core::timed_choice({{[&] { return qi_sdpa_ex_library(a, stream); }},
+                                                  {[&] { qi_sdpa_ex_own(a, stream); return true; }}},
+                                                 [&] { q.wait_and_throw(); });
+        maker = measured.pick == 0;
+        maker = choices.put(dev, key, maker != 0);
+    }
+    if (!maker || !qi_sdpa_ex_library(a, stream)) qi_sdpa_ex_own(a, stream);
 }
 
 }  // namespace strata::image

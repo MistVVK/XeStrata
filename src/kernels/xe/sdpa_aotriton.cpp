@@ -37,7 +37,7 @@ using AotTrainFn = bool (*)(void*, bool, const uint16_t*, const uint16_t*, const
                             uint16_t*, uint16_t*, float*);   // strata_sdpa_aotriton_train's
 AotTrainFn g_train = nullptr;
 
-// The aotriton module (src/image/qi_sdpa_aotriton.cpp), opened at an AMD GPU's first attention from the engine's
+// The aotriton module (src/kernels/xe/sdpa_aotriton_module.cpp), opened at an AMD GPU's first attention from the engine's
 // folder or its lib/ (the packages'), with the libraries it needs beside it; null when it does not open (no HIP
 // runtime here, a build without it), said once.
 AotFn aotriton_module() {

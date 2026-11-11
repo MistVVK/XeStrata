@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/image/qi_sdpa_aotriton.cpp - see include/strata/kernels/sdpa_aotriton.hpp: aotriton's flash attention on AMD
+// src/kernels/xe/sdpa_aotriton_module.cpp - see include/strata/kernels/sdpa_aotriton.hpp: aotriton's flash attention on AMD
 // GPUs (MIT; its library and its kernels' images beside the engine), on the queue's HIP stream (while the queue records
 // a SYCL graph, in a native command whose stream the graph takes in).  A module of its own
 // (libxestrata_sdpa_aotriton.so, xestrata_sdpa_aotriton.dll), which the kernels open on an AMD GPU only

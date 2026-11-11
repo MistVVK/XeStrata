@@ -5,6 +5,7 @@
 #include "strata/kernels/f16_gpu.hpp"
 #include "strata/kernels/flash_attn.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/timed_choice.hpp"
 #include "device_target.hpp"
 #include "amd_wmma.hpp"
 #include "attn_parts.hpp"
@@ -12,6 +13,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/sdpa_aotriton.hpp"
+#include "strata/kernels/sdpa_select.hpp"
 #include "strata/kernels/sdpa_cudnn.hpp"
 #include "strata/kernels/sdpa_onednn.hpp"
 #include "strata/core/gpu.hpp"
@@ -163,7 +165,7 @@ bool flash_pools(sycl::queue& queue, const float* q, const QsaAttnPools& pools, 
     a.out_ld = s.n_head * s.head_dim;
     a.out_f32 = true;
     a.scale = 1.0f / std::sqrt((float) s.head_dim);
-    return flash_attn(a, &queue);
+    return flash_attn_tuned(a, &queue);
 }
 
 // The int8 attention (flash_attn_i8_causal: SageAttention's scheme, the image engine's kernel) over the pools, read
@@ -262,14 +264,12 @@ void gather16(sycl::queue& queue, const QsaAttnPools& pools, int64_t page_size, 
 // window - 1 before its own at most, which aotriton's window takes)
 bool run_maker(sycl::queue& queue, const float* q, const QsaAttnPools& pools, int64_t pos0, int64_t T,
                const QsaShapes& s, float* attn, void* stream, int64_t window) {
-    const bool aot = aotriton_sdpa_ready(stream);
-#if !STRATA_ONEDNN && !STRATA_CUDNN
-    if (!aot) return false;
-#endif
+    const auto maker = sdpa_maker(queue, stream, SdpaUse::prompt, true, s.head_dim);
+    if (maker == SdpaMaker::none) return false;
     const int64_t k0 = window > 0 ? std::max<int64_t>(0, pos0 + 1 - window) : 0;
     const int64_t hd = s.head_dim, KH = s.n_head_kv, NH = s.n_head, Tk = pos0 + T - k0;
     if (window > 0 && pos0 + T <= window) window = 0;   // no key cut off: the causal mask alone
-    if (pools.page_table == nullptr || pool_format(pools) < 0 || (hd != 128 && hd != 256)) return false;
+    if (pools.page_table == nullptr || pool_format(pools) < 0) return false;
     const int64_t CK = KH * hd, CQ = NH * hd;
     uint16_t* k16 = scratch(queue, 1, maker_scratch(s, T, Tk));
     if (k16 == nullptr) return false;
@@ -277,12 +277,12 @@ bool run_maker(sycl::queue& queue, const float* q, const QsaAttnPools& pools, in
     if (hd == 128) gather16<128>(queue, pools, s.page_size, KH, k0, Tk, k16, v16);
     else gather16<256>(queue, pools, s.page_size, KH, k0, Tk, k16, v16);
     queue.parallel_for(sycl::range<1>((size_t) (T * CQ)), [=](sycl::id<1> i) { q16[i] = f16_gpu::f16_from_f32(q[i]); });
-    bool ok = aot && aotriton_sdpa(q16, k16, v16, T, Tk, NH, KH, hd, o16, stream, true, window);
+    bool ok = maker == SdpaMaker::aotriton && aotriton_sdpa(q16, k16, v16, T, Tk, NH, KH, hd, o16, stream, true, window);
 #if STRATA_ONEDNN
-    ok = ok || (!aot && onednn_sdpa(q16, k16, v16, T, Tk, NH, KH, hd, o16, stream, true, 1, window));
+    ok = ok || (maker == SdpaMaker::onednn && onednn_sdpa(q16, k16, v16, T, Tk, NH, KH, hd, o16, stream, true, 1, window));
 #endif
 #if STRATA_CUDNN
-    ok = ok || (!aot && cudnn_sdpa(q16, k16, v16, T, Tk, NH, KH, hd, o16, stream, true, window));
+    ok = ok || (maker == SdpaMaker::cudnn && cudnn_sdpa(q16, k16, v16, T, Tk, NH, KH, hd, o16, stream, true, window));
 #endif
     if (!ok) return false;
     queue.parallel_for(sycl::range<1>((size_t) (T * CQ)),
@@ -301,15 +301,7 @@ void prepare_buffers(sycl::queue& queue, const QsaShapes& s, int64_t a, int64_t 
         if (flash_attn_i8_causal_prepare(T, cells, s.n_head, s.n_head_kv, s.head_dim, stream)) break;
     // a maker's kernel here: aotriton (an AMD GPU with its module), oneDNN (an Intel GPU's Level Zero or OpenCL) or
     // cuDNN (an NVIDIA GPU's CUDA)
-    const sycl::backend be = queue.get_device().get_backend();
-    bool maker = aotriton_sdpa_ready(stream);
-#if STRATA_ONEDNN
-    maker = maker || be == sycl::backend::ext_oneapi_level_zero || be == sycl::backend::opencl;
-#endif
-#if STRATA_CUDNN
-    maker = maker || be == sycl::backend::ext_oneapi_cuda;
-#endif
-    (void) be;
+    const bool maker = sdpa_maker(queue, stream, SdpaUse::prompt, true, s.head_dim) != SdpaMaker::none;
     if (maker)
         for (const int64_t cells : {b, a})
             if (scratch(queue, 1, maker_scratch(s, std::min<int64_t>(2048, cells / 2), cells)) != nullptr) break;
@@ -378,26 +370,6 @@ int time_pick(sycl::queue& queue, const QsaShapes& s, int fmt, int64_t cells, vo
         auto* qv = static_cast<float*>(dev((size_t) (T * nh * hd) * 4));
         auto* out = static_cast<float*>(dev((size_t) (T * nh * hd) * 4));
         queue.wait_and_throw();
-        // a warm run of the timed shape itself, then the timed chunk; -1: not taken.  The warm run is the whole chunk:
-        // a library compiles a kernel per shape (oneDNN's SDPA), and a cold kernel cache (a first start, a new
-        // driver) put that compile into a shorter warm-up's timed chunk: 419.7 ms for oneDNN's 8.2 on the B70
-        // (2026-11-07), the slower kernel kept for the run
-        auto timed = [&](auto&& run) -> double {
-            if (!run(T)) return -1.0;
-            queue.wait_and_throw();
-            const auto t0 = std::chrono::steady_clock::now();
-            run(T);
-            queue.wait_and_throw();
-            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        };
-        ms[kPickMma] = timed([&](int64_t n) { return run_mma(queue, qv, pools, fmt, pos0 + T - n, n, s, out); });
-        ms[kPickI8] = timed([&](int64_t n) { return run_i8(queue, qv, pools, pos0 + T - n, n, s, out, stream); });
-        ms[kPickMaker] =
-            timed([&](int64_t n) { return run_maker(queue, qv, pools, pos0 + T - n, n, s, out, stream, 0); });
-        if (fmt == kFmtF16)
-            ms[kPickFp16] = timed([&](int64_t n) {
-                return prompt_attn(qv, pools.k_pool, pools.v_pool, pools.page_table, pos0 + T - n, n, s, out, stream);
-            });
         // the decode kernel over a slice of the queries its scratch fits in (it takes each query alike), 32 MiB: the
         // timing's buffers are freed after it, and a GPU's driver may keep them from the free memory the engine plans
         // with (the B70's kept 256 MiB of it at 256, 2026-11-07)
@@ -410,28 +382,74 @@ int time_pick(sycl::queue& queue, const QsaShapes& s, int fmt, int64_t cells, vo
         queue.memcpy(steps, hs.data(), hs.size() * 4);
         auto* scratch = static_cast<float*>(dev((size_t) (per_q * (uint64_t) nq)));
         queue.wait_and_throw();
-        try {
-            const double d = timed([&](int64_t n) {
-                if (n == T) qsa_dense_attn_batch(qv, pools, steps, cells, s, scratch, out, nq, stream);
-                else qsa_dense_attn_batch(qv, pools, steps, cells, s, scratch, out, std::min<int64_t>(nq, n), stream);
-                return true;
-            });
-            ms[kPickNone] = d * (double) T / (double) nq;
-        } catch (const std::exception&) {   // a shape the decode kernel does not take
-            ms[kPickNone] = -1.0;
+        // A full 2-5-round trial here slowed Qwen3.5-9B load on the B70 from 4.2 to 4.6 s and on the RTX 4070
+        // from 2.6 to 3.0 s (2026-11-11). Keep this dummy prompt's existing single sample; the chosen kernel
+        // keeps its former paged sub-group count, as explained in flash_attn.cpp.
+        // a kernel over `t` queries (the decode kernel over `dq` of them) after the rest of the cells
+        auto run = [&](int i, int64_t t, int64_t dq) -> bool {
+            const int64_t p0 = cells - t;
+            switch (i) {
+            case 0: return run_maker(queue, qv, pools, p0, t, s, out, stream, 0);
+            case 1: return run_mma(queue, qv, pools, fmt, p0, t, s, out);
+            case 2: return fmt == kFmtF16 && prompt_attn(qv, pools.k_pool, pools.v_pool, pools.page_table, p0, t, s,
+                                                         out, stream);
+            case 3: return run_i8(queue, qv, pools, p0, t, s, out, stream);
+            default:
+                try { qsa_dense_attn_batch(qv, pools, steps, cells, s, scratch, out, dq, stream); return true; }
+                catch (const std::exception&) { return false; }
+            }
+        };
+        // A kernel without the matrix units to run on can take minutes over T queries (oneDNN's SDPA on the UHD 770:
+        // Ornith-1.5's start did not end in 20 minutes, 2026-11-16), so each one runs once over kProbe queries
+        // first (after a run that compiles it) and is left out of the timing when that run, scaled to the timing's
+        // queries, passes kRunBudget; the fastest of the probes always stays in.  The B70's and the RTX 4070's
+        // runs over 2,048 queries take milliseconds, far inside it: they time the kernels as before.  Linear scaling
+        // overstates the kernels that read a cell once for many queries, which only errs towards leaving one out on a
+        // GPU where every run is seconds.
+        constexpr int64_t kProbe = 64;
+        constexpr double kRunBudget = 2.0;   // seconds a timed run may take
+        const int64_t tp = std::min<int64_t>(T, kProbe), dqp = std::min<int64_t>(nq, tp);
+        const int forms[] = {kPickMaker, kPickMma, kPickFp16, kPickI8, kPickNone};   // run()'s kernels as Picks
+        bool left_out[5] = {};
+        double probe[5] = {-1.0, -1.0, -1.0, -1.0, -1.0};
+        int fastest = -1;
+        for (int i = 0; i < 5; ++i) {
+            if (!run(i, tp, dqp)) continue;
+            queue.wait_and_throw();
+            const auto t0 = std::chrono::steady_clock::now();
+            run(i, tp, dqp);
+            queue.wait_and_throw();
+            const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            probe[i] = sec * (i == 4 ? (double) nq / (double) dqp : (double) T / (double) tp);
+            if (fastest < 0 || probe[i] < probe[fastest]) fastest = i;
         }
+        for (int i = 0; i < 5; ++i)
+            if (probe[i] > kRunBudget && i != fastest) {
+                left_out[i] = true;
+                std::fprintf(stderr, "xestrata: prompt attention %s not timed: a run over %lld queries would take "
+                                     "about %.1f s here\n", kPickNames[forms[i]], (long long) T, probe[i]);
+            }
+        const auto measured = core::timed_choice({
+            {[&] { return !left_out[0] && run(0, T, nq); }},
+            {[&] { return !left_out[1] && run(1, T, nq); }},
+            {[&] { return !left_out[2] && run(2, T, nq); }},
+            {[&] { return !left_out[3] && run(3, T, nq); }},
+            {[&] { return !left_out[4] && run(4, T, nq); }, (double) T / (double) nq}
+        }, [&] { queue.wait_and_throw(); }, 1);
+        for (size_t i = 0; i < measured.seconds.size(); ++i)
+            ms[forms[i]] = measured.seconds[i] < 0 ? -1.0 : measured.seconds[i] * 1000;
         // the kernels that read a cell once for many queries first; the decode kernel only when it is clearly ahead:
         // timed alone it came out 1.3% ahead of the matrix engines' at 64K cells of Qwen3.5-9B's 16/4 heads of 256 on
         // a B70, and in the prompt (its per-query scratch beside the other layers' work) it ran 15% behind them
         // (attention 75.1 s against 65.2 of a 63K prompt)
         double t_best = -1.0, t_win = -1.0;
         int win = kPickNone;
-        for (int k : {(int) kPickMma, (int) kPickFp16, (int) kPickI8, (int) kPickMaker}) {
-            if (ms[k] >= 0.0 && (t_best < 0.0 || ms[k] < t_best)) {
+        for (int k : {(int) kPickMaker, (int) kPickMma, (int) kPickFp16, (int) kPickI8}) {
+            if (ms[k] >= 0.0 && (t_best < 0.0 || ms[k] * 1.05 < t_best)) {
                 t_best = ms[k];
                 best = k;
             }
-            if (k != kPickI8 && ms[k] >= 0.0 && (t_win < 0.0 || ms[k] < t_win)) {
+            if (k != kPickI8 && ms[k] >= 0.0 && (t_win < 0.0 || ms[k] * 1.05 < t_win)) {
                 t_win = ms[k];
                 win = k;
             }

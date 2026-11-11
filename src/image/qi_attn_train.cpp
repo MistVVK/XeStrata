@@ -40,7 +40,8 @@
 #include <string>
 
 #include "dit_rows.hpp"
-#include "qi_sdpa.hpp"
+#include "strata/kernels/sdpa_cudnn_internal.hpp"
+#include "strata/kernels/sdpa_select.hpp"
 
 namespace strata::image {
 
@@ -361,32 +362,34 @@ uint8_t* workspace(void* stream, int slot, size_t bytes) {
 // false where none takes the GPU
 bool maker_fwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t rows, int64_t keys, int64_t H,
                int64_t hd, uint16_t* o16, float* st, void* stream) {
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    const auto maker = kernels::sdpa_maker(q, stream, kernels::SdpaUse::train, false, hd);
 #if STRATA_ONEDNN
-    if (kernels::onednn_sdpa_train_fwd(q16, k16, v16, rows, keys, H, hd, o16, st, stream)) return true;
+    if (maker == kernels::SdpaMaker::onednn && kernels::onednn_sdpa_train_fwd(q16, k16, v16, rows, keys, H, hd, o16, st, stream)) return true;
 #endif
 #if STRATA_CUDNN
-    sycl::queue& q = core::Runtime::get().stream(stream);
-    if (q.get_device().get_backend() == sycl::backend::ext_oneapi_cuda && !kernels::no_xmx())
+    if (maker == kernels::SdpaMaker::cudnn)
         return sdpa::cudnn_train(q, false, q16, k16, v16, nullptr, nullptr, st, rows, keys, H, hd, o16, nullptr,
                                  nullptr, nullptr);
 #endif
-    return kernels::aotriton_sdpa_train(false, q16, k16, v16, nullptr, nullptr, st, rows, keys, H, hd, o16, nullptr,
+    return maker == kernels::SdpaMaker::aotriton && kernels::aotriton_sdpa_train(false, q16, k16, v16, nullptr, nullptr, st, rows, keys, H, hd, o16, nullptr,
                                         nullptr, nullptr, nullptr, stream);
 }
 // ws: rows * H * (hd + 1) floats of the library's own
 bool maker_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, const uint16_t* o16, float* st,
                const uint16_t* do16, int64_t rows, int64_t keys, int64_t H, int64_t hd, uint16_t* dq16, uint16_t* dk16,
                uint16_t* dv16, float* ws, void* stream) {
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    const auto maker = kernels::sdpa_maker(q, stream, kernels::SdpaUse::train, false, hd);
 #if STRATA_ONEDNN
-    if (kernels::onednn_sdpa_train_bwd(q16, k16, v16, o16, st, do16, rows, keys, H, hd, dq16, dk16, dv16, stream))
+    if (maker == kernels::SdpaMaker::onednn && kernels::onednn_sdpa_train_bwd(q16, k16, v16, o16, st, do16, rows, keys, H, hd, dq16, dk16, dv16, stream))
         return true;
 #endif
 #if STRATA_CUDNN
-    sycl::queue& q = core::Runtime::get().stream(stream);
-    if (q.get_device().get_backend() == sycl::backend::ext_oneapi_cuda && !kernels::no_xmx())
+    if (maker == kernels::SdpaMaker::cudnn)
         return sdpa::cudnn_train(q, true, q16, k16, v16, o16, do16, st, rows, keys, H, hd, nullptr, dq16, dk16, dv16);
 #endif
-    return kernels::aotriton_sdpa_train(true, q16, k16, v16, o16, do16, st, rows, keys, H, hd, nullptr, dq16, dk16,
+    return maker == kernels::SdpaMaker::aotriton && kernels::aotriton_sdpa_train(true, q16, k16, v16, o16, do16, st, rows, keys, H, hd, nullptr, dq16, dk16,
                                         dv16, ws, stream);
 }
 
@@ -627,6 +630,8 @@ void qi_attention_train(const uint16_t* q16, const uint16_t* k16, const uint16_t
     a.out_f32 = true;
     a.lse = lse;
     a.scale = 1.0f / std::sqrt((float) head_dim);
+    // Keep the original training choice: the common multi-sample trial and sub-group tuning raised four-step
+    // Qwen-Image training from 2.17 to 2.29 s/step on the B70 and 3.88 to 4.06 s/step on the RTX 4070 (2026-11-11).
     // the engine's own kernel (0) or the GPU maker's library (1, library_fwd): XESTRATA_ATTN_TRAIN_FWD (own or
     // library), or the faster the first time a GPU takes the shape (rows in steps of 512, heads), both run twice into
     // the outputs then and the second runs timed (the same outputs either way).  On the B70 at 2,304 rows of 32

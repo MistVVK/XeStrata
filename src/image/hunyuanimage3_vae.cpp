@@ -13,6 +13,7 @@
 #include "strata/image/hunyuanimage3_vae.hpp"
 
 #include "qi_conv.hpp"
+#include "vae_attention.hpp"
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
@@ -87,18 +88,6 @@ void rep_add(float* x, const float* tok, int64_t HW, int64_t O, int64_t I, void*
 // comparisons need one.  The workspace they take is sized for the most positions one GroupNorm here can span.
 constexpr int64_t kMaxGnPositions = (int64_t) 256 * 256 * 256;   // 16.7 M positions
 constexpr int64_t kWsFloats = 2 * kGroups + (kMaxGnPositions / 256 + kMaxGnPositions / 256 / 256) * kGroups;
-
-// qkv [P][3 C] (FP32) -> q16, k16 [P][C] and vt16 [C][P] in FP16 (QiVae's split, the same single-head form:
-// all C in one head, V transposed for the products' W[N][K] layout)
-void split_qkv16(const float* qkv, int64_t P, int64_t C, uint16_t* q16, uint16_t* k16, uint16_t* vt16, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (P * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t p = i / C, c = i - p * C;
-        q16[i] = f16_from_f32(qkv[p * 3 * C + c]);
-        k16[i] = f16_from_f32(qkv[p * 3 * C + C + c]);
-        vt16[c * P + p] = f16_from_f32(qkv[p * 3 * C + 2 * C + c]);
-    });
-}
 
 // The UpsampleDCAE's split: out [(f r1 + i1, h 2 + i2, w 2 + i3)][c] = conv[(f, h, w)][m C + c] +
 // x[(f, h, w)][(m C + c) / rep] with m = (i1 2 + i2) 2 + i3 - einops "b (r1 r2 r3 c) f h w -> b c (f r1)
@@ -446,24 +435,27 @@ void HunyuanImage3Vae::attention(float* x, int64_t P, int64_t C, const std::stri
 
 void HunyuanImage3Vae::attention_w(const float* g, const float* b, const Conv& aq, const Conv& ak, const Conv& av,
                                    const Conv& aproj, float* x, int64_t P, int64_t C, const std::string& tag) {
-    groupnorm(x, g, b, P, C, false, a16_, tag);
     float* qkv = tmp32_;
-    gemm_.f16(a16_, aq.w, qkv, P, C, C, 3 * C);
-    gemm_.f16(a16_, ak.w, qkv + C, P, C, C, 3 * C);
-    gemm_.f16(a16_, av.w, qkv + 2 * C, P, C, C, 3 * C);
-    qi_bias_add(qkv, aq.b, P, C, s_, nullptr, 3 * C);
-    qi_bias_add(qkv + C, ak.b, P, C, s_, nullptr, 3 * C);
-    qi_bias_add(qkv + 2 * C, av.b, P, C, s_, nullptr, 3 * C);
-    uint16_t *q16 = a16_ + P * C, *k16 = a16_ + 2 * P * C, *vt16 = a16_ + 3 * P * C;
-    split_qkv16(qkv, P, C, q16, k16, vt16, s_);
-    gemm_.f16(q16, k16, scores_, P, P, C);
-    uint16_t* p16 = col16_;
-    qi_softmax16(scores_, P, P, 1.0f / std::sqrt((float) C), p16, s_);
-    gemm_.f16(p16, vt16, tmp32_, P, C, P);   // O = P . V (V^T's rows are V's columns)
-    kernels::f32_to_f16_bulk(tmp32_, a16_, P * C, s_);
-    gemm_.f16(a16_, aproj.w, tmp32_, P, C, C);
-    qi_bias_add(tmp32_, aproj.b, P, C, s_);
-    hunyuanimage3_add(x, tmp32_, P * C, s_);
+    vae_mid::Attention mid{1, P, C, P};
+    mid.x = x; mid.weight = g; mid.bias = b; mid.normalized = a16_; mid.norm_workspace = gn_ws_;
+    mid.qkv = qkv;
+    mid.q = a16_ + P * C; mid.k = a16_ + 2 * P * C; mid.vt = a16_ + 3 * P * C;
+    mid.p = col16_; mid.scores = scores_; mid.out = tmp32_;
+    vae_mid::run(mid, gemm_, s_,
+        [&] {
+            if (!tag.empty()) dump_stage(0, tag + "_stats2", gn_ws_, 2 * kGroups);
+            gemm_.f16(a16_, aq.w, qkv, P, C, C, 3 * C);
+            gemm_.f16(a16_, ak.w, qkv + C, P, C, C, 3 * C);
+            gemm_.f16(a16_, av.w, qkv + 2 * C, P, C, C, 3 * C);
+            qi_bias_add(qkv, aq.b, P, C, s_, nullptr, 3 * C);
+            qi_bias_add(qkv + C, ak.b, P, C, s_, nullptr, 3 * C);
+            qi_bias_add(qkv + 2 * C, av.b, P, C, s_, nullptr, 3 * C);
+        },
+        [&] {
+            gemm_.f16(a16_, aproj.w, tmp32_, P, C, C);
+            qi_bias_add(tmp32_, aproj.b, P, C, s_);
+            hunyuanimage3_add(x, tmp32_, P * C, s_);
+        });
 }
 
 // The DCAE downsample: the conv (its input's T decides the time taps), then the fold and the averaged shortcut in

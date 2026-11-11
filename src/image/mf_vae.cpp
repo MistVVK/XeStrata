@@ -18,6 +18,7 @@
 #include "dit_rows.hpp"
 #include "tile_sides.hpp"
 #include "qi_conv.hpp"
+#include "vae_attention.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -80,31 +81,6 @@ void release(std::vector<void*>& owned, void* p) {
 }
 
 float silu(float x) { return x / (1.f + std::exp(-x)); }
-
-// a window's q, k (rows: its 32 x 32 positions, the latent's edge replicated past it) and v transposed ([C][1024]),
-// from qkv [HW][3 C]
-void win_gather16(const float* qkv, int64_t H, int64_t W, int64_t C, int64_t wy, int64_t wx, uint16_t* q16,
-                  uint16_t* k16, uint16_t* vt16, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (kWinTok * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / C, c = i - t * C;
-        const int64_t y = sycl::min(wy * kWin + t / kWin, H - 1), x = sycl::min(wx * kWin + t % kWin, W - 1);
-        const float* r = qkv + (y * W + x) * 3 * C;
-        q16[i] = f16_from_f32(r[c]);
-        k16[i] = f16_from_f32(r[C + c]);
-        vt16[c * kWinTok + t] = f16_from_f32(r[2 * C + c]);
-    });
-}
-
-// out[y][x] = o's row for (y, x) of a window, for the window's positions inside the latent
-void win_scatter(const float* o, int64_t H, int64_t W, int64_t C, int64_t wy, int64_t wx, float* out, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (kWinTok * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / C, c = i - t * C;
-        const int64_t y = wy * kWin + t / kWin, x = wx * kWin + t % kWin;
-        if (y < H && x < W) out[(y * W + x) * C + c] = o[i];
-    });
-}
 
 // y16[p] = LayerNorm(x[p]) over the channels (no affine) * (1 + scale) + shift: qi_ln_mod16's
 void ln_mod16(const float* x, const float* shift, const float* scale, int64_t HW, int64_t C, uint16_t* y16, void* s) {
@@ -350,49 +326,6 @@ void f2_patch(const float* m, const float* mean, const float* sd, int64_t h, int
         const int64_t k = 4 * c + 2 * (Y % 2) + X % 2;
         const float v = m[p * 2 * Lc + c];
         z[((Y / 2) * w + X / 2) * 4 * Lc + k] = mean != nullptr ? (v - mean[k]) / sd[k] : v;
-    });
-}
-
-// q16 [T][C], k16 [T][C] and v transposed vt16 [C][T] from qkv [T][3 C]
-void qkv_split16(const float* qkv, int64_t T, int64_t C, uint16_t* q16, uint16_t* k16, uint16_t* vt16, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (T * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / C, c = i - t * C;
-        q16[i] = f16_from_f32(qkv[t * 3 * C + c]);
-        k16[i] = f16_from_f32(qkv[t * 3 * C + C + c]);
-        vt16[c * T + t] = f16_from_f32(qkv[t * 3 * C + 2 * C + c]);
-    });
-}
-
-// the same of 16-bit activations qkv (BF16 bits with bf)
-void qkv_split16(const uint16_t* qkv, bool bf, int64_t T, int64_t C, uint16_t* q16, uint16_t* k16, uint16_t* vt16,
-                 void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (T * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / C, c = i - t * C;
-        const auto f16 = [bf](uint16_t h) { return bf ? f16_from_f32(kernels::f32_from_bf16(h)) : h; };
-        q16[i] = f16(qkv[t * 3 * C + c]);
-        k16[i] = f16(qkv[t * 3 * C + C + c]);
-        vt16[c * T + t] = f16(qkv[t * 3 * C + 2 * C + c]);
-    });
-}
-
-// p16[r] = softmax(scale sc[r]) over a row of n: a work-group a row (the attention's rows are long, and few at once)
-void softmax_wg16(const float* sc, int64_t rows, int64_t n, float scale, uint16_t* p16, void* s) {
-    constexpr int64_t local = 256;
-    q_of(s).parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (rows * local)), sycl::range<1>((size_t) local)),
-                         [=](sycl::nd_item<1> it) {
-        const auto r = static_cast<int64_t>(it.get_group_linear_id());
-        const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-        const float* row = sc + r * n;
-        float m = -INFINITY;
-        for (int64_t j = lane; j < n; j += local) m = sycl::fmax(m, row[j] * scale);
-        m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
-        float sum = 0.f;
-        for (int64_t j = lane; j < n; j += local) sum += sycl::exp(row[j] * scale - m);
-        sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
-        const float inv = 1.f / sum;
-        for (int64_t j = lane; j < n; j += local) p16[r * n + j] = f16_from_f32(sycl::exp(row[j] * scale - m) * inv);
     });
 }
 
@@ -817,22 +750,17 @@ void MfVae::resblock(const Res& r, float*& x, int64_t H, int64_t W) {
 void MfVae::attention(const Attn& a, float* x, int64_t H, int64_t W) {
     const int64_t HW = H * W;
     float* qkv = x == t0_ ? t1_ : t0_;
-    gn_silu16(x, a.nw, a.nb, HW, C_, false, a16_);
-    conv(a.qkv, a16_, H, W, qkv);
-    uint16_t *q16 = w16_, *k16 = w16_ + kWinTok * C_, *vt16 = w16_ + 2 * kWinTok * C_,
-             *p16 = w16_ + 3 * kWinTok * C_;
-    float* o = t2_;   // the attention's output [HW][C]
-    float* ow = t2_ + HW * C_;   // a window's [1024][C]
-    for (int64_t wy = 0; wy * kWin < H; ++wy)
-        for (int64_t wx = 0; wx * kWin < W; ++wx) {
-            win_gather16(qkv, H, W, C_, wy, wx, q16, k16, vt16, s_);
-            gemm_.f16(q16, k16, scores_, kWinTok, kWinTok, C_);
-            qi_softmax16(scores_, kWinTok, kWinTok, 1.0f / std::sqrt((float) C_), p16, s_);
-            gemm_.f16(p16, vt16, ow, kWinTok, C_, kWinTok);
-            win_scatter(ow, H, W, C_, wy, wx, o, s_);
-        }
-    kernels::f32_to_f16_bulk(o, a16_, HW * C_, s_);
-    conv(a.proj, a16_, H, W, x, true);
+    vae_mid::Attention mid{H, W, C_, kWinTok, kWin};
+    mid.x = x; mid.weight = a.nw; mid.bias = a.nb; mid.normalized = a16_; mid.norm_workspace = gn_part_;
+    mid.qkv = qkv;
+    mid.q = w16_; mid.k = w16_ + kWinTok * C_; mid.vt = w16_ + 2 * kWinTok * C_;
+    mid.p = w16_ + 3 * kWinTok * C_; mid.scores = scores_;
+    mid.out = t2_; mid.window_out = t2_ + HW * C_;
+    vae_mid::run(mid, gemm_, s_,
+        [&] { conv(a.qkv, a16_, H, W, qkv); },
+        [&] {
+            conv(a.proj, a16_, H, W, x, true);
+        });
 }
 
 // a DiCo block's weights under prefix p, with its modulation `mod` [6][C] (host)
@@ -1362,19 +1290,16 @@ void MfVae::f2_attention(const Attn& a, uint16_t* x, int64_t H, int64_t W) {
     const int64_t T = H * W, C = a.qkv.in, rows = f2_cap_.rows;
     uint16_t *qkv = nullptr, *unused = nullptr;
     f2_others(x, qkv, unused);
-    qi_group_norm16(x, vbf_, T, C, a.nw, a.nb, kEps, false, a16_, gn_part_, s_);
-    v_frame(a.qkv, a16_, H, W, false, qkv, true, false);
-    uint16_t *q16 = f2_qk16_, *k16 = f2_qk16_ + T * C, *vt16 = f2_qk16_ + 2 * T * C;
-    qkv_split16(qkv, vbf_, T, C, q16, k16, vt16, s_);
-    float* o = reinterpret_cast<float*>(qkv);   // [T][C] FP32 where the 3 C of qkv's 16 bits were
-    for (int64_t r0 = 0; r0 < T; r0 += rows) {
-        const int64_t n = std::min(rows, T - r0);
-        gemm_.f16(q16 + r0 * C, k16, f2_q_, n, T, C);
-        softmax_wg16(f2_q_, n, T, 1.0f / std::sqrt((float) C), f2_p16_, s_);
-        gemm_.f16(f2_p16_, vt16, o + r0 * C, n, C, T);
-    }
-    kernels::f32_to_f16_bulk(o, a16_, T * C, s_);
-    v_frame(a.proj, a16_, H, W, false, x, true, true, unused);
+    vae_mid::Attention mid{H, W, C, rows};
+    mid.x16 = x; mid.weight = a.nw; mid.bias = a.nb; mid.normalized = a16_; mid.norm_workspace = gn_part_;
+    mid.qkv16 = qkv; mid.bf = vbf_; mid.group_softmax = true;
+    mid.q = f2_qk16_; mid.k = f2_qk16_ + T * C; mid.vt = f2_qk16_ + 2 * T * C;
+    mid.p = f2_p16_; mid.scores = f2_q_; mid.out = reinterpret_cast<float*>(qkv);
+    vae_mid::run(mid, gemm_, s_,
+        [&] { v_frame(a.qkv, a16_, H, W, false, qkv, true, false); },
+        [&] {
+            v_frame(a.proj, a16_, H, W, false, x, true, true, unused);
+        });
 }
 
 // the stages up to level k of the latent z (h x w): x [H][W][c] in one of x, y, t

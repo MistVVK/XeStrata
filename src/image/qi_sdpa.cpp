@@ -12,7 +12,8 @@
 
 #include "strata/image/qi_kernels.hpp"
 
-#include "qi_sdpa.hpp"
+#include "strata/kernels/sdpa_cudnn_internal.hpp"
+#include "strata/kernels/sdpa_select.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "strata/kernels/sdpa_aotriton.hpp"
@@ -30,10 +31,9 @@ bool qi_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int6
     if (batch > 1 && (q0 != 0 || causal)) return false;
     // every maker's kernel here runs on the matrix engines: STRATA_NO_XMX=1 (a GPU without them, played on one with
     // them) leaves the attention to the engine's own kernels, which take their paths without them
-    if (kernels::no_xmx()) return false;
     sycl::queue& q = core::Runtime::get().stream(stream);
-    [[maybe_unused]] const sycl::backend be = q.get_device().get_backend();
-    if (be == sycl::backend::ext_oneapi_hip) {   // aotriton: one call a batch
+    const auto maker = kernels::sdpa_maker(q, stream, kernels::SdpaUse::image, causal, head_dim);
+    if (maker == kernels::SdpaMaker::aotriton) {   // aotriton: one call a batch
         const int64_t row = heads * head_dim;
         for (int64_t b = 0; b < batch; ++b)
             if (!kernels::aotriton_sdpa(q16 + (b * (q1 - q0) + q0) * row, k16 + b * T * row, v16 + b * T * row,
@@ -42,14 +42,13 @@ bool qi_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int6
                 return false;
         return true;
     }
-    if (causal) return false;   // the other makers' kernels take the unmasked rows only
 #if STRATA_CUDNN
-    if (be == sycl::backend::ext_oneapi_cuda)
+    if (maker == kernels::SdpaMaker::cudnn)
         return sdpa::cudnn(q, q16, k16, v16, q0, q1, T, heads, head_dim, out16, batch);
 #endif
 #if STRATA_ONEDNN
     // oneDNN's GPU kernels are Intel's: its Level Zero and OpenCL devices
-    if (be == sycl::backend::ext_oneapi_level_zero || be == sycl::backend::opencl)
+    if (maker == kernels::SdpaMaker::onednn)
         return kernels::onednn_sdpa(q16 + q0 * heads * head_dim, k16, v16, q1 - q0, T, heads, heads, head_dim, out16,
                                     stream, false, batch);
 #endif
