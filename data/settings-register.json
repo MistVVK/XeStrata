@@ -23837,7 +23837,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5830,
+     "line": 5872,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -23853,7 +23853,7 @@
    "doc_mentions": [],
    "status": "research",
    "owner": "prefill",
-   "note": "[reviewed] Research switch, off unless set (\"0\" off, anything else on; src/prefill/fewrows.hpp): on the FP16 prompt path an expert with 1..12 rows runs on the quantized grouped kernels (no dequantize) instead of dequantize + FP16 GEMMs; native packs without APR only. Tesla P100 numbers in phaseA-tests/par/RESULTS-P4-FALLBACK.md. Not documented for users",
+   "note": "[reviewed] Research switch, off unless set (\"0\" off, anything else on; src/prefill/fewrows.hpp), except that the Tesla P100 prompt default turns it on when gp100_prompt_default.hpp's kGp100Default is true. On the FP16 prompt path an expert with 1..12 rows runs on the quantized grouped kernels (no dequantize) instead of dequantize + FP16 GEMMs; native packs without APR only. Tesla P100 numbers in phaseA-tests/par/RESULTS-P4-FALLBACK.md. Not documented for users",
    "retire_after": "",
    "retired_in": ""
   },
@@ -28847,6 +28847,12 @@
     {
      "file": "src/prefill/prefill.cpp",
      "line": 1535,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/prefill/prefill.cpp",
+     "line": 5872,
      "backend": "cuda-hip",
      "fn": "getenv"
     },

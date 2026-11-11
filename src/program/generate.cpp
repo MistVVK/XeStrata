@@ -93,6 +93,7 @@
 #include "strata/prefill/kva_floor.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/prefill/pf_fused_override.hpp"
+#include "strata/prefill/gp100_prompt_default.hpp"
 #include "strata/core/sm120_series.hpp"
 #if defined(STRATA_PREFILL_MMQ)
 #include "strata/prefill/moe_mmq.hpp"
@@ -4160,6 +4161,8 @@ int main(int argc, char** argv) {
         }
     }
     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
+    // Tesla P100: the prompt peer computes on MMQ only, so with --peer-device the GP100 FP16-path default stands aside (gp100_prompt_default.hpp)
+    strata::prefill::peer_device_requested().store(o.peer_device >= 1);
     {   // the RAM guard (parking, session save/restore): --memory-limit-mib, else STRATA_MEMORY_LIMIT_MIB, else none
         int64_t mib = o.memory_limit_mib;
         if (mib < 0) {

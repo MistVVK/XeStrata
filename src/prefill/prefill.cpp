@@ -9,6 +9,7 @@
 #include "strata/prefill/pf_fused_override.hpp"
 #include "strata/prefill/staged_group_rule.hpp"
 #include "strata/prefill/fewrows.hpp"
+#include "strata/prefill/gp100_prompt_default.hpp"
 #if defined(STRATA_HAVE_DFLASH2)
 #include "strata/kernels/dflash2.hpp"
 #endif
@@ -1601,15 +1602,55 @@ bool pf_wmma() {
     return on;
 #endif
 }
+// Tesla P100 (GP100, compute capability 6.0; the STRATA_EXPERIMENTAL_SM60 build): the prompt experts take the FP16 path
+// by default instead of MMQ, with the few-row experts (fewrows.hpp) on the quantized grouped kernels.  GP100 has no
+// __dp4a (MMQ runs on the bit-exact emulation in dp4a.hpp), and with the few-row route the FP16 path is at 0.95 / 0.91 /
+// 0.93 / 1.00 of MMQ's prompt speed at 300 / 1,000 / 2K / 4K and above it from 8K (lane P4-FALLBACK, 11-11:
+// phaseA-tests/par/RESULTS-P4-FALLBACK.md).  Only when EVERY visible CUDA card is cc 6.0 (one process, one decision),
+// and not with what needs MMQ: STRATA_MMQ_WS=1 (its weight-stationary kernels are MMQ's products), STRATA_EXPERT_NIBBLE=1
+// (the FP16 path reads GGUF blocks) and --peer-device (the prompt peer computes on MMQ only).  An explicit
+// STRATA_PREFILL_MMQ keeps its old meaning.  The rule: gp100_prompt_default.hpp (gp100_prompt_default_test);
+// kGp100Default there is the one line that turns it on.
+bool gp100_fp16_default(const char* env) {
+#if defined(__HIPCC__) || !defined(STRATA_EXPERIMENTAL_SM60)
+    (void) env;
+    return false;
+#else
+    if (!kGp100Default || env != nullptr) return false;
+    static const bool on = [] {
+        Gp100PromptInputs in;
+        in.mmq_ws = ws::mode() != 0;
+        in.nibble = strata::core::nibble::config().on;
+        in.peer_device = peer_device_requested().load();
+        in.all_cc60 = true;
+        int n = 0;
+        if (cudaGetDeviceCount(&n) != cudaSuccess || n <= 0) { cudaGetLastError(); in.all_cc60 = false; }
+        for (int d = 0; in.all_cc60 && d < n; ++d) {
+            int major = 0, minor = 0;
+            if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, d) != cudaSuccess ||
+                cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, d) != cudaSuccess) {
+                cudaGetLastError();
+                in.all_cc60 = false;
+            } else if (major != 6 || minor != 0) {
+                in.all_cc60 = false;
+            }
+        }
+        return gp100_fp16_rule(in);
+    }();
+    return on;
+#endif
+}
 const MmqPlan& mmq_plan() {
     static const MmqPlan plan = [] {
         MmqPlan p;
         const auto& lay = strata::kernels::cpu::expert_layout();
         const char* env = std::getenv("STRATA_PREFILL_MMQ");
 #if defined(STRATA_PF_OWN_ONLY)
+        const bool gp100 = false;   // no MMQ in this build: the FP16 path is not a default of the P100 rule here
         const bool on = fused::built() && (env == nullptr || std::atoi(env) != 0);   // P4-SPLIT: no MMQ tile anywhere, the fused-only layers below
 #else
-        const bool on = mmq::built() && (env == nullptr || std::atoi(env) != 0);
+        const bool gp100 = mmq::built() && gp100_fp16_default(env);
+        const bool on = mmq::built() && !gp100 && (env == nullptr || std::atoi(env) != 0);
 #endif
         const int64_t layers = lay.native ? (int64_t) lay.fmt.size() : lay.n_layers;
         p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);
@@ -1658,7 +1699,9 @@ const MmqPlan& mmq_plan() {
         if (mf) {
             if (!on) {
                 strata::core::manifest::instance().path("prefill", "experts", false,
-                    mmq::built() ? "STRATA_PREFILL_MMQ=0" : "this build has no MMQ (ggml sources were not available)",
+                    !mmq::built() ? "this build has no MMQ (ggml sources were not available)"
+                    : gp100 ? "Tesla P100 (compute capability 6.0): the FP16 path is the default there"
+                            : "STRATA_PREFILL_MMQ=0",
                     "the expert products take the FP16 path");
             } else if (layers <= 0) {
                 strata::core::manifest::instance().path("prefill", "experts", false, "no expert layout loaded", "");
@@ -5964,7 +6007,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // expert) is released once the blob is read; `cslot`: the expert-cache slot the blob is in (-1:
                         // a ring slot or the peer's), which STRATA_MMQ_DIRECT reads in place
                         // Few-row experts (fewrows.hpp): research switch STRATA_PF_FEWROWS, off unless set
-                        static const bool fr_env = fewrows_switch(std::getenv("STRATA_PF_FEWROWS"), false);
+                        static const bool fr_env = fewrows_switch(std::getenv("STRATA_PF_FEWROWS"), gp100_fp16_default(std::getenv("STRATA_PREFILL_MMQ")));
                         bool fr_q_done = false;   // the layer's rows quantized to q8_1 (once per layer)
                         auto compute = [&](size_t j, const uint8_t* blob_dev, int slot, int32_t cslot) -> bool {
                             const int32_t e = order[j];

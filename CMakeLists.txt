@@ -440,6 +440,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(fewrows_rule_test PRIVATE include)
   add_test(NAME fewrows_rule_test COMMAND fewrows_rule_test)
 
+  # Tesla P100: when the prompt experts take the FP16 path by default instead of MMQ (header-only, no GPU)
+  add_executable(gp100_prompt_default_test tests/prefill/gp100_prompt_default_test.cpp)
+  target_include_directories(gp100_prompt_default_test PRIVATE include)
+  add_test(NAME gp100_prompt_default_test COMMAND gp100_prompt_default_test)
+
   # PR #4844: the adaptive tier's copy-in range across serial, pipelined and drained rounds (header-only, no GPU)
   add_executable(adaptive_range_test tests/program/adaptive_range_test.cpp)
   target_include_directories(adaptive_range_test PRIVATE include)
