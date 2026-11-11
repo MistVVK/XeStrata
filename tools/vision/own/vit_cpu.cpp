@@ -257,8 +257,7 @@ bool VitCpu::encode(const PreparedImage& img, int threads, std::vector<float>& r
             const float* b = &m.pos[((size_t) y0 * G + x1) * D];
             const float* c = &m.pos[((size_t) y1 * G + x0) * D];
             const float* d = &m.pos[((size_t) y1 * G + x1) * D];
-            float* xr = &x[(size_t) t * D];
-            for (int i = 0; i < D; ++i) xr[i] += a[i] * (1 - dx) * (1 - dy) + b[i] * dx * (1 - dy) + c[i] * (1 - dx) * dy + d[i] * dx * dy;
+            ops.pos_add(&x[(size_t) t * D], a, b, c, d, dx, dy, D);      // a tier kernel: its result depends on multiply-add contraction (cpu_tier.h)
         });
     }
 
@@ -310,16 +309,7 @@ bool VitCpu::encode(const PreparedImage& img, int threads, std::vector<float>& r
             const float* s1 = &rs[(size_t) ty[(size_t) t] * quarter];
             const float* c2 = &cc[(size_t) tx[(size_t) t] * quarter];
             const float* s2 = &cs[(size_t) tx[(size_t) t] * quarter];
-            for (int part = 0; part < 2; ++part)
-                for (int hh = 0; hh < H; ++hh) {
-                    float* v = row + (size_t) part * D + (size_t) hh * HD;
-                    for (int j = 0; j < half; ++j) {
-                        const float co = j < quarter ? c1[j] : c2[j - quarter], si = j < quarter ? s1[j] : s2[j - quarter];
-                        const float a = v[j], b = v[j + half];
-                        v[j] = a * co - b * si;
-                        v[j + half] = a * si + b * co;
-                    }
-                }
+            ops.rope_row(row, (size_t) D, H, HD, c1, s1, c2, s2);       // a tier kernel, as pos_add
             if (m.act_round) ops.round16(row, D3, 2);
             for (int i = 0; i < D; ++i) row[i] *= kq_scale;
         });

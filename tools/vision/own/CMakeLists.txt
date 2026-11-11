@@ -80,15 +80,28 @@ if(NOT MSVC)
   # reference builds on the Linux boxes); the helper's portable build keeps the AVX2 baseline its other code has
   option(STRATA_VIT_OWN_NATIVE "build the reference for this CPU (-march=native)" ${STRATA_VIT_OWN_STANDALONE})
   set_source_files_properties(vit_ref.cpp vit_cpu.cpp cpu_kernels_scalar.cpp cpu_kernels_neon.cpp PROPERTIES COMPILE_OPTIONS "-O3")
-  if(STRATA_VIT_OWN_NATIVE)
-    set_source_files_properties(vit_ref.cpp PROPERTIES COMPILE_OPTIONS "-O3;-march=native")
-  elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-    set_source_files_properties(vit_ref.cpp PROPERTIES COMPILE_OPTIONS "-O3;-mavx2;-mfma")
-  endif()
-  # the CPU tower: the generic part keeps the portable baseline, each kernel tier is compiled for its own instruction set (and only called when the
-  # CPU has it, cpu_caps.h)
+  # The reference (VitRef, a test oracle) is the only generic file compiled above the baseline, and only where the whole program has that floor anyway: an
+  # instruction-set flag on a file that uses the standard library also reaches its inline / template copies (COMDAT), which the linker may keep for the WHOLE
+  # program, so a wider flag here would put AVX2 code on the path of a CPU without it (RESULTS-OWN-3V.md PART H).
+  #   STRATA_VIT_OWN_NATIVE (standalone test builds) or a native helper build (setup, STRATA_PORTABLE=OFF): -march=native, this CPU;
+  #   the portable helper (STRATA_PORTABLE=ON, an AVX2 baseline for the whole program): -mavx2 -mfma as before;
+  #   an older-CPU test build (STRATA_ISA_FLOOR, tools/vision): that floor.
   if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-    set_source_files_properties(vit_cpu.cpp PROPERTIES COMPILE_OPTIONS "-O3;-mavx2;-mfma")
+    if(STRATA_ISA_FLOOR STREQUAL "avx" OR STRATA_ISA_FLOOR STREQUAL "avx_f16c")
+      set_source_files_properties(vit_ref.cpp PROPERTIES COMPILE_OPTIONS "-O3;-mavx")
+    elseif(STRATA_ISA_FLOOR)
+      set_source_files_properties(vit_ref.cpp PROPERTIES COMPILE_OPTIONS "-O3")
+    elseif(STRATA_VIT_OWN_NATIVE OR (DEFINED STRATA_PORTABLE AND NOT STRATA_PORTABLE))
+      set_source_files_properties(vit_ref.cpp PROPERTIES COMPILE_OPTIONS "-O3;-march=native")
+    elseif(STRATA_PORTABLE)
+      set_source_files_properties(vit_ref.cpp PROPERTIES COMPILE_OPTIONS "-O3;-mavx2;-mfma")
+    endif()
+  elseif(STRATA_VIT_OWN_NATIVE)
+    set_source_files_properties(vit_ref.cpp PROPERTIES COMPILE_OPTIONS "-O3;-march=native")
+  endif()
+  # the CPU tower: the generic part (vit_cpu.cpp) keeps the baseline, each kernel tier is compiled for its own instruction set and only called when the CPU
+  # has it (cpu_caps.h); the tiers' files include no standard-library code (cpu_tier.h)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set_source_files_properties(cpu_kernels_avx2.cpp PROPERTIES COMPILE_OPTIONS "-O3;-mavx2;-mfma;-mf16c")
     set_source_files_properties(cpu_kernels_avx512.cpp PROPERTIES COMPILE_OPTIONS "-O3;-mavx2;-mfma;-mf16c;-mavx512f;-mavx512bw;-mavx512dq;-mavx512vl")
   else()

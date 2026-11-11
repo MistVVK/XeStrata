@@ -251,11 +251,32 @@ void softmax_update(float* S, size_t lds, int qrows, int nkeys, float* m, float*
     }
 }
 
+// The rotary and the position add, written as they were in vit_cpu.cpp (the same expressions in the same order), so a tier compiled with the flags vit_cpu.cpp
+// had (-mavx2 -mfma on GCC) contracts them the same way as before: the AVX2 / AVX-512 results stay bit-identical.
+void rope_row(float* row, size_t kstride, int heads, int hd, const float* c1, const float* s1, const float* c2, const float* s2) {
+    const int half = hd / 2, quarter = hd / 4;
+    for (int part = 0; part < 2; ++part)
+        for (int hh = 0; hh < heads; ++hh) {
+            float* v = row + (size_t) part * kstride + (size_t) hh * hd;
+            for (int j = 0; j < half; ++j) {
+                const float co = j < quarter ? c1[j] : c2[j - quarter], si = j < quarter ? s1[j] : s2[j - quarter];
+                const float a = v[j], b = v[j + half];
+                v[j] = a * co - b * si;
+                v[j + half] = a * si + b * co;
+            }
+        }
+}
+
+void pos_add(float* xr, const float* a, const float* b, const float* c, const float* d, float dx, float dy, int D) {
+    for (int i = 0; i < D; ++i) xr[i] += a[i] * (1 - dx) * (1 - dy) + b[i] * dx * (1 - dy) + c[i] * (1 - dx) * dy + d[i] * dx * dy;
+}
+
 }  // namespace kn
 }  // namespace
 
 const CpuOps& STRATA_KN_GETTER() {
-    static const CpuOps ops = {STRATA_KN_NAME, kn::MRF, kn::NR, kn::pack_w, kn::conv, kn::gemm, kn::gelu, kn::layernorm, kn::add, kn::round16, kn::softmax_update};
+    static const CpuOps ops = {STRATA_KN_NAME, kn::MRF, kn::NR, kn::pack_w, kn::conv, kn::gemm, kn::gelu, kn::layernorm, kn::add, kn::round16, kn::softmax_update,
+                               kn::rope_row, kn::pos_add};
     return ops;
 }
 
