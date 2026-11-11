@@ -2,6 +2,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "conversation_checked.hpp"
 #include "conversation_copy.hpp"
+#include "conversation_trace.hpp"
 #include <cuda_runtime.h>
 
 #include <array>
@@ -248,7 +249,7 @@ bool on_device(const void* p) {
 }
 // STRATA_PARK_TRACE: where conversation_kv_save's time goes since the park's begin (ms): the pointer-attribute
 // queries, the host buffer resizes and the copies (into the stage, or the synchronous ones).  Read by the park trace.
-struct KvSaveTrace { double attrs = 0, resize = 0, copy = 0; };
+struct KvSaveTrace { double attrs = 0, resize = 0, copy = 0; long resize_faults = 0; };
 KvSaveTrace& kv_save_trace() { static KvSaveTrace t; return t; }
 bool park_trace_on() {
     static const bool on = std::getenv("STRATA_PARK_TRACE") != nullptr;
@@ -357,9 +358,11 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         const bool staged = a.active && src[i] != nullptr && sizes[i] > keep && a.used + (sizes[i] - keep) <= a.cap &&
                             (st.kv_mode == 0 || on_device(src[i]));
         const auto t1 = tick();
+        const long rf0 = trace ? conversation_trace::thread_minflt() : 0;
         if (staged) dst[i]->resize_for_overwrite(sizes[i]);
         else dst[i]->resize(sizes[i]);
         const auto t2 = tick();
+        if (trace) kv_save_trace().resize_faults += conversation_trace::thread_minflt() - rf0;
         const bool copied = dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
                 const uint8_t* s = src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr;
                 if (!staged) return transfer(p, s, n, error);
@@ -591,6 +594,8 @@ void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& cop
     const KvSaveTrace& t = kv_save_trace();
     attrs_ms = t.attrs; resize_ms = t.resize; copy_ms = t.copy;
 }
+
+long conversation_kv_save_trace_faults() { return kv_save_trace().resize_faults; }
 
 bool conversation_park_async_begin(size_t need) {
     if (park_trace_on()) kv_save_trace() = {};   // (the sums cover this park's saves)
