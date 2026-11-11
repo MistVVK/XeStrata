@@ -35,6 +35,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace strata::image {
@@ -197,12 +198,21 @@ struct Qwen3VlTe {
     const strata::TensorInfo* embd = nullptr;
     cudaStream_t stream = nullptr;
     cublasHandle_t blas = nullptr;
-    uint8_t* d_w = nullptr;            // every layer weight, raw blocks
+    uint8_t* d_w = nullptr;            // resident: every layer weight, raw blocks; streamed: two layer slots
     float* d_norm = nullptr;           // every 1-D norm weight, f32
     uint16_t* d_stage = nullptr;       // one decoded f16 weight group ([Wq; Wk; Wv] or [Wgate; Wup] or Wo / Wdown)
     size_t stage_elems = 0;
     size_t weight_bytes = 0, norm_bytes = 0;
     double read_ms = 0, upload_ms = 0;
+    // uploads: the file's bytes go through two pinned chunks (copied into them by several threads), then async copies
+    bool streamed = false;
+    std::vector<std::pair<const strata::TensorInfo*, size_t>> plan;   // tensor, offset in the resident layout
+    std::vector<size_t> layer_base;    // resident offset of each layer's first weight; a layer's weights are contiguous
+    size_t slot_bytes = 0;             // the largest layer
+    cudaStream_t copy = nullptr;
+    uint8_t* pinned[2] = {nullptr, nullptr};
+    cudaEvent_t pin_ev[2] = {nullptr, nullptr}, up_ev[2] = {nullptr, nullptr}, done_ev[2] = {nullptr, nullptr};
+    int pin_next = 0, threads = 1;
 };
 
 namespace {
@@ -230,6 +240,48 @@ std::string find_norm(Qwen3VlTe* te, const std::string& name, int64_t n, size_t&
     return te_dequant_f32_host(t->type, te->file->tensor_data(*t), n, 1, host.data() + at);
 }
 
+constexpr size_t PIN_CHUNK = 32u << 20;   // bytes per pinned chunk (two of them)
+constexpr double RESIDENT_MIN_GIB = 14.0; // cards with at least this much TOTAL memory keep the weights resident
+
+// host bytes -> device, async on te->copy through the two pinned chunks; the host copy into a chunk is split over
+// te->threads threads (the mapped file's pages fault in in parallel).  The bytes on the device are the file's bytes,
+// whichever way they travel.
+std::string upload(Qwen3VlTe* te, uint8_t* dst, const uint8_t* src, size_t n) {
+    for (size_t done = 0; done < n;) {
+        const int b = te->pin_next;
+        te->pin_next ^= 1;
+        TE_CUDA(cudaEventSynchronize(te->pin_ev[b]));          // the chunk's previous copy has left it
+        const size_t c = std::min(PIN_CHUNK, n - done);
+        const int nt = std::max(1, std::min<int>(te->threads, (int) (c >> 20)));
+        std::vector<std::thread> pool;
+        const size_t part = (c + nt - 1) / nt;
+        for (int t = 0; t < nt; ++t) {
+            const size_t a = (size_t) t * part, e = std::min(c, a + part);
+            if (a < e) pool.emplace_back([=] { std::memcpy(te->pinned[b] + a, src + done + a, e - a); });
+        }
+        for (auto& th : pool) th.join();
+        TE_CUDA(cudaMemcpyAsync(dst + done, te->pinned[b], c, cudaMemcpyHostToDevice, te->copy));
+        TE_CUDA(cudaEventRecord(te->pin_ev[b], te->copy));
+        done += c;
+    }
+    return std::string();
+}
+
+// streamed: layer li's weights into slot li % 2, after the compute stream is done with the layer that used it
+std::string issue_layer(Qwen3VlTe* te, int li) {
+    if (li >= te->n_layer) return std::string();
+    const int s = li & 1;
+    TE_CUDA(cudaStreamWaitEvent(te->copy, te->done_ev[s], 0));
+    const size_t base = te->layer_base[li];
+    for (int k = 0; k < 7; ++k) {
+        const auto& [t, o] = te->plan[(size_t) li * 7 + k];
+        TE_TRY(upload(te, te->d_w + (size_t) s * te->slot_bytes + (o - base), te->file->tensor_data(*t),
+                      te_row_bytes(t->type, (int64_t) t->shape[0]) * t->shape[1]));
+    }
+    TE_CUDA(cudaEventRecord(te->up_ev[s], te->copy));
+    return std::string();
+}
+
 std::string meta_int(const strata::GgufFile& f, const std::string& key, int& v) {
     const strata::MetaValue* m = f.get(key);
     if (!m || !m->is_num()) return "qwen3vl_te: metadata " + key + " missing";
@@ -237,7 +289,7 @@ std::string meta_int(const strata::GgufFile& f, const std::string& key, int& v) 
     return std::string();
 }
 
-std::string open_impl(Qwen3VlTe* te, const std::string& path, int device) {
+std::string open_impl(Qwen3VlTe* te, const std::string& path, int device, int mode) {
     const auto t0 = std::chrono::steady_clock::now();
     te->file = std::make_unique<strata::GgufFile>(path);
     const strata::GgufFile& f = *te->file;
@@ -257,12 +309,13 @@ std::string open_impl(Qwen3VlTe* te, const std::string& path, int device) {
     if (!te->embd || te_row_bytes(te->embd->type, te->C) == 0) return "qwen3vl_te: token_embd.weight missing or unreadable";
 
     const int C = te->C, F = te->F, Q = te->H * HD, K = te->KV * HD;
-    std::vector<std::pair<const strata::TensorInfo*, size_t>> plan;
+    std::vector<std::pair<const strata::TensorInfo*, size_t>>& plan = te->plan;
     std::vector<float> norms;
     size_t off = 0;
     te->layers.resize(te->n_layer);
     for (int i = 0; i < te->n_layer; ++i) {
         Layer& L = te->layers[i];
+        te->layer_base.push_back(off);
         const std::string p = "blk." + std::to_string(i) + ".";
         TE_TRY(find_weight(te, p + "attn_q.weight", C, Q, L.q, off, plan));
         TE_TRY(find_weight(te, p + "attn_k.weight", C, K, L.k, off, plan));
@@ -277,22 +330,35 @@ std::string open_impl(Qwen3VlTe* te, const std::string& path, int device) {
         TE_TRY(find_norm(te, p + "attn_k_norm.weight", HD, L.k_norm, norms));
     }
     te->weight_bytes = off;
+    for (int i = 0; i < te->n_layer; ++i)
+        te->slot_bytes = std::max(te->slot_bytes, (i + 1 < te->n_layer ? te->layer_base[i + 1] : off) - te->layer_base[i]);
     te->norm_bytes = norms.size() * sizeof(float);
     te->stage_elems = std::max<size_t>({(size_t) (Q + 2 * K) * C, (size_t) 2 * F * C, (size_t) C * Q, (size_t) C * F});
 
     if (device >= 0) TE_CUDA(cudaSetDevice(device));
     TE_CUDA(cudaGetDevice(&te->device));
+    size_t free_b = 0, total_b = 0;
+    TE_CUDA(cudaMemGetInfo(&free_b, &total_b));
+    te->streamed = mode == 2 || (mode == 0 && total_b / 1073741824.0 < RESIDENT_MIN_GIB);   // never free memory
     TE_CUDA(cudaStreamCreateWithFlags(&te->stream, cudaStreamNonBlocking));
+    TE_CUDA(cudaStreamCreateWithFlags(&te->copy, cudaStreamNonBlocking));
+    for (int b = 0; b < 2; ++b) {
+        TE_CUDA(cudaMallocHost((void**) &te->pinned[b], PIN_CHUNK));
+        TE_CUDA(cudaEventCreateWithFlags(&te->pin_ev[b], cudaEventDisableTiming));
+        TE_CUDA(cudaEventCreateWithFlags(&te->up_ev[b], cudaEventDisableTiming));
+        TE_CUDA(cudaEventCreateWithFlags(&te->done_ev[b], cudaEventDisableTiming));
+    }
     TE_BLAS(cublasCreate(&te->blas));
     TE_BLAS(cublasSetStream(te->blas, te->stream));
-    TE_CUDA(cudaMalloc((void**) &te->d_w, te->weight_bytes));
+    TE_CUDA(cudaMalloc((void**) &te->d_w, te->streamed ? 2 * te->slot_bytes : te->weight_bytes));
     TE_CUDA(cudaMalloc((void**) &te->d_norm, te->norm_bytes));
     TE_CUDA(cudaMalloc((void**) &te->d_stage, te->stage_elems * sizeof(uint16_t)));
     const auto t1 = std::chrono::steady_clock::now();
-    for (const auto& [t, o] : plan)
-        TE_CUDA(cudaMemcpy(te->d_w + o, f.tensor_data(*t), te_row_bytes(t->type, (int64_t) t->shape[0]) * t->shape[1],
-                           cudaMemcpyHostToDevice));
-    TE_CUDA(cudaMemcpy(te->d_norm, norms.data(), te->norm_bytes, cudaMemcpyHostToDevice));
+    if (!te->streamed)
+        for (const auto& [t, o] : plan)
+            TE_TRY(upload(te, te->d_w + o, f.tensor_data(*t), te_row_bytes(t->type, (int64_t) t->shape[0]) * t->shape[1]));
+    TE_TRY(upload(te, reinterpret_cast<uint8_t*>(te->d_norm), reinterpret_cast<const uint8_t*>(norms.data()), te->norm_bytes));
+    TE_CUDA(cudaStreamSynchronize(te->copy));
     const auto t2 = std::chrono::steady_clock::now();
     te->read_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     te->upload_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
@@ -308,8 +374,10 @@ std::string gemm(Qwen3VlTe* te, const uint16_t* x16, int T, int K, const uint16_
     return std::string();
 }
 
-std::string decode(Qwen3VlTe* te, const WeightRef& w, uint16_t* dst) {
-    return te_dequant_f16(w.type, te->d_w + w.off, w.ne0, w.rows, dst, te->stream);
+std::string decode(Qwen3VlTe* te, int li, const WeightRef& w, uint16_t* dst) {
+    const uint8_t* src = te->streamed ? te->d_w + (size_t) (li & 1) * te->slot_bytes + (w.off - te->layer_base[li])
+                                      : te->d_w + w.off;
+    return te_dequant_f16(w.type, src, w.ne0, w.rows, dst, te->stream);
 }
 
 struct Work {   // per-encode device buffers
@@ -361,14 +429,19 @@ std::string encode_impl(Qwen3VlTe* te, const int32_t* ids, int T, float* out, Qw
     const float scale = 1.0f / sqrtf((float) HD);
     const float one = 1.f, zero = 0.f;
     uint16_t* W = te->d_stage;
+    if (te->streamed) {
+        TE_TRY(issue_layer(te, 0));
+        TE_TRY(issue_layer(te, 1));
+    }
     for (int li = 0; li < te->n_layer; ++li) {
         const Layer& L = te->layers[li];
         const float* nw = te->d_norm;
+        if (te->streamed) TE_CUDA(cudaStreamWaitEvent(te->stream, te->up_ev[li & 1], 0));
         // attention
         rms_f16_kernel<<<T, 256, 0, te->stream>>>(x, nw + L.attn_norm, C, te->eps, h16);
-        TE_TRY(decode(te, L.q, W));
-        TE_TRY(decode(te, L.k, W + (size_t) Q * C));
-        TE_TRY(decode(te, L.v, W + (size_t) (Q + KD) * C));
+        TE_TRY(decode(te, li, L.q, W));
+        TE_TRY(decode(te, li, L.k, W + (size_t) Q * C));
+        TE_TRY(decode(te, li, L.v, W + (size_t) (Q + KD) * C));
         TE_TRY(gemm(te, h16, T, C, W, Q + 2 * KD, qkv, Q + 2 * KD, false));
         qk_rope_kernel<<<dim3(T, H + 2 * KV), HD, 0, te->stream>>>(qkv, T, H, KV, nw + L.q_norm, nw + L.k_norm, te->eps,
                                                                    cs, q16, k16, v16);
@@ -390,16 +463,20 @@ std::string encode_impl(Qwen3VlTe* te, const int32_t* ids, int T, float* out, Qw
             }
         }
         cast_f16_kernel<<<grid_for((size_t) T * Q), 256, 0, te->stream>>>(att, (size_t) T * Q, h16);
-        TE_TRY(decode(te, L.o, W));
+        TE_TRY(decode(te, li, L.o, W));
         TE_TRY(gemm(te, h16, T, Q, W, C, x, C, true));
         // feed-forward
         rms_f16_kernel<<<T, 256, 0, te->stream>>>(x, nw + L.ffn_norm, C, te->eps, h16);
-        TE_TRY(decode(te, L.gate, W));
-        TE_TRY(decode(te, L.up, W + (size_t) F * C));
+        TE_TRY(decode(te, li, L.gate, W));
+        TE_TRY(decode(te, li, L.up, W + (size_t) F * C));
         TE_TRY(gemm(te, h16, T, C, W, 2 * F, gu, 2 * F, false));
         swiglu_f16_kernel<<<grid_for((size_t) T * F), 256, 0, te->stream>>>(gu, T, F, a16);
-        TE_TRY(decode(te, L.down, W));
+        TE_TRY(decode(te, li, L.down, W));
         TE_TRY(gemm(te, a16, T, F, W, C, x, C, true));
+        if (te->streamed) {                           // slot li % 2 is free once this layer's decodes are done
+            TE_CUDA(cudaEventRecord(te->done_ev[li & 1], te->stream));
+            TE_TRY(issue_layer(te, li + 2));
+        }
     }
     TE_CUDA(cudaGetLastError());
     TE_CUDA(cudaMemcpyAsync(out, x, (size_t) T * C * sizeof(float), cudaMemcpyDeviceToHost, te->stream));
@@ -413,19 +490,21 @@ std::string encode_impl(Qwen3VlTe* te, const int32_t* ids, int T, float* out, Qw
         if (!std::isfinite(out[i])) return "qwen3vl_te: the condition has a non-finite value";
     if (st) {
         st->encode_ms = ms;
-        st->weight_bytes = te->weight_bytes;
-        st->peak_bytes = te->weight_bytes + te->norm_bytes + te->stage_elems * sizeof(uint16_t) + wk.bytes;
+        st->weight_bytes = te->streamed ? 2 * te->slot_bytes : te->weight_bytes;
+        st->peak_bytes = st->weight_bytes + te->norm_bytes + te->stage_elems * sizeof(uint16_t) + wk.bytes;
+        st->streamed = te->streamed;
     }
     return std::string();
 }
 
 }  // namespace
 
-Qwen3VlTe* qwen3vl_te_open(const std::string& gguf_path, int device, std::string* err) {
+Qwen3VlTe* qwen3vl_te_open(const std::string& gguf_path, int device, std::string* err, int mode, int threads) {
     auto* te = new Qwen3VlTe();
+    te->threads = threads > 0 ? threads : (int) std::min(8u, std::max(1u, std::thread::hardware_concurrency()));
     std::string e;
     try {
-        e = open_impl(te, gguf_path, device);
+        e = open_impl(te, gguf_path, device, mode);
     } catch (const std::exception& ex) {
         e = std::string("qwen3vl_te: ") + ex.what();
     }
@@ -450,13 +529,23 @@ std::string qwen3vl_te_encode(Qwen3VlTe* te, const int32_t* ids, int n, float* o
 
 std::string qwen3vl_te_open_report(const Qwen3VlTe* te) {
     char b[160];
-    std::snprintf(b, sizeof b, "read %.0f ms, upload %.0f ms (%.2f GB of weights)", te->read_ms, te->upload_ms,
-                  te->weight_bytes / 1e9);
+    std::snprintf(b, sizeof b, "%s, read %.0f ms, upload %.0f ms (%.2f GB of weights%s)",
+                  te->streamed ? "streamed" : "resident", te->read_ms, te->upload_ms, te->weight_bytes / 1e9,
+                  te->streamed ? ", uploaded per layer at every encode" : "");
     return b;
 }
 
 void qwen3vl_te_close(Qwen3VlTe* te) {
     if (!te) return;
+    if (te->copy) cudaStreamSynchronize(te->copy);
+    if (te->stream) cudaStreamSynchronize(te->stream);
+    for (int b = 0; b < 2; ++b) {
+        if (te->pinned[b]) cudaFreeHost(te->pinned[b]);
+        if (te->pin_ev[b]) cudaEventDestroy(te->pin_ev[b]);
+        if (te->up_ev[b]) cudaEventDestroy(te->up_ev[b]);
+        if (te->done_ev[b]) cudaEventDestroy(te->done_ev[b]);
+    }
+    if (te->copy) cudaStreamDestroy(te->copy);
     if (te->d_w) cudaFree(te->d_w);
     if (te->d_norm) cudaFree(te->d_norm);
     if (te->d_stage) cudaFree(te->d_stage);

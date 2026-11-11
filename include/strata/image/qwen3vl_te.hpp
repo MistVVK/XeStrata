@@ -25,13 +25,18 @@ struct Qwen3VlTe;
 struct Qwen3VlTeStats {
     double encode_ms = 0;          // embeddings up, 36 layers, result down (the stream's events)
     size_t peak_bytes = 0;         // the encoder's own device memory at its peak (weights + work)
-    size_t weight_bytes = 0;       // layer weights on the device
+    size_t weight_bytes = 0;       // layer weights on the device (streamed: the two layer slots)
+    bool streamed = false;
 };
 
 // Open the text encoder of a GGUF file (general.architecture "qwen3vl": block_count, embedding_length, ... from its
-// metadata) on `device` (-1: the current device) and copy the layer weights to it.  nullptr and *err on failure (an
-// unknown architecture, a missing tensor, a weight type te_dequant.hpp does not read).
-Qwen3VlTe* qwen3vl_te_open(const std::string& gguf_path, int device, std::string* err);
+// metadata) on `device` (-1: the current device).  nullptr and *err on failure (an unknown architecture, a missing
+// tensor, a weight type te_dequant.hpp does not read).
+// mode 0 (auto): the weights stay resident on cards with at least 14 GiB of TOTAL memory (16 GB cards and up) and are
+// streamed otherwise; never decided by free memory.  1: resident, 2: streamed (tests).  Streamed keeps two layers on
+// the device and uploads each layer at every encode, one ahead of the compute.  Both give the same bytes.
+// threads: for copying the file into the pinned upload chunks (0: up to 8); the bytes do not depend on it.
+Qwen3VlTe* qwen3vl_te_open(const std::string& gguf_path, int device, std::string* err, int mode = 0, int threads = 0);
 
 int qwen3vl_te_hidden(const Qwen3VlTe* te);
 

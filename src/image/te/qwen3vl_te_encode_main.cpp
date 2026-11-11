@@ -1,7 +1,7 @@
 // src/image/te/qwen3vl_te_encode_main.cpp - test program strata-te-encode (not shipped): Strata's text encoder on token
 // ids that stable-diffusion.cpp built (tools/image/gate/stage_hooks.py dumps tokens.bin + tokens.start).
 //
-//   strata-te-encode <te.gguf> <src dir> <dst dir> [--repeat N]
+//   strata-te-encode <te.gguf> <src dir> <dst dir> [--repeat N] [--mode auto|resident|streamed]
 //
 // For every <src dir>/dump_*/ with tokens.bin: the condition sd.cpp's LLMEmbedder would return for those ids (our
 // encoder's rows from tokens.start on; the gate prompts carry no token weights) -> <dst dir>/dump_*/cond.bin (float32,
@@ -26,11 +26,14 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: strata-te-encode <te.gguf> <src dir> <dst dir> [--repeat N]\n");
         return 2;
     }
-    int repeat = 1;
-    for (int i = 4; i + 1 < argc; ++i)
+    int repeat = 1, mode = 0;
+    for (int i = 4; i + 1 < argc; ++i) {
         if (std::strcmp(argv[i], "--repeat") == 0) repeat = std::max(1, std::atoi(argv[i + 1]));
+        if (std::strcmp(argv[i], "--mode") == 0)
+            mode = std::strcmp(argv[i + 1], "resident") == 0 ? 1 : std::strcmp(argv[i + 1], "streamed") == 0 ? 2 : 0;
+    }
     std::string err;
-    Qwen3VlTe* te = qwen3vl_te_open(argv[1], -1, &err);
+    Qwen3VlTe* te = qwen3vl_te_open(argv[1], -1, &err, mode);
     if (!te) {
         std::fprintf(stderr, "%s\n", err.c_str());
         return 2;
