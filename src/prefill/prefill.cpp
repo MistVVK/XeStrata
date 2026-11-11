@@ -2311,9 +2311,12 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     if (r0 >= n) return true;
     // per row: emb/e2 (N), en16 (N half), hn/h2/Rm/gated (HCN), hn16/xn16 (HCN half), lo (LR) + lo16, grs, mixed (N) +
     // mixed_h, K and V (KV each), the token id
-    // E-9: the drafter's Q8_0 matrices through Q8_1 x Q8_0 MMQ - its own pass's integer dot products (mmvq), so
-    // its K/V stay close to what the drafter computes itself; STRATA_MTP_BATCH_F16=1: FP16 GEMMs (the A/B)
-    static const bool f16_only = [] { const char* v = std::getenv("STRATA_MTP_BATCH_F16"); return v && v[0] == '1'; }();
+    // E-9: the drafter's Q8_0 matrices through FP16 GEMMs (Gemm::native: dequantize + cuBLAS / hipBLAS), our own code
+    // instead of llama.cpp's MMQ.  Measured on an RTX PRO 5000 (IQ3_S, 5 rounds, 20 decode prompts of five classes, lane
+    // P4-FALLBACK 11-11): the same tokens in 100 of 100 requests, prompt time 1.001 of MMQ's form, decode 0.993-1.000 by
+    // class, acceptance 0.7447 against 0.7470.  STRATA_MTP_BATCH_F16=0: the Q8_1 x Q8_0 MMQ form (as the drafter's own
+    // integer dot products, mmvq), kept until MMQ leaves the build.
+    static const bool f16_only = [] { const char* v = std::getenv("STRATA_MTP_BATCH_F16"); return v == nullptr || v[0] != '0'; }();
     const bool q8 = !f16_only && mmq::built() && mmq::fits(kQ8_0, Nn) && mmq::fits(kQ8_0, KV);   // #420
     const uint64_t per_row = 4 * (2 * Nn + 4 * HCN + LR + HC + Nn + 2 * KV + 1) + 2 * (Nn + 2 * HCN + LR + Nn) + 64 +
                              (q8 ? (uint64_t) mmq::q8_bytes(g.hc, Nn) + 4 * g.hc : 0);

@@ -21670,7 +21670,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2313,
+     "line": 2319,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -21682,7 +21682,7 @@
     }
    ],
    "parse": "flag",
-   "default_state": "off",
+   "default_state": "on",
    "code_default": null,
    "engine_sets": [],
    "engine_defaults": [],
@@ -21695,9 +21695,9 @@
    "since": "v0.1.40.1",
    "last_commit": "b88eff688b",
    "last_date": "2026-09-30",
-   "status": "research",
+   "status": "rollback",
    "owner": "prefill",
-   "note": "[auto] off unless set, not documented for users",
+   "note": "[reviewed] CUDA / HIP: on unless set to 0 (src/prefill/prefill.cpp:2319, the MTP drafter's prompt pass on FP16 GEMMs instead of Q8_0 MMQ; =0 is MMQ's form until MMQ leaves the build); SYCL: off unless set to 1 (no MMQ there). Not documented for users",
    "retire_after": "",
    "retired_in": ""
   },
