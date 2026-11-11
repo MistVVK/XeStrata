@@ -19,6 +19,7 @@
 #include "strata/platform/io_priority.hpp"
 #include "strata/core/adapt_async_default.hpp"
 #include "strata/core/arch_defaults.hpp"
+#include "strata/core/reader_room.hpp"
 #include "strata/core/gfx12_chunk.hpp"
 #include "strata/core/nv_chunk.hpp"
 #include "strata/core/nv_defaults.hpp"
@@ -7844,6 +7845,16 @@ int main(int argc, char** argv) {
         srcp = &arena_src;
     }
     }   // the arena / file pass loop (#4846)
+    // The picture reader's room in the resident RAM mode (strata/core/reader_room.hpp): there the cache refuses the server's VRAM
+    // command, so an on-demand reader keeps its room in the reserve, as before the reader went on demand.  Decided here, once, before
+    // the cache is sized; the mode is not entered later.
+    if (const int keep = strata::core::reader_room_reserve_mib(o.vram_reserve_mib, o.vision, o.vram_elastic && o.serve,
+                                                               o.resident_cpu_experts);
+        keep != o.vram_reserve_mib) {
+        std::fprintf(stderr, "strata generate: the resident RAM mode cannot resize the expert cache, so the picture reader's %d MiB "
+                             "stay in the reserve (%d MiB asked)\n", keep, o.vram_reserve_mib);
+        o.vram_reserve_mib = keep;
+    }
 #if defined(__linux__)
     // 0.1.43.1: on by default (STRATA_ADAPT_CALLBACK_WARMUP=0 turns it off).  Linux threads inherit the creator's CPU mask, and
     // the host pins itself to one CPU later; a callback thread the driver creates lazily after that would run on the
