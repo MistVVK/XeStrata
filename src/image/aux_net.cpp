@@ -7,6 +7,7 @@
 #include "qi_conv.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/timed_choice.hpp"
 #include "strata/image/aux_kernels.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
@@ -16,7 +17,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <chrono>
 #include <stdexcept>
 
 namespace strata::image {
@@ -329,22 +329,10 @@ void AuxNet::product16(const uint16_t* x16, const Lin& l, uint16_t* y16, int64_t
     const auto key = std::make_tuple(T, l.n, l.k, (int) act * 2 + (b != nullptr ? 1 : 0));
     auto it = pick16_.find(key);
     if (it == pick16_.end()) {
-        // each way warmed (a library makes its kernels at its first product of a shape), then timed; -1: not taken
-        const auto timed = [&](const auto& run) -> double {
-            if (!run()) return -1.0;
-            gpu::stream_sync(s_);
-            const auto t0 = std::chrono::steady_clock::now();
-            run();
-            gpu::stream_sync(s_);
-            return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        };
-        const double t_narrow = timed([&] { narrow(); return true; });
-        const double t_half = prefill::Gemm::half_ok(s_) ? timed([&] { half(); return true; }) : -1.0;
-        const double t_lib = timed(library);
-        int pick = 0;
-        double best = t_narrow;
-        if (t_half >= 0.0 && t_half < best) pick = 1, best = t_half;
-        if (t_lib >= 0.0 && t_lib < best) pick = 2;
+        const auto choice = core::timed_choice({{[&] { narrow(); return true; }},
+                                                {[&] { if (!prefill::Gemm::half_ok(s_)) return false; half(); return true; }},
+                                                {library}}, [&] { gpu::stream_sync(s_); });
+        const int pick = choice.pick;
         it = pick16_.emplace(key, pick).first;
     }
     if (it->second == 2 && library()) return;

@@ -431,6 +431,8 @@ const char* Gemm::path() {
     return text.c_str();
 }
 
+// Opt-in: Qwen3.8 at 1K tokens on the B70 was 637 -> 625 tok/s; Qwen3.5-9B on the RTX 4070
+// was 2889 -> 2834 (2026-11-11, one warm measurement each). The benefit is not established on either engine.
 bool gemm_dequant_side() {
     static const bool on = [] { const char* v = strata::env_get("DEQUANT_SIDE"); return v && v[0] == '1'; }();
     return on;

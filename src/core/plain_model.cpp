@@ -58,6 +58,7 @@
 #include "strata/kernels/sampler_host.hpp"
 #include "strata/kernels/draft_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
+#include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/platform/memory.hpp"
@@ -1257,6 +1258,8 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
     b.cpu_cap = std::min<int64_t>((int64_t) TK, (int64_t) k::cpu::MAXT * (int64_t) E);
     take(b.cpu, (uint64_t) b.cpu_cap * N * 4); take(b.cpu_row, (uint64_t) b.cpu_cap * 4);
     take(b.gemm_scratch, (uint64_t) b.gemm_elems * 2);
+    if (prefill::gemm_dequant_side()) take(b.gemm_side, (uint64_t) b.gemm_elems * 2);
+    else b.gemm_side = nullptr;
     if (glm_) {   // plain_prompt_glm5.cpp
         const uint64_t HC = 4, MIX = (2 + HC) * HC, S = (uint64_t) s.kda_head_dim, GC = NH * S;
         const uint64_t QLR = (uint64_t) s.q_lora_rank, KVR = (uint64_t) s.kv_lora_rank;

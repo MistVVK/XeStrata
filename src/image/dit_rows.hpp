@@ -110,8 +110,8 @@ inline void quantize_row_w8(const uint16_t* src, int64_t K, int8_t* dst, float* 
             amax = std::max(amax, std::fabs(x[j]));
         }
     }
-    const float d = amax / 127.f, id = amax > 0.f ? 1.f / d : 0.f;
-    for (int64_t j = 0; j < K; ++j) dst[j] = (int8_t) std::lround(v[(size_t) j] * id);
+    const float d = kernels::q8act::Mul::scale(amax), id = kernels::q8act::Mul::inv(d);
+    for (int64_t j = 0; j < K; ++j) dst[j] = kernels::q8act::Mul::value(v[(size_t) j], d, id, amax);
     *scale = d;
 }
 
@@ -605,7 +605,7 @@ template<class Op, int W, int G = 4> struct RowsI8Of {
             }
         }
         amax = sycl::reduce_over_group(it.get_group(), amax, sycl::maximum<float>());
-        const float d = amax / 127.f, id = amax > 0.f ? 1.f / d : 0.f;
+        const float d = kernels::q8act::Mul::scale(amax), id = kernels::q8act::Mul::inv(d);
 #pragma unroll
         for (int c = 0; c < kMaxG; ++c) {
             const int64_t g = si + c * nsg;
@@ -613,7 +613,7 @@ template<class Op, int W, int G = 4> struct RowsI8Of {
             int8_t* qg = q + r * K + g * kQiRotate + (int64_t) lane * W;
 #pragma unroll
             for (int h = 0; h < V / W; ++h) {
-                auto q8 = [&](int p) { return (uint32_t) (uint8_t) (int8_t) (int) sycl::round(v[c][h * W + p] * id); };
+                auto q8 = [&](int p) { return (uint32_t) (uint8_t) kernels::q8act::Mul::value(v[c][h * W + p], d, id, amax); };
                 if constexpr (W == 1) {
                     qg[(int64_t) h * SG] = (int8_t) q8(0);
                 } else {   // packed into 32-bit words and stored as one: a sycl::vec<int8_t, W> store is split into

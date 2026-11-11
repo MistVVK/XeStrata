@@ -87,6 +87,8 @@ PlainModel::PromptGemm& PlainModel::prompt_gemm() {
         prompt_gemm_ = std::unique_ptr<PromptGemm, void (*)(PromptGemm*)>(new PromptGemm, &PlainModel::prompt_gemm_free);
         prompt_gemm_->gemm.init_external(cs_, pb_.gemm_scratch, pb_.gemm_elems);
         PromptGemm& g = *prompt_gemm_;
+        if (std::string err; !g.gemm.set_dequant_side(pb_.gemm_side, err))
+            std::fprintf(stderr, "plain prompt: XESTRATA_DEQUANT_SIDE=1 not taken (%s)\n", err.c_str());
         // the copies on a stream of their own, but not through the first Level Zero adapter (the processor's own
         // graphics, plain_generate.cpp): there a product's wait on the copy stream's event hung now and then, about one
         // prompt in ten on the UHD 770, and none in 15 without it (llm-jp-4.1 Q4_K_M, 2026-10-19)
@@ -118,6 +120,8 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
         prompt_carve((T + pieces - 1) / pieces, pb_, nullptr, (uint8_t*) prompt_host_, db, hb, &prompt_dev_);
         PromptGemm& g = prompt_gemm();
         g.gemm.rebind(pb_.gemm_scratch, pb_.gemm_elems);
+        if (std::string err; !g.gemm.set_dequant_side(pb_.gemm_side, err))
+            std::fprintf(stderr, "plain prompt: XESTRATA_DEQUANT_SIDE=1 not taken (%s)\n", err.c_str());
         g.identity = false;
         return true;
     }
@@ -149,6 +153,8 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
         prompt_carve(T, pb_, nullptr, (uint8_t*) prompt_host_, db, hb, &prompt_dev_);
         PromptGemm& g = prompt_gemm();
         g.gemm.rebind(pb_.gemm_scratch, pb_.gemm_elems);
+        if (std::string err; !g.gemm.set_dequant_side(pb_.gemm_side, err))
+            std::fprintf(stderr, "plain prompt: XESTRATA_DEQUANT_SIDE=1 not taken (%s)\n", err.c_str());
         g.identity = false;
         return true;
     }
@@ -173,6 +179,8 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
     prompt_carve(T, pb_, cache_.device_slot((int32_t) first), (uint8_t*) prompt_host_, db, hb);
     PromptGemm& g = prompt_gemm();
     g.gemm.rebind(pb_.gemm_scratch, pb_.gemm_elems);
+    if (std::string err; !g.gemm.set_dequant_side(pb_.gemm_side, err))
+        std::fprintf(stderr, "plain prompt: XESTRATA_DEQUANT_SIDE=1 not taken (%s)\n", err.c_str());
     g.identity = false;   // the identity map is rewritten where the buffers now lie
     return true;
 }
