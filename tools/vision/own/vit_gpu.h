@@ -34,8 +34,9 @@ inline bool vit_gpu_slower_nvidia(int cc_major, int cc_minor, bool bf16_matrices
     return max_tokens <= kVitGpuDefaultLimit && cc_major == 6 && !(cc_minor == 0 && bf16_matrices);
 }
 // AMD gfx1151 (Strix Halo, Radeon 8060S) takes our tower under `auto` (owner 11-11: "For Strix - use our reader, even if its a bit slower ... Our priority is to
-// get off ggml and llama.cpp").  It is slower there: the ROCm package's rocBLAS ships only its generic "fallback" Tensile kernels for gfx1151 (Windows, Strix:
-// 1.73 to 3.03 of mtmd-HIP's time with hipBLAS; RESULTS-OWN-3V.md 12.14, PART F), and correct (rule 1 and 2 pass on 18 pictures, both models).
+// get off ggml and llama.cpp").  The ROCm package's rocBLAS has tuned gfx1151 kernels for 16-bit results only (BF16 / F16 -> F32 is fallback-only), so on
+// gfx1151 the tower asks for F16 results with float32 accumulation (vit_gpu.cu, VitGpu::load): 0.54-0.91 of mtmd-HIP's time on Strix, rule 1 and 2 pass on
+// 18 pictures with both models (RESULTS-OWN-3V.md PART F2/F3; with float32 results it was 1.7 to 3.1).
 // `gfx` is the device's arch name (hipDeviceProp_t::gcnArchName, possibly with feature suffixes such as ":xnack-").
 inline bool vit_gpu_is_gfx1151(const std::string& gfx) { return gfx.rfind("gfx1151", 0) == 0 && (gfx.size() == 7 || gfx[7] == ':'); }
 // AMD on Windows (coordinator 11-11, with the default flip to our tower): no card but gfx1151 has been measured with the Windows HIP package, so `auto` keeps

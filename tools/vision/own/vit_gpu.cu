@@ -486,7 +486,7 @@ struct VitGpuImpl {
 #endif
 
 #if defined(STRATA_VIT_HIP)
-    // STRATA_VIT_HPA16=1 (off by default): the 16-bit weight products ask rocBLAS for a 16-bit RESULT with float32 accumulation (BF16 -> BF16 and F16 -> F16,
+    // STRATA_VIT_HPA16=1 (on by default on gfx1151 only, see VitGpu::load): the 16-bit weight products ask rocBLAS for a 16-bit RESULT with float32 accumulation (BF16 -> BF16 and F16 -> F16,
     // compute 32F: rocBLAS's BB_HPA / HH_HPA kernels), then widen it to float32.  On gfx110x and gfx1151 the Windows ROCm package's rocBLAS has tuned kernels
     // for those types and only its generic fallback kernels for BF16 / F16 -> F32 (BS_HPA / HS_HPA), which our products asked for (lane COVER 11-11,
     // phaseA-tests\par\RESULTS-COVER.md); mtmd's reader asks for the 16-bit result there.  STRATA_VIT_HPA16_ATT=1: the same for the attention's P*V product
@@ -720,6 +720,15 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
         cudaDeviceProp p;
         if (cudaGetDeviceProperties(&p, device) == cudaSuccess && p.major == 6) pascal = m.bf16_as_f16 = true;
         (void) cudaGetLastError();
+    }
+#else
+    {   // gfx1151 (Strix Halo): every product with a 16-bit result and float32 accumulation, BF16 matrices held as F16, so all of them run rocBLAS's tuned
+        // HH_HPA kernels (F16 results, 10-bit mantissa).  Strix, 18 pictures at 1,024 tokens: Qwen3.8 0.54-0.83 of mtmd-HIP's time (median 0.66), Qwen3.6
+        // 0.57-0.91 (median 0.67), rule 1 and 2 pass on both, byte-identical in and across processes; the BF16 results of BB_HPA missed rule 1 on 3 of the
+        // Qwen3.8 pictures and rule 2 on 3 (RESULTS-OWN-3V.md PART F2/F3).  STRATA_VIT_HPA16, STRATA_VIT_HPA16_ATT and STRATA_VIT_BF16_AS_F16 = 0 turn each off.
+        hipDeviceProp_t p;
+        if (hipGetDeviceProperties(&p, device) == hipSuccess && vit_gpu_is_gfx1151(p.gcnArchName)) m.bf16_as_f16 = m.hpa16 = m.hpa16_att = true;
+        (void) hipGetLastError();
     }
 #endif
     if (const char* e = std::getenv("STRATA_VIT_BF16_AS_F16")) m.bf16_as_f16 = std::atoi(e) != 0;
