@@ -701,8 +701,9 @@ def feed_name(platform: str | None = None) -> str:
     return AARCH64_FEED_NAME if platform == "linux-aarch64" else FEED_NAME
 
 
-def fetch(source: str, trusted: dict[str, bytes], *, timeout: float = 30, say=None, **guards) -> Feed:
-    """Read the feed and its signature from `source` (an https URL, a loopback http URL, a file URL or a folder/file path)."""
+def fetch(source: str, trusted: dict[str, bytes], *, timeout: float = 30, say=None, automatic: bool = False, **guards) -> Feed:
+    """Read the feed and its signature from `source` (an https URL, a loopback http URL, a file URL or a folder/file path).  `automatic`: a read
+    nobody asked for by name (strata_control/netpolicy.py rule 4b: a host that refused within the last hours is not asked again)."""
     if not trusted:
         raise FeedError("this build trusts no update key (update_keys.json is empty and STRATA_UPDATE_TRUSTED_KEYS is not set), "
                         "so no update can be verified; nothing was downloaded")
@@ -716,8 +717,8 @@ def fetch(source: str, trusted: dict[str, bytes], *, timeout: float = 30, say=No
     elif transfer.kind_of(source) in ("http", "https") and not source.rsplit("/", 1)[-1].endswith(".json"):
         location = source.rstrip("/") + "/" + feed_name()
     try:
-        payload = transfer.read_small(location, timeout=timeout, say=say)
-        signature = transfer.read_small(location + SIGNATURE_SUFFIX, timeout=timeout, say=say)
+        payload = transfer.read_small(location, timeout=timeout, say=say, automatic=automatic)
+        signature = transfer.read_small(location + SIGNATURE_SUFFIX, timeout=timeout, say=say, automatic=automatic)
     except transfer.Unreachable as exc:
         f = exc.failure                                  # the network rule (W7 and its two companions): the host, and that nothing installed is lost
         key = {"offline": "update_offline", "again": "update_again"}.get(f.kind, "update_no_answer")

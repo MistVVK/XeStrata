@@ -355,6 +355,7 @@ class Context:
     allow_no_model_smoke: bool = True
     state_base: Path | None = None                # where tuning/recheck.json goes (default: the per-user state folder)
     feed_timeout: float = 30.0                    # seconds a read of the feed may wait (the quiet daily check uses 5)
+    automatic: bool = False                       # a read of the feed nobody asked for by name (netpolicy rule 4b: the refusal note)
     gate: object | None = None                    # strata_control.engine_update.ModelGate: what to do when a model is loaded (None: refuse before anything is downloaded)
 
     def say(self, phase: str, message: str, **extra) -> None:
@@ -379,7 +380,8 @@ def open_feed(ctx: Context, state: State) -> feedmod.Feed:
     last = (state.data.get("feed") or {}).get("sequence")
     ctx.say("feed", "Reading the signed update feed")
     try:
-        loaded = feedmod.fetch(ctx.source, ctx.trusted, timeout=ctx.feed_timeout, last_sequence=last, channel=ctx.channel, now=ctx.now)
+        loaded = feedmod.fetch(ctx.source, ctx.trusted, timeout=ctx.feed_timeout, last_sequence=last, channel=ctx.channel, now=ctx.now,
+                               automatic=ctx.automatic)
     except feedmod.FeedDowngrade as exc:
         raise feedmod.FeedDowngrade(downgrade_words(exc.sequence, exc.accepted, state.path)) from None
     for line in loaded.skipped:                       # an entry from a newer release that this Control cannot use: said once, never an error

@@ -886,7 +886,8 @@ class Runner:
         self.emit("engine", shape_engine.WORDS["checking"].format(model=name))
         source = update_cmd._feed_source(argparse.Namespace(feed=self.feed or os.environ.get("STRATA_UPDATE_FEED")), root or ec.components_dir())
         said: list[str] = []
-        exe = shape_engine.ensure(shape, source, components=root, emit=lambda m: (said.append(m), self.emit("engine", m, 0)), title=title)
+        exe = shape_engine.ensure(shape, source, components=root, emit=lambda m: (said.append(m), self.emit("engine", m, 0)), title=title,
+                                  automatic=True)     # with an engine installed, a check nobody asked for (netpolicy rule 4b)
         if exe is None:
             self.no_engine(said[-1] if said else shape_engine.WORDS["fetch_failed"].format(model=name, why="nothing was fetched"))
             return

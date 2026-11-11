@@ -254,7 +254,7 @@ def _open_small(request, timeout: float, limit: int) -> bytes:
         return response.read(limit + 1)
 
 
-def read_small(location: str, *, limit: int = SMALL_LIMIT, timeout: float = 30, say=None) -> bytes:
+def read_small(location: str, *, limit: int = SMALL_LIMIT, timeout: float = 30, say=None, automatic: bool = False) -> bytes:
     """A small document (the feed, its signature). Larger than `limit` is refused, not truncated.
     A web address gets one more try when the first one times out or the connection fails: about one request in 25 to github.com hung for the whole
     timeout on a PC whose next 24 answered in half a second (measured on a 3060 PC: the first-run card said "offline" a moment before the install's
@@ -269,7 +269,8 @@ def read_small(location: str, *, limit: int = SMALL_LIMIT, timeout: float = 30, 
                 def attempt(req, timeout):
                     _SERVER_DATE.clear()                 # only the answer of the try that worked counts
                     return _open_small(req, timeout, limit)
-                data = netpolicy.open_url(attempt, request, limits=(min(timeout, FIRST_TRY_SECONDS), timeout), say=say)   # say: the waiting line (W1)
+                data = netpolicy.open_url(attempt, request, limits=(min(timeout, FIRST_TRY_SECONDS), timeout), say=say,
+                                        automatic=automatic)   # automatic: a read nobody asked for (netpolicy rule 4b)   # say: the waiting line (W1)
             except netpolicy.NetFailure as failure:
                 raise Unreachable(failure, "the update feed") from None
         else:

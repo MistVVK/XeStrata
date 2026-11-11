@@ -12,8 +12,15 @@ the screen. The rule here:
 3. One retry, ``RETRY_GAP_S`` later, for a timeout, a reset before the first byte, or HTTP 408/429/5xx. A host that never answers is
    given up after about 12 + 2 + 30 = 44 s.
 4. A host given up under rule 3 after the whole window (12 s, then 30 s) is not tried again for ``HOST_MEMORY_S`` *in the same process*
-   (``HOSTS``, memory only, never on disk; a call with shorter limits reads it but never writes it;
+   (``HOSTS``, memory only, never on disk (a refusal: rule 4b); a call with shorter limits reads it but never writes it;
    a new run always tries afresh). The next file from it fails at once with the same message.
+4b. A host that REFUSED the connection (connection refused: a proxy that is set but not running, a firewall that resets) is the one
+   exception kept across runs: Windows needs about 2 s to report a refusal, and a launch reads the feed on every start. Its host:port
+   and the time are written to a small note in Strata's own state folder (RefusalNote, REFUSED_NOTE_S = 6 hours; nothing
+   else is written). Only automatic reads (open_url(..., automatic=True): the launch's check for a newer engine of a model's own
+   shape while one is installed) read it and fail at once with the "offline" words. Every read the person asked for by name
+   (strata update, setup, a download) ignores it and tries. The first success from that host removes it. A damaged or unreadable
+   note counts as no note, without a message.
 5. Once the answer has come, a read that gets no byte for ``STALL_S`` ends that connection (the caller resumes from the byte it
    reached). A download stops only after ``GIVE_UP_S`` in a row without a new byte (``StallClock``); there is no total time cap, so a
    slow link that works keeps working.
@@ -28,6 +35,7 @@ from __future__ import annotations
 
 import errno
 import http.client
+import json
 import re
 import socket
 import ssl
@@ -37,6 +45,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Callable, Iterable
 
 FIRST_CONNECT_S = 12.0      # first try: measured, one github.com request in 25 hung while the next answered in 0.5 s
@@ -48,6 +57,8 @@ GIVE_UP_S = 300.0           # no new byte for this long, across every try, ends 
 WAIT_LINE_AFTER_S = 5.0
 WAIT_LINE_EVERY_S = 10.0
 HOST_MEMORY_S = 600.0
+REFUSED_NOTE_S = 6 * 3600.0     # rule 4b: a refused host is not asked again by an automatic read for this long
+REFUSED_NOTE_NAME = "refused-hosts.json"
 RETRY_HTTP = (408, 429, 500, 502, 503, 504)
 
 # The words. {host} is a host name, {seconds} a whole number, {what} what was being fetched ("the picture reader").
@@ -180,6 +191,81 @@ class HostMemory:
 
 
 HOSTS = HostMemory()
+
+
+def refused(exc: BaseException | None) -> bool:
+    """True when the connection was refused (ConnectionRefusedError, also inside a URLError)."""
+    seen = 0
+    while isinstance(exc, urllib.error.URLError) and isinstance(getattr(exc, "reason", None), BaseException) and seen < 4:
+        exc = exc.reason
+        seen += 1
+    return isinstance(exc, ConnectionRefusedError)
+
+
+class RefusalNote:
+    """Rule 4b: the hosts that refused a connection, on disk (host:port -> the time, seconds since the epoch), kept for REFUSED_NOTE_S.
+    The note lives in Strata's own state folder (strata_control/paths.state_base, read when it is used, so a test HOME redirects it).
+    Every failure to read or write it is silent: a damaged note is no note, an unwritable one is simply not kept."""
+
+    def __init__(self, path: Path | None = None, clock: Callable[[], float] = time.time, keep: float | None = None):
+        self._path, self._clock, self._keep = path, clock, keep
+        self._lock = threading.Lock()
+
+    def path(self) -> Path:
+        if self._path is not None:
+            return Path(self._path)
+        from strata_control import paths
+        return paths.state_base() / "net" / REFUSED_NOTE_NAME
+
+    def _load(self) -> dict[str, float]:
+        try:
+            data = json.loads(self.path().read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeDecodeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(k): float(v) for k, v in data.items() if isinstance(k, str) and isinstance(v, (int, float)) and not isinstance(v, bool)}
+
+    def _save(self, data: dict[str, float]) -> None:
+        try:
+            p = self.path()
+            if not data:
+                p.unlink(missing_ok=True)
+                return
+            p.parent.mkdir(parents=True, exist_ok=True)
+            from strata_control import atomic
+            atomic.write_text(p, json.dumps(data, sort_keys=True))
+        except OSError:
+            pass
+
+    def refused_recently(self, key: str) -> bool:
+        keep = REFUSED_NOTE_S if self._keep is None else self._keep
+        with self._lock:
+            at = self._load().get(key)
+            return at is not None and 0 <= self._clock() - at < keep
+
+    def remember(self, key: str) -> None:
+        keep = REFUSED_NOTE_S if self._keep is None else self._keep
+        with self._lock:
+            now = self._clock()
+            data = {k: v for k, v in self._load().items() if 0 <= now - v < keep}     # expired entries go when the note is written
+            data[key] = now
+            self._save(data)
+
+    def forget(self, key: str) -> None:
+        with self._lock:
+            try:
+                if not self.path().is_file():
+                    return                               # the usual case: no note at all, nothing is written
+            except OSError:
+                return
+            data = self._load()
+            if key in data:
+                data.pop(key)
+                self._save(data)
+
+
+REFUSALS = RefusalNote()
 
 
 # ------------------------------------------------------------------------------------------------ the waiting line (rule 6)
@@ -357,10 +443,12 @@ def urlopen(request, timeout=None):
 def open_url(open_fn: Callable, request, *, host: str | None = None, say: Callable[[str], None] | None = None,
              memory: HostMemory | None = None, limits: Iterable[float] | None = None, gap: float | None = None,
              sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.monotonic, check_memory: bool = True,
-             wait_after: float | None = None, wait_every: float | None = None):
-    """open_fn(request, timeout=limit) under rules 1-4 and 6. Returns the answer. Raises NetFailure when the host did not answer or
+             wait_after: float | None = None, wait_every: float | None = None, automatic: bool = False,
+             refusals: RefusalNote | None = None):
+    """open_fn(request, timeout=limit) under rules 1-4b and 6. Returns the answer. Raises NetFailure when the host did not answer or
     cannot be reached, HTTPError for an HTTP answer (after the one retry of 408/429/5xx), and anything else (a certificate problem, a
-    refusal of the acquisition rule) unchanged."""
+    refusal of the acquisition rule) unchanged.  `automatic`: a read nobody asked for by name; only such a read consults the refusal note
+    (rule 4b, `refusals`, default REFUSALS); every read writes a refusal into it and removes its host after an answer."""
     url = getattr(request, "full_url", request)
     host = host or host_of(str(url))
     try:                                                         # remembered per host and port (a test server on 127.0.0.1 is not github.com)
@@ -370,6 +458,9 @@ def open_url(open_fn: Callable, request, *, host: str | None = None, say: Callab
     memory = HOSTS if memory is None else memory
     if check_memory and memory.failed_recently(key):
         raise NetFailure(host, "again")
+    refusals = REFUSALS if refusals is None else refusals
+    if automatic and refusals.refused_recently(key):
+        raise NetFailure(host, "offline")                     # rule 4b: refused within REFUSED_NOTE_S, not asked again by an automatic read
     limits = tuple(CONNECT_LIMITS if limits is None else limits)
     # Only a failure that had the whole window of the rule (12 s, then 30 s) is remembered: a call with shorter limits (an optional read
     # of 5 s) may READ the memory and skip a host that already failed, but never WRITES it, so a slow but working link that a short read
@@ -381,7 +472,7 @@ def open_url(open_fn: Callable, request, *, host: str | None = None, say: Callab
         for i, limit in enumerate(limits):
             last = i + 1 >= len(limits)
             try:
-                return open_fn(request, timeout=limit)
+                answer = open_fn(request, timeout=limit)
             except urllib.error.HTTPError as exc:
                 if exc.code in RETRY_HTTP and not last:
                     try:
@@ -390,6 +481,7 @@ def open_url(open_fn: Callable, request, *, host: str | None = None, say: Callab
                         pass
                     sleep(gap)
                     continue
+                refusals.forget(key)                             # an HTTP answer: the host is there (rule 4b)
                 raise
             except (OSError, http.client.HTTPException) as exc:
                 k = kind(exc)
@@ -401,8 +493,12 @@ def open_url(open_fn: Callable, request, *, host: str | None = None, say: Callab
                         memory.remember(key)
                     raise NetFailure(host, "no_answer", exc, clock() - start) from None
                 if k == "offline":
+                    if refused(exc):
+                        refusals.remember(key)
                     raise NetFailure(host, "offline", exc, clock() - start) from None
                 raise
+            refusals.forget(key)                                 # rule 4b: the first success removes the host from the note
+            return answer
     raise NetFailure(host, "no_answer", None, clock() - start)          # (no limits given)
 
 

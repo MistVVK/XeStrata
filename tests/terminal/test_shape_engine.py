@@ -548,6 +548,44 @@ class Update(Base):
             self.assertIsNone(shape_engine.ensure("q4_mid", dead, components=self.comp, hardware=self.hw, emit=lines.append))
             self.assertTrue(any("could not be downloaded" in line for line in lines), lines)
 
+    def test_a_refused_feed_is_asked_once_by_the_launch_check_then_not_for_six_hours(self):
+        """netpolicy rule 4b: `strata launch` (automatic=True) with an engine installed reads the refusal note; setup (no flag) and a shape
+        with no engine yet always read the feed."""
+        from strata_control import netpolicy, transfer
+        from tests.terminal.test_netpolicy import refused_port
+        self.installed("0.1.59")
+        # the product's own windows (5 s with an engine installed), not net_dead's scaled 0.3 s: Windows reports a refusal only after about 2 s,
+        # so a scaled window would see a timeout there, not a refusal
+        dead = f"http://127.0.0.1:{refused_port()}/strata-feed.json"
+        note = netpolicy.RefusalNote(path=self.root / "state" / "net" / netpolicy.REFUSED_NOTE_NAME)
+        calls = []
+        real = transfer._open_small
+
+        def counting(request, timeout, limit):
+            calls.append(request.full_url)
+            return real(request, timeout, limit)
+        with mock.patch.object(netpolicy, "REFUSALS", note), mock.patch.object(transfer, "_open_small", counting):
+            lines = []
+            self.assertTrue(shape_engine.ensure(SHAPE, dead, components=self.comp, hardware=self.hw, emit=lines.append, automatic=True).is_file())
+            self.assertEqual(lines, [])
+            self.assertEqual(len(calls), 1, "one try: a refusal is clear at once")
+            port = dead.split("/")[2]
+            self.assertEqual(list(json.loads(note.path().read_text(encoding="utf-8"))), [port], "host:port only")
+            self.assertTrue(shape_engine.ensure(SHAPE, dead, components=self.comp, hardware=self.hw, emit=lines.append, automatic=True).is_file())
+            self.assertEqual((len(calls), lines), (1, []), "the next launch check does not connect and says nothing")
+            self.assertTrue(shape_engine.ensure(SHAPE, dead, components=self.comp, hardware=self.hw, emit=lines.append).is_file())
+            self.assertEqual(len(calls), 2, "setup's call (no flag) reads the feed")
+            self.assertIsNone(shape_engine.ensure("q4_mid", dead, components=self.comp, hardware=self.hw, emit=lines.append, automatic=True))
+            self.assertEqual(len(calls), 3, "no engine installed: the feed is always read")
+
+    def test_the_launch_asks_as_an_automatic_check_and_setup_does_not(self):
+        runner_src = (ROOT / "strata_cli" / "launch" / "runner.py").read_text(encoding="utf-8")
+        call = runner_src[runner_src.index("exe = shape_engine.ensure("):]
+        self.assertIn("automatic=True", call[:call.index("\n\n")])
+        setup_src = (ROOT / "setup.py").read_text(encoding="utf-8")
+        call = setup_src[setup_src.index("exe = shape_engine.ensure("):]
+        self.assertNotIn("automatic", call[:call.index("\n")])
+
     def test_the_explicit_update_has_a_step_only_for_an_installed_shape(self):
         self.publish("0.1.59")
         ctx = updater.Context(components=self.comp, source=self.url, trusted=signing.load_trusted_keys(), hardware=self.hw)

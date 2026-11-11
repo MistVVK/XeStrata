@@ -314,10 +314,12 @@ def update_one(ctx, feed, shape: str, *, install_missing: bool = True, title: st
 
 
 def ensure(shape: str, source: str, *, components: Path | None = None, hardware: dict | None = None, emit: Callable[[str], None] = print, cancel=None,
-           quiet_when_current: bool = True, title: str | None = None) -> Path | None:
+           quiet_when_current: bool = True, title: str | None = None, automatic: bool = False) -> Path | None:
     """The engine of `shape` is installed and up to date, from the signed feed at `source` (a URL or a folder). Returns its program, or None with one plain line through `emit` when
     there is none (not in the feed, nothing for this PC, the feed cannot be read). A newer package is fetched only when the feed can be read; an installed one keeps running when it
-    cannot. This is what setup and `strata launch` call when a model of that shape is chosen."""
+    cannot. This is what setup and `strata launch` call when a model of that shape is chosen.  `automatic` (`strata launch`): with an engine installed,
+    the check for a newer one is a read nobody asked for, so a feed host that refused within the last hours is not asked again (netpolicy rule 4b);
+    without one the feed is always read."""
     from strata_control import acquisition, feed as feedmod, signing, updater
     components = Path(components) if components else ec.components_dir()
     hw = hardware or updater.detect_hardware()
@@ -327,6 +329,7 @@ def ensure(shape: str, source: str, *, components: Path | None = None, hardware:
         emit(WORDS["fetching"].format(model=name))
     ctx = updater.Context(components=components, source=source, trusted=signing.load_trusted_keys(), hardware=hw, cancel=cancel,
                           feed_timeout=5.0 if have else 30.0,           # an installed engine: a launch must not wait long for a feed that is not there
+                          automatic=bool(automatic and have),
                           emit=lambda event: emit(event["message"]) if event.get("event") == "phase" and event.get("message") and event.get("phase") != "feed" else None)
     try:
         with updater.update_lock(components):
