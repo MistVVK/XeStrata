@@ -25526,6 +25526,38 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PF_FUSED_IQ2X",
+   "backends": [
+    "hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 2059,
+     "backend": "hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "string",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "status": "rollback",
+   "owner": "prefill",
+   "note": "[OWN-4A 11-10] IQ2_XXS / IQ2_XS gate/up (the IQ3_XXS pack, the IQ2_XS sets) on the fused prompt kernels: default ON on gfx12 under Linux (0.2.15, owner 11-10); =0 keeps those layers on MMQ (two releases); Windows gfx12: opt-in via STRATA_PF_FUSED=1",
+   "retire_after": "",
+   "retired_in": "",
+   "first_commit": "",
+   "first_date": "",
+   "last_commit": "",
+   "last_date": ""
+  },
+  {
    "name": "STRATA_PF_FUSED_KQ",
    "backends": [
     "cuda-hip",
@@ -25712,9 +25744,9 @@
    "since": "v0.2.12",
    "last_commit": "e77bd43bc9",
    "last_date": "2026-11-06",
-   "status": "research",
+   "status": "rollback",
    "owner": "prefill",
-   "note": "[auto] off unless set, not documented for users",
+   "note": "[OWN-4A 11-10] Q5_0 down layers (UD-IQ4_XS-v31) on the fused prompt kernels: default ON on gfx12 under Linux (0.2.15, owner 11-10) and on gfx1151 under Windows (round 0217); =0 keeps the dequantize + FP16 GEMM route (two releases), =1 turns it on elsewhere (gfx12 Windows, Linux gfx1151)",
    "retire_after": "",
    "retired_in": ""
   },
@@ -26266,6 +26298,39 @@
    "status": "opt-in",
    "owner": "sycl/prefill",
    "note": "[reviewed] Int8 prompt path on B70, +20% at 1K prompt, identical output. [phaseA-tests/notes-151-b70.md:15]",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_PF_KQ_OCC",
+   "backends": [
+    "hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 2133,
+     "backend": "hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "off",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "e99f832715",
+   "first_date": "2026-11-10",
+   "since": null,
+   "last_commit": "e99f832715",
+   "last_date": "2026-11-10",
+   "status": "research",
+   "owner": "prefill",
+   "note": "trial switch (OWN-4A, 11-10): the K-quant fused prompt kernels on the occupancy launch, 3 blocks per WGP; HIP only, off by default",
    "retire_after": "",
    "retired_in": ""
   },

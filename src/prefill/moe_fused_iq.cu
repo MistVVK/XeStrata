@@ -2120,6 +2120,10 @@ static int occ_blocks(bool w12, int type, bool gu) {
     if (env > 0) return env;
     // gfx11 too (gfx1151, IQ2_S gate/up: 235 VGPRs and 37,120 B of LDS leave room for 3 blocks of 8 waves per WGP; a grid of 4 per WGP
     // ran a second, lopsided wave: 16K tokens, one layer, IQ2_S / IQ4_NL 81.7 -> 76.5 ms)
+    // The K-quant kernels (Q4_K / Q5_K gate/up, Q5_1 down) reach this launch only with the trial switch STRATA_PF_KQ_OCC=1 (experts_native):
+    // 3 blocks per WGP, measured on gfx1201 (R9700, hip_prefill_fused_iq, one layer, 8,192 tokens x top 10 over 512 experts): Q4_K / Q5_1 16.57 ms
+    // on the default launch, 15.96 at 4 blocks, 15.54 at 3, 16.52 at 2; Q5_K / Q5_1 17.25 / 16.69 / 16.20 / 17.18; parity and outputs unchanged.
+    if (type == T_Q4_K || type == T_Q5_K || type == T_Q5_1) return 3;
     return gu && (type == T_IQ2_S || type == T_IQ2_XS) ? 3 : 4;
 }
 #endif
@@ -2326,14 +2330,16 @@ bool q8d_f16_default(const DevInfo& d) {
 // of leaving the fused path for gather + FP16 dequantize + hipBLASLt (RESULTS-STRIX2.md: 24-29% of the prompt).  It needs the F16 prompt set (STRATA_PF_F16, on by
 // default there), so with STRATA_PF_F16=0 the layers keep the earlier route.  STRATA_PF_FUSED_Q50=0 (or STRATA_GFX1151_DEFAULTS=0) turns it off; =1 turns it on
 // for any gfx1151 build (Linux: opt-in).  gfx12 (RDNA4) keeps its int8 kernel (native_w11_kernel, int8 codes q - 16: its WMMA layout), reached through the same
-// switch: STRATA_PF_FUSED_Q50=1 turns it on there (opt-in; it changes the arithmetic of those layers), =0 / unset leaves the layers on gather + FP16 dequantize + hipBLASLt
-// (phaseA-tests/round0216/rdna4/q50-fused.patch).  The switch means the same on both: 1 on, 0 off, unset = the platform's default.
+// switch.  gfx12 under Linux: ON by default since 0.2.15 (owner 11-10; R9700, UD-IQ4_XS-v31: prompt x1.31 / x1.47 / x1.16 at 4K / 8K / 20K, first-token KL
+// against the FP16 path level with the default's, the neutral-writer forced-token gate PASS, first-8K reads PASS in 64 starts); gfx12 under Windows: opt-in
+// (not measured there).  STRATA_PF_FUSED_Q50=0 keeps the layers on gather + FP16 dequantize + hipBLASLt (the earlier route, kept two releases).
+// The switch means the same everywhere: 1 on, 0 off, unset = the platform's default.
 bool q50_on(const DevInfo& d) {
 #if defined(__HIPCC__)
     if (!d.w12 && !d.g1151) return false;
     static const int env = [] { const char* v = std::getenv("STRATA_PF_FUSED_Q50"); return v == nullptr || v[0] == '\0' ? -1 : (v[0] == '1' ? 1 : 0); }();
     if (env >= 0) return env == 1;
-    if (d.w12) return false;   // gfx12: opt-in (default off)
+    if (d.w12) return strata::core::kGfx12PromptDefaultsOn;   // gfx12: on by default under Linux, opt-in under Windows
 #if defined(_WIN32)
     const char* off = std::getenv("STRATA_GFX1151_DEFAULTS");
     return !(off != nullptr && off[0] == '0');
@@ -2430,6 +2436,21 @@ bool gfx12_iq2s_default() {
     return on;
 }
 
+#if defined(__HIPCC__)
+// IQ2_XXS / IQ2_XS gate/up on gfx12 (the IQ3_XXS pack's 19 layers that kept MMQ, and the IQ2_XS sets): ON by default under Linux since 0.2.15 (owner 11-10;
+// R9700, IQ3_XXS: prompt x1.17 / x1.14 / x1.13 at 4K / 8K / 20K, first-token KL against the FP16 path level with the default's, the neutral-writer forced-token
+// gate PASS, first-8K reads PASS).  STRATA_PF_FUSED_IQ2X=0 keeps these layers on MMQ (the earlier route, kept two releases), as does STRATA_PF_FUSED=0.
+// Windows gfx12: opt-in (STRATA_PF_FUSED=1), as before.  Like gfx12_iq2s_default, native_supported applies it to gfx12 cards only (d.w12).
+static bool gfx12_iq2x_default() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PF_FUSED_IQ2X");
+        const char* all = std::getenv("STRATA_PF_FUSED");
+        return strata::core::kGfx12PromptDefaultsOn && !(v != nullptr && v[0] == '0') && !(all != nullptr && all[0] == '0');
+    }();
+    return on;
+}
+#endif
+
 bool native_supported(int gu_type, int d_type) {
     static const bool off = [] {   // STRATA_PF_FUSED_NATIVE=0: the native packs keep MMQ under STRATA_PF_FUSED=1 (A/B)
         const char* v = std::getenv("STRATA_PF_FUSED_NATIVE");
@@ -2514,7 +2535,11 @@ bool native_supported(int gu_type, int d_type) {
     // R9700 (p620, IQ3_S, serve, 3 interleaved pairs): prompt 2K +9.7%, 8K +12.2%, 32K +8.8%; first-token KL against the MMQ default 0.017 (29 prompts of
     // 1,025 tokens, top-1 28 of 29), the answers are not the MMQ bytes.  STRATA_PF_FUSED_IQ2S=0 turns it off; STRATA_PF_FUSED=0 turns all fused kernels off.
     if (env < 0 && gu_type != T_IQ3_S && gu_type != T_IQ3_XXS && !(gu_type == T_Q2_0 && strata::core::kGfx12PromptDefaultsOn) &&
-        !(gfx12_iq2s_default() && (gu_type == T_IQ2_S || gu_type == T_IQ4_XS))) return false;
+        !(gfx12_iq2s_default() && (gu_type == T_IQ2_S || gu_type == T_IQ4_XS))
+#if defined(__HIPCC__)
+        && !(gfx12_iq2x_default() && (gu_type == T_IQ2_XXS || gu_type == T_IQ2_XS))   // (0.2.15, Linux gfx12: above)
+#endif
+        ) return false;
     const DevInfo& d = dev_info();
     if (!d.ok || !d_covered_on(d_type, d)) return false;
     if (d.t75 && (gu_type != T_Q2_0 || d_type != T_Q2_0)) return false;
@@ -2574,9 +2599,13 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
 #ifdef STRATA_W_NO_OCC
         const bool occ_gu = false, occ_d = false;
 #else
+        // STRATA_PF_KQ_OCC=1 (a trial switch, off by default, HIP only): the K-quant kernels too (Q4_K / Q5_K gate/up, Q5_1 down) take the
+        // occupancy launch above (the H tile on the weight buffers, occ_blocks per WGP; the VGPR cap only where nw_capped says so).
+        static const bool kq_occ = [] { const char* v = std::getenv("STRATA_PF_KQ_OCC"); return v != nullptr && v[0] == '1'; }();
         const bool occ_gu = g.gu_type == T_IQ2_XXS || g.gu_type == T_IQ2_XS || g.gu_type == T_IQ2_S ||
-                            g.gu_type == T_IQ3_XXS || g.gu_type == T_IQ3_S || g.gu_type == T_IQ4_XS || g.gu_type == T_Q2_0;
-        const bool occ_d = g.d_type == T_Q2_0 || g.d_type == T_Q8_0 || g.d_type == T_IQ4_NL;
+                            g.gu_type == T_IQ3_XXS || g.gu_type == T_IQ3_S || g.gu_type == T_IQ4_XS || g.gu_type == T_Q2_0 ||
+                            (kq_occ && (g.gu_type == T_Q4_K || g.gu_type == T_Q5_K));
+        const bool occ_d = g.d_type == T_Q2_0 || g.d_type == T_Q8_0 || g.d_type == T_IQ4_NL || (kq_occ && g.d_type == T_Q5_1);
 #endif
         if (d.w12 && (reinterpret_cast<uintptr_t>(dm) & 15) != 0) {   // gfx12's down store: two float4 per lane
             std::fprintf(stderr, "prefill fused experts (native): the down rows (%p) must be 16-byte aligned\n", (void*) dm);
