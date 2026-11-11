@@ -811,12 +811,16 @@ void QiDit::forward_pair(const float* x, float t, int64_t H, int64_t W, float* o
         product(h16_, wv, v_, R, 0, 0, -1, wk.w8, i8);
         qkv[2] = i8_;
         for (int j = 0; j < 3; ++j) {
-            qkv2[j].sx = qkv[j].sx + HW;
-            qkv2[j].sw = qkv[j].sw;
+            qkv2[j] = qkv[j];
+            if (qkv2[j].sx != nullptr) qkv2[j].sx += HW;
+            if (qkv2[j].bf != nullptr) qkv2[j].bf += HW * C;
         }
         qi_qk_norm_rope16(q_, k_, v_, nq, nk, cos_ + na * kHead / 2, sin_ + na * kHead / 2, HW, heads_, kHead,
                           q16_ + na * C, k16_ + na * C, v16_ + na * C, s_, i8 ? qkv : nullptr);
-        qi_qk_norm_rope16(q_ + HW * C, k_ + HW * C, v_ + HW * C, nq, nk, o.cos + nb * kHead / 2,
+        auto second = [&](float* p, int j) -> const float* {
+            return i8 && qkv2[j].bf != nullptr ? reinterpret_cast<const float*>(qkv2[j].bf) : p + HW * C;
+        };
+        qi_qk_norm_rope16(second(q_, 0), second(k_, 1), second(v_, 2), nq, nk, o.cos + nb * kHead / 2,
                           o.sin + nb * kHead / 2, HW, heads_, kHead, q16b + nb * C, k16b + nb * C, v16b + nb * C, s_,
                           i8 ? qkv2 : nullptr);
         if (na > 0) {   // the prefixes' K and V from their caches
