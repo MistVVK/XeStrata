@@ -828,8 +828,11 @@ int main(int argc, char** argv) {
         }
         // --no-kq (the STRATA_PF_FUSED_Q8D entry): a device or build where the i-quant / Q8_0 pairs are not covered without the K-quant switch
         // (gfx11, or the switch unset) skips instead of failing
-        if (no_kq && !fused::native_supported(GGML_TYPE_IQ3_S, GGML_TYPE_Q8_0)) {
-            std::printf("--no-kq: the i-quant / Q8_0 pairs are not covered here without STRATA_PF_FUSED_KQ (skipped)\n");
+        // (with STRATA_PF_FUSED_Q8GU=1 the probe is the Q8_0 / Q8_0 pair: the Q8GU entry asks the same of its own switch)
+        const char* q8gu_env = std::getenv("STRATA_PF_FUSED_Q8GU");
+        const bool probe_q8gu = q8gu_env != nullptr && q8gu_env[0] == '1';
+        if (no_kq && !fused::native_supported(probe_q8gu ? GGML_TYPE_Q8_0 : GGML_TYPE_IQ3_S, GGML_TYPE_Q8_0)) {
+            std::printf("--no-kq: the %s pairs are not covered here without STRATA_PF_FUSED_KQ (skipped)\n", probe_q8gu ? "Q8_0 / Q8_0" : "i-quant / Q8_0");
             return 77;
         }
 #if defined(__HIPCC__)
@@ -838,10 +841,10 @@ int main(int argc, char** argv) {
         const char* only_tq = nullptr;
         for (int i = 1; i < argc; ++i)
             if (std::strncmp(argv[i], "--only=", 7) == 0) only_tq = argv[i] + 7;
-        if (only_tq != nullptr && std::strstr("TQK6 + TQK7 TQ2_T + TQ2_T", only_tq) != nullptr) {
+        if (only_tq != nullptr && std::strstr("TQK6 + TQK7 TQ2_T + TQ2_T Q6_K + Q8_0", only_tq) != nullptr) {   // (and the Q6_K pair: STRATA_PF_FUSED_Q6K=1 is gfx12's too)
             cudaDeviceProp prop{};
             if (cudaGetDeviceProperties(&prop, 0) == cudaSuccess && std::strncmp(prop.gcnArchName, "gfx12", 5) != 0) {
-                std::printf("the trellis pairs: gfx12 only on HIP (%s: skipped)\n", prop.gcnArchName);
+                std::printf("the trellis / Q6_K pairs: gfx12 only on HIP (%s: skipped)\n", prop.gcnArchName);
                 return 77;
             }
         }
