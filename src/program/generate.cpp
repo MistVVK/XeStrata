@@ -33,9 +33,7 @@
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/lookup_default.hpp"
-#if defined(STRATA_USE_HIP)
 #include "strata/core/serve_stop_bound.hpp"
-#endif
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -112,6 +110,7 @@
 #include "strata/program/prefill_plan.hpp"
 #include "strata/program/draft_kv_plan.hpp"
 #include "strata/program/message_boundary.hpp"
+#include "strata/program/reply_branch.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_vocab.hpp"
 #include "strata/spec/window_rule.hpp"
@@ -14185,7 +14184,7 @@ int main(int argc, char** argv) {
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
         strata::core::manifest::instance().write("ready");   // STRATA_MANIFEST (a no-op unless it is set)
-        std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
+        std::printf("READY %lld stop hold\n", (long long) o.max_context);   // "stop": this engine honours STOP; "hold": GEN hold=N:ID
         std::fflush(stdout);
         std::string line;
         int64_t rounds = 0;
@@ -15931,6 +15930,10 @@ int main(int argc, char** argv) {
             // a parked conversation holding it stays parked) and a later request that resumes from it does not park the
             // branch it leaves: N queries cost one prefix, not N.  Absent = as before.
             int64_t req_pin = 0;
+            // hold=N:ID (the server's thinking budget, GEN only): end the request after N emitted tokens unless token ID
+            // (</think>) came first, with the session at exactly what was emitted (serve_hold_remaining); DONE says "hold".
+            // Absent = as before.  An older engine skips the key (unknown keys are skipped), and says no "hold" in READY.
+            long long req_hold_n = -1, req_hold_id = -1;
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
@@ -15961,6 +15964,15 @@ int main(int argc, char** argv) {
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "prefill") req_prefill_only = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
+                    else if (key == "hold") {
+                        char* he = nullptr;
+                        const long long hn = std::strtoll(tok.c_str() + eq + 1, &he, 10);
+                        if (he != nullptr && *he == ':' && hn > 0) {
+                            char* ie = nullptr;
+                            const long long hid = std::strtoll(he + 1, &ie, 10);
+                            if (ie != he + 1 && *ie == '\0' && hid >= 0) { req_hold_n = hn; req_hold_id = hid; }
+                        }
+                    }
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
                     else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
@@ -16489,6 +16501,28 @@ int main(int argc, char** argv) {
                 resume == req_pin && live_ok)
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
+            // The live branch past this request's resume point is only the reply this prompt replaces: the request resumes from
+            // the live branch's own turn checkpoint and opens the same assistant turn there again (an OpenAI-style client's
+            // next turn sends the reply back without its reasoning; an edited reply; a regenerate).  That branch is not parked:
+            // no request of the client sends the reply back as it was, and its park is a copy of the whole conversation on
+            // this request's path that the next park drops as superseded (reply_branch.hpp).  A real switch (another
+            // conversation, a parked one coming back, a batch slot, a borrow, another cvec) parks as before.
+            bool reply_replaced = false;
+            if (!from_live && !incoming && !borrow && slot_source < 0 && lent_slot < 0 && live_ok && !pin_sibling &&
+                want_cvec == cvec_cached && resume > 0) {
+                std::vector<int64_t> live_pictures;
+                for (const ImgKey& k : live_imgs) live_pictures.push_back((int64_t) k.start);
+                for (const ConvCheckpoint& c : checks)
+                    if ((int64_t) c.ids.size() == resume && starts_with(c.ids, c.imgs) &&
+                        strata::program::live_tail_is_replaced_reply(live, ids, resume, o.turn_token, live_pictures)) {
+                        reply_replaced = true;
+                        break;
+                    }
+            }
+            if (reply_replaced)
+                std::fprintf(stderr, "[DRAFT] strata serve: conversation cache: the reply this request replaces is not parked (%lld "
+                                     "tokens past the turn checkpoint at %lld)\n", (long long) ((int64_t) live.size() - resume),
+                             (long long) resume);
             // --conversation-cache-park-gain N: a park now would supersede the entry parked_prefix_tokens() reports (the copy
             // this conversation wrote last), so a conversation that advanced fewer than N tokens since then keeps it:
             // it still holds this conversation's prefix, and re-parking writes the whole snapshot only for the next
@@ -16533,7 +16567,7 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                 }
-            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth &&
+            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && !reply_replaced && park_worth &&
                        !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
@@ -18265,14 +18299,10 @@ int main(int argc, char** argv) {
                 if (fol_next < fol_sets.size() && !fol_sets[fol_next].empty()) fol = &fol_sets[fol_next];
                 ++fol_next;
             }
-#if defined(STRATA_USE_HIP)
-            // on by default (HIP, where it was measured: 4 x R9700, Qwen3.8-Flash-Next IQ3_S, 0 of 16 continuations fell back to the older
-            // checkpoint against 4 of 16 without it, #4677); STRATA_SERVE_STOP_BOUND=0 turns it off
-            static const bool stop_bound = [] {
-                const char* v = std::getenv("STRATA_SERVE_STOP_BOUND");
-                return v == nullptr || std::strcmp(v, "0") != 0;
-            }();
-#endif
+            // on by default on every backend (measured on HIP: 4 x R9700, Qwen3.8-Flash-Next IQ3_S, 0 of 16 continuations fell back to
+            // the older checkpoint against 4 of 16 without it, #4677; it changes no emitted token, only which accepted rows the
+            // session keeps); STRATA_SERVE_STOP_BOUND=0 turns it off
+            static const bool stop_bound = strata::core::serve_stop_bound_on(std::getenv("STRATA_SERVE_STOP_BOUND"));
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
@@ -18301,6 +18331,9 @@ int main(int argc, char** argv) {
             size_t pen_gen0 = strata::kernels::penalty_window_from(consumed.size(), pen_prompt);
             if (req_pen_from >= 0 && !pen_prompt) pen_gen0 = std::min<size_t>(pen_gen0, (size_t) req_pen_from);   // a continued request: its reply began earlier
             const char* finish = "length";
+            // GEN hold=N:ID: on until ID is emitted; meanwhile the request's cap is min(max_new, N)
+            bool hold_on = req_hold_n > 0 && req_hold_id >= 0;
+            auto cap_now = [&]() -> int64_t { return hold_on ? std::min<int64_t>(max_new, req_hold_n) : (int64_t) max_new; };
             const Clock::time_point d0 = Clock::now();
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
             static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
@@ -18345,7 +18378,7 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: --pipeline-windows: a request with %s decodes serially\n",
                                  pl_serial);
             }
-            if (pl_want && pl_serial == nullptr && !cancelled && produced_n < max_new) {
+            if (pl_want && pl_serial == nullptr && !cancelled && produced_n < cap_now()) {
                 pl_ran = true;
                 if (!pl_prepare(err)) {
                     std::printf("ERR %s\n", err.c_str());
@@ -18828,12 +18861,12 @@ int main(int argc, char** argv) {
                     chain_kind = 0;
                     int a = 0;
                     while (a < A.T - 1 && A.tok[a + 1] == outp[(size_t) a]) ++a;
-#if defined(STRATA_USE_HIP)
-                    if (stop_bound)
-                        a = strata::core::serve_stop_bound(a + 1, max_new - produced_n, outp.data(), [&](int32_t y) {
+                    if (stop_bound || hold_on)   // (a hold always bounds the commit: the server's next pass continues from it)
+                        a = strata::core::serve_stop_bound(a + 1, strata::core::serve_hold_remaining(a + 1, produced_n, max_new,
+                                                               hold_on ? req_hold_n : -1, req_hold_id, outp.data()),
+                                                           outp.data(), [&](int32_t y) {
                             return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                         }) - 1;
-#endif
                     if (!V1(A).pl_commit_async(a + 1, err)) return die(err);
                     for (int i = 0; i <= a; ++i) consumed.push_back(A.tok[i]);
                     draft_offered += A.T - 1;
@@ -18844,8 +18877,9 @@ int main(int argc, char** argv) {
                     dec_T += A.T;
                     const bool nf = nonfinite_hit(V1(A), "decode");   // #879: none of its tokens goes out
                     bool eos = false;
-                    for (int i = 0; !nf && i <= a && produced_n < max_new && !eos; ++i) {
+                    for (int i = 0; !nf && i <= a && produced_n < cap_now() && !eos; ++i) {
                         std::printf("T %d\n", (int) outp[(size_t) i]);
+                        if (hold_on && (int64_t) outp[(size_t) i] == req_hold_id) hold_on = false;
                         if (req_logprobs >= 0) emit_lp_line(V1(A), i, outp[(size_t) i], req_logprobs, req_allowed);
                         strata::core::progress_beat();
                         ++produced_n;
@@ -18856,7 +18890,7 @@ int main(int argc, char** argv) {
                     if (nf) finish = "nonfinite";
                     else if (eos) finish = "stop";
                     else if (stop_req.load()) finish = "cancel";
-                    const bool last = nf || eos || produced_n >= max_new || stop_req.load();
+                    const bool last = nf || eos || produced_n >= cap_now() || stop_req.load();
                     const bool on = !nf && B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
                     if (B.made) {   // the gate's calibration: would B have been on the path, by its estimate p_on
                         const bool would = a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
@@ -19036,7 +19070,7 @@ int main(int argc, char** argv) {
             auto draft_df2 = [&](int) -> bool { return false; };
 #endif
             if (df2_trace != nullptr) std::fprintf(df2_trace, "# request prompt %lld df2 %d spec %d\n", (long long) n, req_df2 ? 1 : 0, S_mtp);
-            while (!pl_ran && !cancelled && produced_n < max_new) {
+            while (!pl_ran && !cancelled && produced_n < cap_now()) {
                 int T = 1;
                 policy.set_context(p);
                 const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
@@ -19370,14 +19404,14 @@ int main(int argc, char** argv) {
                     if (!ver.window_logprobs(fol_tg.data(), a + 1, p, 248046, fol_lp, fe))
                         std::fprintf(stderr, "strata serve: STRATA_FOLLOW_LOGPOS: %s\n", fe.c_str());
                 }
-#if defined(STRATA_USE_HIP)
                 // A merged window contains prompt rows: every one must still be committed.
                 // Otherwise do not cache accepted rows whose outputs this request cannot emit.
-                if (stop_bound && !merged)
-                    a = strata::core::serve_stop_bound(a + 1, max_new - produced_n, outv.data(), [&](int32_t y) {
+                if ((stop_bound || hold_on) && !merged)
+                    a = strata::core::serve_stop_bound(a + 1, strata::core::serve_hold_remaining(a + 1, produced_n, max_new,
+                                                           hold_on ? req_hold_n : -1, req_hold_id, outv.data()),
+                                                       outv.data(), [&](int32_t y) {
                         return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     }) - 1;
-#endif
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
                 if (!from_sfx && !first_window)
@@ -19438,8 +19472,9 @@ int main(int argc, char** argv) {
                 const bool initial_round = first_window;   // a single-row window: no proposal to learn from
                 first_window = false;
                 bool eos = false;
-                for (int i = merged ? a : 0; i <= a && produced_n < max_new && !eos; ++i) {   // (merged: row T-1 only)
+                for (int i = merged ? a : 0; i <= a && produced_n < cap_now() && !eos; ++i) {   // (merged: row T-1 only)
                     std::printf("T %d\n", (int) outv[(size_t) i]);
+                    if (hold_on && (int64_t) outv[(size_t) i] == req_hold_id) hold_on = false;
                     if (req_logprobs >= 0) emit_lp_line(ver, i, outv[(size_t) i], req_logprobs, req_allowed);
                     strata::core::progress_beat();
                     ++produced_n;
@@ -19453,20 +19488,20 @@ int main(int argc, char** argv) {
                 const Clock::time_point tw2 = Clock::now();
                 // coupled drafts with penalties: the next window's row-0 history (`consumed` holds this window's
                 // commit, outv[a] is its row 0) - the drafts extend it on the device as the verify rows will
-                if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
+                if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < cap_now())
                     mtp.set_draft_history(consumed.data() + pen_gen0, (int64_t) (consumed.size() - pen_gen0), outv[(size_t) a]);
                 generation = {};   // a skipped or failed production must not expose an older q view
 #if defined(STRATA_HAVE_DFLASH2)
                 // The request ends here, so no draft follows and the window's committed rows would never reach the drafter's ring or its log: every turn would
                 // leave a hole of a + 1 positions behind it, which a later turn that resumes after this one finds blank (and cannot rebuild). Update them now.
                 static const bool df2_end_update = std::getenv("STRATA_DF2_END_UPDATE") == nullptr || std::getenv("STRATA_DF2_END_UPDATE")[0] != '0';   // =0: the pre-fix behaviour (diagnostics)
-                if (df2_end_update && use_df2 && req_df2 && !merged && (eos || produced_n >= max_new)) {
+                if (df2_end_update && use_df2 && req_df2 && !merged && (eos || produced_n >= cap_now())) {
                     const float* tp_end = df2_win_taps(a + 1, err);   // (on a layer split: every stage's taps gathered onto the drafter's card)
                     if (tp_end == nullptr || !df2.context(tp_end, a + 1, p, err)) { if (adapt_thr.joinable()) adapt_thr.join(); std::printf("ERR %s\n", err.c_str()); return 1; }
                 }
 #endif
                 const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
-                const bool drafted = !draft_on || eos || produced_n >= max_new ||
+                const bool drafted = !draft_on || eos || produced_n >= cap_now() ||
                                      (req_df2 ? ((!merged && defer_df2(a)) || draft_df2(a)) : mtp.draft_long(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p,
                                                                                nullptr, gated_proposal ? &generation : nullptr));
                 {
@@ -19544,6 +19579,8 @@ int main(int argc, char** argv) {
                 x = outv[(size_t) a];
                 p += a + 1;
             }
+            // GEN hold=N:ID reached (ID not emitted): the server wraps up the thinking or asks for more
+            if (hold_on && std::strcmp(finish, "length") == 0 && produced_n >= req_hold_n && produced_n < max_new) finish = "hold";
             if (!keep_sync()) { std::printf("ERR %s\n", err.c_str()); return 1; }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             if (use_df2 && o.draft_auto && bandit_key != 0 && produced_n >= 48 && decode_ms > 0.0) {

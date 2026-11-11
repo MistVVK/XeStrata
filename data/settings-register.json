@@ -35580,13 +35580,13 @@
   {
    "name": "STRATA_SERVE_STOP_BOUND",
    "backends": [
-    "hip"
+    "cuda-hip"
    ],
    "reads": [
     {
      "file": "src/program/generate.cpp",
-     "line": 18141,
-     "backend": "hip",
+     "line": 18199,
+     "backend": "cuda-hip",
      "fn": "getenv"
     }
    ],

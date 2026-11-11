@@ -230,6 +230,11 @@ ANSWER_RESERVE_MIN = 512     # #984: the tokens kept for the answer when a think
 # and no call, is continued once with the thinking closed (the same way the budget's wrap-up closes it)
 REASONING_CLOSE = "\n</think>\n\n"
 REASONING_WRAP_UP = "\n\nI have thought about this long enough; time to give my answer.\n</think>\n\n"
+# The budget's pass to an engine that says "hold" in READY carries GEN hold=N:ID (N: the reasoning tokens left, ID: the one
+# token of </think>): the engine stops there with its session at exactly the tokens it sent, so the next pass (+ the wrap-up)
+# continues from the live session.  Without it the engine ran a window or two past the cut, and the next pass read the
+# whole reasoning again from the checkpoint before it.  The server's own key in `sampling`, never a client's.
+HOLD_KEY = "_strata_hold"
 # #728: opt-in handling of reasoning that repeats whole passages (which the single-token guard above cannot see).
 # "reasoning_loop_recovery": "stop" ends the reply there; "recover" (or true) goes on from the same output with the
 # low-effort instruction in place of the xhigh one.  Both off by default.
@@ -1160,6 +1165,7 @@ class StrataEngine:
         self.ended, self.unloaded = True, True
         self.max_context = int(args[args.index("--max-context") + 1]) if "--max-context" in args else 4096
         self.can_stop = False            # the engine honours a STOP line mid-request (READY <ctx> stop)
+        self.can_hold = False            # the engine takes GEN hold=N:ID (READY <ctx> ... hold)
         self.last = {}
         self.info = {}                   # INFO key=value facts (engine 0.1.8+): kv, expert slots, ... (Monitor tab)
         self.terminal_stages: list[dict] = []  # final layer ranges from this engine start's bounded stderr log
@@ -1243,6 +1249,7 @@ class StrataEngine:
                 f = line.split()
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
+                self.can_hold = "hold" in f[2:]
                 self.multi = next((int(x[6:]) for x in f[2:] if x.startswith("multi=") and x[6:].isdigit()), 0)
                 break
         loading.set()
@@ -1702,6 +1709,11 @@ class StrataEngine:
             ac = tune.get("aux_cpus")
             if isinstance(ac, bool) or (isinstance(ac, (int, float)) and ac in (0, 1)):
                 keys += f" aux_cpus={int(ac)}"
+        # the thinking budget's hold (HOLD_KEY): set by the server for an engine that says "hold", never by a client
+        hold = sampling.get(HOLD_KEY)
+        if (isinstance(hold, tuple) and len(hold) == 2 and all(isinstance(x, int) and not isinstance(x, bool) for x in hold)
+                and hold[0] > 0 and hold[1] >= 0):
+            keys += f" hold={hold[0]}:{hold[1]}"
         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
@@ -6495,13 +6507,24 @@ class Service:
                     before = getattr(self.engine, "last", None)
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
+                    # the engine stops at the budget itself (HOLD_KEY), when it can and </think> is one token: one engine
+                    # at a time (a --batch engine's slots and a multi engine take no hold)
+                    hold_end = None
+                    if (budget and getattr(self.engine, "can_hold", False) is True and not getattr(self.engine, "batch", 0)
+                            and not getattr(self.engine, "multi", 0)):
+                        te = self.tok.encode(THINK_END, parse_special=True)
+                        hold_end = te[0] if len(te) == 1 else None
                     for ev in opening:
                         yield "event", ev
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
-                        gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
-                            else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                        pass_sampling = {k: v for k, v in (sampling or {}).items() if k != HOLD_KEY}
+                        held = hold_end is not None and budget is not None
+                        if held:   # the reasoning tokens left before the budget (at least one: a cut not yet clean)
+                            pass_sampling[HOLD_KEY] = (max(1, int(budget) - thought), int(hold_end))
+                        gen = self.engine.generate(prompt, max_new - n, pass_sampling, cancel, embeddings=emb) if emb \
+                            else self.engine.generate(prompt, max_new - n, pass_sampling, cancel)
                         recover_prompt = None
                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
                         nonfinite = False               # #879: the engine ended this pass on non-finite logits
@@ -6682,6 +6705,13 @@ class Service:
                                 prompt = prompt + seg + extra
                                 finish = "length"
                                 continue
+                        if (held and not (wrap or opens) and not cancel.is_set() and finish != "stop" and not repeated
+                                and not looped and n < max_new and segments and segments[-1].get("finish") == "hold"
+                                and len(segments) > segments_before):
+                            # the engine stopped at the hold but the cut is not clean yet (a character split across
+                            # tokens, a tag held back) or the reasoning count is short: on from the live session
+                            prompt = prompt + seg
+                            continue
                         if not (wrap or opens) or cancel.is_set():
                             break
                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
