@@ -9,7 +9,7 @@
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
-#include "strata/image/mapped_file.hpp"
+#include "strata/platform/mapped_file.hpp"
 #include "strata/image/pipeline.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
@@ -20,6 +20,8 @@
 #include "strata/kernels/flash_attn.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/platform/env.hpp"
+
+#include "strata/image/gpu_buf.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -45,22 +47,6 @@ using namespace dit_rows;
 // kTypeW8: int8 rows rotated as qi_rows_i8 rotates them, then a scale a row (FP32), for prefill::Gemm::i8
 constexpr int kTypeF16 = 1, kTypeQ8_0 = 8, kTypeW8 = -8;
 constexpr float kEps = 1e-6f;
-
-template<class T> T* alloc(std::vector<void*>& owned, int64_t n, bool zero = false) {
-    T* p = nullptr;
-    if (!gpu::alloc_device(&p, (size_t) std::max<int64_t>(n, 1) * sizeof(T)))
-        throw std::runtime_error(std::string("image engine (MOSS-Image DiT): GPU memory: ") + gpu::last_error());
-    if (zero && !gpu::memset(p, 0, (size_t) std::max<int64_t>(n, 1) * sizeof(T)))
-        throw std::runtime_error(std::string("image engine (MOSS-Image DiT): memset: ") + gpu::last_error());
-    owned.push_back(p);
-    return p;
-}
-
-void release(std::vector<void*>& owned, void* p) {
-    if (p == nullptr) return;
-    owned.erase(std::remove(owned.begin(), owned.end(), p), owned.end());
-    gpu::free(p);
-}
 
 // A file's key that changes a text encoder (kohya's lora_te_, diffusers' text_encoder. prefix, the te. other tools
 // write): the image engine applies adapters to the DiT only, and says so rather than leaving it out.
@@ -215,7 +201,7 @@ using namespace moss_dit_detail;
 struct MossDit::Shards {
     struct Shard {
         std::unique_ptr<SafeTensors> st;
-        std::unique_ptr<MappedFile> map;
+        std::unique_ptr<platform::MappedFile> map;
     };
     std::vector<Shard> s;
     explicit Shards(const std::string& path) {
@@ -228,7 +214,7 @@ struct MossDit::Shards {
             files.push_back(path);
         }
         if (files.empty()) throw std::runtime_error("image engine (MOSS-Image DiT): no .safetensors in " + path);
-        for (const auto& f : files) s.push_back({std::make_unique<SafeTensors>(f), std::make_unique<MappedFile>(f)});
+        for (const auto& f : files) s.push_back({std::make_unique<SafeTensors>(f), std::make_unique<platform::MappedFile>(f)});
     }
     // the tensor and its shard, or null
     const SafeTensor* find(const std::string& name, const Shard** at = nullptr) const {
@@ -377,10 +363,10 @@ bool MossDit::open(const std::string& path, void* stream, std::string& err, bool
         if (dry_) return true;
         if (!gemm_.init(s_, scratch, err)) return false;
         blocks_stream_.configure(blocks_stream_.total(), s_);   // all resident until a budget is set
-        t16_ = alloc<uint16_t>(allocs_, freq_ + 2 * C_);
-        temb_ = alloc<float>(allocs_, C_);
-        mod_ = alloc<float>(allocs_, 12 * C_);   // the step's six rows, then timestep 0's (set_refs)
-        head_ = alloc<float>(allocs_, 2 * C_);
+        t16_ = alloc<uint16_t>(allocs_, freq_ + 2 * C_, "image engine (MOSS-Image DiT)");
+        temb_ = alloc<float>(allocs_, C_, "image engine (MOSS-Image DiT)");
+        mod_ = alloc<float>(allocs_, 12 * C_, "image engine (MOSS-Image DiT)");   // the step's six rows, then timestep 0's (set_refs)
+        head_ = alloc<float>(allocs_, 2 * C_, "image engine (MOSS-Image DiT)");
         return true;
     } catch (const std::exception& e) {
         err = e.what();
@@ -420,11 +406,11 @@ MossDit::W MossDit::dense(const std::vector<std::string>& names, bool biased, co
             b.insert(b.end(), v.begin(), v.end());
         }
     }
-    uint16_t* d = alloc<uint16_t>(owned, (int64_t) h.size());
+    uint16_t* d = alloc<uint16_t>(owned, (int64_t) h.size(), "image engine (MOSS-Image DiT)");
     gpu::copy(d, h.data(), h.size() * 2);
     w.d = d;
     if (biased) {
-        float* db = alloc<float>(owned, (int64_t) b.size());
+        float* db = alloc<float>(owned, (int64_t) b.size(), "image engine (MOSS-Image DiT)");
         gpu::copy(db, b.data(), b.size() * 4);
         *bias = db;
     }
@@ -436,7 +422,7 @@ const float* MossDit::vec(const std::string& name, std::vector<void*>& owned, ui
     bytes += (uint64_t) n * 4;
     if (dry_) return nullptr;
     const auto v = files_->f32(name);
-    float* d = alloc<float>(owned, n);
+    float* d = alloc<float>(owned, n, "image engine (MOSS-Image DiT)");
     gpu::copy(d, v.data(), v.size() * 4);
     return d;
 }
@@ -676,36 +662,37 @@ void MossDit::ensure(int64_t hw, int n, int64_t max_text) {
     const Rows rw = rows_for(hw, n, max_text, ref_rows_, ref_i8_on_);
     const int64_t R = rw.R, TP = rw.TP;
     mlp_rows_ = mlp_cap_ > 0 ? std::min(R, mlp_cap_) : R;
-    x_ = alloc<uint16_t>(allocs_, R * C_);
-    q_ = alloc<float>(allocs_, R * C_);
-    k_ = alloc<float>(allocs_, R * C_);
-    v_ = alloc<float>(allocs_, R * C_);
-    a_ = alloc<float>(allocs_, R * C_);
-    gu_ = alloc<float>(allocs_, mlp_rows_ * 2 * F_);
-    h16_ = alloc<uint16_t>(allocs_, std::max(R * C_, mlp_rows_ * F_));
-    rs_ = alloc<float>(allocs_, std::max(R, mlp_rows_));
-    rs2_ = alloc<float>(allocs_, std::max(R, mlp_rows_));
-    rs_o_ = alloc<float>(allocs_, R);
-    hs_ = alloc<float>(allocs_, heads_);
+    x_ = alloc<uint16_t>(allocs_, R * C_, "image engine (MOSS-Image DiT)");
+    q_ = alloc<float>(allocs_, R * C_, "image engine (MOSS-Image DiT)");
+    k_ = alloc<float>(allocs_, R * C_, "image engine (MOSS-Image DiT)");
+    v_ = alloc<float>(allocs_, R * C_, "image engine (MOSS-Image DiT)");
+    a_ = alloc<float>(allocs_, R * C_, "image engine (MOSS-Image DiT)");
+    gu_ = alloc<float>(allocs_, mlp_rows_ * 2 * F_, "image engine (MOSS-Image DiT)");
+    h16_ = alloc<uint16_t>(allocs_, std::max(R * C_, mlp_rows_ * F_), "image engine (MOSS-Image DiT)");
+    rs_ = alloc<float>(allocs_, std::max(R, mlp_rows_), "image engine (MOSS-Image DiT)");
+    rs2_ = alloc<float>(allocs_, std::max(R, mlp_rows_), "image engine (MOSS-Image DiT)");
+    rs_o_ = alloc<float>(allocs_, R, "image engine (MOSS-Image DiT)");
+    hs_ = alloc<float>(allocs_, heads_, "image engine (MOSS-Image DiT)");
     // the int8 attention's statistics: a context's V scales, and K's mean a block and context (zero, no smoothing,
     // until a step makes it)
-    vsv_ = alloc<float>(allocs_, C_);
-    kmean_.init(alloc<float>(allocs_, (int64_t) blocks_.size() * 2 * C_), (int64_t) blocks_.size() * 2, C_);
+    vsv_ = alloc<float>(allocs_, C_, "image engine (MOSS-Image DiT)");
+    kmean_.init(alloc<float>(allocs_, (int64_t) blocks_.size() * 2 * C_, "image engine (MOSS-Image DiT)"),
+                (int64_t) blocks_.size() * 2, C_);
     gpu::memset_async(kmean_.buf, 0, (size_t) blocks_.size() * 2 * C_ * 4, s_);
-    vpart_ = alloc<float>(allocs_, std::max(rw.ctx * heads_, kColSlices * C_));   // head_max's, col_max's
+    vpart_ = alloc<float>(allocs_, std::max(rw.ctx * heads_, kColSlices * C_), "image engine (MOSS-Image DiT)");   // head_max's, col_max's
     if (w8_) {   // W8A8's int8 input: the most rows of the widest input, then two arrays of a scale a row
         xq8_rows_ = std::max(R, mlp_rows_);
         xq8_cols_ = std::max(C_, F_);
-        xq8_ = alloc<int8_t>(allocs_, xq8_rows_ * xq8_cols_ + 2 * xq8_rows_ * 4);
-        pend_sw_ = alloc<float>(allocs_, C_);
+        xq8_ = alloc<int8_t>(allocs_, xq8_rows_ * xq8_cols_ + 2 * xq8_rows_ * 4, "image engine (MOSS-Image DiT)");
+        pend_sw_ = alloc<float>(allocs_, C_, "image engine (MOSS-Image DiT)");
     }
     jrows_ = TP;   // a context's stride (the references' pass: one context, from row 0)
-    jq16_ = alloc<uint16_t>(allocs_, rw.J * C_, true);
-    jk16_ = alloc<uint16_t>(allocs_, rw.J * C_, true);
-    jv16_ = alloc<uint16_t>(allocs_, rw.J * C_, true);
-    jo16_ = alloc<uint16_t>(allocs_, rw.O * C_);
-    o16_ = alloc<uint16_t>(allocs_, R * C_);
-    if (keep0_) b0_ = alloc<uint16_t>(allocs_, (hw + max_text) * C_);
+    jq16_ = alloc<uint16_t>(allocs_, rw.J * C_, "image engine (MOSS-Image DiT)", true);
+    jk16_ = alloc<uint16_t>(allocs_, rw.J * C_, "image engine (MOSS-Image DiT)", true);
+    jv16_ = alloc<uint16_t>(allocs_, rw.J * C_, "image engine (MOSS-Image DiT)", true);
+    jo16_ = alloc<uint16_t>(allocs_, rw.O * C_, "image engine (MOSS-Image DiT)");
+    o16_ = alloc<uint16_t>(allocs_, R * C_, "image engine (MOSS-Image DiT)");
+    if (keep0_) b0_ = alloc<uint16_t>(allocs_, (hw + max_text) * C_, "image engine (MOSS-Image DiT)");
     cap_hw_ = hw;
     cap_n_ = n;
     cap_text_ = max_text;
@@ -803,8 +790,8 @@ void MossDit::lora_scratch(int64_t T) {
             release(allocs_, *p);
             *p = nullptr;
         }
-    lora_f32_ = alloc<float>(allocs_, T * lora_cols_);
-    lora16_ = alloc<uint16_t>(allocs_, T * lora_cols_);
+    lora_f32_ = alloc<float>(allocs_, T * lora_cols_, "image engine (MOSS-Image DiT)");
+    lora16_ = alloc<uint16_t>(allocs_, T * lora_cols_, "image engine (MOSS-Image DiT)");
     lora_tmp_t_ = T;
 }
 
@@ -981,8 +968,8 @@ bool MossDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                     for (const LoraPart& p : w->lora->parts) kr = std::max(kr, w->k * p.entry->rank());
                 }
         if (nk > 0) {
-            bake_tmp_ = alloc<float>(allocs_, nk);
-            bake_at16_ = alloc<uint16_t>(allocs_, kr);
+            bake_tmp_ = alloc<float>(allocs_, nk, "image engine (MOSS-Image DiT)");
+            bake_at16_ = alloc<uint16_t>(allocs_, kr, "image engine (MOSS-Image DiT)");
             baked_any_ = true;
             blocks_stream_.reload();   // the queued work drained before the prepare changes
             install_prepare();
@@ -1105,9 +1092,9 @@ void MossDit::drop_loras() {
 void MossDit::lora_glora_scratch() {
     if (lora_glora_cols_ <= 0 || lora_glora_rows_ <= 0) return;
     const size_t band = (size_t) kLoraGloraRows;
-    lora_glora_y_ = alloc<float>(allocs_, (int64_t) (band * (size_t) lora_glora_rows_));
-    lora_glora_x8_ = alloc<int8_t>(allocs_, (int64_t) (band * (size_t) lora_glora_cols_));
-    lora_glora_sx_ = alloc<float>(allocs_, (int64_t) band);
+    lora_glora_y_ = alloc<float>(allocs_, (int64_t) (band * (size_t) lora_glora_rows_), "image engine (MOSS-Image DiT)");
+    lora_glora_x8_ = alloc<int8_t>(allocs_, (int64_t) (band * (size_t) lora_glora_cols_), "image engine (MOSS-Image DiT)");
+    lora_glora_sx_ = alloc<float>(allocs_, (int64_t) band, "image engine (MOSS-Image DiT)");
 }
 
 void MossDit::free_glora_scratch() {
@@ -1172,8 +1159,8 @@ void MossDit::rope_tables(Ctx& c, int64_t h, int64_t w) {
     gpu::stream_sync(s_);
     release(allocs_, c.cos);
     release(allocs_, c.sin);
-    c.cos = alloc<float>(allocs_, (int64_t) cv.size());
-    c.sin = alloc<float>(allocs_, (int64_t) sv.size());
+    c.cos = alloc<float>(allocs_, (int64_t) cv.size(), "image engine (MOSS-Image DiT)");
+    c.sin = alloc<float>(allocs_, (int64_t) sv.size(), "image engine (MOSS-Image DiT)");
     gpu::copy(c.cos, cv.data(), cv.size() * 4);
     gpu::copy(c.sin, sv.data(), sv.size() * 4);
     c.rope_h = h;
@@ -1210,8 +1197,8 @@ void MossDit::set_time_path(const std::string& path) {
     tp_b2_ = take("time_embedding.2.bias", t2_.n, 0);
     const std::vector<float> sb = take("shared_block_modulation.bias", smod_.n, 0);
     const std::vector<float> hb = take("video_head_modulation.bias", hmod_.n, 0);
-    tp_smod_b_ = alloc<float>(allocs_, smod_.n);
-    tp_hmod_b_ = alloc<float>(allocs_, hmod_.n);
+    tp_smod_b_ = alloc<float>(allocs_, smod_.n, "image engine (MOSS-Image DiT)");
+    tp_hmod_b_ = alloc<float>(allocs_, hmod_.n, "image engine (MOSS-Image DiT)");
     gpu::copy(tp_smod_b_, sb.data(), sb.size() * 4);
     gpu::copy(tp_hmod_b_, hb.data(), hb.size() * 4);
     tp_path_ = path;
@@ -1420,12 +1407,12 @@ void MossDit::set_context(int i, const float* states, int64_t rows) {
     if (!text_loaded_) load_text();
     ensure(cap_hw_, std::max<int>(1, (int) cap_n_), std::max(cap_text_, rows));
     // the input projection (the states' rows scaled into FP16's range), then the text blocks over the text's rows
-    float* xs = alloc<float>(allocs_, rows * txt_dim_);
-    uint16_t* x16 = alloc<uint16_t>(allocs_, rows * txt_dim_);
+    float* xs = alloc<float>(allocs_, rows * txt_dim_, "image engine (MOSS-Image DiT)");
+    uint16_t* x16 = alloc<uint16_t>(allocs_, rows * txt_dim_, "image engine (MOSS-Image DiT)");
     gpu::copy(xs, states, (size_t) (rows * txt_dim_) * 4);
     rows16(Plain{xs, txt_dim_}, rows, txt_dim_, x16, rs_, s_);
-    float* t32 = alloc<float>(allocs_, rows * C_);
-    c.txt0 = alloc<uint16_t>(allocs_, rows * C_);
+    float* t32 = alloc<float>(allocs_, rows * C_, "image engine (MOSS-Image DiT)");
+    c.txt0 = alloc<uint16_t>(allocs_, rows * C_, "image engine (MOSS-Image DiT)");
     product(x16, rs_, tproj_, nullptr, t32, rows, b_tproj_);
     prefill::to_bf16(t32, c.txt0, rows * C_, s_);
     std::vector<float> cv, sv;
@@ -1433,8 +1420,8 @@ void MossDit::set_context(int i, const float* states, int64_t rows) {
         p[0] = p[2] = p[3] = 0.f;
         p[1] = (float) r;
     }, cv, sv);
-    float* dc = alloc<float>(allocs_, (int64_t) cv.size());
-    float* ds = alloc<float>(allocs_, (int64_t) sv.size());
+    float* dc = alloc<float>(allocs_, (int64_t) cv.size(), "image engine (MOSS-Image DiT)");
+    float* ds = alloc<float>(allocs_, (int64_t) sv.size(), "image engine (MOSS-Image DiT)");
     gpu::copy(dc, cv.data(), cv.size() * 4);
     gpu::copy(ds, sv.data(), sv.size() * 4);
     for (const TextBlock& tb : tblocks_) {
@@ -1484,9 +1471,9 @@ void MossDit::set_control(const std::string& path) {
             h[(size_t) (o * K + k)] = v;
             if (k < in_ch_) h0[(size_t) (o * in_ch_ + k)] = v;
         }
-    uint16_t* d = alloc<uint16_t>(ctl_allocs_, (int64_t) h.size());
-    uint16_t* d0 = alloc<uint16_t>(ctl_allocs_, (int64_t) h0.size());
-    float* db = alloc<float>(ctl_allocs_, C_);
+    uint16_t* d = alloc<uint16_t>(ctl_allocs_, (int64_t) h.size(), "image engine (MOSS-Image DiT)");
+    uint16_t* d0 = alloc<uint16_t>(ctl_allocs_, (int64_t) h0.size(), "image engine (MOSS-Image DiT)");
+    float* db = alloc<float>(ctl_allocs_, C_, "image engine (MOSS-Image DiT)");
     gpu::copy(d, h.data(), h.size() * 2);
     gpu::copy(d0, h0.data(), h0.size() * 2);
     gpu::copy(db, b.data(), (size_t) C_ * 4);
@@ -1535,7 +1522,7 @@ void MossDit::input_projection(const float* x, int64_t rows, float* y) {
     if (rows > ctl16_rows_) {
         gpu::stream_sync(s_);
         if (ctl16_ != nullptr) release(allocs_, ctl16_);
-        ctl16_ = alloc<uint16_t>(allocs_, rows * 3 * in_ch_);
+        ctl16_ = alloc<uint16_t>(allocs_, rows * 3 * in_ch_, "image engine (MOSS-Image DiT)");
         ctl16_rows_ = rows;
     }
     moss_ctl_k::tokens(x, color, depth, rows, in_ch_, ctl16_, s_);
@@ -1635,14 +1622,14 @@ void MossDit::set_refs(const std::vector<RefLatent>& refs, QiRefLayout layout) {
     if (R == 0) return;
     if (layout == QiRefLayout::AitkNoKv || layout == QiRefLayout::Appended) {
         // in the stream: their input projection kept, and timestep 0's modulation beside the step's
-        uint16_t* x16 = alloc<uint16_t>(allocs_, R * in_ch_);
+        uint16_t* x16 = alloc<uint16_t>(allocs_, R * in_ch_, "image engine (MOSS-Image DiT)");
         int64_t o = 0;
         for (const RefLatent& f : refs) {
             kernels::f32_to_f16_bulk(f.tokens, x16 + o * in_ch_, f.h * f.w * in_ch_, s_);
             o += f.h * f.w;
         }
-        float* rx = alloc<float>(allocs_, R * C_);
-        ref_x_ = alloc<uint16_t>(allocs_, R * C_);
+        float* rx = alloc<float>(allocs_, R * C_, "image engine (MOSS-Image DiT)");
+        ref_x_ = alloc<uint16_t>(allocs_, R * C_, "image engine (MOSS-Image DiT)");
         product(x16, nullptr, ctl_path_.empty() ? vin_ : ctl_w0_, nullptr, rx, R, ctl_path_.empty() ? b_vin_ : ctl_b_);
         prefill::to_bf16(rx, ref_x_, R * C_, s_);
         if (layout == QiRefLayout::AitkNoKv) {
@@ -1660,19 +1647,19 @@ void MossDit::set_refs(const std::vector<RefLatent>& refs, QiRefLayout layout) {
     ref_i8_on_ = refs_in_i8(R);
     if (ref_i8_on_) {
         ref_i8_stride_ = (qi_attention_i8_prefix_bytes(R, heads_) + 255) / 256 * 256;
-        ref_i8_ = alloc<uint8_t>(allocs_, nb * (int64_t) ref_i8_stride_);
+        ref_i8_ = alloc<uint8_t>(allocs_, nb * (int64_t) ref_i8_stride_, "image engine (MOSS-Image DiT)");
     } else {
-        ref_k16_ = alloc<uint16_t>(allocs_, nb * R * C);
-        ref_v16_ = alloc<uint16_t>(allocs_, nb * R * C);
+        ref_k16_ = alloc<uint16_t>(allocs_, nb * R * C, "image engine (MOSS-Image DiT)");
+        ref_v16_ = alloc<uint16_t>(allocs_, nb * R * C, "image engine (MOSS-Image DiT)");
     }
-    ref_hs_ = alloc<float>(allocs_, nb * heads_);
+    ref_hs_ = alloc<float>(allocs_, nb * heads_, "image engine (MOSS-Image DiT)");
     ref_rows_ = R;   // the attention's rows count them from here (ensure)
     ensure(cap_hw_, std::max<int>(1, (int) cap_n_), cap_text_);
     // their rows through the input projection, on the rotary axes (index + 1, 0, row, column), at timestep 0
     std::vector<float> cv, sv;
     moss_rope_rows(R, hd_, rope_base_, [this](int64_t r, float* p) { ref_coord(r, p); }, cv, sv);
-    float* dc = alloc<float>(allocs_, (int64_t) cv.size());
-    float* ds = alloc<float>(allocs_, (int64_t) sv.size());
+    float* dc = alloc<float>(allocs_, (int64_t) cv.size(), "image engine (MOSS-Image DiT)");
+    float* ds = alloc<float>(allocs_, (int64_t) sv.size(), "image engine (MOSS-Image DiT)");
     gpu::copy(dc, cv.data(), cv.size() * 4);
     gpu::copy(ds, sv.data(), sv.size() * 4);
     int64_t o = 0;

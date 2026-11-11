@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/image/train_loop.cpp - see include/strata/image/train_loop.hpp.
+#include "sigmas.hpp"
 #include "strata/image/train_loop.hpp"
 
 #include "strata/core/gpu.hpp"
@@ -58,7 +59,7 @@ Schedule schedule_linear() {
 
 Schedule schedule_shift(double shift) {
     std::vector<double> s = base_sigmas();
-    for (double& v : s) v = shift * v / (1.0 + (shift - 1.0) * v);
+    for (double& v : s) v = sigma_shift(v, shift);
     return finish(s, 0.0);
 }
 

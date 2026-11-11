@@ -18,12 +18,14 @@ server of the same image model and GPU finds it: a model switch does not lose it
 prompt's text states and the layers that fit in VRAM kept between images, one image a request.  It runs Turbo's
 8 steps (CFG 1, the Euler flow sampler, the model's own sigmas), the image the one stable-diffusion.cpp makes with the
 model card's command for the same seed (within LPIPS 0.03); the base model ("schedule": "base") the steps asked for
-(default the config's "steps", 40) on its scheduler's sigmas (base_sigmas), CFG 1 as well.  A size whose sides are
+(default the config's "steps", 40) on its scheduler's sigmas (the engine's qi_base_sigmas, from SCHED:base
+and STEPS:), CFG 1 as well.  A size whose sides are
 not multiples of 16 (1920x1080) is made at the sides rounded up (1920x1088) and its middle cut out.
 
 Mage-Flow ("family": "mage-flow", "schedule": "mage"): its own prompt form (MF_PROMPT_HEAD, the 34 ids of its system
 turn dropped), the steps asked for (default the config's: Turbo 4, the RL model 20, the base model 30) on its static
-shift (mage_sigmas), and guidance by guidance_scale or true_cfg_scale (the one scale it has; default the config's
+shift (the engine's mage_sigmas, from STEPS:), and guidance by guidance_scale or true_cfg_scale (the one scale it
+has; default the config's
 "cfg_scale": Turbo 1, none; the others 5.0) with negative_prompt (default " ", its pipeline's).  Its edits take up to
 MF_MAX_REFS reference images, in its edit form (MF_EDIT_HEAD, "Image j: <pad>" before the instruction, the 64 ids of
 the system turn dropped) and the config's "edit_steps" (its edit models': Turbo 4, the others 30), on its edit DiT
@@ -115,7 +117,8 @@ byte-level BPE: tools/strata_tokenizer.py's Tokenizer.from_hf), "system_prompt":
   (moss_edit_format)
   max_n: the most images one request makes; budget_s: the longest one request's images may take, by the speed this
   server measured (ImageGen.estimate_s; until it has made an image, at most UNMEASURED_N); schedule: Turbo's own
-  sigmas or the base model's (base_sigmas; no "schedule" is Turbo), Mage-Flow's static shift (mage_sigmas),
+  sigmas or the base model's (the engine's qi_base_sigmas; no "schedule" is Turbo), Mage-Flow's static shift
+  (the engine's mage_sigmas),
   HunyuanImage 3.0's the engine's own (from the step count: none is sent); steps: the model's default (a request's
   "steps" overrides it; Turbo's 8 are its own); vision: Qwen3-VL's vision encoder (mmproj), for the edits (without it
   they are refused); max_refs: the reference images an edit takes at most; reserve_mib: VRAM the
@@ -1150,8 +1153,9 @@ def encode_jxl(png: bytes, quality: int) -> bytes:
 
 
 def base_sigmas(steps: int, width: int, height: int) -> list[float]:
-    """Qwen-Image-2.1's sigmas for `steps` steps of a width x height image (the size the engine makes), and the
-    terminal 0: diffusers' QwenImage21Pipeline with the FlowMatchEulerDiscreteScheduler its scheduler_config sets up
+    """Qwen-Image-2.1's base schedule, the engine's own now (src/image/sigmas.hpp's qi_base_sigmas): this copy
+    remains only for the Turbo redraw's explicit SIGMAS: override (fix_job), which is made at the tile's size.
+    diffusers' QwenImage21Pipeline with the FlowMatchEulerDiscreteScheduler its scheduler_config sets up
     (linspace(1, 1/steps), the exponential time shift by mu, a line in the image's tokens from base_shift 0.5 at 256 to
     max_shift 0.9 at 8192, then stretched to end at shift_terminal 0.02).  An image token is a 16 x 16 pixel square."""
     seq = (width // SIZE_STEP) * (height // SIZE_STEP)
@@ -2180,16 +2184,6 @@ def hunyuanimage3_ids(tok, prompt: str, bucket: dict, base_size: int = 1024, sys
     ids += [marker("<img>")] * (int(bucket["tokens_h"]) * int(bucket["tokens_w"]))
     ids += [marker("<eoi>"), marker("</answer>")]
     return ids + tok.encode("\n\n", parse_special=False)
-
-
-def mage_sigmas(steps: int, shift: float = MF_SHIFT) -> list[float]:
-    """Mage-Flow's sigmas for `steps` and the terminal 0: shift t / (1 + (shift - 1) t), t from 1 down to 1 / steps
-    (its FlowMatchEulerDiscreteScheduler with a static shift; the engine's own default for Turbo's 4)."""
-    out = []
-    for i in range(steps):
-        t = 1.0 - (1.0 - 1.0 / steps) * i / (steps - 1) if steps > 1 else 1.0
-        out.append(shift * t / (1.0 + (shift - 1.0) * t))
-    return out + [0.0]
 
 
 def _tokenizer_module():
@@ -3450,16 +3444,17 @@ class ImageGen:
                 rw, rh = (job["width"], job["height"]) if whole else (mw, mh)
                 lw, lh = (job["width"], job["height"]) if job.get("tiles") else (mw, mh)
                 ids = ",".join(str(i) for i in self.ids(job))
-                sched = self.cfg.get("schedule")
-                sig = (job["sigmas"] if job.get("sigmas") else
-                       base_sigmas(job["steps"], mw, mh) if sched == "base" else
-                       mage_sigmas(job["steps"]) if sched == "mage" else [])
-                sigmas = " SIGMAS:" + ",".join(f"{x:.7g}" for x in sig) if sig else ""
+                sched = job.get("sched") or self.cfg.get("schedule")
+                # the engine owns the schedule now (SCHED:/STEPS: tell it the kind and the settings); an explicit
+                # SIGMAS: list (the API's sigmas, the Turbo redraw's override) still overrides it
+                sigmas = (" SIGMAS:" + ",".join(f"{x:.7g}" for x in job["sigmas"])) if job.get("sigmas") else ""
                 # HunyuanImage 3.0's sigmas are the engine's own (from the step count): its step count and the
                 # guidance token's scale go instead
                 guide = (f" STEPS:{job['steps']} GUID:{job['guidance']:g}" if sched == "hunyuanimage3" else
                          self._moss_words(job) if _pipeline(self.family) == "latent_chat" else
                          self._anima_words(job) if _pipeline(self.family) == "dual_tokenizer" else
+                         f" SCHED:base STEPS:{job['steps']}" if sched == "base" else
+                         f" STEPS:{job['steps']}" if sched == "mage" else
                          f" SAMPLER:{job['sampler']}" if job.get("sampler") else "")
                 guide += guidance_words(job, self.cfg, mw, mh)
                 for i in range(first, job["n"]):

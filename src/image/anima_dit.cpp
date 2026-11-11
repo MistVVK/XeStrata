@@ -5,10 +5,11 @@
 #include "strata/image/anima_dit.hpp"
 
 #include "dit_rows.hpp"
+#include "img_out.hpp"
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
-#include "strata/image/mapped_file.hpp"
+#include "strata/platform/mapped_file.hpp"
 #include "strata/image/pipeline.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/qi_sdpa_ex.hpp"
@@ -21,6 +22,8 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/platform/env.hpp"
+
+#include "strata/image/gpu_buf.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -44,22 +47,6 @@ using namespace dit_rows;
 constexpr int kTypeF16 = 1, kTypeQ8_0 = 8, kTypeW8 = -8;
 constexpr float kEps = 1e-6f;
 constexpr int64_t kCtxRows = 512;   // the context's rows at least: the adapter's output padded with zero rows
-
-template<class T> T* alloc(std::vector<void*>& owned, int64_t n, bool zero = false) {
-    T* p = nullptr;
-    if (!gpu::alloc_device(&p, (size_t) std::max<int64_t>(n, 1) * sizeof(T)))
-        throw std::runtime_error(std::string("image engine (Anima DiT): GPU memory: ") + gpu::last_error());
-    if (zero && !gpu::memset(p, 0, (size_t) std::max<int64_t>(n, 1) * sizeof(T)))
-        throw std::runtime_error(std::string("image engine (Anima DiT): memset: ") + gpu::last_error());
-    owned.push_back(p);
-    return p;
-}
-
-void release(std::vector<void*>& owned, void* p) {
-    if (p == nullptr) return;
-    owned.erase(std::remove(owned.begin(), owned.end(), p), owned.end());
-    gpu::free(p);
-}
 
 bool is_text_encoder_key(const std::string& k) {
     return k.rfind("lora_te", 0) == 0 || k.rfind("text_encoder", 0) == 0 || k.rfind("te.", 0) == 0;
@@ -184,16 +171,6 @@ template<class Op> void rows16_plain(const Op& op, int64_t T, int64_t C, uint16_
     });
 }
 
-// the final layer's [hw][64] (pixel (p1, p2) of channel c at (p1 * 2 + p2) * L + c) in the tokens' order (c * 4 +
-// p1 * 2 + p2)
-void to_tokens(const float* in, int64_t HW, int64_t L, float* out, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (HW * 4 * L)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / (4 * L), j = i - t * 4 * L, p = j / L, c = j - p * L;
-        out[t * 4 * L + c * 4 + p] = in[i];
-    });
-}
-
 // x[t] += y[t] (the adapter's residuals)
 void add_rows(float* x, const float* y, int64_t n, void* s) { qi_axpy(x, y, 1.0f, n, s); }
 
@@ -238,7 +215,7 @@ using namespace anima_dit_detail;
 // the DiT's file: its tensors by their names without the prefix, BF16 in place or converted
 struct AnimaDit::File {
     SafeTensors st;
-    MappedFile map;
+    platform::MappedFile map;
     std::string pre;
     explicit File(const std::string& path) : st(path), map(path) {
         for (const char* p : {"", "net.", "model.diffusion_model.", "diffusion_model."})
@@ -413,12 +390,12 @@ bool AnimaDit::open(const std::string& path, void* stream, std::string& err, boo
         if (dry_) return true;
         if (!gemm_.init(s_, scratch_, err)) return false;
         blocks_stream_.configure(blocks_stream_.total(), s_);
-        e16_ = alloc<uint16_t>(allocs_, C_ + 4 * lat_);
-        m16_ = alloc<uint16_t>(allocs_, std::max(mod_dim_, C_));
-        alora_ = alloc<float>(allocs_, 3 * C_);
-        mh_ = alloc<float>(allocs_, std::max(mod_dim_, C_));
-        mod_ = alloc<float>(allocs_, 3 * C_);
-        fmod_ = alloc<float>(allocs_, 2 * C_);
+        e16_ = alloc<uint16_t>(allocs_, C_ + 4 * lat_, "image engine (Anima DiT)");
+        m16_ = alloc<uint16_t>(allocs_, std::max(mod_dim_, C_), "image engine (Anima DiT)");
+        alora_ = alloc<float>(allocs_, 3 * C_, "image engine (Anima DiT)");
+        mh_ = alloc<float>(allocs_, std::max(mod_dim_, C_), "image engine (Anima DiT)");
+        mod_ = alloc<float>(allocs_, 3 * C_, "image engine (Anima DiT)");
+        fmod_ = alloc<float>(allocs_, 2 * C_, "image engine (Anima DiT)");
         return true;
     } catch (const std::exception& e) {
         err = e.what();
@@ -444,12 +421,12 @@ AnimaDit::W AnimaDit::dense(const std::string& name, bool biased, const float** 
     std::vector<uint16_t> h((size_t) (w.n * w.k));
     for (int64_t r = 0; r < w.n; ++r)
         for (int64_t c = 0; c < w.k; ++c) h[(size_t) (r * w.k + c)] = f16_from_f32(bf16_value(src[r * K + c]));
-    uint16_t* d = alloc<uint16_t>(owned, (int64_t) h.size());
+    uint16_t* d = alloc<uint16_t>(owned, (int64_t) h.size(), "image engine (Anima DiT)");
     gpu::copy(d, h.data(), h.size() * 2);
     w.d = d;
     if (biased) {
         const auto v = f.f32(name + ".bias");
-        float* db = alloc<float>(owned, (int64_t) v.size());
+        float* db = alloc<float>(owned, (int64_t) v.size(), "image engine (Anima DiT)");
         gpu::copy(db, v.data(), v.size() * 4);
         *bias = db;
     }
@@ -461,7 +438,7 @@ const float* AnimaDit::vec(const std::string& name, std::vector<void*>& owned, u
     bytes += (uint64_t) n * 4;
     if (dry_) return nullptr;
     const auto v = file_->f32(name);
-    float* d = alloc<float>(owned, n);
+    float* d = alloc<float>(owned, n, "image engine (Anima DiT)");
     gpu::copy(d, v.data(), v.size() * 4);
     return d;
 }
@@ -625,39 +602,40 @@ void AnimaDit::ensure(int64_t hw, int n) {
     drop_activations();
     const int64_t R = n * hw, L = qi_attn_rows(std::max(kCtxRows, cap_L_)), TP = qi_attn_rows(hw), Rk = std::max(R, L);
     mlp_rows_ = mlp_cap_ > 0 ? std::min(R, mlp_cap_) : R;
-    x_ = alloc<float>(allocs_, R * C_);
-    q_ = alloc<float>(allocs_, Rk * C_);
-    k_ = alloc<float>(allocs_, Rk * C_);
-    v_ = alloc<float>(allocs_, Rk * C_);
-    a_ = alloc<float>(allocs_, Rk * C_);
-    o32_ = alloc<float>(allocs_, R * C_);
-    g_ = alloc<float>(allocs_, mlp_rows_ * F_);
-    h16_ = alloc<uint16_t>(allocs_, std::max(Rk * C_, mlp_rows_ * F_));
-    rs_ = alloc<float>(allocs_, std::max(Rk, mlp_rows_));
-    rs2_ = alloc<float>(allocs_, std::max(Rk, mlp_rows_));
-    rs_o_ = alloc<float>(allocs_, Rk);
-    hs_ = alloc<float>(allocs_, heads_);
-    vpart_ = alloc<float>(allocs_, std::max(hw * heads_, kColSlices * C_));   // head_max's, col_max's
+    x_ = alloc<float>(allocs_, R * C_, "image engine (Anima DiT)");
+    q_ = alloc<float>(allocs_, Rk * C_, "image engine (Anima DiT)");
+    k_ = alloc<float>(allocs_, Rk * C_, "image engine (Anima DiT)");
+    v_ = alloc<float>(allocs_, Rk * C_, "image engine (Anima DiT)");
+    a_ = alloc<float>(allocs_, Rk * C_, "image engine (Anima DiT)");
+    o32_ = alloc<float>(allocs_, R * C_, "image engine (Anima DiT)");
+    g_ = alloc<float>(allocs_, mlp_rows_ * F_, "image engine (Anima DiT)");
+    h16_ = alloc<uint16_t>(allocs_, std::max(Rk * C_, mlp_rows_ * F_), "image engine (Anima DiT)");
+    rs_ = alloc<float>(allocs_, std::max(Rk, mlp_rows_), "image engine (Anima DiT)");
+    rs2_ = alloc<float>(allocs_, std::max(Rk, mlp_rows_), "image engine (Anima DiT)");
+    rs_o_ = alloc<float>(allocs_, Rk, "image engine (Anima DiT)");
+    hs_ = alloc<float>(allocs_, heads_, "image engine (Anima DiT)");
+    vpart_ = alloc<float>(allocs_, std::max(hw * heads_, kColSlices * C_), "image engine (Anima DiT)");   // head_max's, col_max's
     // the int8 attention's statistics: a context's V scales, K's mean a block and context (zero until a step makes it)
-    vsv_ = alloc<float>(allocs_, C_);
-    kmean_.init(alloc<float>(allocs_, (int64_t) blocks_.size() * 2 * C_), (int64_t) blocks_.size() * 2, C_);
+    vsv_ = alloc<float>(allocs_, C_, "image engine (Anima DiT)");
+    kmean_.init(alloc<float>(allocs_, (int64_t) blocks_.size() * 2 * C_, "image engine (Anima DiT)"),
+                (int64_t) blocks_.size() * 2, C_);
     gpu::memset_async(kmean_.buf, 0, (size_t) blocks_.size() * 2 * C_ * 4, s_);
     if (w8_) {
         xq8_rows_ = std::max(Rk, mlp_rows_);
         xq8_cols_ = std::max(C_, F_);
-        xq8_ = alloc<int8_t>(allocs_, xq8_rows_ * xq8_cols_ + 2 * xq8_rows_ * 4);
+        xq8_ = alloc<int8_t>(allocs_, xq8_rows_ * xq8_cols_ + 2 * xq8_rows_ * 4, "image engine (Anima DiT)");
     }
     jrows_ = TP;
-    jq16_ = alloc<uint16_t>(allocs_, TP * C_, true);
-    jk16_ = alloc<uint16_t>(allocs_, TP * C_, true);
-    jv16_ = alloc<uint16_t>(allocs_, TP * C_, true);
-    jo16_ = alloc<uint16_t>(allocs_, TP * C_);
-    o16_ = alloc<uint16_t>(allocs_, Rk * C_);
-    qh16_ = alloc<uint16_t>(allocs_, Rk * C_);
-    sc_ = alloc<float>(allocs_, std::max(hw, L) * L);
-    p16_ = alloc<uint16_t>(allocs_, std::max(hw, L) * L);
-    cos_ = alloc<float>(allocs_, hw * (hd_ / 2));
-    sin_ = alloc<float>(allocs_, hw * (hd_ / 2));
+    jq16_ = alloc<uint16_t>(allocs_, TP * C_, "image engine (Anima DiT)", true);
+    jk16_ = alloc<uint16_t>(allocs_, TP * C_, "image engine (Anima DiT)", true);
+    jv16_ = alloc<uint16_t>(allocs_, TP * C_, "image engine (Anima DiT)", true);
+    jo16_ = alloc<uint16_t>(allocs_, TP * C_, "image engine (Anima DiT)");
+    o16_ = alloc<uint16_t>(allocs_, Rk * C_, "image engine (Anima DiT)");
+    qh16_ = alloc<uint16_t>(allocs_, Rk * C_, "image engine (Anima DiT)");
+    sc_ = alloc<float>(allocs_, std::max(hw, L) * L, "image engine (Anima DiT)");
+    p16_ = alloc<uint16_t>(allocs_, std::max(hw, L) * L, "image engine (Anima DiT)");
+    cos_ = alloc<float>(allocs_, hw * (hd_ / 2), "image engine (Anima DiT)");
+    sin_ = alloc<float>(allocs_, hw * (hd_ / 2), "image engine (Anima DiT)");
     rope_h_ = rope_w_ = -1;
     cap_hw_ = hw;
     cap_n_ = n;
@@ -821,7 +799,7 @@ void AnimaDit::adapter(const std::vector<AdapterIn>& in) {
     if (need > ad_bytes_) {
         gpu::stream_sync(s_);
         release(text_allocs_, ad_scratch_);
-        ad_scratch_ = alloc<uint8_t>(text_allocs_, (int64_t) need);
+        ad_scratch_ = alloc<uint8_t>(text_allocs_, (int64_t) need, "image engine (Anima DiT)");
         ad_bytes_ = need;
     }
     uint8_t* at = ad_scratch_;
@@ -943,8 +921,8 @@ void AnimaDit::adapter(const std::vector<AdapterIn>& in) {
         if (c.c16 == nullptr || c.rows != L) {
             release(allocs_, c.c16);
             release(allocs_, c.rs);
-            c.c16 = alloc<uint16_t>(allocs_, L * C, true);
-            c.rs = alloc<float>(allocs_, L);
+            c.c16 = alloc<uint16_t>(allocs_, L * C, "image engine (Anima DiT)", true);
+            c.rs = alloc<float>(allocs_, L, "image engine (Anima DiT)");
             std::vector<float> ones((size_t) L, 1.f);
             gpu::copy(c.rs, ones.data(), ones.size() * 4);
         } else {   // the zero rows after these, at a scale of 1 as alloc left them
@@ -1080,7 +1058,7 @@ void AnimaDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n,
                 kv = nullptr;
             }
             if (kv == nullptr) {
-                kv = alloc<uint16_t>(allocs_, 2 * heads_ * Lp * hd_);
+                kv = alloc<uint16_t>(allocs_, 2 * heads_ * Lp * hd_, "image engine (Anima DiT)");
                 // the rows past L zero (the shared kernel reads whole chunks of keys, the products form whole Tp):
                 // async, as a synchronous memset here stalled the step's queue once a block (28 of them, +0.11 s)
                 gpu::memset_async(kv, 0, (size_t) (2 * heads_ * Lp * hd_) * 2, s_);
@@ -1138,7 +1116,7 @@ void AnimaDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n,
     for (int i = 0; i < n; ++i) {
         rows16(LnMod{x_ + i * HW * C, fmod_, fmod_ + C, C}, HW, C, h16_, rs_, s_);
         product(h16_, rs_, flin_, nullptr, a_, HW, nullptr);
-        to_tokens(a_, HW, lat_, out + i * HW * TV, s_);
+        patch_to_tokens(a_, HW, lat_, out + i * HW * TV, s_);
     }
 }
 
@@ -1208,8 +1186,8 @@ void AnimaDit::lora_scratch(int64_t T) {
             release(allocs_, *p);
             *p = nullptr;
         }
-    lora_f32_ = alloc<float>(allocs_, T * lora_cols_);
-    lora16_ = alloc<uint16_t>(allocs_, T * lora_cols_);
+    lora_f32_ = alloc<float>(allocs_, T * lora_cols_, "image engine (Anima DiT)");
+    lora16_ = alloc<uint16_t>(allocs_, T * lora_cols_, "image engine (Anima DiT)");
     lora_tmp_t_ = T;
 }
 
@@ -1386,8 +1364,8 @@ bool AnimaDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                     for (const LoraPart& p : w->lora->parts) kr = std::max(kr, w->k * p.entry->rank());
                 }
         if (nk > 0) {
-            bake_tmp_ = alloc<float>(allocs_, nk);
-            bake_at16_ = alloc<uint16_t>(allocs_, kr);
+            bake_tmp_ = alloc<float>(allocs_, nk, "image engine (Anima DiT)");
+            bake_at16_ = alloc<uint16_t>(allocs_, kr, "image engine (Anima DiT)");
             baked_any_ = true;
             blocks_stream_.reload();   // the queued work drained before the prepare changes
             install_prepare();
@@ -1482,9 +1460,9 @@ void AnimaDit::drop_loras() {
 void AnimaDit::lora_glora_scratch() {
     if (lora_glora_cols_ <= 0 || lora_glora_rows_ <= 0) return;
     const size_t band = (size_t) kLoraGloraRows;
-    lora_glora_y_ = alloc<float>(allocs_, (int64_t) (band * (size_t) lora_glora_rows_));
-    lora_glora_x8_ = alloc<int8_t>(allocs_, (int64_t) (band * (size_t) lora_glora_cols_));
-    lora_glora_sx_ = alloc<float>(allocs_, (int64_t) band);
+    lora_glora_y_ = alloc<float>(allocs_, (int64_t) (band * (size_t) lora_glora_rows_), "image engine (Anima DiT)");
+    lora_glora_x8_ = alloc<int8_t>(allocs_, (int64_t) (band * (size_t) lora_glora_cols_), "image engine (Anima DiT)");
+    lora_glora_sx_ = alloc<float>(allocs_, (int64_t) band, "image engine (Anima DiT)");
 }
 
 void AnimaDit::free_glora_scratch() {

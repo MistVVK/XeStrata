@@ -11,7 +11,9 @@
 // mask bilinear).  The model redraws where the blend mask is above 0, its latent positions following the base image
 // as much as the mask keeps them (share), and its picture, resized back to the box (Lanczos), goes into the picture
 // by the blend mask (bilinear): where that is 0 the picture's own pixels stay as they are, byte for byte.  The
-// resizes are Pillow's (its filters, its supports widened by the scale when it shrinks), in floats.
+// resizes are Pillow's (its filters, its supports widened by the scale when it shrinks), in floats: on the GPU
+// (pillow_resize) and, for a picture a model's encoder reads as floats before they go up, on the host
+// (pillow_resize_planes).  Both read one set of taps; they total them differently, so an output can be a level apart.
 #pragma once
 
 #include "strata/image/pipeline.hpp"
@@ -39,6 +41,18 @@ enum class Filter { lanczos, triangle, bicubic, cv_cubic };
 /// `src` (RGBA8) at w x h by Pillow's filter, its support widened by the scale when it shrinks, the rows' pass rounded
 /// and clipped to 8 bits before the columns' as Pillow's is (its fixed-point weights aside: an output within 1 of its).
 QiRef pillow_resize(const QiRef& src, int64_t w, int64_t h, Filter filter);
+
+/// The same Pillow resize of `planes`, planar floats `[C][H][W]` whose values are the whole bytes of a picture
+/// (0 .. 255), read by a model's encoder on the host before they go up: rows then columns, each pass rounded and
+/// clipped to 8 bits as Pillow's and the GPU's rows' pass are.  One set of taps (`taps`) with the GPU's pass, but
+/// totalled in doubles and divided by their sum last, the way PIL's own resample is.  The GPU's pass reads those taps
+/// as floats and accumulates in floats: on a 1024 x 1024 picture shrunk to 512 x 768 that is 1.1% of the values a
+/// level apart (never more than one level; 0.1% at 384 x 384), and this keeps PIL's own output to within that one
+/// level too.  So a model whose pictures are checked against a reference run resizes here, and one that reads a float
+/// plane on the host needs no GPU trip for it (the GPU's pass takes RGBA8 in and gives RGBA8 back).
+/// std::invalid_argument for an empty image or no size; `planes` itself for a resize to the size it is.
+std::vector<float> pillow_resize_planes(const std::vector<float>& planes, int64_t c, int64_t w, int64_t h, int64_t w2,
+                                        int64_t h2, Filter filter);
 
 /// `src` (RGBA8) at w x h by Pillow's Lanczos, its support widened by the scale when it shrinks (an upscale's base
 /// image: the IMG line's UPSCALE).

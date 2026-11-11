@@ -43,10 +43,12 @@ namespace strata::image {
 
 /// Mage-Flow's static-shift schedule (shift s) of n steps: sigma = s t / (1 + (s - 1) t) for t from 1 down to 1 / n,
 /// and the terminal 0 (the reference's FlowMatchEulerDiscreteScheduler, shift 6).
-std::vector<float> mage_sigmas(int n, float shift = 6.0f);
 
 class MfPipeline : public ImagePipeline {
 public:
+    bool takes_loras() const override { return true; }
+    bool takes_guidance() const override { return true; }
+
     /// Reads the parts' files for their sizes; the parts go on the GPU with the first request.  `q8`: the DiT's blocks
     /// as Q8_0 (1), FP16 (0) or by the budget (-1, the default).  `edit_dit` and `vision` (the mmproj): edits (none
     /// without them); `keep`: the DiT not in use kept in RAM.

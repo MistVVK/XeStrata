@@ -41,6 +41,9 @@ void latent_to_tokens(const float* z, int64_t h, int64_t w, int64_t L, float* x,
 
 class AnimaPipeline : public ImagePipeline {
 public:
+    bool takes_loras() const override { return true; }
+    bool takes_guidance() const override { return true; }
+
     /// `dit`: the DiT's safetensors, `vae`: Wan 2.1's VAE (Comfy-Org's qwen_image_vae.safetensors), `text`:
     /// Qwen3-0.6B-Base's GGUF.  `q8`: the DiT's blocks in 8 bits (1), FP16 (0) or by the budget (-1).
     bool open(const std::string& dit, const std::string& vae, const std::string& text, std::string& err, int q8 = -1);

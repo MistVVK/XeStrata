@@ -14,8 +14,11 @@
 #include "strata/kernels/elementwise.hpp"
 
 #include "tile_sides.hpp"
+#include "img_out.hpp"
 #include "qi_conv.hpp"
 #include "vae_attention.hpp"
+
+#include "strata/image/gpu_buf.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -58,22 +61,6 @@ constexpr int64_t kScoreValues = 16ll << 20;                     // the attentio
 // the attention's band of query rows over hw keys: its scores within kScoreValues
 int64_t attn_rows(int64_t hw) { return std::max<int64_t>(1, std::min(hw, kScoreValues / std::max<int64_t>(1, hw))); }
 
-sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
-
-template<class T> T* alloc(std::vector<void*>& owned, int64_t n) {
-    T* p = nullptr;
-    if (!gpu::alloc_device(&p, (size_t) n * sizeof(T)))
-        throw std::runtime_error(std::string("image engine (VAE): GPU memory: ") + gpu::last_error());
-    owned.push_back(p);
-    return p;
-}
-
-void release(std::vector<void*>& owned, void* p) {
-    if (p == nullptr) return;
-    owned.erase(std::remove(owned.begin(), owned.end(), p), owned.end());
-    gpu::free(p);
-}
-
 // out16[p][c] = (z[c][p] * std[c] + mean[c]), the DiT's latent [C][HW] as the decoder's [HW][C]
 void unnorm_tokens16(const float* z, const float* mean, const float* sd, int64_t C, int64_t HW, uint16_t* out16,
                      void* s) {
@@ -95,51 +82,6 @@ void dupup_add(float* y, const float* xin, int64_t H, int64_t W, int64_t cin, in
         const int64_t a = Y % 2, bb = X % 2;
         const int64_t src = ((c * ft + ft - 1) * 4 + 2 * a + bb) / rep;
         y[i] += xin[((Y / 2) * W + X / 2) * cin + src];
-    });
-}
-
-// rgba [4][HW] = clamp((x [HW][C] + 1) / 2, 0, 1); C 3: alpha 1
-void to_rgba(const float* x, int64_t HW, int64_t C, float* rgba, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (4 * HW)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t c = i / HW, p = i - c * HW;
-        rgba[i] = c < C ? sycl::clamp((x[p * C + c] + 1.f) * 0.5f, 0.f, 1.f) : 1.f;
-    });
-}
-
-// sub [C][th][tw] = z [C][h][w] rows y0.., columns x0..
-void crop_latent(const float* z, int64_t C, int64_t h, int64_t w, int64_t y0, int64_t x0, int64_t th, int64_t tw,
-                 float* sub, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (C * th * tw)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t c = i / (th * tw), r = i % (th * tw), y = r / tw, x = r % tw;
-        sub[i] = z[(c * h + y0 + y) * w + x0 + x];
-    });
-}
-
-// acc [4][H][W] += piece [4][ph][pw] * weight, wsum [H][W] += weight, the piece at image row Y0, column X0; the weight
-// ramps from 0 to 1 over `ramp` pixels at each edge that meets another tile, 1 elsewhere
-void blend_add(const float* piece, int64_t ph, int64_t pw, int64_t Y0, int64_t X0, int64_t H, int64_t W, int64_t ramp,
-               bool top, bool bottom, bool left, bool right, float* acc, float* wsum, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (ph * pw)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t y = i / pw, x = i % pw;
-        auto edge = [ramp](int64_t d) { return sycl::fmin(1.0f, (float) (d + 1) / (float) (ramp + 1)); };
-        float wgt = 1.0f;
-        if (top) wgt *= edge(y);
-        if (bottom) wgt *= edge(ph - 1 - y);
-        if (left) wgt *= edge(x);
-        if (right) wgt *= edge(pw - 1 - x);
-        const int64_t p = (Y0 + y) * W + X0 + x;
-        for (int c = 0; c < 4; ++c) acc[c * H * W + p] += piece[c * ph * pw + i] * wgt;
-        wsum[p] += wgt;
-    });
-}
-
-void normalize(float* acc, const float* wsum, int64_t HW, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (4 * HW)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        acc[i] /= wsum[i % HW];
     });
 }
 
@@ -214,7 +156,7 @@ QiVae::Conv QiVae::conv_w(SafeTensors& st, const std::string& name) {
                 for (int64_t dx = 0; dx < c.k; ++dx)
                     h[(size_t) (((o * c.k + dy) * c.k + dx) * c.in + i)] = kernels::f16_from_f32(
                         w[(size_t) ((((o * in + i) * kt + kt - 1) * c.k + dy) * c.k + dx)]);
-    uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
+    uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size(), "image engine (VAE)");
     gpu::copy(d, h.data(), h.size() * 2);
     c.w = d;
     c.b = vec(st, name + ".bias");
@@ -230,7 +172,7 @@ const float* QiVae::vec(SafeTensors& st, const std::string& name) {
         return nullptr;
     }
     const auto v = st.f32(name);
-    float* d = alloc<float>(allocs_, (int64_t) v.size());
+    float* d = alloc<float>(allocs_, (int64_t) v.size(), "image engine (VAE)");
     gpu::copy(d, v.data(), v.size() * 4);
     weight_bytes_ += v.size() * 4;
     return d;
@@ -254,8 +196,8 @@ void QiVae::open_wan21(SafeTensors& st) {
     wan21_ = true;
     rgb_in_ = 3;
     if (!dry_) {
-        mean_ = alloc<float>(allocs_, 16);
-        std_ = alloc<float>(allocs_, 16);
+        mean_ = alloc<float>(allocs_, 16, "image engine (VAE)");
+        std_ = alloc<float>(allocs_, 16, "image engine (VAE)");
         gpu::copy((void*) mean_, kWanMean, sizeof(kWanMean));
         gpu::copy((void*) std_, kWanStd, sizeof(kWanStd));
     }
@@ -333,8 +275,8 @@ bool QiVae::open(const std::string& path, void* stream, std::string& err, bool d
             return gemm_.init(s_, 16, err);
         }
         if (!dry_) {
-            mean_ = alloc<float>(allocs_, 64);
-            std_ = alloc<float>(allocs_, 64);
+            mean_ = alloc<float>(allocs_, 64, "image engine (VAE)");
+            std_ = alloc<float>(allocs_, 64, "image engine (VAE)");
             gpu::copy((void*) mean_, kMean, sizeof(kMean));
             gpu::copy((void*) std_, kStd, sizeof(kStd));
         }
@@ -386,19 +328,19 @@ bool QiVae::open(const std::string& path, void* stream, std::string& err, bool d
 void QiVae::grow(int64_t elems16, int64_t elems32, int64_t col16) {
     if (elems16 > cap16_) {
         release(allocs_, a16_);
-        a16_ = alloc<uint16_t>(allocs_, elems16);
+        a16_ = alloc<uint16_t>(allocs_, elems16, "image engine (VAE)");
         cap16_ = elems16;
     }
     if (elems32 > cap32_) {
         for (float** p : {&t0_, &t1_, &t2_}) {
             release(allocs_, *p);
-            *p = alloc<float>(allocs_, elems32);
+            *p = alloc<float>(allocs_, elems32, "image engine (VAE)");
         }
         cap32_ = elems32;
     }
     if (col16 > col_cap_) {
         release(allocs_, col16_);
-        col16_ = alloc<uint16_t>(allocs_, col16);
+        col16_ = alloc<uint16_t>(allocs_, col16, "image engine (VAE)");
         col_cap_ = col16;
     }
 }
@@ -516,19 +458,15 @@ void QiVae::decode(const float* z, int64_t h, int64_t w, float* rgba, uint64_t m
         throw std::runtime_error(std::string("image engine (VAE): GPU memory: ") + gpu::last_error());
     gpu::memset_async(rgba, 0, (size_t) (4 * H * W) * 4, s_);
     gpu::memset_async(wsum, 0, (size_t) (H * W) * 4, s_);
-    for (int64_t y0 = 0;; y0 += th - ov) {
-        const int64_t yy = std::min(y0, h - th);   // the last row of tiles ends at the edge
-        for (int64_t x0 = 0;; x0 += tw - ov) {
-            const int64_t xx = std::min(x0, w - tw);
-            crop_latent(z, C, h, w, yy, xx, th, tw, sub, s_);
+    const auto ys = tile_positions(h, th, ov), xs = tile_positions(w, tw, ov);
+    for (const int64_t yy : ys)
+        for (const int64_t xx : xs) {
+            tile_crop(z, C, TilePlanes::Planes, h, w, yy, xx, th, tw, sub, s_);
             decode_piece(sub, th, tw, piece);
-            blend_add(piece, S * th, S * tw, S * yy, S * xx, H, W, S * ov, yy > 0, yy + th < h, xx > 0, xx + tw < w,
-                      rgba, wsum, s_);
-            if (xx + tw >= w) break;
+            tile_blend(piece, 4, TilePlanes::Planes, S * th, S * tw, S * yy, S * xx, H, W, S * ov, TileRamp::Step,
+                       yy > 0, yy + th < h, xx > 0, xx + tw < w, rgba, wsum, s_);
         }
-        if (yy + th >= h) break;
-    }
-    normalize(rgba, wsum, H * W, s_);
+    tile_finish(rgba, 4, TilePlanes::Planes, H * W, wsum, rgba, s_);
     gpu::stream_sync(s_);
     gpu::free(sub);
     gpu::free(piece);
@@ -552,7 +490,7 @@ void QiVae::decode_piece(const float* z, int64_t h, int64_t w, float* rgba) {
         // the block's input, for its shortcut: in the buffer neither the residual blocks nor the upsampling write
         float* keep = nullptr;
         if (u.up.out > 0 && u.ft > 0) {
-            keep = alloc<float>(allocs_, H * W * cin);
+            keep = alloc<float>(allocs_, H * W * cin, "image engine (VAE)");
             gpu::copy_async(keep, x, (size_t) (H * W * cin) * 4, s_);
         }
         for (const Res& r : u.r) {
@@ -577,7 +515,7 @@ void QiVae::decode_piece(const float* z, int64_t h, int64_t w, float* rgba) {
     vae_mid::rms16(x, gout_, H * W, c, true, a16_, s_);
     float* out = x == t0_ ? t1_ : t0_;
     conv(cout_, a16_, H, W, out);
-    to_rgba(out, H * W, cout_.out, rgba, s_);
+    to_rgba(out, H * W, cout_.out, TilePlanes::Interleaved, rgba, s_);
     gpu::stream_sync(s_);
 }
 
@@ -626,7 +564,7 @@ bool QiVae::encode(const float* rgba, int64_t H, int64_t W, float* z, float* zst
         const int64_t cin = c;
         float* keep = nullptr;   // the block's input, for its shortcut
         if (d.ft > 0) {
-            keep = alloc<float>(allocs_, H * W * cin);
+            keep = alloc<float>(allocs_, H * W * cin, "image engine (VAE)");
             gpu::copy_async(keep, x, (size_t) (H * W * cin) * 4, s_);
         }
         for (const Res& r : d.r) {

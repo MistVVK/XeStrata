@@ -8,9 +8,13 @@
 #include "strata/core/device.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/image/img_start.hpp"
 #include "strata/image/mf_vae.hpp"
 #include "strata/image/moss_pipeline.hpp"
+#include "strata/kernels/elementwise.hpp"
 #include "strata/upscale/seedvr2_dit.hpp"
+
+#include "strata/image/gpu_buf.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -29,7 +33,7 @@ namespace strata::upscale {
 
 namespace seedvr2_detail {
 
-sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
+using image::q_of;
 
 // A video's VAE in tiles of tt x tt tokens (0: the frame whole) over a th x tw latent of HW pixels, `lat` latents a
 // call: a slice's work (`slice` latents), every tile's carried frames (one tile's of one side where they are kept in
@@ -57,11 +61,6 @@ void rgb_of(const uint8_t* rgba, int64_t HW, float* rgb, void* s) {
         const int64_t c = i / HW, p = i - c * HW;
         rgb[i] = (float) rgba[p * 4 + c] * (2.f / 255.f) - 1.f;
     });
-}
-
-// x = a x
-void scale(float* x, int64_t n, float a, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) { x[id[0]] *= a; });
 }
 
 // z = (noise - v) a: the step's result, as the decoder takes it
@@ -215,7 +214,7 @@ void Seedvr2::Impl::encode_slice(bool keep) {
     for (int64_t i = 0; i < k; ++i) {
         float* z = latent_buf();
         gpu::copy_async(z, v.zbuf + i * n, (size_t) n * 4, s);
-        scale(z, n, kScaling, s);
+        kernels::scale_inplace(z, n, kScaling, s);
         v.cond.push_back(z);
     }
     v.latents += k;
@@ -238,12 +237,8 @@ void Seedvr2::Impl::run_chunks() {
             gpu::copy_async(v.ccat + j * n, v.cond[(size_t) (s0 + j - v.cond0)], (size_t) n * 4, s);
         const std::vector<float> r = image::torch_cpu_randn(v.seed, (uint64_t) (16 * len * lh * lw));
         std::vector<float> tok((size_t) (len * n));
-        for (int64_t c = 0; c < 16; ++c)
-            for (int64_t f = 0; f < len; ++f)
-                for (int64_t y = 0; y < lh; ++y)
-                    for (int64_t x = 0; x < lw; ++x)
-                        tok[(size_t) (f * n + ((y / 2) * tw + x / 2) * 64 + 4 * c + 2 * (y % 2) + x % 2)] =
-                            r[(size_t) (((c * len + f) * lh + y) * lw + x)];
+        for (int64_t f = 0; f < len; ++f)   // one frame's tokens a call, its channels len frames apart (img_start.hpp)
+            image::noise_to_tokens(r.data() + f * lh * lw, 16, lh, lw, 2, tok.data() + f * n, len * lh * lw);
         gpu::copy(v.ncat, tok.data(), tok.size() * 4);
         auto t0 = std::chrono::steady_clock::now();
         dit->forward(v.ncat, v.ccat, th, tw, v.vel, len);
@@ -600,17 +595,13 @@ void Seedvr2::run_clip(const uint8_t* in, int64_t w, int64_t h, int64_t frames, 
             const uint64_t margin = 256ull << 20;
             m.vae->encode(rgb, th, tw, nullptr, cond, free > margin ? (uint64_t) free - margin : 0);
         }
-        scale(cond, n, kScaling, m.s);
+        kernels::scale_inplace(cond, n, kScaling, m.s);
         lap(m.enc_s);
         m.vae->drop_scratch();   // the three parts take the room in turn: each one's buffers go before the next's
         // the noise in the latent's [16][h][w] order (torch.randn's), to the tokens' (value 4 c + 2 dy + dx)
         const std::vector<float> r = image::torch_cpu_randn(seed + (uint64_t) f, (uint64_t) n);
         std::vector<float> tok((size_t) n);
-        for (int64_t c = 0; c < lat; ++c)
-            for (int64_t y = 0; y < lh; ++y)
-                for (int64_t x = 0; x < lw; ++x)
-                    tok[(size_t) (((y / 2) * tw + x / 2) * 64 + 4 * c + 2 * (y % 2) + x % 2)] =
-                        r[(size_t) ((c * lh + y) * lw + x)];
+        image::noise_to_tokens(r.data(), lat, lh, lw, 2, tok.data());
         gpu::copy(noise, tok.data(), tok.size() * 4);
         m.dit->forward(noise, cond, th, tw, vel);
         lap(m.dit_s);

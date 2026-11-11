@@ -59,6 +59,9 @@ public:
                               const std::vector<Picture>& pictures = {});
     /// The <|image_pad|> token's id (-1: the vocabulary has none).
     int32_t image_pad() const { return image_pad_; }
+    /// The same id read straight from a GGUF's vocabulary, for a model that needs the id and no encoder yet
+    /// (MOSS-Image: opening an encoder, even for its sizes, takes the blocks' resident weights onto the GPU).
+    static int32_t pad_id(const std::string& gguf);
     int64_t hidden() const { return hidden_; }
     /// The adapters' text encoder entries (lora_split's `te`: sd-scripts' lora_te_layers_N_... or the model's own
     /// dotted names) added after the blocks' products from the next encode: a plain LoRA, a LoKr, a LoHa or a whole

@@ -49,7 +49,7 @@ std::string json_str(const std::string& j, const char* key) {
 
 // A tensor's bytes, checked against the file before a pointer is handed out: the engine reads whatever the file says,
 // and a wrong offset here is a fault inside a kernel rather than an error at start.
-const uint8_t* checked(const st::SafeTensors& s, const MappedFile& f, const st::SafeTensor& t, uint64_t bytes,
+const uint8_t* checked(const st::SafeTensors& s, const platform::MappedFile& f, const st::SafeTensor& t, uint64_t bytes,
                        const std::string& path, const std::string& name) {
     if (t.end < t.begin || bytes > t.end - t.begin)
         throw std::runtime_error(path + ": " + name + ": its shape does not match its bytes");
@@ -83,7 +83,7 @@ bool HunyuanImage3File::open(const std::string& path, std::string& err, bool hea
         return false;
     }
     try {
-        file_ = std::make_unique<MappedFile>(path);
+        file_ = std::make_unique<platform::MappedFile>(path);
     } catch (const std::exception& e) {
         err = e.what();
         return false;

@@ -10,17 +10,20 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
-#include "strata/image/mapped_file.hpp"
+#include "strata/platform/mapped_file.hpp"
 #include "strata/image/pipeline.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/i8_gemm.hpp"
 #include "strata/kernels/flash_attn.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/platform/env.hpp"
+
+#include "strata/image/gpu_buf.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -48,22 +51,6 @@ using namespace dit_rows;
 // kTypeW8: int8 rows rotated as qi_rows_i8 rotates them, then a scale a row (FP32), for prefill::Gemm::i8
 constexpr int kTypeF16 = 1, kTypeQ8_0 = 8, kTypeW8 = -8, kTypeF32 = 32;
 
-template<class T> T* alloc(std::vector<void*>& owned, int64_t n, bool zero = false) {
-    T* p = nullptr;
-    if (!gpu::alloc_device(&p, (size_t) std::max<int64_t>(n, 1) * sizeof(T)))
-        throw std::runtime_error(std::string("image engine (Mage-Flow DiT): GPU memory: ") + gpu::last_error());
-    if (zero && !gpu::memset(p, 0, (size_t) std::max<int64_t>(n, 1) * sizeof(T)))
-        throw std::runtime_error(std::string("image engine (Mage-Flow DiT): memset: ") + gpu::last_error());
-    owned.push_back(p);
-    return p;
-}
-
-void release(std::vector<void*>& owned, void* p) {
-    if (p == nullptr) return;
-    owned.erase(std::remove(owned.begin(), owned.end(), p), owned.end());
-    gpu::free(p);
-}
-
 // y[n] = x . w[n] + b[n]: w N rows of Q8_0 blocks (K / 32 of them, 34 bytes: an FP16 scale and 32 int8 values),
 // x FP32; a work-group of 32 a row, reading it as 16-bit words, neighbouring items neighbouring words (a row of 3072
 // values: 1632 words, 96 of them the scales, which the items of the block's other words read again from the cache)
@@ -84,21 +71,6 @@ void q8_0_vec(const uint8_t* w, const float* x, const float* b, float* y, int64_
             const float d = f32_from_f16(row[blk * 17]);
             acc += d * ((float) (int8_t) (v & 0xFF) * xb[0] + (float) (int8_t) (v >> 8) * xb[1]);
         }
-        acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
-        if (lane == 0) y[n] = acc + (b != nullptr ? b[n] : 0.f);
-    });
-}
-
-// y[n] = x . w[n] + b[n] (b null: none): w N rows of K FP32, x FP32; a work-group of 32 a row
-void f32_vec(const float* w, const float* x, const float* b, float* y, int64_t N, int64_t K, void* s) {
-    constexpr int64_t local = 32;
-    q_of(s).parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (N * local)), sycl::range<1>((size_t) local)),
-                         [=](sycl::nd_item<1> it) {
-        const auto n = static_cast<int64_t>(it.get_group_linear_id());
-        const auto lane = static_cast<int64_t>(it.get_local_linear_id());
-        const float* row = w + n * K;
-        float acc = 0.f;
-        for (int64_t k = lane; k < K; k += local) acc += row[k] * x[k];
         acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
         if (lane == 0) y[n] = acc + (b != nullptr ? b[n] : 0.f);
     });
@@ -146,7 +118,7 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
         w8_ = q8 && strata::env_get("NO_W8A8") == nullptr && prefill::Gemm::i8_usable(stream);
         st_ = std::make_unique<SafeTensors>(path);
         SafeTensors& st = *st_;
-        file_ = std::make_unique<MappedFile>(path);
+        file_ = std::make_unique<platform::MappedFile>(path);
         const uint8_t* data = file_->data() + st.data_base();
         auto tensor = [&](const std::string& name) -> const SafeTensor& {
             const SafeTensor* t = st.find(name);
@@ -175,11 +147,11 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
                 const auto* src = reinterpret_cast<const uint16_t*>(data + t.begin);
                 std::vector<uint16_t> h((size_t) (w.n * w.k));
                 for (size_t i = 0; i < h.size(); ++i) h[i] = f16_from_f32(bf16_value(src[i]));
-                uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
+                uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size(), "image engine (Mage-Flow DiT)");
                 gpu::copy(d, h.data(), h.size() * 2);
                 w.d = d;
                 const auto b = st.f32(name + ".bias");
-                float* db = alloc<float>(allocs_, (int64_t) b.size());
+                float* db = alloc<float>(allocs_, (int64_t) b.size(), "image engine (Mage-Flow DiT)");
                 gpu::copy(db, b.data(), b.size() * 4);
                 *bias = db;
             }
@@ -197,7 +169,7 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
         weight_bytes_ += (uint64_t) txt_dim_ * 4;
         if (!dry_) {
             const auto v = st.f32("txt_norm.weight");
-            float* d = alloc<float>(allocs_, (int64_t) v.size());
+            float* d = alloc<float>(allocs_, (int64_t) v.size(), "image engine (Mage-Flow DiT)");
             gpu::copy(d, v.data(), v.size() * 4);
             txt_norm_ = d;
         }
@@ -212,10 +184,10 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
             if (!dry_) {
                 const auto wv = st.f32("modulation_down.weight");
                 const auto bv = st.f32("modulation_down.bias");
-                float* dw = alloc<float>(allocs_, (int64_t) wv.size());
+                float* dw = alloc<float>(allocs_, (int64_t) wv.size(), "image engine (Mage-Flow DiT)");
                 gpu::copy(dw, wv.data(), wv.size() * 4);
                 mdown_.d = dw;
-                b_mdown_ = alloc<float>(allocs_, (int64_t) bv.size());
+                b_mdown_ = alloc<float>(allocs_, (int64_t) bv.size(), "image engine (Mage-Flow DiT)");
                 gpu::copy(b_mdown_, bv.data(), bv.size() * 4);
             }
         }
@@ -340,12 +312,12 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
         if (dry_) return true;
         if (!gemm_.init(s_, scratch, err)) return false;
         blocks_stream_.configure(blocks_stream_.total(), s_);   // all resident until a budget is set
-        t16_ = alloc<uint16_t>(allocs_, 256 + 2 * C_);
-        temb_ = alloc<float>(allocs_, C_);
-        mod_i_ = alloc<float>(allocs_, 6 * C_);
-        mod_t_ = alloc<float>(allocs_, 6 * C_);
-        nmod_ = alloc<float>(allocs_, 2 * C_);
-        if (mdown_.n > 0) mlow_ = alloc<float>(allocs_, mdown_.n);
+        t16_ = alloc<uint16_t>(allocs_, 256 + 2 * C_, "image engine (Mage-Flow DiT)");
+        temb_ = alloc<float>(allocs_, C_, "image engine (Mage-Flow DiT)");
+        mod_i_ = alloc<float>(allocs_, 6 * C_, "image engine (Mage-Flow DiT)");
+        mod_t_ = alloc<float>(allocs_, 6 * C_, "image engine (Mage-Flow DiT)");
+        nmod_ = alloc<float>(allocs_, 2 * C_, "image engine (Mage-Flow DiT)");
+        if (mdown_.n > 0) mlow_ = alloc<float>(allocs_, mdown_.n, "image engine (Mage-Flow DiT)");
         return true;
     } catch (const std::exception& e) {
         err = e.what();
@@ -481,7 +453,11 @@ void MfDit::glora_weight(const uint16_t* v, const W& w, const uint8_t* d, int64_
 
 void MfDit::modulation(const uint16_t* tsil, const W& w, const uint8_t* base, float* y, const float* bias) {
     if (w.type == kTypeF32) {
-        f32_vec(reinterpret_cast<const float*>(base + reinterpret_cast<uintptr_t>(w.d)), mlow_, bias, y, w.n, w.k, s_);
+        // the shared F32 MMVF (bf16_gemv.hpp) and the bias as a residual add: the former f32_vec summed strided by
+        // 32 lanes, the MMVF in its tuned order (the same values to rounding; bf16_gemv_parity checks the difference)
+        kernels::f32_gemv_fp32_mmvf(mlow_, reinterpret_cast<const float*>(base + reinterpret_cast<uintptr_t>(w.d)),
+                                    y, w.k, w.n, s_);
+        if (bias != nullptr) kernels::add_inplace(y, bias, w.n, s_, 1.0f);
         return;
     }
     if (w.type != kTypeQ8_0 || w.lora != nullptr) {
@@ -517,50 +493,51 @@ void MfDit::ensure(int64_t hw, int n, int64_t max_text) {
     drop_activations();
     const int64_t R = n * hw, L = n * max_text, X = std::max(R, L), TP = qi_attn_rows(hw + max_text);
     mlp_rows_ = std::max(L, mlp_cap_ > 0 ? std::min(R, mlp_cap_) : R);
-    img_ = alloc<float>(allocs_, R * C_);
-    txt_ = alloc<float>(allocs_, L * C_);
-    q_ = alloc<float>(allocs_, X * C_);
-    k_ = alloc<float>(allocs_, X * C_);
-    v_ = alloc<float>(allocs_, X * C_);
-    a_ = alloc<float>(allocs_, X * C_);
-    tq_ = alloc<float>(allocs_, L * C_);
-    tk_ = alloc<float>(allocs_, L * C_);
-    tv_ = alloc<float>(allocs_, L * C_);
-    rs_ = alloc<float>(allocs_, std::max(X, mlp_rows_));
-    rs2_ = alloc<float>(allocs_, std::max(X, mlp_rows_));
-    rs_io_ = alloc<float>(allocs_, R);
-    rs_to_ = alloc<float>(allocs_, L);
-    hs_ = alloc<float>(allocs_, 2 * heads_);
-    vpart_ = alloc<float>(allocs_, std::max((hw + max_text) * heads_, kColSlices * C_));   // head_max's, col_max's
+    img_ = alloc<float>(allocs_, R * C_, "image engine (Mage-Flow DiT)");
+    txt_ = alloc<float>(allocs_, L * C_, "image engine (Mage-Flow DiT)");
+    q_ = alloc<float>(allocs_, X * C_, "image engine (Mage-Flow DiT)");
+    k_ = alloc<float>(allocs_, X * C_, "image engine (Mage-Flow DiT)");
+    v_ = alloc<float>(allocs_, X * C_, "image engine (Mage-Flow DiT)");
+    a_ = alloc<float>(allocs_, X * C_, "image engine (Mage-Flow DiT)");
+    tq_ = alloc<float>(allocs_, L * C_, "image engine (Mage-Flow DiT)");
+    tk_ = alloc<float>(allocs_, L * C_, "image engine (Mage-Flow DiT)");
+    tv_ = alloc<float>(allocs_, L * C_, "image engine (Mage-Flow DiT)");
+    rs_ = alloc<float>(allocs_, std::max(X, mlp_rows_), "image engine (Mage-Flow DiT)");
+    rs2_ = alloc<float>(allocs_, std::max(X, mlp_rows_), "image engine (Mage-Flow DiT)");
+    rs_io_ = alloc<float>(allocs_, R, "image engine (Mage-Flow DiT)");
+    rs_to_ = alloc<float>(allocs_, L, "image engine (Mage-Flow DiT)");
+    hs_ = alloc<float>(allocs_, 2 * heads_, "image engine (Mage-Flow DiT)");
+    vpart_ = alloc<float>(allocs_, std::max((hw + max_text) * heads_, kColSlices * C_), "image engine (Mage-Flow DiT)");   // head_max's, col_max's
     // the int8 attention's statistics: a context's V scales, K's mean a block and context (zero until a step makes it)
-    vsv_ = alloc<float>(allocs_, C_);
-    kmean_.init(alloc<float>(allocs_, (int64_t) blocks_.size() * 2 * C_), (int64_t) blocks_.size() * 2, C_);
+    vsv_ = alloc<float>(allocs_, C_, "image engine (Mage-Flow DiT)");
+    kmean_.init(alloc<float>(allocs_, (int64_t) blocks_.size() * 2 * C_, "image engine (Mage-Flow DiT)"),
+                (int64_t) blocks_.size() * 2, C_);
     gpu::memset_async(kmean_.buf, 0, (size_t) blocks_.size() * 2 * C_ * 4, s_);
-    gu_ = alloc<float>(allocs_, mlp_rows_ * F_);
-    h16_ = alloc<uint16_t>(allocs_, std::max(X * C_, mlp_rows_ * F_));
+    gu_ = alloc<float>(allocs_, mlp_rows_ * F_, "image engine (Mage-Flow DiT)");
+    h16_ = alloc<uint16_t>(allocs_, std::max(X * C_, mlp_rows_ * F_), "image engine (Mage-Flow DiT)");
     if (w8_) {   // W8A8's int8 input: the most rows of the widest input, then a scale a row
         xq8_rows_ = std::max(X, mlp_rows_);
         xq8_cols_ = std::max(C_, F_);
-        xq8_ = alloc<int8_t>(allocs_, xq8_rows_ * xq8_cols_ + 2 * xq8_rows_ * 4);
+        xq8_ = alloc<int8_t>(allocs_, xq8_rows_ * xq8_cols_ + 2 * xq8_rows_ * 4, "image engine (Mage-Flow DiT)");
     }
-    jq16_ = alloc<uint16_t>(allocs_, n * TP * C_, true);
-    jk16_ = alloc<uint16_t>(allocs_, n * TP * C_, true);
-    jv16_ = alloc<uint16_t>(allocs_, n * TP * C_, true);
-    jo16_ = alloc<uint16_t>(allocs_, TP * C_);
-    io16_ = alloc<uint16_t>(allocs_, R * C_);
-    to16_ = alloc<uint16_t>(allocs_, L * C_);
-    cos_ = alloc<float>(allocs_, hw * hd_ / 2);
-    sin_ = alloc<float>(allocs_, hw * hd_ / 2);
+    jq16_ = alloc<uint16_t>(allocs_, n * TP * C_, "image engine (Mage-Flow DiT)", true);
+    jk16_ = alloc<uint16_t>(allocs_, n * TP * C_, "image engine (Mage-Flow DiT)", true);
+    jv16_ = alloc<uint16_t>(allocs_, n * TP * C_, "image engine (Mage-Flow DiT)", true);
+    jo16_ = alloc<uint16_t>(allocs_, TP * C_, "image engine (Mage-Flow DiT)");
+    io16_ = alloc<uint16_t>(allocs_, R * C_, "image engine (Mage-Flow DiT)");
+    to16_ = alloc<uint16_t>(allocs_, L * C_, "image engine (Mage-Flow DiT)");
+    cos_ = alloc<float>(allocs_, hw * hd_ / 2, "image engine (Mage-Flow DiT)");
+    sin_ = alloc<float>(allocs_, hw * hd_ / 2, "image engine (Mage-Flow DiT)");
     {
         std::vector<float> one((size_t) (max_text * hd_ / 2), 1.f), zero((size_t) (max_text * hd_ / 2), 0.f);
-        cos_id_ = alloc<float>(allocs_, max_text * hd_ / 2);
-        sin_id_ = alloc<float>(allocs_, max_text * hd_ / 2);
+        cos_id_ = alloc<float>(allocs_, max_text * hd_ / 2, "image engine (Mage-Flow DiT)");
+        sin_id_ = alloc<float>(allocs_, max_text * hd_ / 2, "image engine (Mage-Flow DiT)");
         gpu::copy(cos_id_, one.data(), one.size() * 4);
         gpu::copy(sin_id_, zero.data(), zero.size() * 4);
     }
-    b0_img_ = alloc<float>(allocs_, hw * C_);
-    xin_ = alloc<float>(allocs_, hw * in_ch_);
-    b0_txt_ = alloc<float>(allocs_, max_text * C_);
+    b0_img_ = alloc<float>(allocs_, hw * C_, "image engine (Mage-Flow DiT)");
+    xin_ = alloc<float>(allocs_, hw * in_ch_, "image engine (Mage-Flow DiT)");
+    b0_txt_ = alloc<float>(allocs_, max_text * C_, "image engine (Mage-Flow DiT)");
     cap_hw_ = hw;
     cap_n_ = n;
     cap_text_ = max_text;
@@ -639,8 +616,8 @@ void MfDit::lora_scratch(int64_t T) {
             release(allocs_, *p);
             *p = nullptr;
         }
-    lora_f32_ = alloc<float>(allocs_, T * lora_cols_);
-    lora16_ = alloc<uint16_t>(allocs_, T * lora_cols_);
+    lora_f32_ = alloc<float>(allocs_, T * lora_cols_, "image engine (Mage-Flow DiT)");
+    lora16_ = alloc<uint16_t>(allocs_, T * lora_cols_, "image engine (Mage-Flow DiT)");
     lora_tmp_t_ = T;
 }
 
@@ -650,9 +627,9 @@ void MfDit::lora_scratch(int64_t T) {
 void MfDit::lora_glora_scratch() {
     if (lora_glora_cols_ <= 0 || lora_glora_rows_ <= 0) return;
     const size_t band = (size_t) kLoraGloraRows;
-    lora_glora_y_ = alloc<float>(allocs_, (int64_t) (band * (size_t) lora_glora_rows_));
-    lora_glora_x8_ = alloc<int8_t>(allocs_, (int64_t) (band * (size_t) lora_glora_cols_));
-    lora_glora_sx_ = alloc<float>(allocs_, (int64_t) band);
+    lora_glora_y_ = alloc<float>(allocs_, (int64_t) (band * (size_t) lora_glora_rows_), "image engine (Mage-Flow DiT)");
+    lora_glora_x8_ = alloc<int8_t>(allocs_, (int64_t) (band * (size_t) lora_glora_cols_), "image engine (Mage-Flow DiT)");
+    lora_glora_sx_ = alloc<float>(allocs_, (int64_t) band, "image engine (Mage-Flow DiT)");
 }
 
 void MfDit::free_glora_scratch() {
@@ -718,7 +695,7 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                 drop_loras();
                 return false;
             }
-            if (slot->w->type == kTypeF32) {   // MageTrail's low-rank modulation: F32 factors, read by f32_vec
+            if (slot->w->type == kTypeF32) {   // MageTrail's low-rank modulation: F32 factors, read by the F32 MMVF
                 err = "image engine: " + u.file->path() + ": " + e.key +
                       ": the DiT's modulation is the low-rank form (F32, MageTrail's); its adapters are not applied";
                 drop_loras();
@@ -817,8 +794,8 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                     for (const LoraPart& p : w->lora->parts) kr = std::max(kr, w->k * p.entry->rank());
                 }
         if (nk > 0) {
-            bake_tmp_ = alloc<float>(allocs_, nk);
-            bake_at16_ = alloc<uint16_t>(allocs_, kr);
+            bake_tmp_ = alloc<float>(allocs_, nk, "image engine (Mage-Flow DiT)");
+            bake_at16_ = alloc<uint16_t>(allocs_, kr, "image engine (Mage-Flow DiT)");
             baked_any_ = true;
             blocks_stream_.reload();   // the queued work drained before the prepare changes
             install_prepare();
@@ -967,7 +944,7 @@ void MfDit::set_refs(const float* z, const std::vector<std::pair<int64_t, int64_
     int64_t rows = 0;
     for (const auto& [rh, rw] : sizes) rows += rh * rw;
     if (rows == 0) return;
-    refs_ = alloc<float>(allocs_, rows * in_ch_);
+    refs_ = alloc<float>(allocs_, rows * in_ch_, "image engine (Mage-Flow DiT)");
     gpu::copy_async(refs_, z, (size_t) (rows * in_ch_) * 4, s_);
     gpu::stream_sync(s_);
     ref_rows_ = rows;
@@ -993,7 +970,10 @@ void MfDit::time_embedding(float sigma) {
     product(t16_ + 256, nullptr, t2_, nullptr, temb_, 1, b_t2_);
     gpu::copy_async(nmod_, temb_, (size_t) C_ * 4, s_);   // temb kept; its SiLU below
     qi_silu(nmod_, C_, t16_ + 256 + C_, s_);
-    if (mdown_.n > 0) f32_vec(static_cast<const float*>(mdown_.d), nmod_, b_mdown_, mlow_, mdown_.n, mdown_.k, s_);
+    if (mdown_.n > 0) {
+        kernels::f32_gemv_fp32_mmvf(nmod_, static_cast<const float*>(mdown_.d), mlow_, mdown_.k, mdown_.n, s_);
+        kernels::add_inplace(mlow_, b_mdown_, mdown_.n, s_, 1.0f);
+    }
 }
 
 void MfDit::set_context(int i, const float* states, int64_t rows) {
@@ -1003,11 +983,11 @@ void MfDit::set_context(int i, const float* states, int64_t rows) {
     c.txt0 = nullptr;
     c.rows = rows;
     if (rows <= 0) return;
-    float* x = alloc<float>(allocs_, rows * txt_dim_);
-    uint16_t* x16 = alloc<uint16_t>(allocs_, rows * txt_dim_);
+    float* x = alloc<float>(allocs_, rows * txt_dim_, "image engine (Mage-Flow DiT)");
+    uint16_t* x16 = alloc<uint16_t>(allocs_, rows * txt_dim_, "image engine (Mage-Flow DiT)");
     gpu::copy(x, states, (size_t) (rows * txt_dim_) * 4);
     kernels::rms_norm_rows(x, txt_norm_, 1, nullptr, x16, (int) (txt_dim_), (int) (rows), 1e-6f, s_);
-    c.txt0 = alloc<float>(allocs_, rows * C_);
+    c.txt0 = alloc<float>(allocs_, rows * C_, "image engine (Mage-Flow DiT)");
     product(x16, nullptr, txt_in_, nullptr, c.txt0, rows, b_txt_in_);
     gpu::stream_sync(s_);
     release(allocs_, x);

@@ -48,11 +48,16 @@ struct Buffers {
 };
 
 // Pillow's resampling weights (precompute_coeffs) from `in` samples to `out`: each output's first input `lo` and its
-// `k` weights, the filter's support widened by the scale when it shrinks; Lanczos (a = 3), the triangle (bilinear) or
-// the cubic (bicubic, a = -0.5)
+// `k` weights, the filter's support widened by the scale when it shrinks; Lanczos (a = 3), the triangle (bilinear),
+// the cubic (bicubic, a = -0.5) or OpenCV's cubic (cv_cubic, a = -0.75).
+// `w` is what the GPU's passes read: the weights divided by their sum, as floats.  `raw` and `sum` keep the filter's
+// own values and that sum, so a host pass can total its samples in doubles and divide last the way PIL's resample
+// does (pillow_resize_planes); the taps past an output's reach are 0 in both.
 struct Taps {
     std::vector<int32_t> lo;
     std::vector<float> w;
+    std::vector<double> raw;
+    std::vector<double> sum;
     int k = 0;
 };
 
@@ -83,11 +88,14 @@ double cv_cubic(double x) {
 Taps taps(int64_t in, int64_t out, Filter f) {
     const double scale = (double) in / (double) out, fs = std::max(scale, 1.0);
     if (f == Filter::cv_cubic) {
-        // the 4 samples around (x + 0.5) scale - 0.5, an index past an edge taken as the edge's
+        // the 4 samples around (x + 0.5) scale - 0.5, an index past an edge taken as the edge's (its weight
+        // joining the edge's slot, which is what repeating the edge's sample means)
         Taps t;
         t.k = 4;
         t.lo.resize((size_t) out);
         t.w.assign((size_t) (out * t.k), 0.0f);
+        t.raw.assign((size_t) (out * t.k), 0.0);
+        t.sum.assign((size_t) out, 0.0);
         for (int64_t x = 0; x < out; ++x) {
             const double c = ((double) x + 0.5) * scale - 0.5;
             const auto i0 = (int64_t) std::floor(c);
@@ -97,8 +105,11 @@ Taps taps(int64_t in, int64_t out, Filter f) {
             for (int64_t j = 0; j < 4; ++j) {
                 const int64_t at = std::clamp<int64_t>(i0 - 1 + j, 0, in - 1);
                 const int64_t slot = std::clamp<int64_t>(at - lo, 0, 3);
-                t.w[(size_t) (x * 4 + slot)] += (float) cv_cubic(fr + 1.0 - (double) j);
+                const double v = cv_cubic(fr + 1.0 - (double) j);
+                t.w[(size_t) (x * 4 + slot)] += (float) v;
+                t.raw[(size_t) (x * 4 + slot)] += v;
             }
+            for (int64_t j = 0; j < 4; ++j) t.sum[(size_t) x] += t.raw[(size_t) (x * 4 + j)];
         }
         return t;
     }
@@ -107,6 +118,8 @@ Taps taps(int64_t in, int64_t out, Filter f) {
     t.k = (int) std::ceil(support) * 2 + 1;
     t.lo.resize((size_t) out);
     t.w.assign((size_t) (out * t.k), 0.0f);
+    t.raw.assign((size_t) (out * t.k), 0.0);
+    t.sum.assign((size_t) out, 0.0);
     std::vector<double> ww((size_t) t.k);
     for (int64_t x = 0; x < out; ++x) {
         const double center = ((double) x + 0.5) * scale;
@@ -123,8 +136,11 @@ Taps taps(int64_t in, int64_t out, Filter f) {
             sum += v;
         }
         t.lo[(size_t) x] = (int32_t) lo;
-        for (int64_t j = 0; j < hi - lo; ++j)
+        t.sum[(size_t) x] = sum;
+        for (int64_t j = 0; j < hi - lo; ++j) {
+            t.raw[(size_t) (x * t.k + j)] = ww[(size_t) j];
             t.w[(size_t) (x * t.k + j)] = (float) (sum != 0.0 ? ww[(size_t) j] / sum : 0.0);
+        }
     }
     return t;
 }
@@ -372,6 +388,49 @@ QiRef pillow_resize(const QiRef& src, int64_t w, int64_t h, Filter filter) {
     r.rgba.resize((size_t) (4 * w * h));
     gpu::copy(r.rgba.data(), out, r.rgba.size());
     return r;
+}
+
+namespace {
+
+// one axis of Pillow's resample on the host: each of the `n_out` outputs the double total of its taps over `lines`
+// rows of `n_in` samples (`stride_in` apart, the rows `stride_line` apart), divided by the taps' sum and rounded to a
+// whole byte, as PIL's resample does and as the GPU's rows' pass is (its columns' pass clips to the same bounds).
+// The taps past an output's reach are 0 and are skipped; an index past an edge is the edge's, as rows_rgba8's and
+// columns' take it.
+void resize_axis_host(const float* src, int64_t lines, int64_t n_in, int64_t stride_line, int64_t stride_in,
+                      int64_t n_out, const Taps& t, float* dst, int64_t dst_line, int64_t dst_out) {
+    for (int64_t o = 0; o < n_out; ++o) {
+        const double sum = t.sum[(size_t) o];
+        const int64_t lo = t.lo[(size_t) o];
+        for (int64_t l = 0; l < lines; ++l) {
+            double v = 0.0;
+            for (int j = 0; j < t.k; ++j) {
+                const double c = t.raw[(size_t) (o * t.k + j)];
+                if (c == 0.0) continue;
+                const int64_t i = std::clamp<int64_t>(lo + j, (int64_t) 0, n_in - 1);
+                v += c * (double) src[(size_t) (l * stride_line + i * stride_in)];
+            }
+            dst[(size_t) (l * dst_line + o * dst_out)] =
+                (float) std::clamp(sum != 0.0 ? std::nearbyint(v / sum) : 0.0, 0.0, 255.0);
+        }
+    }
+}
+
+}  // namespace
+
+std::vector<float> pillow_resize_planes(const std::vector<float>& planes, int64_t c, int64_t w, int64_t h, int64_t w2,
+                                        int64_t h2, Filter filter) {
+    if (c <= 0 || w <= 0 || h <= 0 || w2 <= 0 || h2 <= 0 || planes.size() != (size_t) (c * w * h))
+        throw std::invalid_argument("image engine: a resize of an empty image, or to no size");
+    if (w == w2 && h == h2) return planes;
+    std::vector<float> mid((size_t) (c * h * w2)), out((size_t) (c * h2 * w2));
+    const Taps tx = taps(w, w2, filter);
+    resize_axis_host(planes.data(), c * h, w, w, 1, w2, tx, mid.data(), w2, 1);
+    const Taps ty = taps(h, h2, filter);
+    for (int64_t ch = 0; ch < c; ++ch)   // the columns' pass, one plane at a time: its rows are w2 apart
+        resize_axis_host(mid.data() + (size_t) (ch * h * w2), w2, h, 1, w2, h2, ty,
+                         out.data() + (size_t) (ch * h2 * w2), 1, w2);
+    return out;
 }
 
 CropBox parse_crop(const std::string& word) {

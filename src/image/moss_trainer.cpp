@@ -9,7 +9,7 @@
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/qi_stream.hpp"
 #include "strata/image/safetensors.hpp"
-#include "strata/image/mapped_file.hpp"
+#include "strata/platform/mapped_file.hpp"
 
 #include "strata/core/gpu.hpp"
 #include "strata/platform/env.hpp"
@@ -255,7 +255,7 @@ namespace {
 // the DiT's shards: a name looked up in each
 struct Shards {
     std::vector<std::unique_ptr<SafeTensors>> st;
-    std::vector<std::unique_ptr<MappedFile>> mf;
+    std::vector<std::unique_ptr<platform::MappedFile>> mf;
     explicit Shards(const std::string& path) {
         std::vector<std::string> files;
         if (std::filesystem::is_directory(path)) {
@@ -268,7 +268,7 @@ struct Shards {
         if (files.empty()) throw std::runtime_error(path + ": no safetensors");
         for (const std::string& f : files) {
             st.push_back(std::make_unique<SafeTensors>(f));
-            mf.push_back(std::make_unique<MappedFile>(f));
+            mf.push_back(std::make_unique<platform::MappedFile>(f));
         }
     }
     int at(const std::string& name) const {

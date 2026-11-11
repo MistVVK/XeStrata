@@ -41,6 +41,7 @@ struct QiRequest {
     int64_t width = 1024, height = 1024;   // multiples of 16
     uint64_t seed = 0;
     std::vector<float> sigmas;  // empty: the model's default (its Turbo's steps)
+    bool base_schedule = false; // SCHED:base: Qwen-Image's base schedule (qi_base_sigmas), not the Turbo's
     int64_t steps = 0;          // with no sigmas: the sampler's steps (0: the model's own).  HunyuanImage 3.0's
                                 // schedule is the shift of its own sampler; a fixed-schedule model leaves this.
     std::vector<QiRef> refs;    // an edit's reference images, in the order of their pads
@@ -178,6 +179,23 @@ public:
     virtual QiNeed need(int64_t n_text, int64_t width, int64_t height,
                         const std::vector<std::pair<int64_t, int64_t>>& refs = {}, bool mask = false,
                         int64_t n_neg = 0, const std::vector<LoraUse>& loras = {}) = 0;
+    /// Request features supported by this pipeline.
+    virtual bool takes_loras() const { return false; }
+    virtual bool takes_guidance() const { return false; }
+    virtual bool takes_control_net() const { return false; }
+    virtual bool takes_moss_options() const { return false; }
+    virtual const char* no_loras_message() const { return "image engine: this image model's DiT takes no adapters"; }
+    /// Extra inputs used when estimating a request, reset by the caller after need().
+    virtual void set_need_context(bool, const std::vector<std::pair<int64_t, int64_t>>&, QiRefLayout) {}
+    virtual std::pair<uint64_t, uint64_t> control_need(const std::string&, int64_t, int64_t) {
+        throw std::invalid_argument("image engine: ControlNet is Qwen-Image-2.1's only");
+    }
+    /// Logits of the last size choice, if the model reports them.
+    virtual const std::vector<double>& ratio_logits() const {
+        static const std::vector<double> empty;
+        return empty;
+    }
+
     /// The request `serve` warms the engine up with.  The default is the generic one (a plain token-id ramp at
     /// 256 x 256, one step), which the models whose DiT reads any ids take; a model whose sequence must carry its
     /// image block's markers (HunyuanImage 3.0) fills `r` with a sequence of its own and returns true.

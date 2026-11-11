@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/image/qi_pipeline.cpp - see include/strata/image/qi_pipeline.hpp.
 
+#include "sigmas.hpp"
 #include "strata/image/qi_pipeline.hpp"
 
 #include "strata/core/gpu.hpp"
@@ -343,7 +344,8 @@ void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::v
                            std::vector<float*>& ref_z, std::vector<int32_t>& neg_ids,
                            std::vector<TextEncoder::Picture>& neg_te, std::vector<QiDit::Ref>& neg_refs, bool vision) {
     if (vision_path_.empty()) throw std::invalid_argument("image engine: an edit needs the vision encoder (--vision)");
-    if (std::count(r.ids.begin(), r.ids.end(), kImagePad) != (int64_t) r.refs.size())
+    const int32_t pad = te_size_->image_pad();   // the <|image_pad|> token, from the text encoder's vocabulary
+    if (std::count(r.ids.begin(), r.ids.end(), pad) != (int64_t) r.refs.size())
         throw std::invalid_argument("image engine: the prompt's image pads and the reference images differ in number");
     // room for the vision encoder and the VAE's encoder: the cache gives way when the budget is short of them
     std::vector<std::pair<int64_t, int64_t>> sizes;
@@ -375,21 +377,14 @@ void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::v
             throw std::invalid_argument("image engine: a reference image is empty");
         int64_t rw = 0, rh = 0;
         qi_ref_size(f.width, f.height, rw, rh);
-        // resized as stable-diffusion.cpp resizes it (nearest), 0 .. 1; the vision encoder's input over white (neither
-        // needed for kept states and a kept latent)
+        // resized as stable-diffusion.cpp resizes it (nearest): the VAE's input its 0 .. 1 as the file has it, the
+        // vision encoder's input over white in -1 .. 1 (neither needed for kept states and a kept latent)
         std::vector<float> rgba, rgb;
         if (vision || !same) {
-            rgba.resize((size_t) (4 * rh * rw));
-            rgb.resize((size_t) (3 * rh * rw));
+            const std::vector<uint8_t> px = resize_nearest(f, rw, rh);
+            rgba = image_planes(px, rw, rh, 4, PlaneAlpha::Keep, PlaneRange::Unit);
+            rgb = image_planes(px, rw, rh, 3, PlaneAlpha::WhiteUnit, PlaneRange::Signed);
         }
-        for (int64_t y = 0; y < (vision || !same ? rh : 0); ++y)
-            for (int64_t x = 0; x < rw; ++x) {
-                const uint8_t* px = f.rgba.data() + ((y * f.height / rh) * f.width + x * f.width / rw) * 4;
-                const float a = (float) px[3] / 255.f;
-                for (int c = 0; c < 4; ++c) rgba[(size_t) ((c * rh + y) * rw + x)] = (float) px[c] / 255.f;
-                for (int c = 0; c < 3; ++c)
-                    rgb[(size_t) ((c * rh + y) * rw + x)] = 2.f * ((float) px[c] / 255.f * a + 1.f - a) - 1.f;
-            }
         if (vision) {
             vouts.push_back(vision_->encode(rgb.data(), rw, rh));
         } else {   // the kept states' references: their vision outputs' shapes only (no rows: the text is not encoded)
@@ -436,7 +431,7 @@ void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::v
                      std::vector<QiDit::Ref>& refs) {
         size_t k = 0;
         for (const int32_t id : src) {
-            if (id != kImagePad) {
+            if (id != pad) {
                 out.push_back(id);
                 continue;
             }
@@ -457,7 +452,7 @@ void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::v
             f.h = grids[k].second / 16;
             f.latent = ref_z[k];
             refs.push_back(f);
-            out.insert(out.end(), (size_t) v.rows, kImagePad);
+            out.insert(out.end(), (size_t) v.rows, pad);
             ++k;
         }
     };
@@ -491,7 +486,10 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
                                     "a reference)");
     if (mask && r.mask.rgba.size() != (size_t) (r.mask.width * r.mask.height * 4))
         throw std::invalid_argument("image engine: the mask is empty");
-    const std::vector<float> sigmas = strength_sigmas(r.sigmas.empty() ? turbo_sigmas() : r.sigmas, r.strength);
+    const std::vector<float> sigmas = strength_sigmas(
+        r.sigmas.empty() ? (r.base_schedule && r.steps > 0 ? qi_base_sigmas((int) r.steps, r.width, r.height)
+                                                           : turbo_sigmas())
+                         : r.sigmas, r.strength);
     LatentStart ls;
     const bool guided = r.cfg > 1.0f && !r.neg_ids.empty();
     std::vector<int32_t> neg_ids;   // an edit's negative prompt, its pads widened
@@ -667,18 +665,7 @@ void QiPipeline::encode_base(const QiRequest& r, const QiRef& base, LatentStart&
         return;
     }
     const std::vector<uint8_t> px = resize_nearest(base, r.width, r.height);
-    const int64_t HW = r.width * r.height;
-    std::vector<float> rgba((size_t) (4 * HW));
-    for (int64_t q = 0; q < HW; ++q)
-        for (int c = 0; c < 4; ++c) rgba[(size_t) (c * HW + q)] = (float) px[(size_t) (q * 4 + c)] / 255.f;
-    float* d = nullptr;
-    if (!gpu::alloc_device(&d, rgba.size() * 4))
-        throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
-    gpu::copy(d, rgba.data(), rgba.size() * 4);
-    const bool ok = vae_->encode(d, r.height, r.width, z0);
-    gpu::free(d);
-    vae_->drop_scratch();
-    if (!ok) throw std::runtime_error("image engine: the VAE's encoder failed on the base image");
+    encode_px(px, r.width, r.height, z0, "the base image");
     // kept for the next request of the same image (1 MiB at 1024 x 1024); without the room, not kept
     if (kept_.base_z != nullptr) gpu::free(kept_.base_z);
     kept_.base_z = nullptr;
@@ -689,11 +676,8 @@ void QiPipeline::encode_base(const QiRequest& r, const QiRef& base, LatentStart&
     }
 }
 
-void QiPipeline::encode_px(const std::vector<uint8_t>& px, int64_t w, int64_t h, float* z) {
-    const int64_t HW = w * h;
-    std::vector<float> rgba((size_t) (4 * HW));
-    for (int64_t q = 0; q < HW; ++q)
-        for (int c = 0; c < 4; ++c) rgba[(size_t) (c * HW + q)] = (float) px[(size_t) (q * 4 + c)] / 255.f;
+void QiPipeline::encode_px(const std::vector<uint8_t>& px, int64_t w, int64_t h, float* z, const char* what) {
+    const std::vector<float> rgba = image_planes(px, w, h, 4, PlaneAlpha::Keep, PlaneRange::Unit);
     float* d = nullptr;
     if (!gpu::alloc_device(&d, rgba.size() * 4))
         throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
@@ -701,7 +685,7 @@ void QiPipeline::encode_px(const std::vector<uint8_t>& px, int64_t w, int64_t h,
     const bool ok = vae_->encode(d, h, w, z);
     gpu::free(d);
     vae_->drop_scratch();
-    if (!ok) throw std::runtime_error("image engine: the VAE's encoder failed on a ControlNet image");
+    if (!ok) throw std::runtime_error(std::string("image engine: the VAE's encoder failed on ") + what);
 }
 
 void QiPipeline::use_control(const QiRequest& r) {
@@ -745,7 +729,8 @@ void QiPipeline::use_control(const QiRequest& r) {
         }
     } free_cond{cond, s_};
     gpu::memset(cond, 0, (size_t) ((2 * ch + 1) * hw) * 4);
-    if (!r.control.rgba.empty()) encode_px(control_resize(r.control, r.width, r.height), r.width, r.height, cond);
+    if (!r.control.rgba.empty())
+        encode_px(control_resize(r.control, r.width, r.height), r.width, r.height, cond, "a ControlNet image");
     if (mask) {
         const QiRef* base = base_image(r);
         if (base == nullptr) throw std::invalid_argument("image engine: a mask through ControlNet needs a base image");
@@ -761,7 +746,7 @@ void QiPipeline::use_control(const QiRequest& r) {
                               pxx = std::min<int64_t>(r.width - 1, (x * r.width) / w);
                 keep[(size_t) (y * w + x)] = 255 - (int) m[(size_t) ((py * r.width + pxx) * 4 + 3)] >= 128 ? 0.f : 1.f;
             }
-        encode_px(px, r.width, r.height, cond + (ch + 1) * hw);
+        encode_px(px, r.width, r.height, cond + (ch + 1) * hw, "a ControlNet image");
     }
     gpu::copy(cond + ch * hw, keep.data(), keep.size() * 4);
     control_->set_input(cond, h, w, r.control_strength, r.control_sigma_lo, r.control_sigma_hi);

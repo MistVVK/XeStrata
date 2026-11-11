@@ -202,6 +202,8 @@
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/stdin_lines.hpp"
+#include "strata/program/id_list.hpp"
 #include "strata/image/anima_pipeline.hpp"
 #include "strata/image/birefnet.hpp"
 #include "strata/image/florence2.hpp"
@@ -255,11 +257,9 @@ namespace si = strata::image;
 namespace su = strata::upscale;
 
 std::vector<int32_t> parse_ids(const std::string& s) {
-    std::vector<int32_t> ids;
-    std::stringstream ss(s);
-    for (std::string tok; std::getline(ss, tok, ',');)
-        if (!tok.empty()) ids.push_back((int32_t) std::stol(tok));
-    return ids;
+    std::vector<int64_t> ids;
+    strata::program::parse_id_list(s, ids, strata::program::IdListForm::Image);   // stol's exceptions, as before
+    return std::vector<int32_t>(ids.begin(), ids.end());
 }
 
 std::vector<float> parse_floats(const std::string& s) {
@@ -376,123 +376,264 @@ void read_lora(const std::string& word, si::QiRequest& r, Loras& loras) {
     r.loras.push_back({loras.get(decoded_path(path)), s});
 }
 
-// the words left on an IMG line: its REF:<path> images (and SIGMAS:, MASK:, INIT:, STRENGTH:...); CROP: sets `crop`
-// (null: refused)
+// How a line reads the words it carries: an IMG line's and the command line's take the images themselves, a NEED
+// line's takes their sizes alone (its estimate reads a REF:'s header, never its pixels).
+enum class WordHow { Take, Size };
+
+// One reading of the words an IMG line, a NEED line and the command line all carry (they were three): each word it
+// knows sets the same field of `r`, or the caller's own below.  `crop` is where CROP:'s box goes, null where the line
+// has no place for one - and then CROP: is not that line's word, as a RATIO line's reading had it ("unknown word
+// CROP:...").  The rest is a NEED line's own: `sizes` the REF:'s, `pictures` the PIC:'s (what set_need_context
+// takes), `mask` and `init` whether it has a base image, `n_neg` guidance's negative prompt's ids, `states` whether
+// TE: or NEGTE: named the chat engine's states.  `loras` holds the adapters' files: the serve engine's one set, the
+// command line's own for --lora.
+struct WordRead {
+    WordRead(si::QiRequest& req, Loras& files, WordHow reads = WordHow::Take, std::optional<si::CropBox>* box = nullptr)
+        : r(req), loras(files), how(reads), crop(box) {}
+    si::QiRequest& r;
+    Loras& loras;
+    WordHow how;
+    std::optional<si::CropBox>* crop;
+    std::vector<si::QiRef> refs;
+    std::vector<std::pair<int64_t, int64_t>> sizes, pictures;
+    bool mask = false, init = false, states = false;
+    int64_t n_neg = 0;
+};
+
+// One word of `t`: false when it is not that reading's word (each caller words a misread its own way, as it did when
+// the readings were split).  A value it cannot read throws, from the same parser as before.
+bool read_word(const std::string& w, WordRead& t) {
+    si::QiRequest& r = t.r;
+    const bool size = t.how == WordHow::Size;
+    // both readings set these the same way
+    if (w.rfind("LORA:", 0) == 0) {
+        read_lora(w, r, t.loras);
+        return true;
+    }
+    if (w.rfind("EDITFMT:", 0) == 0) {
+        r.refs_layout = ref_layout(w);
+        return true;
+    }
+    if (w.rfind("UPS:", 0) == 0) {
+        r.upscaler = w.substr(4);
+        return true;
+    }
+    if (w.rfind("UPSCOLOR:", 0) == 0) {
+        r.upscaler_color = w.substr(9);
+        return true;
+    }
+    if (w.rfind("CNET:", 0) == 0) {   // the ControlNet branch (QiPipeline::control_need)
+        r.control_net = decoded_path(w.substr(5));
+        return true;
+    }
+    if (w.rfind("CROP:", 0) == 0) {
+        if (t.crop == nullptr) return false;   // a line with no place for one: not its word
+        *t.crop = si::parse_crop(w);
+        return true;
+    }
+    // an image word: the image itself, or a NEED line's size of it
+    if (w.rfind("REF:", 0) == 0) {
+        if (size) {
+            int64_t wd = 0, ht = 0;
+            if (!si::image_size(w.substr(4), wd, ht)) throw std::invalid_argument("not an image: " + w);
+            t.sizes.emplace_back(wd, ht);
+        } else {
+            t.refs.push_back(read_image(w.substr(4)));
+        }
+        return true;
+    }
+    if (w.rfind("PIC:", 0) == 0) {
+        if (size) {   // the text encoder's pictures (MossPipeline::set_pictures_given)
+            int64_t wd = 0, ht = 0;
+            if (!si::image_size(w.substr(4), wd, ht)) throw std::invalid_argument("not an image: " + w);
+            t.pictures.emplace_back(wd, ht);
+        } else {
+            r.pictures.push_back(read_image(w.substr(4)));
+        }
+        return true;
+    }
+    if (w.rfind("MASK:", 0) == 0) {
+        if (size) t.mask = true;
+        else r.mask = read_image(w.substr(5));
+        return true;
+    }
+    if (w.rfind("INIT:", 0) == 0) {
+        if (size) {
+            t.mask = true;
+            t.init = true;
+        } else {
+            r.init = read_image(w.substr(5));
+        }
+        return true;
+    }
+    if (w.rfind("TE:", 0) == 0) {
+        if (size) t.states = true;
+        else read_states(w.substr(3), r.te, r.te_rows);
+        return true;
+    }
+    if (w.rfind("NEGTE:", 0) == 0) {
+        if (size) t.states = true;
+        else read_states(w.substr(6), r.neg_te, r.neg_te_rows);
+        return true;
+    }
+    if (w.rfind("NEG:", 0) == 0) {
+        if (size) t.n_neg = std::stoll(w.substr(4));   // guidance's negative prompt of n ids
+        else r.neg_ids = parse_ids(w.substr(4));
+        return true;
+    }
+    if (size) {
+        // present is all a NEED line reads of these: the IMG line reads their values (and checks them)
+        if (w.rfind("COLOR:", 0) == 0 || w == "UPSCALE" || w.rfind("TILES:", 0) == 0 || w.rfind("CTRL:", 0) == 0 ||
+            w.rfind("CTRLS:", 0) == 0 || w == "CTRLNOINPAINT" || w.rfind("MCTL:", 0) == 0 ||
+            w.rfind("MCOLOR:", 0) == 0 || w.rfind("MDEPTH:", 0) == 0 || w.rfind("MCTLENDS:", 0) == 0 ||
+            w.rfind("TIMEPATH:", 0) == 0 || w.rfind("DATASPACE:", 0) == 0)
+            return true;
+        if (w.rfind("UPSIN:", 0) == 0) {
+            const std::vector<int32_t> v = parse_ids(w.substr(6));
+            if ((v.size() != 2 && v.size() != 4) || std::any_of(v.begin(), v.end(), [](int32_t x) { return x <= 0; }))
+                throw std::invalid_argument("UPSIN:<width>,<height>[,<out width>,<out height>]: " + w);
+            r.init.width = v[0];   // only its size: the base image an upscale starts from
+            r.init.height = v[1];
+            if (v.size() == 4) {   // the upscale's own size, past the drawing's (TILES:)
+                r.upscale = true;
+                r.width = v[2];
+                r.height = v[3];
+            }
+            return true;
+        }
+        return false;   // an IMG line's word: the NEED line's reader says "not an image: ..."
+    }
+    // the IMG line's and the command line's own words
+    if (w.rfind("SIGMAS:", 0) == 0) r.sigmas = parse_sigmas(w.substr(7));
+    else if (w == "UPSCALE") r.upscale = true;
+    else if (w.rfind("TILES:", 0) == 0) {
+        const std::vector<int32_t> v = parse_ids(w.substr(6));
+        if (v.size() != 3 || v[0] < 256 || v[1] < 0 || v[2] < 0)
+            throw std::invalid_argument("TILES:<tile>,<pad>,<blur> (tile 256 or more): " + w);
+        r.tile = v[0];
+        r.tile_pad = v[1];
+        r.tile_blur = v[2];
+    }
+    else if (w.rfind("COLOR:", 0) == 0) {
+        const std::string m = w.substr(6);
+        if (m != "off" && m != "auto" && m != "full") throw std::invalid_argument("COLOR:off|auto|full: " + w);
+        r.crop_color = m == "auto" ? 1 : m == "full" ? 2 : 0;
+    }
+    else if (w.rfind("STRENGTH:", 0) == 0) r.strength = std::stod(w.substr(9));
+    else if (w.rfind("CFG:", 0) == 0) r.cfg = std::stof(w.substr(4));
+    else if (w.rfind("GUID:", 0) == 0) r.guidance = std::stof(w.substr(5));
+    else if (w.rfind("STEPS:", 0) == 0) r.steps = std::stoll(w.substr(6));
+    else if (w.rfind("PREVIEW:", 0) == 0)
+        for (const int64_t k : parse_ids(w.substr(8))) r.preview.push_back((int) k);
+    else if (w.rfind("SHIFT:", 0) == 0) r.shift = std::stof(w.substr(6));
+    else if (w.rfind("USKIP:", 0) == 0) {
+        r.uncond_skip = parse_blocks(w.substr(6));
+        r.uncond_skip_set = true;
+    }
+    else if (w.rfind("SLG:", 0) == 0) r.slg_layers = parse_blocks(w.substr(4));
+    else if (w.rfind("SLGSCALE:", 0) == 0) r.slg_scale = std::stof(w.substr(9));
+    else if (w.rfind("SLGSTART:", 0) == 0) r.slg_start = std::stof(w.substr(9));
+    else if (w.rfind("SLGSTOP:", 0) == 0) r.slg_stop = std::stof(w.substr(8));
+    else if (w.rfind("SCHED:", 0) == 0) r.base_schedule = w.substr(6) == "base";
+    else if (w.rfind("T5:", 0) == 0) r.t5_ids = parse_ids(w.substr(3));
+    else if (w.rfind("T5W:", 0) == 0) r.t5_weights = parse_floats(w.substr(4));
+    else if (w.rfind("NEGT5:", 0) == 0) r.neg_t5_ids = parse_ids(w.substr(6));
+    else if (w.rfind("NEGT5W:", 0) == 0) r.neg_t5_weights = parse_floats(w.substr(7));
+    else if (w.rfind("SAMPLER:", 0) == 0) r.sampler = w.substr(8);
+    else if (w.rfind("CFGNORM:", 0) == 0) r.guide.cfgnorm = std::stof(w.substr(8));
+    else if (w == "CFGZERO") r.guide.zero_star = true;
+    else if (w.rfind("APG:", 0) == 0) {
+        const std::vector<float> v = parse_floats(w.substr(4));
+        if (v.size() != 3) throw std::invalid_argument("APG:<eta>,<norm_threshold>,<momentum>: " + w);
+        r.guide.apg = true;
+        r.guide.apg_eta = v[0];
+        r.guide.apg_norm_threshold = v[1];
+        r.guide.apg_momentum = v[2];
+    }
+    else if (w.rfind("DSLG:", 0) == 0) r.guide.slg_layers = parse_blocks(w.substr(5));
+    else if (w.rfind("DSLGP:", 0) == 0) {
+        const std::vector<float> v = parse_floats(w.substr(6));
+        if (v.size() != 4)
+            throw std::invalid_argument("DSLGP:<scale>,<sigma_start>,<sigma_end>,<rescaling_scale>: " + w);
+        r.guide.slg_scale = v[0];
+        r.guide.slg_sigma_start = v[1];
+        r.guide.slg_sigma_end = v[2];
+        r.guide.slg_rescale = v[3];
+    }
+    else if (w.rfind("DD:", 0) == 0) {
+        const std::vector<float> v = parse_floats(w.substr(3));
+        if (v.size() != 10)
+            throw std::invalid_argument("DD:<amount>,<start>,<end>,<bias>,<exponent>,<start_offset>,<end_offset>,"
+                                        "<fade>,<smooth 0|1>,<cfg_scale_override>: " + w);
+        si::GuidanceSpec& g = r.guide;
+        g.dd = true;
+        g.dd_amount = v[0];
+        g.dd_start = v[1];
+        g.dd_end = v[2];
+        g.dd_bias = v[3];
+        g.dd_exponent = v[4];
+        g.dd_start_offset = v[5];
+        g.dd_end_offset = v[6];
+        g.dd_fade = v[7];
+        g.dd_smooth = v[8] != 0.0f;
+        g.dd_cfg = v[9];
+    }
+    else if (w.rfind("CTRL:", 0) == 0) r.control = read_image(decoded_path(w.substr(5)));
+    else if (w.rfind("CTRLS:", 0) == 0) {
+        const auto v = parse_floats(w.substr(6));
+        if (v.size() != 3 || !(v[2] >= 0.0f && v[2] <= v[1] && v[1] <= 1.0f) || !std::isfinite(v[0]))
+            throw std::invalid_argument("CTRLS:<strength>,<sigma from>,<sigma to>: 0 <= to <= from <= 1: " + w);
+        r.control_strength = v[0];
+        r.control_sigma_hi = v[1];
+        r.control_sigma_lo = v[2];
+    }
+    else if (w == "CTRLNOINPAINT") r.control_inpaint = false;
+    else if (w.rfind("MCTL:", 0) == 0) r.mctl = decoded_path(w.substr(5));
+    else if (w.rfind("TIMEPATH:", 0) == 0) r.time_path = decoded_path(w.substr(9));
+    else if (w.rfind("DATASPACE:", 0) == 0) r.dataspace = decoded_path(w.substr(10));
+    else if (w.rfind("MCOLOR:", 0) == 0) r.mctl_color = read_image(decoded_path(w.substr(7)));
+    else if (w.rfind("MDEPTH:", 0) == 0) r.mctl_depth = read_image(decoded_path(w.substr(7)));
+    else if (w.rfind("MCTLENDS:", 0) == 0) {
+        const auto v = parse_floats(w.substr(9));
+        if (v.size() != 2 || !(v[0] >= 0.0f && v[0] <= 1.0f && v[1] >= 0.0f && v[1] <= 1.0f))
+            throw std::invalid_argument("MCTLENDS:<color end>,<depth end>: each 0 .. 1: " + w);
+        r.mctl_color_end = v[0];
+        r.mctl_depth_end = v[1];
+    }
+    else return false;
+    return true;
+}
+
+// The command line's options that are the IMG line's words: --steps 8 reads as the word STEPS:8, through the same
+// reader.  The rest of the options (a model's file, the output, the prompt's ids, width, height, seed and drop, which
+// the line carries in its header rather than as words) are the command line's own.
+bool cli_word(const std::string& a, std::string& word) {
+    static const std::pair<const char*, const char*> same[] = {
+        {"--mask", "MASK:"},           {"--init", "INIT:"},          {"--strength", "STRENGTH:"},
+        {"--neg-ids", "NEG:"},         {"--cfg", "CFG:"},            {"--sigmas", "SIGMAS:"},
+        {"--steps", "STEPS:"},         {"--guidance", "GUID:"},      {"--shift", "SHIFT:"},
+        {"--uncond-skip", "USKIP:"},   {"--slg-layers", "SLG:"},     {"--slg-scale", "SLGSCALE:"},
+        {"--slg-start", "SLGSTART:"},  {"--slg-stop", "SLGSTOP:"},   {"--sched", "SCHED:"},   {"--t5", "T5:"},
+        {"--t5-weights", "T5W:"},      {"--neg-t5", "NEGT5:"},       {"--neg-t5-weights", "NEGT5W:"},
+        {"--sampler", "SAMPLER:"},     {"--lora", "LORA:"},          {"--te", "TE:"},
+        {"--neg-te", "NEGTE:"},
+    };
+    for (const auto& [opt, w] : same)
+        if (a == opt) {
+            word = w;
+            return true;
+        }
+    return false;
+}
+
+// An IMG line's words (and a RATIO line's): its REF:<path> images (and SIGMAS:, MASK:, INIT:, STRENGTH:...); CROP:
+// sets `crop` (null: refused)
 std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r, Loras& loras,
                                  std::optional<si::CropBox>* crop = nullptr) {
-    std::vector<si::QiRef> refs;
-    for (std::string word; ls >> word;) {
-        if (word.rfind("SIGMAS:", 0) == 0) r.sigmas = parse_sigmas(word.substr(7));
-        else if (word.rfind("CROP:", 0) == 0 && crop != nullptr) *crop = si::parse_crop(word);
-        else if (word.rfind("PIC:", 0) == 0) r.pictures.push_back(read_image(word.substr(4)));
-        else if (word.rfind("EDITFMT:", 0) == 0) r.refs_layout = ref_layout(word);
-        else if (word == "UPSCALE") r.upscale = true;
-        else if (word.rfind("UPS:", 0) == 0) r.upscaler = word.substr(4);
-        else if (word.rfind("UPSCOLOR:", 0) == 0) r.upscaler_color = word.substr(9);
-        else if (word.rfind("TILES:", 0) == 0) {
-            const std::vector<int32_t> v = parse_ids(word.substr(6));
-            if (v.size() != 3 || v[0] < 256 || v[1] < 0 || v[2] < 0)
-                throw std::invalid_argument("TILES:<tile>,<pad>,<blur> (tile 256 or more): " + word);
-            r.tile = v[0];
-            r.tile_pad = v[1];
-            r.tile_blur = v[2];
-        }
-        else if (word.rfind("COLOR:", 0) == 0) {
-            const std::string m = word.substr(6);
-            if (m != "off" && m != "auto" && m != "full") throw std::invalid_argument("COLOR:off|auto|full: " + word);
-            r.crop_color = m == "auto" ? 1 : m == "full" ? 2 : 0;
-        }
-        else if (word.rfind("MASK:", 0) == 0) r.mask = read_image(word.substr(5));
-        else if (word.rfind("INIT:", 0) == 0) r.init = read_image(word.substr(5));
-        else if (word.rfind("STRENGTH:", 0) == 0) r.strength = std::stod(word.substr(9));
-        else if (word.rfind("NEG:", 0) == 0) r.neg_ids = parse_ids(word.substr(4));
-        else if (word.rfind("CFG:", 0) == 0) r.cfg = std::stof(word.substr(4));
-        else if (word.rfind("GUID:", 0) == 0) r.guidance = std::stof(word.substr(5));
-        else if (word.rfind("STEPS:", 0) == 0) r.steps = std::stoll(word.substr(6));
-        else if (word.rfind("PREVIEW:", 0) == 0)
-            for (const int64_t k : parse_ids(word.substr(8))) r.preview.push_back((int) k);
-        else if (word.rfind("SHIFT:", 0) == 0) r.shift = std::stof(word.substr(6));
-        else if (word.rfind("USKIP:", 0) == 0) {
-            r.uncond_skip = parse_blocks(word.substr(6));
-            r.uncond_skip_set = true;
-        }
-        else if (word.rfind("SLG:", 0) == 0) r.slg_layers = parse_blocks(word.substr(4));
-        else if (word.rfind("SLGSCALE:", 0) == 0) r.slg_scale = std::stof(word.substr(9));
-        else if (word.rfind("SLGSTART:", 0) == 0) r.slg_start = std::stof(word.substr(9));
-        else if (word.rfind("SLGSTOP:", 0) == 0) r.slg_stop = std::stof(word.substr(8));
-        else if (word.rfind("T5:", 0) == 0) r.t5_ids = parse_ids(word.substr(3));
-        else if (word.rfind("T5W:", 0) == 0) r.t5_weights = parse_floats(word.substr(4));
-        else if (word.rfind("NEGT5:", 0) == 0) r.neg_t5_ids = parse_ids(word.substr(6));
-        else if (word.rfind("NEGT5W:", 0) == 0) r.neg_t5_weights = parse_floats(word.substr(7));
-        else if (word.rfind("SAMPLER:", 0) == 0) r.sampler = word.substr(8);
-        else if (word.rfind("CFGNORM:", 0) == 0) r.guide.cfgnorm = std::stof(word.substr(8));
-        else if (word == "CFGZERO") r.guide.zero_star = true;
-        else if (word.rfind("APG:", 0) == 0) {
-            const std::vector<float> v = parse_floats(word.substr(4));
-            if (v.size() != 3) throw std::invalid_argument("APG:<eta>,<norm_threshold>,<momentum>: " + word);
-            r.guide.apg = true;
-            r.guide.apg_eta = v[0];
-            r.guide.apg_norm_threshold = v[1];
-            r.guide.apg_momentum = v[2];
-        }
-        else if (word.rfind("DSLG:", 0) == 0) r.guide.slg_layers = parse_blocks(word.substr(5));
-        else if (word.rfind("DSLGP:", 0) == 0) {
-            const std::vector<float> v = parse_floats(word.substr(6));
-            if (v.size() != 4)
-                throw std::invalid_argument("DSLGP:<scale>,<sigma_start>,<sigma_end>,<rescaling_scale>: " + word);
-            r.guide.slg_scale = v[0];
-            r.guide.slg_sigma_start = v[1];
-            r.guide.slg_sigma_end = v[2];
-            r.guide.slg_rescale = v[3];
-        }
-        else if (word.rfind("DD:", 0) == 0) {
-            const std::vector<float> v = parse_floats(word.substr(3));
-            if (v.size() != 10)
-                throw std::invalid_argument("DD:<amount>,<start>,<end>,<bias>,<exponent>,<start_offset>,<end_offset>,"
-                                            "<fade>,<smooth 0|1>,<cfg_scale_override>: " + word);
-            si::GuidanceSpec& g = r.guide;
-            g.dd = true;
-            g.dd_amount = v[0];
-            g.dd_start = v[1];
-            g.dd_end = v[2];
-            g.dd_bias = v[3];
-            g.dd_exponent = v[4];
-            g.dd_start_offset = v[5];
-            g.dd_end_offset = v[6];
-            g.dd_fade = v[7];
-            g.dd_smooth = v[8] != 0.0f;
-            g.dd_cfg = v[9];
-        }
-        else if (word.rfind("TE:", 0) == 0) read_states(word.substr(3), r.te, r.te_rows);
-        else if (word.rfind("NEGTE:", 0) == 0) read_states(word.substr(6), r.neg_te, r.neg_te_rows);
-        else if (word.rfind("LORA:", 0) == 0) read_lora(word, r, loras);
-        else if (word.rfind("REF:", 0) == 0) refs.push_back(read_image(word.substr(4)));
-        else if (word.rfind("CNET:", 0) == 0) r.control_net = decoded_path(word.substr(5));
-        else if (word.rfind("CTRL:", 0) == 0) r.control = read_image(decoded_path(word.substr(5)));
-        else if (word.rfind("CTRLS:", 0) == 0) {
-            const auto v = parse_floats(word.substr(6));
-            if (v.size() != 3 || !(v[2] >= 0.0f && v[2] <= v[1] && v[1] <= 1.0f) || !std::isfinite(v[0]))
-                throw std::invalid_argument("CTRLS:<strength>,<sigma from>,<sigma to>: 0 <= to <= from <= 1: " + word);
-            r.control_strength = v[0];
-            r.control_sigma_hi = v[1];
-            r.control_sigma_lo = v[2];
-        }
-        else if (word == "CTRLNOINPAINT") r.control_inpaint = false;
-        else if (word.rfind("MCTL:", 0) == 0) r.mctl = decoded_path(word.substr(5));
-        else if (word.rfind("TIMEPATH:", 0) == 0) r.time_path = decoded_path(word.substr(9));
-        else if (word.rfind("DATASPACE:", 0) == 0) r.dataspace = decoded_path(word.substr(10));
-        else if (word.rfind("MCOLOR:", 0) == 0) r.mctl_color = read_image(decoded_path(word.substr(7)));
-        else if (word.rfind("MDEPTH:", 0) == 0) r.mctl_depth = read_image(decoded_path(word.substr(7)));
-        else if (word.rfind("MCTLENDS:", 0) == 0) {
-            const auto v = parse_floats(word.substr(9));
-            if (v.size() != 2 || !(v[0] >= 0.0f && v[0] <= 1.0f && v[1] >= 0.0f && v[1] <= 1.0f))
-                throw std::invalid_argument("MCTLENDS:<color end>,<depth end>: each 0 .. 1: " + word);
-            r.mctl_color_end = v[0];
-            r.mctl_depth_end = v[1];
-        }
-        else throw std::invalid_argument("unknown word " + word);
-    }
-    return refs;
+    WordRead t(r, loras, WordHow::Take, crop);
+    for (std::string word; ls >> word;)
+        if (!read_word(word, t)) throw std::invalid_argument("unknown word " + word);
+    return t.refs;
 }
 
 // a NEED line's: the REF:<path> images' sizes; MASK:<path> or INIT:<path> (a base image) sets `mask` (INIT: `init`
@@ -502,75 +643,15 @@ std::vector<std::pair<int64_t, int64_t>> ref_sizes(std::istringstream& ls, bool&
                                                    bool& states, std::optional<si::CropBox>& crop,
                                                    std::vector<std::pair<int64_t, int64_t>>& pictures, si::QiRequest& r,
                                                    Loras& loras) {
-    std::vector<std::pair<int64_t, int64_t>> sizes;
-    for (std::string word; ls >> word;) {
-        if (word.rfind("LORA:", 0) == 0) {
-            read_lora(word, r, loras);
-            continue;
-        }
-        if (word.rfind("CROP:", 0) == 0) {
-            crop = si::parse_crop(word);
-            continue;
-        }
-        if (word.rfind("EDITFMT:", 0) == 0) {
-            r.refs_layout = ref_layout(word);
-            continue;
-        }
-        if (word.rfind("COLOR:", 0) == 0 || word == "UPSCALE" || word.rfind("TILES:", 0) == 0) continue;
-        if (word.rfind("UPS:", 0) == 0) {
-            r.upscaler = word.substr(4);
-            continue;
-        }
-        if (word.rfind("UPSCOLOR:", 0) == 0) {
-            r.upscaler_color = word.substr(9);
-            continue;
-        }
-        if (word.rfind("UPSIN:", 0) == 0) {
-            const std::vector<int32_t> v = parse_ids(word.substr(6));
-            if ((v.size() != 2 && v.size() != 4) || std::any_of(v.begin(), v.end(), [](int32_t x) { return x <= 0; }))
-                throw std::invalid_argument("UPSIN:<width>,<height>[,<out width>,<out height>]: " + word);
-            r.init.width = v[0];   // only its size: the base image an upscale starts from
-            r.init.height = v[1];
-            if (v.size() == 4) {   // the upscale's own size, past the drawing's (TILES:)
-                r.upscale = true;
-                r.width = v[2];
-                r.height = v[3];
-            }
-            continue;
-        }
-        if (word.rfind("CTRL:", 0) == 0 || word.rfind("CTRLS:", 0) == 0 || word == "CTRLNOINPAINT" ||
-            word.rfind("MCTL:", 0) == 0 || word.rfind("MCOLOR:", 0) == 0 || word.rfind("MDEPTH:", 0) == 0 ||
-            word.rfind("MCTLENDS:", 0) == 0 || word.rfind("TIMEPATH:", 0) == 0 || word.rfind("DATASPACE:", 0) == 0)
-            continue;
-        if (word.rfind("CNET:", 0) == 0) {   // the ControlNet branch (QiPipeline::control_need)
-            r.control_net = decoded_path(word.substr(5));
-            continue;
-        }
-        if (word.rfind("PIC:", 0) == 0) {   // the text encoder's pictures (MossPipeline::set_pictures_given)
-            int64_t w = 0, h = 0;
-            if (!si::image_size(word.substr(4), w, h)) throw std::invalid_argument("not an image: " + word);
-            pictures.emplace_back(w, h);
-            continue;
-        }
-        if (word.rfind("MASK:", 0) == 0 || word.rfind("INIT:", 0) == 0) {
-            mask = true;
-            init = init || word.rfind("INIT:", 0) == 0;
-            continue;
-        }
-        if (word.rfind("TE:", 0) == 0 || word.rfind("NEGTE:", 0) == 0) {
-            states = true;
-            continue;
-        }
-        if (word.rfind("NEG:", 0) == 0) {
-            n_neg = std::stoll(word.substr(4));
-            continue;
-        }
-        int64_t w = 0, h = 0;
-        if (word.rfind("REF:", 0) != 0 || !si::image_size(word.substr(4), w, h))
-            throw std::invalid_argument("not an image: " + word);
-        sizes.emplace_back(w, h);
-    }
-    return sizes;
+    WordRead t(r, loras, WordHow::Size, &crop);
+    for (std::string word; ls >> word;)
+        if (!read_word(word, t)) throw std::invalid_argument("not an image: " + word);
+    mask = t.mask;
+    init = t.init;
+    n_neg = t.n_neg;
+    states = t.states;
+    pictures = std::move(t.pictures);
+    return t.sizes;
 }
 
 std::string plan_kv(const si::QiTimes& t, const si::QiPlan& p) {
@@ -592,93 +673,6 @@ void write_file(const std::string& path, const std::vector<uint8_t>& img) {
     std::ofstream o(path, std::ios::binary);
     o.write(reinterpret_cast<const char*>(img.data()), (std::streamsize) img.size());
     if (!o) throw std::runtime_error("cannot write " + path);
-}
-
-// stdin's next line, read from the descriptor rather than through std::cin: glibc's exit() flushes every stdio stream
-// and waits for stdin's lock, which getline holds while it waits for input - an engine that ends on QUIT (or on an
-// error, every std::exit) would hang in exit() on Linux and the server would wait for it until it kills it.  The
-// reader thread is never woken; it ends with the process.  (strata serve reads its lines the same way.)
-bool stdin_line(std::string& out, std::string& buf) {
-    char chunk[4096];
-    for (;;) {
-        const size_t nl = buf.find('\n');
-        if (nl != std::string::npos) {
-            out.assign(buf, 0, nl);
-            buf.erase(0, nl + 1);
-            return true;
-        }
-#if defined(_WIN32)
-        const int n = _read(0, chunk, (unsigned) sizeof chunk);
-#else
-        const ssize_t n = ::read(0, chunk, sizeof chunk);
-#endif
-        if (n < 0 && errno == EINTR) continue;
-        if (n <= 0) {
-            if (buf.empty()) return false;
-            out.swap(buf);
-            buf.clear();
-            return true;
-        }
-        buf.append(chunk, (size_t) n);
-    }
-}
-
-// stdin's lines on a thread of their own, so that STOP reaches a running request
-struct Lines {
-    std::mutex mu;
-    std::condition_variable cv;
-    std::deque<std::string> q;
-    bool eof = false;
-    std::atomic<bool> stop{false};
-    void run() {
-        std::string buf;
-        for (std::string line; stdin_line(line, buf);) {
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            if (line == "STOP") {
-                std::lock_guard<std::mutex> l(mu);   // a run waiting for RESUME (resume) wakes to it
-                stop = true;
-                cv.notify_all();
-                continue;
-            }
-            std::lock_guard<std::mutex> l(mu);
-            q.push_back(line);
-            cv.notify_all();
-        }
-        std::lock_guard<std::mutex> l(mu);
-        eof = true;
-        cv.notify_all();
-    }
-    bool next(std::string& line) {
-        std::unique_lock<std::mutex> l(mu);
-        cv.wait(l, [this] { return eof || !q.empty(); });
-        if (q.empty()) return false;
-        line = q.front();
-        q.pop_front();
-        return true;
-    }
-    /// After a YIELD: waits for the server's RESUME; false on STOP or the input's end (the run stops at its next step).
-    bool resume() {
-        std::unique_lock<std::mutex> l(mu);
-        cv.wait(l, [this] { return eof || stop.load() || !q.empty(); });
-        if (stop.load() || q.empty()) return false;
-        const std::string line = q.front();
-        q.pop_front();
-        if (line != "RESUME") throw std::runtime_error("image engine: " + line + " while a video waits for RESUME");
-        return true;
-    }
-};
-
-// a request that names adapters the model does not apply: refused, rather than an image made without them
-void no_loras(si::ImagePipeline& p) {
-    if (dynamic_cast<si::HunyuanImage3Pipeline*>(&p) != nullptr)
-        throw si::LoraRejected("image engine: HunyuanImage 3.0 takes no adapters");
-    throw si::LoraRejected("image engine: this image model's DiT takes no adapters");
-}
-
-// the pipelines whose DiT's products add the adapters a request names (image_lora.hpp)
-bool takes_loras(si::ImagePipeline& p) {
-    return dynamic_cast<si::QiPipeline*>(&p) != nullptr || dynamic_cast<si::MossPipeline*>(&p) != nullptr ||
-           dynamic_cast<si::MfPipeline*>(&p) != nullptr || dynamic_cast<si::AnimaPipeline*>(&p) != nullptr;
 }
 
 // The detectors the process has opened (yolo_detect.hpp), by their file: each opened once, its weights kept beside the
@@ -1261,19 +1255,13 @@ si::QiRef control_box(const si::QiRef& control, const si::CropBox& b) {
     return out;
 }
 
-// the pipelines whose sampling takes guidance.hpp's guidance (GUIDE words)
-bool takes_guidance(si::ImagePipeline& p) {
-    return dynamic_cast<si::QiPipeline*>(&p) != nullptr || dynamic_cast<si::MfPipeline*>(&p) != nullptr ||
-           dynamic_cast<si::MossPipeline*>(&p) != nullptr || dynamic_cast<si::AnimaPipeline*>(&p) != nullptr;
-}
-
 // An upscale past the model's size (TILES:), drawn again a tile at a time: the base image at the line's size
 // (upscale_base: Lanczos, or the line's upscaler), then each tile of r.tile pixels (row by row) cut out with r.tile_pad of context around it, drawn again
 // from it at the line's strength at that size (its sides multiples of 16), and put back by the tile's mask blurred by
 // r.tile_blur (the cut's steps: img_crop.hpp), the next tile cut from the picture as it now is.  The tiles'
 // times summed into `t`, the last one's plan in `pl`, the resizes and the cuts' time in `cut_s`.
 std::vector<uint8_t> upscale_tiles(si::ImagePipeline& p, const si::QiRequest& r0, si::QiTimes& t, si::QiPlan& pl,
-                                   double& cut_s, Lines& in, Upscalers& ups, double& ups_s) {
+                                   double& cut_s, strata::core::StdinLines& in, Upscalers& ups, double& ups_s) {
     const si::QiRef* base0 = !r0.init.rgba.empty() ? &r0.init : !r0.refs.empty() ? &r0.refs[0] : nullptr;
     if (base0 == nullptr) throw std::invalid_argument("TILES: a base image (INIT: or the first REF:)");
     const int64_t W = r0.width, H = r0.height, T = r0.tile;
@@ -1320,7 +1308,7 @@ std::vector<uint8_t> upscale_tiles(si::ImagePipeline& p, const si::QiRequest& r0
             const auto img = p.generate(r, &tt, &pl, [&in](int done, int steps) {
                 std::printf("STEP %d %d\n", done, steps);
                 std::fflush(stdout);
-                return !in.stop.load();
+                return !in.stop().load();
             }, [](const char* stage) {
                 std::printf("STAGE %s\n", stage);
                 std::fflush(stdout);
@@ -1362,9 +1350,7 @@ int serve(si::ImagePipeline& p) {
     std::fflush(stdout);
     // the reader outlives serve(): after QUIT the server closes stdin, and the read it wakes from would lock a destroyed
     // mutex (std::system_error, the engine aborting while the GPU's memory is still its own)
-    Lines& in = *new Lines;
-    std::thread reader([&in] { in.run(); });
-    reader.detach();   // ends with the process: a blocked read cannot be woken
+    strata::core::StdinLines& in = *new strata::core::StdinLines;   // the ctor starts the detached reader
     for (std::string line; in.next(line);) {
         // the fallbacks so far (the warm-up's, the last request's), never before READY: the server reads that first
         strata::platform::downgrades_say();
@@ -1385,14 +1371,14 @@ int serve(si::ImagePipeline& p) {
                 r.ids = parse_ids(ids);
                 std::optional<si::CropBox> crop;
                 r.refs = read_refs(ls, r, loras, &crop);
-                if (!r.loras.empty() && !takes_loras(p)) no_loras(p);
-                if (!r.control_net.empty() && dynamic_cast<si::QiPipeline*>(&p) == nullptr)
+                if (!r.loras.empty() && !p.takes_loras()) throw si::LoraRejected(p.no_loras_message());
+                if (!r.control_net.empty() && !p.takes_control_net())
                     throw std::invalid_argument("image engine: CNET: is Qwen-Image-2.1's ControlNet; this model takes "
                                                 "a control image as a reference image instead");
                 if ((!r.mctl.empty() || !r.time_path.empty() || !r.dataspace.empty()) &&
-                    dynamic_cast<si::MossPipeline*>(&p) == nullptr)
+                    !p.takes_moss_options())
                     throw std::invalid_argument("image engine: MCTL:, TIMEPATH: and DATASPACE: are MOSS-Image's");
-                if (r.guide.any() && !takes_guidance(p))
+                if (r.guide.any() && !p.takes_guidance())
                     throw std::invalid_argument("image engine: this image model takes no CFGNORM:, CFGZERO, APG:, "
                                                 "DSLG: or DD:");
                 // the cut (img_crop.hpp): the mask's box drawn at the line's size, the picture put back at its
@@ -1460,13 +1446,13 @@ int serve(si::ImagePipeline& p) {
                     std::printf("PREVIEW %d %d %s\n", index, done, path.c_str());
                     std::fflush(stdout);
                 };
-                in.stop = false;
+                in.stop() = false;
                 si::QiTimes t;
                 si::QiPlan pl;
                 const auto img = p.generate(r, &t, &pl, [&in](int done, int steps) {
                     std::printf("STEP %d %d\n", done, steps);
                     std::fflush(stdout);
-                    return !in.stop.load();
+                    return !in.stop().load();
                 }, [](const char* stage) {   // the server's progress (serve/images.py)
                     std::printf("STAGE %s\n", stage);
                     std::fflush(stdout);
@@ -1548,12 +1534,12 @@ int serve(si::ImagePipeline& p) {
                 const uint64_t avail = ups_room(p, m);
                 std::printf("STAGE upscale-video\n");
                 std::fflush(stdout);
-                in.stop = false;
+                in.stop() = false;
                 const auto t0 = std::chrono::steady_clock::now();
                 const auto step = [&in](int64_t d, int64_t n) {
                     std::printf("STEP %lld %lld\n", (long long) d, (long long) n);
                     std::fflush(stdout);
-                    return !in.stop.load();
+                    return !in.stop().load();
                 };
                 const su::VideoReport vp = su::UpscaleRunner::run_video(m, src, stem, vr, avail, step);
                 const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -1701,11 +1687,11 @@ int serve(si::ImagePipeline& p) {
                          &m);
                 std::printf("STAGE segment-video\n");
                 std::fflush(stdout);
-                in.stop = false;
+                in.stop() = false;
                 o.step = [&in](int64_t d, int64_t n) {
                     std::printf("STEP %lld %lld\n", (long long) d, (long long) n);
                     std::fflush(stdout);
-                    return !in.stop.load();
+                    return !in.stop().load();
                 };
                 std::string line;
                 try {
@@ -1859,18 +1845,9 @@ int serve(si::ImagePipeline& p) {
                 // the cut: the first reference (the base image without an init image) is drawn from at the
                 // line's size, and the steps' buffers come before the drawing and after it, beside what is held
                 if (crop && !init && !sizes.empty()) sizes[0] = {w, h};
-                auto* moss = dynamic_cast<si::MossPipeline*>(&p);
-                if (moss != nullptr) {
-                    moss->set_states_given(states);
-                    moss->set_pictures_given(pictures);
-                    moss->set_ref_layout(lr.refs_layout);
-                }
+                p.set_need_context(states, pictures, lr.refs_layout);
                 si::QiNeed nd = p.need(n, w, h, sizes, mask, n_neg, lr.loras);
-                if (moss != nullptr) {
-                    moss->set_states_given(false);
-                    moss->set_pictures_given({});
-                    moss->set_ref_layout(si::QiRefLayout::MossEdit);
-                }
+                p.set_need_context(false, {}, si::QiRefLayout::MossEdit);
                 if (!lr.upscaler.empty()) {   // the upscaler runs before the drawing, the image model's cache given back
                     su::UpscaleModel& m = ups.get(lr.upscaler);
                     const int64_t iw = lr.init.width > 0 ? lr.init.width : w, ih = lr.init.height > 0 ? lr.init.height : h;
@@ -1882,9 +1859,7 @@ int serve(si::ImagePipeline& p) {
                                        nd.held + su::UpscaleRunner::full_bytes(m, iw, ih, ow, oh, c));
                 }
                 if (!lr.control_net.empty()) {
-                    auto* qi = dynamic_cast<si::QiPipeline*>(&p);
-                    if (qi == nullptr) throw std::invalid_argument("image engine: ControlNet is Qwen-Image-2.1's only");
-                    const auto [least, full] = qi->control_need(lr.control_net, w, h);
+                    const auto [least, full] = p.control_need(lr.control_net, w, h);
                     nd.least += least;
                     nd.full += full;
                 }
@@ -2095,6 +2070,7 @@ int main(int argc, char** argv) {
         bool lora_bake = true;        // --lora-bake 0: the adapters added to each product, not baked in
         Loras cli_loras;              // --lora's files
         si::QiRequest r;
+        WordRead words(r, cli_loras); // the options that are the IMG line's words read through it (one reading)
         uint64_t budget = 0;
         int repeat = 1;
         std::string edit_dit;
@@ -2113,40 +2089,15 @@ int main(int argc, char** argv) {
             else if (a == "--ratio-head") ratio_head = val();
             else if (a == "--ratio") ratio = true;
             else if (a == "--ref") ref_paths.push_back(val());
-            else if (a == "--mask") r.mask = read_image(val());
-            else if (a == "--init") r.init = read_image(val());
-            else if (a == "--strength") r.strength = std::stod(val());
-            else if (a == "--neg-ids") r.neg_ids = parse_ids(val());
-            else if (a == "--cfg") r.cfg = std::stof(val());
             else if (a == "--out") out = val();
             else if (a == "--ids") ids = val();
             else if (a == "--drop") r.drop = std::stoll(val());
             else if (a == "--width") r.width = std::stoll(val());
             else if (a == "--height") r.height = std::stoll(val());
             else if (a == "--seed") r.seed = std::stoull(val());
-            else if (a == "--sigmas") r.sigmas = parse_sigmas(val());
-            else if (a == "--steps") r.steps = std::stoll(val());
-            else if (a == "--guidance") r.guidance = std::stof(val());
-            else if (a == "--shift") r.shift = std::stof(val());
-            else if (a == "--uncond-skip") {
-                r.uncond_skip = parse_blocks(val());
-                r.uncond_skip_set = true;
-            }
-            else if (a == "--slg-layers") r.slg_layers = parse_blocks(val());
-            else if (a == "--slg-scale") r.slg_scale = std::stof(val());
-            else if (a == "--slg-start") r.slg_start = std::stof(val());
-            else if (a == "--slg-stop") r.slg_stop = std::stof(val());
-            else if (a == "--t5") r.t5_ids = parse_ids(val());
-            else if (a == "--t5-weights") r.t5_weights = parse_floats(val());
-            else if (a == "--neg-t5") r.neg_t5_ids = parse_ids(val());
-            else if (a == "--neg-t5-weights") r.neg_t5_weights = parse_floats(val());
-            else if (a == "--sampler") r.sampler = val();
-            else if (a == "--lora") read_lora("LORA:" + val(), r, cli_loras);   // STRENGTH:PATH, as IMG's LORA:
             else if (a == "--lora-block-map")
                 for (const int32_t b : parse_ids(val())) block_map.push_back((int) b);
             else if (a == "--lora-bake") lora_bake = std::stoi(val()) != 0;
-            else if (a == "--te") read_states(val(), r.te, r.te_rows);
-            else if (a == "--neg-te") read_states(val(), r.neg_te, r.neg_te_rows);
             else if (a == "--budget-mib") budget = std::stoull(val()) << 20;
             else if (a == "--repeat") repeat = std::stoi(val());
             else if (a == "--serve") serving = true;
@@ -2156,7 +2107,11 @@ int main(int argc, char** argv) {
             }
             else if (a == "--edit-dit") edit_dit = val();
             else if (a == "--dit-keep") dit_keep = val() != "0";
-            else throw std::invalid_argument("unknown option " + a);
+            else {   // the rest are the IMG line's words: --steps 8 reads as the word STEPS:8, one reading of both
+                std::string word;
+                if (!cli_word(a, word) || !read_word(word + val(), words))
+                    throw std::invalid_argument("unknown option " + a);
+            }
         }
         // the model is in the DiT's file, not in its extension: both Mage-Flow and HunyuanImage 3.0 are
         // safetensors, and HunyuanImage 3.0's says so in its header (hunyuanimage3_is_dit_file reads the header
@@ -2235,9 +2190,8 @@ int main(int argc, char** argv) {
             double secs = 0.0;
             const int i = p.choose_ratio(r, &secs);
             std::printf("RATIO index=%d ratio_s=%.3f", i, secs);
-            if (const auto* h = dynamic_cast<const si::HunyuanImage3Pipeline*>(&p))
-                for (size_t k = 0; k < h->ratio_logits().size(); ++k)
-                    std::printf("%s%.6g", k == 0 ? " logits=" : ",", h->ratio_logits()[k]);
+            for (size_t k = 0; k < p.ratio_logits().size(); ++k)
+                std::printf("%s%.6g", k == 0 ? " logits=" : ",", p.ratio_logits()[k]);
             std::printf("\n");
             return 0;
         }

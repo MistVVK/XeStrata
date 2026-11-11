@@ -60,6 +60,54 @@ std::vector<uint8_t> resize_nearest(const QiRef& f, int64_t W, int64_t H) {
     return out;
 }
 
+namespace {
+
+/// One 8-bit value's place in the planar floats an encoder reads, the alpha `a` (0 .. 1) over white where `alpha` says
+/// it.  WhiteUnit's composite is the 0 .. 1 floats' and unrounded, the others' the whole byte a picture would save.
+float plane_value(int v, float a, PlaneAlpha alpha, PlaneRange range) {
+    if (alpha == PlaneAlpha::WhiteUnit) {
+        const float u = (float) v / 255.f * a + 1.f - a;
+        return range == PlaneRange::Signed ? 2.f * u - 1.f : u;
+    }
+    const float b = alpha == PlaneAlpha::White ? std::nearbyint((float) v * a + 255.f * (1.f - a)) : (float) v;
+    switch (range) {
+        case PlaneRange::Byte: return b;
+        case PlaneRange::Unit: return b / 255.f;
+        case PlaneRange::Signed: return b / 127.5f - 1.f;
+    }
+    return b;
+}
+
+}  // namespace
+
+std::vector<float> image_planes(const std::vector<uint8_t>& px, int64_t W, int64_t H, int64_t channels,
+                                PlaneAlpha alpha, PlaneRange range) {
+    const int64_t n = W * H;
+    std::vector<float> out((size_t) (channels * n));
+    for (int64_t q = 0; q < n; ++q) {
+        const uint8_t* p = px.data() + (size_t) (q * 4);
+        const float a = (float) p[3] / 255.f;
+        for (int64_t c = 0; c < channels; ++c)
+            out[(size_t) (c * n + q)] =
+                plane_value(c == 3 && alpha != PlaneAlpha::Keep ? 255 : p[c], a, alpha, range);
+    }
+    return out;
+}
+
+std::vector<float> image_planes(const QiRef& f, int64_t W, int64_t H, int64_t channels, PlaneAlpha alpha,
+                                PlaneRange range) {
+    return image_planes(resize_nearest(f, W, H), W, H, channels, alpha, range);
+}
+
+void noise_to_tokens(const float* src, int64_t C, int64_t H, int64_t W, int64_t patch, float* out, int64_t stride) {
+    const int64_t plane = stride != 0 ? stride : H * W, tw = W / patch, TV = C * patch * patch, cc = patch * patch;
+    for (int64_t c = 0; c < C; ++c)
+        for (int64_t y = 0; y < H; ++y)
+            for (int64_t x = 0; x < W; ++x)
+                out[(size_t) (((y / patch) * tw + x / patch) * TV + c * cc + (y % patch) * patch + x % patch)] =
+                    src[(size_t) (c * plane + y * W + x)];
+}
+
 std::vector<float> latent_mask(const std::vector<uint8_t>& px, int64_t W, int64_t H, int64_t patch) {
     const int64_t w = W / patch;
     std::vector<float> m((size_t) ((H / patch) * w), 0.f);

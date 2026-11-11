@@ -18,10 +18,16 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/core/runtime.hpp"
+#include "strata/core/control_vector.hpp"
+#include "strata/core/stdin_lines.hpp"
+#include "strata/core/watchdog.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_tier.hpp"
 #include "strata/program/done_line.hpp"
+#include "strata/program/gen_keys.hpp"
+#include "strata/program/id_list.hpp"
+#include "strata/program/info_line.hpp"
 #include "strata/program/shared_options.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_disk.hpp"
@@ -828,23 +834,7 @@ void extra_sources_append(const int32_t* t, size_t n) {
 }
 
 bool parse_i64_list(const char* s, std::vector<int64_t>& out, std::string& err) {
-    out.clear();
-    std::string text(s);
-    for (char& c : text) if (c == ',') c = ' ';
-    std::istringstream input(text);
-    std::string token;
-    while (input >> token) {
-        int32_t id = 0;
-        const auto parsed = std::from_chars(token.data(), token.data() + token.size(), id);
-        if (parsed.ec != std::errc{} || parsed.ptr != token.data() + token.size() || id < 0) {
-            err = "invalid token id: expected an integer in [0, 2147483647]";
-            out.clear();
-            return false;
-        }
-        out.push_back(id);
-    }
-    if (out.empty()) { err = "token list was empty"; return false; }
-    return true;
+    return strata::program::parse_id_list(s, out, strata::program::IdListForm::TextErr, &err);
 }
 
 /// The pool's adapter plus the wall-clock it spent, so the report can say how much of the token was the CPU.
@@ -974,104 +964,6 @@ static std::string ram_note(const std::optional<strata::core::HostMemoryReading>
     return std::to_string(mem->available >> 20) + " MiB available, source " + strata::core::memory_source_name(mem->source);
 }
 
-// ---- issue #31: what the watchdog prints before it stops a stalled engine
-struct MemSample {
-    unsigned long long faults = 0, rss_mib = 0, avail_mib = 0, commit_mib = 0;   // faults: hard (Linux) / all (Windows)
-};
-MemSample mem_sample() {
-    MemSample m;
-#if defined(_WIN32)
-    PROCESS_MEMORY_COUNTERS pmc{};
-    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) {
-        m.faults = pmc.PageFaultCount;
-        m.rss_mib = pmc.WorkingSetSize >> 20;
-        m.commit_mib = pmc.PagefileUsage >> 20;
-    }
-    MEMORYSTATUSEX ms{};
-    ms.dwLength = sizeof ms;
-    if (GlobalMemoryStatusEx(&ms)) m.avail_mib = ms.ullAvailPhys >> 20;
-#else
-    if (std::FILE* f = std::fopen("/proc/self/stat", "r")) {
-        char buf[4096];
-        const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
-        buf[n] = 0;
-        std::fclose(f);
-        const char* s = std::strrchr(buf, ')');   // fields after the command name: 3 state ... 12 majflt
-        for (int field = 2; s && field < 12; ++field) s = std::strchr(s + 1, ' ');
-        if (s) m.faults = std::strtoull(s + 1, nullptr, 10);
-    }
-    auto kb = [](const char* path, const char* key) -> unsigned long long {
-        unsigned long long v = 0;
-        if (std::FILE* f = std::fopen(path, "r")) {
-            char line[256];
-            const size_t kl = std::strlen(key);
-            while (std::fgets(line, sizeof line, f))
-                if (std::strncmp(line, key, kl) == 0) { v = std::strtoull(line + kl, nullptr, 10); break; }
-            std::fclose(f);
-        }
-        return v;
-    };
-    m.rss_mib = kb("/proc/self/status", "VmRSS:") >> 10;
-    m.commit_mib = kb("/proc/self/status", "VmSwap:") >> 10;
-    m.avail_mib = kb("/proc/meminfo", "MemAvailable:") >> 10;
-#endif
-    return m;
-}
-
-// the stage the watchdog names: "<where> <detail>", and the prompt chunk a batched read is in (upstream 9631c96)
-// upstream #1407: the file tier's activity as the OS counts it (Linux: major page faults and bytes read from storage). The
-// watchdog treats a growing count as "the step is slow, not stuck": a prompt layer whose experts are re-read from the
-// pack (low RAM, mmap experts) can take minutes while the heartbeat stands still. Zero where unavailable.  #59:
-// Windows counts no hard faults for a process alone, so there it is all its page faults (the experts mapped from the
-// pack come in as faults, not as reads) and the MiB its reads brought in: a stuck engine's host makes almost none, and
-// a busy one is still bounded by the allowance (XESTRATA_WATCHDOG_IO_S).
-static uint64_t file_tier_activity() {
-#if defined(_WIN32)
-    uint64_t total = 0;
-    PROCESS_MEMORY_COUNTERS pmc{};
-    if (K32GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc)) total += pmc.PageFaultCount;
-    IO_COUNTERS io{};
-    if (GetProcessIoCounters(GetCurrentProcess(), &io)) total += io.ReadTransferCount >> 20;   // MiB
-    return total;
-#elif defined(__linux__)
-    uint64_t total = 0;
-    if (FILE* f = std::fopen("/proc/self/stat", "r")) {
-        char buf[1024] = {};
-        const size_t n = std::fread(buf, 1, sizeof(buf) - 1, f);
-        std::fclose(f);
-        const char* p = std::strrchr(buf, ')');
-        if (p != nullptr && n > 0) {
-            // after "(comm)": state ppid pgrp session tty tpgid flags minflt cminflt majflt
-            const char* q = p + 1;
-            for (int field = 0; field < 9 && q != nullptr; ++field) q = std::strchr(q + 1, ' ');
-            char* end = nullptr;
-            const unsigned long long majflt = q != nullptr ? std::strtoull(q, &end, 10) : 0;
-            if (q != nullptr && end != q) total += majflt;
-        }
-    }
-    if (FILE* f = std::fopen("/proc/self/io", "r")) {
-        char line[256];
-        while (std::fgets(line, sizeof(line), f) != nullptr) {
-            static const char key[] = "read_bytes:";
-            if (std::strncmp(line, key, sizeof key - 1) != 0) continue;
-            char* end = nullptr;
-            const unsigned long long v = std::strtoull(line + sizeof key - 1, &end, 10);
-            if (end != line + sizeof key - 1) total += v >> 20;   // MiB
-        }
-        std::fclose(f);
-    }
-    return total;
-#else
-    return 0;
-#endif
-}
-std::string stage_text() {
-    const strata::core::Progress& p = strata::core::progress();
-    std::string s = std::string(p.where.load()) + " " + std::to_string((long long) p.detail.load());
-    if (const int64_t c = p.chunk.load(); c >= 0) s += " of the prompt chunk from token " + std::to_string((long long) c);
-    return s;
-}
-
 // --pipeline-windows: what the watchdog prints about the pipelined decode loop (set while it runs)
 struct PlDiag {
     strata::core::Verifier* v[2][2] = {};
@@ -1117,75 +1009,7 @@ int on_rotational_disk(const std::string& path, std::string& dev) {
     return -1;
 }
 
-// upstream #605: the engine's threads in uninterruptible sleep (state D - almost always waiting for the disk), and where
-// (wchan): 16 threads in blk_io_schedule is a disk that cannot keep up, not a deadlock in the engine
-void disk_wait_threads(std::FILE* f) {
-    std::map<std::string, int> where;
-    int waiting = 0, threads = 0, in_driver = 0;
-    std::error_code ec;
-    for (const auto& e : std::filesystem::directory_iterator("/proc/self/task", ec)) {
-        ++threads;
-        std::ifstream st(e.path() / "stat");
-        std::string line;
-        std::getline(st, line);
-        const size_t rp = line.rfind(')');
-        if (rp == std::string::npos || rp + 2 >= line.size() || line[rp + 2] != 'D') continue;
-        ++waiting;
-        std::ifstream w(e.path() / "wchan");
-        std::string wc;
-        std::getline(w, wc);
-        // #44: a GPU driver's call (xe_vm_bind_ioctl) waits in state D too, and is not the drive
-        if (wc.rfind("xe_", 0) == 0 || wc.rfind("drm_", 0) == 0 || wc.rfind("i915_", 0) == 0 || wc.rfind("amdgpu_", 0) == 0)
-            ++in_driver;
-        ++where[wc.empty() || wc == "0" ? "?" : wc];
-    }
-    if (threads == 0) return;
-    std::string list;
-    for (const auto& [name, n] : where) list += (list.empty() ? " (" : ", ") + name + " x" + std::to_string(n);
-    if (!list.empty()) list += ")";
-    std::fprintf(f, "  threads in uninterruptible sleep (state D): %d of %d%s%s%s\n", waiting, threads, list.c_str(),
-                 waiting > in_driver ? " - the engine is waiting for the drive: a rotational or failing disk with "
-                                       "--ple-io direct (#605: --ple-io ram), or a drive too slow for the reads asked of "
-                                       "it" : "",
-                 in_driver > 0 ? " - in the GPU driver: the driver itself is slow or stuck (dmesg says more)" : "");
-}
 #endif
-
-// Upstream #2065: the VRAM free when the current request began (-1 before the first); the stall report prints it, as a
-// card too full is one cause of a window that never finishes (the driver moves GPU memory to system RAM).  No line is
-// drawn: the expert cache fills the card by design, leaving 400-450 MiB free on the RTX 4070 and the B70, below
-// upstream's 512 MiB warning.
-std::atomic<int64_t> g_req_vram_free_mib{-1};
-
-void stall_report(std::FILE* f, uint64_t layers_during) {
-    strata::core::Progress& p = strata::core::progress();
-    std::fprintf(f, "xestrata serve: stall report (engine %s): stage \"%s\" for %lld s; %llu layers served since the "
-                    "last finished step (0 = stopped, more = slow)\n", STRATA_VERSION, stage_text().c_str(),
-                 (long long) ((strata::core::progress_now_ms() - p.since_ms.load()) / 1000),
-                 (unsigned long long) layers_during);
-    if (const int64_t vf = g_req_vram_free_mib.load(); vf >= 0)
-        std::fprintf(f, "  VRAM free when this request began: %lld MiB (a card the driver must move memory off of is "
-                        "a cause of a window that never finishes: a larger --vram-reserve-mib leaves room)\n",
-                     (long long) vf);
-    for (int pass = 0; pass < 2; ++pass) {
-        if (pass == 1) {
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-            std::fprintf(f, "  2 s later:\n");
-        }
-        if (auto fn = strata::core::diag_pool_fn().load()) fn(f);
-        if (auto fn = strata::core::diag_verify_fn().load()) fn(f);
-#if !defined(_WIN32)
-        disk_wait_threads(f);
-#endif
-        if (auto fn = strata::core::diag_pipeline_fn().load()) fn(f);
-        const MemSample m = mem_sample();
-        std::fprintf(f, "  memory: %llu MiB resident, %llu MiB %s, %llu MiB RAM available; %llu %s\n", m.rss_mib,
-                     m.commit_mib,
-                     "in swap", m.avail_mib, m.faults, "major page faults so far"
-        );
-        std::fflush(f);
-    }
-}
 
 /// #463's A/B: STRATA_ADAPT_NOWAIT=1 lets a verify window start before the adaptive tier's copies have landed (0.1.37)
 bool adapt_nowait() {
@@ -1445,84 +1269,26 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
 // `digest` identifies the uploaded tables, mode and range exactly (a session file is bound to it).
 bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g, std::string& summary,
                           uint64_t& digest, std::string& err) {
-    const int64_t L = g.n_layers, N = g.n_embd;
-    std::vector<float> data((size_t) (L * N), 0.0f);
-    std::vector<bool> have((size_t) L, false);
-    for (const auto& [path, scale] : o.cvec_files) {
-        try {
-            strata::GgufFile f(path);
-            const strata::MetaValue* arch = f.get("general.architecture");
-            if (arch == nullptr || arch->s != "controlvector") {
-                err = path + ": not a control vector GGUF (general.architecture is not 'controlvector')";
-                return false;
-            }
-            const strata::MetaValue* hint = f.get("controlvector.model_hint");
-            if (hint != nullptr && hint->s != "qwen4exp")
-                std::fprintf(stderr, "xestrata generate: %s was made for '%s', not qwen4exp\n", path.c_str(), hint->s.c_str());
-            int found = 0;
-            for (const strata::TensorInfo& t : f.tensors()) {
-                if (t.name.rfind("direction.", 0) != 0) continue;
-                const long l = std::strtol(t.name.c_str() + 10, nullptr, 10);
-                if (l < 1 || l >= L) continue;   // layer 0 has no vector; past the model is ignored, as in llama.cpp
-                if (t.type != 0 || t.elements() != (uint64_t) N) {
-                    err = path + ": " + t.name + " must be " + std::to_string((long long) N) + " f32";
-                    return false;
-                }
-                const float* src = reinterpret_cast<const float*>(f.tensor_data(t));
-                for (int64_t j = 0; j < N; ++j) data[(size_t) (l * N + j)] += scale * src[j];
-                have[(size_t) l] = true;
-                ++found;
-            }
-            if (found == 0) { err = path + ": no direction.<layer> tensors"; return false; }
-        } catch (const std::exception& e) {
-            err = e.what();
-            return false;
-        }
-    }
-    const int first = o.cvec_first <= 0 ? 1 : o.cvec_first;
-    const int last = (o.cvec_last <= 0 || o.cvec_last >= L) ? (int) L - 1 : o.cvec_last;
-    const int single = o.cvec_mode == 0 ? o.cvec_single : -1;
-    if (single >= 0 && (single >= L || !have[(size_t) single])) {
-        err = "--cvec-dir single:" + std::to_string(single) + ": the vector has no direction for that layer";
+    strata::core::ControlVectorLoad cv;
+    if (!strata::core::load_control_vectors(o.cvec_files, g.n_layers, g.n_embd, g.hc, o.cvec_first, o.cvec_last,
+                                            o.cvec_mode, o.cvec_single, "qwen4exp", "xestrata generate", true, cv, err))
         return false;
-    }
-    std::vector<float> dir((size_t) (L * N), 0.0f), s((size_t) L, 0.0f);
-    int steered = 0;
-    for (int64_t l = first; l <= last; ++l) {
-        const int64_t src = single >= 0 ? single : l;
-        if (!have[(size_t) src]) continue;
-        const float* d = data.data() + (size_t) (src * N);
-        if (o.cvec_mode == 0) {
-            double nrm = 0.0;
-            for (int64_t j = 0; j < N; ++j) nrm += (double) d[j] * d[j];
-            nrm = std::sqrt(nrm);
-            if (nrm <= 0.0) continue;
-            s[(size_t) l] = (float) nrm;
-            for (int64_t j = 0; j < N; ++j) dir[(size_t) (l * N + j)] = (float) (d[j] / nrm);
-        } else {
-            s[(size_t) l] = 1.0f;
-            std::copy(d, d + N, dir.begin() + (std::ptrdiff_t) (l * N));
-        }
-        ++steered;
-    }
-    if (steered == 0) { err = "the control vector has no direction in layers " + std::to_string(first) + ".." + std::to_string(last); return false; }
-    if (!strata::kernels::cvec_upload(dir, s, o.cvec_mode, first, last, N, g.hc, err)) return false;
     {
         strata::core::SessionIdentityBuilder b(0x43564543ull);   // "CVEC"
         b.i64("mode", o.cvec_mode);
-        b.i64("first", first);
-        b.i64("last", last);
-        b.i64("single", single);
-        b.bytes("dir", dir.data(), dir.size() * sizeof(float));
-        b.bytes("scale", s.data(), s.size() * sizeof(float));
+        b.i64("first", cv.first);
+        b.i64("last", cv.last);
+        b.i64("single", cv.single);
+        b.bytes("dir", cv.dir.data(), cv.dir.size() * sizeof(float));
+        b.bytes("scale", cv.scale.data(), cv.scale.size() * sizeof(float));
         digest = b.digest();
         if (digest == 0) digest = 1;   // 0 means "none loaded"
     }
-    summary = std::string(o.cvec_mode == 0 ? "project" : "add") + ":" + std::to_string(first) + "-" + std::to_string(last) +
-              (single >= 0 ? ":single" + std::to_string(single) : "");
+    summary = cv.summary;
     // the line llama.cpp's patched build prints, so a log shows the same thing
     std::fprintf(stderr, "xestrata generate: control vector mode = %s, dir = %s, layers %d..%d (%d steered)\n",
-                 o.cvec_mode == 0 ? "project" : "add", single >= 0 ? "single" : "per-layer", first, last, steered);
+                 o.cvec_mode == 0 ? "project" : "add", cv.single >= 0 ? "single" : "per-layer", cv.first, cv.last,
+                 cv.steered);
     return true;
 }
 
@@ -2468,6 +2234,78 @@ int main(int argc, char** argv) {
     shared.rope_freq_base = &o.rope_freq_base;
     shared.rope_freq_scale = &o.rope_freq_scale;
     shared.yarn_orig_ctx = &o.yarn_orig_ctx;
+    // the rest of the common options (the ranges are generate's own)
+    shared.serve = &o.serve;
+    shared.vision = &o.vision;
+    shared.stop_eos = &o.stop_eos;
+    shared.session_save_reclaim = &o.session_save_reclaim;
+    shared.prompt_cache_tail = &o.prompt_cache_tail;
+    shared.prompt_cache_spread = &o.prompt_cache_spread;
+    shared.conversation_save_compress = &o.conversation_save_compress;
+    shared.no_host_worker = &o.no_host_worker;
+    shared.batch_mtp_int = &o.batch_mtp;
+    shared.adapt_async_int = &o.adapt_async;
+    shared.coupled_draft = &o.coupled_draft;
+    shared.kv_grow = &o.kv_grow;
+    shared.conversation_save = &o.conversation_save;
+    shared.dump_logits = &o.dump_logits;
+    shared.dump_routing = &o.dump_routing;
+    shared.pool_cores = &o.pool_cores;
+    shared.shared_expert_arena = &o.shared_expert_arena;
+    shared.expert_cache_remote_placement = &o.expert_cache_remote_placement;
+    shared.expert_cache = &o.expert_cache;
+    shared.gpu_consume = true;
+    shared.cvec_files = &o.cvec_files;
+    shared.cvec_first = &o.cvec_first;
+    shared.cvec_last = &o.cvec_last;
+    shared.cvec_mode = &o.cvec_mode;
+    shared.cvec_single = &o.cvec_single;
+    shared.prompt_cache = &o.prompt_cache;
+    shared.suffix_draft = &o.suffix_draft;
+    shared.lookup_chain = &o.lookup_chain;
+    shared.lookup_chain_lo = 0; shared.lookup_chain_hi = 7;
+    shared.lookup_chain_min = &o.lookup_chain_min;
+    shared.lookup_chain_min_lo = 3;
+    shared.pipeline_windows = &o.pipeline_windows;
+    shared.pipeline_windows_hi = 2;
+    shared.adapt_mib_per_token = &o.adapt_mib_per_token;
+    shared.adapt_mib_clamp0 = true;
+    shared.batch = &o.batch;
+    shared.expert_cache_remote = o.expert_cache_remote.data();
+    shared.pool_tasks = &o.pool_tasks;
+    shared.pool_tasks_msg = "xestrata generate: --pool-tasks expects an integer in 0..4096 (0 = automatic)";
+    shared.pool_tasks_strict = true;
+    shared.prompt_cache_every = &o.prompt_cache_every;
+    shared.prompt_cache_root = &o.prompt_cache_root;
+    shared.reply_checkpoint_every = &o.reply_checkpoint_every;
+    shared.short_read = &o.short_read;
+    shared.short_read_given = &o.short_read_given;
+    shared.turn_token = &o.turn_token;
+    shared.tail_role_token = &o.tail_role_token;
+    shared.vram_reserve_mib = &o.vram_reserve_mib;
+    shared.vram_reserve_given = &o.vram_reserve_given;
+    shared.vram_reserve_later_mib = &o.vram_reserve_later_mib;
+    shared.pcie_frac = &o.pcie_frac;
+    shared.yarn_ext_factor = &o.yarn_ext_factor;
+    shared.yarn_attn_factor = &o.yarn_attn_factor;
+    shared.yarn_beta_fast = &o.yarn_beta_fast;
+    shared.yarn_beta_slow = &o.yarn_beta_slow;
+    shared.aux_cpus = &o.aux_cpus;
+    shared.batch_groups = &o.batch_groups;
+    shared.batch_groups_set = &o.batch_groups_set;
+    shared.batch_groups_auto = &o.batch_groups_auto;
+    shared.conv_strict = true;
+    shared.conversation_cache_mib = &o.conversation_cache_mib;
+    shared.conversation_cache_slots = &o.conversation_cache_slots;
+    shared.conversation_cache_min_free_mib = &o.conversation_cache_min_free_mib;
+    shared.conversation_cache_min_tokens = &o.conversation_cache_min_tokens;
+    shared.conversation_cache_park_gain = &o.conversation_cache_park_gain;
+    shared.conversation_save_checkpoints = &o.conversation_save_checkpoints;
+    shared.conversation_save_mib = &o.conversation_save_mib;
+    shared.conversation_save_hours = &o.conversation_save_hours;
+    shared.session_min_free_mib = &o.session_min_free_mib;
+    shared.memory_limit_mib = &o.memory_limit_mib;
+    shared.ram_reserve_mib = &o.ram_reserve_mib;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -2475,6 +2313,10 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (const int r = strata::program::parse_shared_option(a, next, shared); r != 0) {
+            if (r < 0) return 2;
+            continue;
+        }
+        if (const int r = strata::program::parse_conversation_option(a, next, shared); r != 0) {
             if (r < 0) return 2;
             continue;
         }
@@ -2498,12 +2340,6 @@ int main(int argc, char** argv) {
             }
             have_tokens = true;
         }
-        else if (a == "--yarn-ext-factor") o.yarn_ext_factor = std::strtod(next("--yarn-ext-factor"), nullptr);
-        else if (a == "--yarn-attn-factor") o.yarn_attn_factor = std::strtod(next("--yarn-attn-factor"), nullptr);
-        else if (a == "--yarn-beta-fast") o.yarn_beta_fast = std::strtod(next("--yarn-beta-fast"), nullptr);
-        else if (a == "--yarn-beta-slow") o.yarn_beta_slow = std::strtod(next("--yarn-beta-slow"), nullptr);
-        else if (a == "--greedy") o.greedy = true;
-        else if (a == "--dump-logits") o.dump_logits = next("--dump-logits");
         else if (a == "--logits-stride") {
             if (have_logits_stride) { std::fprintf(stderr, "--logits-stride must be supplied only once\n"); return 2; }
             if (!strata::program::logits_selection::parse_stride(next("--logits-stride"), o.logits_stride)) {
@@ -2515,7 +2351,6 @@ int main(int argc, char** argv) {
         else if (a == "--dump-mixed") o.dump_mixed = next("--dump-mixed");
         else if (a == "--dump-layers") o.dump_layers = next("--dump-layers");
         else if (a == "--dump-halves") o.dump_halves = next("--dump-halves");
-        else if (a == "--dump-routing") o.dump_routing = next("--dump-routing");
         else if (a == "--ple-gguf") o.ple_gguf = next("--ple-gguf");
         else if (a == "--no-ple") o.no_ple = true;
         else if (a == "--ple-io") { o.ple_io = next("--ple-io"); o.ple_io_explicit = true; }
@@ -2526,8 +2361,6 @@ int main(int argc, char** argv) {
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
         else if (a == "--kv") o.kv = next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::strtoll(next("--kv-resident"), nullptr, 10);
-        else if (a == "--kv-grow") o.kv_grow = 1;
-        else if (a == "--no-kv-grow") o.kv_grow = 0;
         else if (a == "--stream-token") o.stream_token = true;
         else if (a == "--check-logits") o.check_logits = true;
         else if (a == "--native-flash-attn-short") o.native_flash_attn_short = true;
@@ -2541,42 +2374,6 @@ int main(int argc, char** argv) {
         else if (a == "--stage-timing") o.stage_timing = true;
         else if (a == "--graph-only") o.graph_only = true;
         else if (a == "--gpu-only-full") o.gpu_only_full = true;
-        else if (a == "--pool-cores") o.pool_cores = next("--pool-cores");
-        else if (a == "--aux-cpus") {
-            o.aux_cpus = next("--aux-cpus");
-            std::string aerr;
-            strata::aux_cpus::Config acfg;
-            if (!strata::aux_cpus::parse_spec(o.aux_cpus, acfg, aerr)) {
-                std::fprintf(stderr, "xestrata generate: %s\n", aerr.c_str());
-                return 2;
-            }
-        }
-        else if (a == "--pool-tasks") {
-            const char* v = next("--pool-tasks");
-            char* end = nullptr;
-            const long tasks = std::strtol(v, &end, 10);
-            if (end == v || *end != '\0' || tasks < 0 || tasks > strata::kernels::cpu::ExpertPool::kMaxTasks) {
-                std::fprintf(stderr, "xestrata generate: --pool-tasks expects an integer in 0..4096 (0 = automatic)\n");
-                return 2;
-            }
-            o.pool_tasks = (int) tasks;
-        }
-        else if (a == "--no-host-worker") o.no_host_worker = true;
-        else if (a == "--expert-cache") {
-            const std::string v = next("--expert-cache");
-            o.expert_cache = (v == "auto") ? -1 : (int) std::strtol(v.c_str(), nullptr, 10);
-        }
-        else if (a == "--expert-cache-device1") o.expert_cache_remote[0] = (int) std::strtol(next("--expert-cache-device1"), nullptr, 10);
-        else if (a == "--expert-cache-device2") o.expert_cache_remote[1] = (int) std::strtol(next("--expert-cache-device2"), nullptr, 10);
-        else if (a == "--expert-cache-device3") o.expert_cache_remote[2] = (int) std::strtol(next("--expert-cache-device3"), nullptr, 10);
-        else if (a == "--expert-cache-remote-placement")
-            o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
-        else if (a == "--vram-reserve-mib") {
-            o.vram_reserve_mib = (int) std::strtol(next("--vram-reserve-mib"), nullptr, 10);
-            o.vram_reserve_given = true;
-        }
-        else if (a == "--vram-reserve-later-mib")
-            o.vram_reserve_later_mib = (int) std::strtol(next("--vram-reserve-later-mib"), nullptr, 10);
         else if (a == "--prefill") {
             const std::string v = next("--prefill");
             o.prefill_auto = v == "auto";
@@ -2587,15 +2384,6 @@ int main(int argc, char** argv) {
         else if (a == "--prefill-until") o.prefill_until = std::strtoll(next("--prefill-until"), nullptr, 10);
         else if (a == "--prefill-experts") o.prefill_experts = (int) std::strtol(next("--prefill-experts"), nullptr, 10);
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
-        else if (a == "--batch" || a == "--slots") o.batch = (int) std::strtol(next(a.c_str()), nullptr, 10);
-        else if (a == "--batch-groups") {
-            const char* bgv = next(a.c_str());
-            o.batch_groups_set = true;
-            if (std::strcmp(bgv, "auto") == 0) o.batch_groups_auto = true;
-            else o.batch_groups = (int) std::strtol(bgv, nullptr, 10);
-        }
-        else if (a == "--batch-mtp") o.batch_mtp = 1;
-        else if (a == "--no-batch-mtp") o.batch_mtp = 0;
         else if (a == "--batch-cpu-split") {
             const char* v = next(a.c_str());
             char* e = nullptr;
@@ -2612,71 +2400,15 @@ int main(int argc, char** argv) {
         else if (a == "--window-hashes") o.window_hashes = next("--window-hashes");
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--mtp-window") o.mtp_window = std::strtoll(next("--mtp-window"), nullptr, 10);
-        else if (a == "--pcie-frac") o.pcie_frac = std::strtod(next("--pcie-frac"), nullptr);
-        else if (a == "--adapt-async") o.adapt_async = std::strtol(next("--adapt-async"), nullptr, 10) != 0 ? 1 : 0;
-        else if (a == "--adapt-mib-per-token")
-            o.adapt_mib_per_token = std::max(0, (int) std::strtol(next("--adapt-mib-per-token"), nullptr, 10));
-        else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
-        else if (a == "--gpu") (void) next("--gpu");   // applied at startup, before the runtime
+   // applied at startup, before the runtime
         else if (a == "--split-device") o.split_device = next("--split-device");
         else if (a == "--split-order") o.split_order_given = std::strcmp(next("--split-order"), "as-given") == 0;
         else if (a == "--split-skip-if-fits") o.split_skip_if_fits = true;
         else if (a == "--split-roles") o.split_roles_helper = std::strcmp(next("--split-roles"), "helper") == 0;
         else if (a == "--pcie-mode") o.pcie_mode = next("--pcie-mode");
-        else if (a == "--serve") o.serve = true;
-        else if (a == "--vision") o.vision = true;
-        else if (a == "--session-save-reclaim") o.session_save_reclaim = true;
-        else if (a == "--prompt-cache") o.prompt_cache = std::max(0, (int) std::strtol(next("--prompt-cache"), nullptr, 10));
-        else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
-                 a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens" ||
-                 a == "--conversation-save-checkpoints" ||
-                 a == "--conversation-save-mib" || a == "--conversation-save-hours" || a == "--session-min-free-mib" ||
-                 a == "--conversation-cache-park-gain" || a == "--memory-limit-mib" || a == "--ram-reserve-mib") {
-            const std::string value = next(a.c_str());
-            int64_t parsed = 0;
-            const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
-            const int64_t limit = a == "--conversation-cache-slots" || a == "--conversation-save-checkpoints" ||
-                                          a == "--conversation-cache-min-tokens" || a == "--conversation-cache-park-gain"
-                                      ? INT32_MAX
-                                  : a == "--conversation-save-hours" ? INT64_MAX / 3600
-                                                                     : INT64_MAX / (int64_t{1024} * 1024);
-            if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || parsed < 0 || parsed > limit) {
-                std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
-                return 2;
-            }
-            if (a == "--conversation-cache-mib") o.conversation_cache_mib = parsed;
-            else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = parsed;
-            else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = parsed;
-            else if (a == "--conversation-cache-park-gain") o.conversation_cache_park_gain = parsed;
-            else if (a == "--conversation-save-checkpoints") o.conversation_save_checkpoints = (int) parsed;
-            else if (a == "--conversation-save-mib") o.conversation_save_mib = parsed;
-            else if (a == "--conversation-save-hours") o.conversation_save_hours = parsed;
-            else if (a == "--session-min-free-mib") o.session_min_free_mib = parsed;
-            else if (a == "--memory-limit-mib") o.memory_limit_mib = parsed;
-            else if (a == "--ram-reserve-mib") o.ram_reserve_mib = parsed;
-            else o.conversation_cache_slots = (int) parsed;
-        }
-        else if (a == "--conversation-save") o.conversation_save = next("--conversation-save");
-        else if (a == "--conversation-save-compress") o.conversation_save_compress = true;
-        else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
-        else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
-        else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::strtoll(next("--prompt-cache-every"), nullptr, 10));
-        else if (a == "--reply-checkpoint-every")
-            o.reply_checkpoint_every = std::max(0LL, std::strtoll(next("--reply-checkpoint-every"), nullptr, 10));
-        else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::strtoll(next("--prompt-cache-root"), nullptr, 10));
-        else if (a == "--turn-token") o.turn_token = std::strtoll(next("--turn-token"), nullptr, 10);
-        else if (a == "--tail-role-token") o.tail_role_token = std::strtoll(next("--tail-role-token"), nullptr, 10);
-        else if (a == "--short-read") {
-            o.short_read = std::max(0LL, std::strtoll(next("--short-read"), nullptr, 10));
-            o.short_read_given = true;
-        }
-        else if (a == "--pipeline-windows") o.pipeline_windows = std::max(0, std::min(2, (int) std::strtol(next("--pipeline-windows"), nullptr, 10)));
-        else if (a == "--suffix-draft") o.suffix_draft = std::max(0, (int) std::strtol(next("--suffix-draft"), nullptr, 10));
         else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, (int) std::strtol(next("--mtp-max-t"), nullptr, 10));
-        else if (a == "--lookup-chain") o.lookup_chain = std::clamp((int) std::strtol(next("--lookup-chain"), nullptr, 10), 0, 7);
-        else if (a == "--lookup-chain-min") o.lookup_chain_min = std::max(3, (int) std::strtol(next("--lookup-chain-min"), nullptr, 10));
         else if (a == "--mtp-hnorm") {
             const std::string v = next("--mtp-hnorm");
             if (v != "pooled" && v != "stream") {
@@ -2684,38 +2416,6 @@ int main(int argc, char** argv) {
                 return 2;
             }
             o.mtp_hnorm_stream = v == "stream";
-        }
-        else if (a == "--control-vector") o.cvec_files.push_back({next("--control-vector"), 1.0f});
-        else if (a == "--control-vector-scaled") {
-            // FILE:SCALE, comma-separated; the last colon separates the scale from the path
-            std::stringstream list(next("--control-vector-scaled"));
-            std::string item;
-            while (std::getline(list, item, ',')) {
-                const size_t colon = item.rfind(':');
-                char* end = nullptr;
-                const float sc = colon == std::string::npos ? 0.0f : std::strtof(item.c_str() + colon + 1, &end);
-                if (colon == std::string::npos || colon == 0 || end == item.c_str() + colon + 1 || *end != '\0') {
-                    std::fprintf(stderr, "--control-vector-scaled: expected FILE:SCALE, got '%s'\n", item.c_str());
-                    return 2;
-                }
-                o.cvec_files.push_back({item.substr(0, colon), sc});
-            }
-        }
-        else if (a == "--control-vector-layer-range") {
-            o.cvec_first = (int) std::strtol(next("--control-vector-layer-range"), nullptr, 10);
-            o.cvec_last = (int) std::strtol(next("--control-vector-layer-range"), nullptr, 10);
-        }
-        else if (a == "--cvec-mode") {
-            const std::string m = next("--cvec-mode");
-            if (m == "project") o.cvec_mode = 0;
-            else if (m == "add") o.cvec_mode = 1;
-            else { std::fprintf(stderr, "--cvec-mode: add or project, got '%s'\n", m.c_str()); return 2; }
-        }
-        else if (a == "--cvec-dir") {
-            const std::string d = next("--cvec-dir");
-            if (d == "per-layer") o.cvec_single = -1;
-            else if (d.rfind("single:", 0) == 0) o.cvec_single = (int) std::strtol(d.c_str() + 7, nullptr, 10);
-            else { std::fprintf(stderr, "--cvec-dir: per-layer or single:L, got '%s'\n", d.c_str()); return 2; }
         }
         else if (a == "--no-spec-split") o.spec_split = false;
         else if (a == "--eos-ids") {
@@ -2727,9 +2427,6 @@ int main(int argc, char** argv) {
         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
         else if (a == "--gpu-stages") o.gpu_stages = true;
-        else if (a == "--coupled-draft") o.coupled_draft = true;
-        else if (a == "--no-coupled-draft") o.coupled_draft = false;
-        else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
         else if (a == "--resident-cpu-experts") { o.mmap_experts = o.resident_cpu_experts = true; o.resident_gib = -1; }
         else if (a == "--resident-experts") { o.mmap_experts = o.resident_pin = true; o.resident_gib = -1; }
         else if (a == "--resident-budget-gib") {
@@ -8960,72 +8657,12 @@ int main(int argc, char** argv) {
         };
         // stdin is read on its own thread, so a STOP line reaches a request that is still running (the client went
         // away, or pressed Esc): the flag is checked between prompt chunks and between verify windows.
-        // The reader is detached and may sit in read(2) past QUIT (the server writes more, or closes stdin, while main
-        // returns and the process exits), so what it touches is shared with it, never main's locals: a line or EOF
-        // after QUIT locked a destroyed mutex (upstream 6339e861).
-        struct StdinShared {
-            std::atomic<bool> stop_req{false};
-            std::mutex mu;
-            std::condition_variable cv;
-            std::deque<std::string> lines;
-            bool eof = false;
-        };
-        const auto in_shared = std::make_shared<StdinShared>();
-        std::atomic<bool>& stop_req = in_shared->stop_req;
-        std::mutex& in_mu = in_shared->mu;
-        std::condition_variable& in_cv = in_shared->cv;
-        std::deque<std::string>& in_lines = in_shared->lines;
-        bool& in_eof = in_shared->eof;
-        std::thread([st = in_shared] {
-            strata::platform::name_this_thread("xs-stdin");
-            strata::aux_cpus::pin_current_thread();
-            // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for
-            // stdin's lock, which getline holds while it waits for input - an engine ending on an error (every
-            // std::exit) would hang in exit() on Linux, and the server would wait for it forever
-            std::string l, buf;
-            char chunk[4096];
-            auto getline_fd = [&](std::string& out) -> bool {
-                for (;;) {
-                    const size_t nlpos = buf.find('\n');
-                    if (nlpos != std::string::npos) {
-                        out.assign(buf, 0, nlpos);
-                        buf.erase(0, nlpos + 1);
-                        return true;
-                    }
-#if defined(_WIN32)
-                    const int n = _read(0, chunk, (unsigned) sizeof chunk);
-#else
-                    const ssize_t n = ::read(0, chunk, sizeof chunk);
-#endif
-                    if (n < 0 && errno == EINTR) continue;
-                    if (n <= 0) {
-                        if (buf.empty()) return false;
-                        out.swap(buf);
-                        buf.clear();
-                        return true;
-                    }
-                    buf.append(chunk, (size_t) n);
-                }
-            };
-            while (getline_fd(l)) {
-                if (!l.empty() && l.back() == '\r') l.pop_back();
-                if (l == "STOP") { st->stop_req.store(true); continue; }
-                std::lock_guard<std::mutex> lk(st->mu);
-                st->lines.push_back(l);
-                st->cv.notify_one();
-            }
-            std::lock_guard<std::mutex> lk(st->mu);
-            st->eof = true;
-            st->cv.notify_one();
-        }).detach();
-        auto next_line = [&](std::string& out) -> bool {
-            std::unique_lock<std::mutex> lk(in_mu);
-            in_cv.wait(lk, [&] { return !in_lines.empty() || in_eof; });
-            if (in_lines.empty()) return false;
-            out = std::move(in_lines.front());
-            in_lines.pop_front();
-            return true;
-        };
+        // The reader (strata/core/stdin_lines.hpp, the three engines' one) is detached and may sit in read(2) past
+        // QUIT, so what it touches is shared with it, never main's locals (upstream 6339e861).
+        strata::core::StdinLines in;
+        std::atomic<bool>& stop_req = in.stop();
+        std::mutex& in_mu = in.mu();
+        std::deque<std::string>& in_lines = in.lines();
         sp.should_stop = [&] { return stop_req.load(); };
         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
         const bool trace = strata::env_get("TRACE") != nullptr;
@@ -9097,110 +8734,42 @@ int main(int argc, char** argv) {
             // notice), "none" otherwise
             const std::string igc = strata::core::compiler_workaround();
             const std::string igc_workaround = igc.empty() ? "none" : igc;
-            std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld spec=%d "
-                        "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
-                        "spec_min_p=%.2f spec_window=%s conversation_cache_mib=%lld conversation_cache_slots=%d "
-                        "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld tail_role_token=%lld "
-                        "vram_elastic=%d batch_slots=%d batch_groups=%d slot_cache=%d experts_ram=%s "
-                        "igc_workaround=%s grammar=%d script_table=%d helper_pci=%s engine=" STRATA_VERSION "\n",
-                        (long long) o.max_context, o.kv.c_str(),
-                        (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
-                                         ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
-                        (long long) xcache.slots(), (long long) (xcache.bytes() >> 20), o.spec, o.mtp_max_t,
-                        o.suffix_draft, (long long) (free_b >> 20), cvec_summary.c_str(),
-                        (long long) (ram_experts >> 20), pool.workers(), o.pcie_frac,
-                        o.spec_min_p, o.spec_window.c_str(), (long long) o.conversation_cache_mib, o.conversation_cache_slots,
-                        (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
-                        (long long) o.tail_role_token, xcache.elastic() ? 1 : 0, o.batch,
-                        o.batch > 0 ? o.batch_groups : 1, o.batch > 0 && o.prompt_cache > 0 ? 1 : 0, experts_ram,
-                        igc_workaround.c_str(), strata::core::grammar_built() && (o.batch == 0 || o.batch_groups <= 1) ? 1 : 0,
-                        o.batch == 0 ? 1 : 0,
-                        drive.d.remote_count > 0 ? strata::core::device_info(drive.d.remote[0]->device()).pci.c_str() : "none");
+            strata::program::InfoLine()
+                .add("logit_bias", 1)
+                .add("context", (long long) o.max_context)
+                .add("kv", o.kv)
+                .add("kv_resident", (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
+                                                 ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0))
+                .add("expert_slots", (long long) xcache.slots())
+                .add("expert_cache_mib", (long long) (xcache.bytes() >> 20))
+                .add("spec", o.spec)
+                .add("mtp_max", o.mtp_max_t)
+                .add("lookup", o.suffix_draft)
+                .add("vram_free_mib", (long long) (free_b >> 20))
+                .add("cvec", cvec_summary)
+                .add("arena_mib", (long long) (ram_experts >> 20))
+                .add("pool_workers", pool.workers())
+                .add_f("pcie_frac", o.pcie_frac)
+                .add_f("spec_min_p", o.spec_min_p)
+                .add("spec_window", o.spec_window)
+                .add("conversation_cache_mib", (long long) o.conversation_cache_mib)
+                .add("conversation_cache_slots", o.conversation_cache_slots)
+                .add("conversation_cache_min_free_mib", (long long) o.conversation_cache_min_free_mib)
+                .add("conversation_cache_min_tokens", (long long) o.conversation_cache_min_tokens)
+                .add("tail_role_token", (long long) o.tail_role_token)
+                .add("vram_elastic", xcache.elastic() ? 1 : 0)
+                .add("batch_slots", o.batch)
+                .add("batch_groups", o.batch > 0 ? o.batch_groups : 1)
+                .add("slot_cache", o.batch > 0 && o.prompt_cache > 0 ? 1 : 0)
+                .add("experts_ram", experts_ram)
+                .add("igc_workaround", igc_workaround)
+                .add("grammar", strata::core::grammar_built() && (o.batch == 0 || o.batch_groups <= 1) ? 1 : 0)
+                .add("script_table", o.batch == 0 ? 1 : 0)
+                .add("helper_pci", drive.d.remote_count > 0
+                                       ? strata::core::device_info(drive.d.remote[0]->device()).pci.c_str() : "none")
+                .print();
         }
-        // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
-        // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
-        // GPU spinning forever.  STRATA_WATCHDOG_S=0 turns it off.  Issue #31: before it does, it reports what every
-        // part was doing (stall_report), so one occurrence says where the wait is.
-        {
-            const char* ws = strata::env_get("WATCHDOG_S");
-            const int limit = ws ? (int) std::strtol(ws, nullptr, 10) : 60;   // one step (a prompt layer, a verify window) takes seconds
-            // #1407: while the OS is still reading the file tier (major faults / bytes read advance), a silent step is
-            // slow, not stuck; it gets up to STRATA_WATCHDOG_IO_S (default 10 x the limit) of such time. 0 = no allowance.
-            // #44: so does a step whose layers still finish (a verify window's CPU experts at 18 s a layer on a host
-            // that pages), within the same allowance.
-            const char* wio = strata::env_get("WATCHDOG_IO_S");
-            const int io_limit = wio ? (int) std::strtol(wio, nullptr, 10) : limit * 10;
-            if (limit > 0)
-                std::thread([limit, io_limit] {
-                    strata::platform::name_this_thread("xs-watchdog");
-                    strata::aux_cpus::pin_current_thread();
-                    strata::core::Progress& p = strata::core::progress();
-                    uint64_t last = p.beats.load(), ticks_at = p.ticks.load();
-                    auto since = std::chrono::steady_clock::now();
-                    auto io_since = since;
-                    uint64_t io_last = file_tier_activity();
-                    auto io_active_at = since;   // the last second the file tier was busy
-                    uint64_t ticks_seen = ticks_at;
-                    auto tick_at = since;        // the last second a layer finished
-                    bool io_noted = false, tick_noted = false;
-                    for (;;) {
-                        std::this_thread::sleep_for(std::chrono::seconds(1));
-                        const auto now = std::chrono::steady_clock::now();
-                        const uint64_t b = p.beats.load();
-                        if (!p.busy.load() || b != last) {
-                            last = b; ticks_at = ticks_seen = p.ticks.load(); since = io_since = io_active_at = tick_at = now;
-                            io_noted = tick_noted = false; io_last = file_tier_activity();
-                            continue;
-                        }
-                        if (const uint64_t tk = p.ticks.load(); tk != ticks_seen) { ticks_seen = tk; tick_at = now; }
-                        {   // sampled every second, also during the first `limit` seconds, so a busy file tier is seen
-                            const uint64_t a = file_tier_activity();
-                            if (a >= io_last + 16) io_active_at = now;   // 16 = faults + MiB read in a second: busy
-                            io_last = a;
-                        }
-                        if (now - since < std::chrono::seconds(limit)) continue;
-                        if (io_limit > limit && now - io_since < std::chrono::seconds(io_limit)) {
-                            // a thrashing host has seconds with almost no reads (one thread waiting on one page while
-                            // swap is written): busy within the last 10 s still counts as slow, not stuck (P2003, 46 GB)
-                            if (now - io_active_at < std::chrono::seconds(10)) {
-                                if (!io_noted) {
-                                    io_noted = true;
-                                    std::fprintf(stderr, "xestrata serve: no step finished for %d s, but the file tier is still being read "
-                                                         "(slow storage or low RAM): waiting while it is, up to %d s in all (XESTRATA_WATCHDOG_IO_S) (#1407)\n",
-                                                 limit, io_limit);
-                                }
-                                continue;
-                            }
-                            // #44: a layer finished within the limit: slow, not stuck
-                            if (now - tick_at < std::chrono::seconds(limit)) {
-                                if (!tick_noted) {
-                                    tick_noted = true;
-                                    std::fprintf(stderr, "xestrata serve: no step finished for %d s, but its layers still "
-                                                         "do (a slow host): waiting while they do, up to %d s in all "
-                                                         "(XESTRATA_WATCHDOG_IO_S)\n", limit, io_limit);
-                                }
-                                continue;
-                            }
-                        }
-                        // a blocking step's explicit allowance (session files): still within it, not yet stuck
-                        if (strata::core::progress_now_ms() < p.allow_until_ms.load()) continue;
-                        const auto secs = [&](auto t) { return (long long) std::chrono::duration_cast<std::chrono::seconds>(now - t).count(); };
-                        // #44: how long it was, and why the allowance ended where there was one
-                        std::string why;
-                        if (io_limit > limit)
-                            why = now - io_since >= std::chrono::seconds(io_limit)
-                                      ? "; the allowance of " + std::to_string(io_limit) + " s (XESTRATA_WATCHDOG_IO_S) is used up"
-                                      : "; no file-tier read for " + std::to_string(secs(io_active_at)) + " s and no layer "
-                                        "finished for " + std::to_string(secs(tick_at)) + " s";
-                        std::fprintf(stderr, "xestrata serve: no progress for %lld s during a request (%s)%s - stopping "
-                                             "the engine so the server starts it again (issue #29)\n",
-                                     secs(since), stage_text().c_str(), why.c_str());
-                        stall_report(stderr, p.ticks.load() - ticks_at);
-                        std::fflush(stderr);
-                        std::abort();
-                    }
-                }).detach();
-        }
+        strata::core::start_serve_watchdog();   // the three engines' one (strata/core/watchdog.hpp)
         strata::core::progress_at("idle");
         strata::gpu::pin_reserve_release();   // the engine is up: the pinned memory's last reserve goes back
         strata::platform::settle_before_ready();
@@ -9374,13 +8943,6 @@ int main(int argc, char** argv) {
         int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
         long long admit_max_new = 0;
         auto batch_on = [&] { for (const BSlot& b : bs) if (b.active) return true; return false; };
-        auto try_next_line = [&](std::string& out) -> bool {
-            std::lock_guard<std::mutex> lk(in_mu);
-            if (in_lines.empty()) return false;
-            out = std::move(in_lines.front());
-            in_lines.pop_front();
-            return true;
-        };
         // the session a request just left behind (its prompt and first token) -> slot b's session
         // (a layer split: each GPU's session -> its own slot session, on that GPU; LAYER SPLIT, same process only)
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e) -> bool {
@@ -10237,7 +9799,7 @@ int main(int argc, char** argv) {
         for (;;) {
             strata::platform::downgrades_say();   // a request's fallbacks, between whole lines
             if (batch_on() || (piped && pipe_inflight())) {   // the slots decode while no line waits
-                if (!try_next_line(line)) {
+                if (!in.try_next(line)) {
                     if (!(piped ? pump(true) : batch_step())) return 1;
                     // the stages' threads poll; spinning here slowed them 3x (it starved the runtime's threads)
                     if (pipe_threads) std::this_thread::sleep_for(std::chrono::microseconds(20));
@@ -10245,7 +9807,7 @@ int main(int argc, char** argv) {
                 }
                 // a request reads its prompt through every stage: the groups in flight finish first
                 if (piped && line.rfind("BSTOP ", 0) != 0 && !pipe_drain()) return 1;
-            } else if (!next_line(line)) {
+            } else if (!in.next(line)) {
                 break;
             }
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
@@ -10354,18 +9916,7 @@ int main(int argc, char** argv) {
                 continue;
             }
             // the watchdog watches a request from here until this iteration ends, whichever way it ends
-            struct BusyScope {
-                BusyScope() {
-                    strata::core::progress().allow_until_ms.store(0);
-                    strata::core::progress().busy.store(true);
-                    strata::core::progress_at("request");
-                }
-                ~BusyScope() {
-                    strata::core::progress().busy.store(false);
-                    strata::core::progress().allow_until_ms.store(0);
-                    strata::core::progress_at("idle");
-                }
-            } busy_scope;
+            strata::core::ProgressBusyScope busy_scope;
             stop_req.store(false);   // a STOP that arrived between requests is stale
             err.clear();               // nor may a cancelled request's error fail this one (upstream 6cad1fe)
             // Disk sessions: SAVE <path> | RESTORE <path>, between requests (the path runs to the end of the line,
@@ -10629,7 +10180,7 @@ int main(int argc, char** argv) {
             // only).  Absent keys keep today's behavior: greedy, no penalties.
             float req_temperature = 0.0f, req_top_p = 1.0f;
             int req_top_k = 20;   // the sampler's own default; the sampled path REQUIRES top_k in 1..64
-            unsigned long long req_seed = 0;
+            uint64_t req_seed = 0;
             float req_min_p = 0.0f, req_penalty_repeat = 1.0f, req_penalty_freq = 0.0f, req_penalty_present = 0.0f;
             int req_penalty_last_n = 0;
             std::string req_bias_text;
@@ -10675,65 +10226,24 @@ int main(int argc, char** argv) {
             bool req_route_prior = true;
             // script_table=, script_allow=, script_pending=: the script guard's (src/core/script_guard.cpp)
             std::string req_script, req_script_allow, req_script_pending;
-            if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
-                                     // embedding file path is the first token without an =
-                for (;;) {
-                    while (*endp == ' ') ++endp;
-                    const char* start = endp;
-                    while (*endp != '\0' && *endp != ' ') ++endp;
-                    if (endp == start) break;
-                    const std::string tok(start, (size_t) (endp - start));
-                    const size_t eq = tok.find('=');
-                    if (eq == std::string::npos) { endp = const_cast<char*>(start); break; }
-                    const std::string key = tok.substr(0, eq);
-                    const float fv = std::strtof(tok.c_str() + eq + 1, nullptr);
-                    if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
-                    else if (key == "script_table") req_script = tok.substr(eq + 1);
-                    else if (key == "script_allow") req_script_allow = tok.substr(eq + 1);
-                    else if (key == "script_pending") req_script_pending = tok.substr(eq + 1);
-                    else if (key == "cvec") req_cvec = (int) std::strtol(tok.c_str() + eq + 1, nullptr, 10);
-                    else if (key == "ckpt") req_ckpt = std::strtol(tok.c_str() + eq + 1, nullptr, 10) != 0;
-                    else if (key == "prefill") req_prefill_only = std::strtol(tok.c_str() + eq + 1, nullptr, 10) != 0;
-                    else if (key == "pin") req_pin = std::max<long long>(0, std::strtoll(tok.c_str() + eq + 1, nullptr, 10));
-                    else if (key == "temperature") req_temperature = fv;
-                    else if (key == "top_p") req_top_p = fv;
-                    else if (key == "top_k") req_top_k = (int) std::strtol(tok.c_str() + eq + 1, nullptr, 10);
-                    else if (key == "min_p") req_min_p = fv;
-                    else if (key == "penalty_last_n") req_penalty_last_n = (int) std::strtol(tok.c_str() + eq + 1, nullptr, 10);
-                    else if (key == "logprobs") req_logprobs = (int) std::clamp(std::strtol(tok.c_str() + eq + 1, nullptr, 10), -1L, 20L);
-                    else if (key == "grammar") req_grammar = tok.substr(eq + 1);
-                    else if (key == "route_prior") req_route_prior = std::strtol(tok.c_str() + eq + 1, nullptr, 10) != 0;
-                    else if (key == "allowed") {   // allowed=a,b,c: with logprobs, these ids only (upstream 9ea044962, #3200)
-                        req_allowed.clear();
-                        for (const char* c = tok.c_str() + eq + 1; *c != '\0';) {
-                            char* end = nullptr;
-                            const long id = std::strtol(c, &end, 10);
-                            if (end == c) break;
-                            req_allowed.push_back((int32_t) id);
-                            c = *end == ',' ? end + 1 : end;
-                        }
-                    }
-                    else if (key == "penalty_repeat") req_penalty_repeat = fv;
-                    else if (key == "penalty_freq") req_penalty_freq = fv;
-                    else if (key == "penalty_present") req_penalty_present = fv;
-                    else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
-                    else if (key == "pcie_frac") { req_pcie_frac = std::clamp((double) fv, 0.0, 1.0); req_pcie_set = true; }
-                    else if (key == "spec_min_p") { req_spec_min_p = std::clamp((double) fv, 0.0, 1.0); req_minp_rule = true; }
-                    else if (key == "aux_cpus") req_aux_cpus = std::strtol(tok.c_str() + eq + 1, nullptr, 10) != 0 ? 1 : 0;
-                    else if (key == "img_keys") {
-                        req_img_keys.clear();
-                        const char* q = tok.c_str() + eq + 1;
-                        while (*q != '\0') {
-                            char* qe = nullptr;
-                            const unsigned long long v = std::strtoull(q, &qe, 16);
-                            if (qe == q) { req_img_keys.clear(); break; }
-                            req_img_keys.push_back((uint64_t) v);
-                            q = *qe == ',' ? qe + 1 : qe;
-                            if (*qe != ',' && *qe != '\0') { req_img_keys.clear(); break; }
-                        }
-                    }
-                    // unknown keys are skipped: the ids start at the first token without '='
-                }
+            std::string emb_path;
+            {   // GENI takes the same keys (#75: image requests were always greedy); its embedding file path is
+                // the first token without an = (strata/program/gen_keys.hpp, the two engines' one reader)
+                strata::program::GenKeyFields kf;
+                kf.temperature = &req_temperature; kf.top_p = &req_top_p; kf.top_k = &req_top_k; kf.min_p = &req_min_p;
+                kf.seed = &req_seed;
+                kf.penalty_repeat = &req_penalty_repeat; kf.penalty_freq = &req_penalty_freq;
+                kf.penalty_present = &req_penalty_present; kf.penalty_last_n = &req_penalty_last_n;
+                kf.ckpt_int = &req_ckpt; kf.prefill = &req_prefill_only; kf.pin = &req_pin; kf.pin_clamp0 = true;
+                kf.logprobs = &req_logprobs; kf.grammar = &req_grammar;
+                kf.logit_bias = &req_bias_text; kf.logit_bias_present = &req_bias_present;
+                kf.script_table = &req_script; kf.script_allow = &req_script_allow; kf.script_pending = &req_script_pending;
+                kf.cvec_int = &req_cvec; kf.aux_cpus_deferred = &req_aux_cpus;
+                kf.pcie_frac = &req_pcie_frac; kf.pcie_set = &req_pcie_set; kf.pcie_float = true;
+                kf.spec_min_p = &req_spec_min_p; kf.minp_rule = &req_minp_rule; kf.spec_float = true;
+                kf.route_prior = &req_route_prior;
+                kf.allowed = &req_allowed; kf.img_keys = &req_img_keys;
+                strata::program::parse_gen_keys(endp, kf, geni, &emb_path);
             }
             std::vector<float> req_bias;
             std::string bias_error;
@@ -10767,12 +10277,6 @@ int main(int argc, char** argv) {
                 }
                 script.apply_bans(req_bias, (int) n_vocab);
                 grammar_rows.resize((size_t) strata::kernels::kVerifyMaxT * (size_t) script.words());
-            }
-            std::string emb_path;
-            if (geni && endp != nullptr) {
-                while (*endp == ' ') ++endp;
-                char* gap = std::strchr(endp, ' ');
-                if (gap != nullptr) { emb_path.assign(endp, (size_t) (gap - endp)); endp = gap; }
             }
             std::vector<int64_t> ids;
             std::string pe;
@@ -10968,7 +10472,7 @@ int main(int argc, char** argv) {
             {   // upstream #2065: the free VRAM now, for the stall report (the verify windows' captures and the batch
                 // layouts eat into what the start reported)
                 size_t vf_b = 0, vt_b = 0;
-                if (strata::gpu::mem_info(&vf_b, &vt_b)) g_req_vram_free_mib.store((int64_t) (vf_b >> 20));
+                if (strata::gpu::mem_info(&vf_b, &vt_b)) strata::core::watchdog_note_request_vram((int64_t) (vf_b >> 20));
             }
             int64_t resume = 0;
             bool from_live = false;
@@ -13896,7 +13400,7 @@ int main(int argc, char** argv) {
         // CPU pool was 6x slower came while tens of GB were being downloaded (the 2026-09-30-xe-swift-iq2xs record)
 #if defined(_WIN32)
         // Windows counts the soft faults with the hard ones
-        const auto major_faults = [] { return (long long) mem_sample().faults; };
+        const auto major_faults = [] { return (long long) strata::core::mem_sample().faults; };
 #else
         const auto major_faults = [] { rusage u{}; getrusage(RUSAGE_SELF, &u); return (long long) u.ru_majflt; };
 #endif
@@ -13923,8 +13427,8 @@ int main(int argc, char** argv) {
                     const uint64_t b = pr.beats.load();
                     if (b != last) { last = b; ticks_at = pr.ticks.load(); since = now; continue; }
                     if (now - since < std::chrono::seconds(limit)) continue;
-                    std::fprintf(stderr, "xestrata generate: no progress for %d s (%s)\n", limit, stage_text().c_str());
-                    stall_report(stderr, pr.ticks.load() - ticks_at);
+                    std::fprintf(stderr, "xestrata generate: no progress for %d s (%s)\n", limit, strata::core::stage_text().c_str());
+                    strata::core::stall_report(stderr, pr.ticks.load() - ticks_at);
                     strata::core::release_gpu_waits(stderr);
                     std::fflush(stderr);
                     std::abort();
@@ -14190,7 +13694,7 @@ int main(int argc, char** argv) {
         if (rounds > 0) {
 #if defined(_WIN32)
             std::printf("%-24s %lld page faults (soft and hard) while decoding; %llu MiB committed by this process\n",
-                        "host memory", major_faults() - majflt0, mem_sample().commit_mib);
+                        "host memory", major_faults() - majflt0, strata::core::mem_sample().commit_mib);
 #else
             long long swap_kb = -1;
             std::ifstream st("/proc/self/status");

@@ -54,6 +54,8 @@
 #include <utility>
 #include <vector>
 
+namespace strata::platform { class MappedFile; }
+
 namespace strata::image {
 
 /// W values side by side, aligned to their size: a work-item's load or store of them in one access (vec<T, W> of
@@ -171,7 +173,6 @@ struct MfOut {
     }
 };
 
-class MappedFile;
 class SafeTensors;
 
 class MfDit {
@@ -332,7 +333,7 @@ private:
     void drop_refs();
     void time_embedding(float sigma);
 
-    std::unique_ptr<MappedFile> file_;
+    std::unique_ptr<platform::MappedFile> file_;
     std::unique_ptr<SafeTensors> st_;   // the file's header (a DoRA's row norms read its tensors)
     std::vector<std::vector<uint8_t>> host_;   // the blocks' Q8_0 (and every block's FP32 vectors), when not in place
     void* s_ = nullptr;

@@ -16,6 +16,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/image/gpu_buf.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -29,16 +30,6 @@ namespace gpu = strata::gpu;
 namespace {
 
 constexpr int kTypeF16 = 1, kTypeF32 = 0;
-
-template<class T> T* alloc(std::vector<void*>& owned, int64_t n, bool zero = false) {
-    T* p = nullptr;
-    if (!gpu::alloc_device(&p, (size_t) n * sizeof(T)))
-        throw std::runtime_error(std::string("image engine (vision): GPU memory: ") + gpu::last_error());
-    if (zero && !gpu::memset(p, 0, (size_t) n * sizeof(T)))
-        throw std::runtime_error(std::string("image engine (vision): memset: ") + gpu::last_error());
-    owned.push_back(p);
-    return p;
-}
 
 void put(void* d, const void* h, size_t bytes) {
     if (!gpu::copy(d, h, bytes))
@@ -73,11 +64,11 @@ QiVision::W QiVision::linear(const std::string& name) {
     } else {
         throw std::runtime_error("image engine (vision): " + name + ": type " + std::to_string(t->type));
     }
-    uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
+    uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size(), "image engine (vision)");
     put(d, h.data(), h.size() * 2);
     w.w = d;
     if (b != nullptr) {
-        float* db = alloc<float>(allocs_, w.n);
+        float* db = alloc<float>(allocs_, w.n, "image engine (vision)");
         put(db, g_->tensor_data(*b), (size_t) w.n * 4);
         w.b = db;
     }
@@ -92,7 +83,7 @@ QiVision::Norm QiVision::norm(const std::string& name) {
         const auto c = (int64_t) t->elements();
         weight_bytes_ += (uint64_t) c * 4;
         if (dry_) continue;
-        float* d = alloc<float>(allocs_, c);
+        float* d = alloc<float>(allocs_, c, "image engine (vision)");
         put(d, g_->tensor_data(*t), (size_t) c * 4);
         (part[1] == 'w' ? n.w : n.b) = d;
     }
@@ -137,10 +128,10 @@ bool QiVision::open(const std::string& path, void* stream, std::string& err, boo
             const auto* b = p1 ? reinterpret_cast<const uint16_t*>(g_->tensor_data(*p1)) : nullptr;
             for (size_t i = 0; i < h.size(); ++i)
                 h[i] = kernels::f16_from_f32(kernels::f32_from_f16(a[i]) + (b ? kernels::f32_from_f16(b[i]) : 0.f));
-            uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
+            uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size(), "image engine (vision)");
             put(d, h.data(), h.size() * 2);
             patch_w_ = d;
-            float* db = alloc<float>(allocs_, C_);
+            float* db = alloc<float>(allocs_, C_, "image engine (vision)");
             put(db, g_->tensor_data(*pb), (size_t) C_ * 4);
             patch_b_ = db;
         }
@@ -195,16 +186,16 @@ void QiVision::grow(int64_t patches) {
     if (patches <= cap_) return;
     drop_scratch();
     const int64_t T = patches, TP = qi_attn_rows(T);
-    x_ = alloc<float>(work_, T * C_);
-    y_ = alloc<float>(work_, T * std::max(3 * C_, ffn_));
-    big_ = alloc<float>(work_, T * heads_ * 128);
-    h16_ = alloc<uint16_t>(work_, T * std::max({C_, ffn_, 3 * patch_ * patch_}));
-    q16_ = alloc<uint16_t>(work_, TP * heads_ * 128, true);   // the rows past T stay zero
-    k16_ = alloc<uint16_t>(work_, TP * heads_ * 128, true);
-    v16_ = alloc<uint16_t>(work_, TP * heads_ * 128, true);
-    a16_ = alloc<uint16_t>(work_, T * heads_ * 128);
-    o16_ = alloc<uint16_t>(work_, T * C_);
-    yx_ = alloc<int32_t>(work_, 2 * T);
+    x_ = alloc<float>(work_, T * C_, "image engine (vision)");
+    y_ = alloc<float>(work_, T * std::max(3 * C_, ffn_), "image engine (vision)");
+    big_ = alloc<float>(work_, T * heads_ * 128, "image engine (vision)");
+    h16_ = alloc<uint16_t>(work_, T * std::max({C_, ffn_, 3 * patch_ * patch_}), "image engine (vision)");
+    q16_ = alloc<uint16_t>(work_, TP * heads_ * 128, "image engine (vision)", true);   // the rows past T stay zero
+    k16_ = alloc<uint16_t>(work_, TP * heads_ * 128, "image engine (vision)", true);
+    v16_ = alloc<uint16_t>(work_, TP * heads_ * 128, "image engine (vision)", true);
+    a16_ = alloc<uint16_t>(work_, T * heads_ * 128, "image engine (vision)");
+    o16_ = alloc<uint16_t>(work_, T * C_, "image engine (vision)");
+    yx_ = alloc<int32_t>(work_, 2 * T, "image engine (vision)");
     cap_ = patches;
 }
 

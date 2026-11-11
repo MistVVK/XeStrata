@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// include/strata/image/mapped_file.hpp - a file mapped read-only (a safetensors file's weights read in place, as the
+// include/strata/platform/mapped_file.hpp - a file mapped read-only (a safetensors file's weights read in place, as the
 // GGUF reader maps its files), and a way to drop a range of it from the page cache once it is no longer read.
 #pragma once
 
@@ -24,7 +24,7 @@
 #include <unistd.h>
 #endif
 
-namespace strata::image {
+namespace strata::platform {
 
 class MappedFile {
 public:
@@ -109,4 +109,4 @@ private:
 #endif
 };
 
-}  // namespace strata::image
+}  // namespace strata::platform

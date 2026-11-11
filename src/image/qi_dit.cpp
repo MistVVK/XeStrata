@@ -18,6 +18,7 @@
 #include "strata/core/runtime.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/native_qsa.hpp"
+#include "strata/image/gpu_buf.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -36,22 +37,6 @@ namespace {
 constexpr int kTypeF16 = 1, kTypeF32 = 0, kTypeBF16 = 30;
 constexpr int64_t kHead = 128;
 const int kAxes[3] = {16, 56, 56};   // the rotary embedding's dims per axis: text position, height, width
-
-template<class T> T* alloc(std::vector<void*>& owned, int64_t n, bool zero = false) {
-    T* p = nullptr;
-    if (!gpu::alloc_device(&p, (size_t) n * sizeof(T)))
-        throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
-    if (zero && !gpu::memset(p, 0, (size_t) n * sizeof(T)))
-        throw std::runtime_error(std::string("image engine: memset: ") + gpu::last_error());
-    owned.push_back(p);
-    return p;
-}
-
-void release(std::vector<void*>& owned, void* p) {
-    if (p == nullptr) return;
-    owned.erase(std::remove(owned.begin(), owned.end(), p), owned.end());
-    gpu::free(p);
-}
 
 void put(void* d, const void* h, size_t bytes) {
     if (!gpu::copy(d, h, bytes)) throw std::runtime_error(std::string("image engine: copy: ") + gpu::last_error());
@@ -145,7 +130,7 @@ QiDit::W QiDit::upload(const std::string& name) {
         std::vector<uint16_t> h((size_t) (w.n * w.k));
         const auto* f = reinterpret_cast<const float*>(g_->tensor_data(*t));
         for (size_t i = 0; i < h.size(); ++i) h[i] = kernels::f16_from_f32(f[i]);
-        uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
+        uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size(), "image engine");
         put(d, h.data(), h.size() * 2);
         w.type = kTypeF16;
         w.d = d;
@@ -157,7 +142,7 @@ QiDit::W QiDit::upload(const std::string& name) {
     w.row_bytes = bytes / (uint64_t) w.n;
     weight_bytes_ += bytes;
     if (dry_) return w;
-    uint8_t* d = alloc<uint8_t>(allocs_, (int64_t) bytes);
+    uint8_t* d = alloc<uint8_t>(allocs_, (int64_t) bytes, "image engine");
     put(d, g_->tensor_data(*t), bytes);
     w.d = d;
     return w;
@@ -178,7 +163,7 @@ const float* QiDit::upload_f32(const std::string& name, float add) {
         for (int64_t i = 0; i < n; ++i) h[(size_t) i] = kernels::f32_from_bf16(reinterpret_cast<const uint16_t*>(src)[i]);
     else throw std::runtime_error("image engine: " + name + ": a vector of type " + std::to_string(t->type));
     for (float& v : h) v += add;
-    float* d = alloc<float>(allocs_, n);
+    float* d = alloc<float>(allocs_, n, "image engine");
     put(d, h.data(), (size_t) n * 4);
     weight_bytes_ += (uint64_t) n * 4;
     return d;
@@ -289,14 +274,14 @@ bool QiDit::open(const std::string& path, void* stream, std::string& err, bool d
         if (dry_) return true;
         if (!gemm_.init(s_, scratch, err)) return false;
         if (w8t_bytes > 0) {
-            w8t_ = alloc<int8_t>(allocs_, (int64_t) w8t_bytes);
-            w8t_s_ = alloc<float>(allocs_, kW8tScales * w8t_rows_);
+            w8t_ = alloc<int8_t>(allocs_, (int64_t) w8t_bytes, "image engine");
+            w8t_s_ = alloc<float>(allocs_, kW8tScales * w8t_rows_, "image engine");
         }
         blocks_stream_.configure(blocks_stream_.total(), s_);   // all resident until a budget is set
-        temb_ = alloc<float>(allocs_, 2 * C_);
-        mods_ = alloc<float>(allocs_, 8 * C_);
-        scale_ = alloc<float>(allocs_, 2 * C_);
-        small16_ = alloc<uint16_t>(allocs_, 2 * C_);
+        temb_ = alloc<float>(allocs_, 2 * C_, "image engine");
+        mods_ = alloc<float>(allocs_, 8 * C_, "image engine");
+        scale_ = alloc<float>(allocs_, 2 * C_, "image engine");
+        small16_ = alloc<uint16_t>(allocs_, 2 * C_, "image engine");
         return true;
     } catch (const std::exception& e) {
         err = e.what();
@@ -312,7 +297,7 @@ int8_t* QiDit::xq8(int64_t T, int64_t K, float** sx) {
             allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), xq_), allocs_.end());
             gpu::free(xq_);
         }
-        xq_ = alloc<uint8_t>(allocs_, (int64_t) need);
+        xq_ = alloc<uint8_t>(allocs_, (int64_t) need, "image engine");
         xq_bytes_ = need;
     }
     if (T > xs_rows_) {
@@ -321,7 +306,7 @@ int8_t* QiDit::xq8(int64_t T, int64_t K, float** sx) {
             allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), xs_), allocs_.end());
             gpu::free(xs_);
         }
-        xs_ = alloc<float>(allocs_, 2 * T);
+        xs_ = alloc<float>(allocs_, 2 * T, "image engine");
         xs_rows_ = T;
     }
     *sx = xs_ + xs_next_ * xs_rows_;
@@ -454,22 +439,23 @@ void QiDit::ensure(int64_t T, int64_t HW) {
                 gpu::free(p);
             }
         const int64_t TP = qi_attn_rows(T);
-        x_ = alloc<float>(allocs_, T * C_);
-        q_ = alloc<float>(allocs_, T * C_);
-        k_ = alloc<float>(allocs_, T * C_);
-        v_ = alloc<float>(allocs_, T * C_);
-        h_ = alloc<float>(allocs_, T * std::max(C_, in_ch_));
+        x_ = alloc<float>(allocs_, T * C_, "image engine");
+        q_ = alloc<float>(allocs_, T * C_, "image engine");
+        k_ = alloc<float>(allocs_, T * C_, "image engine");
+        v_ = alloc<float>(allocs_, T * C_, "image engine");
+        h_ = alloc<float>(allocs_, T * std::max(C_, in_ch_), "image engine");
         mlp_rows_ = std::min(T, mlp_cap_ > 0 ? mlp_cap_ : T);
-        gu_ = alloc<float>(allocs_, mlp_rows_ * 2 * inter_);
-        h16_ = alloc<uint16_t>(allocs_, T * std::max(C_, inter_));
-        q16_ = alloc<uint16_t>(allocs_, TP * C_, true);
-        k16_ = alloc<uint16_t>(allocs_, TP * C_, true);
-        v16_ = alloc<uint16_t>(allocs_, TP * C_, true);
-        o16_ = alloc<uint16_t>(allocs_, T * C_);
-        cos_ = alloc<float>(allocs_, T * kHead / 2);
-        sin_ = alloc<float>(allocs_, T * kHead / 2);
+        gu_ = alloc<float>(allocs_, mlp_rows_ * 2 * inter_, "image engine");
+        h16_ = alloc<uint16_t>(allocs_, T * std::max(C_, inter_), "image engine");
+        q16_ = alloc<uint16_t>(allocs_, TP * C_, "image engine", true);
+        k16_ = alloc<uint16_t>(allocs_, TP * C_, "image engine", true);
+        v16_ = alloc<uint16_t>(allocs_, TP * C_, "image engine", true);
+        o16_ = alloc<uint16_t>(allocs_, T * C_, "image engine");
+        cos_ = alloc<float>(allocs_, T * kHead / 2, "image engine");
+        sin_ = alloc<float>(allocs_, T * kHead / 2, "image engine");
         // the int8 attention's K means, a block and context (zero until a step makes one)
-        kmean_.init(alloc<float>(allocs_, (int64_t) blocks_.size() * 2 * C_), (int64_t) blocks_.size() * 2, C_);
+        kmean_.init(alloc<float>(allocs_, (int64_t) blocks_.size() * 2 * C_, "image engine"),
+                    (int64_t) blocks_.size() * 2, C_);
         gpu::memset_async(kmean_.buf, 0, (size_t) blocks_.size() * 2 * C_ * 4, s_);
         // the plain attention's FP32 output: only where the matrix engines' path is not taken
         cap_T_ = T;
@@ -540,7 +526,7 @@ void QiDit::set_context(const float* ctx, int64_t n_ctx, const std::vector<Ref>&
         allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), (void*) text_), allocs_.end());
         gpu::free(text_);
     }
-    text_ = alloc<float>(allocs_, n_pre * C_);
+    text_ = alloc<float>(allocs_, n_pre * C_, "image engine");
     // the prefix: the context's rows, each reference's pads its latent's tokens
     pre_pos_.assign((size_t) (n_pre * 3), 0.0f);
     std::vector<int32_t> lim((size_t) n_pre);
@@ -582,7 +568,7 @@ void QiDit::set_context(const float* ctx, int64_t n_ctx, const std::vector<Ref>&
         key_lim_ = nullptr;
     }
     if (!refs.empty()) {   // without references a prefix row sees itself and before: the attention's own rule
-        key_lim_ = alloc<int32_t>(allocs_, n_pre);
+        key_lim_ = alloc<int32_t>(allocs_, n_pre, "image engine");
         put(key_lim_, lim.data(), lim.size() * 4);
     }
     for (size_t bi = 0; bi < blocks_.size(); ++bi) {
@@ -594,7 +580,7 @@ void QiDit::set_context(const float* ctx, int64_t n_ctx, const std::vector<Ref>&
                 *p = nullptr;
             }
             if ((int) bi < kv_vram_) {
-                *p = alloc<uint16_t>(allocs_, n_pre * C_);
+                *p = alloc<uint16_t>(allocs_, n_pre * C_, "image engine");
             } else {   // pinned RAM: the step copies it in (the device reads it no slower than any copy)
                 if (!gpu::alloc_host(p, (size_t) (n_pre * C_) * 2))
                     throw std::runtime_error(std::string("image engine: pinned RAM for the prefix cache: ") +
@@ -783,7 +769,7 @@ void QiDit::forward_pair(const float* x, float t, int64_t H, int64_t W, float* o
                     allocs_.erase(std::remove(allocs_.begin(), allocs_.end(), (void*) *p), allocs_.end());
                     gpu::free(*p);
                 }
-                *p = alloc<float>(allocs_, Tb * kHead / 2);
+                *p = alloc<float>(allocs_, Tb * kHead / 2, "image engine");
             }
             o.rope_cap = Tb;
         }
@@ -931,8 +917,8 @@ void QiDit::lora_scratch(int64_t T) {
             gpu::free(*p);
             *p = nullptr;
         }
-    lora_f32_ = alloc<float>(allocs_, T * lora_cols_);
-    lora16_ = alloc<uint16_t>(allocs_, T * lora_cols_);
+    lora_f32_ = alloc<float>(allocs_, T * lora_cols_, "image engine");
+    lora16_ = alloc<uint16_t>(allocs_, T * lora_cols_, "image engine");
     lora_tmp_t_ = T;
 }
 
@@ -942,9 +928,9 @@ void QiDit::lora_scratch(int64_t T) {
 void QiDit::lora_glora_scratch() {
     if (lora_glora_cols_ <= 0 || lora_glora_rows_ <= 0) return;
     const size_t band = (size_t) kLoraGloraRows;
-    lora_glora_y_ = alloc<float>(allocs_, (int64_t) (band * (size_t) lora_glora_rows_));
-    lora_glora_x8_ = alloc<int8_t>(allocs_, (int64_t) (band * (size_t) lora_glora_cols_));
-    lora_glora_sx_ = alloc<float>(allocs_, (int64_t) band);
+    lora_glora_y_ = alloc<float>(allocs_, (int64_t) (band * (size_t) lora_glora_rows_), "image engine");
+    lora_glora_x8_ = alloc<int8_t>(allocs_, (int64_t) (band * (size_t) lora_glora_cols_), "image engine");
+    lora_glora_sx_ = alloc<float>(allocs_, (int64_t) band, "image engine");
 }
 
 void QiDit::glora_weight(const uint16_t* v, const W& w, int64_t r0, int64_t n, int64_t nt, int64_t t0, float* y,
@@ -1168,8 +1154,8 @@ bool QiDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                     for (const LoraPart& p : w->lora->parts) kr = std::max(kr, w->k * p.entry->rank());
                 }
         if (nk > 0) {
-            bake_tmp_ = alloc<float>(allocs_, nk);
-            bake_at16_ = alloc<uint16_t>(allocs_, kr);
+            bake_tmp_ = alloc<float>(allocs_, nk, "image engine");
+            bake_at16_ = alloc<uint16_t>(allocs_, kr, "image engine");
             baked_any_ = true;
             blocks_stream_.reload();   // the queued work drained before the prepare changes
             install_prepare();

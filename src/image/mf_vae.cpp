@@ -17,8 +17,11 @@
 
 #include "dit_rows.hpp"
 #include "tile_sides.hpp"
+#include "img_out.hpp"
 #include "qi_conv.hpp"
 #include "vae_attention.hpp"
+
+#include "strata/image/gpu_buf.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -56,28 +59,12 @@ constexpr int64_t kAdaW = 0, kAdaB = kAdaW + 3 * kX * kX, kLnW = kAdaB + 3 * kX,
                   kM1B = kM1W + kX * kX, kM2W = kM1B + kX, kM2B = kM2W + kX * kX, kResSize = kM2B + kX;
 constexpr int64_t kFnW = kRes0 + kResBlocks * kResSize, kFlW = kFnW + kX, kFlB = kFlW + 3 * kX, kPixW = kFlB + 3;
 
-sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
-
-template<class T> T* alloc(std::vector<void*>& owned, int64_t n) {
-    T* p = nullptr;
-    if (!gpu::alloc_device(&p, (size_t) std::max<int64_t>(n, 1) * sizeof(T)))
-        throw std::runtime_error(std::string("image engine (Mage-VAE): GPU memory: ") + gpu::last_error());
-    owned.push_back(p);
-    return p;
-}
-
 template<class T> T* alloc_pinned(std::vector<void*>& owned, int64_t n) {
     void* p = gpu::alloc_host((size_t) std::max<int64_t>(n, 1) * sizeof(T));
     if (p == nullptr)
         throw std::runtime_error(std::string("image engine (Mage-VAE): pinned host memory: ") + gpu::last_error());
     owned.push_back(p);
     return static_cast<T*>(p);
-}
-
-void release(std::vector<void*>& owned, void* p) {
-    if (p == nullptr) return;
-    owned.erase(std::remove(owned.begin(), owned.end(), p), owned.end());
-    gpu::free(p);
 }
 
 float silu(float x) { return x / (1.f + std::exp(-x)); }
@@ -329,60 +316,12 @@ void f2_patch(const float* m, const float* mean, const float* sd, int64_t h, int
     });
 }
 
-// a tile of x [..][w][C]: xt [th][tw][C] = x's rows y0 .. y0 + th, columns x0 .. x0 + tw
-template<class T>
-void tile_gather(const T* x, int64_t w, int64_t C, int64_t y0, int64_t x0, int64_t th, int64_t tw, T* xt, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (th * tw * C)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t p = i / C, c = i - p * C, y = p / tw, xx = p - y * tw;
-        xt[i] = x[((y0 + y) * w + x0 + xx) * C + c];
-    });
-}
-
-// a tile's image trgb [C][TH][TW] ([TH][TW][C] with `hwc`: an encoded tile's tokens) at Y0, X0 of [H][W] into acc
-// (C planes, then the weights' plane), weighted by a linear ramp over `ramp` positions on each side that another tile
-// shares (top, bottom, left, right)
-void tile_blend(const float* trgb, int64_t TH, int64_t TW, int64_t Y0, int64_t X0, int64_t H, int64_t W, int64_t ramp,
-                bool top, bool bottom, bool left, bool right, float* acc, void* s, int64_t C = 3, bool hwc = false) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (TH * TW)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t y = i / TW, x = i - y * TW;
-        const float r = (float) ramp;
-        float wy = 1.f, wx = 1.f;
-        if (top) wy = sycl::fmin(wy, ((float) y + 0.5f) / r);
-        if (bottom) wy = sycl::fmin(wy, ((float) (TH - y) - 0.5f) / r);
-        if (left) wx = sycl::fmin(wx, ((float) x + 0.5f) / r);
-        if (right) wx = sycl::fmin(wx, ((float) (TW - x) - 0.5f) / r);
-        const float wt = wy * wx;
-        const int64_t o = (Y0 + y) * W + X0 + x, HW = H * W;
-        for (int64_t c = 0; c < C; ++c) acc[c * HW + o] += wt * (hwc ? trgb[i * C + c] : trgb[c * TH * TW + i]);
-        acc[C * HW + o] += wt;
-    });
-}
-
-// out [C][HW] ([HW][C] with `hwc`) = acc's planes over its weights
-void tile_finish(const float* acc, int64_t HW, float* rgb, void* s, int64_t C = 3, bool hwc = false) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (C * HW)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t c = hwc ? i % C : i / HW, p = hwc ? i / C : i % HW;
-        rgb[i] = acc[c * HW + p] / acc[C * HW + p];
-    });
-}
-
 // rgb [3][HW] from x [HW][3]
 void hwc3_to_chw(const float* x, int64_t HW, float* rgb, void* s) {
     q_of(s).parallel_for(sycl::range<1>((size_t) (3 * HW)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
         const int64_t c = i / HW, p = i - c * HW;
         rgb[i] = x[p * 3 + c];
-    });
-}
-
-void to_rgba(const float* rgb, int64_t HW, float* rgba, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (4 * HW)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t c = i / HW;
-        rgba[i] = c == 3 ? 1.f : sycl::clamp((rgb[i] + 1.f) * 0.5f, 0.f, 1.f);
     });
 }
 
@@ -399,7 +338,7 @@ MfVae::~MfVae() {
 const float* MfVae::upload(const std::vector<float>& v) {
     weight_bytes_ += v.size() * 4;
     if (dry_) return nullptr;
-    float* d = alloc<float>(allocs_, (int64_t) v.size());
+    float* d = alloc<float>(allocs_, (int64_t) v.size(), "image engine (Mage-VAE)");
     gpu::copy(d, v.data(), v.size() * 4);
     return d;
 }
@@ -447,7 +386,7 @@ MfVae::Conv MfVae::conv_w(SafeTensors& st, const std::string& name, bool bias, i
                     }
         }
         if (!taps) {
-            uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
+            uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size(), "image engine (Mage-VAE)");
             gpu::copy(d, h.data(), h.size() * 2);
             c.w = d;
         }
@@ -463,7 +402,7 @@ MfVae::Conv MfVae::conv_w(SafeTensors& st, const std::string& name, bool bias, i
                                     kernels::f16_from_f32(
                                         w[(size_t) ((((src * in + col0 + i) * kt + z) * c.k + dy) * c.k + dx)]);
             }
-            uint16_t* td = alloc<uint16_t>(allocs_, (int64_t) tw.size());
+            uint16_t* td = alloc<uint16_t>(allocs_, (int64_t) tw.size(), "image engine (Mage-VAE)");
             gpu::copy(td, tw.data(), tw.size() * 2);
             c.taps = td;
         }
@@ -498,7 +437,7 @@ MfVae::Attn MfVae::attn_w(SafeTensors& st, const std::string& norm, const std::s
             for (int64_t k = 0; k < C * C; ++k) h[(size_t) (j * C * C + k)] = kernels::f16_from_f32(w[(size_t) k]);
             std::copy(bb.begin(), bb.end(), b.begin() + j * C);
         }
-        uint16_t* dw = alloc<uint16_t>(allocs_, (int64_t) h.size());
+        uint16_t* dw = alloc<uint16_t>(allocs_, (int64_t) h.size(), "image engine (Mage-VAE)");
         gpu::copy(dw, h.data(), h.size() * 2);
         x.qkv.w = dw;
         x.qkv.b = upload(b);
@@ -647,22 +586,22 @@ void MfVae::grow(int64_t h, int64_t w) {
     const int64_t n = h * w;
     if (n <= cap_hw_) return;
     drop_scratch();
-    x_ = alloc<float>(allocs_, n * C_);
-    cond_ = alloc<float>(allocs_, n * C_);
-    s_state_ = alloc<float>(allocs_, n * C_);
-    t0_ = alloc<float>(allocs_, n * F_);
-    t1_ = alloc<float>(allocs_, n * F_);
-    t2_ = alloc<float>(allocs_, std::max(n * F_, n * C_ + kWinTok * C_));   // the attention's output and a window's
-    gn_part_ = alloc<float>(allocs_, n * kGroups * 2);
-    vec_ = alloc<float>(allocs_, 4 * F_);
-    a16_ = alloc<uint16_t>(allocs_, n * std::max(F_, 3 * C_));
+    x_ = alloc<float>(allocs_, n * C_, "image engine (Mage-VAE)");
+    cond_ = alloc<float>(allocs_, n * C_, "image engine (Mage-VAE)");
+    s_state_ = alloc<float>(allocs_, n * C_, "image engine (Mage-VAE)");
+    t0_ = alloc<float>(allocs_, n * F_, "image engine (Mage-VAE)");
+    t1_ = alloc<float>(allocs_, n * F_, "image engine (Mage-VAE)");
+    t2_ = alloc<float>(allocs_, std::max(n * F_, n * C_ + kWinTok * C_), "image engine (Mage-VAE)");   // the attention's output and a window's
+    gn_part_ = alloc<float>(allocs_, n * kGroups * 2, "image engine (Mage-VAE)");
+    vec_ = alloc<float>(allocs_, 4 * F_, "image engine (Mage-VAE)");
+    a16_ = alloc<uint16_t>(allocs_, n * std::max(F_, 3 * C_), "image engine (Mage-VAE)");
     col_cap_ = std::min(n * 9 * C_, conv::col_values(q_of(s_)));
-    col16_ = alloc<uint16_t>(allocs_, col_cap_);
-    w16_ = alloc<uint16_t>(allocs_, 3 * kWinTok * C_ + kWinTok * kWinTok);
-    scores_ = alloc<float>(allocs_, kWinTok * kWinTok);
+    col16_ = alloc<uint16_t>(allocs_, col_cap_, "image engine (Mage-VAE)");
+    w16_ = alloc<uint16_t>(allocs_, 3 * kWinTok * C_ + kWinTok * kWinTok, "image engine (Mage-VAE)");
+    scores_ = alloc<float>(allocs_, kWinTok * kWinTok, "image engine (Mage-VAE)");
     cap_band_ = std::min<int64_t>(n, 1024);
-    yxb_ = alloc<float>(allocs_, cap_band_ * kX * kPix);
-    ceb_ = alloc<float>(allocs_, cap_band_ * kX * kPix);
+    yxb_ = alloc<float>(allocs_, cap_band_ * kX * kPix, "image engine (Mage-VAE)");
+    ceb_ = alloc<float>(allocs_, cap_band_ * kX * kPix, "image engine (Mage-VAE)");
     cap_hw_ = n;
 }
 
@@ -832,7 +771,7 @@ bool MfVae::open_encoder(std::string& err, bool dry) {
             const auto w = st.f32(e + "patch_cond_embed.weight");
             std::vector<uint16_t> h(w.size());
             for (size_t i = 0; i < w.size(); ++i) h[i] = kernels::f16_from_f32(w[i]);
-            uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
+            uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size(), "image engine (Mage-VAE)");
             gpu::copy(d, h.data(), h.size() * 2);
             e_patch_.w = d;
         }
@@ -929,13 +868,13 @@ void MfVae::encode_moments(const float* rgb, int64_t h, int64_t w, float* moment
     if (!has_encoder()) throw std::runtime_error("image engine (Mage-VAE): the encoder is not loaded");
     const int64_t n = h * w, Ch = enc_head_[0].c1.out, Fh = enc_head_[0].c4.out;
     std::vector<void*> tmp;
-    float* hs = alloc<float>(tmp, n * Ch);
-    float* ls = alloc<float>(tmp, n * C_);
+    float* hs = alloc<float>(tmp, n * Ch, "image engine (Mage-VAE)");
+    float* ls = alloc<float>(tmp, n * C_, "image engine (Mage-VAE)");
     DiCoBufs b;
-    b.t0 = alloc<float>(tmp, n * Fh);
-    b.t1 = alloc<float>(tmp, n * Fh);
-    b.a16 = alloc<uint16_t>(tmp, n * std::max(Fh, 3 * kPix));
-    b.vec = alloc<float>(tmp, 2 * Ch);
+    b.t0 = alloc<float>(tmp, n * Fh, "image engine (Mage-VAE)");
+    b.t1 = alloc<float>(tmp, n * Fh, "image engine (Mage-VAE)");
+    b.a16 = alloc<uint16_t>(tmp, n * std::max(Fh, 3 * kPix), "image engine (Mage-VAE)");
+    b.vec = alloc<float>(tmp, 2 * Ch, "image engine (Mage-VAE)");
     patchify16(rgb, h, w, b.a16, s_);
     conv(e_patch_, b.a16, h, w, hs);
     for (const DiCo& d : enc_head_) dico(d, hs, h, w, b);
@@ -1041,7 +980,7 @@ void MfVae::decode(const float* z, int64_t h, int64_t w, float* rgba, uint64_t l
     } else {
         decode_raw(z, h, w, rgb);
     }
-    to_rgba(rgb, HW, rgba, s_);
+    to_rgba(rgb, HW, 3, TilePlanes::Planes, rgba, s_);
     gpu::stream_sync(s_);
     gpu::free(rgb);
 }
@@ -1236,19 +1175,19 @@ void MfVae::f2_grow(const F2Sizes& z) {
         for (const F2Res& r : l.blocks) cmax = std::max(cmax, r.c1.in);
         cmax = std::max(cmax, l.down.in);
     }
-    f2_x_ = alloc<uint16_t>(allocs_, n.most);
-    f2_y_ = alloc<uint16_t>(allocs_, n.most);
-    f2_t_ = alloc<uint16_t>(allocs_, n.most);
-    vtmp_ = alloc<float>(allocs_, n.most);
+    f2_x_ = alloc<uint16_t>(allocs_, n.most, "image engine (Mage-VAE)");
+    f2_y_ = alloc<uint16_t>(allocs_, n.most, "image engine (Mage-VAE)");
+    f2_t_ = alloc<uint16_t>(allocs_, n.most, "image engine (Mage-VAE)");
+    vtmp_ = alloc<float>(allocs_, n.most, "image engine (Mage-VAE)");
     vtmp_cap_ = n.most;
-    a16_ = alloc<uint16_t>(allocs_, n.most);
+    a16_ = alloc<uint16_t>(allocs_, n.most, "image engine (Mage-VAE)");
     col_cap_ = std::min(n.pix * 9 * cmax, conv::col_values(q_of(s_)));
-    col16_ = alloc<uint16_t>(allocs_, col_cap_);
-    gn_part_ = alloc<float>(allocs_, qi_group_norm_ws_floats(n.pix));
-    vec_ = alloc<float>(allocs_, 4 * cmax);
-    f2_qk16_ = alloc<uint16_t>(allocs_, n.mid * f2_ac_ * 3);
-    f2_q_ = alloc<float>(allocs_, n.rows * n.mid);
-    f2_p16_ = alloc<uint16_t>(allocs_, n.rows * n.mid);
+    col16_ = alloc<uint16_t>(allocs_, col_cap_, "image engine (Mage-VAE)");
+    gn_part_ = alloc<float>(allocs_, qi_group_norm_ws_floats(n.pix), "image engine (Mage-VAE)");
+    vec_ = alloc<float>(allocs_, 4 * cmax, "image engine (Mage-VAE)");
+    f2_qk16_ = alloc<uint16_t>(allocs_, n.mid * f2_ac_ * 3, "image engine (Mage-VAE)");
+    f2_q_ = alloc<float>(allocs_, n.rows * n.mid, "image engine (Mage-VAE)");
+    f2_p16_ = alloc<uint16_t>(allocs_, n.rows * n.mid, "image engine (Mage-VAE)");
     f2_cap_ = n;
     f2_held_ = f2_bytes(n);
 }
@@ -1407,40 +1346,29 @@ void MfVae::f2_decode_tiled(const float* z, int64_t h, int64_t w, float* rgb, in
     const F2Sizes f = f2_walk(h, w, 0, k, true, false), b = f2_walk(th, tw, k, n, false, true);
     f2_grow(f2_max(f, b));
     std::vector<void*> tmp;
-    float* acc = alloc<float>(tmp, 4 * H * W);
-    float* trgb = alloc<float>(tmp, 3 * th * tw * kPix);
+    float* acc = alloc<float>(tmp, 4 * H * W, "image engine (Mage-VAE)");
+    float* trgb = alloc<float>(tmp, 3 * th * tw * kPix, "image engine (Mage-VAE)");
     gpu::memset_async(acc, 0, (size_t) (4 * H * W) * 4, s_);
     // the front on the whole, its output kept [FH][FW][c]: s positions a token
     uint16_t* x = nullptr;
     int64_t FH = 0, FW = 0, c = 0;
     f2_front(z, h, w, k, x, FH, FW, c);
     const int64_t sp = FH / h;
-    uint16_t* kept = alloc<uint16_t>(tmp, FH * FW * c);
+    uint16_t* kept = alloc<uint16_t>(tmp, FH * FW * c, "image engine (Mage-VAE)");
     gpu::copy_async(kept, x, (size_t) (FH * FW * c) * 2, s_);
-    // the tiles' corners: t apart less the overlap, the last flush with the edge
-    auto starts = [](int64_t n, int64_t side) {
-        std::vector<int64_t> v;
-        for (int64_t a = 0;; a += side - kF2Overlap) {
-            if (a + side >= n) {
-                v.push_back(n - side);
-                break;
-            }
-            v.push_back(a);
-        }
-        return v;
-    };
-    const auto ys = starts(h, th), xs = starts(w, tw);
+    const auto ys = tile_positions(h, th, kF2Overlap), xs = tile_positions(w, tw, kF2Overlap);
     for (const int64_t y0 : ys)
         for (const int64_t x0 : xs) {
             int64_t TH = th * sp, TW = tw * sp, tc = c;
             uint16_t* tx = f2_x_;
-            tile_gather(kept, FW, c, y0 * sp, x0 * sp, TH, TW, tx, s_);
+            tile_crop(kept, c, TilePlanes::Interleaved, FH, FW, y0 * sp, x0 * sp, TH, TW, tx, s_);
             f2_levels(k, n, tx, TH, TW, tc);
             f2_tail(tx, TH, TW, tc, trgb);
-            tile_blend(trgb, th * kPatch, tw * kPatch, y0 * kPatch, x0 * kPatch, H, W, kF2Overlap * kPatch, y0 > 0,
-                       y0 + th < h, x0 > 0, x0 + tw < w, acc, s_);
+            tile_blend(trgb, 3, TilePlanes::Planes, th * kPatch, tw * kPatch, y0 * kPatch, x0 * kPatch, H, W,
+                       kF2Overlap * kPatch, TileRamp::Centre, y0 > 0, y0 + th < h, x0 > 0, x0 + tw < w, acc,
+                       acc + 3 * H * W, s_);
         }
-    tile_finish(acc, H * W, rgb, s_);
+    tile_finish(acc, 3, TilePlanes::Planes, H * W, acc + 3 * H * W, rgb, s_);
     gpu::stream_sync(s_);
     for (void* p : tmp) gpu::free(p);
 }
@@ -1455,32 +1383,21 @@ void MfVae::f2_encode_tiled(const float* rgb, int64_t h, int64_t w, float* z, in
     tw = std::min(w, tw);
     const int64_t H = h * kPatch, W = w * kPatch, V = 4 * f2_lc_;
     std::vector<void*> tmp;
-    float* acc = alloc<float>(tmp, (V + 1) * h * w);
-    float* trgb = alloc<float>(tmp, 3 * th * tw * kPix);
-    float* tz = alloc<float>(tmp, th * tw * V);
+    float* acc = alloc<float>(tmp, (V + 1) * h * w, "image engine (Mage-VAE)");
+    float* trgb = alloc<float>(tmp, 3 * th * tw * kPix, "image engine (Mage-VAE)");
+    float* tz = alloc<float>(tmp, th * tw * V, "image engine (Mage-VAE)");
     gpu::memset_async(acc, 0, (size_t) ((V + 1) * h * w) * 4, s_);
-    auto starts = [](int64_t n, int64_t side) {
-        std::vector<int64_t> v;
-        for (int64_t a = 0;; a += side - kF2Overlap) {
-            if (a + side >= n) {
-                v.push_back(n - side);
-                break;
-            }
-            v.push_back(a);
-        }
-        return v;
-    };
-    const auto ys = starts(h, th), xs = starts(w, tw);
+    const auto ys = tile_positions(h, th, kF2Overlap), xs = tile_positions(w, tw, kF2Overlap);
     for (const int64_t y0 : ys)
         for (const int64_t x0 : xs) {
             for (int64_t c = 0; c < 3; ++c)   // the tile's image, a plane at a time
-                tile_gather(rgb + c * H * W, W, 1, y0 * kPatch, x0 * kPatch, th * kPatch, tw * kPatch,
-                            trgb + c * th * tw * kPix, s_);
+                tile_crop(rgb + c * H * W, 1, TilePlanes::Planes, H, W, y0 * kPatch, x0 * kPatch, th * kPatch,
+                          tw * kPatch, trgb + c * th * tw * kPix, s_);
             f2_encode(trgb, th, tw, tz);
-            tile_blend(tz, th, tw, y0, x0, h, w, kF2Overlap, y0 > 0, y0 + th < h, x0 > 0, x0 + tw < w, acc, s_, V,
-                       true);
+            tile_blend(tz, V, TilePlanes::Interleaved, th, tw, y0, x0, h, w, kF2Overlap, TileRamp::Centre, y0 > 0,
+                       y0 + th < h, x0 > 0, x0 + tw < w, acc, acc + V * h * w, s_);
         }
-    tile_finish(acc, h * w, z, s_, V, true);
+    tile_finish(acc, V, TilePlanes::Interleaved, h * w, acc + V * h * w, z, s_);
     gpu::stream_sync(s_);
     for (void* p : tmp) gpu::free(p);
 }
@@ -1549,7 +1466,7 @@ void MfVae::open_flux2_encoder(SafeTensors& st) {
                         for (int64_t z = 0; z < kt; ++z) v += w[(size_t) (((o * 3 + i) * kt + z) * 9 + k)];
                         h[(size_t) ((o * 9 + k) * 8 + i)] = kernels::f16_from_f32(v);
                     }
-            uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
+            uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size(), "image engine (Mage-VAE)");
             gpu::copy(d, h.data(), h.size() * 2);
             f2_ein_.w = d;
             if (taps) {   // [out][kt][9][8], the input widened to 8 alike
@@ -1560,7 +1477,7 @@ void MfVae::open_flux2_encoder(SafeTensors& st) {
                             for (int64_t k = 0; k < 9; ++k)
                                 tw[(size_t) (((o * kt + z) * 9 + k) * 8 + i)] =
                                     kernels::f16_from_f32(w[(size_t) (((o * 3 + i) * kt + z) * 9 + k)]);
-                uint16_t* td = alloc<uint16_t>(allocs_, (int64_t) tw.size());
+                uint16_t* td = alloc<uint16_t>(allocs_, (int64_t) tw.size(), "image engine (Mage-VAE)");
                 gpu::copy(td, tw.data(), tw.size() * 2);
                 f2_ein_.taps = td;
             }
@@ -1677,17 +1594,17 @@ void MfVae::f2_encode(const float* rgb, int64_t h, int64_t w, float* z) {
 void MfVae::v_grow(int64_t values, int64_t head, int64_t frame) {
     if (frame > vtmp_cap_) {
         release(allocs_, vtmp_);
-        vtmp_ = alloc<float>(allocs_, frame);
+        vtmp_ = alloc<float>(allocs_, frame, "image engine (Mage-VAE)");
         vtmp_cap_ = frame;
     }
     if (values <= vcap_ && head <= vhead_) return;
     values = std::max(values, vcap_);
     head = std::max(head, vhead_);
     for (void* p : {(void*) vx_, (void*) vy_, (void*) vt_, (void*) va16_base_}) release(allocs_, p);
-    vx_ = alloc<uint16_t>(allocs_, values);
-    vy_ = alloc<uint16_t>(allocs_, values);
-    vt_ = alloc<uint16_t>(allocs_, values);
-    va16_base_ = alloc<uint16_t>(allocs_, head + values);
+    vx_ = alloc<uint16_t>(allocs_, values, "image engine (Mage-VAE)");
+    vy_ = alloc<uint16_t>(allocs_, values, "image engine (Mage-VAE)");
+    vt_ = alloc<uint16_t>(allocs_, values, "image engine (Mage-VAE)");
+    va16_base_ = alloc<uint16_t>(allocs_, head + values, "image engine (Mage-VAE)");
     va16_ = va16_base_ + head;
     vcap_ = values;
     vhead_ = head;
@@ -1728,7 +1645,7 @@ void MfVae::v_frame(const Conv& k, const uint16_t* in16, int64_t H, int64_t W, b
 
 // whether x's n values are all finite (one flag on the GPU, read back)
 bool MfVae::finite(const float* x, int64_t n) {
-    if (vbad_ == nullptr) vbad_ = alloc<int>(allocs_, 1);
+    if (vbad_ == nullptr) vbad_ = alloc<int>(allocs_, 1, "image engine (Mage-VAE)");
     int* bad = vbad_;
     gpu::memset_async(bad, 0, sizeof(int), s_);
     q_of(s_).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
@@ -1807,7 +1724,7 @@ void MfVae::vconv(const Conv& c, const uint16_t* in16, int64_t T, int64_t H, int
         release(allocs_, vc.buf);
         vc = VCache();
         vc.buf = m <= 0 ? nullptr
-                 : vhost_ ? alloc_pinned<uint16_t>(allocs_, m * fin) : alloc<uint16_t>(allocs_, m * fin);
+                 : vhost_ ? alloc_pinned<uint16_t>(allocs_, m * fin) : alloc<uint16_t>(allocs_, m * fin, "image engine (Mage-VAE)");
         vc.frame = fin;
         vc.m = m;
         if (d != nullptr && d->owner == vtile_) d->owner = -1;
@@ -1823,7 +1740,7 @@ void MfVae::vconv(const Conv& c, const uint16_t* in16, int64_t T, int64_t H, int
             d->owner = -1;
             if (d->frame * d->m < m * fin) {
                 release(allocs_, d->buf);
-                d->buf = alloc<uint16_t>(allocs_, m * fin);
+                d->buf = alloc<uint16_t>(allocs_, m * fin, "image engine (Mage-VAE)");
                 d->frame = fin;
                 d->m = m;
             }
@@ -1870,7 +1787,7 @@ void MfVae::vconv(const Conv& c, const uint16_t* in16, int64_t T, int64_t H, int
     const int64_t per = c.out * c.k * c.k * c.in;
     if (vtapw_cap_ < c.kt * per) {   // each tap's weights apart, as a 2D convolution's
         release(allocs_, vtapw_);
-        vtapw_ = alloc<uint16_t>(allocs_, c.kt * per);
+        vtapw_ = alloc<uint16_t>(allocs_, c.kt * per, "image engine (Mage-VAE)");
         vtapw_cap_ = c.kt * per;
     }
     taps_apart(c.taps, c.out, c.kt, c.k * c.k * c.in, vtapw_, s_);
@@ -2051,33 +1968,20 @@ int64_t MfVae::decode_video(const float* z, int64_t n, int64_t h, int64_t w, boo
 }
 
 namespace {
-// a video's tiles' corners along a side of n: `side` apart less the overlap, the last flush with the edge
-std::vector<int64_t> tile_starts(int64_t n, int64_t side) {
-    std::vector<int64_t> v;
-    for (int64_t a = 0;; a += side - kVOverlap) {
-        if (a + side >= n) {
-            v.push_back(n - side);
-            break;
-        }
-        v.push_back(a);
-    }
-    return v;
-}
-
-// the side of a video's tiles along n of at most `side`: as many tiles as that side takes, each as small as they then
+// The side of a video's tiles along n of at most `side`: as many tiles as that side takes, each as small as they then
 // cover n with (the last no larger than the rest: a tile flush with the edge at the full side computed a fifth more of
-// a 720p frame, 2026-11-08)
-int64_t tile_side(int64_t n, int64_t side) {
+// a 720p frame, 2026-11-08).  The side and the corners are the VAE tiles' shared ones (tile_sides.hpp) at the video's
+// overlap; only the "of at most this" step is a video's own.
+int64_t video_side(int64_t n, int64_t side) {
     if (n <= side) return n;
-    const auto k = (int64_t) tile_starts(n, side).size();
-    return (n + (k - 1) * kVOverlap + k - 1) / k;
+    return tile_side(n, (int64_t) tile_positions(n, side, kVOverlap).size(), kVOverlap);
 }
 }  // namespace
 
-int64_t MfVae::video_tile_side(int64_t n, int64_t tt) { return tt <= 0 ? n : tile_side(n, tt); }
+int64_t MfVae::video_tile_side(int64_t n, int64_t tt) { return tt <= 0 ? n : video_side(n, tt); }
 
 int64_t MfVae::video_tiles(int64_t n, int64_t tt) {
-    return tt <= 0 || n <= tt ? 1 : (int64_t) tile_starts(n, tile_side(n, tt)).size();
+    return tt <= 0 || n <= tt ? 1 : (int64_t) tile_positions(n, video_side(n, tt), kVOverlap).size();
 }
 
 uint64_t MfVae::video_carried_bytes(int64_t h, int64_t w, int side) const {
@@ -2144,29 +2048,34 @@ int64_t MfVae::v_encode_tiled(const float* rgb, int64_t T, int64_t h, int64_t w,
         vtile_ = 0;
         return sliced(rgb, h, w, z);
     }
-    const int64_t th = tile_side(h, tt), tw = tile_side(w, tt), H = h * kPatch, W = w * kPatch, V = 4 * f2_lc_;
+    const int64_t th = video_side(h, tt), tw = video_side(w, tt), H = h * kPatch, W = w * kPatch, V = 4 * f2_lc_;
     const int64_t k = first ? (T - 1) / 4 + 1 : T / 4, plane = th * tw * kPix;
     std::vector<void*> tmp;
-    float* acc = alloc<float>(tmp, k * (V + 1) * h * w);
-    float* trgb = alloc<float>(tmp, T * 3 * plane);
-    float* tz = alloc<float>(tmp, k * th * tw * V);
+    float* acc = alloc<float>(tmp, k * (V + 1) * h * w, "image engine (Mage-VAE)");
+    float* trgb = alloc<float>(tmp, T * 3 * plane, "image engine (Mage-VAE)");
+    float* tz = alloc<float>(tmp, k * th * tw * V, "image engine (Mage-VAE)");
     gpu::memset_async(acc, 0, (size_t) (k * (V + 1) * h * w) * 4, s_);
-    const auto ys = tile_starts(h, th), xs = tile_starts(w, tw);
+    const auto ys = tile_positions(h, th, kVOverlap), xs = tile_positions(w, tw, kVOverlap);
     int tile = 0;
     for (const int64_t y0 : ys)
         for (const int64_t x0 : xs) {
             vtile_ = tile++;
             for (int64_t f = 0; f < T; ++f)
                 for (int64_t c = 0; c < 3; ++c)
-                    tile_gather(rgb + (f * 3 + c) * H * W, W, 1, y0 * kPatch, x0 * kPatch, th * kPatch, tw * kPatch,
-                                trgb + (f * 3 + c) * plane, s_);
+                    tile_crop(rgb + (f * 3 + c) * H * W, 1, TilePlanes::Planes, H, W, y0 * kPatch, x0 * kPatch,
+                              th * kPatch, tw * kPatch, trgb + (f * 3 + c) * plane, s_);
             const int64_t got = sliced(trgb, th, tw, tz);
-            for (int64_t j = 0; j < got; ++j)
-                tile_blend(tz + j * th * tw * V, th, tw, y0, x0, h, w, kVOverlap, y0 > 0, y0 + th < h, x0 > 0,
-                           x0 + tw < w, acc + j * (V + 1) * h * w, s_, V, true);
+            for (int64_t j = 0; j < got; ++j) {
+                float* aj = acc + j * (V + 1) * h * w;
+                tile_blend(tz + j * th * tw * V, V, TilePlanes::Interleaved, th, tw, y0, x0, h, w, kVOverlap,
+                           TileRamp::Centre, y0 > 0, y0 + th < h, x0 > 0, x0 + tw < w, aj, aj + V * h * w, s_);
+            }
         }
     vtile_ = 0;
-    for (int64_t j = 0; j < k; ++j) tile_finish(acc + j * (V + 1) * h * w, h * w, z + j * h * w * V, s_, V, true);
+    for (int64_t j = 0; j < k; ++j) {
+        const float* aj = acc + j * (V + 1) * h * w;
+        tile_finish(aj, V, TilePlanes::Interleaved, h * w, aj + V * h * w, z + j * h * w * V, s_);
+    }
     gpu::stream_sync(s_);
     for (void* p : tmp) gpu::free(p);
     return k;
@@ -2185,27 +2094,33 @@ int64_t MfVae::v_decode_tiled(const float* z, int64_t n, int64_t h, int64_t w, b
         vtile_ = 0;
         return sliced(z, h, w, rgb);
     }
-    const int64_t th = tile_side(h, tt), tw = tile_side(w, tt), H = h * kPatch, W = w * kPatch, V = 4 * f2_lc_;
+    const int64_t th = video_side(h, tt), tw = video_side(w, tt), H = h * kPatch, W = w * kPatch, V = 4 * f2_lc_;
     const int64_t frames = first ? 1 + 4 * (n - 1) : 4 * n, TH = th * kPatch, TW = tw * kPatch;
     std::vector<void*> tmp;
-    float* acc = alloc<float>(tmp, frames * 4 * H * W);
-    float* tz = alloc<float>(tmp, n * th * tw * V);
-    float* trgb = alloc<float>(tmp, frames * 3 * TH * TW);
+    float* acc = alloc<float>(tmp, frames * 4 * H * W, "image engine (Mage-VAE)");
+    float* tz = alloc<float>(tmp, n * th * tw * V, "image engine (Mage-VAE)");
+    float* trgb = alloc<float>(tmp, frames * 3 * TH * TW, "image engine (Mage-VAE)");
     gpu::memset_async(acc, 0, (size_t) (frames * 4 * H * W) * 4, s_);
-    const auto ys = tile_starts(h, th), xs = tile_starts(w, tw);
+    const auto ys = tile_positions(h, th, kVOverlap), xs = tile_positions(w, tw, kVOverlap);
     int tile = 0;
     for (const int64_t y0 : ys)
         for (const int64_t x0 : xs) {
             vtile_ = tile++;
             for (int64_t j = 0; j < n; ++j)
-                tile_gather(z + j * h * w * V, w, V, y0, x0, th, tw, tz + j * th * tw * V, s_);
+                tile_crop(z + j * h * w * V, V, TilePlanes::Interleaved, h, w, y0, x0, th, tw, tz + j * th * tw * V,
+                          s_);
             const int64_t got = sliced(tz, th, tw, trgb);
-            for (int64_t f = 0; f < got; ++f)
-                tile_blend(trgb + f * 3 * TH * TW, TH, TW, y0 * kPatch, x0 * kPatch, H, W, kVOverlap * kPatch, y0 > 0,
-                           y0 + th < h, x0 > 0, x0 + tw < w, acc + f * 4 * H * W, s_);
+            for (int64_t f = 0; f < got; ++f) {
+                float* af = acc + f * 4 * H * W;
+                tile_blend(trgb + f * 3 * TH * TW, 3, TilePlanes::Planes, TH, TW, y0 * kPatch, x0 * kPatch, H, W,
+                           kVOverlap * kPatch, TileRamp::Centre, y0 > 0, y0 + th < h, x0 > 0, x0 + tw < w, af,
+                           af + 3 * H * W, s_);
+            }
         }
     vtile_ = 0;
-    for (int64_t f = 0; f < frames; ++f) tile_finish(acc + f * 4 * H * W, H * W, rgb + f * 3 * H * W, s_);
+    for (int64_t f = 0; f < frames; ++f)
+        tile_finish(acc + f * 4 * H * W, 3, TilePlanes::Planes, H * W, acc + f * 4 * H * W + 3 * H * W,
+                    rgb + f * 3 * H * W, s_);
     gpu::stream_sync(s_);
     for (void* p : tmp) gpu::free(p);
     return frames;

@@ -62,7 +62,7 @@ int main(int argc, char** argv) {
         const auto ids = load<int32_t>(dir + "/te_tokens_0.bin");
         const auto want = load<float>(dir + "/te_hidden_0.bin");
         // an edit's run: the image pads' run and the vision encoder's outputs
-        constexpr int32_t kImagePad = 151655;
+        const int32_t kImagePad = te.image_pad();
         std::vector<strata::image::TextEncoder::Picture> images;
         std::vector<std::vector<float>> vit;
         const auto first = std::find(ids.begin(), ids.end(), kImagePad);

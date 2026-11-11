@@ -95,12 +95,12 @@ double seconds_since(std::chrono::steady_clock::time_point t0) {
 // the text encoder: each prompt of the run (ids.npy, ids_lens.npy) encoded alone, its rows after the 34 of the
 // system turn against txt.npy
 int text(const std::string& gguf, const std::string& dir, const std::string& mmproj = "") {
-    constexpr int32_t kImagePad = 151655;
     const int64_t kDrop = mmproj.empty() ? 34 : 64;   // the system turn: generation's, an edit's
     void* s = strata::core::Runtime::get().create_stream();
     strata::image::TextEncoder te;
     std::string err;
     if (!te.open(gguf, 16384, err)) throw std::runtime_error(err);
+    const int32_t kImagePad = te.image_pad();   // the <|image_pad|> token, from the vocabulary
     te.set_final_norm(true);
     te.set_flat_positions(true);
     // an edit's images (as the processor took them: their sides the grid's 16-pixel patches) through the vision encoder

@@ -201,14 +201,19 @@ bool TextEncoder::set_loras(const std::vector<LoraUse>& loras, std::string& err)
     return true;
 }
 
+int32_t TextEncoder::pad_id(const std::string& gguf) {
+    // the one read of the vocabulary for the  token: open()'s and the models that only need the id
+    try {
+        return (int32_t) GgufModel::open(gguf).meta().string_index("tokenizer.ggml.tokens", "<|image_pad|>");
+    } catch (const std::exception&) {
+        return -1;   // no such token: no pictures
+    }
+}
+
 bool TextEncoder::open(const std::string& gguf, int64_t max_tokens, std::string& err, uint64_t layer_budget,
                        bool dry) {
     close();
-    try {
-        image_pad_ = (int32_t) GgufModel::open(gguf).meta().string_index("tokenizer.ggml.tokens", "<|image_pad|>");
-    } catch (const std::exception&) {
-        image_pad_ = -1;   // no such token: no pictures
-    }
+    image_pad_ = pad_id(gguf);   // -1 when the vocabulary has no such token: no pictures
     core::PlainOptions o;
     o.gguf = gguf;
     o.encoder = true;

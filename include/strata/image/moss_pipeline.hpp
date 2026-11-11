@@ -57,6 +57,16 @@ bool moss_is_dit(const std::string& path);
 
 class MossPipeline : public ImagePipeline {
 public:
+    bool takes_loras() const override { return true; }
+    bool takes_guidance() const override { return true; }
+    bool takes_moss_options() const override { return true; }
+    void set_need_context(bool states, const std::vector<std::pair<int64_t, int64_t>>& pictures,
+                          QiRefLayout layout) override {
+        set_states_given(states);
+        set_pictures_given(pictures);
+        set_ref_layout(layout);
+    }
+
     /// Reads the parts' files for their sizes; the parts go on the GPU with the first request.  `dit`: the transformer
     /// (its folder or a file), `vae`: the Flux2 VAE's safetensors, `text`: Qwen3.5-9B's GGUF.  `q8`: the DiT's blocks
     /// in 8 bits (1), FP16 (0) or by the budget (-1).
@@ -113,8 +123,8 @@ private:
     int64_t ref_rows_ = 0;   // the request's references' latent rows (plan counts their kept keys and values)
     QiRefLayout ref_layout_ = QiRefLayout::MossEdit;   // and their layout (in the stream: as text rows)
     std::string vision_path_;
-    int32_t image_pad_ = -1;   // the text encoder's <|image_pad|> (its GGUF's vocabulary)
     std::unique_ptr<QiVision> vision_size_;
+    int32_t image_pad_ = -1;   // the text encoder's <|image_pad|>, through TextEncoder::pad_id (its GGUF's vocabulary)
     std::vector<std::pair<int64_t, int64_t>> pictures_;   // set_pictures_given's
     std::string last_pics_, last_neg_pics_;   // the pictures the kept states were made with (refs_key)
     std::unique_ptr<TextEncoder> te_;

@@ -5,15 +5,18 @@
 #include "strata/upscale/seedvr2_dit.hpp"
 
 #include "../image/dit_rows.hpp"
+#include "../image/img_out.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
-#include "strata/image/mapped_file.hpp"
+#include "strata/platform/mapped_file.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/i8_gemm.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/platform/env.hpp"
+
+#include "strata/image/gpu_buf.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -35,6 +38,9 @@ namespace seedvr2_dit_detail {
 
 using image::MfOut;
 namespace rows = image::dit_rows;
+using image::q_of;
+using image::alloc;
+using image::patch_to_tokens;
 using kernels::f16_gpu::f16_from_f32;
 using kernels::f16_gpu::f32_from_f16;
 
@@ -57,16 +63,6 @@ void int8_to_q8_0(const int8_t* w, const float* scale, int64_t n, int64_t k, uin
     }
 }
 
-sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
-
-template<class T> T* alloc(std::vector<void*>& owned, int64_t n) {
-    T* p = nullptr;
-    if (!gpu::alloc_device(&p, (size_t) std::max<int64_t>(n, 1) * sizeof(T)))
-        throw std::runtime_error(std::string("image engine (SeedVR2 DiT): GPU memory: ") + gpu::last_error());
-    owned.push_back(p);
-    return p;
-}
-
 // the patch embedder's input, in16 [N][kin]: token t's 2 x 2 positions j = 2 dy + dx of the 33 channels (the noise's
 // 16, the condition's 16, a mask of ones) at j 33 + channel, the columns past 132 zero; the tokens' values are
 // 4 c + j (MfVae's layout)
@@ -81,15 +77,6 @@ void patch_in16(const float* noise, const float* cond, int64_t N, int64_t lat, i
             v = c < lat ? noise[t * 4 * lat + 4 * c + j] : c < 2 * lat ? cond[t * 4 * lat + 4 * (c - lat) + j] : 1.f;
         }
         in16[i] = f16_from_f32(v);
-    });
-}
-
-// the output's 64 values of a token from the projection's order (j 16 + c) to the tokens' (4 c + j)
-void patch_out(const float* y, int64_t N, int64_t lat, float* out, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) (N * 4 * lat)), [=](sycl::id<1> id) {
-        const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / (4 * lat), k = i - t * 4 * lat, c = k / 4, j = k - c * 4;
-        out[i] = y[t * 4 * lat + j * lat + c];
     });
 }
 
@@ -206,7 +193,7 @@ using namespace seedvr2_dit_detail;
 
 struct Seedvr2Dit::File {
     image::SafeTensors st;
-    image::MappedFile map;
+    platform::MappedFile map;
     explicit File(const std::string& path) : st(path), map(path) {}
     const image::SafeTensor& get(const std::string& name) const {
         const image::SafeTensor* t = st.find(name);
@@ -276,11 +263,11 @@ bool Seedvr2Dit::open(const std::string& path, void* stream, std::string& err, b
             std::vector<uint16_t> h((size_t) (w.n * w.k), 0);
             for (int64_t r = 0; r < w.n; ++r)
                 for (int64_t c = 0; c < K; ++c) h[(size_t) (r * w.k + c)] = kernels::f16_from_f32(v[(size_t) (r * K + c)]);
-            uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
+            uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size(), "image engine (SeedVR2 DiT)");
             gpu::copy(d, h.data(), h.size() * 2);
             w.d = d;
             const auto b = f.st.f32(name + ".bias");
-            float* db = alloc<float>(allocs_, (int64_t) b.size());
+            float* db = alloc<float>(allocs_, (int64_t) b.size(), "image engine (SeedVR2 DiT)");
             gpu::copy(db, b.data(), b.size() * 4);
             *bias = db;
             return w;
@@ -326,7 +313,7 @@ bool Seedvr2Dit::open(const std::string& path, void* stream, std::string& err, b
             }
             weight_bytes_ += v.size() * 4;
             if (!dry_) {
-                float* d = alloc<float>(allocs_, (int64_t) v.size());
+                float* d = alloc<float>(allocs_, (int64_t) v.size(), "image engine (SeedVR2 DiT)");
                 gpu::copy(d, v.data(), v.size() * 4);
                 outmod_ = d;
             }
@@ -387,9 +374,9 @@ bool Seedvr2Dit::open(const std::string& path, void* stream, std::string& err, b
                         gpu::stream_sync(s_);
                         for (void* p : qtmp.p) gpu::free(p);
                         qtmp.p.clear();
-                        q16 = alloc<uint16_t>(qtmp.p, nk);
-                        q8 = alloc<int8_t>(qtmp.p, nk);
-                        qsc = alloc<float>(qtmp.p, w.n);
+                        q16 = alloc<uint16_t>(qtmp.p, nk, "image engine (SeedVR2 DiT)");
+                        q8 = alloc<int8_t>(qtmp.p, nk, "image engine (SeedVR2 DiT)");
+                        qsc = alloc<float>(qtmp.p, w.n, "image engine (SeedVR2 DiT)");
                         stage = static_cast<uint8_t*>(gpu::alloc_host((size_t) nk * 2));
                         if (stage != nullptr) qtmp.p.push_back(stage);
                         q_cap = nk;
@@ -530,9 +517,9 @@ bool Seedvr2Dit::open(const std::string& path, void* stream, std::string& err, b
             const auto pv = f.st.f32("positive_conditioning");
             std::vector<uint16_t> h(pv.size());
             for (size_t i = 0; i < pv.size(); ++i) h[i] = kernels::f16_from_f32(pv[i]);
-            uint16_t* p16 = alloc<uint16_t>(tmp, (int64_t) h.size());
+            uint16_t* p16 = alloc<uint16_t>(tmp, (int64_t) h.size(), "image engine (SeedVR2 DiT)");
             gpu::copy(p16, h.data(), h.size() * 2);
-            txt0_ = alloc<float>(allocs_, L_ * C_);
+            txt0_ = alloc<float>(allocs_, L_ * C_, "image engine (SeedVR2 DiT)");
             product(p16, nullptr, tin, nullptr, txt0_, L_, b_tin);
             gpu::stream_sync(s_);
             for (void* q : tmp) gpu::free(q);
@@ -594,13 +581,13 @@ void Seedvr2Dit::layout(int which, int64_t t, int64_t h, int64_t w, std::vector<
     }
     if (covered != N) throw std::runtime_error("image engine (SeedVR2 DiT): the windows are not a partition");
     l.jrows = (int64_t) src.size();
-    l.src = alloc<int32_t>(owned, l.jrows);
+    l.src = alloc<int32_t>(owned, l.jrows, "image engine (SeedVR2 DiT)");
     gpu::copy(l.src, src.data(), src.size() * 4);
     const std::vector<int32_t> starts(l.at.begin(), l.at.end());
-    l.starts = alloc<int32_t>(owned, l.windows);
+    l.starts = alloc<int32_t>(owned, l.windows, "image engine (SeedVR2 DiT)");
     gpu::copy(l.starts, starts.data(), starts.size() * 4);
-    l.cos = alloc<float>(owned, N * half);
-    l.sin = alloc<float>(owned, N * half);
+    l.cos = alloc<float>(owned, N * half, "image engine (SeedVR2 DiT)");
+    l.sin = alloc<float>(owned, N * half, "image engine (SeedVR2 DiT)");
     gpu::copy(l.cos, cs.data(), cs.size() * 4);
     gpu::copy(l.sin, sn.data(), sn.size() * 4);
 }
@@ -641,13 +628,13 @@ void Seedvr2Dit::ensure(int64_t t, int64_t h, int64_t w) {
     layout(0, t, h, w, act_);
     layout(1, t, h, w, act_);
     const int64_t jr = std::max(lay_[0].jrows, lay_[1].jrows);
-    x_ = alloc<float>(act_, N * C_);
-    y_ = alloc<float>(act_, N * C_);
-    t_ = alloc<float>(act_, L_ * C_);
-    tsum_ = alloc<float>(act_, L_ * C_);
-    qkv_ = alloc<float>(act_, N * 3 * C_);
-    qkt_ = alloc<float>(act_, L_ * 3 * C_);
-    hid_ = alloc<float>(act_, N * (v2_ ? 2 * F_ : F_));
+    x_ = alloc<float>(act_, N * C_, "image engine (SeedVR2 DiT)");
+    y_ = alloc<float>(act_, N * C_, "image engine (SeedVR2 DiT)");
+    t_ = alloc<float>(act_, L_ * C_, "image engine (SeedVR2 DiT)");
+    tsum_ = alloc<float>(act_, L_ * C_, "image engine (SeedVR2 DiT)");
+    qkv_ = alloc<float>(act_, N * 3 * C_, "image engine (SeedVR2 DiT)");
+    qkt_ = alloc<float>(act_, L_ * 3 * C_, "image engine (SeedVR2 DiT)");
+    hid_ = alloc<float>(act_, N * (v2_ ? 2 * F_ : F_), "image engine (SeedVR2 DiT)");
     if (v2_) {   // the text's RoPE: row r on all three axes
         const int64_t half = hd_ / 2, nf = (int64_t) freqs_.size();
         std::vector<float> cs((size_t) (L_ * half), 1.f), sn((size_t) (L_ * half), 0.f);
@@ -658,30 +645,30 @@ void Seedvr2Dit::ensure(int64_t t, int64_t h, int64_t w) {
                     cs[(size_t) (r * half + axis * nf + j)] = std::cos(ang);
                     sn[(size_t) (r * half + axis * nf + j)] = std::sin(ang);
                 }
-        tcos_ = alloc<float>(act_, L_ * half);
-        tsin_ = alloc<float>(act_, L_ * half);
+        tcos_ = alloc<float>(act_, L_ * half, "image engine (SeedVR2 DiT)");
+        tsin_ = alloc<float>(act_, L_ * half, "image engine (SeedVR2 DiT)");
         gpu::copy(tcos_, cs.data(), cs.size() * 4);
         gpu::copy(tsin_, sn.data(), sn.size() * 4);
     }
-    rs_ = alloc<float>(act_, std::max(N, L_));
-    rs2_ = alloc<float>(act_, std::max(N, L_));
-    in16_ = alloc<uint16_t>(act_, N * kin_);
-    a16_ = alloc<uint16_t>(act_, std::max(N, L_) * C_);
-    q16_ = alloc<uint16_t>(act_, (N + L_) * C_);
-    k16_ = alloc<uint16_t>(act_, (N + L_) * C_);
-    v16_ = alloc<uint16_t>(act_, (N + L_) * C_);
-    jq_ = alloc<uint16_t>(act_, jr * C_);
-    jk_ = alloc<uint16_t>(act_, jr * C_);
-    jv_ = alloc<uint16_t>(act_, jr * C_);
-    jo_ = alloc<uint16_t>(act_, jr * C_);
-    o16_ = alloc<uint16_t>(act_, N * C_);
-    g16_ = alloc<uint16_t>(act_, N * F_);
+    rs_ = alloc<float>(act_, std::max(N, L_), "image engine (SeedVR2 DiT)");
+    rs2_ = alloc<float>(act_, std::max(N, L_), "image engine (SeedVR2 DiT)");
+    in16_ = alloc<uint16_t>(act_, N * kin_, "image engine (SeedVR2 DiT)");
+    a16_ = alloc<uint16_t>(act_, std::max(N, L_) * C_, "image engine (SeedVR2 DiT)");
+    q16_ = alloc<uint16_t>(act_, (N + L_) * C_, "image engine (SeedVR2 DiT)");
+    k16_ = alloc<uint16_t>(act_, (N + L_) * C_, "image engine (SeedVR2 DiT)");
+    v16_ = alloc<uint16_t>(act_, (N + L_) * C_, "image engine (SeedVR2 DiT)");
+    jq_ = alloc<uint16_t>(act_, jr * C_, "image engine (SeedVR2 DiT)");
+    jk_ = alloc<uint16_t>(act_, jr * C_, "image engine (SeedVR2 DiT)");
+    jv_ = alloc<uint16_t>(act_, jr * C_, "image engine (SeedVR2 DiT)");
+    jo_ = alloc<uint16_t>(act_, jr * C_, "image engine (SeedVR2 DiT)");
+    o16_ = alloc<uint16_t>(act_, N * C_, "image engine (SeedVR2 DiT)");
+    g16_ = alloc<uint16_t>(act_, N * F_, "image engine (SeedVR2 DiT)");
     if (w8_) {
-        xq8_ = alloc<int8_t>(act_, std::max(N, L_) * std::max(C_, F_));
-        xs_ = alloc<float>(act_, std::max(N, L_));
-        xs2_ = alloc<float>(act_, std::max(N, L_));
+        xq8_ = alloc<int8_t>(act_, std::max(N, L_) * std::max(C_, F_), "image engine (SeedVR2 DiT)");
+        xs_ = alloc<float>(act_, std::max(N, L_), "image engine (SeedVR2 DiT)");
+        xs2_ = alloc<float>(act_, std::max(N, L_), "image engine (SeedVR2 DiT)");
     } else if (q8_) {
-        rot16_ = alloc<uint16_t>(act_, std::max(N, L_) * std::max(C_, F_));
+        rot16_ = alloc<uint16_t>(act_, std::max(N, L_) * std::max(C_, F_), "image engine (SeedVR2 DiT)");
     }
     cap_t_ = t;
     cap_h_ = h;
@@ -850,7 +837,7 @@ void Seedvr2Dit::forward(const float* noise, const float* cond, int64_t h, int64
         kernels::f32_to_f16_bulk(x_, a16_, N * C, s_);
         product(a16_, nullptr, vout_, nullptr, y_, N, b_vout_);
     }
-    patch_out(y_, N, lat_, out, s_);
+    patch_to_tokens(y_, N, lat_, out, s_);
     gpu::stream_sync(s_);
 }
 

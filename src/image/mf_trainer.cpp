@@ -6,7 +6,7 @@
 
 #include "strata/core/gpu.hpp"
 #include "strata/image/safetensors.hpp"
-#include "strata/image/mapped_file.hpp"
+#include "strata/platform/mapped_file.hpp"
 #include "strata/image/qi_stream.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -206,7 +206,7 @@ MfTrainModel* mf_trainer_open(const std::string& dit_path, int64_t rank, void* s
     try {
         if (!m->gemm.init(stream, 1 << 24, err)) return nullptr;
         SafeTensors st(dit_path);
-        MappedFile file(dit_path);
+        platform::MappedFile file(dit_path);
         const uint8_t* data = file.data() + st.data_base();
         auto shape_of = [&](const std::string& name, int dim) -> int64_t {
             const SafeTensor* t = st.find(name);
@@ -532,7 +532,7 @@ MfTrainCond mf_trainer_cond(MfTrainModel* base, float sigma, int64_t h, int64_t 
     const int64_t mrank = m->blk.empty() || m->blk[0].adap == nullptr ? 1 : m->blk[0].adap->rank;
     float* hr = tmp.get<float>(mrank, s);
     // MageTrail's: the shared low-rank values from SiLU(temb) in FP32 (qi_silu left it in temb), as the engine's
-    // f32_vec reads them
+    // F32 MMVF reads them
     float* mlow = nullptr;
     if (m->mrank > 0) {
         mlow = tmp.get<float>(m->mrank, s);

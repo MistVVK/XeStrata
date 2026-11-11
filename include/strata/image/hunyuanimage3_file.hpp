@@ -27,7 +27,7 @@
 // and how it streams the banks it cannot hold, is hunyuanimage3_dit's.
 #pragma once
 
-#include "strata/image/mapped_file.hpp"
+#include "strata/platform/mapped_file.hpp"
 #include "strata/image/safetensors.hpp"
 
 #include <cstdint>
@@ -121,7 +121,7 @@ public:
 private:
     std::string path_;
     std::unique_ptr<SafeTensors> st_;
-    std::unique_ptr<MappedFile> file_;
+    std::unique_ptr<platform::MappedFile> file_;
     std::string err_;
 
     static bool low_first_default_;

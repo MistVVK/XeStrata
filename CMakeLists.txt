@@ -385,7 +385,8 @@ if(STRATA_ENABLE_XE)
   endif()
 
   add_library(strata_core STATIC src/core/device.cpp src/core/pinned.cpp src/core/gpu.cpp src/core/graph.cpp
-                                 src/core/weights.cpp src/core/layout.cpp)
+                                 src/core/weights.cpp src/core/layout.cpp src/core/stdin_lines.cpp
+                                 src/core/watchdog.cpp)
   target_include_directories(strata_core PUBLIC include)
   target_link_libraries(strata_core PUBLIC strata_sycl strata_warnings strata_plan strata_platform)
 
@@ -540,7 +541,8 @@ if(STRATA_ENABLE_XE)
                                    src/core/plain_model.cpp src/core/plain_glm5.cpp src/core/pcie_split.cpp
                                    src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
-                                   src/core/conversation_file.cpp src/core/vmm.cpp src/core/draft_head.cpp
+                                   src/core/conversation_file.cpp src/core/control_vector.cpp
+                                   src/core/vmm.cpp src/core/draft_head.cpp
                                    src/core/grammar.cpp src/core/script_guard.cpp src/core/plain_cpu.cpp)
   target_include_directories(strata_engine PUBLIC include)
   # the dense Qwen3.5 forward on the CPU (--device cpu): AVX2 throughout, run only after PlainModel's cpu_avx2_ok()
@@ -842,6 +844,7 @@ if(STRATA_ENABLE_XE)
                            src/image/qi_dit.cpp src/image/image_lora.cpp src/image/w8_choice.cpp
                            src/image/qi_vae.cpp src/image/qi_pipeline.cpp
                            src/image/img_start.cpp src/image/img_crop.cpp src/image/img_color.cpp
+                           src/image/tile_sides.cpp src/image/img_out.cpp
                            src/upscale/upscale.cpp src/upscale/esrgan.cpp src/upscale/seedvr2_dit.cpp
                            src/upscale/seedvr2.cpp src/image/yolo_detect.cpp
                            src/image/cnet_prep.cpp src/image/qi_control.cpp src/image/cnet_depth.cpp
@@ -1226,6 +1229,21 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-image-aux-probe PRIVATE strata_image)
   add_executable(strata-image-text-probe src/image/qi_text_probe.cpp)
   target_link_libraries(strata-image-text-probe PRIVATE strata_image)
+  # img_start's shared parts: a picture as each model's encoder reads its planar floats, the seed's noise as its DiT's
+  # tokens take it (the host's work only: no GPU, no model)
+  add_executable(img_start_test src/image/img_start_test.cpp)
+  target_link_libraries(img_start_test PRIVATE strata_image)
+  add_test(NAME img_start_test COMMAND img_start_test)
+  # img_crop's host resize of a picture's planar floats, against the formula Mage-Flow read with before its private
+  # bicubic went into these parts (the host's work only: no GPU, no model)
+  add_executable(img_crop_test src/image/img_crop_test.cpp)
+  target_link_libraries(img_crop_test PRIVATE strata_image)
+  add_test(NAME img_crop_test COMMAND img_crop_test)
+  # the VAE tiles' shared corners, sides and blend weights, against the formulas Qwen-Image's VAE, the Flux2 VAE and
+  # a video's tiles read with before these parts were shared (the host's work only: no GPU, no model)
+  add_executable(tile_sides_test src/image/tile_sides_test.cpp)
+  target_link_libraries(tile_sides_test PRIVATE strata_image)
+  add_test(NAME tile_sides_test COMMAND tile_sides_test)
   # the image attention (its 16-bit path and the int8 kernel) against FP64 (synthetic; --bench: a benchmark too)
   add_executable(qi_attn_parity src/image/qi_attn_parity.cpp)
   target_link_libraries(qi_attn_parity PRIVATE strata_image)

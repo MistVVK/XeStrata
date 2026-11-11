@@ -25,9 +25,11 @@
 #include <string>
 #include <vector>
 
+namespace strata::platform { class MappedFile; }
+
 namespace strata::image {
 
-class MappedFile;
+
 
 class QiControl {
 public:
@@ -82,7 +84,7 @@ private:
     std::string path_;
     QiDit* dit_ = nullptr;
     bool dry_ = false;
-    std::unique_ptr<MappedFile> file_;
+    std::unique_ptr<platform::MappedFile> file_;
     std::vector<std::vector<uint8_t>> host_;   // the blocks' quantized bytes (the stream's spans)
     std::vector<Block> blocks_;
     LayerStream stream_;

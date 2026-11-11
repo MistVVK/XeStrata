@@ -203,7 +203,11 @@ QiRef UpscaleRunner::run(UpscaleModel& m, const QiRef& src, const Request& r, ui
         fin = feed.p;
         rp.resize_s += since(t0);
     }
-    // the model, the frame whole or in tiles of the largest core whose run fits the VRAM left
+    // the model, the frame whole or in tiles of the largest core whose run fits the VRAM left.  These are not the
+    // VAEs' tile parts (src/image/tile_sides.hpp): a window here is a core plus the context the model needs around it,
+    // cut out of the frame and its core pasted back with nothing overlapping - every output pixel comes from one
+    // window, so there is no shared band to ramp, no weights to add up and no divide to end.  Its side too comes from
+    // halving until the run fits, not from weighing the tiles' positions against each other
     t0 = std::chrono::steady_clock::now();
     if (in.identity) {
         m.run_clip(fin, fw, fh, nfr, made.p, r.seed);

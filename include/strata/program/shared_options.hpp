@@ -8,13 +8,18 @@
 #pragma once
 
 #include "strata/prefill/prefill.hpp"
+#include "strata/platform/aux_cpus.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <sstream>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace strata::program {
 
@@ -56,6 +61,92 @@ struct SharedOptionFields {
     double* rope_freq_base = nullptr;
     double* rope_freq_scale = nullptr;
     double* yarn_orig_ctx = nullptr;
+    // the rest of what the two engines take with one meaning
+    bool* serve = nullptr;
+    bool* vision = nullptr;
+    bool* stop_eos = nullptr;
+    bool* session_save_reclaim = nullptr;
+    bool* prompt_cache_tail = nullptr;
+    bool* prompt_cache_spread = nullptr;
+    bool* conversation_save_compress = nullptr;
+    bool* no_host_worker = nullptr;      ///< generate: true
+    bool* pool_host_works = nullptr;     ///< plain: false
+    int* batch_mtp_int = nullptr;        ///< generate's int
+    bool* batch_mtp_bool = nullptr;      ///< plain's bool
+    int* adapt_async_int = nullptr;      ///< generate's int
+    bool* adapt_async_bool = nullptr;    ///< plain's bool
+    bool* coupled_draft = nullptr;
+    int* kv_grow = nullptr;
+    std::string* conversation_save = nullptr;
+    std::string* dump_logits = nullptr;
+    std::string* dump_routing = nullptr;
+    std::string* pool_cores = nullptr;
+    std::string* shared_expert_arena = nullptr;
+    std::string* expert_cache_remote_placement = nullptr;
+    int* expert_cache = nullptr;         ///< auto -> -1
+    bool gpu_consume = false;            ///< --gpu: applied at startup, before the runtime
+    std::vector<std::pair<std::string, float>>* cvec_files = nullptr;
+    int* cvec_first = nullptr;
+    int* cvec_last = nullptr;
+    int* cvec_mode = nullptr;
+    int* cvec_single = nullptr;
+    int* prompt_cache = nullptr;         ///< max 0
+    int* suffix_draft = nullptr;         ///< max 0
+    int* lookup_chain = nullptr;
+    int lookup_chain_lo = 0, lookup_chain_hi = -1;   ///< generate 0..7; plain 0.. (hi < lo: no upper bound)
+    int* lookup_chain_min = nullptr;
+    int lookup_chain_min_lo = 1;         ///< generate 3; plain 1
+    int* pipeline_windows = nullptr;
+    int pipeline_windows_hi = -1;        ///< generate 2; plain no upper bound
+    int* adapt_mib_per_token = nullptr;
+    bool adapt_mib_clamp0 = false;       ///< generate: max 0; plain as it is
+    int* batch = nullptr;                ///< --batch / --slots
+    bool batch_clamp0 = false;           ///< plain: max 0; generate as it is
+    int* expert_cache_remote = nullptr;  ///< --expert-cache-device1/2/3, an array of 3
+    bool expert_cache_remote_clamp0 = false;   ///< plain: max 0
+    int* pool_tasks = nullptr;
+    const char* pool_tasks_msg = nullptr;      ///< the engine's own error line
+    bool pool_tasks_strict = false;            ///< generate: the whole value an integer
+    int64_t* prompt_cache_every = nullptr;
+    int64_t* prompt_cache_root = nullptr;
+    int64_t* reply_checkpoint_every = nullptr;
+    int64_t* short_read = nullptr;
+    bool* short_read_given = nullptr;
+    int64_t* turn_token = nullptr;             ///< generate: as it is
+    int64_t* tail_role_token = nullptr;
+    int32_t* turn_token_i32 = nullptr;         ///< plain: max(-1, v)
+    int32_t* tail_role_token_i32 = nullptr;
+    int* vram_reserve_mib = nullptr;           ///< generate: int, no clamp
+    bool* vram_reserve_given = nullptr;
+    int64_t* vram_reserve_mib_i64 = nullptr;   ///< plain: max 0
+    int* vram_reserve_later_mib = nullptr;
+    int64_t* vram_reserve_later_mib_i64 = nullptr;
+    double* pcie_frac = nullptr;
+    bool pcie_frac_validate = false;           ///< plain: 0..1, else the error
+    double* yarn_ext_factor = nullptr;
+    double* yarn_attn_factor = nullptr;
+    double* yarn_beta_fast = nullptr;
+    double* yarn_beta_slow = nullptr;
+    bool yarn_validate = false;                ///< plain: finite, ext >= -1, the rest > 0
+    std::string* aux_cpus = nullptr;           ///< parse_spec checked, who in the error
+    int* batch_groups = nullptr;
+    bool* batch_groups_set = nullptr;          ///< generate
+    bool* batch_groups_auto = nullptr;         ///< generate
+    bool batch_groups_plain = false;           ///< plain: auto -> -1, else max 1
+    // the conversation cache / save / memory group (parse_conversation_option): generate checks the value strictly
+    // (from_chars, a per-option limit, its error); plain takes strtoll's value clamped to 0 and converts it itself
+    bool conv_strict = false;
+    int64_t* conversation_cache_mib = nullptr;
+    int* conversation_cache_slots = nullptr;
+    int64_t* conversation_cache_min_free_mib = nullptr;
+    int64_t* conversation_cache_min_tokens = nullptr;
+    int64_t* conversation_cache_park_gain = nullptr;
+    int* conversation_save_checkpoints = nullptr;
+    int64_t* conversation_save_mib = nullptr;
+    int64_t* conversation_save_hours = nullptr;
+    int64_t* session_min_free_mib = nullptr;
+    int64_t* memory_limit_mib = nullptr;
+    int64_t* ram_reserve_mib = nullptr;
 };
 
 /// 1: `a` was one of them (its value taken through `next(name)`), 0: it is not (or this engine does not take it),
@@ -128,7 +219,250 @@ int parse_shared_option(const std::string& a, Next&& next, const SharedOptionFie
     if (a == "--rope-freq-base" && f.rope_freq_base) return f64(f.rope_freq_base);
     if (a == "--rope-freq-scale" && f.rope_freq_scale) return f64(f.rope_freq_scale);
     if (a == "--yarn-orig-ctx" && f.yarn_orig_ctx) return f64(f.yarn_orig_ctx);
+    // the rest of the two engines' common options
+    if (a == "--serve" && f.serve) { *f.serve = true; return 1; }
+    if (a == "--vision" && f.vision) { *f.vision = true; return 1; }
+    if (a == "--greedy" && f.greedy) { *f.greedy = true; return 1; }
+    if (a == "--stop-eos" && f.stop_eos) { *f.stop_eos = true; return 1; }
+    if (a == "--session-save-reclaim" && f.session_save_reclaim) { *f.session_save_reclaim = true; return 1; }
+    if (a == "--prompt-cache-tail" && f.prompt_cache_tail) { *f.prompt_cache_tail = true; return 1; }
+    if (a == "--prompt-cache-spread" && f.prompt_cache_spread) { *f.prompt_cache_spread = true; return 1; }
+    if (a == "--conversation-save-compress" && f.conversation_save_compress) { *f.conversation_save_compress = true; return 1; }
+    if (a == "--no-host-worker") {
+        if (f.no_host_worker) { *f.no_host_worker = true; return 1; }
+        if (f.pool_host_works) { *f.pool_host_works = false; return 1; }
+    }
+    if (a == "--batch-mtp" || a == "--no-batch-mtp") {
+        const bool on = a == "--batch-mtp";
+        if (f.batch_mtp_int) { *f.batch_mtp_int = on ? 1 : 0; return 1; }
+        if (f.batch_mtp_bool) { *f.batch_mtp_bool = on; return 1; }
+    }
+    if (a == "--adapt-async") {
+        const bool on = std::strtol(next(a.c_str()), nullptr, 10) != 0;
+        if (f.adapt_async_int) { *f.adapt_async_int = on ? 1 : 0; return 1; }
+        if (f.adapt_async_bool) { *f.adapt_async_bool = on; return 1; }
+    }
+    if (a == "--coupled-draft" && f.coupled_draft) { *f.coupled_draft = true; return 1; }
+    if (a == "--no-coupled-draft" && f.coupled_draft) { *f.coupled_draft = false; return 1; }
+    if (a == "--kv-grow" && f.kv_grow) { *f.kv_grow = 1; return 1; }
+    if (a == "--no-kv-grow" && f.kv_grow) { *f.kv_grow = 0; return 1; }
+    if (a == "--conversation-save" && f.conversation_save) { *f.conversation_save = next(a.c_str()); return 1; }
+    if (a == "--dump-logits" && f.dump_logits) { *f.dump_logits = next(a.c_str()); return 1; }
+    if (a == "--dump-routing" && f.dump_routing) { *f.dump_routing = next(a.c_str()); return 1; }
+    if (a == "--pool-cores" && f.pool_cores) { *f.pool_cores = next(a.c_str()); return 1; }
+    if (a == "--shared-expert-arena" && f.shared_expert_arena) { *f.shared_expert_arena = next(a.c_str()); return 1; }
+    if (a == "--expert-cache-remote-placement" && f.expert_cache_remote_placement) {
+        *f.expert_cache_remote_placement = next(a.c_str()); return 1;
+    }
+    if (a == "--expert-cache" && f.expert_cache) {
+        const std::string v = next(a.c_str());
+        *f.expert_cache = (v == "auto") ? -1 : (int) std::strtol(v.c_str(), nullptr, 10);
+        return 1;
+    }
+    if (a == "--gpu" && f.gpu_consume) { (void) next(a.c_str()); return 1; }   // applied at startup, before the runtime
+    if (a == "--control-vector" && f.cvec_files) { f.cvec_files->push_back({next(a.c_str()), 1.0f}); return 1; }
+    if (a == "--control-vector-scaled" && f.cvec_files) {   // FILE:SCALE, comma-separated; the last colon before the scale
+        std::stringstream list(next(a.c_str()));
+        std::string item;
+        while (std::getline(list, item, ',')) {
+            const size_t colon = item.rfind(':');
+            char* end = nullptr;
+            const float sc = colon == std::string::npos ? 0.0f : std::strtof(item.c_str() + colon + 1, &end);
+            if (colon == std::string::npos || colon == 0 || end == item.c_str() + colon + 1 || *end != '\0') {
+                std::fprintf(stderr, "--control-vector-scaled: expected FILE:SCALE, got '%s'\n", item.c_str());
+                return -1;
+            }
+            f.cvec_files->push_back({item.substr(0, colon), sc});
+        }
+        return 1;
+    }
+    if (a == "--control-vector-layer-range" && f.cvec_first && f.cvec_last) {
+        *f.cvec_first = (int) std::strtol(next(a.c_str()), nullptr, 10);
+        *f.cvec_last = (int) std::strtol(next(a.c_str()), nullptr, 10);
+        return 1;
+    }
+    if (a == "--cvec-mode" && f.cvec_mode) {
+        const std::string m = next(a.c_str());
+        if (m != "project" && m != "add") {
+            std::fprintf(stderr, "--cvec-mode: add or project, got '%s'\n", m.c_str());
+            return -1;
+        }
+        *f.cvec_mode = m == "project" ? 0 : 1;
+        return 1;
+    }
+    if (a == "--cvec-dir" && f.cvec_single) {
+        const std::string d = next(a.c_str());
+        if (d == "per-layer") *f.cvec_single = -1;
+        else if (d.rfind("single:", 0) == 0) *f.cvec_single = (int) std::strtol(d.c_str() + 7, nullptr, 10);
+        else { std::fprintf(stderr, "--cvec-dir: per-layer or single:L, got '%s'\n", d.c_str()); return -1; }
+        return 1;
+    }
+    if (a == "--prompt-cache" && f.prompt_cache) { *f.prompt_cache = std::max(0, (int) std::strtol(next(a.c_str()), nullptr, 10)); return 1; }
+    if (a == "--suffix-draft" && f.suffix_draft) { *f.suffix_draft = std::max(0, (int) std::strtol(next(a.c_str()), nullptr, 10)); return 1; }
+    if (a == "--lookup-chain" && f.lookup_chain) {
+        const int v = (int) std::strtol(next(a.c_str()), nullptr, 10);
+        *f.lookup_chain = f.lookup_chain_hi < f.lookup_chain_lo ? std::max(f.lookup_chain_lo, v)
+                                                               : std::clamp(v, f.lookup_chain_lo, f.lookup_chain_hi);
+        return 1;
+    }
+    if (a == "--lookup-chain-min" && f.lookup_chain_min) {
+        *f.lookup_chain_min = std::max(f.lookup_chain_min_lo, (int) std::strtol(next(a.c_str()), nullptr, 10));
+        return 1;
+    }
+    if (a == "--pipeline-windows" && f.pipeline_windows) {
+        const int v = std::max(0, (int) std::strtol(next(a.c_str()), nullptr, 10));
+        *f.pipeline_windows = f.pipeline_windows_hi < 0 ? v : std::min(f.pipeline_windows_hi, v);
+        return 1;
+    }
+    if (a == "--adapt-mib-per-token" && f.adapt_mib_per_token) {
+        const int v = (int) std::strtol(next(a.c_str()), nullptr, 10);
+        *f.adapt_mib_per_token = f.adapt_mib_clamp0 ? std::max(0, v) : v;
+        return 1;
+    }
+    if ((a == "--batch" || a == "--slots") && f.batch) {
+        const int v = (int) std::strtol(next(a.c_str()), nullptr, 10);
+        *f.batch = f.batch_clamp0 ? std::max(0, v) : v;
+        return 1;
+    }
+    if ((a == "--expert-cache-device1" || a == "--expert-cache-device2" || a == "--expert-cache-device3") &&
+        f.expert_cache_remote) {
+        const int v = (int) std::strtol(next(a.c_str()), nullptr, 10);
+        f.expert_cache_remote[(size_t) (a.back() - '1')] = f.expert_cache_remote_clamp0 ? std::max(0, v) : v;
+        return 1;
+    }
+    if (a == "--pool-tasks" && f.pool_tasks) {
+        const char* v = next(a.c_str());
+        char* end = nullptr;
+        const long tasks = std::strtol(v, &end, 10);
+        if ((f.pool_tasks_strict && (end == v || *end != '\0')) || tasks < 0 || tasks > 4096) {
+            std::fprintf(stderr, "%s\n", f.pool_tasks_msg != nullptr ? f.pool_tasks_msg : "--pool-tasks takes 0..4096");
+            return -1;
+        }
+        *f.pool_tasks = (int) tasks;
+        return 1;
+    }
+    if (a == "--prompt-cache-every" && f.prompt_cache_every) { *f.prompt_cache_every = std::max<int64_t>(0, std::strtoll(next(a.c_str()), nullptr, 10)); return 1; }
+    if (a == "--prompt-cache-root" && f.prompt_cache_root) { *f.prompt_cache_root = std::max<int64_t>(0, std::strtoll(next(a.c_str()), nullptr, 10)); return 1; }
+    if (a == "--reply-checkpoint-every" && f.reply_checkpoint_every) { *f.reply_checkpoint_every = std::max<int64_t>(0, std::strtoll(next(a.c_str()), nullptr, 10)); return 1; }
+    if (a == "--short-read" && f.short_read) {
+        *f.short_read = std::max<int64_t>(0, std::strtoll(next(a.c_str()), nullptr, 10));
+        if (f.short_read_given) *f.short_read_given = true;
+        return 1;
+    }
+    if (a == "--turn-token") {
+        const long long v = std::strtoll(next(a.c_str()), nullptr, 10);
+        if (f.turn_token) { *f.turn_token = v; return 1; }
+        if (f.turn_token_i32) { *f.turn_token_i32 = (int32_t) std::max(-1LL, v); return 1; }
+    }
+    if (a == "--tail-role-token") {
+        const long long v = std::strtoll(next(a.c_str()), nullptr, 10);
+        if (f.tail_role_token) { *f.tail_role_token = v; return 1; }
+        if (f.tail_role_token_i32) { *f.tail_role_token_i32 = (int32_t) std::max(-1LL, v); return 1; }
+    }
+    if (a == "--vram-reserve-mib") {
+        const long long v = std::strtoll(next(a.c_str()), nullptr, 10);
+        if (f.vram_reserve_mib) {
+            *f.vram_reserve_mib = (int) v;
+            if (f.vram_reserve_given) *f.vram_reserve_given = true;
+            return 1;
+        }
+        if (f.vram_reserve_mib_i64) { *f.vram_reserve_mib_i64 = std::max<int64_t>(0, v); return 1; }
+    }
+    if (a == "--vram-reserve-later-mib") {
+        const long long v = std::strtoll(next(a.c_str()), nullptr, 10);
+        if (f.vram_reserve_later_mib) { *f.vram_reserve_later_mib = (int) v; return 1; }
+        if (f.vram_reserve_later_mib_i64) { *f.vram_reserve_later_mib_i64 = std::max<int64_t>(0, v); return 1; }
+    }
+    if (a == "--pcie-frac" && f.pcie_frac) {
+        const double v = std::strtod(next(a.c_str()), nullptr);
+        if (f.pcie_frac_validate && (!std::isfinite(v) || v < 0.0 || v > 1.0)) {
+            std::fprintf(stderr, "%s: --pcie-frac takes 0 .. 1\n", f.who);
+            return -1;
+        }
+        *f.pcie_frac = v;
+        return 1;
+    }
+    if ((a == "--yarn-ext-factor" || a == "--yarn-attn-factor" || a == "--yarn-beta-fast" || a == "--yarn-beta-slow") &&
+        (f.yarn_ext_factor || f.yarn_attn_factor || f.yarn_beta_fast || f.yarn_beta_slow)) {
+        const double v = std::strtod(next(a.c_str()), nullptr);
+        // plain checks them: finite, the ext factor >= -1 (< 0: auto), the rest positive
+        if (f.yarn_validate && (!std::isfinite(v) || (a == "--yarn-ext-factor" ? v < -1.0 : v <= 0.0))) {
+            std::fprintf(stderr, "%s: %s %g: invalid rope scaling knob\n", f.who, a.c_str(), v);
+            return -1;
+        }
+        double* dst = a == "--yarn-ext-factor"    ? f.yarn_ext_factor
+                    : a == "--yarn-attn-factor" ? f.yarn_attn_factor
+                    : a == "--yarn-beta-fast"   ? f.yarn_beta_fast
+                                                : f.yarn_beta_slow;
+        if (dst != nullptr) *dst = v;
+        return 1;
+    }
+    if (a == "--aux-cpus" && f.aux_cpus) {
+        *f.aux_cpus = next(a.c_str());
+        std::string aerr;
+        strata::aux_cpus::Config acfg;
+        if (!strata::aux_cpus::parse_spec(*f.aux_cpus, acfg, aerr)) {
+            std::fprintf(stderr, "%s: %s\n", f.who, aerr.c_str());
+            return -1;
+        }
+        return 1;
+    }
+    if (a == "--batch-groups" && f.batch_groups) {
+        const std::string v = next(a.c_str());
+        if (f.batch_groups_set) *f.batch_groups_set = true;
+        if (v == "auto") {
+            if (f.batch_groups_auto) *f.batch_groups_auto = true;
+            if (f.batch_groups_plain) *f.batch_groups = -1;
+        } else {
+            const int n = (int) std::strtol(v.c_str(), nullptr, 10);
+            *f.batch_groups = f.batch_groups_plain ? std::max(1, n) : n;
+        }
+        return 1;
+    }
     return 0;
+}
+
+
+/// The conversation cache / save / memory group (--conversation-cache-*, --conversation-save-*, --session-min-free-mib,
+/// --memory-limit-mib, --ram-reserve-mib).  generate checks the value strictly (from_chars, a per-option limit, its
+/// error line); plain takes strtoll's value clamped to 0 and converts it to its own units itself.  1: taken,
+/// -1: refused (strict only), 0: not one of them.
+template <class Next>
+int parse_conversation_option(const std::string& a, Next&& next, const SharedOptionFields& f) {
+    if (a != "--conversation-cache-mib" && a != "--conversation-cache-slots" &&
+        a != "--conversation-cache-min-free-mib" && a != "--conversation-cache-min-tokens" &&
+        a != "--conversation-save-checkpoints" && a != "--conversation-save-mib" &&
+        a != "--conversation-save-hours" && a != "--session-min-free-mib" &&
+        a != "--conversation-cache-park-gain" && a != "--memory-limit-mib" && a != "--ram-reserve-mib")
+        return 0;
+    int64_t parsed = 0;
+    if (f.conv_strict) {
+        const std::string value = next(a.c_str());
+        const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+        const int64_t limit = a == "--conversation-cache-slots" || a == "--conversation-save-checkpoints" ||
+                                      a == "--conversation-cache-min-tokens" || a == "--conversation-cache-park-gain"
+                                  ? INT32_MAX
+                              : a == "--conversation-save-hours" ? INT64_MAX / 3600
+                                                                 : INT64_MAX / (int64_t{1024} * 1024);
+        if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || parsed < 0 || parsed > limit) {
+            std::fprintf(stderr, "%s needs a nonnegative integer within range\n", a.c_str());
+            return -1;
+        }
+    } else {
+        parsed = std::max<int64_t>(0, std::strtoll(next(a.c_str()), nullptr, 10));
+    }
+    if (a == "--conversation-cache-mib" && f.conversation_cache_mib) *f.conversation_cache_mib = parsed;
+    else if (a == "--conversation-cache-min-free-mib" && f.conversation_cache_min_free_mib) *f.conversation_cache_min_free_mib = parsed;
+    else if (a == "--conversation-cache-min-tokens" && f.conversation_cache_min_tokens) *f.conversation_cache_min_tokens = parsed;
+    else if (a == "--conversation-cache-park-gain" && f.conversation_cache_park_gain) *f.conversation_cache_park_gain = parsed;
+    else if (a == "--conversation-save-checkpoints" && f.conversation_save_checkpoints) *f.conversation_save_checkpoints = (int) parsed;
+    else if (a == "--conversation-save-mib" && f.conversation_save_mib) *f.conversation_save_mib = parsed;
+    else if (a == "--conversation-save-hours" && f.conversation_save_hours) *f.conversation_save_hours = parsed;
+    else if (a == "--session-min-free-mib" && f.session_min_free_mib) *f.session_min_free_mib = parsed;
+    else if (a == "--memory-limit-mib" && f.memory_limit_mib) *f.memory_limit_mib = parsed;
+    else if (a == "--ram-reserve-mib" && f.ram_reserve_mib) *f.ram_reserve_mib = parsed;
+    else if (a == "--conversation-cache-slots" && f.conversation_cache_slots) *f.conversation_cache_slots = (int) parsed;
+    return 1;
 }
 
 }  // namespace strata::program

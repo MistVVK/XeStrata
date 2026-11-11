@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/image/anima_pipeline.cpp - see include/strata/image/anima_pipeline.hpp.
 
+#include "sigmas.hpp"
 #include "strata/image/anima_pipeline.hpp"
 
 #include "strata/core/gpu.hpp"
@@ -9,6 +10,8 @@
 #include "strata/image/flow_sampler.hpp"
 #include "strata/image/moss_pipeline.hpp"
 #include "strata/platform/env.hpp"
+
+#include "strata/image/gpu_buf.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -31,23 +34,7 @@ constexpr int64_t kMaxTokens = 4096;
 constexpr int32_t kPad = 151643;    // Qwen3's <|endoftext|>: the one token of an empty prompt
 constexpr int32_t kT5End = 1;       // T5's </s>
 
-sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
-
 uint64_t clampu(uint64_t v, uint64_t lo, uint64_t hi) { return std::max(lo, std::min(v, hi)); }
-
-// RGB [3][H][W] in -1 .. 1 of an RGBA8 image at W x H (nearest), over white where it is not opaque, as RGBA [4][H][W]
-// in 0 .. 1 (the VAE's encoder takes its first three channels)
-std::vector<float> base_rgba(const QiRef& f, int64_t W, int64_t H) {
-    const std::vector<uint8_t> px = resize_nearest(f, W, H);
-    const int64_t n = W * H;
-    std::vector<float> rgba((size_t) (4 * n), 1.f);
-    for (int64_t q = 0; q < n; ++q) {
-        const float a = (float) px[(size_t) (q * 4 + 3)] / 255.f;
-        for (int c = 0; c < 3; ++c)
-            rgba[(size_t) (c * n + q)] = std::nearbyint((float) px[(size_t) (q * 4 + c)] * a + 255.f * (1.f - a)) / 255.f;
-    }
-    return rgba;
-}
 
 // z [L][2h][2w] (the VAE's latent) from the tokens [h w][4 L] (channel c of the patch's pixel (m, n) at c * 4 + m * 2
 // + n), and back
@@ -79,7 +66,7 @@ std::vector<float> anima_sigmas(int n, float shift) {
     for (int i = 0; i < n; ++i) {
         const int k = (int) ((double) i * ((double) kTrain / (double) n));
         const float t = (float) (kTrain - k) / (float) kTrain;
-        out.push_back(shift * t / (1.f + (shift - 1.f) * t));
+        out.push_back(sigma_shift(t, shift));
     }
     out.push_back(0.f);
     return out;
@@ -332,7 +319,10 @@ void AnimaPipeline::encode_base(const QiRequest& r, const QiRef& base, LatentSta
     const int64_t s = vae_->scale(), h = r.height / s / 2, w = r.width / s / 2;
     const uint64_t more = need(0, r.width, r.height, {}, true).least - need(0, r.width, r.height).least;
     if (held() + more > budget()) release(false);
-    const std::vector<float> px = base_rgba(base, r.width, r.height);
+    // RGBA [4][H][W] in 0 .. 1 over white, the alpha's plane the opaque one (img_start.hpp's image_planes);
+    // Wan 2.1's VAE encoder reads its first three channels
+    const std::vector<float> px =
+        image_planes(base, r.width, r.height, 4, PlaneAlpha::White, PlaneRange::Unit);
     float *rgba = nullptr, *z = nullptr;
     const int64_t L = dit_->latent_channels();
     if (!gpu::alloc_device(&rgba, px.size() * 4) || !gpu::alloc_device(&z, (size_t) (L * 4 * h * w) * 4)) {
@@ -465,11 +455,7 @@ std::vector<uint8_t> AnimaPipeline::generate(const QiRequest& r, QiTimes* times,
     const int64_t L = d.latent_channels(), TV = d.token_values(), N = TV * h * w;
     const auto noise = torch_cpu_randn(r.seed, (uint64_t) N);
     std::vector<float> tokens((size_t) N);
-    for (int64_t c = 0; c < L; ++c)
-        for (int64_t y = 0; y < 2 * h; ++y)
-            for (int64_t xx = 0; xx < 2 * w; ++xx)
-                tokens[(size_t) (((y / 2) * w + xx / 2) * TV + c * 4 + (y % 2) * 2 + xx % 2)] =
-                    noise[(size_t) ((c * 2 * h + y) * 2 * w + xx)];
+    noise_to_tokens(noise.data(), L, 2 * h, 2 * w, 2, tokens.data());
     float *x = nullptr, *rgba = nullptr, *x0 = nullptr, *z = nullptr;
     if (!gpu::alloc_device(&x, (size_t) N * 4) || !gpu::alloc_device(&rgba, (size_t) (4 * HW) * 4) ||
         !gpu::alloc_device(&z, (size_t) N * 4)) {

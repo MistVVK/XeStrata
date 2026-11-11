@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/image/img_start.hpp - what img2img and a mask share across the image models' pipelines: the
-// request's base image, the step its strength starts the sampler at, the mask's latent positions and kept pixels, and
-// the device buffers the sampler's start and its steps' blend read.
+// request's base image, the step its strength starts the sampler at, the mask's latent positions and kept pixels, the
+// base and reference pictures as the encoders' planar floats, the seed's noise as its DiT's tokens take it, and the
+// device buffers the sampler's start and its steps' blend read.
 //
 // img2img (a strength below 1) is the flow-matching img2img of diffusers' pipelines: of a schedule's n steps, the
 // first floor(n (1 - strength)) are skipped, and the sampler starts at the next one's sigma s from the base image's
@@ -40,6 +41,32 @@ std::string refs_key(const std::vector<QiRef>& refs);
 /// RGBA8 [H][W][4] of `f` at W x H, nearest (the base image and the mask as the pipelines take them).
 std::vector<uint8_t> resize_nearest(const QiRef& f, int64_t W, int64_t H);
 
+/// The transparency's part in the planar floats an image model's encoder reads, its base or reference picture turned
+/// into them.  The models differ here, and only here: where the alpha goes, and where an 8-bit value lands in the
+/// floats.  The picture's own order (channel first, a plane per channel) is the same in every model.
+enum class PlaneAlpha {
+    Keep,       // none of it: each channel is taken as the file has it, the alpha one of them (Qwen-Image's VAE input)
+    White,      // over white, at the whole byte a saved picture would hold (Mage-Flow, MOSS-Image, Anima)
+    WhiteUnit,  // over white in the 0 .. 1 floats, not rounded to a byte (Qwen-Image's vision encoder's input)
+};
+
+/// An 8-bit value's place in those floats.
+enum class PlaneRange {
+    Byte,    // 0 .. 255 (what Mage-Flow resizes before its own map to -1 .. 1)
+    Unit,    // 0 .. 1
+    Signed,  // -1 .. 1
+};
+
+/// The RGBA8 picture `px` at W x H as planar floats [channels][HW] (channels 3 for RGB, 4 for RGBA), the input of a
+/// VAE's or a vision encoder's.  Where the alpha goes over white, the fourth plane of a four-channel take is the
+/// opaque white.
+std::vector<float> image_planes(const std::vector<uint8_t>& px, int64_t W, int64_t H, int64_t channels,
+                                PlaneAlpha alpha, PlaneRange range);
+
+/// The same of `f` at W x H, nearest (resize_nearest).
+std::vector<float> image_planes(const QiRef& f, int64_t W, int64_t H, int64_t channels, PlaneAlpha alpha,
+                                PlaneRange range);
+
 /// The mask over a W x H picture by latent position (`patch` pixels a side): 1 where a pixel of the position is less
 /// than opaque (the part that changes), 0 elsewhere, [H / patch][W / patch].  `px`: the mask at W x H (nearest).
 std::vector<float> latent_mask(const std::vector<uint8_t>& px, int64_t W, int64_t H, int64_t patch);
@@ -55,6 +82,15 @@ std::vector<uint8_t> rgba8(const std::vector<float>& planar, int64_t HW);
 
 /// The picture's kept part: img = (a base + (255 - a) img) / 255 by the mask's alpha a, all RGBA8 [H][W][4].
 void keep_pixels(std::vector<uint8_t>& img, const std::vector<uint8_t>& base, const std::vector<uint8_t>& mask);
+
+/// The seed's noise as the latent's [C][H][W] (the order a randn of the latent draws it in) in the order its DiT's
+/// tokens take them: H / patch x W / patch tokens of C * patch * patch values, the latent's channel c and the patch's
+/// part (dy, dx) at c * patch * patch + dy * patch + dx.  patch 1 is a token of one latent pixel (Mage-Flow,
+/// MOSS-Image); 2 the 2 x 2 patch a token of Mage-VAE's and Wan 2.1's latents (Anima, SeedVR2).  `src` and `out` take
+/// C * H * W values; `stride`, the values one channel is apart, is H * W of a single latent, and a video's
+/// [channel][frame][H][W] passes its frames' worth, called once a frame with `src` and `out` at that frame's start.
+void noise_to_tokens(const float* src, int64_t C, int64_t H, int64_t W, int64_t patch, float* out,
+                     int64_t stride = 0);
 
 /// The device buffers of a request's start and blend: the base image's latent, and for a mask its positions and the
 /// seed's noise.  Freed with the object.

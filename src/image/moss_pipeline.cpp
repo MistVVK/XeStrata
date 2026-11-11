@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/image/moss_pipeline.cpp - see include/strata/image/moss_pipeline.hpp.
 
+#include "sigmas.hpp"
 #include "strata/image/moss_pipeline.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -42,21 +43,6 @@ uint64_t clampu(uint64_t v, uint64_t lo, uint64_t hi) { return std::max(lo, std:
 // an edit's references in the stream at every step (MossDit::set_refs), rather than kept as keys and values
 bool in_stream(QiRefLayout l) { return l == QiRefLayout::AitkNoKv || l == QiRefLayout::Appended; }
 
-// RGB [3][H][W] in -1 .. 1 of an RGBA8 image at W x H (nearest), over white where it is not opaque
-std::vector<float> base_rgb(const QiRef& f, int64_t W, int64_t H) {
-    const std::vector<uint8_t> px = resize_nearest(f, W, H);
-    const int64_t n = W * H;
-    std::vector<float> rgb((size_t) (3 * n));
-    for (int64_t q = 0; q < n; ++q) {
-        const float a = (float) px[(size_t) (q * 4 + 3)] / 255.f;
-        for (int c = 0; c < 3; ++c) {
-            const float v = std::nearbyint((float) px[(size_t) (q * 4 + c)] * a + 255.f * (1.f - a));
-            rgb[(size_t) (c * n + q)] = v / 127.5f - 1.f;
-        }
-    }
-    return rgb;
-}
-
 }  // namespace
 
 std::vector<float> moss_sigmas(int n, float shift) {
@@ -73,7 +59,7 @@ std::vector<float> moss_sigmas(int n, float shift) {
     };
     auto grid = [&](int count, float s) {
         std::vector<float> v = linspace(1.f, (float) ((double) s / (double) (kTrain + s - 1)), count);
-        for (float& x : v) x = s * x / (1.f + (s - 1.f) * x);
+        for (float& x : v) x = sigma_shift(x, s);
         return v;
     };
     const std::vector<float> want = grid(n, shift);
@@ -160,16 +146,15 @@ bool MossPipeline::open(const std::string& dit, const std::string& vae, const st
     if (!vision.empty()) {   // an ai-toolkit edit adapter's pictures: Qwen3.5-9B's ViT
         vision_size_ = std::make_unique<QiVision>();
         if (!vision_size_->open(vision, s_, err, true)) return false;
-        try {
-            image_pad_ = (int32_t) GgufModel::open(text).meta().string_index("tokenizer.ggml.tokens", "<|image_pad|>");
-        } catch (const std::exception&) {
-            image_pad_ = -1;
-        }
+        image_pad_ = TextEncoder::pad_id(text);   // the shared read of the vocabulary
     }
     {
         std::string no;
         base_encoder_ = vae_size_->open_encoder(no, true);
     }
+    // Not TextEncoder's dry open (the other models' way): it lists only the layers that stream, so 4.0 MiB less over
+    // the blocks, 0.3 MiB less over the two slots, none for the rest but the head (94 MiB), and its blocks' resident
+    // weights take 6 MiB of VRAM at open, which moved MOSS-Image's picture (RX 9060 XT, 2026-11-10).  The safer figure.
     try {   // the text encoder's blocks (blk.N.*) and the rest but the head, from the file's tensors
         GgufFile g(text);
         std::vector<uint64_t> blk;
@@ -506,7 +491,8 @@ void MossPipeline::encode_base(const QiRequest& r, const QiRef& base, LatentStar
     if (held() + more > budget() || free_vram() < enc) release(false);
     std::string err;
     if (!vae_->open_encoder(err)) throw std::runtime_error(err);
-    const std::vector<float> px = base_rgb(base, r.width, r.height);
+    // RGB [3][H][W] in -1 .. 1 over white, at the image's size (nearest): img_start.hpp's image_planes
+    const std::vector<float> px = image_planes(base, r.width, r.height, 3, PlaneAlpha::White, PlaneRange::Signed);
     float* rgb = nullptr;
     if (!gpu::alloc_device(&rgb, px.size() * 4))
         throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
@@ -553,7 +539,7 @@ std::vector<QiVisionOut> MossPipeline::encode_pictures(const std::vector<QiRef>&
     if (!v.open(vision_path_, s_, err)) throw std::runtime_error(err);
     std::vector<QiVisionOut> out;
     for (const QiRef& f : pictures) {
-        const std::vector<float> rgb = base_rgb(f, f.width, f.height);
+        const std::vector<float> rgb = image_planes(f, f.width, f.height, 3, PlaneAlpha::White, PlaneRange::Signed);
         out.push_back(v.encode(rgb.data(), f.width, f.height));
     }
     v.drop_scratch();
@@ -564,7 +550,7 @@ float* MossPipeline::encode_ref(const QiRef& f) {
     const int64_t h = f.height / 16, w = f.width / 16;
     std::string err;
     if (!vae_->open_encoder(err)) throw std::runtime_error(err);
-    const std::vector<float> px = base_rgb(f, f.width, f.height);
+    const std::vector<float> px = image_planes(f, f.width, f.height, 3, PlaneAlpha::White, PlaneRange::Signed);
     float *rgb = nullptr, *z = nullptr;
     if (!gpu::alloc_device(&rgb, px.size() * 4) || !gpu::alloc_device(&z, (size_t) (dit_->latent_channels() * h * w) * 4)) {
         gpu::free(rgb);

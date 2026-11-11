@@ -13,6 +13,9 @@
 #include "strata/program/batch_groups.hpp"
 #include "strata/program/option_scope.hpp"
 #include "strata/program/done_line.hpp"
+#include "strata/program/gen_keys.hpp"
+#include "strata/program/id_list.hpp"
+#include "strata/program/info_line.hpp"
 #include "strata/program/shared_options.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -25,6 +28,9 @@
 #include "strata/core/logit_bias.hpp"
 #include "strata/core/plain_model.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/control_vector.hpp"
+#include "strata/core/stdin_lines.hpp"
+#include "strata/core/watchdog.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/sampler.hpp"
 #include "strata/platform/aux_cpus.hpp"
@@ -75,18 +81,10 @@ namespace {
 using Clock = std::chrono::steady_clock;
 
 bool parse_ids(const std::string& text, std::vector<int32_t>& out) {
-    out.clear();
-    const char* p = text.c_str();
-    while (*p != '\0') {
-        while (*p == ',' || *p == ' ' || *p == '\n' || *p == '\r' || *p == '\t') ++p;
-        if (*p == '\0') break;
-        char* end = nullptr;
-        const long v = std::strtol(p, &end, 10);
-        if (end == p || v < 0 || v > 0x7fffffff) return false;
-        out.push_back((int32_t) v);
-        p = end;
-    }
-    return !out.empty();
+    std::vector<int64_t> ids;
+    if (!strata::program::parse_id_list(text, ids, strata::program::IdListForm::Text)) { out.clear(); return false; }
+    out.assign(ids.begin(), ids.end());
+    return true;
 }
 
 // The model's architecture, from its first shard's metadata only; empty when it cannot be read.
@@ -525,76 +523,15 @@ struct ControlVectors {
 };
 
 bool load_control_vectors(ControlVectors& cv, int64_t L, int64_t N, const std::string& arch, std::string& err) {
-    std::vector<float> data((size_t) (L * N), 0.0f);
-    std::vector<bool> have((size_t) L, false);
-    for (const auto& [path, scale] : cv.files) {
-        try {
-            GgufFile f(path);
-            const MetaValue* a = f.get("general.architecture");
-            if (a == nullptr || a->s != "controlvector") {
-                err = path + ": not a control vector GGUF (general.architecture is not 'controlvector')";
-                return false;
-            }
-            const MetaValue* hint = f.get("controlvector.model_hint");
-            if (hint != nullptr && hint->s != arch)
-                std::fprintf(stderr, "xestrata (%s): %s was made for '%s'\n", arch.c_str(), path.c_str(), hint->s.c_str());
-            int found = 0;
-            for (const TensorInfo& t : f.tensors()) {
-                if (t.name.rfind("direction.", 0) != 0) continue;
-                const long l = std::strtol(t.name.c_str() + 10, nullptr, 10);
-                if (l < 1 || l >= L) continue;   // layer 0 has none; past the model is ignored, as in llama.cpp
-                if (t.type != 0 || t.elements() != (uint64_t) N) {
-                    err = path + ": " + t.name + " must be " + std::to_string((long long) N) + " f32";
-                    return false;
-                }
-                const float* src = reinterpret_cast<const float*>(f.tensor_data(t));
-                for (int64_t j = 0; j < N; ++j) data[(size_t) (l * N + j)] += scale * src[j];
-                have[(size_t) l] = true;
-                ++found;
-            }
-            if (found == 0) { err = path + ": no direction.<layer> tensors"; return false; }
-        } catch (const std::exception& e) {
-            err = e.what();
-            return false;
-        }
-    }
-    const int first = cv.first <= 0 ? 1 : cv.first;
-    const int last = (cv.last <= 0 || cv.last >= L) ? (int) L - 1 : cv.last;
-    const int single = cv.mode == 0 ? cv.single : -1;
-    if (single >= 0 && (single >= L || !have[(size_t) single])) {
-        err = "--cvec-dir single:" + std::to_string(single) + ": the vector has no direction for that layer";
+    strata::core::ControlVectorLoad t;
+    if (!strata::core::load_control_vectors(cv.files, L, N, 1, cv.first, cv.last, cv.mode, cv.single, arch,
+                                            "xestrata (" + arch + ")", false, t, err))
         return false;
-    }
-    std::vector<float> dir((size_t) (L * N), 0.0f), s((size_t) L, 0.0f);
-    int steered = 0;
-    for (int64_t l = first; l <= last; ++l) {
-        const int64_t src = single >= 0 ? single : l;
-        if (!have[(size_t) src]) continue;
-        const float* d = data.data() + (size_t) (src * N);
-        if (cv.mode == 0) {
-            double nrm = 0.0;
-            for (int64_t j = 0; j < N; ++j) nrm += (double) d[j] * d[j];
-            nrm = std::sqrt(nrm);
-            if (nrm <= 0.0) continue;
-            s[(size_t) l] = (float) nrm;
-            for (int64_t j = 0; j < N; ++j) dir[(size_t) (l * N + j)] = (float) (d[j] / nrm);
-        } else {
-            s[(size_t) l] = 1.0f;
-            std::copy(d, d + N, dir.begin() + (std::ptrdiff_t) (l * N));
-        }
-        ++steered;
-    }
-    if (steered == 0) {
-        err = "the control vector has no direction in layers " + std::to_string(first) + ".." + std::to_string(last);
-        return false;
-    }
-    if (!strata::kernels::cvec_upload(dir, s, cv.mode, first, last, N, 1, err)) return false;
-    cv.digest = fnv1a(dir.data(), dir.size() * sizeof(float), fnv1a(s.data(), s.size() * sizeof(float))) |
-                (uint64_t) cv.mode;
-    cv.summary = std::string(cv.mode == 0 ? "project" : "add") + ":" + std::to_string(first) + "-" +
-                 std::to_string(last) + (single >= 0 ? ":single" + std::to_string(single) : "");
+    cv.digest = fnv1a(t.dir.data(), t.dir.size() * sizeof(float),
+                      fnv1a(t.scale.data(), t.scale.size() * sizeof(float))) | (uint64_t) cv.mode;
+    cv.summary = t.summary;
     std::fprintf(stderr, "xestrata (%s): control vector mode = %s, dir = %s, layers %d..%d (%d steered)\n", arch.c_str(),
-                 cv.mode == 0 ? "project" : "add", single >= 0 ? "single" : "per-layer", first, last, steered);
+                 cv.mode == 0 ? "project" : "add", t.single >= 0 ? "single" : "per-layer", t.first, t.last, t.steered);
     return true;
 }
 
@@ -604,71 +541,9 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                        const std::vector<int32_t>& eos, const std::string& profile_save, double save_min,
                        ConversationCache& cache, ConversationFolder& folder, const ControlVectors& cvecs) {
     // the reader thread outlives this function (it is detached and ends with the process), so what it shares is
-    // owned by both
-    struct StdinShared {
-        std::atomic<bool> stop_req{false};
-        std::mutex mu;
-        std::condition_variable cv;
-        std::deque<std::string> lines;
-        bool eof = false;
-    };
-    const auto in_shared = std::make_shared<StdinShared>();
-    std::atomic<bool>& stop_req = in_shared->stop_req;
-    std::thread([st = in_shared] {   // stdin: STOP takes effect mid-request, every other line queues
-        // read(2) on the descriptor, not std::cin: glibc's exit() flushes every stdio stream and waits for stdin's
-        // lock, which getline holds while it waits for input, so the engine hung in exit() after QUIT while the
-        // server kept its stdin open (as the main engine's serve, generate.cpp)
-        std::string l, buf;
-        char chunk[4096];
-        auto getline_fd = [&](std::string& out) -> bool {
-            for (;;) {
-                const size_t nlpos = buf.find('\n');
-                if (nlpos != std::string::npos) {
-                    out.assign(buf, 0, nlpos);
-                    buf.erase(0, nlpos + 1);
-                    return true;
-                }
-#if defined(_WIN32)
-                const int n = _read(0, chunk, (unsigned) sizeof chunk);
-#else
-                const ssize_t n = ::read(0, chunk, sizeof chunk);
-#endif
-                if (n < 0 && errno == EINTR) continue;
-                if (n <= 0) {
-                    if (buf.empty()) return false;
-                    out.swap(buf);
-                    buf.clear();
-                    return true;
-                }
-                buf.append(chunk, (size_t) n);
-            }
-        };
-        while (getline_fd(l)) {
-            if (!l.empty() && l.back() == '\r') l.pop_back();
-            if (l == "STOP") { st->stop_req.store(true); continue; }
-            std::lock_guard<std::mutex> lk(st->mu);
-            st->lines.push_back(l);
-            st->cv.notify_one();
-        }
-        std::lock_guard<std::mutex> lk(st->mu);
-        st->eof = true;
-        st->cv.notify_one();
-    }).detach();
-    auto next_line = [&](std::string& out) {
-        std::unique_lock<std::mutex> lk(in_shared->mu);
-        in_shared->cv.wait(lk, [&] { return !in_shared->lines.empty() || in_shared->eof; });
-        if (in_shared->lines.empty()) return false;
-        out = std::move(in_shared->lines.front());
-        in_shared->lines.pop_front();
-        return true;
-    };
-    auto try_line = [&](std::string& out) {   // a line when one waits (the batch slots decode meanwhile)
-        std::lock_guard<std::mutex> lk(in_shared->mu);
-        if (in_shared->lines.empty()) return false;
-        out = std::move(in_shared->lines.front());
-        in_shared->lines.pop_front();
-        return true;
-    };
+    // owned by both (strata/core/stdin_lines.hpp, the three engines' one reader)
+    strata::core::StdinLines in;
+    std::atomic<bool>& stop_req = in.stop();
     const int64_t ctx = model.max_cells(), V = model.vocab(), N = model.spec().n_embd;
     // the tokens the state holds, positions 0 .. live.size() - 1; a picture's cells as keys of their own (below)
     std::vector<int32_t> live;
@@ -954,20 +829,33 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         size_t free_b = 0, total_b = 0;
         strata::gpu::mem_info(&free_b, &total_b);
         const std::string igc = strata::core::compiler_workaround();
-        std::printf("INFO logit_bias=1 context=%lld kv=%s expert_slots=%lld expert_cache_mib=%lld spec=%d "
-                    "vram_free_mib=%lld arena_mib=%lld spec_min_p=%.2f spec_window=%s conversation_cache_mib=%lld "
-                    "conversation_cache_slots=%d conversation_cache_min_free_mib=%lld vram_elastic=%d batch_slots=%zu "
-                    "batch_groups=%d slot_cache=%d experts_ram=%s igc_workaround=%s grammar=%d script_table=1 "
-                    "cvec=%s engine=" STRATA_VERSION
-                    "\n",
-                    (long long) ctx, opt.kv_q4 == 1 ? "q4_0" : opt.kv_q4 == 2 ? "k8v4" : opt.kv_int8 ? "int8" : "fp16",
-                    (long long) model.slots(), (long long) (model.tier_bytes() >> 20), model.drafts() + 1,
-                    (long long) (free_b >> 20), (long long) (model.experts_ram_bytes() >> 20), opt.spec_min_p,
-                    opt.spec_window.c_str(), (long long) (cache.budget >> 20), cache.slots,
-                    (long long) (cache.min_free >> 20), model.vram_elastic() ? 1 : 0, bs.size(), groups, bs.empty() ? 0 : 1,
-                    model.experts_ram(), igc.empty() ? "none" : igc.c_str(), strata::core::grammar_built() ? 1 : 0,
-                    cvecs.summary.c_str());
+        strata::program::InfoLine()
+            .add("logit_bias", 1)
+            .add("context", (long long) ctx)
+            .add("kv", opt.kv_q4 == 1 ? "q4_0" : opt.kv_q4 == 2 ? "k8v4" : opt.kv_int8 ? "int8" : "fp16")
+            .add("expert_slots", (long long) model.slots())
+            .add("expert_cache_mib", (long long) (model.tier_bytes() >> 20))
+            .add("spec", model.drafts() + 1)
+            .add("vram_free_mib", (long long) (free_b >> 20))
+            .add("arena_mib", (long long) (model.experts_ram_bytes() >> 20))
+            .add_f("spec_min_p", opt.spec_min_p)
+            .add("spec_window", opt.spec_window)
+            .add("conversation_cache_mib", (long long) (cache.budget >> 20))
+            .add("conversation_cache_slots", cache.slots)
+            .add("conversation_cache_min_free_mib", (long long) (cache.min_free >> 20))
+            .add("vram_elastic", model.vram_elastic() ? 1 : 0)
+            .add("batch_slots", bs.size())
+            .add("batch_groups", groups)
+            .add("slot_cache", bs.empty() ? 0 : 1)
+            .add("experts_ram", model.experts_ram())
+            .add("igc_workaround", igc.empty() ? "none" : igc.c_str())
+            .add("grammar", strata::core::grammar_built() ? 1 : 0)
+            .add("script_table", 1)
+            .add("cvec", cvecs.summary)
+            .print();
     }
+    strata::core::start_serve_watchdog();   // the same watchdog as Qwen3.8-Flash-Next's serve (watchdog.hpp)
+    strata::core::progress_at("idle");
     strata::platform::settle_before_ready();
     strata::platform::downgrades_say();   // the start's fallbacks (the server keeps them: /v1/status)
     std::printf("READY %lld stop\n", (long long) ctx);
@@ -979,7 +867,8 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     for (;;) {
         strata::platform::downgrades_say();   // a request's fallbacks, between whole lines
         if (batch_on()) {   // the slots decode while no line waits
-            if (!try_line(line)) {
+            if (!in.try_next(line)) {
+                strata::core::ProgressBusyScope busy_scope;   // the watchdog watches the batch windows too
                 if (!(groups > 1 ? pipe_step(err, false) : batch_step(err))) {
                     std::printf("ERR the batch window failed: %s\n", err.c_str());
                     std::fflush(stdout);
@@ -987,17 +876,19 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 }
                 continue;
             }
-        } else if (!next_line(line)) {
+        } else if (!in.next(line)) {
             break;
         }
         // --batch-groups: the groups in the stages finish before the line is read (it may use the live session)
-        if (line.rfind("BSTOP ", 0) != 0 && line.rfind("BYIELD", 0) != 0)
+        if (line.rfind("BSTOP ", 0) != 0 && line.rfind("BYIELD", 0) != 0) {
+            strata::core::ProgressBusyScope busy_scope;   // the staged groups finish before the line is read
             while (!model.pipe_empty())
                 if (!pipe_step(err, true)) {
                     std::printf("ERR the batch window failed: %s\n", err.c_str());
                     std::fflush(stdout);
                     return 1;
                 }
+        }
         if (line == "QUIT") break;
         if (line.rfind("BSTOP ", 0) == 0) {
             const long b = std::strtol(line.c_str() + 6, nullptr, 10);
@@ -1112,6 +1003,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         // the rows and their width, then the rows (TextEncoder::read_states).  The live conversation is set aside first
         // and put back after, so the next request takes it up as it would have.  ENCODED <rows> <ms>, or ERR.
         if (line.rfind("ENCODE ", 0) == 0) {
+            strata::core::ProgressBusyScope busy_scope;
             const size_t gap = line.find(' ', 7);
             const std::string ids_path = line.substr(7, gap == std::string::npos ? 0 : gap - 7);
             const std::string out_path = gap == std::string::npos ? std::string() : line.substr(gap + 1);
@@ -1181,6 +1073,12 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             std::fflush(stdout);
             continue;
         }
+        // the watchdog watches this request until the iteration ends, whichever way it ends (as generate.cpp)
+        strata::core::ProgressBusyScope busy_scope;
+        {
+            size_t vf_b = 0, vt_b = 0;
+            if (strata::gpu::mem_info(&vf_b, &vt_b)) strata::core::watchdog_note_request_vram((int64_t) (vf_b >> 20));
+        }
         char* endp = nullptr;
         const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
         std::vector<uint64_t> img_keys;   // #2228: the server's key of each picture, in prompt order
@@ -1204,62 +1102,24 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         sp.greedy = true;
         sp.temperature = 0.0f;
         sp.top_p = 1.0f;
-        for (;;) {   // the sampling keys between max_new and the ids; the ids start at the first token without '='
-            while (endp != nullptr && *endp == ' ') ++endp;
-            const char* start = endp;
-            while (endp != nullptr && *endp != '\0' && *endp != ' ') ++endp;
-            if (endp == nullptr || endp == start) break;
-            const std::string tok(start, (size_t) (endp - start));
-            const size_t eq = tok.find('=');
-            if (eq == std::string::npos) { endp = const_cast<char*>(start); break; }
-            const std::string key = tok.substr(0, eq), val = tok.substr(eq + 1);
-            if (key == "temperature") sp.temperature = std::strtof(val.c_str(), nullptr);
-            else if (key == "top_p") sp.top_p = std::strtof(val.c_str(), nullptr);
-            else if (key == "top_k") sp.top_k = (int) std::strtol(val.c_str(), nullptr, 10);
-            else if (key == "min_p") sp.min_p = std::strtof(val.c_str(), nullptr);
-            else if (key == "seed") sp.seed = std::strtoull(val.c_str(), nullptr, 10);
-            else if (key == "ckpt") req_ckpt = std::strtol(val.c_str(), nullptr, 10) != 0;
-            else if (key == "penalty_repeat") sp.penalty_repeat = std::strtof(val.c_str(), nullptr);
-            else if (key == "penalty_freq") sp.penalty_freq = std::strtof(val.c_str(), nullptr);
-            else if (key == "penalty_present") sp.penalty_present = std::strtof(val.c_str(), nullptr);
-            else if (key == "penalty_last_n") sp.penalty_last_n = std::max(0, (int) std::strtol(val.c_str(), nullptr, 10));
-            else if (key == "logprobs") req_logprobs = (int) std::clamp(std::strtol(val.c_str(), nullptr, 10), -1L, 20L);
-            else if (key == "grammar") req_grammar = val;
-            else if (key == "logit_bias") { req_bias_text = val; req_bias = true; }
-            else if (key == "script_table") req_script = val;
-            else if (key == "script_allow") req_script_allow = val;
-            else if (key == "script_pending") req_script_pending = val;
-            else if (key == "cvec") req_cvec = std::strtol(val.c_str(), nullptr, 10) != 0;
-            else if (key == "aux_cpus") strata::aux_cpus::set_enabled(std::strtol(val.c_str(), nullptr, 10) != 0);
-            else if (key == "prefill") req_prefill = std::strtol(val.c_str(), nullptr, 10) != 0;
-            else if (key == "pcie_frac") req_pcie_frac = std::clamp(std::strtod(val.c_str(), nullptr), 0.0, 1.0);
-            else if (key == "spec_min_p") req_spec_min_p = std::clamp(std::strtod(val.c_str(), nullptr), 0.0, 1.0);
-            else if (key == "allowed")
-                for (const char* q = val.c_str(); *q != '\0';) {
-                    char* qe = nullptr;
-                    const long id = std::strtol(q, &qe, 10);
-                    if (qe == q) break;
-                    req_allowed.push_back((int32_t) id);
-                    q = *qe == ',' ? qe + 1 : qe;
-                }
-            else if (key == "pin") req_pin = std::strtoll(val.c_str(), nullptr, 10);
-            else if (key == "img_keys")
-                for (const char* q = val.c_str(); *q != '\0';) {
-                    char* qe = nullptr;
-                    img_keys.push_back((uint64_t) std::strtoull(q, &qe, 16));
-                    if (qe == q || (*qe != ',' && *qe != '\0')) { img_keys.clear(); break; }
-                    q = *qe == ',' ? qe + 1 : qe;
-                }
+        std::string emb_path;   // GENI: the embeddings file, the first word after the keys (the shared reader)
+        {   // the sampling keys between max_new and the ids (strata/program/gen_keys.hpp, the two engines' one)
+            strata::program::GenKeyFields kf;
+            kf.temperature = &sp.temperature; kf.top_p = &sp.top_p; kf.top_k = &sp.top_k; kf.min_p = &sp.min_p;
+            kf.seed = &sp.seed;
+            kf.penalty_repeat = &sp.penalty_repeat; kf.penalty_freq = &sp.penalty_freq;
+            kf.penalty_present = &sp.penalty_present;
+            kf.penalty_last_n = &sp.penalty_last_n; kf.penalty_last_n_clamp0 = true;
+            kf.ckpt_bool = &req_ckpt; kf.prefill = &req_prefill; kf.pin = &req_pin;
+            kf.logprobs = &req_logprobs; kf.grammar = &req_grammar;
+            kf.logit_bias = &req_bias_text; kf.logit_bias_present = &req_bias;
+            kf.script_table = &req_script; kf.script_allow = &req_script_allow; kf.script_pending = &req_script_pending;
+            kf.cvec_bool = &req_cvec; kf.aux_cpus_immediate = true;
+            kf.pcie_frac = &req_pcie_frac; kf.spec_min_p = &req_spec_min_p;
+            kf.allowed = &req_allowed; kf.img_keys = &img_keys;
+            strata::program::parse_gen_keys(endp, kf, geni, &emb_path);
         }
         sp.greedy = sp.temperature <= 0.0f;
-        std::string emb_path;   // GENI: the embeddings file, the first word after the keys
-        if (geni && endp != nullptr) {
-            while (*endp == ' ') ++endp;
-            if (char* gap = std::strchr(endp, ' '); gap != nullptr) {
-                emb_path.assign(endp, (size_t) (gap - endp));
-                endp = gap;
-            }
-        }
         std::vector<int32_t> ids;
         if ((max_new < 1 && !(max_new == 0 && req_prefill)) || (req_prefill && max_new != 0) || endp == nullptr ||
             (geni && emb_path.empty()) || !parse_ids(endp, ids) || ids.empty()) {
@@ -1755,6 +1615,8 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             std::printf("PP %lld %lld %.0f %.1f\n", (long long) reached, (long long) n, ms,
                         ms > 0.0 ? 1000.0 * (double) (reached - resume) / ms : 0.0);
             std::fflush(stdout);
+            strata::core::progress_at("reading the prompt, done up to token", reached);
+            strata::core::progress_beat();
         };
         // --prompt-cache: where the prompt is cut for a checkpoint (Checkpoint), in order; n ends the last part
         struct Cut { int64_t to; bool root, pin, tail = false; };
@@ -1972,6 +1834,8 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             lp_line(next);
             std::fflush(stdout);
             ++produced;
+            strata::core::progress_at("decoding", (int64_t) produced);
+            strata::core::progress_beat();
             if (std::find(eos.begin(), eos.end(), next) != eos.end()) { finish = "stop"; break; }
             if (produced >= max_new) break;
             if (at < pend.size()) {   // the window read this one already
@@ -2310,6 +2174,81 @@ int plain_main(int argc, char** argv) {
     shared.rope_freq_base = &opt.rope_freq_base;
     shared.rope_freq_scale = &opt.rope_freq_scale;
     shared.yarn_orig_ctx = &opt.yarn_orig_ctx;
+    // the rest of the common options (the ranges are plain's own; the conversation group's values are
+    // parsed into these and converted to plain's units below)
+    int64_t conv_mib = 0, conv_min_free = 0, conv_min_tokens = 0, conv_park_gain = 0, conv_save_mib = 0,
+            conv_hours = 0, conv_session_min_free = 0, conv_memory_limit = 0, conv_ram_reserve = 0;
+    int conv_slots = 0, conv_checkpoints = 0;
+    const std::string pool_tasks_msg = who + ": --pool-tasks takes 0..4096";
+    shared.serve = &serve;
+    shared.vision = &opt.vision;
+    shared.stop_eos = &stop_eos;
+    shared.session_save_reclaim = &cache.save_reclaim;
+    shared.prompt_cache_tail = &cache.tail;
+    shared.prompt_cache_spread = &cache.spread;
+    shared.conversation_save_compress = &folder.compress;
+    shared.pool_host_works = &opt.pool_host_works;
+    shared.batch_mtp_bool = &opt.batch_mtp;
+    shared.adapt_async_bool = &opt.adapt_async;
+    shared.coupled_draft = &opt.coupled_draft;
+    shared.kv_grow = &opt.kv_grow;
+    std::string conversation_save_dir;   // folder.dir is a filesystem::path: assigned after the parse
+    shared.conversation_save = &conversation_save_dir;
+    shared.dump_logits = &dump_path;
+    shared.dump_routing = &opt.dump_routing;
+    shared.pool_cores = &pool_cores;
+    shared.shared_expert_arena = &opt.shared_arena;
+    shared.expert_cache_remote_placement = &opt.expert_cache_remote_placement;
+    shared.gpu_consume = true;
+    shared.cvec_files = &cvecs.files;
+    shared.cvec_first = &cvecs.first;
+    shared.cvec_last = &cvecs.last;
+    shared.cvec_mode = &cvecs.mode;
+    shared.cvec_single = &cvecs.single;
+    shared.prompt_cache = &cache.checkpoints;
+    shared.suffix_draft = &opt.suffix_draft;
+    shared.lookup_chain = &opt.lookup_chain;
+    shared.lookup_chain_lo = 0; shared.lookup_chain_hi = -1;
+    shared.lookup_chain_min = &opt.lookup_chain_min;
+    shared.lookup_chain_min_lo = 1;
+    shared.pipeline_windows = &opt.pipeline_windows;
+    shared.pipeline_windows_hi = -1;
+    shared.adapt_mib_per_token = &opt.adapt_mib_per_token;
+    shared.batch = &opt.batch_slots;
+    shared.batch_clamp0 = true;
+    shared.expert_cache_remote = opt.expert_cache_remote.data();
+    shared.expert_cache_remote_clamp0 = true;
+    shared.pool_tasks = &opt.pool_tasks;
+    shared.pool_tasks_msg = pool_tasks_msg.c_str();
+    shared.prompt_cache_every = &cache.every;
+    shared.prompt_cache_root = &cache.root;
+    shared.reply_checkpoint_every = &cache.reply_every;
+    shared.short_read = &cache.short_read;
+    shared.turn_token_i32 = &cache.turn;
+    shared.tail_role_token_i32 = &cache.tail_role;
+    shared.vram_reserve_mib_i64 = &opt.reserve_mib;
+    shared.vram_reserve_later_mib_i64 = &opt.reserve_later_mib;
+    shared.pcie_frac = &opt.pcie_frac;
+    shared.pcie_frac_validate = true;
+    shared.yarn_ext_factor = &opt.yarn_ext_factor;
+    shared.yarn_attn_factor = &opt.yarn_attn_factor;
+    shared.yarn_beta_fast = &opt.yarn_beta_fast;
+    shared.yarn_beta_slow = &opt.yarn_beta_slow;
+    shared.yarn_validate = true;
+    shared.aux_cpus = &aux_cpus;
+    shared.batch_groups = &opt.batch_groups;
+    shared.batch_groups_plain = true;
+    shared.conversation_cache_mib = &conv_mib;
+    shared.conversation_cache_slots = &conv_slots;
+    shared.conversation_cache_min_free_mib = &conv_min_free;
+    shared.conversation_cache_min_tokens = &conv_min_tokens;
+    shared.conversation_cache_park_gain = &conv_park_gain;
+    shared.conversation_save_checkpoints = &conv_checkpoints;
+    shared.conversation_save_mib = &conv_save_mib;
+    shared.conversation_save_hours = &conv_hours;
+    shared.session_min_free_mib = &conv_session_min_free;
+    shared.memory_limit_mib = &conv_memory_limit;
+    shared.ram_reserve_mib = &conv_ram_reserve;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
@@ -2318,6 +2257,30 @@ int plain_main(int argc, char** argv) {
         };
         if (const int r = strata::program::parse_shared_option(a, next, shared); r != 0) {
             if (r < 0) return 2;
+            if (a == "--conversation-save") folder.dir = conversation_save_dir;
+            continue;
+        }
+        if (const int r = strata::program::parse_conversation_option(a, next, shared); r != 0) {
+            if (r < 0) return 2;
+            // plain's units: the cache's budget and min_free are bytes, the slots at least 1, the RAM reserve set at once
+            if (a == "--conversation-cache-mib") cache.budget = conv_mib * (1ll << 20);
+            else if (a == "--conversation-cache-slots") cache.slots = std::max(1, conv_slots);
+            else if (a == "--conversation-cache-min-free-mib") cache.min_free = conv_min_free << 20;
+            else if (a == "--conversation-cache-min-tokens") cache.min_tokens = conv_min_tokens;
+            else if (a == "--conversation-cache-park-gain") cache.park_gain = conv_park_gain;
+            else if (a == "--conversation-save-checkpoints") folder.checkpoints = conv_checkpoints;
+            else if (a == "--conversation-save-mib") folder.budget_mib = conv_save_mib;
+            else if (a == "--conversation-save-hours") folder.hours = conv_hours;
+            else if (a == "--session-min-free-mib") folder.min_free_mib = conv_session_min_free;
+            else if (a == "--memory-limit-mib") memory_limit_mib = conv_memory_limit;
+            else if (a == "--ram-reserve-mib")
+                strata::core::detail::set_ram_reserve_bytes((uint64_t) conv_ram_reserve << 20);
+            continue;
+        }
+        // --expert-cache: plain's own (int64 slots, clamped to 0; generate's is an int without the clamp)
+        if (a == "--expert-cache") {
+            const std::string v = next("--expert-cache");
+            opt.expert_slots = v == "auto" ? -1 : std::max<int64_t>(0, std::strtoll(v.c_str(), nullptr, 10));
             continue;
         }
         if (a == "--native") (void) next("--native");
@@ -2330,8 +2293,6 @@ int plain_main(int argc, char** argv) {
             if (!parse_ids(text, prompt)) { std::fprintf(stderr, "--tokens-file: a list of token ids\n"); return 2; }
         }
         else if (a == "--help" || a == "-h") { plain_usage(arch); return 0; }
-        else if (a == "--serve") serve = true;
-        else if (a == "--vision") opt.vision = true;
         else if (a == "--device") {
             const std::string v = next("--device");
             if (v != "cpu" && v != "gpu") {
@@ -2343,160 +2304,24 @@ int plain_main(int argc, char** argv) {
         }
         else if (a == "--cpu-threads") opt.cpu_threads = std::max(0, (int) std::strtol(next("--cpu-threads"), nullptr, 10));
         else if (a == "--gpu-layers") opt.gpu_layers = std::max<int64_t>(0, std::strtoll(next("--gpu-layers"), nullptr, 10));
-        else if (a == "--greedy") sp.greedy = true;
-        else if (a == "--stop-eos") stop_eos = true;
         else if (a == "--eos-ids") {
             if (!parse_ids(next("--eos-ids"), eos)) { std::fprintf(stderr, "--eos-ids: a list of token ids\n"); return 2; }
             stop_eos = true;
         }
         else if (a == "--max-t") opt.max_t = (int) std::strtol(next("--max-t"), nullptr, 10);
-        else if (a == "--shared-expert-arena") opt.shared_arena = next("--shared-expert-arena");
         else if (a == "--resident-experts") opt.resident_gib = -1;
         else if (a == "--resident-cpu-experts") {
             opt.resident_gib = -1;
             opt.resident_pageable = true;
         } else if (a == "--resident-budget-gib")
             opt.resident_gib = std::max(0.0, std::strtod(next("--resident-budget-gib"), nullptr));
-        else if (a == "--control-vector") cvecs.files.push_back({next("--control-vector"), 1.0f});
-        else if (a == "--control-vector-scaled") {   // FILE:SCALE, comma-separated; the last colon before the scale
-            std::stringstream list(next("--control-vector-scaled"));
-            std::string item;
-            while (std::getline(list, item, ',')) {
-                const size_t colon = item.rfind(':');
-                char* end = nullptr;
-                const float sc = colon == std::string::npos ? 0.0f : std::strtof(item.c_str() + colon + 1, &end);
-                if (colon == std::string::npos || colon == 0 || end == item.c_str() + colon + 1 || *end != '\0') {
-                    std::fprintf(stderr, "--control-vector-scaled: expected FILE:SCALE, got '%s'\n", item.c_str());
-                    return 2;
-                }
-                cvecs.files.push_back({item.substr(0, colon), sc});
-            }
-        } else if (a == "--control-vector-layer-range") {
-            cvecs.first = (int) std::strtol(next("--control-vector-layer-range"), nullptr, 10);
-            cvecs.last = (int) std::strtol(next("--control-vector-layer-range"), nullptr, 10);
-        } else if (a == "--cvec-mode") {
-            const std::string m = next("--cvec-mode");
-            if (m != "project" && m != "add") { std::fprintf(stderr, "--cvec-mode: add or project, got '%s'\n", m.c_str()); return 2; }
-            cvecs.mode = m == "project" ? 0 : 1;
-        } else if (a == "--cvec-dir") {
-            const std::string d = next("--cvec-dir");
-            if (d == "per-layer") cvecs.single = -1;
-            else if (d.rfind("single:", 0) == 0) cvecs.single = (int) std::strtol(d.c_str() + 7, nullptr, 10);
-            else { std::fprintf(stderr, "--cvec-dir: per-layer or single:L, got '%s'\n", d.c_str()); return 2; }
-        }
-        else if (a == "--yarn-ext-factor" || a == "--yarn-attn-factor" || a == "--yarn-beta-fast" ||
-                 a == "--yarn-beta-slow") {
-            const double v = std::strtod(next(a.c_str()), nullptr);
-            // as generate.cpp checks them: finite, the ext factor >= -1 (< 0: auto), the rest positive
-            if (!std::isfinite(v) || (a == "--yarn-ext-factor" ? v < -1.0 : v <= 0.0)) {
-                std::fprintf(stderr, "xestrata (%s): %s %g: invalid rope scaling knob\n", arch.c_str(), a.c_str(), v);
-                return 2;
-            }
-            (a == "--yarn-ext-factor"    ? opt.yarn_ext_factor
-             : a == "--yarn-attn-factor" ? opt.yarn_attn_factor
-             : a == "--yarn-beta-fast"   ? opt.yarn_beta_fast
-                                         : opt.yarn_beta_slow) = v;
-        }
         // the CPU's and the RAM's options, the shared parts' as Qwen3.8-Flash-Next's engine sets them
-        else if (a == "--pool-cores") pool_cores = next("--pool-cores");
-        else if (a == "--aux-cpus") {
-            aux_cpus = next("--aux-cpus");
-            std::string aerr;
-            strata::aux_cpus::Config acfg;
-            if (!strata::aux_cpus::parse_spec(aux_cpus, acfg, aerr)) {
-                std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), aerr.c_str());
-                return 2;
-            }
-        } else if (a == "--pool-tasks") {
-            const long tasks = std::strtol(next("--pool-tasks"), nullptr, 10);
-            if (tasks < 0 || tasks > 4096) {
-                std::fprintf(stderr, "xestrata (%s): --pool-tasks takes 0..4096\n", arch.c_str());
-                return 2;
-            }
-            opt.pool_tasks = (int) tasks;
-        } else if (a == "--no-host-worker") opt.pool_host_works = false;
-        else if (a == "--ram-reserve-mib")
-            strata::core::detail::set_ram_reserve_bytes(
-                (uint64_t) std::max<int64_t>(0, std::strtoll(next("--ram-reserve-mib"), nullptr, 10)) << 20);
-        else if (a == "--memory-limit-mib") memory_limit_mib = std::max<int64_t>(0, std::strtoll(next("--memory-limit-mib"), nullptr, 10));
-        else if (a == "--suffix-draft") opt.suffix_draft = std::max(0, (int) std::strtol(next("--suffix-draft"), nullptr, 10));
-        else if (a == "--lookup-chain") opt.lookup_chain = std::max(0, (int) std::strtol(next("--lookup-chain"), nullptr, 10));
-        else if (a == "--lookup-chain-min")
-            opt.lookup_chain_min = std::max(1, (int) std::strtol(next("--lookup-chain-min"), nullptr, 10));
-        else if (a == "--kv-grow") opt.kv_grow = 1;
-        else if (a == "--no-kv-grow") opt.kv_grow = 0;
-        else if (a == "--batch" || a == "--slots")
-            opt.batch_slots = std::max(0, (int) std::strtol(next(a.c_str()), nullptr, 10));
-        else if (a == "--dump-logits") dump_path = next("--dump-logits");
-        else if (a == "--dump-routing") opt.dump_routing = next("--dump-routing");
-        else if (a == "--conversation-cache-mib")
-            cache.budget = std::max<int64_t>(0, std::strtoll(next("--conversation-cache-mib"), nullptr, 10)) * (1ll << 20);
-        else if (a == "--prompt-cache")
-            cache.checkpoints = std::max(0, (int) std::strtol(next("--prompt-cache"), nullptr, 10));
-        else if (a == "--prompt-cache-every")
-            cache.every = std::max<int64_t>(0, std::strtoll(next("--prompt-cache-every"), nullptr, 10));
-        else if (a == "--reply-checkpoint-every")
-            cache.reply_every = std::max<int64_t>(0, std::strtoll(next("--reply-checkpoint-every"), nullptr, 10));
-        else if (a == "--prompt-cache-root")
-            cache.root = std::max<int64_t>(0, std::strtoll(next("--prompt-cache-root"), nullptr, 10));
-        else if (a == "--turn-token") cache.turn = (int32_t) std::max(-1L, std::strtol(next("--turn-token"), nullptr, 10));
-        else if (a == "--tail-role-token")
-            cache.tail_role = (int32_t) std::max(-1L, std::strtol(next("--tail-role-token"), nullptr, 10));
-        else if (a == "--prompt-cache-tail") cache.tail = true;
-        else if (a == "--prompt-cache-spread") cache.spread = true;
-        else if (a == "--conversation-cache-min-tokens")
-            cache.min_tokens = std::max<int64_t>(0, std::strtoll(next("--conversation-cache-min-tokens"), nullptr, 10));
-        else if (a == "--conversation-cache-park-gain")
-            cache.park_gain = std::max<int64_t>(0, std::strtoll(next("--conversation-cache-park-gain"), nullptr, 10));
-        else if (a == "--short-read")
-            cache.short_read = std::max<int64_t>(0, std::strtoll(next("--short-read"), nullptr, 10));
-        else if (a == "--session-save-reclaim") cache.save_reclaim = true;
-        else if (a == "--conversation-cache-slots")
-            cache.slots = std::max(1, (int) std::strtol(next("--conversation-cache-slots"), nullptr, 10));
-        else if (a == "--conversation-cache-min-free-mib")
-            cache.min_free =
-                std::max<int64_t>(0, std::strtoll(next("--conversation-cache-min-free-mib"), nullptr, 10)) << 20;
-        else if (a == "--conversation-save") folder.dir = next("--conversation-save");
-        else if (a == "--conversation-save-mib")
-            folder.budget_mib = std::max<int64_t>(0, std::strtoll(next("--conversation-save-mib"), nullptr, 10));
-        else if (a == "--conversation-save-checkpoints")
-            folder.checkpoints = std::max(0, (int) std::strtol(next("--conversation-save-checkpoints"), nullptr, 10));
-        else if (a == "--conversation-save-compress") folder.compress = true;
-        else if (a == "--conversation-save-hours")
-            folder.hours = std::max<int64_t>(0, std::strtoll(next("--conversation-save-hours"), nullptr, 10));
-        else if (a == "--session-min-free-mib")
-            folder.min_free_mib = std::max<int64_t>(0, std::strtoll(next("--session-min-free-mib"), nullptr, 10));
         else if (a == "--spec-follow") {
             std::ifstream in(next("--spec-follow"));
             const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
             if (!parse_ids(text, follow)) { std::fprintf(stderr, "--spec-follow: a list of token ids\n"); return 2; }
         }
-        else if (a == "--expert-cache-device1" || a == "--expert-cache-device2" || a == "--expert-cache-device3")
-            opt.expert_cache_remote[(size_t) (a.back() - '1')] = std::max(0, (int) std::strtol(next(a.c_str()), nullptr, 10));
-        else if (a == "--expert-cache-remote-placement") opt.expert_cache_remote_placement = next(a.c_str());
-        else if (a == "--pipeline-windows")
-            opt.pipeline_windows = std::max(0, (int) std::strtol(next("--pipeline-windows"), nullptr, 10));
-        else if (a == "--batch-groups") {
-            const std::string v = next("--batch-groups");
-            opt.batch_groups = v == "auto" ? -1 : std::max(1, (int) std::strtol(v.c_str(), nullptr, 10));
-        }
-        else if (a == "--batch-mtp") opt.batch_mtp = true;
-        else if (a == "--no-batch-mtp") opt.batch_mtp = false;
-        else if (a == "--coupled-draft") opt.coupled_draft = true;
-        else if (a == "--no-coupled-draft") opt.coupled_draft = false;
-        else if (a == "--adapt-async") opt.adapt_async = std::strtol(next("--adapt-async"), nullptr, 10) != 0;
-        else if (a == "--adapt-mib-per-token")
-            opt.adapt_mib_per_token = (int) std::strtol(next("--adapt-mib-per-token"), nullptr, 10);
-        else if (a == "--gpu") (void) next("--gpu");
         else if (a == "--no-pcie-split") opt.pcie_split = false;
-        else if (a == "--pcie-frac") {
-            const double f = std::strtod(next("--pcie-frac"), nullptr);
-            if (!std::isfinite(f) || f < 0.0 || f > 1.0) {
-                std::fprintf(stderr, "xestrata (%s): --pcie-frac takes 0 .. 1\n", arch.c_str());
-                return 2;
-            }
-            opt.pcie_frac = f;
-        }
         else if (a == "--draft-vocab") opt.draft_vocab = next("--draft-vocab");
         else if (a == "--prompt-chunk") {
             opt.prompt_chunk = std::strtoll(next("--prompt-chunk"), nullptr, 10);
@@ -2544,14 +2369,6 @@ int plain_main(int argc, char** argv) {
             }
         }
         else if (a == "--split-order") (void) next("--split-order");   // the stages take the GPUs as given
-        else if (a == "--vram-reserve-mib")
-            opt.reserve_mib = std::max<int64_t>(0, std::strtoll(next("--vram-reserve-mib"), nullptr, 10));
-        else if (a == "--vram-reserve-later-mib")
-            opt.reserve_later_mib = std::max<int64_t>(0, std::strtoll(next("--vram-reserve-later-mib"), nullptr, 10));
-        else if (a == "--expert-cache") {
-            const std::string v = next("--expert-cache");
-            opt.expert_slots = v == "auto" ? -1 : std::max<int64_t>(0, std::strtoll(v.c_str(), nullptr, 10));
-        }
         else if (a == "--kv-ram") {
             const std::string v = next("--kv-ram");
             if (v != "on" && v != "off") {

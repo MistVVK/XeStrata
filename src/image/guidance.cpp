@@ -10,6 +10,8 @@
 #include "strata/core/runtime.hpp"
 #include "strata/platform/env.hpp"
 
+#include "strata/image/gpu_buf.hpp"
+
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
@@ -27,8 +29,6 @@ namespace strata::image {
 namespace gpu = strata::gpu;
 
 namespace {
-
-sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
 
 constexpr int kSums = 4;   // the most sums one reduction makes
 constexpr double kPi = 3.14159265358979323846;   // MSVC's <cmath> has no M_PI without a define

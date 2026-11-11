@@ -61,6 +61,8 @@ namespace strata::image {
 /// no conversion, no text encoder.
 class HunyuanImage3Pipeline : public ImagePipeline {
 public:
+    const char* no_loras_message() const override { return "image engine: HunyuanImage 3.0 takes no adapters"; }
+
     /// Reads the two files for their sizes; the parts go on the GPU with the first request.  `max_layers`: fewer
     /// than the file holds - a smaller run for a check on a small card, and not a comparison against the golden.
     /// `vision`: the file with the model's `vision_model.*` tensors (SigLIP2), which opens the edits - with it the
@@ -102,7 +104,7 @@ public:
     /// generate that follows.
     int choose_ratio(const QiRequest& r, double* seconds = nullptr) override;
     /// The last choice's 37 logits (a check's: `strata-image --ratio` prints them against the CPU golden's).
-    const std::vector<double>& ratio_logits() const { return ratio_logits_; }
+    const std::vector<double>& ratio_logits() const override { return ratio_logits_; }
 
     /// RGBA8 [height][width][4] of the request (every pixel opaque: the VAE decodes three planes).  `step`: the
     /// sampling's progress over the sigmas' steps, false to stop (QiStopped).  `stage`: "text" as the sequence is

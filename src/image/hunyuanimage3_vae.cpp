@@ -23,6 +23,8 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/elementwise.hpp"
 
+#include "strata/image/gpu_buf.hpp"
+
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
@@ -41,22 +43,6 @@ using strata::kernels::f16_from_f32;
 
 constexpr int64_t kGroups = 32;             // every GroupNorm here: nn.GroupNorm(32, C, eps = 1e-6, affine)
 constexpr float kEps = 1e-6f;
-
-sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
-
-template<class T> T* alloc(std::vector<void*>& owned, int64_t n) {
-    T* p = nullptr;
-    if (!gpu::alloc_device(&p, (size_t) n * sizeof(T)))
-        throw std::runtime_error(std::string("image engine (HunyuanImage 3.0 VAE): GPU memory: ") + gpu::last_error());
-    owned.push_back(p);
-    return p;
-}
-
-void release(std::vector<void*>& owned, void* p) {
-    if (p == nullptr) return;
-    owned.erase(std::remove(owned.begin(), owned.end(), p), owned.end());
-    gpu::free(p);
-}
 
 // z [C][HW] (the DiT's latent, model space, FP32) -> the decoder's input: in16 [HW][C] = FP16(z[c][p] / sf) for
 // the convolutions and x32 [HW][C] = the same value in FP32 for conv_in's repeat_interleave shortcut.  The
@@ -212,7 +198,7 @@ HunyuanImage3Vae::Conv HunyuanImage3Vae::conv_w(SafeTensors& st, const std::stri
                 h[(size_t) (o * K + tap * c.in + i)] =
                     kernels::f16_from_f32(w[((size_t) (o * in_file + i) * 3 + dt) * 9 + dy * 3 + dx]);
             }
-    uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
+    uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size(), "image engine (HunyuanImage 3.0 VAE)");
     gpu::copy(d, h.data(), h.size() * 2);
     c.w = d;
     weight_bytes_ += h.size() * 2;
@@ -237,7 +223,7 @@ HunyuanImage3Vae::Conv HunyuanImage3Vae::point_w(SafeTensors& st, const std::str
     const auto w = st.f32(name + ".weight");
     std::vector<uint16_t> h((size_t) (c.out * c.in));
     for (size_t j = 0; j < h.size(); ++j) h[j] = kernels::f16_from_f32(w[j]);
-    uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
+    uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size(), "image engine (HunyuanImage 3.0 VAE)");
     gpu::copy(d, h.data(), h.size() * 2);
     c.w = d;
     weight_bytes_ += h.size() * 2;
@@ -254,7 +240,7 @@ const float* HunyuanImage3Vae::vec(SafeTensors& st, const std::string& name) {
         return nullptr;
     }
     const auto v = st.f32(name);
-    float* d = alloc<float>(allocs_, (int64_t) v.size());
+    float* d = alloc<float>(allocs_, (int64_t) v.size(), "image engine (HunyuanImage 3.0 VAE)");
     gpu::copy(d, v.data(), v.size() * 4);
     weight_bytes_ += v.size() * 4;
     return d;
@@ -354,25 +340,25 @@ bool HunyuanImage3Vae::open_encoder(const std::string& path, std::string& err) {
 void HunyuanImage3Vae::grow(int64_t elems32, int64_t elems16, int64_t col16, int64_t scores) {
     if (elems32 > cap32_) {
         for (float** p : {&t0_, &t1_, &tmp32_}) release(allocs_, *p);
-        for (float** p : {&t0_, &t1_, &tmp32_}) *p = alloc<float>(allocs_, elems32);
+        for (float** p : {&t0_, &t1_, &tmp32_}) *p = alloc<float>(allocs_, elems32, "image engine (HunyuanImage 3.0 VAE)");
         cap32_ = elems32;
     }
     if (elems16 > cap16_) {
         release(allocs_, a16_);
-        a16_ = alloc<uint16_t>(allocs_, elems16);
+        a16_ = alloc<uint16_t>(allocs_, elems16, "image engine (HunyuanImage 3.0 VAE)");
         cap16_ = elems16;
     }
     if (col16 > col_cap_) {
         release(allocs_, col16_);
-        col16_ = alloc<uint16_t>(allocs_, col16);
+        col16_ = alloc<uint16_t>(allocs_, col16, "image engine (HunyuanImage 3.0 VAE)");
         col_cap_ = col16;
     }
     if (scores > score_cap_) {
         release(allocs_, scores_);
-        scores_ = alloc<float>(allocs_, scores);
+        scores_ = alloc<float>(allocs_, scores, "image engine (HunyuanImage 3.0 VAE)");
         score_cap_ = scores;
     }
-    if (gn_ws_ == nullptr) gn_ws_ = alloc<float>(allocs_, kWsFloats);
+    if (gn_ws_ == nullptr) gn_ws_ = alloc<float>(allocs_, kWsFloats, "image engine (HunyuanImage 3.0 VAE)");
     held_bytes_ = (uint64_t) cap32_ * 4 * 3 + (uint64_t) cap16_ * 2 + (uint64_t) col_cap_ * 2 +
                   (uint64_t) score_cap_ * 4 + (uint64_t) kWsFloats * 4;
 }

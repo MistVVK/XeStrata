@@ -11,6 +11,8 @@
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/f16_bits.hpp"
 
+#include "strata/image/gpu_buf.hpp"
+
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
@@ -24,17 +26,6 @@ namespace gpu = strata::gpu;
 namespace {
 
 using strata::kernels::f16_from_f32;
-
-sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
-
-template<class T> T* alloc(std::vector<void*>& owned, int64_t n) {
-    T* p = nullptr;
-    if (!gpu::alloc_device(&p, (size_t) n * sizeof(T)))
-        throw std::runtime_error(std::string("image engine (HunyuanImage 3.0 SigLIP2): GPU memory: ") +
-                                 gpu::last_error());
-    owned.push_back(p);
-    return p;
-}
 
 // qkv [P][3 C] (FP32: q, k, v side by side; the three biases are read here, qkv is read nowhere else) -> the
 // shared attention's rows q16, k16, v16 [P][H][128] in FP16, the head's D channels and the rest zero.  q carries
@@ -79,7 +70,7 @@ const float* HunyuanImage3Vision::vec(SafeTensors& st, const std::string& name, 
     weight_bytes_ += (uint64_t) t->elements() * 4;
     if (dry_) return nullptr;
     const auto v = st.f32(name);
-    float* d = alloc<float>(weights_, (int64_t) v.size());
+    float* d = alloc<float>(weights_, (int64_t) v.size(), "image engine (HunyuanImage 3.0 SigLIP2)");
     gpu::copy(d, v.data(), v.size() * 4);
     return d;
 }
@@ -106,7 +97,7 @@ HunyuanImage3Vision::Lin HunyuanImage3Vision::lin(SafeTensors& st, const std::st
         const auto w = st.f32(name + ".weight");
         std::vector<uint16_t> h(w.size());
         for (size_t i = 0; i < w.size(); ++i) h[i] = f16_from_f32(w[i]);
-        uint16_t* d = alloc<uint16_t>(weights_, (int64_t) h.size());
+        uint16_t* d = alloc<uint16_t>(weights_, (int64_t) h.size(), "image engine (HunyuanImage 3.0 SigLIP2)");
         gpu::copy(d, h.data(), h.size() * 2);
         l.w = d;
     }
@@ -209,21 +200,21 @@ uint64_t HunyuanImage3Vision::scratch_bytes() const {
 void HunyuanImage3Vision::grow() {
     if (x32_ != nullptr) return;
     const int64_t P = kMaxPatches, C = hidden_, Dp = kHeadPad, H = kHeads;
-    patches16_ = alloc<uint16_t>(scratch_, P * patch_.in);
-    a16_ = alloc<uint16_t>(scratch_, P * C);
-    q16_ = alloc<uint16_t>(scratch_, P * H * Dp);
-    k16_ = alloc<uint16_t>(scratch_, P * H * Dp);
-    v16_ = alloc<uint16_t>(scratch_, P * H * Dp);
-    out16_ = alloc<uint16_t>(scratch_, P * H * Dp);
-    mlp16_ = alloc<uint16_t>(scratch_, P * inter_);
-    al16_ = alloc<uint16_t>(scratch_, P * al0_.out);
-    x32_ = alloc<float>(scratch_, P * C);
-    qkv32_ = alloc<float>(scratch_, P * 3 * C);
-    tmp32_ = alloc<float>(scratch_, P * C);
-    mlp32_ = alloc<float>(scratch_, P * inter_);
-    al32_ = alloc<float>(scratch_, P * al0_.out);
-    out32_ = alloc<float>(scratch_, P * out_);
-    pos32_ = alloc<float>(scratch_, P * C);
+    patches16_ = alloc<uint16_t>(scratch_, P * patch_.in, "image engine (HunyuanImage 3.0 SigLIP2)");
+    a16_ = alloc<uint16_t>(scratch_, P * C, "image engine (HunyuanImage 3.0 SigLIP2)");
+    q16_ = alloc<uint16_t>(scratch_, P * H * Dp, "image engine (HunyuanImage 3.0 SigLIP2)");
+    k16_ = alloc<uint16_t>(scratch_, P * H * Dp, "image engine (HunyuanImage 3.0 SigLIP2)");
+    v16_ = alloc<uint16_t>(scratch_, P * H * Dp, "image engine (HunyuanImage 3.0 SigLIP2)");
+    out16_ = alloc<uint16_t>(scratch_, P * H * Dp, "image engine (HunyuanImage 3.0 SigLIP2)");
+    mlp16_ = alloc<uint16_t>(scratch_, P * inter_, "image engine (HunyuanImage 3.0 SigLIP2)");
+    al16_ = alloc<uint16_t>(scratch_, P * al0_.out, "image engine (HunyuanImage 3.0 SigLIP2)");
+    x32_ = alloc<float>(scratch_, P * C, "image engine (HunyuanImage 3.0 SigLIP2)");
+    qkv32_ = alloc<float>(scratch_, P * 3 * C, "image engine (HunyuanImage 3.0 SigLIP2)");
+    tmp32_ = alloc<float>(scratch_, P * C, "image engine (HunyuanImage 3.0 SigLIP2)");
+    mlp32_ = alloc<float>(scratch_, P * inter_, "image engine (HunyuanImage 3.0 SigLIP2)");
+    al32_ = alloc<float>(scratch_, P * al0_.out, "image engine (HunyuanImage 3.0 SigLIP2)");
+    out32_ = alloc<float>(scratch_, P * out_, "image engine (HunyuanImage 3.0 SigLIP2)");
+    pos32_ = alloc<float>(scratch_, P * C, "image engine (HunyuanImage 3.0 SigLIP2)");
     held_bytes_ = scratch_bytes();
 }
 

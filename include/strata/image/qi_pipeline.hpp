@@ -33,11 +33,12 @@ namespace strata::image {
 /// multiples of 32, whatever the image's size (diffusers' QwenImage21Pipeline, its output_resolution 1024).
 void qi_ref_size(int64_t ref_w, int64_t ref_h, int64_t& w, int64_t& h);
 
-/// The token id of <|image_pad|> in Qwen3-VL's vocabulary.
-constexpr int32_t kImagePad = 151655;
-
 class QiPipeline : public ImagePipeline {
 public:
+    bool takes_loras() const override { return true; }
+    bool takes_guidance() const override { return true; }
+    bool takes_control_net() const override { return true; }
+
     /// Reads the parts' files for their sizes; the parts go on the GPU with the first request (ensure_open).
     bool open(const std::string& dit, const std::string& vae, const std::string& text, std::string& err,
               const std::string& vision = "");
@@ -71,7 +72,7 @@ public:
 
     /// What the ControlNet branch at `path` adds to need's least and full for an image of width x height (read for its
     /// sizes; nothing on the GPU).
-    std::pair<uint64_t, uint64_t> control_need(const std::string& path, int64_t width, int64_t height);
+    std::pair<uint64_t, uint64_t> control_need(const std::string& path, int64_t width, int64_t height) override;
 
 private:
     QiPlan plan(int64_t T, int64_t h, int64_t w, int64_t n_ids = 0, int64_t n_neg_pre = 0);
@@ -95,8 +96,9 @@ private:
     /// The request's ControlNet branch opened (or let go, without one) and its conditioning given to it: the control
     /// image's latent, the kept mask and the masked base image's latent (zeros where the request has none).
     void use_control(const QiRequest& r);
-    /// RGBA [4][h][w] FP32 of an RGBA8 picture at w x h through the VAE's encoder into z [64][h / 16][w / 16].
-    void encode_px(const std::vector<uint8_t>& px, int64_t w, int64_t h, float* z);
+    /// RGBA [4][h][w] FP32 (image_planes) of an RGBA8 picture at w x h through the VAE's encoder into
+    /// z [64][h / 16][w / 16].  `what`: the picture, as the failure's message names it.
+    void encode_px(const std::vector<uint8_t>& px, int64_t w, int64_t h, float* z, const char* what);
 
     void* s_ = nullptr;
     std::string dit_path_, vae_path_, text_path_, vision_path_;

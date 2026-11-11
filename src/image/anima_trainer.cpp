@@ -6,7 +6,7 @@
 #include "strata/image/anima_trainer.hpp"
 #include "strata/image/anima_dit.hpp"
 #include "strata/image/anima_train.hpp"
-#include "strata/image/mapped_file.hpp"
+#include "strata/platform/mapped_file.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/qi_stream.hpp"
 #include "strata/image/safetensors.hpp"
@@ -214,7 +214,7 @@ bool AnimaTrainer::open(const std::string& dit, int64_t rank, uint64_t seed, voi
         m.rank = rank;
         if (!m.gemm.init(stream, 1 << 20, err)) return false;
         SafeTensors st(dit);
-        MappedFile file(dit);
+        platform::MappedFile file(dit);
         std::string pre;
         for (const char* p : {"", "net.", "model.diffusion_model."})
             if (st.find(std::string(p) + "blocks.0.self_attn.q_proj.weight") != nullptr) pre = p;

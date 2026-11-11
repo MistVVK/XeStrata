@@ -69,7 +69,14 @@ inline float luma(const uint8_t* p) { return 0.299f * (float) p[0] + 0.587f * (f
 
 // out [h][w][3] = the picture `in` [H][W][3] resampled to w x h, rounded to 8 bits: `area`, each output pixel the
 // mean of the source area it covers (each source pixel weighted by the part covered); else Keys's cubic convolution
-// (a = -0.5) at the pixel centres, the edges repeated
+// (a = -0.5) at the pixel centres, the edges repeated.
+//
+// This one stays beside the shared Pillow resize (src/image/img_crop.hpp) instead of joining it: neither branch is one
+// of its filters.  The cubic here keeps 4 taps whatever the scale, where Pillow's bicubic widens its support by the
+// scale, and the two are 52% of a 1024 x 1024 picture's values apart at 384 x 384 (by up to 91 levels); Pillow's
+// OpenCV cubic (cv_cubic) is the same shape with a = -0.75, still 21% apart (up to 10 levels); and the area branch,
+// a box mean of the covered area, has no Pillow filter here at all.  The resized picture is what a ControlNet was
+// trained to see, so folding either into the shared piece would move every control map's pixels.
 void resample(const uint8_t* in, int64_t W, int64_t H, int64_t w, int64_t h, bool area, uint8_t* out) {
     const float sx = (float) W / (float) w, sy = (float) H / (float) h;
     queue().parallel_for(sycl::range<2>((size_t) h, (size_t) w), [=](sycl::id<2> id) {

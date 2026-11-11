@@ -12,6 +12,7 @@
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/gelu.hpp"
+#include "strata/image/gpu_buf.hpp"
 #include "strata/image/mf_dit.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/w8_choice.hpp"
@@ -21,6 +22,7 @@
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/f16_gpu.hpp"
+#include "strata/kernels/q8_act.hpp"
 #include "strata/kernels/qk_norm_rope.hpp"
 #include "strata/kernels/rows_cols.hpp"
 
@@ -50,7 +52,7 @@ namespace syclex = sycl::ext::oneapi::experimental;
 using kernels::f16_gpu::f16_from_f32;   // the GPU's conversions (f16_gpu.hpp)
 using kernels::f16_gpu::f32_from_f16;
 
-inline sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
+using strata::image::q_of;   // the shared one (gpu_buf.hpp), as every image file's own copy was
 
 inline float bf16_value(uint16_t b) {
     const uint32_t u = (uint32_t) b << 16;
@@ -70,18 +72,20 @@ inline float round_bf16(float x) {
     return f;
 }
 
-// row of K bf16 values -> Q8_0 (ggml's reference rounding): blocks of an FP16 scale and 32 int8 values
+// row of K bf16 values -> Q8_0: blocks of an FP16 scale and 32 int8 values.  The rounding is q8act::Mul's, the one
+// rule the GPU's quantize (fused_gr_quantize_q8_0) also takes, so the host's and the device's bytes agree.
 inline void quantize_row(const uint16_t* src, int64_t K, uint8_t* dst) {
+    namespace q8 = kernels::q8act;
     for (int64_t b = 0; b < K / 32; ++b) {
         float v[32], amax = 0.f;
         for (int j = 0; j < 32; ++j) {
             v[j] = bf16_value(src[b * 32 + j]);
             amax = std::max(amax, std::fabs(v[j]));
         }
-        const float d = amax / 127.f, id = d != 0.f ? 1.f / d : 0.f;
+        const float d = q8::Mul::scale(amax), id = q8::Mul::inv(d);
         const uint16_t dh = f16_from_f32(d);
         int8_t* qs = reinterpret_cast<int8_t*>(dst + b * 34 + 2);
-        for (int j = 0; j < 32; ++j) qs[j] = (int8_t) std::lround(v[j] * id);
+        for (int j = 0; j < 32; ++j) qs[j] = q8::Mul::value(v[j], d, id, amax);
         std::memcpy(dst + b * 34, &dh, 2);
     }
 }

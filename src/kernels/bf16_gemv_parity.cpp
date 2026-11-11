@@ -4,17 +4,22 @@
 // src/kernels/bf16_gemv_parity.cpp - P2.S5's test for the BF16 GEMV (bf16_gemv_fp32_mmvf: BF16 weights, FP32
 // activations, the pinned CUDA single-token MMVF).
 //
-// TWO THINGS ARE CHECKED, and the second is the one the engine's correctness rests on:
+// THREE THINGS ARE CHECKED, and the second is the one the engine's correctness rests on:
 //
 //   1. the kernel against a host reference in double over the SAME bf16 weight bits and FP32 activations - so the
 //      tolerance is set by f32 products and summation order and nothing else;
 //   2. **THE ACTIVATION CONTRACT IS OBSERVABLE.**  The kernel reads the activation in FP32; a BF16-rounded
 //      activation is a 2^-9 = 1.95e-03 relative change, the rival reading (the engine's former contract), computed
 //      and required to differ, because it produces perfectly plausible output.
+//   3. the F32 MMVF against the image engine's former f32_vec (mf_dit.cpp, a work-group of 32 striding a row),
+//      now taken to the MMVF and a bias add: the sums' order differs, so the difference's size is the check.
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
+#include "strata/kernels/elementwise.hpp"
 
 #include "parity_device.hpp"
+
+#include <sycl/sycl.hpp>
 
 #include <cmath>
 #include <cstdio>
@@ -111,6 +116,61 @@ int main(int argc, char** argv) {
             std::printf("      %-30s %s (%.4f%% apart)\n", "fp32 vs bf16 activation",
                         visible ? "yes" : "*** NO ***", rv * 100);
             if (!visible) ++bad;
+        }
+    }
+
+    // ---- 3. THE IMAGE ENGINE'S FORMER f32_vec (mf_dit.cpp; now the F32 MMVF and a bias add).
+    // The MMVF sums in its own tuned order, so the bytes may differ in the last places: the check is the
+    // difference's size over MageTrail's low-rank modulation shapes (the only reader f32_vec had).
+    {
+        auto old_f32_vec = [](const float* w, const float* x, const float* b, float* y, int64_t N, int64_t K) {
+            auto& q = strata::core::Runtime::get().compute();
+            constexpr int64_t local = 32;
+            q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (N * local)), sycl::range<1>((size_t) local)),
+                           [=](sycl::nd_item<1> it) {
+                const auto n = static_cast<int64_t>(it.get_group_linear_id());
+                const auto lane = static_cast<int64_t>(it.get_local_linear_id());
+                const float* row = w + n * K;
+                float acc = 0.f;
+                for (int64_t k = lane; k < K; k += local) acc += row[k] * x[k];
+                acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+                if (lane == 0) y[n] = acc + (b != nullptr ? b[n] : 0.f);
+            });
+            q.wait();
+        };
+        struct FShape { int64_t K, N; const char* what; };
+        const FShape fshapes[] = {
+            {3072, 256, "mdown  [3072 -> 256]"},
+            {256, 18432, "mod    [256 -> 6 x 3072]"},
+            {512, 3072, "mod    [512 -> 3072]"},
+        };
+        for (const FShape& s : fshapes) {
+            std::mt19937 rng(4243);  // NOLINT(bugprone-random-generator-seed): a fixed seed keeps the inputs reproducible
+            std::normal_distribution<float> g(0.0f, 1.0f);
+            std::vector<float> fx((size_t) s.K), fw((size_t) (s.K * s.N)), fb((size_t) s.N);
+            for (auto& v : fx) v = g(rng);
+            for (auto& v : fw) v = g(rng) * 0.05f;
+            for (auto& v : fb) v = g(rng) * 0.1f;
+            strata::parity::Device dev;
+            float* d_x = dev.upload(fx);
+            float* d_w = dev.upload(fw);
+            float* d_b = dev.upload(fb);
+            float* d_old = dev.alloc<float>((size_t) s.N);
+            float* d_new = dev.alloc<float>((size_t) s.N);
+            old_f32_vec(d_w, d_x, d_b, d_old, s.N, s.K);
+            strata::kernels::f32_gemv_fp32_mmvf(d_x, d_w, d_new, s.K, s.N, nullptr);
+            strata::kernels::add_inplace(d_new, d_b, s.N, nullptr, 1.0f);
+            std::vector<float> o((size_t) s.N), nw((size_t) s.N);
+            strata::parity::copy_out(o.data(), d_old, o.size());
+            strata::parity::copy_out(nw.data(), d_new, nw.size());
+            double mx = 0, den = 0;
+            for (size_t i = 0; i < o.size(); ++i) {
+                mx = std::max(mx, std::fabs((double) o[i] - nw[i]));
+                den = std::max(den, std::fabs((double) o[i]));
+            }
+            const double r = rel_l1(o, nw);
+            std::printf("  %-34s old vs mmvf+bias: rel %.2e, max %.2e (of %.2e)\n", s.what, r, mx, den);
+            if (!(r <= 1e-5)) { std::printf("    *** over 1e-5 ***\n"); ++bad; }
         }
     }
 

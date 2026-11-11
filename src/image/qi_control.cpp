@@ -7,7 +7,7 @@
 #include "dit_rows.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
-#include "strata/image/mapped_file.hpp"
+#include "strata/platform/mapped_file.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -91,7 +91,7 @@ bool QiControl::open(const std::string& path, QiDit& dit, std::string& err, bool
         path_ = path;
         dit_ = &dit;
         dry_ = dry;
-        file_ = std::make_unique<MappedFile>(path);
+        file_ = std::make_unique<platform::MappedFile>(path);
         SafeTensors st(path);
         const uint8_t* data = file_->data() + st.data_base();
         const int64_t C = dit.C_;

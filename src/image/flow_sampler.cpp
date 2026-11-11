@@ -10,6 +10,8 @@
 #include "strata/image/pipeline.hpp"
 #include "strata/kernels/elementwise.hpp"
 
+#include "strata/image/gpu_buf.hpp"
+
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
@@ -22,8 +24,6 @@ namespace strata::image {
 namespace gpu = strata::gpu;
 
 namespace flow_sampler_detail {
-
-sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
 
 // The common CFG combination. MOSS-Image's original SLG uses k as the base when no negative pass is present.
 inline float velocity(float c, float u, float k, bool has_u, bool has_k, float cfg, float slg) {

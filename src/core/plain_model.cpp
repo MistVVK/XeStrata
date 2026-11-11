@@ -19,6 +19,7 @@
 // src/models/qwen35.cpp at de7fa0a3) is qwen35moe's with the MoE replaced by a dense SwiGLU, down(silu(gate(h)) * up(h)),
 // in every block and in the MTP layer: no experts, so none of the tiers, the CPU pool or the window protocol.
 #include "strata/core/plain_model.hpp"
+#include "strata/core/constraint_upload.hpp"
 
 #include "strata/core/plain_cpu.hpp"
 
@@ -28,6 +29,7 @@
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/pinned.hpp"
+#include "strata/core/progress.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cvec.hpp"
@@ -2465,6 +2467,8 @@ bool PlainModel::cpu_run(const int32_t* tokens, int64_t n, int64_t pos, int rows
                           hist ? cpu_hist_len_ : 0, sp, picks.data());
     for (int i = 0; i < rows; ++i) out[i] = picks[(size_t) i];
     if (logits != nullptr) std::memcpy(logits, cpu_logits_.data(), cpu_logits_.size() * 4);
+    progress_beat();   // the serve watchdog, as the GPU windows' (stage_forward)
+    progress_tick();
     return true;
 }
 
@@ -2482,8 +2486,7 @@ bool PlainModel::set_logit_bias(const std::vector<float>& bias, std::string& err
     t.bias_on_ = !bias.empty();
     if (!t.bias_on_) return true;
     if (bias.size() != (size_t) n_vocab_) { err = "plain model: a logit bias of another vocabulary"; return false; }
-    if ((t.bias_dev_ == nullptr && !strata::gpu::alloc_device(&t.bias_dev_, bias.size() * 4)) ||
-        !strata::gpu::copy(t.bias_dev_, bias.data(), bias.size() * 4)) {
+    if (!constraint_upload(t.bias_dev_, bias.data(), bias.size() * 4, bias.size() * 4)) {
         t.bias_on_ = false;
         err = std::string("plain model: the logit bias: ") + strata::gpu::last_error();
         return false;
@@ -2506,17 +2509,13 @@ bool PlainModel::set_allowed(const uint32_t* row, std::string& err) {
     t.allowed_on_ = row != nullptr;
     if (!t.allowed_on_) return true;
     const size_t words = (size_t) (n_vocab_ + 31) / 32, T = (size_t) opt_.max_t;
-    if (t.allowed_dev_ == nullptr) {
-        if (!strata::gpu::alloc_device(&t.allowed_dev_, words * T * 4)) {
-            t.allowed_on_ = false;
-            err = std::string("plain model: the grammar's mask: ") + strata::gpu::last_error();
-            return false;
-        }
-        t.allocs_.push_back(t.allowed_dev_);
-    }
     std::vector<uint32_t> rows(words * T);
     for (size_t r = 0; r < T; ++r) std::copy(row, row + words, rows.begin() + (std::ptrdiff_t) (r * words));
-    if (!strata::gpu::copy(t.allowed_dev_, rows.data(), rows.size() * 4)) {
+    const bool uploaded = constraint_upload(t.allowed_dev_, rows.data(), words * T * 4, rows.size() * 4);
+    if (t.allowed_dev_ != nullptr &&
+        std::find(t.allocs_.begin(), t.allocs_.end(), (void*) t.allowed_dev_) == t.allocs_.end())
+        t.allocs_.push_back(t.allowed_dev_);   // kept even when the copy failed, as before
+    if (!uploaded) {
         t.allowed_on_ = false;
         err = std::string("plain model: the grammar's mask: ") + strata::gpu::last_error();
         return false;
@@ -2538,15 +2537,11 @@ bool PlainModel::set_allowed_rows(const uint32_t* rows, int T, std::string& err)
     if (!t.allowed_on_) return true;
     const size_t words = (size_t) (n_vocab_ + 31) / 32;
     if (T < 1 || T > opt_.max_t) { t.allowed_on_ = false; err = "plain model: mask rows out of range"; return false; }
-    if (t.allowed_dev_ == nullptr) {
-        if (!strata::gpu::alloc_device(&t.allowed_dev_, words * (size_t) opt_.max_t * 4)) {
-            t.allowed_on_ = false;
-            err = std::string("plain model: the window's masks: ") + strata::gpu::last_error();
-            return false;
-        }
-        t.allocs_.push_back(t.allowed_dev_);
-    }
-    if (!strata::gpu::copy(t.allowed_dev_, rows, words * (size_t) T * 4)) {
+    const bool uploaded = constraint_upload(t.allowed_dev_, rows, words * (size_t) opt_.max_t * 4, words * (size_t) T * 4);
+    if (t.allowed_dev_ != nullptr &&
+        std::find(t.allocs_.begin(), t.allocs_.end(), (void*) t.allowed_dev_) == t.allocs_.end())
+        t.allocs_.push_back(t.allowed_dev_);   // kept even when the copy failed, as before
+    if (!uploaded) {
         t.allowed_on_ = false;
         err = std::string("plain model: the window's masks: ") + strata::gpu::last_error();
         return false;
@@ -3543,6 +3538,8 @@ bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const 
     pool_ms_ += disp_.ms_plan + disp_.ms_actq + disp_.ms_jobs + disp_.ms_run - pool0;
     win_ms_ += win_ms;
     ++windows_;
+    progress_beat();   // the serve watchdog: a window (decode or prompt) is still moving
+    progress_tick();   // plain's windows run as one graph launch: the tick counts windows, not their layers
     return defer || after_rows(T, pos, err);
 }
 

@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/verify.hpp"
+#include "strata/core/constraint_upload.hpp"
 
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
@@ -466,8 +467,7 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
     }
     if (bias != logit_bias_host_ && !bias.empty()) {
         const size_t bytes = bias.size() * sizeof(float);
-        if ((!logit_bias_device_ && !strata::gpu::alloc_device(&logit_bias_device_, bytes)) ||
-            !strata::gpu::copy(logit_bias_device_, bias.data(), bytes)) {
+        if (!constraint_upload(logit_bias_device_, bias.data(), bytes, bytes)) {
             err = "cannot upload logit_bias"; return false;
         }
     }
@@ -484,8 +484,7 @@ bool Verifier::set_allowed(const uint32_t* rows, int T, std::string& err) {
         if (T < 1 || T > strata::kernels::kVerifyMaxT) { err = "grammar mask: window rows out of range"; return false; }
         const OnDevice on_device(device_);
         const size_t row = (size_t) ((n_vocab_ + 31) / 32) * sizeof(uint32_t);
-        if ((!allowed_device_ && !strata::gpu::alloc_device(&allowed_device_, row * strata::kernels::kVerifyMaxT)) ||
-            !strata::gpu::copy(allowed_device_, rows, row * (size_t) T)) {
+        if (!constraint_upload(allowed_device_, rows, row * strata::kernels::kVerifyMaxT, row * (size_t) T)) {
             err = "cannot upload the grammar's token masks"; return false;
         }
     }
