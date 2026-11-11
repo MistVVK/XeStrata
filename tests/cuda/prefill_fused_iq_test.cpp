@@ -96,12 +96,12 @@ void fill_matrix(uint8_t* m, ggml_type t, int64_t rows, int64_t cols, std::mt199
     std::uniform_int_distribution<int> byte(0, 255);
     const float lo = t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K ? 0.00004f : t == GGML_TYPE_Q5_1 ? 0.0006f
                    : t == GGML_TYPE_Q8_0 ? 0.0001f : t == GGML_TYPE_IQ3_S ? 0.0004f : t == GGML_TYPE_IQ4_XS ? 0.00005f
-                   : t == GGML_TYPE_IQ4_NL ? 0.0002f : t == GGML_TYPE_Q2_0 ? 0.004f : 0.0008f;
+                   : t == GGML_TYPE_IQ4_NL ? 0.0002f : t == GGML_TYPE_Q2_0 ? 0.004f : t == GGML_TYPE_Q6_K ? 0.000005f : 0.0008f;
     std::uniform_real_distribution<float> sc(lo, 6.0f * lo);
     for (size_t i = 0; i < nb * bs; ++i) m[i] = (uint8_t) byte(rng);
     for (size_t b = 0; b < nb; ++b) {
         const ggml_fp16_t h = ggml_fp32_to_fp16(sc(rng));
-        std::memcpy(m + b * bs, &h, 2);
+        std::memcpy(m + b * bs + (t == GGML_TYPE_Q6_K ? 208 : 0), &h, 2);   // (Q6_K keeps d at its end; its 16 int8 scales stay random bytes)
         if (t == GGML_TYPE_Q4_K || t == GGML_TYPE_Q5_K || t == GGML_TYPE_Q5_1) {   // the minimum's scale, either sign
             const ggml_fp16_t h2 = ggml_fp32_to_fp16(sc(rng) * ((rng() & 1) ? 1.0f : -1.0f) * (t == GGML_TYPE_Q5_1 ? 4.0f : 1.0f));
             std::memcpy(m + b * bs + 2, &h2, 2);
@@ -738,7 +738,14 @@ int main(int argc, char** argv) {
             // UD-IQ4_XS-v31's Q5_0 down layers (STRATA_PF_FUSED_Q50=1: HIP gfx12, and CUDA sm_80+ since phase 4 step 1; checked against the reference, the build has no Q5_0 MMQ)
             {GGML_TYPE_IQ3_XXS, GGML_TYPE_Q5_0, "IQ3_XXS / Q5_0"},   {GGML_TYPE_IQ4_XS, GGML_TYPE_Q5_0, "IQ4_XS / Q5_0"},
             // the canonical Q2_0 pack (gate/up and down Q2_0; CUDA)
-            {GGML_TYPE_Q2_0, GGML_TYPE_Q2_0, "Q2_0 / Q2_0"}};
+            {GGML_TYPE_Q2_0, GGML_TYPE_Q2_0, "Q2_0 / Q2_0"},
+            // the pinned UD-IQ4_XS's Q8_0 down layers (IQ3_S / Q8_0 4, IQ4_XS / Q8_0 1): STRATA_PF_FUSED_Q8D=1 on CUDA sm_80+ (opt-in)
+            {GGML_TYPE_IQ3_S, GGML_TYPE_Q8_0, "IQ3_S / Q8_0"},       {GGML_TYPE_IQ4_XS, GGML_TYPE_Q8_0, "IQ4_XS / Q8_0"},
+            // the Q8_0 set's layers (and UD-Q6_K_XL's one Q8_0 layer): STRATA_PF_FUSED_Q8GU=1 on CUDA sm_80+ (opt-in)
+            {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, "Q8_0 / Q8_0"},
+            // UD-Q6_K_XL's layers (and UD-Q5_K_XL's one Q6_K layer): STRATA_PF_FUSED_Q6K=1 on CUDA sm_80+ (opt-in); MMQ = the K-quant library.
+            // Named with "+" so the _kq entry's --only="K / Q" does not take it
+            {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, "Q6_K + Q8_0"}};
         const char* only = nullptr;   // --only=NAME: the pairs whose name contains NAME
         for (int i = 1; i < argc; ++i)
             if (std::strncmp(argv[i], "--only=", 7) == 0) only = argv[i] + 7;
@@ -762,6 +769,9 @@ int main(int argc, char** argv) {
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
         for (const Pair& p : pairs) {
             if (only ? std::string(p.name).find(only) == std::string::npos : p.gu == GGML_TYPE_Q4_K || p.gu == GGML_TYPE_Q5_K) continue;
+            // the i-quant / Q8_0 and Q8_0 / Q8_0 pairs run only when --only names them (ctest prefill_fused_iq_test_q8d / _q8gu), so every
+            // other entry runs what it ran
+            if (!only && p.d == GGML_TYPE_Q8_0 && !kq_gu(p)) continue;
             if (!fused::native_supported((int) p.gu, (int) p.d)) {
                 // the Q2_0 / Q2_0 pair is the Turing opt-in's (STRATA_PF_FUSED_SM75=1; the only pair set up there) or, on sm_80+,
                 // STRATA_PF_FUSED_Q2N=1's: skip what this device does not take (--only=NAME still insists)

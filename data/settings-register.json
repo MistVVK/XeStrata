@@ -25719,6 +25719,105 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PF_FUSED_Q6K",
+   "backends": [
+    "cuda"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 1874,
+     "backend": "cuda",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "",
+   "since": "",
+   "last_commit": "",
+   "last_date": "",
+   "status": "research",
+   "owner": "prefill",
+   "note": "CUDA (phase 4, opt-in, default off): a Q6_K gate/up with a Q8_0 down (UD-Q6_K_XL's 47 layers, UD-Q5_K_XL's one Q6_K layer) on the fused native kernels on any sm_80+ card instead of MMQ.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_PF_FUSED_Q8D",
+   "backends": [
+    "cuda"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 1862,
+     "backend": "cuda",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "",
+   "since": "",
+   "last_commit": "",
+   "last_date": "",
+   "status": "research",
+   "owner": "prefill",
+   "note": "CUDA (phase 4, opt-in, default off): a Q8_0 down behind an i-quant gate/up (the pinned UD-IQ4_XS's five Q8_0-down layers) on the fused native kernels on any sm_80+ card instead of MMQ.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_PF_FUSED_Q8GU",
+   "backends": [
+    "cuda"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 1868,
+     "backend": "cuda",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "",
+   "since": "",
+   "last_commit": "",
+   "last_date": "",
+   "status": "research",
+   "owner": "prefill",
+   "note": "CUDA (phase 4, opt-in, default off): a Q8_0 gate/up with a Q8_0 down (the Q8_0 set, UD-Q6_K_XL's one Q8_0 layer) on the fused native kernels on any sm_80+ card instead of MMQ.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PF_FUSED_SM75",
    "backends": [
     "cuda-hip"
