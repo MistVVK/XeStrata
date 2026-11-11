@@ -113,6 +113,12 @@ if(_vit_hip)
   target_sources(strata_vit_own PRIVATE vit_gpu.cu)
   target_compile_definitions(strata_vit_own PUBLIC STRATA_VIT_GPU STRATA_VIT_HIP)
   target_link_libraries(strata_vit_own PUBLIC hip::host roc::hipblas)
+  # hipBLASLt (optional, as for the engine): the products through it with STRATA_VIT_LT / STRATA_VIT_LT_ATT (vit_gpu.cu); off by default
+  find_package(hipblaslt CONFIG QUIET)
+  if(TARGET roc::hipblaslt)
+    target_compile_definitions(strata_vit_own PRIVATE STRATA_VIT_HIPBLASLT)
+    target_link_libraries(strata_vit_own PUBLIC roc::hipblaslt)
+  endif()
 endif()
 
 if(_vit_sycl)

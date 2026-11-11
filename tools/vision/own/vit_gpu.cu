@@ -14,6 +14,14 @@
 #include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 #include <hipblas/hipblas.h>
+#if defined(STRATA_VIT_HIPBLASLT)
+// hipBLASLt for the matrix products (STRATA_VIT_LT / STRATA_VIT_LT_ATT, off by default): on gfx1151 the package's rocBLAS carries only its generic
+// fallback kernels, and the products took 1.7 to 3.0 times mtmd-HIP's whole picture (RESULTS-OWN-3V.md 12.14, section 14)
+#include <hipblaslt/hipblaslt.h>
+#include <hipblaslt/hipblaslt-ext.hpp>
+#include <map>
+#include <tuple>
+#endif
 #define cudaError_t hipError_t
 #define cudaSuccess hipSuccess
 #define cudaGetErrorString hipGetErrorString
@@ -249,6 +257,14 @@ __global__ void k_cast(const float* __restrict__ in, size_t n, void* out, int ki
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) store_kind(out, i, in[i], kind);
 }
 
+#if defined(STRATA_VIT_HIP)
+// n 16-bit values (K_F16: F16, else BF16) to float32 (STRATA_VIT_HPA16: a product computed with float32 accumulation and a 16-bit result, widened back)
+__global__ void k_widen16(const uint16_t* __restrict__ in, size_t n, float* __restrict__ out, int kind) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
+        out[i] = kind == K_F16 ? __half2float(__ushort_as_half(in[i])) : __uint_as_float((uint32_t) in[i] << 16);
+}
+#endif
+
 // x[r] += y[r] + bias
 __global__ void k_add_bias_res(float* __restrict__ x, const float* __restrict__ y, const float* __restrict__ bias, int D) {
     const size_t base = (size_t) blockIdx.x * D;
@@ -328,9 +344,177 @@ struct VitGpuImpl {
     // STRATA_VIT_BF16_AS_F16=0/1 (a diagnostic) overrides.
     bool bf16_as_f16 = false;
 
+#if defined(STRATA_VIT_HIPBLASLT)
+    // hipBLASLt (HIP builds that found it).  STRATA_VIT_LT=1: the 16-bit weight products; STRATA_VIT_LT_ATT=1: the two batched attention products;
+    // STRATA_VIT_LT_SOL=<id>: that solution for the weight products instead of hipBLASLt's first heuristic answer; STRATA_VIT_LT_VERBOSE=1: the solution
+    // of every new shape and a summary on stderr.  The solution of a shape is chosen once per process, by id or as the heuristic's first answer that fits
+    // the workspace, never by timing, so two processes take the same kernels.  A shape hipBLASLt cannot run goes to hipBLAS as before.
+    struct LtPlan {
+        bool ok = false;
+        int sol = -1;
+        hipblasLtMatmulAlgo_t algo{};
+        hipblasLtMatmulDesc_t op = nullptr;
+        hipblasLtMatrixLayout_t a = nullptr, b = nullptr, c = nullptr;
+    };
+    using LtKey = std::tuple<int, int, int, int, int, int, int, int, int, int, int, int, long long, long long, long long>;
+    hipblasLtHandle_t lt = nullptr;
+    void* lt_ws = nullptr;
+    size_t lt_ws_bytes = (size_t) 32 << 20;
+    bool lt_weights = false, lt_att = false, lt_verbose = false;
+    int lt_sol = -1;
+    std::map<LtKey, LtPlan> lt_plans;
+    unsigned long long lt_launches = 0, lt_fallbacks = 0;
+
+    static hipblasLtMatrixLayout_t lt_layout(hipDataType t, int rows, int cols, int ld, int batch, long long stride) {
+        hipblasLtMatrixLayout_t l = nullptr;
+        if (hipblasLtMatrixLayoutCreate(&l, t, rows, cols, ld) != HIPBLAS_STATUS_SUCCESS) return nullptr;
+        if (batch > 1) {
+            const int32_t bc = batch;
+            const int64_t st = stride;
+            if (hipblasLtMatrixLayoutSetAttribute(l, HIPBLASLT_MATRIX_LAYOUT_BATCH_COUNT, &bc, sizeof(bc)) != HIPBLAS_STATUS_SUCCESS ||
+                hipblasLtMatrixLayoutSetAttribute(l, HIPBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &st, sizeof(st)) != HIPBLAS_STATUS_SUCCESS) {
+                hipblasLtMatrixLayoutDestroy(l);
+                return nullptr;
+            }
+        }
+        return l;
+    }
+    static void lt_free(LtPlan& p) {
+        if (p.op) hipblasLtMatmulDescDestroy(p.op);
+        if (p.a) hipblasLtMatrixLayoutDestroy(p.a);
+        if (p.b) hipblasLtMatrixLayoutDestroy(p.b);
+        if (p.c) hipblasLtMatrixLayoutDestroy(p.c);
+        p = LtPlan{};
+    }
+    // the descriptors and the solution of one call shape (made once, kept for the reader's life)
+    LtPlan& lt_plan(bool ta, bool tb, int m, int n, int k, hipDataType at, int lda, long long sa, hipDataType bt, int ldb, long long sb, hipDataType ct, int ldc,
+                    long long sc, int batch, int sol) {
+        const LtKey key{(int) ta, (int) tb, m, n, k, (int) at, (int) bt, (int) ct, lda, ldb, ldc, batch, sa, sb, sc};
+        auto it = lt_plans.find(key);
+        if (it != lt_plans.end()) return it->second;
+        LtPlan& p = lt_plans[key];
+        const hipblasOperation_t oa = ta ? HIPBLAS_OP_T : HIPBLAS_OP_N, ob = tb ? HIPBLAS_OP_T : HIPBLAS_OP_N;
+        if (hipblasLtMatmulDescCreate(&p.op, HIPBLAS_COMPUTE_32F, HIP_R_32F) != HIPBLAS_STATUS_SUCCESS ||
+            hipblasLtMatmulDescSetAttribute(p.op, HIPBLASLT_MATMUL_DESC_TRANSA, &oa, sizeof(oa)) != HIPBLAS_STATUS_SUCCESS ||
+            hipblasLtMatmulDescSetAttribute(p.op, HIPBLASLT_MATMUL_DESC_TRANSB, &ob, sizeof(ob)) != HIPBLAS_STATUS_SUCCESS ||
+            !(p.a = lt_layout(at, ta ? k : m, ta ? m : k, lda, batch, sa)) || !(p.b = lt_layout(bt, tb ? n : k, tb ? k : n, ldb, batch, sb)) ||
+            !(p.c = lt_layout(ct, m, n, ldc, batch, sc))) {
+            lt_free(p);
+            return p;
+        }
+        const float alpha = 1.0f, beta = 0.0f;
+        size_t need = 0;
+        if (sol >= 0) {      // a given solution id
+            std::vector<int> ids{sol};
+            std::vector<hipblasLtMatmulHeuristicResult_t> r;
+            if (hipblaslt_ext::getAlgosFromIndex(lt, ids, r) == HIPBLAS_STATUS_SUCCESS && !r.empty() && r.front().state == HIPBLAS_STATUS_SUCCESS) {
+                hipblasLtMatmulAlgo_t algo = r.front().algo;
+                if (hipblaslt_ext::matmulIsAlgoSupported(lt, p.op, &alpha, p.a, p.b, &beta, p.c, p.c, algo, need) == HIPBLAS_STATUS_SUCCESS &&
+                    need <= lt_ws_bytes) {
+                    p.algo = algo;
+                    p.ok = true;
+                }
+            }
+        } else {             // hipBLASLt's first heuristic answer that fits the workspace
+            hipblasLtMatmulPreference_t pref = nullptr;
+            const uint64_t ws = lt_ws_bytes;
+            if (hipblasLtMatmulPreferenceCreate(&pref) == HIPBLAS_STATUS_SUCCESS &&
+                hipblasLtMatmulPreferenceSetAttribute(pref, HIPBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws)) == HIPBLAS_STATUS_SUCCESS) {
+                hipblasLtMatmulHeuristicResult_t r[8];
+                int got = 0;
+                if (hipblasLtMatmulAlgoGetHeuristic(lt, p.op, p.a, p.b, p.c, p.c, pref, 8, r, &got) == HIPBLAS_STATUS_SUCCESS)
+                    for (int i = 0; i < got && !p.ok; ++i)
+                        if (r[i].state == HIPBLAS_STATUS_SUCCESS && r[i].workspaceSize <= lt_ws_bytes) {
+                            p.algo = r[i].algo;
+                            need = r[i].workspaceSize;
+                            p.ok = true;
+                        }
+            }
+            if (pref) hipblasLtMatmulPreferenceDestroy(pref);
+        }
+        if (p.ok) p.sol = hipblaslt_ext::getIndexFromAlgo(p.algo);
+        if (lt_verbose)
+            std::fprintf(stderr, "vit-lt: %s%s m=%d n=%d k=%d types=%d/%d/%d batch=%d -> %s %d (workspace %zu)\n", ta ? "T" : "N", tb ? "T" : "N", m, n, k, (int) at,
+                         (int) bt, (int) ct, batch, p.ok ? "solution" : "hipBLAS, no solution", p.sol, need);
+        if (!p.ok) { lt_free(p); p.ok = false; }
+        return p;
+    }
+    // the product through hipBLASLt; false: not run (the caller uses hipBLAS)
+    bool lt_mm(bool ta, bool tb, int m, int n, int k, const void* A, cudaDataType_t at, int lda, long long sa, const void* B, cudaDataType_t bt, int ldb,
+               long long sb, void* C, cudaDataType_t ct, int ldc, long long sc, int batch, int sol) {
+        LtPlan& p = lt_plan(ta, tb, m, n, k, at, lda, sa, bt, ldb, sb, ct, ldc, sc, batch, sol);
+        if (!p.ok) { ++lt_fallbacks; return false; }
+        const float alpha = 1.0f, beta = 0.0f;
+        if (hipblasLtMatmul(lt, p.op, &alpha, A, p.a, B, p.b, &beta, C, p.c, C, p.c, &p.algo, lt_ws, lt_ws_bytes, nullptr) != HIPBLAS_STATUS_SUCCESS) {
+            std::fprintf(stderr, "vit-lt: the hipBLASLt product failed (m=%d n=%d k=%d batch=%d); hipBLAS from now on for this shape\n", m, n, k, batch);
+            lt_free(p);
+            p.ok = false;
+            ++lt_fallbacks;
+            return false;
+        }
+        ++lt_launches;
+        return true;
+    }
+    void lt_setup() {
+        auto on = [](const char* name) { const char* e = std::getenv(name); return e && std::atoi(e) != 0; };
+        lt_weights = on("STRATA_VIT_LT");
+        lt_att = on("STRATA_VIT_LT_ATT");
+        lt_verbose = on("STRATA_VIT_LT_VERBOSE");
+        if (const char* e = std::getenv("STRATA_VIT_LT_SOL")) lt_sol = std::atoi(e);
+        if (!lt_weights && !lt_att) return;
+        if (hipblasLtCreate(&lt) != HIPBLAS_STATUS_SUCCESS || cudaMalloc(&lt_ws, lt_ws_bytes) != cudaSuccess) {
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "vit-lt: hipBLASLt is not usable here; hipBLAS for every product\n");
+            if (lt) { hipblasLtDestroy(lt); lt = nullptr; }
+            lt_ws = nullptr;
+            lt_weights = lt_att = false;
+            return;
+        }
+        std::fprintf(stderr, "vit-lt: hipBLASLt for %s%s%s (solution %s)\n", lt_weights ? "the weight products" : "", lt_weights && lt_att ? " and " : "",
+                     lt_att ? "the attention products" : "", lt_sol >= 0 ? std::to_string(lt_sol).c_str() : "heuristic");
+    }
+    void lt_close() {
+        for (auto& kv : lt_plans) lt_free(kv.second);
+        lt_plans.clear();
+        if (lt_ws) (void) cudaFree(lt_ws);
+        if (lt) hipblasLtDestroy(lt);
+        if (lt_verbose && (lt_launches || lt_fallbacks))
+            std::fprintf(stderr, "vit-lt: %llu hipBLASLt products, %llu by hipBLAS\n", lt_launches, lt_fallbacks);
+        lt = nullptr;
+        lt_ws = nullptr;
+    }
+#endif
+
+#if defined(STRATA_VIT_HIP)
+    // STRATA_VIT_HPA16=1 (on by default on gfx1151 only, see VitGpu::load): the 16-bit weight products ask rocBLAS for a 16-bit RESULT with float32 accumulation (BF16 -> BF16 and F16 -> F16,
+    // compute 32F: rocBLAS's BB_HPA / HH_HPA kernels), then widen it to float32.  On gfx110x and gfx1151 the Windows ROCm package's rocBLAS has tuned kernels
+    // for those types and only its generic fallback kernels for BF16 / F16 -> F32 (BS_HPA / HS_HPA), which our products asked for (lane COVER 11-11,
+    // phaseA-tests\par\RESULTS-COVER.md); mtmd's reader asks for the 16-bit result there.  STRATA_VIT_HPA16_ATT=1: the same for the attention's P*V product
+    // (F16 -> F16, float32 accumulation; the score product S is F16 -> F16 already).  The result is the float32 sum rounded once to 16 bits.
+    bool hpa16 = false, hpa16_att = false;
+    uint16_t *d_y16 = nullptr, *d_pv16 = nullptr;     // the 16-bit results (sized with the work buffers when the switch is on)
+    size_t y16_elems = 0, pv16_elems = 0;
+#endif
+
     // C = alpha * op(A) * op(B), batched, column-major as the BLAS wants it
     bool bgemm(bool ta, bool tb, int m, int n, int k, const void* A, cudaDataType_t at, int lda, long long sa, const void* B, cudaDataType_t bt, int ldb,
                long long sb, void* C, cudaDataType_t ct, int ldc, long long sc, int batch, std::string& err) {
+#if defined(STRATA_VIT_HIPBLASLT)
+        if (lt_att && lt_mm(ta, tb, m, n, k, A, at, lda, sa, B, bt, ldb, sb, C, ct, ldc, sc, batch, -1)) return true;
+#endif
+#if defined(STRATA_VIT_HIP)
+        // a float32 result whose batches tile its rows (P*V: the heads side by side in a row of the context): 16-bit result, then widened
+        if (hpa16_att && ct == CUDA_R_32F && at == CUDA_R_16F && bt == CUDA_R_16F && (long long) batch * sc == ldc && m <= ldc &&
+            (size_t) n * ldc <= pv16_elems) {
+            const float alpha = 1.0f, beta = 0.0f;
+            const cublasStatus_t s = cublasGemmStridedBatchedEx(blas, ta ? CUBLAS_OP_T : CUBLAS_OP_N, tb ? CUBLAS_OP_T : CUBLAS_OP_N, m, n, k, &alpha, A, at, lda,
+                                                                sa, B, bt, ldb, sb, &beta, d_pv16, CUDA_R_16F, ldc, sc, batch, VIT_COMPUTE_32F, VIT_GEMM_DEFAULT);
+            if (s != CUBLAS_STATUS_SUCCESS) { err = "the batched BLAS product failed (status " + std::to_string((int) s) + ")"; return false; }
+            const size_t cnt = (size_t) n * ldc;
+            k_widen16<<<blocks_for(cnt), 256>>>(d_pv16, cnt, (float*) C, (int) K_F16);
+            return true;
+        }
+#endif
         const float alpha = 1.0f, beta = 0.0f;
         const cublasStatus_t s = cublasGemmStridedBatchedEx(blas, ta ? CUBLAS_OP_T : CUBLAS_OP_N, tb ? CUBLAS_OP_T : CUBLAS_OP_N, m, n, k, &alpha, A, at, lda, sa,
                                                             B, bt, ldb, sb, &beta, C, ct, ldc, sc, batch, VIT_COMPUTE_32F, VIT_GEMM_DEFAULT);
@@ -340,6 +524,9 @@ struct VitGpuImpl {
 
     ~VitGpuImpl() {
         (void) cudaSetDevice(device);
+#if defined(STRATA_VIT_HIPBLASLT)
+        lt_close();
+#endif
         for (void* p : allocs) (void) cudaFree(p);
         if (blas) cublasDestroy(blas);
     }
@@ -402,9 +589,26 @@ struct VitGpuImpl {
     // y[M][N] (float32) = A[M][K] (kind of w) * w^T
     bool gemm(const DevW& w, const void* A, int M, void* y, cudaDataType_t kind_a, std::string& err) {
         const float alpha = 1.0f, beta = 0.0f;
-        const cublasStatus_t s = cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, w.rows, M, w.cols, &alpha, w.p, kind_a, w.cols, A, kind_a, w.cols, &beta, y,
-                                              CUDA_R_32F, w.rows, VIT_COMPUTE_32F, VIT_GEMM_DEFAULT);
-        if (s != CUBLAS_STATUS_SUCCESS) { err = "the BLAS matrix product failed (status " + std::to_string((int) s) + ")"; return false; }
+        bool done = false;
+#if defined(STRATA_VIT_HIPBLASLT)
+        if (lt_weights && kind_a != CUDA_R_32F)
+            done = lt_mm(true, false, w.rows, M, w.cols, w.p, kind_a, w.cols, 0, A, kind_a, w.cols, 0, y, CUDA_R_32F, w.rows, 0, 1, lt_sol);
+#endif
+#if defined(STRATA_VIT_HIP)
+        if (!done && hpa16 && kind_a != CUDA_R_32F && (size_t) M * w.rows <= y16_elems) {
+            const cublasStatus_t s = cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, w.rows, M, w.cols, &alpha, w.p, kind_a, w.cols, A, kind_a, w.cols, &beta, d_y16,
+                                                  kind_a, w.rows, VIT_COMPUTE_32F, VIT_GEMM_DEFAULT);
+            if (s != CUBLAS_STATUS_SUCCESS) { err = "the BLAS matrix product failed (status " + std::to_string((int) s) + ")"; return false; }
+            const size_t cnt = (size_t) M * w.rows;
+            k_widen16<<<blocks_for(cnt), 256>>>(d_y16, cnt, (float*) y, kind_a == CUDA_R_16F ? (int) K_F16 : (int) K_BF16);
+            done = true;
+        }
+#endif
+        if (!done) {
+            const cublasStatus_t s = cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, w.rows, M, w.cols, &alpha, w.p, kind_a, w.cols, A, kind_a, w.cols, &beta, y,
+                                                  CUDA_R_32F, w.rows, VIT_COMPUTE_32F, VIT_GEMM_DEFAULT);
+            if (s != CUBLAS_STATUS_SUCCESS) { err = "the BLAS matrix product failed (status " + std::to_string((int) s) + ")"; return false; }
+        }
         if (round_out && w.kind != K_F32) {   // the result as ggml's GPU path keeps it: 16 bits (its inputs are 16 bits here already)
             const size_t n = (size_t) M * w.rows;
             k_round<<<blocks_for(n), 256>>>((float*) y, n, (int) w.kind);
@@ -443,6 +647,12 @@ struct VitGpuImpl {
         bool ok = alloc(d_x, N * D, err, false) && alloc(d_ctx, ctx_elems, err, false) && alloc(d_y, R * std::max<size_t>(3 * D, F), err, false) &&
                   alloc(d_a, R * D, err, false) && alloc(d_f16, R * F, err, false) &&
                   alloc(d_q16, N * D, err, false) && alloc(d_k16, N * D, err, false) && alloc(d_v16, N * D, err, false);
+#if defined(STRATA_VIT_HIP)
+        d_y16 = d_pv16 = nullptr;
+        y16_elems = pv16_elems = 0;
+        if (ok && hpa16) { y16_elems = R * std::max<size_t>(3 * D, F); ok = alloc(d_y16, y16_elems, err, false); }
+        if (ok && hpa16_att) { pv16_elems = N * D; ok = alloc(d_pv16, pv16_elems, err, false); }
+#endif
         if (ok && !alloc(d_S, sp_elems, err, false)) {
             // no room for the large chunk (a small card, or the engine beside the reader): the 16 MB chunk instead, slower, never an error
             ok = false;
@@ -476,16 +686,12 @@ bool VitGpu::prefer_mtmd(bool bf16_matrices, int max_tokens, std::string& why) {
     (void) bf16_matrices;
     (void) max_tokens;
     if (hipGetDeviceProperties(&p, 0) != hipSuccess) { (void) hipGetLastError(); return false; }
-    if (vit_gpu_slower_amd(p.gcnArchName)) {
-        why = std::string(p.gcnArchName) + ": rocBLAS has only fallback kernels there, the own GPU tower is slower than mtmd";
-        return true;
-    }
 #ifdef _WIN32
     const bool windows = true;
 #else
     const bool windows = false;
 #endif
-    if (vit_gpu_hip_windows_not_measured(windows)) {
+    if (vit_gpu_hip_windows_not_measured(windows, p.gcnArchName)) {
         why = std::string(p.gcnArchName) + " on Windows: the own HIP tower is not measured with the Windows ROCm package yet, mtmd stays";
         return true;
     }
@@ -515,10 +721,29 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
         if (cudaGetDeviceProperties(&p, device) == cudaSuccess && p.major == 6) pascal = m.bf16_as_f16 = true;
         (void) cudaGetLastError();
     }
+#else
+    {   // gfx1151 (Strix Halo): every product with a 16-bit result and float32 accumulation, BF16 matrices held as F16, so all of them run rocBLAS's tuned
+        // HH_HPA kernels (F16 results, 10-bit mantissa).  Strix, 18 pictures at 1,024 tokens: Qwen3.8 0.54-0.83 of mtmd-HIP's time (median 0.66), Qwen3.6
+        // 0.57-0.91 (median 0.67), rule 1 and 2 pass on both, byte-identical in and across processes; the BF16 results of BB_HPA missed rule 1 on 3 of the
+        // Qwen3.8 pictures and rule 2 on 3 (RESULTS-OWN-3V.md PART F2/F3).  STRATA_VIT_HPA16, STRATA_VIT_HPA16_ATT and STRATA_VIT_BF16_AS_F16 = 0 turn each off.
+        hipDeviceProp_t p;
+        if (hipGetDeviceProperties(&p, device) == hipSuccess && vit_gpu_is_gfx1151(p.gcnArchName)) m.bf16_as_f16 = m.hpa16 = m.hpa16_att = true;
+        (void) hipGetLastError();
+    }
 #endif
     if (const char* e = std::getenv("STRATA_VIT_BF16_AS_F16")) m.bf16_as_f16 = std::atoi(e) != 0;
     if (cudaSetDevice(device) != cudaSuccess) { err = std::string("cannot use GPU ") + std::to_string(device) + ": " + cudaGetErrorString(cudaGetLastError()); return false; }
     if (cublasCreate(&m.blas) != CUBLAS_STATUS_SUCCESS) { err = "cannot create the BLAS handle"; return false; }
+#if defined(STRATA_VIT_HIPBLASLT)
+    m.lt_setup();
+#endif
+#if defined(STRATA_VIT_HIP)
+    if (const char* e = std::getenv("STRATA_VIT_HPA16")) m.hpa16 = std::atoi(e) != 0;
+    if (const char* e = std::getenv("STRATA_VIT_HPA16_ATT")) m.hpa16_att = std::atoi(e) != 0;
+    if (m.hpa16 || m.hpa16_att)
+        std::fprintf(stderr, "vit-hpa16: 16-bit results with float32 accumulation for %s%s%s\n", m.hpa16 ? "the weight products" : "",
+                     m.hpa16 && m.hpa16_att ? " and " : "", m.hpa16_att ? "the attention's P*V product" : "");
+#endif
     // the patch embedding: the two temporal taps summed, kept in float32 (a small matrix)
     {
         const GgufTensorInfo* t0 = gg.tensor("v.patch_embd.weight");
