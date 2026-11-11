@@ -62,7 +62,7 @@ namespace {
 namespace si = strata::image;
 
 // The save's rotation: the REGULAR Hadamard, kron(H4, H4, ...) with H4 below, normalized - not Sylvester's
-// ((-1)^popcount(r & c)), which is XeStrata's qi_rows_i8 and gives a different basis.  `v` is rotated in place, in
+// ((-1)^popcount(r & c)), which is XeStrata's kernels::rows_i8 and gives a different basis.  `v` is rotated in place, in
 // blocks of `block` (a power of 4: 256 here).
 void hadamard(float* v, int64_t n, int64_t block) {
     if (block <= 1) return;

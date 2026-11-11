@@ -418,7 +418,8 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/mma_gemm.cpp src/kernels/xe/iq_mmq.cpp src/kernels/xe/prompt_attn.cpp
                                     src/kernels/xe/flash_attn.cpp src/kernels/xe/flash_attn_bwd.cpp
                                     src/kernels/xe/flash_attn_i8.cpp
-                                    src/kernels/xe/i8_gemm.cpp src/kernels/xe/sdpa_aotriton.cpp
+                                    src/kernels/xe/i8_gemm.cpp src/kernels/xe/rows_i8.cpp
+                                    src/kernels/xe/sdpa_aotriton.cpp
                                     src/kernels/xe/matrix_report.cpp src/kernels/xe/glm5.cpp
                                     src/kernels/xe/draft_head.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_ngram)
@@ -1285,6 +1286,10 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(i8_gemm_parity PRIVATE strata_image)
   add_test(NAME i8_gemm_parity COMMAND i8_gemm_parity)
   set_tests_properties(i8_gemm_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+  add_executable(gemm_w8a8_llm_parity src/prefill/gemm_w8a8_llm_parity.cpp)
+  target_link_libraries(gemm_w8a8_llm_parity PRIVATE strata_prefill)
+  add_test(NAME gemm_w8a8_llm_parity COMMAND gemm_w8a8_llm_parity)
+  set_tests_properties(gemm_w8a8_llm_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
   add_executable(strata-image-mf-probe src/image/mf_probe.cpp)
   target_link_libraries(strata-image-mf-probe PRIVATE strata_image)
   add_executable(strata-image-seedvr2-probe src/upscale/seedvr2_probe.cpp)

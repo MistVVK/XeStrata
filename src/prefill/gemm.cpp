@@ -9,6 +9,7 @@
 #include "strata/platform/downgrade.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/i8_gemm.hpp"
+#include "strata/kernels/rows_i8.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/core/gpu.hpp"
@@ -37,6 +38,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <new>
+#include <type_traits>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -447,6 +450,8 @@ Gemm::~Gemm() {
     if (!external_ && scratch_) strata::gpu::free(scratch_);
     if (tc_w_) strata::gpu::free(tc_w_);
     if (tc_x_) strata::gpu::free(tc_x_);
+    for (void* p : {(void*) w8_x_, (void*) w8_sx_, (void*) w8_w_, (void*) w8_sw_})
+        if (p) strata::gpu::free(p);
 }
 
 void Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems) {
@@ -816,15 +821,41 @@ bool w8_fused(void* stream) {
 }
 }  // namespace
 
-// The LLMs' dense prompt products do not come here yet: they take native (the GGUF blocks dequantized to FP16, the FP16
-// product), whose readers take FP32 rows.  Timed against this entry on synthetic data (2026-11-11, the rows to int8
-// with qi_rows_i8's rotation, the best of five after a warm-up), Qwen3.8-Flash-Next's attn_qkv (2560 -> 10240, IQ4_XS)
-// at 8192 rows: the RTX 4070 6.93 ms native, 2.36 with the weight made int8 at each call and BF16 out, 3.50 with FP32
-// out; at 1024 rows 1.07, 0.81, 0.45 resident.  The B70: 2.76 native, 1.84 made at each call (BF16 out), 1.47 with the
-// int8 weight resident, 2.47 with FP32 out; at 1024 rows 0.72 native, 0.73 made at each call.  Narrow products
-// (Qwen3.8's shared expert, 2560 -> 640) were slower in W8A8 from 4096 rows on the B70.  Taking it needs the rotated
-// rows' quantizer (image::qi_rows_i8) where the prompt paths reach it, the choice timed a shape at a time for the LLMs'
-// products only (a DiT's FP16 form stays FP16), and the answers checked by KL: the answers change.
+// Whether the LLMs' dense prompt products take the W8A8 form (Gemm::native_llm): off by default, an opt-in
+// (XESTRATA_LLM_W8A8=1).  The form is faster where the int8 product is (the RTX 4070: the three representative shapes
+// at 4096 rows, native 8.1 to 8.8 ms against W8A8 4.7 to 4.8; the Qwen3.5-9B prompt 32K 3245 -> 5462 tok/s, 4K
+// 3340 -> 5842; the B70's 4 to 6% edge on the products, 3.77 to 3.81 against 3.57 to 3.62, did not survive a 5%
+// margin from run to run and is within a 15% one), but its answers are an approximation, and the KL against the
+// floor of the same binary's runs (2026-11-12, 64 teacher-forced positions of the 1K and 32K prompts, top-64,
+// tools/quant_quality.py compare) passed the task's bar (top-1 at the floor's or above, mean KL within three times
+// the floor's) nowhere the form was taken: the RTX 4070's 32K, Qwen3.8-Flash-Next KL 0.00955 top-1 100% (the floor
+// 0 / 100%), Qwen3.6-35B-A3B 0.04622 / 89.06% (0 / 100%), Qwen3.5-9B 0.00411 / 96.88% (the BLAS floor 0.00107 /
+// 100%, 3.8 times it).  So it is not the default; a user who accepts the approximation takes it with the
+// environment variable.  The B70 keeps native either way at the default; with the variable set it takes the form
+// too (its products 4 to 6% faster).  The timed choice of the commits dd3cfe58f / 09dc382e8 (once a GPU, three
+// shapes, native preferred with a 15% margin) picked W8A8 on the RTX 4070 and native on the B70 stably; it is gone
+// with the default off, to be restored from those commits if the bar is ever relaxed.
+bool Gemm::llm_w8a8(void* stream) {
+    static const bool on = [] {
+        const char* e = strata::env_get("LLM_W8A8");
+        return e != nullptr && std::strtol(e, nullptr, 10) != 0;
+    }();
+    return on && Gemm::i8_usable(stream);
+}
+
+// The LLMs' dense prompt products take the W8A8 form through native_llm (their callers only: a DiT's FP16 products
+// stay FP16).  Timed on synthetic data (2026-11-11, K5's probe, the rows to int8 with the rotation, the weight made
+// int8 at each call, FP32 out as the LLMs' readers take it), Qwen3.8-Flash-Next's attn_qkv (2560 -> 10240, IQ4_XS)
+// at 8192 rows: the RTX 4070 6.93 ms native against about 3.9 W8A8 (2.36 with BF16 out, 3.50 with the weight's int8
+// rows resident), at 1024 rows 1.07 against 0.81.  The B70: 2.76 native against about 2.8 (1.84 with BF16 out, 1.47
+// resident), at 1024 rows 0.72 against 0.73.  The whole form timed on the three representative shapes (2026-11-12)
+// put the B70's W8A8 4 to 6% ahead of native (3.77 to 3.81 ms against 3.57 to 3.62).  Making it faster on the B70
+// needs a BF16 reader (every kernel downstream of the products) or the weights' int8 rows resident (several GiB of
+// VRAM for a whole model's dense weights, in the budget): not taken here.  The form is an opt-in
+// (XESTRATA_LLM_W8A8=1, the KL numbers at llm_w8a8 above).  Narrow
+// products (the shared experts, N 512 and 640) were slower in W8A8 from 4096 rows on the B70 (0.21 -> 0.28 ms at
+// 8192 rows), so native_llm takes only N >= 1024; below 1024 rows the weight's conversion outweighs the product
+// (the B70's attn_qkv at 512 rows: 0.74 native, 0.73 W8A8 with BF16 out, more with FP32's).
 bool Gemm::w8a8(const int8_t* X, const float* sx, const int8_t* W, const float* sw, const float* bias, void* Y,
                 int64_t T, int64_t N, int64_t K, int64_t ldy, bool bf16_out, void* stream) {
     if (T <= 0 || N <= 0) return false;
@@ -933,6 +964,58 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     with_f16(ggml_type, W_blocks, N, K, [&](const uint16_t* w, int64_t r0, int64_t n) {
         f16(X, w, Y + r0, T, n, K, ldy, half_sums);
     });
+}
+
+void Gemm::native_w8a8(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N,
+                       int64_t K, int64_t ldy) {
+    if (ldy <= 0) ldy = N;
+    const auto grow = [this](auto*& p, int64_t& have, int64_t want) {
+        if (have >= want) return true;
+        if (p) {
+            strata::gpu::stream_sync(stream_);   // the products queued on the old buffer
+            strata::gpu::free(p);
+        }
+        p = static_cast<std::remove_reference_t<decltype(p)>>(strata::gpu::alloc_device((size_t) want * sizeof(*p)));
+        have = p ? want : 0;
+        return p != nullptr;
+    };
+    if (!grow(w8_x_, w8_x_elems_, T * K) || !grow(w8_sx_, w8_sx_elems_, T) || !grow(w8_w_, w8_w_elems_, N * K) ||
+        !grow(w8_sw_, w8_sw_elems_, N))
+        throw std::runtime_error("prefill gemm: no GPU memory for the W8A8 prompt products' scratch");
+    // the weight's int8 rows: straight from the blocks where the quantizer takes their type, else through the FP16
+    // scratch (in row slices where the weight is larger than it, as with_f16)
+    if (!strata::kernels::rows_i8_blocks(ggml_type, W_blocks, N, K, w8_w_, w8_sw_, stream_)) {
+        if (ggml_type == 1) {   // F16 rows: the quantizer takes them as they are
+            strata::kernels::rows_i8(static_cast<const uint16_t*>(W_blocks), false, N, K, w8_w_, w8_sw_, nullptr,
+                                     stream_);
+        } else {
+            // STRATA_DEQUANT_SIDE's side stream may be dequantizing into the scratch: wait for it (the serial form)
+            if (side_scratch_) strata::gpu::stream_sync(side_stream_);
+            const int64_t rows = std::min(N, scratch_elems_ / K / 16 * 16);
+            if (rows <= 0) throw std::runtime_error("prefill gemm: scratch too small for a W8A8 weight's rows");
+            for (int64_t r0 = 0; r0 < N; r0 += rows) {
+                const int64_t n = std::min(rows, N - r0);
+                strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
+                strata::kernels::rows_i8(scratch_, false, n, K, w8_w_ + r0 * K, w8_sw_ + r0, nullptr, stream_);
+            }
+        }
+    }
+    strata::kernels::rows_i8(X, false, T, K, w8_x_, w8_sx_, nullptr, stream_);
+    w8a8(w8_x_, w8_sx_, w8_w_, w8_sw_, nullptr, Y, T, N, K, ldy, false, stream_);
+    strata::kernels::i8_scale(Y, T, N, ldy, w8_sx_, w8_sw_, nullptr, nullptr, stream_);
+}
+
+void Gemm::native_llm(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N,
+                      int64_t K, int64_t ldy, bool half_sums) {
+    // the shapes the W8A8 form was measured faster for (the comment at w8a8): wide products of many rows, K in whole
+    // rotation groups.  The rest stay native: the narrow shared experts (N 512, 640) slower from 4096 rows on the
+    // B70, the weight's conversion outweighing the product below 1024 rows
+    if (T >= 1024 && N >= 1024 && K % strata::kernels::kI8Rotate == 0 && ggml_type != 0 && W_blocks != nullptr &&
+        llm_w8a8(stream_)) {
+        native_w8a8(X, ggml_type, W_blocks, Y, T, N, K, ldy);
+        return;
+    }
+    native(X, ggml_type, W_blocks, Y, T, N, K, ldy, half_sums);
 }
 
 bool Gemm::half_ok(void* stream) {

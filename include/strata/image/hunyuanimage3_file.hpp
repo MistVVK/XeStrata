@@ -10,7 +10,7 @@
 //     `weight_scale` F32 [E][N][1], one scale a row; K's groups of `convrot_groupsize` (256) were rotated when the
 //     file was made (W_rot = W @ H^T a group), so the *activations* are rotated alike before the product:
 //     x W^T = (x H) (W H)^T for H orthogonal.  THE ROTATION IS NOT SYLVESTER'S: it is the **regular** Hadamard,
-//     kron(H4, H4, H4, H4) with H4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]] / 2, which XeStrata's qi_rows_i8
+//     kron(H4, H4, H4, H4) with H4 = [[1,1,1,-1],[1,1,-1,1],[1,-1,1,1],[-1,1,1,1]] / 2, which XeStrata's kernels::rows_i8
 //     does not use (that one is (-1)^popcount(r & c) / sqrt(b)); the two disagree, and rotating with the wrong one
 //     gives plausible-looking noise (cos 0.05, measured 2026-10-23).  h5/H4 is symmetric, so H^T = H.
 //   * `asym_w4a8_int8` (46.9 GB, the default): `weight` I8 [E][N][K/2] (two 4-bit codes a byte),

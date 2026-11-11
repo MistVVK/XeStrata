@@ -442,7 +442,7 @@ void w8_product(const uint16_t* x16, int64_t T, const Product& P, float* y, int8
     dit_rows::rows_i8(dit_rows::HalfI8<true>{x16, K}, T, K, x8, sx, stream);
     if (w8_int8(stream)) {
         prefill::Gemm::w8a8(x8, sx, P.w8, P.sw, nullptr, y, T, N, K, N, false, stream);
-        qi_i8_scale(y, T, N, N, sx, P.sw, nullptr, nullptr, stream);
+        kernels::i8_scale(y, T, N, N, sx, P.sw, nullptr, nullptr, stream);
         return;
     }
     // no int8 products: the same int8 values (the input's and the weight's, both in the rotated basis) as FP16

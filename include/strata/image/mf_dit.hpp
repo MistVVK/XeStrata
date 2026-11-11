@@ -15,7 +15,7 @@
 // With q8 each block is quantized to 8 bits on the host as it is read, once, and the file's pages are dropped from the
 // page cache: half the VRAM and the bytes a streamed block moves.  Where the GPU's library takes int8 products (prefill::Gemm::i8_usable) the
 // weights are rotated in groups and quantized with a scale a row, and so are the activations a token at each product
-// (W8A8, qi_rows_i8: the form of Comfy-Org's int8_convrot weights, the rotation spreading the outlier channels below);
+// (W8A8, kernels::rows_i8: the form of Comfy-Org's int8_convrot weights, the rotation spreading the outlier channels below);
 // elsewhere as Q8_0, the products dequantizing it to FP16 each time.  Without q8 the bf16 bytes
 // go from the mapped file to the GPU as they are and are rewritten there to FP16 in place (the same two bytes, the few
 // values past FP16's range saturated), which the products take as they are: no dequantization, the matrix units fed

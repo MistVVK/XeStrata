@@ -698,7 +698,7 @@ MfOut Seedvr2Dit::product_out(const uint16_t* x16, const float* rs, const W& w, 
 void Seedvr2Dit::product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
                          const float* bias) {
     const MfOut o = product_out(x16, rs, w, base, y, T, bias, false);
-    if (o.i != nullptr) image::qi_i8_scale(y, T, w.n, w.n, o.sx, o.sw, bias, nullptr, s_);
+    if (o.i != nullptr) kernels::i8_scale(y, T, w.n, w.n, o.sx, o.sw, bias, nullptr, s_);
     else if (rs != nullptr || bias != nullptr) rows::rows_back(y, rs, bias, T, w.n, s_);
 }
 

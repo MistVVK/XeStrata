@@ -1118,7 +1118,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
         return !hooked && T < dense_native_rows_ && prompt_dense_int8(w, x, ldx, y, T, ldy);
     };
     auto proj = [&](const W& w, float* y, int64_t T, int64_t ldy = 0, bool half_sums = false) {
-        gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy, half_sums);
+        gm.native_llm(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy, half_sums);
     };
     // the routed experts in their quantized blocks (int8 products, iq_mmq: on the matrix engines, else by dp4a where the
     // FP16 products have none either) where every layer's types are theirs (prompt_int8, decided with the buffers) and

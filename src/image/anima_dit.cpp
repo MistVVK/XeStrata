@@ -450,7 +450,7 @@ MfOut AnimaDit::product(const uint16_t* x16, const float* rs, const W& w, const 
         float* scales = reinterpret_cast<float*>(xq8_ + xq8_rows_ * xq8_cols_);
         if (!same_input) xs_next_ ^= 1;
         float* sx = scales + xs_next_ * xq8_rows_;
-        if (!same_input) qi_rows_i8(x16, false, T, w.k, xq8_, sx, rs, s_);
+        if (!same_input) kernels::rows_i8(x16, false, T, w.k, xq8_, sx, rs, s_);
         const auto* sw = reinterpret_cast<const float*>(d + w.n * w.k);
         // a reader's values as BF16 where the fused kernel is the faster (prefill::Gemm::w8a8): half the bytes it reads
         if (prefill::Gemm::w8a8(xq8_, sx, reinterpret_cast<const int8_t*>(d), sw, bias, y, T, w.n, w.k, w.n,
@@ -467,7 +467,7 @@ MfOut AnimaDit::product(const uint16_t* x16, const float* rs, const W& w, const 
             out.b = bias;
             return out;
         }
-        qi_i8_scale(y, T, w.n, w.n, sx, sw, oft ? nullptr : bias, col, s_);
+        kernels::i8_scale(y, T, w.n, w.n, sx, sw, oft ? nullptr : bias, col, s_);
     } else {
         if (w.type == kTypeF16) gemm_.f16(x16, reinterpret_cast<const uint16_t*>(d), y, T, w.n, w.k);
         else gemm_.native(x16, w.type, d, y, T, w.n, w.k);
@@ -494,11 +494,11 @@ void AnimaDit::add_glora(const LoraLayer* lora, const uint16_t* x16, const float
 void AnimaDit::glora_weight(const uint16_t* v, const W& w, const uint8_t* d, int64_t r0, int64_t n, int64_t nt,
                             int64_t t0, float* y) {
     if (w.type == kTypeW8) {
-        qi_rows_i8(v, false, nt, w.k, lora_glora_x8_, lora_glora_sx_, nullptr, s_);
+        kernels::rows_i8(v, false, nt, w.k, lora_glora_x8_, lora_glora_sx_, nullptr, s_);
         const auto* sw = reinterpret_cast<const float*>(d + w.n * w.k) + r0;
         prefill::Gemm::w8a8(lora_glora_x8_, lora_glora_sx_, reinterpret_cast<const int8_t*>(d) + r0 * w.k, sw, nullptr,
                             lora_glora_y_, nt, n, w.k, n, false, s_);
-        qi_i8_scale(lora_glora_y_, nt, n, n, lora_glora_sx_, sw, nullptr, nullptr, s_);
+        kernels::i8_scale(lora_glora_y_, nt, n, n, lora_glora_sx_, sw, nullptr, nullptr, s_);
     } else if (w.type == kTypeF16) {
         gemm_.f16(v, reinterpret_cast<const uint16_t*>(d) + r0 * w.k, lora_glora_y_, nt, n, w.k, n);
     } else {

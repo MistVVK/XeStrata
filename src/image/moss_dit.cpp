@@ -45,7 +45,7 @@ namespace moss_dit_detail {
 
 using namespace dit_rows;
 
-// kTypeW8: int8 rows rotated as qi_rows_i8 rotates them, then a scale a row (FP32), for prefill::Gemm::i8
+// kTypeW8: int8 rows rotated as kernels::rows_i8 rotates them, then a scale a row (FP32), for prefill::Gemm::i8
 constexpr int kTypeF16 = 1, kTypeQ8_0 = 8, kTypeW8 = -8;
 constexpr float kEps = 1e-6f;
 
@@ -474,7 +474,7 @@ MfOut MossDit::product(const uint16_t* x16, const float* rs, const W& w, const u
         float* scales = reinterpret_cast<float*>(xq8_ + xq8_rows_ * xq8_cols_);
         if (!same_input) xs_next_ ^= 1;
         float* sx = scales + xs_next_ * xq8_rows_;
-        if (!same_input) qi_rows_i8(x16, false, T, w.k, xq8_, sx, rs, s_);
+        if (!same_input) kernels::rows_i8(x16, false, T, w.k, xq8_, sx, rs, s_);
         const auto* sw = reinterpret_cast<const float*>(d + w.n * w.k);
         // a reader's values as BF16 where the fused kernel is the faster (prefill::Gemm::w8a8): half the bytes it reads
         if (prefill::Gemm::w8a8(xq8_, sx, reinterpret_cast<const int8_t*>(d), sw, bias, y, T, w.n, w.k, w.n, defer,
@@ -494,7 +494,7 @@ MfOut MossDit::product(const uint16_t* x16, const float* rs, const W& w, const u
         // an OFT turns the weight's rows: the weight's own bias goes after it (the delta is the input's own, x16 =
         // x / rs, and the turn is of x16's units too)
         const bool oft = lora != nullptr && lora->has_oft();   // (a layer there: defer is off above)
-        qi_i8_scale(y, T, w.n, w.n, sx, sw, oft ? nullptr : bias, col, s_);   // sx carries the rows' scales: y is in
+        kernels::i8_scale(y, T, w.n, w.n, sx, sw, oft ? nullptr : bias, col, s_);   // sx carries the rows' scales: y is in
                                                                             // the input's units
         if (oft) {
             lora_scratch(T);
@@ -544,11 +544,11 @@ void MossDit::glora_weight(const uint16_t* v, const W& w, const uint8_t* d, int6
                            int64_t t0, float* y) {
     if (w.type == kTypeW8) {
         // the input's own int8 quantization (its buffer, not the product's: that one's is the other products' input)
-        qi_rows_i8(v, false, nt, w.k, lora_glora_x8_, lora_glora_sx_, nullptr, s_);
+        kernels::rows_i8(v, false, nt, w.k, lora_glora_x8_, lora_glora_sx_, nullptr, s_);
         const auto* sw = reinterpret_cast<const float*>(d + w.n * w.k) + r0;
         prefill::Gemm::w8a8(lora_glora_x8_, lora_glora_sx_, reinterpret_cast<const int8_t*>(d) + r0 * w.k, sw, nullptr,
                             lora_glora_y_, nt, n, w.k, n, false, s_);
-        qi_i8_scale(lora_glora_y_, nt, n, n, lora_glora_sx_, sw, nullptr, nullptr, s_);
+        kernels::i8_scale(lora_glora_y_, nt, n, n, lora_glora_sx_, sw, nullptr, nullptr, s_);
     } else if (w.type == kTypeF16) {
         gemm_.f16(v, reinterpret_cast<const uint16_t*>(d) + r0 * w.k, lora_glora_y_, nt, n, w.k, n);
     } else {

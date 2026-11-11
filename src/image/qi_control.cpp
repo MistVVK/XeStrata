@@ -180,7 +180,7 @@ bool QiControl::open(const std::string& path, QiDit& dit, std::string& err, bool
                         rows += t.shape[0];
                     }
                     if (src == nullptr) src = stacked.data();
-                    // W8A8's rows as qi_rows_i8 makes them, else Q8_0
+                    // W8A8's rows as kernels::rows_i8 makes them, else Q8_0
                     dit_rows::quantize_matrix(src, w.n, w.k, host.data() + at, w.w8);
                 }
                 spans.push_back({host.data() + at, wb, 0});

@@ -322,7 +322,7 @@ void QiDit::install_prepare() {
                     gpu::copy_async(gemm_.scratch(), p, (size_t) (w->n * w->k) * 2, s_);
                 else
                     kernels::dequant_f16(w->type, p, 0, w->n, w->k, gemm_.scratch(), s_);
-                qi_rows_i8(gemm_.scratch(), false, w->n, w->k, reinterpret_cast<int8_t*>(p),
+                kernels::rows_i8(gemm_.scratch(), false, w->n, w->k, reinterpret_cast<int8_t*>(p),
                            reinterpret_cast<float*>(p + w->n * w->k), nullptr, s_);
             }
             if (w->baked)
@@ -351,16 +351,16 @@ bool QiDit::product(const uint16_t* x16, const W& w, float* y, int64_t T, int64_
             sx = xs_ + (xs_next_ ^ 1) * xs_rows_;
         } else {
             x8 = xq8(T, w.k, &sx);
-            qi_rows_i8(x16, false, T, w.k, x8, sx, nullptr, s_);
+            kernels::rows_i8(x16, false, T, w.k, x8, sx, nullptr, s_);
         }
         const auto* w8 = static_cast<const uint8_t*>(w.d);
         const float* sw = reinterpret_cast<const float*>(w8 + w.n * w.k) + row0;
         if (w.w8t) {   // the weight's rows as int8 into the scratch, as install_prepare writes a w8 weight's
             float* s = w8t_s_ + w8t_next_ * w8t_rows_;
             w8t_next_ = (w8t_next_ + 1) % kW8tScales;
-            if (!qi_rows_i8_blocks(w.type, base, rows, w.k, w8t_, s, s_)) {
+            if (!kernels::rows_i8_blocks(w.type, base, rows, w.k, w8t_, s, s_)) {
                 kernels::dequant_f16(w.type, base, 0, rows, w.k, gemm_.scratch(), s_);
-                qi_rows_i8(gemm_.scratch(), false, rows, w.k, w8t_, s, nullptr, s_);
+                kernels::rows_i8(gemm_.scratch(), false, rows, w.k, w8t_, s, nullptr, s_);
             }
             w8 = reinterpret_cast<const uint8_t*>(w8t_) - row0 * w.k;
             sw = s;
@@ -376,7 +376,7 @@ bool QiDit::product(const uint16_t* x16, const W& w, float* y, int64_t T, int64_
                 i8_ = {sx, sw};
                 deferred = true;
             } else {
-                qi_i8_scale(y, T, rows, ldy, sx, sw, nullptr, col, s_);
+                kernels::i8_scale(y, T, rows, ldy, sx, sw, nullptr, col, s_);
             }
         }
     } else if (w.type == kTypeF16) {
@@ -944,11 +944,11 @@ void QiDit::glora_weight(const uint16_t* v, const W& w, int64_t r0, int64_t n, i
     const auto* d = static_cast<const uint8_t*>(w.d);
     if (w.w8 && !w.w8t) {   // a w8t weight's blocks take the native path below
         // the input's own int8 quantization (its buffer, not the product's: that one's is the other products' input)
-        qi_rows_i8(v, false, nt, w.k, lora_glora_x8_, lora_glora_sx_, nullptr, s_);
+        kernels::rows_i8(v, false, nt, w.k, lora_glora_x8_, lora_glora_sx_, nullptr, s_);
         const auto* sw = reinterpret_cast<const float*>(d + w.n * w.k) + r0;
         prefill::Gemm::w8a8(lora_glora_x8_, lora_glora_sx_, reinterpret_cast<const int8_t*>(d) + r0 * w.k, sw, nullptr,
                             lora_glora_y_, nt, n, w.k, n, false, s_);
-        qi_i8_scale(lora_glora_y_, nt, n, n, lora_glora_sx_, sw, nullptr, nullptr, s_);
+        kernels::i8_scale(lora_glora_y_, nt, n, n, lora_glora_sx_, sw, nullptr, nullptr, s_);
     } else if (w.type == kTypeF16) {
         gemm_.f16(v, reinterpret_cast<const uint16_t*>(d + (uint64_t) r0 * w.row_bytes), lora_glora_y_, nt, n, w.k, n);
     } else {

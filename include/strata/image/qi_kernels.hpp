@@ -9,6 +9,7 @@
 #pragma once
 
 #include "strata/image/product_store.hpp"
+#include "strata/kernels/rows_i8.hpp"
 
 #include <cstdint>
 #include <utility>
@@ -131,30 +132,12 @@ void qi_attention_bwd(const uint16_t* q16, const uint16_t* k16, const uint16_t* 
                       float* dK, float* dV, bool accumulate, prefill::Gemm& gemm, void* stream,
                       int64_t n_causal = 0, int64_t keys = 0);
 
-/// The group a W8A8 product's operands are rotated in (qi_rows_i8): K must be a multiple of it.
-constexpr int64_t kQiRotate = 256;
+/// The group a W8A8 product's operands are rotated in (kernels::rows_i8): K must be a multiple of it.
+constexpr int64_t kQiRotate = kernels::kI8Rotate;
 
-/// The operands of a W8A8 product (prefill::Gemm::i8): rows of K FP16 (or with bf16 BF16) values (K up to 32768 on a
-/// GPU of 1024-item work-groups), each group of kQiRotate times the normalized Hadamard matrix (orthogonal, so the
-/// product of two rotated operands is that of the originals; it spreads a channel's outliers over the group), then as
-/// int8 with a scale for the row: q [rows][K], s [rows], times rs [rows] where given (rows the caller scaled down).
-/// The weights' rows and the activations' tokens alike.
-void qi_rows_i8(const uint16_t* src, bool bf16, int64_t rows, int64_t K, int8_t* q, float* s, const float* rs,
-                void* stream);
-
-/// qi_rows_i8 of a matrix of GGUF blocks (`type`: Q4_K, Q5_K or Q6_K; K a multiple of 256) straight from the blocks,
-/// the int8 rows qi_rows_i8 makes of kernels::dequant_f16's output; false for another type (nothing is written).
-bool qi_rows_i8_blocks(int type, const void* blocks, int64_t rows, int64_t K, int8_t* q, float* s, void* stream);
-
-/// qi_rows_i8 of the SwiGLU's values (prefill::swiglu_pair's), from the gate_up product's int32 sums gu [T][2 inter]
+/// kernels::rows_i8 of the SwiGLU's values (prefill::swiglu_pair's), from the gate_up product's int32 sums gu [T][2 inter]
 /// (scaled by g): the down product's int8 input in one pass.
 void qi_swiglu_i8(const int32_t* gu, const QiI8& g, int64_t T, int64_t inter, int8_t* q, float* s, void* stream);
-
-/// y [T][N] (row stride ldy) holds a W8A8 product's int32 sums (their bits): y = sum * sx[t] * sw[n] + bias[n], in
-/// place (bias null: none).  col[n] (null: 1) is a DoRA's factor of the weight's row n: the product's part of y only,
-/// the bias not scaled.
-void qi_i8_scale(float* y, int64_t T, int64_t N, int64_t ldy, const float* sx, const float* sw, const float* bias,
-                 const float* col, void* stream);
 
 /// y [T][N] (row stride ldy) *= col[n], in place: a dense product's rows, scaled where a DoRA's c is not 1 (col is
 /// the weight's rows' factors, y's rows the weight's row0 on).

@@ -168,7 +168,7 @@ private:
         int64_t n = 0, k = 0;   // n rows of k
         const void* d = nullptr;
         uint64_t row_bytes = 0;
-        bool w8 = false;        // rewritten as int8 rows and a scale a row (qi_rows_i8) for prefill::Gemm::i8
+        bool w8 = false;        // rewritten as int8 rows and a scale a row (kernels::rows_i8) for prefill::Gemm::i8
         bool w8t = false;       // w8 through w8t_: a block format of fewer bits than int8's rows, kept as it is and
                                 // written as int8 rows into the scratch at each product
         LoraLayer* lora = nullptr;   // the adapters' deltas for its products (null: none: the product is unchanged)

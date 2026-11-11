@@ -83,6 +83,13 @@ public:
     /// f16's.
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, bool half_sums = false);
+    /// The LLMs' dense prompt products (Qwen3.8-Flash-Next's native_proj, the plain engine's proj): native, or the
+    /// W8A8 form (native_w8a8) with XESTRATA_LLM_W8A8=1 (off by default: the form's KL against the floor of the same
+    /// binary's runs passed the task's bar nowhere it was taken, llm_w8a8 in gemm.cpp) and the shape is a wide
+    /// product of many rows (T >= 1024, N >= 1024, K a multiple of kernels::kI8Rotate).  An approximation: the
+    /// answers change.  A DiT's products never come here: they take f16 / bf16 / w8a8 directly.
+    void native_llm(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N,
+                    int64_t K, int64_t ldy = 0, bool half_sums = false);
     /// native with FP16 sums into FP16 rows Y16 (row stride ldy), not widened into FP32: the reader takes them as they
     /// are (prefill::add_h, swiglu_pair_h), a pass over the sums fewer.  Where half_ok says no, the FP32 product
     /// narrowed into Y16 (the same rows, a pass more).
@@ -99,6 +106,9 @@ public:
     bool native_warm(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                      int64_t ldy = 0);
 
+    /// Whether the LLMs' dense prompt products take the W8A8 form: XESTRATA_LLM_W8A8=1 and the GPU takes int8
+    /// products (the comment at llm_w8a8 in gemm.cpp: off by default, the KL bar).
+    static bool llm_w8a8(void* stream);
     /// Loads the products' library ahead of the first prompt (oneMath's backend for the current GPU), on a thread of
     /// its own: call once for each GPU at startup.
     static void prepare();
@@ -128,6 +138,12 @@ public:
 
 private:
     template<class F> void with_f16(int ggml_type, const void* W_blocks, int64_t N, int64_t K, F prod);
+    /// native_llm's W8A8 form: the weight's GGUF blocks to int8 rows and a scale a row (kernels::rows_i8_blocks
+    /// where it takes their type, else dequant_f16 into the scratch and kernels::rows_i8), X's rows likewise, the
+    /// int32 product (w8a8, the reader takes FP32) and the scales back (kernels::i8_scale).  The int8 scratch is
+    /// grown on demand (as bf16_through_f16's), beside the prompt region's budget.
+    void native_w8a8(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N,
+                     int64_t K, int64_t ldy);
     bool bf16_through_f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy);
 
     void* stream_ = nullptr;
@@ -137,6 +153,12 @@ private:
     uint16_t* tc_w_ = nullptr;   // bf16_through_f16's FP16 images of W and of a slice of X, grown on demand
     uint16_t* tc_x_ = nullptr;
     int64_t tc_w_elems_ = 0, tc_x_elems_ = 0;
+    // native_w8a8's int8 scratch: X's rows and their scales, W's rows and their scales, grown on demand
+    int8_t* w8_x_ = nullptr;
+    float* w8_sx_ = nullptr;
+    int8_t* w8_w_ = nullptr;
+    float* w8_sw_ = nullptr;
+    int64_t w8_x_elems_ = 0, w8_sx_elems_ = 0, w8_w_elems_ = 0, w8_sw_elems_ = 0;
     // STRATA_DEQUANT_SIDE (set_dequant_side): the second scratch, the side stream and, per scratch, "the dequant
     // landed" (recorded on the side stream) and "the product read it" (recorded on the compute stream); side_cur_ is
     // the scratch the next native() dequantizes into (0: scratch_, 1: side_scratch_)

@@ -9,7 +9,7 @@
 //
 // The formulas are the ones the record's `hy3_conform.py` holds to Tencent's own modules
 // (records/2026-10-23-hunyuanimage3-plan/CONFORM-2026-10-24.md): the rotation is the REGULAR Hadamard
-// kron(H4,H4,H4,H4)/16, not the Sylvester one qi_rows_i8 uses; the RoPE turns column j and j + head_dim/2 by the
+// kron(H4,H4,H4,H4)/16, not the Sylvester one kernels::rows_i8 uses; the RoPE turns column j and j + head_dim/2 by the
 // SAME angle; SwiGLU silu's the second half; the qk-norm comes after the rope.
 #pragma once
 
