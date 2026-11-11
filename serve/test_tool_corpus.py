@@ -2,8 +2,8 @@
 
 Each specimen is the text a model wrote, the tools the request declared, and what a client must get: the calls (name and
 arguments), the answer text, the reasoning text.  The sources are named in each entry: the reporters' own examples in
-the issues, the Qwen3.8-Flash-Next form (`<tool_call><function=NAME><parameter=P>`), the drift shapes of the 1,462-turn
-corpus the recovery switch was written for, and DeepSeek-V4.1's DSML form.
+the issues, the Qwen3.8-Flash-Next form (`<tool_call><function=NAME><parameter=P>`) and the drift shapes of the 1,462-turn
+corpus the recovery switch was written for.
 
 Every specimen is read whole, one byte at a time, in pieces of 3 and 7 bytes, and cut in two at every byte; with
 streaming of the arguments on and off.  All of them must give the same events, and the streamed arguments of a call
@@ -19,7 +19,6 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from serve.dsml import DsmlOutputParser  # noqa: E402
 from serve.frontend import OutputParser  # noqa: E402
 
 
@@ -36,17 +35,6 @@ def qwen(name, **params):
     """The call as Qwen3.8-Flash-Next writes it (the chat template's own form)."""
     body = "".join(f"<parameter={k}>\n{v}\n</parameter>\n" for k, v in params.items())
     return f"<tool_call>\n<function={name}>\n{body}</function>\n</tool_call>"
-
-
-def dsml(*calls):
-    """DeepSeek-V4.1's DSML block: calls are (name, [(parameter, value, is_string)])."""
-    out = ["<｜DSML｜ calls>\n"]
-    for name, params in calls:
-        out.append(f'<｜DSML｜ invoke name="{name}">\n')
-        for k, v, is_str in params:
-            out.append(f'<｜DSML｜ parameter name="{k}" string="{str(is_str).lower()}">{v}</｜DSML｜ parameter>\n')
-        out.append("</｜DSML｜ invoke>\n")
-    return "".join(out) + "</｜DSML｜ calls>"
 
 
 NESTED = qwen("read", path="nested.txt")
@@ -197,30 +185,9 @@ add("drift-batch-in-one-wrapper", f"<tool_call>\n<function=write>\n{PW}\n<functi
     [("write", {"path": "a.md", "content": "hi"}), ("write", {"path": "b.md", "content": "hi"})], recover=True,
     tools=WRITE_TOOLS, source="corpus 0912870b / 51b155c9")
 
-# ---- DeepSeek-V4.1 (DSML) ---------------------------------------------------------------------------------------
-add("dsml-one-call", dsml(("write_file", [("path", "out.txt", True), ("content", "hello\nworld", True)])),
-    [("write_file", {"path": "out.txt", "content": "hello\nworld"})], parser="dsml", source="the model's own template")
-add("dsml-after-thinking", "Plan.</think>\n\n" + dsml(("read", [("path", "a.txt", True)])), [("read", {"path": "a.txt"})],
-    thinking=True, reasoning="Plan.", parser="dsml", source="a thinking turn")
-add("dsml-typed-arguments", dsml(("run_command", [("command", "make", True), ("timeout", "30", False)]),
-                                 ("todo_write", [("todos", TODO_OK, False)])),
-    [("run_command", {"command": "make", "timeout": 30}), ("todo_write", {"todos": json.loads(TODO_OK)})], parser="dsml",
-    source="string=\"false\" values are JSON")
-add("dsml-damaged-array", dsml(("todo_write", [("todos", TODO_STRAY, False)])), [("todo_write", {"todos": TODO_STRAY_WANT})],
-    notes=1, parser="dsml", source="#4427 shape inside DSML")
-add("dsml-several-calls-and-text", "Reading both.\n\n" + dsml(("read", [("path", "a.txt", True)]), ("read", [("path", "b.txt", True)])),
-    [("read", {"path": "a.txt"}), ("read", {"path": "b.txt"})], content="Reading both.", parser="dsml", source="a batch")
-add("dsml-value-holds-a-qwen-call", dsml(("write_file", [("path", "x.txt", True), ("content", NESTED, True)])),
-    [("write_file", {"path": "x.txt", "content": NESTED})], parser="dsml", source="#4078 shape in DSML")
-add("dsml-stray-think", "Quote:\n</think>\nmore thinking.\n</think>\n\n" + dsml(("read", [("path", "a.txt", True)])),
-    [("read", {"path": "a.txt"})], thinking=True, reasoning="Quote:\n", content="more thinking.", parser="dsml",
-    source="#4077 shape in DSML")
-add("dsml-cut-call", dsml(("read", [("path", "a.txt", True)]))[:60], finish="length", content=None,
-    parser="dsml", source="a DSML call cut by the token limit is no call (its text is the translator's, not checked)")
-
 
 def run(spec, pieces, stream_tools):
-    cls = DsmlOutputParser if spec["parser"] == "dsml" else OutputParser
+    cls = OutputParser
     p = cls(thinking=spec["thinking"], tools=spec["tools"], stream_tools=stream_tools, recover=spec["recover"],
             declared_only=True)
     evs = []

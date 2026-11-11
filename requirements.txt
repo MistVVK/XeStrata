@@ -11,7 +11,7 @@ pyyaml==6.0.3
 tqdm==4.70.1
 requests==2.34.2
 # 13.0.0 carries the fix for GHSA-78g4-xqwv-q3g8 (OpenJPEG heap overflow reachable from Image.open().load(), 11.1.0 to 12.3.0).
-# Pillow 13 needs Python 3.11; Python 3.10 stays on 12.3.0 and relies on serve/ds_pictures.py PICTURE_FORMATS (no JPEG 2000 decoder).
+# Pillow 13 needs Python 3.11; Python 3.10 stays on 12.3.0 and relies on serve/server.py PICTURE_FORMATS (no JPEG 2000 decoder).
 pillow==13.0.0; python_version >= "3.11"
 pillow==12.3.0; python_version < "3.11"
 psutil==7.2.2

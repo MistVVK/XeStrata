@@ -3,7 +3,7 @@
 DeepSeek-V4.1's tokenizer has no single token for Qwen's <|im_end|> / <|endoftext|>: it splits them into '<', '|', 'im', '_end',
 '|', '>' and 'end', 'of', 'text'.  A server that took the ids of those pieces as its stop ids (a config without "arch") ended the
 reply in front of the first "im" it wrote: Nerazim = N, er, az, im.  These tests keep three things true, for the OpenAI and the
-Anthropic route, streamed and not, with and without the family named:
+Anthropic route, streamed and not:
 
   * the reply that has no stop string comes out whole (every word that ends in a piece of a stop string or of an end marker);
   * a stop string cuts the reply exactly there, whatever the chunking;
@@ -26,7 +26,34 @@ import strata_tokenizer as ST  # noqa: E402
 from serve import frontend, server  # noqa: E402
 from serve.frontend import ChatTemplate  # noqa: E402
 from serve.server import ByteTokenizer, Detokenizer, Service, StopMatcher, end_token_ids, serve  # noqa: E402
-from serve.test_dsv41 import EOS, SPECIALS, TEMPLATE, DsEngine  # noqa: E402
+from serve.server import MockEngine  # noqa: E402
+
+# A tokenizer without Qwen's <|im_end|> / <|endoftext|> as single tokens (DeepSeek-V4.1's had none): its own specials, the 256 byte
+# tokens; the reply ends on its own end token (EOS).  The shipped template renders the prompt (its markers are bytes here).
+TEMPLATE = ROOT / "serve" / "chat_template.jinja"
+SPECIALS = [("<｜begin▁of▁sentence｜>", 3), ("<｜end▁of▁sentence｜>", 3), ("<｜User｜>", 3), ("<｜Assistant｜>", 3), ("<｜System｜>", 3),
+            ("<｜latest_reminder｜>", 3), ("<think>", 4), ("</think>", 4)]
+EOS = 1
+
+
+class DsEngine(MockEngine):
+    """Replays scripted completions as ids, then the tokenizer's end token."""
+
+    def __init__(self, tok, script, max_context=8192):
+        super().__init__(tok, script, max_context=max_context)
+        self.scripts = [tok.encode(x, parse_special=True) + [EOS] for x in ([script] if isinstance(script, str) else script)]
+        self.script = self.scripts[0]
+        self.last = {}
+
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        got = 0
+        try:
+            for t in super().generate(ids, max_new, sampling, cancel, embeddings):
+                got += 1
+                yield t
+        finally:
+            self.last = {"generated": got, "prompt_tokens": len(ids), "prompt_ms": 50.0, "decode_ms": got * 10.0,
+                         "finish": "stop"}
 
 QWEN_STOPS = ["<|im_end|>", "<|im_start|>", "<|endoftext|>", "\nUser:"]
 DEEPSEEK_STOPS = ["<｜end▁of▁sentence｜>", "<｜User｜>", "</s>", "\n\nHuman:"]
@@ -44,7 +71,7 @@ def nerazim_tokenizer() -> ST.Tokenizer:
     merges = ["e r", "a z", "i m", "_ e", "_e n", "_en d", "e n", "en d", "o f", "t e", "te x", "tex t"]
     tokens = [s for s, _ in SPECIALS] + [b2u[b] for b in range(256)] + extra
     types = [t for _, t in SPECIALS] + [1] * (256 + len(extra))
-    return ST.Tokenizer(tokens, merges, types, "deepseek3", {"bos": 0, "eos": EOS})
+    return ST.Tokenizer(tokens, merges, types, "qwen35", {"bos": 0, "eos": EOS})
 
 
 class Fixture(unittest.TestCase):
@@ -181,10 +208,7 @@ class Routes(Fixture):
             return engine
         engine = self.servers[named] = DsEngine(self.tok, script)
         engine.script = self.tok.encode(script) + [EOS]
-        svc = Service(engine, self.tok, ChatTemplate(TEMPLATE), model_name="deepseek-v4.1-flash")
-        if named:
-            svc.model_arch = "deepseek41"
-            svc.set_family("deepseek41")
+        svc = Service(engine, self.tok, ChatTemplate(TEMPLATE), model_name="m")
         httpd = serve(svc, port=0)
         self.addCleanup(httpd.server_close)
         self.addCleanup(httpd.shutdown)
@@ -236,7 +260,7 @@ class Routes(Fixture):
         self.bases = {}
 
     def every_route(self):
-        for named in (False, True):
+        for named in (False,):
             for route in ("openai", "anthropic"):
                 for stream in (False, True):
                     yield named, route, stream
