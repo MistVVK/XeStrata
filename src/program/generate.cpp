@@ -14194,8 +14194,10 @@ int main(int argc, char** argv) {
                         policy.set_fixed_costs(cf.tables[(size_t) k].data(), (int) cf.tables[(size_t) k].size(), k);
                         sizes += (sizes.empty() ? "" : ", ") + std::to_string(cf.tables[(size_t) k].size());
                     }
-                std::fprintf(stderr, "strata serve: draft costs: this machine's table is used (%s; window sizes %s): the same request "
-                                     "gives the same tokens on every start\n", o.draft_costs.c_str(), sizes.c_str());
+                if (cf.cpu_share >= 0.0) strata::prefill::Prefill::fix_cpu_share(cf.cpu_share);
+                std::fprintf(stderr, "strata serve: draft costs: this machine's table is used (%s; window sizes %s%s): the same request "
+                                     "gives the same tokens on every start\n", o.draft_costs.c_str(), sizes.c_str(),
+                             cf.cpu_share >= 0.0 ? ("; CPU prompt share " + std::to_string(cf.cpu_share).substr(0, 4)).c_str() : "");
             } else {
                 policy.set_learning(true);
                 dc_learning = true;
@@ -19551,8 +19553,17 @@ int main(int argc, char** argv) {
                     cf.key = dc_key;
                     for (int k = 0; k < strata::spec::CostLearner::kCtxBuckets; ++k)
                         cf.tables[(size_t) k] = policy.learner().table(k, kDraftCostMinN);
+                    // the CPU prompt share, when it is on and balancing from measured times: its balance as measured so far, to a 0.05
+                    // step (0.5 when no short prompt has measured it yet: on an RTX A6000 a fixed 0.5 read a 981-token chunk as fast as the
+                    // balancing share, 1,001-1,009 against 995-997 ms); fixed from now on like the table
+                    if (strata::prefill::Prefill::cpu_share_balancing()) {
+                        const strata::prefill::PrefillStats& pst = sp.stats();
+                        const double s = pst.cpu_share_readings > 0 ? pst.cpu_share_balanced : 0.5;
+                        cf.cpu_share = std::clamp(std::round(s * 20.0) / 20.0, 0.05, 0.9);
+                    }
                     std::string why;
                     const bool saved = strata::spec::write_cost_file(o.draft_costs, cf, why);
+                    if (cf.cpu_share >= 0.0) strata::prefill::Prefill::fix_cpu_share(cf.cpu_share);
                     for (int k = 0; k < strata::spec::CostLearner::kCtxBuckets; ++k)
                         if (!cf.tables[(size_t) k].empty())
                             policy.set_fixed_costs(cf.tables[(size_t) k].data(), (int) cf.tables[(size_t) k].size(), k);
@@ -19563,6 +19574,10 @@ int main(int argc, char** argv) {
                     char b[24];
                     for (size_t i = 0; i < cf.tables[0].size(); ++i) {
                         std::snprintf(b, sizeof b, "%s%.2f", i ? "," : "", cf.tables[0][i]);
+                        t0 += b;
+                    }
+                    if (cf.cpu_share >= 0.0) {
+                        std::snprintf(b, sizeof b, "; CPU prompt share %.2f", cf.cpu_share);
                         t0 += b;
                     }
                     std::fprintf(stderr, "strata serve: draft costs: this machine's table is learned (%s); it is fixed from the next request "

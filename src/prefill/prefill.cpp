@@ -289,6 +289,10 @@ inline int64_t stream_all_min() {
 // STRATA_PREFILL_CPU_SHARE=0 turns it off: the output is then the 0.1.40.3 bytes.  g_share_default is set by
 // Prefill::arm_cpu_share(.., true) from the paths that qualify; the layer split and batch slots stay off, and HIP except a single gfx12 card (AMD-Q, arm_cpu_share).
 bool g_share_default = false;
+// Prefill::fix_cpu_share (--draft-costs, repeatable output): a share learned once on this machine, used like a fixed
+// STRATA_PREFILL_CPU_SHARE while the variable is unset and the default share is armed: no measured time then changes
+// which experts the CPU takes (the balance's EMA and the per-layer gate are both skipped, as with the variable).
+double g_share_fixed = -1.0;
 inline double cpu_share_explicit() {   // -2: the variable is not set; -1: measured
     static const double v = [] {
         const char* e = std::getenv("STRATA_PREFILL_CPU_SHARE");
@@ -300,7 +304,7 @@ inline double cpu_share_explicit() {   // -2: the variable is not set; -1: measu
 }
 inline double cpu_share_env() {   // -1: measured
     const double v = cpu_share_explicit();
-    return v == -2.0 ? (g_share_default ? -1.0 : 0.0) : v;
+    return v == -2.0 ? (g_share_default ? (g_share_fixed >= 0.0 ? g_share_fixed : -1.0) : 0.0) : v;
 }
 inline bool cpu_share_on() { return cpu_share_env() != 0.0; }
 // STRATA_PF_PEER_CPU=1 (opt-in): the share also runs beside a peer GPU (--peer-device), which it otherwise leaves off.  It
@@ -3005,6 +3009,10 @@ void Prefill::arm_cpu_share(bool applies, bool by_default) {
 }
 
 void Prefill::set_share_blocked(bool blocked) { g_share_blocked.store(blocked, std::memory_order_release); }
+
+void Prefill::fix_cpu_share(double share) { g_share_fixed = share >= 0.0 ? std::clamp(share, 0.0, 1.0) : -1.0; }
+
+bool Prefill::cpu_share_balancing() { return cpu_share_env() < 0.0; }
 bool Prefill::ring_bytes_enabled() { return ring_bytes_on(); }
 size_t Prefill::slot_guard_bytes() { return mmq::direct_slot_guard(); }
 
@@ -4952,6 +4960,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 m.cpu_c_ms = m.cpu_c_ms > 0 ? m.cpu_c_ms + a * (c - m.cpu_c_ms) : c;
                                 m.cpu_g_ms = m.cpu_g_ms > 0 ? m.cpu_g_ms + a * (g - m.cpu_g_ms) : g;
                                 m.cpu_share_now = std::clamp(m.cpu_g_ms / (m.cpu_c_ms + m.cpu_g_ms), 0.05, 0.9);
+                                stats_.cpu_share_balanced = m.cpu_share_now;
+                                ++stats_.cpu_share_readings;
                             }
                         }
                         if (m.pend_wall) {   // the last eligible layer's wall, and its ratio to the one before it

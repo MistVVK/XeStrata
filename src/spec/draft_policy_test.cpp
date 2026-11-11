@@ -304,6 +304,12 @@ int main() {
         check(!strata::spec::read_cost_file(path, "x", r, why), "file: a malformed table is not loaded");
         check(strata::spec::write_cost_file(path, c, why) && strata::spec::read_cost_file(path, c.key, r, why), "file: a bad file is replaced whole");
         check(!fs::exists(fs::path(path + ".tmp"), ec), "file: no temporary file is left");
+        check(r.cpu_share < 0.0, "file: no share written, none read");
+        c.cpu_share = 0.45;
+        check(strata::spec::write_cost_file(path, c, why) && strata::spec::read_cost_file(path, c.key, r, why) && r.cpu_share == 0.45,
+              "file: the CPU prompt share is stored and read back with the table");
+        { std::ofstream f(path, std::ios::binary | std::ios::trunc); f << "strata-draft-costs 1\nkey x\nbucket 0 15.1,18\nshare 1.7\nend\n"; }
+        check(!strata::spec::read_cost_file(path, "x", r, why), "file: a share outside 0..1 is not loaded");
         fs::remove_all(dir, ec);
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");

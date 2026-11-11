@@ -203,6 +203,13 @@ bool read_cost_file(const std::string& path, const std::string& key, CostFile& o
     bool ended = false, any = false;
     while (std::getline(f, line)) {
         if (line == "end") { ended = true; break; }
+        if (line.rfind("share ", 0) == 0) {
+            char* e = nullptr;
+            const double s = std::strtod(line.c_str() + 6, &e);
+            if (e == line.c_str() + 6 || *e != '\0' || !(s >= 0.0) || !(s <= 1.0)) { why = "a malformed share"; return false; }
+            out.cpu_share = s;
+            continue;
+        }
         int b = -1, used = 0;
         if (std::sscanf(line.c_str(), "bucket %d %n", &b, &used) < 1 || used == 0 || b < 0 || b >= CostLearner::kCtxBuckets) {
             why = "a malformed line";
@@ -249,6 +256,10 @@ bool write_cost_file(const std::string& path, const CostFile& c, std::string& wh
                 f << b;
             }
             f << "\n";
+        }
+        if (c.cpu_share >= 0.0) {
+            std::snprintf(b, sizeof b, "share %.3f\n", std::min(c.cpu_share, 1.0));
+            f << b;
         }
         f << "end\n";
         f.flush();

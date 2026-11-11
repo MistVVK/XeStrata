@@ -73,10 +73,12 @@ private:
 ///   strata-draft-costs 1
 ///   key <one line>
 ///   bucket <0..2> <ms of T1>,<ms of T2>,...
+///   share <0..1>              (optional: the CPU prompt share learned on this machine, src/prefill/prefill.cpp)
 ///   end
 struct CostFile {
     std::string key;
     std::array<std::vector<double>, CostLearner::kCtxBuckets> tables{};
+    double cpu_share = -1.0;   ///< < 0: none stored
 };
 /// false (with `why` for the log) when the file is missing, unreadable, malformed or truncated, or was learned under another key: the caller
 /// then learns a new table.  Never throws.
