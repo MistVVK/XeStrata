@@ -546,7 +546,6 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     captured.live.ids = view.ids; captured.live.imgs = view.images;
     const auto p1 = now();
     const long cf0 = ptr ? conversation_trace::thread_minflt() : 0;
-    const long hp0 = ptr ? conversation_trace::anon_huge_kb() : 0;
     captured.cvec = view.cvec; captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints, storage);
     const long ck_faults = ptr ? conversation_trace::thread_minflt() - cf0 : 0;
     if (ptr)   // (E1: where each copied checkpoint's running state went: faults of the whole copy, address, heap or mapping)
@@ -613,10 +612,10 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
             return true;
         }();
         (void) thp_said;
-        // E1: page faults per phase (a 4 KiB first touch = 1, a 2 MiB huge page = 1), the process's huge-page bytes after the park
-        std::fprintf(stderr, "strata parktrace: faults: checkpoint copies %ld, K/V resize %ld (copy phase included in the layer loop: %ld); "
-                             "AnonHugePages %ld -> %ld kB\n", ck_faults, conversation_kv_save_trace_faults(), kv_faults_total,
-                     hp0, conversation_trace::anon_huge_kb());
+        // E1: page faults per phase (a 4 KiB first touch = 1, a 2 MiB huge page = 1).  (Not AnonHugePages: reading /proc/self/smaps_rollup
+        // walks the 47 GB expert mapping and costs ~0.5 s a read, which the first E1 job (e1, 11-11) put inside the park's own times.)
+        std::fprintf(stderr, "strata parktrace: faults: checkpoint copies %ld, K/V resize %ld (copy phase included in the layer loop: %ld)\n",
+                     ck_faults, conversation_kv_save_trace_faults(), kv_faults_total);
         if (!captured.kv.empty()) {
             const auto& k0 = captured.kv.front();
             std::fprintf(stderr, "strata parktrace: K/V layer 0 buffers (bytes): k %zu v %zu k_scale %zu v_scale %zu pooled %zu; %zu layers; "
