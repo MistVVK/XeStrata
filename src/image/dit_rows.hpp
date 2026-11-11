@@ -20,11 +20,14 @@
 #include "strata/kernels/i8_gemm.hpp"
 #include "strata/platform/env.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/bf16_to_f16.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/f16_gpu.hpp"
 #include "strata/kernels/q8_act.hpp"
 #include "strata/kernels/qk_norm_rope.hpp"
 #include "strata/kernels/rows_cols.hpp"
+#include "strata/kernels/rows16.hpp"
+#include "strata/kernels/row_stats.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -139,29 +142,9 @@ inline void quantize_matrix(const uint16_t* src, int64_t n, int64_t k, uint8_t* 
 // the product's output rows are multiplied back by it; the attention's v is divided by one power of two a head over a
 // context's rows (its output is a weighted sum of them), and the output multiplied back.  Powers of two leave the
 // rounding as it is; FP16 keeps 3 more bits than bf16.
-constexpr float kRowLim = 16384.f;
-
-inline float pow2_scale(float amax) {
-    return amax > kRowLim ? sycl::exp2(sycl::ceil(sycl::log2(amax / kRowLim))) : 1.f;
-}
-
-// A training step's gradient rows, small or large: the power of two that brings the row's largest value into
-// [2^13, 2^14), up as well as down.  A gradient is often far below FP16's smallest normal value (6.1e-5: the LoRA
-// factors' gradients of Qwen-Image-2.1's real blocks sit near 1e-6), where FP16 keeps a few bits or none.
-// The exponent is read off the value's bits (a subnormal's as -127): sycl::ilogb inside this row kernel gave
-// 2^-144 for a row whose largest value was 2 (intel/llvm v7.2.0, the B70, 2026-11-09).
-inline float pow2_full(float amax) {
-    if (!(amax > 0.f)) return 1.f;
-    const int e = (int) ((sycl::bit_cast<uint32_t>(amax) >> 23) & 0xffu) - 127;
-    return sycl::bit_cast<float>((uint32_t) (sycl::clamp(e - 13, -126, 127) + 127) << 23);
-}
-
 // a BF16 tensor's values as FP16, in place, clamped to FP16's range (the DiTs' 16-bit weights)
 inline void bf16_to_f16_inplace(uint16_t* p, int64_t n, sycl::queue& q) {
-    q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        const float v = kernels::f32_from_bf16(p[id[0]]);
-        p[id[0]] = f16_from_f32(sycl::clamp(v, -65504.f, 65504.f));
-    });
+    kernels::bf16_to_f16<kernels::F16Range::clamp>(q, p, p, n);
 }
 
 // q, k and v [T][heads hd] -> FP16 [T][heads][hd]: q and k RMS-normed over the head (wq, wk; eps, 1e-6 by default)
@@ -224,59 +207,18 @@ inline void qk_norm16(const MfOut& x, const float* w, int64_t T, int64_t heads, 
     kernels::qk::qk_norm_rope(q_of(s), sh, In{x, hd}, kernels::qk::NoRope{}, o);
 }
 
-// A row-wise kernel writing FP16 with each row's scale: Op (LnMod, Gelu, Heads below) gives a row's statistics and its
-// values; a sub-group of 32 a row, 8 rows a work-group (every engine GPU has them: core/device.cpp).
-constexpr int64_t kSG = 32, kRows = 8;
+using kernels::rows16::kSG;
+using kernels::rows16::kRows;
+using kernels::rows16::pow2_scale;
+using kernels::rows16::pow2_full;
 
-// the row's scale is taken from a bound of |op.value| where the op has a cheaper one than the value itself
-template<class Op, class St> float bound(const Op& op, int64_t t, int64_t c, const St& st) {
-    if constexpr (requires { op.bound(t, c); }) return op.bound(t, c);
-    else return sycl::fabs(op.value(t, c, st));
-}
-
-template<class Op> struct Rows16 {
-    Op op;
-    int64_t T, C;
-    uint16_t* y16;
-    float* rs;
-    float *keep_mean = nullptr, *keep_inv = nullptr;   // the rows' statistics kept (a training step's backward)
-    void operator()(sycl::nd_item<1> it) const {
-        const auto sg = it.get_sub_group();
-        const int64_t t = static_cast<int64_t>(it.get_group_linear_id()) * kRows + sg.get_group_linear_id();
-        const int64_t lane = sg.get_local_linear_id();
-        if (t >= T) return;
-        const auto sum = [&](float v) { return sycl::reduce_over_group(sg, v, sycl::plus<float>()); };
-        const auto st = op.stats(t, lane, kSG, sum);
-        float m = 0.f;
-        for (int64_t c = lane; c < C; c += kSG) m = sycl::fmax(m, bound(op, t, c, st));
-        const float rmax = sycl::reduce_over_group(sg, m, sycl::maximum<float>());
-        float sc;
-        if constexpr (requires { Op::kFullRange; }) sc = pow2_full(rmax);
-        else sc = pow2_scale(rmax);
-        const float inv = 1.f / sc;
-        for (int64_t c = lane; c < C; c += kSG) y16[t * C + c] = f16_from_f32(op.value(t, c, st) * inv);
-        if (lane == 0) {
-            if (rs != nullptr) rs[t] = sc;
-            if (keep_mean != nullptr) keep_mean[t] = st.mean;
-            if (keep_inv != nullptr) keep_inv[t] = st.inv;
-        }
-    }
-    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<kSG>}; }
-};
-
-// mean and inv (null: not kept): the rows' statistics (Stats) the Op gave, which a training step's backward reads
 template<class Op> inline void rows16(const Op& op, int64_t T, int64_t C, uint16_t* y16, float* rs, void* s,
                                       float* mean = nullptr, float* inv = nullptr) {
     if (T <= 0) return;
-    sycl::queue& q = q_of(s);
-    q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((T + kRows - 1) / kRows * kRows * kSG)),
-                                     sycl::range<1>((size_t) (kRows * kSG))),
-                   Rows16<Op>{op, T, C, y16, rs, mean, inv});
+    kernels::rows16::rows16(op, T, C, y16, rs, q_of(s), mean, inv);
 }
 
-struct Stats {
-    float mean = 0.f, inv = 1.f;
-};
+using Stats = kernels::row_stats::Stats;
 
 // LayerNorm(x[t]) over the channels (no affine; eps 1e-6) * (1 + scale) + shift: the DiTs' modulated norm (rows16's
 // Op)
@@ -285,12 +227,8 @@ struct LnMod {
     int64_t C;
     template<class R> Stats stats(int64_t t, int64_t lane, int64_t step, R reduce) const {
         const float* r = x + t * C;
-        float s = 0.f;
-        for (int64_t c = lane; c < C; c += step) s += r[c];
-        const float mean = reduce(s) / (float) C;
-        float v = 0.f;
-        for (int64_t c = lane; c < C; c += step) v += (r[c] - mean) * (r[c] - mean);
-        return {mean, 1.f / sycl::sqrt(reduce(v) / (float) C + 1e-6f)};
+        return kernels::row_stats::calculate<kernels::row_stats::Kind::variance>(
+            lane, step, C, 1e-6f, [=](int64_t c) { return r[c]; }, reduce);
     }
     float value(int64_t t, int64_t c, const Stats& st) const {
         return (x[t * C + c] - st.mean) * st.inv * (1.f + scale[c]) + shift[c];
@@ -330,9 +268,8 @@ template<class X> struct RmsAffineOf {
     AltRows alt{};   // rows whose scale and shift are another set's
     template<class R> Stats stats(int64_t t, int64_t lane, int64_t step, R reduce) const {
         const X* r = x + t * C;
-        float s = 0.f;
-        for (int64_t c = lane; c < C; c += step) s += resid(r[c]) * resid(r[c]);
-        return {0.f, 1.f / sycl::sqrt(reduce(s) / (float) C + eps)};
+        return kernels::row_stats::calculate<kernels::row_stats::Kind::rms>(
+            lane, step, C, eps, [=](int64_t c) { return resid(r[c]); }, reduce);
     }
     float value(int64_t t, int64_t c, const Stats& st) const {
         const int64_t m = c + alt.at(t);
@@ -390,7 +327,7 @@ template<bool R> struct SwiGluI8 {
     int64_t F;
     float raw(int64_t t, int64_t c) const {
         const float a = g.at(t, c);
-        return a / (1.f + sycl::exp(-a)) * g.at(t, c + F);
+        return kernels::rows16::swiglu(a, g.at(t, c + F));
     }
     void keep(int64_t, int64_t, float) const {}
     float inv(float) const { return 1.f; }
@@ -403,7 +340,7 @@ struct SwiGlu {
     template<class R> Stats stats(int64_t, int64_t, int64_t, R) const { return {}; }
     float value(int64_t t, int64_t c, const Stats&) const {
         const float a = g.at(t, c);
-        return a / (1.f + sycl::exp(-a)) * g.at(t, c + F);
+        return kernels::rows16::swiglu(a, g.at(t, c + F));
     }
 };
 

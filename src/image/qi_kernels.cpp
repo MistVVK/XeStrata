@@ -8,6 +8,7 @@
 
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/kernels/row_stats.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_gpu.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -207,16 +208,10 @@ void qi_ln_mod16(const float* x, const float* mod, int64_t n_text, int64_t T, in
         sycl::nd_range<1>(sycl::range<1>((size_t) T * local), sycl::range<1>(local)), [=](sycl::nd_item<1> it) {
             const int64_t t = static_cast<int64_t>(it.get_group_linear_id()), lane = static_cast<int64_t>(it.get_local_linear_id());
             const float* r = x + t * C;
-            float s = 0.f;
-            for (int64_t c = lane; c < C; c += (int64_t) local) s += r[c];
-            const float mean = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) / (float) C;
-            float v = 0.f;
-            for (int64_t c = lane; c < C; c += (int64_t) local) {
-                const float d = r[c] - mean;
-                v += d * d;
-            }
-            const float inv = 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), v, sycl::plus<float>()) /
-                                               (float) C + kEps);
+            const auto st = kernels::row_stats::calculate<kernels::row_stats::Kind::variance>(
+                lane, (int64_t) local, C, kEps, [=](int64_t c) { return r[c]; },
+                [&](float v) { return sycl::reduce_over_group(it.get_group(), v, sycl::plus<float>()); });
+            const float mean = st.mean, inv = st.inv;
             const float* m = mod + (t < n_text ? C : 0);
             for (int64_t c = lane; c < C; c += (int64_t) local) {
                 // one expression each, as the two kernels this replaced wrote them (the FMA they compile to)
@@ -874,16 +869,11 @@ void qi_layer_norm16(const float* x, const float* w, const float* b, int64_t T, 
             const auto t = static_cast<int64_t>(it.get_group_linear_id());
             const auto l = static_cast<int64_t>(it.get_local_linear_id());
             const float* r = x + t * C;
-            float s = 0.f, s2 = 0.f;
-            for (int64_t c = l; c < C; c += (int64_t) L) {
-                s += r[c];
-                s2 += r[c] * r[c];
-            }
-            s = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>());
-            s2 = sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>());
-            const float mean = s / (float) C;
-            const float inv = 1.f / sycl::sqrt(sycl::fmax(s2 / (float) C - mean * mean, 0.f) + eps);
-            for (int64_t c = l; c < C; c += (int64_t) L) y16[t * C + c] = f16_from_f32((r[c] - mean) * inv * w[c] + b[c]);
+            const auto st = kernels::row_stats::calculate<kernels::row_stats::Kind::moments>(
+                l, (int64_t) L, C, eps, [=](int64_t c) { return r[c]; },
+                [&](float v) { return sycl::reduce_over_group(it.get_group(), v, sycl::plus<float>()); });
+            for (int64_t c = l; c < C; c += (int64_t) L)
+                y16[t * C + c] = f16_from_f32((r[c] - st.mean) * st.inv * w[c] + b[c]);
         });
     finish(stream, e, "qi_layer_norm16");
 }

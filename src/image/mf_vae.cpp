@@ -10,6 +10,7 @@
 #include "strata/image/aux_kernels.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/image/gelu.hpp"
+#include "strata/kernels/bf16_to_f16.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/f16_gpu.hpp"
@@ -288,8 +289,7 @@ void taps_apart(const uint16_t* taps, int64_t O, int64_t kt, int64_t per, uint16
 
 // y = FP16 of BF16 x (a convolution's input)
 void bf16_to_f16(const uint16_t* x, int64_t n, uint16_t* y, void* s) {
-    q_of(s).parallel_for(sycl::range<1>((size_t) n),
-                         [=](sycl::id<1> id) { y[id[0]] = f16_from_f32(kernels::f32_from_bf16(x[id[0]])); });
+    kernels::bf16_to_f16<kernels::F16Range::native>(q_of(s), x, y, n);
 }
 
 // the Flux2 VAE encoder's input: out16[p][c] = rgb[c][p] for the 3 channels, 0 for the other 5 (its first

@@ -4,6 +4,8 @@
 // the depthwise convolution's fused norm.
 #pragma once
 
+#include "strata/kernels/row_stats.hpp"
+
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
@@ -23,16 +25,10 @@ inline bool row_vals(int64_t C) { return C <= kRowVals * row_items(C); }
 template <int N>
 inline sycl::float2 row_stats(const sycl::nd_item<N>& it, const float (&v)[kRowVals], int64_t l, int64_t L, int64_t C,
                               float eps) {
-    float s = 0.f;
-#pragma unroll
-    for (int64_t k = 0; k < kRowVals; ++k)
-        if (l + k * L < C) s += v[k];
-    const float mean = sycl::reduce_over_group(it.get_group(), s, sycl::plus<float>()) / (float) C;
-    float s2 = 0.f;
-#pragma unroll
-    for (int64_t k = 0; k < kRowVals; ++k)
-        if (l + k * L < C) s2 += (v[k] - mean) * (v[k] - mean);
-    return {mean, 1.f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), s2, sycl::plus<float>()) / (float) C + eps)};
+    const auto st = kernels::row_stats::calculate<kernels::row_stats::Kind::variance, false, kRowVals>(
+        l, L, C, eps, [&](int64_t c) { return v[(c - l) / L]; },
+        [&](float x) { return sycl::reduce_over_group(it.get_group(), x, sycl::plus<float>()); });
+    return {st.mean, st.inv};
 }
 
 }  // namespace strata::image::rows

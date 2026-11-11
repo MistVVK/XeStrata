@@ -7,6 +7,7 @@
 // 3cf03257 (MIT License, Copyright (c) 2023-2026 The ggml authors, see third_party/main/ggml/LICENSE).
 //
 // CUDA's expf and rsqrtf under fast math are the precise exp and SYCL's rsqrt here.
+#include "strata/kernels/row_stats.hpp"
 #include "strata/kernels/native_qsa.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/per_device.hpp"
@@ -108,11 +109,10 @@ void norm_group(sycl::queue& q, const float* input, const float* gamma_all, floa
         const float* gamma =
             gamma_all ? gamma_all + (it.get_group(0) % std::size_t(groups)) * std::size_t(n_cols) : nullptr;
         const float* in = input + row_offset;
-        float partial = 0.0f;
-        for (std::size_t col = tid; col < std::size_t(n_cols); col += Threads) partial += in[col] * in[col];
-        // the reduction's reads of the input precede its result, so the operation may run in place
-        const float scale = sycl::rsqrt(sycl::reduce_over_group(it.get_group(), partial, sycl::plus<float>()) / (float) n_cols +
-                                        epsilon);
+        // All reads of the input precede the reduction result, so the operation may run in place.
+        const float scale = row_stats::calculate<row_stats::Kind::rms, true>(
+            tid, Threads, n_cols, epsilon, [=](int64_t c) { return in[c]; },
+            [&](float v) { return sycl::reduce_over_group(it.get_group(), v, sycl::plus<float>()); }).inv;
         for (std::size_t col = tid; col < std::size_t(n_cols); col += Threads) {
             const float v = gamma ? scale * in[col] * gamma[col] : scale * in[col];
             if (out16 != nullptr) out16[row_offset + col] = f16_gpu::f16_from_f32(v);
@@ -130,7 +130,7 @@ void norm_group(sycl::queue& q, const float* input, const float* gamma_all, floa
 // work-items a row in the block's arithmetic.  q8_1 out needs the 32-wide sub-groups (each block one's); the native
 // entry points stay pinned, the form their q8_1 and fused RoPE forms match bit for bit (rope_parity).
 bool sixteen_wide(const sycl::device& d) {
-    return xe::has_sub_group(d, 16);
+    return row_stats::subgroup_width(d) == 16;
 }
 
 void launch_norm(sycl::queue& q, const float* input, const float* gamma, float* output, int n_cols, int n_rows,

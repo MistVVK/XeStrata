@@ -61,6 +61,14 @@ struct Angles {
     }
 };
 
+// Shared axial pair selection and theta angle. The power function keeps each caller's precision and math path.
+inline int64_t axial_frequency(int64_t j, int64_t quarter) { return j < quarter ? j : j - quarter; }
+
+template <class T, class Power>
+inline T theta_angle(T pos, int64_t f, T dim, int factor, Power power) {
+    return pos * power(-(T) (factor * f) / dim);
+}
+
 /// pos theta^(-2 f / dim): pos the row's own index, or with `yx` ([T][2]) two halves of 2D positions, the first
 /// `quarter` pairs the row's y and the rest its x, f counted from each half's start (Qwen3-VL's vision reader).
 /// f = j otherwise.
@@ -81,9 +89,9 @@ struct Theta {
             int64_t f = j;
             if (two) {
                 pos = j < qu ? pt : ph;
-                f = j < qu ? j : j - qu;
+                f = axial_frequency(j, qu);
             }
-            const float a = pos * sycl::pow(th, -2.0f * (float) f / dm);
+            const float a = theta_angle(pos, f, dm, 2, [=](float e) { return sycl::pow(th, e); });
             c = sycl::cos(a);
             s = sycl::sin(a);
         };

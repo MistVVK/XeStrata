@@ -6,6 +6,7 @@
 #include "strata/image/aux_kernels.hpp"
 
 #include "strata/core/runtime.hpp"
+#include "strata/kernels/qk_norm_rope.hpp"
 
 #include "row_norm.hpp"
 
@@ -626,9 +627,10 @@ const float* rope_table(void* stream, int64_t grid, float pscale, int64_t hd, fl
     std::vector<float> h((size_t) (gg * half * 2));
     for (int64_t li = 0; li < gg; ++li)
         for (int64_t p = 0; p < half; ++p) {
-            const int64_t f = p < quarter ? p : p - quarter;
+            const int64_t f = kernels::qk::axial_frequency(p, quarter);
             const double pos = (double) (p < quarter ? li % grid : li / grid) * pscale;
-            const double ang = pos * std::pow((double) theta, -(double) (4 * f) / (double) hd);
+            const double ang = kernels::qk::theta_angle(pos, f, (double) hd, 4,
+                                                        [=](double e) { return std::pow((double) theta, e); });
             h[(size_t) ((li * half + p) * 2)] = (float) std::cos(ang);
             h[(size_t) ((li * half + p) * 2 + 1)] = (float) std::sin(ang);
         }
@@ -1092,9 +1094,10 @@ void aux_fill(float* x, int64_t n, float v, void* stream) {
 namespace {
 // the 2D axial RoPE's turn of a pair (a, b) of channel 2 p of a head of hd at grid position li (aux_rope2d_split16's)
 inline void rope_pair(float& a, float& b, int64_t p, int64_t hd, int64_t li, int64_t grid, float lt) {
-    const int64_t quarter = hd / 4, f = p < quarter ? p : p - quarter;
+    const int64_t quarter = hd / 4, f = kernels::qk::axial_frequency(p, quarter);
     const float pos = (float) (p < quarter ? li % grid : li / grid);
-    const float ang = pos * sycl::exp(-(float) (4 * f) / (float) hd * lt);
+    const float ang = kernels::qk::theta_angle(pos, f, (float) hd, 4,
+                                               [=](float e) { return sycl::exp(e * lt); });
     const float cs = sycl::cos(ang), sn = sycl::sin(ang), a0 = a;
     a = a0 * cs - b * sn;
     b = b * cs + a0 * sn;

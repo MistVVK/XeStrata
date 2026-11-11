@@ -7,6 +7,7 @@
 #include "strata/image/product_store.hpp"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/f16_gpu.hpp"
+#include "strata/kernels/row_stats.hpp"
 #include "strata/prefill/gemm.hpp"
 
 #include <sycl/sycl.hpp>
@@ -18,9 +19,9 @@ namespace strata::image::vae_mid {
 
 namespace syclex = sycl::ext::oneapi::experimental;
 
-// rms16 a sub-group of 32 a pixel, PIX pixels a work-group
-struct Rms16 {
-    static constexpr int64_t SG = 32, PIX = 8, LANES = SG * PIX;
+// rms16 a device-selected sub-group a pixel, PIX pixels a work-group
+template<int SG> struct Rms16 {
+    static constexpr int64_t PIX = 256 / SG, LANES = SG * PIX;
     const float *x, *g;
     int64_t HW, C;
     bool silu;
@@ -31,9 +32,10 @@ struct Rms16 {
         const int64_t lane = sg.get_local_linear_id();
         if (p >= HW) return;   // the whole sub-group
         const float* r = x + p * C;
-        float ss = 0.f;
-        for (int64_t c = lane; c < C; c += SG) ss += r[c] * r[c];
-        const float inv = 1.f / sycl::sqrt(sycl::reduce_over_group(sg, ss, sycl::plus<float>()) / (float) C + 1e-12f);
+        const auto st = kernels::row_stats::calculate<kernels::row_stats::Kind::rms>(
+            lane, SG, C, 1e-12f, [=](int64_t c) { return r[c]; },
+            [&](float v) { return sycl::reduce_over_group(sg, v, sycl::plus<float>()); });
+        const float inv = st.inv;
         for (int64_t c = lane; c < C; c += SG) {
             float v = r[c] * inv * g[c];
             if (silu) v = v / (1.f + sycl::exp(-v));
@@ -43,13 +45,21 @@ struct Rms16 {
     auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<SG>}; }
 };
 
-// out16[p] = RMS-normed x[p] over the channels times g (SiLU after it when `silu`): a sub-group of 32 a pixel, the
+// out16[p] = RMS-normed x[p] over the channels times g (SiLU after it when `silu`): one sub-group a pixel, the
 // sum within it (a work-group a pixel and its sum through local memory and barriers took the RX 9060 XT 14.8 ms a
 // call on average in a 1024 x 1024 decode)
 inline void rms16(const float* x, const float* g, int64_t HW, int64_t C, bool silu, uint16_t* out16, void* s) {
-    core::Runtime::get().stream(s).parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((HW + Rms16::PIX - 1) / Rms16::PIX * Rms16::LANES)),
-                                           sycl::range<1>((size_t) Rms16::LANES)),
-                         Rms16{x, g, HW, C, silu, out16});
+    auto& q = core::Runtime::get().stream(s);
+    auto launch = [&]<int SG>() {
+        constexpr int64_t PIX = Rms16<SG>::PIX, LANES = Rms16<SG>::LANES;
+        q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((HW + PIX - 1) / PIX * LANES)),
+                                         sycl::range<1>((size_t) LANES)), Rms16<SG>{x, g, HW, C, silu, out16});
+    };
+    // B70, 512-square decode: 16 -> 32 gave Qwen-Image 0.068 -> 0.066 s and Anima 0.018 -> 0.017 s
+    // (warm medians, 3 runs); 32 also restored Qwen-Image's bytes in the isolated Rms16 comparison.
+    const auto widths = q.get_device().get_info<sycl::info::device::sub_group_sizes>();
+    if (std::find(widths.begin(), widths.end(), 32) != widths.end()) launch.template operator()<32>();
+    else launch.template operator()<16>();
 }
 
 enum class Norm { rms, group };

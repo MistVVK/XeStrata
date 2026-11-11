@@ -8,6 +8,7 @@
 #include "strata/prefill/kernels.hpp"
 #include "gdn_tc.hpp"
 #include "strata/kernels/cvec.hpp"
+#include "strata/kernels/bf16_to_f16.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/f16_gpu.hpp"
 #include "strata/kernels/kv_q8.hpp"
@@ -16,6 +17,7 @@
 #include "strata/kernels/rope.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/rows_cols.hpp"
+#include "strata/kernels/rows16.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/per_device.hpp"
@@ -141,10 +143,7 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
 
 void bf16_to_f16(const uint16_t* x, uint16_t* y, int64_t n, void* stream) {
     if (n <= 0) return;
-    Q(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
-        const float f = sycl::bit_cast<float>((uint32_t) x[i] << 16);
-        y[i] = sycl::isinf(f) ? hf(f) : hf_sat(f);
-    });
+    kernels::bf16_to_f16<kernels::F16Range::finite_saturate>(Q(stream), x, y, n);
 }
 void round_f16(const float* x, float* y, int64_t n, void* stream) {
     if (n <= 0) return;
@@ -972,18 +971,16 @@ void blob_dequant_f16(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, voi
 }
 void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream) {
     if (n <= 0) return;
-    Q(stream).parallel_for(sycl::range<1>((size_t) (n * 640)), [=](sycl::id<1> id) {
-        const int64_t i = (int64_t) id[0], r = i / 640, k = i % 640;
-        const float g = gu[r * 1280 + 2 * k], u = gu[r * 1280 + 2 * k + 1];
-        h16[i] = hf_sat(g / (1.0f + sycl::exp(-g)) * u);
+    kernels::rows16::saturated(Q(stream), n * 640, h16, [=](int64_t i) {
+        const int64_t r = i / 640, k = i % 640;
+        return kernels::rows16::swiglu(gu[r * 1280 + 2 * k], gu[r * 1280 + 2 * k + 1]);
     });
 }
 void swiglu_pair(const float* g, const float* u, uint16_t* h16, int64_t n, void* stream, int64_t width, int64_t ld) {
     if (n <= 0) return;
     if (ld <= 0 || ld == width) {   // one run of n x width values (a row index per value cost the shared expert 40%)
-        Q(stream).parallel_for(sycl::range<1>((size_t) (n * width)), [=](sycl::id<1> i) {
-            const float a = g[i];
-            h16[i] = hf_sat(a / (1.0f + sycl::exp(-a)) * u[i]);
+        kernels::rows16::saturated(Q(stream), n * width, h16, [=](int64_t i) {
+            return kernels::rows16::swiglu(g[i], u[i]);
         });
         return;
     }

@@ -193,6 +193,10 @@ bool native_norm_rope_usable(int head_dim, int n_rot) {
 // upstream 088e8a82 (#783 PR-f): native_qsa_rms_norm_weighted (its 256-item form: the same partial sums, sub-group
 // sums and order) and native_rope_apply in one launch, so the result is the pair's bit for bit (rope_parity).  Every
 // item reads its values before the barrier, so out may be x (in_stride == head_dim).
+// The shared qk_norm_rope changes the reduction order: Qwen3.5-9B Q4_K_M, three 1K prompts and 64 teacher-forced
+// tokens each, mean KL 0.000610 and top-1 99.479%; same-binary KL was 0.000264 with automatic BLAS and 0 with BLAS
+// fixed. On RX 9060 XT, 32K decode fell from 41.972 to 41.719 tokens/s (all three alternating pairs slower), so this
+// path stays.
 void native_qsa_rms_norm_rope(const float* x, int in_stride, const float* gamma, float* out, int rows, int head_dim,
                               int n_rot, float epsilon, const RopeScaling& scaling, const int* positions, void* stream) {
     if (!x || !gamma || !out || !positions || !stream || rows < 1 || rows > 65535 ||
