@@ -1,0 +1,50 @@
+[
+ {
+  "seed": 7,
+  "count": 65536,
+  "sha256": "bfb5fc78ccc9b14b5cfb9aa19fe51fe8ad1ad67b47b8d2c27e66e9309a1a6ad5",
+  "from": "stable-diffusion.cpp 2988060 core/rng_philox.hpp, g++ 13.3 -O3 x86_64 (p1006-20261111-0611-d91d)"
+ },
+ {
+  "seed": 42,
+  "count": 65536,
+  "sha256": "b1a06676c313c19d97210626cdb5409063ad9e620f9037187005a1523eaf02e1",
+  "from": "stable-diffusion.cpp 2988060 core/rng_philox.hpp, g++ 13.3 -O3 x86_64 (p1006-20261111-0611-d91d)"
+ },
+ {
+  "seed": 1234,
+  "count": 65536,
+  "sha256": "6fda4453e13c36a80ad8ce78c5f6fecabcd68f8387d973f41b5550613bac8c14",
+  "from": "stable-diffusion.cpp 2988060 core/rng_philox.hpp, g++ 13.3 -O3 x86_64 (p1006-20261111-0611-d91d)"
+ },
+ {
+  "seed": 2026,
+  "count": 65536,
+  "sha256": "30d4d1e00c10bab8bd7d00828aaf4755d9f04eb3d56812a19eb969cc4c8291b3",
+  "from": "stable-diffusion.cpp 2988060 core/rng_philox.hpp, g++ 13.3 -O3 x86_64 (p1006-20261111-0611-d91d)"
+ },
+ {
+  "seed": 7,
+  "count": 262144,
+  "sha256": "7ff12c36e6ee7cc0c0db4294f8b0402a479a7c100823e2eca0d971702ea8c4bd",
+  "from": "stable-diffusion.cpp 2988060 core/rng_philox.hpp, g++ 13.3 -O3 x86_64 (p1006-20261111-0611-d91d)"
+ },
+ {
+  "seed": 42,
+  "count": 262144,
+  "sha256": "5cb8b94b5b1f733aa594d893729b044fb83d69dd1d0bd418a9812079e5c4bf08",
+  "from": "stable-diffusion.cpp 2988060 core/rng_philox.hpp, g++ 13.3 -O3 x86_64 (p1006-20261111-0611-d91d)"
+ },
+ {
+  "seed": 1234,
+  "count": 262144,
+  "sha256": "ec107731ab2cf449a4ac39941e5ea3edb78b5c19056293710f8420e372752fe6",
+  "from": "stable-diffusion.cpp 2988060 core/rng_philox.hpp, g++ 13.3 -O3 x86_64 (p1006-20261111-0611-d91d)"
+ },
+ {
+  "seed": 2026,
+  "count": 262144,
+  "sha256": "e5a3553e4e4078a8b2abb7b1973e8fbe6f6edc10c144dcb846396b4834182c2e",
+  "from": "stable-diffusion.cpp 2988060 core/rng_philox.hpp, g++ 13.3 -O3 x86_64 (p1006-20261111-0611-d91d)"
+ }
+]
