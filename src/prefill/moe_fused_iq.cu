@@ -684,8 +684,9 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
         const uint8_t* wrow = GU ? blob + ((ur & 8) ? geo.up_off : 0) +
                                        (size_t) (fb * (WR / 2) + 8 * (ur >> 4) + (ur & 7)) * geo.gu_row
                                  : blob + geo.down_off + (size_t) (rbase + ur) * geo.d_row;
-        // gate/up in Q2_0 (64-value blocks): a block per stage, as the down rows read theirs
-        constexpr bool GU256 = GU && WT != T_Q2_0;
+        // gate/up in Q2_0 (64-value blocks): a block per stage, as the down rows read theirs; in Q8_0 (32-value blocks, CUDA
+        // STRATA_PF_FUSED_Q8GU=1): two blocks a stage, as the Q8_0 down rows read theirs
+        constexpr bool GU256 = GU && WT != T_Q2_0 && WT != T_Q8_0;
         auto unit = [&](int s) -> const uint8_t* {                  // the block of stage s's sub-block
             if (GU256) return wrow + (s >> 2) * BS;
             return (WT == T_IQ4_NL || WT == T_Q5_0 || WT == T_Q5_1 || WT == T_Q8_0) ? wrow + (2 * s + uj) * BS : wrow + s * BS;   // 32-value blocks: two a stage
@@ -695,7 +696,7 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
         // gate/up PF super-blocks ahead (the row's two threads take a block's first and last line), down the whole row
         // slice at once (180 or 360 bytes a row)
         constexpr int PF = 2;
-        constexpr int SBB = WT == T_Q2_0 ? 4 * BS : BS;              // bytes per 256 values of a row
+        constexpr int SBB = WT == T_Q2_0 ? 4 * BS : WT == T_Q8_0 ? 8 * BS : BS;   // bytes per 256 values of a row
         auto prefetch_sb = [&](int sb) {
             if (dec && sb < GU_ROWS_K / 256) pf_l2(wrow + sb * SBB + (uj ? SBB - 1 : 0));
         };
@@ -1800,6 +1801,8 @@ struct DevInfo {
     bool kq8 = false;   // with kq: the Q8_0 down kernels are set up too (A2; UD-Q4_K_XL's five Q8_0-down layers)
     int occ_kq8 = 1;
     bool q8d = false;   // sm_80+ with STRATA_PF_FUSED_Q8D=1: the same Q8_0 down kernels behind an i-quant gate/up (opt-in, phase 4; their occupancy is occ_kq8)
+    bool q8gu = false;  // sm_80+ with STRATA_PF_FUSED_Q8GU=1: the Q8_0 gate/up kernels, and the Q8_0 down ones behind them (opt-in, phase 4)
+    int occ_q8gu = 1;   // the Q8_0 gate/up kernels' blocks per multiprocessor (the down keeps occ_kq8)
 #endif
 };
 std::mutex g_mu;
@@ -1828,6 +1831,12 @@ bool q50_cuda_requested() {
 // gate/up (the pinned UD-IQ4_XS: IQ3_S / Q8_0 in 4 layers, IQ4_XS / Q8_0 in 1) on any sm_80+ card; anything else keeps those layers on MMQ
 bool q8d_cuda_requested() {
     static const bool on = [] { const char* v = std::getenv("STRATA_PF_FUSED_Q8D"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+// STRATA_PF_FUSED_Q8GU on CUDA: "1" sets the Q8_0 gate/up kernels up (dev_info) and lets native_supported take a Q8_0 gate/up with a Q8_0
+// down (the Q8_0 set's 48 layers, UD-Q6_K_XL's one Q8_0 layer) on any sm_80+ card; anything else keeps those layers on MMQ
+bool q8gu_cuda_requested() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PF_FUSED_Q8GU"); return v != nullptr && v[0] == '1'; }();
     return on;
 }
 bool kq_on();   // STRATA_PF_FUSED_KQ (below): on CUDA "1" sets the K-quant kernels up (dev_info)
@@ -1989,6 +1998,13 @@ const DevInfo& dev_info() {
     // A2's.  The Q8_0 down reads no code sums (has_min is false), so the i-quant gate/up epilogue's H feeds it unchanged.  The occupancy is
     // the one A2 found for the same instances (occ_kq8); a failed setup leaves those layers on MMQ.
     if (int o6 = 1 << 20; d.ok && q8d_cuda_requested() && setup_one<T_Q8_0, false>(o6)) { d.q8d = true; d.occ_kq8 = o6; }
+    // STRATA_PF_FUSED_Q8GU=1 (opt-in on CUDA, off by default): a Q8_0 gate/up (int8 codes, one scale per 32 values: two blocks a 64-value
+    // stage, as the Q8_0 down reads them) with a Q8_0 down on A2's down instances.  Both set up or neither; the gate/up's occupancy is its own.
+    if (int o7 = 1 << 20, o8 = 1 << 20; d.ok && q8gu_cuda_requested() && setup_one<T_Q8_0, true>(o7) && setup_one<T_Q8_0, false>(o8)) {
+        d.q8gu = true;
+        d.occ_q8gu = o7;
+        d.occ_kq8 = o8;
+    }
     if (d.ok && nt256_requested()) {
         int o2 = 1 << 20;
         const bool ok2 = setup_nt<T_IQ2_XXS, true>(o2) && setup_nt<T_IQ2_XS, true>(o2) && setup_nt<T_IQ2_S, true>(o2) &&
@@ -2042,6 +2058,7 @@ bool gu_covered(int t) {
 #if !defined(__HIPCC__)
            || (t == T_Q2_0 && (dev_info().t75 || dev_info().q2n))   // Q2_0 gate/up: the Turing opt-in, or STRATA_PF_FUSED_Q2N=1 on sm_80+
            || ((t == T_Q4_K || t == T_Q5_K) && dev_info().kq)       // STRATA_PF_FUSED_KQ=1 and its kernels set up
+           || (t == T_Q8_0 && dev_info().q8gu)                      // STRATA_PF_FUSED_Q8GU=1 and its kernels set up
 #endif
 #if defined(__HIPCC__)
            || (t == T_Q2_0 && dev_info().w12)   // gfx12: the native Q2_0 pack's gate/up on native_w11_kernel (64-value blocks)
@@ -2104,7 +2121,7 @@ bool d_covered_on(int t, const DevInfo& d) {
 #else
     if (t == T_Q5_0) return d.q50;   // STRATA_PF_FUSED_Q50=1 and its kernels set up (dev_info)
     if (t == T_Q5_1) return d.kq;    // STRATA_PF_FUSED_KQ=1 (behind a K-quant gate/up only: native_supported)
-    if (t == T_Q8_0) return d.kq8 || d.q8d;   // STRATA_PF_FUSED_KQ=1, A2 (behind a K-quant gate/up), or STRATA_PF_FUSED_Q8D=1 (behind an i-quant one): native_supported
+    if (t == T_Q8_0) return d.kq8 || d.q8d || d.q8gu;   // STRATA_PF_FUSED_KQ=1, A2 (behind a K-quant gate/up), STRATA_PF_FUSED_Q8D=1 (behind an i-quant one) or _Q8GU=1 (behind a Q8_0 one): native_supported
 #endif
     (void) d;
     return d_covered(t);
@@ -2206,6 +2223,11 @@ bool native_supported(int gu_type, int d_type) {
     // any sm_80+ card whose Q8_0 down kernels were set up, whatever the 80-SM rule says (the pinned UD-IQ4_XS's five Q8_0-down layers;
     // its other 43 layers follow their own rule).  Not behind the Q2_0 gate/up of STRATA_PF_FUSED_Q2N, not with the NT = 256 /
     // warp-specialized opt-ins (no Q8_0 form): MMQ.
+    // A Q8_0 gate/up (phase 4, opt-in STRATA_PF_FUSED_Q8GU=1; gu_covered checked q8gu above): with a Q8_0 down only, same conditions.
+    if (gu_type == T_Q8_0) {
+        const DevInfo& d = dev_info();
+        return d_type == T_Q8_0 && d.ok && d.q8gu && !d.t75 && d.occ_nt <= 0 && !d.ws;
+    }
     if (d_type == T_Q8_0 && gu_type != T_Q4_K && gu_type != T_Q5_K) {
         const DevInfo& d = dev_info();
         return gu_type != T_Q2_0 && d.ok && d.q8d && !d.t75 && d.occ_nt <= 0 && !d.ws;
@@ -2400,6 +2422,12 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
         case T_IQ3_XXS: launch<T_IQ3_XXS, true>(ww, g_gu, b, g, tb, xa, src, ha, nullptr, s); break;
         case T_IQ3_S: launch<T_IQ3_S, true>(ww, g_gu, b, g, tb, xa, src, ha, nullptr, s); break;
         case T_Q2_0: launch<T_Q2_0, true>(ww, g_gu, b, g, tb, xa, src, ha, nullptr, s); break;
+#if !defined(__HIPCC__)   // (STRATA_PF_FUSED_Q8GU=1, gu_covered checked d.q8gu above; a HIP build returns above and has no such instance)
+        case T_Q8_0:
+            launch<T_Q8_0, true>(ww, (unsigned) std::min<int64_t>(tiles * (GU_ROWS_N / weight_rows(ww)), (int64_t) d.sms * d.occ_q8gu), b, g, tb,
+                                 xa, src, ha, nullptr, s);
+            break;
+#endif
         default: launch<T_IQ4_XS, true>(ww, g_gu, b, g, tb, xa, src, ha, nullptr, s); break;
     }
     if (g.d_type == T_Q2_0) launch<T_Q2_0, false>(ww, g_d, b, g, tb, ha, src, nullptr, dm, s);
