@@ -1,7 +1,7 @@
 // src/image/te/te_dequant.cu - GGUF block formats -> f16 rows on CUDA / HIP (include/strata/image/te_dequant.hpp).
 //
-// One thread decodes one group of 32 values (a K-quant / IQ4_XS super-block has 8 groups; a Q8_0 block is one group)
-// and writes them as 16 packed f16 pairs.  Every multiply and subtract is __fmul_rn / __fsub_rn: the compilers would
+// One thread decodes 8 consecutive values (a quarter of a 32-value group; a K-quant / IQ4_XS super-block has 8 groups,
+// a Q8_0 block is one) and writes them with one 16-byte store, so a warp writes 512 contiguous bytes.  Every multiply and subtract is __fmul_rn / __fsub_rn: the compilers would
 // otherwise fuse "d1 * q - m1" into one FMA, which rounds once instead of twice and gives other f16 bits than ggml's
 // (and dequant.hpp's) f32 values.  The f16 rounding is f16_bits.hpp's (round to nearest even), not __float2half.
 #include "strata/image/te_dequant.hpp"
@@ -37,14 +37,17 @@ __device__ __forceinline__ void scale_min_k4(int j, const uint8_t* q, int& sc, i
     }
 }
 
-__device__ __forceinline__ void put32(uint16_t* out, const float* v) {
-    uint32_t* o = reinterpret_cast<uint32_t*>(out);
-#pragma unroll
-    for (int i = 0; i < 16; ++i) o[i] = (uint32_t) f16_from_f32(v[2 * i]) | ((uint32_t) f16_from_f32(v[2 * i + 1]) << 16);
+__device__ __forceinline__ void put8(uint16_t* out, const float* v) {     // 16-byte store: consecutive threads, consecutive 16 B
+    uint4 o;
+    o.x = (uint32_t) f16_from_f32(v[0]) | ((uint32_t) f16_from_f32(v[1]) << 16);
+    o.y = (uint32_t) f16_from_f32(v[2]) | ((uint32_t) f16_from_f32(v[3]) << 16);
+    o.z = (uint32_t) f16_from_f32(v[4]) | ((uint32_t) f16_from_f32(v[5]) << 16);
+    o.w = (uint32_t) f16_from_f32(v[6]) | ((uint32_t) f16_from_f32(v[7]) << 16);
+    *reinterpret_cast<uint4*>(out) = o;
 }
 
 template <uint32_t TYPE>
-__device__ __forceinline__ void decode_group(const uint8_t* row, int g, float* v) {
+__device__ __forceinline__ void decode8(const uint8_t* row, int g, int l0, float* v) {   // values l0 .. l0+7 of group g
     if constexpr (TYPE == TE_Q4_K) {                    // d dmin scales[12] qs[128]; group g: 32 values
         const uint8_t* b = row + (size_t) (g >> 3) * 144;
         const int sub = g & 7, j64 = sub >> 1, hi = sub & 1;
@@ -53,7 +56,7 @@ __device__ __forceinline__ void decode_group(const uint8_t* row, int g, float* v
         const float d1 = __fmul_rn(h2f_at(b), (float) sc), m1 = __fmul_rn(h2f_at(b + 2), (float) m);
         const uint8_t* q = b + 16 + 32 * j64;
 #pragma unroll
-        for (int l = 0; l < 32; ++l) v[l] = __fsub_rn(__fmul_rn(d1, (float) (hi ? (q[l] >> 4) : (q[l] & 0x0F))), m1);
+        for (int i = 0; i < 8; ++i) { const int l = l0 + i; v[i] = __fsub_rn(__fmul_rn(d1, (float) (hi ? (q[l] >> 4) : (q[l] & 0x0F))), m1); }
     } else if constexpr (TYPE == TE_Q5_K) {             // d dmin scales[12] qh[32] qs[128]
         const uint8_t* b = row + (size_t) (g >> 3) * 176;
         const int sub = g & 7, j64 = sub >> 1, hi = sub & 1;
@@ -64,9 +67,10 @@ __device__ __forceinline__ void decode_group(const uint8_t* row, int g, float* v
         const uint8_t* ql = b + 48 + 32 * j64;
         const int u = 1 << sub;                         // u1 = 1, 4, 16, 64 and u2 = 2, 8, 32, 128
 #pragma unroll
-        for (int l = 0; l < 32; ++l) {
+        for (int i = 0; i < 8; ++i) {
+            const int l = l0 + i;
             const int q = (hi ? (ql[l] >> 4) : (ql[l] & 0x0F)) + ((qh[l] & u) ? 16 : 0);
-            v[l] = __fsub_rn(__fmul_rn(d1, (float) q), m1);
+            v[i] = __fsub_rn(__fmul_rn(d1, (float) q), m1);
         }
     } else if constexpr (TYPE == TE_Q6_K) {             // ql[128] qh[64] scales[16] (int8) d
         const uint8_t* b = row + (size_t) (g >> 3) * 210;
@@ -78,9 +82,10 @@ __device__ __forceinline__ void decode_group(const uint8_t* row, int g, float* v
         const uint8_t* L = ql + ((k & 1) ? 32 : 0);
         const int shift_l = (k & 2) ? 4 : 0, shift_h = 2 * k;
 #pragma unroll
-        for (int l = 0; l < 32; ++l) {
+        for (int i = 0; i < 8; ++i) {
+            const int l = l0 + i;
             const int q = (int) (((L[l] >> shift_l) & 0x0F) | (((qh[l] >> shift_h) & 3) << 4)) - 32;
-            v[l] = __fmul_rn(__fmul_rn(d, (float) sc[(l >> 4) + 2 * k]), (float) q);
+            v[i] = __fmul_rn(__fmul_rn(d, (float) sc[(l >> 4) + 2 * k]), (float) q);
         }
     } else if constexpr (TYPE == TE_IQ4_XS) {           // d scales_h scales_l[4] qs[128]
         const uint8_t* b = row + (size_t) (g >> 3) * 136;
@@ -90,37 +95,37 @@ __device__ __forceinline__ void decode_group(const uint8_t* row, int g, float* v
         const float dl = __fmul_rn(h2f_at(b), (float) (ls - 32));
         const uint8_t* qs = b + 8 + 16 * ib;
 #pragma unroll
-        for (int j = 0; j < 16; ++j) {
-            v[j] = __fmul_rn(dl, (float) kIq4nl[qs[j] & 0x0F]);
-            v[j + 16] = __fmul_rn(dl, (float) kIq4nl[qs[j] >> 4]);
+        for (int i = 0; i < 8; ++i) {                 // values 0-15: low nibbles of qs[0..15], 16-31: high nibbles
+            const int l = l0 + i;
+            v[i] = __fmul_rn(dl, (float) kIq4nl[l < 16 ? (qs[l] & 0x0F) : (qs[l - 16] >> 4)]);
         }
     } else if constexpr (TYPE == TE_Q8_0) {             // d qs[32]
         const uint8_t* b = row + (size_t) g * 34;
         const float d = h2f_at(b);
         const int8_t* q = reinterpret_cast<const int8_t*>(b + 2);
 #pragma unroll
-        for (int l = 0; l < 32; ++l) v[l] = __fmul_rn((float) q[l], d);
+        for (int i = 0; i < 8; ++i) v[i] = __fmul_rn((float) q[l0 + i], d);
     } else if constexpr (TYPE == TE_F32) {
         const float* p = reinterpret_cast<const float*>(row) + 32 * (size_t) g;
 #pragma unroll
-        for (int l = 0; l < 32; ++l) v[l] = p[l];
+        for (int i = 0; i < 8; ++i) v[i] = p[l0 + i];
     } else if constexpr (TYPE == TE_BF16) {
         const uint8_t* p = row + 64 * (size_t) g;
 #pragma unroll
-        for (int l = 0; l < 32; ++l) v[l] = strata::kernels::f32_from_bf16((uint16_t) (p[2 * l] | (p[2 * l + 1] << 8)));
+        for (int i = 0; i < 8; ++i) v[i] = strata::kernels::f32_from_bf16((uint16_t) (p[2 * (l0 + i)] | (p[2 * (l0 + i) + 1] << 8)));
     }
 }
 
 template <uint32_t TYPE>
 __global__ void dequant_kernel(const uint8_t* __restrict__ src, size_t row_bytes, int64_t ne0, int64_t rows,
                                uint16_t* __restrict__ dst) {
-    const int64_t gpr = ne0 / 32;
-    const int64_t total = gpr * rows;
+    const int64_t ppr = ne0 / 8;                          // pieces of 8 values per row
+    const int64_t total = ppr * rows;
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (int64_t) gridDim.x * blockDim.x) {
-        const int64_t r = i / gpr, g = i % gpr;
-        float v[32];
-        decode_group<TYPE>(src + (size_t) r * row_bytes, (int) g, v);
-        put32(dst + r * ne0 + g * 32, v);
+        const int64_t r = i / ppr, pc = i % ppr;
+        float v[8];
+        decode8<TYPE>(src + (size_t) r * row_bytes, (int) (pc >> 2), (int) (pc & 3) * 8, v);
+        put8(dst + r * ne0 + pc * 8, v);
     }
 }
 
@@ -130,7 +135,7 @@ __global__ void copy_f16_kernel(const uint16_t* __restrict__ src, size_t n, uint
 
 template <uint32_t TYPE>
 std::string launch(const void* src, size_t rb, int64_t ne0, int64_t rows, uint16_t* dst, cudaStream_t s) {
-    const int64_t total = ne0 / 32 * rows;
+    const int64_t total = ne0 / 8 * rows;
     const int threads = 256;
     const int64_t want = (total + threads - 1) / threads;
     const int blocks = (int) (want < 65535 * 8 ? want : 65535 * 8);
