@@ -20,6 +20,7 @@
 #include "strata/core/adapt_async_default.hpp"
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/reader_room.hpp"
+#include "strata/core/kfd_settle.hpp"
 #include "strata/core/gfx12_chunk.hpp"
 #include "strata/core/nv_chunk.hpp"
 #include "strata/core/nv_defaults.hpp"
@@ -3984,6 +3985,9 @@ int main(int argc, char** argv) {
             // and on Linux the arena asks for no transparent huge pages there (arch_defaults.hpp, igpu_arena_no_thp_default)
             if (strata::core::igpu_arena_no_thp_default(ad.gcnArchName, all_igpu, win_host))
                 strata::core::arena_no_thp_flag().store(true);
+            // and before READY it waits until its own KFD eviction counter has been quiet for 2 s (kfd_settle.hpp)
+            if (strata::core::igpu_kfd_settle_default(ad.gcnArchName, all_igpu, win_host))
+                strata::core::kfd_settle_flag().store(true);
             // gfx1151 on Windows (#1630 capped a bare `--prefill auto` at 6144 for a 7900 XTX's commit charge): the Strix Halo has its
             // 8192 chunk back.  IQ3_S, 8K prompt: 691 -> 787 tok/s (one chunk streams 1,785 experts instead of 2,782), 64K 713 -> 748;
             // 4K is one chunk already.  STRATA_GFX1151_CHUNK=0 (or STRATA_GFX1151_DEFAULTS=0) keeps 6144.
@@ -14427,6 +14431,7 @@ int main(int argc, char** argv) {
         }
         strata::core::pin_sim_report("at READY");
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
+        strata::core::kfd_settle::settle_before_ready();   // integrated gfx11 under Linux: until the kernel has stopped moving the registered arena (nothing elsewhere)
         strata::core::manifest::instance().write("ready");   // STRATA_MANIFEST (a no-op unless it is set)
         std::printf("READY %lld stop hold holdb\n", (long long) o.max_context);   // "stop": this engine honours STOP; "hold": GEN hold=N:ID; "holdb": the --batch slots end at the hold too (BDONE hold)
         std::fflush(stdout);

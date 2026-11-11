@@ -63,6 +63,10 @@ bool igpu_uma_arena_default(const char* gcn_arch, bool integrated, bool windows,
 /// Setup already wrote STRATA_NO_ARENA_THP=1 for its 780M opt-in; this makes it the engine's own rule.
 /// STRATA_NO_ARENA_THP=0 asks for them (unset = this rule; =1 = never, as before).  Windows and discrete cards: unchanged.
 bool igpu_arena_no_thp_default(const char* gcn_arch, bool integrated, bool windows);
+/// the wait before READY (strata/core/kfd_settle.hpp) applies to the same class: an integrated gfx11 GPU under Linux (gfx1103,
+/// gfx1150, gfx1151), where the registered expert arena is a KFD userptr and the kernel's page moves right after the load evict the
+/// process's queues.  Never Windows, never a discrete card.  STRATA_NO_KFD_SETTLE=1 turns the wait off.
+bool igpu_kfd_settle_default(const char* gcn_arch, bool integrated, bool windows);
 /// Whether the expert arena skips its MADV_HUGEPAGE request: `no_arena_thp` is STRATA_NO_ARENA_THP (nullptr when unset): "0" asks for the huge
 /// pages, any other value skips the request; unset leaves it to `igpu_rule` (igpu_arena_no_thp_default for this device).  `thp_always`: the
 /// kernel's THP mode is "always" (the request would add nothing, #771).  Inline: src/core/pinned.cu (strata_core) uses it without
