@@ -1,7 +1,7 @@
 """The picture reader's context retry (tools/vision/own/vit_gpu.cu, set_device_retrying) exists only in a Linux CUDA build.
 
 A new CUDA context on a shared-memory GPU (DGX Spark) can fail with "out of memory" for a moment while the kernel has no free 2 MiB blocks; the reader
-tries again up to 8 times, one second apart.  The same cudaDevAttrIntegrated is true on AMD APUs (HIP build, same source file) and on Macs (a different
+tries again up to 12 times, one second apart.  The same cudaDevAttrIntegrated is true on AMD APUs (HIP build, same source file) and on Macs (a different
 reader), and Windows has no such case, so the retry loop sits inside one guard, and the pure rule (vit_gpu.h) says no for everything but integrated + out of memory.
 """
 import re

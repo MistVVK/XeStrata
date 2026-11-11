@@ -51,7 +51,7 @@ int main(int argc, char** argv) {
     CHECK(!vit_gpu_slower_amd("gfx1150") && !vit_gpu_slower_amd("gfx1201") && !vit_gpu_slower_amd("gfx11510") && !vit_gpu_slower_amd("gfx115") && !vit_gpu_slower_amd(""));
     CHECK(vit_gpu_hip_windows_not_measured(true) && !vit_gpu_hip_windows_not_measured(false));   // Windows HIP keeps mtmd under auto; Linux HIP does not
     {   // the context retry (vit_gpu.h): only "out of memory", only an integrated GPU, only a Linux CUDA build, at most kVitCtxRetries times
-        CHECK(kVitCtxRetries == 8 && kVitCtxWaitMs == 1000);
+        CHECK(kVitCtxRetries == 12 && kVitCtxWaitMs == 1000);
         for (int done = 0; done < kVitCtxRetries; ++done) CHECK(vit_gpu_retry_context(true, true, true, done));
         CHECK(!vit_gpu_retry_context(true, true, true, kVitCtxRetries) && !vit_gpu_retry_context(true, true, true, kVitCtxRetries + 5) && !vit_gpu_retry_context(true, true, true, -1));
         CHECK(!vit_gpu_retry_context(false, true, true, 0));    // HIP, Windows, Metal: no retry
