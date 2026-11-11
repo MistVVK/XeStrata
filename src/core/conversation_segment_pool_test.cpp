@@ -21,7 +21,8 @@ constexpr size_t MiB = size_t(1) << 20;
 
 // Real memory from the C library, 2 MiB aligned; release wipes the range (a released range loses its content, like madvise)
 struct FakeOs final : SegmentPoolOs {
-    size_t reserved = 0, commits = 0, populates = 0, populated_bytes = 0, releases = 0, released_bytes = 0;
+    size_t reserved = 0;
+    std::atomic<size_t> commits{0}, populates{0}, populated_bytes{0}, releases{0}, released_bytes{0};   // (several threads call the OS in the stress block)
     bool refuse_commit = false, refuse_populate = false, refuse_reserve = false;
     void* mem = nullptr;
     void* reserve(size_t bytes) override {
@@ -189,6 +190,47 @@ int main() {
             settle();
             check(pool.resident_bytes() == 100 * MiB, "after a shrink and a larger permit the pool is topped up to it");
         }
+    }
+    // threads: workers allocate, write, verify and free while the filler populates and the main thread shrinks.  A 192 MiB pool, 3 workers
+    // holding at most 6 MiB each (the memory cap of this test is the pool's size)
+    {
+        FakeOs os;
+        SegmentPool pool(os, 192 * MiB);
+        std::atomic<int> bad{0};
+        std::atomic<size_t> cap{192 * MiB};
+        SegmentPoolFiller filler(pool, [&](size_t step) {
+            const size_t have = pool.resident_bytes();
+            return cap.load() > have ? std::min(step, cap.load() - have) : size_t(0);
+        });
+        std::atomic<bool> stop{false};
+        std::vector<std::thread> workers;
+        for (int w = 0; w < 3; ++w)
+            workers.emplace_back([&, w] {
+                uint64_t s = 88172645463325252ull + w;
+                for (int it = 0; it < 600 && !stop.load(); ++it) {
+                    s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+                    const size_t n = SegmentPool::min_alloc + size_t(s % (6 * MiB));
+                    uint8_t* p = static_cast<uint8_t*>(pool.allocate(n));
+                    if (p == nullptr) continue;
+                    const uint8_t tag = uint8_t(w * 80 + it);
+                    for (size_t k = 0; k < n; k += 4093) p[k] = tag;
+                    std::this_thread::yield();
+                    for (size_t k = 0; k < n; k += 4093) if (p[k] != tag) ++bad;
+                    pool.deallocate(p, n);
+                }
+            });
+        for (int i = 0; i < 300; ++i) {
+            filler.kick();
+            pool.shrink(8 * MiB);
+            (void) pool.idle_bytes();
+            std::this_thread::sleep_for(std::chrono::microseconds(300));
+        }
+        for (auto& t : workers) t.join();
+        stop = true;
+        check(bad.load() == 0, "no worker saw another's bytes in its range (ranges never overlap under threads)");
+        check(pool.live_requested() == 0, "every range was given back");
+        check(pool.resident_bytes() <= pool.capacity() && pool.idle_bytes() == pool.resident_bytes(), "residency stays within the pool and all of it is idle at the end");
+        check(pool.hits() > 0, "the workers were served");
     }
     // the process-wide hook: installed once
     {
