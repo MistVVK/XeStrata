@@ -25,6 +25,9 @@ FILES = {
                                      "                                          input_ids,\n"
                                      "                                          sd::Tensor<float>(),\n"
                                      + S.TE_CALL),
+    "model/diffusion/qwen_image_2_1.hpp": ('#include "model/diffusion/qwen_image.hpp"\n'
+                                           "                pe_data          = finish_rope_pe(std::move(embedding));\n"),
+    "model/diffusion/qwen_image_2_1_native.hpp": "            std::vector<float> pe_all = finish_rope_pe(std::move(emb));\n",
 }
 
 
@@ -50,6 +53,13 @@ class StageHooks(unittest.TestCase):
             self.assertEqual(cond.count('#include "own5_hooks.hpp"'), 1)
             # the other llm->compute call (no attention mask) is left alone
             self.assertEqual(cond.count("own5::dump_ids"), 1)
+            eng = (dst / "src" / "pipeline" / "diffusion_engine.cpp").read_bytes().decode()
+            self.assertEqual(eng.count("own5::dit_in_hook(diffusion_params.x, diffusion_params.timesteps);\n"
+                                       "            auto output_opt"), 1)
+            q21 = (dst / "src" / "model" / "diffusion" / "qwen_image_2_1.hpp").read_bytes().decode()
+            self.assertEqual(q21.count('own5::pe_hook(pe_data, "stock");'), 1)
+            nat = (dst / "src" / "model" / "diffusion" / "qwen_image_2_1_native.hpp").read_bytes().decode()
+            self.assertEqual(nat.count('own5::pe_hook(pe_all, "native");'), 1)
             hooks = (dst / "src" / "own5_hooks.hpp").read_text()
             self.assertIn("inline void dump_ids(const std::vector<int>& ids, const std::vector<float>& weights, int start)", hooks)
             before = {p: p.read_bytes() for p in dst.rglob("*") if p.is_file()}
