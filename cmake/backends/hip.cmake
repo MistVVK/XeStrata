@@ -42,11 +42,13 @@ macro(strata_hip_mmq)
     # Aurora: moe_fused.cu's gfx11 and moe_fused_iq.cu's gfx11 / gfx12 WMMA kernels for the prompt experts (opt-in STRATA_PF_FUSED=1)
     set(_strata_mmq_sources
       src/prefill/moe_mmq.cu
-      src/prefill/moe_fused.cu
-      src/prefill/moe_fused_iq.cu
-      src/prefill/moe_f16_kq.cu
       src/prefill/ggml_cuda_host.cu
       "${_strata_quantize_cu}")
+    # P4-SPLIT: Strata's own prompt kernels in a library of their own (strata_pf_own, as on CUDA)
+    set(_strata_pf_own_sources
+      src/prefill/moe_fused.cu
+      src/prefill/moe_fused_iq.cu
+      src/prefill/moe_f16_kq.cu)
     if(STRATA_MMQ_KQUANTS)
       # the same K-quant instances as the CUDA branch: on HIP they serve the dense GGUF projections
       # of Gemm::native (STRATA_DENSE_MMQ=1), the mixed-quant packs' attention/PLE tensors
@@ -60,11 +62,12 @@ macro(strata_hip_mmq)
         list(APPEND _strata_mmq_sources "${_strata_tq_overlay_dir}/template-instances/mmq-instance-${_t}.cu")
       endforeach()
     endif()
-    set_source_files_properties(${_strata_mmq_sources} PROPERTIES LANGUAGE HIP)
+    set_source_files_properties(${_strata_mmq_sources} ${_strata_pf_own_sources} PROPERTIES LANGUAGE HIP)
     # moe_fused.cu is Strata's own CUDA-shaped source: it takes the HIP compat headers, ggml's MMQ sources do not
-    set_source_files_properties(src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu src/prefill/moe_f16_kq.cu
+    set_source_files_properties(${_strata_pf_own_sources}
                                 PROPERTIES INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
     add_library(strata_mmq STATIC ${_strata_mmq_sources})
+    add_library(strata_pf_own STATIC ${_strata_pf_own_sources})
     target_include_directories(strata_mmq
       PRIVATE "${_strata_gg}/include" "${_strata_gg}/src" "${_strata_mmq}"
       PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -85,6 +88,9 @@ macro(strata_hip_mmq)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_TQP=1)
     endif()
     target_link_libraries(strata_mmq PUBLIC ggml-base hip::host roc::hipblas)
+    strata_pf_own_mirror()
+    target_link_libraries(strata_pf_own PUBLIC ggml-base hip::host roc::hipblas)
+    target_link_libraries(strata_mmq PUBLIC strata_pf_own)
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1 STRATA_PREFILL_FUSED=1)
     # Aurora: the gfx11 fused experts against the FP64 reference and MMQ (tests/cuda's test; exit 77 off gfx11)
@@ -122,6 +128,7 @@ if(STRATA_HIP_GFX906)
     file(GLOB _strata_mmq_cu ${_strata_mmq}/*.cu ${_strata_mmq}/template-instances/*.cu)
     list(APPEND _strata_cu ${_strata_mmq_cu})
     target_compile_definitions(strata_mmq PRIVATE GGML_USE_HIP)
+    target_compile_definitions(strata_pf_own PRIVATE GGML_USE_HIP)   # (P4-SPLIT: the files that were in strata_mmq keep its definitions)
     # #3172: strata_mmq_w4a4 is built from llama.cpp's headers too; without GGML_USE_HIP its common.cuh took the CUDA vendor header
     # (cuda.h, cuda_bf16.h: not found). Here it only reports that W4A4 (RTX 50's FP4 MMA) is not available.
     if(TARGET strata_mmq_w4a4)
@@ -138,7 +145,7 @@ if(STRATA_HIP_GFX906)
       endforeach()
       list(APPEND _strata_cu ${_strata_tq_hip})
     endif()
-    target_sources(strata_mmq PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_f16_kq.cu)
+    target_sources(strata_pf_own PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_f16_kq.cu)   # (Strata's own: beside moe_fused_iq.cu)
   endif()
   set_source_files_properties(${_strata_cu} PROPERTIES LANGUAGE HIP)
 endif()

@@ -33,7 +33,8 @@ class Gfx906CMake(unittest.TestCase):
         tail = HIP_TEXT[HIP_TEXT.index("# HIP gfx906: every CUDA source"):]
         self.assertIn("${_strata_tq_overlay_dir}/quantize.cu", tail)
         self.assertIn("mmq-instance-${_t}.cu", tail)
-        self.assertIn("target_sources(strata_mmq PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_f16_kq.cu)", tail)
+        # (P4-SPLIT: in strata_pf_own, Strata's own prompt kernels, beside moe_fused_iq.cu that calls it)
+        self.assertIn("target_sources(strata_pf_own PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/prefill/moe_f16_kq.cu)", tail)
         self.assertLess(tail.index("moe_f16_kq.cu"), tail.index("set_source_files_properties(${_strata_cu} PROPERTIES LANGUAGE HIP)"))
 
 

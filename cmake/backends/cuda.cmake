@@ -85,6 +85,18 @@ macro(strata_cuda_toolchain)
   set(_strata_gpu_include_directories ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 endmacro()
 
+# strata_pf_own (Strata's own prompt kernels) with strata_mmq's include directories (in their order, the trellis overlay's
+# first), definitions and options: the same command line for the files that left strata_mmq (CUDA and HIP)
+macro(strata_pf_own_mirror)
+  foreach(_strata_p INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS)
+    get_target_property(_strata_v strata_mmq ${_strata_p})
+    if(_strata_v)
+      set_property(TARGET strata_pf_own PROPERTY ${_strata_p} "${_strata_v}")
+    endif()
+  endforeach()
+  target_include_directories(strata_pf_own INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+endmacro()
+
 # strata_mmq, strata_mmq_w4a4 and libstrata_kq: llama.cpp's MMQ kernels for the prompt path (CUDA), and their tests
 macro(strata_cuda_mmq)
     # prompt-speed plan step 2b: llama.cpp's MMQ kernels (ggml-cuda, MIT) for the prompt path's experts, compiled
@@ -98,9 +110,13 @@ macro(strata_cuda_mmq)
     endif()
     # #136: the Q2_0 pack's prompt experts on Strata's own int8 kernels (moe_fused.cu, opt-in STRATA_PF_FUSED=1; CUDA
     # only: the HIP branch below keeps MMQ, and an sm_75 device or an sm_75-only build reports them unavailable)
-    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_iq4_w4a8.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
+    add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_iq4_w4a8.cu
                 src/prefill/mmq_nvfp4_w4a8.cu
                 src/prefill/ggml_cuda_host.cu ${_strata_quantize_cu})
+    # P4-SPLIT: Strata's own prompt kernels (the fused int8 experts) are a library of their own, strata_pf_own, so that a
+    # build without llama.cpp's MMQ keeps them.  With MMQ they are compiled with strata_mmq's command line (strata_pf_own_mirror
+    # below) and strata_mmq hands them on (PUBLIC): every target that links strata_mmq gets the same objects as before.
+    add_library(strata_pf_own STATIC src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu)
     if(STRATA_EXPERIMENTAL_SM60 AND NOT STRATA_HIP_GFX906)
       # GP100 (sm_60): a resident layer's experts weight-stationary, one launch per product (moe_ws.hpp; opt-in at
       # run time, STRATA_MMQ_WS=1, and only where every visible GPU is cc 6.0)
@@ -252,6 +268,12 @@ macro(strata_cuda_mmq)
     if(_strata_mmq_tqp)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_TQP=1)
     endif()
+    strata_pf_own_mirror()
+    target_link_libraries(strata_pf_own PUBLIC ggml-base ${_strata_gpu_runtime_target})
+    if(TARGET CUDA::cuda_driver)
+      target_link_libraries(strata_pf_own PUBLIC CUDA::cuda_driver)
+    endif()
+    target_link_libraries(strata_mmq PUBLIC strata_pf_own)
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1 STRATA_PREFILL_FUSED=1)
     if(STRATA_EXPERIMENTAL_SM60 AND NOT STRATA_HIP_GFX906)
@@ -379,7 +401,7 @@ if(STRATA_ENABLE_CUDA AND STRATA_BUILD_TESTS AND NOT STRATA_ENABLE_HIP AND NOT S
   find_package(Python3 QUIET COMPONENTS Interpreter)
   if(Python3_Interpreter_FOUND)
     set(_strata_spill_libs)
-    foreach(_t strata_kernels strata_core strata_engine strata_prefill strata_qwen35 strata_mmq strata_mmq_w4a4 strata_kq)
+    foreach(_t strata_kernels strata_core strata_engine strata_prefill strata_qwen35 strata_mmq strata_pf_own strata_mmq_w4a4 strata_kq)
       if(TARGET ${_t})
         list(APPEND _strata_spill_libs $<TARGET_FILE:${_t}>)
       endif()
