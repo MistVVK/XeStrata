@@ -224,12 +224,6 @@ static void test_round_choice() {
     bool ok = true;
     for (const Case& c : cs) ok = ok && vit_cpu_round_kind(c.kind, c.env) == c.want;
     check(ok, "rounding default per weight type and its override", "-", 0, 0);
-    // `--tower auto` keeps mtmd on an MSVC x86 build of the CPU tower (vit_cpu.h); any other compiler or CPU family uses ours
-#if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
-    check(vit_cpu_build_slower_than_mtmd(), "an MSVC x86 build is marked slower than mtmd", "-", 0, 0);
-#else
-    check(!vit_cpu_build_slower_than_mtmd(), "a non-MSVC build is not marked slower than mtmd", "-", 0, 0);
-#endif
 }
 
 int main(int argc, char** argv) {

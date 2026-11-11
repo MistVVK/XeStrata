@@ -38,6 +38,10 @@ inline bool vit_gpu_slower_nvidia(int cc_major, int cc_minor, bool bf16_matrices
 // RESULTS-OWN-3V.md 12.14).  Windows and Linux alike until a Linux gfx1151 box is measured.  `gfx` is the device's arch name (hipDeviceProp_t::gcnArchName,
 // possibly with feature suffixes such as ":xnack-").
 inline bool vit_gpu_slower_amd(const std::string& gfx) { return gfx.rfind("gfx1151", 0) == 0 && (gfx.size() == 7 || gfx[7] == ':'); }
+// AMD on Windows, every card (coordinator 11-11, with the default flip to our tower): the Windows HIP package's rocBLAS is the one whose gfx1151 kernels are
+// fallback-only, and no other card has been measured with that package, so `auto` keeps mtmd's reader on Windows HIP.  Not measured on Windows HIP; remove when
+// one RX 9000 / RX 7000 run on Windows is in.  Linux HIP (gfx12 measured on the R9700) is not affected.
+inline bool vit_gpu_hip_windows_not_measured(bool windows) { return windows; }
 
 class VitGpu {
 public:
