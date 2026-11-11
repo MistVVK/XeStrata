@@ -65,6 +65,11 @@ void quantize_act(const float* x, int64_t rows, int64_t cols, void* xa, void* st
 /// `src[row]` = its token (i / k).  The order of the rows within an expert is not fixed; no output depends on it.
 void group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, int32_t* slot, int32_t* src,
            void* stream);
+/// The tables of one GATHERED group (the layer-major walk's): its experts get the local indices 0..n_expert-1, expert e
+/// the rows [bounds[e], bounds[e + 1]) of the group (`bounds` on the device, n_expert + 1 ints, bounds[0] = 0, rows
+/// sorted by expert).  The row's token is the caller's (`src` of experts_native); the outputs go to the group's rows.
+/// `scratch`: group_bytes(bounds[n_expert], n_expert).
+void group_bounds(const int32_t* bounds, int n_expert, void* scratch, void* stream);
 
 /// Experts [e0, e1) of one layer (e1 - e0 <= kMaxBatch); blob[e - e0]: the Strata Q2_0 blob of expert e on the
 /// device (16-byte aligned), read only for an expert with rows.

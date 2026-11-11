@@ -161,6 +161,7 @@ size_t act_bytes(int64_t, int64_t) { return 0; }
 size_t group_bytes(int64_t, int) { return 0; }
 void quantize_act(const float*, int64_t, int64_t, void*, void*) {}
 void group(const int32_t*, int64_t, int, int, void*, int32_t*, int32_t*, void*) {}
+void group_bounds(const int32_t*, int, void*, void*) {}
 void experts(const Batch&, int, int64_t, const void*, const void*, const int32_t*, void*, float*, void*) {}
 bool native_supported(int, int) { return false; }
 void quantize_act_native(const float*, int64_t, int64_t, void*, void*) {}

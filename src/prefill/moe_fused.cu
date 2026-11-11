@@ -173,6 +173,28 @@ __global__ void scan_kernel(Tables tb, int E) {
     }
 }
 
+// group_bounds: one gathered group's tables, expert e of the group (a local index) with the rows [bounds[e], bounds[e + 1]);
+// one block, a thread per expert (E <= 1024), the same tables scan_kernel writes
+__global__ void bounds_kernel(const int32_t* __restrict__ bounds, Tables tb, int E) {
+    __shared__ int sh[32];
+    const int e = threadIdx.x;
+    const int o = e < E ? bounds[e] : 0;
+    const int c = e < E ? bounds[e + 1] - o : 0, nt = (c + kTileRows - 1) / kTileRows;
+    int tiles = 0;
+    const int to = block_excl_sum(nt, &tiles, sh);
+    if (e < E) {
+        tb.cnt[e] = c;
+        tb.off[e] = o;
+        tb.fill[e] = o + c;
+        tb.ts[e] = to;
+        for (int i = 0; i < nt; ++i) tb.tiles[to + i] = make_int2(e, o + i * kTileRows);
+    }
+    if (e == 0) {
+        tb.off[E] = bounds[E];
+        tb.ts[E] = tiles;
+    }
+}
+
 __global__ void place_kernel(const int32_t* __restrict__ ids, int64_t n, int k, int E, Tables tb,
                              int32_t* __restrict__ slot, int32_t* __restrict__ src) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -734,6 +756,15 @@ void group(const int32_t* ids, int64_t n, int k, int n_expert, void* scratch, in
     scan_kernel<<<1, (unsigned) ((n_expert + 31) / 32 * 32), 0, s>>>(tb, n_expert);
     if (n > 0) place_kernel<<<blocks(n, 256), 256, 0, s>>>(ids, n, k, n_expert, tb, slot, src);
     ck(cudaGetLastError(), "group");
+}
+
+void group_bounds(const int32_t* bounds, int n_expert, void* scratch, void* stream) {
+    if (n_expert < 1 || n_expert > 1024) {
+        std::fprintf(stderr, "prefill fused experts: a group of %d experts (the grouping takes 1 to 1024)\n", n_expert);
+        std::exit(1);
+    }
+    bounds_kernel<<<1, (unsigned) ((n_expert + 31) / 32 * 32), 0, (cudaStream_t) stream>>>(bounds, tables(scratch, n_expert), n_expert);
+    ck(cudaGetLastError(), "group_bounds");
 }
 
 void experts(const Batch& b, int n_expert, int64_t n, const void* scratch, const void* xa, const int32_t* src,
