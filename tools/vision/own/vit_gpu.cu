@@ -257,6 +257,14 @@ __global__ void k_cast(const float* __restrict__ in, size_t n, void* out, int ki
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) store_kind(out, i, in[i], kind);
 }
 
+#if defined(STRATA_VIT_HIP)
+// n 16-bit values (K_F16: F16, else BF16) to float32 (STRATA_VIT_HPA16: a product computed with float32 accumulation and a 16-bit result, widened back)
+__global__ void k_widen16(const uint16_t* __restrict__ in, size_t n, float* __restrict__ out, int kind) {
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
+        out[i] = kind == K_F16 ? __half2float(__ushort_as_half(in[i])) : __uint_as_float((uint32_t) in[i] << 16);
+}
+#endif
+
 // x[r] += y[r] + bias
 __global__ void k_add_bias_res(float* __restrict__ x, const float* __restrict__ y, const float* __restrict__ bias, int D) {
     const size_t base = (size_t) blockIdx.x * D;
@@ -477,11 +485,35 @@ struct VitGpuImpl {
     }
 #endif
 
+#if defined(STRATA_VIT_HIP)
+    // STRATA_VIT_HPA16=1 (off by default): the 16-bit weight products ask rocBLAS for a 16-bit RESULT with float32 accumulation (BF16 -> BF16 and F16 -> F16,
+    // compute 32F: rocBLAS's BB_HPA / HH_HPA kernels), then widen it to float32.  On gfx110x and gfx1151 the Windows ROCm package's rocBLAS has tuned kernels
+    // for those types and only its generic fallback kernels for BF16 / F16 -> F32 (BS_HPA / HS_HPA), which our products asked for (lane COVER 11-11,
+    // phaseA-tests\par\RESULTS-COVER.md); mtmd's reader asks for the 16-bit result there.  STRATA_VIT_HPA16_ATT=1: the same for the attention's P*V product
+    // (F16 -> F16, float32 accumulation; the score product S is F16 -> F16 already).  The result is the float32 sum rounded once to 16 bits.
+    bool hpa16 = false, hpa16_att = false;
+    uint16_t *d_y16 = nullptr, *d_pv16 = nullptr;     // the 16-bit results (sized with the work buffers when the switch is on)
+    size_t y16_elems = 0, pv16_elems = 0;
+#endif
+
     // C = alpha * op(A) * op(B), batched, column-major as the BLAS wants it
     bool bgemm(bool ta, bool tb, int m, int n, int k, const void* A, cudaDataType_t at, int lda, long long sa, const void* B, cudaDataType_t bt, int ldb,
                long long sb, void* C, cudaDataType_t ct, int ldc, long long sc, int batch, std::string& err) {
 #if defined(STRATA_VIT_HIPBLASLT)
         if (lt_att && lt_mm(ta, tb, m, n, k, A, at, lda, sa, B, bt, ldb, sb, C, ct, ldc, sc, batch, -1)) return true;
+#endif
+#if defined(STRATA_VIT_HIP)
+        // a float32 result whose batches tile its rows (P*V: the heads side by side in a row of the context): 16-bit result, then widened
+        if (hpa16_att && ct == CUDA_R_32F && at == CUDA_R_16F && bt == CUDA_R_16F && (long long) batch * sc == ldc && m <= ldc &&
+            (size_t) n * ldc <= pv16_elems) {
+            const float alpha = 1.0f, beta = 0.0f;
+            const cublasStatus_t s = cublasGemmStridedBatchedEx(blas, ta ? CUBLAS_OP_T : CUBLAS_OP_N, tb ? CUBLAS_OP_T : CUBLAS_OP_N, m, n, k, &alpha, A, at, lda,
+                                                                sa, B, bt, ldb, sb, &beta, d_pv16, CUDA_R_16F, ldc, sc, batch, VIT_COMPUTE_32F, VIT_GEMM_DEFAULT);
+            if (s != CUBLAS_STATUS_SUCCESS) { err = "the batched BLAS product failed (status " + std::to_string((int) s) + ")"; return false; }
+            const size_t cnt = (size_t) n * ldc;
+            k_widen16<<<blocks_for(cnt), 256>>>(d_pv16, cnt, (float*) C, (int) K_F16);
+            return true;
+        }
 #endif
         const float alpha = 1.0f, beta = 0.0f;
         const cublasStatus_t s = cublasGemmStridedBatchedEx(blas, ta ? CUBLAS_OP_T : CUBLAS_OP_N, tb ? CUBLAS_OP_T : CUBLAS_OP_N, m, n, k, &alpha, A, at, lda, sa,
@@ -562,6 +594,16 @@ struct VitGpuImpl {
         if (lt_weights && kind_a != CUDA_R_32F)
             done = lt_mm(true, false, w.rows, M, w.cols, w.p, kind_a, w.cols, 0, A, kind_a, w.cols, 0, y, CUDA_R_32F, w.rows, 0, 1, lt_sol);
 #endif
+#if defined(STRATA_VIT_HIP)
+        if (!done && hpa16 && kind_a != CUDA_R_32F && (size_t) M * w.rows <= y16_elems) {
+            const cublasStatus_t s = cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, w.rows, M, w.cols, &alpha, w.p, kind_a, w.cols, A, kind_a, w.cols, &beta, d_y16,
+                                                  kind_a, w.rows, VIT_COMPUTE_32F, VIT_GEMM_DEFAULT);
+            if (s != CUBLAS_STATUS_SUCCESS) { err = "the BLAS matrix product failed (status " + std::to_string((int) s) + ")"; return false; }
+            const size_t cnt = (size_t) M * w.rows;
+            k_widen16<<<blocks_for(cnt), 256>>>(d_y16, cnt, (float*) y, kind_a == CUDA_R_16F ? (int) K_F16 : (int) K_BF16);
+            done = true;
+        }
+#endif
         if (!done) {
             const cublasStatus_t s = cublasGemmEx(blas, CUBLAS_OP_T, CUBLAS_OP_N, w.rows, M, w.cols, &alpha, w.p, kind_a, w.cols, A, kind_a, w.cols, &beta, y,
                                                   CUDA_R_32F, w.rows, VIT_COMPUTE_32F, VIT_GEMM_DEFAULT);
@@ -605,6 +647,12 @@ struct VitGpuImpl {
         bool ok = alloc(d_x, N * D, err, false) && alloc(d_ctx, ctx_elems, err, false) && alloc(d_y, R * std::max<size_t>(3 * D, F), err, false) &&
                   alloc(d_a, R * D, err, false) && alloc(d_f16, R * F, err, false) &&
                   alloc(d_q16, N * D, err, false) && alloc(d_k16, N * D, err, false) && alloc(d_v16, N * D, err, false);
+#if defined(STRATA_VIT_HIP)
+        d_y16 = d_pv16 = nullptr;
+        y16_elems = pv16_elems = 0;
+        if (ok && hpa16) { y16_elems = R * std::max<size_t>(3 * D, F); ok = alloc(d_y16, y16_elems, err, false); }
+        if (ok && hpa16_att) { pv16_elems = N * D; ok = alloc(d_pv16, pv16_elems, err, false); }
+#endif
         if (ok && !alloc(d_S, sp_elems, err, false)) {
             // no room for the large chunk (a small card, or the engine beside the reader): the 16 MB chunk instead, slower, never an error
             ok = false;
@@ -679,6 +727,13 @@ bool VitGpu::load(const Gguf& gg, const VitGeometry& g, int device, int max_patc
     if (cublasCreate(&m.blas) != CUBLAS_STATUS_SUCCESS) { err = "cannot create the BLAS handle"; return false; }
 #if defined(STRATA_VIT_HIPBLASLT)
     m.lt_setup();
+#endif
+#if defined(STRATA_VIT_HIP)
+    if (const char* e = std::getenv("STRATA_VIT_HPA16")) m.hpa16 = std::atoi(e) != 0;
+    if (const char* e = std::getenv("STRATA_VIT_HPA16_ATT")) m.hpa16_att = std::atoi(e) != 0;
+    if (m.hpa16 || m.hpa16_att)
+        std::fprintf(stderr, "vit-hpa16: 16-bit results with float32 accumulation for %s%s%s\n", m.hpa16 ? "the weight products" : "",
+                     m.hpa16 && m.hpa16_att ? " and " : "", m.hpa16_att ? "the attention's P*V product" : "");
 #endif
     // the patch embedding: the two temporal taps summed, kept in float32 (a small matrix)
     {
