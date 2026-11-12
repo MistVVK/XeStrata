@@ -378,6 +378,14 @@ struct GrpPath {
     }
 };
 
+static void set_i8_tm(int tm) {   // research: STRATA_I8_TM for the next native_expert_i8 calls (0 = unset: the call's own choice)
+#if defined(_WIN32)
+    _putenv_s("STRATA_I8_TM", tm > 0 ? std::to_string(tm).c_str() : "");
+#else
+    if (tm > 0) setenv("STRATA_I8_TM", std::to_string(tm).c_str(), 1); else unsetenv("STRATA_I8_TM");
+#endif
+}
+
 // I8: the same layer through native_expert_i8 (our own int8 dot-product tile kernels, src/kernels/cuda/i8_expert.cuh); the same tables and activations as GRP
 struct I8Path : GrpPath {
     using GrpPath::GrpPath;
@@ -530,6 +538,7 @@ struct Opts {
     Shape shape{2560, 640, 512, 10, "flash"};
     std::vector<int> tokens = {2048, 4096, 8192, 20000};
     std::vector<std::string> only;
+    std::vector<int> i8_tms;   // --i8-tm=2,3,4: one extra I8 column per tile-row count (STRATA_I8_TM set around each run)
     bool dense = false, tokens_set = false, all = false, list = false, grouped = false, i8 = false, no_grp = false, no_mmq = false, no_fused = false, no_fp16 = false, no_ref = false, quick = false;
     int repeats = 7, sample = 96, experts = 0;
     float warm_ms = 1000.0f;
@@ -676,7 +685,14 @@ void run_cell(const Pair& p, const Shape& s, int T, const Opts& o, const Card& c
         if (fr_ok) paths.push_back({"FP16+FR", [&] { fp->run(true, x_dev.as<float>(), x16_dev.as<uint16_t>(), src_dev.as<int32_t>(), st); }, pair_rows, {}, {}, {}, 0});
     }
     if (gp) paths.push_back({"GRP", [&] { gp->run(x_dev.as<float>(), st); }, pair_rows, {}, {}, {}, 0});
-    if (ip) paths.push_back({"I8", [&] { ip->run_i8(x_dev.as<float>(), st); }, pair_rows, {}, {}, {}, 0});
+    if (ip) paths.push_back({"I8", [&] { set_i8_tm(0); ip->run_i8(x_dev.as<float>(), st); }, pair_rows, {}, {}, {}, 0});
+    if (ip) {
+        static const char* const tm_names[] = {"I8t1", "I8t2", "I8t3", "I8t4", "I8t5", "I8t6"};
+        for (size_t k = 0; k < o.i8_tms.size() && k < 6; ++k) {
+            const int tm = o.i8_tms[k];
+            paths.push_back({tm_names[k], [&, tm] { set_i8_tm(tm); ip->run_i8(x_dev.as<float>(), st); }, pair_rows, {}, {}, {}, 0});
+        }
+    }
     if (fu) paths.push_back({"FUSED", [&] { fu->run(x_dev.as<float>(), st); },
                              [&] {
                                  std::vector<int32_t> slot((size_t) rows);
@@ -1021,6 +1037,10 @@ int main(int argc, char** argv) {
             else if (!std::strcmp(a, "--all")) o.all = true;
             else if (!std::strcmp(a, "--list")) o.list = true;
             else if (!std::strcmp(a, "--grouped")) o.grouped = true;
+            else if (std::string v10 = arg_after(a, "--i8-tm="); !v10.empty()) {
+                o.i8 = true;
+                for (size_t q = 0; q < v10.size();) { o.i8_tms.push_back(std::atoi(v10.c_str() + q)); q = v10.find(',', q) == std::string::npos ? v10.size() : v10.find(',', q) + 1; }
+            }
             else if (!std::strcmp(a, "--i8")) o.i8 = true;
             else if (!std::strcmp(a, "--no-grp")) o.no_grp = true;
             else if (!std::strcmp(a, "--no-mmq")) o.no_mmq = true;

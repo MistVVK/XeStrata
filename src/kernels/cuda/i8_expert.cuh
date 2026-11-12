@@ -22,6 +22,11 @@
 //                     epilogue (a thread holds gate and up of the same feature; the 16 lanes of a row hold the 32 features of one
 //                     q8_1 block), so gate/up never go to memory; !GU: down rows, FP32 into out[ent_dst].
 // Formats: gate/up IQ2_XXS(16) IQ2_XS(17) IQ3_XXS(18) IQ3_S(21) IQ2_S(22); down IQ4_NL(20) Q2_0(42).
+#ifndef I8_BLK_UNROLL
+#define I8_BLK_UNROLL 1     // unroll factor of the 32-value sub-block loop of one stage (the full unroll hoisted every LDS read: 256 VGPRs and 55-200 spilled on gfx1031)
+#endif
+#define I8_STR_(x) #x
+#define I8_PRAGMA_UNROLL(n) _Pragma(I8_STR_(unroll n))
 constexpr int I8_KS = 128;     // values of K per stage
 constexpr int I8_LD = 36;      // dwords per shared row of a stage: 32 + 4 (no bank conflicts for the 16-byte reads)
 constexpr int I8_NT = 256;
@@ -338,7 +343,7 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
         if (st + 1 < ns) { load_w(st + 1, wraw); load_a(st + 1, ar); }
         const uint32_t* const W = s_w + b * SM::SZ_W;
         const uint32_t* const Ab = s_a + b * SM::SZ_A;
-#pragma unroll
+        I8_PRAGMA_UNROLL(I8_BLK_UNROLL)
         for (int blk = 0; blk < 4; ++blk) {
             int m0[4], m1[4];
             float bw[4];
