@@ -1,0 +1,164 @@
+{
+  "_about": "Known cuda_spill_guard violations: kernel instances over their ALLOWED allowance on the base that are inherited and not yet fixed. Per architecture, each by its exact instance name (tools/check_cuda_spills.py instance_key) with the bytes measured. A violation listed here at or below its bytes passes as known; a new instance, or a listed one above its bytes, fails. Another CUDA toolkit may list a slightly different set of instances; add what it measures here, never raise a number to hide growth. sm_60 has no baseline (about 400 violations, nothing measured per instance): the guard says so and its violations fail as before.",
+  "sm_120": {
+    "measured_with": "cuobjdump Build cuda_13.2.r13.2/compiler.37953736_0; the guard libraries of the base bb1bdb4da (MMQ on, tests on, CUDA 13.2, sm_120-real)",
+    "instances": [
+      {
+        "name": "strata::kernels::{anonymous}::tp_band_kernel",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::mmq::{anonymous}::iq4_w4a8_kernel<false, strata::prefill::mmq::{anonymous}::Cfg<104, 2, 1, 1, 72, 1>>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::mmq::{anonymous}::iq4_w4a8_kernel<false, strata::prefill::mmq::{anonymous}::Cfg<112, 2, 1, 1, 72, 1>>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::mmq::{anonymous}::iq4_w4a8_kernel<false, strata::prefill::mmq::{anonymous}::Cfg<128, 2, 1, 1, 72, 1>>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::mmq::{anonymous}::iq4_w4a8_kernel<false, strata::prefill::mmq::{anonymous}::Cfg<96, 2, 1, 1, 72, 1>>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::mmq::{anonymous}::iq4_w4a8_kernel<true, strata::prefill::mmq::{anonymous}::Cfg<104, 2, 1, 1, 72, 1>>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::mmq::{anonymous}::iq4_w4a8_kernel<true, strata::prefill::mmq::{anonymous}::Cfg<112, 2, 1, 1, 72, 1>>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::mmq::{anonymous}::iq4_w4a8_kernel<true, strata::prefill::mmq::{anonymous}::Cfg<128, 2, 1, 1, 72, 1>>",
+        "stack": 56,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::mmq::{anonymous}::iq4_w4a8_kernel<true, strata::prefill::mmq::{anonymous}::Cfg<96, 2, 1, 1, 72, 1>>",
+        "stack": 48,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      }
+    ]
+  },
+  "sm_86": {
+    "measured_with": "cuobjdump Build cuda_13.2.r13.2/compiler.37953736_0; the guard libraries of the base bb1bdb4da (MMQ on, tests on) compiled for sm_86-real on a CUDA 13.2 box: the same 16 instances and bytes as measured on CUDA 13.1 on an RTX A6000",
+    "instances": [
+      {
+        "name": "strata::kernels::{anonymous}::gemm_rows_kernel<2, 2, 2>",
+        "stack": 40,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::gemm_rows_kernel<4, 2, 2>",
+        "stack": 40,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::gemm_rows_kernel<8, 2, 4>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::kernels::{anonymous}::rope_table_inv_kernel",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<12, true, 2, 512, false>",
+        "stack": 64,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<12, true, 4, 512, false>",
+        "stack": 72,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<13, true, 2, 512, false>",
+        "stack": 72,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<13, true, 4, 512, false>",
+        "stack": 80,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::fused::{anonymous}::native_kernel<14, true, 4, 512, false>",
+        "stack": 64,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::mmq::{anonymous}::iq4_w4a8_kernel<false, strata::prefill::mmq::{anonymous}::Cfg<104, 2, 1, 1, 72, 1>>",
+        "stack": 32,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::mmq::{anonymous}::iq4_w4a8_kernel<false, strata::prefill::mmq::{anonymous}::Cfg<112, 2, 1, 1, 72, 1>>",
+        "stack": 40,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::mmq::{anonymous}::iq4_w4a8_kernel<false, strata::prefill::mmq::{anonymous}::Cfg<128, 2, 1, 1, 72, 1>>",
+        "stack": 40,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::mmq::{anonymous}::iq4_w4a8_kernel<false, strata::prefill::mmq::{anonymous}::Cfg<96, 2, 1, 1, 72, 1>>",
+        "stack": 16,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::mmq::{anonymous}::iq4_w4a8_kernel<true, strata::prefill::mmq::{anonymous}::Cfg<104, 2, 1, 1, 72, 1>>",
+        "stack": 8,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::mmq::{anonymous}::iq4_w4a8_kernel<true, strata::prefill::mmq::{anonymous}::Cfg<112, 2, 1, 1, 72, 1>>",
+        "stack": 40,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      },
+      {
+        "name": "strata::prefill::mmq::{anonymous}::iq4_w4a8_kernel<true, strata::prefill::mmq::{anonymous}::Cfg<128, 2, 1, 1, 72, 1>>",
+        "stack": 40,
+        "local": 0,
+        "reason": "inherited, not yet fixed"
+      }
+    ]
+  },
+  "sm_60": null
+}

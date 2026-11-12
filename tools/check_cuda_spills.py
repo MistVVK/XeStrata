@@ -23,15 +23,30 @@ sits in `strata::` or in an anonymous namespace.  The report line counts what wa
                                         nothing judged: this is how the numbers in ALLOWED were produced
   --cuobjdump PATH                      the toolkit's cuobjdump when bin/ is not on PATH (CMake passes it)
 
-Exit 0 = clean, 1 = a violation, 77 = cannot run here (cuobjdump missing, a library missing; ctest SKIP_RETURN_CODE).
+Known violations (tools/cuda_spill_baseline.json): some kernels are over their allowance on the base and have not been fixed
+yet.  Raising ALLOWED for them would hide any later growth, so they are listed per architecture by exact instance name (the
+demangled name with its template arguments, without the parameter list) with the bytes measured, each with the reason
+"inherited, not yet fixed".  A violation that is such an instance, at or below its listed bytes, is counted as known and does not
+fail the check; a violation that is not listed (a new instance), and a listed instance above its bytes, fail.  The report line
+prints the known count.  An architecture with no baseline (sm_60: about 400 violations, nothing measured per instance) prints
+"no baseline for <sm>" and its violations fail as before.  --baseline FILE reads another baseline; --print-baseline prints the
+file's entries for the violations found (how the baseline was made).
+
+Exit 0 = clean (or only known violations), 1 = a new or grown violation, 2 = the baseline file cannot be read, 77 = cannot run
+here (cuobjdump missing, a library missing; ctest SKIP_RETURN_CODE).
 """
 import argparse
 import csv
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+
+# the known violations (see the docstring): per architecture, each inherited instance by exact name with its measured bytes
+BASELINE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cuda_spill_baseline.json")
+KNOWN_REASON = "inherited, not yet fixed"
 
 # 0.2.7 (f-027-gh-eng): re-measured on f-027-int with CUDA 13.0 for sm_120 (Windows, MSVC) and sm_86 (Linux, cuobjdump 12.9
 # reading the CUDA 13.0 objects); an allowance is only ever raised here, never lowered, and the entries that now read 0 with
@@ -384,10 +399,80 @@ def demangle(demangler, names):
     return dict(zip(names, out))
 
 
-def check(path, rows, names):
-    archs = sorted({sm for _, sm, _, _ in rows})
+def instance_key(demangled):
+    """The exact instance name: the demangled name with its template arguments, without return type and parameter list, spelled the
+    same whichever demangler printed it (cu++filt: <unnamed>, (bool)1, (int)96; binutils' c++filt: (anonymous namespace), true, 96,
+    96u, "> >").  The baseline's key."""
+    s = demangled.replace("(anonymous namespace)", "{anonymous}").replace("<unnamed>", "{anonymous}")
+    s = s.replace("(bool)1", "true").replace("(bool)0", "false")
+    s = re.sub(r"\((?:unsigned )?(?:long long|long|int|short|char)\)(-?\d+)", r"\1", s)      # cu++filt's cast before a literal
+    s = re.sub(r"(?<=\d)[ul]+(?![\w])", "", s)                                                # c++filt's 96u / 96ul suffixes
+    while re.search(r">\s+>", s):
+        s = re.sub(r">\s+>", ">>", s)
+    depth, cut = 0, len(s)
+    for i, c in enumerate(s):                       # the parameter list starts at the first '(' outside <...>
+        if c == "<":
+            depth += 1
+        elif c == ">":
+            depth -= 1
+        elif c == "(" and depth == 0:
+            cut = i
+            break
+    s = s[:cut].strip()
+    depth, start = 0, 0
+    for i, c in enumerate(s):                       # a template kernel is printed with its return type: "void ns::k<1, 2>"
+        if c == "<":
+            depth += 1
+        elif c == ">":
+            depth -= 1
+        elif c == " " and depth == 0:
+            start = i + 1
+    return s[start:] or demangled
+
+
+def load_baseline(path):
+    """{sm: {instance name: (stack, local, reason)}} from the baseline file; an architecture that is not in the file has no
+    baseline.  A file that cannot be read, or an entry that is incomplete, is an error (ValueError), never an empty baseline."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            raw = json.load(f)
+    except (OSError, ValueError) as e:
+        raise ValueError("cannot read the baseline %s: %s" % (path, e))
+    if not isinstance(raw, dict):
+        raise ValueError("the baseline %s is not a JSON object" % path)
+    out = {}
+    for sm, block in raw.items():
+        if sm.startswith("_") or block is None:     # "_about" and the like; null = stated as having no baseline
+            continue
+        entries = block.get("instances") if isinstance(block, dict) else None
+        if not isinstance(entries, list):
+            raise ValueError("the baseline %s: %s has no \"instances\" list" % (path, sm))
+        per = {}
+        for e in entries:
+            ok = (isinstance(e, dict) and isinstance(e.get("name"), str) and e["name"]
+                  and all(isinstance(e.get(k), int) and not isinstance(e.get(k), bool) and e[k] >= 0 for k in ("stack", "local"))
+                  and isinstance(e.get("reason"), str) and e["reason"].strip())
+            if not ok:
+                raise ValueError("the baseline %s: %s has an entry without name, stack, local and reason: %r" % (path, sm, e))
+            if e["name"] in per:
+                raise ValueError("the baseline %s: %s lists %s twice" % (path, sm, e["name"]))
+            per[e["name"]] = (e["stack"], e["local"], e["reason"])
+        out[sm] = per
+    return out
+
+
+def default_baseline():
+    """The baseline beside this script; a missing file is an empty baseline (every architecture reports "no baseline")."""
+    if not os.path.exists(BASELINE_FILE):
+        return {}
+    return load_baseline(BASELINE_FILE)
+
+
+def find_violations(rows, names):
+    """(gated entries, entries that use stack or local memory, [violation]) for the rows of one library: a violation is an entry over
+    ALLOWED (or not in it), as (demangled name, instance key, sm, stack, local, why, object)."""
     gated = [(obj, sm, func, cols) for obj, sm, func, cols in rows if not vendored(kernel_key(names[func]))]
-    held, bad = 0, []
+    held, viols = 0, []
     for obj, sm, func, cols in gated:
         stack, local = cols.get("STACK", 0), cols.get("LOCAL", 0)
         if stack == 0 and local == 0:
@@ -400,13 +485,54 @@ def check(path, rows, names):
             why = "over its allowance STACK %d LOCAL %d" % allow
         else:
             continue
-        bad.append((names[func], sm, stack, local, why, obj))
+        viols.append((names[func], instance_key(names[func]), sm, stack, local, why, obj))
+    return gated, held, viols
+
+
+def check(path, rows, names, baseline=None, seen=None, verbose=False):
+    """Judge one library.  `baseline` is load_baseline's result (default: the file beside this script); `seen`, when given, collects
+    {sm: {instance names}} of the known instances found, for the caller's count over several libraries."""
+    if baseline is None:
+        baseline = default_baseline()
+    archs = sorted({sm for _, sm, _, _ in rows})
+    gated, held, viols = find_violations(rows, names)
+    known, bad, no_base = [], [], {}
+    for name, inst, sm, stack, local, why, obj in viols:
+        base = baseline.get(sm)
+        if base is None:
+            no_base[sm] = no_base.get(sm, 0) + 1
+        elif inst in base:
+            b_stack, b_local, _ = base[inst]
+            if stack <= b_stack and local <= b_local:
+                known.append((name, sm, stack, local, obj))
+                if seen is not None:
+                    seen.setdefault(sm, set()).add(inst)
+                continue
+            why = "known instance grew: over its baseline STACK %d LOCAL %d" % (b_stack, b_local)
+        bad.append((name, sm, stack, local, why, obj))
     print("check_cuda_spills: %s: %d kernels on %s (%d entries; %d vendored ggml entries skipped), %d use stack / "
-          "local memory, %d not allowed" % (path, len({f for _, _, f, _ in gated}), ", ".join(archs), len(gated),
-                                           len(rows) - len(gated), held, len(bad)))
+          "local memory, %d of them known from the baseline, %d not allowed" % (
+              path, len({f for _, _, f, _ in gated}), ", ".join(archs), len(gated), len(rows) - len(gated), held, len(known),
+              len(bad)))
+    for sm in sorted(no_base):
+        print("check_cuda_spills: no baseline for %s: its %d violations cannot be told from new ones (baselines: %s)" % (
+            sm, no_base[sm], ", ".join(sorted(baseline)) or "none"))
+    if verbose:
+        for name, sm, stack, local, obj in known:
+            print("  known %s %s: STACK %d LOCAL %d [%s]" % (name[:160], sm, stack, local, obj))
     for name, sm, stack, local, why, obj in bad:
         print("  VIOLATION %s %s: STACK %d LOCAL %d (%s) [%s]" % (name[:160], sm, stack, local, why, obj))
     return 1 if bad else 0
+
+
+def toolkit_line(cuobjdump):
+    """The last line of `cuobjdump --version` (the toolkit release), for the baseline's "measured_with"."""
+    try:
+        run = subprocess.run([cuobjdump, "--version"], capture_output=True, text=True, timeout=30)
+        lines = [l.strip() for l in run.stdout.splitlines() if l.strip()]
+        return lines[-1] if lines else "unknown"
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
 
 
 def main():
@@ -414,6 +540,10 @@ def main():
     ap.add_argument("library", nargs="+", help="a static library, object, shared library or executable with SASS")
     ap.add_argument("--list", action="store_true", help="print every kernel on every sm_ as CSV, judge nothing")
     ap.add_argument("--cuobjdump", help="the toolkit's cuobjdump (default: on PATH)")
+    ap.add_argument("--baseline", help="the known-violations file (default: cuda_spill_baseline.json beside this script)")
+    ap.add_argument("--print-baseline", action="store_true",
+                    help="print the baseline entries (JSON) for the violations found, judge nothing: how the baseline was made")
+    ap.add_argument("-v", "--verbose", action="store_true", help="also print every known violation")
     a = ap.parse_args()
     cuobjdump, demangler = find_tools(a.cuobjdump)
     if cuobjdump is None:
@@ -428,10 +558,18 @@ def main():
         if not os.path.exists(lib):
             print("check_cuda_spills: %s does not exist" % lib)
             return 77
+    baseline = {}
+    if not a.list and not a.print_baseline:
+        try:
+            baseline = load_baseline(a.baseline) if a.baseline else default_baseline()
+        except ValueError as e:        # a baseline that cannot be read is never an empty one: that would pass nothing known and hide it
+            print("check_cuda_spills: %s" % e)
+            return 2
     out = csv.writer(sys.stdout, lineterminator="\n") if a.list else None
     if out:
         out.writerow(["library", "object", "sm", "reg", "stack", "local", "shared", "kernel", "mangled", "gated"])
     rc = 0
+    seen, archs_seen, found = {}, set(), {}
     for lib in a.library:
         rows = resource_usage(cuobjdump, lib)
         if rows is None:
@@ -450,8 +588,21 @@ def main():
                 out.writerow([os.path.basename(lib), obj, sm, cols.get("REG", 0), cols.get("STACK", 0),
                               cols.get("LOCAL", 0), cols.get("SHARED", 0), names[func], func,
                               0 if vendored(kernel_key(names[func])) else 1])
+        elif a.print_baseline:
+            for _, inst, sm, stack, local, _, _ in find_violations(rows, names)[2]:
+                old = found.setdefault(sm, {}).get(inst, (0, 0))
+                found[sm][inst] = (max(stack, old[0]), max(local, old[1]))
         else:
-            rc = max(rc, check(lib, rows, names))
+            archs_seen.update(sm for _, sm, _, _ in rows)
+            rc = max(rc, check(lib, rows, names, baseline, seen, a.verbose))
+    if a.print_baseline:
+        print(json.dumps({sm: {"measured_with": toolkit_line(cuobjdump),
+                               "instances": [{"name": n, "stack": s, "local": l, "reason": KNOWN_REASON}
+                                             for n, (s, l) in sorted(per.items())]}
+                          for sm, per in sorted(found.items())}, indent=2))
+    elif not a.list:
+        for sm in sorted(archs_seen & set(baseline)):     # the known count over all the libraries given
+            print("check_cuda_spills: baseline %s: %d known violations seen, %d listed" % (sm, len(seen.get(sm, ())), len(baseline[sm])))
     return rc
 
 
