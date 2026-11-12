@@ -25,7 +25,7 @@ struct Card {
     bool s86 = false;    // compute capability 8.6 (appended last: the aggregate initializers {s120, s121, sms} of the callers and the test stay valid)
 };
 
-enum class Why { kBand, kS121, kS120Large, kS120Mid, kS120Small, kStaged, kS86Small };
+enum class Why { kBand, kS121, kS120Large, kS120Mid, kS120Small, kStaged, kS86Wide };
 
 struct Pick {
     int ww;     // 2 (128 routed rows) or 4 (64)
@@ -44,11 +44,12 @@ constexpr Pick pick(const Card& c, int64_t n, int n_expert, bool staged = false,
     // cell) and +4.3% at 32K in the second pair, with 4K neutral-to-slightly-worse (0.989x, 0.962x, intervals spanning 1.0).  So on this part the 128-row tile is taken from
     // 65,536 routed rows a launch (about an 11K-token prompt at six experts) up; 4K keeps 64.
     if (c.s121) return {n >= 65536 ? 2 : 4, Why::kS121};
-    // Staged launches (weight staging: a gate/up kernel of IQ3_XXS / IQ3_S / IQ4_XS) on an sm_86 or sm_120 card under 80 SMs: 128 rows from every size.  The 128-row staged kernels
+    // Staged launches (weight staging: a gate/up kernel of IQ3_XXS / IQ3_S / IQ4_XS / Q8_0 / Q6_K) on an sm_86 or sm_120 card under 80 SMs: 128 rows from every size.  The 128-row staged kernels
     // against the 64-row unstaged ones (RTX A4000, sm_86, 48 SMs, one layer, REAL routing, ms, 2,048 / 8,192 / 20,000 tokens): IQ3_S / IQ4_NL 12.37 / 31.46 / 67.33 against 13.18 / 36.71 / 81.65,
     // IQ3_XXS / IQ4_NL 11.72 / 30.04 / 64.44 against 12.07 / 33.97 / 76.16, IQ4_XS / IQ4_NL 11.97 / 30.60 / 65.33 against 13.10 / 36.17 / 80.54, IQ3_S / Q2_0 (the Q2_0 down is not staged)
     // 11.89 / 30.48 / 65.19 against 12.27 / 34.35 / 76.42 (RESULTS-P4-SM.md S1).  Nothing below 48 SMs is measured, and no sm_120 card under 80 SMs with staging.  sm_89 / sm_80 are not in
-    // the class (no DevInfo flag, not measured); launches without a staged gate/up and every other class keep the rules below.
+    // the class (no DevInfo flag, not measured); launches without a staged gate/up and every other class keep the rules below.  With Q8_0 / Q6_K staged (RTX A4000, one layer, real routing, MMQ / head 128 at 2K / 8K / 20K / 32K):
+    // Q8_0 / Q8_0 1.882 / 1.412 / 1.143 / 1.030 (64-row unstaged 1.326 / 0.955 / 0.783 / 0.649), Q6_K + Q8_0 1.499 / 1.188 / 0.998 / 0.918 (1.059 / 0.787 / 0.638 / 0.547), IQ3_S / Q8_0 1.708 / 1.379 / 1.211 / 1.060 (1.407 / 1.076 / 0.912 / 0.768).
     if (staged && (c.s86 || c.s120) && c.sms > 0 && c.sms < 80) return {2, Why::kStaged};
     // sm_120 with 80 SMs and up (the cards that take these kernels by default: RTX 5080 / 5090, PRO 5000 / 6000): 128 rows from 159.9 rows an expert on, the first
     // measured point at or above 1.000 on every pair of the PRO 5000 and PRO 6000 rows above.  Below it the answer depends on the card (the PRO 6000 loses 3-7% at 80
@@ -62,12 +63,14 @@ constexpr Pick pick(const Card& c, int64_t n, int n_expert, bool staged = false,
     // everything else (sm_80 / 86 / 89, sm_120 outside the classes above, HIP builds): 128 rows when an expert has about one such tile (56 to 112 rows on average), else 64.
     // Measured on the RTX 5070 with uniform routing (tests/cuda/prefill_fused_iq_test, a layer of 2048 / 3584 / 8192 tokens, ms, 64 -> 128): IQ2_S 5.2 -> 6.7, 9.5 -> 9.3, 17.5 -> 19.5;
     // IQ2_XXS 4.2 -> 5.8, 7.4 -> 7.6, 13.6 -> 16.5; IQ3_S 5.6 -> 6.6, 10.2 -> 8.8, 18.4 -> 19.0; IQ3_XXS 5.1 -> 6.3, 9.1 -> 8.3, 16.5 -> 17.5 (256 rows was slower still).
-    // sm_86 with 40 to 79 SMs, a Q6_K or Q8_0 gate/up (Q6_K + Q8_0, Q8_0 / Q8_0; CUDA opt-ins), above 112 rows an expert: 128 rows.  Measured on the RTX A4000 (sm_86, 48 SMs, one layer, ms, tile 64 -> tile 128, output bits
+    // sm_86 with 40 SMs and up (the 40-79 SM cards and the 80+ SM ones), a Q6_K or Q8_0 gate/up (Q6_K + Q8_0, Q8_0 / Q8_0; CUDA opt-ins), above 112 rows an expert: 128 rows (below 80 SMs the staged rule above already
+    // takes 128 at every size once these formats are staged; this line is the one that moves the 80+ SM cards).  Measured on the RTX A4000 (sm_86, 48 SMs, one layer, ms, tile 64 -> tile 128, output bits
     // equal): Qwen3.6's shape (256 experts, top 8; lane P4-Q36, z440-20261111-2126-783b) Q6_K + Q8_0 4,096 / 8,192 / 20,000 tokens 17.65 -> 13.14, 31.91 -> 22.78, 73.46 -> 55.80 (MMQ 13.58 / 20.05 / 38.12);
     // Qwen3.8-Flash-Next's shape (512 experts, top 10, real routing, RESULTS-P4-SM.md S0) at 8,192 / 20,000 / 32,768 tokens: Q6_K + Q8_0 64.97 -> 52.56, 142.17 -> 110.45, 241.14 -> 173.50; Q8_0 / Q8_0
     // 50.64 -> 42.02, 109.88 -> 89.91, 186.36 -> 140.29.  The class is narrow on purpose: the same cards run the 64-row tile faster above 112 rows for the unstaged IQ2_S / Q2_0 pair at 8K (33.80 against 35.05) and
-    // for Q2_0 / Q2_0 (26.52 against 28.56 at 8K), so the line does not take every pair.  Staging these two formats (planned) takes 128 rows at every size through the staged rule above.
-    if (wide && c.s86 && c.sms >= 40 && c.sms < 80 && avg > 112.0) return {2, Why::kS86Small};
+    // for Q2_0 / Q2_0 (26.52 against 28.56 at 8K), so the line does not take every pair.  On the RTX A6000 (sm_86, 84 SMs; lane P4-Q36, Boston jobs boston-20261111-2158-c9cf / -1d66 / -2209-d899) Qwen3.6 UD-Q6_K_XL with every expert in VRAM, end to end,
+    // ratio to MMQ at 2K / 8K / 20K: today's tile rule 0.95 / 0.90 / 0.92 (five rounds, spread under 0.02), STRATA_PF_FUSED_TILE=128 0.95 / 0.98 / 0.99 (three rounds).  The i-quant pairs keep the rule lane OWN-4X gated on that class.
+    if (wide && c.s86 && c.sms >= 40 && avg > 112.0) return {2, Why::kS86Wide};
     return {avg > 56.0 && avg <= 112.0 ? 2 : 4, Why::kBand};
 }
 
