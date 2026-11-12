@@ -144,19 +144,25 @@ __host__ __device__ constexpr bool sw_on(int t, bool gu) {
     (void) t; (void) gu;
     return false;
 #else
-    return gu ? (t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS || t == T_Q8_0 || t == T_Q6_K) : (t == T_IQ4_NL || t == T_Q8_0 || t == T_Q5_0);
+    // (the K-quant downs: Q5_K / Q6_K rows of 256-value super-blocks, i.e. a K that is a multiple of 256 - Qwen3.6's n_ff 512; the Flash-Next geometry (640) has none)
+    return gu ? (t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS || t == T_Q8_0 || t == T_Q6_K)
+              : (t == T_IQ4_NL || t == T_Q8_0 || t == T_Q5_0 || ((t == T_Q5_K || t == T_Q6_K) && D_ROWS_K % 256 == 0));
 #endif
 }
 __host__ __device__ constexpr bool sw_inst(int t, bool gu, int ww, int nt, bool f16) { return sw_on(t, gu) && ww == 2 && nt == THREADS && !f16; }
 // the 32-value-block formats (two blocks a 64-value stage), gate/up (Q8_0) or down
 __host__ __device__ constexpr bool sw_b32(int t) { return t == T_IQ4_NL || t == T_Q5_0 || t == T_Q8_0; }
 // the gate/up formats whose block spans 256 values (the kernel's GU256: one block per four stages)
-__host__ __device__ constexpr bool sw_gu256(int t, bool gu) { return gu && t != T_Q2_0 && t != T_Q8_0 && !is_tq(t); }
-// stages a slot: a whole 256-value block (gate/up i-quants), else two (four 32-value blocks; the Q6_K gate/up: half a super-block)
-__host__ __device__ constexpr int sw_spb(int t, bool gu) { return sw_gu256(t, gu) && t != T_Q6_K ? 4 : 2; }
+// (a K-quant down with K a multiple of 256 walks its super-blocks the same way: Q5_K / Q6_K)
+__host__ __device__ constexpr bool sw_gu256(int t, bool gu) {
+    return (gu || ((t == T_Q5_K || t == T_Q6_K) && D_ROWS_K % 256 == 0)) && t != T_Q2_0 && t != T_Q8_0 && !is_tq(t);
+}
+// stages a slot: a whole 256-value block (gate/up i-quants), else two (four 32-value blocks; the Q6_K gate/up and the Q5_K / Q6_K downs: half a super-block)
+__host__ __device__ constexpr int sw_spb(int t, bool gu) { return sw_gu256(t, gu) && t != T_Q6_K && t != T_Q5_K ? 4 : 2; }
 __host__ __device__ constexpr int sw_slot_bytes(int t, bool gu) { return sw_gu256(t, gu) ? block_bytes(t) : sw_spb(t, gu) * 2 * block_bytes(t); }   // (Q6_K: unused, its slot is three windows)
-// 16-byte chunks of a row's slot: the aligned window is at most slot + 14 bytes; Q6_K: ql 64 B (5) + qh 32 B (3) + scales and d, at most 18 B (2)
-__host__ __device__ constexpr int sw_chunks(int t, bool gu) { return t == T_Q6_K ? 10 : (sw_slot_bytes(t, gu) + 14 + 15) / 16; }
+// 16-byte chunks of a row's slot: the aligned window is at most slot + 14 bytes; Q6_K: ql 64 B (5) + qh 32 B (3) + scales and d, at most 18 B (2);
+// Q5_K (down only): qs 64 B (5) + qh 32 B (3) + d, dmin and the 12 scale bytes 16 B (2)
+__host__ __device__ constexpr int sw_chunks(int t, bool gu) { return (t == T_Q6_K || t == T_Q5_K) ? 10 : (sw_slot_bytes(t, gu) + 14 + 15) / 16; }
 constexpr int WLDH = 144;               // F16: bytes per decoded weight row of a stage: 64 halves + 16 (ldmatrix rows apart)
 // shared memory of an instance.  `astages` is the device's depth (host_astages()); a staged instance takes kSwAst instead and adds its ring, sized for ITS side
 // (gu) only: a failed shared-memory set-up makes dev_info() drop every fused kernel
@@ -849,7 +855,9 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
     constexpr bool TWO_PASS = NT != THREADS;   // the two-pass loads (load_unit_l) only in the opt-in NT = 256 kernels
     static_assert(!(TWO_PASS && WT == T_Q5_0), "the NT = 256 kernels have no Q5_0 form");
     static_assert(!(TWO_PASS && (has_min(WT) || WT == T_Q8_0 || WT == T_Q6_K || is_tq(WT))), "the NT = 256 kernels have no K-quant / Q5_1 / Q8_0 / Q6_K / trellis form");
-    constexpr bool KLEAN = GU && (WT == T_Q4_K || WT == T_Q5_K || WT == T_Q6_K);   // (A1b) the K-quant gate/up's lean loads (kq_lean_load)
+    constexpr bool SWT = sw_inst(WT, GU, WW, NT, F16) && ASTAGES_DEV == ASTAGES;   // weight staging (see sw_on)
+    // (A1b) the K-quant gate/up's lean loads (kq_lean_load); a staged K-quant DOWN (Q5_K / Q6_K, K = 512) gathers the same lean words from its slot's windows (sw_q5 / sw_q6)
+    constexpr bool KLEAN = (GU && (WT == T_Q4_K || WT == T_Q5_K || WT == T_Q6_K)) || (SWT && !GU && (WT == T_Q5_K || WT == T_Q6_K));
     constexpr int RAW = KLEAN ? kq_lean_words<WT>() : raw_words(WT) > 5 ? raw_words(WT) : 5;   // the raw words of a sub-block: 5, Q5_0's 6
     constexpr int NS = (GU ? GU_ROWS_K : D_ROWS_K) / 64;   // 64-value stages along K
     constexpr int NFB = (GU ? GU_ROWS_N : D_ROWS_N) / WR;          // weight-row blocks per tile
@@ -858,7 +866,6 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
     constexpr int BS = block_bytes(WT);
     constexpr bool K16 = per16(WT);
     // weight staging (see sw_on): this instance's slots, its activation depth, and a ring at the end of shared memory
-    constexpr bool SWT = sw_inst(WT, GU, WW, NT, F16) && ASTAGES_DEV == ASTAGES;
     constexpr int AST = SWT ? kSwAst : ASTAGES_DEV;
     constexpr int SW_SPB = sw_spb(WT, GU), SW_SB = sw_slot_bytes(WT, GU), SW_NCH = sw_chunks(WT, GU), SW_ROW = 16 * SW_NCH;
     static_assert(!SWT || (NS % SW_SPB == 0 && SW_SPB >= AST - 1), "staging: whole slots a row, and deep enough for the ring (a slot is read until two stages after the next copy is issued)");
@@ -934,6 +941,16 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
                         else { a = bb + 192 + 8 * n; e = bb + 210; dk = k - 8; }
                         const uint8_t* cs = (const uint8_t*) ((uintptr_t) a & ~(uintptr_t) 15) + 16 * dk;
                         if (cs < e) cp16(d + rr * SW_ROW + 16 * k, cs);
+                    } else if constexpr (WT == T_Q5_K) {   // (down) slot j = half n of super-block j / 2: chunks 0-4 qs of the two stages (64 B at 48 + 64 n), 5-7 qh (32 B at 16), 8-9 d, dmin, scales (16 B at 0)
+                        const uint8_t* bb = rp + (size_t) (j >> 1) * BS;
+                        const int n = j & 1;
+                        const uint8_t *a, *e;
+                        int dk;
+                        if (k < 5) { a = bb + 48 + 64 * n; e = a + 64; dk = k; }
+                        else if (k < 8) { a = bb + 16; e = a + 32; dk = k - 5; }
+                        else { a = bb; e = a + 16; dk = k - 8; }
+                        const uint8_t* cs = (const uint8_t*) ((uintptr_t) a & ~(uintptr_t) 15) + 16 * dk;
+                        if (cs < e) cp16(d + rr * SW_ROW + 16 * k, cs);
                     } else {   // (the S1 form, unchanged)
                         const uint8_t* a = rp + (size_t) j * SW_SB;
                         const uint8_t* cs = (const uint8_t*) ((uintptr_t) a & ~(uintptr_t) 15) + 16 * k;
@@ -968,9 +985,31 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
                 w[13] = (uint32_t) r;
             }
         };
+        // (staging, Q5_K down) kq_lean_load<T_Q5_K>'s 10 words from the three windows: the same bytes at the same offsets inside each (qs: bb + 48 + 32 (s & 3) + 16 uj, in the slot's
+        // window from bb + 48 + 64 n that is 32 (s & 1) + 16 uj; qh: bb + 16 + 16 uj; d / dmin / scales: bb, bb + 4), bb = the slot's super-block
+        auto sw_q5 = [&](int s, uint32_t (&w)[RAW]) {
+            if constexpr (SWT && WT == T_Q5_K) {
+                const int j = s >> 1, n = j & 1, ib = sub(s);
+                const uint8_t* slot = sraw + (j & 1) * (WR * SW_ROW) + ur * SW_ROW;
+                const uint8_t* bb = wrow + (size_t) (j >> 1) * BS;
+                const uint8_t* pq = slot + ((uintptr_t) (bb + 48 + 64 * n) & 15) + 32 * (s & 1) + 16 * uj;
+                const uint8_t* ph = slot + 80 + ((uintptr_t) (bb + 16) & 15) + 16 * uj;
+                const uint8_t* pd = slot + 128 + ((uintptr_t) bb & 15);
+#pragma unroll
+                for (int k = 0; k < 4; ++k) w[k] = ld32a(pq + 4 * k);
+                w[4] = ld32a(pd);
+                const uint8_t* sc = pd + 4;
+                w[5] = ib < 4 ? (uint32_t) sc[ib] | ((uint32_t) sc[ib + 4] << 8)
+                              : (uint32_t) sc[ib + 4] | ((uint32_t) sc[ib - 4] << 8) | ((uint32_t) sc[ib] << 16);
+                w[5] |= (uint32_t) ib << 24;
+#pragma unroll
+                for (int k = 0; k < 4; ++k) w[6 + k] = ld32a(ph + 4 * k);
+            }
+        };
         auto load_sw = [&](int s, uint32_t (&w)[RAW]) {
             if constexpr (SWT) {
-                if constexpr (WT == T_Q6_K) sw_q6(s, w);
+                if constexpr (WT == T_Q5_K) sw_q5(s, w);
+                else if constexpr (WT == T_Q6_K) sw_q6(s, w);
                 else load_unit<WT>(sw_unit(s), sub(s), w);
             }
         };
