@@ -6989,6 +6989,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_EXPERT_I8",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/kernels/cuda/iq_kernels.cu",
+     "line": 6240,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "",
+   "since": "",
+   "last_commit": "",
+   "last_date": "",
+   "status": "research",
+   "owner": "kernels",
+   "note": "CUDA / HIP research switch, off unless set, not a user setting: =1 runs a prompt layer's expert groups on our own int8 dot-product kernels (native_expert_i8) for the gate/up formats IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S and IQ2_S with an IQ4_NL or Q2_0 down, in groups of 256 entries or more: in the prompt path's MMQ groups (a layer the fused kernels take stays on them; on a card with fused kernels set STRATA_PF_FUSED=0 as well) and in native_expert_grouped (the Qwen3.6 engine's prompt). Unset: today's path, bit for bit. Goes away with MMQ (release C) or becomes the default.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_EXPERT_NIBBLE",
    "backends": [
     "cuda-hip"
@@ -12587,6 +12620,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_I8_BISECT",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/kernels/cuda/iq_kernels.cu",
+     "line": 6291,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": "0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "",
+   "since": "",
+   "last_commit": "",
+   "last_date": "",
+   "status": "research",
+   "owner": "kernels",
+   "note": "Debug only: STRATA_EXPERT_I8's kernels return at point n, uniform over the block (a fault hunt on HIP). 0: off.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_I8_DBG",
    "backends": [
     "sycl"
@@ -12723,6 +12789,72 @@
    "status": "opt-in",
    "owner": "sycl/prefill",
    "note": "[auto] documented for users (docs/INTEL_INT8_EXPERTS.md:26)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_I8_SMEM_LIMIT",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/kernels/cuda/i8_expert.cuh",
+     "line": 833,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": "0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "",
+   "since": "",
+   "last_commit": "",
+   "last_date": "",
+   "status": "research",
+   "owner": "kernels",
+   "note": "Test only: pretends the card has this many bytes of shared memory per block, so STRATA_EXPERT_I8's kernels fall to a smaller tile or answer 'not supported' (native_i8_parity uses it).",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_I8_TM",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/kernels/cuda/iq_kernels.cu",
+     "line": 6281,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": "0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "",
+   "since": "",
+   "last_commit": "",
+   "last_date": "",
+   "status": "research",
+   "owner": "kernels",
+   "note": "Research: the tile of STRATA_EXPERT_I8's kernels, 2, 3 or 4 rows of 16 entries per thread (32, 48 or 64 entries a block), 8 = the 128-entry tile. Unset: chosen by the entries per expert.",
    "retire_after": "",
    "retired_in": ""
   },

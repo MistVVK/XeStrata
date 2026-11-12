@@ -6235,9 +6235,23 @@ void native_expert_set_mode(int mode, int phase) {
 namespace {
 bool g_grouped_v1 = env_on("STRATA_GROUPED_V1");
 #include "i8_expert.cuh"   // OWN-I8: our own int8 dot-product kernels (native_expert_i8 below)
+// OWN-I8: STRATA_EXPERT_I8, read once: 1 = on, 0 = off, -1 = not set (a research switch: unset, nothing here runs)
+int i8_switch_state() {
+    static const int s = [] { const char* v = std::getenv("STRATA_EXPERT_I8"); return v == nullptr || v[0] == '\0' ? -1 : (v[0] == '0' ? 0 : 1); }();
+    return s;
+}
 }  // namespace
 
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
+
+bool native_expert_i8_prompt(const NativeExpertLayout& L, int64_t group_entries) noexcept {
+    return i8_switch_state() == 1 && group_entries >= 256 && native_expert_i8_supported(L);
+}
+
+size_t native_expert_i8_scratch_bytes(int64_t cap_entries, int64_t cap_groups, int64_t n_ff) {
+    const size_t hqb = ((size_t) cap_entries * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255;   // as native_expert_i8 carves it
+    return hqb + (size_t) (cap_groups + 1) * sizeof(int32_t);
+}
 
 bool native_expert_i8_supported(const NativeExpertLayout& L) noexcept {
     return i8_gu_type(L.gu_type) && i8_d_type(L.d_type) && !L.gu_nib && L.tail_off == 0 && L.had_block == 0 && L.n_embd % 256 == 0 &&
@@ -6326,7 +6340,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     strata::dispatch::kernel(strata::dispatch::kExpert, 0, L.gu_type, (int) L.n_embd, (int) L.n_ff, L.d_type);   // BW-MEASURE: one grouped expert call
     if (L.n_ff % 32 != 0) { std::fprintf(stderr, "native_expert_grouped: n_ff %lld\n", (long long) L.n_ff); std::exit(1); }
     // OWN-I8 research switch (STRATA_EXPERT_I8=1, off by default): a prompt-sized call on our own int8 tile kernels
-    static const bool i8_switch = env_on("STRATA_EXPERT_I8");
+    static const bool i8_switch = i8_switch_state() == 1;
     if (i8_switch && cap_entries >= 256 && grid_groups <= 0 && native_expert_i8_supported(L)) {
         native_expert_i8(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch, out, stream);
         return;

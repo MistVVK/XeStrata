@@ -94,6 +94,14 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 /// no NVFP4 tail, no APR Hadamard, no 4-bit slots.  STRATA_EXPERT_I8=1 makes `native_expert_grouped` itself take it for a call of
 /// 256 entries or more (the prompt chunk of a Qwen3.6 engine without MMQ); STRATA_I8_TM = 2 | 3 | 4 forces the tile.
 bool native_expert_i8_supported(const NativeExpertLayout& L) noexcept;
+/// OWN-I8, the prompt path's question (once per layer, src/prefill/prefill.cpp): do the expert groups of this layer take `native_expert_i8`
+/// on this device, for groups of about `group_entries` entries (rows of one launch)?  STRATA_EXPERT_I8=1 asks for it (the formats and the
+/// device's shared memory still have to allow it: `native_expert_i8_supported`; groups under 256 entries keep the other path), unset or 0:
+/// no.  Shared prompt code, no device work: a Metal build answers false.
+bool native_expert_i8_prompt(const NativeExpertLayout& L, int64_t group_entries) noexcept;
+/// Bytes of scratch `native_expert_i8` needs (it is smaller than native_expert_scratch_bytes: H goes out as q8_1 blocks only): `cap_entries`
+/// entries, at most `cap_groups` groups, `n_ff` features.
+size_t native_expert_i8_scratch_bytes(int64_t cap_entries, int64_t cap_groups, int64_t n_ff);
 void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
                       const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
                       void* scratch, float* out, void* stream);
