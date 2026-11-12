@@ -10689,6 +10689,21 @@ int main(int argc, char** argv) {
             }
             src.set_extra_drop_files(std::move(drop));
         }
+#if defined(STRATA_USE_HIP) && defined(_WIN32)
+        // BATCH SLOTS ON THE STRIX HALO: every session (the main one and each slot) pins its streamed K/V for the whole context, and with the RAM copy of experts
+        // that is the page-locked memory of the start.  4 slots at 131,072 tokens with the usual 38 GiB budget (20.33 GiB of complement) stopped inside the prompt
+        // path, and with 18 GiB the OS ran out of page-locked memory; 15 GiB started and served.  So here the RAM copy is cut to what leaves complement + pinned K/V
+        // at the level of the largest start that worked (include/strata/core/uma_cache.hpp, with the job ids); the experts left out are read from the SSD.  Context,
+        // slot count and prompt chunk are untouched.  Only with --batch 2 or more, so a single request is as before.  STRATA_UMA_PIN_CAP set (any value): off, test only.
+        if (o.batch >= 2 && o.prefill_own_keep_chunk && o.resident_budget > 0 && std::getenv("STRATA_UMA_PIN_CAP") == nullptr) {
+            const uint64_t cap = strata::core::uma_pinned_complement_cap_bytes(strata::core::qsa_kv_host_bytes());
+            if (o.resident_budget > cap) {
+                std::fprintf(stderr, "strata: %d requests at once: %.1f GiB of experts are kept in RAM so that everything fits in this PC's memory; the rest are read from the SSD when needed\n",
+                             o.batch, (double) cap / 1073741824.0);
+                o.resident_budget = cap;
+            }
+        }
+#endif
         const std::vector<std::pair<int32_t, int32_t>>& rank_all = profile_all.empty() ? profile : profile_all;
         src.budget_is_automatic(ram_fallback_resident);   // its clamp line then names no flag
         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
@@ -11595,10 +11610,13 @@ int main(int argc, char** argv) {
                 continue;
             }
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());
-            if (err.find("fit") != std::string::npos)   // #85: say what frees VRAM
+            const bool batch_memory = o.batch >= 2 && o.prefill_own_keep_chunk && (err.find("fit") != std::string::npos || err.find("copy stream") != std::string::npos);
+            if (err.find("fit") != std::string::npos && !batch_memory)   // #85: say what frees VRAM
                 std::fprintf(stderr, "strata serve: the GPU has too little free VRAM for the prompt path: turn images "
                                      "off (setup: --vision no), close other programs using the GPU, use a shorter "
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
+            if (batch_memory)   // (the chunk list has been tried by now, and a failed attempt leaves the pool full: no retry can follow)
+                std::fprintf(stderr, "strata: %d requests at once do not fit in this PC's memory: start with --batch %d\n", o.batch, o.batch - 1);
             return 1;
         }
         uma_refuse_chunk_if_full(o.prefill_chunk, borrow != nullptr, xcache.gib());
