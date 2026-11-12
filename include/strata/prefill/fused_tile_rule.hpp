@@ -14,6 +14,7 @@
 // end-to-end row on a 5070-class card yet, and the fused kernels are opt-in on that class today (MMQ is its default).
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 
 namespace strata::prefill::fused_tile {
@@ -85,5 +86,40 @@ constexpr bool takes_by_default(const Card& c, bool sm40, bool gate_staged, bool
     if (c.sms >= 80) return true;
     return sm40 && gate_staged && down_ok && c.sms >= 40;
 }
+
+// ---- the weight-staging guard (check_staged_blobs's decision in src/prefill/moe_fused_iq.cu), as pure functions so the decision can be tested without a GPU.
+// The staging kernels (sw_on instances) copy the expert blobs into shared memory with cp.async and read 16-bit words at the rows' offsets: they need blobs in device (or managed)
+// memory at 2-byte aligned addresses and 2-byte aligned rows and offsets.  A launch that fails the check does NOT end the process: it takes the unstaged 64-row kernel of the same
+// formats (same output bits, the identity tables of RESULTS-P4-SM.md), whatever STRATA_PF_FUSED_TILE says.  The memory kinds are cudaMemoryType's, as the kernel's host code reads them.
+enum class BlobMem { kDevice, kManaged, kHost, kUnregistered, kUnknown };   // kUnknown: cudaPointerGetAttributes failed (the launch's own error says so)
+
+constexpr bool staged_geometry_ok(std::size_t gu_row, std::size_t d_row, std::size_t up_off, std::size_t down_off) { return ((gu_row | d_row | up_off | down_off) & 1) == 0; }
+constexpr bool staged_blob_ok(BlobMem m, std::uintptr_t addr) {
+    if (m == BlobMem::kUnknown) return true;   // as before: not a pointer the driver knows, the launch reports it
+    return (m == BlobMem::kDevice || m == BlobMem::kManaged) && (addr & 1) == 0;
+}
+
+// The per-process state of the check.  The check costs a driver call per blob, so it runs on the first `left` launches only; once one launch has failed it, every later launch of
+// the process takes the unstaged kernel without asking again (sticky): after the first launches nothing is checked any more, and a call site that gave one bad blob will give more.
+// The log line is printed by the caller that gets `true` from report() (the first failure only).
+struct StagedGuard {
+    enum class Step { kUnstaged, kCheck, kTrust };
+    int left = 256;
+    bool bad = false;
+    constexpr Step next() {
+        if (bad) return Step::kUnstaged;
+        if (left <= 0) return Step::kTrust;
+        --left;
+        return Step::kCheck;
+    }
+    constexpr bool report(bool ok) {   // true: this failure is the first, log it
+        if (ok) return false;
+        const bool first = !bad;
+        bad = true;
+        return first;
+    }
+};
+
+constexpr int kUnstagedWw = 4;   // the fallback's work item: the 64-row instances, which no weight-staging instance shares
 
 }  // namespace strata::prefill::fused_tile

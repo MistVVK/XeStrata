@@ -57,6 +57,9 @@ void hadamard128_rows(float* x, int64_t rows, int64_t cols, const float* signs, 
 /// The NT = 256 kernels (STRATA_PF_FUSED_NT=256 or _F16=1) or the warp-specialized kernel (STRATA_PF_FUSED_WS=1) are
 /// set up on the current device: experts_native takes a WideBatch (STRATA_PF_BATCH up to kBatchRoom experts a launch).
 bool native_wide();
+/// Launches of experts_native that took the unstaged 64-row kernel because the weight-staging check failed (an expert blob not in device memory, or an odd address / row / offset):
+/// 0 in every default configuration; 0 in a HIP build (no staging kernels).  The first such launch logs one line to stderr; the process does not exit.  For the GPU test.
+int staged_blob_fallbacks();
 /// experts_native() of a WideBatch, on the NT = 256 kernels or the warp-specialized kernel; only when native_wide().
 void experts_native(const WideBatch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa,
                     const int32_t* src, void* ha, float* dm, void* stream);

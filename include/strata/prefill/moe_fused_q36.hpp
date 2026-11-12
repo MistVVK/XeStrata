@@ -32,6 +32,9 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
 /// native_supported / experts_native plus the K-quant downs of UD-Q4_K_XL (a Q4_K or Q5_K gate/up with a Q5_K or Q6_K down: K = 512 is two 256-value
 /// super-blocks), which the copy of moe_fused_iq.cu has instances for but whose dispatch is not part of it.  Every other pair goes to the two above.
 bool native_supported_ext(int gu_type, int d_type);
+/// Launches (of experts_native / experts_native_ext) that took the unstaged 64-row kernel because the weight-staging check failed (an expert blob not in device memory, or an odd
+/// address / row / offset): 0 in every default configuration.  This copy's own count (moe_fused_iq.hpp's is the original copy's).  For the GPU test.
+int staged_blob_fallbacks();
 void experts_native_ext(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa,
                         const int32_t* src, void* ha, float* dm, void* stream);
 #endif

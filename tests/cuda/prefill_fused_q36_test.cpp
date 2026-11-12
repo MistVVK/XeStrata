@@ -10,7 +10,9 @@
 // Part 1 (reference), per pair: 256 tokens over 64 experts, skewed routing (experts with 0 rows, with one, with several 64-row tiles), an
 // all-zero token, per-expert blobs at unrelated (2-byte aligned) addresses, three launches of different expert ranges; then the tails and
 // tile edges (33, 1, 130, 517 tokens).  Part 2 (timing): one layer at the engine's chunks (2048, 8192 tokens; 256 experts, top 8) on both
-// paths, the grouping checked and a sample of rows against the reference.  --no-ref, --no-timing, --only=NAME, --chunks=A,B.
+// paths, the grouping checked and a sample of rows against the reference.  --no-ref, --no-timing, --only=NAME, --chunks=A,B,
+// --host-blobs=N [--expect-fallback | --expect-no-fallback] (the first N experts' blobs in host memory: the weight-staging check fails for the launches that hold one and they take the
+// unstaged kernel, same output bits; timing part, use with --no-ref).
 // Exit 77 without a CUDA device of sm_80 or newer.
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/prefill/moe_fused_q36.hpp"
@@ -60,6 +62,8 @@ struct Pair {
     bool optional = false;   // a pair this build may not cover yet: skipped with a printed line instead of failing (UD-Q4_K_XL's K-quant downs)
 };
 bool mmq_ok(const Pair& p) { return mmq::supported((int) p.gu) && mmq::supported((int) p.d); }
+int g_host_blobs = 0;       // --host-blobs=N (the timing part): the first N experts' blobs in pinned host memory, see timing_part; use with --no-ref
+int g_expect_fallback = 0;  // --expect-fallback (+1) / --expect-no-fallback (-1): with --host-blobs, require that some / no launch took the unstaged kernel
 size_t row_size(ggml_type t, int64_t n) { return (size_t) (n / ggml_blck_size(t)) * ggml_type_size(t); }
 
 struct Geo {
@@ -475,13 +479,29 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     }
     std::vector<const uint8_t*> blob((size_t) E);
     for (int e = 0; e < E; ++e) blob[(size_t) e] = blobs.as<uint8_t>() + (size_t) e * stride;
+    // --host-blobs=N: the first N experts' blobs live in pinned, mapped HOST memory (the kernels can still read them through the host pointer), not device memory: the weight-staging
+    // check of the launch fails for the launches that hold one, which then take the unstaged 64-row kernel (no process exit); the output bits must equal the all-device run's
+    struct HostBlobs {
+        void* p = nullptr;
+        ~HostBlobs() { if (p) cudaFreeHost(p); }
+    } host_blobs;
+    if (g_host_blobs > 0) {
+        const int nh = std::min(g_host_blobs, E);
+        ck(cudaHostAlloc(&host_blobs.p, (size_t) nh * stride + 4096, cudaHostAllocMapped), "cudaHostAlloc");
+        std::memset(host_blobs.p, 0, (size_t) nh * stride + 4096);
+        for (int e = 0; e < nh; ++e) {
+            uint8_t* dst = (uint8_t*) host_blobs.p + (size_t) e * stride;
+            ck(cudaMemcpy(dst, blob[(size_t) e], geo.bytes, cudaMemcpyDeviceToHost), "blob to host");
+            blob[(size_t) e] = dst;
+        }
+    }
     std::vector<float> x = make_x(T, rng, -1);
     const std::vector<int32_t> ids = make_ids(T, E, rng, 0, 0);
     const Routing r = sort_rows(ids, E);
     Dev x_dev(x.size() * 4), src_dev((size_t) rows * 4);
     ck(cudaMemcpy(x_dev.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
     ck(cudaMemcpy(src_dev.p, r.src.data(), r.src.size() * 4, cudaMemcpyHostToDevice), "src");
-    const bool mq = mmq_ok(p);
+    const bool mq = mmq_ok(p) && g_host_blobs == 0;   // (MMQ does not read host blobs)
     mmq::Context ctx;
     MmqBufs* mbp = mq ? new MmqBufs(p, rows, E) : nullptr;
     FusedBufs fb(T, rows, E);
@@ -546,7 +566,7 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
         RefWork rw;
         for (size_t j = 0; j < pick.size(); ++j) {
             const size_t i = pick[j];
-            ck(cudaMemcpy(hb.data(), blob[(size_t) ids[i]], geo.bytes, cudaMemcpyDeviceToHost), "blob back");
+            ck(cudaMemcpy(hb.data(), blob[(size_t) ids[i]], geo.bytes, cudaMemcpyDefault), "blob back");   // (default kind: a --host-blobs blob is host memory)
             dequant(p, geo, hb, gu, dn);
             rw.run(gu, dn, x.data() + (i / K) * N, ref.data() + j * N, ref2.data() + j * N);
             if (mq) std::copy_n(y_mmq.begin() + (ptrdiff_t) ((size_t) r.row_of[i] * N), N, ym.begin() + (ptrdiff_t) (j * N));
@@ -562,6 +582,12 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     cudaEventDestroy(a);
     cudaEventDestroy(b);
     delete mbp;
+    if (g_host_blobs > 0) {
+        const int fbk = fq::staged_blob_fallbacks();
+        std::printf("  host blobs (first %d experts): %d launches took the unstaged kernel (the staging check failed; no process exit)\n", g_host_blobs, fbk);
+        if (g_expect_fallback > 0 && fbk == 0) throw std::runtime_error(std::string(p.name) + ": --expect-fallback: no launch took the unstaged kernel");
+        if (g_expect_fallback < 0 && fbk != 0) throw std::runtime_error(std::string(p.name) + ": --expect-no-fallback: a launch took the unstaged kernel");
+    }
     // the two int8 paths at the real shape, every tile of the layer (K-quant gate/up pairs: fused against MMQ is information only, see kq_gu)
     if (mq && !kq_gu(p) && (efm.rms > 1e-3 || efm.worst > 2e-2))
         throw std::runtime_error(std::string(p.name) + ": the paths disagree at the real shape");
@@ -601,6 +627,9 @@ int main(int argc, char** argv) {
             if (std::strncmp(argv[i], "--only=", 7) == 0) only = argv[i] + 7;
             if (std::strcmp(argv[i], "--no-timing") == 0) timing = false;
             if (std::strcmp(argv[i], "--no-ref") == 0) ref = false;
+            if (std::strncmp(argv[i], "--host-blobs=", 13) == 0) g_host_blobs = std::atoi(argv[i] + 13);
+            if (std::strcmp(argv[i], "--expect-fallback") == 0) g_expect_fallback = 1;
+            if (std::strcmp(argv[i], "--expect-no-fallback") == 0) g_expect_fallback = -1;
             if (std::strncmp(argv[i], "--chunks=", 9) == 0) {
                 chunks.clear();
                 for (const char* c = argv[i] + 9; *c;) {
