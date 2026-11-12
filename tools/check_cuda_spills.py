@@ -161,6 +161,11 @@ ALLOWED = {
     # spill 36 / 52 (sm_86), 32 / 32 (sm_120) at the 128-register cap of __launch_bounds__(THREADS = 512, 1); its q[8]
     # / raw[5] / bq[4] / a[4] / d[4] stay in registers
     "strata::prefill::fused::{anonymous}::native_kernel": {"sm_120": (32, 0), "sm_86": (32, 0)},
+    # the Qwen3.6 copy of the same kernels (moe_fused_iq_q36.cu includes moe_fused_iq.cu with the shape override and its namespace renamed): same source and
+    # instance parameters, so the same spill under the same register cap, no per-thread array found (an instance has the same STACK as its fused:: twin in 24 of 25 cases on
+    # sm_86 and 7 of 10 on sm_120, never more than 8 B apart).  Measured on f-p4-q36 7bc09fadf, CUDA 13.2 sm_120 (l620) and CUDA 12.9
+    # cuobjdump on CUDA 13.0 objects for sm_86 (z440): the maximum over 62 instances, which include the K-quant down instances <13 / 14, false, 2 / 4, 512>
+    "strata::prefill::fused_q36::{anonymous}::native_kernel": {"sm_120": (16, 0), "sm_86": (80, 0)},
     # float x[GRW_PER] (GRW_PER = 10): the thread's rows for the norm (no spill)
     "strata::prefill::{anonymous}::gr_write_cvec_norm_rs_kernel": {"sm_86": (40, 0)},
     # float v[GRW_PER] (GRW_PER = 10): the thread's rows for the norm (no spill)
