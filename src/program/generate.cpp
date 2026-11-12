@@ -6441,7 +6441,7 @@ int main(int argc, char** argv) {
             for (int i = 0; i < ns; ++i) {
                 const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1];
                 const int64_t le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
-                capr[(size_t) i] = stage_left(i, lb, le) + trim_frees(lb, le);
+                capr[(size_t) i] = stage_left(i, lb, le) + strata::program::split_rules::trim_credit(i, trim_frees(lb, le));
             }
             std::fill(used.begin(), used.end(), 0);
             std::fill(held_cnt.begin(), held_cnt.end(), 0);
