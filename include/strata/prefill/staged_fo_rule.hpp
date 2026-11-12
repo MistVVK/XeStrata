@@ -24,6 +24,16 @@ inline bool staged_fo_decide(const char* env, bool class_default) {
     return class_default;
 }
 
+/// `--short-read` (serve: pieces of at most N fresh tokens, compared without the last one, are read through the verify windows, longer ones batched), 64 by default.  With the entry on
+/// the batched read of a short piece is cheaper than the windows from about 28 tokens (Strix Halo, UD-Q4_K_XL, par/RESULTS-STRIX-SHORT.md job s8: 24 tokens windows 231 ms against 261 ms
+/// batched; 32 tokens 303 against 265-270; 48 tokens 453 against 293-299; 64 tokens 598 against 314-316), so on that class the default is the largest size where the windows won.
+inline constexpr long long kStagedEntryShortRead = 24;
+
+/// `base`: the engine's own default (64).  `class_measured` / `all_layers_fused_only`: stream_floor_rule.hpp's class; `entry_on`: staged_fo_decide().
+constexpr long long short_read_default(long long base, bool class_measured, bool all_layers_fused_only, bool entry_on) {
+    return class_measured && all_layers_fused_only && entry_on ? kStagedEntryShortRead : base;
+}
+
 /// A layer the staged group entry may take on the layer-side rule: it has an MMQ tile (the entry's earlier rule), or it is fused-only and the entry is on (staged_fo_decide).
 /// The rest of the entry's conditions (native pack, no CPU share, no peer, no Hadamard fold, ...) stay where they are in prefill.cpp.
 constexpr bool staged_entry_layer(bool use_mmq, bool fused_only, bool fo_on) { return use_mmq || (fused_only && fo_on); }

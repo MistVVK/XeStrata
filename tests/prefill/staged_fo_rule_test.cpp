@@ -6,7 +6,9 @@
 
 using strata::prefill::staged_entry_layer;
 using strata::prefill::staged_fo_decide;
-using strata::prefill::staged_fo_off;using strata::prefill::staged_fo_switch;
+using strata::prefill::staged_fo_off;
+using strata::prefill::short_read_default;
+using strata::prefill::staged_fo_switch;
 
 static int failed = 0;
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); ++failed; } } while (0)
@@ -33,6 +35,12 @@ int main() {
     CHECK(staged_fo_decide("1", true));
     CHECK(!staged_fo_decide("0", true));    // the way back: the measured class with the entry off
     CHECK(!staged_fo_decide("0", false));
+    // --short-read: the class default only where the entry is on for a measured class with every layer fused-only; elsewhere the engine's own 64
+    static_assert(strata::prefill::kStagedEntryShortRead > 0 && strata::prefill::kStagedEntryShortRead < 64, "the entry's crossing is below the windows' 64");
+    static_assert(strata::prefill::short_read_default(64, true, true, true) == strata::prefill::kStagedEntryShortRead, "the class default");
+    static_assert(strata::prefill::short_read_default(64, true, true, false) == 64, "entry off (STRATA_PF_STAGED_FO=0): the windows' 64");
+    static_assert(strata::prefill::short_read_default(64, false, true, true) == 64, "another class: unchanged");
+    static_assert(strata::prefill::short_read_default(64, true, false, true) == 64, "a layer on MMQ or FP16: unchanged");
     // the layer rule: a layer with an MMQ tile is the entry's earlier rule, whatever the decision says
     static_assert(staged_entry_layer(true, false, false), "an MMQ layer keeps the entry");
     static_assert(staged_entry_layer(true, false, true), "an MMQ layer keeps the entry");

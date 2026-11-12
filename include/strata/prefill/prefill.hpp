@@ -96,6 +96,10 @@ public:
     /// stages only the experts it routes to.  1024, or STRATA_PREFILL_STREAM_MIN, or the CPU share's limit once that
     /// is armed (3072 when STRATA_PREFILL_CPU_SHARE is set).
     static int64_t stream_all_min_tokens();
+    /// --serve's `--short-read` default for this run: `base` (64), or, where the staged walk's fused entry takes the pieces below the floor on this class
+    /// (staged_fo_rule.hpp: Windows gfx1151, every layer without an MMQ tile and on the fused kernels, entry on), the measured crossing of the verify windows and that entry.
+    /// A `--short-read` given on the command line is not asked.  Call once the expert layout is known.
+    static int64_t short_read_default(int64_t base);
     /// --prefill-pipe (opt-in): the chunk a layer split's first stage reads an `n`-token prompt in, for `stages`
     /// stages, chunks of at most `cap` (the buffers' size) and a stage-chunk cost of b + a C with b/a = `ratio` tokens
     /// (0: unknown - STRATA_PREFILL_EQUAL's rule: the same chunk count as `cap` gives, evened out when its last chunk
