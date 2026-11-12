@@ -1092,9 +1092,9 @@ def os_language_signals(env: Any = None, system: str | None = None) -> dict[str,
     """Every language signal this computer gives cheaply and locally: ``ui``, ``region``, ``keyboards`` (lists of tags). Linux and anywhere an environment is set: LANGUAGE, LC_ALL, LC_MESSAGES, LANG (display) and
     LC_CTYPE, LC_TIME, LC_NUMERIC, LC_MONETARY (regional); Windows: the preferred UI languages, the user locale and the installed keyboard layouts (kernel32 / user32 through ctypes); the Mac: the preferred
     languages and the locale from the user's global preferences file. A read that fails gives nothing for that signal; there is no waiting and no network."""
-    import platform
+    from strata_control import sysinfo         # (the platform module's own call asks WMI with no timeout on Windows)
     env = os.environ if env is None else env
-    system = system or platform.system()
+    system = system or sysinfo.system()
     ui: list[str] = []
     region: list[str] = []
     keyboards: list[str] = []
