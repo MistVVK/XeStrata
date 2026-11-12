@@ -10694,13 +10694,21 @@ int main(int argc, char** argv) {
         // that is the page-locked memory of the start.  4 slots at 131,072 tokens with the usual 38 GiB budget (20.33 GiB of complement) stopped inside the prompt
         // path, and with 18 GiB the OS ran out of page-locked memory; 15 GiB started and served.  So here the RAM copy is cut to what leaves complement + pinned K/V
         // at the level of the largest start that worked (include/strata/core/uma_cache.hpp, with the job ids); the experts left out are read from the SSD.  Context,
-        // slot count and prompt chunk are untouched.  Only with --batch 2 or more, so a single request is as before.  STRATA_UMA_PIN_CAP set (any value): off, test only.
-        if (o.batch >= 2 && o.prefill_own_keep_chunk && o.resident_budget > 0 && std::getenv("STRATA_UMA_PIN_CAP") == nullptr) {
-            const uint64_t cap = strata::core::uma_pinned_complement_cap_bytes(strata::core::qsa_kv_host_bytes());
-            if (o.resident_budget > cap) {
-                std::fprintf(stderr, "strata: %d requests at once: %.1f GiB of experts are kept in RAM so that everything fits in this PC's memory; the rest are read from the SSD when needed\n",
-                             o.batch, (double) cap / 1073741824.0);
-                o.resident_budget = cap;
+        // slot count and prompt chunk are untouched.  Only with --batch 2 or more, so a single request is as before.  STRATA_UMA_PIN_CAP=0: the RAM budget stays as set (the way back).
+        // The line below is printed after the pin, and only when the cap really left experts out (the RAM copy filled up to it): with 2 slots (12.47 GiB of complement) and
+        // 3 slots (16.40 GiB) the whole complement is under the cap, nothing is cut and the start is as before (strix-20261112-1952-001f printed the line there).
+        // The cap has no floor that turns into a refusal (owner, 11-12: "we should allow people to start, even if its read by ssd"): with so many slots that their K/V alone is over
+        // the level the cap is 0 and the RAM copy is empty (budget 1 byte: 0 would mean "no limit"); every expert the GPU cache does not hold is read from the SSD, and the start goes on.
+        bool uma_cap_applied = false;
+        uint64_t uma_cap = 0;
+        const char* const uma_pin_cap = std::getenv("STRATA_UMA_PIN_CAP");
+        if (o.batch >= 2 && o.prefill_own_keep_chunk && o.resident_budget > 0 && !(uma_pin_cap != nullptr && uma_pin_cap[0] == '0')) {
+            const uint64_t kv = strata::core::qsa_kv_host_bytes();
+            uma_cap = strata::core::uma_pinned_complement_cap_bytes(kv);
+            const uint64_t budget = strata::core::uma_pinned_complement_budget_bytes(kv);
+            if (o.resident_budget > budget) {
+                uma_cap_applied = true;
+                o.resident_budget = budget;
             }
         }
 #endif
@@ -10708,6 +10716,16 @@ int main(int argc, char** argv) {
         src.budget_is_automatic(ram_fallback_resident);   // its clamp line then names no flag
         bool resident_ok = src.pin_cache_complement(xcache, err, o.resident_pin, stage_pairs, lend_from,
                                                     o.resident_headroom, o.resident_budget, &rank_all);
+#if defined(STRATA_USE_HIP) && defined(_WIN32)
+        // cut = the RAM copy reached the cap (within 16 MiB: the ranked experts are taken while they fit, the last gap is under one expert's blob, about 4 MiB)
+        if (uma_cap_applied && resident_ok && src.resident_bytes() + (16ull << 20) >= uma_cap) {
+            if (uma_cap == 0)
+                std::fprintf(stderr, "strata: %d requests at once: the experts are read from the SSD when needed so that everything fits in this PC's memory (STRATA_UMA_PIN_CAP=0 keeps the RAM budget as set)\n", o.batch);
+            else
+                std::fprintf(stderr, "strata: %d requests at once: %.1f GiB of experts are kept in RAM so that everything fits in this PC's memory; the rest are read from the SSD when needed (STRATA_UMA_PIN_CAP=0 keeps the RAM budget as set)\n",
+                             o.batch, (double) uma_cap / 1073741824.0);
+        }
+#endif
         std::string whole_err;
         if (!resident_ok && o.resident_soft) {
             // #467: the whole complement does not fit - keep what does, the hottest by the profile, through the #403

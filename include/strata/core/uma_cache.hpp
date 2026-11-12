@@ -50,10 +50,15 @@ inline int wddm_auto_reserve_mib(bool integrated, uint64_t total_bytes, int curr
 /// (-1834-6629) started.  So the RAM copy is capped to what leaves complement + pinned K/V at the level of the largest start that worked, 22.75 GiB (the
 /// largest budget that started, 15 GiB, plus 4 slots' K/V).  One bracket (15 works, 18 fails), not a derived limit.  The experts left out are read from the SSD.
 inline uint64_t uma_pinned_complement_cap_bytes(uint64_t kv_pinned_bytes) {
-    constexpr uint64_t GiB = 1ull << 30;
-    constexpr uint64_t level = GiB * 2275 / 100;   // 22.75 GiB
-    const uint64_t cap = level > kv_pinned_bytes ? level - kv_pinned_bytes : 0;
-    return cap > GiB ? cap : GiB;                  // never 0 (a budget of 0 means "no limit")
+    constexpr uint64_t level = (1ull << 30) * 2275 / 100;   // 22.75 GiB
+    return level > kv_pinned_bytes ? level - kv_pinned_bytes : 0;   // 0 = keep no expert in RAM: every expert outside the GPU cache is read from the SSD (a start, not a refusal)
+}
+
+/// The cap as the budget that pin_cache_complement takes: a budget of 0 there means "no limit", so "nothing in RAM" is the smallest real budget, 1 byte (no expert's blob
+/// fits in it: the copy is empty and every expert the cache does not hold is read from the SSD).  Never an error, never a negative size.
+inline uint64_t uma_pinned_complement_budget_bytes(uint64_t kv_pinned_bytes) {
+    const uint64_t cap = uma_pinned_complement_cap_bytes(kv_pinned_bytes);
+    return cap > 0 ? cap : 1;
 }
 
 }  // namespace strata::core

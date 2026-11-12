@@ -49,7 +49,17 @@ int main() {
         // 4 slots (5 sessions): 22.75 - 7.75 = 15.0 GiB, the largest budget that started (job strix-20261112-1937-7dbd)
         CHECK(capped(5) >= 14 * GiB + GiB * 99 / 100 && capped(5) <= 15 * GiB + GiB / 100);
         CHECK(capped(5) < 18 * GiB);                                          // 18 failed
-        CHECK(uma_pinned_complement_cap_bytes(30 * GiB) == GiB);              // never 0: 0 would mean "no limit"
+        // many slots: the K/V alone is over the level (15 sessions x 1.55 GiB = 23.25 > 22.75): the cap is 0 = no RAM copy, and the budget handed to the pin is 1 byte
+        // (0 would mean "no limit"): a start with every expert outside the GPU cache read from the SSD, never an error, never a wrapped (negative) size
+        CHECK(uma_pinned_complement_cap_bytes(30 * GiB) == 0);
+        CHECK(uma_pinned_complement_cap_bytes(kv * 15) == 0);
+        CHECK(uma_pinned_complement_budget_bytes(30 * GiB) == 1);
+        CHECK(uma_pinned_complement_budget_bytes(kv * 15) == 1);
+        CHECK(uma_pinned_complement_budget_bytes(~0ull) == 1);                // the largest input
+        CHECK(uma_pinned_complement_cap_bytes(0) == GiB * 2275 / 100);        // no session at all: the whole level
+        CHECK(uma_pinned_complement_cap_bytes(kv * 9) > 8 * GiB + GiB * 50 / 100);   // 8 slots + the main session (9 x 1.55 = 13.95): 8.8 GiB, still a copy
+        CHECK(uma_pinned_complement_cap_bytes(kv * 14) > 0);                  // 14 sessions: 1.05 GiB left
+        CHECK(uma_pinned_complement_budget_bytes(kv * 5) == uma_pinned_complement_cap_bytes(kv * 5));   // above zero the budget is the cap itself
     }
     if (fails == 0) std::printf("uma_cache_test: all checks passed\n");
     return fails == 0 ? 0 : 1;
