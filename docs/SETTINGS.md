@@ -10,7 +10,7 @@ debugging and are kept in `data/settings-register.json`.
 A number or a word is set like any environment variable, for example `STRATA_KVA=1`. In the Terminal, `strata launch --set NAME=value`
 puts it in the model's run configuration.
 
-## Switches you can turn on (275)
+## Switches you can turn on (274)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -223,7 +223,6 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_PREFILL_ROUTED_STREAM` | text | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_PREFILL_ROUTED_STREAM_DEPTH` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_PREFILL_STREAM_ALL` | on / off | Intel Arc | [INTEL.md](INTEL.md) |
-| `STRATA_PREFILL_STREAM_MIN` | number | NVIDIA and AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md), [STRIX_HALO.md](STRIX_HALO.md) |
 | `STRATA_PRIMARY_DEVICE` | number | NVIDIA and AMD | [SECOND_GPU.md](SECOND_GPU.md) |
 | `STRATA_PROMPT_ATTN_IMMA` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_PROMPT_DIRECT` | on / off | NVIDIA and AMD | [QUANTS.md](QUANTS.md) |
@@ -292,7 +291,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_WDDM_BUDGET` | number | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md) |
 | `STRATA_WS_FAST` | number | NVIDIA and AMD | [OLDER_GPUS.md](OLDER_GPUS.md) |
 
-## Switches that go back to earlier behaviour (62)
+## Switches that go back to earlier behaviour (64)
 
 These behaviours are on by default. Setting the switch returns the earlier behaviour; the notes in the register say which
 version made it the default.
@@ -332,12 +331,13 @@ version made it the default.
 | `STRATA_NUMA_SPLIT` | text | CPU | v0.2.2 | [DETAILS.md](DETAILS.md), [release-notes-0.2.2.md](release-notes-0.2.2.md) |
 | `STRATA_NV_CHUNK` | on / off | NVIDIA | v0.2.11 | [DETAILS.md](DETAILS.md) |
 | `STRATA_PF_FUSED_IQ2X` | text | AMD | - | - |
-| `STRATA_PF_FUSED_Q50` | on / off | AMD | v0.2.12 | - |
+| `STRATA_PF_FUSED_Q50` | on / off | NVIDIA and AMD | v0.2.12 | - |
 | `STRATA_PF_SMALL_FUSED` | on / off | NVIDIA and AMD | - | - |
 | `STRATA_PF_W16_CACHE_MIB` | on / off | NVIDIA and AMD | v0.2.9 | - |
 | `STRATA_PF_XMX` | text | Intel Arc | v0.1.42 | [INTEL.md](INTEL.md), [release-notes-0.2.0.md](release-notes-0.2.0.md) |
 | `STRATA_PIPELINE_ADAPT_ASYNC` | number | NVIDIA and AMD | v0.1.40.2 | - |
 | `STRATA_PLE_AUTO_MMAP` | number | NVIDIA and AMD, Intel Arc | v0.1.43.1 | [DETAILS.md](DETAILS.md) |
+| `STRATA_PREFILL_STREAM_MIN` | number | NVIDIA and AMD, Intel Arc | v0.1.40.1 | [AMD_HIP.md](AMD_HIP.md), [STRIX_HALO.md](STRIX_HALO.md) |
 | `STRATA_PROMPT_ATTN_ESIMD` | number | Intel Arc | v0.2.9 | - |
 | `STRATA_PROMPT_ATTN_OLD` | on / off | NVIDIA and AMD, Intel Arc | v0.1.40.1 | [NVIDIA_V100.md](NVIDIA_V100.md), [OLDER_GPUS.md](OLDER_GPUS.md) |
 | `STRATA_Q2_WARP` | on / off | NVIDIA and AMD | v0.1.45 | [DETAILS.md](DETAILS.md) |
@@ -359,5 +359,6 @@ version made it the default.
 | `STRATA_TOPK_SPLIT` | number | NVIDIA and AMD | v0.1.45 | [DETAILS.md](DETAILS.md) |
 | `STRATA_TOPK_STREAM` | on / off | NVIDIA and AMD, Intel Arc | v0.1.40.1 | [AMD_HIP.md](AMD_HIP.md), [DETAILS.md](DETAILS.md), [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
 | `STRATA_TQ_STAGE` | on / off | NVIDIA and AMD | v0.2.2 | [GYRO.md](GYRO.md), [release-notes-0.2.2.md](release-notes-0.2.2.md) |
+| `STRATA_UMA_PIN_CAP` | on / off | AMD | - | [BATCHING.md](BATCHING.md) |
 | `STRATA_UMA_RESERVE_GIB` | on / off | NVIDIA and AMD | v0.2.2 | [release-notes-0.2.2.md](release-notes-0.2.2.md), [STRIX_HALO.md](STRIX_HALO.md) |
 | `STRATA_XN_F16` | on / off | NVIDIA and AMD | v0.1.45 | [DETAILS.md](DETAILS.md) |
