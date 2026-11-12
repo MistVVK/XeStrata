@@ -8896,8 +8896,13 @@ int main(int argc, char** argv) {
         GpuStage& st = *stp;
         const auto& lay = strata::kernels::cpu::expert_layout();
         // the drafter and the head are already allocated by now (they load above, before this), so what is left
-        // to hold back is the windows - and `free_b` has already lost the drafter.
-        int64_t room = stage_room(st.dev, true, false);
+        // to hold back is the windows - and `free_b` has already lost the drafter.  Not the draft head and its
+        // logits: the drafter allocates them when it binds, after this, as on one GPU (#199), so on the last stage
+        // they come out of the cache here.  Out of the reserve instead, a later card without a display (300 MiB)
+        // had no room left for them: "mtp: the draft head does not fit" on two 16 GB cards.  (Strata-DualGPU)
+        const int64_t draft_head = (&st == last_st && !o.mtp.empty() && st.head.loaded())
+                                       ? (int64_t) mtp.bind_bytes(st.head.row_bytes(), n_vocab) : 0;
+        int64_t room = stage_room(st.dev, true, false) - draft_head;
         const strata::core::OnDevice on(st.dev);
 #if defined(STRATA_HAVE_DFLASH2)
         // DFlash2's own draft head and logits (and, in serve, the prompt staging) are bound on its card AFTER the caches, as the single card prices them (mtp_bind above): without
