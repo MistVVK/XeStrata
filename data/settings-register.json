@@ -6214,7 +6214,7 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [
-    "docs/DGX_SPARK_LINUX.md:123"
+    "docs/DGX_SPARK_LINUX.md:124"
    ],
    "first_commit": "aea6e45c64",
    "first_date": "2026-10-01",
@@ -11708,8 +11708,8 @@
     "docs/AMD_HIP.md:455",
     "docs/DETAILS.md:1118",
     "docs/DETAILS.md:1524",
-    "docs/DGX_SPARK_LINUX.md:115",
-    "docs/DGX_SPARK_LINUX.md:132",
+    "docs/DGX_SPARK_LINUX.md:116",
+    "docs/DGX_SPARK_LINUX.md:133",
     "docs/RADEON_780M.md:85",
     "docs/RADEON_780M.md:104",
     "docs/STRIX_HALO.md:134",
@@ -24306,6 +24306,7 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [
+    "docs/DGX_SPARK_LINUX.md:114",
     "docs/QUANTS.md:37",
     "docs/STRIX_HALO.md:157"
    ],
@@ -24316,7 +24317,7 @@
    "last_date": "2026-11-12",
    "status": "rollback",
    "owner": "prefill",
-   "note": "[11-12] CUDA: the K-quant experts of UD-Q4_K_XL (Q4_K / Q5_K gate/up with a Q5_1 or Q8_0 down) are read by Strata's fused prompt kernels by default on compute capability 8.0, 8.6, 8.9 and 12.0 cards with 80 or more multiprocessors (RTX A6000, A40, RTX 3090, RTX PRO 5000 class), and with 40 to 79 on the staged launches unless STRATA_PF_FUSED_SM40=0; =0 puts them back on MMQ, =1 takes them on every sm_80+ card. AMD: still opt-in (=1 with STRATA_PF_FUSED=1 on gfx12; on by default on gfx1151 under Windows). One layer on the RTX A6000, Q4_K / Q5_1, MMQ time / fused time with the 128-row tile: 1.65 / 1.49 / 1.52 / 1.29 / 1.04 / 0.97 / 0.88 at 300 / 1,000 / 2,048 / 4,096 / 8,192 / 20,000 / 32,768 tokens. [docs/STRIX_HALO.md:228]",
+   "note": "[11-12] CUDA: the K-quant experts of UD-Q4_K_XL (Q4_K / Q5_K gate/up with a Q5_1 or Q8_0 down) are read by Strata's fused prompt kernels by default on compute capability 8.0, 8.6, 8.9 and 12.0 cards with 80 or more multiprocessors (RTX A6000, A40, RTX 3090, RTX PRO 5000 class), and with 40 to 79 on the staged launches unless STRATA_PF_FUSED_SM40=0, and on the DGX Spark (12.1) through its defaults table; =0 puts them back on MMQ, =1 takes them on every sm_80+ card. AMD: still opt-in (=1 with STRATA_PF_FUSED=1 on gfx12; on by default on gfx1151 under Windows). One layer on the RTX A6000, Q4_K / Q5_1, MMQ time / fused time with the 128-row tile: 1.65 / 1.49 / 1.52 / 1.29 / 1.04 / 0.97 / 0.88 at 300 / 1,000 / 2,048 / 4,096 / 8,192 / 20,000 / 32,768 tokens. [docs/STRIX_HALO.md:228]",
    "retire_after": "",
    "retired_in": ""
   },
@@ -29230,7 +29231,7 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [
-    "docs/DGX_SPARK_LINUX.md:114",
+    "docs/DGX_SPARK_LINUX.md:115",
     "docs/NVFP4.md:84",
     "docs/NVFP4.md:282"
    ],
@@ -34789,7 +34790,7 @@
     "docs/DETAILS.md:1304",
     "docs/DETAILS.md:1305",
     "docs/DETAILS.md:1524",
-    "docs/DGX_SPARK_LINUX.md:116",
+    "docs/DGX_SPARK_LINUX.md:117",
     "docs/OLDER_GPUS.md:149"
    ],
    "first_commit": "ffc30b8d76",
@@ -35052,7 +35053,7 @@
    "doc_mentions": [
     "docs/DGX_SPARK_LINUX.md:88",
     "docs/DGX_SPARK_LINUX.md:108",
-    "docs/DGX_SPARK_LINUX.md:127"
+    "docs/DGX_SPARK_LINUX.md:128"
    ],
    "first_commit": "9a398bd5bf",
    "first_date": "2026-10-27",
@@ -35534,8 +35535,8 @@
    "launch_reads": [],
    "doc_mentions": [
     "docs/DETAILS.md:599",
-    "docs/DGX_SPARK_LINUX.md:117",
-    "docs/DGX_SPARK_LINUX.md:132"
+    "docs/DGX_SPARK_LINUX.md:118",
+    "docs/DGX_SPARK_LINUX.md:133"
    ],
    "first_commit": "6878105560",
    "first_date": "2026-10-21",
