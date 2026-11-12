@@ -272,15 +272,16 @@ static cudaEvent_t g_hc_ev[64][2] = {};        // [device][slot]: the prompt pat
 static bool g_hc_ev_set[64][2] = {};
 
 NativeDense::~NativeDense() {
+    release();
+}
+
+void NativeDense::release() {
+    // what the destructor always did first: no HC scratch pointer and no packed-Q8 registry key may outlive the memory
     for (auto& dev : g_hc_scratch)
         for (auto& cl : dev)
             for (void*& b : cl)
                 if (b != nullptr && std::find(weights_.begin(), weights_.end(), b) != weights_.end()) b = nullptr;
     for (const void* p : packed_keys_) strata::kernels::native_q8_0_packed_unregister(p);
-    release();
-}
-
-void NativeDense::release() {
     if (scratch_) cudaFree(scratch_);
     for (void* p : weights_) cudaFree(p);
     scratch_ = nullptr;
