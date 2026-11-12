@@ -6303,7 +6303,7 @@ int main(int argc, char** argv) {
             char line[1024], name[256];
             while (std::fgets(line, sizeof line, f))
                 if (line[0] != '#' && std::sscanf(line, "%255s", name) == 1 && std::strncmp(name, "blk.", 4) == 0 &&
-                    !skip.count(name)) {
+                    !skip.count(name) && std::strstr(name, "ple") == nullptr) {   // the PLE rows stay on every card (add_foreign keeps them too)
                     const long l = std::strtol(name + 4, nullptr, 10);
                     if (l >= 0 && l < g.n_layers) layer_rows[(size_t) l].push_back(name);
                 }
