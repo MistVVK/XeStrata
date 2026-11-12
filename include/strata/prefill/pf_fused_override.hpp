@@ -23,4 +23,9 @@ inline std::atomic<int>& pf_fused_override() {
 /// a variable the user named is never changed (the small-card rule steps aside for it anyway).
 inline int pf_fused_env_effective(int env, int ov) { return env < 0 && ov == kPfFusedKernelsOnly ? 1 : env; }
 
+/// Whether the small-card prompt path (strata::small_card_prompt_path, core/sm120_series.hpp: MMQ's buffer layout so the layer-major walk runs) also runs the native
+/// fused expert kernels inside that layout (the walk's groups and the streamed chunks): yes, unless STRATA_PF_SMALL_FUSED is "0" (the way back: MMQ's kernels there,
+/// as before).  `env` is getenv's answer.  HIP builds never reach the rule.
+inline bool small_card_kernels_on(const char* env) { return !(env != nullptr && env[0] == '0'); }
+
 }  // namespace strata::prefill

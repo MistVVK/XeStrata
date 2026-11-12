@@ -631,12 +631,12 @@ int main() {
             CHECK(pp.any() == r.fires);
             CHECK(pp.fused_off == r.fires && pp.layer_major == r.fires);
             if (pp.fused_off) {
-                CHECK(small_card_kernels_on(nullptr));                      // unset: the native fused kernels run in MMQ's buffer layout
-                CHECK(small_card_kernels_on(""));
-                CHECK(small_card_kernels_on("1"));
-                CHECK(!small_card_kernels_on("0"));                         // the way back: MMQ's kernels, as before
+                CHECK(prefill::small_card_kernels_on(nullptr));                      // unset: the native fused kernels run in MMQ's buffer layout
+                CHECK(prefill::small_card_kernels_on(""));
+                CHECK(prefill::small_card_kernels_on("1"));
+                CHECK(!prefill::small_card_kernels_on("0"));                         // the way back: MMQ's kernels, as before
             }
-            const int ov = pp.fused_off ? (small_card_kernels_on(nullptr) ? prefill::kPfFusedKernelsOnly : 0) : -1;
+            const int ov = pp.fused_off ? (prefill::small_card_kernels_on(nullptr) ? prefill::kPfFusedKernelsOnly : 0) : -1;
             // STRATA_PF_FUSED as the fused kernels' rule reads it: unset reads as 1 on the small-card path only
             CHECK(prefill::pf_fused_env_effective(-1, ov) == (r.fires ? 1 : -1));
             CHECK(prefill::pf_fused_env_effective(0, ov) == 0);             // "0" stays off

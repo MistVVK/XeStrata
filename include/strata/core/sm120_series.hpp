@@ -150,7 +150,7 @@ inline bool prefill_layer_major_resolve(const char* env, bool hip, int stages, b
 /// `fused_env_set` (STRATA_PF_FUSED named, either value) leaves the expert path alone and with it the walk (a fused layout declines it anyway);
 /// `lm_env_set` (STRATA_PREFILL_LAYER_MAJOR named) leaves the walk alone.
 struct SmallCardPromptPath {
-    bool fused_off = false;     ///< read the prompt in MMQ's buffer layout (no fused layout or ring, so the walk runs); the native fused kernels still run there (small_card_kernels_on)
+    bool fused_off = false;     ///< read the prompt with the unfused experts (STRATA_PF_FUSED=0 as far as the engine is concerned)
     bool layer_major = false;   ///< and take the layer-major walk for a prompt of two chunks or more (STRATA_PREFILL_LAYER_MAJOR=1)
     bool any() const { return fused_off || layer_major; }
 };
@@ -164,8 +164,5 @@ inline SmallCardPromptPath small_card_prompt_path(long long default_chunk, bool 
     r.layer_major = !lm_env_set;
     return r;
 }
-/// Whether the small-card prompt path runs the native fused expert kernels inside MMQ's buffer layout (the layer-major walk's groups and the streamed chunks): yes, unless
-/// STRATA_PF_SMALL_FUSED is "0" (the way back: MMQ's kernels there, as before).  `env` is getenv's answer.  HIP builds never reach the rule.
-inline bool small_card_kernels_on(const char* env) { return !(env != nullptr && env[0] == '0'); }
 
 }  // namespace strata

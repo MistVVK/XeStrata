@@ -11111,7 +11111,7 @@ int main(int argc, char** argv) {
                     const int64_t chunk_default = chunk;
                     // MMQ's buffer layout (so the layer-major walk runs); the native fused kernels still run in the walk's groups and the streamed chunks
                     // (pf_fused_override.hpp), unless STRATA_PF_SMALL_FUSED=0 keeps MMQ's kernels there as before
-                    if (pp.fused_off) strata::prefill::pf_fused_override().store(strata::small_card_kernels_on(std::getenv("STRATA_PF_SMALL_FUSED")) ? strata::prefill::kPfFusedKernelsOnly : 0);
+                    if (pp.fused_off) strata::prefill::pf_fused_override().store(strata::prefill::small_card_kernels_on(std::getenv("STRATA_PF_SMALL_FUSED")) ? strata::prefill::kPfFusedKernelsOnly : 0);
                     if (pp.layer_major) {
 #if defined(_WIN32)
                         _putenv_s("STRATA_PREFILL_LAYER_MAJOR", "1");
