@@ -146,14 +146,14 @@ inline Outcome give_back(const std::vector<std::string>& files) {
     return o;
 }
 
-/// The one line the engine prints (a [DRAFT] until the owner words it, par/OWNER-WORDING-1111.md): empty when nothing was given back.
+/// The one line the engine prints: empty when nothing was given back.
 inline std::string draft_line(const Outcome& o) {
     const double gib = 1073741824.0;
     const uint64_t after_call = o.cached_before > o.cached_after ? o.cached_before - o.cached_after : 0;
     if (o.advised_behind == 0 && after_call == 0) return std::string();
     char buf[512];
     std::snprintf(buf, sizeof buf,
-                  "[DRAFT] the model files' cached pages were given back after the expert load: %.1f GiB asked back during the read, %.1f GiB "
+                  "the model files' cached pages were given back after the expert load: %.1f GiB asked back during the read, %.1f GiB "
                   "by the call after it (%.0f ms); the file cache is %.1f GiB now (STRATA_NO_ARENA_CACHE_DROP=1 keeps it)",
                   (double) o.advised_behind / gib, (double) after_call / gib, o.ms, (double) o.cached_after / gib);
     return std::string(buf);

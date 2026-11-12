@@ -148,7 +148,7 @@ int main() {
         CHECK(pcd::meminfo_bytes("Cach") == 0);   // a prefix is not a key
     }
 #endif
-    // 6. the draft line: nothing when nothing was given back, a [DRAFT] otherwise, with the numbers and the switch
+    // 6. the draft line: nothing when nothing was given back, a line otherwise, with the numbers and the switch
     {
         pcd::Outcome none;
         CHECK(pcd::draft_line(none).empty());
@@ -158,7 +158,7 @@ int main() {
         o.cached_after = 1ull << 30;
         o.ms = 520.0;
         const std::string s = pcd::draft_line(o);
-        CHECK(s.rfind("[DRAFT] ", 0) == 0);
+        CHECK(s.rfind("the model files' cached pages were given back after the expert load: ", 0) == 0);
         CHECK(s.find("9.0 GiB") != std::string::npos);
         CHECK(s.find("6.0 GiB") != std::string::npos);
         CHECK(s.find("520 ms") != std::string::npos);

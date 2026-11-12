@@ -499,7 +499,7 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
                     ? "; transparent huge pages skipped (STRATA_NO_ARENA_THP)"
                     : thp_mode == "always"
                     ? "; transparent huge pages are on for every mapping (THP always): MADV_HUGEPAGE not requested"
-                    : " [DRAFT] ; huge pages not requested on this graphics chip";
+                    : "; huge pages not requested on this graphics chip";
     } else if (std::getenv("STRATA_NO_LARGEPAGES") == nullptr && std::getenv("STRATA_ARENA_THP") == nullptr &&
                free_huge_bytes() < bytes / 2) {
         // #2126: THP "madvise" + defrag "madvise" makes every fault of a MADV_HUGEPAGE mapping reclaim and compact
