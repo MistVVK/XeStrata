@@ -34141,6 +34141,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_SERVE_STOP_SKIP",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 18427,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": "on",
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "",
+   "since": "",
+   "last_commit": "",
+   "last_date": "",
+   "status": "research",
+   "owner": "program",
+   "note": "on unless set to 0: a decode window that finishes after the server's STOP is dropped whole (not committed, not printed), so the session ends at the rows the client was sent (lane AGENT-CAP; serial and pipelined loop; src/program/generate.cpp)",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_SESSION_BUFFERED",
    "backends": [
     "cuda-hip"

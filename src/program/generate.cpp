@@ -18587,6 +18587,9 @@ int main(int argc, char** argv) {
             // the older checkpoint against 4 of 16 without it, #4677; it changes no emitted token, only which accepted rows the
             // session keeps); STRATA_SERVE_STOP_BOUND=0 turns it off
             static const bool stop_bound = strata::core::serve_stop_bound_on(std::getenv("STRATA_SERVE_STOP_BOUND"));
+            // a window that finishes after the server's STOP is dropped whole (no commit, no tokens): the session ends at the rows the
+            // client was sent.  Research switch, on by default; STRATA_SERVE_STOP_SKIP=0 turns it off (serve_stop_bound.hpp)
+            static const bool stop_skip = strata::core::serve_stop_skip_on(std::getenv("STRATA_SERVE_STOP_SKIP"));
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
@@ -18984,7 +18987,7 @@ int main(int argc, char** argv) {
                                 ss.ple_prev[0] = undo_ple[0];
                                 ss.ple_prev[1] = undo_ple[1];
                             }
-                            if (!VF(st, undo_w).pl_commit_async(undo_keep, err)) return die(err);
+                            if (undo_keep > 0 && !VF(st, undo_w).pl_commit_async(undo_keep, err)) return die(err);   // 0: the window was dropped (stop_skip)
                         }
                         doomed = false;
                         ++pl_undo;
@@ -19151,6 +19154,25 @@ int main(int argc, char** argv) {
                                                            outp.data(), [&](int32_t y) {
                             return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                         }) - 1;
+                    // STOP arrived while A was in flight: A is dropped whole (serve_skip_stopped_window), not committed on any stage and not
+                    // printed.  A front stage that B ran on has A committed speculatively (A.com): it goes back to the snapshot taken before
+                    // A, with no replay (undo_keep 0); a stage B never reached never committed A.
+                    if (stop_skip && stop_req.load() && A.seq > 0) {
+                        bool deferred = V1(A).commit_deferred();
+                        for (int st = 0; deferred && st < pl_nf; ++st) deferred = VF(st, A).commit_deferred();
+                        if (strata::core::serve_skip_stopped_window(true, true, false, false, deferred)) {
+                            finish = "cancel";
+                            if (B.launched) {
+                                doomed = true;
+                                D = B;
+                                undo_w = A;
+                                undo_keep = 0;
+                            }
+                            B = PW{};
+                            ending = true;
+                            continue;
+                        }
+                    }
                     if (!V1(A).pl_commit_async(a + 1, err)) return die(err);
                     for (int i = 0; i <= a; ++i) consumed.push_back(A.tok[i]);
                     draft_offered += A.T - 1;
@@ -19668,6 +19690,14 @@ int main(int argc, char** argv) {
                             std::fprintf(stderr, "strata serve: STRATA_DUMP_FIRST_LOGITS: cannot write %s\n", path.c_str());
                         if (f) std::fclose(f);
                     }
+                }
+                // STOP arrived while this window ran: drop it whole (serve_skip_stopped_window).  Not committed, not printed - the server throws
+                // away every token after its STOP - so the session ends at the rows the client was sent and the next request continues
+                // from it.  One flag read per window; a request that ends by its cap or EOS never sets the flag.
+                if (stop_skip && stop_req.load() &&
+                    strata::core::serve_skip_stopped_window(true, true, merged, first_window, ver.commit_deferred())) {
+                    finish = "cancel";
+                    break;
                 }
                 if (fol != nullptr) {   // STRATA_FOLLOW: the forced continuation stands in for the argmax (row i answers continuation index produced_n + i)
                     for (int i = 0; i < T; ++i) {
