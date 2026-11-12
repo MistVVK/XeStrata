@@ -12153,7 +12153,7 @@
    "reads": [
     {
      "file": "src/prefill/gemm.cu",
-     "line": 612,
+     "line": 615,
      "backend": "hip",
      "fn": "getenv"
     },
@@ -12168,27 +12168,35 @@
    "default_state": "off",
    "code_default": null,
    "engine_sets": [],
-   "engine_defaults": [],
+   "engine_defaults": [
+    {
+     "file": "include/strata/core/arch_defaults.hpp",
+     "line": 78,
+     "value": "1",
+     "arch": "gfx1103 (Linux, integrated)"
+    }
+   ],
    "launch_files": [],
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [
-    "docs/AMD_HIP.md:286",
-    "docs/AMD_HIP.md:515",
-    "docs/AMD_HIP.md:516",
-    "docs/AMD_HIP.md:696",
-    "docs/AMD_HIP.md:703",
-    "docs/AMD_HIP.md:769",
-    "docs/AMD_HIP.md:780"
+    "docs/AMD_HIP.md:283",
+    "docs/AMD_HIP.md:512",
+    "docs/AMD_HIP.md:513",
+    "docs/AMD_HIP.md:693",
+    "docs/AMD_HIP.md:700",
+    "docs/AMD_HIP.md:766",
+    "docs/AMD_HIP.md:777",
+    "docs/RADEON_780M.md:91"
    ],
    "first_commit": "972cad1bc5",
    "first_date": "2026-10-05",
    "since": "v0.1.40.1",
    "last_commit": "85f839d80c",
    "last_date": "2026-10-12",
-   "status": "opt-in",
+   "status": "default",
    "owner": "prefill",
-   "note": "[reviewed] Documented FP16 prompt route, off unless =1. [docs/AMD_HIP.md:516]",
+   "note": "[auto] on by default for a Radeon 780M (gfx1103, integrated, Linux) only (include/strata/core/arch_defaults.hpp:78 prompt_f16_resolve, used by prompt_f16() in src/prefill/gemm.cu); opt-in elsewhere (=1); =0 turns it off. [docs/AMD_HIP.md:512]",
    "retire_after": "",
    "retired_in": ""
   },
