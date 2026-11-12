@@ -1,6 +1,7 @@
 #include "strata/core/conversation_snapshot.hpp"
 #include "conversation_checked.hpp"
 #include "conversation_copy.hpp"
+#include "conversation_trace.hpp"
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -298,10 +299,12 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
     static const bool atr = std::getenv("STRATA_PARK_TRACE") != nullptr;
     const bool ready = c.gdn.size() == z.gdn;   // (a pooled checkpoint's pages are in; a fresh vector faults them all)
     const auto r0 = std::chrono::steady_clock::now();
+    const long rf0 = atr ? conversation_trace::thread_minflt() : 0;
     c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
     c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
-    if (atr) std::fprintf(stderr, "strata parktrace: save vectors %s, resize %.2f ms\n", ready ? "ready" : "fresh",
-        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count());
+    if (atr) std::fprintf(stderr, "strata parktrace: save vectors %s, resize %.2f ms, %ld faults, gdn %zu MB at %p (%s)\n", ready ? "ready" : "fresh",
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - r0).count(),
+        conversation_trace::thread_minflt() - rf0, c.gdn.size() >> 20, (const void*) c.gdn.data(), conversation_trace::where(c.gdn.data()));
     if (ckpt_async_on() && c.gdn.size() >= ((size_t) 1 << 20)) {
         CkptAsync& a = ckpt_async();
         int dev = 0;
@@ -513,6 +516,7 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 
 // (conversation_snapshot.cpp) STRATA_PARK_TRACE: conversation_kv_save's time since the park's begin, by part (ms)
 void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& copy_ms);
+long conversation_kv_save_trace_faults();   // (E1) minor faults of the K/V buffer resizes of this park's saves
 
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
                                 const SessionState& ss, const ModelGeometry& g,
@@ -541,7 +545,13 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     }
     captured.live.ids = view.ids; captured.live.imgs = view.images;
     const auto p1 = now();
+    const long cf0 = ptr ? conversation_trace::thread_minflt() : 0;
     captured.cvec = view.cvec; captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints, storage);
+    const long ck_faults = ptr ? conversation_trace::thread_minflt() - cf0 : 0;
+    if (ptr)   // (E1: where each copied checkpoint's running state went: faults of the whole copy, address, heap or mapping)
+        for (const auto& c : captured.checkpoints)
+            std::fprintf(stderr, "strata parktrace: ckpt copy gdn %zu MB at %p (%s)\n", c.gdn.size() >> 20,
+                         (const void*) c.gdn.data(), conversation_trace::where(c.gdn.data()));
     if (moved != nullptr)
         for (auto& c : *moved) {
             conversation_checkpoint_join(c.gdn.data());
@@ -576,6 +586,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     const auto p4 = now();
     struct Abandon { bool on; ~Abandon() { if (on) conversation_park_async_abandon(); } } abandon{staged};
     double kv_max = 0, kv_sum = 0;   // (STRATA_PARK_TRACE: the per-layer save time)
+    const long kf0 = ptr ? conversation_trace::thread_minflt() : 0;
     for (size_t j = 0; j < layers; ++j) {
         const auto k0 = now();
         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
@@ -583,6 +594,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
         const double kt = ms(k0, now());
         kv_sum += kt; kv_max = std::max(kv_max, kt);
     }
+    const long kv_faults_total = ptr ? conversation_trace::thread_minflt() - kf0 : 0;
     if (ptr) {
         size_t kvb = 0;
         for (const auto& k : captured.kv) kvb += k.bytes();
@@ -592,6 +604,24 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                              "begin %.1f ms, K/V %zu MB %.1f ms (layer max %.2f, sum %.2f; attrs %.2f, resize %.2f, copy %.2f)\n",
                      ms(pj, p0), ms(p0, p1), captured.checkpoints.size(), ms(p1, p2), ms(p2, p3), ms(p3, p4), kvb >> 20,
                      ms(p4, now()), kv_max, kv_sum, attrs_ms, resize_ms, copy_ms);
+        static const bool thp_said = [] {
+            std::fprintf(stderr, "strata parktrace: THP enabled %s; defrag %s; page size %ld; sbrk end %p\n",
+                         conversation_trace::sys_line("/sys/kernel/mm/transparent_hugepage/enabled").c_str(),
+                         conversation_trace::sys_line("/sys/kernel/mm/transparent_hugepage/defrag").c_str(),
+                         conversation_trace::page_size(), conversation_trace::brk_end());
+            return true;
+        }();
+        (void) thp_said;
+        // E1: page faults per phase (a 4 KiB first touch = 1, a 2 MiB huge page = 1).  (Not AnonHugePages: reading /proc/self/smaps_rollup
+        // walks the 47 GB expert mapping and costs ~0.5 s a read, which the first E1 job (e1, 11-11) put inside the park's own times.)
+        std::fprintf(stderr, "strata parktrace: faults: checkpoint copies %ld, K/V resize %ld (copy phase included in the layer loop: %ld)\n",
+                     ck_faults, conversation_kv_save_trace_faults(), kv_faults_total);
+        if (!captured.kv.empty()) {
+            const auto& k0 = captured.kv.front();
+            std::fprintf(stderr, "strata parktrace: K/V layer 0 buffers (bytes): k %zu v %zu k_scale %zu v_scale %zu pooled %zu; %zu layers; "
+                                 "segment %zu MiB\n", k0.k.size(), k0.v.size(), k0.k_scale.size(), k0.v_scale.size(), k0.pooled.size(),
+                         captured.kv.size(), ConversationBuffer::segment_bytes >> 20);
+        }
     }
     // The draft's final cell may not have been computed when the output cap was
     // reached. Refresh that page even when the main prefix continued unchanged.

@@ -2961,7 +2961,7 @@
     },
     {
      "file": "src/program/generate.cpp",
-     "line": 377,
+     "line": 381,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3001,7 +3001,7 @@
    "last_date": "2026-11-07",
    "status": "default",
    "owner": "program",
-   "note": "the engine's own default (the parallel-request stack, bit-exact, QUAL-PAR): on with 2 or more batch slots on Linux CUDA (arch_defaults.cpp parallel_default_env_cuda, applied in generate.cpp) and on Windows gfx1151; NAME=0 turns it off; a value you set is kept",
+   "note": "on by default (lane PARK-POOL): in a single-stage serve with a conversation cache the checkpoint pool is on and keeps ready checkpoints (STRATA_CKPT_POOL_READY, by default as many as fit in a twelfth of the cache, at most 4; park_pool_plan in park_pool_policy.hpp); not in the Metal build; NAME=0 turns it off (the diagnostic switch; no user setting); a value you set is kept. Also the parallel-request stack default (QUAL-PAR): on with 2 or more batch slots on Linux CUDA (arch_defaults.cpp parallel_default_env_cuda) and on Windows gfx1151.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -3013,7 +3013,7 @@
    "reads": [
     {
      "file": "src/program/generate.cpp",
-     "line": 388,
+     "line": 395,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3051,7 +3051,7 @@
    "last_date": "2026-10-31",
    "status": "default",
    "owner": "program",
-   "note": "the engine's own default (the parallel-request stack, bit-exact, QUAL-PAR): on with 2 or more batch slots on Linux CUDA (arch_defaults.cpp parallel_default_env_cuda, applied in generate.cpp) and on Windows gfx1151; NAME=0 turns it off; a value you set is kept",
+   "note": "unset: the engine picks the count (lane PARK-POOL): as many ready checkpoints as fit in a twelfth of the conversation cache, at most 4 (park_pool_plan; 1 on a 2 GiB cache, 2 on 3.8 GiB, 4 from 5.25 GiB up); a value you set is kept, 0 = none ahead of time. Idle memory that counts against --conversation-cache-mib and is given back before any parked conversation is evicted or the RAM floor is reached. Also set to 4 by the parallel-request stack (QUAL-PAR) on Linux CUDA with 2 or more batch slots and on Windows gfx1151.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -22553,6 +22553,39 @@
    "status": "opt-in",
    "owner": "core",
    "note": "[reviewed] Documented conversation-cache park option for slow host links; off unless set. [docs/DETAILS.md:1598]",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_PARK_SEGPOOL_MIB",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/program/generate.cpp",
+     "line": 412,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "int",
+   "default_state": null,
+   "code_default": "0",
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "",
+   "since": null,
+   "last_commit": "",
+   "last_date": "",
+   "status": "default",
+   "owner": "core",
+   "note": "on by default on Linux (lane PARK-POOL): unset = an arena of min(2 GiB, a quarter of the conversation cache) in 64 MiB steps (none under 128 MiB), reserved once and made resident in the background; the K/V buffers of parked conversations (segments of 512 KiB and more) are taken from it, so a park no longer pays the first touch of fresh pages. Idle bytes count against --conversation-cache-mib and are given back before any parked conversation is evicted or the RAM floor is reached. NAME=0 turns it off (the diagnostic switch; no user setting), NAME=N sets N MiB (still at most a quarter of the cache). Windows and macOS: the OS layer is not written, the arena is never created there (inert).",
    "retire_after": "",
    "retired_in": ""
   },

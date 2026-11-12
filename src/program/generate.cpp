@@ -38,6 +38,7 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
+#include "strata/core/park_pool_policy.hpp"
 #include "strata/core/auto_cache.hpp"
 #include "strata/core/ple_residency.hpp"
 #include "strata/core/resident_ram_copy.hpp"
@@ -375,27 +376,48 @@ bool park_async_env() {   // STRATA_PARK_ASYNC (strata/core/conversation_snapsho
     static const bool on = [] { const char* v = std::getenv("STRATA_PARK_ASYNC"); return v != nullptr && v[0] == '1'; }();
     return on;
 }
-bool ckpt_pool_env() {
-    static const bool on = [] {
+// STRATA_CKPT_POOL: unset = the engine's default (on in a single-stage serve with a conversation cache: park_pool_plan), 0 = off, any
+// other value = on.  -1 unset, 0 off, 1 on (read once)
+int ckpt_pool_env_state() {
+    static const int state = [] {
         const char* v = std::getenv("STRATA_CKPT_POOL");
-        return v && v[0] != '0';
+        return v ? (v[0] != '0' ? 1 : 0) : -1;
     }();
-    return on;
+    return state;
 }
+bool ckpt_pool_env() { return ckpt_pool_env_state() == 1; }
 // STRATA_CKPT_POOL_READY=N (opt-in, N = 1..16, read once; only with the pool on, STRATA_CKPT_POOL): the pool keeps N ready
 // checkpoints, each a running-state image with its pages in (~118 MB on Qwen3.8-Flash-Next), allocated on a background
 // thread after any take.  Unset: the pool holds the dropped checkpoints only, as with STRATA_CKPT_POOL=1 before - that
 // variable alone allocates nothing ahead of time and its value is not a count.
+// The engine's own count when STRATA_CKPT_POOL_READY is unset (park_pool_plan, set once at the start of a serve with a cache)
+std::atomic<size_t>& ckpt_pool_ready_default() { static std::atomic<size_t> n{0}; return n; }
 size_t ckpt_pool_ready_env() {
-    static const size_t n = [] {
+    static const long env = [] {
         const char* v = std::getenv("STRATA_CKPT_POOL_READY");
-        const long k = v ? std::atol(v) : 0;
-        return k >= 1 ? (size_t) std::min(16L, k) : (size_t) 0;
+        return v ? std::atol(v) : -1L;
     }();
-    return n;
+    if (env < 0) return ckpt_pool_ready_default().load();
+    return env >= 1 ? (size_t) std::min(16L, env) : (size_t) 0;
 }
 // how many dropped checkpoints the pool keeps (a batch admission drops and takes about two): 2, or more when STRATA_CKPT_POOL_READY asks
 size_t ckpt_pool_cap_env() { return std::max<size_t>(2, ckpt_pool_ready_env()); }
+// STRATA_PARK_SEGPOOL_MIB=N (read once; Linux only, inert where the OS layer is not written - Windows, macOS): the host buffers of parked
+// conversations (K/V segments of 512 KiB and more) come from one arena of N MiB (at most a quarter of the conversation cache) that a
+// background thread makes resident, so a park's first touch of fresh pages is paid once at start instead of at every park (include/
+// strata/core/conversation_segment_pool.hpp).  Unset: the engine's default, min(2 GiB, a quarter of the cache) in 64 MiB steps
+// (park_pool_policy.hpp); 0: off (a diagnostic switch).  Its idle bytes count against --conversation-cache-mib and are given back
+// before any parked conversation is evicted and before the RAM floor is reached.  Every byte a park writes is the same; only where
+// the buffers live differs.  -1: unset.
+long long park_segpool_env_mib() {
+    static const long long mib = [] {
+        const char* v = std::getenv("STRATA_PARK_SEGPOOL_MIB");
+        if (v == nullptr) return -1LL;
+        const long long n = std::atoll(v);
+        return n > 0 ? n : 0LL;
+    }();
+    return mib;
+}
 // STRATA_CKPT_THREADS=1 (read once; off by default): a layer split's checkpoint saves every stage's part at once, the
 // first on the calling thread and each later stage's on a thread of its own device (kept for the process: the copies'
 // private streams are per thread), instead of one stage after the other.  Each part is the same copy of the same state
@@ -2346,9 +2368,22 @@ bool checkpoint_restore(const ConvCheckpoint& c, strata::core::SessionState& ss,
 class CheckpointPool {
 public:
     explicit CheckpointPool(bool on, size_t cap = 2) : on_(on), cap_(cap) {}
+    /// Sets the switch and the cap once the serve loop knows its cache (before the first give or take, on the host thread)
+    void configure(bool on, size_t cap) { std::lock_guard<std::mutex> lk(mu_); on_ = on; cap_ = cap; }
     bool on() const { return on_; }
     size_t cap() const { return cap_; }
     size_t held() { std::lock_guard<std::mutex> lk(mu_); return free_.size(); }
+    /// The bytes of the kept checkpoints (idle memory), and giving them back to the system, newest first
+    size_t idle_bytes() const { std::lock_guard<std::mutex> lk(mu_); size_t n = 0; for (const ConvCheckpoint& c : free_) n += c.bytes(); return n; }
+    size_t shrink(size_t want) {
+        std::vector<ConvCheckpoint> out;   // freed outside the lock
+        size_t given = 0;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            while (!free_.empty() && given < want) { given += free_.back().bytes(); out.push_back(std::move(free_.back())); free_.pop_back(); }
+        }
+        return given;
+    }
     void give(ConvCheckpoint&& c) {
         if (!on_ || c.gdn.empty()) return;
         strata::core::conversation_checkpoint_join(c.gdn.data());
@@ -2380,8 +2415,25 @@ private:
     }
     bool on_;
     size_t cap_;
-    std::mutex mu_;
+    mutable std::mutex mu_;
     std::vector<ConvCheckpoint> free_;
+};
+
+/// What the conversation cache counts as the park pools' idle memory (ConversationCache::set_pool): the segment pool's resident
+/// bytes that no image uses, and the checkpoint pool's kept checkpoints.  Giving back takes the arena first (it is the cheaper to
+/// top up again), then the checkpoints.
+class ParkPoolsBudget final : public strata::core::SegmentPoolBudget {
+public:
+    ParkPoolsBudget(strata::core::SegmentPool* seg, CheckpointPool* ck) : seg_(seg), ck_(ck) {}
+    size_t idle_bytes() const override { return (seg_ ? seg_->idle_bytes() : 0) + (ck_ ? ck_->idle_bytes() : 0); }
+    size_t shrink(size_t want) override {
+        size_t given = seg_ ? seg_->shrink(want) : 0;
+        if (given < want && ck_) given += ck_->shrink(want - given);
+        return given;
+    }
+private:
+    strata::core::SegmentPool* seg_;
+    CheckpointPool* ck_;
 };
 
 /// STRATA_CKPT_THREADS: runs job(0) on the calling thread and job(k), k = 1..n-1, on persistent thread k at the same
@@ -12214,6 +12266,80 @@ int main(int argc, char** argv) {
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
+        // The park pools (park_pool_policy.hpp): memory held idle between parks so a park does not pay the first touch of fresh pages.
+        //   * the segment pool: one arena for the K/V buffers of parked conversations (STRATA_PARK_SEGPOOL_MIB=N sets its size, 0 turns it
+        //     off; unset: min(2 GiB, a quarter of the cache); Linux only, the OS layer of Windows and macOS is not written yet: inert there);
+        //   * the checkpoint pool with ready checkpoints (STRATA_CKPT_POOL=0 turns it off; STRATA_CKPT_POOL_READY=N sets the count; unset:
+        //     as many as fit in a twelfth of the cache, at most 4; a single-stage serve only, not in the Metal build).
+        // Both count against the cache's budget (ConversationCache::set_pool) and are given back before any parked conversation is evicted
+        // and before the RAM floor is reached; their top-up runs in the background and only while the budget and the RAM floor plus 1 GiB
+        // leave room.  The arena is never destroyed (a buffer made from it may outlive this scope's objects).
+        strata::core::SegmentPool* segpool = nullptr;
+        std::atomic<size_t> segpool_allow{0};   // bytes the filler may still make resident in this pass (set on the host thread)
+        std::unique_ptr<strata::core::SegmentPoolFiller> segpool_filler;   // (after the allowance: it is joined first)
+        ParkPoolsBudget pools_budget(nullptr, &ckpt_pool);   // (the arena joins below)
+        const size_t cache_mib_now = conversations.enabled() ? (size_t) o.conversation_cache_mib : 0;
+        size_t park_ckpt_bytes = 0;   // one ready checkpoint (what pool_topup allocates)
+        {
+            const ConvStateSizes z = conv_state_sizes(g, ss);
+            if (z.gdn > 0) {
+                const uint64_t layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0);
+                park_ckpt_bytes = (size_t) (z.gdn + (ss.ple_hist != nullptr ? z.ple : 0) + layers * ((uint64_t) z.tail + z.dead + z.block_pos));
+            }
+        }
+        const strata::core::ParkPoolPlan park_plan = strata::core::park_pool_plan(cache_mib_now, park_ckpt_bytes);
+        // the checkpoint pool: on by default in a single-stage serve with a cache (STRATA_CKPT_POOL=0 turns it off), as before when asked for
+        // or when STRATA_SLOT_CKPT_MOVE needs it; the count of ready checkpoints is the plan's unless STRATA_CKPT_POOL_READY says
+#if defined(STRATA_GPU_METAL)
+        constexpr bool ckpt_default_build = false;   // (the Mac engine keeps its own behaviour: not gated there, so not changed by the default)
+#else
+        constexpr bool ckpt_default_build = true;
+#endif
+        const bool ckpt_default_on = ckpt_default_build && ckpt_pool_env_state() == -1 && cache_mib_now > 0 && stages.empty() && park_ckpt_bytes > 0;
+        if (ckpt_default_on) ckpt_pool_ready_default().store(park_plan.ckpt_ready);
+        ckpt_pool.configure(ckpt_pool_env() || slot_ckpt_move_env() || ckpt_default_on, ckpt_pool_cap_env());
+        auto segpool_kick = [&] {
+            if (segpool == nullptr || !segpool_filler) return;
+            const size_t budget = o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0;
+            const size_t used = conversations.resident_bytes();
+            segpool_allow.store(budget > used ? budget - used : 0);
+            segpool_filler->kick();
+        };
+        {
+            const long long env_mib = park_segpool_env_mib();   // -1 unset
+            const size_t want_mib = env_mib >= 0 ? (size_t) env_mib : park_plan.segpool_mib;
+            if (want_mib > 0 && conversations.enabled()) {
+                const size_t budget = (size_t) o.conversation_cache_mib * 1024 * 1024;
+                const size_t bytes = std::min(want_mib * 1024 * 1024, budget / 4);   // never more than a quarter of the cache
+                segpool = new strata::core::SegmentPool(strata::core::segment_pool_os(), bytes);
+                if (segpool->active() && strata::core::segment_pool_install(segpool)) {
+                    pools_budget = ParkPoolsBudget(segpool, &ckpt_pool);
+                    const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+                    segpool_filler = std::make_unique<strata::core::SegmentPoolFiller>(*segpool,
+                        [&segpool_allow, floor](size_t step) -> size_t {
+                            const size_t a = std::min(step, segpool_allow.load());
+                            if (a == 0) return 0;
+                            const auto mem = strata::core::sample_host_memory();   // the floor and one more GiB of RAM must stay free
+                            if (!mem || mem->available < floor + ((uint64_t) 1 << 30) + a) return 0;
+                            segpool_allow.fetch_sub(std::min(a, segpool_allow.load()));
+                            return a;
+                        },
+                        [] { StageThreads::spread_current_thread(); });
+                    if (std::getenv("STRATA_PARK_TRACE"))
+                        std::fprintf(stderr, "strata parktrace: segpool %zu MiB reserved (%s %zu MiB, cache %lld MiB)\n",
+                                     segpool->capacity() >> 20, env_mib >= 0 ? "asked" : "default", want_mib, (long long) o.conversation_cache_mib);
+                } else {
+                    if (std::getenv("STRATA_PARK_TRACE")) std::fprintf(stderr, "strata parktrace: segpool not reserved (%zu MiB wanted)\n", want_mib);
+                    segpool = nullptr;   // (the object stays allocated, inert)
+                }
+            }
+        }
+        if (conversations.enabled() && (segpool != nullptr || ckpt_pool.on())) conversations.set_pool(&pools_budget);
+        if (std::getenv("STRATA_PARK_TRACE"))
+            std::fprintf(stderr, "strata parktrace: park pools: segment pool %zu MiB, checkpoint pool %s (ready %zu, cap %zu, %zu MiB each), cache %zu MiB, stages %zu\n",
+                         segpool != nullptr ? segpool->capacity() >> 20 : (size_t) 0, ckpt_pool.on() ? "on" : "off", ckpt_pool_ready_env(),
+                         ckpt_pool.cap(), park_ckpt_bytes >> 20, cache_mib_now, stages.size());
+        segpool_kick();
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
@@ -12321,7 +12447,20 @@ int main(int argc, char** argv) {
             if (pool_refill.valid() && pool_refill.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
             const size_t have = ckpt_pool.held();
             if (have >= ckpt_pool_ready_env()) return;
-            pool_refill = std::async(std::launch::async, [&ckpt_pool, want = ckpt_pool_ready_env() - have, z = pool_z,
+            size_t topup = ckpt_pool_ready_env() - have;
+            // the top-up stays inside the cache's budget and the RAM floor (plus 1 GiB): a checkpoint more than either leaves room for is not made
+            if (park_ckpt_bytes > 0) {
+                if (conversations.enabled()) {
+                    const size_t budget = (size_t) o.conversation_cache_mib * 1024 * 1024, used = conversations.resident_bytes();
+                    topup = std::min(topup, budget > used ? (budget - used) / park_ckpt_bytes : (size_t) 0);
+                }
+                const auto mem = strata::core::sample_host_memory();
+                const uint64_t keep = ((uint64_t) o.conversation_cache_min_free_mib << 20) + ((uint64_t) 1 << 30);
+                if (mem) topup = std::min<size_t>(topup, mem->available > keep ? (size_t) ((mem->available - keep) / park_ckpt_bytes) : 0);
+                else if (ckpt_pool_env_state() != 1) topup = 0;   // (telemetry unknown: only when asked for by hand)
+            }
+            if (topup == 0) return;
+            pool_refill = std::async(std::launch::async, [&ckpt_pool, want = topup, z = pool_z,
                                                           layers = (size_t) std::max<int64_t>(ss.qsa_alloc, 0),
                                                           ple = ss.ple_hist != nullptr] {
                 StageThreads::spread_current_thread();   // (a thread the host starts inherits its one CPU: aux_cpus.hpp)
@@ -12460,7 +12599,11 @@ int main(int argc, char** argv) {
                     return strata::core::conversation_memory_admit(
                         mem ? std::optional<uint64_t>(mem->available) : std::nullopt, additional, floor);
                 };
-                bool fits = admit() || (strata::core::release_free_heap() && admit());
+                // STRATA_PARK_SEGPOOL_MIB: the pool's idle bytes are the first RAM to go back (before the heap and before any
+                // parked conversation), so the pool never makes this check fail where it would pass without it
+                bool fits = admit();
+                if (!fits && pools_budget.idle_bytes() > 0) { pools_budget.shrink((size_t) -1); fits = admit(); }
+                fits = fits || (strata::core::release_free_heap() && admit());
                 while (!fits && conversations.size() > 0 && evicted < conversations.slots() &&
                        conversations.evict_oldest()) {
                     ++evicted;
@@ -12514,7 +12657,13 @@ int main(int argc, char** argv) {
                         return false;
                     image.stage_images.push_back(std::move(part));
                 }
-                const auto mem_after = strata::core::sample_host_memory();
+                auto mem_after = strata::core::sample_host_memory();
+                // (the park pools' idle memory is the first RAM to go back here too: a park the check refuses with the pools held would pass without them)
+                if (!strata::core::conversation_memory_admit(
+                        mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor) && pools_budget.idle_bytes() > 0) {
+                    pools_budget.shrink((size_t) -1);
+                    mem_after = strata::core::sample_host_memory();
+                }
                 if (!strata::core::conversation_memory_admit(
                         mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
                     std::fprintf(stderr, "strata serve: conversation cache: skip parking (RAM floor after capture: %lld MiB needed, %s)\n",
@@ -12527,6 +12676,13 @@ int main(int argc, char** argv) {
                              stored ? "parked" : "skipped", src.ids.size(), src.what.c_str(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
                              conversations.size(), conversations.bytes(), conversations.evictions(), snapshot_bytes, reused_bytes);
+                if (segpool != nullptr) {
+                    segpool_kick();   // what this park freed or the pool gave back is topped up again in the background
+                    if (std::getenv("STRATA_PARK_TRACE"))
+                        std::fprintf(stderr, "strata parktrace: segpool resident %zu MiB, live %zu MiB, idle %zu MiB, hits %llu, misses %llu; cache images %zu MiB\n",
+                                     segpool->resident_bytes() >> 20, segpool->live_requested() >> 20, segpool->idle_bytes() >> 20,
+                                     (unsigned long long) segpool->hits(), (unsigned long long) segpool->misses(), conversations.bytes() >> 20);
+                }
             } catch (const std::bad_alloc&) {
                 // The active state has not been touched. Continue with normal
                 // prompt processing rather than killing a serving process.
@@ -15874,6 +16030,7 @@ int main(int argc, char** argv) {
                             sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
                         }
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                        pools_budget.shrink((size_t) -1);   // (the park pools' idle memory goes back before the RAM checks of a session save)
                         if (o.session_save_reclaim) {
                             const auto freed = strata::core::session_save_reclaim(
                                 checks, conversations, sl, floor, strata::core::available_host_bytes);
@@ -15945,6 +16102,7 @@ int main(int argc, char** argv) {
                         strata::core::SessionReadLimits limits;
                         limits.progress = moving;
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
+                        pools_budget.shrink((size_t) -1);   // (the park pools' idle memory goes back before the RAM checks of a session load)
                         limits.admit = [floor, &o](uint64_t need, std::string& why) {
                             const auto mem = strata::core::sample_host_memory();
                             const std::optional<uint64_t> avail = mem ? std::optional<uint64_t>(mem->available) : std::nullopt;
