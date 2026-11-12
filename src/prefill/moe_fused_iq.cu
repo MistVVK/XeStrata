@@ -133,8 +133,9 @@ __host__ __device__ constexpr int grid_bytes(int t) {
 // cp.async (a ring of two slots, issued two slots ahead) instead of every decode thread reading it from global memory in 2- and 4-byte loads; the decode
 // then runs the same load_unit on the shared-memory address, so the bits are the same.  It is chosen per instance at compile time, only where it was measured
 // faster (RTX A4000, one layer: +10..+16% for these pairs); every other instance keeps its code and its shared memory unchanged.
-// A slot is the bytes of SPB stages (64 values of K each) of a row: a 256-value block for the gate/up i-quants, two stages of 32-value blocks for IQ4_NL.  The
-// GGUF blocks are only 2-byte aligned, so a slot is copied as the 16-byte chunks of the aligned window around it (SW_CHUNKS of them).
+// A slot is the bytes of SPB stages (64 values of K each) of a row: a 256-value block for the gate/up i-quants, two stages of 32-value blocks (four blocks) for IQ4_NL / Q5_0 / Q8_0 on either side,
+// and for the Q6_K gate/up half a super-block gathered from three windows (ql, qh, scales + d).  The GGUF blocks are only 2-byte aligned, so a slot is copied as the 16-byte chunks of the aligned
+// window around it (SW_CHUNKS of them).
 constexpr int kSwAst = 3;               // the staged instances' activation stages (the ring needs SPB >= AST - 1; 4 stages would not fit the ring beside it)
 constexpr size_t kSmemOptIn = 101376;   // 99 KB: the opt-in shared memory a block gets on sm_86 / sm_89 / sm_120 / sm_121
 __host__ __device__ constexpr bool sw_on(int t, bool gu) {
@@ -142,13 +143,19 @@ __host__ __device__ constexpr bool sw_on(int t, bool gu) {
     (void) t; (void) gu;
     return false;
 #else
-    return gu ? (t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS) : t == T_IQ4_NL;
+    return gu ? (t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS || t == T_Q8_0 || t == T_Q6_K) : (t == T_IQ4_NL || t == T_Q8_0 || t == T_Q5_0);
 #endif
 }
 __host__ __device__ constexpr bool sw_inst(int t, bool gu, int ww, int nt, bool f16) { return sw_on(t, gu) && ww == 2 && nt == THREADS && !f16; }
-__host__ __device__ constexpr int sw_spb(int t, bool gu) { return gu && t != T_IQ4_NL ? 4 : 2; }   // stages a slot: a 256-value block (gate/up), two 32-value blocks a stage (IQ4_NL down)
-__host__ __device__ constexpr int sw_slot_bytes(int t, bool gu) { return gu ? block_bytes(t) : sw_spb(t, gu) * 2 * block_bytes(t); }
-__host__ __device__ constexpr int sw_chunks(int t, bool gu) { return (sw_slot_bytes(t, gu) + 14 + 15) / 16; }   // the aligned window: at most slot + 14 bytes
+// the 32-value-block formats (two blocks a 64-value stage), gate/up (Q8_0) or down
+__host__ __device__ constexpr bool sw_b32(int t) { return t == T_IQ4_NL || t == T_Q5_0 || t == T_Q8_0; }
+// the gate/up formats whose block spans 256 values (the kernel's GU256: one block per four stages)
+__host__ __device__ constexpr bool sw_gu256(int t, bool gu) { return gu && t != T_Q2_0 && t != T_Q8_0 && !is_tq(t); }
+// stages a slot: a whole 256-value block (gate/up i-quants), else two (four 32-value blocks; the Q6_K gate/up: half a super-block)
+__host__ __device__ constexpr int sw_spb(int t, bool gu) { return sw_gu256(t, gu) && t != T_Q6_K ? 4 : 2; }
+__host__ __device__ constexpr int sw_slot_bytes(int t, bool gu) { return sw_gu256(t, gu) ? block_bytes(t) : sw_spb(t, gu) * 2 * block_bytes(t); }   // (Q6_K: unused, its slot is three windows)
+// 16-byte chunks of a row's slot: the aligned window is at most slot + 14 bytes; Q6_K: ql 64 B (5) + qh 32 B (3) + scales and d, at most 18 B (2)
+__host__ __device__ constexpr int sw_chunks(int t, bool gu) { return t == T_Q6_K ? 10 : (sw_slot_bytes(t, gu) + 14 + 15) / 16; }
 constexpr int WLDH = 144;               // F16: bytes per decoded weight row of a stage: 64 halves + 16 (ldmatrix rows apart)
 // shared memory of an instance.  `astages` is the device's depth (host_astages()); a staged instance takes kSwAst instead and adds its ring, sized for ITS side
 // (gu) only: a failed shared-memory set-up makes dev_info() drop every fused kernel
@@ -908,21 +915,56 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
                     const int rr = c / SW_NCH, k = c - SW_NCH * rr;       // weight row rr of the item (the numbering of ur above)
                     const uint8_t* rp = GU ? blob + ((rr & 8) ? geo.up_off : 0) + (size_t) (fb * (WR / 2) + 8 * (rr >> 4) + (rr & 7)) * geo.gu_row
                                            : blob + geo.down_off + (size_t) (rbase + rr) * geo.d_row;
-                    const uint8_t* a = rp + (size_t) j * SW_SB;
-                    const uint8_t* cs = (const uint8_t*) ((uintptr_t) a & ~(uintptr_t) 15) + 16 * k;
-                    if (cs < a + SW_SB) cp16(d + rr * SW_ROW + 16 * k, cs);
+                    if constexpr (WT == T_Q6_K) {   // slot j = half n of super-block j / 2: three windows, chunks 0-4 ql (64 B), 5-7 qh (32 B), 8-9 scales + d (the bytes up to the end of d)
+                        const uint8_t* bb = rp + (size_t) (j >> 1) * BS;
+                        const int n = j & 1;
+                        const uint8_t *a, *e;
+                        int dk;
+                        if (k < 5) { a = bb + 64 * n; e = a + 64; dk = k; }
+                        else if (k < 8) { a = bb + 128 + 32 * n; e = a + 32; dk = k - 5; }
+                        else { a = bb + 192 + 8 * n; e = bb + 210; dk = k - 8; }
+                        const uint8_t* cs = (const uint8_t*) ((uintptr_t) a & ~(uintptr_t) 15) + 16 * dk;
+                        if (cs < e) cp16(d + rr * SW_ROW + 16 * k, cs);
+                    } else {   // (the S1 form, unchanged)
+                        const uint8_t* a = rp + (size_t) j * SW_SB;
+                        const uint8_t* cs = (const uint8_t*) ((uintptr_t) a & ~(uintptr_t) 15) + 16 * k;
+                        if (cs < a + SW_SB) cp16(d + rr * SW_ROW + 16 * k, cs);
+                    }
                 }
             }
         };
         // (staging) the shared-memory address that stands for unit(s): the same bytes at the same offset inside the window
         auto sw_unit = [&](int s) -> const uint8_t* {
-            static_assert(!SWT || (!KLEAN && (GU256 || !GU)), "staging: the gate/up i-quants' 256-value blocks and the IQ4_NL down's 32-value ones only");
+            static_assert(!SWT || GU256 || sw_b32(WT), "staging: the gate/up i-quants' 256-value blocks and the 32-value-block formats (IQ4_NL, Q5_0, Q8_0) only");
             const int j = s / SW_SPB, si = s - SW_SPB * j;
             const uint8_t* p0 = sraw + (j & 1) * (WR * SW_ROW) + ur * SW_ROW + ((uintptr_t) (wrow + (size_t) j * SW_SB) & 15);
             if constexpr (GU256) return p0;
-            else return p0 + (2 * si + uj) * BS;   // IQ4_NL down: 32-value blocks, two a stage
+            else return p0 + (2 * si + uj) * BS;   // 32-value blocks (IQ4_NL / Q5_0 / Q8_0, gate/up or down): two a stage
         };
-        auto load_sw = [&](int s, uint32_t (&w)[RAW]) { if constexpr (SWT) load_unit<WT>(sw_unit(s), sub(s), w); };
+        // (staging, Q6_K gate/up) kq_lean_load<T_Q6_K>'s 14 words from the three gathered windows: the same bytes at the same offsets inside each window (ql: bb + 64 n + 32 (r & 1) + ..., qh:
+        // bb + 128 + 32 n + 16 uj + ..., scales / d: bb + 192 + 8 n + 2 r and bb + 208), bb = the slot's super-block
+        auto sw_q6 = [&](int s, uint32_t (&w)[RAW]) {
+            if constexpr (SWT && WT == T_Q6_K) {
+                const int j = s >> 1, n = j & 1, r = sub(s) & 3;
+                const uint8_t* slot = sraw + (j & 1) * (WR * SW_ROW) + ur * SW_ROW;
+                const uint8_t* bb = wrow + (size_t) (j >> 1) * BS;
+                const uint8_t* pa = slot + ((uintptr_t) (bb + 64 * n) & 15);
+                const uint8_t* pb = slot + 80 + ((uintptr_t) (bb + 128 + 32 * n) & 15);
+                const uint8_t* pq = slot + 128 + ((uintptr_t) (bb + 192 + 8 * n) & 15);
+#pragma unroll
+                for (int k = 0; k < 8; ++k) w[k] = ld32(pa + 32 * (r & 1) + 4 * k);
+#pragma unroll
+                for (int k = 0; k < 4; ++k) w[8 + k] = ld32(pb + 16 * uj + 4 * k);
+                w[12] = ld16(pq + 16 - 8 * n) | (ld16(pq + 2 * r) << 16);
+                w[13] = (uint32_t) r;
+            }
+        };
+        auto load_sw = [&](int s, uint32_t (&w)[RAW]) {
+            if constexpr (SWT) {
+                if constexpr (WT == T_Q6_K) sw_q6(s, w);
+                else load_unit<WT>(sw_unit(s), sub(s), w);
+            }
+        };
         // the weight bytes into L2 ahead of the register loads (one stage ahead only - less than a DRAM round trip):
         // gate/up PF super-blocks ahead (the row's two threads take a block's first and last line), down the whole row
         // slice at once (180 or 360 bytes a row)
@@ -2554,7 +2596,8 @@ void check_staged_blobs(const Batch& b, const NativeGeom& g) {
 }
 #endif
 // `staged`: the launch's gate/up kernel is a weight-staging instance (sw_on); the rule then takes 128 rows from every size on the sm_86 / sm_120 cards under 80 SMs.
-int pick_ww(int64_t n, int n_expert, bool staged) {
+// `wide`: the launch's gate/up is Q6_K or Q8_0: on sm_86 cards with 40+ SMs the rule takes 128 rows above 112 rows an expert (fused_tile_rule.hpp).
+int pick_ww(int64_t n, int n_expert, bool staged, bool wide) {
     static const int forced = [] {
         const char* v = std::getenv("STRATA_PF_FUSED_TILE");
         const int t = v ? std::atoi(v) : 0;
@@ -2564,13 +2607,13 @@ int pick_ww(int64_t n, int n_expert, bool staged) {
     // the rule itself (the card classes, the thresholds and the measurements behind them) is include/strata/prefill/fused_tile_rule.hpp, a pure function the unit test
     // tests/prefill/fused_tile_rule_test.cpp pins for every measured card class.  STRATA_PF_TILE_DEBUG=1 prints the choice of every launch of a class that has its own rule.
     const DevInfo& d = dev_info();
-    const strata::prefill::fused_tile::Pick pk = strata::prefill::fused_tile::pick({d.s120, d.s121, d.sms, d.s86}, n, n_expert, staged);
+    const strata::prefill::fused_tile::Pick pk = strata::prefill::fused_tile::pick({d.s120, d.s121, d.sms, d.s86}, n, n_expert, staged, wide);
     using strata::prefill::fused_tile::Why;
     if (pk.why != Why::kBand) {
         static const bool dbg = [] { const char* v = std::getenv("STRATA_PF_TILE_DEBUG"); return v != nullptr && v[0] == '1'; }();
         if (dbg) {
             const double avg = (double) n / std::max(n_expert, 1);
-            const char* cls = pk.why == Why::kS121 ? "s121" : pk.why == Why::kS120Small ? "s120 small" : pk.why == Why::kStaged ? "staged" : "s120";
+            const char* cls = pk.why == Why::kS121 ? "s121" : pk.why == Why::kS120Small ? "s120 small" : pk.why == Why::kStaged ? "staged" : pk.why == Why::kS86Wide ? "s86 wide" : "s120";
             std::fprintf(stderr, "strata: fused tile: rows %lld experts %d avg %.1f %s yes -> ww %d\n", (long long) n, n_expert, avg, cls, pk.ww);
         }
     }
@@ -2889,11 +2932,11 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
     }
     // the launch's gate/up kernel is a staging instance: the tile rule then takes 128 rows (the gate/up is about two thirds of the layer; a down that is not staged, Q2_0 or Q8_0 or Q5_0,
     // still ran faster in the 128-row tile with it: IQ3_S / Q2_0 on the RTX A4000, RESULTS-P4-SM.md S1).  Either kernel staged: the blob check.
-    const bool staged = sw_on(g.gu_type, true);
+    const bool staged = sw_on(g.gu_type, true), wide = g.gu_type == T_Q6_K || g.gu_type == T_Q8_0;   // wide: the Q6_K / Q8_0 gate/up class of the sm_86 tile line (40+ SMs)
 #if !defined(__HIPCC__)
     if (staged || sw_on(g.d_type, false)) check_staged_blobs(b, g);
 #endif
-    const int ww = pick_ww(n, n_expert, staged);
+    const int ww = pick_ww(n, n_expert, staged, wide);
     // the most 64-row tiles the batch can have (every row in it, plus a partial tile per expert) - the items of the
     // ones inside a larger item end at once
     const int64_t tiles = (n + kTileRows - 1) / kTileRows + (b.e1 - b.e0);
