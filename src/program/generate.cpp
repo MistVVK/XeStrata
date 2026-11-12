@@ -1003,6 +1003,8 @@ struct Options {
     /// A layer split: each card keeps the dense weights of its own layers only (the rest of the model's are another
     /// card's), and the VRAM this frees goes to its expert cache.  --no-trim-stage-weights: every card keeps them all.
     bool trim_stage_weights = true;
+    /// 1 = --trim-stage-weights was given, 0 = --no-trim-stage-weights, -1 = neither (the default trim is on).
+    int trim_stage_flag = -1;
     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
     /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
@@ -3733,7 +3735,7 @@ int main(int argc, char** argv) {
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
         else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
-        else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
+        else if (a == "--trim-stage-weights") { o.trim_stage_weights = true; o.trim_stage_flag = 1; }
         else if (a == "--batch-groups") {
             const char* bgv = next("--batch-groups");
             o.batch_groups_set = true;
@@ -3794,7 +3796,7 @@ int main(int argc, char** argv) {
         else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
         else if (a == "--prefill-head-alias") o.prefill_head_alias = true;
         else if (a == "--pipeline-windows") o.pipeline_windows = std::max(0, std::min(2, std::atoi(next("--pipeline-windows"))));
-        else if (a == "--no-trim-stage-weights") o.trim_stage_weights = false;
+        else if (a == "--no-trim-stage-weights") { o.trim_stage_weights = false; o.trim_stage_flag = 0; }
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
         else if (a == "--mtp-max-t") o.mtp_max_t = std::max(0, std::atoi(next("--mtp-max-t")));
         else if (a == "--lookup-max-t") o.lookup_max_t = std::max(0, std::atoi(next("--lookup-max-t")));
@@ -5215,17 +5217,23 @@ int main(int argc, char** argv) {
     // and the default waits for its author's re-run of the release branch on his cards.
     const std::set<std::string> skip_base = skip;
     // --trim-stage-weights (PR #559) is the same switch as STRATA_STAGE_TRIM=1 (PR #639)
-    bool trim_asked = o.trim_stage_weights || [] {
-        const char* v = std::getenv("STRATA_STAGE_TRIM");
-        return v != nullptr && v[0] != 0 && std::string(v) != "0";
-    }();
+    // The trim is on by default with a split (PR #4522).  STRATA_STAGE_TRIM=0 and --no-trim-stage-weights turn it off (a given
+    // --trim-stage-weights beats STRATA_STAGE_TRIM=0, as before); the spill walk below keeps its own rule, which is
+    // that the user ASKED for the trim (flag or STRATA_STAGE_TRIM=1), not that the trim is on.
+    const char* const stage_trim_env = std::getenv("STRATA_STAGE_TRIM");
+    const bool trim_env_on = stage_trim_env != nullptr && stage_trim_env[0] != 0 && std::string(stage_trim_env) != "0";
+    const bool trim_env_off = stage_trim_env != nullptr && std::string(stage_trim_env) == "0";
+    const bool trim_off = o.trim_stage_flag == 0 || (trim_env_off && o.trim_stage_flag != 1);
+    const bool trim_user_asked = !trim_off && (o.trim_stage_flag == 1 || trim_env_on);
+    o.trim_stage_weights = !trim_off;
+    bool trim_asked = !trim_off;
     // ---- THE LAYER SPLIT'S SPILL WALK, STEP 1 (include/strata/program/split_walk.hpp), EARLY: THE TRIM FOR EVERY CARD, CUDA0 TOO.  Under `--layer-split auto` CUDA0's weights load before the
     // search has chosen the split, so it could not be trimmed.  When the cards in the split are short (two 8 GB cards: every card would carry a 3.5 GiB copy of the dense set beside its
     // session, head, drafter, a working cache and the prompt buffers, and 6 of 6 starts failed in 0.2.10), the split is chosen here, before anything is loaded, from what each card has
     // free once its fixed costs are paid, so every layer gets the same cache bytes on every card; it then runs as an explicit split with every card trimmed.  The dense set's size is
     // estimated from the pack (the native projections at the ratio the IQ3_S pack has); the check after CUDA0's load decides again from the exact figure.  Never reached by cards with
     // room; STRATA_STAGE_TRIM=0, STRATA_SPLIT_EARLY_OFF=1 or STRATA_SPILL_OFF=1 keeps the old path.
-    if (multi_gpu && split_auto && !trim_asked && !split_devs.empty() && std::getenv("STRATA_SPILL_OFF") == nullptr &&
+    if (multi_gpu && split_auto && !trim_user_asked && !split_devs.empty() && std::getenv("STRATA_SPILL_OFF") == nullptr &&
         !(std::getenv("STRATA_STAGE_TRIM") != nullptr && std::string(std::getenv("STRATA_STAGE_TRIM")) == "0") &&
         std::getenv("STRATA_SPLIT_EARLY_OFF") == nullptr && spill_discrete_gpu()) {
         namespace sw = strata::program::split_walk;
@@ -5445,7 +5453,7 @@ int main(int argc, char** argv) {
     // beside its session, its head, its drafter and a working cache loads only the dense weights of its own layers instead (--trim-stage-weights, bit-exact in itself:
     // the cache just gets the room).  A card with room never reaches this; STRATA_STAGE_TRIM=0 or STRATA_SPILL_OFF=1 keeps the old copy.  CUDA0 stays whole under
     // `--layer-split auto` (its weights load before the split is known); it runs the card's share of layers the search gives it.
-    if (multi_gpu && !trim_asked && !split_devs.empty() && std::getenv("STRATA_SPILL_OFF") == nullptr &&
+    if (multi_gpu && !trim_user_asked && !split_devs.empty() && std::getenv("STRATA_SPILL_OFF") == nullptr &&
         !(std::getenv("STRATA_STAGE_TRIM") != nullptr && std::string(std::getenv("STRATA_STAGE_TRIM")) == "0") && spill_discrete_gpu()) {
         strata::program::split_walk::Model wm;
         wm.dense_mib = (int64_t) ((pool_bytes + (o.native_dense_gguf.empty() ? 0 : native_dense.weight_bytes())) >> 20);
