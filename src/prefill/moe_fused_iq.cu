@@ -2507,32 +2507,46 @@ void launch(bool ws, unsigned grid, const WideBatch& b, const NativeGeom& g, con
 // 17.5 (256 rows was slower still).  STRATA_PF_FUSED_TILE=64|128 forces one.
 #if !defined(__HIPCC__)
 // (staging) what the weight copies assume of a launch: the expert blobs are device memory (the prompt path's expert cache slots and its stage ring), not a host-mapped
-// pointer, and every row and offset is 2-byte aligned (the decode reads 16-bit words at the same offsets inside the shared-memory window).  A call site that breaks it
-// stops here with a message instead of reading something else.  Checked on the first launches of a process only (a pointer query is a driver call).
-void check_staged_blobs(const Batch& b, const NativeGeom& g) {
-    static std::mutex mu;
-    static int left = 256;
+// pointer, and every row and offset is 2-byte aligned (the decode reads 16-bit words at the same offsets inside the shared-memory window).  A launch that breaks it
+// does not end the process: it takes the unstaged 64-row kernel of the same formats (same output bits), whatever STRATA_PF_FUSED_TILE says, and the first such launch of a
+// process logs one line.  Checked on the first 256 launches of a process only (a pointer query is a driver call); once one launch failed, every later launch of the process
+// takes the unstaged kernel without asking (fused_tile::StagedGuard: the decision is a pure function, tests/prefill/fused_tile_rule_test.cpp).
+std::mutex g_staged_mu;
+strata::prefill::fused_tile::StagedGuard g_staged_guard;
+int g_staged_fallbacks = 0;   // launches that took the unstaged kernel for this reason (the GPU test reads it)
+
+bool staged_blobs_ok(const Batch& b, const NativeGeom& g) {
+    namespace ft = strata::prefill::fused_tile;
     {
-        std::lock_guard<std::mutex> lk(mu);
-        if (left <= 0) return;
-        --left;
+        std::lock_guard<std::mutex> lk(g_staged_mu);
+        const ft::StagedGuard::Step st = g_staged_guard.next();
+        if (st == ft::StagedGuard::Step::kTrust) return true;
+        if (st == ft::StagedGuard::Step::kUnstaged) { ++g_staged_fallbacks; return false; }
     }
-    if (((g.gu_row | g.d_row | g.up_off | g.down_off) & 1) != 0) {
-        std::fprintf(stderr, "prefill fused experts (native): the staged kernels need 2-byte aligned rows (gu_row %zu d_row %zu up_off %zu down_off %zu)\n", g.gu_row, g.d_row,
-                     g.up_off, g.down_off);
-        std::exit(1);
-    }
-    for (int e = b.e0; e < b.e1; ++e) {
-        const uint8_t* p = b.blob[e - b.e0];
-        cudaPointerAttributes pa{};
-        const cudaError_t err = cudaPointerGetAttributes(&pa, p);
-        if (err != cudaSuccess) { cudaGetLastError(); continue; }   // (not a pointer the driver knows: the launch's own error says so)
-        if ((pa.type != cudaMemoryTypeDevice && pa.type != cudaMemoryTypeManaged) || (reinterpret_cast<uintptr_t>(p) & 1) != 0) {
-            std::fprintf(stderr, "prefill fused experts (native): the staged kernels need expert blobs in device memory, 2-byte aligned (expert %d: %p, memory type %d)\n", e, (const void*) p,
-                         (int) pa.type);
-            std::exit(1);
+    char why[256];
+    why[0] = 0;
+    bool ok = ft::staged_geometry_ok(g.gu_row, g.d_row, g.up_off, g.down_off);
+    if (!ok) {
+        std::snprintf(why, sizeof why, "rows and offsets must be 2-byte aligned (gu_row %zu d_row %zu up_off %zu down_off %zu)", g.gu_row, g.d_row, g.up_off, g.down_off);
+    } else {
+        for (int e = b.e0; e < b.e1; ++e) {
+            const uint8_t* p = b.blob[e - b.e0];
+            cudaPointerAttributes pa{};
+            ft::BlobMem m = ft::BlobMem::kUnknown;
+            if (cudaPointerGetAttributes(&pa, p) != cudaSuccess) cudaGetLastError();   // (not a pointer the driver knows: the launch's own error says so)
+            else m = pa.type == cudaMemoryTypeDevice ? ft::BlobMem::kDevice : pa.type == cudaMemoryTypeManaged ? ft::BlobMem::kManaged : pa.type == cudaMemoryTypeHost ? ft::BlobMem::kHost : ft::BlobMem::kUnregistered;
+            if (!ft::staged_blob_ok(m, reinterpret_cast<uintptr_t>(p))) {
+                std::snprintf(why, sizeof why, "expert blobs must be in device memory at 2-byte aligned addresses (expert %d: %p, memory type %d)", e, (const void*) p, (int) pa.type);
+                ok = false;
+                break;
+            }
         }
     }
+    std::lock_guard<std::mutex> lk(g_staged_mu);
+    if (g_staged_guard.report(ok))
+        std::fprintf(stderr, "prefill fused experts (native): %s; this launch and every later one in this process take the unstaged kernel (same results, slower)\n", why);
+    if (!ok) ++g_staged_fallbacks;
+    return ok;
 }
 #endif
 // `staged`: the launch's gate/up kernel is a weight-staging instance (sw_on); the rule then takes 128 rows from every size on the sm_86 / sm_120 cards under 80 SMs.
@@ -2560,7 +2574,30 @@ int pick_ww(int64_t n, int n_expert, bool staged, bool wide) {
     return pk.ww;
 }
 
+// The work item of one launch of the native kernels: pick_ww's, unless the launch has a weight-staging kernel (`staged`: its gate/up kernel is one; the down's is looked at here) and
+// the staging check fails (staged_blobs_ok), in which case the unstaged 64-row instances run (fused_tile::kUnstagedWw), also when STRATA_PF_FUSED_TILE=128 forces the 128-row tile.
+// Every call site that launches `launch<...>` with a ww from pick_ww on a batch of blobs takes its ww from here.
+int launch_ww(const Batch& b, const NativeGeom& g, int64_t n, int n_expert, bool staged, bool wide) {
+#if !defined(__HIPCC__)
+    if ((staged || sw_on(g.d_type, false)) && !staged_blobs_ok(b, g)) return strata::prefill::fused_tile::kUnstagedWw;
+#else
+    (void) b;
+    (void) g;
+#endif
+    return pick_ww(n, n_expert, staged, wide);
+}
+
 }  // namespace
+
+// Launches that took the unstaged kernel because the staging check failed (see staged_blobs_ok); 0 in a HIP build, which has no staging kernels.
+int staged_blob_fallbacks() {
+#if !defined(__HIPCC__)
+    std::lock_guard<std::mutex> lk(g_staged_mu);
+    return g_staged_fallbacks;
+#else
+    return 0;
+#endif
+}
 
 bool gfx12_iq2s_default() {
     static const bool on = [] {
@@ -2811,10 +2848,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
     // the launch's gate/up kernel is a staging instance: the tile rule then takes 128 rows (the gate/up is about two thirds of the layer; a down that is not staged, Q2_0 or Q8_0 or Q5_0,
     // still ran faster in the 128-row tile with it: IQ3_S / Q2_0 on the RTX A4000, RESULTS-P4-SM.md S1).  Either kernel staged: the blob check.
     const bool staged = sw_on(g.gu_type, true), wide = g.gu_type == T_Q6_K || g.gu_type == T_Q8_0;   // wide: the Q6_K / Q8_0 gate/up class of the sm_86 tile line (40+ SMs)
-#if !defined(__HIPCC__)
-    if (staged || sw_on(g.d_type, false)) check_staged_blobs(b, g);
-#endif
-    const int ww = pick_ww(n, n_expert, staged, wide);
+    const int ww = launch_ww(b, g, n, n_expert, staged, wide);   // (the staging check inside: a launch that fails it takes the unstaged 64-row kernel)
     // the most 64-row tiles the batch can have (every row in it, plus a partial tile per expert) - the items of the
     // ones inside a larger item end at once
     const int64_t tiles = (n + kTileRows - 1) / kTileRows + (b.e1 - b.e0);
