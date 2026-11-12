@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// core::vram_room - the one rule every VRAM margin is sized by (D5): a 32nd of the memory the device reports,
+// core::vram_room - the one rule every VRAM margin is sized by: a 32nd of the memory the device reports,
 // held between the caller's measured bounds, of which a stage keeps a part.  Synthetic memories; no model, no GPU.
 #include "strata/core/device.hpp"
 

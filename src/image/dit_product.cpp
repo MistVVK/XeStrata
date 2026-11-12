@@ -157,8 +157,8 @@ DitOut DitProducts::run(const DitProduct& p) {
         kernels::i8_scale(y, T, rows, ldy, p.sx, sw, oft ? nullptr : p.bias, col, s);
     } else {
         const uint8_t* base = p.d + (uint64_t) p.row0 * w.row_bytes;
-        if (w.type == kDitF16) gemm.f16(p.x16, reinterpret_cast<const uint16_t*>(base), y, T, rows, w.k, p.ldy);
-        else gemm.native(p.x16, w.type, base, y, T, rows, w.k, p.ldy);
+        if (w.type == kDitF16) gemm.f16(p.x16, reinterpret_cast<const uint16_t*>(base), y, T, rows, w.k, ldy);
+        else gemm.native(p.x16, w.type, base, y, T, rows, w.k, ldy);
         if (defer) {
             out.rs = p.rs;
             out.b = p.bias;

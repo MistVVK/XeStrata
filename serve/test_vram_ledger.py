@@ -201,6 +201,22 @@ class LedgerTest(unittest.TestCase):
         self.assertEqual(self.ledger.room(10000), 9900)
         self.assertIsNone(self.ledger.find("text", p.pid))
 
+    def test_part_of_the_base_given_back_settles(self):
+        # a text engine in the base ends: what part of the base it held is not known, and a report read right after
+        # the release still shows the memory - it must not become the base, whose too small a value would then bound
+        # every later room until the next settling
+        p = sleeper()
+        self.ledger.hold("text", 6000, p.pid, in_base=True)
+        self.assertEqual(self.ledger.room(4000), 3900)          # the base read with the holder in it: 4000
+        p.kill()
+        p.wait()
+        self.assertEqual(self.ledger.entries(), [])             # gone: no base known any more
+        self.assertEqual(self.ledger.room(4000), 3900)          # a report that has not caught up: still no base
+        self.assertEqual(self.ledger.room(10000), 9900)         # bounded by itself, not by that stale reading
+        time.sleep(0.6)
+        self.assertEqual(self.ledger.room(10000), 9900)         # the base read again once the settling time passed
+        self.assertIsNotNone(self.ledger.reserve(9000, "image", 10000, pid=self.other()))
+
 
 if __name__ == "__main__":
     unittest.main()

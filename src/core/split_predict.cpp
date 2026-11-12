@@ -4,6 +4,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/platform/env.hpp"
+#include "strata/platform/memory.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -27,7 +28,9 @@ std::vector<int64_t> choose_split_by_room(int64_t layers, uint64_t layer_bytes, 
         if (!slow) { fast_room += room[(size_t) d]; continue; }
         // A fifth of the room for block weights, K/V and buffers: RTX 4070 used 8.4 of 9.6 GiB.
         const int64_t whole = (int64_t) (room[(size_t) d] * 0.8 / (double) layer_bytes) - (d == n - 1 && mtp ? 1 : 0);
-        count[(size_t) d] = std::clamp<int64_t>(whole, 1, left - 1);
+        // a slow device is given a layer only while one is left for it: with left <= 1 the clamp's bounds would
+        // invert, which is undefined.  Nothing is given here, and the layer that is left goes to the devices below.
+        count[(size_t) d] = left > 1 ? std::clamp<int64_t>(whole, 1, left - 1) : 0;
         left -= count[(size_t) d];
     }
     if (left < 1 || fast_room <= 0) return {};
@@ -149,20 +152,33 @@ double split_cpu_bandwidth() {
     if (const char* v = strata::env_get("SPLIT_CPU_GBPS")) return std::strtod(v, nullptr) * 1e6;
     const int nt = std::max(1, (int) std::thread::hardware_concurrency());
     const size_t per = (size_t) 32 << 20;
-    std::vector<std::vector<uint64_t>> bufs((size_t) nt, std::vector<uint64_t>(per / 8, 1));
+    // Every reader holds its own buffer, so how many read at once is capped: 1 GiB of buffers, or an eighth of what
+    // the host has free, whichever is less (a 128-thread machine used to reserve 4 GiB here while the model held the
+    // device).  The readers that do not fit go in the next group inside the same timed span, so a buffer keeps its
+    // 32 MiB - far above the caches a streaming read could otherwise be served from - and the reading is still one
+    // reader per hardware thread.  The i7-14700 (28 threads, 896 MiB) runs as one group, as it did.
+    uint64_t free_b = 0, cached_b = 0;
+    size_t budget = (size_t) 1024 << 20;
+    if (strata::platform::free_and_cached(free_b, cached_b)) budget = std::min(budget, (free_b + cached_b) / 8);
+    const int group = std::max(1, std::min(nt, (int) (budget / per)));
+    std::vector<std::vector<uint64_t>> bufs((size_t) group);
+    for (auto& b : bufs) b.assign(per / 8, 1);   // touched here, so the timed part reads only pages that are there
     double best = 0;
     for (int rep = 0; rep < 3; ++rep) {
         std::atomic<uint64_t> sink{0};
-        std::vector<std::thread> th;
-        th.reserve((size_t) nt);
         const auto t0 = std::chrono::steady_clock::now();
-        for (int t = 0; t < nt; ++t)
-            th.emplace_back([&, t] {
-                uint64_t acc = 0;
-                for (const uint64_t v : bufs[(size_t) t]) acc += v;
-                sink += acc;
-            });
-        for (auto& t : th) t.join();
+        for (int g0 = 0; g0 < nt; g0 += group) {
+            const int n = std::min(group, nt - g0);
+            std::vector<std::thread> th;
+            th.reserve((size_t) n);
+            for (int t = 0; t < n; ++t)
+                th.emplace_back([&, t] {
+                    uint64_t acc = 0;
+                    for (const uint64_t v : bufs[(size_t) t]) acc += v;
+                    sink += acc;
+                });
+            for (auto& t : th) t.join();
+        }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         best = std::max(best, (double) nt * (double) per / std::max(ms, 1e-3));
     }

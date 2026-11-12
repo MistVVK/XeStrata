@@ -415,8 +415,10 @@ def parse_number(v, name: str, lo: float, hi: float, default=None, whole: bool =
             raise bad from None
     if whole and isinstance(v, float) and math.isfinite(v) and v.is_integer():
         v = int(v)
-    if isinstance(v, bool) or not isinstance(v, int if whole else (int, float)) or not math.isfinite(v) \
-            or not lo <= v <= hi:
+    # an int wider than a float is out of range, not a crash: math.isfinite() of one raises OverflowError, which no
+    # entry's handler catches (a 500 for the user).  Only a float is looked at for infinity and NaN.
+    if isinstance(v, bool) or not isinstance(v, int if whole else (int, float)) \
+            or (isinstance(v, float) and not math.isfinite(v)) or not lo <= v <= hi:
         raise bad
     return v if whole else float(v)
 

@@ -1,18 +1,20 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/cpu/vision_cpu.cpp - see include/strata/kernels/cpu/vision_cpu.hpp.  Compiled for the baseline x86-64:
-// the work goes out on the pool from here, the row loops are vision_cpu_avx2.cpp's or vision_cpu_avx512.cpp's and the
-// products bf16_gemm's.
+// the work goes out on the pool from here, the row loops are vision_cpu_avx2.cpp's, vision_cpu_avx512.cpp's or this
+// file's own scalar copies, and the products bf16_gemm's.
 #include "strata/kernels/cpu/vision_cpu.hpp"
 
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <algorithm>
 #include <cmath>
 
 namespace strata::kernels::cpu {
 
-// each instruction set's copy of the row loops (vision_cpu_avx2.cpp, vision_cpu_avx512.cpp)
+// each instruction set's copy of the row loops (vision_cpu_avx2.cpp, vision_cpu_avx512.cpp, and the scalar copies
+// below, made in this file)
 #define STRATA_VISION_ROWS                                                                                            \
     void layer_norm_row(const float* x, int64_t C, const float* w, const float* b, float eps, float* y);              \
     void gelu_tanh_span(float* x, int64_t n);                                                                         \
@@ -26,7 +28,56 @@ STRATA_VISION_ROWS
 namespace vision_detail::avx512 {
 STRATA_VISION_ROWS
 }
+namespace vision_detail::scalar {
+STRATA_VISION_ROWS
+}
 #undef STRATA_VISION_ROWS
+
+// The scalar copies of the row loops, written in this file because it is the one compiled for the baseline x86-64.
+// They are vision_cpu_avx2.cpp's own loops for the elements its vectors leave over, so a CPU without AVX2 - and
+// XESTRATA_BF16_GEMM_ISA=scalar, which stands for one - reads a picture the same way; only the order a whole row's
+// sums round in differs.
+namespace vision_detail::scalar {
+
+namespace {
+inline float gelu_tanh1(float v) {
+    return 0.5f * v * (1.f + std::tanh(0.7978845608028654f * (v + 0.044715f * v * v * v)));
+}
+}  // namespace
+
+void layer_norm_row(const float* x, int64_t C, const float* w, const float* b, float eps, float* y) {
+    float s = 0;
+    for (int64_t c = 0; c < C; ++c) s += x[c];
+    const float mean = s / (float) C;
+    float v = 0;
+    for (int64_t c = 0; c < C; ++c) v += (x[c] - mean) * (x[c] - mean);
+    const float inv = 1.f / std::sqrt(v / (float) C + eps);
+    for (int64_t c = 0; c < C; ++c) y[c] = (x[c] - mean) * inv * w[c] + b[c];
+}
+
+void gelu_tanh_span(float* x, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) x[i] = gelu_tanh1(x[i]);
+}
+
+void add_span(float* x, const float* v, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) x[i] += v[i];
+}
+
+// x[i] = e^(x[i] - max), returns the sum
+float softmax_row(float* x, int64_t n) {
+    float m = -INFINITY;
+    for (int64_t i = 0; i < n; ++i) m = std::fmax(m, x[i]);
+    float s = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        x[i] = std::exp(x[i] - m);
+        s += x[i];
+    }
+    return s;
+}
+
+#include "vision_cpu_rows.inl"
+
+}  // namespace vision_detail::scalar
 
 namespace {
 
@@ -39,15 +90,20 @@ struct Rows {
                           float*, float*, float*);
 };
 
-// The row loops sixteen floats wide where the BF16 product takes its AVX-512 kernel (so XESTRATA_BF16_GEMM_ISA caps
-// both), eight otherwise
+// The row loops as wide as the BF16 product's kernel: sixteen floats where it takes its AVX-512 one (so
+// XESTRATA_BF16_GEMM_ISA caps both), eight where this CPU has AVX2, and the scalar copies above where it has neither
+// or the product was capped to scalar - the rule resize_rows.cpp follows for the host resize's rows.
 const Rows& rows() {
     static const Rows r = [] {
         namespace a2 = vision_detail::avx2;
         namespace a5 = vision_detail::avx512;
-        if (bf16_gemm_isa() == Bf16GemmIsa::avx512)
+        namespace sc = vision_detail::scalar;
+        const Bf16GemmIsa isa = bf16_gemm_isa();
+        if (isa == Bf16GemmIsa::avx512)
             return Rows{a5::layer_norm_row, a5::gelu_tanh_span, a5::add_span, a5::softmax_row, a5::qkv_rope_rows};
-        return Rows{a2::layer_norm_row, a2::gelu_tanh_span, a2::add_span, a2::softmax_row, a2::qkv_rope_rows};
+        if (isa == Bf16GemmIsa::avx2 && cpu_avx2_ok())
+            return Rows{a2::layer_norm_row, a2::gelu_tanh_span, a2::add_span, a2::softmax_row, a2::qkv_rope_rows};
+        return Rows{sc::layer_norm_row, sc::gelu_tanh_span, sc::add_span, sc::softmax_row, sc::qkv_rope_rows};
     }();
     return r;
 }

@@ -29,7 +29,8 @@ read again at the next report, with it.  What such an engine gives back later (t
 for an image, its helper card handed over) is then room, what it takes back charged: only the change is counted, not
 what the base already shows.  When an entry goes, what the base held of it is free again: added back where the entry
 was all its process holds (the image engine's), else (the text engine ended or unloaded: more than its cache) not
-known, and the base is read again at the next report.  The first term takes in what is allocated outside the ledger,
+known, and the base read again only once the report has caught up with the release (`settle_s` after it): until then
+the room counts no part of what went as free.  The first term takes in what is allocated outside the ledger,
 the second what is in the ledger but not yet in the report.  An entry whose owner is gone (no such pid, or one started
 at another time: a reused pid) is removed whenever the ledger is read.
 
@@ -147,12 +148,12 @@ class Ledger:
         start = process_start(int(e.get("pid", -1)))
         return start is not None and abs(start - float(e.get("start", -1.0))) < 1e-3
 
-    @staticmethod
-    def _drop(state: dict, gone: list, now: float) -> None:
+    def _drop(self, state: dict, gone: list, now: float) -> None:
         """`gone` left the entries: the time noted for the base.  What the base held of one is free again: added to
         the base where the entry was all its process holds (`whole`: the image engine's), else an amount the ledger
-        does not know (the text engine's cache is part of the engine) and the base is read again at the next
-        report."""
+        does not know (the text engine's cache is part of the engine): the base goes, and is read again only once the
+        report has caught up with the release (`base_ready`), since a report read right after it still shows the
+        memory as held."""
         if gone:
             state["last_removed"] = now
         for e in gone:
@@ -161,6 +162,7 @@ class Ledger:
                     state["base_mib"] = int(state["base_mib"]) + int(e["base"])
                 else:
                     state["base_mib"] = None
+                    state["base_ready"] = now + self.settle_s
 
     def _purge(self, state: dict, now: float) -> None:
         kept = [e for e in state["entries"] if self._alive(e)]
@@ -169,7 +171,10 @@ class Ledger:
 
     def _room(self, state: dict, device_free_mib: int | None, now: float) -> int | None:
         entries = state["entries"]
-        if device_free_mib is not None and (state.get("base_mib") is None or (
+        # a base read from a report that has not caught up with a release would keep its too small a value until the
+        # next settling: until `base_ready` no base is read at all, and the report's term alone bounds the room
+        ready = now >= float(state.get("base_ready", 0.0))
+        if device_free_mib is not None and ready and (state.get("base_mib") is None or (
                 now - float(state.get("last_removed", 0.0)) >= self.settle_s
                 and all(e.get("exact") and e["state"] == ALLOCATED and now - float(e.get("time", 0.0)) >= self.settle_s
                         for e in entries))):
@@ -243,7 +248,7 @@ class Ledger:
                                      "exact": bool(exact), "base": int(mib) if in_base else 0,
                                      "whole": bool(whole)})
             if in_base:
-                state["base_mib"] = None
+                state["base_mib"], state["base_ready"] = None, 0.0   # nothing was just released: read it again at once
             return eid
 
     def find(self, purpose: str, pid: int) -> str | None:

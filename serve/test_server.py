@@ -6410,6 +6410,16 @@ class ImageRequestWords(unittest.TestCase):
         with self.assertRaisesRegex(images_api.ImageRequestError, r"^x: a whole number 0 or more$"):
             n(-1, "x", 0, math.inf, whole=True)
 
+    def test_a_number_wider_than_a_float_is_400(self):
+        # an integer too wide for a float, as JSON's number or a form's text of it (steps, seed, n, output_compression):
+        # the bound answers, not OverflowError (math.isfinite() of such an int raises, and no entry catches it: a 500)
+        from serve import images as images_api
+        for wide in (10 ** 400, str(10 ** 400)):
+            with self.assertRaisesRegex(images_api.ImageRequestError, r"^x: a whole number from 0 to 9$"):
+                images_api.parse_number(wide, "x", 0, 9, whole=True)
+            with self.assertRaisesRegex(images_api.ImageRequestError, r"^x: a number from 0 to 9$"):
+                images_api.parse_number(wide, "x", 0, 9)
+
 
 class UpscaleRequests(unittest.TestCase):
     """An image's upscale (/v1/images/upscale, LocalAI's) and a video's (/v1/videos, vLLM-Omni's) read their shared
