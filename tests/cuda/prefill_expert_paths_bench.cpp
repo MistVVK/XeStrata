@@ -53,6 +53,7 @@
 #include <cstdlib>
 #include <cctype>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <memory>
 #include <random>
@@ -557,6 +558,18 @@ struct Opts {
     double skew = 0;
     unsigned seed = 1360;
     std::string dense_type = "Q8_0";
+    // --real=DIR --real-pack=native_experts.txt --real-gguf=SHARD.gguf [--real-layers=0,1,...]: real rows (the engine's STRATA_DUMP_MOE_INPUT=DIR/moe STRATA_DUMP_MOE_LAYER=all files DIR/moe.L<l>:
+    // a layer's MoE input and routing) through that layer's real experts (read from the GGUF at the offsets of the pack's native_experts.txt), one cell per layer, the pair taken from the pack's types
+    std::string real_dir, real_pack, real_gguf;
+    std::vector<int> real_layers;
+};
+
+// one real layer: the engine's own MoE input rows of the first chunk, its routing, and the layer's expert blobs (gate | up | down per expert, the engine's blob layout)
+struct RealLayer {
+    int layer = 0, T = 0;
+    std::vector<float> x;
+    std::vector<int32_t> ids;
+    std::vector<std::vector<uint8_t>> blob;   // per expert
 };
 
 void defenv(const char* name, const char* val) {
@@ -620,7 +633,7 @@ struct Card {
     bool hip = false;
 };
 
-void run_cell(const Pair& p, const Shape& s, int T, const Opts& o, const Card& card, pf::Gemm& gemm, cudaStream_t st, bool fp16_shape_ok, bool fewrows_dflt) {
+void run_cell(const Pair& p, const Shape& s, int T, const Opts& o, const Card& card, pf::Gemm& gemm, cudaStream_t st, bool fp16_shape_ok, bool fewrows_dflt, const RealLayer* real = nullptr) {
     const Geo geo(p, s);
     const int N = s.N, FF = s.FF, FF2 = s.FF2(), K = s.K, E = s.E;
     const int64_t rows = (int64_t) T * K;
@@ -634,8 +647,13 @@ void run_cell(const Pair& p, const Shape& s, int T, const Opts& o, const Card& c
     const size_t stride = (geo.bytes + unit - 1) / unit * unit;
     Dev blobs((size_t) E * stride + 4096);
     ck(cudaMemset(blobs.p, 0, blobs.n), "zero");
-    const std::vector<uint8_t> base = make_blob(p, geo, s, rng);
-    auto blob_bytes = [&](int e) { std::vector<uint8_t> b = base; b[4 + (size_t) (e % 16)] ^= (uint8_t) e; return b; };
+    const std::vector<uint8_t> base = real ? std::vector<uint8_t>() : make_blob(p, geo, s, rng);
+    auto blob_bytes = [&](int e) -> std::vector<uint8_t> {
+        if (real) { std::vector<uint8_t> rb = real->blob[(size_t) e]; rb.resize(geo.bytes, 0); return rb; }   // (an expert no row routes to is not loaded: zeros)
+        std::vector<uint8_t> b = base;
+        b[4 + (size_t) (e % 16)] ^= (uint8_t) e;
+        return b;
+    };
     for (int e = 0; e < E; ++e) {
         const std::vector<uint8_t> b = blob_bytes(e);
         ck(cudaMemcpy(blobs.as<uint8_t>() + (size_t) e * stride, b.data(), geo.bytes, cudaMemcpyHostToDevice), "blob");
@@ -643,8 +661,8 @@ void run_cell(const Pair& p, const Shape& s, int T, const Opts& o, const Card& c
     std::vector<const uint8_t*> blob((size_t) E);
     for (int e = 0; e < E; ++e) blob[(size_t) e] = blobs.as<uint8_t>() + (size_t) e * stride;
 
-    std::vector<float> x = make_x(T, N, rng);
-    const std::vector<int32_t> ids = make_ids(T, E, K, o.skew, rng);
+    std::vector<float> x = real ? real->x : make_x(T, N, rng);
+    const std::vector<int32_t> ids = real ? real->ids : make_ids(T, E, K, o.skew, rng);
     const Routing r = sort_rows(ids, E, K);
     int max_rows = 0, few = 0;
     for (int e = 0; e < E; ++e) {
@@ -716,6 +734,7 @@ void run_cell(const Pair& p, const Shape& s, int T, const Opts& o, const Card& c
     cudaMemGetInfo(&free1, &tot);
     const double vram_mib = (double) (free0 - std::min(free0, free1)) / (1024.0 * 1024.0);
 
+    if (real) std::printf("== REAL layer %d (the engine's own rows and routing, the layer's own experts)\n", real->layer);
     std::printf("== %s  shape %s (%dx%d, %d experts, top %d)  T=%d  rows %lld (per expert avg %.1f max %d; experts with <= %d rows: %d)  weights %.1f MiB/expert\n",
                 p.name, s.name.c_str(), N, FF, E, K, T, (long long) rows, (double) rows / E, max_rows, pf::kFewRows, few, (double) geo.bytes / (1024.0 * 1024.0));
     if (paths.empty()) {
@@ -811,6 +830,27 @@ void run_cell(const Pair& p, const Shape& s, int T, const Opts& o, const Card& c
             std::printf("  %s %.2e / %.2e", pr.name, d.rms, d.worst);
         }
         std::printf("\n");
+        // how the difference spreads over the sampled pairs: a few pairs far above the float-rounding level (one int8 code of an activation or of H landing on the other side of a
+        // rounding boundary) against every pair slightly different
+        for (PathRow& pr : paths) {
+            if (&pr == pm || pr.out.sample.size() != pm->out.sample.size()) continue;
+            std::vector<double> rel;
+            for (size_t i = 0; i < pick.size(); ++i) {
+                double me = 0, mr = 0;
+                for (int o = 0; o < N; ++o) {
+                    const double ya = pr.out.sample[i * (size_t) N + (size_t) o], yb = pm->out.sample[i * (size_t) N + (size_t) o];
+                    me = std::max(me, std::isfinite(ya) ? std::fabs(ya - yb) : 1e30);
+                    mr = std::max(mr, std::fabs(yb));
+                }
+                rel.push_back(mr > 0 ? me / mr : (me > 0 ? 1e30 : 0.0));
+            }
+            std::sort(rel.begin(), rel.end());
+            size_t over = 0;
+            for (double r : rel) over += r > 1e-5;
+            const size_t n = rel.size();
+            std::printf("   %s per sampled pair, max|diff| / max|MMQ|: %zu of %zu pairs above 1e-5; largest %.2e, second %.2e, median %.2e\n", pr.name, over, n,
+                        n ? rel[n - 1] : 0.0, n > 1 ? rel[n - 2] : 0.0, n ? rel[n / 2] : 0.0);
+        }
     }
     std::printf("   %-8s %10s %10s %10s %9s  %9s %9s  %-16s %s\n", "path", "ms median", "min", "max", pm ? "x MMQ" : "", "err rms", "worst row", "output hash", "non-finite rows");
     for (PathRow& pr : paths) {
@@ -820,6 +860,13 @@ void run_cell(const Pair& p, const Shape& s, int T, const Opts& o, const Card& c
         std::printf("   %-8s %10.3f %10.3f %10.3f %9s  ", pr.name, md, mn, mx, rel);
         if (pr.err.rms >= 0) std::printf("%9.2e %9.2e  ", pr.err.rms, pr.err.worst); else std::printf("%9s %9s  ", "-", "-");
         std::printf("%016llx %lld\n", (unsigned long long) pr.out.hash, (long long) pr.out.nonfinite_rows);
+    }
+    if (real) {   // REALROW: one line per layer for the tables (error against FP32 of MMQ / I8 / FP16, and the sampled I8-to-MMQ difference)
+        PathRow *rm = find("MMQ"), *ri = find("I8"), *rf = find("FP16");
+        double dif = -1, dwr = -1;
+        if (rm && ri && !rm->out.sample.empty() && ri->out.sample.size() == rm->out.sample.size()) { const Err d = compare(ri->out.sample, rm->out.sample, pick.size(), N); dif = d.rms; dwr = d.worst; }
+        std::printf("REALROW layer=%d pair=\"%s\" T=%d mmq_err=%.3e mmq_worst=%.3e i8_err=%.3e i8_worst=%.3e fp16_err=%.3e i8_vs_mmq=%.3e i8_vs_mmq_worst=%.3e\n", real->layer, p.name, T,
+                    rm ? rm->err.rms : -1.0, rm ? rm->err.worst : -1.0, ri ? ri->err.rms : -1.0, ri ? ri->err.worst : -1.0, rf ? rf->err.rms : -1.0, dif, dwr);
     }
     // the machine-readable line: key=value, n/a where a path is absent; ratios are speed ratios (the first path's ms over this path's ms, > 1: faster)
     auto ms = [&](const char* n, char* buf, size_t cap) { PathRow* q = find(n); if (q) std::snprintf(buf, cap, "%.3f", median(q->t)); else std::snprintf(buf, cap, "n/a"); };
@@ -1033,6 +1080,66 @@ void run_dense_cell(const DenseShape& d, int T, ggml_type ntype, const Opts& o, 
 }
 }  // namespace
 
+// --real: one line of the pack's native_experts.txt ("layer gu_type d_type offset blob_bytes gate_off up_off down_off": absolute offsets of the three stacked expert tensors in the GGUF shard)
+struct PackRow {
+    int layer = 0, gu = 0, d = 0;
+    unsigned long long blob = 0, gate_off = 0, up_off = 0, down_off = 0;
+};
+std::vector<PackRow> read_pack(const std::string& path) {
+    std::vector<PackRow> v;
+    std::ifstream in(path);
+    if (!in) throw std::runtime_error("--real-pack: cannot open " + path);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        PackRow r;
+        unsigned long long off = 0;
+        if (std::sscanf(line.c_str(), "%d %d %d %llu %llu %llu %llu %llu", &r.layer, &r.gu, &r.d, &off, &r.blob, &r.gate_off, &r.up_off, &r.down_off) == 8) v.push_back(r);
+    }
+    return v;
+}
+
+// the dump of STRATA_DUMP_MOE_INPUT (one file per layer: {T, N, K} int64, T x N floats, T x K expert ids) and the layer's experts (the ones some row routes to) from the GGUF
+RealLayer load_real(const Opts& o, const PackRow& pr, const Pair& p, const Shape& s) {
+    RealLayer rl;
+    rl.layer = pr.layer;
+    const std::string dump = o.real_dir + "/moe.L" + std::to_string(pr.layer);
+    std::ifstream f(dump, std::ios::binary);
+    if (!f) throw std::runtime_error("no dump " + dump);
+    int64_t hdr[3] = {};
+    f.read((char*) hdr, sizeof hdr);
+    if (!f || hdr[1] != s.N || hdr[2] != s.K || hdr[0] <= 0) throw std::runtime_error("dump " + dump + ": header T " + std::to_string(hdr[0]) + " N " + std::to_string(hdr[1]) + " K " + std::to_string(hdr[2]));
+    rl.T = (int) hdr[0];
+    rl.x.resize((size_t) rl.T * s.N);
+    rl.ids.resize((size_t) rl.T * s.K);
+    f.read((char*) rl.x.data(), (std::streamsize) (rl.x.size() * 4));
+    f.read((char*) rl.ids.data(), (std::streamsize) (rl.ids.size() * 4));
+    if (!f) throw std::runtime_error("dump " + dump + ": short");
+    const Geo geo(p, s);
+    const size_t gate_per_e = geo.up_off, down_per_e = geo.bytes - geo.down_off;
+    std::vector<char> need((size_t) s.E, 0);
+    for (int32_t e : rl.ids) {
+        if (e < 0 || e >= s.E) throw std::runtime_error("dump " + dump + ": expert id " + std::to_string(e));
+        need[(size_t) e] = 1;
+    }
+    std::ifstream g(o.real_gguf, std::ios::binary);
+    if (!g) throw std::runtime_error("--real-gguf: cannot open " + o.real_gguf);
+    rl.blob.assign((size_t) s.E, std::vector<uint8_t>());
+    for (int e = 0; e < s.E; ++e) {
+        if (!need[(size_t) e]) continue;
+        std::vector<uint8_t>& b = rl.blob[(size_t) e];
+        b.resize(geo.bytes);
+        const unsigned long long at[3] = {pr.gate_off + (unsigned long long) e * gate_per_e, pr.up_off + (unsigned long long) e * gate_per_e, pr.down_off + (unsigned long long) e * down_per_e};
+        const size_t dst[3] = {0, geo.up_off, geo.down_off}, len[3] = {gate_per_e, gate_per_e, down_per_e};
+        for (int k = 0; k < 3; ++k) {
+            g.seekg((std::streamoff) at[k]);
+            g.read((char*) b.data() + dst[k], (std::streamsize) len[k]);
+            if (!g) throw std::runtime_error("--real-gguf: short read of layer " + std::to_string(pr.layer) + " expert " + std::to_string(e));
+        }
+    }
+    return rl;
+}
+
 int main(int argc, char** argv) {
     try {
         Opts o;
@@ -1071,6 +1178,10 @@ int main(int argc, char** argv) {
             else if (!std::strcmp(a, "--no-ref")) o.no_ref = true;
             else if (!std::strcmp(a, "--quick")) o.quick = true;
             else if (!std::strcmp(a, "--dense")) o.dense = true;
+            else if (std::string vr = arg_after(a, "--real="); !vr.empty()) o.real_dir = vr;
+            else if (std::string vp = arg_after(a, "--real-pack="); !vp.empty()) o.real_pack = vp;
+            else if (std::string vg = arg_after(a, "--real-gguf="); !vg.empty()) o.real_gguf = vg;
+            else if (std::string vl = arg_after(a, "--real-layers="); !vl.empty()) o.real_layers = parse_ints(vl);
             else { std::fprintf(stderr, "unknown argument %s (see the head of tests/cuda/prefill_expert_paths_bench.cpp)\n", a); return 1; }
         }
         if (o.experts > 0) o.shape.E = std::max(o.experts, o.shape.K);
@@ -1170,6 +1281,31 @@ int main(int argc, char** argv) {
                 if (ran > 0) std::printf("RESULT dense_total=1 tokens=%d gemms=%d ms_off_per_chunk=%.2f ms_on_per_chunk=%.2f off_over_on=%.3f (sum over the shapes x uses per chunk) arch=%s\n", T, ran, so, sn, sn > 0 ? so / sn : 0.0, card.arch.c_str());
             }
             ck(cudaStreamDestroy(st), "destroy");
+            return 0;
+        }
+        if (!o.real_dir.empty()) {   // --real: one cell per layer of the dump, the layer's own pair, rows, routing and experts
+            if (o.real_pack.empty() || o.real_gguf.empty()) throw std::runtime_error("--real needs --real-pack=native_experts.txt and --real-gguf=SHARD.gguf");
+            const std::vector<PackRow> pack = read_pack(o.real_pack);
+            int cells = 0, skipped = 0;
+            for (const PackRow& pr : pack) {
+                if (!o.real_layers.empty() && std::find(o.real_layers.begin(), o.real_layers.end(), pr.layer) == o.real_layers.end()) continue;
+                const Pair* pp = nullptr;
+                for (const Pair& q : pairs) if ((int) q.gu == pr.gu && (int) q.d == pr.d) pp = &q;
+                if (pp == nullptr) { std::printf("== REAL layer %d: gate/up type %d, down type %d is not a pair of this bench: skipped\n", pr.layer, pr.gu, pr.d); ++skipped; continue; }
+                try {
+                    const RealLayer rl = load_real(o, pr, *pp, s0);
+                    run_cell(*pp, s0, rl.T, o, card, gemm, st, fp16_shape_ok, fewrows_dflt, &rl);
+                    ++cells;
+                } catch (const std::exception& e) {
+                    cudaGetLastError();
+                    std::printf("== REAL layer %d: SKIPPED (%s)\n", pr.layer, e.what());
+                    ++skipped;
+                    if (std::strstr(e.what(), "cudaMalloc") == nullptr && std::strstr(e.what(), "dump") == nullptr) throw;
+                }
+                std::fflush(stdout);
+            }
+            ck(cudaStreamDestroy(st), "destroy");
+            std::printf("prefill_expert_paths_bench --real: %d layers run, %d skipped\n", cells, skipped);
             return 0;
         }
         std::vector<Pair> sel;
