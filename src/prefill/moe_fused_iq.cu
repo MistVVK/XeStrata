@@ -92,6 +92,9 @@ static_assert(GGML_TYPE_IQ2_XXS == strata::prefill::fused_tile::kTypeIq2Xxs && G
               GGML_TYPE_IQ2_S == strata::prefill::fused_tile::kTypeIq2S && GGML_TYPE_IQ3_XXS == strata::prefill::fused_tile::kTypeIq3Xxs &&
               GGML_TYPE_IQ3_S == strata::prefill::fused_tile::kTypeIq3S && GGML_TYPE_IQ4_XS == strata::prefill::fused_tile::kTypeIq4Xs,
               "fused_tile_rule.hpp's default_gate_format uses ggml's type ids");
+static_assert(GGML_TYPE_Q5_1 == strata::prefill::fused_tile::kTypeQ5_1 && GGML_TYPE_Q8_0 == strata::prefill::fused_tile::kTypeQ8_0 && GGML_TYPE_Q4_K == strata::prefill::fused_tile::kTypeQ4K &&
+              GGML_TYPE_Q5_K == strata::prefill::fused_tile::kTypeQ5K && GGML_TYPE_Q6_K == strata::prefill::fused_tile::kTypeQ6K,
+              "fused_tile_rule.hpp's wide_pair and kq_flash_kind use ggml's type ids");
 constexpr int T_IQ2_XXS = GGML_TYPE_IQ2_XXS, T_IQ2_XS = GGML_TYPE_IQ2_XS, T_IQ2_S = GGML_TYPE_IQ2_S,
               T_IQ3_XXS = GGML_TYPE_IQ3_XXS, T_IQ3_S = GGML_TYPE_IQ3_S, T_IQ4_XS = GGML_TYPE_IQ4_XS,
               T_IQ4_NL = GGML_TYPE_IQ4_NL, T_Q2_0 = GGML_TYPE_Q2_0,
@@ -2656,7 +2659,8 @@ bool staged_blobs_ok(const Batch& b, const NativeGeom& g) {
 #endif
 // `staged`: the launch's gate/up kernel is a weight-staging instance (sw_on); the rule then takes 128 rows from every size on the sm_86 / sm_120 cards under 80 SMs.
 // `wide`: the launch's gate/up is Q6_K or Q8_0: on sm_86 cards with 40+ SMs the rule takes 128 rows above 112 rows an expert (fused_tile_rule.hpp).
-int pick_ww(int64_t n, int n_expert, bool staged, bool wide) {
+// `kq`: 0, or the launch's pair is one of Flash-Next's K-quant pairs (fused_tile::kq_flash_kind: 1 a Q5_1 down, 2 a Q8_0 down): on sm_86-class cards with 80-99 SMs the rule takes 128 rows from 5.8 rows an expert up.
+int pick_ww(int64_t n, int n_expert, bool staged, bool wide, int kq) {
     static const int forced = [] {
         const char* v = std::getenv("STRATA_PF_FUSED_TILE");
         const int t = v ? std::atoi(v) : 0;
@@ -2666,13 +2670,13 @@ int pick_ww(int64_t n, int n_expert, bool staged, bool wide) {
     // the rule itself (the card classes, the thresholds and the measurements behind them) is include/strata/prefill/fused_tile_rule.hpp, a pure function the unit test
     // tests/prefill/fused_tile_rule_test.cpp pins for every measured card class.  STRATA_PF_TILE_DEBUG=1 prints the choice of every launch of a class that has its own rule.
     const DevInfo& d = dev_info();
-    const strata::prefill::fused_tile::Pick pk = strata::prefill::fused_tile::pick({d.s120, d.s121, d.sms, d.s86}, n, n_expert, staged, wide);
+    const strata::prefill::fused_tile::Pick pk = strata::prefill::fused_tile::pick({d.s120, d.s121, d.sms, d.s86}, n, n_expert, staged, wide, kq);
     using strata::prefill::fused_tile::Why;
     if (pk.why != Why::kBand) {
         static const bool dbg = [] { const char* v = std::getenv("STRATA_PF_TILE_DEBUG"); return v != nullptr && v[0] == '1'; }();
         if (dbg) {
             const double avg = (double) n / std::max(n_expert, 1);
-            const char* cls = pk.why == Why::kS121 ? "s121" : pk.why == Why::kS120Small ? "s120 small" : pk.why == Why::kStaged ? "staged" : pk.why == Why::kS86Wide ? "s86 wide" : "s120";
+            const char* cls = pk.why == Why::kS121 ? "s121" : pk.why == Why::kS120Small ? "s120 small" : pk.why == Why::kStaged ? "staged" : pk.why == Why::kS86Wide ? "s86 wide" : pk.why == Why::kS86Kq ? "s86 kq" : pk.why == Why::kS120Kq ? "s120 kq" : "s120";
             std::fprintf(stderr, "strata: fused tile: rows %lld experts %d avg %.1f %s yes -> ww %d\n", (long long) n, n_expert, avg, cls, pk.ww);
         }
     }
@@ -2682,14 +2686,14 @@ int pick_ww(int64_t n, int n_expert, bool staged, bool wide) {
 // The work item of one launch of the native kernels: pick_ww's, unless the launch has a weight-staging kernel (`staged`: its gate/up kernel is one; the down's is looked at here) and
 // the staging check fails (staged_blobs_ok), in which case the unstaged 64-row instances run (fused_tile::kUnstagedWw), also when STRATA_PF_FUSED_TILE=128 forces the 128-row tile.
 // Every call site that launches `launch<...>` with a ww from pick_ww on a batch of blobs takes its ww from here.
-int launch_ww(const Batch& b, const NativeGeom& g, int64_t n, int n_expert, bool staged, bool wide) {
+int launch_ww(const Batch& b, const NativeGeom& g, int64_t n, int n_expert, bool staged, bool wide, int kq = 0) {
 #if !defined(__HIPCC__)
     if ((staged || sw_on(g.d_type, false)) && !staged_blobs_ok(b, g)) return strata::prefill::fused_tile::kUnstagedWw;
 #else
     (void) b;
     (void) g;
 #endif
-    return pick_ww(n, n_expert, staged, wide);
+    return pick_ww(n, n_expert, staged, wide, kq);
 }
 #endif
 }  // namespace
@@ -3019,7 +3023,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
     // the launch's gate/up kernel is a staging instance: the tile rule then takes 128 rows (the gate/up is about two thirds of the layer; a down that is not staged, Q2_0 or Q8_0 or Q5_0,
     // still ran faster in the 128-row tile with it: IQ3_S / Q2_0 on the RTX A4000, RESULTS-P4-SM.md S1).  Either kernel staged: the blob check.
     const bool staged = sw_on(g.gu_type, true), wide = g.gu_type == T_Q6_K || g.gu_type == T_Q8_0;   // wide: the Q6_K / Q8_0 gate/up class of the sm_86 tile line (40+ SMs)
-    const int ww = launch_ww(b, g, n, n_expert, staged, wide);   // (the staging check inside: a launch that fails it takes the unstaged 64-row kernel)
+    const int ww = launch_ww(b, g, n, n_expert, staged, wide, strata::prefill::fused_tile::kq_flash_kind(g.gu_type, g.d_type));   // (the staging check inside: a launch that fails it takes the unstaged 64-row kernel; the last argument: Flash-Next's K-quant pairs)
     // the most 64-row tiles the batch can have (every row in it, plus a partial tile per expert) - the items of the
     // ones inside a larger item end at once
     const int64_t tiles = (n + kTileRows - 1) / kTileRows + (b.e1 - b.e0);

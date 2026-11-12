@@ -32,7 +32,7 @@ struct Card {
 // 8.7 (Jetson Orin), 9.0, 10.x, 12.0 / 12.1 and everything below 8.0 are not in the class.  `off` is STRATA_PF_FUSED_SM86=0 (a diagnostic: the class is empty then, whatever the card).
 constexpr bool s86_class(int major, int minor, bool off = false) { return !off && major == 8 && (minor == 0 || minor == 6 || minor == 9); }
 
-enum class Why { kBand, kS121, kS120Large, kS120Mid, kS120Small, kStaged, kS86Wide };
+enum class Why { kBand, kS121, kS120Large, kS120Mid, kS120Small, kStaged, kS86Wide, kS86Kq, kS120Kq };
 
 struct Pick {
     int ww;     // 2 (128 routed rows) or 4 (64)
@@ -42,9 +42,11 @@ struct Pick {
 constexpr double kS120LargeAvg = 159.9;   // sm_120, 80+ SMs: a prompt of 8,192 tokens routes 8,191 positions = 81,910 rows = 159.98 an expert
 constexpr double kS120MidAvg = 112.0;     // sm_120, 100-149 SMs (PRO 5000): from above the band, continuous with it
 constexpr double kS120SmallAvg = 119.9;   // sm_120, 40-79 SMs (RTX 5070): a prompt of 6,144 tokens routes 6,143 positions = 119.98 an expert
+constexpr double kKqMinAvg = 5.8;      // sm_86 class, 80-99 SMs, Flash-Next's K-quant pairs: the smallest launch measured is 300 tokens x top 10 over 512 experts = 5.86 an expert
 
-// staged: the launch's gate/up kernel is a weight-staging instance (sw_on in src/prefill/moe_fused_iq.cu).  wide: the launch's pair is in the class of wide_pair below (a Q6_K or Q8_0 gate/up; Qwen3.6's K-quant pairs).  Defaults false = the rule as it was.
-constexpr Pick pick(const Card& c, int64_t n, int n_expert, bool staged = false, bool wide = false) {
+// staged: the launch's gate/up kernel is a weight-staging instance (sw_on in src/prefill/moe_fused_iq.cu).  wide: the launch's pair is in the class of wide_pair below (a Q6_K or Q8_0 gate/up; Qwen3.6's K-quant pairs).
+// kq: 0, or the launch's pair is one of Flash-Next's K-quant pairs (kq_flash_kind below: 1 = a Q5_1 down, 2 = a Q8_0 down).  Defaults 0 = the rule as it was.
+constexpr Pick pick(const Card& c, int64_t n, int n_expert, bool staged = false, bool wide = false, int kq = 0) {
     const double avg = (double) n / (double) (n_expert > 1 ? n_expert : 1);
     // GB10 (sm_121, 48 SMs): the launch's average is above 112 rows an expert for every prompt size here, so the 56-112 band never fires and the 64-row tile would be
     // chosen everywhere.  Forcing 128 rows measured +3.7% [1.030, 1.079] and +3.4% [1.030, 1.038] at 16K in two independent order-balanced block pairs (12 samples a
@@ -84,14 +86,31 @@ constexpr Pick pick(const Card& c, int64_t n, int n_expert, bool staged = false,
     // already picks 128 from 56 rows an expert, so its default row equals the forced-128 row): tile 64 0.99 / 0.85 / 0.72 / 0.63, 0.92 / 0.77 / 0.66 / 0.58, 0.83 / 0.70 / 0.60 / 0.52 against 1.28 / 1.07 / 1.02 / 0.87,
     // 1.33 / 1.12 / 0.99 / 0.96, 1.23 / 1.08 / 0.93 / 0.90.  So on both SM classes tested 128 rows is the faster tile from 4,096 tokens up and not worse at 2,048 (par/RESULTS-Q36-DEFAULT.md).
     if (wide && c.s86 && c.sms >= 40 && avg > 112.0) return {2, Why::kS86Wide};
+    // Flash-Next's K-quant pairs (UD-Q4_K_XL: Q4_K / Q5_1 in 43 layers, Q4_K / Q8_0 in 4, Q5_K / Q8_0 in 1; kq_flash_kind) on an sm_86-class card with 80 to 99 SMs: 128 rows from the smallest launch measured on.  One layer of
+    // Flash-Next's shape (512 experts, top 10; the output bits hash is equal at every tile), RTX A6000 (sm_86, 84 SMs, CUDA 13.1), MMQ ms / fused ms (above 1: fused faster), median of two repetitions (spread 0.01 or less),
+    // 300 / 1,000 / 2,048 / 4,096 / 8,192 / 20,000 / 32,768 tokens (5.9 / 19.5 / 40 / 80 / 160 / 391 / 640 rows an expert).  The rule's own pick before this line (64 below 56 rows an expert, 128 from 56 to 112, 64 above):
+    // Q4_K / Q5_1 1.28 1.26 1.28 1.29 0.88 0.79 0.73, Q4_K / Q8_0 1.25 1.30 1.32 1.40 0.83 0.72 0.67, Q5_K / Q8_0 1.10 1.15 1.10 1.31 0.67 0.58 0.53.  Tile 128 at every size: Q4_K / Q5_1 1.65 1.49 1.52 1.29 1.04 0.97 0.88,
+    // Q4_K / Q8_0 1.83 1.73 1.72 1.40 1.07 0.98 0.91, Q5_K / Q8_0 1.79 1.69 1.69 1.33 1.04 0.98 0.89 (par/RESULTS-KQ-DEFAULT.md).  Only 80-99 SMs: the card measured has 84 (the A40 and RTX 3090 class are the same size); the A100 and
+    // RTX 40 class (108 SMs and up) keep the rule above, and nothing smaller than 300 tokens was measured.  The 40-79 SM cards take 128 rows from every size through the staged rule above; sm_120 is not touched (the RTX PRO 5000's
+    // pick, 64 below 56 rows an expert and 128 above, is right for the 43-layer Q4_K / Q5_1 pair).
+    if (kq != 0 && c.s86 && c.sms >= 80 && c.sms < 100 && avg >= kKqMinAvg) return {2, Why::kS86Kq};
+    // The two Q8_0-down pairs (kq == 2) on an sm_120 card with 100 to 149 SMs (RTX PRO 5000; the rule above gives it 128 rows from 56 rows an expert, so this line moves launches of 5.8 to 56 rows an expert from 64 to 128): the same
+    // one-layer test on the RTX PRO 5000 (sm_120, 110 SMs, CUDA 13.2), MMQ ms / fused ms, three repetitions, 300 / 1,000 / 2,048 tokens, today's pick against tile 128 (range of the three): Q4_K / Q8_0 1.18 [1.15, 1.19] /
+    // 1.43 [1.42, 1.45] / 1.47 [1.46, 1.47] against 1.52 [1.50, 1.54] / 1.51 [1.50, 1.52] / 1.56 [1.55, 1.57]; Q5_K / Q8_0 0.94 [0.94, 0.95] / 1.20 [1.20, 1.21] / 1.35 [1.35, 1.35] against 1.46 [1.45, 1.48] / 1.44 [1.44, 1.46] /
+    // 1.49 [1.48, 1.49]; the ranges do not overlap, and the output bits hash is equal at every tile.  The Q5_1-down pair (43 layers) keeps the 64-row tile there: 1.64 / 1.71 / 1.67 against 1.50 / 1.52 / 1.58.
+    if (kq == 2 && c.s120 && c.sms >= 100 && c.sms < 150 && avg >= kKqMinAvg) return {2, Why::kS120Kq};
     return {avg > 56.0 && avg <= 112.0 ? 2 : 4, Why::kBand};
 }
 
 // The gate/up + down pairs of the wide line (ggml type ids as in moe_fused_iq.cu): a Q6_K or Q8_0 gate/up (Q6_K + Q8_0, Q8_0 / Q8_0), and since 11-12 the K-quant pairs of Qwen3.6's UD-Q4_K_XL, a Q4_K or Q5_K gate/up
 // with a Q5_K or Q6_K down (the Qwen3.6 copy of the kernels only: Flash-Next's K-quant gate/up has a Q5_1 / Q8_0 down and keeps its rule).
-constexpr int kTypeQ8_0 = 8, kTypeQ4K = 12, kTypeQ5K = 13, kTypeQ6K = 14;
+constexpr int kTypeQ5_1 = 7, kTypeQ8_0 = 8, kTypeQ4K = 12, kTypeQ5K = 13, kTypeQ6K = 14;
 constexpr bool wide_pair(int gu_type, int d_type) {
     return gu_type == kTypeQ6K || gu_type == kTypeQ8_0 || ((gu_type == kTypeQ4K || gu_type == kTypeQ5K) && (d_type == kTypeQ5K || d_type == kTypeQ6K));
+}
+// Flash-Next's K-quant pairs, the last argument class of pick (1 = Q5_1 down, 2 = Q8_0 down, 0 = any other pair): a Q4_K or Q5_K gate/up with a Q5_1 or Q8_0 down (UD-Q4_K_XL: Q4_K / Q5_1, Q4_K / Q8_0, Q5_K / Q8_0).  Disjoint from wide_pair's K-quant pairs (Q5_K / Q6_K downs: Qwen3.6).
+constexpr int kq_flash_kind(int gu_type, int d_type) {
+    return (gu_type == kTypeQ4K || gu_type == kTypeQ5K) ? (d_type == kTypeQ5_1 ? 1 : d_type == kTypeQ8_0 ? 2 : 0) : 0;
 }
 
 // Whether native_supported's default rule (STRATA_PF_FUSED unset; the IQ3_S pack's gate/up IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS with an IQ4_NL / Q2_0 down) takes a launch on this card, as a pure function so the
