@@ -2314,10 +2314,21 @@ bool Window::checkpoint_save(strata::core::ConversationCheckpoint& c, std::strin
     // has to survive a checkpoint: rows 0..2 are the whole state (the means are identical, qsa.metal qsa_prep).
     const size_t gs = GST_B, hs = HIST_B, ts = 3 * 4 * G_ID, dsz = DEAD_B;
     c.gdn.resize(gst_.size() * (gs + hs));
+    size_t sbad = 0;
     for (size_t i = 0; i < gst_.size(); ++i) {
-        std::memcpy(c.gdn.data() + i * (gs + hs), gst_[i].ptr, gs);
-        std::memcpy(c.gdn.data() + i * (gs + hs) + gs, ghist_[hp_][i].ptr, hs);
+        uint8_t* d8 = c.gdn.data() + i * (gs + hs);
+        std::memcpy(d8, gst_[i].ptr, gs);
+        std::memcpy(d8 + gs, ghist_[hp_][i].ptr, hs);
+        // Never persist a non-finite word.  The record is restored wholesale - by this session's recovery path and
+        // by the next session's cold start - so one saved NaN re-poisons every later run from a state that looks
+        // clean.  Zero is the neutral value for both the scan state and the conv history.
+        uint32_t* w = (uint32_t*) d8;
+        for (size_t k = 0; k < (gs + hs) / 4; ++k)
+            if ((w[k] & 0x7F800000u) == 0x7F800000u) { w[k] = 0u; ++sbad; }
     }
+    if (sbad)
+        std::fprintf(stderr, "strata metal: #879 save, %zu tokens: dropped %zu non-finite words instead of persisting them\n",
+                     c.ids.size(), sbad);
     c.ple.assign((const uint8_t*) pleHist_.ptr, (const uint8_t*) pleHist_.ptr + PLEH_B);
     c.tails.resize(tail_.size() * ts);
     c.dead.resize(dead_.size() * dsz);
@@ -2358,10 +2369,31 @@ bool Window::checkpoint_restore(const strata::core::ConversationCheckpoint& c, s
     }
     pend_fold_ = 0;   // the restored state replaces whatever was pending
     last_T_ = 0;
+    // The blob being restored is UNTRUSTED.  A layer of NaN cannot come out of the contractive GDN scan (every
+    // ssm_a is negative, so the decay is <= 1 and the delta rule is bounded), so if it is already in the record it
+    // arrived through the checkpoint - and the #879 recovery restores this very buffer, which is what made one bad
+    // value permanent: it was saved, restored, and re-propagated on every retry.  Zero is the neutral value for both
+    // parts (the state is a memory of v, the conv history is three boundary tokens), so clearing them costs a
+    // three-token warm-up in the affected layer and nothing else.  inf is cleared with NaN: both poison the
+    // recurrence and neither is reachable from a healthy state.  Restore only, so it is off the hot path.
+    const size_t sw = gs / 4, hwc = hs / 4;
+    size_t bad = 0, badl = 0;
     for (size_t i = 0; i < gst_.size(); ++i) {
-        std::memcpy(gst_[i].ptr, c.gdn.data() + i * (gs + hs), gs);
-        std::memcpy(ghist_[hp_][i].ptr, c.gdn.data() + i * (gs + hs) + gs, hs);
+        const uint8_t* s8 = c.gdn.data() + i * (gs + hs);
+        std::memcpy(gst_[i].ptr, s8, gs);
+        std::memcpy(ghist_[hp_][i].ptr, s8 + gs, hs);
+        uint32_t* st = (uint32_t*) gst_[i].ptr;
+        uint32_t* hw = (uint32_t*) ghist_[hp_][i].ptr;
+        size_t here = 0;
+        for (size_t k = 0; k < sw; ++k)
+            if ((((const uint32_t*) s8)[k] & 0x7F800000u) == 0x7F800000u) { st[k] = 0u; ++here; }
+        for (size_t k = 0; k < hwc; ++k)
+            if ((((const uint32_t*) (s8 + gs))[k] & 0x7F800000u) == 0x7F800000u) { hw[k] = 0u; ++here; }
+        if (here) { bad += here; ++badl; }
     }
+    if (bad)
+        std::fprintf(stderr, "strata metal: #879 restore, %zu tokens: cleared %zu non-finite words from the state and "
+                             "conv history of %zu layer(s) - the checkpoint was already poisoned\n", c.ids.size(), bad, badl);
     std::memcpy(pleHist_.ptr, c.ple.data(), c.ple.size());
     const size_t cts = c.tails.size() / std::max<size_t>(tail_.size(), 1);   // 3 rows (the shared contract) or 4 (an older image)
     for (size_t j = 0; j < tail_.size(); ++j) {
@@ -3364,6 +3396,25 @@ bool Window::prompt_chunk(const int32_t* tokens, int Tn, int64_t pos0, std::stri
         GrArgs a{N, HC, LR, (uint32_t) T, 1u, eps_};
         D(P(lib_, "gr_norm", {}, "gr_norm"), {mtl::Arg::B(p.R), mtl::Arg::B(p.bo), mtl::Arg::B(p.inj[ci]), mtl::Arg::B(W_, tn.offset),
                                               mtl::Arg::B(p.YE), mtl::Arg::V(a)}, HC, T, 256);
+    }
+    // No non-finite value may cross a chunk boundary.  The scan state and the conv history are the only two carriers
+    // that outlive a chunk (and, through the conversation cache and the checkpoint, outlive the request), so this pass
+    // makes a poisoned state self-healing instead of permanent.  It is unconditional on purpose: containment has to
+    // hold in production, not only while diagnosing.  Zero is the neutral value for both - the state is a memory of v
+    // and the history is three boundary tokens - so a bad word costs one layer a three-token warm-up instead of
+    // poisoning every later chunk.  ~19 MB of host reads against ~14 s of prefill: 0.005%.
+    {
+        size_t sbad = 0;
+        for (size_t i = 0; i < gst_.size(); ++i) {
+            uint32_t* st = (uint32_t*) gst_[i].ptr;
+            for (size_t k = 0; k < GST_B / 4; ++k)
+                if ((st[k] & 0x7F800000u) == 0x7F800000u) { st[k] = 0u; ++sbad; }
+            uint32_t* hw = (uint32_t*) ghist_[hp_][i].ptr;
+            for (size_t k = 0; k < HIST_B / 4; ++k)
+                if ((hw[k] & 0x7F800000u) == 0x7F800000u) { hw[k] = 0u; ++sbad; }
+        }
+        if (sbad)
+            std::fprintf(stderr, "strata metal: #879 chunk start: cleared %zu non-finite words from the running GDN state\n", sbad);
     }
     const double t0 = now_ms();
     if (stream_) {

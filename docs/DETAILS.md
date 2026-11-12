@@ -615,6 +615,19 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   The Apple Metal port has no device kernel for it; after each head window it scans the window's logits rows in
   unified memory from the host (`metal_scan_rows` in `src/core/verify.cpp`) and records the same fact. On an M1 Max
   the scan costs about 60 microseconds a decode window, 0.2% of the window.
+  The origin of a real poisoning was found in the Metal port: the Mixture-of-Experts activations (`XS`, the gathered
+  input, and `HS`, the gated intermediate) are fp16, and a value outside fp16's range became `inf`. The expert
+  down-GEMM multiplies those activations by quantized weights that are legitimately zero, so `inf * 0` produced a
+  canonical NaN (`0x7fc00000`) in one token row's combined expert output. That row's residual, then every layer above
+  it, then the GDN scan state went NaN, and the window's logits with them - which is why the report named a different
+  layer each time, and why the magnitudes were all O(1) with no ramp. Every fp16 activation store on that path now
+  saturates to +/-65504 (`hsat` in `metal/kernels/moe_mm.metal`) and the combine drops a non-finite term instead of
+  summing it; both only differ from the old result where that result was already non-finite, so finite answers are
+  unchanged. Non-finite words are also cleared from the GDN scan state and conv history at every prompt chunk start,
+  on checkpoint restore and on checkpoint save, because those two buffers are part of the checkpoint and the parked
+  conversation and one bad value used to come back with every later turn. Four consecutive deep probes of 104,748
+  cold prompt tokens then finished with no non-finite logits and nothing to clear, where the previous build poisoned
+  on about seven of eight.
 
 ### Context and limits
 

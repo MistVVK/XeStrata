@@ -113,6 +113,12 @@ kernel void mm_clear(device int* srt_tok [[buffer(0)]], constant uint& n [[buffe
     if (gid < n) srt_tok[gid] = -1;
 }
 
+// Saturating fp16 store for the expert activations.  A value outside fp16's range becomes +/-inf, and the down-GEMM
+// multiplies these activations by quantized weights that are legitimately zero, so inf * 0 = NaN poisoned a whole
+// token row's MoE output (observed: yr non-finite on a single real row, then the residual, then every layer above).
+// Saturating keeps a wrong-but-finite value, which cannot poison anything.
+static inline half hsat(float v) { return half(clamp(v, -65504.0f, 65504.0f)); }
+
 // ---- the GEMMs -----------------------------------------------------------------------------------------------------
 // weights of one expert: gate at W + gate_off + e * gu_stride (+ up_off for up), down at W + down_off + e * d_stride
 struct MmArgs {
@@ -245,7 +251,12 @@ kernel void mm_combine(device const float* YE [[buffer(0)]], device const int* p
     float s = 0.0f;
     for (uint k = 0; k < a.z; ++k) {
         const int r = pos[t * a.z + k];
-        s = fma(srt_w[r], YE[ulong(r) * a.y + d], s);
+        const float wv = srt_w[r], ev = YE[ulong(r) * a.y + d];
+        // This is where the poison below has been measured to be born (yr non-finite on a single real token row).
+        // A non-finite weight or expert output is already garbage, so dropping that term keeps the request alive
+        // with one expert's contribution missing instead of turning one token into a NaN that costs the prompt.
+        // The compare only ever discards non-finite terms, so finite results are bit-identical.
+        if (isfinite(wv) && isfinite(ev)) s = fma(wv, ev, s);
     }
     y[gid] = s;
 }
@@ -266,7 +277,7 @@ kernel void mm_gather(device const float* x [[buffer(0)]], device const int* srt
                       uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     const int t = srt_tok[tg.x];
     device half* o = XS + ulong(tg.x) * n;
-    for (uint k = tid; k < n; k += 256) o[k] = t >= 0 ? half(x[ulong(t) * n + k]) : half(0.0f);
+    for (uint k = tid; k < n; k += 256) o[k] = t >= 0 ? hsat(x[ulong(t) * n + k]) : half(0.0f);
 }
 
 // The SSD-streaming arena (as in moe.metal): with function constant 20, expert e's slot is smap[e] in the chunks W,
@@ -339,7 +350,7 @@ kernel void mm_gu2(device const uchar* W [[buffer(0)]], device const half* XS [[
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (int it = tid; it < TM * TN; it += NTH) {
         const int m = it / TN, f = it - m * TN;
-        HS[ulong(row0 + m) * a.n_ff + f0 + f] = half(ot[it]);
+        HS[ulong(row0 + m) * a.n_ff + f0 + f] = hsat(ot[it]);
     }
 }
 
@@ -984,7 +995,7 @@ kernel void mm_gu3(device const uchar* W [[buffer(0)]], device const half* XS [[
     simdgroup_barrier(mem_flags::mem_threadgroup);
     for (int it = lane; it < TM * TN; it += 32) {
         const int m = it / TN, f = it - m * TN;
-        HS[ulong(row0 + m) * a.n_ff + n0 + f] = half(ot[sg][it]);
+        HS[ulong(row0 + m) * a.n_ff + n0 + f] = hsat(ot[sg][it]);
     }
 }
 
@@ -1130,7 +1141,7 @@ kernel void mm_gu4(device const uchar* W [[buffer(0)]], device const half* XS [[
         simdgroup_barrier(mem_flags::mem_threadgroup);
         for (int it = lane; it < TM * TN; it += 32) {
             const int m = it / TN, f = it - m * TN;
-            HS[ulong(row0 + s * TM + m) * a.n_ff + n0 + f] = half(ot[sg][it]);
+            HS[ulong(row0 + s * TM + m) * a.n_ff + n0 + f] = hsat(ot[sg][it]);
         }
     }
 }
@@ -1210,7 +1221,7 @@ kernel void mm_gu5(device const uchar* W [[buffer(0)]], device const half* XS [[
     simdgroup_barrier(mem_flags::mem_threadgroup);
     for (int it = lane; it < TM * TN; it += 32) {
         const int m = it / TN, f = it - m * TN;
-        HS[ulong(row0 + m) * a.n_ff + n0 + f] = half(ot[sg][it]);
+        HS[ulong(row0 + m) * a.n_ff + n0 + f] = hsat(ot[sg][it]);
     }
 }
 #define MMGU5_(F, N, S) template [[host_name("mm_gu5_" #F "_" #N "_" #S)]] kernel decltype(mm_gu5<F, N, S>) mm_gu5<F, N, S>;
@@ -1354,7 +1365,7 @@ kernel void mm_gu6(device const uchar* W [[buffer(0)]], device const half* XS [[
         simdgroup_barrier(mem_flags::mem_threadgroup); \
         for (int it = lane; it < TM * TN; it += 32) { \
             const int m = it / TN, f = it - m * TN; \
-            HS[ulong(row0 + S * 16 + m) * a.n_ff + n0 + f] = half(ot[sg][it]); \
+            HS[ulong(row0 + S * 16 + m) * a.n_ff + n0 + f] = hsat(ot[sg][it]); \
         } \
     }
     MM6_OUT(0, accg0, accu0)
