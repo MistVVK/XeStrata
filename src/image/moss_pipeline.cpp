@@ -38,7 +38,7 @@ constexpr int64_t kMaxTokens = 4096;  // its text encoder's longest prompt
 // that replaces it.
 constexpr uint64_t kTextWork = 1280 * kMiB;
 // the room a stage keeps beside the plan it was given, for the device's own use past what held() counts: an
-// eighth of the device's room (core::vram_room, D5; the 64 MiB measured here on the 16 GiB card, where the
+// eighth of the device's room (core::vram_room; the 64 MiB measured here on the 16 GiB card, where the
 // room is 512).
 uint64_t stage_slack() { return vram_room(/*parts*/ 8); }
 // ... and a quarter for a whole frame's VAE work: the 128 MiB the RTX 4070's refused 64 MiB buffer measured

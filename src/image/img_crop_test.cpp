@@ -62,7 +62,7 @@ uint64_t fnv(const std::vector<float>& v) {
     return h;
 }
 
-// PIL's own resize of the pictures (R5c's pil_hashes.py on Pillow 12.3.0: Image.fromarray of the planes as L or RGB,
+// PIL's own resize of the pictures (Pillow 12.3.0 hashed by a script: Image.fromarray of the planes as L or RGB,
 // Image.resize with LANCZOS, BILINEAR or BICUBIC): the same bytes.  The models' references were made by PIL, which
 // this matches exactly (the doubles' totals before were a level apart in 0.01 to 1.2% of the values).  The last three
 // are a picture over a hundred times taller than wide losing height, which Image.resize resizes columns first.

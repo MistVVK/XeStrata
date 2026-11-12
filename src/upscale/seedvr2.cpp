@@ -54,7 +54,7 @@ uint64_t vae_video_need(const image::MfVae& vae, int64_t th, int64_t tw, int64_t
 // the tiles video_begin tries after the frame whole, largest first
 constexpr int64_t kVaeTiles[] = {64, 48, 40, 32, 24, 16};
 
-// the room this device keeps free beside the plan (image::vram_room, D5): the whole of it is the plan's margin,
+// the room this device keeps free beside the plan (image::vram_room): the whole of it is the plan's margin,
 // half of it what a VAE call leaves while the other parts hold their place - the 512 and 256 MiB those measured
 // on the 16 GiB card, where the room is 512 MiB
 uint64_t room_margin(uint64_t parts = 1) { return image::vram_room(parts); }

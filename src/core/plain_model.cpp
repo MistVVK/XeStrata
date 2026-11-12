@@ -83,7 +83,7 @@ namespace {
 
 namespace k = strata::kernels;
 
-// The plain engine's floor for the room no plan counts (core::vram_room, D5): under STRATA_VRAM_LIMIT_MIB=4096 on
+// The plain engine's floor for the room no plan counts (core::vram_room): under STRATA_VRAM_LIMIT_MIB=4096 on
 // the RX 9060 XT the peak stayed below the card with 128 MiB kept free - llm-jp Q4_K_M, Ornith Q4_K_M and
 // GSQ-RCO 3bit, 2026-10-12 - where the 768 MiB of before left 700 MiB of the card unused.
 constexpr uint64_t kTierRoomLeast = 192ull << 20;
@@ -1494,7 +1494,7 @@ bool PlainModel::open_experts(std::string& err) {
     const uint64_t window_b = (uint64_t) opt_.max_t * (uint64_t) s.n_expert_used * (uint64_t) s.n_embd * 4 * 3 +
                               16 * lay.max_blob + (64ull << 20);
     // what is allocated after the tier (the products' libraries, the graphs) and the driver's margin: the room of
-    // the device's memory (core::vram_room, D5; its floor kTierRoomLeast above, its 768 MiB ceiling past 24 GiB)
+    // the device's memory (core::vram_room; its floor kTierRoomLeast above, its 768 MiB ceiling past 24 GiB)
     const uint64_t reserve = opt_.reserve_mib >= 0 ? (uint64_t) opt_.reserve_mib << 20
                                                    : core::vram_room(total_b_, /*parts*/ 1, kTierRoomLeast);
     const uint64_t room = free_b > window_b + reserve ? free_b - window_b - reserve : 0;

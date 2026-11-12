@@ -353,7 +353,7 @@ struct Options {
     bool no_fused_gdn = false;         ///< plan v0.3 P3 A/B: llama.cpp-layout GDN step + separate out norm
     /// Plan v0.3 P4: `--expert-cache auto` sizes the VRAM tier from what is free after the weights, the session
     /// and the KV state, minus this reserve for the graphs, the hit scratch and the head.  -1 (the default, unless
-    /// --vram-reserve-mib says otherwise) takes the room the device reports (core::vram_room, D5), never under the
+    /// --vram-reserve-mib says otherwise) takes the room the device reports (core::vram_room), never under the
     /// 700 MiB those measured on the B70 and the RTX 4070: the rule the image pipelines and the plain engine size
     /// their own room by, with this engine's measured room as its floor.
     int vram_reserve_mib = -1;
@@ -2863,7 +2863,7 @@ int main(int argc, char** argv) {
         size_t total_b = 0;
         if (strata::gpu::mem_info(&start_free_b, &total_b)) {
             // the auto cache's reserve, from this device's memory: the one rule every engine and stage sizes its
-            // room by (core::vram_room, D5), floored at the room this engine measured for its graphs, the hit
+            // room by (core::vram_room), floored at the room this engine measured for its graphs, the hit
             // scratch and the head.  A --vram-reserve-mib on the command line keeps its own value (#496).
             if (!o.vram_reserve_given)
                 o.vram_reserve_mib =

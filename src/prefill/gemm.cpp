@@ -830,7 +830,7 @@ bool w8_fused(void* stream) {
 // 15% faster.  At timed_choice's own 5% the choice moved from run to run on the B70 (2026-11-12: the three shapes
 // native 3.77 to 3.81 ms, W8A8 3.57 to 3.62, a 4 to 6% edge astride the margin; the RTX 4070's 8.1 to 8.8 against
 // 4.7 to 4.8, some 45%, is far past it).  Not a shape at a time either: the narrow margins of the small shapes
-// moved the choice from start to start (K5's record, the image DiTs' w8_fused above).  A queue recording a graph,
+// moved the choice from start to start (as recorded; the image DiTs' w8_fused above).  A queue recording a graph,
 // or a timing around this product (core::timing_depth), takes native until the GPU is timed.
 // A MoE model keeps native by default: neither the timing nor the int8 library's load (oneDNN's reservation,
 // about 385 MiB on the B70, shifts the expert cache's placement and the answers with it, A5B 2026-11-12), and its
@@ -942,7 +942,7 @@ bool Gemm::llm_w8a8(void* stream, bool dense) {
 }
 
 // The LLMs' dense prompt products take the W8A8 form through native_llm (their callers only: a DiT's FP16 products
-// stay FP16).  Timed on synthetic data (2026-11-11, K5's probe, the rows to int8 with the rotation, the weight made
+// stay FP16).  Timed on synthetic data (2026-11-11, a probe: the rows to int8 with the rotation, the weight made
 // int8 at each call, FP32 out as the LLMs' readers take it), Qwen3.8-Flash-Next's attn_qkv (2560 -> 10240, IQ4_XS)
 // at 8192 rows: the RTX 4070 6.93 ms native against about 3.9 W8A8 (2.36 with BF16 out, 3.50 with the weight's int8
 // rows resident), at 1024 rows 1.07 against 0.81.  The B70: 2.76 native against about 2.8 (1.84 with BF16 out, 1.47
