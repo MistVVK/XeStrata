@@ -692,6 +692,11 @@ struct Detectors {
         }
         return *d;
     }
+    uint64_t held() const {
+        uint64_t n = 0;
+        for (const auto& d : open) n += d.second->weight_bytes();
+        return n;
+    }
     void release(bool all) {
         if (all) open.clear();
         else
@@ -808,6 +813,11 @@ struct AuxNets {
         auto* t = dynamic_cast<T*>(m.get());
         if (t == nullptr) throw std::invalid_argument(path + ": opened as another model");
         return *t;
+    }
+    uint64_t held() const {
+        uint64_t n = 0;
+        for (const auto& m : open) n += m.second->held();
+        return n;
     }
     void release(bool all) {
         for (auto& m : open) {
@@ -1874,10 +1884,13 @@ int serve(si::ImagePipeline& p) {
                             (unsigned long long) (nd.held >> 20), (unsigned long long) (nd.free >> 20),
                             (unsigned long long) (nd.cap >> 20), (unsigned long long) (nd.host >> 20));
             } else if (op == "FREE") {
+                // held_mib: all the engine holds, the image model's and the tools' models' kept between requests (the
+                // server's VRAM ledger enters it); a detection's scratch and the control steps' buffers are not counted
                 size_t free = 0, total = 0;
                 strata::gpu::mem_info(&free, &total);
+                const uint64_t held = p.held() + ups.held() + aux.held() + detectors.held();
                 std::printf("FREE free_mib=%llu held_mib=%llu total_mib=%llu\n", (unsigned long long) (free >> 20),
-                            (unsigned long long) (p.held() >> 20), (unsigned long long) (total >> 20));
+                            (unsigned long long) (held >> 20), (unsigned long long) (total >> 20));
             } else if (op == "W8") {
                 std::printf("W8 take=%d\n", si::w8_here(nullptr));
             } else if (op == "BUDGET") {

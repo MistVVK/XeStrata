@@ -156,6 +156,7 @@ from serve import image_aux
 from serve import loras as lora_api
 from serve import envvars
 from serve import vram_ledger
+from serve import idle_watch
 from serve.image_daemon import START_TIMEOUT_S
 from serve.model_terms import _qimage
 
@@ -2532,6 +2533,8 @@ class ImageEngine:
         self.f: Any = None
         self.lines: queue.Queue = queue.Queue()
         self.ended = threading.Event()              # the daemon closed this connection
+        self.pid: int | None = None                 # the engine's process (the daemon's READY), what holds its VRAM
+        self.found = False                          # the last start found the daemon running (another server's)
 
     def command(self) -> list[str]:
         cmd = [str(self.cfg["exe"]), "--dit", str(self.cfg["diffusion_model"]), "--vae", str(self.cfg["vae"])]
@@ -2643,7 +2646,10 @@ class ImageEngine:
             self.close()
             raise ImageJobFailed(line[6:] if line.startswith("ERROR") else f"the image engine said: {line}")
         self.say(f"image engine {'started' if proc else 'found'} in {time.monotonic() - t0:.1f} s ({addr})")
-        return _kv(line)
+        info = _kv(line)
+        self.pid = int(info["pid"]) if isinstance(info.get("pid"), int) else None
+        self.found = proc is None
+        return info
 
     def _next(self, waited: float, limit: float, cancel: threading.Event | None = None) -> str:
         """The engine's next line; ImageJobFailed when the connection ended or `limit` passed."""
@@ -2939,6 +2945,48 @@ class ImageGen:
             self.tok = load_tokenizer(self._tokenizer_path(), self.family)
         if not self.engine.alive():
             self.engine.start()
+            self._enter_ledger()
+
+    def ledger(self, total_mib: int = 0) -> vram_ledger.Ledger:
+        """The image GPU's VRAM ledger (serve/vram_ledger.py), `total_mib` the engine's report of the GPU's memory."""
+        return vram_ledger.Ledger(gpu_key(self.engine.env), total_mib=total_mib, engine_total=total_mib > 0)
+
+    def _owner(self) -> int:
+        """The process whose ledger entry is the engine's: the engine's own (it outlives this server), or this server
+        for a daemon that did not say its engine's."""
+        return self.engine.pid if self.engine.pid is not None else os.getpid()
+
+    def _enter_ledger(self) -> None:
+        """After the engine's start (the caller holds the lock): what it holds entered in the ledger.  A daemon found
+        running whose entry the ledger does not have (an older server's, a ledger lost) is entered as in the base:
+        the device's report already shows it."""
+        try:
+            got = self.engine.ask("FREE", "FREE", 60)
+        except ImageJobFailed:
+            return
+        led = self.ledger(int(got.get("total_mib") or 0))
+        held = int(got.get("held_mib") or 0)
+        if led.find("image", self._owner()) is None and held > 0:
+            led.hold("image", held, self._owner(), in_base=self.engine.found, whole=True)
+
+    def ledger_sync(self) -> None:
+        """The engine's ledger entry set to what it holds now, its own report (FREE's held_mib: the image model's and
+        the image tools' models'), or removed when it holds nothing or has ended: the entry lives as long as the
+        engine holds VRAM, past the job and past this server."""
+        with self.lock:
+            led, owner = self.ledger(), self._owner()
+            held = 0
+            if self.engine.alive():
+                try:
+                    held = int(self.engine.ask("FREE", "FREE", 60).get("held_mib") or 0)
+                except ImageJobFailed:
+                    held = 0
+            eid = led.find("image", owner)
+            if held > 0:
+                led.hold("image", held, owner, whole=True)
+            elif eid is not None:
+                led.releasing(eid)
+                led.remove(eid)
 
     def ids(self, job: dict) -> list[int]:
         if self.tok is None:
@@ -3377,9 +3425,14 @@ class ImageGen:
 
     def total_mib(self) -> int:
         """The image GPU's memory, as the engine sees it."""
+        return int(self.memory().get("total_mib") or 0)
+
+    def memory(self) -> dict:
+        """The engine's FREE: the device's free VRAM (free_mib), all the engine holds (held_mib) and the GPU's memory
+        (total_mib), in MiB."""
         with self.lock:
             self._ready()
-            return int(self.engine.ask("FREE", "FREE", 60).get("total_mib") or 0)
+            return self.engine.ask("FREE", "FREE", 60)
 
     def takes_w8(self) -> bool | None:
         """Whether the image GPU takes the image DiTs' 8-bit form (W8A8), as the engine times it once a GPU (W8): None
@@ -3408,6 +3461,7 @@ class ImageGen:
                     self.engine.ask("RELEASE ALL" if everything else "RELEASE", "RELEASE", 120)
                 except ImageJobFailed as e:
                     self._say(f"image engine: release failed ({e})")
+        self.ledger_sync()
 
     def close(self, shutdown: bool = False) -> None:
         """Leave the image daemon (it stays, warm, for the next server: a model switch); `shutdown`: end it."""
@@ -5018,36 +5072,33 @@ class ImageTools:
 
 
 # ------------------------------------------------------------------------------------------- the GPU turn
-def ledger_fit(gen: ImageGen, need: dict, job: dict | None = None) -> tuple:
+def ledger_fit(gen: ImageGen, need: dict, job: dict | None = None) -> int:
     """The image engine's budget within the GPU's VRAM ledger (serve/vram_ledger.py, shared with the translation
     engine): what it may take besides what it holds is the ledger's room (an engine of the ledger's may hold VRAM the
-    device's report does not show yet), and that much is entered for the job, with when it should end (the speed
-    measured: ImageGen.estimate_s) -> (budget, ledger, entry id or None)."""
+    device's report does not show yet), and its entry (ImageGen.ledger_sync's) set to the budget for the job, with when
+    it should end (the speed measured: ImageGen.estimate_s) -> the budget.  The free VRAM is read now, after the text
+    engine made room (`need`'s was read before)."""
     try:
-        total = gen.total_mib()
+        got = gen.memory()
     except ImageJobFailed:
-        total = 0
-    led = vram_ledger.Ledger(gpu_key(gen.engine.env), margin_mib=vram_ledger.device_margin_mib(total))
-    free = int(need.get("free_mib") or 0)
+        got = {}
+    led = gen.ledger(int(got.get("total_mib") or 0))
+    free = int(got.get("free_mib", need.get("free_mib")) or 0)
+    held = int(got.get("held_mib", need.get("held_mib")) or 0)
+    owner = gen._owner()
+    if held > 0:          # what it holds now, before the room is read: its own MiB are not room for it
+        led.hold("image", held, owner, whole=True)
     room = led.room(free)
     extra = max(0, free - gen.reserve - room) if room is not None else 0
     budget = gen.fit(extra)
-    take = max(0, budget - int(need.get("held_mib") or 0))
     est = None
     if job is not None and not job.get("aux") and not job.get("video"):
         with contextlib.suppress(KeyError, TypeError, ValueError, ZeroDivisionError):
             est = gen.estimate_s(job)
-    eid = led.reserve(take, "image", free, until=time.time() + est if est else None) if take else None
-    if eid is not None:
-        led.allocated(eid)
-    return budget, led, eid
-
-
-def ledger_done(led, eid) -> None:
-    """The job's ledger entry given back, after the engine let go of what it does not keep."""
-    if led is not None and eid is not None:
-        led.releasing(eid)
-        led.remove(eid)
+    if budget > 0:
+        led.hold("image", max(budget, held), owner, exact=False, until=time.time() + est if est else None,
+                 whole=True)
+    return budget
 
 
 def resolve_policy(svc, gen: ImageGen, need: dict) -> str:
@@ -5615,9 +5666,8 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
                                 time.sleep(0.25)
                         with svc.status_lock:
                             svc.status.update(busy=True, phase="generating an image", started=time.time())
-                led = eid = None
                 try:
-                    budget, led, eid = ledger_fit(gen, need, job)
+                    budget = ledger_fit(gen, need, job)
                     gen._say(f"image job: {policy}, the image engine's budget {budget} MiB (the DiT resident from "
                              f"{need['full_mib']} MiB, at least {need['least_mib']} MiB)")
                     gen.yield_turn = yield_turn
@@ -5625,7 +5675,7 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
                 finally:
                     gen.yield_turn = None
                     _give_back(svc, gen, policy, restore)
-                    ledger_done(led, eid)
+                    gen.ledger_sync()
                     with svc.status_lock:
                         svc.status["busy"] = False
                     svc.last_request_at = time.time()
@@ -5645,21 +5695,44 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
                 svc.status["queued"] -= 1
 
 
-def helper_borrow(svc, card: str, holder, say, cancel: threading.Event | None = None) -> bool:
+def _helper_ledger(svc, card_env: dict | None, r: dict | None) -> None:
+    """The text engine's helper cache in its card's VRAM ledger (serve/vram_ledger.py; `card_env` the borrower's
+    environment, which names the card as the image and translation engines' ledgers do): its entry, under the text
+    engine's pid, set to what the engine says the cache holds after HELPER (`r`; None: before the first, its INFO's
+    helper_mib).  The cache was on the card before the ledger knew of it: it is entered as in the base, so what it
+    gives back is room and what it takes back charged."""
+    pid = getattr(getattr(svc.engine, "proc", None), "pid", None)
+    if card_env is None or pid is None:
+        return
+    led = vram_ledger.Ledger(gpu_key(card_env))
+    if r is None:
+        mib = (getattr(svc.engine, "info", None) or {}).get("helper_mib")
+        if isinstance(mib, int) and led.find("helper", pid) is None:
+            led.hold("helper", mib, pid, in_base=True)
+    elif isinstance(r.get("held_mib"), int) and led.find("helper", pid) is not None:
+        led.hold("helper", r["held_mib"], pid)
+
+
+def helper_borrow(svc, card: str, holder, say, cancel: threading.Event | None = None,
+                  card_env: dict | None = None) -> bool:
     """Before work on the text engine's helper card (`card`; an image job's, the translation engine's): the helper
     closed (`HELPER off`, the service's turn for that command alone), so the card is the work's; the text engine
     decodes on its first card meanwhile.  `holder` counts the borrowers (helper_lock, helper_jobs: the image models',
-    which the translation engine shares, so the helper stays closed until both are done); `say` writes a log line.
-    False where the engine runs no helper there (it chose its first card alone: the card is free)."""
+    which the translation engine shares, so the helper stays closed until both are done); `say` writes a log line;
+    `card_env` the borrower's environment, for the card's VRAM ledger (_helper_ledger).  False where the engine runs
+    no helper there (it chose its first card alone: the card is free)."""
     eng = svc.engine
     info = getattr(eng, "info", None) or {}
     if not card or str(info.get("helper_pci", "")).lower() != card or not hasattr(eng, "helper"):
         return False
     with holder.helper_lock:
         holder.helper_jobs += 1
+        holder.helper_env = card_env
     try:
         with svc._turn(cancel):
+            _helper_ledger(svc, card_env, None)
             r = eng.helper(False)
+            _helper_ledger(svc, card_env, r)
         say(f"the text model's helper GPU handed over ({r.get('vram_free_mib', '?')} MiB free there, "
             f"{r.get('ms', '?')} ms)")
     except Exception as e:                       # noqa: BLE001 - the work still runs, on what the card has free
@@ -5675,18 +5748,18 @@ def helper_return_later(svc, holder, say) -> None:
         holder.helper_jobs -= 1
 
     def reopen():
-        time.sleep(HELPER_REOPEN_S)
         with holder.helper_lock:
             if holder.helper_jobs > 0:
                 return
             try:
                 with svc._turn():
                     r = svc.engine.helper(True)
+                    _helper_ledger(svc, getattr(holder, "helper_env", None), r)
                 say(f"the text model's helper GPU filled again ({r.get('experts', '?')} experts, "
                     f"{r.get('ms', '?')} ms)")
             except Exception as e:               # noqa: BLE001 - the text engine decodes on its first card meanwhile
                 say(f"the text model's helper GPU was not filled again ({e})")
-    threading.Thread(target=reopen, daemon=True, name="helper-reopen").start()
+    idle_watch.watch.add(HELPER_REOPEN_S, reopen)
 
 
 @contextlib.contextmanager
@@ -5707,24 +5780,27 @@ def separate_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None 
         if _qimage().family_capabilities(gen.family).get("chat_text_states"):
             with svc._turn(cancel):
                 text_states(svc, gen, job)
-        try:
-            need = gen.need(job)
-        except ImageJobFailed:
-            gen.totals["failed"] += 1
-            raise
-        check_room(need, ram_available_mib())
+        # the helper handed over before the NEED: the free VRAM it reads, and the ledger's base taken from it, are the
+        # card's without the helper's cache
         handed = helper_borrow(svc, getattr(models, "helper_card", ""), models, lambda m: gen._say("image job: " + m),
-                               cancel)
-        led = eid = None
+                               cancel, gen.engine.env)
         try:
-            budget, led, eid = ledger_fit(gen, need, job)
-            gen._say(f"image job: separate, the image engine's budget {budget} MiB on its own GPU (the DiT resident "
-                     f"from {need['full_mib']} MiB, at least {need['least_mib']} MiB)")
-            yield "separate"
+            try:
+                need = gen.need(job)
+            except ImageJobFailed:
+                gen.totals["failed"] += 1
+                raise
+            check_room(need, ram_available_mib())
+            try:
+                budget = ledger_fit(gen, need, job)
+                gen._say(f"image job: separate, the image engine's budget {budget} MiB on its own GPU (the DiT "
+                         f"resident from {need['full_mib']} MiB, at least {need['least_mib']} MiB)")
+                yield "separate"
+            finally:
+                _give_back(svc, gen, "separate", None)
+                gen.ledger_sync()
+                svc.last_request_at = time.time()
         finally:
-            _give_back(svc, gen, "separate", None)
-            ledger_done(led, eid)
-            svc.last_request_at = time.time()
             if handed:
                 helper_return_later(svc, models, lambda m: gen._say("image jobs done: " + m))
     except BaseException as e:

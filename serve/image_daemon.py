@@ -33,6 +33,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from serve import line_process  # noqa: E402
+from serve import idle_watch  # noqa: E402
 
 ANSWERS = {"IMG": ("IMAGE",), "NEED": ("NEED",), "FREE": ("FREE",), "W8": ("W8",), "FIT": ("BUDGET",),
            "BUDGET": ("BUDGET",), "RELEASE": ("RELEASE",), "RATIO": ("RATIO",), "DETECT": ("DETECT",),
@@ -75,7 +76,9 @@ class Daemon:
             if line is None:
                 raise RuntimeError(f"the image engine ended (exit code {self.proc.poll()})")
             if line.startswith("READY"):
-                self.ready = line
+                # the engine's pid: a server enters the engine's VRAM in the GPU's ledger under it (vram_ledger.py), so
+                # the entry lasts while the engine holds the memory, whichever server asked for it
+                self.ready = f"{line} pid={self.proc.pid}"
                 self.say(f"image engine ready in {time.monotonic() - t0:.1f} s: {line}")
                 return
 
@@ -239,14 +242,18 @@ def main() -> int:
                 conn.settimeout(None)
             threading.Thread(target=d.client, args=(conn,), daemon=True).start()
     threading.Thread(target=accept, daemon=True).start()
-    while not d.done.is_set():
+
+    def check_idle():
         if d.proc is None or d.proc.poll() is not None:
             d.say("the image engine ended")
-            break
-        if d.clients == 0 and d.owner is None and time.monotonic() - d.last > d.idle:
+            d.done.set()
+        elif d.clients == 0 and d.owner is None and time.monotonic() - d.last > d.idle:
             d.say(f"no client for {d.idle:g} s: ending")
-            break
-        d.done.wait(1.0)
+            d.done.set()
+    check_idle()
+    if not d.done.is_set():
+        idle_watch.watch.add(1.0, check_idle, repeat=True)
+        d.done.wait()
     with contextlib.suppress(OSError):
         srv.close()
     if os.name != "nt" or token is not None:

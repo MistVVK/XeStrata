@@ -754,6 +754,15 @@ def free_vram_mib(gpu_pci=None):
     return int((r["mem_total"] - r["mem_used"]) >> 20)
 
 
+def total_vram_mib(gpu_pci=None):
+    """Total VRAM on the selected card in MiB, or None when it cannot be read."""
+    g = _gpu(gpu_pci)
+    if not g.ok():
+        return None
+    total = g.read().get("mem_total")
+    return int(total >> 20) if total is not None else None
+
+
 # ------------------------------------------------------------------------------------------------ CPU / RAM
 def _cpu_name():
     if os.path.exists("/proc/cpuinfo"):

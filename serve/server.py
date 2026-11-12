@@ -102,6 +102,7 @@ from serve import loras as lora_api  # noqa: E402
 from serve import translate as translate_mod  # noqa: E402
 from serve import translate_api  # noqa: E402
 from serve import vram_ledger  # noqa: E402
+from serve import idle_watch  # noqa: E402
 from serve import line_process  # noqa: E402
 from serve.line_process import end_gpu_process, popen  # noqa: E402
 
@@ -978,6 +979,7 @@ class StrataEngine:
     last_err: str | None = None          # #997: an ERR that was its last stdout line (death_note says it)
     batch = 0                            # --batch: the engine's batch slots (0: one request at a time)
     kept_arena: "KeptArena | None" = None   # main() sets it: the experts' arena kept across an image job's unload
+    ledger_key: str | None = None           # main() sets it: its card's VRAM ledger (image, translation)
     eos_ids = EOS_IDS                    # the tokens that end a reply (Service sets the model's: stop_token_ids)
 
     # `last`: the figures of the engine's last DONE line.  With batch slots several requests run at once, each on its
@@ -1375,6 +1377,7 @@ class StrataEngine:
         proc = self.proc
         if not self.alive() or proc is None or proc.stdin is None:
             raise EngineDied("the engine is not running")
+        self._ledger_cache(None)
         proc.stdin.write("VRAM" + ("" if reserve_mib is None else f" {int(reserve_mib)}") + "\n")
         proc.stdin.flush()
         deadline = time.time() + timeout
@@ -1395,9 +1398,28 @@ class StrataEngine:
                     out[k] = int(v) if v.lstrip("-").isdigit() else v
                 self.info.update({k: out[k] for k in ("expert_slots", "vram_free_mib") if k in out})
                 self.info["vram"] = out
+                self._ledger_cache(out)
                 return out
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
+
+    def _ledger_cache(self, out: dict | None) -> None:
+        """The expert cache in its card's VRAM ledger (serve/vram_ledger.py; ledger_key, set where the server's image or
+        translation engine may share the card): its entry, under the engine's pid, set to the MiB the VRAM answer `out`
+        says the cache maps.  Before the process's first answer (None) it is entered as in the base at its size at the
+        start: the cache was on the card before the ledger knew of it, so what it gives back is room and what it takes
+        back charged."""
+        key, pid = getattr(self, "ledger_key", None), getattr(self.proc, "pid", None)
+        if not key or pid is None:
+            return
+        led = vram_ledger.Ledger(key)
+        with contextlib.suppress(OSError):
+            if out is None:
+                mib = self.info.get("expert_cache_mib")    # the start's INFO: no VRAM answer yet from this process
+                if isinstance(mib, int) and led.find("text", pid) is None:
+                    led.hold("text", mib, pid, in_base=True)
+            elif isinstance(out.get("expert_cache_mib"), int) and led.find("text", pid) is not None:
+                led.hold("text", out["expert_cache_mib"], pid)
 
     def helper(self, on: bool, timeout: float = 120.0) -> dict:
         """`HELPER off|on` between requests (the caller holds the service's FIFO): the helper GPU's expert cache closed,
@@ -3162,7 +3184,7 @@ class Translation:
         self.entry_mib = 0
         self.partial = False                             # started with blocks on the CPU for want of room
         self.rates: dict = {"whole": None, "part": None}   # tokens a second (read and written), measured
-        threading.Thread(target=self._idle_stop, daemon=True, name="xestrata-translate-idle").start()
+        idle_watch.watch.add(min(30.0, max(1.0, self.idle_s / 4)), self._idle_stop, repeat=True)
 
     def args(self) -> list:
         # no conversation cache: a translation is one request, never continued (the engine sized 8 GiB of RAM for it)
@@ -3206,6 +3228,28 @@ class Translation:
     def _env(self) -> dict:
         return dict(self.env or os.environ)
 
+    def _ledger(self) -> vram_ledger.Ledger:
+        env = self._env()
+        pci = envvars.get("GPU_PCI", env=env)
+        total = None
+        # Without a PCI address, a runtime selector may make its first GPU differ from telemetry's first GPU.
+        selectors = ("CUDA_VISIBLE_DEVICES", "ONEAPI_DEVICE_SELECTOR", "HIP_VISIBLE_DEVICES", "ZE_AFFINITY_MASK")
+        if pci or not any(env.get(name) for name in selectors):
+            try:
+                from serve.telemetry import total_vram_mib
+                total = total_vram_mib(pci)
+            except (OSError, ValueError):
+                pass
+        limit = envvars.get("VRAM_LIMIT_MIB", env=env)
+        if total is not None and limit:
+            try:
+                limit_mib = int(limit)
+                if limit_mib > 0:
+                    total = min(total, limit_mib)
+            except ValueError:
+                pass
+        return vram_ledger.Ledger(images_api.gpu_key(env), total_mib=total or 0)
+
     def _say(self, words: str) -> None:
         print(f"[xestrata] translation: {words}", flush=True)
 
@@ -3227,7 +3271,7 @@ class Translation:
         most).  An image engine idle on the card, kept warm after its job, is asked to let go of its VRAM."""
         if self.gpu == "cpu" or (self.engine is not None and self.engine.alive() and not self.partial):
             return
-        led = vram_ledger.Ledger(images_api.gpu_key(self._env()))
+        led = self._ledger()
         need = self.need_mib()
         room = led.room(None)
         own = self.entry_mib if self.engine is not None and self.engine.alive() else 0
@@ -3284,9 +3328,10 @@ class Translation:
         args = self.args()
         need, cap = self.need_mib(), None
         if self.helper_card and self.svc is not None:   # the text model's helper card: closed while the engine runs
-            self.borrowed = images_api.helper_borrow(self.svc, self.helper_card, self._helper_holder(), self._say)
+            self.borrowed = images_api.helper_borrow(self.svc, self.helper_card, self._helper_holder(), self._say,
+                                                     card_env=env)
         if self.gpu != "cpu":
-            self.ledger = vram_ledger.Ledger(images_api.gpu_key(env))
+            self.ledger = self._ledger()
             cap = self.ledger.room(None)
             if cap is not None:
                 args += ["--vram-free-mib", str(cap)]
@@ -3308,17 +3353,15 @@ class Translation:
         self.error = None
 
     def _idle_stop(self) -> None:
-        while True:
-            time.sleep(min(30.0, max(1.0, self.idle_s / 4)))
-            if self.engine is None or time.time() - self.last_used < self.idle_s:
-                continue
-            if self.lock.acquire(blocking=False):
-                try:
-                    if self.engine is not None and time.time() - self.last_used >= self.idle_s:
-                        print("[xestrata] translation: the model is idle, stopping it", flush=True)
-                        self._stop()
-                finally:
-                    self.lock.release()
+        if self.engine is None or time.time() - self.last_used < self.idle_s:
+            return
+        if self.lock.acquire(blocking=False):
+            try:
+                if self.engine is not None and time.time() - self.last_used >= self.idle_s:
+                    print("[xestrata] translation: the model is idle, stopping it", flush=True)
+                    self._stop()
+            finally:
+                self.lock.release()
 
     def translate(self, prompts: list, sampling: dict | None = None, max_tokens: int | None = None,
                   cancel: threading.Event | None = None, on_text=None) -> list:
@@ -4359,6 +4402,21 @@ class Service:
         free1 = self.free_vram_mib()
         took = f", {free0 - free1} MiB of VRAM" if free0 is not None and free1 is not None else ""
         print(f"[xestrata] images: the image encoder started in {time.time() - t0:.1f} s{took}", flush=True)
+        self._ledger_vision()
+
+    def _ledger_vision(self) -> None:
+        """An elastic encoder started on the text engine's card: its elastic_mib entered in the card's VRAM ledger
+        (serve/vram_ledger.py) under its pid, until it stops; the expert cache's give-back for it is the cache's entry
+        (StrataEngine._ledger_cache)."""
+        v, key = self.vision, getattr(self.engine, "ledger_key", None)
+        if v is None or not key or v.proc is None or "--gpu" not in [str(a) for a in v.spawn[0]]:
+            return
+        args, proc = [str(a) for a in v.spawn[0]], v.proc
+        pci = args[args.index("--gpu-pci") + 1].lower() if "--gpu-pci" in args[:-1] else ""
+        if pci and pci != str(getattr(self, "gpu_pci", "") or "").lower():
+            return                                       # a card of its own
+        with contextlib.suppress(OSError):
+            vram_ledger.Ledger(key).hold("vision", v.elastic_mib, proc.pid, exact=False)
 
     def _vision_idle_down(self, force: bool = False) -> str:
         """An elastic encoder idle for elastic_idle_s (or force) stops, and the expert cache takes its VRAM back:
@@ -4394,14 +4452,12 @@ class Service:
               f"{v.elastic_idle_s:g} s without one; while it runs the expert cache keeps {v.elastic_mib} MiB free "
               "for it", flush=True)
 
-        def loop():
-            while True:
-                time.sleep(max(1.0, min(30.0, v.elastic_idle_s / 4)))
-                try:
-                    self._vision_idle_down()
-                except Exception as e:                 # tried again at the next turn; the thread keeps running
-                    print(f"[xestrata] images: stopping the idle image encoder: {e}", flush=True)
-        threading.Thread(target=loop, daemon=True).start()
+        def check():
+            try:
+                self._vision_idle_down()
+            except Exception as e:                     # tried again at the next turn
+                print(f"[xestrata] images: stopping the idle image encoder: {e}", flush=True)
+        idle_watch.watch.add(max(1.0, min(30.0, v.elastic_idle_s / 4)), check, repeat=True)
 
     def free_vram_mib(self) -> int | None:
         """Free VRAM on the engine's GPU (an Intel card by PCI address, read through Level Zero's sysman);
@@ -4636,14 +4692,12 @@ class Service:
             return
         print(f"[xestrata] the model unloads after {self.idle_unload_s} s without requests", flush=True)
 
-        def loop():
-            while True:
-                time.sleep(max(1.0, min(30.0, self.idle_unload_s / 4)))
-                try:
-                    self.unload(idle_for=self.idle_unload_s)
-                except EngineStuck as e:                # tried again at the next turn; the thread keeps running
-                    print(f"[xestrata] idle unload: {e}", flush=True)
-        threading.Thread(target=loop, daemon=True).start()
+        def check():
+            try:
+                self.unload(idle_for=self.idle_unload_s)
+            except EngineStuck as e:                    # tried again at the next turn
+                print(f"[xestrata] idle unload: {e}", flush=True)
+        idle_watch.watch.add(max(1.0, min(30.0, self.idle_unload_s / 4)), check, repeat=True)
 
     def set_shared(self, defaults) -> dict:
         """The Chat settings every client gets for what it leaves out; {} / None = clients use their own again."""
@@ -11360,6 +11414,7 @@ def main() -> int:
             engine = StrataEngine(exe, eargs, cwd=cfg.get("cwd"), log=cfg.get("log"), env=env, lazy=lazy,
                                   fds=(kept.fd,) if kept is not None and kept.fd is not None else ())
             engine.kept_arena = kept                    # an attribute of its own: restart() keeps it
+            engine.ledger_key = images_api.gpu_key(env)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"), engine.info.get("experts_ram"))
         note = None if groups or split_serve else desktop_vram_note(amd_card(cfg.get("gpu_pci")),

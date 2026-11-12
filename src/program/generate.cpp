@@ -8788,6 +8788,7 @@ int main(int argc, char** argv) {
                 .add("script_table", o.batch == 0 ? 1 : 0)
                 .add("helper_pci", drive.d.remote_count > 0
                                        ? strata::core::device_info(drive.d.remote[0]->device()).pci.c_str() : "none")
+                .add("helper_mib", drive.d.remote_count > 0 ? (long long) (drive.d.remote[0]->gib() * 1024.0) : 0LL)
                 .print();
         }
         strata::core::start_serve_watchdog();   // the three engines' one (strata/core/watchdog.hpp)
@@ -9929,9 +9930,12 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "xestrata serve: helper GPU %s: %s in %.0f ms\n", on ? "on" : "off",
                                  on ? "its cache filled from the RAM copy" : "its cache closed",
                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
-                    std::printf("HELPER %s experts=%lld vram_free_mib=%lld ms=%.0f\n", on ? "on" : "off",
-                                (long long) (drive.d.remote_count > 0 ? remote_experts[0].resident() : 0),
-                                (long long) (hf >> 20), std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    // held_mib: the helper's cache on its card, what the server's VRAM ledger of that card enters
+                    const bool open = drive.d.remote_count > 0;
+                    std::printf("HELPER %s experts=%lld vram_free_mib=%lld held_mib=%lld ms=%.0f\n", on ? "on" : "off",
+                                (long long) (open ? remote_experts[0].resident() : 0), (long long) (hf >> 20),
+                                (long long) (open ? (int64_t) (remote_experts[0].gib() * 1024.0) : 0),
+                                std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
                 }
                 std::fflush(stdout);
                 continue;
