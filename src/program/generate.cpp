@@ -7016,11 +7016,11 @@ int main(int argc, char** argv) {
             size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
             {
-                // under-pricing is what put layers on a card that could not hold them (#1238); a little over-pricing is
+                // under-pricing (past a few MiB of rounding) is what put layers on a card that could not hold them (#1238); a little over-pricing is
                 // by design (a granule per matrix runs ~0.8% high).  Past 5% the pricing has drifted from the loading.
                 const uint64_t took = before > fb ? (uint64_t) (before - fb) : 0;
                 const uint64_t priced = carve_bytes(st.lb, st.le);
-                if (priced < took || priced - took > took / 20) {
+                if (priced + (8ull << 20) < took || (priced > took && priced - took > took / 20)) {   // 8 MiB: the card reports its free memory in 2 MiB steps
                     std::fprintf(stderr, "strata generate: layer split, CUDA%d: WARNING the split search priced this "
                                          "stage's weights at %llu MiB, it took %llu MiB\n", st.dev,
                                  (unsigned long long) (priced >> 20), (unsigned long long) (took >> 20));
