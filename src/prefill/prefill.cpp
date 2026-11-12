@@ -5485,6 +5485,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const float* xsrc = m.mixed;
                         if (fz_staged) {
                             fz_staged_l = true;
+                            if (!use_mmq) {   // a fused-only layer (STRATA_PF_STAGED_FO=1): said once
+                                static bool said_fo = false;
+                                if (!said_fo) {
+                                    said_fo = true;
+                                    std::fprintf(stderr, "strata prefill: a layer with no MMQ tile reads prompt pieces below %lld tokens on the fused kernels' staged group "
+                                                         "entry, routed experts only (STRATA_PF_STAGED_FO=1)\n", (long long) stream_all_min());
+                                }
+                            }
                             fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
                         }
                         if (use_mmq || fz_staged) {   // (fz_staged without use_mmq: a fused-only layer behind STRATA_PF_STAGED_FO=1, staged_fo_rule.hpp; the block builds the group bounds)
