@@ -141,6 +141,19 @@ INSTALLER_METAL_TOOLS = ("metal_repack", "stream_experts")
 PROBE = "import jinja2, yaml, regex, psutil, requests, numpy, PIL, tqdm; print('deps ok')"
 
 
+def run_probe(py: Path, root: Path, code: str = PROBE) -> "subprocess.CompletedProcess[str]":
+    """Run the import probe with the bundled interpreter, from the bundle folder, without leaving anything in it.
+
+    The probe imports the runtime packages, which would write a __pycache__ folder next to every module it loads; those compiled files
+    would then be in the archive whenever the caller had not set PYTHONDONTWRITEBYTECODE itself, so the archive's file set depended on who
+    built it. The probe turns bytecode writing off for itself (the variable and -B).
+    """
+    env = {**os.environ, "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1"}
+    for k in ("PYTHONHOME", "PYTHONPATH"):
+        env.pop(k, None)
+    return subprocess.run([str(py), "-B", "-c", code], capture_output=True, text=True, cwd=str(root), env=env)
+
+
 def host_target() -> str:
     machine = platform.machine().lower()
     if sys.platform == "win32" and machine in ("amd64", "x86_64"):
@@ -444,10 +457,7 @@ def main() -> int:
             for cache_dir in list(root.rglob("__pycache__")):
                 shutil.rmtree(cache_dir, ignore_errors=True)
 
-        env = {**os.environ, "PYTHONNOUSERSITE": "1"}
-        for k in ("PYTHONHOME", "PYTHONPATH"):
-            env.pop(k, None)
-        probe = subprocess.run([str(py), "-c", PROBE], capture_output=True, text=True, cwd=str(root), env=env)
+        probe = run_probe(py, root)
         print("  " + (probe.stdout.strip() or probe.stderr.strip()[:200]))
         if not args.skip_deps and probe.returncode != 0:
             raise SystemExit("the bundled interpreter cannot import the runtime packages")

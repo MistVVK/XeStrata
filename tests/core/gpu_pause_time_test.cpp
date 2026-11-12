@@ -145,6 +145,33 @@ int main() {
           "strata serve: the graphics driver paused the GPU for 954 ms during this request while Linux moved memory "
           "the GPU uses; the request was slower by up to that much");
 
+    // the gap line: the same bar, from READY or the end of the previous request to the next request's begin
+    CHECK(gpu_pause_between_line(-1, 900).empty());                  // never idle yet / the read failed
+    CHECK(gpu_pause_between_line(100, -1).empty());
+    CHECK(gpu_pause_between_line(100, 50).empty());                  // a counter that went back (a new process): no line
+    CHECK(gpu_pause_between_line(1000, 1099).empty());
+    CHECK(gpu_pause_between_line(1000, 1100) ==
+          "strata serve: the graphics driver paused the GPU for 100 ms between requests while Linux moved memory the GPU uses");
+
+    // the bookkeeping over a sequence, as the request loop calls it
+    {
+        GpuPauseIdle idle;
+        CHECK(idle.begin(500).empty());                              // before READY was read: nothing to compare with
+        idle.idle(500);                                              // READY
+        CHECK(idle.begin(560).empty());                              // 60 ms before the first request: below the bar
+        idle.idle(900);                                              // the first request ended (it paused 340 ms inside: its own line)
+        CHECK(idle.begin(900).empty());                              // the next one began at once: no gap
+        idle.idle(950);                                              // it ended
+        CHECK(idle.begin(1450) ==                                    // 500 ms of driver pause while idle
+              "strata serve: the graphics driver paused the GPU for 500 ms between requests while Linux moved memory the GPU uses");
+        CHECK(idle.begin(1450) == idle.begin(1450));                 // begin() does not move the mark: only idle() does
+        idle.idle(-1);                                               // a failed read at an end: no gap is made from unrelated counters
+        CHECK(idle.begin(5000).empty());
+        idle.idle(5000);
+        CHECK(idle.begin(5099).empty());
+        CHECK(!idle.begin(5100).empty());
+    }
+
     if (failed) { std::fprintf(stderr, "gpu_pause_time_test: %d failed\n", failed); return 1; }
     std::printf("gpu_pause_time_test: ok\n");
     return 0;

@@ -114,5 +114,50 @@ class BundleImports(unittest.TestCase):
         self.assertIn("calibrate", pt.setup_tool_imports(ROOT))             # and the scan finds it anyway
 
 
+class ProbeLeavesNoBytecode(unittest.TestCase):
+    """The import probe of package_terminal.py must not write compiled files into the bundle, whoever runs the build."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="strata-probe-")
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "bundle"
+        self.root.mkdir()
+        (self.root / "probe_mod.py").write_text("VALUE = 7\n", encoding="utf-8")
+        self.code = "import probe_mod; print('probe ok', probe_mod.VALUE)"
+        self.saved = {k: os.environ.pop(k, None) for k in ("PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX")}
+        self.addCleanup(self.restore)
+
+    def restore(self):
+        for key, value in self.saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def leftovers(self, folder: Path):
+        return sorted(str(p.relative_to(folder)) for p in list(folder.rglob("__pycache__")) + list(folder.rglob("*.pyc")))
+
+    def test_the_check_itself_can_see_bytecode(self):
+        # without the protection the same import does leave a compiled file, so the test below proves something
+        plain = Path(self.temp.name) / "plain"
+        plain.mkdir()
+        (plain / "probe_mod.py").write_text("VALUE = 7\n", encoding="utf-8")
+        done = subprocess.run([sys.executable, "-c", self.code], cwd=str(plain), capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(self.leftovers(plain))
+
+    def test_the_probe_writes_no_bytecode_when_the_caller_did_not_ask_for_that(self):
+        done = pt.run_probe(Path(sys.executable), self.root, code=self.code)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("probe ok 7", done.stdout)
+        self.assertEqual(self.leftovers(self.root), [])
+
+    def test_the_probe_writes_no_bytecode_when_the_caller_asked_for_it(self):
+        os.environ["PYTHONDONTWRITEBYTECODE"] = ""        # an empty value means "write"
+        done = pt.run_probe(Path(sys.executable), self.root, code=self.code)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.leftovers(self.root), [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,12 +5,13 @@
     {
       "name": "cpu-check",
       "displayName": "CPU check build (no GPU, no network)",
-      "description": "The fast check: the CPU-only engine pieces and every test that needs no GPU and no model. STRATA_NATIVE_EXPERTS=OFF, so ggml is not needed. tools/check runs this preset.",
+      "description": "The fast check: the CPU-only engine pieces and every test that needs no GPU and no model, the conversation cache and park pool tests included. STRATA_NATIVE_EXPERTS=OFF, so ggml is not needed. tools/check runs this preset.",
       "generator": "Ninja",
       "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
         "STRATA_BUILD_TESTS": "ON",
+        "STRATA_BUILD_CONVERSATION_TESTS": "ON",
         "STRATA_NATIVE_EXPERTS": "OFF"
       }
     },

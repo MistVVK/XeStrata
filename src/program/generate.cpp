@@ -1758,6 +1758,9 @@ static int64_t gpu_pause_now() {
     return -1;
 #endif
 }
+/// The same counter when the engine last went idle (READY, then the end of every request): the next request's begin reports a pause that
+/// happened in between.  Only the request loop's thread touches it.
+static strata::core::GpuPauseIdle g_gpu_pause_idle;
 constexpr int64_t kVramSafeMib =
 #ifdef _WIN32
     1024;   // WDDM pages instead of failing (docs/DETAILS.md, the sysmem fallback): the line #2065 fell below
@@ -14455,6 +14458,7 @@ int main(int argc, char** argv) {
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
         strata::core::kfd_settle::settle_before_ready();   // integrated gfx11 under Linux: until the kernel has stopped moving the registered arena (nothing elsewhere)
         strata::core::manifest::instance().write("ready");   // STRATA_MANIFEST (a no-op unless it is set)
+        g_gpu_pause_idle.idle(gpu_pause_now());   // AMD on Linux: the gap before the first request starts here (the start-up's own pauses are not a "between")
         std::printf("READY %lld stop hold holdb\n", (long long) o.max_context);   // "stop": this engine honours STOP; "hold": GEN hold=N:ID; "holdb": the --batch slots end at the hold too (BDONE hold)
         std::fflush(stdout);
         std::string line;
@@ -15936,9 +15940,15 @@ int main(int argc, char** argv) {
                     strata::core::progress().busy.store(false);
                     strata::core::progress().allow_until_ms.store(0);
                     strata::core::progress_at("idle");
+                    g_gpu_pause_idle.idle(gpu_pause_now());   // the gap to the next request starts here, whichever way this one ended
                 }
             } busy_scope;
-            g_req_gpu_pause_ms.store(gpu_pause_now());   // AMD on Linux: the driver's GPU pause counter, once per request
+            {   // AMD on Linux: the driver's GPU pause counter, once per request; a pause since the engine went idle gets its own line
+                const int64_t pause_begin = gpu_pause_now();
+                const std::string gap_line = g_gpu_pause_idle.begin(pause_begin);
+                if (!gap_line.empty()) std::fprintf(stderr, "%s\n", gap_line.c_str());
+                g_req_gpu_pause_ms.store(pause_begin);
+            }
             {   // #2065: said, never changed - the free VRAM now (the verify windows' captures and the batch layouts
                 // eat into what startup reported), once per 128 MiB lower it gets
                 size_t vf_b = 0, vt_b = 0;

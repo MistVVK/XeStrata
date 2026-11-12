@@ -5,8 +5,8 @@
 // from the host, and counts the time per GPU in /sys/class/kfd/kfd/proc/<pid>/stats_<gpu id>/evicted_ms (whole ms
 // since the process opened the GPU).  On p620 (R9700) a slow prompt read lost about exactly that time while
 // background compaction moved pages (RESULTS-GH-URGENT.md, "GPU queue evictions from page migration"), and no log
-// showed it.  The engine reads the counter once when a request begins, once when it ends and in the stall report;
-// never on the hot path.
+// showed it.  The engine reads the counter at READY, once when a request begins, once when it ends (that read also starts the
+// gap to the next request) and in the stall report; never on the hot path.
 //
 // Header-only and without the GPU runtime, so the reader and the lines are tested on the CPU against a fake tree
 // (tests/core/gpu_pause_time_test.cpp).  A missing, unreadable or unexpected counter means "not available" (-1): no
@@ -108,5 +108,25 @@ inline std::string gpu_pause_request_line(int64_t at_start, int64_t at_end) {
     return "strata serve: the graphics driver paused the GPU for " + std::to_string(at_end - at_start) +
            " ms during this request while Linux moved memory the GPU uses; the request was slower by up to that much";
 }
+
+/// The per-gap line (no newline): the counter moved by at least kGpuPauseReportMs while the engine sat idle, between READY (or
+/// the end of the previous request) and the start of the next request.  "" when either read is not available or below the bar.
+/// Owner-approved wording (11-12, par\OWNER-WORDING-1111.md): the request line's words with "between requests" in place of
+/// "during this request" and no "slower" clause (nothing was running).  No word changes without a new approval.
+inline std::string gpu_pause_between_line(int64_t idle_from, int64_t at_begin) {
+    if (idle_from < 0 || at_begin < idle_from || at_begin - idle_from < kGpuPauseReportMs) return "";
+    return "strata serve: the graphics driver paused the GPU for " + std::to_string(at_begin - idle_from) +
+           " ms between requests while Linux moved memory the GPU uses";
+}
+
+/// The counter's value when the engine last went idle: at READY, and again at the end of every request (whichever way it ends).
+/// -1 until read, and again after a read that failed, so a failed read never makes a gap out of two unrelated counters.
+/// Touched only by the request loop's thread.
+struct GpuPauseIdle {
+    int64_t from = -1;
+    void idle(int64_t counter_now) { from = counter_now; }
+    /// A request begins with the counter at `counter_now`: the line for the gap since the engine went idle, or "".
+    std::string begin(int64_t counter_now) const { return gpu_pause_between_line(from, counter_now); }
+};
 
 }  // namespace strata::core
