@@ -147,7 +147,6 @@ restart. Defaults are off unless the table says otherwise.
 | `STRATA_SPLIT_OWN=1` or `auto` | Gives every card its own prompt buffers. `auto` does it only where the buffers are at most 12% of each card's VRAM. | Output differs from the default's (stable and coherent). |
 | `STRATA_PREFILL_HELP=1` | The idle card computes a share of the streamed experts of a one-chunk prompt. `STRATA_PREFILL_HELP_FRAC=f` fixes the share. | Helps prompts up to about 3.3K tokens on slow links only; not bit-identical; native packs on the MMQ prompt path only. |
 | `STRATA_SPLIT_MTP_BATCH=1` | The last card fills the draft layer's prompt K/V in batches, as on one card. | Needs a `--native` pack and a paged or ring draft K/V; says why once if it declines. |
-| `STRATA_STAGE_TRIM=1` | Each card loads only its own layers' dense weights (needs explicit `--layer-split K`, not `auto`). The freed VRAM goes to that card's expert cache. | Output can differ slightly. |
 | `--vram-reserve-later-mib N` | A separate VRAM reserve for the later cards (default: `--vram-reserve-mib`). Use it when the display sits on the last card. | `--vram-reserve-mib 300 --vram-reserve-later-mib 1800` gives the first card that VRAM. |
 | `--prefill-pipe R` (or `STRATA_PREFILL_PIPE=R`) | Reads each prompt in the chunk count with the least pipeline time for b/a = R tokens. `1` evens out today's chunk count. | Opt-in. `./setup.sh --calibrate` measures it per PC and writes it to the config. |
 | `STRATA_SPLIT_RING=N` | Sets the prompt path's streamed ring to N slots (`0`: the pinned-share rule). A split uses 96 when at least 75% of the (layer, expert) pairs sit in some card's cache. | The startup line `lend sizing: ...` shows the result. |
@@ -162,6 +161,12 @@ split's greedy output is the same in either mode.
 
 **Under WDDM (Windows and WSL2)** only 8 GiB of the expert arena is pinned on a multi-GPU run; the rest streams through the
 pinned staging ring. Linux pins the whole arena. `STRATA_ARENA_PIN_GIB=N` pins at most N GiB, `0` the whole arena, on any OS.
+
+### Turning a default off
+
+| Setting | What it does | Notes |
+| --- | --- | --- |
+| `STRATA_STAGE_TRIM=0` (or `--no-trim-stage-weights`) | Every card of a layer split keeps the dense weights of all the layers, as before. By default each card, explicit split or `auto`, loads only its own layers' dense weights and the freed VRAM goes to its expert cache. | Output can differ slightly from the default, which caches more experts. |
 
 ### Overlapped hand-off
 

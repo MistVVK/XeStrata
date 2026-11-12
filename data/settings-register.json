@@ -37344,9 +37344,9 @@
    "since": "v0.1.40.1",
    "last_commit": "ee0b367fb7",
    "last_date": "2026-11-03",
-   "status": "research",
+   "status": "rollback",
    "owner": "program",
-   "note": "[reviewed] Experimental split-stack flag; no change in report. [_issues_dump/2239.md:67]",
+    "note": "[reviewed] The trim of each card's dense weights to its own layers is the default with a layer split (PR 4522); =0 (or --no-trim-stage-weights) keeps every card's full copy. [_issues_dump/2239.md:67]",
    "retire_after": "",
    "retired_in": ""
   },
