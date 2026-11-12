@@ -109,6 +109,7 @@
 #include "strata/program/stage_reserve.hpp"
 #include "strata/program/split_walk.hpp"
 #include "strata/program/gpu_report.hpp"
+#include "strata/prefill/loan_rules.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include "strata/platform/host_limits.hpp"
 #include "strata/program/split_ring.hpp"
@@ -10020,6 +10021,16 @@ int main(int argc, char** argv) {
                                     : ((tokens + 255) / 256) * 256;
         return std::min(max_chunk, rounded);
     };
+    // The loan is sized from the walk the piece takes.  The chunk above is rounded UP to the 256 grid, but the walk is decided from
+    // the real token count (a piece below stream_all_min() walks staged), so a 999-token piece under a 1,024 floor was lent the
+    // streamed layout's 512-slot ring and fused buffers while it walked staged: 478 more experts streamed per prompt, 275 ms at 1,000
+    // tokens (RTX A6000).  Applies to every piece within 255 tokens under the floor (769-1,023 at 1,024; 2,817-3,071 under the CPU
+    // share's 3,072).  STRATA_PREFILL_LOAN_WALK=0 keeps the rounded chunk.
+    static const bool loan_by_walk = [] { const char* e = std::getenv("STRATA_PREFILL_LOAN_WALK"); return !(e != nullptr && e[0] == '0'); }();
+    auto loan_chunk = [&](int64_t tokens, int64_t chunk) -> int64_t {
+        return loan_by_walk ? strata::prefill::loan_rules::walk_chunk(tokens, chunk, strata::prefill::Prefill::stream_all_min_tokens())
+                            : chunk;
+    };
     // STRATA_PREFILL_EQUAL=1 (opt-in, PR #693): a segment of `tokens` reads in n = ceil(tokens / max_chunk) chunks of EQUAL
     // size (ceil(tokens / n) rounded up to 256) instead of full chunks and a short last one.  A chunk of
     // stream_all_min_tokens() or more streams every expert the GPU does not hold, whatever its length, so a prompt's cost
@@ -17623,7 +17634,7 @@ int main(int argc, char** argv) {
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
                 // prompt needs, so a large chunk costs a short prompt nothing
-                const int64_t want_full = planned_chunk(tokens, o.prefill_chunk, pf_plan_chunk);
+                const int64_t want_full = loan_chunk(tokens, planned_chunk(tokens, o.prefill_chunk, pf_plan_chunk));
                 // #340: a short enough request reads in the stages' own S-token chunks (nothing lent)
                 const int64_t want_seg = o.prefill_head_alias ? o.prefill_chunk
                                        : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
@@ -20683,7 +20694,7 @@ int main(int argc, char** argv) {
                     k = lend_slots(chunk);
                 }
             }
-            const int64_t request_sized = equal_chunk(n_batched, chunk);
+            const int64_t request_sized = loan_chunk(n_batched, equal_chunk(n_batched, chunk));
             if (k > 0 && request_sized < chunk) {                     // no bigger than this prompt segment needs
                 chunk = request_sized;
                 k = lend_slots(chunk);
