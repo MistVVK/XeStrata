@@ -196,13 +196,13 @@ class AKnownSetUnderAnotherName(unittest.TestCase):
             (Path(tmp) / n).write_bytes(b"x")
         return Path(tmp) / names[0]
 
-    def fake(self, tensors, payload, experts, arch="qwen4exp"):
-        """inspect_metadata of two shards: the totals are split between them."""
-        halves = iter(((tensors - tensors // 2, payload - payload // 2, experts), (tensors // 2, payload // 2, set())))
+    def fake(self, tensors, payload, experts, arch="qwen4exp", second_arch=None):
+        """inspect_metadata of two shards: the totals are split between them; the second shard of a real split set has no architecture key (seen on the real IQ3_S files)."""
+        halves = iter(((tensors - tensors // 2, payload - payload // 2, experts, arch), (tensors // 2, payload // 2, set(), second_arch)))
 
         def inspect(path):
-            t, p, e = next(halves)
-            return {"architecture": arch, "expert_tensor_types": sorted(e), "tensor_count_scanned": t, "payload_bytes_required": p}
+            t, p, e, a = next(halves)
+            return {"architecture": a, "expert_tensor_types": sorted(e), "tensor_count_scanned": t, "payload_bytes_required": p}
         return mock.patch("strata_control.models.inspect_metadata", side_effect=inspect)
 
     def test_the_header_of_a_set_names_it(self):
@@ -220,6 +220,10 @@ class AKnownSetUnderAnotherName(unittest.TestCase):
                 self.assertIsNone(models.known_set_by_header(first))
             with self.fake(self.ROW["tensors"], self.ROW["bytes"], experts, arch="llama"):
                 self.assertIsNone(models.known_set_by_header(first))
+            with self.fake(self.ROW["tensors"], self.ROW["bytes"], experts, second_arch="qwen4exp"):
+                self.assertEqual(models.known_set_by_header(first), "qwen/IQ3_S", "a later shard may name the architecture too")
+            with self.fake(self.ROW["tensors"], self.ROW["bytes"], experts, second_arch="llama"):
+                self.assertIsNone(models.known_set_by_header(first), "a later shard of another architecture")
             with mock.patch.object(models, "_candidate_by_layout", side_effect=AssertionError("the layout guess is never used")), self.fake(self.ROW["tensors"], self.ROW["bytes"] // 2, experts):
                 self.assertIsNone(models.known_set_by_header(first), "a file with the layout of a set is not that set")
             (Path(tmp) / "copy-00002-of-00002.gguf").unlink()

@@ -325,9 +325,10 @@ def known_set_by_header(first_shard: Any) -> str | None:
             shards = [path]
         tensors = payload = 0
         experts: set[str] = set()
-        for item in shards:
+        for number, item in enumerate(shards):
             inspected = inspect_metadata(item)
-            if inspected["architecture"] != "qwen4exp":
+            # the first shard names the architecture; a later shard of a split set (llama.cpp's gguf-split, Strata's own IQ3_S) carries tensors only: no architecture is no objection, another one is
+            if inspected["architecture"] != "qwen4exp" and (number == 0 or inspected["architecture"] is not None):
                 return None
             experts.update(inspected["expert_tensor_types"])
             tensors += inspected["tensor_count_scanned"]
