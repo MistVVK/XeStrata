@@ -395,6 +395,12 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(fused_tile_rule_test PRIVATE include)
   add_test(NAME fused_tile_rule_test COMMAND fused_tile_rule_test)
 
+  # whether the staged walk (chunks below 1,024 tokens) takes the batched group entry: on by default in a CUDA build, opt-in in a HIP build, STRATA_PF_FUSED=1 / =0 both ways
+  # (header-only, no GPU)
+  add_executable(staged_group_rule_test tests/prefill/staged_group_rule_test.cpp)
+  target_include_directories(staged_group_rule_test PRIVATE include)
+  add_test(NAME staged_group_rule_test COMMAND staged_group_rule_test)
+
   # whether the CUDA fused prompt kernels take the Gyro trellis experts by default (STRATA_PF_FUSED_TQ unset: the sm_86 cards with 80+ SMs; =1 any card; =0 off): the pure
   # rule, pinned for every card class (header-only, no GPU)
   add_executable(fused_tq_default_test tests/prefill/fused_tq_default_test.cpp)
