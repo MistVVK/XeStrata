@@ -2150,7 +2150,7 @@ struct DevInfo {
     bool q2n = false;   // sm_80+ with STRATA_PF_FUSED_Q2N=1: the native Q2_0 pack's Q2_0 gate/up is set up as well (opt-in)
     bool s120 = false;  // compute capability 12.0 (sm120_series.hpp): the default for the formats measured there
     bool s121 = false;  // GB10 (sm_121, DGX Spark): 128-row tiles win from 65,536 routed rows a launch up (pick_ww)
-    bool s86 = false;   // compute capability 8.6 (RTX A6000 / A40 / RTX 3090 class): the same default as s120 with 80+ SMs (STRATA_PF_FUSED_SM86=0 off)
+    bool s86 = false;   // the sm_86 rule class, compute capability 8.0 / 8.6 / 8.9 (RTX A6000 / A40 / RTX 3090 class; A100 and RTX 40 since 11-12): the same default as s120 with 80+ SMs (STRATA_PF_FUSED_SM86=0 off)
     int sms = 0, occ = 1;
     int occ_nt = 0;     // blocks per multiprocessor of the NT = 256 kernels (0: not set up)
     bool ws = false;    // STRATA_PF_FUSED_WS: the warp-specialized kernels are set up
@@ -2211,7 +2211,7 @@ bool q6k_cuda_requested() {
     return on;
 }
 // STRATA_PF_FUSED_TQ on CUDA (the rule is include/strata/prefill/fused_tq_default.hpp, pinned by tests/prefill/fused_tq_default_test.cpp): unset = the trellis kernels are
-// set up (dev_info) and native_supported takes Gyro-S's TQK6 / TQK7 layers on a compute capability 8.6 card with 80+ SMs (RTX A6000 class; the A6000 gate series is
+// set up (dev_info) and native_supported takes Gyro-S's TQK6 / TQK7 layers on a card of the sm_86 class (compute capability 8.6, and 8.0 / 8.9 since 11-12; fused_tile::s86_class) with 80+ SMs (RTX A6000 class; the A6000 gate series is
 // Gyro-S); "1" takes them on any sm_80+ card, and Gyro-M's TQ2_T / TQ2_T layers too (no gate series: they are never taken by default); any other value ("0") and every other card: MMQ.  The Hadamard rotations of a folded layer run inside
 // experts_native (set_down_rotation), the gate/up input arrives rotated.
 int tq_env() {
@@ -2336,9 +2336,9 @@ const DevInfo& dev_info() {
     cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
     d.s120 = strata::sm120_default(major, minor);   // (takes the raw attributes, as is_sm120 does)
     d.s121 = major == 12 && minor == 1;             // GB10 (DGX Spark): its own tile threshold, see pick_ww
-    // sm_86 (raw attributes, as s120): STRATA_PF_FUSED_SM86=0 is a diagnostic for bug reports (MMQ on these cards again); it goes with MMQ
+    // the sm_86 rule class (raw attributes, as s120; fused_tile::s86_class: compute capability 8.6, and since 11-12 8.0 and 8.9): STRATA_PF_FUSED_SM86=0 is a diagnostic for bug reports (MMQ on these cards again); it goes with MMQ
     static const bool sm86_off = [] { const char* v = std::getenv("STRATA_PF_FUSED_SM86"); return v != nullptr && v[0] == '0'; }();
-    d.s86 = major == 8 && minor == 6 && !sm86_off;
+    d.s86 = strata::prefill::fused_tile::s86_class(major, minor, sm86_off);
     major = strata::cc_major_of(major);   // STRATA_EMULATE_CC counts (tests)
     minor = strata::cc_minor_of(minor);
     cudaDeviceGetAttribute(&d.sms, cudaDevAttrMultiProcessorCount, dev);
@@ -2809,7 +2809,7 @@ bool native_supported(int gu_type, int d_type) {
         if (gu_type == T_Q2_0) { const DevInfo& d = dev_info(); return d.ok && d.q2n && d_type == T_Q2_0 && d_covered_on(d_type, d); }
         if (!strata::prefill::fused_tile::default_gate_format(gu_type)) return false;   // IQ2_XXS / IQ2_XS joined 11-12 (owner), see fused_tile_rule.hpp
         const DevInfo& d = dev_info();
-        // 12.0 and 8.6 cards with 80+ SMs (RTX PRO 5000 / 6000, RTX 5080 / 5090; RTX A6000 / A40, RTX 3090 / 3090 Ti / 3080 Ti) take every format of the default list;
+        // 12.0 and 8.6 cards with 80+ SMs (RTX PRO 5000 / 6000, RTX 5080 / 5090; RTX A6000 / A40, RTX 3090 / 3090 Ti / 3080 Ti), and since 11-12 8.0 and 8.9 cards (A100; RTX 4090 / 4080 Super, RTX 6000 Ada: the same code, no card run) take every format of the default list;
         // on an RTX 5070 (48 SMs, IQ2_XS pack, experts partly in RAM) the fused kernels were 4.7% slower on 20K prompts (0/6 pairs), so the 40-79 SM cards take only the staged launches below
         // (the unstaged formats keep MMQ there unless STRATA_PF_FUSED=1)
         // The sm_86 / sm_120 cards with 40-79 SMs (RTX A4000, RTX 5070 class) also take the launches with a staged gate/up kernel (IQ3_XXS / IQ3_S / IQ4_XS) and an IQ4_NL / Q2_0 down, by default since

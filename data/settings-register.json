@@ -24476,7 +24476,7 @@
    "last_date": "",
    "status": "research",
    "owner": "prefill",
-   "note": "CUDA diagnostic for bug reports, not a user setting: =0 puts compute capability 8.6 and 12.0 cards with 40-79 SMs back on MMQ for the IQ3_XXS / IQ3_S / IQ4_XS gate/up layers with an IQ4_NL or Q2_0 down (the fused prompt kernels are the default on those cards since 11-12; unset or =1 is the default; RTX A4000 end to end: prompt time MMQ / fused 1.000 / 1.003 / 1.028 / 1.012 at 2K / 4K / 8K / 20K). Goes away with MMQ (release C).",
+   "note": "CUDA diagnostic for bug reports, not a user setting: =0 puts compute capability 8.0, 8.6, 8.9 and 12.0 cards with 40-79 SMs back on MMQ for the IQ3_XXS / IQ3_S / IQ4_XS gate/up layers with an IQ4_NL or Q2_0 down (the fused prompt kernels are the default on those cards since 11-12, on 8.0 and 8.9 by the same code with no card of those two run; unset or =1 is the default; RTX A4000 end to end: prompt time MMQ / fused 1.000 / 1.003 / 1.028 / 1.012 at 2K / 4K / 8K / 20K). Goes away with MMQ (release C).",
    "retire_after": "",
    "retired_in": ""
   },
@@ -24550,7 +24550,7 @@
    "last_date": "",
    "status": "research",
    "owner": "prefill",
-   "note": "CUDA diagnostic for bug reports, not a user setting: =0 puts compute capability 8.6 cards with 80+ SMs back on MMQ for the default list's gate/up formats (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS; the fused prompt kernels are the default there since 11-11, IQ2_XXS / IQ2_XS since 11-12). Goes away with MMQ (release C).",
+   "note": "CUDA diagnostic for bug reports, not a user setting: =0 puts compute capability 8.0, 8.6 and 8.9 cards (the sm_86 class) back on MMQ for the default list's gate/up formats (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS; the fused prompt kernels are the default on 8.6 cards with 80+ SMs since 11-11, IQ2_XXS / IQ2_XS since 11-12, and on 8.0 and 8.9 cards since 11-12 by the same code with no card of those two run). Goes away with MMQ (release C).",
    "retire_after": "",
    "retired_in": ""
   },
@@ -24630,7 +24630,7 @@
    "last_date": "",
    "status": "research",
    "owner": "prefill",
-   "note": "[DRAFT] CUDA and HIP gfx12 (phase 4): the Gyro trellis experts (TQK6 / TQK7, TQ2_T / TQ2_T), Hadamard-folded layers included, on the fused native kernels instead of MMQ. CUDA, unset: Gyro-S (TQK6 / TQK7) on compute capability 8.6 cards with 80+ SMs (RTX A6000 class; include/strata/prefill/fused_tq_default.hpp, tests/prefill/fused_tq_default_test.cpp), a diagnostic switch for bug reports, not a user setting; =1: Gyro-S and Gyro-M (TQ2_T / TQ2_T, no gate series) on any sm_80+ card and, on HIP, on gfx1200 / gfx1201 (HIP stays opt-in, default off); =0: MMQ again. STRATA_PF_FUSED_SM86=0 turns the sm_86 default off too. Goes with MMQ in release C.",
+   "note": "[DRAFT] CUDA and HIP gfx12 (phase 4): the Gyro trellis experts (TQK6 / TQK7, TQ2_T / TQ2_T), Hadamard-folded layers included, on the fused native kernels instead of MMQ. CUDA, unset: Gyro-S (TQK6 / TQK7) on compute capability 8.0, 8.6 and 8.9 cards with 80+ SMs (RTX A6000 class, gated on the 8.6 A6000 only; 8.0 and 8.9 by the same code since 11-12, no card of those two run; include/strata/prefill/fused_tq_default.hpp, tests/prefill/fused_tq_default_test.cpp), a diagnostic switch for bug reports, not a user setting; =1: Gyro-S and Gyro-M (TQ2_T / TQ2_T, no gate series) on any sm_80+ card and, on HIP, on gfx1200 / gfx1201 (HIP stays opt-in, default off); =0: MMQ again. STRATA_PF_FUSED_SM86=0 turns the sm_86 default off too. Goes with MMQ in release C.",
    "retire_after": "",
    "retired_in": ""
   },

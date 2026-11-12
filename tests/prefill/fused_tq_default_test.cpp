@@ -1,5 +1,5 @@
-// the default rule of the CUDA fused trellis (Gyro) prompt kernels (include/strata/prefill/fused_tq_default.hpp): unset = on for a compute capability 8.6 card with 80+ SMs,
-// off for every other class; =1 forces on, any other value off.  No GPU, no model.
+// the default rule of the CUDA fused trellis (Gyro) prompt kernels (include/strata/prefill/fused_tq_default.hpp): unset = on for a card of the sm_86 class (compute capability 8.6, and
+// 8.0 / 8.9 since 11-12: fused_tile_rule.hpp s86_class, tested with the capability in fused_tile_rule_test) with 80+ SMs, off for every other class; =1 forces on, any other value off.  No GPU, no model.
 #include <cstdio>
 
 #include "strata/prefill/fused_tq_default.hpp"
@@ -20,8 +20,8 @@ int main() {
     // unset: the sm_86 cards with 80+ SMs take the trellis kernels (A6000 / A40 84, 3090 Ti 84, 3090 82, 3080 Ti 80) ...
     const int unset = parse_env(nullptr);
     CHECK(on(unset, true, 84) && on(unset, true, 82) && on(unset, true, 80));
-    // ... and nothing else does: RTX 3080 (68), A10 (72), A4000 (48) on sm_86 below 80 SMs; sm_120 cards (5070 48, 5080 84, PRO 5000 110, PRO 6000 188), GB10, sm_80 / 89 / 90
-    // (s86 false) whatever their SM count
+    // ... and nothing else does: RTX 3080 (68), A10 (72), A4000 (48) on sm_86 below 80 SMs; sm_120 cards (5070 48, 5080 84, PRO 5000 110, PRO 6000 188), GB10, sm_90 / 8.7
+    // (s86 false: outside the sm_86 class) whatever their SM count
     CHECK(!on(unset, true, 79) && !on(unset, true, 72) && !on(unset, true, 68) && !on(unset, true, 48));
     CHECK(!on(unset, false, 48) && !on(unset, false, 84) && !on(unset, false, 110) && !on(unset, false, 188) && !on(unset, false, 108) && !on(unset, false, 128));
     // STRATA_PF_FUSED_SM86=0 makes DevInfo::s86 false: the A6000 class is back on MMQ
