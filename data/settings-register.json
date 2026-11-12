@@ -25662,6 +25662,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_PF_STAGED_FO",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/prefill.cpp",
+     "line": 291,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "bool",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": "",
+   "first_date": "",
+   "since": "",
+   "last_commit": "",
+   "last_date": "",
+   "status": "research",
+   "owner": "prefill",
+   "note": "[research] STRATA_PF_STAGED_FO=1: a prompt chunk below the long-prompt floor runs the routed experts of a layer that has no MMQ tile but that the fused kernels cover (UD-Q4_K_XL on gfx1151 without STRATA_MMQ_KQ; every layer of a build without llama.cpp's MMQ) on the staged group entry (fused kernels, routed experts only) instead of the dequantize + FP16 GEMM path. Off unless set. src/prefill/prefill.cpp staged_fo_on, include/strata/prefill/staged_fo_rule.hpp.",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_PF_STEP_SYNC",
    "backends": [
     "cuda-hip",
