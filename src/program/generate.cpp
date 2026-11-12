@@ -5780,7 +5780,14 @@ int main(int argc, char** argv) {
         else if (pio.mode == strata::kernels::PleIo::Direct)
             std::fprintf(stderr, "strata generate: SSD keep-alive off: the SSD may fall asleep between reads\n");
         if (!wire_ple(wt)) return 1;
-        ss.ple.consts = strata::kernels::ple_artifact_consts();
+        ss.ple.consts = ple_consts_run;
+        for (int h = 0; h < strata::kernels::PLE_N_HEADS; ++h) {   // the hash may only reach rows the table has
+            if (ple_consts_run.offset[h] + ple_consts_run.vocab[h] > ple_table.rows()) {
+                std::fprintf(stderr, "strata generate: PLE head %d reaches row %llu but the table has %llu rows (the model file's hash constants do not fit its PLE table)\n",
+                             h, (unsigned long long) (ple_consts_run.offset[h] + ple_consts_run.vocab[h]), (unsigned long long) ple_table.rows());
+                return 1;
+            }
+        }
         if (o.ple_delay_us > 0) ple_table.set_injected_delay_us(o.ple_delay_us);
         ss.ple.table = &ple_table;
         ss.ple.token = &ss.ple_token;
