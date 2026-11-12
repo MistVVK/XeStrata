@@ -6242,7 +6242,7 @@ int main(int argc, char** argv) {
     // 8 GB picked K=2 where K=16 is right (#1238, #880).  Every other run has its weights loaded already, so its
     // `cap` is net of them and this is 0 (nothing about those placements moves); CUDA0's are loaded too.
     bool carve_ok = true;
-    std::map<std::pair<int64_t, int64_t>, uint64_t> carve_memo;
+    std::map<std::pair<int64_t, int64_t>, uint64_t> carve_memo, carve_dense_memo;   // the second: the projections' share of the first
     auto carve_bytes = [&](int64_t lb, int64_t le) -> uint64_t {
         if (!late_weights) return 0;
         const std::pair<int64_t, int64_t> key(lb, le);
@@ -6261,6 +6261,7 @@ int main(int argc, char** argv) {
                 return 0;
             }
             total += dense;
+            carve_dense_memo.emplace(key, dense);
         }
         carve_memo.emplace(key, total);
         return total;
@@ -7019,10 +7020,19 @@ int main(int argc, char** argv) {
                 // by design (a granule per matrix runs ~0.8% high).  Past 5% the pricing has drifted from the loading.
                 const uint64_t took = before > fb ? (uint64_t) (before - fb) : 0;
                 const uint64_t priced = carve_bytes(st.lb, st.le);
-                if (priced < took || priced - took > took / 20)
+                if (priced < took || priced - took > took / 20) {
                     std::fprintf(stderr, "strata generate: layer split, CUDA%d: WARNING the split search priced this "
                                          "stage's weights at %llu MiB, it took %llu MiB\n", st.dev,
                                  (unsigned long long) (priced >> 20), (unsigned long long) (took >> 20));
+                    // which part drifted: the projections (priced next to what `load` allocated) or the rest
+                    const auto dm = carve_dense_memo.find(std::make_pair(st.lb, st.le));
+                    const uint64_t dense_priced = dm != carve_dense_memo.end() ? dm->second : 0;
+                    std::fprintf(stderr, "strata generate: layer split, CUDA%d: projections priced %llu MiB, loaded %llu MiB; "
+                                         "the rest priced %llu MiB, took %llu MiB\n", st.dev,
+                                 (unsigned long long) (dense_priced >> 20), (unsigned long long) (st.dense.allocated_bytes() >> 20),
+                                 (unsigned long long) ((priced - std::min(priced, dense_priced)) >> 20),
+                                 (unsigned long long) ((took - std::min(took, (uint64_t) st.dense.allocated_bytes())) >> 20));
+                }
             }
             std::fprintf(stderr, "strata generate: layer split: CUDA%d holds its weights; %.2f GiB free (its session "
                                  "follows)\n", st.dev, (double) fb / 1073741824.0);

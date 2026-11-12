@@ -88,6 +88,11 @@ bool hc_q8_stage_local() {
     static const bool on = [] { const char* v = std::getenv("STRATA_HC_Q8_ALL_STAGES"); return !(v != nullptr && v[0] == '1'); }();
     return on;
 }
+// STRATA_HC_Q8_INJECT=1: the F32 inject rows get a Q8_0 copy too (S25)
+bool hc_q8_inject_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_HC_Q8_INJECT"); return v && v[0] == '1'; }();
+    return on;
+}
 bool hc_q8_name(const std::string& name) {
     if (name == "output_hc_down.weight" || name == "output_hc_up.weight") return true;   // S25: the final mixer too
     if (name.rfind("blk.", 0) != 0) return false;
@@ -216,13 +221,30 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
                                    int64_t lb, int64_t le, uint64_t& out, std::string& err) {
     out = 0;
     try {
-        std::set<std::string> seen;
+        std::set<std::string> seen, hc_seen;
         uint64_t total = 0;
+        auto in_stage = [&](const std::string& name) {   // a blk.<l>. tensor of layers [lb, le); the rest belongs to every stage
+            if (name.rfind("blk.", 0) != 0) return true;
+            const long l = std::strtol(name.c_str() + 4, nullptr, 10);
+            return l >= lb && l < le;
+        };
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             for (const auto& tensor : gguf.tensors()) {
+                // STRATA_HC_Q8: `load` copies the GGUF's Q8_0 hyper-connection rows of its layers (and the final mixer's)
+                // to the card, one cudaMalloc each, and the pack's bf16 rows get a Q8_0 copy below: priced as `load` makes them
+                if (hc_q8_env() && hc_q8_name(tensor.name) && tensor.shape.size() == 2) {
+                    const bool f32_inject = hc_q8_inject_env() && tensor.type == 0 && tensor.name.ends_with("_inject.weight");
+                    if ((tensor.type == 8 || f32_inject) && (!hc_q8_stage_local() || in_stage(tensor.name)) &&
+                        hc_seen.insert(tensor.name).second) {
+                        const auto found = table.table_.find(tensor.name);
+                        if (found != table.table_.end() && found->second.ne0 % 32 == 0 &&
+                            tensor.shape[0] == (uint64_t) found->second.ne0 && tensor.shape[1] == (uint64_t) found->second.ne1)
+                            total += alloc_bytes((uint64_t) found->second.ne0 / 32 * 34 * (uint64_t) found->second.ne1);
+                    }
+                }
                 if (!eligible(tensor, include_ple_key)) continue;
-                if (tensor.name.rfind("blk.", 0) == 0) {
+                if (tensor.name.rfind("blk.", 0) == 0 && tensor.name.find("ple") == std::string::npos) {   // `load` takes the PLE key on every stage
                     const long l = std::strtol(tensor.name.c_str() + 4, nullptr, 10);
                     if (l < lb || l >= le) continue;
                 }
@@ -248,6 +270,13 @@ bool NativeDense::weight_bytes_for(const std::vector<std::string>& shards, Weigh
                 total += alloc_bytes(strata::kernels::native_mmvq_weight_bytes(tensor.type, (int) ref.ne0, (int) ref.ne1));
             }
         }
+        if (hc_q8_env())   // a bf16 pack: `load` quantizes the layers' down / up projections that the GGUF does not carry as Q8_0
+            for (const auto& [name, ref] : table.table_) {
+                if (name.rfind("blk.", 0) != 0 || !in_stage(name) || !hc_q8_name(name) || hc_seen.count(name) ||
+                    !(name.ends_with("_down.weight") || name.ends_with("_up.weight")))
+                    continue;
+                if (ref.ne0 % 32 == 0 && ref.elements == ref.ne0 * ref.ne1) total += alloc_bytes((uint64_t) ref.elements / 32 * 34);
+            }
         out = total;
         return true;
     } catch (const std::exception& error) {
@@ -475,8 +504,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 for (const auto& tensor : gguf.tensors()) {
                     // S25: the F32 inject rows hold BF16-exact values: the read takes the pack's BF16 rows unless
                     // STRATA_HC_Q8_INJECT=1 asks for a Q8_0 copy
-                    static const bool q8_inject = [] { const char* v = std::getenv("STRATA_HC_Q8_INJECT"); return v && v[0] == '1'; }();
-                    const bool f32_inject = q8_inject && tensor.type == 0 && tensor.name.ends_with("_inject.weight");
+                    const bool f32_inject = hc_q8_inject_env() && tensor.type == 0 && tensor.name.ends_with("_inject.weight");
                     if ((tensor.type != 8 && !f32_inject) || !hc_q8_name(tensor.name) || tensor.shape.size() != 2) continue;
                     // a trimmed layer split: another stage's layers are never read here, so their rows are not copied (the upload
                     // loop above and the bf16 pack path below already filter this way; PR #3559, havok2-htwo).
@@ -504,6 +532,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     ref.hc_q8 = p;
                     weights_.push_back(p);
                     hc_q8_bytes += bytes;
+                    allocated += alloc_bytes(bytes);
                     strata::core::manifest::instance().tensors("dense_hc_q8_copy", f32_inject ? "F32->Q8_0" : "Q8_0", 1, bytes);
                 }
         }
@@ -567,8 +596,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         void* allocation = nullptr;
         const auto status = cudaMalloc(&allocation, strata::kernels::native_q8_1_bytes(max_in));
         DevicePtr scratch(allocation);
-        if (status != cudaSuccess) { err = std::string("native dense scratch: ") + cudaGetErrorString(status); return false; }
-        // All checks and allocations finish before publishing any reference.
+        if (status != cudaSuccess) { err = std::string("native dense scratch: ") + cudaGetErrorString(status); return false; }        // All checks and allocations finish before publishing any reference.
         weights_.reserve(pending.size());
         uint64_t packed_bytes = 0;
         size_t packed_count = 0;

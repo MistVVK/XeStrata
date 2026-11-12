@@ -37,7 +37,8 @@ public:
     /// PLE tensors are loaded everywhere).  Process-wide, read by the next `load`; (-1, -1) = all layers.
     static void set_layer_range(int lb, int le);
     /// Layer split: the device bytes `load` would allocate for the matrices of layers [lb, le) - the same walk and
-    /// filters, each matrix rounded up to the granule cudaMalloc backs it with - reading the GGUF headers and `table`
+    /// filters, each matrix rounded up to the granule cudaMalloc backs it with (with STRATA_HC_Q8 the Q8_0
+    /// hyper-connection rows `load` copies too) - reading the GGUF headers and `table`
     /// only, so it allocates nothing and needs no device (#1238).  `table` must hold every tensor the shards carry.
     static bool weight_bytes_for(const std::vector<std::string>& shards, WeightTable& table, bool include_ple_key,
                                  int64_t lb, int64_t le, uint64_t& out, std::string& err);
