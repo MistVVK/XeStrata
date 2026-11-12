@@ -210,5 +210,55 @@ int main() {
     CHECK(wrong == 0);
     std::printf("fused_tile_rule_test: %lld launches compared against the previous rule (%lld differing), %lld launches of the 40-79 SM class checked, %d failed\n", compared,
                 differing, new_class, failed);
+    // ---- the weight-staging guard (check_staged_blobs's decision): a failed check makes the launch take the unstaged kernel, it never ends the process
+    {
+        using namespace strata::prefill::fused_tile;
+        // the blob: only device and managed memory at an even address pass; a pointer the driver does not know (kUnknown) is left to the launch's own error, as before
+        long long cases = 0;
+        for (BlobMem m : {BlobMem::kDevice, BlobMem::kManaged, BlobMem::kHost, BlobMem::kUnregistered, BlobMem::kUnknown})
+            for (std::uintptr_t a : {(std::uintptr_t) 0x7f0000001000, (std::uintptr_t) 0x7f0000001002, (std::uintptr_t) 0x7f0000001001, (std::uintptr_t) 0x7f0000001fff, (std::uintptr_t) 0}) {
+                ++cases;
+                const bool want = m == BlobMem::kUnknown || ((m == BlobMem::kDevice || m == BlobMem::kManaged) && (a & 1) == 0);
+                CHECK(staged_blob_ok(m, a) == want);
+            }
+        CHECK(cases == 25);
+        static_assert(staged_blob_ok(BlobMem::kDevice, 0x1000) && !staged_blob_ok(BlobMem::kHost, 0x1000) && !staged_blob_ok(BlobMem::kDevice, 0x1001));
+        // the geometry: every combination of odd / even for the four values; ok only when all four are even
+        for (int bits = 0; bits < 16; ++bits) {
+            const std::size_t v[4] = {(std::size_t) (1000 + (bits & 1)), (std::size_t) (2000 + ((bits >> 1) & 1)), (std::size_t) (3000 + ((bits >> 2) & 1)), (std::size_t) (4000 + ((bits >> 3) & 1))};
+            CHECK(staged_geometry_ok(v[0], v[1], v[2], v[3]) == (bits == 0));
+        }
+        CHECK(staged_geometry_ok(0, 0, 0, 0) && staged_geometry_ok(136 * 1280, 72 * 640, 136 * 640 * 2, 136 * 1280 * 2));
+        // the per-process state: the first 256 launches are checked, then trusted; one failure makes every later launch unstaged, and only the first failure is logged
+        {
+            StagedGuard g;
+            int checked = 0, trusted = 0;
+            for (int i = 0; i < 1000; ++i) {
+                const auto s = g.next();
+                CHECK(s != StagedGuard::Step::kUnstaged);
+                if (s == StagedGuard::Step::kCheck) { ++checked; CHECK(!g.report(true)); } else ++trusted;
+            }
+            CHECK(checked == 256 && trusted == 744 && !g.bad);
+        }
+        {
+            StagedGuard g;
+            for (int i = 0; i < 2; ++i) CHECK(g.next() == StagedGuard::Step::kCheck && !g.report(true));
+            CHECK(g.next() == StagedGuard::Step::kCheck);
+            CHECK(g.report(false));                                  // the first failure: logged
+            for (int i = 0; i < 2000; ++i) CHECK(g.next() == StagedGuard::Step::kUnstaged);   // sticky, also past the 256 checked launches
+            CHECK(!g.report(false) && !g.report(true) && g.bad);     // no second log line, and a passing report does not clear it
+            CHECK(g.next() == StagedGuard::Step::kUnstaged);
+        }
+        {   // a failure on the last checked launch, and one with the budget used up (a failure cannot come then: the launch is trusted, nothing to report)
+            StagedGuard g;
+            for (int i = 0; i < 255; ++i) CHECK(g.next() == StagedGuard::Step::kCheck);
+            CHECK(g.next() == StagedGuard::Step::kCheck && g.report(false));
+            CHECK(g.next() == StagedGuard::Step::kUnstaged);
+        }
+        // the fallback's item is the 64-row one (WW 4), which no staging instance shares, and the rule never answers it with a staged item for a launch it does not stage
+        CHECK(kUnstagedWw == 4);
+        CHECK(pick(Card{false, false, 48, true}, 81910, E, false, false).ww == 4 && pick(Card{false, false, 48, true}, 81910, E, true, true).ww == 2);   // the staged 128-row choice the fallback overrides
+        std::printf("fused_tile_rule_test: staging guard: %lld blob cases, 16 geometries, the check budget and the sticky fallback checked, %d failed so far\n", cases, failed);
+    }
     return failed == 0 ? 0 : 1;
 }
