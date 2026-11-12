@@ -4391,6 +4391,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
                 pt.mark(kPfHcUp, cs);
                 bool upmixed = false;
+                // on the FP16 prompt path (m.f16_io) lo16 holds FP16 bits (act16) and gr_upmix reads it on the FP16 matrix-core builtin (g_act_f16)
                 if (wu->q8_scale == nullptr && hc_upmix() && T >= std::max(pf_switch_min_t(), hc_upmix_min_t()) && !gr_unfused() && !m.lo16_lo && !m.mixed_bf_lo &&
                     wu->kind == core::WeightKind::Bf16InF32 && wu->data && wu->ne0 == LR && wu->ne1 == D) {
                     static int checks = [] { const char* e = std::getenv("STRATA_HC_UPMIX_CHECK"); return e ? std::atoi(e) : 0; }();

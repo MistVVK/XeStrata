@@ -88,6 +88,8 @@ On by default on the Radeon 780M (`gfx1103`, integrated, Linux; AMD_HIP.md, "Int
 Measured (021-minipc, P2006, Q2_0, fresh engine per run, 10 interleaved rounds, 6 complete pairs): prompt 1K 98.5 -> 157.3 tok/s (x1.60, 6/6 pairs faster),
 4K 115.1 -> 233.3 (x2.03, 6/6), decode 22.02 -> 21.99 (code) and 15.09 -> 15.05 (story) (x0.999), greedy token ids identical in 6 of 6 pairs.
 
+The 16-bit prompt GEMMs run FP16 in and out by themselves on the 780M under Linux (`STRATA_HIP_PROMPT_F16`; AMD_HIP.md has the numbers and the check against the FP16 path); `STRATA_HIP_PROMPT_F16=0` keeps the BF16 route.
+
 **GPU resets.** The 780M's current Ubuntu firmware (gc 11.0.1 MES) can still reset the GPU now and then, with or without this set: when the kernel moves memory that the
 GPU has registered, the process's queues are evicted, and a kernel that sits in a barrier at that moment never answers. The engine recovers
 ("device wedged, but recovered through reset") but the running request fails. In the same runs the default engine crashed 4 of 10 times and the set 0 of 10, so it did
