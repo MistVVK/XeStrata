@@ -186,17 +186,17 @@ __device__ __forceinline__ void i8_table16(uint32_t q4, const uint32_t (&t)[4], 
     hi = __byte_perm(tmp[0], tmp[1], 0x7531);
 }
 
-// 8 grid bytes with a sign pattern applied: t = {mask of the 4 low values, +1 of them, mask of the 4 high values, +1 of them}; per byte
+// 8 grid bytes with a sign pattern applied: t = {byte mask of the 4 low values, byte mask of the 4 high values} (the +1 of a negated byte is its mask's low bit); per byte
 // (g ^ 0xFF) + 1 = 256 - g = -g for a negated value (g in 1..127, so no carry), g itself otherwise
-__device__ __forceinline__ void i8_signed8t(uint32_t gx, uint32_t gy, const uint4 t, uint32_t& qx, uint32_t& qy) {
-    qx = (gx ^ t.x) + t.y;
-    qy = (gy ^ t.z) + t.w;
+__device__ __forceinline__ void i8_signed8t(uint32_t gx, uint32_t gy, const uint2 t, uint32_t& qx, uint32_t& qy) {
+    qx = (gx ^ t.x) + (t.x & 0x01010101u);
+    qy = (gy ^ t.y) + (t.y & 0x01010101u);
 }
 
 // the sub-block as 8 words of 4 int8 (natural order), the integer scales of its values 0-15 (m0) and 16-31 (m1), and the float base
 // scale: value = base * m * q.  sg = the sign table (shared memory) of the sign formats.
 template <int T>
-__device__ __forceinline__ void i8_convert(const uint32_t (&w)[5], const uint32_t* grid, const uint4* sg, const uint32_t (&kv)[4], uint32_t (&q)[8],
+__device__ __forceinline__ void i8_convert(const uint32_t (&w)[5], const uint32_t* grid, const uint2* sg, const uint32_t (&kv)[4], uint32_t (&q)[8],
                                            int& m0, int& m1, float& base) {
     if constexpr (T == 16) {
         const uint2* g = (const uint2*) grid;
@@ -284,12 +284,20 @@ template <int T, int TM>
 struct I8Smem {
     static constexpr int BM = 16 * TM;
     static constexpr int GW = (i8_grid_words(T) + 3) / 4 * 4;
-    static constexpr int SG = i8_sign_type(T) ? 1024 : 0;
+    static constexpr int SG = i8_sign_type(T) ? 512 : 0;
     static constexpr int SZ_W = 64 * I8_LD, SZ_A = BM * I8_LD, SZ_R = 64 * I8_RS, SZ_D = BM * 4;
     static constexpr int o_sg = GW, o_w = o_sg + SG, o_a = o_w + 2 * SZ_W, o_r = o_a + 2 * SZ_A, o_d = o_r + 2 * SZ_R, o_src = o_d + 2 * SZ_D,
-                         total = (o_src + BM + 3) / 4 * 4;
+                         total = (o_d + 2 * SZ_D + 3) / 4 * 4;   // (the source rows s_src: in the pad words of s_r, see i8_kernel)
     static constexpr size_t bytes = (size_t) total * 4;
 };
+
+// The smallest tile (TM 2) of every covered format fits 48 KB of shared memory per block, the limit of Pascal cards (49,152 bytes on the P100: no opt-in above
+// it).  A format whose decode tables grow past it fails the build here, not on a card nobody has at hand.
+constexpr size_t I8_SMEM_48K = 48 * 1024;
+static_assert(I8Smem<16, 2>::bytes <= I8_SMEM_48K && I8Smem<17, 2>::bytes <= I8_SMEM_48K && I8Smem<18, 2>::bytes <= I8_SMEM_48K &&
+              I8Smem<21, 2>::bytes <= I8_SMEM_48K && I8Smem<22, 2>::bytes <= I8_SMEM_48K && I8Smem<20, 2>::bytes <= I8_SMEM_48K &&
+              I8Smem<42, 2>::bytes <= I8_SMEM_48K,
+              "the TM 2 tile of a covered format must fit 48 KB of shared memory per block");
 
 __global__ void __launch_bounds__(256) i8_tiles_kernel(const int32_t* __restrict__ grp_start, const int32_t* __restrict__ n_groups, int bm,
                                                        int32_t* __restrict__ tile_off) {
@@ -330,7 +338,8 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
     uint32_t* const s_a = smem + SM::o_a;
     uint32_t* const s_r = smem + SM::o_r;
     float* const s_ad = (float*) (smem + SM::o_d);
-    int* const s_src = (int*) (smem + SM::o_src);
+    // the BM source rows of the tile: word (i & 3) of the pad (words 16..19) of row i / 4 of the first record buffer (the records fill words 0..15 of a row)
+    auto s_src = [&](int i) -> int& { return *(int*) (s_r + (i >> 2) * I8_RS + 16 + (i & 3)); };
 
     const int ng = *n_groups;
     const int ti = blockIdx.x;
@@ -370,7 +379,7 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
             mlo |= ((sb >> k) & 1u) ? (0xFFu << (8 * k)) : 0u;
             mhi |= ((sb >> (4 + k)) & 1u) ? (0xFFu << (8 * k)) : 0u;
         }
-        *(uint4*) (s_sg + 4 * b) = make_uint4(mlo, mlo & 0x01010101u, mhi, mhi & 0x01010101u);
+        *(uint2*) (s_sg + 2 * b) = make_uint2(mlo, mhi);
     }
     uint32_t kv[4] = {0, 0, 0, 0};
     if constexpr (T == 20) {
@@ -379,7 +388,7 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
         for (int i = 0; i < 4; ++i) kv[i] = t[i];
     }
     if (bisect == 2) return;
-    if (tid < BM) s_src[tid] = (e_lo + tid < e_hi) ? (GU ? ent_idx[e_lo + tid] : e_lo + tid) : -1;
+    if (tid < BM) s_src(tid) = (e_lo + tid < e_hi) ? (GU ? ent_idx[e_lo + tid] : e_lo + tid) : -1;
     __syncthreads();
     if (bisect == 3) return;
 
@@ -394,7 +403,7 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
     const bool a_thr = tid < 4 * BM;
     uint32_t a_vo = 0;
     if (a_thr) {
-        const int src = s_src[tid >> 2];
+        const int src = s_src(tid >> 2);
         a_vo = (uint32_t) ((size_t) (src >= 0 ? src : 0) * (size_t) ((K / 32) * 36) + (size_t) (tid & 3) * 36);
     }
 
@@ -404,7 +413,7 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
         int m0, m1;
         float base;
         i8_pack<T>(r, (st * 4 + wp) & 7, w);   // (ib of a 256-value super-block; only IQ3_S reads it)
-        i8_convert<T>(w, s_grid, (const uint4*) s_sg, kv, q, m0, m1, base);
+        i8_convert<T>(w, s_grid, (const uint2*) s_sg, kv, q, m0, m1, base);
         uint4* dst = (uint4*) (s_w + b * SM::SZ_W + wr * I8_LD + wp * 8);
         dst[0] = make_uint4(q[0], q[1], q[2], q[3]);
         dst[1] = make_uint4(q[4], q[5], q[6], q[7]);
@@ -546,7 +555,7 @@ constexpr int I8B_BM = 128, I8B_LD = 20, I8B_KS = 64;
 template <int T>
 struct I8BSmem {
     static constexpr int GW = (i8_grid_words(T) + 3) / 4 * 4;
-    static constexpr int SG = i8_sign_type(T) ? 1024 : 0;
+    static constexpr int SG = i8_sign_type(T) ? 512 : 0;
     static constexpr int SZ_W = 128 * I8B_LD, SZ_A = 128 * I8B_LD, SZ_R = 2 * 128 * 4, SZ_D = 2 * 128;
     static constexpr int o_sg = GW, o_w = o_sg + SG, o_a = o_w + 2 * SZ_W, o_r = o_a + 2 * SZ_A, o_d = o_r + 2 * SZ_R, o_src = o_d + 2 * SZ_D,
                          total = (o_src + I8B_BM + 3) / 4 * 4;
@@ -621,7 +630,7 @@ i8b_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __rest
             mlo |= ((sb >> k) & 1u) ? (0xFFu << (8 * k)) : 0u;
             mhi |= ((sb >> (4 + k)) & 1u) ? (0xFFu << (8 * k)) : 0u;
         }
-        *(uint4*) (s_sg + 4 * b) = make_uint4(mlo, mlo & 0x01010101u, mhi, mhi & 0x01010101u);
+        *(uint2*) (s_sg + 2 * b) = make_uint2(mlo, mhi);
     }
     uint32_t kv[4] = {0, 0, 0, 0};
     if constexpr (T == 20) {
@@ -660,7 +669,7 @@ i8b_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __rest
         int m0, m1;
         float base;
         i8_pack<T>(r, (2 * st + wp) & 7, w);
-        i8_convert<T>(w, s_grid, (const uint4*) s_sg, kv, q, m0, m1, base);
+        i8_convert<T>(w, s_grid, (const uint2*) s_sg, kv, q, m0, m1, base);
         uint4* dst = (uint4*) (s_w + b * SM::SZ_W + wr * I8B_LD + wp * 8);
         dst[0] = make_uint4(q[0], q[1], q[2], q[3]);
         dst[1] = make_uint4(q[4], q[5], q[6], q[7]);
