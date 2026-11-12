@@ -10,7 +10,7 @@ debugging and are kept in `data/settings-register.json`.
 A number or a word is set like any environment variable, for example `STRATA_KVA=1`. In the Terminal, `strata launch --set NAME=value`
 puts it in the model's run configuration.
 
-## Switches you can turn on (274)
+## Switches you can turn on (273)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -178,7 +178,6 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_PF_DMA_PAGEABLE` | on / off | Intel Arc | [INTEL.md](INTEL.md) |
 | `STRATA_PF_FUSED_F16` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_PF_FUSED_IQ2S` | text | NVIDIA and AMD | - |
-| `STRATA_PF_FUSED_KQ` | on / off | NVIDIA and AMD, Intel Arc | [QUANTS.md](QUANTS.md), [STRIX_HALO.md](STRIX_HALO.md) |
 | `STRATA_PF_FUSED_NATIVE` | on / off | NVIDIA and AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md), [DETAILS.md](DETAILS.md) |
 | `STRATA_PF_FUSED_NT` | number | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_PF_FUSED_Q2N` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md), [release-notes-0.2.7.md](release-notes-0.2.7.md) |
@@ -291,7 +290,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_WDDM_BUDGET` | number | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md) |
 | `STRATA_WS_FAST` | number | NVIDIA and AMD | [OLDER_GPUS.md](OLDER_GPUS.md) |
 
-## Switches that go back to earlier behaviour (64)
+## Switches that go back to earlier behaviour (65)
 
 These behaviours are on by default. Setting the switch returns the earlier behaviour; the notes in the register say which
 version made it the default.
@@ -331,6 +330,7 @@ version made it the default.
 | `STRATA_NUMA_SPLIT` | text | CPU | v0.2.2 | [DETAILS.md](DETAILS.md), [release-notes-0.2.2.md](release-notes-0.2.2.md) |
 | `STRATA_NV_CHUNK` | on / off | NVIDIA | v0.2.11 | [DETAILS.md](DETAILS.md) |
 | `STRATA_PF_FUSED_IQ2X` | text | AMD | - | - |
+| `STRATA_PF_FUSED_KQ` | text | NVIDIA and AMD, Intel Arc | v0.1.40.1 | [DGX_SPARK_LINUX.md](DGX_SPARK_LINUX.md), [QUANTS.md](QUANTS.md), [STRIX_HALO.md](STRIX_HALO.md) |
 | `STRATA_PF_FUSED_Q50` | on / off | NVIDIA and AMD | v0.2.12 | - |
 | `STRATA_PF_SMALL_FUSED` | on / off | NVIDIA and AMD | - | - |
 | `STRATA_PF_W16_CACHE_MIB` | on / off | NVIDIA and AMD | v0.2.9 | - |
