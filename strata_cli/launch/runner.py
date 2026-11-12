@@ -2461,6 +2461,9 @@ KNOWN_CAUSES = (
      "This engine is too old for this model. Update it with `strata update` and start again."),
     (re.compile(r"dll|libcu|cannot open shared object|0xc0000135", re.I),
      "A library the engine needs is missing. Update the engine (`strata update`) or install the graphics driver again."),
+    # a Strix Halo with --batch N: the engine's own line after a failed start (src/program/generate.cpp); it must stay the LAST entry (explain_engine_exit reads KNOWN_CAUSES[-1])
+    (re.compile(r"requests at once do not fit", re.I),
+     "This PC's memory cannot hold that many requests at once. Lower Concurrent requests in the app (or `--parallel` in the Terminal) by one and start again."),
 )
 
 
@@ -2586,7 +2589,7 @@ def explain_engine_exit(result: dict, config: Path | None, marks: dict | None = 
     if not text.endswith((".", "!")):
         text += "."
     step = HSA_START_NEXT if hsa else (VRAM_STOP_NEXT if vram_cause else next((words for pattern, words in KNOWN_CAUSES if pattern.search(" ".join([cause, str(why or "")]))), "Run it again; if it repeats, report the log."))
-    if shared_memory and not hsa and not any(p.search(" ".join([cause, str(why or "")])) for p, _ in KNOWN_CAUSES[:2]):
+    if shared_memory and not hsa and not any(p.search(" ".join([cause, str(why or "")])) for p, _ in (*KNOWN_CAUSES[:2], KNOWN_CAUSES[-1])):
         # a Strix Halo: the settings fix the expert cache beside a RAM budget, and the engine ended with no error text of its own (STRIX-2Q, 11-01)
         try:
             from strata_control import uma_pool, user_args as _ua

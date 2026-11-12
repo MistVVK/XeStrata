@@ -147,7 +147,9 @@ KV, more with a longer context unless the KV cache streams (`--kv-resident`: the
 stays in VRAM, and each slot's whole KV cache takes pinned RAM - 1.6 GB at 128K). On a card whose experts mostly run
 on the CPU, a batch also reads about as many distinct experts as the requests one by one (different conversations
 route to different experts), so the gain is in **latency** (nobody waits for a whole answer), and a request alone
-runs slower (the smaller expert cache): 11-24 % on a 12 GB card, see the measurements below.
+runs slower (the smaller expert cache): 11-24 % on a 12 GB card, see the measurements below. With several requests at once
+on a Windows PC with integrated AMD graphics, the engine keeps less of the model's RAM copy so that every slot fits, and
+`STRATA_UMA_PIN_CAP=0` turns that off.
 
 So setup recommends `"parallel"` **only where the experts mostly fit in VRAM**: the expert cache (each card's VRAM
 less ~5 GB, every card of a layer split counted) must still hold at least half of the model's experts beside the
