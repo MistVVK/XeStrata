@@ -36,7 +36,8 @@ import launcher_notices
 # not use).  ze_loader.dll comes with Intel's driver, nvcuda.dll and nvml.dll with NVIDIA's, amdhip64_7.dll with AMD's.
 SYCL_DLLS = ("sycl9.dll", "ur_win_proxy_loader.dll", "ur_adapter_cuda.dll", "ur_adapter_hip.dll",
              "ur_adapter_level_zero.dll", "ur_adapter_level_zero_v2.dll", "xptifw.dll")
-ENGINE_EXES = ("xestrata-engine.exe", "xestrata-device.exe", "xestrata-image.exe", "xestrata-vision-cpu.exe")
+ENGINE_EXES = ("xestrata-engine.exe", "xestrata-device.exe", "xestrata-image.exe", "xestrata-vision-cpu.exe",
+               "xestrata-vision-gpu.exe")
 # oneMath and its oneMKL backend (the engine's build folder's bin/), which loads oneMKL where the user installed it
 ONEMATH_DLLS = ("onemath.dll", "onemath_blas_mklgpu.dll", "onemath_blas_cublas.dll", "onemath_blas_rocblas.dll")
 # AMD GPUs' image attention: the engine's module that opens aotriton (on an AMD GPU only), aotriton's library (built

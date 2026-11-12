@@ -18,7 +18,7 @@
 include(GNUInstallDirs)
 
 set(STRATA_PACKAGE_NAME "" CACHE STRING "the package's name, e.g. xestrata-free (STRATA_PACKAGE)")
-set(STRATA_PACKAGE_VISION_DIR "" CACHE PATH "the folder with xestrata-vision-cpu and xestrata-vision-vulkan")
+set(STRATA_PACKAGE_VISION_DIR "" CACHE PATH "the folder with xestrata-vision-cpu")
 set(STRATA_PACKAGE_DEPENDS "" CACHE STRING "the package's dependencies, the distribution's names")
 set(STRATA_PACKAGE_RECOMMENDS "" CACHE STRING "the package's weak dependencies, installed by default")
 set(STRATA_PACKAGE_SUGGESTS "" CACHE STRING "the package's suggestions, not installed by default")
@@ -50,10 +50,9 @@ set(_pkg_engine ${CMAKE_INSTALL_LIBDIR}/xestrata/engine)
 set(_pkg_engine_abs ${CMAKE_INSTALL_FULL_LIBDIR}/xestrata/engine)
 
 # ---- the engine
-set_target_properties(strata strata-image PROPERTIES INSTALL_RPATH "$ORIGIN/lib")
-install(TARGETS strata strata-image RUNTIME DESTINATION ${_pkg_engine})
-install(PROGRAMS ${STRATA_PACKAGE_VISION_DIR}/xestrata-vision-cpu ${STRATA_PACKAGE_VISION_DIR}/xestrata-vision-vulkan
-        DESTINATION ${_pkg_engine})
+set_target_properties(strata strata-image strata-vision-gpu PROPERTIES INSTALL_RPATH "$ORIGIN/lib")
+install(TARGETS strata strata-image strata-vision-gpu RUNTIME DESTINATION ${_pkg_engine})
+install(PROGRAMS ${STRATA_PACKAGE_VISION_DIR}/xestrata-vision-cpu DESTINATION ${_pkg_engine})
 # the SYCL runtime the engine was built with: what libsycl loads for Level Zero and HIP (and CUDA in the contrib mode).
 # (tools/intel_llvm_build.py builds no libsycl-jit: libsycl opens it only to compile kernels from source.)
 get_filename_component(_pkg_sycl_lib "${CMAKE_CXX_COMPILER}" DIRECTORY)

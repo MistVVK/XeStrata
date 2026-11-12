@@ -94,7 +94,7 @@ case " $runtime " in
 esac
 # (libjxl-utils: cjxl, the images' JPEG XL, which the package only recommends)
 # shellcheck disable=SC2086
-dnf install -y -q $runtime $recommends mesa-vulkan-drivers python3-pip libjxl-utils
+dnf install -y -q $runtime $recommends python3-pip libjxl-utils
 if [ "$rocm" != fedora ] && [ -n "$gfx" ]; then
   # AMD's packages install no linker path of their own
   echo "/opt/rocm/core-$rocm/lib" > /etc/ld.so.conf.d/xestrata-rocm.conf

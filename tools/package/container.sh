@@ -57,8 +57,7 @@ case "$distro" in
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -q
     apt-get install -y -q --no-install-recommends git cmake ninja-build g++ libhwloc-dev libzstd-dev python3 \
-      patchelf curl ca-certificates unzip libblosc2-dev libvulkan-dev glslc spirv-headers dpkg-dev file gpg ccache lld opencl-headers \
-      xz-utils
+      patchelf curl ca-certificates unzip libblosc2-dev dpkg-dev file gpg ccache lld opencl-headers xz-utils
     python_deps="python3 (>= 3.10), python3-numpy, python3-jinja2, python3-regex, python3-yaml, python3-tqdm, \
 python3-requests, python3-pil, python3-psutil, python3-jsonschema"
     # Ubuntu's libze-intel-gpu1 does not depend on the graphics compiler it opens (libigc2, libigdfcl2): without them
@@ -66,7 +65,6 @@ python3-requests, python3-pil, python3-psutil, python3-jsonschema"
     level_zero="libze1, libze-intel-gpu1, libigc2, libigdfcl2"
     # oneDNN's SDPA (the image engine's attention on Intel GPUs) runs on OpenCL: Intel's driver and the ICD loader
     opencl="intel-opencl-icd, ocl-icd-libopencl1"
-    vulkan_icd="mesa-vulkan-drivers"
     jxl="libjxl-tools"   # cjxl: the images' JPEG XL (serve/images.py)
     pdf="poppler-utils"  # a PDF a request sends: pdftotext and pdftoppm (serve/server.py read_file)
     ffmpeg="ffmpeg"      # the video tools' input and output: ffmpeg and ffprobe (src/video/video_io.cpp)
@@ -93,12 +91,11 @@ python3-requests, python3-pil, python3-psutil, python3-jsonschema"
     ;;
   fedora*)
     dnf install -y -q git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel libzstd-static python3 patchelf curl unzip \
-      blosc2-devel vulkan-loader-devel glslc spirv-headers-devel rpm-build file findutils ccache lld opencl-headers
+      blosc2-devel rpm-build file findutils ccache lld opencl-headers
     python_deps="python3 >= 3.10, python3-numpy, python3-jinja2, python3-regex, python3-pyyaml, python3-tqdm, \
 python3-requests, python3-pillow, python3-psutil, python3-jsonschema"
     level_zero="oneapi-level-zero, intel-level-zero"
     opencl="intel-opencl, OpenCL-ICD-Loader"   # as on Ubuntu
-    vulkan_icd="mesa-vulkan-drivers"
     jxl="libjxl-utils"
     pdf="poppler-utils"     # as on Ubuntu
     ffmpeg="ffmpeg-free"    # Fedora's own ffmpeg (H.264 through openh264, else VP9: video_io.cpp takes what it has)
@@ -161,18 +158,14 @@ fi
 llvm_keep "$distro-$variant" "$llvm" "$key"
 lap intel-llvm
 
-# the image encoders: any AVX2 CPU, and Vulkan's (free: Mesa's drivers)
+# the picture reader for the CPU (tools/vision, llama.cpp's mtmd): any AVX2 CPU.  The GPU reader is the engine's own
+# vision encoder and comes with the engine (strata-vision-gpu, below).
 jobs=${XESTRATA_JOBS:-$(nproc)}
-for enc in cpu vulkan; do
-  opt=""
-  [ "$enc" = vulkan ] && opt=-DSTRATA_VISION_VULKAN=ON
-  # shellcheck disable=SC2086
-  cmake -G Ninja -S "$src/tools/vision" -B "/build/vision-$enc" -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR="$llama" \
-    -DSTRATA_PORTABLE=ON $opt
-  cmake --build "/build/vision-$enc" --target strata-vision -j "$jobs"
-  mkdir -p /build/vision
-  cp "/build/vision-$enc/bin/xestrata-vision" "/build/vision/xestrata-vision-$enc"
-done
+cmake -G Ninja -S "$src/tools/vision" -B /build/vision-cpu -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR="$llama" \
+  -DSTRATA_PORTABLE=ON
+cmake --build /build/vision-cpu --target strata-vision -j "$jobs"
+mkdir -p /build/vision
+cp /build/vision-cpu/bin/xestrata-vision-cpu /build/vision/xestrata-vision-cpu
 
 lap encoders
 
@@ -188,7 +181,8 @@ if [ "$license" = contrib ]; then
     -DSTRATA_CUDA_PATH="$cuda_path" -DSTRATA_CUDA_PTX= ${cudnn_root:+-DSTRATA_CUDNN_ROOT=$cudnn_root}
 fi
 cmake -G Ninja -S "$src" -B /build/engine "$@"
-targets="strata strata-image onemath_backend_libs"   # oneMath's backends: rocBLAS (AMD GPUs) in every package
+targets="strata strata-image strata-vision-gpu onemath_backend_libs"   # oneMath's backends: rocBLAS (AMD GPUs) in
+# every package; strata-vision-gpu: the GPU picture reader (the engine's own vision encoder)
 # shellcheck disable=SC2086
 cmake --build /build/engine --target $targets -j "$jobs"
 lap engine
@@ -213,7 +207,7 @@ pkg_of() {
 }
 rocm="$(pkg_of libamdhip64.so), $(pkg_of librocblas.so), $(pkg_of libhipblaslt.so)"
 if [ "$license" = free ]; then
-  recommends="$recommends, $level_zero, $opencl, $rocm, $vulkan_icd"
+  recommends="$recommends, $level_zero, $opencl, $rocm"
 else
   # and oneMKL's
   mkl=$(readlink -f /opt/intel/oneapi/mkl/latest/lib/libmkl_sycl_blas.so)
@@ -221,7 +215,7 @@ else
     ubuntu*) mklpkg=$(dpkg -S "$mkl" | cut -d: -f1) ;;
     fedora*) mklpkg=$(rpm -qf --qf '%{NAME}' "$mkl") ;;
   esac
-  suggests="$suggests, $level_zero, $opencl, $vulkan_icd${cublas:+, $cublas}, $mklpkg, $rocm"
+  suggests="$suggests, $level_zero, $opencl${cublas:+, $cublas}, $mklpkg, $rocm"
 fi
 # the same, by GPU maker, for setup to tell what a PC lacks (BUILD.json's "runtime"): what each maker's GPUs need,
 # and in the contrib packages oneMKL and cuBLAS, which make them faster, and pip's names of NVIDIA's libraries setup

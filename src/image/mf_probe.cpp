@@ -21,7 +21,7 @@
 #include "strata/image/mf_dit.hpp"
 #include "strata/image/mf_vae.hpp"
 #include "strata/image/qi_image_io.hpp"
-#include "strata/image/qi_vision.hpp"
+#include "strata/core/vision.hpp"
 #include "strata/image/text_encoder.hpp"
 
 #include <algorithm>
@@ -104,9 +104,9 @@ int text(const std::string& gguf, const std::string& dir, const std::string& mmp
     te.set_final_norm(true);
     te.set_flat_positions(true);
     // an edit's images (as the processor took them: their sides the grid's 16-pixel patches) through the vision encoder
-    std::vector<strata::image::QiVisionOut> vouts;
+    std::vector<strata::core::VisionOut> vouts;
     if (!mmproj.empty()) {
-        strata::image::QiVision vis;
+        strata::core::Vision vis;
         if (!vis.open(mmproj, s, err)) throw std::runtime_error(err);
         for (int j = 0;; ++j) {
             const std::string f = dir + "/vl" + std::to_string(j) + ".png";

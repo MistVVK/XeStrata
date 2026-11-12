@@ -317,10 +317,10 @@ It prints other choices too, as in `./setup.sh --packages fedora44/intel,amd --l
 
 | Choice | Ubuntu 26.04 | Fedora 44 | Arch |
 | --- | --- | --- | --- |
-| common (free, contrib-llvm) | `python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers opencl-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel opencl-headers mesa-vulkan-drivers blosc2-devel` | `python base-devel git cmake ninja lld hwloc zstd vulkan-headers vulkan-icd-loader shaderc spirv-headers opencl-headers blosc2` |
-| Intel GPUs | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` | `level-zero-loader intel-compute-runtime vulkan-intel` |
+| common (free, contrib-llvm) | `python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev opencl-headers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static opencl-headers blosc2-devel` | `python base-devel git cmake ninja lld hwloc zstd opencl-headers blosc2` |
+| Intel GPUs | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` | `level-zero-loader intel-compute-runtime` |
 | Intel GPUs (contrib-llvm) | `intel-oneapi-mkl-sycl-devel` | `intel-oneapi-mkl-sycl-devel` | none (oneMKL is not in Arch's repositories) |
-| AMD GPUs (free, contrib-llvm) | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` | `hip-runtime-amd rocm-device-libs rocm-llvm rocblas hipblaslt hipblas-common vulkan-radeon` |
+| AMD GPUs (free, contrib-llvm) | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` | `hip-runtime-amd rocm-device-libs rocm-llvm rocblas hipblaslt hipblas-common` |
 | NVIDIA GPUs (contrib-llvm) | `nvidia-cuda-toolkit` and NVIDIA's driver | `cuda-toolkit-13-4` (NVIDIA's CUDA repository) and NVIDIA's driver | `cuda` and NVIDIA's driver |
 
 - The packages starting with `intel-oneapi-` are in Intel's oneAPI repository (Intel's guides show how to add it: [APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html), [DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)).
@@ -328,12 +328,11 @@ It prints other choices too, as in `./setup.sh --packages fedora44/intel,amd --l
   Below compute-runtime 26.22 a driver state can refuse device allocations while the VRAM is free (Intel's [compute-runtime #916](https://github.com/intel/compute-runtime/issues/916); the driver works around an xe kernel bug fixed in Linux 7.1 — on XeStrata's side, [#34](https://github.com/MistVVK/XeStrata/issues/34)).
   On Ubuntu 24.04/26.04 with the HWE kernel, setup points to [Intel's graphics PPA](https://launchpad.net/~kobuk-team/+archive/ubuntu/intel-graphics) (a newer compute-runtime and IGC) and stops the start until it is updated (`--old-driver` starts anyway).
   On the GA kernel it recommends moving to the HWE kernel with the PPA, or Fedora 44 / Podman (whose IGC is 2.32 or later; [Troubleshooting](DETAILS.md#troubleshooting)).
-- The common row's Vulkan packages (`libvulkan-dev` and the others) are for the GPU image encoder, and `libblosc2-dev` (`blosc2-devel`) for compressing the saved conversations (optional; [`conversation_save_compress`](DETAILS.md#keeping-parked-conversations-on-the-disk)).
+- The common row's `libblosc2-dev` (`blosc2-devel`) is for compressing the saved conversations (optional; [`conversation_save_compress`](DETAILS.md#keeping-parked-conversations-on-the-disk)).
 - The AMD row's `clang-21` and `libclang-rt-21-dev` (on Fedora `rocm-clang` and `rocm-clang-runtime-devel`: ROCm's clang and its runtime) compile nothing (intel/llvm does the compiling).
   HIP's CMake package, which oneMath's rocBLAS backend reads, asks the compiler for clang's runtime builtins (`libclang_rt.builtins`) to add them to the link.
   intel/llvm has no such builtins, so ROCm's clang is made `HIP_CXX_COMPILER` to answer (`strata_hip_cxx` in `cmake/StrataHip.cmake`).
   They are needed to build only, not to run.
-- On Arch the Vulkan ICD is the GPU maker's own package (`vulkan-intel`, `vulkan-radeon`), not the one `mesa-vulkan-drivers` carries for both on Ubuntu and Fedora.
 - Arch's `zstd` has no `libzstd.a` (`zstd-static` is an AUR package).
   intel/llvm's `configure.py` asks for the static zstd (`LLVM_USE_STATIC_ZSTD=ON`), so `tools/intel_llvm_build.py` turns that off where there is none and links the shared one (intel/llvm handles it from v7.1.1: [intel/llvm#22294](https://github.com/intel/llvm/pull/22294)).
 - Arch's ROCm clang is in `/opt/rocm/lib/llvm`, and its runtime builtins (`libclang_rt.builtins`) are in the same `rocm-llvm` package (one package where the AMD row's `clang-21` and `libclang-rt-21-dev` are two).
@@ -377,7 +376,7 @@ tools/package/build.sh fedora44 cuda13.4
   Nothing of the work tree (`build-xe`, `.tools`, `.venv`) is used.
 - **A clean container each time**: the images are pinned by digest in `build.sh`.
   In the container it installs the build tools and the distribution's ROCm and builds intel/llvm (`tools/intel_llvm_build.py`,
-  with the HIP target, and the CUDA target for the cuda variants), the image encoders (CPU and Vulkan) and the engine, and CPack makes the packages
+  with the HIP target, and the CUDA target for the cuda variants), the CPU image encoder and the engine (with the GPU picture reader), and CPack makes the packages
   (`tools/package/container.sh`, `cmake/packaging.cmake`).
   The container is removed at the end. intel/llvm is built every time, so a build takes a while.
   Kept between builds: the compiler cache (ccache, `build/pkg-ccache/<distro>/`, at most `XESTRATA_CCACHE_MAX`, default 30G),
@@ -424,7 +423,7 @@ The Windows 7z is built with the same `tools/package/build.sh`, in a disposable 
 tools/package/build.sh windows cuda12.4      # XeStrata-<version>-windows-x64.7z
 ```
 
-- All of it is cross-built on Linux for Windows: intel/llvm (the Linux contrib toolchain and the SYCL runtime for Windows), the engine (the contrib-llvm mode, the NVIDIA code as the cuda12.4 deb's), the image encoder on the CPU (`xestrata-vision-cpu.exe`; no Vulkan one, so pictures are read on the CPU), the .NET launchers (`dotnet-sdk-10.0`), and Python's embeddable distribution with the wheels; `tools/package/windows_bundle.py` makes the folder and the 7z.
+- All of it is cross-built on Linux for Windows: intel/llvm (the Linux contrib toolchain and the SYCL runtime for Windows), the engine (the contrib-llvm mode, the NVIDIA code as the cuda12.4 deb's), the picture readers (`xestrata-vision-cpu.exe` and `xestrata-vision-gpu.exe`), the .NET launchers (`dotnet-sdk-10.0`), and Python's embeddable distribution with the wheels; `tools/package/windows_bundle.py` makes the folder and the 7z.
 - The MSVC CRT and the Windows SDK come from Microsoft through xwin, its license accepted (they are not free software and do not go into the 7z). Neither do the Windows CUDA headers and import libraries.
 - It uses the Ubuntu 26.04 packages' ccache (`build/pkg-ccache/ubuntu26.04/`) and keeps xwin's and NuGet's downloads in `build/pkg-cache/windows/`.
 - Every exe, DLL and Python package in the 7z must be one of `windows_bundle.py`'s components; a Visual C++ runtime or an NVIDIA library in it stops the build.
@@ -509,7 +508,6 @@ The image is built on the user's PC and not distributed: the contrib packages' i
 
 - **What it holds**: the Fedora 44 image `tools/package/build.sh` uses (pinned by digest), with the release's rpm, checked against `SHA256SUMS`.
   Then every maker's package its `BUILD.json` records in `runtime` (Level Zero, cuBLAS, oneMKL)
-  and Mesa's Vulkan drivers (`container/install.sh`).
   NVIDIA's driver libraries and `nvidia-smi` are not in it: CDI brings the host's.
 - **AMD's ROCm**: not Fedora's (7.1) but the ROCm of AMD's Radeon repository (its RHEL 10 one; 10.1 by default): its HIP runtime, rocBLAS and hipBLASLt.
   rocBLAS's and hipBLASLt's packages go in for every AMD GPU the engine has code for (`BUILD.json`'s `hip_archs`: RDNA2 to RDNA4), so that one image runs on each generation.

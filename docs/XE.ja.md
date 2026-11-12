@@ -167,7 +167,7 @@ RX 9060 XT で upstream v0.2.1.1 と比べました（IQ3_XXS の generate）。
 upstream のエンジンの変更は、ほかの GPU の計測の経路（1 枚の GPU、エキスパートを RAM に置く）に効かないので、B70 と RTX 4070 は 0.2.0-beta の比べを使っています。
 
 移していないのは、アプリとターミナル、Docker の配布、Mac、upstream の `sycl/`、HIP の内蔵 GPU と hipBLASLt の表と GPU のキューの開き方（RX 9060 XT の XeStrata の prompt は起動ごとに 1.5% の幅に収まっていて、upstream の直した 2 つの速さに分かれる現象は出ていません）、
-experts.bin の pack の I/O の先読みとファイルの段（その土台が XeStrata にありません）、Intel の GPU の画像の読み手（XeStrata は Vulkan の読み手を持ちます）です。
+experts.bin の pack の I/O の先読みとファイルの段（その土台が XeStrata にありません）、Intel の GPU の画像の読み手（XeStrata は自前の視覚エンコーダーで読みます）です。
 
 ## Strata 0.2.0-beta の取り込み
 
@@ -672,17 +672,16 @@ B70 も全部 CPU（以前と同じ）で、RX 9060 XT は PCIe に回す数が 
 ## 画像
 
 画像は、setup で選んだときだけ使えます（既定はオフ）。
-選ぶと、画像のエンコーダー（`tools/vision`。llama.cpp の mtmd とモデルの mmproj）は既定で GPU で動きます（`./setup.sh --vision yes` または `gpu`）。
-GPU で動かせないときは CPU のエンコーダーに切り替わり、`--vision cpu` では CPU のエンコーダーだけを使います。
+選ぶと、画像のエンコーダーは既定で GPU で動きます（`./setup.sh --vision yes` または `gpu`）。
+GPU のエンコーダーは XeStrata 自身の視覚エンコーダー（画像エンジンと共通の `src/core/vision.cpp`。モデルの mmproj の Qwen3-VL の ViT と merger）で、エンジンと一緒にビルドされます（`xestrata-vision-gpu`）。
+GPU で動かせないときは CPU のエンコーダー（`tools/vision` の `xestrata-vision-cpu`。llama.cpp の mtmd とモデルの mmproj）に切り替わり、`--vision cpu` では CPU のエンコーダーだけを使います。
 CPU のエンコーダーは、確かめた画像を、2 つの形の格子で llama.cpp と同じに読みます。
 動くモデルはすべて画像でも確かめました。
 2 つの形の格子、1 つの要求に 2 枚の画像、同じ画像をもう一度送ってそのキャッシュを使う会話です。
 
-GPU のエンコーダーは Vulkan のビルド（ggml-vulkan、`-DSTRATA_VISION_VULKAN=ON`）です。
-GPU を PCI アドレスで選びます（`xestrata-vision --gpu-pci`、設定の `vision.gpu_pci`）。
-Vulkan では、最初の GPU が CPU 内蔵のグラフィックスやほかの GPU のこともあるためです。
-Intel の GPU のドライバーは自由ソフトウェアの Mesa です。
-CPU のエンコーダー（8 スレッド）より 7〜9 倍速く、埋め込みは CPU のエンコーダーと 2.4〜3.1%（相対 L2）違い、毎回ビット単位で同じになります。
+GPU を PCI アドレスで選びます（`xestrata-vision-gpu --gpu-pci`、設定の `vision.gpu_pci`）。
+最初の GPU が CPU 内蔵のグラフィックスやほかの GPU のこともあるためです。
+CPU のエンコーダー（8 スレッド）より 30〜50 倍速く（1,024 トークンの絵で 0.2〜0.3 秒 対 10〜13 秒）、埋め込みは CPU のエンコーダーと 1.5〜5.3%（相対 L2）違い、毎回ビット単位で同じになります。
 （contrib-icpx のモードにあった SYCL のビルド（ggml-sycl、oneMKL）は、そのモードと一緒に 2026-10-15 に廃止しました。）
 
 server は、どちらかが準備できるまで、エンコーダーを次の順に起動します。

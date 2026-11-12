@@ -164,7 +164,7 @@ Carried in:
 Compared with upstream v0.2.1.1 on the RX 9060 XT (IQ3_XXS's generate): 2.1 to 2.7 times as fast in prefill, 3 to 7% faster in decode.
 Upstream's engine changes do not touch the other GPUs' measured paths (one GPU, the experts in RAM), so the B70 and the RTX 4070 keep the 0.2.0-beta comparison.
 
-Not carried in: the app and the terminal, the Docker distribution, the Mac, upstream's `sycl/`, HIP's integrated-GPU defaults, hipBLASLt tables and the order the GPU queues are opened in (XeStrata's RX 9060 XT prompts stay within 1.5% from start to start: the two speeds upstream fixed do not show), the experts.bin packs' I/O read-ahead and file tier (XeStrata lacks their groundwork), and the Intel GPU picture reader (XeStrata has its Vulkan reader).
+Not carried in: the app and the terminal, the Docker distribution, the Mac, upstream's `sycl/`, HIP's integrated-GPU defaults, hipBLASLt tables and the order the GPU queues are opened in (XeStrata's RX 9060 XT prompts stay within 1.5% from start to start: the two speeds upstream fixed do not show), the experts.bin packs' I/O read-ahead and file tier (XeStrata lacks their groundwork), and the Intel GPU picture reader (XeStrata reads with its own vision encoder).
 
 ## Integration through Strata 0.2.0-beta
 
@@ -682,17 +682,16 @@ The B70 keeps every miss on the CPU, as before; the RX 9060 XT reads 1.0 instead
 ## Images
 
 Images are available only when chosen in setup (off by default).
-When they are, the image encoder (`tools/vision`: llama.cpp's mtmd with the model's mmproj) runs on the GPU by default (`./setup.sh --vision yes` or `gpu`).
-When it cannot, the CPU encoder takes over; `--vision cpu` uses the CPU encoder alone.
+When they are, the image encoder runs on the GPU by default (`./setup.sh --vision yes` or `gpu`).
+The GPU encoder is XeStrata's own vision encoder (shared with the image engine, `src/core/vision.cpp`: Qwen3-VL's ViT and merger from the model's mmproj), built with the engine (`xestrata-vision-gpu`).
+When it cannot run, the CPU encoder takes over (`tools/vision`'s `xestrata-vision-cpu`: llama.cpp's mtmd with the model's mmproj); `--vision cpu` uses the CPU encoder alone.
 The CPU encoder reads the pictures checked as llama.cpp does, on grids of both shapes.
 Every model that runs was checked with images:
 two grid shapes, two images in one request, and a conversation that sends the image again and reuses its cache.
 
-The GPU encoder is the Vulkan build (ggml-vulkan, `-DSTRATA_VISION_VULKAN=ON`).
-It takes the GPU by its PCI address (`xestrata-vision --gpu-pci`, from the config's `vision.gpu_pci`):
-with Vulkan the first GPU can be the processor's graphics or another card.
-On Intel GPUs its driver is Mesa, free software.
-It encodes 7–9× faster than the CPU encoder (8 threads); its embeddings differ from the CPU encoder's by 2.4–3.1% (relative L2) and repeat bit for bit.
+It takes the GPU by its PCI address (`xestrata-vision-gpu --gpu-pci`, from the config's `vision.gpu_pci`):
+the first GPU can be the processor's graphics or another card.
+It encodes 30–50× faster than the CPU encoder (8 threads; 0.2–0.3 s against 10–13 s for a 1,024-token picture); its embeddings differ from the CPU encoder's by 1.5–5.3% (relative L2) and repeat bit for bit.
 (The SYCL build of the contrib-icpx mode, ggml-sycl with oneMKL, was removed with that mode on 2026-10-15.)
 
 The server starts the encoders in this order until one is ready:

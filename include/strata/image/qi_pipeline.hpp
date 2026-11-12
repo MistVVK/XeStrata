@@ -19,7 +19,7 @@
 #include "strata/image/qi_dit.hpp"
 #include "strata/image/text_encoder.hpp"
 #include "strata/image/qi_vae.hpp"
-#include "strata/image/qi_vision.hpp"
+#include "strata/core/vision.hpp"
 
 #include <cstdint>
 #include <functional>
@@ -87,7 +87,7 @@ private:
     /// The text encoder's states of a prompt (its pictures' rows among the tokens), the engine's stream's work done
     /// first (the encoder runs on its own); a failure throws.
     std::vector<float> text(const std::vector<int32_t>& ids, const std::vector<TextEncoder::Picture>& pictures);
-    void edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::vector<QiVisionOut>& vouts,
+    void edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::vector<core::VisionOut>& vouts,
                    std::vector<TextEncoder::Picture>& te_images, std::vector<QiDit::Ref>& dit_refs, std::vector<float*>& ref_z,
                    std::vector<int32_t>& neg_ids, std::vector<TextEncoder::Picture>& neg_te,
                    std::vector<QiDit::Ref>& neg_refs, bool vision = true);
@@ -102,8 +102,8 @@ private:
 
     void* s_ = nullptr;
     std::string dit_path_, vae_path_, text_path_, vision_path_;
-    std::unique_ptr<QiVision> vision_;           // an edit's, opened for it and let go after it
-    std::unique_ptr<QiVision> vision_size_;
+    std::unique_ptr<core::Vision> vision_;           // an edit's, opened for it and let go after it
+    std::unique_ptr<core::Vision> vision_size_;
     std::unique_ptr<TextEncoder> te_;
     std::unique_ptr<QiDit> dit_;
     std::unique_ptr<QiVae> vae_;
@@ -125,7 +125,7 @@ private:
     /// vision output's shape: an edit whose states are kept (the same request and references) widens its pads from
     /// these, without the vision encoder, whose output only the text encoder reads
     std::vector<int32_t> last_req_ids_, last_req_neg_;
-    std::vector<QiVisionOut> last_vision_;
+    std::vector<core::VisionOut> last_vision_;
     /// The VAE's latents kept for the same images: the references' (the DiT's input; refs_key of them, empty none) and
     /// a mask's or img2img's base image's at the picture's size (its key and the size): an edit of the same images
     /// again encodes neither

@@ -32,7 +32,7 @@
 #include "strata/image/moss_dit.hpp"
 #include "strata/image/text_encoder.hpp"
 #include "strata/image/pipeline.hpp"
-#include "strata/image/qi_vision.hpp"
+#include "strata/core/vision.hpp"
 #include "strata/image/w8_choice.hpp"
 
 #include <cstdint>
@@ -113,7 +113,7 @@ private:
     void few_steps(const QiRequest& r, float* x, int64_t h, int64_t w, const std::function<bool(int, int)>& step,
                    const std::function<void(int, const std::function<void(float*)>&)>& peek);
     /// The pictures' rows through the vision encoder (opened for them and closed after), one block each.
-    std::vector<QiVisionOut> encode_pictures(const std::vector<QiRef>& pictures);
+    std::vector<core::VisionOut> encode_pictures(const std::vector<QiRef>& pictures);
 
     void* s_ = nullptr;
     std::string dit_path_, vae_path_, text_path_;
@@ -123,7 +123,7 @@ private:
     int64_t ref_rows_ = 0;   // the request's references' latent rows (plan counts their kept keys and values)
     QiRefLayout ref_layout_ = QiRefLayout::MossEdit;   // and their layout (in the stream: as text rows)
     std::string vision_path_;
-    std::unique_ptr<QiVision> vision_size_;
+    std::unique_ptr<core::Vision> vision_size_;
     int32_t image_pad_ = -1;   // the text encoder's <|image_pad|>, through TextEncoder::pad_id (its GGUF's vocabulary)
     std::vector<std::pair<int64_t, int64_t>> pictures_;   // set_pictures_given's
     std::string last_pics_, last_neg_pics_;   // the pictures the kept states were made with (refs_key)

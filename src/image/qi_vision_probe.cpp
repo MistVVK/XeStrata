@@ -8,7 +8,7 @@
 // Prints how far the embeddings and each DeepStack block are from the run's, and the encoder's time.
 
 #include "strata/core/runtime.hpp"
-#include "strata/image/qi_vision.hpp"
+#include "strata/core/vision.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -58,12 +58,12 @@ int main(int argc, char** argv) {
     try {
         const std::string dir = argv[2];
         void* s = strata::core::Runtime::get().create_stream();
-        strata::image::QiVision vit;
+        strata::core::Vision vit;
         std::string err;
         if (!vit.open(argv[1], s, err)) throw std::runtime_error(err);
         const auto rgb = load(dir, "vit_in_0");
         const auto side = (int64_t) std::lround(std::sqrt((double) rgb.size() / 3));   // a square reference
-        strata::image::QiVisionOut out = vit.encode(rgb.data(), side, side);   // warm-up
+        strata::core::VisionOut out = vit.encode(rgb.data(), side, side);   // warm-up
         const auto t0 = std::chrono::steady_clock::now();
         out = vit.encode(rgb.data(), side, side);
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();

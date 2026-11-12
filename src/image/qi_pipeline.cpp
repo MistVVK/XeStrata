@@ -139,7 +139,7 @@ bool QiPipeline::open(const std::string& dit, const std::string& vae, const std:
     text_path_ = text;
     vision_path_ = vision;
     if (!vision.empty()) {
-        vision_size_ = std::make_unique<QiVision>();
+        vision_size_ = std::make_unique<core::Vision>();
         if (!vision_size_->open(vision, s_, err, true)) return false;
     }
     size_t free = 0, total = 0;
@@ -363,7 +363,7 @@ QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w, int64_t n_ids, int64_t 
     return p;
 }
 
-void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::vector<QiVisionOut>& vouts,
+void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::vector<core::VisionOut>& vouts,
                            std::vector<TextEncoder::Picture>& te_images, std::vector<QiDit::Ref>& dit_refs,
                            std::vector<float*>& ref_z, std::vector<int32_t>& neg_ids,
                            std::vector<TextEncoder::Picture>& neg_te, std::vector<QiDit::Ref>& neg_refs, bool vision) {
@@ -382,7 +382,7 @@ void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::v
     ensure_open();
     std::string err;
     if (vision) {
-        vision_ = std::make_unique<QiVision>();
+        vision_ = std::make_unique<core::Vision>();
         if (!vision_->open(vision_path_, s_, err)) {
             vision_.reset();
             throw std::runtime_error(err);
@@ -412,8 +412,8 @@ void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::v
         if (vision) {
             vouts.push_back(vision_->encode(rgb.data(), rw, rh));
         } else {   // the kept states' references: their vision outputs' shapes only (no rows: the text is not encoded)
-            QiVisionOut v;
-            const QiVisionOut& was = last_vision_[vouts.size()];
+            core::VisionOut v;
+            const core::VisionOut& was = last_vision_[vouts.size()];
             v.rows = was.rows;
             v.dim = was.dim;
             v.grid_h = was.grid_h;
@@ -441,8 +441,8 @@ void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::v
     kept_.refs = key;   // every reference's latent is in kept_ now
     if (vision) {   // their shapes, for the next edit of the same request and references
         last_vision_.clear();
-        for (const QiVisionOut& v : vouts) {
-            QiVisionOut s;
+        for (const core::VisionOut& v : vouts) {
+            core::VisionOut s;
             s.rows = v.rows;
             s.dim = v.dim;
             s.grid_h = v.grid_h;
@@ -461,7 +461,7 @@ void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::v
             }
             if (k >= vouts.size())
                 throw std::invalid_argument("image engine: the negative prompt's image pads and the references differ");
-            const QiVisionOut& v = vouts[k];
+            const core::VisionOut& v = vouts[k];
             TextEncoder::Picture im;
             im.index = (int64_t) out.size();
             im.nx = v.grid_w;
@@ -499,7 +499,7 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     use_loras(r);   // before the plan (their bytes are fixed) and the context (a set that changed drops it)
     // an edit: its references through the vision encoder and the VAE's encoder, their pads widened to their tokens
     std::vector<int32_t> ids;
-    std::vector<QiVisionOut> vouts;
+    std::vector<core::VisionOut> vouts;
     std::vector<TextEncoder::Picture> te_images;
     std::vector<QiDit::Ref> dit_refs;
     std::vector<float*> ref_z;   // the references' latents (kept_'s)

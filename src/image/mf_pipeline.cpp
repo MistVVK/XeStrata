@@ -64,7 +64,7 @@ void vl_size(int64_t w, int64_t h, int64_t& cw, int64_t& ch, int64_t& vw, int64_
 // an edit's references as the parts take them: the widened prompts and their images for the text encoder, the
 // references' latents for the DiT (device, [rows][channels])
 struct MfPipeline::Edit {
-    std::vector<QiVisionOut> vouts;
+    std::vector<core::VisionOut> vouts;
     std::vector<int32_t> ids, neg_ids;
     std::vector<TextEncoder::Picture> te, neg_te;
     std::vector<std::pair<int64_t, int64_t>> sizes;
@@ -101,7 +101,7 @@ bool MfPipeline::open(const std::string& dit, const std::string& vae, const std:
             err = "image engine: Mage-Flow's edits need both the edit DiT and the vision encoder";
             return false;
         }
-        vision_size_ = std::make_unique<QiVision>();
+        vision_size_ = std::make_unique<core::Vision>();
         if (!vision_size_->open(vision_path_, s_, err, true) || !vae_size_->open_encoder(err, true)) return false;
     }
     auto_budget_ = vram_cap(free);
@@ -344,11 +344,11 @@ void MfPipeline::edit_refs(const QiRequest& r, Edit& e) {
     std::string err;
     if (!vae_->open_encoder(err)) throw std::runtime_error(err);
     if (!vision_) {   // kept for the next edit while the budget has room for it (plan)
-        auto v = std::make_unique<QiVision>();
+        auto v = std::make_unique<core::Vision>();
         if (!v->open(vision_path_, s_, err)) throw std::runtime_error(err);
         vision_ = std::move(v);
     }
-    QiVision& vision = *vision_;
+    core::Vision& vision = *vision_;
     e.rows = (int64_t) r.refs.size() * h * w;
     const int64_t Z = dit_size_->latent_channels();
     float* rgb = nullptr;
@@ -404,7 +404,7 @@ void MfPipeline::edit_refs(const QiRequest& r, Edit& e) {
             }
             if (k >= e.vouts.size())
                 throw std::invalid_argument("image engine: the negative prompt's image pads and the references differ");
-            const QiVisionOut& v = e.vouts[k++];
+            const core::VisionOut& v = e.vouts[k++];
             TextEncoder::Picture im;
             im.index = (int64_t) out.size();
             im.nx = v.grid_w;

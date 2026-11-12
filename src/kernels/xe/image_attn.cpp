@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/image/qi_attn.cpp - the DiT's attention on the GPU's matrix engines (qi_kernels.hpp: qi_attention).
+// src/kernels/xe/image_attn.cpp - the image engine's attention on the GPU's matrix engines
+// (include/strata/kernels/image_attn.hpp: qi_attention).
 //
 // The 16-bit attention is the kernel the plain models' prompt shares (strata/kernels/flash_attn.hpp, on the
 // matrix engines); Q, K and V hold their rows rounded up to a multiple of 128 (qi_attn_rows), the rows past T zero.
 // A GPU without matrix engines, or STRATA_NO_XMX=1, takes its FMA form.  The int8 attention is flash_attn's too
 // (flash_attn_i8.cpp).
-#include "strata/image/qi_kernels.hpp"
+#include "strata/kernels/image_attn.hpp"
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
@@ -17,7 +18,7 @@
 #include "strata/kernels/matrix_report.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/platform/env.hpp"
-#include "../kernels/xe/attn_parts.hpp"
+#include "attn_parts.hpp"
 
 #include <sycl/sycl.hpp>
 

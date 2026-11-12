@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// include/strata/image/qi_vision.hpp - the image model's vision encoder (Qwen3-VL's ViT, its mmproj GGUF) on the GPU:
-// a reference image (RGB in -1 .. 1, sides multiples of 32) to the text encoder's image embeddings, one per 32 x 32
-// pixels (2 x 2 patches merged), and the DeepStack ones the text encoder adds after its first layers.
+// include/strata/core/vision.hpp - the vision encoder the chat's picture reader and the image engine share: Qwen3-VL's
+// ViT and its merger, from the model's mmproj GGUF, on the GPU.  A picture (RGB in -1 .. 1, sides multiples of 32) to
+// the text model's image embeddings, one per 32 x 32 pixels (2 x 2 patches merged), and the DeepStack ones the text
+// encoder adds after its first layers.
 #pragma once
 
 #include "strata/prefill/gemm.hpp"
@@ -16,33 +17,37 @@ namespace strata {
 class GgufFile;
 }
 
-namespace strata::image {
+namespace strata::core {
 
 /// The encoder's output: rows tokens of dim (main), and one such block per DeepStack layer (host FP32).
-struct QiVisionOut {
+struct VisionOut {
     int64_t rows = 0, dim = 0, grid_h = 0, grid_w = 0;   // grid: the merged tokens' rows and columns
     std::vector<float> main;
     std::vector<std::vector<float>> deepstack;
 };
 
-class QiVision {
+class Vision {
 public:
-    QiVision();
-    ~QiVision();
-    QiVision(const QiVision&) = delete;
-    QiVision& operator=(const QiVision&) = delete;
+    Vision();
+    ~Vision();
+    Vision(const Vision&) = delete;
+    Vision& operator=(const Vision&) = delete;
 
     /// Reads the mmproj GGUF and puts its weights on the current GPU (`dry`: the sizes only).
     bool open(const std::string& path, void* stream, std::string& err, bool dry = false);
 
     /// rgb [3][height][width] (host, -1 .. 1) -> the embeddings; the tokens in rows of the merged grid.
-    QiVisionOut encode(const float* rgb, int64_t width, int64_t height);
+    VisionOut encode(const float* rgb, int64_t width, int64_t height);
 
     uint64_t weight_bytes() const { return weight_bytes_; }
     /// The GPU memory an encode of an image of `tokens` patches works in.
     uint64_t scratch_bytes(int64_t patches) const;
     /// Frees the working buffers.
     void drop_scratch();
+    /// The patch's side and the patches a merged token holds (the mmproj's: a picture's sides are multiples of their
+    /// product, as the reader resizes them).
+    int64_t patch() const { return patch_; }
+    int64_t merge() const { return merge_; }
 
 private:
     struct W {
@@ -90,4 +95,4 @@ private:
     int32_t* yx_ = nullptr;
 };
 
-}  // namespace strata::image
+}  // namespace strata::core

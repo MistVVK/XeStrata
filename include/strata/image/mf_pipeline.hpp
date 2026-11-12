@@ -30,7 +30,7 @@
 #include "strata/image/mf_dit.hpp"
 #include "strata/image/mf_vae.hpp"
 #include "strata/image/pipeline.hpp"
-#include "strata/image/qi_vision.hpp"
+#include "strata/core/vision.hpp"
 #include "strata/image/text_encoder.hpp"
 #include "strata/image/w8_choice.hpp"
 
@@ -92,8 +92,8 @@ private:
     std::unique_ptr<MfDit> dit_, edit_dit_;
     // the closed DiTs' blocks in 8 bits (release(true)), for their next open
     std::vector<std::vector<uint8_t>> dit_host_, edit_host_;
-    std::unique_ptr<QiVision> vision_;        // the edits' vision encoder, while the budget has room for it
-    std::unique_ptr<QiVision> vision_size_;
+    std::unique_ptr<core::Vision> vision_;        // the edits' vision encoder, while the budget has room for it
+    std::unique_ptr<core::Vision> vision_size_;
     std::unique_ptr<MfVae> vae_;
     std::unique_ptr<TextEncoder> te_size_;
     std::unique_ptr<MfDit> dit_size_, dit16_size_;   // the DiT's sizes as Q8_0 and as FP16

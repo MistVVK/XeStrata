@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/image/qi_sdpa.cpp - see include/strata/image/qi_kernels.hpp (qi_sdpa): the image attention's unmasked rows through
+// src/kernels/xe/image_sdpa.cpp - see include/strata/kernels/image_attn.hpp (qi_sdpa): the image attention's
+// unmasked rows through
 // a GPU maker's kernel, the tensors' strides the engine's [rows][heads * head_dim] as they are, a plan built once a shape
 // (the query rows, the key rows) and kept:
 //   * Intel GPUs: oneDNN's SDPA through its graph API (Q . K^T, the scale, the softmax, . V fused into one partition);
@@ -10,7 +11,7 @@
 //     queue's HIP stream, in a module the kernels open on an AMD GPU only (kernels::aotriton_sdpa).
 // A GPU or a build without one, or a failure, leaves it to the engine's own kernel.
 
-#include "strata/image/qi_kernels.hpp"
+#include "strata/kernels/image_attn.hpp"
 
 #include "strata/kernels/sdpa_cudnn_internal.hpp"
 #include "strata/kernels/sdpa_select.hpp"

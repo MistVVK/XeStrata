@@ -18,8 +18,8 @@ What the first run does (each step is skipped when it is already done):
      disk space
   2. asks the questions
   3. installs the Python packages it needs into .venv (numpy, jinja2, ...)
-  4. compiles the Strata engine for the GPU with a SYCL compiler (see docs/XE.md) with its image generator, and the
-     image encoder when images are wanted (on the CPU, and on the GPU through Vulkan)
+  4. compiles the Strata engine for the GPU with a SYCL compiler (see docs/XE.md) with its image generator and its
+     vision encoder (the picture reader on the GPU), and llama.cpp's mtmd for the CPU reader when images are wanted
   5. downloads the model from Hugging Face (resumable), and the vision encoder if you want images
   6. prepares the model for Strata and fetches the MTP draft layer (~5 GB, from the original Qwen checkpoint)
   7. writes run-<model>.sh and starts the model
@@ -1457,15 +1457,18 @@ VISION = {"gpu": {"max_tokens": 1024, "reserve_mib": 700},
           "cpu": {"max_tokens": 300, "reserve_mib": 700}}
 EXE = "xestrata-engine.exe" if WIN else "xestrata-engine"
 IMAGE_EXE = "xestrata-image.exe" if WIN else "xestrata-image"   # the image engine (serve/images.py), built with it
-# the image encoder, one binary per place it runs: the configs of different models may use different ones
-# the image encoders: on the CPU, and on the GPU through Vulkan
+# the picture readers, one binary per place it runs: the configs of different models may use different ones.
+# "gpu" is the engine's own vision encoder (strata-vision-gpu, built with the engine), "cpu" llama.cpp's mtmd
 VEXE = {k: v + (".exe" if WIN else "") for k, v in
-        {"cpu": "xestrata-vision-cpu", "vulkan": "xestrata-vision-vulkan"}.items()}
+        {"cpu": "xestrata-vision-cpu", "gpu": "xestrata-vision-gpu"}.items()}
 # a config written before the programs took XeStrata's names names upstream's: point_engine_parts writes the new ones
 # (repoint_engine, on every start)
 UPSTREAM_EXES = ("strata", "strata-image", "strata-vision-cpu", "strata-vision-vulkan")   # upstream's names
 RENAMED = {old + ext: ("xestrata-engine" if old == UPSTREAM_EXES[0] else "xe" + old) + ext
            for old in UPSTREAM_EXES for ext in (("", ".exe") if WIN else ("",))}
+# the GPU picture reader is the engine's own vision encoder now: a config that named the Vulkan one gets the new binary
+RENAMED.update({"xestrata-vision-vulkan" + ext: "xestrata-vision-gpu" + ext
+                for ext in (("", ".exe") if WIN else ("",))})
 
 
 # ------------------------------------------------------------------------------------------------ output
@@ -2006,10 +2009,9 @@ def amd_elsewhere() -> str:
 
 
 # The distribution packages that building and running XeStrata from the source needs (docs/BUILD.md, "Packages"), by
-# distribution and part: "base" for the free and contrib modes (intel/llvm's build tools, the image encoders' and the
-# optional conversation compression's), and each GPU maker's (Intel's oneMKL in the contrib mode only, NVIDIA's in the
-# contrib mode only).  On Arch the
-# Vulkan ICD is the GPU maker's own package, not one mesa-vulkan-drivers carries for both.  opencl-headers: intel/llvm's
+# distribution and part: "base" for the free and contrib modes (intel/llvm's build tools, the CPU picture reader's and
+# the optional conversation compression's), and each GPU maker's (Intel's oneMKL in the contrib mode only, NVIDIA's in
+# the contrib mode only).  opencl-headers: intel/llvm's
 # SYCL tools (sycl-ls, part of what its build installs) include CL/cl.h, and they get no include for the OpenCL headers
 # the configuration fetches (those are the runtime's own objects'); no distribution's compiler brings the header in (a
 # fresh Fedora 44 lacks it as Arch does).
@@ -2021,8 +2023,8 @@ def amd_elsewhere() -> str:
 ONEMKL_SERIES = "2026.2"
 PACKAGES = {
     "ubuntu": {
-        "base": "python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc "
-                "spirv-headers opencl-headers mesa-vulkan-drivers libblosc2-dev",
+        "base": "python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev "
+                "opencl-headers libblosc2-dev",
         "intel": "libze1 libze-intel-gpu1 libigc2 libigdfcl2",
         "intel-contrib": f"intel-oneapi-mkl-sycl-devel-{ONEMKL_SERIES}",
         "amd": "libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev "
@@ -2031,7 +2033,7 @@ PACKAGES = {
     },
     "fedora": {
         "base": "python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static "
-                "vulkan-loader-devel glslc spirv-headers-devel opencl-headers mesa-vulkan-drivers blosc2-devel",
+                "opencl-headers blosc2-devel",
         "intel": "oneapi-level-zero oneapi-level-zero-devel intel-level-zero",
         "intel-contrib": f"intel-oneapi-mkl-sycl-devel-{ONEMKL_SERIES}",
         "amd": "rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel "
@@ -2043,25 +2045,22 @@ PACKAGES = {
         # (Intel's offline installer is the way to it), so an Intel GPU's dense products stay in XeStrata's own
         # kernels.  zstd's package has no libzstd.a, so
         # intel/llvm's build links the shared one (tools/intel_llvm_build.py).
-        "base": "python base-devel git cmake ninja lld hwloc zstd vulkan-headers vulkan-icd-loader shaderc "
-                "spirv-headers opencl-headers blosc2",
-        "intel": "level-zero-loader intel-compute-runtime vulkan-intel",
+        "base": "python base-devel git cmake ninja lld hwloc zstd opencl-headers blosc2",
+        "intel": "level-zero-loader intel-compute-runtime",
         "intel-contrib": "",
         # ROCm's clang (rocm-llvm) carries clang's runtime builtins too, which HIP's CMake package asks for where
         # PACKAGES' other lists name a package of their own for them (Debian's libclang-rt-21-dev)
-        "amd": "hip-runtime-amd rocm-device-libs rocm-llvm rocm-llvm rocblas hipblaslt hipblas-common vulkan-radeon",
+        "amd": "hip-runtime-amd rocm-device-libs rocm-llvm rocm-llvm rocblas hipblaslt hipblas-common",
         "nvidia": "cuda",
     },
 }
 
 # The packages of the tools setup does not install itself, for its messages, by distro_family()
 TOOL_PACKAGES = {
-    "ubuntu": {"g++": "build-essential", "glslc": "glslc", "vulkan": "libvulkan-dev", "spirv": "spirv-headers",
-               "pdf": "poppler-utils", "jsonschema": "python3-jsonschema", "ffmpeg": "ffmpeg"},
-    "fedora": {"g++": "gcc-c++", "glslc": "glslc", "vulkan": "vulkan-loader-devel", "spirv": "spirv-headers-devel",
-               "pdf": "poppler-utils", "jsonschema": "python3-jsonschema", "ffmpeg": "ffmpeg-free"},
-    "arch": {"g++": "base-devel", "glslc": "shaderc", "vulkan": "vulkan-headers", "spirv": "spirv-headers",
-             "pdf": "poppler", "jsonschema": "python-jsonschema", "ffmpeg": "ffmpeg"},
+    "ubuntu": {"g++": "build-essential", "pdf": "poppler-utils", "jsonschema": "python3-jsonschema",
+               "ffmpeg": "ffmpeg"},
+    "fedora": {"g++": "gcc-c++", "pdf": "poppler-utils", "jsonschema": "python3-jsonschema", "ffmpeg": "ffmpeg-free"},
+    "arch": {"g++": "base-devel", "pdf": "poppler", "jsonschema": "python-jsonschema", "ffmpeg": "ffmpeg"},
 }
 
 # The command that installs distribution packages on this PC, by distro_family()
@@ -4822,26 +4821,13 @@ def choose_compiler(a, gpu: dict) -> dict:
 
 
 def check_build_tools(comp: dict) -> None:
-    """What the build needs besides the SYCL compiler: g++ for the CPU image encoder (glslc and the Vulkan headers for
-    the Vulkan one: vulkan_missing).  Setup does not install them (no apt or sudo from setup): it says what is
-    missing."""
+    """What the build needs besides the SYCL compiler: g++ for the CPU picture reader (llama.cpp's mtmd).  Setup does
+    not install it (no apt or sudo from setup): it says what is missing."""
     missing = []
     if shutil.which("g++") is None:
         missing.append(tool_pkg("g++"))
     if missing:
         fail("missing: " + ", ".join(missing), "install them, then run it again (docs/XE.md lists the packages)")
-
-
-def vulkan_missing() -> list:
-    """The packages the Vulkan image encoder (ggml-vulkan) needs that are not installed."""
-    need = []
-    if shutil.which("glslc") is None:
-        need.append(tool_pkg("glslc"))
-    if not Path("/usr/include/vulkan/vulkan.h").exists():
-        need.append(tool_pkg("vulkan"))
-    if not Path("/usr/include/spirv/unified1/spirv.hpp").exists():
-        need.append(tool_pkg("spirv"))
-    return need
 
 
 def cmake_build(src, bdir, target, defs, env=None):
@@ -4857,8 +4843,8 @@ def cmake_build(src, bdir, target, defs, env=None):
              "run: .venv python -m pip install -r requirements-build.txt")
     conf = [cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(src), "-B", str(bdir),
             "-DCMAKE_BUILD_TYPE=Release", *defs]
-    # the tools on PATH too: ggml's Vulkan backend configures its shader generator as a separate CMake project
-    # (ExternalProject) that asks for Ninja by name, which fails on a clean system where only pip's ninja exists
+    # the tools on PATH too: llama.cpp's ggml configures its CPU build as a separate CMake project (ExternalProject)
+    # that asks for Ninja by name, which fails on a clean system where only pip's ninja exists
     env = dict(env or os.environ)
     env["PATH"] = os.pathsep.join(dict.fromkeys([str(Path(ninja).parent), str(Path(cmake).parent),
                                                  env.get("PATH", "")]))
@@ -4869,7 +4855,9 @@ def cmake_build(src, bdir, target, defs, env=None):
     run([cmake, "--build", str(bdir), "--target", *targets, "-j", str(jobs)], env=env)
 
 
-ENGINE_SOURCES = ("CMakeLists.txt", "cmake", "src", "include", "third_party/main/ggml")
+# the GPU picture reader (tools/vision/strata_vision.cpp) is built with the engine and its sources count for it; the
+# CPU reader's own (tools/vision/strata_vision_mtmd.cpp and its gguf_meta) are hashed apart
+ENGINE_SOURCES = ("CMakeLists.txt", "cmake", "src", "include", "third_party/main/ggml", "tools/vision")
 VISION_SOURCES = ("tools/vision",)
 
 
@@ -4916,10 +4904,10 @@ def engine_cmake_args() -> list:
 
 
 def build_engine(visions, llama, comp: dict, data: Path) -> Path:
-    """Compile the engine with `comp` (choose_compiler) and the image encoders in `visions` ("cpu", "vulkan"); the
-    results go to engine/.  A compiled engine or encoder whose source files or compiler changed since (a
-    `git pull`, another intel/llvm) is compiled again.  Each encoder has its own binary, so installing one never
-    replaces the other."""
+    """Compile the engine with `comp` (choose_compiler) and the picture readers in `visions` ("gpu": the engine's own
+    vision encoder, built with the engine; "cpu": llama.cpp's mtmd, built apart); the results go to engine/.  A
+    compiled engine or reader whose source files or compiler changed since (a `git pull`, another intel/llvm) is
+    compiled again.  Each reader has its own binary, so installing one never replaces the other."""
     eng = ROOT / "engine"
     eng.mkdir(exist_ok=True)
     stamp = eng / "BUILD.json"
@@ -4936,17 +4924,15 @@ def build_engine(visions, llama, comp: dict, data: Path) -> Path:
     cudnn = nvidia_libs_dir(data) / "nvidia" / "cudnn"
     if comp["license"] == "contrib" and comp["cuda_archs"] and (cudnn / "include" / "cudnn.h").exists():
         used["cudnn_root"] = str(cudnn)
-    engine_ok = (xe and (eng / EXE).exists() and (eng / IMAGE_EXE).exists() and meta.get("src") == src
-                 and meta.get("compiler") == used)
+    engine_ok = (xe and (eng / EXE).exists() and (eng / IMAGE_EXE).exists() and (eng / VEXE["gpu"]).exists()
+                 and meta.get("src") == src and meta.get("compiler") == used)
+    # the CPU reader alone is built apart (the old records call the GPU reader "vulkan": the engine's own now)
     built = dict(meta.get("vision_srcs") or {}) if xe else {}
-    missing = [v for v in dict.fromkeys(visions)
-               if v in VEXE and not ((eng / VEXE[v]).exists() and built.get(v) == vsrc)]
+    missing = ["cpu"] if "cpu" in visions and not ((eng / VEXE["cpu"]).exists() and built.get("cpu") == vsrc) else []
     if engine_ok and not missing:
         ok("engine already built for this PC")
         return eng
     check_build_tools(comp)
-    if "vulkan" in missing and (need := vulkan_missing()):
-        fail("the Vulkan image encoder needs: " + ", ".join(need), "install them: " + install_cmd(need))
     if not engine_ok:
         bdir = ROOT / "build-xe"
         cache = bdir / "CMakeCache.txt"
@@ -4955,7 +4941,8 @@ def build_engine(visions, llama, comp: dict, data: Path) -> Path:
             shutil.rmtree(bdir)                        # CMake keeps the compiler and the -D values it configured with
         say("  The engine's source changed: compiling it again (only what changed) ..." if xe and (eng / EXE).exists()
             and bdir.exists() else "  Compiling the XeStrata engine for the GPU (20-40 minutes, once) ...")
-        cmake_build(ROOT, bdir, ["strata", "strata-image"],   # the targets keep upstream's names (CMakeLists.txt)
+        # the targets keep upstream's names (CMakeLists.txt); strata-vision-gpu is the picture reader
+        cmake_build(ROOT, bdir, ["strata", "strata-image", "strata-vision-gpu"],
                     [f"-DCMAKE_CXX_COMPILER={comp['cxx']}", f"-DCMAKE_C_COMPILER={comp['cc']}",
                      f"-DSTRATA_LICENSE={comp['license']}",
                      f"-DSTRATA_CUDA_ARCHS={'auto' if comp['cuda_archs'] else ''}",
@@ -4967,19 +4954,14 @@ def build_engine(visions, llama, comp: dict, data: Path) -> Path:
                      *([f"-DSTRATA_CUDNN_ROOT={used['cudnn_root']}"] if "cudnn_root" in used else [])], comp["env"])
         install_binary(bdir / EXE, eng / EXE)
         install_binary(bdir / IMAGE_EXE, eng / IMAGE_EXE)
+        install_binary(bdir / VEXE["gpu"], eng / VEXE["gpu"])
     for v in missing:
         llama_def = f"-DLLAMA_DIR={llama}"
-        if v == "vulkan":
-            say("  Compiling the image encoder for the GPU (Vulkan; 5-15 minutes, once) ...")
-            bdir = ROOT / "build-vision-vulkan"
-            cmake_build(ROOT / "tools" / "vision", bdir, "strata-vision",   # upstream's target name
-                        [llama_def, "-DSTRATA_VISION_VULKAN=ON", "-DSTRATA_PORTABLE=ON"])
-        else:
-            say("  Compiling the image encoder for the CPU ...")
-            bdir = ROOT / "build-vision-cpu"
-            cmake_build(ROOT / "tools" / "vision", bdir, "strata-vision",   # upstream's target name
-                        [llama_def, "-DSTRATA_PORTABLE=ON"])
-        install_binary(bdir / "bin" / ("xestrata-vision.exe" if WIN else "xestrata-vision"), eng / VEXE[v])
+        say("  Compiling the picture reader for the CPU (llama.cpp's mtmd; 5-15 minutes, once) ...")
+        bdir = ROOT / "build-vision-cpu"
+        cmake_build(ROOT / "tools" / "vision", bdir, "strata-vision",   # upstream's target name
+                    [llama_def, "-DSTRATA_PORTABLE=ON"])
+        install_binary(bdir / "bin" / ("xestrata-vision-cpu.exe" if WIN else "xestrata-vision-cpu"), eng / VEXE[v])
         built[v] = vsrc
     stamp.write_text(json.dumps({"source": "local", "backend": "xe", "version": source_version(), "compiler": used,
                                  "lib_dirs": comp["lib_dirs"], "src": src, "vision_srcs": built}, indent=1))
@@ -5026,10 +5008,10 @@ def update_installed_engine() -> None:
     if not info.exists():
         return
     meta = json.loads(info.read_text())
-    visions = list((meta.get("vision_srcs") or {}).keys())
+    visions = [v for v in (meta.get("vision_srcs") or {}) if v == "cpu"]   # the GPU reader comes with the engine
     vsrc = source_hash(VISION_SOURCES)
     # an engine compiled before the programs took XeStrata's names has none of EXE's name: it is compiled again
-    have = (eng / EXE).exists() and all((eng / VEXE[v]).exists() for v in visions if v in VEXE)
+    have = (eng / EXE).exists() and (eng / VEXE["gpu"]).exists() and all((eng / VEXE[v]).exists() for v in visions)
     if have and engine_is_xe(meta) and meta.get("src") == source_hash(ENGINE_SOURCES) and \
             all(meta["vision_srcs"][v] == vsrc for v in visions):
         return
@@ -7854,7 +7836,7 @@ def prepare_engine(a, gpu: dict, vision: str) -> tuple[Path, Path, str, list]:
         llama = ROOT / "third_party" / "main" / "llama.cpp"   # gguf-py, for the tools below
         eng = packaged_engine_dir()
         meta = packaged_engine()
-        enc = "vulkan"
+        enc = "gpu"
         # the engine's SYCL runtime, and oneMKL's folder when it is installed (oneMath opens its backend at run time;
         # without it the engine takes its own kernels)
         lib_dirs = list(meta.get("lib_dirs", []))
@@ -7867,7 +7849,7 @@ def prepare_engine(a, gpu: dict, vision: str) -> tuple[Path, Path, str, list]:
         llama = get_llama_cpp()
         ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
         comp = choose_compiler(a, gpu)
-        enc = "vulkan"
+        enc = "gpu"
         data = data_folder_path(a.data_dir, load_settings())
         eng = build_engine({"none": [], "gpu": [enc, "cpu"], "cpu": ["cpu"]}[vision], llama, comp, data)
         # the runtime of the compiler the engine was built with (none for the distribution's), and pip's NVIDIA ones
@@ -9613,7 +9595,8 @@ def main() -> int:
     if a.custom:                                       # the engine's verdict before anything is made
         check_model(eng / EXE, lib_dirs, shards[0])
         ok(f"the engine runs {shards[0].name}")
-    # #24: a package takes only the image encoders it carries (the Windows 7z has the CPU one, no Vulkan one)
+    # #24: a package takes only the picture readers it carries (a package without the GPU reader reads images on the
+    # CPU)
     if PACKAGED and vision == "gpu" and not (eng / VEXE[enc]).exists():
         warn("this package has no GPU image encoder: images are read on the CPU")
         vision = "cpu"
@@ -9862,7 +9845,7 @@ def main() -> int:
                    "threads": vision_threads()}
         cfg["vision"] = {"mmproj": str(mmproj), "model": str(shards[0]), **cpu_enc}
         if vision == "gpu":
-            # the GPU encoder takes the card by PCI address: with Vulkan the first GPU can be another card
+            # the GPU reader takes the card by PCI address: the first GPU the runtime lists can be another card
             cfg["vision"] = {"mmproj": str(mmproj), "model": str(shards[0]), "exe": str(eng / VEXE[enc]),
                              "gpu": True, "gpu_pci": gpu["pci"], "max_tokens": vt,
                              "fallback": cpu_enc}   # the server starts it when the GPU encoder does not start

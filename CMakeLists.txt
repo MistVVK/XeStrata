@@ -843,10 +843,19 @@ if(STRATA_ENABLE_XE)
   strata_utf8_manifest(strata)
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
 
+  # the vision encoder the chat's picture reader and the image engine share (Qwen3-VL's ViT, src/core/vision.cpp), with
+  # the attention and the row kernels it shares with the image engine (src/kernels/xe/image_attn.cpp, image_sdpa.cpp,
+  # vision_rows.cpp), and strata-vision-gpu, the picture reader that runs it on the GPU (tools/vision/strata_vision.cpp).
+  # The CPU reader (tools/vision, built apart) is llama.cpp's mtmd, for the machines without a GPU to spare.
+  add_library(strata_vision STATIC src/core/vision.cpp src/kernels/xe/image_attn.cpp src/kernels/xe/image_sdpa.cpp
+                           src/kernels/xe/vision_rows.cpp)
+  target_include_directories(strata_vision PUBLIC include)
+  target_link_libraries(strata_vision PUBLIC strata_prefill strata_kernels)
+
   # the image engine (Qwen-Image-2.1's DiT, src/image/): its kernels and the DiT; strata-image-probe, one block of the
   # DiT against tools/image/qi21_ref.py's NumPy reference, and strata-image-dit-probe, the whole DiT and its sampler
   # against stable-diffusion.cpp's values, timed
-  add_library(strata_image STATIC src/image/qi_kernels.cpp src/image/qi_attn.cpp src/image/qi_attn_train.cpp
+  add_library(strata_image STATIC src/image/qi_kernels.cpp src/image/qi_attn_train.cpp
                            src/image/qi_dit.cpp src/image/dit_file.cpp src/image/dit_product.cpp
                            src/image/dit_loras.cpp src/image/image_lora.cpp
                            src/image/w8_choice.cpp
@@ -867,8 +876,8 @@ if(STRATA_ENABLE_XE)
                            src/image/moss_pipeline.cpp
                            src/image/anima_dit.cpp src/image/anima_pipeline.cpp src/image/flow_sampler.cpp
                            src/image/guidance.cpp
-                           src/image/qi_stream.cpp src/image/qi_vision.cpp src/image/qi_image_io.cpp
-                           src/image/qi_sdpa.cpp src/image/hunyuanimage3_file.cpp
+                           src/image/qi_stream.cpp src/image/qi_image_io.cpp
+                           src/image/hunyuanimage3_file.cpp
                            src/image/hunyuanimage3_host.cpp src/image/hunyuanimage3_kernels.cpp
                            src/image/hunyuanimage3_gpu.cpp src/image/hunyuanimage3_dit.cpp
                            src/image/hunyuanimage3_vae.cpp src/image/hunyuanimage3_entry_exit.cpp
@@ -878,7 +887,8 @@ if(STRATA_ENABLE_XE)
                            src/image/aux_attn.cpp src/image/aux_net.cpp
                            src/image/sam3.cpp src/image/sam3_track.cpp src/image/sam3_video.cpp src/image/birefnet.cpp src/image/florence2.cpp)
   target_include_directories(strata_image PUBLIC include)
-  # The image attention's vendors' kernels (src/image/qi_sdpa.cpp), the engine's own kernel where none takes it.
+  # The image attention's vendors' kernels (src/kernels/xe/image_sdpa.cpp), the engine's own kernel where none
+  # takes it.
   # Intel GPUs: oneDNN's SDPA and the VAEs' convolutions (Apache-2.0, https://github.com/uxlfoundation/oneDNN at the
   # tag pinned here; Ubuntu's libdnnl-sycl is built for another SYCL runtime than intel/llvm's), built with the engine's
   # compiler for Intel GPUs only (its SYCL GPU runtime, no CPU runtime) beside the build, and linked to the image engine
@@ -952,7 +962,7 @@ if(STRATA_ENABLE_XE)
     target_sources(strata_kernels PRIVATE src/kernels/xe/sdpa_onednn.cpp)
     target_link_libraries(strata_kernels PRIVATE strata_dnnl)
     set_property(SOURCE src/kernels/xe/i8_gemm.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN_I8=1)
-    set_property(SOURCE src/image/qi_sdpa.cpp src/kernels/xe/prompt_attn.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp
+    set_property(SOURCE src/kernels/xe/image_sdpa.cpp src/kernels/xe/prompt_attn.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp
                  src/image/yolo_detect.cpp src/image/hunyuanimage3_vae.cpp src/upscale/esrgan.cpp src/image/aux_net.cpp
                  src/image/florence2.cpp src/image/qi_attn_train.cpp
                  APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN=1)
@@ -1205,7 +1215,7 @@ if(STRATA_ENABLE_XE)
       set_property(SOURCE src/kernels/xe/sdpa_cudnn.cpp APPEND PROPERTY COMPILE_DEFINITIONS
                    NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING CUDNN_FRONTEND_SKIP_JSON_LIB)
       set_property(SOURCE src/kernels/xe/sdpa_cudnn.cpp APPEND PROPERTY COMPILE_OPTIONS -w)   # its headers' warnings
-      set_property(SOURCE src/image/qi_sdpa.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp src/image/yolo_detect.cpp
+      set_property(SOURCE src/kernels/xe/image_sdpa.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp src/image/yolo_detect.cpp
                    src/image/hunyuanimage3_vae.cpp src/upscale/esrgan.cpp
                    src/image/aux_net.cpp src/image/qi_attn_train.cpp src/kernels/xe/prompt_attn.cpp
                    APPEND PROPERTY COMPILE_DEFINITIONS STRATA_CUDNN=1)
@@ -1220,7 +1230,12 @@ if(STRATA_ENABLE_XE)
   # qi_image_io.cpp alone, its own warnings not the build's
   target_include_directories(strata_image SYSTEM PRIVATE third_party/main/stb)
   set_source_files_properties(src/image/qi_image_io.cpp PROPERTIES COMPILE_OPTIONS "-w")
-  target_link_libraries(strata_image PUBLIC strata_prefill strata_video)
+  target_link_libraries(strata_image PUBLIC strata_prefill strata_video strata_vision)
+  # the picture reader on the GPU: the engine's own vision encoder, and the image engine's own reading and resizing of
+  # a picture (img_start's planes, img_crop's Pillow resize, qi_image_io's stb), so its preprocessing is an edit's.
+  add_executable(strata-vision-gpu tools/vision/strata_vision.cpp)
+  target_link_libraries(strata-vision-gpu PRIVATE strata_image)
+  strata_utf8_manifest(strata-vision-gpu)
   add_executable(strata-image-lora-probe src/image/lora_probe.cpp)
   target_link_libraries(strata-image-lora-probe PRIVATE strata_image)
   # the adapter's delta (y += scale (x A^T) B^T) against an FP64 reference: the plain form, a fused weight's rows, a

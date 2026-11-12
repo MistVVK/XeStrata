@@ -319,10 +319,10 @@ setup.sh は、venv の使える Python 3 がないときだけ、それを `sud
 
 | 選択 | Ubuntu 26.04 | Fedora 44 | Arch |
 | --- | --- | --- | --- |
-| 共通（free、contrib-llvm） | `python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev libvulkan-dev glslc spirv-headers opencl-headers mesa-vulkan-drivers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static vulkan-loader-devel glslc spirv-headers-devel opencl-headers mesa-vulkan-drivers blosc2-devel` | `python base-devel git cmake ninja lld hwloc zstd vulkan-headers vulkan-icd-loader shaderc spirv-headers opencl-headers blosc2` |
-| Intel の GPU | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` | `level-zero-loader intel-compute-runtime vulkan-intel` |
+| 共通（free、contrib-llvm） | `python3-venv git cmake ninja-build build-essential lld libhwloc-dev libzstd-dev opencl-headers libblosc2-dev` | `python3 git cmake ninja-build gcc-c++ lld hwloc-devel libzstd-devel libzstd-static opencl-headers blosc2-devel` | `python base-devel git cmake ninja lld hwloc zstd opencl-headers blosc2` |
+| Intel の GPU | `libze1 libze-intel-gpu1 libigc2 libigdfcl2` | `oneapi-level-zero oneapi-level-zero-devel intel-level-zero` | `level-zero-loader intel-compute-runtime` |
 | Intel の GPU（contrib-llvm） | `intel-oneapi-mkl-sycl-devel` | `intel-oneapi-mkl-sycl-devel` | なし（oneMKL は Arch のリポジトリにありません） |
-| AMD の GPU（free、contrib-llvm） | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` | `hip-runtime-amd rocm-device-libs rocm-llvm rocblas hipblaslt hipblas-common vulkan-radeon` |
+| AMD の GPU（free、contrib-llvm） | `libamdhip64-dev rocm-device-libs-21 clang-21 libclang-rt-21-dev librocblas-dev libhipblaslt-dev libhipblas-common-dev` | `rocm-hip-devel rocm-device-libs rocm-clang rocm-clang-runtime-devel rocblas-devel hipblaslt-devel hipblas-common-devel` | `hip-runtime-amd rocm-device-libs rocm-llvm rocblas hipblaslt hipblas-common` |
 | NVIDIA の GPU（contrib-llvm） | `nvidia-cuda-toolkit` と NVIDIA のドライバー | `cuda-toolkit-13-4`（NVIDIA の CUDA のリポジトリ）と NVIDIA のドライバー | `cuda` と NVIDIA のドライバー |
 
 - `intel-oneapi-` で始まるものは、Intel の oneAPI のリポジトリにあります（追加のしかたは Intel の手順: [APT](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-apt.html)、[DNF](https://www.intel.com/content/www/us/en/docs/oneapi-toolkit/installation-guide-linux/latest/install-oneapi-toolkit-with-yum-dnf.html)）。
@@ -330,12 +330,11 @@ setup.sh は、venv の使える Python 3 がないときだけ、それを `sud
   compute-runtime 26.22 未満には、VRAM に空きがあっても確保を断る状態になる不具合があります（Intel の [compute-runtime #916](https://github.com/intel/compute-runtime/issues/916)。xe カーネルのバグ（Linux 7.1 で修正）に 26.22 のドライバーが対応したもの。XeStrata では[#34](https://github.com/MistVVK/XeStrata/issues/34)）。
   Ubuntu 24.04/26.04 で HWE カーネルを使っているとき、setup は [Intel の graphics PPA](https://launchpad.net/~kobuk-team/+archive/ubuntu/intel-graphics)（compute-runtime と IGC が新しい）への更新を勧めて、更新まで起動を止めます（`--old-driver` でそのまま起動もできます）。
   GA カーネルでは、HWE カーネルにして PPA を入れるか、Fedora 44 / Podman（IGC も 2.32 以降。[困ったとき](DETAILS.ja.md#困ったとき)）を勧めます。
-- 共通の行の Vulkan のもの（`libvulkan-dev` ほか）は GPU の画像エンコーダーのため、`libblosc2-dev`（`blosc2-devel`）は保存した会話の圧縮（任意。[`conversation_save_compress`](DETAILS.ja.md#置いた会話をディスクにも置く)）のためです。
+- 共通の行の `libblosc2-dev`（`blosc2-devel`）は保存した会話の圧縮（任意。[`conversation_save_compress`](DETAILS.ja.md#置いた会話をディスクにも置く)）のためです。
 - AMD の行の `clang-21` と `libclang-rt-21-dev`（Fedora は `rocm-clang` と `rocm-clang-runtime-devel`、ROCm の clang とその実行時）は、コンパイルには使いません（コンパイルは intel/llvm がします）。
   oneMath の rocBLAS の後端が読む HIP の CMake のパッケージが、clang の実行時の builtins（`libclang_rt.builtins`）をリンクに足すためにコンパイラに尋ねます。
   intel/llvm にはその builtins がないので、ROCm の clang を `HIP_CXX_COMPILER` にしてそれに答えさせています（`cmake/StrataHip.cmake` の `strata_hip_cxx`）。
   要るのはビルドのときだけで、実行には要りません。
-- Arch では、Vulkan の ICD は GPU のメーカーのパッケージです（Intel は `vulkan-intel`、AMD は `vulkan-radeon`。1 つの `mesa-vulkan-drivers` が両方を持つ Ubuntu と Fedora とは違います）。
 - Arch の `zstd` には `libzstd.a` がありません（`zstd-static` は AUR のパッケージです）。
   intel/llvm の `configure.py` は静的な zstd（`LLVM_USE_STATIC_ZSTD=ON`）を要求するので、`tools/intel_llvm_build.py` はそれがないとき OFF にし、共有の zstd をリンクします（intel/llvm は v7.1.1 からそれを扱います: [intel/llvm#22294](https://github.com/intel/llvm/pull/22294)）。
 - Arch の ROCm の clang は `/opt/rocm/lib/llvm` にあり、その実行時の builtins（`libclang_rt.builtins`）も同じ `rocm-llvm` に入っています（AMD の行の `clang-21` と `libclang-rt-21-dev` にあたるものが 1 つのパッケージです）。
@@ -379,7 +378,7 @@ tools/package/build.sh fedora44 cuda13.4
   `build-xe`、`.tools`、`.venv` など、作業ツリーのものは使いません。
 - **毎回キレイなコンテナ**: イメージは `build.sh` にダイジェストで固定しています。
   コンテナの中でビルドの道具とディストリビューションの ROCm を入れ、intel/llvm（`tools/intel_llvm_build.py`、HIP のターゲット付き、cuda の版では CUDA のターゲットも）、
-  画像のエンコーダー（CPU と Vulkan）、エンジンをビルドし、CPack でパッケージにします（`tools/package/container.sh`、`cmake/packaging.cmake`）。
+  画像のエンコーダー（CPU）とエンジン（GPU の読み手も一緒）をビルドし、CPack でパッケージにします（`tools/package/container.sh`、`cmake/packaging.cmake`）。
   コンテナは終わると消えます。intel/llvm を毎回ビルドするので時間がかかります。
   ビルドの間には、コンパイラのキャッシュ（ccache、`build/pkg-ccache/<distro>/`、上限は `XESTRATA_CCACHE_MAX`、既定 30G）を残し、
   同じディストリビューションの 2 つ目からは intel/llvm とエンジンのほとんどをそこから取ります。
@@ -425,7 +424,7 @@ Windows 版の 7z も、同じ `tools/package/build.sh` で、Ubuntu 26.04 の�
 tools/package/build.sh windows cuda12.4      # XeStrata-<版>-windows-x64.7z
 ```
 
-- すべて Linux の上で Windows 向けにクロスビルドします。intel/llvm（Linux 版の contrib と、Windows 版の SYCL のランタイム）、エンジン（contrib-llvm のモード、NVIDIA のコードは cuda12.4 の deb と同じ）、CPU の画像のエンコーダー（`xestrata-vision-cpu.exe`。GPU の Vulkan のものは入れず、画像は CPU で読みます）、.NET の入口（`dotnet-sdk-10.0`）、Python の embeddable 版と wheel を作り、`tools/package/windows_bundle.py` がフォルダーと 7z にします。
+- すべて Linux の上で Windows 向けにクロスビルドします。intel/llvm（Linux 版の contrib と、Windows 版の SYCL のランタイム）、エンジン（contrib-llvm のモード、NVIDIA のコードは cuda12.4 の deb と同じ）、画像の読み手（`xestrata-vision-cpu.exe` と `xestrata-vision-gpu.exe`）、.NET の入口（`dotnet-sdk-10.0`）、Python の embeddable 版と wheel を作り、`tools/package/windows_bundle.py` がフォルダーと 7z にします。
 - MSVC の CRT と Windows SDK は xwin で Microsoft から取り、ライセンスに同意します（自由ソフトウェアではなく、7z には入れません）。CUDA の Windows 版のヘッダーとインポートライブラリも 7z には入れません。
 - Ubuntu 26.04 のパッケージと同じ ccache（`build/pkg-ccache/ubuntu26.04/`）を使い、xwin と NuGet の取得物は `build/pkg-cache/windows/` に残します。
 - 7z の中の exe・DLL・Python のパッケージは、どれも `windows_bundle.py` の部品の一覧にあるものでなければならず、Visual C++ のランタイムや NVIDIA のライブラリが入っていると止まります。
@@ -498,7 +497,6 @@ xe0.1.43.1-1 は `0.1.43.1-1`（rpm は Version が 0.1.43.1、Release が 1）�
 
 - **中身**: `tools/package/build.sh` と同じ Fedora 44 のイメージ（ダイジェストで固定）に、Releases の rpm を `SHA256SUMS` で確かめて入れます。
   続けて、その `BUILD.json` の `runtime` にあるメーカーのもの（Level Zero、cuBLAS、oneMKL）と
-  Mesa の Vulkan のドライバーをすべて入れます（`container/install.sh`）。
   NVIDIA のドライバーのライブラリと `nvidia-smi` は入れず、CDI でホストのものを使います。
 - **AMD の ROCm**: Fedora のもの（7.1）でなく、AMD の Radeon 向けのリポジトリ（RHEL 10 版）の ROCm（既定は 10.1）の HIP の実行時と rocBLAS と hipBLASLt を入れます。
   rocBLAS と hipBLASLt は、エンジンがコードを持つ AMD の GPU（`BUILD.json` の `hip_archs`: RDNA2 から RDNA4 まで）ごとのパッケージを全部入れるので、1 つのイメージがどの世代でも動きます。

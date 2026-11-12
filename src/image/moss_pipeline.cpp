@@ -150,7 +150,7 @@ bool MossPipeline::open(const std::string& dit, const std::string& vae, const st
     }
     vision_path_ = vision;
     if (!vision.empty()) {   // an ai-toolkit edit adapter's pictures: Qwen3.5-9B's ViT
-        vision_size_ = std::make_unique<QiVision>();
+        vision_size_ = std::make_unique<core::Vision>();
         if (!vision_size_->open(vision, s_, err, true)) return false;
         image_pad_ = TextEncoder::pad_id(text);   // the shared read of the vocabulary
     }
@@ -496,7 +496,7 @@ void MossPipeline::encode_base(const QiRequest& r, const QiRef& base, LatentStar
     gpu::free(rgb);   // the VAE's scratch stays for the decode where the plan has room for it (generate)
 }
 
-std::vector<QiVisionOut> MossPipeline::encode_pictures(const std::vector<QiRef>& pictures) {
+std::vector<core::VisionOut> MossPipeline::encode_pictures(const std::vector<QiRef>& pictures) {
     if (vision_path_.empty() || image_pad_ < 0)
         throw std::invalid_argument("image engine: an ai-toolkit edit's pictures need the vision encoder (--vision, "
                                     "Qwen3.5-9B's mmproj) and a text encoder with <|image_pad|>");
@@ -505,7 +505,7 @@ std::vector<QiVisionOut> MossPipeline::encode_pictures(const std::vector<QiRef>&
     // VAE's scratch first, then the DiT's activations and blocks (an ai-toolkit edit after one on the RTX 4070's 12 GB:
     // 7 MiB free, and the encoder's first buffer refused)
     {
-        QiVision size;
+        core::Vision size;
         if (!size.open(vision_path_, s_, err, true)) throw std::runtime_error(err);
         int64_t most = 0;
         for (const QiRef& f : pictures) most = std::max<int64_t>(most, (f.height / 16) * (f.width / 16));
@@ -523,9 +523,9 @@ std::vector<QiVisionOut> MossPipeline::encode_pictures(const std::vector<QiRef>&
         }
         if (room() < need) release(false);
     }
-    QiVision v;
+    core::Vision v;
     if (!v.open(vision_path_, s_, err)) throw std::runtime_error(err);
-    std::vector<QiVisionOut> out;
+    std::vector<core::VisionOut> out;
     for (const QiRef& f : pictures) {
         const std::vector<float> rgb = image_planes(f, f.width, f.height, 3, PlaneAlpha::White, PlaneRange::Signed);
         out.push_back(v.encode(rgb.data(), f.width, f.height));
@@ -665,14 +665,14 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     bool cached = true;
     const std::vector<float>* st[2] = {&r.te, &r.neg_te};
     // an ai-toolkit edit's pictures through the vision encoder, where a prompt with them is encoded
-    std::vector<QiVisionOut> vouts;
+    std::vector<core::VisionOut> vouts;
     std::vector<TextEncoder::Picture> pv;
     auto pictures = [&](const std::vector<int32_t>& ids) {
         if (r.pictures.empty() || std::find(ids.begin(), ids.end(), image_pad_) == ids.end())
             return std::vector<TextEncoder::Picture>{};
         if (vouts.empty()) {
             vouts = encode_pictures(r.pictures);
-            for (const QiVisionOut& v : vouts) {
+            for (const core::VisionOut& v : vouts) {
                 TextEncoder::Picture pic;
                 pic.rows = v.main.data();
                 pic.nx = v.grid_w;

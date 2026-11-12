@@ -1927,12 +1927,12 @@ and set as this section describes.
 It is **optional**, and setup's "Images?" defaults to yes for a model that reads pictures (upstream 91baead75).
 To leave it out, say no or pass `--vision no`; to add it later, run setup again with `--vision gpu` (or `--vision cpu`).
 Yes (`--vision yes`) means the GPU encoder on a card of 24 GB and more and the CPU encoder on a smaller one: the GPU encoder keeps about 1.4 GB of VRAM free, which cost 3-5% of text speed on 16 GB cards (upstream #2406's measurement). `--vision gpu` keeps the GPU encoder on a small card too.
-setup downloads the encoder, builds a small helper (`xestrata-vision`, from llama.cpp's `mtmd` library) and adds it to your start script.
+setup downloads the mmproj and prepares the GPU reader (`xestrata-vision-gpu`: XeStrata's own vision encoder, built with the engine) and the CPU reader (`xestrata-vision-cpu`, from llama.cpp's `mtmd`: for a small card, and when the GPU reader cannot start), then adds it to your start script.
 Nothing else changes.
 
 | Encoder on | Speed | Image tokens per picture |
 | --- | --- | --- |
-| **GPU** (recommended) | 7–9× faster than the CPU encoder (Vulkan) | 1,024 (small and wide pictures scaled up to 1,024) |
+| **GPU** (recommended) | 30–50× faster than the CPU encoder | 1,024 (small and wide pictures scaled up to 1,024) |
 | CPU | slow | scaled down to about 300 |
 
 With images on, setup passes `--vram-reserve-mib 700` to the engine.
@@ -1949,7 +1949,7 @@ A `POST /v1/vram` while the encoder runs stacks the reserve on top of the encode
 With `"vram_elastic": false` the server says so and starts the encoder with the model, as before.
 When the engine says it cannot give pieces back (`vram_elastic` 0, above), the first picture starts the encoder first and loads the model again, and from then on the encoder starts with the model.
 
-The GPU encoder's build (Vulkan), its precision, and the order in which the server falls back to the CPU are in [XE.md](XE.md#images).
+The GPU encoder's (XeStrata's own vision encoder) build, its precision, and the order in which the server falls back to the CPU are in [XE.md](XE.md#images).
 On the GPU encoder a picture becomes about 1,024 tokens of the context; on the CPU encoder about 300.
 The same picture sent again, as chat apps do on every turn, is encoded only once.
 
@@ -2262,7 +2262,7 @@ The web app's About > Model terms shows the full terms of the models it runs now
   The image models: Qwen's Qwen-Image-2.1 and Qwen-Image-2.1-Turbo (GGUFs by Unsloth), Microsoft's Mage-Flow (Comfy-Org's safetensors), RicemanT's MageTrail with Black Forest Labs' Flux2 VAE (FLUX.2-klein-4B's), Tencent's HunyuanImage 3.0 (quantized as single files by PedroMarinhoDev), OpenMOSS's MOSS-Image with its edit adapters (chinoll's Moss-Image-Edit, as a single file by PedroMarinhoDev; akhaliq's MOSS-Image-Edit-HQ armV5 and armV6), the text encoders, Qwen3-VL (Unsloth's, AtomicChat's, and huihui-ai's by noctrex), and the parts' fix's detectors, Bingsu's adetailer (`face_yolov8m`, `hand_yolov8s`, `person_yolov8m-seg`, trained with Ultralytics YOLOv8: Apache 2.0 by their publisher; Ultralytics holds models trained with YOLO to be under AGPL-3.0 by default), and the upscalers, Xintao Wang, Liangbin Xie, Chao Dong and Ying Shan's RealESRGAN x4plus (BSD-3-Clause; the official release's file, fetched from lllyasviel/Annotators) and ByteDance Seed's SeedVR2 7B, 7B sharp and 3B with its VAE (Apache-2.0; Comfy-Org's repackaging), the composition control's alibaba-pai Qwen-Image-2.1 Fun ControlNet Union (Qwen Research License) and darask0's MOSS-Image color and depth adapter and 4-step adapter (Apache-2.0), and the networks that make the control maps, Depth Anything V2 Small (Apache-2.0), DWPose (Apache-2.0), Megvii's YOLOX-L (Apache-2.0), ControlNet 1.1's HED (Apache-2.0), Caroline Chan's line art (MIT) and NAVER's M-LSD (Apache-2.0) ([IMAGE](IMAGE.md#licenses)).
   Their licenses apply to the weights.
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** (MIT): the i-quant formats, the GPU dot products and dequantizers transcribed in `src/kernels/xe/`,
-  the CPU backend linked for the i-quant experts, the `mtmd` library and the GPU backends (Vulkan, SYCL) behind the image encoder (`tools/vision/`),
+  the CPU backend linked for the i-quant experts, the `mtmd` library behind the CPU image encoder (`tools/vision/`; the GPU reader does not use llama.cpp),
   and `gguf-py` used by the tools. See `third_party/main/ggml/LICENSE`.
 - **[oneMath](https://github.com/uxlfoundation/oneMath)** (Apache-2.0): the layer that hands the dense matrix products to oneMKL (Intel) and cuBLAS (NVIDIA) in the contrib-llvm mode, and to rocBLAS and hipBLASLt (AMD) in the free and contrib-llvm modes.
   It is not in the repository: CMake fetches XeStrata's fork ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), oneMath with XeStrata's changes: cuBLAS's BF16 product, hipBLASLt in the rocBLAS backend), under oneMath's license. See `third_party/main/oneMath/LICENSE`.
