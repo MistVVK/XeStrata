@@ -18029,10 +18029,12 @@ int main(int argc, char** argv) {
             // tokens are past the resume point.  Those are the client's stripped answer; a park copies the whole K/V
             // (6-8 GB, 4.7-5.0 s measured at 460K) to keep them.  A park only reads, so skipping it cannot change a
             // token; the suffix is re-read only if that branch is revisited.  Same-conversation check (prefix_equal)
-            // keeps a switch that only shares a system prompt parking as before.
+            // keeps a switch that only shares a system prompt parking as before.  A layer split skips it too: the park
+            // reads every stage's image and the rewind below restores each stage's checkpoint either way, as for
+            // pin_sibling (4.6 s at 900K on two RTX 3090s).
             const bool rewind_skip =
                 o.conversation_cache_rewind_keep > 0 && !from_live && resume > 0 && live_ok && !incoming && !borrow &&
-                slot_source < 0 && lent_slot < 0 && req_imgs.empty() && stages.empty() &&
+                slot_source < 0 && lent_slot < 0 && req_imgs.empty() &&
                 strata::program::conv_cache::rewind_keep(live.data(), (int64_t) live.size(), ids.data(), resume,
                                                          o.conversation_cache_rewind_keep);
             const bool keep_branch = pin_sibling || rewind_skip;
