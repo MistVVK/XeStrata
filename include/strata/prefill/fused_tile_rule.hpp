@@ -120,6 +120,21 @@ constexpr bool default_takes_env(int env, const Card& c, int sm40_env, bool gate
     return default_takes(env, c, sm40_on(sm40_env), gate_staged, down_ok, gu_type);
 }
 
+// ---- the Qwen3.6 engine (strata-q36, src/qwen35/q36_engine.cu; the copy of the kernels in src/prefill/moe_fused_iq_q36.cu): which layers take the fused prompt kernels.
+// STRATA_PF_FUSED as pf_env reads it: -1 unset or empty, 1 = a value starting with '1' (the opt-in: every layer whose pair the kernels cover, on any card that covers it), 0 = any other value
+// (off: every layer on MMQ).  Before 11-12 the engine took the fused kernels only with the opt-in; unset now takes them on the cards the Flash-Next engine's default rule takes
+// (takes_by_default above, reused as it is: sm_86-class and sm_120 cards with 80+ SMs, and the staged launches on 40-79 SMs unless STRATA_PF_FUSED_SM40=0), for the layers whose pair
+// the kernels cover.  gate_staged / down_ok are the launch kind of takes_by_default: the gate/up kernel is a weight-staging instance (sw_on(gu_type, true)) and the down is one the staged
+// instances were measured with (a staged down or IQ4_NL / Q2_0).  Evidence: RESULTS-E2E-BOSTON.md and RESULTS-P4-Q36.md (UD-Q4_K_XL on an RTX A6000, every expert in VRAM: prompt speed
+// fused / MMQ 1.034 at 2K, 0.964 at 4K, 0.966 at 8K, 0.970 at 20K, decode equal; forced-token KL fused / MMQ over all positions 1.047 [0.924, 1.195] at 2K and 0.836 [0.727, 0.969] at 8K).
+constexpr int pf_env(const char* v) { return v == nullptr || v[0] == '\0' ? -1 : (v[0] == '1' ? 1 : 0); }
+constexpr int sm40_env_of(const char* v) { return v == nullptr ? -1 : (v[0] == '0' ? 0 : 1); }   // STRATA_PF_FUSED_SM40 as moe_fused_iq.cu reads it
+constexpr bool q36_takes(int env, const Card& c, int sm40_env, bool gate_staged, bool down_ok, bool covered) {
+    if (!covered || env == 0) return false;
+    if (env > 0) return true;
+    return takes_by_default(c, sm40_on(sm40_env), gate_staged, down_ok);
+}
+
 // ---- the weight-staging guard (check_staged_blobs's decision in src/prefill/moe_fused_iq.cu), as pure functions so the decision can be tested without a GPU.
 // The staging kernels (sw_on instances) copy the expert blobs into shared memory with cp.async and read 16-bit words at the rows' offsets: they need blobs in device (or managed)
 // memory at 2-byte aligned addresses and 2-byte aligned rows and offsets.  A launch that fails the check does NOT end the process: it takes the unstaged 64-row kernel of the same

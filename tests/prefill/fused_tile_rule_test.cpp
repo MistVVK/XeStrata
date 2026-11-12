@@ -457,5 +457,60 @@ int main() {
         CHECK(pick(Card{false, false, 48, true}, 81910, E, false, false).ww == 4 && pick(Card{false, false, 48, true}, 81910, E, true, true).ww == 2);   // the staged 128-row choice the fallback overrides
         std::printf("fused_tile_rule_test: staging guard: %lld blob cases, 16 geometries, the check budget and the sticky fallback checked, %d failed so far\n", cases, failed);
     }
+    // ---- the Qwen3.6 engine (strata-q36): which layers take the fused prompt kernels, q36_takes(env, card, sm40_env, gate_staged, down_ok, covered).  The whole grid against an oracle written from the sentence of the
+    // decision: a layer whose pair the kernels do not cover, or STRATA_PF_FUSED=0 (or any value not starting with '1'): MMQ.  =1: the fused kernels on every card.  Unset: the cards of the Flash-Next default rule, an
+    // sm_86-class (8.0 / 8.6 / 8.9) or sm_120 card (not sm_121 alone, not a card with neither flag: sm_75, sm_87, sm_90, AMD) with 80+ SMs for every layer, 40-79 SMs for a staged gate/up with a staged down
+    // while STRATA_PF_FUSED_SM40 is not "0", under 40 SMs never.
+    {
+        using namespace strata::prefill::fused_tile;
+        CHECK(pf_env(nullptr) == -1 && pf_env("") == -1 && pf_env("1") == 1 && pf_env("1x") == 1 && pf_env("0") == 0 && pf_env("2") == 0 && pf_env("yes") == 0 && pf_env("off") == 0);
+        CHECK(sm40_env_of(nullptr) == -1 && sm40_env_of("0") == 0 && sm40_env_of("1") == 1 && sm40_env_of("") == 1 && sm40_env_of("on") == 1);
+        long long cmp = 0, bad = 0, yes_def = 0, yes_opt = 0, no_zero = 0, yes40 = 0, yes80 = 0;
+        for (int env = -1; env <= 1; ++env)
+            for (int sm40e = -1; sm40e <= 1; ++sm40e)
+                for (int s120 = 0; s120 < 2; ++s120)
+                    for (int s86 = 0; s86 < 2; ++s86)
+                        for (int s121 = 0; s121 < 2; ++s121)
+                            for (int sms = 0; sms <= 200; ++sms)
+                                for (int g = 0; g < 2; ++g)
+                                    for (int d = 0; d < 2; ++d)
+                                        for (int cov = 0; cov < 2; ++cov) {
+                                            ++cmp;
+                                            const Card c{s120 != 0, s121 != 0, sms, s86 != 0};
+                                            const bool in_class = s120 || s86;
+                                            bool want = false;
+                                            if (cov != 0 && env == 1) want = true;
+                                            if (cov != 0 && env == -1) want = in_class && (sms >= 80 || (sms >= 40 && sm40e != 0 && g != 0 && d != 0));
+                                            if (q36_takes(env, c, sm40e, g != 0, d != 0, cov != 0) != want) ++bad;
+                                            if (want && env == -1) ++yes_def;
+                                            if (want && env == 1) ++yes_opt;
+                                            if (want && env == -1 && sms < 80) ++yes40;
+                                            if (want && env == -1 && sms >= 80) ++yes80;
+                                            if (env == 0 && !want) ++no_zero;
+                                        }
+        CHECK(bad == 0 && yes_def > 0 && yes_opt > 0 && yes40 > 0 && yes80 > 0 && no_zero > 0);
+        std::printf("fused_tile_rule_test: Qwen3.6 engine: %lld switch / SM40 switch / card flag / SM count / format combinations (%lld wrong; %lld yes unset, %lld of them below 80 SMs, %lld at 80+; %lld yes under =1)\n", cmp, bad, yes_def, yes40, yes80, yes_opt);
+        // named cards, formats of UD-Q4_K_XL (a staged K-quant gate/up with a staged Q5_K / Q6_K down), STRATA_PF_FUSED unset
+        const Card a6000c{false, false, 84, true}, a4000c{false, false, 48, true}, a100{false, false, 108, true}, rtx4090{false, false, 128, true}, rtx3050{false, false, 20, true}, pro5000{true, false, 110, false},
+            rtx5090{true, false, 170, false}, rtx5070{true, false, 48, false}, gb10c{false, true, 48, false}, turing{false, false, 68, false}, orin{false, false, 16, false}, hopper{false, false, 132, false};
+        for (const Card& c : {a6000c, a100, rtx4090, pro5000, rtx5090}) CHECK(q36_takes(-1, c, -1, true, true, true) && q36_takes(-1, c, 0, true, true, true));      // 80+ SMs: the SM40 switch moves nothing
+        for (const Card& c : {a4000c, rtx5070}) CHECK(q36_takes(-1, c, -1, true, true, true) && q36_takes(-1, c, 1, true, true, true) && !q36_takes(-1, c, 0, true, true, true));   // 40-79 SMs: staged, SM40 not "0"
+        for (const Card& c : {rtx3050, gb10c, turing, orin, hopper}) CHECK(!q36_takes(-1, c, -1, true, true, true) && !q36_takes(-1, c, 1, true, true, true));          // under 40 SMs, sm_121, no class flag: MMQ
+        CHECK(!q36_takes(-1, a4000c, -1, false, true, true) && !q36_takes(-1, a4000c, -1, true, false, true));   // an unstaged gate/up or down on 48 SMs: MMQ
+        CHECK(q36_takes(-1, a6000c, -1, false, false, true) && !q36_takes(-1, a6000c, -1, true, true, false));   // 80+ SMs take any covered pair, never an uncovered one
+        // STRATA_PF_FUSED=0 is MMQ on every card; =1 is the fused kernels on every card that covers the pair (the way strata-q36 behaved with the opt-in)
+        for (const Card& c : {a6000c, a4000c, a100, rtx4090, pro5000, rtx5090, rtx5070, rtx3050, gb10c, turing, orin, hopper}) {
+            CHECK(!q36_takes(0, c, -1, true, true, true) && q36_takes(1, c, -1, false, false, true) && !q36_takes(1, c, -1, true, true, false));
+        }
+        // the class is takes_by_default's: the same answer as the Flash-Next rule for a covered pair with the staged flags, every card above
+        for (const Card& c : {a6000c, a4000c, a100, rtx4090, pro5000, rtx5090, rtx5070, rtx3050, gb10c, turing, orin, hopper})
+            for (int sm40e = -1; sm40e <= 1; ++sm40e)
+                for (int g = 0; g < 2; ++g)
+                    for (int d = 0; d < 2; ++d) CHECK(q36_takes(-1, c, sm40e, g != 0, d != 0, true) == takes_by_default(c, sm40_on(sm40e), g != 0, d != 0));
+        // compute capability: 8.0 / 8.6 / 8.9 are in the class (s86_class), 8.7 / 9.0 / 7.5 are not, STRATA_PF_FUSED_SM86=0 empties it
+        CHECK(q36_takes(-1, Card{false, false, 108, s86_class(8, 0)}, -1, true, true, true) && q36_takes(-1, Card{false, false, 128, s86_class(8, 9)}, -1, true, true, true));
+        CHECK(!q36_takes(-1, Card{false, false, 16, s86_class(8, 7)}, -1, true, true, true) && !q36_takes(-1, Card{false, false, 132, s86_class(9, 0)}, -1, true, true, true) &&
+              !q36_takes(-1, Card{false, false, 68, s86_class(7, 5)}, -1, true, true, true) && !q36_takes(-1, Card{false, false, 84, s86_class(8, 6, true)}, -1, true, true, true));
+    }
     return failed == 0 ? 0 : 1;
 }

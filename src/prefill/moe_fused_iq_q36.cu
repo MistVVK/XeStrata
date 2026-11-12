@@ -99,6 +99,17 @@ bool native_supported_ext(int gu_type, int d_type) {
     return native_supported(gu_type, d_type);
 }
 
+// Whether the engine takes the fused kernels for a layer of this pair on the current device: STRATA_PF_FUSED=1 on every card whose kernels cover the pair, unset on the cards
+// the Flash-Next engine's default rule takes (fused_tile::q36_takes, which is takes_by_default for the card, the staged gate/up and the staged down), =0 never.
+bool native_layer_ext(int gu_type, int d_type) {
+    static const int env = strata::prefill::fused_tile::pf_env(std::getenv("STRATA_PF_FUSED"));
+    static const int sm40_env = strata::prefill::fused_tile::sm40_env_of(std::getenv("STRATA_PF_FUSED_SM40"));
+    if (env == 0 || !native_supported_ext(gu_type, d_type)) return false;
+    const DevInfo& d = dev_info();
+    const bool down_ok = sw_on(d_type, false) || d_type == T_IQ4_NL || d_type == T_Q2_0;
+    return strata::prefill::fused_tile::q36_takes(env, {d.s120, d.s121, d.sms, d.s86}, sm40_env, sw_on(gu_type, true), down_ok, true);
+}
+
 void experts_native_ext(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa, const int32_t* src, void* ha,
                         float* dm, void* stream) {
     if (!is_kq_down_pair(g.gu_type, g.d_type)) {

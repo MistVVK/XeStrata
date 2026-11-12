@@ -1393,13 +1393,13 @@ struct Engine {
         const size_t n_state = m->layers.size() + (m->has_mtp ? 1 : 0);
         fused_on.assign(n_state, 0);
 #if !defined(__HIPCC__)
-        // Strata's fused kernels where they cover the layer's pair on this card: opt-in (STRATA_PF_FUSED=1), as for Flash-Next's packs
-        // below 80 SMs; unset or 0 keeps every layer on MMQ (the default is not changed until the gate for it is passed)
-        if (const char* pf = std::getenv("STRATA_PF_FUSED"); pf != nullptr && pf[0] == '1' && g.n_embd == FQ::kQ36Embd &&
-                                                             g.n_ff == FQ::kQ36FF)
+        // Strata's fused kernels where they cover the layer's pair on this card: the default on the cards the Flash-Next engine's rule takes (sm_86-class and sm_120 cards
+        // with 80+ SMs, the staged launches on 40-79 SMs: fused_tile::q36_takes, the rule of takes_by_default), STRATA_PF_FUSED=1 on every card that covers the pair,
+        // STRATA_PF_FUSED=0 keeps every layer on MMQ; HIP builds, cards under 40 SMs and compute capability below 8 are as before (MMQ)
+        if (g.n_embd == FQ::kQ36Embd && g.n_ff == FQ::kQ36FF)
             for (size_t i = 0; i < n_state; ++i) {
                 const Layer& L = layer_at((int) i);
-                fused_on[i] = FQ::native_supported_ext(L.L.gu_type, L.L.d_type) ? 1 : 0;
+                fused_on[i] = FQ::native_layer_ext(L.L.gu_type, L.L.d_type) ? 1 : 0;
             }
 #endif
         use_pf = true;
@@ -1454,9 +1454,9 @@ struct Engine {
             mq_h = dalloc((size_t) ne * FF);
         }
         if (n_fused == n_state)
-            std::fprintf(stderr, "strata-q36: [DRAFT] prompt experts on the fused int8 kernels\n");
+            std::fprintf(stderr, "strata-q36: prompt experts on the fused int8 kernels\n");
         else if (n_fused > 0)
-            std::fprintf(stderr, "strata-q36: [DRAFT] prompt experts on the fused int8 kernels (%zu of %zu layers), the rest on MMQ (int8)\n",
+            std::fprintf(stderr, "strata-q36: prompt experts on the fused int8 kernels (%zu of %zu layers), the rest on MMQ (int8)\n",
                          n_fused, n_state);
         else
             std::fprintf(stderr, "strata-q36: prompt experts on %s\n", use_mmq ? "MMQ (int8)" : "the native grouped kernels");
