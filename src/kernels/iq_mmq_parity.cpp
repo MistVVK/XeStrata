@@ -136,47 +136,16 @@ int check(ggml_type t, int64_t N, int64_t K, const std::vector<int32_t>& counts)
     return ok ? 0 : 1;
 }
 
-// One expert's few rows with K in parts (iq_mmq_split_set, the parts' buffer reserved) at each aim the plain models'
-// calibration times, 0 to 16 quarters of the compute units: the same bits from each, the aim only spreading the parts
-// over more work-groups (it is timed at the start, and a near tie made a prompt's states differ from start to start)
-int split_same(ggml_type t, int64_t N, int64_t K, int32_t rows) {
+// One expert's few rows with K in parts (the parts' buffer reserved, as the plain models' prompt reserves it): each
+// part's sums and the pass adding them, against the same reference
+int split_parts(ggml_type t, int64_t N, int64_t K, int32_t rows) {
     sycl::queue& q = strata::core::Runtime::get().compute();
-    const std::vector<uint8_t> w = weights(t, N, K);
-    std::vector<float> x((size_t) (rows * K));
-    std::normal_distribution<float> nd(0.0f, 1.0f);
-    for (float& v : x) v = nd(rng());
-    std::vector<int32_t> ids((size_t) rows);
-    for (int32_t i = 0; i < rows; ++i) ids[(size_t) i] = i;
-    const std::vector<int32_t> bounds = {0, rows};
-    P::Device dev;
-    const size_t xq_bytes = strata::kernels::iq_mmq_act_bytes(rows, K);
-    float* dx = dev.upload(x);
-    uint8_t* dw = dev.upload(w);
-    int32_t* db = dev.upload(bounds);
-    int32_t* di = dev.upload(ids);
-    uint8_t* dxq = dev.alloc<uint8_t>(xq_bytes);
-    float* dy = dev.alloc<float>((size_t) rows * N);
-    strata::kernels::iq_mmq_quantize(q, dx, nullptr, dxq, K, K, rows, strata::kernels::iq_mmq_type_sums((int) t)).wait();
     if (!strata::kernels::iq_mmq_split_reserve(q, strata::kernels::iq_mmq_split_floats(rows, N))) {
         std::printf("  %-8s the parts' buffer: no room (skipped)\n", ggml_type_name(t));
         return 0;
     }
-    std::vector<float> first, y((size_t) rows * N);
-    bool ok = true;
-    std::string said;
-    for (const int quarters : {0, 2, 4, 8, 16}) {
-        strata::kernels::iq_mmq_split_set(q, quarters);
-        strata::kernels::iq_mmq_grouped(q, (int) t, dw, w.size(), N, K, 1, dxq, rows, db, rows, di, dy, N).wait();
-        P::copy_out(y.data(), dy, y.size());
-        if (first.empty()) first = y;
-        const bool same = std::memcmp(y.data(), first.data(), y.size() * sizeof(float)) == 0;
-        said += std::string(said.empty() ? "" : ", ") + std::to_string(quarters) + (same ? "" : " (differs)");
-        ok = ok && same;
-    }
-    strata::kernels::iq_mmq_split_set(q, 0);
-    std::printf("  %-8s K %4lld, one expert of %2d rows, aims %s: %s\n", ggml_type_name(t), (long long) K, rows,
-                said.c_str(), ok ? "the same bits" : "*** FAIL ***");
-    return ok ? 0 : 1;
+    std::printf("  K in parts:\n");
+    return check(t, N, K, {rows});
 }
 
 // --bench: a layer's experts as PlainModel's prompt takes them, 16 experts of r rows each, in the two forms the
@@ -309,9 +278,9 @@ int main(int argc, char** argv) try {
     }
     // last: the parts' buffer it reserves stays with the queue
     for (const int32_t rows : {16, 64}) {
-        bad += split_same(GGML_TYPE_Q8_0, 256, 2048, rows);
-        bad += split_same(GGML_TYPE_Q4_K, 256, 2048, rows);
-        bad += split_same(GGML_TYPE_IQ3_XXS, 256, 2048, rows);
+        bad += split_parts(GGML_TYPE_Q8_0, 256, 2048, rows);
+        bad += split_parts(GGML_TYPE_Q4_K, 256, 2048, rows);
+        bad += split_parts(GGML_TYPE_IQ3_XXS, 256, 2048, rows);
     }
     std::printf(bad ? "FAIL\n" : "PASS\n");
     return bad ? 1 : 0;

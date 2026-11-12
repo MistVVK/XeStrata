@@ -33,7 +33,7 @@ Trainer::~Trainer() {
 
 bool Trainer::init(void* stream, size_t ws_bytes, std::string& err) {
     s = stream;
-    return gemm.init(stream, ws_bytes, err);
+    return gemm.init(stream, (int64_t) ws_bytes, err);
 }
 
 void* Trainer::take(size_t bytes) {
@@ -166,7 +166,7 @@ void Trainer::set_budget(int64_t rows, uint64_t keep_row, uint64_t guess_row) {
     gpu::stream_sync(s);
     const bool known = gpu::mem_info(&free_b, &total);
     if (const char* e = strata::env_get("TRAIN_WEIGHTS_MIB")) {
-        budget = (uint64_t) std::atoll(e) << 20;
+        budget = (uint64_t) std::strtoll(e, nullptr, 10) << 20;
     } else if (known) {
         const uint64_t have = (uint64_t) free_b + ws.vram() + tape_cap_;
         const uint64_t reserve = keep_row * (uint64_t) R +
@@ -184,7 +184,7 @@ void Trainer::set_budget(int64_t rows, uint64_t keep_row, uint64_t guess_row) {
 }
 
 bool Trainer::inputs_half(int64_t rows, uint64_t f32_bytes, uint64_t guess_row) {
-    if (const char* e = strata::env_get("TRAIN_INPUTS16")) return std::atoi(e) != 0;
+    if (const char* e = strata::env_get("TRAIN_INPUTS16")) return std::strtol(e, nullptr, 10) != 0;
     size_t free_b = 0, total = 0;
     gpu::stream_sync(s);
     if (!gpu::mem_info(&free_b, &total)) return false;
@@ -200,7 +200,7 @@ int64_t Trainer::keep_tapes(int64_t nb, int64_t rows, size_t per, size_t step_by
     gpu::stream_sync(s);
     size_t avail = 0;   // what the tapes may take this step
     if (const char* e = strata::env_get("TRAIN_TAPES")) {
-        avail = (size_t) std::clamp<int64_t>(std::atoll(e), 0, nb) * per;
+        avail = (size_t) std::clamp<int64_t>(std::strtoll(e, nullptr, 10), 0, nb) * per;
     } else if (scratch_rows > 0 && rows <= scratch_rows) {
         size_t free_b = 0, total = 0;
         if (gpu::mem_info(&free_b, &total)) {

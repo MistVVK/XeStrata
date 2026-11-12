@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <random>
 #include <string>
@@ -57,9 +58,8 @@ bool same_at_widths(const char* name, const Op& op, int64_t T, int64_t K, int8_t
     return ok;
 }
 
-}  // namespace
-
-int main() {
+// the test proper; main reports what it throws
+int run() {
     if (sycl::device::get_devices(sycl::info::device_type::gpu).empty()) return 77;
     sycl::queue& qu = d::q_of(p::stream());
     p::Device dev;
@@ -103,4 +103,17 @@ int main() {
     }
     if (ok) std::printf("rows_i8_width_parity: the same bits at widths 1, 4 and 8\n");
     return ok ? 0 : 1;
+}
+
+}  // namespace
+
+int main() {
+    try {
+        return run();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "rows_i8_width_parity: %s\n", e.what());
+    } catch (...) {
+        std::fprintf(stderr, "rows_i8_width_parity: an unknown exception\n");
+    }
+    return 1;
 }

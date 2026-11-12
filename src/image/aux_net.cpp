@@ -39,7 +39,11 @@ AuxNet::AuxNet(const std::string& path, const char* what)
     for (const auto& t : st_->tensors()) file_bytes_ += t.second.end - t.second.begin;
 }
 
-AuxNet::~AuxNet() { release(); }
+// The base's own scratch and the weights: a derived part's drop_scratch is gone by now (its members with it)
+AuxNet::~AuxNet() {
+    AuxNet::drop_scratch();
+    free_weights();
+}
 
 void* AuxNet::alloc(size_t bytes) {
     void* p = nullptr;
@@ -71,6 +75,10 @@ void AuxNet::upload_async(void* dst, const void* src, size_t bytes, int stage) {
 
 void AuxNet::release() {
     drop_scratch();
+    free_weights();
+}
+
+void AuxNet::free_weights() {
     for (void* p : weights_) gpu::free(p);
     weights_.clear();
     weight_bytes_ = 0;
@@ -349,7 +357,7 @@ void AuxNet::product(const uint16_t* x16, const Lin& l, float* y, int64_t T, int
 }
 
 void AuxNet::convolve(const Conv& c, const uint16_t* x16, int64_t H, int64_t W, float* y, int col_slot, bool add) {
-    const int64_t OH = (H + 2 * c.pad - c.k) / c.stride + 1, OW = (W + 2 * c.pad - c.k) / c.stride + 1;
+    const int64_t OH = (H + 2 * (int64_t) c.pad - c.k) / c.stride + 1, OW = (W + 2 * (int64_t) c.pad - c.k) / c.stride + 1;
     const int64_t P = OH * OW, K = (int64_t) c.k * c.k * c.c;
     sycl::queue& q = core::Runtime::get().stream(s_);
     const int64_t cap = conv::col_values(q);

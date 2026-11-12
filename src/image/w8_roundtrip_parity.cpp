@@ -17,16 +17,17 @@ int main() {
     namespace k = strata::kernels;
     namespace t = strata::image::train;
     constexpr int N = 7, K = 768;
+    constexpr size_t kNK = (size_t) N * K;
     std::mt19937 rng(1201);  // NOLINT(bugprone-random-generator-seed): reproducible inputs.
     std::normal_distribution<float> dist(0.f, 1.f);
-    std::vector<uint16_t> input(N * K), output(N * K);
+    std::vector<uint16_t> input(kNK), output(kNK);
     for (auto& x : input) x = k::f16_from_f32(dist(rng));
     std::vector<float> scales(N);
     p::Device dev;
     auto* x = dev.upload(input);
-    auto* q = dev.alloc<int8_t>(N * K);
+    auto* q = dev.alloc<int8_t>(kNK);
     auto* s = dev.alloc<float>(N);
-    auto* y = dev.alloc<uint16_t>(N * K);
+    auto* y = dev.alloc<uint16_t>(kNK);
     t::w8_quantize(x, N, K, q, s, p::stream());
     t::w8_dequant_rows(q, s, N, K, y, p::stream());
     p::copy_out(output.data(), y, output.size());

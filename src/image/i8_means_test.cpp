@@ -10,7 +10,7 @@
 
 int main() {
     using strata::image::I8Means;
-    std::vector<float> buf(6 * 4, 0.f);   // 6 slots of C = 4
+    std::vector<float> buf(size_t{6} * 4, 0.f);   // 6 slots of C = 4
     I8Means m;
     m.init(buf.data(), 6, 4);
     int fails = 0;
@@ -39,7 +39,7 @@ int main() {
     ck(m.stats(2).kmean_ready, "past mark a no-op");
     // reset (a new image): all fresh again, the buffer kept
     m.reset();
-    ck(!m.stats(2).kmean_ready && m.stats(2).kmean == buf.data() + 2 * 4, "reset");
+    ck(!m.stats(2).kmean_ready && m.stats(2).kmean == buf.data() + ptrdiff_t{2} * 4, "reset");
     // clear
     m.clear();
     ck(m.buf == nullptr && m.slots == 0 && m.ready.empty(), "clear");

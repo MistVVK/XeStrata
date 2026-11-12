@@ -418,12 +418,12 @@ void w8_dequant_rows(const int8_t* q, const float* s, int64_t N, int64_t K, uint
     constexpr int kG = 256, kRowsWG = 4;
     const size_t gn = (size_t) ((N + kRowsWG - 1) / kRowsWG), gk = (size_t) (K / kG);
     dit_rows::q_of(stream).submit([&](sycl::handler& cgh) {
-        sycl::local_accessor<float, 1> v(sycl::range<1>(kRowsWG * kG), cgh);
+        sycl::local_accessor<float, 1> v(sycl::range<1>((size_t) kRowsWG * kG), cgh);
         cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(gn * kRowsWG, gk * kG), sycl::range<2>(kRowsWG, kG)),
                          [=](sycl::nd_item<2> it) {
                              const int r = (int) it.get_local_id(0), j = (int) it.get_local_id(1);
                              const int64_t n = (int64_t) it.get_global_id(0), k = (int64_t) it.get_global_id(1);
-                             float* vr = v.get_multi_ptr<sycl::access::decorated::no>().get() + r * kG;
+                             float* vr = v.get_multi_ptr<sycl::access::decorated::no>().get() + (ptrdiff_t) r * kG;
                              vr[j] = n < N ? (float) q[n * K + k] * s[n] : 0.f;
                              const float y = dit_rows::regular256(vr, j, it.get_group());
                              if (n < N) tmp[n * K + k] = dit_rows::f16_from_f32(y);

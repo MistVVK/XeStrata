@@ -827,10 +827,13 @@ bool w8_fused(void* stream) {
 // 10240 IQ4_XS and attn_output 6144 -> 2560 Q6_K, Qwen3.6-35B-A3B's attn_qkv 2048 -> 8192 Q8_0), the whole form
 // against native (the weight's int8 rows made at each call, the activations' rows, the int32 product, the scales
 // back into FP32), through core::timed_choice, native the preferred side with a wide margin: W8A8 taken only when
-// 15% faster.  At timed_choice's own 5% the choice moved from run to run on the B70 (2026-11-12: the three shapes
-// native 3.77 to 3.81 ms, W8A8 3.57 to 3.62, a 4 to 6% edge astride the margin; the RTX 4070's 8.1 to 8.8 against
-// 4.7 to 4.8, some 45%, is far past it).  Five timings each after 50 ms of both in turn (the GPU clocked up): three
-// right after each form's first run took W8A8 in 6 of 7 starts and native in one on the RX 9060 XT (2026-11-12).
+// 10% faster.  The margin sits between the GPUs' edges, where no start takes the other side: at timed_choice's own 5%
+// the choice moved from run to run on the B70 (2026-11-12: the three shapes native 3.77 to 3.81 ms, W8A8 3.57 to
+// 3.62, a 4 to 6% edge astride the margin), at 15% on the RX 9060 XT (2026-11-12: native 8.91 to 9.06 ms, W8A8 7.74
+// to 7.78, a 14.5 to 16.5% edge, native in 2 starts of 5; its prompts take W8A8 for the speed, Qwen3.5-9B's 32K 2009
+// -> 2497 tok/s); the RTX 4070's 8.1 to 8.8 against 4.7 to 4.8, some 45%, is far past either.  Five timings each
+// after 50 ms of both in turn (the GPU clocked up): three right after each form's first run took W8A8 in 6 of 7
+// starts and native in one on the RX 9060 XT (2026-11-12).
 // Not a shape at a time either: the narrow margins of the small shapes moved the choice from start to start (as
 // recorded; the image DiTs' w8_fused above).  A queue recording a graph,
 // or a timing around this product (core::timing_depth), takes native until the GPU is timed.
@@ -898,7 +901,7 @@ bool Gemm::llm_w8a8(void* stream, bool dense) {
                      tg.native_w8a8(x16, shapes[i].type, wb[i], y, T, shapes[i].N, shapes[i].K, 0);
                  return true;
              }}},
-            [&] { q.wait_and_throw(); }, 5, 1.15, 0.05);
+            [&] { q.wait_and_throw(); }, 5, 1.10, 0.05);
         nat = measured.seconds[0];
         w8 = measured.seconds[1];
         kept.of = measured.pick == 1 ? 1 : 0;
@@ -922,7 +925,7 @@ bool Gemm::llm_w8a8(void* stream, bool dense) {
 // rows resident), at 1024 rows 1.07 against 0.81.  The B70: 2.76 native against about 2.8 (1.84 with BF16 out, 1.47
 // resident), at 1024 rows 0.72 against 0.73.  The whole form timed on the three representative shapes (2026-11-12)
 // put the B70's W8A8 4 to 6% ahead of native (3.77 to 3.81 ms against 3.57 to 3.62), an edge that moved the choice
-// from run to run at a 5% margin: the 15% margin keeps native there.  Making it faster on the B70 needs a BF16
+// from run to run at a 5% margin: the 10% margin keeps native there.  Making it faster on the B70 needs a BF16
 // reader (every kernel downstream of the products) or the weights' int8 rows resident (several GiB of VRAM for a
 // whole model's dense weights, in the budget): not taken here.  Narrow
 // products (the shared experts, N 512 and 640) were slower in W8A8 from 4096 rows on the B70 (0.21 -> 0.28 ms at

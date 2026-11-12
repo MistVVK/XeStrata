@@ -65,7 +65,16 @@ template<class Op, int W, int G = 4> struct RowsI8Of {
         return order[st];
     }
     static constexpr int j_mask(int b) { return b < kLogW ? 1 << b : b >= kLogW + 5 ? 1 << (b - 5) : 0; }
-    static constexpr int lane_mask(int b) { return j_mask(b) != 0 ? 0 : 1 << (b - kLogW); }
+    static constexpr int lane_mask(int b) { return j_mask(b) != 0 || b < kLogW ? 0 : 1 << (b - kLogW); }
+    // every position's bit in j's mask or in the sub-group's 32 lanes'
+    static constexpr bool masks_cover() {
+        for (int st = 0; st < 8; ++st) {
+            const int b = bit_at(st);
+            if (j_mask(b) == 0 && (b < kLogW || b - kLogW >= 5)) return false;
+        }
+        return true;
+    }
+    static_assert(masks_cover());
     static_assert(V == 8 && SG == 32 && kI8Rotate == 256);
     Op op;
     int64_t K, gpr, nsg;

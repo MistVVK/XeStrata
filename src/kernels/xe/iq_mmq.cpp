@@ -567,10 +567,9 @@ struct Kernel {
     float* dst;
     int64_t ld_dst, tiles_m, tiles_n;
     sycl::local_accessor<uint8_t, 1> lm;
-    // K in nch parts of kspan values (launch's), each part's sums into part[ks][row][col] (n_out columns), which launch
-    // adds up in order; ksplit work-groups along K, cpw parts each, one after the other; part null: one part, the sums
-    // straight into dst
-    int64_t ksplit = 1, kspan = 0, nch = 1, cpw = 1;
+    // K in ksplit parts of kspan values (launch's), a work-group each, each part's sums into part[ks][row][col] (n_out
+    // columns), which launch adds up in order; part null: one part, the sums straight into dst
+    int64_t ksplit = 1, kspan = 0;
     float* part = nullptr;
     int64_t total_rows = 0, n_out = 0;
 
@@ -870,19 +869,25 @@ struct Kernel {
 #endif
     }
 
-    // the work-group's parts of K, one after the other (one: the whole K, straight: through the loop, every launch
-    // of the experts' products, none of which takes parts, ran slower, Qwen3.6-35B-A3B UD-Q4_K_XL's 1K prompt on the
-    // B70 3012 -> 2885 tok/s, 2026-11-12)
+    // the work-group's part of K, one a work-group.  K whole (every launch but a few rows' with the parts' buffer)
+    // straight with the constant part: through the parts' index, every launch of the experts' products ran slower on
+    // the B70 (Qwen3.6-35B-A3B UD-Q4_K_XL's 1K prompt 3012 -> 2885 tok/s, 2026-11-12), and the Q4_K and Q5_K WMMA
+    // bodies of 32 rows a tile spilled 60 to 65 VGPRs on the RX 9060 XT (none with the constant).  Never a run of
+    // parts a work-group: a loop over them around the bodies made AMD's compiler keep their addresses live across it,
+    // and the WMMA bodies spilled up to 106 VGPRs (the few rows' products of MOSS-Image's text encoder at 16 and 64
+    // rows 0.54 -> 0.97 ms, 2026-11-12; 0.61 without the loop).  Without it the Q2_K bodies take 203 VGPRs, not 239,
+    // and run a little slower on the RX 9060 XT (Ornith-1.5-35B-A3B GSQ-RCO 3bit's 1K prompt 1519 -> 1472 tok/s,
+    // 2026-11-13): the loop's registers, not its work, had made them faster
     void body(sycl::nd_item<1> it) const {
-        if (nch == 1) {
-            part_body(it, 0);
-            return;
-        }
-        const int64_t kw = (int64_t) it.get_group(0) % ksplit;
-        for (int64_t ks = kw * cpw; ks < sycl::min(nch, (kw + 1) * cpw); ++ks) part_body(it, ks);
+        if (ksplit == 1) part_body(it, 0);
+        else part_body(it, (int64_t) it.get_group(0) % ksplit);
     }
 
-    void part_body(sycl::nd_item<1> it, int64_t ks) const {
+    // Inlined at both of body's calls: with two calls NVIDIA's compiler kept it a function of its own, every kernel
+    // calling it with the kernel's fields on the stack (192 to 320 bytes), and the slower int8 products made the
+    // RTX 4070's prompts take FP16 from 609 rows an expert and chunks of half the tokens (Qwen3.8-Flash-Next
+    // IQ3_XXS's 32K 1244 -> 886 tok/s, 2026-11-13)
+    __attribute__((always_inline)) void part_body(sycl::nd_item<1> it, int64_t ks) const {
         if constexpr (DP4A) {
             dp4a_body(it, ks);
         } else if constexpr (IS != 0 && REG) {
@@ -1137,29 +1142,14 @@ struct Kernel {
     }
 };
 
-// The work-groups a product's K is shared among (iq_mmq_split_set): where one expert's few rows (kIqMmqSplitRows at
-// most) make fewer tiles than the work-groups aimed for (quarters of the compute units), enough to reach them, at most
-// kIqMmqSplitMax and two steps a part.  A prompt's few rows (64 tokens of PLaMo 3 Translate 2B) left the RTX 4070's
-// 46 units mostly idle: 16 tiles of 64 x 128 for a 2560-output product, each running K alone (llama.cpp splits K the
-// same way, its stream-K).  The aim is timed (the units differ: the B70 reports 256 EUs, the RTX 4070 46 SMs; their
-// best were 128 and 184 work-groups).
+// The parts' buffer of each queue (iq_mmq_split_reserve), for one expert's few rows with K in parts (launch)
 struct SplitState {
     std::mutex mu;
-    int quarters = 0;
-    std::unordered_map<const sycl::queue*, std::pair<float*, size_t>> bufs;   // the parts' buffer of each queue
+    std::unordered_map<const sycl::queue*, std::pair<float*, size_t>> bufs;
 };
 SplitState& split_state(sycl::queue& q) {
     static core::PerDevice<std::shared_ptr<SplitState>> per_device;
     return *per_device.get(q.get_device(), [] { return std::make_shared<SplitState>(); });
-}
-
-int64_t split_k(sycl::queue& q, int n, int64_t total_rows, int64_t tiles, int64_t steps) {
-    if (n != 1 || total_rows > kIqMmqSplitRows || steps < 4) return 1;
-    const int quarters = iq_mmq_split_get(q);
-    if (quarters <= 0) return 1;
-    const int64_t cu = (int64_t) q.get_device().get_info<sycl::info::device::max_compute_units>();
-    const int64_t want = (quarters * cu / 4 + tiles - 1) / tiles;
-    return std::max<int64_t>(1, std::min<int64_t>({want, kIqMmqSplitMax, steps / 2}));
 }
 
 // The queue's reserved parts' buffer when it holds `floats`, else null
@@ -1181,32 +1171,33 @@ sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, si
     const auto* xs = reinterpret_cast<const float*>(x8 + total_rows * w_cols);
     const auto* xu = xs + total_rows * (w_cols / 32);
     const int64_t steps = (w_cols + KC - 1) / KC;
-    // One expert's few rows, where the queue holds the parts' buffer: K in the same parts whatever the work-groups
-    // split_k aims for (kIqMmqSplitMax, two steps a part at least), each part's sums from zero and the parts added in
-    // order after, the work-groups along K taking a run of parts each, and a pass of their own adding them (one
-    // work-group as well: adding its second part into dst as it went cost the RTX 4070's products 0.37 ms against
-    // 0.33, the read in the kernels' output; the last of a tile's work-groups adding them, a counter a tile, 0.40
-    // against 0.32, where the B70's took 0.24 against 0.29: the pass costs a short prompt 1-2 ms on the RTX 4070,
-    // Qwen3.5-9B's 52 tokens 1127 -> 1083 tok/s and PLaMo 3 Translate 2B's 64 3810 -> 3372, 2026-11-11).  Two
-    // parts: each part's sums go through memory whatever the aim, and more of them cost more than the work-groups they
-    // let run (Qwen3.5-9B Q4_K_M's FFN gate at 16 and 64 rows, the fastest aim, 2026-11-11: the B70 0.40 ms with 2
-    // parts, 0.43 with 4, 0.46 with 8, and 0.40 before, each work-group its own share; the RTX 4070 0.32, 0.34, 0.40
-    // and 0.33).  Each work-group its own share of K before (as many parts as work-groups) made the sums' order, and
-    // the bits of a prompt's states, follow the aim the plain models' calibration times, which a near tie took one way
-    // or the other from start to start (the RX 9060 XT, 2026-11-10: Mage-Flow's text encoder 0 or 16 quarters, 0.35 ms
-    // each, and another image from the same seed).
-    int64_t nch = 1, kspan = steps * KC, ksplit = 1, cpw = 1;
+    // One expert's few rows, where the queue holds the parts' buffer: K in kIqMmqSplitMax parts (two steps a part at
+    // least), a work-group each, each part's sums from zero and a pass of their own adding the parts in order.  A
+    // prompt's few rows (64 tokens of PLaMo 3 Translate 2B) left the RTX 4070's 46 units mostly idle with K whole: 16
+    // tiles of 64 x 128 for a 2560-output product (llama.cpp splits K the same way, its stream-K).  The parts are the
+    // product's own, so the sums and a prompt's states are the same from start to start: a work-group's own share of K
+    // before, as many parts as the work-groups a timing at the start aimed for (0 to 16 quarters of the compute units),
+    // made them follow that choice, which a near tie took one way or the other (the RX 9060 XT, 2026-11-10: Mage-Flow's
+    // text encoder 0 or 16 quarters, 0.35 ms each, and another image from the same seed).  Two parts: each part's sums
+    // go through memory, and more of them cost more than the work-groups they let run (Qwen3.5-9B Q4_K_M's FFN gate at
+    // 16 and 64 rows, 2026-11-11: the B70 0.40 ms with 2 parts, 0.43 with 4, 0.46 with 8; the RTX 4070 0.32, 0.34,
+    // 0.40).  A work-group each, not one running both: one work-group was the slower wherever the two were timed
+    // (2026-11-12: the B70 0.59 ms against 0.42 and 0.47 against 0.34, the RTX 4070 0.38 against 0.32), and its loop
+    // over the parts spilled on AMD (body).  The pass: adding the second part into dst as the work-group went cost the
+    // RTX 4070's products 0.37 ms against 0.33, the read in the kernels' output; the last of a tile's work-groups
+    // adding them, a counter a tile, 0.40 against 0.32 (the B70's 0.24 against 0.29, the RX 9060 XT's as long as the
+    // pass, 2026-11-13: MOSS-Image's text encoder at 16 and 64 rows 1.30 to 1.47 ms either way, and every launch of the
+    // kernel slower with its code, the 512-row products 1.86 -> 6.6 ms).  It costs a short prompt 1-2 ms on the RTX
+    // 4070 (Qwen3.5-9B's 52 tokens 1127 -> 1083 tok/s, PLaMo 3 Translate 2B's 64 3810 -> 3372, 2026-11-11).
+    int64_t kspan = steps * KC, ksplit = 1;
     float* part = nullptr;
     if (n == 1 && total_rows <= kIqMmqSplitRows && steps >= 4) {
         const int64_t want = std::min<int64_t>(kIqMmqSplitMax, steps / 2);
         const int64_t span = (steps + want - 1) / want * KC, parts = (steps * KC + span - 1) / span;
         part = part_buffer(q, (size_t) (parts * total_rows * w_rows));
         if (part != nullptr) {
-            nch = parts;
+            ksplit = parts;
             kspan = span;
-            ksplit = std::min<int64_t>(nch, split_k(q, n, total_rows, tiles_m * tiles_n, steps));
-            cpw = (nch + ksplit - 1) / ksplit;
-            ksplit = (nch + cpw - 1) / cpw;
         }
     }
     sycl::event e = q.submit([&](sycl::handler& h) {
@@ -1216,8 +1207,6 @@ sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, si
              ld_dst, tiles_m, tiles_n, lm};
         k.ksplit = ksplit;
         k.kspan = kspan;
-        k.nch = nch;
-        k.cpw = cpw;
         k.part = part;
         k.total_rows = total_rows;
         k.n_out = w_rows;
@@ -1228,7 +1217,7 @@ sycl::event launch(sycl::queue& q, const void* w, const uint8_t* const* wtab, si
     return q.parallel_for(sycl::range<2>((size_t) total_rows, (size_t) w_rows), [=](sycl::id<2> i) {
         const int64_t row = (int64_t) i[0], col = (int64_t) i[1];
         float v = part[row * w_rows + col];
-        for (int64_t ks = 1; ks < nch; ++ks) v += part[(ks * total_rows + row) * w_rows + col];
+        for (int64_t ks = 1; ks < ksplit; ++ks) v += part[(ks * total_rows + row) * w_rows + col];
         dst[(int64_t) ids[row] * ld_dst + col] = v;
     });
 }
@@ -1721,18 +1710,6 @@ void iq_mmq_choose_forms(sycl::queue& q, int t, int64_t w_rows, int64_t w_cols, 
     }
     for (void* p : {(void*) w, (void*) xq, (void*) dst, (void*) bounds, (void*) ids})
         if (p != nullptr) sycl::free(p, q);
-}
-
-void iq_mmq_split_set(sycl::queue& q, int quarters) {
-    SplitState& st = split_state(q);
-    std::lock_guard<std::mutex> lock(st.mu);
-    st.quarters = std::max(0, quarters);
-}
-
-int iq_mmq_split_get(sycl::queue& q) {
-    SplitState& st = split_state(q);
-    std::lock_guard<std::mutex> lock(st.mu);
-    return st.quarters;
 }
 
 bool iq_mmq_split_reserve(sycl::queue& q, size_t floats) {

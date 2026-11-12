@@ -53,8 +53,13 @@ inline uint8_t put1(__m256i a, int bits) {
     return (uint8_t) (v < 0 ? 0 : v > 255 ? 255 : v);
 }
 
-inline __m256i bytes8(const uint8_t* p) { return _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*) p)); }
-inline __m256i bytes16(const uint8_t* p) { return _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*) p)); }
+inline __m256i load32(const void* p) { return _mm256_loadu_si256(static_cast<const __m256i*>(p)); }
+inline __m256i bytes8(const uint8_t* p) {
+    return _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(p)));
+}
+inline __m256i bytes16(const uint8_t* p) {
+    return _mm256_cvtepu8_epi16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(p)));
+}
 
 // the VNNI copies' loop, `DOT(acc, x, w)` their vpdpwssd
 #define STRATA_RESIZE_ROWS_PAIRS(DOT)                                                                           \
@@ -67,8 +72,8 @@ inline __m256i bytes16(const uint8_t* p) { return _mm256_cvtepu8_epi16(_mm_loadu
             const int16_t* ll = t.kl + o * t.stride;                                                            \
             __m256i h0 = _mm256_setzero_si256(), h1 = h0, h2 = h0, h3 = h0, q0 = h0, q1 = h0, q2 = h0, q3 = h0; \
             for (int32_t j = 0; j < t.n[o]; j += 16) {                                                          \
-                const __m256i wh = _mm256_loadu_si256((const __m256i*) (hh + j));                               \
-                const __m256i wl = _mm256_loadu_si256((const __m256i*) (ll + j));                               \
+                const __m256i wh = load32(hh + j);                                                              \
+                const __m256i wl = load32(ll + j);                                                              \
                 const __m256i x0 = bytes16(p + j), x1 = bytes16(p + n_in + j);                                  \
                 const __m256i x2 = bytes16(p + 2 * n_in + j), x3 = bytes16(p + 3 * n_in + j);                   \
                 h0 = DOT(h0, x0, wh);                                                                           \
@@ -91,8 +96,8 @@ inline __m256i bytes16(const uint8_t* p) { return _mm256_cvtepu8_epi16(_mm_loadu
             __m256i h = _mm256_setzero_si256(), q = h;                                                          \
             for (int32_t j = 0; j < t.n[o]; j += 16) {                                                          \
                 const __m256i x = bytes16(p + j);                                                               \
-                h = DOT(h, x, _mm256_loadu_si256((const __m256i*) (t.kh + o * t.stride + j)));                  \
-                q = DOT(q, x, _mm256_loadu_si256((const __m256i*) (t.kl + o * t.stride + j)));                  \
+                h = DOT(h, x, load32(t.kh + o * t.stride + j));                                                 \
+                q = DOT(q, x, load32(t.kl + o * t.stride + j));                                                 \
             }                                                                                                   \
             dst[l * n_out + o] = put1(_mm256_add_epi32(_mm256_slli_epi32(h, 15), q), bits);                    \
         }
@@ -118,7 +123,7 @@ void resize_rows_avx2(const uint8_t* src, int64_t lines, int64_t n_in, int64_t n
             const int32_t* k = t.k + o * t.stride;
             __m256i a0 = _mm256_setzero_si256(), a1 = a0, a2 = a0, a3 = a0;
             for (int32_t j = 0; j < t.n[o]; j += 8) {
-                const __m256i w = _mm256_loadu_si256((const __m256i*) (k + j));
+                const __m256i w = load32(k + j);
                 a0 = _mm256_add_epi32(a0, _mm256_mullo_epi32(w, bytes8(p + j)));
                 a1 = _mm256_add_epi32(a1, _mm256_mullo_epi32(w, bytes8(p + n_in + j)));
                 a2 = _mm256_add_epi32(a2, _mm256_mullo_epi32(w, bytes8(p + 2 * n_in + j)));
@@ -133,8 +138,7 @@ void resize_rows_avx2(const uint8_t* src, int64_t lines, int64_t n_in, int64_t n
             const int32_t* k = t.k + o * t.stride;
             __m256i a = _mm256_setzero_si256();
             for (int32_t j = 0; j < t.n[o]; j += 8)
-                a = _mm256_add_epi32(a,
-                                     _mm256_mullo_epi32(_mm256_loadu_si256((const __m256i*) (k + j)), bytes8(p + j)));
+                a = _mm256_add_epi32(a, _mm256_mullo_epi32(load32(k + j), bytes8(p + j)));
             dst[l * n_out + o] = put1(a, bits);
         }
 }

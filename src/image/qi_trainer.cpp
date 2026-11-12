@@ -163,10 +163,10 @@ struct QiTrainer::Impl : train::Trainer {
             if (r < nt) {
                 p[0] = p[1] = p[2] = (float) r;
             } else {
-                const int64_t q = r - nt, y = q / w, x = q % w;
+                const int64_t q = r - nt, y = q / w, x = q % w, top = h - h / 2, left = w - w / 2;
                 p[0] = (float) nt;
-                p[1] = (float) (y - (h - h / 2));
-                p[2] = (float) (x - (w - w / 2));
+                p[1] = (float) (y - top);
+                p[2] = (float) (x - left);
             }
         }
         qi_rope_rows(pos, R, c, sn);

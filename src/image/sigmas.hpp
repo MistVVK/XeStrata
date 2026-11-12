@@ -47,6 +47,7 @@ inline std::vector<float> qi_base_sigmas(int steps, int64_t width, int64_t heigh
     }
     const double scale = (1.0 - shifted.back()) / (1.0 - 0.02);
     std::vector<float> s;
+    s.reserve(shifted.size() + 1);
     for (const double x : shifted) s.push_back((float) (1.0 - (1.0 - x) / scale));
     s.push_back(0.0f);
     return s;

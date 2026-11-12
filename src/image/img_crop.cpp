@@ -436,16 +436,17 @@ PilTaps pil_taps(int64_t in_size, int64_t out_size, Filter f) {
     t.kl.assign(t.k.size(), 0);
     std::vector<double> kk((size_t) t.ksize);
     for (int64_t xx = 0; xx < out_size; ++xx) {
-        const double center = (xx + 0.5) * scale, ss = 1.0 / filterscale;
+        const double center = ((double) xx + 0.5) * scale, ss = 1.0 / filterscale;
         double ww = 0.0;
-        // Pillow's (int) casts: truncation; a negative start is 0 either way
-        int64_t xmin = (int64_t) (center - support + 0.5);
+        // Pillow's (int) casts: truncation, not rounding (lround would move the taps off Pillow's); a negative start
+        // is 0 either way
+        int64_t xmin = (int64_t) (center - support + 0.5);   // NOLINT(bugprone-incorrect-roundings): Pillow's
         if (xmin < 0) xmin = 0;
-        int64_t xmax = (int64_t) (center + support + 0.5);
+        int64_t xmax = (int64_t) (center + support + 0.5);   // NOLINT(bugprone-incorrect-roundings): Pillow's
         if (xmax > in_size) xmax = in_size;
         xmax -= xmin;
         for (int64_t x = 0; x < xmax; ++x) {
-            const double w = pil_filter(f, (x + xmin - center + 0.5) * ss);
+            const double w = pil_filter(f, ((double) (x + xmin) - center + 0.5) * ss);
             kk[(size_t) x] = w;
             ww += w;
         }

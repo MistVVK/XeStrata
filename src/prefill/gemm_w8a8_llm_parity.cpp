@@ -115,7 +115,7 @@ int main() {
         std::printf("gemm init: %s\n", err.c_str());
         return 1;
     }
-    std::mt19937 rng(7);
+    std::mt19937 rng(7);  // NOLINT(bugprone-random-generator-seed): reproducible inputs.
     int rc = 0;
     for (const int type : {8, 12}) {
         rc |= check(Fixture(type, 2048, 2048, 1024, rng), g, true);    // the form taken

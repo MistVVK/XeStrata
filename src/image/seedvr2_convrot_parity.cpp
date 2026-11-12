@@ -30,7 +30,10 @@ template<class T> std::vector<T> rows(const std::string& path, const si::SafeTen
     return data;
 }
 
-int main() {
+namespace {
+
+// the test proper; main reports what it throws
+int run() {
     const char* dir = strata::env_get("SEEDVR2_TEST_DIR");
     if (!dir) return 77;
     const std::string fp = std::string(dir) + "/seedvr2_7b_fp16.safetensors";
@@ -71,4 +74,17 @@ int main() {
         }
     }
     return 0;
+}
+
+}  // namespace
+
+int main() {
+    try {
+        return run();
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "seedvr2_convrot_parity: %s\n", e.what());
+    } catch (...) {
+        std::fprintf(stderr, "seedvr2_convrot_parity: an unknown exception\n");
+    }
+    return 1;
 }

@@ -683,6 +683,8 @@ image::DitProduct Seedvr2Dit::operands(const uint16_t* x16, const float* rs, con
     p.d = base != nullptr ? base + reinterpret_cast<uintptr_t>(w.d) : static_cast<const uint8_t*>(w.d);
     p.x16 = x16;
     if (w.type == kTypeW8) {   // input's int8 rows (xq8_ and their scales xs_in_) against the file's
+        // its scales an offset in the block's bytes: an int8 weight comes with its base (dense() makes FP16 ones)
+        if (base == nullptr) throw std::logic_error("image engine (SeedVR2 DiT): an int8 weight without its block");
         p.x8 = xq8_;
         p.sx = xs_in_;
         p.w8 = reinterpret_cast<const int8_t*>(p.d);

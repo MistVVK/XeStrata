@@ -70,8 +70,6 @@ void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, v
 void choose_forms(int t, int64_t w_rows, int64_t w_cols, int n, void* stream) {
     kernels::iq_mmq_choose_forms(Q(stream), t, w_rows, w_cols, n);
 }
-void split_set(int quarters, void* stream) { kernels::iq_mmq_split_set(Q(stream), quarters); }
-int split_get(void* stream) { return kernels::iq_mmq_split_get(Q(stream)); }
 bool split_reserve(int64_t rows, int64_t n_out, void* stream) {
     return kernels::iq_mmq_split_reserve(Q(stream), kernels::iq_mmq_split_floats(rows, n_out));
 }
@@ -204,6 +202,22 @@ void swiglu_quantize(const float* gu, void* xq, int t, int64_t rows, int64_t n_f
     }
 }
 
+// The crossover a timing found (log2 of the rows), as the step of its octave a chunk is compared with: the same from
+// start to start where the timing moves it a few percent.  The crossover itself moved from start to start, little on
+// the B70 and the RTX 4070 (2026-11-12: by 2 to 4%) and more on the RX 9060 XT (Ornith-1.5-35B-A3B GSQ-RCO 3bit 310
+// to 330 rows, Qwen3.6-35B-A3B UD-Q4_K_XL 627 to 699, Qwen3.8-Flash-Next IQ3_XXS 410 to 421, five starts each), and
+// with it which layers took FP16, and their states, wherever a chunk's mean fell between.  An octave runs from 0.74
+// to 1.48 times a power of two: none of the eight crossovers timed on the three GPUs comes within 8% of an edge (the
+// B70: Ornith 71 to 74, Qwen3.6 135 to 138, Qwen3.8 151 to 152; the RTX 4070: Ornith 240 to 245, Qwen3.6 522 to
+// 545; the RX 9060 XT above).  Its step is 1.19 times the power of two, above a chunk's mean rows an expert, which a
+// power of two's tokens over a power of two's experts puts at or just above one (Ornith's 32K prompt on the RX 9060
+// XT: chunks of 8192 tokens, 256 rows an expert and a few more, int8 as before).  Near the crossover either side
+// costs little.
+static int64_t octave_step(double log2_rows) {
+    const double k = std::floor(log2_rows + 0.435);
+    return (int64_t) std::llround(std::exp2(k + 0.25));
+}
+
 // From how many rows an expert the FP16 path beats the int8 products on this GPU, for a layer of format `f` (its types
 // and shape; synthetic blocks: any bits time alike), timed as a chunk's layer runs them: the experts a chunk of 8192
 // routed rows spreads over at 16 to 1024 rows an expert (all of the model's at the fewest rows; a quarter of the rows where the
@@ -216,8 +230,9 @@ void swiglu_quantize(const float* gu, void* xq, int t, int64_t rows, int64_t n_f
 // 1.05 against 1.26.  The two sides measured in turn, each the least of its timings after both ran a while (the GPU
 // clocked up), and the crossover put between the last row count int8 won at and the first it lost at, where the two
 // lines cross on a log scale: a timing a few percent off moves it a few percent, not to the next power of two (a
-// chunk's mean of 32 rows went int8 or FP16 from start to start).  FP16 wins a count where it is 5% faster.  INT64_MAX:
-// int8 at every count; 0: FP16 from the fewest.  Where the timing cannot run, `fallback`.
+// chunk's mean of 32 rows went int8 or FP16 from start to start), then taken to its octave's step (octave_step).
+// FP16 wins a count where it is 5% faster.  INT64_MAX: int8 at every count; 0: FP16 from the fewest.  Where the
+// timing cannot run, `fallback`.
 static int64_t time_int8_rows_below(const kernels::cpu::NativeFmt& f, size_t blob, int64_t fallback,
                                     const ExpertLaunches& launches) {
     namespace k = strata::kernels;
@@ -416,7 +431,7 @@ static int64_t time_int8_rows_below(const kernels::cpu::NativeFmt& f, size_t blo
                 int64_t below = 0;
                 if (won > 0) {   // where the two lines cross between won and r (log of the rows, log of the ratio)
                     const double t = -std::log(won_ratio) / (std::log(ratio) - std::log(won_ratio));
-                    below = (int64_t) std::llround((double) won * std::pow((double) r / (double) won, t));
+                    below = octave_step(std::log2((double) won) + t * std::log2((double) r / (double) won));
                 }
                 std::fprintf(stderr, "xestrata: the experts' prompt products: int8 below %lld rows an expert, FP16 from "
                                      "there (us an expert int8/FP16 at rows %s)\n", (long long) below, said.c_str());

@@ -129,6 +129,8 @@ protected:
     uint64_t weight_bytes_ = 0, file_bytes_ = 0;
 
 private:
+    void free_weights();
+
     std::vector<void*> weights_;
     std::vector<std::pair<void*, size_t>> work_;
     // product16's way by (T, N, K, the activation and the bias): 0 the FP32 product narrowed, 1 the half product, 2 a

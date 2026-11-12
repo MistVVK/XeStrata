@@ -29,6 +29,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifndef STRATA_TRAIN_MODEL
@@ -40,7 +41,7 @@ namespace {
 using namespace strata::image;
 using Flags = std::map<std::string, std::string>;
 
-const bool kMoss = std::string(STRATA_TRAIN_MODEL) == "moss-image";
+constexpr bool kMoss = std::string_view(STRATA_TRAIN_MODEL) == "moss-image";
 
 void usage() {
     if (kMoss)
@@ -153,8 +154,8 @@ template <class T> int run(T& tr, const Flags& f, bool train, uint64_t seed, int
         const double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         const double own = std::chrono::duration<double>(std::chrono::steady_clock::now() - ts).count();
         std::printf("step %lld loss %.5f (avg %.5f) sigma %.3f grad %.3f %lldx%lld %.2f s (%.2f s/step)\n",
-                    (long long) step, (double) loss, loss_avg, (double) sigma, norm, (long long) (smp.w * 16),
-                    (long long) (smp.h * 16), own, secs / (double) step);
+                    (long long) step, (double) loss, loss_avg, (double) sigma, norm, (long long) smp.w * 16,
+                    (long long) smp.h * 16, own, secs / (double) step);
         std::fflush(stdout);
         if ((save_every > 0 && step % save_every == 0) || step == steps) {
             const std::string path = out + "_" + std::to_string(step) + ".safetensors";

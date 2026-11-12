@@ -106,8 +106,10 @@ sycl::event gdn_conv_l2_launch(sycl::queue& q, const float* history, const float
                 ho[1] = v2;
                 ho[2] = x;
             }
+            // the history after token t, beside the window's own; cp.n is kVerifyMaxT at most (gdn_conv_l2_multi
+            // checks it), so t < cp.n keeps to the array
             if constexpr (COPIES)
-                if (t < cp.n && cp.p[t] != nullptr) {   // the history after token t, beside the window's own
+                if (t < cp.n && cp.p[t] != nullptr) {   // NOLINT(clang-analyzer-security.ArrayBound)
                     float* ho = cp.p[t] + (size_t) c * 3;
                     ho[0] = v1;
                     ho[1] = v2;
@@ -122,8 +124,8 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
                        int qk_heads, float eps, int n_tok, void* stream, int t_begin, bool commit,
                        const GdnRowCopies* copies) {
     if (!history || !qkv || !conv_w || !h || channels % S != 0 || n_tok < 1 || n_tok > kVerifyMaxT ||
-        (commit && (n_tok != 1 || t_begin != 0)))
-        fail("gdn_conv_l2_multi: invalid arguments");
+        (commit && (n_tok != 1 || t_begin != 0)) || (copies != nullptr && copies->n > kVerifyMaxT))
+        fail("gdn_conv_l2_multi: invalid arguments");   // the kernel reads copies->p[t] for t < copies->n
     float* hist_out = commit ? const_cast<float*>(history) : nullptr;   // a work-item reads and writes its channel only
     auto& q = Q(stream);
     const auto e = copies != nullptr && copies->n > 0
@@ -726,8 +728,9 @@ void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* ga
                          const int32_t* n_keep, void* stream, int t_out_begin, void* y_q8_1,
                          const GdnRowCopies* snaps) {
     if (!state || !hbuf || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k || n_tok < 1 ||
-        n_tok > kVerifyMaxT || (snaps != nullptr && snaps->n > 0 && t_out_begin >= n_tok))
-        fail("gdn_step_norm_multi: invalid arguments");
+        n_tok > kVerifyMaxT ||
+        (snaps != nullptr && ((snaps->n > 0 && t_out_begin >= n_tok) || snaps->n > kVerifyMaxT)))
+        fail("gdn_step_norm_multi: invalid arguments");   // the kernels read snaps->p[t] for t < snaps->n
     auto& q = Q(stream);
     const int forced = gdn_forced();
     const int form = forced >= 0 ? forced : gdn_choices().get(q.get_device(), [] { return GdnChoice{}; }).form[n_tok];

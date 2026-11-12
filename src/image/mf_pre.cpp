@@ -404,8 +404,9 @@ int qi_prep(const std::string& vae_path, const std::string& te_path, const std::
             strata::gpu::copy(d, rgba.data(), rgba.size() * 4);
             if (!vae.encode(d, H, W, z, sd)) throw std::runtime_error("the VAE has no encoder");
             std::vector<float> out((size_t) (2 + 2 * n));
-            out[0] = (float) (W / 16);
-            out[1] = (float) (H / 16);
+            const int64_t gw = W / 16, gh = H / 16;   // the latent's grid
+            out[0] = (float) gw;
+            out[1] = (float) gh;
             strata::gpu::copy(out.data() + 2, z, (size_t) n * 4);
             strata::gpu::copy(out.data() + 2 + n, sd, (size_t) n * 4);
             strata::gpu::free(d);

@@ -106,7 +106,7 @@ bool DitLoras::set(const std::vector<LoraUse>& loras, std::string& err, bool& ch
             }
             std::string why;
             if (hooks.refuse && hooks.refuse(*slots[0], e, why)) {
-                err = at + ": " + why;
+                err.assign(at).append(": ").append(why);
                 return fail();
             }
             if (e.kind == LoraKind::bias) {   // a bias's delta alone: its rows are the bias's, its columns none
@@ -143,7 +143,7 @@ bool DitLoras::set(const std::vector<LoraUse>& loras, std::string& err, bool& ch
                 if (dora) {
                     std::vector<float> c;
                     if (!lora_dora_rows(e, slot->src_row, slot->row0, slot->rows, norms, u.scale, c, bases[i], why)) {
-                        err = at + ": " + why;
+                        err.assign(at).append(": ").append(why);
                         return fail();
                     }
                     for (int64_t j = 0; j < slot->rows; ++j) coef[(size_t) (slot->src_row + j)] = c[(size_t) j];
