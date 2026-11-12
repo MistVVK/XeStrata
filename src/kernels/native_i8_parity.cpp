@@ -55,10 +55,14 @@ const char* name_of(int t) {
         case 21: return "IQ3_S";
         case 22: return "IQ2_S";
         case 42: return "Q2_0";
+        case 23: return "IQ4_XS";
+        case 29: return "IQ1_M";
+        case 6: return "Q5_0";
+        case 8: return "Q8_0";
         default: return "?";
     }
 }
-int block_values(int t) { return t == 20 ? 32 : t == 42 ? 64 : 256; }
+int block_values(int t) { return t == 20 || t == 6 || t == 8 ? 32 : t == 42 ? 64 : 256; }
 
 // `rows` rows of `n` values of format t: random bytes (every code is valid for these formats), then a finite fp16 scale in every block
 std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& rng) {
@@ -68,6 +72,10 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
     for (auto& b : w) b = (uint8_t) byte(rng);
     for (size_t o = 0; o < w.size(); o += bs) {   // the fp16 scale starts the block: 2^-13 .. 2^-6
         const uint16_t h = (uint16_t) ((sgn(rng) ? 0x8000 : 0) | (ex(rng) << 10) | man(rng));
+        if (t == 29) {   // IQ1_M: the fp16 scale is spread over the top nibbles of the block's four 16-bit scale words (bytes 48..55)
+            for (int i = 0; i < 4; ++i) w[o + 48 + 2 * i + 1] = (uint8_t) ((w[o + 48 + 2 * i + 1] & 0x0F) | (((h >> (4 * i)) & 15) << 4));
+            continue;
+        }
         std::memcpy(&w[o], &h, 2);
     }
     return w;
@@ -296,6 +304,11 @@ int main() {
             check(gu, dt, 512, 256, s, rng);
             if (gu == 22 || dt == 42 || gu == 18) check(gu, dt, 2560, 640, s, rng);
         }
+    // second wave: gate/up IQ4_XS and IQ1_M, down Q5_0 and Q8_0 (after the first-wave rows, so those lines keep their place)
+    for (const auto& pr : std::vector<std::pair<int, int>>{{23, 20}, {23, 42}, {23, 6}, {29, 20}, {29, 42}, {29, 8}, {16, 6}, {21, 8}, {22, 6}, {22, 8}}) {
+        check(pr.first, pr.second, 512, 256, s, rng);
+        check(pr.first, pr.second, 2560, 640, s, rng);
+    }
     if (g_run == 0) { std::printf("native_i8_parity: nothing ran (%d skipped: not covered on this device)\n", g_skipped); return 77; }
     if (g_skipped) std::printf("native_i8_parity: %d format rows skipped: not covered on this device\n", g_skipped);
     std::printf("native_i8_parity: %s\n", g_fail ? "FAILED" : "all ok");
