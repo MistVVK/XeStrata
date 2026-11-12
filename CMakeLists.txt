@@ -424,6 +424,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(staged_fo_rule_test PRIVATE include)
   add_test(NAME staged_fo_rule_test COMMAND staged_fo_rule_test)
 
+  # STRATA_SWITCH_POINT (research): the floor from the card's share of non-resident experts, a cost estimate of the staged and the streamed walk (header-only, no GPU)
+  add_executable(switch_point_rule_test tests/prefill/switch_point_rule_test.cpp)
+  target_include_directories(switch_point_rule_test PRIVATE include)
+  add_test(NAME switch_point_rule_test COMMAND switch_point_rule_test)
+
   # whether the CUDA fused prompt kernels take the Gyro trellis experts by default (STRATA_PF_FUSED_TQ unset: the sm_86 cards with 80+ SMs; =1 any card; =0 off): the pure
   # rule, pinned for every card class (header-only, no GPU)
   add_executable(fused_tq_default_test tests/prefill/fused_tq_default_test.cpp)
