@@ -19,6 +19,8 @@
 
 #include "strata/core/kv_elastic.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/link_probe.hpp"
+#include "strata/core/split_predict.hpp"
 #include "strata/core/control_vector.hpp"
 #include "strata/core/stdin_lines.hpp"
 #include "strata/core/watchdog.hpp"
@@ -1298,34 +1300,6 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
     return true;
 }
 
-// Copies of `bytes` from `src` to `dst` after a warm-up (the context up, the copy engine primed): four bursts, each one
-// waited for and timed on the host's clock, the fastest in GB/s (< 0 when a copy fails).  `samples`, when given, gets
-// every burst's reading for the log.  #485 (upstream 4e308eb): a single timed burst can read a link low (a link still
-// in a low-power state, other DMA, a context not yet up to speed), and such a disturbance only ever slows a copy, so the
-// fastest of the four is the link's figure.  #59: the host's clock, not the GPU's timestamps (timing events): upstream
-// timed the bursts with those, and reading them back is the one thing this probe asked of the driver that no other part
-// of a start does - an Arc A770 on Windows faulted in it, which ended the start.  A 256 MiB burst takes 9 ms at 28 GB/s;
-// a wait's wake-up (tens of microseconds) moves the figure by under 1%.
-double best_copy_gbps(void* dst, const void* src, size_t bytes, std::string* samples) {
-    constexpr int kBursts = 4;
-    if (samples != nullptr) samples->clear();
-    if (!strata::gpu::copy(dst, src, bytes)) return -1.0;
-    double bw = -1.0;
-    for (int b = 0; b < kBursts; ++b) {
-        const Clock::time_point t0 = Clock::now();
-        if (!strata::gpu::copy(dst, src, bytes)) return -1.0;
-        const double s = std::chrono::duration<double>(Clock::now() - t0).count();
-        const double sv = s > 1e-5 ? (double) bytes / s / 1e9 : -1.0;
-        bw = std::max(bw, sv);
-        if (samples != nullptr) {
-            char buf[32];
-            std::snprintf(buf, sizeof(buf), "%s%.1f", b == 0 ? "" : " ", sv);
-            *samples += buf;
-        }
-    }
-    return bw;
-}
-
 // The effective host->device bandwidth of the PCIe link: copies from pinned host memory, as the expert arena's
 // reads are.  The native default share (0.55) was measured on x16 links (~26-28 GB/s); a x8 card in a x8 slot
 // carries about half of that.  Returns < 0 when the probe cannot run (then the caller keeps the default).  The same
@@ -1336,18 +1310,7 @@ std::map<int, double>& link_readings() {
     return seen;
 }
 double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
-    constexpr size_t kBytes = 256ull << 20;
-    void* h = nullptr;
-    void* d = nullptr;
-    if (!strata::gpu::alloc_host(&h, kBytes)) return -1.0;
-    if (!strata::gpu::alloc_device(&d, kBytes)) {
-        strata::gpu::free(h);
-        return -1.0;
-    }
-    std::memset(h, 0, kBytes);   // fault the pages in before timing
-    const double bw = best_copy_gbps(d, h, kBytes, samples);
-    strata::gpu::free(d);
-    strata::gpu::free(h);
+    const double bw = strata::core::probe_host_to_device_gbps(samples);
     if (bw > 0.0) link_readings()[strata::core::current_device()] = bw;
     return bw;
 }
@@ -1389,31 +1352,6 @@ void attach_prompt_helper(strata::prefill::Prefill& sp, strata::core::RemoteExpe
     }
     std::fprintf(stderr, "xestrata %s: the helper GPU computes the prompt's experts it holds that at most %lld of a chunk's "
                          "tokens route to (links %.1f and %.1f GB/s)\n", who, (long long) rows, l0, lh);
-}
-
-// The time of one small host->device copy (64 KiB, the median of 16 after a warmup): the fixed part of a layer
-// split's hand-off on this GPU's link, for --layer-split auto.  < 0 when the probe cannot run.
-double probe_copy_latency_ms() {
-    constexpr size_t kBytes = (size_t) 64 << 10;
-    void* h = nullptr;
-    void* d = nullptr;
-    if (!strata::gpu::alloc_host(&h, kBytes)) return -1.0;
-    if (!strata::gpu::alloc_device(&d, kBytes)) {
-        strata::gpu::free(h);
-        return -1.0;
-    }
-    std::memset(h, 0, kBytes);
-    std::vector<double> ms;
-    for (int i = 0; i < 17; ++i) {
-        const Clock::time_point t0 = Clock::now();
-        if (!strata::gpu::copy(d, h, kBytes)) break;
-        if (i > 0) ms.push_back(std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
-    }
-    strata::gpu::free(d);
-    strata::gpu::free(h);
-    if (ms.empty()) return -1.0;
-    std::sort(ms.begin(), ms.end());
-    return ms[ms.size() / 2];
 }
 
 // A helper GPU's fixed cost a layer (RemoteExperts::begin and finish): a small upload and three small commands on one
@@ -1517,7 +1455,7 @@ double bench_copy_gbps(bool to_device, bool pinned) {
     double bw = -1.0;
     if (h != nullptr && d != nullptr) {
         std::memset(h, 0, kBytes);
-        bw = to_device ? best_copy_gbps(d, h, kBytes, nullptr) : best_copy_gbps(h, d, kBytes, nullptr);
+        bw = to_device ? strata::core::best_copy_gbps(d, h, kBytes, nullptr) : strata::core::best_copy_gbps(h, d, kBytes, nullptr);
     }
     strata::gpu::free(d);
     if (pinned) strata::gpu::free(h);
@@ -3270,59 +3208,12 @@ int main(int argc, char** argv) {
         // each GPU reading its own memory (bytes per ms; random bytes: a memset's run of one value is compressed on
         // some GPUs, and the B70 then read it at over 1.7 TB/s)
         std::vector<double> bw((size_t) ns);
-        auto gpu_bandwidth = [&](int dev) -> double {
-            const strata::core::OnDevice on(dev);
-            const size_t n = (size_t) 512 << 20;
-            std::vector<uint64_t> host(n / 8);
-            uint64_t x = 0x9e3779b97f4a7c15ull;
-            for (uint64_t& v : host) { x ^= x << 13; x ^= x >> 7; x ^= x << 17; v = x; }
-            void* a = nullptr;
-            void* b = nullptr;
-            std::vector<double> got;
-            if (strata::gpu::alloc_device(&a, n) && strata::gpu::alloc_device(&b, n) &&
-                strata::gpu::copy(a, host.data(), n) && strata::gpu::copy(b, a, n)) {
-                for (int rep = 0; rep < 5; ++rep) {
-                    const Clock::time_point t0 = Clock::now();
-                    if (!strata::gpu::copy(b, a, n)) break;
-                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-                    got.push_back(2.0 * (double) n / std::max(ms, 1e-3));   // read + write
-                }
-            }
-            if (a) strata::gpu::free(a);
-            if (b) strata::gpu::free(b);
-            if (got.empty()) return 100e6;   // (100 GB/s when the copy could not run)
-            std::sort(got.begin(), got.end());
-            return got[got.size() / 2];
-        };
-        // the RAM as the CPU expert pool reads it (one reader per hardware thread; STRATA_SPLIT_CPU_GBPS overrides)
-        const double cpu_bw = [&] {
-            if (const char* v = strata::env_get("SPLIT_CPU_GBPS")) return std::strtod(v, nullptr) * 1e6;
-            const int nt = std::max(1, (int) std::thread::hardware_concurrency());
-            const size_t per = (size_t) 32 << 20;
-            std::vector<std::vector<uint64_t>> bufs((size_t) nt, std::vector<uint64_t>(per / 8, 1));
-            double best = 0;
-            for (int rep = 0; rep < 3; ++rep) {
-                std::atomic<uint64_t> sink{0};
-                std::vector<std::thread> th;
-                th.reserve((size_t) nt);
-                const Clock::time_point t0 = Clock::now();
-                for (int t = 0; t < nt; ++t)
-                    th.emplace_back([&, t] {
-                        uint64_t acc = 0;
-                        for (const uint64_t v : bufs[(size_t) t]) acc += v;
-                        sink += acc;
-                    });
-                for (auto& t : th) t.join();
-                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
-                best = std::max(best, (double) nt * (double) per / std::max(ms, 1e-3));
-            }
-            return best;
-        }();
+        const double cpu_bw = strata::core::split_cpu_bandwidth();
         // STRATA_SPLIT_SPEED_SCALE="1,0.55" (upstream 4a1ef86b, a test seam): each stage's speed times this factor, an
         // unequal pair on two equal cards (#2644); unset = nothing changes
         const char* speed_scale = strata::env_get("SPLIT_SPEED_SCALE");
         for (int i = 0; i < ns; ++i) {
-            bw[(size_t) i] = gpu_bandwidth(dev_of_stage(i));
+            bw[(size_t) i] = strata::core::split_gpu_bandwidth(dev_of_stage(i));
             if (speed_scale != nullptr && *speed_scale != '\0') {
                 const char* p = speed_scale;
                 for (int k = 0; k < i && p != nullptr; ++k) {
@@ -3348,7 +3239,7 @@ int main(int argc, char** argv) {
         for (int i = 0; i < ns; ++i) {
             const strata::core::OnDevice on(dev_of_stage(i));
             link_gbps[(size_t) i] = native_pack ? probe_pcie_h2d_gbps() : -1.0;
-            copy_ms[(size_t) i] = probe_copy_latency_ms();
+            copy_ms[(size_t) i] = strata::core::probe_copy_latency_ms();
         }
         static const bool link_abs = [] { const char* v = strata::env_get("SPLIT_LINK_ABS"); return v && v[0] == '1'; }();
         // STRATA_SPLIT_UNIFORM=1 (opt-in, upstream b8844516): no per-link scaling at all (the uniform miss cost before
@@ -3375,7 +3266,7 @@ int main(int argc, char** argv) {
         const double mass_exp = strata::env_get("SPLIT_MASS_EXP") ? std::strtod(strata::env_get("SPLIT_MASS_EXP"), nullptr) : 0.8;
         std::vector<double> mass(prof.size());
         for (size_t r = 0; r < prof.size(); ++r) mass[r] = std::pow((double) r + 1.0, -mass_exp);
-        std::vector<double> layer_mass((size_t) L, 0.0), layer_held((size_t) L, 0.0);
+        std::vector<double> layer_mass((size_t) L, 0.0);
         for (size_t r = 0; r < prof.size(); ++r) layer_mass[(size_t) prof[r].first] += mass[r];
         auto cost = [&](int64_t l) -> int64_t {
             return native_pack ? ((int64_t) lay.blob_bytes(l) + 255) / 256 * 256 : (int64_t) lay.max_blob;
@@ -3402,58 +3293,35 @@ int main(int argc, char** argv) {
         const bool pipelined = o.pipeline_windows >= 2;
         std::vector<int64_t> cap((size_t) ns), used((size_t) ns);
         bool startable = true;   // predict's: every stage can start its prompt path
+        strata::core::SplitPrediction model;
+        model.layers = L;
+        model.profile = prof;
+        model.mass = mass;
+        model.gpu_bw = bw;
+        model.link_scale = link_scale;
+        for (int i = 0; i < ns; ++i) model.side_ms.push_back(side_ms(i));
+        model.order = ord;
+        model.capacity = cap_raw;
+        model.cost = cost;
+        model.blob_bytes = [&](int64_t l) { return (double) lay.blob_bytes(l); };
+        model.prompt_min = prompt_min;
+        model.cpu_bw = cpu_bw;
+        model.rows = rows;
+        model.experts_per_row = (double) Ka;
+        model.dense_layer = dense_layer;
+        model.tail_keep = tail_keep;
+        model.head_bytes = (double) head_bytes;
+        model.drafts = drafts;
+        model.pipelined = pipelined;
         auto predict = [&](const std::vector<int64_t>& at, double& held_mass, int64_t& held) -> double {
-            const int nst = (int) at.size() + 1;
-            startable = true;
-            for (int i = 0; i < nst; ++i) {
-                const int64_t lo = i == 0 ? 0 : at[(size_t) i - 1], hi = i + 1 < nst ? at[(size_t) i] : L;
-                const int64_t raw = cap_raw(i, nst == 1 ? 0 : lo, nst == 1 ? -1 : hi, i + 1 == nst);
-                if (raw < prompt_min) startable = false;
-                cap[(size_t) i] = std::max<int64_t>(raw, 0);
-            }
-            std::fill(used.begin(), used.end(), 0);
-            std::fill(layer_held.begin(), layer_held.end(), 0.0);
-            held = 0;
-            std::vector<bool> full((size_t) ns, false);
-            for (size_t r = 0; r < prof.size(); ++r) {
-                const int64_t l = prof[r].first;
-                int st = 0;
-                while (st + 1 < nst && l >= at[(size_t) st]) ++st;
-                if (full[(size_t) st]) continue;
-                if (used[(size_t) st] + cost(l) > cap[(size_t) st]) { full[(size_t) st] = true; continue; }   // as the fill
-                used[(size_t) st] += cost(l);
-                layer_held[(size_t) l] += mass[r];
-                ++held;
-            }
-            double hand = 0, all = 0, kept = 0;
-            std::vector<double> stage_ms((size_t) nst, 0.0);
-            for (int i = 1; i < nst; ++i) hand += side_ms(ord[(size_t) i - 1]) + side_ms(ord[(size_t) i]);
-            for (int64_t l = 0; l < L; ++l) {
-                int st = 0;
-                while (st + 1 < nst && l >= at[(size_t) st]) ++st;
-                const int d = ord[(size_t) st];
-                const double hit = layer_mass[(size_t) l] > 0 ? layer_held[(size_t) l] / layer_mass[(size_t) l] : 1.0;
-                const double experts = (double) Ka * rows * (double) lay.blob_bytes(l);
-                stage_ms[(size_t) st] += dense_layer / bw[(size_t) d] +
-                                         std::max(experts * hit / bw[(size_t) d],
-                                                  experts * (1.0 - hit) * tail_keep / cpu_bw * link_scale[(size_t) d]);
-                all += layer_mass[(size_t) l];
-                kept += layer_held[(size_t) l];
-            }
-            // the last stage's own work: the head once a window and, with --mtp, the draft layer for each draft
-            // (taken as one layer's dense weights: its experts are left out)
-            const int last = ord[(size_t) nst - 1];
-            stage_ms[(size_t) nst - 1] += ((double) head_bytes + (drafts ? (rows - 1.0) * dense_layer : 0.0)) /
-                                          bw[(size_t) last];
-            held_mass = all > 0 ? kept / all : 1.0;
-            // --pipeline-windows 2: the first GPU runs the next window while the later ones verify this one, so a
-            // window takes about its slowest stage, not their sum, and the balanced split wins.  Priced as the sum,
-            // auto chose K=47 on a B70 + RTX 4070 (IQ2_XS), where the pipeline lost 17 to 27%, and K=24 gained 5 to 22%
-            // (docs/MULTIGPU.md)
-            if (pipelined && nst > 1) return hand + *std::max_element(stage_ms.begin(), stage_ms.end());
-            double ms = hand;
-            for (const double t : stage_ms) ms += t;
-            return ms;
+            model.order = ord;
+            const auto result = strata::core::predict_layer_split(model, at);
+            cap = result.capacity;
+            used = result.used;
+            startable = result.startable;
+            held_mass = result.held_mass;
+            held = result.held;
+            return result.ms;
         };
         bool alone_holds_all = false;   // CUDA0's cache alone takes every profiled pair (--split-skip-if-fits)
         double alone_ms = 0;            // CUDA0 alone's predicted window (the last choice below)
@@ -3496,28 +3364,12 @@ int main(int argc, char** argv) {
             }
         };
         auto search = [&] {
-        priced.clear();
-        scored.clear();
-        if (ns == 2) {
-            for (int64_t k = 2; k < L; ++k) { at[0] = k; consider(); }
-        } else if (ns == 3) {
-            for (int64_t k1 = 2; k1 + 1 < L; ++k1)
-                for (int64_t k2 = k1 + 1; k2 < L; ++k2) { at[0] = k1; at[1] = k2; consider(); }
-        } else if (ns == 4) {   // every four-way placement as well (upstream e2b32892): ~15,000 for 48 layers
-            for (int64_t k1 = 2; k1 + 2 < L; ++k1)
-                for (int64_t k2 = k1 + 1; k2 + 1 < L; ++k2)
-                    for (int64_t k3 = k2 + 1; k3 < L; ++k3) { at[0] = k1; at[1] = k2; at[2] = k3; consider(); }
-        } else {
-            double total = 0;
-            for (const double c : bw) total += c;
-            double acc = 0;
-            for (int i = 0; i + 1 < ns; ++i) {
-                acc += bw[(size_t) i];
-                at[(size_t) i] = std::clamp<int64_t>((int64_t) std::llround(acc / total * (double) L),
-                                                    i == 0 ? 2 : at[(size_t) i - 1] + 1, L - (ns - 1 - i));
-            }
-            consider();
-        }
+            priced.clear();
+            scored.clear();
+            strata::core::enumerate_layer_splits(L, bw, [&](const std::vector<int64_t>& cuts) {
+                at = cuts;
+                consider();
+            });
         };
         // which GPU runs which stage (upstream be8db787, efe3bfcf, 184012ca: the faster card last, as the last stage
         // runs the head and the draft layer).  Chosen with the split points, from the same prediction: every order of

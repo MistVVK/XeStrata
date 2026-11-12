@@ -26,6 +26,8 @@
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/device.hpp"
+#include "strata/core/link_probe.hpp"
+#include "strata/core/split_predict.hpp"
 #include "strata/core/expert_tier.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
@@ -658,49 +660,10 @@ bool PlainModel::split_auto_points(std::string& err) {
         const uint64_t reserve =
             core::vram_room(total_b, /*parts*/ 1, kTierRoomLeast) + (1ull << 30) + (d == n - 1 ? head : 0);
         room[(size_t) d] = free_b > reserve ? (double) (free_b - reserve) : 0.0;
-        // the link: the best of three 64 MiB copies from pinned host memory
-        constexpr size_t kProbe = 64ull << 20;
-        void *h = nullptr, *g = nullptr;
-        if (strata::gpu::alloc_host(&h, kProbe) && strata::gpu::alloc_device(&g, kProbe)) {
-            std::memset(h, 0, kProbe);
-            double best = 0;
-            for (int r = 0; r < 3; ++r) {
-                const auto t0 = std::chrono::steady_clock::now();
-                if (!strata::gpu::copy(g, h, kProbe)) break;
-                const double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-                best = std::max(best, (double) kProbe / std::max(sec, 1e-9));
-            }
-            link[(size_t) d] = best;
-        }
-        strata::gpu::free(g);
-        strata::gpu::free(h);
+        link[(size_t) d] = std::max(0.0, probe_host_to_device_gbps()) * 1e9;
     }
-    std::vector<int64_t> count((size_t) n, 0);
-    int64_t left = M;
-    double fast_room = 0;
-    for (int d = 0; d < n; ++d) {
-        const bool slow = d > 0 && link[0] > 0 && link[(size_t) d] < link[0] / 2 && layer_b > 0;
-        if (!slow) { fast_room += room[(size_t) d]; continue; }
-        // (a fifth of the room for its blocks' own weights, K/V and buffers: the RTX 4070's tier took 8.4 of 9.6 GiB)
-        const int64_t whole = (int64_t) (room[(size_t) d] * 0.8 / (double) layer_b) - (d == n - 1 && mtp ? 1 : 0);
-        count[(size_t) d] = std::clamp<int64_t>(whole, 1, left - 1);
-        left -= count[(size_t) d];
-    }
-    if (left < 1 || fast_room <= 0) return true;
-    {   // the rest by memory among the others
-        double acc = 0;
-        int64_t given = 0;
-        int last_fast = 0;
-        for (int d = 0; d < n; ++d)
-            if (count[(size_t) d] == 0) last_fast = d;
-        for (int d = 0; d < n; ++d) {
-            if (count[(size_t) d] != 0) continue;
-            acc += room[(size_t) d];
-            const int64_t upto = d == last_fast ? left : (int64_t) std::llround((double) left * acc / fast_room);
-            count[(size_t) d] = std::max<int64_t>(1, upto - given);
-            given += count[(size_t) d];
-        }
-    }
+    const std::vector<int64_t> count = choose_split_by_room(M, layer_b, mtp, room, link);
+    if (count.empty()) return true;
     int64_t seen = 0, l = 0, want = 0;
     for (int d = 0; d + 1 < n; ++d) {
         want += count[(size_t) d];
