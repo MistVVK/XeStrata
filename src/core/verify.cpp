@@ -3933,6 +3933,16 @@ bool Verifier::commit(int n_keep, std::string& err) {
     return next_ == nullptr || next_->commit(n_keep, err);
 }
 
+bool Verifier::commit_deferred() const {
+#if defined(STRATA_GPU_METAL)
+    return false;   // the Metal window keeps its own bookkeeping: never dropped
+#else
+    if (last_t_ < 1) return false;
+    const bool self = last_t_ == 1 && !always_publish_ && one_token_self_commit() && !g_qfuse();   // as commit() above
+    return !self && (next_ == nullptr || next_->commit_deferred());
+#endif
+}
+
 bool Verifier::wait_commit(std::string& err) {
 #if defined(STRATA_GPU_METAL)
     (void) err;
