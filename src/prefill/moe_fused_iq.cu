@@ -88,6 +88,10 @@ constexpr int H_ROW_BYTES = D_ROWS_K / 64 * AB;   // bytes of a row of H in the 
 static_assert(GU_ROWS_K % 256 == 0 && D_ROWS_K % 64 == 0, "the native expert kernels: K of gate/up is whole 256-value super-blocks, K of down whole 64-value stages");
 
 // the formats (ggml type ids)
+static_assert(GGML_TYPE_IQ2_XXS == strata::prefill::fused_tile::kTypeIq2Xxs && GGML_TYPE_IQ2_XS == strata::prefill::fused_tile::kTypeIq2Xs &&
+              GGML_TYPE_IQ2_S == strata::prefill::fused_tile::kTypeIq2S && GGML_TYPE_IQ3_XXS == strata::prefill::fused_tile::kTypeIq3Xxs &&
+              GGML_TYPE_IQ3_S == strata::prefill::fused_tile::kTypeIq3S && GGML_TYPE_IQ4_XS == strata::prefill::fused_tile::kTypeIq4Xs,
+              "fused_tile_rule.hpp's default_gate_format uses ggml's type ids");
 constexpr int T_IQ2_XXS = GGML_TYPE_IQ2_XXS, T_IQ2_XS = GGML_TYPE_IQ2_XS, T_IQ2_S = GGML_TYPE_IQ2_S,
               T_IQ3_XXS = GGML_TYPE_IQ3_XXS, T_IQ3_S = GGML_TYPE_IQ3_S, T_IQ4_XS = GGML_TYPE_IQ4_XS,
               T_IQ4_NL = GGML_TYPE_IQ4_NL, T_Q2_0 = GGML_TYPE_Q2_0,
@@ -2792,15 +2796,16 @@ bool native_supported(int gu_type, int d_type) {
     // formats measured there - the IQ3_S pack's IQ2_S, IQ3_XXS, IQ3_S and IQ4_XS layers with IQ4_NL / Q2_0 down (RTX PRO 5000:
     // prompt +7.0% 4K, +5.2% 20K, +3.4% 98K; teacher-forced KL against MMQ 0.0002 over 5998 positions, 0.0010 over 1760 long
     // ones; first-token KL against the FP16 prompt path 0.01181 vs MMQ's 0.01236 over 48 prompts; HumanEval, reasoning,
-    // agent, needles, CJK and tool calls the same).  IQ2_XXS / IQ2_XS gate/up (the IQ3_XXS and IQ2_XS packs) keep MMQ until
-    // measured.  The same on a compute capability 8.6 card with 80+ SMs (RTX A6000, 84 SMs, IQ3_S pack, 11-11: prompt +6.7% 4K, +3.6% 8K,
+    // agent, needles, CJK and tool calls the same).  The same on a compute capability 8.6 card with 80+ SMs (RTX A6000, 84 SMs, IQ3_S pack, 11-11: prompt +6.7% 4K, +3.6% 8K,
     // +1.0% 20K, 5/5 each; first-token KL against the FP16 prompt path at or below MMQ's at 2,048 / 4K / 8K / 20K; neutral-writer
     // forced-token gate PASS over 48 prompts; small chunks, agent, first 8K read, backstop as MMQ; STRATA_PF_FUSED_SM86=0 off).
+    // IQ2_XXS / IQ2_XS gate/up (the IQ3_XXS and IQ2_XS packs) joined on 11-12 on the owner's word (RTX A6000, IQ3_XXS pack: prompt time fused / MMQ-mixed 0.874-0.976 from 300 to 8,193
+    // tokens on the integration head, 5 rounds; teacher-forced KL vs the FP16 prompt path 0.965 / 1.062 / 1.072 / 1.008 at 512 / 1,000 / 2,048 / 8,192 ids; the rule: fused_tile_rule.hpp).
     // Every other CUDA card: opt-in as before.
     if (env < 0) {
         // the native Q2_0 pack's Q2_0 / Q2_0 layers: only with STRATA_PF_FUSED_Q2N=1 (d.q2n), on any sm_80+ card
         if (gu_type == T_Q2_0) { const DevInfo& d = dev_info(); return d.ok && d.q2n && d_type == T_Q2_0 && d_covered_on(d_type, d); }
-        if (gu_type != T_IQ2_S && gu_type != T_IQ3_XXS && gu_type != T_IQ3_S && gu_type != T_IQ4_XS) return false;
+        if (!strata::prefill::fused_tile::default_gate_format(gu_type)) return false;   // IQ2_XXS / IQ2_XS joined 11-12 (owner), see fused_tile_rule.hpp
         const DevInfo& d = dev_info();
         // 12.0 and 8.6 cards with 80+ SMs only (RTX PRO 5000 / 6000, RTX 5080 / 5090; RTX A6000 / A40, RTX 3090 / 3090 Ti / 3080 Ti):
         // on an RTX 5070 (48 SMs, IQ2_XS pack, experts partly in RAM) the fused kernels were 4.7% slower on 20K prompts (0/6 pairs),
@@ -2808,7 +2813,7 @@ bool native_supported(int gu_type, int d_type) {
         // STRATA_PF_FUSED_SM40=1 (research, off unless set): the sm_86 / sm_120 cards with 40-79 SMs also take the launches with a staged gate/up kernel (IQ3_XXS / IQ3_S / IQ4_XS) and an IQ4_NL / Q2_0
         // down; the rule itself is fused_tile::takes_by_default (unit-tested)
         static const bool sm40 = [] { const char* v = std::getenv("STRATA_PF_FUSED_SM40"); return v != nullptr && v[0] == '1'; }();
-        return d.ok && strata::prefill::fused_tile::takes_by_default({d.s120, d.s121, d.sms, d.s86}, sm40, sw_on(gu_type, true), d_type == T_IQ4_NL || d_type == T_Q2_0) && !d.t75 &&
+        return d.ok && strata::prefill::fused_tile::default_takes(env, {d.s120, d.s121, d.sms, d.s86}, sm40, sw_on(gu_type, true), d_type == T_IQ4_NL || d_type == T_Q2_0, gu_type) && !d.t75 &&
                d_covered_on(d_type, d);
     }
     if (gu_type == T_Q2_0 && d_type != T_Q2_0) return false;   // the opt-in (STRATA_PF_FUSED=1 as well) takes the Q2_0 / Q2_0 pair only

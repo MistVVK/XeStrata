@@ -173,6 +173,43 @@ int main() {
         CHECK(bad == 0);
         std::printf("fused_tile_rule_test: default rule with the switch unset: %lld card / launch combinations compared with 'sm_86 / sm_120, 80+ SMs' (%lld differing)\n", cmpd, bad);
     }
+    // ---- the 2-bit gate/up formats in the default (owner 11-12): default_gate_format / default_takes(env, card, sm40, gate_staged, down_ok, gu_type)
+    {
+        using namespace strata::prefill::fused_tile;
+        // the ids are ggml's (GGML_TYPE_*, asserted in moe_fused_iq.cu): IQ2_XXS 16, IQ2_XS 17, IQ3_XXS 18, IQ1_S 19, IQ4_NL 20, IQ3_S 21, IQ2_S 22, IQ4_XS 23
+        CHECK(default_gate_format(16) && default_gate_format(17));                                                    // IQ2_XXS, IQ2_XS: new
+        CHECK(default_gate_format(18) && default_gate_format(21) && default_gate_format(22) && default_gate_format(23));   // IQ3_XXS, IQ3_S, IQ2_S, IQ4_XS: as before
+        CHECK(!default_gate_format(19) && !default_gate_format(20) && !default_gate_format(29) && !default_gate_format(12) && !default_gate_format(0));   // IQ1_S, IQ4_NL, IQ1_M, Q4_K, F32
+        const int kIq2[2] = {16, 17};
+        long long cmp2 = 0, bad2 = 0;
+        for (int gu : kIq2)
+            for (int s120 = 0; s120 < 2; ++s120)
+                for (int s86 = 0; s86 < 2; ++s86)
+                    for (int s121 = 0; s121 < 2; ++s121)
+                        for (int sms = 0; sms <= 200; ++sms)
+                            for (int sm40 = 0; sm40 < 2; ++sm40)
+                                for (int d = 0; d < 2; ++d) {
+                                    ++cmp2;
+                                    const Card c{s120 != 0, s121 != 0, sms, s86 != 0};
+                                    const bool want = (s120 || s86) && sms >= 80;   // sm_86 / sm_120, 80+ SMs; gate_staged is false for IQ2_XXS / IQ2_XS (sw_on), so sm40 adds nothing
+                                    if (default_takes(-1, c, sm40 != 0, false, d != 0, gu) != want) ++bad2;
+                                    if (default_takes(0, c, sm40 != 0, false, d != 0, gu)) ++bad2;   // STRATA_PF_FUSED=0: the default is off again
+                                    if (default_takes(1, c, sm40 != 0, false, d != 0, gu)) ++bad2;   // STRATA_PF_FUSED=1 is the opt-in, decided elsewhere
+                                }
+        CHECK(bad2 == 0);
+        std::printf("fused_tile_rule_test: IQ2_XXS / IQ2_XS default: %lld card / switch combinations (%lld wrong)\n", cmp2, bad2);
+        // named cards: 80 SMs yes, 79 no, 48 no, AMD (no s86 / s120 flag) no at any SM count, sm_89 / sm_80 (no flag) no
+        CHECK(default_takes(-1, Card{false, false, 84, true}, false, false, true, 16) && default_takes(-1, Card{false, false, 80, true}, false, false, true, 17));   // A6000, 3080 Ti
+        CHECK(!default_takes(-1, Card{false, false, 79, true}, false, false, true, 16) && !default_takes(-1, Card{false, false, 79, true}, true, false, true, 17));   // 79 SMs: no, switch or not
+        CHECK(!default_takes(-1, Card{false, false, 48, true}, true, false, true, 16) && !default_takes(-1, Card{true, false, 48, false}, true, false, true, 17));   // A4000, 5070
+        CHECK(default_takes(-1, Card{true, false, 100, false}, false, false, true, 16));                                                                         // PRO 5000 (sm_120)
+        CHECK(!default_takes(-1, Card{false, false, 304, false}, true, false, true, 16) && !default_takes(-1, Card{false, false, 128, false}, false, false, true, 17));   // AMD / sm_89: no
+        // the formats already in the list keep their rule: IQ3_XXS on 80+ SMs yes, with the sm40 switch and a staged gate also 40-79
+        CHECK(default_takes(-1, Card{false, false, 84, true}, false, true, true, 18) && !default_takes(-1, Card{false, false, 60, true}, false, true, true, 18) &&
+              default_takes(-1, Card{false, false, 60, true}, true, true, true, 18));
+        // a format outside the list never takes the default
+        CHECK(!default_takes(-1, Card{false, false, 84, true}, true, true, true, 19) && !default_takes(-1, Card{false, false, 84, true}, true, true, true, 20));
+    }
     // every class, every launch size: staged = false gives the rule of commit 083b1ac82 exactly as before the argument existed, for the sm_86 cards too (the new flag does not move them)
     {
         long long cmp = 0, diff = 0;

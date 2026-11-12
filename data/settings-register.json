@@ -24456,7 +24456,7 @@
    "last_date": "",
    "status": "research",
    "owner": "prefill",
-   "note": "CUDA diagnostic for bug reports, not a user setting: =0 puts compute capability 8.6 cards with 80+ SMs back on MMQ for the IQ3_S pack's formats (the fused prompt kernels are the default there since 11-11). Goes away with MMQ (release C).",
+   "note": "CUDA diagnostic for bug reports, not a user setting: =0 puts compute capability 8.6 cards with 80+ SMs back on MMQ for the default list's gate/up formats (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS; the fused prompt kernels are the default there since 11-11, IQ2_XXS / IQ2_XS since 11-12). Goes away with MMQ (release C).",
    "retire_after": "",
    "retired_in": ""
   },

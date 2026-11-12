@@ -87,6 +87,23 @@ constexpr bool takes_by_default(const Card& c, bool sm40, bool gate_staged, bool
     return sm40 && gate_staged && down_ok && c.sms >= 40;
 }
 
+// The gate/up formats native_supported's default rule (CUDA, STRATA_PF_FUSED unset) takes at all: IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, as ggml type ids (moe_fused_iq.cu static_asserts
+// that they are GGML_TYPE_*).  IQ2_XXS / IQ2_XS joined on the owner's word of 11-12 ("2-bit fused kernels as the default on 80+ SM NVIDIA cards"): the IQ3_XXS set's 19 gate/up layers (9 IQ2_XXS,
+// 10 IQ2_XS) on an RTX A6000 (sm_86, 84 SMs): prompt time fused / default 0.874-0.976 from 300 to 8,193 tokens on the integration head, teacher-forced KL against the FP16 prompt path 0.965 [0.912,
+// 1.021] at 512, 1.062 [0.995, 1.137] at 1,000, 1.072 [1.020, 1.123] at 2,048 and 1.008 [0.939, 1.101] at 8,192 ids (RESULTS-OWN-4X.md).  The card rule is takes_by_default above and did not
+// change: sm_86 / sm_120 with 80+ SMs; below 80 SMs the sm40 research switch only takes the weight-staging gate/up instances (IQ3_XXS / IQ3_S / IQ4_XS: sw_on), never IQ2_XXS / IQ2_XS.
+// AMD (HIP) has its own rule in native_supported and is not touched.
+constexpr int kTypeIq2Xxs = 16, kTypeIq2Xs = 17, kTypeIq3Xxs = 18, kTypeIq3S = 21, kTypeIq2S = 22, kTypeIq4Xs = 23;
+constexpr bool default_gate_format(int t) {
+    return t == kTypeIq2Xxs || t == kTypeIq2Xs || t == kTypeIq2S || t == kTypeIq3Xxs || t == kTypeIq3S || t == kTypeIq4Xs;
+}
+
+// native_supported's CUDA default decision for a gate/up format on a card: `env` is STRATA_PF_FUSED as native_supported reads it (-1 unset, 0 = "0", 1 = other: the opt-in, decided
+// elsewhere, never "by default"), so only an unset variable can take a layer here, and STRATA_PF_FUSED=0 turns the default off again.
+constexpr bool default_takes(int env, const Card& c, bool sm40, bool gate_staged, bool down_ok, int gu_type) {
+    return env < 0 && default_gate_format(gu_type) && takes_by_default(c, sm40, gate_staged, down_ok);
+}
+
 // ---- the weight-staging guard (check_staged_blobs's decision in src/prefill/moe_fused_iq.cu), as pure functions so the decision can be tested without a GPU.
 // The staging kernels (sw_on instances) copy the expert blobs into shared memory with cp.async and read 16-bit words at the rows' offsets: they need blobs in device (or managed)
 // memory at 2-byte aligned addresses and 2-byte aligned rows and offsets.  A launch that fails the check does NOT end the process: it takes the unstaged 64-row kernel of the same
