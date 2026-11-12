@@ -6244,6 +6244,21 @@ int i8_switch_state() {
 
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
 
+size_t native_expert_i8_smem_limit() noexcept { return i8_smem_limit(); }
+
+NativeExpertI8Launch native_expert_i8_last_launch() noexcept {
+    return {g_i8_last.tile, g_i8_last.gu_bytes, g_i8_last.down_bytes, g_i8_last.gu_err, g_i8_last.down_err};
+}
+
+int native_expert_i8_probe_launch(size_t bytes) noexcept {
+#if !defined(__HIPCC__)
+    return i8_smem_launches(bytes) ? 1 : 0;
+#else
+    (void) bytes;
+    return -1;
+#endif
+}
+
 bool native_expert_i8_prompt(const NativeExpertLayout& L, int64_t group_entries) noexcept {
     return i8_switch_state() == 1 && group_entries >= 256 && native_expert_i8_supported(L);
 }

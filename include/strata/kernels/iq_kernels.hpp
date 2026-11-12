@@ -99,6 +99,20 @@ bool native_expert_i8_supported(const NativeExpertLayout& L) noexcept;
 /// device's shared memory still have to allow it: `native_expert_i8_supported`; groups under 256 entries keep the other path), unset or 0:
 /// no.  Shared prompt code, no device work: a Metal build answers false.
 bool native_expert_i8_prompt(const NativeExpertLayout& L, int64_t group_entries) noexcept;
+/// OWN-I8 (tests, logs; CUDA / HIP builds only, no Metal definition: nothing shared calls these three): the dynamic shared memory per block the current device
+/// lets `native_expert_i8` use, in bytes (the device's opt-in attribute, 48 KB where it reports less; STRATA_I8_SMEM_LIMIT can lower it).
+size_t native_expert_i8_smem_limit() noexcept;
+/// What the last `native_expert_i8` call asked its two launches for: the tile code, the dynamic shared memory passed as each launch's third argument, and each
+/// launch's own status (cudaPeekAtLastError right after it, 0 = accepted).
+struct NativeExpertI8Launch {
+    int tile;
+    size_t gu_bytes, down_bytes;
+    int gu_err, down_err;
+};
+NativeExpertI8Launch native_expert_i8_last_launch() noexcept;
+/// Does a launch of an empty kernel with this much dynamic shared memory run on the current device?  1 yes, 0 refused, -1 not available (a HIP build).  A
+/// diagnostic for native_i8_parity; the attribute call is tried and its refusal ignored, the launch decides; the context is left clean.
+int native_expert_i8_probe_launch(size_t bytes) noexcept;
 /// Bytes of scratch `native_expert_i8` needs (it is smaller than native_expert_scratch_bytes: H goes out as q8_1 blocks only): `cap_entries`
 /// entries, at most `cap_groups` groups, `n_ff` features.
 size_t native_expert_i8_scratch_bytes(int64_t cap_entries, int64_t cap_groups, int64_t n_ff);

@@ -791,6 +791,20 @@ struct I8Args {
     int bisect;
 };
 
+// what the last native_expert_i8 call asked its two launches for (the tile code, the dynamic shared memory in bytes passed as the launch's third argument, and
+// the launch's own status, read without clearing it): native_expert_i8_last_launch, printed by the bench
+struct I8LastLaunch {
+    int tile = 0, gu_err = 0, down_err = 0;
+    size_t gu_bytes = 0, down_bytes = 0;
+};
+I8LastLaunch g_i8_last;
+void i8_note_launch(bool gu, int tile, size_t bytes) {
+    const int e = (int) cudaPeekAtLastError();
+    g_i8_last.tile = tile;
+    if (gu) { g_i8_last.gu_bytes = bytes; g_i8_last.gu_err = e; }
+    else { g_i8_last.down_bytes = bytes; g_i8_last.down_err = e; }
+}
+
 template <int T, bool GU, int TM>
 void i8_launch_tm(const I8Args& a, cudaStream_t s) {
     constexpr size_t smem = I8Smem<T, TM>::bytes;
@@ -802,6 +816,7 @@ void i8_launch_tm(const I8Args& a, cudaStream_t s) {
         i8_kernel<T, true, TM><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect);
     else
         i8_kernel<T, false, TM><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
+    i8_note_launch(GU, TM, smem);
 }
 template <int T, bool GU>
 void i8b_launch(const I8Args& a, cudaStream_t s) {
@@ -814,6 +829,7 @@ void i8b_launch(const I8Args& a, cudaStream_t s) {
         i8b_kernel<T, true><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect);
     else
         i8b_kernel<T, false><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
+    i8_note_launch(GU, 8, smem);
 }
 // shared memory of the instances of a gate/up and a down type for tile code tm (2, 3, 4: rows of 16 entries; 8: variant B), and the device's limit per block
 template <int T>
@@ -826,6 +842,26 @@ size_t i8_smem_bytes(int gu, int dt, int tm) {
     return a > b ? a : b;
 }
 int i8_env_int(const char* name, int dflt);
+#if !defined(__HIPCC__)
+// Diagnostic only (native_expert_i8_probe_launch, used by native_i8_parity): does a launch of an empty kernel with this much dynamic shared memory run?  The
+// attribute call is made first and its refusal ignored (the launch decides, as in the real launch path); every failed attempt is read and cleared at once and an
+// accepted launch is waited for, so the probe leaves the context clean.  Nothing in the engine's path calls it.
+__global__ void i8_smem_probe_kernel() {
+    extern __shared__ uint4 i8_probe_dyn[];
+    if (threadIdx.x == 0xFFFFu) i8_probe_dyn[0] = make_uint4(0, 0, 0, 0);
+}
+bool i8_smem_launches(size_t bytes) {
+    cudaGetLastError();
+    if (bytes > 48 * 1024 && cudaFuncSetAttribute(i8_smem_probe_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) bytes) != cudaSuccess) cudaGetLastError();
+    i8_smem_probe_kernel<<<1, 1, bytes>>>();
+    if (cudaGetLastError() != cudaSuccess) return false;
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return true;
+}
+#endif
 size_t i8_smem_limit() {
     int dev = 0, v = 0;
     size_t lim = 48 * 1024;

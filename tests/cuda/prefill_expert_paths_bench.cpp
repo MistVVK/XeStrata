@@ -46,6 +46,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -393,6 +394,17 @@ struct I8Path : GrpPath {
         kern::quantize_q8_1_rows(x_dev, T, s.N, xq.p, st);
         kern::native_expert_i8(L, ptr.as<unsigned long long>(), start.as<int32_t>(), ngroups.as<int32_t>(), dst.as<int32_t>(), tok.as<int32_t>(), n, rows, xq.p, scr.p,
                                dm.as<float>(), st);
+        // what the call really asked its launches for (the tile code, the dynamic shared memory passed to each launch, each launch's status), once per distinct request
+        const auto la = kern::native_expert_i8_last_launch();
+        static std::vector<std::array<long long, 7>> seen;
+        const std::array<long long, 7> key = {(long long) L.gu_type, (long long) L.d_type, (long long) T, (long long) la.tile, (long long) la.gu_bytes, (long long) la.down_bytes,
+                                              (long long) la.gu_err * 1000 + la.down_err};
+        if (std::find(seen.begin(), seen.end(), key) == seen.end()) {
+            seen.push_back(key);
+            std::printf("I8-LAUNCH gu_type=%d d_type=%d tokens=%d tile=%d gu_dyn_smem_bytes=%zu down_dyn_smem_bytes=%zu gu_launch=%s down_launch=%s\n", (int) L.gu_type, (int) L.d_type,
+                        (int) T, la.tile, la.gu_bytes, la.down_bytes, la.gu_err == 0 ? "accepted" : "ERROR", la.down_err == 0 ? "accepted" : "ERROR");
+            std::fflush(stdout);
+        }
     }
 };
 

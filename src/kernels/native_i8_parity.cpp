@@ -15,6 +15,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -27,7 +28,7 @@ namespace k = strata::kernels;
 
 namespace {
 
-int g_fail = 0;
+int g_fail = 0, g_run = 0, g_skipped = 0;
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) {
@@ -169,6 +170,19 @@ uint64_t hash_bits(const std::vector<float>& v) {
 
 void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng) {
     const int tokens = 40, kpt = 8;   // cap 320 entries
+    // A pair the device does not cover (its smallest tile does not fit the shared memory per block, or the layout is out of range) is skipped, not an error;
+    // the earlier pass of another pair may have left a pretended limit in the environment, so ask with the device's own.
+#ifdef _WIN32
+    _putenv_s("STRATA_I8_SMEM_LIMIT", "0");
+#else
+    setenv("STRATA_I8_SMEM_LIMIT", "0", 1);
+#endif
+    if (!k::native_expert_i8_supported(k::native_expert_layout(gu, dt, H, FF))) {
+        std::printf("%-8s/%-7s %5lld x %4lld  skipped: not covered on this device\n", name_of(gu), name_of(dt), (long long) H, (long long) FF);
+        ++g_skipped;
+        return;
+    }
+    ++g_run;
     Setup S(gu, dt, H, FF, tokens, kpt, 12, rng, s);
     const std::vector<std::vector<int>> plans = {
         {},                                                // no groups at all
@@ -253,6 +267,27 @@ void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& 
 int main() {
     int n = 0;
     if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) { std::printf("no GPU device: skipped\n"); return 77; }
+    {   // for the log: what the device reports (the call's own limit is one of its own to find: i8_smem_limit)
+        int dev = 0, a = 0, b = 0, mj = 0, mn = 0;
+        cudaGetDevice(&dev);
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+        cudaDeviceGetAttribute(&a, hipDeviceAttributeMaxSharedMemoryPerBlock, dev);
+#else
+        cudaDeviceGetAttribute(&a, cudaDevAttrMaxSharedMemoryPerBlock, dev);
+#endif
+        cudaDeviceGetAttribute(&b, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+        cudaDeviceGetAttribute(&mj, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&mn, cudaDevAttrComputeCapabilityMinor, dev);
+        cudaFree(nullptr);
+        std::printf("device: sm_%d%d, shared memory per block %d bytes, opt-in %d bytes\n", mj, mn, a, b);
+        // to stderr (the result lines on stdout stay the same on every card): the limit the call uses, and which sizes an empty kernel really launches with (1 yes, 0 refused,
+        // -1 not available): 49152 = 48 KB, then the sizes the iteration-3 and later tiles of IQ2_S ask for (TM 2 / 3 / 4: 41,088 / 46,272 / 51,456 bytes; later sources 51,328 / 56,512 / 61,696)
+        std::fprintf(stderr, "i8 shared-memory limit used by the call: %zu bytes\n", k::native_expert_i8_smem_limit());
+        std::fprintf(stderr, "empty-kernel launch with dynamic shared memory:");
+        for (const size_t sz : {(size_t) 41088, (size_t) 46272, (size_t) 49152, (size_t) 49408, (size_t) 51328, (size_t) 51456, (size_t) 56512, (size_t) 61696, (size_t) 65536})
+            std::fprintf(stderr, " %zu %s", sz, k::native_expert_i8_probe_launch(sz) == 1 ? "ok" : k::native_expert_i8_probe_launch(sz) == 0 ? "REFUSED" : "n/a");
+        std::fprintf(stderr, "\n");
+    }
     cudaStream_t s;
     ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
     std::mt19937 rng(20261112);
@@ -261,6 +296,8 @@ int main() {
             check(gu, dt, 512, 256, s, rng);
             if (gu == 22 || dt == 42 || gu == 18) check(gu, dt, 2560, 640, s, rng);
         }
+    if (g_run == 0) { std::printf("native_i8_parity: nothing ran (%d skipped: not covered on this device)\n", g_skipped); return 77; }
+    if (g_skipped) std::printf("native_i8_parity: %d format rows skipped: not covered on this device\n", g_skipped);
     std::printf("native_i8_parity: %s\n", g_fail ? "FAILED" : "all ok");
     return g_fail ? 1 : 0;
 }
