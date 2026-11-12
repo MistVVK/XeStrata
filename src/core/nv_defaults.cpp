@@ -136,7 +136,7 @@ bool nv_kq_fused_here(int major, int minor, int sms) {
     namespace ft = strata::prefill::fused_tile;
     if (ft::pf_env(std::getenv("STRATA_PF_FUSED")) == 0) return false;
     const ft::Card c{strata::sm120_default(major, minor), major == 12 && minor == 1, sms, ft::s86_class(major, minor, off("STRATA_PF_FUSED_SM86"))};
-    return ft::kq_takes(ft::pf_env(std::getenv("STRATA_PF_FUSED_KQ")), c, ft::sm40_env_of(std::getenv("STRATA_PF_FUSED_SM40")));
+    return ft::kq_takes(ft::pf_env(std::getenv("STRATA_PF_FUSED_KQ")), c);
 }
 
 std::string nv_kq_default_line(bool fused_here) {

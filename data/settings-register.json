@@ -24173,7 +24173,7 @@
    "last_date": "2026-11-05",
    "status": "rollback",
    "owner": "prefill",
-   "note": "[11-12] CUDA: the K-quant experts of UD-Q4_K_XL (Q4_K / Q5_K gate/up with a Q5_1 or Q8_0 down) are read by Strata's fused prompt kernels by default on compute capability 8.0, 8.6, 8.9 and 12.0 cards with 80 or more multiprocessors (RTX A6000, A40, RTX 3090, RTX PRO 5000 class), and with 40 to 79 on the staged launches unless STRATA_PF_FUSED_SM40=0; =0 puts them back on MMQ, =1 takes them on every sm_80+ card. AMD: still opt-in (=1 with STRATA_PF_FUSED=1 on gfx12; on by default on gfx1151 under Windows). One layer on the RTX A6000, Q4_K / Q5_1, MMQ time / fused time with the 128-row tile: 1.65 / 1.49 / 1.52 / 1.29 / 1.04 / 0.97 / 0.88 at 300 / 1,000 / 2,048 / 4,096 / 8,192 / 20,000 / 32,768 tokens. [docs/STRIX_HALO.md:228]",
+   "note": "[11-12] CUDA: the K-quant experts of UD-Q4_K_XL (Q4_K / Q5_K gate/up with a Q5_1 or Q8_0 down) are read by Strata's fused prompt kernels by default on compute capability 8.0, 8.6, 8.9 and 12.0 cards with 80 or more multiprocessors (RTX A6000, A40, RTX 3090, RTX PRO 5000 class); cards with fewer (RTX A4000, RTX 5070 class) stay on MMQ unless =1; =0 puts them back on MMQ, =1 takes them on every sm_80+ card. AMD: still opt-in (=1 with STRATA_PF_FUSED=1 on gfx12; on by default on gfx1151 under Windows). One layer on the RTX A6000, Q4_K / Q5_1, MMQ time / fused time with the 128-row tile: 1.65 / 1.49 / 1.52 / 1.29 / 1.04 / 0.97 / 0.88 at 300 / 1,000 / 2,048 / 4,096 / 8,192 / 20,000 / 32,768 tokens. [docs/STRIX_HALO.md:228]",
    "retire_after": "",
    "retired_in": ""
   },

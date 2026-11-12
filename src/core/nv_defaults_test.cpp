@@ -97,10 +97,10 @@ int main() {
         unset("STRATA_PF_FUSED"); unset("STRATA_PF_FUSED_KQ"); unset("STRATA_PF_FUSED_SM40"); unset("STRATA_PF_FUSED_SM86"); 
         CHECK(nv_kq_fused_here(8, 6, 84) && nv_kq_fused_here(8, 6, 80) && nv_kq_fused_here(12, 0, 110) && nv_kq_fused_here(12, 0, 80));   // RTX A6000, RTX PRO 5000 class
         CHECK(nv_kq_fused_here(8, 0, 108) && nv_kq_fused_here(8, 9, 128));                                                                  // the sm_86 class
-        CHECK(nv_kq_fused_here(8, 6, 48) && nv_kq_fused_here(12, 0, 48));                                                                   // 40-79 SMs: the staged launches
+        CHECK(!nv_kq_fused_here(8, 6, 48) && !nv_kq_fused_here(12, 0, 48) && !nv_kq_fused_here(8, 6, 79));                                   // 40-79 SMs (RTX A4000, RTX 5070): not in the default
         CHECK(!nv_kq_fused_here(8, 6, 39) && !nv_kq_fused_here(12, 1, 48) && !nv_kq_fused_here(7, 5, 68) && !nv_kq_fused_here(8, 7, 16) && !nv_kq_fused_here(9, 0, 132));   // under 40 SMs, GB10, Turing, Orin, Hopper
-        put("STRATA_PF_FUSED_SM40", "0");
-        CHECK(!nv_kq_fused_here(8, 6, 48) && nv_kq_fused_here(8, 6, 84));
+        put("STRATA_PF_FUSED_SM40", "1");
+        CHECK(!nv_kq_fused_here(8, 6, 48) && nv_kq_fused_here(8, 6, 84));                                                                   // the 40-79 SM switch does not move it
         unset("STRATA_PF_FUSED_SM40");
         put("STRATA_PF_FUSED_KQ", "0");
         CHECK(!nv_kq_fused_here(8, 6, 84) && !nv_kq_fused_here(12, 0, 110));                                                                // the way back

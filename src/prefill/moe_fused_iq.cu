@@ -2372,14 +2372,13 @@ const DevInfo& dev_info() {
     // setup leaves those layers on the FP16 path.
     if (int o3 = 1 << 20; d.ok && q50_cuda_requested() && setup_one<T_Q5_0, false>(o3)) { d.q50 = true; d.occ_q50 = o3; }
     // The K-quant experts of UD-Q4_K_XL - gate/up Q4_K / Q5_K, down Q5_1 (or Q8_0) - on native_kernel instead of MMQ (libstrata_kq).  On CUDA they are the
-    // default on the cards the i-quant default rule takes (fused_tile::kq_takes: sm_86-class and sm_120 with 80+ SMs, the staged launches on 40-79 SMs unless
-    // STRATA_PF_FUSED_SM40=0), STRATA_PF_FUSED_KQ=1 sets them up on every sm_80+ card, STRATA_PF_FUSED_KQ=0 (or STRATA_PF_FUSED=0, native_supported) leaves them on MMQ.
+    // default on the cards of fused_tile::kq_takes (sm_86-class and sm_120 with 80+ SMs; not the 40-79 SM cards: their one-layer table is below MMQ at 20,000 tokens),
+    // STRATA_PF_FUSED_KQ=1 sets them up on every sm_80+ card, STRATA_PF_FUSED_KQ=0 (or STRATA_PF_FUSED=0, native_supported) leaves them on MMQ.
     // The decode is the HIP kernels' (load_unit / convert: int8 codes, a scale and a minimum per 32 values); the minimum enters as s1 d_x (sum of the activation
     // codes), from the sums quant_act_nat_kernel and the K-quant gate/up epilogue store in the spare bytes.  Their own occupancy (occ_kq); a failed setup leaves
     // those layers on MMQ.  (kq_on() below is the HIP builds' reading of the switch; strata-q36 sets STRATA_PF_FUSED_KQ=1 itself, so its cards are unchanged.)
     static const int kq_env = strata::prefill::fused_tile::pf_env(std::getenv("STRATA_PF_FUSED_KQ"));
-    static const int kq_sm40_env = strata::prefill::fused_tile::sm40_env_of(std::getenv("STRATA_PF_FUSED_SM40"));
-    const bool kq_want = strata::prefill::fused_tile::kq_takes(kq_env, {d.s120, d.s121, d.sms, d.s86}, kq_sm40_env);
+    const bool kq_want = strata::prefill::fused_tile::kq_takes(kq_env, {d.s120, d.s121, d.sms, d.s86});
     if (int o4 = 1 << 20; d.ok && kq_want && setup_one<T_Q4_K, true>(o4) && setup_one<T_Q5_K, true>(o4) && setup_one<T_Q5_1, false>(o4)) {
         d.kq = true;
         d.occ_kq = o4;

@@ -170,13 +170,14 @@ constexpr bool q36_takes(int env, const Card& c, int sm40_env, bool gate_staged,
 // ---- Flash-Next's K-quant experts (UD-Q4_K_XL, and the other packs with a Q4_K / Q5_K gate/up and a Q5_1 or Q8_0 down: CUDA): whether the engine sets the K-quant fused kernels up on a card (dev_info in
 // src/prefill/moe_fused_iq.cu), which is what lets native_supported take those layers.  STRATA_PF_FUSED_KQ as pf_env reads it: -1 unset or empty, 1 = a value starting with '1' (on for every sm_80+
 // card, as the opt-in always was), 0 = any other value (off: those layers stay on MMQ).  Unset takes them on the cards the i-quant default rule takes (takes_by_default: sm_86-class and sm_120 cards
-// with 80+ SMs, and the staged launches on 40-79 SMs unless STRATA_PF_FUSED_SM40=0): the K-quant gate/up (Q4_K / Q5_K) is a weight-staging instance (sw_on) and its Q5_1 / Q8_0 down is one the staged
-// kernels were measured with, so the launch kind is (staged, down ok) for every pair this decides.  STRATA_PF_FUSED=0 still turns every fused kernel off (native_supported checks it first).
-// Evidence: par/RESULTS-KQ-DEFAULT.md (RTX A6000 end to end with UD-Q4_K_XL; one layer on the RTX PRO 5000 and RTX A4000).
-constexpr bool kq_takes(int kq_env, const Card& c, int sm40_env) {
+// with 80+ SMs; the 40-79 SM cards are NOT in the K-quant default, whatever STRATA_PF_FUSED_SM40 says: one layer of Flash-Next's shape on an RTX A4000 (sm_86, 48 SMs, CUDA 12.9, 128-row tile, one repetition) has the fused
+// path at 1.67 / 1.44 / 1.49 / 1.35 / 1.05 / 0.97 (Q4_K / Q5_1), 1.79 / 1.61 / 1.67 / 1.46 / 1.08 / 0.98 (Q4_K / Q8_0) and 1.72 / 1.59 / 1.60 / 1.45 / 1.05 / 0.99 (Q5_K / Q8_0) times MMQ's speed at 300 / 1,000 / 2,048 /
+// 4,096 / 8,192 / 20,000 tokens, so below MMQ at 20,000 tokens, and no end-to-end run exists on such a card.  STRATA_PF_FUSED_KQ=1 still sets the kernels up on every sm_80+ card.  STRATA_PF_FUSED=0 still turns every fused
+// kernel off (native_supported checks it first).  Evidence: par/RESULTS-KQ-DEFAULT.md (RTX A6000 end to end with UD-Q4_K_XL; one layer on the RTX PRO 5000 and the RTX A4000).
+constexpr bool kq_takes(int kq_env, const Card& c) {
     if (kq_env == 0) return false;
     if (kq_env > 0) return true;
-    return takes_by_default(c, sm40_on(sm40_env), true, true);
+    return (c.s86 || c.s120) && c.sms >= 80;   // takes_by_default's 80+ SM rule (sm_121 alone and cards with neither flag stay out); its 40-79 SM clause is left out
 }
 
 // ---- the weight-staging guard (check_staged_blobs's decision in src/prefill/moe_fused_iq.cu), as pure functions so the decision can be tested without a GPU.

@@ -49,7 +49,7 @@ std::vector<std::pair<std::string, std::string>> nv_kq_default_env(int min_major
 /// kernels read the K-quant experts on this machine (nv_kq_fused_here for a visible card); the line then says so, otherwise it is the earlier line, byte for byte.
 std::vector<std::string> apply_nv_kq_default(int min_major, int min_minor, bool fused_here = false);
 /// Whether a CUDA card (raw compute capability, its multiprocessor count) reads UD-Q4_K_XL's K-quant experts (Q4_K / Q5_K gate/up with a Q5_1 or Q8_0 down) on Strata's
-/// own fused kernels, from the environment as the engine reads it: the card rule of fused_tile::kq_takes with STRATA_PF_FUSED_KQ, STRATA_PF_FUSED_SM40 and
+/// own fused kernels, from the environment as the engine reads it: the card rule of fused_tile::kq_takes with STRATA_PF_FUSED_KQ and
 /// STRATA_PF_FUSED_SM86; STRATA_PF_FUSED=0 turns every fused kernel off.
 bool nv_kq_fused_here(int major, int minor, int sms);
 /// The line apply_nv_kq_default prints (without the newline).
