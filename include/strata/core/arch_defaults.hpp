@@ -70,6 +70,10 @@ bool igpu_kfd_settle_default(const char* gcn_arch, bool integrated, bool windows
 /// the file-cache give-back during and after the expert load (strata/core/page_cache_drop.hpp) applies to the same class: an integrated
 /// gfx11 GPU under Linux (gfx1103, gfx1150, gfx1151).  Never Windows, never a discrete card.  STRATA_NO_ARENA_CACHE_DROP=1 turns it off.
 bool igpu_cache_drop_default(const char* gcn_arch, bool integrated, bool windows);
+/// the prompt experts on Strata's own fused int8 kernels (STRATA_PF_FUSED=1) instead of llama.cpp's MMQ, for the same class: an integrated gfx11 GPU
+/// under Linux (gfx1103, gfx1150, gfx1151).  Never Windows (gfx1151 there has it in igpu_default_env), never a discrete card.  apply_arch_defaults sets
+/// STRATA_PF_FUSED=1 where the user has not set the variable; STRATA_PF_FUSED=0 is the way back to MMQ.
+bool igpu_fused_prompt_default(const char* gcn_arch, bool integrated, bool windows);
 /// Whether the expert arena skips its MADV_HUGEPAGE request: `no_arena_thp` is STRATA_NO_ARENA_THP (nullptr when unset): "0" asks for the huge
 /// pages, any other value skips the request; unset leaves it to `igpu_rule` (igpu_arena_no_thp_default for this device).  `thp_always`: the
 /// kernel's THP mode is "always" (the request would add nothing, #771).  Inline: src/core/pinned.cu (strata_core) uses it without

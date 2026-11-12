@@ -276,6 +276,8 @@ int main() {
     for (const char* k : {"STRATA_HIP_WMMA", "STRATA_PF_GEMM", "STRATA_PA_FAST", "STRATA_SELECT_WMMA", "STRATA_HC_UPMIX"}) unset(k);
     CHECK(apply_arch_defaults("gfx1150", true).empty());           // 880M / 890M: no hardware, stays as it was
     for (const char* k : {"STRATA_HIP_WMMA", "STRATA_PF_GEMM", "STRATA_PA_FAST", "STRATA_SELECT_WMMA", "STRATA_HC_UPMIX"}) unset(k);
+    CHECK(std::getenv("STRATA_PF_FUSED") != nullptr);              // the Linux integrated gfx11 class also took the fused prompt experts (silent; igpu_fused_prompt_default)
+    unset("STRATA_PF_FUSED");
 #endif
     // the off switches
     put("STRATA_IGPU_PROMPT_SET", "0");
@@ -431,6 +433,37 @@ int main() {
         CHECK(!igpu_cache_drop_default(g, false, false));   // not integrated
     }
     for (const char* g : {"gfx1100", "gfx1201", "gfx90a", "gfx1030", "gfx1152", ""}) CHECK(!igpu_cache_drop_default(g, true, false));
+    // the fused int8 prompt experts (STRATA_PF_FUSED=1 instead of llama.cpp's MMQ): the same class again, nothing else
+    for (const char* g : {"gfx1103", "gfx1150", "gfx1151", "gfx1103:sramecc-:xnack-", "gfx1151:sramecc+:xnack-"}) {
+        CHECK(igpu_fused_prompt_default(g, true, false));
+        CHECK(!igpu_fused_prompt_default(g, true, true));     // Windows: gfx1151 has it in igpu_default_env, the others unchanged
+        CHECK(!igpu_fused_prompt_default(g, false, false));   // not integrated
+    }
+    for (const char* g : {"gfx1152", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201", "gfx1030", "gfx1031", "gfx11030", "", "gfx90a"})
+        CHECK(!igpu_fused_prompt_default(g, true, false));
+#if !defined(_WIN32)
+    {   // apply: nothing set -> STRATA_PF_FUSED=1 on the class, =0 (the way back) and =1 as the user set them are kept, other devices get nothing
+        unset("STRATA_PF_FUSED");
+        apply_arch_defaults("gfx1100", false);
+        CHECK(std::getenv("STRATA_PF_FUSED") == nullptr);       // discrete
+        apply_arch_defaults("gfx1103", false);
+        CHECK(std::getenv("STRATA_PF_FUSED") == nullptr);       // a mixed box (iGPU + dGPU)
+        apply_arch_defaults("gfx1201", false);
+        CHECK(std::getenv("STRATA_PF_FUSED") == nullptr);
+        apply_arch_defaults("gfx1152", true);
+        CHECK(std::getenv("STRATA_PF_FUSED") == nullptr);
+        apply_arch_defaults("gfx1103", true);
+        CHECK(std::getenv("STRATA_PF_FUSED") != nullptr && std::string(std::getenv("STRATA_PF_FUSED")) == "1");
+        put("STRATA_PF_FUSED", "0");
+        apply_arch_defaults("gfx1150", true);
+        CHECK(std::string(std::getenv("STRATA_PF_FUSED")) == "0");   // the way back is kept
+        unset("STRATA_PF_FUSED");
+        apply_arch_defaults("gfx1150", true);
+        CHECK(std::getenv("STRATA_PF_FUSED") != nullptr && std::string(std::getenv("STRATA_PF_FUSED")) == "1");
+        unset("STRATA_PF_FUSED");
+        for (const char* k : {"STRATA_HIP_WMMA", "STRATA_PF_GEMM", "STRATA_PA_FAST", "STRATA_SELECT_WMMA", "STRATA_HC_UPMIX"}) unset(k);
+    }
+#endif
     // STRATA_NO_ARENA_THP: unset = the device rule decides; "0" = ask for the huge pages (also on such a device); any other value = skip them
     CHECK(arena_skip_thp_request(nullptr, false, true));      // integrated gfx11, nothing set: skipped
     CHECK(!arena_skip_thp_request(nullptr, false, false));    // any other device, nothing set: requested (as before)

@@ -23927,42 +23927,127 @@
    "name": "STRATA_PF_FUSED",
    "backends": [
     "cuda-hip",
+    "hip",
     "sycl"
    ],
    "reads": [
     {
+     "file": "src/core/arch_defaults.cpp",
+     "line": 375,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
      "file": "src/core/arch_defaults_test.cpp",
-     "line": 399,
+     "line": 279,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/core/arch_defaults_test.cpp",
+     "line": 401,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/core/arch_defaults_test.cpp",
+     "line": 448,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/core/arch_defaults_test.cpp",
+     "line": 450,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/core/arch_defaults_test.cpp",
+     "line": 452,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/core/arch_defaults_test.cpp",
+     "line": 454,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/core/arch_defaults_test.cpp",
+     "line": 456,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/core/arch_defaults_test.cpp",
+     "line": 456,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/core/arch_defaults_test.cpp",
+     "line": 459,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/core/arch_defaults_test.cpp",
+     "line": 462,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/core/arch_defaults_test.cpp",
+     "line": 462,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused.cu",
-     "line": 692,
+     "line": 714,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused.cu",
-     "line": 703,
+     "line": 725,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2038,
+     "line": 2711,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/moe_fused_iq.cu",
-     "line": 2057,
+     "line": 2727,
+     "backend": "hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/prefill/moe_fused_iq.cu",
+     "line": 2745,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/prefill/prefill.cpp",
+     "line": 281,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/program/generate.cpp",
-     "line": 10951,
+     "line": 11105,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
+     "file": "src/qwen35/q36_engine.cu",
+     "line": 1398,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -23986,9 +24071,15 @@
    "engine_defaults": [
     {
      "file": "src/core/arch_defaults.cpp",
-     "line": 178,
+     "line": 196,
      "value": "1",
      "arch": "gfx1151 (Windows)"
+    },
+    {
+     "file": "src/core/arch_defaults.cpp",
+     "line": 376,
+     "value": "1",
+     "arch": "gfx1103 / gfx1150 / gfx1151 (Linux, integrated)"
     },
     {
      "file": "src/core/nv_defaults.cpp",
@@ -24001,26 +24092,26 @@
    "launch_sets": [],
    "launch_reads": [],
    "doc_mentions": [
-    "docs/AMD_HIP.md:303",
-    "docs/AMD_HIP.md:745",
-    "docs/AMD_HIP.md:773",
-    "docs/DETAILS.md:1053",
-    "docs/DETAILS.md:1158",
-    "docs/DETAILS.md:1167",
-    "docs/DETAILS.md:1316",
-    "docs/DETAILS.md:1318",
-    "docs/DETAILS.md:1434",
-    "docs/DGX_SPARK_LINUX.md:121",
-    "docs/MULTI_GPU.md:335",
+    "docs/AMD_HIP.md:300",
+    "docs/AMD_HIP.md:742",
+    "docs/AMD_HIP.md:770",
+    "docs/DETAILS.md:1056",
+    "docs/DETAILS.md:1161",
+    "docs/DETAILS.md:1170",
+    "docs/DETAILS.md:1319",
+    "docs/DETAILS.md:1321",
+    "docs/DETAILS.md:1436",
+    "docs/DGX_SPARK_LINUX.md:113",
+    "docs/MULTI_GPU.md:329",
     "docs/OLDER_GPUS.md:237",
     "docs/RADEON_780M.md:86",
     "docs/RADEON_780M.md:103",
     "docs/release-notes-0.2.0.md:56",
-    "docs/STRIX_HALO.md:203",
-    "docs/STRIX_HALO.md:215",
-    "docs/STRIX_HALO.md:218",
-    "docs/STRIX_HALO.md:227",
-    "docs/STRIX_HALO_WINDOWS.md:89"
+    "docs/STRIX_HALO.md:132",
+    "docs/STRIX_HALO.md:144",
+    "docs/STRIX_HALO.md:147",
+    "docs/STRIX_HALO.md:156",
+    "docs/STRIX_HALO_WINDOWS.md:70"
    ],
    "first_commit": "47de4a4d83",
    "first_date": "2026-10-02",
@@ -24029,7 +24120,7 @@
    "last_date": "2026-11-05",
    "status": "default",
    "owner": "core",
-   "note": "[auto] on by default for some GPU architectures only (gfx1151 (Windows) src/core/arch_defaults.cpp:178=1; sm_121 src/core/nv_defaults.cpp:62=1); opt-in elsewhere; the variable overrides it",
+   "note": "[auto] on by default for some GPU architectures only (gfx1151 (Windows) src/core/arch_defaults.cpp:196=1; gfx1103 / gfx1150 / gfx1151 (Linux, integrated) src/core/arch_defaults.cpp:376=1; sm_121 src/core/nv_defaults.cpp:66=1); opt-in elsewhere; the variable overrides it; =0 keeps MMQ",
    "retire_after": "",
    "retired_in": ""
   },
