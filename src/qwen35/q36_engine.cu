@@ -1398,7 +1398,7 @@ struct Engine {
                                                              g.n_ff == FQ::kQ36FF)
             for (size_t i = 0; i < n_state; ++i) {
                 const Layer& L = layer_at((int) i);
-                fused_on[i] = FQ::native_supported(L.L.gu_type, L.L.d_type) ? 1 : 0;
+                fused_on[i] = FQ::native_supported_ext(L.L.gu_type, L.L.d_type) ? 1 : 0;
             }
 #endif
         use_pf = true;
@@ -2119,7 +2119,7 @@ struct Engine {
                     b.e0 = e;
                     b.e1 = std::min(ne, e + FQ::kQ36MaxBatch);
                     for (int x = b.e0; x < b.e1; ++x) b.blob[x - b.e0] = wbase + (size_t) x * L.stride;
-                    FQ::experts_native(b, ng, ne, n_ent, f_scr, f_xq, f_src, f_ha, eparts, st);
+                    FQ::experts_native_ext(b, ng, ne, n_ent, f_scr, f_xq, f_src, f_ha, eparts, st);
                 }
                 prow = f_slot;
 #endif
