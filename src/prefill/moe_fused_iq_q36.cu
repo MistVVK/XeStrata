@@ -63,7 +63,7 @@ bool requested() { return strata::prefill::fused::requested(); }
 // the minimum's code sums the Q4_K / Q5_K gate/up epilogue writes into H's spare bytes (has_min); the dispatch is not in the copy's native_supported /
 // experts_native (and moe_fused_iq.cu is not edited for it), so it is here: the pair rule of the K-quant gate/up (native_supported(gu, T_Q5_1): the same
 // prerequisites - STRATA_PF_FUSED, the K-quant instances set up, no NT = 256 / warp-specialized kernels) plus this file's own set-up of the two down instances,
-// then the K-quant launch of experts_native with the new down.  (After lane SMALL-SM's pick_ww(n, n_expert, staged, wide) lands this call takes its arguments.)
+// then the K-quant launch of experts_native with the new down.  (pick_ww takes the staged / wide arguments as experts_native computes them: both false for the Q4_K / Q5_K gate/up of this path.)
 namespace {
 struct KqDown {
     bool ok = false;
@@ -114,7 +114,7 @@ void experts_native_ext(const Batch& b, const NativeGeom& g, int n_expert, int64
     }
     const cudaStream_t s = (cudaStream_t) stream;
     const Tables tb = tables(const_cast<void*>(scratch), n_expert);
-    const int ww = pick_ww(n, n_expert);
+    const int ww = pick_ww(n, n_expert, sw_on(g.gu_type, true), g.gu_type == T_Q6_K || g.gu_type == T_Q8_0);
     const int64_t tiles = (n + kTileRows - 1) / kTileRows + (b.e1 - b.e0);
     const unsigned k_gu = (unsigned) std::min<int64_t>(tiles * (GU_ROWS_N / weight_rows(ww)), (int64_t) d.sms * d.occ_kq);
     const unsigned k_d = (unsigned) std::min<int64_t>(tiles * (D_ROWS_N / weight_rows(ww)), (int64_t) d.sms * (g.d_type == T_Q5_K ? kd.occ5 : kd.occ6));

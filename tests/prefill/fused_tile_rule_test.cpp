@@ -8,6 +8,7 @@
 
 using strata::prefill::fused_tile::Card;
 using strata::prefill::fused_tile::pick;
+using strata::prefill::fused_tile::Pick;
 using strata::prefill::fused_tile::Why;
 
 static int failed = 0;
@@ -72,6 +73,118 @@ int main() {
     CHECK(pick(Card{true, true, 48}, 65535, E).ww == 4 && pick(Card{true, true, 48}, 65536, E).ww == 2);       // s121 wins over s120
     // ---- no experts: the average is rows themselves, never a division by zero
     CHECK(pick(rtx5070, 0, 0).ww == 4 && pick(rtx5070, 120, 0).ww == 2);
+
+    // ---- staged launches (weight staging, both kernels of the launch staged): 128 rows from every size on sm_86 / sm_120 cards with 1 to 79 SMs
+    {
+        const Card a4000s{false, false, 48, true}, rtx3060{false, false, 28, true}, s86at79{false, false, 79, true}, s86at80{false, false, 80, true}, a6000s{false, false, 84, true},
+            s120at79{true, false, 79, false}, s120at80{true, false, 80, false}, s89{false, false, 60, false}, unknown{false, false, 0, true};
+        for (int64_t n : {int64_t(0), int64_t(1), int64_t(10000), int64_t(28672), int64_t(40960), int64_t(57344), int64_t(61388), int64_t(81910), int64_t(200000), int64_t(700000)}) {
+            for (const Card& c : {a4000s, rtx3060, s86at79, rtx5070, rtx5070ti, s120at79, Card{true, false, 40, false}}) {
+                CHECK(pick(c, n, E, true).ww == 2 && pick(c, n, E, true).why == Why::kStaged);
+            }
+            // the same cards, unstaged: today's rule, byte for byte (the default argument is `false`)
+            for (const Card& c : {a4000s, rtx3060, s86at79, rtx5070, rtx5070ti, s120at79}) {
+                CHECK(pick(c, n, E, false).ww == pick(c, n, E).ww && pick(c, n, E, false).why == pick(c, n, E).why);
+                CHECK(pick(c, n, E).why != Why::kStaged);
+            }
+            // outside the class a staged launch keeps the rule: 80+ SMs, sm_121, a card with neither flag (sm_89 / sm_80: not measured), an unknown SM count
+            for (const Card& c : {s86at80, a6000s, s120at80, rtx5080, pro5000, pro6000, rtx5090, gb10, Card{true, true, 48, true}, s89, unknown}) {
+                CHECK(pick(c, n, E, true).ww == pick(c, n, E, false).ww && pick(c, n, E, true).why == pick(c, n, E, false).why);
+            }
+        }
+        // the edges: 79 SMs in the class, 80 out of it
+        CHECK(pick(s86at79, 40960, E, true).why == Why::kStaged && pick(s86at80, 40960, E, true).why == Why::kBand);
+        CHECK(pick(s120at79, 40960, E, true).why == Why::kStaged && pick(s120at80, 40960, E, true).why == Why::kBand);
+        // the cases the 5070 class refuses unstaged (below 119.9 rows an expert) are 128 when staged; the A4000 (sm_86) had no rule of its own below 80 SMs
+        CHECK(pick(rtx5070, 40960, E, false).ww == 4 && pick(rtx5070, 40960, E, true).ww == 2);
+        CHECK(pick(a4000s, 81910, E, false).ww == 4 && pick(a4000s, 81910, E, true).ww == 2);
+        CHECK(pick(a4000s, 40960, E, false).ww == 2 && pick(a4000s, 20000, E, false).ww == 4 && pick(a4000s, 20000, E, true).ww == 2);   // band: 80 rows 128, 39 rows 64
+    }
+    // ---- the Q6_K / Q8_0 gate/up class (wide) on sm_86 cards with 40+ SMs (the 40-79 SM cards and the 80+ SM ones such as the A6000): 128 rows above 112 rows an expert, everything else as it was
+    {
+        const Card a4000w{false, false, 48, true}, s86at39{false, false, 39, true}, s86at40{false, false, 40, true}, s86at79{false, false, 79, true}, s86at80{false, false, 80, true},
+            s120at48{true, false, 48, false}, s89{false, false, 60, false};
+        CHECK(pick(a4000w, 57344, E, false, true).ww == 2 && pick(a4000w, 57344, E, false, true).why == Why::kBand);        // 112.0 rows an expert: the old band's top, 128 as before
+        CHECK(pick(a4000w, 57345, E, false, true).ww == 2 && pick(a4000w, 57345, E, false, true).why == Why::kS86Wide);    // 112.002: the line
+        CHECK(pick(a4000w, 57345, E, false, false).ww == 4 && pick(a4000w, 57345, E, false, false).why == Why::kBand);      // not the class: 64 as before
+        CHECK(pick(a4000w, 81910, E, false, true).ww == 2 && pick(a4000w, 320000, E, false, true).ww == 2);
+        CHECK(pick(a4000w, 28672, E, false, true).ww == 4 && pick(a4000w, 28673, E, false, true).ww == 2);                  // below 112: the band, unchanged
+        // the same count of rows on Qwen3.6's 256 experts: 4,096 tokens x 8 = 32,768 rows = 128 an expert (the line), 2,048 tokens = 64 an expert (the band)
+        CHECK(pick(a4000w, 32768, 256, false, true).ww == 2 && pick(a4000w, 32768, 256, false, true).why == Why::kS86Wide && pick(a4000w, 16384, 256, false, true).why == Why::kBand);
+        // the class edges: 39 SMs keeps the old rule, 40 / 79 / 80 take the line; other cards (sm_120, sm_89 / sm_80) never do
+        CHECK(pick(s86at39, 81910, E, false, true).ww == 4);
+        CHECK(pick(s86at40, 81910, E, false, true).ww == 2 && pick(s86at79, 81910, E, false, true).ww == 2 && pick(s86at80, 81910, E, false, true).ww == 2);
+        // the RTX A6000 (sm_86, 84 SMs): both sides of 112 rows an expert, and the i-quant pairs (not wide) keep the rule OWN-4X gated (64 rows above the band)
+        const Card a6000w{false, false, 84, true};
+        CHECK(pick(a6000w, 57344, E, false, true).ww == 2 && pick(a6000w, 57344, E, false, true).why == Why::kBand);
+        CHECK(pick(a6000w, 57345, E, false, true).ww == 2 && pick(a6000w, 57345, E, false, true).why == Why::kS86Wide);
+        CHECK(pick(a6000w, 57345, E, false, false).ww == 4 && pick(a6000w, 81910, E, false, false).ww == 4 && pick(a6000w, 81910, E, false, true).ww == 2 && pick(a6000w, 320000, E, false, true).ww == 2);
+        CHECK(pick(a6000w, 32768, 256, false, true).why == Why::kS86Wide && pick(a6000w, 16384, 256, false, true).why == Why::kBand && pick(a6000w, 16384, 256, false, true).ww == 2);   // Qwen3.6: 4K tokens 128 an expert, 2K tokens 64
+        CHECK(pick(s120at48, 40960, E, false, true).why == pick(s120at48, 40960, E, false, false).why && pick(s89, 81910, E, false, true).ww == 4);
+        // wide = false is the rule of the previous commit for every class; wide = true moves only sm_86 with 40+ SMs above 112 rows an expert, and only from 64 to 128
+        long long cmpw = 0, badw = 0;
+        for (int s120 = 0; s120 < 2; ++s120)
+            for (int s121 = 0; s121 < 2; ++s121)
+                for (int s86 = 0; s86 < 2; ++s86)
+                    for (int sms : {0, 1, 39, 40, 48, 79, 80, 84, 100, 110, 150, 188})
+                        for (int staged = 0; staged < 2; ++staged)
+                            for (int ne : {1, 256, 512})
+                                for (int64_t n = 0; n <= 400000; n += 11) {
+                                    const Card c{s120 != 0, s121 != 0, sms, s86 != 0};
+                                    const Pick a = pick(c, n, ne, staged != 0, false), b = pick(c, n, ne, staged != 0, true);
+                                    ++cmpw;
+                                    const double avg = (double) n / (ne > 1 ? ne : 1);
+                                    const bool line = !s121 && !(staged && (s86 || s120) && sms > 0 && sms < 80) && !(s120 && sms >= 40 && sms < 80) && !(s120 && sms >= 80 && (avg >= 159.9 || (sms >= 100 && sms < 150 && avg > 112.0))) &&
+                                                      s86 && sms >= 40 && avg > 112.0;
+                                    if (line ? !(b.ww == 2 && b.why == Why::kS86Wide) : (a.ww != b.ww || a.why != b.why)) ++badw;
+                                }
+        CHECK(badw == 0);
+        std::printf("fused_tile_rule_test: wide class: %lld card / launch combinations checked (%lld wrong)\n", cmpw, badw);
+    }
+    // ---- the default rule (native_supported) with the research switch STRATA_PF_FUSED_SM40: takes_by_default(card, sm40, gate_staged, down_ok)
+    {
+        using strata::prefill::fused_tile::takes_by_default;
+        const Card a4000s{false, false, 48, true}, s86at39{false, false, 39, true}, s86at40{false, false, 40, true}, s86at79{false, false, 79, true}, s86at80{false, false, 80, true},
+            s120at48{true, false, 48, false}, s120at39{true, false, 39, false}, s89{false, false, 60, false}, gb10c{true, true, 48, false};
+        // a staged-gate pair (IQ3_S / IQ4_NL, IQ3_XXS / Q2_0, ...) on 48 SMs: on with the switch, today's behaviour (off) without it
+        CHECK(takes_by_default(a4000s, true, true, true) && !takes_by_default(a4000s, false, true, true));
+        CHECK(takes_by_default(s120at48, true, true, true) && !takes_by_default(s120at48, false, true, true));
+        // IQ2_S / Q2_0 (gate/up not staged) and a down outside IQ4_NL / Q2_0: off, switch or not
+        CHECK(!takes_by_default(a4000s, true, false, true) && !takes_by_default(a4000s, true, true, false) && !takes_by_default(a4000s, true, false, false));
+        // the bound: 39 SMs off, 40 and 79 on, 80 on without the switch
+        CHECK(!takes_by_default(s86at39, true, true, true) && !takes_by_default(s120at39, true, true, true));
+        CHECK(takes_by_default(s86at40, true, true, true) && takes_by_default(s86at79, true, true, true));
+        CHECK(!takes_by_default(s86at79, false, true, true) && takes_by_default(s86at80, false, false, false));
+        // other cards: sm_89 / sm_80 (neither flag) and an unknown SM count stay off with the switch; the s121 flag is not looked at by this rule (GB10 has its own tile rule only)
+        CHECK(!takes_by_default(s89, true, true, true) && !takes_by_default(Card{false, false, 0, true}, true, true, true));
+        CHECK(takes_by_default(gb10c, true, true, true) == takes_by_default(s120at48, true, true, true));
+        // switch unset: exactly today's rule (sm_86 / sm_120 with 80+ SMs) for every card flag set, SM count and launch kind
+        long long cmpd = 0, bad = 0;
+        for (int s120 = 0; s120 < 2; ++s120)
+            for (int s86 = 0; s86 < 2; ++s86)
+                for (int sms = 0; sms <= 200; ++sms)
+                    for (int g = 0; g < 2; ++g)
+                        for (int d = 0; d < 2; ++d) {
+                            ++cmpd;
+                            const Card c{s120 != 0, false, sms, s86 != 0};
+                            if (takes_by_default(c, false, g != 0, d != 0) != ((s120 || s86) && sms >= 80)) ++bad;
+                            if (sms >= 80 && takes_by_default(c, true, g != 0, d != 0) != takes_by_default(c, false, g != 0, d != 0)) ++bad;   // the switch moves nothing at 80+ SMs
+                        }
+        CHECK(bad == 0);
+        std::printf("fused_tile_rule_test: default rule with the switch unset: %lld card / launch combinations compared with 'sm_86 / sm_120, 80+ SMs' (%lld differing)\n", cmpd, bad);
+    }
+    // every class, every launch size: staged = false gives the rule of commit 083b1ac82 exactly as before the argument existed, for the sm_86 cards too (the new flag does not move them)
+    {
+        long long cmp = 0, diff = 0;
+        for (const Card& c : {a6000, a4000, Card{false, false, 48, true}, Card{false, false, 84, true}, Card{false, false, 28, true}, pro6000, pro5000, rtx5090, rtx5080, gb10, hip})
+            for (int ne : {1, 64, 256, 512, 1024})
+                for (int64_t n = 0; n <= 700000; n += 13) {
+                    ++cmp;
+                    if (pick(c, n, ne, false).ww != legacy(c, n, ne)) ++diff;
+                }
+        CHECK(diff == 0);
+        std::printf("fused_tile_rule_test: staged = false: %lld launches compared against the previous rule (%lld differing)\n", cmp, diff);
+    }
 
     // ---- "nothing changes": every class except the 40-79 SM one gives, for every launch size, what the rule of commit 083b1ac82 gave
     long long compared = 0, differing = 0;
