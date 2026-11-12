@@ -512,5 +512,50 @@ int main() {
         CHECK(!q36_takes(-1, Card{false, false, 16, s86_class(8, 7)}, -1, true, true, true) && !q36_takes(-1, Card{false, false, 132, s86_class(9, 0)}, -1, true, true, true) &&
               !q36_takes(-1, Card{false, false, 68, s86_class(7, 5)}, -1, true, true, true) && !q36_takes(-1, Card{false, false, 84, s86_class(8, 6, true)}, -1, true, true, true));
     }
+    // ---- the K-quant pairs of Qwen3.6's UD-Q4_K_XL in the wide class (tile 128 above 112 rows an expert on sm_86 cards with 40+ SMs): wide_pair(gu_type, d_type) and the rule at the engine's launch sizes
+    {
+        using namespace strata::prefill::fused_tile;
+        // ggml type ids: Q8_0 8, Q4_K 12, Q5_K 13, Q6_K 14, IQ3_XXS 18, IQ3_S 21, IQ4_XS 23, IQ4_NL 20, Q5_1 7, Q2_0 (any), Q5_0 6
+        long long bad = 0, yes = 0;
+        for (int gu = 0; gu < 40; ++gu)
+            for (int d = 0; d < 40; ++d) {
+                const bool want = gu == 14 || gu == 8 || ((gu == 12 || gu == 13) && (d == 13 || d == 14));
+                if (wide_pair(gu, d) != want) ++bad;
+                yes += want ? 1 : 0;
+            }
+        CHECK(bad == 0 && yes == 84);   // gu 14 (40 downs) + gu 8 (40) + {12, 13} x {13, 14} (4);
+        CHECK(wide_pair(12, 13) && wide_pair(12, 14) && wide_pair(13, 13) && wide_pair(13, 14) && wide_pair(14, 8) && wide_pair(8, 8));
+        CHECK(!wide_pair(12, 7) && !wide_pair(12, 8) && !wide_pair(13, 7) && !wide_pair(12, 20) && !wide_pair(18, 20) && !wide_pair(21, 20) && !wide_pair(23, 20) && !wide_pair(22, 2));   // Flash-Next's K-quant gate/up (Q5_1 / Q8_0 down) and the i-quant pairs keep their rule
+        // Qwen3.6: 256 experts, top 8, a chunk of T tokens = T * 8 rows an expert-average of T / 32: 1,024 / 1,792 / 2,048 / 4,096 / 8,192 / 20,000 tokens
+        const Card a6000{false, false, 84, true}, a4000{false, false, 48, true}, a100{false, false, 108, true}, rtx4090{false, false, 128, true}, pro5000{true, false, 110, false}, rtx5090{true, false, 170, false};
+        const bool w = wide_pair(12, 13);
+        for (const Card& c : {a6000, a100, rtx4090}) {   // sm_86 class with 80+ SMs
+            CHECK(pick(c, 1024 * 8, 256, true, w).ww == 4 && pick(c, 1792 * 8, 256, true, w).ww == 4);                       // 32 and 56 rows an expert: the band's bottom, 64 as before
+            CHECK(pick(c, 2048 * 8, 256, true, w).ww == 2 && pick(c, 2048 * 8, 256, true, w).why == Why::kBand);              // 64: the band, 128 as before
+            for (int T : {4096, 8192, 20000}) CHECK(pick(c, (int64_t) T * 8, 256, true, w).ww == 2 && pick(c, (int64_t) T * 8, 256, true, w).why == Why::kS86Wide);   // 128 / 256 / 625: 128 rows now
+            for (int T : {4096, 8192, 20000}) CHECK(pick(c, (int64_t) T * 8, 256, true, false).ww == 4);                       // not the class: the old pick, 64 rows
+            CHECK(pick(c, 4096 * 8, 256, true, w).ww == 2 && pick(c, 3584 * 8, 256, true, w).ww == 2 && pick(c, 3584 * 8, 256, true, false).ww == 2);   // 112 rows an expert (3,584 tokens): band, 128 either way
+            CHECK(pick(c, 3585 * 8, 256, true, w).ww == 2 && pick(c, 3585 * 8, 256, true, false).ww == 4);                    // 112.03: the line
+        }
+        // under 80 SMs the staged rule already takes 128 (A4000), sm_120 never looks at wide
+        for (int T : {1024, 2048, 4096, 8192, 20000}) {
+            const int64_t n = (int64_t) T * 8;
+            CHECK(pick(a4000, n, 256, true, w).ww == 2 && pick(a4000, n, 256, true, w).why == Why::kStaged && pick(a4000, n, 256, true, false).ww == 2);
+            for (const Card& c : {pro5000, rtx5090, Card{true, false, 48, false}}) CHECK(pick(c, n, 256, true, w).ww == pick(c, n, 256, true, false).ww && pick(c, n, 256, true, w).why == pick(c, n, 256, true, false).why);
+        }
+        CHECK(pick(pro5000, 4096 * 8, 256, true, w).ww == 2 && pick(pro5000, 2048 * 8, 256, true, w).ww == 2 && pick(rtx5090, 4096 * 8, 256, true, w).ww == 4);   // the 110-SM card picks 128 from 56 rows an expert; the 170-SM one is as before
+        // the whole sm_86 grid at the Qwen3.6 shape against an oracle written from the sentence: staged and wide, an sm_86-class card: 1-79 SMs 128 rows; 80+ SMs 128 rows from above 56 rows an expert, else 64
+        long long bad2 = 0, cmp2 = 0;
+        for (int sms = 1; sms <= 200; ++sms)
+            for (int T = 256; T <= 24576; T += 64) {
+                const int64_t n = (int64_t) T * 8;
+                const double avg = (double) n / 256.0;
+                const int want = sms < 80 ? 2 : (avg > 56.0 ? 2 : 4);
+                ++cmp2;
+                if (pick(Card{false, false, sms, true}, n, 256, true, true).ww != want) ++bad2;
+            }
+        CHECK(bad2 == 0);
+        std::printf("fused_tile_rule_test: Qwen3.6 K-quant pairs in the wide class: %lld sm_86 SM count / chunk combinations (%lld wrong)\n", cmp2, bad2);
+    }
     return failed == 0 ? 0 : 1;
 }

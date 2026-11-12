@@ -127,9 +127,9 @@ void experts_native_ext(const Batch& b, const NativeGeom& g, int n_expert, int64
     const Tables tb = tables(const_cast<void*>(scratch), n_expert);
     // staged: the launch's gate/up or down kernel is a weight-staging instance (the K-quant downs are, K = 512); the staged instances are the 128-row tile's.  launch_ww (as in
     // experts_native) runs the staging check for such a launch: one whose expert blobs are not device memory at 2-byte aligned addresses takes the unstaged 64-row kernel of the
-    // same formats (same output bits), sticky for the process, one log line, no exit.  The wide argument (the Q6_K / Q8_0 gate/up class of the sm_86 tile line) is false for this path's gate/up.
+    // same formats (same output bits), sticky for the process, one log line, no exit.  The wide argument is fused_tile::wide_pair: true for this path's K-quant pairs, so sm_86 cards with 40+ SMs take the 128-row tile above 112 rows an expert (fused_tile_rule.hpp; the 80+ SM ones used to take 64 there).
     const bool staged = sw_on(g.gu_type, true) || sw_on(g.d_type, false);
-    const int ww = launch_ww(b, g, n, n_expert, staged, g.gu_type == T_Q6_K || g.gu_type == T_Q8_0);
+    const int ww = launch_ww(b, g, n, n_expert, staged, strata::prefill::fused_tile::wide_pair(g.gu_type, g.d_type));
     const int64_t tiles = (n + kTileRows - 1) / kTileRows + (b.e1 - b.e0);
     const unsigned k_gu = (unsigned) std::min<int64_t>(tiles * (GU_ROWS_N / weight_rows(ww)), (int64_t) d.sms * d.occ_kq);
     const unsigned k_d = (unsigned) std::min<int64_t>(tiles * (D_ROWS_N / weight_rows(ww)), (int64_t) d.sms * (g.d_type == T_Q5_K ? kd.occ5 : kd.occ6));

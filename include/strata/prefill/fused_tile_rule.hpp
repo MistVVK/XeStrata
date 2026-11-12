@@ -43,7 +43,7 @@ constexpr double kS120LargeAvg = 159.9;   // sm_120, 80+ SMs: a prompt of 8,192 
 constexpr double kS120MidAvg = 112.0;     // sm_120, 100-149 SMs (PRO 5000): from above the band, continuous with it
 constexpr double kS120SmallAvg = 119.9;   // sm_120, 40-79 SMs (RTX 5070): a prompt of 6,144 tokens routes 6,143 positions = 119.98 an expert
 
-// staged: the launch's gate/up kernel is a weight-staging instance (sw_on in src/prefill/moe_fused_iq.cu).  wide: the launch's gate/up is Q6_K or Q8_0 (the pair class below).  Defaults false = the rule as it was.
+// staged: the launch's gate/up kernel is a weight-staging instance (sw_on in src/prefill/moe_fused_iq.cu).  wide: the launch's pair is in the class of wide_pair below (a Q6_K or Q8_0 gate/up; Qwen3.6's K-quant pairs).  Defaults false = the rule as it was.
 constexpr Pick pick(const Card& c, int64_t n, int n_expert, bool staged = false, bool wide = false) {
     const double avg = (double) n / (double) (n_expert > 1 ? n_expert : 1);
     // GB10 (sm_121, 48 SMs): the launch's average is above 112 rows an expert for every prompt size here, so the 56-112 band never fires and the 64-row tile would be
@@ -77,8 +77,21 @@ constexpr Pick pick(const Card& c, int64_t n, int n_expert, bool staged = false,
     // 50.64 -> 42.02, 109.88 -> 89.91, 186.36 -> 140.29.  The class is narrow on purpose: the same cards run the 64-row tile faster above 112 rows for the unstaged IQ2_S / Q2_0 pair at 8K (33.80 against 35.05) and
     // for Q2_0 / Q2_0 (26.52 against 28.56 at 8K), so the line does not take every pair.  On the RTX A6000 (sm_86, 84 SMs; lane P4-Q36, Boston jobs boston-20261111-2158-c9cf / -1d66 / -2209-d899) Qwen3.6 UD-Q6_K_XL with every expert in VRAM, end to end,
     // ratio to MMQ at 2K / 8K / 20K: today's tile rule 0.95 / 0.90 / 0.92 (five rounds, spread under 0.02), STRATA_PF_FUSED_TILE=128 0.95 / 0.98 / 0.99 (three rounds).  The i-quant pairs keep the rule lane OWN-4X gated on that class.
+    // The K-quant pairs of Qwen3.6's UD-Q4_K_XL (wide_pair below: a Q4_K / Q5_K gate/up with a Q5_K / Q6_K down, both weight-staging instances at 128 rows) take this line too.  One layer of Qwen3.6's shape (256
+    // experts, top 8), MMQ ms / fused ms, 2,048 / 4,096 / 8,192 / 20,000 tokens, two repeats, output bits hash equal at every tile, STRATA_PF_FUSED_TILE=64 against 128 (the rule's own pick before this line = 64
+    // from 128 rows an expert, 4,096 tokens): RTX A6000 (sm_86, 84 SMs) Q4_K / Q5_K tile 64 0.91 / 0.85 / 0.71 / 0.65, tile 128 1.42 / 1.08 / 0.95 / 0.91; Q4_K / Q6_K 64: 0.82 / 0.73 / 0.61 / 0.53, 128: 1.47 / 1.17 /
+    // 1.02 / 0.91; Q5_K / Q6_K 64: 0.71 / 0.63 / 0.52 / 0.46, 128: 1.37 / 1.14 / 0.98 / 0.86 (2,048 tokens = 64 rows an expert is 128 in the band already: equal).  RTX PRO 5000 (sm_120, 110 SMs; its rule above
+    // already picks 128 from 56 rows an expert, so its default row equals the forced-128 row): tile 64 0.99 / 0.85 / 0.72 / 0.63, 0.92 / 0.77 / 0.66 / 0.58, 0.83 / 0.70 / 0.60 / 0.52 against 1.28 / 1.07 / 1.02 / 0.87,
+    // 1.33 / 1.12 / 0.99 / 0.96, 1.23 / 1.08 / 0.93 / 0.90.  So on both SM classes tested 128 rows is the faster tile from 4,096 tokens up and not worse at 2,048 (par/RESULTS-Q36-DEFAULT.md).
     if (wide && c.s86 && c.sms >= 40 && avg > 112.0) return {2, Why::kS86Wide};
     return {avg > 56.0 && avg <= 112.0 ? 2 : 4, Why::kBand};
+}
+
+// The gate/up + down pairs of the wide line (ggml type ids as in moe_fused_iq.cu): a Q6_K or Q8_0 gate/up (Q6_K + Q8_0, Q8_0 / Q8_0), and since 11-12 the K-quant pairs of Qwen3.6's UD-Q4_K_XL, a Q4_K or Q5_K gate/up
+// with a Q5_K or Q6_K down (the Qwen3.6 copy of the kernels only: Flash-Next's K-quant gate/up has a Q5_1 / Q8_0 down and keeps its rule).
+constexpr int kTypeQ8_0 = 8, kTypeQ4K = 12, kTypeQ5K = 13, kTypeQ6K = 14;
+constexpr bool wide_pair(int gu_type, int d_type) {
+    return gu_type == kTypeQ6K || gu_type == kTypeQ8_0 || ((gu_type == kTypeQ4K || gu_type == kTypeQ5K) && (d_type == kTypeQ5K || d_type == kTypeQ6K));
 }
 
 // Whether native_supported's default rule (STRATA_PF_FUSED unset; the IQ3_S pack's gate/up IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS with an IQ4_NL / Q2_0 down) takes a launch on this card, as a pure function so the
