@@ -141,7 +141,7 @@ int main() {
         CHECK(badw == 0);
         std::printf("fused_tile_rule_test: wide class: %lld card / launch combinations checked (%lld wrong)\n", cmpw, badw);
     }
-    // ---- the default rule (native_supported) with the research switch STRATA_PF_FUSED_SM40: takes_by_default(card, sm40, gate_staged, down_ok)
+    // ---- the default rule (native_supported) with the 40-79 SM rule on or off (STRATA_PF_FUSED_SM40, on unless 0; see below): takes_by_default(card, sm40, gate_staged, down_ok)
     {
         using strata::prefill::fused_tile::takes_by_default;
         const Card a4000s{false, false, 48, true}, s86at39{false, false, 39, true}, s86at40{false, false, 40, true}, s86at79{false, false, 79, true}, s86at80{false, false, 80, true},
@@ -209,6 +209,52 @@ int main() {
               default_takes(-1, Card{false, false, 60, true}, true, true, true, 18));
         // a format outside the list never takes the default
         CHECK(!default_takes(-1, Card{false, false, 84, true}, true, true, true, 19) && !default_takes(-1, Card{false, false, 84, true}, true, true, true, 20));
+    }
+    // ---- the 40-79 SM cards in the default (owner 11-12): the staged path is the default there, STRATA_PF_FUSED_SM40=0 the way back.  default_takes_env(env, card, sm40_env, gate_staged, down_ok, gu_type)
+    {
+        using namespace strata::prefill::fused_tile;
+        CHECK(sm40_on(-1) && sm40_on(1) && !sm40_on(0));   // unset and "1" on, "0" off
+        // the whole grid against an oracle written from the sentence of the decision: STRATA_PF_FUSED unset; a format of the default list (IQ2_XXS 16, IQ2_XS 17, IQ3_XXS 18, IQ3_S 21, IQ2_S 22, IQ4_XS 23; not
+        // Q8_0 8, Q4_K 12, Q5_K 13, Q6_K 14, IQ1_S 19, IQ4_NL 20, IQ1_M 29); a card with the sm_86 or sm_120 flag; then 80+ SMs always, and 40-79 SMs only for a staged gate/up with an IQ4_NL / Q2_0 down while
+        // the switch is not "0"
+        const int kTypes[] = {8, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29};
+        long long cmp3 = 0, bad3 = 0, yes40 = 0, yes80 = 0;
+        for (int gu : kTypes)
+            for (int env = -1; env <= 1; ++env)
+                for (int sm40e = -1; sm40e <= 1; ++sm40e)
+                    for (int s120 = 0; s120 < 2; ++s120)
+                        for (int s86 = 0; s86 < 2; ++s86)
+                            for (int s121 = 0; s121 < 2; ++s121)
+                                for (int sms = 0; sms <= 200; ++sms)
+                                    for (int g = 0; g < 2; ++g)
+                                        for (int d = 0; d < 2; ++d) {
+                                            ++cmp3;
+                                            const Card c{s120 != 0, s121 != 0, sms, s86 != 0};
+                                            const bool inlist = gu == 16 || gu == 17 || gu == 18 || gu == 21 || gu == 22 || gu == 23;
+                                            const bool card = s120 || s86;
+                                            const bool want = env == -1 && inlist && card && (sms >= 80 || (sms >= 40 && sm40e != 0 && g != 0 && d != 0));
+                                            if (default_takes_env(env, c, sm40e, g != 0, d != 0, gu) != want) ++bad3;
+                                            if (want && sms < 80) ++yes40;
+                                            if (want && sms >= 80) ++yes80;
+                                        }
+        CHECK(bad3 == 0);
+        CHECK(yes40 > 0 && yes80 > 0);
+        std::printf("fused_tile_rule_test: 40-79 SM default: %lld env / switch / card / SM count / launch combinations (%lld wrong; %lld yes below 80 SMs, %lld yes at 80+)\n", cmp3, bad3, yes40, yes80);
+        // named cards, switch unset: the A4000 (sm_86, 48 SMs) and the RTX 5070 (sm_120, 48 SMs) take a staged gate/up with an IQ4_NL / Q2_0 down; switch "0" takes them back; "1" is the same as unset
+        const Card a4000c{false, false, 48, true}, r5070{true, false, 48, false}, a6000c{false, false, 84, true}, tiny{false, false, 39, true}, sm60{false, false, 56, false}, gb10c{true, true, 48, false};
+        for (int gu : {18, 21, 23})   // IQ3_XXS, IQ3_S, IQ4_XS
+            for (bool dn : {true}) {
+                CHECK(default_takes_env(-1, a4000c, -1, true, dn, gu) && default_takes_env(-1, r5070, -1, true, dn, gu) && default_takes_env(-1, a4000c, 1, true, dn, gu));
+                CHECK(!default_takes_env(-1, a4000c, 0, true, dn, gu) && !default_takes_env(-1, r5070, 0, true, dn, gu));
+                CHECK(default_takes_env(-1, a6000c, 0, true, dn, gu));   // 80+ SMs: the switch moves nothing
+                CHECK(!default_takes_env(-1, tiny, -1, true, dn, gu) && !default_takes_env(-1, sm60, -1, true, dn, gu));   // 39 SMs, a card with neither flag (sm_60 / sm_80 / sm_89 / AMD): as before
+                CHECK(!default_takes_env(0, a4000c, -1, true, dn, gu) && !default_takes_env(1, a4000c, -1, true, dn, gu));   // STRATA_PF_FUSED=0 is MMQ, =1 is the opt-in decided elsewhere
+            }
+        CHECK(!default_takes_env(-1, a4000c, -1, false, true, 22));   // IQ2_S gate/up is not a staged instance: stays on MMQ on 48 SMs (IQ2_S / Q2_0 was 0.97 of MMQ at 32K)
+        CHECK(!default_takes_env(-1, a4000c, -1, true, false, 21));   // an IQ3_S gate/up with a down outside IQ4_NL / Q2_0 (Q5_0, Q8_0, K-quants): not taken
+        CHECK(!default_takes_env(-1, a4000c, -1, false, true, 16) && !default_takes_env(-1, a4000c, -1, false, true, 17));   // IQ2_XXS / IQ2_XS: no staged instance, MMQ below 80 SMs
+        CHECK(!default_takes_env(-1, a4000c, -1, true, true, 12) && !default_takes_env(-1, a4000c, -1, true, true, 13) && !default_takes_env(-1, a4000c, -1, true, true, 14));   // Q4_K / Q5_K / Q6_K: opt-in as before
+        CHECK(default_takes_env(-1, gb10c, -1, true, true, 21) == default_takes_env(-1, r5070, -1, true, true, 21));   // the s121 flag is not looked at by this rule
     }
     // every class, every launch size: staged = false gives the rule of commit 083b1ac82 exactly as before the argument existed, for the sm_86 cards too (the new flag does not move them)
     {

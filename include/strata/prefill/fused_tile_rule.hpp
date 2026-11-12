@@ -76,11 +76,14 @@ constexpr Pick pick(const Card& c, int64_t n, int n_expert, bool staged = false,
 }
 
 // Whether native_supported's default rule (STRATA_PF_FUSED unset; the IQ3_S pack's gate/up IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS with an IQ4_NL / Q2_0 down) takes a launch on this card, as a pure function so the
-// rule can be tested without a GPU.  Today: sm_86 / sm_120 cards with 80+ SMs.  sm40 (STRATA_PF_FUSED_SM40=1, a research switch, OFF unless set) adds the sm_86 / sm_120 cards with 40-79 SMs for the
+// rule can be tested without a GPU.  sm_86 / sm_120 cards with 80+ SMs: always.  sm40 (the 40-79 SM rule; ON by default since the owner's word of 11-12, STRATA_PF_FUSED_SM40=0 turns it off, see sm40_on
+// below; it was a research switch, off unless set, before) adds the sm_86 / sm_120 cards with 40-79 SMs for the
 // launches whose gate/up kernel is a weight-staging instance (gate_staged: IQ3_XXS / IQ3_S / IQ4_XS, sw_on in src/prefill/moe_fused_iq.cu) with an IQ4_NL or Q2_0 down (down_ok).  Evidence: RTX A4000
 // (sm_86, 48 SMs) one layer, real routing, staged 128-row tile against MMQ at 2,048 / 8,192 / 20,000 / 32,768 tokens: IQ3_S / IQ4_NL 1.594 / 1.337 / 1.190 / 1.070, IQ3_XXS / IQ4_NL 1.645 / 1.373 / 1.223 /
 // 1.097, IQ4_XS / IQ4_NL 1.621 / 1.326 / 1.176 / 1.055, IQ3_S / Q2_0 1.563 / 1.338 / 1.195 / 1.078 (RESULTS-P4-SM.md S1); the same kernels give the same output bits on every card.  IQ2_S / Q2_0 is 0.95-0.97
-// of MMQ at 32K and stays out.  No end-to-end row exists below 80 SMs, and nothing below 48 SMs is measured (the bound is 40).
+// of MMQ at 32K and stays out.  End to end on the RTX A4000 (z440, IQ3_XXS set, the 19 staged-pair layers on the fused kernels, 29 on MMQ, experts streamed over PCIe), prompt time MMQ / fused 1.000 / 1.003 /
+// 1.028 / 1.012 at 2K / 4K / 8K / 20K (5 interleaved rounds; 8K and 20K fused faster in 5 of 5), teacher-forced KL against the FP16 prompt path, fused / MMQ 0.930 [0.881, 0.988] at 2,048 and 0.973 [0.898,
+// 1.057] at 8,192 ids (RESULTS-P4-SM.md, ITEM 1).  Nothing below 48 SMs is measured (the bound is 40).
 constexpr bool takes_by_default(const Card& c, bool sm40, bool gate_staged, bool down_ok) {
     if (!(c.s86 || c.s120)) return false;
     if (c.sms >= 80) return true;
@@ -91,7 +94,7 @@ constexpr bool takes_by_default(const Card& c, bool sm40, bool gate_staged, bool
 // that they are GGML_TYPE_*).  IQ2_XXS / IQ2_XS joined on the owner's word of 11-12 ("2-bit fused kernels as the default on 80+ SM NVIDIA cards"): the IQ3_XXS set's 19 gate/up layers (9 IQ2_XXS,
 // 10 IQ2_XS) on an RTX A6000 (sm_86, 84 SMs): prompt time fused / default 0.874-0.976 from 300 to 8,193 tokens on the integration head, teacher-forced KL against the FP16 prompt path 0.965 [0.912,
 // 1.021] at 512, 1.062 [0.995, 1.137] at 1,000, 1.072 [1.020, 1.123] at 2,048 and 1.008 [0.939, 1.101] at 8,192 ids (RESULTS-OWN-4X.md).  The card rule is takes_by_default above and did not
-// change: sm_86 / sm_120 with 80+ SMs; below 80 SMs the sm40 research switch only takes the weight-staging gate/up instances (IQ3_XXS / IQ3_S / IQ4_XS: sw_on), never IQ2_XXS / IQ2_XS.
+// change: sm_86 / sm_120 with 80+ SMs; below 80 SMs the 40-79 SM rule (sm40) only takes the weight-staging gate/up instances (IQ3_XXS / IQ3_S / IQ4_XS: sw_on), never IQ2_XXS / IQ2_XS.
 // AMD (HIP) has its own rule in native_supported and is not touched.
 constexpr int kTypeIq2Xxs = 16, kTypeIq2Xs = 17, kTypeIq3Xxs = 18, kTypeIq3S = 21, kTypeIq2S = 22, kTypeIq4Xs = 23;
 constexpr bool default_gate_format(int t) {
@@ -102,6 +105,13 @@ constexpr bool default_gate_format(int t) {
 // elsewhere, never "by default"), so only an unset variable can take a layer here, and STRATA_PF_FUSED=0 turns the default off again.
 constexpr bool default_takes(int env, const Card& c, bool sm40, bool gate_staged, bool down_ok, int gu_type) {
     return env < 0 && default_gate_format(gu_type) && takes_by_default(c, sm40, gate_staged, down_ok);
+}
+
+// STRATA_PF_FUSED_SM40 as moe_fused_iq.cu reads it: -1 unset, 0 = a value starting with '0', 1 = any other value.  The 40-79 SM rule of takes_by_default is ON unless the variable is "0"
+// (the way back, a diagnostic like STRATA_PF_FUSED_SM86=0; "1" keeps working and means the same as unset).  default_takes_env is default_takes with that variable folded in, as native_supported calls it.
+constexpr bool sm40_on(int sm40_env) { return sm40_env != 0; }
+constexpr bool default_takes_env(int env, const Card& c, int sm40_env, bool gate_staged, bool down_ok, int gu_type) {
+    return default_takes(env, c, sm40_on(sm40_env), gate_staged, down_ok, gu_type);
 }
 
 // ---- the weight-staging guard (check_staged_blobs's decision in src/prefill/moe_fused_iq.cu), as pure functions so the decision can be tested without a GPU.
