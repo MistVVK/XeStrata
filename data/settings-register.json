@@ -29445,9 +29445,9 @@
    "since": "v0.1.40.1",
    "last_commit": "125025a770",
    "last_date": "2026-10-14",
-   "status": "opt-in",
+   "status": "rollback",
    "owner": "prefill",
-   "note": "[reviewed] Documented tuning for STRATA_PF_FUSED chunk floor, opt-in. [docs/STRIX_HALO.md:227]",
+   "note": "[reviewed] The chunk size from which a prompt chunk takes the long-prompt path (1,024 by default). Unset, Windows gfx1151 with a layer set that has no MMQ tile and the fused kernels on every layer (UD-Q4_K_XL) uses 64 (src/prefill/prefill.cpp default_stream_floor, include/strata/prefill/stream_floor_rule.hpp); STRATA_PREFILL_STREAM_MIN=1024 restores the old rule on it. Any value set replaces the floor everywhere. [docs/STRIX_HALO.md:156]",
    "retire_after": "",
    "retired_in": ""
   },

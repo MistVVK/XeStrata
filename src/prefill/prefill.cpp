@@ -8,6 +8,8 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/prefill/pf_fused_override.hpp"
 #include "strata/prefill/staged_group_rule.hpp"
+#include "strata/prefill/stream_floor_rule.hpp"
+#include "strata/kernels/gfx_arch.hpp"
 #include "strata/prefill/fewrows.hpp"
 #include "strata/prefill/gp100_prompt_default.hpp"
 #if defined(STRATA_HAVE_DFLASH2)
@@ -332,10 +334,62 @@ constexpr int RING_MAX = 1024;          // the arrays; the ring itself is ring_s
 // (Prefill::arm_cpu_share) it is the share's own limit instead: the share applies to staged chunks only.
 constexpr int64_t kStreamAllMinDefault = 1024;   // the default above (and the CPU share's default limit)
 int64_t g_stream_min_share = 0;
+// A layer set in which EVERY layer has no MMQ tile for its formats and the fused kernels take it (UD-Q4_K_XL's Q4_K / Q5_K gate/up with a Q5_1 / Q8_0 down: STRATA_MMQ_KQ is
+// opt-in, so mmq::fits is false; the same test mmq_plan() makes, p.fo).  Its chunks below the floor take the staged walk, which has no fused entry for such a layer
+// (fz_staged needs use_mmq) and runs every routed expert on the dequantize-to-FP16 path: about 1.6 s a prompt whatever its length (stream_floor_rule.hpp).
+inline bool layers_all_fused_only() {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || lay.fmt.empty()) return false;
+    if (const char* e = std::getenv("STRATA_PREFILL_MMQ"); e != nullptr && std::atoi(e) == 0) return false;   // mmq_plan(): no plan, no fused-only layers
+#if defined(STRATA_PF_OWN_ONLY)
+    if (!fused::built()) return false;
+#else
+    if (!mmq::built()) return false;
+#endif
+    for (const auto& f : lay.fmt) {
+        if (mmq::fits(f.gu_type, kFF2) && mmq::fits(f.d_type, N)) return false;   // a layer on MMQ
+        if (!fused::native_supported(f.gu_type, f.d_type)) return false;           // a layer on the FP16 path at every size
+    }
+    return true;
+}
+// The device class the lower floor was measured on: Windows, one visible card, gfx1151 (Strix Halo).  Not cached before a card answers.
+inline bool stream_floor_class_measured() {
+#if defined(STRATA_USE_HIP) && defined(_WIN32)
+    static std::atomic<int> state{-1};
+    int s = state.load(std::memory_order_acquire);
+    if (s < 0) {
+        int dev = 0, n = 0;
+        cudaDeviceProp prop;
+        if (cudaGetDeviceCount(&n) != cudaSuccess || cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        s = n == 1 && strata::kernels::gfx_arch_is_gfx1151(prop.gcnArchName) ? 1 : 0;
+        state.store(s, std::memory_order_release);
+    }
+    return s == 1;
+#else
+    return false;
+#endif
+}
+// The floor without STRATA_PREFILL_STREAM_MIN and the CPU share: stream_floor_rule.hpp's answer, decided once when the expert layout is known (a call before that gets the default and is not cached).
+inline int64_t default_stream_floor() {
+    static std::atomic<int64_t> cached{-1};
+    const int64_t c = cached.load(std::memory_order_acquire);
+    if (c >= 0) return c;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || lay.fmt.empty()) return strata::prefill::kStreamFloorDefault;
+    const bool cls = stream_floor_class_measured();
+    const int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only());
+    cached.store(v, std::memory_order_release);
+    if (v != strata::prefill::kStreamFloorDefault)
+        std::fprintf(stderr, "prefill: prompt pieces of %lld tokens or more read on the fused kernels, as long prompts do. STRATA_PREFILL_STREAM_MIN=1024 keeps the old rule.\n", (long long) v);
+    return v;
+}
 inline int64_t stream_all_min() {
     static const int64_t env = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) -1; }();
     if (env >= 0) return env;
-    return g_stream_min_share > 0 ? g_stream_min_share : kStreamAllMinDefault;
+    return g_stream_min_share > 0 ? g_stream_min_share : default_stream_floor();
 }
 // STRATA_PREFILL_CPU_SHARE (opt-in; set_cpu_pool): a chunk below stream_all_min() hands the decode CPU pool - idle
 // while a prompt is read - the non-resident experts few of its tokens route to, instead of streaming them over PCIe.
