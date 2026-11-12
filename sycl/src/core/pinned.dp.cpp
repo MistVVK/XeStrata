@@ -254,12 +254,15 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         }
         std::fclose(f);
     }
-    const bool skip_thp_request = std::getenv("STRATA_NO_ARENA_THP") != nullptr || thp_mode == "always";
+    // STRATA_NO_ARENA_THP=0 asks for the huge pages (the same meaning as in src/core/pinned.cu); any other value skips the request
+    const char* no_thp = std::getenv("STRATA_NO_ARENA_THP");
+    const bool user_no_thp = no_thp != nullptr && no_thp[0] != '0';
+    const bool skip_thp_request = user_no_thp || thp_mode == "always";
     if (std::getenv("STRATA_NO_LARGEPAGES") == nullptr && skip_thp_request) {
         const std::string four_k = "; using 4 KB pages";
         if (note.size() >= four_k.size() && note.compare(note.size() - four_k.size(), four_k.size(), four_k) == 0)
             note.resize(note.size() - four_k.size());
-        note += std::getenv("STRATA_NO_ARENA_THP") != nullptr
+        note += user_no_thp
                     ? "; transparent huge pages skipped (STRATA_NO_ARENA_THP)"
                     : "; transparent huge pages are on for every mapping (THP always): MADV_HUGEPAGE not requested";
     } else if (std::getenv("STRATA_NO_LARGEPAGES") == nullptr && madvise(p, bytes, MADV_HUGEPAGE) == 0) {

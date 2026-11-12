@@ -2,6 +2,8 @@
 #include "strata/core/pinned.hpp"
 #include "strata/platform/memory.hpp"
 #include "strata/core/pin_budget.hpp"
+#include "strata/core/arch_defaults.hpp"   // arena_skip_thp_request
+#include "strata/core/page_cache_drop.hpp"   // drop_range (the drop behind the arena read, Linux)
 #include <cstddef>
 
 #include <cuda_runtime.h>
@@ -482,14 +484,22 @@ void* reserve(uint64_t bytes, PageBacking& got, std::string& note, const std::st
         }
         std::fclose(f);
     }
-    const bool skip_thp_request = std::getenv("STRATA_NO_ARENA_THP") != nullptr || thp_mode == "always";
+    // STRATA_NO_ARENA_THP unset = the engine decides: an integrated gfx11 GPU under Linux asks for none (arena_no_thp_flag, set
+    // from the device before the arena is made; a huge-page move inside the registered arena resets that GPU in a prompt), every other
+    // device as before.  =0 asks for them there too (the user's choice; #2126's free-block check below still applies); any other value
+    // skips the request on any device (as before).
+    const char* no_thp = std::getenv("STRATA_NO_ARENA_THP");
+    const bool user_no_thp = no_thp != nullptr && no_thp[0] != '0';
+    const bool skip_thp_request = arena_skip_thp_request(no_thp, thp_mode == "always", arena_no_thp_flag().load(std::memory_order_relaxed));
     if (std::getenv("STRATA_NO_LARGEPAGES") == nullptr && skip_thp_request) {
         const std::string four_k = "; using 4 KB pages";
         if (note.size() >= four_k.size() && note.compare(note.size() - four_k.size(), four_k.size(), four_k) == 0)
             note.resize(note.size() - four_k.size());
-        note += std::getenv("STRATA_NO_ARENA_THP") != nullptr
+        note += user_no_thp
                     ? "; transparent huge pages skipped (STRATA_NO_ARENA_THP)"
-                    : "; transparent huge pages are on for every mapping (THP always): MADV_HUGEPAGE not requested";
+                    : thp_mode == "always"
+                    ? "; transparent huge pages are on for every mapping (THP always): MADV_HUGEPAGE not requested"
+                    : " [DRAFT] ; huge pages not requested on this graphics chip";
     } else if (std::getenv("STRATA_NO_LARGEPAGES") == nullptr && std::getenv("STRATA_ARENA_THP") == nullptr &&
                free_huge_bytes() < bytes / 2) {
         // #2126: THP "madvise" + defrag "madvise" makes every fault of a MADV_HUGEPAGE mapping reclaim and compact
@@ -1172,7 +1182,7 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
 
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
-                              const std::atomic<int>* ready, const PadMap* pad) {
+                              const std::atomic<int>* ready, const PadMap* pad, bool drop_behind) {
     LoadStats st;
     const uint64_t layers = (uint64_t) layer_off.size();
     st.layers = layers;
@@ -1255,6 +1265,10 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
                 h = fnv1a64(buf.data(), n, h);
                 copy_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::steady_clock::now() - t_copy).count();
+#if defined(__linux__)
+                // this chunk is in the arena now: its file-cache pages are only a second copy.  Advice; a failure is ignored.
+                if (drop_behind) (void) strata::core::page_cache_drop::drop_range(::fileno(f), off + pos, n);
+#endif
                 pos += n;
                 remaining -= n;
             }

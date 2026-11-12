@@ -55,6 +55,30 @@ bool igpu_prompt_set_enabled(const char* gcn_arch, bool windows);
 inline constexpr bool kIgpuUmaArenaDefaultOn = false;
 bool igpu_uma_arena_default(const char* gcn_arch, bool integrated, bool windows, bool on = kIgpuUmaArenaDefaultOn);
 
+/// the registered expert arena asks for no transparent huge pages on an integrated gfx11 GPU under Linux (gfx1103 Radeon
+/// 780M, gfx1150 880M / 890M, gfx1151 Strix Halo; detected from the device: `integrated` and the arch name).  MADV_HUGEPAGE on a registered
+/// range adds direct compaction and khugepaged collapse in it; each move invalidates the range, KFD evicts the process's queues, and the
+/// gc 11 MES firmware resets the GPU when a dispatch sits in a barrier (notes-minipc.md).  Radeon 780M, Q2_0 pack, registered 31.6 GiB arena,
+/// one engine at a time: huge pages requested 9 starts, 8 ended in "unspecified launch failure" in the first prompt; not requested 3 of 3 ran.
+/// Setup already wrote STRATA_NO_ARENA_THP=1 for its 780M opt-in; this makes it the engine's own rule.
+/// STRATA_NO_ARENA_THP=0 asks for them (unset = this rule; =1 = never, as before).  Windows and discrete cards: unchanged.
+bool igpu_arena_no_thp_default(const char* gcn_arch, bool integrated, bool windows);
+/// the wait before READY (strata/core/kfd_settle.hpp) applies to the same class: an integrated gfx11 GPU under Linux (gfx1103,
+/// gfx1150, gfx1151), where the registered expert arena is a KFD userptr and the kernel's page moves right after the load evict the
+/// process's queues.  Never Windows, never a discrete card.  STRATA_NO_KFD_SETTLE=1 turns the wait off.
+bool igpu_kfd_settle_default(const char* gcn_arch, bool integrated, bool windows);
+/// the file-cache give-back during and after the expert load (strata/core/page_cache_drop.hpp) applies to the same class: an integrated
+/// gfx11 GPU under Linux (gfx1103, gfx1150, gfx1151).  Never Windows, never a discrete card.  STRATA_NO_ARENA_CACHE_DROP=1 turns it off.
+bool igpu_cache_drop_default(const char* gcn_arch, bool integrated, bool windows);
+/// Whether the expert arena skips its MADV_HUGEPAGE request: `no_arena_thp` is STRATA_NO_ARENA_THP (nullptr when unset): "0" asks for the huge
+/// pages, any other value skips the request; unset leaves it to `igpu_rule` (igpu_arena_no_thp_default for this device).  `thp_always`: the
+/// kernel's THP mode is "always" (the request would add nothing, #771).  Inline: src/core/pinned.cu (strata_core) uses it without
+/// linking arch_defaults.cpp.
+inline bool arena_skip_thp_request(const char* no_arena_thp, bool thp_always, bool igpu_rule) {
+    if (no_arena_thp != nullptr) return no_arena_thp[0] != '0' || thp_always;   // the user's own value: 0 = ask for them, else skip
+    return thp_always || igpu_rule;
+}
+
 /// The matrix-core prompt set an integrated GPU takes when `igpu_prompt_set_enabled()`: STRATA_HIP_WMMA, STRATA_PF_GEMM, STRATA_PA_FAST,
 /// STRATA_SELECT_WMMA, STRATA_HC_UPMIX, all "1".  Empty unless `integrated` (hipDeviceProp_t::integrated: the device
 /// shares the host's memory) AND the architecture is one of `igpu_prompt_defaults_arch`: a discrete card of the same

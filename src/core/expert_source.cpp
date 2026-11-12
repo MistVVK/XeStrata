@@ -4,6 +4,7 @@
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/page_cache_drop.hpp"
 #include "strata/core/ple_residency.hpp"
 #include "strata/core/resident_ram_copy.hpp"
 #include "strata/platform/aux_cpus.hpp"
@@ -6313,7 +6314,8 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     } else {
         if (unbuffered && !padded_) st = load_experts_direct(path, a->data(), loff, lbytes, readers, /*chunk=*/8u << 20, rp);
         if (!unbuffered || padded_ || (!st.ok && st.error.empty()))   // unaligned ranges / the padded layout: the buffered reader
-            st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20, rp, padded_ ? &pad_ : nullptr);
+            st = load_experts_ranges(path, a->data(), loff, lbytes, threads, /*chunk=*/8u << 20, rp, padded_ ? &pad_ : nullptr,
+                                     /*drop_behind=*/strata::core::page_cache_drop::enabled());   // integrated gfx11 under Linux
     }
     if (reg.joinable()) reg.join();
     std::fprintf(stderr, "strata generate: expert arena read %s (%s)\n", unbuffered ? "unbuffered" : "through the file cache",

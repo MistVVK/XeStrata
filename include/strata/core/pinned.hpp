@@ -38,6 +38,12 @@ inline std::atomic<bool>& arena_uma_no_register_flag() {
     static std::atomic<bool> f{false};
     return f;
 }
+/// the engine sets this on an integrated gfx11 GPU under Linux (arch_defaults.hpp, igpu_arena_no_thp_default): the arena
+/// then asks for no transparent huge pages (as STRATA_NO_ARENA_THP=1), unless STRATA_NO_ARENA_THP=0 asks for them.
+inline std::atomic<bool>& arena_no_thp_flag() {
+    static std::atomic<bool> f{false};
+    return f;
+}
 /// True when the arena is to stay unregistered: STRATA_ARENA_PIN_GIB=none always, otherwise the flag above unless the user set
 /// STRATA_ARENA_PIN_GIB to a number (STRATA_ARENA_PIN_GIB=0 registers the whole arena as before).
 bool arena_no_register();
@@ -169,7 +175,9 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
 /// (an overload, not a default argument: the SYCL build has its own pinned.dp.cpp that defines the signature above only)
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
-                              const std::atomic<int>* ready, const PadMap* pad);
+                              const std::atomic<int>* ready, const PadMap* pad, bool drop_behind = false);
+/// `drop_behind` (Linux only; page_cache_drop.hpp): right after each chunk is copied into the arena, the file cache of that chunk is
+/// given back (posix_fadvise DONTNEED, advice only: a failure is ignored), so the cache of the file never grows to the arena's size.
 
 /// The same ranges read UNBUFFERED straight into `dst` (Windows): no staging buffer and no file-cache copy - the
 /// drive's DMA lands where the experts live. Every range, `dst` and `chunk` must be 4 KiB aligned; returns ok =
