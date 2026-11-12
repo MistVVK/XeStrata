@@ -636,41 +636,43 @@ int main() {
         // Qwen3.6 (256 experts, top 8) is a different call: kq is never passed there, and wide_pair's answers above are unchanged
         CHECK(pick(a6000, 2048 * 8, 256, true, true, 0).ww == pick(a6000, 2048 * 8, 256, true, true).ww);
     }
-    // ---- Flash-Next's K-quant experts by default: kq_takes(kq_env, card), whether dev_info sets the K-quant kernels up.  The whole grid against an oracle written from the sentence of the decision:
-    // STRATA_PF_FUSED_KQ=0 (or any value not starting with '1'): never.  =1: every card.  Unset: an sm_86-class or sm_120 card (not sm_121 alone, not a card with neither flag) with 80+ SMs; the 40-79 SM cards
-    // and everything under 80 SMs never (the A4000's one-layer table is below MMQ at 20,000 tokens), whatever STRATA_PF_FUSED_SM40 says.
+    // ---- Flash-Next's K-quant experts by default: kq_takes(kq_env, card, sm40_env), whether dev_info sets the K-quant kernels up.  The whole grid against an oracle written from the sentence of the decision:
+    // STRATA_PF_FUSED_KQ=0 (or any value not starting with '1'): never.  =1: every card.  Unset: the cards of the i-quant default rule (an sm_86-class or sm_120 card, not sm_121 alone, not a card with neither
+    // flag) with 80+ SMs, 40-79 SMs while STRATA_PF_FUSED_SM40 is not "0", under 40 SMs never.
     {
         using namespace strata::prefill::fused_tile;
-        long long cmp = 0, bad = 0, yes_def = 0, yes_below80 = 0;
+        long long cmp = 0, bad = 0, yes_def = 0, yes40 = 0, yes80 = 0;
         for (int env = -1; env <= 1; ++env)
-            for (int s120 = 0; s120 < 2; ++s120)
-                for (int s86 = 0; s86 < 2; ++s86)
-                    for (int s121 = 0; s121 < 2; ++s121)
-                        for (int sms = 0; sms <= 200; ++sms) {
-                            const Card c{s120 != 0, s121 != 0, sms, s86 != 0};
-                            bool want = false;
-                            if (env == 1) want = true;
-                            if (env == -1) want = (s120 || s86) && sms >= 80;
-                            ++cmp;
-                            if (kq_takes(env, c) != want) ++bad;
-                            if (want && env == -1) { ++yes_def; if (sms < 80) ++yes_below80; }
-                        }
-        CHECK(bad == 0 && yes_def > 0 && yes_below80 == 0);
-        std::printf("fused_tile_rule_test: Flash-Next K-quant default: %lld switch / card flag / SM count combinations (%lld wrong; %lld yes unset, none below 80 SMs)\n", cmp, bad, yes_def);
+            for (int sm40e = -1; sm40e <= 1; ++sm40e)
+                for (int s120 = 0; s120 < 2; ++s120)
+                    for (int s86 = 0; s86 < 2; ++s86)
+                        for (int s121 = 0; s121 < 2; ++s121)
+                            for (int sms = 0; sms <= 200; ++sms) {
+                                const Card c{s120 != 0, s121 != 0, sms, s86 != 0};
+                                bool want = false;
+                                if (env == 1) want = true;
+                                if (env == -1) want = (s120 || s86) && (sms >= 80 || (sms >= 40 && sm40e != 0));
+                                ++cmp;
+                                if (kq_takes(env, c, sm40e) != want) ++bad;
+                                if (want && env == -1) { ++yes_def; (sms >= 80 ? yes80 : yes40)++; }
+                            }
+        CHECK(bad == 0 && yes_def > 0 && yes40 > 0 && yes80 > 0);
+        std::printf("fused_tile_rule_test: Flash-Next K-quant default: %lld switch / SM40 switch / card flag / SM count combinations (%lld wrong; %lld yes unset: %lld at 80+ SMs, %lld at 40-79)\n", cmp, bad, yes_def, yes80, yes40);
         // the switch as the engine reads it: the same reading as STRATA_PF_FUSED's (pf_env)
         CHECK(pf_env(nullptr) == -1 && pf_env("") == -1 && pf_env("1") == 1 && pf_env("0") == 0 && pf_env("off") == 0);
         // named cards, switch unset
         const Card a6000{false, false, 84, true}, a40{false, false, 84, true}, a4000{false, false, 48, true}, a100{false, false, 108, true}, rtx4090{false, false, 128, true}, pro5000{true, false, 110, false},
             rtx5090{true, false, 170, false}, rtx5070{true, false, 48, false}, gb10{false, true, 48, false}, rtx3050{false, false, 20, true}, turing{false, false, 68, false}, hopper{false, false, 132, false};
-        for (const Card& c : {a6000, a40, a100, rtx4090, pro5000, rtx5090}) CHECK(kq_takes(-1, c) && !kq_takes(0, c) && kq_takes(1, c));   // 80+ SMs: on by default, =0 off
-        for (const Card& c : {a4000, rtx5070, gb10, rtx3050, turing, hopper}) CHECK(!kq_takes(-1, c) && !kq_takes(0, c) && kq_takes(1, c));   // 40-79 SMs, sm_121, under 40 SMs, no class flag: the opt-in only
-        // the same answer as the i-quant rule for a staged gate/up with a staged down on the 80+ SM cards; the 40-79 SM clause of that rule (sm40 on) is the one difference
-        for (const Card& c : {a6000, a4000, a100, rtx4090, pro5000, rtx5090, rtx5070, gb10, rtx3050, turing, hopper}) CHECK(kq_takes(-1, c) == takes_by_default(c, false, true, true));
-        CHECK(takes_by_default(a4000, true, true, true) && !kq_takes(-1, a4000));
+        for (const Card& c : {a6000, a40, a100, rtx4090, pro5000, rtx5090}) CHECK(kq_takes(-1, c, -1) && kq_takes(-1, c, 0) && kq_takes(-1, c, 1) && !kq_takes(0, c, -1) && kq_takes(1, c, -1));   // 80+ SMs: the SM40 switch moves nothing
+        for (const Card& c : {a4000, rtx5070}) CHECK(kq_takes(-1, c, -1) && kq_takes(-1, c, 1) && !kq_takes(-1, c, 0) && !kq_takes(0, c, -1) && kq_takes(1, c, 0));                             // 40-79 SMs: on, STRATA_PF_FUSED_SM40=0 off
+        for (const Card& c : {gb10, rtx3050, turing, hopper}) CHECK(!kq_takes(-1, c, -1) && !kq_takes(-1, c, 1) && !kq_takes(0, c, -1) && kq_takes(1, c, -1));                                  // sm_121, under 40 SMs, no class flag: the opt-in only
+        // the same answer as the i-quant rule for a staged gate/up with a staged down, every card above
+        for (const Card& c : {a6000, a4000, a100, rtx4090, pro5000, rtx5090, rtx5070, gb10, rtx3050, turing, hopper})
+            for (int sm40e = -1; sm40e <= 1; ++sm40e) CHECK(kq_takes(-1, c, sm40e) == takes_by_default(c, sm40_on(sm40e), true, true));
         // compute capability: 8.0 / 8.6 / 8.9 are in the class (s86_class), 8.7 / 9.0 / 7.5 are not, STRATA_PF_FUSED_SM86=0 empties it
-        CHECK(kq_takes(-1, Card{false, false, 108, s86_class(8, 0)}) && kq_takes(-1, Card{false, false, 128, s86_class(8, 9)}));
-        CHECK(!kq_takes(-1, Card{false, false, 16, s86_class(8, 7)}) && !kq_takes(-1, Card{false, false, 132, s86_class(9, 0)}) && !kq_takes(-1, Card{false, false, 68, s86_class(7, 5)}) &&
-              !kq_takes(-1, Card{false, false, 84, s86_class(8, 6, true)}));
+        CHECK(kq_takes(-1, Card{false, false, 108, s86_class(8, 0)}, -1) && kq_takes(-1, Card{false, false, 128, s86_class(8, 9)}, -1));
+        CHECK(!kq_takes(-1, Card{false, false, 16, s86_class(8, 7)}, -1) && !kq_takes(-1, Card{false, false, 132, s86_class(9, 0)}, -1) && !kq_takes(-1, Card{false, false, 68, s86_class(7, 5)}, -1) &&
+              !kq_takes(-1, Card{false, false, 84, s86_class(8, 6, true)}, -1));
     }
     return failed == 0 ? 0 : 1;
 }
