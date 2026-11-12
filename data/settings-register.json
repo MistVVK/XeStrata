@@ -21039,7 +21039,7 @@
    "last_date": "2026-10-07",
    "status": "opt-in",
    "owner": "core",
-   "note": "[DRAFT] unset: the engine decides (no huge-page request for the expert arena on an integrated gfx11 GPU under Linux: gfx1103, gfx1150, gfx1151; a request everywhere else, as before); 1 (any value but 0): never request them, as before; 0: request them, also on those GPUs (#2126's free-block check still applies). Documented for users (docs/TROUBLESHOOTING.md:122).",
+   "note": "unset: the engine decides (no huge-page request for the expert arena on an integrated gfx11 GPU under Linux: gfx1103, gfx1150, gfx1151; a request everywhere else, as before); 1 (any value but 0): never request them, as before; 0: request them, also on those GPUs (#2126's free-block check still applies). Documented for users (docs/TROUBLESHOOTING.md:122).",
    "retire_after": "",
    "retired_in": ""
   },
