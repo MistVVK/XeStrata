@@ -64,6 +64,13 @@ std::vector<std::pair<std::string, std::string>> nv_default_env(int major, int m
             // identical with it on and off (docs/DGX_SPARK_LINUX.md; HANDOVER §6.2).  It rounds differently from MMQ,
             // so it is a default with an off switch, like the sm_86 table.
             {"STRATA_PF_FUSED", "1"},
+            // the same fused prompt kernels for the K-quant experts of Unsloth's UD-Q4_K_XL files (Q4_K / Q5_K gate/up, Q5_1 / Q8_0 down) instead of llama.cpp's MMQ.
+            // UD-Q4_K_XL (Flash-Next), expert cache budget 12000 (15,283 of 24,576 experts resident, so the box keeps over 16 GiB of its 121 GiB free), two starts a pair,
+            // against the FP16 prompt path's text, 48 real-text prompts (24 at 2,048 and 24 at 4,096 tokens, 256 forced tokens each, 12,288 positions): forced-token
+            // KL kq / MMQ 0.895 [0.808, 0.989] (0.864 [0.756, 0.976] at 2K, 0.928 [0.791, 1.088] at 4K), top-1 against the FP16 path's 96.31% / 95.74%, the same
+            // text twice byte for byte on both sides (repeat floor 0); prompt speed kq / MMQ, 10 interleaved pairs, median of the per-round ratios 1.10 / 1.26 / 1.18 / 1.53 at 2K / 4K / 8K / 20K (faster in 7 / 8 / 8 / 9 of 10; the rounds scatter 0.5 to 2.0)
+            // (phaseA-tests/par/RESULTS-SPARK-KQ.md).  STRATA_PF_FUSED_KQ=0 is the way back (a switch you set is kept); it is off with the rest of the table by STRATA_SM121_PERF=0.
+            {"STRATA_PF_FUSED_KQ", "1"},
             // NVFP4 prompt MMQ with FP4 activations (W4A4), the Blackwell path the engine keeps opt-in.  On this part, the
             // NVFP4 pack measured prompt 1.106x at 4K and 1.229x at 16K against the default W4A8 MMQ, decode unchanged
             // (1.015x), and 24 of 24 greedy answers byte-identical with it on and off.  Opt-in upstream because it is only
