@@ -6298,7 +6298,7 @@
    "last_date": "2026-10-12",
    "status": "research",
    "owner": "prefill",
-   "note": "[auto] diagnostic / trace / measurement switch by name or by code, not documented for users",
+   "note": "Research: the layer whose first-chunk MoE input STRATA_DUMP_MOE_INPUT writes; \"all\" writes every layer of the first chunk to <path>.L<layer> (the rows for the bench's --real mode).",
    "retire_after": "",
    "retired_in": ""
   },
