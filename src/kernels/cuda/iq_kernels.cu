@@ -6335,6 +6335,7 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
         case 21: i8_launch<21, true>(tm, a, s); break;
         case 23: i8_launch<23, true>(tm, a, s); break;
         case 29: i8_launch<29, true>(tm, a, s); break;
+        case 42: i8_launch<42, true>(tm, a, s); break;
         default: i8_launch<22, true>(tm, a, s); break;
     }
     check("native_expert_i8/gu");

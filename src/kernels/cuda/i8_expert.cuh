@@ -57,7 +57,7 @@ __host__ __device__ constexpr bool i8_two_scales(int t) { return t == 17 || t ==
 __host__ __device__ constexpr bool i8_unit_scale(int t) { return t == 20 || t == 42 || t == 6 || t == 8; }
 __host__ __device__ constexpr bool i8_wide_scale(int t) { return t == 23; }   // scale -32..31: |sum x scale| can pass 2^23, plain 32-bit multiply
 __host__ __device__ constexpr bool i8_sign_type(int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22; }
-__host__ __device__ constexpr bool i8_gu_type(int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 23 || t == 29; }
+__host__ __device__ constexpr bool i8_gu_type(int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42; }   // (42: the Q2_0 pack's gate/up)
 __host__ __device__ constexpr bool i8_d_type(int t) { return t == 20 || t == 42 || t == 6 || t == 8; }
 // raw words one thread loads for a sub-block, and the packed words the decode reads (Q8_0: the 8 code words and the scale)
 template <int T> constexpr int I8NR = T == 8 ? 9 : 6;
@@ -938,7 +938,7 @@ size_t i8_sm(int tm) {
 }
 size_t i8_smem_bytes(int gu, int dt, int tm) {
     const size_t a = gu == 16 ? i8_sm<16>(tm) : gu == 17 ? i8_sm<17>(tm) : gu == 18 ? i8_sm<18>(tm) : gu == 21 ? i8_sm<21>(tm) : gu == 23 ? i8_sm<23>(tm) :
-                     gu == 29 ? i8_sm<29>(tm) : i8_sm<22>(tm);
+                     gu == 29 ? i8_sm<29>(tm) : gu == 42 ? i8_sm<42>(tm) : i8_sm<22>(tm);
     const size_t b = dt == 20 ? i8_sm<20>(tm) : dt == 6 ? i8_sm<6>(tm) : dt == 8 ? i8_sm<8>(tm) : i8_sm<42>(tm);
     return a > b ? a : b;
 }

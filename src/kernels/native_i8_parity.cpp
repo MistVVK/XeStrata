@@ -304,8 +304,8 @@ int main() {
             check(gu, dt, 512, 256, s, rng);
             if (gu == 22 || dt == 42 || gu == 18) check(gu, dt, 2560, 640, s, rng);
         }
-    // second wave: gate/up IQ4_XS and IQ1_M, down Q5_0 and Q8_0 (after the first-wave rows, so those lines keep their place)
-    for (const auto& pr : std::vector<std::pair<int, int>>{{23, 20}, {23, 42}, {23, 6}, {29, 20}, {29, 42}, {29, 8}, {16, 6}, {21, 8}, {22, 6}, {22, 8}}) {
+    // second wave: gate/up IQ4_XS, IQ1_M and Q2_0, down Q5_0 and Q8_0 (after the first-wave rows, so those lines keep their place)
+    for (const auto& pr : std::vector<std::pair<int, int>>{{23, 20}, {23, 42}, {23, 6}, {29, 20}, {29, 42}, {29, 8}, {16, 6}, {21, 8}, {22, 6}, {22, 8}, {42, 42}, {42, 20}, {42, 6}}) {
         check(pr.first, pr.second, 512, 256, s, rng);
         check(pr.first, pr.second, 2560, 640, s, rng);
     }
