@@ -7,6 +7,7 @@
 #include "strata/core/run_manifest.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/prefill/pf_fused_override.hpp"
+#include "strata/prefill/staged_group_rule.hpp"
 #if defined(STRATA_HAVE_DFLASH2)
 #include "strata/kernels/dflash2.hpp"
 #endif
@@ -266,6 +267,19 @@ constexpr int STAGE = 8;           // host->device expert staging ring (chunks b
 // the group that read it was gathered (the walk stages at most STAGE_GRP - MMQ_GROUP - 1 entries ahead)
 constexpr int STAGE_GRP = 32;
 constexpr int kSplitHelpRing = 48;  // layer split help: the helper stage's ring slots it streams through (at most)
+// The staged walk's batched group entry (fz_staged below): on by default in a CUDA build, opt-in (STRATA_PF_FUSED=1) in a HIP build (owner 2026-11-12, "8 yes for
+// nvidia"; staged_group_rule.hpp).  The card's own fused rule (fused::native_supported) still has to take the layer's formats.
+inline bool staged_group_entry_on() {
+    static const bool on = [] {
+#if defined(STRATA_USE_HIP) || defined(__HIPCC__) || defined(STRATA_HIP_GFX906)
+        constexpr bool hip = true;
+#else
+        constexpr bool hip = false;
+#endif
+        return strata::prefill::staged_group_entry_default(hip, std::getenv("STRATA_PF_FUSED"));
+    }();
+    return on;
+}
 // STRATA_PREFILL_GROUP_GATHER (unset or not 0): the staged walk's resident groups (read again here for P4-SMALL's fused groups, which
 // need that staging: the same variable, the same answer)
 inline bool staged_group_gather() {
@@ -5346,7 +5360,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // STRATA_MMQ_DIRECT / _WS, the WMMA tiles, STRATA_PF_GROUP_SCRATCH, NVFP4 tails, Hadamard-folded or nibble layers.
                         const bool fz_staged = !stream_all && use_mmq && lay.native && !fused_l && !wmma_l && !had_gu && !had_d && rows_cpu == 0 &&
                                                on_peer.empty() && !m.pp && m.group_cap == 0 && !lay.fmt[(size_t) l].tail_off && ws::mode() == 0 &&
-                                               !(m.cache && mmq_plan().direct[(size_t) l]) && staged_group_gather() &&
+                                               !(m.cache && mmq_plan().direct[(size_t) l]) && staged_group_gather() && staged_group_entry_on() &&
                                                MMQ_GROUP <= mmq::kGatherGroupMax && MMQ_GROUP <= fused::kMaxBatch &&
 #if STRATA_EXPERT_NIBBLE_BUILT
                                                !nib_l.on &&
