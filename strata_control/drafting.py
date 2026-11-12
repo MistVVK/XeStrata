@@ -540,6 +540,32 @@ def gguf_facts(path: Any) -> dict[str, Any] | None:
     return facts if facts["arch"] else None
 
 
+#: The model_name setup writes for a set of each family (setup.py's family names): f"{name}-{model.lower()}". Coder, Swift and NVFP4 are left out on purpose (no DFlash2 numbers).
+_SET_NAME_PREFIX = {"qwen": "qwen3.8-flash-next", "unsloth": "qwen3.8-flash-next-unsloth", "gyro": "qwen3.8-flash-next-gyro"}
+_known_names: dict[tuple[str, int, int], str | None] = {}
+
+
+def known_name_of_file(args: list[Any]) -> str | None:
+    """The model_name setup would have written for the file in --native when its header is EXACTLY one set of data/gguf_fingerprints.json (strata_control/models.py known_set_by_header: tensor count,
+    payload bytes and expert formats over all shards; never the layout guess), so a renamed copy gets that set's table entry (tuned pack, confidence) as under its own name; None otherwise.
+    Read once per file, size and time (the tensor directory of every shard is read: about a second)."""
+    path = _flag_value(args, "--native")
+    if not path:
+        return None
+    try:
+        stat = Path(path).stat()
+        key = (str(path), stat.st_size, stat.st_mtime_ns)
+        if key not in _known_names:
+            from strata_control import models
+            found = models.known_set_by_header(path)
+            prefix = _SET_NAME_PREFIX.get(found.split("/", 1)[0]) if found else None
+            name = f"{prefix}-{found.split('/', 1)[1].lower()}" if prefix and found else None
+            _known_names[key] = name if name and supported_model(name) else None
+        return _known_names[key]
+    except Exception:                                  # noqa: BLE001 - not known is the general defaults
+        return None
+
+
 def pack_target(data_dir: str | Path | None = None) -> dict[str, Any]:
     """What the drafter pack on this computer says it was made for (``hidden``, ``vocab``, ``taps`` from its ``cfg`` lines), else PACK_TARGET."""
     want = dict(PACK_TARGET)
@@ -1437,7 +1463,7 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
         # the name is not one setup writes: what the FILE is decides (a renamed Flash-Next file, a hand-written config, a feed model under its own name); Coder, NVFP4 and Swift stay out by name
         fit = file_fit(args, data_dir) if family is None and not _EXCLUDED_NAME.search(str(name or "")) else ""
         if fit == "fits":
-            name = FILE_FITS_AS
+            name = known_name_of_file(args) or FILE_FITS_AS        # a file that is exactly a known set gets that set's table entry; any other the general defaults
     if not supported_model(name, family):                     # another model: its drafting is not this choice's business (Swift, Coder, NVFP4, Qwen3.6...)
         asked = normalize(cfg.get("drafting"))
         if asked == "off" or cfg.get("mtp") is False:            # no drafter for this model (its draft layer is off, or a feed model whose entry says drafter: none): say so, start none

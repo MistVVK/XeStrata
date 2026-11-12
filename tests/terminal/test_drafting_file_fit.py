@@ -3,6 +3,7 @@ vocabulary size) against what the DFlash2 drafter pack records. A renamed Qwen3.
 
 from __future__ import annotations
 
+import json
 import struct
 import tempfile
 import unittest
@@ -182,6 +183,82 @@ class ARenamedFileAtStart(unittest.TestCase):
             with mock.patch.object(drafting, "file_fit", side_effect=AssertionError("the family is the answer")):
                 self.assertEqual(drafting.apply(cfg, data_dir=data, family="qwen", backend="cuda", archs=["sm_120"]).drafter, "dflash2")
                 self.assertEqual(drafting.apply(dict(cfg), data_dir=data, family="coder", backend="cuda", archs=["sm_120"]).drafter, "mtp")
+
+
+class AKnownSetUnderAnotherName(unittest.TestCase):
+    """A renamed file that is EXACTLY one of data/gguf_fingerprints.json's sets (tensor count, payload bytes, expert formats over every shard) is treated under that set's own name, so it gets the set's table entry
+    (tuned pack, confidence); anything else keeps the general defaults. The layout guess (a fine-tune that only looks like a set) never counts."""
+
+    ROW = json.loads((ROOT / "data" / "gguf_fingerprints.json").read_text(encoding="utf-8"))["qwen/IQ3_S"]
+
+    def shards(self, tmp, names=("copy-00001-of-00002.gguf", "copy-00002-of-00002.gguf")):
+        for n in names:
+            (Path(tmp) / n).write_bytes(b"x")
+        return Path(tmp) / names[0]
+
+    def fake(self, tensors, payload, experts, arch="qwen4exp"):
+        """inspect_metadata of two shards: the totals are split between them."""
+        halves = iter(((tensors - tensors // 2, payload - payload // 2, experts), (tensors // 2, payload // 2, set())))
+
+        def inspect(path):
+            t, p, e = next(halves)
+            return {"architecture": arch, "expert_tensor_types": sorted(e), "tensor_count_scanned": t, "payload_bytes_required": p}
+        return mock.patch("strata_control.models.inspect_metadata", side_effect=inspect)
+
+    def test_the_header_of_a_set_names_it(self):
+        from strata_control import models
+        experts = set(self.ROW["expert_bytes"])
+        with tempfile.TemporaryDirectory() as tmp:
+            first = self.shards(tmp)
+            with self.fake(self.ROW["tensors"], self.ROW["bytes"], experts):
+                self.assertEqual(models.known_set_by_header(first), "qwen/IQ3_S")
+            with self.fake(self.ROW["tensors"], self.ROW["bytes"] + 1, experts):
+                self.assertIsNone(models.known_set_by_header(first), "one byte of payload more: not that set")
+            with self.fake(self.ROW["tensors"], self.ROW["bytes"], experts | {"Q8_0"}):
+                self.assertIsNone(models.known_set_by_header(first), "another expert format: not that set")
+            with self.fake(self.ROW["tensors"] - 1, self.ROW["bytes"], experts):
+                self.assertIsNone(models.known_set_by_header(first))
+            with self.fake(self.ROW["tensors"], self.ROW["bytes"], experts, arch="llama"):
+                self.assertIsNone(models.known_set_by_header(first))
+            with mock.patch.object(models, "_candidate_by_layout", side_effect=AssertionError("the layout guess is never used")), self.fake(self.ROW["tensors"], self.ROW["bytes"] // 2, experts):
+                self.assertIsNone(models.known_set_by_header(first), "a file with the layout of a set is not that set")
+            (Path(tmp) / "copy-00002-of-00002.gguf").unlink()
+            with self.fake(self.ROW["tensors"], self.ROW["bytes"], experts):
+                self.assertIsNone(models.known_set_by_header(first), "a shard missing")
+            with mock.patch("strata_control.models.inspect_metadata", side_effect=OSError("unreadable")):
+                self.assertIsNone(models.known_set_by_header(first))
+        self.assertIsNone(models.known_set_by_header("/no/such/file.gguf"))
+
+    def test_the_name_setup_would_have_written(self):
+        for found, want in (("qwen/IQ3_S", "qwen3.8-flash-next-iq3_s"), ("unsloth/UD-Q4_K_XL", "qwen3.8-flash-next-unsloth-ud-q4_k_xl"), ("gyro/Gyro-S", "qwen3.8-flash-next-gyro-gyro-s"),
+                            ("unsloth/UD-IQ4_XS-v31", "qwen3.8-flash-next-unsloth-ud-iq4_xs-v31"), ("coder/IQ1_M", None), ("swift/IQ3_S", None), (None, None)):
+            drafting._known_names.clear()
+            with tempfile.TemporaryDirectory() as tmp:
+                model = Path(tmp) / "m.gguf"
+                model.write_bytes(b"x")
+                with mock.patch("strata_control.models.known_set_by_header", return_value=found) as call:
+                    self.assertEqual(drafting.known_name_of_file(["--native", str(model)]), want, found)
+                    self.assertEqual(drafting.known_name_of_file(["--native", str(model)]), want)
+                    self.assertEqual(call.call_count, 1, "read once per file, size and time")
+        self.assertIsNone(drafting.known_name_of_file([]))
+        self.assertIsNone(drafting.known_name_of_file(["--native", "/no/such/file.gguf"]))
+
+    def test_a_renamed_known_set_is_decided_under_its_own_name_and_any_other_under_the_general_one(self):
+        for known, want in ("qwen3.8-flash-next-iq3_s", "qwen3.8-flash-next-iq3_s"), (None, drafting.FILE_FITS_AS):
+            with tempfile.TemporaryDirectory() as tmp:
+                cfg, data = ARenamedFileAtStart("test_a_renamed_flash_next_file_starts_dflash2_with_nothing_said").config(tmp, "my-copy", gguf_header(), "auto")
+                seen = []
+                real = drafting.tuned_applies
+                with mock.patch.object(drafting, "known_name_of_file", return_value=known),                         mock.patch.object(drafting, "tuned_applies", side_effect=lambda backend, name, *a, **k: (seen.append(name), real(backend, name, *a, **k))[1]):
+                    decision = drafting.apply(cfg, data_dir=data, backend="cuda", archs=["sm_120"], vram_mib=73728)
+                self.assertEqual((decision.drafter, decision.note), ("dflash2", ""))
+                self.assertEqual(seen, [want])
+
+    def test_a_name_setup_wrote_never_reads_the_file_for_its_set(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg, data = ARenamedFileAtStart("test_a_renamed_flash_next_file_starts_dflash2_with_nothing_said").config(tmp, "qwen3.8-flash-next-iq3_s", gguf_header())
+            with mock.patch.object(drafting, "known_name_of_file", side_effect=AssertionError("not read")):
+                self.assertEqual(drafting.apply(cfg, data_dir=data, backend="cuda", archs=["sm_120"]).drafter, "dflash2")
 
 
 if __name__ == "__main__":

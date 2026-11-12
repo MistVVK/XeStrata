@@ -307,6 +307,37 @@ def _candidate_by_header(shards: list[Path], tensors: int, payload: int, experts
     return None
 
 
+def known_set_by_header(first_shard: Any) -> str | None:
+    """``family/model`` (``qwen/IQ3_S``, ``unsloth/UD-Q4_K_XL``) of the file set that starts at ``first_shard`` when its header is EXACTLY one row of data/gguf_fingerprints.json: the same tensor count,
+    the same payload size and the same expert formats over every shard (the other shards are found beside the first by their ``-00001-of-0000N`` names). Never the layout guess of
+    ``_candidate_by_layout``. None: no exact match, a shard missing, or a file that cannot be read."""
+    try:
+        path = Path(first_shard)
+        match = SHARD.match(path.name)
+        if match:
+            total = int(match.group(3))
+            if not 1 <= total <= MAX_IMPORT_SHARDS:
+                return None
+            shards = [path.with_name(f"{match.group(1)}-{i:05d}-of-{total:05d}.gguf") for i in range(1, total + 1)]
+            if not all(p.is_file() for p in shards):
+                return None
+        else:
+            shards = [path]
+        tensors = payload = 0
+        experts: set[str] = set()
+        for item in shards:
+            inspected = inspect_metadata(item)
+            if inspected["architecture"] != "qwen4exp":
+                return None
+            experts.update(inspected["expert_tensor_types"])
+            tensors += inspected["tensor_count_scanned"]
+            payload += int(inspected.get("payload_bytes_required") or 0)
+        found = _candidate_by_header(shards, tensors, payload, experts)
+        return f"{found['family']}/{found['model']}" if found else None
+    except Exception:                         # noqa: BLE001 - a file that cannot be judged is not matched
+        return None
+
+
 def _candidate_by_layout(shards: list[Path], tensors: int, payload: int, experts: set[str]) -> dict | None:
     """A qwen4exp file set that is no build Strata has tested (a fine-tune, a K-quant mix from another maker) but has the layout of one
     (#3651 #3777): the closest row by expert formats, then by size. Strata uses the files as that model and says so; it never refuses a
