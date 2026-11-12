@@ -28,6 +28,7 @@ import mmap
 import os
 import re
 import struct
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -785,6 +786,7 @@ class Decision:
     drafter: str                 # what the engine is started with: mtp | dflash2 | off
     note: str = ""               # plain words when the choice could not be applied; "" otherwise
     flags: tuple[str, ...] = ()  # engine flags added
+    vocab: str = ""              # log line (not shown to the person): which draft vocabulary file a DFlash2 start uses and why; "" for the other drafters
 
 
 def normalize(value: Any) -> str:
@@ -980,7 +982,7 @@ VOCAB_NAME = "draft_vocab.bin"
 
 
 #: The subsets a person can choose in setup (``--draft-vocab``), by name: the files Strata ships in data/ (setup.DRAFT_VOCABS names the same ones).
-VOCAB_FILES = {"cjk": VOCAB_NAME, "en": "draft_vocab_en.bin", "cyrillic": "draft_vocab_cyrillic.bin", "fr": "draft_vocab_fr.bin"}
+VOCAB_FILES = {"cjk": VOCAB_NAME, "en": "draft_vocab_en.bin", "cyrillic": "draft_vocab_cyrillic.bin", "fr": "draft_vocab_fr.bin", "latin": "draft_vocab_latin.bin"}
 #: The sha256 of the 27-Han-token subset up to 0.1.26 (setup.OLD_DRAFT_VOCABS): a copy that is any shipped subset may be replaced by the person's later choice, a made-by-hand one never.
 OLD_VOCAB_SHA256 = {"369151522226a5edaa5f12cfd1e2ae7db8f4fbdbd222f3dcf327dced9597fb25"}
 
@@ -988,6 +990,201 @@ OLD_VOCAB_SHA256 = {"369151522226a5edaa5f12cfd1e2ae7db8f4fbdbd222f3dcf327dced959
 def shipped_vocab(choice: str | None = None) -> Path:
     """The draft vocabulary Strata ships with (``data/draft_vocab.bin``, also in the packaged Control), or the shipped subset named ``choice`` (cjk, en, cyrillic, fr)."""
     return Path(__file__).resolve().parents[1] / "data" / VOCAB_FILES.get(choice or "cjk", VOCAB_NAME)
+
+
+# --------------------------------------------------------------------------------------------------- the vocabulary by the computer's language
+#
+# DFlash2 proposes tokens only from the draft vocabulary. The default one (cjk) holds English, code and every Chinese / Japanese / Korean token and misses 46% of the tokens of a Russian answer
+# and 20-26% of German, Spanish, French and Polish ones. Measured on l620 (RESULTS-DRAFT-VOCAB.md): `cyrillic` gives Russian +26%, `latin` (English + the tokens of de / es / fr / pl text) +8 to +12%
+# on those four, both within 0.3% of the default on English and code; either file costs 12-16% on Chinese and Japanese. So with no choice saved, the file follows the computer's languages, and
+# anything that could mean Chinese, Japanese or Korean keeps the default (the costs are lopsided: the wrong file on CJK text costs far more than the right one gains elsewhere).
+
+#: Language codes by the script their text is written in (the ones the vocabulary files cover: Cyrillic, and the Latin script beyond English). Anything else (English, Arabic, Hebrew, Hindi, Thai,
+#: Greek...) says nothing.
+_CJK_LANGS = frozenset("zh ja ko yue cmn wuu hak nan gan lzh".split())
+_CYRILLIC_LANGS = frozenset("ru uk be bg mk sr kk ky tg mn tt ba cv ce os sah ab av kv udm".split())
+_LATIN_LANGS = frozenset(("de fr es pt it nl pl cs sk sl hr bs ro hu sv da nb nn no fi et lv lt tr vi id ms ca gl eu af sq is ga cy mt fil tl sw "
+                          "lb fo gd br oc rm eo la uz az tk hsb dsb ast an co fy sc se smn nds wa ln zu xh st tn yo ig ha so mg haw mi sm to").split())
+_CJK_SCRIPTS = frozenset("hans hant hani jpan kore hang hira kana bopo".split())
+
+
+def script_of_language(tag: Any) -> str:
+    """The script group a language tag (``ru-RU``, ``sr-Latn-RS``, ``de_DE.UTF-8``, ``sr_RS@latin``, ``zh-Hans``) says: ``cjk``, ``cyrillic``, ``latin`` (a Latin-script language other than English) or ``""`` (English, another
+    script, ``C`` / ``POSIX``, nothing readable)."""
+    text = str(tag or "").strip()
+    if not text:
+        return ""
+    low = text.lower()
+    if low in ("c", "posix") or low.startswith(("c.", "posix.")):
+        return ""
+    modifier = ""
+    if "@" in low:
+        low, modifier = low.split("@", 1)
+    low = low.split(".", 1)[0]
+    parts = [p for p in low.replace("_", "-").split("-") if p]
+    if not parts:
+        return ""
+    lang, scripts = parts[0], parts[1:]
+    if any(p in _CJK_SCRIPTS for p in scripts) or lang in _CJK_LANGS:
+        return "cjk"
+    if "cyrl" in scripts or modifier == "cyrillic":
+        return "cyrillic"
+    if "latn" in scripts or modifier == "latin":
+        return "" if lang == "en" else "latin"
+    if lang in _CYRILLIC_LANGS:
+        return "cyrillic"
+    if lang in _LATIN_LANGS:
+        return "latin"
+    return ""
+
+
+def vocab_for_languages(ui: Any = (), region: Any = (), keyboards: Any = ()) -> tuple[str, str]:
+    """(choice, language): the draft vocabulary for the computer's language signals, ``cjk`` (the default file) or ``cyrillic`` or ``latin``, and the language that decided ("" for the default). Each argument is a list of
+    language tags: ``ui`` the display / interface languages, ``region`` the regional format (user locale), ``keyboards`` the installed keyboard-layout languages.
+      any Chinese, Japanese or Korean signal anywhere -> the default;
+      else a Cyrillic signal, or a Latin-script non-English signal, picks that file; when both kinds are present the first one in the UI languages wins, then the regional format, then the keyboards;
+      no signal at all, English only, ``C`` / ``POSIX``, other scripts -> the default."""
+    groups = [[(script_of_language(t), str(t)) for t in (g or ())] for g in (ui, region, keyboards)]
+    seen = {s for g in groups for s, _ in g if s}
+    if not seen or "cjk" in seen:
+        return "cjk", ""
+    for g in groups:
+        for script, tag in g:
+            if script:
+                return script, tag.replace("_", "-").split(".", 1)[0].split("@", 1)[0].split("-", 1)[0].lower()
+    return "cjk", ""
+
+
+def _windows_names(call) -> list[str]:
+    try:
+        return [x for x in call() if x]
+    except Exception:                        # noqa: BLE001 - a signal that cannot be read says nothing
+        return []
+
+
+def os_language_signals(env: Any = None, system: str | None = None) -> dict[str, list[str]]:
+    """Every language signal this computer gives cheaply and locally: ``ui``, ``region``, ``keyboards`` (lists of tags). Linux and anywhere an environment is set: LANGUAGE, LC_ALL, LC_MESSAGES, LANG (display) and
+    LC_CTYPE, LC_TIME, LC_NUMERIC, LC_MONETARY (regional); Windows: the preferred UI languages, the user locale and the installed keyboard layouts (kernel32 / user32 through ctypes); the Mac: the preferred
+    languages and the locale from the user's global preferences file. A read that fails gives nothing for that signal; there is no waiting and no network."""
+    import platform
+    env = os.environ if env is None else env
+    system = system or platform.system()
+    ui: list[str] = []
+    region: list[str] = []
+    keyboards: list[str] = []
+    try:
+        ui += [x for x in str(env.get("LANGUAGE", "")).split(":") if x]
+        ui += [str(env.get(k, "")) for k in ("LC_ALL", "LC_MESSAGES", "LANG") if env.get(k)]
+        region += [str(env.get(k, "")) for k in ("LC_CTYPE", "LC_TIME", "LC_NUMERIC", "LC_MONETARY") if env.get(k)]
+    except Exception:                        # noqa: BLE001
+        pass
+    if system == "Windows":
+        ui_w, region_w, kb_w = _windows_languages()
+        ui, region, keyboards = ui_w + ui, region_w + region, kb_w
+    elif system == "Darwin":
+        try:
+            import plistlib
+            with open(Path.home() / "Library" / "Preferences" / ".GlobalPreferences.plist", "rb") as fh:
+                prefs = plistlib.load(fh)
+            ui = [str(x) for x in prefs.get("AppleLanguages") or []] + ui
+            if prefs.get("AppleLocale"):
+                region = [str(prefs["AppleLocale"])] + region
+        except Exception:                    # noqa: BLE001
+            pass
+    return {"ui": ui, "region": region, "keyboards": keyboards}
+
+
+def computer_language_signals() -> dict[str, list[str]]:
+    """The signals of THIS computer (os_language_signals with its own environment); the one name the tests replace so that no result depends on the language of the box that runs them."""
+    return os_language_signals()
+
+
+def _windows_languages() -> tuple[list[str], list[str], list[str]]:
+    """(UI languages, user locale, keyboard-layout languages) as locale names on Windows, each read on its own so one failure leaves the others."""
+    ui: list[str] = []
+    region: list[str] = []
+    keyboards: list[str] = []
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+    except Exception:                        # noqa: BLE001
+        return ui, region, keyboards
+
+    def locale_name(langid: int) -> str:
+        buf = ctypes.create_unicode_buffer(85)
+        return buf.value if k32.LCIDToLocaleName(langid & 0xFFFF, buf, 85, 0) > 0 else ""
+
+    try:
+        count = wintypes.ULONG(0)
+        size = wintypes.ULONG(0)
+        if k32.GetUserPreferredUILanguages(0x8, ctypes.byref(count), None, ctypes.byref(size)) and size.value:
+            raw = ctypes.create_unicode_buffer(size.value)
+            if k32.GetUserPreferredUILanguages(0x8, ctypes.byref(count), raw, ctypes.byref(size)):
+                ui = [x for x in ctypes.wstring_at(ctypes.addressof(raw), size.value).split("\x00") if x]
+    except Exception:                        # noqa: BLE001
+        pass
+    if not ui:
+        try:
+            ui = [x for x in (locale_name(k32.GetUserDefaultUILanguage()),) if x]
+        except Exception:                    # noqa: BLE001
+            pass
+    try:
+        buf = ctypes.create_unicode_buffer(85)
+        if k32.GetUserDefaultLocaleName(buf, 85) > 0 and buf.value:
+            region = [buf.value]
+    except Exception:                        # noqa: BLE001
+        pass
+    try:
+        u32 = ctypes.windll.user32
+        u32.GetKeyboardLayoutList.restype = ctypes.c_int
+        n = u32.GetKeyboardLayoutList(0, None)
+        if 0 < n <= 64:
+            layouts = (ctypes.c_void_p * n)()
+            got = u32.GetKeyboardLayoutList(n, layouts)
+            keyboards = [x for x in (locale_name(int(layouts[i] or 0) & 0xFFFF) for i in range(max(0, got))) if x]
+    except Exception:                        # noqa: BLE001
+        pass
+    return ui, region, keyboards
+
+
+def vocab_ids_fit(path: Path, n_vocab: int | None = None) -> bool:
+    """Is this file a draft vocabulary of the model's tokenizer: whole int32 ids, none below zero or past the vocabulary (the drafter pack's own vocabulary size, 248,320 for Qwen3.8-Flash-Next)?"""
+    import array
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return False
+    if not data or len(data) % 4:
+        return False
+    ids = array.array("i")
+    ids.frombytes(data)
+    if sys.byteorder == "big":
+        ids.byteswap()
+    return min(ids) >= 0 and max(ids) < (n_vocab or PACK_TARGET["vocab"])
+
+
+def auto_vocab(cfg: dict, args: list[str], current: Path | None, form: str | None, data_dir: str | Path | None = None,
+               signals: dict[str, list[str]] | None = None) -> tuple[Path | None, str]:
+    """(file, line) for a DFlash2 start: the draft vocabulary file and one log line saying which and why. The person's own choice always wins and is kept as it was: ``draft_vocab`` saved in the run config (setup
+    ``--draft-vocab``, also when it is the default one) or ``--mtp-draft-vocab`` in the arguments. Otherwise the file follows the computer's languages (vocab_for_languages) when the engine takes the file by name
+    (FORM_FILE, or an engine nobody can tell: the usual form), the shipped file is here and fits this model's vocabulary; anything else is today's default, said nothing about. Nothing is written to the config: it is worked out at every start."""
+    name = lambda p: Path(p).name if p else "none"       # noqa: E731
+    saved = cfg.get("draft_vocab")
+    if saved or _flag_value(args, "--mtp-draft-vocab") or _flag_value(cfg.get("user_args") or [], "--mtp-draft-vocab"):
+        return current, f"draft vocabulary: {name(current)} (set by you)"
+    if form not in (None, FORM_FILE) or current is None:           # (None: the engine program is not known: the usual form, the file by name)
+        return current, f"draft vocabulary: {name(current)} (the default)"
+    try:
+        sig = signals if signals is not None else computer_language_signals()
+        choice, language = vocab_for_languages(sig.get("ui"), sig.get("region"), sig.get("keyboards"))
+    except Exception:                        # noqa: BLE001 - no answer means the default
+        choice, language = "cjk", ""
+    if choice != "cjk":
+        picked = shipped_vocab(choice)
+        if picked.is_file() and vocab_ids_fit(picked, pack_target(data_dir)["vocab"]):
+            return picked, f"draft vocabulary: {picked.name} (by this computer's language: {language})"
+    return current, f"draft vocabulary: {name(current)} (the default)"
 
 
 def _sha256(path: Path) -> str:
@@ -1281,6 +1478,8 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
             cfg["mtp"] = True                                 # an explicit drafter choice overrides an older "mtp": false
     else:
         base = strip_mtp_flags(strip_draft_flags(args))
+        vocab, vocab_line = auto_vocab(cfg, args, vocab, form, data_dir)         # the person's own choice, else the computer's language, else the default
+        decision.vocab = vocab_line
         flags = list(engine_flags(pack, vocab, form))
         kept_conf = _flag_value(mine, "--draft-conf")
         tuned_conf = tuned_conf_for(backend, name) if Path(pack) == tuned_path(data_dir, tuned_variant(backend, name)) else None     # Metal: the conf the tuned pack was measured with; CUDA / HIP: None, the backend's own conf stays
