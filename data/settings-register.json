@@ -25669,7 +25669,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 291,
+     "line": 384,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -25688,9 +25688,9 @@
    "since": "",
    "last_commit": "",
    "last_date": "",
-   "status": "research",
+   "status": "rollback",
    "owner": "prefill",
-   "note": "[research] STRATA_PF_STAGED_FO=1: a prompt chunk below the long-prompt floor runs the routed experts of a layer that has no MMQ tile but that the fused kernels cover (UD-Q4_K_XL on gfx1151 without STRATA_MMQ_KQ; every layer of a build without llama.cpp's MMQ) on the staged group entry (fused kernels, routed experts only) instead of the dequantize + FP16 GEMM path. Off unless set. src/prefill/prefill.cpp staged_fo_on, include/strata/prefill/staged_fo_rule.hpp.",
+   "note": "[reviewed] The staged walk's fused group entry for a layer that has no MMQ tile but that the fused kernels cover (UD-Q4_K_XL on gfx1151 without STRATA_MMQ_KQ; every layer of a build without llama.cpp's MMQ): a prompt chunk below the long-prompt floor runs its routed experts on the fused kernels, streaming only the routed ones, instead of the dequantize + FP16 GEMM path. Unset: on for Windows gfx1151 with a layer set that has no MMQ tile and the fused kernels on every layer; off elsewhere. =1 asks for it on any card (research), =0 turns it off (the long-prompt path from 64 tokens on that class). src/prefill/prefill.cpp staged_fo_on, include/strata/prefill/staged_fo_rule.hpp.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -29356,7 +29356,7 @@
    "last_date": "2026-10-14",
    "status": "rollback",
    "owner": "prefill",
-   "note": "[reviewed] The chunk size from which a prompt chunk takes the long-prompt path (1,024 by default). Unset, Windows gfx1151 with a layer set that has no MMQ tile and the fused kernels on every layer (UD-Q4_K_XL) uses 64 (src/prefill/prefill.cpp default_stream_floor, include/strata/prefill/stream_floor_rule.hpp); STRATA_PREFILL_STREAM_MIN=1024 restores the old rule on it. Any value set replaces the floor everywhere. [docs/STRIX_HALO.md:156]",
+   "note": "[reviewed] The chunk size from which a prompt chunk takes the long-prompt path (1,024 by default). On Windows gfx1151 with a layer set that has no MMQ tile and the fused kernels on every layer (UD-Q4_K_XL) the staged walk has a fused entry (STRATA_PF_STAGED_FO, on by default there) and the floor stays 1,024; with STRATA_PF_STAGED_FO=0 that class uses 64 (src/prefill/prefill.cpp default_stream_floor, include/strata/prefill/stream_floor_rule.hpp). STRATA_PREFILL_STREAM_MIN=1024 restores the old rule. Any value set replaces the floor everywhere. [docs/STRIX_HALO.md:156]",
    "retire_after": "",
    "retired_in": ""
   },

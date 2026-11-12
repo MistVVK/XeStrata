@@ -285,12 +285,6 @@ inline bool staged_group_entry_on() {
     }();
     return on;
 }
-// STRATA_PF_STAGED_FO=1 (research, off unless set; staged_fo_rule.hpp): the staged walk's group entry (fz_staged) also takes a layer with no MMQ tile that the fused kernels
-// cover (mmq_plan().fo), routed experts only, so a prompt chunk below the long-prompt floor does not run each routed expert on the dequantize + FP16 GEMM path.
-inline bool staged_fo_on() {
-    static const bool on = strata::prefill::staged_fo_switch(std::getenv("STRATA_PF_STAGED_FO"));
-    return on;
-}
 // STRATA_PREFILL_GROUP_GATHER (unset or not 0): the staged walk's resident groups (read again here for P4-SMALL's fused groups, which
 // need that staging: the same variable, the same answer)
 inline bool staged_group_gather() {
@@ -343,7 +337,7 @@ constexpr int64_t kStreamAllMinDefault = 1024;   // the default above (and the C
 int64_t g_stream_min_share = 0;
 // A layer set in which EVERY layer has no MMQ tile for its formats and the fused kernels take it (UD-Q4_K_XL's Q4_K / Q5_K gate/up with a Q5_1 / Q8_0 down: STRATA_MMQ_KQ is
 // opt-in, so mmq::fits is false; the same test mmq_plan() makes, p.fo).  Its chunks below the floor take the staged walk, which has no fused entry for such a layer
-// (fz_staged needs use_mmq, or the research switch STRATA_PF_STAGED_FO=1) and runs every routed expert on the dequantize-to-FP16 path: about 1.6 s a prompt whatever its length (stream_floor_rule.hpp).
+// (fz_staged needs use_mmq, or the staged entry for fused-only layers: STRATA_PF_STAGED_FO, on by default on the class below) and without it runs every routed expert on the dequantize-to-FP16 path: about 1.6 s a prompt whatever its length (stream_floor_rule.hpp).
 inline bool layers_all_fused_only() {
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (!lay.native || lay.fmt.empty()) return false;
@@ -379,6 +373,22 @@ inline bool stream_floor_class_measured() {
     return false;
 #endif
 }
+// The staged walk's group entry (fz_staged) also takes a layer with no MMQ tile that the fused kernels cover (mmq_plan().fo), routed experts only, so a prompt chunk below the long-prompt
+// floor does not run each routed expert on the dequantize + FP16 GEMM path (staged_fo_rule.hpp).  STRATA_PF_STAGED_FO=1 asks for it on any card (research), 0 turns it off; unset: on where it was
+// measured (Windows gfx1151 with a layer set that is fused-only on every layer, and the entry's own prerequisites: the staged walk's resident-group gather and its group entry).  Decided once when
+// the expert layout is known (a call before that answers from the variable alone and is not cached).
+inline bool staged_fo_on() {
+    static std::atomic<int> cached{-1};
+    const int c = cached.load(std::memory_order_acquire);
+    if (c >= 0) return c == 1;
+    const char* env = std::getenv("STRATA_PF_STAGED_FO");
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || lay.fmt.empty()) return strata::prefill::staged_fo_switch(env);
+    const bool cls = stream_floor_class_measured();
+    const bool v = strata::prefill::staged_fo_decide(env, cls && layers_all_fused_only() && staged_group_gather() && staged_group_entry_on());
+    cached.store(v ? 1 : 0, std::memory_order_release);
+    return v;
+}
 // The floor without STRATA_PREFILL_STREAM_MIN and the CPU share: stream_floor_rule.hpp's answer, decided once when the expert layout is known (a call before that gets the default and is not cached).
 inline int64_t default_stream_floor() {
     static std::atomic<int64_t> cached{-1};
@@ -387,7 +397,7 @@ inline int64_t default_stream_floor() {
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (!lay.native || lay.fmt.empty()) return strata::prefill::kStreamFloorDefault;
     const bool cls = stream_floor_class_measured();
-    const int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only());
+    const int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only(), staged_fo_on());
     cached.store(v, std::memory_order_release);
     if (v != strata::prefill::kStreamFloorDefault)
         std::fprintf(stderr, "prefill: prompt pieces of %lld tokens or more read on the fused kernels, as long prompts do. STRATA_PREFILL_STREAM_MIN=1024 keeps the old rule.\n", (long long) v);
@@ -5485,17 +5495,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const float* xsrc = m.mixed;
                         if (fz_staged) {
                             fz_staged_l = true;
-                            if (!use_mmq) {   // a fused-only layer (STRATA_PF_STAGED_FO=1): said once
+                            if (!use_mmq) {   // a fused-only layer (the class default, or STRATA_PF_STAGED_FO=1): said once
                                 static bool said_fo = false;
                                 if (!said_fo) {
                                     said_fo = true;
                                     std::fprintf(stderr, "strata prefill: a layer with no MMQ tile reads prompt pieces below %lld tokens on the fused kernels' staged group "
-                                                         "entry, routed experts only (STRATA_PF_STAGED_FO=1)\n", (long long) stream_all_min());
+                                                         "entry, routed experts only. STRATA_PF_STAGED_FO=0 keeps the old rule.\n", (long long) stream_all_min());
                                 }
                             }
                             fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
                         }
-                        if (use_mmq || fz_staged) {   // (fz_staged without use_mmq: a fused-only layer behind STRATA_PF_STAGED_FO=1, staged_fo_rule.hpp; the block builds the group bounds)
+                        if (use_mmq || fz_staged) {   // (fz_staged without use_mmq: a fused-only layer with the entry on (staged_fo_on(), staged_fo_rule.hpp); the block builds the group bounds)
                             // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed` (APR:
                             // from its rotated copy `Xr`): each token quantized once and written to its K rows
                             // (slot_dev, the inverse of src_dev).
