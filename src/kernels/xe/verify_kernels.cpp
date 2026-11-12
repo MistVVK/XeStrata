@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 namespace strata::kernels {
@@ -68,14 +69,14 @@ inline uint32_t read_host(const uint32_t* p) {
 
 }  // namespace
 
-void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels,
-                       int qk_heads, float eps, int n_tok, void* stream, int t_begin, bool commit) {
-    if (!history || !qkv || !conv_w || !h || channels % S != 0 || n_tok < 1 || n_tok > kVerifyMaxT ||
-        (commit && (n_tok != 1 || t_begin != 0)))
-        fail("gdn_conv_l2_multi: invalid arguments");
-    float* hist_out = commit ? const_cast<float*>(history) : nullptr;   // a work-item reads and writes its channel only
-    const int C = channels;
-    const auto e = Q(stream).submit([&](sycl::handler& hd) {
+namespace {
+// COPIES: the rows' histories also to cp (the plain engine's drafts); its own instance, so the verify window's kernel
+// is the one it was
+template <bool COPIES>
+sycl::event gdn_conv_l2_launch(sycl::queue& q, const float* history, const float* qkv, const float* conv_w, float* h,
+                               int C, int qk_heads, float eps, int n_tok, int t_begin, float* hist_out,
+                               const GdnRowCopies cp) {
+    return q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> part(sycl::range<1>(S / WARP), hd);
         hd.parallel_for(sycl::nd_range<2>({(size_t) n_tok, (size_t) C}, {1, S}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
@@ -105,8 +106,31 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
                 ho[1] = v2;
                 ho[2] = x;
             }
+            if constexpr (COPIES)
+                if (t < cp.n && cp.p[t] != nullptr) {   // the history after token t, beside the window's own
+                    float* ho = cp.p[t] + (size_t) c * 3;
+                    ho[0] = v1;
+                    ho[1] = v2;
+                    ho[2] = x;
+                }
         });
     });
+}
+}  // namespace
+
+void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv_w, float* h, int channels,
+                       int qk_heads, float eps, int n_tok, void* stream, int t_begin, bool commit,
+                       const GdnRowCopies* copies) {
+    if (!history || !qkv || !conv_w || !h || channels % S != 0 || n_tok < 1 || n_tok > kVerifyMaxT ||
+        (commit && (n_tok != 1 || t_begin != 0)))
+        fail("gdn_conv_l2_multi: invalid arguments");
+    float* hist_out = commit ? const_cast<float*>(history) : nullptr;   // a work-item reads and writes its channel only
+    auto& q = Q(stream);
+    const auto e = copies != nullptr && copies->n > 0
+                       ? gdn_conv_l2_launch<true>(q, history, qkv, conv_w, h, channels, qk_heads, eps, n_tok, t_begin,
+                                                  hist_out, *copies)
+                       : gdn_conv_l2_launch<false>(q, history, qkv, conv_w, h, channels, qk_heads, eps, n_tok, t_begin,
+                                                   hist_out, GdnRowCopies{});
     done(stream, e, "gdn_conv_l2_multi");
 }
 
@@ -155,8 +179,8 @@ void gdn_conv_commit_layers(float* hist0, int64_t hist_stride, const float* qkv0
 namespace {
 // gdn_ab_multi for at most MAX_T tokens; EXACT: exactly MAX_T (the token loop fixed at compile time, upstream ae3b249f).
 // A lane unpacks its eight BF16 weights once for all tokens; the FMA order is the same as before.
-template <int MAX_T, bool EXACT>
-sycl::event gdn_ab_launch(sycl::queue& q, const float* x, const uint16_t* w_alpha, const uint16_t* w_beta,
+template <int MAX_T, bool EXACT, typename WT>
+sycl::event gdn_ab_launch(sycl::queue& q, const float* x, const WT* w_alpha, const WT* w_beta,
                           const float* dt, const float* ssm_a, float* gate, float* beta, int n, int h_v, int T_arg) {
     const size_t groups = (size_t) ((2 * h_v + 7) / 8);
     return q.parallel_for(sycl::nd_range<1>(groups * 256, 256), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
@@ -167,17 +191,23 @@ sycl::event gdn_ab_launch(sycl::queue& q, const float* x, const uint16_t* w_alph
         if (row >= 2 * h_v) return;   // uniform over the sub-group
         const bool is_beta = row >= h_v;
         const int r = is_beta ? row - h_v : row;
-        const uint32_t* w = reinterpret_cast<const uint32_t*>((is_beta ? w_beta : w_alpha) + (size_t) r * n);
+        const WT* wr = (is_beta ? w_beta : w_alpha) + (size_t) r * n;
         auto lo = [](uint32_t u) { return sycl::bit_cast<float>(u << 16); };
         auto hi = [](uint32_t u) { return sycl::bit_cast<float>(u & 0xffff0000u); };
         float acc[MAX_T];
         #pragma unroll
         for (int t = 0; t < MAX_T; ++t) acc[t] = 0.0f;
         for (int j = lane; j < n / 8; j += 32) {
-            const uint32_t* wj = w + (size_t) j * 4;
-            const uint32_t u0 = wj[0], u1 = wj[1], u2 = wj[2], u3 = wj[3];
-            const float w0 = lo(u0), w1 = hi(u0), w2 = lo(u1), w3 = hi(u1);
-            const float w4 = lo(u2), w5 = hi(u2), w6 = lo(u3), w7 = hi(u3);
+            float w0, w1, w2, w3, w4, w5, w6, w7;
+            if constexpr (std::is_same_v<WT, float>) {   // F32 weights (widened as the plain engine loads them)
+                const float* wj = wr + (size_t) j * 8;
+                w0 = wj[0]; w1 = wj[1]; w2 = wj[2]; w3 = wj[3]; w4 = wj[4]; w5 = wj[5]; w6 = wj[6]; w7 = wj[7];
+            } else {
+                const uint32_t* wj = reinterpret_cast<const uint32_t*>(wr) + (size_t) j * 4;
+                const uint32_t u0 = wj[0], u1 = wj[1], u2 = wj[2], u3 = wj[3];
+                w0 = lo(u0); w1 = hi(u0); w2 = lo(u1); w3 = hi(u1);
+                w4 = lo(u2); w5 = hi(u2); w6 = lo(u3); w7 = hi(u3);
+            }
             #pragma unroll
             for (int t = 0; t < MAX_T; ++t) {
                 if (!EXACT && t >= T) break;
@@ -207,8 +237,10 @@ sycl::event gdn_ab_launch(sycl::queue& q, const float* x, const uint16_t* w_alph
 }
 }  // namespace
 
-void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
-                  float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream) {
+namespace {
+template <typename WT>
+void gdn_ab_run(const float* x, const WT* w_alpha, const WT* w_beta, const float* dt, const float* ssm_a, float* gate,
+                float* beta, int n_embd, int h_v, int n_tok, void* stream) {
     if (n_embd % 8 != 0 || n_tok < 1 || n_tok > kVerifyMaxT) fail("gdn_ab_multi: invalid arguments");
     auto& q = Q(stream);
     sycl::event e;
@@ -223,6 +255,17 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
     }
     done(stream, e, "gdn_ab_multi");
 }
+}  // namespace
+
+void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_beta, const float* dt, const float* ssm_a,
+                  float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream) {
+    gdn_ab_run(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok, stream);
+}
+
+void gdn_ab_multi(const float* x, const float* w_alpha, const float* w_beta, const float* dt, const float* ssm_a,
+                  float* gate, float* beta, int n_embd, int h_v, int n_tok, void* stream) {
+    gdn_ab_run(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok, stream);
+}
 
 namespace {
 // upstream e3c3d6ba: the recurrence with each head's 128 state columns over 4 work-groups of 32
@@ -231,10 +274,14 @@ namespace {
 // a head's 128 columns, follows in a second kernel: this one leaves the unnormalized output in y, and the norm sums
 // the squares by the same sub-groups (columns 32w .. 32w+31, the same butterfly) in the same order.
 constexpr int GS_COLS = 32;
-template <bool Q8>
+// SNAP: the state after each of the first sn.n tokens also to sn.p[t] (the plain engine's drafts); its own instance, so
+// the forms the verify window takes keep their registers (a copy in the prefetch form took the RTX 4070's 512
+// work-items past the registers it has).
+template <bool Q8, bool SNAP = false>
 sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
                            const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
-                           const int32_t* n_keep, int t_out_begin, uint8_t* y_q8_1) {
+                           const int32_t* n_keep, int t_out_begin, uint8_t* y_q8_1,
+                           const GdnRowCopies sn) {
     q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
             red(sycl::range<1>((size_t) RG * GS_COLS), hd);
@@ -270,6 +317,12 @@ sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int 
                     s[r] = sycl::fma(g, s[r], sk[rg * RPG + r] * delta);
                     o = sycl::fma(s[r], sq[rg * RPG + r], o);
                 }
+                if constexpr (SNAP)
+                    if (t < sn.n && sn.p[t] != nullptr) {   // the state after token t, to go back to
+                        float* d = sn.p[t] + (base - state);
+                        #pragma unroll
+                        for (int r = 0; r < RPG; ++r) d[r * row_stride] = s[r];
+                    }
                 sycl::group_barrier(it.get_group());
                 red[rg * GS_COLS + lc] = o;
                 sycl::group_barrier(it.get_group());
@@ -550,11 +603,19 @@ int gdn_forced() {   // STRATA_GDN_STEP=0|1|2: one form always (one group a head
 }
 sycl::event gdn_step_form(int form, sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
                            const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
-                           const int32_t* n_keep, int t_out_begin, uint8_t* y_q8_1) {
+                           const int32_t* n_keep, int t_out_begin, uint8_t* y_q8_1,
+                           const GdnRowCopies sn) {
+    if (sn.n > 0) {   // the rows' copies: the split form's own instance
+        if (y_q8_1 != nullptr)
+            return gdn_step_split<true, true>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep,
+                                              t_out_begin, y_q8_1, sn);
+        return gdn_step_split<false, true>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep,
+                                           t_out_begin, nullptr, sn);
+    }
     if (y_q8_1 != nullptr) {
         if (form == kGdnSplit)
             return gdn_step_split<true>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep, t_out_begin,
-                                        y_q8_1);
+                                        y_q8_1, sn);
         if (form == kGdnPrefetch)
             return gdn_step_prefetch<true>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep,
                                            t_out_begin, y_q8_1);
@@ -563,7 +624,7 @@ sycl::event gdn_step_form(int form, sycl::queue& q, float* state, const float* h
     }
     if (form == kGdnSplit)
         return gdn_step_split<false>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep, t_out_begin,
-                                     nullptr);
+                                     nullptr, sn);
     if (form == kGdnPrefetch)
         return gdn_step_prefetch<false>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep, t_out_begin,
                                         nullptr);
@@ -602,7 +663,8 @@ void gdn_step_tune(int C, int h_k, int h_v, void* stream) {
                 sx::command_graph<sx::graph_state::modifiable> graph(q.get_context(), q.get_device());
                 graph.begin_recording(q);
                 for (int i = 0; i < 32; ++i)
-                    gdn_step_form(form, q, state, h, C, gate, beta, z, gamma, 1e-6f, y, h_k, h_v, T, nullptr, 0, yq);
+                    gdn_step_form(form, q, state, h, C, gate, beta, z, gamma, 1e-6f, y, h_k, h_v, T, nullptr, 0, yq,
+                                  GdnRowCopies{});
                 graph.end_recording(q);
                 exec.push_back(graph.finalize());
             }
@@ -661,9 +723,10 @@ const int32_t* gdn_dbg_keep(sycl::queue& q, const int32_t* n_keep, int n_max) {
 
 void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* gate, const float* beta,
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
-                         const int32_t* n_keep, void* stream, int t_out_begin, void* y_q8_1) {
+                         const int32_t* n_keep, void* stream, int t_out_begin, void* y_q8_1,
+                         const GdnRowCopies* snaps) {
     if (!state || !hbuf || !gate || !beta || !z || !gamma || !y || h_k <= 0 || h_v % h_k || n_tok < 1 ||
-        n_tok > kVerifyMaxT)
+        n_tok > kVerifyMaxT || (snaps != nullptr && snaps->n > 0 && t_out_begin >= n_tok))
         fail("gdn_step_norm_multi: invalid arguments");
     auto& q = Q(stream);
     const int forced = gdn_forced();
@@ -679,7 +742,7 @@ void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* ga
         return;
     }
     done(stream, gdn_step_form(form, q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin,
-                               static_cast<uint8_t*>(y_q8_1)),
+                               static_cast<uint8_t*>(y_q8_1), snaps != nullptr ? *snaps : GdnRowCopies{}),
          "gdn_step_norm_multi");
 }
 

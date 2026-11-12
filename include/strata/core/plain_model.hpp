@@ -588,6 +588,10 @@ private:
         int64_t gdn = -1, attn = -1;    ///< index among the GDN / attention blocks
         const float *attn_norm = nullptr, *post_norm = nullptr;
         W qkv, z, alpha, beta, ssm_out;                       // GDN
+        // alpha and beta widened to F32 for the decode's fused kernel (gdn_ab_multi reads BF16 or F32) where the file
+        // has another type; the prompt keeps the file's (its F32 product cost Qwen3.5-9B Q4_K_M's 1K and 32K prompts
+        // 3 to 5% on the B70, 2026-11-12).  Unset (data null): the decode reads alpha and beta.
+        W alpha_f, beta_f;
         const float *conv = nullptr, *dt = nullptr, *a = nullptr, *ssm_norm = nullptr;
         W q, k, v, o;                                         // attention
         const float *q_norm = nullptr, *k_norm = nullptr;
@@ -617,8 +621,9 @@ private:
     /// A projection's GGUF tensor into VRAM: its first dimension the input, every other the outputs (a 3-D tensor, the
     /// MLA's per-head wk_b and wv_b, is its heads' matrices one after another).  `f32`: an F32 matrix is taken as it is
     /// (Qwen3.6's GDN alpha and beta: llama.cpp's float product), and an F16 one widened to F32 (exact; Unsloth's
-    /// Qwen3.5 UD files keep alpha and beta in F16, which no product kernel reads)
-    bool upload(const GgufModel& m, const std::string& name, W& w, std::string& err, bool f32 = false);
+    /// Qwen3.5 UD files keep alpha and beta in F16, which no product kernel reads).  `widen`: any type but BF16 and F32
+    /// widened to F32 (exact; the GDN's alpha_f and beta_f)
+    bool upload(const GgufModel& m, const std::string& name, W& w, std::string& err, bool f32 = false, bool widen = false);
     /// The decode layouts of the matrices upload put on the GPU since the last call (native_mmvq_tune), timed over
     /// all of them: the model's weights, read as the decode reads them, rather than a span allocated for the timing.
     bool tune_uploaded(std::string& err);
@@ -1196,8 +1201,8 @@ private:
     int32_t *step_ = nullptr, *pos_ = nullptr;
     float *x_ = nullptr, *hn_ = nullptr, *mix_ = nullptr;
     uint8_t* xq_ = nullptr;
-    float *qkv_ = nullptr, *craw_ = nullptr, *hc_ = nullptr, *z_ = nullptr, *alpha_ = nullptr, *beta_ = nullptr,
-          *gate_ = nullptr, *o_ = nullptr, *y_ = nullptr;
+    float *qkv_ = nullptr, *hc_ = nullptr, *z_ = nullptr, *beta_ = nullptr, *gate_ = nullptr, *y_ = nullptr;
+    int32_t* counts_ = nullptr;   ///< 0 .. max_t on the device: a window's rows, as the GDN kernels read their count
     float *qfull_ = nullptr, *qcur_ = nullptr, *kraw_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *attn_ = nullptr,
           *attn32_ = nullptr, *attn_scratch_ = nullptr;
     float *rlog_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *sh_g_ = nullptr, *sh_gate_ = nullptr, *sh_up_ = nullptr,

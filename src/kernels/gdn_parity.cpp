@@ -19,17 +19,24 @@
 //      differs by sqrt(S) = 11.3x at S = 128.  `ref/gdn.py` PROPERTY 1 instruments the derivation, so it is
 //      not taken on trust there either.
 //
+// Last, a window's rows through the verify-window kernels (verify_kernels.hpp) as the plain engine runs them - the
+// rows in one launch each, the history and the state left after them, the rows' copies beside - against the same rows
+// one at a time: the same bits.
+//
 // It also checks the STATE LAYOUT, which is the one place these kernels intentionally differ from the
 // reference: (S, h_v, S) with j fastest instead of (S, S, h_v).  A layout mix-up is silent, so the state is
 // filled with a value that encodes its own coordinates.
 #include "strata/kernels/gdn.hpp"
 #include "strata/kernels/native_gdn.hpp"
 #include "strata/kernels/native_gdn_preprocess.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include "parity_device.hpp"
 #include "strata/core/gpu.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -408,6 +415,101 @@ int main(int argc, char** argv) {
         std::printf("  %-42s rel %.3e\n", "out norm with gdn_set_silu_gate (silu z)", rel_gate);
         if (!(rel_gate <= 1e-6)) ++bad;
         }
+
+    // ================= 5. a window's rows at once, as the plain engine runs them =================
+    {
+        namespace sk = strata::kernels;
+        const int T = 3, NE = 256, C = 2 * h_k * S + h_v * S, ZV = h_v * S;
+        const float eps = 1e-6f;
+        auto fill = [&](std::vector<float>& v, size_t n, float scale) {
+            v.resize(n);
+            for (auto& x : v) x = gauss(rng) * scale;
+        };
+        std::vector<float> qkv, conv_w, hist, x, wa, wb, dt, sa, z, gamma, st;
+        fill(qkv, (size_t) T * C, 1.0f); fill(conv_w, (size_t) C * 4, 0.5f); fill(hist, (size_t) C * 3, 1.0f);
+        fill(x, (size_t) T * NE, 1.0f); fill(wa, (size_t) h_v * NE, 0.1f); fill(wb, (size_t) h_v * NE, 0.1f);
+        fill(dt, (size_t) h_v, 1.0f); fill(sa, (size_t) h_v, 1.0f); fill(z, (size_t) T * ZV, 1.0f);
+        fill(gamma, (size_t) S, 1.0f); fill(st, (size_t) S * h_v * S, 0.01f);
+        for (auto& v : sa) v = -std::fabs(v);
+        // BF16-exact weights: the F32 and BF16 forms of the alpha/beta kernel must then agree to the bit
+        std::vector<uint16_t> wa16(wa.size()), wb16(wb.size());
+        for (size_t i = 0; i < wa.size(); ++i) {
+            uint32_t u;
+            std::memcpy(&u, &wa[i], 4); u &= 0xffff0000u; std::memcpy(&wa[i], &u, 4); wa16[i] = (uint16_t) (u >> 16);
+            std::memcpy(&u, &wb[i], 4); u &= 0xffff0000u; std::memcpy(&wb[i], &u, 4); wb16[i] = (uint16_t) (u >> 16);
+        }
+        auto up = [&](const void* src, size_t bytes) {
+            void* d = strata::parity::alloc_bytes(std::max<size_t>(bytes, 4));
+            if (src != nullptr) strata::parity::copy_bytes_in(d, src, bytes);
+            return static_cast<float*>(d);
+        };
+        const std::vector<int32_t> counts{0, 1, 2, 3};
+        auto* d_counts = reinterpret_cast<int32_t*>(up(counts.data(), counts.size() * 4));
+        float *d_qkv = up(qkv.data(), qkv.size() * 4), *d_cw = up(conv_w.data(), conv_w.size() * 4),
+              *d_x = up(x.data(), x.size() * 4), *d_wa = up(wa.data(), wa.size() * 4), *d_wb = up(wb.data(), wb.size() * 4),
+              *d_dt = up(dt.data(), dt.size() * 4), *d_sa = up(sa.data(), sa.size() * 4), *d_z = up(z.data(), z.size() * 4),
+              *d_gm = up(gamma.data(), gamma.size() * 4);
+        auto* d_wa16 = reinterpret_cast<uint16_t*>(up(wa16.data(), wa16.size() * 2));
+        auto* d_wb16 = reinterpret_cast<uint16_t*>(up(wb16.data(), wb16.size() * 2));
+        // [0]: the window, [1]: row by row
+        float *d_hist[2], *d_st[2], *d_h[2], *d_gate[2], *d_beta[2], *d_y[2], *d_hsnap[2][T - 1], *d_ssnap[2][T - 1];
+        for (int w = 0; w < 2; ++w) {
+            d_hist[w] = up(hist.data(), hist.size() * 4);
+            d_st[w] = up(st.data(), st.size() * 4);
+            d_h[w] = up(nullptr, (size_t) T * C * 4);
+            d_gate[w] = up(nullptr, (size_t) T * h_v * 4);
+            d_beta[w] = up(nullptr, (size_t) T * h_v * 4);
+            d_y[w] = up(nullptr, (size_t) T * ZV * 4);
+            for (int t = 0; t < T - 1; ++t) {
+                d_hsnap[w][t] = up(nullptr, hist.size() * 4);
+                d_ssnap[w][t] = up(nullptr, st.size() * 4);
+            }
+        }
+        sk::GdnRowCopies hs, ss;
+        for (int t = 0; t < T - 1; ++t) { hs.p[t] = d_hsnap[0][t]; ss.p[t] = d_ssnap[0][t]; }
+        hs.n = ss.n = T - 1;
+        sk::gdn_ab_multi(d_x, d_wa, d_wb, d_dt, d_sa, d_gate[0], d_beta[0], NE, h_v, T, cs);
+        sk::gdn_conv_l2_multi(d_hist[0], d_qkv, d_cw, d_h[0], C, 2 * h_k, eps, T, cs, 0, false, &hs);
+        sk::gdn_conv_commit(d_hist[0], d_qkv, C, d_counts + T, cs);
+        sk::gdn_step_norm_multi(d_st[0], d_h[0], C, d_gate[0], d_beta[0], d_z, d_gm, eps, d_y[0], h_k, h_v, T,
+                                d_counts + T, cs, 0, nullptr, &ss);
+        for (int t = 0; t < T; ++t) {
+            sk::gdn_ab_multi(d_x + (size_t) t * NE, d_wa16, d_wb16, d_dt, d_sa, d_gate[1] + (size_t) t * h_v,
+                             d_beta[1] + (size_t) t * h_v, NE, h_v, 1, cs);
+            sk::gdn_conv_l2_multi(d_hist[1], d_qkv + (size_t) t * C, d_cw, d_h[1] + (size_t) t * C, C, 2 * h_k, eps, 1, cs,
+                                  0, true);
+            sk::gdn_step_norm_multi(d_st[1], d_h[1] + (size_t) t * C, C, d_gate[1] + (size_t) t * h_v,
+                                    d_beta[1] + (size_t) t * h_v, d_z + (size_t) t * ZV, d_gm, eps,
+                                    d_y[1] + (size_t) t * ZV, h_k, h_v, 1, d_counts + 1, cs);
+            if (t < T - 1) {
+                strata::gpu::stream_sync(cs);
+                std::vector<float> tmp(st.size());
+                strata::parity::copy_bytes_out(tmp.data(), d_st[1], tmp.size() * 4);
+                strata::parity::copy_bytes_in(d_ssnap[1][t], tmp.data(), tmp.size() * 4);
+                strata::parity::copy_bytes_out(tmp.data(), d_hist[1], hist.size() * 4);
+                strata::parity::copy_bytes_in(d_hsnap[1][t], tmp.data(), hist.size() * 4);
+            }
+        }
+        strata::gpu::stream_sync(cs);
+        auto same = [&](const char* what, const float* a, const float* b, size_t n) {
+            std::vector<float> va(n), vb(n);
+            strata::parity::copy_bytes_out(va.data(), a, n * 4);
+            strata::parity::copy_bytes_out(vb.data(), b, n * 4);
+            const bool ok = std::memcmp(va.data(), vb.data(), n * 4) == 0;
+            std::printf("  %-42s %s\n", what, ok ? "same bits" : "*** DIFFER ***");
+            if (!ok) ++bad;
+        };
+        same("window: gate (F32 vs BF16 weights)", d_gate[0], d_gate[1], (size_t) T * h_v);
+        same("window: beta (F32 vs BF16 weights)", d_beta[0], d_beta[1], (size_t) T * h_v);
+        same("window: conv + norms of the rows", d_h[0], d_h[1], (size_t) T * C);
+        same("window: outputs", d_y[0], d_y[1], (size_t) T * ZV);
+        same("window: conv history after the rows", d_hist[0], d_hist[1], hist.size());
+        same("window: state after the rows", d_st[0], d_st[1], st.size());
+        for (int t = 0; t < T - 1; ++t) {
+            same("window: conv history copy of a row", d_hsnap[0][t], d_hsnap[1][t], hist.size());
+            same("window: state copy of a row", d_ssnap[0][t], d_ssnap[1][t], st.size());
+        }
+    }
 
     strata::gpu::stream_destroy(cs);
     std::printf("\ngdn: %d failures\n", bad);

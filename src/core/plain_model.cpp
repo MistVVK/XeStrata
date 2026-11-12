@@ -40,7 +40,6 @@
 #include "strata/kernels/gdn.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/iq_mmq.hpp"
-#include "strata/kernels/native_gdn.hpp"
 #include "strata/kernels/native_gdn_preprocess.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_moe.hpp"
@@ -140,7 +139,7 @@ PlainModel::~PlainModel() {
     if (cs_ != nullptr) strata::gpu::stream_destroy(cs_);
 }
 
-bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::string& err, bool f32) {
+bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::string& err, bool f32, bool widen) {
     size_t at = 0;
     const TensorInfo* t = m.find(name, &at);
     if (t == nullptr || t->shape.size() < 2 || !m.in_bounds(*t, at)) {
@@ -155,10 +154,11 @@ bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::
     const void* src = m.shard(at).tensor_data(*t);
     uint64_t bytes = tensor_payload_bytes(*t);
     std::vector<float> wide;
-    if (f32 && w.type == kF16) {
+    if ((f32 && w.type == kF16) || (widen && w.type != kBF16 && w.type != kF32)) {
+        f32 = true;
         wide.resize((size_t) w.n_in * rows);
-        if (!k::cpu::native_row_to_float(kF16, src, wide.data(), (int64_t) wide.size())) {
-            err = "plain model: widening " + name + " from F16 failed";
+        if (!k::cpu::native_row_to_float(w.type, src, wide.data(), (int64_t) wide.size())) {
+            err = "plain model: widening " + name + " from " + t->type_name() + " failed";
             return false;
         }
         src = wide.data();
@@ -286,6 +286,9 @@ bool PlainModel::load_block(const GgufModel& m, int64_t l, Block& b, std::string
         if (!upload(m, p + "attn_qkv.weight", b.qkv, err) || !upload(m, p + "attn_gate.weight", b.z, err) ||
             !upload(m, p + "ssm_alpha.weight", b.alpha, err, true) ||
             !upload(m, p + "ssm_beta.weight", b.beta, err, true) ||
+            (b.alpha.type != kBF16 && b.alpha.type != kF32 &&
+             (!upload(m, p + "ssm_alpha.weight", b.alpha_f, err, true, true) ||
+              !upload(m, p + "ssm_beta.weight", b.beta_f, err, true, true))) ||
             !upload(m, p + "ssm_out.weight", b.ssm_out, err) ||
             !upload_f32(m, p + "ssm_conv1d.weight", C * (uint64_t) s.ssm_d_conv, b.conv, err) ||
             !upload_f32(m, p + "ssm_dt.bias", (uint64_t) s.ssm_dt_rank, b.dt, err) ||
@@ -773,7 +776,7 @@ bool PlainModel::load_qwen(std::string& err) {
     bool shape_ok = s.key_length == s.value_length && (s.key_length == 128 || s.key_length == 256) &&
                     (s.rope_dims == 64 || s.rope_dims == s.key_length) && s.n_expert_used <= 15 && s.n_dense_lead == 0;
     if (q35)
-        shape_ok = shape_ok && s.ssm_d_state == 128 && s.ssm_d_conv == 4 && s.ssm_n_group > 0 &&
+        shape_ok = shape_ok && s.ssm_d_state == 128 && s.ssm_d_conv == 4 && s.ssm_n_group > 0 && s.n_embd % 8 == 0 &&
                    s.ssm_dt_rank % s.ssm_n_group == 0 && s.ssm_d_inner == s.ssm_dt_rank * s.ssm_d_state &&
                    (dense_ ? s.n_ff > 0 : s.n_ff_shexp > 0);
     if (!shape_ok) {
@@ -866,12 +869,16 @@ bool PlainModel::load_qwen(std::string& err) {
                 if (w->type == kBF16) k::bf16_gemv_fp32_mmvf_multi_tune(w->n_in, w->n_out, cs_);
         };
         for (int64_t l = lb_; l < le_; ++l) tune(blocks_[(size_t) l]);
+        // the GDN recurrence's forms (Qwen3.8's verify-window kernel), one a window size
+        if (std::any_of(blocks_.begin() + lb_, blocks_.begin() + le_, [](const Block& b) { return b.recurrent; }))
+            k::gdn_step_tune((int) (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner), (int) s.ssm_n_group,
+                             (int) s.ssm_dt_rank, cs_);
         if (has_mtp_) {
             tune(mtp_);
             if (mtp_eh_.type == kBF16) k::bf16_gemv_fp32_mmvf_multi_tune(mtp_eh_.n_in, mtp_eh_.n_out, cs_);
         }
     } catch (const std::exception& e) {
-        err = std::string("plain model: timing the BF16 products: ") + e.what();
+        err = std::string("plain model: timing the BF16 products and the GDN recurrence: ") + e.what();
         return false;
     }
     // per-sequence state
@@ -899,9 +906,9 @@ bool PlainModel::load_qwen(std::string& err) {
     // the states after a window's rows but its last, for going back to the last accepted draft: a window checks up to
     // spec - 1 drafts (at most the window kernel's snapshots); every stage's recurrent blocks
     // (--suffix-draft, --lookup-chain: as many as a window's drafts can be, MTP layer or not)
-    const int lookup = opt_.suffix_draft > 0 || opt_.lookup_chain > 0 ? std::min(opt_.max_t, k::kNativeGdnMaxSnaps + 1) - 1 : 0;
+    const int lookup = opt_.suffix_draft > 0 || opt_.lookup_chain > 0 ? std::min(opt_.max_t, k::kVerifyMaxT + 1) - 1 : 0;
     if (model_mtp_ || lookup > 0) {
-        if (model_mtp_) opt_.spec = std::min({opt_.spec, opt_.max_t, k::kNativeGdnMaxSnaps + 1});
+        if (model_mtp_) opt_.spec = std::min({opt_.spec, opt_.max_t, k::kVerifyMaxT + 1});
         n_mtp_ = model_mtp_ ? opt_.spec - 1 : 0;
         n_snap_ = std::max(n_mtp_, lookup);
         gdn_snap_.assign(gdn_state_.size(), {});
@@ -1124,9 +1131,9 @@ bool PlainModel::load_qwen(std::string& err) {
     };
     if (!dev(&step_, T * k::kStepCount * 4) || !dev(&pos_, T * (NH + NKV) * 4) || !dev(&x_, T * N * 4) ||
         !dev(&hn_, T * N * 4) || !dev(&mix_, T * N * 4) || !dev(&xq_, k::native_q8_1_bytes((int) max_in, (int) T)) ||
-        !dev(&qkv_, T * (uint64_t) C * 4) || !dev(&craw_, (uint64_t) C * 4) || !dev(&hc_, T * (uint64_t) C * 4) ||
-        !dev(&z_, T * ZV * 4) || !dev(&alpha_, T * HV * 4) || !dev(&beta_, T * HV * 4) || !dev(&gate_, T * HV * 4) ||
-        !dev(&o_, T * ZV * 4) || !dev(&y_, T * ZV * 4) || !dev(&qfull_, T * std::max(NH * 2 * HD, 2 * N) * 4) ||
+        !dev(&qkv_, T * (uint64_t) C * 4) || !dev(&hc_, T * (uint64_t) C * 4) || !dev(&z_, T * ZV * 4) ||
+        !dev(&beta_, T * HV * 4) || !dev(&gate_, T * HV * 4) || !dev(&y_, T * ZV * 4) || !dev(&counts_, (T + 1) * 4) ||
+        !dev(&qfull_, T * std::max(NH * 2 * HD, 2 * N) * 4) ||
         !dev(&qcur_, T * NH * HD * 4) || !dev(&kraw_, T * NKV * HD * 4) || !dev(&kcur_, T * NKV * HD * 4) ||
         !dev(&vcur_, T * NKV * HD * 4) || !dev(&attn_, T * NH * HD * 4) || !dev(&attn32_, T * NH * HD * 4) ||
         !dev(&attn_scratch_, T * (uint64_t) attn_scratch_floats_ * 4) || !dev(&rlog_, T * E * 4) ||
@@ -1136,6 +1143,9 @@ bool PlainModel::load_qwen(std::string& err) {
         err = "plain model: no VRAM for the window's buffers";
         return false;
     }
+    std::vector<int32_t> counts((size_t) T + 1);
+    for (size_t i = 0; i < counts.size(); ++i) counts[i] = (int32_t) i;
+    if (!strata::gpu::copy(counts_, counts.data(), counts.size() * 4)) { err = "plain model: the uploads failed"; return false; }
     if (!strata::gpu::stream_sync(cs_)) { err = "plain model: the uploads failed"; return false; }
     setup_int2();   // before the expert tier takes what VRAM is left
     if (!(dense_ ? open_dense(err) : open_experts(err))) return false;
@@ -3017,7 +3027,6 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
     const float eps = (float) s.rms_eps;
     const k::QsaShapes qs = attn_shapes();
     const int64_t NKV = qs.n_head_kv;
-    const k::GdnShapes gs{S, HK, HV};
     const k::RopeScaling& rs = rope_of(b);
     const int32_t* pos_q = pos_;
     const int32_t* pos_k = pos_ + (size_t) opt_.max_t * NH;
@@ -3045,48 +3054,64 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
         float* hist = gdn_conv_[(size_t) b.gdn];
         proj(b.qkv, hn_, qkv_, T, false);
         proj(b.z, hn_, z_, T, false);
-        // alpha and beta, one shape and type: one launch where the pair kernel takes the type (nextsycl's
-        // Qwen3.5 decode fuses the two products)
-        if (b.alpha.type == kBF16 || b.alpha.type == kF32 || b.alpha.type != b.beta.type ||
-            b.alpha.n_in != b.beta.n_in || b.alpha.n_out != b.beta.n_out ||
-            !k::native_mmvq_pair(b.alpha.type, b.alpha.data, b.beta.data, xq_, alpha_, beta_, b.alpha.n_in,
-                                 b.alpha.n_out, T, cs)) {
-            proj(b.alpha, hn_, alpha_, T, false);
-            proj(b.beta, hn_, beta_, T, false);
-        }
+        // Qwen3.8's verify-window kernels (verify_kernels.hpp), at most kVerifyMaxT rows a launch: alpha/beta with their
+        // gates in one; the conv, SiLU and q/k norms of every row in one; the recurrence and the output norm in one,
+        // writing ssm_out's q8_1 input as well.  The conv history and the state go on over the rows (counts_[n]: the
+        // kernels' count of rows kept), and the drafts' rows to go back to are written beside (spec_step).
+        const bool q8_out = b.ssm_out.type != kBF16 && b.ssm_out.type != kF32;
+        const size_t q8_row = (size_t) (ZV / 32) * 36;
+        const W& wa = b.alpha_f.type >= 0 ? b.alpha_f : b.alpha;
+        const W& wb = b.alpha_f.type >= 0 ? b.beta_f : b.beta;
+        auto ab = [&](int t0, int n) {
+            if (wa.type == kBF16)
+                k::gdn_ab_multi(hn_ + (size_t) t0 * N, static_cast<const uint16_t*>(wa.data),
+                                static_cast<const uint16_t*>(wb.data), b.dt, b.a, gate_ + (size_t) t0 * HV,
+                                beta_ + (size_t) t0 * HV, (int) N, (int) HV, n, cs);
+            else
+                k::gdn_ab_multi(hn_ + (size_t) t0 * N, static_cast<const float*>(wa.data),
+                                static_cast<const float*>(wb.data), b.dt, b.a, gate_ + (size_t) t0 * HV,
+                                beta_ + (size_t) t0 * HV, (int) N, (int) HV, n, cs);
+        };
+        // rows [t0, t0 + n) from the conv history `hist` and the state `st`, both left after the n rows; conv_snaps /
+        // st_snaps: the history and the state after rows t0 .. (t0 + n_snaps - 1)
+        auto run = [&](float* hist, float* st, int t0, int n, const k::GdnRowCopies& conv_snaps,
+                       const k::GdnRowCopies& st_snaps) {
+            const float* q = qkv_ + (size_t) t0 * C;
+            k::gdn_conv_l2_multi(hist, q, b.conv, hc_ + (size_t) t0 * C, (int) C, (int) (2 * HK), eps, n, cs, 0, n == 1,
+                                 &conv_snaps);
+            if (n > 1) k::gdn_conv_commit(hist, q, (int) C, counts_ + n, cs);
+            k::gdn_step_norm_multi(st, hc_ + (size_t) t0 * C, (int) C, gate_ + (size_t) t0 * HV, beta_ + (size_t) t0 * HV,
+                                   z_ + (size_t) t0 * ZV, b.ssm_norm, eps, y_ + (size_t) t0 * ZV, (int) HK, (int) HV, n,
+                                   counts_ + n, cs, 0, q8_out ? (void*) (xq_ + (size_t) t0 * q8_row) : nullptr, &st_snaps);
+        };
         const int n_snaps = rows ? 0 : std::min(T - 1, n_snap_);   // the states after rows 0 .. n_snaps - 1, for spec_step
-        for (int t = 0; t < T; ++t) {   // each row's inputs; the convolution's history goes on row by row
-            float* h = hc_ + (size_t) t * C;
-            k::native_gdn_conv_silu(rows ? slot_of(t).gdn_conv[(size_t) b.gdn] : hist, qkv_ + (size_t) t * C, b.conv, craw_,
-                                    h, C, s.ssm_d_conv, cs);
-            k::native_gdn_l2_norm(h, HK, S, eps, cs);
-            k::native_gdn_l2_norm(h + HK * S, HK, S, eps, cs);
-            k::native_gdn_gate(alpha_ + (size_t) t * HV, b.dt, b.a, gate_ + (size_t) t * HV, HV, cs);
-            if (t < n_snaps)
-                k::copy_from_mapped(conv_snap_[(size_t) b.gdn][(size_t) t], hist, C * (s.ssm_d_conv - 1), cs);
-            else if (rows && first_of_two(t))   // --batch-mtp: the slot's history after its token, before its draft
-                k::copy_from_mapped(slot_of(t).conv_snap[(size_t) b.gdn], slot_of(t).gdn_conv[(size_t) b.gdn],
-                                    C * (s.ssm_d_conv - 1), cs);
-        }
-        k::native_gdn_beta_gate(beta_, HV * T, cs);
-        // the recurrence over the window's rows in one launch (the state read and written once, the rows' states
-        // to go back to written beside): one launch a row read and wrote the 2 MiB state of Qwen3.6's 32 heads each
-        // time, 45 us a row on the RX 9060 XT (2026-10-15)
-        float* snaps[k::kNativeGdnMaxSnaps] = {};
-        for (int t = 0; t < n_snaps; ++t) snaps[t] = gdn_snap_[(size_t) b.gdn][(size_t) t];
+        for (int t0 = 0; t0 < T; t0 += k::kVerifyMaxT) ab(t0, std::min(T - t0, k::kVerifyMaxT));
         if (rows)
-            for (int t = 0; t < T;) {   // a slot's rows in one launch (--batch-mtp: two, the state after the first kept)
+            for (int t = 0; t < T;) {   // a slot's rows from its own state (--batch-mtp: two, the state after the first kept)
+                const SlotSession& sl = slot_of(t);
                 const int n = first_of_two(t) ? 2 : 1;
-                float* one[k::kNativeGdnMaxSnaps] = {n == 2 ? slot_of(t).gdn_snap[(size_t) b.gdn] : nullptr};
-                k::native_gdn_step_rows(slot_of(t).gdn_state[(size_t) b.gdn], hc_ + (size_t) t * C, C,
-                                        gate_ + (size_t) t * HV, beta_ + (size_t) t * HV, o_ + (size_t) t * ZV, ZV, n,
-                                        one, n - 1, gs, cs);
+                k::GdnRowCopies conv_snaps, st_snaps;
+                if (n == 2) {
+                    conv_snaps.p[0] = sl.conv_snap[(size_t) b.gdn];
+                    st_snaps.p[0] = sl.gdn_snap[(size_t) b.gdn];
+                    conv_snaps.n = st_snaps.n = 1;
+                }
+                run(sl.gdn_conv[(size_t) b.gdn], sl.gdn_state[(size_t) b.gdn], t, n, conv_snaps, st_snaps);
                 t += n;
             }
         else
-            k::native_gdn_step_rows(state, hc_, C, gate_, beta_, o_, ZV, T, snaps, n_snaps, gs, cs);
-        k::native_gdn_out_norm(o_, z_, b.ssm_norm, y_, HV * T, S, eps, cs);
-        proj(b.ssm_out, y_, mix_, T, true);
+            for (int t0 = 0; t0 < T; t0 += k::kVerifyMaxT) {
+                const int n = std::min(T - t0, k::kVerifyMaxT);
+                k::GdnRowCopies conv_snaps, st_snaps;
+                for (int t = t0; t < std::min(t0 + n, n_snaps); ++t) {
+                    conv_snaps.p[t - t0] = conv_snap_[(size_t) b.gdn][(size_t) t];
+                    st_snaps.p[t - t0] = gdn_snap_[(size_t) b.gdn][(size_t) t];
+                    conv_snaps.n = st_snaps.n = t - t0 + 1;
+                }
+                run(hist, state, t0, n, conv_snaps, st_snaps);
+            }
+        if (q8_out) k::native_mmvq(b.ssm_out.type, b.ssm_out.data, xq_, mix_, (int) ZV, (int) N, T, cs);
+        else proj(b.ssm_out, y_, mix_, T, false);
     } else {
         const int64_t a = b.attn;
         // plamo3's fused Q, K and V: one product for one row (its Q, K and V side by side in qfull_, which holds twice
