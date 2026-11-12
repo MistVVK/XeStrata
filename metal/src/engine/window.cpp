@@ -2089,8 +2089,12 @@ void Window::fold(std::vector<mtl::Dispatch>& ds, int n_keep, int hp) {
                   mtl::Arg::B(ydump_), mtl::Arg::V(a), mtl::Arg::B(ghist_[1 - hp][(size_t) gi])};
         d.grid[0] = G_HV;
         d.tg[0] = 512;
-        nb_ = true;   // the layers' folds are independent of each other
         push(ds, d);
+        // The first fold must barrier against whatever the caller last wrote into qkvL_/alL_/beL_/zL_ (the window's
+        // own projections): setting nb_ before the push cleared the caller's `nb_ = false` and let the fold read the
+        // previous chunk's projections, committing them into the recurrent state.  Folds after the first are
+        // independent of each other, so they keep the barrier off.
+        nb_ = true;
     }
     nb_ = false;   // what follows reads the folded state: a barrier
 }
