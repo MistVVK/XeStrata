@@ -114,6 +114,9 @@ public:
     /// the first prompt, not in it; native_llm calls it too (a GPU the startup did not measure, a layer split's
     /// second one).
     static bool llm_w8a8(void* stream, bool dense);
+    /// The fewest rows native_llm takes the W8A8 form at (the comment there): a model whose prompt chunks are
+    /// shorter never takes it.
+    static constexpr int64_t kLlmW8a8Rows = 1024;
     /// Loads the products' library ahead of the first prompt (oneMath's backend for the current GPU), on a thread of
     /// its own: call once for each GPU at startup.
     static void prepare();

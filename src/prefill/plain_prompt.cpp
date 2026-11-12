@@ -289,9 +289,11 @@ bool PlainModel::prompt_warm(std::string& err) {
     if (!prompt_borrow(std::min<int64_t>(opt_.prompt_chunk, 512), err)) return false;
     const bool ok = prompt_warm_products(err);
     // the W8A8 choice of the dense products (Gemm::llm_w8a8): measured at startup where the program called it; an
-    // encoder opened in another process (the image engine's text reader) measures here, once a GPU.  A MoE model
-    // (dense_ false) takes neither the timing nor the int8 library's load
-    if (ok) prefill::Gemm::llm_w8a8(cs_, dense_);
+    // encoder opened in another process measures here, once a GPU.  A MoE model (dense_ false) takes neither the
+    // timing nor the int8 library's load, and neither does a model whose chunks never reach the form's rows: the
+    // image engine's text readers (TextEncoder's chunks of 512) paid the timing's 1.3 s in their first encode for a
+    // form they never take (MOSS-Image, RX 9060 XT, 2026-11-12: the first request's text 5.37 -> 4.03 s)
+    if (ok && opt_.prompt_chunk >= prefill::Gemm::kLlmW8a8Rows) prefill::Gemm::llm_w8a8(cs_, dense_);
     if (ok && dense_) prompt_dense_calibrate();
     if (ok && !dense_ && spec_.n_expert > 0 && prompt_int8()) {   // the experts' products' forms, timed for each type
         const int64_t N = spec_.n_embd, FF = spec_.n_ff_exp;

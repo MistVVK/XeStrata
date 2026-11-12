@@ -42,9 +42,12 @@ WIDE_PUBLIC = {
     "tq_rows_avx512",   # the trellis rows (tq_cpu.cpp): reached only through tq_isa_ok (cpu_avx512_ok)
     # the int8 product's copies (i8_gemm.hpp): reached only through i8_gemm_isa_ok (cpu_avxvnni_ok, cpu_avx512vnni_ok)
     "i8_gemm_rows_x86", "i8_gemm_rows_avx512",
+    # the BF16 row kernels (bf16_gemm_avx512.cpp, vision_cpu_avx512.cpp): reached only through cpu_avx512_ok
+    # (bf16_gemm_isa's Bf16GemmIsa::avx512, the vision row loops' own dispatch)
+    "bf16_gemm_rows_avx512", "add_span", "gelu_tanh_span", "layer_norm_row", "qkv_rope_rows", "softmax_row",
 }
 WIDE_OBJECTS = ("expert.cpp", "iq_avx512.cpp", "iq_avx2.cpp", "q2_avx2.cpp", "kq_avx2.cpp", "tq_avx512.cpp",
-                "i8_gemm_vnni.cpp", "i8_gemm_avx512.cpp")
+                "i8_gemm_vnni.cpp", "i8_gemm_avx512.cpp", "bf16_gemm_avx512.cpp", "vision_cpu_avx512.cpp")
 
 # An instruction is "wide" if it is EVEX encoded (first byte 0x62 in 64-bit mode), or one of these VEX / legacy
 # extensions that an AVX2 CPU may lack.  AVX-VNNI is VEX encoded (vpdpbusd, vpdpwssd ...).

@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
 import setup  # noqa: E402
+from serve import model_terms  # noqa: E402
 
 SHA = re.compile(r"/resolve/[0-9a-f]{40}/")
 
@@ -99,10 +100,12 @@ class HuggingFacePins(unittest.TestCase):
                 raise not_found(req.full_url)
             return Response(b"model bytes", status=200)
 
-        # the pinned Hugging Face path itself (setup's --source huggingface; auto may pick ModelScope)
+        # the pinned Hugging Face path itself (setup's --source huggingface; auto may pick ModelScope); the terms'
+        # cache is forced empty, so a user who fetched them before does not hide the fetch this test asks for
         with tempfile.TemporaryDirectory() as d, mock.patch.object(setup.urllib.request, "urlopen", urlopen), \
                 mock.patch.dict(setup.os.environ, {"XESTRATA_SOURCE": "huggingface", "XESTRATA_ALLOW_UNPINNED": "1"}), \
-                mock.patch.object(setup, "_unpinned_said", []), mock.patch.object(setup, "_TERMS_DONE", set()):
+                mock.patch.object(setup, "_unpinned_said", []), mock.patch.object(setup, "_TERMS_DONE", set()), \
+                mock.patch.object(model_terms, "_read_ok", lambda *a: None):
             dst = Path(d) / "m.gguf"
             _, out = quiet(setup.download, setup.FAMILIES["qwen"]["mmproj_hf"] + "m.gguf", dst)
             self.assertEqual(dst.read_bytes(), b"model bytes")

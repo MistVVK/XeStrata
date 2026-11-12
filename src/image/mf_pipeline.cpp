@@ -132,14 +132,12 @@ void MfPipeline::ensure_open() {
 // layers, all of them: FP16 blocks that leave the encoder a few slots cost more than they give (RTX 4070, an edit:
 // its text and image read 0.5 s slower, a second in all against the 8-bit DiT's 3.2)
 bool MfPipeline::want_q8(int64_t rows, int n, int64_t max_text, int64_t n_ids) const {
-    if (q8_ >= 0) return q8_ == 1;
     const MfDit& d16 = *dit16_size_;
     const uint64_t fixed = d16.weight_bytes() + vae_size_->weight_bytes() + kScratch +
                            (vision_size_ ? vae_size_->encoder_bytes() : 0);
     const uint64_t work = std::max(d16.activation_bytes(rows, n, max_text), te_size_->activation_bytes(n_ids));
-    if (fixed + d16.block_bytes() + work + te_size_->layer_bytes() > budget()) return true;
-    // both forms fit (the engine's small warm-up image first): the faster on this GPU
-    return w8_.take(rows, "Mage-Flow's DiT", s_, [&](int64_t r) { return d16.time_forms(r); });
+    return w8_.want_q8(q8_, fixed + d16.block_bytes() + work + te_size_->layer_bytes(), budget(), rows,
+                       "Mage-Flow's DiT", s_, [&](int64_t r) { return d16.time_forms(r); });
 }
 
 // the DiT for a generation or an edit: the other gives its VRAM back (its Q8_0 kept in RAM with keep_, else let go),

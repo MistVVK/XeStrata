@@ -1259,8 +1259,8 @@ if(STRATA_ENABLE_XE)
   add_executable(img_start_test src/image/img_start_test.cpp)
   target_link_libraries(img_start_test PRIVATE strata_image)
   add_test(NAME img_start_test COMMAND img_start_test)
-  # img_crop's host resize of a picture's planar floats, against the formula Mage-Flow read with before its private
-  # bicubic went into these parts (the host's work only: no GPU, no model)
+  # img_crop's host resize of a picture's planar floats, against PIL's own Image.resize of the same pictures (the
+  # host's work only: no GPU, no model)
   add_executable(img_crop_test src/image/img_crop_test.cpp)
   target_link_libraries(img_crop_test PRIVATE strata_image)
   add_test(NAME img_crop_test COMMAND img_crop_test)

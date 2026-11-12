@@ -235,14 +235,14 @@ void MossPipeline::ensure_open(bool q8) {
     }
 }
 
-// as MfPipeline::want_q8: FP16 when its blocks all fit beside the rest, all of it, and FP16 is the faster here
+// W8Choice::want_q8 on the FP16 blocks all resident beside the rest.  The encoder's share is its fixed part and two
+// layer slots: what plan() keeps it open with (need()'s least)
 bool MossPipeline::want_q8(int64_t rows, int n, int64_t max_text) {
-    if (q8_ >= 0) return q8_ == 1;
     const MossDit& d16 = *dit16_size_;
     const uint64_t fixed = d16.weight_bytes() + d16.text_bytes() + vae_size_->weight_bytes() +
-                           (te_ ? text_fixed() + te_layers_ : 0);
-    if (fixed + d16.block_bytes() + d16.activation_bytes(rows, n, max_text) > budget()) return true;
-    return w8_.take(rows, "MOSS-Image's DiT", s_, [&](int64_t r) { return d16.time_forms(r); });
+                           (states_given_ ? 0 : text_fixed() + 2 * te_layer_max_);
+    return w8_.want_q8(q8_, fixed + d16.block_bytes() + d16.activation_bytes(rows, n, max_text), budget(), rows,
+                       "MOSS-Image's DiT", s_, [&](int64_t r) { return d16.time_forms(r); });
 }
 
 uint64_t MossPipeline::held() const {

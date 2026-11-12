@@ -411,6 +411,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
    - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)（MIT）の一部。Gyro の形式は agentionai の llama.cpp のフォーク（MIT）から。
    - Peasant Smith と Project Maya の貢献者による [Project Maya](https://github.com/mw00/project-maya)（MIT）: server のループ対策（`serve/loop_guard.py`）。
    - Ostris の [ai-toolkit](https://github.com/ostris/ai-toolkit)（MIT）: LoRA の学習の時刻の重み（Anima の既定の weighted、`src/image/flow_weighting.cpp`）。
+   - Secret Labs AB・Fredrik Lundh・Jeffrey A. Clark と寄稿者の [Pillow](https://github.com/python-pillow/Pillow)（MIT-CMU）: 画像のエンジンがホストで行う Pillow と同じバイトのリサイズ（`src/image/img_crop.cpp` の `pillow_resize_planes`、`libImaging/Resample.c` から）。
    - [oneMath](https://github.com/uxlfoundation/oneMath)（Apache-2.0）: 密な行列積（contrib-llvm、free では AMD の GPU）。
      CMake が XeStrata の変更の入ったフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、同じライセンス）から取得します。
    - [intel/llvm](https://github.com/intel/llvm) の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib-llvm のコンパイラ。

@@ -88,6 +88,12 @@ Every copyright holder whose work is in this repository, its license and where t
   MIT - the LoRA trainer's timestep weights (src/image/flow_weighting.cpp: the 1,000 weights of ai-toolkit's
   "weighted" timesteps, toolkit/timestep_weighing/default_weighing_scheme.py of https://github.com/ostris/ai-toolkit,
   as they are); they stay under MIT, the file as a whole is under the LGPL (LGPL-3.0-or-later AND MIT) - text below
+- Copyright (c) 1997-2011 Secret Labs AB; Copyright (c) 1995-2011 Fredrik Lundh and contributors; Copyright (c) 2010
+  Jeffrey A. Clark and contributors (Pillow)
+  MIT-CMU - the image engine's resize of a picture on the host (src/image/img_crop.cpp, pillow_resize_planes: the
+  fixed-point weights, the totals and the order of the passes), transcribed from Pillow's libImaging/Resample.c and
+  Image.resize (https://github.com/python-pillow/Pillow); that code stays under MIT-CMU, the file as a whole is under
+  the LGPL (LGPL-3.0-or-later AND MIT-CMU) - LICENSES/MIT-CMU.txt
 - Copyright (c) 2024 ZhengPeng
   MIT - BiRefNet's foreground estimate (src/image/aux_kernels.cpp, include/strata/image/aux_kernels.hpp and
   src/image/birefnet.cpp: the blur fusion's two passes, their radii and constants), written after

@@ -155,13 +155,14 @@ void AnimaPipeline::ensure_open(bool q8) {
     }
 }
 
+// W8Choice::want_q8 on the FP16 blocks all resident beside the rest.  The encoder's share is all its layers and its
+// activations at 512 ids: what plan() keeps it open with
 bool AnimaPipeline::want_q8(int64_t rows, int n) {
-    if (q8_ >= 0) return q8_ == 1;
     const AnimaDit& d16 = *dit16_size_;
     const uint64_t fixed = d16.weight_bytes() + d16.text_bytes() + vae_size_->weight_bytes() +
-                           (te_ ? te_->layer_bytes() + te_->activation_bytes(512) : 0);
-    if (fixed + d16.block_bytes() + d16.activation_bytes(rows, n) > budget()) return true;
-    return w8_.take(rows, "Anima's DiT", s_, [&](int64_t r) { return d16.time_forms(r); });
+                           te_size_->layer_bytes() + te_size_->activation_bytes(512);
+    return w8_.want_q8(q8_, fixed + d16.block_bytes() + d16.activation_bytes(rows, n), budget(), rows, "Anima's DiT",
+                       s_, [&](int64_t r) { return d16.time_forms(r); });
 }
 
 uint64_t AnimaPipeline::held() const {

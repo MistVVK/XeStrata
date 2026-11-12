@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
-// src/image/img_crop.cpp - see include/strata/image/img_crop.hpp.
+// SPDX-FileCopyrightText: 1997-2011 Secret Labs AB
+// SPDX-FileCopyrightText: 1995-2011 Fredrik Lundh and contributors
+// SPDX-FileCopyrightText: 2010 Jeffrey A. Clark and contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT-CMU
+// src/image/img_crop.cpp - see include/strata/image/img_crop.hpp.  The host resize (pillow_resize_planes) is
+// transcribed from Pillow's libImaging/Resample.c (https://github.com/python-pillow/Pillow): that code stays under
+// Pillow's license (MIT-CMU), the file as a whole is under the LGPL.
 
 #include "strata/image/img_crop.hpp"
 
@@ -49,15 +54,10 @@ struct Buffers {
 
 // Pillow's resampling weights (precompute_coeffs) from `in` samples to `out`: each output's first input `lo` and its
 // `k` weights, the filter's support widened by the scale when it shrinks; Lanczos (a = 3), the triangle (bilinear),
-// the cubic (bicubic, a = -0.5) or OpenCV's cubic (cv_cubic, a = -0.75).
-// `w` is what the GPU's passes read: the weights divided by their sum, as floats.  `raw` and `sum` keep the filter's
-// own values and that sum, so a host pass can total its samples in doubles and divide last the way PIL's resample
-// does (pillow_resize_planes); the taps past an output's reach are 0 in both.
+// the cubic (bicubic, a = -0.5) or OpenCV's cubic (cv_cubic, a = -0.75): the weights divided by their sum, as floats
 struct Taps {
     std::vector<int32_t> lo;
     std::vector<float> w;
-    std::vector<double> raw;
-    std::vector<double> sum;
     int k = 0;
 };
 
@@ -94,8 +94,6 @@ Taps taps(int64_t in, int64_t out, Filter f) {
         t.k = 4;
         t.lo.resize((size_t) out);
         t.w.assign((size_t) (out * t.k), 0.0f);
-        t.raw.assign((size_t) (out * t.k), 0.0);
-        t.sum.assign((size_t) out, 0.0);
         for (int64_t x = 0; x < out; ++x) {
             const double c = ((double) x + 0.5) * scale - 0.5;
             const auto i0 = (int64_t) std::floor(c);
@@ -105,11 +103,8 @@ Taps taps(int64_t in, int64_t out, Filter f) {
             for (int64_t j = 0; j < 4; ++j) {
                 const int64_t at = std::clamp<int64_t>(i0 - 1 + j, 0, in - 1);
                 const int64_t slot = std::clamp<int64_t>(at - lo, 0, 3);
-                const double v = cv_cubic(fr + 1.0 - (double) j);
-                t.w[(size_t) (x * 4 + slot)] += (float) v;
-                t.raw[(size_t) (x * 4 + slot)] += v;
+                t.w[(size_t) (x * 4 + slot)] += (float) cv_cubic(fr + 1.0 - (double) j);
             }
-            for (int64_t j = 0; j < 4; ++j) t.sum[(size_t) x] += t.raw[(size_t) (x * 4 + j)];
         }
         return t;
     }
@@ -118,8 +113,6 @@ Taps taps(int64_t in, int64_t out, Filter f) {
     t.k = (int) std::ceil(support) * 2 + 1;
     t.lo.resize((size_t) out);
     t.w.assign((size_t) (out * t.k), 0.0f);
-    t.raw.assign((size_t) (out * t.k), 0.0);
-    t.sum.assign((size_t) out, 0.0);
     std::vector<double> ww((size_t) t.k);
     for (int64_t x = 0; x < out; ++x) {
         const double center = ((double) x + 0.5) * scale;
@@ -136,11 +129,8 @@ Taps taps(int64_t in, int64_t out, Filter f) {
             sum += v;
         }
         t.lo[(size_t) x] = (int32_t) lo;
-        t.sum[(size_t) x] = sum;
-        for (int64_t j = 0; j < hi - lo; ++j) {
-            t.raw[(size_t) (x * t.k + j)] = ww[(size_t) j];
+        for (int64_t j = 0; j < hi - lo; ++j)
             t.w[(size_t) (x * t.k + j)] = (float) (sum != 0.0 ? ww[(size_t) j] / sum : 0.0);
-        }
     }
     return t;
 }
@@ -392,27 +382,130 @@ QiRef pillow_resize(const QiRef& src, int64_t w, int64_t h, Filter filter) {
 
 namespace {
 
-// one axis of Pillow's resample on the host: each of the `n_out` outputs the double total of its taps over `lines`
-// rows of `n_in` samples (`stride_in` apart, the rows `stride_line` apart), divided by the taps' sum and rounded to a
-// whole byte, as PIL's resample does and as the GPU's rows' pass is (its columns' pass clips to the same bounds).
-// The taps past an output's reach are 0 and are skipped; an index past an edge is the edge's, as rows_rgba8's and
-// columns' take it.
-void resize_axis_host(const float* src, int64_t lines, int64_t n_in, int64_t stride_line, int64_t stride_in,
-                      int64_t n_out, const Taps& t, float* dst, int64_t dst_line, int64_t dst_out) {
-    for (int64_t o = 0; o < n_out; ++o) {
-        const double sum = t.sum[(size_t) o];
-        const int64_t lo = t.lo[(size_t) o];
-        for (int64_t l = 0; l < lines; ++l) {
-            double v = 0.0;
-            for (int j = 0; j < t.k; ++j) {
-                const double c = t.raw[(size_t) (o * t.k + j)];
-                if (c == 0.0) continue;
-                const int64_t i = std::clamp<int64_t>(lo + j, (int64_t) 0, n_in - 1);
-                v += c * (double) src[(size_t) (l * stride_line + i * stride_in)];
-            }
-            dst[(size_t) (l * dst_line + o * dst_out)] =
-                (float) std::clamp(sum != 0.0 ? std::nearbyint(v / sum) : 0.0, 0.0, 255.0);
+// Pillow's 8-bit resample on the host (libImaging/Resample.c: precompute_coeffs, normalize_coeffs_8bpc,
+// ImagingResampleHorizontal_8bpc / Vertical_8bpc, ImagingResampleInner), the arithmetic as Pillow has it: each
+// output's taps the filter's values times 1 / the scale, divided by their sum in doubles, then fixed point with 22
+// bits below the point (rounded half away from 0); an output the int32 total of its taps times the 8-bit samples from
+// half a unit, shifted down and clipped to 0 .. 255.  The rows' pass then the columns', each skipped where its axis
+// keeps its size.
+constexpr int kPilBits = 32 - 8 - 2;   // Pillow's PRECISION_BITS
+
+// Pillow's filters (bicubic_filter: a = -0.5, lanczos_filter, bilinear_filter) and their supports
+double pil_filter(Filter f, double x) {
+    if (f == Filter::lanczos) {
+        auto sinc = [](double v) {
+            if (v == 0.0) return 1.0;
+            v = v * 3.14159265358979323846;
+            return std::sin(v) / v;
+        };
+        return -3.0 <= x && x < 3.0 ? sinc(x) * sinc(x / 3) : 0.0;
+    }
+    if (x < 0.0) x = -x;
+    if (f == Filter::triangle) return x < 1.0 ? 1.0 - x : 0.0;
+    constexpr double a = -0.5;
+    if (x < 1.0) return ((a + 2.0) * x - (a + 3.0)) * x * x + 1;
+    if (x < 2.0) return (((x - 5) * x + 8) * x - 4) * a;
+    return 0.0;
+}
+
+// one axis's taps: output o reads n[o] inputs from lo[o], its fixed-point weights k[o * ksize ..]
+struct PilTaps {
+    std::vector<int32_t> lo, n, k;
+    int64_t ksize = 0;
+};
+
+PilTaps pil_taps(int64_t in_size, int64_t out_size, Filter f) {
+    const double support0 = f == Filter::lanczos ? 3.0 : f == Filter::bicubic ? 2.0 : 1.0;
+    double filterscale, scale;
+    filterscale = scale = (double) in_size / (double) out_size;
+    if (filterscale < 1.0) filterscale = 1.0;
+    const double support = support0 * filterscale;
+    PilTaps t;
+    t.ksize = (int64_t) std::ceil(support) * 2 + 1;
+    t.lo.resize((size_t) out_size);
+    t.n.resize((size_t) out_size);
+    t.k.assign((size_t) (out_size * t.ksize), 0);
+    std::vector<double> kk((size_t) t.ksize);
+    for (int64_t xx = 0; xx < out_size; ++xx) {
+        const double center = (xx + 0.5) * scale, ss = 1.0 / filterscale;
+        double ww = 0.0;
+        // Pillow's (int) casts: truncation; a negative start is 0 either way
+        int64_t xmin = (int64_t) (center - support + 0.5);
+        if (xmin < 0) xmin = 0;
+        int64_t xmax = (int64_t) (center + support + 0.5);
+        if (xmax > in_size) xmax = in_size;
+        xmax -= xmin;
+        for (int64_t x = 0; x < xmax; ++x) {
+            const double w = pil_filter(f, (x + xmin - center + 0.5) * ss);
+            kk[(size_t) x] = w;
+            ww += w;
         }
+        for (int64_t x = 0; x < xmax; ++x) {
+            if (ww != 0.0) kk[(size_t) x] /= ww;
+            const double v = kk[(size_t) x] * (1 << kPilBits);
+            t.k[(size_t) (xx * t.ksize + x)] = (int32_t) (v < 0 ? -0.5 + v : 0.5 + v);
+        }
+        t.lo[(size_t) xx] = (int32_t) xmin;
+        t.n[(size_t) xx] = (int32_t) xmax;
+    }
+    return t;
+}
+
+// Pillow's clip8: the total shifted down to whole levels and clipped
+uint8_t pil_clip8(int32_t v) { return (uint8_t) std::clamp<int32_t>(v >> kPilBits, 0, 255); }
+
+// The rows' pass: `lines` rows of `n_in` bytes to rows of `n_out`, four rows at a time (a tap's weight and index read
+// once for the four, the four totals side by side).  The totals are Pillow's, one product added at a time.
+void pil_rows(const uint8_t* src, int64_t lines, int64_t n_in, int64_t n_out, const PilTaps& t, uint8_t* dst) {
+    constexpr int32_t half = 1 << (kPilBits - 1);
+    int64_t l = 0;
+    for (; l + 4 <= lines; l += 4) {
+        const uint8_t* r0 = src + (size_t) (l * n_in);
+        const uint8_t *r1 = r0 + n_in, *r2 = r1 + n_in, *r3 = r2 + n_in;
+        uint8_t* d0 = dst + (size_t) (l * n_out);
+        for (int64_t o = 0; o < n_out; ++o) {
+            const int32_t* k = t.k.data() + (size_t) (o * t.ksize);
+            const int64_t lo = t.lo[(size_t) o], n = t.n[(size_t) o];
+            int32_t v0 = half, v1 = half, v2 = half, v3 = half;
+            for (int64_t x = 0; x < n; ++x) {
+                v0 += (int32_t) r0[lo + x] * k[x];
+                v1 += (int32_t) r1[lo + x] * k[x];
+                v2 += (int32_t) r2[lo + x] * k[x];
+                v3 += (int32_t) r3[lo + x] * k[x];
+            }
+            d0[o] = pil_clip8(v0);
+            d0[n_out + o] = pil_clip8(v1);
+            d0[2 * n_out + o] = pil_clip8(v2);
+            d0[3 * n_out + o] = pil_clip8(v3);
+        }
+    }
+    for (; l < lines; ++l) {
+        const uint8_t* r = src + (size_t) (l * n_in);
+        for (int64_t o = 0; o < n_out; ++o) {
+            const int32_t* k = t.k.data() + (size_t) (o * t.ksize);
+            const int64_t lo = t.lo[(size_t) o], n = t.n[(size_t) o];
+            int32_t v = half;
+            for (int64_t x = 0; x < n; ++x) v += (int32_t) r[lo + x] * k[x];
+            dst[(size_t) (l * n_out + o)] = pil_clip8(v);
+        }
+    }
+}
+
+// The columns' pass: a plane of `n_in` rows of `lines` bytes to `n_out` rows, an output row's totals for all its
+// samples at once (each tap's row added across them, side by side in the vector registers).
+void pil_columns(const uint8_t* src, int64_t lines, int64_t n_out, const PilTaps& t, uint8_t* dst) {
+    std::vector<int32_t> acc((size_t) lines);
+    for (int64_t o = 0; o < n_out; ++o) {
+        std::fill(acc.begin(), acc.end(), 1 << (kPilBits - 1));
+        const int32_t* k = t.k.data() + (size_t) (o * t.ksize);
+        const int64_t lo = t.lo[(size_t) o], n = t.n[(size_t) o];
+        for (int64_t y = 0; y < n; ++y) {
+            const int32_t c = k[y];
+            const uint8_t* row = src + (size_t) ((lo + y) * lines);
+            for (int64_t l = 0; l < lines; ++l) acc[(size_t) l] += (int32_t) row[l] * c;
+        }
+        uint8_t* d = dst + (size_t) (o * lines);
+        for (int64_t l = 0; l < lines; ++l) d[l] = pil_clip8(acc[(size_t) l]);
     }
 }
 
@@ -422,15 +515,35 @@ std::vector<float> pillow_resize_planes(const std::vector<float>& planes, int64_
                                         int64_t h2, Filter filter) {
     if (c <= 0 || w <= 0 || h <= 0 || w2 <= 0 || h2 <= 0 || planes.size() != (size_t) (c * w * h))
         throw std::invalid_argument("image engine: a resize of an empty image, or to no size");
+    if (filter == Filter::cv_cubic)
+        throw std::invalid_argument("image engine: the host resize takes Pillow's filters (not OpenCV's cubic)");
     if (w == w2 && h == h2) return planes;
-    std::vector<float> mid((size_t) (c * h * w2)), out((size_t) (c * h2 * w2));
-    const Taps tx = taps(w, w2, filter);
-    resize_axis_host(planes.data(), c * h, w, w, 1, w2, tx, mid.data(), w2, 1);
-    const Taps ty = taps(h, h2, filter);
-    for (int64_t ch = 0; ch < c; ++ch)   // the columns' pass, one plane at a time: its rows are w2 apart
-        resize_axis_host(mid.data() + (size_t) (ch * h * w2), w2, h, 1, w2, h2, ty,
-                         out.data() + (size_t) (ch * h2 * w2), 1, w2);
-    return out;
+    std::vector<uint8_t> in(planes.size()), mid, out((size_t) (c * h2 * w2));
+    for (size_t i = 0; i < in.size(); ++i) in[i] = (uint8_t) std::clamp(std::nearbyint(planes[i]), 0.0f, 255.0f);
+    auto rows = [&](const uint8_t* src, int64_t lines, uint8_t* dst) {
+        pil_rows(src, lines, w, w2, pil_taps(w, w2, filter), dst);
+    };
+    auto columns = [&](const uint8_t* src, int64_t width, uint8_t* dst) {
+        const PilTaps ty = pil_taps(h, h2, filter);
+        for (int64_t ch = 0; ch < c; ++ch)
+            pil_columns(src + (size_t) (ch * h * width), width, h2, ty, dst + (size_t) (ch * h2 * width));
+    };
+    // Image.resize's order: the columns first where the picture is over a hundred times taller than wide and loses
+    // height (Pillow 12's Image.py), else the rows first; a pass is skipped where its axis keeps its size
+    if (h > w * 100 && h2 < h) {
+        mid.resize((size_t) (c * h2 * w));
+        columns(in.data(), w, mid.data());
+        if (w2 != w) rows(mid.data(), c * h2, out.data());
+        else out = std::move(mid);
+    } else if (w2 != w) {
+        mid.resize((size_t) (c * h * w2));
+        rows(in.data(), c * h, mid.data());
+        if (h2 != h) columns(mid.data(), w2, out.data());
+        else out = std::move(mid);
+    } else {
+        columns(in.data(), w, out.data());
+    }
+    return std::vector<float>(out.begin(), out.end());
 }
 
 CropBox parse_crop(const std::string& word) {

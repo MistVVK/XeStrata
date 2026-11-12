@@ -46,6 +46,20 @@ public:
         return faster_ == 1;
     }
 
+    /// The form of a request's DiT, 8 bits (true) or FP16, in Mage-Flow's, MOSS-Image's and Anima's pipelines:
+    /// `forced` (--dit-q8: 1 8 bits, 0 FP16, -1 auto), else 8 bits where `fp16_need` passes `budget`, else take()'s.
+    /// `fp16_need` is the model's own sum: the FP16 blocks all resident beside what else the request keeps, the text
+    /// encoder counted as the pipeline's plan() keeps it open, whether it is open yet or not.  Counted only once
+    /// open, the first request (the encoder not open yet) chose FP16 and the next 8 bits, which opened the DiT again
+    /// in the other form inside the second request's text stage (MOSS-Image: 5.5 s of its 5.6, RX 9060 XT,
+    /// 2026-11-12).
+    bool want_q8(int forced, uint64_t fp16_need, uint64_t budget, int64_t rows, const char* what, void* stream,
+                 const Timer& time) const {
+        if (forced >= 0) return forced == 1;
+        if (fp16_need > budget) return true;
+        return take(rows, what, stream, time);
+    }
+
     /// Whether take() has an answer: false while neither form could be timed (no room for the timing's buffers).
     bool decided() const { return faster_ >= 0; }
 

@@ -1108,7 +1108,7 @@ void Gemm::native_llm(const uint16_t* X, int ggml_type, const void* W_blocks, fl
     // the shapes the W8A8 form was measured faster for (the comment at w8a8): wide products of many rows, K in whole
     // rotation groups.  The rest stay native: the narrow shared experts (N 512, 640) slower from 4096 rows on the
     // B70, the weight's conversion outweighing the product below 1024 rows
-    if (T >= 1024 && N >= 1024 && K % strata::kernels::kI8Rotate == 0 && ggml_type != 0 && W_blocks != nullptr &&
+    if (T >= kLlmW8a8Rows && N >= 1024 && K % strata::kernels::kI8Rotate == 0 && ggml_type != 0 && W_blocks != nullptr &&
         llm_w8a8(stream_, dense)) {
         native_w8a8(X, ggml_type, W_blocks, Y, T, N, K, ldy);
         return;
