@@ -27,6 +27,7 @@ import json
 import mmap
 import os
 import re
+import struct
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -463,6 +464,123 @@ def supported_model(model_name: str | None = None, family: str | None = None) ->
     if family is not None:
         return family.lower() in SUPPORTED_FAMILIES
     return bool(model_name and _SUPPORTED_NAME.match(str(model_name)))
+
+
+# --------------------------------------------------------------------------------------------------- the model file itself
+#
+# A run config whose model_name does not match _SUPPORTED_NAME (a renamed file, a hand-written config, a feed model under its own name, no name at all) used to start the MTP with
+# no word said, also when the file is Qwen3.8-Flash-Next and DFlash2 was the default for it. What decides now is what the file is: the architecture, the layer count, the hidden
+# size and the vocabulary size in its GGUF header against what the drafter pack records (its ``cfg hidden / vocab / taps`` lines, tools/dflash2_pack.py).
+
+TARGET_ARCH = "qwen4exp"                                    # general.architecture of the Qwen3.8-Flash-Next GGUFs (tools/gguf_writer.py)
+#: What the drafter pack was made for, used when no pack is on this computer yet to read it from: ``cfg hidden 2560``, ``cfg vocab 248320``, ``cfg taps 5,15,25,35,45``
+#: (the layers of the target it reads; the model needs more layers than the last tap).
+PACK_TARGET = {"hidden": 2560, "vocab": 248320, "taps": (5, 15, 25, 35, 45)}
+#: The model name a file that fits is treated as (the plain family name: no quantization, so no per-quantization table entry applies).
+FILE_FITS_AS = "qwen3.8-flash-next"
+#: Names the DFlash2 exclusions above stand for (Coder, NVFP4, Swift): a file under such a name stays out whatever its header says.
+_EXCLUDED_NAME = re.compile(r"coder|nvfp4|swift", re.IGNORECASE)
+_GGUF_HEAD = 1 << 20                                        # bytes of a GGUF read for its header (the keys are in the first few KB; the vocabulary's words are never read)
+_PACK_HEAD = 1 << 16
+_GGUF_SCALAR = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+
+
+def gguf_facts(path: Any) -> dict[str, Any] | None:
+    """What a GGUF file says about itself, from its first megabyte: ``arch`` (general.architecture), ``layers`` (<arch>.block_count), ``hidden`` (<arch>.embedding_length) and
+    ``vocab`` (the number of tokenizer.ggml.tokens, read from the array's header: the words are not read). A part that is not there is None; None when the file is not a GGUF
+    or cannot be read."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(_GGUF_HEAD)
+    except (OSError, TypeError, ValueError):
+        return None
+    if len(head) < 24 or head[:4] != b"GGUF":
+        return None
+    facts: dict[str, Any] = {"arch": None, "layers": None, "hidden": None, "vocab": None}
+    try:
+        pos = 16
+        (n_kv,) = struct.unpack_from("<Q", head, pos)
+        pos += 8
+        for _ in range(min(n_kv, 4096)):
+            (klen,) = struct.unpack_from("<Q", head, pos)
+            pos += 8
+            key = head[pos:pos + klen].decode("utf-8", "replace")
+            pos += klen
+            (vtype,) = struct.unpack_from("<I", head, pos)
+            pos += 4
+            if vtype == 8:                                  # a string
+                (slen,) = struct.unpack_from("<Q", head, pos)
+                pos += 8
+                if key == "general.architecture":
+                    facts["arch"] = head[pos:pos + slen].decode("utf-8", "replace")
+                pos += slen
+            elif vtype in (4, 5) and (key.endswith(".block_count") or key.endswith(".embedding_length")):
+                (value,) = struct.unpack_from("<I" if vtype == 4 else "<i", head, pos)
+                facts["layers" if key.endswith(".block_count") else "hidden"] = value
+                pos += 4
+            elif vtype in _GGUF_SCALAR:
+                pos += _GGUF_SCALAR[vtype]
+            elif vtype == 9:                                # an array: element type, count
+                etype, count = struct.unpack_from("<IQ", head, pos)
+                pos += 12
+                if key == "tokenizer.ggml.tokens":
+                    facts["vocab"] = count
+                    break                                   # the words follow: everything wanted comes before them
+                if etype in _GGUF_SCALAR:
+                    pos += count * _GGUF_SCALAR[etype]
+                else:
+                    break                                   # an array of words before the tokens: not looked into
+            else:
+                break
+            if pos > len(head):
+                break
+    except (struct.error, ValueError, OverflowError, MemoryError):        # a damaged header: no answer
+        return None
+    return facts if facts["arch"] else None
+
+
+def pack_target(data_dir: str | Path | None = None) -> dict[str, Any]:
+    """What the drafter pack on this computer says it was made for (``hidden``, ``vocab``, ``taps`` from its ``cfg`` lines), else PACK_TARGET."""
+    want = dict(PACK_TARGET)
+    if data_dir:
+        base = Path(data_dir) / FOLDER
+        for name in (TUNED_NAME, TUNED_BF16_NAME, CONVERTED_NAME, PACK_NAME):
+            try:
+                with open(base / name, "rb") as f:
+                    head = f.read(_PACK_HEAD)
+            except OSError:
+                continue
+            if len(head) < 12 or head[:4] != b"DF2P":
+                continue
+            (n,) = struct.unpack_from("<I", head, 8)
+            for ln in head[12:12 + n].decode("utf-8", "replace").splitlines():
+                parts = ln.split()
+                if len(parts) >= 3 and parts[0] == "cfg":
+                    try:
+                        if parts[1] in ("hidden", "vocab"):
+                            want[parts[1]] = int(parts[2])
+                        elif parts[1] == "taps":
+                            want["taps"] = tuple(int(x) for x in parts[2].split(","))
+                    except ValueError:
+                        pass
+            break
+    return want
+
+
+def file_fit(args: list[Any], data_dir: str | Path | None = None) -> str:
+    """Is the model file in the engine arguments (``--native``) the one the drafter pack was made for? ``fits`` (Qwen3.8-Flash-Next's architecture, the pack's hidden size and
+    vocabulary, more layers than the last tap), ``family`` (the same architecture, other sizes: a different model of that family), ``other`` (another architecture) or
+    ``unknown`` (no file in the arguments, not a GGUF, or not readable)."""
+    path = _flag_value(args, "--native")
+    facts = gguf_facts(path) if path else None
+    if not facts:
+        return "unknown"
+    if facts["arch"] != TARGET_ARCH:
+        return "other"
+    want = pack_target(data_dir)
+    if facts["hidden"] == want["hidden"] and (facts["layers"] or 0) > max(want["taps"]) and facts["vocab"] in (None, want["vocab"]):
+        return "fits"
+    return "family"
 
 
 def _here(path: Path) -> bool:
@@ -1116,13 +1234,23 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
     args = [str(a) for a in cfg.get("args") or []]
     if cfg.get("split_engine_note") and _flag_value(args, "--draft") == "dflash2":   # the all-cards split engine started with DFlash2 as its drafter (split_engine.split_config): its flags are its own, nothing is added or taken out
         return Decision("dflash2", "dflash2")
-    if not supported_model(cfg.get("model_name"), family):    # another model: its drafting is not this choice's business (Swift, Coder, NVFP4, Qwen3.6...)
+    name = cfg.get("model_name")
+    fit = ""
+    if not supported_model(name, family):
+        # the name is not one setup writes: what the FILE is decides (a renamed Flash-Next file, a hand-written config, a feed model under its own name); Coder, NVFP4 and Swift stay out by name
+        fit = file_fit(args, data_dir) if family is None and not _EXCLUDED_NAME.search(str(name or "")) else ""
+        if fit == "fits":
+            name = FILE_FITS_AS
+    if not supported_model(name, family):                     # another model: its drafting is not this choice's business (Swift, Coder, NVFP4, Qwen3.6...)
         asked = normalize(cfg.get("drafting"))
         if asked == "off" or cfg.get("mtp") is False:            # no drafter for this model (its draft layer is off, or a feed model whose entry says drafter: none): say so, start none
             # "mtp": false: the server's own draft-layer step takes the layer out (and says so); "drafting": "off" alone: taken out here
             cfg["args"] = strip_draft_flags(args) if cfg.get("mtp") is False else strip_mtp_flags(strip_draft_flags(args))
             return Decision(asked, "off")
         if asked == "dflash2":
+            cfg["args"] = strip_draft_flags(args)
+            return Decision(asked, "mtp", NOT_SUPPORTED)
+        if fit == "family":                                       # a Qwen3.8-Flash-Next-family file the drafter was not made for (other sizes): the MTP, and the person is told
             cfg["args"] = strip_draft_flags(args)
             return Decision(asked, "mtp", NOT_SUPPORTED)
         return Decision(asked, "mtp")
@@ -1134,15 +1262,15 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
     mode = cfg.get("drafting")
     if cfg.get("mtp") is False and normalize(mode) == "auto":
         mode = "off"                                          # "Draft layer (MTP)" turned off by the person, and no drafter chosen since: no drafter
-    decision = decide(mode, model_name=cfg.get("model_name"), family=family, data_dir=data_dir, backend=backend, archs=archs,
+    decision = decide(mode, model_name=name, family=family, data_dir=data_dir, backend=backend, archs=archs,
                       mtp_here=mtp_here, blocked=blocked_by(strip_draft_flags(args), split=split, slots=slots, named=normalize(mode) == "dflash2", backend=backend) or form == FORM_NONE, vocab_here=vocab is not None,
                       args=strip_mtp_flags(strip_draft_flags(args)), vram_mib=vram_mib)
     mine = cfg.get("user_args") or []
     pack = None
     if decision.drafter == "dflash2":
-        qualifies = tuned_applies(backend, cfg.get("model_name"), archs, args=strip_mtp_flags(strip_draft_flags(args)), vram_mib=vram_mib)
-        pack = pack_path(data_dir, engine, model_name=cfg.get("model_name"), backend=backend, tuned=qualifies)
-        if Path(pack) != tuned_path(data_dir, tuned_variant(backend, cfg.get("model_name"))) and not pack_ready(data_dir):         # (only the tuned pack is here and this engine cannot read it: no drafter file for it)
+        qualifies = tuned_applies(backend, name, archs, args=strip_mtp_flags(strip_draft_flags(args)), vram_mib=vram_mib)
+        pack = pack_path(data_dir, engine, model_name=name, backend=backend, tuned=qualifies)
+        if Path(pack) != tuned_path(data_dir, tuned_variant(backend, name)) and not pack_ready(data_dir):         # (only the tuned pack is here and this engine cannot read it: no drafter file for it)
             decision = Decision(decision.asked, "mtp", NOT_DOWNLOADED) if mtp_here is not False else Decision(decision.asked, "off", NONE_HERE)
     if decision.drafter == "off":
         cfg["args"] = strip_mtp_flags(strip_draft_flags(args))
@@ -1155,10 +1283,10 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
         base = strip_mtp_flags(strip_draft_flags(args))
         flags = list(engine_flags(pack, vocab, form))
         kept_conf = _flag_value(mine, "--draft-conf")
-        tuned_conf = tuned_conf_for(backend, cfg.get("model_name")) if Path(pack) == tuned_path(data_dir, tuned_variant(backend, cfg.get("model_name"))) else None     # Metal: the conf the tuned pack was measured with; CUDA / HIP: None, the backend's own conf stays
+        tuned_conf = tuned_conf_for(backend, name) if Path(pack) == tuned_path(data_dir, tuned_variant(backend, name)) else None     # Metal: the conf the tuned pack was measured with; CUDA / HIP: None, the backend's own conf stays
         held = slots_of(base, vram_mib)
-        tuned_here = Path(pack) == tuned_path(data_dir, tuned_variant(backend, cfg.get("model_name")))
-        card_conf = big_blackwell_conf_for(backend, cfg.get("model_name"), archs, vram_mib, held) if tuned_here else None      # large-VRAM Blackwell, IQ3_S, tuned pack: the measured 0.55; Strix keeps 0.35 and only widens the window
+        tuned_here = Path(pack) == tuned_path(data_dir, tuned_variant(backend, name))
+        card_conf = big_blackwell_conf_for(backend, name, archs, vram_mib, held) if tuned_here else None      # large-VRAM Blackwell, IQ3_S, tuned pack: the measured 0.55; Strix keeps 0.35 and only widens the window
         flags[flags.index("--draft-conf") + 1] = kept_conf if kept_conf is not None else f"{tuned_conf if tuned_conf is not None else card_conf if card_conf is not None else conf_for(backend, held):g}"
         flags[flags.index("--spec") + 1] = str(window_for(backend, archs, vram_mib, held))
         if _flag_value(mine, "--spec") is None:
