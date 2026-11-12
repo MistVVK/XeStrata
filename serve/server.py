@@ -2727,9 +2727,9 @@ def vision_attempts(cfg: dict) -> list[dict]:
 
 
 class Vision:
-    """The resident image encoder: `xestrata-vision` (llama.cpp mtmd + the mmproj file) reads `ENC <image> <out>`
-    lines and writes each image's embeddings; results are cached by the image's hash, so a conversation that
-    sends the same picture again (every turn, with most clients) encodes it once.
+    """The resident image encoder: `xestrata-vision` (the engine's vision encoder + the mmproj file, on the GPU or the
+    CPU) reads `ENC <image> <out>` lines and writes each image's embeddings; results are cached by the image's hash,
+    so a conversation that sends the same picture again (every turn, with most clients) encodes it once.
 
     Every wait on it is bounded.  An encoder that stops or stops answering is marked dead: later image requests
     fail with the reason and text requests are unaffected."""
@@ -2785,8 +2785,8 @@ class Vision:
     # the fewest image tokens a picture becomes on the GPU reader: below it a small or wide picture shrank to 300 tokens
     # or so and its text was misread (a receipt of 800 x 400 at 325 tokens, by every Qwen3.x reader and by llama.cpp's
     # mtmd, which recommends 1,024 for Qwen-VL); at 1,024 it read right, in 1.5 s at most a picture on the B70 and with
-    # the same VRAM (the reader's buffers are sized for its maximum).  The CPU reader keeps its 300 (11 s a picture at
-    # 1,024 on an i7-14700), and a config's min_tokens sets either
+    # the same VRAM (the reader's buffers are sized for its maximum).  The CPU reader keeps its 300 (9-10 s a picture
+    # at 1,024 on a Ryzen 7 5700X with 8 threads, 2.4-2.7 s at 300), and a config's min_tokens sets either
     DEFAULT_MIN_TOKENS = {"gpu": 1024, "cpu": 0}
 
     @staticmethod

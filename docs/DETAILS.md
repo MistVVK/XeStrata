@@ -1927,12 +1927,12 @@ and set as this section describes.
 It is **optional**, and setup's "Images?" defaults to yes for a model that reads pictures (upstream 91baead75).
 To leave it out, say no or pass `--vision no`; to add it later, run setup again with `--vision gpu` (or `--vision cpu`).
 Yes (`--vision yes`) means the GPU encoder on a card of 24 GB and more and the CPU encoder on a smaller one: the GPU encoder keeps about 1.4 GB of VRAM free, which cost 3-5% of text speed on 16 GB cards (upstream #2406's measurement). `--vision gpu` keeps the GPU encoder on a small card too.
-setup downloads the mmproj and prepares the GPU reader (`xestrata-vision-gpu`: XeStrata's own vision encoder, built with the engine) and the CPU reader (`xestrata-vision-cpu`, from llama.cpp's `mtmd`: for a small card, and when the GPU reader cannot start), then adds it to your start script.
+setup downloads the mmproj and adds the picture reader (`xestrata-vision`: XeStrata's own vision encoder, built with the engine, on the GPU, or on the CPU for a small card and when it cannot start on the GPU) to your start script.
 Nothing else changes.
 
 | Encoder on | Speed | Image tokens per picture |
 | --- | --- | --- |
-| **GPU** (recommended) | 30–50× faster than the CPU encoder | 1,024 (small and wide pictures scaled up to 1,024) |
+| **GPU** (recommended) | 30–45× faster than the CPU encoder | 1,024 (small and wide pictures scaled up to 1,024) |
 | CPU | slow | scaled down to about 300 |
 
 With images on, setup passes `--vram-reserve-mib 700` to the engine.
@@ -1963,21 +1963,12 @@ The default is 1,024 on the GPU encoder and no minimum on the CPU encoder.
 With few tokens small text such as a receipt's is misread (an 800x400 receipt at 325 tokens gave a wrong number and total, at 1,024 the right ones; llama.cpp's mtmd recommends at least 1,024 for Qwen-VL models too).
 On the GPU 1,024 takes no more VRAM and at most 1.5 s a picture on the B70.
 To read small text accurately on the CPU too, write `"min_tokens": 1024` and `"max_tokens": 1024` by hand in the `"vision"` section of `xestrata-<model>.json`.
-Encoding then takes 11–12 s a picture (an i7-14700, 14 threads; 1.4–2.2 s at the default of about 300 tokens).
+Encoding then takes 8.9–9.9 s a picture (a Ryzen 7 5700X, 8 threads; 2.4–2.7 s at the default of about 300 tokens).
 A setup run again keeps the values.
 
 **A Q8_0 encoder** (upstream #625): `"mmproj"` in the `"vision"` section can point to another mmproj file of this model, for example a Q8_0 one (`llama-quantize mmproj-Qwen3.8-Flash-Next-BF16.gguf mmproj-Qwen3.8-Flash-Next-Q8_0.gguf Q8_0` makes one).
-The file is smaller (590 MiB against 865 MiB for the BF16 one), the encoder takes about 280 MiB less RAM on the CPU, and at the default 300 tokens it can encode faster than BF16.
-It is the one to use with `--vision cpu`.
+The file is smaller (590 MiB against 865 MiB for the BF16 one), but the encoder converts the weights when it loads them, to FP16 on the GPU and to BF16 on the CPU, so it takes the same memory and time as with the BF16 file.
 Setup downloads the BF16 file, and a setup run again keeps a file of your own that still exists.
-Against BF16, upstream reports a cosine of the embeddings per image token of 0.997-0.999 on average (at 300, 768 and 1,024 tokens), 0.94-0.96 for the worst token.
-Above 768 tokens the encode time is within about 3% of BF16's.
-
-**Flash attention in the CPU encoder** (upstream #660): ggml's fast CPU kernel for flash attention needs the encoder's head size (72) to be a multiple of the vector width.
-It is with AVX2's 8 floats, not with AVX-512's 16, where ggml falls back to a kernel several times slower that adds in FP16.
-`xestrata-vision` therefore turns flash attention off in a CPU build whose ggml has AVX-512, and leaves it at `auto` (on) otherwise.
-`--flash-attn on|off|auto` overrides that.
-Upstream measured a 1024x1024 picture on a Ryzen 7 7700X with 8 threads: AVX2 8-10 s with it and 14-15 s without, AVX-512 44 s with it and 13 s without.
 
 ### Sending a picture
 
@@ -2262,7 +2253,7 @@ The web app's About > Model terms shows the full terms of the models it runs now
   The image models: Qwen's Qwen-Image-2.1 and Qwen-Image-2.1-Turbo (GGUFs by Unsloth), Microsoft's Mage-Flow (Comfy-Org's safetensors), RicemanT's MageTrail with Black Forest Labs' Flux2 VAE (FLUX.2-klein-4B's), Tencent's HunyuanImage 3.0 (quantized as single files by PedroMarinhoDev), OpenMOSS's MOSS-Image with its edit adapters (chinoll's Moss-Image-Edit, as a single file by PedroMarinhoDev; akhaliq's MOSS-Image-Edit-HQ armV5 and armV6), the text encoders, Qwen3-VL (Unsloth's, AtomicChat's, and huihui-ai's by noctrex), and the parts' fix's detectors, Bingsu's adetailer (`face_yolov8m`, `hand_yolov8s`, `person_yolov8m-seg`, trained with Ultralytics YOLOv8: Apache 2.0 by their publisher; Ultralytics holds models trained with YOLO to be under AGPL-3.0 by default), and the upscalers, Xintao Wang, Liangbin Xie, Chao Dong and Ying Shan's RealESRGAN x4plus (BSD-3-Clause; the official release's file, fetched from lllyasviel/Annotators) and ByteDance Seed's SeedVR2 7B, 7B sharp and 3B with its VAE (Apache-2.0; Comfy-Org's repackaging), the composition control's alibaba-pai Qwen-Image-2.1 Fun ControlNet Union (Qwen Research License) and darask0's MOSS-Image color and depth adapter and 4-step adapter (Apache-2.0), and the networks that make the control maps, Depth Anything V2 Small (Apache-2.0), DWPose (Apache-2.0), Megvii's YOLOX-L (Apache-2.0), ControlNet 1.1's HED (Apache-2.0), Caroline Chan's line art (MIT) and NAVER's M-LSD (Apache-2.0) ([IMAGE](IMAGE.md#licenses)).
   Their licenses apply to the weights.
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** (MIT): the i-quant formats, the GPU dot products and dequantizers transcribed in `src/kernels/xe/`,
-  the CPU backend linked for the i-quant experts, the `mtmd` library behind the CPU image encoder (`tools/vision/`; the GPU reader does not use llama.cpp),
+  the CPU backend linked for the i-quant experts,
   and `gguf-py` used by the tools. See `third_party/main/ggml/LICENSE`.
 - **[oneMath](https://github.com/uxlfoundation/oneMath)** (Apache-2.0): the layer that hands the dense matrix products to oneMKL (Intel) and cuBLAS (NVIDIA) in the contrib-llvm mode, and to rocBLAS and hipBLASLt (AMD) in the free and contrib-llvm modes.
   It is not in the repository: CMake fetches XeStrata's fork ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), oneMath with XeStrata's changes: cuBLAS's BF16 product, hipBLASLt in the rocBLAS backend), under oneMath's license. See `third_party/main/oneMath/LICENSE`.

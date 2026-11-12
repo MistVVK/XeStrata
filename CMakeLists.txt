@@ -845,8 +845,8 @@ if(STRATA_ENABLE_XE)
 
   # the vision encoder the chat's picture reader and the image engine share (Qwen3-VL's ViT, src/core/vision.cpp), with
   # the attention and the row kernels it shares with the image engine (src/kernels/xe/image_attn.cpp, image_sdpa.cpp,
-  # vision_rows.cpp), and strata-vision-gpu, the picture reader that runs it on the GPU (tools/vision/strata_vision.cpp).
-  # The CPU reader (tools/vision, built apart) is llama.cpp's mtmd, for the machines without a GPU to spare.
+  # vision_rows.cpp), and strata-vision, the chat's picture reader that runs it on the GPU or, without --gpu, on the CPU
+  # (tools/vision/strata_vision.cpp; the CPU's rows are kernels/cpu/vision_cpu.hpp's).
   add_library(strata_vision STATIC src/core/vision.cpp src/kernels/xe/image_attn.cpp src/kernels/xe/image_sdpa.cpp
                            src/kernels/xe/vision_rows.cpp)
   target_include_directories(strata_vision PUBLIC include)
@@ -1231,11 +1231,12 @@ if(STRATA_ENABLE_XE)
   target_include_directories(strata_image SYSTEM PRIVATE third_party/main/stb)
   set_source_files_properties(src/image/qi_image_io.cpp PROPERTIES COMPILE_OPTIONS "-w")
   target_link_libraries(strata_image PUBLIC strata_prefill strata_video strata_vision)
-  # the picture reader on the GPU: the engine's own vision encoder, and the image engine's own reading and resizing of
-  # a picture (img_start's planes, img_crop's Pillow resize, qi_image_io's stb), so its preprocessing is an edit's.
-  add_executable(strata-vision-gpu tools/vision/strata_vision.cpp)
-  target_link_libraries(strata-vision-gpu PRIVATE strata_image)
-  strata_utf8_manifest(strata-vision-gpu)
+  # the picture reader (xestrata-vision, on the GPU or the CPU): the engine's own vision encoder, and the image engine's
+  # own reading and resizing of a picture (img_start's planes, img_crop's Pillow resize, qi_image_io's stb), so its
+  # preprocessing is an edit's.
+  add_executable(strata-vision tools/vision/strata_vision.cpp)
+  target_link_libraries(strata-vision PRIVATE strata_image)
+  strata_utf8_manifest(strata-vision)
   add_executable(strata-image-lora-probe src/image/lora_probe.cpp)
   target_link_libraries(strata-image-lora-probe PRIVATE strata_image)
   # the adapter's delta (y += scale (x A^T) B^T) against an FP64 reference: the plain form, a fused weight's rows, a
@@ -1600,8 +1601,10 @@ endif()
 add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
             src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/hadamard.cpp
             src/kernels/cpu/kq_avx2.cpp src/kernels/cpu/bf16_gemm.cpp src/kernels/cpu/bf16_gemm_avx2.cpp
+            src/kernels/cpu/bf16_gemm_avx512.cpp
             src/kernels/cpu/i8_gemm.cpp src/kernels/cpu/i8_gemm_vnni.cpp src/kernels/cpu/i8_gemm_avx512.cpp
-            src/kernels/cpu/cpu_ops.cpp)
+            src/kernels/cpu/cpu_ops.cpp src/kernels/cpu/vision_cpu.cpp src/kernels/cpu/vision_cpu_avx2.cpp
+            src/kernels/cpu/vision_cpu_avx512.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
@@ -1615,6 +1618,12 @@ set_source_files_properties(src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/kq_avx2.
 # baseline x86-64 and its vector copies in a file of their own with the AVX2 flags.  -mavxvnni is NOT put on a file:
 # the VNNI intrinsics are used only inside functions marked target("avxvnni"), the rule below.
 set_source_files_properties(src/kernels/cpu/bf16_gemm_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+set_source_files_properties(src/kernels/cpu/bf16_gemm_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx2;-mfma")
+# the CPU vision encoder's rows (vision_cpu.hpp): the LayerNorm, the GELU, the softmax and the RoPE, eight floats wide
+# where cpu_avx2_ok() and sixteen where the BF16 product takes its AVX-512 kernel; each copy its own file and flags
+set_source_files_properties(src/kernels/cpu/vision_cpu_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+set_source_files_properties(src/kernels/cpu/vision_cpu_avx512.cpp PROPERTIES COMPILE_OPTIONS
+                            "-mavx512f;-mavx2;-mfma")
 # The AVX-512 VNNI copy is compiled the same way: its functions alone are target("avx512f,avx512vnni").
 set_source_files_properties(src/kernels/cpu/i8_gemm_vnni.cpp src/kernels/cpu/i8_gemm_avx512.cpp
                             PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")

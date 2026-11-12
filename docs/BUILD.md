@@ -185,7 +185,7 @@ cmake --build build/free --target xestrata-device xestrata-load elementwise_pari
 
 The engine (the `xestrata-engine` executable) uses llama.cpp for the native i-quant experts.
 llama.cpp goes in `third_party/main/llama.cpp` at the pinned commit (`3cf03257f219afbe7334045ff7c6a06ac68c627d`).
-setup.py fetches it; the image encoder also uses its `tools/mtmd`.
+setup.py fetches it.
 
 ```bash
 L=$PWD/.tools/intel-llvm/install
@@ -423,7 +423,7 @@ The Windows 7z is built with the same `tools/package/build.sh`, in a disposable 
 tools/package/build.sh windows cuda12.4      # XeStrata-<version>-windows-x64.7z
 ```
 
-- All of it is cross-built on Linux for Windows: intel/llvm (the Linux contrib toolchain and the SYCL runtime for Windows), the engine (the contrib-llvm mode, the NVIDIA code as the cuda12.4 deb's), the picture readers (`xestrata-vision-cpu.exe` and `xestrata-vision-gpu.exe`), the .NET launchers (`dotnet-sdk-10.0`), and Python's embeddable distribution with the wheels; `tools/package/windows_bundle.py` makes the folder and the 7z.
+- All of it is cross-built on Linux for Windows: intel/llvm (the Linux contrib toolchain and the SYCL runtime for Windows), the engine (the contrib-llvm mode, the NVIDIA code as the cuda12.4 deb's), the picture reader (`xestrata-vision.exe`), the .NET launchers (`dotnet-sdk-10.0`), and Python's embeddable distribution with the wheels; `tools/package/windows_bundle.py` makes the folder and the 7z.
 - The MSVC CRT and the Windows SDK come from Microsoft through xwin, its license accepted (they are not free software and do not go into the 7z). Neither do the Windows CUDA headers and import libraries.
 - It uses the Ubuntu 26.04 packages' ccache (`build/pkg-ccache/ubuntu26.04/`) and keeps xwin's and NuGet's downloads in `build/pkg-cache/windows/`.
 - Every exe, DLL and Python package in the 7z must be one of `windows_bundle.py`'s components; a Visual C++ runtime or an NVIDIA library in it stops the build.

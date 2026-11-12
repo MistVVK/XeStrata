@@ -139,7 +139,7 @@ if [ "$license" = contrib ]; then
   [ -x "$cuda_path/bin/nvcc" ] || export PATH="/usr/bin:$PATH"   # Debian's toolkit: /usr/lib/cuda, nvcc in /usr/bin
 fi
 
-# llama.cpp at the commit setup.py pins: ggml for the engine, mtmd for the image encoders, gguf-py for the tools
+# llama.cpp at the commit setup.py pins: ggml for the engine, gguf-py for the tools
 commit=$(sed -n 's/^LLAMA_CPP_COMMIT = "\([0-9a-f]*\)"$/\1/p' "$src/setup.py")
 curl -fsSL -o /tmp/llama.zip "https://github.com/ggml-org/llama.cpp/archive/$commit.zip"
 unzip -q /tmp/llama.zip -d /tmp/llama
@@ -158,31 +158,21 @@ fi
 llvm_keep "$distro-$variant" "$llvm" "$key"
 lap intel-llvm
 
-# the picture reader for the CPU (tools/vision, llama.cpp's mtmd): any AVX2 CPU.  The GPU reader is the engine's own
-# vision encoder and comes with the engine (strata-vision-gpu, below).
-jobs=${XESTRATA_JOBS:-$(nproc)}
-cmake -G Ninja -S "$src/tools/vision" -B /build/vision-cpu -DCMAKE_BUILD_TYPE=Release -DLLAMA_DIR="$llama" \
-  -DSTRATA_PORTABLE=ON
-cmake --build /build/vision-cpu --target strata-vision -j "$jobs"
-mkdir -p /build/vision
-cp /build/vision-cpu/bin/xestrata-vision-cpu /build/vision/xestrata-vision-cpu
-
-lap encoders
-
 # the engine
+jobs=${XESTRATA_JOBS:-$(nproc)}
 set -- -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
   -DCMAKE_CXX_COMPILER="$llvm/install/bin/clang++" -DCMAKE_C_COMPILER="$llvm/install/bin/clang" \
   -DSTRATA_LICENSE="$license" -DSTRATA_ENABLE_XE=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF \
   -DSTRATA_PORTABLE=ON -DSTRATA_GGML_DIR="$llama" -DSTRATA_PACKAGE=ON -DSTRATA_PACKAGE_NAME="$pkgname" \
-  -DSTRATA_PACKAGE_VISION_DIR=/build/vision -DSTRATA_HIP_ARCHS=rocblas
+  -DSTRATA_HIP_ARCHS=rocblas
 if [ "$license" = contrib ]; then
   # the PTX version: the toolkit's (empty); the driver must support this CUDA version
   set -- "$@" -DSTRATA_CUDA_ARCHS="$archs" -DSTRATA_ONEMKL=ON -DMKL_ROOT=/opt/intel/oneapi/mkl/latest \
     -DSTRATA_CUDA_PATH="$cuda_path" -DSTRATA_CUDA_PTX= ${cudnn_root:+-DSTRATA_CUDNN_ROOT=$cudnn_root}
 fi
 cmake -G Ninja -S "$src" -B /build/engine "$@"
-targets="strata strata-image strata-vision-gpu onemath_backend_libs"   # oneMath's backends: rocBLAS (AMD GPUs) in
-# every package; strata-vision-gpu: the GPU picture reader (the engine's own vision encoder)
+targets="strata strata-image strata-vision onemath_backend_libs"   # oneMath's backends: rocBLAS (AMD GPUs) in
+# every package; strata-vision: the picture reader (the engine's own vision encoder, on the GPU or the CPU)
 # shellcheck disable=SC2086
 cmake --build /build/engine --target $targets -j "$jobs"
 lap engine
@@ -238,7 +228,7 @@ case "$distro" in
     : > /stage/debian/control
     # its own assignment, so that set -e stops on a failure (in a pipe the last command's status would hide it)
     # shellcheck disable=SC2046
-    substvars=$(cd /stage && dpkg-shlibdeps -O --ignore-missing-info -l"$eng/lib" "$eng"/xestrata-engine "$eng"/xestrata-image "$eng"/xestrata-vision-* \
+    substvars=$(cd /stage && dpkg-shlibdeps -O --ignore-missing-info -l"$eng/lib" "$eng"/xestrata-engine "$eng"/xestrata-image "$eng"/xestrata-vision \
       $(find "$eng/lib" -type f \( -name 'libsycl.so*' -o -name 'libumf.so*' \
         -o -name 'libur_adapter_level_zero*' -o -name 'libonemath.so*' \)))
     shlibs=$(echo "$substvars" | sed -n 's/^shlibs:Depends=//p')

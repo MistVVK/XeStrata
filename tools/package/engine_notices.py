@@ -26,9 +26,9 @@ from typing import Any
 # it goes with (PARTS.json's "parts"; None: every build), the texts on Linux where they differ, and whether it is free
 # software and carried (False: opened where the user installed it, never in a package).
 ROWS: list[dict[str, Any]] = [
-    {"name": "ggml, mtmd and gguf-py (llama.cpp: compiled into the engine and the image encoders; the tools' GGUF "
-             "reader)", "version": "llama.cpp", "license": "MIT", "source": "https://github.com/ggml-org/llama.cpp",
-     "texts": ["llama:LICENSE"]},
+    {"name": "ggml and gguf-py (llama.cpp: ggml compiled into the engine, the image engine and the picture reader; "
+             "the tools' GGUF reader)", "version": "llama.cpp", "license": "MIT",
+     "source": "https://github.com/ggml-org/llama.cpp", "texts": ["llama:LICENSE"]},
     {"name": "oneMath (XeStrata's fork)", "version": "onemath", "license": "Apache-2.0",
      "source": "https://github.com/MistVVK/oneMath", "texts": ["onemath:LICENSE"],
      "linux_texts": ["src:third_party/main/oneMath/LICENSE"], "part": "onemath",

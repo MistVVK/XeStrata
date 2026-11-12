@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// tools/vision/strata_vision.cpp - the chat's picture reader on the GPU: the vision encoder the image engine shares
-// (strata/core/vision.hpp: Qwen3-VL's ViT and its merger from the model's mmproj GGUF) in place of llama.cpp's mtmd,
-// which the CPU reader keeps (strata_vision_mtmd.cpp, built apart).  Same protocol, so serve and the engines do not
-// change:
+// tools/vision/strata_vision.cpp - the chat's picture reader: the vision encoder the image engine shares
+// (strata/core/vision.hpp: Qwen3-VL's ViT and its merger from the model's mmproj GGUF), on the GPU with --gpu and on
+// the CPU without (BF16 products on --threads threads, default one a core; int8 ones with XESTRATA_VISION_CPU_I8=1).  The protocol is the one llama.cpp's mtmd
+// reader spoke before it, so serve and the engines do not change:
 //
-//   xestrata-vision-gpu --mmproj <mmproj.gguf> [--model <text model, for a config that names it: not read>]
-//                       [--gpu] [--gpu-pci ADDR] [--max-tokens N] [--min-tokens N]
+//   xestrata-vision --mmproj <mmproj.gguf> [--model <text model, for a config that names it: not read>]
+//                   [--gpu] [--gpu-pci ADDR] [--threads N] [--max-tokens N] [--min-tokens N]
 //
 // Resident: prints "READY <n_embd>", then per stdin line
 //   ENC <image path> <output path>   ->  "OK <n_tokens> <nx> <ny> <ms>"  or  "ERR <message>"
@@ -19,6 +19,8 @@
 // and --max-tokens, Pillow's bicubic, RGB in -1 .. 1 (the mmproj's image mean and deviation of 0.5).
 #include "strata/core/runtime.hpp"
 #include "strata/core/vision.hpp"
+#include "strata/kernels/cpu/bf16_gemm.hpp"
+#include "strata/kernels/cpu/i8_gemm.hpp"
 #include "strata/image/img_crop.hpp"
 #include "strata/image/img_start.hpp"
 #include "strata/image/pipeline.hpp"
@@ -33,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -87,7 +90,7 @@ std::vector<float> picture_planes(const std::vector<uint8_t>& rgba, int64_t widt
 }
 
 // "ENC <image> <out>": paths may contain spaces, so the image path ends at the last " " before the output path (as
-// the CPU reader reads it; the server writes paths without spaces)
+// mtmd's reader read it; the server writes paths without spaces)
 bool parse_enc(const std::string& line, std::string& img, std::string& out) {
     if (line.rfind("ENC ", 0) != 0) return false;
     const std::string rest = line.substr(4);
@@ -103,6 +106,8 @@ bool parse_enc(const std::string& line, std::string& img, std::string& out) {
 int main(int argc, char** argv) {
     std::string mmproj, model, gpu_pci;
     int64_t max_tokens = 0, min_tokens = 0;
+    bool gpu = false;
+    int threads = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -113,9 +118,10 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "--mmproj") mmproj = next();
-        else if (a == "--model") model = next();   // the config names it for the CPU reader; this one reads no text model
-        else if (a == "--gpu") { }
+        else if (a == "--model") model = next();   // the configs name it (mtmd's reader read its vocabulary); not read
+        else if (a == "--gpu") gpu = true;
         else if (a == "--gpu-pci") gpu_pci = next();
+        else if (a == "--threads") threads = (int) std::strtol(next().c_str(), nullptr, 10);
         else if (a == "--max-tokens") max_tokens = std::strtoll(next().c_str(), nullptr, 10);
         else if (a == "--min-tokens") min_tokens = std::strtoll(next().c_str(), nullptr, 10);
         else {
@@ -124,14 +130,16 @@ int main(int argc, char** argv) {
         }
     }
     if (mmproj.empty()) {
-        std::fprintf(stderr, "usage: xestrata-vision-gpu --mmproj <mmproj.gguf> [--model <model.gguf>] [--gpu] "
-                             "[--gpu-pci ADDR] [--max-tokens N] [--min-tokens N]\n");
+        std::fprintf(stderr, "usage: xestrata-vision --mmproj <mmproj.gguf> [--model <model.gguf>] [--gpu] "
+                             "[--gpu-pci ADDR] [--threads N] [--max-tokens N] [--min-tokens N]\n");
         return 2;
     }
     (void) model;
-    // the ViT's attention in 16 bits unless the environment names a choice: the rows come out closer to the CPU
-    // reader's (llama.cpp's mtmd has no int8 path) than the int8 kernel's, for about 40 ms a picture of 1,024 tokens
-    if (strata::env_get("IMAGE_ATTN_I8") == nullptr) {
+    // on the CPU without --threads: one per core (hardware threads over two, as mtmd's reader took them)
+    if (threads <= 0) threads = (int) std::max(1u, std::thread::hardware_concurrency() / 2);
+    // the ViT's attention in 16 bits unless the environment names a choice: the rows come out closer to the FP32
+    // reference than the int8 kernel's, for about 40 ms a picture of 1,024 tokens
+    if (gpu && strata::env_get("IMAGE_ATTN_I8") == nullptr) {
 #if defined(_WIN32)
         _putenv_s("XESTRATA_IMAGE_ATTN_I8", "0");
 #else
@@ -140,7 +148,7 @@ int main(int argc, char** argv) {
     }
     // the runtime reads the card's PCI address when it starts (core/device.cpp: XESTRATA_GPU_PCI), as the engines take
     // it: this has to happen before the first device is opened
-    if (!gpu_pci.empty()) {
+    if (gpu && !gpu_pci.empty()) {
 #if defined(_WIN32)
         _putenv_s("XESTRATA_GPU_PCI", gpu_pci.c_str());
 #else
@@ -148,19 +156,25 @@ int main(int argc, char** argv) {
 #endif
     }
 
-    void* stream = strata::core::Runtime::get().create_stream();
     // the products' library loaded on a thread of its own while the encoder opens (as the image engine starts), and not
-    // still loading when the process ends
-    strata::prefill::Gemm::prepare();
-    strata::prefill::Gemm::settle();
+    // still loading when the process ends (the GPU's; the CPU opens no device)
     struct GemmDone {
-        ~GemmDone() { strata::prefill::Gemm::finish(); }
+        bool on = false;
+        ~GemmDone() {
+            if (on) strata::prefill::Gemm::finish();
+        }
     } gemm_done;
-    (void) gemm_done;
+    void* stream = nullptr;
+    if (gpu) {
+        stream = strata::core::Runtime::get().create_stream();
+        strata::prefill::Gemm::prepare();
+        strata::prefill::Gemm::settle();
+        gemm_done.on = true;
+    }
     strata::core::Vision vision;
     std::string err;
     const auto load_t0 = std::chrono::steady_clock::now();
-    if (!vision.open(mmproj, stream, err)) {
+    if (!(gpu ? vision.open(mmproj, stream, err) : vision.open_cpu(mmproj, threads, err))) {
         std::printf("ERR cannot load the vision encoder %s (%s)\n", mmproj.c_str(), err.c_str());
         std::fflush(stdout);
         return 1;
@@ -168,12 +182,26 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "xestrata-vision: model files loaded in %.1f s (weights %.2f GB)\n",
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - load_t0).count(),
                  (double) vision.weight_bytes() / 1e9);
+    if (!gpu)
+        std::fprintf(stderr, "xestrata-vision: on the CPU, %d threads, %s products (%s), no warm-up\n", threads,
+                     vision.cpu_i8() ? "int8" : "BF16",
+                     vision.cpu_i8() ? strata::kernels::cpu::i8_gemm_isa_name(strata::kernels::cpu::i8_gemm_isa())
+                                     : strata::kernels::cpu::bf16_gemm_isa_name(strata::kernels::cpu::bf16_gemm_isa()));
     const int64_t align = vision.patch() * vision.merge();
     // Warm up at the largest picture (well above any cap; the reader's size rule brings it to --max-tokens) before
     // READY: the encoder's work buffers are allocated now, not at the first real picture, and the server starts this
-    // process before the engine so that the engine sizes its expert cache from what is really left.
+    // process before the engine so that the engine sizes its expert cache from what is really left.  The CPU's
+    // buffers are the host's, so it only counts the tokens such a picture becomes (an encode there takes seconds).
     int64_t warm_tokens = 0, n_embd = 0;
-    {
+    if (!gpu) {
+        const Size sz = reader_size(2048, 2048, align, min_tokens, max_tokens);
+        warm_tokens = (sz.w / align) * (sz.h / align);
+        n_embd = vision.dim();
+        if (max_tokens > 0 && warm_tokens > max_tokens + max_tokens / 8)
+            std::fprintf(stderr, "xestrata-vision: WARNING a 2048 x 2048 picture becomes %lld image tokens, over the "
+                                 "limit of %lld (--max-tokens): pictures over it are refused\n",
+                         (long long) warm_tokens, (long long) max_tokens);
+    } else {
         const auto warm_t0 = std::chrono::steady_clock::now();
         const int64_t side = 2048;
         std::vector<uint8_t> gray((size_t) (side * side * 4), 128);
@@ -190,8 +218,8 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "xestrata-vision: warmed up at %lld image tokens in %.1f s\n", (long long) warm_tokens,
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_t0).count());
-        // I7 (#3690): a picture that became 93,700 image tokens under --max-tokens 1024.  The same evidence line the
-        // CPU reader writes, for the same report.
+        // I7 (#3690): a picture that became 93,700 image tokens under --max-tokens 1024: the evidence line the
+        // report asks for
         if (max_tokens > 0 && warm_tokens > max_tokens + max_tokens / 8)
             std::fprintf(stderr, "xestrata-vision: WARNING the warm-up picture became %lld image tokens, over the limit "
                                  "of %lld (--max-tokens): pictures over it are refused\n", (long long) warm_tokens,
@@ -240,7 +268,7 @@ int main(int argc, char** argv) {
             continue;
         }
         // never silently produce many times the budget (I7, #3690): over the limit (a rounding margin of an eighth)
-        // the picture is refused, as the CPU reader refuses it
+        // the picture is refused, as mtmd's reader refused it
         if (max_tokens > 0 && n > max_tokens + max_tokens / 8) {
             std::printf("ERR the picture became %lld image tokens, over the limit of %lld (vision.max_tokens); send a "
                         "smaller picture or raise the limit\n", (long long) n, (long long) max_tokens);

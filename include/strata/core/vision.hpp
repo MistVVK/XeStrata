@@ -1,11 +1,16 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // include/strata/core/vision.hpp - the vision encoder the chat's picture reader and the image engine share: Qwen3-VL's
-// ViT and its merger, from the model's mmproj GGUF, on the GPU.  A picture (RGB in -1 .. 1, sides multiples of 32) to
-// the text model's image embeddings, one per 32 x 32 pixels (2 x 2 patches merged), and the DeepStack ones the text
-// encoder adds after its first layers.
+// ViT and its merger, from the model's mmproj GGUF, on the GPU (open) or on the CPU (open_cpu: the chat's reader on a
+// machine without a GPU to spare).  A picture (RGB in -1 .. 1, sides multiples of 32) to the text model's image
+// embeddings, one per 32 x 32 pixels (2 x 2 patches merged), and the DeepStack ones the text encoder adds after its
+// first layers.  The two share the reading of the file, the patches and the positions; the CPU's products take the
+// weights in BF16 and the activations in FP32 (kernels/cpu/bf16_gemm.hpp; why not int8: kernels/cpu/vision_cpu.hpp),
+// or with XESTRATA_VISION_CPU_I8=1 int8 both (W8A8, kernels/cpu/i8_gemm.hpp): about twice as fast and further from the
+// reference.
 #pragma once
 
+#include "strata/kernels/cpu/vision_cpu.hpp"
 #include "strata/prefill/gemm.hpp"
 
 #include <cstdint>
@@ -35,6 +40,11 @@ public:
 
     /// Reads the mmproj GGUF and puts its weights on the current GPU (`dry`: the sizes only).
     bool open(const std::string& path, void* stream, std::string& err, bool dry = false);
+    /// Reads the mmproj GGUF for the CPU: the products' weights packed in BF16, `threads` threads (the caller
+    /// included) to run on.  The CPU must have AVX2 (kernels/cpu/expert_layout.hpp's cpu_avx2_ok).
+    bool open_cpu(const std::string& path, int threads, std::string& err);
+    /// Whether the CPU's products are int8 (XESTRATA_VISION_CPU_I8=1), after open_cpu.
+    bool cpu_i8() const { return i8_; }
 
     /// rgb [3][height][width] (host, -1 .. 1) -> the embeddings; the tokens in rows of the merged grid.
     VisionOut encode(const float* rgb, int64_t width, int64_t height);
@@ -48,15 +58,19 @@ public:
     /// product, as the reader resizes them).
     int64_t patch() const { return patch_; }
     int64_t merge() const { return merge_; }
+    /// The embeddings' width (the text model's).
+    int64_t dim() const { return out_dim_; }
 
 private:
     struct W {
-        const uint16_t* w = nullptr;   // FP16 [n][k]
-        const float* b = nullptr;
+        const uint16_t* w = nullptr;   // FP16 [n][k] (the GPU's)
+        const float* b = nullptr;      // the GPU's, or the file's on the CPU
         int64_t n = 0, k = 0;
+        kernels::cpu::Bf16Matrix b16;  // the CPU's, or
+        kernels::cpu::I8Matrix q8;     // with XESTRATA_VISION_CPU_I8=1
     };
     struct Norm {
-        const float *w = nullptr, *b = nullptr;
+        const float *w = nullptr, *b = nullptr;   // the GPU's, or the file's on the CPU
     };
     struct Layer {
         Norm ln1, ln2;
@@ -67,14 +81,29 @@ private:
         Norm norm;
         W fc1, fc2;
     };
+    bool read(const std::string& path, std::string& err);
     W linear(const std::string& name);
     Norm norm(const std::string& name);
+    void layout(const float* rgb, int64_t width, int64_t height, std::vector<float>& patches, std::vector<int32_t>& yx,
+                std::vector<float>& pos) const;
+    VisionOut encode_cpu(const float* rgb, int64_t width, int64_t height);
     void product(const uint16_t* x16, const W& w, float* y, int64_t T);
+    void product_cpu(const float* x, const W& w, float* y, int64_t T);
     void grow(int64_t patches);
     void merger(const Merger& m, const float* x, int64_t rows, int64_t in_dim, bool norm_merged, std::vector<float>& out);
+    void merger_cpu(const Merger& m, const float* x, int64_t rows, int64_t in_dim, bool norm_merged,
+                    std::vector<float>& out);
 
     void* s_ = nullptr;
     bool dry_ = false;
+    // the CPU's: the pool, the patch embedding and the working rows
+    std::unique_ptr<kernels::cpu::BandPool> pool_;
+    bool i8_ = false;   // XESTRATA_VISION_CPU_I8=1: the int8 products
+    kernels::cpu::I8GemmIsa isa_ = kernels::cpu::I8GemmIsa::scalar;
+    kernels::cpu::I8Rows rows8_;
+    W patch16_;
+    kernels::cpu::VisionAttention attn_;
+    std::vector<float> cx_, ch_, cy_, cbig_;
     std::unique_ptr<GgufFile> g_;
     prefill::Gemm gemm_;
     std::vector<void*> allocs_;

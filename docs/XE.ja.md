@@ -673,15 +673,18 @@ B70 も全部 CPU（以前と同じ）で、RX 9060 XT は PCIe に回す数が 
 
 画像は、setup で選んだときだけ使えます（既定はオフ）。
 選ぶと、画像のエンコーダーは既定で GPU で動きます（`./setup.sh --vision yes` または `gpu`）。
-GPU のエンコーダーは XeStrata 自身の視覚エンコーダー（画像エンジンと共通の `src/core/vision.cpp`。モデルの mmproj の Qwen3-VL の ViT と merger）で、エンジンと一緒にビルドされます（`xestrata-vision-gpu`）。
-GPU で動かせないときは CPU のエンコーダー（`tools/vision` の `xestrata-vision-cpu`。llama.cpp の mtmd とモデルの mmproj）に切り替わり、`--vision cpu` では CPU のエンコーダーだけを使います。
-CPU のエンコーダーは、確かめた画像を、2 つの形の格子で llama.cpp と同じに読みます。
+エンコーダーは XeStrata 自身の視覚エンコーダー（画像エンジンと共通の `src/core/vision.cpp`。モデルの mmproj の Qwen3-VL の ViT と merger）で、エンジンと一緒にビルドされる 1 つの実行ファイル（`xestrata-vision`）が、GPU（`--gpu`）でも CPU でも動かします。
+GPU で動かせないときは CPU のエンコーダーに切り替わり、`--vision cpu` では CPU のエンコーダーだけを使います。
+CPU のエンコーダーは、重みを読み込むときに BF16 にし、活性は FP32 のまま、XeStrata の CPU の BF16 の積（AVX2 か AVX-512 を CPU の報告で選ぶ）で計算します。
+どちらのエンコーダーも、画像を llama.cpp の mtmd と同じ格子（大きさの規則と黒の余白）にします。
 動くモデルはすべて画像でも確かめました。
 2 つの形の格子、1 つの要求に 2 枚の画像、同じ画像をもう一度送ってそのキャッシュを使う会話です。
 
-GPU を PCI アドレスで選びます（`xestrata-vision-gpu --gpu-pci`、設定の `vision.gpu_pci`）。
+GPU を PCI アドレスで選びます（`xestrata-vision --gpu --gpu-pci`、設定の `vision.gpu_pci`）。
 最初の GPU が CPU 内蔵のグラフィックスやほかの GPU のこともあるためです。
-CPU のエンコーダー（8 スレッド）より 30〜50 倍速く（1,024 トークンの絵で 0.2〜0.3 秒 対 10〜13 秒）、埋め込みは CPU のエンコーダーと 1.5〜5.3%（相対 L2）違い、毎回ビット単位で同じになります。
+GPU のエンコーダーは CPU のエンコーダー（8 スレッド）より 30〜45 倍速く（1,024 トークンの絵で RX 9060 XT が 0.2〜0.3 秒、Ryzen 7 5700X が 8.9〜9.9 秒）、埋め込みは毎回ビット単位で同じになります。
+CPU のエンコーダーは、以前の CPU のエンコーダー（llama.cpp の mtmd）より 1 割あまり速く（同じ 5700X・8 スレッドで 10.2〜11.2 秒）、埋め込みは mtmd のものと画像のトークンごとのコサインが平均 0.9998 です。
+環境変数 `XESTRATA_VISION_CPU_I8=1` を置くと、CPU のエンコーダーは積を int8（重みも活性も）にし、約 2 倍速くなります（同じ 5700X で 4.9〜5.5 秒）が、mtmd との近さはコサインの平均 0.9964 に下がります。
 （contrib-icpx のモードにあった SYCL のビルド（ggml-sycl、oneMKL）は、そのモードと一緒に 2026-10-15 に廃止しました。）
 
 server は、どちらかが準備できるまで、エンコーダーを次の順に起動します。

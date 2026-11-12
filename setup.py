@@ -19,7 +19,7 @@ What the first run does (each step is skipped when it is already done):
   2. asks the questions
   3. installs the Python packages it needs into .venv (numpy, jinja2, ...)
   4. compiles the Strata engine for the GPU with a SYCL compiler (see docs/XE.md) with its image generator and its
-     vision encoder (the picture reader on the GPU), and llama.cpp's mtmd for the CPU reader when images are wanted
+     vision encoder (the picture reader, on the GPU or the CPU)
   5. downloads the model from Hugging Face (resumable), and the vision encoder if you want images
   6. prepares the model for Strata and fetches the MTP draft layer (~5 GB, from the original Qwen checkpoint)
   7. writes run-<model>.sh and starts the model
@@ -592,8 +592,7 @@ MODELS: dict[str, dict[str, Any]] = {
     # Gyro (agentionai): "ram_gb" is the RAM that holds every expert with the usual room beside them ("arena_gb" +
     # LOW_RAM_HEADROOM_GB); with less, the low-RAM mode needs RAM and VRAM together of "arena_gb" + 12 (low_ram_fits:
     # 6 GB of each for the rest).  The rest of the download is the n-gram table, read from the SSD.  Neither is anyone's
-    # default.  Images: the same mmproj as every Flash-Next model; xestrata-vision reads only the vocabulary and header
-    # of the Gyro GGUF (tools/vision/gguf_meta.h), whose TQK6 / TQK7 tensors llama.cpp does not know.
+    # default.  Images: the same mmproj as every Flash-Next model (xestrata-vision reads the mmproj alone).
     "Gyro-S": {"about": "for PCs with little memory (36 GB of RAM, or 38 GB of RAM and VRAM together); lower "
                         "quality than the 2-3-bit sizes, and the 2-bit Q2_0 decodes faster",
                "download_gb": 58.5, "ram_gb": 35.8, "arena_gb": 25.8, "families": ("gyro",),
@@ -1457,17 +1456,19 @@ VISION = {"gpu": {"max_tokens": 1024, "reserve_mib": 700},
           "cpu": {"max_tokens": 300, "reserve_mib": 700}}
 EXE = "xestrata-engine.exe" if WIN else "xestrata-engine"
 IMAGE_EXE = "xestrata-image.exe" if WIN else "xestrata-image"   # the image engine (serve/images.py), built with it
-# the picture readers, one binary per place it runs: the configs of different models may use different ones.
-# "gpu" is the engine's own vision encoder (strata-vision-gpu, built with the engine), "cpu" llama.cpp's mtmd
-VEXE = {k: v + (".exe" if WIN else "") for k, v in
-        {"cpu": "xestrata-vision-cpu", "gpu": "xestrata-vision-gpu"}.items()}
+# the picture reader: the engine's own vision encoder (strata-vision, built with the engine), on the GPU with "gpu"
+# true in its config and on the CPU without
+VISION_EXE = "xestrata-vision.exe" if WIN else "xestrata-vision"
 # a config written before the programs took XeStrata's names names upstream's: point_engine_parts writes the new ones
 # (repoint_engine, on every start)
-UPSTREAM_EXES = ("strata", "strata-image", "strata-vision-cpu", "strata-vision-vulkan")   # upstream's names
+UPSTREAM_EXES = ("strata", "strata-image")   # upstream's names
 RENAMED = {old + ext: ("xestrata-engine" if old == UPSTREAM_EXES[0] else "xe" + old) + ext
            for old in UPSTREAM_EXES for ext in (("", ".exe") if WIN else ("",))}
-# the GPU picture reader is the engine's own vision encoder now: a config that named the Vulkan one gets the new binary
-RENAMED.update({"xestrata-vision-vulkan" + ext: "xestrata-vision-gpu" + ext
+# the readers one binary per place it ran (llama.cpp's mtmd on the CPU and on Vulkan, upstream's names and XeStrata's,
+# and the GPU's of a source build before the CPU's joined it): a config that names one gets the one reader
+RENAMED.update({old + ext: VISION_EXE
+                for old in ("strata-vision-cpu", "strata-vision-vulkan", "xestrata-vision-cpu",
+                            "xestrata-vision-vulkan", "xestrata-vision-gpu")
                 for ext in (("", ".exe") if WIN else ("",))})
 
 
@@ -4317,10 +4318,9 @@ def tree_sha256(top: Path) -> str:
 
 
 def get_llama_cpp():
-    """llama.cpp at the pinned commit (ggml for the build, gguf-py for the tools, mtmd for images), as a zip: no git."""
+    """llama.cpp at the pinned commit (ggml for the build, gguf-py for the tools), as a zip: no git."""
     llama = ROOT / "third_party" / "main" / "llama.cpp"
-    if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir() and \
-            (llama / "tools" / "mtmd" / "CMakeLists.txt").exists():   # a copy without mtmd cannot build the encoder
+    if (llama / "ggml" / "CMakeLists.txt").exists() and (llama / "gguf-py").is_dir():
         return llama
     z = ROOT / "third_party" / "main" / f"llama.cpp-{LLAMA_CPP_COMMIT[:7]}.zip"
     download(LLAMA_CPP_ZIP, z, "llama.cpp source")
@@ -4821,8 +4821,8 @@ def choose_compiler(a, gpu: dict) -> dict:
 
 
 def check_build_tools(comp: dict) -> None:
-    """What the build needs besides the SYCL compiler: g++ for the CPU picture reader (llama.cpp's mtmd).  Setup does
-    not install it (no apt or sudo from setup): it says what is missing."""
+    """What the build needs besides the SYCL compiler: g++, whose C++ standard library intel/llvm's clang compiles
+    against.  Setup does not install it (no apt or sudo from setup): it says what is missing."""
     missing = []
     if shutil.which("g++") is None:
         missing.append(tool_pkg("g++"))
@@ -4855,10 +4855,8 @@ def cmake_build(src, bdir, target, defs, env=None):
     run([cmake, "--build", str(bdir), "--target", *targets, "-j", str(jobs)], env=env)
 
 
-# the GPU picture reader (tools/vision/strata_vision.cpp) is built with the engine and its sources count for it; the
-# CPU reader's own (tools/vision/strata_vision_mtmd.cpp and its gguf_meta) are hashed apart
+# the picture reader (tools/vision/strata_vision.cpp) is built with the engine and its sources count for it
 ENGINE_SOURCES = ("CMakeLists.txt", "cmake", "src", "include", "third_party/main/ggml", "tools/vision")
-VISION_SOURCES = ("tools/vision",)
 
 
 def source_hash(parts) -> str:
@@ -4903,17 +4901,16 @@ def engine_cmake_args() -> list:
     return keep
 
 
-def build_engine(visions, llama, comp: dict, data: Path) -> Path:
-    """Compile the engine with `comp` (choose_compiler) and the picture readers in `visions` ("gpu": the engine's own
-    vision encoder, built with the engine; "cpu": llama.cpp's mtmd, built apart); the results go to engine/.  A
-    compiled engine or reader whose source files or compiler changed since (a `git pull`, another intel/llvm) is
-    compiled again.  Each reader has its own binary, so installing one never replaces the other."""
+def build_engine(llama, comp: dict, data: Path) -> Path:
+    """Compile the engine with `comp` (choose_compiler), its image engine and its picture reader (the engine's own
+    vision encoder, on the GPU or the CPU); the results go to engine/.  A compiled engine whose source files or compiler
+    changed since (a `git pull`, another intel/llvm) is compiled again."""
     eng = ROOT / "engine"
     eng.mkdir(exist_ok=True)
     stamp = eng / "BUILD.json"
     meta = json.loads(stamp.read_text()) if stamp.exists() else {}
     xe = engine_is_xe(meta)
-    src, vsrc = source_hash(ENGINE_SOURCES), source_hash(VISION_SOURCES)
+    src = source_hash(ENGINE_SOURCES)
     used = {"cxx": comp["cxx"], "version": comp["version"], "kind": comp["kind"], "xmx": comp["xmx"],
             "license": comp["license"], "cuda_archs": comp["cuda_archs"], "onemkl": comp["onemkl"],
             "hip_archs": comp.get("hip_archs", [])}
@@ -4924,47 +4921,35 @@ def build_engine(visions, llama, comp: dict, data: Path) -> Path:
     cudnn = nvidia_libs_dir(data) / "nvidia" / "cudnn"
     if comp["license"] == "contrib" and comp["cuda_archs"] and (cudnn / "include" / "cudnn.h").exists():
         used["cudnn_root"] = str(cudnn)
-    engine_ok = (xe and (eng / EXE).exists() and (eng / IMAGE_EXE).exists() and (eng / VEXE["gpu"]).exists()
+    engine_ok = (xe and (eng / EXE).exists() and (eng / IMAGE_EXE).exists() and (eng / VISION_EXE).exists()
                  and meta.get("src") == src and meta.get("compiler") == used)
-    # the CPU reader alone is built apart (the old records call the GPU reader "vulkan": the engine's own now)
-    built = dict(meta.get("vision_srcs") or {}) if xe else {}
-    missing = ["cpu"] if "cpu" in visions and not ((eng / VEXE["cpu"]).exists() and built.get("cpu") == vsrc) else []
-    if engine_ok and not missing:
+    if engine_ok:
         ok("engine already built for this PC")
         return eng
     check_build_tools(comp)
-    if not engine_ok:
-        bdir = ROOT / "build-xe"
-        cache = bdir / "CMakeCache.txt"
-        if cache.exists() and (f"CMAKE_CXX_COMPILER:FILEPATH={comp['cxx']}" not in cache.read_text(errors="replace")
-                               or (meta.get("compiler") or {}).get("cmake_args") != used.get("cmake_args")):
-            shutil.rmtree(bdir)                        # CMake keeps the compiler and the -D values it configured with
-        say("  The engine's source changed: compiling it again (only what changed) ..." if xe and (eng / EXE).exists()
-            and bdir.exists() else "  Compiling the XeStrata engine for the GPU (20-40 minutes, once) ...")
-        # the targets keep upstream's names (CMakeLists.txt); strata-vision-gpu is the picture reader
-        cmake_build(ROOT, bdir, ["strata", "strata-image", "strata-vision-gpu"],
-                    [f"-DCMAKE_CXX_COMPILER={comp['cxx']}", f"-DCMAKE_C_COMPILER={comp['cc']}",
-                     f"-DSTRATA_LICENSE={comp['license']}",
-                     f"-DSTRATA_CUDA_ARCHS={'auto' if comp['cuda_archs'] else ''}",
-                     f"-DSTRATA_HIP_ARCHS={';'.join(comp.get('hip_archs', []))}",
-                     f"-DSTRATA_ONEMKL={'ON' if comp['onemkl'] else 'OFF'}",
-                     *([f"-DMKL_ROOT={mkl_root()}"] if comp["onemkl"] else []), "-DSTRATA_ENABLE_XE=ON",
-                     "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_PORTABLE=ON",
-                     f"-DSTRATA_GGML_DIR={llama}", *(f"-D{x}" for x in used.get("cmake_args", [])),
-                     *([f"-DSTRATA_CUDNN_ROOT={used['cudnn_root']}"] if "cudnn_root" in used else [])], comp["env"])
-        install_binary(bdir / EXE, eng / EXE)
-        install_binary(bdir / IMAGE_EXE, eng / IMAGE_EXE)
-        install_binary(bdir / VEXE["gpu"], eng / VEXE["gpu"])
-    for v in missing:
-        llama_def = f"-DLLAMA_DIR={llama}"
-        say("  Compiling the picture reader for the CPU (llama.cpp's mtmd; 5-15 minutes, once) ...")
-        bdir = ROOT / "build-vision-cpu"
-        cmake_build(ROOT / "tools" / "vision", bdir, "strata-vision",   # upstream's target name
-                    [llama_def, "-DSTRATA_PORTABLE=ON"])
-        install_binary(bdir / "bin" / ("xestrata-vision-cpu.exe" if WIN else "xestrata-vision-cpu"), eng / VEXE[v])
-        built[v] = vsrc
+    bdir = ROOT / "build-xe"
+    cache = bdir / "CMakeCache.txt"
+    if cache.exists() and (f"CMAKE_CXX_COMPILER:FILEPATH={comp['cxx']}" not in cache.read_text(errors="replace")
+                           or (meta.get("compiler") or {}).get("cmake_args") != used.get("cmake_args")):
+        shutil.rmtree(bdir)                        # CMake keeps the compiler and the -D values it configured with
+    say("  The engine's source changed: compiling it again (only what changed) ..." if xe and (eng / EXE).exists()
+        and bdir.exists() else "  Compiling the XeStrata engine for the GPU (20-40 minutes, once) ...")
+    # the targets keep upstream's names (CMakeLists.txt); strata-vision is the picture reader
+    cmake_build(ROOT, bdir, ["strata", "strata-image", "strata-vision"],
+                [f"-DCMAKE_CXX_COMPILER={comp['cxx']}", f"-DCMAKE_C_COMPILER={comp['cc']}",
+                 f"-DSTRATA_LICENSE={comp['license']}",
+                 f"-DSTRATA_CUDA_ARCHS={'auto' if comp['cuda_archs'] else ''}",
+                 f"-DSTRATA_HIP_ARCHS={';'.join(comp.get('hip_archs', []))}",
+                 f"-DSTRATA_ONEMKL={'ON' if comp['onemkl'] else 'OFF'}",
+                 *([f"-DMKL_ROOT={mkl_root()}"] if comp["onemkl"] else []), "-DSTRATA_ENABLE_XE=ON",
+                 "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_PORTABLE=ON",
+                 f"-DSTRATA_GGML_DIR={llama}", *(f"-D{x}" for x in used.get("cmake_args", [])),
+                 *([f"-DSTRATA_CUDNN_ROOT={used['cudnn_root']}"] if "cudnn_root" in used else [])], comp["env"])
+    install_binary(bdir / EXE, eng / EXE)
+    install_binary(bdir / IMAGE_EXE, eng / IMAGE_EXE)
+    install_binary(bdir / VISION_EXE, eng / VISION_EXE)
     stamp.write_text(json.dumps({"source": "local", "backend": "xe", "version": source_version(), "compiler": used,
-                                 "lib_dirs": comp["lib_dirs"], "src": src, "vision_srcs": built}, indent=1))
+                                 "lib_dirs": comp["lib_dirs"], "src": src}, indent=1))
     ok(f"engine compiled: {eng / EXE}")
     return eng
 
@@ -5008,16 +4993,14 @@ def update_installed_engine() -> None:
     if not info.exists():
         return
     meta = json.loads(info.read_text())
-    visions = [v for v in (meta.get("vision_srcs") or {}) if v == "cpu"]   # the GPU reader comes with the engine
-    vsrc = source_hash(VISION_SOURCES)
-    # an engine compiled before the programs took XeStrata's names has none of EXE's name: it is compiled again
-    have = (eng / EXE).exists() and (eng / VEXE["gpu"]).exists() and all((eng / VEXE[v]).exists() for v in visions)
-    if have and engine_is_xe(meta) and meta.get("src") == source_hash(ENGINE_SOURCES) and \
-            all(meta["vision_srcs"][v] == vsrc for v in visions):
+    # an engine compiled before the programs took XeStrata's names has none of EXE's name, one before the picture
+    # reader was one binary none of VISION_EXE's: it is compiled again
+    have = (eng / EXE).exists() and (eng / VISION_EXE).exists()
+    if have and engine_is_xe(meta) and meta.get("src") == source_hash(ENGINE_SOURCES):
         return
 
     try:
-        build_engine(visions, get_llama_cpp(), recorded_compiler(meta), data_folder_path(None, load_settings()))
+        build_engine(get_llama_cpp(), recorded_compiler(meta), data_folder_path(None, load_settings()))
     except (Exception, SystemExit) as e:
         why = "" if isinstance(e, SystemExit) else f" ({e})"
         if not engine_is_xe(meta) or not (eng / EXE).exists():
@@ -7818,10 +7801,9 @@ def resolve_rope(ctx: int, scaling, scale, trained: int = 262144):
     return scaling or "yarn", scale if scale is not None else derived_factor(ctx, trained)
 
 
-def prepare_engine(a, gpu: dict, vision: str) -> tuple[Path, Path, str, list]:
-    """Steps 3 and 4: the Python packages, and the engine (the package's, or compiled here with the image encoders
-    `vision` needs) -> (llama.cpp's folder, the engine's folder, the image encoder's kind, the engine's library
-    folders)."""
+def prepare_engine(a, gpu: dict) -> tuple[Path, Path, list]:
+    """Steps 3 and 4: the Python packages, and the engine (the package's, or compiled here with its image engine and
+    picture reader) -> (llama.cpp's folder, the engine's folder, the engine's library folders)."""
     # ---- 3. python packages
     step(3, "Python packages")
     if PACKAGED:                                       # the distribution's, which the package depends on
@@ -7836,7 +7818,6 @@ def prepare_engine(a, gpu: dict, vision: str) -> tuple[Path, Path, str, list]:
         llama = ROOT / "third_party" / "main" / "llama.cpp"   # gguf-py, for the tools below
         eng = packaged_engine_dir()
         meta = packaged_engine()
-        enc = "gpu"
         # the engine's SYCL runtime, and oneMKL's folder when it is installed (oneMath opens its backend at run time;
         # without it the engine takes its own kernels)
         lib_dirs = list(meta.get("lib_dirs", []))
@@ -7847,16 +7828,15 @@ def prepare_engine(a, gpu: dict, vision: str) -> tuple[Path, Path, str, list]:
         ok(f"engine: {eng / EXE} ({meta.get('package', 'package')})")
     else:
         llama = get_llama_cpp()
-        ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml, mtmd)")
+        ok(f"llama.cpp {LLAMA_CPP_COMMIT[:7]} (gguf-py, ggml)")
         comp = choose_compiler(a, gpu)
-        enc = "gpu"
         data = data_folder_path(a.data_dir, load_settings())
-        eng = build_engine({"none": [], "gpu": [enc, "cpu"], "cpu": ["cpu"]}[vision], llama, comp, data)
+        eng = build_engine(llama, comp, data)
         # the runtime of the compiler the engine was built with (none for the distribution's), and pip's NVIDIA ones
         nvidia_libs = nvidia_lib_dirs(data) if comp["license"] == "contrib" else []
         lib_dirs = list(dict.fromkeys(comp["lib_dirs"] + nvidia_libs))
         ok(f"engine: {eng / EXE}")
-    return llama, eng, enc, lib_dirs
+    return llama, eng, lib_dirs
 
 
 # A dense model's VRAM beside its weights and K/V cache: the prompt's buffers (Qwen3.5-9B's for 4096-token chunks are
@@ -8047,7 +8027,7 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         warn(f"little free disk space in {models_dir}: {free_gb(models_dir):.1f} GB free for about {left:.1f} GB. "
              "Setup goes on and should fit")
 
-    llama, eng, enc, lib_dirs = prepare_engine(a, gpu, vision)
+    llama, eng, lib_dirs = prepare_engine(a, gpu)
     if d.get("custom"):                                # the engine's verdict before anything is made
         check_model(eng / EXE, lib_dirs, gguf)
         ok(f"the engine runs {gguf.name}")
@@ -8164,12 +8144,12 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     replicas_config(a, cfg)
     if vision != "none" and mmproj is not None:   # as Qwen3.8-Flash-Next's (setup's main path)
         vt = vision_tokens(a.vision_tokens, vision, CONF / f"xestrata-{tag.lower()}.json")
-        cpu_enc = {"exe": str(eng / VEXE["cpu"]), "gpu": False,
+        cpu_enc = {"exe": str(eng / VISION_EXE), "gpu": False,
                    "max_tokens": vt if vision == "cpu" else VISION["cpu"]["max_tokens"],
                    "threads": vision_threads()}
         cfg["vision"] = {"mmproj": str(mmproj), "model": str(gguf), **cpu_enc}
         if vision == "gpu":
-            cfg["vision"] = {"mmproj": str(mmproj), "model": str(gguf), "exe": str(eng / VEXE[enc]), "gpu": True,
+            cfg["vision"] = {"mmproj": str(mmproj), "model": str(gguf), "exe": str(eng / VISION_EXE), "gpu": True,
                              "gpu_pci": gpu["pci"], "max_tokens": vt, "fallback": cpu_enc}
     elif a.vision_tokens is not None:
         warn("--vision-tokens: images are off for this model, so it is not used")
@@ -9591,16 +9571,12 @@ def main() -> int:
         warn(f"little free disk space in {models_dir}: {free_now:.0f} GB free for about {real:.0f} GB of files. "
              "Setup goes on and should fit; free up space if it stops")
 
-    llama, eng, enc, lib_dirs = prepare_engine(a, gpu, vision)
+    llama, eng, lib_dirs = prepare_engine(a, gpu)
     if a.custom:                                       # the engine's verdict before anything is made
         check_model(eng / EXE, lib_dirs, shards[0])
         ok(f"the engine runs {shards[0].name}")
-    # #24: a package takes only the picture readers it carries (a package without the GPU reader reads images on the
-    # CPU)
-    if PACKAGED and vision == "gpu" and not (eng / VEXE[enc]).exists():
-        warn("this package has no GPU image encoder: images are read on the CPU")
-        vision = "cpu"
-    if PACKAGED and vision == "cpu" and not (eng / VEXE["cpu"]).exists():
+    # #24: a package takes the picture reader only where it carries one
+    if PACKAGED and vision != "none" and not (eng / VISION_EXE).exists():
         warn("this package has no image encoder: images are off")
         vision = "none"
 
@@ -9840,13 +9816,13 @@ def main() -> int:
             say("  " + line)
     if vision != "none":
         vt = vision_tokens(a.vision_tokens, vision, CONF / f"xestrata-{tag.lower()}.json")
-        cpu_enc = {"exe": str(eng / VEXE["cpu"]), "gpu": False,
+        cpu_enc = {"exe": str(eng / VISION_EXE), "gpu": False,
                    "max_tokens": vt if vision == "cpu" else VISION["cpu"]["max_tokens"],
                    "threads": vision_threads()}
         cfg["vision"] = {"mmproj": str(mmproj), "model": str(shards[0]), **cpu_enc}
         if vision == "gpu":
             # the GPU reader takes the card by PCI address: the first GPU the runtime lists can be another card
-            cfg["vision"] = {"mmproj": str(mmproj), "model": str(shards[0]), "exe": str(eng / VEXE[enc]),
+            cfg["vision"] = {"mmproj": str(mmproj), "model": str(shards[0]), "exe": str(eng / VISION_EXE),
                              "gpu": True, "gpu_pci": gpu["pci"], "max_tokens": vt,
                              "fallback": cpu_enc}   # the server starts it when the GPU encoder does not start
     elif a.vision_tokens is not None:

@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/kernels/cpu/bf16_gemm.cpp - see include/strata/kernels/cpu/bf16_gemm.hpp: the packing, the scalar reference
 // kernel, the run-time ISA choice and the dispatch.  Compiled for the baseline x86-64, so everything here runs on
-// any CPU; the AVX2 kernel is in bf16_gemm_avx2.cpp, its own translation unit.
+// any CPU; the AVX2 and AVX-512 kernels are in bf16_gemm_avx2.cpp and bf16_gemm_avx512.cpp, translation units of
+// their own.
 #include "strata/kernels/cpu/bf16_gemm.hpp"
 
 #include "strata/kernels/bf16_bits.hpp"           // f32_from_bf16
-#include "strata/kernels/cpu/expert_layout.hpp"   // cpu_avx2_ok
+#include "strata/kernels/cpu/expert_layout.hpp"   // cpu_avx2_ok, cpu_avx512_ok
 #include "strata/platform/env.hpp"
 
 #include <algorithm>
@@ -48,7 +49,7 @@ void bf16_gemm_rows_scalar(const uint16_t* panel, int n_in, int n_out, const flo
 
 bool bf16_gemm_isa_ok(Bf16GemmIsa isa) noexcept {
 #if defined(STRATA_BF16_GEMM_X86)
-    return isa == Bf16GemmIsa::avx2 ? cpu_avx2_ok() : true;
+    return isa == Bf16GemmIsa::avx2 ? cpu_avx2_ok() : isa == Bf16GemmIsa::avx512 ? cpu_avx512_ok() : true;
 #else
     return isa == Bf16GemmIsa::scalar;
 #endif
@@ -58,13 +59,15 @@ Bf16GemmIsa bf16_gemm_isa() {
     static const Bf16GemmIsa isa = [] {
         const char* e = strata::env_get("BF16_GEMM_ISA");
         if (e != nullptr && std::strcmp(e, "scalar") == 0) return Bf16GemmIsa::scalar;
+        const bool cap_avx2 = e != nullptr && std::strcmp(e, "avx2") == 0;
+        if (!cap_avx2 && bf16_gemm_isa_ok(Bf16GemmIsa::avx512)) return Bf16GemmIsa::avx512;
         return bf16_gemm_isa_ok(Bf16GemmIsa::avx2) ? Bf16GemmIsa::avx2 : Bf16GemmIsa::scalar;
     }();
     return isa;
 }
 
 const char* bf16_gemm_isa_name(Bf16GemmIsa isa) noexcept {
-    return isa == Bf16GemmIsa::avx2 ? "avx2" : "scalar";
+    return isa == Bf16GemmIsa::avx512 ? "avx512" : isa == Bf16GemmIsa::avx2 ? "avx2" : "scalar";
 }
 
 int bf16_gemm_token_block(int n_in) {
@@ -103,6 +106,10 @@ void bf16_gemm_rows(Bf16GemmIsa isa, const uint16_t* panel, int n_in, int n_out,
 #if defined(STRATA_BF16_GEMM_X86)
     if (isa == Bf16GemmIsa::avx2) {
         bf16_gemm_detail::bf16_gemm_rows_avx2(panel, n_in, n_out, x, ldx, y, ldy, n_tok, p0, p1, bias);
+        return;
+    }
+    if (isa == Bf16GemmIsa::avx512) {
+        bf16_gemm_detail::bf16_gemm_rows_avx512(panel, n_in, n_out, x, ldx, y, ldy, n_tok, p0, p1, bias);
         return;
     }
 #endif

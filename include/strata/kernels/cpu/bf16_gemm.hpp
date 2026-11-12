@@ -47,14 +47,14 @@ constexpr size_t bf16_gemm_packed_bytes(int n_out, int n_in) noexcept {
     return (size_t) bf16_gemm_panels(n_out) * (size_t) n_in * (size_t) kBf16Panel * sizeof(uint16_t);
 }
 
-/// The kernels of this product.  `scalar` is the reference and runs anywhere; `avx2` is the vector copy.
-/// There is deliberately no AVX-512 copy: the machine this is developed on has no AVX-512, and AGENTS.md keeps the
-/// AVX-512 paths to the expert kernels; a future one must be checked the same way as this (bit for bit against scalar).
-enum class Bf16GemmIsa : int { scalar = 0, avx2 = 1 };
+/// The kernels of this product.  `scalar` is the reference and runs anywhere; `avx2` is the vector copy; `avx512`
+/// takes two panels in one zmm where cpu_avx512_ok() (bf16_gemm_avx512.cpp; checked under Intel SDE, AGENTS.md).
+/// All three give the same bits.
+enum class Bf16GemmIsa : int { scalar = 0, avx2 = 1, avx512 = 2 };
 
 /// Whether this CPU runs `isa` (the scalar kernel: always).
 bool bf16_gemm_isa_ok(Bf16GemmIsa isa) noexcept;
-/// The best ISA this CPU runs, capped by XESTRATA_BF16_GEMM_ISA=scalar (tests and A/B).
+/// The best ISA this CPU runs, capped by XESTRATA_BF16_GEMM_ISA=avx2|scalar (tests and A/B).
 Bf16GemmIsa bf16_gemm_isa();
 const char* bf16_gemm_isa_name(Bf16GemmIsa isa) noexcept;
 
@@ -86,6 +86,9 @@ namespace bf16_gemm_detail {
 /// bf16_gemm_isa_ok(), and public here so the test and the bench can call it directly.
 void bf16_gemm_rows_avx2(const uint16_t* panel, int n_in, int n_out, const float* x, size_t ldx, float* y, size_t ldy,
                          int n_tok, int p0, int p1, const float* bias);
+/// The AVX-512 kernel (bf16_gemm_avx512.cpp, compiled with -mavx512f), the same way.
+void bf16_gemm_rows_avx512(const uint16_t* panel, int n_in, int n_out, const float* x, size_t ldx, float* y,
+                           size_t ldy, int n_tok, int p0, int p1, const float* bias);
 }  // namespace bf16_gemm_detail
 
 }  // namespace strata::kernels::cpu

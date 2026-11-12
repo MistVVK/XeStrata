@@ -683,15 +683,18 @@ The B70 keeps every miss on the CPU, as before; the RX 9060 XT reads 1.0 instead
 
 Images are available only when chosen in setup (off by default).
 When they are, the image encoder runs on the GPU by default (`./setup.sh --vision yes` or `gpu`).
-The GPU encoder is XeStrata's own vision encoder (shared with the image engine, `src/core/vision.cpp`: Qwen3-VL's ViT and merger from the model's mmproj), built with the engine (`xestrata-vision-gpu`).
-When it cannot run, the CPU encoder takes over (`tools/vision`'s `xestrata-vision-cpu`: llama.cpp's mtmd with the model's mmproj); `--vision cpu` uses the CPU encoder alone.
-The CPU encoder reads the pictures checked as llama.cpp does, on grids of both shapes.
+The encoder is XeStrata's own vision encoder (shared with the image engine, `src/core/vision.cpp`: Qwen3-VL's ViT and merger from the model's mmproj), and one program built with the engine (`xestrata-vision`) runs it on the GPU (`--gpu`) or on the CPU.
+When it cannot run on the GPU, the CPU encoder takes over; `--vision cpu` uses the CPU encoder alone.
+The CPU encoder makes the weights BF16 when it loads them, keeps the activations in FP32, and computes with XeStrata's BF16 product for the CPU (AVX2 or AVX-512, chosen from what the CPU reports).
+Both encoders make a picture into the grid llama.cpp's mtmd makes of it (its size rule and its black border).
 Every model that runs was checked with images:
 two grid shapes, two images in one request, and a conversation that sends the image again and reuses its cache.
 
-It takes the GPU by its PCI address (`xestrata-vision-gpu --gpu-pci`, from the config's `vision.gpu_pci`):
+It takes the GPU by its PCI address (`xestrata-vision --gpu --gpu-pci`, from the config's `vision.gpu_pci`):
 the first GPU can be the processor's graphics or another card.
-It encodes 30–50× faster than the CPU encoder (8 threads; 0.2–0.3 s against 10–13 s for a 1,024-token picture); its embeddings differ from the CPU encoder's by 1.5–5.3% (relative L2) and repeat bit for bit.
+The GPU encoder encodes 30–45× faster than the CPU encoder (8 threads; a 1,024-token picture in 0.2–0.3 s on an RX 9060 XT, in 8.9–9.9 s on a Ryzen 7 5700X), and its embeddings repeat bit for bit.
+The CPU encoder is a little over a tenth faster than the CPU encoder before it (llama.cpp's mtmd: 10.2–11.2 s on the same 5700X with 8 threads), and its embeddings have a mean cosine of 0.9998 per image token to mtmd's.
+With the environment variable `XESTRATA_VISION_CPU_I8=1` the CPU encoder's products are int8 (weights and activations), about twice as fast (4.9–5.5 s on the same 5700X), and the mean cosine to mtmd's drops to 0.9964.
 (The SYCL build of the contrib-icpx mode, ggml-sycl with oneMKL, was removed with that mode on 2026-10-15.)
 
 The server starts the encoders in this order until one is ready:

@@ -14,6 +14,7 @@
 // activation rows are quantized once per product, by the pool, before the pieces go out.
 #pragma once
 
+#include "strata/kernels/cpu/bf16_gemm.hpp"
 #include "strata/kernels/cpu/i8_gemm.hpp"
 
 #include <atomic>
@@ -87,5 +88,19 @@ void i8_quantize_rows(BandPool& pool, I8GemmIsa isa, const float* x, size_t ldx,
 /// y[t * ldy + o] for the r.n rows through `m` (its scale block r's), pieces of panels and token rows on the pool.
 void i8_linear(BandPool& pool, I8GemmIsa isa, const I8Matrix& m, const I8Rows& r, float* y, size_t ldy,
                const float* bias = nullptr);
+
+/// A matrix in bf16_gemm.hpp's panel form: [n_out, n_in] BF16, the FP32 activations' product.
+struct Bf16Matrix {
+    std::vector<uint16_t> panel;
+    int n_in = 0, n_out = 0;
+    int panels() const { return bf16_gemm_panels(n_out); }
+    size_t bytes() const { return panel.size() * 2; }
+};
+/// Pack the rows `row(o, dst)` writes (n_in floats each, rounded to BF16) into `m`, panel bands on the pool.
+bool bf16_pack_rows(BandPool& pool, int n_in, int n_out, const std::function<bool(int o, float* dst)>& row,
+                    Bf16Matrix& m);
+/// y[t * ldy + o] = x[t] . m[o] (+ bias[o]) for `n` rows of x (stride ldx), pieces of panels and token rows on the pool.
+void bf16_linear(BandPool& pool, const Bf16Matrix& m, const float* x, size_t ldx, int n, float* y, size_t ldy,
+                 const float* bias = nullptr);
 
 }  // namespace strata::kernels::cpu

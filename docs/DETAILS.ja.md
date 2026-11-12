@@ -1852,12 +1852,12 @@ Ornith-1.5、Qwen3.6-35B-A3B、Qwen3.5-9B は、それぞれの配布元の mmpr
 使うかどうかは**任意**で、画像を読めるモデルでは setup の「Images?」の既定は yes です（upstream 91baead75）。
 切るには no と答えるか `--vision no` を付けます。後から入れるには `--vision gpu`（または `--vision cpu`）を付けて setup をもう一度実行します。
 yes（`--vision yes`）は、24 GB 以上のカードでは GPU のエンコーダー、それより小さいカードでは CPU のエンコーダーです。GPU のエンコーダーは VRAM を約 1.4 GB 空けておくので、16 GB のカードで文章の速さが 3〜5% 落ちたためです（upstream #2406 の計測）。`--vision gpu` を付ければ、小さいカードでも GPU のエンコーダーです。
-setup は mmproj をダウンロードし、GPU の読み手（`xestrata-vision-gpu`。XeStrata 自身の視覚エンコーダーで、エンジンと一緒にビルド）と、CPU の読み手（`xestrata-vision-cpu`。llama.cpp の `mtmd` から。小さいカードと、GPU の読み手が起動しないとき）を用意して、起動スクリプトに足します。
+setup は mmproj をダウンロードし、画像の読み手（`xestrata-vision`。XeStrata 自身の視覚エンコーダーで、エンジンと一緒にビルド。GPU でも、小さいカードと GPU で起動しないときは CPU でも動かす）を起動スクリプトに足します。
 ほかは何も変わりません。
 
 | エンコーダーの場所 | 速さ | 画像 1 枚のトークン |
 | --- | --- | --- |
-| **GPU**（勧める） | CPU のエンコーダーより 30〜50 倍速い | 1,024（小さな画像や横長の画像も 1,024 まで拡大） |
+| **GPU**（勧める） | CPU のエンコーダーより 30〜45 倍速い | 1,024（小さな画像や横長の画像も 1,024 まで拡大） |
 | CPU | 遅い | 約 300 に縮める |
 
 画像を有効にすると、setup はエンジンに `--vram-reserve-mib 700` を渡します。
@@ -1888,21 +1888,12 @@ setup をやり直しても、同じエンコーダーの場所（GPU か CPU）
 少ないトークンでは、レシートのような小さな文字を読み違えます（800x400 のレシートが 325 トークンでは番号と合計を誤り、1,024 では正しく読めました。llama.cpp の mtmd も Qwen-VL 系に 1,024 以上を勧めます）。
 GPU では 1,024 にしても VRAM は増えず、B70 で 1 枚 1.5 秒以内です。
 CPU でも細かい文字を正確に読みたいときは、`xestrata-<model>.json` の `"vision"` に `"min_tokens": 1024` と `"max_tokens": 1024` を手で書きます。
-そのときエンコードは 1 枚 11〜12 秒かかります（i7-14700、14 スレッド。既定の約 300 トークンでは 1.4〜2.2 秒）。
+そのときエンコードは 1 枚 8.9〜9.9 秒かかります（Ryzen 7 5700X、8 スレッド。既定の約 300 トークンでは 2.4〜2.7 秒）。
 setup をやり直しても、この値は残ります。
 
 **Q8_0 のエンコーダー**（upstream #625）: `"vision"` の `"mmproj"` は、このモデルの別の mmproj のファイル、たとえば Q8_0 のものを指せます（`llama-quantize mmproj-Qwen3.8-Flash-Next-BF16.gguf mmproj-Qwen3.8-Flash-Next-Q8_0.gguf Q8_0` で作れます）。
-ファイルは小さく（BF16 の 865 MiB に対して 590 MiB）、CPU ではエンコーダーの RAM が約 280 MiB 減り、既定の 300 トークンでは BF16 より速くエンコードできます。
-`--vision cpu` には、これを勧めます。
+ファイルは小さくなります（BF16 の 865 MiB に対して 590 MiB）が、エンコーダーは読み込むときに重みを GPU では FP16 に、CPU では BF16 にするので、メモリと速さは BF16 のファイルと変わりません。
 setup は BF16 のファイルをダウンロードし、やり直しても、まだあるユーザーのファイルは残します。
-BF16 との違いは、upstream の報告で、画像のトークンごとの埋め込みのコサインが平均 0.997〜0.999（300・768・1,024 トークン）、最も悪いトークンで 0.94〜0.96 です。
-768 トークンを超えると、エンコードの時間は BF16 と 3% ほどしか変わりません。
-
-**CPU のエンコーダーの flash attention**（upstream #660）: ggml の CPU の速い flash attention のカーネルは、エンコーダーのヘッドの大きさ（72）がベクトルの幅の倍数であることを要します。
-AVX2 では 8 で割り切れますが、AVX-512 の 16 では割り切れず、ggml は数倍遅く FP16 で足すカーネルに戻ります。
-そのため `xestrata-vision` は、ggml が AVX-512 でビルドされた CPU 版では flash attention を切り、それ以外では `auto`（オン）にします。
-`--flash-attn on|off|auto` で変えられます。
-upstream の測定（Ryzen 7 7700X、8 スレッド、1024x1024 の画像）では、AVX2 で入れて 8〜10 秒・切って 14〜15 秒、AVX-512 で入れて 44 秒・切って 13 秒でした。
 
 ### 画像を送る
 
@@ -2186,7 +2177,7 @@ Web の「情報」の「モデルの規約」のタブには、今動かして�
   画像のモデルは、Qwen の Qwen-Image-2.1 と Qwen-Image-2.1-Turbo（GGUF は Unsloth）、Microsoft の Mage-Flow（Comfy-Org の safetensors）、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE（FLUX.2-klein-4B のもの）、Tencent の HunyuanImage 3.0（量子化は PedroMarinhoDev の単一ファイル）、OpenMOSS の MOSS-Image と編集の LoRA（chinoll の Moss-Image-Edit、単一ファイルの形は PedroMarinhoDev。akhaliq の MOSS-Image-Edit-HQ の armV5 と armV6）、文の読み手の Qwen3-VL（Unsloth、AtomicChat、huihui-ai と noctrex の版）、部分を直す道具の検出器の Bingsu の adetailer（`face_yolov8m`・`hand_yolov8s`・`person_yolov8m-seg`、Ultralytics YOLOv8 で学習。公開元は Apache 2.0、Ultralytics は YOLO で学習したモデルを既定で AGPL-3.0 とする）、拡大の Xintao Wang・Liangbin Xie・Chao Dong・Ying Shan の RealESRGAN x4plus（BSD-3-Clause、公式のリリースと同じファイルを lllyasviel/Annotators から取る）と ByteDance Seed の SeedVR2 の 7B・7B sharp・3B と VAE（Apache-2.0、Comfy-Org の再配布）、構図の制御の alibaba-pai の Qwen-Image-2.1 Fun ControlNet Union（Qwen Research License）と darask0 の MOSS-Image の色と深度のアダプターと 4 ステップのアダプター（Apache-2.0）、制御の図を作る Depth Anything V2 Small（Apache-2.0）・DWPose（Apache-2.0）・Megvii の YOLOX-L（Apache-2.0）・ControlNet 1.1 の HED（Apache-2.0）・Caroline Chan の線画（MIT）・NAVER の M-LSD（Apache-2.0）（[IMAGE](IMAGE.ja.md#ライセンス)）。
   重みにはそれぞれのライセンスが適用されます。
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)**（MIT）: i-quant の形式、`src/kernels/xe/` に書き写した GPU の内積と展開、
-  i-quant のエキスパートのためにリンクする CPU のバックエンド、CPU の画像のエンコーダー（`tools/vision/`）の `mtmd` のライブラリ（GPU の読み手は llama.cpp を使わない）、
+  i-quant のエキスパートのためにリンクする CPU のバックエンド、
   道具が使う `gguf-py`。`third_party/main/ggml/LICENSE` を参照。
 - **[oneMath](https://github.com/uxlfoundation/oneMath)**（Apache-2.0）: 密な行列積を、contrib-llvm では oneMKL（Intel）と cuBLAS（NVIDIA）に、free と contrib-llvm では rocBLAS と hipBLASLt（AMD）に渡す層。
   リポジトリには含めず、CMake が XeStrata のフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)。XeStrata の変更として cuBLAS の BF16 の積と rocBLAS の後端の hipBLASLt が入った oneMath）を取ってきます。oneMath と同じライセンスです。`third_party/main/oneMath/LICENSE` を参照。

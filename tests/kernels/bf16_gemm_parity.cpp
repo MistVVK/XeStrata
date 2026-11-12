@@ -126,12 +126,12 @@ void check_shape(const Shape& sh, int n_tok, bool with_bias) {
 
     std::vector<float> yv((size_t) n_tok * sh.n_out, 0.0f), ys((size_t) n_tok * sh.n_out, 0.0f);
     // The scalar kernel is the definition, so it runs first; the vector one either agrees bit for bit or the shape
-    // is compared against itself (a CPU without AVX2: the checks below still hold, and only the avx2-vs-scalar one
+    // is compared against itself (a CPU without AVX2: the checks below still hold, and only the vector-vs-scalar one
     // has nothing to say).
     bf16_gemm_rows(Bf16GemmIsa::scalar, panel.data(), sh.n_in, sh.n_out, x.data(), (size_t) sh.n_in, ys.data(),
                    (size_t) sh.n_out, n_tok, 0, panels, bias.empty() ? nullptr : bias.data());
-    if (cpu_avx2_ok())
-        bf16_gemm_rows(Bf16GemmIsa::avx2, panel.data(), sh.n_in, sh.n_out, x.data(), (size_t) sh.n_in, yv.data(),
+    if (bf16_gemm_isa() != Bf16GemmIsa::scalar)
+        bf16_gemm_rows(bf16_gemm_isa(), panel.data(), sh.n_in, sh.n_out, x.data(), (size_t) sh.n_in, yv.data(),
                        (size_t) sh.n_out, n_tok, 0, panels, bias.empty() ? nullptr : bias.data());
     else
         yv = ys;
@@ -141,10 +141,11 @@ void check_shape(const Shape& sh, int n_tok, bool with_bias) {
         size_t first = 0;
         while (first < ys.size() && yv[first] == ys[first]) ++first;
         if (first < ys.size())
-            std::printf("  FAIL %s: avx2 != scalar at %zu (%g vs %g), n_tok %d, bias %d\n", sh.name, first,
+            std::printf("  FAIL %s: %s != scalar at %zu (%g vs %g), n_tok %d, bias %d\n", sh.name,
+                        bf16_gemm_isa_name(bf16_gemm_isa()), first,
                         (double) yv[first], (double) ys[first], n_tok, (int) with_bias);
         else
-            std::printf("  FAIL %s: avx2 != scalar (different sizes?), n_tok %d\n", sh.name, n_tok);
+            std::printf("  FAIL %s: vector != scalar (different sizes?), n_tok %d\n", sh.name, n_tok);
         ++g_failures;
         return;
     }
@@ -153,7 +154,7 @@ void check_shape(const Shape& sh, int n_tok, bool with_bias) {
     if (panels > 2) {
         std::vector<float> band(ys.size(), 0.0f);
         const int a = 1, b = panels - 1;
-        const auto isa = cpu_avx2_ok() ? Bf16GemmIsa::avx2 : Bf16GemmIsa::scalar;
+        const auto isa = bf16_gemm_isa();
         bf16_gemm_rows(isa, panel.data(), sh.n_in, sh.n_out, x.data(), (size_t) sh.n_in, band.data(),
                        (size_t) sh.n_out, n_tok, 0, a, bias.empty() ? nullptr : bias.data());
         bf16_gemm_rows(isa, panel.data(), sh.n_in, sh.n_out, x.data(), (size_t) sh.n_in, band.data(),
@@ -169,7 +170,7 @@ void check_shape(const Shape& sh, int n_tok, bool with_bias) {
     // (3) every token alone is the same row as inside the group
     for (int t = 0; t < n_tok; ++t) {
         std::vector<float> one((size_t) sh.n_out, 0.0f);
-        const auto isa = cpu_avx2_ok() ? Bf16GemmIsa::avx2 : Bf16GemmIsa::scalar;
+        const auto isa = bf16_gemm_isa();
         bf16_gemm_rows(isa, panel.data(), sh.n_in, sh.n_out, x.data() + (size_t) t * sh.n_in, (size_t) sh.n_in,
                        one.data(), (size_t) sh.n_out, 1, 0, panels, bias.empty() ? nullptr : bias.data());
         if (std::memcmp(one.data(), ys.data() + (size_t) t * sh.n_out, (size_t) sh.n_out * sizeof(float)) != 0) {
@@ -186,7 +187,7 @@ void check_shape(const Shape& sh, int n_tok, bool with_bias) {
         std::normal_distribution<float> g(0.0f, 0.03f);
         for (auto& v : b2) v = g(rb);
         std::vector<float> yb(ys.size(), 0.0f);
-        const auto isa = cpu_avx2_ok() ? Bf16GemmIsa::avx2 : Bf16GemmIsa::scalar;
+        const auto isa = bf16_gemm_isa();
         bf16_gemm_rows(isa, panel.data(), sh.n_in, sh.n_out, x.data(), (size_t) sh.n_in, yb.data(), (size_t) sh.n_out,
                        n_tok, 0, panels, b2.data());
         size_t bad = 0;

@@ -143,19 +143,10 @@ cmake -G Ninja -S "$src" -B /build/engine -DCMAKE_BUILD_TYPE=Release \
   -DSTRATA_CUDA_PTX= -DSTRATA_ONEMKL=ON -DMKL_ROOT=/build/mkl -DSTRATA_HIP_ARCHS="$hip_archs" -DSTRATA_ENABLE_XE=ON \
   -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF -DSTRATA_PORTABLE=ON -DSTRATA_GGML_DIR="$llama" \
   -DSTRATA_CUDNN_ROOT=/opt/cudnn -DSTRATA_CUDA_WINDOWS_LIBS=/build/cudalib -DSTRATA_ROCM_WINDOWS_LIBS=/build/rocmwin
-targets="strata strata-device strata-image strata-vision-gpu onemath_backend_libs"   # CMake's targets keep upstream's names
+targets="strata strata-device strata-image strata-vision onemath_backend_libs"   # CMake's targets keep upstream's names
 # shellcheck disable=SC2086
 cmake --build /build/engine --target $targets -j "$jobs"
 lap engine
-# the picture reader for the CPU (tools/vision, llama.cpp's mtmd), with the same toolchain (#24: the config pointed to
-# it and the package had none); the GPU one (strata-vision-gpu) is built with the engine
-cmake -G Ninja -S "$src/tools/vision" -B /build/vision -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_TOOLCHAIN_FILE="$src/cmake/toolchain-windows-msvc.cmake" \
-  -DCMAKE_CXX_COMPILER="$src/.tools/intel-llvm-contrib/install/bin/clang++" \
-  -DSTRATA_XWIN=/build/xwin -DSTRATA_SYCL_WINDOWS="$sycl" -DLLAMA_DIR="$llama" -DSTRATA_PORTABLE=ON
-cmake --build /build/vision --target strata-vision -j "$jobs"
-cp /build/vision/bin/xestrata-vision-cpu.exe /build/engine/xestrata-vision-cpu.exe
-lap encoders
 
 # the launchers (framework-dependent: Windows' .NET 10 runtime runs them); Avalonia's build telemetry off
 export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 AVALONIA_TELEMETRY_OPTOUT=1 NUGET_PACKAGES=/cache/nuget
