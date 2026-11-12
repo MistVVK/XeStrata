@@ -10,7 +10,7 @@ debugging and are kept in `data/settings-register.json`.
 A number or a word is set like any environment variable, for example `STRATA_KVA=1`. In the Terminal, `strata launch --set NAME=value`
 puts it in the model's run configuration.
 
-## Switches you can turn on (273)
+## Switches you can turn on (272)
 
 Off unless you set them. The last column says where each one is described.
 
@@ -86,7 +86,6 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_HIPBLASLT_TUNING` | on / off | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md), [AMD_HIP_PERFORMANCE.md](AMD_HIP_PERFORMANCE.md), [RADEON_780M.md](RADEON_780M.md) |
 | `STRATA_HIPBLASLT_VERBOSE` | text | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md) |
 | `STRATA_HIP_ADAPT_KERNEL_COPY` | on / off | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md), [DETAILS.md](DETAILS.md) |
-| `STRATA_HIP_PROMPT_F16` | on / off | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md) |
 | `STRATA_HIP_ROUTER_OLD` | on / off | NVIDIA and AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md) |
 | `STRATA_HIP_WMMA_MIN_Q` | number | AMD | [AMD_HIP.md](AMD_HIP.md) |
 | `STRATA_HOST_CORE` | on / off | NVIDIA and AMD, Intel Arc | [DETAILS.md](DETAILS.md) |
@@ -290,7 +289,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_WDDM_BUDGET` | number | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md) |
 | `STRATA_WS_FAST` | number | NVIDIA and AMD | [OLDER_GPUS.md](OLDER_GPUS.md) |
 
-## Switches that go back to earlier behaviour (65)
+## Switches that go back to earlier behaviour (66)
 
 These behaviours are on by default. Setting the switch returns the earlier behaviour; the notes in the register say which
 version made it the default.
@@ -333,6 +332,7 @@ version made it the default.
 | `STRATA_PF_FUSED_KQ` | text | NVIDIA and AMD, Intel Arc | v0.1.40.1 | [DGX_SPARK_LINUX.md](DGX_SPARK_LINUX.md), [QUANTS.md](QUANTS.md), [STRIX_HALO.md](STRIX_HALO.md) |
 | `STRATA_PF_FUSED_Q50` | on / off | NVIDIA and AMD | v0.2.12 | - |
 | `STRATA_PF_SMALL_FUSED` | on / off | NVIDIA and AMD | - | - |
+| `STRATA_PF_STAGED_FO` | on / off | NVIDIA and AMD | - | [STRIX_HALO.md](STRIX_HALO.md) |
 | `STRATA_PF_W16_CACHE_MIB` | on / off | NVIDIA and AMD | v0.2.9 | - |
 | `STRATA_PF_XMX` | text | Intel Arc | v0.1.42 | [INTEL.md](INTEL.md), [release-notes-0.2.0.md](release-notes-0.2.0.md) |
 | `STRATA_PIPELINE_ADAPT_ASYNC` | number | NVIDIA and AMD | v0.1.40.2 | - |
