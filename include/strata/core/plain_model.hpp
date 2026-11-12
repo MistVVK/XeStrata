@@ -1056,6 +1056,7 @@ private:
     bool restore_parts(const Snapshot& snap, bool recurrent_only, std::string& err);
     std::vector<std::pair<int32_t, int32_t>> prior_;   ///< the profile the tier was filled from
     int64_t n_slots_ = 0;
+    bool tier_whole_ = false;   ///< every expert has its slot in the tier (the prompt's buffers then beside it)
     int64_t windows_ = 0, swaps_total_ = 0;
     // the decode's PCIe share chosen by measurement (pcie_probe): windows in blocks with it on and off, alternating,
     // their milliseconds and tokens; -1 once chosen (or not to be chosen: no split, or STRATA_PLAIN_DECODE_PCIE given)

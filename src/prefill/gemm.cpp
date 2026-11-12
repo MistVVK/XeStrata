@@ -829,11 +829,13 @@ bool w8_fused(void* stream) {
 // back into FP32), through core::timed_choice, native the preferred side with a wide margin: W8A8 taken only when
 // 15% faster.  At timed_choice's own 5% the choice moved from run to run on the B70 (2026-11-12: the three shapes
 // native 3.77 to 3.81 ms, W8A8 3.57 to 3.62, a 4 to 6% edge astride the margin; the RTX 4070's 8.1 to 8.8 against
-// 4.7 to 4.8, some 45%, is far past it).  Not a shape at a time either: the narrow margins of the small shapes
-// moved the choice from start to start (as recorded; the image DiTs' w8_fused above).  A queue recording a graph,
+// 4.7 to 4.8, some 45%, is far past it).  Five timings each after 50 ms of both in turn (the GPU clocked up): three
+// right after each form's first run took W8A8 in 6 of 7 starts and native in one on the RX 9060 XT (2026-11-12).
+// Not a shape at a time either: the narrow margins of the small shapes moved the choice from start to start (as
+// recorded; the image DiTs' w8_fused above).  A queue recording a graph,
 // or a timing around this product (core::timing_depth), takes native until the GPU is timed.
 // A MoE model keeps native by default: neither the timing nor the int8 library's load (oneDNN's reservation,
-// about 385 MiB on the B70, shifts the expert cache's placement and the answers with it, A5B 2026-11-12), and its
+// about 385 MiB on the B70, shifts the expert cache's placement and the answers with it, 2026-11-12), and its
 // KL against the floor of the same binary's runs passed the task's bar nowhere the form was taken (the RTX 4070's
 // 32K: Qwen3.8-Flash-Next 0.00955 / top-1 100%, Qwen3.6-35B-A3B 0.04622 / 89.06%, the floors 0 / 100%).  A dense
 // model's default is the timed choice (the user's decision 2026-11-12: the RTX 4070's Qwen3.5-9B 32K prompt
@@ -886,48 +888,20 @@ bool Gemm::llm_w8a8(void* stream, bool dense) {
         Gemm tg;
         std::string err;
         if (!tg.init(stream, max_elems, err)) throw std::runtime_error(err);
-        auto pass = [&](int64_t rows, bool w8a8) {
-            for (int i = 0; i < 3; ++i) {
-                if (w8a8) tg.native_w8a8(x16, shapes[i].type, wb[i], y, rows, shapes[i].N, shapes[i].K, 0);
-                else tg.native(x16, shapes[i].type, wb[i], y, rows, shapes[i].N, shapes[i].K);
-            }
-            return true;
-        };
-        // The timing runs each form some 7 times: on a GPU where a pass at 4096 rows takes seconds (the UHD 770,
-        // whose int8 product has no matrix unit to run on: its W8A8 pass did not end in 10 minutes, 2026-11-16) that
-        // is the start's minutes.  So both forms run once at kProbe rows first (after a run that compiles them), the
-        // slower one sets a pass's cost, taken as linear in the rows, and the timing takes the most rows up to T whose
-        // pass fits kPass; when not even kMinRows fit, no timing: native, the form the products took before.  The
-        // B70's and the RTX 4070's passes at 4096 rows (3.6 and 8.8 ms, above) are far inside it: they time at T as
-        // before.  The probe's rows overstate a W8A8 pass (its weights' conversion does not grow with the rows),
-        // which only errs towards fewer rows.
-        constexpr int64_t kProbe = 256, kMinRows = 1024;
-        constexpr double kPass = 0.25;   // seconds a pass may take: some 14 passes, a few seconds at the start
-        double probe = 0;
-        for (const bool w8a8 : {false, true}) {
-            pass(kProbe, w8a8);
-            q.wait_and_throw();
-            const auto t0 = std::chrono::steady_clock::now();
-            pass(kProbe, w8a8);
-            q.wait_and_throw();
-            probe = std::max(probe, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-        }
-        int64_t rows = T;
-        while (rows >= kMinRows && probe * (double) rows / (double) kProbe > kPass) rows /= 2;
-        if (rows < kMinRows) {
-            std::fprintf(stderr, "xestrata: the LLMs' dense prompt products not timed: a pass of %lld rows would take "
-                                 "%.0f ms here (%.1f ms at %lld)\n", (long long) kMinRows,
-                         1e3 * probe * (double) kMinRows / (double) kProbe, 1e3 * probe, (long long) kProbe);
-            kept.of = 0;
-        } else {
-            const auto measured = core::timed_choice(
-                {{[&] { return pass(rows, false); }}, {[&] { return pass(rows, true); }}},
-                [&] { q.wait_and_throw(); }, 5, 1.10, 0.05);
-            nat = measured.seconds[0];
-            w8 = measured.seconds[1];
-            timed_rows = rows;
-            kept.of = measured.pick == 1 ? 1 : 0;
-        }
+        const auto measured = core::timed_choice(
+            {{[&] {
+                 for (int i = 0; i < 3; ++i) tg.native(x16, shapes[i].type, wb[i], y, T, shapes[i].N, shapes[i].K);
+                 return true;
+             }},
+             {[&] {
+                 for (int i = 0; i < 3; ++i)
+                     tg.native_w8a8(x16, shapes[i].type, wb[i], y, T, shapes[i].N, shapes[i].K, 0);
+                 return true;
+             }}},
+            [&] { q.wait_and_throw(); }, 5, 1.15, 0.05);
+        nat = measured.seconds[0];
+        w8 = measured.seconds[1];
+        kept.of = measured.pick == 1 ? 1 : 0;
     } catch (const std::exception& e) {
         // native: the form the products took before (a GPU whose memory the timing's buffers do not fit)
         std::fprintf(stderr, "xestrata: timing the LLMs' dense products: %s\n", e.what());

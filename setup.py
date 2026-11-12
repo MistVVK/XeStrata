@@ -1467,8 +1467,8 @@ RENAMED = {old + ext: ("xestrata-engine" if old == UPSTREAM_EXES[0] else "xe" + 
 # the readers one binary per place it ran (llama.cpp's mtmd on the CPU and on Vulkan, upstream's names and XeStrata's,
 # and the GPU's of a source build before the CPU's joined it): a config that names one gets the one reader
 RENAMED.update({old + ext: VISION_EXE
-                for old in ("strata-vision-cpu", "strata-vision-vulkan", "xestrata-vision-cpu",
-                            "xestrata-vision-vulkan", "xestrata-vision-gpu")
+                for old in ("strata-vision-cpu", "strata-vision-vulkan",   # upstream's and the earlier names
+                            "xestrata-vision-cpu", "xestrata-vision-vulkan", "xestrata-vision-gpu")
                 for ext in (("", ".exe") if WIN else ("",))})
 
 
@@ -4935,7 +4935,7 @@ def build_engine(llama, comp: dict, data: Path) -> Path:
     say("  The engine's source changed: compiling it again (only what changed) ..." if xe and (eng / EXE).exists()
         and bdir.exists() else "  Compiling the XeStrata engine for the GPU (20-40 minutes, once) ...")
     # the targets keep upstream's names (CMakeLists.txt); strata-vision is the picture reader
-    cmake_build(ROOT, bdir, ["strata", "strata-image", "strata-vision"],
+    cmake_build(ROOT, bdir, ["strata", "strata-image", "strata-vision"],   # upstream's CMake target names
                 [f"-DCMAKE_CXX_COMPILER={comp['cxx']}", f"-DCMAKE_C_COMPILER={comp['cc']}",
                  f"-DSTRATA_LICENSE={comp['license']}",
                  f"-DSTRATA_CUDA_ARCHS={'auto' if comp['cuda_archs'] else ''}",

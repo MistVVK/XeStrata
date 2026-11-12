@@ -1073,8 +1073,16 @@ const MmqPlan& mmq_plan() {
         if (p.any && mmq_env() < 0) {   // by the rows a layer's experts average, against this GPU's timing
             int64_t first = 0;
             while (!p.layer[(size_t) first]) ++first;
+            // as a chunk's layer launches them: MMQ_GROUP experts an int8 launch, each gathered into the group's
+            // buffer first; the FP16 path's groups of g_expert_group (MMQ_GROUP at most)
+            mmq::ExpertLaunches launches;
+            launches.n_expert = lay.n_expert;
+            launches.int8_group = MMQ_GROUP;
+            launches.f16_group = std::min(MMQ_GROUP, g_expert_group);
+            launches.int8_gathers = true;
             p.int8_below = mmq::int8_rows_below(lay.fmt[(size_t) first], (size_t) lay.blob_bytes(first),
-                                                 strata::kernels::xmx_available(strata::kernels::XmxType::f16) ? 0 : INT64_MAX);
+                                                 strata::kernels::xmx_available(strata::kernels::XmxType::f16) ? 0 : INT64_MAX,
+                                                 launches);
             if (p.int8_below == 0) {   // FP16 at every size
                 p = MmqPlan{};
                 p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);

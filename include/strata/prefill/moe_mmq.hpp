@@ -111,11 +111,21 @@ bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_byt
 /// (gate k, up n_ff + k: GGUF).  FP32 out (the down product's quantizer reads floats).
 void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream);
 
+/// How a prompt's layer launches its experts' products, for int8_rows_below to time them so: the model's experts, how
+/// many the int8 products take a launch, how many the FP16 path dequantizes and multiplies a launch, and whether each
+/// expert's blob is first gathered into a group buffer for the int8 products (Qwen3.8-Flash-Next's prompt).
+struct ExpertLaunches {
+    int64_t n_expert = 0;
+    int int8_group = 0, f16_group = 0;
+    bool int8_gathers = false;
+};
 /// From how many rows an expert (a layer's rows over the experts it routes to) the FP16 path - the experts dequantized
 /// to FP16 and their grouped products - beats the int8 products on the current GPU, for experts of format `f` (`blob`
-/// bytes each): timed the first time a GPU and format are asked, and kept.  INT64_MAX: int8 at every size; 0: FP16 at
-/// every size; `fallback` where the timing cannot run.  Both engines' prompts choose a chunk's layer by it.
-int64_t int8_rows_below(const kernels::cpu::NativeFmt& f, size_t blob, int64_t fallback);
+/// bytes each) launched as `launches` says: timed the first time a GPU, format and launch shape are asked, and kept.
+/// INT64_MAX: int8 at every size; 0: FP16 at every size; `fallback` where the timing cannot run.  Both engines' prompts
+/// choose a chunk's layer by it.
+int64_t int8_rows_below(const kernels::cpu::NativeFmt& f, size_t blob, int64_t fallback,
+                        const ExpertLaunches& launches);
 
 /// dst[i] = i for i < n (the identity row map MMQ's MoE mode writes through).
 void iota(int32_t* dst, int64_t n, void* stream);

@@ -962,8 +962,9 @@ if(STRATA_ENABLE_XE)
     target_sources(strata_kernels PRIVATE src/kernels/xe/sdpa_onednn.cpp)
     target_link_libraries(strata_kernels PRIVATE strata_dnnl)
     set_property(SOURCE src/kernels/xe/i8_gemm.cpp APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN_I8=1)
-    set_property(SOURCE src/kernels/xe/image_sdpa.cpp src/kernels/xe/prompt_attn.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp
-                 src/image/yolo_detect.cpp src/image/hunyuanimage3_vae.cpp src/upscale/esrgan.cpp src/image/aux_net.cpp
+    set_property(SOURCE src/kernels/xe/image_sdpa.cpp src/kernels/xe/prompt_attn.cpp src/image/qi_vae.cpp
+                 src/image/mf_vae.cpp src/image/yolo_detect.cpp src/image/hunyuanimage3_vae.cpp
+                 src/upscale/esrgan.cpp src/image/aux_net.cpp
                  src/image/florence2.cpp src/image/qi_attn_train.cpp
                  APPEND PROPERTY COMPILE_DEFINITIONS STRATA_ONEDNN=1)
   endif()
@@ -1215,8 +1216,8 @@ if(STRATA_ENABLE_XE)
       set_property(SOURCE src/kernels/xe/sdpa_cudnn.cpp APPEND PROPERTY COMPILE_DEFINITIONS
                    NV_CUDNN_FRONTEND_USE_DYNAMIC_LOADING CUDNN_FRONTEND_SKIP_JSON_LIB)
       set_property(SOURCE src/kernels/xe/sdpa_cudnn.cpp APPEND PROPERTY COMPILE_OPTIONS -w)   # its headers' warnings
-      set_property(SOURCE src/kernels/xe/image_sdpa.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp src/image/yolo_detect.cpp
-                   src/image/hunyuanimage3_vae.cpp src/upscale/esrgan.cpp
+      set_property(SOURCE src/kernels/xe/image_sdpa.cpp src/image/qi_vae.cpp src/image/mf_vae.cpp
+                   src/image/yolo_detect.cpp src/image/hunyuanimage3_vae.cpp src/upscale/esrgan.cpp
                    src/image/aux_net.cpp src/image/qi_attn_train.cpp src/kernels/xe/prompt_attn.cpp
                    APPEND PROPERTY COMPILE_DEFINITIONS STRATA_CUDNN=1)
       target_link_libraries(strata_kernels PRIVATE ${CMAKE_DL_LIBS})
@@ -1622,8 +1623,7 @@ set_source_files_properties(src/kernels/cpu/bf16_gemm_avx512.cpp PROPERTIES COMP
 # the CPU vision encoder's rows (vision_cpu.hpp): the LayerNorm, the GELU, the softmax and the RoPE, eight floats wide
 # where cpu_avx2_ok() and sixteen where the BF16 product takes its AVX-512 kernel; each copy its own file and flags
 set_source_files_properties(src/kernels/cpu/vision_cpu_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
-set_source_files_properties(src/kernels/cpu/vision_cpu_avx512.cpp PROPERTIES COMPILE_OPTIONS
-                            "-mavx512f;-mavx2;-mfma")
+set_source_files_properties(src/kernels/cpu/vision_cpu_avx512.cpp PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx2;-mfma")
 # the rows' pass of the image engine's host resize (resize_rows.hpp): the AVX2 copy, and the VNNI ones in functions
 # marked target("avxvnni") / target("avx512f,avx512vl,avx512vnni"), as i8_gemm_vnni.cpp's
 set_source_files_properties(src/kernels/cpu/resize_rows_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2")

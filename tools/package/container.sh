@@ -171,8 +171,9 @@ if [ "$license" = contrib ]; then
     -DSTRATA_CUDA_PATH="$cuda_path" -DSTRATA_CUDA_PTX= ${cudnn_root:+-DSTRATA_CUDNN_ROOT=$cudnn_root}
 fi
 cmake -G Ninja -S "$src" -B /build/engine "$@"
-targets="strata strata-image strata-vision onemath_backend_libs"   # oneMath's backends: rocBLAS (AMD GPUs) in
-# every package; strata-vision: the picture reader (the engine's own vision encoder, on the GPU or the CPU)
+targets="strata strata-image strata-vision onemath_backend_libs"   # upstream's CMake target names; oneMath's
+# backends: rocBLAS (AMD GPUs) in every package; strata-vision: the picture reader (the engine's own vision
+# encoder, on the GPU or the CPU)
 # shellcheck disable=SC2086
 cmake --build /build/engine --target $targets -j "$jobs"
 lap engine

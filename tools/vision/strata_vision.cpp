@@ -1,5 +1,6 @@
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // tools/vision/strata_vision.cpp - the chat's picture reader: the vision encoder the image engine shares
 // (strata/core/vision.hpp: Qwen3-VL's ViT and its merger from the model's mmproj GGUF), on the GPU with --gpu and on
 // the CPU without (int8 products by default, BF16 with XESTRATA_VISION_CPU_I8=0, on --threads threads, default one a

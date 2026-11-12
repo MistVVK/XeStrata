@@ -870,8 +870,14 @@ struct Kernel {
 #endif
     }
 
-    // the work-group's parts of K, one after the other (one: the whole K)
+    // the work-group's parts of K, one after the other (one: the whole K, straight: through the loop, every launch
+    // of the experts' products, none of which takes parts, ran slower, Qwen3.6-35B-A3B UD-Q4_K_XL's 1K prompt on the
+    // B70 3012 -> 2885 tok/s, 2026-11-12)
     void body(sycl::nd_item<1> it) const {
+        if (nch == 1) {
+            part_body(it, 0);
+            return;
+        }
         const int64_t kw = (int64_t) it.get_group(0) % ksplit;
         for (int64_t ks = kw * cpw; ks < sycl::min(nch, (kw + 1) * cpw); ++ks) part_body(it, ks);
     }

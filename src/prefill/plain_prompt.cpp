@@ -585,11 +585,18 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
     }
     dump_routes(ml, P.h_ids, T, K);
     // the int8 products while the experts this layer routes to average fewer rows than this GPU measured them faster
-    // at (int8_below, prefill::mmq::int8_rows_below: Qwen3.8-Flash-Next's rule), else the FP16 path
-    int64_t routed = 0;
-    for (int64_t e = 0; e < E; ++e) routed += count[(size_t) e] > 0;
-    const bool use_mmq =
-        P.int8 && (!P.f16 || P.int8_below == INT64_MAX || T * K < P.int8_below * std::max<int64_t>(routed, 1));
+    // at (int8_below, prefill::mmq::int8_rows_below: Qwen3.8-Flash-Next's rule), else the FP16 path - where every one
+    // of them is in VRAM: the FP16 path copies a missed expert on the compute queue before its dequantization, where
+    // the int8 products copy the next group's beside this one's products.  Ornith-1.5-35B-A3B GSQ-RCO 3bit on the RTX
+    // 4070 (about 78% of the routed experts in VRAM), a 32K prompt's chunks of 8192 tokens (256 rows an expert, where
+    // the products alone time FP16 8% faster): 2,934 tok/s in int8, 2,336 to 2,441 on the FP16 path (2026-11-12)
+    int64_t routed = 0, missed = 0;
+    for (int64_t e = 0; e < E; ++e) {
+        routed += count[(size_t) e] > 0;
+        missed += count[(size_t) e] > 0 && res_[(size_t) (ml * E + e)] < 0;
+    }
+    const bool use_mmq = P.int8 && (!P.f16 || P.int8_below == INT64_MAX || missed > 0 ||
+                                    T * K < P.int8_below * std::max<int64_t>(routed, 1));
     if (routes != nullptr) std::copy(P.h_ids, P.h_ids + T * K, routes);
     const auto& f = lay.fmt[(size_t) ml];
     // the CPU's share of the missed experts (after Project Maya's CPU lane, as the windows split them): of

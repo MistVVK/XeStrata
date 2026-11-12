@@ -51,8 +51,10 @@ inline int64_t timed_key_class(int64_t keys) {
 // Nested candidate launches use already measured choices, but defer new tuning until the actual call.
 inline thread_local int timing_depth = 0;
 
-// Candidates are in preference order. A later one must be at least 5% faster than the current choice.
+// Candidates are in preference order. A later one must be at least `margin` faster than the current choice (5%).
 // A false return means that candidate cannot take this shape. `scale` accounts for a timed slice of the work.
+// `warm_s`: after each candidate's first run, the candidates run in turn for this long before the timings, so that a
+// GPU that idled clocks up first (0: none, the choices of short products, whose callers count every millisecond).
 struct TimedCandidate {
     std::function<bool()> run;
     double scale = 1.0;
@@ -63,7 +65,7 @@ struct TimedChoice {
 };
 
 inline TimedChoice timed_choice(const std::vector<TimedCandidate>& candidates, const std::function<void()>& wait,
-                                int samples = 5) {
+                                int samples = 5, double margin = 1.05, double warm_s = 0.0) {
     struct Guard { Guard() { ++timing_depth; } ~Guard() { --timing_depth; } } guard;
     TimedChoice result;
     result.seconds.assign(candidates.size(), -1.0);
@@ -72,6 +74,16 @@ inline TimedChoice timed_choice(const std::vector<TimedCandidate>& candidates, c
         if (candidates[i].run()) {
             wait();
             result.seconds[i] = std::numeric_limits<double>::infinity();
+        }
+    }
+    if (warm_s > 0) {
+        const auto start = std::chrono::steady_clock::now();
+        while (std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count() < warm_s) {
+            bool any = false;
+            for (size_t i = 0; i < candidates.size(); ++i)
+                if (result.seconds[i] >= 0 && candidates[i].run()) any = true;
+            wait();
+            if (!any) break;
         }
     }
     for (int sample = 0; sample < samples; ++sample) {
@@ -98,7 +110,7 @@ inline TimedChoice timed_choice(const std::vector<TimedCandidate>& candidates, c
     }
     for (size_t i = 0; i < result.seconds.size(); ++i) {
         const double t = result.seconds[i];
-        if (t >= 0 && (result.pick < 0 || t * 1.05 < result.seconds[(size_t) result.pick])) result.pick = (int) i;
+        if (t >= 0 && (result.pick < 0 || t * margin < result.seconds[(size_t) result.pick])) result.pick = (int) i;
     }
     return result;
 }

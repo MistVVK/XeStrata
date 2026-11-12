@@ -1142,7 +1142,12 @@ int64_t PlainModel::prompt_int8_below() const {
     if (const char* v = strata::env_get("PLAIN_MMQ"); v != nullptr && v[0] != '\0') return INT64_MAX;
     const auto& lay = k::cpu::expert_layout();
     if (dense_ || spec_.n_expert <= 0 || !lay.native || lay.fmt.empty()) return INT64_MAX;
-    return prefill::mmq::int8_rows_below(lay.fmt.front(), (size_t) lay.blob_bytes(0), INT64_MAX);
+    // as prompt_routed launches them: the experts in VRAM in one int8 launch, kGroup a launch on the FP16 path
+    prefill::mmq::ExpertLaunches launches;
+    launches.n_expert = spec_.n_expert;
+    launches.int8_group = (int) spec_.n_expert;
+    launches.f16_group = PromptBufs::kGroup;
+    return prefill::mmq::int8_rows_below(lay.fmt.front(), (size_t) lay.blob_bytes(0), INT64_MAX, launches);
 }
 
 void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* host, uint64_t& dev_bytes,
@@ -1224,8 +1229,13 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
     // in grouped order (the int8 one writes them in routing order, straight into parts); beside the int8 products'
     // where a chunk of T tokens reaches int8_below rows an expert spread over every expert.  They are 0.9 GB at 8192
     // tokens of Qwen3.6-35B-A3B, and taken where a layer could not reach it they halved the chunk the tier lends (the
-    // RTX 4070, 32K: 16384 -> 8192 tokens, its missed experts read 1.4 times as often, 2622 -> 1963 tok/s)
-    b.f16 = !b.int8 || (b.int8_below != INT64_MAX && (int64_t) TK >= b.int8_below * (int64_t) E);
+    // RTX 4070, 32K: 16384 -> 8192 tokens, its missed experts read 1.4 times as often, 2622 -> 1963 tok/s).  Only
+    // where every expert has its slot (tier_whole_): elsewhere a layer's routed experts are seldom all in VRAM, which
+    // the FP16 path needs (prompt_routed), and the buffers the prompt borrows from the tier left more of them out
+    // (Ornith-1.5-35B-A3B GSQ-RCO 3bit on the RTX 4070, 197 slots a layer, a 32K prompt: 23,714 experts read from RAM
+    // with the int8 products' buffers alone, 27,187 with these, 2,934 -> 2,824 tok/s, 2026-11-12)
+    b.f16 = !b.int8 ||
+            (tier_whole_ && b.int8_below != INT64_MAX && (int64_t) TK >= b.int8_below * (int64_t) E);
     const uint64_t f16 = b.f16 ? 1 : 0;
     take(b.xs16, f16 * TK * N * 2); take(b.gu, TK * 2 * FF * 4); take(b.hh, TK * FF * 4); take(b.h16, f16 * TK * FF * 2);
     take(b.dm, f16 * TK * N * 4); take(b.parts, TK * N * 4); take(b.moe_out, U * N * 4);
@@ -1563,6 +1573,7 @@ bool PlainModel::open_experts(std::string& err) {
     }
     if (!slot_bytes.empty() && !cache_.open_sized(slot_bytes, L, E, err)) return false;
     n_slots_ = (int64_t) slot_bytes.size();
+    tier_whole_ = q == E;
     if (!opt_.prompt_chunk_given && opt_.prompt_chunk > 0 && prompt_host_ != nullptr && first() && last())
         auto_prompt_chunk(q == E ? room - per_layer_b * (uint64_t) q : 0);
     // every expert has its slot and VRAM is left beside the tier: the prompt's buffers there, for the longest chunk
