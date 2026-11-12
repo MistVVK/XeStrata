@@ -1560,6 +1560,19 @@ constexpr size_t MMQ_TAIL = 4096;
 // OWN-I8: the device record of one native_expert_i8 launch (a group of at most MMQ_GROUP experts): the blob pointers (8 bytes each), the rows'
 // bounds relative to the launch's first row (MMQ_GROUP + 1 ints, padded to 80 bytes) and the group count (one int)
 constexpr size_t kI8RecStart = 8 * (size_t) MMQ_GROUP, kI8RecN = kI8RecStart + 80, kI8RecBytes = kI8RecN + 16;
+// STRATA_I8_COUNT=1 (diagnostic, off by default, no effect on any result): one stderr line per prompt chunk saying how many of the routed (token, expert)
+// entries of the layers that reached the MMQ group walk ran on native_expert_i8 and how many stayed on the walk's own kernels (MMQ, or the FP16 path).
+bool i8_count_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_I8_COUNT"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+struct I8Count {
+    int64_t layers = 0, layers_i8 = 0, ent = 0, ent_i8 = 0, groups_i8 = 0, min_avg = INT64_MAX;
+};
+I8Count& i8_count() {
+    static I8Count c;
+    return c;
+}
 // The MMQ row table (`ids_identity`, T*K rows) is read past its end by llama.cpp's stream-k fixup, which loads a whole
 // J-column tile of ids before it compares the tile with the expert's rows (see mmq_ids_margin.hpp: the margin follows the
 // backend's tile bound).  An expert takes at most one row per token, so max_rows <= T.  Without the slack the table is an
@@ -5461,6 +5474,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             fz_staged_l = true;
                             fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
                         }
+                            if (i8_count_on() && i8_groups > 0) {
+                                I8Count& c = i8_count();
+                                c.min_avg = std::min<int64_t>(c.min_avg, rows_local / i8_groups);
+                                if (i8_l) c.groups_i8 += i8_groups;
+                            }
+                        }
+                        if (i8_count_on()) {   // every layer that reaches here: its routed entries and where they ran
+                            I8Count& c = i8_count();
+                            ++c.layers;
+                            c.ent += rows_local;
+                            if (i8_l) { ++c.layers_i8; c.ent_i8 += rows_local; }
                         if (i8_l) {   // the layer's T tokens as q8_1 rows, once (the grouped kernels' activations)
                             if (static bool said = false; !said) {
                                 said = true;
@@ -6696,6 +6720,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     cudaMemcpy(row.data(), m.R + t * D, (size_t) D * 4, cudaMemcpyDeviceToHost);
                     const int64_t pos = p0 + t;
                     std::fwrite(&pos, sizeof pos, 1, f);
+        if (i8_count_on()) {   // STRATA_I8_COUNT=1: this chunk's entries by path (the counters restart for the next chunk)
+            I8Count& c = i8_count();
+            std::fprintf(stderr, "strata i8-count: chunk of %lld tokens: %lld layers reached the group walk, %lld on native_expert_i8; routed entries %lld, on native_expert_i8 %lld (%.2f %%), "
+                                 "elsewhere in the walk %lld; i8 groups %lld; smallest group average seen %lld entries\n",
+                         (long long) T, (long long) c.layers, (long long) c.layers_i8, (long long) c.ent, (long long) c.ent_i8, c.ent > 0 ? 100.0 * (double) c.ent_i8 / (double) c.ent : 0.0,
+                         (long long) (c.ent - c.ent_i8), (long long) c.groups_i8, (long long) (c.min_avg == INT64_MAX ? -1 : c.min_avg));
+            c = I8Count{};
+        }
                     std::fwrite(row.data(), 4, row.size(), f);
                 }
                 std::fclose(f);
