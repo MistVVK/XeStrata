@@ -6234,9 +6234,49 @@ void native_expert_set_mode(int mode, int phase) {
 
 namespace {
 bool g_grouped_v1 = env_on("STRATA_GROUPED_V1");
+#include "i8_expert.cuh"   // OWN-I8: our own int8 dot-product kernels (native_expert_i8 below)
 }  // namespace
 
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
+
+bool native_expert_i8_supported(const NativeExpertLayout& L) noexcept {
+    return i8_gu_type(L.gu_type) && i8_d_type(L.d_type) && !L.gu_nib && L.tail_off == 0 && L.had_block == 0 && L.n_embd % 256 == 0 &&
+           L.n_ff % 128 == 0 && L.n_embd % 64 == 0;
+}
+
+void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                      const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
+                      void* scratch, float* out, void* stream) {
+    if (cap_groups <= 0 || cap_entries <= 0) return;
+    if (!native_expert_i8_supported(L)) {
+        std::fprintf(stderr, "native_expert_i8: gate/up type %d, down type %d at %lld x %lld is not covered\n", L.gu_type, L.d_type,
+                     (long long) L.n_embd, (long long) L.n_ff);
+        std::exit(1);
+    }
+    cudaStream_t s = (cudaStream_t) stream;
+    // scratch: the H blocks (q8_1, one per 32 features and entry), then the tile table (cap_groups + 1 ints)
+    block_q8_1* hq = (block_q8_1*) scratch;
+    const size_t hqb = ((size_t) cap_entries * (size_t) (L.n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255;
+    int32_t* tile_off = (int32_t*) ((uint8_t*) scratch + hqb);
+    int tm = i8_env_int("STRATA_I8_TM", 0);   // research: the tile's rows per thread (2, 3 or 4 -> 32, 48 or 64 entries)
+    if (tm <= 0) tm = (int) std::max<int64_t>(2, std::min<int64_t>(4, (cap_entries / cap_groups + 8) / 16));
+    tm = tm <= 2 ? 2 : tm == 3 ? 3 : 4;
+    const int bm = 16 * tm;
+    i8_tiles_kernel<<<1, 256, 0, s>>>(grp_start, n_groups, bm, tile_off);
+    I8Args a{grp_ptr, grp_start, n_groups, tile_off, ent_tok, ent_dst, (const block_q8_1*) x_q8_1, hq, out, L,
+             cap_entries / bm + cap_groups};
+    switch (L.gu_type) {
+        case 16: i8_launch<16, true>(tm, a, s); break;
+        case 17: i8_launch<17, true>(tm, a, s); break;
+        case 18: i8_launch<18, true>(tm, a, s); break;
+        case 21: i8_launch<21, true>(tm, a, s); break;
+        default: i8_launch<22, true>(tm, a, s); break;
+    }
+    check("native_expert_i8/gu");
+    if (L.d_type == 20) i8_launch<20, false>(tm, a, s);
+    else i8_launch<42, false>(tm, a, s);
+    check("native_expert_i8/down");
+}
 
 void native_expert_set_expdec(int on) { g_expdec = on < 0 ? -1 : (on ? 1 : 0); }
 int native_expert_expdec() { return expdec_mode(); }
@@ -6275,6 +6315,12 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     if (cap_groups <= 0 || cap_entries <= 0) return;
     strata::dispatch::kernel(strata::dispatch::kExpert, 0, L.gu_type, (int) L.n_embd, (int) L.n_ff, L.d_type);   // BW-MEASURE: one grouped expert call
     if (L.n_ff % 32 != 0) { std::fprintf(stderr, "native_expert_grouped: n_ff %lld\n", (long long) L.n_ff); std::exit(1); }
+    // OWN-I8 research switch (STRATA_EXPERT_I8=1, off by default): a prompt-sized call on our own int8 tile kernels
+    static const bool i8_switch = env_on("STRATA_EXPERT_I8");
+    if (i8_switch && cap_entries >= 256 && grid_groups <= 0 && native_expert_i8_supported(L)) {
+        native_expert_i8(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch, out, stream);
+        return;
+    }
     cudaStream_t s = (cudaStream_t) stream;
     const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
     float* gate = (float*) scratch;

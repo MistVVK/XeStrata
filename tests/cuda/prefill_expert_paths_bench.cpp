@@ -378,6 +378,16 @@ struct GrpPath {
     }
 };
 
+// I8: the same layer through native_expert_i8 (our own int8 dot-product tile kernels, src/kernels/cuda/i8_expert.cuh); the same tables and activations as GRP
+struct I8Path : GrpPath {
+    using GrpPath::GrpPath;
+    void run_i8(const float* x_dev, cudaStream_t st) {
+        kern::quantize_q8_1_rows(x_dev, T, s.N, xq.p, st);
+        kern::native_expert_i8(L, ptr.as<unsigned long long>(), start.as<int32_t>(), ngroups.as<int32_t>(), dst.as<int32_t>(), tok.as<int32_t>(), n, rows, xq.p, scr.p,
+                               dm.as<float>(), st);
+    }
+};
+
 // ---------------------------------------------------------------------------------------------------------------------------------------------
 // FUSED: moe_fused_iq.hpp's native entry points (the compiled geometry's copy), or the Qwen3.6 copy's.
 struct FusedFlash {
@@ -520,7 +530,7 @@ struct Opts {
     Shape shape{2560, 640, 512, 10, "flash"};
     std::vector<int> tokens = {2048, 4096, 8192, 20000};
     std::vector<std::string> only;
-    bool dense = false, tokens_set = false, all = false, list = false, grouped = false, no_mmq = false, no_fused = false, no_fp16 = false, no_ref = false, quick = false;
+    bool dense = false, tokens_set = false, all = false, list = false, grouped = false, i8 = false, no_grp = false, no_mmq = false, no_fused = false, no_fp16 = false, no_ref = false, quick = false;
     int repeats = 7, sample = 96, experts = 0;
     float warm_ms = 1000.0f;
     double skew = 0;
@@ -639,16 +649,19 @@ void run_cell(const Pair& p, const Shape& s, int T, const Opts& o, const Card& c
 #else
     const bool fused_q36 = false;
 #endif
-    const bool grp_ok = (o.grouped || s.name == "q36") && kern::native_expert_supported((int) p.gu, (int) p.d, N, FF);
+    const bool grp_ok = !o.no_grp && (o.grouped || s.name == "q36") && kern::native_expert_supported((int) p.gu, (int) p.d, N, FF);
     const bool fr_ok = fp16_ok && kern::native_expert_supported((int) p.gu, (int) p.d, N, FF);
+    const bool i8_ok = o.i8 && kern::native_expert_supported((int) p.gu, (int) p.d, N, FF) && kern::native_expert_i8_supported(kern::native_expert_layout((int) p.gu, (int) p.d, N, FF));
 
     std::unique_ptr<MmqPath> mp;
     std::unique_ptr<Fp16Path> fp;
     std::unique_ptr<GrpPath> gp;
+    std::unique_ptr<I8Path> ip;
     std::unique_ptr<FusedBase> fu;
     if (mmq_ok) mp = std::make_unique<MmqPath>(p, s, geo, rows, r, blob, gu, hmq, dm);
     if (fp16_ok) fp = std::make_unique<Fp16Path>(p, s, geo, gemm, T, rows, r, blob, gu, dm, fr_ok);
     if (grp_ok) gp = std::make_unique<GrpPath>(p, s, T, rows, r, blob, dm);
+    if (i8_ok) ip = std::make_unique<I8Path>(p, s, T, rows, r, blob, dm);
     if (fused_flash) fu = std::make_unique<FusedPath<FusedFlash>>(p, geo, s, T, rows, ids, blob, dm);
 #if !defined(FB_HIP)
     if (fused_q36) fu = std::make_unique<FusedPath<FusedQ36>>(p, geo, s, T, rows, ids, blob, dm);
@@ -663,6 +676,7 @@ void run_cell(const Pair& p, const Shape& s, int T, const Opts& o, const Card& c
         if (fr_ok) paths.push_back({"FP16+FR", [&] { fp->run(true, x_dev.as<float>(), x16_dev.as<uint16_t>(), src_dev.as<int32_t>(), st); }, pair_rows, {}, {}, {}, 0});
     }
     if (gp) paths.push_back({"GRP", [&] { gp->run(x_dev.as<float>(), st); }, pair_rows, {}, {}, {}, 0});
+    if (ip) paths.push_back({"I8", [&] { ip->run_i8(x_dev.as<float>(), st); }, pair_rows, {}, {}, {}, 0});
     if (fu) paths.push_back({"FUSED", [&] { fu->run(x_dev.as<float>(), st); },
                              [&] {
                                  std::vector<int32_t> slot((size_t) rows);
@@ -783,8 +797,9 @@ void run_cell(const Pair& p, const Shape& s, int T, const Opts& o, const Card& c
         else std::snprintf(buf, cap, "n/a");
     };
     char m_mmq[24], m_fp[24], m_fr[24], m_grp[24], m_fu[24], r_fp[24], r_fr[24], r_grp[24], r_fu[24], r_fu_fp[24], e_mmq[40], e_fp[40], e_fr[40], e_grp[40], e_fu[40];
+    char m_i8[24], r_i8[24], e_i8[40], h_i8[24], sp_i8[24];
     char h_mmq[24], h_fp[24], h_fr[24], h_grp[24], h_fu[24], sp_mmq[24], sp_fp[24], sp_fu[24];
-    ms("MMQ", m_mmq, sizeof m_mmq); ms("FP16", m_fp, sizeof m_fp); ms("FP16+FR", m_fr, sizeof m_fr); ms("GRP", m_grp, sizeof m_grp); ms("FUSED", m_fu, sizeof m_fu);
+    ms("MMQ", m_mmq, sizeof m_mmq); ms("FP16", m_fp, sizeof m_fp); ms("FP16+FR", m_fr, sizeof m_fr); ms("GRP", m_grp, sizeof m_grp); ms("FUSED", m_fu, sizeof m_fu); ms("I8", m_i8, sizeof m_i8); ratio("MMQ", "I8", r_i8, sizeof r_i8); errs("I8", e_i8, sizeof e_i8); hs("I8", h_i8, sizeof h_i8); spread("I8", sp_i8, sizeof sp_i8);
     ratio("MMQ", "FP16", r_fp, sizeof r_fp); ratio("MMQ", "FP16+FR", r_fr, sizeof r_fr); ratio("MMQ", "GRP", r_grp, sizeof r_grp); ratio("MMQ", "FUSED", r_fu, sizeof r_fu);
     ratio("FP16", "FUSED", r_fu_fp, sizeof r_fu_fp);
     errs("MMQ", e_mmq, sizeof e_mmq); errs("FP16", e_fp, sizeof e_fp); errs("FP16+FR", e_fr, sizeof e_fr); errs("GRP", e_grp, sizeof e_grp); errs("FUSED", e_fu, sizeof e_fu);
@@ -797,9 +812,9 @@ void run_cell(const Pair& p, const Shape& s, int T, const Opts& o, const Card& c
     std::printf("RESULT shape=%s pair=%s tokens=%d experts=%d top=%d few_row_experts=%d fewrows_default_here=%d mmq_ms=%s fp16_ms=%s fp16fr_ms=%s grp_ms=%s fused_ms=%s "
                 "mmq_over_fp16=%s mmq_over_fp16fr=%s mmq_over_grp=%s mmq_over_fused=%s fp16_over_fused=%s spread_mmq=%s spread_fp16=%s spread_fused=%s repeats=%d "
                 "err_mmq=%s err_fp16=%s err_fp16fr=%s err_grp=%s err_fused=%s hash_mmq=%s hash_fp16=%s hash_fp16fr=%s hash_grp=%s hash_fused=%s nonfinite_rows=%lld "
-                "vram_mib=%.0f card=%s arch=%s skew=%.2f\n",
+                "i8_ms=%s mmq_over_i8=%s err_i8=%s hash_i8=%s spread_i8=%s vram_mib=%.0f card=%s arch=%s skew=%.2f\n",
                 s.name.c_str(), pn.c_str(), T, E, K, few, fewrows_dflt ? 1 : 0, m_mmq, m_fp, m_fr, m_grp, m_fu, r_fp, r_fr, r_grp, r_fu, r_fu_fp, sp_mmq, sp_fp, sp_fu,
-                repeats, e_mmq, e_fp, e_fr, e_grp, e_fu, h_mmq, h_fp, h_fr, h_grp, h_fu, bad, vram_mib, [&] {
+                repeats, e_mmq, e_fp, e_fr, e_grp, e_fu, h_mmq, h_fp, h_fr, h_grp, h_fu, bad, m_i8, r_i8, e_i8, h_i8, sp_i8, vram_mib, [&] {
                     static std::string cn; cn = card.name; for (char& c : cn) if (c == ' ') c = '_'; return cn.c_str(); }(), card.arch.c_str(), o.skew);
     std::fflush(stdout);
 }
@@ -1006,6 +1021,8 @@ int main(int argc, char** argv) {
             else if (!std::strcmp(a, "--all")) o.all = true;
             else if (!std::strcmp(a, "--list")) o.list = true;
             else if (!std::strcmp(a, "--grouped")) o.grouped = true;
+            else if (!std::strcmp(a, "--i8")) o.i8 = true;
+            else if (!std::strcmp(a, "--no-grp")) o.no_grp = true;
             else if (!std::strcmp(a, "--no-mmq")) o.no_mmq = true;
             else if (!std::strcmp(a, "--no-fused")) o.no_fused = true;
             else if (!std::strcmp(a, "--no-fp16")) o.no_fp16 = true;

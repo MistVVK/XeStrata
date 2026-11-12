@@ -86,6 +86,17 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            int64_t grid_groups = 0);
+/// OWN-I8 (research, off by default): the same call as `native_expert_grouped` on our own int8 dot-product kernels - a tile of
+/// 64 weight rows x 32..64 entries per block, each weight sub-block decoded once per tile into int8 in shared memory, `dp4a`
+/// products, SwiGLU and the q8_1 quantization of H in the gate/up epilogue (gate/up never go to memory).  For cards with no
+/// matrix cores the fused prompt kernels can use.  `scratch` as for native_expert_grouped (native_expert_scratch_bytes).
+/// Covered: gate/up IQ2_XXS / IQ2_XS / IQ3_XXS / IQ3_S / IQ2_S with a down of IQ4_NL / Q2_0 (`native_expert_i8_supported`);
+/// no NVFP4 tail, no APR Hadamard, no 4-bit slots.  STRATA_EXPERT_I8=1 makes `native_expert_grouped` itself take it for a call of
+/// 256 entries or more (the prompt chunk of a Qwen3.6 engine without MMQ); STRATA_I8_TM = 2 | 3 | 4 forces the tile.
+bool native_expert_i8_supported(const NativeExpertLayout& L) noexcept;
+void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                      const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
+                      void* scratch, float* out, void* stream);
 /// true: `native_expert_grouped`'s launches before the group stride (STRATA_GROUPED_V1=1 at startup) - a block row
 /// per possible group, SwiGLU and the q8_1 quantization as two kernels over all cap_entries.  Bitwise the same results
 /// (native_grouped_parity checks it); kept for A/B timing.  Set before graph capture; captured graphs keep theirs.
