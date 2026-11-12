@@ -424,6 +424,13 @@ int main() {
         CHECK(!igpu_kfd_settle_default(g, false, false));   // not integrated
     }
     for (const char* g : {"gfx1100", "gfx1201", "gfx90a", "gfx1030", "gfx1152", ""}) CHECK(!igpu_kfd_settle_default(g, true, false));
+    // the file-cache give-back during and after the expert load (page_cache_drop.hpp): the same class
+    for (const char* g : {"gfx1103", "gfx1150", "gfx1151", "gfx1103:sramecc-:xnack-"}) {
+        CHECK(igpu_cache_drop_default(g, true, false));
+        CHECK(!igpu_cache_drop_default(g, true, true));     // Windows
+        CHECK(!igpu_cache_drop_default(g, false, false));   // not integrated
+    }
+    for (const char* g : {"gfx1100", "gfx1201", "gfx90a", "gfx1030", "gfx1152", ""}) CHECK(!igpu_cache_drop_default(g, true, false));
     // STRATA_NO_ARENA_THP: unset = the device rule decides; "0" = ask for the huge pages (also on such a device); any other value = skip them
     CHECK(arena_skip_thp_request(nullptr, false, true));      // integrated gfx11, nothing set: skipped
     CHECK(!arena_skip_thp_request(nullptr, false, false));    // any other device, nothing set: requested (as before)

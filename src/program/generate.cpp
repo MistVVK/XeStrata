@@ -21,6 +21,7 @@
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/reader_room.hpp"
 #include "strata/core/kfd_settle.hpp"
+#include "strata/core/page_cache_drop.hpp"
 #include "strata/core/gfx12_chunk.hpp"
 #include "strata/core/nv_chunk.hpp"
 #include "strata/core/nv_defaults.hpp"
@@ -3988,6 +3989,10 @@ int main(int argc, char** argv) {
             // and before READY it waits until its own KFD eviction counter has been quiet for 2 s (kfd_settle.hpp)
             if (strata::core::igpu_kfd_settle_default(ad.gcnArchName, all_igpu, win_host))
                 strata::core::kfd_settle_flag().store(true);
+            // and the file cache of the model files is given back while the expert arena is read and after it (page_cache_drop.hpp):
+            // the little free memory left beside the arena, the GPU's buffers and that cache is what makes the kernel's proactive compaction run
+            if (strata::core::igpu_cache_drop_default(ad.gcnArchName, all_igpu, win_host))
+                strata::core::arena_cache_drop_flag().store(true);
             // gfx1151 on Windows (#1630 capped a bare `--prefill auto` at 6144 for a 7900 XTX's commit charge): the Strix Halo has its
             // 8192 chunk back.  IQ3_S, 8K prompt: 691 -> 787 tok/s (one chunk streams 1,785 experts instead of 2,782), 64K 713 -> 748;
             // 4K is one chunk already.  STRATA_GFX1151_CHUNK=0 (or STRATA_GFX1151_DEFAULTS=0) keeps 6144.
@@ -7979,6 +7984,23 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: loaded %.2f GiB at %.2f GiB/s\n",
                      (double) strata::kernels::cpu::expert_layout().total / (1024.0 * 1024 * 1024),
                      arena_src.load_gib_per_second());
+#if defined(__linux__)
+        // integrated gfx11 under Linux: the experts are in the arena now; the model files' cached pages are a second copy.  The reads of
+        // experts.bin gave theirs back as they went (drop behind); this is the call after it, for every file the start read: the arena's expert files,
+        // the pack's dense.bin and embd.bin, the GGUF shards of --native (not the PLE table's: its rows are read directly).  The weights, the native
+        // projections and the head were loaded before the arena (engine log order); the PLE table is read from the drive on request.  Advice only.
+        if (strata::core::page_cache_drop::enabled()) {
+            std::vector<std::string> cached_files;
+            for (const auto& kv : arena_src.model_inputs()) cached_files.push_back(kv.second);
+            if (!o.pack.empty())
+                for (const char* n : {"dense.bin", "embd.bin"}) cached_files.push_back(o.pack + "/" + n);
+            for (const std::string& s : o.native_shards)
+                if (s != o.ple_gguf) cached_files.push_back(s);
+            const auto outcome = strata::core::page_cache_drop::give_back(cached_files);
+            const std::string line = strata::core::page_cache_drop::draft_line(outcome);
+            if (!line.empty()) std::fprintf(stderr, "strata generate: %s\n", line.c_str());
+        }
+#endif
         // A rate under ~0.2 GiB/s is not the hardware.  Task Scheduler / service contexts throttle this
         // read+fill about 24x (measured 0.05 vs 1.42 GiB/s for the same binary, args and cache state; the
         // scheduler's defaults - Below normal priority and a least-privilege token - were the only

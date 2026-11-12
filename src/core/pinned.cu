@@ -3,6 +3,7 @@
 #include "strata/platform/memory.hpp"
 #include "strata/core/pin_budget.hpp"
 #include "strata/core/arch_defaults.hpp"   // arena_skip_thp_request
+#include "strata/core/page_cache_drop.hpp"   // drop_range (the drop behind the arena read, Linux)
 #include <cstddef>
 
 #include <cuda_runtime.h>
@@ -1181,7 +1182,7 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
 
 LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::vector<uint64_t>& layer_off,
                               const std::vector<uint64_t>& layer_bytes, int threads, uint64_t chunk,
-                              const std::atomic<int>* ready, const PadMap* pad) {
+                              const std::atomic<int>* ready, const PadMap* pad, bool drop_behind) {
     LoadStats st;
     const uint64_t layers = (uint64_t) layer_off.size();
     st.layers = layers;
@@ -1264,6 +1265,10 @@ LoadStats load_experts_ranges(const std::string& path, uint8_t* dst, const std::
                 h = fnv1a64(buf.data(), n, h);
                 copy_ns += (uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::steady_clock::now() - t_copy).count();
+#if defined(__linux__)
+                // this chunk is in the arena now: its file-cache pages are only a second copy.  Advice; a failure is ignored.
+                if (drop_behind) (void) strata::core::page_cache_drop::drop_range(::fileno(f), off + pos, n);
+#endif
                 pos += n;
                 remaining -= n;
             }

@@ -158,6 +158,10 @@ bool igpu_kfd_settle_default(const char* gcn_arch, bool integrated, bool windows
     return igpu_arena_no_thp_default(gcn_arch, integrated, windows);   // the same device class
 }
 
+bool igpu_cache_drop_default(const char* gcn_arch, bool integrated, bool windows) {
+    return igpu_arena_no_thp_default(gcn_arch, integrated, windows);   // the same device class
+}
+
 std::vector<std::pair<std::string, std::string>> igpu_default_env(const char* gcn_arch, bool integrated) {
     std::vector<std::pair<std::string, std::string>> t;
     if (!integrated || !igpu_prompt_defaults_arch(gcn_arch)) return t;

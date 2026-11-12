@@ -20948,6 +20948,39 @@
    "retired_in": ""
   },
   {
+   "name": "STRATA_NO_ARENA_CACHE_DROP",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "include/strata/core/page_cache_drop.hpp",
+     "line": 49,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "flag",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "research",
+   "owner": "core",
+   "note": "turns off the file-cache give-back during and after the expert load on an integrated gfx11 GPU under Linux (posix_fadvise DONTNEED behind the arena read and once per model file; automatic on that class, nothing on other devices); for A/B runs only, not for users",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
    "name": "STRATA_NO_ARENA_THP",
    "backends": [
     "cuda-hip",
