@@ -2615,6 +2615,22 @@ __device__ __forceinline__ um_b16 um_frag(const uint16_t* p) {   // 16 BF16 (32 
     const uint32_t w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
     return __builtin_bit_cast(um_b16, w);
 }
+// The FP16 prompt path (g_act_f16, STRATA_HIP_PROMPT_F16=1): lo16 holds FP16 bits, so the same product runs on the FP16 matrix-core
+// builtin; the BF16 w_up rows are converted to FP16 while they are staged (bf_to_hf_conv, the conversion the FP16 GEMM route applies;
+// a BF16 value is exact in FP16 above 6e-5).  FP32 accumulate, same K order as the BF16 kernel.
+typedef _Float16 um_h16 __attribute__((ext_vector_type(16)));
+__device__ __forceinline__ um_f8 um_wmma_h(um_h16 a, um_h16 b, um_f8 c) {
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, b, c);
+#else
+    (void) a; (void) b; return c;   // not a gfx11 device pass: never launched (runtime gate)
+#endif
+}
+__device__ __forceinline__ um_h16 um_frag_h(const uint16_t* p) {   // 16 FP16 (32 bytes, 16-byte aligned)
+    const uint4 a = *reinterpret_cast<const uint4*>(p), b = *reinterpret_cast<const uint4*>(p + 8);
+    const uint32_t w[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+    return __builtin_bit_cast(um_h16, w);
+}
 // The block's w_up rows (16 columns x 4 streams x all 320 k) are staged in LDS once; each wave streams its own 16
 // tokens' lo16 rows from global memory (every A fragment feeds the 4 streams' WMMAs) - one barrier per block.
 __global__ void __launch_bounds__(512) gr_upmix_kernel(const uint16_t* __restrict__ lo16, const uint16_t* __restrict__ wu,
@@ -2628,10 +2644,18 @@ __global__ void __launch_bounds__(512) gr_upmix_kernel(const uint16_t* __restric
     // along rows (token-tile fastest scattered them over 512 rows x 40 KB per block: 28 ms instead of 3.7 at 8K)
     const int64_t t0 = (int64_t) blockIdx.y * UM_T + 16 * wave;
     const int d0 = blockIdx.x * UM_D;
+    const bool f16 = g_act_f16 != 0;   // uniform: the FP16 prompt path
     for (int i = tid; i < HC * UM_D * (LR / 8); i += 512) {
         const int rr = i / (LR / 8), q = i % (LR / 8);
         const int c = rr / UM_D, dd = rr % UM_D;
-        *reinterpret_cast<uint4*>(&sB[rr][8 * q]) = *reinterpret_cast<const uint4*>(wu + (size_t) (c * N + d0 + dd) * LR + 8 * q);
+        uint4 v = *reinterpret_cast<const uint4*>(wu + (size_t) (c * N + d0 + dd) * LR + 8 * q);
+        if (f16) {
+            uint32_t* w32 = reinterpret_cast<uint32_t*>(&v);
+#pragma unroll
+            for (int j = 0; j < 4; ++j)
+                w32[j] = (uint32_t) bf_to_hf_conv((uint16_t) (w32[j] & 0xffffu)) | ((uint32_t) bf_to_hf_conv((uint16_t) (w32[j] >> 16)) << 16);
+        }
+        *reinterpret_cast<uint4*>(&sB[rr][8 * q]) = v;
     }
     __syncthreads();
     if (t0 >= T) return;
@@ -2640,11 +2664,20 @@ __global__ void __launch_bounds__(512) gr_upmix_kernel(const uint16_t* __restric
     um_f8 acc[HC];
 #pragma unroll
     for (int c = 0; c < HC; ++c) acc[c] = um_f8{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    if (f16) {
 #pragma unroll
-    for (int ks = 0; ks < LR; ks += 16) {
-        const um_b16 a = um_frag(arow + ks);
+        for (int ks = 0; ks < LR; ks += 16) {
+            const um_h16 a = um_frag_h(arow + ks);
 #pragma unroll
-        for (int c = 0; c < HC; ++c) acc[c] = um_wmma(a, um_frag(&sB[c * UM_D + l16][ks]), acc[c]);
+            for (int c = 0; c < HC; ++c) acc[c] = um_wmma_h(a, um_frag_h(&sB[c * UM_D + l16][ks]), acc[c]);
+        }
+    } else {
+#pragma unroll
+        for (int ks = 0; ks < LR; ks += 16) {
+            const um_b16 a = um_frag(arow + ks);
+#pragma unroll
+            for (int c = 0; c < HC; ++c) acc[c] = um_wmma(a, um_frag(&sB[c * UM_D + l16][ks]), acc[c]);
+        }
     }
     const int d = d0 + l16;
 #pragma unroll
