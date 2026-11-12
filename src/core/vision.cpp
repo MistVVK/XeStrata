@@ -161,7 +161,9 @@ bool Vision::open_cpu(const std::string& path, int threads, std::string& err) {
         err = "the CPU vision encoder needs AVX2";
         return false;
     }
-    pool_ = std::make_unique<kernels::cpu::BandPool>(std::max(1, threads));
+    pool_ = std::make_unique<kernels::cpu::ExpertPool>(std::max(1, threads), true, true, 0, 0, true);
+    const std::vector<int> cores = kernels::cpu::physical_cores(false);
+    if (pool_->workers() > 0 && !cores.empty()) host_cpu_ = cores[0];
     const char* e = strata::env_get("VISION_CPU_I8");
     i8_ = e != nullptr && std::strcmp(e, "1") == 0;
     isa_ = kernels::cpu::i8_gemm_isa();
@@ -426,6 +428,7 @@ void Vision::merger_cpu(const Merger& m, const float* x, int64_t rows, int64_t i
 
 VisionOut Vision::encode_cpu(const float* rgb, int64_t width, int64_t height) {
     namespace kc = kernels::cpu;
+    const kc::ScopedThreadPin pin(host_cpu_);
     std::vector<float> patches, pos;
     std::vector<int32_t> yx;
     layout(rgb, width, height, patches, yx, pos);

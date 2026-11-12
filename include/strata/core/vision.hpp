@@ -97,7 +97,8 @@ private:
     void* s_ = nullptr;
     bool dry_ = false;
     // the CPU's: the pool, the patch embedding and the working rows
-    std::unique_ptr<kernels::cpu::BandPool> pool_;
+    std::unique_ptr<kernels::cpu::ExpertPool> pool_;
+    int host_cpu_ = -1;
     bool i8_ = false;   // XESTRATA_VISION_CPU_I8=1: the int8 products
     kernels::cpu::I8GemmIsa isa_ = kernels::cpu::I8GemmIsa::scalar;
     kernels::cpu::I8Rows rows8_;

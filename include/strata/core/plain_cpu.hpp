@@ -40,6 +40,7 @@ public:
     int64_t vocab() const { return n_vocab_; }
     /// The pool's threads and the int8 product's kernel, for the start log.
     std::string describe() const;
+    std::vector<int> worker_cpus() const;
     /// Zeroes the recurrent states: the next run starts a sequence at position 0.
     void reset();
     /// The model has recurrent layers (their state cannot go back to a prefix; the K/V cells can).

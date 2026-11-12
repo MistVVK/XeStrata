@@ -781,6 +781,20 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
     p.page_table = table;
     return p;
 }
+// The attention stage is shared by chunk-major and layer-major prefill.
+void qsa_attention(const float* q, const strata::kernels::QsaAttnPools& pools, const int32_t* ids,
+                   const int32_t* steps, int64_t cap, const strata::kernels::QsaShapes& shapes,
+                   float* scratch, float* out, int64_t n, int64_t batch, bool rotate, gpu::Stream stream) {
+    static const bool old_attn = strata::env_get("PROMPT_ATTN_OLD") != nullptr;
+    if (old_attn || !strata::kernels::flash_attn_select(q, pools, ids, steps, cap, shapes, out, n, stream))
+        for (int64_t t = 0; t < n; t += batch) {
+            const int64_t nb = std::min(batch, n - t);
+            strata::kernels::qsa_decode_attn_batch(q + t * ZV, pools, ids + t * cap,
+                                                   steps + t * strata::kernels::kStepCount, cap,
+                                                   shapes, scratch, out + t * ZV, nb, stream);
+        }
+    if (rotate) strata::kernels::fwht256_inplace_cuda(out, n * 24, stream);
+}
 }  // namespace
 
 // set_helper: a helper GPU's share of a small chunk's experts.  Per MoE layer this GPU gathers the rows of the tokens
@@ -2580,19 +2594,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
                                                                        : core::qsa_attn_pools(st);
                     pt.mark(kPfQsaAttn, cs);
-                    // perf-review D-1: the whole chunk on tensor cores, one block per (query, KV head), FP32-level
-                    // accuracy but not bitwise (flash_attn.hpp). The pools it has no kernel for on this device,
-                    // or STRATA_PROMPT_ATTN_OLD=1: the decode kernel, 32 queries at a time
-                    static const bool old_attn = strata::env_get("PROMPT_ATTN_OLD") != nullptr;
-                    if (old_attn || !strata::kernels::flash_attn_select(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
-                                                                            m.attn, T, m.cs))
-                        for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
-                            const int64_t nb = std::min(m.attn_batch, T - t0);
-                            strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
-                                                                   m.steps_dev + t0 * strata::kernels::kStepCount, m.cap,
-                                                                   s, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
-                        }
-                    if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
+                    qsa_attention(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s, m.attn_scratch, m.attn,
+                                  T, m.attn_batch, st.kv_rot || st.kv_hybrid, m.cs);
                     pt.mark(kPfQsa, cs);
                     kernels::native_qsa_gate_apply(m.attn, m.Qf, nullptr, (int) (T * 24), 256, m.cs, m.attn_h);
                     if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;
@@ -4806,16 +4809,8 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                         const strata::kernels::QsaAttnPools pools = staged ? pools_of(m.stage, m.ident_table)
                                                                            : core::qsa_attn_pools(st);
                         pt.mark(kPfQsaAttn, cs);
-                        static const bool old_attn = strata::env_get("PROMPT_ATTN_OLD") != nullptr;
-                        if (old_attn || !strata::kernels::flash_attn_select(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
-                                                                                m.attn, T, cs))
-                            for (int64_t q0 = 0; q0 < T; q0 += m.attn_batch) {
-                                const int64_t nb = std::min(m.attn_batch, T - q0);
-                                strata::kernels::qsa_decode_attn_batch(m.q + q0 * ZV, pools, m.sel_ids + q0 * m.cap,
-                                                                       m.steps_dev + q0 * strata::kernels::kStepCount, m.cap,
-                                                                       s, m.attn_scratch, m.attn + q0 * ZV, nb, cs);
-                            }
-                        if (st.kv_rot || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, cs);
+                        qsa_attention(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s, m.attn_scratch, m.attn,
+                                      T, m.attn_batch, st.kv_rot || st.kv_hybrid, cs);
                         pt.mark(kPfQsa, cs);
                         kernels::native_qsa_gate_apply(m.attn, m.Qf, nullptr, (int) (T * 24), 256, cs, m.attn_h);
                         if (!native_proj(m.gemm, wo, m.attn_h, m.bo, T, v.name("attn_output.weight"), err)) return false;

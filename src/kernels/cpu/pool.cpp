@@ -290,8 +290,8 @@ ThreadAffinity pin_current_thread(int core) {
     cpu_set_t prev;
     CPU_ZERO(&prev);
     if (pthread_getaffinity_np(pthread_self(), sizeof prev, &prev) != 0) return {};
-    for (int i = 0; i < CPU_SETSIZE && i < 64; ++i)
-        if (CPU_ISSET(i, &prev)) previous.mask |= 1ul << i;
+    for (int i = 0; i < CPU_SETSIZE; ++i)
+        if (CPU_ISSET(i, &prev)) previous.cpus.push_back(i);
     pin_this_thread(core);
 #endif
     previous.valid = true;
@@ -308,8 +308,7 @@ void restore_thread_affinity(const ThreadAffinity& previous) {
 #else
     cpu_set_t set;
     CPU_ZERO(&set);
-    for (int i = 0; i < 64; ++i)
-        if ((previous.mask >> i) & 1) CPU_SET(i, &set);
+    for (int cpu : previous.cpus) CPU_SET(cpu, &set);
     pthread_setaffinity_np(pthread_self(), sizeof set, &set);
 #endif
 }
@@ -381,7 +380,7 @@ static int default_worker_cap() {
     return cap;
 }
 
-ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int first_core, int tasks)
+ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int first_core, int tasks, bool generic)
     : tasks_(tasks), host_works_(host_works) {
     if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
     if (const char* e = strata::env_get("POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
@@ -409,15 +408,18 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int first_core,
     n_ = n_workers > 0 ? n_workers
                        : explicit_cores_ ? (int) cores.size()
                                          : (int) std::min<size_t>(cores.size(), (size_t) default_worker_cap());
-    if (n_ < 1) n_ = 1;
+    if (generic && n_workers > 0) n_ = n_workers - 1;
+    if (!generic && n_ < 1) n_ = 1;
     scratch_.resize((size_t) n_);
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
     hstate_ms_.store(now_ms());
-    g_diag_pool.store(this);
-    strata::core::diag_pool_fn().store(&diag_active_pool);
-    split_.resize((size_t) kMaxSplit);
-    split_multi_.resize((size_t) kMaxSplitMulti);
+    if (!generic) {
+        g_diag_pool.store(this);
+        strata::core::diag_pool_fn().store(&diag_active_pool);
+        split_.resize((size_t) kMaxSplit);
+        split_multi_.resize((size_t) kMaxSplitMulti);
+    }
     threads_.reserve((size_t) n_);
     for (int i = 0; i < n_; ++i) {
         const int c = first_core + i;
@@ -603,7 +605,9 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
         const uint32_t i = (uint32_t) ci;
         if (id >= 0) wstate_[(size_t) id].store(ci, std::memory_order_relaxed);
         else { hstate_.store(ci, std::memory_order_relaxed); hstate_ms_.store(now_ms(), std::memory_order_relaxed); }
-        if (mode_ == 0) {
+        if (mode_ == 7) {
+            (*fn_)(fn_offset_ + (int) i);
+        } else if (mode_ == 0) {
             const ExpertJob& j = jobs_[i];
             s2_expert_vnni_q(j.blob, *j.act, j.out, scratch);
         } else if (mode_ == 1) {
@@ -675,6 +679,22 @@ void ExpertPool::run_phase(int mode, int n_tasks) {
     wait_parked("after a phase");
     hstate_.store(kIdle, std::memory_order_relaxed);
     hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+}
+
+void ExpertPool::run(int n, const std::function<void(int)>& fn) {
+    if (n <= 0) return;
+    if (n_ == 0 || n == 1) {
+        for (int i = 0; i < n; ++i) fn(i);
+        return;
+    }
+    fn_ = &fn;
+    for (int offset = 0; offset < n;) {
+        fn_offset_ = offset;
+        const int count = std::min(n - offset, 0xffff);
+        run_phase(7, count);
+        offset += count;
+    }
+    fn_ = nullptr;
 }
 
 void ExpertPool::run_split(ExpertJob* jobs, int n) {

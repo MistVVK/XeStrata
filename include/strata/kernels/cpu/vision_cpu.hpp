@@ -31,14 +31,14 @@ namespace strata::kernels::cpu {
 inline constexpr int kVisionAttnBlock = 32;
 
 /// y [n][C] = (x - mean) / sqrt(var + eps) * w + b, per row (FP32), rows on the pool.
-void vision_layer_norm(BandPool& pool, const float* x, int64_t n, int64_t C, const float* w, const float* b, float eps,
+void vision_layer_norm(ExpertPool& pool, const float* x, int64_t n, int64_t C, const float* w, const float* b, float eps,
                        float* y);
 /// x[i] = GELU(x[i]), the tanh form (the ViT's MLP), on the pool.
-void vision_gelu_tanh(BandPool& pool, float* x, int64_t n);
+void vision_gelu_tanh(ExpertPool& pool, float* x, int64_t n);
 /// x[i] = GELU(x[i]), the erf form (the merger's MLP), on the pool.
-void vision_gelu_erf(BandPool& pool, float* x, int64_t n);
+void vision_gelu_erf(ExpertPool& pool, float* x, int64_t n);
 /// x[i] += v[i], on the pool.
-void vision_add(BandPool& pool, float* x, const float* v, int64_t n);
+void vision_add(ExpertPool& pool, float* x, const float* v, int64_t n);
 
 /// The 2-D RoPE's angles [T][hd / 2] (cos, sin) for the patches at yx [T][2] (row, column): pair j < hd / 4 turns by
 /// the row, the rest by the column, j counted from each half's start, theta^(-4 f / hd) (qk_norm_rope.hpp's Theta).
@@ -50,11 +50,11 @@ void vision_rope_table(const int32_t* yx, int64_t T, int64_t hd, float theta, st
 /// `i8`: the int8 form on that ISA (i8_gemm_isa(), its weight levels i8_gemm_weight_levels), null the BF16 one.
 class VisionAttention {
 public:
-    void run(BandPool& pool, const float* qkv, int64_t T, int64_t heads, int64_t hd, const std::vector<float>& cos,
+    void run(ExpertPool& pool, const float* qkv, int64_t T, int64_t heads, int64_t hd, const std::vector<float>& cos,
              const std::vector<float>& sin, float* out, const I8GemmIsa* i8 = nullptr);
 
 private:
-    void run_i8(BandPool& pool, I8GemmIsa isa, int64_t T, int64_t heads, int64_t hd, float* out);
+    void run_i8(ExpertPool& pool, I8GemmIsa isa, int64_t T, int64_t heads, int64_t hd, float* out);
     std::vector<float> q_, k_, vt_;   // [heads][T][hd], [heads][T][hd], [heads][hd][T]
     std::vector<Bf16Matrix> keys_, values_;   // per head
     std::vector<I8Matrix> keys8_, values8_;   // per head; the values per head and key chunk

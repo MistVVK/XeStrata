@@ -16,6 +16,7 @@
 
 #include "strata/kernels/cpu/bf16_gemm.hpp"
 #include "strata/kernels/cpu/i8_gemm.hpp"
+#include "strata/kernels/cpu/pool.hpp"
 
 #include <atomic>
 #include <condition_variable>
@@ -27,33 +28,6 @@
 #include <vector>
 
 namespace strata::kernels::cpu {
-
-class BandPool {
-public:
-    /// `workers` threads take pieces, the caller included (1: the caller alone, no thread started).
-    explicit BandPool(int workers);
-    ~BandPool();
-    BandPool(const BandPool&) = delete;
-    BandPool& operator=(const BandPool&) = delete;
-
-    /// How many threads take pieces, the caller included.
-    int size() const { return (int) threads_.size() + 1; }
-    /// fn(0) .. fn(n-1) on the pool's threads, returning once all are done.
-    void run(int n, const std::function<void(int)>& fn);
-
-private:
-    void work();
-    void loop();
-
-    std::vector<std::thread> threads_;
-    std::mutex mu_;
-    std::condition_variable cv_, done_;
-    const std::function<void(int)>* fn_ = nullptr;
-    std::atomic<int> next_{0}, idle_{0};
-    int total_ = 0;
-    unsigned long long epoch_ = 0;
-    bool quit_ = false;
-};
 
 /// `y[t] = x[t] * pow(mean(x[t]^2) + eps, -0.5)`, times `w` when it has one (the scale-free norms pass null).  The
 /// squares walk the row in index order into one accumulator, as every other sum here does.
@@ -72,7 +46,7 @@ struct I8Matrix {
 /// Pack the rows `row(o, dst)` writes (n_in floats each) into `m` with `levels` weight levels
 /// (i8_gemm_weight_levels of the ISA that will run it), panel bands on the pool.  False when the matrix is one
 /// i8_gemm_pack refuses (wider than kI8MaxIn) or a row could not be made (`row` returned false).
-bool i8_pack_rows(BandPool& pool, int n_in, int n_out, int block, int levels,
+bool i8_pack_rows(ExpertPool& pool, int n_in, int n_out, int block, int levels,
                   const std::function<bool(int o, float* dst)>& row, I8Matrix& m);
 
 /// Activation rows quantized for one or more products that read them: `n` rows of `n_in`, scale block `block`.
@@ -83,10 +57,10 @@ struct I8Rows {
     int n = 0, n_in = 0, block = 0;
 };
 /// Quantize `n` rows of `x` (stride `ldx`) into `r`, row ranges on the pool.
-void i8_quantize_rows(BandPool& pool, I8GemmIsa isa, const float* x, size_t ldx, int n, int n_in, int block,
+void i8_quantize_rows(ExpertPool& pool, I8GemmIsa isa, const float* x, size_t ldx, int n, int n_in, int block,
                       I8Rows& r);
 /// y[t * ldy + o] for the r.n rows through `m` (its scale block r's), pieces of panels and token rows on the pool.
-void i8_linear(BandPool& pool, I8GemmIsa isa, const I8Matrix& m, const I8Rows& r, float* y, size_t ldy,
+void i8_linear(ExpertPool& pool, I8GemmIsa isa, const I8Matrix& m, const I8Rows& r, float* y, size_t ldy,
                const float* bias = nullptr);
 
 /// A matrix in bf16_gemm.hpp's panel form: [n_out, n_in] BF16, the FP32 activations' product.
@@ -97,10 +71,10 @@ struct Bf16Matrix {
     size_t bytes() const { return panel.size() * 2; }
 };
 /// Pack the rows `row(o, dst)` writes (n_in floats each, rounded to BF16) into `m`, panel bands on the pool.
-bool bf16_pack_rows(BandPool& pool, int n_in, int n_out, const std::function<bool(int o, float* dst)>& row,
+bool bf16_pack_rows(ExpertPool& pool, int n_in, int n_out, const std::function<bool(int o, float* dst)>& row,
                     Bf16Matrix& m);
 /// y[t * ldy + o] = x[t] . m[o] (+ bias[o]) for `n` rows of x (stride ldx), pieces of panels and token rows on the pool.
-void bf16_linear(BandPool& pool, const Bf16Matrix& m, const float* x, size_t ldx, int n, float* y, size_t ldy,
+void bf16_linear(ExpertPool& pool, const Bf16Matrix& m, const float* x, size_t ldx, int n, float* y, size_t ldy,
                  const float* bias = nullptr);
 
 }  // namespace strata::kernels::cpu

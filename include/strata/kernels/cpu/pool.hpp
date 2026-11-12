@@ -36,6 +36,7 @@
 
 #include <atomic>
 #include <cstdio>
+#include <functional>
 #include <memory>
 #include <chrono>
 #include <condition_variable>
@@ -107,12 +108,23 @@ struct ThreadAffinity {
 #if defined(_WIN32)
     std::vector<unsigned long> cpu_sets;   ///< the thread's selected CPU Sets; empty: the process defaults
 #else
-    unsigned long mask = 0;                ///< CPUs 0..63
+    std::vector<int> cpus;                 ///< every CPU in the calling thread's previous mask
 #endif
     bool valid = false;
 };
 ThreadAffinity pin_current_thread(int core);
 void restore_thread_affinity(const ThreadAffinity& previous);
+
+/// Hold the host on its reserved core for a forward, restoring its former placement on return.
+class ScopedThreadPin {
+public:
+    explicit ScopedThreadPin(int cpu) { if (cpu >= 0) previous_ = pin_current_thread(cpu); }
+    ~ScopedThreadPin() { restore_thread_affinity(previous_); }
+    ScopedThreadPin(const ScopedThreadPin&) = delete;
+    ScopedThreadPin& operator=(const ScopedThreadPin&) = delete;
+private:
+    ThreadAffinity previous_;
+};
 
 class ExpertPool {
 public:
@@ -134,7 +146,9 @@ public:
     /// the cores below it: a layer split's stages each with workers of their own).
     /// `tasks`: the row tasks of each batched expert phase (--pool-tasks), 0 = three per participating thread; a
     /// count is capped by the phase's rows.
-    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true, int first_core = 0, int tasks = 0);
+    /// `generic` makes a pool for independent pieces; n_workers then includes the calling thread (0: auto).
+    explicit ExpertPool(int n_workers = 0, bool pin = true, bool host_works = true, int first_core = 0, int tasks = 0,
+                        bool generic = false);
     static constexpr int kMaxTasks = 4096;
     /// The watchdog's view of the pool (issue #31): the batch, the counters, every thread's state.
     void diag(std::FILE* f) const;
@@ -143,6 +157,9 @@ public:
     ExpertPool& operator=(const ExpertPool&) = delete;
 
     int workers() const { return n_; }
+    int size() const { return n_ + (host_works_ ? 1 : 0); }
+    /// Run independent pieces on the same pool, the caller included.
+    void run(int n, const std::function<void(int)>& fn);
     /// Whether the host thread also drains.  Reported at startup, because "the engine adapts to the machine it
     /// is on" is only true if the engine says which adaptation it took.
     bool host_works() const { return host_works_; }
@@ -268,6 +285,8 @@ private:
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
     // run_split state: mode 0 = whole experts, 1 = gate/up row parts, 2 = down row parts
     int mode_ = 0;
+    const std::function<void(int)>* fn_ = nullptr;
+    int fn_offset_ = 0;
     int parts_a_ = 1, parts_b_ = 1;
     struct SplitBuf {
         alignas(64) float ff[FF];

@@ -2103,7 +2103,7 @@ static void plain_usage(const std::string& arch) {
                  "  --gpu PCI            the GPU (its PCI address)\n"
                  "  --device cpu|gpu     where the forward runs (default gpu; the dense Qwen3.5 models, qwen35, run on\n"
                  "                       the CPU as well, and take it when no GPU is there)\n"
-                 "  --cpu-threads N      --device cpu: the threads the forward takes (default every hardware thread)\n"
+                 "  --cpu-threads N      --device cpu: the threads the forward takes (default: physical cores, subject to the CPU quota)\n"
                  "  --gpu-layers N       dense models: the first N blocks and the head on the GPU, the rest on the CPU\n"
                  "  --layer-split K[,K2..]|auto  the blocks across the GPUs: the first runs the blocks before K, the\n"
                  "                       next those from K on, ..; auto: in proportion to each GPU's free memory\n"

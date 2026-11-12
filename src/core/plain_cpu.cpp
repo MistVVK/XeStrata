@@ -118,7 +118,8 @@ struct Layer {
 struct PlainCpu::Impl {
     ModelSpec s;
     const GgufModel* m = nullptr;
-    std::unique_ptr<kc::BandPool> pool;
+    std::unique_ptr<kc::ExpertPool> pool;
+    int host_cpu = -1;
     k::cpu::I8GemmIsa isa = k::cpu::I8GemmIsa::scalar;
     int levels = 0;   ///< the int8 weights' levels (kc::i8_gemm_weight_levels, or eight bits where the model needs them)
     int64_t N = 0, NH = 0, HD = 0, NROT = 0, HK = 0, HV = 0, S = 0, ZV = 0, C = 0, FF = 0;
@@ -312,8 +313,10 @@ bool PlainCpu::load(const GgufModel& m, const ModelSpec& s, const PlainOptions& 
     P.theta_swa = std::pow((float) P.rope_swa.freq_base, -2.0f / (float) P.NROT);
     P.max_cells = opt.max_cells;
     if (opt.prompt_chunk > 0) P.chunk = opt.prompt_chunk;
-    const int threads = opt.cpu_threads > 0 ? opt.cpu_threads : (int) std::max(1u, std::thread::hardware_concurrency());
-    P.pool = std::make_unique<kc::BandPool>(threads);
+    const int threads = opt.cpu_threads > 0 ? opt.cpu_threads : 0;
+    P.pool = std::make_unique<kc::ExpertPool>(threads, true, true, 0, 0, true);
+    const std::vector<int> cores = kc::physical_cores(false);
+    if (P.pool->workers() > 0 && !cores.empty()) P.host_cpu = cores[0];
     P.isa = kc::i8_gemm_isa();
     // AVX2's seven-bit weights moved plamo3 past its checks (the user's decision, 2026-11-09: not for PLaMo 3 Translate):
     // against llama.cpp's FP32 reference, 0.8B at 512 tokens, the 99th percentile's KL 0.135 where llama.cpp's own
@@ -435,6 +438,10 @@ std::string PlainCpu::describe() const {
            (p_->head.q.levels == kc::kI8Levels7 ? " with 7-bit weights" : "") + " (" + std::to_string(bytes >> 20) +
            " MiB of packed weights); the decode " +
            (p_->native ? "from the model file's rows (the RAM holds both)" : "from the int8 copy");
+}
+
+std::vector<int> PlainCpu::worker_cpus() const {
+    return p_ && p_->pool ? p_->pool->worker_cpus() : std::vector<int>();
 }
 
 bool PlainCpu::recurrent() const { return !p_->gdn_state.empty(); }
@@ -793,6 +800,7 @@ void PlainCpu::Impl::blocks(int T, int64_t pos) {
 
 bool PlainCpu::run_blocks(float* x, int64_t n, int64_t pos, std::string& err) {
     Impl& P = *p_;
+    const kc::ScopedThreadPin pin(P.host_cpu);
     if (n <= 0 || pos < 0 || pos + n > P.max_cells) {
         err = "plain cpu: the rows are past the context (" + std::to_string(P.max_cells) + " cells)";
         return false;
@@ -809,6 +817,7 @@ bool PlainCpu::run_blocks(float* x, int64_t n, int64_t pos, std::string& err) {
 
 bool PlainCpu::run(const int32_t* tokens, int64_t n, int64_t pos, int rows, float* logits, std::string& err) {
     Impl& P = *p_;
+    const kc::ScopedThreadPin pin(P.host_cpu);
     if (n <= 0 || rows < 0 || rows > n) {
         err = "plain cpu: no tokens to run";
         return false;

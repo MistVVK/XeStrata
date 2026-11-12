@@ -2045,7 +2045,10 @@ int64_t PlainModel::resident() const {
 }
 
 std::vector<int> PlainModel::pool_worker_cpus() const {
-    return pool_ != nullptr ? pool_->worker_cpus() : std::vector<int>();
+    if (pool_ != nullptr) return pool_->worker_cpus();
+    if (cpu_ != nullptr) return cpu_->worker_cpus();
+    if (cpu_tail_ != nullptr) return cpu_tail_->worker_cpus();
+    return {};
 }
 
 const char* PlainModel::experts_ram() const {

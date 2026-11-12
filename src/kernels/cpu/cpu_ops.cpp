@@ -11,68 +11,6 @@
 
 namespace strata::kernels::cpu {
 
-BandPool::BandPool(int workers) {
-    for (int i = 1; i < workers; ++i) threads_.emplace_back([this] { loop(); });
-}
-
-BandPool::~BandPool() {
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        quit_ = true;
-    }
-    cv_.notify_all();
-    for (std::thread& t : threads_) t.join();
-}
-
-void BandPool::run(int n, const std::function<void(int)>& fn) {
-    if (n <= 0) return;
-    if (threads_.empty() || n == 1) {
-        for (int i = 0; i < n; ++i) fn(i);
-        return;
-    }
-    const int all = (int) threads_.size() + 1;   // the workers and this thread
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        fn_ = &fn;
-        total_ = n;
-        next_.store(0);
-        idle_.store(0);
-        ++epoch_;
-    }
-    cv_.notify_all();
-    work();
-    std::unique_lock<std::mutex> lk(mu_);
-    done_.wait(lk, [this, all] { return idle_.load() >= all; });
-}
-
-void BandPool::work() {
-    const std::function<void(int)>* fn = nullptr;
-    int total = 0;
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        fn = fn_;
-        total = total_;
-    }
-    for (int i = next_.fetch_add(1); i < total; i = next_.fetch_add(1)) (*fn)(i);
-    const int all = (int) threads_.size() + 1;
-    if (idle_.fetch_add(1) + 1 == all) {
-        std::lock_guard<std::mutex> lk(mu_);
-        done_.notify_one();
-    }
-}
-
-void BandPool::loop() {
-    unsigned long long seen = 0;
-    for (;;) {
-        std::unique_lock<std::mutex> lk(mu_);
-        cv_.wait(lk, [this, &seen] { return quit_ || epoch_ != seen; });
-        if (quit_) return;
-        seen = epoch_;
-        lk.unlock();
-        work();
-    }
-}
-
 void rmsnorm_rows(const float* x, size_t ldx, float* y, size_t ldy, int n, int dim, const float* w, float eps) {
     for (int t = 0; t < n; ++t) {
         const float* r = x + (size_t) t * ldx;
@@ -88,7 +26,7 @@ void rmsnorm_rows(const float* x, size_t ldx, float* y, size_t ldy, int n, int d
     }
 }
 
-bool i8_pack_rows(BandPool& pool, int n_in, int n_out, int block, int levels,
+bool i8_pack_rows(ExpertPool& pool, int n_in, int n_out, int block, int levels,
                   const std::function<bool(int o, float* dst)>& row, I8Matrix& m) {
     if (n_in > kI8MaxIn || !i8_gemm_block_ok(block) || !i8_gemm_levels_ok(levels) || n_in <= 0 || n_out <= 0)
         return false;
@@ -122,7 +60,7 @@ bool i8_pack_rows(BandPool& pool, int n_in, int n_out, int block, int levels,
     return !bad;
 }
 
-void i8_quantize_rows(BandPool& pool, I8GemmIsa isa, const float* x, size_t ldx, int n, int n_in, int block,
+void i8_quantize_rows(ExpertPool& pool, I8GemmIsa isa, const float* x, size_t ldx, int n, int n_in, int block,
                       I8Rows& r) {
     r.n = n;
     r.n_in = n_in;
@@ -139,7 +77,7 @@ void i8_quantize_rows(BandPool& pool, I8GemmIsa isa, const float* x, size_t ldx,
     });
 }
 
-void i8_linear(BandPool& pool, I8GemmIsa isa, const I8Matrix& m, const I8Rows& r, float* y, size_t ldy,
+void i8_linear(ExpertPool& pool, I8GemmIsa isa, const I8Matrix& m, const I8Rows& r, float* y, size_t ldy,
                const float* bias) {
     const int panels = m.panels();
     if (panels == 0 || r.n <= 0) return;
@@ -161,7 +99,7 @@ void i8_linear(BandPool& pool, I8GemmIsa isa, const I8Matrix& m, const I8Rows& r
     });
 }
 
-bool bf16_pack_rows(BandPool& pool, int n_in, int n_out, const std::function<bool(int o, float* dst)>& row,
+bool bf16_pack_rows(ExpertPool& pool, int n_in, int n_out, const std::function<bool(int o, float* dst)>& row,
                     Bf16Matrix& m) {
     if (n_in <= 0 || n_out <= 0) return false;
     m.n_in = n_in;
@@ -187,7 +125,7 @@ bool bf16_pack_rows(BandPool& pool, int n_in, int n_out, const std::function<boo
     return !bad;
 }
 
-void bf16_linear(BandPool& pool, const Bf16Matrix& m, const float* x, size_t ldx, int n, float* y, size_t ldy,
+void bf16_linear(ExpertPool& pool, const Bf16Matrix& m, const float* x, size_t ldx, int n, float* y, size_t ldy,
                  const float* bias) {
     const int panels = m.panels();
     if (panels == 0 || n <= 0) return;

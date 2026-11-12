@@ -53,7 +53,7 @@ const Rows& rows() {
 }
 
 // [0, n) in pieces of `chunk`, fn(i0, i1) each, on the pool
-template <class Fn> void spans(BandPool& pool, int64_t n, int64_t chunk, const Fn& fn) {
+template <class Fn> void spans(ExpertPool& pool, int64_t n, int64_t chunk, const Fn& fn) {
     if (n <= 0) return;
     const int64_t pieces = (n + chunk - 1) / chunk;
     pool.run((int) pieces, [&](int p) { fn(p * chunk, std::min(n, (p + 1) * chunk)); });
@@ -63,7 +63,7 @@ constexpr int64_t kSpan = 1 << 15;   // elements a piece of an elementwise pass:
 
 }  // namespace
 
-void vision_layer_norm(BandPool& pool, const float* x, int64_t n, int64_t C, const float* w, const float* b, float eps,
+void vision_layer_norm(ExpertPool& pool, const float* x, int64_t n, int64_t C, const float* w, const float* b, float eps,
                        float* y) {
     const int64_t per = std::max<int64_t>(1, kSpan / std::max<int64_t>(1, C));
     spans(pool, n, per, [&](int64_t t0, int64_t t1) {
@@ -71,17 +71,17 @@ void vision_layer_norm(BandPool& pool, const float* x, int64_t n, int64_t C, con
     });
 }
 
-void vision_gelu_tanh(BandPool& pool, float* x, int64_t n) {
+void vision_gelu_tanh(ExpertPool& pool, float* x, int64_t n) {
     spans(pool, n, kSpan, [&](int64_t i0, int64_t i1) { rows().gelu_tanh_span(x + i0, i1 - i0); });
 }
 
-void vision_gelu_erf(BandPool& pool, float* x, int64_t n) {
+void vision_gelu_erf(ExpertPool& pool, float* x, int64_t n) {
     spans(pool, n, kSpan, [&](int64_t i0, int64_t i1) {
         for (int64_t i = i0; i < i1; ++i) x[i] = 0.5f * x[i] * (1.f + std::erf(x[i] * 0.70710678118654752f));
     });
 }
 
-void vision_add(BandPool& pool, float* x, const float* v, int64_t n) {
+void vision_add(ExpertPool& pool, float* x, const float* v, int64_t n) {
     spans(pool, n, kSpan, [&](int64_t i0, int64_t i1) { rows().add_span(x + i0, v + i0, i1 - i0); });
 }
 
@@ -101,7 +101,7 @@ void vision_rope_table(const int32_t* yx, int64_t T, int64_t hd, float theta, st
         }
 }
 
-void VisionAttention::run(BandPool& pool, const float* qkv, int64_t T, int64_t heads, int64_t hd,
+void VisionAttention::run(ExpertPool& pool, const float* qkv, int64_t T, int64_t heads, int64_t hd,
                           const std::vector<float>& cos, const std::vector<float>& sin, float* out,
                           const I8GemmIsa* i8) {
     const int64_t C = heads * hd;
@@ -159,7 +159,7 @@ void VisionAttention::run(BandPool& pool, const float* qkv, int64_t T, int64_t h
     });
 }
 
-void VisionAttention::run_i8(BandPool& pool, I8GemmIsa isa, int64_t T, int64_t heads, int64_t hd, float* out) {
+void VisionAttention::run_i8(ExpertPool& pool, I8GemmIsa isa, int64_t T, int64_t heads, int64_t hd, float* out) {
     const int64_t C = heads * hd;
     const int levels = i8_gemm_weight_levels(isa);
     // the keys, a scale a key; the values' rows in chunks of keys the product can sum, a scale per kVisionAttnBlock
