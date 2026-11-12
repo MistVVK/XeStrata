@@ -92,6 +92,9 @@ static_assert(GGML_TYPE_IQ2_XXS == strata::prefill::fused_tile::kTypeIq2Xxs && G
               GGML_TYPE_IQ2_S == strata::prefill::fused_tile::kTypeIq2S && GGML_TYPE_IQ3_XXS == strata::prefill::fused_tile::kTypeIq3Xxs &&
               GGML_TYPE_IQ3_S == strata::prefill::fused_tile::kTypeIq3S && GGML_TYPE_IQ4_XS == strata::prefill::fused_tile::kTypeIq4Xs,
               "fused_tile_rule.hpp's default_gate_format uses ggml's type ids");
+static_assert(GGML_TYPE_Q5_1 == strata::prefill::fused_tile::kTypeQ5_1 && GGML_TYPE_Q8_0 == strata::prefill::fused_tile::kTypeQ8_0 && GGML_TYPE_Q4_K == strata::prefill::fused_tile::kTypeQ4K &&
+              GGML_TYPE_Q5_K == strata::prefill::fused_tile::kTypeQ5K && GGML_TYPE_Q6_K == strata::prefill::fused_tile::kTypeQ6K,
+              "fused_tile_rule.hpp's wide_pair and kq_flash_kind use ggml's type ids");
 constexpr int T_IQ2_XXS = GGML_TYPE_IQ2_XXS, T_IQ2_XS = GGML_TYPE_IQ2_XS, T_IQ2_S = GGML_TYPE_IQ2_S,
               T_IQ3_XXS = GGML_TYPE_IQ3_XXS, T_IQ3_S = GGML_TYPE_IQ3_S, T_IQ4_XS = GGML_TYPE_IQ4_XS,
               T_IQ4_NL = GGML_TYPE_IQ4_NL, T_Q2_0 = GGML_TYPE_Q2_0,
@@ -2157,7 +2160,7 @@ struct DevInfo {
 #if !defined(__HIPCC__)
     bool q50 = false;   // sm_80+ with STRATA_PF_FUSED_Q50=1: the Q5_0 down kernels are set up (opt-in, phase 4 step 1)
     int occ_q50 = 1;    // their blocks per multiprocessor (kept apart, so the other formats' grids do not change)
-    bool kq = false;    // sm_80+ with STRATA_PF_FUSED_KQ=1: the K-quant kernels (Q4_K / Q5_K gate/up, Q5_1 down) are set up (opt-in, phase 4)
+    bool kq = false;    // the K-quant kernels (Q4_K / Q5_K gate/up, Q5_1 / Q8_0 down) are set up: by default on the cards of fused_tile::kq_takes, STRATA_PF_FUSED_KQ=1 on any sm_80+ card, =0 off
     int occ_kq = 1;     // their blocks per multiprocessor (their own, as occ_q50)
     bool kq8 = false;   // with kq: the Q8_0 down kernels are set up too (A2; UD-Q4_K_XL's five Q8_0-down layers)
     int occ_kq8 = 1;
@@ -2218,7 +2221,7 @@ int tq_env() {
     static const int v = strata::prefill::fused_tq::env_value();
     return v;
 }
-bool kq_on();   // STRATA_PF_FUSED_KQ (below): on CUDA "1" sets the K-quant kernels up (dev_info)
+[[maybe_unused]] bool kq_on();   // STRATA_PF_FUSED_KQ (below): the HIP builds' reading of the switch (the CUDA builds decide in dev_info with fused_tile::kq_takes)
 template <int T, bool GU, int WW, int NT = THREADS, bool F16 = false> bool setup_ww(int& occ) {
     cudaFuncAttributes fa{};
     if (cudaFuncGetAttributes(&fa, native_kernel<T, GU, WW, NT, F16>) != cudaSuccess || fa.ptxVersion < 75) return false;
@@ -2368,12 +2371,16 @@ const DevInfo& dev_info() {
     // FP32 scales and sums).  Their occupancy is their own (occ_q50), so the other formats' launches do not change; a failed
     // setup leaves those layers on the FP16 path.
     if (int o3 = 1 << 20; d.ok && q50_cuda_requested() && setup_one<T_Q5_0, false>(o3)) { d.q50 = true; d.occ_q50 = o3; }
-    // STRATA_PF_FUSED_KQ=1 (opt-in on CUDA, off by default; the HIP switch's name and meaning): the K-quant experts of UD-Q4_K_XL -
-    // gate/up Q4_K / Q5_K, down Q5_1 - on native_kernel instead of MMQ (libstrata_kq).  The decode is the HIP kernels' (load_unit /
-    // convert: int8 codes, a scale and a minimum per 32 values); the minimum enters as s1 d_x (sum of the activation codes), from the
-    // sums quant_act_nat_kernel and the K-quant gate/up epilogue store in the spare bytes.  Their own occupancy (occ_kq); a failed
-    // setup leaves those layers on MMQ.
-    if (int o4 = 1 << 20; d.ok && kq_on() && setup_one<T_Q4_K, true>(o4) && setup_one<T_Q5_K, true>(o4) && setup_one<T_Q5_1, false>(o4)) {
+    // The K-quant experts of UD-Q4_K_XL - gate/up Q4_K / Q5_K, down Q5_1 (or Q8_0) - on native_kernel instead of MMQ (libstrata_kq).  On CUDA they are the
+    // default on the cards the i-quant default rule takes (fused_tile::kq_takes: sm_86-class and sm_120 with 80+ SMs, the staged launches on 40-79 SMs unless
+    // STRATA_PF_FUSED_SM40=0), STRATA_PF_FUSED_KQ=1 sets them up on every sm_80+ card, STRATA_PF_FUSED_KQ=0 (or STRATA_PF_FUSED=0, native_supported) leaves them on MMQ.
+    // The decode is the HIP kernels' (load_unit / convert: int8 codes, a scale and a minimum per 32 values); the minimum enters as s1 d_x (sum of the activation
+    // codes), from the sums quant_act_nat_kernel and the K-quant gate/up epilogue store in the spare bytes.  Their own occupancy (occ_kq); a failed setup leaves
+    // those layers on MMQ.  (kq_on() below is the HIP builds' reading of the switch; strata-q36 sets STRATA_PF_FUSED_KQ=1 itself, so its cards are unchanged.)
+    static const int kq_env = strata::prefill::fused_tile::pf_env(std::getenv("STRATA_PF_FUSED_KQ"));
+    static const int kq_sm40_env = strata::prefill::fused_tile::sm40_env_of(std::getenv("STRATA_PF_FUSED_SM40"));
+    const bool kq_want = strata::prefill::fused_tile::kq_takes(kq_env, {d.s120, d.s121, d.sms, d.s86}, kq_sm40_env);
+    if (int o4 = 1 << 20; d.ok && kq_want && setup_one<T_Q4_K, true>(o4) && setup_one<T_Q5_K, true>(o4) && setup_one<T_Q5_1, false>(o4)) {
         d.kq = true;
         d.occ_kq = o4;
         // (A2) the Q8_0 down behind a K-quant gate/up: int8 codes and one scale per 32 values, no minimum (load_unit / convert<T_Q8_0>);
@@ -2656,7 +2663,8 @@ bool staged_blobs_ok(const Batch& b, const NativeGeom& g) {
 #endif
 // `staged`: the launch's gate/up kernel is a weight-staging instance (sw_on); the rule then takes 128 rows from every size on the sm_86 / sm_120 cards under 80 SMs.
 // `wide`: the launch's gate/up is Q6_K or Q8_0: on sm_86 cards with 40+ SMs the rule takes 128 rows above 112 rows an expert (fused_tile_rule.hpp).
-int pick_ww(int64_t n, int n_expert, bool staged, bool wide) {
+// `kq`: 0, or the launch's pair is one of Flash-Next's K-quant pairs (fused_tile::kq_flash_kind: 1 a Q5_1 down, 2 a Q8_0 down): on sm_86-class cards with 80-99 SMs the rule takes 128 rows from 5.8 rows an expert up.
+int pick_ww(int64_t n, int n_expert, bool staged, bool wide, int kq) {
     static const int forced = [] {
         const char* v = std::getenv("STRATA_PF_FUSED_TILE");
         const int t = v ? std::atoi(v) : 0;
@@ -2666,13 +2674,13 @@ int pick_ww(int64_t n, int n_expert, bool staged, bool wide) {
     // the rule itself (the card classes, the thresholds and the measurements behind them) is include/strata/prefill/fused_tile_rule.hpp, a pure function the unit test
     // tests/prefill/fused_tile_rule_test.cpp pins for every measured card class.  STRATA_PF_TILE_DEBUG=1 prints the choice of every launch of a class that has its own rule.
     const DevInfo& d = dev_info();
-    const strata::prefill::fused_tile::Pick pk = strata::prefill::fused_tile::pick({d.s120, d.s121, d.sms, d.s86}, n, n_expert, staged, wide);
+    const strata::prefill::fused_tile::Pick pk = strata::prefill::fused_tile::pick({d.s120, d.s121, d.sms, d.s86}, n, n_expert, staged, wide, kq);
     using strata::prefill::fused_tile::Why;
     if (pk.why != Why::kBand) {
         static const bool dbg = [] { const char* v = std::getenv("STRATA_PF_TILE_DEBUG"); return v != nullptr && v[0] == '1'; }();
         if (dbg) {
             const double avg = (double) n / std::max(n_expert, 1);
-            const char* cls = pk.why == Why::kS121 ? "s121" : pk.why == Why::kS120Small ? "s120 small" : pk.why == Why::kStaged ? "staged" : pk.why == Why::kS86Wide ? "s86 wide" : "s120";
+            const char* cls = pk.why == Why::kS121 ? "s121" : pk.why == Why::kS120Small ? "s120 small" : pk.why == Why::kStaged ? "staged" : pk.why == Why::kS86Wide ? "s86 wide" : pk.why == Why::kS86Kq ? "s86 kq" : pk.why == Why::kS120Kq ? "s120 kq" : "s120";
             std::fprintf(stderr, "strata: fused tile: rows %lld experts %d avg %.1f %s yes -> ww %d\n", (long long) n, n_expert, avg, cls, pk.ww);
         }
     }
@@ -2682,14 +2690,14 @@ int pick_ww(int64_t n, int n_expert, bool staged, bool wide) {
 // The work item of one launch of the native kernels: pick_ww's, unless the launch has a weight-staging kernel (`staged`: its gate/up kernel is one; the down's is looked at here) and
 // the staging check fails (staged_blobs_ok), in which case the unstaged 64-row instances run (fused_tile::kUnstagedWw), also when STRATA_PF_FUSED_TILE=128 forces the 128-row tile.
 // Every call site that launches `launch<...>` with a ww from pick_ww on a batch of blobs takes its ww from here.
-int launch_ww(const Batch& b, const NativeGeom& g, int64_t n, int n_expert, bool staged, bool wide) {
+int launch_ww(const Batch& b, const NativeGeom& g, int64_t n, int n_expert, bool staged, bool wide, int kq = 0) {
 #if !defined(__HIPCC__)
     if ((staged || sw_on(g.d_type, false)) && !staged_blobs_ok(b, g)) return strata::prefill::fused_tile::kUnstagedWw;
 #else
     (void) b;
     (void) g;
 #endif
-    return pick_ww(n, n_expert, staged, wide);
+    return pick_ww(n, n_expert, staged, wide, kq);
 }
 #endif
 }  // namespace
@@ -2750,8 +2758,9 @@ bool native_supported(int gu_type, int d_type) {
     if (off || env == 0 || !gu_covered(gu_type)) return false;
     if (strata::prefill::pf_fused_override().load(std::memory_order_relaxed) == 0) return false;   // the small-card prompt path (pf_fused_override.hpp)
 #if !defined(__HIPCC__)
-    // CUDA, a K-quant gate/up (phase 4, opt-in): with STRATA_PF_FUSED_KQ=1 a Q4_K / Q5_K gate/up with a Q5_1 down takes the fused
-    // kernels on any sm_80+ card whose K-quant kernels were set up, whatever the 80-SM rule says; other downs keep MMQ for now.  A Q5_1
+    // CUDA, a K-quant gate/up: a Q4_K / Q5_K gate/up with a Q5_1 (or, with the Q8_0 down kernels set up, Q8_0) down takes the fused
+    // kernels on any sm_80+ card whose K-quant kernels were set up: by default on the cards of fused_tile::kq_takes (dev_info), with
+    // STRATA_PF_FUSED_KQ=1 on every card, never with STRATA_PF_FUSED_KQ=0; other downs keep MMQ for now.  A Q5_1
     // down needs the code sums only the K-quant gate/up epilogue writes, so it is never taken behind another gate/up.  Not with the
     // NT = 256 / warp-specialized opt-ins (no K-quant form): MMQ.
     // CUDA, a Q8_0 down behind an i-quant gate/up (phase 4, opt-in): with STRATA_PF_FUSED_Q8D=1 such a layer takes the fused kernels on
@@ -3021,7 +3030,7 @@ void experts_native(const Batch& b, const NativeGeom& g, int n_expert, int64_t n
     // the launch's gate/up kernel is a staging instance: the tile rule then takes 128 rows (the gate/up is about two thirds of the layer; a down that is not staged, Q2_0 or Q8_0 or Q5_0,
     // still ran faster in the 128-row tile with it: IQ3_S / Q2_0 on the RTX A4000, RESULTS-P4-SM.md S1).  Either kernel staged: the blob check.
     const bool staged = sw_on(g.gu_type, true), wide = g.gu_type == T_Q6_K || g.gu_type == T_Q8_0;   // wide: the Q6_K / Q8_0 gate/up class of the sm_86 tile line (40+ SMs)
-    const int ww = launch_ww(b, g, n, n_expert, staged, wide);   // (the staging check inside: a launch that fails it takes the unstaged 64-row kernel)
+    const int ww = launch_ww(b, g, n, n_expert, staged, wide, strata::prefill::fused_tile::kq_flash_kind(g.gu_type, g.d_type));   // (the staging check inside: a launch that fails it takes the unstaged 64-row kernel; the last argument: Flash-Next's K-quant pairs)
     // the most 64-row tiles the batch can have (every row in it, plus a partial tile per expert) - the items of the
     // ones inside a larger item end at once
     const int64_t tiles = (n + kTileRows - 1) / kTileRows + (b.e1 - b.e0);

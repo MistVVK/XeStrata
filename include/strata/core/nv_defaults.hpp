@@ -45,8 +45,15 @@ namespace strata::core {
 constexpr bool kNvKqDefaultOn = true;
 std::vector<std::pair<std::string, std::string>> nv_kq_default_env(int min_major, int min_minor, bool defaults026);
 std::vector<std::pair<std::string, std::string>> nv_kq_default_env(int min_major, int min_minor);
-/// Sets what nv_kq_default_env returns where the user has not set the variable; prints one line to stderr when it set anything.
-std::vector<std::string> apply_nv_kq_default(int min_major, int min_minor);
+/// Sets what nv_kq_default_env returns where the user has not set the variable; prints one line to stderr when it set anything.  fused_here: Strata's own fused
+/// kernels read the K-quant experts on this machine (nv_kq_fused_here for a visible card); the line then says so, otherwise it is the earlier line, byte for byte.
+std::vector<std::string> apply_nv_kq_default(int min_major, int min_minor, bool fused_here = false);
+/// Whether a CUDA card (raw compute capability, its multiprocessor count) reads UD-Q4_K_XL's K-quant experts (Q4_K / Q5_K gate/up with a Q5_1 or Q8_0 down) on Strata's
+/// own fused kernels, from the environment as the engine reads it: the card rule of fused_tile::kq_takes with STRATA_PF_FUSED_KQ, STRATA_PF_FUSED_SM40 and
+/// STRATA_PF_FUSED_SM86; STRATA_PF_FUSED=0 turns every fused kernel off.
+bool nv_kq_fused_here(int major, int minor, int sms);
+/// The line apply_nv_kq_default prints (without the newline).
+std::string nv_kq_default_line(bool fused_here);
 
 /// dflash2-kern: the speculative runs' faster start-up adaptation of the expert tier (opt-in on sm_86 with STRATA_SPEC_ADAPT_SM86=1 since owner round 9; STRATA_SPEC_ADAPT_EVERY / _WARM, read by
 /// generate.cpp): sm_86 only (z440 A4000 Q2_0; the P100 is opt-in through the two variables, notes-dflash2-kern.md).  Not part of
