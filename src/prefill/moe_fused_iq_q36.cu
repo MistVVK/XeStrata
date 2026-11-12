@@ -63,7 +63,7 @@ bool requested() { return strata::prefill::fused::requested(); }
 // the minimum's code sums the Q4_K / Q5_K gate/up epilogue writes into H's spare bytes (has_min); the dispatch is not in the copy's native_supported /
 // experts_native (and moe_fused_iq.cu is not edited for it), so it is here: the pair rule of the K-quant gate/up (native_supported(gu, T_Q5_1): the same
 // prerequisites - STRATA_PF_FUSED, the K-quant instances set up, no NT = 256 / warp-specialized kernels) plus this file's own set-up of the two down instances,
-// then the K-quant launch of experts_native with the new down.  (After lane SMALL-SM's pick_ww(n, n_expert, staged, wide) lands this call takes its arguments.)
+// then the K-quant launch of experts_native with the new down.  (pick_ww takes the staged / wide arguments as experts_native computes them: both false for the Q4_K / Q5_K gate/up of this path.)
 namespace {
 struct KqDown {
     bool ok = false;
