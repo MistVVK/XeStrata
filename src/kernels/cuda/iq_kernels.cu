@@ -11,6 +11,7 @@
 #include "strata/core/sm120_series.hpp"
 #include "strata/core/dispatch_stats.hpp"
 #include "strata/kernels/gfx_arch.hpp"
+#include "strata/kernels/i8_expert_rule.hpp"
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/q8_1_finite.hpp"
 #include "s26_tsum.cuh"
@@ -6235,10 +6236,29 @@ void native_expert_set_mode(int mode, int phase) {
 namespace {
 bool g_grouped_v1 = env_on("STRATA_GROUPED_V1");
 #include "i8_expert.cuh"   // OWN-I8: our own int8 dot-product kernels (native_expert_i8 below)
-// OWN-I8: STRATA_EXPERT_I8, read once: 1 = on, 0 = off, -1 = not set (a research switch: unset, nothing here runs)
+// OWN-I8: STRATA_EXPERT_I8, read once: 1 = on, 0 = off, -1 = not set (then the card class decides: i8_expert_rule.hpp)
 int i8_switch_state() {
-    static const int s = [] { const char* v = std::getenv("STRATA_EXPERT_I8"); return v == nullptr || v[0] == '\0' ? -1 : (v[0] == '0' ? 0 : 1); }();
+    static const int s = strata::kernels::i8_switch_parse(std::getenv("STRATA_EXPERT_I8"));
     return s;
+}
+// the current device's gcnArchName, read once per device (a HIP card; "" on a CUDA card)
+const char* i8_device_gcn() {
+#if defined(__HIPCC__)
+    static std::mutex mu;
+    static char names[16][64];
+    static bool done[16];
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 16) return "";
+    std::lock_guard<std::mutex> lk(mu);
+    if (!done[dev]) {
+        cudaDeviceProp p{};
+        if (cudaGetDeviceProperties(&p, dev) == cudaSuccess) std::snprintf(names[dev], sizeof(names[dev]), "%s", p.gcnArchName);
+        done[dev] = true;
+    }
+    return names[dev];
+#else
+    return "";
+#endif
 }
 }  // namespace
 
@@ -6260,8 +6280,12 @@ int native_expert_i8_probe_launch(size_t bytes) noexcept {
 }
 
 bool native_expert_i8_prompt(const NativeExpertLayout& L, int64_t group_entries) noexcept {
-    return i8_switch_state() == 1 && group_entries >= 256 && native_expert_i8_supported(L);
+    const int st = i8_switch_state();
+    if (st == 0 || group_entries < kI8MinGroupEntries) return false;   // before any device query
+    return i8_expert_takes(st, i8_device_gcn(), group_entries, native_expert_i8_supported(L));
 }
+
+bool native_expert_i8_by_default() noexcept { return i8_expert_class_default(i8_switch_state(), i8_device_gcn()); }
 
 size_t native_expert_i8_scratch_bytes(int64_t cap_entries, int64_t cap_groups, int64_t n_ff) {
     const size_t hqb = ((size_t) cap_entries * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255;   // as native_expert_i8 carves it
@@ -6354,7 +6378,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     if (cap_groups <= 0 || cap_entries <= 0) return;
     strata::dispatch::kernel(strata::dispatch::kExpert, 0, L.gu_type, (int) L.n_embd, (int) L.n_ff, L.d_type);   // BW-MEASURE: one grouped expert call
     if (L.n_ff % 32 != 0) { std::fprintf(stderr, "native_expert_grouped: n_ff %lld\n", (long long) L.n_ff); std::exit(1); }
-    // OWN-I8 research switch (STRATA_EXPERT_I8=1, off by default): a prompt-sized call on our own int8 tile kernels
+    // OWN-I8: a prompt-sized call on our own int8 tile kernels when STRATA_EXPERT_I8=1 names it.  Only the explicit switch: the card-class default
+    // (i8_expert_rule.hpp) is for the prompt path's MMQ groups, where it was measured; this fallback (the Qwen3.6 engine's prompt) has no timing on that class.
     static const bool i8_switch = i8_switch_state() == 1;
     if (i8_switch && cap_entries >= 256 && grid_groups <= 0 && native_expert_i8_supported(L)) {
         native_expert_i8(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch, out, stream);

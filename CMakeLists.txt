@@ -409,6 +409,12 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(staged_group_rule_test PRIVATE include)
   add_test(NAME staged_group_rule_test COMMAND staged_group_rule_test)
 
+  # when a prompt layer's expert groups take our own int8 kernels (native_expert_i8): STRATA_EXPERT_I8 = 1 / 0 / unset, where unset means the HIP cards gfx1030 / 1031 / 1032 from
+  # 256 entries per group and every other card keeps MMQ (header-only, no GPU)
+  add_executable(i8_expert_rule_test tests/prefill/i8_expert_rule_test.cpp)
+  target_include_directories(i8_expert_rule_test PRIVATE include)
+  add_test(NAME i8_expert_rule_test COMMAND i8_expert_rule_test)
+
   # whether the CUDA fused prompt kernels take the Gyro trellis experts by default (STRATA_PF_FUSED_TQ unset: the sm_86 cards with 80+ SMs; =1 any card; =0 off): the pure
   # rule, pinned for every card class (header-only, no GPU)
   add_executable(fused_tq_default_test tests/prefill/fused_tq_default_test.cpp)

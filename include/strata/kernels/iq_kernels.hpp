@@ -95,10 +95,14 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 /// 256 entries or more (the prompt chunk of a Qwen3.6 engine without MMQ); STRATA_I8_TM = 2 | 3 | 4 forces the tile.
 bool native_expert_i8_supported(const NativeExpertLayout& L) noexcept;
 /// OWN-I8, the prompt path's question (once per layer, src/prefill/prefill.cpp): do the expert groups of this layer take `native_expert_i8`
-/// on this device, for groups of about `group_entries` entries (rows of one launch)?  STRATA_EXPERT_I8=1 asks for it (the formats and the
-/// device's shared memory still have to allow it: `native_expert_i8_supported`; groups under 256 entries keep the other path), unset or 0:
-/// no.  Shared prompt code, no device work: a Metal build answers false.
+/// on this device, for groups of about `group_entries` entries (rows of one launch)?  STRATA_EXPERT_I8=1 asks for it on any card, =0 never; unset:
+/// the HIP cards gfx1030 / gfx1031 / gfx1032 take it, every other card keeps MMQ (include/strata/kernels/i8_expert_rule.hpp).  The formats and the
+/// device's shared memory still have to allow it (`native_expert_i8_supported`); groups under 256 entries keep the other path.
+/// Shared prompt code, no device work: a Metal build answers false.
 bool native_expert_i8_prompt(const NativeExpertLayout& L, int64_t group_entries) noexcept;
+/// OWN-I8: true when the answer above is "yes" because of the card class (STRATA_EXPERT_I8 not set), not because the variable names it; the engine's
+/// start line differs.  A Metal build answers false.
+bool native_expert_i8_by_default() noexcept;
 /// OWN-I8 (tests, logs; CUDA / HIP builds only, no Metal definition: nothing shared calls these three): the dynamic shared memory per block the current device
 /// lets `native_expert_i8` use, in bytes (the device's opt-in attribute, 48 KB where it reports less; STRATA_I8_SMEM_LIMIT can lower it).
 size_t native_expert_i8_smem_limit() noexcept;

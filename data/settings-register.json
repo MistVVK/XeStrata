@@ -6996,7 +6996,7 @@
    "reads": [
     {
      "file": "src/kernels/cuda/iq_kernels.cu",
-     "line": 6240,
+     "line": 6241,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -7015,9 +7015,9 @@
    "since": "",
    "last_commit": "",
    "last_date": "",
-   "status": "research",
+   "status": "rollback",
    "owner": "kernels",
-   "note": "CUDA / HIP research switch, off unless set, not a user setting: =1 runs a prompt layer's expert groups on our own int8 dot-product kernels (native_expert_i8) for the gate/up formats IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S and IQ2_S with an IQ4_NL or Q2_0 down, in groups of 256 entries or more: in the prompt path's MMQ groups (a layer the fused kernels take stays on them; on a card with fused kernels set STRATA_PF_FUSED=0 as well) and in native_expert_grouped (the Qwen3.6 engine's prompt). Unset: today's path, bit for bit. Goes away with MMQ (release C) or becomes the default.",
+   "note": "CUDA / HIP, not a user setting. Unset: the HIP cards gfx1030 / gfx1031 / gfx1032 (RX 6000 series RDNA2, no matrix cores) run a prompt layer's expert groups on our own int8 dot-product kernels (native_expert_i8) for the gate/up formats IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S and IQ2_S with an IQ4_NL or Q2_0 down, in the prompt path's MMQ groups of 256 entries or more (include/strata/kernels/i8_expert_rule.hpp); every other card is unchanged. =0 goes back to the old kernels on that class (the way back). =1 asks for the int8 kernels on any card (a layer the fused kernels take stays on them; on a card with fused kernels set STRATA_PF_FUSED=0 as well) and, as the only way, in native_expert_grouped (the Qwen3.6 engine's prompt). Goes away with MMQ (release C) or stays as the only path.",
    "retire_after": "",
    "retired_in": ""
   },

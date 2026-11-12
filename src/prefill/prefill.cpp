@@ -5426,7 +5426,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                !nib_l.on &&
 #endif
                                                fused::native_supported(mmq_gt, mmq_dt);
-                        // OWN-I8 (STRATA_EXPERT_I8=1, a research switch, unset = nothing here runs): the MMQ groups of a native layer on our own
+                        // OWN-I8 (STRATA_EXPERT_I8=1 on any card; unset: the default of the HIP cards gfx1030 / 1031 / 1032, i8_expert_rule.hpp; =0 off): the MMQ groups of a native layer on our own
                         // int8 dot-product kernels (native_expert_i8, src/kernels/cuda/i8_expert.cuh), where MMQ's gather, per-row quantize,
                         // gate/up, SwiGLU, quantize and down run.  The group's experts are read where they are (the cache slot or the ring slot:
                         // the gather's wait and slot release are kept, the copy is not made); the layer's tokens go to q8_1 ONCE per token (fr_xq,
@@ -5464,7 +5464,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (i8_l) {   // the layer's T tokens as q8_1 rows, once (the grouped kernels' activations)
                             if (static bool said = false; !said) {
                                 said = true;
-                                std::fprintf(stderr, "strata: prompt experts on our own int8 dot-product kernels (STRATA_EXPERT_I8=1)\n");
+                                if (strata::kernels::native_expert_i8_by_default())
+                                    std::fprintf(stderr, "strata: prompt experts on our own int8 kernels (the default on this graphics card; STRATA_EXPERT_I8=0 goes back to the old kernels)\n");
+                                else
+                                    std::fprintf(stderr, "strata: prompt experts on our own int8 dot-product kernels (STRATA_EXPERT_I8=1)\n");
                             }
                             if (m.fr_xq == nullptr || m.fr_xq_rows < T) {
                                 if (m.fr_xq) cudaFree(m.fr_xq);
