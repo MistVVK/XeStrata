@@ -88,9 +88,9 @@
       },
       {
         "name": "strata::prefill::fused::{anonymous}::native_kernel<12, true, 2, 512, false>",
-        "stack": 64,
+        "stack": 72,
         "local": 0,
-        "reason": "inherited, not yet fixed"
+        "reason": "changed by the K-quant staging commit (was 64), accepted in its gate"
       },
       {
         "name": "strata::prefill::fused::{anonymous}::native_kernel<12, true, 4, 512, false>",
