@@ -167,6 +167,18 @@ constexpr bool q36_takes(int env, const Card& c, int sm40_env, bool gate_staged,
     return takes_by_default(c, sm40_on(sm40_env), gate_staged, down_ok);
 }
 
+// ---- Flash-Next's K-quant experts (UD-Q4_K_XL, and the other packs with a Q4_K / Q5_K gate/up and a Q5_1 or Q8_0 down: CUDA): whether the engine sets the K-quant fused kernels up on a card (dev_info in
+// src/prefill/moe_fused_iq.cu), which is what lets native_supported take those layers.  STRATA_PF_FUSED_KQ as pf_env reads it: -1 unset or empty, 1 = a value starting with '1' (on for every sm_80+
+// card, as the opt-in always was), 0 = any other value (off: those layers stay on MMQ).  Unset takes them on the cards the i-quant default rule takes (takes_by_default: sm_86-class and sm_120 cards
+// with 80+ SMs, and the staged launches on 40-79 SMs unless STRATA_PF_FUSED_SM40=0): the K-quant gate/up (Q4_K / Q5_K) is a weight-staging instance (sw_on) and its Q5_1 / Q8_0 down is one the staged
+// kernels were measured with, so the launch kind is (staged, down ok) for every pair this decides.  STRATA_PF_FUSED=0 still turns every fused kernel off (native_supported checks it first).
+// Evidence: par/RESULTS-KQ-DEFAULT.md (RTX A6000 end to end with UD-Q4_K_XL; one layer on the RTX PRO 5000 and RTX A4000).
+constexpr bool kq_takes(int kq_env, const Card& c, int sm40_env) {
+    if (kq_env == 0) return false;
+    if (kq_env > 0) return true;
+    return takes_by_default(c, sm40_on(sm40_env), true, true);
+}
+
 // ---- the weight-staging guard (check_staged_blobs's decision in src/prefill/moe_fused_iq.cu), as pure functions so the decision can be tested without a GPU.
 // The staging kernels (sw_on instances) copy the expert blobs into shared memory with cp.async and read 16-bit words at the rows' offsets: they need blobs in device (or managed)
 // memory at 2-byte aligned addresses and 2-byte aligned rows and offsets.  A launch that fails the check does NOT end the process: it takes the unstaged 64-row kernel of the same

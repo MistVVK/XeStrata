@@ -2160,7 +2160,7 @@ struct DevInfo {
 #if !defined(__HIPCC__)
     bool q50 = false;   // sm_80+ with STRATA_PF_FUSED_Q50=1: the Q5_0 down kernels are set up (opt-in, phase 4 step 1)
     int occ_q50 = 1;    // their blocks per multiprocessor (kept apart, so the other formats' grids do not change)
-    bool kq = false;    // sm_80+ with STRATA_PF_FUSED_KQ=1: the K-quant kernels (Q4_K / Q5_K gate/up, Q5_1 down) are set up (opt-in, phase 4)
+    bool kq = false;    // the K-quant kernels (Q4_K / Q5_K gate/up, Q5_1 / Q8_0 down) are set up: by default on the cards of fused_tile::kq_takes, STRATA_PF_FUSED_KQ=1 on any sm_80+ card, =0 off
     int occ_kq = 1;     // their blocks per multiprocessor (their own, as occ_q50)
     bool kq8 = false;   // with kq: the Q8_0 down kernels are set up too (A2; UD-Q4_K_XL's five Q8_0-down layers)
     int occ_kq8 = 1;
@@ -2221,7 +2221,7 @@ int tq_env() {
     static const int v = strata::prefill::fused_tq::env_value();
     return v;
 }
-bool kq_on();   // STRATA_PF_FUSED_KQ (below): on CUDA "1" sets the K-quant kernels up (dev_info)
+[[maybe_unused]] bool kq_on();   // STRATA_PF_FUSED_KQ (below): the HIP builds' reading of the switch (the CUDA builds decide in dev_info with fused_tile::kq_takes)
 template <int T, bool GU, int WW, int NT = THREADS, bool F16 = false> bool setup_ww(int& occ) {
     cudaFuncAttributes fa{};
     if (cudaFuncGetAttributes(&fa, native_kernel<T, GU, WW, NT, F16>) != cudaSuccess || fa.ptxVersion < 75) return false;
@@ -2371,12 +2371,16 @@ const DevInfo& dev_info() {
     // FP32 scales and sums).  Their occupancy is their own (occ_q50), so the other formats' launches do not change; a failed
     // setup leaves those layers on the FP16 path.
     if (int o3 = 1 << 20; d.ok && q50_cuda_requested() && setup_one<T_Q5_0, false>(o3)) { d.q50 = true; d.occ_q50 = o3; }
-    // STRATA_PF_FUSED_KQ=1 (opt-in on CUDA, off by default; the HIP switch's name and meaning): the K-quant experts of UD-Q4_K_XL -
-    // gate/up Q4_K / Q5_K, down Q5_1 - on native_kernel instead of MMQ (libstrata_kq).  The decode is the HIP kernels' (load_unit /
-    // convert: int8 codes, a scale and a minimum per 32 values); the minimum enters as s1 d_x (sum of the activation codes), from the
-    // sums quant_act_nat_kernel and the K-quant gate/up epilogue store in the spare bytes.  Their own occupancy (occ_kq); a failed
-    // setup leaves those layers on MMQ.
-    if (int o4 = 1 << 20; d.ok && kq_on() && setup_one<T_Q4_K, true>(o4) && setup_one<T_Q5_K, true>(o4) && setup_one<T_Q5_1, false>(o4)) {
+    // The K-quant experts of UD-Q4_K_XL - gate/up Q4_K / Q5_K, down Q5_1 (or Q8_0) - on native_kernel instead of MMQ (libstrata_kq).  On CUDA they are the
+    // default on the cards the i-quant default rule takes (fused_tile::kq_takes: sm_86-class and sm_120 with 80+ SMs, the staged launches on 40-79 SMs unless
+    // STRATA_PF_FUSED_SM40=0), STRATA_PF_FUSED_KQ=1 sets them up on every sm_80+ card, STRATA_PF_FUSED_KQ=0 (or STRATA_PF_FUSED=0, native_supported) leaves them on MMQ.
+    // The decode is the HIP kernels' (load_unit / convert: int8 codes, a scale and a minimum per 32 values); the minimum enters as s1 d_x (sum of the activation
+    // codes), from the sums quant_act_nat_kernel and the K-quant gate/up epilogue store in the spare bytes.  Their own occupancy (occ_kq); a failed setup leaves
+    // those layers on MMQ.  (kq_on() below is the HIP builds' reading of the switch; strata-q36 sets STRATA_PF_FUSED_KQ=1 itself, so its cards are unchanged.)
+    static const int kq_env = strata::prefill::fused_tile::pf_env(std::getenv("STRATA_PF_FUSED_KQ"));
+    static const int kq_sm40_env = strata::prefill::fused_tile::sm40_env_of(std::getenv("STRATA_PF_FUSED_SM40"));
+    const bool kq_want = strata::prefill::fused_tile::kq_takes(kq_env, {d.s120, d.s121, d.sms, d.s86}, kq_sm40_env);
+    if (int o4 = 1 << 20; d.ok && kq_want && setup_one<T_Q4_K, true>(o4) && setup_one<T_Q5_K, true>(o4) && setup_one<T_Q5_1, false>(o4)) {
         d.kq = true;
         d.occ_kq = o4;
         // (A2) the Q8_0 down behind a K-quant gate/up: int8 codes and one scale per 32 values, no minimum (load_unit / convert<T_Q8_0>);
@@ -2752,8 +2756,9 @@ bool native_supported(int gu_type, int d_type) {
     if (off || env == 0 || !gu_covered(gu_type)) return false;
     if (strata::prefill::pf_fused_override().load(std::memory_order_relaxed) == 0) return false;   // the small-card prompt path (pf_fused_override.hpp)
 #if !defined(__HIPCC__)
-    // CUDA, a K-quant gate/up (phase 4, opt-in): with STRATA_PF_FUSED_KQ=1 a Q4_K / Q5_K gate/up with a Q5_1 down takes the fused
-    // kernels on any sm_80+ card whose K-quant kernels were set up, whatever the 80-SM rule says; other downs keep MMQ for now.  A Q5_1
+    // CUDA, a K-quant gate/up: a Q4_K / Q5_K gate/up with a Q5_1 (or, with the Q8_0 down kernels set up, Q8_0) down takes the fused
+    // kernels on any sm_80+ card whose K-quant kernels were set up: by default on the cards of fused_tile::kq_takes (dev_info), with
+    // STRATA_PF_FUSED_KQ=1 on every card, never with STRATA_PF_FUSED_KQ=0; other downs keep MMQ for now.  A Q5_1
     // down needs the code sums only the K-quant gate/up epilogue writes, so it is never taken behind another gate/up.  Not with the
     // NT = 256 / warp-specialized opt-ins (no K-quant form): MMQ.
     // CUDA, a Q8_0 down behind an i-quant gate/up (phase 4, opt-in): with STRATA_PF_FUSED_Q8D=1 such a layer takes the fused kernels on
