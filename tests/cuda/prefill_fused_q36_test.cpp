@@ -245,7 +245,7 @@ void run_fused(const Pair& p, const Geo& geo, FusedBufs& b, const float* x_dev, 
             bt.e0 = e0;
             bt.e1 = std::min(cuts[c + 1], e0 + fq::kQ36MaxBatch);
             for (int e = bt.e0; e < bt.e1; ++e) bt.blob[e - bt.e0] = blob[(size_t) e];
-            fq::experts_native(bt, ng, E, rows, b.scratch.p, b.xa.p, b.src.as<int32_t>(), b.ha.p, b.dm.as<float>(), s);
+            fq::experts_native_ext(bt, ng, E, rows, b.scratch.p, b.xa.p, b.src.as<int32_t>(), b.ha.p, b.dm.as<float>(), s);
         }
     }
 }
@@ -614,7 +614,7 @@ int main(int argc, char** argv) {
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
         for (const Pair& p : pairs) {
             if (only && std::string(p.name).find(only) == std::string::npos) continue;
-            if (!fq::native_supported((int) p.gu, (int) p.d)) {
+            if (!fq::native_supported_ext((int) p.gu, (int) p.d)) {
                 if (p.optional) { std::printf("%s: not covered by this build of the Qwen3.6 kernels (skipped)\n", p.name); continue; }
                 throw std::runtime_error(std::string(p.name) + ": not covered by the Qwen3.6 copy of the kernels");
             }
