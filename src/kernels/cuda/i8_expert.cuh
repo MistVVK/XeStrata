@@ -214,7 +214,7 @@ template <int T, bool GU, int TM>
 __global__ void __launch_bounds__(I8_NT)
 i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start, const int32_t* __restrict__ n_groups,
           const int32_t* __restrict__ tile_off, const int32_t* __restrict__ ent_idx, const block_q8_1* __restrict__ A,
-          block_q8_1* __restrict__ hq, float* __restrict__ out, NativeExpertLayout L) {
+          block_q8_1* __restrict__ hq, float* __restrict__ out, NativeExpertLayout L, int bisect) {
     using SM = I8Smem<T, TM>;
     constexpr int BM = SM::BM, NA = (BM * I8_LD + I8_NT - 1) / I8_NT;
     extern __shared__ uint4 i8_dyn[];
@@ -245,6 +245,7 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
         printf("i8 dbg T=%d GU=%d TM=%d ti=%d ng=%d total=%d g=%d e_lo=%d e_hi=%d blob=%p A=%p hq=%p out=%p tok=%p\n", T, (int) GU, TM, ti, ng,
                tile_off[ng], g, e_lo, e_hi, (const void*) blob, (const void*) A, (const void*) hq, (const void*) out, (const void*) ent_idx);
 #endif
+    if (bisect == 1) return;   // research (STRATA_I8_BISECT = n): return at point n, uniform over the block (the HIP fault hunt)
     const int K = GU ? (int) L.n_embd : (int) L.n_ff;
     const int ns = K / I8_KS;
     const size_t wrb = GU ? L.gu_row : L.d_row;
@@ -259,8 +260,10 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
 #pragma unroll
         for (int i = 0; i < 4; ++i) kv[i] = t[i];
     }
+    if (bisect == 2) return;
     if (tid < BM) s_src[tid] = (e_lo + tid < e_hi) ? (GU ? ent_idx[e_lo + tid] : e_lo + tid) : -1;
     __syncthreads();
+    if (bisect == 3) return;
 
     // the weight sub-block of this thread: row wr of the tile, 32 values wp of each stage
     const int wr = tid >> 2, wp = tid & 3;
@@ -322,10 +325,14 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
 
     uint32_t wraw[5], ar[NA];
     load_w(0, wraw);
+    if (bisect == 4) { if (wraw[0] == 0x12345678u) out[0] = 0.0f; return; }
     load_a(0, ar);
+    if (bisect == 5) { if (wraw[0] + ar[0] == 0x12345678u) out[0] = 0.0f; return; }
     store_w(0, wraw);
+    if (bisect == 6) return;
     store_a(0, ar);
     __syncthreads();
+    if (bisect == 7) return;
     for (int st = 0; st < ns; ++st) {
         const int b = st & 1;
         if (st + 1 < ns) { load_w(st + 1, wraw); load_a(st + 1, ar); }
@@ -426,6 +433,7 @@ struct I8Args {
     float* out;
     NativeExpertLayout L;
     int64_t tiles_ub;
+    int bisect;
 };
 
 template <int T, bool GU, int TM>
@@ -436,9 +444,9 @@ void i8_launch_tm(const I8Args& a, cudaStream_t s) {
 #endif
     const dim3 grid((unsigned) a.tiles_ub, (unsigned) (GU ? a.L.n_ff / 32 : a.L.n_embd / 64));
     if constexpr (GU)
-        i8_kernel<T, true, TM><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L);
+        i8_kernel<T, true, TM><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect);
     else
-        i8_kernel<T, false, TM><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L);
+        i8_kernel<T, false, TM><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
 }
 template <int T, bool GU>
 void i8_launch(int tm, const I8Args& a, cudaStream_t s) {

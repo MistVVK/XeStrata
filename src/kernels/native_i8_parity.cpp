@@ -41,6 +41,7 @@ T* dalloc(size_t n) {
     T* p = nullptr;
     ck(cudaMalloc(&p, n * sizeof(T) + 256), "malloc");
     ck(cudaMemset(p, 0, n * sizeof(T) + 256), "memset");
+    ck(cudaDeviceSynchronize(), "memset sync");   // (a legacy-stream memset may still be queued when the first kernel of the non-blocking stream runs: it zeroed the activations)
     return p;
 }
 
@@ -145,8 +146,8 @@ struct Setup {
         return ng;
     }
     std::vector<float> result(bool i8, int junk, cudaStream_t s) {
-        ck(cudaMemset(out, 0xFF, out_floats * 4), "memset");
-        ck(cudaMemset(scr, junk, scr_bytes), "memset");
+        ck(cudaMemsetAsync(out, 0xFF, out_floats * 4, s), "memset");   // (on the same stream: a legacy-stream cudaMemset is not ordered against a non-blocking stream)
+        ck(cudaMemsetAsync(scr, junk, scr_bytes, s), "memset");
         if (i8) k::native_expert_i8(L, ptr, start, n, dst, tok, cap, cap, xq, scr, out, s);
         else k::native_expert_grouped(L, ptr, start, n, dst, tok, cap, cap, xq, scr, out, s, 0);
         ck(cudaStreamSynchronize(s), "sync");
