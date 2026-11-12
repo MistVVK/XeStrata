@@ -2388,7 +2388,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     static const bool f16_only = [] { const char* v = std::getenv("STRATA_MTP_BATCH_F16"); return v == nullptr || v[0] != '0'; }();
     const bool q8 = !f16_only && mmq::built() && mmq::fits(kQ8_0, Nn) && mmq::fits(kQ8_0, KV);   // #420
     const uint64_t per_row = 4 * (2 * Nn + 4 * HCN + LR + HC + Nn + 2 * KV + 1) + 2 * (Nn + 2 * HCN + LR + Nn) + 64 +
-                             (q8 ? (uint64_t) mmq::q8_bytes(g.hc, Nn) + 4 * g.hc : 0);
+                             (q8 ? (uint64_t) mmq::q8_bytes(g.hc, Nn) + 8 * g.hc : 0);   // (8 * hc: the row table twice, see its margin below)
     int64_t B = std::min<int64_t>(n - r0, (int64_t) (m.region_bytes / per_row) & ~(int64_t) 63);
     if (st.kv_mode == 2)   // a ring: one batch's cells must not share a slot (a batch can straddle one page more)
         B = std::min<int64_t>(B, ((st.n_slots - 1) * strata::kernels::qsa_real_shapes().page_size) & ~(int64_t) 63);
@@ -2413,7 +2413,10 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     float* Vc = (float*) carve((size_t) B * KV * 4);
     int32_t* tok = (int32_t*) carve((size_t) B * 4);
     void* xq = q8 ? carve(mmq::q8_bytes(B * g.hc, Nn)) : nullptr;
-    int32_t* ident = q8 ? (int32_t*) carve((size_t) B * g.hc * 4) : nullptr;
+    // The row table is read past its end by llama.cpp's MMQ (a whole J-column tile from the start of each tile; the stream-k fixup up to roundup(max_rows, J)
+    // from the expert's first row; J up to 128): rows + the margin of mmq_ids_margin.hpp, max_rows <= B * hc (one expert, p.n = 1), the identity over all of it.
+    const uint64_t ids_rows = q8 ? mmq::mmq_ids_table_rows((uint64_t) (B * g.hc), (uint64_t) (B * g.hc)) : 0;
+    int32_t* ident = q8 ? (int32_t*) carve((size_t) ids_rows * 4) : nullptr;
     int32_t* bnd = q8 ? (int32_t*) carve(16) : nullptr;
     if ((uint64_t) (q - m.region) > m.region_bytes) return decline("the batch buffers do not fit the scratch region");
     static const bool timing = std::getenv("STRATA_DRAFT_TIMING") != nullptr;   // debug: where this pass's time goes
@@ -2426,7 +2429,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     std::vector<int32_t> tk((size_t) B);
     if (q8) {
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
-        mmq::iota(ident, B * g.hc, m.cs);
+        mmq::iota(ident, (int64_t) ids_rows, m.cs);
     }
     // y[rows, n_out] = x[rows, k] . w^T for a Q8_0 matrix: MMQ from the FP32 rows (bounds slot 0: rows, 1: rows*hc)
     auto proj = [&](const float* x, const uint16_t* x16, const void* w, float* y, int64_t rows, int64_t n_out,
