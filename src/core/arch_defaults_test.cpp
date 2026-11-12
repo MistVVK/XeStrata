@@ -3,6 +3,7 @@
 #include "strata/core/gfx12_platform_defaults.hpp"
 #include "strata/core/sm120_series.hpp"
 #include "strata/core/defaults_026.hpp"
+#include "strata/prefill/pf_fused_override.hpp"
 #include "strata/core/spill_gate.hpp"
 
 #include <cstdio>
@@ -617,6 +618,34 @@ int main() {
         CHECK(sc(2048, false, 1, true, false, false, true).fused_off);      // STRATA_PREFILL_LAYER_MAJOR named: the walk is theirs ...
         CHECK(!sc(2048, false, 1, true, false, false, true).layer_major);   // ... the expert path still follows the rule
         CHECK(!sc(2048, false, 1, true, false, true, true).any());          // both named: nothing changes
+    }
+    {
+        using namespace strata;
+        // the small-card path over the card sizes of the measured grid (RTX A4000 held to N MiB free, IQ2_XS, no MTP; default chunk the rule sees):
+        // where it fires, and what it does with the fused kernels (on, unless STRATA_PF_SMALL_FUSED=0)
+        struct Row { long long mib, dflt; bool fires; };
+        const Row rows[] = {{7000, 2048, true}, {8000, 4096, true}, {8500, 5120, true}, {9000, 6144, true}, {9500, 7168, true},
+                            {10000, 8192, false}, {12000, 12288, false}, {16376, 20480, false}};
+        for (const Row& r : rows) {
+            const SmallCardPromptPath pp = small_card_prompt_path(r.dflt, false, 1, true, false, false, false);
+            CHECK(pp.any() == r.fires);
+            CHECK(pp.fused_off == r.fires && pp.layer_major == r.fires);
+            if (pp.fused_off) {
+                CHECK(small_card_kernels_on(nullptr));                      // unset: the native fused kernels run in MMQ's buffer layout
+                CHECK(small_card_kernels_on(""));
+                CHECK(small_card_kernels_on("1"));
+                CHECK(!small_card_kernels_on("0"));                         // the way back: MMQ's kernels, as before
+            }
+            const int ov = pp.fused_off ? (small_card_kernels_on(nullptr) ? prefill::kPfFusedKernelsOnly : 0) : -1;
+            // STRATA_PF_FUSED as the fused kernels' rule reads it: unset reads as 1 on the small-card path only
+            CHECK(prefill::pf_fused_env_effective(-1, ov) == (r.fires ? 1 : -1));
+            CHECK(prefill::pf_fused_env_effective(0, ov) == 0);             // "0" stays off
+            CHECK(prefill::pf_fused_env_effective(1, ov) == 1);
+        }
+        CHECK(prefill::pf_fused_env_effective(-1, 0) == -1);                // the way back (override 0): the variable as it is
+        CHECK(prefill::pf_fused_env_effective(-1, -1) == -1);               // nothing decided
+        CHECK(small_card_prompt_path(2048, false, 1, true, false, true, false).any() == false);   // STRATA_PF_FUSED named by hand: the user's path, no rule
+        CHECK(small_card_prompt_path(2048, true, 1, true, false, false, false).any() == false);   // HIP: unchanged
     }
     {
         using namespace strata;

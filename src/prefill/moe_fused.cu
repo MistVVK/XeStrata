@@ -725,7 +725,8 @@ bool requested() {
         const char* v = std::getenv("STRATA_PF_FUSED");
         return v != nullptr && v[0] == '1';
     }();
-    return env && available() && strata::prefill::pf_fused_override().load(std::memory_order_relaxed) != 0;
+    const int ov = strata::prefill::pf_fused_override().load(std::memory_order_relaxed);
+    return (env || ov == strata::prefill::kPfFusedKernelsOnly) && available() && ov != 0;   // (the small-card prompt path reads an unset variable as 1)
 }
 
 size_t act_bytes(int64_t rows, int64_t cols) { return (size_t) rows * (size_t) (cols / 64) * AB; }

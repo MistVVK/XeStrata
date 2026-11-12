@@ -18,4 +18,9 @@ inline std::atomic<int>& pf_fused_override() {
     return v;
 }
 
+/// STRATA_PF_FUSED as the fused kernels' rule reads it (`env`: -1 unset, 0 = "0", 1 = anything else; `ov`: pf_fused_override()).  On the small-card prompt
+/// path (kPfFusedKernelsOnly) an unset variable reads as 1: the native kernels take every format they cover on this card, as STRATA_PF_FUSED=1 does;
+/// a variable the user named is never changed (the small-card rule steps aside for it anyway).
+inline int pf_fused_env_effective(int env, int ov) { return env < 0 && ov == kPfFusedKernelsOnly ? 1 : env; }
+
 }  // namespace strata::prefill

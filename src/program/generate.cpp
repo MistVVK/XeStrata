@@ -11109,7 +11109,9 @@ int main(int argc, char** argv) {
                     fe != nullptr && fe[0] != '\0', le != nullptr && le[0] != '\0');
                 if (pp.any()) {
                     const int64_t chunk_default = chunk;
-                    if (pp.fused_off) strata::prefill::pf_fused_override().store(0);
+                    // MMQ's buffer layout (so the layer-major walk runs); the native fused kernels still run in the walk's groups and the streamed chunks
+                    // (pf_fused_override.hpp), unless STRATA_PF_SMALL_FUSED=0 keeps MMQ's kernels there as before
+                    if (pp.fused_off) strata::prefill::pf_fused_override().store(strata::small_card_kernels_on(std::getenv("STRATA_PF_SMALL_FUSED")) ? strata::prefill::kPfFusedKernelsOnly : 0);
                     if (pp.layer_major) {
 #if defined(_WIN32)
                         _putenv_s("STRATA_PREFILL_LAYER_MAJOR", "1");
@@ -11132,7 +11134,7 @@ int main(int argc, char** argv) {
                                      (long long) chunk);
                     } else
                     std::fprintf(stderr, "strata serve: small expert cache: the default prompt path would read in chunks of %lld tokens (under %lld), "
-                                         "so prompts read with the unfused experts%s (chunk %lld tokens); STRATA_PF_SMALL=0 keeps the default path, "
+                                         "so prompts are read the way that suits a card with little memory%s (chunk %lld tokens); STRATA_PF_SMALL=0 keeps the default path, "
                                          "STRATA_PF_FUSED / STRATA_PREFILL_LAYER_MAJOR set by hand win\n",
                                  (long long) chunk_default, (long long) strata::kSmallCardChunkBelow,
                                  pp.layer_major ? " and, from two chunks, the layer-major walk" : "", (long long) chunk);
