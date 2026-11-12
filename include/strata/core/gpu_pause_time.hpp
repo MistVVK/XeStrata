@@ -111,8 +111,8 @@ inline std::string gpu_pause_request_line(int64_t at_start, int64_t at_end) {
 
 /// The per-gap line (no newline): the counter moved by at least kGpuPauseReportMs while the engine sat idle, between READY (or
 /// the end of the previous request) and the start of the next request.  "" when either read is not available or below the bar.
-/// [DRAFT, not approved] wording: the request line's words with "between requests" in place of "during this request" and no
-/// "slower" clause (nothing was running).
+/// Owner-approved wording (11-12, par\OWNER-WORDING-1111.md): the request line's words with "between requests" in place of
+/// "during this request" and no "slower" clause (nothing was running).  No word changes without a new approval.
 inline std::string gpu_pause_between_line(int64_t idle_from, int64_t at_begin) {
     if (idle_from < 0 || at_begin < idle_from || at_begin - idle_from < kGpuPauseReportMs) return "";
     return "strata serve: the graphics driver paused the GPU for " + std::to_string(at_begin - idle_from) +
