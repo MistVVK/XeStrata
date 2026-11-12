@@ -39239,11 +39239,11 @@
    "doc_mentions": [
     "docs/BATCHING.md:152"
    ],
-   "first_commit": null,
-   "first_date": null,
+   "first_commit": "3a25581693",
+   "first_date": "2026-11-12",
    "since": null,
-   "last_commit": null,
-   "last_date": null,
+   "last_commit": "00807c9b30",
+   "last_date": "2026-11-12",
    "status": "rollback",
    "owner": "program",
    "note": "STRATA_UMA_PIN_CAP=0 keeps the RAM budget as given: on a Strix Halo (Windows HIP) with --batch 2 or more the engine cuts the pinned RAM copy of experts so that it plus the slots' pinned K/V stays at 22.75 GiB (15.0 GiB of experts at 4 slots and 131,072 tokens), measured on one 64 GB PC (strix-20261112-1937-7dbd started, -1923-8a6a failed at 25.75 GiB); the engine's line names this switch",
