@@ -5351,12 +5351,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // of layer l ({T, N, K} int64, T x N floats, T x K expert ids) for testing products on real rows
                         static const char* dump_moe = std::getenv("STRATA_DUMP_MOE_INPUT");
                         static bool dumped_moe = false;
-                        if (dump_moe && !dumped_moe && l == std::atoi(std::getenv("STRATA_DUMP_MOE_LAYER") ? std::getenv("STRATA_DUMP_MOE_LAYER") : "0")) {
+                        // STRATA_DUMP_MOE_LAYER=all (research): every layer of the process's first chunk, layer l into <path>.L<l> (the layers come in order; the second chunk and later
+                        // requests are not dumped)
+                        static const bool dump_all = [] { const char* e = std::getenv("STRATA_DUMP_MOE_LAYER"); return e != nullptr && std::strcmp(e, "all") == 0; }();
+                        static int dump_next = 0;
+                        const bool dump_this = dump_moe != nullptr && (dump_all ? l == dump_next
+                                                                               : (!dumped_moe && l == std::atoi(std::getenv("STRATA_DUMP_MOE_LAYER") ? std::getenv("STRATA_DUMP_MOE_LAYER") : "0")));
+                        if (dump_this) {
                             dumped_moe = true;
+                            if (dump_all) ++dump_next;
                             std::vector<float> x((size_t) (T * N));
                             cudaMemcpyAsync(x.data(), m.mixed, x.size() * sizeof(float), cudaMemcpyDeviceToHost, m.cs);
                             cudaStreamSynchronize(m.cs);
-                            if (std::FILE* f = std::fopen(dump_moe, "wb")) {
+                            const std::string dump_path = dump_all ? std::string(dump_moe) + ".L" + std::to_string(l) : std::string(dump_moe);
+                            if (std::FILE* f = std::fopen(dump_path.c_str(), "wb")) {
                                 const int64_t hdr[3] = {(int64_t) T, (int64_t) N, (int64_t) K};
                                 std::fwrite(hdr, sizeof hdr, 1, f);
                                 std::fwrite(x.data(), sizeof(float), x.size(), f);
@@ -5537,7 +5545,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 err = "prefill: int8 experts: no memory for the group record";
                                 return false;
                             }
-                            strata::kernels::quantize_q8_1_rows(m.mixed, T, N, m.fr_xq, m.cs);
+                            strata::kernels::native_expert_i8_quantize(m.mixed, T, N, m.fr_xq, m.cs);   // the kernels' own image (FP32 scales), 36 bytes per block as q8_1
                         }
                         if (use_mmq) {
                             // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed` (APR:

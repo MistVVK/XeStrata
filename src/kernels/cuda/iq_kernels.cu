@@ -6298,6 +6298,14 @@ bool native_expert_i8_supported(const NativeExpertLayout& L) noexcept {
            i8_smem_bytes(L.gu_type, L.d_type, 2) <= i8_smem_limit();                  // the smallest tile fits the device's shared memory per block
 }
 
+void native_expert_i8_quantize(const float* x, int64_t n_rows, int64_t n_cols, void* y, void* stream) {
+    const long long n = (long long) n_rows * n_cols;
+    if (n <= 0) return;
+    if (n_cols % 32 != 0) { std::fprintf(stderr, "native_expert_i8_quantize: %lld columns\n", (long long) n_cols); std::exit(1); }
+    i8_quantize_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>(x, (block_q8_1*) y, n);
+    check("native_expert_i8_quantize");
+}
+
 void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
                       const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries, const void* x_q8_1,
                       void* scratch, float* out, void* stream) {
@@ -6383,13 +6391,8 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     if (cap_groups <= 0 || cap_entries <= 0) return;
     strata::dispatch::kernel(strata::dispatch::kExpert, 0, L.gu_type, (int) L.n_embd, (int) L.n_ff, L.d_type);   // BW-MEASURE: one grouped expert call
     if (L.n_ff % 32 != 0) { std::fprintf(stderr, "native_expert_grouped: n_ff %lld\n", (long long) L.n_ff); std::exit(1); }
-    // OWN-I8: a prompt-sized call on our own int8 tile kernels when STRATA_EXPERT_I8=1 names it.  Only the explicit switch: the card-class default
-    // (i8_expert_rule.hpp) is for the prompt path's MMQ groups, where it was measured; this fallback (the Qwen3.6 engine's prompt) has no timing on that class.
-    static const bool i8_switch = i8_switch_state() == 1;
-    if (i8_switch && cap_entries >= 256 && grid_groups <= 0 && native_expert_i8_supported(L)) {
-        native_expert_i8(L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_1, scratch, out, stream);
-        return;
-    }
+    // (OWN-I8: this fallback no longer hands its calls to native_expert_i8: that kernel reads its own activation image, native_expert_i8_quantize's, and this call's rows are q8_1
+    //  blocks.  The prompt path's MMQ groups, where the kernel was measured, quantize the image themselves.)
     cudaStream_t s = (cudaStream_t) stream;
     const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
     float* gate = (float*) scratch;

@@ -20,6 +20,9 @@ size_t native_expert_i8_scratch_bytes(int64_t cap_entries, int64_t cap_groups, i
     const size_t hqb = ((size_t) cap_entries * (size_t) (n_ff / 32) * 36 + 255) & ~(size_t) 255;   // 36 bytes: sizeof(block_q8_1)
     return hqb + (size_t) (cap_groups + 1) * sizeof(int32_t);
 }
+void native_expert_i8_quantize(const float*, int64_t, int64_t, void*, void*) {
+    strata::metal_engine::missing("strata::kernels::native_expert_i8_quantize");
+}
 void native_expert_i8(const NativeExpertLayout&, const unsigned long long*, const int32_t*, const int32_t*, const int32_t*, const int32_t*, int64_t, int64_t,
                       const void*, void*, float*, void*) {
     strata::metal_engine::missing("strata::kernels::native_expert_i8");
