@@ -143,8 +143,9 @@ __host__ __device__ constexpr bool sw_on(int t, bool gu) {
     (void) t; (void) gu;
     return false;
 #else
-    // (the K-quant downs: Q5_K / Q6_K rows of 256-value super-blocks, i.e. a K that is a multiple of 256 - Qwen3.6's n_ff 512; the Flash-Next geometry (640) has none)
-    return gu ? (t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS || t == T_Q8_0 || t == T_Q6_K)
+    // (the K-quant downs: Q5_K / Q6_K rows of 256-value super-blocks, i.e. a K that is a multiple of 256 - Qwen3.6's n_ff 512; the Flash-Next geometry (640) has none; the K-quant gate/up Q4_K / Q5_K:
+    // their K is the model width, 2,560 / 2,048 = 10 / 8 super-blocks)
+    return gu ? (t == T_IQ3_XXS || t == T_IQ3_S || t == T_IQ4_XS || t == T_Q8_0 || t == T_Q6_K || t == T_Q4_K || t == T_Q5_K)
               : (t == T_IQ4_NL || t == T_Q8_0 || t == T_Q5_0 || ((t == T_Q5_K || t == T_Q6_K) && D_ROWS_K % 256 == 0));
 #endif
 }
@@ -1001,6 +1002,7 @@ native_kernel(const BatchOf<NT> b, const NativeGeom geo, const Tables tb, const 
             if constexpr (SWT) {
                 if constexpr (WT == T_Q5_K) sw_q5(s, w);
                 else if constexpr (WT == T_Q6_K) sw_q6(s, w);
+                else if constexpr (WT == T_Q4_K && GU) kq_lean_load<WT>(sw_unit(s), sub(s), uj, w);   // (K-quant gate/up: the lean words from the slot, as the unstaged path reads them from the block)
                 else load_unit<WT>(sw_unit(s), sub(s), w);
             }
         };
