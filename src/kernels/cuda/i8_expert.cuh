@@ -11,7 +11,7 @@
 // thread then multiplies a TM x 4 register tile with `__dp4a`:
 //     per 32 values and (entry, weight row):  8 dp4a, the format's integer scale(s), one float fma with d_w * d_x.
 // The arithmetic is the quantized-dot arithmetic of the other native kernels: w = d_w * s * q (q the int8 code, s a small
-// integer scale), x = d_x * a (a in -127..127), sum w x = d_w d_x sum s (q . a).  The scale algebra is ggml's: IQ2_XXS d (2s+1)/8
+// integer scale), x = d_x * a (a in -127..127; d_x an FP32 scale, i8_quantize_kernel / the epilogue below: MMQ's numbers, not the q8_1 half2), sum w x = d_w d_x sum s (q . a).  The scale algebra is ggml's: IQ2_XXS d (2s+1)/8
 // per 32, IQ2_XS / IQ2_S d (2s+1)/8 per 16, IQ3_XXS d (2s+1)/4 per 32, IQ3_S d (2s+1) per 32, IQ4_NL / Q2_0 d.  Unlike the
 // decode kernels the integer division inside the dot is not done (the exact value is used), so the error against FP32 is at
 // most theirs.
@@ -71,6 +71,23 @@ __device__ __forceinline__ uint32_t i8_ld16(I8P p) { return *(I8P16) p; }   // 2
 __device__ __forceinline__ uint32_t i8_ld8(I8P p) { return *p; }
 __device__ __forceinline__ uint32_t i8_ldw(I8P p) { return *(I8P32) p; }   // 4-byte aligned
 __device__ __forceinline__ float i8_half(uint32_t w) { return __half2float(__ushort_as_half((unsigned short) w)); }
+// The activation image of these kernels (the call's x rows and the H the gate/up epilogue writes): blocks of 32 values {float d; int8 q[32]}, 36 bytes (the q8_1 block's size, so the
+// tables and strides are unchanged), numbers as MMQ's quantizer (quantize_mmq_q8_1, layout D4): d_inv = 127 / amax, q = round(x * d_inv), d = 1 / d_inv, the scale kept in FP32.
+// (The q8_1 half2 would round d to FP16 - up to 2^-11 per block - and the kernels would differ from MMQ's output by more than float rounding.)  An all-zero block: q 0, d 0.
+__device__ __forceinline__ int8_t i8_code(float x, float d_inv, float amax) { return amax == 0.0f ? (int8_t) 0 : (int8_t) roundf(x * d_inv); }
+__device__ __forceinline__ void i8_put_scale(block_q8_1* b, float amax, float d_inv) { *reinterpret_cast<uint32_t*>(&b->ds) = __float_as_uint(amax == 0.0f ? 0.0f : 1.0f / d_inv); }
+__global__ void i8_quantize_kernel(const float* __restrict__ x, block_q8_1* __restrict__ y, long long n) {   // n a multiple of 32: a warp is whole blocks
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float xi = x[i];
+    float amax = fabsf(xi);
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    const float d_inv = 127.0f / amax;
+    const long long ib = i / 32, iqs = i % 32;
+    y[ib].qs[iqs] = i8_code(xi, d_inv, amax);
+    if (iqs == 0) i8_put_scale(&y[ib], amax, d_inv);
+}
 // byte 0 of v (v < 256) in all four bytes (one v_perm instead of a quarter-rate 32-bit multiply)
 __device__ __forceinline__ uint32_t i8_bcast(uint32_t v) { return __byte_perm(v, 0u, 0x0000); }
 // a pointer that is the same in every lane, as scalar registers (the compiler cannot tell: it came out of a binary search over loads)
@@ -422,7 +439,7 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
             uint4* d = (uint4*) (s_a + b * SM::SZ_A + (tid >> 2) * I8_LD + (tid & 3) * 8);
             d[0] = make_uint4(ar[1], ar[2], ar[3], ar[4]);
             d[1] = make_uint4(ar[5], ar[6], ar[7], ar[8]);
-            s_ad[b * SM::SZ_D + tid] = i8_half(ar[0] & 0xFFFFu);
+            s_ad[b * SM::SZ_D + tid] = __uint_as_float(ar[0]);
         }
     };
 
@@ -508,18 +525,15 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
             const float g0 = acc[j][0], g1 = acc[j][1];
             const float h0 = (g0 / (1.0f + __expf(-g0))) * acc[j][2];
             const float h1 = (g1 / (1.0f + __expf(-g1))) * acc[j][3];
-            float amax = fmaxf(fabsf(h0), fabsf(h1)), sum = h0 + h1;
+            float amax = fmaxf(fabsf(h0), fabsf(h1));
 #pragma unroll
-            for (int o = 8; o > 0; o >>= 1) {
-                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-                sum += __shfl_xor_sync(0xffffffffu, sum, o);
-            }
+            for (int o = 8; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
             if (e < e_hi) {
-                const float d = q8_1_finite(amax / 127.0f);
+                const float d_inv = 127.0f / amax;
                 block_q8_1* hb = hq + (size_t) e * nb + blockIdx.y;
-                hb->qs[tx] = q8_1_quant(h0, d, amax);
-                hb->qs[tx + 16] = q8_1_quant(h1, d, amax);
-                if (tx == 0) hb->ds = q8_1_ds(d, sum);
+                hb->qs[tx] = i8_code(h0, d_inv, amax);
+                hb->qs[tx + 16] = i8_code(h1, d_inv, amax);
+                if (tx == 0) i8_put_scale(hb, amax, d_inv);
             }
         }
     } else {
@@ -675,7 +689,7 @@ i8b_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __rest
         uint4* d = (uint4*) (s_a + b * SM::SZ_A + ea * I8B_LD + ba * 8);
         d[0] = make_uint4(ar[1], ar[2], ar[3], ar[4]);
         d[1] = make_uint4(ar[5], ar[6], ar[7], ar[8]);
-        s_ad[b * SM::SZ_D + ba * 128 + ea] = i8_half(ar[0] & 0xFFFFu);
+        s_ad[b * SM::SZ_D + ba * 128 + ea] = __uint_as_float(ar[0]);
     };
 
     float acc[16][4];
@@ -755,16 +769,13 @@ i8b_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __rest
             for (int half = 0; half < 2; ++half) {
                 const float g0 = acc[j][half], u0 = acc[j][2 + half];
                 const float h0 = (g0 / (1.0f + __expf(-g0))) * u0;
-                float amax = fabsf(h0), sum = h0;
+                float amax = fabsf(h0);
 #pragma unroll
-                for (int o = 16; o > 0; o >>= 1) {
-                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-                    sum += __shfl_xor_sync(0xffffffffu, sum, o);
-                }
-                const float d = q8_1_finite(amax / 127.0f);
+                for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+                const float d_inv = 127.0f / amax;
                 block_q8_1* hb = hq + (size_t) e * nb + 2 * blockIdx.y + half;
-                hb->qs[lane] = q8_1_quant(h0, d, amax);
-                if (lane == 0) hb->ds = q8_1_ds(d, sum);
+                hb->qs[lane] = i8_code(h0, d_inv, amax);
+                if (lane == 0) i8_put_scale(hb, amax, d_inv);
             }
             }}
     } else {

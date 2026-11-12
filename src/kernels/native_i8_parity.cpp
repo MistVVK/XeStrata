@@ -77,7 +77,7 @@ struct Setup {
     k::NativeExpertLayout L;
     int T, cap, n_blobs;
     size_t slot;
-    uint8_t *blobs, *xq, *scr;
+    uint8_t *blobs, *xq, *xq8, *scr;   // xq: the q8_1 image of native_expert_grouped; xq8: native_expert_i8's own image (FP32 scales)
     size_t scr_bytes, out_floats;
     float* out;
     unsigned long long* ptr;
@@ -106,6 +106,8 @@ struct Setup {
         ck(cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
         xq = dalloc<uint8_t>((size_t) T * (H / 32) * 36);
         k::quantize_q8_1_rows(dx, T, H, xq, s);
+        xq8 = dalloc<uint8_t>((size_t) T * (H / 32) * 36);
+        k::native_expert_i8_quantize(dx, T, H, xq8, s);
         ck(cudaStreamSynchronize(s), "quantize");
         cudaFree(dx);
         scr_bytes = k::native_expert_scratch_bytes(cap, FF);
@@ -119,7 +121,7 @@ struct Setup {
         tok = dalloc<int32_t>(cap);
     }
     ~Setup() {
-        cudaFree(blobs); cudaFree(xq); cudaFree(scr); cudaFree(out);
+        cudaFree(blobs); cudaFree(xq); cudaFree(xq8); cudaFree(scr); cudaFree(out);
         cudaFree(ptr); cudaFree(start); cudaFree(n); cudaFree(dst); cudaFree(tok);
     }
     // groups of these sizes from entry `base` on, each its own blob; every other entry row of `out` is a destination nobody uses
@@ -149,7 +151,7 @@ struct Setup {
     std::vector<float> result(bool i8, int junk, cudaStream_t s) {
         ck(cudaMemsetAsync(out, 0xFF, out_floats * 4, s), "memset");   // (on the same stream: a legacy-stream cudaMemset is not ordered against a non-blocking stream)
         ck(cudaMemsetAsync(scr, junk, scr_bytes, s), "memset");
-        if (i8) k::native_expert_i8(L, ptr, start, n, dst, tok, cap, cap, xq, scr, out, s);
+        if (i8) k::native_expert_i8(L, ptr, start, n, dst, tok, cap, cap, xq8, scr, out, s);
         else k::native_expert_grouped(L, ptr, start, n, dst, tok, cap, cap, xq, scr, out, s, 0);
         ck(cudaStreamSynchronize(s), "sync");
         std::vector<float> o(out_floats);

@@ -391,7 +391,7 @@ static void set_i8_tm(int tm) {   // research: STRATA_I8_TM for the next native_
 struct I8Path : GrpPath {
     using GrpPath::GrpPath;
     void run_i8(const float* x_dev, cudaStream_t st) {
-        kern::quantize_q8_1_rows(x_dev, T, s.N, xq.p, st);
+        kern::native_expert_i8_quantize(x_dev, T, s.N, xq.p, st);
         kern::native_expert_i8(L, ptr.as<unsigned long long>(), start.as<int32_t>(), ngroups.as<int32_t>(), dst.as<int32_t>(), tok.as<int32_t>(), n, rows, xq.p, scr.p,
                                dm.as<float>(), st);
         // what the call really asked its launches for (the tile code, the dynamic shared memory passed to each launch, each launch's status), once per distinct request

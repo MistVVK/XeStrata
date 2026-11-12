@@ -5509,7 +5509,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 err = "prefill: int8 experts: no memory for the group record";
                                 return false;
                             }
-                            strata::kernels::quantize_q8_1_rows(m.mixed, T, N, m.fr_xq, m.cs);
+                            strata::kernels::native_expert_i8_quantize(m.mixed, T, N, m.fr_xq, m.cs);   // the kernels' own image (FP32 scales), 36 bytes per block as q8_1
                         }
                         if (use_mmq) {
                             // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed` (APR:
