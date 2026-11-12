@@ -3222,6 +3222,22 @@ void blob_dequant_f16(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, voi
     blob_dequant_kernel<true><<<blocks_for((int64_t) BLOB_GU_ROWS * BLOB_ROW_GU + (int64_t) N * BLOB_ROW_D), 256, 0, (cudaStream_t) stream>>>(blob, gu16, down16);
     check("blob_dequant_f16");
 }
+__global__ void fewrows_record_kernel(uint8_t* rec, unsigned long long blob, int ne, int o0) {
+    const int i = threadIdx.x;
+    int32_t* r = reinterpret_cast<int32_t*>(rec + 8);
+    if (i == 0) {
+        *reinterpret_cast<unsigned long long*>(rec) = blob;
+        r[0] = 0;
+        r[1] = ne;
+        r[2] = 1;
+        r[3] = 0;
+    }
+    if (i < ne) r[4 + i] = o0 + i;
+}
+void fewrows_record(void* rec, const void* blob, int ne, int o0, void* stream) {
+    fewrows_record_kernel<<<1, 32, 0, (cudaStream_t) stream>>>((uint8_t*) rec, (unsigned long long) (uintptr_t) blob, ne, o0);
+    check("fewrows_record");
+}
 void swiglu_interleaved(const float* gu, uint16_t* h16, int64_t n, void* stream) {
     if (n <= 0) return;
     swiglu_il_kernel<<<blocks_for(n * FFC), 256, 0, (cudaStream_t) stream>>>(gu, h16, n);
