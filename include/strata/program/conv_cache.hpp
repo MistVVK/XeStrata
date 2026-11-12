@@ -96,6 +96,22 @@ inline bool restore_fits(const uint64_t* free_bytes, const uint8_t* stream_ready
     return true;
 }
 
+/// --conversation-cache-rewind-keep N: this request resumes the conversation at `resume` tokens and the session
+/// still holds `live_n` - at most N of them past that point.  Those are the client's private suffix (the answer it
+/// did not send back, because it strips reasoning), and parking the whole K/V to keep them puts a 6-8 GB copy on the
+/// follow-up's critical path (measured 4.7-5.0 s at 460K).  The shared prefix must be exactly `resume` tokens and
+/// the bulk of the live conversation, so a switch that only shares a system prompt parks as before.  Pure, so
+/// conv_cache_test.cpp walks the cases; a park only reads, so skipping it cannot change a token.
+inline bool rewind_keep(const int32_t* live, int64_t live_n, const int64_t* prompt, int64_t resume,
+                        int64_t max_suffix) {
+    if (max_suffix <= 0 || resume <= 0 || live == nullptr || prompt == nullptr) return false;
+    if (live_n <= resume || live_n - resume > max_suffix) return false;
+    if (resume * 2 < live_n) return false;   // the shared prefix must be the bulk of the conversation
+    for (int64_t i = 0; i < resume; ++i)
+        if (live[i] != (int32_t) prompt[i]) return false;
+    return true;
+}
+
 /// --prompt-cache-spread: the item whose removal leaves the smallest gap for its distance from the newest, so the kept
 /// points thin out geometrically towards the root and an edit d tokens before the end reads about d again.  `lens`:
 /// the chain's token counts.  Never the root, the newest or a pinned item; the tail rule first, as above.
