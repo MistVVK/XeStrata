@@ -22,6 +22,19 @@
 //                     epilogue (a thread holds gate and up of the same feature; the 16 lanes of a row hold the 32 features of one
 //                     q8_1 block), so gate/up never go to memory; !GU: down rows, FP32 into out[ent_dst].
 // Formats: gate/up IQ2_XXS(16) IQ2_XS(17) IQ3_XXS(18) IQ3_S(21) IQ2_S(22); down IQ4_NL(20) Q2_0(42).
+//
+// Iteration 4 (what changed against the iteration-3 kernel, all of it exact: the output is bit-identical):
+//   * the byte dot product of a chain starts with the three-operand v_dot4_i32_i8 on gfx1030-1032 (src2 = 0), where the compiler emitted a
+//     v_mov 0 and the accumulating v_dot4c for every one of the 16-32 chains of a sub-block;
+//   * the integer scales and the float base scale of a (row, sub-block) are one 16-byte record in shared memory ({m0, m1, d, 0}):
+//     one read per row, and the two-scale formats use mul24 + mad24 on clean registers (the packed form cost mul, mul, add);
+//     the unit-scale formats (IQ4_NL, Q2_0) skip the scale multiply;
+//   * the sign pattern of the i-quant grids comes from a 256-entry table in shared memory ({mask lo, +1 lo, mask hi, +1 hi}) and is
+//     applied as (grid ^ mask) + 1s: the grids have no zero byte, so no borrow crosses a byte (checked: par/owni8/grid_zero_check.py);
+//   * the activation stage is one thread per (row, q8_1 block): 9 dword loads from one base + immediate offsets, two 16-byte and one
+//     4-byte store, no branch (the old mapping branched per dword); the weight pieces are read with a uniform base plus a per-thread
+//     32-bit offset (global SADDR form) instead of 64-bit address arithmetic per piece;
+//   * a tile whose last entries are empty skips the 16-entry slices that hold no entry (uniform branch; bit-identical for the others).
 #ifndef I8_BLK_UNROLL
 #define I8_BLK_UNROLL 1     // unroll factor of the 32-value sub-block loop of one stage (the full unroll hoisted every LDS read: 256 VGPRs and 55-200 spilled on gfx1031)
 #endif
@@ -29,6 +42,7 @@
 #define I8_PRAGMA_UNROLL(n) _Pragma(I8_STR_(unroll n))
 constexpr int I8_KS = 128;     // values of K per stage
 constexpr int I8_LD = 36;      // dwords per shared row of a stage: 32 + 4 (no bank conflicts for the 16-byte reads)
+constexpr int I8_RS = 20;      // dwords per row of the scale records: 4 x 4 + 4 (no bank conflicts for the 16-byte reads)
 constexpr int I8_NT = 256;
 
 __host__ __device__ constexpr int i8_block_bytes(int t) {
@@ -37,6 +51,8 @@ __host__ __device__ constexpr int i8_block_bytes(int t) {
 __host__ __device__ constexpr int i8_block_vals(int t) { return t == 20 ? 32 : t == 42 ? 64 : 256; }
 __host__ __device__ constexpr int i8_grid_words(int t) { return t == 16 ? 512 : t == 17 ? 1024 : t == 22 ? 2048 : t == 18 ? 256 : t == 21 ? 512 : 4; }
 __host__ __device__ constexpr bool i8_two_scales(int t) { return t == 17 || t == 22; }
+__host__ __device__ constexpr bool i8_unit_scale(int t) { return t == 20 || t == 42; }
+__host__ __device__ constexpr bool i8_sign_type(int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22; }
 __host__ __device__ constexpr bool i8_gu_type(int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22; }
 __host__ __device__ constexpr bool i8_d_type(int t) { return t == 20 || t == 42; }
 
@@ -49,23 +65,34 @@ __host__ __device__ constexpr bool i8_d_type(int t) { return t == 20 || t == 42;
 #endif
 using I8P = const I8_AS uint8_t*;
 using I8P16 = const I8_AS uint16_t*;
+using I8P32 = const I8_AS uint32_t*;
 #define I8_GPTR(x) ((I8P) (uintptr_t) (x))
 __device__ __forceinline__ uint32_t i8_ld16(I8P p) { return *(I8P16) p; }   // 2-byte aligned only
 __device__ __forceinline__ uint32_t i8_ld8(I8P p) { return *p; }
+__device__ __forceinline__ uint32_t i8_ldw(I8P p) { return *(I8P32) p; }   // 4-byte aligned
 __device__ __forceinline__ float i8_half(uint32_t w) { return __half2float(__ushort_as_half((unsigned short) w)); }
 // byte 0 of v (v < 256) in all four bytes (one v_perm instead of a quarter-rate 32-bit multiply)
 __device__ __forceinline__ uint32_t i8_bcast(uint32_t v) { return __byte_perm(v, 0u, 0x0000); }
-// 7 sign bits of the field (the 8th is their parity), as the sign byte broadcast to 4 bytes
-__device__ __forceinline__ uint32_t i8_ksigns(uint32_t v) {
-    v &= 0xFF;
-    const uint32_t p = __popc(v) & 1;
-    return i8_bcast(v ^ p << 7);
+// a pointer that is the same in every lane, as scalar registers (the compiler cannot tell: it came out of a binary search over loads)
+__device__ __forceinline__ I8P i8_uniform(I8P p) {
+#if defined(__HIPCC__)
+    const uint64_t v = (uint64_t) (uintptr_t) p;
+    const uint32_t lo = (uint32_t) __builtin_amdgcn_readfirstlane((int) (uint32_t) v), hi = (uint32_t) __builtin_amdgcn_readfirstlane((int) (uint32_t) (v >> 32));
+    return (I8P) (uintptr_t) (((uint64_t) hi << 32) | lo);
+#else
+    return p;
+#endif
 }
-// 8 codebook bytes with the sign byte `s` (broadcast) applied: bits 0-3 to qx, 4-7 to qy
-__device__ __forceinline__ void i8_signed8(uint32_t gx, uint32_t gy, uint32_t s, uint32_t& qx, uint32_t& qy) {
-    const uint32_t m0 = __vcmpne4(s & 0x08040201u, 0), m1 = __vcmpne4(s & 0x80402010u, 0);
-    qx = __vsub4(gx ^ m0, m0);
-    qy = __vsub4(gy ^ m1, m1);
+// the first dot product of a chain: 4 byte products plus 0.  gfx1030-1032 have the three-operand v_dot4_i32_i8 (the accumulating v_dot4c needs the
+// accumulator zeroed first by a v_mov, one extra instruction per chain; the compiler picks the v_dot4c form for sdot4(a, b, 0)).
+__device__ __forceinline__ int i8_dot0(int a, int b) {
+#if defined(__gfx1030__) || defined(__gfx1031__) || defined(__gfx1032__)
+    int r;
+    __asm__("v_dot4_i32_i8 %0, %1, %2, 0" : "=v"(r) : "v"(a), "v"(b));
+    return r;
+#else
+    return ggml_cuda_dp4a(a, b, 0);
+#endif
 }
 
 // bytes of sub-block `ib` of the block at `bp` (the 256-value super-block, ib 0..7; Q2_0: the 64-value block, ib 0..1; IQ4_NL: the block)
@@ -80,23 +107,51 @@ __device__ __forceinline__ uint32_t i8_ld32(I8P p) { return *(const I8_AS i8_u32
 #else
 __device__ __forceinline__ uint32_t i8_ld32(I8P p) { return i8_ld16(p) | (i8_ld16(p + 2) << 16); }   // NVIDIA: a 32-bit load must be 4-byte aligned ("misaligned address" otherwise)
 #endif
+// per-thread byte offsets of the pieces of the thread's sub-block (the thread of sub-block wp of the stage's four), all relative to the expert's blob:
+// the row's start plus wp times the stride of the piece's family (8-byte, 4-byte, 1-byte pieces per sub-block; o_h: half a byte), see i8_load
+struct I8Off { uint32_t o8, o4, o1, oh, o0; };
 template <int T>
-__device__ __forceinline__ void i8_load(I8P bp, int ib, uint32_t (&r)[I8_NRAW]) {
-    if constexpr (T == 16 || T == 17 || T == 42) {
-        r[0] = i8_ld32(bp + 2 + 8 * ib); r[1] = i8_ld32(bp + 6 + 8 * ib); r[2] = i8_ld16(bp);
-        if constexpr (T == 17) r[3] = i8_ld8(bp + 66 + ib);
+__device__ __forceinline__ I8Off i8_offs(uint32_t row_off, int wp) {
+    I8Off o;
+    o.o0 = row_off;
+    o.o8 = row_off + 8 * wp;
+    o.o4 = row_off + 4 * wp;
+    o.o1 = row_off + wp;
+    o.oh = row_off + (wp >> 1);
+    if constexpr (T == 20) o.o4 = row_off + 18 * wp;                                   // IQ4_NL: the block of sub-block wp
+    if constexpr (T == 42) { o.o0 = row_off + (wp >> 1) * 18; o.o8 = o.o0 + 8 * (wp & 1); }   // Q2_0: block wp / 2, half wp % 2
+    return o;
+}
+// the stage's pieces.  Per stage the bases are uniform (scalar), the offsets per thread: super-block bi = st / 2 and half par = st % 2 of it
+// (ib = 4 par + wp); IQ4_NL: block 4 st + wp; Q2_0: block 2 st + wp / 2.
+template <int T>
+__device__ __forceinline__ void i8_load(I8P blob, const I8Off& of, int st, uint32_t (&r)[I8_NRAW]) {
+    const uint32_t bi = (uint32_t) st >> 1, par = (uint32_t) st & 1;
+    if constexpr (T == 16 || T == 17) {
+        constexpr uint32_t BB = T == 16 ? 66 : 74;
+        I8P a8 = blob + (bi * BB + 32 * par) + of.o8;
+        r[0] = i8_ld32(a8 + 2); r[1] = i8_ld32(a8 + 6); r[2] = i8_ld16(blob + (bi * BB) + of.o0);
+        if constexpr (T == 17) r[3] = i8_ld8(blob + (bi * BB + 4 * par) + of.o1 + 66);
+    } else if constexpr (T == 42) {
+        I8P a8 = blob + (36u * (uint32_t) st) + of.o8;
+        r[0] = i8_ld32(a8 + 2); r[1] = i8_ld32(a8 + 6); r[2] = i8_ld16(blob + (36u * (uint32_t) st) + of.o0);
     } else if constexpr (T == 22) {
-        r[0] = i8_ld32(bp + 2 + 4 * ib); r[1] = i8_ld32(bp + 34 + 4 * ib);
-        r[2] = i8_ld16(bp); r[3] = i8_ld8(bp + 66 + ib); r[4] = i8_ld8(bp + 74 + ib);
+        I8P a4 = blob + (bi * 82 + 16 * par) + of.o4, b1 = blob + (bi * 82 + 4 * par) + of.o1;
+        r[0] = i8_ld32(a4 + 2); r[1] = i8_ld32(a4 + 34);
+        r[2] = i8_ld16(blob + (bi * 82) + of.o0); r[3] = i8_ld8(b1 + 66); r[4] = i8_ld8(b1 + 74);
     } else if constexpr (T == 18) {
-        r[0] = i8_ld32(bp + 2 + 8 * ib); r[1] = i8_ld32(bp + 6 + 8 * ib); r[2] = i8_ld32(bp + 66 + 4 * ib); r[3] = i8_ld16(bp);
+        I8P a8 = blob + (bi * 98 + 32 * par) + of.o8, a4 = blob + (bi * 98 + 16 * par) + of.o4;
+        r[0] = i8_ld32(a8 + 2); r[1] = i8_ld32(a8 + 6); r[2] = i8_ld32(a4 + 66); r[3] = i8_ld16(blob + (bi * 98) + of.o0);
     } else if constexpr (T == 21) {
-        r[0] = i8_ld32(bp + 2 + 8 * ib); r[1] = i8_ld32(bp + 6 + 8 * ib); r[2] = i8_ld32(bp + 74 + 4 * ib);
-        r[3] = i8_ld16(bp); r[4] = i8_ld8(bp + 66 + ib); r[5] = i8_ld8(bp + 106 + ib / 2);
+        I8P a8 = blob + (bi * 110 + 32 * par) + of.o8, a4 = blob + (bi * 110 + 16 * par) + of.o4;
+        r[0] = i8_ld32(a8 + 2); r[1] = i8_ld32(a8 + 6); r[2] = i8_ld32(a4 + 74);
+        r[3] = i8_ld16(blob + (bi * 110) + of.o0); r[4] = i8_ld8(blob + (bi * 110 + 4 * par) + of.o1 + 66);
+        r[5] = i8_ld8(blob + (bi * 110 + 2 * par) + of.oh + 106);
     } else {   // IQ4_NL
+        I8P a = blob + (72u * (uint32_t) st) + of.o4;
 #pragma unroll
-        for (int k = 0; k < 4; ++k) r[k] = i8_ld32(bp + 2 + 4 * k);
-        r[4] = i8_ld16(bp);
+        for (int k = 0; k < 4; ++k) r[k] = i8_ld32(a + 2 + 4 * k);
+        r[4] = i8_ld16(a);
     }
 }
 template <int T>
@@ -131,17 +186,24 @@ __device__ __forceinline__ void i8_table16(uint32_t q4, const uint32_t (&t)[4], 
     hi = __byte_perm(tmp[0], tmp[1], 0x7531);
 }
 
+// 8 grid bytes with a sign pattern applied: t = {mask of the 4 low values, +1 of them, mask of the 4 high values, +1 of them}; per byte
+// (g ^ 0xFF) + 1 = 256 - g = -g for a negated value (g in 1..127, so no carry), g itself otherwise
+__device__ __forceinline__ void i8_signed8t(uint32_t gx, uint32_t gy, const uint4 t, uint32_t& qx, uint32_t& qy) {
+    qx = (gx ^ t.x) + t.y;
+    qy = (gy ^ t.z) + t.w;
+}
+
 // the sub-block as 8 words of 4 int8 (natural order), the integer scales of its values 0-15 (m0) and 16-31 (m1), and the float base
-// scale: value = base * m * q
+// scale: value = base * m * q.  sg = the sign table (shared memory) of the sign formats.
 template <int T>
-__device__ __forceinline__ void i8_convert(const uint32_t (&w)[5], const uint32_t* grid, const uint32_t (&kv)[4], uint32_t (&q)[8], int& m0,
-                                           int& m1, float& base) {
+__device__ __forceinline__ void i8_convert(const uint32_t (&w)[5], const uint32_t* grid, const uint4* sg, const uint32_t (&kv)[4], uint32_t (&q)[8],
+                                           int& m0, int& m1, float& base) {
     if constexpr (T == 16) {
         const uint2* g = (const uint2*) grid;
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
             const uint2 e = g[(w[0] >> (8 * l)) & 255];
-            i8_signed8(e.x, e.y, i8_ksigns(w[1] >> (7 * l)), q[2 * l], q[2 * l + 1]);
+            i8_signed8t(e.x, e.y, sg[(w[1] >> (7 * l)) & 127], q[2 * l], q[2 * l + 1]);
         }
         m0 = m1 = (int) ((w[1] >> 27) | 1);
         base = i8_half(w[2]) * 0.125f;
@@ -151,7 +213,7 @@ __device__ __forceinline__ void i8_convert(const uint32_t (&w)[5], const uint32_
         for (int l = 0; l < 4; ++l) {
             const uint32_t c = (w[l >> 1] >> (16 * (l & 1))) & 0xFFFF;
             const uint2 e = g[c & 511];
-            i8_signed8(e.x, e.y, i8_ksigns(c >> 9), q[2 * l], q[2 * l + 1]);
+            i8_signed8t(e.x, e.y, sg[c >> 9], q[2 * l], q[2 * l + 1]);
         }
         const uint32_t sc = w[2] >> 16;
         m0 = (int) (2 * (sc & 15) + 1);
@@ -163,7 +225,7 @@ __device__ __forceinline__ void i8_convert(const uint32_t (&w)[5], const uint32_
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
             const uint2 e = g[((w[0] >> (8 * l)) & 255) | ((qh << (8 - 2 * l)) & 0x300)];
-            i8_signed8(e.x, e.y, i8_bcast((w[1] >> (8 * l)) & 255), q[2 * l], q[2 * l + 1]);
+            i8_signed8t(e.x, e.y, sg[(w[1] >> (8 * l)) & 255], q[2 * l], q[2 * l + 1]);
         }
         const uint32_t sc = w[2] >> 24;
         m0 = (int) (2 * (sc & 15) + 1);
@@ -173,7 +235,7 @@ __device__ __forceinline__ void i8_convert(const uint32_t (&w)[5], const uint32_
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
             const uint32_t i0 = (w[l >> 1] >> (16 * (l & 1))) & 255, i1 = (w[l >> 1] >> (16 * (l & 1) + 8)) & 255;
-            i8_signed8(grid[i0], grid[i1], i8_ksigns(w[2] >> (7 * l)), q[2 * l], q[2 * l + 1]);
+            i8_signed8t(grid[i0], grid[i1], sg[(w[2] >> (7 * l)) & 127], q[2 * l], q[2 * l + 1]);
         }
         m0 = m1 = (int) (2 * (w[2] >> 28) + 1);
         base = i8_half(w[3]) * 0.25f;
@@ -182,8 +244,8 @@ __device__ __forceinline__ void i8_convert(const uint32_t (&w)[5], const uint32_
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
             const uint32_t i0 = (w[l >> 1] >> (16 * (l & 1))) & 255, i1 = (w[l >> 1] >> (16 * (l & 1) + 8)) & 255;
-            i8_signed8(grid[i0 | ((qh << (8 - 2 * l)) & 256)], grid[i1 | ((qh << (7 - 2 * l)) & 256)], i8_bcast((w[2] >> (8 * l)) & 255),
-                       q[2 * l], q[2 * l + 1]);
+            i8_signed8t(grid[i0 | ((qh << (8 - 2 * l)) & 256)], grid[i1 | ((qh << (7 - 2 * l)) & 256)], sg[(w[2] >> (8 * l)) & 255], q[2 * l],
+                        q[2 * l + 1]);
         }
         m0 = m1 = (int) (1 + 2 * (w[3] >> 24));
         base = i8_half(w[3]);
@@ -216,15 +278,16 @@ __device__ __forceinline__ const uint32_t* i8_grid_src() {
     else return nullptr;
 }
 
-// shared memory of an instance, in dwords: grid | stage weights x2 | stage activations x2 | integer scales x2 | float base scales x2 |
+// shared memory of an instance, in dwords: grid | sign table | stage weights x2 | stage activations x2 | scale records x2 |
 // activation scales x2 | source rows
 template <int T, int TM>
 struct I8Smem {
     static constexpr int BM = 16 * TM;
     static constexpr int GW = (i8_grid_words(T) + 3) / 4 * 4;
-    static constexpr int SZ_W = 64 * I8_LD, SZ_A = BM * I8_LD;
-    static constexpr int o_w = GW, o_a = o_w + 2 * SZ_W, o_m = o_a + 2 * SZ_A, o_wd = o_m + 2 * 256, o_ad = o_wd + 2 * 256,
-                         o_src = o_ad + 2 * BM * 4, total = (o_src + BM + 3) / 4 * 4;
+    static constexpr int SG = i8_sign_type(T) ? 1024 : 0;
+    static constexpr int SZ_W = 64 * I8_LD, SZ_A = BM * I8_LD, SZ_R = 64 * I8_RS, SZ_D = BM * 4;
+    static constexpr int o_sg = GW, o_w = o_sg + SG, o_a = o_w + 2 * SZ_W, o_r = o_a + 2 * SZ_A, o_d = o_r + 2 * SZ_R, o_src = o_d + 2 * SZ_D,
+                         total = (o_src + BM + 3) / 4 * 4;
     static constexpr size_t bytes = (size_t) total * 4;
 };
 
@@ -258,15 +321,15 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
           const int32_t* __restrict__ tile_off, const int32_t* __restrict__ ent_idx, const block_q8_1* __restrict__ A,
           block_q8_1* __restrict__ hq, float* __restrict__ out, NativeExpertLayout L, int bisect) {
     using SM = I8Smem<T, TM>;
-    constexpr int BM = SM::BM, NA = (BM * I8_LD + I8_NT - 1) / I8_NT;
+    constexpr int BM = SM::BM;
     extern __shared__ uint4 i8_dyn[];
     uint32_t* const smem = (uint32_t*) i8_dyn;
     uint32_t* const s_grid = smem;
+    uint32_t* const s_sg = smem + SM::o_sg;
     uint32_t* const s_w = smem + SM::o_w;
     uint32_t* const s_a = smem + SM::o_a;
-    uint32_t* const s_m = smem + SM::o_m;
-    float* const s_wd = (float*) (smem + SM::o_wd);
-    float* const s_ad = (float*) (smem + SM::o_ad);
+    uint32_t* const s_r = smem + SM::o_r;
+    float* const s_ad = (float*) (smem + SM::o_d);
     int* const s_src = (int*) (smem + SM::o_src);
 
     const int ng = *n_groups;
@@ -280,7 +343,8 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
     const int g = lo;
     const int e_lo = grp_start[g] + (ti - tile_off[g]) * BM;
     const int e_hi = min(grp_start[g + 1], e_lo + BM);
-    I8P blob = I8_GPTR(grp_ptr[g]);
+    const int nv = e_hi - e_lo;   // entries of this tile (the rest of the tile is empty)
+    I8P blob = i8_uniform(I8_GPTR(grp_ptr[g]));
     const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
 #if defined(STRATA_I8_DBG)
     if (tid == 0 && blockIdx.y == 0 && ti < 3)
@@ -296,6 +360,18 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
         const uint32_t* src = i8_grid_src<T>();
         for (int i = tid; i < i8_grid_words(T); i += I8_NT) s_grid[i] = src[i];
     }
+    if constexpr (i8_sign_type(T)) {   // entry b = tid: the 8 sign bits (the ksigns formats: 7 bits and their parity), as byte masks and +1s
+        const uint32_t b = (uint32_t) tid;
+        uint32_t sb = b;
+        if constexpr (T != 21 && T != 22) sb = (b & 127u) | (((uint32_t) __popc(b & 127u) & 1u) << 7);
+        uint32_t mlo = 0, mhi = 0;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            mlo |= ((sb >> k) & 1u) ? (0xFFu << (8 * k)) : 0u;
+            mhi |= ((sb >> (4 + k)) & 1u) ? (0xFFu << (8 * k)) : 0u;
+        }
+        *(uint4*) (s_sg + 4 * b) = make_uint4(mlo, mlo & 0x01010101u, mhi, mhi & 0x01010101u);
+    }
     uint32_t kv[4] = {0, 0, 0, 0};
     if constexpr (T == 20) {
         const uint32_t* t = (const uint32_t*) kvalues_iq4nl;
@@ -309,54 +385,44 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
 
     // the weight sub-block of this thread: row wr of the tile, 32 values wp of each stage
     const int wr = tid >> 2, wp = tid & 3;
-    I8P wrow;
-    if constexpr (GU) wrow = blob + (wr >= 32 ? L.up_off : (size_t) 0) + (size_t) (blockIdx.y * 32 + (wr & 31)) * wrb;
-    else wrow = blob + L.down_off + (size_t) (blockIdx.y * 64 + wr) * wrb;
-    // the activation dwords of this thread: item it of the stage's BM rows x 36 dwords
-    const uint32_t* const Ad = (const uint32_t*) A;
-    const int arow_dw = (K / 32) * 9;
-    int a_off[NA], a_dst[NA];
-#pragma unroll
-    for (int q = 0; q < NA; ++q) {
-        const int it = tid + q * I8_NT;
-        if (it >= BM * 36) { a_off[q] = -1; a_dst[q] = 0x7fffffff; continue; }
-        const int mr = it / 36, d = it - mr * 36, blk = d / 9, k9 = d - blk * 9;
-        const int src = s_src[mr];
-        a_off[q] = src >= 0 ? src * arow_dw + d : -1;
-        a_dst[q] = k9 == 0 ? ~(mr * 4 + blk) : mr * I8_LD + blk * 8 + (k9 - 1);
+    uint32_t row_off;
+    if constexpr (GU) row_off = (uint32_t) ((wr >= 32 ? L.up_off : (size_t) 0) + (size_t) (blockIdx.y * 32 + (wr & 31)) * wrb);
+    else row_off = (uint32_t) (L.down_off + (size_t) (blockIdx.y * 64 + wr) * wrb);
+    const I8Off woff = i8_offs<T>(row_off, wp);
+    // the activation blocks of this thread (the first 4 BM threads, a whole number of waves): q8_1 block (tid & 3) of row (tid >> 2) of the tile, 9 dwords
+    I8P const abase = I8_GPTR(A);
+    const bool a_thr = tid < 4 * BM;
+    uint32_t a_vo = 0;
+    if (a_thr) {
+        const int src = s_src[tid >> 2];
+        a_vo = (uint32_t) ((size_t) (src >= 0 ? src : 0) * (size_t) ((K / 32) * 36) + (size_t) (tid & 3) * 36);
     }
 
-    auto load_w = [&](int st, uint32_t (&r)[I8_NRAW]) {
-        const int sb = st * 4 + wp;
-        int bi, ib;
-        if constexpr (i8_block_vals(T) == 256) { bi = sb >> 3; ib = sb & 7; }
-        else if constexpr (i8_block_vals(T) == 64) { bi = sb >> 1; ib = sb & 1; }
-        else { bi = sb; ib = 0; }
-        i8_load<T>(wrow + (size_t) bi * i8_block_bytes(T), ib, r);
-    };
+    auto load_w = [&](int st, uint32_t (&r)[I8_NRAW]) { i8_load<T>(blob, woff, st, r); };
     auto store_w = [&](int b, int st, const uint32_t (&r)[I8_NRAW]) {
         uint32_t q[8], w[5];
         int m0, m1;
         float base;
         i8_pack<T>(r, (st * 4 + wp) & 7, w);   // (ib of a 256-value super-block; only IQ3_S reads it)
-        i8_convert<T>(w, s_grid, kv, q, m0, m1, base);
+        i8_convert<T>(w, s_grid, (const uint4*) s_sg, kv, q, m0, m1, base);
         uint4* dst = (uint4*) (s_w + b * SM::SZ_W + wr * I8_LD + wp * 8);
         dst[0] = make_uint4(q[0], q[1], q[2], q[3]);
         dst[1] = make_uint4(q[4], q[5], q[6], q[7]);
-        s_m[b * 256 + wr * 4 + wp] = (uint32_t) (m0 & 0xff) | ((uint32_t) (m1 & 0xff) << 8);
-        s_wd[b * 256 + wr * 4 + wp] = base;
+        *(uint4*) (s_r + b * SM::SZ_R + wr * I8_RS + wp * 4) = make_uint4((uint32_t) m0, (uint32_t) m1, __float_as_uint(base), 0u);
     };
-    auto load_a = [&](int st, uint32_t (&ar)[NA]) {
+    auto load_a = [&](int st, uint32_t (&ar)[9]) {
+        if (a_thr) {
+            I8P p = abase + (size_t) st * 144 + a_vo;
 #pragma unroll
-        for (int q = 0; q < NA; ++q) ar[q] = Ad[max(a_off[q], 0) + st * 36];   // an unused slot reads row 0 (never stored): no divergent branch per load
+            for (int k = 0; k < 9; ++k) ar[k] = i8_ldw(p + 4 * k);
+        }
     };
-    auto store_a = [&](int b, const uint32_t (&ar)[NA]) {
-#pragma unroll
-        for (int q = 0; q < NA; ++q) {
-            const int d = a_dst[q];
-            if (d == 0x7fffffff) continue;
-            if (d >= 0) s_a[b * SM::SZ_A + d] = ar[q];
-            else s_ad[b * BM * 4 + ~d] = i8_half(ar[q] & 0xFFFFu);
+    auto store_a = [&](int b, const uint32_t (&ar)[9]) {
+        if (a_thr) {
+            uint4* d = (uint4*) (s_a + b * SM::SZ_A + (tid >> 2) * I8_LD + (tid & 3) * 8);
+            d[0] = make_uint4(ar[1], ar[2], ar[3], ar[4]);
+            d[1] = make_uint4(ar[5], ar[6], ar[7], ar[8]);
+            s_ad[b * SM::SZ_D + tid] = i8_half(ar[0] & 0xFFFFu);
         }
     };
 
@@ -366,7 +432,9 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
 #pragma unroll
         for (int i = 0; i < 4; ++i) acc[j][i] = 0.0f;
 
-    uint32_t wraw[I8_NRAW], ar[NA];
+    uint32_t wraw[I8_NRAW], ar[9];
+#pragma unroll
+    for (int k = 0; k < 9; ++k) ar[k] = 0;
     load_w(0, wraw);
     if (bisect == 4) { if (wraw[0] == 0x12345678u) out[0] = 0.0f; return; }
     load_a(0, ar);
@@ -381,48 +449,47 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
         if (st + 1 < ns) { load_w(st + 1, wraw); load_a(st + 1, ar); }
         const uint32_t* const W = s_w + b * SM::SZ_W;
         const uint32_t* const Ab = s_a + b * SM::SZ_A;
+        const uint32_t* const Rb = s_r + b * SM::SZ_R;
+        const float* const Db = s_ad + b * SM::SZ_D;
         I8_PRAGMA_UNROLL(I8_BLK_UNROLL)
         for (int blk = 0; blk < 4; ++blk) {
-            int m0[4], m1[4];
-            float bw[4];
-            uint4 wv[4][2];
+            uint4 rc[4], wv[4][2];
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 const int row = tx + 16 * i;
-                const uint32_t mm = s_m[b * 256 + row * 4 + blk];
-                m0[i] = (int) (int8_t) (mm & 0xff);
-                m1[i] = (int) (int8_t) ((mm >> 8) & 0xff);
-                bw[i] = s_wd[b * 256 + row * 4 + blk];
+                rc[i] = *(const uint4*) (Rb + row * I8_RS + blk * 4);
                 wv[i][0] = *(const uint4*) (W + row * I8_LD + blk * 8);
                 wv[i][1] = *(const uint4*) (W + row * I8_LD + blk * 8 + 4);
             }
 #pragma unroll
             for (int j = 0; j < TM; ++j) {
+                if (16 * j >= nv) break;   // uniform: the 16-entry slices at and beyond nv hold no entry of this tile (the loop is unrolled: a forward branch)
                 const int arow = ty + 16 * j;
-                const float ax = s_ad[b * BM * 4 + arow * 4 + blk];
+                const float ax = Db[arow * 4 + blk];
                 const uint4 a0 = *(const uint4*) (Ab + arow * I8_LD + blk * 8);
                 const uint4 a1 = *(const uint4*) (Ab + arow * I8_LD + blk * 8 + 4);
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
-                    int s0 = ggml_cuda_dp4a((int) wv[i][0].x, (int) a0.x, 0);
+                    int s0 = i8_dot0((int) wv[i][0].x, (int) a0.x);
                     s0 = ggml_cuda_dp4a((int) wv[i][0].y, (int) a0.y, s0);
                     s0 = ggml_cuda_dp4a((int) wv[i][0].z, (int) a0.z, s0);
                     s0 = ggml_cuda_dp4a((int) wv[i][0].w, (int) a0.w, s0);
                     int t;
                     if constexpr (i8_two_scales(T)) {
-                        int s1 = ggml_cuda_dp4a((int) wv[i][1].x, (int) a1.x, 0);
+                        int s1 = i8_dot0((int) wv[i][1].x, (int) a1.x);
                         s1 = ggml_cuda_dp4a((int) wv[i][1].y, (int) a1.y, s1);
                         s1 = ggml_cuda_dp4a((int) wv[i][1].z, (int) a1.z, s1);
                         s1 = ggml_cuda_dp4a((int) wv[i][1].w, (int) a1.w, s1);
-                        t = __mul24(s0, m0[i]) + __mul24(s1, m1[i]);   // |s * m| < 8.0e6 < 2^23 for every format (IQ3_XXS: 32 x 62 x 127 x 31): exact; v_mad_i32_i24 instead of the quarter-rate 32-bit multiplies
+                        t = __mul24(s1, (int) rc[i].y) + __mul24(s0, (int) rc[i].x);   // |s * m| < 8.0e6 < 2^23 for every format (IQ3_XXS: 32 x 62 x 127 x 31): exact; v_mul_i32_i24 + v_mad_i32_i24
                     } else {
                         s0 = ggml_cuda_dp4a((int) wv[i][1].x, (int) a1.x, s0);
                         s0 = ggml_cuda_dp4a((int) wv[i][1].y, (int) a1.y, s0);
                         s0 = ggml_cuda_dp4a((int) wv[i][1].z, (int) a1.z, s0);
                         s0 = ggml_cuda_dp4a((int) wv[i][1].w, (int) a1.w, s0);
-                        t = __mul24(s0, m0[i]);
+                        if constexpr (i8_unit_scale(T)) t = s0;
+                        else t = __mul24(s0, (int) rc[i].x);
                     }
-                    acc[j][i] = fmaf((float) t, bw[i] * ax, acc[j][i]);
+                    acc[j][i] = fmaf((float) t, __uint_as_float(rc[i].z) * ax, acc[j][i]);
                 }
             }
         }
@@ -436,6 +503,7 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
         const int nb = (int) (L.n_ff / 32);
 #pragma unroll
         for (int j = 0; j < TM; ++j) {
+            if (16 * j >= nv) break;   // uniform
             const int e = e_lo + ty + 16 * j;
             const float g0 = acc[j][0], g1 = acc[j][1];
             const float h0 = (g0 / (1.0f + __expf(-g0))) * acc[j][2];

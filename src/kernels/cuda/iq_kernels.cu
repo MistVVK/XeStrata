@@ -6241,7 +6241,7 @@ void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
 
 bool native_expert_i8_supported(const NativeExpertLayout& L) noexcept {
     return i8_gu_type(L.gu_type) && i8_d_type(L.d_type) && !L.gu_nib && L.tail_off == 0 && L.had_block == 0 && L.n_embd % 256 == 0 &&
-           L.n_ff % 128 == 0 && L.n_embd % 64 == 0;
+           L.n_ff % 128 == 0 && L.n_embd % 64 == 0 && L.bytes < ((size_t) 1 << 32);   // 32-bit byte offsets inside one expert's blob
 }
 
 void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
@@ -6250,6 +6250,11 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
     if (cap_groups <= 0 || cap_entries <= 0) return;
     if (!native_expert_i8_supported(L)) {
         std::fprintf(stderr, "native_expert_i8: gate/up type %d, down type %d at %lld x %lld is not covered\n", L.gu_type, L.d_type,
+                     (long long) L.n_embd, (long long) L.n_ff);
+        std::exit(1);
+    }
+    if ((size_t) cap_entries * (size_t) (std::max(L.n_embd, L.n_ff) / 32 * 36) >= ((size_t) 1 << 32)) {   // 32-bit byte offsets of the activation rows
+        std::fprintf(stderr, "native_expert_i8: %lld entries at %lld x %lld exceed 4 GiB of activation rows\n", (long long) cap_entries,
                      (long long) L.n_embd, (long long) L.n_ff);
         std::exit(1);
     }
