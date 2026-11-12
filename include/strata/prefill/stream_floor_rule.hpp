@@ -7,7 +7,9 @@
 // against 1,110 ms for 1,100 tokens on the streamed walk: par/RESULTS-STRIX-SHORT.md).  The streamed walk reads 128 to 1,000 tokens 3.6 to 4.4 times sooner there.
 //
 // The rule: the default floor is 1,024 (kStreamAllMinDefault in prefill.cpp, measured on a discrete card).  For a layer set in which EVERY layer has no MMQ tile and takes the
-// fused kernels, on a class of device where that was measured (today: Windows gfx1151 only), the floor is kFusedOnlyFloor.  STRATA_PREFILL_STREAM_MIN, set to any value,
+// fused kernels, on a class of device where that was measured (today: Windows gfx1151 only), the staged walk has a fused entry for such layers (staged_fo_rule.hpp, on by default on
+// that class: pieces below 1,024 tokens 5x faster than the FP16 path, 1.03 to 1.23x faster than the long path from 96 to 1,000 tokens) and the floor stays 1,024; with the entry off
+// (STRATA_PF_STAGED_FO=0) the floor is kFusedOnlyFloor, which sends pieces of 64 tokens and more to the streamed walk.  STRATA_PREFILL_STREAM_MIN, set to any value,
 // replaces the floor (1024 restores the old rule); the CPU share's own limit (g_stream_min_share) keeps precedence where it applies.  Pure: no GPU, no environment read here.
 #pragma once
 
@@ -16,11 +18,12 @@
 namespace strata::prefill {
 
 inline constexpr int64_t kStreamFloorDefault = 1024;
-inline constexpr int64_t kFusedOnlyFloor = 64;   // the streamed walk is faster at every size measured from 96 up (par/RESULTS-STRIX-SHORT.md); the server reads pieces of up to 64 tokens through the verify windows (--short-read 64) and longer ones batched
+inline constexpr int64_t kFusedOnlyFloor = 64;   // the streamed walk is faster than the FP16 path at every size measured from 96 up (par/RESULTS-STRIX-SHORT.md); the server reads pieces of up to --short-read tokens through the verify windows and longer ones batched
 
 /// `class_measured`: the device class this default was measured on (Windows gfx1151).  `all_layers_fused_only`: the layer set has no MMQ tile and the fused kernels take every layer.
-constexpr int64_t stream_floor_default(bool class_measured, bool all_layers_fused_only) {
-    return class_measured && all_layers_fused_only ? kFusedOnlyFloor : kStreamFloorDefault;
+/// `staged_entry`: the staged walk takes such layers on its fused group entry (staged_fo_rule.hpp), so the old FP16 path below the floor is gone and the floor needs no lowering.
+constexpr int64_t stream_floor_default(bool class_measured, bool all_layers_fused_only, bool staged_entry) {
+    return class_measured && all_layers_fused_only && !staged_entry ? kFusedOnlyFloor : kStreamFloorDefault;
 }
 
 }  // namespace strata::prefill

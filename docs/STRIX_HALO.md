@@ -153,7 +153,7 @@ measured there.
 
 | Switch | What it does |
 | --- | --- |
-| `STRATA_PREFILL_STREAM_MIN=N` | `STRATA_PF_FUSED=1` reaches only chunks of N tokens or more (1,024 by default, the floor measured on a discrete card). On Windows a UD-Q4_K_XL set takes 64 by itself (prompt pieces of 96 to 1,000 tokens read 3.6 to 4.4 times sooner); other sets keep 1,024, and a smaller N is opt-in. |
+| `STRATA_PREFILL_STREAM_MIN=N` | `STRATA_PF_FUSED=1` reaches only chunks of N tokens or more (1,024 by default, the floor measured on a discrete card). On Windows a UD-Q4_K_XL set reads pieces below 1,024 tokens on the fused kernels' staged entry by itself (pieces of 96 to 1,000 tokens read 3.8 to 5.2 times sooner than on the old path; `STRATA_PF_STAGED_FO=0` gives the long-prompt path from 64 tokens instead, 3.6 to 4.5 times sooner); other sets keep 1,024, and a smaller N is opt-in. |
 | `STRATA_PF_FUSED_KQ=1` | A UD-Q4_K_XL or other K-quant pack takes the fused experts only with this as well. |
 | `STRATA_PF_F16=1` (gfx11 only) | Runs the covered prompt experts on the F16 matrix cores instead of the int8 ones. It rounds differently from the int8 kernels. |
 | `STRATA_REFILL_PARTS=1` (exact; HIP and CUDA, a GGUF read in place) | Refills the expert-cache slots a prompt borrowed straight from the GGUF mapping instead of through an assembled 4 MB copy per expert. Only gfx1151 has measured it. |

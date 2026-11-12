@@ -8,6 +8,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/prefill/pf_fused_override.hpp"
 #include "strata/prefill/staged_group_rule.hpp"
+#include "strata/prefill/staged_fo_rule.hpp"
 #include "strata/prefill/stream_floor_rule.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/prefill/fewrows.hpp"
@@ -336,7 +337,7 @@ constexpr int64_t kStreamAllMinDefault = 1024;   // the default above (and the C
 int64_t g_stream_min_share = 0;
 // A layer set in which EVERY layer has no MMQ tile for its formats and the fused kernels take it (UD-Q4_K_XL's Q4_K / Q5_K gate/up with a Q5_1 / Q8_0 down: STRATA_MMQ_KQ is
 // opt-in, so mmq::fits is false; the same test mmq_plan() makes, p.fo).  Its chunks below the floor take the staged walk, which has no fused entry for such a layer
-// (fz_staged needs use_mmq) and runs every routed expert on the dequantize-to-FP16 path: about 1.6 s a prompt whatever its length (stream_floor_rule.hpp).
+// (fz_staged needs use_mmq, or the staged entry for fused-only layers: STRATA_PF_STAGED_FO, on by default on the class below) and without it runs every routed expert on the dequantize-to-FP16 path: about 1.6 s a prompt whatever its length (stream_floor_rule.hpp).
 inline bool layers_all_fused_only() {
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (!lay.native || lay.fmt.empty()) return false;
@@ -372,6 +373,22 @@ inline bool stream_floor_class_measured() {
     return false;
 #endif
 }
+// The staged walk's group entry (fz_staged) also takes a layer with no MMQ tile that the fused kernels cover (mmq_plan().fo), routed experts only, so a prompt chunk below the long-prompt
+// floor does not run each routed expert on the dequantize + FP16 GEMM path (staged_fo_rule.hpp).  STRATA_PF_STAGED_FO=1 asks for it on any card (research), 0 turns it off; unset: on where it was
+// measured (Windows gfx1151 with a layer set that is fused-only on every layer, and the entry's own prerequisites: the staged walk's resident-group gather and its group entry).  Decided once when
+// the expert layout is known (a call before that answers from the variable alone and is not cached).
+inline bool staged_fo_on() {
+    static std::atomic<int> cached{-1};
+    const int c = cached.load(std::memory_order_acquire);
+    if (c >= 0) return c == 1;
+    const char* env = std::getenv("STRATA_PF_STAGED_FO");
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || lay.fmt.empty()) return strata::prefill::staged_fo_switch(env);
+    const bool cls = stream_floor_class_measured();
+    const bool v = strata::prefill::staged_fo_decide(env, cls && layers_all_fused_only() && staged_group_gather() && staged_group_entry_on());
+    cached.store(v ? 1 : 0, std::memory_order_release);
+    return v;
+}
 // The floor without STRATA_PREFILL_STREAM_MIN and the CPU share: stream_floor_rule.hpp's answer, decided once when the expert layout is known (a call before that gets the default and is not cached).
 inline int64_t default_stream_floor() {
     static std::atomic<int64_t> cached{-1};
@@ -380,7 +397,7 @@ inline int64_t default_stream_floor() {
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (!lay.native || lay.fmt.empty()) return strata::prefill::kStreamFloorDefault;
     const bool cls = stream_floor_class_measured();
-    const int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only());
+    const int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only(), staged_fo_on());
     cached.store(v, std::memory_order_release);
     if (v != strata::prefill::kStreamFloorDefault)
         std::fprintf(stderr, "prefill: prompt pieces of %lld tokens or more read on the fused kernels, as long prompts do. STRATA_PREFILL_STREAM_MIN=1024 keeps the old rule.\n", (long long) v);
@@ -2979,6 +2996,12 @@ void Prefill::set_ring_budget(int slots, int64_t small_max) {
 }
 double Prefill::pinned_share() { return g_pinned_share; }
 int64_t Prefill::stream_all_min_tokens() { return stream_all_min(); }
+int64_t Prefill::short_read_default(int64_t base) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || lay.fmt.empty()) return base;
+    const bool cls = stream_floor_class_measured();
+    return strata::prefill::short_read_default(base, cls, cls && layers_all_fused_only(), staged_fo_on());
+}
 
 // --prefill-pipe (opt-in; STRATA_PREFILL_PIPE): a layer split reads a prompt as a pipeline - stage s reads chunk c while
 // stage s+1 reads chunk c-1. A stage-chunk costs its layers x (b + a C): a fixed part per chunk (b: the pass over the
@@ -5466,7 +5489,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // src_dev, the groups' relative bounds MMQ's own, H into H, the down rows into Dm at the group's rows (the combine is MMQ's).
                         // The staging is the resident groups' (STAGE_GRP slots held until the group's launch).  Not with the CPU share, a peer,
                         // STRATA_MMQ_DIRECT / _WS, the WMMA tiles, STRATA_PF_GROUP_SCRATCH, NVFP4 tails, Hadamard-folded or nibble layers.
-                        const bool fz_staged = !stream_all && use_mmq && lay.native && !fused_l && !wmma_l && !had_gu && !had_d && rows_cpu == 0 &&
+                        const bool fz_staged = !stream_all && strata::prefill::staged_entry_layer(use_mmq, fused_only, staged_fo_on()) && lay.native && !fused_l && !wmma_l && !had_gu && !had_d && rows_cpu == 0 &&
                                                on_peer.empty() && !m.pp && m.group_cap == 0 && !lay.fmt[(size_t) l].tail_off && ws::mode() == 0 &&
                                                !(m.cache && mmq_plan().direct[(size_t) l]) && staged_group_gather() && staged_group_entry_on() &&
                                                MMQ_GROUP <= mmq::kGatherGroupMax && MMQ_GROUP <= fused::kMaxBatch &&
@@ -5479,9 +5502,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const float* xsrc = m.mixed;
                         if (fz_staged) {
                             fz_staged_l = true;
+                            if (!use_mmq) {   // a fused-only layer (the class default, or STRATA_PF_STAGED_FO=1): said once
+                                static bool said_fo = false;
+                                if (!said_fo) {
+                                    said_fo = true;
+                                    std::fprintf(stderr, "strata prefill: a layer with no MMQ tile reads prompt pieces below %lld tokens on the fused kernels' staged group "
+                                                         "entry, routed experts only. STRATA_PF_STAGED_FO=0 keeps the old rule.\n", (long long) stream_all_min());
+                                }
+                            }
                             fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
                         }
-                        if (use_mmq) {
+                        if (use_mmq || fz_staged) {   // (fz_staged without use_mmq: a fused-only layer with the entry on (staged_fo_on(), staged_fo_rule.hpp); the block builds the group bounds)
                             // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed` (APR:
                             // from its rotated copy `Xr`): each token quantized once and written to its K rows
                             // (slot_dev, the inverse of src_dev).
@@ -5917,7 +5948,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // then STAGE_GRP slots, two groups, and it stages no further ahead than the open group allows,
                         // so a group's staged slots stay unread-over until its flush (one wait on the last copy, one
                         // event releasing them all, as in the streamed walk).
-                        const bool group_resident = group_env && !stream_all && use_mmq && lay.native &&
+                        const bool group_resident = group_env && !stream_all && (use_mmq || fz_staged) && lay.native &&
                                                     MMQ_GROUP <= mmq::kGatherGroupMax;
                         const bool gg_now = group_gather || group_resident;
                         const int stage_n = group_resident ? STAGE_GRP : STAGE;

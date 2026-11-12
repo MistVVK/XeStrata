@@ -996,6 +996,7 @@ struct Options {
     /// result) goes through the verify windows, S tokens at a time, instead of the batched prompt path (0 = always
     /// the batched path)
     int64_t short_read = 64;
+    bool short_read_set = false;       // --short-read given: the class default (Prefill::short_read_default) does not apply
     bool prefill_head_alias = false;   // lend the native output head's VRAM to prompt buffers between request phases
     /// --pipeline-windows N (--serve, a layer split on exactly two GPUs; opt-in): 1 = a prompt's short reads through
     /// the verify windows run with the stages overlapped (stage 0 reads window K+1 while stage 1 reads window K);
@@ -1180,7 +1181,8 @@ void usage() {
                  "  --tail-role-token ID --serve: a turn of this role right before the last turn is left out of\n"
                  "                       the conversation checkpoint (a trailing effort turn; default -1 = off)\n"
                  "  --short-read N       --serve: read at most N fresh text tokens through the decode windows instead\n"
-                 "                       of the batched prompt path (default 64, 0 = off)\n"
+                 "                       of the batched prompt path (default 64, or 24 on Windows Strix Halo with a\n"
+                 "                       UD-Q4_K_XL set, where the batched path is quicker from 26 tokens; 0 = off)\n"
                  "  --prefill-head-alias --serve: unload the native output head while each fresh prompt is read,\n"
                  "                       then release prompt buffers and reload it before decode\n"
                  "  --suffix-draft N     prompt lookup: draft from an earlier repeat of the last N+ tokens of context\n"
@@ -3786,7 +3788,7 @@ int main(int argc, char** argv) {
         else if (a == "--prompt-cache-root") o.prompt_cache_root = std::max(0LL, std::atoll(next("--prompt-cache-root")));
         else if (a == "--turn-token") o.turn_token = std::atoll(next("--turn-token"));
         else if (a == "--tail-role-token") o.tail_role_token = std::atoll(next("--tail-role-token"));
-        else if (a == "--short-read") o.short_read = std::max(0LL, std::atoll(next("--short-read")));
+        else if (a == "--short-read") { o.short_read = std::max(0LL, std::atoll(next("--short-read"))); o.short_read_set = true; }
         else if (a == "--prefill-head-alias") o.prefill_head_alias = true;
         else if (a == "--pipeline-windows") o.pipeline_windows = std::max(0, std::min(2, std::atoi(next("--pipeline-windows"))));
         else if (a == "--suffix-draft") o.suffix_draft = std::max(0, std::atoi(next("--suffix-draft")));
@@ -12298,6 +12300,8 @@ int main(int argc, char** argv) {
         // the verify windows after the batched part).  The retry reads that tail batched (--short-read 0 for one request):
         // a reporter's prompts failed there every time and passed with --short-read 0.
         bool nf_prompt_windows = false, short_read_off_once = false;
+        // --short-read's default (64) is a class default where the staged fused entry takes the pieces the windows would otherwise read (Prefill::short_read_default); the user's own value wins
+        if (!o.short_read_set) o.short_read = strata::prefill::Prefill::short_read_default(o.short_read);
         std::vector<ConvCheckpoint> checks;
         // KVA: which prefixes of token ids a KVA read approximated, so the draft layer knows, for whatever state a request
         // continues from, the first cell built from a real row (kva_floor.hpp).  Empty without KVA.
