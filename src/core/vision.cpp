@@ -10,10 +10,11 @@
 // patch and a GELU (tanh) MLP; after the DeepStack layers a merger of 4 patches (LayerNorm over the 4, GELU (erf) MLP),
 // and at the end the final LayerNorm per patch and the same merger.
 //
-// On the CPU (open_cpu) the same steps run in FP32 rows, every product's weight packed in BF16 when the file is read
-// (kernels/cpu/cpu_ops.hpp's bf16_linear) and the attention's two products the same way (kernels/cpu/vision_cpu.hpp);
-// with XESTRATA_VISION_CPU_I8=1 the products are W8A8 instead (the weights int8 when the file is read, a scale per
-// kCpuI8Block inputs of an output; the activations quantized a row at a time: i8_linear).
+// On the CPU (open_cpu) the same steps run in FP32 rows, every product's weight packed as int8 when the file is read
+// and the products W8A8 (the weights int8, a scale per kCpuI8Block inputs of an output; the activations quantized a row
+// at a time: i8_linear); with XESTRATA_VISION_CPU_I8=0 the weights are packed in BF16 instead and the products are
+// bf16_linear (kernels/cpu/cpu_ops.hpp), the attention's two products the same way (kernels/cpu/vision_cpu.hpp), the
+// closer form.
 
 #include "strata/core/vision.hpp"
 #include "strata/image/qi_gguf.hpp"
@@ -165,7 +166,7 @@ bool Vision::open_cpu(const std::string& path, int threads, std::string& err) {
     const std::vector<int> cores = kernels::cpu::physical_cores(false);
     if (pool_->workers() > 0 && !cores.empty()) host_cpu_ = cores[0];
     const char* e = strata::env_get("VISION_CPU_I8");
-    i8_ = e != nullptr && std::strcmp(e, "1") == 0;
+    i8_ = e == nullptr || std::strcmp(e, "0") != 0;   // the default: the int8 products; =0 the BF16 ones
     isa_ = kernels::cpu::i8_gemm_isa();
     return read(path, err);
 }

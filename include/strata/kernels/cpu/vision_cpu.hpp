@@ -7,17 +7,17 @@
 //
 // THE ATTENTION.  Per head, the keys and the transposed values are packed as BF16 panels once a layer; a piece of
 // query rows then takes its scores (FP32 queries against the BF16 keys), the softmax in FP32 and the weighted values
-// (the FP32 probabilities against the BF16 values), and divides by the softmax's sum.  The opt-in int8 form
-// (XESTRATA_VISION_CPU_I8=1, core/vision.hpp) packs them as int8 instead (the keys a scale a key, the values a scale
-// per kVisionAttnBlock keys) and quantizes the queries and the probabilities the same way before i8_gemm_rows; keys
-// past kI8MaxIn go in more than one chunk of the value product, summed.
+// (the FP32 probabilities against the BF16 values), and divides by the softmax's sum.  The int8 form (the default;
+// XESTRATA_VISION_CPU_I8=0 takes this BF16 one, core/vision.hpp) packs them as int8 instead (the keys a scale a key,
+// the values a scale per kVisionAttnBlock keys) and quantizes the queries and the probabilities the same way before
+// i8_gemm_rows; keys past kI8MaxIn go in more than one chunk of the value product, summed.
 //
-// WHY BF16 AND NOT INT8, though the products of int8 (i8_gemm.hpp) were two times faster on an AVX2 CPU: the reader's
-// embeddings must stay as close to llama.cpp's mtmd as the readers already shipped are to it (mtmd on the CPU against
-// mtmd on Vulkan: a mean cosine of 0.99971 per image token).  With W8A8 products everywhere they came to 0.99637, and
-// every product moved back to BF16 helped a little, none much; only all of them in BF16 came to 0.99978.  Measured on
-// a Ryzen 7 5700X, 8 threads, 9 pictures of 1,024 tokens, 2026-11-12: int8 5.3 s a picture, BF16 9.5 s, mtmd 10.9 s.
-// So BF16 is the default and int8 an opt-in for whom the speed is worth the distance.
+// WHY THE INT8 DEFAULT AND WHAT =0 KEEPS: the int8 products (i8_gemm.hpp) are about twice as fast on an AVX2 CPU,
+// but their embeddings stand further from llama.cpp's mtmd (mtmd on the CPU against mtmd on Vulkan: a mean cosine of
+// 0.99971 per image token).  With W8A8 products everywhere the mean cosine came to 0.99637; with every product in
+// BF16 it came to 0.99978.  Measured on a Ryzen 7 5700X, 8 threads, 9 pictures of 1,024 tokens, 2026-11-12: int8
+// 5.3 s a picture, BF16 9.5 s, mtmd 10.9 s; the answers to 36 questions: int8 18 at 300 tokens / 28 at 1,024, BF16
+// 19 / 26.  The user chose the speed for the default (2026-11-12); XESTRATA_VISION_CPU_I8=0 keeps the closer form.
 #pragma once
 
 #include "strata/kernels/cpu/cpu_ops.hpp"

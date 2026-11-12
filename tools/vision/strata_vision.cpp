@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // tools/vision/strata_vision.cpp - the chat's picture reader: the vision encoder the image engine shares
 // (strata/core/vision.hpp: Qwen3-VL's ViT and its merger from the model's mmproj GGUF), on the GPU with --gpu and on
-// the CPU without (BF16 products on --threads threads, default one a core; int8 ones with XESTRATA_VISION_CPU_I8=1).  The protocol is the one llama.cpp's mtmd
-// reader spoke before it, so serve and the engines do not change:
+// the CPU without (int8 products by default, BF16 with XESTRATA_VISION_CPU_I8=0, on --threads threads, default one a
+// core).  The protocol is the one llama.cpp's mtmd reader spoke before it, so serve and the engines do not change:
 //
 //   xestrata-vision --mmproj <mmproj.gguf> [--model <text model, for a config that names it: not read>]
 //                   [--gpu] [--gpu-pci ADDR] [--threads N] [--max-tokens N] [--min-tokens N]

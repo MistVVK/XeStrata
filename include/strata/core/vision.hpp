@@ -4,10 +4,10 @@
 // ViT and its merger, from the model's mmproj GGUF, on the GPU (open) or on the CPU (open_cpu: the chat's reader on a
 // machine without a GPU to spare).  A picture (RGB in -1 .. 1, sides multiples of 32) to the text model's image
 // embeddings, one per 32 x 32 pixels (2 x 2 patches merged), and the DeepStack ones the text encoder adds after its
-// first layers.  The two share the reading of the file, the patches and the positions; the CPU's products take the
-// weights in BF16 and the activations in FP32 (kernels/cpu/bf16_gemm.hpp; why not int8: kernels/cpu/vision_cpu.hpp),
-// or with XESTRATA_VISION_CPU_I8=1 int8 both (W8A8, kernels/cpu/i8_gemm.hpp): about twice as fast and further from the
-// reference.
+// first layers.  The two share the reading of the file, the patches and the positions; the CPU's products take int8
+// weights and activations by default (W8A8, kernels/cpu/i8_gemm.hpp: about twice as fast and further from the
+// reference), or with XESTRATA_VISION_CPU_I8=0 BF16 weights (kernels/cpu/bf16_gemm.hpp) and FP32 activations, the
+// closer form (kernels/cpu/vision_cpu.hpp).
 #pragma once
 
 #include "strata/kernels/cpu/vision_cpu.hpp"
@@ -40,10 +40,11 @@ public:
 
     /// Reads the mmproj GGUF and puts its weights on the current GPU (`dry`: the sizes only).
     bool open(const std::string& path, void* stream, std::string& err, bool dry = false);
-    /// Reads the mmproj GGUF for the CPU: the products' weights packed in BF16, `threads` threads (the caller
-    /// included) to run on.  The CPU must have AVX2 (kernels/cpu/expert_layout.hpp's cpu_avx2_ok).
+    /// Reads the mmproj GGUF for the CPU: the products' weights packed as int8 (XESTRATA_VISION_CPU_I8=0: in BF16),
+    /// `threads` threads (the caller included) to run on.  The CPU must have AVX2 (kernels/cpu/expert_layout.hpp's
+    /// cpu_avx2_ok).
     bool open_cpu(const std::string& path, int threads, std::string& err);
-    /// Whether the CPU's products are int8 (XESTRATA_VISION_CPU_I8=1), after open_cpu.
+    /// Whether the CPU's products are int8 (the default; XESTRATA_VISION_CPU_I8=0: the BF16 ones), after open_cpu.
     bool cpu_i8() const { return i8_; }
 
     /// rgb [3][height][width] (host, -1 .. 1) -> the embeddings; the tokens in rows of the merged grid.
@@ -66,8 +67,8 @@ private:
         const uint16_t* w = nullptr;   // FP16 [n][k] (the GPU's)
         const float* b = nullptr;      // the GPU's, or the file's on the CPU
         int64_t n = 0, k = 0;
-        kernels::cpu::Bf16Matrix b16;  // the CPU's, or
-        kernels::cpu::I8Matrix q8;     // with XESTRATA_VISION_CPU_I8=1
+        kernels::cpu::Bf16Matrix b16;  // the CPU's with XESTRATA_VISION_CPU_I8=0, or
+        kernels::cpu::I8Matrix q8;     // the CPU's, the default
     };
     struct Norm {
         const float *w = nullptr, *b = nullptr;   // the GPU's, or the file's on the CPU
@@ -99,7 +100,7 @@ private:
     // the CPU's: the pool, the patch embedding and the working rows
     std::unique_ptr<kernels::cpu::ExpertPool> pool_;
     int host_cpu_ = -1;
-    bool i8_ = false;   // XESTRATA_VISION_CPU_I8=1: the int8 products
+    bool i8_ = false;   // the int8 products (the default; XESTRATA_VISION_CPU_I8=0: BF16)
     kernels::cpu::I8GemmIsa isa_ = kernels::cpu::I8GemmIsa::scalar;
     kernels::cpu::I8Rows rows8_;
     W patch16_;

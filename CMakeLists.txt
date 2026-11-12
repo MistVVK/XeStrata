@@ -1604,7 +1604,7 @@ add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu
             src/kernels/cpu/bf16_gemm_avx512.cpp
             src/kernels/cpu/i8_gemm.cpp src/kernels/cpu/i8_gemm_vnni.cpp src/kernels/cpu/i8_gemm_avx512.cpp
             src/kernels/cpu/cpu_ops.cpp src/kernels/cpu/vision_cpu.cpp src/kernels/cpu/vision_cpu_avx2.cpp
-            src/kernels/cpu/vision_cpu_avx512.cpp)
+            src/kernels/cpu/vision_cpu_avx512.cpp src/kernels/cpu/resize_rows.cpp src/kernels/cpu/resize_rows_avx2.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
@@ -1624,6 +1624,9 @@ set_source_files_properties(src/kernels/cpu/bf16_gemm_avx512.cpp PROPERTIES COMP
 set_source_files_properties(src/kernels/cpu/vision_cpu_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
 set_source_files_properties(src/kernels/cpu/vision_cpu_avx512.cpp PROPERTIES COMPILE_OPTIONS
                             "-mavx512f;-mavx2;-mfma")
+# the rows' pass of the image engine's host resize (resize_rows.hpp): the AVX2 copy, and the VNNI ones in functions
+# marked target("avxvnni") / target("avx512f,avx512vl,avx512vnni"), as i8_gemm_vnni.cpp's
+set_source_files_properties(src/kernels/cpu/resize_rows_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2")
 # The AVX-512 VNNI copy is compiled the same way: its functions alone are target("avx512f,avx512vnni").
 set_source_files_properties(src/kernels/cpu/i8_gemm_vnni.cpp src/kernels/cpu/i8_gemm_avx512.cpp
                             PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
@@ -1654,6 +1657,7 @@ set_property(SOURCE src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/canon_expert.cpp
 # the int8 product needs the same answer twice: the kernel file to know whether to define the VNNI copy, the
 # dispatch file to know whether the VNNI copy exists to be reached.
 set_property(SOURCE src/kernels/cpu/i8_gemm.cpp src/kernels/cpu/i8_gemm_vnni.cpp src/kernels/cpu/i8_gemm_avx512.cpp
+             src/kernels/cpu/resize_rows.cpp src/kernels/cpu/resize_rows_avx2.cpp
              APPEND PROPERTY
              COMPILE_DEFINITIONS ${_strata_avxvnni})
 # AVX-VNNI-INT8 (Arrow Lake, Lunar Lake and later): the int8 product's vpdpbssd copy (i8_gemm_rows.inl), in functions

@@ -12,11 +12,13 @@
 #include "strata/core/gpu.hpp"
 #include "strata/image/img_color.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/kernels/cpu/resize_rows.hpp"
 
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstring>
 #include <functional>
 #include <queue>
@@ -408,10 +410,14 @@ double pil_filter(Filter f, double x) {
     return 0.0;
 }
 
-// one axis's taps: output o reads n[o] inputs from lo[o], its fixed-point weights k[o * ksize ..]
+// one axis's taps: output o reads n[o] inputs from lo[o], its fixed-point weights k[o * stride ..] (Pillow's ksize of
+// them, 0 past n[o] up to `stride`, a multiple of 16) and their int16 halves for the rows' vector copies
+// (kernels/cpu/resize_rows.hpp)
 struct PilTaps {
     std::vector<int32_t> lo, n, k;
-    int64_t ksize = 0;
+    std::vector<int16_t> kh, kl;
+    int64_t ksize = 0, stride = 0;
+    int32_t n_max = 0;
 };
 
 PilTaps pil_taps(int64_t in_size, int64_t out_size, Filter f) {
@@ -424,7 +430,10 @@ PilTaps pil_taps(int64_t in_size, int64_t out_size, Filter f) {
     t.ksize = (int64_t) std::ceil(support) * 2 + 1;
     t.lo.resize((size_t) out_size);
     t.n.resize((size_t) out_size);
-    t.k.assign((size_t) (out_size * t.ksize), 0);
+    t.stride = (t.ksize + 15) / 16 * 16;
+    t.k.assign((size_t) (out_size * t.stride), 0);
+    t.kh.assign(t.k.size(), 0);
+    t.kl.assign(t.k.size(), 0);
     std::vector<double> kk((size_t) t.ksize);
     for (int64_t xx = 0; xx < out_size; ++xx) {
         const double center = (xx + 0.5) * scale, ss = 1.0 / filterscale;
@@ -443,10 +452,14 @@ PilTaps pil_taps(int64_t in_size, int64_t out_size, Filter f) {
         for (int64_t x = 0; x < xmax; ++x) {
             if (ww != 0.0) kk[(size_t) x] /= ww;
             const double v = kk[(size_t) x] * (1 << kPilBits);
-            t.k[(size_t) (xx * t.ksize + x)] = (int32_t) (v < 0 ? -0.5 + v : 0.5 + v);
+            const int32_t q = (int32_t) (v < 0 ? -0.5 + v : 0.5 + v);
+            t.k[(size_t) (xx * t.stride + x)] = q;
+            t.kh[(size_t) (xx * t.stride + x)] = (int16_t) (q >> 15);
+            t.kl[(size_t) (xx * t.stride + x)] = (int16_t) (q & 0x7fff);
         }
         t.lo[(size_t) xx] = (int32_t) xmin;
         t.n[(size_t) xx] = (int32_t) xmax;
+        t.n_max = std::max(t.n_max, (int32_t) xmax);
     }
     return t;
 }
@@ -454,9 +467,20 @@ PilTaps pil_taps(int64_t in_size, int64_t out_size, Filter f) {
 // Pillow's clip8: the total shifted down to whole levels and clipped
 uint8_t pil_clip8(int32_t v) { return (uint8_t) std::clamp<int32_t>(v >> kPilBits, 0, 255); }
 
-// The rows' pass: `lines` rows of `n_in` bytes to rows of `n_out`, four rows at a time (a tap's weight and index read
-// once for the four, the four totals side by side).  The totals are Pillow's, one product added at a time.
+// The rows' pass: `lines` rows of `n_in` bytes (readable 16 bytes past the end) to rows of `n_out`: the CPU's vector
+// copy (kernels/cpu/resize_rows.hpp), else four rows at a time here (a tap's weight and index read once for the four,
+// the four totals side by side).  The totals are Pillow's integers either way.
 void pil_rows(const uint8_t* src, int64_t lines, int64_t n_in, int64_t n_out, const PilTaps& t, uint8_t* dst) {
+    namespace kc = strata::kernels::cpu;
+    kc::ResizeRowsTaps v;
+    v.lo = t.lo.data();
+    v.n = t.n.data();
+    v.k = t.k.data();
+    v.kh = t.kh.data();
+    v.kl = t.kl.data();
+    v.stride = t.stride;
+    v.n_max = t.n_max;
+    if (kc::resize_rows_u8(kc::resize_rows_isa(), src, lines, n_in, n_out, v, kPilBits, dst)) return;
     constexpr int32_t half = 1 << (kPilBits - 1);
     int64_t l = 0;
     for (; l + 4 <= lines; l += 4) {
@@ -464,7 +488,7 @@ void pil_rows(const uint8_t* src, int64_t lines, int64_t n_in, int64_t n_out, co
         const uint8_t *r1 = r0 + n_in, *r2 = r1 + n_in, *r3 = r2 + n_in;
         uint8_t* d0 = dst + (size_t) (l * n_out);
         for (int64_t o = 0; o < n_out; ++o) {
-            const int32_t* k = t.k.data() + (size_t) (o * t.ksize);
+            const int32_t* k = t.k.data() + (size_t) (o * t.stride);
             const int64_t lo = t.lo[(size_t) o], n = t.n[(size_t) o];
             int32_t v0 = half, v1 = half, v2 = half, v3 = half;
             for (int64_t x = 0; x < n; ++x) {
@@ -482,7 +506,7 @@ void pil_rows(const uint8_t* src, int64_t lines, int64_t n_in, int64_t n_out, co
     for (; l < lines; ++l) {
         const uint8_t* r = src + (size_t) (l * n_in);
         for (int64_t o = 0; o < n_out; ++o) {
-            const int32_t* k = t.k.data() + (size_t) (o * t.ksize);
+            const int32_t* k = t.k.data() + (size_t) (o * t.stride);
             const int64_t lo = t.lo[(size_t) o], n = t.n[(size_t) o];
             int32_t v = half;
             for (int64_t x = 0; x < n; ++x) v += (int32_t) r[lo + x] * k[x];
@@ -497,7 +521,7 @@ void pil_columns(const uint8_t* src, int64_t lines, int64_t n_out, const PilTaps
     std::vector<int32_t> acc((size_t) lines);
     for (int64_t o = 0; o < n_out; ++o) {
         std::fill(acc.begin(), acc.end(), 1 << (kPilBits - 1));
-        const int32_t* k = t.k.data() + (size_t) (o * t.ksize);
+        const int32_t* k = t.k.data() + (size_t) (o * t.stride);
         const int64_t lo = t.lo[(size_t) o], n = t.n[(size_t) o];
         for (int64_t y = 0; y < n; ++y) {
             const int32_t c = k[y];
@@ -518,8 +542,13 @@ std::vector<float> pillow_resize_planes(const std::vector<float>& planes, int64_
     if (filter == Filter::cv_cubic)
         throw std::invalid_argument("image engine: the host resize takes Pillow's filters (not OpenCV's cubic)");
     if (w == w2 && h == h2) return planes;
-    std::vector<uint8_t> in(planes.size()), mid, out((size_t) (c * h2 * w2));
-    for (size_t i = 0; i < in.size(); ++i) in[i] = (uint8_t) std::clamp(std::nearbyint(planes[i]), 0.0f, 255.0f);
+    // the bytes, each pass's input 16 bytes longer (the rows' vector copies read whole vectors).  Rounded to the
+    // nearest, ties to even, by 2^23's add and subtract (nearbyint on 0 .. 255): nearbyint itself is a call per value
+    // on the baseline x86-64, the most of this resize's time before
+    const size_t pad = 16, n_out = (size_t) (c * h2 * w2);
+    std::vector<uint8_t> in(planes.size() + pad), mid, out(n_out + pad);
+    for (size_t i = 0; i < planes.size(); ++i)
+        in[i] = (uint8_t) (int32_t) ((std::clamp(planes[i], 0.0f, 255.0f) + 0x1p23f) - 0x1p23f);
     auto rows = [&](const uint8_t* src, int64_t lines, uint8_t* dst) {
         pil_rows(src, lines, w, w2, pil_taps(w, w2, filter), dst);
     };
@@ -531,19 +560,19 @@ std::vector<float> pillow_resize_planes(const std::vector<float>& planes, int64_
     // Image.resize's order: the columns first where the picture is over a hundred times taller than wide and loses
     // height (Pillow 12's Image.py), else the rows first; a pass is skipped where its axis keeps its size
     if (h > w * 100 && h2 < h) {
-        mid.resize((size_t) (c * h2 * w));
+        mid.resize((size_t) (c * h2 * w) + pad);
         columns(in.data(), w, mid.data());
         if (w2 != w) rows(mid.data(), c * h2, out.data());
         else out = std::move(mid);
     } else if (w2 != w) {
-        mid.resize((size_t) (c * h * w2));
+        mid.resize((size_t) (c * h * w2) + pad);
         rows(in.data(), c * h, mid.data());
         if (h2 != h) columns(mid.data(), w2, out.data());
         else out = std::move(mid);
     } else {
         columns(in.data(), w, out.data());
     }
-    return std::vector<float>(out.begin(), out.end());
+    return std::vector<float>(out.begin(), out.begin() + (std::ptrdiff_t) n_out);
 }
 
 CropBox parse_crop(const std::string& word) {
