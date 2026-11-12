@@ -176,15 +176,23 @@ void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& 
         {47, 48, 49, 0, 63, 64, 65},
         {130, 5},
         {64, 64, 64, 64, 64},
+        {200, 5, 63, 0, 33},                               // a group of two 128-entry tiles (the second one partly empty)
+        {128, 129, 17},
     };
     int calls = 0, bad = 0;
     double worst = 0;
-    for (const int tm : {2, 3, 4}) {
+    // (tile code, shared-memory limit to pretend: 0 = the device's own).  Tile code 8 is variant B (128 entries); with a 48 KB limit (a Pascal card) the
+    // call must fall to a tile that fits, or the format is unsupported there (then the pass is skipped).
+    for (const auto& tl : std::vector<std::pair<int, int>>{{2, 0}, {3, 0}, {4, 0}, {8, 0}, {8, 49152}, {4, 49152}}) {
+        const int tm = tl.first;
 #ifdef _WIN32
         _putenv_s("STRATA_I8_TM", std::to_string(tm).c_str());
+        _putenv_s("STRATA_I8_SMEM_LIMIT", std::to_string(tl.second).c_str());
 #else
         setenv("STRATA_I8_TM", std::to_string(tm).c_str(), 1);
+        setenv("STRATA_I8_SMEM_LIMIT", std::to_string(tl.second).c_str(), 1);
 #endif
+        if (tl.second && !k::native_expert_i8_supported(S.L)) continue;
         for (const int base : {0, 9}) {
             for (const auto& sizes : plans) {
                 int total = 0;

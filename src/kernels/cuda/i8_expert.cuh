@@ -535,6 +535,250 @@ i8_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restr
     }
 }
 
+// ---------------------------------------------------------------- variant B (tile code 8): 128 weight rows x 128 entries, 4 rows x 16 entries per thread
+// Iteration 5.  Iteration 4 cut the instructions of the dot loop by a quarter and the 20K time by 3 %: the loop is limited by the shared-memory reads
+// (a b128 read takes 4 cycles of the LDS pipe whatever the lanes read; the 4 x 4 register tile needs 16 of them per 128 dots).  Here a lane owns 4 weight
+// rows (lane + 32 i: a wave covers 32 rows with full 16-byte reads) and a wave owns 16 entries, which every lane of the wave reads from the same address
+// (one request): 8 + 32 b128 reads per 512 dots instead of 4 x 16 = 64 (and half the scale reads).  The arithmetic per (row, entry) is the one of the
+// other tiles in the same order (so the output is bit-identical); the stage is 64 values (two sub-blocks) because 128 rows x 128 values would not fit.
+// Per stage: thread (row tid / 2, sub-block tid % 2) decodes one sub-block, thread (entry tid / 2, q8_1 block tid % 2) stages one activation block.
+constexpr int I8B_BM = 128, I8B_LD = 20, I8B_KS = 64;
+template <int T>
+struct I8BSmem {
+    static constexpr int GW = (i8_grid_words(T) + 3) / 4 * 4;
+    static constexpr int SG = i8_sign_type(T) ? 1024 : 0;
+    static constexpr int SZ_W = 128 * I8B_LD, SZ_A = 128 * I8B_LD, SZ_R = 2 * 128 * 4, SZ_D = 2 * 128;
+    static constexpr int o_sg = GW, o_w = o_sg + SG, o_a = o_w + 2 * SZ_W, o_r = o_a + 2 * SZ_A, o_d = o_r + 2 * SZ_R, o_src = o_d + 2 * SZ_D,
+                         total = (o_src + I8B_BM + 3) / 4 * 4;
+    static constexpr size_t bytes = (size_t) total * 4;
+};
+// the raw pieces of sub-block `ib` of the block at bp (one load per piece, see i8_load for the stage-uniform form used by the other tiles)
+template <int T>
+__device__ __forceinline__ void i8_load_bp(I8P bp, int ib, uint32_t (&r)[I8_NRAW]) {
+    if constexpr (T == 16 || T == 17 || T == 42) {
+        r[0] = i8_ld32(bp + 2 + 8 * ib); r[1] = i8_ld32(bp + 6 + 8 * ib); r[2] = i8_ld16(bp);
+        if constexpr (T == 17) r[3] = i8_ld8(bp + 66 + ib);
+    } else if constexpr (T == 22) {
+        r[0] = i8_ld32(bp + 2 + 4 * ib); r[1] = i8_ld32(bp + 34 + 4 * ib);
+        r[2] = i8_ld16(bp); r[3] = i8_ld8(bp + 66 + ib); r[4] = i8_ld8(bp + 74 + ib);
+    } else if constexpr (T == 18) {
+        r[0] = i8_ld32(bp + 2 + 8 * ib); r[1] = i8_ld32(bp + 6 + 8 * ib); r[2] = i8_ld32(bp + 66 + 4 * ib); r[3] = i8_ld16(bp);
+    } else if constexpr (T == 21) {
+        r[0] = i8_ld32(bp + 2 + 8 * ib); r[1] = i8_ld32(bp + 6 + 8 * ib); r[2] = i8_ld32(bp + 74 + 4 * ib);
+        r[3] = i8_ld16(bp); r[4] = i8_ld8(bp + 66 + ib); r[5] = i8_ld8(bp + 106 + ib / 2);
+    } else {   // IQ4_NL
+#pragma unroll
+        for (int k = 0; k < 4; ++k) r[k] = i8_ld32(bp + 2 + 4 * k);
+        r[4] = i8_ld16(bp);
+    }
+}
+
+template <int T, bool GU>
+__global__ void __launch_bounds__(I8_NT)
+i8b_kernel(const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start, const int32_t* __restrict__ n_groups,
+           const int32_t* __restrict__ tile_off, const int32_t* __restrict__ ent_idx, const block_q8_1* __restrict__ A,
+           block_q8_1* __restrict__ hq, float* __restrict__ out, NativeExpertLayout L, int bisect) {
+    using SM = I8BSmem<T>;
+    extern __shared__ uint4 i8_dyn[];
+    uint32_t* const smem = (uint32_t*) i8_dyn;
+    uint32_t* const s_grid = smem;
+    uint32_t* const s_sg = smem + SM::o_sg;
+    uint32_t* const s_w = smem + SM::o_w;
+    uint32_t* const s_a = smem + SM::o_a;
+    uint32_t* const s_r = smem + SM::o_r;
+    float* const s_ad = (float*) (smem + SM::o_d);
+    int* const s_src = (int*) (smem + SM::o_src);
+
+    const int ng = *n_groups;
+    const int ti = blockIdx.x;
+    if (ti >= tile_off[ng]) return;
+    int lo = 0, hi = ng - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi + 1) >> 1;
+        if (tile_off[mid] <= ti) lo = mid; else hi = mid - 1;
+    }
+    const int g = lo;
+    const int e_lo = grp_start[g] + (ti - tile_off[g]) * I8B_BM;
+    const int e_hi = min(grp_start[g + 1], e_lo + I8B_BM);
+    const int nv = e_hi - e_lo;
+    I8P blob = i8_uniform(I8_GPTR(grp_ptr[g]));
+    const int tid = threadIdx.x, lane = tid & 31, wave = tid >> 5;
+    const int K = GU ? (int) L.n_embd : (int) L.n_ff;
+    const int ns = K / I8B_KS;
+    const size_t wrb = GU ? L.gu_row : L.d_row;
+
+    if constexpr (i8_grid_words(T) > 4) {
+        const uint32_t* src = i8_grid_src<T>();
+        for (int i = tid; i < i8_grid_words(T); i += I8_NT) s_grid[i] = src[i];
+    }
+    if constexpr (i8_sign_type(T)) {
+        const uint32_t b = (uint32_t) tid;
+        uint32_t sb = b;
+        if constexpr (T != 21 && T != 22) sb = (b & 127u) | (((uint32_t) __popc(b & 127u) & 1u) << 7);
+        uint32_t mlo = 0, mhi = 0;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            mlo |= ((sb >> k) & 1u) ? (0xFFu << (8 * k)) : 0u;
+            mhi |= ((sb >> (4 + k)) & 1u) ? (0xFFu << (8 * k)) : 0u;
+        }
+        *(uint4*) (s_sg + 4 * b) = make_uint4(mlo, mlo & 0x01010101u, mhi, mhi & 0x01010101u);
+    }
+    uint32_t kv[4] = {0, 0, 0, 0};
+    if constexpr (T == 20) {
+        const uint32_t* t = (const uint32_t*) kvalues_iq4nl;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) kv[i] = t[i];
+    }
+    if (tid < I8B_BM) s_src[tid] = (e_lo + tid < e_hi) ? (GU ? ent_idx[e_lo + tid] : e_lo + tid) : -1;
+    __syncthreads();
+
+    // weights: thread = (tile row wr, sub-block wp of the stage's two); the tile's rows 0..63 are gate features, 64..127 up features (GU), or 128 down rows
+    const int wr = tid >> 1, wp = tid & 1;
+    size_t row_off;
+    if constexpr (GU) row_off = (wr >= 64 ? L.up_off : (size_t) 0) + (size_t) (blockIdx.y * 64 + (wr & 63)) * wrb;
+    else row_off = L.down_off + (size_t) (blockIdx.y * 128 + wr) * wrb;
+    I8P const wrowb = blob + row_off;
+    // activations: thread = (entry ea, q8_1 block ba of the stage's two)
+    const int ea = tid >> 1, ba = tid & 1;
+    I8P const abase = I8_GPTR(A);
+    uint32_t a_vo;
+    {
+        const int src = s_src[ea];
+        a_vo = (uint32_t) ((size_t) (src >= 0 ? src : 0) * (size_t) ((K / 32) * 36) + (size_t) ba * 36);
+    }
+
+    auto load_w = [&](int st, uint32_t (&r)[I8_NRAW]) {
+        const int sb = 2 * st + wp;
+        int bi, ib;
+        if constexpr (i8_block_vals(T) == 256) { bi = sb >> 3; ib = sb & 7; }
+        else if constexpr (i8_block_vals(T) == 64) { bi = sb >> 1; ib = sb & 1; }
+        else { bi = sb; ib = 0; }
+        i8_load_bp<T>(wrowb + (size_t) bi * i8_block_bytes(T), ib, r);
+    };
+    auto store_w = [&](int b, int st, const uint32_t (&r)[I8_NRAW]) {
+        uint32_t q[8], w[5];
+        int m0, m1;
+        float base;
+        i8_pack<T>(r, (2 * st + wp) & 7, w);
+        i8_convert<T>(w, s_grid, (const uint4*) s_sg, kv, q, m0, m1, base);
+        uint4* dst = (uint4*) (s_w + b * SM::SZ_W + wr * I8B_LD + wp * 8);
+        dst[0] = make_uint4(q[0], q[1], q[2], q[3]);
+        dst[1] = make_uint4(q[4], q[5], q[6], q[7]);
+        *(uint4*) (s_r + b * SM::SZ_R + (wp * 128 + wr) * 4) = make_uint4((uint32_t) m0, (uint32_t) m1, __float_as_uint(base), 0u);
+    };
+    auto load_a = [&](int st, uint32_t (&ar)[9]) {
+        I8P p = abase + (size_t) st * 72 + a_vo;
+#pragma unroll
+        for (int k = 0; k < 9; ++k) ar[k] = i8_ldw(p + 4 * k);
+    };
+    auto store_a = [&](int b, const uint32_t (&ar)[9]) {
+        uint4* d = (uint4*) (s_a + b * SM::SZ_A + ea * I8B_LD + ba * 8);
+        d[0] = make_uint4(ar[1], ar[2], ar[3], ar[4]);
+        d[1] = make_uint4(ar[5], ar[6], ar[7], ar[8]);
+        s_ad[b * SM::SZ_D + ba * 128 + ea] = i8_half(ar[0] & 0xFFFFu);
+    };
+
+    float acc[16][4];
+#pragma unroll
+    for (int j = 0; j < 16; ++j)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) acc[j][i] = 0.0f;
+
+    uint32_t wraw[I8_NRAW], ar[9];
+    load_w(0, wraw);
+    load_a(0, ar);
+    store_w(0, 0, wraw);
+    store_a(0, ar);
+    __syncthreads();
+    const int ebase = 16 * wave;
+    for (int st = 0; st < ns; ++st) {
+        const int b = st & 1;
+        if (st + 1 < ns) { load_w(st + 1, wraw); load_a(st + 1, ar); }
+        const uint32_t* const W = s_w + b * SM::SZ_W;
+        const uint32_t* const Ab = s_a + b * SM::SZ_A;
+        const uint32_t* const Rb = s_r + b * SM::SZ_R;
+        const float* const Db = s_ad + b * SM::SZ_D;
+#pragma unroll 1
+        for (int blk = 0; blk < 2; ++blk) {
+            uint4 rc[4], wv[4][2];
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int row = lane + 32 * i;
+                rc[i] = *(const uint4*) (Rb + blk * 512 + row * 4);
+                wv[i][0] = *(const uint4*) (W + row * I8B_LD + blk * 8);
+                wv[i][1] = *(const uint4*) (W + row * I8B_LD + blk * 8 + 4);
+            }
+#pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                if (ebase + j < nv) {   // uniform per wave: no entry of this tile from here on otherwise
+                const int e = ebase + j;
+                const float ax = Db[blk * 128 + e];
+                const uint4 a0 = *(const uint4*) (Ab + e * I8B_LD + blk * 8);
+                const uint4 a1 = *(const uint4*) (Ab + e * I8B_LD + blk * 8 + 4);
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    int s0 = i8_dot0((int) wv[i][0].x, (int) a0.x);
+                    s0 = ggml_cuda_dp4a((int) wv[i][0].y, (int) a0.y, s0);
+                    s0 = ggml_cuda_dp4a((int) wv[i][0].z, (int) a0.z, s0);
+                    s0 = ggml_cuda_dp4a((int) wv[i][0].w, (int) a0.w, s0);
+                    int t;
+                    if constexpr (i8_two_scales(T)) {
+                        int s1 = i8_dot0((int) wv[i][1].x, (int) a1.x);
+                        s1 = ggml_cuda_dp4a((int) wv[i][1].y, (int) a1.y, s1);
+                        s1 = ggml_cuda_dp4a((int) wv[i][1].z, (int) a1.z, s1);
+                        s1 = ggml_cuda_dp4a((int) wv[i][1].w, (int) a1.w, s1);
+                        t = __mul24(s1, (int) rc[i].y) + __mul24(s0, (int) rc[i].x);
+                    } else {
+                        s0 = ggml_cuda_dp4a((int) wv[i][1].x, (int) a1.x, s0);
+                        s0 = ggml_cuda_dp4a((int) wv[i][1].y, (int) a1.y, s0);
+                        s0 = ggml_cuda_dp4a((int) wv[i][1].z, (int) a1.z, s0);
+                        s0 = ggml_cuda_dp4a((int) wv[i][1].w, (int) a1.w, s0);
+                        if constexpr (i8_unit_scale(T)) t = s0;
+                        else t = __mul24(s0, (int) rc[i].x);
+                    }
+                    acc[j][i] = fmaf((float) t, __uint_as_float(rc[i].z) * ax, acc[j][i]);
+                }
+            }}
+        }
+        if (st + 1 < ns) { store_w(b ^ 1, st + 1, wraw); store_a(b ^ 1, ar); }
+        __syncthreads();
+    }
+
+    if constexpr (GU) {
+        // lane = feature; thread rows i = 0, 1: gate features lane, lane + 32; i = 2, 3: up features of the same; the 32 lanes of a wave are one q8_1 block of H
+        const int nb = (int) (L.n_ff / 32);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            if (ebase + j < nv) {   // uniform
+            const int e = e_lo + ebase + j;
+#pragma unroll
+            for (int half = 0; half < 2; ++half) {
+                const float g0 = acc[j][half], u0 = acc[j][2 + half];
+                const float h0 = (g0 / (1.0f + __expf(-g0))) * u0;
+                float amax = fabsf(h0), sum = h0;
+#pragma unroll
+                for (int o = 16; o > 0; o >>= 1) {
+                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+                    sum += __shfl_xor_sync(0xffffffffu, sum, o);
+                }
+                const float d = q8_1_finite(amax / 127.0f);
+                block_q8_1* hb = hq + (size_t) e * nb + 2 * blockIdx.y + half;
+                hb->qs[lane] = q8_1_quant(h0, d, amax);
+                if (lane == 0) hb->ds = q8_1_ds(d, sum);
+            }
+            }}
+    } else {
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            if (ebase + j < nv) {
+            const int e = e_lo + ebase + j;
+            float* o = out + (size_t) ent_idx[e] * L.n_embd + (size_t) blockIdx.y * 128 + lane;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) o[32 * i] = acc[j][i];
+        }}
+    }
+}
+
 // ---------------------------------------------------------------- host side
 struct I8Args {
     const unsigned long long* grp_ptr;
@@ -560,8 +804,39 @@ void i8_launch_tm(const I8Args& a, cudaStream_t s) {
         i8_kernel<T, false, TM><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
 }
 template <int T, bool GU>
+void i8b_launch(const I8Args& a, cudaStream_t s) {
+    constexpr size_t smem = I8BSmem<T>::bytes;
+#if !defined(__HIPCC__)
+    if (smem > 48 * 1024) cudaFuncSetAttribute(i8b_kernel<T, GU>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) smem);
+#endif
+    const dim3 grid((unsigned) a.tiles_ub, (unsigned) (GU ? a.L.n_ff / 64 : a.L.n_embd / 128));
+    if constexpr (GU)
+        i8b_kernel<T, true><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_tok, a.x, a.hq, a.out, a.L, a.bisect);
+    else
+        i8b_kernel<T, false><<<grid, I8_NT, smem, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.tile_off, a.ent_dst, a.hq, nullptr, a.out, a.L, a.bisect);
+}
+// shared memory of the instances of a gate/up and a down type for tile code tm (2, 3, 4: rows of 16 entries; 8: variant B), and the device's limit per block
+template <int T>
+size_t i8_sm(int tm) {
+    return tm == 8 ? I8BSmem<T>::bytes : tm <= 2 ? I8Smem<T, 2>::bytes : tm == 3 ? I8Smem<T, 3>::bytes : I8Smem<T, 4>::bytes;
+}
+size_t i8_smem_bytes(int gu, int dt, int tm) {
+    const size_t a = gu == 16 ? i8_sm<16>(tm) : gu == 17 ? i8_sm<17>(tm) : gu == 18 ? i8_sm<18>(tm) : gu == 21 ? i8_sm<21>(tm) : i8_sm<22>(tm);
+    const size_t b = dt == 20 ? i8_sm<20>(tm) : i8_sm<42>(tm);
+    return a > b ? a : b;
+}
+int i8_env_int(const char* name, int dflt);
+size_t i8_smem_limit() {
+    int dev = 0, v = 0;
+    size_t lim = 48 * 1024;
+    if (cudaGetDevice(&dev) == cudaSuccess && cudaDeviceGetAttribute(&v, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev) == cudaSuccess && v > 0) lim = (size_t) v;
+    const int o = i8_env_int("STRATA_I8_SMEM_LIMIT", 0);   // research / the parity test: pretend a smaller device
+    return o > 0 && (size_t) o < lim ? (size_t) o : lim;
+}
+template <int T, bool GU>
 void i8_launch(int tm, const I8Args& a, cudaStream_t s) {
-    if (tm <= 2) i8_launch_tm<T, GU, 2>(a, s);
+    if (tm == 8) i8b_launch<T, GU>(a, s);
+    else if (tm <= 2) i8_launch_tm<T, GU, 2>(a, s);
     else if (tm == 3) i8_launch_tm<T, GU, 3>(a, s);
     else i8_launch_tm<T, GU, 4>(a, s);
 }

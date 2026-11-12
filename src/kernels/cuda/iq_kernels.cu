@@ -6241,7 +6241,8 @@ void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
 
 bool native_expert_i8_supported(const NativeExpertLayout& L) noexcept {
     return i8_gu_type(L.gu_type) && i8_d_type(L.d_type) && !L.gu_nib && L.tail_off == 0 && L.had_block == 0 && L.n_embd % 256 == 0 &&
-           L.n_ff % 128 == 0 && L.n_embd % 64 == 0 && L.bytes < ((size_t) 1 << 32);   // 32-bit byte offsets inside one expert's blob
+           L.n_ff % 128 == 0 && L.n_embd % 64 == 0 && L.bytes < ((size_t) 1 << 32) &&   // 32-bit byte offsets inside one expert's blob
+           i8_smem_bytes(L.gu_type, L.d_type, 2) <= i8_smem_limit();                  // the smallest tile fits the device's shared memory per block
 }
 
 void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
@@ -6263,10 +6264,14 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
     block_q8_1* hq = (block_q8_1*) scratch;
     const size_t hqb = ((size_t) cap_entries * (size_t) (L.n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255;
     int32_t* tile_off = (int32_t*) ((uint8_t*) scratch + hqb);
-    int tm = i8_env_int("STRATA_I8_TM", 0);   // research: the tile's rows per thread (2, 3 or 4 -> 32, 48 or 64 entries)
-    if (tm <= 0) tm = (int) std::max<int64_t>(2, std::min<int64_t>(4, (cap_entries / cap_groups + 8) / 16));
-    tm = tm <= 2 ? 2 : tm == 3 ? 3 : 4;
-    const int bm = 16 * tm;
+    int tm = i8_env_int("STRATA_I8_TM", 0);   // research: the tile code (2, 3 or 4 rows of 16 entries per thread -> 32, 48 or 64 entries; 8 = variant B, 128 entries)
+    const int64_t avg = cap_entries / cap_groups;
+    const bool b_ok = L.n_embd % 128 == 0 && L.n_ff % 64 == 0;
+    if (tm <= 0) tm = (avg >= 96 && b_ok) ? 8 : (int) std::max<int64_t>(2, std::min<int64_t>(4, (avg + 8) / 16));
+    tm = tm <= 2 ? 2 : tm == 3 ? 3 : tm >= 8 && b_ok ? 8 : 4;
+    const size_t smem_limit = i8_smem_limit();   // a tile that does not fit the device's shared memory per block falls to the next smaller one
+    while (tm > 2 && i8_smem_bytes(L.gu_type, L.d_type, tm) > smem_limit) tm = tm == 8 ? 4 : tm - 1;
+    const int bm = tm == 8 ? 128 : 16 * tm;
     i8_tiles_kernel<<<1, 256, 0, s>>>(grp_start, n_groups, bm, tile_off);
     I8Args a{grp_ptr, grp_start, n_groups, tile_off, ent_tok, ent_dst, (const block_q8_1*) x_q8_1, hq, out, L,
              cap_entries / bm + cap_groups, i8_env_int("STRATA_I8_BISECT", 0)};

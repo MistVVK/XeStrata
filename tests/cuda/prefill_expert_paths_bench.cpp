@@ -687,10 +687,10 @@ void run_cell(const Pair& p, const Shape& s, int T, const Opts& o, const Card& c
     if (gp) paths.push_back({"GRP", [&] { gp->run(x_dev.as<float>(), st); }, pair_rows, {}, {}, {}, 0});
     if (ip) paths.push_back({"I8", [&] { set_i8_tm(0); ip->run_i8(x_dev.as<float>(), st); }, pair_rows, {}, {}, {}, 0});
     if (ip) {
-        static const char* const tm_names[] = {"I8t1", "I8t2", "I8t3", "I8t4", "I8t5", "I8t6"};
-        for (size_t k = 0; k < o.i8_tms.size() && k < 6; ++k) {
+        static const char* const tm_names[] = {"I8t1", "I8t2", "I8t3", "I8t4", "I8t5", "I8t6", "I8t7", "I8t8"};
+        for (size_t k = 0; k < o.i8_tms.size() && k < 8; ++k) {
             const int tm = o.i8_tms[k];
-            paths.push_back({tm_names[std::min(std::max(tm, 1), 6) - 1], [&, tm] { set_i8_tm(tm); ip->run_i8(x_dev.as<float>(), st); }, pair_rows, {}, {}, {}, 0});
+            paths.push_back({tm_names[std::min(std::max(tm, 1), 8) - 1], [&, tm] { set_i8_tm(tm); ip->run_i8(x_dev.as<float>(), st); }, pair_rows, {}, {}, {}, 0});
         }
     }
     if (fu) paths.push_back({"FUSED", [&] { fu->run(x_dev.as<float>(), st); },
