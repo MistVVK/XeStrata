@@ -154,7 +154,18 @@ std::string nv_kq_default_line(bool fused_here) {
            "(STRATA_MMQ_KQ=0 or STRATA_NV_KQ_DEFAULT=0 turns it off)";
 }
 
-std::vector<std::string> apply_nv_kq_default(int min_major, int min_minor, bool fused_here) {
+bool nv_kq_expert_type(int ggml_type) {
+    // ggml type ids: Q5_1 = 7, Q4_K = 12, Q5_K = 13, Q6_K = 14 (the cases of prefill::mmq::supported() behind kq_ok())
+    return ggml_type == 7 || ggml_type == 12 || ggml_type == 13 || ggml_type == 14;
+}
+
+bool nv_kq_line_wanted(const std::vector<std::pair<int, int>>& layer_gate_up_down_types) {
+    for (const auto& l : layer_gate_up_down_types)
+        if (nv_kq_expert_type(l.first) || nv_kq_expert_type(l.second)) return true;
+    return false;
+}
+
+std::vector<std::string> apply_nv_kq_default(int min_major, int min_minor, bool fused_here, bool say) {
     std::vector<std::string> set;
     for (const auto& kv : nv_kq_default_env(min_major, min_minor)) {
         if (std::getenv(kv.first.c_str()) != nullptr) continue;   // the user's setting wins, whatever it is
@@ -165,7 +176,7 @@ std::vector<std::string> apply_nv_kq_default(int min_major, int min_minor, bool 
 #endif
         set.push_back(kv.first);
     }
-    if (!set.empty())   // the engine says nothing more on a pack without K-quant experts: the variable is never read there
+    if (say && !set.empty())   // the engine passes say = false and prints the line after the expert layout is loaded, only for a set with K-quant experts (nv_kq_line_wanted)
         std::fprintf(stderr, "%s\n", nv_kq_default_line(fused_here).c_str());
     return set;
 }
