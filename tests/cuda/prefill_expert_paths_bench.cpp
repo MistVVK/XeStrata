@@ -802,6 +802,16 @@ void run_cell(const Pair& p, const Shape& s, int T, const Opts& o, const Card& c
 
     const auto find = [&](const char* n) -> PathRow* { for (PathRow& pr : paths) if (std::strcmp(pr.name, n) == 0) return &pr; return nullptr; };
     PathRow* pm = find("MMQ");
+    // the sampled pairs of every path against MMQ's (not against the FP32 reference): two paths with the same int8 activations and exact integer sums differ by float rounding only
+    if (pm != nullptr && !pm->out.sample.empty()) {
+        std::printf("   rms difference to MMQ's output on the sampled pairs (relative to MMQ's own RMS; worst row max|diff| / max|MMQ|):");
+        for (PathRow& pr : paths) {
+            if (&pr == pm || pr.out.sample.size() != pm->out.sample.size()) continue;
+            const Err d = compare(pr.out.sample, pm->out.sample, pick.size(), N);
+            std::printf("  %s %.2e / %.2e", pr.name, d.rms, d.worst);
+        }
+        std::printf("\n");
+    }
     std::printf("   %-8s %10s %10s %10s %9s  %9s %9s  %-16s %s\n", "path", "ms median", "min", "max", pm ? "x MMQ" : "", "err rms", "worst row", "output hash", "non-finite rows");
     for (PathRow& pr : paths) {
         const float md = median(pr.t), mn = *std::min_element(pr.t.begin(), pr.t.end()), mx = *std::max_element(pr.t.begin(), pr.t.end());
