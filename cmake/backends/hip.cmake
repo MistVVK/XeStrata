@@ -143,6 +143,13 @@ macro(strata_hip_prompt_tests)
     add_test(NAME hip_prefill_fused_iq_f16 COMMAND hip_prefill_fused_iq)
     set_tests_properties(hip_prefill_fused_iq_f16 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 ENVIRONMENT "STRATA_PF_F16=1;STRATA_PF_F16_KQ=1")
     list(APPEND _strata_hip_tests hip_prefill_fused_iq)
+    # one prompt layer of experts timed on every path the engine can take (see tests/cuda/prefill_expert_paths_bench.cpp); any AMD card, a small smoke run here
+    add_executable(hip_prefill_expert_paths_bench tests/cuda/prefill_expert_paths_bench.cpp)
+    target_include_directories(hip_prefill_expert_paths_bench PRIVATE "${_strata_gg}/include")
+    target_link_libraries(hip_prefill_expert_paths_bench PRIVATE strata_prefill ${_strata_pf_tests_lib} ggml-base strata_hip_runtime)
+    add_test(NAME hip_prefill_expert_paths_bench COMMAND hip_prefill_expert_paths_bench --quick)
+    set_tests_properties(hip_prefill_expert_paths_bench PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+    list(APPEND _strata_hip_tests hip_prefill_expert_paths_bench)
     # STRATA_PF_FUSED_Q8D=1 (gfx12, opt-in): the pinned UD-IQ4_XS's i-quant / Q8_0 pairs on the fused kernels without the K-quant switch (--no-kq);
     # off gfx12 the pairs are not covered without STRATA_PF_FUSED_KQ and the test skips (77, as without a card)
     add_test(NAME hip_prefill_fused_iq_q8d COMMAND hip_prefill_fused_iq "--only=S / Q8_0" --edge --no-timing --no-kq)
