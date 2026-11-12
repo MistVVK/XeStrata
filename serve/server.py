@@ -6371,11 +6371,10 @@ class Service:
                     last_print = time.time()
                     prompt, thought = ids, 0            # thought: the reasoning tokens so far (the budget's count)
                     # the engine stops at the budget itself (HOLD_KEY), when it can and </think> is one token: a --batch engine
-                    # only when its slots say they hold too (READY holdb); a multi engine takes no hold
+                    # only when its slots say they hold too (READY holdb)
                     hold_end = None
                     if (budget and getattr(self.engine, "can_hold", False) is True
                             and (not getattr(self.engine, "batch", 0) or getattr(self.engine, "can_hold_batch", False) is True)
-                            and not getattr(self.engine, "multi", 0)
                             and getattr(self.engine, "split_engine", False) is not True):   # (the split engine's parser refuses the key: tests/split/test_split_gen_keys.py)
                         te = self.tok.encode(THINK_END, parse_special=True)
                         hold_end = te[0] if len(te) == 1 else None
