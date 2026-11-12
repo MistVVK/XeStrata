@@ -3,6 +3,8 @@
 
 #include "strata/core/defaults_026.hpp"
 #include "strata/core/emulate.hpp"
+#include "strata/core/sm120_series.hpp"
+#include "strata/prefill/fused_tile_rule.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -130,7 +132,22 @@ std::vector<std::pair<std::string, std::string>> nv_kq_default_env(int min_major
     return t;
 }
 
-std::vector<std::string> apply_nv_kq_default(int min_major, int min_minor) {
+bool nv_kq_fused_here(int major, int minor, int sms) {
+    namespace ft = strata::prefill::fused_tile;
+    if (ft::pf_env(std::getenv("STRATA_PF_FUSED")) == 0) return false;
+    const ft::Card c{strata::sm120_default(major, minor), major == 12 && minor == 1, sms, ft::s86_class(major, minor, off("STRATA_PF_FUSED_SM86"))};
+    return ft::kq_takes(ft::pf_env(std::getenv("STRATA_PF_FUSED_KQ")), c, ft::sm40_env_of(std::getenv("STRATA_PF_FUSED_SM40")));
+}
+
+std::string nv_kq_default_line(bool fused_here) {
+    if (fused_here)
+        return "strata: a model with K-quant experts (Unsloth UD-Q4/Q5/Q6_K_XL) reads its prompt on Strata's own kernels where they cover the layer "
+               "(Q4_K and Q5_K gate/up with a Q5_1 or Q8_0 down) and on llama.cpp's MMQ kernels for the rest (STRATA_PF_FUSED_KQ=0 gives all of them back to MMQ)";
+    return "strata: a model with K-quant experts (Unsloth UD-Q4/Q5/Q6_K_XL) reads its prompt on llama.cpp's MMQ kernels "
+           "(STRATA_MMQ_KQ=0 or STRATA_NV_KQ_DEFAULT=0 turns it off)";
+}
+
+std::vector<std::string> apply_nv_kq_default(int min_major, int min_minor, bool fused_here) {
     std::vector<std::string> set;
     for (const auto& kv : nv_kq_default_env(min_major, min_minor)) {
         if (std::getenv(kv.first.c_str()) != nullptr) continue;   // the user's setting wins, whatever it is
@@ -142,8 +159,7 @@ std::vector<std::string> apply_nv_kq_default(int min_major, int min_minor) {
         set.push_back(kv.first);
     }
     if (!set.empty())   // the engine says nothing more on a pack without K-quant experts: the variable is never read there
-        std::fprintf(stderr, "strata: a model with K-quant experts (Unsloth UD-Q4/Q5/Q6_K_XL) reads its prompt on llama.cpp's MMQ kernels "
-                             "(STRATA_MMQ_KQ=0 or STRATA_NV_KQ_DEFAULT=0 turns it off)\n");
+        std::fprintf(stderr, "%s\n", nv_kq_default_line(fused_here).c_str());
     return set;
 }
 

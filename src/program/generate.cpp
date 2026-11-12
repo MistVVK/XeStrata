@@ -4067,7 +4067,15 @@ int main(int argc, char** argv) {
                     if (cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d) == cudaSuccess &&
                         cudaDeviceGetAttribute(&n, cudaDevAttrComputeCapabilityMinor, d) == cudaSuccess && (m < lo_m || (m == lo_m && n < lo_n))) { lo_m = m; lo_n = n; }
                 }
-                strata::core::apply_nv_kq_default(lo_m, lo_n);
+                // does Strata's own fused kernel read the K-quant experts on a visible card (the line says so then; strata::core::nv_kq_fused_here)
+                bool kq_fused_here = false;
+                for (int d = 0; d < nd; ++d) {
+                    int m = 0, n = 0, sms = 0;
+                    if (cudaDeviceGetAttribute(&m, cudaDevAttrComputeCapabilityMajor, d) == cudaSuccess && cudaDeviceGetAttribute(&n, cudaDevAttrComputeCapabilityMinor, d) == cudaSuccess &&
+                        cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, d) == cudaSuccess && strata::core::nv_kq_fused_here(m, n, sms))
+                        kq_fused_here = true;
+                }
+                strata::core::apply_nv_kq_default(lo_m, lo_n, kq_fused_here);
             }
         }
         (void) cudaGetLastError();
