@@ -23,8 +23,14 @@ struct Card {
     bool s120 = false;   // compute capability 12.0 (sm120_series.hpp: STRATA_SM120_PERF not 0)
     bool s121 = false;   // GB10 (DGX Spark)
     int sms = 0;
-    bool s86 = false;    // compute capability 8.6 (appended last: the aggregate initializers {s120, s121, sms} of the callers and the test stay valid)
+    bool s86 = false;    // the sm_86 rule class, s86_class below: compute capability 8.0, 8.6 or 8.9 (appended last: the aggregate initializers {s120, s121, sms} of the callers and the test stay valid)
 };
+
+// The compute capabilities that take the sm_86 rules (the 80+ SM default, the staged default of the 40-79 SM cards, the staged / wide tile lines, the Gyro-S default of fused_tq_default.hpp).  8.6 is the class
+// the rules were gated on (RTX A4000 and RTX A6000); 8.0 (A100 class) and 8.9 (RTX 40 / Ada class) joined on the owner's word of 11-12 ("1 Yes" to: may RTX 40 / A100 take the defaults of the cards we
+// tested, since they run the same code?).  No card of those two capabilities has run these kernels here: the evidence is the 8.6 and 12.0 rows below, and the same source compiled for sm_80 / sm_89.
+// 8.7 (Jetson Orin), 9.0, 10.x, 12.0 / 12.1 and everything below 8.0 are not in the class.  `off` is STRATA_PF_FUSED_SM86=0 (a diagnostic: the class is empty then, whatever the card).
+constexpr bool s86_class(int major, int minor, bool off = false) { return !off && major == 8 && (minor == 0 || minor == 6 || minor == 9); }
 
 enum class Why { kBand, kS121, kS120Large, kS120Mid, kS120Small, kStaged, kS86Wide };
 
@@ -48,8 +54,8 @@ constexpr Pick pick(const Card& c, int64_t n, int n_expert, bool staged = false,
     // Staged launches (weight staging: a gate/up kernel of IQ3_XXS / IQ3_S / IQ4_XS / Q8_0 / Q6_K) on an sm_86 or sm_120 card under 80 SMs: 128 rows from every size.  The 128-row staged kernels
     // against the 64-row unstaged ones (RTX A4000, sm_86, 48 SMs, one layer, REAL routing, ms, 2,048 / 8,192 / 20,000 tokens): IQ3_S / IQ4_NL 12.37 / 31.46 / 67.33 against 13.18 / 36.71 / 81.65,
     // IQ3_XXS / IQ4_NL 11.72 / 30.04 / 64.44 against 12.07 / 33.97 / 76.16, IQ4_XS / IQ4_NL 11.97 / 30.60 / 65.33 against 13.10 / 36.17 / 80.54, IQ3_S / Q2_0 (the Q2_0 down is not staged)
-    // 11.89 / 30.48 / 65.19 against 12.27 / 34.35 / 76.42 (RESULTS-P4-SM.md S1).  Nothing below 48 SMs is measured, and no sm_120 card under 80 SMs with staging.  sm_89 / sm_80 are not in
-    // the class (no DevInfo flag, not measured); launches without a staged gate/up and every other class keep the rules below.  With Q8_0 / Q6_K staged (RTX A4000, one layer, real routing, MMQ / head 128 at 2K / 8K / 20K / 32K):
+    // 11.89 / 30.48 / 65.19 against 12.27 / 34.35 / 76.42 (RESULTS-P4-SM.md S1).  Nothing below 48 SMs is measured, and no sm_120 card under 80 SMs with staging.  sm_80 / sm_89 are in
+    // the class since 11-12 (s86_class: the same source, no card of those two capabilities run here); launches without a staged gate/up and every other class keep the rules below.  With Q8_0 / Q6_K staged (RTX A4000, one layer, real routing, MMQ / head 128 at 2K / 8K / 20K / 32K):
     // Q8_0 / Q8_0 1.882 / 1.412 / 1.143 / 1.030 (64-row unstaged 1.326 / 0.955 / 0.783 / 0.649), Q6_K + Q8_0 1.499 / 1.188 / 0.998 / 0.918 (1.059 / 0.787 / 0.638 / 0.547), IQ3_S / Q8_0 1.708 / 1.379 / 1.211 / 1.060 (1.407 / 1.076 / 0.912 / 0.768).
     if (staged && (c.s86 || c.s120) && c.sms > 0 && c.sms < 80) return {2, Why::kStaged};
     // sm_120 with 80 SMs and up (the cards that take these kernels by default: RTX 5080 / 5090, PRO 5000 / 6000): 128 rows from 159.9 rows an expert on, the first
@@ -64,7 +70,7 @@ constexpr Pick pick(const Card& c, int64_t n, int n_expert, bool staged = false,
     // everything else (sm_80 / 86 / 89, sm_120 outside the classes above, HIP builds): 128 rows when an expert has about one such tile (56 to 112 rows on average), else 64.
     // Measured on the RTX 5070 with uniform routing (tests/cuda/prefill_fused_iq_test, a layer of 2048 / 3584 / 8192 tokens, ms, 64 -> 128): IQ2_S 5.2 -> 6.7, 9.5 -> 9.3, 17.5 -> 19.5;
     // IQ2_XXS 4.2 -> 5.8, 7.4 -> 7.6, 13.6 -> 16.5; IQ3_S 5.6 -> 6.6, 10.2 -> 8.8, 18.4 -> 19.0; IQ3_XXS 5.1 -> 6.3, 9.1 -> 8.3, 16.5 -> 17.5 (256 rows was slower still).
-    // sm_86 with 40 SMs and up (the 40-79 SM cards and the 80+ SM ones), a Q6_K or Q8_0 gate/up (Q6_K + Q8_0, Q8_0 / Q8_0; CUDA opt-ins), above 112 rows an expert: 128 rows (below 80 SMs the staged rule above already
+    // sm_86-class cards (s86_class: 8.0, 8.6, 8.9) with 40 SMs and up (the 40-79 SM cards and the 80+ SM ones), a Q6_K or Q8_0 gate/up (Q6_K + Q8_0, Q8_0 / Q8_0; CUDA opt-ins), above 112 rows an expert: 128 rows (below 80 SMs the staged rule above already
     // takes 128 at every size once these formats are staged; this line is the one that moves the 80+ SM cards).  Measured on the RTX A4000 (sm_86, 48 SMs, one layer, ms, tile 64 -> tile 128, output bits
     // equal): Qwen3.6's shape (256 experts, top 8; lane P4-Q36, z440-20261111-2126-783b) Q6_K + Q8_0 4,096 / 8,192 / 20,000 tokens 17.65 -> 13.14, 31.91 -> 22.78, 73.46 -> 55.80 (MMQ 13.58 / 20.05 / 38.12);
     // Qwen3.8-Flash-Next's shape (512 experts, top 10, real routing, RESULTS-P4-SM.md S0) at 8,192 / 20,000 / 32,768 tokens: Q6_K + Q8_0 64.97 -> 52.56, 142.17 -> 110.45, 241.14 -> 173.50; Q8_0 / Q8_0
@@ -76,7 +82,7 @@ constexpr Pick pick(const Card& c, int64_t n, int n_expert, bool staged = false,
 }
 
 // Whether native_supported's default rule (STRATA_PF_FUSED unset; the IQ3_S pack's gate/up IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS with an IQ4_NL / Q2_0 down) takes a launch on this card, as a pure function so the
-// rule can be tested without a GPU.  sm_86 / sm_120 cards with 80+ SMs: always.  sm40 (the 40-79 SM rule; ON by default since the owner's word of 11-12, STRATA_PF_FUSED_SM40=0 turns it off, see sm40_on
+// rule can be tested without a GPU.  sm_86-class (s86_class: 8.0, 8.6, 8.9) and sm_120 cards with 80+ SMs: always.  sm40 (the 40-79 SM rule; ON by default since the owner's word of 11-12, STRATA_PF_FUSED_SM40=0 turns it off, see sm40_on
 // below; it was a research switch, off unless set, before) adds the sm_86 / sm_120 cards with 40-79 SMs for the
 // launches whose gate/up kernel is a weight-staging instance (gate_staged: IQ3_XXS / IQ3_S / IQ4_XS, sw_on in src/prefill/moe_fused_iq.cu) with an IQ4_NL or Q2_0 down (down_ok).  Evidence: RTX A4000
 // (sm_86, 48 SMs) one layer, real routing, staged 128-row tile against MMQ at 2,048 / 8,192 / 20,000 / 32,768 tokens: IQ3_S / IQ4_NL 1.594 / 1.337 / 1.190 / 1.070, IQ3_XXS / IQ4_NL 1.645 / 1.373 / 1.223 /

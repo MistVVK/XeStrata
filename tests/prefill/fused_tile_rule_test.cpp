@@ -5,6 +5,7 @@
 #include <initializer_list>
 
 #include "strata/prefill/fused_tile_rule.hpp"
+#include "strata/prefill/fused_tq_default.hpp"
 
 using strata::prefill::fused_tile::Card;
 using strata::prefill::fused_tile::pick;
@@ -255,6 +256,119 @@ int main() {
         CHECK(!default_takes_env(-1, a4000c, -1, false, true, 16) && !default_takes_env(-1, a4000c, -1, false, true, 17));   // IQ2_XXS / IQ2_XS: no staged instance, MMQ below 80 SMs
         CHECK(!default_takes_env(-1, a4000c, -1, true, true, 12) && !default_takes_env(-1, a4000c, -1, true, true, 13) && !default_takes_env(-1, a4000c, -1, true, true, 14));   // Q4_K / Q5_K / Q6_K: opt-in as before
         CHECK(default_takes_env(-1, gb10c, -1, true, true, 21) == default_takes_env(-1, r5070, -1, true, true, 21));   // the s121 flag is not looked at by this rule
+    }
+    // ---- the sibling classes (owner 11-12, "1 Yes"): compute capability 8.0 (A100 class) and 8.9 (RTX 40 / Ada class) take the rules of the cards we tested (8.6; 12.0).  The grid below starts from the compute
+    // capability, builds the card the way dev_info() in src/prefill/moe_fused_iq.cu does (s120 = 12.0 and STRATA_SM120_PERF not 0, s121 = 12.1, s86 = s86_class(cc, STRATA_PF_FUSED_SM86=0)) and checks the
+    // default of native_supported (default_takes_env), the Gyro-S default (fused_tq::on) and the tile rule (pick) against oracles written from the sentence of the decision, not from the code
+    {
+        using namespace strata::prefill::fused_tile;
+        namespace tq = strata::prefill::fused_tq;
+        struct Cc { int major, minor; };
+        // every capability a CUDA card the engine sees can report, 8.7 (Jetson Orin) and 9.0 (Hopper) included: the class is 8.0, 8.6 and 8.9 only
+        const Cc kCc[] = {{6, 0}, {6, 1}, {7, 0}, {7, 5}, {8, 0}, {8, 6}, {8, 7}, {8, 9}, {9, 0}, {10, 0}, {12, 0}, {12, 1}};
+        const auto flagged = [](const Cc& c, bool off, bool perf120) {   // the oracle: which cards the rules call tested-class
+            const bool a = !off && c.major == 8 && (c.minor == 0 || c.minor == 6 || c.minor == 9);
+            const bool b = c.major == 12 && c.minor == 0 && perf120;
+            return a || b;
+        };
+        const auto card_for = [](const Cc& c, int sms, bool off, bool perf120) {   // dev_info()
+            return Card{c.major == 12 && c.minor == 0 && perf120, c.major == 12 && c.minor == 1, sms, s86_class(c.major, c.minor, off)};
+        };
+        // the class function itself over a wider range: 0.0 .. 15.9, only 8.0 / 8.6 / 8.9 are in; the old rule (8.6 only) differs from it at exactly 8.0 and 8.9
+        long long cls = 0, cls_bad = 0, cls_moved = 0;
+        for (int major = 0; major < 16; ++major)
+            for (int minor = 0; minor < 10; ++minor) {
+                ++cls;
+                if (s86_class(major, minor) != (major == 8 && (minor == 0 || minor == 6 || minor == 9))) ++cls_bad;
+                if (s86_class(major, minor, true)) ++cls_bad;   // STRATA_PF_FUSED_SM86=0: nothing is in the class
+                if (s86_class(major, minor) != (major == 8 && minor == 6)) ++cls_moved;
+            }
+        CHECK(cls_bad == 0 && cls_moved == 2);
+        // the default of native_supported: STRATA_PF_FUSED (unset / 0 / 1) x SM40 switch (unset / 0 / 1) x STRATA_PF_FUSED_SM86=0 x STRATA_SM120_PERF=0 x 12 capabilities x 0-200 SMs x gate_staged x down_ok x 13 formats
+        const int kTypes[] = {8, 12, 13, 14, 16, 17, 18, 19, 20, 21, 22, 23, 29};
+        long long cmp = 0, bad = 0, yes_hi = 0, yes_mid = 0, yes_new = 0;
+        for (const Cc& cc : kCc)
+            for (int off = 0; off < 2; ++off)
+                for (int perf = 0; perf < 2; ++perf)
+                    for (int env = -1; env <= 1; ++env)
+                        for (int sm40e = -1; sm40e <= 1; ++sm40e)
+                            for (int sms = 0; sms <= 200; ++sms)
+                                for (int g = 0; g < 2; ++g)
+                                    for (int d = 0; d < 2; ++d)
+                                        for (int gu : kTypes) {
+                                            ++cmp;
+                                            const bool inlist = gu == 16 || gu == 17 || gu == 18 || gu == 21 || gu == 22 || gu == 23;   // IQ2_XXS, IQ2_XS, IQ3_XXS, IQ3_S, IQ2_S, IQ4_XS
+                                            const bool want = env == -1 && inlist && flagged(cc, off != 0, perf != 0) && (sms >= 80 || (sms >= 40 && sm40e != 0 && g != 0 && d != 0));
+                                            const bool got = default_takes_env(env, card_for(cc, sms, off != 0, perf != 0), sm40e, g != 0, d != 0, gu);
+                                            if (got != want) ++bad;
+                                            if (want && (cc.minor == 0 || cc.minor == 9) && cc.major == 8) { if (sms >= 80) ++yes_hi; else ++yes_mid; ++yes_new; }
+                                        }
+        CHECK(bad == 0);
+        CHECK(yes_hi > 0 && yes_mid > 0 && yes_new == yes_hi + yes_mid);
+        std::printf("fused_tile_rule_test: sibling classes, default rule: %lld capability / switch / SM count / launch / format combinations (%lld wrong; the new 8.0 / 8.9 cards: %lld yes at 80+ SMs, %lld yes at 40-79); class function: %lld capabilities (%lld wrong, %lld moved from the old rule)\n",
+                    cmp, bad, yes_hi, yes_mid, cls, cls_bad, cls_moved);
+        // what must NOT move: for every capability but 8.0 / 8.9 the card, and with it every answer, is the one the old flag (8.6 only) gave
+        long long same = 0, moved_card = 0;
+        for (const Cc& cc : kCc)
+            for (int off = 0; off < 2; ++off)
+                for (int sms : {0, 1, 39, 40, 48, 79, 80, 84, 108, 128, 200}) {
+                    const Card now = card_for(cc, sms, off != 0, true);
+                    const Card old{cc.major == 12 && cc.minor == 0, cc.major == 12 && cc.minor == 1, sms, cc.major == 8 && cc.minor == 6 && off == 0};
+                    ++same;
+                    if (now.s120 != old.s120 || now.s121 != old.s121 || now.sms != old.sms || now.s86 != old.s86) {
+                        ++moved_card;
+                        CHECK(cc.major == 8 && (cc.minor == 0 || cc.minor == 9) && off == 0);   // only the two new capabilities, and not under STRATA_PF_FUSED_SM86=0
+                    }
+                }
+        CHECK(moved_card == 2 * 11);   // 8.0 and 8.9, SM86 switch not 0, 11 SM counts
+        std::printf("fused_tile_rule_test: sibling classes: %lld capability / SM count / switch cards built, %lld differ from the old flag (8.0 and 8.9 without STRATA_PF_FUSED_SM86=0 only)\n", same, moved_card);
+        // Gyro-S default (fused_tq_default.hpp): STRATA_PF_FUSED_TQ unset / 0 / 1 (the parsed value) x capability x SM86 switch x SM count: on for env 1, else only the class with 80+ SMs
+        long long cmpq = 0, badq = 0;
+        for (const Cc& cc : kCc)
+            for (int off = 0; off < 2; ++off)
+                for (int tqe = -1; tqe <= 1; ++tqe)
+                    for (int sms = 0; sms <= 200; ++sms) {
+                        ++cmpq;
+                        const bool want = tqe == 1 || (tqe == -1 && flagged(cc, off != 0, false) && sms >= 80);   // (perf120 false: the 12.0 card is not in the Gyro rule, whatever STRATA_SM120_PERF says)
+                        if (tq::on(tqe, card_for(cc, sms, off != 0, true).s86, sms) != want) ++badq;
+                    }
+        CHECK(badq == 0);
+        CHECK(tq::on(-1, card_for({8, 0}, 108, false, true).s86, 108) && tq::on(-1, card_for({8, 9}, 128, false, true).s86, 128) && !tq::on(-1, card_for({8, 9}, 60, false, true).s86, 60) &&
+              !tq::on(-1, card_for({12, 0}, 110, false, true).s86, 110) && !tq::on(-1, card_for({8, 0}, 108, true, true).s86, 108) && !tq::on(-1, card_for({8, 7}, 128, false, true).s86, 128));
+        std::printf("fused_tile_rule_test: sibling classes, Gyro-S default: %lld capability / switch / SM count combinations (%lld wrong)\n", cmpq, badq);
+        // the tile rule: an 8.0 or 8.9 card of N SMs picks, for every launch kind and size, what an 8.6 card of N SMs picks (the same class); 8.7 / 9.0 / 7.5 / 6.x pick what a card with no flag picks
+        long long cmpt = 0, badt = 0;
+        for (int sms : {0, 1, 39, 40, 48, 56, 60, 76, 79, 80, 84, 108, 128, 142, 200})
+            for (int staged = 0; staged < 2; ++staged)
+                for (int wide = 0; wide < 2; ++wide)
+                    for (int ne : {1, 256, 512})
+                        for (int64_t n = 0; n <= 400000; n += 53) {
+                            const Pick ref = pick(card_for({8, 6}, sms, false, true), n, ne, staged != 0, wide != 0);
+                            const Pick none = pick(Card{false, false, sms, false}, n, ne, staged != 0, wide != 0);
+                            for (const Cc& cc : kCc) {
+                                if (cc.major == 12) continue;
+                                const Pick p = pick(card_for(cc, sms, false, true), n, ne, staged != 0, wide != 0);
+                                const bool in_class = cc.major == 8 && (cc.minor == 0 || cc.minor == 6 || cc.minor == 9);
+                                const Pick& want = in_class ? ref : none;
+                                ++cmpt;
+                                if (p.ww != want.ww || p.why != want.why) ++badt;
+                            }
+                        }
+        CHECK(badt == 0);
+        std::printf("fused_tile_rule_test: sibling classes, tile rule: %lld capability / SM count / launch combinations (%lld wrong)\n", cmpt, badt);
+        // named cards, switches unset: A100 (8.0, 108 SMs) and RTX 4090 (8.9, 128): every format of the default list; A30 (8.0, 56) and RTX 4070 Ti (8.9, 60): the staged launches only; RTX 4060 Ti (8.9, 34): nothing
+        for (int gu : {16, 17, 18, 21, 22, 23}) {
+            CHECK(default_takes_env(-1, card_for({8, 0}, 108, false, true), -1, false, true, gu) && default_takes_env(-1, card_for({8, 9}, 128, false, true), -1, false, true, gu));
+            CHECK(!default_takes_env(-1, card_for({8, 9}, 34, false, true), -1, true, true, gu) && !default_takes_env(-1, card_for({8, 0}, 56, false, true), 0, true, true, gu));
+        }
+        for (int gu : {18, 21, 23}) CHECK(default_takes_env(-1, card_for({8, 0}, 56, false, true), -1, true, true, gu) && default_takes_env(-1, card_for({8, 9}, 60, false, true), -1, true, true, gu));
+        CHECK(!default_takes_env(-1, card_for({8, 9}, 60, false, true), -1, false, true, 22) && !default_takes_env(-1, card_for({8, 0}, 56, false, true), -1, false, true, 16));   // IQ2_S / IQ2_XXS: unstaged, MMQ below 80 SMs
+        CHECK(!default_takes_env(-1, card_for({8, 9}, 128, false, true), -1, true, true, 12) && !default_takes_env(-1, card_for({8, 0}, 108, false, true), -1, true, true, 14) &&
+              !default_takes_env(-1, card_for({8, 9}, 128, false, true), -1, true, true, 8));   // Q4_K / Q6_K / Q8_0: opt-in on every class
+        CHECK(!default_takes_env(0, card_for({8, 0}, 108, false, true), -1, true, true, 21) && !default_takes_env(1, card_for({8, 9}, 128, false, true), -1, true, true, 21));   // STRATA_PF_FUSED=0 is MMQ, =1 the opt-in decided elsewhere
+        CHECK(!default_takes_env(-1, card_for({8, 0}, 108, true, true), -1, true, true, 21) && !default_takes_env(-1, card_for({8, 9}, 128, true, true), -1, true, true, 21));   // STRATA_PF_FUSED_SM86=0: MMQ again
+        CHECK(!default_takes_env(-1, card_for({8, 7}, 128, false, true), -1, true, true, 21) && !default_takes_env(-1, card_for({9, 0}, 132, false, true), -1, true, true, 21) &&
+              !default_takes_env(-1, card_for({7, 5}, 72, false, true), -1, true, true, 21) && !default_takes_env(-1, card_for({6, 0}, 56, false, true), -1, true, true, 21));   // Orin, Hopper, Turing, Pascal: untouched
     }
     // every class, every launch size: staged = false gives the rule of commit 083b1ac82 exactly as before the argument existed, for the sm_86 cards too (the new flag does not move them)
     {
