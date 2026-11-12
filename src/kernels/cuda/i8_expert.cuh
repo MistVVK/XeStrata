@@ -118,8 +118,8 @@ __device__ __forceinline__ int i8_dot0(int a, int b) {
 // i8_convert reads.  (Read as 16-bit halves the compiler merged them into one dword load and split the dword again right after the load, which put an
 // s_waitcnt vmcnt in front of the dot loop.)
 constexpr int I8_NRAW = 6;
-typedef uint32_t i8_u32a __attribute__((aligned(2)));
 #if defined(__HIPCC__)
+typedef uint32_t i8_u32a __attribute__((aligned(2)));
 __device__ __forceinline__ uint32_t i8_ld32(I8P p) { return *(const I8_AS i8_u32a*) p; }   // AMD global loads may be unaligned
 #else
 __device__ __forceinline__ uint32_t i8_ld32(I8P p) { return i8_ld16(p) | (i8_ld16(p + 2) << 16); }   // NVIDIA: a 32-bit load must be 4-byte aligned ("misaligned address" otherwise)
