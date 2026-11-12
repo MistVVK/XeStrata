@@ -10,7 +10,7 @@
 namespace strata::prefill {
 
 /// The whole default: false keeps MMQ on the P100 as before; true makes the rule below the P100's default.  One line.
-constexpr bool kGp100Default = false;
+constexpr bool kGp100Default = true;
 
 struct Gp100PromptInputs {
     const char* env = nullptr;   // STRATA_PREFILL_MMQ as read (nullptr: unset; any value keeps its old meaning: 0 FP16 path, else MMQ)
