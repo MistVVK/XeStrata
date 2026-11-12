@@ -383,8 +383,7 @@ inline int64_t default_stream_floor() {
     const int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only());
     cached.store(v, std::memory_order_release);
     if (v != strata::prefill::kStreamFloorDefault)
-        std::fprintf(stderr, "prefill: this layer set has no MMQ tile and the fused kernels take every layer: prompt chunks of %lld tokens or more read on them, as long prompts do "
-                             "(Windows gfx1151, UD-Q4_K_XL: 128 to 1,000 tokens 3.6 to 4.4 times sooner). STRATA_PREFILL_STREAM_MIN=1024 keeps the old rule.\n", (long long) v);   // [DRAFT] wording: the owner's to word
+        std::fprintf(stderr, "prefill: prompt pieces of %lld tokens or more read on the fused kernels, as long prompts do. STRATA_PREFILL_STREAM_MIN=1024 keeps the old rule.\n", (long long) v);
     return v;
 }
 inline int64_t stream_all_min() {
