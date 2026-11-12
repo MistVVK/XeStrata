@@ -5466,14 +5466,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int64_t i8_groups = ((int64_t) order.size() + MMQ_GROUP - 1) / MMQ_GROUP;
                             i8_l = i8_L.up_off == f.up_off && i8_L.down_off == f.down_off && i8_L.bytes == f.bytes && f.n_embd == N && f.n_ff == kFF &&
                                    strata::kernels::native_expert_i8_prompt(i8_L, rows_local / i8_groups);
-                        }
-                        // the routed experts' input: `mixed`, or (APR) its rotated copy, which the peer / the layer
-                        // split's helper also take (one rotation for both cards; `mixed` itself feeds the shared expert)
-                        const float* xsrc = m.mixed;
-                        if (fz_staged) {
-                            fz_staged_l = true;
-                            fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
-                        }
                             if (i8_count_on() && i8_groups > 0) {
                                 I8Count& c = i8_count();
                                 c.min_avg = std::min<int64_t>(c.min_avg, rows_local / i8_groups);
@@ -5485,6 +5477,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             ++c.layers;
                             c.ent += rows_local;
                             if (i8_l) { ++c.layers_i8; c.ent_i8 += rows_local; }
+                        }
+                        // the routed experts' input: `mixed`, or (APR) its rotated copy, which the peer / the layer
+                        // split's helper also take (one rotation for both cards; `mixed` itself feeds the shared expert)
+                        const float* xsrc = m.mixed;
+                        if (fz_staged) {
+                            fz_staged_l = true;
+                            fused::quantize_act_native(m.mixed, T, N, m.Xq, m.cs);
+                        }
                         if (i8_l) {   // the layer's T tokens as q8_1 rows, once (the grouped kernels' activations)
                             if (static bool said = false; !said) {
                                 said = true;
@@ -6712,14 +6712,6 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             hand_buf_ ^= 1;
             continue;   // the last stage reports the chunk (on_chunk)
         }
-        if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
-            cudaStreamSynchronize(m.cs);                                  // position (A/B quality of this path)
-            if (std::FILE* f = std::fopen(dump, c0 == 0 ? "wb" : "ab")) {
-                std::vector<float> row((size_t) D);
-                for (int64_t t = (64 - p0 % 64) % 64; t < T; t += 64) {
-                    cudaMemcpy(row.data(), m.R + t * D, (size_t) D * 4, cudaMemcpyDeviceToHost);
-                    const int64_t pos = p0 + t;
-                    std::fwrite(&pos, sizeof pos, 1, f);
         if (i8_count_on()) {   // STRATA_I8_COUNT=1: this chunk's entries by path (the counters restart for the next chunk)
             I8Count& c = i8_count();
             std::fprintf(stderr, "strata i8-count: chunk of %lld tokens: %lld layers reached the group walk, %lld on native_expert_i8; routed entries %lld, on native_expert_i8 %lld (%.2f %%), "
@@ -6728,6 +6720,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                          (long long) (c.ent - c.ent_i8), (long long) c.groups_i8, (long long) (c.min_avg == INT64_MAX ? -1 : c.min_avg));
             c = I8Count{};
         }
+        if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
+            cudaStreamSynchronize(m.cs);                                  // position (A/B quality of this path)
+            if (std::FILE* f = std::fopen(dump, c0 == 0 ? "wb" : "ab")) {
+                std::vector<float> row((size_t) D);
+                for (int64_t t = (64 - p0 % 64) % 64; t < T; t += 64) {
+                    cudaMemcpy(row.data(), m.R + t * D, (size_t) D * 4, cudaMemcpyDeviceToHost);
+                    const int64_t pos = p0 + t;
+                    std::fwrite(&pos, sizeof pos, 1, f);
                     std::fwrite(row.data(), 4, row.size(), f);
                 }
                 std::fclose(f);
