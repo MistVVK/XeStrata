@@ -6448,6 +6448,22 @@ int main(int argc, char** argv) {
                 ++held_cnt[(size_t) st];
             }
             held_mass /= std::max(total_mass, 1e-9);
+            // --pipeline-windows 2 on two stages: the stages overlap, so a window costs about the slower stage,
+            // and a stage's CPU misses wait on that stage.  The last one also runs the head and the draft chain
+            // the next window waits for: ~4 ms on an RTX 5080, about 12 of its layers.  (A sum of the stages put
+            // 2 of 48 layers on the first card of a 4060 Ti + 5080 pair and left most of its VRAM idle: 29 tok/s
+            // against 165 at K=20.  From Strata-DualGPU, adapted to keep this tree's per-link miss scaling.)
+            if (o.pipeline_windows >= 2 && ns == 2) {
+                double slowest = 0.0;
+                for (int i = 0; i < ns; ++i) {
+                    const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1], le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
+                    const double gpu = (double) (le - lb + (i + 1 == ns ? 12 : 0)) * layer_ms[(size_t) i];
+                    slowest = std::max(slowest, gpu + miss_ms * link_scale[(size_t) i] *
+                                       std::max(0.0, mass_i[(size_t) i] - held_i[(size_t) i]) /
+                                       std::max(total_mass, 1e-9));
+                }
+                return slowest;
+            }
             // Each stage's misses on its own link (link_scale; 1.0 everywhere = the fitted single-constant formula).
             double ms = 0.0;
             for (int i = 0; i < ns; ++i)
