@@ -101,6 +101,20 @@ std::string architecture(const std::string& path) {
     }
 }
 
+// Whether the model has no experts (a dense model): its structure, read from the GGUF's expert_count before the
+// load, so the dense products' W8A8 choice (Gemm::llm_w8a8) and the int8 library it may load land before the
+// weights take the room.  A key it does not carry reads as 0 (a dense model's, model_spec.hpp).
+bool dense_gguf(const std::string& path, const std::string& arch) {
+    if (arch.empty()) return false;
+    try {
+        const GgufModel m = GgufModel::open(path);
+        const MetaValue* e = m.meta().get(arch + ".expert_count");
+        return e == nullptr || (e->is_num() && e->u == 0);
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 // The tokens that end a generation: the GGUF's end-of-sequence, end-of-turn and end-of-message tokens it names
 std::vector<int32_t> eos_tokens(const std::string& path) {
     std::vector<int32_t> ids;
@@ -2457,7 +2471,16 @@ int plain_main(int argc, char** argv) {
     }
     const Clock::time_point t0 = Clock::now();
     // the products' library loads beside the model (not on the CPU: no GPU is opened there)
-    if (opt.prompt_chunk > 0 && !opt.cpu) strata::prefill::Gemm::prepare();
+    if (opt.prompt_chunk > 0 && !opt.cpu) {
+        strata::prefill::Gemm::prepare();
+        // a dense model's W8A8 choice timed here, before the weights take the room (as generate.cpp's): the int8
+        // library the timing may load (oneDNN) is then in the free memory the load's VRAM plan reads.  A MoE
+        // model takes neither the timing nor the library (its reservation shifts the expert cache's placement)
+        if (dense_gguf(gguf, arch)) {
+            strata::prefill::Gemm::settle();
+            strata::prefill::Gemm::llm_w8a8(nullptr, /*dense=*/true);
+        }
+    }
     {   // before the expert pool is built: its workers' CPUs, the other threads' plan, the RAM guard's limit
         std::string text = pool_cores;
         if (text.empty())

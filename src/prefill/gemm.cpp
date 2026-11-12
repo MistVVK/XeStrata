@@ -37,6 +37,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <new>
 #include <type_traits>
@@ -821,26 +822,123 @@ bool w8_fused(void* stream) {
 }
 }  // namespace
 
-// Whether the LLMs' dense prompt products take the W8A8 form (Gemm::native_llm): off by default, an opt-in
-// (XESTRATA_LLM_W8A8=1).  The form is faster where the int8 product is (the RTX 4070: the three representative shapes
-// at 4096 rows, native 8.1 to 8.8 ms against W8A8 4.7 to 4.8; the Qwen3.5-9B prompt 32K 3245 -> 5462 tok/s, 4K
-// 3340 -> 5842; the B70's 4 to 6% edge on the products, 3.77 to 3.81 against 3.57 to 3.62, did not survive a 5%
-// margin from run to run and is within a 15% one), but its answers are an approximation, and the KL against the
-// floor of the same binary's runs (2026-11-12, 64 teacher-forced positions of the 1K and 32K prompts, top-64,
-// tools/quant_quality.py compare) passed the task's bar (top-1 at the floor's or above, mean KL within three times
-// the floor's) nowhere the form was taken: the RTX 4070's 32K, Qwen3.8-Flash-Next KL 0.00955 top-1 100% (the floor
-// 0 / 100%), Qwen3.6-35B-A3B 0.04622 / 89.06% (0 / 100%), Qwen3.5-9B 0.00411 / 96.88% (the BLAS floor 0.00107 /
-// 100%, 3.8 times it).  So it is not the default; a user who accepts the approximation takes it with the
-// environment variable.  The B70 keeps native either way at the default; with the variable set it takes the form
-// too (its products 4 to 6% faster).  The timed choice of the commits dd3cfe58f / 09dc382e8 (once a GPU, three
-// shapes, native preferred with a 15% margin) picked W8A8 on the RTX 4070 and native on the B70 stably; it is gone
-// with the default off, to be restored from those commits if the bar is ever relaxed.
-bool Gemm::llm_w8a8(void* stream) {
-    static const bool on = [] {
+// Whether the LLMs' dense prompt products take the W8A8 form (Gemm::native_llm): for a dense model (no experts),
+// timed once a GPU over three of their representative shapes at 4096 rows (Qwen3.8-Flash-Next's attn_qkv 2560 ->
+// 10240 IQ4_XS and attn_output 6144 -> 2560 Q6_K, Qwen3.6-35B-A3B's attn_qkv 2048 -> 8192 Q8_0), the whole form
+// against native (the weight's int8 rows made at each call, the activations' rows, the int32 product, the scales
+// back into FP32), through core::timed_choice, native the preferred side with a wide margin: W8A8 taken only when
+// 15% faster.  At timed_choice's own 5% the choice moved from run to run on the B70 (2026-11-12: the three shapes
+// native 3.77 to 3.81 ms, W8A8 3.57 to 3.62, a 4 to 6% edge astride the margin; the RTX 4070's 8.1 to 8.8 against
+// 4.7 to 4.8, some 45%, is far past it).  Not a shape at a time either: the narrow margins of the small shapes
+// moved the choice from start to start (K5's record, the image DiTs' w8_fused above).  A queue recording a graph,
+// or a timing around this product (core::timing_depth), takes native until the GPU is timed.
+// A MoE model keeps native by default: neither the timing nor the int8 library's load (oneDNN's reservation,
+// about 385 MiB on the B70, shifts the expert cache's placement and the answers with it, A5B 2026-11-12), and its
+// KL against the floor of the same binary's runs passed the task's bar nowhere the form was taken (the RTX 4070's
+// 32K: Qwen3.8-Flash-Next 0.00955 / top-1 100%, Qwen3.6-35B-A3B 0.04622 / 89.06%, the floors 0 / 100%).  A dense
+// model's default is the timed choice (the user's decision 2026-11-12: the RTX 4070's Qwen3.5-9B 32K prompt
+// 3245 -> 5462 tok/s; its KL 0.00411 / 96.88% against the BLAS floor 0.00107 / 100% accepted).
+// XESTRATA_LLM_W8A8=0 fixes the form off (a dense model too), =1 on (a MoE model too, without the timing).
+bool Gemm::llm_w8a8(void* stream, bool dense) {
+    static const int fixed = [] {
         const char* e = strata::env_get("LLM_W8A8");
-        return e != nullptr && std::strtol(e, nullptr, 10) != 0;
+        return e == nullptr ? -1 : std::strtol(e, nullptr, 10) != 0 ? 1 : 0;
     }();
-    return on && Gemm::i8_usable(stream);
+    if (fixed >= 0) return fixed == 1 && Gemm::i8_usable(stream);
+    if (!dense) return false;   // a MoE model: no timing, no int8 library (the comment above)
+    if (!Gemm::i8_usable(stream)) return false;
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    struct Kept {
+        std::mutex m;
+        int of = -1;
+    };
+    static core::PerDevice<std::shared_ptr<Kept>> per_device;
+    Kept& kept = *per_device.get(q.get_device(), [] { return std::make_shared<Kept>(); });
+    std::lock_guard<std::mutex> lock(kept.m);
+    if (kept.of >= 0) return kept.of == 1;
+    namespace sx = sycl::ext::oneapi::experimental;
+    if (core::timing_depth > 0 || q.ext_oneapi_get_state() == sx::queue_state::recording) return false;
+    constexpr int64_t T = 4096;
+    struct Shape { int type; int64_t N, K; size_t blk; };   // blk: a block's bytes (256 values, Q8_0's 32)
+    const Shape shapes[] = {{23, 10240, 2560, 136}, {14, 2560, 6144, 210}, {8, 8192, 2048, 272}};
+    std::vector<void*> held;
+    auto get = [&](size_t bytes) -> void* {
+        void* p = nullptr;
+        if (!strata::gpu::alloc_device(&p, bytes)) return nullptr;
+        held.push_back(p);
+        strata::gpu::memset_async(p, 0x11, bytes, stream);
+        return p;
+    };
+    double nat = -1, w8 = -1;
+    int64_t timed_rows = T;
+    try {
+        auto* x16 = static_cast<uint16_t*>(get((size_t) (T * 6144) * 2));
+        auto* y = static_cast<float*>(get((size_t) (T * 10240) * 4));
+        const void* wb[3];
+        int64_t max_elems = 0;
+        for (int i = 0; i < 3; ++i) {
+            const size_t bytes = (size_t) (shapes[i].N * shapes[i].K) / 256 * shapes[i].blk;
+            wb[i] = get(bytes);
+            max_elems = std::max(max_elems, shapes[i].N * shapes[i].K);
+        }
+        if (x16 == nullptr || y == nullptr || wb[0] == nullptr || wb[1] == nullptr || wb[2] == nullptr)
+            throw std::bad_alloc();
+        Gemm tg;
+        std::string err;
+        if (!tg.init(stream, max_elems, err)) throw std::runtime_error(err);
+        auto pass = [&](int64_t rows, bool w8a8) {
+            for (int i = 0; i < 3; ++i) {
+                if (w8a8) tg.native_w8a8(x16, shapes[i].type, wb[i], y, rows, shapes[i].N, shapes[i].K, 0);
+                else tg.native(x16, shapes[i].type, wb[i], y, rows, shapes[i].N, shapes[i].K);
+            }
+            return true;
+        };
+        // The timing runs each form some 7 times: on a GPU where a pass at 4096 rows takes seconds (the UHD 770,
+        // whose int8 product has no matrix unit to run on: its W8A8 pass did not end in 10 minutes, 2026-11-16) that
+        // is the start's minutes.  So both forms run once at kProbe rows first (after a run that compiles them), the
+        // slower one sets a pass's cost, taken as linear in the rows, and the timing takes the most rows up to T whose
+        // pass fits kPass; when not even kMinRows fit, no timing: native, the form the products took before.  The
+        // B70's and the RTX 4070's passes at 4096 rows (3.6 and 8.8 ms, above) are far inside it: they time at T as
+        // before.  The probe's rows overstate a W8A8 pass (its weights' conversion does not grow with the rows),
+        // which only errs towards fewer rows.
+        constexpr int64_t kProbe = 256, kMinRows = 1024;
+        constexpr double kPass = 0.25;   // seconds a pass may take: some 14 passes, a few seconds at the start
+        double probe = 0;
+        for (const bool w8a8 : {false, true}) {
+            pass(kProbe, w8a8);
+            q.wait_and_throw();
+            const auto t0 = std::chrono::steady_clock::now();
+            pass(kProbe, w8a8);
+            q.wait_and_throw();
+            probe = std::max(probe, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        }
+        int64_t rows = T;
+        while (rows >= kMinRows && probe * (double) rows / (double) kProbe > kPass) rows /= 2;
+        if (rows < kMinRows) {
+            std::fprintf(stderr, "xestrata: the LLMs' dense prompt products not timed: a pass of %lld rows would take "
+                                 "%.0f ms here (%.1f ms at %lld)\n", (long long) kMinRows,
+                         1e3 * probe * (double) kMinRows / (double) kProbe, 1e3 * probe, (long long) kProbe);
+            kept.of = 0;
+        } else {
+            const auto measured = core::timed_choice(
+                {{[&] { return pass(rows, false); }}, {[&] { return pass(rows, true); }}},
+                [&] { q.wait_and_throw(); }, 5, 1.10, 0.05);
+            nat = measured.seconds[0];
+            w8 = measured.seconds[1];
+            timed_rows = rows;
+            kept.of = measured.pick == 1 ? 1 : 0;
+        }
+    } catch (const std::exception& e) {
+        // native: the form the products took before (a GPU whose memory the timing's buffers do not fit)
+        std::fprintf(stderr, "xestrata: timing the LLMs' dense products: %s\n", e.what());
+        kept.of = 0;
+    }
+    strata::gpu::stream_sync(stream);
+    for (void* p : held) strata::gpu::free(p);
+    std::fprintf(stderr, "xestrata: the LLMs' dense prompt products through %s (three shapes at %lld rows: native "
+                         "%.2f ms, W8A8 %.2f)\n", kept.of == 1 ? "W8A8" : "native", (long long) timed_rows,
+                 nat > 0 ? 1e3 * nat : -1.0, w8 > 0 ? 1e3 * w8 : -1.0);
+    return kept.of == 1;
 }
 
 // The LLMs' dense prompt products take the W8A8 form through native_llm (their callers only: a DiT's FP16 products
@@ -849,10 +947,10 @@ bool Gemm::llm_w8a8(void* stream) {
 // at 8192 rows: the RTX 4070 6.93 ms native against about 3.9 W8A8 (2.36 with BF16 out, 3.50 with the weight's int8
 // rows resident), at 1024 rows 1.07 against 0.81.  The B70: 2.76 native against about 2.8 (1.84 with BF16 out, 1.47
 // resident), at 1024 rows 0.72 against 0.73.  The whole form timed on the three representative shapes (2026-11-12)
-// put the B70's W8A8 4 to 6% ahead of native (3.77 to 3.81 ms against 3.57 to 3.62).  Making it faster on the B70
-// needs a BF16 reader (every kernel downstream of the products) or the weights' int8 rows resident (several GiB of
-// VRAM for a whole model's dense weights, in the budget): not taken here.  The form is an opt-in
-// (XESTRATA_LLM_W8A8=1, the KL numbers at llm_w8a8 above).  Narrow
+// put the B70's W8A8 4 to 6% ahead of native (3.77 to 3.81 ms against 3.57 to 3.62), an edge that moved the choice
+// from run to run at a 5% margin: the 15% margin keeps native there.  Making it faster on the B70 needs a BF16
+// reader (every kernel downstream of the products) or the weights' int8 rows resident (several GiB of VRAM for a
+// whole model's dense weights, in the budget): not taken here.  Narrow
 // products (the shared experts, N 512 and 640) were slower in W8A8 from 4096 rows on the B70 (0.21 -> 0.28 ms at
 // 8192 rows), so native_llm takes only N >= 1024; below 1024 rows the weight's conversion outweighs the product
 // (the B70's attn_qkv at 512 rows: 0.74 native, 0.73 W8A8 with BF16 out, more with FP32's).
@@ -1006,12 +1104,12 @@ void Gemm::native_w8a8(const uint16_t* X, int ggml_type, const void* W_blocks, f
 }
 
 void Gemm::native_llm(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N,
-                      int64_t K, int64_t ldy, bool half_sums) {
+                      int64_t K, bool dense, int64_t ldy, bool half_sums) {
     // the shapes the W8A8 form was measured faster for (the comment at w8a8): wide products of many rows, K in whole
     // rotation groups.  The rest stay native: the narrow shared experts (N 512, 640) slower from 4096 rows on the
     // B70, the weight's conversion outweighing the product below 1024 rows
     if (T >= 1024 && N >= 1024 && K % strata::kernels::kI8Rotate == 0 && ggml_type != 0 && W_blocks != nullptr &&
-        llm_w8a8(stream_)) {
+        llm_w8a8(stream_, dense)) {
         native_w8a8(X, ggml_type, W_blocks, Y, T, N, K, ldy);
         return;
     }

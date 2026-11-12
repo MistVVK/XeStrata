@@ -84,12 +84,13 @@ public:
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, bool half_sums = false);
     /// The LLMs' dense prompt products (Qwen3.8-Flash-Next's native_proj, the plain engine's proj): native, or the
-    /// W8A8 form (native_w8a8) with XESTRATA_LLM_W8A8=1 (off by default: the form's KL against the floor of the same
-    /// binary's runs passed the task's bar nowhere it was taken, llm_w8a8 in gemm.cpp) and the shape is a wide
-    /// product of many rows (T >= 1024, N >= 1024, K a multiple of kernels::kI8Rotate).  An approximation: the
-    /// answers change.  A DiT's products never come here: they take f16 / bf16 / w8a8 directly.
+    /// W8A8 form (native_w8a8) where the model is dense and the GPU took it in a timing of three representative
+    /// shapes once (llm_w8a8 in gemm.cpp; XESTRATA_LLM_W8A8=0 or 1 fixes it, =1 a MoE model too) and the shape is a
+    /// wide product of many rows (T >= 1024, N >= 1024, K a multiple of kernels::kI8Rotate).  `dense`: the model
+    /// has no experts (its structure, not its name).  An approximation: the answers change (checked by KL against
+    /// the floor of the same binary's runs).  A DiT's products never come here: they take f16 / bf16 / w8a8 directly.
     void native_llm(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N,
-                    int64_t K, int64_t ldy = 0, bool half_sums = false);
+                    int64_t K, bool dense, int64_t ldy = 0, bool half_sums = false);
     /// native with FP16 sums into FP16 rows Y16 (row stride ldy), not widened into FP32: the reader takes them as they
     /// are (prefill::add_h, swiglu_pair_h), a pass over the sums fewer.  Where half_ok says no, the FP32 product
     /// narrowed into Y16 (the same rows, a pass more).
@@ -106,9 +107,13 @@ public:
     bool native_warm(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                      int64_t ldy = 0);
 
-    /// Whether the LLMs' dense prompt products take the W8A8 form: XESTRATA_LLM_W8A8=1 and the GPU takes int8
-    /// products (the comment at llm_w8a8 in gemm.cpp: off by default, the KL bar).
-    static bool llm_w8a8(void* stream);
+    /// Whether the LLMs' dense prompt products take the W8A8 form on this GPU: a dense model's choice timed once
+    /// (the comment at llm_w8a8 in gemm.cpp), XESTRATA_LLM_W8A8=0 or 1 fixing it (=1 without the timing, a MoE
+    /// model too).  `dense`: the model has no experts; a MoE model's default takes neither the timing nor the int8
+    /// library's load.  Called at startup (after settle) so the timing's cost and the library it loads land before
+    /// the first prompt, not in it; native_llm calls it too (a GPU the startup did not measure, a layer split's
+    /// second one).
+    static bool llm_w8a8(void* stream, bool dense);
     /// Loads the products' library ahead of the first prompt (oneMath's backend for the current GPU), on a thread of
     /// its own: call once for each GPU at startup.
     static void prepare();

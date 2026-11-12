@@ -4,6 +4,7 @@
 // layouts (channels last, weights [out][k][k][in]), a primitive made once a shape and kept.
 
 #include "qi_conv.hpp"
+#include "strata/kernels/onednn.hpp"
 #include "strata/platform/downgrade.hpp"
 
 #include <oneapi/dnnl/dnnl.hpp>
@@ -47,6 +48,7 @@ bool onednn(sycl::queue& q, const uint16_t* x, int64_t H, int64_t W, int64_t C, 
     using tag = dnnl::memory::format_tag;
     if ((add || f.gelu) && f.leaky >= 0.0f) return false;
     if (add && f.gelu) return false;
+    strata::kernels::onednn_quiet();
     std::lock_guard<std::mutex> lock(g_mu);
     Conv& d = g_conv[q.get_device()];
     if (d.failed) return false;

@@ -28,6 +28,7 @@
 #endif
 #endif
 #if STRATA_ONEDNN_I8
+#include "strata/kernels/onednn.hpp"
 #include <dnnl.hpp>
 #include <dnnl_sycl.hpp>
 #include <map>
@@ -306,6 +307,7 @@ std::unordered_map<sycl::device, Dnnl> g_dnnl;
 
 // Whether oneDNN's GPU engine takes q's device (made once a device).
 bool onednn_ok(sycl::queue& q) {
+    onednn_quiet();
     std::lock_guard<std::mutex> lock(g_dnnl_mu);
     Dnnl& d = g_dnnl[q.get_device()];
     if (!d.failed && !d.eng) {

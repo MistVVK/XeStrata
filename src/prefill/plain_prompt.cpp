@@ -288,6 +288,10 @@ bool PlainModel::prompt_warm(std::string& err) {
     if (opt_.prompt_chunk <= 0 || prompt_host_ == nullptr) return true;
     if (!prompt_borrow(std::min<int64_t>(opt_.prompt_chunk, 512), err)) return false;
     const bool ok = prompt_warm_products(err);
+    // the W8A8 choice of the dense products (Gemm::llm_w8a8): measured at startup where the program called it; an
+    // encoder opened in another process (the image engine's text reader) measures here, once a GPU.  A MoE model
+    // (dense_ false) takes neither the timing nor the int8 library's load
+    if (ok) prefill::Gemm::llm_w8a8(cs_, dense_);
     if (ok && dense_) prompt_dense_calibrate();
     if (ok && !dense_ && spec_.n_expert > 0 && prompt_int8()) {   // the experts' products' forms, timed for each type
         const int64_t N = spec_.n_embd, FF = spec_.n_ff_exp;
@@ -1115,7 +1119,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
         return !hooked && T < dense_native_rows_ && prompt_dense_int8(w, x, ldx, y, T, ldy);
     };
     auto proj = [&](const W& w, float* y, int64_t T, int64_t ldy = 0, bool half_sums = false) {
-        gm.native_llm(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy, half_sums);
+        gm.native_llm(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, dense_, ldy, half_sums);
     };
     // the routed experts in their quantized blocks (int8 products, iq_mmq: on the matrix engines, else by dp4a where the
     // FP16 products have none either) where every layer's types are theirs (prompt_int8, decided with the buffers) and

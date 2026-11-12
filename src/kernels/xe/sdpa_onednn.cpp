@@ -6,6 +6,8 @@
 
 #include "strata/kernels/sdpa_onednn.hpp"
 
+#include "strata/kernels/onednn.hpp"
+
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include "strata/platform/downgrade.hpp"
@@ -236,6 +238,7 @@ struct TrainCall {
 };
 bool train_call(sycl::queue& q, int64_t rows, int64_t keys, int64_t heads, int64_t hd, bool bwd, TrainCall& tc) {
     if (no_xmx()) return false;
+    onednn_quiet();
     const sycl::backend be = q.get_device().get_backend();
     if (be != sycl::backend::ext_oneapi_level_zero && be != sycl::backend::opencl) return false;
     Sdpa& d = g_sdpa[q.get_device()];
@@ -296,6 +299,7 @@ bool onednn_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, 
     // its kernels run on the matrix engines: STRATA_NO_XMX=1 (a GPU without them, played on one with them) leaves the
     // attention to the engine's own kernels
     if (no_xmx()) return false;
+    onednn_quiet();
     sycl::queue& q = core::Runtime::get().stream(stream);
     // oneDNN's GPU kernels are Intel's: its Level Zero and OpenCL devices
     const sycl::backend be = q.get_device().get_backend();

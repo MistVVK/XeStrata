@@ -4,8 +4,8 @@
 // same parts put together by hand (kernels::rows_i8 / rows_i8_blocks, Gemm::w8a8's int32 sums, kernels::i8_scale):
 // the same bits, and the FP16 product (native) within the int8 rows' rounding of it.  The shapes the form does not
 // take (a narrow product, few rows, K not in whole rotation groups) stay native, bit for bit, with
-// XESTRATA_LLM_W8A8=1 fixing the form on.  GPU, synthetic, no model; skipped (77) where the GPU takes no int8
-// product.
+// XESTRATA_LLM_W8A8=1 fixing the form on (a MoE model's dense=false too).  GPU, synthetic, no model; skipped (77)
+// where the GPU takes no int8 product.
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/rows_i8.hpp"
@@ -49,7 +49,7 @@ int check(const Fixture& f, strata::prefill::Gemm& g, bool take) {
     auto* dy = dev.alloc<float>((size_t) (f.T * f.N));
     auto* dr = dev.alloc<float>((size_t) (f.T * f.N));
     auto* dn = dev.alloc<float>((size_t) (f.T * f.N));
-    g.native_llm(dx, f.type, dw, dy, f.T, f.N, f.K);
+    g.native_llm(dx, f.type, dw, dy, f.T, f.N, f.K, /*dense=*/true);
     g.native(dx, f.type, dw, dn, f.T, f.N, f.K);
     if (take) {
         // the form by hand: the weight's int8 rows, the activations', the int32 sums, the scales back
@@ -103,6 +103,11 @@ int main() {
     if (!strata::prefill::Gemm::i8_usable(s)) {
         std::printf("no int8 product on this GPU: skipped\n");
         return 77;
+    }
+    // XESTRATA_LLM_W8A8=1 takes the form for a MoE model too (dense=false), without the timing
+    if (!strata::prefill::Gemm::llm_w8a8(s, /*dense=*/false)) {
+        std::printf("XESTRATA_LLM_W8A8=1 did not take the form for a MoE model\n");
+        return 1;
     }
     strata::prefill::Gemm g;
     std::string err;

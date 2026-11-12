@@ -2970,6 +2970,11 @@ int main(int argc, char** argv) {
         strata::gpu::mem_info(&f0, &tot);
         strata::prefill::Gemm::prepare();
         strata::prefill::Gemm::settle();
+        // the LLMs' dense products' W8A8 choice: this engine's models have experts (Prefill::init rejects
+        // n_expert < 1), so no timing and no int8 library by default; XESTRATA_LLM_W8A8=1 preloads the library
+        // here, before the weights take the room (its buffers are temporary; the library stays, counted into
+        // blas_bytes below)
+        strata::prefill::Gemm::llm_w8a8(nullptr, /*dense=*/false);
         strata::gpu::mem_info(&f1, &tot);
         blas_bytes = std::max<int64_t>(0, (int64_t) f0 - (int64_t) f1);
     }
