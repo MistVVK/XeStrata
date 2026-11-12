@@ -60,6 +60,7 @@
 #include "strata/prefill/moe_ws.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/i8_group.hpp"
 #include "strata/prefill/routed_stream.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/core/expert_nibble.hpp"
@@ -1557,9 +1558,11 @@ constexpr int MMQ_GROUP = 16;                  // experts per MMQ launch (the ga
 // product: 640 values).  Those bytes meet zero activations, which is harmless only if they decode to finite numbers -
 // llama.cpp zero-pads after every tensor, and so does a group buffer: this many zeroed bytes follow its last expert.
 constexpr size_t MMQ_TAIL = 4096;
-// OWN-I8: the device record of one native_expert_i8 launch (a group of at most MMQ_GROUP experts): the blob pointers (8 bytes each), the rows'
-// bounds relative to the launch's first row (MMQ_GROUP + 1 ints, padded to 80 bytes) and the group count (one int)
-constexpr size_t kI8RecStart = 8 * (size_t) MMQ_GROUP, kI8RecN = kI8RecStart + 80, kI8RecBytes = kI8RecN + 16;
+// OWN-I8: the int8 kernels' groups are collected by i8_group.hpp (its own group size, no MMQ); both sizes are the same number here
+static_assert(MMQ_GROUP == strata::prefill::i8grp::kGroupMax, "the int8 expert group and the MMQ group have the same size");
+#if defined(STRATA_PREFILL_MMQ)
+static_assert(strata::prefill::i8grp::kGroupMax == strata::prefill::mmq::kGatherGroupMax, "the int8 expert group and MMQ's gather group have the same size");
+#endif
 // STRATA_I8_COUNT=1 (diagnostic, off by default, no effect on any result): one stderr line per prompt chunk saying how many of the routed (token, expert)
 // entries of the layers that reached the MMQ group walk ran on native_expert_i8 and how many stayed on the walk's own kernels (MMQ, or the FP16 path).
 bool i8_count_on() {
@@ -1790,6 +1793,22 @@ const MmqPlan& mmq_plan() {
 }
 // the FP16 buffers (Xs, Hh): the FP16 path's, or pf_wmma's activations and down input
 bool fp16_bufs(const MmqPlan& mp) { return mp.fallback || pf_wmma(); }
+// OWN-I8: does a layer of this layout take the int8 expert groups on this device (the class rule or STRATA_EXPERT_I8=1, and the formats)?  A build without MMQ
+// has no MMQ buffers when no layer takes the fused kernels (mmq_plan().any is false); the int8 groups need one row table of theirs (the identity ids_identity),
+// which carve and bytes_needed then take on their own.
+bool i8_wants_identity() {
+    static const bool on = [] {
+        const auto& lay = strata::kernels::cpu::expert_layout();
+        if (!lay.native) return false;
+        for (const auto& f : lay.fmt) {
+            if (f.tail_off || f.had_gu || f.had_d) continue;
+            const strata::kernels::NativeExpertLayout L = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+            if (strata::kernels::native_expert_i8_prompt(L, (int64_t) 1 << 20)) return true;
+        }
+        return false;
+    }();
+    return on;
+}
 // STRATA_PF_GROUP_SCRATCH=1 (opt-in): on a layout whose every layer takes MMQ (no fused experts, no FP16 fallback or pf_wmma), the
 // gate/up output, its SwiGLU and its q8_1 copy (GU, H, Hq) hold one expert group's rows instead of the whole chunk's:
 // a group's products read them and are done with them before the next group starts, so the products and the bits are
@@ -2300,6 +2319,10 @@ bool Prefill::carve(size_t T, void* alloc) {
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
         // lends them - a write now would corrupt a resident expert)
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
+    } else if (i8_wants_identity()) {
+        const size_t ids_rows = mmq_ids_rows(T);
+        if (ids_rows == 0) ok = false;
+        m.ids_identity = o.take<int32_t>(ids_rows, ok);   // OWN-I8: the identity row table of the int8 groups (no MMQ buffers in this layout)
     }
     m.ring = ring_slots(T);
     const int nstage = stage_slots(T);   // the staged walk may use STAGE_GRP of them
@@ -3107,6 +3130,10 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
             o.take<int64_t>((size_t) g.n_expert, ok);
             o.take<int32_t>(4 * ws::max_chunks((int64_t) T * K, g.n_expert), ok);
         }
+    } else if (i8_wants_identity()) {
+        const size_t ids_rows = mmq_ids_rows(T);
+        if (ids_rows == 0) ok = false;
+        o.take<int32_t>(ids_rows, ok);   // ids_identity (OWN-I8, a build without MMQ buffers)
     }
     if (owned_pages) {
         if (stage_slots(T) > 0) o.take<uint8_t>((size_t) stage_slots(T) * (size_t) MAXBLOB(), ok);   // one allocation
@@ -5453,9 +5480,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }();
                         strata::kernels::NativeExpertLayout i8_L{};
                         bool i8_l = false;
-                        if (use_mmq && lay.native && !fused_l && !fz_staged && !wmma_l && !had_gu && !had_d && rows_cpu == 0 && on_peer.empty() && !m.pp &&
+                        // (a build without MMQ has no use_mmq layer: the layers the fused kernels do not take come here too, as long as the buffers below exist)
+                        if (lay.native && !fused_l && !fz_staged && !wmma_l && !had_gu && !had_d && rows_cpu == 0 && on_peer.empty() && !m.pp &&
                             m.group_cap == 0 && !m.fused_bufs && !lay.fmt[(size_t) l].tail_off && ws::mode() == 0 &&
-                            !(m.cache && mmq_plan().direct[(size_t) l]) && i8_group_env && MMQ_GROUP <= mmq::kGatherGroupMax && !order.empty() &&
+                            !(m.cache && mmq_plan().direct[(size_t) l]) && i8_group_env && !order.empty() &&
                             m.GU != nullptr && m.Dm != nullptr && m.src_dev != nullptr && m.ids_identity != nullptr &&
 #if STRATA_EXPERT_NIBBLE_BUILT
                             !nib_l.on &&
@@ -5504,7 +5532,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 }
                                 m.fr_xq_rows = T;
                             }
-                            if (m.i8_rec == nullptr && cudaMalloc((void**) &m.i8_rec, kI8RecBytes) != cudaSuccess) {
+                            if (m.i8_rec == nullptr && cudaMalloc((void**) &m.i8_rec, strata::prefill::i8grp::kRecBytes) != cudaSuccess) {
                                 m.i8_rec = nullptr;
                                 err = "prefill: int8 experts: no memory for the group record";
                                 return false;
@@ -5637,6 +5665,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     wl.rows = T * K; wl.n = (int) n; wl.xq = m.Xq; wl.gu = m.GU; wl.hq = m.Hq; wl.dm = m.Dm;
                                 }
                             }
+                        } else if (i8_l) {
+                            // (the int8 kernels read the tokens' q8_1 rows through src_dev: no per-row copy at all)
                         } else {
                             gather_rows16(m.mixed_h, m.src_dev, m.Xs, T * K, N, m.cs);
                             // APR: Hadamard-folded gate/up take H (s * x); Xs is this layer's private gathered copy
@@ -5943,14 +5973,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const char* v = std::getenv("STRATA_PREFILL_GROUP_GATHER");
                             return v == nullptr || std::atoi(v) != 0;
                         }();
-                        const bool group_gather = group_env && stream_all && use_mmq && lay.native &&
-                                                  MMQ_GROUP <= mmq::kGatherGroupMax;
+                        const bool group_gather = group_env && stream_all && lay.native && ((use_mmq && MMQ_GROUP <= mmq::kGatherGroupMax) || i8_l);
                         // The staged walk (a short prompt) groups too, resident and staged experts alike: its ring is
                         // then STAGE_GRP slots, two groups, and it stages no further ahead than the open group allows,
                         // so a group's staged slots stay unread-over until its flush (one wait on the last copy, one
                         // event releasing them all, as in the streamed walk).
-                        const bool group_resident = group_env && !stream_all && use_mmq && lay.native &&
-                                                    MMQ_GROUP <= mmq::kGatherGroupMax;
+                        const bool group_resident = group_env && !stream_all && lay.native && ((use_mmq && MMQ_GROUP <= mmq::kGatherGroupMax) || i8_l);
                         const bool gg_now = group_gather || group_resident;
                         const int stage_n = group_resident ? STAGE_GRP : STAGE;
                         // Stage ahead: the copy stream moves blobs host -> device while the compute stream works.
@@ -6034,7 +6062,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         size_t gg_ents[MMQ_GROUP];   // the streamed walk: their entries (wait_copied)
                         int gg_nslots = 0;   // ring slots gathered by the next flush
                         size_t cur_entry = 0;   // the streamed walk: the entry compute() is given
-                        size_t gg_j0 = 0;       // OWN-I8: the open group's first position in `order` (gg's expert i is order[gg_j0 + i])
+                        strata::prefill::i8grp::Group g8;   // OWN-I8: the open group of the int8 kernels (i8_group.hpp), for a layer with i8_l
                         // P4-SMALL (fz_staged): the open group's expert pointers and the layer's native geometry
                         // The layer's tables are built once (fused::group_bounds over every routed expert's rows, below); the experts then
                         // launch in batches: the open batch (fz_b, local experts [fz_j0, ..)) closes at kMaxBatch experts, at MMQ_GROUP experts
@@ -6057,7 +6085,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // `zero`: the MMQ tail zeroed after the gathered experts (the group's last flush); a direct
                         // group's tail is zeroed by prep_group
                         auto flush = [&](size_t zero) {
-                            if (gg.n <= gg.first) return;
+                            if (i8_l ? !g8.open() : gg.n <= gg.first) return;
                             const auto& f = lay.fmt[(size_t) l];
                             if (gg_nslots > 0) {   // the copies land in order: the last one covers the others
                                 pt.mark(kPfWaitCopy, cs);
@@ -6065,41 +6093,27 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 pt.mark(kPfDequant, cs);
                             }
                             if (i8_l) {
-                                // OWN-I8: the open group's experts [gg.first, gg.n) run here as one launch pair on native_expert_i8, each read where it is
-                                // (a flush in the middle of a group, for a skipped ring entry, runs the experts it holds so far as a group of their own).
-                                // Their rows are contiguous: bounds relative to the first row go up with the blob pointers; the rows' tokens are src_dev
-                                // from there, the rows' places in Dm are the identity from there; H as q8_1 lives in the group's own rows of GU
-                                // (MMQ's gate/up output, unused here: 5,120 bytes a row against the 720 + a few bytes of H that this needs)
-                                const size_t a = gg_j0 + (size_t) gg.first, b = gg_j0 + (size_t) gg.n;
-                                const int ne = (int) (b - a);
-                                const int64_t r0 = m.off[(size_t) order[a]];
-                                const int64_t nr = (int64_t) m.off[(size_t) order[b - 1]] + m.cnt[(size_t) order[b - 1]] - r0;
-                                uint8_t rec_h[kI8RecBytes] = {};
-                                for (int i = 0; i < ne; ++i) {
-                                    const unsigned long long p = (unsigned long long) (uintptr_t) gg.blob[gg.first + i];
-                                    std::memcpy(rec_h + 8 * (size_t) i, &p, 8);
-                                    const int32_t s = (int32_t) (m.off[(size_t) order[a + (size_t) i]] - r0);
-                                    std::memcpy(rec_h + kI8RecStart + 4 * (size_t) i, &s, 4);
-                                }
-                                const int32_t s_end = (int32_t) nr;
-                                std::memcpy(rec_h + kI8RecStart + 4 * (size_t) ne, &s_end, 4);
-                                std::memcpy(rec_h + kI8RecN, &ne, 4);
-                                if (nr <= 0 || strata::kernels::native_expert_i8_scratch_bytes(nr, ne, i8_L.n_ff) > (size_t) nr * (size_t) kFF2 * sizeof(float) ||
-                                    m.up_ring.h2d(m.i8_rec, rec_h, kI8RecBytes, m.cs) != cudaSuccess) {
-                                    std::fprintf(stderr, "prefill: int8 experts: the group's record could not be made (%lld rows, %d experts)\n", (long long) nr, ne);
+                                // OWN-I8 (i8_group.hpp): the open group's experts [g8.first, g8.n) run here as one launch pair on native_expert_i8, each read
+                                // where it is (a flush in the middle of a group, for a skipped ring entry, runs the experts it holds so far as a group of
+                                // their own).  Their rows are contiguous: bounds relative to the first row go up with the blob pointers; the rows' tokens are
+                                // src_dev from there, the rows' places in Dm are the identity from there; H as q8_1 lives in the group's own rows of GU
+                                // (the rows of an MMQ gate/up output, unused here: 5,120 bytes a row against the 720 + a few bytes of H that this needs)
+                                int64_t i8_nr = 0;
+                                int i8_ne = 0;
+                                pt.mark(kPfGemmGU, cs);
+                                if (!strata::prefill::i8grp::run(i8_L, g8, order.data(), m.off.data(), m.cnt.data(),
+                                                                 [&](const void* h, size_t bytes) { return m.up_ring.h2d(m.i8_rec, h, bytes, m.cs) == cudaSuccess; },
+                                                                 m.i8_rec, m.ids_identity, m.src_dev, m.fr_xq, m.GU, kFF2, m.Dm, N, m.cs, &i8_nr, &i8_ne)) {
+                                    std::fprintf(stderr, "prefill: int8 experts: the group's record could not be made (%lld rows, %d experts)\n", (long long) i8_nr, i8_ne);
                                     std::exit(1);   // (flush cannot return an error: as the gather's own failure path, the engine stops)
                                 }
-                                pt.mark(kPfGemmGU, cs);
-                                strata::kernels::native_expert_i8(i8_L, (const unsigned long long*) m.i8_rec, (const int32_t*) (m.i8_rec + kI8RecStart),
-                                                                  (const int32_t*) (m.i8_rec + kI8RecN), m.ids_identity, m.src_dev + r0, ne, nr, m.fr_xq,
-                                                                  (void*) (m.GU + r0 * kFF2), m.Dm + r0 * N, m.cs);
                                 if (gg_nslots > 0) {   // the group's staged blobs are read: one event releases their slots
                                     const int rel = gg_slots[gg_nslots - 1];
                                     cudaEventRecord(m.used[rel], m.cs);
                                     for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel;
                                 }
                                 gg_nslots = 0;
-                                gg.first = gg.n;
+                                g8.launched();
                                 return;
                             }
 #if STRATA_EXPERT_NIBBLE_BUILT
@@ -6172,6 +6186,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 fz_j0 = j + 1;
                                 return true;
                             }
+                            if (i8_l) {   // OWN-I8: the expert joins the int8 kernels' open group; the group's products run in the flush
+                                g8.add(j, blob_dev);
+                                if (slot >= 0) { gg_ents[gg_nslots] = cur_entry; gg_slots[gg_nslots++] = slot; }
+                                if (!strata::prefill::i8grp::Group::last(j, order.size())) return true;
+                                flush(0);
+                                g8.reset();
+                                return true;
+                            }
                             if (use_mmq) {
                                 // gather the expert into its group slot (GGUF blocks, unchanged or converted)
                                 const size_t q = j % MMQ_GROUP;
@@ -6211,12 +6233,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (gg_now) {
                                     gg.blob[q] = blob_dev;
                                     gg.n = (int) q + 1;
-                                    gg_j0 = j - q;
                                     if (slot >= 0) { gg_ents[gg_nslots] = cur_entry; gg_slots[gg_nslots++] = slot; }
                                     if (!last_of_group) return true;
                                     flush(MMQ_TAIL);
                                     gg = mmq::GatherGroup{};
-                                    if (i8_l) return true;   // OWN-I8: the group's products ran in the flush (native_expert_i8: gate/up, SwiGLU, down)
                                 } else if (lay.native) {
                                     const auto& f = lay.fmt[(size_t) l];
 #if STRATA_EXPERT_NIBBLE_BUILT
