@@ -2803,19 +2803,21 @@ bool native_supported(int gu_type, int d_type) {
     // forced-token gate PASS over 48 prompts; small chunks, agent, first 8K read, backstop as MMQ; STRATA_PF_FUSED_SM86=0 off).
     // IQ2_XXS / IQ2_XS gate/up (the IQ3_XXS and IQ2_XS packs) joined on 11-12 on the owner's word (RTX A6000, IQ3_XXS pack: prompt time fused / MMQ-mixed 0.874-0.976 from 300 to 8,193
     // tokens on the integration head, 5 rounds; teacher-forced KL vs the FP16 prompt path 0.965 / 1.062 / 1.072 / 1.008 at 512 / 1,000 / 2,048 / 8,192 ids; the rule: fused_tile_rule.hpp).
-    // Every other CUDA card: opt-in as before.
+    // Every other CUDA card (and the 40-79 SM cards for every launch outside the staged class): opt-in as before.
     if (env < 0) {
         // the native Q2_0 pack's Q2_0 / Q2_0 layers: only with STRATA_PF_FUSED_Q2N=1 (d.q2n), on any sm_80+ card
         if (gu_type == T_Q2_0) { const DevInfo& d = dev_info(); return d.ok && d.q2n && d_type == T_Q2_0 && d_covered_on(d_type, d); }
         if (!strata::prefill::fused_tile::default_gate_format(gu_type)) return false;   // IQ2_XXS / IQ2_XS joined 11-12 (owner), see fused_tile_rule.hpp
         const DevInfo& d = dev_info();
-        // 12.0 and 8.6 cards with 80+ SMs only (RTX PRO 5000 / 6000, RTX 5080 / 5090; RTX A6000 / A40, RTX 3090 / 3090 Ti / 3080 Ti):
-        // on an RTX 5070 (48 SMs, IQ2_XS pack, experts partly in RAM) the fused kernels were 4.7% slower on 20K prompts (0/6 pairs),
-        // and the RTX A4000 (sm_86, 48 SMs) has no real-model data - they keep MMQ unless STRATA_PF_FUSED=1
-        // STRATA_PF_FUSED_SM40=1 (research, off unless set): the sm_86 / sm_120 cards with 40-79 SMs also take the launches with a staged gate/up kernel (IQ3_XXS / IQ3_S / IQ4_XS) and an IQ4_NL / Q2_0
-        // down; the rule itself is fused_tile::takes_by_default (unit-tested)
-        static const bool sm40 = [] { const char* v = std::getenv("STRATA_PF_FUSED_SM40"); return v != nullptr && v[0] == '1'; }();
-        return d.ok && strata::prefill::fused_tile::default_takes(env, {d.s120, d.s121, d.sms, d.s86}, sm40, sw_on(gu_type, true), d_type == T_IQ4_NL || d_type == T_Q2_0, gu_type) && !d.t75 &&
+        // 12.0 and 8.6 cards with 80+ SMs (RTX PRO 5000 / 6000, RTX 5080 / 5090; RTX A6000 / A40, RTX 3090 / 3090 Ti / 3080 Ti) take every format of the default list;
+        // on an RTX 5070 (48 SMs, IQ2_XS pack, experts partly in RAM) the fused kernels were 4.7% slower on 20K prompts (0/6 pairs), so the 40-79 SM cards take only the staged launches below
+        // (the unstaged formats keep MMQ there unless STRATA_PF_FUSED=1)
+        // The sm_86 / sm_120 cards with 40-79 SMs (RTX A4000, RTX 5070 class) also take the launches with a staged gate/up kernel (IQ3_XXS / IQ3_S / IQ4_XS) and an IQ4_NL / Q2_0 down, by default since
+        // the owner's word of 11-12 (RTX A4000, IQ3_XXS set, end to end: prompt time MMQ / fused 1.000 / 1.003 / 1.028 / 1.012 at 2K / 4K / 8K / 20K, forced-token KL against the FP16 prompt path
+        // 0.930 [0.881, 0.988] at 2,048 and 0.973 [0.898, 1.057] at 8,192 ids); STRATA_PF_FUSED_SM40=0 takes them back to MMQ (a diagnostic like STRATA_PF_FUSED_SM86=0).  The rule itself is
+        // fused_tile::default_takes_env (unit-tested over every card flag, SM count, switch state and launch kind).  This whole branch is CUDA-only (the #if !defined(__HIPCC__) above): a HIP build never reads it.
+        static const int sm40_env = [] { const char* v = std::getenv("STRATA_PF_FUSED_SM40"); return v == nullptr ? -1 : (v[0] == '0' ? 0 : 1); }();
+        return d.ok && strata::prefill::fused_tile::default_takes_env(env, {d.s120, d.s121, d.sms, d.s86}, sm40_env, sw_on(gu_type, true), d_type == T_IQ4_NL || d_type == T_Q2_0, gu_type) && !d.t75 &&
                d_covered_on(d_type, d);
     }
     if (gu_type == T_Q2_0 && d_type != T_Q2_0) return false;   // the opt-in (STRATA_PF_FUSED=1 as well) takes the Q2_0 / Q2_0 pair only
