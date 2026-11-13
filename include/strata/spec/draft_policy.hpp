@@ -120,6 +120,7 @@ struct CostFile {
     double cpu_share = -1.0;   ///< < 0: none stored
     double pcie_frac = -1.0;   ///< the decode PCIe share PcieAuto settled on; < 0: none stored (a file from before it: refined, then written)
     /// Calibration against real requests (see DraftPolicy::start_calibration); a file without these lines has none done.
+    int reqs = 0;   ///< requests that ran while the table was held back (DraftPolicy::kCalibReqs ends the holding)
     bool state_effect = false;   ///< the learning stretch showed a load-time effect: only fresh real rounds are counted
     std::array<unsigned, CostLearner::kCtxBuckets> real{};   ///< bit t-1: the cost of size t is a median of real rounds, no longer the learned one
     std::array<std::array<CalAcc, CostLearner::kMaxT + 1>, CostLearner::kCtxBuckets> cal{};   ///< real rounds collected so far for the sizes not yet replaced
@@ -231,12 +232,15 @@ public:
     /// keeps its learned cost.  real, cal and real_cost come from the file (CostFile).
     /// Until every size of the table is real the table is not used: the policy decides with live costs, exactly as without a table (a half-calibrated
     /// table priced a JSON request 5 % slower than live costs), and only collects the real rounds; once the last size is calibrated the table
-    /// (the real costs) decides for good.
+    /// (the real costs) decides for good.  A size that real requests do not reach (the long lookup sizes of a big GPU) would hold it back for good, so after
+    /// kCalibReqs requests the table is used anyway: such a size is priced at its learned cost x the mean (real / learned) of the real
+    /// sizes of 2 or more rows (a size 1 at its learned cost) until it has its own kCalibN rounds.  The count is kept in the file (CostFile::reqs).
     static constexpr int kCalibN = 16;
+    static constexpr int kCalibReqs = 100;   // requests that may run while the table is held back; then a size not reached keeps a scaled learned cost
     static constexpr double kCalibLo = 0.85, kCalibHi = 1.30, kCalibOkLo = 0.86, kCalibOkHi = 1.29;
     void start_calibration(bool state_effect, const std::array<unsigned, kCtxBuckets>& real,
                            const std::array<std::array<CalAcc, kMaxT + 1>, kCtxBuckets>& cal,
-                           const std::array<std::array<double, kMaxT + 1>, kCtxBuckets>& real_cost);
+                           const std::array<std::array<double, kMaxT + 1>, kCtxBuckets>& real_cost, int reqs = 0);
     bool calibrating() const { return calib_on_; }
     bool calib_dirty() const { return calib_dirty_; }
     /// While a loaded table still has sizes that are not calibrated (calibrating()), the table is held back: the policy decides with live costs
@@ -299,6 +303,7 @@ private:
     std::array<unsigned, kCtxBuckets> real_{};
     std::array<std::array<CalAcc, kMaxT + 1>, kCtxBuckets> cal_{};
     std::array<std::array<double, kMaxT + 1>, kCtxBuckets> learned_{}, real_cost_{};   // the table as fixed (learned); the cost of each real size
+    int reqs_ = 0;                                         // requests that ran while the table was held back (the file keeps it)
     bool held_table_ = false;                              // a table is loaded but not used yet: live costs decide (see table_held())
     bool live_saved_ = false;
     std::array<std::array<double, kMaxT + 1>, kCtxBuckets> live_cost_{}, live_n_{};   // the live costs as they were when the table was set

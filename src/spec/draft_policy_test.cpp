@@ -620,11 +620,37 @@ int main() {
             check(u.fixed() && !u.table_held() && !u.calibrating() && std::fabs(u.cost_ms(4) - 18.57 * 1.03) < 1e-9 && std::fabs(u.cost_ms(1) - 12.68 * 1.03) < 1e-9,
                   "calib: a start from a fully calibrated file uses the table at the real costs");
         }
+        {   // sizes that real requests never reach: after kCalibReqs requests the table is used anyway, those sizes at a scaled learned cost
+            DraftPolicy bd(8);
+            bd.set_fixed_costs(tab, 5, 0);
+            bd.start_calibration(false, Real{}, cal0, rc0, 0);
+            CostFile cb;
+            std::string rb;
+            for (int i = 0; i < 16; ++i) bd.observe(false, 2, 1, 0, 14.60);
+            bd.calibrate(cb, rb);
+            for (int rq = 2; rq < DraftPolicy::kCalibReqs; ++rq) {
+                bd.observe(false, 3, 2, 0, 16.70);
+                bd.calibrate(cb, rb);
+            }
+            check(bd.table_held() && !bd.fixed() && cb.reqs == DraftPolicy::kCalibReqs - 1, "budget: held back before the last request of the budget");
+            bd.observe(false, 3, 2, 0, 16.70);
+            const bool wr = bd.calibrate(cb, rb);
+            const double rr = (14.60 / 14.30 + 16.70 / 16.41) / 2.0;
+            check(wr && bd.fixed() && !bd.table_held() && cb.reqs == DraftPolicy::kCalibReqs && bd.calibrating(), "budget: after kCalibReqs requests the table is used, calibration goes on");
+            check(std::fabs(bd.cost_ms(2) - 14.60) < 1e-9 && std::fabs(bd.cost_ms(3) - 16.70) < 1e-9 && std::fabs(bd.cost_ms(1) - 12.68) < 1e-9 &&
+                      std::fabs(bd.cost_ms(4) - 18.57 * rr) < 1e-6 && std::fabs(bd.cost_ms(5) - 20.90 * rr) < 1e-6,
+                  "budget: real sizes at their real cost, sizes not reached at learned x the mean ratio, size 1 at its learned cost");
+            DraftPolicy bs(8);   // a start from that file: used at once
+            bs.set_fixed_costs(tab, 5, 0);
+            bs.start_calibration(false, cb.real, cb.cal, cb.real_cost, cb.reqs);
+            check(bs.fixed() && !bs.table_held() && std::fabs(bs.cost_ms(4) - 18.57 * rr) < 1e-6, "budget: a start after the budget uses the table at once, same prices");
+        }
         // the file round trip: state, real, real cost, cal
         CostFile w;
         w.key = "k2";
         w.tables[0].assign(tab, tab + 5);
         w.state_effect = true;
+        w.reqs = 7;
         w.real[0] = 6u;
         w.real_cost[0][2] = 14.6;
         w.real_cost[0][3] = 16.7;
@@ -633,7 +659,7 @@ int main() {
         std::string why;
         check(write_cost_file(path, w, why), "calib file: written");
         CostFile r;
-        check(read_cost_file(path, "k2", r, why) && r.state_effect && r.real[0] == 6u && r.cal[0][4].n == 7 && std::fabs(r.cal[0][4].sum - 131.0) < 1e-3 && r.cal[0][2].n == 0 &&
+        check(read_cost_file(path, "k2", r, why) && r.state_effect && r.reqs == 7 && r.real[0] == 6u && r.cal[0][4].n == 7 && std::fabs(r.cal[0][4].sum - 131.0) < 1e-3 && r.cal[0][2].n == 0 &&
                   std::fabs(r.real_cost[0][2] - 14.6) < 1e-9 && std::fabs(r.real_cost[0][3] - 16.7) < 1e-9,
               "calib file: state, real marks, real costs and collected rounds come back");
         std::remove(path.c_str());

@@ -14568,7 +14568,7 @@ int main(int argc, char** argv) {
                         sizes += (sizes.empty() ? "" : ", ") + std::to_string(cf.tables[(size_t) k].size());
                     }
                 dc_file = cf;
-                policy.start_calibration(cf.state_effect, cf.real, cf.cal, cf.real_cost);
+                policy.start_calibration(cf.state_effect, cf.real, cf.cal, cf.real_cost, cf.reqs);
                 dc_calib = policy.calibrating();
                 if (cf.cpu_share >= 0.0) strata::prefill::Prefill::fix_cpu_share(cf.cpu_share);
                 std::string extra = cf.cpu_share >= 0.0 ? "; CPU prompt share " + std::to_string(cf.cpu_share).substr(0, 4) : "";
@@ -14581,7 +14581,7 @@ int main(int argc, char** argv) {
                 }
                 if (dc_calib)
                     std::fprintf(stderr, "strata serve: draft costs: this machine's table is loaded (%s; window sizes %s%s), not used yet: the "
-                                         "windows follow live costs until every size is calibrated against real requests\n",
+                                         "windows follow live costs until every size is calibrated against real requests (or 100 requests have run)\n",
                                  o.draft_costs.c_str(), sizes.c_str(), extra.c_str());
                 else
                     std::fprintf(stderr, "strata serve: draft costs: this machine's table is used (%s; window sizes %s%s): the same request "
@@ -20090,7 +20090,7 @@ int main(int argc, char** argv) {
                     policy.reset_learning();
                     dc_learning = false;
                     dc_file = cf;
-                    policy.start_calibration(cf.state_effect, cf.real, cf.cal, cf.real_cost);
+                    policy.start_calibration(cf.state_effect, cf.real, cf.cal, cf.real_cost, cf.reqs);
                     dc_calib = policy.calibrating();
                     std::string t0;
                     char b[24];
@@ -20107,14 +20107,14 @@ int main(int argc, char** argv) {
                         t0 += b;
                     }
                     std::fprintf(stderr, "strata serve: draft costs: this machine's table is learned (%s); %s%s%s\n", t0.c_str(),
-                                 dc_calib ? "live costs decide until every size is calibrated against real requests, then it is fixed"
+                                 dc_calib ? "live costs decide until every size is calibrated against real requests (or 100 requests have run), then it is fixed"
                                           : "it is fixed from the next request on",
                                  saved ? "" : " (not saved: ", saved ? "" : (why + "; the next start learns again)").c_str());
                 }
             }
             // --draft-costs, calibration: the real rounds of this request that the sizes still at their learned cost have collected; a size with
             // kCalibN of them takes their mean (the file is rewritten whole, the new cost applies from the next request on, no later change)
-            if (dc_calib && policy.calib_dirty()) {
+            if (dc_calib && (policy.calib_dirty() || policy.table_held())) {
                 strata::spec::CostFile cc = dc_file;
                 std::string rep, why;
                 if (policy.calibrate(cc, rep)) {
@@ -20126,7 +20126,7 @@ int main(int argc, char** argv) {
                 }
                 dc_calib = policy.calibrating();
                 if (!dc_calib && policy.fixed())
-                    std::fprintf(stderr, "strata serve: draft costs: every size is calibrated; this machine's table decides the windows from the next "
+                    std::fprintf(stderr, "strata serve: draft costs: calibration is over; this machine's table decides the windows from the next "
                                          "request on\n");
             }
             // --draft-costs with a table from before the stored PCIe share: once PcieAuto has settled (three readings, or it gave up), its
