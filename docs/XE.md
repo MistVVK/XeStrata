@@ -446,7 +446,6 @@ The paths meant to be faster are not carried: measured on the B70, none was fast
 | GDN key-head sharing (`XESTRATA_GDN_KEYHEAD`) | 0.54x of the default path |
 | Split hyper-connection read (`XESTRATA_GR_V3`) | Decode about 18% slower |
 | P-core / E-core placement of the CPU pool (`--pool-affinity`) | Decode 1–4% slower |
-| AVX2 multi-token K-quant products (`XESTRATA_KQ256`) | Within the spread |
 | Software prefetch in the AVX2 IQ kernels | Within the spread |
 | Routing-aware prefetch of the file tier (`XESTRATA_LOOKAHEAD`) | Decode about 2% slower |
 

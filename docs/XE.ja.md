@@ -430,7 +430,6 @@ CUDA、HIP、Windows の実装は移していません。複数の GPU の実装
 | GDN の key-head の共有（`XESTRATA_GDN_KEYHEAD`） | 既定の経路の 0.54 倍 |
 | hyper-connection の分割読み出し（`XESTRATA_GR_V3`） | decode が約 18% 遅い |
 | CPU のプールの P コアと E コアの配置（`--pool-affinity`） | decode が 1〜4% 遅い |
-| K-quant の AVX2 の多トークンの積（`XESTRATA_KQ256`） | 差はばらつきの範囲 |
 | AVX2 の IQ カーネルのソフトウェアのプリフェッチ | 差はばらつきの範囲 |
 | ファイルの層のルーティングによる先読み（`XESTRATA_LOOKAHEAD`） | decode が約 2% 遅い |
 
