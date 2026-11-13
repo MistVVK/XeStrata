@@ -135,6 +135,8 @@ Every idea is ported and measured, whether XeStrata wins or loses against upstre
 - Port it behind an environment switch (`XESTRATA_<NAME>=0|1` through `strata::env_get`, or the option upstream gave it), so it can be measured on and off and turned off later. Related ideas go in as a group, each behind its own switch.
 - Its condition is XeStrata's: what the device reports (matrix units, memory, the PCIe link, the CPU pool's measured speed), not upstream's backend.
 - An exact change that can be checked bitwise is checked by a probe; an opt-in feature is run once to see it works.
+  A change that has to leave the answers as they are is checked by the answers' md5 (below), a cell that moved saying
+  either that the change is not exact (step 5) or that it is a bug.
 - A speed idea is measured with `scripts/ab_pair.py`: the same binary with its switch off (A) and on (B), in the setting the idea is for (its tier, the serve path, a conversation; `TIERS`, `MODES`, `CONVS`), once (`ROUNDS=1`) on one GPU, the one the idea is most likely to help (the user's decision of 2026-10-12).
   Both runs are XeStrata with one seed: they write one text unless the switch changes the output, so the difference is the switch's alone and a difference of 1 to 2% shows.
 
@@ -150,6 +152,23 @@ python .claude/skills/upstream-sync/scripts/judge.py <out>        # B against A 
   The numbers go into the idea's line, the commit and the record.
 - Probes on the B70 and the RTX 4070 may run together; whole-engine A/B runs one card at a time.
 - An idea taken into the plain engine is measured there as well, by the same rule, on a plain model (Ornith-1.5 or Qwen3.6-35B-A3B), with `--no-pcie-split --adapt-every 0` where two outputs are compared (else the measured CPU/GPU split changes the output from run to run).
+
+### The answers that must not move
+
+An idea that must leave the answers as they are is checked by their md5, against the previous record's: a cell is one model at one length (Qwen3.8-Flash-Next and the plain models, at 1K and 32K) or one image model at one size (the four, at 512²), run on a fixed text with the settings that decide its answer (greedy, `--adapt-every 0 --pcie-frac 0`, setup's context for the length; the image models' 4 steps and seed 7), two rounds a cell (a cell that answers differently from run to run is one the watch cannot read alone).
+A run keeps the answer's line and the logits it was chosen from, or the PNG; the md5s are of those, so the unify2 records' tables (`llm/*.out`, their `s-sum.py`) compare with a new record as they are.
+
+```sh
+DATA=<data> XE="CMD..." XE_PROFILE=<data>/data/expert-profile.bin [XE_IMAGE_EXE=... XE_LIB_DIRS=...] \
+  python .claude/skills/upstream-sync/scripts/md5_watch.py $o/md5-<step> <GPU>      # every cell: ~30 min
+python .claude/skills/upstream-sync/scripts/md5_judge.py $o/md5-<step> --prev $o/md5
+```
+
+`md5_judge.py` prints a line a cell: `SAME` (the same answer from the same logits bit for bit), `BITS` (the same answer, other logits: the arithmetic moved without moving it), `MIXED` (each record has an answer the other lacks), `CHANGED` (no answer in common), `FAILED` (no answer where the previous record's had one), `NEW` and `NOT COMPARED`.
+A cell that moved is read by the KL of the logits (an LLM's: the previous record's distribution against this one's, over the rows both read the same text at) or by the pixels' difference (an image's), each against its own floor: `SAME` and `MIXED` are not failures, `BITS`, `CHANGED` and `FAILED` are (exit 1).
+The cells cost more than an A/B: run them after an idea that has to be exact, or once for a bundle of such ideas, on the GPU whose answers the engine gives most steadily (the B70), and keep `$o/md5` as the next run's baseline (step 9).
+The auto choices (`--expert-cache auto`, `--prefill auto`) can pick other slot counts between two starts and with them other bits: a cell that answers differently round to round shows as `MIXED`, and `EXTRA` takes setup's `--vram-free-mib` and `--prefill-cpu-share` to pin them.
+`LOGITS=0` saves the dumps (32 MB a cell) and leaves a moved cell's KL unread; `MODELS`, `TIERS`, `IMAGE_MODELS` and `ROUNDS` narrow a step to the cells it touched.
 
 ### GPUs there is no machine for
 
@@ -179,6 +198,10 @@ An idea that changes the output (it skips experts, reads fewer of them, rounds c
 - Within upstream's criterion: on by default where upstream has it on by default (under XeStrata's own condition, step 4) and where step 4's A/B shows it faster; its switch turns it off. Beyond the criterion on a GPU, or no check upstream ran to follow: opt-in, and the report says why.
 - Its numbers (the check's and the A/B's) go into the idea's line, the commit and the record; the documents name the switch that turns it off, as upstream's do.
 
+Step 4's watch is the first of those checks, and the one that says where the output changed: the cells the idea touches are run before and after it, and the judge gives their KL (an LLM's) or pixels (an image's) against the floor two rounds of one build give (0 when they are bitwise equal).
+Within the floor the movement is the engine's own noise, not the idea's; beyond it, and for a cell whose answer changed, upstream's check above decides.
+An idea whose cells all come back `SAME` is exact: it goes in on by default, its switch turned off where it is slower (step 4).
+
 When the rule does not fit an idea (upstream's check does not apply to XeStrata's path, or the loss is plain in use though within the criterion), ask the user.
 
 ## 6. Build and test
@@ -199,11 +222,13 @@ As AGENTS.md says, with intel/llvm only, in the free and contrib-llvm modes:
 
 A warning or a mismatch only one mode shows is traced back to the commit that caused it and fixed there.
 AVX-512 code touched: AGENTS.md's Intel SDE runs.
+The answers' md5 (step 4) runs in the build the tables use, contrib-llvm: a cell of the free build is not compared with one of contrib-llvm's, their dense products being other libraries (oneMKL against XeStrata's own kernels) and so other bits.
 
 ## 7. Against the tag
 
 The tables against the tag, on the three GPUs, with generate, the serve path and everyday use, for every model file: [references/measure.md](references/measure.md) has the engines, the files and tiers, and the commands.
 They come after step 4 has taken upstream's ideas, as the check that nothing lost; a loss here is worked as in step 8.
+The tables' runs follow upstream's text (`--spec-follow`), so they say nothing about the answers XeStrata itself gives: those are step 4's watch of the final HEAD, `$o/md5`, run once the tables are done (one more pass, half an hour or so) on the B70 — the next run's baseline, and what step 8 compares the answers against.
 
 ## 8. The check
 
@@ -229,6 +254,9 @@ The previous XeStrata is not measured again: its record is the reference (the us
 
 For each failing cell: find where the time goes (the GPU profilers of docs/DEVTOOLS.md, the engine's timing lines), read how upstream does that part (for a `prev` failure: what changed since the previous XeStrata, `git log <xe tag>..HEAD`), make XeStrata faster (step 4's rules), and measure that cell again.
 The run is done only when a full run of step 7 on the final HEAD, every file and tier of the table (IQ3_XXS with 262K), the serve path, everyday use and every reachable GPU, gives `ALL PASS` with the `--prev` records: a cell fixed earlier can lose again to a later change.
+
+The answers are judged against the previous XeStrata the same way: its record is the last merge's `md5/` (a run before this watch kept none, and then the answers have no previous record), and every cell both records have is `SAME`, `BITS`, `MIXED` or `CHANGED` (step 4).A cell that moved goes into the record's README and docs/XE.md with its KL or its pixels, and a cell whose KL is within its floor is the engine's own noise, not one to report: a release whose answers moved differently from the last one's is a change the user reads about there.
+`MIXED` is listed too, as where the engine answers differently from run to run, so that the next run reads that cell knowing it.
 
 ## 9. The record and the report
 
