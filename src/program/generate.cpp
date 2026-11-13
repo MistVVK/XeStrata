@@ -14680,6 +14680,43 @@ int main(int argc, char** argv) {
         strata::core::pin_reserve_release_hard();   // the load is over: nothing else needs the headroom
         strata::core::kfd_settle::settle_before_ready();   // integrated gfx11 under Linux: until the kernel has stopped moving the registered arena (nothing elsewhere)
         strata::core::manifest::instance().write("ready");   // STRATA_MANIFEST (a no-op unless it is set)
+        // ---- window warm-up (lane DRAFT-COSTS): the first run of a window width builds its graph / pipeline (srv118 CUDA: a capture; Metal: the first execution), so a
+        // width that the policy first picks inside a long request pays it there (M5 Max, IQ3_S: +60 ms on the first five-row lookup round, in the timed code request in 5 of 8 launches
+        // with a table, because the release and the live costs happen to pay it in request 1).  One dummy window per allowed width 1..S, once, before the first request is read; it
+        // changes nothing a request can see: the windows write K/V cells 0..T-1 and the recurrent state of the session, and session_zero() below zeroes the session exactly as a request
+        // that reuses nothing does (the engine's state after session_init); no checkpoint, conversation entry, RNG draw, policy sample or statistic is touched (the policy's observe_*
+        // calls live in the decode loop); the expert cache may page in what the dummy token routes to (speed only).  STRATA_WINDOW_WARM=0: off (research switch).
+        {
+            static const bool warm_off = [] { const char* v = std::getenv("STRATA_WINDOW_WARM"); return v != nullptr && v[0] == '0'; }();
+            if (!warm_off && o.spec >= 2 && n_stages == 1 && o.batch <= 0) {
+                const Clock::time_point w0 = Clock::now();
+                std::vector<int32_t> wtok((size_t) o.spec, 1), wout((size_t) o.spec + 1, 0);
+                std::string werr, wlist;
+                bool wok = true;
+                for (int t = 1; t <= o.spec && wok; ++t) {
+                    if (!((lookup_size_mask(o) >> t) & 1u)) continue;
+                    bool no_vram = false;
+                    if (!ver.prepare(t, no_vram, werr)) { if (no_vram) continue; wok = false; break; }   // CUDA / HIP: the graph now (a size that finds no VRAM is left to the runtime rule); Metal: nothing to do
+                    const Clock::time_point t0 = Clock::now();
+                    drive.d.layers = 0;
+                    drive.d.experts = 0;
+                    drive.d.failed = false;
+                    wok = ver.run(t, wtok.data(), 0, win_pool_fn, win_pool_user, wout.data(), werr) && !drive.d.failed;
+                    char wb[48];
+                    std::snprintf(wb, sizeof wb, "%s%d:%.0f", wlist.empty() ? "" : " ", t,
+                                  std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    wlist += wb;
+                }
+                strata::core::session_zero(ss, g, nullptr, main_cs);
+                cudaStreamSynchronize(main_stream);
+                drive.d.layers = 0;
+                drive.d.experts = 0;
+                drive.d.failed = false;
+                std::fprintf(stderr, "strata serve: window warm-up: ms per width %s, total %.0f ms%s%s\n", wlist.c_str(),
+                             std::chrono::duration<double, std::milli>(Clock::now() - w0).count(), wok ? "" : "; a window failed: ",
+                             wok ? "" : werr.c_str());
+            }
+        }
         g_gpu_pause_idle.idle(gpu_pause_now());   // AMD on Linux: the gap before the first request starts here (the start-up's own pauses are not a "between")
         std::printf("READY %lld stop hold holdb\n", (long long) o.max_context);   // "stop": this engine honours STOP; "hold": GEN hold=N:ID; "holdb": the --batch slots end at the hold too (BDONE hold)
         std::fflush(stdout);
@@ -14721,31 +14758,74 @@ int main(int argc, char** argv) {
         constexpr int kDraftCostMinN = 20;           // a window size needs this many rounds to be measured (fewer: filled in)
         std::string dc_key;
         bool dc_learning = false;
+        bool dc_calib = false;   // a table is used and its sizes are being calibrated against real rounds (DraftPolicy::start_calibration)
+        // how long the engine has been busy: the learner keeps only the rounds of the first seconds of a busy run (CostLearner::kFreshS); a busy run
+        // starts at a request that begins CostLearner::kIdleS or more after the last one ended (the GPU runs slower and steeper after a long load)
+        Clock::time_point dc_busy_since = Clock::now(), dc_last_end = Clock::now();
+        bool dc_seen_request = false;
         bool dc_pcie_pending = false;    // a loaded table without a PCIe share: written into it once PcieAuto has settled
         strata::spec::CostFile dc_file;  // that table, as loaded
+        bool dc_shares_due = false;      // the table is held back (live costs): its stored CPU prompt share / PCIe share are fixed when it takes over
+        auto dc_apply_shares = [&](const strata::spec::CostFile& cf) {
+            if (cf.cpu_share >= 0.0) strata::prefill::Prefill::fix_cpu_share(cf.cpu_share);
+            if (dc_pcie_ok && cf.pcie_frac >= 0.0) fix_pcie_share(cf.pcie_frac);
+        };
         if (!o.draft_costs.empty() && !policy.fixed()) {
             dc_key = draft_costs_key(argc, argv, o.draft_costs_key, spec_cost);
             strata::spec::CostFile cf;
             std::string why;
-            if (strata::spec::read_cost_file(o.draft_costs, dc_key, cf, why)) {
+            // a machine with no table (a new engine, driver, model or setting discards the file) builds one from the rounds of its normal requests, with live
+            // costs deciding meanwhile: no learning stretch.  The old one-start stretch (forced filler windows, a burst of requests) runs only for the test
+            // harnesses that set STRATA_DRAFT_COSTS_LEARN=1; the server and the launcher never do.
+            const char* dc_lv = std::getenv("STRATA_DRAFT_COSTS_LEARN");
+            const bool dc_force_learn = dc_lv != nullptr && dc_lv[0] == '1';
+            const bool dc_read_ok = strata::spec::read_cost_file(o.draft_costs, dc_key, cf, why);
+            if (dc_read_ok && cf.fresh) {   // a file of the passive stretch: the real rounds collected so far
+                dc_file = cf;
+                policy.start_passive(cf, policy.top_size());
+                dc_calib = true;
+                std::fprintf(stderr, "strata serve: draft costs: this machine's table is being built from real requests (%s; %d requests so far): live costs "
+                                     "decide until every window size has %d own rounds or %d requests have run\n",
+                             o.draft_costs.c_str(), cf.reqs, strata::spec::DraftPolicy::kCalibN, strata::spec::DraftPolicy::kCalibReqs);
+            } else if (!dc_read_ok && !dc_force_learn) {   // no table yet
+                cf.key = dc_key;
+                cf.fresh = true;
+                dc_file = cf;
+                policy.start_passive(cf, policy.top_size());
+                dc_calib = true;
+                std::fprintf(stderr, "strata serve: draft costs: no table for this machine yet (%s: %s): it is built from real requests, live costs decide "
+                                     "until every window size has %d own rounds or %d requests have run\n",
+                             o.draft_costs.c_str(), why.c_str(), strata::spec::DraftPolicy::kCalibN, strata::spec::DraftPolicy::kCalibReqs);
+            } else if (dc_read_ok) {
                 std::string sizes;
                 for (int k = 0; k < strata::spec::CostLearner::kCtxBuckets; ++k)
                     if (!cf.tables[(size_t) k].empty()) {
                         policy.set_fixed_costs(cf.tables[(size_t) k].data(), (int) cf.tables[(size_t) k].size(), k);
                         sizes += (sizes.empty() ? "" : ", ") + std::to_string(cf.tables[(size_t) k].size());
                     }
-                if (cf.cpu_share >= 0.0) strata::prefill::Prefill::fix_cpu_share(cf.cpu_share);
+                dc_file = cf;
+                policy.start_calibration(cf.state_effect, cf.real, cf.cal, cf.real_cost, cf.reqs);
+                dc_calib = policy.calibrating();
+                if (policy.table_held()) dc_shares_due = true;   // a held table leaves the shares live too: they are fixed when the table takes over
+                else dc_apply_shares(cf);
                 std::string extra = cf.cpu_share >= 0.0 ? "; CPU prompt share " + std::to_string(cf.cpu_share).substr(0, 4) : "";
                 if (dc_pcie_ok && cf.pcie_frac >= 0.0) {   // PcieAuto's settled share: fixed, no refinement in this run
-                    fix_pcie_share(cf.pcie_frac);
                     extra += "; PCIe share " + std::to_string(cf.pcie_frac).substr(0, 4);
                 } else if (dc_pcie_ok) {   // a file from before the stored PCIe share: refined as before, then written into the file
                     dc_pcie_pending = true;
-                    dc_file = cf;
                     extra += "; PCIe share: refined in this run, then stored";
                 }
-                std::fprintf(stderr, "strata serve: draft costs: this machine's table is used (%s; window sizes %s%s): the same request "
-                                     "gives the same tokens on every start\n", o.draft_costs.c_str(), sizes.c_str(), extra.c_str());
+                if (dc_calib && policy.table_held())
+                    std::fprintf(stderr, "strata serve: draft costs: this machine's table is loaded (%s; window sizes %s%s), not used yet: the "
+                                         "windows follow live costs until every size is calibrated against real requests (or 100 requests have run)\n",
+                                 o.draft_costs.c_str(), sizes.c_str(), extra.c_str());
+                else if (dc_calib)
+                    std::fprintf(stderr, "strata serve: draft costs: this machine's table is used (%s; window sizes %s%s); sizes real requests have not "
+                                         "reached yet keep collecting rounds and change the table once when they have their own\n",
+                                 o.draft_costs.c_str(), sizes.c_str(), extra.c_str());
+                else
+                    std::fprintf(stderr, "strata serve: draft costs: this machine's table is used (%s; window sizes %s%s): the same request "
+                                         "gives the same tokens on every start\n", o.draft_costs.c_str(), sizes.c_str(), extra.c_str());
             } else {
                 policy.set_learning(true);
                 dc_learning = true;
@@ -16446,7 +16526,14 @@ int main(int argc, char** argv) {
                 continue;
             }
             const bool geni = line.rfind("GENI ", 0) == 0;
-            if (geni || line.rfind("GEN ", 0) == 0) refresh_file_tier();
+            if (geni || line.rfind("GEN ", 0) == 0) {
+                refresh_file_tier();
+                if (dc_learning || dc_calib) {   // the request's arrival, before its prompt is read: a pause since the last one ended starts a new busy run
+                    const Clock::time_point dc_now = Clock::now();
+                    if (!dc_seen_request || std::chrono::duration<double>(dc_now - dc_last_end).count() >= strata::spec::CostLearner::kIdleS) dc_busy_since = dc_now;
+                    dc_seen_request = true;
+                }
+            }
             if (!geni && line.rfind("GEN ", 0) != 0) {
                 std::printf("ERR expected: GEN <max_new> <id,id,...> or GENI <max_new> <file> <id,id,...>\n");
                 continue;
@@ -19682,6 +19769,7 @@ int main(int argc, char** argv) {
                 policy.set_context(p);
                 const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
                 bool from_sfx = false;
+                int sfx_pad = 0;      // a learning stretch's lookup window longer than the proposal: the filler rows (DraftPolicy::Pick::pad)
                 int sfx_match = 0;
                 bool dfr_lookup = false;
                 int dfr_T = 0, dfr_match = 0;
@@ -19737,13 +19825,34 @@ int main(int argc, char** argv) {
                         // chooses, and the lookup is taken without asking whether the MTP's first guess agrees
                         const bool probabilistic = use_mtp && !req_df2 && mtp.prob();   // DFlash2's candidates are not draws from the MTP's q
                         if (k > 0 && (probabilistic || !draft_on || sbuf[0] == drafts[0])) {
+                            // a learning stretch may run a longer window than the proposal to time that size: the extra rows repeat the proposal's last
+                            // token, which the verifier rejects (a deterministic proposal only: a probabilistic window keeps its own draws)
                             const strata::spec::DraftPolicy::Pick pk = probabilistic
-                                ? source_policy.choose(S_mtp, k, sfx_match) : policy.choose(T, k, sfx_match);
-                            if (pk.lookup && !trace_nopick) { T = pk.t; from_sfx = true; }
+                                ? source_policy.choose(S_mtp, k, sfx_match) : policy.choose(T, k, sfx_match, dc_learning ? S_look - 1 : 0);
+                            if (pk.lookup && !trace_nopick && pk.t - 1 <= (int) sbuf.size()) {
+                                T = pk.t; from_sfx = true;
+                                if (pk.pad > 0) {
+                                    sfx_pad = pk.pad;
+                                    for (int i = k; i < k + pk.pad; ++i) sbuf[(size_t) i] = sbuf[(size_t) k - 1];
+                                }
+                            }
                             if (pk.lookup && !trace_nopick && o.lookup_max_t > 0) {   // --lookup-max-t: a size whose window graph fits
                                 const int t = graph_fits(T);
                                 if (t < 0) { std::printf("ERR %s\n", err.c_str()); return 1; }
                                 T = t;
+                            }
+                        } else if (k == 0 && dc_learning && draft_on && !probabilistic && !trace_nopick) {
+                            // no proposal at all: a learning stretch may still time a lookup-type window size (every row after the first is filler,
+                            // the MTP's own first guess repeated; the verifier rejects them), so that sizes only lookups reach get measured
+                            const int s = policy.explore_lookup(std::min<int>(S_look, (int) sbuf.size() + 1));
+                            if (s > 0) {
+                                T = s; from_sfx = true; sfx_pad = s - 1; sfx_match = 0;
+                                for (int i = 0; i < s - 1; ++i) sbuf[(size_t) i] = drafts[0];
+                                if (o.lookup_max_t > 0) {   // --lookup-max-t: a size whose window graph fits
+                                    const int t = graph_fits(T);
+                                    if (t < 0) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                                    T = t;
+                                }
                             }
                         }
                     }
@@ -19778,6 +19887,14 @@ int main(int argc, char** argv) {
                         if (t < 0) { std::printf("ERR %s\n", err.c_str()); return 1; }
                         chain_n = std::max(0, t - T);
                     }
+                }
+                // a learning stretch times the window sizes the round's own rule does not reach: the MTP / drafter window of a round with no lookup and no
+                // chain is run at another size (the rows past the real drafts are whatever the drafts array holds: valid ids that the verifier rejects);
+                // a deterministic window only, and only the learning stretch (DraftPolicy::explore_window)
+                bool win_forced = false;
+                if (dc_learning && draft_on && !first_window && !merged && !from_sfx && chain_n == 0 && !gated_proposal && !(use_mtp && !req_df2 && mtp.prob())) {
+                    const int sx = policy.explore_window(T, std::min<int>(S_mtp, (int) drafts.size() + 1));
+                    if (sx > 0 && p + sx <= o.max_context) { T = sx; win_forced = true; }
                 }
                 const int T_mtp = T;
                 T += chain_n;
@@ -20182,8 +20299,11 @@ int main(int argc, char** argv) {
                     std::fprintf(df2_trace, "\n");
                     tr_k = 0;
                 }
-                if (spec_cost && use_mtp && timed_round && !from_sfx) policy.observe_probs(dwin_s.data(), T_mtp - 1, a);
-                if (timed_round && !eos && chain_n == 0)
+                if (spec_cost && use_mtp && timed_round && !from_sfx && !win_forced) policy.observe_probs(dwin_s.data(), T_mtp - 1, a);
+                if (dc_learning || dc_calib) policy.set_busy_age(std::chrono::duration<double>(Clock::now() - dc_busy_since).count());
+                if (timed_round && !eos && chain_n == 0 && ((sfx_pad > 0 && from_sfx) || win_forced))   // a window run for its size's sake: its time only
+                    policy.observe_forced(T, std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                else if (timed_round && !eos && chain_n == 0)
                     policy.observe(from_sfx, T, a, sfx_match,
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 else if (timed_round && !eos)   // a chained window: its MTP part, its chain, its cost
@@ -20199,6 +20319,7 @@ int main(int argc, char** argv) {
             if (hold_on && std::strcmp(finish, "length") == 0 && produced_n >= req_hold_n && (produced_n < max_new || admit_slot >= 0)) finish = "hold";
             if (!keep_sync()) { std::printf("ERR %s\n", err.c_str()); return 1; }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
+            dc_last_end = Clock::now();   // the busy run goes on when the next request starts within CostLearner::kIdleS of this
             if (use_df2 && o.draft_auto && bandit_key != 0 && produced_n >= 48 && decode_ms > 0.0) {
                 DraftBandit& b = bandit[bandit_key];
                 const int w = req_df2 ? 1 : 0;
@@ -20216,12 +20337,13 @@ int main(int argc, char** argv) {
                 const strata::spec::CostLearner::Verdict v = policy.learner().check(kDraftCostRounds, kDraftCostMinN);
                 if (v.ready && v.disturbed) {
                     std::fprintf(stderr, "strata serve: draft costs: the learning stretch looks disturbed (%s): it is learned again\n", v.why.c_str());
-                    policy.learner().reset();
+                    policy.reset_learning();
                 } else if (v.ready) {
                     strata::spec::CostFile cf;
                     cf.key = dc_key;
                     for (int k = 0; k < strata::spec::CostLearner::kCtxBuckets; ++k)
-                        cf.tables[(size_t) k] = policy.learner().table(k, kDraftCostMinN);
+                        cf.tables[(size_t) k] = policy.learner().table(k, kDraftCostMinN, policy.top_size());
+                    cf.state_effect = policy.learner().state_effect(0, kDraftCostMinN);   // real rounds are counted by the same rule (fresh only, or all)
                     // the CPU prompt share, when it is on and balancing from measured times: its balance as measured so far, to a 0.05
                     // step (0.5 when no short prompt has measured it yet: on an RTX A6000 a fixed 0.5 read a 981-token chunk as fast as the
                     // balancing share, 1,001-1,009 against 995-997 ms); fixed from now on like the table
@@ -20235,14 +20357,17 @@ int main(int argc, char** argv) {
                     if (dc_pcie_ok) cf.pcie_frac = o.pcie_frac;
                     std::string why;
                     const bool saved = strata::spec::write_cost_file(o.draft_costs, cf, why);
-                    if (cf.cpu_share >= 0.0) strata::prefill::Prefill::fix_cpu_share(cf.cpu_share);
-                    if (cf.pcie_frac >= 0.0) fix_pcie_share(cf.pcie_frac);
                     for (int k = 0; k < strata::spec::CostLearner::kCtxBuckets; ++k)
                         if (!cf.tables[(size_t) k].empty())
                             policy.set_fixed_costs(cf.tables[(size_t) k].data(), (int) cf.tables[(size_t) k].size(), k);
                     policy.set_learning(false);
-                    policy.learner().reset();
+                    policy.reset_learning();
                     dc_learning = false;
+                    dc_file = cf;
+                    policy.start_calibration(cf.state_effect, cf.real, cf.cal, cf.real_cost, cf.reqs);
+                    dc_calib = policy.calibrating();
+                    if (policy.table_held()) dc_shares_due = true;   // the shares stay live until the table takes over
+                    else dc_apply_shares(cf);
                     std::string t0;
                     char b[24];
                     for (size_t i = 0; i < cf.tables[0].size(); ++i) {
@@ -20257,8 +20382,42 @@ int main(int argc, char** argv) {
                         std::snprintf(b, sizeof b, "; PCIe share %.2f", cf.pcie_frac);
                         t0 += b;
                     }
-                    std::fprintf(stderr, "strata serve: draft costs: this machine's table is learned (%s); it is fixed from the next request "
-                                         "on%s%s\n", t0.c_str(), saved ? "" : " (not saved: ", saved ? "" : (why + "; the next start learns again)").c_str());
+                    std::fprintf(stderr, "strata serve: draft costs: this machine's table is learned (%s); %s%s%s\n", t0.c_str(),
+                                 dc_calib ? "live costs decide until every size is calibrated against real requests (or 100 requests have run), then it is fixed"
+                                          : "it is fixed from the next request on",
+                                 saved ? "" : " (not saved: ", saved ? "" : (why + "; the next start learns again)").c_str());
+                }
+            }
+            // --draft-costs, calibration: the real rounds of this request that the sizes still at their learned cost have collected; a size with
+            // kCalibN of them takes their mean (the file is rewritten whole, the new cost applies from the next request on, no later change)
+            if (dc_calib && (policy.calib_dirty() || policy.table_held())) {
+                const bool dc_was_held = policy.table_held(), dc_was_passive = policy.passive();
+                strata::spec::CostFile cc = dc_file;
+                std::string rep, why;
+                if (policy.calibrate(cc, rep)) {
+                    if (dc_was_passive && !policy.passive()) {   // the table is made: the shares go in with it, the CPU share only when a short prompt has measured it
+                        if (strata::prefill::Prefill::cpu_share_balancing() && sp.stats().cpu_share_readings > 0)
+                            cc.cpu_share = std::clamp(std::round(sp.stats().cpu_share_balanced * 20.0) / 20.0, 0.05, 0.9);
+                        if (dc_pcie_ok) {
+                            if (!pcie_auto.on) cc.pcie_frac = o.pcie_frac;
+                            else dc_pcie_pending = true;
+                        }
+                        dc_shares_due = true;
+                    }
+                    const bool saved = strata::spec::write_cost_file(o.draft_costs, cc, why);
+                    dc_file = cc;
+                    if (!rep.empty())
+                        std::fprintf(stderr, "strata serve: draft costs: calibrated against real requests: %s%s\n", rep.c_str(),
+                                     saved ? "" : (" (not saved: " + why + ")").c_str());
+                }
+                dc_calib = policy.calibrating();
+                if (dc_was_held && policy.fixed()) {   // the table takes over: the stored shares are fixed with it
+                    if (dc_shares_due) dc_apply_shares(dc_file);
+                    dc_shares_due = false;
+                    std::fprintf(stderr, "strata serve: draft costs: %s; this machine's table decides the windows from the next request on%s\n",
+                                 dc_calib ? "100 requests have run, sizes real requests did not reach keep a scaled learned cost until they have their own rounds"
+                                          : "every size is calibrated",
+                                 dc_file.cpu_share >= 0.0 || dc_file.pcie_frac >= 0.0 ? " (the stored shares are fixed with it)" : "");
                 }
             }
             // --draft-costs with a table from before the stored PCIe share: once PcieAuto has settled (three readings, or it gave up), its
@@ -20270,9 +20429,12 @@ int main(int argc, char** argv) {
                 cf.pcie_frac = o.pcie_frac;
                 std::string why;
                 const bool saved = strata::spec::write_cost_file(o.draft_costs, cf, why);
-                fix_pcie_share(cf.pcie_frac);
-                std::fprintf(stderr, "strata serve: draft costs: the PCIe share settled at %.2f; it is %s and fixed from the next request on\n",
-                             cf.pcie_frac, saved ? "stored with this machine's table" : ("not stored (" + why + ")").c_str());
+                dc_file = cf;
+                if (policy.table_held()) dc_shares_due = true;   // held back: fixed when the table takes over
+                else fix_pcie_share(cf.pcie_frac);
+                std::fprintf(stderr, "strata serve: draft costs: the PCIe share settled at %.2f; it is %s and fixed %s\n",
+                             cf.pcie_frac, saved ? "stored with this machine's table" : ("not stored (" + why + ")").c_str(),
+                             policy.table_held() ? "when the table takes over" : "from the next request on");
             }
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
             if (!ver.wait_commit(err)) {

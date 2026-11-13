@@ -4063,7 +4063,17 @@ def learned_profile_args(cfg: dict, args: list[str]) -> list[str]:
     return args
 
 
-DRAFT_COSTS_DEFAULT = True    # repeatable output: on by default (owner decision); "draft_costs": false in a config turns it off
+DRAFT_COSTS_DEFAULT_PLATFORMS = ("darwin",)   # Metal: the taken-over table measured above live costs there (M5 Max: Q2_0 code +2.6 %, chat +2.4 %, JSON +0.2 %; IQ3_S +0.2 / +0.6 / +0.7 %)
+
+
+def draft_costs_default(platform: str | None = None) -> bool:
+    """Repeatable output (owner decision) is the default only where the table was measured at or above live costs: Metal.  On CUDA (RTX PRO 5000, IQ3_S: code
+    -1.5 %, chat -1.5 %, JSON +1.9 % against live costs) and HIP the engine keeps live costs, as an engine started without --draft-costs does.  `"draft_costs": true`
+    in a config turns the table on anywhere (tests and A/Bs), `"draft_costs": false` turns it off."""
+    return (platform or sys.platform) in DRAFT_COSTS_DEFAULT_PLATFORMS
+
+
+DRAFT_COSTS_DEFAULT = draft_costs_default()    # "draft_costs": true / false in a config overrides it
 _engine_texts: dict = {}
 
 

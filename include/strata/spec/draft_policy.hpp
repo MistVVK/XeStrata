@@ -35,25 +35,54 @@ namespace strata::spec {
 
 /// The round times of a learning stretch, by context bucket and window size, for a fixed cost table.  Keeps up to kKeep
 /// samples per (bucket, size) in arrival order.
+///
+/// Which rounds count (measured, phaseA-tests/par/RESULTS-DRAFT-COSTS.md): on an Apple M5 Max a GPU that has been busy for more than about 7 s runs
+/// slower, and unevenly by window size (after 75 s of continuous load 5 rows cost 27 % more and 1 row 14 % more, so 5 rows against 3 rows read 1.38
+/// instead of 1.30), while a request that arrives after a pause of half a second runs in the fast state at once; the Radeon 780M shows no such
+/// difference (round times within 1 % at any load time).  The table is what requests after a pause cost.  add() takes the busy age of the round
+/// (`busy_age_s`: the seconds since the last pause of kIdleS or more) and keeps the rounds of the first kFreshS seconds ("fresh") apart from the later
+/// ones ("late"); the table uses the fresh rounds only when the late ones differ from them by more than kStateTol in some size that has min_n of
+/// both (a state effect), and all rounds otherwise (the engine does not need the split on a machine that has no such difference, and more rounds
+/// measure the rare sizes better).
 class CostLearner {
 public:
     static constexpr int kMaxT = 16;
     static constexpr int kCtxBuckets = 3;
     static constexpr int kKeep = 4096;
-    void add(int bucket, int t, double ms);
+    static constexpr double kFreshS = 6.0;    ///< a round is fresh when the engine has been busy for at most this long (M5 Max: flat to 7.5 s, +3 % at 7.5-10 s)
+    static constexpr double kIdleS = 0.5;     ///< a pause of this length (no request running) starts a new busy run; the caller measures it (M5 Max: 0.5 s restores the fast state)
+    static constexpr double kStateTol = 0.02; ///< late against fresh round times beyond this in some size = a state effect
+    static constexpr int kFallbackFactor = 3; ///< with a state effect, a stretch with this many times min_rounds timed rounds of any age ends with the fresh ones ...
+    static constexpr int kFallbackShare = 5;  ///< ... when they are at least 1 / kFallbackShare of min_rounds
+    /// `busy_age_s` < 0: unknown (counts as fresh).
+    void add(int bucket, int t, double ms, double busy_age_s = -1.0);
     void reset();
-    int64_t rounds() const { return rounds_; }
-    int samples(int bucket, int t) const;
-    /// The table of `bucket` for windows 1..n (n = the largest size seen in that bucket; empty when the bucket has none):
-    /// the trimmed mean (the lowest and highest kTrim share dropped) of each size with at least `min_n` samples; the other
-    /// sizes are filled between measured neighbours (linear in the size) or, outside them, by the policy's prior shape.
-    std::vector<double> table(int bucket, int min_n) const;
+    int64_t rounds() const { return rounds_; }          ///< the fresh rounds
+    int64_t late_rounds() const { return late_; }       ///< the rounds after the engine had been busy for more than kFreshS
+    int samples(int bucket, int t) const;               ///< fresh samples of a size
+    /// A state effect in `bucket`: some size has at least `min_n` fresh and `min_n` late samples and their trimmed means differ by more than kStateTol.
+    bool state_effect(int bucket, int min_n) const;
+    /// Some size of `bucket` has at least `min_n` fresh and `min_n` late samples: state_effect() says something (a fresh-only machine is told apart from one without effect).
+    bool state_known(int bucket, int min_n) const;
+    /// The samples of size `t` that table() would use now: the fresh ones when there is a state effect, fresh + late otherwise.
+    int usable(int bucket, int t, int min_n) const;
+    /// The table of `bucket` for windows 1..n (n = the largest size seen in that bucket, or `upto` when that is larger; empty when the bucket has none):
+    /// the trimmed mean (the lowest and highest kTrim share dropped) of each size with at least `min_n` samples; a size with kWeakN to min_n - 1
+    /// samples counts with its median when that is within [fill, kWeakMax x fill] (a rough measurement, never below the trend); a size in between two measured ones is linear in the size; a size above the
+    /// measured ones continues the straight line through them with the steeper of the last segment's slope and the slope over all measured sizes
+    /// (costs grow at least that fast: a fill never falls below the measured trend; one measured size: the policy's prior shape), below them the
+    /// prior shape; the table never falls from one size to the next.
+    std::vector<double> table(int bucket, int min_n, int upto = 0) const;
+    static constexpr int kWeakN = 5;          ///< samples from which a size below min_n counts by its median ...
+    static constexpr double kWeakMax = 1.5;   ///< ... when that median is not below the fill and at most this many times it (a stalled handful is not a measurement)
     struct Verdict {
         bool ready = false;          ///< enough rounds, and every bucket with data has a size with min_n samples
         bool disturbed = false;      ///< the stretch looks disturbed: do not keep a table from it (start learning again)
         std::string why;             ///< what was seen (for the log)
     };
-    /// Ready after `min_rounds` timed rounds.  Disturbed (each check per size with at least 2 x min_n samples):
+    /// Ready after `min_rounds` usable rounds (fresh and late ones when no bucket has a state effect, the fresh ones when one has), or, with a state
+    /// effect, after kFallbackFactor x `min_rounds` rounds of any age when at least `min_rounds` / kFallbackShare of them are fresh (one long burst
+    /// keeps only its first kFreshS seconds).  Disturbed (each check per size with at least 2 x min_n samples, on the samples the table uses):
     /// (1) its trimmed means of the first and the second half of its samples differ by more than kDriftMax;
     /// (2) more than kSpikeMax of its samples are above twice its median;
     /// (3) a measured size is cheaper than a measured smaller one by more than kOrderSlack (a round of more rows cannot be cheaper).
@@ -64,23 +93,45 @@ public:
     static constexpr double kOrderSlack = 0.10;
 
 private:
-    std::array<std::array<std::vector<float>, kMaxT + 1>, kCtxBuckets> s_{};
+    /// The samples of every size of `bucket` that the table uses: the fresh ones, or fresh + late.
+    std::array<std::vector<float>, kMaxT + 1> sets(int bucket, bool pooled) const;
+    std::array<std::array<std::vector<float>, kMaxT + 1>, kCtxBuckets> s_{};       // fresh
+    std::array<std::array<std::vector<float>, kMaxT + 1>, kCtxBuckets> late_s_{};  // late
     int64_t rounds_ = 0;
+    int64_t late_ = 0;
 };
 
 /// The per-machine table file of --draft-costs: text, one table per context bucket, valid only for the `key` it was learned under
 /// (card, driver, engine, model, drafter and the settings that move a round's cost; the engine builds it).
-///   strata-draft-costs 1
+///   strata-draft-costs 2      (1: tables learned from every round of a stretch; they are learned again)
 ///   key <one line>
 ///   bucket <0..2> <ms of T1>,<ms of T2>,...
 ///   share <0..1>              (optional: the CPU prompt share learned on this machine, src/prefill/prefill.cpp)
 ///   pcie <0..1>               (optional: the decode PCIe share PcieAuto settled on, src/program/generate.cpp)
 ///   end
+/// The real rounds of one size seen since the table was learned: n rounds, their sum in ms (each clamped to [kCalibLo, kCalibHi] x the learned cost), and the
+/// rounds themselves (up to kVals): the size's real price is their MEDIAN (a cold or stalled round, a first use, another process, moves a mean but not a median).
+/// A file line from before the values ("cal b t n sum" without them) has nv = 0: its price is the mean as before.
+///   cal <bucket> <size> <n> <sum> [<ms of round 1> ... <ms of round n>]
+struct CalAcc {
+    static constexpr int kVals = 16;
+    int n = 0;
+    double sum = 0.0;
+    int nv = 0;                          ///< how many of vals hold a round (== n when every round is kept)
+    std::array<double, kVals> vals{};
+};
 struct CostFile {
     std::string key;
     std::array<std::vector<double>, CostLearner::kCtxBuckets> tables{};
     double cpu_share = -1.0;   ///< < 0: none stored
     double pcie_frac = -1.0;   ///< the decode PCIe share PcieAuto settled on; < 0: none stored (a file from before it: refined, then written)
+    /// Calibration against real requests (see DraftPolicy::start_calibration); a file without these lines has none done.
+    int reqs = 0;   ///< requests that ran while the table was held back (DraftPolicy::kCalibReqs ends the holding)
+    bool fresh = false;   ///< a file with no table yet: the real rounds of the sizes are being collected while live costs decide (DraftPolicy::start_passive); no "bucket" lines
+    bool state_effect = false;   ///< the learning stretch showed a load-time effect: only fresh real rounds are counted
+    std::array<unsigned, CostLearner::kCtxBuckets> real{};   ///< bit t-1: the cost of size t is a median of real rounds, no longer the learned one
+    std::array<std::array<CalAcc, CostLearner::kMaxT + 1>, CostLearner::kCtxBuckets> cal{};   ///< real rounds collected so far for the sizes not yet replaced
+    std::array<std::array<double, CostLearner::kMaxT + 1>, CostLearner::kCtxBuckets> real_cost{};   ///< the cost of a size marked real (the table lines keep the learned costs)
 };
 /// false (with `why` for the log) when the file is missing, unreadable, malformed or truncated, or was learned under another key: the caller
 /// then learns a new table.  Never throws.
@@ -99,11 +150,16 @@ public:
     struct Pick {
         bool lookup = false;
         int t = 1;                      // window size (1 + drafts)
+        int pad = 0;                    // a learning stretch's window longer than the proposal: this many rows past it are filler (the caller fills them)
     };
     /// `t_mtp`: the MTP's window; `lookup_k`: the lookup proposal's length (0 = none); `match`: its match length.
-    Pick choose(int t_mtp, int lookup_k, int match) const;
+    /// pad_cap > 0 (learning, a deterministic proposal): a window may be longer than the proposal, up to pad_cap drafts, its extra rows filler
+    /// that the verifier will most likely reject; only a learning stretch asks for one (see explore below).
+    Pick choose(int t_mtp, int lookup_k, int match, int pad_cap = 0) const;
     /// After the round: the window it used, the drafts accepted, and the round's time (verify + commit + draft).
     void observe(bool lookup, int t, int accepted, int match, double round_ms);
+    /// The round of a window run for its size's sake (Pick::pad > 0): its time goes to the learner and the cost of that size, its outcome to no statistic.
+    void observe_forced(int t, double round_ms);
     /// Gated proposals, inside one generation: a round's committed outcome only, never its time. `t` is the
     /// lookup window chosen before the draws, or the configured MTP window; both are fixed by the history. A
     /// lookup window counts as a probe of its size, so a size whose cost is still guessed is tried kProbes times,
@@ -150,6 +206,65 @@ public:
     /// Learning a fixed table: every timed round also goes to learner() (raw round time, in its context bucket).  Off by default.
     void set_learning(bool on) { learning_ = on; }
     bool learning() const { return learning_; }
+    /// Measuring the sizes the policy can pick (learning only): after kExploreAfter timed rounds, a lookup proposal (padded with filler rows up to
+    /// pad_cap when the caller allows it, else long enough as it is) takes the window of a size that has fewer than kExploreN samples in the
+    /// current context bucket instead (the smallest such size), at most kExplorePerSize times per size and kExploreBudget times in a stretch.  The tokens of a learning stretch were never repeatable
+    /// (the windows follow the live costs); a window's size can change the batch the verifier runs, and with it the tokens.  A size that
+    /// no proposal ever reaches keeps its filled-in cost (CostLearner::table).
+    static constexpr int kExploreAfter = 100;
+    static constexpr int kExploreN = 30;
+    static constexpr int kExplorePerSize = 40;
+    static constexpr int kExploreBudget = 300;
+    int forced_rounds() const { return forced_total_; }
+    /// The MTP / drafter window of a round that the caller has just decided (`t` rows, at most `cap` rows possible): the size to run instead when
+    /// a learning stretch wants to time one (rows past the drafts are the caller's filler), else 0.  Same limits as for a lookup window.  Forced
+    /// rounds happen only while they count: in the first kFreshS seconds of a busy run, or when the stretch has shown no state effect.
+    int explore_window(int t, int cap) const;
+    /// A round with no lookup proposal: the size of a lookup-type window (2..cap rows, every row after the first filler) a learning stretch wants to time, else 0.
+    int explore_lookup(int cap) const;
+    /// Start the learning stretch again: the learner's samples and the forced-round counts.
+    void reset_learning();
+    /// The largest allowed window size (the table is written up to it).
+    int top_size() const { return fit(max_t_); }
+    /// How long the engine has been busy (seconds since its last pause of CostLearner::kIdleS), as the caller measures it, for the round
+    /// observe() is about to be given; < 0 (the default): unknown.  Only the learner reads it.
+    void set_busy_age(double s) { busy_age_ = s; }
+    /// Calibration of a fixed table against real requests.  The learned costs come from a learning stretch (forced windows with filler rows, a burst of
+    /// prose), and a real round of the same size can cost a little more (measured on an M5 Max: 2 % on 2, 3 and 5 rows) - enough to flip a close choice
+    /// between a 4 and a 5 row window (JSON decode 6 % slower than live costs).  After a table is fixed, every real round (never a forced one) of a size
+    /// whose cost is still the learned one is kept (clamped to [kCalibLo, kCalibHi] x the learned cost; only the first kFreshS seconds of a busy run when
+    /// the machine has a load-time effect), across starts through the table file (CostFile::cal).  At kCalibN rounds the size's cost becomes their mean
+    /// (a result outside [kCalibOkLo, kCalibOkHi] x the learned cost means a disturbed stretch: the rounds are dropped and collected again) and the size
+    /// is marked real (CostFile::real) for good: no later change, so the windows of a repeated start are the same.  A size that real requests never reach
+    /// keeps its learned cost.  real, cal and real_cost come from the file (CostFile).
+    /// Until every size of the table is real the table is not used: the policy decides with live costs, exactly as without a table (a half-calibrated
+    /// table priced a JSON request 5 % slower than live costs), and only collects the real rounds; once the last size is calibrated the table
+    /// (the real costs) decides for good.  A size that real requests do not reach (the long lookup sizes of a big GPU) would hold it back for good, so after
+    /// kCalibReqs requests the table is used anyway: such a size is priced at its learned cost x the mean (real / learned) of the real
+    /// sizes of 2 or more rows (a size 1 at its learned cost) until it has its own kCalibN rounds.  The count is kept in the file (CostFile::reqs).
+    static constexpr int kCalibN = 16;
+    static constexpr int kCalibReqs = 100;   // requests that may run while the table is held back; then a size not reached keeps a scaled learned cost
+    static constexpr double kCalibLo = 0.85, kCalibHi = 1.30, kCalibOkLo = 0.86, kCalibOkHi = 1.29;
+    void start_calibration(bool state_effect, const std::array<unsigned, kCtxBuckets>& real,
+                           const std::array<std::array<CalAcc, kMaxT + 1>, kCtxBuckets>& cal,
+                           const std::array<std::array<double, kMaxT + 1>, kCtxBuckets>& real_cost, int reqs = 0);
+    /// A machine without a table file builds one from the rounds its live-cost policy runs anyway, with no learning stretch and no forced window: from the
+    /// first request on the table is held back (live costs decide, exactly as without --draft-costs); only the first kFreshS seconds of a busy run are counted
+    /// (a machine without a load-time effect just gets fewer samples); a size is real at kCalibN own rounds (the file keeps the sums, so counts survive a
+    /// restart); when every size up to `n` is real, or after kCalibReqs requests, the table takes over: the real costs, and for a size never reached the live
+    /// cost at that moment (the policy's own prior when it never measured one); such a size keeps collecting like any size of a table that is in use.
+    /// cf: the file as read (or an empty one with only the key); n: the table length (top_size()).
+    void start_passive(const CostFile& cf, int n);
+    bool passive() const { return passive_; }
+    bool calibrating() const { return calib_on_; }
+    bool calib_dirty() const { return calib_dirty_; }
+    /// While a loaded table still has sizes that are not calibrated (calibrating()), the table is held back: the policy decides with live costs
+    /// exactly as without a table (fixed() is false), and the real rounds are collected meanwhile.  Once the last size is calibrated (at a request's
+    /// end, calibrate()) the table takes over for good.  table_held() is true in that stretch.
+    bool table_held() const { return held_table_; }
+    /// At a request's end: replaces the sizes that have kCalibN real rounds and puts the table, the real marks and the rounds collected so far into
+    /// cf (its other fields stay); report says which sizes changed (empty when none).  True when cf should be written (something changed).
+    bool calibrate(CostFile& cf, std::string& report);
     CostLearner& learner() { return learner_; }
     const CostLearner& learner() const { return learner_; }
 
@@ -197,6 +312,27 @@ private:
     bool robust_ = false;
     bool fixed_ = false;                                   // set_fixed_costs: no round time changes a cost
     bool learning_ = false;                                // set_learning: round times also go to learner_
+    double busy_age_ = -1.0;                               // set_busy_age
+    bool calib_on_ = false, calib_dirty_ = false, calib_fresh_only_ = false;
+    std::array<int, kCtxBuckets> fixed_n_{};               // the length of each bucket's fixed table
+    std::array<unsigned, kCtxBuckets> real_{};
+    std::array<std::array<CalAcc, kMaxT + 1>, kCtxBuckets> cal_{};
+    std::array<std::array<double, kMaxT + 1>, kCtxBuckets> learned_{}, real_cost_{};   // the table as fixed (learned); the cost of each real size
+    int reqs_ = 0;                                         // requests that ran while the table was held back (the file keeps it)
+    bool passive_ = false;                                 // start_passive: no learned table until the take-over (learned_ is zero before it)
+    void take_over_passive();   // the learned cost of every size not real: the live cost now (a real one keeps its own); then use_table()
+    bool held_table_ = false;                              // a table is loaded but not used yet: live costs decide (see table_held())
+    bool live_saved_ = false;
+    std::array<std::array<double, kMaxT + 1>, kCtxBuckets> live_cost_{}, live_n_{};   // the live costs as they were when the table was set
+    void calib_add(int bucket, int t, double ms, double age);
+    void apply_table();
+    void hold_table();       // back to the live costs (fixed_ off) for the buckets that have a table
+    void use_table();        // all sizes calibrated: the table (real costs) decides, fixed_ on
+    int explore_size(int lookup_k, int pad_cap) const;                  // the size a learning stretch measures next, 0 = none (choose() counts it)
+    int explore_next(int reach, int skip) const;                        // the smallest size 2..reach (not `skip`) that still needs rounds; counts it; 0 = none
+    bool explore_ok() const;                                            // a forced round counts now (fresh phase, or no state effect)
+    mutable int forced_total_ = 0;                         // windows taken for their size's sake, this stretch
+    mutable std::array<int, kMaxT + 1> forced_{};          // ... by size
     CostLearner learner_;
     double clamp_sample(int t, double ms) const;
     static constexpr int kPBuckets = 8;
@@ -205,7 +341,7 @@ private:
     // Gated proposals (observe_committed / defer_cost / apply_costs); all zero or empty on any other path.
     std::array<std::array<double, kMaxT + 1>, kCtxBuckets> tried_{};      // lookup windows of that size run with no time yet
     std::array<std::array<double, kMaxT + 1>, kCtxBuckets> delayed_n_{};  // of cost_n_: times applied by apply_costs (not new probes)
-    struct HeldCost { int64_t end; int bucket; int t; double ms; };
+    struct HeldCost { int64_t end; int bucket; int t; double ms; double age; };
     std::vector<HeldCost> held_;                                          // defer_cost, oldest first
 };
 

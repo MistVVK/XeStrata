@@ -51,7 +51,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_DMA_BATCH` | number | NVIDIA and AMD | [BATCHED_DMA.md](BATCHED_DMA.md), [DETAILS.md](DETAILS.md) |
 | `STRATA_DOWN_WS` | on / off | NVIDIA and AMD | [OLDER_GPUS.md](OLDER_GPUS.md), [release-notes-0.2.7.md](release-notes-0.2.7.md) |
 | `STRATA_DUMP_FIRST_LOGITS` | on / off | NVIDIA and AMD, Intel Arc | [DGX_SPARK_LINUX.md](DGX_SPARK_LINUX.md) |
-| `STRATA_DUMP_MOE_INPUT` | number | NVIDIA and AMD | [NVFP4.md](NVFP4.md) |
+| `STRATA_DUMP_MOE_INPUT` | text | NVIDIA and AMD | [NVFP4.md](NVFP4.md) |
 | `STRATA_EMBED_VRAM` | on / off | NVIDIA and AMD | [DETAILS.md](DETAILS.md) |
 | `STRATA_EXCHANGE_ROTATE` | on / off | NVIDIA and AMD, Intel Arc, CPU | [DETAILS.md](DETAILS.md), [EXCHANGE_ROTATION.md](EXCHANGE_ROTATION.md) |
 | `STRATA_EXPDEC_MINB` | number | NVIDIA and AMD | [EXPERTDEC.md](EXPERTDEC.md) |
@@ -303,7 +303,7 @@ version made it the default.
 | `STRATA_BATCH_MTP_SERIAL` | on / off | NVIDIA and AMD | v0.1.43.1 | [BATCHING.md](BATCHING.md) |
 | `STRATA_DEFAULTS` | text | NVIDIA and AMD | v0.2.7 | [BATCHING.md](BATCHING.md), [DETAILS.md](DETAILS.md), [DGX_SPARK_LINUX.md](DGX_SPARK_LINUX.md) |
 | `STRATA_DEQUANT_WIDE` | number | NVIDIA and AMD | v0.1.44 | [DETAILS.md](DETAILS.md), [OLDER_GPUS.md](OLDER_GPUS.md), [release-notes-0.2.7.md](release-notes-0.2.7.md) |
-| `STRATA_EXPERT_I8` | on / off | NVIDIA and AMD | - | - |
+| `STRATA_EXPERT_I8` | text | NVIDIA and AMD | - | - |
 | `STRATA_FILE_TIER_IDLE` | number | NVIDIA and AMD | v0.2.12 | [DETAILS.md](DETAILS.md) |
 | `STRATA_GFX1151_CHUNK` | text | AMD | v0.2.3 | [release-notes-0.2.3.md](release-notes-0.2.3.md), [STRIX_HALO.md](STRIX_HALO.md), [STRIX_HALO_WINDOWS.md](STRIX_HALO_WINDOWS.md) |
 | `STRATA_GFX1151_DEFAULTS` | on / off | NVIDIA and AMD | v0.1.40.1 | [STRIX_HALO.md](STRIX_HALO.md), [STRIX_HALO_WINDOWS.md](STRIX_HALO_WINDOWS.md) |
