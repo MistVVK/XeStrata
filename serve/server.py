@@ -80,6 +80,7 @@ from serve import downgrades  # noqa: E402
 from serve import model_terms  # noqa: E402
 from serve import notices  # noqa: E402
 from serve import envvars  # noqa: E402
+from serve import autotune  # noqa: E402
 from serve import search as search_api  # noqa: E402
 from serve import skills as skills_api  # noqa: E402
 from serve import tool_parallel  # noqa: E402
@@ -3845,35 +3846,57 @@ def engine_args(cfg: dict) -> list[str]:
         args.append("--session-save-reclaim")
     args += parallel_args(cfg, args)
     args += pool_cores_args(cfg, args)
-    return conversation_save_args(cfg, learned_profile_args(cfg, args))
+    return conversation_save_args(cfg, learned_profile_args(cfg, conversation_cache_args(cfg, args)))
+
+
+def conversation_cache_args(cfg: dict, args: list[str]) -> list[str]:
+    """"conversation_cache_mib" in the config: the RAM budget of the engine's parked conversations, in MiB (0 turns
+    them off).  Absent or "auto": the engine sizes it from the RAM free once the model is loaded - its own rule, the
+    same in both engines (core's auto_conversation_cache_mib), which knows what the load left.  An engine argument of
+    the config's own wins."""
+    v = cfg.get("conversation_cache_mib")
+    if v is None or v == autotune.AUTO or "--conversation-cache-mib" in args[:-1]:
+        return args
+    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+        print(f'[xestrata] "conversation_cache_mib" must be a number of MiB (0 turns it off) or "auto", not {v!r}: the '
+              "engine sizes it", flush=True)
+        return args
+    return args + ["--conversation-cache-mib", str(v)]
 
 
 PARALLEL_MAX = 8      # the engine's batch window holds at most 8 rows (kVerifyMaxT); --batch-mtp waves more through it
 
 
 def parallel_args(cfg: dict, args: list[str]) -> list[str]:
-    """#465 (opt-in): "parallel": N in the config - up to N requests decode together in the engine's batch slots
-    (--batch N); more wait their turn.  1 or absent: one request at a time, as before.  A value the engine cannot use
-    is said and passed on: the engine warns and adjusts (recommend, never force)."""
-    if "--batch" in args or "--slots" in args:
-        return []
-    n = cfg.get("parallel")
-    if n is None or n is False:
-        return []
-    if isinstance(n, bool) or not isinstance(n, int):
-        print(f'[xestrata] "parallel" must be a whole number of requests (2..{PARALLEL_MAX}), not {n!r}: ignored',
-              flush=True)
-        return []
-    if n <= 1:
-        return []
-    # --batch-mtp is on by default with --mtp (the engine's --no-batch-mtp / XESTRATA_BATCH_MTP=0 turn it off)
-    env = envvars.get("BATCH_MTP", "")
-    batch_mtp = "--batch-mtp" in args or env not in ("", "0") or (
-        "--mtp" in args and "--no-batch-mtp" not in args and env != "0")
-    if n > PARALLEL_MAX and not batch_mtp:
-        print(f'[xestrata] "parallel": {n} - the engine runs at most {PARALLEL_MAX} requests together; it will use '
-              f"{PARALLEL_MAX}", flush=True)
-    return ["--batch", str(n)]
+    """The engine's batch slots: "parallel": N in the config - up to N requests decode together (--batch N); more wait
+    their turn.  1, false or absent: one request at a time, as before.  The server fills "parallel" in from the
+    machine before the engine starts (serve/autotune.py: "auto" is the default), so an "auto" still here was not
+    resolved by its caller and runs one at a time.  "batch_groups": a number, or "auto" for the engine's own choice of
+    groups over a layer split's stages (the engine knows the slots that fit).  A value the engine cannot use is said
+    and passed on: the engine warns and adjusts (recommend, never force)."""
+    out: list[str] = []
+    if "--batch" not in args and "--slots" not in args:
+        n = cfg.get("parallel")
+        if isinstance(n, bool) or n == autotune.AUTO:
+            n = None
+        elif n is not None and not isinstance(n, int):
+            print(f'[xestrata] "parallel" must be a whole number of requests (2..{PARALLEL_MAX}), not {n!r}: ignored',
+                  flush=True)
+            n = None
+        if isinstance(n, int) and n >= 2:
+            # --batch-mtp is on by default with --mtp (the engine's --no-batch-mtp / XESTRATA_BATCH_MTP=0 turn it off)
+            env = envvars.get("BATCH_MTP", "")
+            batch_mtp = "--batch-mtp" in args or env not in ("", "0") or (
+                "--mtp" in args and "--no-batch-mtp" not in args and env != "0")
+            if n > PARALLEL_MAX and not batch_mtp:
+                print(f'[xestrata] "parallel": {n} - the engine runs at most {PARALLEL_MAX} requests together; it '
+                      f"will use {PARALLEL_MAX}", flush=True)
+            out += ["--batch", str(n)]
+    g = cfg.get("batch_groups")
+    if "--batch-groups" not in args and (g == autotune.AUTO or (
+            isinstance(g, int) and not isinstance(g, bool) and g >= 1)):
+        out += ["--batch-groups", str(g)]
+    return out
 
 
 def conversation_save_args(cfg: dict, args: list[str]) -> list[str]:
@@ -4352,6 +4375,11 @@ class Service:
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = True):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        # #465: the requests that decode together (the engine's batch slots).  The config's "parallel" is "auto" by
+        # default and serve/autotune.py chose it for this machine; watch_parallel() then measures from the requests
+        # whether decoding together pays here, and may bring it back to one at a time
+        self.parallel_slots = int(getattr(engine, "batch", 0) or 0)
+        self.slots_watch: autotune.SlotsWatch | None = None
         self.vision_error: str | None = None           # why the configured encoder did not start (images off)
         self.text_only: str | None = None              # why this model reads no images by design (the CPU's forward)
         self.vision_fallback: str | None = None        # why a later encoder serves instead of the configured one
@@ -5052,17 +5080,46 @@ class Service:
     def _image_shares_text(self) -> bool:
         return self._image_running() and self.image_gpu_mode() == "shared"
 
+    def watch_parallel(self) -> None:
+        """Measure from the requests whether decoding several together pays on this machine (the config left
+        "parallel" to the machine: serve/autotune.py chose the slots).  The first requests that run alone and the
+        first that run side by side give both sides of the comparison; a machine where the two together are no
+        faster than one runs one at a time from the next idle moment on.  The result is this run's: a restart measures
+        again."""
+        if self.parallel_slots > 1:
+            self.slots_watch = autotune.SlotsWatch()
+
+    def _watch_slots(self, alone, together: list) -> None:
+        """Feed the measurement (the status's samples, once a second) and settle it: `alone` is the speed of the one
+        request decoding on its own, `together` the speeds of those decoding side by side."""
+        w = self.slots_watch
+        if w is None:
+            return
+        w.sample(alone, together if len(together) > 1 else [])
+        if w.decide() is False and self.parallel_slots > 1:
+            with self.status_lock:
+                if self.live_reqs or self.status.get("busy"):     # a request is in a slot: from the next idle moment
+                    return
+            self.parallel_slots = 1
+            print(f"[xestrata] several requests: one at a time from now on - measured here, {len(w.alone)} samples "
+                  f"alone and {len(w.together)} together: two together did not raise the total over one request's "
+                  "speed (a restart measures again)", flush=True)
+
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating.  With parallel requests:
         the sum of theirs."""
         with self.status_lock:
             many = [(dict(st), list(rt)) for st, rt in self.live_reqs.values()]
         if many:
-            return sum(self._rate_of(st, rt) for st, rt in many)
+            rates = [self._rate_of(st, rt) for st, rt in many]
+            self._watch_slots(rates[0] if len(rates) == 1 else None, rates)
+            return sum(rates)
         with self.status_lock:
             s = dict(self.status)
             rate = list(self.rate)
-        return self._rate_of(s, rate)
+        one = self._rate_of(s, rate)
+        self._watch_slots(one if one > 0 else None, [])
+        return one
 
     @staticmethod
     def _rate_of(s, rate):
@@ -5196,7 +5253,7 @@ class Service:
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
-        par = int(getattr(self.engine, "batch", 0) or 0)
+        par = self.parallel_slots
         if par:                                         # #465: the requests running together, slot by slot
             with self.status_lock:
                 running = len(self.live_reqs)
@@ -5323,8 +5380,9 @@ class Service:
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
-            # one request at a time (more wait their turn), or "parallel": N batch slots (#465)
-            "concurrency": {"serving": max(1, int(getattr(self.engine, "batch", 0) or 0)),
+            # one request at a time (more wait their turn), or "parallel": N batch slots (#465) - and a machine where
+            # the measurement found them no faster than one runs one at a time (serve/autotune.py's SlotsWatch)
+            "concurrency": {"serving": max(1, self.parallel_slots),
                             "requested": max(1, int(getattr(self.engine, "batch", 0) or 0))},
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
             "vision": {"enabled": images or vision_error is not None, "available": images, "error": vision_error,
@@ -5927,7 +5985,7 @@ class Service:
         waiting = time.perf_counter()
         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
-        par = bool(getattr(self.engine, "batch", 0))
+        par = self.parallel_slots > 1
         st: dict = {} if par else self.status
         rate = collections.deque(maxlen=32) if par else self.rate
         with self.status_lock:
@@ -11687,14 +11745,16 @@ def _main() -> int:
                     help="enable POST /slots/0?action=save|restore {\"filename\": NAME} (llama-server's API): the "
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
     ap.add_argument("--replicas", type=int, default=None, metavar="N",
-                    help="data-parallel replicas (opt-in): cut the cards (\"gpu_pci\" and \"split_pci\") into N equal "
-                         "groups and run one engine on each, requests spread over them (also \"replicas\" in the "
-                         "config: a number, or [{\"gpus\": [\"0000:03:00.0\"]}, {\"gpus\": [\"0000:09:00.0\"]}])")
+                    help="data-parallel replicas: cut the cards (\"gpu_pci\" and \"split_pci\") into N equal groups "
+                         "and run one engine on each, requests spread over them (also \"replicas\" in the config: a "
+                         "number, [{\"gpus\": [\"0000:03:00.0\"]}, {\"gpus\": [\"0000:09:00.0\"]}], or \"auto\", the "
+                         "default: one engine per card when every card alone holds the model)")
     ap.add_argument("--split-serve", default=None, metavar="PREFILL,DECODE",
-                    help="split serving (opt-in): one engine on the card PREFILL reads the prompt, a second on the "
-                         "card DECODE makes the answer, the session handed over in RAM; the cards by PCI address "
+                    help="split serving: one engine on the card PREFILL reads the prompt, a second on the card DECODE "
+                         "makes the answer, the session handed over in RAM; the cards by PCI address "
                          "(0000:03:00.0,0000:09:00.0; also \"split_serve\" in the config: {\"prefill_gpu\": "
-                         "\"0000:03:00.0\", \"decode_gpu\": \"0000:09:00.0\"}; docs/MULTIGPU.md)")
+                         "\"0000:03:00.0\", \"decode_gpu\": \"0000:09:00.0\"}, or \"auto\", the default, which "
+                         "chooses it for two cards that each hold the model; docs/MULTIGPU.md)")
     a = ap.parse_args()
     if a.engine == "strata":                            # the name upstream's scripts and older launchers pass
         a.engine = "xestrata"
@@ -11715,6 +11775,17 @@ def _main() -> int:
     lift_reasoning_effort_arg(cfg)
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
+    # the settings the machine decides (serve/autotune.py): "parallel", "batch_groups", "vram_elastic",
+    # "conversation_cache_mib", "replicas", "split_serve" and "split_skip_if_fits" are "auto" unless the config says
+    # otherwise.  The cards' VRAM, the RAM, their number and the model's size choose here; the first requests measure
+    # "parallel" (SlotsWatch).  An explicit value in the config is the user's own and is left as it is.
+    plan = None
+    if a.engine == "xestrata" and cfg:
+        plan = autotune.resolve(cfg, autotune.read(cfg))
+        cfg = plan.cfg
+        print("[xestrata] the machine's choices:", flush=True)
+        for line in plan.notes:
+            print(f"[xestrata]   {line}", flush=True)
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
         Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
@@ -11848,6 +11919,8 @@ def _main() -> int:
                                                       and cfg.get("fit_max_tokens") is not False))
     svc.vision_error = vision_error
     svc.vision_fallback = vision_fallback
+    if plan is not None and "parallel" in plan.auto and isinstance(engine, StrataEngine):
+        svc.watch_parallel()                           # measure from the first requests whether the slots pay here
     eargs = [str(x) for x in cfg.get("args", [])]
     if "--device" in eargs[:-1] and eargs[eargs.index("--device") + 1] == "cpu":   # setup's model without a GPU
         svc.text_only = "the model runs on the CPU, which reads text only (a GPU reads images)"

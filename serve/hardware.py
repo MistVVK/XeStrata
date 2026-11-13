@@ -17,6 +17,31 @@ def proc_text(name: str, *, encoding=None, errors=None) -> str:
     return Path("/proc", name).read_text(encoding=encoding, errors=errors)
 
 
+def ram_gb() -> float:
+    """The RAM this machine has, in GB; 0.0 when it cannot be read."""
+    if sys.platform == "win32":
+        class _Status(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        m = _Status()
+        m.dwLength = ctypes.sizeof(_Status)
+        try:
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))   # type: ignore[attr-defined]
+        except (AttributeError, OSError):
+            return 0.0
+        return m.ullTotalPhys / 2 ** 30
+    try:
+        for line in proc_text("meminfo").splitlines():
+            if line.startswith("MemTotal"):
+                return int(line.split()[1]) * 1024 / 2 ** 30
+    except (OSError, IndexError, ValueError):
+        pass
+    return 0.0
+
+
 def missing_devices(vendor: str, render: str | None) -> list:
     need = [render or ("/dev/nvidiactl" if vendor == "nvidia" else "a render node")]
     if vendor == "amd":
