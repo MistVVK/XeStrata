@@ -23,7 +23,10 @@
 
 #include <immintrin.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -335,6 +338,7 @@ void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* 
 
 void iq512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
                    float* const* ff, int r0, int r1) {
+    iq3_gather_decide();
     switch (type) {
         case 16: gu_rows_nt<16>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 17: gu_rows_nt<17>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
@@ -348,6 +352,7 @@ void iq512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, 
 
 void iq512_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                 int r0, int r1) {
+    iq3_gather_decide();
     switch (type) {
         case 16: dot_rows_nt<16>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 17: dot_rows_nt<17>(nt, w, row_bytes, n, act, out, r0, r1); break;

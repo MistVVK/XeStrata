@@ -48,14 +48,11 @@ For a chunk of 2,048 to 3,072 tokens, the CPU pool can take an expert's rows as 
 
 With a helper GPU (`--expert-cache-device1`, or the helper `--layer-split auto` chose), in the same short chunks the experts not in VRAM that the helper holds and few tokens route to are computed by the helper from its own VRAM. Their tokens' rows go to it through host memory registered on both GPUs, and the results come back the same way. How many tokens an expert may have is where moving its rows over the helper's link and back takes less time than streaming the expert to the first GPU, from both links as measured at the start (19 for a B70 and an RTX 4070 on x4). `XESTRATA_PREFILL_HELPER_ROWS=n` sets it, `0` turns it off. The helper computes with its int8 products, so the reply can differ slightly from the first GPU alone's (the first token's KL on a 1K prompt 0.011; the CPU share at 0.5: 0.020). On a B70 and an RTX 4070 a 1K prompt went from 693 to 735 tokens/s.
 
-The prefill has four opt-in switches, set in the engine's environment. None of them changes a bit of the answers.
+The prefill has four switches, set in the engine's environment. None of them changes a bit of the answers.
 
-- `XESTRATA_PLE_COMPACT=1`: the chunk's PLE rows go up to the GPU still quantized (IQ4_NL) and are dequantized there, about a seventh of the bytes over the host link. Without VRAM for that buffer the rows are dequantized on the host as before.
-- `XESTRATA_PLE_COPY_STREAM=1` (with `XESTRATA_PLE_COMPACT=1`): those rows go up on a stream of their own instead of the compute stream.
-- `XESTRATA_EMBED_VRAM=1`: the native embedding table in VRAM instead of mapped host memory. Without room for the table plus 512 MiB it stays in host memory, and the log says so.
+- `XESTRATA_PLE_COMPACT` (0 or 1 fixes it): the chunk's PLE rows go up to the GPU still quantized (IQ4_NL) and are dequantized there, about a seventh of the bytes over the host link. Without VRAM for that buffer the rows are dequantized on the host as before. Unset (auto), the first start times the landing of a 512-token chunk both ways (the host's dequant, and the raw rows with the device's) and takes the form 3% or more faster.
+- `XESTRATA_PLE_COPY_STREAM` (0 or 1 fixes it; with `XESTRATA_PLE_COMPACT`): those rows go up on a stream of their own instead of the compute stream. Auto takes it only when `XESTRATA_PLE_COMPACT` was taken (the same bytes and kernels, the upload moved off the compute stream).
 - `XESTRATA_DEQUANT_SIDE=1`: the dense weights' dequantization to FP16 runs on a side stream, overlapping the product before it. It takes a second scratch buffer.
-
-`XESTRATA_GDN_TC=1` (opt-in, changes the reply, upstream 8c2a84694) runs the DeltaNet recurrence of prompt chunks of 128 tokens or more as a scan over blocks of 32 tokens on the matrix engines (Intel's XMX, NVIDIA's tensor cores, RDNA3 and RDNA4's WMMA). Its products take the values split in two FP16 parts and add in FP32, so the rounding differs from the default FP32 recurrence. A GPU without matrix engines, and `XESTRATA_NO_XMX=1`, keeps the default recurrence. It takes about 60 MiB of VRAM for its scratch.
 
 An opt-in that reads the late layers of a long prompt approximately for a faster prefill (`XESTRATA_KVA=1`, it changes the answers) is in [KVA](KVA.md).
 
@@ -632,15 +629,16 @@ With every expert in RAM, the move into the GPU driver's memory (host USM) for t
   Without page-locked exchange buffers, and with the pipelined groups of `--batch-groups`, the waiting tier runs (beside the `--batch` slots it moves on between their windows, upstream 495dc436).
   `--adapt-min-gain F` (default 1.5) is the bar a swap must clear (the decayed routing count of the expert coming in against the one going out); higher means fewer swaps a round. Both tiers use it.
   With `--pipeline-windows 2` ([MULTIGPU](MULTIGPU.md)) the decode loop queues each card's copies while that card has no window in flight, and the copies into the evicted slots and the moves into RAM wait until the windows that were in flight when they were decided have completed (upstream 13eee452; `XESTRATA_PIPELINE_ADAPT_ASYNC=0`: the waiting tier).
-  `STRATA_EXCHANGE_ROTATE=1` (opt-in, upstream 1e6cec80) hands the exchange buffer's ownership over at a swap instead of
+  `XESTRATA_EXCHANGE_ROTATE` (upstream 1e6cec80; 0 or 1 fixes it) hands the exchange buffer's ownership over at a swap instead of
   copying the evicted expert into the RAM copy (the same tokens, fewer host copies).
+  Unset (auto), it is taken for a pack whose layers differ in block size, when the RAM has room for the spares and a GiB more.
   It works only with a fully page-locked RAM copy; a native pack whose blobs differ by layer (IQ3_XXS has nine sizes) keeps its spare buffers per size (upstream fa1d1d1e).
   That takes more page-locked RAM (1.20 GiB with IQ3_XXS and `--adapt-swaps 80`). On the B70, IQ3_XXS, 4K, `--resident-experts --adapt-every 1 --adapt-swaps 80` decoded +1.4% (73.2 -> 74.3 tok/s) with the same tokens.
 - `XESTRATA_RAM_ADAPT=<n>` (opt-in, `--serve`, one GPU, upstream d7298883, 2b13a4493): the RAM copy follows the conversation too.
   Without it the copy is chosen once, at start, so when the RAM cannot hold every expert the GPU does not, an expert outside the copy is read from the files (the SSD) every time the conversation routes to it.
   With it, before a decode window and while no adaptive round is in flight, experts the windows keep routing to (the adaptive tier's decayed count, 2 or more) take the RAM places of experts of their own layer that are not routed to (below 0.5): up to 4 pairs per layer, the largest difference first.
   The incoming expert was usually read for the window before; when its blob still sits in that read's stage buffer it is copied from there and no file is read. `n` caps only the pairs that need a file read. The log counts the experts moved and how many came out of a stage buffer.
-  The RAM stays the same size; the routing, the weights and the VRAM tier's rule are untouched. It needs the adaptive tier (`--adapt-every`), and does nothing with `STRATA_EXCHANGE_ROTATE=1`, a layer split, a helper GPU or `--batch`.
+  The RAM stays the same size; the routing, the weights and the VRAM tier's rule are untouched. It needs the adaptive tier (`--adapt-every`), and does nothing with `XESTRATA_EXCHANGE_ROTATE=1`, a layer split, a helper GPU or `--batch`.
   Upstream measured decode +16.5% on an RTX 3060 12 GB with 32 GB of RAM (IQ2_XS). On the B70, IQ3_XXS with a 6 GiB RAM budget, serve at 32K was equal: the file reads come from the OS file cache there.
 - Otherwise they are read through the OS file cache (`--mmap-experts`), which re-reads them from the SSD as it runs: slower.
   Reading from the GGUF files, the prefill copies the experts with the SSD profile (many threads, a deep ring). When
@@ -662,7 +660,7 @@ of an unlocked 40 GiB copy, 3–4.6 GiB went to swap and decoding ran at half sp
 That needs a memlock limit (`ulimit -l`) as large as the copy; setup warns when the limit is small.
 Raise it with `memlock` in `/etc/security/limits.conf` or `DefaultLimitMEMLOCK` in systemd's `user.conf`, then log in again.
 
-With a native pack whose experts the GPU mostly holds, `XESTRATA_ARENA_MMAP=1` in the engine's environment (opt-in, upstream #640) maps the experts read-only from the pack's `experts.bin`, not locked.
+With a native pack whose experts the GPU mostly holds, `XESTRATA_ARENA_MMAP` in the engine's environment (upstream #640) maps the experts read-only from the pack's `experts.bin`, not locked. Unset (auto) it maps when that file already exists and the RAM has no room for the arena plus 2 GiB; 0 or 1 fixes it, and 1 writes the file at the first start (34 GB once).
 The first start writes the arena to `experts.bin` (only when the drive has its size and 2 GiB more free); later starts map it.
 The pages of the experts in VRAM are handed back to the OS (`XESTRATA_ARENA_RELEASE=0` keeps them) and the rest are read ahead.
 The GPU does not read the mapping directly: run with `--pcie-frac 0`.

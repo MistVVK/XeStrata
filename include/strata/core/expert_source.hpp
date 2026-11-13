@@ -533,6 +533,16 @@ struct PcieSplitTimes {
 /// native format; `layer` < 0 picks the first such layer and gets it.  False, with `why`, when no layer has enough such
 /// experts or the pack is not native.
 bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, double& c, int64_t& layer, std::string& why);
+/// The CPU side on ONE expert, for a decision a start may spend about 100 ms on where measure_cpu_expert_ms takes
+/// about half a second: the same call, 32 rounds after 30 ms of calls, the median.  False, with `why`, as above.
+bool measure_cpu_expert_one_ms(ExpertDispatch& d, int64_t n_layers, double& c, int64_t& layer, std::string& why);
+/// STRATA_PCIE_MIN1: whether the PCIe lane's floor under a FIXED share pays (one of two misses over PCIe).  Decided
+/// once at the start (setup_pcie_split, pcie_min1_worth) when the share is fixed and the switch is auto; forced 0/1 by
+/// the environment.  False where the split is measured (that split has its own floor) and before the probe ran.
+bool pcie_min1_on();
+/// The probe behind it: the CPU's one expert, one and two experts over PCIe, and the GPU's compute of one, from one
+/// layer; the rule is pcie_split_m's for two misses and no hits.  False, with `why`, when a side cannot be timed.
+bool pcie_min1_worth(ExpertDispatch& d, int64_t n_layers, std::string& why);
 /// Of `f` missed experts of a group with `h` VRAM hits: the number read over PCIe.  The GPU computes its hits, then
 /// (`overlap`: beside them) fetches the `m` and computes them; the CPU computes the other `f - m`; both at their times
 /// beside each other when both work.  The `m` that makes the later side earliest, taken only when that is at least 10%

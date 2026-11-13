@@ -6,6 +6,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace strata {
 
@@ -17,6 +18,15 @@ inline const char* env_get(const char* name) noexcept {
     if (n <= 0 || n >= (int) sizeof key) return nullptr;
     if (const char* v = std::getenv(key)) return v;
     return std::getenv(key + 2);   // STRATA_<name>
+}
+
+/// A speed switch's three values: "auto" (unset, empty or `auto`) -> -1, the switch decides at run time; "0" -> 0,
+/// forced off; anything else -> 1, forced on.  A switch whose value is a number itself (a cycle count) reads the
+/// string and does not use this.
+inline int env_auto(const char* name) noexcept {
+    const char* v = env_get(name);
+    if (v == nullptr || v[0] == '\0' || std::strcmp(v, "auto") == 0) return -1;
+    return std::strtol(v, nullptr, 10) != 0 ? 1 : 0;
 }
 
 }  // namespace strata

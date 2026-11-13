@@ -2371,12 +2371,34 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err, int64_t bo
         err = "FileExpertSource: the exchange buffers' size overflows";
         return false;
     }
-    const char* rotate_env = strata::env_get("EXCHANGE_ROTATE");
-    const bool requested = rotate_env != nullptr && std::strcmp(rotate_env, "1") == 0;
-    // layers of several block sizes (a GGUF's mixed i-quants): spares of every size, see ExchangeStorage
+    // STRATA_EXCHANGE_ROTATE=0/1 fixes it; unset/auto takes it for a pack whose layers differ in block size (the case
+    // it is for: B70, IQ3_XXS, decode +1.4% at +1.20 GiB of page-locked RAM) when the RAM has room for the extra
+    // spares and a GiB more.  A pack of one block size needs no spares of every size: the one buffer is the same.
     bounce = std::max<int64_t>(0, std::min(bounce, n));
     const uint64_t rotate_total =
         detail::ExchangeStorage::exchange_bytes_needed(layer_blob_bytes_, (size_t) n, (size_t) bounce);
+    int rotate_want = strata::env_auto("EXCHANGE_ROTATE");
+    if (rotate_want < 0) {
+        uint64_t first = 0, extra = 0;
+        bool mixed = false;
+        for (const uint64_t b : layer_blob_bytes_)
+            if (b != 0) {
+                if (first == 0) first = b;
+                else if (b != first) mixed = true;
+            }
+        const uint64_t plain_total = (uint64_t) n * blob;
+        extra = rotate_total > plain_total ? rotate_total - plain_total : 0;
+        uint64_t have = 0;
+        if (detail::HostMemory hm; mixed && detail::host_available_memory(hm)) have = hm.available;
+        const bool room = !mixed ? false : have == 0 || have >= extra + (1ull << 30);
+        rotate_want = mixed && room ? 1 : 0;
+        if (mixed)
+            std::fprintf(stderr, "xestrata: the exchange buffer rotation: %s (the pack's layers differ in block size: "
+                                 "%.2f GiB more page-locked RAM, %.2f GiB available; XESTRATA_EXCHANGE_ROTATE=0/1 picks "
+                                 "one)\n", rotate_want == 1 ? "on" : "off",
+                         (double) extra / 1073741824.0, (double) have / 1073741824.0);
+    }
+    const bool requested = rotate_want == 1;
     const bool eligible = requested && rotate_total != 0 && rotate_total <= std::numeric_limits<size_t>::max() &&
                           complement_pinned_ && !complement_partial_ &&
                           complement_host_ != nullptr && complement_device_ != nullptr && complement_bytes_ > 0 &&
@@ -2867,6 +2889,29 @@ bool measure_cpu_expert_ms(ExpertDispatch& d, int64_t n_layers, double& c0, doub
     return true;
 }
 
+bool measure_cpu_expert_one_ms(ExpertDispatch& d, int64_t n_layers, double& c, int64_t& layer, std::string& why) {
+    CpuCalJobs cj;
+    if (!cpu_cal_jobs(d, n_layers, layer, cj, why)) return false;
+    const auto now = [] { return std::chrono::steady_clock::now(); };
+    // 30 ms of calls keep the clocks up (an idle CPU takes tens of ms to raise them); then 32 calls of one expert, the
+    // median - the decode's own calls, one expert at a time, as a miss is
+    for (const auto t0 = now(); now() - t0 < std::chrono::milliseconds(30);) {
+        cj.next(1);
+        d.pool->run_split_multi_native(cj.f, cj.jobs, 1);
+    }
+    double one[32];
+    for (int rep = 0; rep < 32; ++rep) {
+        cj.next(1);
+        const auto t0 = now();
+        d.pool->run_split_multi_native(cj.f, cj.jobs, 1);
+        one[rep] = std::chrono::duration<double, std::milli>(now() - t0).count();
+    }
+    std::nth_element(one, one + 16, one + 32);
+    c = one[16];
+    if (!(c > 0.0)) { why = "the CPU's one-expert calls took no time"; return false; }
+    return true;
+}
+
 int pcie_split_m(const PcieSplitTimes& t, bool overlap, int f, int h) {
     if (f <= 0) return 0;
     const double hits = h > 0 ? t.q0 + t.q * h : 0.0;
@@ -3078,14 +3123,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         int m = !pcie_ok ? 0
                 : d.pcie_split != nullptr ? pcie_split_m(*d.pcie_split, d.pcie_overlap, nmiss, std::max(0, nd - nmiss))
                                           : (nmiss * d.pcie_num) >> 8;
-        // STRATA_PCIE_MIN1 (opt-in, upstream ab6bce05): the share pcie_num/256 rounds to 0 at 1-2 misses a layer, so the
-        // PCIe lane idles on the typical decode step; with two misses or more one goes over PCIe (the last in routing
-        // order; only where its blob is pinned, as the fetch below checks).  Not with the measured split.
-        static const bool pcie_min1 = [] {
-            const char* v = strata::env_get("PCIE_MIN1");
-            return v != nullptr && std::strtol(v, nullptr, 10) != 0;
-        }();
-        if (pcie_min1 && pcie_ok && d.pcie_split == nullptr && m < 1 && nmiss >= 2) m = 1;
+        // STRATA_PCIE_MIN1 (upstream ab6bce05): the share pcie_num/256 rounds to 0 at 1-2 misses a layer, so the PCIe
+        // lane idles on the typical decode step; with two misses or more one goes over PCIe (the last in routing
+        // order; only where its blob is pinned, as the fetch below checks).  Not with the measured split, which has
+        // its own floor.  0/1 fixes it; unset/auto takes the start's timing (pcie_min1_worth).
+        if (pcie_min1_on() && pcie_ok && d.pcie_split == nullptr && m < 1 && nmiss >= 2) m = 1;
         if (pcie_ok && d.pcie_split != nullptr) split_m = m;
         int miss_rank = 0, groups = 0, entries = 0, fetches = 0;
         GpuPlanSink& P = *d.plan;
@@ -3891,6 +3933,57 @@ bool ArenaExpertSource::registered_on(int device) const {
     return arena_ != nullptr && static_cast<PinnedArena*>(arena_)->registered_on(device);
 }
 
+namespace {
+// XESTRATA_ARENA_HOST_USM=auto: a 16 MiB arena built both ways, copied to the device in turn; host USM is taken only
+// when its copies are 2% faster (a tie keeps the mapping: the OS can take a mapping's pages back, host USM's not).  Host USM is the form GPU kernels read on a runtime whose registration is for
+// copies only (Level Zero's), but its memory is the GPU driver's, which the OS cannot take back when RAM runs short
+// (issue #10), so it is not taken for a "may be needed".
+bool arena_host_usm_faster() {
+    static const bool picked = [] {
+        constexpr uint64_t kProbe = 16ull << 20;
+        const std::vector<uint64_t> bounds{0, kProbe};
+        std::unique_ptr<PinnedArena> mapped, host;
+        try {
+            mapped = std::make_unique<PinnedArena>(kProbe, bounds, (uint64_t) 0, false);
+            host = std::make_unique<PinnedArena>(kProbe, bounds, (uint64_t) 0, true);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "xestrata: the expert arena: the host USM timing: %s: the registered mapping\n", e.what());
+            return false;
+        }
+        void* dst = nullptr;
+        if (!strata::gpu::alloc_device(&dst, (size_t) kProbe)) {
+            std::fprintf(stderr, "xestrata: the expert arena: the host USM timing: no device memory for 16 MiB\n");
+            return false;
+        }
+        auto one = [dst](PinnedArena& a) {
+            double best = 1e30;
+            for (int i = 0; i < 5; ++i) {
+                const auto t0 = std::chrono::steady_clock::now();
+                const bool ok = strata::gpu::copy_async(dst, a.at(0), (size_t) kProbe, nullptr) &&
+                                strata::gpu::stream_sync(nullptr);
+                const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                if (!ok) return -1.0;
+                best = std::min(best, ms);
+            }
+            return best;
+        };
+        const double m = one(*mapped), h = one(*host);
+        strata::gpu::free(dst);
+        if (m < 0 || h < 0) {
+            std::fprintf(stderr, "xestrata: the expert arena: the host USM timing failed (%s): the registered mapping\n",
+                         strata::gpu::last_error());
+            return false;
+        }
+        const bool on = h < m * 0.98;   // a tie keeps the mapping: the OS can take its pages back, host USM's not
+        std::fprintf(stderr, "xestrata: the expert arena, 16 MiB to the device: the registered mapping %.2f ms, host USM "
+                             "%.2f ms: %s (XESTRATA_ARENA_HOST_USM=0/1 picks one)\n", m, h,
+                     on ? "host USM" : "the registered mapping");
+        return on;
+    }();
+    return picked;
+}
+}  // namespace
+
 bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, int threads,
                              std::string& err, const std::string& shared_arena_file) {
     close();
@@ -3924,23 +4017,40 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         }
     }
 
-    // STRATA_ARENA_MMAP=1 (a small-RAM machine whose GPUs hold most experts): the arena is the pack's experts.bin
+    // STRATA_ARENA_MMAP (a small-RAM machine whose GPUs hold most experts): the arena is the pack's experts.bin
     // mapped READ-ONLY - not locked, not pinned.  The page cache keeps what the CPU pool and the prompt path
     // actually read (the experts no VRAM cache holds) and gives back the rest under memory pressure; a page
     // dropped is re-read from the file, so a result never depends on what is resident.  The GPUs then get no
     // mapped alias: run with --pcie-frac 0.  The first start writes experts.bin (arena layout, padded by one blob
     // so a whole-slot copy may start at any expert), later ones map it.
+    // Unset/auto: the map when the packed file is there and the RAM has no room for the arena plus 2 GiB (the memory
+    // case it is for).  The file itself is written only when asked: 34 GB once, more than a start may spend on it.
 #if defined(_WIN32)
-    static const bool arena_mmap = false;   // POSIX mmap/madvise: Linux only for now
+    const int arena_mmap_want = 0;   // POSIX mmap/madvise: Linux only for now
 #else
-    static const bool arena_mmap = [] { const char* v = strata::env_get("ARENA_MMAP"); return v && v[0] == '1'; }();
+    const int arena_mmap_want = strata::env_auto("ARENA_MMAP");
+    uint64_t map_file_bytes = 0;
+    {
+        std::ifstream f(path, std::ios::binary | std::ios::ate);
+        if (f) map_file_bytes = (uint64_t) f.tellg();
+    }
+    const bool map_file = map_file_bytes == want + (uint64_t) blob;
+    bool arena_mmap = arena_mmap_want == 1;
+    if (arena_mmap_want < 0) {
+        uint64_t have = 0;
+        detail::HostMemory hm;
+        if (detail::host_available_memory(hm)) have = hm.available;
+        const bool low = have != 0 && have < want + (uint64_t) blob + (2ull << 30);
+        arena_mmap = map_file && low;
+        if (map_file)
+            std::fprintf(stderr, "xestrata: the expert arena: %s from %s (%.2f GiB available for a %.2f GiB arena; "
+                                 "XESTRATA_ARENA_MMAP=0/1 picks one)\n",
+                         arena_mmap ? "mapped read-only" : "read into RAM", path.c_str(), (double) have / 1073741824.0,
+                         (double) (want + (uint64_t) blob) / 1073741824.0);
+    }
     if (arena_mmap) {
         const uint64_t file_bytes = want + (uint64_t) blob;
-        uint64_t have = 0;
-        {
-            std::ifstream f(path, std::ios::binary | std::ios::ate);
-            if (f) have = (uint64_t) f.tellg();
-        }
+        const uint64_t have = map_file_bytes;
         if (have == file_bytes) {
             const int fd = ::open(path.c_str(), O_RDONLY);
             void* v = fd >= 0 ? mmap(nullptr, (size_t) file_bytes, PROT_READ, MAP_SHARED, fd, 0) : MAP_FAILED;
@@ -4053,8 +4163,11 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     cuts.push_back(want);
     // STRATA_ARENA_HOST_USM=1: every layer in its own host USM block, which GPU kernels can read (the PCIe share).
     // Without it the one registered mapping, moved into host USM later only when the measured split reads experts
-    // over PCIe and the runtime's registration is for copies only (Level Zero's): make_kernel_readable.
-    static const bool host_usm = [] { const char* e = strata::env_get("ARENA_HOST_USM"); return e && *e == '1'; }();
+    // over PCIe and the runtime's registration is for copies only (Level Zero's): make_kernel_readable.  Unset/auto:
+    // the faster container for a copy to the device, timed once (above); a shared arena stays a mapping.
+    const int host_usm_want = strata::env_auto("ARENA_HOST_USM");
+    const bool host_usm = host_usm_want >= 0 ? host_usm_want == 1
+                                            : shared_arena_file.empty() && arena_host_usm_faster();
     if (!shared_arena_file.empty() && host_usm) {
         err = "shared arena cannot use layer-separated host USM"; return false;
     }
@@ -4114,17 +4227,19 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
         err = "ArenaExpertSource: the load read " + std::to_string(st.bytes) + " B of " + std::to_string(want);
         return false;
     }
-    // the first start: write experts.bin for the mapped starts after this one - only when the drive has room for it
-    // and 2 GiB more (a full drive fails other writes too); otherwise this start says so and runs pinned as before
+    // the first start asked for: write experts.bin for the mapped starts after this one - only when the drive has room
+    // for it and 2 GiB more (a full drive fails other writes too); otherwise this start says so and runs pinned as
+    // before
     std::error_code space_ec;
-    const uint64_t free_disk = arena_mmap && from_gguf ? (uint64_t) std::filesystem::space(
+    const bool write_map_file = arena_mmap_want == 1 && from_gguf;
+    const uint64_t free_disk = write_map_file ? (uint64_t) std::filesystem::space(
         std::filesystem::path(path).parent_path(), space_ec).available : 0;
     const bool room = !space_ec && free_disk >= want + (uint64_t) blob + (2ull << 30);
-    if (arena_mmap && from_gguf && !room)
+    if (write_map_file && !room)
         std::fprintf(stderr, "xestrata generate: XESTRATA_ARENA_MMAP: NOT writing %s - %.1f GiB free on that drive, it needs "
                              "%.1f GiB plus 2 GiB to spare; this start keeps the arena in RAM\n", path.c_str(),
                      (double) free_disk / 1073741824.0, (double) (want + (uint64_t) blob) / 1073741824.0);
-    if (arena_mmap && from_gguf && room) {
+    if (write_map_file && room) {
         const std::string tmp = path + ".tmp";
         std::FILE* f = std::fopen(tmp.c_str(), "wb");
         bool ok = f != nullptr && std::fwrite(a->data(), 1, (size_t) want, f) == (size_t) want;
