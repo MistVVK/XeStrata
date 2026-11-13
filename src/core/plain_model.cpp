@@ -1536,7 +1536,8 @@ bool PlainModel::open_experts(std::string& err) {
     q = std::min<int64_t>(q, E);
     if (opt_.expert_slots >= 0) q = std::min<int64_t>(q, opt_.expert_slots / std::max<int64_t>(L, 1));
     if (q < 1 && LS > 0) {
-        err = "plain model: no VRAM is left for the expert tier (" + std::to_string(free_b >> 20) + " MiB free)";
+        err = "plain model: no VRAM is left for the expert tier (" + std::to_string(free_b >> 20) +
+              " MiB free); reduce --max-context, --batch or --vram-reserve-mib, or close other GPU programs";
         return false;
     }
     // the xe driver gives VRAM only with as much RAM free beside it, and the file cache does not count as free there
