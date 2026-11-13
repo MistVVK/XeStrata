@@ -404,6 +404,9 @@ macro(strata_cuda_prompt_tests)
       # fused path's H rotation (set_down_rotation) against the host-side rotation of the reference and MMQ with its H rotated on the device
       add_test(NAME prefill_fused_iq_test_tqh COMMAND prefill_fused_iq_test "--only=+ T" --folded --edge --no-timing)
       set_tests_properties(prefill_fused_iq_test_tqh PROPERTIES ENVIRONMENT "STRATA_PF_FUSED_TQ=1" SKIP_RETURN_CODE 77 TIMEOUT 900)
+      # NVFP4 / NVFP4 (ModelOpt packs) on the native kernels: weights decoded from the 36-byte blocks, the blob's tail scales on the FP32 products; edge shapes too
+      add_test(NAME prefill_fused_iq_test_nvfp4 COMMAND prefill_fused_iq_test "--only=NVFP4" --edge)
+      set_tests_properties(prefill_fused_iq_test_nvfp4 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
     endif()
     if(STRATA_BUILD_TESTS AND STRATA_MMQ)   # (P4-SPLIT: MMQ's own tests, below too)
       # the MoE input quantized per token and scattered to its rows (mmq::quantize_scatter) against the per-row
