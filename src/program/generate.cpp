@@ -1964,6 +1964,18 @@ void seed_usage_from_prompt(std::vector<float>& usage, const strata::prefill::Pr
 }
 }  // namespace
 
+// The prompt path gets the CPU pool beside --batch slots too (upstream 1b1a28e77's opt-in, on by default here: RX
+// 9060 XT, --batch 2, a 2050-token read --prefill 3072: 577.2 -> 780.4 tok/s, +35.2%; the decode of the same runs
+// 56.5 -> 55.4, -1.9%, within the run spread).  A batched read takes the share only while no slot decodes
+// (Prefill::set_share_blocked), since the slots' windows use the pool; XESTRATA_PREFILL_CPU_SHARE_BATCH=0 turns it off.
+static bool prefill_cpu_share_batch() {
+    static const bool on = [] {
+        const char* v = strata::env_get("PREFILL_CPU_SHARE_BATCH");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
 // Whether the prompt path gets the CPU pool for its share (STRATA_PREFILL_CPU_SHARE, auto by default).  An explicit
 // setting is the user's: the pool is given (0 turns the share off in the prompt path), with a warning when host memory
 // is short.  The default is not armed when the expert cache holds every expert (upstream eaaa237e, #1595: nothing
@@ -6984,7 +6996,14 @@ int main(int argc, char** argv) {
         }
         if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
         // the pool is idle while a prompt is read unless batch slots decode between its parts
-        if (!multi_gpu && o.batch <= 0 && !o.no_pool && cpu_share_default_ok(g, xcache, srcp == &src ? &src : nullptr))
+        // XESTRATA_PREFILL_CPU_SHARE_BATCH=1 (opt-in): the prompt path gets the pool beside batch slots too; a read
+        // takes the share only while no slot decodes (set_share_blocked before each chunk of a batched read), since
+        // the slots' windows use the pool
+        if (prefill_cpu_share_batch() && o.batch > 0 && !o.no_pool)
+            std::fprintf(stderr, "xestrata serve: XESTRATA_PREFILL_CPU_SHARE_BATCH=1: the prompt path may use the CPU "
+                                 "pool beside the %lld batch slots, for a read with no slot decoding\n", (long long) o.batch);
+        if (!multi_gpu && (o.batch <= 0 || prefill_cpu_share_batch()) && !o.no_pool &&
+            cpu_share_default_ok(g, xcache, srcp == &src ? &src : nullptr))
             sp.set_cpu_pool(&pool);
         mem_mark("before the prompt path init");
         if (df2_loaded) sp.set_taps(df2.tap_layers(), 0, 2048);   // tap_first set per request (the prompt's length)
@@ -11294,7 +11313,13 @@ int main(int argc, char** argv) {
                 for (int64_t q = a0; q < b0;) {
                     const int64_t r = std::min(b0, q + C);
                     const auto tq = Clock::now();
-                    if (!sp.run(ids.data() + q, r - q, q, e)) return false;
+                    // XESTRATA_PREFILL_CPU_SHARE_BATCH: this chunk takes the CPU share only with no slot decoding
+                    // (the slots' windows between the chunks use the pool)
+                    const bool gate = prefill_cpu_share_batch();
+                    if (gate) strata::prefill::Prefill::set_share_blocked(batch_on());
+                    const bool run_ok = sp.run(ids.data() + q, r - q, q, e);
+                    if (gate) strata::prefill::Prefill::set_share_blocked(false);
+                    if (!run_ok) return false;
                     q = r;
                     if (q >= b0) continue;
                     int ys = -1;

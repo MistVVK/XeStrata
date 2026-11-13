@@ -9,7 +9,8 @@
 // `maddubs` and a `madd`.  The arithmetic is ggml's (ggml-cpu/quants.c, the `_generic` references): integer sums
 // per block, times d_x * d_y * the format's constant - only the order of the float additions differs.
 //
-// Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22).  IQ1_M stays on ggml-cpu (no shipped
+// Formats: IQ2_XXS (16), IQ2_XS (17), IQ3_XXS (18), IQ3_S (21), IQ2_S (22), IQ4_XS (23, opt-in:
+// XESTRATA_IQ512_IQ4XS=1, its rows round differently from ggml-cpu's).  IQ1_M stays on ggml-cpu (no shipped
 // model has IQ1_M expert rows: the 'Coder IQ1_M' pack's gate/up are IQ2_S / IQ3_XXS / IQ3_S).
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
@@ -95,13 +96,14 @@ template <> struct Fmt<22> {   // IQ2_S: d, qs[64] (32 grid bytes, 32 sign bytes
     static constexpr int bytes = 82;
     static constexpr float K = 0.125f;
     static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
-        const uint8_t* qs = b + 2 + 8 * j;
+        const int o = 8 * j;   // int, not ptrdiff_t: the wider product changed this decode's AVX-512 code
+        const uint8_t* qs = b + 2 + o;
         const uint8_t h0 = b[66 + 2 * j], h1 = b[66 + 2 * j + 1];
         g = _mm512_set_epi64((long long) iq2s_grid[qs[7] | ((h1 << 2) & 0x300)], (long long) iq2s_grid[qs[6] | ((h1 << 4) & 0x300)],
                              (long long) iq2s_grid[qs[5] | ((h1 << 6) & 0x300)], (long long) iq2s_grid[qs[4] | ((h1 << 8) & 0x300)],
                              (long long) iq2s_grid[qs[3] | ((h0 << 2) & 0x300)], (long long) iq2s_grid[qs[2] | ((h0 << 4) & 0x300)],
                              (long long) iq2s_grid[qs[1] | ((h0 << 6) & 0x300)], (long long) iq2s_grid[qs[0] | ((h0 << 8) & 0x300)]);
-        m = _cvtu64_mask64(u64(b + 2 + 32 + 8 * j));
+        m = _cvtu64_mask64(u64(b + 2 + 32 + o));
         const uint8_t s0 = b[74 + 2 * j], s1 = b[74 + 2 * j + 1];
         sc = scales4(2 * (s0 & 15) + 1, 2 * (s0 >> 4) + 1, 2 * (s1 & 15) + 1, 2 * (s1 >> 4) + 1);
     }
@@ -339,6 +341,7 @@ void iq512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, 
         case 18: gu_rows_nt<18>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 21: gu_rows_nt<21>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 22: gu_rows_nt<22>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
+        case 23: gu_rows_nt<23>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         default: break;
     }
 }
@@ -351,6 +354,7 @@ void iq512_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
         case 18: dot_rows_nt<18>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 21: dot_rows_nt<21>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 22: dot_rows_nt<22>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 23: dot_rows_nt<23>(nt, w, row_bytes, n, act, out, r0, r1); break;
         default: break;
     }
 }
