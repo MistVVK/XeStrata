@@ -105,6 +105,7 @@ from serve import translate_api  # noqa: E402
 from serve import vram_ledger  # noqa: E402
 from serve import idle_watch  # noqa: E402
 from serve import line_process  # noqa: E402
+from serve import reader_room  # noqa: E402
 from serve.line_process import end_gpu_process, popen  # noqa: E402
 
 IM_END = "<|im_end|>"
@@ -2753,6 +2754,39 @@ def vision_attempts(cfg: dict) -> list[dict]:
     return out
 
 
+def vision_log_size(log=None) -> int:
+    """How long the encoder's stderr file is now (0 when there is none): a start reads only what it wrote after this."""
+    try:
+        name = getattr(log, "name", None)
+        return os.path.getsize(name) if name else 0
+    except (OSError, TypeError):
+        return 0
+
+
+def vision_log_tail(log=None, limit: int = 16384, since: int = 0) -> str:
+    """The last `limit` bytes of the encoder's stderr file (`log` is the file object it started with; "" when there is
+    none or it cannot be read), but nothing from before `since` (the file's size when this start began: a log that
+    several starts share, as the server's does)."""
+    try:
+        name = getattr(log, "name", None)
+        if name:
+            with open(name, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(since, f.tell() - limit))
+                return f.read().decode("utf-8", "replace")
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+class VisionNoRoom(RuntimeError):
+    """The picture reader could not start because its card has no room for it (`room`: reader_room.NoRoom)."""
+
+    def __init__(self, message: str, room):
+        super().__init__(message)
+        self.room = room
+
+
 def stray_words(strays) -> str:
     """The tail of a picture reader's start error: the last lines it printed instead of an answer (a debugger's, a
     library's), which say what went wrong when the reader's own answer did not come."""
@@ -2879,6 +2913,7 @@ class Vision:
         args, log, env = self.spawn
         self.dead = None
         self._ensure_dir()
+        since = vision_log_size(log)               # this start's own lines of a log that earlier starts wrote too
         # cwd is the encoder's directory: the ENC lines name the files relative to it (#480: no space in the line)
         try:
             self.proc = popen("the image encoder", args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -2898,14 +2933,32 @@ class Vision:
             line = self._await_ready(VISION_READY_S, strays)
         except RuntimeError as e:                  # silent for VISION_READY_S: it was ended, not left half-started
             self._stop(str(e))
-            raise RuntimeError("the vision encoder did not start: " + str(e) + stray_words(strays)) from None
+            message, room = self._start_failure(str(e), strays, log, since)
+            raise (VisionNoRoom(message, room) if room else RuntimeError(message)) from None
         if line is None or line == "" or not line.startswith("READY"):
-            code = self.proc.poll() if self.proc is not None else None
+            proc = self.proc
+            code = proc.poll() if proc is not None else None
+            if code is None and proc is not None and (line is None or line == ""):   # output ended: status follows
+                try:
+                    code = proc.wait(timeout=2)
+                except (subprocess.TimeoutExpired, OSError):
+                    code = None
             why = (f"it exited ({engine_exit_words(code)})" if engine_exit_words(code) else "it exited") \
                 if line is None or line == "" else line.strip()
             self._stop(why)
-            raise RuntimeError("the vision encoder did not start: " + why + stray_words(strays))
+            message, room = self._start_failure(why, strays, log, since)
+            raise (VisionNoRoom(message, room) if room else RuntimeError(message))
         self.stopped = False
+
+    def _start_failure(self, said_text: str, strays, log, since: int):
+        """(the error of a start that did not reach READY, the card's no-room report when the reader's own lines say
+        its card was full).  The lines searched are the answer it gave (or its exit), its stray lines and the lines its
+        stderr file gained since this start began (the log is shared with earlier starts and with the engines)."""
+        said = [said_text, *strays, *vision_log_tail(log, since=since).splitlines()]
+        room = reader_room.find(said)
+        if room:
+            return reader_room.start_error(room, said), room
+        return "the vision encoder did not start: " + said_text + stray_words(strays), None
 
     #: how long a reader that has already ended may still hold its output pipe open (a debugger attached to it, a
     #: child it started) before the start is judged: the pipe's end does not come, the process's end is what counts
