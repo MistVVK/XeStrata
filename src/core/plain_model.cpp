@@ -1081,7 +1081,8 @@ bool PlainModel::load_qwen(std::string& err) {
             const uint64_t cells = (uint64_t) std::max<int64_t>(want, 0);
             const uint64_t codes = cells * kv_head_dim, scales = cells * (kv_head_dim / k::KV_Q8_GROUP) * 2,
                            q4 = cells * (uint64_t) k::kv_q4_bytes_per_head((int) kv_head_dim);
-            return opt_.kv_q4 == 1 ? 2 * q4
+            return opt_.kv_tcq != 0 ? 2 * cells * k::kv_tcq_bytes_per_head((int) kv_head_dim, opt_.kv_tcq)
+                   : opt_.kv_q4 == 1 ? 2 * q4
                    : opt_.kv_q4 == 2 ? codes + scales + q4
                    : opt_.kv_int8 ? 2 * codes + 2 * scales : 4 * codes;
         };
