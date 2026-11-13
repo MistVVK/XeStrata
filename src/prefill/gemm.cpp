@@ -207,6 +207,12 @@ core::TimedCache<sycl::device, std::tuple<int, int, int64_t, int64_t>, bool> g_o
 // accumulating product, whose output a trial would change; a queue recording a graph, which cannot wait) takes a
 // choice already made for the class and otherwise the library.  XESTRATA_BLAS=1 keeps the library; without one (the
 // trial failed, or XESTRATA_NO_BLAS=1) the products take the own kernels anyway.
+//
+// The choice is made per start, and the library's speed moves between starts: on the RX 9060 XT the same BF16 product
+// (4096 x 320 x 10240) measured 13.1 to 25.5 TFLOPS through rocBLAS while XeStrata's kernels held at 16.8-21.3, and a
+// class near the two paths' speed changed sides from start to start, taking the answer's last bits with it (2026-11-14:
+// the same binary and settings split a 64K greedy answer at token 18).  The library's own fast and slow states gave the
+// same bits.  A run whose answer must be the same every time takes the own kernels throughout: XESTRATA_NO_BLAS=1.
 bool own_first(void* stream, Own k, int64_t T, int64_t N, int64_t K, bool measure, const std::function<void()>& own,
                const std::function<void()>& lib) {
     static const bool library = env_on("BLAS");
