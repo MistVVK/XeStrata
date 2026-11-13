@@ -128,11 +128,16 @@ public:
     struct Pick {
         bool lookup = false;
         int t = 1;                      // window size (1 + drafts)
+        int pad = 0;                    // a learning stretch's window longer than the proposal: this many rows past it are filler (the caller fills them)
     };
     /// `t_mtp`: the MTP's window; `lookup_k`: the lookup proposal's length (0 = none); `match`: its match length.
-    Pick choose(int t_mtp, int lookup_k, int match) const;
+    /// pad_cap > 0 (learning, a deterministic proposal): a window may be longer than the proposal, up to pad_cap drafts, its extra rows filler
+    /// that the verifier will most likely reject; only a learning stretch asks for one (see explore below).
+    Pick choose(int t_mtp, int lookup_k, int match, int pad_cap = 0) const;
     /// After the round: the window it used, the drafts accepted, and the round's time (verify + commit + draft).
     void observe(bool lookup, int t, int accepted, int match, double round_ms);
+    /// The round of a window run for its size's sake (Pick::pad > 0): its time goes to the learner and the cost of that size, its outcome to no statistic.
+    void observe_forced(int t, double round_ms);
     /// Gated proposals, inside one generation: a round's committed outcome only, never its time. `t` is the
     /// lookup window chosen before the draws, or the configured MTP window; both are fixed by the history. A
     /// lookup window counts as a probe of its size, so a size whose cost is still guessed is tried kProbes times,
@@ -179,15 +184,15 @@ public:
     /// Learning a fixed table: every timed round also goes to learner() (raw round time, in its context bucket).  Off by default.
     void set_learning(bool on) { learning_ = on; }
     bool learning() const { return learning_; }
-    /// Measuring the sizes the policy can pick (learning only): after kExploreAfter timed rounds, a lookup proposal long enough for a size
-    /// that has fewer than kExploreN samples in the current context bucket takes that size's window instead (the smallest such size), at
-    /// most kExplorePerSize times per size and kExploreBudget times in a stretch.  The tokens of a learning stretch were never repeatable
+    /// Measuring the sizes the policy can pick (learning only): after kExploreAfter timed rounds, a lookup proposal (padded with filler rows up to
+    /// pad_cap when the caller allows it, else long enough as it is) takes the window of a size that has fewer than kExploreN samples in the
+    /// current context bucket instead (the smallest such size), at most kExplorePerSize times per size and kExploreBudget times in a stretch.  The tokens of a learning stretch were never repeatable
     /// (the windows follow the live costs); a window's size can change the batch the verifier runs, and with it the tokens.  A size that
     /// no proposal ever reaches keeps its filled-in cost (CostLearner::table).
     static constexpr int kExploreAfter = 300;
     static constexpr int kExploreN = 30;
     static constexpr int kExplorePerSize = 40;
-    static constexpr int kExploreBudget = 150;
+    static constexpr int kExploreBudget = 200;
     int forced_rounds() const { return forced_total_; }
     /// Start the learning stretch again: the learner's samples and the forced-round counts.
     void reset_learning();
@@ -244,7 +249,7 @@ private:
     bool fixed_ = false;                                   // set_fixed_costs: no round time changes a cost
     bool learning_ = false;                                // set_learning: round times also go to learner_
     double busy_age_ = -1.0;                               // set_busy_age
-    int explore_size(int lookup_k) const;                  // the size a learning stretch measures next, 0 = none (choose() counts it)
+    int explore_size(int lookup_k, int pad_cap) const;                  // the size a learning stretch measures next, 0 = none (choose() counts it)
     mutable int forced_total_ = 0;                         // windows taken for their size's sake, this stretch
     mutable std::array<int, kMaxT + 1> forced_{};          // ... by size
     CostLearner learner_;

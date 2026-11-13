@@ -19485,6 +19485,7 @@ int main(int argc, char** argv) {
                 policy.set_context(p);
                 const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
                 bool from_sfx = false;
+                int sfx_pad = 0;      // a learning stretch's lookup window longer than the proposal: the filler rows (DraftPolicy::Pick::pad)
                 int sfx_match = 0;
                 bool dfr_lookup = false;
                 int dfr_T = 0, dfr_match = 0;
@@ -19540,9 +19541,17 @@ int main(int argc, char** argv) {
                         // chooses, and the lookup is taken without asking whether the MTP's first guess agrees
                         const bool probabilistic = use_mtp && !req_df2 && mtp.prob();   // DFlash2's candidates are not draws from the MTP's q
                         if (k > 0 && (probabilistic || !draft_on || sbuf[0] == drafts[0])) {
+                            // a learning stretch may run a longer window than the proposal to time that size: the extra rows repeat the proposal's last
+                            // token, which the verifier rejects (a deterministic proposal only: a probabilistic window keeps its own draws)
                             const strata::spec::DraftPolicy::Pick pk = probabilistic
-                                ? source_policy.choose(S_mtp, k, sfx_match) : policy.choose(T, k, sfx_match);
-                            if (pk.lookup && !trace_nopick) { T = pk.t; from_sfx = true; }
+                                ? source_policy.choose(S_mtp, k, sfx_match) : policy.choose(T, k, sfx_match, dc_learning ? S_look - 1 : 0);
+                            if (pk.lookup && !trace_nopick && pk.t - 1 <= (int) sbuf.size()) {
+                                T = pk.t; from_sfx = true;
+                                if (pk.pad > 0) {
+                                    sfx_pad = pk.pad;
+                                    for (int i = k; i < k + pk.pad; ++i) sbuf[(size_t) i] = sbuf[(size_t) k - 1];
+                                }
+                            }
                             if (pk.lookup && !trace_nopick && o.lookup_max_t > 0) {   // --lookup-max-t: a size whose window graph fits
                                 const int t = graph_fits(T);
                                 if (t < 0) { std::printf("ERR %s\n", err.c_str()); return 1; }
@@ -19987,7 +19996,9 @@ int main(int argc, char** argv) {
                 }
                 if (spec_cost && use_mtp && timed_round && !from_sfx) policy.observe_probs(dwin_s.data(), T_mtp - 1, a);
                 if (dc_learning) policy.set_busy_age(std::chrono::duration<double>(Clock::now() - dc_busy_since).count());
-                if (timed_round && !eos && chain_n == 0)
+                if (timed_round && !eos && chain_n == 0 && sfx_pad > 0 && from_sfx)   // a window run for its size's sake: its time only
+                    policy.observe_forced(T, std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
+                else if (timed_round && !eos && chain_n == 0)
                     policy.observe(from_sfx, T, a, sfx_match,
                                    std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 else if (timed_round && !eos)   // a chained window: its MTP part, its chain, its cost

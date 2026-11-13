@@ -458,6 +458,7 @@ int main() {
         check(f1.lookup && f1.t == 2 && y.forced_rounds() == 1, "explore: after the first rounds the smallest size with few samples is taken, if a proposal reaches it");
         const DraftPolicy::Pick f2 = y.choose(1, 1, 3);
         check(y.forced_rounds() == 2 && f2.lookup && f2.t == 2, "explore: a proposal of one draft reaches 2 rows only");
+        y.set_busy_age(100.0);                                      // late rounds: no size gets a fresh sample, so the per-size cap (40) and then the budget end the forcing
         int per[DraftPolicy::kMaxT + 1] = {};
         for (int i = 0; i < 700; ++i) {
             const DraftPolicy::Pick pk = y.choose(1, 7, 3);
@@ -495,6 +496,21 @@ int main() {
         const std::vector<double> wt = w.learner().table(0, 20, 6);
         check(w.learner().samples(0, 4) == 0 && wt.size() == 6 && wt[3] > wt[2] && wt[5] > wt[3], "explore: a size no proposal reaches is filled in above the measured ones");
         (void) worst;
+        // a padded window: a short proposal, a size past it that has no samples, the caller allows filler rows
+        DraftPolicy g(8);
+        g.set_learning(true);
+        feed(g, 400);
+        for (int i = 0; i < 40; ++i) g.observe_forced(2, 95.0);     // size 2 measured (3 is fed already)
+        const DraftPolicy::Pick np = g.choose(1, 1, 3);
+        check(g.forced_rounds() == 0 || !np.lookup || np.pad == 0, "pad: without pad_cap a proposal of one draft never makes a longer window");
+        const DraftPolicy::Pick gp = g.choose(1, 1, 3, 7);
+        check(gp.lookup && gp.t == 4 && gp.pad == 2 && g.forced_rounds() == 1, "pad: with pad_cap the smallest unmeasured size is run, 2 filler rows past the proposal");
+        const double q0 = g.lookup_rate(3);
+        for (int i = 0; i < 30; ++i) g.observe_forced(4, 143.0);
+        check(g.lookup_rate(3) == q0 && g.learner().samples(0, 4) == 30, "pad: a forced round feeds the learner and no lookup statistic");
+        const DraftPolicy::Pick g5 = g.choose(1, 1, 3, 7);
+        check(g5.lookup && g5.t == 5 && g5.pad == 3, "pad: the next unmeasured size follows once one has its samples");
+        check(g.choose(1, 1, 3, 1).pad == 0, "pad: a pad_cap of one draft makes no filler");
     }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;

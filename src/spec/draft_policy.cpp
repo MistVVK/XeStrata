@@ -458,15 +458,16 @@ double DraftPolicy::mtp_tokens(int t) const {
     return 1.0 + 0.7 * (t - 1);       // before any MTP window of this size: a typical acceptance
 }
 
-DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const {
+DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match, int pad_cap) const {
     Pick p;
     p.t = std::clamp(t_mtp, 1, max_t_);
     if (lookup_k <= 0) return p;
     if (learning_ && !fixed_) {   // a learning stretch measures the sizes it has too few rounds of, when a proposal is long enough for one
-        const int s = explore_size(lookup_k);
+        const int s = explore_size(lookup_k, pad_cap);
         if (s > 0) {
             p.lookup = true;
             p.t = s;
+            p.pad = std::max(0, s - 1 - lookup_k);
             return p;
         }
     }
@@ -498,15 +499,28 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
     return p;
 }
 
-int DraftPolicy::explore_size(int lookup_k) const {
+int DraftPolicy::explore_size(int lookup_k, int pad_cap) const {
     if (learner_.rounds() + learner_.late_rounds() < kExploreAfter || forced_total_ >= kExploreBudget) return 0;
-    for (int s = 2; s <= std::min(lookup_k + 1, max_t_); ++s) {
+    for (int s = 2; s <= std::min(std::max(lookup_k, pad_cap) + 1, max_t_); ++s) {
         if (!allowed(s) || forced_[(size_t) s] >= kExplorePerSize || learner_.samples(bk_, s) >= kExploreN) continue;
         ++forced_[(size_t) s];
         ++forced_total_;
         return s;
     }
     return 0;
+}
+
+void DraftPolicy::observe_forced(int t, double round_ms) {
+    t = std::clamp(t, 1, kMaxT);
+    if (learning_ && round_ms > 0) learner_.add(bk_, t, round_ms, busy_age_);
+    if (round_ms > 0 && !fixed_) {
+        round_ms = clamp_sample(t, round_ms);
+        const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;
+        cost_[bk_][t] = cost_n_[bk_][t] > 0 ? (1.0 - alpha) * cost_[bk_][t] + alpha * round_ms : round_ms;
+        cost_n_[bk_][t] += 1.0;
+        last_[bk_][t] = rounds_;
+    }
+    rounds_ += 1.0;
 }
 
 void DraftPolicy::reset_learning() {
