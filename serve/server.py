@@ -894,6 +894,7 @@ class ConvCacheLog:
 
     def __init__(self):
         self.key, self.pos = None, 0
+        self.lock = threading.Lock()                    # polls come from several request / monitor threads at once
         self.reset()
 
     def reset(self):
@@ -901,7 +902,12 @@ class ConvCacheLog:
                       "last_tokens": None, "last_at": None}
 
     def poll(self, path, start) -> dict:
-        """The state after the log's new lines; `start` is where the engine's current run began in it."""
+        """The state after the log's new lines; `start` is where the engine's current run began in it.  One poll at a
+        time: a second one moved `pos` between the size check and the seek and raised ValueError (negative seek)."""
+        with self.lock:
+            return self._poll(path, start)
+
+    def _poll(self, path, start) -> dict:
         if not path or start is None:
             return dict(self.state)
         if self.key != (path, start):                   # another start of the engine: its cache starts empty
@@ -1065,6 +1071,8 @@ class StrataEngine:
             if log and not isinstance(self.log, int):
                 self.log.close()
             raise
+        # THIS start's process: a close() on another thread may set self.proc to None meanwhile (#4792)
+        proc = self.proc
         # the READY read has a timeout (#1317): the lines come from a thread, up to READY, so the rest of the stream
         # stays for _pump (one reader at a time)
         ready_q: queue.Queue = queue.Queue()
@@ -1116,21 +1124,21 @@ class StrataEngine:
         loading.set()
         if self.max_context <= 0:
             if timed_out or start_err is not None:      # still loading, hung or failed: end it, so the turn is not held
-                end_gpu_process(self.proc)
+                end_gpu_process(proc)
             try:                                        # its pipes and our handle on its log (the log stays)
-                self.proc.wait(timeout=5)
-                if self.proc.stdin is not None:
-                    self.proc.stdin.close()
-                if self.proc.stdout is not None:
-                    self.proc.stdout.close()
+                proc.wait(timeout=5)
+                if proc.stdin is not None:
+                    proc.stdin.close()
+                if proc.stdout is not None:
+                    proc.stdout.close()
                 if log and not isinstance(self.log, int):
                     self.log.close()
             except (OSError, subprocess.TimeoutExpired):
                 pass
             if not timed_out and start_err is None and _attempt < START_RETRIES and \
-                    transient_start_failure(log, log_start, time.monotonic() - spawned_at, self.proc.returncode):
+                    transient_start_failure(log, log_start, time.monotonic() - spawned_at, proc.returncode):
                 wait_s = 2.0 * (2 ** _attempt)              # 2, 4, 8 s: the previous process's GPU queues go away
-                exit_words = engine_exit_words(self.proc.returncode)
+                exit_words = engine_exit_words(proc.returncode)
                 if start_log_marks(log, log_start):         # the runtime said so itself (hsa_exception ...)
                     print(f"[xestrata] the engine stopped while the GPU runtime was starting (most often right after "
                           f"another engine exited, whose GPU queues were still being released"
@@ -1146,7 +1154,7 @@ class StrataEngine:
                 return
             why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
                    f"the engine could not start: {start_err}" if start_err is not None else
-                   f"the engine exited before it was ready ({exit_text(self.proc.poll())})")
+                   f"the engine exited before it was ready ({exit_text(proc.poll())})")
             # EngineDied, not bare RuntimeError: a request waiting on this load must end with a 503
             # through the request path's handler - a RuntimeError there left the turn with no answer (#1527)
             note = "" if timed_out or start_err is not None else start_exit_note(self.proc.returncode)
@@ -3058,6 +3066,12 @@ class Vision:
 
     #: how long a reader that has already ended may still hold its output pipe open (a debugger attached to it, a
     #: child it started) before the start is judged: the pipe's end does not come, the process's end is what counts
+    # (defaults, so a bare Vision built for a test without __init__ is a reader with no fallback)
+    fallback = cpu_spawn = cpu_label = None
+    on_cpu = False
+    elastic = False
+    cpu_note = fallback_why = None
+
     READY_GRACE_S = 2.0
     #: lines kept from a reader's output before its answer (and written to the log): enough to see what it said
     STRAY_KEEP = 20
