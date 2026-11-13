@@ -1329,7 +1329,9 @@ def forced_call(tool_choice, tools: list[dict] | None, form: str = "qwen") -> st
     if kind == "required" and len(names) == 1:     # one tool to call: name it, the model cannot invent another
         kind, name = "named", next(iter(names))
     if kind == "required" and names:
-        return CALL_START if form == "glm" else CALL_START + "\n<function="
+        # the model writes "<function=NAME>" itself: from a written "<function=", Qwen3.8 went on with names no tool
+        # has, and the reply came back as text (upstream d7e555bdb)
+        return CALL_START if form == "glm" else CALL_START + "\n"
     if kind == "named" and name in names:
         return CALL_START + str(name) if form == "glm" else CALL_START + f"\n<function={name}>\n"
     if kind == "named":

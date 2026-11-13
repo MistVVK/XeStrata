@@ -257,7 +257,7 @@ class ForcedCallOpening(unittest.TestCase):
         from serve.frontend import forced_call
         one, two = [{"name": "a"}], [{"name": "a"}, {"name": "b"}]
         self.assertTrue(forced_call("required", one).endswith("<function=a>\n"))
-        self.assertTrue(forced_call("required", two).endswith("<function="))
+        self.assertTrue(forced_call("required", two).endswith("<tool_call>\n"))   # the model writes "<function=NAME>"
         self.assertIsNone(forced_call("auto", one))
 
 
