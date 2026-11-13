@@ -2,6 +2,7 @@
 // experts in a build without MMQ, and leaves them (as before) in a build with MMQ.  No GPU, no model.
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
 
 #include "strata/prefill/share_own_rule.hpp"
 
