@@ -131,7 +131,7 @@ NativeEmbed::~NativeEmbed() {
     for (void* c : copies_)
         if (c) strata::gpu::free(c);
     if (host_) strata::gpu::free(host_);
-    else if (dev_) strata::gpu::free(dev_);   // STRATA_EMBED_VRAM: the table itself in VRAM
+    else if (dev_) strata::gpu::free(dev_);   // a table placed in its own VRAM block
 }
 
 const void* NativeEmbed::table_for(void* stream) const {
@@ -150,8 +150,8 @@ const void* NativeEmbed::table_for(void* stream) const {
                                          " MiB for GPU " + std::to_string(dev));
             std::memcpy(c, host_, bytes_);
         } else {
-            // STRATA_EMBED_VRAM: the table is in table_rt's VRAM, which another GPU's context cannot read; that
-            // GPU gets a VRAM copy of its own, through the host
+            // a table in one GPU's VRAM, which another GPU's context cannot read: that GPU gets a copy of its own,
+            // through the host
             std::vector<uint8_t> bounce(bytes_);
             bool ok = false;
             {
@@ -195,33 +195,6 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
             return false;
         }
         strata::platform::advise_willneed(gguf.tensor_data(*t), bytes_);   // copied out of the mapping below
-        // STRATA_EMBED_VRAM=1 (upstream 884e37dfd): the table in the current device's VRAM instead of mapped host
-        // memory.  The same bytes, read by the same gather kernels through dev_; what changes is where a prompt's
-        // scattered row reads go, which over a slow host link cost more than the table's size in VRAM is worth.
-        // Taken only with the table plus 512 MiB free; otherwise, or when the upload fails, the mapped placement
-        // below is used as before, and the fallback is said.
-        if (const char* ev = strata::env_get("EMBED_VRAM"); ev != nullptr && ev[0] == '1') {
-            size_t free_b = 0, total_b = 0;
-            const bool have_free = strata::gpu::mem_info(&free_b, &total_b);
-            void* d = nullptr;
-            if (have_free && (uint64_t) free_b > bytes_ + ((uint64_t) 512 << 20) &&
-                strata::gpu::alloc_device(&d, bytes_)) {
-                if (strata::gpu::copy(d, gguf.tensor_data(*t), bytes_)) {
-                    std::fprintf(stderr, "xestrata: native embedding: XESTRATA_EMBED_VRAM=1: %llu MiB placed in VRAM "
-                                         "(%llu MiB were free)\n",
-                                 (unsigned long long) (bytes_ >> 20), (unsigned long long) (free_b >> 20));
-                    dev_ = d;   // host_ stays null: the destructor frees dev_
-                    type_ = (int) t->type;
-                    n_embd_ = n_embd;
-                    n_vocab_ = n_vocab;
-                    return true;
-                }
-                strata::gpu::free(d);
-            }
-            std::fprintf(stderr, "xestrata: native embedding: XESTRATA_EMBED_VRAM=1 not taken (%llu MiB free, the table "
-                                 "needs %llu MiB plus 512 MiB): kept in mapped host memory\n",
-                         (unsigned long long) (have_free ? free_b >> 20 : 0), (unsigned long long) (bytes_ >> 20));
-        }
         if (!strata::gpu::alloc_host(&host_, bytes_)) {
             host_ = nullptr;
             err = "native embedding: cannot pin " + std::to_string(bytes_ >> 20) + " MiB";

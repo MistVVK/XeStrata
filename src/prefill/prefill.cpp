@@ -1188,7 +1188,7 @@ uint64_t expert_group_bytes(size_t T) {
 // and the device's dequant.  The compact form is taken when it is 3% faster: upstream's reporters had +1.0..1.7% of a
 // prompt on a PCIe Gen2 x4 link, and a Gen4 x16 link is where it saves nothing.  The copy stream goes with it: the same
 // bytes and kernels, the upload moved off the compute stream.
-void ple_landing_probe(void* stream, const strata::kernels::PleTable& table, int64_t chunk) {
+void ple_landing_probe(void* stream, strata::kernels::PleTable& table, int64_t chunk) {
     constexpr int64_t kTokens = 512, kRounds = 2;
     const int64_t T = std::min<int64_t>(chunk, kTokens);
     const uint64_t nrows = table.rows();

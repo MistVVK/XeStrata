@@ -73,7 +73,7 @@ upstream の Strata 0.2.6 から 0.2.7（`5e8a4cca`）までの変更を Xe に�
 - Web ページ: 会話の履歴の作り直し（保存・編集と巻き戻し・枝分かれ・答えている間の送信）、9 言語の訳（既定はブラウザーの言語）、KaTeX の数式（opt-in、`third_party/main/katex/`）、svg・html のプレビュー、読み込み・解放のボタン、広い画面、待ち行列の Timeout の印。
 - setup と道具: `--rope-scale` の検査、ダウンロードの長さが取れないときの公開の大きさ、ワーカー数と画像のエンコーダーのスレッドの上限、calibrate で途中で死んだ候補だけを外す、`gguf_reader.py` の読みの上限、Maxwell 以前の NVIDIA の GPU に使えない理由を言う。
 - エンジンの修正: PLE の読みの失敗の後に止まらない、prefill の領域が取れないときに部分ごとに確保しに行かない、`--adapt-decay` の範囲、`XESTRATA_TRACE` の時刻、decode の時間の行の内訳。
-- opt-in のまま移したもの（XeStrata の 3 社の GPU で速くならなかったもの）: PLE の表を RAM に置く判定（`XESTRATA_PLE_AUTO_RAM=1`。B70 では 32K が完走しなくなった）、swiglu と q8 の量子化の融合（`XESTRATA_SWIGLU_QUANT=1`）、layer-major の prefill（`XESTRATA_PREFILL_LAYER_MAJOR=1`）、DeltaNet の再帰を行列ユニットで（`XESTRATA_GDN_TC=1`、答えが変わる）、KVA（`XESTRATA_KVA=1`、答えが変わる、[KVA](KVA.ja.md)）、`XESTRATA_EMBED_VRAM`・`XESTRATA_DEQUANT_SIDE`、流れ作業のバッチの組の `XESTRATA_PIPED_MTP`・`XESTRATA_PIPE_ADAPT_EVERY`、`XESTRATA_RAM_ADAPT` の改良、GP100 の `XESTRATA_DOWN_WS`。
+- opt-in のまま移したもの（XeStrata の 3 社の GPU で速くならなかったもの）: PLE の表を RAM に置く判定（`XESTRATA_PLE_AUTO_RAM=1`。B70 では 32K が完走しなくなった）、swiglu と q8 の量子化の融合（`XESTRATA_SWIGLU_QUANT=1`）、layer-major の prefill（`XESTRATA_PREFILL_LAYER_MAJOR=1`）、DeltaNet の再帰を行列ユニットで（`XESTRATA_GDN_TC=1`、答えが変わる）、KVA（`XESTRATA_KVA=1`、答えが変わる、[KVA](KVA.ja.md)）、`XESTRATA_DEQUANT_SIDE`、流れ作業のバッチの組の `XESTRATA_PIPED_MTP`・`XESTRATA_PIPE_ADAPT_EVERY`、`XESTRATA_RAM_ADAPT` の改良、GP100 の `XESTRATA_DOWN_WS`。
 - 起動時の短い測りで選ぶもの（`0`・`1` で固定できる）: PLE の行の上げ方（`XESTRATA_PLE_COMPACT`・`XESTRATA_PLE_COPY_STREAM`。最初の起動で 512 トークンの塊を 2 通りの上げ方で測り、3% 以上速い方を選びます）。
 - 2 枚の NVIDIA の `--batch` は、流れ作業の組に戻しました（直列の組は `XESTRATA_BATCH_GROUPS_NV_SERIAL=1`）。
 
@@ -251,7 +251,7 @@ upstream の Strata 0.1.43.1 から 0.1.44.1（`296b59d2`）までの変更を X
   GPU のランタイムの立ち上げで止まったエンジンの起動し直し、落ちたエンジンの終わり方の表示、Responses API の `reasoning_effort`、会話のキャッシュの画像の照合（#2228）、stdin の読み手の終了の競合。
 - 量子化の品質の物差し（`tools/quant_quality.py`、`tools/quant_formats.py`）。
 - `XESTRATA_HC_Q8`（ハイパーコネクションの down/up を Q8_0 で読む、BF16 の pack では読み込み時に Q8_0 にする）: 読み込み時に両方の形を測って速い方を使い、Q8_0 なら GPU 1 枚のときは BF16 の写しを VRAM から外します。AMD では次の射影のための q8_1 も読みの中で書きます（B70 で decode +3.5%。答えが変わる近似）。
-- opt-in のまま移したもの: `XESTRATA_MTP_PRIO`・`XESTRATA_COPY_PRIO`、`XESTRATA_PCIE_MIN1`、arena の `--adapt-async 1`、`XESTRATA_DENSE_F32`。
+- opt-in のまま移したもの: `XESTRATA_COPY_PRIO`、`XESTRATA_PCIE_MIN1`、arena の `--adapt-async 1`、`XESTRATA_DENSE_F32`。
 - 起動時の短い測りで選ぶもの（`0`・`1` で固定できる）: CPU プールの待ち方（`XESTRATA_POOL_UMWAIT`。CPU の WAITPKG を確かめ、公開から起きるまでの時間をスピンと UMWAIT で測ります）と、PCIe の分担の下限（`XESTRATA_PCIE_MIN1`。分担を固定したときに 1〜2 個の外れが 0 に丸まらないよう、CPU・PCIe・GPU の 1 個あたりの時間を測って決めます）。
 
 この取り込みの間に XeStrata の側で直したもの:
@@ -663,7 +663,7 @@ llama.cpp と分かれるのは、どれも参照の上位 2 候補が僅差の�
   decode の呼び出しの実時間を、分け方が見込んだ時間と比べ、15% を超えてずれていれば CPU の時間をその比で直します（CPU に計算のあった呼び出しの 512 回、さらに 1,024 回、2,048 回の後、3 回まで。upstream の PcieAuto が割合を詰めるのと同じ考え方）。
   RX 9060 XT の IQ3_XXS で decode が 1K 50.3 → 52.2、64K 48.5 → 51.3、262K 42.5 → 44.7 tok/s になり、起動時の時間が実測と合う B70 と RTX 4070 では動きません。`XESTRATA_PCIE_SPLIT_REFINE=0` で起動時の時間のままにします。
 - **領域**: Level Zero では、デバイスへのコピー用に登録したエキスパートの領域を GPU のカーネルが読めません。
-  分け方が PCIe に回すときだけ、領域を層ごとにホスト USM へ移します（IQ3_XXS の 40 GB で約 7.5 秒）。`XESTRATA_ARENA_HOST_USM` は 16 MiB を両方の置き場から GPU へ写して比べ、速い方（差が 2% 以内ならホスト USM）を最初から使います（`0`・`1` で固定）。
+  分け方が PCIe に回すときだけ、領域を層ごとにホスト USM へ移します（IQ3_XXS の 40 GB で約 7.5 秒）。`XESTRATA_ARENA_HOST_USM` は 16 MiB を両方の置き場から GPU へ写して比べ、ホスト USM が 2% 以上速いときだけ最初からホスト USM にします（同じなら、OS がページを取り返せる写像のまま。`0`・`1` で固定）。
 - **READY の前の待ち**: エンジンは READY と言う前に、カーネルがホストのページを動かし終えるまで待ちます（`/proc/vmstat` の `pgmigrate_success` が 2 秒続けて毎秒 10,000 ページ未満、最大 30 秒。Linux だけ）。
   読み込みの直後のメモリの詰め直しは登録した領域のページも動かしうるので、それを最初の要求より前に済ませます。`XESTRATA_SETTLE_S` で最大の秒数を変え、0 で待ちません。
 - **割合のまま**: `--pcie-frac`（`--calibrate` が保存した値を含む）を渡したとき、層の分割、`--pcie-mode dma` と `direct`、測れなかったときは、以前の割合を使います。

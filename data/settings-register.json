@@ -379,7 +379,7 @@
   "DRAFT_INT2": {
    "reads": [
     "src/core/draft_head.cpp:201",
-    "src/core/mtp.cpp:439",
+    "src/core/mtp.cpp:433",
     "src/core/plain_model.cpp:3399"
    ]
   },
@@ -401,11 +401,6 @@
   "DUMP_FIRST_LOGITS": {
    "reads": [
     "src/program/generate.cpp:12448"
-   ]
-  },
-  "EMBED_VRAM": {
-   "reads": [
-    "src/core/native_head.cpp:203"
    ]
   },
   "EMB_REUSE_ACCOUNT": {
@@ -606,7 +601,7 @@
   },
   "HEAD_MIX_MULTI": {
    "reads": [
-    "src/core/mtp.cpp:796",
+    "src/core/mtp.cpp:790",
     "src/core/verify.cpp:332"
    ]
   },
@@ -984,17 +979,12 @@
   },
   "MTP_FULL_HEAD": {
    "reads": [
-    "src/core/mtp.cpp:406"
+    "src/core/mtp.cpp:400"
    ]
   },
   "MTP_PREFILL_SYNC": {
    "reads": [
-    "src/core/mtp.cpp:997"
-   ]
-  },
-  "MTP_PRIO": {
-   "reads": [
-    "src/core/mtp.cpp:379"
+    "src/core/mtp.cpp:991"
    ]
   },
   "MTP_REVISION": {
@@ -1004,12 +994,12 @@
   },
   "MTP_SHARED_BRANCH": {
    "reads": [
-    "src/core/mtp.cpp:749"
+    "src/core/mtp.cpp:743"
    ]
   },
   "MTP_TOP2": {
    "reads": [
-    "src/core/mtp.cpp:412"
+    "src/core/mtp.cpp:406"
    ]
   },
   "NAME": {

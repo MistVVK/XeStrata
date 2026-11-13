@@ -311,7 +311,7 @@ class Engine:
 
 def model_args(pack: str, native: str | None, ple: str | None, extra: list[str]) -> list[str]:
     """The model's files (the pack, the GGUF's first shard, the shard with per_layer_token_embd) and EXTRA."""
-    a = ["--pack", pack]
+    a = ["--pack", pack] if pack else []   # PACK= (empty): a plain model's engine takes no pack at all
     if native:
         a += ["--native", native]
     if ple:

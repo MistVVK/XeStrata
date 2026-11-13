@@ -46,7 +46,7 @@ private:
 /// window and the MTP drafter) takes it instead of the canonical table when it is set (`set_native_embed`).  Host
 /// USM belongs to one GPU's context, so a layer split's stage on another GPU (the drafter on the last one) reads a
 /// copy made in its own, once.
-/// `STRATA_EMBED_VRAM=1` places the same bytes in VRAM instead (slow host links); the gathers read `dev_` either way.
+/// The gathers read `dev_`, the device alias of the pinned table.
 class NativeEmbed {
 public:
     NativeEmbed() = default;
@@ -58,7 +58,7 @@ public:
     strata::kernels::EmbedTable table(void* stream) const;
     uint64_t bytes() const { return bytes_; }
     int type() const { return type_; }
-    /// The table was placed in VRAM (STRATA_EMBED_VRAM=1) rather than mapped.
+    /// The table has its own VRAM block rather than the pinned alias.
     bool in_vram() const { return dev_ != nullptr && host_ == nullptr; }
 
 private:

@@ -3934,8 +3934,8 @@ bool ArenaExpertSource::registered_on(int device) const {
 }
 
 namespace {
-// XESTRATA_ARENA_HOST_USM=auto: a 16 MiB arena built both ways, copied to the device in turn; host USM is taken when
-// its copies are not slower (within 2%).  Host USM is the form GPU kernels read on a runtime whose registration is for
+// XESTRATA_ARENA_HOST_USM=auto: a 16 MiB arena built both ways, copied to the device in turn; host USM is taken only
+// when its copies are 2% faster (a tie keeps the mapping: the OS can take a mapping's pages back, host USM's not).  Host USM is the form GPU kernels read on a runtime whose registration is for
 // copies only (Level Zero's), but its memory is the GPU driver's, which the OS cannot take back when RAM runs short
 // (issue #10), so it is not taken for a "may be needed".
 bool arena_host_usm_faster() {
@@ -3971,10 +3971,10 @@ bool arena_host_usm_faster() {
         strata::gpu::free(dst);
         if (m < 0 || h < 0) {
             std::fprintf(stderr, "xestrata: the expert arena: the host USM timing failed (%s): the registered mapping\n",
-                         strata::gpu::last_error().c_str());
+                         strata::gpu::last_error());
             return false;
         }
-        const bool on = h <= m * 1.02;
+        const bool on = h < m * 0.98;   // a tie keeps the mapping: the OS can take its pages back, host USM's not
         std::fprintf(stderr, "xestrata: the expert arena, 16 MiB to the device: the registered mapping %.2f ms, host USM "
                              "%.2f ms: %s (XESTRATA_ARENA_HOST_USM=0/1 picks one)\n", m, h,
                      on ? "host USM" : "the registered mapping");
