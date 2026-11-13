@@ -855,12 +855,9 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
                 const size_t nrows = std::min<size_t>(n_q, 8), count = nrows * (size_t) s.n_head * HD;
                 std::vector<float> baseline(count), candidate(count);
                 auto trial = [&](bool on) {
-                    auto e = on ? chunks_i8(nrows)
-                                : chunks(percell, nrows);
-                    e.wait_and_throw();
+                    if (on) chunks_i8(nrows); else chunks(percell, nrows);
                     launch_merge<HD, G, false>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, nrows,
-                                               stride, steps, ids == nullptr, window, min_chunk)
-                        .wait_and_throw();
+                                               stride, steps, ids == nullptr, window, min_chunk);
                     return true;
                 };
                 trial(false);
