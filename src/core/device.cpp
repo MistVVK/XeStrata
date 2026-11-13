@@ -299,6 +299,20 @@ static void sycl_code_cache() {
 #endif
 }
 
+// The HIP runtime's hardware queues a process takes (GPU_MAX_HW_QUEUES, ROCclr's; 4 by default), 2 unless the user
+// set it.  With 4, the expert streaming of a prompt ran at one of two speeds from start to start, the same binary and
+// settings (RX 9060 XT, ROCm 7.1, Linux, 2026-11-13: Qwen3.8-Flash-Next IQ3_XXS, a 4K prompt 692-727 or 913-977
+// tok/s, about half the starts each; a 1K prompt 429 or 632; a 32K one 1138-1151), the slow starts losing 10-40 ms
+// at random layers to the copies and the products around them; another GPU program run between two starts moved
+// which start was slow, and nothing the engine logs differed.  With 2: 945-949, 666-683 and 1210-1211, three starts
+// each, the decode alike; Qwen3.6-35B-A3B's 4K prompt 1541-1545 -> 1575-1579.  Only the HIP runtime reads it.
+// Linux only: Windows's HIP runtime was not measured.
+static void hip_hw_queues() {
+#if !defined(_WIN32)
+    setenv("GPU_MAX_HW_QUEUES", "2", 0);
+#endif
+}
+
 // What the RAM and the kernel's memory compaction did between the engine's start and a stop on a GPU fault, said with
 // the fault: the B70's copy engine faulted (Fault response -EBUSY) while the page cache turned over, and the xe driver
 // mapped the registered host memory again after each move of its pages (#42; 2026-10-22's trace: 83k to 134k
@@ -331,6 +345,7 @@ HostCounters g_start_counters;
 const std::vector<sycl::device>& engine_devices() {
     static const std::vector<sycl::device> devices = [] {
         sycl_code_cache();
+        hip_hw_queues();
         g_start_counters = host_counters();
         const CompilerWorkaround w = intel_compiler_workaround();
         std::vector<sycl::device> found = find_devices();
