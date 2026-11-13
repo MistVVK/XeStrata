@@ -8,6 +8,7 @@
 // engine: those were measured apart (generate.cpp's adapt_lag and --adapt-async).
 #pragma once
 
+#include "strata/core/auto_pick.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/gpu.hpp"
@@ -180,13 +181,13 @@ ProfileFill<Pairs> plan_profile_fill(const Pairs& prior, int64_t layers, int64_t
 /// reproducible.  Default 2 (upstream 2725c23f7 on sm_86 and sm_60; on XeStrata's GPUs the RTX 4070's decode 59.1 ->
 /// 64.2 tok/s, IQ2_XS, and the B70's equal, IQ3_XXS 1K and 32K within 0.7%, 2026-10-20); STRATA_ADAPT_LAG=1 is #463's
 /// (the very next window waits for the copies).  Both engines' (generate.cpp, PlainModel); `windows` the engine's
-/// default, STRATA_ADAPT_LAG over it.
+/// default, STRATA_ADAPT_LAG over it.  `auto` (the default) lets the first windows where a swap is waiting choose
+/// between the engine's default and 1 (auto_pick.hpp), on a pack whose layers round alike on the CPU and the GPU.
 inline int adapt_lag(int windows = 2) {
-    static const int v = [] {
-        const char* e = strata::env_get("ADAPT_LAG");
-        return e ? std::max(1, (int) std::strtol(e, nullptr, 10)) : 0;
-    }();
-    return v > 0 ? v : windows;
+    const int forced = adapt_lag_forced();
+    if (forced > 0) return forced;
+    const int chosen = adapt_lag_chosen();
+    return chosen > 0 ? chosen : windows;
 }
 
 /// The adaptive tier's period when --adapt-every is not given, for both engines (generate.cpp, PlainModel): chosen once,

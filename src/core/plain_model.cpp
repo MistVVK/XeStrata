@@ -3656,6 +3656,9 @@ bool PlainModel::forward_run(const int32_t* tokens, int64_t n, int64_t pos, int3
 
 bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const float* hand_in, std::string& err,
                                bool defer) {
+    // the first window of a round whose swaps are still to be applied: with the lag it computes the swapped-in
+    // expert on the CPU, without it waits for the copy and computes it on the GPU
+    const bool swap_waited = !pending_.empty() && pending_age_ == 0;
     if (!settle_window(err) || !stage(tokens, T, pos, err, first())) return false;
     if (hand_in != nullptr) std::memcpy(h_in_, hand_in, (size_t) T * (size_t) hand_w_ * 4);
     ring_advance(pos, T);
@@ -3681,6 +3684,8 @@ bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const 
     const double win_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     if (timing) step_form_.timed(win_ms, "xestrata plain", "the decode windows");
     pcie_probe_after(win_ms, T);
+    if (root_ == this && !serve_)   // the adaptive tier's swap wait, chosen by the windows that had one waiting
+        strata::core::adapt_lag_window(win_ms, T, swap_waited);
     if (disp_.failed) {
         err = std::string("plain model: the CPU experts: ") + (disp_.fail ? disp_.fail : "failed");
         return false;

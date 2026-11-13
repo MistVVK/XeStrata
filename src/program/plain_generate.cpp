@@ -31,6 +31,7 @@
 #include "strata/core/script_guard.hpp"
 #include "strata/core/logit_bias.hpp"
 #include "strata/core/plain_model.hpp"
+#include "strata/core/auto_pick.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/control_vector.hpp"
 #include "strata/core/stdin_lines.hpp"
@@ -2473,6 +2474,7 @@ int plain_main(int argc, char** argv) {
 
     strata::core::PlainModel model;
     model.set_sampler(sp);
+    model.set_serve(serve);
     std::string err;
     if (!opt.shared_arena.empty() && (opt.mmap_experts || opt.resident_gib != 0)) {
         std::fprintf(stderr, "xestrata (%s): --shared-expert-arena shares the experts' RAM copy: not with --mmap-experts or "

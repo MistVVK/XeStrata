@@ -177,12 +177,13 @@ The main ones:
 - setup: the model files it downloads are pinned by size and SHA-256; large files are downloaded over several connections; the build tools (cmake, ninja) are apart from the run-time requirements; `--ple-io ram` also on an SSD when the RAM has room; pictures on by default for the models that read them.
 - serve: a `max_tokens` that does not fit in the context is shortened to the room left instead of answered with 400 (`--no-fit-max-tokens` refuses it as before).
 - The CPU pool's default workers are at most 32 and the container's CPU quota; the cgroup RAM check counts the clean page cache as reclaimable.
-- The adaptive tier's swapped-in experts are used from the second window by default (`XESTRATA_ADAPT_LAG=2`, decode +8.6% on the RTX 4070).
+- The adaptive tier's swapped-in experts are used from the second window by default (`XESTRATA_ADAPT_LAG`, decode +8.6% on the RTX 4070).
+  `auto` (the default) runs the next window waiting and the engine's window count in turn over the first windows where one of the tier's copies is waiting, and keeps the shorter time a token (3% or more; `0` waits at the next window, `2` and up is that many windows).
 - The picture reader (xestrata-vision) reads only the text model's vocabulary and header (so a file of Gyro's types opens).
 
 Fixed on XeStrata's side meanwhile:
 
-- The windows are cut at the positions of the VRAM experts' swaps only for a model with a layer that the CPU and the GPU round differently (`XESTRATA_ADAPT_CUT=0|1`). Every layer of Qwen3.8's four files gives the same bits on the CPU and the GPU, so their windows are not cut: on one text, decode 59.3 -> 61.3 tok/s on the RTX 4070 and 80.5 -> 86.9 on the B70.
+- The windows are cut at the positions of the VRAM experts' swaps only for a model with a layer that the CPU and the GPU round differently (`XESTRATA_ADAPT_CUT`; `auto` is the format's rule, `0` and `1` fix it). Every layer of Qwen3.8's four files gives the same bits on the CPU and the GPU, so their windows are not cut: on one text, decode 59.3 -> 61.3 tok/s on the RTX 4070 and 80.5 -> 86.9 on the B70.
 
 Compared with upstream v0.2.0-beta on the three makers' GPUs (generate on five model files, serve, everyday use, image generation).
 In IQ3_XXS's generate, the B70 is 1.7 to 3.0 times as fast in prefill as upstream's `sycl/` port and 18 to 38% faster in decode;

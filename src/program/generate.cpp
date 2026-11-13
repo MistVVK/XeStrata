@@ -27,6 +27,7 @@
 #include "strata/core/device.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_tier.hpp"
+#include "strata/core/auto_pick.hpp"
 #include "strata/program/done_line.hpp"
 #include "strata/program/gen_keys.hpp"
 #include "strata/program/id_list.hpp"
@@ -192,15 +193,12 @@ const char* pipe_dbg_env(const char* name) {
     return on ? strata::env_get(name) : nullptr;
 }
 
-// Upstream #731 (opt-in, STRATA_DISJOINT_ADAPT=1): the adaptive tier leaves an expert a helper GPU holds out of the
-// primary's promotion candidates (it would sit in both caches).  Asked live, from the helper's own cache
-// (RemoteExperts::holds), so an expert the helper's tier swaps in or out later is followed.
+// Upstream #731: the adaptive tier leaves an expert a helper GPU holds out of the primary's promotion candidates (it
+// would sit in both caches).  Asked live, from the helper's own cache (RemoteExperts::holds), so an expert the helper's
+// tier swaps in or out later is followed.  XESTRATA_DISJOINT_ADAPT: auto (the first windows of a run whose helpers
+// hold experts decide, auto_pick.hpp), 0 or 1.  Nothing to do without a helper.
 bool helper_holds(const strata::core::ExpertDispatch& d, int64_t layer, int32_t expert) {
-    static const bool on = [] {
-        const char* v = strata::env_get("DISJOINT_ADAPT");
-        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
-    }();
-    if (!on) return false;
+    if (d.remote_count <= 0 || !strata::core::disjoint_adapt_on()) return false;
     for (int r = 0; r < d.remote_count; ++r)
         if (d.remote[r]->holds(layer, expert)) return true;
     return false;
@@ -1024,9 +1022,11 @@ int on_rotational_disk(const std::string& path, std::string& dev) {
 
 #endif
 
-/// #463's A/B: STRATA_ADAPT_NOWAIT=1 lets a verify window start before the adaptive tier's copies have landed (0.1.37)
+/// #463's A/B: XESTRATA_ADAPT_NOWAIT=1 lets a verify window start before the adaptive tier's copies have landed
+/// (0.1.37).  Auto (the default) is off: the wait the lag gives (core::adapt_lag) was the faster form on the RTX 4070
+/// and equal on the B70 (2026-10-20), and 1 is the form it replaced; 0 keeps the wait.
 bool adapt_nowait() {
-    static const bool v = [] { const char* e = strata::env_get("ADAPT_NOWAIT"); return e && e[0] == '1'; }();
+    static const bool v = [] { return strata::core::pick_from_env("ADAPT_NOWAIT") == strata::core::Pick::On; }();
     return v;
 }
 
@@ -1102,7 +1102,7 @@ bool adapt_device_table_lags() { return adapt_nowait() || adapt_lag() > 1; }
 /// windows on one text at temperature 0.7 (97 against 89 rounds, 2026-10-20).  What it gives up: serve's prompts from
 /// the second turn on are not computed in the canonical rows, so there the swaps' timing changes the rounding and a
 /// greedy chat can differ from run to run (the fourth turn did on the RTX 4070, 1K, 2026-10-20; cut, two runs gave the
-/// same text).  STRATA_ADAPT_CUT=0|1 forces it.
+/// same text).  XESTRATA_ADAPT_CUT=0|1 forces it; auto (the default) is the pack's format's rule.
 /// Gyro's trellis layers (TQ2_T to TQP7, rotated) are not cut either, though their two sides round differently:
 /// cut, the windows that the draft policy and the lookups would make long were held to the next position, and Gyro-M
 /// lost decode to upstream, which does not cut (RX 9060 XT, 1K, upstream's text: 48.0 tok/s cut against 54.2 uncut
@@ -1110,14 +1110,10 @@ bool adapt_device_table_lags() { return adapt_nowait() || adapt_lag() > 1; }
 /// moves an expert between the CPU and the GPU inside a window.
 bool adapt_cuts_windows() {
     static const bool v = [] {
-        const char* e = strata::env_get("ADAPT_CUT");
-        if (e && *e) return e[0] != '0';
-        const auto& lay = strata::kernels::cpu::expert_layout();
-        if (!lay.native || lay.fmt.empty()) return true;
-        for (const auto& f : lay.fmt)
-            if ((f.had_gu || !strata::kernels::cpu::canon_layer(f)) && !strata::kernels::cpu::tq_supported(f.gu_type))
-                return true;
-        return false;
+        const auto p = strata::core::pick_from_env("ADAPT_CUT");
+        if (p == strata::core::Pick::Off) return false;
+        if (p == strata::core::Pick::On) return true;
+        return !strata::core::adapt_layers_round_alike();
     }();
     return v;
 }
@@ -13527,6 +13523,9 @@ int main(int argc, char** argv) {
             // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
             // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
             // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
+            // the first window of a round whose swaps are still to be applied: with the lag it computes the
+            // swapped-in expert on the CPU, without it waits for the copy and computes it on the GPU
+            const bool swap_waited = !pending.empty() && pending_age == 0;
             if (adapt_nowait()) apply_pending(false);
             else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
@@ -13644,6 +13643,10 @@ int main(int argc, char** argv) {
             const bool timed = timed_round && !ver.captured_last();
             if (timed && chain_n == 0) policy.observe(from_sfx, T, a, sfx_match, round_ms);
             else if (timed) policy.observe_chain(T_mtp, chain_n, a, cm, round_ms);
+            if (timed) {   // the switches the windows choose (auto_pick.hpp)
+                strata::core::adapt_lag_window(round_ms, T, swap_waited);
+                strata::core::disjoint_adapt_window(round_ms, T, drive.d.remote_count > 0);
+            }
             if (rounds % 64 == 0)
                 std::fprintf(stderr, "xestrata generate: position %lld, %lld tokens, %lld rounds\n", (long long) p,
                              (long long) produced.size(), (long long) rounds);
