@@ -127,6 +127,11 @@ HF_REVISIONS = {
     "unsloth/Qwen3.5-0.8B-GGUF": "6ab461498e2023f6e3c1baea90a8f0fe38ab64d0",                        # 2026-11-08
     "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": "0a41c68809d375475f954be12ba7c40efa56c2a9",  # 2026-10-26
     "AtomicChat/Qwen3.8-Flash-Next-GGUF": "f5b0b790eebb89033c48091c26abf74c1b385940",               # 2026-11-03
+    # Edge0's latent-MoE packs (EDGE0_REVISIONS below pins the same by model name; setup_edge0 fetches the files)
+    "Edge0/Edge0-145B-q3k": "dd6864e1a097685e0ef808cd2e088cfde992abea",                            # 2026-11-13
+    "Edge0/Edge0-120B-q3k": "2d8fda55854cdc22b5af049476fd55be3f0a5370",                            # 2026-11-13
+    "Edge0/Edge0-145B-NVFP4": "a3778c635f2e97323132ff0b5fe3e093cd48e634",                          # 2026-11-15
+    "Edge0/Edge0-120B-NVFP4": "f2c72e69c8649e3718b17b2b942e364d730a2dcd",                          # 2026-11-15
     # the translation models (serve/translate.py's MODELS)
     "pfnet/plamo-3-translate-2b-GGUF": "4f672106b847200bfdc0f6af6c321cd94eba1aed",                  # 2026-11-09
     "pfnet/plamo-3-translate-0.8b-GGUF": "1cf96ae02133958a20074bfdfab76517bb737d00",                # 2026-11-09
@@ -922,6 +927,205 @@ UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and
 # Contexts past 262144 (the model's trained length) extend it by rope scaling (upstream #84): for the context it will
 # serve the setup takes yarn (or asks, when interactive) and the factor final / 262144 (at least 1), keeps an explicit
 # --rope-scaling / --rope-scale, and refuses an explicit --rope-scaling none there.
+EDGE0_FILES = {
+    "Edge0-145B-q3k": {
+        "LICENSE": (13059, "b1f5016a9f27a770e0fdd98f37c588477154d07a96f50e203de8ac53cdbefa79"),
+        "NOTICE": (2560, "f2f4feabdd5b75e3ed5b41870a022bfc1dfdbcd798b8009f648cc870edbef777"),
+        "README.md": (32435, "a6c9e1e8250cf0b4b72527bf932bed0f993e8ac2750823faacdbf67c3e672a1a"),
+        "dense.bin": (1538625024, "f9bcc7f36eac4e59a7b1cb1962e038ba12dc831a41fb193761f1d1e72657fb62"),
+        "experts.bin": (40076574720, "947d15f3d69ecdb45d602a62bc84803451da779a22294e1db5b3568290b42879"),
+        "index.txt": (117464, "980366930f95ae1b8138652256c3b9be8925b02395d4f093b72410797675a349"),
+        "labels.bin": (98304, "ce9b4a20b92c5c866e65d84a3884c104986522471cf11cc5f797a153affbcc06"),
+        "latent_dense_q4.bin": (1981808640, "e31e11f36c7e5a23c82550b524fd44fb28cfa821ef59fd688b8d2339137ab287"),
+        "latent_dense_q8.bin": (3743416320, "fbb25caaa0dcf45ef62f1a4945dcf98a53a166934a3b461b166fbafa831d87ca"),
+        "model-bench.json": (1248, "f26262014dbd7ae0fa5de9ea5cbf67ca8689122954dbd2a66e4d8079b42fa67b"),
+        "model-skeleton.gguf": (5991569248, "ab49fbe7590cdcda45d7a2bcae4be0bd42c6a70b951d594a00eb158d7df0b72f"),
+        "model.json": (1531, "95b8280bf5151e11cf7b0622688172c9572dd8fd13558bb64d7e8edfc8c32ed4"),
+        "mtp/dense.bin": (116099072, "c724dc0b0822ada5d2977bf5bde821605feabaa64ea2e0045b67ca656329070a"),
+        "mtp/dense.txt": (1851, "991456cf4eb266eb8a888c349e548d11bc640f5dbd9149439aa9786af0f732fd"),
+        "mtp/draft_vocab.bin": (425196, "b1e1d3a7a9e4bf862dcd5923ce661fb59bbd07907e594df5cf86a62ac235cb91"),
+        "mtp/experts.bin": (707788800, "09398406be61f1f54c93861f449e48b8df0bfccbc9ec9b2b7636775a6ea9244f"),
+        "native_experts.txt": (1463, "0de7b81744e89f722374842a73b8b26a8a6145c645493471a9c10a4f5f566e70"),
+        "ple-fp8.gguf": (51200246112, "c7615c59b060277ddf6f84729fa8f7469cfc82c7fb983d6e7eab5a2f7446f170"),
+        "profile.bin": (196632, "543f8a364c8dbfef909ecd1a1d7adbc177d3db18ceecdca1fc568f3eaeb8c655"),
+        "release-scope.json": (2534, "9ab2d5f7bb8fef4caf664502a73a6b4371c56ad0244e81571df48587a69a11f4"),
+        "scales/l0.f32": (7168, "ccfb45da4cb91bf0cc19d867472ddfb5c2175640046f6bfc754aa4e344855972"),
+        "scales/l1.f32": (7168, "73a4a4964c59fe2ae6eebd994f099fde0389ddf7c49fe5994ea372d7f826a5c6"),
+        "scales/l10.f32": (7168, "30d4046e0efc59b0ff81d74d1da05f41661d12f3cdc3cade317d646b15aef135"),
+        "scales/l11.f32": (7168, "d41bc1a5fc130916cea24416da58d6c3edac68c6a27f24719c885083aef13d8f"),
+        "scales/l12.f32": (7168, "877b3eaac39446fe23023a06a643a0783f6604e4a722dcd5ed40e6976cb68408"),
+        "scales/l13.f32": (7168, "b62631e02ddf5ae3be123d4385ae1d147a13253e250a4d645a4e5f77673aeaa7"),
+        "scales/l14.f32": (7168, "547f5bd37f52a0e913532c90fb7ad11658ac4fabc6b2a28be159c4e07b1e286b"),
+        "scales/l15.f32": (7168, "374222a8750c7aa5e72f5a2b05229521931be61f99778b841d571ca1b19ae4d4"),
+        "scales/l16.f32": (7168, "de4aaf5ddc41a6b961db1e786929aad539da114495867cc3ee2283f77cb10a0a"),
+        "scales/l17.f32": (7168, "c29c3976ce49f137147213a84dece24c4221dae5326f1a0cf45717b03624368b"),
+        "scales/l18.f32": (7168, "aaf7450624f01bb074bae633f17432841a3794c8efaa76202f3d259046d2f679"),
+        "scales/l19.f32": (7168, "81625f559d0218685104a168d32ac8cabfb271531a8e8e9c8282df25f2754884"),
+        "scales/l2.f32": (7168, "1e2ad898903d58779bddef0708f6b9b605376f451da7d4a3e092c75921abee0e"),
+        "scales/l20.f32": (7168, "0effc90ca93708fc835a5fee3a51a9e4e8e28139e7d289e618bb160fbacc6de4"),
+        "scales/l21.f32": (7168, "4643ac0076f9df916418a8ea58ff70dfb5cd3ce8f8220686698dd1011ed70c48"),
+        "scales/l22.f32": (7168, "8c15e401e96b52144fab43ca05e312d9cd12a6ced369aff85b55bb4e8233e45d"),
+        "scales/l23.f32": (7168, "c737877b64bb32eb444eb497db2b1661c5f92bd35716a2b5ed57fa27c9c5bedc"),
+        "scales/l24.f32": (7168, "e708f5923e499b338c1e95b633eef61e75034ec68d8ea1a9579c159cdc372b5b"),
+        "scales/l25.f32": (7168, "f0ac87f861b8c85065e09fdef886f957f73e6ef7d42ef86d6bc6e4abe2daafd3"),
+        "scales/l26.f32": (7168, "14adbeb9d6dcb10dafe0912d897eb02e2aa6abdb9e0a56f377945697bee02630"),
+        "scales/l27.f32": (7168, "1003f7dbacce30b7d2e1d758cfb7057a742bdf648472fcbd63333234f076e515"),
+        "scales/l28.f32": (7168, "e912c6d85335fc9ec83635064e523b0efe19fd5ef4de4f299bddfd1203c33693"),
+        "scales/l29.f32": (7168, "8c186910f9afcecd23abdbaf2eee52f48360b114f4e47543a41922414db1fd5b"),
+        "scales/l3.f32": (7168, "5b4b1994bcb00a0e78150152ed4d3eba1c90203f3772fc9d3b01bb133661949a"),
+        "scales/l30.f32": (7168, "b5cd2e55d0baeed12a8479feb5df830817821a1d00ff24050c451ecdf4913404"),
+        "scales/l31.f32": (7168, "b65fc3a4d56ca8ec2bd59b41ca63e0946ce30f27e4380477a79e7bcb868bef34"),
+        "scales/l32.f32": (7168, "4590579308a3973129592ced56ff24ed38f3bfe3ef4a8412c9dc2dbd40d170a7"),
+        "scales/l33.f32": (7168, "b8e28a6a3a4e68b935d8779bc43f0cca8a7c87e43cfe0cdcb9ce757631c5bd79"),
+        "scales/l34.f32": (7168, "bad3b4908fecfd92429cdc1b16c0b00314a8f843f9510b8a87afdd297a348c65"),
+        "scales/l35.f32": (7168, "2bc0b3d52dbc8ff6079cf978307698aede8a7ebb0084ba746f6164ce020c4fb1"),
+        "scales/l36.f32": (7168, "d6627bdbf25218a3dd429fa752a1ef882fd610eb23b66871b42b078713059356"),
+        "scales/l37.f32": (7168, "8afc17ed3b68756be8e5590ecbebb3e36179fabafb71901faf63e67ffe02f244"),
+        "scales/l38.f32": (7168, "445fbb2f2365079f06569460e6a905dad3e7f475d23af5ac2b967ab548e27c27"),
+        "scales/l39.f32": (7168, "020697f9289610c49dea1b47b72dd7f0f3746352c52b02f7d9d05db9011ddb07"),
+        "scales/l4.f32": (7168, "223b5a8a9fef3fb289915b985f0492db776be6ee4bc794af6bd6b40bc73f5951"),
+        "scales/l40.f32": (7168, "64b0d2d16992197dc7e2f0986f3d71ab0b744b4df0bdbab15bf08450c0919b00"),
+        "scales/l41.f32": (7168, "a75175bdc03d571f557d59aede6de9a0e734c61b03cfacc4ceb74c19b3787b7d"),
+        "scales/l42.f32": (7168, "e6596c611be63531fbf46fc73c1d1fcf86d38b09cfb27f97ee63571eea4be9cd"),
+        "scales/l43.f32": (7168, "e6e2227612938fac5320a81970215dac65bbee6e555573a5a3da7632adfe6087"),
+        "scales/l44.f32": (7168, "4187577ae6c484c700dfbf003a698aef48ce27fff9035ba40781abec05b58bf7"),
+        "scales/l45.f32": (7168, "270938e5d001b88e23a01d7c0f967ca165f1ac35adeff23f6401365d4d381430"),
+        "scales/l46.f32": (7168, "e3c18301cbfdf48eaa11cbb657f0696d3582aad5f68e2c9c27bafa3481b5a4e2"),
+        "scales/l47.f32": (7168, "552e22ee2bf8dbce16b68ac95a1146a141443a42e3326f7115d47dbe0ec9b845"),
+        "scales/l5.f32": (7168, "2b54008e9681de98a3590ab2d87eccda2f0ce4cfb6a99c91ddea2bfaf7ee9103"),
+        "scales/l6.f32": (7168, "7c0475b18ff380f4fc900ef308226b0a98ef855e793add4c1d149a3620a18f30"),
+        "scales/l7.f32": (7168, "ffb91ee9d1abf5ce63a07c1cc6f8182849700c9701705c3a386398fde797771b"),
+        "scales/l8.f32": (7168, "2ef5f3fdea5a3bc49e8b7cd93a41a793460da3685ed9d0ea10e9aae053c85477"),
+        "scales/l9.f32": (7168, "788cb1c638605ac71728913ce4fcb14c008dbbf46982c4c9c9d1f7af90e03ba5"),
+        "start.sh": (1058, "4067fc14bab4b859a8d9666996ecb963f15b52c54b241696f255caf209baa5e8"),
+        "third-party/Qwen-LICENSE.txt": (3235, "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        "tokenizer/chat_template.jinja": (8952, "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"),
+        "tokenizer/merges.txt": (3353258, "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332"),
+        "tokenizer/token_type.json": (744960, "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b"),
+        "tokenizer/tokenizer.json": (541, "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf"),
+        "tokenizer/vocab.json": (5737005, "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4"),
+    },
+    "Edge0-120B-q3k": {
+        "LICENSE": (13059, "b1f5016a9f27a770e0fdd98f37c588477154d07a96f50e203de8ac53cdbefa79"),
+        "NOTICE": (2560, "f2f4feabdd5b75e3ed5b41870a022bfc1dfdbcd798b8009f648cc870edbef777"),
+        "README.md": (32744, "6f91e1e1810a789a368765f263f2b95ddaf2a0c9626d6cf06ebc325fe1be1b75"),
+        "dense.bin": (1538625024, "f9bcc7f36eac4e59a7b1cb1962e038ba12dc831a41fb193761f1d1e72657fb62"),
+        "experts.bin": (28626124800, "ffa87de634deb4d0a65b82b06748aef2cbe649838e20f239730cc62a0e3c7c80"),
+        "index.txt": (117464, "980366930f95ae1b8138652256c3b9be8925b02395d4f093b72410797675a349"),
+        "labels.bin": (98304, "ce9b4a20b92c5c866e65d84a3884c104986522471cf11cc5f797a153affbcc06"),
+        "latent_dense_q4.bin": (1415577600, "4824fb68c5dceb94c33bae0fda3801b1f26f65eb8b9ea0dfac0450fc2bfa41b5"),
+        "latent_dense_q8.bin": (2673868800, "fec3adc0b7b3b0798127550951e541823a0c96ca136911332ee050e39c302c91"),
+        "model-skeleton.gguf": (5991569248, "ab49fbe7590cdcda45d7a2bcae4be0bd42c6a70b951d594a00eb158d7df0b72f"),
+        "model.json": (1531, "7dd6161693d6af7c7ae3b664e546b44120c6e7b3725b4234dd0bbb9172a0b5ba"),
+        "mtp/dense.bin": (116099072, "c724dc0b0822ada5d2977bf5bde821605feabaa64ea2e0045b67ca656329070a"),
+        "mtp/dense.txt": (1851, "991456cf4eb266eb8a888c349e548d11bc640f5dbd9149439aa9786af0f732fd"),
+        "mtp/draft_vocab.bin": (425196, "b1e1d3a7a9e4bf862dcd5923ce661fb59bbd07907e594df5cf86a62ac235cb91"),
+        "mtp/experts.bin": (707788800, "09398406be61f1f54c93861f449e48b8df0bfccbc9ec9b2b7636775a6ea9244f"),
+        "native_experts.txt": (1458, "28566dc85c852619f81afbe368dd0e361df5db06b23e98b41b5ac838e0c29df8"),
+        "ple-fp8.gguf": (51200246112, "c7615c59b060277ddf6f84729fa8f7469cfc82c7fb983d6e7eab5a2f7446f170"),
+        "profile.bin": (196632, "543f8a364c8dbfef909ecd1a1d7adbc177d3db18ceecdca1fc568f3eaeb8c655"),
+        "release-scope.json": (2534, "f5a88536e8159fac311adaa16e8b44433d047ab580a568028c2cc557aac6c6b6"),
+        "scales/l0.f32": (5120, "85e8d36581a6e0b2fb8a22f12f6625ef467281bf8d8bc526c68741bdcb7ddbe6"),
+        "scales/l1.f32": (5120, "3e0a6fff0f1201ca1fd345b1e47fa5bdc2d5bcd4405e58ecc496f6103e12d299"),
+        "scales/l10.f32": (5120, "4b2035666630fb86f2adcbd630506305ceea48c98e3bbe3bc2f248e9f5ccc7f9"),
+        "scales/l11.f32": (5120, "8e0aebd966a8687c5a28826611bbce3dfec31b968d9ab24241aa934e93165456"),
+        "scales/l12.f32": (5120, "74d8083edca0925e1f1a8ecda7ce0c18617170799f3a0569d5722b1a02718619"),
+        "scales/l13.f32": (5120, "cb9b543a3d1e64e5985fd5e16938f8dc257d33e56282ff5b1f14027b4c56b989"),
+        "scales/l14.f32": (5120, "95af2b87fcae0bc7dbf0b916957ec51e97d82f10409a0cbaf7327c7972ca9347"),
+        "scales/l15.f32": (5120, "8d94319506c360b0cdcf0bfc987d4685a21dcf905bf02b9344c2bd485bdaa019"),
+        "scales/l16.f32": (5120, "32373bfb26bb63695cd41e2fdeee3e4cd6bd744c9b1f1b4a9e130ea782399db6"),
+        "scales/l17.f32": (5120, "c492007a2d14eb49ee744ba0afe268e2433c6f63937f5b599a89e222f64dcf41"),
+        "scales/l18.f32": (5120, "d93f01aaa68d51faf05b0d6c6c55825e3b2f434bdd0f3816c91352953964c841"),
+        "scales/l19.f32": (5120, "3fc5e3cd3afa52b11337756fb814230797c4d51f34ef1b036df34e917300bf67"),
+        "scales/l2.f32": (5120, "2eeb3efeafd713dd4e8e7bb8c2abb85ac54f4ecc14e474ea841087500121d5b2"),
+        "scales/l20.f32": (5120, "6701c6dbf754d580b8fb72a33866115c46563d17a5536950a5d86fe3e6654587"),
+        "scales/l21.f32": (5120, "c59bcf8ab53fa1d22b7b235adff7003e92201079d376c7339e12ccdca62d84f8"),
+        "scales/l22.f32": (5120, "fd71197a966c96bc7fa6f0012ef4dad0339280a4df5b4aea05806732ffdb9a16"),
+        "scales/l23.f32": (5120, "1aa2dded4c52631fccbb7d3ac02528ecc60b69e1cef9380d364b73d6a22fec9a"),
+        "scales/l24.f32": (5120, "99302c6a43e44d709bda4a09d90a889844fa5fd6cfe544ddfbd037d953866b14"),
+        "scales/l25.f32": (5120, "1483f9ce27321e6b8d10c9306f7c40136f1e7e1adf3aa7606138af8130ab51de"),
+        "scales/l26.f32": (5120, "29915afbc4dea9c8045ccbbee2d5ac94e6aea8e496545ed9b727b19140636dba"),
+        "scales/l27.f32": (5120, "25239299177bbab603db755fb3739c7227c91204e0093b6c2e986ac100845fdb"),
+        "scales/l28.f32": (5120, "1720ba26be65dc87ec49a4bd9c3fe1b6b4b92ea2754a7cab942db0c3665a1fb5"),
+        "scales/l29.f32": (5120, "b9320996043f4df4fe235eca0683e7078e9a8ac7ae212a0a89b57554bf7338c0"),
+        "scales/l3.f32": (5120, "fd2401ccb2d2d15f3b63e33586b46c447dbc974608409af4992df91c0b70c171"),
+        "scales/l30.f32": (5120, "1159fbf1ac7e1fd20d6cd82fb14f1be91d53c7462785449872e57344176aca37"),
+        "scales/l31.f32": (5120, "7098314f9d94022ca159dd279b9e7198c9e64e8e48923934659e52519d88e692"),
+        "scales/l32.f32": (5120, "fe82b2cc3d4b1335357216a56ac5f2800b4c392c58e093c2ab8a7bc169dba811"),
+        "scales/l33.f32": (5120, "51d0fb481ce58aca0e9ce133a75af614edb63c2876505cf5e36da63a7c295b2d"),
+        "scales/l34.f32": (5120, "5218e92125014bf751d6374a52c997ea6875e1f812af5bc189e149b17ce68a40"),
+        "scales/l35.f32": (5120, "9522b0e703aeb0843a4695b15126763906fc100474aa980f77ed598d1ef590d3"),
+        "scales/l36.f32": (5120, "65c83633c75aff863e3187c75a9de44ae6f45678cf78c3e057a752fa04c062d7"),
+        "scales/l37.f32": (5120, "dcfa6fe6abb0e8235a0864c05e1fc8a836c9641e6ac11d30197c95fa21f4b713"),
+        "scales/l38.f32": (5120, "50a47c31ca71ad178a0d254304f8e90ed2fbee4e306e67cae64dac90ce3dff09"),
+        "scales/l39.f32": (5120, "38732ae23e0f9603c549a7c125e47592a3195d13b79bb7c2de56e23a4d1b894b"),
+        "scales/l4.f32": (5120, "90abd2538b48544cc485cd856c42114f901d14356bf0a86857a9fd3a3c5a09a7"),
+        "scales/l40.f32": (5120, "a10316a6e129834a2db7c7d1b1b5db88a0b00468f4d58f354265c7249c11d6a6"),
+        "scales/l41.f32": (5120, "9e624d36588778350bcb7afde14e36b21a3b70e59b1660f1b581fcfad83f82b9"),
+        "scales/l42.f32": (5120, "8c2774c473010bd59ea6dc7c972b470dae8f76b852f075213677d5ee53a0af5c"),
+        "scales/l43.f32": (5120, "b183a20b1c168d445dafb9b9249143972b9febc3af7d7c9f10d84c8b4426eaf5"),
+        "scales/l44.f32": (5120, "5dd13b9160ba411c7a0aba2089235a2b32ad8efdad2fc922b959b17a90a2c916"),
+        "scales/l45.f32": (5120, "269cf0a2043b02abaabd991d514d91dd375cc633c432d188157e50e1470632d0"),
+        "scales/l46.f32": (5120, "01ae36b1f210e9d7790bd311870fa2cac543d5551c50269db70b9386974d9420"),
+        "scales/l47.f32": (5120, "9b612fcdc354854717f42a7b46d186304f51e95bfc8561a49b159e8db33a1736"),
+        "scales/l5.f32": (5120, "28e0e050ac722705694ab3d1ffcec262b94a6139db1ece3b7b29779e233d7014"),
+        "scales/l6.f32": (5120, "b43b04e83c260a609c8ae5e38bf1cecfddcfc9f76fc79ca7e0097728dbeb5f57"),
+        "scales/l7.f32": (5120, "af2f95705b96b7e640d73b214d756d9e4f3dcad6754161bf516beb1f0da09db5"),
+        "scales/l8.f32": (5120, "7660bac487ec9d9605c704267ebcf5f53193094581587fdfd40d948c5cf4e1b4"),
+        "scales/l9.f32": (5120, "263225e5e897c64c631ed492d6a0686c0f5df1a51d06f666a7137732c314a8b5"),
+        "start.sh": (1058, "4067fc14bab4b859a8d9666996ecb963f15b52c54b241696f255caf209baa5e8"),
+        "third-party/Qwen-LICENSE.txt": (3235, "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"),
+        "tokenizer/chat_template.jinja": (8952, "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"),
+        "tokenizer/merges.txt": (3353258, "4ba698529766c7a2f5052083ea10cdf2485577f5237a332ee291054eb11e3332"),
+        "tokenizer/token_type.json": (744960, "5088c8c298fc06af8382ddb3b76c888703ac2634e82263b97eedcc2ad202738b"),
+        "tokenizer/tokenizer.json": (541, "c0bd435efbc6c3b28964b47999afe16c4ad268c7c7c4e8cb3af410796a6f30bf"),
+        "tokenizer/vocab.json": (5737005, "4ba64f0332abcfb0b600b7df1537d1e836e68009d5fb7cdb77339738dc6365c4"),
+    },
+}
+EDGE0_SHARED = [
+    "LICENSE",
+    "NOTICE",
+    "dense.bin",
+    "index.txt",
+    "labels.bin",
+    "model-skeleton.gguf",
+    "mtp/dense.bin",
+    "mtp/dense.txt",
+    "mtp/draft_vocab.bin",
+    "mtp/experts.bin",
+    "ple-fp8.gguf",
+    "profile.bin",
+    "start.sh",
+    "third-party/Qwen-LICENSE.txt",
+    "tokenizer/chat_template.jinja",
+    "tokenizer/merges.txt",
+    "tokenizer/token_type.json",
+    "tokenizer/tokenizer.json",
+    "tokenizer/vocab.json",
+]
+
+# Edge0's latent-MoE releases (Edge0-145B-q3k / Edge0-120B-q3k): a pre-built Strata pack (experts.bin + the v6
+# native_experts.txt + dense.bin + the skeleton GGUF + the fp8 n-gram table + the latent D/U files + labels + scales),
+# not a GGUF the packer converts.  The two share 19 files (the n-gram table, the skeleton, dense.bin, the MTP layer,
+# labels, the tokenizer, ...): setup downloads them once and hardlinks the second model's copy.  The weights are
+# non-free (Edge0 Community Model License 1.0 + Qwen Community License 1.0): setup fetches them to the user's machine,
+# XeStrata bundles nothing.  Files pinned at the revision (the Hub's LFS SHA-256; the small files' own SHA-256).
+EDGE0_REVISIONS = {
+    "Edge0-145B-q3k": "dd6864e1a097685e0ef808cd2e088cfde992abea",
+    "Edge0-120B-q3k": "2d8fda55854cdc22b5af049476fd55be3f0a5370",
+}
+EDGE0_MODELS = {
+    "Edge0-145B-q3k": {"repo": "Edge0/Edge0-145B-q3k", "latent_dim": 1792, "dense_fmt": "8",
+                       "dense_file": "latent_dense_q8.bin", "download_gb": 105.4, "ram_gb": 64,
+                       "about": "145B latent MoE (latent width 1792), Q3_K experts; ~99 GB on disk"},
+    "Edge0-120B-q3k": {"repo": "Edge0/Edge0-120B-q3k", "latent_dim": 1280, "dense_fmt": "4",
+                       "dense_file": "latent_dense_q4.bin", "download_gb": 92.3, "ram_gb": 48,
+                       "about": "120B latent MoE (latent width 1280), Q3_K experts; ~86 GB on disk"},
+}
+EDGE0_LICENSE = ("Edge0 Community Model License 1.0 (personal, research and non-commercial sharing; commercial use "
+                 "needs a separate Edge0 license) and Qwen Community License 1.0 (the Qwen3.8-Flash-Next base): "
+                 "https://huggingface.co/Edge0/Edge0-145B-q3k/blob/main/LICENSE")
+
 # 204800 (200K) sits between 128K and 256K: it is inside the trained 262144, so it needs no rope scaling and
 # costs ~2.8 GB of 8-bit KV with IQ3_S (vs ~3.6 GB at 256K) - a middle step for PCs that cannot hold 256K.
 CONTEXTS = [8192, 32768, 65536, 131072, 204800, 262144, 393216, 524288]
@@ -1056,6 +1260,14 @@ FAMILIES: dict[str, dict[str, Any]] = {
                    "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; the AD files are AtomicChat's "
                               "quantization): https://huggingface.co/AtomicChat/Qwen3.8-Flash-Next-GGUF"},
 }
+# Edge0's latent MoE (the Qwen3.8-Flash-Next engine with the experts at a latent width): a pre-built pack, its own
+# install path (setup_edge0).  Listed for --family edge0; the models are the two sizes in Q3_K and NVFP4, each from
+# its own repository (EDGE0_MODELS' "repo").  No picture reader: the pack has none ("vision" False, no mmproj).
+FAMILIES["edge0"] = {"title": "Edge0 (latent MoE)", "by": "Edge0's latent-MoE distillations of Qwen3.8-Flash-Next",
+                     "about": "145B and 120B latent sparse MoE, Q3_K experts; a pre-built pack, ~99 / ~86 GB on disk",
+                     "hf": hf("Edge0/Edge0-145B-q3k"), "file": "", "tag": "edge0-",
+                     "name": "edge0", "models": EDGE0_MODELS, "license": EDGE0_LICENSE, "edge0": True,
+                     "vision": False, "mmproj_hf": None, "mmproj": None}
 # The models the engine runs other than Qwen3.8-Flash-Next (src/core/plain_model.cpp: `xestrata-engine --native` with
 # another architecture): one GGUF file each, its size and SHA-256 at the pinned revision (the Hub's LFS pointers), or
 # its "parts" (a model in several files: each one's path in the repository, size and SHA-256; "file" is the first, which
@@ -9153,6 +9365,86 @@ def describe() -> dict:
             "options": options_described()}
 
 
+def setup_edge0(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, found: list, gpu_chosen: bool,
+                ram: float, roots: list, elsewhere: list, port: int, adopted: Path | None) -> int:
+    """Steps 5-7 for Edge0's latent MoE (the Qwen3.8-Flash-Next engine, experts at a latent width): the pre-built
+    pack downloaded file by file (each checked against its SHA-256 at the pinned revision), the files the two models
+    share hardlinked from the one already here, and the config from the pack's model.json (the engine's args and the
+    latent environment, paths made absolute).  The weights are non-free (Edge0 Community Model License 1.0 + Qwen
+    Community License 1.0): their terms are accepted before the download.  XeStrata bundles nothing."""
+    names = list(EDGE0_MODELS)
+    if a.model and a.model not in names:
+        fail(f"{fam['title']} has no {a.model}", "choose one of: " + ", ".join(names))
+    for i, m in enumerate(names, 1):
+        d = EDGE0_MODELS[m]
+        fit = "" if ram >= d["ram_gb"] else f"   <- needs ~{d['ram_gb']} GB of RAM, this PC has {ram:.0f}"
+        say(f"  {i}) {m:16s} {d['about']}; download ~{d['download_gb']:.0f} GB{fit}")
+    model = a.model or names[int(ask("Which model?", [str(i) for i in range(1, len(names) + 1)], "1", a.yes)) - 1]
+    d = EDGE0_MODELS[model]
+    say(f"  Its license: {EDGE0_LICENSE}")
+    if ask("  Accept these terms and download the weights?", ["y", "n"], "n", a.yes) != "y":
+        fail("the Edge0 weights need their license accepted; nothing was downloaded")
+    models_dir = Path(a.models_dir)
+    pack = models_dir / model
+    rev, repo, files = EDGE0_REVISIONS[model], d["repo"], EDGE0_FILES[model]
+    step(5, f"downloading {model}")
+    say(f"  The model files go in {pack} (the two Edge0 models share {len(EDGE0_SHARED)} files: one download,")
+    say("  hardlinked into the other model's folder; a different filesystem downloads its own copy)")
+    for path, (size, sha) in sorted(files.items(), key=lambda kv: (kv[1][0], kv[0])):
+        dst = pack / path
+        if dst.exists() and done(dst):
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if path in EDGE0_SHARED:
+            src = next((models_dir / o / path for o in EDGE0_MODELS
+                        if o != model and (models_dir / o / path).exists() and done(models_dir / o / path)), None)
+            if src is not None:
+                try:
+                    dst.unlink(missing_ok=True)
+                    os.link(src, dst)
+                    mark(dst, f"hardlink {src}")
+                    ok(f"{path} linked from {src.parent.name}")
+                    continue
+                except OSError:
+                    pass   # a different filesystem: download it
+        download_file(f"{hf_endpoint()}/{repo}/resolve/{rev}/{path}", dst, path)
+        verify_sha256(dst, size, sha, own=True)
+    ok(f"model files present: {pack}")
+    llama, eng, lib_dirs = prepare_engine(a, gpu)
+    # the config from the pack's model.json: the engine's args and the latent environment, paths made absolute
+    mj = json.loads((pack / "model.json").read_text(encoding="utf-8"))
+
+    def abs_path(p: str) -> str:
+        p = p.lstrip("./")
+        return str(pack / p) if p not in (".", "") else str(pack)
+
+    path_flags = {"--pack", "--native", "--native-dense-gguf", "--ple-gguf", "--expert-profile", "--mtp"}
+    args: list[str] = []
+    it = iter(mj.get("args", []))
+    for tok in it:
+        if tok in path_flags:
+            args += [tok, abs_path(next(it))]
+        else:
+            args.append(tok)
+    env: dict[str, str] = {}
+    for k, v in (mj.get("env") or {}).items():
+        name = "XESTRATA_" + k[len("STRATA_"):] if k.startswith("STRATA_") else k
+        if name in ("XESTRATA_LATENT_DENSE", "XESTRATA_LATENT_A", "XESTRATA_LATENT_LABELS"):
+            v = abs_path(v)
+        env[name] = str(v)
+    tag = model.lower()
+    cfg: dict[str, Any] = {"exe": str(eng / EXE), "args": args, "cwd": str(pack),
+                           "tokenizer": str(pack / "tokenizer"), "model_name": tag, "family": family,
+                           "log": str(STATE / f"xestrata-{tag}.log"), "lib_dirs": lib_dirs, "port": port,
+                           "env": env, "model_gb": d["download_gb"],
+                           "experts_gb": files["experts.bin"][0] / 1e9}
+    if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
+        cfg["gpu_pci"] = gpu["pci"]
+    return finish_setup(a, cfg, tag, port, adopted, False,
+                        notes=("The latent MoE runs its experts at the latent width on the GPU; the D/U projections and "
+                               "the column scales are the pack's. First runs: see docs/DETAILS.md (Edge0).",))
+
+
 def main() -> int:
     # Windows: the 7z's prebuilt engine only (PACKAGED); this folder compiles one on Linux only
     if sys.platform != "linux" and not (WIN and PACKAGED):
@@ -9692,7 +9984,7 @@ def main() -> int:
     if on_cpu and a.family == CUSTOM:
         fail("a model of your own files needs a GPU: without one the CPU runs " +
              " and ".join(PLAIN_FAMILIES[f]["title"] for f in cpu_fams))
-    fams = cpu_fams if on_cpu else [f for f in FAMILIES if f != CUSTOM]
+    fams = cpu_fams if on_cpu else [f for f in FAMILIES if f != CUSTOM and f != "edge0"]   # edge0: --family edge0
     # a Strix Halo with the memory for it: UD-IQ4_XS is the recommendation, the menus list the rest (upstream c4a329fe)
     halo = gpu.get("gfx") == STRIX_HALO_GFX and "uma_gb" in gpu and ram + gpu.get("carve_gb", 0.0) >= STRIX_HALO_MIN_GB
     halo_fam = (next((f for f in fams if f in MODELS.get(STRIX_HALO_MODEL, {}).get("families", ())), None)
@@ -9709,6 +10001,8 @@ def main() -> int:
         say(f"  Its license: {lic}")
     if fam.get("plain"):
         return setup_plain(a, family, fam, gpu, chosen, sel, found, gpu_chosen, ram, roots, elsewhere, port, adopted)
+    if fam.get("edge0"):
+        return setup_edge0(a, family, fam, gpu, chosen, sel, found, gpu_chosen, ram, roots, elsewhere, port, adopted)
     say()
     # an experimental size sorts last (UD-IQ4_XS before UD-Q4_K_XL); --model takes the names as they are
     names = sorted((m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))),
