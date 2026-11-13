@@ -5660,9 +5660,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (i8_l) {   // the layer's T tokens as q8_1 rows, once (the grouped kernels' activations)
                             if (static bool said = false; !said) {
                                 said = true;
-                                if (strata::kernels::native_expert_i8_by_default())
+                                if (strata::kernels::native_expert_i8_by_default()) {
+#if !defined(STRATA_PF_OWN_ONLY)   // a build without MMQ says what runs in its start-up line (own_only_line.hpp), per chunk size: this one would be wrong above the P100's stream floor
                                     std::fprintf(stderr, "strata: prompt experts on our own int8 kernels (the default of this build or graphics card; STRATA_EXPERT_I8=0 goes back to the old kernels)\n");
-                                else
+#endif
+                                } else
                                     std::fprintf(stderr, "strata: prompt experts on our own int8 dot-product kernels (STRATA_EXPERT_I8=1)\n");
                             }
                             if (m.fr_xq == nullptr || m.fr_xq_rows < T) {
