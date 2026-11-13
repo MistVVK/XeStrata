@@ -540,7 +540,7 @@ if(STRATA_ENABLE_XE)
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
                                    src/core/native_dense.cpp src/core/verify.cpp src/core/moe_window.cpp
                                    src/core/plain_model.cpp src/core/plain_glm5.cpp src/core/pcie_split.cpp
-                                   src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
+                                   src/core/mtp.cpp src/core/dflash2.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
                                    src/core/conversation_file.cpp src/core/control_vector.cpp
                                    src/core/vmm.cpp src/core/draft_head.cpp
@@ -613,6 +613,9 @@ if(STRATA_ENABLE_XE)
     target_link_libraries(dflash2_parity PRIVATE strata_engine)
     add_test(NAME dflash2_parity COMMAND dflash2_parity)
     set_tests_properties(dflash2_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    # the ring log's rebuild against the original update (GPU, the real pack: dflash2_ring_test PACK)
+    add_executable(dflash2_ring_test src/core/dflash2_ring_test.cpp)
+    target_link_libraries(dflash2_ring_test PRIVATE strata_engine)
     add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)
     target_link_libraries(pinned_shared_test PRIVATE strata_engine)
     add_test(NAME pinned_shared_test COMMAND pinned_shared_test)
