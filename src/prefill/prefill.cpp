@@ -27,6 +27,7 @@
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/canon_expert.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/qsa.hpp"
@@ -1167,6 +1168,7 @@ inline bool mmq_tab_on() {
 }
 struct MmqPlan {
     bool any = false, fallback = true;
+    bool canon = false;                        // a layer takes the fixed-point products (canon_prefill_layer)
     std::vector<char> layer;                   // per layer: MMQ
     size_t gu_max = 0, d_max = 0;
     int64_t int8_below = INT64_MAX;            // a layer of a chunk takes MMQ while its experts average fewer rows
@@ -1178,6 +1180,23 @@ int mmq_env() {
     return env == nullptr || env[0] == '\0' ? -1 : (int) std::strtol(env, nullptr, 10);
 }
 bool mmq_wanted() { return mmq::chosen() && mmq_env() != 0; }
+// The layers whose experts the CPU computes in the canonical rows (canon_expert.hpp) and whose every part has the
+// fixed-point int8 products (kernels::iq_mmq_fx): a chunk the CPU may share takes those products, with the canonical
+// activations and SwiGLU, for such a layer on the GPU, so an expert gives the same bits on either side and the share
+// the chunk measures leaves the answer as it is (the measured share moved from run to run, and the greedy text with
+// it).  XESTRATA_PREFILL_CANON=0: the GPU's own products there as before (A/B).
+bool canon_prefill_on() {
+    static const bool on = [] {
+        const char* v = strata::env_get("PREFILL_CANON");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+bool canon_prefill_layer(const strata::kernels::cpu::NativeFmt& f) {
+    const int up = f.up_type < 0 ? f.gu_type : f.up_type;
+    return canon_prefill_on() && strata::kernels::cpu::canon_layer(f) && !f.had_gu && !f.had_d && up == f.gu_type &&
+           strata::kernels::iq_mmq_fx(f.gu_type) != 0 && strata::kernels::iq_mmq_fx(f.d_type) != 0;
+}
 
 const MmqPlan& mmq_plan() {
     // per GPU (the current device's): a layer split's stages can differ, and a stage that took the first GPU's plan
@@ -1201,6 +1220,7 @@ const MmqPlan& mmq_plan() {
             }
             p.layer[(size_t) l] = 1;
             p.any = true;
+            p.canon = p.canon || canon_prefill_layer(lay.fmt[(size_t) l]);
             p.gu_max = std::max(p.gu_max, mmq::matrix_bytes(gt, 1280, N));
             p.d_max = std::max(p.d_max, mmq::matrix_bytes(dt, N, 640));
         }
@@ -1210,6 +1230,10 @@ const MmqPlan& mmq_plan() {
             if (p.layer[(size_t) l]) {
                 mmq::choose_forms(lay.fmt[(size_t) l].gu_type, 1280, N, 16, nullptr);
                 mmq::choose_forms(lay.fmt[(size_t) l].d_type, N, 640, 16, nullptr);
+                if (canon_prefill_layer(lay.fmt[(size_t) l])) {
+                    mmq::choose_forms(strata::kernels::iq_mmq_fx(lay.fmt[(size_t) l].gu_type), 1280, N, 16, nullptr);
+                    mmq::choose_forms(strata::kernels::iq_mmq_fx(lay.fmt[(size_t) l].d_type), N, 640, 16, nullptr);
+                }
             }
         if (p.any && mmq_env() < 0) {   // by the rows a layer's experts average, against this GPU's timing
             int64_t first = 0;
@@ -1224,10 +1248,10 @@ const MmqPlan& mmq_plan() {
             p.int8_below = mmq::int8_rows_below(lay.fmt[(size_t) first], (size_t) lay.blob_bytes(first),
                                                  strata::kernels::xmx_available(strata::kernels::XmxType::f16) ? 0 : INT64_MAX,
                                                  launches);
-            if (p.int8_below == 0) {   // FP16 at every size
+            if (p.int8_below == 0 && !p.canon) {   // FP16 at every size
                 p = MmqPlan{};
                 p.layer.assign((size_t) std::max<int64_t>(layers, 0), 0);
-            } else if (p.int8_below != INT64_MAX) {
+            } else if (p.int8_below != INT64_MAX) {   // (with canon: the int8 products for the shared chunks only)
                 p.fallback = true;   // both kinds of layer: their scratch at one place (moe_set_bytes)
             }
         }
@@ -2982,8 +3006,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     int64_t routed = 0;   // the experts this layer routes to: a chunk's layer takes MMQ by their mean rows
                     for (int32_t e = 0; e < m.g->n_expert; ++e) routed += m.cnt[(size_t) e] > 0;
                     const int64_t below = mmq_plan().int8_below;
-                    const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l] &&
-                                         (below == INT64_MAX || T * K < below * std::max<int64_t>(routed, 1));
+                    // a chunk the CPU may share: the canonical layers' experts on the GPU in the CPU's bits
+                    const bool canon_l = cpu_maybe && lay.native && mmq_plan().any && mmq_plan().layer[(size_t) l] &&
+                                         canon_prefill_layer(lay.fmt[(size_t) l]);
+                    const bool use_mmq =
+                        canon_l || (mmq_plan().any && mmq_plan().layer[(size_t) l] &&
+                                    (below == INT64_MAX || T * K < below * std::max<int64_t>(routed, 1)));
                     // set_helper: the experts the helper GPU computes this layer, the ones it holds that this GPU
                     // would stream and at most max_rows tokens route to (their rows last, after the CPU's)
                     std::vector<char> on_help;
@@ -3247,8 +3275,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         std::future<bool>& f;
                         ~CpuJoin() { if (f.valid()) f.wait(); }
                     } cpu_join{cpu_fut};
-                    const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
-                    const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
+                    const int mmq_gt = canon_l ? strata::kernels::iq_mmq_fx(lay.fmt[(size_t) l].gu_type)
+                                               : lay.native ? lay.fmt[(size_t) l].gu_type : 42;
+                    const int mmq_dt = canon_l ? strata::kernels::iq_mmq_fx(lay.fmt[(size_t) l].d_type)
+                                               : lay.native ? lay.fmt[(size_t) l].d_type : 42;
                     // APR (prism.hadamard): folded gate/up take H (s * x), folded down H (s * h), on the FP16 path
                     // (mmq_plan gives such a layer no int8 products); the CPU's rows rotate in native_quant_act
                     const bool had_gu = lay.native && lay.fmt[(size_t) l].had_gu;
@@ -3267,7 +3297,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfGather, cs);
                     if (use_mmq) {
                         // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
-                        mmq::quantize_scatter(m.mixed, m.slot_dev, m.src_dev, m.Xq, mmq_gt, N, N, T, (int) K, m.cs);
+                        mmq::quantize_scatter(m.mixed, m.slot_dev, m.src_dev, m.Xq, mmq_gt, N, N, T, (int) K, m.cs,
+                                              canon_l ? 256 : 0);
                         // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
                         // reads the group's own quantized H)
                         // the groups: up to MMQ_GROUP experts in `order`, ended early when the rows would pass the
@@ -3552,9 +3583,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const auto* tabs = reinterpret_cast<const uint8_t* const*>(m.tab_dev);
                             if (mtab) { gu.wtab = tabs + j0; gu.woff = 0; }
                             m.mmq_ctx->run(gu, m.cs);
-                            mmq::swiglu(m.GU, m.H, nr, 640, !lay.native, m.cs);
+                            mmq::swiglu(m.GU, m.H, nr, 640, !lay.native, m.cs, canon_l);
                             pt.mark(kPfGemmD, cs);
-                            mmq::quantize(m.H, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
+                            mmq::quantize(m.H, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs, canon_l ? 32 : 0);
                             grp_rows_last = nr;
                             mmq::Product dn;
                             dn.w = mmq_direct ? ring0 + f.down_off : m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640;

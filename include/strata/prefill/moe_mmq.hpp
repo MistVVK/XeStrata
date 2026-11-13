@@ -38,14 +38,15 @@ size_t matrix_bytes(int ggml_type, int64_t rows, int64_t cols);
 size_t q8_bytes(int64_t rows, int64_t cols);
 
 /// int8 activations for MMQ against weights of `ggml_type`: row i of the output is row ids[i] of x (or row i when
-/// ids is null); `x` has `ld` floats per row.
+/// ids is null); `x` has `ld` floats per row.  `canon` (the fixed-point products, kernels::iq_mmq_fx): the canonical
+/// activations with one scale for each `canon` values (256 a gate/up's, 32 a down's), the CPU's canonical rows'.
 void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
-              void* stream);
+              void* stream, int canon = 0);
 /// The rows quantize(x, src, ...) writes for tokens x k_used rows in expert order, written token by token: token t's
 /// row of x is quantized once and stored at rows slot[t * k_used + k] (`slot` the inverse of `src`) - the same bytes,
 /// a k_used-th of the quantizations (upstream c675f5b7).  STRATA_QUANT_GATHER=1: quantize() over `src`, as before.
 void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, void* xq, int ggml_type, int64_t cols,
-                      int64_t ld, int64_t tokens, int k_used, void* stream);
+                      int64_t ld, int64_t tokens, int k_used, void* stream, int canon = 0);
 
 /// One launch over n experts whose weights lie `expert_bytes` apart from `w`: for expert e, the activation rows
 /// [bounds[e], bounds[e+1]) of `xq` (bounds on the device, n+1 entries) times its [w_rows, w_cols] matrix into
@@ -102,8 +103,9 @@ struct GatherGroup {
 bool gather_native_group(const GatherGroup& g, size_t up_off, size_t gu_half_bytes, size_t down_off, size_t d_bytes,
                          void* gu_dst, size_t gu_stride, void* d_dst, size_t d_stride, void* stream);
 /// h[r, k] = silu(gate) * up of GU rows [2 n_ff wide]: interleaved (gate 2k, up 2k+1: the Strata pack) or split
-/// (gate k, up n_ff + k: GGUF).  FP32 out (the down product's quantizer reads floats).
-void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream);
+/// (gate k, up n_ff + k: GGUF).  FP32 out (the down product's quantizer reads floats).  `canon`: canon_math.hpp's
+/// SwiGLU (the CPU's canonical rows' and the decode's, bit for bit).
+void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interleaved, void* stream, bool canon = false);
 
 /// How a prompt's layer launches its experts' products, for int8_rows_below to time them so: the model's experts, how
 /// many the int8 products take a launch, how many the FP16 path dequantizes and multiplies a launch, and whether each
