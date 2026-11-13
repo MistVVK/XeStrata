@@ -45,6 +45,7 @@
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/kernels/iq_mmq.hpp"
+#include "strata/kernels/exact.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/prefill/kva.hpp"   // STRATA_KVA: the approximate late-layer prompt read (opt-in)
@@ -1181,17 +1182,11 @@ int mmq_env() {
 }
 bool mmq_wanted() { return mmq::chosen() && mmq_env() != 0; }
 // The layers whose experts the CPU computes in the canonical rows (canon_expert.hpp) and whose every part has the
-// fixed-point int8 products (kernels::iq_mmq_fx): a chunk the CPU may share takes those products, with the canonical
-// activations and SwiGLU, for such a layer on the GPU, so an expert gives the same bits on either side and the share
-// the chunk measures leaves the answer as it is (the measured share moved from run to run, and the greedy text with
-// it).  XESTRATA_PREFILL_CANON=0: the GPU's own products there as before (A/B).
-bool canon_prefill_on() {
-    static const bool on = [] {
-        const char* v = strata::env_get("PREFILL_CANON");
-        return v == nullptr || v[0] != '0';
-    }();
-    return on;
-}
+// fixed-point int8 products (kernels::iq_mmq_fx), with the fixed-point sums on (kernels::exact_sums, XESTRATA_EXACT=1):
+// a chunk the CPU may share takes those products, with the canonical activations and SwiGLU, for such a layer on the
+// GPU, so an expert gives the same bits on either side and the share the chunk measures leaves the answer as it is
+// (the measured share moved from run to run, and the greedy text with it).
+bool canon_prefill_on() { return strata::kernels::exact_sums(); }
 bool canon_prefill_layer(const strata::kernels::cpu::NativeFmt& f) {
     const int up = f.up_type < 0 ? f.gu_type : f.up_type;
     return canon_prefill_on() && strata::kernels::cpu::canon_layer(f) && !f.had_gu && !f.had_d && up == f.gu_type &&

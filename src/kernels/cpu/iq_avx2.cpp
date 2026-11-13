@@ -29,6 +29,7 @@
 // initializer at namespace scope (#391, 016ea2e), the switches are read on first use.
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/canon_math.hpp"
+#include "strata/kernels/exact.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/swiglu_clamp.hpp"
 #include "strata/platform/env.hpp"

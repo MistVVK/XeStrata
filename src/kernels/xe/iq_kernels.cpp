@@ -32,6 +32,7 @@
 // SOFTWARE.
 //
 #include "strata/kernels/canon_math.hpp"
+#include "strata/kernels/exact.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/matrix_report.hpp"
@@ -1157,14 +1158,17 @@ inline void seg_dot_canon_fx(const sycl::sub_group& sg, const uint8_t* row, cons
 
 // S256: the activation's scale is one for each 256 values (the gate/up rows' x, quantize_q8_1_rows); a down row's h
 // has one for each 32, where a format's calls of a block (kGroup > 1) do not share it: the plain loop
+// fx: the fixed-point sums (exact.hpp) for a format that has them, the same on every lane of the launch
 template<int TY, int LPR, int NE, class G = void, bool S256 = true>
 inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const block_q8_1* const (&x)[NE], int n,
-                          int nb, int nb_all, int seg_lane, float (&out)[NE], const G* grid = nullptr) {
+                          int nb, int nb_all, int seg_lane, float (&out)[NE], bool fx, const G* grid = nullptr) {
     using F = Fmt<TY>;
-    if constexpr (HasFx<typename F::S>::value && (S256 || group_of<typename F::S>() == 1)) {
-        seg_dot_canon_fx<TY, LPR, NE, G, S256>(sg, row, x, n, nb, nb_all, seg_lane, out, grid);
-        return;
-    } else if constexpr (HasParts<typename F::S>::value && (S256 || group_of<typename F::S>() == 1)) {
+    if constexpr (HasFx<typename F::S>::value && (S256 || group_of<typename F::S>() == 1))
+        if (fx) {
+            seg_dot_canon_fx<TY, LPR, NE, G, S256>(sg, row, x, n, nb, nb_all, seg_lane, out, grid);
+            return;
+        }
+    if constexpr (HasParts<typename F::S>::value && (S256 || group_of<typename F::S>() == 1)) {
         seg_dot_canon<TY, LPR, NE, G>(sg, row, x, n, nb, nb_all, seg_lane, out, grid);
         return;
     } else {
@@ -1273,6 +1277,7 @@ template<int TG, int LPR>
 sycl::event launch_native_gu(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
                              const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok,
                              const block_q8_1* xq, NativeExpertLayout L, float* gate, float* up, int part = -1) {
+    const bool fx = exact_sums();   // the fixed-point sums (exact.hpp), the launch's lanes alike
     constexpr int RPW = kWarp / LPR;
     const int row_lo = part == 1 ? (int) L.n_ff : 0, row_hi = part == 0 ? (int) L.n_ff : (int) (2 * L.n_ff);
     const size_t xgroups = (size_t) ((row_hi - row_lo + (int64_t) GU_ROWS * RPW - 1) / ((int64_t) GU_ROWS * RPW));
@@ -1297,7 +1302,8 @@ sycl::event launch_native_gu(sycl::queue& q, size_t cap_groups, const unsigned l
                 const block_q8_1* xs[kEntriesPass];
                 for (int j = 0; j < kEntriesPass; ++j) xs[j] = xq + (size_t) ent_tok[j < n ? e + j : e] * xb;
                 float s[kEntriesPass];
-                seg_dot_multi<TG, LPR, kEntriesPass>(sg, wr, xs, n, nb, (int) (L.n_embd / Fmt<TG>::qk), seg_lane, s);
+                seg_dot_multi<TG, LPR, kEntriesPass>(sg, wr, xs, n, nb, (int) (L.n_embd / Fmt<TG>::qk), seg_lane, s,
+                                                     fx);
                 if (valid && seg_lane == 0)
                     for (int j = 0; j < n; ++j) (is_up ? up : gate)[(size_t) (e + j) * L.n_ff + r] = s[j];
             }
@@ -1311,6 +1317,7 @@ template<int TG>
 sycl::event launch_native_gu_pair(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
                                   const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok,
                                   const block_q8_1* xq, NativeExpertLayout L, float* gate, float* up, int part) {
+    const bool fx = exact_sums();   // the fixed-point sums (exact.hpp), the launch's lanes alike
     static_assert(TG == 18 || TG == 21 || TG == 22);
     using F = Fmt<TG>;
     constexpr int LPR = GU_LPR, RPW = kWarp / LPR, KG = F::S::kGroup;
@@ -1338,12 +1345,13 @@ sycl::event launch_native_gu_pair(sycl::queue& q, size_t cap_groups, const unsig
             [[maybe_unused]] int topw[2] = {canon::kFxNone, canon::kFxNone};
             [[maybe_unused]] bool whole = false;
             if constexpr (HasFx<typename F::S>::value)
-                for (int r = 0; r < 2; ++r) topw[r] = fx_first_top<TG>(wr[r], rows[r] < row_hi ? nb_all : 0);
+                if (fx)
+                    for (int r = 0; r < 2; ++r) topw[r] = fx_first_top<TG>(wr[r], rows[r] < row_hi ? nb_all : 0);
             for (int e = e0; e < e1; e += kEntriesPass) {
                 const int n = sycl::min(kEntriesPass, e1 - e);
                 const block_q8_1* xs[kEntriesPass];
                 for (int j = 0; j < kEntriesPass; ++j) xs[j] = xq + (size_t) ent_tok[j < n ? e + j : e] * xb;
-                if constexpr (HasFx<typename F::S>::value) {
+                if constexpr (HasFx<typename F::S>::value) if (fx) {
                     int ta[kEntriesPass], top[2][kEntriesPass];
                     int64_t fs[2][kEntriesPass];
                     for (int j = 0; j < kEntriesPass; ++j) ta[j] = j < n ? fx_act_first_top(xs[j]) : canon::kFxNone;
@@ -1470,6 +1478,7 @@ template<int TD, int LPR>
 sycl::event launch_native_down(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
                                const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
                                const block_q8_1* hq, NativeExpertLayout L, float* out) {
+    const bool fx = exact_sums();   // the fixed-point sums (exact.hpp), the launch's lanes alike
     constexpr int RPW = kWarp / LPR;
     const size_t xgroups = (size_t) ((L.n_embd + (int64_t) 8 * RPW - 1) / ((int64_t) 8 * RPW));
     return q.parallel_for(sycl::nd_range<2>({cap_groups, xgroups * 8 * kWarp}, {1, (size_t) 8 * kWarp}),
@@ -1490,7 +1499,8 @@ sycl::event launch_native_down(sycl::queue& q, size_t cap_groups, const unsigned
                 const block_q8_1* xs[kEntriesPass];
                 for (int j = 0; j < kEntriesPass; ++j) xs[j] = hq + (size_t) (j < n ? e + j : e) * hb;
                 float s[kEntriesPass];
-                seg_dot_multi<TD, LPR, kEntriesPass, void, false>(sg, wr, xs, n, nb, (int) (L.n_ff / Fmt<TD>::qk), seg_lane, s);
+                seg_dot_multi<TD, LPR, kEntriesPass, void, false>(sg, wr, xs, n, nb, (int) (L.n_ff / Fmt<TD>::qk),
+                                                                  seg_lane, s, fx);
                 if (valid && seg_lane == 0)
                     for (int j = 0; j < n; ++j) out[(size_t) ent_dst[e + j] * L.n_embd + r] = s[j];
             }
@@ -1512,6 +1522,7 @@ template<int TG, int LPR>
 sycl::event launch_native_gu_fused(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
                                    const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok,
                                    const block_q8_1* xq, NativeExpertLayout L, block_q8_1* hq) {
+    const bool fx = exact_sums();   // the fixed-point sums (exact.hpp), the launch's lanes alike
     using GT = typename GridOf<TG>::T;
     constexpr int NG = GridOf<TG>::N, RPW = kWarp / LPR, WG = GU_ROWS * kWarp;
     static_assert(kM8Rows % (GU_ROWS * RPW) == 0, "whole passes");
@@ -1554,8 +1565,9 @@ sycl::event launch_native_gu_fused(sycl::queue& q, size_t cap_groups, const unsi
                     const int i = (p * GU_ROWS + warp) * RPW + lane / LPR;   // gate row r0 + i, or up row r0 + i - 32
                     const uint8_t* wr = blob + (i < 32 ? (size_t) 0 : L.up_off) + (size_t) (r0 + (i & 31)) * L.gu_row;
                     float s[kEntriesPass];
-                    if constexpr (NG > 0) seg_dot_multi<TG, LPR, kEntriesPass>(sg, wr, xs, cn, nb, nb, seg_lane, s, grid);
-                    else seg_dot_multi<TG, LPR, kEntriesPass>(sg, wr, xs, cn, nb, nb, seg_lane, s);
+                    if constexpr (NG > 0)
+                        seg_dot_multi<TG, LPR, kEntriesPass>(sg, wr, xs, cn, nb, nb, seg_lane, s, fx, grid);
+                    else seg_dot_multi<TG, LPR, kEntriesPass>(sg, wr, xs, cn, nb, nb, seg_lane, s, fx);
                     if (seg_lane == 0)
                         for (int j = 0; j < cn; ++j) res[j * kM8Rows + i] = s[j];
                 }
@@ -1581,6 +1593,7 @@ template<int TD, int LPR, bool WS = false>
 sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
                                    const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
                                    const block_q8_1* hq, NativeExpertLayout L, float* out) {
+    const bool fx = exact_sums();   // the fixed-point sums (exact.hpp), the launch's lanes alike
     constexpr int RPW = kWarp / LPR, WG = 8 * kWarp;
     static_assert(kM8Rows % (8 * RPW) == 0, "whole passes");
     const int hb = (int) (L.n_ff / 32);
@@ -1632,7 +1645,7 @@ sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsi
                     const uint8_t* wr = WS ? lw + (size_t) (valid ? r - rb : 0) * L.d_row
                                            : blob + L.down_off + (size_t) (valid ? r : 0) * L.d_row;
                     seg_dot_multi<TD, LPR, kEntriesPass, void, false>(sg, wr, xs, cn, nb, (int) (L.n_ff / Fmt<TD>::qk),
-                                                                      seg_lane, s);
+                                                                      seg_lane, s, fx);
                     if (valid && seg_lane == 0)
                         for (int j = 0; j < cn; ++j) out[(size_t) ent_dst[c0 + j] * L.n_embd + r] = s[j];
                 }
