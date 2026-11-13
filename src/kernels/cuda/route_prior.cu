@@ -48,6 +48,7 @@ __global__ void route_prior_k(const float* __restrict__ logits, const int32_t* _
     }
     (void) wsum(sum);
     float sel_p = 0.0f, sel_sum = 0.0f;
+    int sel_id = -1, sel_n = 0;
     for (int rank = 0; rank < 10; ++rank) {
         float best = -FLT_MAX, bp = 0.0f;
         int be = 1 << 30;
@@ -63,18 +64,23 @@ __global__ void route_prior_k(const float* __restrict__ logits, const int32_t* _
         }
         // a fully degenerate token row (every s NaN or -inf: garbage logits) leaves be at the sentinel on every
         // lane: be >> 5 would index far past s[16], and writing the sentinel into ids kills the request on the
-        // host's range check.  Keep the router's own pick instead - a token the prior cannot read is unrouted
-        // by it, which is exactly what "prior not applied" means.
+        // host's range check.
         if (be < 512 && (be & 31) == lane) s[be >> 5] = -FLT_MAX;
-        if (lane == rank) {
-            const int prev = id[rank];
-            id[rank] = be < 512 ? be : prev;
-            sel_p = bp;
-        }
+        if (lane == rank) { sel_id = be; sel_p = bp; }
         sel_sum += bp;                                      // the same on every lane
+        sel_n += (be < 512);
     }
-    // sel_sum is 0 only for a fully degenerate token: leave the router's weights beside its own picks
-    if (lane < 10 && sel_sum > 0.0f) w[lane] = sel_p / sel_sum;
+    // Commit ids and weights together, only when every rank found a real candidate and the picked mass is
+    // finite-positive.  Otherwise - a fully degenerate row, or a partially degenerate one where the prior can
+    // rank only k < 10 entries - the whole row keeps the router's own top-10 and its weights: a token the prior
+    // cannot rank in full is unrouted by it, which is exactly what "prior not applied" means.  Committing a
+    // partial selection per rank instead would mix prior ids and router ids in one row (possibly duplicating an
+    // expert) while the weights were renormalised over the picked subset only - trailing native picks would keep
+    // their ids but lose their weight to 0, and a single surviving score would take weight 1.0.
+    if (lane < 10 && sel_n == 10 && isfinite(sel_sum) && sel_sum > 0.0f) {
+        id[lane] = sel_id;
+        w[lane] = sel_p / sel_sum;
+    }
 }
 
 }  // namespace
