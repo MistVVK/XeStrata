@@ -1632,6 +1632,29 @@ bool PlainModel::open_experts(std::string& err) {
                 slot_layer_.push_back(l);
                 slot_bytes.push_back((int64_t) lay.bytes[(size_t) l]);
             }
+    // the free memory read again just before the tier is opened: what was allocated since it was read above (the
+    // prompt path's pinned buffers count against the device on some drivers) comes off the last slots, so the tier
+    // and the reserve still fit (GLM-5.3-Flash without its MTP layer asked 164 MiB more than the B70 had free and the
+    // start stopped, 2026-11-13)
+    if (opt_.expert_slots < 0) {
+        size_t f = 0, t = 0;
+        if (strata::gpu::mem_info(&f, &t)) {
+            const uint64_t now = counted_free(f, f, opt_.vram_free_mib);
+            const uint64_t limit = now > window_b + reserve ? now - window_b - reserve : 0;
+            uint64_t need = 0;
+            for (const int64_t b : slot_bytes) need += ((uint64_t) b + 255) / 256 * 256;
+            const size_t before = slot_bytes.size();
+            while (!slot_bytes.empty() && need > limit) {
+                need -= ((uint64_t) slot_bytes.back() + 255) / 256 * 256;
+                free_[(size_t) slot_layer_.back()].pop_back();   // (before the reverse: its last is this slot)
+                slot_layer_.pop_back();
+                slot_bytes.pop_back();
+            }
+            if (slot_bytes.size() < before)
+                std::fprintf(stderr, "xestrata plain: %lld MiB of VRAM free now, less than when the tier was planned: "
+                                     "%zu slots instead of %zu\n", (long long) (now >> 20), slot_bytes.size(), before);
+        }
+    }
     for (auto& f : free_) std::reverse(f.begin(), f.end());   // taken from the back: the lowest slot first
     cache_.set_max_piece(max_alloc_bytes());   // in pieces where the tier passes the device's largest allocation
     if (opt_.vram_elastic) {   // #533: in segments, as generate.cpp's cache; one GPU only (a split has a tier per GPU)
