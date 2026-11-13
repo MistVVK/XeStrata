@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // include/strata/kernels/cpu/kq_avx2.hpp - the routing-aware prefetch's router dot product (AVX2).  Upstream's file
-// also holds UD-Q4_K_XL's multi-token expert rows, which XeStrata does not take (STRATA_KQ256, measured no faster).
+// also holds UD-Q4_K_XL's multi-token expert rows, which XeStrata does not take (measured no faster).
 #pragma once
 
 #include <cstdint>

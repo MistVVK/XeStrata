@@ -2375,19 +2375,14 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     auto& q = queue_for(stream);   // in order: the launches below follow one another
     const float lim = expert_swiglu_limit();
     // upstream 0bc1594: the gate/up and down grids take grid_groups rows of groups (each striding over the groups) and
-    // SwiGLU + q8_1 run as one pass over the call's own entries; STRATA_GROUPED_V1=1: a row per possible group and the
-    // two passes over every entry (A/B; the same bits)
-    static const bool v1 = [] {
-        const char* v = strata::env_get("GROUPED_V1");
-        return v != nullptr && v[0] == '1';
-    }();
+    // SwiGLU + q8_1 run as one pass over the call's own entries
     const size_t f = (size_t) cap_entries * (size_t) L.n_ff * sizeof(float), fa = (f + 255) & ~(size_t) 255;
     float* gate = (float*) scratch;
     float* up = reinterpret_cast<float*>((uint8_t*) scratch + fa);
     float* h = reinterpret_cast<float*>((uint8_t*) scratch + 2 * fa);
     block_q8_1* hq = reinterpret_cast<block_q8_1*>((uint8_t*) scratch + 3 * fa);
     const auto* X = (const block_q8_1*) x_q8_1;
-    const size_t cg = (size_t) (v1 || grid_groups <= 0 ? cap_groups : std::min(grid_groups, cap_groups));
+    const size_t cg = (size_t) (grid_groups <= 0 ? cap_groups : std::min(grid_groups, cap_groups));
     // upstream's expert mode 8 (launch_native_gu_fused): its gate/up for the grid formats and IQ4_XS, its down for
     // IQ4_NL and Q2_0, each where its local memory fits; never for a call whose grid strides over the groups (a verify
     // window's PCIe call), which upstream keeps on its default layout
@@ -2451,7 +2446,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         gu_rows(L.gu_type, -1);
     }
     const long long nh = (long long) cap_entries * L.n_ff;
-    if (v1 || had) {
+    if (had) {
         q.parallel_for(sycl::range<1>((size_t) nh), [=](sycl::id<1> i) {
             float g = gate[i], u = up[i];
             swiglu_clamp(g, u, lim);

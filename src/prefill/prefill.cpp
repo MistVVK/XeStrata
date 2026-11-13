@@ -816,8 +816,7 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
 void qsa_attention(const float* q, const strata::kernels::QsaAttnPools& pools, const int32_t* ids,
                    const int32_t* steps, int64_t cap, const strata::kernels::QsaShapes& shapes,
                    float* scratch, float* out, int64_t n, int64_t batch, bool rotate, gpu::Stream stream) {
-    static const bool old_attn = strata::env_get("PROMPT_ATTN_OLD") != nullptr;
-    if (old_attn || !strata::kernels::flash_attn_select(q, pools, ids, steps, cap, shapes, out, n, stream))
+    if (!strata::kernels::flash_attn_select(q, pools, ids, steps, cap, shapes, out, n, stream))
         for (int64_t t = 0; t < n; t += batch) {
             const int64_t nb = std::min(batch, n - t);
             strata::kernels::qsa_decode_attn_batch(q + t * ZV, pools, ids + t * cap,
@@ -2543,20 +2542,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                     pt.mark(kPfQsaIdx, cs);
                     // C-2: the chunk's appends in three launches instead of one per token (the same end state:
-                    // the queries below read it only after the whole chunk is appended). STRATA_INDEXER_PER_TOKEN=1: the old
+                    // the queries below read it only after the whole chunk is appended)
                     try {
-                        static const bool per_token = strata::env_get("INDEXER_PER_TOKEN") != nullptr;
-                        if (!per_token) {
-                            strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
-                                                                             EPS, ib, s, st.max_cells,
-                                                                             strata::kernels::rope_scaling(), m.cs);
-                        }
-                        for (int64_t t = 0; per_token && t < T; ++t) {
-                            const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
-                            strata::kernels::native_qsa_indexer_append(m.idx_raw + t * 128, step_t + strata::kernels::kStepPos, 0,
-                                                                       (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                                       strata::kernels::rope_scaling(), m.cs);
-                        }
+                        strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
+                                                                         EPS, ib, s, st.max_cells,
+                                                                         strata::kernels::rope_scaling(), m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
                     // KVA: the KV pages and the indexer's keys/pool are complete for this chunk.  Nothing that reads
                     // them (query side, selection, attention, output projection, the MoE half) has a consumer left, so
@@ -2576,11 +2566,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // C-1: the grid reaches the batch's last query's n_bid (they rise with the position)
                         const int64_t active = (int64_t) m.steps_host[(size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
                                                                                 strata::kernels::kStepNBid)] + 1;
-                        // the scores on tensor cores (3xTF32: FP32-level, not bitwise); STRATA_SELECT_OLD=1: the warp kernel
-                        static const bool old_sel = strata::env_get("SELECT_OLD") != nullptr;
-                        if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
-                                                                             steps0, nb, m.max_blocks, s, m.sel_scores,
-                                                                             m.cs, active))
+                        // the scores on tensor cores (3xTF32: FP32-level, not bitwise); the warp kernel where that form
+                        // cannot run
+                        if (!strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
+                                                                  steps0, nb, m.max_blocks, s, m.sel_scores,
+                                                                  m.cs, active))
                             strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
                                                               m.max_blocks, s, m.sel_scores, m.cs, active);
                         strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
@@ -4889,18 +4879,9 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                         const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                         pt.mark(kPfQsaIdx, cs);
                         try {
-                            static const bool per_token = strata::env_get("INDEXER_PER_TOKEN") != nullptr;
-                            if (!per_token) {
-                                strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
-                                                                                 EPS, ib, s, st.max_cells,
-                                                                                 strata::kernels::rope_scaling(), cs);
-                            }
-                            for (int64_t t = 0; per_token && t < T; ++t) {
-                                const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
-                                strata::kernels::native_qsa_indexer_append(m.idx_raw + t * 128, step_t + strata::kernels::kStepPos, 0,
-                                                                           (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                                           strata::kernels::rope_scaling(), cs);
-                            }
+                            strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
+                                                                             EPS, ib, s, st.max_cells,
+                                                                             strata::kernels::rope_scaling(), cs);
                         } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
                         pt.mark(kPfQsaSel, cs);
                         for (int64_t q0 = 0; q0 < T; q0 += m.sel_batch) {
@@ -4908,10 +4889,9 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             const int32_t* steps0 = m.steps_dev + q0 * strata::kernels::kStepCount;
                             const int64_t active = (int64_t) m.steps_host[(size_t) ((q0 + nb - 1) * strata::kernels::kStepCount +
                                                                                     strata::kernels::kStepNBid)] + 1;
-                            static const bool old_sel = strata::env_get("SELECT_OLD") != nullptr;
-                            if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512,
-                                                                                 steps0, nb, m.max_blocks, s, m.sel_scores,
-                                                                                 cs, active))
+                            if (!strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512,
+                                                                      steps0, nb, m.max_blocks, s, m.sel_scores,
+                                                                      cs, active))
                                 strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512, steps0, nb,
                                                                   m.max_blocks, s, m.sel_scores, cs, active);
                             strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
