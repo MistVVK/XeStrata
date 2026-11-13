@@ -84,8 +84,9 @@ inline int64_t floor_for_card(int64_t resident_slots, int64_t total_pairs, const
     return std::max<int64_t>(kFloorDefault, first - kGrid);
 }
 /// With the share on, the staged walk's limit is the floor times this ratio. Measured share-on break-even / share-off crossing: RTX A4000 2.9K / 1.93K = 1.50, RTX A6000 6.19K / 4.18K = 1.48,
-/// R9700 2.5K / 1.5K = 1.67 (not covered by this rule). Against this rule's own floors (A6000 3,840, A4000 2,048) the same break-evens are 1.61 and 1.42: 1.6 lands within one grid step of both
-/// (limits 6,144 and 3,072); 1.5 would give 5,760 on the A6000 and lose about 5% between 5,760 and 6,190 tokens (par/RESULTS-SWITCH-POINT.md).
+/// R9700 2.5K / 1.5K = 1.67 (not covered by this rule). Against this rule's own floors as the engine printed them (A6000 3,584, A4000 2,048) the same break-evens are 1.73 and 1.42, so no single ratio
+/// fits both: 1.6 gives limits 5,632 (A6000, 558 under its break-even: up to 6% left on the table at 5,633) and 3,072 (A4000, 172 over: up to 3% lost at 2,900-3,072); both are far better than the
+/// fixed 3,072 on the A6000 (par/RESULTS-SWITCH-POINT.md, 06:12 block).
 inline constexpr double kShareRatio = 1.6;
 /// The share's limit for a card whose floor moved: floor x kShareRatio on the grid; 0 (the share's own default stays) when the floor is the default.
 inline int64_t share_limit_for(int64_t floor) {
