@@ -54,6 +54,10 @@ public:
     static constexpr double kStateTol = 0.02; ///< late against fresh round times beyond this in some size = a state effect
     static constexpr int kFallbackFactor = 3; ///< with a state effect, a stretch with this many times min_rounds timed rounds of any age ends with the fresh ones ...
     static constexpr int kFallbackShare = 5;  ///< ... when they are at least 1 / kFallbackShare of min_rounds
+    /// Does a request that arrives `gap_s` seconds after the last one ended start a new busy run (its rounds are fresh again)?  The first request does, and one after a
+    /// pause of kIdleS.  `learning_stretch`: the one-start learning stretch (STRATA_DRAFT_COSTS_LEARN=1, a harness switch) starts a new busy run at EVERY request, so a
+    /// harness that sends its requests back to back still collects fresh rounds (one long busy run keeps only its first kFreshS seconds).  No other caller passes true.
+    static constexpr bool starts_busy_run(bool seen_request, double gap_s, bool learning_stretch) { return !seen_request || learning_stretch || gap_s >= kIdleS; }
     /// `busy_age_s` < 0: unknown (counts as fresh).
     void add(int bucket, int t, double ms, double busy_age_s = -1.0);
     void reset();
@@ -138,6 +142,10 @@ struct CostFile {
 bool read_cost_file(const std::string& path, const std::string& key, CostFile& out, std::string& why);
 /// Writes the file whole or not at all (a temporary file beside it, then renamed over it); makes the folder.  Never throws.
 bool write_cost_file(const std::string& path, const CostFile& f, std::string& why);
+/// A table made by the one-start learning stretch (STRATA_DRAFT_COSTS_LEARN=1): every size of it was measured by that stretch, so all of them are marked real and the
+/// next start uses the table at once (DraftPolicy::start_calibration holds back only a table with sizes not yet marked real, and the file is then not rewritten).  The
+/// costs are rounded to the 3 decimals the file keeps, so the start that learned the table and the start that reads it use the same numbers.  Not used by the passive path.
+void mark_learned_real(CostFile& cf);
 
 class DraftPolicy {
 public:

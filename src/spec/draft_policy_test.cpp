@@ -892,6 +892,66 @@ int main() {
         h.calibrate(ch, rh);
         check((ch.real[0] & 1u) != 0 && h.table_held() && !h.fixed(), "calib: one real size does not bring the table into use");
     }
+    {
+        // STRATA_DRAFT_COSTS_LEARN=1 keeps its one-start promise (f-dc-learn-fix): (a) a request of the learning stretch starts a new busy run; (b) the table it writes is used by the next start at once.
+        using strata::spec::CostFile;
+        using strata::spec::CostLearner;
+        namespace fs = std::filesystem;
+        static_assert(CostLearner::starts_busy_run(false, 0.0, false) && !CostLearner::starts_busy_run(true, 0.01, false) && CostLearner::starts_busy_run(true, 0.5, false),
+                      "no learning stretch: the first request and a pause of kIdleS start a busy run, a request a few ms later does not");
+        check(CostLearner::starts_busy_run(true, 0.0, true) && CostLearner::starts_busy_run(true, 0.01, true), "learn (a): a request of the learning stretch starts a new busy run, however close");
+        check(!CostLearner::starts_busy_run(true, 0.2, false) && CostLearner::starts_busy_run(true, CostLearner::kIdleS, false), "learn (a): without the learning stretch the rule is the 0.5 s pause as before");
+        // 40 requests back to back of 200 rounds each (3 window sizes, 40 / 44 / 48 ms, 5 % slower after 6 s of load): one long busy run keeps 150 fresh rounds, a busy run per request 6,000
+        const auto sim = [](bool per_request_run) {
+            CostLearner L;
+            double clock = 0.0;
+            for (int q = 0; q < 40; ++q) {
+                double req_start = per_request_run ? clock : 0.0;
+                for (int i = 0; i < 200; ++i) {
+                    const int t = 1 + i % 3;
+                    const double age = clock - req_start;
+                    const double ms = (40.0 + 4.0 * (t - 1)) * (age > CostLearner::kFreshS ? 1.05 : 1.0) * (1.0 + 0.004 * ((i % 5) - 2));
+                    L.add(0, t, ms, age);
+                    clock += ms / 1000.0;
+                }
+            }
+            return L.check(1000, 20);
+        };
+        check(!sim(false).ready, "learn (a): back to back, one busy run: fresh rounds stay at the first seconds, the stretch never finishes (the batch 15 behaviour)");
+        check(sim(true).ready && !sim(true).disturbed, "learn (a): back to back, a busy run per request: the stretch finishes");
+        // (b) the written table is marked real: read back, it is used at once and nothing rewrites it
+        CostFile c;
+        c.key = "card A|engine 1|model m";
+        c.tables[0] = {12.3456, 14.2, 16.2004, 18.5};
+        c.state_effect = true;
+        strata::spec::mark_learned_real(c);
+        check(c.real[0] == 0xFu && c.real[1] == 0u && c.real_cost[0][1] == 12.346 && c.tables[0][0] == 12.346 && c.tables[0][2] == 16.2 && c.real_cost[0][3] == 16.2,
+              "learn (b): every size of the stretch's table is marked real, its cost rounded to the file's 3 decimals");
+        const fs::path dir = fs::temp_directory_path() / ("strata-dpt-learn-" + std::to_string((unsigned long long) (uintptr_t) &c));
+        const std::string path = (dir / "t.costs").string();
+        std::string why;
+        CostFile r;
+        check(strata::spec::write_cost_file(path, c, why) && strata::spec::read_cost_file(path, c.key, r, why) && r.real[0] == 0xFu && r.real_cost[0][4] == 18.5 && r.tables[0][1] == 14.2,
+              "learn (b): the marks and the costs survive the file");
+        DraftPolicy used(6);
+        used.set_fixed_costs(r.tables[0].data(), (int) r.tables[0].size(), 0);
+        used.start_calibration(r.state_effect, r.real, r.cal, r.real_cost, r.reqs);
+        check(used.fixed() && !used.table_held() && !used.calibrating(), "learn (b): the next start uses the table at once (no holding, no calibration)");
+        for (int i = 0; i < 30; ++i) used.observe(false, 2, 1, 0, 15.5);
+        CostFile again = r;
+        std::string rep;
+        check(!used.calibrate(again, rep) && rep.empty(), "learn (b): rounds of the next start never ask for the file to be rewritten");
+        // the same table WITHOUT the marks (what the stretch wrote before) is held back, as the passive path still does
+        CostFile u;
+        u.key = c.key;
+        u.tables[0] = {12.3456, 14.2, 16.2004, 18.5};
+        DraftPolicy held(6);
+        held.set_fixed_costs(u.tables[0].data(), 4, 0);
+        held.start_calibration(u.state_effect, u.real, u.cal, u.real_cost, u.reqs);
+        check(held.table_held() && held.calibrating() && !held.fixed(), "learn (b): a table without marks is still held back (the passive path is unchanged)");
+        std::error_code ec;
+        fs::remove_all(dir, ec);
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }

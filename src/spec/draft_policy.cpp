@@ -429,6 +429,19 @@ bool write_cost_file(const std::string& path, const CostFile& c, std::string& wh
     return true;
 }
 
+void mark_learned_real(CostFile& cf) {
+    for (int k = 0; k < CostLearner::kCtxBuckets; ++k) {
+        std::vector<double>& tab = cf.tables[(size_t) k];
+        for (size_t i = 0; i < tab.size(); ++i) {
+            const double v = std::round(tab[i] * 1000.0) / 1000.0;
+            if (!(v > 0.0)) continue;   // never for a valid table; the size then stays not real (held, as before)
+            tab[i] = v;
+            cf.real[(size_t) k] |= 1u << i;
+            cf.real_cost[(size_t) k][i + 1] = v;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------------------------------- DraftPolicy
 
 DraftPolicy::DraftPolicy(int max_t, double margin)
