@@ -181,11 +181,15 @@ void kv_append_tcq(const KvAppend& a, const QsaShapes& s, void* stream) {
                     for (int i = 1; i < 8; ++i) key = kmin(key, ((int64_t) cost[i] << 8) | (32 * i + lane));
                     for (int o = uu; o < WARP; o <<= 1) key = kmin(key, sycl::permute_group_by_xor(sg, key, o));
                     if (lane < uu) bps[t * uu + lane] = (uint8_t) (key & 0xFF);
+                    // state 32 i + lane takes its group's least from lane (state >> bits), the cost alone in 32 bits:
+                    // with 5 bits that lane is i for every lane (one value broadcast), with 4 it is 2 i or 2 i + 1
+                    const int mc = (int) (key >> 8);
 #pragma unroll
-                    for (int i = 0; i < 8; ++i) {   // state 32 i + lane: its group's least, from lane (state >> bits)
-                        const int64_t m = sycl::select_from_group(sg, key, (size_t) ((32 * i + lane) >> bits));
+                    for (int i = 0; i < 8; ++i) {
+                        const int m = bits == 5 ? sycl::group_broadcast(sg, mc, i)
+                                                : sycl::select_from_group(sg, mc, (size_t) ((32 * i + lane) >> bits));
                         const int dx = x - code[i];
-                        cost[i] = (int) (m >> 8) + dx * dx;
+                        cost[i] = m + dx * dx;
                     }
                 }
                 int64_t key = ((int64_t) cost[0] << 8) | lane;
