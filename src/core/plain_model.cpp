@@ -18,6 +18,7 @@
 // whole head; the MoE without the shared expert; the second norm named ffn_norm.  qwen35's (Qwen3.5-9B,
 // src/models/qwen35.cpp at de7fa0a3) is qwen35moe's with the MoE replaced by a dense SwiGLU, down(silu(gate(h)) * up(h)),
 // in every block and in the MTP layer: no experts, so none of the tiers, the CPU pool or the window protocol.
+#include "strata/core/context_fit.hpp"
 #include "strata/core/kv_elastic.hpp"
 #include "strata/core/kv_grow_hold.hpp"
 #include "strata/core/plain_model.hpp"
@@ -1029,6 +1030,30 @@ bool PlainModel::load_qwen(std::string& err) {
         if (grow)
             std::fprintf(stderr, "xestrata plain: the elastic K/V: a parked conversation's cells %s\n",
                          strata::core::kv_grow_hold() ? "stay while it waits" : "go back after each request");
+        // #5715: the room this stage's K/V cache has, read before any of it is allocated, so a start that does not fit
+        // says the largest context that does (context_fit.hpp) instead of the number of cells it stopped at
+        size_t kv_room_b = 0, kv_total_b = 0;
+        const bool kv_room_known = strata::gpu::mem_info(&kv_room_b, &kv_total_b) && kv_room_b > 0;
+        const size_t kv_head_dim = (size_t) qs.head_dim;
+        auto kv_block_bytes = [&](int64_t want) -> uint64_t {   // one attention block's K/V at `want` cells (alloc_kv)
+            const uint64_t cells = (uint64_t) std::max<int64_t>(want, 0);
+            const uint64_t codes = cells * kv_head_dim, scales = cells * (kv_head_dim / k::KV_Q8_GROUP) * 2,
+                           q4 = cells * (uint64_t) k::kv_q4_bytes_per_head((int) kv_head_dim);
+            return opt_.kv_q4 == 1 ? 2 * q4
+                   : opt_.kv_q4 == 2 ? codes + scales + q4
+                   : opt_.kv_int8 ? 2 * codes + 2 * scales : 4 * codes;
+        };
+        auto kv_bytes_at = [&](int64_t want) -> uint64_t {   // this stage's blocks at `want` cells
+            uint64_t total = 0;
+            for (int64_t i2 = 0; i2 < n_attn; ++i2) {
+                bool mine2 = has_mtp_ && i2 == mtp_.attn;
+                for (int64_t l = lb_; l < le_ && !mine2; ++l) mine2 = blocks_[(size_t) l].attn == i2;
+                if (!mine2 || (opt_.encoder && i2 > 0)) continue;   // an encoder's layers share the first's cells
+                total += kv_block_bytes(ringed((size_t) i2) ? std::min<int64_t>(want, ring_pages_ * qs.page_size)
+                                                            : want);
+            }
+            return total;
+        };
         for (int64_t i = 0; i < n_attn; ++i) {   // this stage's attention blocks, the MTP layer on the last
             bool mine = has_mtp_ && i == mtp_.attn;
             for (int64_t l = lb_; l < le_ && !mine; ++l) mine = blocks_[(size_t) l].attn == i;
@@ -1060,6 +1085,23 @@ bool PlainModel::load_qwen(std::string& err) {
             v_q4_[a] = p.v_q4;
             if (!ok) {
                 err = "plain model: no VRAM for the K/V cache (" + std::to_string(opt_.max_cells) + " cells)";
+                if (kv_room_known) {   // #5715: the context that would fit, from this engine's own K/V figure
+                    const auto fit = strata::core::context_that_fits(opt_.max_cells, kv_room_b, kv_bytes_at);
+                    char msg[512];
+                    if (fit.cells > 0)
+                        std::snprintf(msg, sizeof msg,
+                                      "plain model: a context of %lld tokens does not fit on this graphics card: its K/V "
+                                      "cache needs %.2f GiB and only %.2f GiB is free; a context of %lld tokens fits here",
+                                      (long long) opt_.max_cells, (double) fit.need / 1073741824.0,
+                                      (double) fit.room / 1073741824.0, (long long) fit.cells);
+                    else
+                        std::snprintf(msg, sizeof msg,
+                                      "plain model: a context of %lld tokens does not fit on this graphics card: its K/V "
+                                      "cache needs %.2f GiB and only %.2f GiB is free (not even 1024 tokens fit here)",
+                                      (long long) opt_.max_cells, (double) fit.need / 1073741824.0,
+                                      (double) fit.room / 1073741824.0);
+                    err = msg;
+                }
                 return false;
             }
         }

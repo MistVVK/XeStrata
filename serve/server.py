@@ -337,6 +337,9 @@ def engine_frozen(base: tuple[float, int], now: tuple[float, int]) -> bool:
     return (now[0] - base[0]) <= STALL_CPU_EPS_S and (now[1] - base[1]) <= STALL_IO_EPS_B
 
 
+#: what the GPU picture reader takes from the card (1,342 MiB measured on an RTX A6000 and an R9700; upstream
+#: 79dc46376): a start with less free VRAM than this reads the picture on the CPU where a CPU reader exists
+READER_NEEDS_MIB = 1536
 VISION_READY_S = _timeout_env("VISION_READY_S", 600.0)   # a first GPU start compiles its kernels (JIT)
 VISION_ENCODE_S = _timeout_env("VISION_ENCODE_S", 300.0)
 ENGINE_READY_S = _timeout_env("ENGINE_READY_S", 900.0)
@@ -3025,27 +3028,59 @@ class Vision:
             self.dir.mkdir(parents=True, exist_ok=True)
             self.cache.clear()
 
+    #: a GPU reader whose start failed the GPU runtime's transient way (TRANSIENT_START_MARKS) is tried again before
+    #: the CPU reader takes over: upstream a95046690's bounds (12 tries, 18 s of budget, 1 s apart).  A reader that
+    #: ends for its own reason (no room, a missing file, the engine's error line) is not retried.
+    START_RETRIES = 12
+    START_RETRY_BUDGET_S = 18.0
+
     def _start(self):
-        """Start the reader; a GPU reader that does not start gives way to the processor's (RuntimeError only when
-        nothing starts).  The reason stays in `fallback_why` and, for a full card or any other cause, in `cpu_note`."""
-        try:
-            self._start_reader()
-        except (OSError, RuntimeError) as e:
-            if self.fallback is None or self.spawn == self.fallback:
-                raise
-            why = " ".join(str(e).split())[:240]
-            # the person is told the pictures became slow, whatever the cause: the card's size or the reader's own
-            # reason, in the engine's log (the reader's stderr)
-            self.cpu_note = (self._no_room_note(e.room) if isinstance(e, VisionNoRoom) else
-                             reader_room.not_started_on_processor(self._spawn_arg("--gpu-pci"),
-                                                                  getattr(self.spawn[1], "name", None)))
-            self.fallback_why = why
-            again = " until it is idle" if self.elastic else ""
-            print(f"[xestrata] the GPU picture reader did not start ({why}); pictures are read on the CPU{again}",
-                  flush=True)
-            self.spawn, self.fallback, self.on_cpu = self.fallback, None, True
-            self.label = self.cpu_label
-            self._start_reader()
+        """Start the reader; a start that failed the GPU runtime's transient way is tried again (12 tries, 18 s), and a
+        GPU reader that does not start gives way to the processor's (RuntimeError only when nothing starts).  The
+        reason stays in `fallback_why` and, for a full card or any other cause, in `cpu_note`."""
+        t0 = time.monotonic()
+        failure: BaseException | None = None
+        for attempt in range(self.START_RETRIES + 1):
+            log = self.spawn[1] if self.spawn else None
+            since = vision_log_size(log)
+            try:
+                self._start_reader()
+                return
+            except (OSError, RuntimeError) as e:
+                failure = e
+                if isinstance(e, OSError):                 # a reader that is not installed: a retry repeats it
+                    break
+                if self.fallback is None or self.spawn == self.fallback:   # the CPU reader: no GPU runtime to wait for
+                    break
+                spent = time.monotonic() - t0
+                if attempt >= self.START_RETRIES or spent + 1.0 > self.START_RETRY_BUDGET_S:
+                    break
+                # upstream b90d38aa8: only the graphics runtime's own failure is worth a retry (a card that is full, a
+                # missing kernel image, a reader that ends for its own reason are not); in XeStrata that is the ROCm
+                # set-up's transient text the engine's own retry knows (TRANSIENT_START_MARKS)
+                text = str(e) + "\n" + vision_log_tail(log, since=since)
+                if not any(mark in text for mark in TRANSIENT_START_MARKS):
+                    break
+                print(f"[xestrata] the GPU picture reader failed the graphics runtime's way; starting it again in 1 s "
+                      f"(try {attempt + 2} of {self.START_RETRIES + 1})", flush=True)
+                time.sleep(1.0)
+        assert failure is not None
+        e = failure
+        if self.fallback is None or self.spawn == self.fallback:
+            raise e
+        why = " ".join(str(e).split())[:240]
+        # the person is told the pictures became slow, whatever the cause: the card's size or the reader's own
+        # reason, in the engine's log (the reader's stderr)
+        self.cpu_note = (self._no_room_note(e.room) if isinstance(e, VisionNoRoom) else
+                         reader_room.not_started_on_processor(self._spawn_arg("--gpu-pci"),
+                                                              getattr(self.spawn[1], "name", None)))
+        self.fallback_why = why
+        again = " until it is idle" if self.elastic else ""
+        print(f"[xestrata] the GPU picture reader did not start ({why}); pictures are read on the CPU{again}",
+              flush=True)
+        self.spawn, self.fallback, self.on_cpu = self.fallback, None, True
+        self.label = self.cpu_label
+        self._start_reader()
 
     def _spawn_arg(self, name: str) -> str | None:
         """The value this start's command line gives `name` (None when it does not name it)."""
@@ -3341,6 +3376,25 @@ class Vision:
                 raise ClientGone()
             out.append(self.encode(src, keep=[p for p, _ in out]))
         return out
+
+    def use_cpu(self) -> bool:
+        """The next start is the CPU reader's (the card has no room for the GPU one): False when there is no CPU reader.
+        Upstream 9f0794e99's use_cpu."""
+        if self.fallback is None:
+            return False
+        self.spawn, self.fallback, self.on_cpu = self.fallback, None, True
+        return True
+
+    def all_cached(self, sources: list) -> bool:
+        """Every picture of `sources` was encoded already (a conversation sends its pictures with each turn): no reader
+        has to start for them.  Upstream 9f0794e99.  False on any error (encode() then says what is wrong)."""
+        try:
+            with self.lock:
+                self._ensure_dir()
+                return all(hashlib.sha256(self.normalize(src if isinstance(src, bytes) else self.load(src)))
+                           .hexdigest()[:32] in self.cache for src in sources)
+        except (ValueError, OSError):
+            return False
 
     def encode(self, source: str | bytes, keep=()) -> tuple[Path, int]:
         """-> (embeddings file, number of image tokens).  `source`: what load() reads, or the image's bytes.
@@ -4716,8 +4770,17 @@ class Service:
                 print(f"[xestrata] images: the expert cache keeps {v.elastic_mib} MiB free for the image encoder "
                       f"({out.get('expert_cache_mib')} of {out.get('expert_cache_full_mib')} MiB left)", flush=True)
             except ValueError as e:
-                print(f"[xestrata] images: the expert cache did not make room for the image encoder ({e}); starting "
-                      "it anyway", flush=True)
+                # upstream 79dc46376: the cache could not make room, so the reader goes into the VRAM that is free; when
+                # that is under what it needs and a CPU reader exists, the CPU reads this picture instead of a start
+                # that would fail (the cache keeps its room)
+                free = self.free_vram_mib()
+                need = min(v.elastic_mib, READER_NEEDS_MIB)
+                if free is not None and free < need and v.use_cpu():
+                    print(f"[xestrata] images: the expert cache cannot make room ({e}) and only {free} MiB of VRAM is "
+                          f"free (the image encoder needs about {need}): this picture is read on the CPU", flush=True)
+                else:
+                    print(f"[xestrata] images: the expert cache did not make room for the image encoder ({e}); starting "
+                          "it anyway", flush=True)
         if self.vision_held:
             time.sleep(0.2)          # the driver's free-VRAM counter shows the cache's release a moment later
         free0, t0 = self.free_vram_mib(), time.time()
@@ -4726,8 +4789,17 @@ class Service:
         except Exception as e:      # a 503 as for a non-elastic encoder at a load, not a dropped connection (#2435)
             raise EngineDied(f"the image encoder failed to start: {e}") from e
         free1 = self.free_vram_mib()
+        on_cpu = getattr(v, "on_cpu", False)
         took = f", {free0 - free1} MiB of VRAM" if free0 is not None and free1 is not None else ""
-        print(f"[xestrata] images: the image encoder started in {time.time() - t0:.1f} s{took}", flush=True)
+        print(f"[xestrata] images: the image encoder started in {time.time() - t0:.1f} s"
+              f"{', on the CPU' if on_cpu else took}", flush=True)
+        if on_cpu and self.vision_held and hasattr(self.engine, "vram") and self.loaded():
+            # the CPU reader needs no VRAM: the cache takes back what it made room for (upstream 9f0794e99)
+            try:
+                self.engine.vram(self._engine_reserve())
+            except ValueError as e:
+                print(f"[xestrata] images: the expert cache did not grow back ({e})", flush=True)
+            self.vision_held = False
         self._ledger_vision()
 
     def _ledger_vision(self) -> None:
@@ -5588,7 +5660,8 @@ class Service:
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
             # same FIFO as the requests.
             with self._turn(cancel):
-                self._vision_up()
+                if not (hasattr(self.vision, "all_cached") and self.vision.all_cached(images)):
+                    self._vision_up()
                 try:
                     encoded = (self.vision.encode_all(images, cancel) if hasattr(self.vision, "encode_all")
                                else [self.vision.encode(src) for src in images])
@@ -10825,6 +10898,10 @@ def desktop_vram_note(amd: bool, vram_free_mib, args: list, desktop: bool) -> st
     default reserve (700 MiB) is sized for a card without a desktop.  A recommendation, nothing changes: "" when it
     does not apply."""
     if not amd or not desktop or not isinstance(vram_free_mib, int) or vram_free_mib >= DESKTOP_FREE_MIB:
+        return ""
+    if "--resident-budget-gib" in args:
+        # upstream 530a29ea2: on a unified-memory GPU the RAM budget's page-locked complement takes that room straight
+        # back, so a larger --vram-reserve-mib cannot raise the free VRAM - the advice would only cost the cache
         return ""
     try:
         reserve = int(args[args.index("--vram-reserve-mib") + 1]) if "--vram-reserve-mib" in args else 700

@@ -919,6 +919,7 @@ SC117_SWIFT_FILES = {
         (26710079616, "5b91b79a4bbee162761c16b9a47a3434c3f8be0ad6bf34849318d9efcb4b6aa1"),
 }
 UNSLOTH_RAM_LEFT_GB = 24        # RAM beside the budget: the OS, the engine, and the file cache the rest is read through
+UMA_DENSE_ROOM_GB = 8          # in the GPU's own pool: the dense weights' buffers beside the file's dense bytes
 # Contexts past 262144 (the model's trained length) extend it by rope scaling (upstream #84): for the context it will
 # serve the setup takes yarn (or asks, when interactive) and the factor final / 262144 (at least 1), keeps an explicit
 # --rope-scaling / --rope-scale, and refuses an explicit --rope-scaling none there.
@@ -1984,6 +1985,12 @@ def kfd_nodes() -> dict:
 # three, their KFD SIMD count (two per CU) names them.
 UMA_OS_LEFT_GB = 6             # the unified memory kept for the OS (the engine keeps the same out of its figure)
 STRIX_HALO_GFX = "gfx1151"
+# AMD's integrated GPUs, by GFX version: the one place a gfx name may choose (AGENTS.md allows it for the APU judgement
+# and the memory estimate).  The KFD topology gives the GPU node the CPU's cores on some kernels (cpu_cores_count), but
+# ROCm 10.1 with a 6.14 kernel splits a CPU node and a GPU node apart (Strix Halo: cpu_cores_count 0 on the GPU node),
+# so the gfx version says it there: gfx1103 (Phoenix, Hawk Point), gfx1150 (Strix Point), gfx1151 (Strix Halo) and
+# gfx1152 / gfx1153 (Krackan).  A discrete card reports none of them.
+APU_GFX = {"gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153"}
 STRIX_HALO_BY_SIMDS = {80: "8060S", 64: "8050S", 32: "8040S"}
 STRIX_HALO_MODEL = "UD-IQ4_XS"  # upstream's Strix Halo guide measures it; its experts stay in memory from ~80 GB
 STRIX_HALO_MIN_GB = 80
@@ -2025,16 +2032,18 @@ def unused_card_notes(found, used) -> list:
 
 def strix_halo_notes(gpu, ram) -> list:
     """What setup tells a Strix Halo owner (a leading "!" = a warning): nothing is changed or refused."""
-    notes = [f"  Strix Halo (gfx1151, Ryzen AI Max): the CPU and the GPU share one memory ({ram:.0f} GB seen by the "
-             f"OS + a {gpu.get('carve_gb', 0.0):.1f} GB BIOS carve-out); the model's experts live in it."]
+    notes = [f"  Strix Halo (gfx1151, Ryzen AI Max): one memory in all ({ram:.0f} GB seen by the OS + a "
+             f"{gpu.get('carve_gb', 0.0):.1f} GB BIOS carve-out the OS does not see). The engine's device allocations "
+             "come from the carve-out; the model's experts live in the RAM beside it."]
     if gpu.get("shared_gb", 0.0) < 0.75 * ram - 1:
-        notes.append(f"!the GPU reaches {gpu.get('shared_gb', 0.0):.0f} GB of shared memory (the GTT pool; the "
-                     "kernel's default is about half of the RAM). The kernel options ttm.pages_limit and "
-                     "ttm.page_pool_size give it more (docs/DETAILS.md, AMD APUs); setup changes no host setting")
+        notes.append(f"!the GPU reaches {gpu.get('shared_gb', 0.0):.0f} GB of the RAM through the GTT pool (the "
+                     "kernel's default is about half of the RAM; the GTT pool is the RAM itself). The kernel options "
+                     "ttm.pages_limit and ttm.page_pool_size give it more (docs/DETAILS.md, AMD APUs); setup changes "
+                     "no host setting")
     if gpu.get("carve_gb", 0.0) > 16:
         notes.append(f"!the BIOS carve-out is {gpu['carve_gb']:.0f} GB: that memory is taken from the OS, while the "
-                     "GPU reaches the shared memory anyway. A small carve-out (512 MB - 2 GB) leaves the RAM to the "
-                     "model")
+                     "GPU reaches the RAM through the GTT anyway. A small carve-out (512 MB - 2 GB) leaves the RAM "
+                     "to the model")
     if ram + gpu.get("carve_gb", 0.0) >= STRIX_HALO_MIN_GB:
         notes.append(f"  Recommended model: {STRIX_HALO_MODEL} (Unsloth); the menus list the others.")
     return notes
@@ -2927,7 +2936,7 @@ def gpus():
             kfd = kfd_nodes() if kfd is None else kfd
             node = kfd.get(pci, {})
             render = next(iter(sorted((dev / "drm").glob("renderD*"))), None)
-            integrated = bool(node.get("integrated"))
+            integrated = bool(node.get("integrated")) or node.get("gfx") in APU_GFX
             name = f"{pci_name(0x1002, did)} ({node.get('gfx') or 'no KFD node'})"
             if node.get("gfx") == STRIX_HALO_GFX and node.get("simds") in STRIX_HALO_BY_SIMDS:
                 name = f"AMD Radeon {STRIX_HALO_BY_SIMDS[node['simds']]} (Ryzen AI Max, Strix Halo, gfx1151)"
@@ -5932,7 +5941,7 @@ def kv_streaming_ram_gb(ctx, kv) -> float:
 def kv_streaming_wanted(model, ctx, kv, ram) -> bool:
     """Does setup stream this model's KV cache on this PC (--kv-resident): from 64K up, when the RAM holds the cache
     beside the model's experts (+1 GB).  The merges' and the release's measurements ask it too (tools/bench_core.py)."""
-    return ctx >= 65536 and ram >= MODELS[model]["ram_gb"] + kv_streaming_ram_gb(ctx, kv) + 1
+    return ctx >= 65536 and ram >= MODELS[model]["arena_gb"] + LOW_RAM_HEADROOM_GB + kv_streaming_ram_gb(ctx, kv) + 1
 
 
 #: The draft layer (MTP) takes about 1 GB of graphics memory out of the expert cache (upstream 671f4573d): its files
@@ -7235,8 +7244,8 @@ def saved_ple_io(cfg_path: Path) -> str | None:
 
 
 def ple_io_auto(ple: Path, model: str, ram: float, low_ram: bool) -> bool:
-    """Whether setup keeps the n-gram table in RAM by itself (--ple-io ram), saying why; False: the engine's default
-    reads (direct), which the engine may still lock in RAM itself where the RAM can spare the table."""
+    """Whether setup keeps the n-gram table in RAM by itself (--ple-io ram), saying why; False: the engine chooses
+    (auto: it measures direct against mmap, and locks the table in RAM itself where XESTRATA_PLE_AUTO_RAM asks it)."""
     if str(ROOT / "tools") not in sys.path:
         sys.path.insert(0, str(ROOT / "tools"))
     from gguf_reader import GGUFFile
@@ -9552,8 +9561,8 @@ def main() -> int:
         mem = "no VRAM of its own (it shares the system RAM)" if gpu.get("integrated") else \
             f"{gpu['vram_gb']:.0f} GB VRAM"
         if "uma_gb" in gpu:
-            mem = (f"unified memory: a {gpu['carve_gb']:.1f} GB BIOS carve-out + {gpu['shared_gb']:.0f} GB shared with "
-                   f"the RAM, {gpu['uma_gb']:.0f} GB usable by the GPU")
+            mem = (f"unified memory: a {gpu['carve_gb']:.1f} GB BIOS carve-out (the GPU's own pool) + "
+                   f"{gpu['shared_gb']:.0f} GB of the RAM reached through the GTT, {gpu['uma_gb']:.0f} GB in all")
         ok(f"GPU: {gpu['name']}, {mem}, PCI {gpu['pci']}, PCIe link " + (gpu["link"] or "not readable"))
         if gpu.get("gfx") == STRIX_HALO_GFX and "uma_gb" in gpu:
             for line in strix_halo_notes(gpu, ram_gb()):
@@ -9760,7 +9769,20 @@ def main() -> int:
                          "install it anyway", "  Install it anyway?")
             warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
         budget = budget_choice(model, ram, a.resident_budget_gib)
-        ok(f"RAM budget: {budget:g} GiB of {model}'s experts in RAM, the rest read from the model files on the SSD")
+        # upstream 86ffdbeb1: on a unified-memory GPU whose own pool holds the experts, the expert cache takes them all
+        # and nothing is pinned.  The GPU's own pool is the BIOS carve-out (the OS does not see it), not `uma_gb`: the
+        # GTT pool is the RAM itself.  The dense weights and the buffers take their part of the carve-out first, so the
+        # experts' room is the carve-out less the file's dense bytes (the download holds experts and dense) and room
+        # beside them.
+        own_gb = (gpu.get("carve_gb") or 0.0) if gpu.get("integrated") else 0.0
+        dense_gb = max(0.0, MODELS[model]["download_gb"] - MODELS[model]["arena_gb"])
+        if (gpu.get("integrated") and a.resident_budget_gib is None
+                and own_gb >= MODELS[model]["arena_gb"] + dense_gb + UMA_DENSE_ROOM_GB):
+            ok(f"{model}'s experts fit the GPU's own memory ({own_gb:.0f} GB BIOS carve-out): the expert cache takes "
+               "them all, no RAM copy is pinned")
+            budget = None
+        else:
+            ok(f"RAM budget: {budget:g} GiB of {model}'s experts in RAM, the rest read from the model files on the SSD")
         if a.low_ram not in ("auto", "off"):
             warn(f"--low-ram {a.low_ram} does not apply to {model}: it always reads part of its experts from the files")
     elif a.resident_budget_gib is not None:
@@ -10179,9 +10201,11 @@ def main() -> int:
                    f"so setup leaves {UNSLOTH_RAM_LEFT_GB} GB of the RAM for the OS and the desktop. "
                    "--expert-cache N in the config's args sets it")
             else:
-                warn(f"this GPU shares the RAM, and the {budget:g} GiB RAM budget leaves almost none for the expert "
-                     "cache: it stays on auto, which may take the room the OS needs. A smaller "
-                     "--resident-budget-gib leaves room")
+                # upstream 1d342f083: say where the cache is sized from, not that it may take the OS's room (on a
+                # unified-memory GPU a larger --vram-reserve-mib cannot raise it)
+                carve = gpu.get("carve_gb") or 0.0
+                where = f"the {carve:.0f} GB BIOS carve-out" if carve else "the shared memory"
+                ok(f"expert cache: sized from {where}, not from the RAM (the GTT pool is the RAM)")
     if vision != "none":
         args += ["--vision", "--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
     if a.vram_reserve_mib is not None:                 # #493: VRAM left free for other programs (only when given)

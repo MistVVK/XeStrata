@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+#include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU core_device
@@ -48,6 +49,8 @@
 #include <fstream>
 #include <string>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -211,6 +214,23 @@ std::string g_workaround_version;   // set by engine_devices when the workaround
 #if !defined(_WIN32) && defined(__has_include)
 #if __has_include(<drm/xe_drm.h>)
 #define STRATA_XE_QUERY 1
+// The kernel's GT-list entry gained ip_ver_major with Linux 6.16 (the IP version a GMD_ID GPU has); a header from
+// before it (Ubuntu 24.04's linux-libc-dev, a 6.8 UAPI) has no such member, and no kernel of that header's time
+// reports one, so the workaround cannot be decided there and stays off.
+template <typename T, typename = void>
+struct has_ip_ver_major : std::false_type {};
+template <typename T>
+struct has_ip_ver_major<T, std::void_t<decltype(std::declval<T>().ip_ver_major)>> : std::true_type {};
+template <typename List>
+bool gt_list_is_xe2(const List* list) {
+    if constexpr (has_ip_ver_major<drm_xe_gt>::value) {
+        for (uint32_t i = 0; i < list->num_gt; ++i)
+            if (list->gt_list[i].type == DRM_XE_QUERY_GT_TYPE_MAIN && list->gt_list[i].ip_ver_major >= 20) return true;
+    } else {
+        (void) list;
+    }
+    return false;
+}
 #endif
 #endif
 
@@ -236,9 +256,7 @@ bool xe_gpu_from_xe2() {
                 q.data = (uint64_t) (uintptr_t) buf.data();
                 if (ioctl(fd, DRM_IOCTL_XE_DEVICE_QUERY, &q) == 0) {
                     const auto* list = reinterpret_cast<const drm_xe_query_gt_list*>(buf.data());
-                    for (uint32_t i = 0; i < list->num_gt; ++i)
-                        if (list->gt_list[i].type == DRM_XE_QUERY_GT_TYPE_MAIN && list->gt_list[i].ip_ver_major >= 20)
-                            found = true;
+                    found = gt_list_is_xe2(list);
                 }
             }
         }
@@ -299,6 +317,20 @@ static void sycl_code_cache() {
 #endif
 }
 
+// The HIP runtime's hardware queues a process takes (GPU_MAX_HW_QUEUES, ROCclr's; 4 by default), 2 unless the user
+// set it.  With 4, the expert streaming of a prompt ran at one of two speeds from start to start, the same binary and
+// settings (RX 9060 XT, ROCm 7.1, Linux, 2026-11-13: Qwen3.8-Flash-Next IQ3_XXS, a 4K prompt 692-727 or 913-977
+// tok/s, about half the starts each; a 1K prompt 429 or 632; a 32K one 1138-1151), the slow starts losing 10-40 ms
+// at random layers to the copies and the products around them; another GPU program run between two starts moved
+// which start was slow, and nothing the engine logs differed.  With 2: 945-949, 666-683 and 1210-1211, three starts
+// each, the decode alike; Qwen3.6-35B-A3B's 4K prompt 1541-1545 -> 1575-1579.  Only the HIP runtime reads it.
+// Linux only: Windows's HIP runtime was not measured.
+static void hip_hw_queues() {
+#if !defined(_WIN32)
+    setenv("GPU_MAX_HW_QUEUES", "2", 0);
+#endif
+}
+
 // What the RAM and the kernel's memory compaction did between the engine's start and a stop on a GPU fault, said with
 // the fault: the B70's copy engine faulted (Fault response -EBUSY) while the page cache turned over, and the xe driver
 // mapped the registered host memory again after each move of its pages (#42; 2026-10-22's trace: 83k to 134k
@@ -331,6 +363,7 @@ HostCounters g_start_counters;
 const std::vector<sycl::device>& engine_devices() {
     static const std::vector<sycl::device> devices = [] {
         sycl_code_cache();
+        hip_hw_queues();
         g_start_counters = host_counters();
         const CompilerWorkaround w = intel_compiler_workaround();
         std::vector<sycl::device> found = find_devices();
@@ -1010,32 +1043,39 @@ void apply_os_budget(const std::string& pci, uint64_t& free) {
         free = std::min(free, budget > usage ? budget - usage : 0);
 }
 
-void apply_uma_limit(uint64_t& free) {
+void apply_uma_limit(uint64_t& free, uint64_t total) {
     static const uint64_t headroom = [] {
         const char* v = strata::env_get("UMA_HEADROOM_GIB");
         const long long g = v != nullptr ? std::strtoll(v, nullptr, 10) : 6;
         return (uint64_t) std::max(0LL, g) << 30;
     }();
+    uint64_t os_total = 0, avail = 0;
 #if defined(_WIN32)
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof ms;
-    if (GlobalMemoryStatusEx(&ms)) {
-        const uint64_t avail = (uint64_t) ms.ullAvailPhys;
-        free = std::min(free, avail > headroom ? avail - headroom : 0);
-    }
+    if (!GlobalMemoryStatusEx(&ms)) return;
+    os_total = (uint64_t) ms.ullTotalPhys;
+    avail = (uint64_t) ms.ullAvailPhys;
 #else
     std::ifstream meminfo("/proc/meminfo");
     std::string key;
     uint64_t kb = 0;
-    while (meminfo >> key >> kb) {
-        if (key == "MemAvailable:") {
-            const uint64_t avail = kb << 10;
-            free = std::min(free, avail > headroom ? avail - headroom : 0);
-            return;
-        }
-        meminfo.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    while ((os_total == 0 || avail == 0) && meminfo >> key >> kb) {
+        if (key == "MemTotal:")
+            os_total = kb << 10;
+        else if (key == "MemAvailable:")
+            avail = kb << 10;
+        else
+            meminfo.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
     }
+    if (avail == 0) return;   // no figure to cut to: the device's own stands
 #endif
+    // A BIOS carve-out is a pool of its own: the device reports more memory than the OS has, so what the OS can give
+    // back says nothing about it (the Strix Halo's 64 GiB carve-out beside the 62 GiB the OS sees; the free figure is
+    // the carve-out's).  Where the device's total is within the OS's RAM, the two are the same pool and the OS's
+    // figure binds (an Intel iGPU, an APU with a small carve-out).
+    if (os_total != 0 && total > os_total) return;
+    free = std::min(free, avail > headroom ? avail - headroom : 0);
 }
 
 // The used memory is the larger of the report's and what the process holds: the B70 reports its global_mem_size
@@ -1071,9 +1111,28 @@ uint64_t unreported_vram_margin(const std::string& pci, uint64_t total) {
 }
 
 uint64_t max_alloc_bytes() {
-    const uint64_t dev = Runtime::get().device().get_info<sycl::info::device::max_mem_alloc_size>();
-    const uint64_t lim = max_alloc_limit_bytes();
-    return lim != 0 && lim < dev ? lim : dev;
+    static const uint64_t v = [] {
+        const uint64_t dev = Runtime::get().device().get_info<sycl::info::device::max_mem_alloc_size>();
+        const uint64_t lim = max_alloc_limit_bytes();
+        const uint64_t claim = lim != 0 && lim < dev ? lim : dev;
+        // HIP's adapter can report a largest allocation far below what the device gives: 32 MiB for a gfx1151 that
+        // hands out 24 GiB in one call (Strix Halo, 2026-11-13).  A claim that small splits the expert tier into
+        // pieces too small for the prompt path to borrow its chunk across (74 MiB for 16 tokens), so it is measured:
+        // allocations twice the claim up to 1 GiB, the largest that succeeds.  Where the claim is the device's
+        // limit the first try fails and the claim stands; the tier's own allocation is what reports a refusal, and
+        // its pieces fallback covers that.
+        const uint64_t total = Runtime::get().device().get_info<sycl::info::device::global_mem_size>();
+        if (claim >= (1ull << 30) || total < (8ull << 30)) return claim;
+        uint64_t good = claim;
+        for (uint64_t want = claim * 2; want <= (1ull << 30); want *= 2) {
+            void* p = strata::gpu::alloc_device((size_t) want);
+            if (p == nullptr) break;
+            strata::gpu::free(p);
+            good = want;
+        }
+        return good;
+    }();
+    return v;
 }
 
 DeviceInfo device_info(int ordinal) {

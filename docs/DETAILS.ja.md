@@ -734,7 +734,7 @@ Qwen3.8-Flash-Next の大きさの質問では、入っている大きさを `(i
 ./setup.sh --gpus 1,2                       2 枚以上の GPU に層を分けて載せる（記録される。docs/MULTIGPU.ja.md）
 ./setup.sh --vram-reserve-mib 2048          ほかのプログラムのために VRAM を 2 GB 空けておく（記録される）
 ./setup.sh --setup --ram-reserve-gib 16     ほかのプログラムのために RAM を 16 GiB 空けておく（記録される）
-./setup.sh --ple-io ram                     n-gram の表を RAM に置く（記録される。direct は SSD から読む、auto は setup が選ぶ）
+./setup.sh --ple-io ram                     n-gram の表を RAM に置く（記録される。direct は SSD から読む。auto は setup が RAM に置けるなら ram を書き、そうでなければエンジンが direct と mmap を測って速い方を取る）
 ./setup.sh --no-browser                     準備ができてもチャットのページを開かない（記録される。--browser で戻す）
 ./setup.sh --calibrate                      この PC に合わせてエンジンを調整してから起動する（15〜30 分、遅いカードではもっと）
 ./setup.sh --check                          この PC を調べるだけ

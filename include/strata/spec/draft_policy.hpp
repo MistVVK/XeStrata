@@ -15,7 +15,10 @@
 //
 // and takes the lookup window only when its best E/cost beats the MTP's by `margin`. Costs are the measured round
 // times per window size (EMA; sizes not seen yet are scaled from seen ones by a prior shape), so the policy adapts
-// to the machine and the context length. It only chooses which drafts to verify: the output is unchanged.
+// to the machine and the context length. Its sizes are part of what it verifies: the same row of a 3-token window and
+// of a 4-token window got different argmaxes (XeStrata's own products and dense kernels, RX 9060 XT, 2026-11-14), so
+// the sizes moving with the measured times move the answer's last bits. A run whose answer must be the same every time
+// fixes them (--spec-window min-p --spec-min-p 0) and turns the suffix drafts off (--suffix-draft 0).
 #pragma once
 
 #include "strata/kernels/window_limits.hpp"

@@ -135,6 +135,7 @@ INT8's and Q4_0's codes are exact in FP16 and go to the matrix engines as they a
 With sm_70 code on the RTX 4070, `qsa_prompt_attn_parity` was off FP64 by at most 3 times the FP32 kernel's error, and a chunk of 2,048 queries over 32K cells ran 1.6 times as fast at INT8 and 1.5 times at FP16 and K8V4.
 Intel GPUs do not report that shape and keep the XMX FP16 path.
 Qwen3.8's prefill takes the faster of the int8 and the FP16 expert products for each layer of a chunk, by the rows its experts average. Where one stops beating the other is measured at the start on each GPU, both timed at 16 to 256 rows an expert in the shape of the model's first layer, and logged (181 rows on the B70; int8 at every count on the RTX 4070). `XESTRATA_PREFILL_MMQ=0` takes the FP16 path, `1` the int8 products.
+On RDNA3 and RDNA4, the int8 products of groups of experts that average more than 256 rows (a long prompt's large chunks) are also timed at the start in a form that dequantizes the weights to FP16 for the WMMA instructions, which is taken for the types and row counts where it is 5% faster or more (+4% on a 32K prompt on the RX 9060 XT; the output's last bits change). `XESTRATA_IQ_MMQ_F16=0` never takes it, `1` takes it at every row count.
 
 Pascal (sm_60, sm_61: P100, P40, the GTX 10 series) gets code too, from a CUDA 12 toolkit.
 It has no tensor cores, so no matrix-engine path is chosen and it runs on the DP4a and FP32 paths.
