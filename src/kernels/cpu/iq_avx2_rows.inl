@@ -80,14 +80,22 @@ STRATA_ROWS_FN inline __m128 pair_sums1(__m256i e, __m256i o) {
     return _mm_cvtepi32_ps(_mm_hadd_epi32(f, f));
 }
 
+// The exact sum of 8 int32 lanes.
+STRATA_ROWS_FN inline int32_t hsum_i32(__m256i v) {
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1));
+    return _mm_cvtsi128_si32(s);
+}
+
 // ---- IQ2_XS (17) with ggml's vectorized sign decode (arch/x86/quants.c, ggml_vec_dot_iq2_xs_q8_K):
 // the 7-bit sign indices never touch ksigns_iq2xs - the 8th sign bit is reconstructed by parity (two
 // shifts, a xor and ggml's bit_helper pshufb) and the per-half sign vectors come out of shuffles of one
 // 32-byte load.  The 8 scale bytes become all 16 half-scales with ggml's unpack trick.  The grid lookups
 // stay scalar loads into set_epi64x (ggml does the same).  Every token still only pays a load, a sign,
 // a maddubs, a madd and an add per half, into alternating accumulators.
-// C: the canonical rows (row_dot_canon below) against xq / xd instead of y: a block's integer sum, and two blocks'
-// (d x the scale x 0.125) x sum into the even and the odd lane with one fma.
+// C: the canonical rows (row_dot_canon below) against xq / xd instead of y: a block's integer sum times its integer
+// scale (canon_math.hpp's fixed-point sums, row_dot_canon_fx's) added in int64.
 template <bool C, int NT> STRATA_ROWS_FN
 inline void row_dot_iq2xs_impl(const uint8_t* row, int nblocks, const block_q8_K* const* y, const int8_t* const* xq,
                                const float* const* xd, float* res) {
@@ -124,12 +132,21 @@ inline void row_dot_iq2xs_impl(const uint8_t* row, int nblocks, const block_q8_K
     const int pf = prefetch_distance();
 
     __m256 accf[NT];
-    constexpr int NP = (NT + 1) / 2;
-    __m128 accc[NP];   // C: token pairs, lanes 0, 1 the first token's even and odd blocks, 2, 3 the second's
-    alignas(32) int32_t even[NT][8];   // C: the even block's sums, in memory until the odd one's (one token: even1)
-    __m256i even1 = _mm256_setzero_si256();
-    for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
-    for (int p = 0; p < NP; ++p) accc[p] = _mm_setzero_ps();
+    int64_t fxs[NT];   // C: the fixed-point sums, and each token's row top
+    int top[NT];
+    for (int t = 0; t < NT; ++t) {
+        accf[t] = _mm256_setzero_ps();
+        fxs[t] = 0;
+        top[t] = canon::kFxNone;
+    }
+    if constexpr (C) {
+        int topw = canon::kFxNone;
+        for (int i = 0; i < nblocks; ++i) topw = std::max(topw, canon::fx_exp(h2f(u16(row + (size_t) i * 74))));
+        for (int t = 0; t < NT; ++t) {
+            for (int i = 0; i < nblocks; ++i) top[t] = std::max(top[t], canon::fx_exp(xd[t][i]));
+            top[t] += topw;
+        }
+    }
     for (int i = 0; i < nblocks; ++i) {
         const uint8_t* blk = row + (size_t) i * 74;
         rows_ahead(blk, pf);
@@ -170,31 +187,10 @@ inline void row_dot_iq2xs_impl(const uint8_t* row, int nblocks, const block_q8_K
             }
         }
         if constexpr (C) {
-            if ((i & 1) == 0) {
-                if constexpr (NT == 1) even1 = _mm256_add_epi32(acc[0][0], acc[0][1]);
-                else
-                    for (int t = 0; t < NT; ++t)
-                        _mm256_store_si256(reinterpret_cast<__m256i*>(even[t]), _mm256_add_epi32(acc[t][0], acc[t][1]));
-            } else if constexpr (NT == 1) {
-                const __m128 cw = _mm_cvtph_ps(_mm_set_epi16(0, 0, 0, 0, 0, 0, (short) u16(blk), (short) u16(blk - 74)));
-                const __m128 T = pair_sums1(even1, _mm256_add_epi32(acc[0][0], acc[0][1]));
-                const __m128 dx = _mm_castpd_ps(_mm_load_sd(reinterpret_cast<const double*>(xd[0] + i - 1)));
-                accc[0] = _mm_fmadd_ps(_mm_mul_ps(_mm_mul_ps(cw, dx), _mm_set1_ps(0.125f)), T, accc[0]);
-            } else {
-                const short h0 = (short) u16(blk - 74), h1 = (short) u16(blk);
-                const __m128 cw = _mm_cvtph_ps(_mm_set_epi16(0, 0, 0, 0, h1, h0, h1, h0));
-                __m256i odd[NT];
-                for (int t = 0; t < NT; ++t) odd[t] = _mm256_add_epi32(acc[t][0], acc[t][1]);
-                for (int p = 0; p < NP; ++p) {
-                    const int t = 2 * p, u = t + 1 < NT ? t + 1 : t;
-                    const __m128 T = pair_sums2(_mm256_load_si256(reinterpret_cast<const __m256i*>(even[t])), odd[t],
-                                                _mm256_load_si256(reinterpret_cast<const __m256i*>(even[u])), odd[u]);
-                    const __m128 dx = _mm_castpd_ps(
-                        _mm_unpacklo_pd(_mm_load_sd(reinterpret_cast<const double*>(xd[t] + i - 1)),
-                                        _mm_load_sd(reinterpret_cast<const double*>(xd[u] + i - 1))));
-                    accc[p] = _mm_fmadd_ps(_mm_mul_ps(_mm_mul_ps(cw, dx), _mm_set1_ps(0.125f)), T, accc[p]);
-                }
-            }
+            const canon::FxPart w = canon::fx_part(h2f(u16(blk)));
+            for (int t = 0; t < NT; ++t)
+                fxs[t] += (int64_t) canon::fx_scale(canon::fx_part(xd[t][i]), w, top[t]) *
+                          (int64_t) hsum_i32(_mm256_add_epi32(acc[t][0], acc[t][1]));
         } else {
             const float dx = h2f(u16(blk)) * 0.125f;
             for (int t = 0; t < NT; ++t)
@@ -203,10 +199,7 @@ inline void row_dot_iq2xs_impl(const uint8_t* row, int nblocks, const block_q8_K
         }
     }
     if constexpr (C) {
-        for (int p = 0; p < NP; ++p) {
-            res[2 * (size_t) p] = canon_pair_sum(accc[p], 0);
-            if (2 * p + 1 < NT) res[2 * p + 1] = canon_pair_sum(accc[p], 1);
-        }
+        for (int t = 0; t < NT; ++t) res[t] = canon::fx_value(fxs[t], top[t], -3);
     } else {
         for (int t = 0; t < NT; ++t) res[t] = hsum8(accf[t]);
     }
@@ -534,20 +527,13 @@ inline void row_dot_canon_gen(const uint8_t* row, int nblocks, const int8_t* con
 // int64; the row's value from its sum.  Every addition is exact, so no order is the GPU's to follow.  IQ2_XXS, IQ3_XXS
 // and IQ3_S (and their gathered decodes).
 template <int TY> constexpr bool canon_fx() {
-    return TY == 16 || TY == 18 || TY == 118 || TY == 21 || TY == 121;
+    return TY == 16 || TY == 18 || TY == 118 || TY == 21 || TY == 121 || TY == 22 || TY == 122;
 }
 template <int TY> constexpr int fx_k_log2() {
     return Fmt32<TY>::K == 0.125f ? -3 : Fmt32<TY>::K == 0.25f ? -2 : Fmt32<TY>::K == 0.5f ? -1 : 0;
 }
 // the activations' blocks a row of these rows takes at most (canon_layer: n_embd's values within kNativeActBytes)
 constexpr int kFxBlocks = 32;
-
-STRATA_ROWS_FN inline int32_t hsum_i32(__m256i v) {
-    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
-    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E));
-    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1));
-    return _mm_cvtsi128_si32(s);
-}
 
 // xp[t][i]: token t's block i's scale as fx parts, topa[t] its largest exponent
 template <int TY, int NT> STRATA_ROWS_FN

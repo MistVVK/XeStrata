@@ -303,6 +303,10 @@ template<> struct Split<17> {   // IQ2_XS
         return r;
     }
     static void parts(const W& r, const block_q8_1* bq8_1, int iqs, float& c, int& s) { parts_ls2(r, bq8_1, iqs, c, s); }
+    // the fixed-point sums (seg_dot_canon_fx): the 1/8, the block's d, the activation scale a call reads
+    static constexpr int kFxLog2 = -3;
+    static float block_d(const void* blk) { return (float) static_cast<const block_iq2_xs*>(blk)->d; }
+    static float act_d(const block_q8_1* bq8_1, int iqs) { return low_half(bq8_1[iqs / 2].ds); }
     // the products' order an expert's row takes on every device and on the CPU (canon_math.hpp, seg_dot_multi)
     static constexpr bool kParts = true;
     // the calls in a row that share one activation scale (their integer sums add before the scale)
@@ -336,6 +340,10 @@ template<> struct Split<22> {   // IQ2_S
         return r;
     }
     static void parts(const W& r, const block_q8_1* bq8_1, int iqs, float& c, int& s) { parts_ls2(r, bq8_1, iqs, c, s); }
+    // the fixed-point sums (seg_dot_canon_fx): the 1/8, the block's d, the activation scale a call reads
+    static constexpr int kFxLog2 = -3;
+    static float block_d(const void* blk) { return (float) static_cast<const block_iq2_s*>(blk)->d; }
+    static float act_d(const block_q8_1* bq8_1, int iqs) { return low_half(bq8_1[iqs / 2].ds); }
     // the products' order an expert's row takes on every device and on the CPU (canon_math.hpp, seg_dot_multi)
     static constexpr bool kParts = true;
     // the calls in a row that share one activation scale (their integer sums add before the scale)
@@ -1044,11 +1052,11 @@ inline void seg_dot_canon(const sycl::sub_group& sg, const uint8_t* row, const b
     }
 }
 
-// A format with kFxLog2 (IQ2_XXS, IQ3_XXS, IQ3_S, IQ4_NL): seg_dot_canon's calls and integer butterflies, each group's
-// sum times its block's integer scale (canon_math.hpp's fx_scale) added in int64 and the lanes' sums by an int64
-// butterfly - exact, so in any order: the CPU's rows (iq_avx2_rows.inl's row_dot_canon_fx) and the prompt's products
-// (iq_mmq.cpp's FX bodies) give the same bits.  The row's top: the largest exponent of its blocks' d's, read by the
-// segment's lanes, plus each activation's (the scale of each 256, in its first q8_1 block).
+// A format with kFxLog2 (the gate/up's i-quants, IQ4_NL's down): seg_dot_canon's calls and integer butterflies, each
+// group's sum times its block's integer scale (canon_math.hpp's fx_scale) added in int64 and the lanes' sums by an
+// int64 butterfly - exact, so in any order: the CPU's rows (iq_avx2_rows.inl's row_dot_canon_fx) and the prompt's
+// products (iq_mmq.cpp's FX bodies) give the same bits.  The row's top: the largest exponent of its blocks' d's, read
+// by the segment's lanes, plus each activation's (the scale of each 256, in its first q8_1 block).
 template<class S, class = void> struct HasFx : std::false_type {};
 template<class S> struct HasFx<S, std::void_t<decltype(S::kFxLog2)>> : std::true_type {};
 

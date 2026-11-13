@@ -83,11 +83,15 @@ constexpr PosTables kPos{};
 
 // one IQ2_XS row of n values against an activation with a scale per 256 values (the reference loops)
 float iq2xs_row(const block_iq2_xs* w, int n, const void* a) {
-    STRATA_CANON_NO_CONTRACT
     const int8_t* xq = act_values(a, n, QK_K);
     const float* xd = act_scales(a);
-    float s[2] = {0.0f, 0.0f};
     const int nb = n / QK_K;
+    int ta = canon::kFxNone, tw = canon::kFxNone;   // canon_math.hpp's fixed-point sums: the row's top
+    for (int kbx = 0; kbx < nb; ++kbx) {
+        ta = std::max(ta, canon::fx_exp(xd[kbx]));
+        tw = std::max(tw, canon::fx_exp(h2f(w[kbx].d)));
+    }
+    int64_t s = 0;
     for (int kbx = 0; kbx < nb; ++kbx) {
         int t = 0;
         for (int ib = 0; ib < 8; ++ib) {
@@ -104,10 +108,9 @@ float iq2xs_row(const block_iq2_xs* w, int n, const void* a) {
             }
             t += sum[0] * (2 * (w[kbx].scales[ib] & 0x0F) + 1) + sum[1] * (2 * (w[kbx].scales[ib] >> 4) + 1);
         }
-        const float c = h2f(w[kbx].d) * xd[kbx] * 0.125f;
-        s[kbx & 1] = canon::fma(c, (float) t, s[kbx & 1]);
+        s += (int64_t) canon::fx_scale(xd[kbx], h2f(w[kbx].d), ta + tw) * t;
     }
-    return s[0] + s[1];
+    return canon::fx_value(s, ta + tw, -3);
 }
 
 // one IQ4_NL row of n values against an activation with a scale per 32 values (the reference loops): the GPU's lane

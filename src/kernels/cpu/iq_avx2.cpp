@@ -39,6 +39,7 @@
 
 #include <immintrin.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
