@@ -23,7 +23,7 @@ int main() {
     CHECK(strata::prefill::share_rules::default_share_limit() == 3072);
     CHECK(strata::prefill::share_rules::default_share_limit(true) == strata::prefill::share_rules::kShareLimitNew);
     CHECK(strata::prefill::share_rules::default_share_limit(false) == 1024);
-    CHECK(strata::prefill::share_rules::gfx12_share_limit(true) == 1536 && strata::prefill::share_rules::gfx12_share_limit(false) == 3072);   // AMD-Q
+    CHECK(strata::prefill::share_rules::gfx12_share_limit(true) == 2304 && strata::prefill::share_rules::gfx12_share_limit(false) == 3072);   // AMD-Q
     static_assert(strata::prefill::share_rules::kShareLimitOld == 1024, "the old limit (the way back is STRATA_PREFILL_CPU_SHARE_MAX=1024)");
 
     // H11: memory verdicts
