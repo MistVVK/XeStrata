@@ -13,7 +13,8 @@ launcher reads `XESTRATA_*` through launcher/Core/Platform.fs, and the shell scr
     python tools/settings_register.py --names     # print the names that are read, one per line
 
 What counts as a read: the name is the string literal argument of an engine env helper (`env_get`, `env_on`, `env_off`,
-`env_or`, `env_mib`, `env_isa_cap`, `env_auto`), of `envvars.get` in Python, a `XESTRATA_*` string in the launcher's F#, or a
+`env_or`, `env_mib`, `env_isa_cap`, `env_auto`), of `envvars.get` in Python, a `XESTRATA_*` string in the
+launcher's F#, or a
 `$XESTRATA_*` reference in a shell script.  A call whose argument is not a literal (a computed name) is not listed: it
 cannot be enumerated.
 
