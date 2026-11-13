@@ -478,6 +478,7 @@ bool PlainModel::record_gblock(const GBlock& b, int64_t l, int T, uint32_t& ring
         ffn_out = moe_out_;
     }
     k::glm5_hc_post(ffn_out, g_hs_, g_post_, g_comb_, g_hs_, N, T, cs);
+    tap_rows(l, g_hs_, kHC, T, 0, true, cs);   // DFlash2's taps: the mean of the four streams (sglang's capture)
     return true;
 }
 
