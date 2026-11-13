@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <utility>
 #include <vector>
 
@@ -256,24 +257,60 @@ void add_route_rows(std::vector<float>& usage, const std::vector<int32_t>& rec, 
     }
 }
 
-/// A prompt chunk's layer, for the CPU's share of the experts the GPU does not hold: `missed` the routed experts not in
-/// VRAM, `cand` (rows, expert) those the CPU may take, fewest rows first - at most MAXT rows (one multi-token job) and a
-/// blob the CPU reads where it lies, page-locked or not assembled into a short-lived buffer (the CPU's jobs keep their
-/// pointers while the GPU's groups stage the rest; upstream 92bce20e).  How many of them the CPU takes is each engine's
-/// (a share of `missed`).  `in_vram(e)`, `skip(e)`: an expert another part computes (a helper GPU's).
+// auto tunes the staged walk; 0 keeps streaming and 1 forces the CPU jobs.
+inline int cpu_share_staged_3k_mode() {
+    static const int mode = [] {
+        const char* v = strata::env_get("PREFILL_STAGED_3K");
+        if (!v || std::strcmp(v, "auto") == 0) return -1;
+        return *v == '1' ? 1 : 0;
+    }();
+    return mode;
+}
+inline bool cpu_share_batched(int64_t rows, bool qualified = false) {
+    const int mode = cpu_share_staged_3k_mode();
+    return (mode == 1 || (mode < 0 && qualified)) && rows >= 2048 && rows <= 3072;
+}
+
+// Compare adjacent layers after warm-up. Require two ratios to beat the unshared layer by 10%, so a
+// near-tie keeps the earlier path. One instance belongs to one model/device.
+struct PromptShareChoice {
+    int attempts = 0, samples = 0, ratios = 0, last_arm = -1;
+    int64_t last_layer = -1;
+    double last_cost = 0, values[2] = {};
+    bool selected = false;
+    bool decided() const { return ratios >= 2; }
+    bool next() { return decided() ? selected : (attempts++ & 1) != 0; }
+    void add(bool arm, int64_t layer, int64_t missed, double ms, const char* who) {
+        if (decided() || missed <= 0 || ms <= 0) return;
+        const double cost = ms / (double) missed;
+        if (++samples > 1 && last_arm >= 0 && last_arm != (int) arm && layer > last_layer) {
+            values[ratios++] = arm ? cost / last_cost : last_cost / cost;
+            if (decided()) {
+                const double slower = std::max(values[0], values[1]);
+                selected = slower < 0.90;
+                std::fprintf(stderr, "xestrata: CPU prompt share auto (%s): slower shared/unshared %.3f, %s\n",
+                             who, slower, selected ? "share" : "do not share");
+            }
+        }
+        last_arm = (int) arm; last_layer = layer; last_cost = cost;
+    }
+};
+
+/// A prompt chunk's layer: missed experts and those the CPU can read, fewest rows first. max_rows bounds an
+/// expert's rows; the default is one multi-token job. The blob must stay at its address during the jobs.
 struct CpuShareCandidates {
     int64_t missed = 0;
     std::vector<std::pair<int32_t, int32_t>> cand;
 };
 template <class InVram, class Skip>
 CpuShareCandidates cpu_share_candidates(const int32_t* counts, int64_t n_expert, int64_t layer, const ExpertSource& src,
-                                        InVram in_vram, Skip skip) {
+                                        InVram in_vram, Skip skip, int64_t max_rows = kernels::cpu::MAXT) {
     CpuShareCandidates r;
     for (int32_t e = 0; e < (int32_t) n_expert; ++e) {
         const int32_t c = counts[e];
         if (c == 0 || in_vram(e) || skip(e)) continue;
         ++r.missed;
-        if (c <= kernels::cpu::MAXT && (src.pinned(layer, e) || !src.transient(layer, e))) r.cand.emplace_back(c, e);
+        if (c <= max_rows && (src.pinned(layer, e) || !src.transient(layer, e))) r.cand.emplace_back(c, e);
     }
     std::sort(r.cand.begin(), r.cand.end());
     return r;

@@ -237,7 +237,7 @@ bool PlainModel::prompt_settle(std::string& err) {
 bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& experts, const std::vector<int32_t>& count,
                                     const std::vector<int32_t>& start, std::string& err) {
     // On the host while the GPU computes its share: each routed row's token quantized once to the layer's native
-    // activation, one multi-token job an expert, the outputs back to the GPU into their routing entries' rows of parts.
+    // activation, up to MAXT rows per job, and the outputs back to their routing entries' rows of parts.
     namespace kc = k::cpu;
     PromptBufs& P = pb_;
     const int64_t N = spec_.n_embd;
@@ -262,8 +262,9 @@ bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& expe
             P.h_cpu_row[q] = P.h_entry[r];
             ++j.nt;
             ++q;
+            if (j.nt == kc::MAXT) { jobs.push_back(j); j.nt = 0; }
         }
-        jobs.push_back(j);
+        if (j.nt > 0) jobs.push_back(j);
     }
     // the chunks pipelined over a layer split (prompt_split): the stages take the pool one at a time
     std::unique_lock<std::mutex> turn(root_->pool_mu_, std::defer_lock);
@@ -530,7 +531,7 @@ bool PlainModel::prompt_split_reserve() {
     return prefill::mmq::split_reserve(k::kIqMmqSplitRows, n_out, cs_);
 }
 
-bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* routes,
+bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, bool large_share, int64_t max_cpu, int32_t* routes,
                                 const std::function<void(int)>& mark, PromptRouted& st, std::string& err) {
     PromptBufs& P = pb_;
     const auto& lay = k::cpu::expert_layout();
@@ -569,8 +570,8 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
     const auto& f = lay.fmt[(size_t) ml];
     // the CPU's share of the missed experts (after Project Maya's CPU lane, as the windows split them): of
     // the f experts not in VRAM, pcie_split_m's count over PCIe from the times measured at load, the rest
-    // on the CPU pool beside the GPU, those with the fewest rows first (a window's tokens at most: one
-    // multi-token job, its weights read once)
+    // on the CPU pool beside the GPU, those with the fewest rows first; longer experts are split into jobs
+    // of at most MAXT rows each.
     std::vector<char> on_cpu((size_t) E, 0);
     std::vector<int32_t> cpu_experts;
     if (cpu_share && f.gu_type != 42) {
@@ -579,13 +580,13 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
         // the candidates and how many of them (core/expert_tier, as Qwen3.8-Flash-Next's prompt path takes them)
         const CpuShareCandidates cc = cpu_share_candidates(
             count.data(), E, ml, *src_, [&](int32_t e) { return res_[(size_t) (ml * E + e)] >= 0; },
-            [](int32_t) { return false; });
+            [](int32_t) { return false; }, large_share ? T : k::cpu::MAXT);
         // a fixed share (--prefill-cpu-share S) gives the CPU S of the missed experts, else the decode's split times:
         // the share measured on the prompt's layers (Qwen3.8-Flash-Next's) was no faster here.  Qwen3.6-35B-A3B
         // UD-Q4_K_XL on the RTX 4070 (2026-11-12, 2 rounds): the same with the split measured; with --pcie-frac 0, where
         // no split is measured and the CPU took none, 1K 519 -> 645 tok/s, 4K 1284 -> 1304, 32K 2651 -> 2371
         const double fixed = strata::prefill::cpu_share_setting();
-        const int64_t want = cpu_share_count(cc.missed, hits, fixed > 0.0 ? fixed : -1.0, nullptr, &split_);
+        const int64_t want = std::min(max_cpu, cpu_share_count(cc.missed, hits, fixed > 0.0 ? fixed : -1.0, nullptr, &split_));
         cpu_share_take(cc.cand, want, P.cpu_cap, [&](int32_t e) { return src_->blob(ml, e); },
                        [&](int32_t e, int32_t, const uint8_t*) {
                            on_cpu[(size_t) e] = 1;
@@ -880,6 +881,37 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
     return true;
 }
 
+bool PlainModel::prompt_routed_tuned(int64_t ml, int64_t T, bool cpu_share, int32_t* routes,
+                                     const std::function<void(int)>& mark, PromptRouted& st, std::string& err) {
+    const int mode = cpu_share_staged_3k_mode();
+    const bool eligible = cpu_share && T >= 2048 && T <= 3072 && mode != 0;
+    if (eligible && mode < 0 && prompt_share_pending_) {
+        float ms = 0;
+        if (!strata::gpu::event_sync(prompt_share_events_[1]) ||
+            !strata::gpu::event_elapsed_ms(&ms, prompt_share_events_[0], prompt_share_events_[1])) {
+            err = "plain prompt: share timing event"; return false;
+        }
+        prompt_share_3k_.add(prompt_share_arm_, prompt_share_layer_, prompt_share_missed_, ms, "plain");
+        prompt_share_pending_ = false;
+    }
+    const bool tune = eligible && mode < 0 && !prompt_share_3k_.decided();
+    const bool large = eligible && (mode == 1 || (mode < 0 && prompt_share_3k_.next()));
+    if (tune) {
+        if (!prompt_share_events_[0] && (!strata::gpu::event_create(&prompt_share_events_[0], true) ||
+                                          !strata::gpu::event_create(&prompt_share_events_[1], true))) {
+            err = "plain prompt: share timing event"; return false;
+        }
+        if (!strata::gpu::event_record(prompt_share_events_[0], cs_)) { err = "plain prompt: share timing start"; return false; }
+    }
+    // The trial moves at most 16 experts; the chosen path takes its full share after the timing.
+    if (!prompt_routed(ml, T, cpu_share, large, tune && large ? 16 : INT64_MAX, routes, mark, st, err)) return false;
+    if (tune && st.miss_n > 0 && (!large || st.cpu_n > 0)) {
+        if (!strata::gpu::event_record(prompt_share_events_[1], cs_)) { err = "plain prompt: share timing end"; return false; }
+        prompt_share_pending_ = true; prompt_share_arm_ = large; prompt_share_layer_ = ml; prompt_share_missed_ = st.miss_n;
+    }
+    return true;
+}
+
 bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err) {
     if (cpu_ != nullptr) return cpu_run(tokens, n, pos, 1, out, logits, err);
     // upstream 711a7e937: the stall report asks this stream (the one the prompt's waits block on) whether its work is done
@@ -1111,8 +1143,9 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
         const char* v = strata::env_get("PLAIN_CPU_SHARE");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
-    const bool cpu_share = cpu_env && strata::prefill::cpu_share_setting() != 0.0 && split_.c > 0.0 && split_.p > 0.0 &&
-                           P.cpu_cap > 0;
+    const double share_setting = strata::prefill::cpu_share_setting();
+    const bool cpu_share = cpu_env && share_setting != 0.0 &&
+                           (share_setting > 0.0 || (split_.c > 0.0 && split_.p > 0.0)) && P.cpu_cap > 0;
     static const bool prompt_attn_on = [] {   // STRATA_PLAIN_PROMPT_ATTN=0: the decode's attention kernel
         const char* v = strata::env_get("PLAIN_PROMPT_ATTN");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
@@ -1442,7 +1475,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 // the routed experts grouped by expert (prompt_routed), into parts in routing order
                 const int64_t ml = is_mtp ? n_moe_ - 1 : s.moe_index(l);
                 PromptRouted rst;
-                if (!prompt_routed(ml, T, cpu_share, routes.empty() ? nullptr : routes.data() + ml * P.T * K,
+                if (!prompt_routed_tuned(ml, T, cpu_share, routes.empty() ? nullptr : routes.data() + ml * P.T * K,
                                    [&](int stage) { mark(stage, t_mark); }, rst, err))
                     return false;
                 cpu_n += rst.cpu_n;
