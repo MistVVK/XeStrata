@@ -841,7 +841,7 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
     // the complete attention on the actual pools with the FP32 form and keeps int8 only within the upstream parity
     // line (1e-4 of the output scale) and where it is faster; no timing or comparison inside a graph capture.
     bool i8 = false;
-    if (kv_mode == 1 && ids != nullptr && n_q >= 2 && row_pools.n == 0) {
+    if (kv_mode == 1 && ids != nullptr && n_q >= 2 && row_pools.n == 0 && split == 1) {
         const char* im = strata::env_get("QSA_ATTN_I8");
         using I8Key = std::tuple<int, int, int, int, int>;
         static core::TimedCache<sycl::device, I8Key, bool> i8_choices;
