@@ -74,29 +74,41 @@ decode の速さは文章によっても変わります。
 （B70、IQ2_XS、K=3: 文書の書き直し 109.6 → 129.2、ふつうの会話 71.1 → 68.3 トークン/秒）。
 `--lookup-chain-min M` は、続きを足すのに要る一致の長さです（既定 3 トークン）。
 
-#### DFlash2（Qwen3.8-Flash-Next のもう一つの drafter）
+#### DFlash2（もう一つの drafter）と起動時の選択
 
-`--draft mtp|dflash2|auto|off` で drafter を選びます（既定 mtp）。DFlash2 は Qwen3.8-Flash-Next 用の block drafter
-（[incoai/Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2)、Apache-2.0）です。
-target の層 5/15/25/35/45 の隠れ状態を読み、anchor 1 行と mask 7 行の forward 1 回で 7 トークンを推測し、
-top-16 と rank-256 の selector で左から右へ選びます。MTP の層とは別の drafter で、`--draft-model PACK` に
-`tools/dflash2_pack.py` の pack（Q4_0 行列・Q4_0 selector、約 0.5 GB）を渡します。setup が `--drafting auto|dflash2` の
-とき pinned revision から取得してこの PC で pack します（`tools/dflash2_fetch.py`、SHA-256 照合）。
+`--draft mtp|dflash2|auto|off` で drafter を選びます（既定 mtp、setup は auto を書きます）。DFlash2 は Inco AI の
+block drafter（Apache-2.0）で、Qwen3.8-Flash-Next 用（[incoai/Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2)）、
+GLM-5.3-Flash 用（[incoai/GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2)）、
+Qwen3.6-35B-A3B 用（[incoai/Qwen3.6-35B-A3B-DFlash2](https://huggingface.co/incoai/Qwen3.6-35B-A3B-DFlash2)）があります。
+target のいくつかの層の出力（流れが 4 本のモデルはその平均）を読み、anchor 1 行と mask 7 行の forward 1 回で
+7 トークンを推測し、top-16 と rank-256 の selector で左から右へ選びます。MTP の層とは別の drafter で、
+`--draft-model PACK` に `tools/dflash2_pack.py` の pack（Q4_0 行列・Q4_0 selector）を渡します。
+setup は `--drafting auto|dflash2` のとき、モデルごとに版を固定した重みを取得してこの PC で pack します
+（`tools/dflash2_fetch.py --model`、SHA-256 照合。Qwen3.8-Flash-Next はデータフォルダの `dflash2/`、ほかはモデルの
+フォルダの `dflash2/`）。取得できなければ MTP の層で続けます。
 
-`--draft auto` は MTP と DFlash2 の両方を読み、要求ごとにどちらを使うかを選びます。要求の `xestrata_draft`
-（`mtp|dflash2|auto`）が明示ならそれに従い、なければ `--draft-rule df2|mtp|learn`（既定 learn）です。learn は
-要求の種類（prompt 先頭 32 トークン）× 文脈の深さ（2K/8K/32K の境）ごとに、実測の decode 速度（EMA）の良い方を
-選び、負けた側も時々試します（差 4% 未満で 6 回に 1 回、以上で 12 回に 1 回）。起動直後は MTP から始め、最初の
-数要求で両方を測ります。結果はファイルに残しません（プロセス内だけ）。選ばれなかった drafter も最新に保ちます
-（DFlash2 の ring は context update、MTP は prompt の再読で引き継ぎます）。
+`--serve` の `--draft auto` は、起動の最後（READY の前）に、読み込んだ drafter（MTP、DFlash2 の pack があれば
+DFlash2）と「drafter なし」を、固定の短い英文で交互に decode して比べ、速いものを残します。負けた drafter は
+VRAM と RAM から外します。`--spec auto`（setup が書きます）なら窓の上限も候補にします（Qwen3.8-Flash-Next は 4 と 2、
+plain エンジンは 3 と 2）。最速が他より 3%（と自身の回の間のぶれ）以上速くなければ、安い形（MTP、DFlash2、なしの順、
+設定の窓）を残します。MTP と DFlash2 がその幅の中なら両方を残し、要求ごとに選びます（下）。測りに使う DFlash2 は
+起動の最後に読み込み、エキスパートのキャッシュは MTP だけのときと同じ大きさで取るので、MTP が勝てば pack が
+ないときと同じ状態になります。DFlash2 を残すのは、それを載せても `--vram-reserve-mib` の予備が空いているときだけ
+です。測りの間はエキスパートの入れ替えと、最初の窓で決める切り替えは動きません。測りは浅い文脈（百数十トークン）で
+行い、深い文脈では窓の規則（`--spec-window auto`）が回ごとに補います。結果はファイルに残さず、起動ごとに測ります。
+`XESTRATA_DRAFT_PROBE=0` で測らず（auto は両方を読みます）、`XESTRATA_DRAFT_PROBE_TOKENS` で 1 回の長さ（既定 64）を
+変えます。`--draft mtp|dflash2|off` と数字の `--spec` はそのとおりにします。`--serve` なしの auto は MTP の層です。
 
-DFlash2 の窓は `--draft-conf P` で、selector 確率の積が P を下回る所で閉じます（既定は drafter 読み込み後の
-expert slots から決めます。`--draft-conf` の明示が優先）。`--draft dflash2` は既定で MTP の層を読みません
-（`--draft-fallback mtp` で両方）。DFlash2 は 1 枚の GPU・1 要求ずつです（層分割・`--batch`・pipeline windows は
-MTP のまま）。greedy の答えは drafter によらず同じです（検証の窓が target の argmax を出します）。
+両方を残したときは、要求の `xestrata_draft`（`mtp|dflash2|auto|off`）が明示ならそれに従い、なければ
+`--draft-rule df2|mtp|learn`（既定 learn）です。learn は要求の種類（prompt 先頭 32 トークン）× 文脈の深さ
+（2K/8K/32K の境）ごとに、実測の decode 速度（EMA）の良い方を選び、負けた側も時々試します（差 4% 未満で 6 回に
+1 回、以上で 12 回に 1 回）。
 
-plain エンジン（Qwen3.6・Ornith など）も同じ `--draft`・`xestrata_draft`・tap の機構を共有しますが、DFlash2 の
-重みは Qwen3.8-Flash-Next 用なので plain モデル用の pack はまだなく、`--draft dflash2` は拒否、auto は MTP を保ちます。
+DFlash2 の窓は `--draft-conf P` で、selector 確率の積が P を下回る所で閉じます（既定は expert slots から決めます。
+`--draft-conf` の明示が優先）。`--draft dflash2` は既定で MTP の層を読みません（Qwen3.8-Flash-Next は
+`--draft-fallback mtp` で両方）。DFlash2 は 1 枚の GPU・1 要求ずつです（層分割・`--batch`・pipeline windows は
+MTP のまま）。plain エンジンの `--draft dflash2` は `--serve` だけです。greedy の答えは drafter によらず同じです
+（検証の窓が target の argmax を出します）。
 
 サーバーの decode では、VRAM にないエキスパートを順位 7 以下（上位 10 のうち重みの小さい 8〜10 番目）で選んだトークンでは、その寄与を 0 にし、検証の窓のどのトークンもその順位でしか選ばないものは読まず計算もしません（`XESTRATA_ROUTE_TAIL_SKIP`、既定 7、upstream b4e3407b）。
 残りのエキスパートの重みは正規化し直しません。そのぶん答えが少し変わります。upstream は窓のほかのトークンがそのエキスパートを使わないときだけ 0 にするので、トークンの出力が窓のほかの行で変わりました。XeStrata はトークンごとに決めます。

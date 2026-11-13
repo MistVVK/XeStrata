@@ -1164,6 +1164,7 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
                "tag": "qwen36-", "name": "qwen3.6-35b-a3b", "max_context": 262144, "plain": True,
                "profile": "expert-profile-qwen36.bin", "mmproj": _QWEN36_MMPROJ,
                "draft_vocab": True,   # the vocabulary of Qwen3.8's draft head subsets (data/draft_vocab*.bin)
+               "dflash2": "qwen3.6-35b-a3b",   # its DFlash2 drafter (tools/dflash2_fetch.py's key)
                "models": {
                    "UD-Q4_K_XL": {"repo": _QWEN36, "file": "Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf", "size": 22853663008,
                                   "sha256": "55983c5a75a1ab969824077b3bb3de4146e82a9234072b48ad4e8f92ad3fe9f1",
@@ -1298,6 +1299,7 @@ PLAIN_FAMILIES["glm53"] = {
     "about": "320B, 18B active; a large MoE for the PCs whose RAM and VRAM hold 95 GB or more",
     "tag": "glm53-", "name": "glm-5.3-flash", "max_context": 262144, "plain": True,
     "profile": "expert-profile-glm53.bin",
+    "dflash2": "glm-5.3-flash",   # its DFlash2 drafter (tools/dflash2_fetch.py's key)
     "models": {
         "UD-IQ3_XXS": {"repo": _GLM53, "file": _GLM53_IQ3[0]["path"], "parts": _GLM53_IQ3,
                        "size": sum(x["size"] for x in _GLM53_IQ3), "about": "3-bit (Unsloth Dynamic)", "tested": True},
@@ -8361,6 +8363,36 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         args += ["--expert-profile", str(ROOT / "data" / fam["profile"])]
     if fam.get("draft_vocab"):                         # the MTP layer's drafts over a token subset (--draft-vocab)
         args += ["--draft-vocab", str(ROOT / "data" / DRAFT_VOCABS.get(a.draft_vocab or "cjk", "draft_vocab.bin"))]
+    # the drafter: a model with a DFlash2 drafter (the family's "dflash2", tools/dflash2_fetch.py's key) has it fetched
+    # into dflash2/ beside the model for auto (the default) and dflash2; with auto the engine measures it, the MTP layer
+    # and no drafter at its start and keeps the fastest (the window too, --spec auto)
+    drafting = getattr(a, "drafting", None) or saved_drafting(CONF / f"xestrata-{tag.lower()}.json") or "auto"
+    df2_key = fam.get("dflash2")
+    df2_pack = None
+    if df2_key and drafting in ("auto", "dflash2") and not on_cpu:
+        df2_dir = models_dir / "dflash2"
+        say(f"  The DFlash2 drafter of {fam['title']} (a second way to guess ahead) comes from Inco AI (Apache-2.0);")
+        say("  it is packed on this PC.")
+        run([sys.executable, str(ROOT / "tools" / "dflash2_fetch.py"), "fetch", "--model", df2_key, "--out",
+             str(df2_dir)], env=dict(os.environ), check=False)
+        df2_pack = next((p for p in (df2_dir / f"{df2_key}-dflash2.q4_0-selq4.pack",
+                                     df2_dir / f"{df2_key}-dflash2.q4_0.pack") if p.exists()), None)
+        if df2_pack is None:
+            warn("the DFlash2 drafter is not on this PC (the download did not complete): the MTP layer continues")
+            if drafting == "dflash2":
+                drafting = "mtp"
+    elif drafting == "dflash2":
+        drafting = "auto"   # no drafter for this model: the MTP layer, measured against none
+    if not on_cpu:
+        if drafting == "off":
+            args += ["--draft", "off"]
+        elif drafting == "dflash2" and df2_pack is not None:
+            args += ["--draft", "dflash2", "--draft-model", str(df2_pack)]
+        else:
+            args += ["--draft", drafting, "--spec", "auto"]
+            if drafting == "auto" and df2_pack is not None:
+                args += ["--draft-model", str(df2_pack)]
+        ok(f"drafting: {drafting}")
     if vision != "none":   # the GPU encoder warms up before the engine, which then sizes itself around it
         args += ["--vision"]
     if a.vram_reserve_mib is not None:
@@ -8397,6 +8429,10 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
                            "tokenizer": str(tok_dir / "tokenizer"), "model_name": served_name(family, model),
                            "family": family,
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
+    if not on_cpu:
+        cfg["drafting"] = drafting
+        if df2_pack is not None:
+            cfg["draft_model"] = str(df2_pack)
     # for serve/autotune.py's choices (its "parallel": slots taken from the VRAM the experts leave, "replicas",
     # "split_serve"): the model's files and, of them, the experts the cache holds - a dense model has none
     cfg["model_gb"] = round(d["size"] / 1e9, 1)
@@ -8800,13 +8836,12 @@ OPTIONS = [
                      ["fr", "English, code and French"]],
             default=""),
     _option("drafting", "How the model guesses ahead (speculative decoding)",
-            "the drafter: auto = the model's MTP layer, and DFlash2 too only if its pack is already on this PC "
-            "(then the faster is chosen per request by the measured speed and the context depth; default, no "
-            "download), mtp = the MTP layer only, dflash2 = fetch the DFlash2 block drafter (~0.5 GB, "
-            "Qwen3.8-Flash-Next only) and use it, off = no drafter",
-            choices=[["auto", "Auto: the MTP layer, DFlash2 too if its pack is present (recommended, no download)"],
+            "the drafter: auto = the model's MTP layer and, where the model has one, the DFlash2 block drafter "
+            "(fetched, ~0.5-0.8 GB packed); the engine measures them and no drafter at its start and keeps the "
+            "fastest (default), mtp = the MTP layer only, dflash2 = DFlash2 only, off = no drafter",
+            choices=[["auto", "Auto: measured at each start, the fastest kept (recommended)"],
                      ["mtp", "The model's MTP layer only"],
-                     ["dflash2", "DFlash2: fetch the pack (Qwen3.8-Flash-Next only)"],
+                     ["dflash2", "DFlash2 only (Qwen3.8-Flash-Next, GLM-5.3-Flash, Qwen3.6-35B-A3B)"],
                      ["off", "Off: no speculative decoding"]],
             default="auto", when=["download"], question="How should the model guess ahead?"),
     _option("script-guard", "Other languages' characters in the answers, for every model (the thinking is left as "
@@ -9999,14 +10034,14 @@ def main() -> int:
     for line in draft_vocab_note(gpu_expert_vram(gpu), draft_vocab):   # #474: a recommendation, nothing changes
         say("  " + line)
 
-    # the DFlash2 block drafter (--drafting dflash2): a pinned download packed on this PC (tools/dflash2_fetch.py).
-    # Only an explicit dflash2 choice fetches it. auto does NOT download: the engine runs the MTP alone unless a pack
-    # is already on this PC (a previous dflash2 install), and only then loads both and learns which drafter is faster.
-    # DFlash2 measured slower than the MTP on every B70/RTX 4070 depth, so its cost is not paid by everyone.
+    # the DFlash2 block drafter: a pinned download packed on this PC (tools/dflash2_fetch.py), fetched for auto (the
+    # default) and dflash2. With auto the engine measures the MTP, DFlash2 and no drafter at its start and keeps the
+    # fastest, releasing the others (strata/spec/draft_probe.hpp): where the MTP wins (the B70 and the RTX 4070) the
+    # engine is as it is without the pack. A failed download leaves the MTP (auto measures it against no drafter).
     drafting = getattr(a, "drafting", None) or saved_drafting(CONF / f"xestrata-{tag.lower()}.json") or "auto"
     df2_dir = data / "dflash2"
     df2_pack = df2_dir / "qwen3.8-flash-next-dflash2.q4_0-selq4.pack"
-    if drafting == "dflash2":
+    if drafting in ("auto", "dflash2"):
         say("  The DFlash2 drafter (a second way to guess ahead, ~0.5 GB packed) comes from")
         say("  incoai/Qwen3.8-Flash-Next-DFlash2 (Apache-2.0); it is packed on this PC.")
         run([sys.executable, str(ROOT / "tools" / "dflash2_fetch.py"), "fetch", "--out", str(df2_dir)],
@@ -10014,7 +10049,8 @@ def main() -> int:
         have_pack = df2_pack.exists() or (df2_dir / "qwen3.8-flash-next-dflash2.q4_0.pack").exists()
         if not have_pack:   # offline or a failed check: the MTP layer continues (the install goes on)
             warn("the DFlash2 drafter is not on this PC (the download did not complete): the MTP layer continues")
-            drafting = "mtp"
+            if drafting == "dflash2":
+                drafting = "mtp"
     # the draft vocabulary subset beside the pack (when a pack is present), the choice this model's config keeps
     if df2_pack.exists() or (df2_dir / "qwen3.8-flash-next-dflash2.q4_0.pack").exists():
         src_vocab = ROOT / "data" / DRAFT_VOCABS.get(draft_vocab or "cjk", "draft_vocab.bin")
@@ -10031,7 +10067,7 @@ def main() -> int:
         fail("the model has no per_layer_token_embd tensor (is this a Qwen3.8-Flash-Next GGUF?)")
     args = ["--pack", str(pack), "--native", str(shards[0]), "--ple-gguf", str(ple),
             "--expert-profile", str(ROOT / "data" / fam.get("profile", "expert-profile.bin")), "--expert-cache", "auto",
-            "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", str(rt),
+            "--prefill", "auto", "--spec", "auto", "--spec-min-p", "0.5", "--mtp", str(rt),
             "--max-context", str(ctx)]
     df2_use = df2_pack if df2_pack.exists() else df2_dir / "qwen3.8-flash-next-dflash2.q4_0.pack"
     if drafting == "off":
@@ -10040,7 +10076,7 @@ def main() -> int:
         args += ["--draft", "dflash2", "--draft-model", str(df2_use), "--spec", "6"]   # the anchor + up to 7 drafts
     elif drafting == "auto":
         args += ["--draft", "auto"]
-        if df2_use.exists():   # a pack is present (a previous dflash2 install): auto may load both and learn
+        if df2_use.exists():   # the engine measures DFlash2 against the MTP at its start and keeps the faster
             args += ["--draft-model", str(df2_use)]
     elif drafting == "mtp":
         args += ["--draft", "mtp"]
