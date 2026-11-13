@@ -6668,7 +6668,7 @@ def choices_from_config(cfg_path: Path) -> dict:
     return {"family": family, "model": model if family == CUSTOM or model in FAMILIES[family].get("models", MODELS)
             else None,
             "context": int(ctx) if (ctx := val("--max-context")) else None,
-            "kv": val("--kv") if val("--kv") in ("int8", "q4_0", "k8v4") else None,
+            "kv": val("--kv") if val("--kv") in ("int8", "q4_0", "k8v4", "tcq4", "tcq5") else None,
             "vision": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none",
             "esp": ("on" if Path(esp_path).name == ESP_VECTOR.name else esp_path) if esp_path else "off",
             "host": cfg.get("host"), "api_key": cfg.get("api_key"), "port": cfg.get("port"), "gpu": cfg.get("gpu"),
@@ -8228,11 +8228,12 @@ def replicas_config(a, cfg: dict) -> None:
 
 def plain_kv_takes(family: str) -> tuple:
     """The KV cache precisions a plain family's engine path takes (--kv), FP16 the default: the Hadamard-rotated Q4_0
-    forms for heads of 256; GLM-5.3-Flash's DSA caches in FP16 only.  A model of the user's own files: by its
-    architecture, as the family of that architecture."""
+    and trellis-coded forms for heads of 256; GLM-5.3-Flash's DSA caches in FP16 only.  A model of the user's own
+    files: by its architecture, as the family of that architecture."""
     arch = FAMILIES.get(family, {}).get("arch") if family == CUSTOM else None
     return ("fp16",) if family == "glm53" or arch in ("glm5-next", "glm5next") else \
-        ("fp16", "int8") if family == "llmjp" or arch == "qwen3moe" else ("fp16", "int8", "q4_0", "k8v4")
+        ("fp16", "int8") if family == "llmjp" or arch == "qwen3moe" else \
+        ("fp16", "int8", "q4_0", "k8v4", "tcq4", "tcq5")
 
 
 def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, found: list, gpu_chosen: bool,

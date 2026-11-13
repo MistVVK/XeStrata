@@ -203,6 +203,12 @@ void linkless_gpu_adapter() {
 // starts over, or from the conversation cache).
 namespace {
 
+// The K/V cache's format, as --kv names it
+const char* kv_name(const strata::core::PlainOptions& o) {
+    return o.kv_tcq == 4 ? "tcq4" : o.kv_tcq == 5 ? "tcq5" : o.kv_q4 == 1 ? "q4_0" : o.kv_q4 == 2 ? "k8v4"
+                                                                         : o.kv_int8 ? "int8" : "fp16";
+}
+
 // The conversation cache (--conversation-cache-mib, sized from the free RAM by default as Qwen3.8-Flash-Next's, #3493):
 // conversations set aside
 // in RAM, each its tokens and the state they left (PlainModel::save_state), so a client that comes back to one reads
@@ -891,7 +897,8 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     if (folder.on()) {
         folder.id = "engine=" STRATA_VERSION "\n" + model_id + "\nmodel=" +
                     strata::core::conversation_file_identity(opt.gguf) + "\nkv_int8=" +
-                    std::to_string((int) opt.kv_int8) + " kv_q4=" + std::to_string(opt.kv_q4) + " kv_ram=" +
+                    std::to_string((int) model.options().kv_int8) + " kv_q4=" + std::to_string(model.options().kv_q4) +
+                    " kv_tcq=" + std::to_string(model.options().kv_tcq) + " kv_ram=" +
                     std::to_string((int) opt.kv_ram) + " kv_page=" + std::to_string((long long) model.attn_shapes().page_size) +
                     " cvec=" + std::to_string((unsigned long long) cvecs.digest) +
                     " split=";
@@ -960,7 +967,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             strata::program::InfoLine()
                 .add("logit_bias", 1)
                 .add("context", (long long) ctx)
-                .add("kv", opt.kv_q4 == 1 ? "q4_0" : opt.kv_q4 == 2 ? "k8v4" : opt.kv_int8 ? "int8" : "fp16")
+                .add("kv", kv_name(model.options()))
                 .add("expert_slots", (long long) model.slots())
                 .add("expert_cache_mib", (long long) (model.tier_bytes() >> 20))
                 .add("spec", drafting_off ? 1 : dr.loaded && !model.drafts() ? dr.window : model.drafts() + 1)
@@ -2372,6 +2379,9 @@ static void plain_usage(const std::string& arch) {
                  "  --pcie-frac F        that share of the missed experts over PCIe, not the measured split (0 .. 1)\n"
                  "  --kv fp16|int8       the attention layers' K/V cache: FP16 (the default) or int8 codes with a scale\n"
                  "                       per 64 values (half the VRAM; the answers differ slightly; not GLM-5.3-Flash)\n"
+                 "  --kv q4_0|k8v4|tcq4|tcq5  heads of 256: K and V rotated, Q4_0 (144 B a head's row), INT8 K with\n"
+                 "                       Q4_0 V, or trellis-coded at 4 or 5 bits a value (132 or 164 B: less error\n"
+                 "                       than Q4_0's)\n"
                  "  --prefill-cpu-share S  the CPU pool's share of the prompt's experts the VRAM tier misses (0-1;\n"
                  "                       auto = from the times measured at load, the default; 0: all on the GPU)\n"
                  "  --prompt-chunk N     the prompt's most tokens a chunk through the batched products (default:\n"
@@ -2746,13 +2756,14 @@ int plain_main(int argc, char** argv) {
         else if (a == "--kv") {   // as Qwen3.8-Flash-Next's (q4 is q4_0); the rotated ones for heads of 256
             std::string v = next("--kv");
             if (v == "q4") v = "q4_0";
-            if (v != "fp16" && v != "int8" && v != "q4_0" && v != "k8v4") {
-                std::fprintf(stderr, "xestrata (%s): --kv takes fp16, int8, q4_0 or k8v4, not \"%s\"\n", arch.c_str(),
-                             v.c_str());
+            if (v != "fp16" && v != "int8" && v != "q4_0" && v != "k8v4" && v != "tcq4" && v != "tcq5") {
+                std::fprintf(stderr, "xestrata (%s): --kv takes fp16, int8, q4_0, k8v4, tcq4 or tcq5, not \"%s\"\n",
+                             arch.c_str(), v.c_str());
                 return 2;
             }
             opt.kv_int8 = v == "int8";
             opt.kv_q4 = v == "q4_0" ? 1 : v == "k8v4" ? 2 : 0;
+            opt.kv_tcq = v == "tcq4" ? 4 : v == "tcq5" ? 5 : 0;
         }
         else {
             switch (option_scope(a)) {
@@ -2812,10 +2823,11 @@ int plain_main(int argc, char** argv) {
             std::fprintf(stderr, "xestrata (%s): --vision is off: the CPU's forward reads text only\n", arch.c_str());
             opt.vision = false;
         }
-        if (opt.kv_int8 || opt.kv_q4 != 0) {
+        if (opt.kv_int8 || opt.kv_q4 != 0 || opt.kv_tcq != 0) {
             std::fprintf(stderr, "xestrata (%s): --kv is FP32 on the CPU\n", arch.c_str());
             opt.kv_int8 = false;
             opt.kv_q4 = 0;
+            opt.kv_tcq = 0;
         }
         opt.kv_grow = 0;
         opt.vram_elastic = false;
