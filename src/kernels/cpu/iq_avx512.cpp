@@ -22,7 +22,10 @@
 
 #include <immintrin.h>
 
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -39,6 +42,12 @@ inline uint64_t u64(const uint8_t* p) { uint64_t v; std::memcpy(&v, p, 8); retur
 // the two decodes are timed once at the first use (iq3_gather_probe): a CPU's name does not say which it is.
 // XESTRATA_IQ_GATHER=0/1 fixes one; unset/auto measures.
 bool gather = false;
+// E-2: software prefetch distance in bytes (STRATA_IQ_PREFETCH; 0 = off): -2-3% gate/up time on IQ3_S decode
+// (the rows are read at ~30 GB/s by 6 cores, near what DDR5 with 4 KB pages gives: the pool is memory-bound)
+const int prefetch_ahead = [] {
+    const char* v = strata::env_get("IQ_PREFETCH");
+    return v ? std::atoi(v) : 2048;
+}();
 
 // lanes 0-7 -> s0, 8-15 -> s1, 16-23 -> s2, 24-31 -> s3 (int16 lanes of a maddubs result: two values each)
 inline __m512i scales4(int s0, int s1, int s2, int s3) {
@@ -154,33 +163,6 @@ template <> struct Fmt<21> {   // IQ3_S: d, qs[64], qh[8], signs[32], scales[4]
     }
 };
 
-template <> struct Fmt<23> {   // IQ4_XS: d, scales_h, scales_l[4], qs[128] - 136 B, 8 signed sub-scales
-    // The same 16-value codebook as IQ4_NL (kvalues_iq4nl), a 32-value sub-block from 16 bytes of nibbles (the low
-    // nibbles first, then the high ones).  Each of the eight 32-value sub-blocks carries its own signed 6-bit scale
-    // (a nibble of scales_l and two bits of scales_h, less 32), which folds into the int16 operand of madd_epi16 as in
-    // the AVX-2 kernel (iq_avx2.cpp's Fmt32<23>); the codebook's sign becomes the activation's mask.
-    static constexpr int bytes = 136;
-    static constexpr float K = 1.0f;
-    static inline void decode(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
-        const __m512i tab = _mm512_broadcast_i32x4(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl)));
-        const __m128i q0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 8 + 16 * (2 * j)));
-        const __m128i q1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + 8 + 16 * (2 * j + 1)));
-        const __m128i m4 = _mm_set1_epi8(0x0f);
-        const __m256i h0 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q0, 4), m4), _mm_and_si128(q0, m4));
-        const __m256i h1 = _mm256_set_m128i(_mm_and_si128(_mm_srli_epi16(q1, 4), m4), _mm_and_si128(q1, m4));
-        const __m512i idx = _mm512_inserti64x4(_mm512_castsi256_si512(h0), h1, 1);
-        const __m512i q = _mm512_permutexvar_epi8(idx, tab);
-        g = _mm512_abs_epi8(q);
-        m = _mm512_movepi8_mask(q);
-        const int H0 = 2 * j, H1 = H0 + 1;
-        const uint8_t l = b[4 + j];
-        const uint16_t h = u16(b + 2);
-        const int s0 = ((l & 15) | ((h >> (2 * H0) & 3) << 4)) - 32;
-        const int s1 = ((l >> 4) | ((h >> (2 * H1) & 3) << 4)) - 32;
-        sc = scales4(s0, s0, s1, s1);
-    }
-};
-
 // XESTRATA_IQ_GATHER=auto (unset): the two decodes, gather and scalar lookups, on 256 blocks of each IQ3 format, in
 // turn after a warm-up; the gather is taken when it is 2% faster.  The margin keeps a start from moving the choice
 // where the two are close, and the difference the gather makes is 3-5%: one instruction on some cores, microcode on
@@ -235,9 +217,6 @@ void iq3_gather_decide() {
     (void) once;
 }
 
-// prefetch_ahead: E-2's software prefetch distance in bytes (iq_prefetch_bytes, STRATA_IQ_PREFETCH; 0 = off): -2-3%
-// gate/up time on IQ3_S decode (the rows are read at ~30 GB/s by 6 cores, near what DDR5 with 4 KB pages gives: the
-// pool is memory-bound)
 template <int TY, int NT>
 inline void row_dot(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res, int prefetch_ahead) {
     __m512 accf[NT];
@@ -333,6 +312,7 @@ void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* 
 
 void iq512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
                    float* const* ff, int r0, int r1) {
+    iq3_gather_decide();
     switch (type) {
         case 16: gu_rows_nt<16>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
         case 17: gu_rows_nt<17>(nt, blob, gu_row, up_off, n, act, ff, r0, r1); break;
@@ -345,6 +325,7 @@ void iq512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, 
 
 void iq512_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                 int r0, int r1) {
+    iq3_gather_decide();
     switch (type) {
         case 16: dot_rows_nt<16>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 17: dot_rows_nt<17>(nt, w, row_bytes, n, act, out, r0, r1); break;
