@@ -12,12 +12,14 @@
 // shapes of 16, 32 and 64 rows).  The weights are random block bytes with a sane d: every bit pattern of the grid
 // indices and signs is a valid block.  Exit 77 (skipped) where the GPU runs neither form.
 //
-// The fixed-point form (iq_mmq_fx: IQ3_XXS) against the CPU's canonical rows (canon_expert.hpp, iq256_canon_rows),
-// every bit: the activations' int8 values and fp16 scales the two quantized, and each output.  The rows' 256s at
-// scales 2^-6 to 2^6, a row of zeros among them, so the rows' tops and the blocks' shifts both ways are taken.
+// The fixed-point forms (iq_mmq_fx: IQ2_XXS, IQ3_XXS, IQ3_S, and IQ4_NL's down) against the CPU's canonical rows
+// (canon_expert.hpp, iq256_canon_rows), every bit: the activations' int8 values and fp16 scales the two quantized, and
+// each output.  The rows' 256s at scales 2^-6 to 2^6, a row of zeros among them, so the rows' tops and the blocks'
+// shifts both ways are taken.
 #include "strata/kernels/cpu/canon_expert.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/iq_avx2.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
@@ -143,12 +145,11 @@ int check(ggml_type t, int64_t N, int64_t K, const std::vector<int32_t>& counts)
     return ok ? 0 : 1;
 }
 
-// The fixed-point products of IQ3_XXS (iq_mmq_fx) on canonical activations against the CPU's canonical rows, bit for
+// The fixed-point products of type t (iq_mmq_fx) on canonical activations against the CPU's canonical rows, bit for
 // bit: K a multiple of 512 (canon_layer's), the rows one at a time and eight at a time on the CPU
-int check_fx(int64_t N, int64_t K, const std::vector<int32_t>& counts) {
+int check_fx(ggml_type t, int64_t N, int64_t K, const std::vector<int32_t>& counts) {
     namespace k = strata::kernels;
     namespace cpu = strata::kernels::cpu;
-    const ggml_type t = GGML_TYPE_IQ3_XXS;
     sycl::queue& q = strata::core::Runtime::get().compute();
     const int n = (int) counts.size();
     std::vector<int32_t> bounds(1, 0);
@@ -182,7 +183,7 @@ int check_fx(int64_t N, int64_t K, const std::vector<int32_t>& counts) {
     int32_t* di = dev.upload(ids);
     uint8_t* dxq = dev.alloc<uint8_t>(xq_bytes);
     float* dy = dev.alloc<float>((size_t) (R * N));
-    k::iq_mmq_quantize(q, dx, nullptr, dxq, K, K, R, false, false, true).wait();
+    k::iq_mmq_quantize(q, dx, nullptr, dxq, K, K, R, false, false, 256).wait();
     k::iq_mmq_grouped(q, k::iq_mmq_fx((int) t), dw, w[0].size(), N, K, n, dxq, R, db, max_rows, di, dy, N).wait();
     std::vector<uint8_t> xq(xq_bytes);
     std::vector<float> y((size_t) (R * N));
@@ -235,6 +236,96 @@ int check_fx(int64_t N, int64_t K, const std::vector<int32_t>& counts) {
     std::printf("  %-8s fixed-point, K %4lld, %d experts of up to %3lld rows: activations %zu differ, outputs %zu (1 a "
                 "call) and %zu (8 a call) of %lld differ  %s\n",
                 ggml_type_name(t), (long long) K, n, (long long) max_rows, act_diff, diff1, diff8, (long long) (R * N),
+                ok ? "ok" : "*** FAIL ***");
+    return ok ? 0 : 1;
+}
+
+// The fixed-point down products of IQ4_NL (a scale for each 32 of the activations) against the CPU's canonical down
+// rows (native_down_rows on a canonical layer's blob), bit for bit: the activations' scales and each output
+int check_fx_down(int64_t N, int64_t K, const std::vector<int32_t>& counts) {
+    namespace k = strata::kernels;
+    namespace cpu = strata::kernels::cpu;
+    const ggml_type t = GGML_TYPE_IQ4_NL;
+    sycl::queue& q = strata::core::Runtime::get().compute();
+    cpu::NativeFmt f;
+    std::string err;
+    if (!cpu::native_fmt((int) GGML_TYPE_IQ3_XXS, (int) t, N, K, f, err) || !cpu::canon_layer(f)) {
+        std::printf("  %-8s fixed-point down: no canonical layer of %lld x %lld (%s)  *** FAIL ***\n",
+                    ggml_type_name(t), (long long) N, (long long) K, err.c_str());
+        return 1;
+    }
+    const int n = (int) counts.size();
+    std::vector<int32_t> bounds(1, 0);
+    int64_t max_rows = 0;
+    for (int32_t c : counts) {
+        bounds.push_back(bounds.back() + c);
+        max_rows = std::max<int64_t>(max_rows, c);
+    }
+    const int64_t R = bounds.back();
+    std::vector<std::vector<uint8_t>> w;
+    std::vector<uint8_t> all;
+    for (int e = 0; e < n; ++e) {
+        w.push_back(weights(t, N, K));
+        all.insert(all.end(), w.back().begin(), w.back().end());
+    }
+    std::vector<float> h((size_t) (R * K));
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (int64_t r = 0; r < R; ++r)
+        for (int64_t i = 0; i < K; ++i) {
+            const int g = (int) ((r + i / 32) % 5) * 3 - 6;   // each 32 at 2^-6 .. 2^6 (its scale an fp16 normal)
+            h[(size_t) (r * K + i)] = r == 3 ? 0.0f : std::ldexp(nd(rng()), g);
+        }
+    std::vector<int32_t> ids((size_t) R);
+    for (int64_t i = 0; i < R; ++i) ids[(size_t) i] = (int32_t) i;
+
+    P::Device dev;
+    const size_t xq_bytes = k::iq_mmq_act_bytes(R, K);
+    float* dh = dev.upload(h);
+    uint8_t* dw = dev.upload(all);
+    int32_t* db = dev.upload(bounds);
+    int32_t* di = dev.upload(ids);
+    uint8_t* dxq = dev.alloc<uint8_t>(xq_bytes);
+    float* dy = dev.alloc<float>((size_t) (R * N));
+    k::iq_mmq_quantize(q, dh, nullptr, dxq, K, K, R, false, false, 32).wait();
+    k::iq_mmq_grouped(q, k::iq_mmq_fx((int) t), dw, w[0].size(), N, K, n, dxq, R, db, max_rows, di, dy, N).wait();
+    std::vector<uint8_t> xq(xq_bytes);
+    std::vector<float> y((size_t) (R * N));
+    P::copy_out(xq.data(), dxq, xq_bytes);
+    P::copy_out(y.data(), dy, y.size());
+
+    struct alignas(64) HBuf { uint8_t bytes[cpu::kNativeHBytes]; };
+    std::vector<HBuf> act((size_t) R);
+    const auto* gxs = reinterpret_cast<const float*>(xq.data() + R * K);
+    size_t scale_diff = 0;
+    for (int64_t r = 0; r < R; ++r) {
+        cpu::native_quant_h(f, h.data() + r * K, act[(size_t) r].bytes);
+        const auto* ds = reinterpret_cast<const float*>(act[(size_t) r].bytes);   // canon_quant's: the scales first
+        for (int64_t b = 0; b < K / 32; ++b) scale_diff += std::memcmp(&ds[b], &gxs[r * (K / 32) + b], 4) != 0;
+    }
+    std::vector<uint8_t> blob(f.bytes, 0);
+    size_t diff = 0;
+    std::vector<float> yc((size_t) (8 * N));
+    for (int e = 0; e < n; ++e) {
+        std::memcpy(blob.data() + f.down_off, w[(size_t) e].data(), w[(size_t) e].size());
+        for (int64_t r0 = bounds[(size_t) e]; r0 < bounds[(size_t) e + 1]; r0 += 8) {
+            const int nt = (int) std::min<int64_t>(8, bounds[(size_t) e + 1] - r0);
+            const void* hq[8];
+            float* out[8];
+            for (int j = 0; j < nt; ++j) {
+                hq[j] = act[(size_t) (r0 + j)].bytes;
+                out[j] = yc.data() + (size_t) j * (size_t) N;
+            }
+            cpu::native_down_rows(f, blob.data(), hq, nt, out, 0, (int) N);
+            for (int j = 0; j < nt; ++j)
+                for (int64_t o = 0; o < N; ++o)
+                    diff += std::memcmp(&yc[(size_t) j * (size_t) N + (size_t) o], &y[(size_t) ((r0 + j) * N + o)],
+                                        4) != 0;
+        }
+    }
+    const bool ok = scale_diff == 0 && diff == 0;
+    std::printf("  %-8s fixed-point down, K %4lld, %d experts of up to %3lld rows: scales %zu differ, outputs %zu of "
+                "%lld differ  %s\n",
+                ggml_type_name(t), (long long) K, n, (long long) max_rows, scale_diff, diff, (long long) (R * N),
                 ok ? "ok" : "*** FAIL ***");
     return ok ? 0 : 1;
 }
@@ -334,7 +425,7 @@ int bench() {
                 xc = io.alloc<uint8_t>(k::iq_mmq_act_bytes(R, N));
                 float* z = io.alloc<float>((size_t) (R * N));
                 q.memset(z, 0, (size_t) (R * N) * 4).wait();
-                k::iq_mmq_quantize(q, z, nullptr, xc, N, N, R, false, false, true).wait();
+                k::iq_mmq_quantize(q, z, nullptr, xc, N, N, R, false, false, 256).wait();
             }
             float* gu = io.alloc<float>((size_t) (R * 2 * FF));
             float* dn = io.alloc<float>((size_t) (R * N));
@@ -396,7 +487,11 @@ int main(int argc, char** argv) try {
         bad += check(GGML_TYPE_IQ3_XXS, 128, 512, c);
         bad += check(GGML_TYPE_IQ2_XS, 128, 512, c);
         bad += check(GGML_TYPE_Q4_K, 128, 512, c);
-        if (strata::kernels::cpu::cpu_avx2_ok()) bad += check_fx(256, 2560, c);   // the CPU's rows are AVX2's
+        if (strata::kernels::cpu::cpu_avx2_ok()) {   // the CPU's rows are AVX2's
+            for (const ggml_type t : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S})
+                bad += check_fx(t, 256, 2560, c);
+            bad += check_fx_down(512, 640, c);
+        }
     }
     // last: the parts' buffer it reserves stays with the queue
     for (const int32_t rows : {16, 64}) {

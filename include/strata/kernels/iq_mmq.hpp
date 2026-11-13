@@ -28,7 +28,8 @@ const char* iq_mmq_path(sycl::queue& q);
 /// activations (iq_mmq_quantize's canon); the same bits as the CPU's canonical rows (canon_expert.hpp) and the decode's
 /// grouped experts, in any tile shape and on every GPU.
 inline constexpr int kIqMmqFx = 1000;
-/// The type iq_mmq_grouped takes for the fixed-point products of ggml_type (IQ3_XXS), or 0 where it has none.
+/// The type iq_mmq_grouped takes for the fixed-point products of ggml_type (the gate/up's IQ2_XXS, IQ3_XXS, IQ3_S, the
+/// down's IQ4_NL), or 0 where it has none.
 int iq_mmq_fx(int ggml_type);
 /// The ggml types whose weights these products decode (the i-quants but IQ1_S, Q2_0, Q8_0, Q5_0, Q2_K to Q6_K), and
 /// the fixed-point forms (iq_mmq_fx).
@@ -45,16 +46,17 @@ bool iq_mmq_type_sums(int ggml_type);
 bool iq_mmq_type_dup(int ggml_type);
 /// The activations: row i of xq from row ids[i] of x (row i when ids is null), `ld` floats a row of x; `sums`: their
 /// block sums too (iq_mmq_type_sums), else that part is left unwritten; `dup`: each block twice (rows of 2 cols).
-/// `canon` (the fixed-point products', iq_mmq_fx; cols a multiple of 256, no sums or dup): canon_math.hpp's int8 values
-/// with one scale a 256, its fp16 value in each of its blocks - the CPU's canonical rows' activations.
+/// `canon` (the fixed-point products', iq_mmq_fx; no sums or dup): canon_math.hpp's int8 values with one scale for each
+/// `canon` values (256: a gate/up's, cols a multiple of 256; 32: a down's), its fp16 value in each of its blocks - the
+/// CPU's canonical rows' activations; 0: MMQ's own.
 sycl::event iq_mmq_quantize(sycl::queue& q, const float* x, const int32_t* ids, void* xq, int64_t cols, int64_t ld,
-                            int64_t rows, bool sums, bool dup = false, bool canon = false);
+                            int64_t rows, bool sums, bool dup = false, int canon = 0);
 /// The rows iq_mmq_quantize(x, src, ...) writes for `tokens` x `k_used` rows, written token by token: token t's row of
 /// x is quantized once and its blocks stored at rows slot[t * k_used + k] (`slot` the inverse of `src`): the same bytes,
 /// a k_used-th of the quantizations (upstream c675f5b7, llama.cpp's quantize_scatter_mmq_q8_1).
 sycl::event iq_mmq_quantize_scatter(sycl::queue& q, const float* x, const int32_t* slot, void* xq, int64_t cols,
                                     int64_t ld, int64_t tokens, int k_used, bool sums, bool dup = false,
-                                    bool canon = false);
+                                    int canon = 0);
 
 /// n experts, one launch: expert e's weights ([w_rows, w_cols] in ggml_type's blocks) at w + e * expert_bytes, its
 /// activation rows bounds[e] .. bounds[e + 1] of xq (bounds on the device; xq holds total_rows rows), into dst rows
