@@ -21,9 +21,12 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <utility>
+#include <vector>
 
 namespace strata::kernels {
 namespace {
@@ -148,14 +151,25 @@ void df2_kv_ring(const float* kin, const float* vin, const float* gk, const int3
     });
 }
 
-// ---- attention: partials over 64-key chunks, then the combine.  One work-group (one sub-group of 32) per
-// (chunk, K/V head, 8-query group): lane = key of the 32-key tile, each lane holds 4 output dims of its 8 queries.
-void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk,
-                   const int32_t* anchor_pos, int ring_slots, int window, float* part, void* xq, float* xd,
-                   void* stream, const int64_t* tag, const int32_t* epoch_ptr) {
-    sycl::queue& qu = Q(stream);
+// ---- attention: partials over 64-key chunks, then the combine.
+// Variant 1: one work-group (one sub-group of 32) per (chunk, K/V head, 8-query group): lane = key of the 32-key
+// tile, each lane holds 4 output dims of its 8 queries.  Variant 2 (upstream dc9b2a407): one work-group of 256 per
+// (chunk, K/V head): its eight sub-groups take the 32 queries four each, so the K/V tile is read and staged once
+// for all of them; each sub-group's 4 queries are one row's four GQA heads.  Every query's dot, softmax and fold are
+// variant 1's expressions in the same order, so the partials are its own bits.  Auto times the two on the actual
+// shapes (once per device and ring/window) and keeps the faster; DF2_ATTN_256=0|1 fixes it, 2 in df2_attention_variant.
+static int g_attn_variant = 0;
+
+void df2_attention_variant(int v) { g_attn_variant = v; }
+
+namespace {
+
+sycl::event df2_attention_v1(sycl::queue& qu, const float* q, const float* kring, const float* vring, const float* kblk,
+                             const float* vblk, const int32_t* anchor_pos, int ring_slots, int window, float* part,
+                             void* xq, float* xd, const int64_t* tag, const int32_t* epoch_ptr) {
     constexpr int CK = kDf2Chunk;
-    qu.submit([&](sycl::handler& h) {
+    (void) xq; (void) xd;   // the combine quantizes the rows
+    return qu.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 2> Qs({8, HD}, h), Ks({32, HD}, h);
         sycl::local_accessor<float, 2> Ps({32, 8}, h);
         h.parallel_for(sycl::nd_range<3>({(size_t) kDf2PartChunks, (size_t) kDf2Kv, 4 * WARP}, {1, 1, WARP}),
@@ -265,8 +279,129 @@ void df2_attention(const float* q, const float* kring, const float* vring, const
             }
         });
     });
-    // the combine: one work-group of 128 per (K/V head, query), a sub-group per 32-value output block
-    qu.parallel_for(sycl::nd_range<1>((size_t) kDf2Kv * 32 * HD, HD), [=](nd_item<1> it) DF2_SG32 {
+}
+
+sycl::event df2_attention_v2(sycl::queue& qu, const float* q, const float* kring, const float* vring, const float* kblk,
+                             const float* vblk, const int32_t* anchor_pos, int ring_slots, int window, float* part,
+                             void* xq, float* xd, const int64_t* tag, const int32_t* epoch_ptr) {
+    constexpr int CK = kDf2Chunk;
+    (void) xq; (void) xd;   // the combine quantizes the rows
+    return qu.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 2> Qs({32, HD}, h), Ks({32, HD}, h);
+        sycl::local_accessor<float, 3> Ps({8, 32, 4}, h);   // per sub-group: its 4 queries' scores
+        h.parallel_for(sycl::nd_range<2>({(size_t) kDf2PartChunks, (size_t) kDf2Kv * 256}, {1, 256}),
+                       [=](nd_item<2> it) DF2_SG32 {
+            const sycl::sub_group sg = it.get_sub_group();
+            const int chunk = (int) it.get_group(0), kvh = (int) it.get_group(1);
+            const int tid = (int) it.get_local_id(1);
+            const int qg = (int) sg.get_group_linear_id();   // this sub-group's row (4 GQA heads)
+            const int lane = (int) sg.get_local_linear_id();
+            const int s = *anchor_pos;
+            const int lo = s - (window - 1) > 0 ? s - (window - 1) : 0;
+            const int nctx = s - lo;
+            const int nkeys = nctx + kDf2Rows;
+            const int k_begin = chunk * CK;
+            const int64_t ep = tag != nullptr ? ((int64_t) *epoch_ptr << 32) : 0;
+            float* const pbase = part + (((size_t) chunk * kDf2Kv + kvh) * 32 + qg * 4) * 130;
+            if (k_begin >= nkeys) {
+                for (int i = tid; i < 4 * 130; i += 256) pbase[i] = (i % 130 == 0) ? -INFINITY : 0.0f;
+                return;
+            }
+            const float scale = sycl::rsqrt((float) HD);
+            for (int i = tid; i < 32 * HD; i += 256) {   // the group's 32 queries, scaled once
+                const int ql = i / HD, d = i % HD;
+                const int row = ql >> 2, g = ql & 3;
+                Qs[ql][d] = q[((size_t) row * 32 + kvh * kDf2Gqa + g) * HD + d] * scale;
+            }
+            float m[4], l[4], O[4][4];
+#pragma unroll
+            for (int qi = 0; qi < 4; ++qi) { m[qi] = -INFINITY; l[qi] = 0.0f; }
+#pragma unroll
+            for (int qi = 0; qi < 4; ++qi)
+#pragma unroll
+                for (int j = 0; j < 4; ++j) O[qi][j] = 0.0f;
+            const int k_end = sycl::min(k_begin + CK, nkeys);
+            auto load_tile = [&](int k0, const float* ring, const float* blk) {
+                for (int i = tid; i < 32 * HD; i += 256) {
+                    const int t = i / HD, d = i % HD, k = k0 + t;
+                    float v = 0.0f;
+                    if (k < nctx) {
+                        const int64_t pos = lo + k;
+                        const int slot = (int) (pos % ring_slots);
+                        const bool ok = tag == nullptr || tag[slot] == (ep | pos);
+                        if (ok) v = ring[((size_t) kvh * ring_slots + slot) * HD + d];
+                    } else if (k < nkeys) {
+                        v = blk[((size_t) (k - nctx) * kDf2Kv + kvh) * HD + d];
+                    }
+                    Ks[t][d] = v;
+                }
+            };
+            for (int k0 = k_begin; k0 < k_end; k0 += 32) {
+                sycl::group_barrier(it.get_group());
+                load_tile(k0, kring, kblk);
+                sycl::group_barrier(it.get_group());
+                float sc[4];
+                {   // lane = key t: its dot with this sub-group's 4 queries
+                    const int t = lane, k = k0 + t;
+                    bool ctx_ok = false;
+                    if (k < nctx) {
+                        const int64_t pos = lo + k;
+                        ctx_ok = tag == nullptr || tag[(int) (pos % ring_slots)] == (ep | pos);
+                    }
+#pragma unroll
+                    for (int qi = 0; qi < 4; ++qi) {
+                        if (k >= nkeys) { sc[qi] = -INFINITY; continue; }
+                        if (k < nctx) {
+                            if (!ctx_ok || lo + k <= s + qg - window) { sc[qi] = -INFINITY; continue; }
+                        }
+                        float acc = 0.0f;
+#pragma unroll 4
+                        for (int d = 0; d < HD; ++d) acc = sycl::fma(Qs[qg * 4 + qi][d], Ks[t][d], acc);
+                        sc[qi] = acc;
+                    }
+                }
+                float corr[4];
+#pragma unroll
+                for (int qi = 0; qi < 4; ++qi) {
+                    float tmax = sc[qi];
+                    for (int o = 16; o > 0; o >>= 1) tmax = sycl::fmax(tmax, xorf(sg, tmax, o));
+                    const float mn = sycl::fmax(m[qi], tmax);
+                    corr[qi] = (m[qi] == -INFINITY) ? 0.0f : sycl::exp(m[qi] - mn);
+                    const float p = sc[qi] == -INFINITY ? 0.0f : sycl::exp(sc[qi] - mn);
+                    float psum = p;
+                    for (int o = 16; o > 0; o >>= 1) psum += xorf(sg, psum, o);
+                    l[qi] = l[qi] * corr[qi] + psum;
+                    m[qi] = mn;
+                    Ps[qg][lane][qi] = p;
+                }
+                sycl::group_barrier(it.get_group());
+                load_tile(k0, vring, vblk);
+                sycl::group_barrier(it.get_group());
+#pragma unroll
+                for (int qi = 0; qi < 4; ++qi) {
+#pragma unroll
+                    for (int j = 0; j < 4; ++j) O[qi][j] *= corr[qi];
+                    for (int t = 0; t < 32; ++t) {
+                        const float p = Ps[qg][t][qi];
+#pragma unroll
+                        for (int j = 0; j < 4; ++j) O[qi][j] = sycl::fma(p, Ks[t][lane * 4 + j], O[qi][j]);
+                    }
+                }
+            }
+            sycl::group_barrier(it.get_group());
+#pragma unroll
+            for (int qi = 0; qi < 4; ++qi) {
+                if (lane == 0) { pbase[qi * 130] = m[qi]; pbase[qi * 130 + 1] = l[qi]; }
+#pragma unroll
+                for (int j = 0; j < 4; ++j) pbase[qi * 130 + 2 + lane * 4 + j] = O[qi][j];
+            }
+        });
+    });
+}
+
+// the combine: one work-group of 128 per (K/V head, query), a sub-group per 32-value output block
+sycl::event df2_attention_combine(sycl::queue& qu, const float* part, void* xq, float* xd) {
+    return qu.parallel_for(sycl::nd_range<1>((size_t) kDf2Kv * 32 * HD, HD), [=](nd_item<1> it) DF2_SG32 {
         const sycl::sub_group sg = it.get_sub_group();
         const int a = (int) it.get_group(0);
         const int kvh = a >> 5, qi = a & 31, d = (int) it.get_local_id(0);
@@ -283,6 +418,72 @@ void df2_attention(const float* q, const float* kring, const float* vring, const
         quant_block(sg, L > 0.0f ? o / L : 0.0f, (kvh * kDf2Gqa + g) * (HD / 32) + (d >> 5), row, 32 * HD,
                     static_cast<int8_t*>(xq), xd);
     });
+}
+
+bool df2_attn_256_pays(sycl::queue& qu, const float* q, const float* kring, const float* vring, const float* kblk,
+                       const float* vblk, const int32_t* anchor_pos, int ring_slots, int window, float* part,
+                       void* xq, float* xd, const int64_t* tag, const int32_t* epoch_ptr) {
+    using Key = std::pair<int, int>;
+    static core::TimedCache<sycl::device, Key, bool> choices;
+    const Key key{ring_slots, window};
+    if (const auto cached = choices.get(qu.get_device(), key)) return *cached;
+    if (core::timing_depth != 0 || qu.ext_oneapi_get_state() == sycl::ext::oneapi::experimental::queue_state::recording)
+        return false;
+    constexpr size_t NQ = 32 * HD;   // the quantized rows: int8 values + their fp32 block scales
+    const size_t nxq = NQ, nxd = (size_t) 32 * HD / 32;
+    std::vector<int8_t> b0(nxq), b1(nxq);
+    std::vector<float> d0(nxd), d1(nxd);
+    auto trial = [&](bool two) {
+        (two ? df2_attention_v2(qu, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, xq, xd, tag, epoch_ptr)
+             : df2_attention_v1(qu, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, xq, xd, tag, epoch_ptr))
+            .wait_and_throw();
+        df2_attention_combine(qu, part, xq, xd).wait_and_throw();
+        return true;
+    };
+    trial(false);
+    qu.memcpy(b0.data(), xq, nxq).wait_and_throw();
+    qu.memcpy(d0.data(), xd, nxd * sizeof(float)).wait_and_throw();
+    trial(true);
+    qu.memcpy(b1.data(), xq, nxq).wait_and_throw();
+    qu.memcpy(d1.data(), xd, nxd * sizeof(float)).wait_and_throw();
+    const bool same = std::memcmp(b0.data(), b1.data(), nxq) == 0 && std::memcmp(d0.data(), d1.data(), nxd * sizeof(float)) == 0;
+    bool two = false;
+    if (same) {
+        static core::TimedCache<sycl::device, int, bool> warmed;
+        const bool first = warmed.put_first(qu.get_device(), 0, true, [](int) { return true; }).second;
+        const auto measured = core::timed_choice({{[&] { return trial(false); }}, {[&] { return trial(true); }}},
+                                                 [&] { qu.wait_and_throw(); }, 5, 1.05, first ? 0.5 : 0.0);
+        two = measured.pick == 1;
+        std::fprintf(stderr, "xestrata: DFlash2 attention %s (%.1f / %.1f us, %s)\n",
+                     two ? "one 256-work-item group" : "an 8-query group", measured.seconds[0] * 1e6,
+                     measured.seconds[1] * 1e6, same ? "the same bytes" : "DIFFERENT BYTES");
+    } else {
+        std::fprintf(stderr, "xestrata: DFlash2 attention keeps an 8-query group (the variants' bytes differ)\n");
+    }
+    return choices.put(qu.get_device(), key, two);
+}
+
+}  // namespace
+
+void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk,
+                   const int32_t* anchor_pos, int ring_slots, int window, float* part, void* xq, float* xd,
+                   void* stream, const int64_t* tag, const int32_t* epoch_ptr) {
+    sycl::queue& qu = Q(stream);
+    static const int env = [] {
+        const char* v = strata::env_get("DF2_ATTN_256");
+        if (v == nullptr || *v == '\0' || std::string(v) == "auto") return 0;
+        if (v[0] == '1' && v[1] == '\0') return 1;
+        if (v[0] == '0' && v[1] == '\0') return -1;
+        throw std::runtime_error("xestrata: XESTRATA_DF2_ATTN_256 must be auto, 0 or 1");
+    }();
+    const int forced = g_attn_variant != 0 ? (g_attn_variant == 2 ? 1 : -1) : env;
+    const bool two = forced == 1 ||
+                     (forced == 0 &&
+                      df2_attn_256_pays(qu, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, xq, xd,
+                                        tag, epoch_ptr));
+    (two ? df2_attention_v2(qu, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, xq, xd, tag, epoch_ptr)
+         : df2_attention_v1(qu, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, xq, xd, tag, epoch_ptr));
+    df2_attention_combine(qu, part, xq, xd);
 }
 
 // ---- the drafter's GEMM: one sub-group per output row, lane = block * 2 + half (16 values a lane).  The matrices

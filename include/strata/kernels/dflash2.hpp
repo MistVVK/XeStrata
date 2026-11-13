@@ -57,6 +57,9 @@ void df2_kv_ring(const float* kin, const float* vin, const float* gk, const int3
 void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk,
                    const int32_t* anchor_pos, int ring_slots, int window, float* part, void* xq, float* xd,
                    void* stream, const int64_t* tag = nullptr, const int32_t* epoch = nullptr);
+/// 0: XESTRATA_DF2_ATTN_256 (auto: timed on the first window), 1: the 8-query-group form, 2: the 256-work-item
+/// form (the tests run both; the engine leaves 0).
+void df2_attention_variant(int v);
 
 /// The drafter's GEMM: up to 3 tiled weight matrices that share the input, times the planar activations.  A matrix
 /// is TILED (df2_q4_tile / df2_q8_tile make it from ggml blocks): the int8 / nibble plane then the fp16 scale plane.
