@@ -235,9 +235,30 @@ constexpr int64_t GU_ELEMS = 1280ll * 2560, D_ELEMS = 2560ll * 640;
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
+// upstream 4084979c: XESTRATA_PF_ALLOC_TRACE=1 (diagnostic, no behaviour change): the free-memory figure around the
+// prompt path's allocations, against what the code asked for, to see what `bytes_needed` does not count.
+inline bool pf_alloc_trace() {
+    static const bool on = [] { const char* e = strata::env_get("PF_ALLOC_TRACE"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+inline int64_t pf_free_mib() {
+    size_t f = 0, t = 0;
+    return strata::gpu::mem_info(&f, &t) ? (int64_t) (f >> 20) : -1;
+}
+inline void pf_mark(const char* what, int64_t& last, uint64_t asked_bytes = 0) {
+    if (!pf_alloc_trace()) return;
+    const int64_t now = pf_free_mib();
+    if (now < 0) return;
+    std::fprintf(stderr, "prefill alloc trace: %-44s free %7lld MiB, dropped %7lld MiB, asked %7lld MiB\n", what,
+                 (long long) now, (long long) (last - now), (long long) (asked_bytes >> 20));
+    last = now;
+}
+
 // Either cudaMalloc (owned, freed with the object) or a bump allocation from a borrowed region; with no base and
 // no region it only counts, which is how `bytes_needed` sizes the region.
 struct Alloc {
+    uint64_t tr_asked = 0, tr_n = 0;   ///< STRATA_PF_ALLOC_TRACE: the device takes' sizes, and how far the free figure fell over them
+    int64_t tr_drop = 0;
     uint8_t* base = nullptr;
     uint64_t cap = 0, used = 0;
     uint64_t failed_bytes = 0;          ///< the take that could not be allocated; the failure message names it
@@ -253,7 +274,14 @@ struct Alloc {
             return p;
         }
         void* p = nullptr;
+        const int64_t tr0 = pf_alloc_trace() ? pf_free_mib() : 0;
         if (!strata::gpu::alloc_device(&p, bytes)) { ok = false; failed_bytes = bytes; return nullptr; }
+        if (pf_alloc_trace()) {
+            const int64_t tr1 = pf_free_mib();
+            if (tr0 >= 0 && tr1 >= 0) tr_drop += tr0 - tr1;
+            tr_asked += bytes;
+            ++tr_n;
+        }
         owned->push_back(p);
         used += bytes;
         return (T*) p;
@@ -1158,6 +1186,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         err = "prefill: geometry differs from the artifact's"; return false;
     }
     m.device = strata::core::current_device();
+    int64_t tr_last = pf_alloc_trace() ? pf_free_mib() : 0;
+    pf_mark("init: start (host sides, then the chunk's buffers)", tr_last);
     if (stage_le_ < 0) stage_le_ = g.n_layers;
     if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers || (stage_le_ < g.n_layers) != (next_ != nullptr)) {
         err = "prefill: the stage's layer range is wrong";
@@ -1276,6 +1306,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             m.owned.push_back(m.ident_table);
     }
     if (!ok) { err = "prefill: host buffers or events for a chunk of " + std::to_string(chunk) + " tokens"; return false; }
+    pf_mark("init: host buffers, PLE rows, identity table", tr_last);
     Alloc o;
     o.base = (uint8_t*) borrow;
     o.cap = borrow_bytes;
@@ -1286,6 +1317,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         uint16_t* gs2 = gemm_dequant_side() ? o.take<uint16_t>((size_t) GEMM_SCRATCH, ok) : nullptr;
         if (!ok) { err = "prefill: GEMM scratch does not fit"; return false; }
         m.gemm.init_external(stream, gs, GEMM_SCRATCH);
+        pf_mark("init: GEMM scratch + workspace (Alloc takes so far)", tr_last, o.tr_asked);
         if (std::string side_err; !m.gemm.set_dequant_side(gs2, side_err))
             std::fprintf(stderr, "prefill: XESTRATA_DEQUANT_SIDE=1 not taken (%s): the dense weights are dequantized in "
                                  "front of their products\n", side_err.c_str());
@@ -1295,6 +1327,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
               fit_failure(o);
         return false;
     }
+    pf_mark("init: carve (all buffers of the chunk)", tr_last, o.tr_asked);
+    if (pf_alloc_trace())
+        std::fprintf(stderr, "prefill alloc trace: Alloc takes: %llu device allocations, asked %lld MiB, free fell %lld MiB "
+                             "over them (bytes_needed counts %lld MiB for this chunk's own buffers; o.used %lld MiB)\n",
+                     (unsigned long long) o.tr_n, (long long) (o.tr_asked >> 20), (long long) o.tr_drop,
+                     (long long) (Prefill::bytes_needed(g, ss, chunk) >> 20), (long long) (o.used >> 20));
     return true;
 }
 
