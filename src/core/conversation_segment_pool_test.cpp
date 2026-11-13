@@ -1,5 +1,6 @@
 // The segment pool (STRATA_PARK_SEGPOOL_MIB): the arena logic behind the OS interface, tested with a fake OS that counts its calls.
 #include "strata/core/conversation_segment_pool.hpp"
+#include "strata/core/park_pool_policy.hpp"
 
 #include <chrono>
 #include <cstdio>
@@ -190,6 +191,31 @@ int main() {
             settle();
             check(pool.resident_bytes() == 100 * MiB, "after a shrink and a larger permit the pool is topped up to it");
         }
+    }
+    // upkeep only while idle (park_pool_policy.hpp): a permit gated by a "request in flight" flag populates nothing while it is set (a
+    // kick during the request is a no-op), the allocation still works from cold granules, and one kick after the request fills the pool
+    {
+        FakeOs os;
+        SegmentPool pool(os, 128 * MiB);
+        std::atomic<bool> busy{true};
+        SegmentPoolFiller filler(pool, [&](size_t step) {
+            const size_t have = pool.resident_bytes();
+            return park_pool_permit(busy.load(), 128 * MiB > have ? std::min(step, 128 * MiB - have) : size_t(0));
+        });
+        auto settle = [&] {
+            for (int i = 0; i < 5000 && filler.busy(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            check(!filler.busy(), "the filler finished its pass");
+        };
+        filler.kick();
+        settle();
+        check(pool.resident_bytes() == 0 && os.populates.load() == 0, "a kick during a request populates nothing");
+        void* p = pool.allocate(4 * MiB);
+        check(p != nullptr, "an allocation during a request is served from the cold pool (never waits for the upkeep)");
+        pool.deallocate(p, 4 * MiB);
+        busy = false;
+        filler.kick();
+        settle();
+        check(pool.resident_bytes() == 128 * MiB, "one kick after the request fills the pool");
     }
     // threads: workers allocate, write, verify and free while the filler populates and the main thread shrinks.  A 192 MiB pool, 3 workers
     // holding at most 6 MiB each (the memory cap of this test is the pool's size)

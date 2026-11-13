@@ -33,4 +33,10 @@ inline ParkPoolPlan park_pool_plan(uint64_t cache_mib, uint64_t ckpt_bytes) {
     return p;
 }
 
+/// Pool upkeep (the segment pool's background fill, the checkpoint pool's background refill) runs only while the engine is idle:
+/// page faults and madvise calls of a background thread must not overlap a request's GPU work (prompt read, decode).  A request
+/// that finds a pool short falls back to fresh memory; it never waits for the upkeep.  `engine_busy` is the serve loop's
+/// "a request is in flight" flag; the answer is how many of `wanted` bytes (or vectors) the upkeep may make now.
+inline size_t park_pool_permit(bool engine_busy, size_t wanted) { return engine_busy ? 0 : wanted; }
+
 }  // namespace strata::core
