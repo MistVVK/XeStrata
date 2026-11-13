@@ -168,6 +168,14 @@ struct Setup {
     }
 };
 
+void set_env(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
 uint64_t hash_bits(const std::vector<float>& v) {
     uint64_t h = 1469598103934665603ull;
     for (float f : v) {
@@ -223,6 +231,7 @@ void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& 
                 for (int m : sizes) total += m;
                 if (base + total > S.cap) continue;
                 S.plan_sizes(sizes, base, rng);
+                set_env("STRATA_I8_N8", "0");   // the 16-entry slices: the reference of the bit check below, whatever the class default is
                 const auto ref = S.result(false, 0x00, s);
                 const auto a = S.result(true, 0x00, s);
                 const auto b = S.result(true, 0x7F, s);
@@ -230,6 +239,12 @@ void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& 
                 ++calls;
                 bool fail = false;
                 if (hash_bits(a) != hash_bits(b) || hash_bits(a) != hash_bits(c)) { std::printf("  tm %d base %d: the bits changed between runs  FAIL\n", tm, base); fail = true; }
+                if (tm <= 4) {   // tile codes 2-4 also run as 8-entry slices (STRATA_I8_N8=1): the same terms in the same order, so the same bits
+                    set_env("STRATA_I8_N8", "1");
+                    const auto d8 = S.result(true, 0x7F, s);
+                    set_env("STRATA_I8_N8", "0");
+                    if (hash_bits(a) != hash_bits(d8)) { std::printf("  tm %d base %d: 8-entry slices (N8) changed the bits  FAIL\n", tm, base); fail = true; }
+                }
                 std::vector<char> active((size_t) S.cap, 0);
                 for (int e = S.active_lo; e < S.active_hi; ++e) active[(size_t) S.dst_h[(size_t) e]] = 1;
                 double e2 = 0, r2 = 0;
