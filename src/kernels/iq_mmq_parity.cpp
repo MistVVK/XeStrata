@@ -32,6 +32,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -570,6 +571,12 @@ int bench() {
 }  // namespace
 
 int main(int argc, char** argv) try {
+    // the fixed-point forms' checks and timings compare against the CPU's rows in the fixed-point sums (exact.hpp)
+#if defined(_WIN32)
+    _putenv_s("XESTRATA_EXACT", "1");
+#else
+    setenv("XESTRATA_EXACT", "1", 1);
+#endif
     if (argc > 1 && std::string(argv[1]) == "--bench") return bench();
     sycl::queue& q = strata::core::Runtime::get().compute();
     const bool matrix = strata::kernels::iq_mmq_usable(q), dp4a = strata::kernels::iq_mmq_dp4a_usable(q);
