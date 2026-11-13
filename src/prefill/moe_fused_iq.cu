@@ -117,7 +117,8 @@ __host__ __device__ constexpr int t75_slot(int t) {
     return t == T_IQ2_XXS ? 0 : t == T_IQ2_XS ? 1 : t == T_IQ2_S ? 2 : t == T_IQ3_XXS ? 3 : t == T_IQ3_S ? 4 : t == T_IQ4_XS ? 5 : t == T_IQ4_NL ? 6 : -1;
 }
 __host__ __device__ constexpr unsigned t75_bit(int t, bool gu) { return t75_slot(t) < 0 ? 0u : 1u << (t75_slot(t) + (gu ? 0 : 8)); }
-constexpr unsigned kT75Formats = t75_bit(T_IQ3_S, true) | t75_bit(T_IQ4_NL, false);
+constexpr unsigned kT75Formats = t75_bit(T_IQ3_S, true) | t75_bit(T_IQ4_NL, false) | t75_bit(T_IQ2_S, true) | t75_bit(T_IQ3_XXS, true) | t75_bit(T_IQ4_XS, true) |
+                                 t75_bit(T_IQ2_XXS, true) | t75_bit(T_IQ2_XS, true);
 // the trellis types: 128-value blocks (32 steps of 4 weights), two 32-value sub-blocks a 64-value stage
 __host__ __device__ constexpr bool is_tq(int t) { return t == T_TQ2_T || t == T_TQK6 || t == T_TQK7; }
 __host__ __device__ constexpr int tq_k(int t) { return t == T_TQK6 ? 6 : t == T_TQK7 ? 7 : 8; }
