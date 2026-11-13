@@ -118,6 +118,7 @@ template <int NT> STRATA_ROWS_FN void iq4nl_rows_nt(const uint8_t* row, int n, c
     const auto* wb = reinterpret_cast<const block_iq4_nl*>(row);
     int topw = canon::kFxNone;
     for (int k = 0; k < nb; ++k) topw = std::max(topw, canon::fx_exp(_cvtsh_ss(wb[k].d)));
+    topw = canon::fx_row_top(canon::fx_exp(_cvtsh_ss(wb[0].d)), topw);
     __m256i acc[NT];   // int64 x 4
     __m256i shift0[NT];   // kFxHead - the row's top, a lane each
     for (int t = 0; t < NT; ++t) {
@@ -189,7 +190,7 @@ STRATA_ROWS_FN inline __m256i q20_step_sums(const __m256i (&c)[8], const int8_t*
     return _mm256_sub_epi32(T, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qs)));
 }
 
-// The largest exponent of a Q2_0 row's d's (canon_math.hpp's top), nb blocks of 64
+// A Q2_0 row's part of its top (canon_math.hpp's fx_row_top), nb blocks of 64
 STRATA_ROWS_FN inline int q20_topw(const uint8_t* row, int nb) {
     int top = canon::kFxNone;
     for (int b = 0; b < nb; ++b) {
@@ -197,7 +198,9 @@ STRATA_ROWS_FN inline int q20_topw(const uint8_t* row, int nb) {
         std::memcpy(&h, row + 18 * (ptrdiff_t) b, 2);
         top = std::max(top, canon::fx_exp(_cvtsh_ss(h)));
     }
-    return top;
+    uint16_t h0;
+    std::memcpy(&h0, row, 2);
+    return canon::fx_row_top(canon::fx_exp(_cvtsh_ss(h0)), top);
 }
 
 // one Q2_0 row against NT tokens' activations in Q2_0's order (canon_quant's q2_planes), with a scale for each 32

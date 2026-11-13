@@ -704,13 +704,13 @@ struct Kernel {
             int t = canon::kFxNone;
             if (m0 + rr < rows)
                 for (int64_t b = 0; b < kb; b += FXG) t = sycl::max(t, canon::fx_exp(xs[(row0 + m0 + rr) * kb + b]));
-            ta[rr] = t;
+            ta[rr] = m0 + rr < rows ? canon::fx_row_top(canon::fx_exp(xs[(row0 + m0 + rr) * kb]), t) : t;
         }
         for (int nn = lid; nn < WN; nn += lanes) {
             int t = canon::kFxNone;
             const uint8_t* wr = wx + (size_t) (n0 + nn) * row_bytes;
             for (int64_t b = 0; b < nw; ++b) t = sycl::max(t, canon::fx_exp(Dec<TY>::block_d(wr, (int) b)));
-            tw[nn] = t;
+            tw[nn] = canon::fx_row_top(canon::fx_exp(Dec<TY>::block_d(wr, 0)), t);
         }
     }
     // FX: a group's integer scale from its activation scale and its d at a row and output's top
@@ -1018,12 +1018,15 @@ struct Kernel {
                 }
             for (int64_t b = 0; b < K / Dec<TY>::QK; ++b)
                 twl = sycl::max(twl, canon::fx_exp(Dec<TY>::block_d(wx, (int) b)));
+            twl = canon::fx_row_top(canon::fx_exp(Dec<TY>::block_d(wx, 0)), twl);
             for (int j = 0; j < XR; ++j) {
                 const int64_t rr = (int64_t) j * IN + lane;
                 ta_r[j] = canon::kFxNone;
-                if (rr < live)
+                if (rr < live) {
                     for (int64_t b = 0; b < kb; b += FXG)
                         ta_r[j] = sycl::max(ta_r[j], canon::fx_exp(xs[(row0 + m0 + rr) * kb + b]));
+                    ta_r[j] = canon::fx_row_top(canon::fx_exp(xs[(row0 + m0 + rr) * kb]), ta_r[j]);
+                }
             }
         }
         const int64_t b0 = ks * kspan / 32, b1 = sycl::min(K, (ks + 1) * kspan) / 32;

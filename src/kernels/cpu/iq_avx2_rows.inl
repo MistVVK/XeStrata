@@ -142,9 +142,10 @@ inline void row_dot_iq2xs_impl(const uint8_t* row, int nblocks, const block_q8_K
     if constexpr (C) {
         int topw = canon::kFxNone;
         for (int i = 0; i < nblocks; ++i) topw = std::max(topw, canon::fx_exp(h2f(u16(row + (size_t) i * 74))));
+        topw = canon::fx_row_top(canon::fx_exp(h2f(u16(row))), topw);
         for (int t = 0; t < NT; ++t) {
             for (int i = 0; i < nblocks; ++i) top[t] = std::max(top[t], canon::fx_exp(xd[t][i]));
-            top[t] += topw;
+            top[t] = canon::fx_row_top(canon::fx_exp(xd[t][0]), top[t]) + topw;
         }
     }
     for (int i = 0; i < nblocks; ++i) {
@@ -545,6 +546,7 @@ inline void row_dot_canon_fx(const uint8_t* row, int nblocks, const int8_t* cons
         const int e = canon::fx_exp(h2f(u16(row + (size_t) i * Fmt32<TY>::bytes)));
         topw = e > topw ? e : topw;
     }
+    topw = canon::fx_row_top(canon::fx_exp(h2f(u16(row))), topw);
     int64_t acc[NT];
     for (int t = 0; t < NT; ++t) acc[t] = 0;
     for (int i = 0; i < nblocks; ++i) {
@@ -590,6 +592,7 @@ void canon_rows(const uint8_t* w, size_t row_bytes, int n, const int8_t* const* 
                 xp[t][i] = canon::fx_part(xd[t][i]);
                 topa[t] = xp[t][i].e > topa[t] ? xp[t][i].e : topa[t];
             }
+            topa[t] = canon::fx_row_top(xp[t][0].e, topa[t]);
         }
         for (int r = r0; r < r1; ++r) {
             row_dot_canon_fx<TY, NT>(w + (size_t) r * row_bytes, nb, xq, xp, topa, res);

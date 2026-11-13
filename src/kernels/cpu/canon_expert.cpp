@@ -91,6 +91,8 @@ float iq2xs_row(const block_iq2_xs* w, int n, const void* a) {
         ta = std::max(ta, canon::fx_exp(xd[kbx]));
         tw = std::max(tw, canon::fx_exp(h2f(w[kbx].d)));
     }
+    ta = canon::fx_row_top(canon::fx_exp(xd[0]), ta);
+    tw = canon::fx_row_top(canon::fx_exp(h2f(w[0].d)), tw);
     int64_t s = 0;
     for (int kbx = 0; kbx < nb; ++kbx) {
         int t = 0;
@@ -124,6 +126,8 @@ float iq4nl_row(const block_iq4_nl* w, int n, const void* a) {
         ta = std::max(ta, canon::fx_exp(xd[kbx]));
         tw = std::max(tw, canon::fx_exp(h2f(w[kbx].d)));
     }
+    ta = canon::fx_row_top(canon::fx_exp(xd[0]), ta);
+    tw = canon::fx_row_top(canon::fx_exp(h2f(w[0].d)), tw);
     int64_t s = 0;
     for (int kbx = 0; kbx < nb; ++kbx) {
         int t = 0;
@@ -178,6 +182,8 @@ float q20_gu_row(const block_q2_0* w, int n, const void* a) {
     int ta = canon::kFxNone, tw = canon::kFxNone;   // canon_math.hpp's fixed-point sums: the row's top
     for (int k = 0; k < n / QK_K; ++k) ta = std::max(ta, canon::fx_exp(xd[k]));
     for (int k = 0; k < n / 64; ++k) tw = std::max(tw, canon::fx_exp(h2f(w[k].d)));
+    ta = canon::fx_row_top(canon::fx_exp(xd[0]), ta);
+    tw = canon::fx_row_top(canon::fx_exp(h2f(w[0].d)), tw);
     int64_t s = 0;
     for (int k = 0; k < n / 32; ++k) {
         const block_q2_0& b = w[k / 2];

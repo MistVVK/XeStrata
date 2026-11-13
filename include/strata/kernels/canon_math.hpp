@@ -119,9 +119,10 @@ inline int8_t q8_value(float x, float id) {
 //   y = K sum_b da_b dw_b I_b,  I_b = sum over the block's 32-value calls of (the call's integer scale) x (its dot)
 // with da_b, dw_b fp16 values (the activation's and the weights' d) and K a power of two (the format's).  Each fp16
 // value is m 2^e with an integer m below 2^11, so da_b dw_b = (ma mw) 2^(ea + ew) with ma mw below 2^22, exactly.  The
-// row's sum takes one exponent, top = (the largest ea of the activation) + (the largest ew of the row): block b's
-// product is the integer A_b = ma mw 2^(ea + ew - top + kFxHead), rounded half away from zero where the shift is to the
-// right (a block far below the row's largest), below 2^30; A_b I_b (I_b below 2^26 for the i-quants' grids and scales)
+// row's sum takes one exponent, top = (the activation's ea part) + (the row's ew part), each fx_row_top (at least the
+// largest): block b's product is the integer A_b = ma mw 2^(ea + ew - top + kFxHead), rounded half away from zero where
+// the shift is to the right (a block below the top), below 2^30; A_b I_b (I_b below 2^26 for the i-quants' grids and
+// scales)
 // is added in int64, and the sum times 2^(top - kFxHead) K is the row's value, one conversion to FP32 (nearest).
 // Every step is an integer one but that last, so the same blocks give the same bits on the CPU and every GPU, in any
 // order.
@@ -143,8 +144,16 @@ inline FxPart fx_part(float v) {
     if (ef == 0) return {0u, kFxNone, 0u};
     return {((u & 0x7FFFFFu) | 0x800000u) >> 13, (int) ef - 137, u >> 31};
 }
-/// e of an fp16 value (kFxNone for 0): a row's top is the largest of its activation's plus the largest of its weights'
+/// e of an fp16 value (kFxNone for 0): a row's top is the largest of its activation's plus its weights' (fx_row_top)
 inline int fx_exp(float v) { return fx_part(v).e; }
+
+/// The weights' (or the activation's) part of a row's top, from the exponents of its first block's d or scale (e0) and
+/// of its largest (emax): e0 + kFxRowSpan unless a block's is larger than that, then emax.  A GPU's row starts with its
+/// first blocks alone and takes emax only where a block past the span shows up (rare: a row's d's are seldom 2^8
+/// apart), instead of reading every block's d and scale before its products (that first pass cost the decode's expert
+/// rows a fifth of their time).
+constexpr int kFxRowSpan = 8;
+inline int fx_row_top(int e0, int emax) { return emax <= e0 + kFxRowSpan ? e0 + kFxRowSpan : emax; }
 
 /// A block's integer scale A for the parts of a (the activation's d) and w (the weights' d) in a row of exponent `top`:
 /// (ma mw) 2^(ea + ew - top + kFxHead), rounded half away from zero where the shift is to the right.

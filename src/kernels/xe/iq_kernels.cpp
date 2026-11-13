@@ -1064,13 +1064,22 @@ inline void seg_dot_canon(const sycl::sub_group& sg, const uint8_t* row, const b
 template<class S, class = void> struct HasFx : std::false_type {};
 template<class S> struct HasFx<S, std::void_t<decltype(S::kFxLog2)>> : std::true_type {};
 
+// The row's weights' part of its top, canon_math.hpp's fx_row_top, read whole: every block's d by the segment's lanes
+// (the rare row with a d past its first block's span, fx_first_top's redo)
 template<int TY, int LPR>
 inline int fx_row_top(const sycl::sub_group& sg, const uint8_t* row, int nb, int seg_lane) {
     using F = Fmt<TY>;
     int top = canon::kFxNone;
     for (int b = seg_lane; b < nb; b += LPR) top = sycl::max(top, canon::fx_exp(F::S::block_d(block_at<F>(row, b))));
     for (int o = LPR / 2; o > 0; o >>= 1) top = sycl::max(top, sycl::permute_group_by_xor(sg, top, o));
-    return top;
+    return nb > 0 ? canon::fx_row_top(canon::fx_exp(F::S::block_d(block_at<F>(row, 0))), top) : top;
+}
+// The same where no block's d is past its first block's span (fx_row_top's usual case): the first block's d alone.
+// Its sums then flag a block past it (its exponent above the top), and the row is done again with fx_row_top.
+template<int TY>
+inline int fx_first_top(const uint8_t* row, int nb) {
+    using F = Fmt<TY>;
+    return nb > 0 ? canon::fx_exp(F::S::block_d(block_at<F>(row, 0))) + canon::kFxRowSpan : canon::kFxNone;
 }
 // an activation of nb_all of TY's blocks; S256: its scale is one for each 256 values (each 8th q8_1 block read), else
 // one for each 32
@@ -1082,8 +1091,10 @@ inline int fx_act_top(const sycl::sub_group& sg, const block_q8_1* x, int nb_all
     for (int b = seg_lane * step; b < n32; b += LPR * step)
         top = sycl::max(top, canon::fx_exp(low_half(x[b].ds)));
     for (int o = LPR / 2; o > 0; o >>= 1) top = sycl::max(top, sycl::permute_group_by_xor(sg, top, o));
-    return top;
+    return canon::fx_row_top(canon::fx_exp(low_half(x[0].ds)), top);   // the activation's part, as the weights'
 }
+// The activation's part where no scale is past its first block's span (fx_first_top's, for the activation)
+inline int fx_act_first_top(const block_q8_1* x) { return canon::fx_exp(low_half(x[0].ds)) + canon::kFxRowSpan; }
 
 template<int TY, int LPR, int NE, class G, bool S256>
 inline void seg_dot_canon_fx(const sycl::sub_group& sg, const uint8_t* row, const block_q8_1* const (&x)[NE], int n,
@@ -1091,33 +1102,49 @@ inline void seg_dot_canon_fx(const sycl::sub_group& sg, const uint8_t* row, cons
     using F = Fmt<TY>;
     constexpr int KG = F::S::kGroup;
     static_assert(LPR % KG == 0 && (KG & (KG - 1)) == 0, "a group's calls on neighbouring lanes of one segment");
-    const int topw = fx_row_top<TY, LPR>(sg, row, nb, seg_lane);
+    int ta[NE];
+    for (int e = 0; e < NE; ++e) ta[e] = e < n ? fx_act_first_top(x[e]) : canon::kFxNone;
     int top[NE];
     int64_t s[NE];
-    for (int e = 0; e < NE; ++e) {
-        s[e] = 0;
-        top[e] = e < n ? fx_act_top<TY, LPR, S256>(sg, x[e], nb_all, seg_lane) + topw : canon::kFxNone;
-    }
-    const int total = nb_all * F::ipb, mine = nb * F::ipb;
-    for (int k0 = 0; k0 < total; k0 += LPR) {
-        const int k = k0 + seg_lane;
-        const bool on = k < mine;
-        const int kk = on ? k : 0, kbx = kk / F::ipb, iqs = F::step * (kk % F::ipb);
-        const auto wd = [&] {
-            if constexpr (std::is_void_v<G>) return F::S::load(block_at<F>(row, kbx), 0, iqs);
-            else return F::S::load(block_at<F>(row, kbx), 0, iqs, grid);
-        }();
-        const canon::FxPart wp = canon::fx_part(wd.d);
-        const uint32_t xo32 = (uint32_t) kbx * (uint32_t) (F::qk / 32);   // in 32 bits (block_at)
-        const size_t xo = xo32;
+    // the sums at the weights' top topw and the activations' ta; `over`: a block's d or scale past them (the first
+    // blocks' spans: a redo with the whole tops)
+    const auto sums = [&](int topw, bool& over) {
+        for (int e = 0; e < NE; ++e) {
+            s[e] = 0;
+            top[e] = ta[e] + topw;
+        }
+        const int total = nb_all * F::ipb, mine = nb * F::ipb;
+        for (int k0 = 0; k0 < total; k0 += LPR) {
+            const int k = k0 + seg_lane;
+            const bool on = k < mine;
+            const int kk = on ? k : 0, kbx = kk / F::ipb, iqs = F::step * (kk % F::ipb);
+            const auto wd = [&] {
+                if constexpr (std::is_void_v<G>) return F::S::load(block_at<F>(row, kbx), 0, iqs);
+                else return F::S::load(block_at<F>(row, kbx), 0, iqs, grid);
+            }();
+            const canon::FxPart wp = canon::fx_part(wd.d);
+            over = over || (on && wp.e > topw);
+            const uint32_t xo32 = (uint32_t) kbx * (uint32_t) (F::qk / 32);   // in 32 bits (block_at)
+            const size_t xo = xo32;
+            for (int e = 0; e < NE; ++e)
+                if (e < n) {   // n is the whole sub-group's: the butterflies stay uniform
+                    float c = 0.0f;
+                    int t = 0;
+                    if (on) F::S::parts(wd, x[e] + xo, iqs, c, t);
+                    for (int o = KG / 2; o > 0; o >>= 1) t += sycl::permute_group_by_xor(sg, t, o);
+                    const canon::FxPart ap = canon::fx_part(F::S::act_d(x[e] + xo, iqs));
+                    over = over || (on && ap.e > ta[e]);
+                    if (on) s[e] += (int64_t) canon::fx_scale(ap, wp, top[e]) * t;
+                }
+        }
+    };
+    bool over = false;
+    sums(fx_first_top<TY>(row, nb), over);
+    if (sycl::any_of_group(sg, over)) {   // the whole sub-group again, each row at its whole tops
         for (int e = 0; e < NE; ++e)
-            if (e < n) {   // n is the whole sub-group's: the butterflies stay uniform
-                float c = 0.0f;
-                int t = 0;
-                if (on) F::S::parts(wd, x[e] + xo, iqs, c, t);
-                for (int o = KG / 2; o > 0; o >>= 1) t += sycl::permute_group_by_xor(sg, t, o);
-                if (on) s[e] += (int64_t) canon::fx_scale(canon::fx_part(F::S::act_d(x[e] + xo, iqs)), wp, top[e]) * t;
-            }
+            if (e < n) ta[e] = fx_act_top<TY, LPR, S256>(sg, x[e], nb_all, seg_lane);
+        bool again = false;
+        sums(fx_row_top<TY, LPR>(sg, row, nb, seg_lane), again);
     }
     for (int e = 0; e < NE; ++e) {
         for (int o = LPR / 2; o >= KG; o >>= 1) s[e] += sycl::permute_group_by_xor(sg, s[e], o);
@@ -1303,49 +1330,67 @@ sycl::event launch_native_gu_pair(sycl::queue& q, size_t cap_groups, const unsig
                 wr[r] = blob + (is_up && valid ? L.up_off + (size_t) idx * L.up_row : (size_t) idx * L.gu_row);
             }
             const int e0 = grp_start[g], e1 = grp_start[g + 1];
+            // seg_dot_canon_fx's sums, each row's own top: its first block's (fx_first_top) until a block past it shows
+            // up in the first pass over the entries, then the whole (fx_row_top) from that pass on
             [[maybe_unused]] int topw[2] = {canon::kFxNone, canon::kFxNone};
-            if constexpr (HasFx<typename F::S>::value)   // seg_dot_canon_fx's sums, each row's own top
-                for (int r = 0; r < 2; ++r)
-                    topw[r] = fx_row_top<TG, LPR>(sg, wr[r], rows[r] < row_hi ? nb_all : 0, seg_lane);
+            [[maybe_unused]] bool whole = false;
+            if constexpr (HasFx<typename F::S>::value)
+                for (int r = 0; r < 2; ++r) topw[r] = fx_first_top<TG>(wr[r], rows[r] < row_hi ? nb_all : 0);
             for (int e = e0; e < e1; e += kEntriesPass) {
                 const int n = sycl::min(kEntriesPass, e1 - e);
                 const block_q8_1* xs[kEntriesPass];
                 for (int j = 0; j < kEntriesPass; ++j) xs[j] = xq + (size_t) ent_tok[j < n ? e + j : e] * xb;
                 if constexpr (HasFx<typename F::S>::value) {
-                    int top[2][kEntriesPass];
+                    int ta[kEntriesPass], top[2][kEntriesPass];
                     int64_t fs[2][kEntriesPass];
-                    for (int j = 0; j < kEntriesPass; ++j) {
-                        const int ta =
-                            j < n ? fx_act_top<TG, LPR, true>(sg, xs[j], nb_all, seg_lane) : canon::kFxNone;
-                        for (int r = 0; r < 2; ++r) {
-                            top[r][j] = ta + topw[r];
-                            fs[r][j] = 0;
-                        }
-                    }
-                    for (int k0 = 0; k0 < nb_all * F::ipb; k0 += LPR) {
-                        const int k = k0 + seg_lane;
-                        const bool active = k < nb_all * F::ipb;
-                        const int kk = active ? k : 0, kbx = kk / F::ipb, iqs = F::step * (kk % F::ipb);
-                        const auto w0 = F::S::load(block_at<F>(wr[0], kbx), 0, iqs);
-                        const auto w1 = F::S::load(block_at<F>(wr[1], kbx), 0, iqs);
-                        const canon::FxPart p0 = canon::fx_part(w0.d), p1 = canon::fx_part(w1.d);
-                        const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32) + (uint32_t) (iqs / 2));
-                        for (int j = 0; j < n; ++j) {
-                            const block_q8_1 act = xs[j][xo];
-                            const canon::FxPart pa = canon::fx_part(F::S::act_d(&act, 0));
-                            float c0 = 0.0f, c1 = 0.0f;
-                            int t0 = 0, t1 = 0;
-                            if (active && rows[0] < row_hi) F::S::parts(w0, &act, 0, c0, t0);
-                            if (active && rows[1] < row_hi) F::S::parts(w1, &act, 0, c1, t1);
-                            for (int o = KG / 2; o > 0; o >>= 1) {
-                                t0 += sycl::permute_group_by_xor(sg, t0, o);
-                                t1 += sycl::permute_group_by_xor(sg, t1, o);
+                    for (int j = 0; j < kEntriesPass; ++j) ta[j] = j < n ? fx_act_first_top(xs[j]) : canon::kFxNone;
+                    const auto sums = [&](bool& over) {
+                        for (int j = 0; j < kEntriesPass; ++j)
+                            for (int r = 0; r < 2; ++r) {
+                                top[r][j] = ta[j] + topw[r];
+                                fs[r][j] = 0;
                             }
-                            if (active && rows[0] < row_hi)
-                                fs[0][j] += (int64_t) canon::fx_scale(pa, p0, top[0][j]) * t0;
-                            if (active && rows[1] < row_hi)
-                                fs[1][j] += (int64_t) canon::fx_scale(pa, p1, top[1][j]) * t1;
+                        for (int k0 = 0; k0 < nb_all * F::ipb; k0 += LPR) {
+                            const int k = k0 + seg_lane;
+                            const bool active = k < nb_all * F::ipb;
+                            const int kk = active ? k : 0, kbx = kk / F::ipb, iqs = F::step * (kk % F::ipb);
+                            const auto w0 = F::S::load(block_at<F>(wr[0], kbx), 0, iqs);
+                            const auto w1 = F::S::load(block_at<F>(wr[1], kbx), 0, iqs);
+                            const canon::FxPart p0 = canon::fx_part(w0.d), p1 = canon::fx_part(w1.d);
+                            over = over || (active && rows[0] < row_hi && p0.e > topw[0]) ||
+                                   (active && rows[1] < row_hi && p1.e > topw[1]);
+                            const size_t xo =
+                                (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32) + (uint32_t) (iqs / 2));
+                            for (int j = 0; j < n; ++j) {
+                                const block_q8_1 act = xs[j][xo];
+                                const canon::FxPart pa = canon::fx_part(F::S::act_d(&act, 0));
+                                over = over || (active && pa.e > ta[j]);
+                                float c0 = 0.0f, c1 = 0.0f;
+                                int t0 = 0, t1 = 0;
+                                if (active && rows[0] < row_hi) F::S::parts(w0, &act, 0, c0, t0);
+                                if (active && rows[1] < row_hi) F::S::parts(w1, &act, 0, c1, t1);
+                                for (int o = KG / 2; o > 0; o >>= 1) {
+                                    t0 += sycl::permute_group_by_xor(sg, t0, o);
+                                    t1 += sycl::permute_group_by_xor(sg, t1, o);
+                                }
+                                if (active && rows[0] < row_hi)
+                                    fs[0][j] += (int64_t) canon::fx_scale(pa, p0, top[0][j]) * t0;
+                                if (active && rows[1] < row_hi)
+                                    fs[1][j] += (int64_t) canon::fx_scale(pa, p1, top[1][j]) * t1;
+                            }
                         }
+                    };
+                    bool over = false;
+                    sums(over);
+                    if (sycl::any_of_group(sg, over)) {   // the whole tops (the rows' from here on)
+                        if (!whole)
+                            for (int r = 0; r < 2; ++r)
+                                topw[r] = fx_row_top<TG, LPR>(sg, wr[r], rows[r] < row_hi ? nb_all : 0, seg_lane);
+                        whole = true;
+                        for (int j = 0; j < kEntriesPass; ++j)
+                            if (j < n) ta[j] = fx_act_top<TG, LPR, true>(sg, xs[j], nb_all, seg_lane);
+                        bool again = false;
+                        sums(again);
                     }
                     for (int r = 0; r < 2; ++r) {
                         for (int j = 0; j < n; ++j)
