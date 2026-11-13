@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "strata/prefill/own_only_switches.hpp"
@@ -36,6 +37,51 @@ int main() {
     // no name twice
     for (size_t i = 0; i < cuda.size(); ++i)
         for (size_t j = i + 1; j < cuda.size(); ++j) CHECK(std::strcmp(cuda[i], cuda[j]) != 0);
+    // the recorder: a fake environment; a name that was there before the initialiser ran is the user's and is not recorded, the others are set and recorded in list order
+    {
+        std::vector<std::pair<std::string, std::string>> env;   // name -> value
+        const auto get = [&](const char* k) -> const char* {
+            for (const auto& kv : env)
+                if (kv.first == k) return kv.second.c_str();
+            return nullptr;
+        };
+        const auto set = [&](const char* k) { env.emplace_back(k, "1"); };
+        std::vector<std::string> rec;
+        env.emplace_back("STRATA_PF_FUSED_Q8D", "0");   // the user named one of them (their way back)
+        strata::prefill::own_only_apply_defaults(false, get, set, rec);
+        CHECK(rec.size() == cuda.size() - 1);
+        CHECK(!strata::prefill::own_only_set_by_build("STRATA_PF_FUSED_Q8D", rec));
+        CHECK(std::string(get("STRATA_PF_FUSED_Q8D")) == "0");        // kept
+        CHECK(strata::prefill::own_only_set_by_build("STRATA_PF_FUSED", rec));
+        CHECK(std::string(get("STRATA_PF_FUSED")) == "1");
+        CHECK(strata::prefill::own_only_set_by_build("STRATA_PF_FUSED_Q2N", rec));
+        // "named by the user" (what the small-card rule reads): the build's own STRATA_PF_FUSED=1 is not, the same text from the user is, "" is neither
+        CHECK(!strata::prefill::own_only_user_named("STRATA_PF_FUSED", get("STRATA_PF_FUSED"), rec));
+        CHECK(strata::prefill::own_only_user_named("STRATA_PF_FUSED_Q8D", get("STRATA_PF_FUSED_Q8D"), rec));
+        CHECK(!strata::prefill::own_only_user_named("STRATA_PF_FUSED", nullptr, rec));
+        CHECK(!strata::prefill::own_only_user_named("STRATA_PF_FUSED_Q8D", "", rec));
+        // a user who set STRATA_PF_FUSED itself (either value) before the initialiser: not recorded, so still the user's
+        for (const char* v : {"1", "0"}) {
+            env.clear();
+            rec.clear();
+            env.emplace_back("STRATA_PF_FUSED", v);
+            strata::prefill::own_only_apply_defaults(false, get, set, rec);
+            CHECK(!strata::prefill::own_only_set_by_build("STRATA_PF_FUSED", rec));
+            CHECK(strata::prefill::own_only_user_named("STRATA_PF_FUSED", get("STRATA_PF_FUSED"), rec));
+            CHECK(std::string(get("STRATA_PF_FUSED")) == v);
+        }
+        // nothing set: every name of the list is the build's; the HIP list is shorter
+        env.clear();
+        rec.clear();
+        strata::prefill::own_only_apply_defaults(true, get, set, rec);
+        CHECK(rec.size() == hip.size());
+        CHECK(strata::prefill::own_only_set_by_build("STRATA_PF_FUSED", rec));
+        CHECK(!strata::prefill::own_only_set_by_build("STRATA_PF_FUSED_SM75", rec));
+        // the process-wide list is empty until the engine's initialiser (a binary that does not link prefill.cpp) runs
+        CHECK(strata::prefill::own_only_recorded().empty());
+        CHECK(!strata::prefill::own_only_user_named("STRATA_PF_FUSED", nullptr));
+        CHECK(strata::prefill::own_only_user_named("STRATA_PF_FUSED", "1"));   // no record: the user's
+    }
     if (failed) {
         std::fprintf(stderr, "own_only_switches_test: %d check(s) failed\n", failed);
         return 1;
