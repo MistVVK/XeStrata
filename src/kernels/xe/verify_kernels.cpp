@@ -271,8 +271,14 @@ void gdn_ab_run(const float* x, const WT* w_alpha, const WT* w_beta, const float
         case 8:
             e = gdn_ab_launch<kVerifyNarrowT, false>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
             break;
-        default:   // a wide window
-            e = gdn_ab_launch<kWindowMaxT, false>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+        default:   // a wide window: its first 8 rows and the rest, each by the 8-row instance (a 16-row instance's
+                   // token loop is not unrolled, and each row's arithmetic is its own either way)
+            gdn_ab_launch<kVerifyNarrowT, false>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v,
+                                                 kVerifyNarrowT);
+            e = gdn_ab_launch<kVerifyNarrowT, false>(q, x + (size_t) kVerifyNarrowT * n_embd, w_alpha, w_beta, dt, ssm_a,
+                                                     gate + (size_t) kVerifyNarrowT * h_v,
+                                                     beta + (size_t) kVerifyNarrowT * h_v, n_embd, h_v,
+                                                     n_tok - kVerifyNarrowT);
     }
     done(stream, e, "gdn_ab_multi");
 }
