@@ -792,10 +792,13 @@ bool g_q8_fuse = false;
 // is used for.  auto: what the load timed (fused_gr_time_down); 0/1 forces it (see fused_gr_down_rows).
 bool g_down_rows2 = false;
 int g_down_rows2_from = 1;
+// the timing's form (1: one row a sub-group, 2: two), or -1: the switch's setting
+int g_down_force = -1;
 }
 void fused_gr_set_q8_fuse(bool on) { g_q8_fuse = on; }
 bool fused_gr_q8_fuse() { return g_q8_fuse; }
 bool fused_gr_down_rows(int n_tok) {
+    if (g_down_force >= 0) return g_down_force != 0;
     static const core::Pick pick = core::pick_from_env("HC_DOWN_ROWS");
     if (pick == core::Pick::On) return true;
     if (pick == core::Pick::Off) return false;
@@ -858,29 +861,30 @@ void fused_gr_time_q8(const FusedGrArgs& w, int n_tok, int reps, void* stream, d
 }
 
 void fused_gr_time_down(const FusedGrArgs& w, int n_tok, int reps, void* stream, double& r1_us, double& r2_us) {
-    if (n_tok < 1 || n_tok > kFusedGrMaxT || reps < 1 || w.w_down == nullptr)
+    if (n_tok < 1 || n_tok > kFusedGrMaxT || reps < 1 || w.w_norm == nullptr || w.w_down == nullptr ||
+        w.w_up == nullptr)
         throw core::DeviceError("fused_gr_time_down: invalid arguments");
     auto& q = queue_for(stream);
-    // per token: lo, then the inject rows; then the xn scratch
-    const size_t per = (size_t) LR + HC;
+    // per token: the residual (updated in place), the previous half's output and injection, lo, rs, the inject rows and
+    // mixed; then the xn scratch
+    const size_t per = (size_t) D + N + HC + LR + HC + HC + N;
     const size_t total = per * (size_t) n_tok + (size_t) n_tok * D;
     float* buf = sycl::malloc_device<float>(total, q);
     if (buf == nullptr) throw core::DeviceError("fused_gr_time_down: no device memory for the inputs");
     q.memset(buf, 0, total * sizeof(float)).wait();
-    GrMulti m;
+    FusedGrArgs a[kFusedGrMaxT];
     for (int t = 0; t < n_tok; ++t) {
         float* b = buf + per * (size_t) t;
-        m.a[t] = w;
-        m.a[t].lo = b;
-        m.a[t].inject_out = b + LR;
+        a[t] = w;
+        a[t].R = b; a[t].R_out = b; a[t].apply = true;
+        a[t].bo_prev = b + D; a[t].inj_prev = b + D + N; a[t].lo = b + D + N + HC;
+        a[t].rs = b + D + N + HC + LR; a[t].inject_out = b + D + N + HC + LR + HC;
+        a[t].mixed = b + D + N + HC + LR + (size_t) 2 * HC;
     }
-    m.xn = buf + per * (size_t) n_tok;
-    m.T = n_tok;
+    float* xn = buf + per * (size_t) n_tok;
     auto run = [&](int rows) {
-        auto once = [&] {
-            if (rows == 2) gr_down_bf16<2>(q, m, n_tok);
-            else gr_down_bf16<1>(q, m, n_tok);
-        };
+        g_down_force = rows == 2 ? 1 : 0;   // one row a sub-group, or two
+        auto once = [&] { fused_gr_read_multi(a, n_tok, xn, stream); };
         for (int i = 0; i < 3; ++i) once();
         q.wait();
         const auto t0 = std::chrono::steady_clock::now();
@@ -888,7 +892,7 @@ void fused_gr_time_down(const FusedGrArgs& w, int n_tok, int reps, void* stream,
         q.wait();
         return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
     };
-    // both forms in turn, three times, the fastest of each (the values do not change the time: zero inputs)
+    // the read's two forms in turn, three times, the fastest of each (the values do not change the time: zero inputs)
     r1_us = r2_us = 1e30;
     for (int r = 0; r < 3; ++r) {
         if ((r & 1) == 0) {
@@ -899,6 +903,7 @@ void fused_gr_time_down(const FusedGrArgs& w, int n_tok, int reps, void* stream,
             r1_us = std::min(r1_us, run(1));
         }
     }
+    g_down_force = -1;
     sycl::free(buf, q);
 }
 

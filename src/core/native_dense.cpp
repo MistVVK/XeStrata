@@ -141,17 +141,25 @@ bool hc_q8_faster(const WeightTable& table, const std::vector<std::pair<WeightRe
     return false;
 }
 
-// XESTRATA_HC_DOWN_ROWS unset: one layer's BF16 down projection timed with one row a sub-group and with two, on one
-// token and on a window of eight; two rows are kept where the eight-token read is faster (from the first window when
-// the one-token read is faster too, else from five tokens, where upstream's row blocking paid).  Said either way.
+// XESTRATA_HC_DOWN_ROWS unset: one layer's hyper-connection read (the same work a half-layer does: norm, down, up)
+// timed with one row a sub-group in the down and with two, on one token and on a window of eight; two rows are kept
+// where the eight-token read is faster (from the first window when the one-token read is faster too, else from five
+// tokens, where upstream's row blocking paid).  The read is timed, not the down alone: upstream's down blocking was
+// faster as a kernel and slower in the engine on two of XeStrata's cards.  Said either way.
 void hc_down_rows_choose(const WeightTable& table, void* stream) {
     for (int l = 0; l < 1024; ++l) {
         const std::string layer = "blk." + std::to_string(l) + ".";
         const WeightRef* down = table.find(layer + "hc_attn_down.weight");
-        if (down == nullptr || down->data == nullptr) continue;
+        const WeightRef* up = table.find(layer + "hc_attn_up.weight");
+        const WeightRef* norm = table.find(layer + "hc_attn_norm.weight");
+        if (down == nullptr || up == nullptr || norm == nullptr || down->data == nullptr || up->data == nullptr ||
+            norm->data == nullptr)
+            continue;
         const WeightRef* inject = table.find(layer + "hc_attn_inject.weight");
         strata::kernels::FusedGrArgs w;
+        w.w_norm = static_cast<const float*>(norm->data);
         w.w_down = static_cast<const uint16_t*>(down->data);
+        w.w_up = static_cast<const uint16_t*>(up->data);
         w.w_inject = inject != nullptr ? static_cast<const uint16_t*>(inject->data) : nullptr;
         double o1 = 0, t1 = 0, o8 = 0, t8 = 0;
         try {
@@ -166,7 +174,7 @@ void hc_down_rows_choose(const WeightTable& table, void* stream) {
         // read does (the switch's threshold cannot say "two rows below five, one above")
         const bool one = t1 < 0.99 * o1, window = t8 < 0.99 * o8;
         strata::kernels::fused_gr_set_down_rows(window, one ? 1 : 5);
-        std::fprintf(stderr, "xestrata: XESTRATA_HC_DOWN_ROWS: the hyper-connection down, 1 and 8 tokens: one row a "
+        std::fprintf(stderr, "xestrata: XESTRATA_HC_DOWN_ROWS: the hyper-connection read, 1 and 8 tokens: one row a "
                              "sub-group %.1f + %.1f us, two rows %.1f + %.1f us: %s (XESTRATA_HC_DOWN_ROWS=0/1 picks "
                              "one)\n",
                      o1, o8, t1, t8,

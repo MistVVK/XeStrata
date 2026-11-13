@@ -63,9 +63,9 @@ void fused_gr_q8_rows_to_bf16(const uint8_t* q8, uint16_t* dst, int64_t ne0, int
 /// and of the Q8_0 read that writes the q8_1 itself (`q8_mixed`).
 void fused_gr_time_q8(const FusedGrArgs& w, int n_tok, int reps, void* stream, double& bf16_us, double& q8_us,
                       double& q8f_us);
-/// XESTRATA_HC_DOWN_ROWS unset: the multi-token read's down projection (`w`'s BF16 `w_down`, its `w_inject` for the
-/// inject rows) on a window of `n_tok` tokens, `reps` times after a warm-up, on zero inputs -> the mean microseconds
-/// with one row a sub-group and with two.
+/// XESTRATA_HC_DOWN_ROWS unset: one layer's hyper-connection read (`w`'s BF16 weights) on a window of `n_tok`
+/// tokens, `reps` times after a warm-up, on zero inputs -> the mean microseconds with one row a sub-group in the down
+/// and with two.  The whole read (norm, down, up) is timed, as a half-layer runs it, not the down alone.
 void fused_gr_time_down(const FusedGrArgs& w, int n_tok, int reps, void* stream, double& r1_us, double& r2_us);
 /// The multi-token read's down projection with two rows a sub-group for a window of `n_tok` tokens: the same dots in
 /// the same order as one row (`XESTRATA_HC_DOWN_ROWS=1`/`0` forces it; auto is what the load timed, `from_tok` the
