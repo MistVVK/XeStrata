@@ -61,12 +61,27 @@ public:
     struct SharedHead { const uint8_t* rows = nullptr; const int32_t* vocab_dev = nullptr; int64_t n = 0; int type = -1; };
     void share_head(const SharedHead& s) { shared_ = s; }
     bool head_shared() const { return dhead_shared_; }
-    /// The plain engine's / a test's embedding and head: raw callbacks (the head runs over the planar q8_1 rows this
-    /// drafter quantizes, `head_rows` rows of the native form, or the gathered subset).
+    /// A test's embedding and head: raw callbacks (the head runs over the q8_1 rows this drafter quantizes - `xq`,
+    /// or the same rows in fp32, `xf`, for a head of bf16 rows - `head_rows` rows of the native form, or the gathered
+    /// subset).
     using EmbedFn = std::function<bool(const int32_t* tokens_dev, int n, float* out, void* stream, std::string& err)>;
-    using HeadFn = std::function<void(const uint8_t* rows, const uint8_t* xq, int n, float* y, void* stream)>;
+    using HeadFn = std::function<void(const uint8_t* rows, const uint8_t* xq, const float* xf, int n, float* y,
+                                      void* stream)>;
     bool bind_raw(EmbedFn embed, HeadFn head, int head_type, int64_t head_rows, const std::vector<int32_t>& vocab,
                   std::string& err);
+    /// The plain engine's: its embedding is dequantized on the host a token at a time (the table stays in the model's
+    /// mapping), so the drafter asks for two rows only - the mask token's once here, the anchor's as it stages a
+    /// round - and the round's graph copies them into the block.  `head_rows` rows of the head, `vocab_dev` (null:
+    /// the whole head) the token of each row, the engine's (it keeps owning it).
+    using HostEmbedFn = std::function<bool(int32_t token, float* row)>;
+    bool bind_host(HostEmbedFn embed, HeadFn head, int64_t head_rows, const int32_t* vocab_dev, std::string& err);
+    /// Everything this drafter holds on the GPU and in RAM given back (the pack, the work buffers and the rings, the
+    /// draft head and logits it owns, the ring log and its stash, the stream and the graphs): the engine's startup
+    /// measurement drops the drafter that lost.  It is unloaded after this (load again to use it).
+    void release();
+    bool loaded() const { return blob_ != nullptr; }
+    /// The host memory the drafter holds (the staging and the ring log with its stash).
+    uint64_t ram_bytes() const;
 
     /// A new request: the ring is empty again.
     void reset();
@@ -122,6 +137,7 @@ public:
     /// rows and the draft logits.  The expert cache is sized before bind(), so it reserves this.
     uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab, const std::string& vocab_file) const;
     int64_t n_draft_vocab() const { return n_dvocab_; }
+    int64_t vocab() const { return vocab_; }
     int n_embd() const { return N_; }
     int mask_token() const { return mask_token_; }
     const std::vector<int>& tap_layers() const { return taps_; }
@@ -145,10 +161,12 @@ private:
     bool record_kv(int n, const uint8_t* xq, const float* xd, const int32_t* pos, std::string& err);
     bool record_block(std::string& err);
     bool capture(int n, const float* taps, std::string& err);
+    /// The block's 8 input rows into h_: the target's embedding of the anchor and the 7 mask tokens
+    bool embed_rows(std::string& err);
     bool alloc(std::string& err);
-    /// The host's staging of one launch: positions and rope tables (rows 0..7 context, 8..15 block), the anchor,
-    /// then ONE copy to the device.
-    void stage(int n_ctx, int64_t pos0, int64_t block_s, int32_t anchor);
+    /// The host's staging of one launch: positions and rope tables (rows 0..7 context, 8..15 block), the anchor (and
+    /// with bind_host its embedding row, when `block`: a round, not a context update alone), then ONE copy to the device.
+    void stage(int n_ctx, int64_t pos0, int64_t block_s, int32_t anchor, bool block = true);
 
     int device_ = -1;
     strata::gpu::Stream cs_ = nullptr;
@@ -158,6 +176,7 @@ private:
     uint64_t vram_ = 0;
     int N_ = 2560, L_ = 5, NH_ = 32, NKV_ = 8, HD_ = 128, I_ = 7680, window_ = 2048, group_ = 16, rank_ = 256,
         mask_token_ = 0;
+    int in_max_ = 12800;            ///< the widest product input (the taps' fc, the FFN's down, the attention's o)
     float theta_ = 10000.0f, eps_ = 1e-6f;
     std::vector<int> taps_;
     int64_t vocab_ = 0;
@@ -165,6 +184,7 @@ private:
 
     // target pieces
     EmbedFn embed_;
+    HostEmbedFn host_embed_;        ///< bind_host: the anchor's row staged with the round (h_meta_), the mask's in emb_mask_
     HeadFn head_fn_;
     const uint8_t* head_w_ = nullptr;
     int head_type_ = -1;
@@ -178,7 +198,9 @@ private:
     // device buffers (the slab)
     int32_t* d_meta_ = nullptr;     ///< ints [0..7] context positions, [8..15] block positions, [16] anchor token,
                                     ///< [17] anchor position, [18] epoch, [24..31] block tokens; then 16 rope tables of 128 floats
-    int32_t* h_meta_ = nullptr;     ///< host staging of d_meta_ (host USM)
+    int32_t* h_meta_ = nullptr;     ///< host staging of d_meta_ (host USM); then, with bind_host, the anchor's row
+    float* emb_mask_ = nullptr;     ///< bind_host: the mask token's embedding row
+    bool vocab_borrowed_ = false;   ///< bind_host's vocab_dev: the engine's, not freed here
     float* rt_ctx_ = nullptr;       ///< d_meta_ + 32 (as floats); rt_blk_ = rt_ctx_ + 8 * 128
     float* rt_blk_ = nullptr;
     int32_t* d_out_ = nullptr;      ///< the select kernel's 7 picks, then 9 pad, then 7 probabilities
@@ -208,6 +230,7 @@ private:
     static constexpr int kLogChunk = 256;   ///< positions per log chunk (allocated on first use)
     struct LogChunk { std::vector<int8_t> q; std::vector<float> d; std::vector<uint8_t> ok; };
     struct Lineage {
+        size_t wq = 2560;                                 ///< a logged row's int8 codes (the drafter's hidden; wq / 32 scales)
         std::vector<int32_t> hist;                        ///< the token of every position the ring was filled for
         std::vector<std::shared_ptr<LogChunk>> chunks;    ///< the activation rows by position / 256 (copy on write)
         bool logged(int64_t pos) const;
