@@ -89,7 +89,8 @@ class Fallback(unittest.TestCase):
         self.assertFalse(v.stopped)
         self.assertIsNone(v.proc.poll(), "the processor's reader runs")
         self.assertIn("ERR cannot load the vision encoder", v.fallback_why)
-        self.assertIsNone(v.cpu_note)                   # not a full card: no figures for the person
+        self.assertIn("the picture reader could not start", v.cpu_note)     # not a full card: the log names the why
+        self.assertIn("the engine's log", v.cpu_note)
         v.close()
 
     def test_a_full_card_says_so_in_the_persons_words(self):

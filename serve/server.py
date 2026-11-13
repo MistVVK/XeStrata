@@ -2928,7 +2928,11 @@ class Vision:
             if self.fallback is None or self.spawn == self.fallback:
                 raise
             why = " ".join(str(e).split())[:240]
-            self.cpu_note = self._no_room_note(e.room) if isinstance(e, VisionNoRoom) else None
+            # the person is told the pictures became slow, whatever the cause: the card's size or the reader's own
+            # reason, in the engine's log (the reader's stderr)
+            self.cpu_note = (self._no_room_note(e.room) if isinstance(e, VisionNoRoom) else
+                             reader_room.not_started_on_processor(self._spawn_arg("--gpu-pci"),
+                                                                  getattr(self.spawn[1], "name", None)))
             self.fallback_why = why
             again = " until it is idle" if self.elastic else ""
             print(f"[xestrata] the GPU picture reader did not start ({why}); pictures are read on the CPU{again}",
@@ -2937,14 +2941,17 @@ class Vision:
             self.label = self.cpu_label
             self._start_reader()
 
+    def _spawn_arg(self, name: str) -> str | None:
+        """The value this start's command line gives `name` (None when it does not name it)."""
+        args = [str(a) for a in self.spawn[0]]
+        return args[args.index(name) + 1] if name in args[:-1] else None
+
     def _no_room_note(self, room) -> str:
         """The sentence for the person when the card had no room for the reader and the processor reads instead: the
         card (by the PCI address the config names), what the reader needs (what its line says, else its mmproj's size)
         and the card's free memory now that the reader is gone."""
-        args = [str(a) for a in self.spawn[0]]
-        card = args[args.index("--gpu-pci") + 1] if "--gpu-pci" in args[:-1] else None
-        need = room.need_mib or (reader_room.weights_mib(args[args.index("--mmproj") + 1])
-                                 if "--mmproj" in args[:-1] else None)
+        card = self._spawn_arg("--gpu-pci")
+        need = room.need_mib or reader_room.weights_mib(self._spawn_arg("--mmproj"))
         try:
             from serve.telemetry import free_vram_mib
             free = free_vram_mib(card)
