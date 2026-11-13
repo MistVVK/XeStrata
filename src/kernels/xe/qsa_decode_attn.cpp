@@ -539,11 +539,11 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
     using MergeKey = std::tuple<int, int, int, int, int, int, int>;
     static core::TimedCache<sycl::device, MergeKey, bool> choices;
     const MergeKey key{n_slots, (int) n_q, (int) s.n_head, kv_mode, ids == nullptr, window, min_chunk};
-    auto merge = [&](bool prefetch) {
+    auto merge = [&](bool prefetch, size_t rows) {
         return prefetch
-            ? launch_merge<HD, G, true>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, n_q,
+            ? launch_merge<HD, G, true>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, rows,
                                         stride, steps, ids == nullptr, window, min_chunk)
-            : launch_merge<HD, G, false>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, n_q,
+            : launch_merge<HD, G, false>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, rows,
                                          stride, steps, ids == nullptr, window, min_chunk);
     };
     bool prefetch = false;
@@ -554,9 +554,10 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
         if (cached) prefetch = *cached;
         else if (n_slots >= 8 && core::timing_depth == 0 &&
                  queue.ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording) {
+            const size_t rows = std::min<size_t>(n_q, 8);
             const auto measured = core::timed_choice({
-                {[&] { for (int i = 0; i < 8; ++i) merge(false); return true; }},
-                {[&] { for (int i = 0; i < 8; ++i) merge(true); return true; }}
+                {[&] { for (int i = 0; i < 8; ++i) merge(false, rows); return true; }},
+                {[&] { for (int i = 0; i < 8; ++i) merge(true, rows); return true; }}
             }, [&] { queue.wait_and_throw(); });
             prefetch = choices.put(queue.get_device(), key, measured.pick == 1);
             std::fprintf(stderr, "xestrata: attention merge %s (%d slots, %zu queries; %.1f / %.1f us)\n",
@@ -566,7 +567,7 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
     } else if (!(mode[0] == '0' && mode[1] == '\0')) {
         throw core::DeviceError("XESTRATA_ATTN_MERGE_PREFETCH must be auto, 0 or 1");
     }
-    const auto e = merge(prefetch);
+    const auto e = merge(prefetch, n_q);
     if (!stream) core::Runtime::get().wait(e, "qsa_decode_attn");
 }
 
