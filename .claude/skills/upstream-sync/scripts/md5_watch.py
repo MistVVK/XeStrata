@@ -21,7 +21,8 @@ EXTRA: options both engines take besides.  MODELS (default "q38 ornith q36 q35 l
 KINDS (default "llm image"), IMAGE_MODELS (default "qwen-image-turbo mage-flow-turbo moss-image anima-turbo"),
 IMAGE_SIZE (default 512x512), IMAGE_STEPS (4), IMAGE_SEED (7), ROUNDS (2: a cell that answers differently from run
 to run is one the watch cannot read alone), LOGITS (1: keep the dumps, 32 MB a cell) select what runs.  EXACT=1 runs
-the Qwen3.8 cell with its answer fixed (XESTRATA_NO_BLAS=1, --spec-window min-p --spec-min-p 0, --suffix-draft 0):
+the cells with their answers fixed (XESTRATA_NO_BLAS=1 in every cell; Qwen3.8 also --spec-window min-p --spec-min-p 0
+--suffix-draft 0):
 the dense products' own/library choice and the verify windows' sizes are measured per start and move the answer's last
 bits (docs/XE.md, "Why outputs change from run to run").  --dry-run: print the commands and the image configs instead
 of running them.
@@ -124,7 +125,7 @@ def llm_cells(rows: list[dict], meta: dict) -> None:
                     continue
                 t0, rc = time.monotonic(), None
                 env = engine.env
-                if EXACT and name == "q38":
+                if EXACT:            # the plain engine's dense products choose own/library per start as well
                     env = {**env, "XESTRATA_NO_BLAS": "1"}
                 with open(answer, "wb") as f_out, open(log, "wb") as f_log:
                     f_log.write(f"# {shlex.join(cmd)}\n".encode())
