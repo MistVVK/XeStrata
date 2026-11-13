@@ -54,8 +54,6 @@ The prefill has four switches, set in the engine's environment. None of them cha
 - `XESTRATA_PLE_COPY_STREAM` (0 or 1 fixes it; with `XESTRATA_PLE_COMPACT`): those rows go up on a stream of their own instead of the compute stream. Auto takes it only when `XESTRATA_PLE_COMPACT` was taken (the same bytes and kernels, the upload moved off the compute stream).
 - `XESTRATA_DEQUANT_SIDE=1`: the dense weights' dequantization to FP16 runs on a side stream, overlapping the product before it. It takes a second scratch buffer.
 
-`XESTRATA_GDN_TC=1` (opt-in, changes the reply, upstream 8c2a84694) runs the DeltaNet recurrence of prompt chunks of 128 tokens or more as a scan over blocks of 32 tokens on the matrix engines (Intel's XMX, NVIDIA's tensor cores, RDNA3 and RDNA4's WMMA). Its products take the values split in two FP16 parts and add in FP32, so the rounding differs from the default FP32 recurrence. A GPU without matrix engines, and `XESTRATA_NO_XMX=1`, keeps the default recurrence. It takes about 60 MiB of VRAM for its scratch.
-
 An opt-in that reads the late layers of a long prompt approximately for a faster prefill (`XESTRATA_KVA=1`, it changes the answers) is in [KVA](KVA.md).
 
 ### Decode (tokens/s)

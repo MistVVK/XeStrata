@@ -183,24 +183,6 @@ struct SwigluRows {
     }
 };
 
-void swiglu_quantize(const float* gu, void* xq, int t, int64_t rows, int64_t n_ff, bool interleaved, void* stream) {
-    if (rows <= 0) return;
-    // swiglu()'s value for each element, then kernels::iq_mmq_quantize's blocks (ids null, ld n_ff): the same bytes
-    // without H's round trip through memory
-    const bool dup = kernels::iq_mmq_type_dup(t);
-    const int64_t oc = dup ? 2 * n_ff : n_ff, nb = n_ff / 32;
-    auto* x8 = static_cast<int8_t*>(xq);
-    auto* xs = reinterpret_cast<float*>(x8 + rows * oc);
-    float* xu = xs + rows * (oc / 32);
-    const SwigluRows src{gu, n_ff, kernels::expert_swiglu_limit(), interleaved};
-    if (kernels::iq_mmq_type_sums(t)) {
-        const kernels::q8act::Rows<true> out{x8, xs, xu, oc, oc / 32, dup ? 2 : 1};
-        kernels::q8act::quantize<8, kernels::q8act::Mul>(Q(stream), rows * nb, nb, src, out);
-    } else {
-        const kernels::q8act::Rows<false> out{x8, xs, xu, oc, oc / 32, dup ? 2 : 1};
-        kernels::q8act::quantize<8, kernels::q8act::Mul>(Q(stream), rows * nb, nb, src, out);
-    }
-}
 
 // The crossover a timing found (log2 of the rows), as the step of its octave a chunk is compared with: the same from
 // start to start where the timing moves it a few percent.  The crossover itself moved from start to start, little on

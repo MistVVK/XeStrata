@@ -54,8 +54,6 @@ prefill には、エンジンの環境で入れる切り替えが 4 つありま
 - `XESTRATA_PLE_COPY_STREAM`（0/1 で固定）: `XESTRATA_PLE_COMPACT` と一緒に、その行を計算のストリームでなく専用のストリームで送ります。自動では、`XESTRATA_PLE_COMPACT` が選ばれたときだけ使います（同じバイトと同じカーネルで、転送を計算のストリームから外すだけです）。
 - `XESTRATA_DEQUANT_SIDE=1`: 密な行列の重みの FP16 への展開を別のストリームで動かし、前の積と重ねます。作業領域をもう 1 つ使います。
 
-`XESTRATA_GDN_TC=1`（opt-in、答えが変わる、upstream 8c2a84694）にすると、128 トークン以上のチャンクの DeltaNet の再帰を、32 トークンの塊ごとの走査にして、行列ユニット（Intel の XMX、NVIDIA の tensor core、RDNA3・RDNA4 の WMMA）で計算します。積は FP16 の 2 つに分けた値で取り、FP32 で足すので、既定の FP32 の再帰とは丸めが変わります。行列ユニットのない GPU と `XESTRATA_NO_XMX=1` では既定の再帰のままです。作業用に約 60 MiB の VRAM を使います。
-
 長いプロンプトの後ろの層を近似で読んで prefill を速くする opt-in（`XESTRATA_KVA=1`、答えが変わる）は [KVA](KVA.ja.md) にあります。
 
 ### decode（トークン/秒）

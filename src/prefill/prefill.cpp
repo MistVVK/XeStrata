@@ -3468,21 +3468,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const auto* tabs = reinterpret_cast<const uint8_t* const*>(m.tab_dev);
                             if (mtab) { gu.wtab = tabs + j0; gu.woff = 0; }
                             m.mmq_ctx->run(gu, m.cs);
-                            // STRATA_SWIGLU_QUANT=1: swiglu and the down product's int8 rows in one kernel, the same
-                            // bytes (upstream dd97421d3).  Opt-in: 32K prompt equal on the B70 and the RTX 4070, 5%
-                            // slower on the RX 9060 XT (2026-10-28)
-                            static const bool sq = [] {
-                                const char* e = strata::env_get("SWIGLU_QUANT");
-                                return e != nullptr && e[0] == '1';
-                            }();
-                            if (sq) {
-                                pt.mark(kPfGemmD, cs);
-                                mmq::swiglu_quantize(m.GU, m.Hq, mmq_dt, nr, 640, !lay.native, m.cs);
-                            } else {
-                                mmq::swiglu(m.GU, m.H, nr, 640, !lay.native, m.cs);
-                                pt.mark(kPfGemmD, cs);
-                                mmq::quantize(m.H, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
-                            }
+                            mmq::swiglu(m.GU, m.H, nr, 640, !lay.native, m.cs);
+                            pt.mark(kPfGemmD, cs);
+                            mmq::quantize(m.H, nullptr, m.Hq, mmq_dt, 640, 640, nr, m.cs);
                             grp_rows_last = nr;
                             mmq::Product dn;
                             dn.w = mmq_direct ? ring0 + f.down_off : m.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640;

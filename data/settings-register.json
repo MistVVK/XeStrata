@@ -270,7 +270,7 @@
   },
   "CVEC_FUSE": {
    "reads": [
-    "src/prefill/prefill.cpp:3689"
+    "src/prefill/prefill.cpp:3677"
    ]
   },
   "DBG_CPU_GATE": {
@@ -287,8 +287,8 @@
   "DBG_NAN": {
    "reads": [
     "src/core/verify.cpp:1880",
-    "src/prefill/prefill.cpp:3657",
-    "src/prefill/prefill.cpp:3822"
+    "src/prefill/prefill.cpp:3645",
+    "src/prefill/prefill.cpp:3810"
    ]
   },
   "DEBUG": {
@@ -499,34 +499,27 @@
   },
   "GDN_CONVL2": {
    "reads": [
-    "src/prefill/kernels.cpp:393"
+    "src/prefill/kernels.cpp:388"
    ]
   },
   "GDN_KEYHEAD": {
    "reads": [
-    "src/prefill/kernels.cpp:742"
+    "src/prefill/kernels.cpp:737"
    ]
   },
   "GDN_PIPELINE": {
    "reads": [
-    "src/prefill/kernels.cpp:735"
+    "src/prefill/kernels.cpp:730"
    ]
   },
   "GDN_REC_LANE": {
    "reads": [
-    "src/prefill/kernels.cpp:705"
+    "src/prefill/kernels.cpp:700"
    ]
   },
   "GDN_STEP": {
    "reads": [
     "src/kernels/xe/verify_kernels.cpp:600"
-   ]
-  },
-  "GDN_TC": {
-   "reads": [
-    "serve/test_server.py:3264",
-    "serve/test_server.py:3265",
-    "src/prefill/kernels.cpp:829"
    ]
   },
   "GGUF_PY": {
@@ -749,7 +742,9 @@
   },
   "KVA": {
    "reads": [
-    "include/strata/prefill/kva.hpp:122"
+    "include/strata/prefill/kva.hpp:122",
+    "serve/test_server.py:3264",
+    "serve/test_server.py:3265"
    ]
   },
   "KVA_CAPTURE": {
@@ -865,7 +860,7 @@
   },
   "LM_PREFETCH": {
    "reads": [
-    "src/prefill/prefill.cpp:4307"
+    "src/prefill/prefill.cpp:4295"
    ]
   },
   "LOGPOS": {
@@ -1155,8 +1150,8 @@
   },
   "PF_DQ_FUSED": {
    "reads": [
-    "src/prefill/prefill.cpp:3510",
-    "src/prefill/prefill.cpp:4549"
+    "src/prefill/prefill.cpp:3498",
+    "src/prefill/prefill.cpp:4537"
    ]
   },
   "PIN_PARTS": {
@@ -1203,7 +1198,7 @@
   },
   "PLAIN_CPU_SHARE": {
    "reads": [
-    "src/prefill/plain_prompt.cpp:1143",
+    "src/prefill/plain_prompt.cpp:1136",
     "src/prefill/plain_prompt_glm5.cpp:96"
    ]
   },
@@ -1226,7 +1221,7 @@
   },
   "PLAIN_PROMPT_ATTN": {
    "reads": [
-    "src/prefill/plain_prompt.cpp:1150"
+    "src/prefill/plain_prompt.cpp:1143"
    ]
   },
   "PLAIN_RING": {
@@ -1248,7 +1243,7 @@
    "reads": [
     "src/core/verify.cpp:856",
     "src/prefill/prefill.cpp:2073",
-    "src/prefill/prefill.cpp:4252"
+    "src/prefill/prefill.cpp:4240"
    ]
   },
   "PLE_COMPACT": {
@@ -1330,14 +1325,14 @@
   },
   "PREFILL_DUMP_R": {
    "reads": [
-    "src/prefill/prefill.cpp:3769",
-    "src/prefill/prefill.cpp:4768"
+    "src/prefill/prefill.cpp:3757",
+    "src/prefill/prefill.cpp:4756"
    ]
   },
   "PREFILL_DUMP_R_ALL": {
    "reads": [
-    "src/prefill/prefill.cpp:3782",
-    "src/prefill/prefill.cpp:4025"
+    "src/prefill/prefill.cpp:3770",
+    "src/prefill/prefill.cpp:4013"
    ]
   },
   "PREFILL_FUSED": {
@@ -1374,7 +1369,7 @@
   },
   "PREFILL_LAYER_MAJOR": {
    "reads": [
-    "src/prefill/prefill.cpp:3941"
+    "src/prefill/prefill.cpp:3929"
    ]
   },
   "PREFILL_LEND_PCT": {
@@ -1384,22 +1379,22 @@
   },
   "PREFILL_LM_EVEN": {
    "reads": [
-    "src/prefill/prefill.cpp:3947"
+    "src/prefill/prefill.cpp:3935"
    ]
   },
   "PREFILL_LM_MARGIN_MIB": {
    "reads": [
-    "src/prefill/prefill.cpp:3968"
+    "src/prefill/prefill.cpp:3956"
    ]
   },
   "PREFILL_LM_R": {
    "reads": [
-    "src/prefill/prefill.cpp:3959"
+    "src/prefill/prefill.cpp:3947"
    ]
   },
   "PREFILL_LM_TOKENS": {
    "reads": [
-    "src/prefill/prefill.cpp:3952"
+    "src/prefill/prefill.cpp:3940"
    ]
   },
   "PREFILL_MMQ": {
@@ -1471,8 +1466,8 @@
   },
   "PROMPT_PROFILE": {
    "reads": [
-    "src/prefill/plain_prompt.cpp:1088",
-    "src/prefill/plain_prompt.cpp:1162",
+    "src/prefill/plain_prompt.cpp:1081",
+    "src/prefill/plain_prompt.cpp:1155",
     "src/prefill/plain_prompt_glm5.cpp:102"
    ]
   },
@@ -1833,19 +1828,13 @@
   },
   "STATE_HASH_GDN": {
    "reads": [
-    "src/prefill/prefill.cpp:3900",
+    "src/prefill/prefill.cpp:3888",
     "src/program/generate.cpp:12750"
    ]
   },
   "SUB_GROUP_32": {
    "reads": [
     "src/kernels/xe/dp4a_gemm.cpp:125"
-   ]
-  },
-  "SWIGLU_QUANT": {
-   "reads": [
-    "src/prefill/plain_prompt.cpp:769",
-    "src/prefill/prefill.cpp:3475"
    ]
   },
   "TAIL_SKIP_MAX_CACHED": {
