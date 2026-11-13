@@ -166,6 +166,12 @@ constexpr bool q36_takes(int env, const Card& c, int sm40_env, bool gate_staged,
     if (env > 0) return true;
     return takes_by_default(c, sm40_on(sm40_env), gate_staged, down_ok);
 }
+// The Qwen3.6 engine on HIP (gfx12 / RDNA4 only): a layer whose pair the kernels cover takes the fused kernels with STRATA_PF_FUSED=1, never with =0 or on another card, and unset does NOT take them:
+// a build with llama.cpp's MMQ keeps its route.  A build without MMQ has strata-q36 read an unset STRATA_PF_FUSED as 1 (q36_start_env), which is the default there; =0 is the way back (the int8
+// kernels, then the grouped ones).
+constexpr bool q36_takes_gfx12(int env, bool gfx12, bool covered) { return covered && gfx12 && env > 0; }
+// The value strata-q36 works with after its start: an unset STRATA_PF_FUSED (env -1) becomes 1 in a build without MMQ, a value the user set (0 or 1) is kept, a build with MMQ keeps what it had.
+constexpr int q36_start_env(bool mmq_built, int env) { return !mmq_built && env < 0 ? 1 : env; }
 
 // ---- Flash-Next's K-quant experts (UD-Q4_K_XL, and the other packs with a Q4_K / Q5_K gate/up and a Q5_1 or Q8_0 down: CUDA): whether the engine sets the K-quant fused kernels up on a card (dev_info in
 // src/prefill/moe_fused_iq.cu), which is what lets native_supported take those layers.  STRATA_PF_FUSED_KQ as pf_env reads it: -1 unset or empty, 1 = a value starting with '1' (on for every sm_80+

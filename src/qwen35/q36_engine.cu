@@ -26,6 +26,7 @@
 #include "strata/kernels/q36_prompt_route.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_fused.hpp"
+#include "strata/prefill/fused_tile_rule.hpp"
 #include "strata/prefill/moe_fused_q36.hpp"
 #include "strata/prefill/mmq_ids_margin.hpp"
 #include "strata/prefill/moe_mmq.hpp"
@@ -1399,7 +1400,7 @@ struct Engine {
         };
         const size_t n_state = m->layers.size() + (m->has_mtp ? 1 : 0);
         fused_on.assign(n_state, 0);
-#if !defined(__HIPCC__)
+        // (HIP: gfx12 only, STRATA_PF_FUSED=1, which this engine sets itself in a build without MMQ: fused_tile::q36_takes_gfx12)
         // Strata's fused kernels where they cover the layer's pair on this card: the default on the cards the Flash-Next engine's rule takes (sm_86-class and sm_120 cards
         // with 80+ SMs, the staged launches on 40-79 SMs: fused_tile::q36_takes, the rule of takes_by_default), STRATA_PF_FUSED=1 on every card that covers the pair,
         // STRATA_PF_FUSED=0 keeps every layer on MMQ; HIP builds, cards under 40 SMs and compute capability below 8 are as before (MMQ)
@@ -1408,7 +1409,6 @@ struct Engine {
                 const Layer& L = layer_at((int) i);
                 fused_on[i] = FQ::native_layer_ext(L.L.gu_type, L.L.d_type) ? 1 : 0;
             }
-#endif
         // the route of each layer (q36_layer_route): fused > our int8 kernels (STRATA_EXPERT_I8=1) > MMQ > our int8 kernels > the grouped kernels.  A build without MMQ reads an unset
         // STRATA_EXPERT_I8 as 1 (the standalone engine does not link prefill.cpp's start-up list, so it tells the kernel library itself).
         const bool mmq_free = !MMQ::built();
@@ -1447,7 +1447,6 @@ struct Engine {
             rbounds = dalloc_t<int32_t>((size_t) g.n_expert + 1);
             rmax = dalloc_t<int32_t>(1);
             rinv = dalloc_t<int32_t>((size_t) ne);
-#if !defined(__HIPCC__)
             if (n_fused > 0) {
                 CK(cudaMalloc(&f_scr, PF::group_bytes(ne, (int) g.n_expert)));
                 CK(cudaMalloc(&f_xq, PF::act_bytes((int64_t) T, g.n_embd)));
@@ -1455,7 +1454,6 @@ struct Engine {
                 f_slot = dalloc_t<int32_t>((size_t) ne);
                 f_src = dalloc_t<int32_t>((size_t) ne);
             }
-#endif
         }
         if (use_mmq) {
             const int64_t ne = (int64_t) T * Kp;
@@ -2158,7 +2156,6 @@ struct Engine {
             }
             const uint8_t* wbase = lhy(li) ? stream_take((int) li) : L.blobs;
             if (fz) {
-#if !defined(__HIPCC__)
                 // the layer's input to int8 once per token, the rows of each expert grouped on the device (no host wait),
                 // then per batch of experts gate/up + SwiGLU + H to int8 + down into the entries' rows (f_slot)
                 FQ::quantize_act_native(h, T, N, f_xq, st);
@@ -2172,7 +2169,6 @@ struct Engine {
                     FQ::experts_native_ext(b, ng, ne, n_ent, f_scr, f_xq, f_src, f_ha, eparts, st);
                 }
                 prow = f_slot;
-#endif
             } else if (i8l) {
                 // our int8 expert kernels: the layer's rows quantized once, the groups per expert (blobs from wbase: the streamed ring in the hybrid mode), gate/up + SwiGLU + H to int8 and
                 // the down rows into eparts by entry (prow stays null, as the grouped kernels).  A chunk whose experts average few rows takes the grouped kernels (the few-rows route).
@@ -3959,19 +3955,21 @@ int strata::qwen35::run(int argc, char** argv) {
         if (std::getenv(v) == nullptr) _putenv_s(v, "1");
 #endif
     }
-#if !defined(__HIPCC__)
+    // (HIP: gfx12 cards take the fused kernels through the same value: fused_tile::q36_takes_gfx12; other cards keep their route)
     // A build without llama.cpp's MMQ (MMQ::built() false: strata_pf_own with mmq_absent.cpp) has no MMQ tile for any layer, so a layer takes the fused kernels or the
     // whole prompt takes the grouped kernels.  `strata` already sets STRATA_PF_FUSED=1 before main in such a build (prefill.cpp, g_own_only_defaults), which makes every
     // sm_80+ card whose kernels cover a layer's pair take them (fused_tile::q36_takes); this standalone engine does not link that code, so it does the same here: the same
     // behaviour on both entry points.  A value you set is kept (=0 keeps every layer on the grouped kernels).  A build with MMQ is unchanged.
-    if (!MMQ::built()) {
+    {
+        const int pf_now = strata::prefill::fused_tile::pf_env(std::getenv("STRATA_PF_FUSED"));
+        if (pf_now < 0 && strata::prefill::fused_tile::q36_start_env(MMQ::built(), pf_now) == 1) {
 #if !defined(_WIN32)
-        setenv("STRATA_PF_FUSED", "1", 0);
+            setenv("STRATA_PF_FUSED", "1", 1);
 #else
-        if (std::getenv("STRATA_PF_FUSED") == nullptr) _putenv_s("STRATA_PF_FUSED", "1");
+            _putenv_s("STRATA_PF_FUSED", "1");
 #endif
+        }
     }
-#endif
     if (mtp_d < 0 || mtp_d > 7) { std::fprintf(stderr, "strata-q36: --mtp takes 0 .. 7 drafts\n"); return 2; }
     if (chunk < 0 || chunk > 4096 || ctx < 256) { std::fprintf(stderr, "strata-q36: bad --chunk / --max-context\n"); return 2; }
     Model m;

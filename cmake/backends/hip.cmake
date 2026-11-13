@@ -48,6 +48,7 @@ macro(strata_hip_mmq)
     set(_strata_pf_own_sources
       src/prefill/moe_fused.cu
       src/prefill/moe_fused_iq.cu
+      src/prefill/moe_fused_iq_q36.cu   # the same kernels again for Qwen3.6's expert shape (gfx12: strata-q36's fused prompt experts)
       src/prefill/moe_f16_kq.cu
       src/prefill/moe_helpers.cu)   # the gathers, SwiGLU passes and row table (cut from moe_mmq.cu)
     if(STRATA_MMQ_KQUANTS)
@@ -104,6 +105,7 @@ macro(strata_hip_pf_own)
     set(_strata_pf_own_sources
       src/prefill/moe_fused.cu
       src/prefill/moe_fused_iq.cu
+      src/prefill/moe_fused_iq_q36.cu
       src/prefill/moe_f16_kq.cu
       src/prefill/moe_helpers.cu)
     set_source_files_properties(${_strata_pf_own_sources} PROPERTIES LANGUAGE HIP INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")

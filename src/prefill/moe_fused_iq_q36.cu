@@ -5,8 +5,7 @@
 // renamed to strata::prefill::fused_q36, so every function of the original copy keeps its code and every name here is
 // this copy's own.  The API the engine calls is declared in include/strata/prefill/moe_fused_q36.hpp.
 //
-// CUDA only for now (the HIP copies of the kernels call into moe_f16_kq.cu's namespace, which this copy would rename).
-#if !defined(__HIPCC__)
+// CUDA, and HIP on gfx12 (the native_w11_kernel launches; the gfx11 F16 kernels of moe_f16_kq.cu are not part of this copy: its f16kq namespace is a stub below).
 
 // the headers the original includes, processed once here before the rename (none declares a name `fused`)
 #include <cuda_fp16.h>
@@ -50,6 +49,17 @@ static_assert(sizeof(NativeGeom) == 2 * sizeof(int) + 4 * sizeof(size_t) && offs
               "fused_q36::NativeGeom as moe_fused_q36.hpp declares it");
 }  // namespace strata::prefill::fused_q36
 
+#if defined(__HIPCC__)
+// The gfx11 F16 K-quant kernels (moe_f16_kq.cu) are the original copy's: this copy's f16kq namespace (declared by moe_f16_kq.hpp inside the rename) has no kernels, so it covers nothing and
+// the int8 kernels run.  They are only reached under `!d.w12 && f16::requested()`, and this copy's layers are taken on gfx12 only (native_layer_ext).
+namespace strata::prefill::fused_q36::f16kq {
+bool covers(int) { return false; }
+bool covers_down(int) { return false; }
+void gate_up(const Batch&, const NativeGeom&, const int32_t*, const int2*, const int32_t*, int64_t, int, int64_t, const uint8_t*, const int32_t*, uint8_t*, cudaStream_t) {}
+void down(const Batch&, const NativeGeom&, const int32_t*, const int2*, const int32_t*, int64_t, int, int64_t, const uint8_t*, float*, cudaStream_t, bool) {}
+}  // namespace strata::prefill::fused_q36::f16kq
+#endif
+
 namespace strata::prefill::fused {
 bool requested();
 }  // namespace strata::prefill::fused
@@ -65,6 +75,7 @@ bool requested() { return strata::prefill::fused::requested(); }
 // prerequisites - STRATA_PF_FUSED, the K-quant instances set up, no NT = 256 / warp-specialized kernels) plus this file's own set-up of the two down instances,
 // then the K-quant launch of experts_native with the new down.  (pick_ww takes the staged / wide arguments as experts_native computes them: both false for the Q4_K / Q5_K gate/up of this path.)
 namespace {
+#if !defined(__HIPCC__)
 struct KqDown {
     bool ok = false;
     int occ5 = 1, occ6 = 1;   // blocks per multiprocessor of the Q5_K / Q6_K down instances
@@ -89,13 +100,20 @@ const KqDown& kqdown_info() {
     cudaGetLastError();
     return k;
 }
+#endif
 bool is_kq_down_pair(int gu_type, int d_type) {
     return (gu_type == T_Q4_K || gu_type == T_Q5_K) && (d_type == T_Q5_K || d_type == T_Q6_K);
 }
 }  // namespace
 
 bool native_supported_ext(int gu_type, int d_type) {
+#if defined(__HIPCC__)
+    // gfx12: native_w11_kernel's K-quant gate/up (native_supported(gu, Q5_1): STRATA_PF_FUSED not 0, STRATA_PF_FUSED_KQ=1 as the engine sets it, the card's kernels set up) and, for the
+    // K-quant downs, native_w11_kernel<Q5_K / Q6_K, false> (KQD256); no per-format set-up (the instances are the copy's own and the same kernel body as the gate/up's)
+    if (is_kq_down_pair(gu_type, d_type)) return native_supported(gu_type, T_Q5_1) && dev_info().w12;
+#else
     if (is_kq_down_pair(gu_type, d_type)) return native_supported(gu_type, T_Q5_1) && kqdown_info().ok;
+#endif
     return native_supported(gu_type, d_type);
 }
 
@@ -106,10 +124,50 @@ bool native_layer_ext(int gu_type, int d_type) {
     static const int sm40_env = strata::prefill::fused_tile::sm40_env_of(std::getenv("STRATA_PF_FUSED_SM40"));
     if (env == 0 || !native_supported_ext(gu_type, d_type)) return false;
     const DevInfo& d = dev_info();
+#if defined(__HIPCC__)
+    // HIP: gfx12 only, and only with STRATA_PF_FUSED=1, which strata-q36 sets itself in a build without MMQ (fused_tile::q36_start_env); a build with MMQ keeps its route unless the user sets it
+    (void) sm40_env;
+    return strata::prefill::fused_tile::q36_takes_gfx12(env, d.w12, true);
+#else
     const bool down_ok = sw_on(d_type, false) || d_type == T_IQ4_NL || d_type == T_Q2_0;
     return strata::prefill::fused_tile::q36_takes(env, {d.s120, d.s121, d.sms, d.s86}, sm40_env, sw_on(gu_type, true), down_ok, true);
+#endif
 }
 
+#if defined(__HIPCC__)
+// gfx12: the K-quant gate/up (native_w11_kernel<Q4_K / Q5_K, true>, experts_native's own launch) and the K-quant down on the same kernel (<Q5_K / Q6_K, false>: KQD256, two super-blocks a row at
+// K = 512), the plain launch (no occupancy variant: the K-quant kernels spill under the cap).  The H the first writes, with the code sums the minimum terms read, is the second's input.
+void experts_native_ext(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa, const int32_t* src, void* ha,
+                        float* dm, void* stream) {
+    if (!is_kq_down_pair(g.gu_type, g.d_type)) {
+        experts_native(b, g, n_expert, n, scratch, xa, src, ha, dm, stream);
+        return;
+    }
+    g_dm16_used = false;
+    if (b.e1 <= b.e0 || n <= 0) return;
+    const DevInfo& d = dev_info();
+    if (!d.ok || !d.w12 || !gu_covered(g.gu_type)) {
+        std::fprintf(stderr, "prefill fused experts (Qwen3.6): types %d / %d are not covered here\n", g.gu_type, g.d_type);
+        std::exit(1);
+    }
+    if ((reinterpret_cast<uintptr_t>(dm) & 15) != 0) {   // gfx12's down store: two float4 per lane
+        std::fprintf(stderr, "prefill fused experts (Qwen3.6): the down rows (%p) must be 16-byte aligned\n", (void*) dm);
+        std::exit(1);
+    }
+    const cudaStream_t s = (cudaStream_t) stream;
+    const Tables tb = tables(const_cast<void*>(scratch), n_expert);
+    const int64_t tiles = (n + kTileRows - 1) / kTileRows + (b.e1 - b.e0);
+    const unsigned g_gu = (unsigned) std::min<int64_t>(tiles * (GU_ROWS_N / NW_ROWS), (int64_t) d.sms * wgp_blocks(d.occ));
+    const unsigned g_d = (unsigned) std::min<int64_t>(tiles * (D_ROWS_N / NW_ROWS), (int64_t) d.sms * wgp_blocks(d.occ));
+    const uint8_t* xa8 = (const uint8_t*) xa;
+    uint8_t* ha8 = (uint8_t*) ha;
+    if (g.gu_type == T_Q4_K) native_w11_kernel<T_Q4_K, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr);
+    else native_w11_kernel<T_Q5_K, true><<<g_gu, NW_THREADS, 0, s>>>(b, g, tb, xa8, src, ha8, nullptr);
+    if (g.d_type == T_Q5_K) native_w11_kernel<T_Q5_K, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm);
+    else native_w11_kernel<T_Q6_K, false><<<g_d, NW_THREADS, 0, s>>>(b, g, tb, ha8, src, nullptr, dm);
+    ck(cudaGetLastError(), "experts_native_ext");
+}
+#else
 void experts_native_ext(const Batch& b, const NativeGeom& g, int n_expert, int64_t n, const void* scratch, const void* xa, const int32_t* src, void* ha,
                         float* dm, void* stream) {
     if (!is_kq_down_pair(g.gu_type, g.d_type)) {
@@ -139,6 +197,5 @@ void experts_native_ext(const Batch& b, const NativeGeom& g, int n_expert, int64
     else launch<T_Q6_K, false>(ww, k_d, b, g, tb, ha, src, nullptr, dm, s);
     ck(cudaGetLastError(), "experts_native_ext");
 }
+#endif
 }  // namespace strata::prefill::fused_q36
-
-#endif  // !__HIPCC__
