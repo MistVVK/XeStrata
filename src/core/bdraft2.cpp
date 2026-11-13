@@ -47,6 +47,7 @@ void Bdraft2Weights::release() {
     }
     allocations_.clear(); matrices_.clear(); vectors_.clear(); container_.reset();
     device_ = -1; bytes_ = 0; scratch_bytes_ = 0;
+    full_head_ = {}; head_mode_ = HeadMode::Auto; probe_shead_ = false;
 }
 
 bool Bdraft2Weights::load(const std::string& path, const std::string& head, int device, int target_hidden,
@@ -126,7 +127,8 @@ bool Bdraft2Weights::load(const std::string& path, const std::string& head, int 
                 vectors_.emplace(v->name, put(f.data(), f.size() * sizeof(float)));
             }
         }
-        if (!head_.load(head, device, m.vocab, m.hidden, m.block - 1, err)) throw std::runtime_error(err);
+        if (!head.empty() && !head_.load(head, device, m.vocab, m.hidden, m.block - 1, err))
+            throw std::runtime_error(err);
         container_ = std::move(c);
         return true;
     } catch (const std::exception& e) {
@@ -242,7 +244,18 @@ void Bdraft2Weights::select(const float* h, int rows, const int32_t* anchor, flo
     const auto* succ = static_cast<const uint16_t*>(vector("bdraft2.sel.succ"));
     strata::kernels::bf16_gemv_fp32_mmvf_multi(h, model().hidden, w, hp, model().rank, model().hidden, model().rank,
                                               rows, stream);
-    head_.top512(h, rows, ids, values, stream);
+    if (uses_shead()) {
+        if (!head_.loaded()) throw std::runtime_error("bdraft2: SHEAD was selected but not loaded");
+        head_.top512(h, rows, ids, values, stream);
+    } else {
+        const auto& full = full_head_;
+        if (!full.weights || !full.projection || !full.logits || !full.top_scratch ||
+            full.weights->cols != model().hidden || full.weights->rows_used != model().vocab)
+            throw std::runtime_error("bdraft2: the full target head and its scratch are required");
+        strata::kernels::yskn_proj(*full.weights, h, model().hidden, rows, full.logits, model().vocab,
+                                   full.projection, stream);
+        strata::kernels::df2_topk(full.logits, model().vocab, nullptr, rows, full.top_scratch, values, ids, stream);
+    }
     strata::kernels::df2_select(hp, values, ids, pred, succ, model().rank, rows, anchor, out, probabilities, stream);
 }
 
