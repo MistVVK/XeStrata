@@ -223,6 +223,8 @@ struct QsaIndexerBuffers {
 
 /// The largest context the selection's capacity is sized for: `qsa_selection_width(kTopkMaxCells, s)` ids.
 inline constexpr int64_t kTopkMaxCells = 32768;
+/// The most rows one launch of the batch-window kernels takes (a verify window's slots).
+inline constexpr int kQsaRowsMax = 8;
 
 /// Softmax GQA over ONLY the gathered cells.  `q` is (n_head, head_dim) f32, already normed and rotated.
 ///

@@ -179,10 +179,11 @@ inline float dotn(const float* k, const float* q) {
 // LOOP: a slot reads more than one chunk (n_slots below the chunks); without it every expression is the one this file
 // had before the slots.
 template <int HD, int G, int KV_MODE, bool LOOP, int NC, bool PERCELL>
-sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPools p, const int32_t* ids_all,
+sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPools pools, const int32_t* ids_all,
                          const int32_t* step_all, int n_kv_heads, int page_size, float scale, float* part_acc_all,
                          float* part_m_all, float* part_l_all, int n_slots, size_t n_q, int cap,
-                         long long scratch_stride, int window, int kv_div, int min_chunk) {
+                         long long scratch_stride, int window, int kv_div, int min_chunk,
+                         const QsaAttnPoolsRows rows) {
     static_assert(G >= 1 && G <= 16, "reduce12 sums at most 16 heads");
     static_assert(HD % 128 == 0 && HD <= 256, "a lane holds HD/32 dimensions inside one Q4_0 half");
     constexpr int THREADS = HD;           // one work-item per dimension in the value loop
@@ -202,7 +203,9 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
             const auto grp = it.get_group();
             const sycl::sub_group sg = it.get_sub_group();
             const size_t z = it.get_group(0);
-            // batched form: query z, with its own q row, selection, step and scratch
+            // batched form: query z, with its own q row, selection, step and scratch; a batch window's row reads
+            // its own slot's pools (rows.n > 0)
+            const QsaAttnPools p = rows.n > 0 ? rows.p[z] : pools;
             const float* q = q_all + z * (size_t) (n_kv_heads * G) * HD;
             const int32_t* ids = dense ? nullptr : ids_all + z * (size_t) cap;
             const int32_t* step = step_all + z * kStepCount;
@@ -490,32 +493,33 @@ template <int HD, int G, bool LOOP, bool PERCELL>
 void launch_kv_form(int kv_mode, int nc, sycl::queue& queue, const float* q, const QsaAttnPools& pools, const int32_t* ids,
                const int32_t* steps, int nkv, int ps, float scale, float* part_acc, float* part_m, float* part_l,
                int n_slots, size_t n_q, int cap, long long stride, int window, int kv_div,
-               int min_chunk) {
+               int min_chunk, const QsaAttnPoolsRows& rows) {
     if constexpr (PERCELL) {
-        if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2, true>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
-        else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2, true>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
-        else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2, true>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
-        else launch_chunk<HD, G, 0, LOOP, 2, true>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
+        if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2, true>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+        else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2, true>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+        else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2, true>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+        else launch_chunk<HD, G, 0, LOOP, 2, true>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
     } else {
-    if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2, PERCELL>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
-    else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2, PERCELL>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
-    else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2, PERCELL>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
-    else if (nc == 8) launch_chunk<HD, G, 0, LOOP, 8, PERCELL>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
-    else if (nc == 4) launch_chunk<HD, G, 0, LOOP, 4, PERCELL>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
-    else launch_chunk<HD, G, 0, LOOP, 2, PERCELL>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
+    if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2, PERCELL>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2, PERCELL>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2, PERCELL>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    else if (nc == 8) launch_chunk<HD, G, 0, LOOP, 8, PERCELL>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    else if (nc == 4) launch_chunk<HD, G, 0, LOOP, 4, PERCELL>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
+    else launch_chunk<HD, G, 0, LOOP, 2, PERCELL>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
     }
 }
 
 template <int HD, int G, bool LOOP>
 void launch_kv(int kv_mode, int nc, sycl::queue& queue, const float* q, const QsaAttnPools& pools, const int32_t* ids,
                const int32_t* steps, int nkv, int ps, float scale, float* part_acc, float* part_m, float* part_l,
-               int n_slots, size_t n_q, int cap, long long stride, int window, int kv_div, int min_chunk, bool percell) {
+               int n_slots, size_t n_q, int cap, long long stride, int window, int kv_div, int min_chunk, bool percell,
+               const QsaAttnPoolsRows& rows) {
     if (percell)
         launch_kv_form<HD, G, LOOP, true>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m,
-                                        part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
+                                        part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
     else
         launch_kv_form<HD, G, LOOP, false>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m,
-                                         part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk);
+                                         part_l, n_slots, n_q, cap, stride, window, kv_div, min_chunk, rows);
 }
 
 // The decode attention's form on a GPU, for a shape (head_dim, query heads per KV head): the cells a step of the fp16
@@ -556,22 +560,24 @@ Form form_of(sycl::queue& q) {
 template <int HD, int G>
 void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream,
-               int window, int nc, int split, int min_chunk = CHUNK) {
+               int window, int nc, int split, int min_chunk = CHUNK, const QsaAttnPoolsRows& row_pools = {}) {
     const int kv_mode = kv_mode_of(pools);
     auto& queue = queue_for(stream);
     const int nkv = (int) s.n_head_kv * split, ps = (int) s.page_size;
-    const int n_slots = slots_for(queue, cap, nkv, n_q);
+    // a batch window's rows keep one row's slot count, so each row's sums are its own 1-row call's bits
+    const int n_slots = slots_for(queue, cap, nkv, row_pools.n > 0 ? 1 : n_q);
     float* part_acc = scratch;
     float* part_m = scratch + (size_t) n_slots * s.n_head * HD;
     float* part_l = part_m + (size_t) n_slots * s.n_head;
     const float scale = 1.0f / std::sqrt((float) HD);
-    auto chunks = [&](bool cell, size_t rows) {
+    const QsaAttnPoolsRows pools_rows = row_pools;
+    auto chunks = [&](bool cell, size_t nrows) {
         if (n_slots < (cap + CHUNK - 1) / CHUNK)
             launch_kv<HD, G, true>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l,
-                                   n_slots, rows, (int) cap, stride, window, split, min_chunk, cell);
+                                   n_slots, nrows, (int) cap, stride, window, split, min_chunk, cell, pools_rows);
         else
             launch_kv<HD, G, false>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l,
-                                    n_slots, rows, (int) cap, stride, window, split, min_chunk, cell);
+                                    n_slots, nrows, (int) cap, stride, window, split, min_chunk, cell, pools_rows);
     };
     // Compare the complete attention on the actual pools before choosing the different FP32 order.  The upstream
     // parity line is a maximum difference of 1e-4 of the output scale.  No timing is started inside a graph capture.
@@ -677,13 +683,14 @@ bool with_split(int heads_per_group, auto&& f) {
 
 template <int HD, int G>
 void run_form(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-              const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream, int window) {
+              const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream, int window,
+              const QsaAttnPoolsRows& rows = {}) {
     const Form f = form_of<HD, G>(queue_for(stream));
     const bool ok = with_split<HD>(G / f.split, [&]<int GS>() {
         run_shape<HD, GS>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window, f.nc, f.split,
-                          f.min_chunk);
+                          f.min_chunk, rows);
     });
-    if (!ok) run_shape<HD, G>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window, f.nc, 1);
+    if (!ok) run_shape<HD, G>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window, f.nc, 1, CHUNK, rows);
 }
 
 // The shapes this file is built for: (head_dim, query heads per KV head).  A model with another shape needs its line
@@ -709,9 +716,10 @@ bool with_shape(const QsaShapes& s, auto&& f) {
 }
 
 void run(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
-         const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream, int window = 0) {
+         const QsaShapes& s, float* scratch, float* attn, size_t n_q, long long stride, void* stream, int window = 0,
+         const QsaAttnPoolsRows& rows = {}) {
     with_shape(s, [&]<int HD, int G>() {
-        run_form<HD, G>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window);
+        run_form<HD, G>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream, window, rows);
     });
 }
 
@@ -830,6 +838,20 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         throw core::DeviceError("qsa_decode_attn_batch: unsupported geometry (" + shape_name(s) + ") or missing buffers");
     // per query: [acc: n_chunks*n_head*HD][m: n_chunks*n_head][l: n_chunks*n_head], all offsets from one stride
     run(q, pools, ids, steps, cap, s, scratch, attn, (size_t) n_q, (long long) qsa_decode_attn_scratch_floats(cap, s), stream);
+}
+
+void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, const int32_t* ids, const int32_t* steps,
+                                int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
+    if (n_q <= 0) return;
+    if (!shape_ok(s) || cap <= 0 || !scratch || !ids || !steps || rows.n != n_q || n_q > kQsaRowsMax ||
+        rows.p[0].page_table == nullptr)
+        throw core::DeviceError("qsa_decode_attn_batch_rows: unsupported geometry (" + shape_name(s) + ") or missing buffers");
+    const int mode = kv_mode_of(rows.p[0]);
+    for (int z = 1; z < rows.n; ++z)
+        if (kv_mode_of(rows.p[z]) != mode || rows.p[z].page_table == nullptr)
+            throw core::DeviceError("qsa_decode_attn_batch_rows: the rows' pools differ in format");
+    run(q, rows.p[0], ids, steps, cap, s, scratch, attn, (size_t) n_q, (long long) qsa_decode_attn_scratch_floats(cap, s),
+        stream, 0, rows);
 }
 
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s) {
