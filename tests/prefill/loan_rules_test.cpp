@@ -1,6 +1,7 @@
 // A prompt piece below the walk floor lends buffers for the staged walk, not for the rounded chunk's streamed one: no GPU, no model.
 #include <cstdint>
 #include <cstdio>
+#include <initializer_list>
 
 #include "strata/prefill/loan_rules.hpp"
 
@@ -41,7 +42,7 @@ int main() {
     // the chunk configured below the floor stays: a piece of 999 under a 512-token chunk reads in several pieces
     CHECK(walk_chunk(999, 512, 1024) == 512);
     // never larger than the chunk the caller chose, never below the piece itself
-    for (int64_t floor : {64, 1024, 2048, 3072, 4096})
+    for (int64_t floor : std::initializer_list<int64_t>{64, 1024, 2048, 3072, 4096})
         for (int64_t t = 1; t <= 9000; t += 7) {
             const int64_t c = walk_chunk(t, grid(t), floor);
             CHECK(c <= grid(t));
