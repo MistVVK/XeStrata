@@ -37,8 +37,8 @@ public:
     /// `name` is the switch as a user reads it (XESTRATA_<name>), `what` the decision's subject in its line.
     WindowChoice(const char* who, const char* name, const char* what, int block = 4, int rounds = 2,
                  double gain = 1.03, const char* unit = "a window")
-        : who_(who), name_(name), what_(what), block_(block < 1 ? 1 : block), rounds_(rounds < 1 ? 1 : rounds),
-          unit_(unit), gain_(gain) {}
+        : who_(who), name_(name), what_(what), unit_(unit), block_(block < 1 ? 1 : block),
+          rounds_(rounds < 1 ? 1 : rounds), gain_(gain) {}
 
     /// The form for the window about to run: false (the default) until it decides, then the winner.
     bool on() const { return on_; }
