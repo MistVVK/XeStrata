@@ -434,6 +434,30 @@ sycl::event block_scores_tail(sycl::queue& q, const float* dead, const float* q_
 }
 }  // namespace
 
+void qsa_block_scores_reduce(const float* products, int64_t tile, int64_t b0, int64_t blocks, const int32_t* steps,
+                             int64_t nq, int64_t max_blocks, float* scores, void* stream) {
+    if (nq <= 0 || blocks <= 0) return;
+    auto& q = queue_for(stream);
+    const auto e = q.parallel_for(sycl::range<2>((size_t) nq, (size_t) blocks), [=](sycl::id<2> it) {
+        const int64_t row = (int64_t) it[0], b = b0 + (int64_t) it[1];
+        if (b >= max_blocks || b >= steps[row * kStepCount + kStepNBid]) return;
+        float sum = 0.0f;
+        for (int h = 0; h < IDX_HEADS; ++h) {
+            const float x = products[(row * IDX_HEADS + h) * tile + (b - b0)];
+            sum += x > 0.0f ? x : 0.0f;
+        }
+        scores[row * max_blocks + b] = sum;
+    });
+    finish(stream, e, "qsa_block_scores_reduce");
+}
+
+void qsa_block_scores_tail(const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
+                           int64_t max_blocks, float* scores, void* stream) {
+    if (nq <= 0) return;
+    auto& q = queue_for(stream);
+    finish(stream, block_scores_tail(q, dead, q_idx, steps, nq, max_blocks, scores), "qsa_block_scores_tail");
+}
+
 bool qsa_block_scores_tc(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                          int64_t max_blocks, const QsaShapes& s, float* scores, void* stream, int64_t active_blocks) {
     if (nq <= 0) return true;
