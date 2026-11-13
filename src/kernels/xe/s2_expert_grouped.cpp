@@ -231,9 +231,12 @@ sycl::event cpu_order_projection(sycl::queue& q, const uint8_t* blob_base, const
 // ---- grouped by expert (a verify window)
 constexpr int GU_CHUNKS = (H / 32 + 31) / 32;   // 3: chunks of a gate/up row per lane (80 chunks / 32 lanes)
 constexpr int GMAX = 8;                          // entries per group (tokens routed to one expert in a window)
-// a group holds one entry per token of the window routed to its expert, and the kernels below keep at most GMAX of
-// them: a longer window would drop entries without a word (upstream 64cfe3c)
-static_assert(GMAX >= kVerifyMaxT, "a verify window's group can exceed GMAX entries");
+// a group holds one entry per token of the window routed to its expert, and a pass of the kernels below keeps at most
+// GMAX of them (a longer window would drop entries without a word, upstream 64cfe3c): a window of up to GMAX rows is
+// one pass, as it always was, a wider one a second pass over its groups' entries past the GMAX-th
+// (moe_grouped_s2_window)
+static_assert(GMAX >= kVerifyNarrowT, "a narrow window's group can exceed a pass's entries");
+static_assert(2 * GMAX >= kVerifyMaxT, "a window's group can exceed two passes' entries");
 constexpr int GU_ROWS = 32;                      // gate/up rows per work-group: 4 per sub-group
 constexpr int D_ROWS = 64;                       // down rows per work-group: 8 per sub-group
 
@@ -395,7 +398,17 @@ void moe_group_resident(const int32_t* ids, int n, int k_per_tok, const uint8_t*
 void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
                     const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
                     const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream) {
+    moe_grouped_s2_window(grp_ptr, grp_start, n_groups, ent_dst, ent_tok, cap_groups, cap_entries, x_q8_0, x_scales,
+                          scratch, out, stream, kVerifyNarrowT);
+}
+
+void moe_grouped_s2_window(const unsigned long long* grp_ptr, const int32_t* grp_start, const int32_t* n_groups,
+                           const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
+                           const uint8_t* x_q8_0, const float* x_scales, void* scratch, float* out, void* stream,
+                           int window_rows) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
+    if (window_rows > 2 * GMAX) fail("moe_grouped_s2: a window of " + std::to_string(window_rows) + " rows");
+    const bool second = window_rows > GMAX;   // a group can hold more entries than a pass takes
     auto& q = Q(stream);
     const uint64_t gu_bytes = ((uint64_t) cap_entries * (uint64_t) (2 * FF) * 4 + 15) & ~15ull;
     const uint64_t q8_bytes = ((uint64_t) cap_entries * (uint64_t) (FF / 32) * 34 + 15) & ~15ull;
@@ -403,6 +416,8 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
     uint8_t* h_q8_0 = (uint8_t*) scratch + gu_bytes;
     float* h_scales = reinterpret_cast<float*>((uint8_t*) scratch + gu_bytes + q8_bytes);
     const int cap_e = (int) cap_entries;
+    // SKIP: the pass over a group's entries from the SKIP-th on (0: the one pass a narrow window takes, unchanged)
+    const auto gate_up_pass = [&]<int SKIP>() {
     q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<int, 1> xs_q(sycl::range<1>((size_t) GMAX * (H / 4)), hd);   // the entries' int8 activations as words
         sycl::local_accessor<float, 1> xs_d(sycl::range<1>((size_t) GMAX * (H / 32)), hd);
@@ -411,7 +426,9 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
             const sycl::sub_group sg = it.get_sub_group();
             const int g = (int) it.get_group(0);
             if (g >= *n_groups) return;   // uniform
-            const int e0 = grp_start[g], ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+            const int e0 = grp_start[g] + SKIP, ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+            if constexpr (SKIP > 0)
+                if (ne <= 0) return;   // uniform: the group fits the first pass
             const int t = (int) it.get_local_id(1), lane = t & 31, warp = t >> 5;
             for (int i = t; i < ne * (H / 32); i += 256) {
                 const int k = i / (H / 32), c = i - k * (H / 32);
@@ -459,6 +476,9 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
             }
         });
     });
+    };
+    gate_up_pass.template operator()<0>();
+    if (second) gate_up_pass.template operator()<GMAX>();
     void* s = &q;
     if (x_scales != nullptr) {
         swiglu_q8_launch(q, gate_up, cap_entries * (long long) FF, h_q8_0, h_scales);
@@ -467,7 +487,8 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
         quantize_q8_0(gate_up, h_q8_0, cap_entries * (int64_t) FF, s);
     }
     const float* hs = x_scales != nullptr ? h_scales : nullptr;
-    const auto e = q.submit([&](sycl::handler& hd) {
+    const auto down_pass = [&]<int SKIP>() {
+    return q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<int, 1> hs_q(sycl::range<1>((size_t) GMAX * (FF / 4)), hd);
         sycl::local_accessor<float, 1> hs_d(sycl::range<1>((size_t) GMAX * (FF / 32)), hd);
         hd.parallel_for(sycl::nd_range<2>({(size_t) cap_groups, (size_t) (H / D_ROWS) * 256}, {1, 256}),
@@ -475,7 +496,9 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
             const sycl::sub_group sg = it.get_sub_group();
             const int g = (int) it.get_group(0);
             if (g >= *n_groups) return;
-            const int e0 = grp_start[g], ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+            const int e0 = grp_start[g] + SKIP, ne = sycl::min(grp_start[g + 1] - e0, GMAX);
+            if constexpr (SKIP > 0)
+                if (ne <= 0) return;
             const int t = (int) it.get_local_id(1), lane = t & 31, warp = t >> 5;
             for (int i = t; i < ne * (FF / 32); i += 256) {
                 const int k = i / (FF / 32), c = i - k * (FF / 32);
@@ -515,6 +538,9 @@ void moe_grouped_s2(const unsigned long long* grp_ptr, const int32_t* grp_start,
             }
         });
     });
+    };
+    sycl::event e = down_pass.template operator()<0>();
+    if (second) e = down_pass.template operator()<GMAX>();
     if (!stream) core::Runtime::get().wait(e, "moe_grouped_s2");
 }
 

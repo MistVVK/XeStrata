@@ -18,6 +18,8 @@
 // to the machine and the context length. It only chooses which drafts to verify: the output is unchanged.
 #pragma once
 
+#include "strata/kernels/window_limits.hpp"
+
 #include <array>
 #include <cstdint>
 
@@ -25,7 +27,7 @@ namespace strata::spec {
 
 class DraftPolicy {
 public:
-    static constexpr int kMaxT = 8;
+    static constexpr int kMaxT = strata::kernels::kWindowMaxT;   // (a policy made for 8 rows never looks past them)
     static constexpr int kBuckets = 4;
     static constexpr int kCtxBuckets = 3;   // XESTRATA_SPEC_COST: round costs per context (< 6K, < 24K, longer)
     // XESTRATA_SPEC_COST=auto (the default): the cost-aware window from this bucket of context length on, below it

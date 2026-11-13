@@ -164,6 +164,7 @@ void df2_attention_variant(int v) { g_attn_variant = v; }
 
 namespace {
 
+template <int Rows>
 sycl::event df2_attention_v1(sycl::queue& qu, const float* q, const float* kring, const float* vring, const float* kblk,
                              const float* vblk, const int32_t* anchor_pos, int ring_slots, int window, float* part,
                              void* xq, float* xd, const int64_t* tag, const int32_t* epoch_ptr) {
@@ -172,7 +173,7 @@ sycl::event df2_attention_v1(sycl::queue& qu, const float* q, const float* kring
     return qu.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 2> Qs({8, HD}, h), Ks({32, HD}, h);
         sycl::local_accessor<float, 2> Ps({32, 8}, h);
-        h.parallel_for(sycl::nd_range<3>({(size_t) kDf2PartChunks, (size_t) kDf2Kv, 4 * WARP}, {1, 1, WARP}),
+        h.parallel_for(sycl::nd_range<3>({(size_t) kDf2PartChunks, (size_t) kDf2Kv, (Rows / 2) * WARP}, {1, 1, WARP}),
                        [=](nd_item<3> it) DF2_SG32 {
             const sycl::sub_group sg = it.get_sub_group();
             const int chunk = (int) it.get_group(0), kvh = (int) it.get_group(1), qg = (int) it.get_group(2);
@@ -180,10 +181,10 @@ sycl::event df2_attention_v1(sycl::queue& qu, const float* q, const float* kring
             const int s = *anchor_pos;
             const int lo = s - (window - 1) > 0 ? s - (window - 1) : 0;
             const int nctx = s - lo;
-            const int nkeys = nctx + kDf2Rows;
+            const int nkeys = nctx + Rows;
             const int k_begin = chunk * CK;
             const int64_t ep = tag != nullptr ? ((int64_t) *epoch_ptr << 32) : 0;
-            float* const pbase = part + (((size_t) chunk * kDf2Kv + kvh) * 32 + qg * 8) * 130;
+            float* const pbase = part + (((size_t) chunk * kDf2Kv + kvh) * (Rows * 4) + qg * 8) * 130;
             if (k_begin >= nkeys) {
                 for (int i = lane; i < 8 * 130; i += WARP) pbase[i] = (i % 130 == 0) ? -INFINITY : 0.0f;
                 return;
@@ -400,16 +401,17 @@ sycl::event df2_attention_v2(sycl::queue& qu, const float* q, const float* kring
 }
 
 // the combine: one work-group of 128 per (K/V head, query), a sub-group per 32-value output block
+template <int Rows>
 sycl::event df2_attention_combine(sycl::queue& qu, const float* part, void* xq, float* xd) {
-    return qu.parallel_for(sycl::nd_range<1>((size_t) kDf2Kv * 32 * HD, HD), [=](nd_item<1> it) DF2_SG32 {
+    return qu.parallel_for(sycl::nd_range<1>((size_t) kDf2Kv * (Rows * 4) * HD, HD), [=](nd_item<1> it) DF2_SG32 {
         const sycl::sub_group sg = it.get_sub_group();
         const int a = (int) it.get_group(0);
-        const int kvh = a >> 5, qi = a & 31, d = (int) it.get_local_id(0);
+        const int kvh = a / (Rows * 4), qi = a % (Rows * 4), d = (int) it.get_local_id(0);
         float M = -INFINITY;
-        for (int c = 0; c < kDf2PartChunks; ++c) M = sycl::fmax(M, part[(((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130]);
+        for (int c = 0; c < kDf2PartChunks; ++c) M = sycl::fmax(M, part[(((size_t) c * kDf2Kv + kvh) * (Rows * 4) + qi) * 130]);
         float L = 0.0f, o = 0.0f;
         for (int c = 0; c < kDf2PartChunks; ++c) {
-            const float* p = part + (((size_t) c * kDf2Kv + kvh) * 32 + qi) * 130;
+            const float* p = part + (((size_t) c * kDf2Kv + kvh) * (Rows * 4) + qi) * 130;
             const float w = (p[0] == -INFINITY) ? 0.0f : sycl::exp(p[0] - M);
             L += p[1] * w;
             o = sycl::fma(p[2 + d], w, o);
@@ -435,9 +437,9 @@ bool df2_attn_256_pays(sycl::queue& qu, const float* q, const float* kring, cons
     std::vector<float> d0(nxd), d1(nxd);
     auto trial = [&](bool two) {
         (two ? df2_attention_v2(qu, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, xq, xd, tag, epoch_ptr)
-             : df2_attention_v1(qu, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, xq, xd, tag, epoch_ptr))
+             : df2_attention_v1<8>(qu, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, xq, xd, tag, epoch_ptr))
             .wait_and_throw();
-        df2_attention_combine(qu, part, xq, xd).wait_and_throw();
+        df2_attention_combine<8>(qu, part, xq, xd).wait_and_throw();
         return true;
     };
     trial(false);
@@ -467,8 +469,14 @@ bool df2_attn_256_pays(sycl::queue& qu, const float* q, const float* kring, cons
 
 void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk,
                    const int32_t* anchor_pos, int ring_slots, int window, float* part, void* xq, float* xd,
-                   void* stream, const int64_t* tag, const int32_t* epoch_ptr) {
+                   void* stream, const int64_t* tag, const int32_t* epoch_ptr, int rows) {
     sycl::queue& qu = Q(stream);
+    if (rows == 16) {
+        df2_attention_v1<16>(qu, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, xq, xd, tag, epoch_ptr);
+        df2_attention_combine<16>(qu, part, xq, xd);
+        return;
+    }
+    if (rows != 8) throw std::invalid_argument("df2_attention: rows must be 8 or 16");
     static const int env = [] {
         const char* v = strata::env_get("DF2_ATTN_256");
         if (v == nullptr || *v == '\0' || std::string(v) == "auto") return 0;
@@ -482,8 +490,8 @@ void df2_attention(const float* q, const float* kring, const float* vring, const
                       df2_attn_256_pays(qu, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, xq, xd,
                                         tag, epoch_ptr));
     (two ? df2_attention_v2(qu, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, xq, xd, tag, epoch_ptr)
-         : df2_attention_v1(qu, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, xq, xd, tag, epoch_ptr));
-    df2_attention_combine(qu, part, xq, xd);
+         : df2_attention_v1<8>(qu, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, xq, xd, tag, epoch_ptr));
+    df2_attention_combine<8>(qu, part, xq, xd);
 }
 
 void df2_attention_f32(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk,
@@ -491,7 +499,7 @@ void df2_attention_f32(const float* q, const float* kring, const float* vring, c
                        const int64_t* tag, const int32_t* epoch) {
     sycl::queue& qu = Q(stream);
     // The 8-query form does not touch the quantized output buffers; combine its partials directly as FP32.
-    df2_attention_v1(qu, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, nullptr, nullptr, tag, epoch);
+    df2_attention_v1<8>(qu, q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, nullptr, nullptr, tag, epoch);
     qu.parallel_for(sycl::nd_range<1>((size_t) kDf2Kv * 32 * HD, HD), [=](nd_item<1> it) {
         const int a = (int) it.get_group(0), kvh = a >> 5, qi = a & 31, d = (int) it.get_local_id(0);
         float maximum = -INFINITY;
@@ -615,7 +623,15 @@ void gemm_nc(sycl::queue& qu, const void* w, const uint16_t* dpl, float* y, int 
 }  // namespace
 
 void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_in, int ncols, void* stream) {
-    if (n < 1 || n > 3 || n_in % 512 != 0 || ncols < 1 || ncols > 8) throw std::invalid_argument("df2_gemm: unsupported shape");
+    if (n < 1 || n > 3 || n_in % 512 != 0 || ncols < 1 || ncols > 16) throw std::invalid_argument("df2_gemm: unsupported shape");
+    if (ncols > 8) {
+        Df2Mat tail[3];
+        for (int i = 0; i < n; ++i) tail[i] = {mats[i].w, mats[i].y + (size_t) 8 * mats[i].n_out, mats[i].n_out, mats[i].q4};
+        df2_gemm(mats, n, xq, xd, n_in, 8, stream);
+        df2_gemm(tail, n, static_cast<const int8_t*>(xq) + (size_t) 8 * n_in,
+                 xd + (size_t) 8 * (n_in / 32), n_in, ncols - 8, stream);
+        return;
+    }
     sycl::queue& qu = Q(stream);
     const int8_t* xqp = static_cast<const int8_t*>(xq);
     for (int i = 0; i < n; ++i) {

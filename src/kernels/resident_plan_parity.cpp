@@ -5,7 +5,8 @@
 // by a scan) against a host replay of its contract: distinct experts in routing order, each with its entries
 // ascending, `ptr[g]` = the expert's slot, counts / start / dst / tok / start2 in the host pool's layout.
 //
-// n = 1..80 entries (a window of up to kVerifyMaxT tokens x 10 experts), ids drawn from pools of 3..512 experts so
+// n = 1..160 entries (a window of up to kVerifyMaxT tokens x 10 experts: up to 128 the narrow window's work-group, past
+// it a wide window's), ids drawn from pools of 3..512 experts so
 // duplicates run from "every entry the same expert" to "all distinct", with and without a slot table (`slot_off`),
 // and the skip word (ring when the plan was built; 0 and the plan untouched when an expert was not resident).
 // Every word of the plan the host pool would read is compared with memcmp. GPU, synthetic, no model.
@@ -36,7 +37,7 @@ int main() {
     uint8_t* const cache_base = reinterpret_cast<uint8_t*>(uintptr_t(0x40000000));   // never dereferenced
     void* st = P::stream();
 
-    auto* d_ids = dalloc<int32_t>(128);
+    auto* d_ids = dalloc<int32_t>((size_t) capx);
     auto* d_res = dalloc<int32_t>(NE);
     auto* d_off = dalloc<unsigned long long>(1024);
     auto* d_plan = dalloc<int32_t>(plan_words);
@@ -52,7 +53,7 @@ int main() {
     const uint32_t zero = 0;
 
     int cases = 0, bad = 0;
-    for (int n = 1; n <= 80; ++n) {
+    for (int n = 1; n <= (int) capx; ++n) {
         for (int variant = 0; variant < 4; ++variant) {
             const int pool = variant == 0 ? 3 : (variant == 1 ? 12 : (variant == 2 ? 40 : 512));
             std::vector<int32_t> ids(n);

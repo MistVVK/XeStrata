@@ -17,6 +17,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/kernels/window_limits.hpp"
 #include "strata/platform/env.hpp"
 
 #include <algorithm>
@@ -31,7 +32,7 @@ namespace strata::core {
 namespace {
 constexpr int64_t H = strata::kernels::cpu::H;
 constexpr int64_t FF = strata::kernels::cpu::FF;
-constexpr int64_t CAP = (int64_t) strata::kernels::cpu::MAXT * 10;
+constexpr int64_t CAP = (int64_t) strata::kernels::kWindowMaxT * 10;   // a window's rows x top-10 (upstream 9d3c8c366)
 
 // Small enough to copy as one buffer per layer; the kernels read the arrays through pointers into one allocation.
 struct RemoteMeta {
@@ -287,7 +288,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
     struct Timer { double& acc; std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
         ~Timer() { acc += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); } } timer{ms_begin_};
     const int64_t n = n_tok * k;
-    if (n <= 0 || n > CAP || n_tok > strata::kernels::cpu::MAXT || layer < 0 ||
+    if (n <= 0 || n > CAP || n_tok > strata::kernels::kWindowMaxT || layer < 0 ||
         (size_t) layer >= layers_present_.size() || device_ < 0) {
         err = "GPU" + std::to_string(device_) + " experts: invalid layer, routing width or window size";
         return false;
@@ -363,8 +364,9 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
                                                    (int64_t) dst_.size(), d_q8_, d_scratch_, out, s);
         } else {
             strata::kernels::quantize_q8_0_scaled(xin, d_q8_, d_scales_, n_tok * H, s);
-            strata::kernels::moe_grouped_s2(d_ptr_, d_start_, d_count_, d_dst_, d_tok_, groups_,
-                                            (int64_t) dst_.size(), d_q8_, d_scales_, d_scratch_, out, s);
+            strata::kernels::moe_grouped_s2_window(d_ptr_, d_start_, d_count_, d_dst_, d_tok_, groups_,
+                                                   (int64_t) dst_.size(), d_q8_, d_scales_, d_scratch_, out, s,
+                                                   (int) n_tok);
         }
         if (!zero_copy_ && !gpu::copy_async(h_out_, d_out_, (size_t) compact_bytes, s)) {
             err = failed(device_, "copy results");

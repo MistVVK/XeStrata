@@ -612,10 +612,14 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
             return false;
         }
     }
-    if (opt_.max_t < 1 || opt_.max_t > k::cpu::MAXT || opt_.max_cells < 16) {
+    // (a window wider than the CPU kernels' MAXT tokens: the CPU's experts take it in jobs of MAXT, plain_prompt.cpp
+    // and expert_pool_dispatch_multi)
+    if (opt_.max_t < 1 || opt_.max_t > k::kVerifyMaxT || opt_.max_cells < 16) {
         err = "plain model: the window or the context is out of range";
         return false;
     }
+    // the window rule's sizes: a wide window's (up to max_t), else the 8 rows it always had
+    if (opt_.max_t > k::kVerifyNarrowT) policy_ = strata::spec::DraftPolicy(opt_.max_t);
     if (opt_.cpu) return cpu_load(err);
     // the processor's own graphics through Level Zero: the first Level Zero adapter only (plain_generate.cpp's
     // linkless_gpu_adapter chooses it before the devices are listed; a user's SYCL_UR_USE_LEVEL_ZERO_V2=1 is refused)
@@ -1847,7 +1851,7 @@ bool PlainModel::open_experts(std::string& err) {
     win_.sink()->pcie_mode = 2;   // the PCIe share staged by the copy kernel inside the window (the split's timing)
     // the windows with every routed expert in VRAM run without the host (resident_plan), as Qwen3.8-Flash-Next's:
     // the residency table on the device, and the ids the host counts after the window (res_count)
-    if (win_.device_plans() && MoeWindow::resident_graph_on() && (int64_t) opt_.max_t * s.n_expert_used <= 128) {
+    if (win_.device_plans() && MoeWindow::resident_graph_on() && (int64_t) opt_.max_t * s.n_expert_used <= 256) {
         void* d = nullptr;
         if (strata::gpu::alloc_device(&d, res_.size() * 4) &&
             mapped((uint64_t) L * (uint64_t) opt_.max_t * (uint64_t) s.n_expert_used * 4, (void**) &h_rroute_,
@@ -4703,13 +4707,13 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
         while (keep < nd && probs[keep] >= (float) opt_.spec_min_p) ++keep;
         nd = keep;
     }
-    int32_t win[k::cpu::MAXT];
-    int32_t out[k::cpu::MAXT];
+    int32_t win[k::kVerifyMaxT];
+    int32_t out[k::kVerifyMaxT];
     win[0] = cur_;
     for (int i = 0; i < nd; ++i) win[i + 1] = drafts_[(size_t) i];
     // --suffix-draft / --lookup-chain: the lookup's drafts where they are more and agree with the MTP's first
     const int cap = (int) std::min<int64_t>({(int64_t) n_ext, (int64_t) window_drafts(), limit - 1,
-                                             opt_.max_cells - cur_pos_ - 1, (int64_t) k::cpu::MAXT - 1});
+                                             opt_.max_cells - cur_pos_ - 1, (int64_t) k::kVerifyMaxT - 1});
     bool from_ext = ext != nullptr && cap > nd && (nd == 0 || drafts_.empty() || ext[0] == drafts_[0]);
     if (ext_only) {   // an outside drafter's window (its own rule chose its length)
         nd = std::max(0, cap);
@@ -4908,7 +4912,7 @@ bool PlainModel::spec_step_pl(const std::vector<int32_t>& stop, int64_t limit, i
     }
     for (int j = 0; j < nd && j < strata::spec::DraftPolicy::kMaxT; ++j) probs[j] = prob((size_t) j);
     const int T = nd + 1;
-    int32_t win[k::cpu::MAXT];
+    int32_t win[k::kVerifyMaxT];
     win[0] = cur_;
     for (int i = 0; i < nd; ++i) win[i + 1] = drafts_[(size_t) i];
     // the next window's guess: this one whole, then the chain's next token and its drafts after it
@@ -4955,7 +4959,7 @@ bool PlainModel::spec_step_pl(const std::vector<int32_t>& stop, int64_t limit, i
             }
             pl_hand_.assign(s0.h_hand_, s0.h_hand_ + guess.size() * (size_t) s0.hand_w_);
         });
-    int32_t out[k::cpu::MAXT];
+    int32_t out[k::kVerifyMaxT];
     bool ok = true;
     {
         const OnDevice on(dev_);

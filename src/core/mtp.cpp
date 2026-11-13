@@ -231,7 +231,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     ss_ = &ss;
     max_t_ = max_t;
     rt_dir_ = rt_dir;
-    if (max_t < 1 || max_t > strata::kernels::kVerifyMaxT) { err = "mtp: max_t out of range"; return false; }
+    if (max_t < 1 || max_t > strata::kernels::kVerifyNarrowT) { err = "mtp: max_t out of range"; return false; }
     if (shared != nullptr) {   // --batch-mtp: a slot's drafter on the main one's weights
         if (shared->device_ != device_ || shared->g_ != &g || shared->dense_ == nullptr || shared->experts_ == nullptr ||
             shared->rt_dir_ != rt_dir) {
@@ -1220,7 +1220,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (!wait_step(0)) return false;
     drafts[0] = ((volatile int32_t*) h_out_)[0];
     if (top2_env()) { strata::gpu::stream_sync(cs_); record_top2(0); }
-    float pl[strata::kernels::kVerifyMaxT];   // the drafts' probabilities for `more`, where the caller keeps none
+    float pl[strata::kernels::kVerifyNarrowT];   // the drafts' probabilities for `more`, where the caller keeps none
     float* pr = probs != nullptr ? probs : pl;
     pr[0] = ((volatile float*) h_prob_)[0];
     int n = 1;

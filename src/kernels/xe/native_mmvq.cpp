@@ -36,6 +36,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/q8_act.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
@@ -68,7 +69,10 @@ constexpr int QI = 32;
 constexpr int VDR = 2;
 constexpr int WARPS = 4;
 constexpr int WARP = 32;
-constexpr int MAX_NCOLS = 8;
+// Columns one launch takes: a window has one column a row, so the window's most (kVerifyMaxT, 16).  Up to 8 columns
+// run the instances they always ran; 9..16 have their own, reached only by a window wider than 8 rows (they read every
+// weight once for all their columns: two 8-column passes read the dense weights twice, upstream 9d3c8c366).
+constexpr int MAX_NCOLS = kVerifyMaxT;
 
 using half = sycl::half;
 using half2 = sycl::half2;
@@ -806,7 +810,7 @@ void validate_shape(int n_in, int ncols, int block_elems = Q8K) {
     if (n_in <= 0 || n_in % block_elems != 0) {
         throw std::invalid_argument("native MMVQ requires n_in > 0 and divisible by its block element count");
     }
-    if (ncols < 1 || ncols > MAX_NCOLS) throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 8");
+    if (ncols < 1 || ncols > MAX_NCOLS) throw std::invalid_argument("native MMVQ requires 1 <= ncols <= 16");
 }
 void validate_pointer(const void* p) {
     if (!p || reinterpret_cast<std::uintptr_t>(p) % 4 != 0) {
@@ -837,7 +841,15 @@ void mmvq(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out
         case 6: launch_n<F, 6>(q, weights, x_q8_1, y, n_in, n_out, row); break;
         case 7: launch_n<F, 7>(q, weights, x_q8_1, y, n_in, n_out, row); break;
         case 8: launch_n<F, 8>(q, weights, x_q8_1, y, n_in, n_out, row); break;
-        default: break;   // validate_shape took only 1 to 8 columns
+        case 9: launch_n<F, 9>(q, weights, x_q8_1, y, n_in, n_out, row); break;
+        case 10: launch_n<F, 10>(q, weights, x_q8_1, y, n_in, n_out, row); break;
+        case 11: launch_n<F, 11>(q, weights, x_q8_1, y, n_in, n_out, row); break;
+        case 12: launch_n<F, 12>(q, weights, x_q8_1, y, n_in, n_out, row); break;
+        case 13: launch_n<F, 13>(q, weights, x_q8_1, y, n_in, n_out, row); break;
+        case 14: launch_n<F, 14>(q, weights, x_q8_1, y, n_in, n_out, row); break;
+        case 15: launch_n<F, 15>(q, weights, x_q8_1, y, n_in, n_out, row); break;
+        case 16: launch_n<F, 16>(q, weights, x_q8_1, y, n_in, n_out, row); break;
+        default: break;   // validate_shape took only 1 to 16 columns
     }
 }
 
@@ -888,7 +900,7 @@ bool mmvq_pair(const void* w1, const void* w2, const void* x_q8_1, float* y1, fl
         case 6: launch_row<F, 6, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); break;
         case 7: launch_row<F, 7, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); break;
         case 8: launch_row<F, 8, 8>(q, w1, x_q8_1, y1, n_in, n_out, w2, y2); break;
-        default: return false;
+        default: return false;   // (a wider window: the two products' own launches)
     }
     return true;
 }

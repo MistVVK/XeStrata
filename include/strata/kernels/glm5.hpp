@@ -9,6 +9,8 @@
 // Every buffer is a device pointer; `stream` null runs synchronously.  T is the number of tokens, N the model width.
 #pragma once
 
+#include "strata/kernels/window_limits.hpp"
+
 #include <cstdint>
 
 namespace strata::kernels {
@@ -77,7 +79,7 @@ void glm5_kda_step(float* state, const float* q, const float* k, const float* v,
 /// recurrence depends on no other column, so each walks the tokens by itself; every value is the per-token calls'.
 /// `snaps` (n_snaps of them, at most kGlm5MaxSnaps): the state after rows 0 .. n_snaps - 1 written there too, for a
 /// speculative window to go back to the last accepted row.
-inline constexpr int kGlm5MaxSnaps = 8;
+inline constexpr int kGlm5MaxSnaps = kWindowMaxT;   ///< (a window of up to 8 rows passes the 8 it always did)
 void glm5_kda_scan(float* state, const float* q, const float* k, const float* v, const float* g, const float* beta,
                    float* out, int64_t n_heads, int64_t n_tokens, void* stream, float* const* snaps = nullptr,
                    int n_snaps = 0);

@@ -69,7 +69,23 @@ public:
                float* probabilities, void* stream);
     // Final norm output [rows][hidden] to token IDs and scores [rows][16], on stream.
     void top512(const float* h, int rows, int32_t* ids, float* values, void* stream);
-    // The selector projects the normalized rows, scores the SHEAD candidates, and walks from anchor.
+    // The full vocabulary head is owned by the target. projection is at least yskn_scratch_bytes(*weights, 7),
+    // logits is [7][vocab], and top_scratch is [7][kDf2TopBlocks][kDf2TopK][2]. All buffers stay on device.
+    struct FullHead {
+        const strata::kernels::YsknDev* weights = nullptr;
+        void* projection = nullptr;
+        float* logits = nullptr;
+        uint32_t* top_scratch = nullptr;
+    };
+    void set_full_head(const FullHead& full) { full_head_ = full; }
+    enum class HeadMode { Auto, Off, On };
+    // Auto starts with the full head. The startup probe tests Off and On and applies its verdict to Auto.
+    // Off uses the full target head. On requires the model-specific SHEAD. Changes must precede graph capture.
+    void set_head_mode(HeadMode mode) { head_mode_ = mode; }
+    void set_probe_shead(bool use) { probe_shead_ = use; }
+    bool has_shead() const { return head_.loaded(); }
+    bool uses_shead() const { return head_mode_ == HeadMode::On || (head_mode_ == HeadMode::Auto && probe_shead_); }
+    // The selector projects the normalized rows, scores the selected head's candidates, and walks from anchor.
     // hp is [rows][rank], ids and values are [rows][16]; all pointers are device buffers on stream.
     void select(const float* h, int rows, const int32_t* anchor, float* hp, int32_t* ids, float* values,
                 int32_t* out, float* probabilities, void* stream);
@@ -84,6 +100,9 @@ private:
     std::unordered_map<std::string, const void*> vectors_;
     std::vector<void*> allocations_;
     Shead head_;
+    FullHead full_head_;
+    HeadMode head_mode_ = HeadMode::Auto;
+    bool probe_shead_ = false;
 };
 
 }  // namespace strata::core

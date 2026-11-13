@@ -32,12 +32,14 @@
 #include "strata/core/script_guard.hpp"
 #include "strata/core/logit_bias.hpp"
 #include "strata/core/dflash2.hpp"
+#include "strata/core/window_rows.hpp"
 #include "strata/core/plain_model.hpp"
 #include "strata/core/auto_pick.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/control_vector.hpp"
 #include "strata/core/stdin_lines.hpp"
 #include "strata/core/watchdog.hpp"
+#include "strata/core/window_rows.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -48,8 +50,10 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/spec/draft_probe.hpp"
+#include "strata/spec/df2_block_policy.hpp"
 #include "strata/spec/drafter_policy.hpp"
 #include "strata/spec/suffix_drafter.hpp"
+#include "strata/spec/static_drafter.hpp"
 #include "strata/spec/window_rule.hpp"
 #include "strata/platform/downgrade.hpp"
 #include "strata/platform/env.hpp"
@@ -202,6 +206,16 @@ void linkless_gpu_adapter() {
 // starts with them reads only what follows (a model with a recurrent state only when it extends them all; else it
 // starts over, or from the conversation cache).
 namespace {
+
+// Reserve the wider tap and verifier buffers before loading where the DFlash2 start probe can compare both blocks.
+bool wants_wide_window(const strata::core::PlainOptions& opt, bool serve) {
+    if (!serve || (opt.draft != "auto" && opt.draft != "dflash2") || opt.draft_model.empty() ||
+        !opt.split_at.empty() || opt.split_auto || opt.batch_slots != 0 || opt.cpu || opt.pipeline_windows >= 2 ||
+        !strata::spec::probe_enabled()) return false;
+    strata::core::Dflash2Drafter::PackShape shape;
+    std::string err;
+    return strata::core::Dflash2Drafter::read_shape(opt.draft_model, shape, err);
+}
 
 // The conversation cache (--conversation-cache-mib, sized from the free RAM by default as Qwen3.8-Flash-Next's, #3493):
 // conversations set aside
@@ -608,9 +622,14 @@ struct PlainDrafters {
             return false;
         }
         std::string e;
-        if (!model.set_window_drafts(strata::core::Dflash2Drafter::kDrafts, e))
+        if (!model.set_window_drafts(strata::core::window_rows_cap() - 1, e))
             std::fprintf(stderr, "xestrata (%s): %s: DFlash2's windows are the MTP layer's\n", arch.c_str(), e.c_str());
-        window = std::min(strata::core::Dflash2Drafter::kRows, model.window_drafts() + 1);
+        window = std::min(strata::core::window_rows_cap(), model.window_drafts() + 1);
+        if (strata::core::wide_window() == strata::core::WideWindow::On && window < strata::kernels::kWindowMaxT) {
+            err = "DFlash2: wide windows need a 16-row verifier";
+            release(model);
+            return false;
+        }
         df2.set_max_drafts(window - 1);
         if (!df2.prepare(model.tap_dev(), err)) {
             release(model);
@@ -939,6 +958,10 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     std::deque<std::string> probe_lines;
     std::vector<strata::spec::ProbeArm> probe_arms;
     std::vector<strata::spec::ProbeRun> probe_runs;
+    strata::spec::StaticDrafter static_drafter;
+    const int static_mode = static_drafter.configure((int32_t) model.vocab());
+    bool static_selected = static_mode == 1;
+    int block_selected = strata::core::wide_window() == strata::core::WideWindow::On ? 1 : 0;
     bool probe_running = false, drafting_off = false;
     int probe_stdout = -1;
     size_t probe_free0 = 0;
@@ -1001,7 +1024,10 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         const strata::spec::ProbeVerdict v = judge.decide(probe_arms, probe_runs, dr.loaded, model.drafts() + 1);
         std::fprintf(stderr, "xestrata (%s): %s (%.1f s)\n", arch.c_str(), v.line.c_str(),
                      std::chrono::duration<double>(Clock::now() - probe_t0).count());
-        strata::spec::Drafter keep = v.measured ? v.keep : strata::spec::Drafter::Mtp;
+        if (v.measured && static_mode < 0) static_selected = v.df2_static;
+        if (v.measured && strata::core::wide_window() == strata::core::WideWindow::Auto) block_selected = v.df2_block;
+        strata::spec::Drafter keep = v.measured ? v.keep : model.drafts() > 0 ? strata::spec::Drafter::Mtp
+                                                                             : strata::spec::Drafter::Df2;
         bool both = v.measured && v.keep_both;
         // DFlash2 kept only where the VRAM it took from the reserve leaves the reserve the start had (a long prompt's
         // buffers come out of it)
@@ -1011,7 +1037,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         if ((keep == strata::spec::Drafter::Df2 || both) && free_during < reserve) {
             std::fprintf(stderr, "xestrata (%s): DFlash2 is not kept: with it %lld MiB of VRAM stay free, less than the "
                                  "%lld MiB reserve: the MTP layer drafts\n", arch.c_str(), free_during, reserve);
-            keep = strata::spec::Drafter::Mtp;
+            keep = model.drafts() > 0 ? strata::spec::Drafter::Mtp : strata::spec::Drafter::None;
             both = false;
         }
         if (dr.loaded && keep != strata::spec::Drafter::Df2 && !both) dr.release(model);
@@ -1045,7 +1071,11 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     probe_arms.clear();
     {
         const bool probe_ok = strata::spec::probe_enabled() && model.stages() == 1 && bs.empty() && !model.on_cpu();
-        const bool want_arms = probe_ok && (opt.draft == "auto" || opt.spec_auto) && model.drafts() > 0;
+        const bool want_arms = probe_ok && (((opt.draft == "auto" || opt.spec_auto) &&
+                                              (model.drafts() > 0 || dr.deferred)) ||
+                                             (dr.loaded && static_mode < 0 && static_drafter.loaded()) ||
+                                             (dr.loaded && dr.window >= strata::kernels::kWindowMaxT &&
+                                              strata::core::wide_window() == strata::core::WideWindow::Auto));
         size_t fb = 0, tb = 0;
         strata::gpu::mem_info(&fb, &tb);
         probe_free0 = fb;
@@ -1069,9 +1099,14 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         } else if (dr.deferred) {
             dr.release(model);
         }
-        if (want_arms)
-            probe_arms = strata::spec::DraftProbe::arms(true, dr.loaded, opt.draft == "auto", model.drafts() + 1,
-                                                         opt.spec_auto, dr.window);
+        if (want_arms) {
+            probe_arms = strata::spec::DraftProbe::arms(model.drafts() > 0, dr.loaded, opt.draft == "auto", model.drafts() + 1,
+                                                         opt.spec_auto, dr.window, false, 8,
+                                                         static_mode < 0 && static_drafter.loaded(),
+                                                         dr.window < strata::kernels::kWindowMaxT ? 0 : strata::core::wide_window() == strata::core::WideWindow::On ? 1
+                                                             : strata::core::wide_window() == strata::core::WideWindow::Auto ? 2 : 0,
+                                                             false, static_mode == 1);
+        }
         std::vector<int32_t> prompt;
         if (probe_arms.size() >= 2) {
             try {
@@ -1406,6 +1441,14 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             else if (d == "learn")
                 req_df2 = drafter_policy.choose(req_kind, (int64_t) ids.size(), true) == strata::spec::DrafterPolicy::Df2;
         }
+        const int64_t df2_short0 = dr.df2.rounds_short, df2_wide0 = dr.df2.rounds_wide;
+        const bool req_static = req_df2 && (probe_running && req_probe >= -1
+            ? probe_arms[(size_t) std::max(req_probe, 0)].static_table : static_selected);
+        const int req_block = probe_running && req_probe >= -1
+            ? probe_arms[(size_t) std::max(req_probe, 0)].block : block_selected;
+        strata::spec::Df2BlockPolicy block_policy(req_block == 1 ? strata::spec::Df2BlockPolicy::Mode::Long
+                                                  : req_block == 2 ? strata::spec::Df2BlockPolicy::Mode::Adaptive
+                                                                   : strata::spec::Df2BlockPolicy::Mode::Short);
         if (req_spec_cap > 0 && !req_df2 && model.drafts() > 0) model.set_mtp_drafts(req_spec_cap - 1);
         if (req_prefill && (geni || ids.size() < 2 || admit_slot >= 0)) {
             std::printf("ERR prefill=1 needs a text prompt of at least 2 tokens and no batch slot\n");
@@ -2101,10 +2144,11 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         std::vector<int32_t> ext((size_t) opt.max_t + 1);
         const bool spec = ((model.drafts() > 0 && !req_off) || lookup || req_df2) && !constrained;
         // DFlash2's drafts for the next window (none before the first: its first window is the pending token alone)
-        constexpr int kD2 = strata::core::Dflash2Drafter::kDrafts;
+        constexpr int kD2 = strata::core::Dflash2Drafter::kMaxDrafts;
         int32_t d2[kD2] = {};
         float d2p[kD2] = {};
         bool d2_have = false;
+        int d2_width = strata::kernels::kVerifyNarrowT;
         const double d2_conf = opt.draft_conf > 0.0 ? opt.draft_conf : strata::spec::df2_default_conf(model.slots());
         if (spec && lookup) {
             sfx.reset();
@@ -2153,23 +2197,36 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             }
             if (spec && req_df2) {   // DFlash2: its window (its own rule over its selector's probabilities), then its next
                 int n_emit = 0;
-                const int n_ext = d2_have ? strata::spec::df2_window(d2p, dr.window, d2_conf) - 1 : 0;
+                int n_ext = d2_have ? strata::spec::df2_window(d2p, std::min(d2_width, dr.window), d2_conf) - 1 : 0;
+                const int32_t* candidate = d2;
+                bool static_window = false;
+                if (req_static && d2_have) {
+                    const int32_t prev = live.empty() ? -1 : live.back();
+                    const int count = static_drafter.propose(prev, next, std::min(d2_width, dr.window) - 1, ext.data());
+                    if (count > 0) { candidate = ext.data(); n_ext = count; static_window = true; }
+                }
                 const int64_t p0 = model.pending_pos();
                 const int32_t pending = next;
-                if (!model.spec_step(eos, max_new - produced, out.data(), n_emit, nullptr, err, nullptr, d2, n_ext, 0,
+                if (!model.spec_step(eos, max_new - produced, out.data(), n_emit, nullptr, err, nullptr, candidate, n_ext, 0,
                                      true)) {
                     ok = false;
                     break;
                 }
+                if (d2_have && !static_window && n_ext == d2_width - 1 && n_emit <= n_ext + 1 &&
+                    produced + n_emit < max_new &&
+                    std::find(eos.begin(), eos.end(), out[(size_t) n_emit - 1]) == eos.end())
+                    block_policy.observe(d2_width, n_emit - 1);
                 // the window's committed rows: the pending token and the accepted drafts; the token after them anchors
                 // the next block
-                int32_t rows[strata::core::Dflash2Drafter::kRows + 1];
+                int32_t rows[strata::core::Dflash2Drafter::kMaxRows + 1];
                 rows[0] = pending;
-                for (int i = 1; i < n_emit && i <= strata::core::Dflash2Drafter::kRows; ++i) rows[i] = out[(size_t) i - 1];
+                for (int i = 1; i < n_emit && i <= strata::core::Dflash2Drafter::kMaxRows; ++i) rows[i] = out[(size_t) i - 1];
                 d2_have = false;
                 const bool ends = produced + n_emit >= max_new ||
                                   std::find(eos.begin(), eos.end(), out[(size_t) n_emit - 1]) != eos.end();
                 if (!ends) {
+                    d2_width = block_policy.choose(dr.window);
+                    dr.df2.set_block_rows(d2_width);
                     if (!dr.df2.draft(model.tap_dev(), n_emit, p0, out[(size_t) n_emit - 1], d2, d2p, err)) {
                         ok = false;
                         break;
@@ -2248,6 +2305,10 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                                      (double) (model.file_read_bytes() - file_bytes0) / 1e6, (int64_t) (n_end - resume),
                                      (int64_t) (model.offloaded() - offload0), ""});
         std::fflush(stdout);
+        if (req_df2 && strata::env_auto("DF2_BLOCK_LOG") == 1)
+            std::fprintf(stderr, "xestrata dflash2: block rounds 8=%lld 16=%lld static=%d\n",
+                         (long long) (dr.df2.rounds_short - df2_short0), (long long) (dr.df2.rounds_wide - df2_wide0),
+                         (int) req_static);
         if (req_probe >= 0)   // the start's measurement: this run's speed
             probe_runs.push_back({req_probe, (int64_t) produced, decode_ms, (int64_t) (model.spec_drafted() - off0),
                                   (int64_t) (model.spec_accepted() - acc0)});
@@ -2376,7 +2437,9 @@ static void plain_usage(const std::string& arch) {
                  "                       auto = from the times measured at load, the default; 0: all on the GPU)\n"
                  "  --prompt-chunk N     the prompt's most tokens a chunk through the batched products (default:\n"
                  "                       4096, or up to 32768 where the VRAM tier lends it; 0: the prompt in windows)\n"
-                 "  --max-t N            the decode window's most tokens (default 8)\n"
+                 "  --max-t N            the decode window's most tokens (default 8; 16 with --wide-window on)\n"
+                 "  --wide-window auto|off|on  windows of up to 16 rows: auto (default) where a drafter of the run takes\n"
+                 "                       them, off never, on always (XESTRATA_WIDE_WINDOW)\n"
                  "  --spec N             speculative decoding with the model's MTP layer: windows of up to N tokens,\n"
                  "                       the last one and N - 1 drafts (default 3; 0: off; --serve's sampled requests\n"
                  "                       too, the CLI's greedy runs)\n"
@@ -2490,7 +2553,7 @@ int plain_main(int argc, char** argv) {
     int64_t n_new = 16;
     strata::kernels::SamplerParams sp;   // greedy unless --seed
     sp.greedy = true;
-    bool stop_eos = false, serve = false, device_given = false;
+    bool stop_eos = false, serve = false, device_given = false, max_t_given = false;
     std::vector<int32_t> eos;
     std::string dump_path, profile_save;
     std::vector<int32_t> follow;   // --spec-follow: the continuation emitted instead of the picks (benchmarks)
@@ -2575,6 +2638,7 @@ int plain_main(int argc, char** argv) {
     shared.lookup_chain_min_lo = 1;
     shared.pipeline_windows = &opt.pipeline_windows;
     shared.pipeline_windows_hi = -1;
+    shared.wide_window = true;
     shared.adapt_mib_per_token = &opt.adapt_mib_per_token;
     shared.batch = &opt.batch_slots;
     shared.batch_clamp0 = true;
@@ -2670,7 +2734,10 @@ int plain_main(int argc, char** argv) {
             if (!parse_ids(next("--eos-ids"), eos)) { std::fprintf(stderr, "--eos-ids: a list of token ids\n"); return 2; }
             stop_eos = true;
         }
-        else if (a == "--max-t") opt.max_t = (int) std::strtol(next("--max-t"), nullptr, 10);
+        else if (a == "--max-t") {
+            opt.max_t = (int) std::strtol(next("--max-t"), nullptr, 10);
+            max_t_given = true;
+        }
         else if (a == "--resident-experts") opt.resident_gib = -1;
         else if (a == "--resident-cpu-experts") {
             opt.resident_gib = -1;
@@ -2779,6 +2846,12 @@ int plain_main(int argc, char** argv) {
         std::fprintf(stderr, "xestrata (%s): needs --tokens and --max-new >= 1\n", arch.c_str());
         return 2;
     }
+    // the window's rows (window_rows.hpp), before anything is sized for them: --max-t, else 16 with --wide-window on or
+    // under auto where a drafter of this run takes wide windows or a batch has more than 8 slots, else the 8 a window
+    // always had
+    if (!max_t_given)
+        opt.max_t = strata::core::window_rows_for(wants_wide_window(opt, serve) ||
+                                                  opt.batch_slots > (int) strata::kernels::kVerifyNarrowT);
     // the last window's drafts and the MTP layer's cells reach a window past the last token
     if ((int64_t) prompt.size() + n_new + opt.max_t > opt.max_cells)
         opt.max_cells = (int64_t) prompt.size() + n_new + opt.max_t;
@@ -2897,6 +2970,9 @@ int plain_main(int argc, char** argv) {
                                  "the drafters at its start)\n", arch.c_str());
         } else if (want) {
             dr.pack = opt.draft_model;
+            dr.df2.set_capacity_rows(opt.max_t > strata::kernels::kVerifyNarrowT &&
+                                      strata::core::window_rows_cap() >= strata::kernels::kWindowMaxT
+                                          ? strata::kernels::kWindowMaxT : strata::kernels::kVerifyNarrowT);
             dr.deferred = opt.draft == "auto";
             model.set_taps(dr.shape.taps);   // the windows' tap staging (small) is the load's
         }

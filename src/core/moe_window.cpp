@@ -73,7 +73,7 @@ bool MoeWindow::resident_graph_on() {
 bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std::string& err) {
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (shape.n_embd <= 0 || shape.n_embd % 256 || shape.n_expert <= 0 || shape.k < 1 || shape.k > 64 ||
-        shape.max_t < 1 || shape.max_t > strata::kernels::kVerifyMaxT || shape.max_t > strata::kernels::cpu::MAXT) {
+        shape.max_t < 1 || shape.max_t > strata::kernels::kVerifyMaxT) {   // (the CPU's jobs take it in parts)
         err = "moe window: the shape is out of range";
         return false;
     }
@@ -354,8 +354,8 @@ bool MoeWindow::experts(int64_t layer, uint32_t ring, int grp, int groups, int t
             native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap, nat_xq(tb), hit_scratch_, hit_out, cs,
                                   grid_groups);
         } else {
-            moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
-                           hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs);
+            moe_grouped_s2_window(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
+                                  hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, hit_out, cs, n);   // (<= n a group)
         }
     };
     // the PCIe share: its flag, and in the kernel mode the copy into staging

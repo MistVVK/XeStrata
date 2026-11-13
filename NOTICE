@@ -84,19 +84,23 @@ Every copyright holder whose work is in this repository, its license and where t
   noise hashed from (seed, position, token id) and the cut to the 20 most likely tokens before the draws), written
   after YASAKANI's smp_hash.cuh (kh_mix, kh_gumbel) and q35_sample.cu (its version-3 pick)
   (https://github.com/yasakani-dev/yasakani, 0.1.0 at 0205f06); that code stays under Apache-2.0, the files as a
-  whole are under the LGPL (LGPL-3.0-or-later AND MIT AND Apache-2.0) - LICENSES/Apache-2.0.txt.  The .yskn models
-  (YASAKANI's trellis-coded Qwen3.8-27B): the container's reader and the reference of its products
-  (include/strata/artifact/yskn.hpp, src/artifact/yskn.cpp), the products' integer sums
-  (include/strata/kernels/yskn_sum.hpp), the GPU products (include/strata/kernels/yskn.hpp, src/kernels/xe/yskn.cpp)
-  and the GGUF skeleton's writer (tools/yskn_skeleton.py), written after YASAKANI's format.hpp, signs.hpp, loader.cpp,
-  repack.cu, lnord.cu, a8_prologue.cuh and q35_kernels.cu; those files as a whole are under the LGPL
-  (LGPL-3.0-or-later AND Apache-2.0)
+  whole are under the LGPL (LGPL-3.0-or-later AND MIT AND Apache-2.0) - LICENSES/Apache-2.0.txt
   The SHEAD output head (include/strata/kernels/shead.hpp, src/kernels/xe/shead.cpp,
   include/strata/core/shead.hpp, src/core/shead.cpp) is written after YASAKANI's q35_bdraft.cu and engine35.cpp.
-  The block drafter weights and context update (include/strata/core/bdraft2.hpp, src/core/bdraft2.cpp) are written
-  after YASAKANI's engine35.cpp. These files stay under Apache-2.0; as a whole they are under the LGPL
-  (LGPL-3.0-or-later AND Apache-2.0) -
+  It stays under Apache-2.0; these files as a whole are under the LGPL (LGPL-3.0-or-later AND Apache-2.0) -
   LICENSES/Apache-2.0.txt.
+  The YD1S static draft table (include/strata/spec/static_drafter.hpp, src/spec/static_drafter.cpp) is written after
+  YASAKANI's specx.cpp. It stays under Apache-2.0; these files as a whole are under the LGPL
+  (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt.
+  The adaptive DFlash2 block-width rule (include/strata/spec/df2_block_policy.hpp) is written after that same source.
+  It stays under Apache-2.0; the file as a whole is under the LGPL (LGPL-3.0-or-later AND Apache-2.0).
+  The .yskn models' container reader and reference products (include/strata/artifact/yskn.hpp,
+  src/artifact/yskn.cpp), integer sums and GPU products (include/strata/kernels/yskn_sum.hpp,
+  include/strata/kernels/yskn.hpp, src/kernels/xe/yskn.cpp), and GGUF skeleton writer (tools/yskn_skeleton.py)
+  are written after YASAKANI's format.hpp, signs.hpp, loader.cpp, repack.cu, lnord.cu, a8_prologue.cuh and
+  q35_kernels.cu. The block drafter weights and context update (include/strata/core/bdraft2.hpp,
+  src/core/bdraft2.cpp) are written after YASAKANI's engine35.cpp. These files stay under Apache-2.0; as a whole
+  they are under the LGPL (LGPL-3.0-or-later AND Apache-2.0) - LICENSES/Apache-2.0.txt.
 - Copyright (c) 2024 Sahand Ahmadian; Copyright (c) 2024 Jonseed
   MIT - the image engine's Detail Daemon (src/image/guidance.cpp, include/strata/image/guidance.hpp: its schedule, the
   sigma the model is asked at, their constants and the settings' defaults), written after

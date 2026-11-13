@@ -72,6 +72,7 @@
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/dflash2.hpp"
+#include "strata/core/window_rows.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/prefill/kva.hpp"   // STRATA_KVA: the engine's part (kva_engine)
@@ -86,11 +87,13 @@
 #include "strata/program/message_boundary.hpp"
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/draft_probe.hpp"
+#include "strata/spec/df2_block_policy.hpp"
 #include "strata/spec/drafter_policy.hpp"
 #include "strata/spec/window_rule.hpp"
 #include "strata/spec/draft_source.hpp"
 #include "strata/spec/guess_gate.hpp"
 #include "strata/spec/suffix_drafter.hpp"
+#include "strata/spec/static_drafter.hpp"
 #include "strata/spec/spec_start.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -98,6 +101,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/progress.hpp"
 #include "strata/core/run_manifest.hpp"
+#include "strata/core/window_rows.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/artifact/model_spec.hpp"
 #include "strata/platform/direct_file.hpp"
@@ -709,7 +713,10 @@ void usage() {
                  "  --mtp-max-t M        cap the MTP's windows at M tokens (0 = --spec; longer ones come from suffixes)\n"
                  "  --spec N|auto        the MTP drafter's verify window: how many tokens it proposes per check (--suffix-\n"
                  "                       draft lets it grow by 2, up to 8, where a repeat is likely); auto (setup's): 4 or\n"
-                 "                       2, measured at the --serve start\n"
+                 "                       2, measured at the --serve start.  Past 8 (up to 16): the MTP's own windows\n"
+                 "                       stay at 8, the lookup's or DFlash2's take the rest\n"
+                 "  --wide-window auto|off|on  verify and batch windows of up to 16 rows: auto (default) for --spec\n"
+                 "                       past 8 and a batch of more than 8 slots, off never, on wherever they fit\n"
                  "  --spec-window R      auto (default): each round keeps a draft while the tokens it is expected to\n"
                  "                       add raise the window's tokens per ms, at the measured window costs; min-p:\n"
                  "                       the floor below\n"
@@ -2328,6 +2335,7 @@ int main(int argc, char** argv) {
     shared.lookup_chain_min_lo = 3;
     shared.pipeline_windows = &o.pipeline_windows;
     shared.pipeline_windows_hi = 2;
+    shared.wide_window = true;
     shared.adapt_mib_per_token = &o.adapt_mib_per_token;
     shared.adapt_mib_clamp0 = true;
     shared.batch = &o.batch;
@@ -2782,12 +2790,25 @@ int main(int argc, char** argv) {
         return 2;
     }
     strata::core::qsa_set_kv_resident(o.kv_resident);
+    // The windows' rows (window_rows.hpp): --spec past 8 needs the wide windows, which --wide-window off and
+    // --pipeline-windows (its windows are captured for every size up to 8) leave out; a lookup lengthens a window up to
+    // 8, or with --spec past 8 or --wide-window on up to the wide window's 16.
+    const int spec_row_cap = o.pipeline_windows >= 2 ? (int) strata::kernels::kVerifyNarrowT
+                                                     : strata::core::window_rows_cap();
+    if (o.spec > spec_row_cap) {
+        std::fprintf(stderr, "xestrata generate: --spec %d: a window holds %d rows here, so %d\n", o.spec, spec_row_cap,
+                     spec_row_cap);
+        o.spec = spec_row_cap;
+    }
+    const bool wide_on = strata::core::wide_window() == strata::core::WideWindow::On && o.pipeline_windows < 2;
+    const int narrow_rows = strata::kernels::kVerifyNarrowT;
+    const int spec_rows = o.spec > narrow_rows || wide_on ? spec_row_cap : narrow_rows;
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
     // up to 2 tokens longer; the draft policy (strata/spec/draft_policy.hpp) takes one only where it pays. Code
     // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.
     if (o.suffix_draft > 0 && o.spec >= 2 && o.mtp_max_t == 0) {
         o.mtp_max_t = o.spec;
-        o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
+        o.spec = std::min(o.spec + 2, spec_rows);
     }
     // --lookup-chain (opt-in): the MTP keeps its windows; a lookup chained after its drafts may lengthen one by up to K.
     // Sized from the cap actually in force: the suffix block above may already have raised --spec to --spec+2, so sizing
@@ -2795,8 +2816,28 @@ int main(int argc, char** argv) {
     if (o.lookup_chain > 0 && o.spec >= 2) {
         if (o.mtp_max_t == 0) o.mtp_max_t = o.spec;
         const int chain_base = o.spec;
-        o.spec = std::max(chain_base, std::min(std::max(chain_base, o.mtp_max_t) + o.lookup_chain, 8));   // kVerifyMaxT
+        o.spec = std::max(chain_base, std::min(std::max(chain_base, o.mtp_max_t) + o.lookup_chain, spec_rows));
     }
+    // Reserve the wide DFlash2 probe's window before the verifier and tap buffers are allocated. Keep an explicitly
+    // numbered --spec as given unless --wide-window on asks for the wider form. A missing pack cannot be measured.
+    if ((o.draft == "auto" || o.draft == "dflash2") && !o.draft_model.empty() &&
+        o.batch == 0 && o.pipeline_windows < 2 && strata::core::window_rows_cap() == strata::kernels::kWindowMaxT) {
+        bool wide = strata::core::wide_window() == strata::core::WideWindow::On;
+        if (!wide && o.serve && o.spec_auto && strata::spec::probe_enabled()) {
+            strata::core::Dflash2Drafter::PackShape shape;
+            std::string why;
+            wide = strata::core::Dflash2Drafter::read_shape(o.draft_model, shape, why);
+        }
+        if (wide) {
+            if (o.mtp_max_t == 0 && o.spec > 0) o.mtp_max_t = o.spec;
+            o.spec = strata::core::window_rows_cap();
+        }
+    }
+    // the MTP's own windows stay at 8 rows (its draft layer's kernels are the narrow window's); a lookup or DFlash2
+    // window goes on to --spec
+    if (!o.mtp.empty() && o.spec > (int) strata::kernels::kVerifyNarrowT &&
+        (o.mtp_max_t == 0 || o.mtp_max_t > (int) strata::kernels::kVerifyNarrowT))
+        o.mtp_max_t = strata::kernels::kVerifyNarrowT;
     strata::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
         // every shard of --native's model, once: a missing shard is an error that names it (upstream 02cfe36; the
@@ -4645,7 +4686,8 @@ int main(int argc, char** argv) {
         const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
         // --pipeline-windows 2: 8 rows (the chain runs on past the window in flight: its drafts, its bonus token and
         // the next window's drafts), and the round/step graphs carry the forcing kernel
-        const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
+        const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyNarrowT
+                                                  : std::min(o.spec, (int) strata::kernels::kVerifyNarrowT);
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "xestrata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
     }
@@ -4672,6 +4714,10 @@ int main(int argc, char** argv) {
     const strata::core::WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { std::fprintf(stderr, "xestrata generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
+    strata::spec::StaticDrafter static_drafter;
+    const int static_mode = static_drafter.configure((int32_t) n_vocab);
+    bool static_selected = static_mode == 1;
+    int block_selected = strata::core::wide_window() == strata::core::WideWindow::On ? 1 : 0;
     strata::core::NativeHead native_head;
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
@@ -4727,14 +4773,16 @@ int main(int argc, char** argv) {
         else
             std::fprintf(stderr, "xestrata generate: --batch is off: two slots leave %s no VRAM on this GPU\n", beside);
     };
+    // a batch window's rows: 16 where it has more than 8 slots and the wide windows are not off (window_rows.hpp)
+    const int batch_rows = strata::core::window_rows_for(o.batch > (int) strata::kernels::kVerifyNarrowT);
     if (o.batch != 0) {
         const char* why = !o.serve ? "it needs --serve"
                         : o.batch < 2 ? "it needs at least 2 slots"
                         : nullptr;
-        if (o.batch > strata::kernels::kVerifyMaxT && !batch_mtp) {   // --batch-mtp: the slots rotate through the windows
+        if (o.batch > batch_rows && !batch_mtp) {   // --batch-mtp: the slots rotate through the windows
             std::fprintf(stderr, "xestrata generate: --batch %d: a window holds %d rows, so %d slots\n", o.batch,
-                         strata::kernels::kVerifyMaxT, strata::kernels::kVerifyMaxT);
-            o.batch = strata::kernels::kVerifyMaxT;
+                         batch_rows, batch_rows);
+            o.batch = batch_rows;
         }
         if (why != nullptr) {
             std::fprintf(stderr, "xestrata generate: --batch is off: %s\n", why);
@@ -4852,17 +4900,17 @@ int main(int argc, char** argv) {
         // --batch-mtp goes on as it would without it: in serial windows, or off beside the pipelined groups.
         if (batch_mtp && piped_mtp_asked && !stages.empty() && o.batch > 0) {
             pm_drafts = std::clamp((int) std::strtol(piped_mtp_env, nullptr, 10), 1,
-                                   std::max(1, std::min(o.spec - 1, (int) strata::kernels::kVerifyMaxT - 1)));
+                                   std::max(1, std::min(o.spec - 1, batch_rows - 1)));
             char buf[160];
             const char* why = nullptr;
             if (o.batch_groups <= 1) {
                 std::snprintf(buf, sizeof buf, "it needs 2 or more pipelined groups and %d slot%s in %d group%s are left",
                               o.batch, o.batch == 1 ? "" : "s", o.batch_groups, o.batch_groups == 1 ? "" : "s");
                 why = buf;
-            } else if ((o.batch / o.batch_groups) * (1 + pm_drafts) > (int) strata::kernels::kVerifyMaxT) {
+            } else if ((o.batch / o.batch_groups) * (1 + pm_drafts) > batch_rows) {
                 std::snprintf(buf, sizeof buf, "a group's window would hold %d rows (%d slots x %d), more than %d",
                               (o.batch / o.batch_groups) * (1 + pm_drafts), o.batch / o.batch_groups, 1 + pm_drafts,
-                              (int) strata::kernels::kVerifyMaxT);
+                              batch_rows);
                 why = buf;
             }
             if (why != nullptr) {
@@ -6953,6 +7001,9 @@ int main(int argc, char** argv) {
     // (the arena mode has no RAM copy to exchange with: its experts are always in RAM, the tier only copies them in)
     if (o.adapt_async && !src.complement_ready() && srcp != &arena_src)
         adapt_async_off("the resident RAM mode is not running");
+    // the verify windows' most rows in this run (the verifier's max_t: --spec's, the batch's), at least the 8 a window
+    // always had: what the buffers that follow the window (the hand-off, the penalty rows) hold
+    const int win_rows = std::max({(int) strata::kernels::kVerifyNarrowT, o.spec, batch_mtp ? batch_rows : o.batch});
     if (o.serve) {
         if (o.spec < 2 || o.prefill_chunk <= 0 ||
             (graph_hits && (thits.d_res == nullptr || host_res.empty()))) {
@@ -7110,7 +7161,7 @@ int main(int argc, char** argv) {
         // the widest window; a request without penalties gets a null buffer and takes the byte-for-byte
         // neutral path (no upload, no buffer handed to the sampler).
         constexpr int kPenaltyWindowCap = 4096;
-        constexpr size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) strata::kernels::kVerifyMaxT;
+        const size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) win_rows;
         int32_t* d_hist = nullptr;
         std::vector<int32_t> hist_stage(kHistSlots, -1);
         const int hist_dev = last_st ? last_st->dev : -1;   // with the head: the last stage's device
@@ -7168,9 +7219,8 @@ int main(int argc, char** argv) {
         }
         if (n_stages > 1) {
             // STRATA_PIPED_MTP: the groups write each slot's token and proposals at hbase = group * rows-per-group, so
-            // the hand-off holds every slot's rows (otherwise kVerifyMaxT, as before)
-            const int hrows = piped_mtp ? std::max<int>(strata::kernels::kVerifyMaxT, (1 + pm_drafts) * o.batch)
-                                        : (int) strata::kernels::kVerifyMaxT;
+            // the hand-off holds every slot's rows (otherwise a window's, win_rows: 8, as before, unless it is wide)
+            const int hrows = piped_mtp ? std::max<int>(win_rows, (1 + pm_drafts) * o.batch) : win_rows;
             const size_t hb = (size_t) hrows * (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             auto dev_of = [&](int st) { return st == 0 || split_same ? 0 : stages[(size_t) st - 1]->dev; };
             auto hand_alloc = [&](int dev) -> float* {
@@ -7197,7 +7247,7 @@ int main(int argc, char** argv) {
                 stage_ver(st).set_stage(st == 0 ? 0 : split_at[(size_t) st - 1], st + 1 < n_stages ? split_at[(size_t) st] : -1,
                                         st == 0 ? nullptr : hand_in[(size_t) st - 1],
                                         st + 1 < n_stages ? hand_out[(size_t) st] : nullptr);
-                if (piped_mtp) stage_ver(st).set_handoff_rows(hrows);
+                if (piped_mtp || hrows > (int) strata::kernels::kVerifyNarrowT) stage_ver(st).set_handoff_rows(hrows);
                 split_drive.end[st] = st + 1 < n_stages ? split_at[(size_t) st] : g.n_layers;
                 split_drive.cache_base[st] = drive.d.cache_base;
                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
@@ -7217,12 +7267,12 @@ int main(int argc, char** argv) {
                     vs.blob = thits.blob;
                     vs.slot_off = gs.cache.slot_offsets();
                     vs.n_slots = gs.cache.slots();
-                    // --batch-mtp: every stage runs the first one's windows of two rows a slot (up to kVerifyMaxT rows,
+                    // --batch-mtp: every stage runs the first one's windows of two rows a slot (up to batch_rows rows,
                     // the hand-off's size) and bounds its captured batch layouts like it (upstream 48f2c47d)
                     if (batch_mtp) gs.ver.set_batch_graph_limit(64);
                     if (adapt_device_table_lags()) gs.ver.set_always_publish(true);
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
-                                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err);
+                                       batch_mtp ? batch_rows : std::max(o.spec, o.batch), err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
                     // the PCIe share's kernels read the missed experts where CUDA0's runtime allocated or registered
@@ -7271,7 +7321,7 @@ int main(int argc, char** argv) {
         // Verifier::pl_finish copies it across.
         float* pl_mtp_R = nullptr;
         if (pipe) {
-            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
+            const size_t hb = (size_t) strata::kernels::kVerifyNarrowT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             auto hand_alloc = [&](int dev) -> float* {
                 const strata::core::OnDevice on(dev);
@@ -7310,7 +7360,7 @@ int main(int argc, char** argv) {
                                  gs.dev, st + 1, err.c_str());
                     return 1;
                 }
-                if (last && !strata::gpu::alloc_device(&pl_mtp_R, (size_t) strata::kernels::kVerifyMaxT *
+                if (last && !strata::gpu::alloc_device(&pl_mtp_R, (size_t) strata::kernels::kVerifyNarrowT *
                                                                       (size_t) (g.hc * g.n_embd) * sizeof(float))) {
                     std::fprintf(stderr, "xestrata serve: --pipeline-windows: the drafter's row buffer does not fit\n");
                     return 1;
@@ -7331,7 +7381,7 @@ int main(int argc, char** argv) {
         if (df2_loaded) ver.set_taps(df2.tap_layers());   // the DFlash2 drafter's taps (before init allocates them)
         else if (df2_deferred) ver.set_taps(df2_shape.taps);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
+                      batch_mtp ? batch_rows : std::max(o.spec, o.batch), err) ||
             (use_mtp &&
              !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                        pipe ? pl_mtp_R : ver.final_R_all(), err))) {
@@ -7348,6 +7398,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "xestrata serve: %s\n", err.c_str());
                 return 1;
             }
+            df2.set_max_drafts(o.spec - 1);
             if (!df2.prepare(ver.tap_dev(), err)) {
                 std::fprintf(stderr, "xestrata serve: %s\n", err.c_str());
                 return 1;
@@ -7401,7 +7452,7 @@ int main(int argc, char** argv) {
             }
             // STRATA_PIPED_MTP: the rows a group's commit replays after the verdict, one hand-off row each
             for (int st = 0; slots_ok && piped_mtp && st < n_stages; ++st)
-                if (!stage_ver(st).init_deferred_commit(std::max<int>(strata::kernels::kVerifyMaxT, (1 + pm_drafts) * o.batch),
+                if (!stage_ver(st).init_deferred_commit(std::max<int>(win_rows, (1 + pm_drafts) * o.batch),
                                                         err)) {
                     std::fprintf(stderr, "xestrata serve: XESTRATA_PIPED_MTP, stage %d: %s%s\n", st + 1, err.c_str(),
                                  vram_free_note().c_str());
@@ -8991,6 +9042,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "xestrata serve: %s (%.1f s)\n", v.line.c_str(),
                          std::chrono::duration<double>(Clock::now() - probe_t0).count());
             if (v.measured) {
+                if (static_mode < 0) static_selected = v.df2_static;
+                if (strata::core::wide_window() == strata::core::WideWindow::Auto) block_selected = v.df2_block;
                 strata::spec::Drafter keep = v.keep;
                 // DFlash2 alone or beside the MTP keeps the VRAM it took from the reserve: only where the reserve the
                 // engine started with is still free beside it (a long prompt's buffers come out of the reserve)
@@ -9020,8 +9073,9 @@ int main(int argc, char** argv) {
                         if (df2_loaded && df2.head_shared()) {   // DFlash2's head was the MTP's: its own first
                             std::string e;
                             df2.release();
-                            if (!df2.load(o.draft_model, 0, e) || !df2.bind(wt, g, &native_head, df2_vocab, e) ||
-                                !df2.prepare(ver.tap_dev(), e)) {
+                            const bool rebound = df2.load(o.draft_model, 0, e) && df2.bind(wt, g, &native_head, df2_vocab, e);
+                            if (rebound) df2.set_max_drafts(S - 1);
+                            if (!rebound || !df2.prepare(ver.tap_dev(), e)) {
                                 std::fprintf(stderr, "xestrata serve: DFlash2 could not take its own head (%s): the MTP "
                                                      "stays\n", e.c_str());
                                 df2_drop(nullptr);
@@ -9070,7 +9124,9 @@ int main(int argc, char** argv) {
             return true;
         };
         {
-            const bool want_arms = probe_ok && (o.draft == "auto" || o.spec_auto) && !o.native_head_gguf.empty();
+            const bool want_arms = probe_ok && !o.native_head_gguf.empty() &&
+                (o.draft == "auto" || o.spec_auto || (df2_loaded && static_mode < 0 && static_drafter.loaded()) ||
+                 (df2_loaded && S >= strata::kernels::kWindowMaxT && strata::core::wide_window() == strata::core::WideWindow::Auto));
             if (df2_deferred && want_arms) {
                 // DFlash2 beside everything else, where the VRAM it takes leaves kProbeFreeMib free; its pack must be
                 // this model's
@@ -9100,21 +9156,30 @@ int main(int argc, char** argv) {
                             if (sh.rows != nullptr) df2.share_head({sh.rows, sh.vocab_dev, sh.n, sh.type});
                         }
                         df2_loaded = true;
-                        if (!df2.bind(wt, g, &native_head, df2_vocab, e) || !df2.prepare(ver.tap_dev(), e)) {
+                        if (!df2.bind(wt, g, &native_head, df2_vocab, e)) {
                             std::fprintf(stderr, "xestrata serve: DFlash2: %s: the MTP drafts\n", e.c_str());
                             df2_drop(nullptr);
-                        } else if (free_mib() < (long long) kProbeFreeMib) {
-                            df2_drop("less VRAM is left free beside it than the measurement needs");
                         } else {
                             df2.set_max_drafts(S - 1);
+                            if (!df2.prepare(ver.tap_dev(), e)) {
+                                std::fprintf(stderr, "xestrata serve: DFlash2: %s: the MTP drafts\n", e.c_str());
+                                df2_drop(nullptr);
+                            } else if (free_mib() < (long long) kProbeFreeMib) {
+                                df2_drop("less VRAM is left free beside it than the measurement needs");
+                            }
                         }
                     }
                 }
             } else if (df2_deferred) {
                 df2_drop(nullptr);
             }
-            if (want_arms)
-                probe_arms = strata::spec::DraftProbe::arms(use_mtp, df2_loaded, o.draft == "auto", S_mtp, o.spec_auto, S);
+            if (want_arms) {
+                probe_arms = strata::spec::DraftProbe::arms(use_mtp, df2_loaded, o.draft == "auto", S_mtp, o.spec_auto, S,
+                                                             false, 8, static_mode < 0 && static_drafter.loaded(),
+                                                             S < strata::kernels::kWindowMaxT ? 0 : strata::core::wide_window() == strata::core::WideWindow::On ? 1
+                                                                 : strata::core::wide_window() == strata::core::WideWindow::Auto ? 2 : 0,
+                                                             false, static_mode == 1);
+            }
             std::vector<int32_t> prompt;
             if (probe_arms.size() >= 2) {
                 try {
@@ -9460,7 +9525,7 @@ int main(int argc, char** argv) {
             static size_t next_slot = 0;
             int A = 0;
             const int per = batch_mtp ? 2 : 1;
-            for (size_t offset = 0; offset < bs.size() && S + per <= strata::kernels::kVerifyMaxT; ++offset) {
+            for (size_t offset = 0; offset < bs.size() && S + per <= batch_rows; ++offset) {
                 const int b = batch_mtp ? (int) ((next_slot + offset) % bs.size()) : (int) offset;
                 if (!bs[(size_t) b].active) continue;
                 first[A] = S;
@@ -9795,7 +9860,7 @@ int main(int argc, char** argv) {
         // copies and chains (on its GPU) start then.
         const int pmtp_rows_per_group = GS * (1 + pm_drafts);
         const bool pmtp = piped && piped_mtp && batch_mtp && stage_ver(0).deferred_commit_on() &&
-                          pmtp_rows_per_group <= (int) strata::kernels::kVerifyMaxT;
+                          pmtp_rows_per_group <= batch_rows;
         int64_t pm_checked = 0;   // proposals checked since the last timing line (bt_accepted: kept)
         // a slot whose next proposals are drafting (its chain in flight on the drafter's stream), and per slot the event
         // after the copy of its rows on the last stage's stream, which the chain waits for
@@ -10677,7 +10742,7 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 if (!grammar.start(req_grammar, (int) n_vocab, stops, err)) { std::printf("ERR %s\n", err.c_str()); continue; }
-                grammar_rows.resize((size_t) strata::kernels::kVerifyMaxT * (size_t) grammar.words());
+                grammar_rows.resize((size_t) win_rows * (size_t) grammar.words());
             }
             static strata::core::ScriptGuard script;   // one request at a time (not with --batch), as the grammar
             script.stop();
@@ -10688,7 +10753,7 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 script.apply_bans(req_bias, (int) n_vocab);
-                grammar_rows.resize((size_t) strata::kernels::kVerifyMaxT * (size_t) script.words());
+                grammar_rows.resize((size_t) win_rows * (size_t) script.words());
             }
             std::vector<int64_t> ids;
             std::string pe;
@@ -10710,9 +10775,17 @@ int main(int argc, char** argv) {
                 if (req_off) req_df2 = false;
                 if (req_df2 != policy_is_df2) { std::swap(policy, policy_idle); policy_is_df2 = req_df2; }
             }
+            const int64_t df2_short0 = df2.rounds_short, df2_wide0 = df2.rounds_wide;
+            const bool req_static = req_df2 && (probe_running && req_probe >= -1
+                ? probe_arms[(size_t) std::max(req_probe, 0)].static_table : static_selected);
+            const int req_block = probe_running && req_probe >= -1
+                ? probe_arms[(size_t) std::max(req_probe, 0)].block : block_selected;
+            strata::spec::Df2BlockPolicy block_policy(req_block == 1 ? strata::spec::Df2BlockPolicy::Mode::Long
+                                                      : req_block == 2 ? strata::spec::Df2BlockPolicy::Mode::Adaptive
+                                                                       : strata::spec::Df2BlockPolicy::Mode::Short);
             const bool req_mtp = use_mtp && mtp.loaded() && !req_df2 && !req_off;   // the MTP drafts this request
             // the windows this request checks: the measurement's arm, else the window the measurement kept
-            const int req_cap = req_spec_cap > 0 ? req_spec_cap : spec_cap;
+            const int req_cap = req_spec_cap > 0 ? req_spec_cap : req_df2 ? 0 : spec_cap;
             const int S_r = req_cap > 0 ? std::min(S, req_cap) : S, S_mtp_r = std::min(S_mtp, S_r);
             if (use_mtp && req_mtp)
                 mtp.set_max_drafts(req_cap > 0 ? S_mtp_r - 1 : mtp_drafts0);
@@ -11968,6 +12041,7 @@ int main(int argc, char** argv) {
                 for (int64_t t : ids) { const int32_t t32 = (int32_t) t; extra_sources_append(&t32, 1); }
             }
             bool first_window = true;
+            int df2_width = strata::kernels::kVerifyNarrowT;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
             // XESTRATA_FOLLOW=<file> (token forcing, measurement only, off by default; tools/force_check.py): one line
             // per request in the order the engine decodes them, comma-separated token ids (an empty line: that request
@@ -12077,7 +12151,7 @@ int main(int argc, char** argv) {
                                  pl_serial);
             }
             if (pl_want && pl_serial == nullptr && !cancelled && produced_n < max_new && kvg.on &&
-                !kvg_ensure(std::min<int64_t>(o.max_context, p + max_new + 2 * (int64_t) strata::kernels::kVerifyMaxT + 64),
+                !kvg_ensure(std::min<int64_t>(o.max_context, p + max_new + 2 * (int64_t) strata::kernels::kVerifyNarrowT + 64),
                             adapt_quiesce)) {
                 std::printf("ERR the K/V cannot grow: no VRAM is left\n");
                 return 1;
@@ -12575,7 +12649,7 @@ int main(int argc, char** argv) {
                         ++pl_on;
                         // the chain over A, forced through B's drafts: B's bonus guess and the next window's drafts
                         mtp.set_source_R(V1(A).final_R(0));
-                        chain_n = std::min(strata::kernels::kVerifyMaxT - 1, B.T + S_mtp - 1);
+                        chain_n = std::min(strata::kernels::kVerifyNarrowT - 1, B.T + S_mtp - 1);
                         if (!mtp.chain_launch(A.T, outp.data(), A.p, a, B.tok + 1, B.T - 1, chain_n, chain_n, err))
                             return die(err);
                         chain_kind = 1;
@@ -12604,7 +12678,7 @@ int main(int argc, char** argv) {
                         B = PW{};
                         if (!last) {
                             mtp.set_source_R(V1(A).final_R(0));
-                            chain_n = strata::kernels::kVerifyMaxT - 1;
+                            chain_n = strata::kernels::kVerifyNarrowT - 1;
                             if (!mtp.chain_launch(A.T, outp.data(), A.p, a, nullptr, 0, chain_n, chain_n, err))
                                 return die(err);
                             chain_kind = 2;
@@ -12672,8 +12746,20 @@ int main(int argc, char** argv) {
             policy.set_scale_all(req_minp_rule);
             while (!pl_ran && !cancelled && produced_n < max_new) {
                 policy.set_context(p);         // STRATA_SPEC_COST: the round costs of this context length
+                bool static_window = false;
+                if (req_static && !first_window) {
+                    const int32_t prev = consumed.empty() ? -1 : consumed.back();
+                    const int count = static_drafter.propose(prev, x, std::min(S_r, df2_width) - 1, sbuf.data());
+                    if (count > 0) {
+                        static_window = true;
+                        for (int i = 0; i < S_r - 1; ++i) {
+                            if (i < count) drafts[(size_t) i] = sbuf[(size_t) i];
+                            dprob[(size_t) i] = i < count ? 1.0f : 0.0f;
+                        }
+                    }
+                }
                 int T = (req_mtp || req_df2) ? S_mtp_r : 1;   // no drafter: one token a round unless a lookup fires
-                if (req_df2) T = strata::spec::df2_window(dprob.data(), S_r, df2_conf);   // DFlash2's confidence cut
+                if (req_df2) T = strata::spec::df2_window(dprob.data(), std::min(S_r, df2_width), df2_conf);   // DFlash2's confidence cut
                 else if (req_mtp && !req_minp_rule) T = policy.mtp_window(dprob.data(), S_mtp_r);
                 else if (req_mtp && req_spec_min_p > 0.0) {
                     T = 1;
@@ -12894,6 +12980,9 @@ int main(int argc, char** argv) {
                 }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+                if (req_df2 && !first_window && !static_window && !from_sfx && chain_n == 0 && T == df2_width &&
+                    produced_n + a + 1 < max_new)
+                    block_policy.observe(df2_width, a);
                 draft_offered += T - 1;
                 draft_accepted += a;
                 first_window = false;
@@ -12943,10 +13032,12 @@ int main(int argc, char** argv) {
                                           outv[(size_t) a]);
                 bool drafted = eos || produced_n >= max_new;
                 if (!drafted && req_df2) {
-                    int32_t dd[strata::core::Dflash2Drafter::kDrafts];
-                    float pp[strata::core::Dflash2Drafter::kDrafts];
+                    df2_width = block_policy.choose(S_r);
+                    df2.set_block_rows(df2_width);
+                    int32_t dd[strata::core::Dflash2Drafter::kMaxDrafts] = {};
+                    float pp[strata::core::Dflash2Drafter::kMaxDrafts] = {};
                     drafted = df2.draft(ver.tap_dev(), a + 1, p, outv[(size_t) a], dd, pp, err);
-                    for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) {
+                    for (size_t i = 0; i < drafts.size() && i < (size_t) df2_width - 1; ++i) {
                         drafts[(size_t) i] = dd[i];
                         dprob[(size_t) i] = pp[i];
                     }
@@ -13027,6 +13118,10 @@ int main(int argc, char** argv) {
                 }
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
+            if (req_df2 && strata::env_auto("DF2_BLOCK_LOG") == 1)
+                std::fprintf(stderr, "xestrata dflash2: block rounds 8=%lld 16=%lld static=%d\n",
+                             (long long) (df2.rounds_short - df2_short0), (long long) (df2.rounds_wide - df2_wide0),
+                             (int) req_static);
             if (req_probe >= 0)   // the start's measurement: this run's speed
                 probe_runs.push_back({req_probe, produced_n, decode_ms, draft_offered, draft_accepted});
             if (df2_loaded && req_kind != 0 && req_probe == -2)   // --draft auto learn: this request's measured decode speed
@@ -13808,7 +13903,12 @@ int main(int argc, char** argv) {
                 const auto sh = mtp.shared_head();
                 if (sh.rows != nullptr) df2.share_head({sh.rows, sh.vocab_dev, sh.n, sh.type});
             }
-            if (!df2.bind(wt, g, &native_head, df2_vocab, err) || !df2.prepare(ver.tap_dev(), err)) {
+            if (!df2.bind(wt, g, &native_head, df2_vocab, err)) {
+                std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
+                return 1;
+            }
+            df2.set_max_drafts(o.spec - 1);
+            if (!df2.prepare(ver.tap_dev(), err)) {
                 std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
                 return 1;
             }
@@ -13947,8 +14047,11 @@ int main(int argc, char** argv) {
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
         if (use_mtp && S_mtp < o.spec) mtp.set_max_drafts(S_mtp - 1);
         const bool use_df2 = df2_loaded;   // the CLI: DFlash2 is the drafter when loaded (--draft auto acts as dflash2)
+        strata::spec::Df2BlockPolicy block_policy(block_selected == 1 ? strata::spec::Df2BlockPolicy::Mode::Long
+                                                                      : strata::spec::Df2BlockPolicy::Mode::Short);
+        int df2_width = strata::kernels::kVerifyNarrowT;
         const double df2_conf = o.draft_conf > 0.0 ? o.draft_conf : df2_default_conf(xcache.slots());
-        if (use_df2) df2.set_max_drafts(S_mtp - 1);
+        if (use_df2) df2.set_max_drafts(o.spec - 1);
         strata::spec::DraftPolicy policy(o.spec);   // MTP or lookup window (see draft_policy.hpp)
         // the window rule, as the chain drafts: another draft after n when the rule would keep it (--spec-window)
         const bool minp_rule = o.spec_window == "min-p";
@@ -14032,8 +14135,19 @@ int main(int argc, char** argv) {
             const Clock::time_point t0 = Clock::now();
             strata::core::progress_at("spec loop: choosing the window", (int64_t) produced.size());
             policy.set_context(p);   // STRATA_SPEC_COST: the round costs of this context length
+            if (use_df2 && static_selected && !first_window) {
+                const int32_t prev = produced.size() > 1 ? (int32_t) produced[produced.size() - 2]
+                    : o.tokens.empty() ? -1 : (int32_t) o.tokens.back();
+                const int count = static_drafter.propose(prev, x, std::min(o.spec, df2_width) - 1, sbuf.data());
+                if (count > 0) {
+                    for (int i = 0; i < o.spec - 1; ++i) {
+                        if (i < count) drafts[(size_t) i] = sbuf[(size_t) i];
+                        dprob[(size_t) i] = i < count ? 1.0f : 0.0f;
+                    }
+                }
+            }
             int T = S_mtp;
-            if (use_df2) T = strata::spec::df2_window(dprob.data(), S_mtp, df2_conf);
+            if (use_df2) T = strata::spec::df2_window(dprob.data(), std::min(o.spec, df2_width), df2_conf);
             else if (use_mtp && !minp_rule) T = policy.mtp_window(dprob.data(), S_mtp);
             else if (use_mtp && o.spec_min_p > 0.0) {
                 T = 1;
@@ -14211,10 +14325,12 @@ int main(int argc, char** argv) {
             }
             bool drafted = (int64_t) produced.size() >= max_new;
             if (!drafted && use_df2) {
-                int32_t dd[strata::core::Dflash2Drafter::kDrafts];
-                float pp[strata::core::Dflash2Drafter::kDrafts];
+                df2_width = block_policy.choose(o.spec);
+                df2.set_block_rows(df2_width);
+                int32_t dd[strata::core::Dflash2Drafter::kMaxDrafts] = {};
+                float pp[strata::core::Dflash2Drafter::kMaxDrafts] = {};
                 drafted = df2.draft(ver.tap_dev(), a + 1, p, outv[(size_t) a], dd, pp, err);
-                for (size_t i = 0; i < drafts.size() && i < (size_t) strata::core::Dflash2Drafter::kDrafts; ++i) {
+                for (size_t i = 0; i < drafts.size() && i < (size_t) df2_width - 1; ++i) {
                     drafts[(size_t) i] = dd[i];
                     dprob[(size_t) i] = pp[i];
                 }
