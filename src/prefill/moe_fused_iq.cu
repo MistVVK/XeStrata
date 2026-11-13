@@ -2716,12 +2716,17 @@ bool staged_blobs_ok(const Batch& b, const NativeGeom& g) {
 // `staged`: the launch's gate/up kernel is a weight-staging instance (sw_on); the rule then takes 128 rows from every size on the sm_86 / sm_120 cards under 80 SMs.
 // `wide`: the launch's gate/up is Q6_K or Q8_0: on sm_86 cards with 40+ SMs the rule takes 128 rows above 112 rows an expert (fused_tile_rule.hpp).
 // `kq`: 0, or the launch's pair is one of Flash-Next's K-quant pairs (fused_tile::kq_flash_kind: 1 a Q5_1 down, 2 a Q8_0 down): on sm_86-class cards with 80-99 SMs the rule takes 128 rows from 5.8 rows an expert up.
-int pick_ww(int64_t n, int n_expert, bool staged, bool wide, int kq) {
+// STRATA_PF_FUSED_TILE=64|128 as a work item (4 / 2), 0 when the variable does not force one.  Read once.
+int forced_ww() {
     static const int forced = [] {
         const char* v = std::getenv("STRATA_PF_FUSED_TILE");
         const int t = v ? std::atoi(v) : 0;
         return t == 64 ? 4 : t == 128 ? 2 : 0;
     }();
+    return forced;
+}
+int pick_ww(int64_t n, int n_expert, bool staged, bool wide, int kq) {
+    const int forced = forced_ww();
     if (forced) return forced;
     // the rule itself (the card classes, the thresholds and the measurements behind them) is include/strata/prefill/fused_tile_rule.hpp, a pure function the unit test
     // tests/prefill/fused_tile_rule_test.cpp pins for every measured card class.  STRATA_PF_TILE_DEBUG=1 prints the choice of every launch of a class that has its own rule.
@@ -2744,9 +2749,13 @@ int pick_ww(int64_t n, int n_expert, bool staged, bool wide, int kq) {
 // Every call site that launches `launch<...>` with a ww from pick_ww on a batch of blobs takes its ww from here.
 int launch_ww(const Batch& b, const NativeGeom& g, int64_t n, int n_expert, bool staged, bool wide, int kq = 0) {
 #if !defined(__HIPCC__)
-    {   // Turing has no staging kernels (no cp.async: ASTAGES_DEV 2), so the blob check does not apply; only the instances that fit 64 KB exist
+    {   // Turing has no staging kernels (no cp.async: ASTAGES_DEV 2), so the blob check does not apply; only the instances that fit 64 KB exist.  Its own tile rule
+        // (fused_tile::t75_pick: an i-quant gate/up takes 128 rows from above 56 rows an expert, a Q2_0 gate/up keeps the band); STRATA_PF_FUSED_TILE still forces one.
         const DevInfo& dv = dev_info();
-        if (dv.t75) return t75_ww(dv, g, pick_ww(n, n_expert, staged, wide, kq));
+        if (dv.t75) {
+            const int f = forced_ww();
+            return t75_ww(dv, g, f != 0 ? f : strata::prefill::fused_tile::t75_pick(n, n_expert, g.gu_type == T_Q2_0));
+        }
     }
     if ((staged || sw_on(g.d_type, false)) && !staged_blobs_ok(b, g)) return strata::prefill::fused_tile::kUnstagedWw;
 #else

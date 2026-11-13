@@ -102,6 +102,20 @@ constexpr Pick pick(const Card& c, int64_t n, int n_expert, bool staged = false,
     return {avg > 56.0 && avg <= 112.0 ? 2 : 4, Why::kBand};
 }
 
+// Turing (sm_75: the m8n8k16 int8 path of the native kernels, `t75` in src/prefill/moe_fused_iq.cu, which calls this instead of pick): an i-quant gate/up takes 128 routed rows from above 56 rows
+// an expert, with no upper end (pick's band goes back to 64 above 112).  A Q2_0 gate/up (the Q2_0 / Q2_0 pair) keeps the band: its tile was not measured on Turing.  t75_ww then turns 64 rows into 128
+// where the 64-row instance does not fit 64 KB (IQ2_S).  One layer of Flash-Next's shape (512 experts, top 10) on a TITAN RTX (sm_75, 72 SMs, power-capped at 100 W), one process per run in the order
+// 64 / 128 / MMQ / 128 / 64, ms at 8,192 tokens (160 rows an expert): IQ3_S / IQ4_NL 110.2 / 105.9 / MMQ 128.7 / 123.0 / 180.5; IQ3_S / Q2_0 164.3 / 112.5 / MMQ 133.5 / 121.7 / 169.7.  That card's
+// time moves 10-20 % from one process to the next, so each run is also read against the int8 dp4a time measured in the same process (the tile does not touch that kernel): fused / dp4a 0.68 / 0.61 /
+// (MMQ 0.69) / 0.64 / 0.88 and 0.87 / 0.60 / (0.69) / 0.62 / 0.86.  At 4,096 tokens (80 rows, 128 in the band already) the 64 and 128 runs agree within 5 %; at 2,048 (40 rows) the two halves of the
+// order disagree; at 1,000 and 256 tokens (19.5 and 5 rows) the 64-row tile is faster (128 / 64 of the dp4a share 1.1 to 1.7).
+constexpr double kT75MinAvg = 56.0;
+constexpr int t75_pick(int64_t n, int n_expert, bool q2_gate) {
+    if (q2_gate) return pick(Card{}, n, n_expert).ww;
+    const double avg = (double) n / (double) (n_expert > 1 ? n_expert : 1);
+    return avg > kT75MinAvg ? 2 : 4;
+}
+
 // The gate/up + down pairs of the wide line (ggml type ids as in moe_fused_iq.cu): a Q6_K or Q8_0 gate/up (Q6_K + Q8_0, Q8_0 / Q8_0), and since 11-12 the K-quant pairs of Qwen3.6's UD-Q4_K_XL, a Q4_K or Q5_K gate/up
 // with a Q5_K or Q6_K down (the Qwen3.6 copy of the kernels only: Flash-Next's K-quant gate/up has a Q5_1 / Q8_0 down and keeps its rule).
 constexpr int kTypeQ5_1 = 7, kTypeQ8_0 = 8, kTypeQ4K = 12, kTypeQ5K = 13, kTypeQ6K = 14;
