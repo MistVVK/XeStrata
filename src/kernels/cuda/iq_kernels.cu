@@ -6345,7 +6345,7 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
     const int64_t avg = cap_entries / cap_groups;
     const bool b_ok = L.n_embd % 128 == 0 && L.n_ff % 64 == 0;
     if (tm <= 0) tm = (avg >= 96 && b_ok) ? 8 : (int) std::max<int64_t>(2, std::min<int64_t>(4, (avg + 8) / 16));
-    tm = tm <= 2 ? 2 : tm == 3 ? 3 : tm >= 8 && b_ok ? 8 : 4;
+    tm = tm <= 2 ? 2 : tm == 3 ? 3 : tm >= 8 && b_ok && i8_tile8_type(L.gu_type) && i8_tile8_type(L.d_type) ? 8 : 4;   // (the K-quants and Q5_1 have no tile 8)
     const size_t smem_limit = i8_smem_limit();   // a tile that does not fit the device's shared memory per block falls to the next smaller one
     while (tm > 2 && i8_smem_bytes(L.gu_type, L.d_type, tm) > smem_limit) tm = tm == 8 ? 4 : tm - 1;
     const int bm = tm == 8 ? 128 : 16 * tm;
@@ -6360,12 +6360,16 @@ void native_expert_i8(const NativeExpertLayout& L, const unsigned long long* grp
         case 23: i8_launch<23, true>(tm, a, s); break;
         case 29: i8_launch<29, true>(tm, a, s); break;
         case 42: i8_launch<42, true>(tm, a, s); break;
+        case 12: i8_launch<12, true>(tm, a, s); break;
+        case 13: i8_launch<13, true>(tm, a, s); break;
+        case 14: i8_launch<14, true>(tm, a, s); break;
         default: i8_launch<22, true>(tm, a, s); break;
     }
     check("native_expert_i8/gu");
     if (L.d_type == 20) i8_launch<20, false>(tm, a, s);
     else if (L.d_type == 6) i8_launch<6, false>(tm, a, s);
     else if (L.d_type == 8) i8_launch<8, false>(tm, a, s);
+    else if (L.d_type == 7) i8_launch<7, false>(tm, a, s);
     else i8_launch<42, false>(tm, a, s);
     check("native_expert_i8/down");
 }

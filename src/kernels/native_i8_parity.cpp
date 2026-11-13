@@ -59,10 +59,14 @@ const char* name_of(int t) {
         case 29: return "IQ1_M";
         case 6: return "Q5_0";
         case 8: return "Q8_0";
+        case 12: return "Q4_K";
+        case 13: return "Q5_K";
+        case 14: return "Q6_K";
+        case 7: return "Q5_1";
         default: return "?";
     }
 }
-int block_values(int t) { return t == 20 || t == 6 || t == 8 ? 32 : t == 42 ? 64 : 256; }
+int block_values(int t) { return t == 20 || t == 6 || t == 8 || t == 7 ? 32 : t == 42 ? 64 : 256; }
 
 // `rows` rows of `n` values of format t: random bytes (every code is valid for these formats), then a finite fp16 scale in every block
 std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& rng) {
@@ -76,7 +80,15 @@ std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& r
             for (int i = 0; i < 4; ++i) w[o + 48 + 2 * i + 1] = (uint8_t) ((w[o + 48 + 2 * i + 1] & 0x0F) | (((h >> (4 * i)) & 15) << 4));
             continue;
         }
+        if (t == 14) {   // Q6_K: d is the block's last two bytes (offset 208); the ql / qh / int8 scale bytes stay random
+            std::memcpy(&w[o + 208], &h, 2);
+            continue;
+        }
         std::memcpy(&w[o], &h, 2);
+        if (t == 12 || t == 13 || t == 7) {   // Q4_K / Q5_K: dmin, Q5_1: m, the second fp16 of the block, either sign
+            const uint16_t h2 = (uint16_t) ((sgn(rng) ? 0x8000 : 0) | (ex(rng) << 10) | man(rng));
+            std::memcpy(&w[o + 2], &h2, 2);
+        }
     }
     return w;
 }
@@ -323,6 +335,11 @@ int main() {
         }
     // second wave: gate/up IQ4_XS, IQ1_M and Q2_0, down Q5_0 and Q8_0 (after the first-wave rows, so those lines keep their place)
     for (const auto& pr : std::vector<std::pair<int, int>>{{23, 20}, {23, 42}, {23, 6}, {29, 20}, {29, 42}, {29, 8}, {16, 6}, {21, 8}, {22, 6}, {22, 8}, {42, 42}, {42, 20}, {42, 6}}) {
+        check(pr.first, pr.second, 512, 256, s, rng);
+        check(pr.first, pr.second, 2560, 640, s, rng);
+    }
+    // third wave: the K-quants Q4_K, Q5_K, Q6_K as gate/up and Q5_1 as down (the UD-Q4_K_XL / Q6_K_XL pairs and mixes of them with the earlier formats)
+    for (const auto& pr : std::vector<std::pair<int, int>>{{12, 7}, {12, 8}, {13, 7}, {13, 8}, {14, 8}, {14, 7}, {12, 20}, {12, 42}, {13, 20}, {14, 20}, {14, 42}, {16, 7}, {23, 7}, {42, 7}}) {
         check(pr.first, pr.second, 512, 256, s, rng);
         check(pr.first, pr.second, 2560, 640, s, rng);
     }
