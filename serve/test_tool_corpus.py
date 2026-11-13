@@ -102,6 +102,20 @@ DOC = "Close a call with </function> and then </tool_call>.\nlike this."
 add("4078-call-format-in-a-file", qwen("write_file", path="DOC.md", content=DOC),
     [("write_file", {"path": "DOC.md", "content": DOC})],
     source="#210: a file that documents the format")
+CLOSE_DOC = ("# Tool calls\n\nThe closing tags, in order:\n\n</parameter>\n</function>\n</tool_call>\n\n"
+             "Nothing may follow the last one.")
+add("4701-closing-tags-in-a-file", "I will save the doc.\n\n" + qwen("write_file", path="TOOLS.md", content=CLOSE_DOC),
+    [("write_file", {"path": "TOOLS.md", "content": CLOSE_DOC})], content="I will save the doc.",
+    source="#4701, #5040: streamed arguments too")
+add("4701-closing-tags-in-a-file-recover", qwen("write_file", path="TOOLS.md", content=CLOSE_DOC),
+    [("write_file", {"path": "TOOLS.md", "content": CLOSE_DOC})], recover=True, source="#4701, recover on")
+add("4701-text-after-a-whole-call", qwen("read", path="a.txt") + "\n\nThat is the read.",
+    [("read", {"path": "a.txt"})], content="That is the read.",
+    source="#4701: with no later close, the first one is the end")
+add("4701-two-calls-with-text-between",
+    qwen("read", path="a.txt") + "\n\nAnd the next:\n" + qwen("read", path="b.txt"),
+    [("read", {"path": "a.txt"}), ("read", {"path": "b.txt"})], content="And the next:",
+    source="#4701: a later call is not a later close")
 add("4077-stray-think-line",
     "The user wants a file with a literal.\n" + STRAY_VALUE + "\nSo I write it.\n</think>\n\n"
     + qwen("write_file", path="out.txt", content=STRAY_VALUE),
