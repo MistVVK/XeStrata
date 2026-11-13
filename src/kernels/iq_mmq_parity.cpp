@@ -11,6 +11,13 @@
 // scale per 16 (IQ2_XS) and a min term (Q4_K); each over three experts of 5, 40 and 17 rows and one of 70 (the tile
 // shapes of 16, 32 and 64 rows).  The weights are random block bytes with a sane d: every bit pattern of the grid
 // indices and signs is a valid block.  Exit 77 (skipped) where the GPU runs neither form.
+//
+// The fixed-point form (iq_mmq_fx: IQ3_XXS) against the CPU's canonical rows (canon_expert.hpp, iq256_canon_rows),
+// every bit: the activations' int8 values and fp16 scales the two quantized, and each output.  The rows' 256s at
+// scales 2^-6 to 2^6, a row of zeros among them, so the rows' tops and the blocks' shifts both ways are taken.
+#include "strata/kernels/cpu/canon_expert.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
@@ -136,6 +143,102 @@ int check(ggml_type t, int64_t N, int64_t K, const std::vector<int32_t>& counts)
     return ok ? 0 : 1;
 }
 
+// The fixed-point products of IQ3_XXS (iq_mmq_fx) on canonical activations against the CPU's canonical rows, bit for
+// bit: K a multiple of 512 (canon_layer's), the rows one at a time and eight at a time on the CPU
+int check_fx(int64_t N, int64_t K, const std::vector<int32_t>& counts) {
+    namespace k = strata::kernels;
+    namespace cpu = strata::kernels::cpu;
+    const ggml_type t = GGML_TYPE_IQ3_XXS;
+    sycl::queue& q = strata::core::Runtime::get().compute();
+    const int n = (int) counts.size();
+    std::vector<int32_t> bounds(1, 0);
+    int64_t max_rows = 0;
+    for (int32_t c : counts) {
+        bounds.push_back(bounds.back() + c);
+        max_rows = std::max<int64_t>(max_rows, c);
+    }
+    const int64_t R = bounds.back();
+    std::vector<std::vector<uint8_t>> w;
+    std::vector<uint8_t> all;
+    for (int e = 0; e < n; ++e) {
+        w.push_back(weights(t, N, K));
+        all.insert(all.end(), w.back().begin(), w.back().end());
+    }
+    std::vector<float> x((size_t) (R * K));
+    std::normal_distribution<float> nd(0.0f, 1.0f);
+    for (int64_t r = 0; r < R; ++r)
+        for (int64_t i = 0; i < K; ++i) {
+            const int g = (int) ((r + i / 256) % 5) * 3 - 6;   // each 256 at 2^-6 .. 2^6 (its scale an fp16 normal)
+            x[(size_t) (r * K + i)] = r == 3 ? 0.0f : std::ldexp(nd(rng()), g);
+        }
+    std::vector<int32_t> ids((size_t) R);
+    for (int64_t i = 0; i < R; ++i) ids[(size_t) i] = (int32_t) i;
+
+    P::Device dev;
+    const size_t xq_bytes = k::iq_mmq_act_bytes(R, K);
+    float* dx = dev.upload(x);
+    uint8_t* dw = dev.upload(all);
+    int32_t* db = dev.upload(bounds);
+    int32_t* di = dev.upload(ids);
+    uint8_t* dxq = dev.alloc<uint8_t>(xq_bytes);
+    float* dy = dev.alloc<float>((size_t) (R * N));
+    k::iq_mmq_quantize(q, dx, nullptr, dxq, K, K, R, false, false, true).wait();
+    k::iq_mmq_grouped(q, k::iq_mmq_fx((int) t), dw, w[0].size(), N, K, n, dxq, R, db, max_rows, di, dy, N).wait();
+    std::vector<uint8_t> xq(xq_bytes);
+    std::vector<float> y((size_t) (R * N));
+    P::copy_out(xq.data(), dxq, xq_bytes);
+    P::copy_out(y.data(), dy, y.size());
+
+    // the CPU's: canon_quant's form (the scales of the 256s, the sums of the 32s, the values from a 64-byte boundary)
+    const size_t qs_off = (size_t) (((K / 256) * 4 + (K / 32) * 4 + 63) / 64 * 64);
+    std::vector<std::vector<uint8_t>> act((size_t) R, std::vector<uint8_t>(qs_off + (size_t) K + 64));
+    const auto* gx8 = reinterpret_cast<const int8_t*>(xq.data());
+    const auto* gxs = reinterpret_cast<const float*>(xq.data() + R * K);
+    size_t act_diff = 0;
+    for (int64_t r = 0; r < R; ++r) {
+        uint8_t* a = act[(size_t) r].data();
+        cpu::canon_quant(x.data() + r * K, K, 256, a);
+        const auto* ds = reinterpret_cast<const float*>(a);
+        const auto* v = reinterpret_cast<const int8_t*>(a + qs_off);
+        for (int64_t i = 0; i < K; ++i) act_diff += v[i] != gx8[r * K + i];
+        for (int64_t b = 0; b < K / 32; ++b) act_diff += std::memcmp(&ds[b / 8], &gxs[r * (K / 32) + b], 4) != 0;
+    }
+    size_t diff1 = 0, diff8 = 0;
+    std::vector<float> yc((size_t) N), yc8((size_t) (8 * N));
+    for (int e = 0; e < n; ++e) {
+        const uint8_t* we = w[(size_t) e].data();
+        const size_t rb = ggml_row_size(t, K);
+        for (int64_t r0 = bounds[(size_t) e]; r0 < bounds[(size_t) e + 1]; r0 += 8) {
+            const int nt = (int) std::min<int64_t>(8, bounds[(size_t) e + 1] - r0);
+            const int8_t* xv[8];
+            const float* xd[8];
+            float* out8[8];
+            for (int j = 0; j < nt; ++j) {
+                const uint8_t* a = act[(size_t) (r0 + j)].data();
+                xv[j] = reinterpret_cast<const int8_t*>(a + qs_off);
+                xd[j] = reinterpret_cast<const float*>(a);
+                out8[j] = yc8.data() + (size_t) j * (size_t) N;
+            }
+            cpu::iq256_canon_rows((int) t, we, rb, (int) K, xv, xd, nt, out8, 0, (int) N);
+            for (int j = 0; j < nt; ++j) {
+                float* out1[1] = {yc.data()};
+                cpu::iq256_canon_rows((int) t, we, rb, (int) K, &xv[j], &xd[j], 1, out1, 0, (int) N);
+                const float* g = y.data() + (r0 + j) * N;
+                for (int64_t o = 0; o < N; ++o) {
+                    diff1 += std::memcmp(&yc[(size_t) o], &g[o], 4) != 0;
+                    diff8 += std::memcmp(&yc8[(size_t) j * (size_t) N + (size_t) o], &g[o], 4) != 0;
+                }
+            }
+        }
+    }
+    const bool ok = act_diff == 0 && diff1 == 0 && diff8 == 0;
+    std::printf("  %-8s fixed-point, K %4lld, %d experts of up to %3lld rows: activations %zu differ, outputs %zu (1 a "
+                "call) and %zu (8 a call) of %lld differ  %s\n",
+                ggml_type_name(t), (long long) K, n, (long long) max_rows, act_diff, diff1, diff8, (long long) (R * N),
+                ok ? "ok" : "*** FAIL ***");
+    return ok ? 0 : 1;
+}
+
 // One expert's few rows with K in parts (the parts' buffer reserved, as the plain models' prompt reserves it): each
 // part's sums and the pass adding them, against the same reference
 int split_parts(ggml_type t, int64_t N, int64_t K, int32_t rows) {
@@ -185,7 +288,8 @@ int bench() {
     const Combo combos[] = {{"ornith-q4_k_m", GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, 2048, 512},
                             {"ornith-3bit", GGML_TYPE_Q3_K, GGML_TYPE_Q2_K, GGML_TYPE_Q2_K, 2048, 512},
                             {"llmjp-q4_k_m", GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_0, 2560, 960},
-                            {"qwen-iq2_xs", GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS, 2560, 640}};
+                            {"qwen-iq2_xs", GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_XS, 2560, 640},
+                            {"qwen-iq3_xxs", GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL, 2560, 640}};
     constexpr int G = 16;
     for (const Combo& c : combos) {
         const int64_t N = c.N, FF = c.FF;
@@ -199,8 +303,10 @@ int bench() {
         q.memset(wd, 0x11, db * G).wait();
         uint16_t* dq_gu = dev.alloc<uint16_t>((size_t) G * 2 * (size_t) (FF * N));
         uint16_t* dq_d = dev.alloc<uint16_t>((size_t) (G * N * FF));
+        const int fx = one ? k::iq_mmq_fx((int) c.gate) : 0;   // the gate/up's fixed-point form, where it has one
         if (one) {   // the forms the engine's warming chooses (iq_mmq_choose_forms)
             k::iq_mmq_choose_forms(q, (int) c.gate, 2 * FF, N, G);
+            if (fx != 0) k::iq_mmq_choose_forms(q, fx, 2 * FF, N, G);
         } else {
             k::iq_mmq_choose_forms(q, (int) c.gate, FF, N, G);
             k::iq_mmq_choose_forms(q, (int) c.up, FF, N, G);
@@ -223,6 +329,13 @@ int bench() {
                 return p;
             };
             const uint8_t *xg = xq_of(c.gate, N), *xu = one ? xg : xq_of(c.up, N), *xh = xq_of(c.down, FF);
+            uint8_t* xc = nullptr;   // the fixed-point form's canonical rows (of zeros)
+            if (fx != 0) {
+                xc = io.alloc<uint8_t>(k::iq_mmq_act_bytes(R, N));
+                float* z = io.alloc<float>((size_t) (R * N));
+                q.memset(z, 0, (size_t) (R * N) * 4).wait();
+                k::iq_mmq_quantize(q, z, nullptr, xc, N, N, R, false, false, true).wait();
+            }
             float* gu = io.alloc<float>((size_t) (R * 2 * FF));
             float* dn = io.alloc<float>((size_t) (R * N));
             uint16_t* x16 = io.alloc<uint16_t>((size_t) (R * N));
@@ -252,8 +365,16 @@ int bench() {
                 k::xmx_gemm_grouped(x16, dq_gu, 2 * FF * N, gu, db_, G, r, 2 * FF, N, s);
                 k::xmx_gemm_grouped(h16, dq_d, N * FF, dn, db_, G, r, N, FF, s);
             });
-            std::printf("  %-14s %3lld rows an expert: int8 %8.1f us  FP16 %8.1f us  %s\n", c.name, (long long) r, us8,
+            double usfx = 0.0;   // the gate/up's fixed-point form, the same down
+            if (fx != 0)
+                usfx = time_us(q, [&] {
+                    k::iq_mmq_grouped(q, fx, wg, gb + ub, 2 * FF, N, G, xc, R, db_, r, di, gu, 2 * FF);
+                    k::iq_mmq_grouped(q, (int) c.down, wd, db, N, cols(c.down, FF), G, xh, R, db_, r, di, dn, N);
+                });
+            std::printf("  %-14s %3lld rows an expert: int8 %8.1f us  FP16 %8.1f us  %s", c.name, (long long) r, us8,
                         us16, us8 < us16 ? "int8" : "FP16");
+            if (fx != 0) std::printf("  fixed-point %8.1f us (%+.1f%% of int8)", usfx, 100.0 * (usfx / us8 - 1.0));
+            std::printf("\n");
         }
     }
     return 0;
@@ -275,6 +396,7 @@ int main(int argc, char** argv) try {
         bad += check(GGML_TYPE_IQ3_XXS, 128, 512, c);
         bad += check(GGML_TYPE_IQ2_XS, 128, 512, c);
         bad += check(GGML_TYPE_Q4_K, 128, 512, c);
+        if (strata::kernels::cpu::cpu_avx2_ok()) bad += check_fx(256, 2560, c);   // the CPU's rows are AVX2's
     }
     // last: the parts' buffer it reserves stays with the queue
     for (const int32_t rows : {16, 64}) {
