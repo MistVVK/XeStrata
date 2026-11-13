@@ -3167,6 +3167,33 @@ def free_gb(path):
     return shutil.disk_usage(path).free / 1e9
 
 
+def disk_room_problem(models_dir, pack_dir, other_gb, copy_gb, other_note="", free=None):
+    """None when the files this setup run still writes fit, else (message, hint).  `other_gb` is what goes to the model
+    folder (a download, the preparation, the picture files); `copy_gb` is the Q2_0 experts' pack, which is written to
+    the data folder's packs folder and not to the model folder (a refusal named the model folder although the bytes
+    belonged to the pack in the data folder).  The pack is measured where it goes; on one drive both add up."""
+    free = free or free_gb
+    packs = pack_dir.parent
+    free_models = free(models_dir)
+    models_problem = (f"not enough free disk space in {models_dir}: need ~{other_gb:.0f} GB, {free_models:.0f} GB free"
+                      + other_note, "use --models-dir on a bigger drive")
+    if free_models < other_gb:
+        return models_problem
+    if not copy_gb:
+        return None
+    free_packs = free(packs)
+    try:
+        same_drive = os.stat(models_dir).st_dev == os.stat(packs).st_dev
+    except OSError:
+        same_drive = False
+    needs = copy_gb + (other_gb if same_drive else 0)
+    if free_packs < needs:
+        return (f"not enough free disk space for the Q2_0 experts' pack in {pack_dir}: it needs about {needs:.0f} GB "
+                f"and {free_packs:.0f} GB are free there.",
+                "free some space, or move XeStrata's data folder to a bigger drive (--data-dir)")
+    return None
+
+
 # ------------------------------------------------------------------------------------------------ downloads
 # Parallel ranged downloads (upstream 04221c3e2).  One TCP stream often cannot fill a fast line (a long or lossy route,
 # a CDN that limits each connection): download() takes the file in DL_CHUNK pieces over several connections, writes each
@@ -9684,12 +9711,14 @@ def main() -> int:
     mtp_have = find_in(roots, "mtp/rt/experts.bin") is not None
     q2_avx = model == "Q2_0" and avx512 and family == "qwen"
     margin = 2 if mtp_have else 8                      # working room: a guess, not bytes that will be written
-    real = to_fetch + (40 if q2_avx and not pack_bin else 0) + (1 if vision != "none" else 0)
+    copy_gb = 40 if q2_avx and not pack_bin else 0     # the Q2_0 experts' pack (goes to the data folder's packs)
+    real = to_fetch + copy_gb + (1 if vision != "none" else 0)
     need = real + margin
     free_now = free_gb(models_dir)
-    if free_now < real:                                # upstream 537f8fef8: stop only when the bytes do not fit
-        fail(f"not enough free disk space in {models_dir}: need ~{real:.0f} GB, {free_now:.0f} GB free",
-             "use --models-dir on a bigger drive")
+    if (problem := disk_room_problem(models_dir, pack_now, real - copy_gb, copy_gb,
+                                     f" ({on_disk:.0f} GB of the model is already there)" if on_disk >= 1
+                                     and not have_model else "")):   # upstream 537f8fef8: only when the bytes lack room
+        fail(*problem)
     if free_now < need:
         warn(f"little free disk space in {models_dir}: {free_now:.0f} GB free for about {real:.0f} GB of files. "
              "Setup goes on and should fit; free up space if it stops")
