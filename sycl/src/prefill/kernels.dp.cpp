@@ -997,6 +997,40 @@ __dpct_inline__ void gdn_rec_cols_pipe_kernel(float *__restrict__ state,
 #pragma unroll
     for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
 }
+
+__dpct_inline__ void gdn_rec_cols_pipe_local_kernel(float* state,const float* h,const float* gate,const float* beta,float* oc_out,int64_t T){
+    auto it=sycl::ext::oneapi::this_work_item::get_nd_item<3>();auto sg=it.get_sub_group();
+    const int head=it.get_group(2)/NCB,cb=it.get_group(2)%NCB;
+    const int c=it.get_local_id(2),rg=it.get_local_id(1),lane=c&15,col=cb*CB+c,qh=head%HK;
+    auto& kvred=*sycl::ext::oneapi::group_local_memory_for_overwrite<float[RG][CB]>(it.get_group());
+    auto& ored=*sycl::ext::oneapi::group_local_memory_for_overwrite<float[RG][CB]>(it.get_group());
+    float st[RPG];float* base=state+((size_t(rg*RPG)*HV+head)*S+col);const size_t stride=size_t(HV)*S;
+#pragma unroll
+    for(int r=0;r<RPG;++r)st[r]=base[r*stride];
+    for(int64_t t=0;t<T;++t){
+        const float* row=h+t*C;
+        const float* qp=row+qh*S+rg*RPG;const float* kp=row+HK*S+qh*S+rg*RPG;
+        const float q0=qp[lane],q1=qp[lane+16],k0=kp[lane],k1=kp[lane+16];
+        const float cv=row[2*HK*S+head*S+col],cg=gate[t*HV+head],cbt=beta[t*HV+head];
+        const float g=sycl::native::exp(cg);float kv=0.f;
+#pragma unroll
+        for(int r=0;r<RPG;++r){const float k=sycl::group_broadcast(sg,r<16?k0:k1,r&15);kv=sycl::fma(st[r],k,kv);}
+        kvred[rg][c]=kv;it.barrier(sycl::access::fence_space::local_space);
+        const float kvcol=kvred[0][c]+kvred[1][c]+kvred[2][c]+kvred[3][c];
+        const float delta=(cv-g*kvcol)*cbt;float o=0.f;
+#pragma unroll
+        for(int r=0;r<RPG;++r){
+            const float k=sycl::group_broadcast(sg,r<16?k0:k1,r&15);
+            const float q=sycl::group_broadcast(sg,r<16?q0:q1,r&15);
+            st[r]=sycl::fma(g,st[r],k*delta);o=sycl::fma(st[r],q,o);
+        }
+        ored[rg][c]=o;it.barrier(sycl::access::fence_space::local_space);
+        if(rg==0)oc_out[(size_t(t)*HV+head)*S+col]=(ored[0][c]+ored[1][c]+ored[2][c]+ored[3][c])*sycl::rsqrt(float(S));
+    }
+#pragma unroll
+    for(int r=0;r<RPG;++r)base[r*stride]=st[r];
+}
+
 #if !defined(__HIPCC__)
 // The recurrence with one thread for the three value heads that share a key head (head % HK): column c of heads
 // qh, qh + 16 and qh + 32, row group rg.  gdn_rec_cols_pipe_kernel spends its time in shared memory, not in
@@ -2725,6 +2759,11 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
 
+            if([]{const char* e=std::getenv("STRATA_SYCL_GDN_PREFILL_REG_QK");return e&&e[0]=='1';}()){
+                strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)->template parallel_for<dpct_kernel_name<class gdn_rec_cols_pipe_local_probe>>(
+                    sycl::nd_range<3>(sycl::range(1,1,HV*NCB)*sycl::range(1,RG,CB),sycl::range(1,RG,CB)),exp_props,
+                    [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(16)]] {gdn_rec_cols_pipe_local_kernel(state,h,gate,beta,y,T);});
+            }else
             strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
                 ->template parallel_for<
                     dpct_kernel_name<class gdn_rec_cols_pipe_kernel_c6cea3>>(

@@ -1,7 +1,12 @@
+#include "b60_weight_cache.hpp"
+#include "b60_layout_state.hpp"
+#include "strata/kernels/q8_1_finite.hpp"
 // src/kernels/cuda/fused_gr.cu - see include/strata/kernels/fused_gr.hpp.
 #define DPCT_PROFILING_ENABLED
 #include <mutex>
 #include "strata/kprof.hpp"
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/experimental/esimd/math.hpp>
 #include "strata/core/geometry.hpp"
 #include <unordered_map>
 #include <sycl/sycl.hpp>
@@ -9,6 +14,7 @@
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
+#include "strata/workload_trace.hpp"
 #include "strata/core/emulate.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -65,6 +71,38 @@ __dpct_inline__ float warp_sum(float v) {
             0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(), v,
             o);
     return v;
+}
+
+int g_gr_cached_norm_mode=[](){
+    const char* e=std::getenv("STRATA_SYCL_GR_CACHED_NORM");
+    return e&&std::atoi(e)==3?3:0;
+}();
+bool gr_overlap(const void* a,size_t as,const void* b,size_t bs){
+    if(!a||!b||!as||!bs)return false;
+    const uintptr_t av=reinterpret_cast<uintptr_t>(a),bv=reinterpret_cast<uintptr_t>(b);
+    return av<=bv?bv-av<as:av-bv<bs;
+}
+bool gr_cached_norm_safe(const FusedGrArgs* a,int T,const float* xn){
+    for(int k=0;k<T;++k){
+        if(!a[k].apply)continue;
+        const auto* out=a[k].R_out;
+        if(!out||(reinterpret_cast<uintptr_t>(out)&15u)||gr_overlap(out,D*4,xn,size_t(T)*D*4))return false;
+        for(int j=0;j<T;++j){
+            if(!(j==k&&out==a[j].R)&&gr_overlap(out,D*4,a[j].R,D*4))return false;
+            if(j!=k&&a[j].apply&&gr_overlap(out,D*4,a[j].R_out,D*4))return false;
+            if(gr_overlap(out,D*4,a[j].bo_prev,N*4)||
+               gr_overlap(out,D*4,a[j].inj_prev,HC*4)||
+               gr_overlap(out,D*4,a[j].w_norm,D*4)||
+               gr_overlap(out,D*4,a[j].w_down,size_t(LR)*D*2)||
+               gr_overlap(out,D*4,a[j].w_up,size_t(D)*LR*2)||
+               gr_overlap(out,D*4,a[j].w_inject,size_t(HC)*D*2)||
+               gr_overlap(out,D*4,a[j].lo,LR*4)||
+               gr_overlap(out,D*4,a[j].rs,HC*4)||
+               gr_overlap(out,D*4,a[j].inject_out,HC*4)||
+               gr_overlap(out,D*4,a[j].mixed,N*4))return false;
+        }
+    }
+    return true;
 }
 __dpct_inline__ float sigmoidf_(float x) {
     return 1.0f / (1.0f + sycl::native::exp(-x));
@@ -261,11 +299,7 @@ struct GrMulti {
     bool cached_lo = false;
 };
 
-bool gr_overlap(const void* a, size_t as, const void* b, size_t bs) {
-    if (!a || !b || !as || !bs) return false;
-    const uintptr_t av = reinterpret_cast<uintptr_t>(a), bv = reinterpret_cast<uintptr_t>(b);
-    return av <= bv ? bv - av < as : av - bv < bs;
-}
+// gr_overlap: defined once above (the #3153 helper; the #4185 port's copy of it was the same function)
 
 bool gr_reuse_safe(const FusedGrArgs* a, int T, const float* xn) {
     for (int k = 0; k < T; ++k) {
@@ -435,6 +469,108 @@ __dpct_inline__ void gr_norm_split_port_kernel(GrMulti m) {
         *reinterpret_cast<sycl::float4*>(xn + i) = sycl::float4(x.x() * rs, x.y() * rs, x.z() * rs, x.w() * rs);
     }
 }
+// Visit only the owned stream, preserving thread ownership and reduction order.
+__dpct_inline__ void gr_norm_bounds_port_kernel(GrMulti m) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto& part = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[WARPS]>(item.get_group());
+    auto& s_rs = *sycl::ext::oneapi::group_local_memory_for_overwrite<float>(item.get_group());
+    const int tok = (int) item.get_group(2) / HC, c = (int) item.get_group(2) % HC;
+    const FusedGrArgs& a = m.a[tok];
+    float* xn = m.xn + (size_t) tok * D;
+    const int t = (int) item.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+    constexpr int MAXK = (N + THREADS * 4 - 1) / (THREADS * 4) + 1;   // 3: float4s of one stream per thread
+    sycl::float4 keep[MAXK];
+    int kept = 0;
+    float ss = 0.0f;
+    const int first_i = t * 4 + ((c * N - t * 4 + THREADS * 4 - 1) / (THREADS * 4)) * (THREADS * 4);
+    const int end_i = (c + 1) * N;
+    for (int i = first_i; i < end_i; i += THREADS * 4) {
+        const int d = i - c * N;
+        sycl::float4 r = *reinterpret_cast<const sycl::float4*>(a.R + i);
+        if (a.apply) {
+            const sycl::float4 b = *reinterpret_cast<const sycl::float4*>(a.bo_prev + d);
+            r.x() = sycl::fma((float) (b.x()), gw, r.x());
+            r.y() = sycl::fma((float) (b.y()), gw, r.y());
+            r.z() = sycl::fma((float) (b.z()), gw, r.z());
+            r.w() = sycl::fma((float) (b.w()), gw, r.w());
+        }
+        const sycl::float4 g = *reinterpret_cast<const sycl::float4*>(a.w_norm + i);
+        ss += r.x() * r.x() + r.y() * r.y() + r.z() * r.z() + r.w() * r.w();
+        if (kept < MAXK) keep[kept++] = sycl::float4(r.x() * g.x(), r.y() * g.y(), r.z() * g.z(), r.w() * g.w());
+    }
+    const float v = warp_sum(ss);
+    if (lane == 0) part[warp] = v;
+    item.barrier(sycl::access::fence_space::local_space);
+    if (t == 0) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < WARPS; ++w) sum += part[w];
+        s_rs = sycl::rsqrt(sum / (float) N + a.eps);
+        a.rs[c] = s_rs;
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    const float rs = s_rs;
+    int k = 0;
+    for (int i = first_i; i < end_i && k < kept; i += THREADS * 4) {
+        const sycl::float4 x = keep[k++];
+        *reinterpret_cast<sycl::float4*>(xn + i) = sycl::float4(x.x() * rs, x.y() * rs, x.z() * rs, x.w() * rs);
+    }
+}
+// Cached normalized product with the original optional pending write.
+__dpct_inline__ void gr_norm_cached_write_kernel(GrMulti m) {
+    auto item = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    auto& part = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[WARPS]>(item.get_group());
+    auto& s_rs = *sycl::ext::oneapi::group_local_memory_for_overwrite<float>(item.get_group());
+    const int tok = (int) item.get_group(2) / HC, c = (int) item.get_group(2) % HC;
+    const FusedGrArgs& a = m.a[tok];
+    float* xn = m.xn + (size_t) tok * D;
+    const int t = (int) item.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
+    constexpr int MAXK = (N + THREADS * 4 - 1) / (THREADS * 4) + 1;   // 3: float4s of one stream per thread
+    sycl::float4 keep[MAXK];
+    int kept = 0;
+    float ss = 0.0f;
+    const int first_i = t * 4 + ((c * N - t * 4 + THREADS * 4 - 1) / (THREADS * 4)) * (THREADS * 4);
+    const int end_i = (c + 1) * N;
+    for (int i = first_i; i < end_i; i += THREADS * 4) {
+        const int d = i - c * N;
+        sycl::float4 r = *reinterpret_cast<const sycl::float4*>(a.R + i);
+        if (a.apply) {
+            const sycl::float4 b = *reinterpret_cast<const sycl::float4*>(a.bo_prev + d);
+            r.x() = sycl::fma((float) (b.x()), gw, r.x());
+            r.y() = sycl::fma((float) (b.y()), gw, r.y());
+            r.z() = sycl::fma((float) (b.z()), gw, r.z());
+            r.w() = sycl::fma((float) (b.w()), gw, r.w());
+        }
+        if(a.apply)*reinterpret_cast<sycl::float4*>(a.R_out+i)=r;
+        const sycl::float4 g = *reinterpret_cast<const sycl::float4*>(a.w_norm + i);
+        ss += r.x() * r.x() + r.y() * r.y() + r.z() * r.z() + r.w() * r.w();
+        if (kept < MAXK) keep[kept++] = sycl::float4(r.x() * g.x(), r.y() * g.y(), r.z() * g.z(), r.w() * g.w());
+    }
+    const float v = warp_sum(ss);
+    if (lane == 0) part[warp] = v;
+    item.barrier(sycl::access::fence_space::local_space);
+    if (t == 0) {
+        float sum = 0.0f;
+#pragma unroll
+        for (int w = 0; w < WARPS; ++w) sum += part[w];
+        s_rs = sycl::rsqrt(sum / (float) N + a.eps);
+        a.rs[c] = s_rs;
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    const float rs = s_rs;
+    int k = 0;
+    for (int i = first_i; i < end_i && k < kept; i += THREADS * 4) {
+        const sycl::float4 x = keep[k++];
+        *reinterpret_cast<sycl::float4*>(xn + i) = sycl::float4(x.x() * rs, x.y() * rs, x.z() * rs, x.w() * rs);
+    }
+}
+const bool g_gr_norm_direct_bounds = [] {
+    const char* value = std::getenv("STRATA_SYCL_GR_NORM_BOUNDS");
+    return value && value[0] == '1';
+}();
+
 bool gr_norm_split() {   // default; STRATA_GR_NORM_SPLIT=0: one work-group per token
     static const bool v = std::getenv("STRATA_GR_NORM_SPLIT") == nullptr || std::atoi(std::getenv("STRATA_GR_NORM_SPLIT")) != 0;
     return v;
@@ -855,6 +991,178 @@ auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
     }
 }
 
+// Consume the normalized product without changing its multiply order.
+template<bool LoReady = false>
+__dpct_inline__ void gr_up_cached_norm_kernel(GrMulti m) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+    float[kFusedGrMaxT][LR]>(
+    sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[kFusedGrMaxT][HC][UPM_COLS]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int T = m.T;
+    const int d0 = item_ct1.get_group(2) * UPM_COLS;
+#pragma unroll
+    for (int i = t; i < T * LR; i += THREADS) {   // the down kernel's partial sums, in split order, then silu
+        const int k = i / LR, r = i % LR;
+        if constexpr (LoReady) {
+            lo[k][r] = m.a[k].lo[r];
+        } else {
+            float x = 0.0f;
+#pragma unroll
+            for (int sp = 0; sp < DOWN_SPLIT; ++sp) if (sp < m.nsplit) x += m.part[((size_t) sp * kFusedGrMaxT + k) * LR + r];
+            x /= (float) HC;
+            const float v = x / (1.0f + sycl::native::exp(-x));
+            lo[k][r] = v;
+            m.a[k].lo[r] = v;
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int r = warp; r < HC * UPM_COLS; r += WARPS) {
+        const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        const sycl::uint4 *w4 =
+            reinterpret_cast<const sycl::uint4 *>(m.a[0].w_up + (size_t)i * LR);
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        const sycl::uint4 wa = *(w4 + lane);
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        const sycl::uint4 wb =
+            lane < LR / 8 - 32 ? *(w4 + 32 + lane) : sycl::uint4(0, 0, 0, 0);
+        float normalized=0.f;
+        if(lane<T)normalized=m.xn[size_t(lane)*D+i];
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k) {
+            if (k >= T) break;
+            float acc = dot8(wa, lo[k] + lane * 8);
+            if (lane < LR / 8 - 32) acc += dot8(wb, lo[k] + (32 + lane) * 8);
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+        }
+        if(lane<T)g[lane][c][dd]=normalized*sigmoidf_(mine);
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * UPM_COLS; i += THREADS) {
+        const int k = i / UPM_COLS, col = i - k * UPM_COLS;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += g[k][c][col];
+        m.a[k].mixed[d0 + col] = s / (float) HC;
+    }
+}
+
+// Pass only the fields used by the prepared-up kernel.
+struct GrUpCompactReady {
+    const uint16_t* w_up;
+    const float* xn;
+    const float* lo[kFusedGrMaxT];
+    float* mixed[kFusedGrMaxT];
+    int T;
+};
+static_assert(sizeof(GrUpCompactReady)==152);
+__dpct_inline__ void gr_up_compact_ready_kernel(GrUpCompactReady m) {
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+    float[kFusedGrMaxT][LR]>(
+    sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[kFusedGrMaxT][HC][UPM_COLS]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int T = m.T;
+    const int d0 = item_ct1.get_group(2) * UPM_COLS;
+#pragma unroll
+    for (int i = t; i < T * LR; i += THREADS) {   // the down kernel's partial sums, in split order, then silu
+        const int k = i / LR, r = i % LR;
+        lo[k][r]=m.lo[k][r];
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int r = warp; r < HC * UPM_COLS; r += WARPS) {
+        const int c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+        const sycl::uint4 *w4 =
+            reinterpret_cast<const sycl::uint4 *>(m.w_up + (size_t)i * LR);
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        const sycl::uint4 wa = *(w4 + lane);
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        const sycl::uint4 wb =
+            lane < LR / 8 - 32 ? *(w4 + 32 + lane) : sycl::uint4(0, 0, 0, 0);
+        float normalized=0.f;
+        if(lane<T)normalized=m.xn[size_t(lane)*D+i];
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k) {
+            if (k >= T) break;
+            float acc = dot8(wa, lo[k] + lane * 8);
+            if (lane < LR / 8 - 32) acc += dot8(wb, lo[k] + (32 + lane) * 8);
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+        }
+        if(lane<T)g[lane][c][dd]=normalized*sigmoidf_(mine);
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * UPM_COLS; i += THREADS) {
+        const int k = i / UPM_COLS, col = i - k * UPM_COLS;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += g[k][c][col];
+        m.mixed[k][d0 + col] = s / (float) HC;
+    }
+}
+
+bool g_gr_lo_once = [] {
+    const char* value = std::getenv("STRATA_SYCL_GR_LO_ONCE");
+    return value && std::atoi(value) != 0;
+}();
+void launch_gr_up_prepared_lo(const GrMulti& m0, dpct::queue_ptr stream) {
+    // #3153's "lo ready" up kernel is the head's REUSE instance of gr_up_multi_kernel with cached_lo set (it reads the rows
+    // the reduce wrote, GR_PICK(m, k, lo)); the normalized activation is recomputed (cached_norm off).
+    GrMulti m = m0;
+    m.cached_lo = true;
+    m.cached_norm = false;
+    auto properties = sycl::ext::oneapi::experimental::properties{
+        sycl::ext::oneapi::experimental::use_root_sync};
+    stream->parallel_for<dpct_kernel_name<class gr_up_prepared_lo_kernel>>(
+        sycl::nd_range<3>(sycl::range(1, 1, UPM_BLOCKS) * sycl::range(1, 1, THREADS),
+                          sycl::range(1, 1, THREADS)), properties,
+        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_up_multi_kernel<UPM_COLS, false, false, true>(m); });
+}
 // gr_more_groups launches (BIG: large GRF, as gr_large_grf)
 template <bool BIG>
 void launch_gr_down_more(dpct::queue_ptr st, const GrMulti& m) {
@@ -1816,10 +2124,1007 @@ int env_variant() {
 // per device: the variant `fused_gr_check` chose (0 = not checked yet)
 std::atomic<int> g_variant[64];
 
+// BEGIN PRIVATE UP FROM LO
+
+__dpct_inline__ void gr_up_from_lo_kernel(GrMulti m) {   // stream sum unchanged, so the same bits; more blocks, fewer serial rows per warp
+    constexpr int COLS=UPM_COLS;
+    constexpr bool ILP=false;
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+    float[kFusedGrMaxT][LR]>(
+    sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[kFusedGrMaxT][HC][COLS]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int T = m.T;
+    const int d0 = item_ct1.get_group(2) * COLS;
+#pragma unroll 1
+    for (int i=t;i<T*LR;i+=THREADS) {
+        const int k=i/LR,r=i%LR;
+        lo[k][r]=GR_PICK(m,k,lo)[r];
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    // this lane's token (lane < T), picked once - not per row
+    const int pk = lane < T ? lane : 0;
+    const float* const pR = GR_PICK(m, pk, R);
+    const float* const pWn = GR_PICK(m, pk, w_norm);
+    const float* const pRs = GR_PICK(m, pk, rs);
+    const bool pApply = GR_PICK(m, pk, apply);
+    const float* const pBo = GR_PICK(m, pk, bo_prev);
+    const float* const pIp = GR_PICK(m, pk, inj_prev);
+    float* const pRout = GR_PICK(m, pk, R_out);
+    for (int r = warp; r < HC * COLS; r += WARPS) {
+        const int c = r / COLS, dd = r - c * COLS, i = c * N + d0 + dd;
+        const sycl::uint4 *w4 =
+            reinterpret_cast<const sycl::uint4 *>(m.a[0].w_up + (size_t)i * LR);
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        const sycl::uint4 wa = *(w4 + lane);
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        const sycl::uint4 wb =
+            lane < LR / 8 - 32 ? *(w4 + 32 + lane) : sycl::uint4(0, 0, 0, 0);
+        // the epilogue inputs of this lane's token, fetched while the dots run
+        float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (lane < T) {
+            rv = pR[i];
+            wn = pWn[i];
+            rsc = pRs[c];
+            apply = pApply;
+            if (apply) { bo = pBo[d0 + dd]; ip = pIp[c]; }
+        }
+        float mine = 0.0f;
+        if constexpr (ILP) {   // STRATA_GR_UP_ILP: the T dots first, then their butterflies interleaved step by step -
+            float accs[kFusedGrMaxT];   // each value sees warp_sum's shuffles in warp_sum's order: the same bits
+#pragma unroll
+            for (int k = 0; k < kFusedGrMaxT; ++k) {
+                float acc = 0.0f;
+                if (k < T) {
+                    acc = dot8(wa, lo[k] + lane * 8);
+                    if (lane < LR / 8 - 32) acc += dot8(wb, lo[k] + (32 + lane) * 8);
+                }
+                accs[k] = acc;
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+#pragma unroll
+                for (int k = 0; k < kFusedGrMaxT; ++k)
+                    if (k < T) accs[k] += dpct::experimental::permute_sub_group_by_xor(
+                                   0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(), accs[k], o);
+#pragma unroll
+            for (int k = 0; k < kFusedGrMaxT; ++k) if (k < T && lane == k) mine = accs[k];
+        } else {
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k) {
+            if (k >= T) break;
+            float acc = dot8(wa, lo[k] + lane * 8);
+            if (lane < LR / 8 - 32) acc += dot8(wb, lo[k] + (32 + lane) * 8);
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+        }
+        }
+        if (lane < T) {
+            if (apply) {
+                rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float)HC), rv);
+                pRout[i] = rv;
+            }
+            const float x = rv * wn * rsc;
+            g[lane][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * COLS; i += THREADS) {
+        const int k = i / COLS, col = i - k * COLS;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += g[k][c][col];
+        GR_PICK(m, k, mixed)[d0 + col] = s / (float) HC;
+    }
+}
+
+// END PRIVATE UP FROM LO
+// BEGIN PRIVATE LO VEC4
+struct alignas(16) GrLoVec4Storage {float values[kFusedGrMaxT][2][LR/2];};
+static_assert(sizeof(GrLoVec4Storage)==kFusedGrMaxT*LR*sizeof(float));
+__dpct_inline__ float gr_lo_vec4_dot(sycl::uint4 w,const float* low,const float* high) {
+    const sycl::float4 a(low[0],low[1],low[2],low[3]);
+    const sycl::float4 b(high[0],high[1],high[2],high[3]);
+    return dot8v(w,a,b);
+}
+__dpct_inline__ void gr_up_lo_vec4_kernel(GrMulti m) {   // stream sum unchanged, so the same bits; more blocks, fewer serial rows per warp
+    constexpr int COLS=UPM_COLS;
+    constexpr bool ILP=false;
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &lo = (*sycl::ext::oneapi::group_local_memory_for_overwrite<
+    GrLoVec4Storage>(sycl::ext::oneapi::this_work_item::get_work_group<3>())).values;
+    auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[kFusedGrMaxT][HC][COLS]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int T = m.T;
+    const int d0 = item_ct1.get_group(2) * COLS;
+#pragma unroll 1
+    for (int i=t;i<T*LR;i+=THREADS) {
+        const int k=i/LR,r=i%LR;
+        lo[k][(r>>2)&1][(r>>3)*4+(r&3)]=GR_PICK(m,k,lo)[r];
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    // this lane's token (lane < T), picked once - not per row
+    const int pk = lane < T ? lane : 0;
+    const float* const pR = GR_PICK(m, pk, R);
+    const float* const pWn = GR_PICK(m, pk, w_norm);
+    const float* const pRs = GR_PICK(m, pk, rs);
+    const bool pApply = GR_PICK(m, pk, apply);
+    const float* const pBo = GR_PICK(m, pk, bo_prev);
+    const float* const pIp = GR_PICK(m, pk, inj_prev);
+    float* const pRout = GR_PICK(m, pk, R_out);
+    for (int r = warp; r < HC * COLS; r += WARPS) {
+        const int c = r / COLS, dd = r - c * COLS, i = c * N + d0 + dd;
+        const sycl::uint4 *w4 =
+            reinterpret_cast<const sycl::uint4 *>(m.a[0].w_up + (size_t)i * LR);
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        const sycl::uint4 wa = *(w4 + lane);
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        const sycl::uint4 wb =
+            lane < LR / 8 - 32 ? *(w4 + 32 + lane) : sycl::uint4(0, 0, 0, 0);
+        // the epilogue inputs of this lane's token, fetched while the dots run
+        float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (lane < T) {
+            rv = pR[i];
+            wn = pWn[i];
+            rsc = pRs[c];
+            apply = pApply;
+            if (apply) { bo = pBo[d0 + dd]; ip = pIp[c]; }
+        }
+        float mine = 0.0f;
+        if constexpr (ILP) {   // STRATA_GR_UP_ILP: the T dots first, then their butterflies interleaved step by step -
+            float accs[kFusedGrMaxT];   // each value sees warp_sum's shuffles in warp_sum's order: the same bits
+#pragma unroll
+            for (int k = 0; k < kFusedGrMaxT; ++k) {
+                float acc = 0.0f;
+                if (k < T) {
+                    acc = gr_lo_vec4_dot(wa,lo[k][0]+lane*4,lo[k][1]+lane*4);
+                    if (lane < LR / 8 - 32) acc += gr_lo_vec4_dot(wb,lo[k][0]+(32+lane)*4,lo[k][1]+(32+lane)*4);
+                }
+                accs[k] = acc;
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+#pragma unroll
+                for (int k = 0; k < kFusedGrMaxT; ++k)
+                    if (k < T) accs[k] += dpct::experimental::permute_sub_group_by_xor(
+                                   0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(), accs[k], o);
+#pragma unroll
+            for (int k = 0; k < kFusedGrMaxT; ++k) if (k < T && lane == k) mine = accs[k];
+        } else {
+#pragma unroll
+        for (int k = 0; k < kFusedGrMaxT; ++k) {
+            if (k >= T) break;
+            float acc = gr_lo_vec4_dot(wa,lo[k][0]+lane*4,lo[k][1]+lane*4);
+            if (lane < LR / 8 - 32) acc += gr_lo_vec4_dot(wb,lo[k][0]+(32+lane)*4,lo[k][1]+(32+lane)*4);
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+        }
+        }
+        if (lane < T) {
+            if (apply) {
+                rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float)HC), rv);
+                pRout[i] = rv;
+            }
+            const float x = rv * wn * rsc;
+            g[lane][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * COLS; i += THREADS) {
+        const int k = i / COLS, col = i - k * COLS;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += g[k][c][col];
+        GR_PICK(m, k, mixed)[d0 + col] = s / (float) HC;
+    }
+}
+
+class GrUpLoVec4;
+inline bool gr_lo_vec4_enabled() {
+    static const bool on=[] {const char* p=std::getenv("STRATA_PRIVATE_GR_LO_VEC4");return p&&std::atoi(p)!=0;}();
+    return on;
+}
+void launch_gr_up_lo_vec4(dpct::queue_ptr st,const GrMulti& m) {
+    const sycl::nd_range<3> r(sycl::range<3>(1,1,UPM_BLOCKS*THREADS),sycl::range<3>(1,1,THREADS));
+    const auto props=sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    st->parallel_for<GrUpLoVec4>(r,props,[=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {gr_up_lo_vec4_kernel(m);});
+}
+// END PRIVATE LO VEC4
+
+
+// Match the original quantizer type name: AOT coalesces identical layouts.
+struct Q81Block {sycl::half2 ds;int8_t qs[32];};
+static_assert(sizeof(Q81Block)==36 && offsetof(Q81Block,qs)==4);
+__dpct_inline__ float b60_gr_q8_warp_max(float value){
+ #pragma unroll
+ for(int off=16;off>0;off>>=1)value=sycl::fmax(value,dpct::experimental::permute_sub_group_by_xor(0xffffffffu,sycl::ext::oneapi::this_work_item::get_sub_group(),value,off));
+ return value;
+}
+inline bool b60_gr_q8_up32_enabled(){static const bool on=[] {const char*p=std::getenv("STRATA_PRIVATE_GR_Q8_UP32");return p&&p[0]=='1';}();return on&&b60_layout_requested();}
+__dpct_inline__ void b60_gr_q8_up32_t1_kernel(GrMulti m) {   // stream sum unchanged, so the same bits; more blocks, fewer serial rows per warp
+    constexpr int COLS=32;
+    constexpr bool ILP=false;
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+auto &lo = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+    float[1][LR]>(
+    sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    auto &g = *sycl::ext::oneapi::group_local_memory_for_overwrite<
+        float[1][HC][COLS]>(
+        sycl::ext::oneapi::this_work_item::get_work_group<3>());
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    constexpr int T = 1;
+    const int d0 = item_ct1.get_group(2) * COLS;
+#pragma unroll 1
+    for (int i=t;i<T*LR;i+=THREADS) {
+        const int k=i/LR,r=i%LR;
+        lo[k][r]=GR_PICK(m,k,lo)[r];
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    // this lane's token (lane < T), picked once - not per row
+    const int pk = lane < T ? lane : 0;
+    const float* const pR = GR_PICK(m, pk, R);
+    const float* const pWn = GR_PICK(m, pk, w_norm);
+    const float* const pRs = GR_PICK(m, pk, rs);
+    const bool pApply = GR_PICK(m, pk, apply);
+    const float* const pBo = GR_PICK(m, pk, bo_prev);
+    const float* const pIp = GR_PICK(m, pk, inj_prev);
+    float* const pRout = GR_PICK(m, pk, R_out);
+    for (int r = warp; r < HC * COLS; r += WARPS) {
+        const int c = r / COLS, dd = r - c * COLS, i = c * N + d0 + dd;
+        const sycl::uint4 *w4 =
+            reinterpret_cast<const sycl::uint4 *>(m.a[0].w_up + (size_t)i * LR);
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        const sycl::uint4 wa = *(w4 + lane);
+        /*
+        DPCT1098: The '*' expression is used instead of the __ldg call.
+        These two expressions do not provide the exact same functionality. Check
+        the generated code for potential precision and/or performance issues.
+        */
+        const sycl::uint4 wb =
+            lane < LR / 8 - 32 ? *(w4 + 32 + lane) : sycl::uint4(0, 0, 0, 0);
+        // the epilogue inputs of this lane's token, fetched while the dots run
+        float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (lane < T) {
+            rv = pR[i];
+            wn = pWn[i];
+            rsc = pRs[c];
+            apply = pApply;
+            if (apply) { bo = pBo[d0 + dd]; ip = pIp[c]; }
+        }
+        float mine = 0.0f;
+        if constexpr (ILP) {   // STRATA_GR_UP_ILP: the T dots first, then their butterflies interleaved step by step -
+            float accs[1];   // each value sees warp_sum's shuffles in warp_sum's order: the same bits
+#pragma unroll
+            for (int k = 0; k < 1; ++k) {
+                float acc = 0.0f;
+                if (k < T) {
+                    acc = dot8(wa, lo[k] + lane * 8);
+                    if (lane < LR / 8 - 32) acc += dot8(wb, lo[k] + (32 + lane) * 8);
+                }
+                accs[k] = acc;
+            }
+#pragma unroll
+            for (int o = 16; o > 0; o >>= 1)
+#pragma unroll
+                for (int k = 0; k < 1; ++k)
+                    if (k < T) accs[k] += dpct::experimental::permute_sub_group_by_xor(
+                                   0xffffffffu, sycl::ext::oneapi::this_work_item::get_sub_group(), accs[k], o);
+#pragma unroll
+            for (int k = 0; k < 1; ++k) if (k < T && lane == k) mine = accs[k];
+        } else {
+#pragma unroll
+        for (int k = 0; k < 1; ++k) {
+            if (k >= T) break;
+            float acc = dot8(wa, lo[k] + lane * 8);
+            if (lane < LR / 8 - 32) acc += dot8(wb, lo[k] + (32 + lane) * 8);
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+        }
+        }
+        if (lane < T) {
+            if (apply) {
+                rv = sycl::fma(bo, 2.0f * sigmoidf_(ip / (float)HC), rv);
+                pRout[i] = rv;
+            }
+            const float x = rv * wn * rsc;
+            g[lane][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    for (int i = t; i < T * COLS; i += THREADS) {
+        const int k = i / COLS, col = i - k * COLS;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += g[k][c][col];
+        const float xi=s/(float)HC;
+        GR_PICK(m,k,mixed)[d0+col]=xi;
+        const float amax=b60_gr_q8_warp_max(sycl::fabs(xi));
+        const float sum=warp_sum(xi);
+        const float scale=q8_1_finite(amax/127.0f);
+        const int8_t quant=q8_1_quant(xi,scale,amax);
+        auto* image=reinterpret_cast<Q81Block*>(GR_PICK(m,k,q8_mixed));
+        image[(d0+col)/32].qs[col&31]=quant;
+        if((col&31)==0)image[(d0+col)/32].ds=q8_1_ds(scale,sum);
+    }
+}
+
+
+class B60GrQ8Up32T1;
+void launch_b60_gr_q8_up32_t1(dpct::queue_ptr st,GrMulti m){
+ const sycl::nd_range<3> r(sycl::range<3>(1,1,(N/32)*THREADS),sycl::range<3>(1,1,THREADS));
+ const auto props=sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+ st->parallel_for<B60GrQ8Up32T1>(r,props,[=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {b60_gr_q8_up32_t1_kernel(m);});
+}
+
+inline bool gr_up_rows16_enabled(){static const bool on=[] {const char*p=std::getenv("STRATA_PRIVATE_GR_UP_ROWS16");return p&&p[0]=='1';}();return on&&b60_layout_requested()&&b60_main_actor();}
+void gf_dispatch_up(dpct::queue_ptr,GrMulti);
+class GrUpFromLo;
+class GrReduceSilu;
+void launch_gr_up_from_lo(dpct::queue_ptr st,const GrMulti& m) {
+    if(gr_up_rows16_enabled() && m.T==4){gf_dispatch_up(st,m);return;}
+    if(gr_lo_vec4_enabled() && m.T>=2 && m.T<=4) {launch_gr_up_lo_vec4(st,m);return;}
+    const sycl::nd_range<3> r(sycl::range<3>(1,1,UPM_BLOCKS*THREADS),sycl::range<3>(1,1,THREADS));
+    const auto p=sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+    st->parallel_for<GrUpFromLo>(r,p,[=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {gr_up_from_lo_kernel(m);});
+}
+
+inline bool gr_combo_silu_enabled() {
+    static const bool enabled=[] {const char* p=std::getenv("STRATA_PRIVATE_GR_SILU_FROM_LO");return p&&std::atoi(p)!=0;}();
+    return enabled;
+}
+
+
+// Private decode-only GR experiment. FP32 inputs; original dot8 and XOR trees.
+namespace gf = sycl::ext::intel::esimd;
+namespace gfm = sycl::ext::intel::experimental::esimd;
+
+template<int O>
+SYCL_ESIMD_FUNCTION ESIMD_INLINE gf::simd<float,32> gf_xor(gf::simd<float,32> v) {
+    gf::simd<float,32> w;
+#pragma unroll
+    for(int i=0;i<32;i+=2*O) {
+        w.template select<O,1>(i)=v.template select<O,1>(i+O);
+        w.template select<O,1>(i+O)=v.template select<O,1>(i);
+    }
+    return v+w;
+}
+
+template<int E>
+SYCL_ESIMD_FUNCTION ESIMD_INLINE void gf_up(GrMulti m,int d) {
+#pragma clang fp contract(off)
+    gf::simd<float,LR> lo[E];
+#pragma unroll
+    for(int e=0;e<E;++e) {
+        lo[e].template select<128,1>(0)=gf::block_load<float,128>(m.a[e].lo);
+        lo[e].template select<128,1>(128)=gf::block_load<float,128>(m.a[e].lo+128);
+        lo[e].template select<64,1>(256)=gf::block_load<float,64>(m.a[e].lo+256);
+    }
+    for(int c=0;c<HC;++c) {
+        const auto* p=reinterpret_cast<const uint32_t*>(m.a[0].w_up+(size_t)(c*N+d)*LR);
+        auto wa=gf::block_load<uint32_t,128>(p);
+        auto wb=gf::block_load<uint32_t,32>(p+128);
+#pragma unroll
+        for(int e=0;e<E;++e) {
+            gf::simd<float,32> a=0.f;
+#pragma unroll
+            for(int j=0;j<4;++j) {
+                gf::simd<uint32_t,32> bits=wa.template select<32,4>(j);
+                gf::simd<uint32_t,32> low=bits<<16,high=bits&0xffff0000u;
+                gf::simd<float,32> w0=low.template bit_cast_view<float>(),w1=high.template bit_cast_view<float>();
+                gf::simd<float,32> x0=lo[e].template select<32,8>(2*j),x1=lo[e].template select<32,8>(2*j+1);
+                a=gfm::fma(w0,x0,a);
+                a=gfm::fma(w1,x1,a);
+            }
+            gf::simd<float,8> b=0.f;
+#pragma unroll
+            for(int j=0;j<4;++j) {
+                gf::simd<uint32_t,8> bits=wb.template select<8,4>(j);
+                gf::simd<uint32_t,8> low=bits<<16,high=bits&0xffff0000u;
+                gf::simd<float,8> w0=low.template bit_cast_view<float>(),w1=high.template bit_cast_view<float>();
+                gf::simd<float,8> x0=lo[e].template select<8,8>(256+2*j),x1=lo[e].template select<8,8>(257+2*j);
+                b=gfm::fma(w0,x0,b);
+                b=gfm::fma(w1,x1,b);
+            }
+            a.template select<8,1>(0)=a.template select<8,1>(0)+b;
+            a=gf_xor<16>(a);a=gf_xor<8>(a);a=gf_xor<4>(a);a=gf_xor<2>(a);a=gf_xor<1>(a);
+            // xn is no longer read by down. Postop restores every scratch value.
+            m.xn[(size_t)e*D+c*N+d]=a[e];
+        }
+    }
+}
+
+template<int E>
+SYCL_ESIMD_FUNCTION ESIMD_INLINE void gf_down(GrMulti m,int sl,int tile) {
+#pragma clang fp contract(off)
+    if(tile>=21 || (tile==20 && !m.a[0].w_inject))return;
+    gf::simd<uint32_t,16> rows(tile*16,1);
+    auto valid=rows<uint32_t(GRS_ROWS);
+    const auto* base=reinterpret_cast<const uint32_t*>(tile==20?m.a[0].w_inject:m.a[0].w_down);
+    gf::simd<uint32_t,16> off=(rows-uint32_t(tile==20?LR:0))*uint32_t(D*2)+uint32_t(sl*GRS_COLS*2);
+    gf::simd<float,128> x[E];
+    gf::simd<float,16> acc[E][4];
+#pragma unroll
+    for(int e=0;e<E;++e) {
+        x[e]=gf::block_load<float,128>(m.xn+(size_t)e*D+sl*GRS_COLS);
+#pragma unroll
+        for(int q=0;q<4;++q)acc[e][q]=0.f;
+    }
+#pragma unroll
+    for(int cc=0;cc<4;++cc) {
+        auto first=gf::gather<uint32_t,128,8>(base,off+uint32_t(cc*64),valid,gf::simd<uint32_t,128>(0));
+        auto last=gf::gather<uint32_t,128,8>(base,off+uint32_t(cc*64+32),valid,gf::simd<uint32_t,128>(0));
+#pragma unroll
+        for(int q=0;q<4;++q) {
+            gf::simd<float,16> dot[E];
+#pragma unroll
+            for(int e=0;e<E;++e)dot[e]=0.f;
+#pragma unroll
+            for(int j=0;j<4;++j) {
+                gf::simd<uint32_t,16> bits;
+                // VS8 gather returns component-major: word j across all16 rows.
+                if(q<2)bits=first.template select<16,1>((q*4+j)*16);
+                else bits=last.template select<16,1>(((q-2)*4+j)*16);
+                gf::simd<uint32_t,16> low=bits<<16,high=bits&0xffff0000u;
+                gf::simd<float,16> w0=low.template bit_cast_view<float>(),w1=high.template bit_cast_view<float>();
+#pragma unroll
+                for(int e=0;e<E;++e) {
+                    dot[e]=gfm::fma(w0,gf::simd<float,16>(x[e][cc*32+q*8+2*j]),dot[e]);
+                    dot[e]=gfm::fma(w1,gf::simd<float,16>(x[e][cc*32+q*8+2*j+1]),dot[e]);
+                }
+            }
+#pragma unroll
+            for(int e=0;e<E;++e)acc[e][q]=acc[e][q]+dot[e];
+        }
+    }
+#pragma unroll
+    for(int e=0;e<E;++e) {
+        auto value=(acc[e][0]+acc[e][1])+(acc[e][2]+acc[e][3]);
+        gf::scatter<float,16>(m.part2,((uint32_t(sl*kFusedGrMaxT+e)*GRS_ROWS)+rows)*4u,value,valid);
+    }
+}
+
+__dpct_inline__ void gf_reduce_silu(GrMulti m) {
+    const int i=int(sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_global_id(2));
+    if(i>=m.T*GRS_ROWS)return;
+    const int k=i/GRS_ROWS,r=i%GRS_ROWS;
+    if(r>=LR && !m.a[0].w_inject)return;
+    float x=0.f;
+    for(int sl=0;sl<GRS_SLICES;++sl)x+=m.part2[((size_t)sl*kFusedGrMaxT+k)*GRS_ROWS+r];
+    if(r<LR) {
+        m.part[(size_t)k*LR+r]=x;
+        float value=0.f;value+=x;value/=(float)HC;
+        GR_PICK(m,k,lo)[r]=value/(1.f+sycl::native::exp(-value));
+    } else GR_PICK(m,k,inject_out)[r-LR]=x;
+}
+
+__dpct_inline__ void gf_postop(GrMulti m) {
+#pragma clang fp contract(off)
+    const int i=int(sycl::ext::oneapi::this_work_item::get_nd_item<3>().get_global_id(2));
+    if(i>=m.T*N)return;
+    const int k=i/N,d=i%N;
+    const float* R=GR_PICK(m,k,R);
+    const float* wn=GR_PICK(m,k,w_norm);
+    const float* rs=GR_PICK(m,k,rs);
+    float sum=0.f;
+#pragma unroll
+    for(int c=0;c<HC;++c) {
+        const int j=c*N+d;
+        const float score=m.xn[(size_t)k*D+j];
+        float rv=R[j];
+        if(GR_PICK(m,k,apply)) {
+            const float bo=GR_PICK(m,k,bo_prev)[d],ip=GR_PICK(m,k,inj_prev)[c];
+            rv=sycl::fma(bo,2.f*sigmoidf_(ip/(float)HC),rv);
+            GR_PICK(m,k,R_out)[j]=rv;
+        }
+        const float x=rv*wn[j]*rs[c];
+        m.xn[(size_t)k*D+j]=x;
+        const float gate=x*sigmoidf_(score);
+        sum+=gate;
+    }
+    GR_PICK(m,k,mixed)[d]=sum/(float)HC;
+}
+
+bool gf_enabled(dpct::queue_ptr st,const GrMulti& m) {
+    static const bool enabled=[] {const char* s=std::getenv("STRATA_PRIVATE_GR_F32_REG");return s&&std::atoi(s)!=0;}();
+    return enabled && m.T>=1 && m.T<=4 && gr_down_sliced() && !gr_more_groups(st) && !gr_large_grf(st) &&
+        gr_norm_split() && gr_up_cols()==16 && !gr_up_ilp() && strata::intel_gpu_gen(st->get_device())==strata::IntelGpuGen::Battlemage;
+}
+bool gf_phase(const char* phase) {
+    const char* p=std::getenv("STRATA_PRIVATE_GR_F32_PHASE");
+    return !p || std::strcmp(p,"both")==0 || std::strcmp(p,phase)==0;
+}
+template<int E> class GfDown;
+template<int E> class GfUp;
+class GfReduce;
+template<int E> class GfPostop;
+template<int E> void gf_launch_down(dpct::queue_ptr st,GrMulti m) {
+    st->parallel_for<GfDown<E>>(sycl::nd_range<1>(GRS_SLICES*24,8),[=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+        const int id=int(it.get_global_id(0));gf_down<E>(m,id/24,id%24);
+    });
+}
+// SIMD across16 output rows, preserving the original BF16 dot8/XOR arithmetic.
+template<int E,int Lane>
+SYCL_ESIMD_FUNCTION ESIMD_INLINE gf::simd<float,E*16> gp_leaf(GrMulti m,int row) {
+#pragma clang fp contract(off)
+ const auto* w=reinterpret_cast<const uint32_t*>(m.a[0].w_up);
+ auto wa=gf::load_2d<uint32_t,4,16,1,true,false>(w,LR*2-1,D-1,LR*2-1,Lane*4,row);
+ gf::simd<float,8> x[E];gf::simd<float,16> dot[E];
+#pragma unroll
+ for(int e=0;e<E;++e){x[e]=gf::block_load<float,8>(m.a[e].lo+Lane*8);dot[e]=0.f;}
+#pragma unroll
+ for(int j=0;j<4;++j){
+  gf::simd<uint32_t,16> bits=wa.template select<16,1>(j*16),low=bits<<16,high=bits&0xffff0000u;
+  gf::simd<float,16> a=low.template bit_cast_view<float>(),b=high.template bit_cast_view<float>();
+#pragma unroll
+  for(int e=0;e<E;++e){dot[e]=gfm::fma(a,gf::simd<float,16>(x[e][2*j]),dot[e]);dot[e]=gfm::fma(b,gf::simd<float,16>(x[e][2*j+1]),dot[e]);}
+ }
+ if constexpr(Lane<8){
+  auto wb=gf::load_2d<uint32_t,4,16,1,true,false>(w,LR*2-1,D-1,LR*2-1,128+Lane*4,row);
+  gf::simd<float,16> extra[E];
+#pragma unroll
+  for(int e=0;e<E;++e){x[e]=gf::block_load<float,8>(m.a[e].lo+256+Lane*8);extra[e]=0.f;}
+#pragma unroll
+  for(int j=0;j<4;++j){
+   gf::simd<uint32_t,16> bits=wb.template select<16,1>(j*16),low=bits<<16,high=bits&0xffff0000u;
+   gf::simd<float,16> a=low.template bit_cast_view<float>(),b=high.template bit_cast_view<float>();
+#pragma unroll
+   for(int e=0;e<E;++e){extra[e]=gfm::fma(a,gf::simd<float,16>(x[e][2*j]),extra[e]);extra[e]=gfm::fma(b,gf::simd<float,16>(x[e][2*j+1]),extra[e]);}
+  }
+#pragma unroll
+  for(int e=0;e<E;++e)dot[e]=dot[e]+extra[e];
+ }
+ gf::simd<float,E*16> result;
+#pragma unroll
+ for(int e=0;e<E;++e)result.template select<16,1>(e*16)=dot[e];
+ return result;
+}
+template<int E,int Lane,int Offset>
+SYCL_ESIMD_FUNCTION ESIMD_INLINE gf::simd<float,E*16> gp_tree(GrMulti m,int row){
+#pragma clang fp contract(off)
+ if constexpr(Offset==32)return gp_leaf<E,Lane>(m,row);
+ else return gp_tree<E,Lane,Offset*2>(m,row)+gp_tree<E,Lane^Offset,Offset*2>(m,row);
+}
+template<int E>class GrUpRows16;
+template<int E>void gp_launch_compute(dpct::queue_ptr st,GrMulti m){
+ st->parallel_for<GrUpRows16<E>>(sycl::nd_range<1>(D/16,4),[=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+#pragma clang fp contract(off)
+  const int row=int(it.get_global_id(0))*16;
+  gf::simd<float,E*16> partial[4];
+  partial[0]=gp_tree<E,0,4>(m,row);partial[1]=gp_tree<E,1,4>(m,row);
+  partial[2]=gp_tree<E,2,4>(m,row);partial[3]=gp_tree<E,3,4>(m,row);
+#pragma unroll
+  for(int e=0;e<E;++e){
+   gf::simd<float,16> a=partial[e].template select<16,1>(e*16),b=partial[e^2].template select<16,1>(e*16);
+   gf::simd<float,16> c=partial[e^1].template select<16,1>(e*16),d=partial[e^3].template select<16,1>(e*16);
+   gf::simd<float,16> result=(a+b)+(c+d);
+   gf::block_store<float,16>(m.xn+size_t(e)*D+row,result);
+  }
+ });
+}
+
+
+inline bool gr_2d_pair_enabled(){static const bool enabled=[] {const char*p=std::getenv("STRATA_PRIVATE_GR_2D_PAIR");return p&&p[0]=='1';}();return enabled&&b60_main_actor();}
+template<int E>
+SYCL_ESIMD_FUNCTION ESIMD_INLINE void gf_down_2d(GrMulti m,int sl,int tile) {
+#pragma clang fp contract(off)
+    if(tile>=21 || (tile==20 && !m.a[0].w_inject))return;
+    gf::simd<uint32_t,16> rows(tile*16,1);
+    auto valid=rows<uint32_t(GRS_ROWS);
+    const auto* base=reinterpret_cast<const uint32_t*>(tile==20?m.a[0].w_inject:m.a[0].w_down);
+    gf::simd<uint32_t,16> off=(rows-uint32_t(tile==20?LR:0))*uint32_t(D*2)+uint32_t(sl*GRS_COLS*2);
+    gf::simd<float,128> x[E];
+    gf::simd<float,16> acc[E][4];
+#pragma unroll
+    for(int e=0;e<E;++e) {
+        x[e]=gf::block_load<float,128>(m.xn+(size_t)e*D+sl*GRS_COLS);
+#pragma unroll
+        for(int q=0;q<4;++q)acc[e][q]=0.f;
+    }
+#pragma unroll
+    for(int cc=0;cc<4;++cc) {
+        const int height=(tile==20?HC:LR);
+        const int row0=tile==20?0:tile*16;
+        const int col0=sl*(GRS_COLS/2)+cc*16;
+        auto first=gf::load_2d<uint32_t,8,16,1,true,false>(base,D*2-1,height-1,D*2-1,col0,row0);
+        auto last=gf::load_2d<uint32_t,8,16,1,true,false>(base,D*2-1,height-1,D*2-1,col0+8,row0);
+#pragma unroll
+        for(int q=0;q<4;++q) {
+            gf::simd<float,16> dot[E];
+#pragma unroll
+            for(int e=0;e<E;++e)dot[e]=0.f;
+#pragma unroll
+            for(int j=0;j<4;++j) {
+                gf::simd<uint32_t,16> bits;
+                // VS8 gather returns component-major: word j across all16 rows.
+                if(q<2)bits=first.template select<16,1>((q*4+j)*16);
+                else bits=last.template select<16,1>(((q-2)*4+j)*16);
+                gf::simd<uint32_t,16> low=bits<<16,high=bits&0xffff0000u;
+                gf::simd<float,16> w0=low.template bit_cast_view<float>(),w1=high.template bit_cast_view<float>();
+#pragma unroll
+                for(int e=0;e<E;++e) {
+                    dot[e]=gfm::fma(w0,gf::simd<float,16>(x[e][cc*32+q*8+2*j]),dot[e]);
+                    dot[e]=gfm::fma(w1,gf::simd<float,16>(x[e][cc*32+q*8+2*j+1]),dot[e]);
+                }
+            }
+#pragma unroll
+            for(int e=0;e<E;++e)acc[e][q]=acc[e][q]+dot[e];
+        }
+    }
+#pragma unroll
+    for(int e=0;e<E;++e) {
+        auto value=(acc[e][0]+acc[e][1])+(acc[e][2]+acc[e][3]);
+        gf::scatter<float,16>(m.part2,((uint32_t(sl*kFusedGrMaxT+e)*GRS_ROWS)+rows)*4u,value,valid);
+    }
+}
+
+template<int E,int Even>
+SYCL_ESIMD_FUNCTION ESIMD_INLINE gf::simd<float,E*32> gp_leaf_pair(GrMulti m,int row){
+#pragma clang fp contract(off)
+ const auto*w=reinterpret_cast<const uint32_t*>(m.a[0].w_up);
+ auto wa=gf::load_2d<uint32_t,8,16,1,true,false>(w,LR*2-1,D-1,LR*2-1,Even*4,row);
+ gf::simd<uint32_t,128> wb;
+ if constexpr(Even<8)wb=gf::load_2d<uint32_t,8,16,1,true,false>(w,LR*2-1,D-1,LR*2-1,128+Even*4,row);
+ gf::simd<float,E*32> result;
+#pragma unroll
+ for(int parity=0;parity<2;++parity){
+ gf::simd<float,8> x[E];gf::simd<float,16> dot[E];
+#pragma unroll
+ for(int e=0;e<E;++e){x[e]=gf::block_load<float,8>(m.a[e].lo+(Even+parity)*8);dot[e]=0.f;}
+#pragma unroll
+ for(int j=0;j<4;++j){
+  gf::simd<uint32_t,16> bits=wa.template select<16,1>((parity*4+j)*16),low=bits<<16,high=bits&0xffff0000u;
+  gf::simd<float,16> a=low.template bit_cast_view<float>(),b=high.template bit_cast_view<float>();
+#pragma unroll
+  for(int e=0;e<E;++e){dot[e]=gfm::fma(a,gf::simd<float,16>(x[e][2*j]),dot[e]);dot[e]=gfm::fma(b,gf::simd<float,16>(x[e][2*j+1]),dot[e]);}
+ }
+ if constexpr(Even<8){
+  gf::simd<float,16> extra[E];
+#pragma unroll
+  for(int e=0;e<E;++e){x[e]=gf::block_load<float,8>(m.a[e].lo+256+(Even+parity)*8);extra[e]=0.f;}
+#pragma unroll
+  for(int j=0;j<4;++j){
+   gf::simd<uint32_t,16> bits=wb.template select<16,1>((parity*4+j)*16),low=bits<<16,high=bits&0xffff0000u;
+   gf::simd<float,16> a=low.template bit_cast_view<float>(),b=high.template bit_cast_view<float>();
+#pragma unroll
+   for(int e=0;e<E;++e){extra[e]=gfm::fma(a,gf::simd<float,16>(x[e][2*j]),extra[e]);extra[e]=gfm::fma(b,gf::simd<float,16>(x[e][2*j+1]),extra[e]);}
+  }
+#pragma unroll
+  for(int e=0;e<E;++e)dot[e]=dot[e]+extra[e];
+ }
+#pragma unroll
+ for(int e=0;e<E;++e)result.template select<16,1>((parity*E+e)*16)=dot[e];
+ }
+ return result;
+}
+template<int E,int Even,int Offset>
+SYCL_ESIMD_FUNCTION ESIMD_INLINE gf::simd<float,E*32> gp_tree_pair(GrMulti m,int row){
+#pragma clang fp contract(off)
+ if constexpr(Offset==32)return gp_leaf_pair<E,Even>(m,row);
+ else return gp_tree_pair<E,Even,Offset*2>(m,row)+gp_tree_pair<E,Even^Offset,Offset*2>(m,row);
+}
+template<int E>class GrUpRows16Pair;
+template<int E>void gp_launch_compute_pair(dpct::queue_ptr st,GrMulti m){
+ st->parallel_for<GrUpRows16Pair<E>>(sycl::nd_range<1>(D/16,4),[=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+#pragma clang fp contract(off)
+  const int row=int(it.get_global_id(0))*16;
+  gf::simd<float,E*16> partial[4];
+  auto p01=gp_tree_pair<E,0,4>(m,row),p23=gp_tree_pair<E,2,4>(m,row);
+  partial[0]=p01.template select<E*16,1>(0);partial[1]=p01.template select<E*16,1>(E*16);
+  partial[2]=p23.template select<E*16,1>(0);partial[3]=p23.template select<E*16,1>(E*16);
+#pragma unroll
+  for(int e=0;e<E;++e){
+   gf::simd<float,16> a=partial[e].template select<16,1>(e*16),b=partial[e^2].template select<16,1>(e*16);
+   gf::simd<float,16> c=partial[e^1].template select<16,1>(e*16),d=partial[e^3].template select<16,1>(e*16);
+   gf::simd<float,16> result=(a+b)+(c+d);
+   gf::block_store<float,16>(m.xn+size_t(e)*D+row,result);
+  }
+ });
+}
+
+template<int E>class GfDown2D;
+template<int E>void gf_launch_down_2d(dpct::queue_ptr st,GrMulti m){
+ st->parallel_for<GfDown2D<E>>(sycl::nd_range<1>(GRS_SLICES*24,8),[=](sycl::nd_item<1>it) SYCL_ESIMD_KERNEL {
+  const int id=int(it.get_global_id(0));gf_down_2d<E>(m,id/24,id%24);
+ });
+}
+
+
+struct GcDown {const uint16_t *w_down,*w_inject;float *xn,*part2;};
+// Upstream added two optional HC-Q8 scale pointers to each FusedGrArgs.
+// Merge with the head: GrMulti gained two bools (cached_norm, cached_lo, the #4185 port) after the PR measured 1384; they sit at the end, so every earlier
+// field keeps its offset and the PR's kernels (which read fields by name) are unaffected; the size is 1384 plus at most the padding of the two bools.
+static_assert(sizeof(FusedGrArgs)==168 && sizeof(GrMulti)==1392 && sizeof(GcDown)==32);
+inline bool gc_enabled(){static const bool on=[] {const char*p=std::getenv("STRATA_PRIVATE_B60_NEXT_POOL");return p&&p[0]=='1';}();return on&&b60_main_actor();}
+template<int E>
+SYCL_ESIMD_FUNCTION ESIMD_INLINE void gc_down(GcDown m,int sl,int tile) {
+#pragma clang fp contract(off)
+    if(tile>=21 || (tile==20 && !m.w_inject))return;
+    gf::simd<uint32_t,16> rows(tile*16,1);
+    auto valid=rows<uint32_t(GRS_ROWS);
+    const auto* base=reinterpret_cast<const uint32_t*>(tile==20?m.w_inject:m.w_down);
+    gf::simd<uint32_t,16> off=(rows-uint32_t(tile==20?LR:0))*uint32_t(D*2)+uint32_t(sl*GRS_COLS*2);
+    gf::simd<float,128> x[E];
+    gf::simd<float,16> acc[E][4];
+#pragma unroll
+    for(int e=0;e<E;++e) {
+        x[e]=gf::block_load<float,128>(m.xn+(size_t)e*D+sl*GRS_COLS);
+#pragma unroll
+        for(int q=0;q<4;++q)acc[e][q]=0.f;
+    }
+#pragma unroll
+    for(int cc=0;cc<4;++cc) {
+        const int height=(tile==20?HC:LR);
+        const int row0=tile==20?0:tile*16;
+        const int col0=sl*(GRS_COLS/2)+cc*16;
+        gf::simd<uint32_t,128> first,last;
+        if(tile==20){
+          first=gf::load_2d<uint32_t,8,16,1,true,false>(base,D*2-1,height-1,D*2-1,col0,row0);
+          last=gf::load_2d<uint32_t,8,16,1,true,false>(base,D*2-1,height-1,D*2-1,col0+8,row0);
+        }else{
+          const auto* packed=base+size_t(tile)*16*(D/2);
+          first=gf::block_load<uint32_t,128>(packed+size_t(col0)*16);
+          last=gf::block_load<uint32_t,128>(packed+size_t(col0+8)*16);
+        }
+#pragma unroll
+        for(int q=0;q<4;++q) {
+            gf::simd<float,16> dot[E];
+#pragma unroll
+            for(int e=0;e<E;++e)dot[e]=0.f;
+#pragma unroll
+            for(int j=0;j<4;++j) {
+                gf::simd<uint32_t,16> bits;
+                // VS8 gather returns component-major: word j across all16 rows.
+                if(q<2)bits=first.template select<16,1>((q*4+j)*16);
+                else bits=last.template select<16,1>(((q-2)*4+j)*16);
+                gf::simd<uint32_t,16> low=bits<<16,high=bits&0xffff0000u;
+                gf::simd<float,16> w0=low.template bit_cast_view<float>(),w1=high.template bit_cast_view<float>();
+#pragma unroll
+                for(int e=0;e<E;++e) {
+                    dot[e]=gfm::fma(w0,gf::simd<float,16>(x[e][cc*32+q*8+2*j]),dot[e]);
+                    dot[e]=gfm::fma(w1,gf::simd<float,16>(x[e][cc*32+q*8+2*j+1]),dot[e]);
+                }
+            }
+#pragma unroll
+            for(int e=0;e<E;++e)acc[e][q]=acc[e][q]+dot[e];
+        }
+    }
+#pragma unroll
+    for(int e=0;e<E;++e) {
+        auto value=(acc[e][0]+acc[e][1])+(acc[e][2]+acc[e][3]);
+        gf::scatter<float,16>(m.part2,((uint32_t(sl*kFusedGrMaxT+e)*GRS_ROWS)+rows)*4u,value,valid);
+    }
+}
+
+template<int E>class GcDownKernel;
+template<int E>void gc_launch_down(dpct::queue_ptr st,GrMulti full){
+ GcDown m{full.a[0].w_down,full.a[0].w_inject,full.xn,full.part2};
+ const unsigned device=dpct::get_device_id(st->get_device());
+ static std::atomic<unsigned> reported{0};
+ if(device<8 && !(reported.fetch_or(1u<<device,std::memory_order_relaxed)&(1u<<device)))
+  std::fprintf(stderr,"[B60_GR_COMPACT_DOWN] capture device=%u T=%d\n",device,E);
+
+ st->parallel_for<GcDownKernel<E>>(sycl::nd_range<1>(GRS_SLICES*24,8),[=](sycl::nd_item<1>it) SYCL_ESIMD_KERNEL {
+  const int id=int(it.get_global_id(0));gc_down<E>(m,id/24,id%24);
+ });
+}
+
+inline bool gr_soa_enabled(){static const bool enabled=[] {const char*p=std::getenv("STRATA_PRIVATE_GR_SOA_CACHE");return p&&p[0]=='1';}();return enabled&&b60_main_actor();}
+template<int E>
+SYCL_ESIMD_FUNCTION ESIMD_INLINE void gf_down_soa(GrMulti m,int sl,int tile) {
+#pragma clang fp contract(off)
+    if(tile>=21 || (tile==20 && !m.a[0].w_inject))return;
+    gf::simd<uint32_t,16> rows(tile*16,1);
+    auto valid=rows<uint32_t(GRS_ROWS);
+    const auto* base=reinterpret_cast<const uint32_t*>(tile==20?m.a[0].w_inject:m.a[0].w_down);
+    gf::simd<uint32_t,16> off=(rows-uint32_t(tile==20?LR:0))*uint32_t(D*2)+uint32_t(sl*GRS_COLS*2);
+    gf::simd<float,128> x[E];
+    gf::simd<float,16> acc[E][4];
+#pragma unroll
+    for(int e=0;e<E;++e) {
+        x[e]=gf::block_load<float,128>(m.xn+(size_t)e*D+sl*GRS_COLS);
+#pragma unroll
+        for(int q=0;q<4;++q)acc[e][q]=0.f;
+    }
+#pragma unroll
+    for(int cc=0;cc<4;++cc) {
+        const int height=(tile==20?HC:LR);
+        const int row0=tile==20?0:tile*16;
+        const int col0=sl*(GRS_COLS/2)+cc*16;
+        gf::simd<uint32_t,128> first,last;
+        if(tile==20){
+          first=gf::load_2d<uint32_t,8,16,1,true,false>(base,D*2-1,height-1,D*2-1,col0,row0);
+          last=gf::load_2d<uint32_t,8,16,1,true,false>(base,D*2-1,height-1,D*2-1,col0+8,row0);
+        }else{
+          const auto* packed=base+size_t(tile)*16*(D/2);
+          first=gf::block_load<uint32_t,128>(packed+size_t(col0)*16);
+          last=gf::block_load<uint32_t,128>(packed+size_t(col0+8)*16);
+        }
+#pragma unroll
+        for(int q=0;q<4;++q) {
+            gf::simd<float,16> dot[E];
+#pragma unroll
+            for(int e=0;e<E;++e)dot[e]=0.f;
+#pragma unroll
+            for(int j=0;j<4;++j) {
+                gf::simd<uint32_t,16> bits;
+                // VS8 gather returns component-major: word j across all16 rows.
+                if(q<2)bits=first.template select<16,1>((q*4+j)*16);
+                else bits=last.template select<16,1>(((q-2)*4+j)*16);
+                gf::simd<uint32_t,16> low=bits<<16,high=bits&0xffff0000u;
+                gf::simd<float,16> w0=low.template bit_cast_view<float>(),w1=high.template bit_cast_view<float>();
+#pragma unroll
+                for(int e=0;e<E;++e) {
+                    dot[e]=gfm::fma(w0,gf::simd<float,16>(x[e][cc*32+q*8+2*j]),dot[e]);
+                    dot[e]=gfm::fma(w1,gf::simd<float,16>(x[e][cc*32+q*8+2*j+1]),dot[e]);
+                }
+            }
+#pragma unroll
+            for(int e=0;e<E;++e)acc[e][q]=acc[e][q]+dot[e];
+        }
+    }
+#pragma unroll
+    for(int e=0;e<E;++e) {
+        auto value=(acc[e][0]+acc[e][1])+(acc[e][2]+acc[e][3]);
+        gf::scatter<float,16>(m.part2,((uint32_t(sl*kFusedGrMaxT+e)*GRS_ROWS)+rows)*4u,value,valid);
+    }
+}
+
+template<int E,int Even>
+SYCL_ESIMD_FUNCTION ESIMD_INLINE gf::simd<float,E*32> gp_leaf_soa(GrMulti m,int row){
+#pragma clang fp contract(off)
+ const auto*w=reinterpret_cast<const uint32_t*>(m.a[0].w_up);
+ const auto* packed=w+size_t(row)*(LR/2);
+ auto wa=gf::block_load<uint32_t,128>(packed+size_t(Even*4)*16);
+ gf::simd<uint32_t,128> wb;
+ if constexpr(Even<8)wb=gf::block_load<uint32_t,128>(packed+size_t(128+Even*4)*16);
+ gf::simd<float,E*32> result;
+#pragma unroll
+ for(int parity=0;parity<2;++parity){
+ gf::simd<float,8> x[E];gf::simd<float,16> dot[E];
+#pragma unroll
+ for(int e=0;e<E;++e){x[e]=gf::block_load<float,8>(m.a[e].lo+(Even+parity)*8);dot[e]=0.f;}
+#pragma unroll
+ for(int j=0;j<4;++j){
+  gf::simd<uint32_t,16> bits=wa.template select<16,1>((parity*4+j)*16),low=bits<<16,high=bits&0xffff0000u;
+  gf::simd<float,16> a=low.template bit_cast_view<float>(),b=high.template bit_cast_view<float>();
+#pragma unroll
+  for(int e=0;e<E;++e){dot[e]=gfm::fma(a,gf::simd<float,16>(x[e][2*j]),dot[e]);dot[e]=gfm::fma(b,gf::simd<float,16>(x[e][2*j+1]),dot[e]);}
+ }
+ if constexpr(Even<8){
+  gf::simd<float,16> extra[E];
+#pragma unroll
+  for(int e=0;e<E;++e){x[e]=gf::block_load<float,8>(m.a[e].lo+256+(Even+parity)*8);extra[e]=0.f;}
+#pragma unroll
+  for(int j=0;j<4;++j){
+   gf::simd<uint32_t,16> bits=wb.template select<16,1>((parity*4+j)*16),low=bits<<16,high=bits&0xffff0000u;
+   gf::simd<float,16> a=low.template bit_cast_view<float>(),b=high.template bit_cast_view<float>();
+#pragma unroll
+   for(int e=0;e<E;++e){extra[e]=gfm::fma(a,gf::simd<float,16>(x[e][2*j]),extra[e]);extra[e]=gfm::fma(b,gf::simd<float,16>(x[e][2*j+1]),extra[e]);}
+  }
+#pragma unroll
+  for(int e=0;e<E;++e)dot[e]=dot[e]+extra[e];
+ }
+#pragma unroll
+ for(int e=0;e<E;++e)result.template select<16,1>((parity*E+e)*16)=dot[e];
+ }
+ return result;
+}
+template<int E,int Even,int Offset>
+SYCL_ESIMD_FUNCTION ESIMD_INLINE gf::simd<float,E*32> gp_tree_soa(GrMulti m,int row){
+#pragma clang fp contract(off)
+ if constexpr(Offset==32)return gp_leaf_soa<E,Even>(m,row);
+ else return gp_tree_soa<E,Even,Offset*2>(m,row)+gp_tree_soa<E,Even^Offset,Offset*2>(m,row);
+}
+template<int E>class GrUpRows16Soa;
+template<int E>void gp_launch_compute_soa(dpct::queue_ptr st,GrMulti m){
+ st->parallel_for<GrUpRows16Soa<E>>(sycl::nd_range<1>(D/16,4),[=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+#pragma clang fp contract(off)
+  const int row=int(it.get_global_id(0))*16;
+  gf::simd<float,E*16> partial[4];
+  auto p01=gp_tree_soa<E,0,4>(m,row),p23=gp_tree_soa<E,2,4>(m,row);
+  partial[0]=p01.template select<E*16,1>(0);partial[1]=p01.template select<E*16,1>(E*16);
+  partial[2]=p23.template select<E*16,1>(0);partial[3]=p23.template select<E*16,1>(E*16);
+#pragma unroll
+  for(int e=0;e<E;++e){
+   gf::simd<float,16> a=partial[e].template select<16,1>(e*16),b=partial[e^2].template select<16,1>(e*16);
+   gf::simd<float,16> c=partial[e^1].template select<16,1>(e*16),d=partial[e^3].template select<16,1>(e*16);
+   gf::simd<float,16> result=(a+b)+(c+d);
+   gf::block_store<float,16>(m.xn+size_t(e)*D+row,result);
+  }
+ });
+}
+
+template<int E>class GfDownSoa;
+template<int E>void gf_launch_down_soa(dpct::queue_ptr st,GrMulti m){
+ if constexpr(E==1 || E==2 || E==4){if(gc_enabled()){gc_launch_down<E>(st,m);return;}}
+ st->parallel_for<GfDownSoa<E>>(sycl::nd_range<1>(GRS_SLICES*24,8),[=](sycl::nd_item<1>it) SYCL_ESIMD_KERNEL {
+  const int id=int(it.get_global_id(0));gf_down_soa<E>(m,id/24,id%24);
+ });
+}
+
+template<int E> void gf_launch_up(dpct::queue_ptr st,GrMulti m) {
+    if(gr_up_rows16_enabled() && m.T==4){if(gr_soa_enabled())gp_launch_compute_soa<E>(st,m);else if(gr_2d_pair_enabled())gp_launch_compute_pair<E>(st,m);else gp_launch_compute<E>(st,m);}
+    else
+    st->parallel_for<GfUp<E>>(sycl::nd_range<1>(N,8),[=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {gf_up<E>(m,int(it.get_global_id(0)));});
+    st->parallel_for<GfPostop<E>>(sycl::nd_range<3>(sycl::range<3>(1,1,((m.T*N+127)/128)*128),sycl::range<3>(1,1,128)),
+        [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {gf_postop(m);});
+}
+void gf_dispatch_down(dpct::queue_ptr st,GrMulti m) {
+    if(gr_soa_enabled()){
+        switch(m.T){case 1:gf_launch_down_soa<1>(st,m);return;case 2:gf_launch_down_soa<2>(st,m);return;case 4:gf_launch_down_soa<4>(st,m);return;}
+    }
+    if(gr_2d_pair_enabled() && m.T==4){switch(m.T){case 1:gf_launch_down_2d<1>(st,m);break;case 2:gf_launch_down_2d<2>(st,m);break;case 4:gf_launch_down_2d<4>(st,m);break;}return;}
+    switch(m.T) {case 1:gf_launch_down<1>(st,m);break;case 2:gf_launch_down<2>(st,m);break;case 3:gf_launch_down<3>(st,m);break;case 4:gf_launch_down<4>(st,m);break;}
+}
+void gf_dispatch_up(dpct::queue_ptr st,GrMulti m) {
+    switch(m.T) {case 1:gf_launch_up<1>(st,m);break;case 2:gf_launch_up<2>(st,m);break;case 3:gf_launch_up<3>(st,m);break;case 4:gf_launch_up<4>(st,m);break;}
+}
+
+
 }  // namespace
 
 // one partials buffer per queue (the verifier's and the drafter's launches never share a queue; within a queue the
 // launches are ordered, and a graph capture records the pointer)
+
+
 static float* down_partials(sycl::queue* q) {
     static std::mutex mu;
     static std::unordered_map<sycl::queue*, float*> bufs;
@@ -1833,6 +3138,7 @@ static float* down_partials(sycl::queue* q) {
 
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
                          int stamp_i0) {
+    strata::workload_trace::Scope trace("decode.gr_read_api", stream, n_tok, D, LR, HC, N, 30);
     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
         std::exit(1);
@@ -1851,6 +3157,14 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     m.xn = xn_scratch;
     m.T = n_tok;
     dpct::queue_ptr st = strata::q_of(stream);
+    if(gr_soa_enabled() && (n_tok==1||n_tok==2||n_tok==4)){
+        if(!gf_enabled(st,m)||!gf_phase("down")||gf_phase("up")||!gr_combo_silu_enabled()||!gr_up_rows16_enabled())
+            throw std::logic_error("B60 GR cache requires the measured GR control combination");
+        const auto* down=static_cast<const uint16_t*>(b60_cached_weight(a[0].w_down,30));
+        const auto* up=static_cast<const uint16_t*>(b60_cached_weight(a[0].w_up,30));
+        if(!down||!up)throw std::logic_error("B60 missing GR decode cache");
+        for(int t=0;t<n_tok;++t){m.a[t].w_down=down;if(n_tok==4)m.a[t].w_up=up;}
+    }
     // STRATA_GR_V3=1: the two-kernel read above (another summation order - opt-in)
     static const bool v3 = [] { const char* v = std::getenv("STRATA_GR_V3"); return v != nullptr && std::atoi(v) != 0; }();
     static int split3[64] = {};   // per device: 0 = not decided yet, 1 / 2 = column halves S, -1 = does not fit
@@ -1981,10 +3295,12 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
 
         return false;   // SYCL port: never writes the q8_1 images (STRATA_QFUSE is not supported here)
     }
+    const bool cached_norm=!gf_enabled(st,m)&&g_gr_cached_norm_mode>0&&g_gr_norm_direct_bounds&&gr_norm_split()&&
+        gr_down_sliced()&&gr_cached_norm_safe(a,n_tok,xn_scratch);
     m.part = down_partials(st);
     static const bool reuse_norm = strata::bm_default_on("STRATA_GR_CACHED_NORM", st->get_device(), false);
     static const bool reuse_lo = strata::bm_default_on("STRATA_GR_LO_REUSE", st->get_device());
-    if ((reuse_norm || reuse_lo) && gr_norm_split() && gr_down_sliced() &&
+    if ((reuse_norm || reuse_lo) && !cached_norm && !gf_enabled(st, m) && gr_norm_split() && gr_down_sliced() &&
         !gr_more_groups(st) && !gr_large_grf(st) && !gr_up_ilp() && gr_up_cols() == UPM_COLS &&
         strata::intel_gpu_gen(st->get_device()) == strata::IntelGpuGen::Battlemage &&
         gr_reuse_safe(a, n_tok, xn_scratch)) {
@@ -2001,7 +3317,15 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
 
-        if (gr_norm_split())
+        if(cached_norm)
+            strata::kprof::kp(st, __FILE__, __func__, __LINE__)->template parallel_for<dpct_kernel_name<class gr_norm_cached_write>>(
+                sycl::nd_range<3>(sycl::range(1,1,n_tok*HC)*sycl::range(1,1,THREADS),sycl::range(1,1,THREADS)),
+                [=](sycl::nd_item<3>)[[sycl::reqd_sub_group_size(32)]]{gr_norm_cached_write_kernel(m);});
+        else if (g_gr_norm_direct_bounds && gr_norm_split())
+            strata::kprof::kp(st, __FILE__, __func__, __LINE__)->template parallel_for<dpct_kernel_name<class gr_norm_bounds_k>>(
+                sycl::nd_range<3>(sycl::range(1, 1, n_tok * HC) * sycl::range(1, 1, THREADS), sycl::range(1, 1, THREADS)),
+                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_norm_bounds_port_kernel(m); });
+        else if (gr_norm_split())
             strata::kprof::kp(st, __FILE__, __func__, __LINE__)->template parallel_for<dpct_kernel_name<class gr_norm_split_k>>(
                 sycl::nd_range<3>(sycl::range(1, 1, n_tok * HC) * sycl::range(1, 1, THREADS), sycl::range(1, 1, THREADS)),
                 [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_norm_split_port_kernel(m); });
@@ -2032,7 +3356,8 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         attr[dev] = true;
     }
     const int chunk_tok = (dev >= 0 && dev < 64 && chunk[dev]) ? chunk[dev] : kFusedGrMaxT;
-    if (gr_down_sliced() && gr_more_groups(st)) {
+    const bool lo_once = (g_gr_lo_once||(cached_norm&&g_gr_cached_norm_mode>=2))&&gr_down_sliced();
+    if (gr_down_sliced() && gr_more_groups(st) && !lo_once) {
         m.part2 = slice_partials(st);
         m.nsplit = 1;
         if (gr_large_grf(st)) launch_gr_down_more<true>(st, m);
@@ -2041,7 +3366,8 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         m.part2 = slice_partials(st);
         m.nsplit = 1;
         const bool big = gr_large_grf(st);
-        strata::kprof::kp(st, __FILE__, __func__, __LINE__)->submit([&](sycl::handler& cgh) {
+        if(gf_enabled(st,m) && gf_phase("down")) gf_dispatch_down(st,m);
+        else strata::kprof::kp(st, __FILE__, __func__, __LINE__)->submit([&](sycl::handler& cgh) {
             sycl::local_accessor<float, 1> tl(sycl::range<1>((size_t) kFusedGrMaxT * GRS_COLS), cgh);
             const sycl::nd_range<3> nr(sycl::range(1, 1, GRS_SLICES) * sycl::range(1, 1, THREADS), sycl::range(1, 1, THREADS));
             if (big)
@@ -2059,7 +3385,14 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         const unsigned nred = unsigned((n_tok * GRS_ROWS + 127) / 128);
         const sycl::nd_range<3> nr(sycl::range(1, 1, nred) * sycl::range(1, 1, 128),
                                     sycl::range(1, 1, 128));
-        if (m.cached_lo) {
+        if(gf_enabled(st,m) && (gf_phase("up") || gr_combo_silu_enabled())) {
+            st->parallel_for<GfReduce>(
+                sycl::nd_range<3>(sycl::range(1,1,nred*128),sycl::range(1,1,128)),
+                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {gf_reduce_silu(m);});
+        } else if (lo_once) {   // #3153: the reduce writes the low-rank SiLU rows (PrepareLo, the same kernel as the head's REUSE_LO)
+            strata::kprof::kp(st, __FILE__, __func__, __LINE__)->template parallel_for<dpct_kernel_name<class gr_down_reduce_lo_once_k>>(nr,
+                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] { gr_down_reduce_kernel<false, true>(m); });
+        } else if (m.cached_lo) {   // #4185 port (Battlemage default / STRATA_GR_LO_REUSE)
             static const bool reduce_ilp = strata::bm_default_on("STRATA_GR_REDUCE_ILP", st->get_device(), false);
             if (reduce_ilp) {
                 strata::kprof::kp(st, __FILE__, __func__, __LINE__)->template parallel_for<dpct_kernel_name<class gr_down_reduce_lo_ilp>>(nr,
@@ -2130,7 +3463,29 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         }
     }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
-    if (gr_more_groups(st)) {
+    const bool private_q8=b60_gr_q8_up32_enabled() && n_tok==1 && a[0].q8_mixed &&
+        !a[0].q8_down && !a[0].q8_up && gf_enabled(st,m) && gf_phase("down") && !gf_phase("up") && gr_combo_silu_enabled();
+    if(private_q8)launch_b60_gr_q8_up32_t1(st,m);
+    else if(gf_enabled(st,m) && gf_phase("up")) gf_dispatch_up(st,m);
+    else if(gf_enabled(st,m) && gr_combo_silu_enabled()) launch_gr_up_from_lo(st,m);
+    else if(cached_norm){
+        auto exp_props=sycl::ext::oneapi::experimental::properties{sycl::ext::oneapi::experimental::use_root_sync};
+        if(g_gr_cached_norm_mode==3){
+            GrUpCompactReady u{};u.w_up=m.a[0].w_up;u.xn=m.xn;u.T=m.T;
+            for(int k=0;k<m.T;++k){u.lo[k]=m.a[k].lo;u.mixed[k]=m.a[k].mixed;}
+            st->parallel_for<dpct_kernel_name<class gr_up_compact_ready>>(
+                sycl::nd_range<3>(sycl::range(1,1,UPM_BLOCKS)*sycl::range(1,1,THREADS),sycl::range(1,1,THREADS)),exp_props,
+                [=](sycl::nd_item<3>)[[sycl::reqd_sub_group_size(32)]]{gr_up_compact_ready_kernel(u);});
+        }else if(lo_once)st->parallel_for<dpct_kernel_name<class gr_up_cached_norm_lo>>(
+            sycl::nd_range<3>(sycl::range(1,1,UPM_BLOCKS)*sycl::range(1,1,THREADS),sycl::range(1,1,THREADS)),exp_props,
+            [=](sycl::nd_item<3>)[[sycl::reqd_sub_group_size(32)]]{gr_up_cached_norm_kernel<true>(m);});
+        else st->parallel_for<dpct_kernel_name<class gr_up_cached_norm>>(
+            sycl::nd_range<3>(sycl::range(1,1,UPM_BLOCKS)*sycl::range(1,1,THREADS),sycl::range(1,1,THREADS)),exp_props,
+            [=](sycl::nd_item<3>)[[sycl::reqd_sub_group_size(32)]]{gr_up_cached_norm_kernel<false>(m);});
+    }else if (lo_once) {
+        launch_gr_up_prepared_lo(m, st);
+    } else if (gr_more_groups(st)) {
+
         if (gr_large_grf(st)) launch_gr_up_more<true>(st, m);
         else launch_gr_up_more<false>(st, m);
     } else {
@@ -2142,7 +3497,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     need to rewrite this code.
     */
     const dpct::err0 e = 0;
-    return false;   // SYCL port: the q8_1 images (S26 STRATA_QFUSE) and the Q8_0 reads (S23 STRATA_HC_Q8) are not built; the caller quantizes
+    return private_q8; // only the private T1 branch writes the image; all other paths retain fallback
 }
 
 // the bench only (AMD latency-hidden kernels): nothing to switch on the SYCL port

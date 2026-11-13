@@ -1,3 +1,5 @@
+#include "b60_layout_state.hpp"
+#include <cstdlib>
 // src/kernels/cuda/qsa_decode_attn.cu - see include/strata/kernels/qsa_decode_attn.hpp.
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
@@ -5,6 +7,7 @@
 #include "strata/core/geometry.hpp"
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
+#include "strata/workload_trace.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
@@ -12,6 +15,10 @@
 #include <cfloat>
 #include <cstdio>
 #include <cstdlib>
+// BEGIN PRIVATE QSA TWO STAGE INCLUDES
+#include <climits>
+#include <stdexcept>
+// END PRIVATE QSA TWO STAGE INCLUDES
 #include <cmath>
 
 namespace strata::kernels {
@@ -683,6 +690,80 @@ bool merge_active_on(const sycl::device& d) {
     return on;
 }
 
+// BEGIN PRIVATE QSA TWO STAGE HELPER
+
+struct QsaMergeGroupPartial { float m, l, acc; };
+__dpct_inline__ QsaMergeGroupPartial qsa_merge_group_partial(
+    const float* __restrict__ part_acc, const float* __restrict__ part_m,
+    const float* __restrict__ part_l, int n_chunks, int kvh, int hl, int d,
+    int first, int last) {
+    float M = -FLT_MAX;
+#pragma unroll
+    for (int c = first; c < last; ++c)
+        M = sycl::fmax(M, part_m[(kvh * n_chunks + c) * G + hl]);
+    float L = 0.0f, acc = 0.0f;
+    for (int c = first; c < last; ++c) {
+        const int slot = kvh * n_chunks + c;
+        const float m = part_m[slot * G + hl];
+        if (m == -FLT_MAX) continue;
+        const float w = sycl::native::exp(m - M);
+        L = sycl::fma((float)(part_l[slot * G + hl]), (float)w, L);
+        acc = sycl::fma((float)(part_acc[((size_t)slot * G + hl) * HD + d]),
+                        (float)w, acc);
+    }
+    return {M, L, acc};
+}
+
+constexpr int QsaMergeGroupChunks = 32;
+class QsaMergeTwoStageOriginal;
+class QsaMergeTwoStagePartial;
+class QsaMergeTwoStageFinal;
+
+void launch_qsa_merge_two_stage_original(const float* part_acc,
+    const float* part_m, const float* part_l, int n_chunks, float* out,
+    sycl::queue* queue) {
+    auto props = sycl::ext::oneapi::experimental::properties{};
+    queue->parallel_for<QsaMergeTwoStageOriginal>(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, size_t(24) * THREADS),
+                          sycl::range<3>(1, 1, THREADS)), props,
+        [=](sycl::nd_item<3>) {
+            attn_merge_kernel(part_acc, part_m, part_l, n_chunks, out, 0);
+        });
+}
+
+void launch_qsa_merge_two_stage_partial(const float* part_acc,
+    const float* part_m, const float* part_l, int n_chunks,
+    float* group_acc, float* group_m, float* group_l, int n_groups,
+    float* out, sycl::queue* queue) {
+    static_assert(HD == 256 && G == 12 && THREADS == 256);
+    auto props = sycl::ext::oneapi::experimental::properties{};
+    queue->parallel_for<QsaMergeTwoStagePartial>(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, size_t(24) * n_groups * THREADS),
+                          sycl::range<3>(1, 1, THREADS)), props,
+        [=](sycl::nd_item<3> item) {
+            const size_t index = item.get_group(2);
+            const int h = int(index / n_groups), group = int(index % n_groups);
+            const int kvh = h / G, hl = h % G;
+            const int d = int(item.get_local_id(2));
+            const int first = group * QsaMergeGroupChunks;
+            const int last = sycl::min(first + QsaMergeGroupChunks, n_chunks);
+            const auto partial = qsa_merge_group_partial(
+                part_acc, part_m, part_l, n_chunks, kvh, hl, d, first, last);
+            const int slot = (kvh * n_groups + group) * G + hl;
+            // Keep an unnormalised acc: the original final helper applies L once.
+            group_acc[size_t(slot) * HD + d] = partial.acc;
+            if (d == 0) { group_m[slot] = partial.m; group_l[slot] = partial.l; }
+        });
+    // The caller's in-order queue/capture supplies the inter-kernel dependency.
+    // No new wait/event/node API, SLM or global barrier is introduced here.
+    queue->parallel_for<QsaMergeTwoStageFinal>(
+        sycl::nd_range<3>(sycl::range<3>(1, 1, size_t(24) * THREADS),
+                          sycl::range<3>(1, 1, THREADS)), props,
+        [=](sycl::nd_item<3>) {
+            attn_merge_kernel(group_acc, group_m, group_l, n_groups, out, 0);
+        });
+}
+// END PRIVATE QSA TWO STAGE HELPER
 #if defined(STRATA_EXPERIMENTAL_SM60)
 // the current device is below sm_75 (per device: a layer split can mix cards); STRATA_ATTN_PRE75=0 turns PR #540's
 // kernel off (A/B)
@@ -874,6 +955,49 @@ void launch_percell(dpct::queue_ptr st, const float* q, const QsaAttnPools& pool
 
 }  // namespace
 
+
+static void launch_qsa_chunk_down(int,const float*,const QsaAttnPools&,const int32_t*,const int32_t*,int64_t,
+                           const QsaShapes&,float*,float*,int64_t,void*);
+bool qsa_chunk_down_supported(int64_t cap, int64_t n_q, const QsaShapes& s, void* stream) {
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_SYCL_QSA_CHUNK_DOWN");
+        return !v || v[0] == '1';
+    }();
+    const bool batch = n_q >= 1 && n_q <= 6;
+    const bool shape = (cap == 2051 && (batch || n_q == 32)) || (cap == 32768 && batch);
+    return enabled && shape && s.n_head == 24 && s.n_head_kv == 2 && s.page_size == 4 &&
+        strata::intel_gpu_gen(strata::q_of(stream)->get_device()) == strata::IntelGpuGen::Battlemage;
+}
+// BEGIN PRIVATE QSA TWO STAGE ENTRY
+uint64_t qsa_merge_two_stage_scratch_floats(int n_chunks) {
+    if (n_chunks <= 0 || n_chunks > INT_MAX / 24)
+        throw std::invalid_argument("QSA two-stage scratch arguments");
+    const uint64_t n_groups = (uint64_t(n_chunks) + 31) / 32;
+    return n_groups * 24 * (HD + 2) + 64;
+}
+
+void qsa_merge_two_stage_probe(int mode, const float* scratch, int n_chunks,
+                               float* group_scratch, float* out, void* stream) {
+    if (mode < 0 || mode > 1 || !scratch || !out || !stream || n_chunks <= 0 ||
+        n_chunks > INT_MAX / 24 || (mode == 1 && !group_scratch))
+        throw std::invalid_argument("QSA two-stage diagnostic arguments");
+    auto* queue = strata::q_of(stream);
+    if (!queue->is_in_order())
+        throw std::invalid_argument("QSA two-stage probe requires an in-order queue");
+    const float* part_m = scratch + size_t(n_chunks) * 24 * HD;
+    const float* part_l = part_m + size_t(n_chunks) * 24;
+    if (mode == 0) {
+        launch_qsa_merge_two_stage_original(scratch, part_m, part_l, n_chunks, out, queue);
+        return;
+    }
+    const int n_groups = (n_chunks + 31) / 32;
+    float* group_m = group_scratch + size_t(n_groups) * 24 * HD;
+    float* group_l = group_m + size_t(n_groups) * 24;
+    launch_qsa_merge_two_stage_partial(scratch, part_m, part_l, n_chunks,
+                                      group_scratch, group_m, group_l, n_groups, out, queue);
+}
+
+// END PRIVATE QSA TWO STAGE ENTRY
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
     if (n_q <= 0) return;
@@ -884,6 +1008,12 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     }
     const int kv_mode = pools.k_q4 != nullptr ? 2 : (pools.k_q != nullptr && pools.v_q4 != nullptr ? 3
                         : (pools.k_q != nullptr ? 1 : 0));
+    strata::workload_trace::Scope trace("decode.qsa_attention", stream, n_q, s.n_head, s.head_dim,
+                                        cap, s.n_head_kv, kv_mode);
+    if (qsa_chunk_down_supported(cap, n_q, s, stream) && kv_mode == 1 && pools.v_q) {
+        launch_qsa_chunk_down(1, q, pools, ids, steps, cap, s, scratch, attn, n_q, stream);
+        return;
+    }
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
     // per query: [acc: n_chunks*n_head*HD][m: n_chunks*n_head][l: n_chunks*n_head], all offsets from one stride
     const long long stride = (long long) qsa_decode_attn_scratch_floats(cap, s);
@@ -1189,6 +1319,9 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
         std::fprintf(stderr, "qsa_decode_attn: incomplete KV pools\n");
         std::exit(1);
     }
+    if(qsa_chunk_down_supported(cap, 1, s, stream)&&kv_mode==1){
+        launch_qsa_chunk_down(1,q,pools,ids,step,cap,s,scratch,attn,1,stream);return;
+    }
     const int n_chunks = (int) ((cap + CHUNK - 1) / CHUNK);
     float* part_acc = scratch;
     float* part_m = scratch + (size_t) n_chunks * s.n_head * HD;
@@ -1305,3 +1438,1199 @@ void qsa_prompt_attn_percell(const float* q, const QsaAttnPools& pools, const in
 }
 
 }  // namespace strata::kernels
+
+#include <stdexcept>
+
+namespace strata::kernels {
+namespace {
+__dpct_inline__ float lane0_sum(float value){
+    auto group=sycl::ext::oneapi::this_work_item::get_sub_group();
+#pragma unroll
+    for(int offset=16;offset>0;offset>>=1)value+=sycl::shift_group_left(group,value,offset);
+    return value;
+}
+template <int KV_MODE>
+/*
+DPCT1110: The total declared local variable size in device function
+chunk_down_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void
+chunk_down_kernel(const float *__restrict__ q, QsaAttnPools p,
+                  const int32_t *__restrict__ ids,
+                  const int32_t *__restrict__ step, int n_kv_heads,
+                  int page_size, float scale, float *__restrict__ part_acc,
+                  float *__restrict__ part_m, float *__restrict__ part_l,
+                  int n_chunks, int cap = 0, long long scratch_stride = 0) {
+    // batched form: query blockIdx.z, with its own q row, selection, step and scratch
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    q += (size_t)item_ct1.get_group(0) * (size_t)(n_kv_heads * G) * HD;
+    ids += (size_t)item_ct1.get_group(0) * (size_t)cap;
+    step += (size_t)item_ct1.get_group(0) * kStepCount;
+    part_acc += (size_t)item_ct1.get_group(0) * (size_t)scratch_stride;
+    part_m += (size_t)item_ct1.get_group(0) * (size_t)scratch_stride;
+    part_l += (size_t)item_ct1.get_group(0) * (size_t)scratch_stride;
+    auto &sq =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[G][HD]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<
+                3>()); // 12 KB: this KV head's query heads
+    auto &sp =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[G][CHUNK]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<
+                3>()); // scores, then probabilities
+    auto &srow =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<long long[CHUNK]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<
+                3>()); // pool row of each cell (page, kv head, slot)
+    /*
+    DPCT1098: The '*' expression is used instead of the __ldg call. These
+    two expressions do not provide the exact same functionality. Check the
+    generated code for potential precision and/or performance issues.
+    */
+    const int n_ids = *(step + kStepWidth);
+    const int chunk = item_ct1.get_group(2), kvh = item_ct1.get_group(1);
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int c0 = chunk * CHUNK;
+    const int n_here = sycl::min(CHUNK, n_ids - c0);
+    const int slot = kvh * n_chunks + chunk;
+    if (n_here <= 0) {
+        if (t < G) { part_m[slot * G + t] = -FLT_MAX; part_l[slot * G + t] = 0.0f; }
+        return;
+    }
+#pragma unroll
+    for (int i = t; i < G * HD; i += THREADS)
+        sq[i / HD][i % HD] = q[(size_t)(kvh * G) * HD + i];
+    if (t < CHUNK) {
+        long long r = -1;
+        if (t < n_here) {
+            const int cell = ids[c0 + t];
+            const long long page = (long long) p.page_table[cell / page_size];
+            // a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
+            // (score -FLT_MAX, weight 0) instead of being read from before the pool.
+            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+        }
+        srow[t] = r;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    // scores: each warp takes cells warp, warp+8, ...; each lane holds 8 of the 256 dimensions.
+    for (int c = warp; c < CHUNK; c += WARPS) {
+        if (c >= n_here || srow[c] < 0) {
+            if (lane < G) sp[lane][c] = -FLT_MAX;
+            continue;
+        }
+        float k8[8];
+        load8<KV_MODE>(p, false, srow[c], lane * 8, k8);
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            const sycl::float4 qa =
+                *reinterpret_cast<const sycl::float4 *>(&sq[h][lane * 8]);
+            const sycl::float4 qb =
+                *reinterpret_cast<const sycl::float4 *>(&sq[h][lane * 8 + 4]);
+            float s = k8[0] * qa.x() + k8[1] * qa.y() + k8[2] * qa.z() +
+                      k8[3] * qa.w() + k8[4] * qb.x() + k8[5] * qb.y() +
+                      k8[6] * qb.z() + k8[7] * qb.w();
+            s = lane0_sum(s);
+            if (lane == 0) sp[h][c] = s * scale;
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    // per-head chunk max and exp-sum: warp w handles heads w and w+8.
+    for (int h = warp; h < G; h += WARPS) {
+        const float a = sp[h][lane], b = sp[h][lane + 32];
+        const float m = warp_max(sycl::fmax(a, b));
+        const float ea = (lane < n_here && srow[lane] >= 0)
+                             ? sycl::native::exp(a - m)
+                             : 0.0f;
+        const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0)
+                             ? sycl::native::exp(b - m)
+                             : 0.0f;
+        sp[h][lane] = ea;
+        sp[h][lane + 32] = eb;
+        const float l = lane0_sum(ea + eb);
+        if (lane == 0) { part_m[slot * G + h] = m; part_l[slot * G + h] = l; }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    // values: thread t owns dimension t for all 12 heads.
+    float acc[G];
+#pragma unroll
+    for (int h = 0; h < G; ++h) acc[h] = 0.0f;
+    for (int c = 0; c < n_here; ++c) {
+        if (srow[c] < 0) continue;   // masked above, weight 0
+        float v;
+        if constexpr (KV_MODE == 0) {
+            v = sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(
+                        p.v_pool[srow[c] * HD + t]))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+        } else if constexpr (KV_MODE == 1) {
+            const float sc =
+                sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(
+                        p.v_scale[srow[c] * (HD / KV_Q8_GROUP) +
+                                  t / KV_Q8_GROUP]))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+            v = (float) p.v_q[srow[c] * HD + t] * sc;
+        } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
+            constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
+            const int b = t / QK4_0;
+            const int rem = t % QK4_0;
+            const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + srow[c] * bytes_per_head) + b;
+            const float d =
+                sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(blk->d))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+            const int j = rem < 16 ? rem : (rem - 16);
+            const uint8_t byte = blk->qs[j];
+            const int nibble = (rem < 16) ? ((byte & 0x0F) - 8) : ((byte >> 4) - 8);
+            v = (float) nibble * d;
+        }
+#pragma unroll
+        for (int h = 0; h < G; ++h) acc[h] = sycl::fma(sp[h][c], v, acc[h]);
+    }
+#pragma unroll
+    for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
+}
+
+
+class QsaChunkDown;
+}
+namespace {
+__dpct_inline__ void private_load8_vector_codes(const QsaAttnPools& p,bool value,long long row,int d0,float* out){
+    const int8_t* codes=(value?p.v_q:p.k_q)+row*HD+d0;
+    const uint16_t sbits=(value?p.v_scale:p.k_scale)[row*(HD/KV_Q8_GROUP)+d0/KV_Q8_GROUP];
+    const float sc=sycl::vec<sycl::half,1>(sycl::bit_cast<sycl::half,unsigned short>(sbits)).convert<float,sycl::rounding_mode::automatic>()[0];
+    const auto raw=*reinterpret_cast<const sycl::vec<int8_t,8>*>(codes);
+    const auto converted=raw.convert<float,sycl::rounding_mode::automatic>();
+#pragma unroll
+    for(int j=0;j<8;++j)out[j]=converted[j]*sc;
+}
+template <int KV_MODE>
+/*
+DPCT1110: The total declared local variable size in device function
+chunk_down_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void
+chunk_vector_codes_kernel(const float *__restrict__ q, QsaAttnPools p,
+                  const int32_t *__restrict__ ids,
+                  const int32_t *__restrict__ step, int n_kv_heads,
+                  int page_size, float scale, float *__restrict__ part_acc,
+                  float *__restrict__ part_m, float *__restrict__ part_l,
+                  int n_chunks, int cap = 0, long long scratch_stride = 0) {
+    // batched form: query blockIdx.z, with its own q row, selection, step and scratch
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    q += (size_t)item_ct1.get_group(0) * (size_t)(n_kv_heads * G) * HD;
+    ids += (size_t)item_ct1.get_group(0) * (size_t)cap;
+    step += (size_t)item_ct1.get_group(0) * kStepCount;
+    part_acc += (size_t)item_ct1.get_group(0) * (size_t)scratch_stride;
+    part_m += (size_t)item_ct1.get_group(0) * (size_t)scratch_stride;
+    part_l += (size_t)item_ct1.get_group(0) * (size_t)scratch_stride;
+    auto &sq =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[G][HD]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<
+                3>()); // 12 KB: this KV head's query heads
+    auto &sp =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[G][CHUNK]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<
+                3>()); // scores, then probabilities
+    auto &srow =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<long long[CHUNK]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<
+                3>()); // pool row of each cell (page, kv head, slot)
+    /*
+    DPCT1098: The '*' expression is used instead of the __ldg call. These
+    two expressions do not provide the exact same functionality. Check the
+    generated code for potential precision and/or performance issues.
+    */
+    const int n_ids = *(step + kStepWidth);
+    const int chunk = item_ct1.get_group(2), kvh = item_ct1.get_group(1);
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int c0 = chunk * CHUNK;
+    const int n_here = sycl::min(CHUNK, n_ids - c0);
+    const int slot = kvh * n_chunks + chunk;
+    if (n_here <= 0) {
+        if (t < G) { part_m[slot * G + t] = -FLT_MAX; part_l[slot * G + t] = 0.0f; }
+        return;
+    }
+#pragma unroll
+    for (int i = t; i < G * HD; i += THREADS)
+        sq[i / HD][i % HD] = q[(size_t)(kvh * G) * HD + i];
+    if (t < CHUNK) {
+        long long r = -1;
+        if (t < n_here) {
+            const int cell = ids[c0 + t];
+            const long long page = (long long) p.page_table[cell / page_size];
+            // a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
+            // (score -FLT_MAX, weight 0) instead of being read from before the pool.
+            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+        }
+        srow[t] = r;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    // scores: each warp takes cells warp, warp+8, ...; each lane holds 8 of the 256 dimensions.
+    for (int c = warp; c < CHUNK; c += WARPS) {
+        if (c >= n_here || srow[c] < 0) {
+            if (lane < G) sp[lane][c] = -FLT_MAX;
+            continue;
+        }
+        float k8[8];
+        private_load8_vector_codes(p, false, srow[c], lane * 8, k8);
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            const sycl::float4 qa =
+                *reinterpret_cast<const sycl::float4 *>(&sq[h][lane * 8]);
+            const sycl::float4 qb =
+                *reinterpret_cast<const sycl::float4 *>(&sq[h][lane * 8 + 4]);
+            float s = k8[0] * qa.x() + k8[1] * qa.y() + k8[2] * qa.z() +
+                      k8[3] * qa.w() + k8[4] * qb.x() + k8[5] * qb.y() +
+                      k8[6] * qb.z() + k8[7] * qb.w();
+            s = lane0_sum(s);
+            if (lane == 0) sp[h][c] = s * scale;
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    // per-head chunk max and exp-sum: warp w handles heads w and w+8.
+    for (int h = warp; h < G; h += WARPS) {
+        const float a = sp[h][lane], b = sp[h][lane + 32];
+        const float m = warp_max(sycl::fmax(a, b));
+        const float ea = (lane < n_here && srow[lane] >= 0)
+                             ? sycl::native::exp(a - m)
+                             : 0.0f;
+        const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0)
+                             ? sycl::native::exp(b - m)
+                             : 0.0f;
+        sp[h][lane] = ea;
+        sp[h][lane + 32] = eb;
+        const float l = lane0_sum(ea + eb);
+        if (lane == 0) { part_m[slot * G + h] = m; part_l[slot * G + h] = l; }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    // values: thread t owns dimension t for all 12 heads.
+    float acc[G];
+#pragma unroll
+    for (int h = 0; h < G; ++h) acc[h] = 0.0f;
+    for (int c0 = 0; c0 < n_here; c0 += 8) {
+        long long rows[8]; bool full = c0 + 8 <= n_here;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            rows[j] = c0 + j < n_here ? srow[c0 + j] : -1;
+            full = full && rows[j] >= 0;
+        }
+        if (full) {
+            float values[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const long long row = rows[j];
+        float v;
+        if constexpr (KV_MODE == 0) {
+            v = sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(
+                        p.v_pool[row * HD + t]))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+        } else if constexpr (KV_MODE == 1) {
+            const float sc =
+                sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(
+                        p.v_scale[row * (HD / KV_Q8_GROUP) +
+                                  t / KV_Q8_GROUP]))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+            v = (float) p.v_q[row * HD + t] * sc;
+        } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
+            constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
+            const int b = t / QK4_0;
+            const int rem = t % QK4_0;
+            const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * bytes_per_head) + b;
+            const float d =
+                sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(blk->d))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+            const int j = rem < 16 ? rem : (rem - 16);
+            const uint8_t byte = blk->qs[j];
+            const int nibble = (rem < 16) ? ((byte & 0x0F) - 8) : ((byte >> 4) - 8);
+            v = (float) nibble * d;
+        }
+                values[j] = v;
+            }
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            const sycl::float4 p0 = *reinterpret_cast<const sycl::float4*>(&sp[h][c0]);
+            const sycl::float4 p1 = *reinterpret_cast<const sycl::float4*>(&sp[h][c0 + 4]);
+            acc[h] = sycl::fma(p0[0], values[0], acc[h]);
+            acc[h] = sycl::fma(p0[1], values[1], acc[h]);
+            acc[h] = sycl::fma(p0[2], values[2], acc[h]);
+            acc[h] = sycl::fma(p0[3], values[3], acc[h]);
+            acc[h] = sycl::fma(p1[0], values[4], acc[h]);
+            acc[h] = sycl::fma(p1[1], values[5], acc[h]);
+            acc[h] = sycl::fma(p1[2], values[6], acc[h]);
+            acc[h] = sycl::fma(p1[3], values[7], acc[h]);
+        }
+
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const long long row = rows[j];
+                if (row < 0) continue;
+        float v;
+        if constexpr (KV_MODE == 0) {
+            v = sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(
+                        p.v_pool[row * HD + t]))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+        } else if constexpr (KV_MODE == 1) {
+            const float sc =
+                sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(
+                        p.v_scale[row * (HD / KV_Q8_GROUP) +
+                                  t / KV_Q8_GROUP]))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+            v = (float) p.v_q[row * HD + t] * sc;
+        } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
+            constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
+            const int b = t / QK4_0;
+            const int rem = t % QK4_0;
+            const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * bytes_per_head) + b;
+            const float d =
+                sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(blk->d))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+            const int j = rem < 16 ? rem : (rem - 16);
+            const uint8_t byte = blk->qs[j];
+            const int nibble = (rem < 16) ? ((byte & 0x0F) - 8) : ((byte >> 4) - 8);
+            v = (float) nibble * d;
+        }
+#pragma unroll
+                for (int h = 0; h < G; ++h) acc[h] = sycl::fma(sp[h][c0 + j], v, acc[h]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
+}
+
+template <int KV_MODE>
+/*
+DPCT1110: The total declared local variable size in device function
+chunk_down_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void
+b60_qsa_float4_kernel(const float *__restrict__ q, QsaAttnPools p,
+                  const int32_t *__restrict__ ids,
+                  const int32_t *__restrict__ step, int n_kv_heads,
+                  int page_size, float scale, float *__restrict__ part_acc,
+                  float *__restrict__ part_m, float *__restrict__ part_l,
+                  int n_chunks, int cap = 0, long long scratch_stride = 0) {
+    // batched form: query blockIdx.z, with its own q row, selection, step and scratch
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    q += (size_t)item_ct1.get_group(0) * (size_t)(n_kv_heads * G) * HD;
+    ids += (size_t)item_ct1.get_group(0) * (size_t)cap;
+    step += (size_t)item_ct1.get_group(0) * kStepCount;
+    part_acc += (size_t)item_ct1.get_group(0) * (size_t)scratch_stride;
+    part_m += (size_t)item_ct1.get_group(0) * (size_t)scratch_stride;
+    part_l += (size_t)item_ct1.get_group(0) * (size_t)scratch_stride;
+    auto &sq =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[G][HD]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<
+                3>()); // 12 KB: this KV head's query heads
+    auto &sp =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[G][CHUNK]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<
+                3>()); // scores, then probabilities
+    auto &srow =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<long long[CHUNK]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<
+                3>()); // pool row of each cell (page, kv head, slot)
+    /*
+    DPCT1098: The '*' expression is used instead of the __ldg call. These
+    two expressions do not provide the exact same functionality. Check the
+    generated code for potential precision and/or performance issues.
+    */
+    const int n_ids = *(step + kStepWidth);
+    const int chunk = item_ct1.get_group(2), kvh = item_ct1.get_group(1);
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int c0 = chunk * CHUNK;
+    const int n_here = sycl::min(CHUNK, n_ids - c0);
+    const int slot = kvh * n_chunks + chunk;
+    if (n_here <= 0) {
+        if (t < G) { part_m[slot * G + t] = -FLT_MAX; part_l[slot * G + t] = 0.0f; }
+        return;
+    }
+#pragma unroll
+    for (int i = t; i < G * HD; i += THREADS)
+        sq[i / HD][i % HD] = q[(size_t)(kvh * G + i / HD) * HD +
+            ((i % HD) % 128 / 4) * 8 + ((i % HD) / 128) * 4 + (i % 4)];
+    if (t < CHUNK) {
+        long long r = -1;
+        if (t < n_here) {
+            const int cell = ids[c0 + t];
+            const long long page = (long long) p.page_table[cell / page_size];
+            // a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
+            // (score -FLT_MAX, weight 0) instead of being read from before the pool.
+            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+        }
+        srow[t] = r;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    // scores: each warp takes cells warp, warp+8, ...; each lane holds 8 of the 256 dimensions.
+    for (int c = warp; c < CHUNK; c += WARPS) {
+        if (c >= n_here || srow[c] < 0) {
+            if (lane < G) sp[lane][c] = -FLT_MAX;
+            continue;
+        }
+        float k8[8];
+        private_load8_vector_codes(p, false, srow[c], lane * 8, k8);
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            const sycl::float4 qa =
+                *reinterpret_cast<const sycl::float4 *>(&sq[h][lane * 4]);
+            const sycl::float4 qb =
+                *reinterpret_cast<const sycl::float4 *>(&sq[h][128 + lane * 4]);
+            float s = k8[0] * qa.x() + k8[1] * qa.y() + k8[2] * qa.z() +
+                      k8[3] * qa.w() + k8[4] * qb.x() + k8[5] * qb.y() +
+                      k8[6] * qb.z() + k8[7] * qb.w();
+            s = lane0_sum(s);
+            if (lane == 0) sp[h][c] = s * scale;
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    // per-head chunk max and exp-sum: warp w handles heads w and w+8.
+    for (int h = warp; h < G; h += WARPS) {
+        const float a = sp[h][lane], b = sp[h][lane + 32];
+        const float m = warp_max(sycl::fmax(a, b));
+        const float ea = (lane < n_here && srow[lane] >= 0)
+                             ? sycl::native::exp(a - m)
+                             : 0.0f;
+        const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0)
+                             ? sycl::native::exp(b - m)
+                             : 0.0f;
+        sp[h][lane] = ea;
+        sp[h][lane + 32] = eb;
+        const float l = lane0_sum(ea + eb);
+        if (lane == 0) { part_m[slot * G + h] = m; part_l[slot * G + h] = l; }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    // values: thread t owns dimension t for all 12 heads.
+    float acc[G];
+#pragma unroll
+    for (int h = 0; h < G; ++h) acc[h] = 0.0f;
+    for (int c0 = 0; c0 < n_here; c0 += 8) {
+        long long rows[8]; bool full = c0 + 8 <= n_here;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            rows[j] = c0 + j < n_here ? srow[c0 + j] : -1;
+            full = full && rows[j] >= 0;
+        }
+        if (full) {
+            float values[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const long long row = rows[j];
+        float v;
+        if constexpr (KV_MODE == 0) {
+            v = sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(
+                        p.v_pool[row * HD + t]))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+        } else if constexpr (KV_MODE == 1) {
+            const float sc =
+                sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(
+                        p.v_scale[row * (HD / KV_Q8_GROUP) +
+                                  t / KV_Q8_GROUP]))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+            v = (float) p.v_q[row * HD + t] * sc;
+        } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
+            constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
+            const int b = t / QK4_0;
+            const int rem = t % QK4_0;
+            const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * bytes_per_head) + b;
+            const float d =
+                sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(blk->d))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+            const int j = rem < 16 ? rem : (rem - 16);
+            const uint8_t byte = blk->qs[j];
+            const int nibble = (rem < 16) ? ((byte & 0x0F) - 8) : ((byte >> 4) - 8);
+            v = (float) nibble * d;
+        }
+                values[j] = v;
+            }
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            const sycl::float4 p0 = *reinterpret_cast<const sycl::float4*>(&sp[h][c0]);
+            const sycl::float4 p1 = *reinterpret_cast<const sycl::float4*>(&sp[h][c0 + 4]);
+            acc[h] = sycl::fma(p0[0], values[0], acc[h]);
+            acc[h] = sycl::fma(p0[1], values[1], acc[h]);
+            acc[h] = sycl::fma(p0[2], values[2], acc[h]);
+            acc[h] = sycl::fma(p0[3], values[3], acc[h]);
+            acc[h] = sycl::fma(p1[0], values[4], acc[h]);
+            acc[h] = sycl::fma(p1[1], values[5], acc[h]);
+            acc[h] = sycl::fma(p1[2], values[6], acc[h]);
+            acc[h] = sycl::fma(p1[3], values[7], acc[h]);
+        }
+
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const long long row = rows[j];
+                if (row < 0) continue;
+        float v;
+        if constexpr (KV_MODE == 0) {
+            v = sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(
+                        p.v_pool[row * HD + t]))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+        } else if constexpr (KV_MODE == 1) {
+            const float sc =
+                sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(
+                        p.v_scale[row * (HD / KV_Q8_GROUP) +
+                                  t / KV_Q8_GROUP]))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+            v = (float) p.v_q[row * HD + t] * sc;
+        } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
+            constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
+            const int b = t / QK4_0;
+            const int rem = t % QK4_0;
+            const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * bytes_per_head) + b;
+            const float d =
+                sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(blk->d))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+            const int j = rem < 16 ? rem : (rem - 16);
+            const uint8_t byte = blk->qs[j];
+            const int nibble = (rem < 16) ? ((byte & 0x0F) - 8) : ((byte >> 4) - 8);
+            v = (float) nibble * d;
+        }
+#pragma unroll
+                for (int h = 0; h < G; ++h) acc[h] = sycl::fma(sp[h][c0 + j], v, acc[h]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
+}
+
+template <int KV_MODE>
+/*
+DPCT1110: The total declared local variable size in device function
+chunk_down_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void
+b60_qsa_head6_kernel(const float *__restrict__ q, QsaAttnPools p,
+                  const int32_t *__restrict__ ids,
+                  const int32_t *__restrict__ step, int n_kv_heads,
+                  int page_size, float scale, float *__restrict__ part_acc,
+                  float *__restrict__ part_m, float *__restrict__ part_l,
+                  int n_chunks, int cap = 0, long long scratch_stride = 0) {
+    // batched form: query blockIdx.z, with its own q row, selection, step and scratch
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    constexpr int H=6;const int headbase=int(item_ct1.get_group(2)%2)*H;
+    q += (size_t)item_ct1.get_group(0) * (size_t)(n_kv_heads * G) * HD;
+    ids += (size_t)item_ct1.get_group(0) * (size_t)cap;
+    step += (size_t)item_ct1.get_group(0) * kStepCount;
+    part_acc += (size_t)item_ct1.get_group(0) * (size_t)scratch_stride;
+    part_m += (size_t)item_ct1.get_group(0) * (size_t)scratch_stride;
+    part_l += (size_t)item_ct1.get_group(0) * (size_t)scratch_stride;
+    auto &sq =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[H][HD]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<
+                3>()); // 12 KB: this KV head's query heads
+    auto &sp =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[H][CHUNK]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<
+                3>()); // scores, then probabilities
+    auto &srow =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<long long[CHUNK]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<
+                3>()); // pool row of each cell (page, kv head, slot)
+    /*
+    DPCT1098: The '*' expression is used instead of the __ldg call. These
+    two expressions do not provide the exact same functionality. Check the
+    generated code for potential precision and/or performance issues.
+    */
+    const int n_ids = *(step + kStepWidth);
+    const int chunk = item_ct1.get_group(2)/2, kvh = item_ct1.get_group(1);
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int c0 = chunk * CHUNK;
+    const int n_here = sycl::min(CHUNK, n_ids - c0);
+    const int slot = kvh * n_chunks + chunk;
+    if (n_here <= 0) {
+        if (t < H) { part_m[slot * G + headbase + t] = -FLT_MAX; part_l[slot * G + headbase + t] = 0.0f; }
+        return;
+    }
+#pragma unroll
+    for (int i = t; i < H * HD; i += THREADS)
+        sq[i / HD][i % HD] = q[(size_t)(kvh * G + headbase + i / HD) * HD +
+            ((i % HD) % 128 / 4) * 8 + ((i % HD) / 128) * 4 + (i % 4)];
+    if (t < CHUNK) {
+        long long r = -1;
+        if (t < n_here) {
+            const int cell = ids[c0 + t];
+            const long long page = (long long) p.page_table[cell / page_size];
+            // a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
+            // (score -FLT_MAX, weight 0) instead of being read from before the pool.
+            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+        }
+        srow[t] = r;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    // scores: each warp takes cells warp, warp+8, ...; each lane holds 8 of the 256 dimensions.
+    for (int c = warp; c < CHUNK; c += WARPS) {
+        if (c >= n_here || srow[c] < 0) {
+            if (lane < H) sp[lane][c] = -FLT_MAX;
+            continue;
+        }
+        float k8[8];
+        private_load8_vector_codes(p, false, srow[c], lane * 8, k8);
+#pragma unroll
+        for (int h = 0; h < H; ++h) {
+            const sycl::float4 qa =
+                *reinterpret_cast<const sycl::float4 *>(&sq[h][lane * 4]);
+            const sycl::float4 qb =
+                *reinterpret_cast<const sycl::float4 *>(&sq[h][128 + lane * 4]);
+            float s = k8[0] * qa.x() + k8[1] * qa.y() + k8[2] * qa.z() +
+                      k8[3] * qa.w() + k8[4] * qb.x() + k8[5] * qb.y() +
+                      k8[6] * qb.z() + k8[7] * qb.w();
+            s = lane0_sum(s);
+            if (lane == 0) sp[h][c] = s * scale;
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    // per-head chunk max and exp-sum: warp w handles heads w and w+8.
+    for (int h = warp; h < H; h += WARPS) {
+        const float a = sp[h][lane], b = sp[h][lane + 32];
+        const float m = warp_max(sycl::fmax(a, b));
+        const float ea = (lane < n_here && srow[lane] >= 0)
+                             ? sycl::native::exp(a - m)
+                             : 0.0f;
+        const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0)
+                             ? sycl::native::exp(b - m)
+                             : 0.0f;
+        sp[h][lane] = ea;
+        sp[h][lane + 32] = eb;
+        const float l = lane0_sum(ea + eb);
+        if (lane == 0) { part_m[slot * G + headbase + h] = m; part_l[slot * G + headbase + h] = l; }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier();
+    // values: thread t owns dimension t for all 12 heads.
+    float acc[H];
+#pragma unroll
+    for (int h = 0; h < H; ++h) acc[h] = 0.0f;
+    for (int c0 = 0; c0 < n_here; c0 += 8) {
+        long long rows[8]; bool full = c0 + 8 <= n_here;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            rows[j] = c0 + j < n_here ? srow[c0 + j] : -1;
+            full = full && rows[j] >= 0;
+        }
+        if (full) {
+            float values[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const long long row = rows[j];
+        float v;
+        if constexpr (KV_MODE == 0) {
+            v = sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(
+                        p.v_pool[row * HD + t]))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+        } else if constexpr (KV_MODE == 1) {
+            const float sc =
+                sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(
+                        p.v_scale[row * (HD / KV_Q8_GROUP) +
+                                  t / KV_Q8_GROUP]))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+            v = (float) p.v_q[row * HD + t] * sc;
+        } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
+            constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
+            const int b = t / QK4_0;
+            const int rem = t % QK4_0;
+            const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * bytes_per_head) + b;
+            const float d =
+                sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(blk->d))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+            const int j = rem < 16 ? rem : (rem - 16);
+            const uint8_t byte = blk->qs[j];
+            const int nibble = (rem < 16) ? ((byte & 0x0F) - 8) : ((byte >> 4) - 8);
+            v = (float) nibble * d;
+        }
+                values[j] = v;
+            }
+#pragma unroll
+        for (int h = 0; h < H; ++h) {
+            const sycl::float4 p0 = *reinterpret_cast<const sycl::float4*>(&sp[h][c0]);
+            const sycl::float4 p1 = *reinterpret_cast<const sycl::float4*>(&sp[h][c0 + 4]);
+            acc[h] = sycl::fma(p0[0], values[0], acc[h]);
+            acc[h] = sycl::fma(p0[1], values[1], acc[h]);
+            acc[h] = sycl::fma(p0[2], values[2], acc[h]);
+            acc[h] = sycl::fma(p0[3], values[3], acc[h]);
+            acc[h] = sycl::fma(p1[0], values[4], acc[h]);
+            acc[h] = sycl::fma(p1[1], values[5], acc[h]);
+            acc[h] = sycl::fma(p1[2], values[6], acc[h]);
+            acc[h] = sycl::fma(p1[3], values[7], acc[h]);
+        }
+
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const long long row = rows[j];
+                if (row < 0) continue;
+        float v;
+        if constexpr (KV_MODE == 0) {
+            v = sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(
+                        p.v_pool[row * HD + t]))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+        } else if constexpr (KV_MODE == 1) {
+            const float sc =
+                sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(
+                        p.v_scale[row * (HD / KV_Q8_GROUP) +
+                                  t / KV_Q8_GROUP]))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+            v = (float) p.v_q[row * HD + t] * sc;
+        } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
+            constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
+            const int b = t / QK4_0;
+            const int rem = t % QK4_0;
+            const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * bytes_per_head) + b;
+            const float d =
+                sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(blk->d))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+            const int j = rem < 16 ? rem : (rem - 16);
+            const uint8_t byte = blk->qs[j];
+            const int nibble = (rem < 16) ? ((byte & 0x0F) - 8) : ((byte >> 4) - 8);
+            v = (float) nibble * d;
+        }
+#pragma unroll
+                for (int h = 0; h < H; ++h) acc[h] = sycl::fma(sp[h][c0 + j], v, acc[h]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int h = 0; h < H; ++h) part_acc[((size_t) slot * G + headbase + h) * HD + t] = acc[h];
+}
+
+class B60QsaHead6;
+template <int KV_MODE>
+/*
+DPCT1110: The total declared local variable size in device function
+chunk_down_kernel exceeds 128 bytes and may cause high register pressure.
+Consult with your hardware vendor to find the total register size available and
+adjust the code, or use smaller sub-group size to avoid high register pressure.
+*/
+__dpct_inline__ void
+b60_qsa_local_fence_kernel(const float *__restrict__ q, QsaAttnPools p,
+                  const int32_t *__restrict__ ids,
+                  const int32_t *__restrict__ step, int n_kv_heads,
+                  int page_size, float scale, float *__restrict__ part_acc,
+                  float *__restrict__ part_m, float *__restrict__ part_l,
+                  int n_chunks, int cap = 0, long long scratch_stride = 0) {
+    // batched form: query blockIdx.z, with its own q row, selection, step and scratch
+    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
+    q += (size_t)item_ct1.get_group(0) * (size_t)(n_kv_heads * G) * HD;
+    ids += (size_t)item_ct1.get_group(0) * (size_t)cap;
+    step += (size_t)item_ct1.get_group(0) * kStepCount;
+    part_acc += (size_t)item_ct1.get_group(0) * (size_t)scratch_stride;
+    part_m += (size_t)item_ct1.get_group(0) * (size_t)scratch_stride;
+    part_l += (size_t)item_ct1.get_group(0) * (size_t)scratch_stride;
+    auto &sq =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[G][HD]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<
+                3>()); // 12 KB: this KV head's query heads
+    auto &sp =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<float[G][CHUNK]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<
+                3>()); // scores, then probabilities
+    auto &srow =
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<long long[CHUNK]>(
+            sycl::ext::oneapi::this_work_item::get_work_group<
+                3>()); // pool row of each cell (page, kv head, slot)
+    /*
+    DPCT1098: The '*' expression is used instead of the __ldg call. These
+    two expressions do not provide the exact same functionality. Check the
+    generated code for potential precision and/or performance issues.
+    */
+    const int n_ids = *(step + kStepWidth);
+    const int chunk = item_ct1.get_group(2), kvh = item_ct1.get_group(1);
+    const int t = item_ct1.get_local_id(2), lane = t & 31, warp = t >> 5;
+    const int c0 = chunk * CHUNK;
+    const int n_here = sycl::min(CHUNK, n_ids - c0);
+    const int slot = kvh * n_chunks + chunk;
+    if (n_here <= 0) {
+        if (t < G) { part_m[slot * G + t] = -FLT_MAX; part_l[slot * G + t] = 0.0f; }
+        return;
+    }
+#pragma unroll
+    for (int i = t; i < G * HD; i += THREADS)
+        sq[i / HD][i % HD] = q[(size_t)(kvh * G + i / HD) * HD +
+            ((i % HD) % 128 / 4) * 8 + ((i % HD) / 128) * 4 + (i % 4)];
+    if (t < CHUNK) {
+        long long r = -1;
+        if (t < n_here) {
+            const int cell = ids[c0 + t];
+            const long long page = (long long) p.page_table[cell / page_size];
+            // a block the KV streaming could not make resident keeps page -1 (ctl[3]); its cells are masked
+            // (score -FLT_MAX, weight 0) instead of being read from before the pool.
+            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+        }
+        srow[t] = r;
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    // scores: each warp takes cells warp, warp+8, ...; each lane holds 8 of the 256 dimensions.
+    for (int c = warp; c < CHUNK; c += WARPS) {
+        if (c >= n_here || srow[c] < 0) {
+            if (lane < G) sp[lane][c] = -FLT_MAX;
+            continue;
+        }
+        float k8[8];
+        private_load8_vector_codes(p, false, srow[c], lane * 8, k8);
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            const sycl::float4 qa =
+                *reinterpret_cast<const sycl::float4 *>(&sq[h][lane * 4]);
+            const sycl::float4 qb =
+                *reinterpret_cast<const sycl::float4 *>(&sq[h][128 + lane * 4]);
+            float s = k8[0] * qa.x() + k8[1] * qa.y() + k8[2] * qa.z() +
+                      k8[3] * qa.w() + k8[4] * qb.x() + k8[5] * qb.y() +
+                      k8[6] * qb.z() + k8[7] * qb.w();
+            s = lane0_sum(s);
+            if (lane == 0) sp[h][c] = s * scale;
+        }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    // per-head chunk max and exp-sum: warp w handles heads w and w+8.
+    for (int h = warp; h < G; h += WARPS) {
+        const float a = sp[h][lane], b = sp[h][lane + 32];
+        const float m = warp_max(sycl::fmax(a, b));
+        const float ea = (lane < n_here && srow[lane] >= 0)
+                             ? sycl::native::exp(a - m)
+                             : 0.0f;
+        const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0)
+                             ? sycl::native::exp(b - m)
+                             : 0.0f;
+        sp[h][lane] = ea;
+        sp[h][lane + 32] = eb;
+        const float l = lane0_sum(ea + eb);
+        if (lane == 0) { part_m[slot * G + h] = m; part_l[slot * G + h] = l; }
+    }
+    /*
+    DPCT1065: Consider replacing sycl::nd_item::barrier() with
+    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
+    performance if there is no access to global memory.
+    */
+    item_ct1.barrier(sycl::access::fence_space::local_space);
+    // values: thread t owns dimension t for all 12 heads.
+    float acc[G];
+#pragma unroll
+    for (int h = 0; h < G; ++h) acc[h] = 0.0f;
+    for (int c0 = 0; c0 < n_here; c0 += 8) {
+        long long rows[8]; bool full = c0 + 8 <= n_here;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            rows[j] = c0 + j < n_here ? srow[c0 + j] : -1;
+            full = full && rows[j] >= 0;
+        }
+        if (full) {
+            float values[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const long long row = rows[j];
+        float v;
+        if constexpr (KV_MODE == 0) {
+            v = sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(
+                        p.v_pool[row * HD + t]))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+        } else if constexpr (KV_MODE == 1) {
+            const float sc =
+                sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(
+                        p.v_scale[row * (HD / KV_Q8_GROUP) +
+                                  t / KV_Q8_GROUP]))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+            v = (float) p.v_q[row * HD + t] * sc;
+        } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
+            constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
+            const int b = t / QK4_0;
+            const int rem = t % QK4_0;
+            const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * bytes_per_head) + b;
+            const float d =
+                sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(blk->d))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+            const int j = rem < 16 ? rem : (rem - 16);
+            const uint8_t byte = blk->qs[j];
+            const int nibble = (rem < 16) ? ((byte & 0x0F) - 8) : ((byte >> 4) - 8);
+            v = (float) nibble * d;
+        }
+                values[j] = v;
+            }
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            const sycl::float4 p0 = *reinterpret_cast<const sycl::float4*>(&sp[h][c0]);
+            const sycl::float4 p1 = *reinterpret_cast<const sycl::float4*>(&sp[h][c0 + 4]);
+            acc[h] = sycl::fma(p0[0], values[0], acc[h]);
+            acc[h] = sycl::fma(p0[1], values[1], acc[h]);
+            acc[h] = sycl::fma(p0[2], values[2], acc[h]);
+            acc[h] = sycl::fma(p0[3], values[3], acc[h]);
+            acc[h] = sycl::fma(p1[0], values[4], acc[h]);
+            acc[h] = sycl::fma(p1[1], values[5], acc[h]);
+            acc[h] = sycl::fma(p1[2], values[6], acc[h]);
+            acc[h] = sycl::fma(p1[3], values[7], acc[h]);
+        }
+
+        } else {
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const long long row = rows[j];
+                if (row < 0) continue;
+        float v;
+        if constexpr (KV_MODE == 0) {
+            v = sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(
+                        p.v_pool[row * HD + t]))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+        } else if constexpr (KV_MODE == 1) {
+            const float sc =
+                sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(
+                        p.v_scale[row * (HD / KV_Q8_GROUP) +
+                                  t / KV_Q8_GROUP]))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+            v = (float) p.v_q[row * HD + t] * sc;
+        } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
+            constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
+            const int b = t / QK4_0;
+            const int rem = t % QK4_0;
+            const block_q4_0* blk = reinterpret_cast<const block_q4_0*>(p.v_q4 + row * bytes_per_head) + b;
+            const float d =
+                sycl::vec<sycl::half, 1>(
+                    sycl::bit_cast<sycl::half, unsigned short>(blk->d))
+                    .convert<float, sycl::rounding_mode::automatic>()[0];
+            const int j = rem < 16 ? rem : (rem - 16);
+            const uint8_t byte = blk->qs[j];
+            const int nibble = (rem < 16) ? ((byte & 0x0F) - 8) : ((byte >> 4) - 8);
+            v = (float) nibble * d;
+        }
+#pragma unroll
+                for (int h = 0; h < G; ++h) acc[h] = sycl::fma(sp[h][c0 + j], v, acc[h]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
+}
+
+class B60QsaLocalFence;
+inline bool b60_next_qsa_pool(){static const bool on=[] {const char*p=std::getenv("STRATA_PRIVATE_B60_NEXT_POOL");return p&&p[0]=='1';}();return on;}
+class B60QsaFloat4;
+thread_local bool b60_qsa_float4_probe_mode=false;
+
+class QsaVectorCodes;
+}
+static void launch_normal_qsa_vector(int mode,const float* q,const QsaAttnPools& pools,
+    const int32_t* ids,const int32_t* steps,int64_t cap,const QsaShapes& sh,
+    float* scratch,float* attn,int64_t nq,void* stream,float* secondary = nullptr){
+    if(nq<=0)return;
+    const int chunks=int((cap+CHUNK-1)/CHUNK);
+    const long long stride=qsa_decode_attn_scratch_floats(cap,sh);
+    auto* pm=scratch+size_t(chunks)*sh.n_head*HD;
+    auto* pl=pm+size_t(chunks)*sh.n_head;
+    auto* queue=strata::q_of(stream);const float scale=1.f/sqrtf(float(HD));
+    auto props=sycl::ext::oneapi::experimental::properties{};
+    if(b60_layout_requested()&&b60_next_qsa_pool()&&((cap==2051&&nq==1&&(!b60_single_actor_requested()&&queue->get_device()==static_cast<const sycl::device&>(dpct::get_device(0)))) || (cap==2051&&nq==1&&(b60_single_actor_requested()||queue->get_device()==static_cast<const sycl::device&>(dpct::get_device(1)))))) {
+    queue->parallel_for<B60QsaHead6>(
+        sycl::nd_range<3>(sycl::range<3>(nq,sh.n_head_kv,size_t(chunks)*2*THREADS),sycl::range<3>(1,1,THREADS)),props,
+        [=](sycl::nd_item<3>)[[sycl::reqd_sub_group_size(32)]]{
+            b60_qsa_head6_kernel<1>(q,pools,ids,steps,sh.n_head_kv,sh.page_size,scale,scratch,pm,pl,chunks,cap,stride);
+        });
+    } else
+    if(b60_layout_requested()&&b60_next_qsa_pool()&&((cap==2051&&nq==4&&(!b60_single_actor_requested()&&queue->get_device()==static_cast<const sycl::device&>(dpct::get_device(0)))) || (cap==32768&&nq==1&&(b60_single_actor_requested()||queue->get_device()==static_cast<const sycl::device&>(dpct::get_device(1)))))) {
+    queue->parallel_for<B60QsaLocalFence>(
+        sycl::nd_range<3>(sycl::range<3>(nq,sh.n_head_kv,size_t(chunks)*THREADS),sycl::range<3>(1,1,THREADS)),props,
+        [=](sycl::nd_item<3>)[[sycl::reqd_sub_group_size(32)]]{
+            b60_qsa_local_fence_kernel<1>(q,pools,ids,steps,sh.n_head_kv,sh.page_size,scale,scratch,pm,pl,chunks,cap,stride);
+        });
+    } else
+    if(b60_qsa_float4_probe_mode || (b60_layout_requested() && ((cap==2051&&nq>=1&&nq<=4)||(cap==32768&&nq==1)))) {
+    queue->parallel_for<B60QsaFloat4>(
+        sycl::nd_range<3>(sycl::range<3>(nq,sh.n_head_kv,size_t(chunks)*THREADS),sycl::range<3>(1,1,THREADS)),props,
+        [=](sycl::nd_item<3>)[[sycl::reqd_sub_group_size(32)]]{
+            b60_qsa_float4_kernel<1>(q,pools,ids,steps,sh.n_head_kv,sh.page_size,scale,scratch,pm,pl,chunks,cap,stride);
+        });
+    } else {
+    queue->parallel_for<QsaVectorCodes>(
+        sycl::nd_range<3>(sycl::range<3>(nq,sh.n_head_kv,size_t(chunks)*THREADS),sycl::range<3>(1,1,THREADS)),props,
+        [=](sycl::nd_item<3>)[[sycl::reqd_sub_group_size(32)]]{
+            chunk_vector_codes_kernel<1>(q,pools,ids,steps,sh.n_head_kv,sh.page_size,scale,scratch,pm,pl,chunks,cap,stride);
+        });
+    }
+    if (secondary) {
+        qsa_merge_two_stage_probe(1, scratch, chunks, secondary, attn, stream);
+        return;
+    }
+    queue->parallel_for<dpct_kernel_name<class qsa_vector_codes_merge>>(
+        sycl::nd_range<3>(sycl::range<3>(1,nq,size_t(sh.n_head)*THREADS),sycl::range<3>(1,1,THREADS)),props,
+        [=](sycl::nd_item<3>){attn_merge_kernel(scratch,pm,pl,chunks,attn,stride);});
+}
+static void launch_qsa_chunk_down(int mode,const float* q,const QsaAttnPools& pools,
+    const int32_t* ids,const int32_t* steps,int64_t cap,const QsaShapes& s,
+    float* scratch,float* attn,int64_t nq,void* stream){
+    if(mode<0||mode>1)throw std::invalid_argument("QSA chunk down mode");
+    if(mode==0||!pools.k_q||!pools.v_q||pools.k_q4||pools.v_q4){
+        qsa_decode_attn_batch(q,pools,ids,steps,cap,s,scratch,attn,nq,stream);return;
+    }
+    if(nq<=0)return;
+    static const bool vector_enabled = [] {
+        const char* v = std::getenv("STRATA_SYCL_QSA_VALUE8_K8_VEC");
+        return !v || v[0] == '1';
+    }();
+    const bool vector_shape=(cap==2051&&(nq==1||nq==2||nq==3||nq==4||nq==32))||(cap==32768&&nq==1);
+    if(vector_enabled&&vector_shape){launch_normal_qsa_vector(1,q,pools,ids,steps,cap,s,scratch,attn,nq,stream);return;}
+    const int chunks=int((cap+CHUNK-1)/CHUNK);
+    const long long stride=qsa_decode_attn_scratch_floats(cap,s);
+    auto* part_m=scratch+size_t(chunks)*s.n_head*HD;
+    auto* part_l=part_m+size_t(chunks)*s.n_head;
+    auto* queue=strata::q_of(stream);
+    const float scale=1.f/sqrtf(float(HD));
+    auto props=sycl::ext::oneapi::experimental::properties{};
+    queue->parallel_for<QsaChunkDown>(
+        sycl::nd_range<3>(sycl::range<3>(nq,s.n_head_kv,size_t(chunks)*THREADS),sycl::range<3>(1,1,THREADS)),props,
+        [=](sycl::nd_item<3>)[[sycl::reqd_sub_group_size(32)]]{
+            chunk_down_kernel<1>(q,pools,ids,steps,s.n_head_kv,s.page_size,scale,
+                scratch,part_m,part_l,chunks,cap,stride);
+        });
+    queue->parallel_for<dpct_kernel_name<class qsa_chunk_down_merge>>(
+        sycl::nd_range<3>(sycl::range<3>(1,nq,size_t(s.n_head)*THREADS),sycl::range<3>(1,1,THREADS)),props,
+        [=](sycl::nd_item<3>){attn_merge_kernel(scratch,part_m,part_l,chunks,attn,stride);});
+}
+
+bool qsa_decode_attn_batch_try_two_stage(const float* q, const QsaAttnPools& pools,
+    const int32_t* ids, const int32_t* steps, int64_t cap, const QsaShapes& s,
+    float* scratch, float* attn, int64_t n_q, float* secondary,
+    uint64_t secondary_floats, void* stream) {
+    // The sole caller owns parts_ and a one-query scratch. Keep every other
+    // caller, geometry, storage mode and existing dispatch fallback unchanged.
+    if (cap != 32768 || n_q != 1 || s.n_head != 24 || s.n_head_kv != 2 ||
+        s.head_dim != 256 || s.page_size != 4 || !q || !ids || !steps ||
+        !scratch || !attn || !secondary || !pools.page_table ||
+        !pools.k_q || !pools.v_q || !pools.k_scale || !pools.v_scale ||
+        pools.k_q4 || pools.v_q4 || !qsa_chunk_down_supported(cap, n_q, s, stream))
+        return false;
+    static const bool vector_enabled = [] {
+        const char* v = std::getenv("STRATA_SYCL_QSA_VALUE8_K8_VEC");
+        return !v || v[0] == '1';
+    }();
+    auto* queue = strata::q_of(stream);
+    const int chunks = int((cap + CHUNK - 1) / CHUNK);
+    const uint64_t used = qsa_merge_two_stage_scratch_floats(chunks);
+    if (!vector_enabled || !queue->is_in_order() || secondary_floats < used)
+        return false;
+    const auto disjoint = [](const void* a, uint64_t an, const void* b, uint64_t bn) {
+        const uintptr_t av = reinterpret_cast<uintptr_t>(a), bv = reinterpret_cast<uintptr_t>(b);
+        if (av > UINTPTR_MAX - an || bv > UINTPTR_MAX - bn) return false;
+        return av + an <= bv || bv + bn <= av;
+    };
+    const uint64_t bytes = used * sizeof(float);
+    if (!disjoint(secondary, bytes, scratch, qsa_decode_attn_scratch_floats(cap, s) * sizeof(float)) ||
+        !disjoint(secondary, bytes, attn, uint64_t(24 * HD) * sizeof(float)) ||
+        !disjoint(secondary, bytes, q, uint64_t(24 * HD) * sizeof(float)))
+        return false;
+    launch_normal_qsa_vector(1, q, pools, ids, steps, cap, s, scratch, attn,
+                             n_q, stream, secondary);
+    return true;
+}
+}
+
+namespace strata::kernels {
+void qsa_query_float4_probe(int mode,const float*q,const QsaAttnPools&p,const int32_t*ids,const int32_t*steps,int64_t cap,const QsaShapes&sh,float*scratch,float*attn,int64_t T,void*stream,float*secondary){
+ if(mode<0||mode>1)throw std::invalid_argument("B60 query float4 mode");
+ struct Restore {bool previous;~Restore(){b60_qsa_float4_probe_mode=previous;}} restore{b60_qsa_float4_probe_mode};
+ b60_qsa_float4_probe_mode=mode==1;
+ launch_normal_qsa_vector(1,q,p,ids,steps,cap,sh,scratch,attn,T,stream,secondary);
+}
+}

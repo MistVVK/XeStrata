@@ -5,6 +5,7 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/prefill/gemm.hpp"
+#include "strata/workload_trace.hpp"
 #include "strata/kernels/dequant_bf16.hpp"
 #include <dpct/blas_utils.hpp>
 
@@ -831,6 +832,7 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
         return;
     }
 #endif
+    workload_trace::Scope trace("gemm.bf16_to_f32", stream_, T, N, K, ldx ? ldx : K, ldy);
     const float alpha = 1.0f;
     {   // CLEAN-6.0: the repeatable path for skinny outputs (see strata_bf16_det)
         static const int det_mode = [] { const char* v = std::getenv("STRATA_SYCL_BF16_DET"); return v == nullptr || v[0] == 0 ? 1 : std::atoi(v); }();
@@ -917,6 +919,7 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
 #if defined(__HIPCC__)
     if (f16_io_ && beta == 0.0f) { f16_inplace(X, W, Y, T, N, K, ldy); return; }
 #endif
+    workload_trace::Scope trace("gemm.f16_to_f32", stream_, T, N, K, K, ldy);
     const float alpha = 1.0f;
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
     if (try_hipblaslt(hipblaslt_state_, strata::prefill::hipblaslt::InputType::f16, X, W, Y, T, N, K, ldy,
@@ -1029,42 +1032,21 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                   int64_t ldy, float beta, int64_t ldx) {
-#ifdef STRATA_USE_HIP
-    // S23 (opt-in STRATA_PF_PAD=1, with STRATA_PF_GEMM=1 on chunks of STRATA_PF_SWITCH_MIN_T+ tokens): the weight
-    // dequantized into the scratch with row stride K + 64 halves, so no 4 KB-multiple stride camps on the memory
-    // channels (gemm_probe8: K 6144 19 -> 29 TFLOPS from W alone, 35 with X padded too).  Bitwise the same products.
-    static const bool pad_on = [] { const char* v = std::getenv("STRATA_PF_PAD"); return v && v[0] == '1'; }();
-    static const bool pf_on = [] { const char* v = std::getenv("STRATA_PF_GEMM"); return v && v[0] == '1'; }();
-    static const int64_t pf_min_t = [] { const char* v = std::getenv("STRATA_PF_SWITCH_MIN_T"); return v ? (int64_t) std::atoll(v) : (int64_t) 0; }();
-    if (pad_on && pf_on && T >= pf_min_t && T >= 64 && N >= 512 && K % 32 == 0 && N * (K + 64) <= scratch_elems_) {
-        const int64_t ldw = K + 64;
-        if (strata::kernels::dequant_f16_ld(ggml_type, W_blocks, 0, N, K, ldw, scratch_, stream_) &&
-            strata_pf_gemm_f16_ld(X, ldx > 0 ? ldx : K, scratch_, ldw, Y, T, N, K, ldy, beta, stream_)) {
-            return;
-        }
-    }
-#endif
-    if (ldx > 0 && ldx != K) {
-#ifdef STRATA_USE_HIP
-        // X arrived padded but the weight cannot be (an i-quant without a strided dequant, or the scratch is too
-        // small for N x (K + 64)): the weight unpadded, X read at its stride - the same products, the same bits
-        const int64_t rows = scratch_elems_ / K;
-        bool ok = rows > 0;
-        if (ldy <= 0) ldy = N;
-        for (int64_t r0 = 0; ok && r0 < N; r0 += rows) {
-            const int64_t n = (N - r0 < rows) ? N - r0 : rows;
-            strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
-            ok = strata_pf_gemm_f16_ld(X, ldx, scratch_, K, Y + r0, T, n, K, ldy, beta, stream_);
-        }
-        if (ok) return;
-#endif
-        std::fprintf(stderr, "prefill gemm: a padded X (ldx %lld, K %lld) needs STRATA_PF_PAD's path\n",
-                     (long long) ldx, (long long) K);
-        std::exit(1);
-    }
-#if defined(STRATA_PREFILL_MMQ) && defined(__HIPCC__)
-    if (beta == 0.0f && (ldx == 0 || ldx == K) && native_mmq(X, ggml_type, W_blocks, Y, T, N, K, ldy)) return;
-#endif
+    if (T <= 0 || N <= 0) return;
+    if (ldy <= 0) ldy = N;
+    if (ldx <= 0) ldx = K;
+    auto multiply = [&](int64_t n, float* out) {
+        workload_trace::Scope trace("gemm.native_f16_to_f32", stream_, T, n, K, ldx, ldy, ggml_type);
+        const float alpha = 1.0f;
+        ck(DPCT_CHECK_ERROR(dpct::blas::gemm(
+               (dpct::blas::descriptor_ptr)handle_, oneapi::mkl::transpose::trans,
+               oneapi::mkl::transpose::nontrans, (int)n, (int)T, (int)K, &alpha, scratch_,
+               dpct::library_data_t::real_half, (int)K, X,
+               dpct::library_data_t::real_half, (int)ldx, &beta, out,
+               dpct::library_data_t::real_float, (int)ldy,
+               dpct::compute_type::f32)),
+           "cublasGemmEx native");
+    };
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices.
         const int64_t rows = scratch_elems_ / K;
@@ -1073,12 +1055,12 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = (N - r0 < rows) ? N - r0 : rows;
             strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
-            f16(X, scratch_, Y + r0, T, n, K, ldy, beta);
+            multiply(n, Y + r0);
         }
         return;
     }
     strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
-    f16(X, scratch_, Y, T, N, K, ldy, beta);
+    multiply(N, Y);
 }
 
 }  // namespace strata::prefill
