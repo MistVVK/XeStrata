@@ -91,6 +91,10 @@ Every copyright holder whose work is in this repository, its license and where t
   and the GGUF skeleton's writer (tools/yskn_skeleton.py), written after YASAKANI's format.hpp, signs.hpp, loader.cpp,
   repack.cu, lnord.cu, a8_prologue.cuh and q35_kernels.cu; those files as a whole are under the LGPL
   (LGPL-3.0-or-later AND Apache-2.0)
+  The SHEAD output head (include/strata/kernels/shead.hpp, src/kernels/xe/shead.cpp,
+  include/strata/core/shead.hpp, src/core/shead.cpp) is written after YASAKANI's q35_bdraft.cu and engine35.cpp.
+  It stays under Apache-2.0; these files as a whole are under the LGPL (LGPL-3.0-or-later AND Apache-2.0) -
+  LICENSES/Apache-2.0.txt.
 - Copyright (c) 2024 Sahand Ahmadian; Copyright (c) 2024 Jonseed
   MIT - the image engine's Detail Daemon (src/image/guidance.cpp, include/strata/image/guidance.hpp: its schedule, the
   sigma the model is asked at, their constants and the settings' defaults), written after
