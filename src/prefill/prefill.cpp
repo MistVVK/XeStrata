@@ -4164,7 +4164,11 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             const bool tr = m.src->transient(l, e);   // copied by the source in the stager (never pinned)
             if (!tr && m.src->pinned(l, e)) continue;
             const uint8_t* b = tr ? nullptr : m.src->blob(l, e);
-            if (!tr && !b) { err = "prefill (layer-major): expert source has no blob"; return false; }
+            if (!tr && !b) {   // upstream 08e8770c (#4695): no contiguous mapped blob (the mapping dropped): the source copies it itself
+                pf_job[(size_t) e] = (int) js.size();
+                js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
+                continue;
+            }
             pf_job[(size_t) e] = (int) js.size();
             js.push_back({b, (size_t) lay.blob_bytes(l), tr ? m.src : nullptr, (int32_t) l, e});
         }
@@ -4238,7 +4242,11 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 const bool tr = m.src->transient(l, e);
                 if (!tr && m.src->pinned(l, e)) continue;
                 const uint8_t* b = tr ? nullptr : m.src->blob(l, e);
-                if (!tr && !b) { err = "prefill (layer-major): expert source has no blob"; return false; }
+                if (!tr && !b) {   // upstream 08e8770c (#4695): as in lm_prefetch
+                    job_of[u] = (int) js.size();
+                    js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
+                    continue;
+                }
                 job_of[u] = (int) js.size();
                 js.push_back({b, (size_t) lay.blob_bytes(l), tr ? m.src : nullptr, (int32_t) l, e});
             }
