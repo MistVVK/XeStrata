@@ -208,7 +208,7 @@ The main ones:
 - The resident RAM mode: with room left in the budget, the experts of the slots the prompt path borrows are kept in RAM too (#1683).
 - `--layer-split auto`: when two cards leave a small stage, it picks again by the ratio of their room (#2644).
 - serve: the thinking limit (`max_tokens` and Anthropic's `budget_tokens`), the model card's sampling for a request without one, the prompt tokenized from the last shared prefix (#1852), the next turn sent to the slot that holds the conversation's checkpoint (#2518), short prompts admitted first (`XESTRATA_ADMIT_SHORT_FIRST`, opt-in), parser fixes.
-- Carried as opt-in: `STRATA_EXCHANGE_ROTATE`, `XESTRATA_RAM_ADAPT`, `XESTRATA_SPLIT_UNIFORM`.
+- Carried as opt-in: `STRATA_EXCHANGE_ROTATE`, `XESTRATA_RAM_ADAPT`.
 
 Fixed on XeStrata's side during the integration:
 

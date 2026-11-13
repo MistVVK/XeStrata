@@ -3246,18 +3246,10 @@ int main(int argc, char** argv) {
             copy_ms[(size_t) i] = strata::core::probe_copy_latency_ms();
         }
         static const bool link_abs = [] { const char* v = strata::env_get("SPLIT_LINK_ABS"); return v && v[0] == '1'; }();
-        // STRATA_SPLIT_UNIFORM=1 (opt-in, upstream b8844516): no per-link scaling at all (the uniform miss cost before
-        // upstream 0.1.41), for links where any scaling moves auto off the balanced placement (2x RTX 3090 on x16 + x4:
-        // decode -4..-8%)
-        static const bool split_uniform = [] {
-            const char* v = strata::env_get("SPLIT_UNIFORM");
-            return v && v[0] == '1';
-        }();
         std::vector<double> link_scale = strata::program::split_rules::link_miss_scale(link_gbps);
         for (int i = 0; i < ns; ++i) {
             const double lbw = link_gbps[(size_t) i];
-            if (split_uniform) link_scale[(size_t) i] = 1.0;
-            else if (link_abs) link_scale[(size_t) i] = lbw > 0.0 ? std::clamp(20.0 / lbw, 1.0, 64.0) : 1.0;
+            if (link_abs) link_scale[(size_t) i] = lbw > 0.0 ? std::clamp(20.0 / lbw, 1.0, 64.0) : 1.0;
             std::fprintf(stderr, "xestrata generate: layer split auto: CUDA%d link %.1f GB/s (a 64 KiB copy %.3f ms) -> "
                                  "miss cost x%.2f\n",
                          dev_of_stage(i), lbw, copy_ms[(size_t) i], link_scale[(size_t) i]);

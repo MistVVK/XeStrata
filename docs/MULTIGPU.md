@@ -81,7 +81,6 @@ The log shows the choice (`layer split auto: K=...`); from there on it runs as i
   A GPU with few layers has a small cache, and the prefill chunk shrinks to it.
   On two GPUs it first chooses among the placements that give each GPU at least its share of the layers by its room for experts (upstream 3b848837, #2644): the estimate leans the layers to the faster card, and the three-layer rule landed on its own edge (the slower card with three layers) and left that card idle (upstream: an RTX 4060 Ti 16 GB with an RTX 3060 12 GB read a prompt at 452 tok/s instead of 802). The log says which rule chose the split.
   `XESTRATA_SPLIT_SPEED_SCALE=1,0.55` multiplies each stage's read speed by the factor (a test seam for an unequal pair on two equal cards, upstream 4a1ef86b).
-- `XESTRATA_SPLIT_UNIFORM=1` (opt-in, upstream b8844516) prices every link's misses the same (the uniform cost before upstream 0.1.41), for links where any scaling moves auto off the balanced placement (upstream: 2x RTX 3090 on x16 + x4, decode -4..-8%).
 - On GPUs of different speed or link, when another placement whose split points lie three or more layers away is predicted within 4%, the log names it (`NEAR TIE`, upstream 8bb250d8).
   The prediction prices decode, not prefill, so it is worth a try; the choice stays.
 - Which of the later GPUs runs which stage is chosen from the same prediction (what upstream's "the faster card last", be8db787 and others, does).
