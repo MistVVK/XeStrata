@@ -36,6 +36,7 @@
 #include <linux/io_uring.h>
 #include <sys/mman.h>
 #include <sys/file.h>
+#include <sys/vfs.h>
 #include <sys/syscall.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -476,10 +477,23 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
         } else {
             if (file_size != bytes + kArenaHeaderBytes) {
                 note = "shared arena: file size differs from expected arena size";
-            } else if (!pread_all(shared_fd_, &hdr, sizeof hdr, 0) ||
-                       std::memcmp(hdr.magic, "STRATA-ARENA-V1", 16) != 0 || hdr.version != 1 ||
+            } else if (!pread_all(shared_fd_, &hdr, sizeof hdr, 0)) {
+                note = "shared arena: cannot read the header";
+            } else if (std::memcmp(hdr.magic, "STRATA-ARENA-V1", 16) != 0 || hdr.version != 1 ||
                        hdr.header_bytes != kArenaHeaderBytes || hdr.arena_bytes != bytes) {
-                note = "shared arena: incompatible header";
+                // upstream 0c948518: the creator sizes the file first and writes the header right after; the lock above
+                // serialises a live creator with the importer, so a matching size with a zero header is a creator that
+                // died in that gap.  Every engine fills the arena itself, so nothing in the file is worth keeping: write
+                // the header as the creator would, and load.
+                if (hdr.magic[0] == '\0' && hdr.magic[1] == '\0') {
+                    SharedArenaHeader fresh;
+                    fresh.arena_bytes = bytes; fresh.pack_hash = pack_hash;
+                    if (!pwrite_all(shared_fd_, &fresh, sizeof fresh, 0) || !sync_file(shared_fd_))
+                        throw DeviceError("shared arena: cannot initialize the header");
+                    hdr = fresh;
+                } else {
+                    note = "shared arena: incompatible header";
+                }
             } else if (hdr.pack_hash != pack_hash) {
                 note = "shared arena: pack hash mismatch";
             }
@@ -489,6 +503,20 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
                 return;
             }
         }
+#if !defined(_WIN32)
+        // upstream 0c948518: tmpfs: take the pages now.  ftruncate only sets the length; with /dev/shm too small the load
+        // would die with a bus error part-way, whereas here a full tmpfs is a plain error at start, for every engine that
+        // maps the file (pages already taken cost nothing).  A file on a disk stays sparse.
+        {
+            struct statfs sf {};
+            if (fstatfs(shared_fd_, &sf) == 0 && (unsigned long) sf.f_type == 0x01021994ul) {
+                const int fe = posix_fallocate(shared_fd_, 0, (off_t) (bytes + kArenaHeaderBytes));
+                if (fe != 0 && fe != EOPNOTSUPP && fe != EINVAL)
+                    throw DeviceError("shared arena: not enough room in the tmpfs for " + gib_text(bytes) + ": " +
+                                      std::strerror(fe));
+            }
+        }
+#endif
 #if defined(_WIN32)
         // A view starts at a multiple of the allocation granularity (64 KiB), so the header is mapped with the arena
         // and the arena starts 4 KiB in.  The mapping object closes at once: the view keeps it.
