@@ -195,6 +195,7 @@ std::vector<std::string>& own_only_switches() {
     return set;
 }
 const bool g_own_only_defaults = [] {
+    strata::kernels::native_expert_i8_set_mmq_free();   // the int8 expert kernels are the default prompt-expert kernels here (i8_expert_rule.hpp, i8_switch_effective)
 #if defined(STRATA_USE_HIP) || defined(__HIPCC__)
     static const char* const kOn[] = {"STRATA_PF_FUSED", "STRATA_PF_FUSED_Q50", "STRATA_PF_FUSED_KQ"};
 #else
@@ -5569,7 +5570,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         bool i8_l = false;
                         bool i8_few = false;   // the few-rows route: the layer's groups run on native_expert_grouped, the activations as quantize_q8_1_rows makes them
                         // (a build without MMQ has no use_mmq layer: the layers the fused kernels do not take come here too, as long as the buffers below exist)
-                        if (lay.native && !fused_l && !fz_staged && !wmma_l && !had_gu && !had_d && rows_cpu == 0 && on_peer.empty() && !m.pp &&
+                        if (lay.native && strata::kernels::i8_order_allows(fused_l, fz_staged) && !wmma_l && !had_gu && !had_d && rows_cpu == 0 && on_peer.empty() && !m.pp &&
                             m.group_cap == 0 && !m.fused_bufs && !lay.fmt[(size_t) l].tail_off && ws::mode() == 0 &&
                             !(m.cache && mmq_plan().direct[(size_t) l]) && i8_group_env && !order.empty() &&
                             m.GU != nullptr && m.Dm != nullptr && m.src_dev != nullptr && m.ids_identity != nullptr &&
@@ -5630,7 +5631,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (static bool said = false; !said) {
                                 said = true;
                                 if (strata::kernels::native_expert_i8_by_default())
-                                    std::fprintf(stderr, "strata: prompt experts on our own int8 kernels (the default on this graphics card; STRATA_EXPERT_I8=0 goes back to the old kernels)\n");
+                                    std::fprintf(stderr, "strata: prompt experts on our own int8 kernels (the default of this build or graphics card; STRATA_EXPERT_I8=0 goes back to the old kernels)\n");
                                 else
                                     std::fprintf(stderr, "strata: prompt experts on our own int8 dot-product kernels (STRATA_EXPERT_I8=1)\n");
                             }

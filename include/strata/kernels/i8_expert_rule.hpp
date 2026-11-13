@@ -30,8 +30,23 @@ inline int i8_switch_parse(const char* text) {
     return text == nullptr || text[0] == '\0' ? -1 : (text[0] == '0' ? 0 : 1);
 }
 
-/// Does the card class alone (switch not set) take the int8 kernels?
-inline bool i8_expert_class_default(int state, const char* gcn) { return state == -1 && gfx_arch_is_gfx103x_i8(gcn); }
+/// A build without llama.cpp's MMQ (-DSTRATA_MMQ=OFF, or HIP without STRATA_PREFILL_MMQ; prefill.cpp's STRATA_PF_OWN_ONLY): the int8 kernels are the default prompt-expert kernels on every
+/// card that covers the layer's formats, because MMQ is what they replace; without them the layer runs each expert on the FP16 path (4 - 5 times slower on an RX 6700 XT).  `state` is
+/// i8_switch_parse's answer; a value the user set (0 or 1) is kept, an unset switch reads as 1 in such a build.  "Default on" is not "forced": see i8_order_allows.
+inline int i8_switch_effective(int state, bool mmq_free) { return state == -1 && mmq_free ? 1 : state; }
+
+/// Does the build / card class alone (switch not set) take the int8 kernels: the RDNA2 class, or any card in a build without MMQ.
+inline bool i8_expert_class_default(int state, const char* gcn, bool mmq_free = false) { return state == -1 && (mmq_free || gfx_arch_is_gfx103x_i8(gcn)); }
+
+/// The order of the prompt-expert paths for one layer of one chunk: the fused kernels (a long chunk on a layer they cover) and the staged group entry (a short chunk, the fused kernels'
+/// entry) come first, the int8 kernels take what is left, the FP16 path what even they do not cover.  This holds for a value the user set too (STRATA_EXPERT_I8=1 asks for the int8 kernels
+/// where nothing faster takes the layer: R9700, 2,048 tokens, fused 1,144.6 ms against int8 1,624.5); it is the order prefill.cpp's `i8_l` condition has.
+inline bool i8_order_allows(bool fused_takes, bool staged_takes) { return !fused_takes && !staged_takes; }
+
+/// The whole question for one layer of one chunk, as the pure rule (the engine asks the two halves where it has them: i8_order_allows in prefill.cpp, i8_expert_takes in iq_kernels.cu).
+inline bool i8_layer_takes(int raw_state, bool mmq_free, const char* gcn, int64_t group_entries, bool supported, bool fused_takes, bool staged_takes) {
+    return i8_order_allows(fused_takes, staged_takes) && i8_expert_takes(i8_switch_effective(raw_state, mmq_free), gcn, group_entries, supported);
+}
 
 /// Do the expert groups of a layer take `native_expert_i8`?  `state` = i8_switch_parse(getenv), `gcn` the device's gcnArchName, `group_entries` the entries
 /// of one launch on average, `supported` = native_expert_i8_supported(layout) (formats, sizes, the device's shared memory).

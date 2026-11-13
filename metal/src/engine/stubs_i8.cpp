@@ -17,6 +17,7 @@ namespace strata::kernels {
 bool native_expert_i8_supported(const NativeExpertLayout&) noexcept { return false; }
 bool native_expert_i8_prompt(const NativeExpertLayout&, int64_t) noexcept { return false; }
 bool native_expert_i8_by_default() noexcept { return false; }
+void native_expert_i8_set_mmq_free() noexcept {}
 int native_expert_i8_few_rows_limit() noexcept { return 0; }
 size_t native_expert_i8_scratch_bytes(int64_t cap_entries, int64_t cap_groups, int64_t n_ff) {
     const size_t hqb = ((size_t) cap_entries * (size_t) (n_ff / 32) * 36 + 255) & ~(size_t) 255;   // 36 bytes: sizeof(block_q8_1)

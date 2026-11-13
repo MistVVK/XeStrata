@@ -26,6 +26,7 @@
 #include "tq_lut_i8.cuh"       // int8 copy of the trellis codebook (one global scale) for the dp4a dot
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <utility>
@@ -6237,10 +6238,12 @@ namespace {
 bool g_grouped_v1 = env_on("STRATA_GROUPED_V1");
 #include "i8_expert.cuh"   // OWN-I8: our own int8 dot-product kernels (native_expert_i8 below)
 // OWN-I8: STRATA_EXPERT_I8, read once: 1 = on, 0 = off, -1 = not set (then the card class decides: i8_expert_rule.hpp)
-int i8_switch_state() {
+std::atomic<bool> g_i8_mmq_free{false};   // set before main by a build without MMQ (native_expert_i8_set_mmq_free)
+int i8_switch_raw() {
     static const int s = strata::kernels::i8_switch_parse(std::getenv("STRATA_EXPERT_I8"));
     return s;
 }
+int i8_switch_state() { return strata::kernels::i8_switch_effective(i8_switch_raw(), g_i8_mmq_free.load(std::memory_order_relaxed)); }
 // the current device's gcnArchName, read once per device (a HIP card; "" on a CUDA card)
 const char* i8_device_gcn() {
 #if defined(__HIPCC__)
@@ -6285,7 +6288,8 @@ bool native_expert_i8_prompt(const NativeExpertLayout& L, int64_t group_entries)
     return i8_expert_takes(st, i8_device_gcn(), group_entries, native_expert_i8_supported(L));
 }
 
-bool native_expert_i8_by_default() noexcept { return i8_expert_class_default(i8_switch_state(), i8_device_gcn()); }
+bool native_expert_i8_by_default() noexcept { return i8_expert_class_default(i8_switch_raw(), i8_device_gcn(), g_i8_mmq_free.load(std::memory_order_relaxed)); }
+void native_expert_i8_set_mmq_free() noexcept { g_i8_mmq_free.store(true, std::memory_order_relaxed); }
 
 // OWN-I8 few-rows route: STRATA_I8_FEWROWS read once (not set = the card's class default, 0 = off, N = a limit of N rows per expert); the class default asks the
 // current device's compute capability (a HIP card has none that matters: the CUDA rule's 10)
