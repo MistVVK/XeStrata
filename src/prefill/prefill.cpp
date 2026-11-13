@@ -9,6 +9,7 @@
 #include "strata/prefill/pf_fused_override.hpp"
 #include "strata/prefill/staged_group_rule.hpp"
 #include "strata/prefill/staged_fo_rule.hpp"
+#include "strata/prefill/plain_floor_rule.hpp"
 #include "strata/prefill/share_own_rule.hpp"
 #include "strata/prefill/fp16_rows_rule.hpp"
 #include "strata/prefill/own_only_line.hpp"
@@ -535,10 +536,26 @@ inline int64_t default_stream_floor() {
         std::fprintf(stderr, "prefill: prompt pieces of %lld tokens or more read on the fused kernels, as long prompts do. STRATA_PREFILL_STREAM_MIN=1024 keeps the old rule.\n", (long long) v);
     return v;
 }
+// The CPU share's limit (g_stream_min_share) replaces the default floor, because the share applies to staged chunks only.  Not on the plain pack in a build without MMQ: the share takes experts of
+// a native pack only (cpu_maybe), so there it takes nothing, and the staged walk below the floor runs the plain pack's experts on the dequantize + FP16 path (plain_floor_rule.hpp).
+// STRATA_PF_PLAIN_FLOOR=0 is the way back.  Decided once, when the expert layout is known; before that the old rule answers and is not cached.
+inline bool share_limit_raises_floor_now() {
+#if defined(STRATA_PF_OWN_ONLY)
+    static std::atomic<int> cached{-1};
+    const int c = cached.load(std::memory_order_acquire);
+    if (c >= 0) return c == 1;
+    if (strata::kernels::cpu::expert_layout().n_layers <= 0) return true;
+    const bool v = strata::prefill::share_limit_raises_floor(plain_pack_all_fused(), std::getenv("STRATA_PF_PLAIN_FLOOR"));
+    cached.store(v ? 1 : 0, std::memory_order_release);
+    return v;
+#else
+    return true;
+#endif
+}
 inline int64_t stream_all_min() {
     static const int64_t env = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) -1; }();
     if (env >= 0) return env;
-    return g_stream_min_share > 0 ? g_stream_min_share : default_stream_floor();
+    return g_stream_min_share > 0 && share_limit_raises_floor_now() ? g_stream_min_share : default_stream_floor();
 }
 // STRATA_PREFILL_CPU_SHARE (opt-in; set_cpu_pool): a chunk below stream_all_min() hands the decode CPU pool - idle
 // while a prompt is read - the non-resident experts few of its tokens route to, instead of streaming them over PCIe.
