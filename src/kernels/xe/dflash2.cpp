@@ -650,7 +650,8 @@ inline float cb_val(const uint16_t* cb, int64_t row, int v, int rank, bool q4) {
     const uint8_t* bytes = reinterpret_cast<const uint8_t*>(cb);
     const int b = v / 32, j = v % 32;
     const uint8_t* blk = bytes + row * (rank / 32) * 18 + b * 18;
-    const float d = (float) sycl::bit_cast<sycl::half>((uint16_t) blk[0] | ((uint16_t) blk[1] << 8));
+    const uint16_t dbits = (uint16_t) ((uint16_t) blk[0] | (uint16_t) ((uint16_t) blk[1] << 8));
+    const float d = (float) sycl::bit_cast<sycl::half>(dbits);
     const uint8_t byte = blk[2 + (j & 15)];
     const int q = j < 16 ? (byte & 15) : (byte >> 4);
     return (float) (q - 8) * d;

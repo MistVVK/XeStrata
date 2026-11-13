@@ -29,7 +29,7 @@ public:
 
     /// The request's kind: FNV-1a of its first prompt tokens (the system prompt decides the kind; the first token,
     /// a BOS, is skipped).  Upstream's bandit key.
-    static uint64_t kind_of(const int32_t* ids, int64_t n);
+    static uint64_t kind_of(const int64_t* ids, int64_t n);
     /// The context-depth bucket of a position.
     static int depth_bucket(int64_t pos);
 

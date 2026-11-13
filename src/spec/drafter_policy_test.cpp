@@ -22,8 +22,8 @@ void check(bool ok, const char* what) {
     std::printf("  %-70s %s\n", what, ok ? "ok" : "FAIL");
     if (!ok) ++g_fail;
 }
-std::vector<int32_t> prompt(int32_t seed) {
-    std::vector<int32_t> ids(40);
+std::vector<int64_t> prompt(int32_t seed) {
+    std::vector<int64_t> ids(40);
     for (int i = 0; i < 40; ++i) ids[(size_t) i] = seed + i * 7;
     return ids;
 }

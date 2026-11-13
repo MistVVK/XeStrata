@@ -369,7 +369,6 @@ void test_attention(void* s) {
     for (auto& v : kblk) v = rnd(-0.5f, 0.5f);
     for (auto& v : vblk) v = rnd(-0.5f, 0.5f);
     const int lo = std::max(0, anchor - (window - 1));
-    const int nctx = anchor - lo;
     std::vector<int64_t> tag(slots, -1);
     for (int j = lo; j < anchor; ++j) tag[j % slots] = ((int64_t) 3 << 32) | j;
     // a few slots hold the wrong row (a stale epoch): the attention must skip them

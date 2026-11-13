@@ -8,7 +8,7 @@
 
 namespace strata::spec {
 
-uint64_t DrafterPolicy::kind_of(const int32_t* ids, int64_t n) {
+uint64_t DrafterPolicy::kind_of(const int64_t* ids, int64_t n) {
     uint64_t key = 1469598103934665603ull;
     const int64_t lim = std::min<int64_t>(n, 33);
     for (int64_t i = 1; i < lim; ++i) key = (key ^ (uint64_t) ids[i]) * 1099511628211ull;
@@ -39,7 +39,7 @@ DrafterPolicy::Arm DrafterPolicy::choose(uint64_t kind, int64_t pos, bool df2_av
 }
 
 void DrafterPolicy::observe(uint64_t kind, int64_t pos, Arm arm, int64_t committed, double decode_ms) {
-    if (committed < kMinTokens || decode_ms <= 0.0 || arm < 0 || arm >= kArms) return;
+    if (committed < kMinTokens || decode_ms <= 0.0 || (int) arm < 0 || (int) arm >= kArms) return;
     const double speed = (double) committed / (decode_ms / 1000.0);
     Cell& c = cells_[kind];
     ++c.reqs;

@@ -10905,7 +10905,8 @@ int main(int argc, char** argv) {
             if (df2_loaded) {
                 // the ring goes on from the live conversation, or starts over (a parked or edited one)
                 bool cold = false;
-                df2.begin_request(ids.data(), n, reread_to > 0 ? 0 : resume, &cold);
+                const std::vector<int32_t> ids32(ids.begin(), ids.end());
+                df2.begin_request(ids32.data(), n, reread_to > 0 ? 0 : resume, &cold);
                 sp.set_taps(df2.tap_layers(), std::max<int64_t>(0, n - 2047), 2048);
             }
             tr("request", n, geni ? 1 : 0);

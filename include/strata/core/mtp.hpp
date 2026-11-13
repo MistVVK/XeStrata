@@ -68,9 +68,7 @@ public:
     /// DF-05: the gathered draft-head rows and vocabulary (this drafter keeps owning them), for the DFlash2 drafter
     /// to share when they are the same bytes (the same head and vocabulary file).  rows null: the whole head.
     struct SharedHead { const uint8_t* rows; const int32_t* vocab_dev; int64_t n; int type; };
-    SharedHead shared_head() const {
-        return {dhead_, dvocab_, n_dvocab_, head_ != nullptr ? head_->type() : -1};
-    }
+    SharedHead shared_head() const;
     /// The draft layer's K/V state (read-only: --serve's STRATA_STATE_HASH check hashes it)
     const QsaState& kv_state() const { return st_; }
     /// KV streaming: refill the ring of the drafter's window from its host copy for a sequence that continues at
