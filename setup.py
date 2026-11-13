@@ -454,6 +454,16 @@ def source_hint(url: str) -> str:
     return ""
 
 
+def proxy_hint() -> str:
+    """The next step when a download cannot reach its server: behind a proxy, the variables below are what XeStrata
+    (and pip, git) read."""
+    names = ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
+    if any(os.environ.get(n) for n in names):
+        return "; a proxy is set in this terminal (HTTPS_PROXY): check that it is the right one and that it is running"
+    return ("; behind a company or school proxy, set HTTPS_PROXY (for example HTTPS_PROXY=http://host:port) in this "
+            "terminal first")
+
+
 def ms_file(url: str):
     """(repo, path) when `url` is a Hugging Face file of a repository setup knows (HF_REVISIONS), else None."""
     m = HF_FILE.match(url)
@@ -3865,12 +3875,12 @@ def download_file(url, dst: Path, what=None):
                 continue
             if attempt == 4:
                 fail(f"cannot reach {url.split('/')[2]} ({e})",
-                     "check your internet connection and run it again" + source_hint(url))
+                     "check your internet connection and run it again" + proxy_hint() + source_hint(url))
             time.sleep(5)
         except OSError as e:
             if attempt == 4:
                 fail(f"cannot reach {url.split('/')[2]} ({e})",
-                     "check your internet connection and run it again" + source_hint(url))
+                     "check your internet connection and run it again" + proxy_hint() + source_hint(url))
             time.sleep(5)
     if not total:
         total = range_total(url)
