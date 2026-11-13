@@ -1867,13 +1867,14 @@ const MmqPlan& mmq_plan() {
             for (int64_t l = 0; l < layers; ++l) {
                 const bool fo = p.fo[(size_t) l] != 0 && !peer_off;
                 bool i8 = false;                                            // the int8 expert kernels take this layer's formats (the class rule or STRATA_EXPERT_I8, i8_wants_identity's test)
+                bool unfolded = true;                                       // no Hadamard fold and no tail: the staged entry and the int8 kernels read neither (fz_staged / i8_l: !had_gu && !had_d && !tail_off)
                 if (lay.native) {
                     const auto& f = lay.fmt[(size_t) l];
-                    if (!f.tail_off && !f.had_gu && !f.had_d)
+                    unfolded = !f.tail_off && !f.had_gu && !f.had_d;
+                    if (unfolded)
                         i8 = strata::kernels::native_expert_i8_prompt(strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff), (int64_t) 1 << 20);
                 }
-                if (fo) ++big.fused; else if (i8 && !i8_gated) ++big.i8; else ++big.fp16;   // (a gated class: no int8 in the long class)
-                if (fo && entry_on) ++small.staged; else if (i8) ++small.i8; else ++small.fp16;
+                strata::prefill::own_only_count_layer(big, small, fo, i8, i8_gated, entry_on, unfolded);
             }
             std::fprintf(stderr, "%s\n", strata::prefill::own_only_line(layers, stream_all_min(), big, small, peer_off).c_str());
             std::string sw;

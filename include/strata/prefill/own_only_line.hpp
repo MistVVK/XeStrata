@@ -18,6 +18,14 @@ struct OwnOnlySplit {
     bool operator==(const OwnOnlySplit& o) const { return fused == o.fused && staged == o.staged && i8 == o.i8 && fp16 == o.fp16; }
 };
 
+/// One layer into the two splits (prefill.cpp's start-up counts).  `fo`: the fused kernels take the layer at the floor and above.  `i8`: the int8 kernels take it.  `i8_gated`: the int8 default is for chunks under
+/// the floor only.  `entry_on`: the staged group entry is on for fused-only layers.  `unfolded`: the layer is not Hadamard-folded and has no tail (the staged entry and the int8 kernels read neither, so a folded layer
+/// below the floor runs each routed expert on the FP16 path).
+inline void own_only_count_layer(OwnOnlySplit& big, OwnOnlySplit& small, bool fo, bool i8, bool i8_gated, bool entry_on, bool unfolded) {
+    if (fo) ++big.fused; else if (i8 && !i8_gated) ++big.i8; else ++big.fp16;   // (a gated class: no int8 in the long class)
+    if (fo && entry_on && unfolded) ++small.staged; else if (i8) ++small.i8; else ++small.fp16;
+}
+
 namespace own_only_detail {
 inline std::string parts(const OwnOnlySplit& s, int64_t layers, bool staged_name, bool with_total) {
     std::vector<std::string> v;
