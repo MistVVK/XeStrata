@@ -4669,7 +4669,7 @@ bool PlainModel::settle_window(std::string& err) {
     const bool ok = settle_swaps(true, err);
     const double wait_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - lag0).count();
     const double per = root_ != nullptr && root_->split_.c > 0.0
-                           ? std::max(0.0, (root_->split_.c - root_->split_.q) * 1000.0) : 0.04;
+                           ? std::max(0.0, root_->split_.c - root_->split_.q) : 0.04;
     if ((root_ == nullptr || root_ == this) && !serve_)   // not under --serve: a prompt reads the table again
         strata::core::adapt_lag_window(wait_ms + (lag > 1 ? (double) (lag - 1) * (double) n_swaps * per : 0.0));
     return ok;

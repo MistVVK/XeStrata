@@ -13441,7 +13441,7 @@ int main(int argc, char** argv) {
         setup_pcie_split(drive.d, g.n_layers, o, pcie_given, !split_devs.empty(), ver.fetch_branch(), pcie_split);
         // what a swapped-in expert costs on the CPU against the GPU (the split probe's times): what a window the lag
         // keeps it on the CPU costs (auto_pick.hpp's ADAPT_LAG); 0.04 ms when the probe could not run
-        const double per_expert_ms = pcie_split.c > 0.0 ? std::max(0.0, (pcie_split.c - pcie_split.q) * 1000.0) : 0.04;
+        const double per_expert_ms = pcie_split.c > 0.0 ? std::max(0.0, pcie_split.c - pcie_split.q) : 0.04;
         pcie_move_if_pays(drive.d, ver.fetch_branch(), prefill.stats(), host_res, o.spec);
         const int64_t pcie0 = drive.d.pcie_experts;
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
