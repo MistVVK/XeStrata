@@ -1961,6 +1961,12 @@ def kfd_nodes() -> dict:
 # three, their KFD SIMD count (two per CU) names them.
 UMA_OS_LEFT_GB = 6             # the unified memory kept for the OS (the engine keeps the same out of its figure)
 STRIX_HALO_GFX = "gfx1151"
+# AMD's integrated GPUs, by GFX version: the one place a gfx name may choose (AGENTS.md allows it for the APU judgement
+# and the memory estimate).  The KFD topology gives the GPU node the CPU's cores on some kernels (cpu_cores_count), but
+# ROCm 10.1 with a 6.14 kernel splits a CPU node and a GPU node apart (Strix Halo: cpu_cores_count 0 on the GPU node),
+# so the gfx version says it there: gfx1103 (Phoenix, Hawk Point), gfx1150 (Strix Point), gfx1151 (Strix Halo) and
+# gfx1152 / gfx1153 (Krackan).  A discrete card reports none of them.
+APU_GFX = {"gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1153"}
 STRIX_HALO_BY_SIMDS = {80: "8060S", 64: "8050S", 32: "8040S"}
 STRIX_HALO_MODEL = "UD-IQ4_XS"  # upstream's Strix Halo guide measures it; its experts stay in memory from ~80 GB
 STRIX_HALO_MIN_GB = 80
@@ -2904,7 +2910,7 @@ def gpus():
             kfd = kfd_nodes() if kfd is None else kfd
             node = kfd.get(pci, {})
             render = next(iter(sorted((dev / "drm").glob("renderD*"))), None)
-            integrated = bool(node.get("integrated"))
+            integrated = bool(node.get("integrated")) or node.get("gfx") in APU_GFX
             name = f"{pci_name(0x1002, did)} ({node.get('gfx') or 'no KFD node'})"
             if node.get("gfx") == STRIX_HALO_GFX and node.get("simds") in STRIX_HALO_BY_SIMDS:
                 name = f"AMD Radeon {STRIX_HALO_BY_SIMDS[node['simds']]} (Ryzen AI Max, Strix Halo, gfx1151)"
