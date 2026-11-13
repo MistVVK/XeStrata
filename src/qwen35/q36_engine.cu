@@ -23,6 +23,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_moe.hpp"
 #include "strata/kernels/native_router.hpp"
+#include "strata/kernels/q36_prompt_route.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_fused.hpp"
 #include "strata/prefill/moe_fused_q36.hpp"
@@ -1192,6 +1193,12 @@ struct Engine {
     // where it has a tile, else the native grouped kernels.  use_pf: every layer's prompt chunks have one of the two, so the
     // hybrid mode streams each layer's experts for a chunk (the strategy MMQ had alone before)
     std::vector<char> fused_on;   // by state index (the MTP block last)
+    // our int8 expert kernels (native_expert_i8) for the layers neither the fused kernels nor MMQ take (q36_layer_route, include/strata/kernels/q36_prompt_route.hpp): the layer's
+    // rows are quantized once, the groups come from group_entries, the output is the grouped kernels' (eparts by entry); a chunk with few rows per expert takes the grouped kernels
+    std::vector<char> i8_on;      // by state index
+    size_t n_i8 = 0;
+    int i8_few = 0;               // native_expert_i8_few_rows_limit()
+    void* i8x = nullptr;          // the activation image native_expert_i8 reads (native_expert_i8_quantize)
     bool use_pf = false;
     void* f_scr = nullptr;        // the grouping tables (fused::group_bytes)
     void *f_xq = nullptr, *f_ha = nullptr;   // the layer's input and H in the kernels' int8 form (fused::act_bytes)
@@ -1402,21 +1409,37 @@ struct Engine {
                 fused_on[i] = FQ::native_layer_ext(L.L.gu_type, L.L.d_type) ? 1 : 0;
             }
 #endif
+        // the route of each layer (q36_layer_route): fused > our int8 kernels (STRATA_EXPERT_I8=1) > MMQ > our int8 kernels > the grouped kernels.  A build without MMQ reads an unset
+        // STRATA_EXPERT_I8 as 1 (the standalone engine does not link prefill.cpp's start-up list, so it tells the kernel library itself).
+        const bool mmq_free = !MMQ::built();
+        if (mmq_free) K::native_expert_i8_set_mmq_free();
+        const int i8_raw = K::i8_switch_parse(std::getenv("STRATA_EXPERT_I8"));
+        i8_on.assign(n_state, 0);
+        i8_few = K::native_expert_i8_few_rows_limit();
         use_pf = true;
         bool any_mmq = false;
-        size_t n_fused = 0;
+        size_t n_fused = 0, n_grouped = 0;
         for (size_t i = 0; i < n_state; ++i) {
-            const bool mq = !fused_on[i] && mmq_avail && mmq_ok(layer_at((int) i));
-            use_pf = use_pf && (fused_on[i] || mq);
+            const Layer& Li = layer_at((int) i);
+            const bool mmq_takes = !fused_on[i] && mmq_avail && mmq_ok(Li);
+            const K::Q36Route r = K::q36_layer_route(fused_on[i] != 0, i8_raw, mmq_free, mmq_takes, !fused_on[i] && K::native_expert_i8_supported(Li.L));
+            const bool mq = r == K::Q36Route::Mmq;
+            i8_on[i] = r == K::Q36Route::Int8 ? 1 : 0;
+            if (r == K::Q36Route::Grouped) ++n_grouped;
             any_mmq = any_mmq || mq;
             n_fused += fused_on[i] ? 1 : 0;
+            n_i8 += i8_on[i];
         }
-        if (!use_pf) {   // a layer has neither: every prompt chunk on the native grouped kernels, as before
+        use_pf = K::q36_prompt_path_ok((int) n_state, (int) n_grouped);
+        if (!use_pf) {   // a layer has no route faster than the grouped kernels: every prompt chunk on the native grouped kernels, as before
             std::fill(fused_on.begin(), fused_on.end(), 0);
+            std::fill(i8_on.begin(), i8_on.end(), 0);
             n_fused = 0;
+            n_i8 = 0;
             any_mmq = false;
         }
         use_mmq = use_pf && any_mmq;
+        if (n_i8 > 0) CK(cudaMalloc(&i8x, K::native_q8_1_bytes((int) N, 1) * T));
         if (use_pf) {
             const int64_t ne = (int64_t) T * Kp;
             rcnt = dalloc_t<int32_t>((size_t) g.n_expert);
@@ -1453,7 +1476,10 @@ struct Engine {
             mq_gu = dalloc((size_t) ne * 2 * FF);
             mq_h = dalloc((size_t) ne * FF);
         }
-        if (n_fused == n_state)
+        if (n_i8 > 0)
+            std::fprintf(stderr, "strata-q36: prompt experts: %zu of %zu layers on the fused int8 kernels, %zu on our int8 kernels, %zu on MMQ (int8)\n", n_fused, n_state, n_i8,
+                         n_state - n_fused - n_i8);
+        else if (n_fused == n_state)
             std::fprintf(stderr, "strata-q36: prompt experts on the fused int8 kernels\n");
         else if (n_fused > 0)
             std::fprintf(stderr, "strata-q36: prompt experts on the fused int8 kernels (%zu of %zu layers), the rest on MMQ (int8)\n",
@@ -1547,7 +1573,7 @@ struct Engine {
                 const strata::qwen35::OneSessionFit f = strata::qwen35::one_session_fit(
                     {(size_t) ctx, kv_tok, shared_tok, per - kv_tok * (size_t) ctx, fr0, total_main, packed,
                      kAttScoreFloats > ((size_t) 16 << 20) ? (kAttScoreFloats - ((size_t) 16 << 20)) * 6 : 0,
-                     use_mmq ? 2 * (max_layer + kMmqTail) : 0, T * Kp * N * 4 + T * Kp * 4});
+                     (use_mmq || n_i8 > 0) ? 2 * (max_layer + kMmqTail) : 0, T * Kp * N * 4 + T * Kp * 4});
                 if (f.refuse) {   // the old ending: the bare cudaMalloc line in alloc_session, or the hybrid buffers' text in place_experts
                     std::fprintf(stderr, "strata-q36: %s\n", strata::qwen35::one_session_fit_line(ctx, f).c_str());
                     std::exit(1);
@@ -1829,13 +1855,14 @@ struct Engine {
         }
     }
     void group_old(const Layer& L, const int32_t* slot_of, int T, unsigned long long* o_ptr, int32_t* o_start, int32_t* o_ng,
-                   int32_t* o_dst, int32_t* o_tok) {
+                   int32_t* o_dst, int32_t* o_tok, const uint8_t* wb = nullptr) {
         const int Kp = (int) m->top_k, n_ent = T * Kp;
+        const uint8_t* bl = wb ? wb : L.blobs;
         if (slot_of)
-            k_group_hy<<<1, kThreads, 0, st>>>(ids, n_ent, Kp, (int) m->g.n_expert, slot_of, L.blobs, L.stride, o_ptr, o_start,
+            k_group_hy<<<1, kThreads, 0, st>>>(ids, n_ent, Kp, (int) m->g.n_expert, slot_of, bl, L.stride, o_ptr, o_start,
                                                o_ng, o_dst, o_tok);
         else
-            k_group<<<1, kThreads, 0, st>>>(ids, n_ent, Kp, (int) m->g.n_expert, L.blobs, L.stride, o_ptr, o_start, o_ng, o_dst,
+            k_group<<<1, kThreads, 0, st>>>(ids, n_ent, Kp, (int) m->g.n_expert, bl, L.stride, o_ptr, o_start, o_ng, o_dst,
                                             o_tok);
     }
     /// VERIFY: the old grouping of the current `ids` into scratch, compared with grp_ptr / grp_start / n_groups / ent_dst / ent_tok.
@@ -1902,7 +1929,7 @@ struct Engine {
         return true;
     }
     /// The routed entries of T rows grouped per expert (k_group; with slot_of the hybrid mode's k_group_hy).
-    void group_entries(const Layer& L, const int32_t* slot_of, int T) {
+    void group_entries(const Layer& L, const int32_t* slot_of, int T, const uint8_t* wb = nullptr) {
         if (grouped_by_route) {   // route_group did it
             grouped_by_route = false;
             return;
@@ -1910,15 +1937,15 @@ struct Engine {
         const int Kp = (int) m->top_k, n_ent = T * Kp;
         if (fast_k && n_ent <= 64) {
             if (slot_of)
-                q36k::k_group_small<true><<<1, 64, 0, st>>>(ids, n_ent, Kp, slot_of, L.blobs, L.stride, grp_ptr, grp_start,
+                q36k::k_group_small<true><<<1, 64, 0, st>>>(ids, n_ent, Kp, slot_of, wb ? wb : L.blobs, L.stride, grp_ptr, grp_start,
                                                             n_groups, ent_dst, ent_tok);
             else
-                q36k::k_group_small<false><<<1, 64, 0, st>>>(ids, n_ent, Kp, nullptr, L.blobs, L.stride, grp_ptr, grp_start,
+                q36k::k_group_small<false><<<1, 64, 0, st>>>(ids, n_ent, Kp, nullptr, wb ? wb : L.blobs, L.stride, grp_ptr, grp_start,
                                                              n_groups, ent_dst, ent_tok);
             if (verify_k) group_verify(L, slot_of, T);
             return;
         }
-        group_old(L, slot_of, T, grp_ptr, grp_start, n_groups, ent_dst, ent_tok);
+        group_old(L, slot_of, T, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, wb);
     }
     void* vgrp = nullptr;
     float *vx_ = nullptr, *vh_ = nullptr;
@@ -2108,12 +2135,14 @@ struct Engine {
             // (stream_take); the routing counts feed the slots' scores there
             const int ne = (int) g.n_expert;
             const bool fz = fused_on[li] != 0;
+            const bool i8l = i8_on[li] != 0;   // our int8 kernels (no sorted-row tables: they collect their own groups)
+            const bool mql = !fz && !i8l;       // MMQ
             int64_t maxr = 0;
-            if (!fz || lhy(li)) {
+            if (mql || lhy(li)) {
                 CK(cudaMemsetAsync(rcnt, 0, (size_t) ne * 4, st));
                 k_route_count<<<grid1(n_ent), kThreads, 0, st>>>(ids, (int) n_ent, rcnt);
             }
-            if (!fz) {
+            if (mql) {
                 // MMQ: the entries sorted by expert on the device, gate+up as one [2 FF] product per expert, SwiGLU, down
                 // into rows the combine reads through entry -> sorted row
                 k_route_scan<<<1, 32, 0, st>>>(rcnt, ne, rbounds, rcur, rmax);
@@ -2121,7 +2150,7 @@ struct Engine {
                 CK(cudaMemcpyAsync(hpin + 10, rmax, 4, cudaMemcpyDeviceToHost, st));
             }
             if (lhy(li)) CK(cudaMemcpyAsync(h_cnt + li * g.n_expert, rcnt, (size_t) ne * 4, cudaMemcpyDeviceToHost, st));
-            if (!fz || lhy(li)) {
+            if (mql || lhy(li)) {
                 CK(cudaStreamSynchronize(st));
                 if (lhy(li))
                     for (int x = 0; x < ne; ++x) hy[li].score[(size_t) x] += h_cnt[li * g.n_expert + x];
@@ -2144,6 +2173,17 @@ struct Engine {
                 }
                 prow = f_slot;
 #endif
+            } else if (i8l) {
+                // our int8 expert kernels: the layer's rows quantized once, the groups per expert (blobs from wbase: the streamed ring in the hybrid mode), gate/up + SwiGLU + H to int8 and
+                // the down rows into eparts by entry (prow stays null, as the grouped kernels).  A chunk whose experts average few rows takes the grouped kernels (the few-rows route).
+                group_entries(L, nullptr, T, wbase);
+                if (K::q36_i8_chunk_takes(n_ent, ne, i8_few)) {
+                    K::native_expert_i8_quantize(h, T, N, i8x, st);
+                    K::native_expert_i8(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, std::min<int64_t>(n_ent, g.n_expert), n_ent, i8x, escr, eparts, st);
+                } else {
+                    quant(h, N, T, xq);
+                    K::native_expert_grouped(L.L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, std::min<int64_t>(n_ent, g.n_expert), n_ent, xq, escr, eparts, st);
+                }
             } else {
                 MMQ::quantize(h, ent_tok, mq_x, L.L.gu_type, N, N, n_ent, st);
                 MMQ::Product gu;
