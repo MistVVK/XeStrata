@@ -20021,12 +20021,12 @@ int main(int argc, char** argv) {
                 const strata::spec::CostLearner::Verdict v = policy.learner().check(kDraftCostRounds, kDraftCostMinN);
                 if (v.ready && v.disturbed) {
                     std::fprintf(stderr, "strata serve: draft costs: the learning stretch looks disturbed (%s): it is learned again\n", v.why.c_str());
-                    policy.learner().reset();
+                    policy.reset_learning();
                 } else if (v.ready) {
                     strata::spec::CostFile cf;
                     cf.key = dc_key;
                     for (int k = 0; k < strata::spec::CostLearner::kCtxBuckets; ++k)
-                        cf.tables[(size_t) k] = policy.learner().table(k, kDraftCostMinN);
+                        cf.tables[(size_t) k] = policy.learner().table(k, kDraftCostMinN, policy.top_size());
                     // the CPU prompt share, when it is on and balancing from measured times: its balance as measured so far, to a 0.05
                     // step (0.5 when no short prompt has measured it yet: on an RTX A6000 a fixed 0.5 read a 981-token chunk as fast as the
                     // balancing share, 1,001-1,009 against 995-997 ms); fixed from now on like the table
@@ -20046,7 +20046,7 @@ int main(int argc, char** argv) {
                         if (!cf.tables[(size_t) k].empty())
                             policy.set_fixed_costs(cf.tables[(size_t) k].data(), (int) cf.tables[(size_t) k].size(), k);
                     policy.set_learning(false);
-                    policy.learner().reset();
+                    policy.reset_learning();
                     dc_learning = false;
                     std::string t0;
                     char b[24];

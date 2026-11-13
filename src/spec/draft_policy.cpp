@@ -125,13 +125,13 @@ int CostLearner::samples(int bucket, int t) const {
     return (int) s_[(size_t) bucket][(size_t) t].size();
 }
 
-std::vector<double> CostLearner::table(int bucket, int min_n) const {
+std::vector<double> CostLearner::table(int bucket, int min_n, int upto) const {
     std::vector<double> out;
     if (bucket < 0 || bucket >= kCtxBuckets) return out;
     const std::array<std::vector<float>, kMaxT + 1> b = sets(bucket, !state_effect(bucket, min_n));
     int top = 0;
     std::array<double, kMaxT + 1> got{};
-    std::vector<int> seen;
+    std::vector<int> seen;   // the measured sizes (min_n samples), ascending; a rough one (kWeakN samples) joins when it is accepted below
     for (int t = 1; t <= kMaxT; ++t) {
         if (!b[(size_t) t].empty()) top = t;
         if ((int) b[(size_t) t].size() >= std::max(1, min_n)) {
@@ -140,23 +140,40 @@ std::vector<double> CostLearner::table(int bucket, int min_n) const {
         }
     }
     if (top == 0 || seen.empty()) return out;
-    for (int t = 1; t <= top; ++t) {
-        if (got[(size_t) t] > 0.0) {
-            out.push_back(got[(size_t) t]);
-            continue;
-        }
+    top = std::max(top, std::min(upto, kMaxT));
+    // the cost of an unmeasured size from the measured ones: linear between two, the prior shape below them, above them the straight line with the
+    // steeper of the last segment's slope and the slope over all measured sizes (never flatter than the measured trend)
+    const auto fill = [&](int t) {
         int lo = 0, hi = 0;
         for (const int u : seen) {
             if (u < t) lo = u;
             if (u > t && hi == 0) hi = u;
         }
-        if (lo > 0 && hi > 0) out.push_back(got[(size_t) lo] + (got[(size_t) hi] - got[(size_t) lo]) * (t - lo) / (double) (hi - lo));
-        else if (hi > 0) out.push_back(got[(size_t) hi] * kShape[t] / kShape[hi]);   // below every measured size: the prior shape
-        else if (seen.size() >= 2) {   // above them: the straight line through the two largest measured sizes (a size with a few samples is not trusted)
-            const int u2 = seen[seen.size() - 1], u1 = seen[seen.size() - 2];
-            const double slope = std::max(0.0, (got[(size_t) u2] - got[(size_t) u1]) / (double) (u2 - u1));
-            out.push_back(got[(size_t) u2] + slope * (t - u2));
-        } else out.push_back(got[(size_t) lo] * kShape[t] / kShape[lo]);
+        if (lo > 0 && hi > 0) return got[(size_t) lo] + (got[(size_t) hi] - got[(size_t) lo]) * (t - lo) / (double) (hi - lo);
+        if (hi > 0) return got[(size_t) hi] * kShape[t] / kShape[hi];
+        if (seen.size() < 2) return got[(size_t) lo] * kShape[t] / kShape[lo];
+        const int u2 = seen.back(), u1 = seen[seen.size() - 2], u0 = seen.front();
+        const double slope = std::max({0.0, (got[(size_t) u2] - got[(size_t) u1]) / (double) (u2 - u1), (got[(size_t) u2] - got[(size_t) u0]) / (double) (u2 - u0)});
+        return got[(size_t) u2] + slope * (t - u2);
+    };
+    for (int t = 1; t <= top; ++t) {
+        if (got[(size_t) t] > 0.0) {
+            out.push_back(got[(size_t) t]);
+            continue;
+        }
+        double v = fill(t);
+        const int n = (int) b[(size_t) t].size();
+        if (n >= kWeakN) {   // a few rounds: their median counts when it is not below the trend and not far above it (a stalled handful does not)
+            std::vector<float> s = b[(size_t) t];
+            std::sort(s.begin(), s.end());
+            const double med = n % 2 ? (double) s[(size_t) n / 2] : 0.5 * ((double) s[(size_t) n / 2 - 1] + (double) s[(size_t) n / 2]);
+            if (med >= v && med <= kWeakMax * v) {
+                v = med;
+                got[(size_t) t] = med;
+                seen.insert(std::upper_bound(seen.begin(), seen.end(), t), t);
+            }
+        }
+        out.push_back(v);
     }
     for (size_t i = 1; i < out.size(); ++i) out[i] = std::max(out[i], out[i - 1]);   // more rows never cost less
     return out;
@@ -445,6 +462,14 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
     Pick p;
     p.t = std::clamp(t_mtp, 1, max_t_);
     if (lookup_k <= 0) return p;
+    if (learning_ && !fixed_) {   // a learning stretch measures the sizes it has too few rounds of, when a proposal is long enough for one
+        const int s = explore_size(lookup_k);
+        if (s > 0) {
+            p.lookup = true;
+            p.t = s;
+            return p;
+        }
+    }
     const double base = mtp_tokens(p.t) / cost_ms(p.t);
     const double q = lookup_rate(match);
     double e = 1.0, qi = 1.0, best = 0.0;
@@ -471,6 +496,23 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
         p.t = t_full;
     }
     return p;
+}
+
+int DraftPolicy::explore_size(int lookup_k) const {
+    if (learner_.rounds() + learner_.late_rounds() < kExploreAfter || forced_total_ >= kExploreBudget) return 0;
+    for (int s = 2; s <= std::min(lookup_k + 1, max_t_); ++s) {
+        if (!allowed(s) || forced_[(size_t) s] >= kExplorePerSize || learner_.samples(bk_, s) >= kExploreN) continue;
+        ++forced_[(size_t) s];
+        ++forced_total_;
+        return s;
+    }
+    return 0;
+}
+
+void DraftPolicy::reset_learning() {
+    learner_.reset();
+    forced_total_ = 0;
+    forced_.fill(0);
 }
 
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {

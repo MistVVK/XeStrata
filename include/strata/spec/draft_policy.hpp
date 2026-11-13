@@ -62,11 +62,15 @@ public:
     int samples(int bucket, int t) const;               ///< fresh samples of a size
     /// A state effect in `bucket`: some size has at least `min_n` fresh and `min_n` late samples and their trimmed means differ by more than kStateTol.
     bool state_effect(int bucket, int min_n) const;
-    /// The table of `bucket` for windows 1..n (n = the largest size seen in that bucket; empty when the bucket has none):
-    /// the trimmed mean (the lowest and highest kTrim share dropped) of each size with at least `min_n` samples; a size in between two
-    /// measured ones is linear in the size; a size above the measured ones continues the straight line through the two largest measured
-    /// sizes (one measured size: the policy's prior shape), below them the prior shape; the table never falls from one size to the next.
-    std::vector<double> table(int bucket, int min_n) const;
+    /// The table of `bucket` for windows 1..n (n = the largest size seen in that bucket, or `upto` when that is larger; empty when the bucket has none):
+    /// the trimmed mean (the lowest and highest kTrim share dropped) of each size with at least `min_n` samples; a size with kWeakN to min_n - 1
+    /// samples counts with its median when that is within [fill, kWeakMax x fill] (a rough measurement, never below the trend); a size in between two measured ones is linear in the size; a size above the
+    /// measured ones continues the straight line through them with the steeper of the last segment's slope and the slope over all measured sizes
+    /// (costs grow at least that fast: a fill never falls below the measured trend; one measured size: the policy's prior shape), below them the
+    /// prior shape; the table never falls from one size to the next.
+    std::vector<double> table(int bucket, int min_n, int upto = 0) const;
+    static constexpr int kWeakN = 5;          ///< samples from which a size below min_n counts by its median ...
+    static constexpr double kWeakMax = 1.5;   ///< ... when that median is not below the fill and at most this many times it (a stalled handful is not a measurement)
     struct Verdict {
         bool ready = false;          ///< enough rounds, and every bucket with data has a size with min_n samples
         bool disturbed = false;      ///< the stretch looks disturbed: do not keep a table from it (start learning again)
@@ -175,6 +179,20 @@ public:
     /// Learning a fixed table: every timed round also goes to learner() (raw round time, in its context bucket).  Off by default.
     void set_learning(bool on) { learning_ = on; }
     bool learning() const { return learning_; }
+    /// Measuring the sizes the policy can pick (learning only): after kExploreAfter timed rounds, a lookup proposal long enough for a size
+    /// that has fewer than kExploreN samples in the current context bucket takes that size's window instead (the smallest such size), at
+    /// most kExplorePerSize times per size and kExploreBudget times in a stretch.  The tokens of a learning stretch were never repeatable
+    /// (the windows follow the live costs); a window's size can change the batch the verifier runs, and with it the tokens.  A size that
+    /// no proposal ever reaches keeps its filled-in cost (CostLearner::table).
+    static constexpr int kExploreAfter = 300;
+    static constexpr int kExploreN = 30;
+    static constexpr int kExplorePerSize = 40;
+    static constexpr int kExploreBudget = 150;
+    int forced_rounds() const { return forced_total_; }
+    /// Start the learning stretch again: the learner's samples and the forced-round counts.
+    void reset_learning();
+    /// The largest allowed window size (the table is written up to it).
+    int top_size() const { return fit(max_t_); }
     /// How long the engine has been busy (seconds since its last pause of CostLearner::kIdleS), as the caller measures it, for the round
     /// observe() is about to be given; < 0 (the default): unknown.  Only the learner reads it.
     void set_busy_age(double s) { busy_age_ = s; }
@@ -226,6 +244,9 @@ private:
     bool fixed_ = false;                                   // set_fixed_costs: no round time changes a cost
     bool learning_ = false;                                // set_learning: round times also go to learner_
     double busy_age_ = -1.0;                               // set_busy_age
+    int explore_size(int lookup_k) const;                  // the size a learning stretch measures next, 0 = none (choose() counts it)
+    mutable int forced_total_ = 0;                         // windows taken for their size's sake, this stretch
+    mutable std::array<int, kMaxT + 1> forced_{};          // ... by size
     CostLearner learner_;
     double clamp_sample(int t, double ms) const;
     static constexpr int kPBuckets = 8;

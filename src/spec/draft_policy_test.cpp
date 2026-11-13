@@ -419,6 +419,83 @@ int main() {
               "file: the next write replaces the leftover temporary file and the table loads");
         fs::remove_all(dir, ec);
     }
+    {
+        // sizes with too few samples: a rough measurement counts when it is not below the trend, a stalled handful does not, and a fill above the
+        // measured sizes never flattens the measured trend (Radeon 780M, 11-13: sizes 1 / 3 measured at 76.2 / 111.6 ms, size 4 with 6 rounds at 143)
+        using strata::spec::CostLearner;
+        const auto fill = [](CostLearner& L, int t, int n, double ms) {
+            for (int i = 0; i < n; ++i) L.add(0, t, ms * (1.0 + 0.004 * ((i % 5) - 2)));
+        };
+        CostLearner R;
+        fill(R, 1, 1279, 76.2); fill(R, 2, 2, 97.0); fill(R, 3, 126, 111.6); fill(R, 4, 6, 143.0);
+        const std::vector<double> t = R.table(0, 20);
+        check(t.size() == 4 && std::fabs(t[3] - 143.0) < 0.5, "sizes: 6 rounds of 4 rows (143 ms, above the line's 129) count by their median");
+        check(t.size() == 4 && std::fabs(t[1] - (76.2 + 111.6) / 2.0) < 0.2, "sizes: 2 rounds of 2 rows are filled in linearly");
+        const std::vector<double> u = R.table(0, 20, 6);
+        bool mono = u.size() == 6;
+        for (size_t i = 1; i < u.size(); ++i) mono &= u[i] >= u[i - 1];
+        check(u.size() == 6 && mono && u[4] >= 143.0 + 0.9 * (143.0 - 111.6) && u[5] > u[4], "sizes: 5 and 6 rows continue the steeper measured slope (32 ms a row), not the first segment's 18");
+        CostLearner S;
+        fill(S, 1, 600, 12.5); fill(S, 2, 400, 14.2); fill(S, 3, 700, 16.2); fill(S, 4, 6, 99.0);
+        const std::vector<double> s = S.table(0, 20);
+        check(s.size() == 4 && std::fabs(s[3] - 18.2) < 0.05, "sizes: a handful of rounds 5x above the trend (a stall) is not a measurement");
+        CostLearner Q;                                              // costs 10 / 20 / 35: the fill goes on at 15 ms a row, not at 10
+        fill(Q, 1, 100, 10.0); fill(Q, 2, 100, 20.0); fill(Q, 3, 100, 35.0);
+        const std::vector<double> q = Q.table(0, 20, 5);
+        check(q.size() == 5 && q[3] >= 35.0 + 15.0 - 0.1 && q[4] >= 35.0 + 30.0 - 0.1, "sizes: a size above the measured ones never costs less than the last slope says");
+        check(Q.table(0, 20, 3).size() == 3 && Q.table(1, 20, 5).empty(), "sizes: upto adds nothing below the largest size seen, and an empty bucket stays empty");
+        // the learning stretch measures the sizes it has too few rounds of
+        const auto feed = [](DraftPolicy& p, int n) {
+            for (int i = 0; i < n; ++i) { p.observe(false, 1, 0, 0, 76.0); if (i % 4 == 0) p.observe(false, 3, 2, 0, 111.0); }
+        };
+        DraftPolicy y(8);
+        y.set_learning(true);
+        feed(y, 100);
+        y.choose(1, 5, 3);
+        check(y.forced_rounds() == 0, "explore: nothing is forced in the first rounds of a stretch");
+        feed(y, 300);
+        const DraftPolicy::Pick f1 = y.choose(1, 5, 3);
+        check(f1.lookup && f1.t == 2 && y.forced_rounds() == 1, "explore: after the first rounds the smallest size with few samples is taken, if a proposal reaches it");
+        const DraftPolicy::Pick f2 = y.choose(1, 1, 3);
+        check(y.forced_rounds() == 2 && f2.lookup && f2.t == 2, "explore: a proposal of one draft reaches 2 rows only");
+        int per[DraftPolicy::kMaxT + 1] = {};
+        for (int i = 0; i < 700; ++i) {
+            const DraftPolicy::Pick pk = y.choose(1, 7, 3);
+            per[pk.t] += pk.lookup ? 1 : 0;
+            y.observe(pk.lookup, pk.t, pk.t > 1 ? pk.t - 1 : 0, 3, 76.0 + 17.0 * (pk.t - 1));
+        }
+        int worst = 0;
+        for (int i = 2; i <= 8; ++i) worst = std::max(worst, per[i]);
+        check(y.forced_rounds() == DraftPolicy::kExploreBudget, "explore: the forced rounds stop at the stretch's budget");
+        const int before = y.forced_rounds();
+        for (int i = 0; i < 50; ++i) y.choose(1, 7, 3);
+        check(y.forced_rounds() == before, "explore: nothing is forced once the budget is spent");
+        DraftPolicy z(8);                                           // the cap per size: with a budget left over, one size is still not forced more than kExplorePerSize times
+        z.set_learning(true);
+        feed(z, 400);
+        z.set_busy_age(100.0);                                    // every round of size 2 lands in the late set: no fresh sample ever arrives
+        for (int i = 0; i < 200; ++i) { const DraftPolicy::Pick pk = z.choose(1, 1, 3); z.observe(pk.lookup, pk.t, 0, 3, 95.0); }
+        check(z.forced_rounds() == DraftPolicy::kExplorePerSize, "explore: a size is forced at most kExplorePerSize times");
+        z.reset_learning();
+        check(z.forced_rounds() == 0 && z.learner().rounds() == 0, "explore: a new stretch starts with a new budget");
+        DraftPolicy n(8);                                           // not learning, or fixed: the policy never takes a window for its size's sake
+        feed(n, 400);
+        n.choose(1, 5, 3);
+        DraftPolicy x(8);
+        x.set_learning(true);
+        feed(x, 400);
+        const double ms[3] = {76.0, 95.0, 111.0};
+        x.set_fixed_costs(ms, 3);
+        for (int i = 0; i < 20; ++i) x.choose(1, 5, 3);
+        check(n.forced_rounds() == 0 && x.forced_rounds() == 0, "explore: not while learning is off, and not once the costs are fixed");
+        DraftPolicy w(8);                                           // a size no proposal reaches stays filled in
+        w.set_learning(true);
+        feed(w, 600);
+        for (int i = 0; i < 100; ++i) { const DraftPolicy::Pick pk = w.choose(1, 1, 3); w.observe(pk.lookup, pk.t, 1, 3, 95.0); }
+        const std::vector<double> wt = w.learner().table(0, 20, 6);
+        check(w.learner().samples(0, 4) == 0 && wt.size() == 6 && wt[3] > wt[2] && wt[5] > wt[3], "explore: a size no proposal reaches is filled in above the measured ones");
+        (void) worst;
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }
