@@ -38,6 +38,7 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/dflash2.hpp"
+#include "strata/kernels/glm5.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -3408,7 +3409,7 @@ PlainModel::HeadView PlainModel::draft_head_view() const {
     if (t.dhead_ != nullptr) {
         v.rows = t.dhead_;
         v.n_rows = t.n_dvocab_;
-        v.vocab_dev = t.dvocab_;
+        v.vocab_dev = t.subset_->ids_device();
     } else {
         v.rows = t.head_.data;
         v.n_rows = t.head_.n_out;
