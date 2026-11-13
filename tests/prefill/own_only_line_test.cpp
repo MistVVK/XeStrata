@@ -53,6 +53,13 @@ int main() {
         CHECK_LINE(own_only_line(48, 1024, s, s, true),
                    "strata: [DRAFT] prompt kernels: every chunk runs 40 of 48 layers on the int8 kernels and 8 on the FP16 path (--peer-device: the fused kernels are off).");
     }
+    // the Tesla P100 in a build without MMQ (no fused kernels; the int8 default under the chunk limit, the FP16 path from it): the stream floor is the limit: FP16 from it up
+    {
+        OwnOnlySplit big; big.fp16 = 48;
+        OwnOnlySplit small; small.i8 = 48;
+        CHECK_LINE(own_only_line(48, 1024, big, small, false),
+                   "strata: [DRAFT] prompt kernels: chunks of 1024 tokens or more run 48 of 48 layers on the FP16 path; shorter chunks run 48 on the int8 kernels.");
+    }
     if (failed) {
         std::fprintf(stderr, "own_only_line_test: %d check(s) failed\n", failed);
         return 1;

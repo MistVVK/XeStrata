@@ -71,6 +71,10 @@
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/sm120_series.hpp"
 
+namespace strata::kernels {   // the P100 class rule's entry point (iq_kernels.cu; Metal: stubs_i8.cpp); declared here so that no kernel object's header changes
+bool native_expert_i8_floor_gated() noexcept;   // true: the unset int8 default gives way to the FP16 path from stream_all_min() tokens up (Tesla P100, build without MMQ)
+}  // namespace strata::kernels
+
 namespace {
 // STRATA_PLE_BATCH for the prompt path: the user's variable wins; unset, it is on except for an engine built with CUDA 12.8 on a compute capability 12.0 card
 // (sm120_series.hpp ple_batch_default), which says so once.
@@ -1820,6 +1824,7 @@ const MmqPlan& mmq_plan() {
             const bool peer_off = strata::core::peer_portable();            // the walk's own condition (no_peer): the fused kernels stay off with a peer device
             const bool entry_on = staged_fo_on();                           // the staged group entry for a fused-only layer below the floor (staged_fo_rule.hpp)
             strata::prefill::OwnOnlySplit big, small;                       // at or above the long-prompt floor, below it
+            const bool i8_gated = strata::kernels::native_expert_i8_floor_gated();   // P100 class: the int8 default is for chunks under stream_all_min() only, the FP16 path from it up
             for (int64_t l = 0; l < layers; ++l) {
                 const bool fo = p.fo[(size_t) l] != 0 && !peer_off;
                 bool i8 = false;                                            // the int8 expert kernels take this layer's formats (the class rule or STRATA_EXPERT_I8, i8_wants_identity's test)
@@ -1828,7 +1833,7 @@ const MmqPlan& mmq_plan() {
                     if (!f.tail_off && !f.had_gu && !f.had_d)
                         i8 = strata::kernels::native_expert_i8_prompt(strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff), (int64_t) 1 << 20);
                 }
-                if (fo) ++big.fused; else if (i8) ++big.i8; else ++big.fp16;
+                if (fo) ++big.fused; else if (i8 && !i8_gated) ++big.i8; else ++big.fp16;   // (a gated class: no int8 in the long class)
                 if (fo && entry_on) ++small.staged; else if (i8) ++small.i8; else ++small.fp16;
             }
             std::fprintf(stderr, "%s\n", strata::prefill::own_only_line(layers, stream_all_min(), big, small, peer_off).c_str());
@@ -5591,6 +5596,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (lay.native && strata::kernels::i8_order_allows(fused_l, fz_staged) && !wmma_l && !had_gu && !had_d && rows_cpu == 0 && on_peer.empty() && !m.pp &&
                             m.group_cap == 0 && (!m.fused_bufs || !stream_all) && !lay.fmt[(size_t) l].tail_off && ws::mode() == 0 &&
                             !(m.cache && mmq_plan().direct[(size_t) l]) && i8_group_env && !order.empty() &&
+                            (!strata::kernels::native_expert_i8_floor_gated() || strata::kernels::i8_chunk_default_allows(-1, true, true, (int64_t) T, stream_all_min())) &&   // the P100 class rule: from the stream floor up the unset default is the FP16 path (i8_expert_rule.hpp)
                             m.GU != nullptr && m.Dm != nullptr && m.src_dev != nullptr && m.ids_identity != nullptr &&
 #if STRATA_EXPERT_NIBBLE_BUILT
                             !nib_l.on &&

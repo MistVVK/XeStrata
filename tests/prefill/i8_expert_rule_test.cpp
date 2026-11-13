@@ -150,6 +150,27 @@ int main() {
     CHECK(i8_n8_takes(i8_switch_parse(""), 2));
     CHECK(!i8_n8_takes(i8_switch_parse("0"), 2));
     CHECK(i8_n8_takes(i8_switch_parse("1"), 4));
+    // the P100 class rule (build without MMQ, switch not set): the int8 default applies under the stream floor (stream_all_min, 1,024 tokens by default) only; the FP16 path from it up (the build with MMQ's default there)
+    {
+        const int64_t lim = 1024;   // stream_all_min() by default: the rule is the comparison, rows at floor - 1, floor, floor + 1
+        CHECK(i8_chunk_default_allows(-1, true, true, 1, lim));
+        CHECK(i8_chunk_default_allows(-1, true, true, lim - 1, lim));
+        CHECK(!i8_chunk_default_allows(-1, true, true, lim, lim));
+        CHECK(!i8_chunk_default_allows(-1, true, true, lim + 1, lim));
+        CHECK(i8_chunk_default_allows(-1, true, true, 300, lim));
+        CHECK(i8_chunk_default_allows(-1, true, true, 1000, lim));
+        CHECK(i8_chunk_default_allows(-1, true, true, lim - 1, lim));
+        CHECK(!i8_chunk_default_allows(-1, true, true, lim, lim));
+        CHECK(!i8_chunk_default_allows(-1, true, true, 2048, lim));
+        CHECK(!i8_chunk_default_allows(-1, true, true, 8192, lim));
+        // a value the user set keeps its meaning at every size (the rule is not asked to veto it)
+        CHECK(i8_chunk_default_allows(1, true, true, 8192, lim));
+        CHECK(i8_chunk_default_allows(0, true, true, 8192, lim));
+        // not the P100 (6.1, 7.x, 8.x, a HIP card): no limit; a build with MMQ: no limit (its P100 default is the FP16 path already)
+        CHECK(i8_chunk_default_allows(-1, true, false, 8192, lim));
+        CHECK(i8_chunk_default_allows(-1, false, true, 8192, lim));
+        CHECK(i8_chunk_default_allows(-1, false, false, 8192, lim));
+    }
     if (failed) {
         std::fprintf(stderr, "i8_expert_rule_test: %d check(s) failed\n", failed);
         return 1;

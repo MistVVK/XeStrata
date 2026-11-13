@@ -92,4 +92,18 @@ inline bool i8_n8_takes(int state, int tile) {
     return state == 1 ? tile >= 2 && tile <= 4 : tile == 2;
 }
 
+// The Tesla P100 (compute capability 6.0) in a build without MMQ.  There the build WITH MMQ takes the FP16 prompt path by default (prefill.cpp gp100_fp16_default: GP100 has no
+// dp4a), so the unset-switch int8 default of a build without MMQ (i8_switch_effective) must not replace it where the int8 kernel loses to it.  Measured on the P100 (OUT build,
+// prompt read ms int8 / FP16, par/RESULTS-P100-GATE.md): 300 0.874, 600 0.865, 1,000 0.844, then 1,200 1.196, 1,500 1.142, 2,048 1.085, 8,192 1.081: the step sits at the chunk size from
+// which every expert streams (stream_all_min, 1,024 tokens, prefill.cpp), so the limit is that floor and no constant of its own: the int8 default applies to chunks BELOW it
+// (the staged per-layer path), the FP16 path from it up, as the build with MMQ does.  A value the user set wins at every size (STRATA_EXPERT_I8=1 keeps the int8 kernels, =0 turns
+// them off); every other card class has no such limit.
+
+/// May the int8 default (switch NOT set, build without MMQ) take a chunk of `chunk_tokens` tokens on this device?  `raw_state` = i8_switch_parse(getenv): a set value (0 or 1) is
+/// not this rule's to decide (true); a build with MMQ, or a card that is not the P100 (`sm60`), has no limit (true); otherwise the chunk must be under `limit`.
+inline bool i8_chunk_default_allows(int raw_state, bool mmq_free, bool sm60, int64_t chunk_tokens, int64_t limit) {
+    if (raw_state != -1 || !mmq_free || !sm60) return true;
+    return chunk_tokens < limit;
+}
+
 }  // namespace strata::kernels

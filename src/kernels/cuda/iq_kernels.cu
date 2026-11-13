@@ -6290,6 +6290,21 @@ bool native_expert_i8_prompt(const NativeExpertLayout& L, int64_t group_entries)
 
 bool native_expert_i8_by_default() noexcept { return i8_expert_class_default(i8_switch_raw(), i8_device_gcn(), g_i8_mmq_free.load(std::memory_order_relaxed)); }
 void native_expert_i8_set_mmq_free() noexcept { g_i8_mmq_free.store(true, std::memory_order_relaxed); }
+// The P100 class rule (i8_expert_rule.hpp, i8_chunk_default_allows; declared in prefill.cpp, the one caller): is the int8 DEFAULT of this process the one that gives way to the FP16
+// path from the stream floor up?  True only on a Tesla P100 (compute capability 6.0) in a build without MMQ with STRATA_EXPERT_I8 not set; a set value, a build with MMQ, any other
+// card and a HIP card: false (no size limit).
+bool native_expert_i8_floor_gated() noexcept {
+    if (i8_switch_raw() != -1 || !g_i8_mmq_free.load(std::memory_order_relaxed)) return false;   // before any device query
+#if !defined(__HIPCC__)
+    int dev = 0, major = 0, minor = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+    cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+    return major == 6 && minor == 0;
+#else
+    return false;
+#endif
+}
 
 // OWN-I8 few-rows route: STRATA_I8_FEWROWS read once (not set = the card's class default, 0 = off, N = a limit of N rows per expert); the class default asks the
 // current device's compute capability (a HIP card has none that matters: the CUDA rule's 10)
