@@ -4976,8 +4976,8 @@ int main(int argc, char** argv) {
                                    ? std::min(hm.available - std::min(hm.available, strata::platform::cma_free_bytes()),
                                               hm.cgroup_limit)
                                    : 0;
-        if (!(keep != nullptr && std::strcmp(keep, "keep") == 0) && avail > 0 &&
-            !strata::core::detail::resident_pin_fits(need, 0, headroom, avail, why)) {
+        const bool room_short = avail > 0 && !strata::core::detail::resident_pin_fits(need, 0, headroom, avail, why);
+        if (!(keep != nullptr && std::strcmp(keep, "keep") == 0) && room_short) {
             std::fprintf(stderr, "xestrata generate: the expert arena needs %.2f GiB of RAM and %.0f GiB beside it, but "
                                  "%.2f GiB is available: starting as with --resident-experts (the experts the GPU does "
                                  "not hold in RAM as far as it has room, the rest from the model files; "
@@ -4988,6 +4988,24 @@ int main(int argc, char** argv) {
             if (!o.shared_expert_arena.empty())
                 std::fprintf(stderr, "xestrata generate: the shared expert arena is not used (it needs the room)\n");
             o.shared_expert_arena.clear();
+        } else if (room_short && ple_lock_by_policy && ple_table.locked()) {
+            // #4846 (upstream eb8917247): the arena is loaded anyway (XESTRATA_ARENA_LOW_RAM=keep, or a shared arena
+            // another engine filled), and the RAM is short.  The PLE table's lock the residency policy took is RAM this
+            // start needs: give it back before the arena is registered, as #4518 gives it back for the conversation
+            // cache (the pages stay cached, the OS may reclaim them).  --ple-io ram asked for by hand is never touched.
+            const uint64_t table_b = ple_table.table_bytes();
+            if (ple_table.unlock()) {
+                strata::core::detail::HostMemory after;
+                std::string now;
+                if (strata::core::detail::host_available_memory(after)) {
+                    char b[64];
+                    std::snprintf(b, sizeof b, " (%.2f GiB available now)", (double) after.available / 1073741824.0);
+                    now = b;
+                }
+                std::fprintf(stderr, "xestrata generate: the RAM is short for the expert arena; the PLE table's lock "
+                                     "(%.2f GiB) is given back before the arena is loaded%s\n",
+                             (double) table_b / 1073741824.0, now.c_str());
+            }
         }
     }
     if (o.mmap_experts) {
