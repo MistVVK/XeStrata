@@ -1,18 +1,20 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""tools/dflash2_fetch.py - the DFlash2 drafter onto this computer: a pinned download, checked, packed for the engine.
+"""tools/dflash2_fetch.py - a model's DFlash2 drafter onto this computer: a pinned download, checked, packed for the
+engine.
 
-    python tools/dflash2_fetch.py plan   --out DIR     what it would download (nothing is changed)
-    python tools/dflash2_fetch.py fetch  --out DIR     download, check, pack; progress in plain words
-    python tools/dflash2_fetch.py verify --out DIR     the pack on disk against its pinned size and SHA-256
+    python tools/dflash2_fetch.py plan   --out DIR [--model KEY]   what it would download (nothing is changed)
+    python tools/dflash2_fetch.py fetch  --out DIR [--model KEY]   download, check, pack; progress in plain words
+    python tools/dflash2_fetch.py verify --out DIR [--model KEY]   the pack on disk against its pinned size and SHA-256
 
-Only `fetch` reaches the network. The drafter is incoai/Qwen3.8-Flash-Next-DFlash2 (Apache-2.0) at one revision; the
-1.2 GB safetensors file is packed (tools/dflash2_pack.py --q4_0, numpy only) into the engine's 0.52 GB runtime file,
-checked against its pinned size and SHA-256, and the download is then removed. The selector's codebooks are converted
-to Q4_0 rows on this computer too (174 MiB less VRAM, the same drafts); a conversion that does not match its pin is
-deleted and the bf16-selector pack stays. A Q8 pack from an earlier run keeps working. LICENSE and NOTICE (Inco AI,
-Apache-2.0; the selector idea is nazeshinjite's) are copied beside the pack.
+Only `fetch` reaches the network. Each model with a drafter (DRAFTERS: Qwen3.8-Flash-Next, the default; GLM-5.3-Flash;
+Qwen3.6-35B-A3B) has one of Inco AI's (Apache-2.0) at one revision; its safetensors file is packed (tools/
+dflash2_pack.py --q4_0, numpy only) into the engine's runtime file, checked against its pinned size and SHA-256, and
+the download is then removed. The selector's codebooks are converted to Q4_0 rows on this computer too (less VRAM,
+the same drafts); a conversion that does not match its pin is deleted and the bf16-selector pack stays. A Q8 pack from
+an earlier run keeps working. LICENSE and NOTICE.md (Inco AI, Apache-2.0; the selector idea is nazeshinjite's) are
+copied beside the pack.
 """
 import argparse
 import json
@@ -31,57 +33,97 @@ from serve import envvars, file_lock  # noqa: E402
 
 import dflash2_pack  # noqa: E402
 
-REPO = "incoai/Qwen3.8-Flash-Next-DFlash2"
-REVISION = "a22a1744e85c17364dcc54a6a420af7135d4c7f6"
+
+class Drafter:
+    """One model's drafter: its repository and revision, the files' sizes and SHA-256 there, the packs' names and pins
+    (None: packed on this computer and kept without a pin), the NOTICE in data/dflash2/."""
+
+    def __init__(self, key, repo, revision, files, pack_name, pack_pin, converted_name, converted_pin, download_gb,
+                 pack_gb, notice, legacy=None):
+        self.key, self.repo, self.revision, self.files = key, repo, revision, files
+        self.pack_name, self.pack_pin = pack_name, pack_pin
+        self.converted_name, self.converted_pin = converted_name, converted_pin
+        self.download_gb, self.pack_gb, self.notice, self.legacy = download_gb, pack_gb, notice, legacy
+        self.base_url = download_core.hf_endpoint() + "/%s/resolve/%s/" % (repo, revision)
+
+
+DRAFTERS = {
+    # the drafter of Qwen3.8-Flash-Next (the target's layers 5/15/25/35/45, the mean of the four hyper-connection
+    # streams); the bf16 1.2 GB download becomes a 0.52 GB Q4_0 pack, 0.34 GB with the Q4_0 selector
+    "qwen3.8-flash-next": Drafter(
+        "qwen3.8-flash-next", "incoai/Qwen3.8-Flash-Next-DFlash2", "a22a1744e85c17364dcc54a6a420af7135d4c7f6",
+        (("config.json", 1236, "2409575986f9ea24d455343eb469c0e6940def5edab1d1be503bb8eb4cc3b1b9"),
+         ("model.safetensors", 1206140008, "d6723f2a359eaf33ec0c95f22ae8edda896774020c552296a85e1913b4d3186f")),
+        "qwen3.8-flash-next-dflash2.q4_0.pack",
+        (522458112, "cda40d62d0eb8f37ed6e272142641a1d2f0de4a32f9e14d0416e7a71534849f1"),
+        "qwen3.8-flash-next-dflash2.q4_0-selq4.pack",
+        (339694592, "4a42b98220ea7880664002c8edda1563aecbae754b762a2e2f31b2b91ee93ecd"),
+        1.2, 0.52, "NOTICE.md", legacy="qwen3.8-flash-next-dflash2.q8.pack"),
+    # GLM-5.3-Flash's (base zai-org/GLM-5.3-Flash): hidden 4096, 5 layers, the target's layers 5/14/24/33/42, the mean
+    # of its four mHC streams (sglang's capture, PR 36708); vocabulary 154,880
+    "glm-5.3-flash": Drafter(
+        "glm-5.3-flash", "incoai/GLM-5.3-Flash-DFlash2", "6cc6c481eee930a5139619ed919f78726371adbc",
+        (("config.json", 1273, "c4aeac0101196a6e26705b34c45230bcd0c7c68ee2d2d1efdb242087f3712573"),
+         ("model.safetensors", 2342169800, "b038e1d9d1e7833fa3880c2c0135ba9b673013f03da1b29fb831931584759dac")),
+        "glm-5.3-flash-dflash2.q4_0.pack", None, "glm-5.3-flash-dflash2.q4_0-selq4.pack", None,
+        2.3, 0.75, "NOTICE-GLM-5.3-Flash.md"),
+    # Qwen3.6-35B-A3B's: hidden 2048, 6 layers, the target's layers 1/6/11/16/22/27/32/37 (its residual: one stream);
+    # vocabulary 248,320
+    "qwen3.6-35b-a3b": Drafter(
+        "qwen3.6-35b-a3b", "incoai/Qwen3.6-35B-A3B-DFlash2", "51ef7b6923ad6c14cb1bb41c37a9041446496ab6",
+        (("config.json", 1291, "86d2e8e57e7c70bb867240708d00c0535ae9ed3c828dbdcb21584471c7bbce59"),
+         ("model.safetensors", 1052513456, "d1f16c0ff85afbe6166fabfae998af3ec16fa11da87da4391b5e0e0a7c796a4d")),
+        "qwen3.6-35b-a3b-dflash2.q4_0.pack", None, "qwen3.6-35b-a3b-dflash2.q4_0-selq4.pack", None,
+        1.1, 0.45, "NOTICE-Qwen3.6-35B-A3B.md"),
+}
+DEFAULT = "qwen3.8-flash-next"
+# the Qwen3.8 drafter's names, for the callers that knew only it (setup's)
+REPO = DRAFTERS[DEFAULT].repo
+REVISION = DRAFTERS[DEFAULT].revision
 LICENSE = "Apache-2.0"
-BASE_URL = download_core.hf_endpoint() + "/%s/resolve/%s/" % (REPO, REVISION)
-# the repository's own sizes and hashes for that revision: a download is refused if either differs
-FILES = (
-    ("config.json", 1236, "2409575986f9ea24d455343eb469c0e6940def5edab1d1be503bb8eb4cc3b1b9"),
-    ("model.safetensors", 1206140008, "d6723f2a359eaf33ec0c95f22ae8edda896774020c552296a85e1913b4d3186f"),
-)
-PACK_NAME = "qwen3.8-flash-next-dflash2.q4_0.pack"
-PACK_BYTES = 522458112
-PACK_SHA256 = "cda40d62d0eb8f37ed6e272142641a1d2f0de4a32f9e14d0416e7a71534849f1"
-CONVERTED_NAME = "qwen3.8-flash-next-dflash2.q4_0-selq4.pack"
-CONVERTED_BYTES = 339694592
-CONVERTED_SHA256 = "4a42b98220ea7880664002c8edda1563aecbae754b762a2e2f31b2b91ee93ecd"
-LEGACY_PACK_NAME = "qwen3.8-flash-next-dflash2.q8.pack"      # an earlier run's Q8 pack: still read by the engine
-DOWNLOAD_GB = 1.2
-PACK_GB = 0.52
+PACK_NAME = DRAFTERS[DEFAULT].pack_name
+CONVERTED_NAME = DRAFTERS[DEFAULT].converted_name
 BAD = 3                                             # `verify`'s exit code: the pack is missing or corrupt
 UA = {"User-Agent": "xestrata-dflash2-fetch"}
 
 
-def pack_ok(path, size, sha):
+def pack_ok(path, pin):
+    """The pack is there and, where it is pinned ((size, SHA-256)), is those bytes; an unpinned pack (a drafter whose
+    pack has no pin yet) only has to be a whole DF2P file (fetch writes it last, under a temporary name)."""
     try:
-        return path.is_file() and path.stat().st_size == size and download_core.sha256_file(path) == sha
+        if not path.is_file():
+            return False
+        if pin is None:
+            with open(path, "rb") as f:
+                return f.read(4) == b"DF2P" and path.stat().st_size > 4096
+        return path.stat().st_size == pin[0] and download_core.sha256_file(path) == pin[1]
     except OSError:
         return False
 
 
-def ready(out: Path):
+def ready(d: Drafter, out: Path):
     """The pack this install would use: (path, name) or None. The converted pack first, then the Q4_0, then a Q8."""
-    for name, size, sha in ((CONVERTED_NAME, CONVERTED_BYTES, CONVERTED_SHA256), (PACK_NAME, PACK_BYTES, PACK_SHA256)):
-        if pack_ok(out / name, size, sha):
+    for name, pin in ((d.converted_name, d.converted_pin), (d.pack_name, d.pack_pin)):
+        if pack_ok(out / name, pin):
             return out / name, name
-    legacy = out / LEGACY_PACK_NAME
-    if legacy.is_file() and legacy.stat().st_size > 0:
-        return legacy, LEGACY_PACK_NAME
+    if d.legacy:
+        legacy = out / d.legacy
+        if legacy.is_file() and legacy.stat().st_size > 0:
+            return legacy, d.legacy
     return None
 
 
-def plan(out: Path):
-    got = ready(out)
+def plan(d: Drafter, out: Path):
+    got = ready(d, out)
     if got:
         text = "The DFlash2 drafter is already on this computer (%s)." % got[1]
         gb = 0.0
     else:
         text = ("The DFlash2 drafter is %.1f GB to download (it is packed to %.2f GB for the engine and the download "
-                "is removed), from %s, %s." % (DOWNLOAD_GB, PACK_GB, REPO, LICENSE))
-        gb = DOWNLOAD_GB
-    print(json.dumps({"ready": got is not None, "gb": gb, "pack": str(got[0]) if got else str(out / CONVERTED_NAME),
-                      "repo": REPO, "revision": REVISION, "text": text}, indent=1))
+                "is removed), from %s, %s." % (d.download_gb, d.pack_gb, d.repo, LICENSE))
+        gb = d.download_gb
+    print(json.dumps({"ready": got is not None, "gb": gb, "pack": str(got[0]) if got else str(out / d.converted_name),
+                      "repo": d.repo, "revision": d.revision, "model": d.key, "text": text}, indent=1))
 
 
 def online(url, timeout=6.0):
@@ -96,7 +138,7 @@ def online(url, timeout=6.0):
         return False
 
 
-def hub_snapshots():
+def hub_snapshots(d: Drafter):
     """Where the Hugging Face tools keep this repository's pinned revision, if the person already has it (nothing is
     created or changed)."""
     roots = []
@@ -104,9 +146,9 @@ def hub_snapshots():
         if os.environ.get(name):
             roots.append(Path(os.environ[name]))
     if os.environ.get("HF_HOME"):
-        roots.append(Path(os.environ[name]) / "hub")
+        roots.append(Path(os.environ["HF_HOME"]) / "hub")
     roots.append(Path.home() / ".cache" / "huggingface" / "hub")
-    return [r / ("models--" + REPO.replace("/", "--")) / "snapshots" / REVISION for r in roots]
+    return [r / ("models--" + d.repo.replace("/", "--")) / "snapshots" / d.revision for r in roots]
 
 
 def present(folders, spec):
@@ -174,54 +216,58 @@ def download(url, path: Path, size, sha):
     part.replace(path)
 
 
-def notices(out: Path):
-    """LICENSE (Apache-2.0) and NOTICE (Inco AI, the selector credit) beside the pack, from the checkout's data/."""
+def notices(d: Drafter, out: Path):
+    """LICENSE (Apache-2.0) and NOTICE.md (Inco AI, the selector credit) beside the pack, from the checkout's data/."""
     src = Path(__file__).resolve().parents[1] / "data" / "dflash2"
-    for name in ("LICENSE", "NOTICE.md"):
+    for name, dst in (("LICENSE", "LICENSE"), (d.notice, "NOTICE.md")):
         try:
-            shutil.copyfile(src / name, out / name)
+            shutil.copyfile(src / name, out / dst)
         except OSError as e:
-            print("  the drafter's %s could not be copied (%s)" % (name, e), file=sys.stderr)
+            print("  the drafter's %s could not be copied (%s)" % (dst, e), file=sys.stderr)
 
 
-def convert(out: Path):
+def convert(d: Drafter, out: Path):
     """The verified Q4_0 pack's selector codebooks as Q4_0 rows (no network). A conversion that does not match its
     pin is deleted and the bf16-selector pack stays."""
     print("  converting the selector's codebooks to Q4_0 (less graphics memory, the same drafts)")
-    conv = out / CONVERTED_NAME
+    conv = out / d.converted_name
+    tmp = conv.with_name(conv.name + ".tmp")
     try:
-        dflash2_pack.convert_selector_q4(str(out / PACK_NAME), str(conv))
-        if not pack_ok(conv, CONVERTED_BYTES, CONVERTED_SHA256):
+        dflash2_pack.convert_selector_q4(str(out / d.pack_name), str(tmp))
+        tmp.replace(conv)
+        if not pack_ok(conv, d.converted_pin):
             raise ValueError("the converted pack does not match the pinned bytes")
     except (OSError, ValueError) as e:
+        tmp.unlink(missing_ok=True)
         conv.unlink(missing_ok=True)
         print("  the selector conversion failed (%s): the bf16-selector pack stays" % e,
               file=sys.stderr)
 
 
-def fetch(out: Path):
+def fetch(d: Drafter, out: Path):
     out.mkdir(parents=True, exist_ok=True)
-    if pack_ok(out / CONVERTED_NAME, CONVERTED_BYTES, CONVERTED_SHA256):
-        print("The DFlash2 drafter is already here: %s" % (out / CONVERTED_NAME))
-        notices(out)
+    if pack_ok(out / d.converted_name, d.converted_pin):
+        print("The DFlash2 drafter is already here: %s" % (out / d.converted_name))
+        notices(d, out)
         return
-    if pack_ok(out / PACK_NAME, PACK_BYTES, PACK_SHA256):
-        convert(out)                     # the Q4_0 pack is here: the selector conversion needs no network
-        notices(out)
+    if pack_ok(out / d.pack_name, d.pack_pin):
+        convert(d, out)                  # the Q4_0 pack is here: the selector conversion needs no network
+        notices(d, out)
         return
-    legacy = out / LEGACY_PACK_NAME
-    if legacy.is_file() and legacy.stat().st_size > 0:
-        print("The DFlash2 drafter is already here (an earlier Q8 pack): %s" % legacy)
-        notices(out)
-        return
-    if not online(BASE_URL + "config.json"):
+    if d.legacy:
+        legacy = out / d.legacy
+        if legacy.is_file() and legacy.stat().st_size > 0:
+            print("The DFlash2 drafter is already here (an earlier Q8 pack): %s" % legacy)
+            notices(d, out)
+            return
+    if not online(d.base_url + "config.json"):
         raise SystemExit("the DFlash2 drafter's download address did not answer (no internet, or the host is down): "
                          "the model keeps its MTP draft layer; run setup again when the connection is back")
-    found = present(hub_snapshots(), FILES)
+    found = present(hub_snapshots(d), d.files)
     work = out / "download"
     work.mkdir(exist_ok=True)
     src = {}
-    for name, size, sha in FILES:
+    for name, size, sha in d.files:
         if name in found:
             src[name] = found[name]
             print("  using the Hugging Face cache's %s" % name)
@@ -232,24 +278,27 @@ def fetch(out: Path):
                 print("  downloading %s (%.2f GB)" % (name, size / 1e9))
             else:
                 print("  downloading %s" % name)
-            download(BASE_URL + name, dst, size, sha)
+            download(d.base_url + name, dst, size, sha)
         src[name] = dst
     print("  packing the drafter for the engine (Q4_0, numpy only)")
-    q4 = out / PACK_NAME
-    dflash2_pack.pack(str(src["model.safetensors"]), str(src["config.json"]), str(q4), q4=True)
-    if not pack_ok(q4, PACK_BYTES, PACK_SHA256):
+    q4 = out / d.pack_name
+    tmp = q4.with_name(q4.name + ".tmp")         # the whole file or none: an unpinned pack is taken as it is
+    dflash2_pack.pack(str(src["model.safetensors"]), str(src["config.json"]), str(tmp), q4=True,
+                      source="%s %s" % (d.repo, d.revision[:8]))
+    tmp.replace(q4)
+    if not pack_ok(q4, d.pack_pin):
         q4.unlink(missing_ok=True)
         raise SystemExit("the packed drafter does not match the pinned bytes (size or SHA-256): it was deleted; "
                          "run setup again")
-    convert(out)
-    shutil.rmtree(work, ignore_errors=True)      # the 1.2 GB download is removed; the pack stays
-    notices(out)
-    got = ready(out)
+    convert(d, out)
+    shutil.rmtree(work, ignore_errors=True)      # the download is removed; the pack stays
+    notices(d, out)
+    got = ready(d, out)
     print("The DFlash2 drafter is ready: %s" % (got[0] if got else q4))
 
 
-def verify(out: Path):
-    got = ready(out)
+def verify(d: Drafter, out: Path):
+    got = ready(d, out)
     if got is None:
         print("no checked DFlash2 pack in %s" % out, file=sys.stderr)
         return BAD
@@ -311,17 +360,20 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["plan", "fetch", "verify"])
     ap.add_argument("--out", required=True)
+    ap.add_argument("--model", default=DEFAULT, choices=sorted(DRAFTERS),
+                    help="whose drafter (default %s)" % DEFAULT)
     a = ap.parse_args()
     out = Path(a.out)
+    d = DRAFTERS[a.model]
     if a.cmd == "plan":
-        plan(out)
+        plan(d, out)
         return
     if a.cmd == "verify":
-        sys.exit(verify(out))
+        sys.exit(verify(d, out))
     exit_with_parent()
     lock = lock_folder(out)
     try:
-        fetch(out)
+        fetch(d, out)
     finally:
         file_lock.release(lock)
         lock.close()
