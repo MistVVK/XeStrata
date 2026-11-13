@@ -803,7 +803,6 @@ private:
         float* cpu = nullptr;              ///< the CPU's rows, sent back to be scattered into parts
         int32_t* cpu_row = nullptr;        ///< the routing entry each of them belongs to
         uint16_t* gemm_scratch = nullptr;  ///< Gemm::native's dequantized weight
-        uint16_t* gemm_side = nullptr;  ///< optional second dequant scratch
         // pinned host
         float* emb = nullptr;              ///< T rows of n_embd
         int32_t *h_steps = nullptr, *h_pos = nullptr, *h_ids = nullptr, *h_src = nullptr, *h_slot = nullptr,

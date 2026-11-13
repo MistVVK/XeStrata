@@ -717,22 +717,12 @@ struct Prefill::Impl {
     bool cpu_pend = false;
     double pend_cpu_ms = 0;
     int64_t pend_n_cpu = 0, pend_n_gpu = 0;
-    // ... and whether sharing pays at all (auto, upstream f2a3b946, #1282): an eligible layer's wall time per
-    // non-resident expert, from before its routing sync to its combine (events, two sets: a layer's start is recorded
-    // before the last one's is read); two adjacent layers of the two arms give a ratio (with / without), and the median
-    // of the last CPU_RATIOS decides.  Layers differ up to 8x in that cost, the same in every run, which is why adjacent
-    // layers are compared rather than a running mean per arm.
-    static constexpr int CPU_RATIOS = 5;
-    int64_t cpu_layers = 0;     // the eligible layers so far (the arms' schedule)
-    int64_t cpu_first_l = -1;   // the model's first eligible layer: 2x the others' cost in both arms, never read
+    // the staged 3K share's own schedule: an eligible layer's wall time per non-resident expert, from before its
+    // routing sync to its combine (events, two sets: a layer's start is recorded before the last one's is read)
+    int64_t cpu_layers = 0;     // the eligible layers so far (the schedule's index)
     strata::gpu::Event* cpu_wall[4] = {};
     int pend_wall = 0, pend_set = 0, pend_l = 0;   // pend_wall 1: the last eligible layer ran without the share, 2: with
     int64_t pend_wall_n = 0;
-    int last_arm = 0, last_l = 0;
-    double last_w = 0;
-    double cpu_ratio[CPU_RATIOS] = {};
-    int cpu_nratio = 0;
-    bool cpu_gate = false;   // the median ratio is below 1: the layers that share are the cheaper ones
     strata::core::PromptShareChoice share_3k;
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn).
     // LAYER SPLIT, same process only: allocated in this stage's context, the next stage reads them where they are
@@ -1409,14 +1399,9 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     o.owned = &m.owned;
     {
         uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
-        // STRATA_DEQUANT_SIDE: the second dequant scratch (counted by bytes_needed, retaken by relayout)
-        uint16_t* gs2 = gemm_dequant_side() ? o.take<uint16_t>((size_t) GEMM_SCRATCH, ok) : nullptr;
         if (!ok) { err = "prefill: GEMM scratch does not fit"; return false; }
         m.gemm.init_external(stream, gs, GEMM_SCRATCH);
         pf_mark("init: GEMM scratch + workspace (Alloc takes so far)", tr_last, o.tr_asked);
-        if (std::string side_err; !m.gemm.set_dequant_side(gs2, side_err))
-            std::fprintf(stderr, "prefill: XESTRATA_DEQUANT_SIDE=1 not taken (%s): the dense weights are dequantized in "
-                                 "front of their products\n", side_err.c_str());
     }
     if (!carve(T, &o)) {
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit" +
@@ -1609,11 +1594,7 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
     o.cap = borrow_bytes;
     o.owned = &m.owned;
     uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
-    uint16_t* gs2 = gemm_dequant_side() ? o.take<uint16_t>((size_t) GEMM_SCRATCH, ok) : nullptr;   // STRATA_DEQUANT_SIDE
     if (ok) m.gemm.rebind(gs, GEMM_SCRATCH);
-    if (std::string side_err; ok && !m.gemm.set_dequant_side(gs2, side_err))
-        std::fprintf(stderr, "prefill: XESTRATA_DEQUANT_SIDE=1 not taken (%s): the dense weights are dequantized in "
-                             "front of their products\n", side_err.c_str());
     if (!ok || !carve((size_t) chunk, &o)) {
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit" +
               fit_failure(o);
@@ -1786,7 +1767,6 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     Alloc o;
     o.count_only = true;
     o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
-    if (gemm_dequant_side()) o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);   // STRATA_DEQUANT_SIDE: the second scratch
     auto f = [&](size_t n) { o.take<float>(n, ok); };
     f(T * N); f(T * D); f(T * HC);
     if (!hc_in_region()) o.take<uint8_t>((size_t) hc_set_bytes(T), ok);
@@ -2808,29 +2788,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         std::fprintf(stderr, "prefill: the CPU share is off for this run: the host could not give %s "
                                              "(RAM is short); the GPU streams every expert\n", what);
                     };
-                    bool cpu_arm = true;     // auto: this layer may share (false: the arm without)
-                    int cpu_set = -1;        // auto: the wall events' set, -1 when not measured
-                    bool cpu_cold = false;   // auto: one-time costs in the window (no reading)
-                    // auto shares only while the layers that share cost less per non-resident expert than their
-                    // neighbours that do not.  #1282 (upstream, RX 7900 GRE + 5700X3D): every share lost, auto's 0.47 by
-                    // 4.5%, the host's issue time per streamed expert rising 107 -> 200 us with the CPU busy - a cost
-                    // g / (c + g) cannot see, as both sides are measured with the share on.  The first eligible layers
-                    // alternate, without first, until CPU_MIN_RATIOS ratios are in; then the cheaper arm, and every
-                    // CPU_PROBE-th layer the other one (a prime: the probes move across the layers from one chunk to the
-                    // next), so both stay measured.  Opt-in (STRATA_PREFILL_CPU_GATE=1): the arms without the share cost
-                    // more than the gate saved on XeStrata's GPUs, 1K IQ3_XXS prompts 844 -> 833 tok/s on a B70 and
-                    // 296 -> 283 on an RTX 4070 (2026-10-11, four interleaved rounds).
-                    static const bool cpu_gate_on = [] { const char* e = strata::env_get("PREFILL_CPU_GATE"); return e != nullptr && e[0] == '1'; }();
+                    bool cpu_arm = true;     // this layer may share (the schedule says so)
+                    int cpu_set = -1;        // the wall events' set, -1 when not measured
+                    bool cpu_cold = false;   // one-time costs in the window (no reading)
                     const bool tune_3k = strata::core::cpu_share_staged_3k_mode() < 0 &&
                                          strata::core::cpu_share_batched(T, true);
-                    if (cpu_maybe && (tune_3k || (cpu_share_env() < 0.0 && cpu_gate_on))) {
-                        constexpr int64_t CPU_PROBE = 29;
-                        constexpr int CPU_MIN_RATIOS = 3;
+                    if (cpu_maybe && tune_3k) {
                         const int64_t i = m.cpu_layers++;
-                        cpu_arm = tune_3k ? m.share_3k.next()
-                                          : (m.cpu_nratio < CPU_MIN_RATIOS ? (i & 1) != 0 : (i % CPU_PROBE == 0) != m.cpu_gate);
-                        if (m.cpu_first_l < 0) m.cpu_first_l = l;
-                        cpu_cold = l == m.cpu_first_l;
+                        cpu_arm = m.share_3k.next();
                         if (m.cpu_wall[0] == nullptr)
                             for (strata::gpu::Event*& e : m.cpu_wall)
                                 if (!strata::gpu::event_create(&e, true)) {
@@ -2883,29 +2848,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                         }
                     }
-                    if (m.pend_wall) {   // the last eligible layer's wall, and its ratio to the one before it
+                    if (m.pend_wall) {   // the last eligible layer's wall, for the staged share's schedule
                         float w_ms = 0;
                         if (strata::gpu::event_elapsed_ms(&w_ms, m.cpu_wall[(size_t) 2 * m.pend_set], m.cpu_wall[(size_t) 2 * m.pend_set + 1])) {
-                            const double w = w_ms / (double) m.pend_wall_n;
-                            if (tune_3k) {
-                                m.share_3k.add(m.pend_wall == 2, m.pend_l, m.pend_wall_n, w_ms, "Qwen3.8");
-                            } else if (m.last_arm != 0 && m.last_arm != m.pend_wall && m.pend_l > m.last_l) {   // same chunk
-                                std::rotate(m.cpu_ratio, m.cpu_ratio + 1, m.cpu_ratio + Impl::CPU_RATIOS);
-                                m.cpu_ratio[Impl::CPU_RATIOS - 1] = m.pend_wall == 2 ? w / m.last_w : m.last_w / w;
-                                m.cpu_nratio = std::min(m.cpu_nratio + 1, Impl::CPU_RATIOS);
-                                double v[Impl::CPU_RATIOS];
-                                std::copy(m.cpu_ratio + Impl::CPU_RATIOS - m.cpu_nratio, m.cpu_ratio + Impl::CPU_RATIOS, v);
-                                std::nth_element(v, v + m.cpu_nratio / 2, v + m.cpu_nratio);   // even: the upper one
-                                m.cpu_gate = v[m.cpu_nratio / 2] < 1.0;
-                            }
-                            // debug: STRATA_DBG_CPU_GATE=1 prints each reading and what the next layers do
-                            if (static const bool dbg = strata::env_get("DBG_CPU_GATE") != nullptr; dbg)
-                                std::fprintf(stderr, "cpu gate: layer %d %s, %lld non-resident, %.2f ms (%.4f a expert) -> %s\n",
-                                             m.pend_l, m.pend_wall == 2 ? "shared" : "not shared", (long long) m.pend_wall_n,
-                                             w_ms, w, m.cpu_gate ? "share" : "do not share");
-                            m.last_arm = m.pend_wall;
-                            m.last_l = m.pend_l;
-                            m.last_w = w;
+                            m.share_3k.add(m.pend_wall == 2, m.pend_l, m.pend_wall_n, w_ms, "Qwen3.8");
                         }
                         m.pend_wall = 0;
                     }
