@@ -582,7 +582,7 @@ The engine's options (added to the settings' `args`):
 | `--vram-reserve-later-mib N` | with a layer split, the VRAM left free on the later GPUs (by default as `--vram-reserve-mib`) |
 | `--vision` | with `--serve`, take requests with images (Qwen3.5-9B and the qwen35moe models; setup writes it when images are chosen) |
 | `--device cpu`, `--cpu-threads N` | run a dense Qwen3.5 model (qwen35) on the CPU alone ([a PC without a GPU](#a-pc-without-a-gpu); without a GPU that SYCL can use it runs on the CPU unasked). `--cpu-threads` is the number of threads (default: physical cores, subject to the CPU quota) |
-| `--batch N` (`"parallel": N`) | with `--serve`, decode up to N conversations together ([BATCHING](BATCHING.md#the-other-models-the-plain-engine); not GLM-5.3-Flash nor `--vision` yet) |
+| `--batch N` (`"parallel": N`, `"auto"` by default) | with `--serve`, decode up to N conversations together ([BATCHING](BATCHING.md#the-other-models-the-plain-engine); not GLM-5.3-Flash nor `--vision` yet) |
 | `--prompt-cache N`, `--prompt-cache-every N`, `--prompt-cache-root N`, `--turn-token ID`, `--conversation-save-checkpoints N` | with `--serve`, the conversation checkpoints of a model with a recurrent state (Ornith, Qwen3.6, Qwen3.5-9B). A recurrent state cannot go back to an earlier position, so a request that takes a conversation up short of its end (the next turn after a reply rendered otherwise, an edited message, a new chat on the same system prompt) reads all of it again without one. The meanings and defaults are Qwen3.8-Flash-Next's ([the conversation cache](#the-conversation-cache)), and a request's `pin` and `"strata_checkpoint": false` apply. A checkpoint is the recurrent state only (about 60 MB for Qwen3.6); the K/V of the positions below it are the conversation's. `--turn-token` defaults to the vocabulary's `<|im_start|>`, else `<|start|>`. A model of attention layers only (llm-jp, GLM-5.3-Flash) needs none: the K/V up to any position serve |
 | `--tail-role-token ID`, `--prompt-cache-tail`, `--prompt-cache-spread`, `--conversation-cache-min-tokens N`, `--conversation-cache-park-gain N`, `--short-read N`, `--session-save-reclaim` | `--serve`'s policies of the conversation cache and the checkpoints (Qwen3.8-Flash-Next's meanings); `--short-read` defaults to `--max-t` |
 | `--rope-scaling none\|linear\|yarn`, `--rope-scale F`, `--yarn-orig-ctx N`, `--yarn-ext-factor F`, `--yarn-attn-factor F`, `--yarn-beta-fast F`, `--yarn-beta-slow F` | context extension (the YaRN knobs as llama.cpp's) |
@@ -752,8 +752,11 @@ The app has three tabs:
   of the layers, prefill / decode).
   With the images on a GPU of their own, the text's state and the image job's are on lines of their own.
   Its conversation cache card shows how many prefill tokens the cache gave back (in the last request and since the
-  start) and, with `--conversation-cache-mib`, the parked conversations and their memory, and how many were parked,
-  restored and evicted (upstream #596; the same is under `"conversation_cache"` in `/metrics`).
+  start) and, while the conversation cache is on (`--conversation-cache-mib`, or the engine's own sizing without it),
+  the parked conversations and their memory, and how many were parked, restored and evicted (upstream #596; the same
+  is under `"conversation_cache"` in `/metrics`).  `--conversation-cache-mib` can also be written as the config's
+  `"conversation_cache_mib"` (MiB; 0 turns it off); without it the engine sizes it from the RAM free once the model is
+  loaded, the same rule in both engines.
 - **About**: the model and engine settings, and the addresses to connect other apps.
 
 `http://127.0.0.1:8095/?q=your question` opens it with a new chat already asking.
@@ -804,7 +807,7 @@ For a game, a 3D program or another model beside it, leave more (upstream #493).
 The expert cache is then that much smaller, so answers can be a little slower.
 
 The amount can also change while it runs (upstream #533).
-A config with image generation or a GPU encoder holds the expert cache in pieces of 512 MiB (`"vram_segment_mib"` changes it; `--vram-elastic`). Other configs do the same with `"vram_elastic": true`, and `"vram_elastic": false` always keeps one allocation. Held in pieces, the cache read the prompt and wrote the answer as fast on the B70, the RTX 4070 and the RX 9060 XT.
+Whether the expert cache is held in pieces of 512 MiB (`"vram_segment_mib"` changes it; `--vram-elastic`) is the config's `"vram_elastic"`.  The default `"auto"` holds it in pieces with image generation or a GPU encoder (something borrows the VRAM between requests) and in one allocation otherwise; `true` always holds it in pieces, `false` always in one allocation.  On a layer split the engine keeps one cache per card, so it is never in pieces.  Held in pieces, the cache read the prompt and wrote the answer as fast on the B70, the RTX 4070 and the RX 9060 XT.
 Between requests, `POST /v1/vram` with `{"reserve_mib": 6000}` gives the cache's last pieces back to the GPU until that much is free, and `{"reserve_mib": null}` goes back to the amount the start left.
 A running request finishes first.
 The experts of the pieces given back are computed on the CPU: the same answers, slower.
@@ -1518,7 +1521,7 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
 
 ### Current limits and sampling
 
-- One request at a time (several at once only with `"parallel"`, [BATCHING](BATCHING.md)), and one conversation's history in the KV cache at a time.
+- One request at a time (several at once only with `"parallel": N`, [BATCHING](BATCHING.md)), and one conversation's history in the KV cache at a time.
   Switching between two chats re-reads the part where they diverge unless parking is on; the shared prefix, such as the system prompt, is reused.
 - Images only when set up with them ([below](#images)); no video.
 - **Temperature, top_p, top_k, min_p and seed** are honored per request (OpenAI and Anthropic fields).
