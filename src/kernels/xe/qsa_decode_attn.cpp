@@ -51,6 +51,7 @@ inline int chunk_of(bool dense, int n_ids, int n_slots, int min_chunk) {
     return per < min_chunk ? min_chunk : per > CHUNK ? CHUNK : per;
 }
 constexpr int WARP = 32;
+core::TimedCache<sycl::device, int, bool> g_merge_warmed;
 
 sycl::queue& queue_for(void* stream) {
     auto& queue = core::Runtime::get().stream(stream);
@@ -535,7 +536,7 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
         launch_kv<HD, G, false>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l,
                                 n_slots, n_q, (int) cap, stride, window, split, min_chunk);
     // Measure both forms on this device and shape, outside graph capture.  The new form keeps the fold order but
-    // brings eight independent partials into registers before using them.  A 5% margin keeps the old form at a tie.
+    // brings eight independent partials into registers before using them.  A 10% margin keeps the old form at a tie.
     using MergeKey = std::tuple<int, int, int, int, int, int, int>;
     static core::TimedCache<sycl::device, MergeKey, bool> choices;
     const MergeKey key{n_slots, (int) n_q, (int) s.n_head, kv_mode, ids == nullptr, window, min_chunk};
@@ -555,10 +556,11 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
         else if (n_slots >= 8 && core::timing_depth == 0 &&
                  queue.ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording) {
             const size_t rows = std::min<size_t>(n_q, 8);
+            const bool first = g_merge_warmed.put_first(queue.get_device(), 0, true, [](int) { return true; }).second;
             const auto measured = core::timed_choice({
                 {[&] { for (int i = 0; i < 8; ++i) merge(false, rows); return true; }},
                 {[&] { for (int i = 0; i < 8; ++i) merge(true, rows); return true; }}
-            }, [&] { queue.wait_and_throw(); });
+            }, [&] { queue.wait_and_throw(); }, 5, 1.10, first ? 0.5 : 0.0);
             prefetch = choices.put(queue.get_device(), key, measured.pick == 1);
             std::fprintf(stderr, "xestrata: attention merge %s (%d slots, %zu queries; %.1f / %.1f us)\n",
                          prefetch ? "prefetch" : "plain", n_slots, n_q, measured.seconds[0] * 1e6 / 8,

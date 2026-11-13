@@ -33,6 +33,7 @@ using sycl::nd_item;
 
 constexpr int HD = kDf2Hd;
 constexpr int WARP = 32;
+core::TimedCache<sycl::device, int, bool> g_gemm_warmed;
 #define DF2_SG32 [[sycl::reqd_sub_group_size(32)]]
 
 sycl::queue& Q(void* stream) { return core::Runtime::get().stream(stream); }
@@ -406,10 +407,11 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
                 if (cached) pair16 = *cached;
                 else if (supported && core::timing_depth == 0 &&
                          qu.ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording) {
+                    const bool first = g_gemm_warmed.put_first(qu.get_device(), 0, true, [](int) { return true; }).second;
                     const auto measured = core::timed_choice({
                         {[&] { for (int r = 0; r < 4; ++r) gemm_nc<true, false>(qu, w, dpl, mats[i].y, mats[i].n_out, n_in, xqp, xd, ncols); return true; }},
                         {[&] { for (int r = 0; r < 4; ++r) gemm_nc<true, true>(qu, w, dpl, mats[i].y, mats[i].n_out, n_in, xqp, xd, ncols); return true; }}
-                    }, [&] { qu.wait_and_throw(); });
+                    }, [&] { qu.wait_and_throw(); }, 5, 1.10, first ? 0.5 : 0.0);
                     pair16 = choices.put(qu.get_device(), key, measured.pick == 1);
                     std::fprintf(stderr, "xestrata: DFlash2 Q4 GEMM %s (%d x %d x %d; %.1f / %.1f us)\n",
                                  pair16 ? "paired subgroup" : "one subgroup", mats[i].n_out, n_in, ncols,
