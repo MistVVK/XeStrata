@@ -15,6 +15,7 @@
 #include "strata/kernels/s2_gemv_q8.hpp"
 #include "strata/kernels/s_gemv.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/window_limits.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_caps.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_shared_expert
@@ -68,8 +69,8 @@ void sigmoid_scale_rows(sycl::queue& q, float* out, const float* g, int n, int n
 bool shared_expert_multi(int n_tok, const float* x, const NativeSharedWeights& nw,
                          const uint16_t* gate_inp_bf16, float* gate, float* up, float* g, float* out, int64_t n_embd,
                          int64_t n_ff, void* stream, bool gate_later, bool g_ready, const void* x_q8_1) {
-    if (n_tok < 1 || n_tok > 8 || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
-        throw std::invalid_argument("shared_expert_multi: needs 1..8 tokens, native weights, scratch and a stream");
+    if (n_tok < 1 || n_tok > kWindowMaxT || !nw.q8_1 || !nw.gate_data || !nw.up_data || !nw.down_data || !stream)
+        throw std::invalid_argument("shared_expert_multi: needs 1..16 tokens, native weights, scratch and a stream");
     auto& q = queue_for(stream);
     const void* xq = x_q8_1;
     if (xq == nullptr) {
