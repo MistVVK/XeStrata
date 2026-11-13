@@ -79,7 +79,7 @@ void df2_conv_quant(const float* x, const float* dyn, int dyn_stride, const floa
 /// silu(gate) * up of `rows` rows of I, quantized.
 void df2_swiglu_quant(const float* gate, const float* up, int rows, int I, void* xq, float* xd, void* stream);
 /// h += conv(x) (the finish convolution with the residual), then the RMS norm of the new h (weights gamma) -> xn
-/// (optional) and the planar quantization.  rows <= 8, H <= 3072 (H a multiple of 32).
+/// (optional) and the planar quantization.  rows <= 8, H <= 4096 (H a multiple of 32).
 void df2_conv_rms_quant(const float* x, const float* dyn, int dyn_stride, const float* base, float* h,
                         const float* gamma, float* xn, int rows, int H, int group, float eps, void* xq, float* xd,
                         void* stream);
@@ -104,6 +104,10 @@ void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint
 void df2_select(const float* hp, const float* unary, const int32_t* tok, const uint16_t* pred_cb, const uint16_t* succ_cb,
                 int rank, int rows, const int32_t* anchor_tok, int32_t* out_tok, float* out_prob, void* stream,
                 bool cb_q4 = false);
+
+/// The block's input rows from two embedding rows (a host-embedded target, the plain engine's): h[0] = anchor,
+/// h[1..rows-1] = mask, each of N floats.
+void df2_embed_rows(const float* anchor, const float* mask, float* h, int N, int rows, void* stream);
 
 /// The verify window's tap: out[r][d] = mean over the hc streams c of (R[r][c][d] + bo[r][d] * 2 * sigmoid(inject[r][c]
 /// / hc)) - the layer output with its pending FFN write applied, averaged over the streams.  R rows are R_stride floats

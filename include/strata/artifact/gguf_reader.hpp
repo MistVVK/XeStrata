@@ -434,6 +434,30 @@ public:
         }
         return -1;
     }
+    /// The whole string array `key` (a vocabulary's tokens), read from the header again; empty when there is none.
+    std::vector<std::string> string_array(const std::string& key) const {
+        Cursor c(base_, size_);
+        c.read<uint32_t>();
+        c.read<uint32_t>();
+        c.read<uint64_t>();
+        const uint64_t n_kv = c.read<uint64_t>();
+        for (uint64_t i = 0; i < n_kv; ++i) {
+            const std::string k = c.str();
+            const MetaType t = (MetaType)c.read<uint32_t>();
+            if (k != key || t != MetaType::ARRAY) {
+                read_value(c, t);
+                continue;
+            }
+            const MetaType e = (MetaType)c.read<uint32_t>();
+            const uint64_t n = c.read<uint64_t>();
+            if (e != MetaType::STRING) return {};
+            std::vector<std::string> out;
+            out.reserve((size_t)n);
+            for (uint64_t j = 0; j < n; ++j) out.push_back(c.str());
+            return out;
+        }
+        return {};
+    }
     const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
 
 private:

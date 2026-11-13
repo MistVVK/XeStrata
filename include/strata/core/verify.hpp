@@ -223,6 +223,9 @@ public:
     /// gathered for every window row into tap_dev() ([T][ntap][n_embd]).  Only the layers this stage runs below the
     /// last are kept.  Set before init; empty (the default) allocates nothing and records nothing.
     void set_taps(const std::vector<int>& layers) { tap_req_ = layers; }
+    /// The taps off after init (the start's measurement released DFlash2): the window graphs, captured with the tap
+    /// kernels, are dropped and captured again without them on their next use.
+    void taps_off();
     const float* tap_dev() const { return tap_dev_; }
     int n_taps() const { return (int) tap_layers_.size(); }
 

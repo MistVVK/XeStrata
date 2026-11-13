@@ -1582,7 +1582,7 @@ endif()
 #     features, and the fallback exists for tests, exactly as P2.S3 specifies.
 # Plan v0.3 P6: speculation components that need no GPU.
 add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp
-                             src/spec/drafter_policy.cpp
+                             src/spec/drafter_policy.cpp src/spec/draft_probe.cpp
             src/spec/draft_source.cpp src/spec/guess_gate.cpp)
 target_include_directories(strata_spec PUBLIC include)
 if(STRATA_BUILD_TESTS)
@@ -1598,6 +1598,9 @@ if(STRATA_BUILD_TESTS)
   add_executable(drafter_policy_test src/spec/drafter_policy_test.cpp)
   target_link_libraries(drafter_policy_test PRIVATE strata_spec)
   add_test(NAME drafter_policy_test COMMAND drafter_policy_test)
+  add_executable(draft_probe_test src/spec/draft_probe_test.cpp)
+  target_link_libraries(draft_probe_test PRIVATE strata_spec)
+  add_test(NAME draft_probe_test COMMAND draft_probe_test)
   add_executable(window_rule_test src/spec/window_rule_test.cpp)
   target_link_libraries(window_rule_test PRIVATE strata_spec)
   add_test(NAME window_rule_test COMMAND window_rule_test)

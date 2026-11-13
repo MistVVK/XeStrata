@@ -689,11 +689,14 @@ void df2_conv_quant(const float* x, const float* dyn, int dyn_stride, const floa
     });
 }
 
-void df2_conv_rms_quant(const float* x, const float* dyn, int dyn_stride, const float* base, float* h,
-                        const float* gamma, float* xn, int rows, int H, int group, float eps, void* xq, float* xd,
-                        void* stream) {
-    constexpr int MAXJ = 12;   // H <= 3072 -> 96 blocks -> 12 a sub-group
-    if (H > 3072) throw std::invalid_argument("df2_conv_rms_quant: H too large");
+namespace {
+
+// MAXJ blocks of 32 a sub-group, the row's values held in registers between the norm's sum and its scaling: 12 for
+// H <= 3072 (Qwen3.8-Flash-Next's drafter, 2560), 16 for H <= 4096 (GLM-5.3-Flash's)
+template <int MAXJ>
+void conv_rms_quant_launch(const float* x, const float* dyn, int dyn_stride, const float* base, float* h,
+                           const float* gamma, float* xn, int rows, int H, int group, float eps, void* xq, float* xd,
+                           void* stream) {
     int8_t* xqi = static_cast<int8_t*>(xq);
     Q(stream).submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> red(8, hd);
@@ -740,6 +743,16 @@ void df2_conv_rms_quant(const float* x, const float* dyn, int dyn_stride, const 
             }
         });
     });
+}
+
+}  // namespace
+
+void df2_conv_rms_quant(const float* x, const float* dyn, int dyn_stride, const float* base, float* h,
+                        const float* gamma, float* xn, int rows, int H, int group, float eps, void* xq, float* xd,
+                        void* stream) {
+    if (H <= 3072) conv_rms_quant_launch<12>(x, dyn, dyn_stride, base, h, gamma, xn, rows, H, group, eps, xq, xd, stream);
+    else if (H <= 4096) conv_rms_quant_launch<16>(x, dyn, dyn_stride, base, h, gamma, xn, rows, H, group, eps, xq, xd, stream);
+    else throw std::invalid_argument("df2_conv_rms_quant: H too large");
 }
 
 void df2_swiglu_quant(const float* gate, const float* up, int rows, int I, void* xq, float* xd, void* stream) {
@@ -950,6 +963,14 @@ void df2_select(const float* hp, const float* unary, const int32_t* tok, const u
                 sycl::group_barrier(it.get_group());
             }
         });
+    });
+}
+
+void df2_embed_rows(const float* anchor, const float* mask, float* h, int N, int rows, void* stream) {
+    const size_t n = (size_t) rows * N;
+    Q(stream).parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
+        const size_t r = i[0] / (size_t) N, c = i[0] % (size_t) N;
+        h[i[0]] = r == 0 ? anchor[c] : mask[c];
     });
 }
 

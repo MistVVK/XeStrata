@@ -46,6 +46,7 @@
 #include "strata/spec/draft_policy.hpp"
 #include "strata/spec/guess_gate.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -220,13 +221,14 @@ struct PlainOptions {
     /// and the uniform of the window row that checks each (coupled_draft.hpp) instead of taking the most likely token
     bool coupled_draft = false;
     double spec_min_p = 0.0;
-    /// --draft mtp|dflash2|auto|off: which drafter proposes (the shared option, generate's too).  The plain engine's
-    /// drafter is the model file's MTP layer; DFlash2 weights are trained for Qwen3.8-Flash-Next's taps and none exist
-    /// for the plain models, so dflash2 is refused and auto keeps the MTP.  The mechanism (core/dflash2.hpp, the tap
-    /// hook, spec/drafter_policy.hpp) is shared, ready for a plain-model drafter pack.
+    /// --draft mtp|dflash2|auto|off: which drafter proposes (the shared option, generate's too): the model file's MTP
+    /// layer, a DFlash2 pack of the model's (--draft-model: GLM-5.3-Flash's and Qwen3.6-35B-A3B's, tools/
+    /// dflash2_fetch.py), or none; auto (--serve) measures them at the start and keeps the fastest
+    /// (strata/spec/draft_probe.hpp).
     std::string draft = "mtp";
-    std::string draft_model;   ///< --draft-model: a DFlash2 pack (none exists for the plain models yet)
-    double draft_conf = 0.0;   ///< --draft-conf: DFlash2's window confidence (the plain engine: unused)
+    std::string draft_model;   ///< --draft-model: the model's DFlash2 pack
+    double draft_conf = 0.0;   ///< --draft-conf: DFlash2's window confidence (0: the engine's default)
+    bool spec_auto = false;    ///< --spec auto: the window is one of the start's candidates (spec and 2)
     std::string draft_rule = "learn";   ///< --draft-rule: a request without a draft= key (--draft auto)
     /// A layer split across the engine's GPUs (--layer-split): GPU 0 runs the blocks before split_at[0], GPU 1 those
     /// from there to split_at[1], and so on, the last GPU the rest, the head and the MTP layer; `split_auto`: the points
@@ -463,6 +465,34 @@ public:
     void set_taps(const std::vector<int>& layers) { tap_req_ = layers; }
     const float* tap_dev() const { return tail().tap_dev_; }
     int n_taps() const { return (int) tail().tap_local_.size(); }
+    /// DFlash2 beside the model (the engine's): the head its drafts are read through - the drafts' subset when the
+    /// model has one (draft_vocab), else the whole head - on the last stage.
+    struct HeadView {
+        const void* rows = nullptr;
+        int type = -1;          ///< the GGUF / engine row type (30: bf16, read with fp32 rows)
+        int64_t n_in = 0, n_rows = 0;
+        const int32_t* vocab_dev = nullptr;   ///< row i's token (null: row i is token i)
+    };
+    HeadView draft_head_view() const;
+    /// After load: room for windows of `drafts` drafts (the recurrent states' copies, the extra ones from the VRAM free
+    /// now; fewer than the load made: the extra ones freed).  False with `err`, nothing changed, when they do not fit.
+    /// The window graphs are captured again.  One GPU only.
+    bool set_window_drafts(int drafts, std::string& err);
+    /// The window graphs dropped: captured again on their next use (the taps went off, the copies changed).
+    void drop_window_graphs();
+    /// The prompt's DFlash2 taps (prompt() in chunks and forward_run's windows): the rows at or after `first_pos`,
+    /// staged on the device for up to `cap_rows` rows and handed to `on` after each chunk or window (the stream
+    /// synchronized).  cap_rows 0 or `on` empty: off, the staging freed.
+    bool set_prompt_taps(int64_t first_pos, int64_t cap_rows,
+                         std::function<bool(const float* taps, int64_t rows, int64_t pos0, std::string& err)> on,
+                         std::string& err);
+    /// The taps off after load (DFlash2 released): neither the windows nor the prompt write them.
+    void taps_off();
+    /// The MTP layer given back after the start's measurement chose DFlash2 or no drafter: its own weights (the
+    /// allocations its load made), graphs and the drafts' 2-bit head, and its token subset unless `keep_head`
+    /// (DFlash2 reads it).  Its K/V pool and its experts' places stay (a saved state and the tier's layout hold them).
+    /// The VRAM given back.
+    uint64_t release_mtp(bool keep_head);
     /// The most drafts a window can check (spec_step's `ext`): the recurrent states' copies, else a window less one
     int window_drafts() const {
         const PlainModel& t = tail();
@@ -472,7 +502,19 @@ public:
     const std::vector<int32_t>& pending_drafts() const { return tail().drafts_; }
     /// After prompt() (or the windows of a prompt): `first`, the token picked after it, at position `pos`, the next
     /// window's first token; the MTP layer reads it and drafts the tokens after it.
-    bool spec_start(int32_t first, int64_t pos, std::string& err);
+    /// `no_mtp`: an outside drafter (DFlash2) drafts this request: the MTP layer makes no draft.
+    bool spec_start(int32_t first, int64_t pos, std::string& err, bool no_mtp = false);
+    /// The MTP layer's drafts a window from now on, 1 .. the load's (the start's measurement keeps a window)
+    void set_mtp_drafts(int k) {
+        PlainModel& t = tail();
+        if (t.n_mtp_load_ < 0) t.n_mtp_load_ = t.n_mtp_;
+        t.n_mtp_ = std::clamp(k, std::min(1, t.n_mtp_load_), t.n_mtp_load_);
+    }
+    /// The start's measurement of the drafters runs: no routing is counted, no expert moves, no one-time choice is
+    /// made on its windows (a start without it makes them on the first request's)
+    void set_frozen(bool on) { root_->frozen_ = on; }
+    /// A token's embedding row on the host (n_embd floats; DFlash2's anchor and mask rows)
+    bool embed_token(int32_t tok, float* dst) const { return embed(tok, -1, dst); }
     /// --pipeline-windows 2: a guessed window the first stage computed for a next window that will not come (the
     /// request ended) is given back, so the state holds the accepted tokens only.  Before the next use of the state.
     bool spec_end(std::string& err);
@@ -485,9 +527,14 @@ public:
     /// checks instead of the MTP layer's, where they start as those do (or there are none) and the window rule
     /// (Qwen3.8-Flash-Next's DraftPolicy::choose, from the measured window costs and the lookup's acceptance by match
     /// length) expects more tokens a ms from them, as many of them as it takes.
+    /// `ext_only`: the window is the pending token and `ext` as given (an outside drafter's, DFlash2's: its window rule
+    /// chose them) and the MTP layer makes no draft after it; the committed rows' taps are tap_dev()'s rows 0 ..
+    /// n_emit - 1.
     bool spec_step(const std::vector<int32_t>& stop, int64_t limit, int32_t* emitted, int& n_emit, float* logits,
                    std::string& err, const int32_t* follow = nullptr, const int32_t* ext = nullptr, int n_ext = 0,
-                   int match = 0);
+                   int match = 0, bool ext_only = false);
+    /// The position of the pending token (spec_start's, then each window's).
+    int64_t pending_pos() const { return tail().cur_pos_; }
     /// The windows and the drafts they checked and accepted since the load, for the report.
     int64_t spec_windows() const { return tail().spec_windows_; }
     int64_t spec_drafted() const { return tail().spec_drafted_; }
@@ -680,6 +727,10 @@ private:
     /// The control vector after block b's FFN write, on T rows of x (kernels/cvec.hpp), where it covers the layer
     void steer(const Block& b, int64_t T, float* x, strata::gpu::Stream cs) const;
     void tap_block(const Block& b, int T, strata::gpu::Stream cs);
+    /// A tapped layer's output rows (R: [T][hc][n_embd]) into the window's taps (`window`) or the prompt's staging
+    void tap_rows(int64_t l, const float* R, int hc, int64_t T, int64_t p0, bool window, strata::gpu::Stream cs);
+    /// The prompt's staging handed on after a chunk or a window of rows from p0 (prompt_taps_)
+    bool prompt_taps_deliver(const float* staging, int64_t T, int64_t p0, strata::gpu::Stream cs, std::string& err);
     /// One stage's part of forward_slots
     bool stage_slots(const int32_t* tokens, const int* slot, const int64_t* pos, const strata::kernels::SamplerParams* sp,
                      int T, const float* hand_in, std::string& err);
@@ -1134,6 +1185,14 @@ private:
     std::vector<int> tap_req_, tap_local_;   ///< set_taps: the DFlash2 drafter's tap layers (this stage's share)
     std::vector<int> tap_slot_;        ///< layer -> its tap index (-1: not tapped)
     float* tap_dev_ = nullptr;         ///< [max_t][ntap][n_embd] window taps (null: none)
+    bool taps_on_ = true;              ///< taps_off: nothing is written to them
+    float* ptap_dev_ = nullptr;        ///< [ptap_cap_][ntap][n_embd] the prompt's taps (set_prompt_taps)
+    int64_t ptap_cap_ = 0, ptap_first_ = 0;
+    std::function<bool(const float*, int64_t, int64_t, std::string&)> prompt_taps_;
+    int n_snap_load_ = -1;             ///< the copies the load made (set_window_drafts frees only those after them)
+    int n_mtp_load_ = -1;              ///< the MTP layer's drafts the load set (set_mtp_drafts goes no higher)
+    size_t mtp_allocs_[2] = {0, 0};    ///< allocs_[0] .. [1]: the MTP layer's own weights (release_mtp)
+    bool frozen_ = false;              ///< set_frozen (the root's)
     std::vector<std::vector<float*>> gdn_snap_, conv_snap_;
     /// --pipeline-windows 2, a stage before the last: the rows' copies of the window before a guess and the state that
     /// window left (per GDN block), whether the copies are there, and (the last stage's) the guessed window the first
