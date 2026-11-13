@@ -43,6 +43,7 @@ inline bool i8_expert_class_default(int state, const char* gcn, bool mmq_free = 
 /// where nothing faster takes the layer: R9700, 2,048 tokens, fused 1,144.6 ms against int8 1,624.5); it is the order prefill.cpp's `i8_l` condition has.
 inline bool i8_order_allows(bool fused_takes, bool staged_takes) { return !fused_takes && !staged_takes; }
 
+inline bool i8_expert_takes(int state, const char* gcn, int64_t group_entries, bool supported);   // (defined below)
 /// The whole question for one layer of one chunk, as the pure rule (the engine asks the two halves where it has them: i8_order_allows in prefill.cpp, i8_expert_takes in iq_kernels.cu).
 inline bool i8_layer_takes(int raw_state, bool mmq_free, const char* gcn, int64_t group_entries, bool supported, bool fused_takes, bool staged_takes) {
     return i8_order_allows(fused_takes, staged_takes) && i8_expert_takes(i8_switch_effective(raw_state, mmq_free), gcn, group_entries, supported);
