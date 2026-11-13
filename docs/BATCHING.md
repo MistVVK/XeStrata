@@ -141,11 +141,12 @@ These settings make the comparison exact:
 With the default settings the outputs stay coherent but drift apart after some tokens, as two solo runs whose windows differ can.
 
 Sampled requests (temperature, top_p, top_k, min_p, seed) are drawn row by row with the solo window's counter-based draw (Philox(seed, position)).
+The repetition / frequency / presence penalties and the logit bias are the request's own as well: the slot stages its reply's tail (from the token its reply began at) before each window, and its rows are drawn with the history a solo window gives them (a request that continues an earlier leg names where its reply began, `pen_from`).
+A plain greedy slot with no penalty and no bias keeps the window's argmax token, as before.
 
 ## Limits (for now)
 
 - Batch windows carry no MTP drafts: a conversation in a slot decodes one token per window (the solo path keeps its drafts, which is why a request alone is not put in a slot, and goes back to it when left alone).
-- Repetition / frequency / presence penalties are not applied in batch windows.
 - A prompt shorter than one chunk is read in one piece (the slots wait for it); a read gives way only at a chunk boundary, and not for pictures.
 - Admissions are one at a time: two new long prompts are read one after the other.
 - The slot sessions take VRAM (above) and, with KV streaming, pinned RAM.

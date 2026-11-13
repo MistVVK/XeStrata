@@ -101,4 +101,39 @@ inline size_t penalty_window_from(size_t consumed_at_decode_start, bool counts_p
     return counts_prompt ? 0 : consumed_at_decode_start;
 }
 
+// The penalty-history rows of a BATCH window, on the host: row t of the window fed `tokens[t]` to slot `rows[t]`,
+// and its row of `out` (S rows of `h` slots) is the last `h` tokens of that slot's reply tail (`tails[slot]` with
+// `n_tails[slot]` tokens: what the slot's session consumed since the reply began, the fed-back head not yet in it)
+// followed by the tokens this window's rows of the same slot fed up to and including row t, most recent LAST, -1 in
+// the unused front slots.  A slot may hold several rows (--batch-mtp's drafts).  This is exactly what `penalty_rows`
+// gives a solo window, slot by slot, so a request's picks are the ones it would have made alone.
+inline void slot_penalty_rows(const int* rows, const int32_t* tokens, int S, const int32_t* const* tails,
+                              const int64_t* n_tails, int h, int32_t* out) {
+    for (int t = 0; t < S; ++t) {
+        int32_t* row = out + (size_t) t * (size_t) h;
+        const int slot = rows[t];
+        const int32_t* tail = tails != nullptr ? tails[slot] : nullptr;
+        const int64_t n_tail = tail != nullptr ? n_tails[slot] : 0;
+        int64_t in_window = 0;                                     // this window's rows of the slot, up to t
+        for (int u = 0; u <= t; ++u) in_window += rows[u] == slot;
+        const int64_t avail = n_tail + in_window;
+        const int take = (int) std::min<int64_t>(h, avail);
+        std::fill(row, row + (h - take), -1);
+        for (int j = 0; j < take; ++j) {
+            const int64_t i = avail - take + j;                     // index into (the tail, the slot's window tokens)
+            if (i < n_tail) { row[h - take + j] = tail[i]; continue; }
+            int64_t k = i - n_tail, seen = 0;
+            for (int u = 0; u <= t; ++u)
+                if (rows[u] == slot) {
+                    if (seen == k) { row[h - take + j] = tokens[u]; break; }
+                    ++seen;
+                }
+        }
+    }
+}
+
+// The widest penalty window a history row keeps, the engine's own cap (serve's kPenaltyWindowCap in generate.cpp):
+// a longer penalty_last_n is counted over the last this many tokens.
+constexpr int kPenaltyWindowCap = 4096;
+
 }  // namespace strata::kernels
