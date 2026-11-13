@@ -286,6 +286,59 @@ for _key, _per_sm in _INT3_ALLOWED.items():
         _old = _merged.get(_sm, (0, 0))
         _merged[_sm] = (max(_stack, _old[0]), max(_local, _old[1]))
 
+# sm_89 (Ada: the RTX 40 cards), measured 11-13 on a CUDA 13.2 build of d6f9f68f9 (batch 15, sm_89-real; cuobjdump 13.2 reading libstrata_kernels.a):
+# 432 instances in these 40 kernels use stack, none uses .local.  36 of the keys equal the sm_86 allowance above to the byte, or are below it; gemm4_rows_kernel,
+# gemm_rows_kernel, i8_kernel and rope_table_inv_kernel have no sm_86 entry (their stack is the same size on sm_86).  The kernels are the same device code on
+# every architecture (there is no per-architecture variant of them); the sm_89 keys were only missing.  Same shape and rule as the entries above: the
+# measured maximum, so any growth fails.
+_SM89_ALLOWED = {
+    "strata::kernels::native_gu_lds_kernel": {"sm_89": (8, 0)},
+    "strata::kernels::route_resident_k": {"sm_89": (40, 0)},
+    "strata::kernels::{anonymous}::attn_chunk_kernel": {"sm_89": (384, 0)},
+    "strata::kernels::{anonymous}::attn_chunk_kernel_pre75": {"sm_89": (8, 0)},
+    "strata::kernels::{anonymous}::attn_chunk_slots_kernel": {"sm_89": (384, 0)},
+    "strata::kernels::{anonymous}::block_scores_simt_kernel": {"sm_89": (8, 0)},
+    "strata::kernels::{anonymous}::block_topk_reg_kernel": {"sm_89": (96, 0)},
+    "strata::kernels::{anonymous}::copy_kernel": {"sm_89": (88, 0)},
+    "strata::kernels::{anonymous}::dequant_gu_kernel": {"sm_89": (32, 0)},
+    "strata::kernels::{anonymous}::dequant_kernel": {"sm_89": (64, 0)},
+    "strata::kernels::{anonymous}::expdec_down_kernel": {"sm_89": (288, 0)},
+    "strata::kernels::{anonymous}::expdec_gu_kernel": {"sm_89": (56, 0)},
+    "strata::kernels::{anonymous}::gdn_step_commit_kernel": {"sm_89": (8, 0)},
+    "strata::kernels::{anonymous}::gemm4_rows_kernel": {"sm_89": (8, 0)},
+    "strata::kernels::{anonymous}::gemm_iq_f16_grouped_kernel": {"sm_89": (32, 0)},
+    "strata::kernels::{anonymous}::gemm_rows_kernel": {"sm_89": (40, 0)},
+    "strata::kernels::{anonymous}::gr_down_multi_kernel": {"sm_89": (8, 0)},
+    "strata::kernels::{anonymous}::gr_down_q8_fast_kernel": {"sm_89": (8, 0)},
+    "strata::kernels::{anonymous}::gr_down_q8_kernel": {"sm_89": (16, 0)},
+    "strata::kernels::{anonymous}::gr_down_staged_kernel": {"sm_89": (16, 0)},
+    "strata::kernels::{anonymous}::gr_down_v3_kernel": {"sm_89": (8, 0)},
+    "strata::kernels::{anonymous}::gr_up_q8_fast_kernel": {"sm_89": (8, 0)},
+    "strata::kernels::{anonymous}::hcp::persist_kernel": {"sm_89": (16, 0)},
+    "strata::kernels::{anonymous}::i8_kernel": {"sm_89": (8, 0)},
+    "strata::kernels::{anonymous}::native_down_kernel": {"sm_89": (8, 0)},
+    "strata::kernels::{anonymous}::native_down_multi_kernel": {"sm_89": (64, 0)},
+    "strata::kernels::{anonymous}::native_gu_kernel": {"sm_89": (8, 0)},
+    "strata::kernels::{anonymous}::native_gu_multi_kernel": {"sm_89": (144, 0)},
+    "strata::kernels::{anonymous}::native_mmvq_il_pf_kernel": {"sm_89": (1336, 0)},
+    "strata::kernels::{anonymous}::pair_kernel": {"sm_89": (16, 0)},
+    "strata::kernels::{anonymous}::prompt_attn_kernel": {"sm_89": (8, 0)},
+    "strata::kernels::{anonymous}::rope_table_inv_kernel": {"sm_89": (32, 0)},
+    "strata::kernels::{anonymous}::rope_table_kernel": {"sm_89": (32, 0)},
+    "strata::kernels::{anonymous}::route": {"sm_89": (64, 0)},
+    "strata::kernels::{anonymous}::route_multi": {"sm_89": (64, 0)},
+    "strata::kernels::{anonymous}::route_prior_k": {"sm_89": (64, 0)},
+    "strata::kernels::{anonymous}::route_topk": {"sm_89": (32, 0)},
+    "strata::kernels::{anonymous}::s26_gu_l_kernel": {"sm_89": (32, 0)},
+    "strata::kernels::{anonymous}::s27_down_kernel": {"sm_89": (16, 0)},
+    "strata::kernels::{anonymous}::s27_gu_kernel": {"sm_89": (32, 0)},
+}
+for _key, _per_sm in _SM89_ALLOWED.items():
+    _merged = ALLOWED.setdefault(_key, {})
+    for _sm, (_stack, _local) in _per_sm.items():
+        _old = _merged.get(_sm, (0, 0))
+        _merged[_sm] = (max(_stack, _old[0]), max(_local, _old[1]))
+
 
 
 
