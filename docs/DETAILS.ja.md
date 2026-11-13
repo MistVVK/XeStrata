@@ -823,6 +823,7 @@ xestrata --setup --gguf ~/models/My-Model-Q4_K_M-00001-of-00003.gguf --name my-m
 - **入れられるもの**: Qwen3.8-Flash-Next（`qwen4exp`）と、ほかのモデルと同じアーキテクチャのもの（`qwen35moe`: Ornith-1.5・Qwen3.6-35B-A3B、`qwen35`: Qwen3.5 の 9B・2B・0.8B、`qwen3moe`: llm-jp-4.1、`glm5-next`: GLM-5.3-Flash）。
 - **渡すもの**: `.gguf` のファイル（分かれたモデルならどれか 1 つ。全部を同じフォルダーに置きます）か、1 つのモデルだけがあるフォルダー。`--name` を省くとファイルの名前を使います。
 - **確かめること**: setup はヘッダーを読み、エンジンに動かせるかを聞きます（`xestrata-engine --check-model <ファイル>`。GPU は開きません）。
+  エンジンがどの形にコンパイルされているかは `xestrata-engine --geometry` が 1 行で答えます（既定は `flash_next`。GPU は開きません）。
   ヘッダーが読めないとき（途中で切れたファイルを含む）、別のアーキテクチャのとき、エキスパートや PLE の表がエンジンのカーネルにない形式のときは、層ごとの理由を出して止まり、何も作りません。
 - **入るもの**: `custom-<名前>` という名前で、設定（`xestrata-custom-<名前>.json`）とパックを作ります。setup の大きさとは別なので、公式の版を上書きしません。
   起動、`--bench`、`--calibrate` では `--model custom-<名前>` を指定します。
