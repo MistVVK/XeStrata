@@ -490,6 +490,14 @@ void df2_attention(const float* q, const float* kring, const float* vring, const
 // of one launch share the activations; each runs as its own kernel (the fused launch is a later speed idea).
 namespace {
 
+// The paired form's sub-group is 16 wide.  NVIDIA's device compile takes 32 only and warns of any other number, and
+// df2_gemm never picks the pair where the device does not report 16, so that compile names 32.
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__NVPTX__)
+#define DF2_GEMM_SG(PAIR) [[sycl::reqd_sub_group_size(32)]]
+#else
+#define DF2_GEMM_SG(PAIR) [[sycl::reqd_sub_group_size((PAIR) ? 16 : 32)]]
+#endif
+
 template <int NC, bool Q4, bool PAIR16>
 void gemm_launch(sycl::queue& qu, const void* w, const uint16_t* dpl, float* y, int n_out, int n_in,
                  const int8_t* xq, const float* xd) {
@@ -497,7 +505,7 @@ void gemm_launch(sycl::queue& qu, const void* w, const uint16_t* dpl, float* y, 
     qu.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> halves(PAIR16 ? NC * WARP : 1, h);
         h.parallel_for(sycl::nd_range<1>((size_t) n_out * WARP, WARP),
-                       [=](nd_item<1> it) [[sycl::reqd_sub_group_size(PAIR16 ? 16 : 32)]] {
+                       [=](nd_item<1> it) DF2_GEMM_SG(PAIR16) {
         const sycl::sub_group sg = it.get_sub_group();
         const int row = (int) it.get_group(0), lane = (int) it.get_local_id(0);
         const int g = row / 8, r = row % 8;
