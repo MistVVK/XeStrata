@@ -11,7 +11,7 @@ from serve import frontend
 
 class ReferenceParser(frontend.OutputParser):
     def _wrapped_call_end(self):
-        return frontend.call_end(self.buf)
+        return frontend.call_end(self.buf, self._final)
 
 
 def events_without_ids(events):
@@ -56,6 +56,7 @@ class CallScanTests(unittest.TestCase):
                 for char in "</parameter></function></tool_call>":
                     parser.feed(char)
                 self.assertEqual(walk.call_count, before + 1)
+                parser.finish()      # #4701: a closed call waits for what might follow it; the turn's end settles it
                 self.assertEqual(parser._call_end_checked, 0)
 
 
