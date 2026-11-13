@@ -557,6 +557,7 @@ if(STRATA_ENABLE_XE)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
                                    src/core/native_dense.cpp src/core/verify.cpp src/core/moe_window.cpp
+                                   src/core/latent.cpp
                                    src/core/plain_model.cpp src/core/plain_glm5.cpp src/core/pcie_split.cpp
                                    src/core/mtp.cpp src/core/dflash2.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
@@ -1790,6 +1791,11 @@ if(STRATA_NATIVE_EXPERTS)
     add_executable(dequant_q5_1_test tests/core/dequant_q5_1_test.cpp)
     target_link_libraries(dequant_q5_1_test PRIVATE strata_artifact ggml-base)
     add_test(NAME dequant_q5_1_test COMMAND dequant_q5_1_test)
+    # the latent MoE pack's readers (Edge0's D/U, A, labels, v6 manifest, column scales): synthetic packs and the
+    # real Edge0 manifests, the layouts against ggml's own.  No model, no GPU, no engine (the reader compiles in)
+    add_executable(latent_pack_test tests/core/latent_pack_test.cpp src/core/latent.cpp)
+    target_link_libraries(latent_pack_test PRIVATE strata_artifact ggml-base)
+    add_test(NAME latent_pack_test COMMAND latent_pack_test)
     # the AVX-2 expert kernels' variants (iq_avx2.cpp, q2_avx2.cpp: gathered, AVX-VNNI) bit for bit against each other
     # at 1..8 tokens and against ggml-cpu's dot, on random blocks (upstream a7336175, b211ba17); --bench: ms per expert
     add_executable(iq_avx2_parity src/kernels/cpu/iq_avx2_parity.cpp)
