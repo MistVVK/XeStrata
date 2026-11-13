@@ -81,6 +81,9 @@ int main() {
         CHECK(strata::prefill::own_only_recorded().empty());
         CHECK(!strata::prefill::own_only_user_named("STRATA_PF_FUSED", nullptr));
         CHECK(strata::prefill::own_only_user_named("STRATA_PF_FUSED", "1"));   // no record: the user's
+        CHECK(!strata::prefill::own_only_build());                              // not an engine without MMQ until its initialiser says so
+        strata::prefill::own_only_build_flag() = true;
+        CHECK(strata::prefill::own_only_build());
     }
     if (failed) {
         std::fprintf(stderr, "own_only_switches_test: %d check(s) failed\n", failed);

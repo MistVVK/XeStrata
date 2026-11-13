@@ -203,6 +203,7 @@ namespace {
 // (the list lives in own_only_switches.hpp: the start-up rules of generate.cpp ask it which names the build set and which the user did)
 std::vector<std::string>& own_only_switches() { return strata::prefill::own_only_recorded(); }
 const bool g_own_only_defaults = [] {
+    strata::prefill::own_only_build_flag() = true;      // (the engine's start-up rules ask own_only_build(): a build without MMQ has no MMQ kernels to go back to)
     strata::kernels::native_expert_i8_set_mmq_free();   // the int8 expert kernels are the default prompt-expert kernels here (i8_expert_rule.hpp, i8_switch_effective)
 #if defined(STRATA_USE_HIP) || defined(__HIPCC__)
     // (gfx12 only: every one of these is read behind the device's own gfx12 check, moe_fused_iq.cu q8d_hip_requested .. q6k_hip_requested, so a gfx11

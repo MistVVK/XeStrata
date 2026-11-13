@@ -38,6 +38,13 @@ inline std::vector<std::string>& own_only_recorded() {
     return set;
 }
 
+/// This process is an engine built without llama.cpp's MMQ (the start-up initialiser in prefill.cpp says so, whatever the user had set).  False in every other build.
+inline bool& own_only_build_flag() {
+    static bool v = false;
+    return v;
+}
+inline bool own_only_build() { return own_only_build_flag(); }
+
 /// Sets every default switch that `get` says is not in the environment (get(name) == nullptr: a name that is there, either value, stays the user's) through
 /// `set(name)`, and appends the names it set to `recorded`.  `get` and `set` are getenv and setenv("1", 0) in the engine and a fake environment in the test.
 template <class Get, class Set>
