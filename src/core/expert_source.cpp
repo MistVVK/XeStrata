@@ -16,6 +16,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/kernels/window_limits.hpp"
 #include "strata/kernels/cpu/kq_avx2.hpp"
 
 #include "strata/core/gpu.hpp"
@@ -2795,10 +2796,11 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 
 namespace {
 // the verify window's per-entry tables in `expert_pool_dispatch_multi` (`kind`, `distinct`, `first_of`) are fixed
-// arrays of this many entries: MAXT tokens of the model's 10 routed experts must fit, and a larger k is refused at
-// run time rather than written past them (upstream 64cfe3c)
-constexpr int64_t kMaxWindowEntries = 128;
-static_assert((int64_t) strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
+// arrays of this many entries: a window's rows (kWindowMaxT) of the model's 10 routed experts must fit, and a larger k
+// is refused at run time rather than written past them (upstream 64cfe3c; 256 for the 16-row window, 9d3c8c366)
+constexpr int64_t kMaxWindowEntries = 256;
+static_assert((int64_t) strata::kernels::kWindowMaxT * 10 <= kMaxWindowEntries,
+              "a verify window's entries overflow the tables");
 }  // namespace
 
 namespace {
@@ -2999,9 +3001,10 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                                 float* out) {
     using namespace strata::kernels::cpu;
     if (d.failed) return;
-    if (n_tok < 1 || n_tok > MAXT) {
+    // (a window of more than MAXT tokens: an expert's tokens go to jobs of at most MAXT, as the CPU kernels take)
+    if (n_tok < 1 || n_tok > strata::kernels::kWindowMaxT) {
         d.failed = true;
-        d.fail = "a verify window has more tokens than the multi-token expert kernel takes";
+        d.fail = "a verify window has more tokens than the expert pool takes";
         d.fail_layer = d.layers;
         return;
     }
@@ -3012,14 +3015,15 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         return;
     }
     if (d.lookahead) d.lookahead->submit(d.layers, x_f, n_tok, d.host_res);
-    if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) MAXT);
+    if ((int64_t) d.act_multi.size() < n_tok) d.act_multi.resize((size_t) std::max<int64_t>(MAXT, n_tok));
     const ExpertLayout& lay = expert_layout();
     const bool native = lay.native;
     // the activation width: a native layer's own (models other than Qwen3.8), else the S2 kernels' compiled H
     const int64_t W = native ? lay.fmt[(size_t) d.layers].n_embd : (int64_t) H;
-    if (native && d.nact_multi.size() < (size_t) MAXT) d.nact_multi.resize((size_t) MAXT);
+    if (native && d.nact_multi.size() < (size_t) std::max<int64_t>(MAXT, n_tok))
+        d.nact_multi.resize((size_t) std::max<int64_t>(MAXT, n_tok));
     if (d.job_of.size() != (size_t) d.n_expert) d.job_of.assign((size_t) d.n_expert, (int16_t) -1);
-    if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (MAXT * k));
+    if (d.jobs_multi.size() < (size_t) (n_tok * k)) d.jobs_multi.resize((size_t) (std::max<int64_t>(MAXT, n_tok) * k));
     static const bool ptrace = strata::env_get("POOL_TRACE") != nullptr;
     auto pt = [&](const char* what, long long a = -1) {
         if (ptrace) { std::fprintf(stderr, "pool trace: layer %lld %s %lld\n", (long long) d.layers, what, a); std::fflush(stderr); }
@@ -3286,10 +3290,12 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             int16_t& jo = d.job_of[(size_t) e];
             // #45: a job takes MAXT tokens, and an id routed twice within a token (the same expert in two of its k
             // slots) can give one expert more: a ninth wrote past act/out/nact into fmt and the pool's per-job arrays,
-            // and the CPU pool faulted.  The expert gets another job then (jobs_multi has n_tok * k of them).
+            // and the CPU pool faulted.  The expert gets another job then (jobs_multi has n_tok * k of them); so does
+            // an expert that more than MAXT rows of a wider window route to (each token's rows are its own: the split
+            // changes no value, the blob is read once more).
             if (jo >= 0 && d.jobs_multi[(size_t) jo].nt >= MAXT) {
                 static std::atomic<bool> said{false};
-                if (!said.exchange(true))
+                if (n_tok <= MAXT && !said.exchange(true))
                     std::fprintf(stderr, "xestrata: expert %lld of layer %lld is routed more than %d times in a window "
                                          "of %lld tokens (an id repeated within a token); it is computed in two "
                                          "jobs (#45, said once)\n",
