@@ -8068,6 +8068,11 @@ int main(int argc, char** argv) {
                 }
             }
             if (!e.empty() || (use_mtp && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
+            if (df2_loaded) {
+                std::vector<int32_t> tokens((size_t) T);
+                for (int64_t t = 0; t < T; ++t) tokens[(size_t) t] = (int32_t) cur[(size_t) (p0 + t)];
+                df2.note_rows(tokens.data(), T, p0);
+            }
             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
             const int64_t done = p0 + T;
             pp_reached = done;
