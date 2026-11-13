@@ -142,6 +142,10 @@ struct CostFile {
 bool read_cost_file(const std::string& path, const std::string& key, CostFile& out, std::string& why);
 /// Writes the file whole or not at all (a temporary file beside it, then renamed over it); makes the folder.  Never throws.
 bool write_cost_file(const std::string& path, const CostFile& f, std::string& why);
+/// A table made by the one-start learning stretch (STRATA_DRAFT_COSTS_LEARN=1): every size of it was measured by that stretch, so all of them are marked real and the
+/// next start uses the table at once (DraftPolicy::start_calibration holds back only a table with sizes not yet marked real, and the file is then not rewritten).  The
+/// costs are rounded to the 3 decimals the file keeps, so the start that learned the table and the start that reads it use the same numbers.  Not used by the passive path.
+void mark_learned_real(CostFile& cf);
 
 class DraftPolicy {
 public:
