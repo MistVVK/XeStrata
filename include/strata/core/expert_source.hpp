@@ -53,6 +53,7 @@ struct ExpertLayout;
 namespace strata::core {
 
 class RemoteExperts;
+class LatentDense;
 struct LoadStats;
 
 namespace detail {
@@ -446,6 +447,20 @@ struct ExpertDispatch {
 
     std::vector<strata::kernels::cpu::ExpertJob> jobs;
     strata::kernels::cpu::ActQ act;
+
+    // ---- the latent MoE (Edge0): the CPU share runs the A-blob experts on the host over the D stage's rows
+    // (the window computed D on the GPU and published them through the doorbell), then either hands its q8_1
+    // rows of h to the GPU's U (lat_u_gpu, the mapped out buffer holds them) or computes U itself.
+    bool latent = false;
+    int64_t lat_H = 0, lat_ELL = 0, lat_I = 0;
+    int lat_G = 8, lat_E = 0;
+    int lat_fmt = 8;                 ///< the D/U pack's format (8 Q8_0 / 4 Q4_0)
+    bool lat_u_gpu = true;           ///< XESTRATA_LATENT_U_GPU: the CPU share's U on the GPU
+    const int32_t* lat_labels = nullptr;   ///< [layers * E] group labels, host
+    const float* lat_xl = nullptr;         ///< mapped: the D stage's f32 rows (row t*G + g)
+    const uint32_t* lat_xlseq = nullptr;   ///< mapped: the D stage's doorbell (layer + 1)
+    const uint8_t* lat_act0 = nullptr;     ///< mapped: the D rows as Q8_0, GPU-made (nullptr: host quantizes)
+    const strata::core::LatentDense* lat_dense = nullptr;   ///< the D/U file, mapped (the CPU U reads it)
     /// Plan v0.3 P6 verify window: one quantized activation per token, the multi-token jobs, and the expert ->
     /// job map (reset after every layer).
     std::vector<strata::kernels::cpu::ActQ> act_multi;
