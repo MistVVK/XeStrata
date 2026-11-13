@@ -205,9 +205,10 @@ void linkless_gpu_adapter() {
 namespace {
 
 // Whether a drafter of this run takes windows of more than 8 rows, so that under --wide-window auto the model sizes its
-// windows for 16 (window_rows_for) before it loads.  No drafter does yet.
-bool wants_wide_window(const strata::core::PlainOptions& opt) {
+// windows for 16 (window_rows_for) before it loads (`serve`: the run serves requests).  No drafter does yet.
+bool wants_wide_window(const strata::core::PlainOptions& opt, bool serve) {
     (void) opt;
+    (void) serve;
     return false;
 }
 
@@ -2802,7 +2803,7 @@ int plain_main(int argc, char** argv) {
     }
     // the window's rows (window_rows.hpp), before anything is sized for them: --max-t, else 16 with --wide-window on or
     // under auto where a drafter of this run takes wide windows, else the 8 a window always had
-    if (!max_t_given) opt.max_t = strata::core::window_rows_for(wants_wide_window(opt));
+    if (!max_t_given) opt.max_t = strata::core::window_rows_for(wants_wide_window(opt, serve));
     // the last window's drafts and the MTP layer's cells reach a window past the last token
     if ((int64_t) prompt.size() + n_new + opt.max_t > opt.max_cells)
         opt.max_cells = (int64_t) prompt.size() + n_new + opt.max_t;
