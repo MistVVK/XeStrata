@@ -529,13 +529,19 @@ static int check_synthetic(const std::string& arg, void* s, bool had = false) {
     std::normal_distribution<float> nd(0.f, 0.05f);
     std::vector<float> w((size_t) FF * H);
     std::vector<uint8_t> blob(f.bytes);
+    // the quantizer's importance matrix for the types that require one (IQ2_XXS, IQ2_XS, IQ1_S): ggml asserts on a
+    // NULL there.  All 1.0: the weights are random, so every column matters the same
+    const std::vector<float> imatrix((size_t) (H > FF ? H : FF), 1.0f);
+    auto q = [&](ggml_type t, const float* src, void* dst, int64_t rows, int64_t cols) {
+        ggml_quantize_chunk(t, src, dst, 0, rows, cols, ggml_quantize_requires_imatrix(t) ? imatrix.data() : nullptr);
+    };
     for (int part = 0; part < 2; ++part) {   // gate, up
         for (auto& v : w) v = nd(rng);
-        ggml_quantize_chunk((ggml_type) gu, w.data(), blob.data() + (size_t) part * f.up_off, 0, FF, H, nullptr);
+        q((ggml_type) gu, w.data(), blob.data() + (size_t) part * f.up_off, FF, H);
     }
     std::vector<float> wd((size_t) H * FF);
     for (auto& v : wd) v = nd(rng);
-    ggml_quantize_chunk((ggml_type) dt, wd.data(), blob.data() + f.down_off, 0, H, FF, nullptr);
+    q((ggml_type) dt, wd.data(), blob.data() + f.down_off, H, FF);
     int failures = check_blob(had ? "hadamard" : "synthetic", 0, blob, f, s);
     // the GPU dequantizers against ggml's to_float, every bit
     namespace par = strata::parity;
