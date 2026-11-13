@@ -25,6 +25,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -38,12 +39,14 @@
 namespace strata::kernels::cpu {
 
 namespace {
-// STRATA_POOL_UMWAIT=<TSC cycles> (opt-in, upstream caf1856b, 54b61dbb): a parked worker waits with UMONITOR/UMWAIT on
-// the epoch's cache line instead of spinning on _mm_pause.  It wakes when the host publishes (a write to that line) or
-// after the cycles, in the light C0.1 state; on a laptop whose CPU and GPU share a power budget the spin's power goes
-// to the GPU.  0, unset, or a CPU without WAITPKG (CPUID.7.0:ECX bit 5): the spin, unchanged.
+// STRATA_POOL_UMWAIT (upstream caf1856b, 54b61dbb): a parked worker waits with UMONITOR/UMWAIT on the epoch's cache
+// line instead of spinning on _mm_pause.  It wakes when the host publishes (a write to that line) or after the cycles,
+// in the light C0.1 state; on a laptop whose CPU and GPU share a power budget the spin's power goes to the GPU.
+// 0 forces the spin; 1 takes UMWAIT with the default cycles; a larger number is the cycle count; unset/auto decides at
+// the first pool from the wake both ways cost (below), and a CPU without WAITPKG (CPUID.7.0:ECX bit 5) always spins.
 // STRATA_POOL_UMWAIT_C02=1: the deeper C0.2 state; STRATA_POOL_UMWAIT_ESC=<cycles>: C0.1 first, C0.2 after.
 // The instructions are compiled for this one function (clang and GCC, on Linux and Windows), not for the file.
+constexpr uint64_t kUmwaitCycles = 200000;   // some 80 us: a park much shorter than that is a spin's work anyway
 bool cpu_waitpkg() {
     unsigned r[4] = {0, 0, 0, 0};
 #if defined(_MSC_VER)
@@ -58,19 +61,6 @@ bool cpu_waitpkg() {
     __cpuid_count(7, 0, r[0], r[1], r[2], r[3]);
 #endif
     return ((r[2] >> 5) & 1u) != 0;
-}
-uint64_t umwait_cycles() {
-    static const uint64_t c = [] {
-        const char* e = strata::env_get("POOL_UMWAIT");
-        if (e == nullptr || std::strtoll(e, nullptr, 10) <= 0) return (uint64_t) 0;
-        if (!cpu_waitpkg()) {
-            std::fprintf(stderr, "xestrata: XESTRATA_POOL_UMWAIT: this CPU has no WAITPKG, the workers spin\n");
-            return (uint64_t) 0;
-        }
-        std::fprintf(stderr, "xestrata: XESTRATA_POOL_UMWAIT: parked workers wait with UMWAIT (%lld cycles)\n", std::strtoll(e, nullptr, 10));
-        return (uint64_t) std::strtoll(e, nullptr, 10);
-    }();
-    return c;
 }
 unsigned umwait_state() {   // 1 = C0.1 (light), 0 = C0.2
     static const unsigned s = [] { const char* e = strata::env_get("POOL_UMWAIT_C02"); return e && *e == '1' ? 0u : 1u; }();
@@ -94,6 +84,68 @@ bool umwait_unless_moved(const std::atomic<uint32_t>& epoch, uint32_t seen, unsi
     return true;
 }
 
+// The wake of a worker parked by each way, in turn: the median of 64 publishes, in microseconds.  The clock reads
+// are the caller's; the thread waits as a worker does - a pause loop, or UMWAIT on the epoch's line.
+double umwait_wake_us(uint64_t cycles, bool use) {
+    std::atomic<uint32_t> epoch{0};
+    std::atomic<uint64_t> woken{0};
+    std::atomic<bool> stop{false};
+    std::thread th([&] {
+        uint32_t s = 0;
+        while (!stop.load(std::memory_order_relaxed)) {
+            if (use) {
+                while (epoch.load(std::memory_order_acquire) == s && !stop.load(std::memory_order_relaxed))
+                    if (!umwait_unless_moved(epoch, s, umwait_state(), __rdtsc() + cycles)) break;
+            } else {
+                while (epoch.load(std::memory_order_acquire) == s && !stop.load(std::memory_order_relaxed)) _mm_pause();
+            }
+            s = epoch.load(std::memory_order_acquire);
+            woken.fetch_add(1, std::memory_order_release);
+        }
+    });
+    double one[64];
+    uint64_t n = 0;
+    for (int rep = 0; rep < 64; ++rep) {
+        while (woken.load(std::memory_order_acquire) < n) _mm_pause();
+        const auto t0 = std::chrono::steady_clock::now();
+        epoch.fetch_add(1, std::memory_order_release);
+        while (woken.load(std::memory_order_acquire) == n) _mm_pause();
+        one[rep] = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        ++n;
+    }
+    stop.store(true, std::memory_order_relaxed);
+    epoch.fetch_add(1, std::memory_order_release);
+    th.join();
+    std::nth_element(one, one + 32, one + 64);
+    return one[32];
+}
+
+uint64_t umwait_cycles() {
+    static const uint64_t c = [] {
+        const char* e = strata::env_get("POOL_UMWAIT");
+        const bool aut = e == nullptr || e[0] == '\0' || std::strcmp(e, "auto") == 0;
+        const long long asked = aut ? 0 : std::strtoll(e, nullptr, 10);
+        if (!aut && asked <= 0) return (uint64_t) 0;   // "0": the spin
+        if (!cpu_waitpkg()) {
+            if (!aut) std::fprintf(stderr, "xestrata: XESTRATA_POOL_UMWAIT: this CPU has no WAITPKG, the workers spin\n");
+            return (uint64_t) 0;
+        }
+        const uint64_t cycles = asked > 1 ? (uint64_t) asked : kUmwaitCycles;
+        if (!aut) {
+            std::fprintf(stderr, "xestrata: XESTRATA_POOL_UMWAIT: parked workers wait with UMWAIT (%lld cycles)\n", asked);
+            return cycles;
+        }
+        // auto: the two ways in turn; UMWAIT is taken unless it adds more than 2% to a wake (the power it saves is
+        // a laptop's, where a spinning core takes the GPU's budget; a core that wakes slowly keeps the spin)
+        const double spin = umwait_wake_us(cycles, false), wait = umwait_wake_us(cycles, true);
+        const bool on = wait <= spin * 1.02;
+        std::fprintf(stderr, "xestrata: the CPU pool's park: a publish wakes a spinning worker in %.2f us, a UMWAIT one in "
+                             "%.2f us: the %s (XESTRATA_POOL_UMWAIT=0/1 picks one)\n",
+                     spin, wait, on ? "UMWAIT" : "spin");
+        return on ? cycles : (uint64_t) 0;
+    }();
+    return c;
+}
 constexpr uint64_t pack_head(uint32_t epoch, uint32_t n, uint32_t i) {
     return ((uint64_t) epoch << 32) | ((uint64_t) n << 16) | (uint64_t) i;
 }
@@ -385,6 +437,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, int first_core,
     if (tasks < 0 || tasks > kMaxTasks) throw std::invalid_argument("expert pool tasks must be in 0..4096");
     if (const char* e = strata::env_get("POOL_SPIN_US"))   // a test knob; see kSpinBeforeSleep
         spin_before_sleep_ = std::chrono::microseconds((std::max)(0, std::atoi(e)));
+    (void) umwait_cycles();   // the park's way is decided before a worker runs (auto: timed on a thread of its own)
     pinned_ = pin;
     std::vector<int> cores = physical_cores(true);
     // --pool-cores (experimental, off by default): the person's own list of logical processors for the workers, in its
