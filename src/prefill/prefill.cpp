@@ -159,12 +159,12 @@ inline int64_t stream_all_min() {
 // streamed expert, events around its expert work read after the next layer's routing sync, as running means): the
 // next layers hand the CPU g / (c + g), where both sides end together, so a GPU that streams faster than the CPU
 // computes gives it little.  x: a fixed x.  0: every expert on the GPU.  The CPU rounds differently from the GPU, so
-// an answer can differ slightly from the GPU-only one.  Unset, --prefill-cpu-share (set_cpu_share) fixes the share
-// where the default arms it: the measured one moves from run to run, and which experts the CPU takes with it, so two
-// greedy runs of one prompt parted (2026-10-16, an RTX 4070: logits up to 1.5 apart at the first generated token).
-// A fixed share does not make the runs alike: the CPU takes from the experts outside VRAM, and --expert-cache auto
-// sizes that tier from the free VRAM at start (a B70: 14,870 or 14,873 slots, the matrix library's 6 or 10 MiB), so a
-// few experts move and the reply with them (2026-11-01, 1 run in 6).  Only 0 gives the same reply each time.
+// an answer can differ slightly from the GPU-only one.  The measured share also moves from run to run (the B70,
+// 2026-11-13: 0.53 to 0.83 over five runs, and five greedy 256-token runs of one prompt gave five answers), so a run
+// whose answer must not move needs a fixed share: setup's warm-up measures it once per PC and model with `auto` and
+// writes the value into the run config (--prefill-cpu-share), and 0 is the GPU-only answer every time.  A share fixed
+// where the cache's tier does not move keeps a reply too (the RTX 4070's 0.84: 8 runs alike; its 0.5 moved in 3 runs
+// of 2 answers).
 double g_cpu_share_fixed = -1.0;   // set_cpu_share: -1 measured
 inline double cpu_share_env() {   // -1: measured
     static const double v = [] {

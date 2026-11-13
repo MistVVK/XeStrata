@@ -7626,6 +7626,14 @@ def warm_up(cfg_path: Path) -> None:
     import socket
     import urllib.error
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    # The prompt's CPU share is measured here, once per PC and model, and the value written into the config: the
+    # engine's default measures it in every run, and a measured share moves a greedy answer between runs (2026-11-13);
+    # a fixed value is read the same way every time.
+    share_arg = False
+    if "--prefill-cpu-share" not in cfg.get("args", [])[:-1]:
+        cfg.setdefault("args", []).extend(["--prefill-cpu-share", "auto"])
+        write_config(cfg_path, cfg)
+        share_arg = True
     with socket.socket() as sk:
         sk.bind(("127.0.0.1", 0))
         port = sk.getsockname()[1]
@@ -7727,7 +7735,10 @@ def warm_up(cfg_path: Path) -> None:
         finally:
             end_process_group(proc)
     if share is not None:
-        fix_prefill_share(cfg_path, share)
+        fix_prefill_share(cfg_path, share, replace_auto=share_arg)
+    elif share_arg:                     # nothing measured: the engine's own default (the GPU's) stays
+        cfg["args"] = cfg["args"][:-2]
+        write_config(cfg_path, cfg)
     free = start_free_mib(elog, since)
     if free is not None:
         fix_vram_free(cfg_path, free)
@@ -7796,16 +7807,18 @@ def measured_cpu_share(elog: str | None, since: int) -> float | None:
     return float(found[-1]) if found else None
 
 
-def fix_prefill_share(cfg_path: Path, share: float) -> None:
-    """Write the measured prompt CPU share into the config (--prefill-cpu-share): measured anew in every run, it moved
-    a little, which experts the CPU took with it, and two greedy runs of one prompt parted (2026-10-16).  A
-    "--prefill-cpu-share auto" in the args is the user's and stays."""
+def fix_prefill_share(cfg_path: Path, share: float, replace_auto: bool = False) -> None:
+    """Write the measured prompt CPU share into the config (--prefill-cpu-share): the engine measures it in every run by
+    default, and a measured share moves a little, which experts the CPU took with it, and two greedy runs of one prompt
+    parted (2026-10-16); measured once here, the runs of this PC and model read a prompt the same way.  A
+    "--prefill-cpu-share auto" the user put there is the user's and stays, unless this warm-up wrote it
+    (`replace_auto`)."""
     cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
     a = list(cfg.get("args", []))
     v = f"{share:.2f}"
     if "--prefill-cpu-share" in a[:-1]:
         i = a.index("--prefill-cpu-share")
-        if a[i + 1] == "auto":
+        if a[i + 1] == "auto" and not replace_auto:
             return
         a[i + 1] = v
     else:
