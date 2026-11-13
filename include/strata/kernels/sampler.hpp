@@ -33,8 +33,14 @@ struct SamplerParams {
     // (-inf) before penalties and filters.  Grammar-constrained decoding (src/core/grammar.cpp): row t's allowed tokens
     // after the window's tokens 0..t
     const uint32_t* allowed = nullptr;
-    bool gumbel = false;         // STRATA_SPEC_GUMBEL=1: Gumbel-max pick keyed by (seed, counter, token id) - see sampler.cpp
+    // Gumbel-max pick: argmax_i z_i + G_i, G_i a Gumbel noise hashed from (seed, counter, token id), over the top
+    // kGumbelK of the surviving list (sampler.cpp).  XESTRATA_SPEC_GUMBEL=1 turns it on for every sampled request.
+    bool gumbel = false;
 };
+
+// The most candidates a Gumbel draw is made for (YASAKANI's Q35_SMP_K, q35.hpp): a tail beyond them would rarely
+// win a draw, and the list is cut before the draws so their cost stays small whatever top_k the request asked for.
+inline constexpr int kGumbelK = 20;
 
 // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.
 //
