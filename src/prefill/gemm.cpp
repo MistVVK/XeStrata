@@ -435,19 +435,7 @@ const char* Gemm::path() {
     return text.c_str();
 }
 
-// Opt-in: Qwen3.8 at 1K tokens on the B70 was 637 -> 625 tok/s; Qwen3.5-9B on the RTX 4070
-// was 2889 -> 2834 (2026-11-11, one warm measurement each). The benefit is not established on either engine.
-bool gemm_dequant_side() {
-    static const bool on = [] { const char* v = strata::env_get("DEQUANT_SIDE"); return v && v[0] == '1'; }();
-    return on;
-}
-
 Gemm::~Gemm() {
-    for (strata::gpu::Event* e : side_ready_)
-        if (e) strata::gpu::event_destroy(e);
-    for (strata::gpu::Event* e : side_free_)
-        if (e) strata::gpu::event_destroy(e);
-    if (side_stream_) strata::gpu::stream_destroy(side_stream_);
     if (!external_ && scratch_) strata::gpu::free(scratch_);
     if (tc_w_) strata::gpu::free(tc_w_);
     if (tc_x_) strata::gpu::free(tc_x_);
@@ -467,31 +455,6 @@ void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems) {
     scratch_elems_ = scratch_elems;
 }
 
-bool Gemm::set_dequant_side(uint16_t* scratch2, std::string& err) {
-    side_scratch_ = scratch2;
-    side_cur_ = 0;
-    if (scratch2 == nullptr) return true;
-    if (side_stream_ == nullptr) {   // once: the stream and the four events outlive every rebind
-        side_stream_ = strata::gpu::stream_create();
-        if (side_stream_ == nullptr) {
-            err = std::string("prefill gemm: dequant side stream: ") + strata::gpu::last_error();
-            side_scratch_ = nullptr;
-            return false;
-        }
-        for (int i = 0; i < 2; ++i) {
-            // kept even on a failure: the destructor frees what was made
-            if (!strata::gpu::event_create(&side_ready_[i]) || !strata::gpu::event_create(&side_free_[i])) {
-                err = "prefill gemm: dequant side events";
-                side_scratch_ = nullptr;
-                return false;
-            }
-        }
-    }
-    // both scratches are free once what the compute stream holds now is done (a rebind follows a stream sync, so
-    // this is belt and braces)
-    for (strata::gpu::Event* e : side_free_) strata::gpu::event_record(e, stream_);
-    return true;
-}
 
 bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
     stream_ = stream;
@@ -994,7 +957,7 @@ bool Gemm::native_warm(const uint16_t* X, int ggml_type, const void* W_blocks, f
 }
 
 // W's FP16 rows for prod(w16, r0, n) (rows r0 .. r0 + n - 1 of W): as they are for F16 rows, else dequantized into the
-// scratch, at once or in row slices, on the side stream with STRATA_DEQUANT_SIDE
+// scratch, at once or in row slices
 template<class F> void Gemm::with_f16(int ggml_type, const void* W_blocks, int64_t N, int64_t K, F prod) {
     if (ggml_type == 1) {   // F16 rows (an F16 GGUF's, Anima's Qwen3-0.6B-Base): the product takes them as they are
         prod(static_cast<const uint16_t*>(W_blocks), 0, N);
@@ -1009,24 +972,6 @@ template<class F> void Gemm::with_f16(int ggml_type, const void* W_blocks, int64
             strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
             prod(scratch_, r0, n);
         }
-        // the side stream's next dequant into scratch_ waits for these slices' reads and writes of it
-        if (side_scratch_) strata::gpu::event_record(side_free_[0], stream_);
-        return;
-    }
-    if (side_scratch_) {
-        // STRATA_DEQUANT_SIDE (upstream dc390c386): the dequant on the side stream, into the scratch the compute
-        // stream read last but one.  free[cur] -> dequant -> ready[cur] -> product -> free[cur] orders the dequant
-        // after the product that last read this scratch and the product after the dequant that filled it, so every
-        // read and write of a scratch is where the serial form had it - the same kernels, the same bits - and the
-        // dequant runs while the kernels queued ahead of this product do.
-        uint16_t* const s = side_cur_ == 0 ? scratch_ : side_scratch_;
-        strata::gpu::stream_wait_event(side_stream_, side_free_[side_cur_]);
-        strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, s, side_stream_);
-        strata::gpu::event_record(side_ready_[side_cur_], side_stream_);
-        strata::gpu::stream_wait_event(stream_, side_ready_[side_cur_]);
-        prod(s, 0, N);
-        strata::gpu::event_record(side_free_[side_cur_], stream_);
-        side_cur_ ^= 1;
         return;
     }
     strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
@@ -1064,8 +1009,6 @@ void Gemm::native_w8a8(const uint16_t* X, int ggml_type, const void* W_blocks, f
             strata::kernels::rows_i8(static_cast<const uint16_t*>(W_blocks), false, N, K, w8_w_, w8_sw_, nullptr,
                                      stream_);
         } else {
-            // STRATA_DEQUANT_SIDE's side stream may be dequantizing into the scratch: wait for it (the serial form)
-            if (side_scratch_) strata::gpu::stream_sync(side_stream_);
             const int64_t rows = std::min(N, scratch_elems_ / K / 16 * 16);
             if (rows <= 0) throw std::runtime_error("prefill gemm: scratch too small for a W8A8 weight's rows");
             for (int64_t r0 = 0; r0 < N; r0 += rows) {

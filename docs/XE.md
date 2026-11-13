@@ -71,7 +71,7 @@ What is taken:
 - The web page: the chat history redone (saved chats, edit and rewind, branches, sending while answering), nine languages (the browser's language by default), KaTeX math (opt-in, `third_party/main/katex/`), svg and html previews, Load and Unload buttons, wide windows, a Timeout badge for the queue.
 - Setup and tools: the `--rope-scale` check, the published size when the download length cannot be probed, caps on the worker count and the picture encoder's threads, calibration dropping only a candidate whose engine died, bounded reads in `gguf_reader.py`, and NVIDIA GPUs older than Pascal told why they cannot be used.
 - Engine fixes: no hang after a failed PLE read, no per-part allocations after the prefill's region cannot be had, the `--adapt-decay` range, `XESTRATA_TRACE` times, and the decode timing line's parts.
-- Taken as opt-in (not faster on XeStrata's three makers' GPUs): the PLE table resident in RAM (`XESTRATA_PLE_AUTO_RAM=1`; on the B70 a 32K prompt no longer finished), the layer-major prefill (`XESTRATA_PREFILL_LAYER_MAJOR=1`), KVA (`XESTRATA_KVA=1`, changes the answers, [KVA](KVA.md)), `XESTRATA_DEQUANT_SIDE`, the pipelined batch groups' `XESTRATA_PIPED_MTP` and `XESTRATA_PIPE_ADAPT_EVERY`, the `XESTRATA_RAM_ADAPT` change and GP100's `XESTRATA_DOWN_WS`.
+- Taken as opt-in (not faster on XeStrata's three makers' GPUs): the PLE table resident in RAM (`XESTRATA_PLE_AUTO_RAM=1`; on the B70 a 32K prompt no longer finished), the layer-major prefill (`XESTRATA_PREFILL_LAYER_MAJOR=1`), KVA (`XESTRATA_KVA=1`, changes the answers, [KVA](KVA.md)), the pipelined batch groups' `XESTRATA_PIPED_MTP` and `XESTRATA_PIPE_ADAPT_EVERY`, the `XESTRATA_RAM_ADAPT` change and GP100's `XESTRATA_DOWN_WS`.
 - Chosen by a short measurement at start (0 or 1 fixes them): the way a prompt chunk's PLE rows go up (`XESTRATA_PLE_COMPACT`, `XESTRATA_PLE_COPY_STREAM`: 512 tokens landed both ways at the first start, the form 3% or more faster taken).
 - Two NVIDIA cards run `--batch` in pipelined groups again (one serial group with `XESTRATA_BATCH_GROUPS_NV_SERIAL=1`).
 
@@ -389,7 +389,7 @@ Found during the final comparison and fixed on XeStrata's side:
 - serve's short reads keep each path's readings with where the read started and choose from the readings near it; a batched read is tried only up to 16K. On the RTX 4070 at 64K the fourth turn's follow-up went from 505 to 304 ms.
 
 Of the paths meant to be faster, those faster on the B70, the RTX 4070 or the RX 9060 XT and slower on none are carried.
-The CPU share's auto gate (upstream f2a3b946) slowed 1K prompts on the B70 and the RTX 4070, so it is opt-in (`XESTRATA_PREFILL_CPU_GATE=1`); the Q8_0 dequantization four threads a block (upstream e910e410) was faster on neither, so it is left out.
+The CPU share's auto gate (upstream f2a3b946) slowed 1K prompts on the B70 and the RTX 4070 (-1.3% and -4.4%) and made no difference on a plain Ornith 32K (-0.1%), so it is removed; the Q8_0 dequantization four threads a block (upstream e910e410) was faster on neither, so it is left out.
 Not carried: the Windows implementation, upstream's `sycl/` (measured against on the same B70), the HIP and CUDA kernels' tuning tables, some paths for GPUs there is no machine for (those for RDNA2 only), and the multi-GPU changes (carried together in work of their own).
 
 ## Integration through Strata 0.1.40

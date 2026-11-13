@@ -73,7 +73,7 @@ upstream の Strata 0.2.6 から 0.2.7（`5e8a4cca`）までの変更を Xe に�
 - Web ページ: 会話の履歴の作り直し（保存・編集と巻き戻し・枝分かれ・答えている間の送信）、9 言語の訳（既定はブラウザーの言語）、KaTeX の数式（opt-in、`third_party/main/katex/`）、svg・html のプレビュー、読み込み・解放のボタン、広い画面、待ち行列の Timeout の印。
 - setup と道具: `--rope-scale` の検査、ダウンロードの長さが取れないときの公開の大きさ、ワーカー数と画像のエンコーダーのスレッドの上限、calibrate で途中で死んだ候補だけを外す、`gguf_reader.py` の読みの上限、Maxwell 以前の NVIDIA の GPU に使えない理由を言う。
 - エンジンの修正: PLE の読みの失敗の後に止まらない、prefill の領域が取れないときに部分ごとに確保しに行かない、`--adapt-decay` の範囲、`XESTRATA_TRACE` の時刻、decode の時間の行の内訳。
-- opt-in のまま移したもの（XeStrata の 3 社の GPU で速くならなかったもの）: PLE の表を RAM に置く判定（`XESTRATA_PLE_AUTO_RAM=1`。B70 では 32K が完走しなくなった）、layer-major の prefill（`XESTRATA_PREFILL_LAYER_MAJOR=1`）、KVA（`XESTRATA_KVA=1`、答えが変わる、[KVA](KVA.ja.md)）、`XESTRATA_DEQUANT_SIDE`、流れ作業のバッチの組の `XESTRATA_PIPED_MTP`・`XESTRATA_PIPE_ADAPT_EVERY`、`XESTRATA_RAM_ADAPT` の改良、GP100 の `XESTRATA_DOWN_WS`。
+- opt-in のまま移したもの（XeStrata の 3 社の GPU で速くならなかったもの）: PLE の表を RAM に置く判定（`XESTRATA_PLE_AUTO_RAM=1`。B70 では 32K が完走しなくなった）、layer-major の prefill（`XESTRATA_PREFILL_LAYER_MAJOR=1`）、KVA（`XESTRATA_KVA=1`、答えが変わる、[KVA](KVA.ja.md)）、流れ作業のバッチの組の `XESTRATA_PIPED_MTP`・`XESTRATA_PIPE_ADAPT_EVERY`、`XESTRATA_RAM_ADAPT` の改良、GP100 の `XESTRATA_DOWN_WS`。
 - 起動時の短い測りで選ぶもの（`0`・`1` で固定できる）: PLE の行の上げ方（`XESTRATA_PLE_COMPACT`・`XESTRATA_PLE_COPY_STREAM`。最初の起動で 512 トークンの塊を 2 通りの上げ方で測り、3% 以上速い方を選びます）。
 - 2 枚の NVIDIA の `--batch` は、流れ作業の組に戻しました（直列の組は `XESTRATA_BATCH_GROUPS_NV_SERIAL=1`）。
 
@@ -370,7 +370,7 @@ RX 9060 XT の decode は、同じ条件でも回ごとに 3 割ほど変わり�
 - serve の短い読み込みで、窓とまとめ読みの実測を読み始めの位置と一緒に覚え、近い位置の実測だけで選ぶ。試しのまとめ読みは 16K までの位置でだけ行う。RTX 4070 の 64K で、4 ターン目の続きが 505 ms から 304 ms に。
 
 速くするための経路は、B70・RTX 4070・RX 9060 XT のどれかで速くなり、ほかで遅くならないものを移しました。
-CPU 分担の auto の判定（upstream f2a3b946）は B70 と RTX 4070 の 1K で遅くなったので opt-in（`XESTRATA_PREFILL_CPU_GATE=1`）に、Q8_0 の逆量子化の 4 分け（upstream e910e410）はどちらでも速くならなかったので外しました。
+CPU 分担の auto の判定（upstream f2a3b946）は B70 と RTX 4070 の 1K で遅く（−1.3%・−4.4%）、plain の Ornith 32K でも差が無かった（−0.1%）ので消しました。Q8_0 の逆量子化の 4 分け（upstream e910e410）はどちらでも速くならなかったので外しました。
 移していないのは、Windows の実装、upstream の `sycl/`（同じ B70 で速さを比べる相手）、HIP と CUDA の専用のカーネルの調整表、試せる機器のない GPU のための経路の一部（RDNA2 特有のもの）、複数 GPU の変更（別の作業でまとめて移します）です。
 
 ## Strata 0.1.40 の取り込み
