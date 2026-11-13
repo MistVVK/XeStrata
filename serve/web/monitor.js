@@ -9,6 +9,19 @@ document.documentElement.dataset.theme = localStorage.getItem("xestrata.theme") 
 const seconds = n => typeof n === "number" ? `${n.toFixed(2)} s` : "—";
 const speed = n => typeof n === "number" ? n.toFixed(1) : "—";
 const active = r => !["completed", "error", "disconnected"].includes(r.state);
+// The run's average decode speed: every token produced over the run divided by the run's decode time, from each
+// finished request's engine timings (predicted_n over predicted_ms).  Token-weighted, so a short request does not
+// outweigh a long one - the same figure the engine's DONE lines and the server's totals report.  Not the last request.
+function averageDecodeSpeed(rows) {
+  let tokens = 0, ms = 0;
+  for (const r of rows) {
+    const t = r.timings;
+    if (!t) continue;
+    const n = t.predicted_n, d = t.predicted_ms;
+    if (typeof n === "number" && typeof d === "number" && n >= 2 && d > 0) { tokens += n; ms += d; }
+  }
+  return ms > 0 ? tokens / (ms / 1000) : null;
+}
 function text(id, value) { const el = $(id); if (el.textContent !== String(value)) el.textContent = value; }
 async function api(path, body) {
   const response = await fetch(path, {cache:"no-store", headers:{...(apiKey ? {Authorization:`Bearer ${apiKey}`} : {}), ...(body !== undefined ? {"Content-Type":"application/json"} : {})}, ...(body !== undefined ? {method:"POST", body:JSON.stringify(body)} : {})});
@@ -88,7 +101,8 @@ async function refresh() {
     text("model", status.model); text("count", records.length);
     text("active", inflight ? `${inflight} active / queued` : status.auto_load ? "Loads automatically on the next request" : "No active requests");
     const last = records.find(r => !active(r));
-    text("wall", last ? seconds(last.wallclock_s) : "—"); text("speed", speed(last?.timings?.predicted_per_second));
+    text("wall", last ? seconds(last.wallclock_s) : "—");
+    text("speed", speed(averageDecodeSpeed(records.filter(r => !active(r)))));
     $("load").disabled = operating || Boolean(inflight) || status.loaded; $("unload").disabled = operating || Boolean(inflight) || !status.loaded;
     list(); if (selected) await showDetail();
     text("updated", `Live · updated ${new Date().toLocaleTimeString()}`);

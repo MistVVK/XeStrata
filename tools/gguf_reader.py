@@ -44,6 +44,9 @@ GGUF_META = {
 # This is what makes a per-tensor byte count checkable, and it is the contract the kernels share.
 BLOCK_GEOMETRY: dict[str, tuple[int, int]] = {
     "F32": (1, 4), "F16": (1, 2), "BF16": (1, 2), "F64": (1, 8),
+    # one value per block: the IST-DAS DeepSeek-V4.1 first shard carries the Engram's hash parameters as integer
+    # tensors (tools/dsv41 is not in this tree; the types are ggml's, and a file of them must not read as cut short)
+    "I8": (1, 1), "I16": (1, 2), "I32": (1, 4), "I64": (1, 8),
     "Q4_0": (32, 18), "Q4_1": (32, 20), "Q5_0": (32, 22), "Q5_1": (32, 24),
     "Q8_0": (32, 34), "Q8_1": (32, 36),
     "Q2_K": (256, 84), "Q3_K": (256, 110), "Q4_K": (256, 144), "Q5_K": (256, 176),

@@ -158,6 +158,8 @@ private:
     static void publish_plan(void* ctx);
     static void fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes);
     static void raise_flag(uint32_t* flag, uint32_t value);
+    /// Flag B for `want`, behind every copy queued on copy_ (an empty plan must not overtake an earlier ring's DMA).
+    void raise_flag_b_ordered(uint32_t want);
     void set_plan_slot(int grp, int groups);
     int32_t* plan_dev(int grp) const { return plan_ + (size_t) grp * (size_t) (plan_i32_ + 16); }
 
@@ -169,6 +171,7 @@ private:
     bool segmented_ = false;
     const std::vector<strata::gpu::Graph*>* segs_ = nullptr;
     strata::gpu::Stream copy_ = nullptr;   ///< the copy engine's stream (the PCIe share by DMA)
+    bool copy_used_ = false;               ///< copies queued on copy_ since it was last drained
     uint32_t cur_ring_ = 0;
 
     // mapped staging: the host's view (h_) and the device's (m_) of the same bytes

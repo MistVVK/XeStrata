@@ -28,7 +28,6 @@ import argparse
 import hashlib
 import json
 import pathlib
-import struct
 import sys
 
 import numpy as np
@@ -318,18 +317,18 @@ def rebuild_role(blob: bytes, role: str) -> bytes:
     the only independent statement about the blob layout in the tree, and if it and `pack_layer` were the
     same code the arena would be unverified by construction.
     """
-    O, out = PL.OFF, bytearray()
+    off, out = PL.OFF, bytearray()
     n_blk = PL.H * PL.FF // PL.QK
     for blk in range(n_blk):
         if role == "down":
             row, b_in = blk // PL.SCALES_D, blk % PL.SCALES_D
-            co = O["down_codes"] + row * PL.ROW_BYTES_D + b_in * 16
-            so = O["down_scales"] + (row * PL.SCALES_D + b_in) * 2
+            co = off["down_codes"] + row * PL.ROW_BYTES_D + b_in * 16
+            so = off["down_scales"] + (row * PL.SCALES_D + b_in) * 2
         else:
             row, b_in = blk // PL.SCALES_GU, blk % PL.SCALES_GU
             slot = 2 * row + (0 if role == "gate" else 1)
-            co = O["gate_up_codes"] + slot * PL.ROW_BYTES_GU + b_in * 16
-            so = O["gate_up_scales"] + (slot * PL.SCALES_GU + b_in) * 2
+            co = off["gate_up_codes"] + slot * PL.ROW_BYTES_GU + b_in * 16
+            so = off["gate_up_scales"] + (slot * PL.SCALES_GU + b_in) * 2
         out += blob[so:so + 2]          # fp16 d first, as block_q2_0 has it
         out += blob[co:co + 16]         # then the 16 packed code bytes
     return bytes(out)

@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-License-Identifier: MIT
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Strata P0.S9 - build the pack-layout expert arena from the real GGUF.
 
 The architecture (§3.2) defines one expert blob as 1,382,400 bytes:
@@ -27,7 +28,6 @@ from __future__ import annotations
 
 import json
 import pathlib
-import struct
 import sys
 
 import numpy as np
@@ -88,6 +88,7 @@ def build(n_layers: int, out_path: pathlib.Path) -> dict:
             layer_off = out.tell()
             # vectorized over the layer's 512 experts (the same bytes the per-block loop wrote; tools/strata_pack.py
             # verify checks them): each role is (512 experts, rows, blocks per row, 18 bytes)
+
             def role_blocks(role, rows, per_row):
                 t = roles[role]
                 n = NE * ROLE_BYTES

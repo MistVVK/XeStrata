@@ -9,6 +9,7 @@
 #include "strata/core/device.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/stream_watch.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
@@ -44,6 +45,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/prefill/kva.hpp"   // STRATA_KVA: the approximate late-layer prompt read (opt-in)
+#include "strata/prefill/timer_marks.hpp"   // upstream 4006: a mark that repeats its phase is not recorded
 
 #include "strata/core/gpu.hpp"
 #include "strata/platform/env.hpp"
@@ -236,9 +238,30 @@ constexpr int64_t GU_ELEMS = 1280ll * 2560, D_ELEMS = 2560ll * 640;
 
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 
+// upstream 4084979c: XESTRATA_PF_ALLOC_TRACE=1 (diagnostic, no behaviour change): the free-memory figure around the
+// prompt path's allocations, against what the code asked for, to see what `bytes_needed` does not count.
+inline bool pf_alloc_trace() {
+    static const bool on = [] { const char* e = strata::env_get("PF_ALLOC_TRACE"); return e != nullptr && e[0] == '1'; }();
+    return on;
+}
+inline int64_t pf_free_mib() {
+    size_t f = 0, t = 0;
+    return strata::gpu::mem_info(&f, &t) ? (int64_t) (f >> 20) : -1;
+}
+inline void pf_mark(const char* what, int64_t& last, uint64_t asked_bytes = 0) {
+    if (!pf_alloc_trace()) return;
+    const int64_t now = pf_free_mib();
+    if (now < 0) return;
+    std::fprintf(stderr, "prefill alloc trace: %-44s free %7lld MiB, dropped %7lld MiB, asked %7lld MiB\n", what,
+                 (long long) now, (long long) (last - now), (long long) (asked_bytes >> 20));
+    last = now;
+}
+
 // Either cudaMalloc (owned, freed with the object) or a bump allocation from a borrowed region; with no base and
 // no region it only counts, which is how `bytes_needed` sizes the region.
 struct Alloc {
+    uint64_t tr_asked = 0, tr_n = 0;   ///< XESTRATA_PF_ALLOC_TRACE: the device takes' sizes, and how far the free figure fell over them
+    int64_t tr_drop = 0;
     uint8_t* base = nullptr;
     uint64_t cap = 0, used = 0;
     uint64_t failed_bytes = 0;          ///< the take that could not be allocated; the failure message names it
@@ -254,7 +277,14 @@ struct Alloc {
             return p;
         }
         void* p = nullptr;
+        const int64_t tr0 = pf_alloc_trace() ? pf_free_mib() : 0;
         if (!strata::gpu::alloc_device(&p, bytes)) { ok = false; failed_bytes = bytes; return nullptr; }
+        if (pf_alloc_trace()) {
+            const int64_t tr1 = pf_free_mib();
+            if (tr0 >= 0 && tr1 >= 0) tr_drop += tr0 - tr1;
+            tr_asked += bytes;
+            ++tr_n;
+        }
         owned->push_back(p);
         used += bytes;
         return (T*) p;
@@ -1160,6 +1190,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         err = "prefill: geometry differs from the artifact's"; return false;
     }
     m.device = strata::core::current_device();
+    int64_t tr_last = pf_alloc_trace() ? pf_free_mib() : 0;
+    pf_mark("init: start (host sides, then the chunk's buffers)", tr_last);
     if (stage_le_ < 0) stage_le_ = g.n_layers;
     if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers || (stage_le_ < g.n_layers) != (next_ != nullptr)) {
         err = "prefill: the stage's layer range is wrong";
@@ -1292,6 +1324,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             m.owned.push_back(m.ident_table);
     }
     if (!ok) { err = "prefill: host buffers or events for a chunk of " + std::to_string(chunk) + " tokens"; return false; }
+    pf_mark("init: host buffers, PLE rows, identity table", tr_last);
     Alloc o;
     o.base = (uint8_t*) borrow;
     o.cap = borrow_bytes;
@@ -1302,6 +1335,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         uint16_t* gs2 = gemm_dequant_side() ? o.take<uint16_t>((size_t) GEMM_SCRATCH, ok) : nullptr;
         if (!ok) { err = "prefill: GEMM scratch does not fit"; return false; }
         m.gemm.init_external(stream, gs, GEMM_SCRATCH);
+        pf_mark("init: GEMM scratch + workspace (Alloc takes so far)", tr_last, o.tr_asked);
         if (std::string side_err; !m.gemm.set_dequant_side(gs2, side_err))
             std::fprintf(stderr, "prefill: XESTRATA_DEQUANT_SIDE=1 not taken (%s): the dense weights are dequantized in "
                                  "front of their products\n", side_err.c_str());
@@ -1311,6 +1345,12 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
               fit_failure(o);
         return false;
     }
+    pf_mark("init: carve (all buffers of the chunk)", tr_last, o.tr_asked);
+    if (pf_alloc_trace())
+        std::fprintf(stderr, "prefill alloc trace: Alloc takes: %llu device allocations, asked %lld MiB, free fell %lld MiB "
+                             "over them (bytes_needed counts %lld MiB for this chunk's own buffers; o.used %lld MiB)\n",
+                     (unsigned long long) o.tr_n, (long long) (o.tr_asked >> 20), (long long) o.tr_drop,
+                     (long long) (Prefill::bytes_needed(g, ss, chunk) >> 20), (long long) (o.used >> 20));
     return true;
 }
 
@@ -1725,11 +1765,12 @@ namespace {
 // rows (ple_land, read from the SSD beside layer 0) lands on layer 0's 'hc write'.
 enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
                kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut,
-               kPfHcWrite, kPfCount };
+               kPfHcWrite, kPfHcDown, kPfHcUp, kPfHcInj, kPfHcMix, kPfCount };
 const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
                                         "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
                                         "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
-                                        "gdn recurrence", "gdn out proj", "hc write"};
+                                        "gdn recurrence", "gdn out proj", "hc write", "hc read: down+silu", "hc read: up",
+                                        "hc read: inject", "hc read: mix"};
 struct PfTimer {
     bool on = env_on("PREFILL_TIMING");
     std::vector<strata::gpu::Event*> ev;
@@ -1738,6 +1779,11 @@ struct PfTimer {
     double ms[kPfCount] = {};
     void mark(int phase, strata::gpu::Stream s) {
         if (!on) return;
+        // a mark in the phase already running adds nothing to the totals (the gaps are charged to the earlier mark's
+        // phase either way), but every event record is a submission of its own under WDDM (~80 us on a 6900 XT,
+        // Windows 11): compute() marks "dequant" once per expert, which put ~16 records per MMQ group on the stream
+        // and charged the launch gaps they made to "dequant".  The same totals, a fraction of the records.
+        if (strata::prefill::timer_mark_repeats(ph.data(), used, phase)) return;
         if (used == ev.size()) {
             strata::gpu::Event* e = nullptr;
             strata::gpu::event_create(&e, true);
@@ -1882,6 +1928,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     err.clear();
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
+    // upstream 711a7e937: the stall report asks this stream (the one the waits below block on) whether its work is done
+    const core::WatchedStream watched("the prompt path's compute stream", (void*) m.cs, m.device);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
@@ -2369,10 +2417,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 core::WeightRef wdv = *wd, wuv = *wu;
                 if (wd->data == nullptr) wdv.data = core::hc_bf16_view(wd, 0, m.cs);
                 if (wu->data == nullptr) wuv.data = core::hc_bf16_view(wu, 1, m.cs);
+                pt.mark(kPfHcDown, cs);   // STRATA_PREFILL_TIMING: the hyper-connection read's parts on their own lines
                 if (!bf16_proj(m.gemm, &wdv, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo)) return false;
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
+                pt.mark(kPfHcUp, cs);
                 if (!bf16_proj(m.gemm, &wuv, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
+                pt.mark(kPfHcInj, cs);
                 if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo)) return false;
+                pt.mark(kPfHcMix, cs);
                 gr_mix_r(m.R, m.xn, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
                          m.mixed_bf_lo);
 
@@ -4100,6 +4152,8 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
     err.clear();
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
+    // upstream 711a7e937: as the default path
+    const core::WatchedStream watched("the prompt path's compute stream", (void*) m.cs, m.device);
     const core::ModelGeometry& g = *m.g;
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
@@ -4186,7 +4240,11 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             const bool tr = m.src->transient(l, e);   // copied by the source in the stager (never pinned)
             if (!tr && m.src->pinned(l, e)) continue;
             const uint8_t* b = tr ? nullptr : m.src->blob(l, e);
-            if (!tr && !b) { err = "prefill (layer-major): expert source has no blob"; return false; }
+            if (!tr && !b) {   // upstream 08e8770c (#4695): no contiguous mapped blob (the mapping dropped): the source copies it itself
+                pf_job[(size_t) e] = (int) js.size();
+                js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
+                continue;
+            }
             pf_job[(size_t) e] = (int) js.size();
             js.push_back({b, (size_t) lay.blob_bytes(l), tr ? m.src : nullptr, (int32_t) l, e});
         }
@@ -4260,7 +4318,11 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 const bool tr = m.src->transient(l, e);
                 if (!tr && m.src->pinned(l, e)) continue;
                 const uint8_t* b = tr ? nullptr : m.src->blob(l, e);
-                if (!tr && !b) { err = "prefill (layer-major): expert source has no blob"; return false; }
+                if (!tr && !b) {   // upstream 08e8770c (#4695): as in lm_prefetch
+                    job_of[u] = (int) js.size();
+                    js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
+                    continue;
+                }
                 job_of[u] = (int) js.size();
                 js.push_back({b, (size_t) lay.blob_bytes(l), tr ? m.src : nullptr, (int32_t) l, e});
             }
@@ -4730,10 +4792,14 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                     core::WeightRef wdv = *wd, wuv = *wu;
                     if (wd->data == nullptr) wdv.data = core::hc_bf16_view(wd, 0, cs);
                     if (wu->data == nullptr) wuv.data = core::hc_bf16_view(wu, 1, cs);
+                    pt.mark(kPfHcDown, cs);   // (as the default path: the hyper-connection read's parts on their own lines)
                     if (!bf16_proj(m.gemm, &wdv, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo)) return false;
                     gr_silu(m.lo, m.lo16, T, cs, m.lo16_lo);
+                    pt.mark(kPfHcUp, cs);
                     if (!bf16_proj(m.gemm, &wuv, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
+                    pt.mark(kPfHcInj, cs);
                     if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo)) return false;
+                    pt.mark(kPfHcMix, cs);
                     gr_mix_r(m.R, m.xn, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, cs, m.mixed_h,
                              m.mixed_bf_lo);
                     if (half == 0 && !core::is_qsa_layer(g, l)) {

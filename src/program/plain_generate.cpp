@@ -22,6 +22,7 @@
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/session_save_reclaim.hpp"
+#include "strata/core/conversation_cache.hpp"
 #include "strata/core/conversation_disk.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -1100,6 +1101,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         {
             size_t vf_b = 0, vt_b = 0;
             if (strata::gpu::mem_info(&vf_b, &vt_b)) strata::core::watchdog_note_request_vram((int64_t) (vf_b >> 20));
+            strata::core::watchdog_note_request_gpu_pause();   // AMD on Linux: the stall report's paused-time line
         }
         char* endp = nullptr;
         const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
@@ -1241,12 +1243,17 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         // a request with any of them decodes a token a window (each pick its own mask, history and logits)
         // (a bias is the same for every row of a spec window, and the script guard sets each window's masks)
         const bool constrained = grammar.active() || penalties || req_logprobs >= 0;
-        std::vector<int32_t> seen(ids.begin(), ids.end());   // what the penalties count: the prompt, then the reply
+        std::vector<int32_t> seen(ids.begin(), ids.end());   // the session's tokens: the prompt, then the reply
+        // #4590: the penalties count the reply's tokens (the last prompt token, which the first pick follows, stays
+        // in); XESTRATA_PENALTY_PROMPT=1 counts the prompt's last tokens too, unset is this build's default (see
+        // sampler.hpp: the old window until the quality check passes)
+        static const bool pen_prompt = strata::kernels::penalty_counts_prompt(strata::env_get("PENALTY_PROMPT"));
+        const size_t pen_from = strata::kernels::penalty_window_from(ids.empty() ? 0 : ids.size() - 1, pen_prompt);
         std::vector<float> lrow(req_logprobs >= 0 ? (size_t) V : 0);   // the logits the next pick comes from
         // before a pick after the window that reads `fed`
         auto constrain = [&](int32_t fed) -> bool {
             if (penalties) {
-                const size_t k = std::min(seen.size(), (size_t) sp.penalty_last_n);
+                const size_t k = std::min(seen.size() - pen_from, (size_t) sp.penalty_last_n);
                 if (!model.set_history(seen.data() + seen.size() - k, (int) k, cerr)) return false;
             }
             bool masked = false;
@@ -1429,12 +1436,17 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 live_to_folder("too large for the RAM cache");
                 return;
             }
+            bool dropped = false;
             while (!cache.parked.empty() &&
                    ((int) cache.parked.size() >= cache.slots || cache.used() + need > cache.budget)) {
                 if (std::prev(cache.parked.end()) == keep) break;
                 to_folder(cache.parked.back().ids, cache.parked.back().snap, cache.parked.back().checks, "evicted");
                 cache.parked.pop_back();
+                dropped = true;
             }
+            // upstream 8c71c492 (#5697): the next admission reads MemAvailable, and a dropped image's memory may sit in
+            // the C library's heap otherwise
+            if (dropped) strata::core::release_free_heap();
             if ((int) cache.parked.size() >= cache.slots || cache.used() + need > cache.budget) {
                 live_to_folder("no room in the RAM cache");
                 return;
@@ -1457,11 +1469,14 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             for (const Checkpoint& c : sl.checks) need += (int64_t) c.snap->bytes();
             const auto avail = strata::core::available_host_bytes();
             if (need > cache.budget || !avail || (int64_t) *avail - need <= cache.min_free) return;
+            bool dropped = false;
             while (!cache.parked.empty() &&
                    ((int) cache.parked.size() >= cache.slots || cache.used() + need > cache.budget)) {
                 to_folder(cache.parked.back().ids, cache.parked.back().snap, cache.parked.back().checks, "evicted");
                 cache.parked.pop_back();
+                dropped = true;
             }
+            if (dropped) strata::core::release_free_heap();
             ConversationCache::Entry e;
             std::string perr;
             if (!model.save_slot(b, (int64_t) sl.ids.size(), e.snap, perr)) return;

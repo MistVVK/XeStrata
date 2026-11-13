@@ -51,6 +51,8 @@ ALLOWED = [
     r'targets="(?:strata[\w-]*\s+)+',
     # a shell script's old name, read after XeStrata's: ${XESTRATA_X:-${STRATA_X:-}}
     r'\$\{STRATA_[A-Z0-9_]+:-',
+    # a tool that starts an engine clears the upstream-named measurement variables it may inherit
+    r'"STRATA_"',
     # upstream's own things: its SYCL port, a variable of its that XeStrata did not take
     r'strata-sycl', r'build-sycl-aot/strata\b', r"f7eaf2de(?:'s| の) STRATA_EXPDEC",
     # the old names, where a document says they are read too

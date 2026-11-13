@@ -190,14 +190,35 @@ void MoeWindow::raise_flag(uint32_t* flag, uint32_t value) {
     while (cur < value && !__atomic_compare_exchange_n(flag, &cur, value, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {}
 }
 
+// Flag B for ring `want`, behind every copy queued on the copy stream (upstream #5096, @AlanJager).  The counter only
+// rises and the graph waits for "flag B >= ring", so raising it on the spot for a ring with nothing to copy releases an
+// earlier ring's (or the other token group's) uploads that have not landed: the graph then reads half-written staging.
+void MoeWindow::raise_flag_b_ordered(uint32_t want) {
+    if (!copy_used_ || copy_ == nullptr) {   // nothing queued: nothing to wait for
+        raise_flag(h_flagB_, want);
+        return;
+    }
+    FlagSet& fs = flag_sets_[want % (sizeof flag_sets_ / sizeof flag_sets_[0])];
+    fs.flag = h_flagB_;
+    fs.value = want;
+    FlagSet* set = &fs;
+    if (!strata::gpu::launch_host(copy_, [set] { raise_flag(set->flag, set->value); })) {
+        // The flag was not raised: the consumers must not be released to staging that is still being written.
+        std::fprintf(stderr, "xestrata DMA: ordered flag B completion failed: %s\n", strata::gpu::last_error());
+        std::fflush(stderr);
+        std::abort();
+    }
+}
+
 // The PCIe share by DMA: the copy engine moves the blobs while the CPU computes its share and the GPU its VRAM
 // experts; a host function raises flag B when they have landed (the graph waits for it before the PCIe groups).
 void MoeWindow::fetch_dma(void* ctx, const uint8_t* const* src, int n, size_t bytes) {
     MoeWindow* w = (MoeWindow*) ctx;
     const uint32_t want = w->cur_ring_;
-    if (n <= 0) { raise_flag(w->h_flagB_, want); return; }
+    if (n <= 0) { w->raise_flag_b_ordered(want); return; }   // an empty plan stays behind the copies already queued
     uint8_t* stage = (uint8_t*) w->sink_.staging;   // this group's half in a split window
     for (int i = 0; i < n; ++i) strata::gpu::copy_async(stage + (size_t) i * bytes, src[i], bytes, w->copy_);
+    w->copy_used_ = true;
     FlagSet& fs = w->flag_sets_[want % (sizeof w->flag_sets_ / sizeof w->flag_sets_[0])];
     fs.flag = w->h_flagB_;
     fs.value = want;
@@ -454,14 +475,16 @@ void MoeWindow::answer(uint32_t want, int grp, int groups, int tb, int n, int64_
         sink_.start2[0] = 0;
         std::atomic_thread_fence(std::memory_order_seq_cst);
         *(volatile uint32_t*) h_flagA_ = want;
-        raise_flag(h_flagB_, want);
+        raise_flag_b_ordered(want);   // behind any copy still queued from an earlier ring
     }
     *(volatile uint32_t*) h_flag_ = want;
 }
 
 bool MoeWindow::next_segment(uint32_t want, strata::gpu::Graph* next, strata::gpu::Stream cs, const char* who,
                              int64_t layer, std::string& err) {
-    if (!strata::gpu::stream_sync(copy_) || *(volatile uint32_t*) h_flagB_ < want) {
+    const bool synced = strata::gpu::stream_sync(copy_);
+    if (synced) copy_used_ = false;   // drained: everything queued on copy_ has landed
+    if (!synced || *(volatile uint32_t*) h_flagB_ < want) {
         err = std::string(who) + ": the PCIe share of layer " + std::to_string(layer) + " did not land";
         return false;
     }
@@ -481,9 +504,14 @@ void MoeWindow::release(strata::gpu::Stream cs) {
     *(volatile uint32_t*) h_flag_ = UINT32_MAX;
     strata::gpu::stream_sync(cs);
     strata::gpu::stream_sync(copy_);
+    copy_used_ = false;
 }
 
-bool MoeWindow::sync_copies() { return strata::gpu::stream_sync(copy_); }
+bool MoeWindow::sync_copies() {
+    const bool ok = strata::gpu::stream_sync(copy_);
+    if (ok) copy_used_ = false;
+    return ok;
+}
 
 strata::gpu::Status MoeWindow::copies_status() { return strata::gpu::stream_status(copy_); }
 

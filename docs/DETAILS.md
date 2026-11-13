@@ -285,13 +285,14 @@ Its license is the Swift Open License 1.0: read it on the model page.
 ./setup.sh --setup --family swift --model IQ2_XS
 ```
 
-### Or: Unsloth's Dynamic v3.1 (UD-Q2_0 to UD-IQ4_XS)
+### Or: Unsloth's Dynamic v3.1 (UD-IQ1_M to UD-IQ4_XS)
 
-**[Unsloth's Dynamic v3.1](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)** (2026-11-04) are 2- to 4-bit versions of the original model (upstream #621's UD-IQ4_XS is now this version too).
+**[Unsloth's Dynamic v3.1](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)** (2026-11-04) are 1- to 4-bit versions of the original model (upstream #621's UD-IQ4_XS is now this version too).
 The experts' gate and up are IQ2_XXS to IQ4_XS and their downs Q2_0, IQ4_NL and Q5_0; the n-gram table is in the last shard (IQ4_NL).
 
 | Size | Download | Experts | RAM that holds them all |
 | --- | ---: | ---: | ---: |
+| UD-IQ1_M | 68.0 GB | 34.8 GB | about 59 GB |
 | UD-Q2_0 | 70.5 GB | 37.4 GB | about 61 GB |
 | UD-IQ2_XS | 75.8 GB | 42.3 GB | about 66 GB |
 | UD-Q2_K_XL | 79.6 GB | 46.0 GB | about 70 GB |
@@ -837,6 +838,22 @@ Every model file setup downloads has a fixed size and SHA-256 (upstream e193161d
 When the server's size is not the pinned one, setup stops before the download; a downloaded file that does not match its SHA-256 is deleted and setup stops.
 When the pinned revision is gone from the repository, setup stops (for testing, `XESTRATA_ALLOW_UNPINNED=1` takes the current files without the check).
 
+**Fetching the files yourself (the `hf` command)**: setup downloads over 16 connections (`XESTRATA_DL_CONNECTIONS` 1 to 32), resumes a stopped download and checks every file's SHA-256 against the pinned value.
+Measured by upstream from two computers (a home PC and a server in China), anonymous downloads from Hugging Face ran at 16 to 19 MB/s whatever the connection count (one stream 7 MB/s, 16 connections 17, 32 connections 19).
+Hugging Face's own `hf` command with its Xet backend gave 16 to 24 MB/s anonymously in the same test, so it is not faster by itself.
+Hugging Face limits anonymous requests per IP address and says a login (a token of your own account) raises the limits, so if the download is slow you can fetch the file with the `hf` command, optionally after `hf auth login`, and give the folder to setup:
+
+```bash
+uvx hf auth login            # optional: your own Hugging Face account; XeStrata does not read or send this token
+uvx hf download agentionai/Qwen3.8-Flash-Next-Gyro-GGUF Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf \
+    --revision 1ada08422e404aca51ab9df665f089f34c419c6b --local-dir /data/gyro-s
+./setup.sh --gguf-dir /data/gyro-s       # Windows: xestrata-cli --gguf-dir D:\gyro-s
+```
+
+Use the file names and the revision setup shows for your model (the revision above is the one this version pins for Gyro-S: another version of XeStrata may pin another).
+Keep the file's original name. Setup finds the files in `--gguf-dir`, checks their SHA-256 and does not download them again; a file that does not match the published one is reported and, for files in your own folder, never deleted.
+Without `uvx`, `pip install -U huggingface_hub` gives the same `hf` command.
+
 **From ModelScope** (mainland China, upstream #908): every repository setup downloads from (the GSQ-RCO models, Swift 1.5, the Coder, Unsloth's files, and the original checkpoint the MTP draft layer is taken from) is on [ModelScope](https://www.modelscope.cn) under the same name, with the same files.
 Setup never switches to it by itself (a download that fails says how).
 Choose it with `--source modelscope` (`XESTRATA_SOURCE=modelscope`).
@@ -1180,6 +1197,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   So are the forms next to the template's (a call that opens with `<parameter=NAME>`, JSON inside `<tool_call>`, a `<function=NAME>` block without `<tool_call>`, a second call inside one `<tool_call>`) when the call is a declared tool's (the default since upstream 0.2.8).
   On 1,462 agent turns 98.3% read as intended with it and 92.9% without.
   `"tool_call_recovery": false` in `xestrata-<model>.json` turns it off.
+  A well-formed call of a name the request did not declare can come back as a tool call instead, with `"undeclared_tool_calls": "call"` in `xestrata-<model>.json` (or `XESTRATA_UNDECLARED_TOOL_CALLS=call`; the config wins): it is for a client with its own policy for unknown names (it answers the model with the tool names it has). The default, `"text"`, stays the text the model wrote, with `strata_rejected_tool_calls` beside it (upstream #4622).
   A `<tool_call>` block that still does not read as a call is counted in the server window.
 - **What the parser repairs, and what it leaves.** A string argument that quotes a whole tool call, or repeats its own `</parameter><parameter=NAME>`, stays exact (upstream #4078).
   A call whose `</function>` was left out is read as the call (upstream #4427), in the answer and inside the thinking.
@@ -1193,6 +1211,9 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   A client that wants to recover can answer the model with the tool names it does have and ask again; XeStrata never runs or forwards a call for a tool the request did not declare.
   The server window prints the same names, and `/metrics/prometheus` counts the blocks in `strata:tool_calls_unread_total`.
   A block that is malformed (not an undeclared name) is counted there as well, but has no name to list.
+- **Anthropic's tool search on `/v1/messages`** (upstream #4663). A tool with `"defer_loading": true` is declared but not listed in the prompt; a `tool_reference` block in a `tool_result` (a tool search's result) puts that tool's definition into the prompt where it stands, in the form the tool list uses, so loading a tool leaves the prompt's start, and the prompt cache, unchanged.
+  Any other reference is left out, as before (a tool whose MCP server is gone must not fail the session).
+  A request with a deferred tool holds back more tools than it declares (Claude Code declares ToolSearch and a `DeferredToolPlaceholder` and names its MCP tools in the conversation), so there a call for an undeclared name is returned as a `tool_use`: Claude Code runs it, where text ended the turn.
 - **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8095/v1`, any API key.
 - **OpenCode** (upstream #543). A starting point for `opencode.jsonc` (in your project, or `~/.config/opencode/`).
   The field names are OpenCode's, so check its config docs if your version differs:
@@ -1517,9 +1538,11 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
 - The penalties (`presence_penalty`, `frequency_penalty`, `repetition_penalty`) ride the same path.
   `penalty_last_n` caps how many recent tokens they count over, 64 by default when any penalty is set.
   llama.cpp's names `repeat_penalty` and `repeat_last_n` work too, in the config's `sampling` block and in a request (upstream #1819).
-  They count the tokens the request has consumed, so a repetition penalty suppresses what the model itself just said, not the prompt alone.
   They apply to every token speculative decoding checks at once, exactly as if it decoded one token at a time.
   The draft layer guesses without penalties, so more of its guesses are rejected and requests with penalties run slower.
+  The penalty window (`penalty_last_n`, 64 by default when any penalty is set) is the last tokens of prompt and reply together.
+  `XESTRATA_PENALTY_PROMPT=0` counts only the tokens the current reply has written (upstream #4590): the prompt, including earlier assistant turns in it, is not counted, so the numbers or a quoted earlier answer in a new task are not penalised.
+  Both engines (Qwen3.8-Flash-Next and plain) count this way.
 - `top_k` keeps at most 64 candidates: `0` ("off") or anything above 64 uses all 64.
 - A sampling field sent as a numeric string (`"0.7"`) is read and used; a value that cannot be read as a number, or of another type (`true`), is a 400 that names the field (upstream #1663).
 - **logit_bias**: `"logit_bias"` in `/v1/chat/completions` (`{"<token id>": -100 to 100}`, or a list of `[id, bias]` pairs) is added before the penalties and filters (upstream dcc6f756).
@@ -2271,7 +2294,7 @@ The web app's About > Model terms shows the full terms of the models it runs now
   The Coder: [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)
   (Apache-2.0 per its card); its support in Strata came from @pjgmobile's PR #54.
   Swift 1.5: [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) by UkisAI.
-  UD-Q2_0 to UD-Q4_K_XL (Dynamic v3.1), UD-Q5_K_XL, UD-Q6_K_XL and Q8_0: [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) by Unsloth.
+  UD-IQ1_M to UD-Q4_K_XL (Dynamic v3.1), UD-Q5_K_XL, UD-Q6_K_XL and Q8_0: [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) by Unsloth.
   Gyro: [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) by agentionai;
   Gyro-Coder: [agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF), also by agentionai.
   The abliterated versions: [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF) by huihui-ai;

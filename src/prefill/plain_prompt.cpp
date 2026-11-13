@@ -12,6 +12,7 @@
 // The state is left as the windows leave it: the GDN recurrent state and conv history (the same layouts), the K/V
 // cells of the chunk's positions.  The decode then continues at the next position.
 #include "strata/core/plain_model.hpp"
+#include "strata/core/stream_watch.hpp"
 #include "strata/core/plain_cpu.hpp"
 #include "strata/core/expert_tier.hpp"
 
@@ -881,6 +882,8 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
 
 bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err) {
     if (cpu_ != nullptr) return cpu_run(tokens, n, pos, 1, out, logits, err);
+    // upstream 711a7e937: the stall report asks this stream (the one the prompt's waits block on) whether its work is done
+    const strata::core::WatchedStream watched("the prompt path's compute stream", cs_, strata::core::current_device());
     return next_.empty() ? prompt_one(tokens, n, pos, out, logits, err) : prompt_split(tokens, n, pos, out, logits, err);
 }
 
