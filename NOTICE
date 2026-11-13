@@ -43,6 +43,15 @@ Every copyright holder whose work is in this repository, its license and where t
   under the LGPL: LGPL-3.0-or-later AND MIT) - text below and in
   third_party/main/ggml/LICENSE. setup also fetches llama.cpp (MIT, the same authors) into third_party/main/llama.cpp,
   with its own LICENSE
+- Copyright (c) 2026 Edge0
+  Apache-2.0 - the latent MoE support (Edge0-145B / Edge0-120B, Qwen3.8-Flash-Next's shell with experts at a latent
+  width): the pack readers (src/core/latent.cpp, include/strata/core/latent.hpp), the latent kernels
+  (src/kernels/xe/latent.cpp, include/strata/kernels/latent.hpp) and the layer parity (src/kernels/latent_parity.cpp),
+  written after the latent additions of edge0-strata (https://github.com/Edge0-AI/Edge0, branch feat/edge0-strata at
+  761f14a), a fork of Strata whose directory keeps Strata's MIT; Edge0's contributions carry the Edge0 repository's
+  Apache-2.0. The files keep both notices and are under the LGPL as a whole (LGPL-3.0-or-later AND MIT AND
+  Apache-2.0) - LICENSES/Apache-2.0.txt. The models' weights are under the Edge0 Community Model License 1.0 and the
+  Qwen Community License 1.0 (non-free): XeStrata does not bundle them; setup fetches them to the user's machine
 - Copyright (c) 2026 Peasant Smith and the Project Maya contributors
   MIT - the loop guard of the server (serve/loop_guard.py and its tests), transcribed from Project Maya
   (https://github.com/mw00/project-maya), a fork of Strata; the code stays under MIT, the files as a whole are under
