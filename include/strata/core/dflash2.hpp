@@ -109,11 +109,7 @@ public:
     /// made from (2560 int8 codes + 80 block scales a position, 2.9 KB) into a host log of the lineage; a rebuild runs
     /// the K/V projections, norms, rope and ring writes over the logged rows with the same kernels, so the rebuilt
     /// K/V bytes are those of the original update.
-    struct RingStats {
-        int64_t requests = 0, rebuilds = 0, rows_rebuilt = 0, rows_missing = 0, stash_hits = 0, stash_stores = 0,
-                stash_evictions = 0, cold_starts = 0;
-        double ms_rebuild = 0, ms_swap = 0;
-    };
+    using RingStats = DraftRingHistory::Stats;
     RingStats ring_stats;
     int64_t last_rebuilt = 0, last_missing = 0;
     double last_ms = 0;
@@ -246,29 +242,21 @@ private:
     bool ctx_pending_ = false;      ///< context_async queued rows nobody has waited for yet
 
     // ---- ring log (see begin_request)
-    static constexpr int kLogChunk = kDraftLogChunk;
-    using LogChunk = DraftLogChunk;
-    using Lineage = DraftLineage;
-    Lineage cur_;
-    std::deque<Lineage> stash_;
+    DraftRingHistory history_;
     bool log_on_ = true;
     uint64_t stash_budget_ = 256ull << 20;
     int8_t* h_logq_ = nullptr;      ///< host USM: the last update's codes [8][2560] ...
     float* h_logd_ = nullptr;       ///< ... and scales [8][80], copied from the device after the update
     int64_t pend_pos0_ = -1;
     int pend_n_ = 0;
-    int64_t slot_pos_[kRing] = {};  ///< host shadow of the device ring tags
     uint8_t* rb_q_ = nullptr;       ///< rebuild scratch (device): the window's codes, scales and positions
     float* rb_d_ = nullptr;
     int32_t* rb_pos_ = nullptr;
     void log_stage(int64_t pos0, int n);
     void log_fetch(int n);
     void log_flush();
-    bool rebuild(int64_t lo, int64_t hi, int64_t* rebuilt, int64_t* missing, std::string& err);
-    void stash_push(Lineage&& l);
-    void invalidate_ring();
-    int64_t ring_hi_ = 0;
-    int32_t epoch_ = 0;
+    bool replay(const int32_t* positions, const int8_t* q, const float* scales, int rows, int32_t epoch,
+                std::string& err);
 };
 
 }  // namespace strata::core
