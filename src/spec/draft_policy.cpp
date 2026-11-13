@@ -305,14 +305,31 @@ bool read_cost_file(const std::string& path, const std::string& key, CostFile& o
             continue;
         }
         if (line.rfind("cal ", 0) == 0) {
-            int cb = -1, ct = -1, cn = -1;
+            int cb = -1, ct = -1, cn = -1, used = 0;
             double cs = -1.0;
-            if (std::sscanf(line.c_str(), "cal %d %d %d %lf", &cb, &ct, &cn, &cs) != 4 || cb < 0 || cb >= CostLearner::kCtxBuckets || ct < 1 || ct > CostLearner::kMaxT
+            if (std::sscanf(line.c_str(), "cal %d %d %d %lf%n", &cb, &ct, &cn, &cs, &used) != 4 || cb < 0 || cb >= CostLearner::kCtxBuckets || ct < 1 || ct > CostLearner::kMaxT
                 || cn < 0 || cn > 100000 || !(cs >= 0.0) || !(cs < 1e9)) {
                 why = "a malformed calibration line";
                 return false;
             }
-            out.cal[(size_t) cb][(size_t) ct] = CalAcc{cn, cs};
+            CalAcc ca;
+            ca.n = cn;
+            ca.sum = cs;
+            {   // the rounds themselves (a line from before them: none, the mean decides as it did)
+                const char* p = line.c_str() + used;
+                int k = 0;
+                bool ok = true;
+                while (k < CalAcc::kVals) {
+                    char* e = nullptr;
+                    const double v = std::strtod(p, &e);
+                    if (e == p) break;
+                    if (!(v > 0.0) || !(v < 1e6)) { ok = false; break; }
+                    ca.vals[(size_t) k++] = v;
+                    p = e;
+                }
+                ca.nv = ok && k == cn && cn <= CalAcc::kVals ? k : 0;
+            }
+            out.cal[(size_t) cb][(size_t) ct] = ca;
             continue;
         }
         if (line.rfind("rc ", 0) == 0) {
@@ -386,7 +403,13 @@ bool write_cost_file(const std::string& path, const CostFile& c, std::string& wh
                 const CalAcc& a = c.cal[(size_t) k][(size_t) t];
                 if (a.n <= 0 || (c.real[(size_t) k] >> (t - 1) & 1u)) continue;
                 std::snprintf(b, sizeof b, "%.4f", a.sum);
-                f << "cal " << k << " " << t << " " << a.n << " " << b << "\n";
+                f << "cal " << k << " " << t << " " << a.n << " " << b;
+                if (a.nv == a.n)
+                    for (int i = 0; i < a.nv; ++i) {
+                        std::snprintf(b, sizeof b, "%.4f", (double) a.vals[(size_t) i]);
+                        f << " " << b;
+                    }
+                f << "\n";
             }
         }
         if (c.cpu_share >= 0.0) {
@@ -673,7 +696,16 @@ void DraftPolicy::apply_table() {
             if (real_[(size_t) k] >> (t - 1) & 1u) cost_[(size_t) k][(size_t) t] = real_cost_[(size_t) k][(size_t) t];
             else cost_[(size_t) k][(size_t) t] = learned_[(size_t) k][(size_t) t] * (t >= 2 ? r : 1.0);
         }
-        for (int t = 2; t <= n; ++t)   // more rows never cost less
+        // more rows never cost less.  An inversion is repaired from the trusted side: a size that is only guessed (not real), or that sits below another real size, is
+        // LOWERED to the price of the next larger size first (a cold first-use round or a live value taken at take-over made it too high; raising every larger size to it,
+        // as a forward pass alone does, made one 20 ms 2-row price of the srv118 table the price of every size from 2 to 7 rows and the policy took 12-row windows);
+        // a real size above an unreached next size is left, and the forward pass then lifts that guess to it
+        for (int t = n - 1; t >= 1; --t) {
+            const bool real_t = real_[(size_t) k] >> (t - 1) & 1u, real_next = real_[(size_t) k] >> t & 1u;
+            if (cost_[(size_t) k][(size_t) t] > cost_[(size_t) k][(size_t) t + 1] && (!real_t || real_next))
+                cost_[(size_t) k][(size_t) t] = cost_[(size_t) k][(size_t) t + 1];
+        }
+        for (int t = 2; t <= n; ++t)
             if (cost_[(size_t) k][(size_t) t] < cost_[(size_t) k][(size_t) t - 1]) cost_[(size_t) k][(size_t) t] = cost_[(size_t) k][(size_t) t - 1];
     }
 }
@@ -772,6 +804,7 @@ void DraftPolicy::use_table() {
 }
 
 void DraftPolicy::calib_add(int bucket, int t, double ms, double age) {
+    static_assert(kCalibN <= CalAcc::kVals, "a size's rounds are all kept for the median");
     if (bucket < 0 || bucket >= kCtxBuckets || t < 1 || t > fixed_n_[(size_t) bucket]) return;
     if (real_[(size_t) bucket] >> (t - 1) & 1u) return;
     if (calib_fresh_only_ && age > CostLearner::kFreshS) return;   // the table is what rounds of the first seconds of a busy run cost
@@ -780,7 +813,9 @@ void DraftPolicy::calib_add(int bucket, int t, double ms, double age) {
     if (!(base > 0.0)) return;
     CalAcc& a = cal_[(size_t) bucket][(size_t) t];
     if (a.n >= kCalibN) return;
-    a.sum += std::clamp(ms, kCalibLo * base, kCalibHi * base);   // one stalled round moves the mean by at most (kCalibHi - 1) / kCalibN
+    const double r = std::clamp(ms, kCalibLo * base, kCalibHi * base);   // one stalled round moves the mean by at most (kCalibHi - 1) / kCalibN
+    a.sum += r;
+    if (a.nv == a.n && a.n < CalAcc::kVals) a.vals[(size_t) a.nv++] = r;   // the rounds are kept: the price is their median
     a.n += 1;
     calib_dirty_ = true;
 }
@@ -797,7 +832,13 @@ bool DraftPolicy::calibrate(CostFile& cf, std::string& report) {
             if (real_[(size_t) k] >> (t - 1) & 1u) continue;
             CalAcc& a = cal_[(size_t) k][(size_t) t];
             if (a.n < kCalibN) continue;
-            const double v = a.sum / a.n, base = learned_[(size_t) k][(size_t) t];
+            double v = a.sum / a.n;   // a file from before the kept rounds: the mean
+            if (a.nv == a.n && a.n > 0) {   // the median of the rounds: a cold first use, a stall, another process move a mean, not a median
+                std::array<double, CalAcc::kVals> s = a.vals;
+                std::sort(s.begin(), s.begin() + a.nv);
+                v = a.nv % 2 == 1 ? s[(size_t) a.nv / 2] : 0.5 * (s[(size_t) a.nv / 2 - 1] + s[(size_t) a.nv / 2]);
+            }
+            const double base = learned_[(size_t) k][(size_t) t];
             if (!(base > 0.0) || (v >= kCalibOkLo * base && v <= kCalibOkHi * base)) {   // no learned cost (passive): the clamped rounds are taken as they are
                 if (base > 0.0) std::snprintf(b, sizeof b, "%s%d rows %.2f -> %.2f", report.empty() ? "" : ", ", t, base, v);
                 else std::snprintf(b, sizeof b, "%s%d rows real %.2f", report.empty() ? "" : ", ", t, v);

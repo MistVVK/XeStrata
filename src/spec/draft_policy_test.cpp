@@ -544,6 +544,125 @@ int main() {
         check(g5.lookup && g5.t == 5 && g5.pad == 3, "pad: the next unmeasured size follows once one has its samples");
         check(g.choose(1, 1, 3, 1).pad == 0, "pad: a pad_cap of one draft makes no filler");
     }
+    {   // DRAFT-COSTS-5: a real price is the MEDIAN of its 16 rounds; the monotone guard repairs an inversion from the trusted side
+        namespace fs = std::filesystem;
+        using strata::spec::CalAcc;
+        using strata::spec::CostFile;
+        using strata::spec::CostLearner;
+        using Cal = std::array<std::array<CalAcc, CostLearner::kMaxT + 1>, CostLearner::kCtxBuckets>;
+        using Rc = std::array<std::array<double, CostLearner::kMaxT + 1>, CostLearner::kCtxBuckets>;
+        using Real = std::array<unsigned, CostLearner::kCtxBuckets>;
+        const double tab[5] = {12.68, 14.30, 16.41, 18.57, 20.90};
+        const Cal cal0{};
+        const Rc rc0{};
+        {   // one cold round among 16 (the first use of a width): the real price is the median, a mean would be moved by it
+            DraftPolicy m(8);
+            m.set_fixed_costs(tab, 5, 0);
+            m.start_calibration(false, Real{}, cal0, rc0);
+            for (int i = 0; i < 15; ++i) m.observe(false, 2, 1, 0, 14.5);
+            m.observe(false, 2, 1, 0, 40.0);
+            CostFile cf;
+            std::string rep;
+            check(m.calibrate(cf, rep) && (cf.real[0] & 2u), "median: the 16th round marks the size real");
+            check(std::fabs(cf.real_cost[0][2] - 14.5) < 1e-9, "median: one cold round among 16 does not move the real price");
+        }
+        {   // eight slow rounds in the first request, eight normal ones after: the median sits between (even count: mean of the two middle rounds)
+            DraftPolicy m(8);
+            m.set_fixed_costs(tab, 5, 0);
+            m.start_calibration(false, Real{}, cal0, rc0);
+            for (int i = 0; i < 8; ++i) m.observe(false, 2, 1, 0, 15.0);
+            for (int i = 0; i < 8; ++i) m.observe(false, 2, 1, 0, 14.0);
+            CostFile cf;
+            std::string rep;
+            check(m.calibrate(cf, rep) && std::fabs(cf.real_cost[0][2] - 14.5) < 1e-9, "median: sixteen rounds of two values: the mean of the two middle ones");
+        }
+        {   // the rounds survive the file (a start collects part of them, the next start the rest) and a file line without them still loads (mean as before)
+            const fs::path dir = fs::temp_directory_path() / ("strata-dpt-med-" + std::to_string((unsigned long long) (uintptr_t) &tab));
+            const std::string path = (dir / "m.costs").string();
+            CostFile c;
+            c.key = "k";
+            c.tables[0] = {12.68, 14.30, 16.41};
+            c.cal[0][2] = CalAcc{};
+            c.cal[0][2].n = 3;
+            c.cal[0][2].sum = 43.5;
+            c.cal[0][2].nv = 3;
+            c.cal[0][2].vals = {14.5, 14.0, 15.0};
+            c.cal[0][3].n = 2;   // no rounds kept (a file of an older build): only the sum
+            c.cal[0][3].sum = 33.0;
+            std::string why;
+            check(strata::spec::write_cost_file(path, c, why), "median file: written");
+            CostFile r;
+            check(strata::spec::read_cost_file(path, c.key, r, why), "median file: read back");
+            check(r.cal[0][2].n == 3 && r.cal[0][2].nv == 3 && std::fabs((double) r.cal[0][2].vals[1] - 14.0) < 1e-6 && std::fabs(r.cal[0][2].sum - 43.5) < 1e-3,
+                  "median file: the kept rounds come back with their count and sum");
+            check(r.cal[0][3].n == 2 && r.cal[0][3].nv == 0 && std::fabs(r.cal[0][3].sum - 33.0) < 1e-3, "median file: a line without rounds keeps only n and sum (the mean decides)");
+            std::error_code ec;
+            fs::remove_all(dir, ec);
+        }
+        {   // fixture 1: the srv118 table as taken over (a real 2-row price of 20.08 ms, the sizes above it real or unreached): the outlier is lowered, 3-6 rows keep their prices
+            const double t12[12] = {7.928, 20.085, 9.577, 10.524, 12.136, 13.270, 19.223, 21.293, 23.659, 26.024, 28.390, 30.756};
+            Real real0{};
+            real0[0] = 63u;
+            Cal cal1{};
+            Rc rc1{};
+            const double rcv[7] = {0.0, 7.9276, 20.0847, 9.5771, 10.5245, 12.1355, 13.2695};
+            for (int t = 1; t <= 6; ++t) rc1[0][(size_t) t] = rcv[t];
+            DraftPolicy p(12);
+            p.set_fixed_costs(t12, 12, 0);
+            p.start_calibration(false, real0, cal1, rc1, 100);
+            bool mono = true;
+            for (int t = 2; t <= 12; ++t) mono = mono && p.cost_ms(t) >= p.cost_ms(t - 1) - 1e-12;
+            check(mono, "guard: the used table never costs less for more rows");
+            check(std::fabs(p.cost_ms(2) - 9.5771) < 1e-9 && std::fabs(p.cost_ms(3) - 9.5771) < 1e-9 && std::fabs(p.cost_ms(4) - 10.5245) < 1e-9 && std::fabs(p.cost_ms(6) - 13.2695) < 1e-9,
+                  "guard: the 20 ms 2-row outlier is lowered to the next real price, not raised into every larger size");
+            check(std::fabs(p.cost_ms(1) - 7.9276) < 1e-9, "guard: the 1-row price is untouched");
+        }
+        {   // fixture 2: the Q2_0 table at take-over: 4 rows an unreached live value above the real 5 rows
+            const double q[5] = {12.966, 14.482, 17.042, 21.796, 21.361};
+            Real real0{};
+            real0[0] = 23u;   // sizes 1, 2, 3, 5
+            Cal cal1{};
+            Rc rc1{};
+            rc1[0][1] = 12.9665;
+            rc1[0][2] = 14.4821;
+            rc1[0][3] = 17.0419;
+            rc1[0][5] = 21.3610;
+            DraftPolicy p(8);
+            p.set_fixed_costs(q, 5, 0);
+            p.start_calibration(false, real0, cal1, rc1, 100);
+            check(std::fabs(p.cost_ms(4) - 21.3610) < 1e-9 && std::fabs(p.cost_ms(5) - 21.3610) < 1e-9 && std::fabs(p.cost_ms(3) - 17.0419) < 1e-9,
+                  "guard: an unreached 4 rows above the real 5 rows is lowered to it");
+        }
+        {   // fixture 3: the IQ3_S table at take-over: 4 rows 28.31 (a live value) above the real 5 rows 25.00
+            const double q[5] = {14.734, 16.967, 20.096, 28.312, 25.005};
+            Real real0{};
+            real0[0] = 23u;
+            Cal cal1{};
+            Rc rc1{};
+            rc1[0][1] = 14.7341;
+            rc1[0][2] = 16.9669;
+            rc1[0][3] = 20.0959;
+            rc1[0][5] = 25.0046;
+            DraftPolicy p(8);
+            p.set_fixed_costs(q, 5, 0);
+            p.start_calibration(false, real0, cal1, rc1, 100);
+            check(std::fabs(p.cost_ms(4) - 25.0046) < 1e-9 && std::fabs(p.cost_ms(5) - 25.0046) < 1e-9 && std::fabs(p.cost_ms(2) - 16.9669) < 1e-9,
+                  "guard: IQ3_S 4 rows 28.31 is lowered to the real 5 rows 25.00");
+        }
+        {   // a real size above an unreached next size is not lowered by the guess: the guess is lifted to it
+            const double q[5] = {12.0, 14.0, 20.0, 15.0, 16.0};
+            Real real0{};
+            real0[0] = 4u;   // size 3 real at 20.0
+            Cal cal1{};
+            Rc rc1{};
+            rc1[0][3] = 20.0;
+            DraftPolicy p(8);
+            p.set_fixed_costs(q, 5, 0);
+            p.start_calibration(false, real0, cal1, rc1, 100);
+            check(std::fabs(p.cost_ms(3) - 20.0) < 1e-9 && p.cost_ms(4) >= 20.0 - 1e-9 && p.cost_ms(5) >= p.cost_ms(4) - 1e-12 && std::fabs(p.cost_ms(2) - 14.0) < 1e-9,
+                  "guard: a real price is kept against a guessed larger size, which is lifted to it");
+        }
+    }
     {   // calibration against real rounds
         using strata::spec::CalAcc;
         using strata::spec::CostFile;
@@ -722,7 +841,7 @@ int main() {
                   "passive: real size 2 at its real cost, size 4 at its live cost, size 3 (never measured) at the policy's prior");
             for (int i = 0; i < 17; ++i) b.observe(true, 4, 2, 0, 20.1);   // the unreached size keeps collecting
             CostFile cb3 = cb2;
-            check(b.calibrate(cb3, rp) && (cb3.real[0] & 8u) && std::fabs(b.cost_ms(4) - (5 * 19.9 + 11 * 20.1) / 16.0) < 1e-6, "passive: after the take-over a size still collects and becomes real at 16 own rounds");
+            check(b.calibrate(cb3, rp) && (cb3.real[0] & 8u) && std::fabs(b.cost_ms(4) - 20.1) < 1e-9, "passive: after the take-over a size still collects and becomes real at 16 own rounds (its price the median: 5 rounds of 19.9, 11 of 20.1)");
         }
         // the file round trip: state, real, real cost, cal
         CostFile w;

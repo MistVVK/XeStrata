@@ -109,10 +109,16 @@ private:
 ///   share <0..1>              (optional: the CPU prompt share learned on this machine, src/prefill/prefill.cpp)
 ///   pcie <0..1>               (optional: the decode PCIe share PcieAuto settled on, src/program/generate.cpp)
 ///   end
-/// The real rounds of one size seen since the table was learned: n rounds, their sum in ms (each clamped to [kCalibLo, kCalibHi] x the learned cost).
+/// The real rounds of one size seen since the table was learned: n rounds, their sum in ms (each clamped to [kCalibLo, kCalibHi] x the learned cost), and the
+/// rounds themselves (up to kVals): the size's real price is their MEDIAN (a cold or stalled round, a first use, another process, moves a mean but not a median).
+/// A file line from before the values ("cal b t n sum" without them) has nv = 0: its price is the mean as before.
+///   cal <bucket> <size> <n> <sum> [<ms of round 1> ... <ms of round n>]
 struct CalAcc {
+    static constexpr int kVals = 16;
     int n = 0;
     double sum = 0.0;
+    int nv = 0;                          ///< how many of vals hold a round (== n when every round is kept)
+    std::array<double, kVals> vals{};
 };
 struct CostFile {
     std::string key;
