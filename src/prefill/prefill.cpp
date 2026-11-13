@@ -5493,7 +5493,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         bool i8_few = false;   // the few-rows route: the layer's groups run on native_expert_grouped, the activations as quantize_q8_1_rows makes them
                         // (a build without MMQ has no use_mmq layer: the layers the fused kernels do not take come here too, as long as the buffers below exist)
                         if (lay.native && strata::kernels::i8_order_allows(fused_l, fz_staged) && !wmma_l && !had_gu && !had_d && rows_cpu == 0 && on_peer.empty() && !m.pp &&
-                            m.group_cap == 0 && !m.fused_bufs && !lay.fmt[(size_t) l].tail_off && ws::mode() == 0 &&
+                            m.group_cap == 0 && (!m.fused_bufs || !stream_all) && !lay.fmt[(size_t) l].tail_off && ws::mode() == 0 &&
                             !(m.cache && mmq_plan().direct[(size_t) l]) && i8_group_env && !order.empty() &&
                             m.GU != nullptr && m.Dm != nullptr && m.src_dev != nullptr && m.ids_identity != nullptr &&
 #if STRATA_EXPERT_NIBBLE_BUILT
