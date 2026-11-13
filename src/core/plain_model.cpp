@@ -22,7 +22,6 @@
 #include "strata/core/kv_elastic.hpp"
 #include "strata/core/kv_grow_hold.hpp"
 #include "strata/core/plain_model.hpp"
-#include "strata/core/dense_slab.hpp"
 #include "strata/core/constraint_upload.hpp"
 
 #include "strata/core/plain_cpu.hpp"
@@ -146,7 +145,6 @@ PlainModel::~PlainModel() {
             strata::gpu::free(conv_snap_[g][t]);
         }
     for (void* p : allocs_) strata::gpu::free(p);
-    dense_slab_.reset();
     for (void* p : {(void*) h_emb_, (void*) h_step_, (void*) h_pos_, (void*) h_out_, (void*) h_prob_, (void*) fill_tmp_,
                     (void*) hand_host_, (void*) h_rroute_})
         strata::gpu::free(p);
@@ -193,13 +191,12 @@ bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::
         w.data = nullptr;
         return true;
     }
-    if (!dense_slab_) dense_slab_ = std::make_unique<DenseSlab>();
-    void* d = dense_slab_->alloc(bytes);
-    if (!d) {
+    void* d = nullptr;
+    if (!strata::gpu::alloc_device(&d, bytes)) {
         err = "plain model: no VRAM for " + name;
         return false;
     }
-    if (!dense_slab_->owns(d)) allocs_.push_back(d);
+    allocs_.push_back(d);
     if (!strata::gpu::copy(d, src, bytes)) {
         err = "plain model: uploading " + name + " failed";
         return false;
@@ -258,13 +255,12 @@ bool PlainModel::upload_f32(const GgufModel& m, const std::string& name, uint64_
         }
         src = wide.data();
     }
-    if (!dense_slab_) dense_slab_ = std::make_unique<DenseSlab>();
-    void* d = dense_slab_->alloc(elements * 4);
-    if (!d) {
+    void* d = nullptr;
+    if (!strata::gpu::alloc_device(&d, elements * 4)) {
         err = "plain model: no VRAM for " + name;
         return false;
     }
-    if (!dense_slab_->owns(d)) allocs_.push_back(d);
+    allocs_.push_back(d);
     if (!strata::gpu::copy(d, src, elements * 4)) {
         err = "plain model: uploading " + name + " failed";
         return false;
