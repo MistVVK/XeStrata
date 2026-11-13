@@ -2586,6 +2586,7 @@ int plain_main(int argc, char** argv) {
     shared.lookup_chain_min_lo = 1;
     shared.pipeline_windows = &opt.pipeline_windows;
     shared.pipeline_windows_hi = -1;
+    shared.wide_window = true;
     shared.adapt_mib_per_token = &opt.adapt_mib_per_token;
     shared.batch = &opt.batch_slots;
     shared.batch_clamp0 = true;
@@ -2684,14 +2685,6 @@ int plain_main(int argc, char** argv) {
         else if (a == "--max-t") {
             opt.max_t = (int) std::strtol(next("--max-t"), nullptr, 10);
             max_t_given = true;
-        } else if (a == "--wide-window") {
-            const char* v = next("--wide-window");
-            strata::core::WideWindow w;
-            if (!strata::core::parse_wide_window(v, w)) {
-                std::fprintf(stderr, "xestrata (%s): --wide-window takes auto, off or on, not \"%s\"\n", arch.c_str(), v);
-                return 2;
-            }
-            strata::core::set_wide_window(w);
         }
         else if (a == "--resident-experts") opt.resident_gib = -1;
         else if (a == "--resident-cpu-experts") {

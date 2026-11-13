@@ -2328,6 +2328,7 @@ int main(int argc, char** argv) {
     shared.lookup_chain_min_lo = 3;
     shared.pipeline_windows = &o.pipeline_windows;
     shared.pipeline_windows_hi = 2;
+    shared.wide_window = true;
     shared.adapt_mib_per_token = &o.adapt_mib_per_token;
     shared.adapt_mib_clamp0 = true;
     shared.batch = &o.batch;
