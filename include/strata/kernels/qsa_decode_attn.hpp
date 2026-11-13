@@ -35,6 +35,13 @@ struct QsaAttnPools {
     const int32_t* page_table = nullptr;
 };
 
+/// A batch window's queries, each with its own slot's pools (upstream 7a9245b6c): query z reads rows.p[z].
+/// `n == 0`: `pools` for every query.  At most kQsaRowsMax rows (a verify window's slots).
+struct QsaAttnPoolsRows {
+    QsaAttnPools p[kQsaRowsMax];
+    int n = 0;
+};
+
 /// Scratch floats for `cap` selected cells: partial accumulators, maxima and sums.
 uint64_t qsa_decode_attn_scratch_floats(int64_t cap, const QsaShapes& s);
 
@@ -45,6 +52,10 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 /// [n_q, kStepCount], attn [n_q, n_head, 256]; scratch is `n_q` times the single-query size.
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
+/// The same with a batch window's own pools per query (upstream 7a9245b6c): row z of the window attends over the
+/// cells of its slot's K/V, in one launch.  Every row's pools must be of the same format.
+void qsa_decode_attn_batch_rows(const float* q, const QsaAttnPoolsRows& rows, const int32_t* ids, const int32_t* steps,
+                                int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
 
 /// The same kernels over EVERY cell of the cache, cells [0, step[kStepNKv]), with no selection: the full attention of
 /// qwen35moe (Ornith-1.5: 16/2 heads of 256), qwen35 (Qwen3.5-9B: 16/4 heads of 256) and qwen3moe (llm-jp-4.1: 40/4

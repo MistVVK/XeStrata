@@ -36,7 +36,9 @@
 #include "strata/kernels/swiglu_clamp.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/per_device.hpp"
+#include "strata/core/timed_choice.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/gpu.hpp"
 #include "cuda_intrinsics.hpp"
 #include "device_target.hpp"
 #include "iq_bits.hpp"
@@ -56,6 +58,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <vector>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -1168,6 +1172,95 @@ sycl::event launch_native_gu(sycl::queue& q, size_t cap_groups, const unsigned l
             }
         }
     });
+}
+
+// Two gate/up rows share each loaded Q8 activation block.  Each row keeps the same integer butterflies and
+// accumulation order as seg_dot_canon; only formats whose parts read exactly one Q8 block can take this form.
+template<int TG>
+sycl::event launch_native_gu_pair(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
+                                  const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_tok,
+                                  const block_q8_1* xq, NativeExpertLayout L, float* gate, float* up, int part) {
+    static_assert(TG == 18 || TG == 21 || TG == 22);
+    using F = Fmt<TG>;
+    constexpr int LPR = GU_LPR, RPW = kWarp / LPR, KG = F::S::kGroup;
+    const int row_lo = part == 1 ? (int) L.n_ff : 0, row_hi = part == 0 ? (int) L.n_ff : (int) (2 * L.n_ff);
+    const size_t xgroups = (size_t) ((row_hi - row_lo + 2 * GU_ROWS * RPW - 1) / (2 * GU_ROWS * RPW));
+    return q.parallel_for(sycl::nd_range<2>({cap_groups, xgroups * GU_ROWS * kWarp}, {1, (size_t) GU_ROWS * kWarp}),
+                          [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
+        const sycl::sub_group sg = it.get_sub_group();
+        const int warp = (int) sg.get_group_linear_id(), lane = (int) sg.get_local_linear_id();
+        const int row0 = row_lo + ((int) it.get_group(1) * GU_ROWS + warp) * 2 * RPW + lane / LPR;
+        const int rows[2] = {row0, row0 + RPW};
+        if (row0 - lane / LPR >= row_hi) return;
+        const int seg_lane = lane % LPR, nb_all = (int) (L.n_embd / F::qk), xb = (int) (L.n_embd / 32);
+        for (int g = (int) it.get_group(0); g < *n_groups; g += (int) it.get_group_range(0)) {
+            const uint8_t* blob = (const uint8_t*) grp_ptr[g];
+            const uint8_t* wr[2];
+            for (int r = 0; r < 2; ++r) {
+                const bool valid = rows[r] < row_hi, is_up = rows[r] >= L.n_ff;
+                const int idx = valid ? (is_up ? rows[r] - (int) L.n_ff : rows[r]) : 0;
+                wr[r] = blob + (is_up && valid ? L.up_off + (size_t) idx * L.up_row : (size_t) idx * L.gu_row);
+            }
+            const int e0 = grp_start[g], e1 = grp_start[g + 1];
+            for (int e = e0; e < e1; e += kEntriesPass) {
+                const int n = sycl::min(kEntriesPass, e1 - e);
+                const block_q8_1* xs[kEntriesPass];
+                for (int j = 0; j < kEntriesPass; ++j) xs[j] = xq + (size_t) ent_tok[j < n ? e + j : e] * xb;
+                float sum[2][kEntriesPass] = {};
+                for (int k0 = 0; k0 < nb_all * F::ipb; k0 += LPR) {
+                    const int k = k0 + seg_lane;
+                    const bool active = k < nb_all * F::ipb;
+                    const int kk = active ? k : 0, kbx = kk / F::ipb, iqs = F::step * (kk % F::ipb);
+                    const auto w0 = F::S::load(block_at<F>(wr[0], kbx), 0, iqs);
+                    const auto w1 = F::S::load(block_at<F>(wr[1], kbx), 0, iqs);
+                    const size_t xo = (size_t) ((uint32_t) kbx * (uint32_t) (F::qk / 32) + (uint32_t) (iqs / 2));
+                    for (int j = 0; j < n; ++j) {
+                        const block_q8_1 act = xs[j][xo];
+                        float c0 = 0.0f, c1 = 0.0f;
+                        int t0 = 0, t1 = 0;
+                        if (active && rows[0] < row_hi) F::S::parts(w0, &act, 0, c0, t0);
+                        if (active && rows[1] < row_hi) F::S::parts(w1, &act, 0, c1, t1);
+                        for (int o = KG / 2; o > 0; o >>= 1) {
+                            t0 += sycl::permute_group_by_xor(sg, t0, o);
+                            t1 += sycl::permute_group_by_xor(sg, t1, o);
+                        }
+                        if (active && rows[0] < row_hi) sum[0][j] = canon::fma(c0, (float) t0, sum[0][j]);
+                        if (active && rows[1] < row_hi) sum[1][j] = canon::fma(c1, (float) t1, sum[1][j]);
+                    }
+                }
+                for (int r = 0; r < 2; ++r) {
+                    for (int j = 0; j < n; ++j)
+                        for (int o = LPR / 2; o >= KG; o >>= 1) sum[r][j] += sycl::permute_group_by_xor(sg, sum[r][j], o);
+                    if (rows[r] < row_hi && seg_lane == 0) {
+                        const bool is_up = rows[r] >= L.n_ff;
+                        const int idx = is_up ? rows[r] - (int) L.n_ff : rows[r];
+                        for (int j = 0; j < n; ++j) (is_up ? up : gate)[(size_t) (e + j) * L.n_ff + idx] = sum[r][j];
+                    }
+                }
+            }
+        }
+    });
+}
+
+using GuPairKey = std::tuple<int, int64_t, int64_t, size_t, size_t, size_t, int>;
+core::TimedCache<sycl::device, GuPairKey, bool> g_gu_pair_choices;
+core::TimedCache<sycl::device, int, bool> g_gu_pair_warmed;
+GuPairKey gu_pair_key(const NativeExpertLayout& L, int type, int part) {
+    return {type, L.n_embd, L.n_ff, L.gu_row, L.up_row, L.up_off, part};
+}
+bool gu_pair_type(int type) { return type == 18 || type == 21 || type == 22; }
+int gu_pair_mode() {
+    const char* v = strata::env_get("IQ_GU_PAIR");
+    if (!v || !*v || std::strcmp(v, "auto") == 0) return -1;
+    if (std::strcmp(v, "0") == 0) return 0;
+    if (std::strcmp(v, "1") == 0) return 1;
+    throw core::DeviceError("XESTRATA_IQ_GU_PAIR must be auto, 0 or 1");
+}
+bool gu_pair_selected(sycl::queue& q, const NativeExpertLayout& L, int type, int part) {
+    if (!gu_pair_type(type)) return false;
+    const int mode = gu_pair_mode();
+    if (mode >= 0) return mode == 1;
+    return g_gu_pair_choices.get(q.get_device(), gu_pair_key(L, type, part)).value_or(false);
 }
 
 template<int TD, int LPR>
@@ -2362,6 +2455,65 @@ NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd,
     return L;
 }
 
+void native_expert_gu_pair_tune(const NativeExpertLayout& L, int type, int part, void* stream) {
+    if (!gu_pair_type(type) || gu_pair_mode() != -1) return;
+    auto& q = queue_for(stream);
+    const GuPairKey key = gu_pair_key(L, type, part);
+    if (g_gu_pair_choices.get(q.get_device(), key)) return;
+    std::vector<void*> allocated;
+    auto alloc = [&](size_t bytes) {
+        void* p = sycl::malloc_device(bytes, q);
+        if (!p) throw core::DeviceError("IQ gate/up timing allocation failed");
+        allocated.push_back(p);
+        return p;
+    };
+    auto release = [&] { q.wait_and_throw(); for (void* p : allocated) sycl::free(p, q); };
+    try {
+        auto* blob = static_cast<uint8_t*>(alloc(L.bytes));
+        auto* ptr = static_cast<unsigned long long*>(alloc(4 * sizeof(unsigned long long)));
+        auto* starts = static_cast<int32_t*>(alloc(5 * sizeof(int32_t)));
+        auto* count = static_cast<int32_t*>(alloc(sizeof(int32_t)));
+        auto* toks = static_cast<int32_t*>(alloc(16 * sizeof(int32_t)));
+        auto* x = static_cast<block_q8_1*>(alloc((size_t) 4 * (L.n_embd / 32) * sizeof(block_q8_1)));
+        auto* gate = static_cast<float*>(alloc((size_t) 16 * L.n_ff * sizeof(float)));
+        auto* up = static_cast<float*>(alloc((size_t) 16 * L.n_ff * sizeof(float)));
+        const unsigned long long hp[4] = {(unsigned long long) (uintptr_t) blob, (unsigned long long) (uintptr_t) blob,
+                                          (unsigned long long) (uintptr_t) blob, (unsigned long long) (uintptr_t) blob};
+        const int32_t hc = 4, ht[16] = {0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3};
+        q.memset(blob, 0, L.bytes);
+        q.memset(x, 0, (size_t) 4 * (L.n_embd / 32) * sizeof(block_q8_1));
+        q.memcpy(ptr, hp, sizeof hp); q.memcpy(count, &hc, sizeof hc); q.memcpy(toks, ht, sizeof ht);
+        auto run = [&](bool pair) {
+            switch (type) {
+            case 18: if (pair) launch_native_gu_pair<18>(q, 4, ptr, starts, count, toks, x, L, gate, up, part);
+                     else launch_native_gu<18, GU_LPR>(q, 4, ptr, starts, count, toks, x, L, gate, up, part); break;
+            case 21: if (pair) launch_native_gu_pair<21>(q, 4, ptr, starts, count, toks, x, L, gate, up, part);
+                     else launch_native_gu<21, GU_LPR>(q, 4, ptr, starts, count, toks, x, L, gate, up, part); break;
+            default: if (pair) launch_native_gu_pair<22>(q, 4, ptr, starts, count, toks, x, L, gate, up, part);
+                     else launch_native_gu<22, GU_LPR>(q, 4, ptr, starts, count, toks, x, L, gate, up, part); break;
+            }
+            return true;
+        };
+        const bool first = g_gu_pair_warmed.put_first(q.get_device(), 0, true, [](int) { return true; }).second;
+        bool faster = true;
+        for (int entries : {1, 4}) {
+            const int32_t hs[5] = {0, entries, 2 * entries, 3 * entries, 4 * entries};
+            q.memcpy(starts, hs, sizeof hs).wait_and_throw();
+            const auto m = core::timed_choice({{[&] { for (int i = 0; i < 4; ++i) run(false); return true; }},
+                                               {[&] { for (int i = 0; i < 4; ++i) run(true); return true; }}},
+                                              [&] { q.wait_and_throw(); }, 5, 1.10, first && entries == 1 ? 0.5 : 0.0);
+            faster = faster && m.pick == 1;
+            std::fprintf(stderr, "xestrata: IQ gate/up %d entries, type %d: %.1f / %.1f us\n", entries, type,
+                         m.seconds[0] * 1e6 / 4, m.seconds[1] * 1e6 / 4);
+        }
+        g_gu_pair_choices.put(q.get_device(), key, faster);
+        release();
+    } catch (...) {
+        for (void* p : allocated) sycl::free(p, q);
+        throw;
+    }
+}
+
 size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
     const size_t f = (size_t) cap * (size_t) n_ff * sizeof(float);
     return 3 * ((f + 255) & ~(size_t) 255) + (((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255);
@@ -2411,6 +2563,13 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     } else {
     // the gate and up rows in one launch, or one a type where they differ (native_mixed_gu's layers)
     auto gu_rows = [&](int ty, int part) {
+        if (gu_pair_selected(q, L, ty, part)) {
+            switch (ty) {
+                case 18: launch_native_gu_pair<18>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); return;
+                case 21: launch_native_gu_pair<21>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); return;
+                case 22: launch_native_gu_pair<22>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); return;
+            }
+        }
         switch (ty) {
             case 16: launch_native_gu<16, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
             case 17: launch_native_gu<17, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;

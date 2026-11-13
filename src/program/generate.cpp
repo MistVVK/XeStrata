@@ -5289,14 +5289,16 @@ int main(int argc, char** argv) {
                     ? ", a smaller --vram-reserve-mib (" + std::to_string(o.vram_reserve_mib) + " now; " +
                           std::to_string(kSmallReserveMib) + " is enough on a small card)"
                     : std::string();
+            const char* batch_tip = o.batch > 1 ? "fewer simultaneous requests (--batch / parallel), " : "";
             std::fprintf(stderr, "xestrata generate: no VRAM is left for the expert cache: it needs at least %lld slots "
-                                 "(%lld MiB), about %lld MiB more than this card has free. To make room: a smaller "
+                                 "(%lld MiB), about %lld MiB more than this card has free. To make room: %sa smaller "
                                  "--max-context (the session, mostly its KV cache, takes %lld MiB at %lld tokens), "
                                  "--kv q4_0, the English draft subset (setup --draft-vocab en; the draft head takes "
                                  "%lld MiB now)%s, images on the CPU, or close other programs that use the GPU\n",
                          (long long) min_slots, (long long) ((min_slots * blob) >> 20), (long long) short_mib,
-                         (long long) session_mib, (long long) o.max_context, (long long) (mtp_bind >> 20),
+                         batch_tip, (long long) session_mib, (long long) o.max_context, (long long) (mtp_bind >> 20),
                          reserve_tip.c_str());
+            if (o.spec > 0) return 1;   // the verify window cannot start without a tier; the line above is the refusal
         }
     } else if (multi_gpu && o.expert_cache > 0 && o.no_prefill_borrow) {
         // a layer split's prompt path with buffers of its own (--no-prefill-borrow): an explicit cache size leaves
@@ -8074,6 +8076,11 @@ int main(int argc, char** argv) {
                 }
             }
             if (!e.empty() || (use_mtp && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
+            if (df2_loaded) {
+                std::vector<int32_t> tokens((size_t) T);
+                for (int64_t t = 0; t < T; ++t) tokens[(size_t) t] = (int32_t) cur[(size_t) (p0 + t)];
+                df2.note_rows(tokens.data(), T, p0);
+            }
             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
             const int64_t done = p0 + T;
             pp_reached = done;
@@ -11274,6 +11281,10 @@ int main(int argc, char** argv) {
                         return false;
                     if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)))
                         return false;
+                    if (df2_loaded) {
+                        if (!df2.context(ver.tap_dev(), T, q, e)) return false;
+                        df2.note_rows(win.data(), T, q);
+                    }
                     q += T;
                     pp_reached = q;   // #471
                 }

@@ -90,6 +90,23 @@ bool MoeWindow::init(const MoeWindowShape& shape, const MoeWindowTier& tier, std
         bf16_ = bf16_ || (lay.native && lay.fmt[(size_t) l].gu_type == 30);
     }
 
+    // The grouped expert kernel is usually captured in a verify graph; choose its row layout beforehand.
+    if (lay.native) {
+        try {
+            for (int64_t l = 0; l < lay.n_layers; ++l) {
+                const auto& f = lay.fmt[(size_t) l];
+                if (f.gu_type == 30) continue;
+                const auto layout = strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_type);
+                const bool mixed = f.up_type >= 0 && f.up_type != f.gu_type;
+                strata::kernels::native_expert_gu_pair_tune(layout, f.gu_type, mixed ? 0 : -1, nullptr);
+                if (mixed) strata::kernels::native_expert_gu_pair_tune(layout, f.up_type, 1, nullptr);
+            }
+        } catch (const std::exception& e) {
+            err = std::string("moe window: gate/up timing: ") + e.what();
+            return false;
+        }
+    }
+
     const uint64_t T = (uint64_t) shape.max_t, N = (uint64_t) shape.n_embd, K = (uint64_t) shape.k;
     bool ok = mapped(T * N * 4, (void**) &h_x_, (void**) &m_x_) &&
               mapped(T * K * 4, (void**) &h_ids_, (void**) &m_ids_) &&
