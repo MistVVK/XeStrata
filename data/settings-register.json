@@ -30264,7 +30264,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private opt-in (=1), off by default: the 'B60 next pool' path of the fused GR and IQ kernels (the name is the code's); read at sycl/src/kernels/cuda/fused_gr.dp.cpp:2895 and iq_kernels.dp.cpp:5191 and only effective on the main actor. Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30297,7 +30297,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private opt-in (=1), off by default: the S4 down-projection variant of the IQ2 kernels (p4_enabled, sycl/src/kernels/cuda/iq_kernels.dp.cpp:4721). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30330,7 +30330,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private opt-in (=1), off by default: the 2-D pair layout of the fused GR kernel, main actor only (gr_2d_pair_enabled, sycl/src/kernels/cuda/fused_gr.dp.cpp:2764). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30363,7 +30363,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private selector for STRATA_PRIVATE_GR_F32_REG: which phase takes the FP32 register path; unset or 'both' = both phases, otherwise the named phase only (gf_phase, sycl/src/kernels/cuda/fused_gr.dp.cpp:2691). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30396,7 +30396,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private switch, off by default (any non-zero number turns it on): the FP32 register path of the fused GR kernel for 1 to 4 tokens when the down projection is sliced (gf_enabled, sycl/src/kernels/cuda/fused_gr.dp.cpp:2686). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30429,7 +30429,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private switch, off by default (non-zero turns it on): four-wide loads in the GR up-projection low-order part (gr_lo_vec4_enabled, sycl/src/kernels/cuda/fused_gr.dp.cpp:2367). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30462,7 +30462,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private opt-in (=1), off by default: the Q8 up-projection kernel with 32-row blocks (more blocks, fewer serial rows per warp, same bits), Battlemage layout only (b60_gr_q8_up32_enabled, sycl/src/kernels/cuda/fused_gr.dp.cpp:2386). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30495,7 +30495,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private switch, off by default (non-zero turns it on): the combined kernel takes SiLU from the low-order part (gr_combo_silu_enabled, sycl/src/kernels/cuda/fused_gr.dp.cpp:2530). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30528,7 +30528,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private opt-in (=1), off by default: structure-of-arrays cache of the fused GR kernel, main actor only (gr_soa_enabled, sycl/src/kernels/cuda/fused_gr.dp.cpp:2969). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30561,7 +30561,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private opt-in (=1), off by default: 16-row up-projection blocks of the fused GR kernel, Battlemage layout only (gr_up_rows16_enabled, sycl/src/kernels/cuda/fused_gr.dp.cpp:2517). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30594,7 +30594,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private opt-in (=1), off by default: the 64-wide grid variant of the IQ gate/up kernel (grid64_enabled, sycl/src/kernels/cuda/iq_kernels.dp.cpp:4816). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30627,7 +30627,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private opt-in (=1), off by default: the S4 grid table variant of the IQ gate/up kernel (grid_s4_enabled, sycl/src/kernels/cuda/iq_kernels.dp.cpp:4913). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30672,7 +30672,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private opt-in (=1), off by default: packed-weight IQ1_M gate/up kernel, Battlemage cards with packed weights only (i1_enabled, sycl/src/kernels/cuda/iq_kernels.dp.cpp:5090). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30711,7 +30711,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private opt-in (=1), off by default: prepared row reuse of the IQ2 gate/up kernel (gu22_row_reuse_enabled, sycl/src/kernels/cuda/iq_kernels.dp.cpp:4227). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30744,7 +30744,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private opt-in (=1), off by default: basis-9 variant of the S4 grid gate/up kernel (grid_s4_basis9_enabled, sycl/src/kernels/cuda/iq_kernels.dp.cpp:5310). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30777,7 +30777,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private opt-in (=1), off by default: shared-local-memory variant of the S4 grid gate/up kernel (grid_s4_slm_enabled, sycl/src/kernels/cuda/iq_kernels.dp.cpp:5192). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30810,7 +30810,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private opt-in (=1), off by default: work-group-16 variant of the S4 grid gate/up kernel (grid_s4_wg16_enabled, sycl/src/kernels/cuda/iq_kernels.dp.cpp:5427). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30855,7 +30855,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private opt-in (=1), off by default: packed-weight IQ2_XXS gate/up kernel, Battlemage cards with packed weights only (p16_enabled, sycl/src/kernels/cuda/iq_kernels.dp.cpp:4623). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30888,7 +30888,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private opt-in (=1), off by default: sixteen-row S4 variant of the IQ2_XXS gate/up kernel (xxs_s4_enabled, sycl/src/kernels/cuda/iq_kernels.dp.cpp:5480). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30921,7 +30921,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private opt-in (=1), off by default: exact int4 DPAS path of the IQ4 matrix-vector kernel when the weights are packed (sycl/src/kernels/cuda/native_mmvq.dp.cpp:3717). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30954,7 +30954,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private opt-in (=1), off by default: demand-driven MTP drafting state; debug disagreement or forced-miss modes keep the normal path (sycl/src/program/generate.cpp:11735). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -30987,7 +30987,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private debug switch: any value (even empty) prints functional evidence of the demand-driven MTP path, kept out of timing (sycl/src/program/generate.cpp:11866). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -31020,7 +31020,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private micro-benchmark switch of the demand-driven MTP path (a number; replays the last chain's staging, no model or device allocation; sycl/src/program/generate.cpp:12153). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -31065,7 +31065,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Private opt-in (=1), off by default: register-resident packed-weight kernel, Battlemage cards with packed weights only (ps_enabled, sycl/src/kernels/cuda/iq_kernels.dp.cpp:4467). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39027,7 +39027,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Opt-in (=1), off by default: the mirrored adaptive route histogram counts presence of an expert in a window instead of rows, to match the CPU usage counter's increment order (sycl/src/core/verify.cpp:2673). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39093,7 +39093,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Opt-in (=1), off by default: bounded-launch IQ gate/up dequantization to FP16 (sycl/src/kernels/cuda/iq_kernels.dp.cpp:6643). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39126,7 +39126,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Number of subgroups of the IQ gate/up dequantization; unset = 1 (the single-subgroup path); other values take the tiled kernel (dequant_gu_subgroups, sycl/src/kernels/cuda/iq_kernels.dp.cpp:6613). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39159,7 +39159,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Opt-in (=1), off by default: static row indexing in the tiled IQ gate/up dequantization; only read when STRATA_SYCL_DEQUANT_GU_SG is not 1 (sycl/src/kernels/cuda/iq_kernels.dp.cpp:6647). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39192,7 +39192,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Opt-in (=1), off by default: static type dispatch in the tiled IQ gate/up dequantization; only read when STRATA_SYCL_DEQUANT_GU_SG is not 1 (sycl/src/kernels/cuda/iq_kernels.dp.cpp:6646). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39225,7 +39225,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Switch, off by default (non-zero turns it on): row reuse of the IQ2_XXS expert kernel (g_iq2xxs_reuse, sycl/src/kernels/cuda/iq_kernels.dp.cpp:4251). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39258,7 +39258,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Opt-in (=1), off by default: staged expert reads in the verify path; needs device planning with STRATA_VERIFY_NO_HOST and not the Battlemage layout (sycl/src/core/verify.cpp:1659). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39291,7 +39291,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Tuning number of the staged expert copy of STRATA_SYCL_EXPERT_STAGE; the code's default is 8 (sycl/src/core/verify.cpp:1664). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39324,7 +39324,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Tuning string of the staged expert reads of STRATA_SYCL_EXPERT_STAGE: the group batching (sycl/src/core/verify.cpp:1663). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39357,7 +39357,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Opt-in (=1), off by default: FP16 expert pair kernel in the prompt path; needs a native layout, no MMQ and XMX mode 0 (sycl/src/prefill/prefill.cpp:4309). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39390,7 +39390,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Opt-in (=1), off by default: register-resident QK variant of the GDN prompt kernel (sycl/src/prefill/kernels.dp.cpp:2762). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39423,7 +39423,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Opt-in (=1), off by default: 256-register-file variant of the GDN QK kernel for the 16 / 48 head shape with 10,240 conv channels (sycl/src/kernels/cuda/verify_kernels.dp.cpp:2244). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39456,7 +39456,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Opt-in (=1), off by default: GDN state-only commit in the verify path (sycl/src/core/verify.cpp:2129). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39564,7 +39564,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Mode number, default 0 (off); only the value 3 selects the cached-norm mode (sycl/src/kernels/cuda/fused_gr.dp.cpp:77). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39597,7 +39597,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Switch, off by default (non-zero turns it on): the GR low-order part is computed once (g_gr_lo_once, sycl/src/kernels/cuda/fused_gr.dp.cpp:1150). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39630,7 +39630,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Opt-in (=1), off by default: direct bounds in the GR norm (g_gr_norm_direct_bounds, sycl/src/kernels/cuda/fused_gr.dp.cpp:570). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39663,7 +39663,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Opt-in (=1), off by default: metadata-quartet gate/up dequantization for type 16 with n_ff 640 and n_embd 2560 (sycl/src/kernels/cuda/iq_kernels.dp.cpp:6547). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39694,9 +39694,9 @@
    "since": null,
    "last_commit": "cb436853ab",
    "last_date": "2026-10-20",
-   "status": "research",
+   "status": "rollback",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "ON by default; =0 turns it off: the IQ4 matrix-vector kernel selects its table values by bit select, not a lookup, unless set to 0 (use_bit_select, sycl/src/kernels/cuda/native_mmvq.dp.cpp:3745). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39727,9 +39727,9 @@
    "since": null,
    "last_commit": "cb436853ab",
    "last_date": "2026-10-20",
-   "status": "research",
+   "status": "rollback",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "ON by default; =0 turns it off: pair reuse in the IQ4 matrix-vector kernel (sycl/src/kernels/cuda/native_mmvq.dp.cpp:3737). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39760,9 +39760,9 @@
    "since": null,
    "last_commit": "cb436853ab",
    "last_date": "2026-10-20",
-   "status": "research",
+   "status": "rollback",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "ON by default; =0 turns it off: split Q8 activation handling in the IQ4 matrix-vector kernel (sycl/src/kernels/cuda/native_mmvq.dp.cpp:3741). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39795,7 +39795,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Opt-in (=1), off by default: ESIMD IQ4 kernel for 4 columns on Battlemage with n_in 2560 or 6144 (sycl/src/kernels/cuda/native_mmvq.dp.cpp:3758). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39828,7 +39828,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Opt-in (=1), off by default: XMX IQ4 kernel for 4 columns on the shapes 2560 to 6144 / 10240 / 12288 / 248320 and 6144 to 2560 (sycl/src/kernels/cuda/native_mmvq.dp.cpp:3764). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39867,7 +39867,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Opt-in (=1), off by default: adaptive routing mirror on the SYCL verify path (sycl_mirror_adapt, sycl/src/core/verify.cpp:75). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39906,7 +39906,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Opt-in (=1), off by default: packed-sign IQ gate/up row-reuse kernel for the 2560 / 640 shape, only with the old kernels, split-multi and IQ2_XXS reuse off (sycl/src/kernels/cuda/iq_kernels.dp.cpp:5641). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39939,7 +39939,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Profiling switch of the prompt path's expert copy: the value 0 changes what happens when no copy-engine queue could be made (sycl/src/prefill/prefill.cpp:1350); STRATA_COPY_ENGINE=0 turns the copy engine itself off. Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -39976,9 +39976,9 @@
    "since": null,
    "last_commit": "cb436853ab",
    "last_date": "2026-10-20",
-   "status": "research",
+   "status": "rollback",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm. The scan reads it as default on.",
+   "note": "ON by default; =0 turns it off: the Q2 word-expand path of the IQ kernels is taken unless the variable starts with 0 (q2_word_expand_enabled, sycl/src/kernels/cuda/iq_kernels.dp.cpp:3706-3709: `return !(v && v[0] == '0')`), then a per-device check in the same function. Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -40009,9 +40009,9 @@
    "since": null,
    "last_commit": "cb436853ab",
    "last_date": "2026-10-20",
-   "status": "research",
+   "status": "rollback",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "ON by default; =0 turns it off: chunked down projection of the QSA decode attention (sycl/src/kernels/cuda/qsa_decode_attn.dp.cpp:963). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -40048,9 +40048,9 @@
    "since": null,
    "last_commit": "cb436853ab",
    "last_date": "2026-10-20",
-   "status": "research",
+   "status": "rollback",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "ON by default; =0 turns it off: the vector variant of the QSA value kernel with 8 keys (sycl/src/kernels/cuda/qsa_decode_attn.dp.cpp:2569). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -40083,7 +40083,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Path of a routing audit file; read only in builds with STRATA_SYCL_WORKLOAD_TRACE and needs device planning (sycl/src/core/verify.cpp:908). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -40116,7 +40116,7 @@
    "last_date": "2026-10-20",
    "status": "research",
    "owner": "sycl",
-   "note": "Intel (SYCL) engine setting that came in with f-sycl-prs (pull requests 4185 / 3153). Registered by the integration lane at the batch 16 merge so that the register matches the code; its meaning, default and final status are for lane SYCL-PR to confirm.",
+   "note": "Opt-in (=1), off by default, and compiled only in builds that define the macro of the same name: the TLA attention kernel for batch 32 with a 2,051 cap (sycl/src/prefill/prefill.cpp:3638). Read from the code only; the integration lane measured nothing on it.",
    "retire_after": "",
    "retired_in": ""
   },

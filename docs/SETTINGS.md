@@ -289,7 +289,7 @@ Off unless you set them. The last column says where each one is described.
 | `STRATA_WDDM_BUDGET` | number | AMD, Intel Arc | [AMD_HIP.md](AMD_HIP.md) |
 | `STRATA_WS_FAST` | number | NVIDIA and AMD | [OLDER_GPUS.md](OLDER_GPUS.md) |
 
-## Switches that go back to earlier behaviour (70)
+## Switches that go back to earlier behaviour (76)
 
 These behaviours are on by default. Setting the switch returns the earlier behaviour; the notes in the register say which
 version made it the default.
@@ -359,6 +359,12 @@ version made it the default.
 | `STRATA_SPLIT_OWN` | on / off | NVIDIA and AMD, Intel Arc | v0.1.40.1 | [MULTI_GPU.md](MULTI_GPU.md) |
 | `STRATA_SWITCH_POINT` | on / off | NVIDIA and AMD | - | - |
 | `STRATA_SYCL_BF16_DET` | number | Intel Arc | v0.2.13 | - |
+| `STRATA_SYCL_IQ4_LOOKUP` | number | Intel Arc | - | - |
+| `STRATA_SYCL_IQ4_PAIR_REUSE` | on / off | Intel Arc | - | - |
+| `STRATA_SYCL_IQ4_Q8_SPLIT` | on / off | Intel Arc | - | - |
+| `STRATA_SYCL_Q2_WORD_EXPAND` | on / off | Intel Arc | - | - |
+| `STRATA_SYCL_QSA_CHUNK_DOWN` | on / off | Intel Arc | - | - |
+| `STRATA_SYCL_QSA_VALUE8_K8_VEC` | on / off | Intel Arc | - | - |
 | `STRATA_TOPK_SAMPLE` | number | NVIDIA and AMD | v0.1.45 | [DETAILS.md](DETAILS.md) |
 | `STRATA_TOPK_SPLIT` | number | NVIDIA and AMD | v0.1.45 | [DETAILS.md](DETAILS.md) |
 | `STRATA_TOPK_STREAM` | on / off | NVIDIA and AMD, Intel Arc | v0.1.40.1 | [AMD_HIP.md](AMD_HIP.md), [DETAILS.md](DETAILS.md), [TROUBLESHOOTING.md](TROUBLESHOOTING.md) |
