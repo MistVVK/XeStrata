@@ -15,12 +15,13 @@ import json
 import socket
 import sys
 import unittest
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import (ByteTokenizer, MockEngine, Service, allowed_hosts_of, host_allowed,  # noqa: E402
+from serve.server import (ByteTokenizer, MockEngine, Server, Service, allowed_hosts_of, host_allowed,  # noqa: E402
                           host_name, host_names_for, origin_allowed, serve)
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,6 +59,24 @@ class HostNames(unittest.TestCase):
             names = host_names_for("127.0.0.1", ["strata.example.com", "*"], ["https://chat.example.net"])
             self.assertTrue({"strata.example.com", "chat.example.net"} <= names)
             self.assertNotIn("*", names)
+
+
+class ListenAddress(unittest.TestCase):
+    def test_bind_does_not_look_up_a_host_name(self):
+        """http.server's own server_bind asks socket.getfqdn for the address: a machine whose reverse lookup stalls
+        (GitHub's macOS runner: 35 s for the first lookup of every new process) then listens that much later after
+        the start.  No network answer may delay a start."""
+        def no_lookup(*args, **kwargs):
+            raise AssertionError("server_bind looked up a host name")
+        with mock.patch.object(socket, "getfqdn", no_lookup), mock.patch.object(socket, "gethostbyaddr", no_lookup):
+            with Server(("127.0.0.1", 0), BaseHTTPRequestHandler) as s:
+                self.assertNotEqual(s.server_address[1], 0)
+
+    def test_bind_sets_server_name_to_the_address_and_server_port(self):
+        # (http.server set server_name to the looked-up name, "localhost" for 127.0.0.1; nothing here reads it)
+        with Server(("127.0.0.1", 0), BaseHTTPRequestHandler) as s:
+            self.assertEqual((s.server_name, s.server_port), ("127.0.0.1", s.server_address[1]))
+            self.assertGreater(s.server_port, 0)
 
 
 class HostCheck(unittest.TestCase):

@@ -87,4 +87,18 @@ inline void penalty_rows(const int32_t* tail, int64_t n_tail, const int32_t* win
     }
 }
 
+// #4590 (upstream): which tokens the repeat / frequency / presence penalties count.  The reply's window is the
+// tokens the answer has written; the window starts at the last prompt token, the one the first decode step feeds in.
+// The prompt, including earlier assistant turns in it, is then not counted, so a number or a quoted answer in the new
+// task is not penalised just for being there.  XESTRATA_PENALTY_PROMPT=1 keeps the old window: the last
+// penalty_last_n tokens of prompt + reply together; 0 is the reply's own tokens.  Unset is this build's default,
+// which stays the old window until the quality check (quality027) passes on XeStrata's GPUs: the change of the
+// answers it makes is taken only where that line is met (the user's rule for output-changing changes).
+inline bool penalty_counts_prompt(const char* env) { return env == nullptr || env[0] != '0'; }
+// The first index of the session's consumed tokens (prompt, then reply) the penalty window may read, given how many
+// were consumed when the request's decode began (the prompt without its last token).
+inline size_t penalty_window_from(size_t consumed_at_decode_start, bool counts_prompt) {
+    return counts_prompt ? 0 : consumed_at_decode_start;
+}
+
 }  // namespace strata::kernels

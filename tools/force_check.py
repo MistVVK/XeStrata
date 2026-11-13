@@ -2,43 +2,40 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""force_check.py: the token-forcing check, after SpecPilot (arXiv 2611.02501, Li et al., Apache-2.0, "token forcing").
+"""force_check.py: the token-forcing check after SpecPilot (arXiv 2611.02501, Li et al., Apache-2.0).
 
 A candidate engine/build/setting is judged on a FIXED text: the engine scores prompt + continuation teacher-forced
 (every position's head logits come out of the verify windows with the head in FP32: XESTRATA_LOGPOS /
 XESTRATA_LOGPOS_TOPK, the prompt cache off), and the checker counts where the scorer's argmax is not the forced token.
-Nothing here depends on a drafter; it serves any change of the decode path or the scorer (Q5_0 experts, tree verify, a
-new kernel ...).
+Nothing here depends on a drafter; it serves any class N change (Q5_0 experts, tree verify, a new kernel ...).
 
   force_check.py gen   CFG SET.json --corpus held.jsonl [--kinds code,json] [--per-kind 4] [--offset 8] [--new 300]
-                       [--env K=V ...]
-        one engine with CFG's normal decode flags; greedy continuations of the corpus prompts (rows with "ids")
-        -> SET.json
-  force_check.py score CFG SET.json OUT.tsv [--env K=V ...] [--arg "--flag v" ...]
-        one engine with the scorer flags (no drafter, no prompt cache, --short-read over the whole text): OUT.tsv =
-        XESTRATA_LOGPOS rows (top-2), OUT.tsv.meta.json = per item line ranges.  --env XESTRATA_FORCE_FAULT=7:0.3 is
-        the test fault (adds 0.3 to every 7th token's logit; a build with the hook).
-  force_check.py check --stock A.tsv B.tsv [...] --cand C.tsv [--delta D] [--json out.json]
-        the two rules of the paper against the stock arms (>= 2 stock arms: the noise): exit 0 pass, 1 reject,
-        2 inconclusive
-  force_check.py selftest      the statistics on synthetic rows (no engine)
+[--env K=V ...]         one engine with CFG's normal decode flags; greedy continuations of the corpus prompts (rows
+with "ids") -> SET.json   force_check.py score CFG SET.json OUT.tsv [--path decode|prompt] [--env K=V ...] [--arg "--
+flag v" ...]         --path decode (default): one engine with CFG's own flags (drafter, spec windows, adaptive tiers
+...), prompt cache off; every request decodes the         forced continuation: the verify windows take the forced
+token in place of the argmax (XESTRATA_FOLLOW), so drafts are accepted when they match it,         and the FP32 head
+logits of every valid row come out (XEXESTRATA_FOLLOW_LOGPOS, top-2).  --path prompt: the whole text is read as a
+prompt through the         windows (XESTRATA_LOGPOS, --short-read), no decode features.  OUT.tsv.meta.json = per item
+line ranges.         --env XESTRATA_FORCE_FAULT=7:0.3 is the test fault (adds 0.3 to every 7th token's logit in the
+scored rows).   force_check.py check --stock A.tsv B.tsv [...] --cand C.tsv [--delta D] [--json out.json]         the
+two rules of the paper against the stock arms (>= 2 stock arms: the noise): exit 0 pass, 1 reject, 2 inconclusive
+force_check.py selftest      the statistics on synthetic rows (no engine)
 
-An "arm" = one scored TSV.  Which engine produced the continuation and which scored it is the caller's choice:
-  - a change of the scorer (a different expert format, kernel, KV type): same SET.json, `score` with the candidate
-    build/flags;
-  - a change of the decode path (tree verify, a drafter): `gen` with the candidate, `score` with the STOCK scorer (the
-    paper's way).
-Stock arms = the same procedure with the stock build, at least twice (a second `gen`, or a second `score`).
+An "arm" = one scored TSV.  Which engine produced the continuation and which scored it is the caller's choice:   - a
+change of the scorer (a different expert format, kernel, KV type): same SET.json, `score` with the candidate
+build/flags;   - a change of the decode path (tree verify, a drafter): `gen` with the candidate, `score` with the
+STOCK scorer (the paper's way). Stock arms = the same procedure with the stock build, at least twice (a second `gen`,
+or a second `score`).
 
 Rules (paper):  mismatch = the scorer's argmax is not the forced token; margin = log p(argmax) - log p(forced token).
-  rate rule : candidate mismatch rate within +0.5 points of stock at 95% (one-sided bootstrap over requests, paired on
-              the same positions).  REJECT if the 95% lower bound of (cand - stock) > 0.5 points; PASS if the 95%
-              upper bound <= 0.5 points; else INCONCLUSIVE (more tokens).
-  event rule: delta = the largest margin among stock's first departures per request, rounded UP to a multiple of 1/8;
-              a large-margin event is a mismatch with margin > 2 delta.  REJECT if the candidate has more events than
-              stock by an exact one-sided binomial test (p < 0.05, exposure-weighted).  (The paper also audits events
-              stock reproduces on its own paths; that audit is not done here, events are counted raw.)
-"""
+rate rule : candidate mismatch rate within +0.5 points of stock at 95% (one-sided bootstrap over requests, paired on
+the same positions).               REJECT if the 95% lower bound of (cand - stock) > 0.5 points; PASS if the 95% upper
+bound <= 0.5 points; else INCONCLUSIVE (more tokens).   event rule: delta = the largest margin among stock's first
+departures per request, rounded UP to a multiple of 1/8; a large-margin event is a               mismatch with margin
+> 2 delta.  REJECT if the candidate has more events than stock by an exact one-sided binomial test (p < 0.05,
+exposure-weighted).  (The paper also audits events stock reproduces on its own paths; that audit is not done here,
+events are counted raw.)"""
 import argparse
 import json
 import math
@@ -49,9 +46,11 @@ import signal
 import subprocess
 import sys
 
-SCORER_DROP_VALUE = {"--draft", "--draft-model", "--draft-fallback", "--mtp-draft-vocab", "--spec", "--draft-conf",
-                     "--draft-cap", "--mtp", "--spec-min-p", "--prompt-cache", "--max-context", "--prefill",
-                     "--short-read", "--prompt-cache-every", "--conversation-cache-mib", "--suffix-draft"}
+MEASURED = {"XESTRATA_LOGPOS", "XESTRATA_LOGPOS_TOPK", "XESTRATA_FOLLOW", "XESTRATA_FOLLOW_LOGPOS",
+            "XESTRATA_ROUTE_TAIL_SKIP", "XESTRATA_FORCE_FAULT"}
+
+SCORER_DROP_VALUE = {"--draft", "--draft-model", "--draft-fallback", "--mtp-draft-vocab", "--spec", "--draft-conf", "--draft-cap", "--mtp", "--spec-min-p",  # noqa: E501
+                     "--prompt-cache", "--max-context", "--prefill", "--short-read", "--prompt-cache-every", "--conversation-cache-mib", "--suffix-draft"}  # noqa: E501
 SCORER_DROP_FLAG = {"--serve", "--vision"}
 
 
@@ -70,16 +69,15 @@ class Engine:
     def __init__(self, cfg, args, env_extra, log):
         env = dict(os.environ)
         for k in list(env):
-            if k.startswith(("XESTRATA_", "STRATA_")):    # the engine reads the old name too
+            if k.startswith("STRATA_") or k in MEASURED:
                 env.pop(k)
         env.update(cfg.get("env", {}))
         env.update(env_extra)
         if cfg.get("lib_dirs"):
             env["LD_LIBRARY_PATH"] = ":".join(cfg["lib_dirs"] + [env.get("LD_LIBRARY_PATH", "")])
         self.errf = open(log, "wb")
-        self.p = subprocess.Popen([cfg["exe"], "--serve"] + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=self.errf, text=True, cwd=cfg.get("cwd"), env=env, bufsize=1,
-                                  start_new_session=True)
+        self.p = subprocess.Popen([cfg["exe"], "--serve"] + args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.errf, text=True,  # noqa: E501
+                                  cwd=cfg.get("cwd"), env=env, bufsize=1, start_new_session=True)
 
     def ready(self):
         for line in self.p.stdout:
@@ -113,6 +111,20 @@ class Engine:
         self.errf.close()
 
 
+def fresh_profile(cfg, args, tag):
+    """cfg "profile_src": a fresh copy of the expert profile per engine start (the engine may rewrite it), and the
+    args with the copy's path (upstream 13eedf552)."""
+    src = cfg.get("profile_src")
+    if not src or "--expert-profile" not in args:
+        return args
+    import shutil
+    dst = os.path.abspath(tag) + ".profile.bin"
+    shutil.copyfile(src, dst)
+    args = list(args)
+    args[args.index("--expert-profile") + 1] = dst
+    return args
+
+
 def scorer_args(cfg, total_tokens, extra):
     base, out, i = list(cfg["args"]), [], 0
     while i < len(base):
@@ -124,8 +136,7 @@ def scorer_args(cfg, total_tokens, extra):
         else:
             out.append(x)
             i += 1
-    return out + ["--prompt-cache", "0", "--max-context", str(total_tokens + 512),
-                  "--short-read", str(total_tokens + 64), "--prefill", "512"] + extra
+    return out + ["--prompt-cache", "0", "--max-context", str(total_tokens + 512), "--short-read", str(total_tokens + 64), "--prefill", "512"] + extra  # noqa: E501
 
 
 def kv_env(lst):
@@ -139,16 +150,15 @@ def kv_env(lst):
 # ------------------------------------------------------------------------------------------------ gen / score
 def cmd_gen(a):
     cfg = json.load(open(a.config, encoding="utf-8-sig"))
-    rows = [json.loads(line) for line in open(a.corpus) if line.strip()]
+    rows = [json.loads(ln) for ln in open(a.corpus) if ln.strip()]
     rows = [r for r in rows if r.get("split", "held") == "held"]
     kinds = a.kinds.split(",") if a.kinds else sorted({r["kind"] for r in rows})
     sel = []
     for k in kinds:
         sel += [r for r in rows if r["kind"] == k][a.offset:a.offset + a.per_kind]
     if mem_available_gb() < a.min_free_gb:
-        raise SystemExit("only %.0f GB available (< %d): not starting an engine"
-                         % (mem_available_gb(), a.min_free_gb))
-    eng = Engine(cfg, list(cfg["args"]), kv_env(a.env), a.out + ".engine.log")
+        raise SystemExit("only %.0f GB available (< %d): not starting an engine" % (mem_available_gb(), a.min_free_gb))
+    eng = Engine(cfg, fresh_profile(cfg, list(cfg["args"]), a.out), kv_env(a.env), a.out + ".engine.log")
     items = []
     try:
         if not eng.ready():
@@ -172,12 +182,32 @@ def cmd_score(a):
     if out.exists():
         out.unlink()
     env = kv_env(a.env)
-    env.update({"XESTRATA_LOGPOS": str(out), "XESTRATA_LOGPOS_TOPK": "2",
-                "XESTRATA_ROUTE_TAIL_SKIP": env.get("XESTRATA_ROUTE_TAIL_SKIP", "0")})
+    extra = [x for s in (a.arg or []) for x in s.split()]
+    if a.path == "decode":
+        # the real decode/verify windows (drafter, spec windows, adaptive tiers, whatever the config has) with the forced continuation standing in  # noqa: E501
+        # for the argmax (XESTRATA_FOLLOW, one line per request in decode order); rows come from XEXESTRATA_FOLLOW_LOGPOS  # noqa: E501
+        follow = str(out) + ".follow.txt"
+        with open(follow, "w") as ff:
+            for it in items:
+                ff.write(",".join(map(str, it["cont"])) + chr(10))
+        env.update({"XESTRATA_FOLLOW": follow, "XEXESTRATA_FOLLOW_LOGPOS": str(out), "XESTRATA_LOGPOS_TOPK": "2"})
+        args = list(cfg["args"])
+        # XeStrata: the forcing is in the serial decode/verify window loop (a pipelined window is prepared ahead of the
+        # verdict it belongs to), so the decode path runs without --pipeline-windows
+        if "--pipeline-windows" in args:
+            i = args.index("--pipeline-windows")
+            del args[i:i + 2]
+        args += ["--pipeline-windows", "0"]
+        if "--prompt-cache" in args:
+            i = args.index("--prompt-cache")
+            del args[i:i + 2]
+        args += ["--prompt-cache", "0"] + extra
+    else:
+        env.update({"XESTRATA_LOGPOS": str(out), "XESTRATA_LOGPOS_TOPK": "2", "XESTRATA_ROUTE_TAIL_SKIP": env.get("XESTRATA_ROUTE_TAIL_SKIP", "0")})  # noqa: E501
+        args = scorer_args(cfg, total, extra)
     if mem_available_gb() < a.min_free_gb:
-        raise SystemExit("only %.0f GB available (< %d): not starting an engine"
-                         % (mem_available_gb(), a.min_free_gb))
-    args = scorer_args(cfg, total, [x for s in (a.arg or []) for x in s.split()])
+        raise SystemExit("only %.0f GB available (< %d): not starting an engine" % (mem_available_gb(), a.min_free_gb))
+    args = fresh_profile(cfg, args, str(out))
     eng = Engine(cfg, args, env, str(out) + ".engine.log")
 
     def nlines():
@@ -189,18 +219,21 @@ def cmd_score(a):
         for it in items:
             ids = it["prompt"] + it["cont"]
             n0 = nlines()
-            toks, f = eng.gen(ids, 1)
+            if a.path == "decode":
+                toks, f = eng.gen(it["prompt"], len(it["cont"]))
+                if toks != it["cont"]:
+                    print("%s: WARNING the engine emitted %d tokens, %d differ from the forced continuation" % (
+                        it["id"], len(toks), sum(1 for x, y in zip(toks, it["cont"]) if x != y) + abs(len(toks) - len(it["cont"]))), flush=True)  # noqa: E501
+            else:
+                toks, f = eng.gen(ids, 1)
             n1 = nlines()
-            if n1 - n0 < len(ids) // 2:
-                raise SystemExit("%s: only %d positions scored (the prompt took the batched path? raise --short-read)"
-                                 % (it["id"], n1 - n0))
-            meta.append({"id": it["id"], "kind": it["kind"], "first_line": n0, "end_line": n1,
-                         "prompt_len": len(it["prompt"]), "ids": ids})
+            if n1 - n0 < len(it["cont"]) // 2:
+                raise SystemExit("%s: only %d positions scored (the prompt took the batched path? raise --short-read; decode path: XESTRATA_FOLLOW not in this build?)" % (it["id"], n1 - n0))  # noqa: E501
+            meta.append({"id": it["id"], "kind": it["kind"], "first_line": n0, "end_line": n1, "prompt_len": len(it["prompt"]), "ids": ids})  # noqa: E501
             print("%s: %d positions" % (it["id"], n1 - n0), flush=True)
     finally:
         eng.close()
-    json.dump({"set": a.set, "config": a.config, "env": a.env or [], "args": args, "items": meta},
-              open(str(out) + ".meta.json", "w"))
+    json.dump({"set": a.set, "config": a.config, "path": a.path, "env": a.env or [], "args": args, "items": meta}, open(str(out) + ".meta.json", "w"))  # noqa: E501
     return 0
 
 
@@ -219,8 +252,7 @@ def load_arm(tsv):
             if pos < P - 1 or pos + 1 >= len(ids):
                 continue
             if ids[pos + 1] != tgt:
-                raise SystemExit("%s: line for position %d scores token %d, the set has %d"
-                                 % (it["id"], pos, tgt, ids[pos + 1]))
+                raise SystemExit("%s: line for position %d scores token %d, the set has %d" % (it["id"], pos, tgt, ids[pos + 1]))  # noqa: E501
             lp_t, am, lp_am = float(f[2]), int(f[3]), float(f[4])
             lp2 = None
             for x in f[8:10]:
@@ -256,8 +288,7 @@ def check(stock, cand, delta=None, seed=1, boots=4000):
         delta = ceil8(max(firsts)) if firsts else 0.125
 
     def counts(arm):
-        return [(len(arm[i]), sum(1 for r in arm[i] if r[0]),
-                 sum(1 for r in arm[i] if r[0] and r[1] > 2 * delta)) for i in ids]
+        return [(len(arm[i]), sum(1 for r in arm[i] if r[0]), sum(1 for r in arm[i] if r[0] and r[1] > 2 * delta)) for i in ids]  # noqa: E501
     sc = [counts(s) for s in stock]
     cc = counts(cand)
     n_s = [sum(c[0] for c in a) for a in sc]
@@ -292,15 +323,10 @@ def check(stock, cand, delta=None, seed=1, boots=4000):
     p = binom_tail_ge(ev_c, n, p0) if n > 0 else 1.0
     event_v = "REJECT" if p < 0.05 else "PASS"
     # stock-vs-stock spread (the noise): per-arm rates and large-margin events
-    return {"requests": len(ids), "tokens_cand": n_c, "tokens_stock_arms": n_s, "delta": delta,
-            "mismatch_rate_stock_arms_pct": [round(x, 3) for x in r_stock],
-            "mismatch_rate_cand_pct": round(r_cand, 3), "diff_pts": round(r_cand - r_s, 3),
-            "diff_ci90_pts": [round(lo, 3), round(hi, 3)],
-            "rate_rule": rate_v, "events_cand": ev_c, "events_stock_arms": [sum(c[2] for c in a) for a in sc],
-            "events_p": round(p, 5),
-            "event_rule": event_v,
-            "verdict": "REJECT" if "REJECT" in (rate_v, event_v) else
-                       ("PASS" if rate_v == "PASS" else "INCONCLUSIVE")}
+    return {"requests": len(ids), "tokens_cand": n_c, "tokens_stock_arms": n_s, "delta": delta, "mismatch_rate_stock_arms_pct": [round(x, 3) for x in r_stock],  # noqa: E501
+            "mismatch_rate_cand_pct": round(r_cand, 3), "diff_pts": round(r_cand - r_s, 3), "diff_ci90_pts": [round(lo, 3), round(hi, 3)],  # noqa: E501
+            "rate_rule": rate_v, "events_cand": ev_c, "events_stock_arms": [sum(c[2] for c in a) for a in sc], "events_p": round(p, 5),  # noqa: E501
+            "event_rule": event_v, "verdict": "REJECT" if "REJECT" in (rate_v, event_v) else ("PASS" if rate_v == "PASS" else "INCONCLUSIVE")}  # noqa: E501
 
 
 def cmd_check(a):
@@ -359,6 +385,9 @@ def main():
     s.add_argument("config")
     s.add_argument("set")
     s.add_argument("out")
+    s.add_argument("--path", choices=["decode", "prompt"], default="decode",
+                   help="decode: the real verify windows with the forced tokens (XESTRATA_FOLLOW); "
+                        "prompt: the text read as a prompt (XESTRATA_LOGPOS)")
     s.add_argument("--env", action="append")
     s.add_argument("--arg", action="append")
     s.add_argument("--min-free-gb", type=int, default=20)
