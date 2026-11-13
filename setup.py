@@ -5896,7 +5896,7 @@ def kv_streaming_ram_gb(ctx, kv) -> float:
 def kv_streaming_wanted(model, ctx, kv, ram) -> bool:
     """Does setup stream this model's KV cache on this PC (--kv-resident): from 64K up, when the RAM holds the cache
     beside the model's experts (+1 GB).  The merges' and the release's measurements ask it too (tools/bench_core.py)."""
-    return ctx >= 65536 and ram >= MODELS[model]["ram_gb"] + kv_streaming_ram_gb(ctx, kv) + 1
+    return ctx >= 65536 and ram >= MODELS[model]["arena_gb"] + LOW_RAM_HEADROOM_GB + kv_streaming_ram_gb(ctx, kv) + 1
 
 
 #: The draft layer (MTP) takes about 1 GB of graphics memory out of the expert cache (upstream 671f4573d): its files
@@ -9691,7 +9691,16 @@ def main() -> int:
                          "install it anyway", "  Install it anyway?")
             warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
         budget = budget_choice(model, ram, a.resident_budget_gib)
-        ok(f"RAM budget: {budget:g} GiB of {model}'s experts in RAM, the rest read from the model files on the SSD")
+        if (gpu.get("integrated") and a.resident_budget_gib is None
+                and (gpu.get("uma_gb") or 0.0) >= MODELS[model]["arena_gb"] + UNSLOTH_RAM_LEFT_GB):
+            # upstream 86ffdbeb1: on a unified-memory GPU whose shared pool holds the experts, the expert cache takes
+            # them all and nothing is pinned (a fixed cache beside a pinned RAM budget failed its first start on a
+            # 64 GB Strix Halo).  The engine sizes the cache from the memory the GPU can use.
+            ok(f"{model}'s experts fit this GPU's shared memory ({(gpu.get('uma_gb') or 0.0):.0f} GB): the expert cache "
+               "takes them all, no RAM copy is pinned")
+            budget = None
+        else:
+            ok(f"RAM budget: {budget:g} GiB of {model}'s experts in RAM, the rest read from the model files on the SSD")
         if a.low_ram not in ("auto", "off"):
             warn(f"--low-ram {a.low_ram} does not apply to {model}: it always reads part of its experts from the files")
     elif a.resident_budget_gib is not None:
@@ -10109,9 +10118,11 @@ def main() -> int:
                    f"so setup leaves {UNSLOTH_RAM_LEFT_GB} GB of the RAM for the OS and the desktop. "
                    "--expert-cache N in the config's args sets it")
             else:
-                warn(f"this GPU shares the RAM, and the {budget:g} GiB RAM budget leaves almost none for the expert "
-                     "cache: it stays on auto, which may take the room the OS needs. A smaller "
-                     "--resident-budget-gib leaves room")
+                # upstream 1d342f083: say where the cache is sized from, not that it may take the OS's room (on a
+                # unified-memory GPU a larger --vram-reserve-mib cannot raise it)
+                carve = gpu.get("carve_gb") or 0.0
+                where = f"{carve:.0f} GB carve-out + shared" if carve else "the shared memory"
+                ok(f"expert cache: sized from the graphics memory ({where}), not from the RAM")
     if vision != "none":
         args += ["--vision", "--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
     if a.vram_reserve_mib is not None:                 # #493: VRAM left free for other programs (only when given)

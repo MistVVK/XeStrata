@@ -25,6 +25,7 @@
 #include "strata/core/control_vector.hpp"
 #include "strata/core/stdin_lines.hpp"
 #include "strata/core/watchdog.hpp"
+#include "strata/core/context_fit.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_tier.hpp"
@@ -4071,7 +4072,51 @@ int main(int argc, char** argv) {
     const int64_t hi0 = carve ? split_at[0] : -1;
     auto stage_lo = [&](size_t i) { return split_at[i]; };
     auto stage_hi = [&](size_t i) { return i + 1 < split_at.size() ? split_at[i + 1] : g.n_layers; };
-    if (!strata::gpu::alloc_device(&sbuf, strata::core::session_bytes(g, o.max_context, K, 0, hi0))) {
+    // #5715: the room the session has now, read before its allocation, so a start that does not fit says the largest
+    // context that does (context_fit.hpp) instead of only that the allocation failed
+    size_t sess_free_b = 0, sess_total_b = 0;
+    const bool sess_room_known = strata::gpu::mem_info(&sess_free_b, &sess_total_b) && sess_free_b > 0;
+    const uint64_t sess_bytes = strata::core::session_bytes(g, o.max_context, K, 0, hi0);
+    if (!strata::gpu::alloc_device(&sbuf, sess_bytes)) {
+        if (sess_room_known) {
+            // The session is not the last allocation: leave the native head, the later prompt buffers and the
+            // engine's VRAM reserve out of its room.  The prompt estimate is the same one used by auto cache sizing.
+            uint64_t later = (uint64_t) std::max(0, o.vram_reserve_mib) << 20;
+            if (o.prefill_chunk > 0)
+                later += (uint64_t) (160 + o.prefill_chunk * 680 / 1024) << 20;
+            if (!o.native_head_gguf.empty() && !multi_gpu) {
+                try {
+                    const auto hm = strata::GgufModel::open(o.native_head_gguf);
+                    size_t at = 0;
+                    if (const auto* t = hm.find("output.weight", &at)) later += strata::tensor_payload_bytes(*t);
+                } catch (const std::exception&) {
+                    std::fprintf(stderr, "xestrata generate: cannot estimate the later head allocation\n");
+                    std::fprintf(stderr, "xestrata generate: session state allocation failed\n");
+                    return 1;
+                }
+            }
+            if (!o.mtp.empty()) {
+                for (const char* f : {"dense.bin", "experts.bin"}) {
+                    std::error_code ec;
+                    const auto b = std::filesystem::file_size(std::filesystem::path(o.mtp) / f, ec);
+                    if (!ec) later += b;
+                }
+            }
+            const uint64_t room = sess_free_b > later ? sess_free_b - later : 0;
+            const auto fit = strata::core::context_that_fits(
+                o.max_context, room,
+                [&](int64_t cells) { return strata::core::session_bytes(g, cells, K, 0, hi0); });
+            if (fit.cells > 0)
+                std::fprintf(stderr, "xestrata generate: a context of %lld tokens does not fit on this graphics card: its "
+                                     "session needs %.2f GiB and %.2f GiB remains after later allocations; try a context of %lld tokens\n",
+                             (long long) o.max_context, (double) fit.need / 1073741824.0,
+                             (double) fit.room / 1073741824.0, (long long) fit.cells);
+            else
+                std::fprintf(stderr, "xestrata generate: a context of %lld tokens does not fit on this graphics card: its "
+                                     "session needs %.2f GiB and %.2f GiB remains after later allocations (not even 1024 tokens fit)\n",
+                             (long long) o.max_context, (double) fit.need / 1073741824.0,
+                             (double) fit.room / 1073741824.0);
+        }
         std::fprintf(stderr, "xestrata generate: session state allocation failed\n");
         return 1;
     }
@@ -4923,6 +4968,7 @@ int main(int argc, char** argv) {
     // CUDA error left set by the failed `cudaHostRegister` and read later by `gr_read`'s launch check.  See the
     // note in `pinned.cu`.
     strata::core::FileExpertSource src;
+    bool io_pf_by_default = false;   // the file tier's Linux defaults turned io prefetch on (no XESTRATA_IO_PREFETCH given)
     strata::core::ArenaExpertSource arena_src;
     strata::core::ExpertSource* srcp = nullptr;
     std::vector<uint8_t> fill_tmp;   // blob_to_copy's buffer for a transient source
@@ -4955,8 +5001,8 @@ int main(int argc, char** argv) {
                                    ? std::min(hm.available - std::min(hm.available, strata::platform::cma_free_bytes()),
                                               hm.cgroup_limit)
                                    : 0;
-        if (!(keep != nullptr && std::strcmp(keep, "keep") == 0) && avail > 0 &&
-            !strata::core::detail::resident_pin_fits(need, 0, headroom, avail, why)) {
+        const bool room_short = avail > 0 && !strata::core::detail::resident_pin_fits(need, 0, headroom, avail, why);
+        if (!(keep != nullptr && std::strcmp(keep, "keep") == 0) && room_short) {
             std::fprintf(stderr, "xestrata generate: the expert arena needs %.2f GiB of RAM and %.0f GiB beside it, but "
                                  "%.2f GiB is available: starting as with --resident-experts (the experts the GPU does "
                                  "not hold in RAM as far as it has room, the rest from the model files; "
@@ -4967,6 +5013,24 @@ int main(int argc, char** argv) {
             if (!o.shared_expert_arena.empty())
                 std::fprintf(stderr, "xestrata generate: the shared expert arena is not used (it needs the room)\n");
             o.shared_expert_arena.clear();
+        } else if (room_short && ple_lock_by_policy && ple_table.locked()) {
+            // #4846 (upstream eb8917247): the arena is loaded anyway (XESTRATA_ARENA_LOW_RAM=keep, or a shared arena
+            // another engine filled), and the RAM is short.  The PLE table's lock the residency policy took is RAM this
+            // start needs: give it back before the arena is registered, as #4518 gives it back for the conversation
+            // cache (the pages stay cached, the OS may reclaim them).  --ple-io ram asked for by hand is never touched.
+            const uint64_t table_b = ple_table.table_bytes();
+            if (ple_table.unlock()) {
+                strata::core::detail::HostMemory after;
+                std::string now;
+                if (strata::core::detail::host_available_memory(after)) {
+                    char b[64];
+                    std::snprintf(b, sizeof b, " (%.2f GiB available now)", (double) after.available / 1073741824.0);
+                    now = b;
+                }
+                std::fprintf(stderr, "xestrata generate: the RAM is short for the expert arena; the PLE table's lock "
+                                     "(%.2f GiB) is given back before the arena is loaded%s\n",
+                             (double) table_b / 1073741824.0, now.c_str());
+            }
         }
     }
     if (o.mmap_experts) {
@@ -5004,6 +5068,7 @@ int main(int argc, char** argv) {
         if (io_pf_default || (io_pf_env != nullptr && std::strtol(io_pf_env, nullptr, 10) != 0)) {
             const char* th = strata::env_get("IO_PF_THREADS");
             src.set_io_prefetch(true, th != nullptr ? (int) std::strtol(th, nullptr, 10) : 0);
+            io_pf_by_default = io_pf_default && src.io_prefetch();
             const char* cv = strata::env_get("COLD_OVERLAP");
             const bool zc = cv != nullptr && cv[0] != '\0' ? std::strtol(cv, nullptr, 10) == 4 : src.gguf_mode();
             if (src.io_prefetch())
@@ -5716,6 +5781,48 @@ int main(int argc, char** argv) {
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
+    // upstream 994029b02 (PR 4972): when every routed expert sits in the GPU's caches the decode reads nothing from the
+    // file tier, and its Linux defaults (io prefetch, the decode gate) and the routing-aware prefetch only cost time
+    // (2x W7900D gfx1100, all 24576 pairs resident: decode 57 -> 80 tok/s, the answer byte-identical).  Only what the
+    // defaults switched on is suspended: XESTRATA_IO_PREFETCH=1 and XESTRATA_LOOKAHEAD=1 keep their own, and
+    // XESTRATA_FILE_TIER_IDLE=0 turns the policy off.  Checked at the start; the serve's VRAM command (a smaller cache
+    // later) does not turn them back on - the resize cases are rarer than the start this helps.
+    int64_t gpu_held_now = 0;
+    bool gpu_holds_all = false;
+    auto count_gpu_held = [&]() -> int64_t {
+        int64_t held = 0;
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            const int st = multi_gpu ? stage_of(l) : 0;
+            strata::core::ExpertCache& c = st > 0 ? stages[(size_t) st - 1]->cache : xcache;
+            const int64_t live = c.slots();
+            for (int64_t e = 0; e < g.n_expert; ++e) {
+                const int32_t slot = c.slot_of(l, e);
+                held += slot != strata::core::kNotResident && slot < live;
+            }
+        }
+        return held;
+    };
+    const bool file_tier_idle_ok = [] {
+        const char* v = strata::env_get("FILE_TIER_IDLE");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    const bool la_asked = [] {
+        const char* v = strata::env_get("LOOKAHEAD");
+        const char* p = strata::env_get("IO_PREFETCH");
+        return (v != nullptr && v[0] != '\0' && std::strtol(v, nullptr, 10) != 0) ||
+               (p != nullptr && p[0] != '\0' && std::strtol(p, nullptr, 10) != 0);
+    }();
+    if (srcp == &src && file_tier_idle_ok) {
+        gpu_held_now = count_gpu_held();
+        gpu_holds_all = gpu_held_now == g.n_layers * g.n_expert;
+        if (gpu_holds_all && io_pf_by_default) {
+            src.set_io_prefetch(false, 0);
+            std::fprintf(stderr, "xestrata generate: every expert is in the GPU caches (%lld of %lld): the file tier's "
+                                 "Linux defaults (io prefetch, the decode gate) are off; the decode reads nothing from "
+                                 "it (XESTRATA_IO_PREFETCH=1 keeps them, XESTRATA_FILE_TIER_IDLE=0 this policy)\n",
+                         (long long) gpu_held_now, (long long) (g.n_layers * g.n_expert));
+        }
+    }
     // CS-T: routing-aware prefetch of the file tier: the next layer's router on this layer's MoE input predicts its
     // experts, and with io prefetch (upstream 149) the I/O threads read them ahead (else their pages are only advised).
     // It never changes what is computed; STRATA_LOOKAHEAD=0 is the A/B arm, STRATA_LOOKAHEAD_K the experts per token
@@ -5735,13 +5842,19 @@ int main(int argc, char** argv) {
         }
         const char* kv = strata::env_get("LOOKAHEAD_K");
         if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? (int) std::strtol(kv, nullptr, 10) : 10, &src, err)) {
-            drive.d.lookahead = &lookahead;
-            // two layers ahead with io prefetch (upstream 149's default); STRATA_IO_PREFETCH_DEPTH 1..4
-            if (const char* dv = strata::env_get("IO_PREFETCH_DEPTH"); dv != nullptr && std::strtol(dv, nullptr, 10) > 0)
-                lookahead.set_depth((int) std::strtol(dv, nullptr, 10));
-            else if (src.io_prefetch())
-                lookahead.set_depth(2);
-            std::fprintf(stderr, "xestrata generate: routing-aware prefetch of the file tier on (the next layer's router)\n");
+            if (gpu_holds_all && !la_asked) {
+                std::fprintf(stderr, "xestrata generate: routing-aware prefetch off (every expert is in the GPU caches; "
+                                     "XESTRATA_LOOKAHEAD=1 runs it)\n");
+            } else {
+                drive.d.lookahead = &lookahead;
+                // two layers ahead with io prefetch (upstream 149's default); STRATA_IO_PREFETCH_DEPTH 1..4
+                if (const char* dv = strata::env_get("IO_PREFETCH_DEPTH"); dv != nullptr && std::strtol(dv, nullptr, 10) > 0)
+                    lookahead.set_depth((int) std::strtol(dv, nullptr, 10));
+                else if (src.io_prefetch())
+                    lookahead.set_depth(2);
+                std::fprintf(stderr, "xestrata generate: routing-aware prefetch of the file tier on (the next layer's "
+                                     "router)\n");
+            }
         } else {
             std::fprintf(stderr, "xestrata generate: routing-aware prefetch off (%s)\n",
                          ok ? err.c_str() : "the routers are not BF16 in the arena");
