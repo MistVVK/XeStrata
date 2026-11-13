@@ -44,6 +44,7 @@
 #include <exception>
 #include <fstream>
 #include <immintrin.h>
+#include <new>
 #include <sstream>
 #include <vector>
 
@@ -149,6 +150,11 @@ MtpDrafter::~MtpDrafter() {
     if (head_logits_) strata::gpu::free(head_logits_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_};
     for (void* h : hosts) if (h) strata::gpu::free(h);
+}
+
+void MtpDrafter::release() {
+    this->~MtpDrafter();
+    new (this) MtpDrafter();
 }
 
 const float* MtpDrafter::f32(const char* name) const {

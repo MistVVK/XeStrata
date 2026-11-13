@@ -399,6 +399,25 @@ void Verifier::diag(std::FILE* f) const {
                  last_t_, (long long) last_pos0_, at, rang, served, fa, fb);
 }
 
+void Verifier::taps_off() {
+    if (tap_layers_.empty() && tap_req_.empty()) return;
+    if (cs_) strata::gpu::stream_sync(cs_);
+    tap_req_.clear();
+    tap_layers_.clear();
+    std::fill(tap_slot_.begin(), tap_slot_.end(), -1);
+    for (auto& e : exec_)
+        if (e) { strata::gpu::graph_destroy(e); e = nullptr; }
+    for (auto& e : exec_res_)
+        if (e) { strata::gpu::graph_destroy(e); e = nullptr; }
+    for (auto& v : segs_) {
+        for (auto* e : v) strata::gpu::graph_destroy(e);
+        v.clear();
+    }
+    for (auto& kv : exec_bm_)
+        if (kv.second) strata::gpu::graph_destroy(kv.second);
+    exec_bm_.clear();
+}
+
 Verifier::~Verifier() {
     const Verifier* self = this;
     g_diag_verifier.compare_exchange_strong(self, nullptr);

@@ -50,6 +50,11 @@ public:
     Dflash2Drafter(const Dflash2Drafter&) = delete;
     Dflash2Drafter& operator=(const Dflash2Drafter&) = delete;
 
+    /// A pack's tap layers, hidden size and vocabulary, and the bytes its tensors take on the GPU, from its index
+    /// alone (nothing is loaded): an engine sets its taps before the drafter is loaded and checks the pack is its
+    /// model's (the hidden size, the vocabulary, the taps inside the model's layers).
+    struct PackShape { std::vector<int> taps; int hidden = 0; int64_t vocab = 0; uint64_t bytes = 0; };
+    static bool read_shape(const std::string& pack_path, PackShape& shape, std::string& err);
     /// Reads the pack (tools/dflash2_pack.py) to the GPU `device` and allocates the ring and the buffers.
     bool load(const std::string& pack_path, int device, std::string& err);
     /// The target's embedding and head (and the draft vocabulary file, "" or missing: the whole head).  The head's

@@ -44,6 +44,10 @@ class MtpDrafter {
 public:
     MtpDrafter() = default;
     ~MtpDrafter();
+    /// Everything given back (VRAM, the host staging, the streams and graphs): the engine's start measured that no
+    /// drafter or DFlash2 decodes faster.  The drafter is as a new one after this (unloaded).
+    void release();
+    bool loaded() const { return dense_ != nullptr; }
     MtpDrafter(const MtpDrafter&) = delete;
     MtpDrafter& operator=(const MtpDrafter&) = delete;
 
@@ -56,6 +60,7 @@ public:
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
     void set_max_drafts(int k) { max_drafts_ = k; }
+    int max_drafts() const { return max_drafts_; }
     int max_t() const { return max_t_; }
     /// --mtp-hnorm stream (opt-in; before the first draft or prefill): pre_fc_norm_hidden normalizes each
     /// hyper-connection stream on its own, as llama.cpp's qwen4exp MTP graph does, instead of one RMS over all four.

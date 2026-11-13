@@ -946,12 +946,39 @@ bool Prefill::set_helper(core::RemoteExperts* helper, int64_t max_rows, std::str
 }
 
 Prefill::Prefill() : impl_(new Impl) {}
+
+bool Prefill::set_tap_rows(int64_t cap_rows, std::string& err) {
+    tap_cap_ = cap_rows;
+    if (tap_local_.empty() || cap_rows == tap_alloc_) return true;
+    if (impl_ && impl_->cs) strata::gpu::stream_sync(impl_->cs);
+    strata::gpu::free(tap_dev_);
+    tap_dev_ = nullptr;
+    tap_alloc_ = 0;
+    if (!strata::gpu::alloc_device(&tap_dev_, (size_t) cap_rows * tap_local_.size() * (size_t) tap_n_ * 4)) {
+        err = "prefill: the DFlash2 tap staging does not fit";
+        return false;
+    }
+    tap_alloc_ = cap_rows;
+    return true;
+}
+
+void Prefill::taps_off() {
+    if (impl_ && impl_->cs) strata::gpu::stream_sync(impl_->cs);
+    strata::gpu::free(tap_dev_);
+    tap_dev_ = nullptr;
+    tap_layers_.clear();
+    tap_local_.clear();
+    std::fill(tap_slot_.begin(), tap_slot_.end(), -1);
+    tap_cap_ = tap_alloc_ = 0;
+    on_taps = nullptr;
+}
 Prefill::~Prefill() { release(); }
 void Prefill::reset() { release(); impl_ = std::make_unique<Impl>(); stats_ = {}; }
 void Prefill::release() {
     if (!impl_) return;
     lm_release();
     if (tap_dev_) { strata::gpu::free(tap_dev_); tap_dev_ = nullptr; }
+    tap_alloc_ = 0;
     impl_->stager.reset();
     if (impl_->cs) strata::gpu::stream_sync(impl_->cs);
     if (impl_->copy) strata::gpu::stream_sync(impl_->copy);
@@ -1261,11 +1288,13 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             tap_slot_[(size_t) l] = (int) tap_local_.size();
             tap_local_.push_back(l);
         }
+    tap_n_ = N;
     if (!tap_local_.empty() && tap_dev_ == nullptr) {
         if (tap_cap_ < 1 || !strata::gpu::alloc_device(&tap_dev_, (size_t) tap_cap_ * tap_local_.size() * N * 4)) {
             err = "prefill: the DFlash2 tap staging does not fit";
             return false;
         }
+        tap_alloc_ = tap_cap_;
     }
     for (int b = 0; next_ != nullptr && b < 2; ++b)
         if (!m.hand[b] && !strata::gpu::alloc_host((void**) &m.hand[b], (size_t) chunk * D * 4)) {
@@ -2119,7 +2148,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // the DFlash2 taps of this chunk: the rows at or after tap_first_ (the ring's window)
         const int64_t tap_t0 = tap_dev_ ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : 0;
         const int64_t tap_rows = tap_dev_ ? T - tap_t0 : 0;
-        if (tap_rows > tap_cap_) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
+        if (tap_rows > std::min(tap_cap_, tap_alloc_)) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
         // STRATA_KVA: this chunk is approximated in the layers at and after the split when its last position is
         // before the request's full-computation suffix; a chunk in the suffix runs the ordinary path everywhere.
         const bool kva_approx = kva_run && (p0 + T <= kva_frontier);
@@ -4639,7 +4668,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 const int64_t t0 = c * m.T;                // in the super-chunk
                 const int64_t tap_t0 = tap_dev_ ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : 0;
                 const int64_t tap_rows = tap_dev_ ? T - tap_t0 : 0;
-                if (tap_rows > tap_cap_) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
+                if (tap_rows > std::min(tap_cap_, tap_alloc_)) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
                 m.R = lb.r_dev ? lb.R + t0 * D : r_buf(c);
                 if (lb.r_dev && l == LB && LB > 0 &&
                     !strata::gpu::copy_async(m.R, lb.R_in + (size_t) t0 * D, (size_t) T * D * 4, cs)) {

@@ -164,32 +164,23 @@ bool Dflash2Drafter::read_shape(const std::string& path, PackShape& shape, std::
         const std::string line = index.substr(i, j - i);
         i = j + 1;
         char a[256], b[64], c[256];
-        int64_t v[4];
-        bool ok = true;
+        long long v1, v2, v3, v4;
         if (std::sscanf(line.c_str(), "cfg %63s %255s", b, c) == 2) {
             const std::string key = b;
-            if (key == "hidden") ok = read_int(c, shape.hidden);
-            else if (key == "vocab") ok = read_int(c, shape.vocab);
-            else if (key == "taps") ok = read_int_list(c, shape.taps);
-        } else if (read_tensor_line(line, a, b, v)) {
-            shape.bytes = std::max<uint64_t>(shape.bytes, (uint64_t) v[2] + (uint64_t) v[3]);
-        } else if (line.starts_with("t ")) {
-            ok = false;
-        }
-        if (!ok) {
-            err = "dflash2: " + path + " has a bad line in its index: ";
-            err += line;
-            return false;
+            if (key == "hidden") shape.hidden = std::atoi(c);
+            else if (key == "vocab") shape.vocab = std::atoll(c);
+            else if (key == "taps")
+                for (const char* q = c; *q;) {
+                    shape.taps.push_back(std::atoi(q));
+                    while (*q && *q != ',') ++q;
+                    if (*q == ',') ++q;
+                }
+        } else if (std::sscanf(line.c_str(), "t %255s %63s %lld %lld %lld %lld", a, b, &v1, &v2, &v3, &v4) == 6) {
+            shape.bytes = std::max<uint64_t>(shape.bytes, (uint64_t) v3 + (uint64_t) v4);
         }
     }
     if (shape.taps.empty() || shape.hidden <= 0) { err = "dflash2: " + path + " has no taps in its index"; return false; }
     return true;
-}
-
-void Dflash2Drafter::set_capacity_rows(int rows) {
-    if (device_ >= 0 || (rows != kRows && rows != kMaxRows))
-        throw std::invalid_argument("dflash2: capacity must be 8 or 16, set before load");
-    requested_capacity_rows_ = rows;
 }
 
 bool Dflash2Drafter::load(const std::string& path, int device, std::string& err) {
