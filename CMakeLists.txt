@@ -424,6 +424,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(staged_fo_rule_test PRIVATE include)
   add_test(NAME staged_fo_rule_test COMMAND staged_fo_rule_test)
 
+  # the start-up sentence of an engine built without llama.cpp's MMQ prompt kernels (layer counts per path; header-only, no GPU)
+  add_executable(own_only_line_test tests/prefill/own_only_line_test.cpp)
+  target_include_directories(own_only_line_test PRIVATE include)
+  add_test(NAME own_only_line_test COMMAND own_only_line_test)
+
   # whether the CUDA fused prompt kernels take the Gyro trellis experts by default (STRATA_PF_FUSED_TQ unset: the sm_86 cards with 80+ SMs; =1 any card; =0 off): the pure
   # rule, pinned for every card class (header-only, no GPU)
   add_executable(fused_tq_default_test tests/prefill/fused_tq_default_test.cpp)

@@ -35,6 +35,16 @@ int main() {
     CHECK(staged_fo_decide("1", true));
     CHECK(!staged_fo_decide("0", true));    // the way back: the measured class with the entry off
     CHECK(!staged_fo_decide("0", false));
+    // the class default: a build without MMQ takes the entry on every class (when the prerequisites hold); a build with MMQ only on the measured class with every layer fused-only
+    static_assert(strata::prefill::staged_fo_class_default(true, false, true), "no MMQ, any class: on");
+    static_assert(strata::prefill::staged_fo_class_default(true, true, true), "no MMQ, the measured class: on");
+    static_assert(!strata::prefill::staged_fo_class_default(true, false, false), "no MMQ, prerequisites missing (no gather or no group entry): off");
+    static_assert(strata::prefill::staged_fo_class_default(false, true, true), "MMQ build, the measured class with every layer fused-only: on (as before)");
+    static_assert(!strata::prefill::staged_fo_class_default(false, false, true), "MMQ build, another class: off (as before)");
+    static_assert(!strata::prefill::staged_fo_class_default(false, true, false), "MMQ build, prerequisites missing: off");
+    CHECK(staged_fo_decide(nullptr, strata::prefill::staged_fo_class_default(true, false, true)));
+    CHECK(!staged_fo_decide("0", strata::prefill::staged_fo_class_default(true, false, true)));    // the way back stays
+    CHECK(!staged_fo_decide(nullptr, strata::prefill::staged_fo_class_default(false, false, true)));
     // --short-read: the class default only where the entry is on for a measured class with every layer fused-only; elsewhere the engine's own 64
     static_assert(strata::prefill::kStagedEntryShortRead > 0 && strata::prefill::kStagedEntryShortRead < 64, "the entry's crossing is below the windows' 64");
     static_assert(strata::prefill::short_read_default(64, true, true, true) == strata::prefill::kStagedEntryShortRead, "the class default");

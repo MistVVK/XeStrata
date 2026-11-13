@@ -9,6 +9,7 @@
 #include "strata/prefill/pf_fused_override.hpp"
 #include "strata/prefill/staged_group_rule.hpp"
 #include "strata/prefill/staged_fo_rule.hpp"
+#include "strata/prefill/own_only_line.hpp"
 #include "strata/prefill/stream_floor_rule.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/prefill/fewrows.hpp"
@@ -377,7 +378,7 @@ inline bool stream_floor_class_measured() {
 #endif
 }
 // The staged walk's group entry (fz_staged) also takes a layer with no MMQ tile that the fused kernels cover (mmq_plan().fo), routed experts only, so a prompt chunk below the long-prompt
-// floor does not run each routed expert on the dequantize + FP16 GEMM path (staged_fo_rule.hpp).  STRATA_PF_STAGED_FO=1 asks for it on any card (research), 0 turns it off; unset: on where it was
+// floor does not run each routed expert on the dequantize + FP16 GEMM path (staged_fo_rule.hpp).  STRATA_PF_STAGED_FO=1 asks for it on any card (research), 0 turns it off; unset: in a build without MMQ on every class for the layers the fused kernels cover; in a build with MMQ on where it was
 // measured (Windows gfx1151 with a layer set that is fused-only on every layer, and the entry's own prerequisites: the staged walk's resident-group gather and its group entry).  Decided once when
 // the expert layout is known (a call before that answers from the variable alone and is not cached).
 inline bool staged_fo_on() {
@@ -388,7 +389,12 @@ inline bool staged_fo_on() {
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (!lay.native || lay.fmt.empty()) return strata::prefill::staged_fo_switch(env);
     const bool cls = stream_floor_class_measured();
-    const bool v = strata::prefill::staged_fo_decide(env, cls && layers_all_fused_only() && staged_group_gather() && staged_group_entry_on());
+#if defined(STRATA_PF_OWN_ONLY)
+    constexpr bool own_only = true;    // a build without MMQ: the fused staged entry on every class, for every layer the fused kernels cover (staged_fo_rule.hpp)
+#else
+    constexpr bool own_only = false;
+#endif
+    const bool v = strata::prefill::staged_fo_decide(env, strata::prefill::staged_fo_class_default(own_only, cls && layers_all_fused_only(), staged_group_gather() && staged_group_entry_on()));
     cached.store(v ? 1 : 0, std::memory_order_release);
     return v;
 }
@@ -1810,15 +1816,27 @@ const MmqPlan& mmq_plan() {
             }
         }
 #if defined(STRATA_PF_OWN_ONLY)
-        {   // [DRAFT] wording: the owner's to word (P4-SPLIT); one line per process, the plan is made once
-            int64_t nf = 0;
-            for (char c : p.fo) nf += c != 0;
+        if (layers > 0) {   // [DRAFT] wording: the owner's to word.  One line per process (the plan is made once): the layer counts per path, from the rule functions that pick the path.
+            const bool peer_off = strata::core::peer_portable();            // the walk's own condition (no_peer): the fused kernels stay off with a peer device
+            const bool entry_on = staged_fo_on();                           // the staged group entry for a fused-only layer below the floor (staged_fo_rule.hpp)
+            strata::prefill::OwnOnlySplit big, small;                       // at or above the long-prompt floor, below it
+            for (int64_t l = 0; l < layers; ++l) {
+                const bool fo = p.fo[(size_t) l] != 0 && !peer_off;
+                bool i8 = false;                                            // the int8 expert kernels take this layer's formats (the class rule or STRATA_EXPERT_I8, i8_wants_identity's test)
+                if (lay.native) {
+                    const auto& f = lay.fmt[(size_t) l];
+                    if (!f.tail_off && !f.had_gu && !f.had_d)
+                        i8 = strata::kernels::native_expert_i8_prompt(strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff), (int64_t) 1 << 20);
+                }
+                if (fo) ++big.fused; else if (i8) ++big.i8; else ++big.fp16;
+                if (fo && entry_on) ++small.staged; else if (i8) ++small.i8; else ++small.fp16;
+            }
+            std::fprintf(stderr, "%s\n", strata::prefill::own_only_line(layers, stream_all_min(), big, small, peer_off).c_str());
             std::string sw;
             for (const std::string& k : own_only_switches()) sw += (sw.empty() ? "" : " ") + k;
-            std::fprintf(stderr, "strata: [DRAFT] this engine was built without llama.cpp's MMQ prompt kernels. Prompt experts use Strata's own "
-                                 "kernels for %lld of %lld layers; the other layers, prompt pieces under %lld tokens and --peer-device use the "
-                                 "slower FP16 path. Switched on for this: %s (a switch you set is kept).\n",
-                         (long long) nf, (long long) layers, (long long) stream_all_min(), sw.empty() ? "none" : sw.c_str());
+            if (mf) strata::core::manifest::instance().path("prefill", "own-only-build", true,
+                "this engine was built without llama.cpp's MMQ prompt kernels",
+                "switches on by default here (a switch you set is kept): " + (sw.empty() ? std::string("none") : sw));
         }
 #endif
         // STRATA_MMQ_DIRECT=1: a native layer's resident experts are read in place when the pointer-table MMQ covers

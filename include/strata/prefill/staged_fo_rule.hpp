@@ -17,6 +17,11 @@ inline bool staged_fo_switch(const char* env) { return env != nullptr && env[0] 
 /// STRATA_PF_STAGED_FO asked for off: only "0".
 inline bool staged_fo_off(const char* env) { return env != nullptr && env[0] == '0' && env[1] == '\0'; }
 
+/// The class default of the entry for fused-only layers.  `prereqs`: the entry's own prerequisites (the staged walk's resident-group gather and its group entry).  A build without
+/// llama.cpp's MMQ takes the path a build with MMQ takes wherever that path does not need MMQ: the fused kernels' staged entry for every layer they cover, on every card class
+/// (`own_only_build`).  A build with MMQ keeps the measured class only (`measured_class_all_fused`: Windows gfx1151 with every layer fused-only).
+constexpr bool staged_fo_class_default(bool own_only_build, bool measured_class_all_fused, bool prereqs) { return prereqs && (own_only_build || measured_class_all_fused); }
+
 /// The entry for fused-only layers on or off for this run: "1" on, "0" off, else the class default (`class_default`: the measured class AND the entry's own prerequisites hold).
 inline bool staged_fo_decide(const char* env, bool class_default) {
     if (staged_fo_switch(env)) return true;
