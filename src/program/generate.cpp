@@ -2819,14 +2819,19 @@ int main(int argc, char** argv) {
         o.spec = std::max(chain_base, std::min(std::max(chain_base, o.mtp_max_t) + o.lookup_chain, spec_rows));
     }
     // Reserve the wide DFlash2 probe's window before the verifier and tap buffers are allocated. Keep an explicitly
-    // numbered --spec as given unless --wide-window on asks for the wider form.
+    // numbered --spec as given unless --wide-window on asks for the wider form. A missing pack cannot be measured.
     if ((o.draft == "auto" || o.draft == "dflash2") && !o.draft_model.empty() &&
-        o.batch == 0 && o.pipeline_windows < 2 &&
-        strata::core::window_rows_cap() == strata::kernels::kWindowMaxT &&
-        (strata::core::wide_window() == strata::core::WideWindow::On ||
-         (o.serve && o.spec_auto && strata::spec::probe_enabled()))) {
-        if (o.mtp_max_t == 0 && o.spec > 0) o.mtp_max_t = o.spec;
-        o.spec = strata::core::window_rows_cap();
+        o.batch == 0 && o.pipeline_windows < 2 && strata::core::window_rows_cap() == strata::kernels::kWindowMaxT) {
+        bool wide = strata::core::wide_window() == strata::core::WideWindow::On;
+        if (!wide && o.serve && o.spec_auto && strata::spec::probe_enabled()) {
+            strata::core::Dflash2Drafter::PackShape shape;
+            std::string why;
+            wide = strata::core::Dflash2Drafter::read_shape(o.draft_model, shape, why);
+        }
+        if (wide) {
+            if (o.mtp_max_t == 0 && o.spec > 0) o.mtp_max_t = o.spec;
+            o.spec = strata::core::window_rows_cap();
+        }
     }
     // the MTP's own windows stay at 8 rows (its draft layer's kernels are the narrow window's); a lookup or DFlash2
     // window goes on to --spec
