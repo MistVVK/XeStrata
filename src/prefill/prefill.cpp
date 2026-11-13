@@ -258,7 +258,7 @@ inline void pf_mark(const char* what, int64_t& last, uint64_t asked_bytes = 0) {
 // Either cudaMalloc (owned, freed with the object) or a bump allocation from a borrowed region; with no base and
 // no region it only counts, which is how `bytes_needed` sizes the region.
 struct Alloc {
-    uint64_t tr_asked = 0, tr_n = 0;   ///< STRATA_PF_ALLOC_TRACE: the device takes' sizes, and how far the free figure fell over them
+    uint64_t tr_asked = 0, tr_n = 0;   ///< XESTRATA_PF_ALLOC_TRACE: the device takes' sizes, and how far the free figure fell over them
     int64_t tr_drop = 0;
     uint8_t* base = nullptr;
     uint64_t cap = 0, used = 0;

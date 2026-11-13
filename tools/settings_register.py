@@ -8,7 +8,8 @@
 launcher reads `XESTRATA_*` through launcher/Core/Platform.fs, and the shell scripts read `$XESTRATA_NAME`.
 
     python tools/settings_register.py             # write data/settings-register.json
-    python tools/settings_register.py --check     # scan only; print what is missing from / extra in the register; exit 1 on a name difference
+    python tools/settings_register.py --check     # scan only; print what is missing from / extra in the register;
+                                                 # exit 1 on a name difference
     python tools/settings_register.py --names     # print the names that are read, one per line
 
 What counts as a read: the name is the string literal argument of an engine env helper (`env_get`, `env_on`, `env_off`,

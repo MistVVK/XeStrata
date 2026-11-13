@@ -1600,7 +1600,7 @@ if(STRATA_BUILD_TESTS)
   add_executable(stream_watch_test tests/core/stream_watch_test.cpp)
   target_include_directories(stream_watch_test PRIVATE include)
   add_test(NAME stream_watch_test COMMAND stream_watch_test)
-  # upstream 89f4fa18: the run manifest (XESTRATA_MANIFEST), off by default, the same text in any recording order - no GPU
+  # upstream 89f4fa18: the run manifest (XESTRATA_MANIFEST), off by default, the same text in any order - no GPU
   add_executable(run_manifest_test tests/core/run_manifest_test.cpp)
   target_include_directories(run_manifest_test PRIVATE include)
   target_link_libraries(run_manifest_test PRIVATE strata_platform)
@@ -1792,12 +1792,12 @@ if(STRATA_NATIVE_EXPERTS)
     # upstream 5d56ff8c0, c1d5e4d5e: the Unsloth v3.1 Qwen3.8-Flash-Next mixes - IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S,
     # IQ3_XXS and IQ4_XS gate/up with Q2_0, IQ4_NL, Q5_0 and Q8_0 down, at hidden 2560 / FF 640
     foreach(gu iq1_m iq2_xxs iq2_xs iq2_s iq3_xxs iq4_xs)
-      foreach(d q2_0 iq4_nl q5_0 q8_0)
-        if(gu STREQUAL "iq3_xxs" AND d STREQUAL "iq4_nl")
+      foreach(down q2_0 iq4_nl q5_0 q8_0)
+        if(gu STREQUAL "iq3_xxs" AND down STREQUAL "iq4_nl")
           continue()   # in the list above already
         endif()
-        add_test(NAME native_expert_parity_${gu}_${d} COMMAND native_expert_parity --synthetic ${gu}/${d})
-        set_tests_properties(native_expert_parity_${gu}_${d} PROPERTIES TIMEOUT 120)
+        add_test(NAME native_expert_parity_${gu}_${down} COMMAND native_expert_parity --synthetic ${gu}/${down})
+        set_tests_properties(native_expert_parity_${gu}_${down} PROPERTIES TIMEOUT 120)
       endforeach()
     endforeach()
     # APR (prism.hadamard, upstream fbf045eb6): a Hadamard-folded expert, the GPU rotation (float and the prompt path's
