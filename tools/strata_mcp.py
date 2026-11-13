@@ -48,6 +48,7 @@ DEFAULT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_PORT = 8095
 STATE_DIR = ".strata-mcp"                             # in the Strata folder (git-ignored)
 CONFIG = "xestrata-"                                  # setup's run configs: xestrata-<model>.json
+WIN = os.name == "nt"
 
 # What setup.py offers, used only when setup.py cannot be imported (the numbers are setup's MODELS / FAMILIES /
 # CONTEXTS; tools/test_strata_mcp.py checks they still match).
@@ -198,6 +199,19 @@ BENCH_PROMPT = ("Write a short story (about 300 words) about a lighthouse keeper
                 "Plain prose, no title.")
 
 
+if WIN:
+    import ctypes
+    from ctypes import wintypes
+
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+    _k32.OpenProcess.restype = wintypes.HANDLE
+    _k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    _k32.GetProcessTimes.argtypes = (wintypes.HANDLE, *(ctypes.POINTER(wintypes.FILETIME),) * 4)
+    _k32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    _k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    _QUERY, _STILL_ACTIVE = 0x1000, 259              # PROCESS_QUERY_LIMITED_INFORMATION, STILL_ACTIVE
+
+
 def log(msg: str) -> None:
     """Diagnostics go to stderr: stdout carries only the protocol."""
     try:
@@ -217,6 +231,23 @@ def proc_identity(pid) -> str | None:
         return None
     if pid <= 0:
         return None
+    if WIN:
+        # upstream 7ea172159: an ended child that nobody has reaped yet is not "running".  On Windows the test must
+        # not be os.kill(pid, 0): that terminates the process (its exit code is the signal).  OpenProcess and
+        # GetExitCodeProcess say whether it still runs, GetProcessTimes gives the start time for the token.
+        h = _k32.OpenProcess(_QUERY, False, pid)
+        if not h:
+            return None
+        try:
+            code = wintypes.DWORD()
+            if not _k32.GetExitCodeProcess(h, ctypes.byref(code)) or code.value != _STILL_ACTIVE:
+                return None
+            c, e, k, u = (wintypes.FILETIME() for _ in range(4))
+            if not _k32.GetProcessTimes(h, ctypes.byref(c), ctypes.byref(e), ctypes.byref(k), ctypes.byref(u)):
+                return None
+            return f"win:{(c.dwHighDateTime << 32) | c.dwLowDateTime}"
+        finally:
+            _k32.CloseHandle(h)
     stat = Path(f"/proc/{pid}/stat")
     if Path("/proc/self/stat").exists():
         try:
@@ -226,8 +257,8 @@ def proc_identity(pid) -> str | None:
         if fields[0] in ("Z", "X"):                     # a zombie has ended
             return None
         return f"linux:{fields[19]}"                    # field 22 of stat: the start time in clock ticks
-    try:                                                # elsewhere (no /proc): alive, without a start time
-        os.kill(pid, 0)
+    try:                                                # a POSIX system without /proc: alive, without a start time
+        os.kill(pid, 0)                                 # (never on Windows: there it would end the process)
         return "pid"
     except OSError:
         return None

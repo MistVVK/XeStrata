@@ -109,6 +109,14 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
     const int NT = 3;
     const int64_t H = f.n_embd, FF = f.n_ff;
     int failures = 0;
+    // upstream bfbe7fab2: the float reference below is ggml's, and this ggml's type table ends at GGML_TYPE_COUNT -
+    // llama.cpp's own ggml has no trellis types (144-149, which XeStrata's own rows handle).  Asking it for one of
+    // those reads past the table (on Windows: garbage), so the check is skipped rather than read past it.
+    if (f.gu_type >= (int) GGML_TYPE_COUNT || f.d_type >= (int) GGML_TYPE_COUNT) {
+        std::printf("%s %d: the expert types %d/%d are past this ggml's type table (it has no host traits for the "
+                    "trellis types): skipped\n", label, l, f.gu_type, f.d_type);
+        return 0;
+    }
     // (a) the float reference
     const auto* tg = ggml_get_type_traits((ggml_type) f.gu_type);
     const auto* td = ggml_get_type_traits((ggml_type) f.d_type);

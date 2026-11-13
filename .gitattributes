@@ -7,6 +7,10 @@ bench/prompts/** -text
 # launchers keep their platform line endings wherever the repository is cloned
 *.sh text eol=lf
 
+# Chat templates are rendered byte for byte (the served prompt, the pack's chat_golden.json): LF wherever the
+# repository is cloned, so a Windows checkout with core.autocrlf=true does not turn them into CRLF.
+*.jinja text eol=lf
+
 # Pack fixtures are parsed byte for byte.
 tests/data/native_experts/** -text
 
