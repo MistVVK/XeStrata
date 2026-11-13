@@ -179,6 +179,9 @@ inline double cpu_share_env() {   // -1: measured
     return v;
 }
 inline bool cpu_share_on() { return cpu_share_env() != 0.0; }
+// XESTRATA_PREFILL_CPU_SHARE_BATCH: a batch slot is decoding beside this read (Prefill::set_share_blocked): the pool
+// is its windows'
+std::atomic<bool> g_share_blocked{false};
 double g_pinned_share = 1.0;
 int g_ring_override = 0;
 // The streamed ring: 384 slots when (nearly) every streamed expert is DMA'd from pinned RAM - measured on Q2_0,
@@ -1681,6 +1684,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
 void Prefill::set_ring_override(int slots) { g_ring_override = std::clamp(slots,0,RING_MAX); }
 void Prefill::set_pinned_share(double share) { g_pinned_share = share; }
 void Prefill::set_group_cap(bool on) { g_group_cap = on; }
+void Prefill::set_share_blocked(bool blocked) { g_share_blocked.store(blocked, std::memory_order_release); }
 bool Prefill::group_cap() { return g_group_cap; }
 void Prefill::set_expert_group(int g) { g_expert_group = std::clamp(g, 1, 64); }
 int Prefill::expert_group() { return g_expert_group; }
@@ -2703,6 +2707,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     m.ids_host.from_device(m.ids, m.cs);
                     const strata::kernels::cpu::ExpertLayout& lay_c = strata::kernels::cpu::expert_layout();
                     bool cpu_maybe = cpu_pool_ != nullptr && cpu_share_on() && !stream_all && m.src != nullptr && !m.cpu_dead &&
+                                     !g_share_blocked.load(std::memory_order_acquire) &&
                                      lay_c.native && !lay_c.fmt.empty();
                     // The share's two pinned buffers are small (~50 MB) but are had mid-request, when the host may have
                     // nothing left (upstream 04dbe561, 0.1.41 report: tight RAM, chats failing).  A buffer that cannot be
