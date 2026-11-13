@@ -1410,6 +1410,56 @@ for _fam in PLAIN_FAMILIES.values():                 # the other models' files, 
         _m = _fam["mmproj"]
         REPO_PINS.setdefault(_m["repo"], {})[_m["path"].rsplit("/", 1)[-1]] = (_m["size"], _m["sha256"])
 
+# The pinned YASAKANI files; the models are not offered until the yskn engine can run them.
+YASAKANI_REPOS = {
+    "quality": "yasakani-dev/Qwen3.8-27B-YASAKANI-quality",
+    "speed": "yasakani-dev/Qwen3.8-27B-YASAKANI-speed",
+}
+HF_REVISIONS.update({
+    YASAKANI_REPOS["quality"]: "c1ca9235876d32fe21a4d5a5dd08e0000dee58ca",
+    YASAKANI_REPOS["speed"]: "cd78f90d205677f8b3d2ce95eae82a64e278b910",
+})
+YASAKANI_FILES = {
+    "quality": {
+        "LICENSE": (11544, "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"),
+        "NOTICE": (2102, "cd9ee7bacf223cec64d8f336ad684307531db3c54487aa70812fd97997757837"),
+        "bdraft2_k8.shead": (1411010584, "b412bdcf949fe372a3a452316c5f1c80e39f38845efd69a6b623f52a73066620"),
+        "bdraft2_k8.yskn": (1164969472, "631fa2ae75029897377837910227ec5ef19ce529515626049819e9367fdb53cc"),
+        "chat_template.jinja": (8952, "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"),
+        "config.json": (4312, "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab"),
+        "generation_config.json": (202, "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"),
+        "kvq_u5.bin": (17432, "a4760d46ecb8869bfdd808b01994cb65cd9b245c3c3eadd930a5b2bab2ea7570"),
+        "qwen38_27b_quality.yskn": (12365242368, "6493983cf95391823dfd8b4477733649fc20b0ddfd39fdc773cf2fa0ed46d18b"),
+        "selfcheck.json": (1192, "4d4bb670afcdc97efb7d2e84d16b1c9c10cb47d2d644030bec059c9239142827"),
+        "tokenizer.json": (12809320, "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"),
+        "tokenizer_config.json": (17928, "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27"),
+        "yasakani.json": (1322, "b3c139568132e2f9ad4bffc55d2cd8546773c4d2a5f1aa96c378529beab0505c"),
+    },
+    "speed": {
+        "LICENSE": (11544, "bbedc3fda3305820b977265f01b8619d87570a6739de3a5582c3464840f1e57a"),
+        "NOTICE": (2100, "a48f63c844b1d7bd63a613952b3c25d2725af3cc4ac2dd6d34c06a7ab7d2ad43"),
+        "bdraft2_k8.shead": (1411010584, "b412bdcf949fe372a3a452316c5f1c80e39f38845efd69a6b623f52a73066620"),
+        "bdraft2_k8.yskn": (1164969472, "631fa2ae75029897377837910227ec5ef19ce529515626049819e9367fdb53cc"),
+        "chat_template.jinja": (8952, "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041"),
+        "config.json": (4312, "191e0af232104ed8b65258cf3fb2b842e288008baca7633c11b82a1ac7203aab"),
+        "generation_config.json": (202, "e70c136c1b78ddc1fb0905bac8e733a4dc448d4f852a5dd75143fffc70be550e"),
+        "kvq_u5.bin": (17432, "a4760d46ecb8869bfdd808b01994cb65cd9b245c3c3eadd930a5b2bab2ea7570"),
+        "qwen38_27b_speed.yskn": (10311344128, "3ba17a76871a2b5e86fb1d01ab677e6b35ff5ccc27d4f03ad941501e3319d1ca"),
+        "selfcheck.json": (1192, "3e5efb03ecc2dec1c6fce4c9b87ee48d4e43ce84a074a8d3591eb3bc3ddb0ab6"),
+        "tokenizer.json": (12809320, "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"),
+        "tokenizer_config.json": (17928, "b11349aafa7cdc6a320767cf7ceb29ed82f7eda5d65e8e0819e76f0ce947bf27"),
+        "yasakani.json": (1318, "de4445e3f542aaf03187d92479aa4a82b874f8be85bf497dce7b9725614cab38"),
+    },
+}
+YASAKANI_MODELS = {
+    kind: {"repo": repo, "file": f"qwen38_27b_{kind}.yskn",
+           "size": YASAKANI_FILES[kind][f"qwen38_27b_{kind}.yskn"][0],
+           "sha256": YASAKANI_FILES[kind][f"qwen38_27b_{kind}.yskn"][1]}
+    for kind, repo in YASAKANI_REPOS.items()
+}
+for _kind, _repo in YASAKANI_REPOS.items():
+    REPO_PINS[_repo] = YASAKANI_FILES[_kind]
+
 # the translation models' GGUFs (serve/translate.py's MODELS), at HF_REVISIONS' commits: file -> (bytes, sha256)
 TRANSLATE_FILES = {
     "plamo-3-translate-2b-Q4_K_M.gguf":
