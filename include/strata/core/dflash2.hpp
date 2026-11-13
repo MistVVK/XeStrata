@@ -118,6 +118,9 @@ public:
     void set_max_drafts(int n);
 
     uint64_t vram_bytes() const { return vram_; }
+    /// The VRAM bind() will allocate for the draft head over `vocab_file`'s subset (or the whole head): the gathered
+    /// rows and the draft logits.  The expert cache is sized before bind(), so it reserves this.
+    uint64_t bind_bytes(uint64_t head_row_bytes, int64_t n_vocab, const std::string& vocab_file) const;
     int64_t n_draft_vocab() const { return n_dvocab_; }
     int n_embd() const { return N_; }
     int mask_token() const { return mask_token_; }

@@ -366,6 +366,12 @@ bool Dflash2Drafter::alloc(std::string& err) {
     return strata::gpu::stream_sync(cs_);
 }
 
+uint64_t Dflash2Drafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab, const std::string& vocab_file) const {
+    int64_t dv = DraftSubset::file_tokens(vocab_file);
+    if (dv <= 0 || dv > n_vocab) dv = n_vocab;
+    return (uint64_t) dv * head_row_bytes + (uint64_t) kDrafts * (uint64_t) dv * 4 + (uint64_t) dv * 4;
+}
+
 bool Dflash2Drafter::bind_raw(EmbedFn embed, HeadFn head, int head_type, int64_t head_rows,
                               const std::vector<int32_t>& vocab, std::string& err) {
     const OnDevice on_device(device_);
