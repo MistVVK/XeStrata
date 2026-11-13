@@ -2753,6 +2753,14 @@ def vision_attempts(cfg: dict) -> list[dict]:
     return out
 
 
+def stray_words(strays) -> str:
+    """The tail of a picture reader's start error: the last lines it printed instead of an answer (a debugger's, a
+    library's), which say what went wrong when the reader's own answer did not come."""
+    if not strays:
+        return ""
+    return " (it also printed on its output: " + " | ".join(x[:120] for x in list(strays)[-3:]) + ")"
+
+
 class Vision:
     """The resident image encoder: `xestrata-vision` (the engine's vision encoder + the mmproj file, on the GPU or the
     CPU) reads `ENC <image> <out>` lines and writes each image's embeddings; results are cached by the image's hash,
@@ -2885,13 +2893,65 @@ class Vision:
             raise RuntimeError(self.dead) from e
         self.lines: queue.Queue = queue.Queue()    # its stdout, read on a thread so that a wait can time out
         threading.Thread(target=self._read, args=(self.proc, self.lines), daemon=True).start()
-        line = self._line(VISION_READY_S)
-        if line is None or not line.startswith("READY"):
-            why = ("no answer within %d s" % VISION_READY_S if line == "" else
-                   "it exited" if line is None else line.strip())
+        strays: list[str] = []
+        try:
+            line = self._await_ready(VISION_READY_S, strays)
+        except RuntimeError as e:                  # silent for VISION_READY_S: it was ended, not left half-started
+            self._stop(str(e))
+            raise RuntimeError("the vision encoder did not start: " + str(e) + stray_words(strays)) from None
+        if line is None or line == "" or not line.startswith("READY"):
+            code = self.proc.poll() if self.proc is not None else None
+            why = (f"it exited ({engine_exit_words(code)})" if engine_exit_words(code) else "it exited") \
+                if line is None or line == "" else line.strip()
             self._stop(why)
-            raise RuntimeError("the vision encoder did not start: " + why)
+            raise RuntimeError("the vision encoder did not start: " + why + stray_words(strays))
         self.stopped = False
+
+    #: how long a reader that has already ended may still hold its output pipe open (a debugger attached to it, a
+    #: child it started) before the start is judged: the pipe's end does not come, the process's end is what counts
+    READY_GRACE_S = 2.0
+    #: lines kept from a reader's output before its answer (and written to the log): enough to see what it said
+    STRAY_KEEP = 20
+
+    def _await_ready(self, timeout: float | None, strays: list) -> str | None:
+        """The reader's answer to its start: a "READY ..." or "ERR ..." line (its two answers on stdout; everything
+        else it says goes to stderr), None when its output ended, or "" when its process has ended while a debugger
+        or a child still holds the pipe open.  Any other line is a stray line - a debugger a crashing reader started,
+        a library's banner - not an answer: it is kept in `strays` (the last STRAY_KEEP), written to the log, and the
+        wait goes on, so a reader that is only printing is never killed.  The wait has ONE deadline of `timeout` s
+        (None: for ever); on it the reader is killed and the read raises RuntimeError."""
+        proc = self.proc
+        if proc is None:
+            return ""
+        deadline = None if timeout is None else time.monotonic() + timeout
+        ended_at = None
+        said = 0
+        while True:
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                try:
+                    proc.kill()
+                except OSError:
+                    pass
+                raise RuntimeError(f"it said nothing for {timeout:.0f} s")
+            line = self._line(max(0.01, min(0.25, deadline - now)) if deadline is not None else 0.25)
+            if line is None or line.startswith(("READY", "ERR")):
+                return line
+            if line == "":                                   # nothing yet: has the process ended under the pipe?
+                code = proc.poll() if hasattr(proc, "poll") else None
+                if code is not None:
+                    ended_at = now if ended_at is None else ended_at
+                    if now - ended_at >= self.READY_GRACE_S:
+                        return ""
+                continue
+            stray = line.strip()
+            if stray:
+                strays.append(stray[:300])
+                del strays[:-self.STRAY_KEEP]
+                said += 1
+                if said <= self.STRAY_KEEP:
+                    print(f"[xestrata] the picture reader printed on its output, not an answer: {stray[:200]}",
+                          flush=True)
 
     def alive(self) -> bool:
         """False after `unload` (and before a lazy encoder's first start): the next request starts it again.  An
