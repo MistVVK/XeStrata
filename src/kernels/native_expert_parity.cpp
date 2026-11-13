@@ -902,6 +902,10 @@ int check_load(const char* pack, const char* gguf) {
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);   // keep the trail on a crash
+    // ggml-cpu's dots read the fp16 -> fp32 table that ggml_cpu_init() fills, and until it runs every vec_dot returns 0.
+    // The CPU pool no longer calls it (STRATA_OWN_CPU_QUANT, the default), so this test, whose reference is ggml's own
+    // vec_dot, starts it itself; without it all the CPU legs below compare against zeros.
+    ggml_cpu_init();
     if (const char* e = std::getenv("Q4KQ_PARITY_EMBD")) H = std::atoll(e);
     if (const char* e = std::getenv("Q4KQ_PARITY_FF")) FF = std::atoll(e);
     if (argc < 2) {
