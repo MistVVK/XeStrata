@@ -562,7 +562,8 @@ if(STRATA_ENABLE_XE)
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
                                    src/core/conversation_file.cpp src/core/control_vector.cpp
                                    src/core/vmm.cpp src/core/draft_head.cpp
-                                   src/core/grammar.cpp src/core/script_guard.cpp src/core/plain_cpu.cpp)
+                                   src/core/grammar.cpp src/core/script_guard.cpp src/core/plain_cpu.cpp
+                                   src/core/auto_pick.cpp)
   target_include_directories(strata_engine PUBLIC include)
   # the dense Qwen3.5 forward on the CPU (--device cpu): AVX2 throughout, run only after PlainModel's cpu_avx2_ok()
   set_source_files_properties(src/core/plain_cpu.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
@@ -1598,6 +1599,10 @@ if(STRATA_BUILD_TESTS)
   add_executable(conversation_cache_test src/core/conversation_cache_test.cpp)
   target_include_directories(conversation_cache_test PRIVATE include)
   add_test(NAME conversation_cache_test COMMAND conversation_cache_test)
+  # a speed switch's three settings and the choice its first windows make (header-only, no GPU)
+  add_executable(auto_pick_test src/core/auto_pick_test.cpp)
+  target_include_directories(auto_pick_test PRIVATE include)
+  add_test(NAME auto_pick_test COMMAND auto_pick_test)
   add_executable(conversation_memory_test src/core/conversation_memory_test.cpp src/core/conversation_memory.cpp)
   target_include_directories(conversation_memory_test PRIVATE include)
   add_test(NAME conversation_memory_test COMMAND conversation_memory_test)

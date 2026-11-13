@@ -1,0 +1,112 @@
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// include/strata/core/auto_pick.hpp - a speed switch's three settings, and the choice its first windows make.
+#pragma once
+
+#include "strata/platform/env.hpp"
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+namespace strata::core {
+
+/// A speed switch's settings as XESTRATA_<name> gives them: unset or "auto" lets the engine choose at run time,
+/// "0"/"off" turns it off, "1"/"on" on.  A value that is none of these reads as auto, with one line.
+enum class Pick { Auto, Off, On };
+
+inline Pick pick_from_env(const char* name) {
+    const char* v = strata::env_get(name);
+    if (v == nullptr || v[0] == 0 || std::strcmp(v, "auto") == 0) return Pick::Auto;
+    if (v[0] == '0' || std::strcmp(v, "off") == 0 || std::strcmp(v, "no") == 0) return Pick::Off;
+    if (v[0] == '1' || std::strcmp(v, "on") == 0 || std::strcmp(v, "yes") == 0) return Pick::On;
+    std::fprintf(stderr, "xestrata: XESTRATA_%s=%s is not auto, off or on: auto\n", name, v);
+    return Pick::Auto;
+}
+
+/// A switch that shows only inside the engine's windows, chosen by the first ones: the windows run in blocks of
+/// `block`, the switch's other form and its default in turn, `rounds` rounds of two blocks (two rounds: default,
+/// other, other, default, so that a drift over the run falls on both alike), and the faster time a token stays.  The
+/// other form has to be `gain` faster, so a run the two cannot be told apart in keeps the default.  Only windows where
+/// the switch could change anything are counted; the blocks run out all the same, and one that never saw such a window
+/// keeps the default and says so.  Nothing is kept between runs; the decision is one line.
+class WindowChoice {
+public:
+    WindowChoice() = default;
+    /// `name` is the switch as a user reads it (XESTRATA_<name>), `what` the decision's subject in its line.
+    WindowChoice(const char* who, const char* name, const char* what, int block = 4, int rounds = 2,
+                 double gain = 1.03, const char* unit = "a window")
+        : who_(who), name_(name), what_(what), block_(block < 1 ? 1 : block), rounds_(rounds < 1 ? 1 : rounds),
+          unit_(unit), gain_(gain) {}
+
+    /// The form for the window about to run: false (the default) until it decides, then the winner.
+    bool on() const { return on_; }
+    /// Still measuring.
+    bool choosing() const { return block_index_ < blocks(); }
+    int blocks() const { return 2 * rounds_; }
+
+    /// The window that just ran under on(): its milliseconds and tokens, and whether it could show the difference.
+    void took(double ms, int64_t tokens, bool informative = true) {
+        if (!choosing()) return;
+        if (informative && tokens > 0) {
+            ms_[on_ ? 1 : 0] += ms;
+            tok_[on_ ? 1 : 0] += tokens;
+        }
+        if (++windows_in_block_ < block_) return;
+        windows_in_block_ = 0;
+        ++block_index_;
+        if (block_index_ < blocks()) on_ = other(block_index_);
+        else decide();
+    }
+
+private:
+    /// ABBA: the default, the other, the other, the default, ...  A round is two blocks.
+    static bool other(int block) { return (block % 2) != ((block / 2) % 2); }
+
+    void decide() {
+        const double def_rate = tok_[0] > 0 ? ms_[0] / (double) tok_[0] : -1.0;
+        const double alt_rate = tok_[1] > 0 ? ms_[1] / (double) tok_[1] : -1.0;
+        if (def_rate < 0.0 || alt_rate < 0.0) {
+            on_ = false;
+            std::fprintf(stderr, "%s: XESTRATA_%s: %s: not seen in the first windows: off\n", who_, name_, what_);
+            return;
+        }
+        on_ = alt_rate * gain_ < def_rate;
+        std::fprintf(stderr, "%s: XESTRATA_%s: %s: %.2f ms %s with it, %.2f without: %s (XESTRATA_%s=0/1 picks one)\n",
+                     who_, name_, what_, alt_rate, unit_, def_rate, on_ ? "on" : "off", name_);
+    }
+
+    const char* who_ = "xestrata";
+    const char* name_ = "";
+    const char* what_ = "";
+    const char* unit_ = "a window";
+    int block_ = 4, rounds_ = 2;
+    double gain_ = 1.03;
+    int block_index_ = 0, windows_in_block_ = 0;
+    bool on_ = false;
+    double ms_[2] = {0.0, 0.0};
+    int64_t tok_[2] = {0, 0};
+};
+
+/// Whether every MoE layer of the pack rounds the CPU's and the GPU's experts to the same bits (a canon layer, or a
+/// trellis one the CPU supports): the adaptive tier's swaps then move an expert between them without changing a
+/// token, and the switches that only change when a swap is applied can be measured on the running text.  The same
+/// rule that decides whether a window is cut at a swap (ADAPT_CUT).
+bool adapt_layers_round_alike();
+
+/// ADAPT_LAG=auto: the value the first windows chose (1: the next window waits for the copies, 0: not yet, the
+/// engine's own default stays).  XESTRATA_ADAPT_LAG=<n> fixes it.
+int adapt_lag_forced();
+int adapt_lag_chosen();
+/// A decode window's time, `tokens` rows, `first` on the first window of a round whose swaps are still to be
+/// applied (the window the lag decides the cost of).
+void adapt_lag_window(double ms, int64_t tokens, bool first);
+
+/// DISJOINT_ADAPT=auto: whether a helper GPU's experts stay out of the primary's promotion candidates, chosen by the
+/// first windows of a run whose helpers hold experts.  XESTRATA_DISJOINT_ADAPT=0/1 fixes it.
+bool disjoint_adapt_on();
+/// A decode window of a run with helpers: its time, rows, and whether a helper GPU held an expert.
+void disjoint_adapt_window(double ms, int64_t tokens, bool helpers);
+
+}  // namespace strata::core
