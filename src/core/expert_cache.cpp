@@ -8,6 +8,7 @@
 #include "strata/platform/env.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -313,6 +314,15 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
 namespace {
 bool g_cache_vmm = false;   // set_vmm
 
+// upstream e008709d (#5708): a failed free-memory query is not a full card.  The size checks below go on without the
+// figure, so say once why (a "0 MiB free" would read as a measurement).
+void note_free_query_error(const char* where) {
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true))
+        std::fprintf(stderr, "xestrata: the GPU's free memory could not be read (%s); the expert cache is sized at %s without that check\n",
+                     strata::gpu::last_error(), where);
+}
+
 // STRATA_TEST_ALLOC_FAIL=N: the first N single allocations of the cache fail as a refused allocation does, so the
 // piece fallback and its give-up can be tested without a driver in that state (the B70's xe, 2026-10-22: 25.5 GiB
 // refused with 26.4 GiB reported free, every retry after it refused).
@@ -376,7 +386,8 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     // `device_slot()` walks off the end. So the free-VRAM figure is read and compared BEFORE the allocation,
     // and the two numbers are named in the refusal.
     size_t free_b = 0, total_b = 0;
-    if (strata::gpu::mem_info(&free_b, &total_b)) {
+    if (!strata::gpu::mem_info(&free_b, &total_b)) note_free_query_error("open");
+    else {
         if ((uint64_t) free_b < want) {
             err = "ExpertCache: " + std::to_string(n_slots) + " slots of " +
                   std::to_string((long long) (blob_bytes >> 20)) + " MiB = " +
@@ -480,7 +491,8 @@ bool ExpertCache::alloc_pieces(const std::vector<uint64_t>& size_off, uint64_t p
     const uint64_t want = size_off.back();
     if (!best_effort) {
         size_t free_b = 0, total_b = 0;
-        if (strata::gpu::mem_info(&free_b, &total_b) && (uint64_t) free_b < want) {
+        if (!strata::gpu::mem_info(&free_b, &total_b)) note_free_query_error("alloc_pieces");
+        else if ((uint64_t) free_b < want) {
             err = "ExpertCache: " + std::to_string((long long) (want >> 20)) + " MiB of slots, but only " +
                   std::to_string((long long) (free_b >> 20)) + " MiB of VRAM is free";
             return false;

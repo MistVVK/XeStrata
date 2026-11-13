@@ -3972,6 +3972,10 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
     // (a shared arena, --shared-expert-arena, may already be in RAM for another engine: not checked)
     if (detail::HostMemory hm; shared_arena_file.empty() && detail::host_available_memory(hm)) {
         const uint64_t need = want + (uint64_t) blob;
+        // A cgroup limit below the arena itself.  The callers judge the limit with the arena's headroom and take the
+        // low-RAM start when it does not fit (generate.cpp, plain_model.cpp); a start that asks for the arena anyway
+        // (XESTRATA_ARENA_LOW_RAM=keep, a shared arena another engine filled) is refused here, as before, rather than
+        // killed by the cgroup OOM killer part-way through the load.
         const double gib = 1073741824.0;
         char buf[512];
         if (hm.cgroup_limit < need) {

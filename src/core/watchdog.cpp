@@ -5,7 +5,9 @@
 
 #include "strata/core/watchdog.hpp"
 
+#include "strata/core/gpu.hpp"
 #include "strata/core/gpu_pause_time.hpp"
+#include "strata/core/stream_watch.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/platform/env.hpp"
 #include "strata/platform/thread_name.hpp"
@@ -256,14 +258,15 @@ static void collect() {
 }
 
 static void print(std::FILE* f) {
-    using SymInitializeFn = BOOL(WINAPI*)(HANDLE, const char*, BOOL);
-    using SymFromAddrFn = BOOL(WINAPI*)(HANDLE, DWORD64, DWORD64*, SYMBOL_INFO*);
-    using SymSetOptionsFn = DWORD(WINAPI*)(DWORD);
+    // x64 has one calling convention, so no WINAPI; GetProcAddress's FARPROC goes through void* to the real type
+    using SymInitializeFn = BOOL (*)(HANDLE, const char*, BOOL);
+    using SymFromAddrFn = BOOL (*)(HANDLE, DWORD64, DWORD64*, SYMBOL_INFO*);
+    using SymSetOptionsFn = DWORD (*)(DWORD);
     SymFromAddrFn sym_from = nullptr;
     if (HMODULE dbg = LoadLibraryA("dbghelp.dll")) {
-        auto init = (SymInitializeFn) GetProcAddress(dbg, "SymInitialize");
-        auto setopt = (SymSetOptionsFn) GetProcAddress(dbg, "SymSetOptions");
-        sym_from = (SymFromAddrFn) GetProcAddress(dbg, "SymFromAddr");
+        auto init = reinterpret_cast<SymInitializeFn>(reinterpret_cast<void*>(GetProcAddress(dbg, "SymInitialize")));
+        auto setopt = reinterpret_cast<SymSetOptionsFn>(reinterpret_cast<void*>(GetProcAddress(dbg, "SymSetOptions")));
+        sym_from = reinterpret_cast<SymFromAddrFn>(reinterpret_cast<void*>(GetProcAddress(dbg, "SymFromAddr")));
         if (setopt) setopt(0x2 /*SYMOPT_UNDNAME*/ | 0x10 /*SYMOPT_DEFERRED_LOADS*/ | 0x20000 /*SYMOPT_NO_PROMPTS*/);
         if (init == nullptr || !init(GetCurrentProcess(), nullptr, TRUE)) sym_from = nullptr;
     }
@@ -331,6 +334,15 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
             std::fprintf(f, "  2 s later:\n");
         }
+        // upstream 711a7e937 (#5718 follow-up): the streams a host may be blocked on (the prompt path's), asked without
+        // blocking - before the diags below, so "finished" here means the GPU was done and the waiting host was not woken
+        strata::core::stream_watch().report(f, [](void* s, int, std::string& why) {
+            switch (strata::gpu::stream_status((strata::gpu::Stream) s)) {
+                case strata::gpu::Status::Done: return strata::core::StreamState::finished;
+                case strata::gpu::Status::Pending: return strata::core::StreamState::working;
+                default: why = strata::gpu::last_error(); return strata::core::StreamState::failed;
+            }
+        });
         if (auto fn = diag_pool_fn().load()) fn(f);
         if (auto fn = diag_verify_fn().load()) fn(f);
 #if !defined(_WIN32)

@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/native_dense.hpp"
+#include "strata/core/run_manifest.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/fused_gr.hpp"
@@ -408,6 +409,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 max_in = (std::max)(max_in, (int) ref.ne0);
                 total += bytes;
+                // upstream 89f4fa18 (XESTRATA_MANIFEST): the dense formats as held
+                if (strata::core::manifest::enabled())
+                    strata::core::manifest::instance().tensors("dense", strata::ggml_type_name((uint32_t) tensor.type), 1, bytes);
                 pending.push_back(Pending{&ref, type, bytes, std::move(data)});
             }
             for (const auto& tensor : gguf.tensors()) {
@@ -520,6 +524,15 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             hc_q8_.push_back(data.release());
         }
         bytes_ = total + hc_q8_bytes;
+        if (strata::core::manifest::enabled()) {   // upstream 89f4fa18: whether the hyper-connection rows were copied, and why
+            const char* v = strata::env_get("HC_Q8");
+            const bool on = hc_q8_requested() && !hc_q8_short;
+            strata::core::manifest::instance().path(
+                "dense", "hc_q8", on,
+                on ? (hc_q8_mode() == HcQ8::Auto ? "XESTRATA_HC_Q8=auto: measured faster on this GPU" : "XESTRATA_HC_Q8=1")
+                   : (v != nullptr && v[0] != '\0' && std::strcmp(v, "auto") != 0 ? "XESTRATA_HC_Q8 turned it off"
+                                                                                 : "off: the BF16 read, or no VRAM for the copies"));
+        }
         if (!hc_q8_.empty())
             std::fprintf(stderr, "xestrata: XESTRATA_HC_Q8: %.2f GiB of Q8_0 hyper-connection projections (%zu)\n",
                          (double) hc_q8_bytes / 1073741824.0, hc_q8_.size());

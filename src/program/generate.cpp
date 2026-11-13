@@ -93,6 +93,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/core/progress.hpp"
+#include "strata/core/run_manifest.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/artifact/model_spec.hpp"
 #include "strata/platform/direct_file.hpp"
@@ -1985,7 +1986,9 @@ static double ple_direct_rows_per_s(strata::kernels::PleTable& t) {
     if (n < 4096) return -1.0;
     constexpr size_t kTok = 4;   // 64 rows a batch
     std::vector<uint32_t> rows(kTok * 16);
-    std::vector<float> out(kTok * 2560);
+    // upstream dcaf4755: one token's PLE rows are PLE_N_HEADS x PLE_HEAD_DIM floats = the compiled hidden size (2560
+    // for Flash-Next): a buffer of 2560 floats a token is a heap overflow where the hidden size is larger
+    std::vector<float> out(kTok * (size_t) strata::kernels::PLE_N_HEADS * (size_t) strata::kernels::PLE_HEAD_DIM);
     uint64_t x = 0x9E3779B97F4A7C15ull ^ n;
     const auto t0 = std::chrono::steady_clock::now();
     uint64_t done = 0;
@@ -4800,16 +4803,23 @@ int main(int argc, char** argv) {
         const uint64_t need = lay.total + lay.max_blob;
         std::string why;
         const uint64_t headroom = strata::core::detail::ram_headroom(8ull << 30);
-        if (!(keep != nullptr && std::strcmp(keep, "keep") == 0) && strata::core::detail::host_available_memory(hm) &&
-            !strata::core::detail::resident_pin_fits(
-                need, 0, headroom, hm.available - std::min(hm.available, strata::platform::cma_free_bytes()), why) &&
-            hm.cgroup_limit >= need) {
+        // upstream 4adc047d (#5708 era), as XeStrata takes it: a HARD memory limit (a cgroup, a container) is part of the
+        // RAM this start may use, next to MemAvailable (plain's judgment: host_available_memory's figure, capped by the
+        // limit).  A limit that cannot hold the arena and the headroom beside it takes the low-RAM start below - the
+        // same start as --resident-experts - not a refusal (a container just above the arena was killed by the cgroup
+        // OOM killer while loading, upstream: 49 GiB against a 46.84 GiB arena).
+        const bool mem_known = strata::core::detail::host_available_memory(hm);
+        const uint64_t avail = mem_known
+                                   ? std::min(hm.available - std::min(hm.available, strata::platform::cma_free_bytes()),
+                                              hm.cgroup_limit)
+                                   : 0;
+        if (!(keep != nullptr && std::strcmp(keep, "keep") == 0) && avail > 0 &&
+            !strata::core::detail::resident_pin_fits(need, 0, headroom, avail, why)) {
             std::fprintf(stderr, "xestrata generate: the expert arena needs %.2f GiB of RAM and %.0f GiB beside it, but "
                                  "%.2f GiB is available: starting as with --resident-experts (the experts the GPU does "
                                  "not hold in RAM as far as it has room, the rest from the model files; "
                                  "XESTRATA_ARENA_LOW_RAM=keep loads the whole arena anyway)\n",
-                         (double) need / 1073741824.0, (double) headroom / 1073741824.0,
-                         (double) hm.available / 1073741824.0);
+                         (double) need / 1073741824.0, (double) headroom / 1073741824.0, (double) avail / 1073741824.0);
             o.mmap_experts = o.resident_pin = true;
             o.resident_gib = -1;
             if (!o.shared_expert_arena.empty())
@@ -7619,12 +7629,17 @@ int main(int argc, char** argv) {
                     return strata::core::conversation_memory_admit(
                         mem ? std::optional<uint64_t>(mem->available) : std::nullopt, additional, floor);
                 };
-                while (!admit() && conversations.size() > 0 && freed < conversations.slots() &&
+                // upstream 8c71c492 (#5697): freed memory can stay in the C library's heap, which MemAvailable does not
+                // count (make_room's evictions, dropped checkpoints): a failed check hands it back first, and
+                // evict_oldest() hands back each entry it drops, so the next check reads it from /proc/meminfo.
+                bool fits = admit() || (strata::core::release_free_heap() && admit());
+                while (!fits && conversations.size() > 0 && freed < conversations.slots() &&
                        conversations.evict_oldest(disk.enabled() ? &evicted : nullptr)) {
                     ++freed;
                     save_evicted();
+                    fits = admit();
                 }
-                if (!admit()) {
+                if (!fits) {
                     std::fprintf(stderr, "xestrata serve: conversation cache: skip parking (physical RAM admission; need "
                                          "%zu MiB plus %lld MiB floor, %s; evicted %zu, %zu still parked)\n",
                                  additional >> 20, (long long) o.conversation_cache_min_free_mib, ram_note(mem).c_str(),
@@ -8660,6 +8675,30 @@ int main(int argc, char** argv) {
         strata::gpu::pin_reserve_release();   // the engine is up: the pinned memory's last reserve goes back
         strata::platform::settle_before_ready();
         strata::platform::downgrades_say();   // the start's fallbacks (the server keeps them: /v1/status)
+        if (strata::core::manifest::enabled()) {   // upstream 89f4fa18 (XESTRATA_MANIFEST): the engine choice and budgets
+            auto& M = strata::core::manifest::instance();
+            M.engine("version", STRATA_VERSION);
+            M.engine("engine", stages.empty() ? "native-single-gpu" : "native-layer-split");
+            M.engine("stages", std::to_string(stages.size() + 1));
+            M.engine("kv_format", o.kv);
+            M.engine("spec_window", std::to_string(o.spec));
+            M.engine("prompt_experts", strata::prefill::experts_path());
+            M.budget("context", o.max_context);
+            M.budget("expert_cache_mib", xcache.bytes() >> 20);
+            M.budget("expert_slots", xcache.slots());
+            M.budget("vram_reserve_mib", o.vram_reserve_mib);
+            M.budget("prefill_chunk", o.prefill_chunk);
+            M.budget("pool_workers", pool.workers());
+            M.budget("conversation_cache_mib", o.conversation_cache_mib);
+            M.budget("batch_slots", o.batch);
+            // upstream 445cdf45: an unset XESTRATA_ROUTE_TAIL_SKIP means the engine default applies (tails are skipped
+            // only where the configuration allows), not "off"
+            const int tail = strata::core::tail_skip_rank();
+            M.path("experts", "route_tail_skip", tail > 0,
+                   tail > 0 ? "XESTRATA_ROUTE_TAIL_SKIP=" + std::to_string(tail)
+                            : "XESTRATA_ROUTE_TAIL_SKIP is unset: the engine default applies, tails are skipped only where the configuration allows");
+            M.write("ready");
+        }
         std::printf("READY %lld stop\n", (long long) o.max_context);   // "stop": this engine honours STOP
         std::fflush(stdout);
         std::string line;
@@ -9683,6 +9722,7 @@ int main(int argc, char** argv) {
             return pmtp_settle();
         };
         for (;;) {
+            strata::core::manifest::instance().flush_if_dirty("request");   // XESTRATA_MANIFEST: what the last request added (a no-op when off)
             strata::platform::downgrades_say();   // a request's fallbacks, between whole lines
             if (batch_on() || (piped && pipe_inflight())) {   // the slots decode while no line waits
                 if (!in.try_next(line)) {

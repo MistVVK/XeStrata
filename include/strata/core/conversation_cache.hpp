@@ -16,7 +16,24 @@
 #include <utility>
 #include <vector>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 namespace strata::core {
+
+/// upstream 8c71c492 (#5697): hands the memory this process freed back to the system where the C library keeps it in
+/// its heap (glibc: malloc_trim, every arena; freed pages inside the heap are released, not only its top).  MemAvailable,
+/// which the RAM gates read, counts only what was handed back.  False where there is no such call (Windows, macOS, musl:
+/// their allocators return large blocks on free).  Costs a walk over the heap's free chunks: call it when RAM is short.
+inline bool release_free_heap() {
+#if defined(__GLIBC__)
+    ::malloc_trim(0);
+    return true;
+#else
+    return false;
+#endif
+}
 
 struct ConversationImageKey {
     int64_t start = 0;
@@ -306,29 +323,22 @@ public:
         while (!entries_.empty() && (entries_.size() >= slots_ || bytes_ > budget_ - held - incoming)) {
             // the oldest entry that does not hold a pinned shared prefix leaves; with only pinned ones left the new
             // image does not fit (the caller skips parking it - the pinned prefix is what the queries come back to)
-            if (!evict_oldest(evicted)) return false;
+            if (!drop_oldest(evicted)) return false;
         }
         return true;
     }
 
-    // The parked conversation that has gone unused the longest.  This is make_room()'s loop body, so
-    // the parking path can also free RAM one entry at a time on demand (see the physical-RAM admission
-    // gate in generate.cpp).  A ConversationBuffer is a list of 16 MiB segments and each segment is its
-    // own allocation, far above glibc's mmap threshold, so dropping an entry returns the whole footprint
-    // to the kernel at once - the next admission check reads it back from /proc/meminfo.
-    // False when none can go (empty, or only entries that hold a pinned shared prefix are left).
+    // The parked conversation that has gone unused the longest, for the callers that free RAM one entry at a time and
+    // read MemAvailable after each (the physical-RAM admission gate in generate.cpp).  upstream 8c71c492 (#5697): the
+    // buffers' segments can come from the C library's heap, and free() hands back only the heap's top - an entry below a
+    // newer one stayed resident and the gate read no change - so the freed memory is handed back here too
+    // (release_free_heap).  make_room() drops entries without it: its room is for the image allocated right after, which
+    // reuses that memory.  False when none can go (empty, or only entries that hold a pinned shared prefix are left).
     // `evicted`: as make_room's.
     bool evict_oldest(std::vector<SavedConversation>* evicted = nullptr) {
-        // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
-        for (size_t i = 0; i < entries_.size(); ++i) {
-            if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
-            bytes_ -= entries_[i].bytes();
-            if (evicted) evicted->push_back(std::move(entries_[i]));
-            erase(i);
-            ++evictions_;
-            return true;
-        }
-        return false;
+        if (!drop_oldest(evicted)) return false;
+        release_free_heap();
+        return true;
     }
 
     // #879 (upstream f332a855): every parked conversation (pinned ones too) and the retained K/V go - after
@@ -428,6 +438,19 @@ public:
     }
 
 private:
+    // evict_oldest() without handing the memory back (make_room's loop)
+    bool drop_oldest(std::vector<SavedConversation>* evicted = nullptr) {
+        // the oldest entry that holds no pinned shared prefix and is not the guarded (borrowed) donor
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
+            bytes_ -= entries_[i].bytes();
+            if (evicted) evicted->push_back(std::move(entries_[i]));
+            erase(i);
+            ++evictions_;
+            return true;
+        }
+        return false;
+    }
     void erase(size_t index) {
         entries_.erase(entries_.begin() + (std::ptrdiff_t) index);
         serials_.erase(serials_.begin() + (std::ptrdiff_t) index);
