@@ -69,7 +69,8 @@ int main() {
     CHECK(tail_need(5120 + 1023, 5120, 1024) == 1023);
     CHECK(tail_need(5120 + 1024, 5120, 1024) == 0);       // a last chunk at the floor streams: fused
     // a floor of 3,584 (the rule on an RTX A6000): the same segments now have a tail up to 3,583
-    CHECK(tail_need(4097, 2048, 3584) == 1);
+    CHECK(tail_need(8193, 8192, 3584) == 1);
+    CHECK(tail_need(4097, 2048, 3584) == 2048);           // a layout of 2,048-token chunks is below the floor: not fused, every chunk is MMQ's
     CHECK(tail_need(8193 + 2000, 8192, 3584) == 2001);
     CHECK(tail_need(8192 + 3584, 8192, 3584) == 0);
     // a segment read in one chunk below the floor, in a layout whose chunk reaches it (a reused big loan)
@@ -107,8 +108,8 @@ int main() {
         CHECK(!reuse_ok(2048, 2000, lent_chunk, lent_tail, floor));                 // needs 2,000 (grid 2,048): relayout
         CHECK(tail_need(2000, lent_chunk, floor) > lent_tail);
         CHECK(reuse_ok(256, 100, lent_chunk, lent_tail, floor));                    // 100 <= 256: reuse
-        CHECK(reuse_ok(2048, 4096 + 100, lent_chunk, lent_tail, floor) == false);   // chunk 8,192 > 4,196: one chunk of 4,196 >= floor: need 0
-        CHECK(tail_need(4196, lent_chunk, floor) == 0);                              // (it is fused, so it reuses)
+        CHECK(tail_need(4196, lent_chunk, floor) == 0);                              // one chunk of 4,196 >= floor: fused, no tail
+        CHECK(reuse_ok(2048, 4196, lent_chunk, lent_tail, floor));                  // so it reuses
     }
     // a smaller want never reuses a smaller loan, a bigger tail never reuses a smaller one
     CHECK(!reuse_ok(4096, 4096, 2048, 4095, 1024));
