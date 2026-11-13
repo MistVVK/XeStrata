@@ -78,5 +78,39 @@ class HistoryTools(unittest.TestCase):
         self.assertEqual(server.with_history_tools([TODO], odd), [TODO])
 
 
+class PrefixedNames(unittest.TestCase):
+    """#4751: `tools.write` for a declared `write` (a programmatic-tool-calling harness shows the model
+    `tools.write(...)`)."""
+
+    WRITE = {"name": "write", "parameters": {"type": "object", "properties": {"file_path": {"type": "string"},
+                                                                              "content": {"type": "string"}}}}
+    TEXT = ("<tool_call>\n<function=tools.write>\n<parameter=file_path>/a/b.py</parameter>\n"
+            "<parameter=content>x = 1\n</parameter>\n</function>\n</tool_call>")
+
+    def calls(self, tools, text=None):
+        p = OutputParser(thinking=False, tools=tools, stream_tools=True, recover=True, declared_only=True)
+        evs = p.feed(text or self.TEXT) + p.finish("stop")
+        return [e.call for e in evs if e.kind == "tool_call"], "".join(e.text for e in evs if e.kind == "content")
+
+    def test_the_prefix_is_read_as_the_declared_tool(self):
+        calls, answer = self.calls([self.WRITE])
+        self.assertEqual([(c.name, c.arguments["file_path"]) for c in calls], [("write", "/a/b.py")])
+        self.assertEqual(answer, "")
+
+    def test_functions_prefix_too(self):
+        calls, _ = self.calls([self.WRITE], self.TEXT.replace("tools.write", "functions.write"))
+        self.assertEqual([c.name for c in calls], ["write"])
+
+    def test_an_undeclared_name_stays_text(self):
+        calls, answer = self.calls([self.WRITE], self.TEXT.replace("tools.write", "tools.delete"))
+        self.assertEqual(calls, [])
+        self.assertIn("<tool_call>", answer)
+
+    def test_a_declared_dotted_name_wins(self):
+        dotted = {"name": "tools.write", "parameters": self.WRITE["parameters"]}
+        calls, _ = self.calls([self.WRITE, dotted])
+        self.assertEqual([c.name for c in calls], ["tools.write"])
+
+
 if __name__ == "__main__":
     unittest.main()
