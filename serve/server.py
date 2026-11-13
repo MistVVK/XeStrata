@@ -6316,26 +6316,46 @@ class ToolHubs:
                 "tool": name}
 
 
+def _history_call_names(req) -> list:
+    """The tool names a request's own conversation called, in order, on any of the three routes: Chat Completions (an
+    assistant message's tool_calls), Anthropic (an assistant message's tool_use blocks) and Responses (function_call /
+    custom_tool_call input items, a namespace in front as `namespace.name`)."""
+    names = []
+    for message in req.get("messages") or []:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for call in message.get("tool_calls") or []:
+            names.append((call.get("function") or {}).get("name") if isinstance(call, dict) else None)
+        content = message.get("content")
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                names.append(block.get("name"))
+    items = req.get("input")
+    for item in items if isinstance(items, list) else []:
+        if isinstance(item, dict) and item.get("type") in ("function_call", "custom_tool_call"):
+            name = item.get("name")
+            if isinstance(name, str) and name and isinstance(item.get("namespace"), str) and item["namespace"]:
+                name = f"{item['namespace']}.{name}"
+            names.append(name)
+    return names
+
+
 def with_history_tools(tools, req) -> list:
     """#4663: an agent's tool set changes between turns (deferred tools, MCP servers, a compacted history), and the
     model calls a tool it used earlier in this conversation that this turn's `tools` no longer lists.  That call came
     back as raw text with finish_reason "stop", and the client took it for prose and stopped.  A name the
-    conversation's own assistant messages called is a tool the client has, so it counts as declared (the call comes
-    back as a tool call; the client says what it does with it).  Nothing is added when the request declared no tools at
-    all, or for a name that is already declared."""
+    conversation's own assistant turns called is a tool the client has, so it counts as declared (the call comes back
+    as a tool call; the client says what it does with it) - on Chat Completions, Anthropic and Responses.  Nothing is
+    added when the request declared no tools at all, or for a name that is already declared."""
     if not tools or not isinstance(req, dict):
         return tools
     try:
         have = {t.get("name") for t in tools if isinstance(t, dict)}
         extra = []
-        for message in req.get("messages") or []:
-            if not isinstance(message, dict) or message.get("role") != "assistant":
-                continue
-            for call in message.get("tool_calls") or []:
-                name = (call.get("function") or {}).get("name") if isinstance(call, dict) else None
-                if isinstance(name, str) and name and name not in have:
-                    have.add(name)
-                    extra.append({"name": name, "parameters": {"type": "object", "properties": {}}})
+        for name in _history_call_names(req):
+            if isinstance(name, str) and name and name not in have:
+                have.add(name)
+                extra.append({"name": name, "parameters": {"type": "object", "properties": {}}})
         return [*tools, *extra] if extra else tools
     except Exception:  # noqa: BLE001 - a shape this reader does not know leaves the tools as they were
         return tools

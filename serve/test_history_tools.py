@@ -45,6 +45,33 @@ class HistoryTools(unittest.TestCase):
         self.assertEqual(server.with_history_tools([], history("Bash")), [])
         self.assertIsNone(server.with_history_tools(None, history("Bash")))
 
+    def test_anthropic_tool_use_blocks_count(self):
+        req = {"messages": [{"role": "user", "content": "go"},
+                            {"role": "assistant", "content": [{"type": "text", "text": "ok"},
+                                                              {"type": "tool_use", "id": "t1", "name": "Bash",
+                                                               "input": {}}]}]}
+        names, answer = run(server.with_history_tools([TODO], req))
+        self.assertEqual(names, ["Bash"])
+        self.assertEqual(answer, "")
+
+    def test_responses_function_call_items_count(self):
+        req = {"input": [{"type": "message", "role": "user", "content": "go"},
+                         {"type": "function_call", "name": "Bash", "call_id": "c1", "arguments": "{}"}]}
+        names, answer = run(server.with_history_tools([TODO], req))
+        self.assertEqual(names, ["Bash"])
+        self.assertEqual(answer, "")
+
+    def test_responses_namespace_is_part_of_the_name(self):
+        req = {"input": [{"type": "function_call", "namespace": "mcp", "name": "Bash", "call_id": "c1",
+                          "arguments": "{}"}]}
+        self.assertEqual([t["name"] for t in server.with_history_tools([TODO], req)], ["TodoWrite", "mcp.Bash"])
+
+    def test_the_other_routes_without_history_stay_text(self):
+        req = {"input": [{"type": "message", "role": "user", "content": "go"}]}
+        names, answer = run(server.with_history_tools([TODO], req))
+        self.assertEqual(names, [])
+        self.assertIn("<tool_call>", answer)
+
     def test_odd_requests_are_left_alone(self):
         self.assertEqual(server.with_history_tools([TODO], None), [TODO])
         odd = {"messages": [None, {"role": "assistant", "tool_calls": [None, {}]}]}
