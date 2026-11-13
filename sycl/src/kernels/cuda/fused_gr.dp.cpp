@@ -2889,7 +2889,9 @@ template<int E>void gf_launch_down_2d(dpct::queue_ptr st,GrMulti m){
 
 struct GcDown {const uint16_t *w_down,*w_inject;float *xn,*part2;};
 // Upstream added two optional HC-Q8 scale pointers to each FusedGrArgs.
-static_assert(sizeof(FusedGrArgs)==168 && sizeof(GrMulti)==1384 && sizeof(GcDown)==32);
+// Merge with the head: GrMulti gained two bools (cached_norm, cached_lo, the #4185 port) after the PR measured 1384; they sit at the end, so every earlier
+// field keeps its offset and the PR's kernels (which read fields by name) are unaffected; the size is 1384 plus at most the padding of the two bools.
+static_assert(sizeof(FusedGrArgs)==168 && sizeof(GrMulti)>=1384 && sizeof(GrMulti)<=1392 && sizeof(GcDown)==32);
 inline bool gc_enabled(){static const bool on=[] {const char*p=std::getenv("STRATA_PRIVATE_B60_NEXT_POOL");return p&&p[0]=='1';}();return on&&b60_main_actor();}
 template<int E>
 SYCL_ESIMD_FUNCTION ESIMD_INLINE void gc_down(GcDown m,int sl,int tile) {
