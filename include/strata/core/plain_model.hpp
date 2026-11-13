@@ -750,7 +750,7 @@ private:
         std::vector<uint16_t*> k_pool, v_pool, k_scale, v_scale;
         std::vector<int8_t*> k_q, v_q;
         std::vector<uint8_t*> k_q4, v_q4;
-        std::vector<uint8_t*> k_tc, v_tc;
+        std::vector<uint8_t*> k_tc, v_tc, tc_ring;
     };
     std::vector<SlotSession> bslots_;
     bool bslot_snaps_ = false;   ///< the slots keep the states after their first row (--batch-mtp)
@@ -1139,6 +1139,7 @@ private:
         int8_t *k_q = nullptr, *v_q = nullptr;
         uint8_t *k_q4 = nullptr, *v_q4 = nullptr;
         uint8_t *k_tc = nullptr, *v_tc = nullptr;
+        uint8_t* tc_ring = nullptr;   ///< --kv tcq's INT8 ring of the cells not coded yet (deferred coding)
     };
     KvPtrs kv_ptrs(size_t a, int slot) const;
     /// The buffers of attention block a in session `slot` for `cells` (cell, KV head) pairs and their bytes, in one
@@ -1247,6 +1248,10 @@ private:
     std::vector<int8_t*> k_q_, v_q_;              ///< ...kv_int8's codes (K8V4's K)
     std::vector<uint8_t*> k_q4_, v_q4_;           ///< ...kv_q4's Q4_0 blocks (K8V4's V)
     std::vector<uint8_t*> k_tc_, v_tc_;           ///< ...kv_tcq's trellis-coded rows
+    std::vector<uint8_t*> tc_ring_;               ///< ...and their INT8 ring (kv_tcq.hpp), null when not deferred
+    /// --kv tcq: the cells kept as INT8 until their block of 16 is complete, then coded (kv_tcq.hpp); 0 with
+    /// STRATA_KV_TCQ_DEFER=0 (each cell coded as it is written), for the comparison
+    bool tcq_defer_ = true;
     std::vector<uint16_t*> k_scale_, v_scale_;    ///< ...and their scales
     /// The attention block a's pools, for the kernels
     strata::kernels::QsaAttnPools kv_pools(size_t a, int slot = -1) const;
