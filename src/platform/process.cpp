@@ -12,6 +12,8 @@
 
 #if defined(_WIN32)
 #define NOMINMAX
+#include <fcntl.h>
+#include <io.h>
 #include <windows.h>
 #else
 #include <cerrno>
@@ -362,6 +364,40 @@ std::string Process::read_rest() {
 std::string Process::error_tail() const {
     std::lock_guard<std::mutex> lock(impl_->mu);
     return impl_->tail;
+}
+
+int stdout_mute() {
+#if defined(_WIN32)
+    const int saved = _dup(1);
+    const int null_fd = _open("NUL", _O_WRONLY);
+    if (saved < 0 || null_fd < 0 || _dup2(null_fd, 1) != 0) {
+        if (null_fd >= 0) _close(null_fd);
+        if (saved >= 0) _close(saved);
+        return -1;
+    }
+    _close(null_fd);
+#else
+    const int saved = dup(1);
+    const int null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (saved < 0 || null_fd < 0 || dup2(null_fd, 1) < 0) {
+        if (null_fd >= 0) close(null_fd);
+        if (saved >= 0) close(saved);
+        return -1;
+    }
+    close(null_fd);
+#endif
+    return saved;
+}
+
+void stdout_restore(int saved) {
+    if (saved < 0) return;
+#if defined(_WIN32)
+    _dup2(saved, 1);
+    _close(saved);
+#else
+    dup2(saved, 1);
+    close(saved);
+#endif
 }
 
 }  // namespace strata::platform

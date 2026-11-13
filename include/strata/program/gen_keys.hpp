@@ -55,7 +55,9 @@ struct GenKeyFields {
     bool* minp_rule = nullptr;            ///< generate: the window rule turns to min-p
     bool spec_float = false;              ///< generate: (double) strtof; plain: strtod
     bool* route_prior = nullptr;          ///< generate only
-    std::string* draft = nullptr;         ///< draft=mtp|dflash2|auto: this request's drafter (--draft auto)
+    std::string* draft = nullptr;         ///< draft=mtp|dflash2|auto|off: this request's drafter (--draft auto)
+    int* spec_cap = nullptr;              ///< spec=N: the largest window this request checks (N >= 1)
+    int* probe = nullptr;                 ///< probe=K: the start's measurement's run K (its own lines only)
     std::vector<int32_t>* allowed = nullptr;
     std::vector<uint64_t>* img_keys = nullptr;
 };
@@ -123,6 +125,8 @@ inline void parse_gen_keys(char*& endp, const GenKeyFields& f, bool geni = false
             }
             else if (key == "route_prior" && f.route_prior) *f.route_prior = std::strtol(v, nullptr, 10) != 0;
             else if (key == "draft" && f.draft) *f.draft = val;
+            else if (key == "spec" && f.spec_cap) *f.spec_cap = std::max(1, (int) std::strtol(v, nullptr, 10));
+            else if (key == "probe" && f.probe) *f.probe = (int) std::strtol(v, nullptr, 10);
             else if (key == "allowed" && f.allowed) {
                 f.allowed->clear();
                 for (const char* q = v; *q != '\0';) {

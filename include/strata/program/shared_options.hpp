@@ -44,6 +44,10 @@ struct SharedOptionFields {
     bool* greedy = nullptr;   ///< --seed turns it off
     // speculative decoding
     int* spec = nullptr;
+    /// --spec auto: the window is one of the candidates the serve engine measures at its start (strata/spec/
+    /// draft_probe.hpp), from `spec_auto_default` (its largest) down; a number is kept as given
+    bool* spec_auto = nullptr;
+    int spec_auto_default = 4;
     std::string* spec_window = nullptr;
     bool* spec_window_given = nullptr;
     bool spec_window_all = false;   ///< --spec-window all is taken (PlainModel's every-draft window)
@@ -185,7 +189,17 @@ int parse_shared_option(const std::string& a, Next&& next, const SharedOptionFie
         if (f.greedy) *f.greedy = false;
         return 1;
     }
-    if (a == "--spec" && f.spec) { *f.spec = (int) std::strtol(next(a.c_str()), nullptr, 10); return 1; }
+    if (a == "--spec" && f.spec) {
+        const std::string v = next(a.c_str());
+        if (v == "auto" && f.spec_auto) {
+            *f.spec_auto = true;
+            *f.spec = f.spec_auto_default;
+        } else {
+            if (f.spec_auto) *f.spec_auto = false;
+            *f.spec = (int) std::strtol(v.c_str(), nullptr, 10);
+        }
+        return 1;
+    }
     if (a == "--spec-window" && f.spec_window) {
         *f.spec_window = next(a.c_str());
         if (f.spec_window_given) *f.spec_window_given = true;
