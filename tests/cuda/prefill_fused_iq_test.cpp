@@ -878,6 +878,89 @@ void timing_part(const Pair& p, int T, cudaStream_t s) {
     if (mq && !no_mmq && !kq_gu(p) && (efm.rms > (f16_on() ? 5e-3 : 1e-3) || efm.worst > 2e-2))
         throw std::runtime_error(std::string(p.name) + ": the paths disagree at the real shape");
 }
+// --bits-staged: byte identity of the weight-staging kernels against the unstaged kernel of the same formats.  The same experts, input and routing run twice per size:
+// first with every blob in device memory (the staged 128-row instances where the pair has them, at blobs 2-byte aligned at eight different offsets modulo 16), then with every
+// blob in pinned, mapped HOST memory, where the staging check of experts_native fails and the launch takes the unstaged 64-row instances (sticky for the process, so all the
+// staged runs come first).  Every output float of every routed row must be the same bits.  Needs --only=NAME.
+struct BitsRun {
+    std::vector<float> y;
+    std::vector<int32_t> slot;
+    uint64_t hash = 0;
+};
+BitsRun bits_run(const Pair& p, int T, int E, bool host, cudaStream_t s) {
+    const Geo geo(p);
+    std::mt19937 rng(5100 + (unsigned) p.gu * 7 + (unsigned) p.d + (unsigned) T);
+    const int64_t rows = (int64_t) T * K;
+    const size_t stride = (geo.bytes + 64 + 15) / 16 * 16;
+    constexpr int kDistinct = 8;   // eight different blobs, repeated over the experts with a byte changed in each
+    std::vector<std::vector<uint8_t>> base;
+    for (int i = 0; i < kDistinct; ++i) base.push_back(make_blob(p, geo, rng));
+    Dev blobs((size_t) E * stride + 4096);
+    ck(cudaMemset(blobs.p, 0, (size_t) E * stride + 4096), "zero");
+    struct HostMem {
+        void* p = nullptr;
+        ~HostMem() { if (p) cudaFreeHost(p); }
+    } hm;
+    if (host) {
+        ck(cudaHostAlloc(&hm.p, (size_t) E * stride + 4096, cudaHostAllocMapped), "cudaHostAlloc");
+        std::memset(hm.p, 0, (size_t) E * stride + 4096);
+    }
+    std::vector<const uint8_t*> blob((size_t) E);
+    for (int e = 0; e < E; ++e) {
+        std::vector<uint8_t> b = base[(size_t) (e % kDistinct)];
+        b[4 + (size_t) (e % 16)] ^= (uint8_t) e;
+        const size_t off = (size_t) e * stride + 2 * (size_t) (e % 8);   // 2-byte aligned, eight positions inside a 16-byte window
+        if (host) {
+            std::memcpy((uint8_t*) hm.p + off, b.data(), geo.bytes);
+            blob[(size_t) e] = (const uint8_t*) hm.p + off;
+        } else {
+            ck(cudaMemcpy(blobs.as<uint8_t>() + off, b.data(), geo.bytes, cudaMemcpyHostToDevice), "blob");
+            blob[(size_t) e] = blobs.as<uint8_t>() + off;
+        }
+    }
+    const std::vector<float> x = make_x(T, rng, T > 3 ? 1 : -1);
+    const std::vector<int32_t> ids = make_ids(T, E, rng, 2, 4);   // experts 0 and 1 hot (several tiles), the last 4 unused
+    Dev x_dev(x.size() * 4);
+    ck(cudaMemcpy(x_dev.p, x.data(), x.size() * 4, cudaMemcpyHostToDevice), "x");
+    FusedBufs fb(T, rows, E);
+    ck(cudaMemcpy(fb.ids.p, ids.data(), ids.size() * 4, cudaMemcpyHostToDevice), "ids");
+    ck(cudaMemset(fb.dm.p, 0xff, (size_t) rows * N * 4), "sentinel");   // an unwritten row is NaN
+    ck(cudaDeviceSynchronize(), "uploads");
+    run_fused(p, geo, fb, x_dev.as<float>(), T, E, {0, 1, std::min(20, E - 1), E}, blob, s);
+    ck(cudaStreamSynchronize(s), "sync");
+    BitsRun r;
+    r.y = download(fb.dm, (size_t) rows * N);
+    r.slot = download_i(fb.slot, (size_t) rows);
+    r.hash = 1469598103934665603ull;
+    for (size_t i = 0; i < (size_t) rows; ++i)
+        for (size_t c = 0; c < (size_t) N; ++c) { uint32_t u; std::memcpy(&u, &r.y[(size_t) r.slot[i] * N + c], 4); r.hash = (r.hash ^ u) * 1099511628211ull; }
+    return r;
+}
+// every pair's staged runs first (the fallback is sticky for the process), then every pair's unstaged runs
+void bits_staged(const std::vector<Pair>& ps, const std::vector<int>& sizes, int E, cudaStream_t s) {
+    std::vector<BitsRun> staged;
+    for (const Pair& p : ps)
+        for (int T : sizes) staged.push_back(bits_run(p, T, E, false, s));
+    if (fused::staged_blob_fallbacks() != 0) throw std::runtime_error("--bits-staged: a device-blob launch took the unstaged kernel");
+    size_t idx = 0;
+    for (const Pair& p : ps)
+        for (int T : sizes) {
+        const BitsRun u = bits_run(p, T, E, true, s);
+        if (fused::staged_blob_fallbacks() == 0) throw std::runtime_error(std::string(p.name) + ": --bits-staged: the host-blob run did not take the unstaged kernel");
+        const BitsRun& a = staged[idx++];
+        int64_t diff = 0, bad = 0, nz = 0;
+        for (size_t q = 0; q < (size_t) T * K; ++q) {
+            const float* ya = a.y.data() + (size_t) a.slot[q] * N;
+            const float* yb = u.y.data() + (size_t) u.slot[q] * N;
+            if (std::memcmp(ya, yb, (size_t) N * 4) != 0) ++diff;
+            for (int c = 0; c < N; ++c) { bad += !std::isfinite(ya[c]); nz += ya[c] != 0.0f; }
+        }
+        std::printf("%s - bits-staged: %d tokens x top %d over %d experts: staged vs unstaged %lld of %d rows differ, hash %016llx / %016llx, %lld non-finite, %lld nonzero values\n",
+                    p.name, T, K, E, (long long) diff, T * K, (unsigned long long) a.hash, (unsigned long long) u.hash, (long long) bad, (long long) nz);
+        if (diff != 0 || a.hash != u.hash) throw std::runtime_error(std::string(p.name) + ": --bits-staged: the staged and unstaged outputs differ");
+        if (bad != 0 || nz == 0) throw std::runtime_error(std::string(p.name) + ": --bits-staged: a non-finite or an all-zero output");
+    }
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -998,6 +1081,23 @@ int main(int argc, char** argv) {
         }
         cudaStream_t s = nullptr;
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
+        bool bits = false;
+        for (int i = 1; i < argc; ++i)
+            if (std::strcmp(argv[i], "--bits-staged") == 0) bits = true;
+        if (bits) {   // see bits_staged: tails (1, 33, 130, 517 tokens), a tile boundary and a real chunk
+            if (!only) throw std::runtime_error("--bits-staged needs --only=NAME");
+            std::vector<Pair> sel;
+            for (const Pair& p : pairs) {
+                if (std::string(p.name).find(only) == std::string::npos) continue;
+                if (!fused::native_supported((int) p.gu, (int) p.d)) throw std::runtime_error(std::string(p.name) + ": not covered by the native kernels");
+                sel.push_back(p);
+            }
+            if (sel.empty()) throw std::runtime_error("--bits-staged: no pair matches --only");
+            bits_staged(sel, {1, 33, 130, 517, 640, 2048}, 64, s);
+            ck(cudaStreamDestroy(s), "destroy");
+            std::printf("prefill fused MoE (native formats) staged-vs-unstaged bit identity passed\n");
+            return 0;
+        }
         for (const Pair& p : pairs) {
             if (only ? std::string(p.name).find(only) == std::string::npos : p.gu == GGML_TYPE_Q4_K || p.gu == GGML_TYPE_Q5_K) continue;
             // the i-quant / Q8_0 and Q8_0 / Q8_0 pairs run only when --only names them (ctest prefill_fused_iq_test_q8d / _q8gu), so every
