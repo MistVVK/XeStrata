@@ -1114,7 +1114,7 @@ EDGE0_REVISIONS = {
     "Edge0-145B-q3k": "dd6864e1a097685e0ef808cd2e088cfde992abea",
     "Edge0-120B-q3k": "2d8fda55854cdc22b5af049476fd55be3f0a5370",
 }
-EDGE0_MODELS = {
+EDGE0_MODELS: dict[str, dict[str, Any]] = {
     "Edge0-145B-q3k": {"repo": "Edge0/Edge0-145B-q3k", "latent_dim": 1792, "dense_fmt": "8",
                        "dense_file": "latent_dense_q8.bin", "download_gb": 105.4, "ram_gb": 64,
                        "about": "145B latent MoE (latent width 1792), Q3_K experts; ~99 GB on disk"},
@@ -9441,8 +9441,8 @@ def setup_edge0(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     if gpu_chosen or sum(1 for x in found if gpu_problem(x) is None) > 1:
         cfg["gpu_pci"] = gpu["pci"]
     return finish_setup(a, cfg, tag, port, adopted, False,
-                        notes=("The latent MoE runs its experts at the latent width on the GPU; the D/U projections and "
-                               "the column scales are the pack's. First runs: see docs/DETAILS.md (Edge0).",))
+                        notes=("The latent MoE runs its experts at the latent width on the GPU; D/U and the column "
+                               "scales are the pack's. First runs: see docs/DETAILS.md (Edge0).",))
 
 
 def main() -> int:
