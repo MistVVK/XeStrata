@@ -58,4 +58,37 @@ inline int64_t floor_for(int64_t resident_slots, int64_t total_pairs, const Cons
     return T;
 }
 
+// ---- per-card scaling (SWITCH-POINT-2) ----
+// The A6000 fit above does not transfer as it is (the A4000's crossing is about 1,930 tokens, the fit's 5,632), but its structure does: the copy terms scale with the cost of moving one expert
+// (mean blob bytes / the link's GB/s) and the compute terms with 1 / the SM count (the A4000 streams at 0.63 ms a token against the A6000's 0.36: 84 / 48).  s0 and u(T) stay as fitted.
+// Measured crossings of the staged walk against the streamed one with the CPU share off (RTX A6000 3.8K, RTX A4000 1.9K) are matched to within one 256-token step by the real crossing
+// rounded DOWN to the grid.  The R9700 (HIP, 28.3 GB/s probe but 0.14 ms a streamed expert) is not matched (model 1.1K, measured 1.5K): CUDA builds only.
+struct Card {
+    double blob_mb = 3.19;     // mean expert blob of the cache (cache bytes / slots), MB: the A6000 fit's value
+    double link_gbps = 12.2;   // the start-up host-to-device probe, GB/s
+    int sm = 84;               // multiprocessor count
+};
+inline bool card_known(const Card& c) { return c.blob_mb > 0.0 && c.link_gbps > 0.0 && c.sm > 0; }
+inline Constants constants_for(const Card& c) {
+    Constants k;
+    const double copy = (c.blob_mb / c.link_gbps) / (3.19 / 12.2);
+    const double comp = 84.0 / (double) c.sm;
+    k.c_p *= copy; k.c_s *= copy;
+    k.a_p *= comp; k.a_s *= comp;
+    return k;
+}
+/// The floor for this card with the CPU share off: the largest grid size at which the staged walk still wins (the first size where it does not, one step back), never below 1,024.
+inline int64_t floor_for_card(int64_t resident_slots, int64_t total_pairs, const Card& c) {
+    if (!card_known(c)) return kFloorDefault;
+    const int64_t first = floor_for(resident_slots, total_pairs, constants_for(c));
+    return std::max<int64_t>(kFloorDefault, first - kGrid);
+}
+/// With the share on, the staged walk's limit is the floor times this ratio (measured share-on / share-off break-evens: A4000 2.9K / 1.9K = 1.5, R9700 2.5K / 1.5K = 1.7, A6000 see the results file).
+inline constexpr double kShareRatio = 1.6;
+/// The share's limit for a card whose floor moved: floor x kShareRatio on the grid; 0 (the share's own default stays) when the floor is the default.
+inline int64_t share_limit_for(int64_t floor) {
+    if (floor <= kFloorDefault) return 0;
+    return std::min<int64_t>(2 * kFloorMax, ((int64_t) ((double) floor * kShareRatio) / kGrid) * kGrid);
+}
+
 }  // namespace strata::prefill::switch_point

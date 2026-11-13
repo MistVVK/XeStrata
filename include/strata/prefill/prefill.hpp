@@ -101,8 +101,8 @@ public:
     /// A `--short-read` given on the command line is not asked.  Call once the expert layout is known.
     static int64_t short_read_default(int64_t base);
     /// STRATA_SWITCH_POINT=1 (research): the expert cache's live slots and layers x experts of the single card's own model, before the first lend; the floor above is then
-    /// chosen from the share of experts the card does not hold (switch_point_rule.hpp).  Without the switch this changes nothing.
-    static void set_card_expert_share(int64_t resident_slots, int64_t total_pairs);
+    /// chosen from the share of experts the card does not hold, scaled by the cache's mean blob (MB), the start-up link probe (GB/s) and the card's SM count (switch_point_rule.hpp; 0 = unknown: the default floor).  Without the switch this changes nothing.
+    static void set_card_expert_share(int64_t resident_slots, int64_t total_pairs, double blob_mb = 0.0, double link_gbps = 0.0);
     /// --prefill-pipe (opt-in): the chunk a layer split's first stage reads an `n`-token prompt in, for `stages`
     /// stages, chunks of at most `cap` (the buffers' size) and a stage-chunk cost of b + a C with b/a = `ratio` tokens
     /// (0: unknown - STRATA_PREFILL_EQUAL's rule: the same chunk count as `cap` gives, evened out when its last chunk

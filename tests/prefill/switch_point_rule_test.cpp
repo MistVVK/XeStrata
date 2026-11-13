@@ -64,6 +64,34 @@ int main() {
     CHECK(sp::uncovered(8193, k) < 0.2);
     CHECK(sp::uncovered(0, k) == 1.0);
 
+    // per-card scaling: the A6000 (3.19 MB experts, 12.2 GB/s, 84 SMs, 13,580 of 24,576 resident) and the A4000 (1.44 MB, 10.5 GB/s, 48 SMs, 7,836 resident), CPU share off:
+    // measured crossings about 3,840 and 1,930 tokens, the rule's floors are within one grid step of them
+    {
+        const sp::Card a6000{3.19, 12.2, 84}, a4000{1.44, 10.5, 48};
+        const int64_t f6 = sp::floor_for_card(13580, total, a6000);
+        const int64_t f4 = sp::floor_for_card(7836, total, a4000);
+        CHECK(f6 >= 3584 && f6 <= 4096);
+        CHECK(f4 >= 1792 && f4 <= 2048);
+        CHECK(f4 < f6);                                              // the slower card of the two crosses earlier, as measured
+        CHECK((f6 - 1024) % sp::kGrid == 0 && (f4 - 1024) % sp::kGrid == 0);
+        // an unknown card (no probe, no SM count): the default
+        CHECK(sp::floor_for_card(13580, total, sp::Card{0.0, 12.2, 84}) == 1024);
+        CHECK(sp::floor_for_card(13580, total, sp::Card{3.19, 0.0, 84}) == 1024);
+        CHECK(sp::floor_for_card(13580, total, sp::Card{3.19, 12.2, 0}) == 1024);
+        // every expert resident: the default whatever the card
+        CHECK(sp::floor_for_card(total, total, a6000) == 1024);
+        // the A6000-class card's constants are the fit's own
+        const sp::Constants kc = sp::constants_for(sp::Card{});
+        CHECK(std::fabs(kc.c_p - 0.2612) < 1e-9 && std::fabs(kc.a_s - 0.2294) < 1e-9);
+        // faster link, same card: a smaller floor; more SMs, same link: a higher one
+        CHECK(sp::floor_for_card(13580, total, sp::Card{3.19, 24.0, 84}) <= f6);
+        CHECK(sp::floor_for_card(13580, total, sp::Card{3.19, 12.2, 120}) >= f6);
+    }
+    // the share's limit: the floor times the measured ratio on the grid, 0 (the share's own default stays) when the floor did not move
+    CHECK(sp::share_limit_for(1024) == 0);
+    CHECK(sp::share_limit_for(2048) == 3072);                        // A4000: measured break-even about 2,900
+    CHECK(sp::share_limit_for(3840) % sp::kGrid == 0 && sp::share_limit_for(3840) > 3840);
+
     if (failed) {
         std::fprintf(stderr, "switch_point_rule_test: %d check(s) failed\n", failed);
         return 1;
