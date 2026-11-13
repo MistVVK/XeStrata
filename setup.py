@@ -1924,6 +1924,18 @@ def unused_apu_notes(found, used, ram) -> list:
     return out
 
 
+def unused_card_notes(found, used) -> list:
+    """upstream 7aa9a584a: a card that can run alone but is not in this run is said, not asked - one line per card,
+    with the way to use it.  Nothing about the cards used changes; a chosen card (--gpu, --gpus) asks nothing."""
+    first = next((g for g in found if g["index"] in used), None)
+    if first is None or len(used) != 1:
+        return []                                       # a layer split names its cards already
+    return [f"  GPU {g['index']} ({g['name']}, {g['vram_gb']:.0f} GB) is not used: this model runs on GPU "
+            f"{first['index']} alone, and --gpus {first['index']},{g['index']} splits its layers across the two cards"
+            for g in found
+            if g["index"] not in used and not g.get("integrated") and gpu_problem(g) is None]
+
+
 def strix_halo_notes(gpu, ram) -> list:
     """What setup tells a Strix Halo owner (a leading "!" = a warning): nothing is changed or refused."""
     notes = [f"  Strix Halo (gfx1151, Ryzen AI Max): the CPU and the GPU share one memory ({ram:.0f} GB seen by the "
@@ -9175,6 +9187,8 @@ def main() -> int:
         if gpu.get("gfx") == STRIX_HALO_GFX and "uma_gb" in gpu:
             for line in strix_halo_notes(gpu, ram_gb()):
                 (warn if line.startswith("!") else say)(line.lstrip("!"))
+        for line in (unused_card_notes(found, set(sel)) if not gpu_chosen and not a.gpus else []):
+            say(line)
         for line in unused_apu_notes(found, set(sel), ram_gb()):
             (warn if line.startswith("!") else say)(line.lstrip("!"))
         for i in sel[1:]:                                  # --gpus: the later layers' cards
