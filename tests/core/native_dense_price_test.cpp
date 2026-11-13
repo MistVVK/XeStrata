@@ -65,13 +65,30 @@ const std::vector<std::string>& names() {
     return n;
 }
 
-// every row a shape-only quantized row (what iq_pack writes for a tensor the GGUF serves): no bytes in the pool
+// the projections and the PLE key are shape-only quantized rows (what iq_pack writes for a tensor the GGUF serves): no bytes in
+// the pool.  The hyper-connection rows are real BF16 rows (kind 4, 256 x 4 x 2 = 2,048 B each), as in a real pack: on a layer
+// split generate.cpp does not skip them (add_hc_skip runs on one card only), and WeightTable::load refuses a shape-only row
+// that is not in its skip set.
+constexpr uint64_t HC_ROW_BYTES = NE0 * NE1 * 2;
+bool is_hc_row(const std::string& n) { return n.find("hc_") != std::string::npos; }
+
 void write_pack(const fs::path& dir) {
     fs::create_directories(dir);
-    std::string idx = "# align 256 pool 256 tensors " + std::to_string(names().size()) + "\n";
-    for (const auto& n : names()) idx += n + " 0 0 0 0 0 0 256 4 8 0 32 0 0 0 0 0 0 0\n";
+    uint64_t hc_rows = 0;
+    for (const auto& n : names()) hc_rows += is_hc_row(n) ? 1 : 0;
+    std::string idx = "# align 256 pool " + std::to_string(hc_rows * HC_ROW_BYTES) + " tensors " + std::to_string(names().size()) + "\n";
+    uint64_t at = 0;
+    for (const auto& n : names()) {
+        if (is_hc_row(n)) {
+            const std::string off = std::to_string(at), len = std::to_string(HC_ROW_BYTES);
+            idx += n + " 0 4 " + off + " " + len + " " + off + " " + len + " 256 4 0 0 0 0 0 0 0 0 0 0\n";
+            at += HC_ROW_BYTES;
+        } else {
+            idx += n + " 0 0 0 0 0 0 256 4 8 0 32 0 0 0 0 0 0 0\n";
+        }
+    }
     std::ofstream(dir / "index.txt", std::ios::binary) << idx;
-    std::vector<char> bytes(16, 0);
+    std::vector<char> bytes((size_t) (hc_rows * HC_ROW_BYTES ? hc_rows * HC_ROW_BYTES : 16), 0);
     std::ofstream(dir / "dense.bin", std::ios::binary).write(bytes.data(), (std::streamsize) bytes.size());
 }
 
