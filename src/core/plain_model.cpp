@@ -623,25 +623,67 @@ bool PlainModel::auto_gpu_layers(std::string& err) {
         }
     const int64_t nkv = std::max<int64_t>(1, s.n_head_kv.empty() ? 1 : *std::max_element(s.n_head_kv.begin(), s.n_head_kv.end()));
     const int64_t chunk = std::max<int64_t>(opt_.prompt_chunk, opt_.max_t);
+    // a cell's K and V of one KV head in the --kv format (int8, q4: kv_q4 1 or 2, tcq: its bits)
+    const auto kv_row = [&](bool i8, int q4, int tcq) -> uint64_t {
+        const int hd = (int) s.key_length;
+        const uint64_t i8_row = (uint64_t) hd + (uint64_t) hd / k::KV_Q8_GROUP * 2;
+        if (tcq != 0) return 2 * k::kv_tcq_bytes_per_head(hd, tcq);
+        if (q4 == 1) return 2 * k::kv_q4_bytes_per_head(hd);
+        if (q4 == 2) return i8_row + k::kv_q4_bytes_per_head(hd);
+        return i8 ? 2 * i8_row : 4 * (uint64_t) hd;
+    };
+    std::vector<uint64_t> kv_cells((size_t) nl, 0);
     for (int64_t l = 0; l < nl; ++l) {
         const int64_t cells = s.layer_swa(l) ? std::min<int64_t>(opt_.max_cells, s.swa_window + chunk) : opt_.max_cells;
-        block[(size_t) l] += s.recurrent[(size_t) l]
-                                 ? (uint64_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state + (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner) * 3) * 4
-                                 : (uint64_t) (cells * nkv * s.key_length) * 2 * (opt_.kv_int8 ? 1 : 2);
+        if (s.recurrent[(size_t) l])
+            block[(size_t) l] += (uint64_t) (s.ssm_d_state * s.ssm_dt_rank * s.ssm_d_state + (2 * s.ssm_n_group * s.ssm_d_state + s.ssm_d_inner) * 3) * 4;
+        else
+            kv_cells[(size_t) l] = (uint64_t) (cells * nkv);
     }
     // the window's and the prompt's buffers and the driver's share: the layer split's reserve (split_auto_points)
     // - the device's room, core::vram_room, plus the 1 GiB this stage's windows and prompt path take
     const uint64_t reserve = opt_.reserve_mib >= 0
                                  ? (uint64_t) opt_.reserve_mib << 20
                                  : core::vram_room(t, /*parts*/ 1, kTierRoomLeast) + (1ull << 30);
-    uint64_t used = head + reserve;
-    int64_t fit = 0;
-    while (fit < nl && used + block[(size_t) fit] <= free_b) used += block[(size_t) fit++];
+    // the blocks the GPU holds in order with the K/V's rows of `row` bytes, and the bytes they take
+    const auto fits = [&](uint64_t row, uint64_t* bytes) {
+        uint64_t used = head + reserve;
+        int64_t n = 0;
+        while (n < nl && used + block[(size_t) n] + kv_cells[(size_t) n] * row <= free_b) {
+            used += block[(size_t) n] + kv_cells[(size_t) n] * row;
+            ++n;
+        }
+        if (bytes != nullptr)
+            for (int64_t l = 0; l < nl; ++l) *bytes += block[(size_t) l] + kv_cells[(size_t) l] * row;
+        return n;
+    };
+    // --kv not given: the FP16 cache unless it leaves blocks off the GPU (whose CPU forward costs far more than the
+    // cache's rounding); then the first of INT8, tcq5 and tcq4 (heads of 256, not PLaMo 3's: kv_tcq.hpp) with which the
+    // GPU holds them all, else the smallest.  In this order each rounds the cache a little more than the one before
+    if (opt_.kv_auto && opt_.kv_tcq == 0 && opt_.kv_q4 == 0 && !opt_.kv_int8) {
+        const int64_t f16 = fits(kv_row(false, 0, 0), nullptr);
+        if (f16 < nl) {
+            const bool tc_ok = s.key_length == 256 && s.arch != ModelArch::Plamo3;
+            struct Pick { bool i8; int tcq; const char* name; };
+            const Pick picks[] = {{true, 0, "int8"}, {false, 5, "tcq5"}, {false, 4, "tcq4"}};
+            const Pick* take = &picks[0];
+            for (const Pick& p : picks) {
+                if (p.tcq != 0 && !tc_ok) continue;
+                take = &p;
+                if (fits(kv_row(p.i8, 0, p.tcq), nullptr) == nl) break;
+            }
+            opt_.kv_int8 = take->i8;
+            opt_.kv_tcq = take->tcq;
+            std::fprintf(stderr, "xestrata plain: the K/V cache in %s (with FP16's, the GPU would hold %lld of the %lld "
+                                 "blocks; --kv fp16 keeps it)\n", take->name, (long long) f16, (long long) nl);
+        }
+    }
+    uint64_t total = 0;
+    const int64_t fit = fits(kv_row(opt_.kv_int8, opt_.kv_q4, opt_.kv_tcq), &total);
     if (fit == nl) return true;   // every block on the GPU (gpu_layers stays -1)
     opt_.gpu_layers = head + reserve > free_b ? 0 : fit;   // below the head and the reserve: the CPU alone
     std::fprintf(stderr, "xestrata plain: %.2f GiB of VRAM free, the head and a reserve %.2f GiB, the blocks %.2f GiB: %s\n",
-                 free_b / 1073741824.0, (head + reserve) / 1073741824.0,
-                 std::accumulate(block.begin(), block.end(), uint64_t{0}) / 1073741824.0,
+                 free_b / 1073741824.0, (head + reserve) / 1073741824.0, total / 1073741824.0,
                  opt_.gpu_layers == 0 ? "the CPU alone" : ("the first " + std::to_string(fit) + " blocks on the GPU").c_str());
     return true;
 }

@@ -81,6 +81,9 @@ struct PlainOptions {
     /// rotation (kv_tcq.hpp, the query rotated the same way and the output back): 132 and 164 B a head's row, against
     /// Q4_0's 144 and INT8's 264.  head_dim 256 only; not GLM-5.3-Flash's caches.
     int kv_tcq = 0;
+    /// --kv not given: a dense model whose blocks the GPU would not all hold with the FP16 cache takes the first of
+    /// INT8, tcq5 and tcq4 with which it holds them (auto_gpu_layers), else tcq4
+    bool kv_auto = true;
     /// --kv-ram on|off (GLM-5.3-Flash): the DSA layers' MLA latent cells in host memory instead of VRAM, which goes to
     /// the expert tier: a window copies the cells each token selected into VRAM once (glm5_latent_gather), a prompt
     /// chunk the layer's cells up to it (Project Maya #86's idea, written anew: there the cells live in VRAM slots).
@@ -274,7 +277,7 @@ public:
     /// The forward runs on the CPU (--device cpu): no GPU, no drafts, no pictures, no batches.
     bool on_cpu() const { return cpu_ != nullptr; }
     int64_t max_cells() const { return opt_.max_cells; }
-    /// The options as loaded
+    /// The options as loaded (the --kv format auto_gpu_layers chose)
     const PlainOptions& options() const { return opt_; }
     /// The prompt's chunk (0: the prompt runs in windows; GLM-5.3-Flash's for now, whatever the options asked).
     int64_t prompt_chunk() const { return opt_.prompt_chunk; }

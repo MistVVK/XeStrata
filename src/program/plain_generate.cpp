@@ -2381,7 +2381,8 @@ static void plain_usage(const std::string& arch) {
                  "                       per 64 values (half the VRAM; the answers differ slightly; not GLM-5.3-Flash)\n"
                  "  --kv q4_0|k8v4|tcq4|tcq5  heads of 256: K and V rotated, Q4_0 (144 B a head's row), INT8 K with\n"
                  "                       Q4_0 V, or trellis-coded at 4 or 5 bits a value (132 or 164 B: less error\n"
-                 "                       than Q4_0's)\n"
+                 "                       than Q4_0's).  Not given: a dense model whose blocks the GPU would not hold\n"
+                 "                       with FP16 takes the first of int8, tcq5 and tcq4 with which it holds them\n"
                  "  --prefill-cpu-share S  the CPU pool's share of the prompt's experts the VRAM tier misses (0-1;\n"
                  "                       auto = from the times measured at load, the default; 0: all on the GPU)\n"
                  "  --prompt-chunk N     the prompt's most tokens a chunk through the batched products (default:\n"
@@ -2764,6 +2765,7 @@ int plain_main(int argc, char** argv) {
             opt.kv_int8 = v == "int8";
             opt.kv_q4 = v == "q4_0" ? 1 : v == "k8v4" ? 2 : 0;
             opt.kv_tcq = v == "tcq4" ? 4 : v == "tcq5" ? 5 : 0;
+            opt.kv_auto = false;
         }
         else {
             switch (option_scope(a)) {
@@ -2829,6 +2831,7 @@ int plain_main(int argc, char** argv) {
             opt.kv_q4 = 0;
             opt.kv_tcq = 0;
         }
+        opt.kv_auto = false;
         opt.kv_grow = 0;
         opt.vram_elastic = false;
         opt.batch_slots = 0;
