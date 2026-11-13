@@ -51,7 +51,6 @@ inline int chunk_of(bool dense, int n_ids, int n_slots, int min_chunk) {
     return per < min_chunk ? min_chunk : per > CHUNK ? CHUNK : per;
 }
 constexpr int WARP = 32;
-core::TimedCache<sycl::device, int, bool> g_merge_warmed;
 
 sycl::queue& queue_for(void* stream) {
     auto& queue = core::Runtime::get().stream(stream);
@@ -538,6 +537,49 @@ Form form_of(sycl::queue& q) {
     return f;
 }
 
+// Whether the merge reads eight slots' partials into registers before it folds them (the same fold order, the same
+// bits): timed once for a device and a slot count, on partials of its own and on a queue of its own, since the
+// callers' queues are recording a graph when the decode windows first come here.  Below 8 slots the two forms are one.
+// The B70 at a 32K context (2026-11-14): Ornith-1.5's window 22.53 -> 21.77 ms, Qwen3.8-Flash-Next's drafts 5.06 ->
+// 4.63 ms a round; the RTX 4070 the same within its noise.
+template <int HD, int G>
+bool merge_prefetch(sycl::queue& queue, int n_slots, size_t n_head) {
+    if (n_slots < 8) return false;
+    using Key = std::tuple<int, int>;
+    static core::TimedCache<sycl::device, Key, bool> choices;
+    const Key key{n_slots, (int) n_head};
+    if (const auto cached = choices.get(queue.get_device(), key)) return *cached;
+    if (core::timing_depth != 0) return false;
+    sycl::queue probe(queue.get_context(), queue.get_device());
+    const size_t n_ml = (size_t) n_slots * n_head, n_acc = n_ml * HD;
+    float* acc = sycl::malloc_device<float>(n_acc, probe);
+    float* m = sycl::malloc_device<float>(n_ml, probe);
+    float* l = sycl::malloc_device<float>(n_ml, probe);
+    float* out = sycl::malloc_device<float>(n_head * HD, probe);
+    bool pick = false;
+    if (acc && m && l && out) {
+        probe.fill(acc, 0.01f, n_acc);
+        probe.fill(m, 0.5f, n_ml);
+        probe.fill(l, 1.0f, n_ml).wait_and_throw();
+        const auto run = [&](bool prefetch) {
+            for (int i = 0; i < 8; ++i) {
+                if (prefetch) launch_merge<HD, G, true>(probe, acc, m, l, n_slots, out, n_head, 1, 0);
+                else launch_merge<HD, G, false>(probe, acc, m, l, n_slots, out, n_head, 1, 0);
+            }
+            return true;
+        };
+        const auto measured = core::timed_choice({{[&] { return run(false); }}, {[&] { return run(true); }}},
+                                                 [&] { probe.wait_and_throw(); }, 5, 1.05, 0.02);
+        pick = measured.pick == 1;
+        std::fprintf(stderr, "xestrata: attention merge %s (%d slots, %zu heads of %d; %.1f / %.1f us)\n",
+                     pick ? "prefetch" : "plain", n_slots, n_head, HD, measured.seconds[0] * 1e6 / 8,
+                     measured.seconds[1] * 1e6 / 8);
+    }
+    for (float* x : {acc, m, l, out})
+        if (x) sycl::free(x, probe);
+    return choices.put(queue.get_device(), key, pick);
+}
+
 // G: the query heads a work-group takes, the KV head's own split `split` ways
 template <int HD, int G>
 void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
@@ -559,11 +601,8 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
     else
         launch_kv<HD, G, false>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l,
                                 n_slots, n_q, (int) cap, stride, window, split, min_chunk, pools_rows);
-    // Measure both forms on this device and shape, outside graph capture.  The new form keeps the fold order but
-    // brings eight independent partials into registers before using them.  A 10% margin keeps the old form at a tie.
-    using MergeKey = std::tuple<int, int, int, int, int, int, int>;
-    static core::TimedCache<sycl::device, MergeKey, bool> choices;
-    const MergeKey key{n_slots, (int) n_q, (int) s.n_head, kv_mode, ids == nullptr, window, min_chunk};
+    // The merge's form: with XESTRATA_ATTN_MERGE_PREFETCH unset or auto, the one merge_prefetch timed for this device
+    // and slot count.
     auto merge = [&](bool prefetch, size_t rows) {
         return prefetch
             ? launch_merge<HD, G, true>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, rows,
@@ -571,28 +610,8 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
             : launch_merge<HD, G, false>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, rows,
                                          stride, steps, ids == nullptr, window, min_chunk);
     };
-    bool prefetch = false;
-    const char* mode = strata::env_get("ATTN_MERGE_PREFETCH");
-    if (mode && mode[0] == '1' && mode[1] == '\0') prefetch = true;
-    else if (!mode || !*mode || std::string(mode) == "auto") {
-        const auto cached = choices.get(queue.get_device(), key);
-        if (cached) prefetch = *cached;
-        else if (n_slots >= 8 && core::timing_depth == 0 &&
-                 queue.ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording) {
-            const size_t rows = std::min<size_t>(n_q, 8);
-            const bool first = g_merge_warmed.put_first(queue.get_device(), 0, true, [](int) { return true; }).second;
-            const auto measured = core::timed_choice({
-                {[&] { for (int i = 0; i < 8; ++i) merge(false, rows); return true; }},
-                {[&] { for (int i = 0; i < 8; ++i) merge(true, rows); return true; }}
-            }, [&] { queue.wait_and_throw(); }, 5, 1.10, first ? 0.5 : 0.0);
-            prefetch = choices.put(queue.get_device(), key, measured.pick == 1);
-            std::fprintf(stderr, "xestrata: attention merge %s (%d slots, %zu queries; %.1f / %.1f us)\n",
-                         prefetch ? "prefetch" : "plain", n_slots, n_q, measured.seconds[0] * 1e6 / 8,
-                         measured.seconds[1] * 1e6 / 8);
-        }
-    } else if (!(mode[0] == '0' && mode[1] == '\0')) {
-        throw core::DeviceError("XESTRATA_ATTN_MERGE_PREFETCH must be auto, 0 or 1");
-    }
+    static const int merge_mode = strata::env_auto("ATTN_MERGE_PREFETCH");
+    const bool prefetch = merge_mode >= 0 ? merge_mode == 1 : merge_prefetch<HD, G>(queue, n_slots, (size_t) s.n_head);
     const auto e = merge(prefetch, n_q);
     if (!stream) core::Runtime::get().wait(e, "qsa_decode_attn");
 }
