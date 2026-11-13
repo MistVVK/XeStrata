@@ -429,6 +429,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(own_only_line_test PRIVATE include)
   add_test(NAME own_only_line_test COMMAND own_only_line_test)
 
+  # how many tokens the FP16 expert path's buffers (Xs, Hh) are sized for: the tail below the stream floor in a fused layout, the full chunk elsewhere (header-only, no GPU)
+  add_executable(fp16_rows_rule_test tests/prefill/fp16_rows_rule_test.cpp)
+  target_include_directories(fp16_rows_rule_test PRIVATE include)
+  add_test(NAME fp16_rows_rule_test COMMAND fp16_rows_rule_test)
+
   # whether the CUDA fused prompt kernels take the Gyro trellis experts by default (STRATA_PF_FUSED_TQ unset: the sm_86 cards with 80+ SMs; =1 any card; =0 off): the pure
   # rule, pinned for every card class (header-only, no GPU)
   add_executable(fused_tq_default_test tests/prefill/fused_tq_default_test.cpp)
