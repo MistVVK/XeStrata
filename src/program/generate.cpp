@@ -1895,6 +1895,46 @@ int kernel_bench(const std::string& pack) {
     return 0;
 }
 
+// XESTRATA_PREFILL_HELPER_SOURCE=auto: a blob a helper holds, copied from the helper's VRAM and from the source the
+// prompt path would read anyway (RAM or the files) in turn; the helper is taken when it is 5% faster.  The B70 + RTX
+// 4070 pair read slower from the helper (the 4070's x4 link against RAM), which is what the timing keeps the switch
+// from being on where it is so.
+bool helper_copy_faster(strata::core::RemotePrefillSource& helper, strata::core::ExpertSource& fallback) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    int64_t layer = -1, expert = -1;
+    for (int64_t l = 0; l < lay.n_layers && layer < 0; ++l)
+        for (int64_t e = 0; e < lay.n_expert; ++e)
+            if (helper.from_helper(l, e)) { layer = l; expert = e; break; }
+    if (layer < 0) {
+        std::fprintf(stderr, "xestrata serve: no helper holds a prompt expert yet: the prompt path reads as before\n");
+        return false;
+    }
+    std::vector<uint8_t> dst((size_t) lay.blob_bytes(layer));
+    const auto now = [] { return std::chrono::steady_clock::now(); };
+    auto one = [&](bool from_helper) {
+        double best = 1e30;
+        for (int r = 0; r < 5; ++r) {
+            const auto t0 = now();
+            const bool ok = from_helper ? helper.copy_blob(layer, expert, dst.data())
+                                        : fallback.copy_blob(layer, expert, dst.data());
+            const double ms = std::chrono::duration<double, std::milli>(now() - t0).count();
+            if (!ok) return -1.0;
+            best = std::min(best, ms);
+        }
+        return best;
+    };
+    const double h = one(true), f = one(false);
+    if (h < 0.0 || f < 0.0) {
+        std::fprintf(stderr, "xestrata serve: the helper's blob could not be timed: the prompt path reads as before\n");
+        return false;
+    }
+    const bool on = h <= 0.95 * f;
+    std::fprintf(stderr, "xestrata serve: a helper's cached blob %.3f ms against the source's %.3f ms: the prompt path "
+                         "%s (XESTRATA_PREFILL_HELPER_SOURCE=0/1 picks one)\n", h, f,
+                 on ? "reads the helper's cache" : "reads as before");
+    return on;
+}
+
 // The PCIe split: core's setup_pcie_split, which the other models' engine calls the same way.
 void setup_pcie_split(strata::core::ExpertDispatch& d, int64_t n_layers, const Options& o, bool pcie_given,
                       bool layer_split, bool overlap, strata::core::PcieSplitTimes& t) {
@@ -6878,18 +6918,26 @@ int main(int argc, char** argv) {
                                  "--conversation-save are off (a parked conversation carries the draft layer's K/V)\n");
             o.conversation_save.clear();
         }
-        // STRATA_PREFILL_HELPER_SOURCE (opt-in): the prompt path may take a blob a helper's VRAM cache already
-        // holds from that cache instead of reading the files again.  The helpers are idle while a prompt is read
-        // (the serve path is serial: no batch slots), so the copy needs no ordering against their kernel streams.
-        // Default off: the prompt path's source is srcp, exactly as before.
+        // STRATA_PREFILL_HELPER_SOURCE: the prompt path may take a blob a helper's VRAM cache already holds from that
+        // cache instead of reading the files again.  The helpers are idle while a prompt is read (the serve path is
+        // serial: no batch slots), so the copy needs no ordering against their kernel streams.  0/1 fixes it;
+        // unset/auto times a helper's blob against the source's once (helper_copy_faster).
         std::vector<strata::core::RemoteExperts*> prefill_helpers;
         prefill_helpers.reserve((size_t) drive.d.remote_count);
         for (int r = 0; r < drive.d.remote_count; ++r) prefill_helpers.push_back(drive.d.remote[r]);
         std::unique_ptr<strata::core::RemotePrefillSource> prefill_helper_src;
         strata::core::ExpertSource* prefill_src = srcp;
         uint64_t helper_blobs_before = 0, helper_bytes_before = 0;
-        if (const char* hv = strata::env_get("PREFILL_HELPER_SOURCE"); hv != nullptr && std::strtol(hv, nullptr, 10) != 0 &&
-            srcp != nullptr && !multi_gpu && stages.empty() && o.batch <= 0 && !prefill_helpers.empty()) {
+        bool take_helper = false;
+        if (srcp != nullptr && !multi_gpu && stages.empty() && o.batch <= 0 && !prefill_helpers.empty()) {
+            const int want = strata::env_auto("PREFILL_HELPER_SOURCE");
+            if (want >= 0) take_helper = want == 1;
+            else {
+                strata::core::RemotePrefillSource probe(*srcp, prefill_helpers);
+                take_helper = helper_copy_faster(probe, *srcp);
+            }
+        }
+        if (take_helper) {
             prefill_helper_src = std::make_unique<strata::core::RemotePrefillSource>(*srcp, prefill_helpers);
             prefill_src = prefill_helper_src.get();
             std::fprintf(stderr, "xestrata serve: the prompt path reads the experts a helper cache holds from that "
