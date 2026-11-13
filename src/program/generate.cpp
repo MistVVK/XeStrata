@@ -248,7 +248,7 @@ struct Options {
     /// stream-token path.  The arithmetic is the native one with or without it.
     std::string native_preset;
     /// Plan v0.3 P2: how the n-gram table is read. Direct (default) = unbuffered SSD reads, table never in RAM.
-    std::string ple_io = "direct";
+    std::string ple_io = "auto";
     bool ple_io_explicit = false;      ///< --ple-io was given: the engine only warns when direct measures slow
     /// The token embedding from this GGUF instead of --native's (tools/embd_bf16_pack.py: BF16 as shipped)
     std::string embd_gguf;
@@ -589,9 +589,12 @@ void usage() {
                  "  --tokens-file PATH   pretokenized prompt, commas or whitespace (alternative to --tokens)\n"
                  "  --ple-gguf PATH      the PLE table (with --native: default the shard of --native's model that holds it)\n"
                  "  --no-ple             explicit diagnostic ablation of the PLE layer\n"
-                 "  --ple-io direct|mmap|ram  n-gram table reads (plan v0.3 P2). direct (default): unbuffered SSD\n"
-                 "                       reads, the table never enters RAM or the file cache; mmap: A/B arm;\n"
-                 "                       ram: mmap with the whole table locked in RAM at start\n"
+                 "  --ple-io auto|direct|mmap|ram  n-gram table reads (plan v0.3 P2). auto (default): the reads\n"
+                 "                       are measured here and the faster of direct and mmap is taken; direct:\n"
+                 "                       unbuffered SSD reads, the table never enters RAM or the file cache; mmap:\n"
+                 "                       mapped reads (the OS file cache); ram: mmap with the table locked in RAM\n"
+                 "                       (XESTRATA_PLE_AUTO_RAM=1 lets the RAM policy choose it; XESTRATA_PLE_AUTO_MMAP\n"
+                 "                       =0/1 keeps direct or takes mmap without measuring it)\n"
                  "  --embd-gguf PATH     the token embedding from this GGUF instead of --native's (tools/embd_bf16_pack.py:\n"
                  "                       BF16 as the checkpoint ships it; mapped host memory, no VRAM)\n"
                  "  --ple-row-cache N    bounded cache of fetched rows, 90 B each (default 1048576; 0 = off)\n"
@@ -2730,7 +2733,7 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    if ((o.ple_io != "direct" && o.ple_io != "mmap" && o.ple_io != "ram") || o.ple_row_cache < 0 || o.ple_inflight < 1 ||
+    if ((o.ple_io != "auto" && o.ple_io != "direct" && o.ple_io != "mmap" && o.ple_io != "ram") || o.ple_row_cache < 0 || o.ple_inflight < 1 ||
         o.ple_inflight > 1024 || !(o.ple_delay_us >= 0)) {
         std::fprintf(stderr, "xestrata generate: invalid --ple-io/--ple-row-cache/--ple-inflight/--ple-delay-us\n");
         return 2;
@@ -4233,41 +4236,85 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        // Recommend, never force: when the default direct reads measure slow, say so.  The switch to the mapped reads
-        // (40-100x faster on some DRAM-less NVMe drives) is made only with STRATA_PLE_AUTO_MMAP=1 (upstream #2040: the
-        // 15K rows/s bar is NVMe-calibrated, a SATA SSD tops out at 10-14K with direct's 16 reads in flight, and mapped
-        // reads were 7x slower there); an explicit --ple-io direct is kept and only warned about.
-        if (pio.mode == strata::kernels::PleIo::Direct && strata::env_get("PLE_PROBE") == nullptr) {
+        // The default (--ple-io auto) measures the reads here; nothing about a drive is assumed.  direct's unbuffered
+        // reads are the fastest where the drive serves them (a healthy NVMe: >100K rows/s), but some DRAM-less NVMe
+        // drives served the mapped reads 40-100x faster (upstream #2040); there the table stays in the file cache and
+        // mmap wins.  A SATA SSD is the other way (mapped reads 7x slower): so the mapped reads are measured too, and
+        // only a clear win (5%) takes them.  XESTRATA_PLE_AUTO_MMAP=0 keeps direct and only warns; =1 takes mmap
+        // wherever direct is slow, without measuring it.  --ple-io (not auto) wins over both and is only warned about.
+        if (pio.mode == strata::kernels::PleIo::Direct && !o.ple_io_explicit && strata::env_get("PLE_PROBE") == nullptr) {
             constexpr double kSlowRowsPerS = 15000.0;   // ~60 MB/s of 4 KiB pages; a healthy NVMe is >100k
             const double rps = ple_direct_rows_per_s(ple_table);
             if (rps >= kSlowRowsPerS)
                 std::fprintf(stderr, "xestrata generate: PLE direct read probe: %.0f rows/s (fine)\n", rps);
-            static const bool auto_mmap = [] {
+            static const int auto_mmap = [] {
                 const char* v = strata::env_get("PLE_AUTO_MMAP");
-                return v != nullptr && std::strtol(v, nullptr, 10) == 1;
+                if (v == nullptr || *v == '\0' || std::strcmp(v, "auto") == 0) return -1;   // measure both
+                return std::strtol(v, nullptr, 10) != 0 ? 1 : 0;
             }();
             if (rps > 0 && rps < kSlowRowsPerS) {
-                if (!o.ple_io_explicit && auto_mmap) {
-                    std::fprintf(stderr, "xestrata generate: --ple-io direct measures slow here (%.0f rows/s, about %.0f MB/s of "
-                                         "random 4 KiB reads): using --ple-io mmap instead (the OS file cache holds the pages; "
-                                         "--ple-io direct forces the old mode, --ple-io ram keeps the table in RAM)\n",
-                                 rps, rps * 4096.0 / 1e6);
-                    ple_table.close();
-                    pio.mode = strata::kernels::PleIo::Mmap;
-                    pio.keepalive_ms = 0;
-                    if (!ple_table.open(o.ple_gguf, err, pio)) {
-                        std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
-                        return 1;
-                    }
-                } else {
+                bool use_mmap = false;
+                double mmap_rps = 0;
+                if (auto_mmap == 0) {
                     std::fprintf(stderr, "xestrata generate: WARNING: --ple-io direct measures slow here (%.0f rows/s, about %.0f "
                                          "MB/s of random 4 KiB reads): a prompt can spend minutes reading layer 1 and trip the "
-                                         "stall watchdog (#1425, #1629). --ple-io mmap was 40-100x faster on some DRAM-less "
-                                         "NVMe drives but 7x slower on a SATA SSD (#2040), so it is not chosen for you; "
-                                         "--ple-io ram needs the RAM for the table%s\n", rps, rps * 4096.0 / 1e6,
-                                 o.ple_io_explicit ? "" : " (kept direct: pass --ple-io mmap or --ple-io ram to change it; in a "
-                                                          "config file's \"args\" they are two entries: \"--ple-io\", "
-                                                          "\"mmap\")");
+                                         "stall watchdog (#1425, #1629). XESTRATA_PLE_AUTO_MMAP=0 keeps it; leave it unset "
+                                         "to measure the mapped reads instead, or pass --ple-io mmap / --ple-io ram\n",
+                                 rps, rps * 4096.0 / 1e6);
+                } else {
+                    // the mapped reads through the same probe: the file's pages in the OS cache, one row a read
+                    if (auto_mmap < 0) {
+                        ple_table.close();
+                        pio.mode = strata::kernels::PleIo::Mmap;
+                        pio.keepalive_ms = 0;
+                        std::string mmap_err;
+                        if (ple_table.open(o.ple_gguf, mmap_err, pio)) {
+                            mmap_rps = ple_direct_rows_per_s(ple_table);
+                            use_mmap = mmap_rps > rps * 1.05;   // a clear win, not run-to-run noise
+                        } else {
+                            std::fprintf(stderr, "xestrata generate: the mapped reads cannot open the table (%s); "
+                                                 "direct stays\n", mmap_err.c_str());
+                        }
+                        if (!use_mmap) {   // back to the reads that were there: mmap must beat direct clearly
+                            ple_table.close();
+                            pio.mode = strata::kernels::PleIo::Direct;
+                            if (!ple_table.open(o.ple_gguf, err, pio)) {
+                                std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
+                                return 1;
+                            }
+                        }
+                    } else {
+                        use_mmap = true;
+                    }
+                    if (use_mmap) {
+                        if (pio.mode == strata::kernels::PleIo::Direct) {
+                            ple_table.close();
+                            pio.mode = strata::kernels::PleIo::Mmap;
+                            pio.keepalive_ms = 0;
+                            if (!ple_table.open(o.ple_gguf, err, pio)) {
+                                std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
+                                return 1;
+                            }
+                        }
+                        if (mmap_rps > 0)
+                            std::fprintf(stderr, "xestrata generate: --ple-io direct measures slow here (%.0f rows/s, about %.0f "
+                                                 "MB/s of random 4 KiB reads), the mapped reads %.0f rows/s: using --ple-io "
+                                                 "mmap (the OS file cache holds the pages; --ple-io direct forces the old "
+                                                 "mode, --ple-io ram keeps the table in RAM)\n",
+                                         rps, rps * 4096.0 / 1e6, mmap_rps);
+                        else
+                            std::fprintf(stderr, "xestrata generate: --ple-io direct measures slow here (%.0f rows/s, about %.0f "
+                                                 "MB/s of random 4 KiB reads): using --ple-io mmap (XESTRATA_PLE_AUTO_MMAP=1; "
+                                                 "the OS file cache holds the pages, --ple-io direct forces the old mode, "
+                                                 "--ple-io ram keeps the table in RAM)\n",
+                                         rps, rps * 4096.0 / 1e6);
+                    } else {
+                        std::fprintf(stderr, "xestrata generate: WARNING: --ple-io direct measures slow here (%.0f rows/s, about %.0f "
+                                             "MB/s of random 4 KiB reads): a prompt can spend minutes reading layer 1 and trip the "
+                                             "stall watchdog (#1425, #1629); the mapped reads measured %.0f rows/s here, so "
+                                             "direct stays. --ple-io ram needs the RAM for the table\n",
+                                     rps, rps * 4096.0 / 1e6, mmap_rps);
+                    }
                 }
             }
         }
