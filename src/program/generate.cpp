@@ -4800,16 +4800,23 @@ int main(int argc, char** argv) {
         const uint64_t need = lay.total + lay.max_blob;
         std::string why;
         const uint64_t headroom = strata::core::detail::ram_headroom(8ull << 30);
-        if (!(keep != nullptr && std::strcmp(keep, "keep") == 0) && strata::core::detail::host_available_memory(hm) &&
-            !strata::core::detail::resident_pin_fits(
-                need, 0, headroom, hm.available - std::min(hm.available, strata::platform::cma_free_bytes()), why) &&
-            hm.cgroup_limit >= need) {
+        // upstream 4adc047d (#5708 era), as XeStrata takes it: a HARD memory limit (a cgroup, a container) is part of the
+        // RAM this start may use, next to MemAvailable (plain's judgment: host_available_memory's figure, capped by the
+        // limit).  A limit that cannot hold the arena and the headroom beside it takes the low-RAM start below - the
+        // same start as --resident-experts - not a refusal (a container just above the arena was killed by the cgroup
+        // OOM killer while loading, upstream: 49 GiB against a 46.84 GiB arena).
+        const bool mem_known = strata::core::detail::host_available_memory(hm);
+        const uint64_t avail = mem_known
+                                   ? std::min(hm.available - std::min(hm.available, strata::platform::cma_free_bytes()),
+                                              hm.cgroup_limit)
+                                   : 0;
+        if (!(keep != nullptr && std::strcmp(keep, "keep") == 0) && avail > 0 &&
+            !strata::core::detail::resident_pin_fits(need, 0, headroom, avail, why)) {
             std::fprintf(stderr, "xestrata generate: the expert arena needs %.2f GiB of RAM and %.0f GiB beside it, but "
                                  "%.2f GiB is available: starting as with --resident-experts (the experts the GPU does "
                                  "not hold in RAM as far as it has room, the rest from the model files; "
                                  "XESTRATA_ARENA_LOW_RAM=keep loads the whole arena anyway)\n",
-                         (double) need / 1073741824.0, (double) headroom / 1073741824.0,
-                         (double) hm.available / 1073741824.0);
+                         (double) need / 1073741824.0, (double) headroom / 1073741824.0, (double) avail / 1073741824.0);
             o.mmap_experts = o.resident_pin = true;
             o.resident_gib = -1;
             if (!o.shared_expert_arena.empty())
