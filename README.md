@@ -306,7 +306,7 @@ Installing from the source with `./setup.sh` is in [docs/BUILD.md](docs/BUILD.md
 - **From a phone or another PC:** run `xestrata --host 0.0.0.0 --api-key <secret>` and open the address
   the server window prints ([details](docs/DETAILS.md#streaming-and-connecting)).
 
-**Good to know:** it answers one request at a time (several at once is opt-in: `"parallel": 2`, [BATCHING](docs/BATCHING.md)). The first message of a conversation is read in full; after that
+**Good to know:** it answers one request at a time (several at once with `"parallel": N`, [BATCHING](docs/BATCHING.md); setup says how many this card could hold). The first message of a conversation is read in full; after that
 it keeps the conversation and reads only what is new, so follow-ups start right away.
 The API in full, MCP tools and llama-swap: [DETAILS](docs/DETAILS.md#using-it) and [LLAMA_SWAP](docs/LLAMA_SWAP.md).
 With a SearXNG-compatible search server set, the API and the web page can search the web ([Web search](docs/DETAILS.md#web-search)).

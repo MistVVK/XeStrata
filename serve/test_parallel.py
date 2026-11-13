@@ -225,6 +225,29 @@ class ParallelArgs(unittest.TestCase):
         args = engine_args({"args": ["--pack", "p"], "parallel": 2})
         self.assertEqual(args[-2:], ["--batch", "2"])
 
+    def test_auto_is_not_a_count(self):
+        # the server fills "auto" in from the machine before the engine starts (serve/autotune.py); one that reaches
+        # the arguments unresolved is one at a time
+        self.assertEqual(parallel_args({"parallel": "auto"}, []), [])
+
+    def test_batch_groups_and_the_conversation_cache(self):
+        self.assertEqual(engine_args({"args": ["--pack", "p"], "parallel": 4, "batch_groups": "auto"})[-4:],
+                         ["--batch", "4", "--batch-groups", "auto"])
+        self.assertEqual(engine_args({"args": ["--pack", "p"], "batch_groups": 2})[-2:], ["--batch-groups", "2"])
+        self.assertEqual(engine_args({"args": ["--pack", "p"], "conversation_cache_mib": 2048})[-2:],
+                         ["--conversation-cache-mib", "2048"])
+        self.assertEqual(engine_args({"args": ["--pack", "p"], "conversation_cache_mib": 0})[-2:],
+                         ["--conversation-cache-mib", "0"])
+        # "auto" leaves the engine's own sizing (from the RAM free once the model is loaded)
+        self.assertNotIn("--conversation-cache-mib", engine_args({"args": ["--pack", "p"],
+                                                                  "conversation_cache_mib": "auto"}))
+        # the config's own engine arguments win
+        mine = ["--pack", "p", "--batch-groups", "1", "--conversation-cache-mib", "512"]
+        got = engine_args({"args": list(mine), "batch_groups": "auto", "conversation_cache_mib": 2048})
+        self.assertEqual(got[:len(mine)], mine)
+        self.assertEqual(got.count("--batch-groups"), 1)
+        self.assertEqual(got.count("--conversation-cache-mib"), 1)
+
 
 class PickSlot(unittest.TestCase):
     def engine(self, n):

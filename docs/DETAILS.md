@@ -44,6 +44,8 @@ One run per cell.
 
 While a short prompt (a chunk below 2,048 tokens) is read, the decode CPU pool, idle then, computes the experts outside VRAM that few of its tokens route to (opt-in upstream, the default here: `XESTRATA_PREFILL_CPU_SHARE=auto`). It measures the CPU's and the GPU's time per expert and hands over the share at which both end together. With `XESTRATA_PREFILL_CPU_GATE=1` it also times neighbouring layers with and without the share, and shares only while the layers that share take less time per expert outside VRAM (upstream f2a3b946, #1282: on one PC the busy CPU slowed the host that issues the streams, and every share lost). The layers tried without the share cost more than that saved here, 1.3% of a 1K prompt's speed on the B70 and 4.4% on the RTX 4070, so it is off by default. `XESTRATA_DBG_CPU_GATE=1` prints those readings. The default leaves it off when the GPU cache holds every expert (nothing streams) and when the host is short of memory (less free RAM than the share's buffers and 3 GiB, or file pages of the experts it would read that the free RAM cannot keep) (upstream eaaa237e, 04dbe561; `XESTRATA_PREFILL_CPU_SHARE=auto` turns it on anyway). A buffer of the share that cannot be had ends the share instead of failing the request. The CPU computes in its own activation format, so an answer can differ a little from the GPU-only one. The measured share moved a little from run to run, and the experts the CPU took with it, so two greedy runs with the same settings parted after some tokens. Setup's warm-up therefore measures the share once per PC and model and writes it into the run config (`--prefill-cpu-share`): a prompt is read the same way every run. `--prefill-cpu-share auto` measures it in every prompt as before. The decode's PCIe share also changes from run to run, but it does not change the answer where the experts compute alike on the CPU and the GPU (i-quant, IQ4_XS or Q2_0 gate/up and IQ4_NL or Q2_0 down: the four Qwen3.8 files); to compare two runs' answers exactly on a model with experts of other types, add `--pcie-frac 0` as well. `XESTRATA_PREFILL_CPU_SHARE=0` keeps every expert on the GPU, `0.4` and the like a fixed share. 262- / 914-token prompts went from 319.2 to 383.1 / 736.3 to 828.0 tokens/s on the B70 and from 109.9 to 266.1 / 275.9 to 457.8 tokens/s on the RTX 4070 (one run each).
 
+For a chunk of 2,048 to 3,072 tokens, the CPU pool can take an expert's rows as jobs of up to eight rows. The first layers alternate the share and no-share paths. In plain, a trial sends at most 16 experts to the CPU to keep its cost small. If both of two time ratios show the share at least 10% faster, later layers use it. On Qwen3.8, an unshared layer in auto mode also stages only the experts it routes to, instead of streaming every expert ahead. The choice lasts for the run and is not saved to a file. `XESTRATA_PREFILL_STAGED_3K=0` keeps the earlier path; `=1` forces the share; unset or `=auto` measures and chooses. The trial layers also affect the answer, so it can differ from a GPU-only run.
+
 With a helper GPU (`--expert-cache-device1`, or the helper `--layer-split auto` chose), in the same short chunks the experts not in VRAM that the helper holds and few tokens route to are computed by the helper from its own VRAM. Their tokens' rows go to it through host memory registered on both GPUs, and the results come back the same way. How many tokens an expert may have is where moving its rows over the helper's link and back takes less time than streaming the expert to the first GPU, from both links as measured at the start (19 for a B70 and an RTX 4070 on x4). `XESTRATA_PREFILL_HELPER_ROWS=n` sets it, `0` turns it off. The helper computes with its int8 products, so the reply can differ slightly from the first GPU alone's (the first token's KL on a 1K prompt 0.011; the CPU share at 0.5: 0.020). On a B70 and an RTX 4070 a 1K prompt went from 693 to 735 tokens/s.
 
 The prefill has four switches, set in the engine's environment. None of them changes a bit of the answers.
@@ -191,7 +193,9 @@ It costs about 13.7 KB of RAM per context token, about 1.7 GB at 128K.
 The expert cache holds the rest, giving slots to the K/V as the context grows and taking them back after a short request.
 Both live in virtual memory (`sycl_ext_oneapi_virtual_mem`) and neither address moves, so the captured graphs stay valid.
 It needs one GPU with virtual memory, an expert profile, no KV streaming and every expert in RAM; otherwise (and with `--batch` or `--vram-elastic`) the engine says so and stays off.
-`XESTRATA_KV_GROW_HOLD=1` keeps the longest parked conversation's cells in the K/V until it comes back.
+`XESTRATA_KV_GROW_HOLD` keeps the longest parked conversation's cells in the K/V until it comes back (`=1` always, `=0` never).
+Unless given, the device's reported virtual-memory granularity decides, as for `--kv-grow` itself: kept at 2 MiB or more.
+Where the pages are smaller (the B70's 64 KiB) the cache in virtual memory is slower there anyway, so holding measured slower (faster on the RTX 4070, slower on the B70, 2026-10-09).
 At a 128K context, int8, IQ2_XS and a 4,945-token prompt (one run each) the result differs by card:
 
 | | prefill (tokens/s) | decode after it | short chat decode | slots |
@@ -580,7 +584,7 @@ The engine's options (added to the settings' `args`):
 | `--vram-reserve-later-mib N` | with a layer split, the VRAM left free on the later GPUs (by default as `--vram-reserve-mib`) |
 | `--vision` | with `--serve`, take requests with images (Qwen3.5-9B and the qwen35moe models; setup writes it when images are chosen) |
 | `--device cpu`, `--cpu-threads N` | run a dense Qwen3.5 model (qwen35) on the CPU alone ([a PC without a GPU](#a-pc-without-a-gpu); without a GPU that SYCL can use it runs on the CPU unasked). `--cpu-threads` is the number of threads (default: physical cores, subject to the CPU quota) |
-| `--batch N` (`"parallel": N`) | with `--serve`, decode up to N conversations together ([BATCHING](BATCHING.md#the-other-models-the-plain-engine); not GLM-5.3-Flash nor `--vision` yet) |
+| `--batch N` (`"parallel": N`, `"auto"` by default) | with `--serve`, decode up to N conversations together ([BATCHING](BATCHING.md#the-other-models-the-plain-engine); not GLM-5.3-Flash nor `--vision` yet) |
 | `--prompt-cache N`, `--prompt-cache-every N`, `--prompt-cache-root N`, `--turn-token ID`, `--conversation-save-checkpoints N` | with `--serve`, the conversation checkpoints of a model with a recurrent state (Ornith, Qwen3.6, Qwen3.5-9B). A recurrent state cannot go back to an earlier position, so a request that takes a conversation up short of its end (the next turn after a reply rendered otherwise, an edited message, a new chat on the same system prompt) reads all of it again without one. The meanings and defaults are Qwen3.8-Flash-Next's ([the conversation cache](#the-conversation-cache)), and a request's `pin` and `"strata_checkpoint": false` apply. A checkpoint is the recurrent state only (about 60 MB for Qwen3.6); the K/V of the positions below it are the conversation's. `--turn-token` defaults to the vocabulary's `<|im_start|>`, else `<|start|>`. A model of attention layers only (llm-jp, GLM-5.3-Flash) needs none: the K/V up to any position serve |
 | `--tail-role-token ID`, `--prompt-cache-tail`, `--prompt-cache-spread`, `--conversation-cache-min-tokens N`, `--conversation-cache-park-gain N`, `--short-read N`, `--session-save-reclaim` | `--serve`'s policies of the conversation cache and the checkpoints (Qwen3.8-Flash-Next's meanings); `--short-read` defaults to `--max-t` |
 | `--rope-scaling none\|linear\|yarn`, `--rope-scale F`, `--yarn-orig-ctx N`, `--yarn-ext-factor F`, `--yarn-attn-factor F`, `--yarn-beta-fast F`, `--yarn-beta-slow F` | context extension (the YaRN knobs as llama.cpp's) |
@@ -751,8 +755,11 @@ The app has three tabs:
   of the layers, prefill / decode).
   With the images on a GPU of their own, the text's state and the image job's are on lines of their own.
   Its conversation cache card shows how many prefill tokens the cache gave back (in the last request and since the
-  start) and, with `--conversation-cache-mib`, the parked conversations and their memory, and how many were parked,
-  restored and evicted (upstream #596; the same is under `"conversation_cache"` in `/metrics`).
+  start) and, while the conversation cache is on (`--conversation-cache-mib`, or the engine's own sizing without it),
+  the parked conversations and their memory, and how many were parked, restored and evicted (upstream #596; the same
+  is under `"conversation_cache"` in `/metrics`).  `--conversation-cache-mib` can also be written as the config's
+  `"conversation_cache_mib"` (MiB; 0 turns it off); without it the engine sizes it from the RAM free once the model is
+  loaded, the same rule in both engines.
 - **About**: the model and engine settings, and the addresses to connect other apps.
 
 `http://127.0.0.1:8095/?q=your question` opens it with a new chat already asking.
@@ -803,7 +810,7 @@ For a game, a 3D program or another model beside it, leave more (upstream #493).
 The expert cache is then that much smaller, so answers can be a little slower.
 
 The amount can also change while it runs (upstream #533).
-A config with image generation or a GPU encoder holds the expert cache in pieces of 512 MiB (`"vram_segment_mib"` changes it; `--vram-elastic`). Other configs do the same with `"vram_elastic": true`, and `"vram_elastic": false` always keeps one allocation. Held in pieces, the cache read the prompt and wrote the answer as fast on the B70, the RTX 4070 and the RX 9060 XT.
+Whether the expert cache is held in pieces of 512 MiB (`"vram_segment_mib"` changes it; `--vram-elastic`) is the config's `"vram_elastic"`.  The default `"auto"` holds it in pieces with image generation or a GPU encoder (something borrows the VRAM between requests) and in one allocation otherwise; `true` always holds it in pieces, `false` always in one allocation.  On a layer split the engine keeps one cache per card, so it is never in pieces.  Held in pieces, the cache read the prompt and wrote the answer as fast on the B70, the RTX 4070 and the RX 9060 XT.
 Between requests, `POST /v1/vram` with `{"reserve_mib": 6000}` gives the cache's last pieces back to the GPU until that much is free, and `{"reserve_mib": null}` goes back to the amount the start left.
 A running request finishes first.
 The experts of the pieces given back are computed on the CPU: the same answers, slower.
@@ -1517,7 +1524,7 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
 
 ### Current limits and sampling
 
-- One request at a time (several at once only with `"parallel"`, [BATCHING](BATCHING.md)), and one conversation's history in the KV cache at a time.
+- One request at a time (several at once only with `"parallel": N`, [BATCHING](BATCHING.md)), and one conversation's history in the KV cache at a time.
   Switching between two chats re-reads the part where they diverge unless parking is on; the shared prefix, such as the system prompt, is reused.
 - Images only when set up with them ([below](#images)); no video.
 - **Temperature, top_p, top_k, min_p and seed** are honored per request (OpenAI and Anthropic fields).

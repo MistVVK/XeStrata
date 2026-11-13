@@ -13,10 +13,9 @@ launcher reads `XESTRATA_*` through launcher/Core/Platform.fs, and the shell scr
     python tools/settings_register.py --names     # print the names that are read, one per line
 
 What counts as a read: the name is the string literal argument of an engine env helper (`env_get`, `env_on`, `env_off`,
-`env_or`, `env_mib`, `env_isa_cap`, `env_auto`), of `envvars.get` in Python, a `XESTRATA_*` string in the
-launcher's F#, or a
-`$XESTRATA_*` reference in a shell script.  A call whose argument is not a literal (a computed name) is not listed: it
-cannot be enumerated.
+`env_or`, `env_mib`, `env_isa_cap`, `env_auto`, `pick_from_env`), of `envvars.get` in Python, a `XESTRATA_*` string in
+the launcher's F#, or a `$XESTRATA_*` reference in a shell script.  A call whose argument is not a literal (a computed
+name) is not listed: it cannot be enumerated.
 
 The register is generated; only the names and their read sites are in it, with no hand-kept fields.  `--check` compares
 the NAMES (a new setting must be added by running the tool; the read sites' line numbers are refreshed by the same run).
@@ -40,7 +39,8 @@ LAUNCHER_FILES = ("launcher/Core/Platform.fs",)
 SHELL_GLOBS = ("setup.sh", "tools", "container")
 SKIP_PARTS = ("node_modules", "__pycache__", "/build/", "/.tools/", "/.lint/", "/third_party/")
 
-CPP_CALL = re.compile(r'\b(?:env_get|env_on|env_off|env_or|env_mib|env_isa_cap|env_auto)\s*\(\s*"([A-Z0-9_]+)"')
+CPP_CALL = re.compile(r'\b(?:env_get|env_on|env_off|env_or|env_mib|env_isa_cap|env_auto|pick_from_env)'
+                      r'\s*\(\s*"([A-Z0-9_]+)"')
 PY_CALL = re.compile(r'\benvvars\.get\s*\(\s*"([A-Z0-9_]+)"')
 FS_NAME = re.compile(r'"(XESTRATA_[A-Z0-9_]+)"')
 SH_NAME = re.compile(r'\$\{?(XESTRATA_[A-Z0-9_]+)')

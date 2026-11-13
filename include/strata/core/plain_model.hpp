@@ -35,6 +35,7 @@
 #include "strata/core/draft_head.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/expert_tier.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/graph.hpp"
 #include "strata/core/moe_window.hpp"
@@ -514,9 +515,10 @@ public:
     /// was filled from, marked dropped before the server unloads the engine.  False with `err` without an arena.
     bool arena_drop(const std::string& line, std::string& answer, std::string& err);
     /// --kv-grow: the K/V holds at least `cells` cells (whole steps), the tier giving VRAM up for them; and, when it
-    /// holds far more than `cells`, it gives the rest back to the tier.  Between requests; true without --kv-grow.
+    /// holds far more than `cells` (or `hold`, the cells a parked conversation may need: kv_grow_hold.hpp), it gives
+    /// the rest back to the tier.  Between requests; true without --kv-grow.
     bool kv_grow_to(int64_t cells, std::string& err);
-    bool kv_trim(int64_t cells, std::string& err);
+    bool kv_trim(int64_t cells, int64_t hold, std::string& err);
     bool kv_elastic() const { return kv_cells_ >= 0; }
     /// --control-vector: the loaded vector's tables (kernels/cvec.hpp, cvec_upload) on every stage's GPU too, before
     /// the first window; the blocks then apply it after their FFN (steer)
@@ -891,8 +893,14 @@ private:
     struct PromptRouted {
         int64_t cpu_n = 0, cpu_rows = 0, miss_n = 0;   ///< the CPU's experts and rows, the experts not in VRAM
     };
-    bool prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* routes, const std::function<void(int)>& mark,
-                       PromptRouted& st, std::string& err);
+    PromptShareChoice prompt_share_3k_;
+    strata::gpu::Event* prompt_share_events_[2] = {};
+    bool prompt_share_pending_ = false, prompt_share_arm_ = false;
+    int64_t prompt_share_layer_ = 0, prompt_share_missed_ = 0;
+    bool prompt_routed(int64_t ml, int64_t T, bool cpu_share, bool large_share, int64_t max_cpu, int32_t* routes,
+                       const std::function<void(int)>& mark, PromptRouted& st, std::string& err);
+    bool prompt_routed_tuned(int64_t ml, int64_t T, bool cpu_share, int32_t* routes,
+                             const std::function<void(int)>& mark, PromptRouted& st, std::string& err);
     bool prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& experts, const std::vector<int32_t>& count,
                             const std::vector<int32_t>& start, std::string& err);
     bool prompt_return(std::string& err);
