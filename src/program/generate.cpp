@@ -4392,10 +4392,10 @@ int main(int argc, char** argv) {
                      st.dev, last ? " and head" : "", (double) fb / 1073741824.0);
     }
     GpuStage* const last_st = stages.empty() ? nullptr : stages.back().get();
-    auto batch_mtp_serial = [] {   // STRATA_BATCH_MTP_SERIAL=1: --batch-mtp keeps its serial windows (batch_groups.hpp)
-        const char* v = strata::env_get("BATCH_MTP_SERIAL");
-        return v != nullptr && v[0] != '\0' && v[0] != '0';
-    };
+    // XESTRATA_BATCH_MTP_SERIAL: auto (the default) keeps the pipelined groups where a layer split runs them (measured
+    // faster: Qwen3.6-35B-A3B on a B70 + RTX 4070 split, 4 slots, 89.3 tok/s in 2 groups against 69.2 in one group with
+    // drafts, docs/BATCHING.md), 1 keeps --batch-mtp's serial windows, 0 the pipelined groups.
+    auto batch_mtp_serial = [] { return strata::core::pick_from_env("BATCH_MTP_SERIAL") == strata::core::Pick::On; };
 
     // --batch (upstream PR #559, #465): o.batch more sessions carved like the main one, one per slot of the batch
     // windows.  Before the expert cache is sized, so `--expert-cache auto` leaves them room.  A count the engine
@@ -4406,7 +4406,14 @@ int main(int argc, char** argv) {
     // 45.2 / 44.0 -> 44.6 / 43.8 (the run-to-run spread); 49 MiB a slot.  --no-batch-mtp / STRATA_BATCH_MTP=0: off.
     // When it was asked for and cannot run it is said and left off (plain batching still starts).
     int want_batch_mtp = o.batch_mtp;
-    if (const char* v = strata::env_get("BATCH_MTP"); v != nullptr && v[0] != '\0') want_batch_mtp = v[0] != '0' ? 1 : 0;
+    // XESTRATA_BATCH_MTP: auto (the default) keeps the command line's choice, on where --mtp and the slots allow it;
+    // 0 and 1 turn it off and on.  Measured near neutral either way (4 slots, aggregate: B70 87.4 -> 90.6 tok/s, RTX
+    // 4070 45.2 -> 44.6, within the run-to-run spread), so auto keeps it where it runs.
+    switch (strata::core::pick_from_env("BATCH_MTP")) {
+        case strata::core::Pick::On: want_batch_mtp = 1; break;
+        case strata::core::Pick::Off: want_batch_mtp = 0; break;
+        case strata::core::Pick::Auto: break;
+    }
     bool batch_mtp = want_batch_mtp != 0;
     // STRATA_PIPED_MTP=N (opt-in, upstream 17878ac57): --batch-mtp's proposals in the pipelined groups of a layer split
     // (batch_groups.hpp mtp_piped); decided once the slots that fit and the groups are final (piped_mtp, below)

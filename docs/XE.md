@@ -300,7 +300,7 @@ The main ones:
 - serve: a refused BGEN slot tries another slot (#1994), a failing before_load hook answers 503 with Retry-After and `/unload?wait=1` is taken (#1997),
   a quoted `</tool_call>` in a message is text (#2026), a call in a Markdown fence inside `<tool_call>` is read (#2037),
   and a client that leaves while its pictures are prepared stops the preparation (#1999).
-- Layer split with `--batch`: the default groups no longer give way to `--batch-mtp` (#2038; `XESTRATA_BATCH_MTP_SERIAL=1` for the old form).
+- Layer split with `--batch`: the default groups no longer give way to `--batch-mtp` (#2038; `XESTRATA_BATCH_MTP_SERIAL` is `auto` by default, the pipelined groups, `1` for the old form).
 - setup's `--calibrate` tunes the model of `--model` and `--family` (#2036). The benchmark reports only the GPUs the engine uses (#1985, #2062),
   and the server it starts runs without `--expert-profile-save` (#2088).
 

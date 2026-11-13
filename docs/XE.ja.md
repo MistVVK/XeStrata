@@ -285,7 +285,7 @@ upstream の Strata 0.1.43 から 0.1.43.1（`a0116b27`）までの変更を、W
 - serve: BGEN の枠を断られたら別の枠を試す（#1994）、before_load のフックの失敗に 503 と Retry-After を返し `/unload?wait=1` を受ける（#1997）、
   文中の `</tool_call>` を文として扱う（#2026）、`<tool_call>` の中の Markdown の囲みの呼び出しを読む（#2037）、
   画像の準備中に去ったクライアントの準備を止める（#1999）。
-- 層の分割と `--batch` では、既定の組を `--batch-mtp` に譲らない（#2038、`XESTRATA_BATCH_MTP_SERIAL=1` で前の形）。
+- 層の分割と `--batch` では、既定の組を `--batch-mtp` に譲らない（#2038、`XESTRATA_BATCH_MTP_SERIAL` の `auto`（既定）は流れ作業、`1` で前の形）。
 - setup の `--calibrate` は `--model`・`--family` のモデルを調整する（#2036）。ベンチマークはエンジンが使う GPU だけを報告し（#1985・#2062）、
   ベンチマークが起動するサーバーは `--expert-profile-save` なしで動く（#2088）。
 

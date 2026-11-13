@@ -23,7 +23,7 @@ Setup recommends it only where it does not cost speed (below); any number you as
 | Option | What it does |
 | --- | --- |
 | `"parallel": N` / `--batch N` / `--slots N` (2..8) | up to N conversations decoded together; more requests wait for a free slot. Each slot gets its own session (GDN recurrence, QSA K/V and indexer, PLE history). |
-| `--batch-mtp` / `--no-batch-mtp` | on by default with `--mtp` (upstream 8cfb3fd7, c8c79b17; opt-in upstream): each slot also verifies one MTP proposal per window and moves two tokens when it holds. The draft layer's weights are shared; each slot's own state is about 50 MiB. Slots that do not fit a window take turns, so `"parallel"` above 8 works too. On a layer split the slots' drafters sit on the last GPU ([MULTIGPU](MULTIGPU.md#decoding-several-conversations)). `XESTRATA_BATCH_MTP=0` turns it off as well. |
+| `--batch-mtp` / `--no-batch-mtp` | on by default with `--mtp` (upstream 8cfb3fd7, c8c79b17; opt-in upstream): each slot also verifies one MTP proposal per window and moves two tokens when it holds. The draft layer's weights are shared; each slot's own state is about 50 MiB. Slots that do not fit a window take turns, so `"parallel"` above 8 works too. On a layer split the slots' drafters sit on the last GPU ([MULTIGPU](MULTIGPU.md#decoding-several-conversations)). `XESTRATA_BATCH_MTP=0` turns it off as well (`auto`, the default, keeps it where `--mtp` and the slots allow it; `0` and `1` fix it). |
 
 The engine never refuses a count it cannot run: it says so in its log and runs what it can.
 That is at most 8 slots (a window holds 8 rows), as many as fit in VRAM, or none (one request at a time) when not two fit.
@@ -152,10 +152,10 @@ How the server uses them (moving from the solo path into a slot, each slot's con
 
 - At most `--max-t` slots (8 by default). Each slot's state is taken before the VRAM tier of experts, within half the VRAM free then, and the start log says how many were taken.
 - A slot grows with the context (Qwen3.6-35B-A3B: 414 MiB at a 16K context, 2,878 MiB at 128K; Qwen3.5-9B: 562 MiB at 16K).
-- With the MTP layer, each slot also checks one MTP draft a window, as Qwen3.8-Flash-Next's, and moves two tokens when it holds (`--batch-mtp`, on by default; `--no-batch-mtp` or `XESTRATA_BATCH_MTP=0` turns it off). A window holds `--max-t` rows, so the slots past that go without a draft in it. Each slot keeps a copy of its recurrent states after its first row (about 60 MiB for Qwen3.6-35B-A3B).
+- With the MTP layer, each slot also checks one MTP draft a window, as Qwen3.8-Flash-Next's, and moves two tokens when it holds (`--batch-mtp`, on by default; `--no-batch-mtp` or `XESTRATA_BATCH_MTP=0` turns it off; `XESTRATA_BATCH_MTP=auto` is the default). A window holds `--max-t` rows, so the slots past that go without a draft in it. Each slot keeps a copy of its recurrent states after its first row (about 60 MiB for Qwen3.6-35B-A3B).
 - While a prompt is read the slots wait (they do not decode between its chunks); `BYIELD` is taken and does nothing.
 - A batch window is recorded as a graph once for each set of slots in it.
-- On a layer split the slots run in groups pipelined through the stages, as Qwen3.8-Flash-Next's (`--batch-groups G` or `auto`, `auto` by default there): each stage computes another group at once. The groups' windows carry no drafts, so `--batch-mtp` is off then (`--batch-groups 1` or `XESTRATA_BATCH_MTP_SERIAL=1` keeps one group with them). No adaptive round starts while groups are in the stages. Qwen3.6-35B-A3B on a B70 + RTX 4070 split at layer 20, 4 slots: 89.3 tokens/s in 2 groups, against 66.1 in one group without drafts and 69.2 with them.
+- On a layer split the slots run in groups pipelined through the stages, as Qwen3.8-Flash-Next's (`--batch-groups G` or `auto`, `auto` by default there): each stage computes another group at once. The groups' windows carry no drafts, so `--batch-mtp` is off then (`--batch-groups 1` or `XESTRATA_BATCH_MTP_SERIAL=1` keeps one group with them; `auto`, the default, is the pipelined groups). No adaptive round starts while groups are in the stages. Qwen3.6-35B-A3B on a B70 + RTX 4070 split at layer 20, 4 slots: 89.3 tokens/s in 2 groups, against 66.1 in one group without drafts and 69.2 with them.
 
 `tools/batch_test.py` (greedy) with 4 slots on the B70:
 

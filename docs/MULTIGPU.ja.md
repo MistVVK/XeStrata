@@ -130,7 +130,7 @@ G は N を割り切る数です。
 層の分割で `--batch-groups` を渡さなければ、既定は `auto` です（upstream ca001df5。組を 1 つにするには `--batch-groups 1`）。
 既定の組は `--batch-mtp`（`--mtp` があれば既定で有効）に譲らず、そのとき `--batch-mtp` を切って、そうログに出します（upstream a0116b27）。
 組に分けたウィンドウは MTP の下書きを確かめませんが、2x RTX A4000 の 4 本の同時の要求では、組に分けたほうが MTP の下書きを確かめる 1 組より 25〜30% 速かったためです。
-`--batch-groups 1` か `XESTRATA_BATCH_MTP_SERIAL=1` で、前と同じく 1 組で `--batch-mtp` を使います（同時の要求が少ないときや、prompt がまれにしか来ないときは、こちらが速いことがあります）。
+`--batch-groups 1` か `XESTRATA_BATCH_MTP_SERIAL=1` で、前と同じく 1 組で `--batch-mtp` を使います（同時の要求が少ないときや、prompt がまれにしか来ないときは、こちらが速いことがあります）。`XESTRATA_BATCH_MTP_SERIAL` の `auto`（既定）は流れ作業の組です。
 `XESTRATA_PIPED_MTP=N`（明示的に有効にする機能）を付けると、組に分けたまま各スロットが MTP の下書きを確かめます（[BATCHING](BATCHING.ja.md#流れ作業の組でも-mtp-の下書きを確かめるxestrata_piped_mtp明示的に有効にする機能)）。
 エンジンが選んだ組の数はログと `INFO batch_groups` に出て、サーバーはそれに合わせてスロットを割り当てます。
 組の中の使用中のスロットより前が空いていれば、そのスロットを先に使います（upstream 2c7c02ab）。
