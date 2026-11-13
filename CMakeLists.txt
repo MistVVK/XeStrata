@@ -434,6 +434,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(own_only_line_test PRIVATE include)
   add_test(NAME own_only_line_test COMMAND own_only_line_test)
 
+  # the opt-in fused-kernel switches a build without MMQ turns on by default, per backend (header-only, no GPU)
+  add_executable(own_only_switches_test tests/prefill/own_only_switches_test.cpp)
+  target_include_directories(own_only_switches_test PRIVATE include)
+  add_test(NAME own_only_switches_test COMMAND own_only_switches_test)
+
   # how many tokens the FP16 expert path's buffers (Xs, Hh) are sized for: the tail below the stream floor in a fused layout, the full chunk elsewhere (header-only, no GPU)
   add_executable(fp16_rows_rule_test tests/prefill/fp16_rows_rule_test.cpp)
   target_include_directories(fp16_rows_rule_test PRIVATE include)
