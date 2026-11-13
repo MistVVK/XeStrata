@@ -409,6 +409,26 @@
   ],
   "repo": "AtomicChat/Qwen3.8-Flash-Next-GGUF"
  },
+ "unsloth/UD-IQ1_M": {
+  "arch": "qwen4exp",
+  "tensors": 1224,
+  "bytes": 67996070400,
+  "expert_bytes": {
+   "IQ2_S": 9673113600,
+   "IQ2_XS": 3394764800,
+   "IQ2_XXS": 9948364800,
+   "IQ4_NL": 943718400,
+   "Q2_0": 10852761600
+  },
+  "experts_bpw": 2.306,
+  "bpw": 3.074,
+  "files": [
+   "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf",
+   "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf",
+   "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf"
+  ],
+  "repo": "unsloth/Qwen3.8-Flash-Next-GGUF"
+ },
  "_roles": {
   "blk.N.attn_gate.weight": [
    "IQ3_S",

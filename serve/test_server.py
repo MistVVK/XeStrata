@@ -824,6 +824,22 @@ class ListenProblem(unittest.TestCase):
         self.assertIn("10.9.9.9 is not an address of this PC", text)
         self.assertNotIn("already in use", text)
 
+    def test_a_denied_port_names_the_cause_of_that_system(self):
+        """upstream 8768e95f: Windows keeps ranges of ports for Hyper-V, WSL and Docker; Linux and macOS keep none, and
+        what does not let the server listen there is a port below 1024."""
+        import errno
+        from serve.server import listen_problem
+        win = listen_problem("127.0.0.1", 80, OSError(errno.EACCES, "denied"), windows=True)
+        self.assertIn("Windows may keep this port for itself", win)
+        self.assertIn("excludedportrange", win)
+        for port in (80, 8080):
+            other = listen_problem("127.0.0.1", port, OSError(errno.EACCES, "denied"), windows=False)
+            self.assertIn(f"does not let XeStrata use port {port}", other)
+            self.assertIn("ports below 1024 need administrator rights", other)
+            self.assertIn("different --port, for example 8801", other)
+            self.assertNotIn("Hyper-V", other)
+            self.assertNotIn("netsh", other)
+
 
 def shutil_rmtree(path):
     import shutil

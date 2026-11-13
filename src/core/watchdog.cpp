@@ -10,6 +10,7 @@
 #include "strata/platform/env.hpp"
 #include "strata/platform/thread_name.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -24,6 +25,8 @@
 #if defined(_WIN32)
 #include <windows.h>
 #include <psapi.h>
+#include <tlhelp32.h>
+#include <dbghelp.h>
 #endif
 
 namespace strata::core {
@@ -173,6 +176,126 @@ int64_t gpu_pause_now() {
 
 }  // namespace
 
+#if defined(_WIN32)
+// XESTRATA_STALL_STACKS=1: the call stack of every other thread, in the stall report (upstream dbf6a6bb6).  The other
+// threads are suspended while their stacks are unwound with the unwind tables (RtlLookupFunctionEntry /
+// RtlVirtualUnwind: no heap, no loader lock, no stdio), into static storage; the threads run again before anything is
+// looked up or printed.  The engine's own module's frames are then named from its PDB (dbghelp, when the PDB lies
+// beside the exe); other modules are printed as module+offset.
+namespace stall_stacks {
+constexpr int kMaxThreads = 256, kMaxFrames = 32, kMaxMods = 128;
+struct Mod { uint64_t base; uint64_t size; char name[64]; };
+struct Stack { DWORD tid; int n; uint64_t pc[kMaxFrames]; };
+static Mod g_mods[kMaxMods];
+static Stack g_stacks[kMaxThreads];
+static int g_nmods = 0, g_nstacks = 0;
+
+static void collect() {
+    g_nmods = g_nstacks = 0;
+    HMODULE hm[kMaxMods];
+    DWORD need = 0;
+    if (K32EnumProcessModules(GetCurrentProcess(), hm, sizeof hm, &need)) {
+        const int n = std::min<int>(kMaxMods, (int) (need / sizeof(HMODULE)));
+        for (int i = 0; i < n; ++i) {
+            MODULEINFO mi{};
+            char path[MAX_PATH] = {};
+            if (!K32GetModuleInformation(GetCurrentProcess(), hm[i], &mi, sizeof mi)) continue;
+            K32GetModuleFileNameExA(GetCurrentProcess(), hm[i], path, MAX_PATH);
+            const char* base = path;
+            for (const char* p = path; *p; ++p)
+                if (*p == '\\' || *p == '/') base = p + 1;
+            Mod& m = g_mods[g_nmods++];
+            m.base = (uint64_t) (uintptr_t) mi.lpBaseOfDll;
+            m.size = mi.SizeOfImage;
+            std::snprintf(m.name, sizeof m.name, "%s", base);
+        }
+    }
+    const DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+    THREADENTRY32 te{};
+    te.dwSize = sizeof te;
+    static DWORD tids[kMaxThreads];
+    int nt = 0;
+    if (Thread32First(snap, &te)) {
+        do {
+            if (te.th32OwnerProcessID == pid && te.th32ThreadID != me && nt < kMaxThreads) tids[nt++] = te.th32ThreadID;
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    for (int i = 0; i < nt; ++i) {
+        HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tids[i]);
+        if (th == nullptr) continue;
+        if (SuspendThread(th) == (DWORD) -1) { CloseHandle(th); continue; }
+        Stack& s = g_stacks[g_nstacks];
+        s.tid = tids[i];
+        s.n = 0;
+        alignas(16) CONTEXT ctx;
+        std::memset(&ctx, 0, sizeof ctx);
+        ctx.ContextFlags = CONTEXT_FULL;
+        if (GetThreadContext(th, &ctx)) {
+            for (int k = 0; k < kMaxFrames && ctx.Rip != 0; ++k) {
+                s.pc[s.n++] = ctx.Rip;
+                DWORD64 base = 0;
+                RUNTIME_FUNCTION* fe = RtlLookupFunctionEntry(ctx.Rip, &base, nullptr);
+                if (fe == nullptr) {                       // a leaf: the return address is at the stack pointer
+                    if (ctx.Rsp == 0) break;
+                    ctx.Rip = *(const DWORD64*) ctx.Rsp;
+                    ctx.Rsp += 8;
+                } else {
+                    PVOID hd = nullptr;
+                    DWORD64 est = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, base, ctx.Rip, fe, &ctx, &hd, &est, nullptr);
+                }
+            }
+            ++g_nstacks;
+        }
+        ResumeThread(th);
+        CloseHandle(th);
+    }
+}
+
+static void print(std::FILE* f) {
+    using SymInitializeFn = BOOL(WINAPI*)(HANDLE, const char*, BOOL);
+    using SymFromAddrFn = BOOL(WINAPI*)(HANDLE, DWORD64, DWORD64*, SYMBOL_INFO*);
+    using SymSetOptionsFn = DWORD(WINAPI*)(DWORD);
+    SymFromAddrFn sym_from = nullptr;
+    if (HMODULE dbg = LoadLibraryA("dbghelp.dll")) {
+        auto init = (SymInitializeFn) GetProcAddress(dbg, "SymInitialize");
+        auto setopt = (SymSetOptionsFn) GetProcAddress(dbg, "SymSetOptions");
+        sym_from = (SymFromAddrFn) GetProcAddress(dbg, "SymFromAddr");
+        if (setopt) setopt(0x2 /*SYMOPT_UNDNAME*/ | 0x10 /*SYMOPT_DEFERRED_LOADS*/ | 0x20000 /*SYMOPT_NO_PROMPTS*/);
+        if (init == nullptr || !init(GetCurrentProcess(), nullptr, TRUE)) sym_from = nullptr;
+    }
+    const uint64_t own = (uint64_t) (uintptr_t) GetModuleHandleW(nullptr);   // this program's own frames get names
+    std::fprintf(f, "  thread stacks (XESTRATA_STALL_STACKS=1; innermost first; this program's frames named from its "
+                    "PDB when it is beside the exe):\n");
+    for (int i = 0; i < g_nstacks; ++i) {
+        const Stack& s = g_stacks[i];
+        std::fprintf(f, "  thread %lu:\n", (unsigned long) s.tid);
+        for (int k = 0; k < s.n; ++k) {
+            const uint64_t pc = s.pc[k];
+            const Mod* m = nullptr;
+            for (int j = 0; j < g_nmods; ++j)
+                if (pc >= g_mods[j].base && pc < g_mods[j].base + g_mods[j].size) { m = &g_mods[j]; break; }
+            char nm[200] = {};
+            if (m != nullptr && sym_from != nullptr && m->base == own) {
+                alignas(8) char buf[sizeof(SYMBOL_INFO) + 160] = {};
+                SYMBOL_INFO* si = reinterpret_cast<SYMBOL_INFO*>(buf);
+                si->SizeOfStruct = sizeof(SYMBOL_INFO);
+                si->MaxNameLen = 160;
+                DWORD64 disp = 0;
+                if (sym_from(GetCurrentProcess(), pc, &disp, si))
+                    std::snprintf(nm, sizeof nm, " %s+0x%llx", si->Name, (unsigned long long) disp);
+            }
+            if (m != nullptr) std::fprintf(f, "    %s+0x%llx%s\n", m->name, (unsigned long long) (pc - m->base), nm);
+            else std::fprintf(f, "    0x%llx\n", (unsigned long long) pc);
+        }
+    }
+}
+}  // namespace stall_stacks
+#endif
+
 std::string stage_text() {
     const Progress& p = progress();
     std::string s = std::string(p.where.load()) + " " + std::to_string((long long) p.detail.load());
@@ -185,6 +308,11 @@ void watchdog_note_request_vram(int64_t free_mib) { g_req_vram_free_mib.store(fr
 void watchdog_note_request_gpu_pause() { g_req_gpu_pause_ms.store(gpu_pause_now()); }
 
 void stall_report(std::FILE* f, uint64_t layers_during) {
+#if defined(_WIN32)
+    const char* stacks = strata::env_get("STALL_STACKS");
+    const bool want_stacks = stacks != nullptr && stacks[0] == '1';
+    if (want_stacks) stall_stacks::collect();   // first: the stacks as they were when the stall was noticed
+#endif
     Progress& p = progress();
     std::fprintf(f, "xestrata serve: stall report (engine %s): stage \"%s\" for %lld s; %llu layers served since the "
                     "last finished step (0 = stopped, more = slow)\n", STRATA_VERSION, stage_text().c_str(),
@@ -194,6 +322,9 @@ void stall_report(std::FILE* f, uint64_t layers_during) {
         std::fprintf(f, "  VRAM free when this request began: %lld MiB (a card the driver must move memory off of is "
                         "a cause of a window that never finishes: a larger --vram-reserve-mib leaves room)\n",
                      (long long) vf);
+#if defined(_WIN32)
+    if (want_stacks) stall_stacks::print(f);   // as they were when the stall was noticed, not as they are now
+#endif
     int64_t gpu_pause_before = -1;   // the GPU pause counter at the first pass, for the change over the 2 s
     for (int pass = 0; pass < 2; ++pass) {
         if (pass == 1) {
