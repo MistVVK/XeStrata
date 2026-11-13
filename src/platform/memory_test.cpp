@@ -110,7 +110,10 @@ int main() {
     const strata::platform::LockResult r = strata::platform::lock_resident(p, bytes);
     std::printf("lock_resident: ok=%d locked=%llu MiB (%s)\n", (int) r.ok, (unsigned long long) (r.locked_bytes >> 20),
                 r.note.c_str());
-    int fail = !(r.ok && r.locked_bytes == bytes) | fail_keeps;
+    // The system refused the lock (a container or a shell with a small `ulimit -l`: RLIMIT_MEMLOCK of 8 MiB, no CAP_IPC_LOCK): nothing was locked, so the
+    // lock itself cannot be tested here.  The cases above still count; the test then reports "skipped" (exit 77) with the reason, not a failure.
+    const bool lock_refused = !r.ok && r.locked_bytes == 0;
+    int fail = (lock_refused ? 0 : !(r.ok && r.locked_bytes == bytes)) | fail_keeps;
 #if defined(_WIN32)
     PROCESS_MEMORY_COUNTERS pmc{};
     GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof pmc);
@@ -119,6 +122,11 @@ int main() {
 #endif
     strata::platform::unlock_resident(p, bytes);
     std::free(p);
+    if (!fail && lock_refused) {
+        std::printf("platform_memory_test: SKIPPED, the system refused to lock %llu MiB (%s); raise the memory-lock limit to run it\n",
+                    (unsigned long long) (bytes >> 20), r.note.c_str());
+        return 77;
+    }
     std::printf("platform_memory_test: %s\n", fail ? "FAILED" : "OK");
     return fail;
 }

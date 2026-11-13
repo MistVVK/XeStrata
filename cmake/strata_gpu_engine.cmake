@@ -1207,6 +1207,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(platform_memory_test src/platform/memory_test.cpp)
   target_link_libraries(platform_memory_test PRIVATE strata_core ${_strata_gpu_runtime_target})
   add_test(NAME platform_memory_test COMMAND platform_memory_test)
+  set_tests_properties(platform_memory_test PROPERTIES SKIP_RETURN_CODE 77)   # the system refused to lock the region (small memory-lock limit): skipped, with the reason printed
 
   # The pinned-memory headroom (pin_budget.hpp) against a simulated ceiling; skips without a GPU.
   add_executable(pin_budget_test src/core/pin_budget_test.cpp)
