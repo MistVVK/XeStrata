@@ -257,13 +257,14 @@ Its license is the Swift Open License 1.0: read it on the model page.
 ./setup.sh --setup --family swift --model IQ2_XS
 ```
 
-### Or: Unsloth's Dynamic v3.1 (UD-Q2_0 to UD-IQ4_XS)
+### Or: Unsloth's Dynamic v3.1 (UD-IQ1_M to UD-IQ4_XS)
 
-**[Unsloth's Dynamic v3.1](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)** (2026-11-04) are 2- to 4-bit versions of the original model (upstream #621's UD-IQ4_XS is now this version too).
+**[Unsloth's Dynamic v3.1](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)** (2026-11-04) are 1- to 4-bit versions of the original model (upstream #621's UD-IQ4_XS is now this version too).
 The experts' gate and up are IQ2_XXS to IQ4_XS and their downs Q2_0, IQ4_NL and Q5_0; the n-gram table is in the last shard (IQ4_NL).
 
 | Size | Download | Experts | RAM that holds them all |
 | --- | ---: | ---: | ---: |
+| UD-IQ1_M | 68.0 GB | 34.8 GB | about 59 GB |
 | UD-Q2_0 | 70.5 GB | 37.4 GB | about 61 GB |
 | UD-IQ2_XS | 75.8 GB | 42.3 GB | about 66 GB |
 | UD-Q2_K_XL | 79.6 GB | 46.0 GB | about 70 GB |
@@ -2259,7 +2260,7 @@ The web app's About > Model terms shows the full terms of the models it runs now
   The Coder: [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)
   (Apache-2.0 per its card); its support in Strata came from @pjgmobile's PR #54.
   Swift 1.5: [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF) by UkisAI.
-  UD-Q2_0 to UD-Q4_K_XL (Dynamic v3.1), UD-Q5_K_XL, UD-Q6_K_XL and Q8_0: [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) by Unsloth.
+  UD-IQ1_M to UD-Q4_K_XL (Dynamic v3.1), UD-Q5_K_XL, UD-Q6_K_XL and Q8_0: [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) by Unsloth.
   Gyro: [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) by agentionai;
   Gyro-Coder: [agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF), also by agentionai.
   The abliterated versions: [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF) by huihui-ai;

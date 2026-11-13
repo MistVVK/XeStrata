@@ -63,6 +63,10 @@ FALLBACK_MODELS = {
               "families": ("qwen", "swift", "sc117", "sc117-swift")},
     "IQ1_M": {"about": "the Coder's only size: half the experts, stored like IQ3_S (3.5 bits)", "download_gb": 58.4,
               "ram_gb": 32, "arena_gb": 23.4, "families": ("coder",)},
+    "UD-IQ1_M": {"about": "~1-bit (Unsloth Dynamic v3.1), the smallest download; on a PC with less than ~59 GB of RAM "
+                          "part of its experts are read from the SSD",
+                 "download_gb": 68.0, "ram_gb": 48, "arena_gb": 34.8, "families": ("unsloth",), "budget": True,
+                 "vision": True},
     "UD-Q2_0": {"about": "2-bit (Unsloth Dynamic v3.1), experts a little larger than the GSQ-RCO IQ2_XS's; on a PC "
                          "with less than ~61 GB of RAM part of its experts are read from the SSD",
                 "download_gb": 70.5, "ram_gb": 48, "arena_gb": 37.4, "families": ("unsloth",), "budget": True,
@@ -129,7 +133,7 @@ FALLBACK_FAMILIES = {
                                              "authors' numbers)", "tag": "swift-"},
     "coder": {"title": "Qwen3.8-Flash-Next Coder", "about": "half the experts (code, tools, images kept): needs ~32 GB "
                                                             "of RAM, faster; weaker outside coding", "tag": "coder-"},
-    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "about": "2 to 4 bits (UD-Q2_0 to UD-Q4_K_XL, 71 to 111 GB "
+    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "about": "1 to 4 bits (UD-IQ1_M to UD-Q4_K_XL, 68 to 111 GB "
                                                                   "downloads) and 5 to 8 bits; with too little RAM "
                                                                   "part of the experts are read from the SSD",
                 "tag": "unsloth-", "vision": False},

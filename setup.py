@@ -548,6 +548,10 @@ MODELS: dict[str, dict[str, Any]] = {
     # same file for the sizes of three shards, and for those of four).  A RAM budget of the experts, the rest read
     # from the GGUF files in place; "about" gives the RAM that holds them all ("arena_gb" + UNSLOTH_RAM_LEFT_GB).
     # Not run here.  Images: the same base model and encoder
+    "UD-IQ1_M": {"about": "~1-bit (Unsloth Dynamic v3.1), the smallest download; on a PC with less than ~59 GB of RAM "
+                          "part of its experts are read from the SSD",
+                 "download_gb": 68.0, "ram_gb": 48, "arena_gb": 34.8, "families": ("unsloth",), "budget": True,
+                 "shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "vision": True},
     "UD-Q2_0": {"about": "2-bit (Unsloth Dynamic v3.1), experts a little larger than the GSQ-RCO IQ2_XS's; on a PC "
                          "with less than ~61 GB of RAM part of its experts are read from the SSD",
                 "download_gb": 70.5, "ram_gb": 48, "arena_gb": 37.4, "families": ("unsloth",), "budget": True,
@@ -639,6 +643,12 @@ MODELS: dict[str, dict[str, Any]] = {
 # LFS pointers, checked after the download (check_shards reads the other model files' directories; these are also
 # hashed once).
 UNSLOTH_V31_SHARDS = {
+    "Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf":
+        (10946618, "b0d883bb9464021f31074145af74bfc2aa2d4bf0cf506f26f6f5107f4ca6ce17"),
+    "Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf":
+        (39196009888, "bddcd79634ccddbb2e0951345c73c6ae8bd7b12594f55a2a529474701757391e"),
+    "Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf":
+        (28800138432, "05716382c280d999b81afff92b2d527fadbfd926ac225ffdc273f2d1d13331c6"),
     "Qwen3.8-Flash-Next-UD-Q2_0-00001-of-00003.gguf":
         (10946618, "38803c4e8d13077165aa9854502b3d4e7fef750e72a21d27a38ee42089f96ad6"),
     "Qwen3.8-Flash-Next-UD-Q2_0-00002-of-00003.gguf":
@@ -926,7 +936,7 @@ FAMILIES: dict[str, dict[str, Any]] = {
     # Unsloth's Dynamic v3.1 from 2 to 4 bits (UD-Q2_0 to the EXPERIMENTAL UD-Q4_K_XL) and the 5- to 8-bit files of
     # the original model; "shards", "experimental" and "vision" are per model (MODELS)
     "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "by": "Unsloth's Dynamic v3.1 quantizations",
-                "about": "2 to 4 bits (UD-Q2_0 to UD-Q4_K_XL, 71 to 111 GB downloads) and 5 to 8 bits; with too "
+                "about": "1 to 4 bits (UD-IQ1_M to UD-Q4_K_XL, 68 to 111 GB downloads) and 5 to 8 bits; with too "
                          "little RAM part of the experts are read from the SSD",
                 "hf": hf("unsloth/Qwen3.8-Flash-Next-GGUF") + "{q}/",
                 "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00004.gguf", "shards": 4, "tag": "unsloth-",
@@ -4058,8 +4068,12 @@ def gguf_dir_shards(folder: Path, fam: dict, model: str) -> list[Path]:
 GGUF_QUANT = re.compile(r"(?<![A-Za-z0-9])((?:UD-)?(?:I?Q\d+(?:_[A-Za-z0-9]+)*|BF16|F16|F32))"
                         r"(?=-\d{5}-of-\d{5}\.gguf$|\.gguf$)", re.I)
 SUPPORTED_GGUFS = ("XeStrata runs ISTA-DASLab's GSQ-RCO files (Qwen3.8-Flash-Next Q2_0, IQ2_XS, IQ3_XXS, IQ3_S; Swift "
-                   "1.5's; the Coder's IQ1_M) and Unsloth's (UD-Q2_0 to UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL, Q8_0) "
-                   "only: other GGUFs (K-quants of other makers) cannot be used")
+                   "1.5's; the Coder's IQ1_M) and Unsloth's (UD-IQ1_M, UD-Q2_0, UD-IQ2_XS, UD-Q2_K_XL, UD-IQ3_XXS, "
+                   "UD-Q3_K_XL, UD-IQ4_XS, UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL, Q8_0) only: other GGUFs (Unsloth's "
+                   "UD-IQ1_S, K-quants of other makers) cannot be used")
+# why a GGUF of a name XeStrata knows is still refused (said beside SUPPORTED_GGUFS)
+UNSUPPORTED_WHY = {"UD-IQ1_S": "UD-IQ1_S mixes two expert formats in one layer, which XeStrata cannot load; "
+                               "UD-IQ1_M is the 1-bit choice"}
 
 
 def gguf_unsupported(name: str) -> str | None:
@@ -4085,7 +4099,9 @@ def gguf_dir_problem(folder: Path, first: Path, fam: dict, model: str) -> tuple 
     folder without GGUFs stays check_shards' "missing")."""
     bad = gguf_unsupported(first.name) if first.exists() else None
     if bad:
-        return f"{first.name} is {bad}, a GGUF XeStrata cannot run", SUPPORTED_GGUFS
+        why = UNSUPPORTED_WHY.get(bad.upper())
+        return (f"{first.name} is {bad}, a GGUF XeStrata cannot run",
+                SUPPORTED_GGUFS + (".\n       " + why if why else ""))
     if first.exists():
         return None
 
@@ -4101,6 +4117,9 @@ def gguf_dir_problem(folder: Path, first: Path, fam: dict, model: str) -> tuple 
     hint = SUPPORTED_GGUFS
     if unusable:
         hint += ".\n       Not usable here: " + ", ".join(unusable)
+        for q in dict.fromkeys(gguf_unsupported(n) for n in unusable):
+            if q and q.upper() in UNSUPPORTED_WHY:
+                hint += ".\n       " + UNSUPPORTED_WHY[q.upper()]
     if usable:
         hint += ".\n       Usable here: " + ", ".join(f"--family {f} --model {m}" for f, m in usable)
     return f"{folder} has no {fam['title']} {model} file", hint
