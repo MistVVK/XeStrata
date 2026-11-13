@@ -7843,10 +7843,9 @@ def parallel_note(asked: int | None, vram_gb: float, arena_gb: float, ctx: int, 
         if not rec:
             return [f"Several requests at once: one at a time on this machine - {PARALLEL_COST_NOTE} "
                     "(docs/BATCHING.md)."]
-        return [f'Several requests at once: auto (the default) - this machine holds {rec} (the config\'s "parallel": '
-                f'{rec} fixes it; each slot takes ~{slot:.1f} GB of VRAM from the expert cache; docs/BATCHING.md). '
-                'Without the key the server chooses from the card\'s VRAM and the experts\' size, and measures the '
-                "first requests"]
+        return [f'Several requests at once: off in "auto" (the default) - a slot takes VRAM from the expert cache, '
+                f'which a request alone pays for. This machine holds {rec}: the config\'s "parallel": {rec} starts '
+                f"them (each slot takes ~{slot:.1f} GB; docs/BATCHING.md)"]
     lines = [f"parallel requests: {asked} at once (each takes ~{slot:.1f} GB of VRAM from the expert cache, "
              f"{asked * slot:.1f} GB in all)"]
     used = asked if batch_mtp else min(asked, PARALLEL_MAX)
@@ -8141,8 +8140,9 @@ def replicas_config(a, cfg: dict) -> None:
         if not cfg.get("replicas"):
             n = autotune.replicas(autotune.read(cfg), cfg)
             if n >= 2:
-                ok(f"replicas: auto - {n} engines, one on each card (the model fits one card, and the RAM holds a copy "
-                   "of its experts for each; the server chooses at every start)")
+                ok(f"replicas: this machine could run {n} engines, one on each card (the model fits one card, and the "
+                   f'RAM holds a copy of its experts for each); "replicas": {n} runs them - the server does not choose '
+                   "them by itself, since a request alone is faster on the layer split")
         return
     if a.replicas < 2:
         return

@@ -102,19 +102,43 @@ class Conversation(unittest.TestCase):
 
 
 class Resolve(unittest.TestCase):
-    """The plan: every "auto" chosen, the user's own values kept, the config left as it was."""
+    """The plan: every "auto" chosen, the user's own values kept, the config left as it was.  "auto" never takes the
+    slots or re-divides the cards: both cost the one user a server mostly has."""
     CFG = {"args": ["--native", "/nonexistent/model.gguf", "--max-context", "32768", "--mtp", "/m/mtp.gguf"],
            "gpu_pci": "0000:03:00.0", "model_gb": 71.0, "experts_gb": 50.0}
 
-    def test_the_machines_choices(self):
+    def test_auto_keeps_one_request_at_a_time(self):
+        # a 64 GB card holds 4 slots beside the experts, and "auto" still starts none of them: a request alone would
+        # take the smaller expert cache
         plan = A.resolve(self.CFG, machine(vram=(64.0,)))
-        self.assertEqual(plan.cfg["parallel"], 4)
+        self.assertEqual(A.parallel(machine(vram=(64.0,))), 4)          # what the machine could hold
+        self.assertEqual(plan.cfg["parallel"], 1)
+        self.assertTrue(any('"parallel": 4' in x for x in plan.notes))
         self.assertNotIn("batch_groups", plan.cfg)                     # one card: one group
         self.assertIs(plan.cfg["vram_elastic"], False)                 # nothing borrows the VRAM
         self.assertNotIn("conversation_cache_mib", plan.cfg)           # the engine sizes it
         self.assertIs(plan.cfg["split_skip_if_fits"], False)           # one card: no layer split
-        self.assertIn("parallel", plan.auto)
         self.assertEqual(len(plan.notes), 7)
+
+    def test_auto_does_not_re_divid_the_cards(self):
+        # two 32 GB cards that each hold the model, and the RAM for two copies: replicas would pay for conversations,
+        # but a request alone is slower there - "auto" keeps the layer split
+        m = machine(vram=(32.0, 32.0), ram=128.0)
+        self.assertEqual(A.replicas(m, self.CFG), 2)                    # what the machine could do
+        plan = A.resolve(self.CFG, m)
+        self.assertNotIn("replicas", plan.cfg)
+        self.assertNotIn("split_serve", plan.cfg)
+        self.assertEqual(plan.cfg["parallel"], 1)
+        self.assertTrue(any('"replicas": 2' in x for x in plan.notes))
+
+    def test_auto_offers_split_serving_but_does_not_take_it(self):
+        # two cards that each hold the model, and the RAM for one copy of the experts: split serving could read the
+        # prompts on the second card, but a request alone is made on one there
+        m = machine(vram=(32.0, 32.0), ram=64.0)
+        self.assertIsNotNone(A.split_serve(m, self.CFG))
+        plan = A.resolve(self.CFG, m)
+        self.assertNotIn("split_serve", plan.cfg)
+        self.assertTrue(any('"split_serve"' in x for x in plan.notes))
 
     def test_the_users_values_are_kept(self):
         cfg = {**self.CFG, "parallel": 2, "vram_elastic": True, "conversation_cache_mib": 1024,
@@ -127,26 +151,22 @@ class Resolve(unittest.TestCase):
         self.assertEqual(plan.cfg["replicas"], cfg["replicas"])
         self.assertEqual(plan.cfg["batch_groups"], 2)
         self.assertIs(plan.cfg["split_skip_if_fits"], False)
-        self.assertNotIn("parallel", plan.auto)
         self.assertTrue(any("as the config says" in x for x in plan.notes))
 
     def test_off_is_the_users_too(self):
         plan = A.resolve({**self.CFG, "parallel": 1, "vram_elastic": False}, machine(vram=(64.0,)))
         self.assertEqual(plan.cfg["parallel"], 1)
         self.assertIs(plan.cfg["vram_elastic"], False)
-        self.assertNotIn("parallel", plan.auto)
 
     def test_the_config_passed_in_is_left_alone(self):
         before = dict(self.CFG)
         A.resolve(self.CFG, machine(vram=(64.0,)))
         self.assertEqual(self.CFG, before)
 
-    def test_replicas_turn_the_others_off(self):
-        plan = A.resolve(self.CFG, machine(vram=(32.0, 32.0), ram=128.0))
-        self.assertEqual(plan.cfg["replicas"], 2)
-        self.assertNotIn("split_serve", plan.cfg)
-        self.assertEqual(plan.cfg["parallel"], 3)                      # each replica's own card holds 3 slots
-        self.assertIs(plan.cfg["split_skip_if_fits"], False)
+    def test_a_replica_counts_the_slots_of_its_own_card(self):
+        plan = A.resolve({**self.CFG, "replicas": 2}, machine(vram=(32.0, 32.0), ram=128.0))
+        self.assertEqual(plan.cfg["replicas"], 2)                      # the user's
+        self.assertEqual(plan.cfg["parallel"], 1)                      # "auto" still starts none
 
     def test_a_layer_split_point_of_the_users_is_kept(self):
         plan = A.resolve({**self.CFG, "split_pci": ["0000:09:00.0"], "layer_split": "24"},
@@ -154,14 +174,7 @@ class Resolve(unittest.TestCase):
         self.assertIs(plan.cfg["split_skip_if_fits"], False)          # the split point is the user's: not skipped
         self.assertNotIn("replicas", plan.cfg)
         self.assertNotIn("split_serve", plan.cfg)
-        self.assertEqual(plan.cfg["parallel"], 4)                     # the split's two cards hold the slots together
-
-    def test_an_automatic_split_is_taken_as_the_machine_serves_it_better(self):
-        # two cards that each hold the model, and the RAM holds one copy of the experts: the split becomes split
-        # serving (the second card reads the prompts) rather than a layer split whose stages wait on each other
-        plan = A.resolve({**self.CFG, "split_pci": ["0000:09:00.0"]}, machine(vram=(32.0, 32.0), ram=64.0))
-        self.assertIn("split_serve", plan.cfg)
-        self.assertIs(plan.cfg["split_skip_if_fits"], False)
+        self.assertEqual(plan.cfg["parallel"], 1)
 
     def test_split_serving_steps_aside_for_the_configs_parallel(self):
         plan = A.resolve({**self.CFG, "split_pci": ["0000:09:00.0"], "parallel": 2},
@@ -170,10 +183,10 @@ class Resolve(unittest.TestCase):
         self.assertEqual(plan.cfg["parallel"], 2)
 
     def test_each_engine_holds_its_cache_in_pieces_only_on_one_card(self):
-        # split serving: each engine is on one card, so an image job may borrow its VRAM
-        plan = A.resolve({**self.CFG, "split_pci": ["0000:09:00.0"], "images": {"exe": "x"}},
-                         machine(vram=(32.0, 32.0), ram=64.0))
-        self.assertIn("split_serve", plan.cfg)
+        # a split serving the user set: each engine is on one card, so an image job may borrow its VRAM
+        plan = A.resolve({**self.CFG, "split_serve": {"prefill_gpu": "0000:03:00.0", "decode_gpu": "0000:09:00.0"},
+                          "images": {"exe": "x"}}, machine(vram=(32.0, 32.0), ram=64.0))
+        self.assertEqual(plan.cfg["split_serve"]["prefill_gpu"], "0000:03:00.0")
         self.assertIs(plan.cfg["vram_elastic"], True)
         # a layer split the user set: each card's cache cannot give its VRAM back
         plan = A.resolve({**self.CFG, "split_pci": ["0000:09:00.0"], "layer_split": "24", "images": {"exe": "x"}},
@@ -219,41 +232,6 @@ class Read(unittest.TestCase):
             m = A.read({"args": ["--native", "/m/plain.gguf", "--max-context", "32768"], "model_gb": 21.7})
         self.assertEqual(m.experts, 0.0)
         self.assertEqual(m.dense, 21.7)
-
-
-class Watch(unittest.TestCase):
-    """The measurement from the requests: alone against together, with a dead band and the median."""
-
-    def test_a_clear_gain_keeps_the_slots(self):
-        w = A.SlotsWatch()
-        for _ in range(3):
-            w.sample(50.0, [])
-            w.sample(None, [47.0, 46.0])
-        self.assertIs(w.decide(), True)
-        self.assertIs(w.sample(None, [10.0, 10.0]), True)          # decided: later samples change nothing
-
-    def test_no_gain_after_every_sample_turns_them_off(self):
-        w = A.SlotsWatch()
-        for _ in range(A.SlotsWatch.LIMIT):
-            w.sample(50.0, [])
-            w.sample(None, [26.0, 25.0])                            # the total is one alone: no gain
-        self.assertIs(w.decide(), False)
-
-    def test_the_rule_stands_without_enough_samples(self):
-        w = A.SlotsWatch()
-        for _ in range(A.SlotsWatch.LIMIT + 5):
-            w.sample(50.0, [])                                      # one user the whole time: nothing to compare
-        self.assertIsNone(w.decide())
-        for _ in range(A.SlotsWatch.LIMIT + 5):
-            w.sample(None, [50.0, 50.0])                            # together and clearly faster
-        self.assertIs(w.decide(), True)
-
-    def test_a_gain_within_noise_does_not_decide(self):
-        w = A.SlotsWatch()
-        for _ in range(5):
-            w.sample(50.0, [])
-            w.sample(None, [25.5, 25.0])
-        self.assertIsNone(w.decide())                               # 50.5 against 50: inside the band
 
 
 if __name__ == "__main__":

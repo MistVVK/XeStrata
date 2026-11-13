@@ -4375,11 +4375,6 @@ class Service:
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = True):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
-        # #465: the requests that decode together (the engine's batch slots).  The config's "parallel" is "auto" by
-        # default and serve/autotune.py chose it for this machine; watch_parallel() then measures from the requests
-        # whether decoding together pays here, and may bring it back to one at a time
-        self.parallel_slots = int(getattr(engine, "batch", 0) or 0)
-        self.slots_watch: autotune.SlotsWatch | None = None
         self.vision_error: str | None = None           # why the configured encoder did not start (images off)
         self.text_only: str | None = None              # why this model reads no images by design (the CPU's forward)
         self.vision_fallback: str | None = None        # why a later encoder serves instead of the configured one
@@ -5080,46 +5075,17 @@ class Service:
     def _image_shares_text(self) -> bool:
         return self._image_running() and self.image_gpu_mode() == "shared"
 
-    def watch_parallel(self) -> None:
-        """Measure from the requests whether decoding several together pays on this machine (the config left
-        "parallel" to the machine: serve/autotune.py chose the slots).  The first requests that run alone and the
-        first that run side by side give both sides of the comparison; a machine where the two together are no
-        faster than one runs one at a time from the next idle moment on.  The result is this run's: a restart measures
-        again."""
-        if self.parallel_slots > 1:
-            self.slots_watch = autotune.SlotsWatch()
-
-    def _watch_slots(self, alone, together: list) -> None:
-        """Feed the measurement (the status's samples, once a second) and settle it: `alone` is the speed of the one
-        request decoding on its own, `together` the speeds of those decoding side by side."""
-        w = self.slots_watch
-        if w is None:
-            return
-        w.sample(alone, together if len(together) > 1 else [])
-        if w.decide() is False and self.parallel_slots > 1:
-            with self.status_lock:
-                if self.live_reqs or self.status.get("busy"):     # a request is in a slot: from the next idle moment
-                    return
-            self.parallel_slots = 1
-            print(f"[xestrata] several requests: one at a time from now on - measured here, {len(w.alone)} samples "
-                  f"alone and {len(w.together)} together: two together did not raise the total over one request's "
-                  "speed (a restart measures again)", flush=True)
-
     def _tok_s(self):
         """tok/s over the last RATE_WINDOW_S seconds.  Returns 0.0 while nothing is generating.  With parallel requests:
         the sum of theirs."""
         with self.status_lock:
             many = [(dict(st), list(rt)) for st, rt in self.live_reqs.values()]
         if many:
-            rates = [self._rate_of(st, rt) for st, rt in many]
-            self._watch_slots(rates[0] if len(rates) == 1 else None, rates)
-            return sum(rates)
+            return sum(self._rate_of(st, rt) for st, rt in many)
         with self.status_lock:
             s = dict(self.status)
             rate = list(self.rate)
-        one = self._rate_of(s, rate)
-        self._watch_slots(one if one > 0 else None, [])
-        return one
+        return self._rate_of(s, rate)
 
     @staticmethod
     def _rate_of(s, rate):
@@ -5253,7 +5219,7 @@ class Service:
                 "tok_s_window_s": RATE_WINDOW_S if state == "generating" else None}
         if state == "reading" and progress:
             live["prompt_read"], live["prompt_total"] = progress
-        par = self.parallel_slots
+        par = int(getattr(self.engine, "batch", 0) or 0)
         if par:                                         # #465: the requests running together, slot by slot
             with self.status_lock:
                 running = len(self.live_reqs)
@@ -5380,9 +5346,8 @@ class Service:
             "started": int(self.started_at), "uptime_s": int(time.time() - self.started_at),
             "cache_max_tokens": ctx,
             "context": {"native": ctx, "max_positions": ctx},
-            # one request at a time (more wait their turn), or "parallel": N batch slots (#465) - and a machine where
-            # the measurement found them no faster than one runs one at a time (serve/autotune.py's SlotsWatch)
-            "concurrency": {"serving": max(1, self.parallel_slots),
+            # one request at a time (more wait their turn), or "parallel": N batch slots (#465)
+            "concurrency": {"serving": max(1, int(getattr(self.engine, "batch", 0) or 0)),
                             "requested": max(1, int(getattr(self.engine, "batch", 0) or 0))},
             "dialects": ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
             "vision": {"enabled": images or vision_error is not None, "available": images, "error": vision_error,
@@ -5985,7 +5950,7 @@ class Service:
         waiting = time.perf_counter()
         # #465: with "parallel" (the engine's batch slots) requests run at once: each keeps its own status and rate
         # window (self.status says busy while any runs); one at a time they are self.status / self.rate, as before
-        par = self.parallel_slots > 1
+        par = bool(getattr(self.engine, "batch", 0))
         st: dict = {} if par else self.status
         rate = collections.deque(maxlen=32) if par else self.rate
         with self.status_lock:
@@ -11747,14 +11712,14 @@ def _main() -> int:
     ap.add_argument("--replicas", type=int, default=None, metavar="N",
                     help="data-parallel replicas: cut the cards (\"gpu_pci\" and \"split_pci\") into N equal groups "
                          "and run one engine on each, requests spread over them (also \"replicas\" in the config: a "
-                         "number, [{\"gpus\": [\"0000:03:00.0\"]}, {\"gpus\": [\"0000:09:00.0\"]}], or \"auto\", the "
-                         "default: one engine per card when every card alone holds the model)")
+                         "number, [{\"gpus\": [\"0000:03:00.0\"]}, {\"gpus\": [\"0000:09:00.0\"]}]; \"auto\", the "
+                         "default, runs none and the start log says how many this machine could run)")
     ap.add_argument("--split-serve", default=None, metavar="PREFILL,DECODE",
                     help="split serving: one engine on the card PREFILL reads the prompt, a second on the card DECODE "
                          "makes the answer, the session handed over in RAM; the cards by PCI address "
                          "(0000:03:00.0,0000:09:00.0; also \"split_serve\" in the config: {\"prefill_gpu\": "
-                         "\"0000:03:00.0\", \"decode_gpu\": \"0000:09:00.0\"}, or \"auto\", the default, which "
-                         "chooses it for two cards that each hold the model; docs/MULTIGPU.md)")
+                         "\"0000:03:00.0\", \"decode_gpu\": \"0000:09:00.0\"}; \"auto\", the default, runs none "
+                         "and the start log says when two cards could; docs/MULTIGPU.md)")
     a = ap.parse_args()
     if a.engine == "strata":                            # the name upstream's scripts and older launchers pass
         a.engine = "xestrata"
@@ -11777,8 +11742,8 @@ def _main() -> int:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     # the settings the machine decides (serve/autotune.py): "parallel", "batch_groups", "vram_elastic",
     # "conversation_cache_mib", "replicas", "split_serve" and "split_skip_if_fits" are "auto" unless the config says
-    # otherwise.  The cards' VRAM, the RAM, their number and the model's size choose here; the first requests measure
-    # "parallel" (SlotsWatch).  An explicit value in the config is the user's own and is left as it is.
+    # otherwise.  The cards' VRAM, the RAM, their number and the model's size choose here, and the log says what each
+    # choice is.  An explicit value in the config is the user's own and is left as it is.
     plan = None
     if a.engine == "xestrata" and cfg:
         plan = autotune.resolve(cfg, autotune.read(cfg))
@@ -11919,8 +11884,6 @@ def _main() -> int:
                                                       and cfg.get("fit_max_tokens") is not False))
     svc.vision_error = vision_error
     svc.vision_fallback = vision_fallback
-    if plan is not None and "parallel" in plan.auto and isinstance(engine, StrataEngine):
-        svc.watch_parallel()                           # measure from the first requests whether the slots pay here
     eargs = [str(x) for x in cfg.get("args", [])]
     if "--device" in eargs[:-1] and eargs[eargs.index("--device") + 1] == "cpu":   # setup's model without a GPU
         svc.text_only = "the model runs on the CPU, which reads text only (a GPU reads images)"

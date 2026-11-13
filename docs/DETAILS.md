@@ -1491,7 +1491,7 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
 
 ### Current limits and sampling
 
-- One request at a time (several at once only when `"parallel"` chooses them for the machine, [BATCHING](BATCHING.md)), and one conversation's history in the KV cache at a time.
+- One request at a time (several at once only with `"parallel": N`, [BATCHING](BATCHING.md)), and one conversation's history in the KV cache at a time.
   Switching between two chats re-reads the part where they diverge unless parking is on; the shared prefix, such as the system prompt, is reused.
 - Images only when set up with them ([below](#images)); no video.
 - **Temperature, top_p, top_k, min_p and seed** are honored per request (OpenAI and Anthropic fields).

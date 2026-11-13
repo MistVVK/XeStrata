@@ -13,15 +13,15 @@ The same rule serves Qwen3.8-Flash-Next and the plain engine's models: it takes 
 facts, never the model's family.  Where the model's files are not known (a config written by hand), the choice is the
 conservative one.
 
-Nothing decided here is written to a file: a restart reads the machine again.  Where a machine can answer only by
-trying, the first requests decide (SlotsWatch), in the server's memory.
+Nothing decided here is written to a file: a restart reads the machine again.  "auto" chooses nothing that costs the
+one user a server mostly has - the batch slots stay off, and the cards are not re-divided - and the log says what the
+machine could do instead.
 
 setup.py imports the same rules, so what it says of a machine is what the server does on it.
 """
 from __future__ import annotations
 
 import copy
-import collections
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -288,7 +288,6 @@ def conversation_mib(cfg: dict):
 @dataclass
 class Plan:
     cfg: dict = field(default_factory=dict)   # the config with the choices made
-    auto: tuple = ()                          # the keys the machine decided (not the user's)
     notes: tuple = ()                         # one line per choice, for the server's window
 
 
@@ -314,39 +313,40 @@ def _parallel_asked(cfg: dict) -> bool:
 
 def resolve(cfg: dict, m: Machine) -> Plan:
     """The config with every "auto" chosen for this machine, and what was chosen (the log's lines).  An explicit
-    value in the config is the user's own and is left as it is."""
+    value in the config is the user's own and is left as it is.
+
+    "auto" never takes anything from the one user a server mostly has: the batch slots stay off (each takes VRAM from
+    the expert cache, which a request alone pays for), and the cards are not re-arranged into replicas or split
+    serving (a request alone is slower there than on the layer split, and no measurement of ours says otherwise).
+    The log says what this machine could do instead, and the key's own value does it."""
     c = copy.deepcopy(cfg)
     args = [str(a) for a in c.get("args") or []]
-    auto: list[str] = []
     notes: list[str] = []
 
-    # replicas: a model one card holds, one engine per card
+    # replicas: one engine per card serves several conversations, at a single request's speed
     want = c.get("replicas", AUTO)
     if _left_alone(want) or want is True:
-        auto.append("replicas")
         n = replicas(m, c)
         if n >= 2:
-            c["replicas"] = n
-            why = ("the model fits one card, and its experts are read from the files" if "--mmap-experts" in args else
-                   f"the model fits one card, and the RAM holds {n} copies of its experts")
-            notes.append(f"replicas: {n} engines, one on each card (auto: {why})")
+            notes.append(f"replicas: off (auto: {n} engines, one on each card, would serve {n} conversations at "
+                         f"once, but a request alone is slower there than on the layer split - the config's "
+                         f"\"replicas\": {n} runs them)")
         else:
             notes.append("replicas: off (auto: " + _no_replicas(m, c) + ")")
     elif isinstance(want, int) and not isinstance(want, bool) and want >= 2:
         notes.append(f"replicas: {want} engines, as the config says")
 
-    # split serving: the second card reads the prompts while the first answers
+    # split serving: the second card reads the prompts while the first answers; one request at a time
     want = c.get("split_serve", AUTO)
     if _left_alone(want) or want is True:
-        auto.append("split_serve")
         if _many_engines(c):
             notes.append("split_serve: off (replicas are on: both start engines on the cards)")
         else:
             spec = split_serve(m, c, busy=_split_busy(args) or _parallel_asked(c))
             if spec is not None:
-                c["split_serve"] = spec
-                notes.append(f"split_serve: on (auto: {spec['prefill_gpu']} reads the prompts while "
-                             f"{spec['decode_gpu']} answers)")
+                notes.append(f"split_serve: off (auto: {spec['prefill_gpu']} could read the prompts while "
+                             f"{spec['decode_gpu']} answers, but a request alone is made on one card there - a "
+                             "\"split_serve\" of the two cards runs it)")
             else:
                 notes.append("split_serve: off (auto: " + _no_split(m, c) + ")")
     elif isinstance(want, dict):
@@ -359,15 +359,14 @@ def resolve(cfg: dict, m: Machine) -> Plan:
         if (_many_engines(c) or c.get("split_serve")) and m.vram else m
     want = c.get("parallel", AUTO)
     if _left_alone(want) or want is True:
-        auto.append("parallel")
+        c["parallel"] = 1
         n = parallel(one) if not c.get("split_serve") else 0
         if n >= 2:
-            c["parallel"] = n
             slot = parallel_slot_gb(one.ctx, one.kv, one.streaming)
-            notes.append(f"parallel: {n} requests at once (auto: {sum(one.vram):.0f} GB of VRAM holds {n} sessions of "
-                         f"~{slot:.1f} GB beside half of the experts)")
+            notes.append(f"parallel: one at a time (auto: each slot takes ~{slot:.1f} GB of VRAM from the expert "
+                         f"cache, which a request alone pays for; this machine holds {n} - the config's "
+                         f"\"parallel\": {n} starts them)")
         else:
-            c["parallel"] = 1
             why = ("split serving runs one request at a time (a session file cannot carry the slots)"
                    if c.get("split_serve") else _no_parallel(one))
             notes.append("parallel: one at a time (auto: " + why + ")")
@@ -381,7 +380,6 @@ def resolve(cfg: dict, m: Machine) -> Plan:
 
     want = c.get("batch_groups", AUTO)
     if _left_alone(want) or want is True:
-        auto.append("batch_groups")
         g = groups(one, slots)
         if g == AUTO:
             c["batch_groups"] = AUTO
@@ -400,7 +398,6 @@ def resolve(cfg: dict, m: Machine) -> Plan:
     encoder = isinstance(vsec, dict) and vsec.get("gpu") is True
     borrower = bool(c.get("images")) or encoder
     if _left_alone(want):
-        auto.append("vram_elastic")
         e = elastic(one, borrower, encoder)
         c["vram_elastic"] = e
         notes.append("vram_elastic: " + ("on (auto: an image job or a GPU encoder borrows the VRAM between requests)"
@@ -413,7 +410,6 @@ def resolve(cfg: dict, m: Machine) -> Plan:
 
     # the conversation cache: the engine sizes it unless the config says otherwise
     if _left_alone(c.get("conversation_cache_mib")):
-        auto.append("conversation_cache_mib")
         notes.append("conversation_cache_mib: the engine sizes it from the RAM free once the model is loaded (auto)")
     else:
         mib = conversation_mib(c)
@@ -424,14 +420,13 @@ def resolve(cfg: dict, m: Machine) -> Plan:
     # the first card alone when it holds every profiled expert
     want = c.get("split_skip_if_fits", AUTO)
     if _left_alone(want):
-        auto.append("split_skip_if_fits")
         skip = len(m.vram) > 1 and not c.get("split_serve") and not _many_engines(c) and not _split_wanted(c)
         c["split_skip_if_fits"] = skip
         notes.append("split_skip_if_fits: " + ("on (auto: a layer split; the engine skips it when the first card "
                                                "holds every expert)" if skip else "off (auto: no layer split)"))
     elif isinstance(want, bool):
         notes.append(f"split_skip_if_fits: {'on' if want else 'off'}, as the config says")
-    return Plan(cfg=c, auto=tuple(auto), notes=tuple(notes))
+    return Plan(cfg=c, notes=tuple(notes))
 
 
 def _no_parallel(m: Machine) -> str:
@@ -483,54 +478,3 @@ def _split_busy(args: list) -> bool:
     if "--batch" in args[:-1] or "--slots" in args[:-1]:
         return True
     return "--prompt-cache" in args[:-1] and str(_arg(args, "--prompt-cache")).strip() == "0"
-
-
-# ------------------------------------------------------------------------------------------------ the measurement
-class SlotsWatch:
-    """Whether decoding requests together pays on this machine, from the requests themselves: the first requests give
-    both sides of the comparison - their speed alone, then the total while two of them decode side by side.  The
-    result stays in the server's memory.  A dead band and the median of several samples keep noise from deciding:
-    only a clear gain keeps more than one request decoding at a time, and turning them off takes every sample."""
-
-    BAND = 1.05        # the total must be this much above one request's speed: below it the slots do not pay
-    NEED = 3           # samples of each kind before a gain is believed
-    LIMIT = 30         # samples together after which no gain turns the slots off; past it the rule's choice stands
-
-    def __init__(self):
-        self.alone: collections.deque = collections.deque(maxlen=self.LIMIT)
-        self.together: collections.deque = collections.deque(maxlen=self.LIMIT)
-        self.verdict: bool | None = None
-        self.seen_alone = 0
-        self.seen_together = 0
-
-    def sample(self, alone, together) -> bool | None:
-        """One round: `alone` is the speed of the one request decoding (None: none alone), `together` the speeds of
-        the requests decoding side by side (two or more).  Returns the verdict when it is known."""
-        if self.verdict is not None:
-            return self.verdict
-        if alone is not None and alone > 0:
-            self.alone.append(float(alone))
-            self.seen_alone += 1
-        elif len(together) >= 2 and all(r > 0 for r in together):
-            self.together.append(float(sum(together)))
-            self.seen_together += 1
-        if len(self.alone) >= self.NEED and len(self.together) >= self.NEED:
-            one, many = _median(list(self.alone)), _median(list(self.together))
-            if many >= one * self.BAND:
-                self.verdict = True
-            elif self.seen_together >= self.LIMIT:
-                self.verdict = False           # every sample: requests together are no faster than one alone
-        return self.verdict
-
-    def decide(self) -> bool | None:
-        """The verdict for what has been seen; None while the requests have not shown both kinds enough.  With every
-        sample together seen and no clear answer, the rule's choice stands (True)."""
-        if self.verdict is None and self.seen_together >= self.LIMIT:
-            self.verdict = True
-        return self.verdict
-
-
-def _median(xs: list) -> float:
-    s = sorted(xs)
-    n = len(s)
-    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2

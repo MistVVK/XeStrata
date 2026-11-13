@@ -7,7 +7,6 @@ A fake engine (a Python script speaking the engine's GEN / BGEN / BT / BDONE / B
 real StrataEngine and Service, so the server's side is tested without a GPU: requests up to N run at once, more
 wait for a slot, /metrics shows the slots, each request's history row is its own, and a conversation's next turn
 goes back to the slot that holds it."""
-import collections
 import json
 import sys
 import tempfile
@@ -19,7 +18,6 @@ import urllib.request
 from pathlib import Path
 from unittest import mock
 
-from serve import autotune
 from serve.frontend import ChatTemplate
 from serve.server import ByteTokenizer, Service, StrataEngine, engine_args, parallel_args, serve
 
@@ -249,58 +247,6 @@ class ParallelArgs(unittest.TestCase):
         self.assertEqual(got[:len(mine)], mine)
         self.assertEqual(got.count("--batch-groups"), 1)
         self.assertEqual(got.count("--conversation-cache-mib"), 1)
-
-
-class SlotsWatchInService(unittest.TestCase):
-    """The measurement of "parallel": the first requests that run alone and together decide whether the slots pay
-    here; when they do not, the server runs one at a time from the next idle moment (the engine keeps its slots)."""
-
-    def service(self, slots=2):
-        e = StrataEngine("missing-executable", [], lazy=True)
-        e.batch = slots
-        svc = Service(e, ByteTokenizer(), ChatTemplate(Path(__file__).parent / "test_chat_template.jinja"))
-        return svc
-
-    def feed(self, svc, alone, together):
-        svc._watch_slots(alone, together)
-
-    def test_a_machine_where_they_do_not_pay_runs_one_at_a_time(self):
-        svc = self.service()
-        svc.watch_parallel()
-        with mock.patch("builtins.print") as printed:
-            for _ in range(autotune.SlotsWatch.LIMIT):
-                self.feed(svc, 50.0, [])
-                self.feed(svc, None, [26.0, 25.0])
-            self.assertEqual(svc.parallel_slots, 1)
-        self.assertTrue(any("one at a time" in str(c) for c in printed.call_args_list))
-
-    def test_a_busy_slot_is_left_to_its_request(self):
-        svc = self.service()
-        svc.watch_parallel()
-        for _ in range(autotune.SlotsWatch.LIMIT - 1):
-            self.feed(svc, 50.0, [])
-            self.feed(svc, None, [26.0, 25.0])
-        svc.live_reqs[1] = ({"busy": True}, collections.deque())      # a request still in a slot
-        self.feed(svc, 50.0, [])
-        self.feed(svc, None, [26.0, 25.0])                            # the last sample decides: not while busy
-        self.assertEqual(svc.parallel_slots, 2)
-        svc.live_reqs.clear()
-        self.feed(svc, 50.0, [])
-        self.assertEqual(svc.parallel_slots, 1)                       # from the idle moment on
-
-    def test_the_slots_stay_where_they_pay(self):
-        svc = self.service()
-        svc.watch_parallel()
-        for _ in range(5):
-            self.feed(svc, 50.0, [])
-            self.feed(svc, None, [47.0, 46.0])
-        self.assertEqual(svc.parallel_slots, 2)
-
-    def test_without_auto_nothing_is_measured(self):
-        svc = self.service()
-        self.assertIsNone(svc.slots_watch)
-        svc._watch_slots(50.0, [])
-        self.assertEqual(svc.parallel_slots, 2)
 
 
 class PickSlot(unittest.TestCase):
