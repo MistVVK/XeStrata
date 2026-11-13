@@ -1591,6 +1591,9 @@ def ask(question, choices, default, yes, free=False):
 
 
 def run(cmd, cwd=None, env=None, check=True, quiet=False):
+    gguf_py = (env or {}).get("XESTRATA_GGUF_PY")
+    if gguf_py and not Path(gguf_py).is_dir() and Path(gguf_py).parent == ROOT / "third_party" / "main" / "llama.cpp":
+        get_llama_cpp()                                # the preparation tools read GGUF files with it: fetched now
     say("  > " + " ".join(str(c) for c in cmd))
     if JSON_OUT and not quiet:                         # the program's lines as log objects, not loose on stdout
         with subprocess.Popen([str(c) for c in cmd], cwd=cwd, env=env, stdout=subprocess.PIPE,
@@ -1639,18 +1642,55 @@ def out(cmd):
         return ""
 
 
+def _kept_mark(path: Path) -> Path | None:
+    """Where the finish mark of a file in a folder XeStrata cannot write to is kept instead: marks/<hash>.done under
+    the user's state folder.  The hash is of the file's full path, size and modification time, so a file that changed
+    (or a different file at the same place) has no mark."""
+    try:
+        st = path.stat()
+        key = f"{path.resolve()}|{st.st_size}|{st.st_mtime_ns}"
+    except OSError:
+        return None
+    return STATE / "marks" / (hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:24] + ".done")
+
+
+def mark_text(path: Path) -> str | None:
+    """The text of the finish mark of `path` (beside it, else the kept one), or None when it has none."""
+    for m in (path.with_name(path.name + ".done"), _kept_mark(path)):
+        try:
+            if m is not None and m.exists():
+                return m.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+    return None
+
+
 def done(path: Path) -> bool:
-    """A step's finish mark: <path>.done exists (written only after the step completed)."""
-    return path.with_name(path.name + ".done").exists()
+    """A step's finish mark: <path>.done beside it, or the kept one when its folder cannot be written (written only
+    after the step completed)."""
+    return mark_text(path) is not None
 
 
 def mark(path: Path, text=""):
-    """Write the finish mark.  A folder that cannot be written (--gguf-dir on a read-only share, upstream #570) only
-    costs the mark: setup says so and goes on (the step is repeated on the next run), it does not stop."""
+    """Write the finish mark.  A folder that cannot be written (--gguf-dir on a read-only share, upstream #570, a
+    read-only model disk) keeps the mark in XeStrata's own folder instead (state/marks), so a 110 GB model file is
+    hashed once, not on every launch; only when that cannot be written either does setup say so and go on (the step is
+    repeated on the next run), it does not stop."""
+    text = text or time.strftime("%Y-%m-%d %H:%M")
     try:
-        download_core.write_done(path, text or time.strftime("%Y-%m-%d %H:%M"))
+        download_core.write_done(path, text)
+        return
     except OSError as e:
-        warn(f"the finish mark of {path.name} cannot be written ({e}): the next run does this step again")
+        beside = e
+    kept = _kept_mark(path)
+    try:
+        if kept is not None:
+            kept.parent.mkdir(parents=True, exist_ok=True)
+            kept.write_text(text, encoding="utf-8")
+            return
+    except OSError:
+        pass
+    warn(f"the finish mark of {path.name} cannot be written ({beside}): the next run does this step again")
 
 
 # ------------------------------------------------------------------------------------------------ the PC
@@ -3839,6 +3879,16 @@ def download_file(url, dst: Path, what=None):
     if dst.exists() and done(dst):
         ok(f"{what or dst.name} already downloaded")
         return
+    pin_here = file_pin(url) if url.startswith(("http://", "https://")) else None
+    if (pin_here and dst.is_file() and dst.stat().st_size == pin_here[0]
+            and not dst.with_name(dst.name + ".part").exists()):
+        # a file copied in by hand (or whose mark was lost) that is the pinned size: checked here, no network, so a PC
+        # with every file but no internet can start
+        say(f"  checking {dst.name} (SHA-256) ...")
+        if _hash_file(dst, pin_here[0]) == pin_here[1]:
+            mark(dst, f"sha256 {pin_here[1]}")
+            ok(f"{what or dst.name} is already here (checked)")
+            return
     if not url.startswith(("http://", "https://")):
         src = Path(url[7:] if url.startswith("file://") else url)
         if not src.exists():
@@ -4291,8 +4341,8 @@ def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None, 
     `repair` (a downloaded file's own re-reader, see repair_download): the wrong file is first compared with the server
     piece by piece and only the damaged pieces are written again, then it is checked a second time.  `other`: what the
     person can do instead when their own file (`own`) is not the published one."""
-    m = s.with_name(s.name + ".done")
-    if m.exists() and f"sha256 {sha}" in m.read_text(encoding="utf-8", errors="replace"):
+    kept = mark_text(s)
+    if kept is not None and f"sha256 {sha}" in kept:
         return
     have = s.stat().st_size if s.exists() else -1
     if have != size:
@@ -4317,8 +4367,11 @@ def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None, 
             fail(f"{s.name} does not match the published file (SHA-256 {digest}, expected {sha})",
                  "it may be damaged or another version; your file was left as it is. " +
                  (other or "Copy the whole published file into the folder"))
+        gone = _kept_mark(s)                           # keyed on the file's stat: taken before the file goes
         s.unlink(missing_ok=True)
-        m.unlink(missing_ok=True)
+        s.with_name(s.name + ".done").unlink(missing_ok=True)
+        if gone is not None:
+            gone.unlink(missing_ok=True)
         fail(f"{s.name} has the wrong SHA-256 ({digest}, expected {sha}): deleted",
              "run setup again to download it again")
     mark(s, f"sha256 {sha}")
@@ -5248,8 +5301,7 @@ def link_identical(dst: Path, sha: str, candidates: list, models_dir: Path) -> N
     if dst.exists():
         return
     for p in [*candidates, *Path(models_dir).glob("*/" + dst.name)]:
-        if p == dst or not p.exists() or not done(p) or f"sha256 {sha}" not in \
-                p.with_name(p.name + ".done").read_text(encoding="utf-8", errors="replace"):
+        if p == dst or not p.exists() or f"sha256 {sha}" not in (mark_text(p) or ""):
             continue
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -8072,9 +8124,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     if mm is not None and mmproj is not None:
         # the same file beside another size or the other family (Qwen3.5-9B's two share one): linked, not fetched
         # (only a copy whose finish mark holds the pinned SHA-256: GLM-5.3-Flash's is named mmproj-BF16.gguf too)
-        other = [p for p in Path(a.models_dir).glob("*/" + mmproj.name) if p != mmproj and done(p)
-                 and f"sha256 {mm['sha256']}" in p.with_name(p.name + ".done").read_text(encoding="utf-8",
-                                                                                         errors="replace")]
+        other = [p for p in Path(a.models_dir).glob("*/" + mmproj.name)
+                 if p != mmproj and f"sha256 {mm['sha256']}" in (mark_text(p) or "")]
         if other and not mmproj.exists() and not a.gguf_dir:
             try:
                 os.link(other[0], mmproj)
