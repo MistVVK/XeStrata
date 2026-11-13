@@ -10,7 +10,10 @@
 
 #include <algorithm>
 #include <exception>
+#include <cstdlib>
+#include <cstdio>
 #include <limits>
+#include <initializer_list>
 #include <stdexcept>
 #include <type_traits>
 
@@ -38,7 +41,7 @@ void Bdraft2Runner::release() {
         weights_.release();
         for (void* p : allocations_) gpu::free(p);
     }
-    allocations_.clear(); bytes_ = 0; device_ = -1; model_ = nullptr; stream_ = nullptr;
+    allocations_.clear(); history_.reset(); bytes_ = 0; device_ = -1; model_ = nullptr; stream_ = nullptr;
     context_ = {}; block_ = {}; full_ = {}; full_bytes_ = 0; mode_ = Bdraft2Weights::HeadMode::Auto;
 }
 
@@ -98,10 +101,17 @@ bool Bdraft2Runner::load(const std::string& path, const std::string& head, Plain
         alloc(block_.gate, B * FF); alloc(block_.up, B * FF); alloc(block_.glu, B * FF); alloc(block_.final, (B - 1) * H);
         alloc(block_.hp, (B - 1) * RANK); alloc(block_.part, (size_t) kernels::kDf2PartChunks * 8 * 32 * 130);
         alloc(block_.scores, (B - 1) * 16); alloc(block_.ids, (B - 1) * 16);
+        history_.init(H, 512, SLOTS, weights_.model().window);
+        bool log_on = true;
+        if (const char* e = strata::env_get("DF2_RING_LOG"); e && e[0] == '0') log_on = false;
+        uint64_t budget = 256ull << 20;
+        if (const char* e = strata::env_get("DF2_LOG_MIB"); e && *e)
+            budget = (uint64_t) std::max(0, std::atoi(e)) << 20;
+        history_.configure(log_on, budget);
         std::vector<float> mask(H);
         if (!model.embed_token(weights_.model().mask_token, mask.data()) ||
             !gpu::copy_async(mask_embedding_, mask.data(), H * sizeof(float), stream_, "bdraft2 mask") ||
-            !gpu::memset_async(tags_, 0xff, SLOTS * sizeof(int64_t), stream_) || !epoch(1, err) ||
+            !gpu::memset_async(tags_, 0xff, SLOTS * sizeof(int64_t), stream_) || !epoch(history_.epoch(), err) ||
             !gpu::stream_sync(stream_)) throw std::runtime_error("bdraft2: initial buffers");
         return true;
     } catch (const std::exception& e) { err = e.what(); release(); return false; }
@@ -125,6 +135,37 @@ bool Bdraft2Runner::release_full_head(std::string& err) {
     full_ = {}; full_bytes_ = 0;
     weights_.set_full_head(full_);
     return true;
+}
+
+bool Bdraft2Runner::finish_head_choice(bool use_shead, std::string& err) {
+    if (!loaded() || !head_auto()) { err = "bdraft2: the head choice is not automatic"; return false; }
+    if (!gpu::stream_sync(stream_)) { err = "bdraft2: head choice synchronization"; return false; }
+    weights_.set_probe_shead(use_shead);
+    return use_shead ? release_full_head(err) : weights_.release_shead(err);
+}
+
+bool Bdraft2Runner::begin_request(const int32_t* ids, int64_t n, int64_t resume, bool* cold, std::string& err) {
+    std::string replay_error;
+    if (!begin_request(history_, ids, n, resume, cold, replay_error, err)) return false;
+    if (!replay_error.empty())
+        std::fprintf(stderr, "xestrata bdraft2: %s: the ring starts over for this request\n", replay_error.c_str());
+    return true;
+}
+
+bool Bdraft2Runner::context(const float* taps, int64_t rows, int64_t pos0, std::string& err) {
+    if (!loaded() || !taps || rows < 0 || pos0 < 0) { err = "bdraft2: invalid context"; return false; }
+    try {
+        for (int64_t r = 0; r < rows; r += B) {
+            const int count = (int) std::min<int64_t>(B, rows - r);
+            if (!commit_context(history_, taps + (size_t) r * 5 * H, count, pos0 + r, err)) return false;
+        }
+        return true;
+    } catch (const std::exception& e) { err = e.what(); return false; }
+}
+
+bool Bdraft2Runner::draft(const float* taps, int rows, int64_t pos0, int32_t anchor, int32_t* drafts,
+                          float* probabilities, std::string& err) {
+    return context(taps, rows, pos0, err) && draft(anchor, pos0 + rows, drafts, probabilities, err);
 }
 
 bool Bdraft2Runner::epoch(int32_t value, std::string& err) {
