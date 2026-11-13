@@ -219,11 +219,38 @@ class RedactionTests(unittest.TestCase):
         self.assertIn("<ip>", text)
         self.assertEqual(red("127.0.0.1:8080 and version 0.1.40.3 and driver 32.0.15.7"),
                          "127.0.0.1:8080 and version 0.1.40.3 and driver 32.0.15.7")
-        self.assertNotIn(str(B.ROOT), red(f"loading {B.ROOT / 'strata-x.json'}"))
+        self.assertNotIn(str(B.ROOT), red(f"loading {B.ROOT / 'xestrata-x.json'}"))
         self.assertIn("<xestrata>", red(f"loading {B.ROOT / 'strata-x.json'}"))
         self.assertNotIn(str(Path.home()), red(f"in {Path.home() / 'data'}"))
         if len(user) >= 4:
             self.assertNotIn(user, red(f"hello {user} world"))
+
+    def test_a_login_that_is_an_ordinary_word_stays_in_the_report_s_own_words(self):
+        # upstream 0855796e6 (#4484): a PC whose login is "user" or "test" had field names and statuses turned into
+        # <user>; paths, addresses and the key are still replaced everywhere
+        red = B.redactor(key="sk-secret-123456")          # gitleaks:allow (a made-up key)
+        structural = red.structural
+        self.assertEqual(structural("user"), "user")
+        self.assertEqual(structural("test"), "test")
+        self.assertNotIn("192.168.1.20", structural("peer 192.168.1.20"))
+        self.assertNotIn("sk-secret-123456", structural("key sk-secret-123456"))
+
+    def test_the_document_redacts_what_people_and_servers_wrote_only(self):
+        import getpass
+        name = getpass.getuser()
+        doc = {"schema": "x", "status": "user", "machine": {"gpu": f"a card of {name}'s PC", "cpu": "user"},
+               "results": {"failures": [{"where": "chat.1", "error": f"{name}: denied"}],
+                           "chat": {"1": {"decode_tps": 12.5, "err": None}},
+                           "prompts": {"2": {"decode_tps": 3.0, "err": f"at {name}"}}}}
+        clean = B.redact_document(doc, B.redactor())
+        if len(name) >= 4:
+            self.assertEqual(clean["status"], "user")            # the report's own word
+            self.assertNotIn(name, clean["machine"]["gpu"])      # a person's or server's text
+            self.assertNotIn(name, clean["results"]["failures"][0]["error"])
+            self.assertNotIn(name, clean["results"]["prompts"]["2"]["err"])
+            self.assertEqual(clean["results"]["chat"]["1"]["decode_tps"], 12.5)
+        else:
+            self.assertIn("user", clean["machine"]["cpu"])
 
     def test_objects_are_redacted_deeply(self):
         red = B.redactor()

@@ -75,27 +75,28 @@ BURST_MAX_TOKENS = 128
 
 # --------------------------------------------------------------------------------------------------------- redaction
 def redactor(extra: tuple[str, ...] = (), key: str = ""):
-    """-> f(text) -> text with this machine's home folders, user and host names, the Strata folder, IP addresses and the
-    API key replaced.  Applied to everything that is written or printed from the server's or the machine's own text."""
-    subs: list[tuple[re.Pattern, str, int]] = []   # pattern, label, the value's length
+    """-> f(text) -> text with this machine's home folders, user and host names, the XeStrata folder, IP addresses and
+    the API key replaced.  Applied to everything that is written or printed from the server's or the machine's own
+    text.  f.structural leaves a login or host name that is also an ordinary word alone (for the report's schema)."""
+    subs: list[tuple[re.Pattern, str, int, bool]] = []   # pattern, label, the value's length, a login or host name
 
-    def add(value, label, word=False):
+    def add(value, label, word=False, name=False):
         if value and len(str(value)) >= 4:
             v = str(value)
             for form in sorted({v, v.replace("\\", "/"), v.replace("/", "\\")}, key=len, reverse=True):
                 pat = re.escape(form)
                 subs.append((re.compile(r"(?<![\w-])" + pat + r"(?![\w-])" if word else pat, re.I), label,
-                             len(form)))
+                             len(form), name))
 
     add(ROOT, "<xestrata>")
     add(Path.home(), "<home>")
     add(tempfile.gettempdir(), "<tmp>")
     try:
-        add(getpass.getuser(), "<user>", True)
+        add(getpass.getuser(), "<user>", True, name=True)
     except Exception:                                   # noqa: BLE001
         pass
-    add(socket.gethostname(), "<host>", True)
-    add(platform.node(), "<host>", True)
+    add(socket.gethostname(), "<host>", True, name=True)
+    add(platform.node(), "<host>", True, name=True)
     for x in extra:
         add(x, "<private>", True)
     add(key, "<key>")
@@ -107,15 +108,52 @@ def redactor(extra: tuple[str, ...] = (), key: str = ""):
                      r"|169\.254)\.\d{1,3}\.\d{1,3}\b")
     bearer = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
 
-    def f(text):
+    def f(text, names=True):
+        """names=False leaves a login or host name that is also an ordinary word ("user", "test", "admin") alone: for
+        the report's fixed schema text, where the word is not this machine's name.  Paths, addresses and the key are
+        still replaced."""
         if not isinstance(text, str):
             return text
-        for pat, label, _ in subs:
-            text = pat.sub(label, text)
+        for pat, label, _, is_name in subs:
+            if names or not is_name:
+                text = pat.sub(label, text)
         text = path_user.sub(lambda m: f"{m.group(1) or ''}{m.group(2)}{m.group(3)}{m.group(4)}<user>", text)
         text = bearer.sub(r"\1<key>", text)
         return ip4.sub("<ip>", text)
+
+    setattr(f, "structural", lambda text: f(text, names=False))
     return f
+
+
+def redact_values(value, red) -> object:
+    """redact_obj for free text: the strings are replaced, the keys stay."""
+    if isinstance(value, dict):
+        return {k: redact_values(v, red) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_values(v, red) for v in value]
+    return red(value) if isinstance(value, str) else value
+
+
+def redact_document(doc: dict, red) -> dict:
+    """The report as results.json carries it: the text a person or a server wrote (the machine, model and configuration
+    facts, error messages) gets the full redaction; everything else is the report's own fixed text (field names, enum
+    values, statuses) and only loses paths, addresses and the key, so a login called "user" or "test" does not turn the
+    report's own words into <user> (upstream #4484)."""
+    structural = getattr(red, "structural", red)
+    out = redact_obj(doc, structural)
+    if "machine" in doc:
+        out["machine"] = redact_values(doc["machine"], red)
+    results = doc.get("results")
+    if isinstance(results, dict):
+        if isinstance(results.get("failures"), list):
+            out["results"]["failures"] = [redact_values(f, red) for f in results["failures"]]
+        for group, block in results.items():
+            if not isinstance(block, dict):
+                continue
+            for name, record in block.items():
+                if isinstance(record, dict) and isinstance(record.get("err"), str):
+                    out["results"][group][name] = {**record, "err": red(record["err"])}
+    return out
 
 
 def redact_obj(obj, red):
@@ -996,7 +1034,7 @@ def short_table(res: dict) -> str:
 def write_results(res: dict, parent: Path, red, log_lines: list[str]) -> Path:
     d = unique_dir(parent, results_dir_name(res["machine"], res["date"]))
     d.mkdir(parents=True)
-    clean = redact_obj(res, red)
+    clean = redact_document(res, red)
     (d / "results.json").write_text(json.dumps(clean, indent=1, ensure_ascii=False), encoding="utf-8")
     (d / "README.md").write_text(red(render_readme(res)), encoding="utf-8")
     if log_lines:
