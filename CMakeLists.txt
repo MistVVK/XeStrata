@@ -23,6 +23,9 @@ string(REPLACE "-" "~" XESTRATA_PACKAGE_UPSTREAM "${STRATA_UPSTREAM_VERSION}")
 add_compile_definitions(STRATA_VERSION="${STRATA_VERSION_NAME}"
   STRATA_BACKEND="xe" STRATA_UPSTREAM_VERSION="${STRATA_UPSTREAM_VERSION}"
   STRATA_UPSTREAM_COMMIT="${STRATA_UPSTREAM_COMMIT}")
+# -DSTRATA_GEOMETRY=<name> / -DSTRATA_GEOMETRY_FILE=<path>: the model shape the Qwen3.8 engine's kernels are compiled
+# for (include/strata/core/layout.hpp's kCompiledGeometry); the default is Flash-Next's header and adds no flag.
+include(cmake/StrataGeometry.cmake)
 # ggml's CPU backend for any AVX2 CPU (the default), or OFF for this machine's (-march=native).  On the B70 machines
 # measured the two decode equally fast, and a native build can stop running when the CPU is changed (Strata's own
 # AVX-512 kernels are per-file and chosen at run time either way).

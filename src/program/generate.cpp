@@ -1676,7 +1676,7 @@ int check_model(const std::string& gguf) {
             problems.push_back(err);
         } else {
             const bool q38 = s.arch == strata::ModelArch::Qwen4Exp;
-            strata::core::ModelGeometry g;
+            strata::core::ModelGeometry g = strata::core::kCompiledGeometry;
             if (q38 && !strata::core::geometry_from_spec(s, g, err)) problems.push_back(err);
             std::vector<int64_t> blocks;
             for (int64_t l = 0; l < s.n_layer; ++l)
@@ -2190,6 +2190,14 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc && i < 3; ++i) {
         if (std::strcmp(argv[i], "--version") == 0 || std::strcmp(argv[i], "-V") == 0) {
             std::printf("xestrata %s\n", STRATA_VERSION);
+            return 0;
+        }
+    }
+    // `xestrata --geometry`: the model shape the kernels are compiled for (the geometry header's kGeometryName;
+    // flash_next for the default build), one line and nothing else, before any GPU is touched
+    for (int i = 1; i < argc && i < 3; ++i) {
+        if (std::strcmp(argv[i], "--geometry") == 0) {
+            std::printf("%s\n", strata::core::kGeometryName);
             return 0;
         }
     }
@@ -2926,7 +2934,7 @@ int main(int argc, char** argv) {
     // every quantized tensor in its GGUF form, so it needs --native (the dense projections, head and embedding
     // come from the model file) and runs its experts in verify windows only (--spec).
     {
-        const strata::core::ModelGeometry g0;
+        const strata::core::ModelGeometry& g0 = strata::core::kCompiledGeometry;
         if (!strata::kernels::cpu::expert_layout_load(o.pack, g0.n_layers, g0.n_expert, err)) {
             std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
             return 1;
@@ -3128,7 +3136,7 @@ int main(int argc, char** argv) {
                                  "and --prefill CHUNK\n", o.pack.c_str());
             return 2;
         }
-        const strata::core::ModelGeometry g0;
+        const strata::core::ModelGeometry& g0 = strata::core::kCompiledGeometry;
         const auto embed_t0 = std::chrono::steady_clock::now();
         if (!native_embed.load(o.embd_gguf.empty() ? o.native_preset : o.embd_gguf, g0.n_embd, 248320, err)) {
             std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
@@ -3174,7 +3182,7 @@ int main(int argc, char** argv) {
     //   STRATA_SPLIT_ROWS, default 3, the average verify window with MTP drafts).
     if (multi_gpu && split_auto) {
         // the geometry, as set up below (the canonical one, the model file's MoE shape)
-        strata::core::ModelGeometry ga;
+        strata::core::ModelGeometry ga = strata::core::kCompiledGeometry;
         int64_t Ka = 10;
         if (!o.native_preset.empty()) {
             try {
@@ -3941,7 +3949,7 @@ int main(int argc, char** argv) {
         }
         strata::kernels::mrope_table_set(d_mrope);
     }
-    strata::core::ModelGeometry g;   // canonical defaults; the model file overrides the MoE shape below
+    strata::core::ModelGeometry g = strata::core::kCompiledGeometry;   // the compiled shape; the model file may lower the expert count below
     int64_t K = 10;
     // the model file's rope keys (llama.cpp's names; the artifact ships none today)
     std::string gguf_rope_type;
