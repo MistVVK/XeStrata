@@ -245,6 +245,25 @@ LOOPBACK_NAMES = ("localhost", "127.0.0.1", "::1")
 QUEUE_BEAT_S = 10.0         # a request waiting for the single turn sends a keep-alive this often (#1619)
 KEEPALIVE_S = 10.0          # a held-back tool argument leaves the stream quiet: ping at least this often
 CTX_SLACK = 8               # `xestrata-engine --serve` rejects prompt + max_new + 8 > context: the same margin here
+
+
+class ContextOverflow(ValueError):
+    """A request that does not fit the context (a 400 on every API).  It keeps the numbers, so /v1/messages can also
+    say it the way Anthropic's API does: a client that decides from the wording (Claude Code compacts on "prompt is
+    too long", and shortens max_tokens on "input length and `max_tokens` exceed context limit") then does what it does
+    for Anthropic's own error (#4838)."""
+
+    def __init__(self, text, *, prompt, context, max_new=None):
+        super().__init__(text)
+        self.prompt, self.context, self.max_new = prompt, context, max_new
+
+    def anthropic_text(self) -> str:
+        room = self.context - CTX_SLACK
+        if self.max_new is None or self.prompt > room - 1:   # the prompt alone leaves no room
+            return f"prompt is too long: {self.prompt} tokens > {room - 1} maximum; {self}"
+        return f"input length and `max_tokens` exceed context limit: {self.prompt} + {self.max_new} > {room}; {self}"
+
+
 # The live tok/s is a rate over a window, not a mean since the first token: a mean reads ~1/elapsed at the first
 # token (the Monitor showed five-digit numbers) and then undershoots for the first second of every answer.
 RATE_WINDOW_S = 2.0
@@ -5311,18 +5330,19 @@ class Service:
                 # A prompt refused for the context is not kept (#567): the client cannot resend it unchanged.  The
                 # other refusals (engine starting, images) keep it: the same prompt comes back and its encode is reused.
                 self.forget_prompt(encoded_ids)
-                raise ValueError("request exceeds the context window: "
-                                 f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
-                                 f"({ctx}); requests are never truncated")
+                raise ContextOverflow("request exceeds the context window: "
+                                      f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
+                                      f"({ctx}); requests are never truncated", prompt=len(ids), context=ctx)
             max_new = room
         elif max_new > room:
             if not self.fit_max_tokens:
                 self.forget_prompt(encoded_ids)
-                raise ValueError("request exceeds the context window: "
-                                 f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
-                                 f"({ctx}); requests are never truncated. Send a smaller "
-                                 f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
-                                 "model's xestrata-<model>.json to shorten it to the room left (#545)")
+                raise ContextOverflow("request exceeds the context window: "
+                                      f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
+                                      f"({ctx}); requests are never truncated. Send a smaller "
+                                      f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to "
+                                      "the model's xestrata-<model>.json to shorten it to the room left (#545)",
+                                      prompt=len(ids), context=ctx, max_new=max_new)
             print(f"[xestrata] max_tokens {max_new} shortened to {max(1, room)}: the prompt ({len(ids)} tokens) "
                   f"leaves that much of the context ({ctx}); \"fit_max_tokens\": false answers 400 instead", flush=True)
             max_new = max(1, room)          # a shorter completion beats a 400 (the default; upstream f31b6efd6)
@@ -10315,7 +10335,12 @@ def make_handler(svc: Service):
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            try:
+                ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req,
+                                                     cancel=cancel)
+            except ContextOverflow as overflow:
+                # #4838: Anthropic's own wording first, XeStrata's sentence after it
+                raise ValueError(overflow.anthropic_text()) from None
             strict, patterns = constrained_tools(req.get("tools"))
             # with tools only the calls have a grammar: the answer is checked after it is written (#60)
             svc.attach_grammar(req, answer_grammar(anthropic_format(req), thinking)
