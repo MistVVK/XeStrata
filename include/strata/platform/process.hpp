@@ -51,4 +51,10 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+/// This process's standard output sent to the null device until restore (the serve engines' start: the requests of
+/// its measurement of the drafters print their lines as a request does, and nobody reads them).  Flush the C stream
+/// before both.  mute returns the saved descriptor, or -1 when it could not (the output then stays as it is).
+int stdout_mute();
+void stdout_restore(int saved);
+
 }  // namespace strata::platform

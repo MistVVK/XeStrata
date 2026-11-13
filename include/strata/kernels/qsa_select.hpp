@@ -31,11 +31,29 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
                       int64_t active_blocks = -1);   ///< perf-review C-1: > 0 launches only this many blocks (the
                                                      ///< batch's largest n_bid + 1; not for a captured graph)
 
+/// Turn FP32 products [nq * idx_n_head, tile] into completed-block scores; the moving tail is written separately.
+void qsa_block_scores_reduce(const float* products, int64_t tile, int64_t b0, int64_t blocks, const int32_t* steps,
+                             int64_t nq, int64_t max_blocks, float* scores, void* stream);
+void qsa_block_scores_tail(const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
+                           int64_t max_blocks, float* scores, void* stream);
+
 /// The same scores for a verify window's rows (consecutive positions of one sequence, so their n_bid rise): one
 /// sub-group a block reads its key once for every row, and the four heads' lane sums reduce with the same pairings as
 /// qsa_block_scores' (the bits are its own, upstream 5b6c9398's STRATA_QSA_ROWS).  For a graph: the grid is max_blocks.
 void qsa_block_scores_rows(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
                            int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores, void* stream);
+/// The same with each row's own indexer keys (a batch window: a slot's pooled blocks and dead key; upstream
+/// 7a9245b6c).  `rows.n` must be nq; every row's keys are read for its own blocks only.
+struct QsaScoreRows {
+    const float* pooled[kQsaRowsMax] = {};
+    const float* dead[kQsaRowsMax] = {};
+    int n = 0;
+};
+void qsa_block_scores_rows(const QsaScoreRows& rows, const float* q_idx, const int32_t* steps, int64_t nq,
+                           int64_t max_blocks, const QsaShapes& s, float* scores, void* stream);
+/// Whether the one-launch form beats a qsa_block_scores call a row on this device for `n_rows` rows of `blocks`
+/// blocks (timed once per device and shape on dummy keys; the caller's own choice).
+bool qsa_rows_pays(int n_rows, int64_t blocks, const QsaShapes& s, void* stream);
 
 /// The same scores on tensor cores (3xTF32, FP32-level accuracy but another summation order: not bitwise; the tail
 /// block n_bid is the warp kernel's arithmetic). For the prompt path; false (nothing launched) on another geometry.

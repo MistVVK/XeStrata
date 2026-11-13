@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/prefill.hpp"
+#include "strata/core/auto_pick.hpp"
 #include "strata/core/expert_tier.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
@@ -12,6 +13,7 @@
 #include "strata/core/stream_watch.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/core/per_device.hpp"
+#include "strata/core/timed_choice.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/platform/direct_file.hpp"
@@ -62,6 +64,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace strata::prefill {
@@ -159,12 +162,12 @@ inline int64_t stream_all_min() {
 // streamed expert, events around its expert work read after the next layer's routing sync, as running means): the
 // next layers hand the CPU g / (c + g), where both sides end together, so a GPU that streams faster than the CPU
 // computes gives it little.  x: a fixed x.  0: every expert on the GPU.  The CPU rounds differently from the GPU, so
-// an answer can differ slightly from the GPU-only one.  Unset, --prefill-cpu-share (set_cpu_share) fixes the share
-// where the default arms it: the measured one moves from run to run, and which experts the CPU takes with it, so two
-// greedy runs of one prompt parted (2026-10-16, an RTX 4070: logits up to 1.5 apart at the first generated token).
-// A fixed share does not make the runs alike: the CPU takes from the experts outside VRAM, and --expert-cache auto
-// sizes that tier from the free VRAM at start (a B70: 14,870 or 14,873 slots, the matrix library's 6 or 10 MiB), so a
-// few experts move and the reply with them (2026-11-01, 1 run in 6).  Only 0 gives the same reply each time.
+// an answer can differ slightly from the GPU-only one.  The measured share also moves from run to run (the B70,
+// 2026-11-13: 0.53 to 0.83 over five runs, and five greedy 256-token runs of one prompt gave five answers), so a run
+// whose answer must not move needs a fixed share: setup's warm-up measures it once per PC and model with `auto` and
+// writes the value into the run config (--prefill-cpu-share), and 0 is the GPU-only answer every time.  A share fixed
+// where the cache's tier does not move keeps a reply too (the RTX 4070's 0.84: 8 runs alike; its 0.5 moved in 3 runs
+// of 2 answers).
 double g_cpu_share_fixed = -1.0;   // set_cpu_share: -1 measured
 inline double cpu_share_env() {   // -1: measured
     static const double v = [] {
@@ -191,10 +194,25 @@ int g_ring_override = 0;
 // slots 1296 tok/s, 512 1364, 768 1376; IQ3_XXS's 2.3 MB blobs, 64K: 384 1043, 512 1034, the ring's slots taken from
 // the cache's resident experts).
 constexpr uint64_t kRingBigBytes = 800ull << 20;
+// XESTRATA_PREFILL_RING_DEPTH (upstream a1e6ef324): the pinned read's ring is 192 slots, not 384, below 8192-token
+// chunks - a short chunk's attention half is short and the deeper ring's staging only waits longer.  Measured on the
+// RTX 4070 at a 4K prompt: +1.2% and then +1.6% with 192, the B70 the same; a 32K prompt in one 16384-token chunk
+// loses 12.5% with it, so the chunk's size decides.  Upstream's boundary is 12K-token chunks; this path's big-ring
+// rule starts at 8192-token chunks and measured better there (384 slots 1296 tok/s, 512 1364 at 8192-token chunks),
+// so the shallow ring stops at it.  auto (unset): the chunk's size; 0: 384 everywhere; 1: 192 everywhere.
+// STRATA_PREFILL_RING's exact count still wins over all three (the A/B's switch).
+constexpr int64_t kRingShallowT = 8192;
+inline core::Pick ring_depth_pick() {
+    static const core::Pick v = core::pick_from_env("PREFILL_RING_DEPTH");
+    return v;
+}
 inline int ring_slots(size_t T) {
     const char* v = strata::env_get("PREFILL_RING");
     const uint64_t blob_b = (uint64_t) std::max<int64_t>(MAXBLOB(), 1);
-    const int pinned = (int64_t) T >= 8192 ? (int) std::clamp<uint64_t>(kRingBigBytes / blob_b, 384, 512) : 384;
+    const int big_ring = (int) std::clamp<uint64_t>(kRingBigBytes / blob_b, 384, 512);
+    const core::Pick depth = ring_depth_pick();
+    const bool shallow = depth == core::Pick::On || (depth == core::Pick::Auto && (int64_t) T < kRingShallowT);
+    const int pinned = shallow ? 192 : (int64_t) T >= 8192 ? big_ring : 384;
     int r = v ? (int) std::strtol(v, nullptr, 10)
               : (g_ring_override > 0 ? g_ring_override : g_pinned_share >= 0.9 ? pinned : 96);
     if (!v) {
@@ -809,6 +827,74 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
     p.page_table = table;
     return p;
 }
+// QSA block scoring is a product of the FP32 pooled keys and indexer queries, followed by the per-head ReLU sum.
+// Keep the moving tail in the existing kernel.  The library form is timed against the shared tiled scorer, and is
+// only eligible when its selections on the measured rows are the same.  The full quality check is still required.
+void qsa_scores(const float* pooled, const float* dead, const float* query, const int32_t* steps, int64_t nq,
+                int64_t active, int64_t max_blocks, int64_t cap, const strata::kernels::QsaShapes& s,
+                float* scores, int32_t* ids, float* scratch, uint64_t scratch_floats, gpu::Stream stream) {
+    using namespace strata::kernels;
+    auto& queue = core::Runtime::get().stream(stream);
+    auto baseline = [&](int64_t rows) {
+        if (!qsa_block_scores_tc(pooled, dead, query, steps, rows, max_blocks, s, scores, stream, active))
+            qsa_block_scores(pooled, dead, query, steps, rows, max_blocks, s, scores, stream, active);
+        return true;
+    };
+    const int64_t tile = nq > 0 ? std::min<int64_t>(active, (int64_t) (scratch_floats / ((uint64_t) nq * 4))) : 0;
+    auto product = [&](int64_t rows) {
+        if (s.idx_dim != 128 || s.idx_n_head != 4 || s.idx_block != 4 || tile < 1 || !scratch) return false;
+        for (int64_t b = 0; b < active; b += tile) {
+            const int64_t n = std::min(tile, active - b);
+            if (!Gemm::f32(query, pooled + b * 128, scratch, rows * 4, n, 128, tile, stream)) return false;
+            qsa_block_scores_reduce(scratch, tile, b, n, steps, rows, max_blocks, scores, stream);
+        }
+        qsa_block_scores_tail(dead, query, steps, rows, max_blocks, scores, stream);
+        return true;
+    };
+    const char* mode = strata::env_get("SELECT_GEMM");
+    bool use = false;
+    if (mode && mode[0] == '1' && mode[1] == '\0') use = true;
+    else if (!mode || !*mode || std::strcmp(mode, "auto") == 0) {
+        using Key = std::tuple<int64_t, int64_t, int64_t, int64_t>;
+        static core::TimedCache<sycl::device, Key, bool> choices;
+        static core::TimedCache<sycl::device, int, bool> warmed;
+        const Key key{nq, core::timed_key_class(active), max_blocks, cap};
+        const auto cached = choices.get(queue.get_device(), key);
+        if (cached) use = *cached;
+        else if (tile > 0 && core::timing_depth == 0 &&
+                 queue.ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording) {
+            const int64_t rows = std::min<int64_t>(nq, 8);
+            const size_t bytes = (size_t) rows * (size_t) cap * sizeof(int32_t);
+            std::vector<int32_t> old_ids((size_t) rows * (size_t) cap), new_ids(old_ids.size());
+            queue.memset(ids, 0, bytes); baseline(rows);
+            qsa_block_topk(scores, steps, rows, max_blocks, cap, s, ids, stream);
+            queue.memcpy(old_ids.data(), ids, bytes).wait_and_throw();
+            queue.memset(ids, 0, bytes);
+            bool ok = product(rows);
+            if (ok) {
+                qsa_block_topk(scores, steps, rows, max_blocks, cap, s, ids, stream);
+                queue.memcpy(new_ids.data(), ids, bytes).wait_and_throw();
+                ok = old_ids == new_ids;
+            }
+            bool faster = false;
+            if (ok) {
+                const bool first = warmed.put_first(queue.get_device(), 0, true, [](int) { return true; }).second;
+                const auto m = core::timed_choice({{[&] { return baseline(rows); }}, {[&] { return product(rows); }}},
+                    [&] { queue.wait_and_throw(); }, 5, 1.10, first ? 0.5 : 0.0);
+                faster = m.pick == 1;
+                std::fprintf(stderr, "xestrata: QSA score %s (%lld blocks, %.1f / %.1f us)\n",
+                             faster ? "GEMM" : "tiled", (long long) active, m.seconds[0] * 1e6, m.seconds[1] * 1e6);
+            }
+            use = choices.put(queue.get_device(), key, faster);
+        }
+    } else if (!(mode[0] == '0' && mode[1] == '\0')) {
+        throw core::DeviceError("XESTRATA_SELECT_GEMM must be auto, 0 or 1");
+    }
+    if (use) {
+        if (!product(nq)) throw core::DeviceError("XESTRATA_SELECT_GEMM: FP32 product or scratch unavailable");
+    } else baseline(nq);
+}
+
 // The attention stage is shared by chunk-major and layer-major prefill.
 void qsa_attention(const float* q, const strata::kernels::QsaAttnPools& pools, const int32_t* ids,
                    const int32_t* steps, int64_t cap, const strata::kernels::QsaShapes& shapes,
@@ -946,12 +1032,39 @@ bool Prefill::set_helper(core::RemoteExperts* helper, int64_t max_rows, std::str
 }
 
 Prefill::Prefill() : impl_(new Impl) {}
+
+bool Prefill::set_tap_rows(int64_t cap_rows, std::string& err) {
+    tap_cap_ = cap_rows;
+    if (tap_local_.empty() || cap_rows == tap_alloc_) return true;
+    if (impl_ && impl_->cs) strata::gpu::stream_sync(impl_->cs);
+    strata::gpu::free(tap_dev_);
+    tap_dev_ = nullptr;
+    tap_alloc_ = 0;
+    if (!strata::gpu::alloc_device(&tap_dev_, (size_t) cap_rows * tap_local_.size() * (size_t) tap_n_ * 4)) {
+        err = "prefill: the DFlash2 tap staging does not fit";
+        return false;
+    }
+    tap_alloc_ = cap_rows;
+    return true;
+}
+
+void Prefill::taps_off() {
+    if (impl_ && impl_->cs) strata::gpu::stream_sync(impl_->cs);
+    strata::gpu::free(tap_dev_);
+    tap_dev_ = nullptr;
+    tap_layers_.clear();
+    tap_local_.clear();
+    std::fill(tap_slot_.begin(), tap_slot_.end(), -1);
+    tap_cap_ = tap_alloc_ = 0;
+    on_taps = nullptr;
+}
 Prefill::~Prefill() { release(); }
 void Prefill::reset() { release(); impl_ = std::make_unique<Impl>(); stats_ = {}; }
 void Prefill::release() {
     if (!impl_) return;
     lm_release();
     if (tap_dev_) { strata::gpu::free(tap_dev_); tap_dev_ = nullptr; }
+    tap_alloc_ = 0;
     impl_->stager.reset();
     if (impl_->cs) strata::gpu::stream_sync(impl_->cs);
     if (impl_->copy) strata::gpu::stream_sync(impl_->copy);
@@ -1261,11 +1374,13 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             tap_slot_[(size_t) l] = (int) tap_local_.size();
             tap_local_.push_back(l);
         }
+    tap_n_ = N;
     if (!tap_local_.empty() && tap_dev_ == nullptr) {
         if (tap_cap_ < 1 || !strata::gpu::alloc_device(&tap_dev_, (size_t) tap_cap_ * tap_local_.size() * N * 4)) {
             err = "prefill: the DFlash2 tap staging does not fit";
             return false;
         }
+        tap_alloc_ = tap_cap_;
     }
     for (int b = 0; next_ != nullptr && b < 2; ++b)
         if (!m.hand[b] && !strata::gpu::alloc_host((void**) &m.hand[b], (size_t) chunk * D * 4)) {
@@ -2119,7 +2234,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // the DFlash2 taps of this chunk: the rows at or after tap_first_ (the ring's window)
         const int64_t tap_t0 = tap_dev_ ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : 0;
         const int64_t tap_rows = tap_dev_ ? T - tap_t0 : 0;
-        if (tap_rows > tap_cap_) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
+        if (tap_rows > std::min(tap_cap_, tap_alloc_)) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
         // STRATA_KVA: this chunk is approximated in the layers at and after the split when its last position is
         // before the request's full-computation suffix; a chunk in the suffix runs the ordinary path everywhere.
         const bool kva_approx = kva_run && (p0 + T <= kva_frontier);
@@ -2648,11 +2763,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                                 strata::kernels::kStepNBid)] + 1;
                         // the scores on tensor cores (3xTF32: FP32-level, not bitwise); the warp kernel where that form
                         // cannot run
-                        if (!strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
-                                                                  steps0, nb, m.max_blocks, s, m.sel_scores,
-                                                                  m.cs, active))
-                            strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
-                                                              m.max_blocks, s, m.sel_scores, m.cs, active);
+                        qsa_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb, active, m.max_blocks,
+                                   m.cap, s, m.sel_scores, m.sel_ids + t0 * m.cap, m.attn_scratch,
+                                   (uint64_t) m.attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s), m.cs);
                         strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                         m.sel_ids + t0 * m.cap, m.cs);
                     }
@@ -4639,7 +4752,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 const int64_t t0 = c * m.T;                // in the super-chunk
                 const int64_t tap_t0 = tap_dev_ ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : 0;
                 const int64_t tap_rows = tap_dev_ ? T - tap_t0 : 0;
-                if (tap_rows > tap_cap_) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
+                if (tap_rows > std::min(tap_cap_, tap_alloc_)) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
                 m.R = lb.r_dev ? lb.R + t0 * D : r_buf(c);
                 if (lb.r_dev && l == LB && LB > 0 &&
                     !strata::gpu::copy_async(m.R, lb.R_in + (size_t) t0 * D, (size_t) T * D * 4, cs)) {
@@ -4933,11 +5046,9 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             const int32_t* steps0 = m.steps_dev + q0 * strata::kernels::kStepCount;
                             const int64_t active = (int64_t) m.steps_host[(size_t) ((q0 + nb - 1) * strata::kernels::kStepCount +
                                                                                     strata::kernels::kStepNBid)] + 1;
-                            if (!strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512,
-                                                                      steps0, nb, m.max_blocks, s, m.sel_scores,
-                                                                      cs, active))
-                                strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512, steps0, nb,
-                                                                  m.max_blocks, s, m.sel_scores, cs, active);
+                            qsa_scores(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512, steps0, nb, active, m.max_blocks,
+                                       m.cap, s, m.sel_scores, m.sel_ids + q0 * m.cap, m.attn_scratch,
+                                       (uint64_t) m.attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s), cs);
                             strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                             m.sel_ids + q0 * m.cap, cs);
                         }

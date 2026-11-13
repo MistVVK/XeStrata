@@ -42,7 +42,7 @@ MTP の推測デコードはオンです。
 | **IQ3_S** | 450 | 740 | 1,718 | 1,458 | 1,333 | 1,081 |
 | **Coder** | 936 | 1,573 | 2,015 | 1,659 | 1,499 | 1,188 |
 
-短いプロンプト（2,048 トークン未満のチャンク）では、VRAM にないエキスパートのうち少しのトークンにしか選ばれないものを、そのあいだ空いている decode 用の CPU のプールが計算します（upstream では opt-in、Xe は既定、`XESTRATA_PREFILL_CPU_SHARE=auto`）。CPU と GPU のエキスパートあたりの時間を測り、両方が同時に終わる割合を渡します。GPU のキャッシュがすべてのエキスパートを持つとき（流すものがない）と、ホストのメモリが足りないとき（空き RAM が分担のバッファと 3 GiB より少ない、または読むエキスパートのファイルのページを空き RAM が持てない）は、既定では使いません（upstream eaaa237e・04dbe561、`XESTRATA_PREFILL_CPU_SHARE=auto` で使います）。分担のバッファを確保できなかったときは、その要求を失敗させずに分担を止めます。CPU の活性の形で計算するので、GPU だけのときと答えが少し変わります。測った割合は実行ごとに少し動き、CPU が受け持つエキスパートもそれにつれて変わるので、同じ設定の 2 回の greedy の答えが途中から分かれていました。そこで setup のウォームアップが、PC とモデルの組ごとに一度だけ割合を測って実行の設定に書きます（`--prefill-cpu-share`）。プロンプトは毎回同じように読まれます。`--prefill-cpu-share auto` にすると、以前のようにプロンプトごとに測ります。decode の PCIe の分担も実行ごとに変わりますが、CPU と GPU で同じ計算をするエキスパート（gate と up が i-quant・IQ4_XS・Q2_0、down が IQ4_NL・Q2_0。Qwen3.8 の 4 つのファイル）では答えは変わりません。それ以外の型のエキスパートのモデルで 2 回の答えを厳密に比べるときは、`--pcie-frac 0` も付けます。`XESTRATA_PREFILL_CPU_SHARE=0` で GPU だけ、`0.4` などで決まった割合です。`--batch` のスロットがあるときも、どのスロットも decode していない読みには分担を使います（そのあいだスロットの窓がプールを使うため。`XESTRATA_PREFILL_CPU_SHARE_BATCH=0` で切ります。RX 9060 XT、`--batch 2`、`--prefill 3072` の 2050 トークンの読みで 577.2 → 780.4 トークン/秒、+35.2%。同じ実行の decode は 56.5 → 55.4 トークン/秒、−1.9%）。262 / 914 トークンのプロンプトは、B70 で 319.2 → 383.1 / 736.3 → 828.0 トークン/秒、RTX 4070 で 109.9 → 266.1 / 275.9 → 457.8 トークン/秒でした（各 1 回）。
+短いプロンプト（2,048 トークン未満のチャンク）では、VRAM にないエキスパートのうち少しのトークンにしか選ばれないものを、そのあいだ空いている decode 用の CPU のプールが計算します（upstream では opt-in、Xe は既定）。分担の割合は `XESTRATA_PREFILL_CPU_SHARE` か `--prefill-cpu-share` の値、どちらも無ければプロンプトごとに測ります（auto: CPU と GPU のエキスパートあたりの時間を層ごとに測り、両方が同時に終わる g/(c+g) を次の層に渡す）。CPU の活性の形で計算するので、GPU だけのときと答えが少し変わります。割合を実行ごとに測ると、測った値も、CPU が受け持つエキスパートも動くので、同じ設定の greedy の答えが途中から分かれることがあります（2026-11-13、B70 の 5 回で 0.53〜0.83）。GPU のキャッシュがすべてのエキスパートを持つとき（流すものがない）と、ホストのメモリが足りないとき（空き RAM が分担のバッファと 3 GiB より少ない、または読むエキスパートのファイルのページを空き RAM が持てない）は、分担を使いません（upstream eaaa237e・04dbe561）。分担のバッファを確保できなかったときは、その要求を失敗させずに分担を止めます。setup のウォームアップが、PC とモデルの組ごとに一度だけ測り、その値を実行の設定に書きます（`--prefill-cpu-share`）。以後の実行はプロンプトを毎回同じように読みます。直接使うときに毎回同じ答えが要るときは `--prefill-cpu-share 0`（すべて GPU）です。decode の PCIe の分担も実行ごとに変わりますが、CPU と GPU で同じ計算をするエキスパート（gate と up が i-quant・IQ4_XS・Q2_0、down が IQ4_NL・Q2_0。Qwen3.8 の 4 つのファイル）では答えは変わりません。それ以外の型のエキスパートのモデルで 2 回の答えを厳密に比べるときは、`--pcie-frac 0` も付けます。`XESTRATA_PREFILL_CPU_SHARE=0` で GPU だけ、`0.4` などで決まった割合です。`--batch` のスロットがあるときも、どのスロットも decode していない読みには分担を使います（そのあいだスロットの窓がプールを使うため。`XESTRATA_PREFILL_CPU_SHARE_BATCH=0` で切ります。RX 9060 XT、`--batch 2`、`--prefill 3072` の 2050 トークンの読みで 577.2 → 780.4 トークン/秒、+35.2%。同じ実行の decode は 56.5 → 55.4 トークン/秒、−1.9%）。262 / 914 トークンのプロンプトは、B70 で 319.2 → 383.1 / 736.3 → 828.0 トークン/秒、RTX 4070 で 109.9 → 266.1 / 275.9 → 457.8 トークン/秒でした（各 1 回）。
 
 2,048〜3,072 トークンのチャンクでは、エキスパートの行を 8 行ずつに分けて CPU と GPU が分担できるか、最初の層で両方を交互に測ります。plain の試行では CPU に渡すエキスパートを最大 16 個にして、測りの負担を小さくします。2 組の時間比の両方で、CPU に渡す方が 10% 以上速いときだけ、その後も渡します。Qwen3.8 の auto では、渡さない層も全 expert の先読みではなく、その層の route に沿って読みます。選択はその実行中だけ使い、ファイルには保存しません。`XESTRATA_PREFILL_STAGED_3K=0` で以前の経路、`=1` でこの分担を強制し、未設定または `=auto` で測って選びます。試す層の計算も答えに影響するため、GPU のみの計算とは出力が変わることがあります。
 
@@ -74,29 +74,41 @@ decode の速さは文章によっても変わります。
 （B70、IQ2_XS、K=3: 文書の書き直し 109.6 → 129.2、ふつうの会話 71.1 → 68.3 トークン/秒）。
 `--lookup-chain-min M` は、続きを足すのに要る一致の長さです（既定 3 トークン）。
 
-#### DFlash2（Qwen3.8-Flash-Next のもう一つの drafter）
+#### DFlash2（もう一つの drafter）と起動時の選択
 
-`--draft mtp|dflash2|auto|off` で drafter を選びます（既定 mtp）。DFlash2 は Qwen3.8-Flash-Next 用の block drafter
-（[incoai/Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2)、Apache-2.0）です。
-target の層 5/15/25/35/45 の隠れ状態を読み、anchor 1 行と mask 7 行の forward 1 回で 7 トークンを推測し、
-top-16 と rank-256 の selector で左から右へ選びます。MTP の層とは別の drafter で、`--draft-model PACK` に
-`tools/dflash2_pack.py` の pack（Q4_0 行列・Q4_0 selector、約 0.5 GB）を渡します。setup が `--drafting auto|dflash2` の
-とき pinned revision から取得してこの PC で pack します（`tools/dflash2_fetch.py`、SHA-256 照合）。
+`--draft mtp|dflash2|auto|off` で drafter を選びます（既定 mtp、setup は auto を書きます）。DFlash2 は Inco AI の
+block drafter（Apache-2.0）で、Qwen3.8-Flash-Next 用（[incoai/Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2)）、
+GLM-5.3-Flash 用（[incoai/GLM-5.3-Flash-DFlash2](https://huggingface.co/incoai/GLM-5.3-Flash-DFlash2)）、
+Qwen3.6-35B-A3B 用（[incoai/Qwen3.6-35B-A3B-DFlash2](https://huggingface.co/incoai/Qwen3.6-35B-A3B-DFlash2)）があります。
+target のいくつかの層の出力（流れが 4 本のモデルはその平均）を読み、anchor 1 行と mask 7 行の forward 1 回で
+7 トークンを推測し、top-16 と rank-256 の selector で左から右へ選びます。MTP の層とは別の drafter で、
+`--draft-model PACK` に `tools/dflash2_pack.py` の pack（Q4_0 行列・Q4_0 selector）を渡します。
+setup は `--drafting auto|dflash2` のとき、モデルごとに版を固定した重みを取得してこの PC で pack します
+（`tools/dflash2_fetch.py --model`、SHA-256 照合。Qwen3.8-Flash-Next はデータフォルダの `dflash2/`、ほかはモデルの
+フォルダの `dflash2/`）。取得できなければ MTP の層で続けます。
 
-`--draft auto` は MTP と DFlash2 の両方を読み、要求ごとにどちらを使うかを選びます。要求の `xestrata_draft`
-（`mtp|dflash2|auto`）が明示ならそれに従い、なければ `--draft-rule df2|mtp|learn`（既定 learn）です。learn は
-要求の種類（prompt 先頭 32 トークン）× 文脈の深さ（2K/8K/32K の境）ごとに、実測の decode 速度（EMA）の良い方を
-選び、負けた側も時々試します（差 4% 未満で 6 回に 1 回、以上で 12 回に 1 回）。起動直後は MTP から始め、最初の
-数要求で両方を測ります。結果はファイルに残しません（プロセス内だけ）。選ばれなかった drafter も最新に保ちます
-（DFlash2 の ring は context update、MTP は prompt の再読で引き継ぎます）。
+`--serve` の `--draft auto` は、起動の最後（READY の前）に、読み込んだ drafter（MTP、DFlash2 の pack があれば
+DFlash2）と「drafter なし」を、固定の短い英文で交互に decode して比べ、速いものを残します。負けた drafter は
+VRAM と RAM から外します（MTP の層の K/V は、会話のキャッシュと保存した会話が持つので残します）。`--spec auto`（setup が書きます）なら窓の上限も候補にします（Qwen3.8-Flash-Next は 4 と 2、
+plain エンジンは 3 と 2）。最速が他より 3%（と自身の回の間のぶれ）以上速くなければ、安い形（MTP、DFlash2、なしの順、
+設定の窓）を残します。MTP と DFlash2 がその幅の中なら両方を残し、要求ごとに選びます（下）。測りに使う DFlash2 は
+起動の最後に読み込み、エキスパートのキャッシュは MTP だけのときと同じ大きさで取るので、MTP が勝てば pack が
+ないときと同じ状態になります。DFlash2 を残すのは、それを載せても `--vram-reserve-mib` の予備が空いているときだけ
+です。測りの間はエキスパートの入れ替えと、最初の窓で決める切り替えは動きません。測りは浅い文脈（百数十トークン）で
+行い、深い文脈では窓の規則（`--spec-window auto`）が回ごとに補います。結果はファイルに残さず、起動ごとに測ります。
+`XESTRATA_DRAFT_PROBE=0` で測らず（auto は両方を読みます）、`XESTRATA_DRAFT_PROBE_TOKENS` で 1 回の長さ（既定 64）を
+変えます。`--draft mtp|dflash2|off` と数字の `--spec` はそのとおりにします。`--serve` なしの auto は MTP の層です。
 
-DFlash2 の窓は `--draft-conf P` で、selector 確率の積が P を下回る所で閉じます（既定は drafter 読み込み後の
-expert slots から決めます。`--draft-conf` の明示が優先）。`--draft dflash2` は既定で MTP の層を読みません
-（`--draft-fallback mtp` で両方）。DFlash2 は 1 枚の GPU・1 要求ずつです（層分割・`--batch`・pipeline windows は
-MTP のまま）。greedy の答えは drafter によらず同じです（検証の窓が target の argmax を出します）。
+両方を残したときは、要求の `xestrata_draft`（`mtp|dflash2|auto|off`）が明示ならそれに従い、なければ
+`--draft-rule df2|mtp|learn`（既定 learn）です。learn は要求の種類（prompt 先頭 32 トークン）× 文脈の深さ
+（2K/8K/32K の境）ごとに、実測の decode 速度（EMA）の良い方を選び、負けた側も時々試します（差 4% 未満で 6 回に
+1 回、以上で 12 回に 1 回）。
 
-plain エンジン（Qwen3.6・Ornith など）も同じ `--draft`・`xestrata_draft`・tap の機構を共有しますが、DFlash2 の
-重みは Qwen3.8-Flash-Next 用なので plain モデル用の pack はまだなく、`--draft dflash2` は拒否、auto は MTP を保ちます。
+DFlash2 の窓は `--draft-conf P` で、selector 確率の積が P を下回る所で閉じます（既定は expert slots から決めます。
+`--draft-conf` の明示が優先）。`--draft dflash2` は既定で MTP の層を読みません（Qwen3.8-Flash-Next は
+`--draft-fallback mtp` で両方）。DFlash2 は 1 枚の GPU・1 要求ずつです（層分割・`--batch`・pipeline windows は
+MTP のまま）。plain エンジンの `--draft dflash2` は `--serve` だけです。greedy の答えは drafter によらず同じです
+（検証の窓が target の argmax を出します）。
 
 サーバーの decode では、VRAM にないエキスパートを順位 7 以下（上位 10 のうち重みの小さい 8〜10 番目）で選んだトークンでは、その寄与を 0 にし、検証の窓のどのトークンもその順位でしか選ばないものは読まず計算もしません（`XESTRATA_ROUTE_TAIL_SKIP`、既定 7、upstream b4e3407b）。
 残りのエキスパートの重みは正規化し直しません。そのぶん答えが少し変わります。upstream は窓のほかのトークンがそのエキスパートを使わないときだけ 0 にするので、トークンの出力が窓のほかの行で変わりました。XeStrata はトークンごとに決めます。
@@ -516,7 +528,7 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | `--no-pcie-split` | VRAM にないエキスパートを、すべて CPU で計算する |
 | `--pcie-frac F` | VRAM にないエキスパートのうち、どの窓でもこの割合を PCIe で GPU が読む（測った分け方の代わり。要求ごとの `strata_tune` の `pcie_frac` も効きます） |
 | `--vram-elastic` | `--serve` で 1 GPU のとき、VRAM のエキスパートの段をセグメント（`--vram-segment-mib`、既定 512）に分けて持ち、画像の仕事の前に空けて後で戻す（`--image-gpu-policy shrink`） |
-| `--prefill-cpu-share S` | prefill で VRAM にないエキスパートのうち、CPU のプールが計算する割合（0〜1。既定の `auto` は起動時に測った時間から決める。0 ですべて GPU）。CPU と GPU は丸めが違い、CPU が受け持つエキスパートは VRAM にあるエキスパートで変わります。そのエキスパートの段は `--expert-cache auto` のとき起動時の空き VRAM で大きさが決まるので、同じ問いの貪欲な答えが実行ごとに少し変わることがあります。0 なら毎回同じです |
+| `--prefill-cpu-share S` | prefill で VRAM にないエキスパートのうち、CPU のプールが計算する割合（0〜1。既定は `auto` でプロンプトごとに測る。0 ですべて GPU）。CPU と GPU は丸めが違うので、割合が実行ごとに動くと貪欲な答えも動きます。setup は PC とモデルの組ごとに一度だけ測った値を設定に書きます。0 なら毎回同じです |
 | `--pool-workers N` | エキスパートを計算する CPU のスレッドの数（既定は物理コアの数より 1 少なく、多くて 32。Linux のコンテナで CPU の割り当て（cgroup）があれば、その数より 1 少ない数まで） |
 | `--pool-cores LIST`、`--aux-cpus SET`、`--pool-tasks N`、`--no-host-worker`、`--memory-limit-mib N` | CPU のワーカーを置く CPU、ワーカーでもホストでもないスレッドを置く CPU（要求ごとの `strata_tune` の `aux_cpus` も効きます）、プールの 1 段の仕事の数、ホストのスレッドを仕事に加えないこと、会話の退避と保存が数える RAM の上限（Qwen3.8-Flash-Next と同じ意味） |
 | `--prompt-chunk N` | prefill で一度にまとめて計算する最大のトークン数（既定は 4096。VRAM のエキスパートの枠がもっと大きい塊を貸せるときはそれ。32768 まで、塊のバッファーが枠の 85% 以内に収まるもの。0 でまとめない） |
@@ -823,6 +835,7 @@ xestrata --setup --gguf ~/models/My-Model-Q4_K_M-00001-of-00003.gguf --name my-m
 - **入れられるもの**: Qwen3.8-Flash-Next（`qwen4exp`）と、ほかのモデルと同じアーキテクチャのもの（`qwen35moe`: Ornith-1.5・Qwen3.6-35B-A3B、`qwen35`: Qwen3.5 の 9B・2B・0.8B、`qwen3moe`: llm-jp-4.1、`glm5-next`: GLM-5.3-Flash）。
 - **渡すもの**: `.gguf` のファイル（分かれたモデルならどれか 1 つ。全部を同じフォルダーに置きます）か、1 つのモデルだけがあるフォルダー。`--name` を省くとファイルの名前を使います。
 - **確かめること**: setup はヘッダーを読み、エンジンに動かせるかを聞きます（`xestrata-engine --check-model <ファイル>`。GPU は開きません）。
+  エンジンがどの形にコンパイルされているかは `xestrata-engine --geometry` が 1 行で答えます（既定は `flash_next`。GPU は開きません）。
   ヘッダーが読めないとき（途中で切れたファイルを含む）、別のアーキテクチャのとき、エキスパートや PLE の表がエンジンのカーネルにない形式のときは、層ごとの理由を出して止まり、何も作りません。
 - **入るもの**: `custom-<名前>` という名前で、設定（`xestrata-custom-<名前>.json`）とパックを作ります。setup の大きさとは別なので、公式の版を上書きしません。
   起動、`--bench`、`--calibrate` では `--model custom-<名前>` を指定します。
@@ -1092,7 +1105,7 @@ print(r.choices[0].message.content)
   setup は、対話で動かした最初の 1 回と `--setup` のときに、使うかを尋ねて `settings.json` に書きます（`--script-guard ja|en|ko|zh-cn|zh-tw|off` で尋ねずに決められます）。勧める答えは、システムの言語が日本語なら `ja`、韓国語なら `ko`、中国語なら `zh-cn`（台湾・香港は `zh-tw`）、ベトナム語なら `off`、それ以外は `en` です。
   XeStrata の計測（`xestrata --setup --bench`、`tools/` の計測の道具、リリースと upstream の追従の比べ）は、どの要求にも `"script_guard": "off"` を付けるので、この設定に左右されません。
   Web のチャット設定では、最初は表示言語が日本語なら「日本語」、韓国語なら「韓国語」、中国語なら「中国語（簡体）」、それ以外なら「英語など（CJKV 以外）」が選ばれています。止める字の言語で書かせるときはオフにします。
-  logit_bias を受け付けないエンジン（古いエンジン、`"parallel"` のバッチの枠）では効かず、server のウィンドウにそう 1 行出します。
+  logit_bias を受け付けないエンジン（古いエンジン）と、`"parallel"` のバッチの枠（この守りは 1 度に 1 つの要求の分しか持ちません）では効かず、server のウィンドウにそう 1 行出します。
   `GET /props` の `script_guard` が指定のない要求に効く値を、`/metrics` の `script_guard`（Prometheus では `strata:script_guard_*_total`）が効かせた要求、書き直した字、通した字の数を示します。
 - **1 つのトークンを繰り返す返答は打ち切ります**: 返答が同じトークンを 256 回続けたら、server はそこで `finish_reason` を `"length"` にして終え、ウィンドウにそう表示します。
   ループに入ったモデルや、1 つのトークンを出し続ける壊れた状態のためです（upstream の #606 では `!` が 36,689 個続きました）。

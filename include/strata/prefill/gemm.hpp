@@ -64,6 +64,10 @@ public:
     static bool f16_groups(const uint16_t* X, const uint16_t* W, int64_t w_stride, float* Y, const int32_t* bounds,
                            int G, int64_t N, int64_t K, void* stream);
 
+    /// FP32 row-major X[T,K] times W[N,K]^T into Y[T,N].  False when no library backend takes this device.
+    static bool f32(const float* X, const float* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                    void* stream);
+
     /// Whether `stream`'s GPU takes i8: oneMath's backend for it has int8 products (asked of it once, by a trial), or
     /// oneDNN takes the GPU (kernels::i8_gemm_s32: Intel's GPUs, the free mode's int8 products).
     static bool i8_usable(void* stream);

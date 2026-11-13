@@ -21,6 +21,7 @@
 #include "strata/core/kv_elastic.hpp"
 #include "strata/core/kv_grow_hold.hpp"
 #include "strata/core/plain_model.hpp"
+#include "strata/core/dense_slab.hpp"
 #include "strata/core/constraint_upload.hpp"
 
 #include "strata/core/plain_cpu.hpp"
@@ -38,6 +39,7 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/dflash2.hpp"
+#include "strata/kernels/glm5.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -117,6 +119,7 @@ PlainModel::~PlainModel() {
     if (swap_cs_ != nullptr) strata::gpu::stream_sync(swap_cs_);
     if (cs_ != nullptr) strata::gpu::stream_sync(cs_);
     strata::gpu::free(tap_dev_);
+    strata::gpu::free(ptap_dev_);
     for (auto* e : prompt_share_events_) if (e) strata::gpu::event_destroy(e);
     prompt_gemm_.reset();   // the products' state before the stream
     strata::gpu::free(prompt_host_);
@@ -136,7 +139,13 @@ PlainModel::~PlainModel() {
         for (auto& [key, v] : *m)
             for (auto* g : v) strata::gpu::graph_destroy(g);
     for (auto& h : helpers_) h.reset();   // (their streams before the memory below)
+    for (size_t g = 0; n_snap_load_ >= 0 && g < gdn_snap_.size(); ++g)   // set_window_drafts' copies (not in allocs_)
+        for (size_t t = (size_t) n_snap_load_; t < gdn_snap_[g].size(); ++t) {
+            strata::gpu::free(gdn_snap_[g][t]);
+            strata::gpu::free(conv_snap_[g][t]);
+        }
     for (void* p : allocs_) strata::gpu::free(p);
+    dense_slab_.reset();
     for (void* p : {(void*) h_emb_, (void*) h_step_, (void*) h_pos_, (void*) h_out_, (void*) h_prob_, (void*) fill_tmp_,
                     (void*) hand_host_, (void*) h_rroute_})
         strata::gpu::free(p);
@@ -183,12 +192,13 @@ bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::
         w.data = nullptr;
         return true;
     }
-    void* d = nullptr;
-    if (!strata::gpu::alloc_device(&d, bytes)) {
+    if (!dense_slab_) dense_slab_ = std::make_unique<DenseSlab>();
+    void* d = dense_slab_->alloc(bytes);
+    if (!d) {
         err = "plain model: no VRAM for " + name;
         return false;
     }
-    allocs_.push_back(d);
+    if (!dense_slab_->owns(d)) allocs_.push_back(d);
     if (!strata::gpu::copy(d, src, bytes)) {
         err = "plain model: uploading " + name + " failed";
         return false;
@@ -247,12 +257,13 @@ bool PlainModel::upload_f32(const GgufModel& m, const std::string& name, uint64_
         }
         src = wide.data();
     }
-    void* d = nullptr;
-    if (!strata::gpu::alloc_device(&d, elements * 4)) {
+    if (!dense_slab_) dense_slab_ = std::make_unique<DenseSlab>();
+    void* d = dense_slab_->alloc(elements * 4);
+    if (!d) {
         err = "plain model: no VRAM for " + name;
         return false;
     }
-    allocs_.push_back(d);
+    if (!dense_slab_->owns(d)) allocs_.push_back(d);
     if (!strata::gpu::copy(d, src, elements * 4)) {
         err = "plain model: uploading " + name + " failed";
         return false;
@@ -818,6 +829,7 @@ bool PlainModel::load_qwen(std::string& err) {
     }
     if (has_mtp_) {
         const std::string p = "blk." + std::to_string(s.n_layer) + ".nextn.";
+        mtp_allocs_[0] = allocs_.size();   // the layer's own weights (release_mtp)
         mtp_.attn = n_attn++;
         if (!load_block(m, s.n_layer, mtp_, err) || !upload(m, p + "eh_proj.weight", mtp_eh_, err) ||
             !upload_f32(m, p + "enorm.weight", N, mtp_enorm_, err) ||
@@ -831,6 +843,7 @@ bool PlainModel::load_qwen(std::string& err) {
         if (m.find(p + "shared_head_norm.weight") != nullptr &&
             !upload_f32(m, p + "shared_head_norm.weight", N, mtp_head_norm_, err))
             return false;
+        mtp_allocs_[1] = allocs_.size();
     }
 
     if (nkv_ == 0) { err = "plain model: the model has no attention block"; return false; }
@@ -1532,7 +1545,8 @@ bool PlainModel::open_experts(std::string& err) {
     q = std::min<int64_t>(q, E);
     if (opt_.expert_slots >= 0) q = std::min<int64_t>(q, opt_.expert_slots / std::max<int64_t>(L, 1));
     if (q < 1 && LS > 0) {
-        err = "plain model: no VRAM is left for the expert tier (" + std::to_string(free_b >> 20) + " MiB free)";
+        err = "plain model: no VRAM is left for the expert tier (" + std::to_string(free_b >> 20) +
+              " MiB free); reduce --max-context, --batch or --vram-reserve-mib, or close other GPU programs";
         return false;
     }
     // the xe driver gives VRAM only with as much RAM free beside it, and the file cache does not count as free there
@@ -2643,6 +2657,45 @@ bool PlainModel::set_history(const int32_t* tokens, int n, std::string& err) {
     return true;
 }
 
+void PlainModel::set_slot_history(int slot, const int32_t* tail, int64_t n) {
+    PlainModel& t = this->tail();
+    if (slot < 0 || slot >= t.batch_slot_count()) return;
+    if ((int) t.slot_tail_.size() <= slot) t.slot_tail_.resize((size_t) slot + 1);
+    if (n > 0) t.slot_tail_[(size_t) slot].assign(tail, tail + n);
+    else t.slot_tail_[(size_t) slot].clear();
+}
+
+bool PlainModel::set_slot_logit_bias(int slot, const std::vector<float>& bias, std::string& err) {
+    PlainModel& t = tail();
+    if (slot < 0 || slot >= t.batch_slot_count()) return true;
+    if ((int) t.slot_bias_dev_.size() <= slot) {
+        t.slot_bias_dev_.resize((size_t) slot + 1, nullptr);
+        t.slot_bias_on_.resize((size_t) slot + 1, 0);
+    }
+    if (bias.empty()) {   // its array stays for the slot's next bias; only this request's rows stop reading it
+        t.slot_bias_on_[(size_t) slot] = 0;
+        return true;
+    }
+    if (cpu_ != nullptr) { err = "plain model: a slot's logit_bias needs a GPU"; return false; }
+    if (bias.size() != (size_t) t.n_vocab_) { err = "plain model: logit_bias vocabulary size mismatch"; return false; }
+    const OnDevice on(t.dev_);
+    float*& dev = t.slot_bias_dev_[(size_t) slot];
+    const size_t bytes = bias.size() * sizeof(float);
+    if (dev == nullptr) {
+        if (!strata::gpu::alloc_device(&dev, bytes)) {
+            err = "plain model: cannot allocate the slot's logit_bias";
+            return false;
+        }
+        t.allocs_.push_back(dev);
+    }
+    if (!strata::gpu::copy(dev, bias.data(), bytes)) {   // its own array: a request's bias is its row's alone
+        err = "plain model: cannot upload the slot's logit_bias";
+        return false;
+    }
+    t.slot_bias_on_[(size_t) slot] = 1;
+    return true;
+}
+
 void PlainModel::pick(const float* logits, int T, int64_t pos, int32_t* out, strata::gpu::Stream cs) const {
     k::SamplerParams sp = sampler_;
     sp.counter = (uint64_t) pos;   // row t's draw: position pos + t
@@ -3260,11 +3313,189 @@ bool PlainModel::moe_experts(int64_t ml, int T, uint32_t ring, std::vector<strat
 
 // the DFlash2 tap of a block: its completed output (the plain residual has one hc stream), the window's rows
 void PlainModel::tap_block(const Block& b, int T, strata::gpu::Stream cs) {
-    if (tap_dev_ == nullptr) return;
     const int64_t l = &b >= blocks_.data() && &b < blocks_.data() + blocks_.size() ? &b - blocks_.data() : -1;
-    if (l < 0 || l >= (int64_t) tap_slot_.size() || tap_slot_[(size_t) l] < 0) return;
+    tap_rows(l, x_, 1, T, 0, true, cs);
+}
+
+// A tapped layer's completed output (R: [T][hc][n_embd], the mean of the hc streams: GLM-5.3-Flash's four, as sglang's
+// DFlash2 capture contracts them) into the window's taps, or the prompt's rows at or after ptap_first_ into its staging
+void PlainModel::tap_rows(int64_t l, const float* R, int hc, int64_t T, int64_t p0, bool window, strata::gpu::Stream cs) {
+    if (!taps_on_ || l < 0 || l >= (int64_t) tap_slot_.size() || tap_slot_[(size_t) l] < 0) return;
     const int64_t N = spec_.n_embd, nt = (int64_t) tap_local_.size();
-    strata::kernels::df2_tap_rows(x_, tap_dev_ + (size_t) tap_slot_[(size_t) l] * N, nt * N, N, 1, T, cs);
+    if (window) {
+        if (tap_dev_ != nullptr)
+            strata::kernels::df2_tap_rows(R, tap_dev_ + (size_t) tap_slot_[(size_t) l] * N, nt * N, N, hc, (int) T, cs);
+        return;
+    }
+    if (ptap_dev_ == nullptr) return;
+    const int64_t t0 = std::clamp<int64_t>(ptap_first_ - p0, 0, T), rows = T - t0;
+    if (rows <= 0 || rows > ptap_cap_) return;
+    strata::kernels::df2_tap_rows(R + (size_t) (t0 * hc * N), ptap_dev_ + (size_t) tap_slot_[(size_t) l] * N, nt * N, N,
+                                  hc, (int) rows, cs);
+}
+
+bool PlainModel::prompt_taps_deliver(const float* staging, int64_t T, int64_t p0, strata::gpu::Stream cs,
+                                     std::string& err) {
+    if (!taps_on_ || !prompt_taps_ || staging == nullptr || tap_local_.empty()) return true;
+    const int64_t t0 = std::clamp<int64_t>(ptap_first_ - p0, 0, T), rows = T - t0;
+    if (rows <= 0) return true;
+    if (staging == ptap_dev_ && rows > ptap_cap_) {
+        err = "plain model: the DFlash2 prompt taps' staging is smaller than the chunk's tapped rows";
+        return false;
+    }
+    if (!strata::gpu::stream_sync(cs)) { err = std::string("plain model: ") + strata::gpu::last_error(); return false; }
+    // a window's taps hold all of its rows: from the first tapped one
+    const float* from = staging == ptap_dev_ ? staging : staging + (size_t) (t0 * (int64_t) tap_local_.size() * spec_.n_embd);
+    return prompt_taps_(from, rows, p0 + t0, err);
+}
+
+bool PlainModel::set_prompt_taps(int64_t first_pos, int64_t cap_rows,
+                                 std::function<bool(const float*, int64_t, int64_t, std::string&)> on,
+                                 std::string& err) {
+    PlainModel& t = tail();
+    if (&t != this) return t.set_prompt_taps(first_pos, cap_rows, std::move(on), err);
+    ptap_first_ = first_pos;
+    if (cap_rows <= 0 || !on || tap_local_.empty()) {
+        if (cs_ != nullptr) strata::gpu::stream_sync(cs_);
+        strata::gpu::free(ptap_dev_);
+        ptap_dev_ = nullptr;
+        ptap_cap_ = 0;
+        prompt_taps_ = nullptr;
+        return true;
+    }
+    if (ptap_dev_ == nullptr || ptap_cap_ != cap_rows) {
+        if (cs_ != nullptr) strata::gpu::stream_sync(cs_);
+        strata::gpu::free(ptap_dev_);
+        ptap_dev_ = nullptr;
+        ptap_cap_ = 0;
+        if (!strata::gpu::alloc_device(&ptap_dev_, (size_t) cap_rows * tap_local_.size() * (size_t) spec_.n_embd * 4)) {
+            err = "plain model: the DFlash2 prompt taps' staging does not fit";
+            return false;
+        }
+        ptap_cap_ = cap_rows;
+    }
+    prompt_taps_ = std::move(on);
+    return true;
+}
+
+void PlainModel::taps_off() {
+    PlainModel& t = tail();
+    if (&t != this) { t.taps_off(); return; }
+    std::string e;
+    set_prompt_taps(0, 0, nullptr, e);
+    if (taps_on_ && !tap_local_.empty()) {
+        taps_on_ = false;
+        drop_window_graphs();   // captured with the tap kernels
+    }
+    taps_on_ = false;
+}
+
+void PlainModel::drop_window_graphs() {
+    if (cs_ != nullptr) strata::gpu::stream_sync(cs_);
+    for (auto& g : exec_)
+        if (g) { strata::gpu::graph_destroy(g); g = nullptr; }
+    for (auto& v : segs_) {
+        for (auto* g : v) strata::gpu::graph_destroy(g);
+        v.clear();
+    }
+    for (auto& g : rexec_)
+        if (g) { strata::gpu::graph_destroy(g); g = nullptr; }
+}
+
+bool PlainModel::set_window_drafts(int drafts, std::string& err) {
+    if (!next_.empty()) { err = "plain model: more window drafts on a layer split"; return false; }
+    if (n_snap_load_ < 0) n_snap_load_ = n_snap_;
+    drafts = std::max(drafts, n_snap_load_);   // never fewer than the load's (the MTP layer's windows)
+    drafts = std::min(drafts, std::min(opt_.max_t, k::kVerifyMaxT + 1) - 1);
+    if (glm_) drafts = std::min(drafts, k::kGlm5MaxSnaps);
+    if (drafts == n_snap_) return true;
+    if (cs_ != nullptr) strata::gpu::stream_sync(cs_);
+    if (drafts > n_snap_) {
+        std::vector<void*> made;
+        for (size_t g = 0; g < gdn_state_.size(); ++g) {
+            if (gdn_state_[g] == nullptr) continue;
+            if (gdn_snap_.size() <= g) { gdn_snap_.resize(gdn_state_.size()); conv_snap_.resize(gdn_state_.size()); }
+            while ((int) gdn_snap_[g].size() < drafts) {
+                float *st = nullptr, *cv = nullptr;
+                if (!strata::gpu::alloc_device(&st, state_bytes_) || !strata::gpu::alloc_device(&cv, conv_bytes_)) {
+                    strata::gpu::free(st);
+                    for (size_t h = 0; h < gdn_state_.size() && h < gdn_snap_.size(); ++h)
+                        while ((int) gdn_snap_[h].size() > n_snap_) {   // back to what there was
+                            strata::gpu::free(gdn_snap_[h].back());
+                            strata::gpu::free(conv_snap_[h].back());
+                            gdn_snap_[h].pop_back();
+                            conv_snap_[h].pop_back();
+                        }
+                    err = "plain model: no VRAM for the recurrent states' copies of the longer windows";
+                    return false;
+                }
+                gdn_snap_[g].push_back(st);
+                conv_snap_[g].push_back(cv);
+            }
+        }
+    } else {
+        for (size_t g = 0; g < gdn_snap_.size(); ++g)
+            while ((int) gdn_snap_[g].size() > drafts) {
+                strata::gpu::free(gdn_snap_[g].back());
+                strata::gpu::free(conv_snap_[g].back());
+                gdn_snap_[g].pop_back();
+                conv_snap_[g].pop_back();
+            }
+    }
+    n_snap_ = drafts;
+    drop_window_graphs();   // a window's graph took the copies of its rows
+    return true;
+}
+
+uint64_t PlainModel::release_mtp(bool keep_head) {
+    PlainModel& t = tail();
+    if (&t != this) return t.release_mtp(keep_head);
+    if (!has_mtp_) return 0;
+    if (cs_ != nullptr) strata::gpu::stream_sync(cs_);
+    for (auto& g : mexec_)
+        if (g) { strata::gpu::graph_destroy(g); g = nullptr; }
+    for (auto& v : msegs_) {
+        for (auto* g : v) strata::gpu::graph_destroy(g);
+        v.clear();
+    }
+    for (auto& g : mrexec_)
+        if (g) { strata::gpu::graph_destroy(g); g = nullptr; }
+    size_t fb0 = 0, fb1 = 0, tb = 0;
+    strata::gpu::mem_info(&fb0, &tb);
+    // the layer's own weights: the allocations its load made (the K/V pool stays: a saved state carries it)
+    for (size_t i = mtp_allocs_[0]; i < mtp_allocs_[1] && i < allocs_.size(); ++i) {
+        strata::gpu::free(allocs_[i]);
+        allocs_[i] = nullptr;
+    }
+    int2_.reset();
+    if (!keep_head) {   // the drafts' subset (DFlash2 reads it when it stays)
+        subset_.reset();
+        dhead_ = nullptr;
+        dvocab_.clear();
+        n_dvocab_ = 0;
+    }
+    has_mtp_ = false;
+    n_mtp_ = 0;
+    drafts_.clear();
+    dprob_.clear();
+    strata::gpu::mem_info(&fb1, &tb);
+    return fb1 > fb0 ? (uint64_t) (fb1 - fb0) : 0;
+}
+
+PlainModel::HeadView PlainModel::draft_head_view() const {
+    const PlainModel& t = tail();
+    HeadView v;
+    v.type = t.head_.type;
+    v.n_in = t.head_.n_in;
+    if (t.dhead_ != nullptr && t.subset_) {
+        v.rows = t.dhead_;
+        v.n_rows = t.n_dvocab_;
+        v.vocab_dev = t.subset_->ids_device();
+    } else {
+        v.rows = t.head_.data;
+        v.n_rows = t.head_.n_out;
+    }
+    return v;
 }
 
 void PlainModel::steer(const Block& b, int64_t T, float* x, strata::gpu::Stream cs) const {
@@ -3631,6 +3862,9 @@ bool PlainModel::forward_run(const int32_t* tokens, int64_t n, int64_t pos, int3
     if (S < 2 || opt_.pipeline_windows == 0 || wins.size() < 2) {
         for (const Win& w : wins) {
             if (!forward(tokens + w.at, w.T, pos + w.at, out, &w == &wins.back() ? logits : nullptr, err)) return false;
+            // DFlash2's prompt taps: the window's own (set_prompt_taps)
+            PlainModel& t = tail();
+            if (t.prompt_taps_ && !t.prompt_taps_deliver(t.tap_dev_, w.T, pos + w.at, t.cs_, err)) return false;
             if (progress) progress(w.at + w.T);
         }
         return true;
@@ -3928,12 +4162,56 @@ bool PlainModel::stage_slots(const int32_t* tokens, const int* slot, const int64
     if (!(eager ? run_window(T, false, err)
                 : launch_serve(bexec_[set], bsegs_[set], moe_trunk_, moe_local_.data(), T, err)))
         return false;
-    if (last())
-        for (int t = 0; t < T; ++t) {   // each row with its request's sampling, its draw counted from its position
+    if (last()) {
+        // Each row with its request's sampling, its draw counted from its position; a penalised slot's row with its
+        // reply tail and this window's tokens of it (`slot_penalty_rows`: what a solo request's row holds), and a
+        // slot's own logit bias (set_slot_logit_bias).  A plain greedy row without them keeps the window's pick.
+        const auto penalised = [](const k::SamplerParams& p) {
+            return p.penalty_last_n > 0 &&
+                   (p.penalty_repeat != 1.0f || p.penalty_freq != 0.0f || p.penalty_present != 0.0f);
+        };
+        int h = 0;
+        for (int t = 0; t < T; ++t)
+            if (penalised(sp[t])) h = std::max(h, std::min(sp[t].penalty_last_n, k::kPenaltyWindowCap));
+        std::vector<int32_t> hrows;
+        if (h > 0) {
+            std::vector<const int32_t*> tails((size_t) batch_slot_count(), nullptr);
+            std::vector<int64_t> n_tails((size_t) batch_slot_count(), 0);
+            for (int b = 0; b < batch_slot_count() && b < (int) slot_tail_.size(); ++b) {
+                tails[(size_t) b] = slot_tail_[(size_t) b].data();
+                n_tails[(size_t) b] = (int64_t) slot_tail_[(size_t) b].size();
+            }
+            hrows.assign((size_t) T * (size_t) h, -1);
+            k::slot_penalty_rows(slot, tokens, T, tails.data(), n_tails.data(), h, hrows.data());
+            const size_t need = (size_t) T * (size_t) h;
+            if (slot_hist_cap_ < need) {   // its own buffer: the solo window's history keeps its own
+                int32_t* d = nullptr;
+                if (!strata::gpu::alloc_device(&d, need * 4)) {
+                    err = std::string("plain model: the slots' penalty history: ") + strata::gpu::last_error();
+                    return false;
+                }
+                allocs_.push_back(d);
+                slot_hist_dev_ = d;
+                slot_hist_cap_ = need;
+            }
+            if (!strata::gpu::copy(slot_hist_dev_, hrows.data(), need * 4)) {
+                err = std::string("plain model: the slots' penalty history: ") + strata::gpu::last_error();
+                return false;
+            }
+        }
+        for (int t = 0; t < T; ++t) {
             k::SamplerParams p = sp[t];
             p.counter = (uint64_t) pos[t];
-            k::sample_tokens(logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_, nullptr, 0, p, m_out_ + t, cs_);
+            const int b = slot[t];
+            const bool pen = h > 0 && penalised(p);
+            const bool bias = b >= 0 && b < (int) slot_bias_on_.size() && slot_bias_on_[(size_t) b] != 0;
+            if (bias) p.logit_bias = slot_bias_dev_[(size_t) b];
+            if (!pen) p.penalty_last_n = 0;   // no history handed to this row: nothing for it to count
+            k::sample_tokens(logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_,
+                             pen ? slot_hist_dev_ + (size_t) t * (size_t) h : nullptr, pen ? h : 0, p, m_out_ + t,
+                             cs_);
         }
+    }
     if (!strata::gpu::stream_sync(cs_)) {
         err = std::string("plain model: the batch window: ") + strata::gpu::last_error();
         return false;
@@ -3952,6 +4230,7 @@ bool PlainModel::stage_slots(const int32_t* tokens, const int* slot, const int64
 }
 
 bool PlainModel::after_rows(int rows, int64_t pos0, std::string& err) {
+    if (root_->frozen_) return true;   // the start's measurement (set_frozen)
     tokens_since_adapt_ += rows;
     if (disp_.usage.empty()) return true;
     add_route_rows(disp_.usage, disp_.route_rec, trunk_layers_, spec_.n_expert, opt_.max_t, spec_.n_expert_used, rows);
@@ -4130,17 +4409,17 @@ bool PlainModel::mtp_chain(int want, int64_t pos, std::string& err, bool all) {
     return true;
 }
 
-bool PlainModel::spec_start(int32_t first, int64_t pos, std::string& err) {
+bool PlainModel::spec_start(int32_t first, int64_t pos, std::string& err, bool no_mtp) {
     if (!next_.empty()) {   // the MTP layer is the last stage's
         const OnDevice on(tail().dev_);
-        return tail().spec_start(first, pos, err);
+        return tail().spec_start(first, pos, err, no_mtp);
     }
     if (!spec_end(err)) return false;
     drafts_.clear();
     dprob_.clear();
     cur_ = first;
     cur_pos_ = pos;
-    if (!has_mtp_ || n_mtp_ < 1) return true;
+    if (!has_mtp_ || n_mtp_ < 1 || no_mtp) return true;
     // the trunk's row before `first`: prompt() leaves it in mtp_h_, a window in hn_
     if (!mtp_h_set_ &&
         !strata::gpu::copy(mtp_h_, hn_ + (size_t) (last_T_ - 1) * (size_t) spec_.n_embd, (size_t) spec_.n_embd * 4)) {
@@ -4156,13 +4435,14 @@ bool PlainModel::spec_start(int32_t first, int64_t pos, std::string& err) {
 }
 
 bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int32_t* emitted, int& n_emit, float* logits,
-                           std::string& err, const int32_t* follow, const int32_t* ext, int n_ext, int match) {
+                           std::string& err, const int32_t* follow, const int32_t* ext, int n_ext, int match,
+                           bool ext_only) {
     if (!next_.empty()) {   // the drafts are the last stage's; its window goes through every stage (root_->forward)
         const OnDevice on(tail().dev_);
-        return tail().spec_step(stop, limit, emitted, n_emit, logits, err, follow, ext, n_ext, match);
+        return tail().spec_step(stop, limit, emitted, n_emit, logits, err, follow, ext, n_ext, match, ext_only);
     }
     if (pipelined_spec()) {   // --pipeline-windows 2: a window's MTP drafts alone pipeline; else a pending guess goes
-        if (ext == nullptr && follow == nullptr && logits == nullptr)   // (no window masks: none left from before)
+        if (ext == nullptr && follow == nullptr && logits == nullptr && !ext_only)   // (no window masks: none left from before)
             return (!window_masks_ || set_allowed_rows(nullptr, 0, err)) &&
                    spec_step_pl(stop, limit, emitted, n_emit, err);
         if (!spec_end(err)) return false;
@@ -4170,14 +4450,16 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
     n_emit = 0;
     if (cur_ < 0) { err = "plain model: spec_step before spec_start"; return false; }
     // the window: the pending token and the drafts that fit the context and the limit
-    int nd = (int) std::min<int64_t>({(int64_t) drafts_.size(), limit - 1, opt_.max_cells - cur_pos_ - 1});
+    int nd = ext_only ? 0 : (int) std::min<int64_t>({(int64_t) drafts_.size(), limit - 1, opt_.max_cells - cur_pos_ - 1});
     nd = std::max(nd, 0);
     // the window rule (--spec-window) over the drafts' probabilities
     float probs[strata::spec::DraftPolicy::kMaxT + 1] = {};
     for (int j = 0; j < nd && j < (int) dprob_.size() && j < strata::spec::DraftPolicy::kMaxT; ++j) probs[j] = dprob_[(size_t) j];
     policy_.set_context(cur_pos_);   // STRATA_SPEC_COST: the round costs of this context length
-    if (opt_.spec_window == "auto") nd = std::min(nd, policy_.mtp_window(probs, n_mtp_ + 1) - 1);
-    else if (opt_.spec_window == "min-p") {
+    if (ext_only) {
+    } else if (opt_.spec_window == "auto") {
+        nd = std::min(nd, policy_.mtp_window(probs, n_mtp_ + 1) - 1);
+    } else if (opt_.spec_window == "min-p") {
         int keep = 0;
         while (keep < nd && probs[keep] >= (float) opt_.spec_min_p) ++keep;
         nd = keep;
@@ -4190,7 +4472,11 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
     const int cap = (int) std::min<int64_t>({(int64_t) n_ext, (int64_t) window_drafts(), limit - 1,
                                              opt_.max_cells - cur_pos_ - 1, (int64_t) k::cpu::MAXT - 1});
     bool from_ext = ext != nullptr && cap > nd && (nd == 0 || drafts_.empty() || ext[0] == drafts_[0]);
-    if (from_ext) {
+    if (ext_only) {   // an outside drafter's window (its own rule chose its length)
+        nd = std::max(0, cap);
+        for (int i = 0; i < nd; ++i) win[i + 1] = ext[i];
+        from_ext = false;
+    } else if (from_ext) {
         const strata::spec::DraftPolicy::Pick pk = policy_.choose(nd + 1, cap, match);
         from_ext = pk.lookup && pk.t - 1 > nd;
         if (from_ext) {
@@ -4218,7 +4504,7 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
         const OnDevice on(st->dev_);
         if (!st->after_rows(n + 1, cur_pos_, err)) return false;
     }
-    if (opt_.spec_window == "auto" && !from_ext) policy_.observe_mtp_drafts(probs, T, n);
+    if (opt_.spec_window == "auto" && !from_ext && !ext_only) policy_.observe_mtp_drafts(probs, T, n);
     for (int j = 0; j <= n; ++j) emitted[j] = out[j];
     n_emit = n + 1;
     // the recurrent states back to the last accepted row's (the attention's later cells are rewritten in turn)
@@ -4237,6 +4523,7 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
             policy_.observe(from_ext, T, n, from_ext ? match : 0,
                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
     };
+    if (ext_only) return true;   // the outside drafter drafts next (from the window's taps)
     if (cur_pos_ >= opt_.max_cells || !has_mtp_ || n_mtp_ < 1) { observe(); return true; }   // (no MTP layer)
     if (!strata::gpu::copy_async(mtp_h_, hn_, (size_t) (n + 1) * (size_t) spec_.n_embd * 4, cs_)) {
         err = std::string("plain model: the MTP layer's input: ") + strata::gpu::last_error();

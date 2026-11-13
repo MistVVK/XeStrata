@@ -31,6 +31,8 @@ struct GenKeyFields {
     float* penalty_present = nullptr;
     int* penalty_last_n = nullptr;
     bool penalty_last_n_clamp0 = false;   ///< plain: max(0, v); generate takes v as it is
+    int64_t* pen_from = nullptr;          ///< the request continues one whose reply began at token N (its penalty
+                                          ///< window starts there; a solo -> batch slot or slot -> solo leg)
     // the request
     int* ckpt_int = nullptr;              ///< generate's int
     bool* ckpt_bool = nullptr;            ///< plain's bool
@@ -55,7 +57,9 @@ struct GenKeyFields {
     bool* minp_rule = nullptr;            ///< generate: the window rule turns to min-p
     bool spec_float = false;              ///< generate: (double) strtof; plain: strtod
     bool* route_prior = nullptr;          ///< generate only
-    std::string* draft = nullptr;         ///< draft=mtp|dflash2|auto: this request's drafter (--draft auto)
+    std::string* draft = nullptr;         ///< draft=mtp|dflash2|auto|off: this request's drafter (--draft auto)
+    int* spec_cap = nullptr;              ///< spec=N: the largest window this request checks (N >= 1)
+    int* probe = nullptr;                 ///< probe=K: the start's measurement's run K (its own lines only)
     std::vector<int32_t>* allowed = nullptr;
     std::vector<uint64_t>* img_keys = nullptr;
 };
@@ -82,6 +86,7 @@ inline void parse_gen_keys(char*& endp, const GenKeyFields& f, bool geni = false
             else if (key == "penalty_repeat" && f.penalty_repeat) *f.penalty_repeat = std::strtof(v, nullptr);
             else if (key == "penalty_freq" && f.penalty_freq) *f.penalty_freq = std::strtof(v, nullptr);
             else if (key == "penalty_present" && f.penalty_present) *f.penalty_present = std::strtof(v, nullptr);
+            else if (key == "pen_from" && f.pen_from) *f.pen_from = std::strtoll(v, nullptr, 10);
             else if (key == "penalty_last_n" && f.penalty_last_n)
                 *f.penalty_last_n = f.penalty_last_n_clamp0 ? std::max(0, (int) std::strtol(v, nullptr, 10))
                                                             : (int) std::strtol(v, nullptr, 10);
@@ -123,6 +128,8 @@ inline void parse_gen_keys(char*& endp, const GenKeyFields& f, bool geni = false
             }
             else if (key == "route_prior" && f.route_prior) *f.route_prior = std::strtol(v, nullptr, 10) != 0;
             else if (key == "draft" && f.draft) *f.draft = val;
+            else if (key == "spec" && f.spec_cap) *f.spec_cap = std::max(1, (int) std::strtol(v, nullptr, 10));
+            else if (key == "probe" && f.probe) *f.probe = (int) std::strtol(v, nullptr, 10);
             else if (key == "allowed" && f.allowed) {
                 f.allowed->clear();
                 for (const char* q = v; *q != '\0';) {

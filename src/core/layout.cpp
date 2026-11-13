@@ -180,7 +180,7 @@ bool geometry_from_spec(const strata::ModelSpec& s, ModelGeometry& g, std::strin
         err = "architecture '" + s.arch_name + "': these layers are qwen4exp's";
         return false;
     }
-    const ModelGeometry d;   // what the kernels are built for
+    const ModelGeometry& d = kCompiledGeometry;   // the shape the kernels are compiled for
     // the full-attention layers' K/V heads: the first layer that is not recurrent
     int64_t head_kv = 0;
     for (int64_t l = 0; l < s.n_layer; ++l)

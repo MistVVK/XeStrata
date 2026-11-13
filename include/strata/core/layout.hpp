@@ -59,16 +59,34 @@ struct ModelGeometry {
     int64_t n_expert = 512;
     int64_t n_ff = 640;
 
-    int64_t hc_dim() const { return hc * n_embd; }
+    constexpr int64_t hc_dim() const { return hc * n_embd; }
     /// `layer % qsa_interval == qsa_interval - 1` is full attention.  Derived, not a second list.
-    int64_t n_qsa_layers() const { return n_layers / qsa_interval; }
-    int64_t n_gdn_layers() const { return n_layers - n_qsa_layers(); }
+    constexpr int64_t n_qsa_layers() const { return n_layers / qsa_interval; }
+    constexpr int64_t n_gdn_layers() const { return n_layers - n_qsa_layers(); }
 };
 
-/// Fills `g` from a qwen4exp model's GGUF shape (artifact/model_spec.hpp).  The engine's kernels are built for
-/// the defaults above, so every value the file writes must equal its default - except `n_expert`, which a pruned
-/// variant (the GSQ-RCO Coder) legitimately lowers.  False, naming the first value that differs, otherwise and for
-/// any other architecture.
+}  // namespace strata::core
+
+// The shape the Qwen3.8 engine's kernels are compiled for: `kCompiledGeometry`, defined by the geometry header chosen
+// at configure time (`-DSTRATA_GEOMETRY=<name>` selects include/strata/core/geometries/<name>.hpp,
+// `-DSTRATA_GEOMETRY_FILE=<path>` takes any header; cmake/StrataGeometry.cmake writes geometry_selected.hpp into the
+// build tree for either).  With neither option the build uses Flash-Next's header and adds no compile flag, so the
+// default build is the one it was.  A kernel that fixes a dimension at compile time asserts it against
+// `kCompiledGeometry`; geometry_checks.hpp holds the constraints every shape must meet.  The device-dependent sizes
+// (tiles, chunks, work-groups) are not here: they stay what the device's report picks at run time.
+#if __has_include("strata/core/geometry_selected.hpp")
+#include "strata/core/geometry_selected.hpp"
+#else
+#include "strata/core/geometries/flash_next.hpp"
+#endif
+#include "strata/core/geometry_checks.hpp"
+
+namespace strata::core {
+
+/// Fills `g` from a qwen4exp model's GGUF shape (artifact/model_spec.hpp).  The engine's kernels are compiled for
+/// the compiled shape (kCompiledGeometry), so every value the file writes must equal its value - except `n_expert`,
+/// which a pruned variant (the GSQ-RCO Coder) legitimately lowers.  False, naming the first value that differs,
+/// otherwise and for any other architecture.
 bool geometry_from_spec(const strata::ModelSpec& s, ModelGeometry& g, std::string& err);
 
 /// True for the full-attention layers.  `docs/semantics.md` gives this twice over - `full_attention_interval

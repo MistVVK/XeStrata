@@ -52,6 +52,25 @@ void gdn_step_norm_multi(float* state, const float* h, int conv_channels, const 
                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int n_tok,
                          const int32_t* n_keep, void* stream, int t_out_begin = 0, void* y_q8_1 = nullptr,
                          const GdnRowCopies* snaps = nullptr);
+/// The groups of a batch window's GDN layer: group gi's recurrence reads state[gi] over its ntok[gi] rows at
+/// h + first[gi] * conv_channels, gate|beta + first[gi] * h_v, z|y + first[gi] * value_dim, and (commit) runs
+/// *keep[gi] tokens and writes the state; without commit the rows run from the untouched state (verify).  One launch
+/// for all groups, each group's arithmetic the same as its own gdn_step_norm_multi call (upstream 7a9245b6c).
+struct GdnGroups {
+    float* state[kVerifyMaxT] = {};
+    const int32_t* keep[kVerifyMaxT] = {};
+    uint8_t* y_q8_1[kVerifyMaxT] = {};   ///< the group's q8_1 image of its rows (nullptr: none)
+    int first[kVerifyMaxT] = {};         ///< the group's first row in the window's buffers
+    int ntok[kVerifyMaxT] = {};
+    int n = 0;
+};
+void gdn_step_norm_groups(const GdnGroups& g, const float* h, int conv_channels, const float* gate, const float* beta,
+                          const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, bool commit,
+                          void* stream);
+/// Whether one launch of the groups is faster than a gdn_step_norm_multi call a group on this device, for `n` groups
+/// of at most `max_tok` rows (timed once per device and window shape on dummy buffers; the caller's own choice).
+bool gdn_groups_pays(int n, int max_tok, int conv_channels, int h_k, int h_v, void* stream);
+
 /// The commit of `n_layers` GDN layers in two launches (upstream 6f3e3810): layer i's conv history is
 /// `state + i * state_stride + conv_off` and its qkv rows `qkv + i * qkv_stride`, as gdn_conv_commit; its recurrence
 /// state `state + i * state_stride` over the first *n_keep rows of `h + i * h_stride` / `gate|beta + i * gb_stride`, as
