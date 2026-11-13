@@ -120,6 +120,21 @@ std::array<std::vector<float>, CostLearner::kMaxT + 1> CostLearner::sets(int buc
     return out;
 }
 
+bool CostLearner::state_known(int bucket, int min_n) const {
+    if (bucket < 0 || bucket >= kCtxBuckets) return false;
+    const int need = std::max(1, min_n);
+    for (int t = 1; t <= kMaxT; ++t)
+        if ((int) s_[(size_t) bucket][(size_t) t].size() >= need && (int) late_s_[(size_t) bucket][(size_t) t].size() >= need) return true;
+    return false;
+}
+
+int CostLearner::usable(int bucket, int t, int min_n) const {
+    if (bucket < 0 || bucket >= kCtxBuckets || t < 1 || t > kMaxT) return 0;
+    int n = (int) s_[(size_t) bucket][(size_t) t].size();
+    if (!state_effect(bucket, min_n)) n += (int) late_s_[(size_t) bucket][(size_t) t].size();
+    return n;
+}
+
 int CostLearner::samples(int bucket, int t) const {
     if (bucket < 0 || bucket >= kCtxBuckets || t < 1 || t > kMaxT) return 0;
     return (int) s_[(size_t) bucket][(size_t) t].size();
@@ -499,15 +514,30 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match, int pa
     return p;
 }
 
-int DraftPolicy::explore_size(int lookup_k, int pad_cap) const {
-    if (learner_.rounds() + learner_.late_rounds() < kExploreAfter || forced_total_ >= kExploreBudget) return 0;
-    for (int s = 2; s <= std::min(std::max(lookup_k, pad_cap) + 1, max_t_); ++s) {
-        if (!allowed(s) || forced_[(size_t) s] >= kExplorePerSize || learner_.samples(bk_, s) >= kExploreN) continue;
+bool DraftPolicy::explore_ok() const {
+    const double age = busy_age_ < 0.0 ? 0.0 : busy_age_;
+    if (age <= CostLearner::kFreshS) return true;     // a fresh round: it counts on every machine
+    return learner_.state_known(bk_, 20) && !learner_.state_effect(bk_, 20);   // a late round counts only where the stretch has shown no state effect
+}
+
+int DraftPolicy::explore_next(int reach, int skip) const {
+    if (learner_.rounds() + learner_.late_rounds() < kExploreAfter || forced_total_ >= kExploreBudget || !explore_ok()) return 0;
+    for (int s = 2; s <= std::min(reach, max_t_); ++s) {
+        if (s == skip || !allowed(s) || forced_[(size_t) s] >= kExplorePerSize || learner_.usable(bk_, s, 20) >= kExploreN) continue;
         ++forced_[(size_t) s];
         ++forced_total_;
         return s;
     }
     return 0;
+}
+
+int DraftPolicy::explore_size(int lookup_k, int pad_cap) const {
+    return explore_next(std::max(lookup_k, pad_cap) + 1, 0);
+}
+
+int DraftPolicy::explore_window(int t, int cap) const {
+    if (!learning_ || fixed_) return 0;
+    return explore_next(cap, t);
 }
 
 void DraftPolicy::observe_forced(int t, double round_ms) {

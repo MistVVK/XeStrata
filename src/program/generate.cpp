@@ -19591,6 +19591,14 @@ int main(int argc, char** argv) {
                         chain_n = std::max(0, t - T);
                     }
                 }
+                // a learning stretch times the window sizes the round's own rule does not reach: the MTP / drafter window of a round with no lookup and no
+                // chain is run at another size (the rows past the real drafts are whatever the drafts array holds: valid ids that the verifier rejects);
+                // a deterministic window only, and only the learning stretch (DraftPolicy::explore_window)
+                bool win_forced = false;
+                if (dc_learning && draft_on && !first_window && !merged && !from_sfx && chain_n == 0 && !gated_proposal && !(use_mtp && !req_df2 && mtp.prob())) {
+                    const int sx = policy.explore_window(T, std::min<int>(S_mtp, (int) drafts.size() + 1));
+                    if (sx > 0 && p + sx <= o.max_context) { T = sx; win_forced = true; }
+                }
                 const int T_mtp = T;
                 T += chain_n;
                 const bool timed_round = !first_window;
@@ -19994,9 +20002,9 @@ int main(int argc, char** argv) {
                     std::fprintf(df2_trace, "\n");
                     tr_k = 0;
                 }
-                if (spec_cost && use_mtp && timed_round && !from_sfx) policy.observe_probs(dwin_s.data(), T_mtp - 1, a);
+                if (spec_cost && use_mtp && timed_round && !from_sfx && !win_forced) policy.observe_probs(dwin_s.data(), T_mtp - 1, a);
                 if (dc_learning) policy.set_busy_age(std::chrono::duration<double>(Clock::now() - dc_busy_since).count());
-                if (timed_round && !eos && chain_n == 0 && sfx_pad > 0 && from_sfx)   // a window run for its size's sake: its time only
+                if (timed_round && !eos && chain_n == 0 && ((sfx_pad > 0 && from_sfx) || win_forced))   // a window run for its size's sake: its time only
                     policy.observe_forced(T, std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 else if (timed_round && !eos && chain_n == 0)
                     policy.observe(from_sfx, T, a, sfx_match,
@@ -21836,7 +21844,7 @@ int main(int argc, char** argv) {
                 t_cycle_ms[(size_t) T] += round_ms;
                 ++t_cycle_n[(size_t) T];
             }
-            if (spec_cost && use_mtp && timed_round && !from_sfx) policy.observe_probs(dwin.data(), T_mtp - 1, a);
+            if (spec_cost && use_mtp && timed_round && !from_sfx && !win_forced) policy.observe_probs(dwin.data(), T_mtp - 1, a);
             if (timed_round && chain_n == 0) policy.observe(from_sfx, T, a, sfx_match, round_ms);
             else if (timed_round) policy.observe_chain(T_mtp, chain_n, a, cm, round_ms);
             if (rounds % 64 == 0)

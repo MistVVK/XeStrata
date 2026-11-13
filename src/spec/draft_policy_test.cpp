@@ -450,7 +450,7 @@ int main() {
         };
         DraftPolicy y(8);
         y.set_learning(true);
-        feed(y, 100);
+        feed(y, 40);
         y.choose(1, 5, 3);
         check(y.forced_rounds() == 0, "explore: nothing is forced in the first rounds of a stretch");
         feed(y, 300);
@@ -458,24 +458,21 @@ int main() {
         check(f1.lookup && f1.t == 2 && y.forced_rounds() == 1, "explore: after the first rounds the smallest size with few samples is taken, if a proposal reaches it");
         const DraftPolicy::Pick f2 = y.choose(1, 1, 3);
         check(y.forced_rounds() == 2 && f2.lookup && f2.t == 2, "explore: a proposal of one draft reaches 2 rows only");
-        y.set_busy_age(100.0);                                      // late rounds: no size gets a fresh sample, so the per-size cap (40) and then the budget end the forcing
-        int per[DraftPolicy::kMaxT + 1] = {};
-        for (int i = 0; i < 700; ++i) {
-            const DraftPolicy::Pick pk = y.choose(1, 7, 3);
-            per[pk.t] += pk.lookup ? 1 : 0;
-            y.observe(pk.lookup, pk.t, pk.t > 1 ? pk.t - 1 : 0, 3, 76.0 + 17.0 * (pk.t - 1));
+        DraftPolicy y16(16);                                        // the budget: 14 sizes that need 30 rounds each are more than the stretch's budget
+        y16.set_learning(true);
+        feed(y16, 400);
+        for (int i = 0; i < 1200; ++i) {
+            const DraftPolicy::Pick pk = y16.choose(1, 15, 3);
+            y16.observe(pk.lookup, pk.t, pk.t > 1 ? pk.t - 1 : 0, 3, 76.0 + 17.0 * (pk.t - 1));
         }
-        int worst = 0;
-        for (int i = 2; i <= 8; ++i) worst = std::max(worst, per[i]);
-        check(y.forced_rounds() == DraftPolicy::kExploreBudget, "explore: the forced rounds stop at the stretch's budget");
-        const int before = y.forced_rounds();
-        for (int i = 0; i < 50; ++i) y.choose(1, 7, 3);
-        check(y.forced_rounds() == before, "explore: nothing is forced once the budget is spent");
+        check(y16.forced_rounds() == DraftPolicy::kExploreBudget, "explore: the forced rounds stop at the stretch's budget");
+        const int before = y16.forced_rounds();
+        for (int i = 0; i < 50; ++i) y16.choose(1, 15, 3);
+        check(y16.forced_rounds() == before, "explore: nothing is forced once the budget is spent");
         DraftPolicy z(8);                                           // the cap per size: with a budget left over, one size is still not forced more than kExplorePerSize times
         z.set_learning(true);
         feed(z, 400);
-        z.set_busy_age(100.0);                                    // every round of size 2 lands in the late set: no fresh sample ever arrives
-        for (int i = 0; i < 200; ++i) { const DraftPolicy::Pick pk = z.choose(1, 1, 3); z.observe(pk.lookup, pk.t, 0, 3, 95.0); }
+        for (int i = 0; i < 200; ++i) { const DraftPolicy::Pick pk = z.choose(1, 1, 3); z.observe(pk.lookup, pk.t, 0, 3, 0.0); }   // no time, so no sample ever arrives
         check(z.forced_rounds() == DraftPolicy::kExplorePerSize, "explore: a size is forced at most kExplorePerSize times");
         z.reset_learning();
         check(z.forced_rounds() == 0 && z.learner().rounds() == 0, "explore: a new stretch starts with a new budget");
@@ -495,7 +492,38 @@ int main() {
         for (int i = 0; i < 100; ++i) { const DraftPolicy::Pick pk = w.choose(1, 1, 3); w.observe(pk.lookup, pk.t, 1, 3, 95.0); }
         const std::vector<double> wt = w.learner().table(0, 20, 6);
         check(w.learner().samples(0, 4) == 0 && wt.size() == 6 && wt[3] > wt[2] && wt[5] > wt[3], "explore: a size no proposal reaches is filled in above the measured ones");
-        (void) worst;
+        // the window of a round that has no proposal: any undersampled size up to the cap, but not the size it already is
+        DraftPolicy m(8);
+        m.set_learning(true);
+        feed(m, 400);
+        check(m.explore_window(3, 6) == 2 && m.forced_rounds() == 1, "window: the smallest unmeasured size is run, not the one the round already has");
+        check(m.explore_window(2, 6) == 4, "window: a size with samples (3 rows) is skipped, the next unmeasured one is run");
+        check(m.explore_window(1, 1) == 0, "window: a cap of one row leaves nothing to run");
+        DraftPolicy m0(8);
+        feed(m0, 400);
+        check(m0.explore_window(3, 6) == 0, "window: nothing while learning is off");
+        // a late round counts only where the stretch has shown no state effect
+        DraftPolicy e1(8);                                          // fresh 76 ms, late 80 ms: a state effect
+        e1.set_learning(true);
+        e1.set_busy_age(2.0);
+        for (int i = 0; i < 60; ++i) e1.observe(false, 1, 0, 0, 76.0);
+        e1.set_busy_age(100.0);
+        for (int i = 0; i < 60; ++i) e1.observe(false, 1, 0, 0, 80.0);
+        check(e1.explore_window(3, 6) == 0, "gate: a late round is not forced when the stretch has a state effect");
+        e1.set_busy_age(2.0);
+        check(e1.explore_window(3, 6) == 2, "gate: a fresh round is");
+        DraftPolicy e2(8);                                          // fresh and late alike: no state effect
+        e2.set_learning(true);
+        e2.set_busy_age(2.0);
+        for (int i = 0; i < 60; ++i) e2.observe(false, 1, 0, 0, 76.0);
+        e2.set_busy_age(100.0);
+        for (int i = 0; i < 60; ++i) e2.observe(false, 1, 0, 0, 76.2);
+        check(e2.explore_window(3, 6) == 2, "gate: a late round is forced when the stretch shows no state effect");
+        DraftPolicy e3(8);                                          // late rounds only so far: unknown, so not forced
+        e3.set_learning(true);
+        e3.set_busy_age(100.0);
+        for (int i = 0; i < 150; ++i) e3.observe(false, 1, 0, 0, 76.0);
+        check(e3.explore_window(3, 6) == 0, "gate: a late round is not forced while the stretch cannot tell yet");
         // a padded window: a short proposal, a size past it that has no samples, the caller allows filler rows
         DraftPolicy g(8);
         g.set_learning(true);

@@ -62,6 +62,10 @@ public:
     int samples(int bucket, int t) const;               ///< fresh samples of a size
     /// A state effect in `bucket`: some size has at least `min_n` fresh and `min_n` late samples and their trimmed means differ by more than kStateTol.
     bool state_effect(int bucket, int min_n) const;
+    /// Some size of `bucket` has at least `min_n` fresh and `min_n` late samples: state_effect() says something (a fresh-only machine is told apart from one without effect).
+    bool state_known(int bucket, int min_n) const;
+    /// The samples of size `t` that table() would use now: the fresh ones when there is a state effect, fresh + late otherwise.
+    int usable(int bucket, int t, int min_n) const;
     /// The table of `bucket` for windows 1..n (n = the largest size seen in that bucket, or `upto` when that is larger; empty when the bucket has none):
     /// the trimmed mean (the lowest and highest kTrim share dropped) of each size with at least `min_n` samples; a size with kWeakN to min_n - 1
     /// samples counts with its median when that is within [fill, kWeakMax x fill] (a rough measurement, never below the trend); a size in between two measured ones is linear in the size; a size above the
@@ -189,11 +193,15 @@ public:
     /// current context bucket instead (the smallest such size), at most kExplorePerSize times per size and kExploreBudget times in a stretch.  The tokens of a learning stretch were never repeatable
     /// (the windows follow the live costs); a window's size can change the batch the verifier runs, and with it the tokens.  A size that
     /// no proposal ever reaches keeps its filled-in cost (CostLearner::table).
-    static constexpr int kExploreAfter = 300;
+    static constexpr int kExploreAfter = 100;
     static constexpr int kExploreN = 30;
     static constexpr int kExplorePerSize = 40;
-    static constexpr int kExploreBudget = 200;
+    static constexpr int kExploreBudget = 300;
     int forced_rounds() const { return forced_total_; }
+    /// The MTP / drafter window of a round that the caller has just decided (`t` rows, at most `cap` rows possible): the size to run instead when
+    /// a learning stretch wants to time one (rows past the drafts are the caller's filler), else 0.  Same limits as for a lookup window.  Forced
+    /// rounds happen only while they count: in the first kFreshS seconds of a busy run, or when the stretch has shown no state effect.
+    int explore_window(int t, int cap) const;
     /// Start the learning stretch again: the learner's samples and the forced-round counts.
     void reset_learning();
     /// The largest allowed window size (the table is written up to it).
@@ -250,6 +258,8 @@ private:
     bool learning_ = false;                                // set_learning: round times also go to learner_
     double busy_age_ = -1.0;                               // set_busy_age
     int explore_size(int lookup_k, int pad_cap) const;                  // the size a learning stretch measures next, 0 = none (choose() counts it)
+    int explore_next(int reach, int skip) const;                        // the smallest size 2..reach (not `skip`) that still needs rounds; counts it; 0 = none
+    bool explore_ok() const;                                            // a forced round counts now (fresh phase, or no state effect)
     mutable int forced_total_ = 0;                         // windows taken for their size's sake, this stretch
     mutable std::array<int, kMaxT + 1> forced_{};          // ... by size
     CostLearner learner_;
