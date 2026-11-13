@@ -1392,7 +1392,8 @@ FAMILIES.update(PLAIN_FAMILIES)
 # one level mixed models, copies and quantizers).  A family is one (model, version, quantization), its --family ID
 # kept; Ornith-1.5's sizes are of two quantizations (a size's own "quantizer").  BASES in the order setup lists them:
 # FIRST_CHOICE's models first.
-BASES = {"qwen3.8-27b": "Qwen3.8-27B", "qwen3.8-flash-next": "Qwen3.8-Flash-Next", "ornith-1.5": "Ornith-1.5-35B-A3B",
+BASES = {"qwen3.8-27b": "Qwen3.8-27B", "qwen3.8-flash-next": "Qwen3.8-Flash-Next",
+         "ornith-1.5": "Ornith-1.5-35B-A3B",
          "qwen3.6": "Qwen3.6-35B-A3B", "qwen3.5-9b": "Qwen3.5-9B", "qwen3.5-2b": "Qwen3.5-2B",
          "llm-jp-4.1": "llm-jp-4.1-32b-a3b-thinking", "glm-5.3-flash": "GLM-5.3-Flash", "qwen3.5-0.8b": "Qwen3.5-0.8B"}
 VARIANTS = {"original": "the original", "swift": "Swift 1.5 (UkisAI's fine-tune)",
@@ -1400,7 +1401,8 @@ VARIANTS = {"original": "the original", "swift": "Swift 1.5 (UkisAI's fine-tune)
             "swift-sc117": "Swift 1.5, abliterated by SC117", "huihui-ai": "abliterated by huihui-ai",
             "swift-huihui-ai": "Swift 1.5, abliterated by huihui-ai", "dealignai": "uncensored by dealignai",
             "llmfan46": "uncensored by llmfan46", "hauhaucs": "uncensored by HauhauCS"}
-QUANTIZERS = {"yasakani": "YASAKANI", "gsq-rco": "GSQ-RCO by ISTA-DASLab", "unsloth": "Unsloth", "gyro": "Gyro by agentionai",
+QUANTIZERS = {"yasakani": "YASAKANI", "gsq-rco": "GSQ-RCO by ISTA-DASLab", "unsloth": "Unsloth",
+              "gyro": "Gyro by agentionai",
               "ad": "AD by AtomicChat", "ornith-ai": "GGUFs by Ornith AI", "gsq-rco-pfeifferj": "GSQ-RCO by pfeifferj",
               "dealignai": "GGUFs by dealignai", "llm-jp": "GGUFs by LLM-jp", "apex": "APEX by SC117",
               "hauhaucs": "GGUFs by HauhauCS", "own": "your own files"}
@@ -8409,6 +8411,11 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     gguf = models_dir / names_of[0]
     have = all_there(models_dir)
     left = 0 if have else d["size"] / 1e9
+    if fam.get("yskn"):
+        shared = models_dir.parent / "qwen3.8-27b-yasakani-draft"
+        left = sum(size for name, (size, _) in YASAKANI_FILES[model].items()
+                   if not (models_dir / name).exists() and
+                   not (name in ("bdraft2_k8.yskn", "bdraft2_k8.shead") and (shared / name).exists())) / 1e9
     mm = fam.get("mmproj") if vision != "none" else None
     mmproj = models_dir / Path(mm["path"]).name if mm else None   # the picture reader, beside the model
     if mm is not None and mmproj is not None and not mmproj.exists():
@@ -8490,13 +8497,11 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     # into dflash2/ beside the model for auto (the default) and dflash2; with auto the engine measures it, the MTP layer
     # and no drafter at its start and keeps the fastest (the window too, --spec auto)
     drafting = getattr(a, "drafting", None) or saved_drafting(CONF / f"xestrata-{tag.lower()}.json") or "auto"
-    if fam.get("yskn"):
-        if drafting != "off":
-            warn("the YASAKANI block drafter is not connected yet: starting without drafts")
-        drafting = "off"
     df2_key = fam.get("dflash2")
     df2_pack = None
-    if df2_key and drafting in ("auto", "dflash2") and not on_cpu:
+    if fam.get("yskn") and drafting in ("auto", "dflash2") and not on_cpu:
+        df2_pack = models_dir / "bdraft2_k8.yskn"
+    elif df2_key and drafting in ("auto", "dflash2") and not on_cpu:
         df2_dir = models_dir / "dflash2"
         say(f"  The DFlash2 drafter of {fam['title']} (a second way to guess ahead) comes from Inco AI (Apache-2.0);")
         say("  it is packed on this PC.")
