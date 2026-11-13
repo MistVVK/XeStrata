@@ -106,8 +106,22 @@ std::vector<uint8_t> ggml_blocks(int n_out, int n_in, bool q4, std::vector<float
     return out;
 }
 
+// one dequantized ggml weight (the kernel reads the quantized blocks, so the reference must too)
+float deq(const std::vector<uint8_t>& blocks, int n_in, bool q4, int r, int i) {
+    const int b = i / 32, j = i % 32;
+    const int bs = q4 ? 18 : 34;
+    const uint8_t* blk = blocks.data() + ((size_t) r * (n_in / 32) + b) * bs;
+    const float d = f16f((uint16_t) blk[0] | ((uint16_t) blk[1] << 8));
+    if (q4) {
+        const uint8_t byte = blk[2 + (j & 15)];
+        const int q = j < 16 ? (byte & 15) : (byte >> 4);
+        return (float) (q - 8) * d;
+    }
+    return (float) (int8_t) blk[2 + j] * d;
+}
+
 // dequantized ggml row dot the planar activations (the GEMM's reference, fp64 sums)
-void gemm_ref(const std::vector<float>& w, int n_out, int n_in, const std::vector<int8_t>& xq,
+void gemm_ref(const std::vector<uint8_t>& blocks, int n_out, int n_in, bool q4, const std::vector<int8_t>& xq,
               const std::vector<float>& xd, int ncols, std::vector<float>& y) {
     y.assign((size_t) ncols * n_out, 0);
     for (int c = 0; c < ncols; ++c)
@@ -116,7 +130,7 @@ void gemm_ref(const std::vector<float>& w, int n_out, int n_in, const std::vecto
             for (int b = 0; b < n_in / 32; ++b) {
                 double s = 0;
                 for (int i = 0; i < 32; ++i)
-                    s += (double) w[(size_t) r * n_in + b * 32 + i] * xq[(size_t) c * n_in + b * 32 + i];
+                    s += (double) deq(blocks, n_in, q4, r, b * 32 + i) * xq[(size_t) c * n_in + b * 32 + i];
                 acc += (double) xd[(size_t) c * (n_in / 32) + b] * s;
             }
             y[(size_t) c * n_out + r] = (float) acc;
@@ -165,7 +179,7 @@ void test_gemm(void* s, bool q4) {
         std::vector<int8_t> xq; std::vector<float> xd;
         quant_planar(x.data(), c.n_in, c.ncols, xq, xd);
         std::vector<float> y_ref;
-        gemm_ref(w, c.n_out, c.n_in, xq, xd, c.ncols, y_ref);
+        gemm_ref(blocks, c.n_out, c.n_in, q4, xq, xd, c.ncols, y_ref);
         parity::Device dev;
         const uint8_t* dblocks = dev.upload(blocks);
         const size_t plane = q4 ? (size_t) c.n_out * c.n_in / 2 : (size_t) c.n_out * c.n_in;
@@ -257,7 +271,21 @@ void test_rms_swiglu(void* s) {
     parity::sync();
     parity::copy_out(xq.data(), dxq, xq.size());
     parity::copy_out(xd.data(), dxd, xd.size());
-    report("swiglu_quant", (xq == xq_ref ? 0 : 1) + (xd == xd_ref ? 0 : 1), 0);
+    // silu's exp may differ by 1 ULP (sycl vs std), flipping one code at a rounding boundary: compare the
+    // dequantized values within one quantization step (a draft only proposes; the verify window decides)
+    int64_t sw_bad = 0; double sw_worst = 0;
+    for (int r = 0; r < rows; ++r)
+        for (int b = 0; b < N / 32; ++b) {
+            const float d = xd[(size_t) r * (N / 32) + b], dr = xd_ref[(size_t) r * (N / 32) + b];
+            for (int i = 0; i < 32; ++i) {
+                const size_t at = (size_t) r * N + b * 32 + i;
+                const double e = std::fabs((double) xq[at] * d - (double) xq_ref[at] * dr);
+                const double bound = 1.5 * std::max(std::fabs(d), std::fabs(dr)) + 1e-6;
+                sw_worst = std::max(sw_worst, e / bound);
+                if (e > bound) ++sw_bad;
+            }
+        }
+    report("swiglu_quant", sw_bad, sw_worst);
 }
 
 void test_rope(void* s) {

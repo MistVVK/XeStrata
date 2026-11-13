@@ -112,16 +112,23 @@ int main(int argc, char** argv) {
     if (!d.debug_ring(kvC, tgC, err)) return 1;
     compare(kvC, tgC, 3030 - 2047, 3000, "after the rebuild");
 
-    // another conversation takes the ring; the first is parked, then comes back
+    // another conversation takes the ring; the first is parked in the stash as a branch, then comes back
     d.begin_request(other.data(), 400, 0, &cold);
     feed(other, 0, 400);
-    check(cold, "a conversation with no log starts cold");
+    check(d.ring_stats.stash_stores >= 1, "another conversation at 0: the first lineage is kept in the stash as a branch");
     d.begin_request(big.data(), 3030, 3000, &cold);
-    std::printf("  stash return: rebuilt %lld rows (missing %lld), swapped %d\n",
-                (long long) d.last_rebuilt, (long long) d.last_missing, (int) d.last_swapped);
-    check(d.last_swapped && d.last_missing == 0, "the parked lineage came back from the stash");
+    std::printf("  stash return: rebuilt %lld rows (missing %lld), swapped %d, cold %d\n",
+                (long long) d.last_rebuilt, (long long) d.last_missing, (int) d.last_swapped, (int) cold);
+    check(d.last_swapped && d.last_rebuilt >= 1900 && d.last_missing == 0 && !cold,
+          "the parked lineage came back, the whole window rebuilt, none missing");
     if (!d.debug_ring(kvC, tgC, err)) return 1;
     compare(kvC, tgC, 3030 - 2047, 3000, "after the stash return");
+
+    // an edited prompt: the history differs at 2500, resume 2800: not covered, no stash match: starts over, cold
+    std::vector<int32_t> edit = big;
+    edit[2500] ^= 1;
+    d.begin_request(edit.data(), 2830, 2800, &cold);
+    check(cold || d.last_missing > 0, "an edited conversation: the drafter reports it has no log of the window (cold)");
 
     strata::gpu::free(head);
     strata::gpu::free(taps);
