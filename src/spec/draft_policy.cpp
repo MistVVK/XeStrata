@@ -285,6 +285,29 @@ bool read_cost_file(const std::string& path, const std::string& key, CostFile& o
             out.pcie_frac = s;
             continue;
         }
+        if (line.rfind("state ", 0) == 0) {   // calibration lines (DraftPolicy::start_calibration); a file without them has no calibration done
+            if (line != "state 0" && line != "state 1") { why = "a malformed state"; return false; }
+            out.state_effect = line == "state 1";
+            continue;
+        }
+        if (line.rfind("real ", 0) == 0) {
+            int rb = -1;
+            unsigned m = 0;
+            if (std::sscanf(line.c_str(), "real %d %u", &rb, &m) != 2 || rb < 0 || rb >= CostLearner::kCtxBuckets) { why = "a malformed real mark"; return false; }
+            out.real[(size_t) rb] = m;
+            continue;
+        }
+        if (line.rfind("cal ", 0) == 0) {
+            int cb = -1, ct = -1, cn = -1;
+            double cs = -1.0;
+            if (std::sscanf(line.c_str(), "cal %d %d %d %lf", &cb, &ct, &cn, &cs) != 4 || cb < 0 || cb >= CostLearner::kCtxBuckets || ct < 1 || ct > CostLearner::kMaxT
+                || cn < 0 || cn > 100000 || !(cs >= 0.0) || !(cs < 1e9)) {
+                why = "a malformed calibration line";
+                return false;
+            }
+            out.cal[(size_t) cb][(size_t) ct] = CalAcc{cn, cs};
+            continue;
+        }
         int b = -1, used = 0;
         if (std::sscanf(line.c_str(), "bucket %d %n", &b, &used) < 1 || used == 0 || b < 0 || b >= CostLearner::kCtxBuckets) {
             why = "a malformed line";
@@ -332,6 +355,16 @@ bool write_cost_file(const std::string& path, const CostFile& c, std::string& wh
             }
             f << "\n";
         }
+        if (c.state_effect) f << "state 1\n";
+        for (int k = 0; k < CostLearner::kCtxBuckets; ++k) {
+            if (c.real[(size_t) k] != 0u) f << "real " << k << " " << c.real[(size_t) k] << "\n";
+            for (int t = 1; t <= CostLearner::kMaxT; ++t) {
+                const CalAcc& a = c.cal[(size_t) k][(size_t) t];
+                if (a.n <= 0 || (c.real[(size_t) k] >> (t - 1) & 1u)) continue;
+                std::snprintf(b, sizeof b, "%.4f", a.sum);
+                f << "cal " << k << " " << t << " " << a.n << " " << b << "\n";
+            }
+        }
         if (c.cpu_share >= 0.0) {
             std::snprintf(b, sizeof b, "share %.3f\n", std::min(c.cpu_share, 1.0));
             f << b;
@@ -363,6 +396,7 @@ void DraftPolicy::set_fixed_costs(const double* ms, int n, int bucket) {
     held_.clear();
     if (ms == nullptr || n <= 0) return;
     bucket = std::clamp(bucket, 0, kCtxBuckets - 1);
+    fixed_n_[(size_t) bucket] = std::min(n, kMaxT);
     for (int t = 1; t <= kMaxT; ++t) {   // the table replaces what was measured; sizes past its end scale from it (cost_ms)
         const bool in = t <= n && ms[t - 1] > 0.0;
         cost_[bucket][t] = in ? ms[t - 1] : 0.0;
@@ -567,6 +601,7 @@ void DraftPolicy::reset_learning() {
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
     t = std::clamp(t, 1, kMaxT);
     if (learning_ && round_ms > 0) learner_.add(bk_, t, round_ms, busy_age_);
+    if (calib_on_ && round_ms > 0) calib_add(bk_, t, round_ms, busy_age_);
     if (round_ms > 0 && !fixed_) {
         round_ms = clamp_sample(t, round_ms);
         const double alpha = robust_ ? std::max(kCostAlpha, 1.0 / (cost_n_[bk_][t] + 1.0)) : kCostAlpha;   // a running mean for the first samples
@@ -586,6 +621,72 @@ void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double ro
     }
 }
 
+// ---- calibration of a fixed table against real requests (see the header)
+
+void DraftPolicy::start_calibration(bool state_effect, const std::array<unsigned, kCtxBuckets>& real,
+                                    const std::array<std::array<CalAcc, kMaxT + 1>, kCtxBuckets>& cal) {
+    calib_fresh_only_ = state_effect;
+    real_ = real;
+    cal_ = cal;
+    calib_dirty_ = false;
+    calib_on_ = false;
+    for (int k = 0; k < kCtxBuckets; ++k) {
+        const int n = fixed_n_[(size_t) k];
+        for (int t = 1; t <= n; ++t)
+            if (!(real_[(size_t) k] >> (t - 1) & 1u)) calib_on_ = true;
+    }
+}
+
+void DraftPolicy::calib_add(int bucket, int t, double ms, double age) {
+    if (bucket < 0 || bucket >= kCtxBuckets || t < 1 || t > fixed_n_[(size_t) bucket]) return;
+    if (real_[(size_t) bucket] >> (t - 1) & 1u) return;
+    if (calib_fresh_only_ && age > CostLearner::kFreshS) return;   // the table is what rounds of the first seconds of a busy run cost
+    const double base = cost_[(size_t) bucket][(size_t) t];
+    if (!(base > 0.0)) return;
+    CalAcc& a = cal_[(size_t) bucket][(size_t) t];
+    if (a.n >= kCalibN) return;
+    a.sum += std::clamp(ms, kCalibLo * base, kCalibHi * base);   // one stalled round moves the mean by at most (kCalibHi - 1) / kCalibN
+    a.n += 1;
+    calib_dirty_ = true;
+}
+
+bool DraftPolicy::calibrate(CostFile& cf, std::string& report) {
+    report.clear();
+    if (!calib_on_ && !calib_dirty_) return false;
+    char b[96];
+    bool changed = calib_dirty_;
+    for (int k = 0; k < kCtxBuckets; ++k) {
+        const int n = fixed_n_[(size_t) k];
+        for (int t = 1; t <= n; ++t) {
+            if (real_[(size_t) k] >> (t - 1) & 1u) continue;
+            CalAcc& a = cal_[(size_t) k][(size_t) t];
+            if (a.n < kCalibN) continue;
+            const double v = a.sum / a.n, base = cost_[(size_t) k][(size_t) t];
+            if (v >= kCalibOkLo * base && v <= kCalibOkHi * base) {
+                std::snprintf(b, sizeof b, "%s%d rows %.2f -> %.2f", report.empty() ? "" : ", ", t, base, v);
+                report += b;
+                cost_[(size_t) k][(size_t) t] = v;
+                real_[(size_t) k] |= 1u << (t - 1);
+            }
+            a = CalAcc{};   // replaced, or disturbed (rounds dropped, collected again)
+        }
+        for (int t = 2; t <= n; ++t)   // more rows never cost less
+            if (cost_[(size_t) k][(size_t) t] < cost_[(size_t) k][(size_t) t - 1]) cost_[(size_t) k][(size_t) t] = cost_[(size_t) k][(size_t) t - 1];
+        if (n > 0) {
+            cf.tables[(size_t) k].assign(cost_[(size_t) k].begin() + 1, cost_[(size_t) k].begin() + 1 + n);
+            cf.real[(size_t) k] = real_[(size_t) k];
+            for (int t = 0; t <= kMaxT; ++t) cf.cal[(size_t) k][(size_t) t] = cal_[(size_t) k][(size_t) t];
+        }
+    }
+    cf.state_effect = calib_fresh_only_;
+    calib_dirty_ = false;
+    calib_on_ = false;
+    for (int k = 0; k < kCtxBuckets; ++k)
+        for (int t = 1; t <= fixed_n_[(size_t) k]; ++t)
+            if (!(real_[(size_t) k] >> (t - 1) & 1u)) calib_on_ = true;
+    return changed || !report.empty();
+}
+
 void DraftPolicy::observe_committed(bool lookup, int t, int accepted, int match) {
     t = std::clamp(t, 1, kMaxT);
     rounds_ += 1.0;
@@ -603,7 +704,7 @@ void DraftPolicy::observe_committed(bool lookup, int t, int accepted, int match)
 }
 
 void DraftPolicy::defer_cost(int64_t end, int t, double round_ms) {
-    if (round_ms > 0 && (learning_ || !fixed_)) held_.push_back({end, bk_, std::clamp(t, 1, kMaxT), round_ms, busy_age_});
+    if (round_ms > 0 && (learning_ || calib_on_ || !fixed_)) held_.push_back({end, bk_, std::clamp(t, 1, kMaxT), round_ms, busy_age_});
 }
 
 void DraftPolicy::apply_costs(int64_t committed) {
@@ -612,6 +713,7 @@ void DraftPolicy::apply_costs(int64_t committed) {
     for (; n < held_.size() && held_[n].end < committed; ++n) {
         const HeldCost& h = held_[n];
         if (learning_) learner_.add(h.bucket, h.t, h.ms, h.age);
+        if (calib_on_) calib_add(h.bucket, h.t, h.ms, h.age);
         if (fixed_) continue;
         bk_ = h.bucket;   // observe()'s update, in the bucket the round ran in
         const double ms = clamp_sample(h.t, h.ms);

@@ -544,6 +544,84 @@ int main() {
         check(g5.lookup && g5.t == 5 && g5.pad == 3, "pad: the next unmeasured size follows once one has its samples");
         check(g.choose(1, 1, 3, 1).pad == 0, "pad: a pad_cap of one draft makes no filler");
     }
+    {   // calibration against real rounds
+        using strata::spec::CalAcc;
+        using strata::spec::CostFile;
+        using strata::spec::CostLearner;
+        using strata::spec::read_cost_file;
+        using strata::spec::write_cost_file;
+        const double tab[5] = {12.68, 14.30, 16.41, 18.57, 20.90};
+        DraftPolicy c(8);
+        c.set_fixed_costs(tab, 5, 0);
+        std::array<unsigned, CostLearner::kCtxBuckets> real0{};
+        std::array<std::array<CalAcc, CostLearner::kMaxT + 1>, CostLearner::kCtxBuckets> cal0{};
+        c.start_calibration(false, real0, cal0);
+        check(c.calibrating() && !c.calib_dirty(), "calib: on after a table is fixed, nothing collected");
+        for (int i = 0; i < 15; ++i) c.observe(false, 3, 2, 0, 16.70);
+        CostFile cf;
+        std::string rep;
+        check(c.calibrate(cf, rep) && rep.empty() && cf.cal[0][3].n == 15, "calib: 15 real rounds are kept, nothing replaced");
+        check(std::fabs(c.cost_ms(3) - 16.41) < 1e-9, "calib: the cost of a size stays at the learned one under kCalibN rounds");
+        c.observe(false, 3, 2, 0, 16.70);
+        check(c.calibrate(cf, rep) && !rep.empty(), "calib: the 16th real round replaces the cost");
+        check(std::fabs(c.cost_ms(3) - 16.70) < 1e-9 && (cf.real[0] & 4u) && std::fabs(cf.tables[0][2] - 16.70) < 1e-9, "calib: the cost is the mean, the size is marked real, the file has it");
+        check(std::fabs(c.cost_ms(5) - 20.90) < 1e-9 && std::fabs(c.cost_ms(4) - 18.57) < 1e-9, "calib: a size without real rounds keeps its learned cost (nothing guessed)");
+        for (int i = 0; i < 40; ++i) c.observe(false, 3, 2, 0, 15.0);
+        check(!c.calib_dirty() && std::fabs(c.cost_ms(3) - 16.70) < 1e-9, "calib: a real size never changes again");
+        // a lookup size reached once per request: rounds come across starts through the file
+        DraftPolicy d(8);
+        d.set_fixed_costs(tab, 5, 0);
+        CostFile cd;
+        cd.key = "k";
+        cd.tables[0].assign(tab, tab + 5);
+        std::array<std::array<CalAcc, CostLearner::kMaxT + 1>, CostLearner::kCtxBuckets> cal1 = cal0;
+        for (int start = 0; start < 16; ++start) {
+            DraftPolicy e(8);
+            e.set_fixed_costs(tab, 5, 0);
+            e.start_calibration(false, real0, cal1);
+            e.observe(true, 4, 2, 0, 18.9);
+            std::string r2;
+            check(e.calibrate(cd, r2), "calib: a start with one real round of a size writes the file");
+            cal1 = cd.cal;
+            real0 = cd.real;
+        }
+        check((cd.real[0] & 8u) != 0 && std::fabs(cd.tables[0][3] - 18.9) < 1e-9 && cd.cal[0][4].n == 0, "calib: 16 starts of one round each calibrate the size");
+        // the file round trip: state, real, cal
+        CostFile w;
+        w.key = "k2";
+        w.tables[0].assign(tab, tab + 5);
+        w.state_effect = true;
+        w.real[0] = 6u;
+        w.cal[0][4] = CalAcc{7, 131.0};
+        const std::string path = "dp_calib_test.costs";
+        std::string why;
+        check(write_cost_file(path, w, why), "calib file: written");
+        CostFile r;
+        check(read_cost_file(path, "k2", r, why) && r.state_effect && r.real[0] == 6u && r.cal[0][4].n == 7 && std::fabs(r.cal[0][4].sum - 131.0) < 1e-3 && r.cal[0][2].n == 0,
+              "calib file: state, real marks and collected rounds come back");
+        std::remove(path.c_str());
+        // a machine with a load-time effect counts only the first kFreshS seconds of a busy run
+        DraftPolicy f(8);
+        f.set_fixed_costs(tab, 5, 0);
+        f.start_calibration(true, real0 = {}, cal0);
+        f.set_busy_age(2.0);
+        for (int i = 0; i < 10; ++i) f.observe(false, 2, 1, 0, 14.6);
+        f.set_busy_age(50.0);
+        for (int i = 0; i < 10; ++i) f.observe(false, 2, 1, 0, 17.0);
+        CostFile cfz;
+        std::string rz;
+        f.calibrate(cfz, rz);
+        check(cfz.cal[0][2].n == 10, "calib: with a state effect only fresh rounds are counted");
+        // a disturbed stretch (a stalled machine) is dropped, not taken
+        DraftPolicy g(8);
+        g.set_fixed_costs(tab, 5, 0);
+        g.start_calibration(false, real0 = {}, cal0);
+        for (int i = 0; i < 16; ++i) g.observe(false, 1, 0, 0, 40.0);
+        CostFile cg;
+        std::string rg;
+        g.calibrate(cg, rg);
+        check(rg.empty() && std::fabs(g.cost_ms(1) - 12.68) < 1e-9 && cg.cal[0][1].n == 0 && (cg.real[0] & 1u) == 0, "calib: rounds far above the learned cost are dropped");
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }

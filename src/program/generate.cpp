@@ -14549,6 +14549,7 @@ int main(int argc, char** argv) {
         constexpr int kDraftCostMinN = 20;           // a window size needs this many rounds to be measured (fewer: filled in)
         std::string dc_key;
         bool dc_learning = false;
+        bool dc_calib = false;   // a table is used and its sizes are being calibrated against real rounds (DraftPolicy::start_calibration)
         // how long the engine has been busy: the learner keeps only the rounds of the first seconds of a busy run (CostLearner::kFreshS); a busy run
         // starts at a request that begins CostLearner::kIdleS or more after the last one ended (the GPU runs slower and steeper after a long load)
         Clock::time_point dc_busy_since = Clock::now(), dc_last_end = Clock::now();
@@ -14566,6 +14567,9 @@ int main(int argc, char** argv) {
                         policy.set_fixed_costs(cf.tables[(size_t) k].data(), (int) cf.tables[(size_t) k].size(), k);
                         sizes += (sizes.empty() ? "" : ", ") + std::to_string(cf.tables[(size_t) k].size());
                     }
+                dc_file = cf;
+                policy.start_calibration(cf.state_effect, cf.real, cf.cal);
+                dc_calib = policy.calibrating();
                 if (cf.cpu_share >= 0.0) strata::prefill::Prefill::fix_cpu_share(cf.cpu_share);
                 std::string extra = cf.cpu_share >= 0.0 ? "; CPU prompt share " + std::to_string(cf.cpu_share).substr(0, 4) : "";
                 if (dc_pcie_ok && cf.pcie_frac >= 0.0) {   // PcieAuto's settled share: fixed, no refinement in this run
@@ -14573,7 +14577,6 @@ int main(int argc, char** argv) {
                     extra += "; PCIe share " + std::to_string(cf.pcie_frac).substr(0, 4);
                 } else if (dc_pcie_ok) {   // a file from before the stored PCIe share: refined as before, then written into the file
                     dc_pcie_pending = true;
-                    dc_file = cf;
                     extra += "; PCIe share: refined in this run, then stored";
                 }
                 std::fprintf(stderr, "strata serve: draft costs: this machine's table is used (%s; window sizes %s%s): the same request "
@@ -16275,7 +16278,7 @@ int main(int argc, char** argv) {
             const bool geni = line.rfind("GENI ", 0) == 0;
             if (geni || line.rfind("GEN ", 0) == 0) {
                 refresh_file_tier();
-                if (dc_learning) {   // the request's arrival, before its prompt is read: a pause since the last one ended starts a new busy run
+                if (dc_learning || dc_calib) {   // the request's arrival, before its prompt is read: a pause since the last one ended starts a new busy run
                     const Clock::time_point dc_now = Clock::now();
                     if (!dc_seen_request || std::chrono::duration<double>(dc_now - dc_last_end).count() >= strata::spec::CostLearner::kIdleS) dc_busy_since = dc_now;
                     dc_seen_request = true;
@@ -20016,7 +20019,7 @@ int main(int argc, char** argv) {
                     tr_k = 0;
                 }
                 if (spec_cost && use_mtp && timed_round && !from_sfx && !win_forced) policy.observe_probs(dwin_s.data(), T_mtp - 1, a);
-                if (dc_learning) policy.set_busy_age(std::chrono::duration<double>(Clock::now() - dc_busy_since).count());
+                if (dc_learning || dc_calib) policy.set_busy_age(std::chrono::duration<double>(Clock::now() - dc_busy_since).count());
                 if (timed_round && !eos && chain_n == 0 && ((sfx_pad > 0 && from_sfx) || win_forced))   // a window run for its size's sake: its time only
                     policy.observe_forced(T, std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 else if (timed_round && !eos && chain_n == 0)
@@ -20059,6 +20062,7 @@ int main(int argc, char** argv) {
                     cf.key = dc_key;
                     for (int k = 0; k < strata::spec::CostLearner::kCtxBuckets; ++k)
                         cf.tables[(size_t) k] = policy.learner().table(k, kDraftCostMinN, policy.top_size());
+                    cf.state_effect = policy.learner().state_effect(0, kDraftCostMinN);   // real rounds are counted by the same rule (fresh only, or all)
                     // the CPU prompt share, when it is on and balancing from measured times: its balance as measured so far, to a 0.05
                     // step (0.5 when no short prompt has measured it yet: on an RTX A6000 a fixed 0.5 read a 981-token chunk as fast as the
                     // balancing share, 1,001-1,009 against 995-997 ms); fixed from now on like the table
@@ -20080,6 +20084,9 @@ int main(int argc, char** argv) {
                     policy.set_learning(false);
                     policy.reset_learning();
                     dc_learning = false;
+                    dc_file = cf;
+                    policy.start_calibration(cf.state_effect, cf.real, cf.cal);
+                    dc_calib = policy.calibrating();
                     std::string t0;
                     char b[24];
                     for (size_t i = 0; i < cf.tables[0].size(); ++i) {
@@ -20098,6 +20105,20 @@ int main(int argc, char** argv) {
                                          "on%s%s\n", t0.c_str(), saved ? "" : " (not saved: ", saved ? "" : (why + "; the next start learns again)").c_str());
                 }
             }
+            // --draft-costs, calibration: the real rounds of this request that the sizes still at their learned cost have collected; a size with
+            // kCalibN of them takes their mean (the file is rewritten whole, the new cost applies from the next request on, no later change)
+            if (dc_calib && policy.calib_dirty()) {
+                strata::spec::CostFile cc = dc_file;
+                std::string rep, why;
+                if (policy.calibrate(cc, rep)) {
+                    const bool saved = strata::spec::write_cost_file(o.draft_costs, cc, why);
+                    dc_file = cc;
+                    if (!rep.empty())
+                        std::fprintf(stderr, "strata serve: draft costs: calibrated against real requests: %s%s\n", rep.c_str(),
+                                     saved ? "" : (" (not saved: " + why + ")").c_str());
+                }
+                dc_calib = policy.calibrating();
+            }
             // --draft-costs with a table from before the stored PCIe share: once PcieAuto has settled (three readings, or it gave up), its
             // share goes into the file beside the table and is fixed from the next request; the next start loads it
             if (dc_pcie_pending && !pcie_auto.on) {
@@ -20107,6 +20128,7 @@ int main(int argc, char** argv) {
                 cf.pcie_frac = o.pcie_frac;
                 std::string why;
                 const bool saved = strata::spec::write_cost_file(o.draft_costs, cf, why);
+                dc_file = cf;
                 fix_pcie_share(cf.pcie_frac);
                 std::fprintf(stderr, "strata serve: draft costs: the PCIe share settled at %.2f; it is %s and fixed from the next request on\n",
                              cf.pcie_frac, saved ? "stored with this machine's table" : ("not stored (" + why + ")").c_str());

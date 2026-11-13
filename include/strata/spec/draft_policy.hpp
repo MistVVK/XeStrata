@@ -109,11 +109,20 @@ private:
 ///   share <0..1>              (optional: the CPU prompt share learned on this machine, src/prefill/prefill.cpp)
 ///   pcie <0..1>               (optional: the decode PCIe share PcieAuto settled on, src/program/generate.cpp)
 ///   end
+/// The real rounds of one size seen since the table was learned: n rounds, their sum in ms (each clamped to [kCalibLo, kCalibHi] x the learned cost).
+struct CalAcc {
+    int n = 0;
+    double sum = 0.0;
+};
 struct CostFile {
     std::string key;
     std::array<std::vector<double>, CostLearner::kCtxBuckets> tables{};
     double cpu_share = -1.0;   ///< < 0: none stored
     double pcie_frac = -1.0;   ///< the decode PCIe share PcieAuto settled on; < 0: none stored (a file from before it: refined, then written)
+    /// Calibration against real requests (see DraftPolicy::start_calibration); a file without these lines has none done.
+    bool state_effect = false;   ///< the learning stretch showed a load-time effect: only fresh real rounds are counted
+    std::array<unsigned, CostLearner::kCtxBuckets> real{};   ///< bit t-1: the cost of size t is a median of real rounds, no longer the learned one
+    std::array<std::array<CalAcc, CostLearner::kMaxT + 1>, CostLearner::kCtxBuckets> cal{};   ///< real rounds collected so far for the sizes not yet replaced
 };
 /// false (with `why` for the log) when the file is missing, unreadable, malformed or truncated, or was learned under another key: the caller
 /// then learns a new table.  Never throws.
@@ -211,6 +220,23 @@ public:
     /// How long the engine has been busy (seconds since its last pause of CostLearner::kIdleS), as the caller measures it, for the round
     /// observe() is about to be given; < 0 (the default): unknown.  Only the learner reads it.
     void set_busy_age(double s) { busy_age_ = s; }
+    /// Calibration of a fixed table against real requests.  The learned costs come from a learning stretch (forced windows with filler rows, a burst of
+    /// prose), and a real round of the same size can cost a little more (measured on an M5 Max: 2 % on 2, 3 and 5 rows) - enough to flip a close choice
+    /// between a 4 and a 5 row window (JSON decode 6 % slower than live costs).  After a table is fixed, every real round (never a forced one) of a size
+    /// whose cost is still the learned one is kept (clamped to [kCalibLo, kCalibHi] x the learned cost; only the first kFreshS seconds of a busy run when
+    /// the machine has a load-time effect), across starts through the table file (CostFile::cal).  At kCalibN rounds the size's cost becomes their mean
+    /// (a result outside [kCalibOkLo, kCalibOkHi] x the learned cost means a disturbed stretch: the rounds are dropped and collected again) and the size
+    /// is marked real (CostFile::real) for good: no later change, so the windows of a repeated start are the same.  A size that real requests never reach
+    /// keeps its learned cost (nothing is guessed from other sizes).  real and cal come from the file (CostFile).
+    static constexpr int kCalibN = 16;
+    static constexpr double kCalibLo = 0.85, kCalibHi = 1.30, kCalibOkLo = 0.86, kCalibOkHi = 1.29;
+    void start_calibration(bool state_effect, const std::array<unsigned, kCtxBuckets>& real,
+                           const std::array<std::array<CalAcc, kMaxT + 1>, kCtxBuckets>& cal);
+    bool calibrating() const { return calib_on_; }
+    bool calib_dirty() const { return calib_dirty_; }
+    /// At a request's end: replaces the sizes that have kCalibN real rounds and puts the table, the real marks and the rounds collected so far into
+    /// cf (its other fields stay); report says which sizes changed (empty when none).  True when cf should be written (something changed).
+    bool calibrate(CostFile& cf, std::string& report);
     CostLearner& learner() { return learner_; }
     const CostLearner& learner() const { return learner_; }
 
@@ -259,6 +285,11 @@ private:
     bool fixed_ = false;                                   // set_fixed_costs: no round time changes a cost
     bool learning_ = false;                                // set_learning: round times also go to learner_
     double busy_age_ = -1.0;                               // set_busy_age
+    bool calib_on_ = false, calib_dirty_ = false, calib_fresh_only_ = false;
+    std::array<int, kCtxBuckets> fixed_n_{};               // the length of each bucket's fixed table
+    std::array<unsigned, kCtxBuckets> real_{};
+    std::array<std::array<CalAcc, kMaxT + 1>, kCtxBuckets> cal_{};
+    void calib_add(int bucket, int t, double ms, double age);
     int explore_size(int lookup_k, int pad_cap) const;                  // the size a learning stretch measures next, 0 = none (choose() counts it)
     int explore_next(int reach, int skip) const;                        // the smallest size 2..reach (not `skip`) that still needs rounds; counts it; 0 = none
     bool explore_ok() const;                                            // a forced round counts now (fresh phase, or no state effect)
