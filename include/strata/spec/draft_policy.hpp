@@ -202,6 +202,8 @@ public:
     /// a learning stretch wants to time one (rows past the drafts are the caller's filler), else 0.  Same limits as for a lookup window.  Forced
     /// rounds happen only while they count: in the first kFreshS seconds of a busy run, or when the stretch has shown no state effect.
     int explore_window(int t, int cap) const;
+    /// A round with no lookup proposal: the size of a lookup-type window (2..cap rows, every row after the first filler) a learning stretch wants to time, else 0.
+    int explore_lookup(int cap) const;
     /// Start the learning stretch again: the learner's samples and the forced-round counts.
     void reset_learning();
     /// The largest allowed window size (the table is written up to it).

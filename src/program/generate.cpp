@@ -19557,6 +19557,19 @@ int main(int argc, char** argv) {
                                 if (t < 0) { std::printf("ERR %s\n", err.c_str()); return 1; }
                                 T = t;
                             }
+                        } else if (k == 0 && dc_learning && draft_on && !probabilistic && !trace_nopick) {
+                            // no proposal at all: a learning stretch may still time a lookup-type window size (every row after the first is filler,
+                            // the MTP's own first guess repeated; the verifier rejects them), so that sizes only lookups reach get measured
+                            const int s = policy.explore_lookup(std::min<int>(S_look, (int) sbuf.size() + 1));
+                            if (s > 0) {
+                                T = s; from_sfx = true; sfx_pad = s - 1; sfx_match = 0;
+                                for (int i = 0; i < s - 1; ++i) sbuf[(size_t) i] = drafts[0];
+                                if (o.lookup_max_t > 0) {   // --lookup-max-t: a size whose window graph fits
+                                    const int t = graph_fits(T);
+                                    if (t < 0) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                                    T = t;
+                                }
+                            }
                         }
                     }
                 }

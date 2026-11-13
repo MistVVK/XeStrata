@@ -535,6 +535,11 @@ int DraftPolicy::explore_size(int lookup_k, int pad_cap) const {
     return explore_next(std::max(lookup_k, pad_cap) + 1, 0);
 }
 
+int DraftPolicy::explore_lookup(int cap) const {
+    if (!learning_ || fixed_) return 0;
+    return explore_next(cap, 0);
+}
+
 int DraftPolicy::explore_window(int t, int cap) const {
     if (!learning_ || fixed_) return 0;
     return explore_next(cap, t);

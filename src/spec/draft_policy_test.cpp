@@ -502,6 +502,10 @@ int main() {
         DraftPolicy m0(8);
         feed(m0, 400);
         check(m0.explore_window(3, 6) == 0, "window: nothing while learning is off");
+        DraftPolicy lk(8);                                          // a round with no proposal at all: a lookup-type window of an unmeasured size
+        lk.set_learning(true);
+        feed(lk, 400);
+        check(lk.explore_lookup(5) == 2 && lk.explore_lookup(1) == 0 && m0.explore_lookup(5) == 0, "window: a round without a proposal can time a lookup-type size, only while learning");
         // a late round counts only where the stretch has shown no state effect
         DraftPolicy e1(8);                                          // fresh 76 ms, late 80 ms: a state effect
         e1.set_learning(true);
