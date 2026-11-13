@@ -37,6 +37,28 @@ public:
     bool replay(const int8_t* q, const float* scales, const int32_t* positions, int rows, std::string& err);
     // Drafts after the supplied anchor. The caller first commits the previous window's taps with context().
     bool draft(int32_t anchor, int64_t position, int32_t* drafts, float* probabilities, std::string& err);
+    // Adapt the shared history to the runner without duplicating its begin/stash/rewind policy. The epoch is set
+    // both before a replay and after begin: a cache hit may not need replay, and a failed replay invalidates it again.
+    template <class History>
+    bool begin_request(History& history, const int32_t* ids, int64_t n, int64_t resume, bool* cold,
+                       std::string& replay_error, std::string& err) {
+        auto restore = [&](const int32_t* pos, const int8_t* q, const float* scales, int rows, int32_t ep,
+                           std::string& why) {
+            return epoch(ep, why) && replay(q, scales, pos, rows, why);
+        };
+        history.begin(ids, n, resume, restore, cold, replay_error);
+        return epoch(history.epoch(), err);
+    }
+    // Record exactly the activation rows used by the committed context update. Token history is a separate
+    // history.note_rows() call, as for DFlash2; a failure must never put a partial row in the log.
+    template <class History>
+    bool commit_context(History& history, const float* taps, int rows, int64_t pos0, std::string& err) {
+        std::vector<int8_t> q;
+        std::vector<float> scales;
+        if (!epoch(history.epoch(), err) || !context(taps, rows, pos0, q, scales, err)) return false;
+        history.commit(pos0, rows, q.data(), scales.data());
+        return true;
+    }
     // A new lineage changes the epoch; the shared history decides when this is required.
     bool epoch(int32_t value, std::string& err);
 

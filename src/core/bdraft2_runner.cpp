@@ -106,7 +106,7 @@ bool Bdraft2Runner::load(const std::string& path, const std::string& head, Plain
 
 bool Bdraft2Runner::epoch(int32_t value, std::string& err) {
     const OnDevice on(device_);
-    if (!epoch_ || value < 1 || !gpu::copy_async(epoch_, &value, sizeof value, stream_, "bdraft2 epoch") ||
+    if (!epoch_ || value < 0 || !gpu::copy_async(epoch_, &value, sizeof value, stream_, "bdraft2 epoch") ||
         !gpu::stream_sync(stream_)) { err = "bdraft2: epoch update"; return false; }
     return true;
 }
