@@ -4049,6 +4049,9 @@ int main(int argc, char** argv) {
                              "#1630); 7500 and below were stable. Kept as asked; a bare --prefill auto stops at %lld\n",
                      o.prefill_cap_warn.c_str(), (long long) strata::platform::host_limits::kWinHipAutoChunkCap);
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL)
+    // the start-up line about K-quant experts: the default is set here (before any engine code reads its switches), the line is printed once the expert layout is
+    // loaded and only when the loaded set has K-quant experts (strata::core::nv_kq_line_wanted), so a model without them says nothing untrue
+    bool kq_line_pending = false, kq_line_fused = false;
     {   // CUDA sm_86 / sm_60: the switches that are exact AND faster there are on by default (strata/core/nv_defaults.hpp), when every
         // visible card has that one compute capability; before any engine code reads its switches, the user's own settings are kept
         int nd = 0;
@@ -4077,7 +4080,8 @@ int main(int argc, char** argv) {
                         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, d) == cudaSuccess && strata::core::nv_kq_fused_here(m, n, sms))
                         kq_fused_here = true;
                 }
-                strata::core::apply_nv_kq_default(lo_m, lo_n, kq_fused_here);
+                kq_line_pending = !strata::core::apply_nv_kq_default(lo_m, lo_n, kq_fused_here, false).empty();
+                kq_line_fused = kq_fused_here;
             }
         }
         (void) cudaGetLastError();
@@ -4825,6 +4829,15 @@ int main(int argc, char** argv) {
             (void) strata::prefill::mmq::supported(f.d_type);
 #endif
         }
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_GPU_METAL)
+        if (kq_line_pending && lay.native) {
+            std::vector<std::pair<int, int>> kq_types;
+            kq_types.reserve(lay.fmt.size());
+            for (const auto& f : lay.fmt) kq_types.emplace_back(f.gu_type, f.d_type);
+            if (strata::core::nv_kq_line_wanted(kq_types))
+                std::fprintf(stderr, "%s\n", strata::core::nv_kq_default_line(kq_line_fused).c_str());
+        }
+#endif
         // APR (prism.hadamard) packs: every expert path rotates its activations (CPU pool: native_quant_act / _h;
         // GPU verify, remote GPUs, prompt FP16 path: hadamard_rows).  Validated end to end on CUDA (sm_86, sm_89 with
         // a two-GPU layer split and peer decode, sm_120) and on HIP gfx1151.  Other HIP architectures run the same
