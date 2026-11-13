@@ -38,6 +38,7 @@
 #include "strata/core/control_vector.hpp"
 #include "strata/core/stdin_lines.hpp"
 #include "strata/core/watchdog.hpp"
+#include "strata/core/window_rows.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -202,6 +203,13 @@ void linkless_gpu_adapter() {
 // starts with them reads only what follows (a model with a recurrent state only when it extends them all; else it
 // starts over, or from the conversation cache).
 namespace {
+
+// Whether a drafter of this run takes windows of more than 8 rows, so that under --wide-window auto the model sizes its
+// windows for 16 (window_rows_for) before it loads.  No drafter does yet.
+bool wants_wide_window(const strata::core::PlainOptions& opt) {
+    (void) opt;
+    return false;
+}
 
 // The conversation cache (--conversation-cache-mib, sized from the free RAM by default as Qwen3.8-Flash-Next's, #3493):
 // conversations set aside
@@ -2376,7 +2384,9 @@ static void plain_usage(const std::string& arch) {
                  "                       auto = from the times measured at load, the default; 0: all on the GPU)\n"
                  "  --prompt-chunk N     the prompt's most tokens a chunk through the batched products (default:\n"
                  "                       4096, or up to 32768 where the VRAM tier lends it; 0: the prompt in windows)\n"
-                 "  --max-t N            the decode window's most tokens (default 8)\n"
+                 "  --max-t N            the decode window's most tokens (default 8; 16 with --wide-window on)\n"
+                 "  --wide-window auto|off|on  windows of up to 16 rows: auto (default) where a drafter of the run takes\n"
+                 "                       them, off never, on always (XESTRATA_WIDE_WINDOW)\n"
                  "  --spec N             speculative decoding with the model's MTP layer: windows of up to N tokens,\n"
                  "                       the last one and N - 1 drafts (default 3; 0: off; --serve's sampled requests\n"
                  "                       too, the CLI's greedy runs)\n"
@@ -2490,7 +2500,7 @@ int plain_main(int argc, char** argv) {
     int64_t n_new = 16;
     strata::kernels::SamplerParams sp;   // greedy unless --seed
     sp.greedy = true;
-    bool stop_eos = false, serve = false, device_given = false;
+    bool stop_eos = false, serve = false, device_given = false, max_t_given = false;
     std::vector<int32_t> eos;
     std::string dump_path, profile_save;
     std::vector<int32_t> follow;   // --spec-follow: the continuation emitted instead of the picks (benchmarks)
@@ -2670,7 +2680,18 @@ int plain_main(int argc, char** argv) {
             if (!parse_ids(next("--eos-ids"), eos)) { std::fprintf(stderr, "--eos-ids: a list of token ids\n"); return 2; }
             stop_eos = true;
         }
-        else if (a == "--max-t") opt.max_t = (int) std::strtol(next("--max-t"), nullptr, 10);
+        else if (a == "--max-t") {
+            opt.max_t = (int) std::strtol(next("--max-t"), nullptr, 10);
+            max_t_given = true;
+        } else if (a == "--wide-window") {
+            const char* v = next("--wide-window");
+            strata::core::WideWindow w;
+            if (!strata::core::parse_wide_window(v, w)) {
+                std::fprintf(stderr, "xestrata (%s): --wide-window takes auto, off or on, not \"%s\"\n", arch.c_str(), v);
+                return 2;
+            }
+            strata::core::set_wide_window(w);
+        }
         else if (a == "--resident-experts") opt.resident_gib = -1;
         else if (a == "--resident-cpu-experts") {
             opt.resident_gib = -1;
@@ -2779,6 +2800,9 @@ int plain_main(int argc, char** argv) {
         std::fprintf(stderr, "xestrata (%s): needs --tokens and --max-new >= 1\n", arch.c_str());
         return 2;
     }
+    // the window's rows (window_rows.hpp), before anything is sized for them: --max-t, else 16 with --wide-window on or
+    // under auto where a drafter of this run takes wide windows, else the 8 a window always had
+    if (!max_t_given) opt.max_t = strata::core::window_rows_for(wants_wide_window(opt));
     // the last window's drafts and the MTP layer's cells reach a window past the last token
     if ((int64_t) prompt.size() + n_new + opt.max_t > opt.max_cells)
         opt.max_cells = (int64_t) prompt.size() + n_new + opt.max_t;

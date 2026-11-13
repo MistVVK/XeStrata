@@ -10,6 +10,7 @@
 // shuffle-down tree.
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/window_limits.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/per_device.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_bf16_gemv
@@ -261,7 +262,8 @@ void multi_dispatch(sycl::queue& q, const float* x, int64_t ldx, const uint16_t*
         case 6: dispatch_mmvf<6, true>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows, aux); break;
         default:
             if (n_tok <= 4) dispatch_mmvf<4>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows, aux);
-            else dispatch_mmvf<8>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows, aux);
+            else if (n_tok <= kVerifyNarrowT) dispatch_mmvf<8>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows, aux);
+            else dispatch_mmvf<kWindowMaxT>(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, rows, aux);   // a wide window
     }
 }
 
@@ -270,9 +272,9 @@ void multi_dispatch(sycl::queue& q, const float* x, int64_t ldx, const uint16_t*
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream) {
     if (n_tok == 1 && ldy >= n_out) { bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream); return; }
-    if (n_tok < 1 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 || x == nullptr ||
-        w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
-        throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..8 rows, even n_in/ldx, aligned pointers");
+    if (n_tok < 1 || n_tok > kWindowMaxT || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 ||
+        x == nullptr || w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
+        throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..16 rows, even n_in/ldx, aligned pointers");
     auto& q = queue_for(stream);
     multi_dispatch(q, x, ldx, w, y, ldy, n_in, n_out, n_tok, n_out >= 64 && rows_form(q, n_in, n_out, n_tok));
     if (!stream) core::Runtime::get().finish(q);
@@ -281,6 +283,8 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
 bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                    int64_t n_in, int64_t n_out, int n_tok, const uint16_t* w_aux, float* y_aux,
                                    int64_t ldy_aux, void* stream) {
+    // a wide window: two launches (the pair is built for 8 rows)
+    if (n_tok > kVerifyNarrowT && n_tok <= kWindowMaxT) return false;
     if (n_tok < 2 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_out < 1 || (ldx & 1) != 0 || x == nullptr ||
         w == nullptr || y == nullptr || w_aux == nullptr || y_aux == nullptr ||
         (reinterpret_cast<uintptr_t>(x) & 7u) != 0 || (reinterpret_cast<uintptr_t>(w_aux) & 3u) != 0)
@@ -420,23 +424,28 @@ void f32_gemm_rows(const float* x, int64_t ldx, const float* w, float* y, int64_
 
 void f32_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const float* w, float* y, int64_t ldy, int64_t n_in,
                               int64_t n_out, int n_tok, void* stream) {
-    if (n_tok < 1 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_in > std::numeric_limits<int>::max() ||
-        n_out <= 0 || n_out > std::numeric_limits<int>::max() || (ldx & 1) != 0 || x == nullptr || w == nullptr ||
-        y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0 || (reinterpret_cast<uintptr_t>(w) & 7u) != 0 ||
-        (reinterpret_cast<uintptr_t>(y) & 3u) != 0)
-        throw std::invalid_argument("f32_gemv_fp32_mmvf_multi: 1..8 rows, even n_in/ldx, aligned pointers");
+    if (n_tok < 1 || n_tok > kWindowMaxT || n_in <= 0 || (n_in & 1) != 0 ||
+        n_in > std::numeric_limits<int>::max() || n_out <= 0 || n_out > std::numeric_limits<int>::max() ||
+        (ldx & 1) != 0 || x == nullptr || w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0 ||
+        (reinterpret_cast<uintptr_t>(w) & 7u) != 0 || (reinterpret_cast<uintptr_t>(y) & 3u) != 0)
+        throw std::invalid_argument("f32_gemv_fp32_mmvf_multi: 1..16 rows, even n_in/ldx, aligned pointers");
     auto& q = queue_for(stream);
     const int ni = (int) n_in;
-    switch (mmvf_block_size(n_in)) {
-        case 32: launch_mmvf<32, 8>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
-        case 64: launch_mmvf<64, 8>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
-        case 96: launch_mmvf<96, 8>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
-        case 128: launch_mmvf<128, 8>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
-        case 160: launch_mmvf<160, 8>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
-        case 192: launch_mmvf<192, 8>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
-        case 224: launch_mmvf<224, 8>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
-        default: launch_mmvf<256, 8>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
-    }
+    // NT: 8 for a window of up to 8 rows (the instances it always ran), 16 for a wider one
+    const auto go = [&]<int NT>() {
+        switch (mmvf_block_size(n_in)) {
+            case 32: launch_mmvf<32, NT>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
+            case 64: launch_mmvf<64, NT>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
+            case 96: launch_mmvf<96, NT>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
+            case 128: launch_mmvf<128, NT>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
+            case 160: launch_mmvf<160, NT>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
+            case 192: launch_mmvf<192, NT>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
+            case 224: launch_mmvf<224, NT>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
+            default: launch_mmvf<256, NT>(q, x, ldx, w, y, ldy, ni, n_out, n_tok); break;
+        }
+    };
+    if (n_tok <= kVerifyNarrowT) go.template operator()<kVerifyNarrowT>();
+    else go.template operator()<kWindowMaxT>();
     if (!stream) core::Runtime::get().finish(q);
 }
 

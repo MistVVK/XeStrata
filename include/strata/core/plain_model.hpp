@@ -1214,7 +1214,7 @@ private:
     int64_t cur_pos_ = 0;
     std::vector<int32_t> drafts_;
     std::vector<float> dprob_;   ///< drafts_[j]'s probability under the MTP layer, for the window rule
-    strata::spec::DraftPolicy policy_{strata::spec::DraftPolicy::kMaxT};
+    strata::spec::DraftPolicy policy_{strata::kernels::kVerifyNarrowT};   ///< (load: the window, max_t)
     /// Whether the window rule keeps another draft after the n drafts made (opt_.spec_window).
     bool draft_more(int n) const;
     float* mtp_h_ = nullptr;

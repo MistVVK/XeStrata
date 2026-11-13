@@ -44,5 +44,13 @@ inline bool parse_wide_window(const char* s, WideWindow& out) {
 inline int window_rows_cap() {
     return wide_window() == WideWindow::Off ? strata::kernels::kVerifyNarrowT : strata::kernels::kWindowMaxT;
 }
+/// The rows an engine sizes its windows for (its buffers and graphs, before it loads): 16 when the wide windows are on,
+/// or under auto when a user of the windows will take more than 8 rows (`wants_wide`: a drafter that measures wide
+/// windows, a batch group of more than 8 slots); else the 8 a window always had.
+inline int window_rows_for(bool wants_wide) {
+    const WideWindow w = wide_window();
+    return w == WideWindow::On || (w == WideWindow::Auto && wants_wide) ? window_rows_cap()
+                                                                        : strata::kernels::kVerifyNarrowT;
+}
 
 }  // namespace strata::core

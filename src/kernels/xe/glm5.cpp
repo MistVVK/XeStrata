@@ -323,14 +323,16 @@ void glm5_kda_scan(float* state, const float* q, const float* k, const float* v,
     if (n_heads <= 0 || n_heads > 65535) throw core::DeviceError("glm5_kda_scan: " + std::to_string(n_heads) + " heads");
     if (n_snaps < 0 || n_snaps > kGlm5MaxSnaps) throw core::DeviceError("glm5_kda_scan: too many snapshots");
     if (n_tokens <= 0) return;
-    struct Snaps { float* p[kGlm5MaxSnaps]; } sn{};
-    for (int i = 0; i < n_snaps; ++i) sn.p[i] = snaps[i];
     const int NS = (int) std::min<int64_t>(n_snaps, n_tokens);
     const int H = (int) n_heads;
     const int64_t T = n_tokens, TS = (int64_t) H * S;
     const float scale = 1.0f / sycl::sqrt((float) S);
+    // CAP: the snapshots' argument, 8 for a window of up to 8 rows (the kernel it always ran), else the wide window's
+    const auto launch = [&]<int CAP>() {
+    struct Snaps { float* p[CAP]; } sn{};
+    for (int i = 0; i < n_snaps; ++i) sn.p[i] = snaps[i];
     // one sub-group a (head, column): its four state rows a lane in registers, as native_gdn_step
-    const auto event = queue_for(stream).parallel_for(
+    return queue_for(stream).parallel_for(
         sycl::nd_range<2>({(size_t) H, (size_t) S * WARP}, {1, (size_t) COLS * WARP}),
         [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
@@ -367,6 +369,9 @@ void glm5_kda_scan(float* state, const float* q, const float* k, const float* v,
             }
             for (int r = 0; r < 4; ++r) state[((size_t) (r * WARP + lane) * H + head) * S + col] = s[r];
         });
+    };
+    const auto event = n_snaps <= kVerifyNarrowT ? launch.template operator()<kVerifyNarrowT>()
+                                                 : launch.template operator()<kGlm5MaxSnaps>();
     sync_if_needed(stream, event, "glm5_kda_scan");
 }
 

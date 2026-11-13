@@ -157,7 +157,7 @@ public:
     /// measurement (about 1 s on an RTX 4070) is not in its time to the first token.  Throws on a device error.
     static void tune_device(const ModelGeometry& g, void* stream);
 
-    /// `max_t` <= kVerifyMaxT.  `head` may be null (the canonical head is then run per token).
+    /// `max_t` <= kVerifyNarrowT.  `head` may be null (the canonical head is then run per token).
     bool init(const WeightTable& wt, const ModelGeometry& g, SessionState& ss, const VerifyHits& hits,
               const NativeHead* head, int max_t, std::string& err);
 
@@ -196,7 +196,7 @@ public:
     /// front slots -1 (the kernel reads only the tail window).  Row t follows the window's drafts 1..t - staging
     /// row 0 alone (before 0.1.19) left the drafted rows with unwritten histories.  Null disables the penalties
     /// entirely - the neutral run's sampling call is byte-for-byte what it was.  The engine re-uploads the rows
-    /// before every window; the buffer must hold kVerifyMaxT rows and stay alive across the request.
+    /// before every window; the buffer must hold kVerifyNarrowT rows and stay alive across the request.
     void set_history(const int32_t* history, int history_len) {
         hist_d_ = history;
         hist_len_ = history_len;
@@ -229,8 +229,8 @@ public:
     const float* tap_dev() const { return tap_dev_; }
     int n_taps() const { return (int) tap_layers_.size(); }
 
-    /// The rows the hand-off buffers of `set_stage` hold (0: kVerifyMaxT, the default).  STRATA_PIPED_MTP's groups write
-    /// their slots' token and proposal rows at hbase = group * rows-per-group, past kVerifyMaxT with enough slots.
+    /// The rows the hand-off buffers of `set_stage` hold (0: kVerifyNarrowT, the default).  STRATA_PIPED_MTP's groups write
+    /// their slots' token and proposal rows at hbase = group * rows-per-group, past kVerifyNarrowT with enough slots.
     void set_handoff_rows(int rows) { handoff_rows_ = rows; }
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.  Everything goes through a StageLink (an InProcessStage here).
@@ -454,7 +454,7 @@ private:
     bool head_sampling_ = true;          ///< set_head_sampling
     std::vector<float> logit_bias_host_;
     float* logit_bias_device_ = nullptr;
-    uint32_t* allowed_device_ = nullptr;   ///< kVerifyMaxT rows of the grammar's mask (set_allowed)
+    uint32_t* allowed_device_ = nullptr;   ///< kVerifyNarrowT rows of the grammar's mask (set_allowed)
     bool allowed_on_ = false;
     float* rp_lambda_d_ = nullptr;          ///< STRATA_ROUTE_PRIOR's lambda on the device (0: off; set_route_prior)
     bool rp_on_ = true;
@@ -523,7 +523,7 @@ private:
     std::vector<int> tap_req_, tap_layers_;   ///< set_taps: the DFlash2 drafter's tap layers (this stage's share)
     std::vector<int> tap_slot_;          ///< layer -> its tap index (-1: not tapped)
     float* tap_dev_ = nullptr;           ///< [max_t][ntap][n_embd], the window's taps (null: none)
-    int handoff_rows_ = 0;               ///< set_handoff_rows (0: kVerifyMaxT)
+    int handoff_rows_ = 0;               ///< set_handoff_rows (0: kVerifyNarrowT)
     const float* hand_in_ = nullptr;
     float* hand_out_ = nullptr;
     StageLink* next_ = nullptr;          ///< set_next: the next stage, through this link only
@@ -581,7 +581,7 @@ private:
     int32_t* h_commit_ = nullptr; int32_t* m_commit_ = nullptr; // [n_keep, n_keep-1, pos_0 .. pos_{T-1}]
     float* h_ple_ = nullptr;     float* m_ple_ = nullptr;       // T * n_embd
     int32_t* h_out_ = nullptr;   int32_t* m_out_ = nullptr;     // T argmax ids
-    uint32_t* h_nf_ = nullptr;   uint32_t* m_nf_ = nullptr;     // #879: kVerifyMaxT * kNonfiniteBlocks flags
+    uint32_t* h_nf_ = nullptr;   uint32_t* m_nf_ = nullptr;     // #879: kVerifyNarrowT * kNonfiniteBlocks flags
     int nf_row_ = -1;                     ///< nonfinite_row()
     int64_t nf_pos_ = -1;                 ///< nonfinite_pos()
     uint32_t nf_mask_ = 0;                ///< nonfinite_in(): bit t = row t
