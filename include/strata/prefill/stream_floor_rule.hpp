@@ -22,8 +22,12 @@ inline constexpr int64_t kFusedOnlyFloor = 64;   // the streamed walk is faster 
 
 /// `class_measured`: the device class this default was measured on (Windows gfx1151).  `all_layers_fused_only`: the layer set has no MMQ tile and the fused kernels take every layer.
 /// `staged_entry`: the staged walk takes such layers on its fused group entry (staged_fo_rule.hpp), so the old FP16 path below the floor is gone and the floor needs no lowering.
-constexpr int64_t stream_floor_default(bool class_measured, bool all_layers_fused_only, bool staged_entry) {
-    return class_measured && all_layers_fused_only && !staged_entry ? kFusedOnlyFloor : kStreamFloorDefault;
+///
+/// `plain_pack_fused`: a build without llama.cpp's MMQ (prefill.cpp STRATA_PF_OWN_ONLY) loading a pack that is not a native one (the AVX-512 Q2_0 pack: no native_experts.txt) whose layers the plan marks
+/// fused (fused::enabled()).  The staged entry and the int8 kernels read the native layout only, so below the floor such a layer would run each routed expert on the dequantize + FP16 path
+/// (Radeon 780M, Q2_0 pack: 367-token prompts 7,435 ms against 3,222 ms with MMQ); the floor is kFusedOnlyFloor there, on every card class.  A build with MMQ passes false.
+constexpr int64_t stream_floor_default(bool class_measured, bool all_layers_fused_only, bool staged_entry, bool plain_pack_fused = false) {
+    return (class_measured && all_layers_fused_only && !staged_entry) || plain_pack_fused ? kFusedOnlyFloor : kStreamFloorDefault;
 }
 
 }  // namespace strata::prefill
