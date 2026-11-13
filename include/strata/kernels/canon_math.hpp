@@ -148,15 +148,19 @@ inline int fx_exp(float v) { return fx_part(v).e; }
 
 /// A block's integer scale A for the parts of a (the activation's d) and w (the weights' d) in a row of exponent `top`:
 /// (ma mw) 2^(ea + ew - top + kFxHead), rounded half away from zero where the shift is to the right.
+/// The integer m 2^s (m below 2^22, s at most kFxHead), rounded half away from zero where s < 0, negated where neg:
+/// fx_scale's last step, for a caller that has the shift's parts at hand (the row's and the output's apart).
+/// Without branches (a GPU's lanes take different shifts): the shift's three cases as selects, the counts held to 0..31.
+inline int32_t fx_shift(uint32_t m, int s, uint32_t neg) {
+    const uint32_t ns = (uint32_t) -s;   // the right shift, where s < 0
+    const uint32_t left = m << ((uint32_t) s & 31u);
+    const uint32_t right = (m + (1u << ((ns - 1u) & 31u))) >> (ns & 31u);
+    const uint32_t r = s >= 0 ? left : s < -23 ? 0u : right;   // m below 2^22: 0 past a shift of 23
+    return neg != 0u ? -(int32_t) r : (int32_t) r;
+}
 inline int32_t fx_scale(const FxPart& a, const FxPart& w, int top) {
     if (a.m == 0u || w.m == 0u) return 0;
-    const uint32_t m = a.m * w.m;
-    const int s = a.e + w.e - top + kFxHead;   // at most kFxHead where top is the row's
-    uint32_t r;
-    if (s >= 0) r = m << s;
-    else if (s < -23) r = 0u;   // m below 2^22: rounds to 0
-    else r = (m + (1u << (-s - 1))) >> -s;
-    return (a.neg ^ w.neg) != 0u ? -(int32_t) r : (int32_t) r;
+    return fx_shift(a.m * w.m, a.e + w.e - top + kFxHead, a.neg ^ w.neg);   // the shift at most kFxHead
 }
 inline int32_t fx_scale(float a, float w, int top) { return fx_scale(fx_part(a), fx_part(w), top); }
 

@@ -1432,18 +1432,29 @@ struct Kernel {
                         }
                     }
                     if constexpr (FX)
-                        if ((k0 / 32 + b) % FXG == FXG - 1)   // the group's sums into int64
+                        if ((k0 / 32 + b) % FXG == FXG - 1) {   // the group's sums into int64
+                            // fx_scale's parts, a row's and an output's apart: m = ma mw, s = (ea - ta + kFxHead) +
+                            // (ew - tw)
+                            uint32_t am[SGM][8];
+                            int as[SGM][8];
+                            for (int i = 0; i < SGM; ++i)
+                                for (int el = 0; el < 8; ++el) {
+                                    const canon::FxPart p = canon::fx_part(xsr[i][el]);
+                                    am[i][el] = p.m;
+                                    as[i][el] = p.e - ta[ms + i * TM + row_of(el)] + canon::kFxHead;
+                                }
                             for (int j = 0; j < SGN; ++j) {
                                 const int nn = ns + j * TN + lo;
-                                const float wd = fx_wd(wsl, wml, b, nn);
+                                const canon::FxPart wp = canon::fx_part(fx_wd(wsl, wml, b, nn));
+                                const int ws = wp.e - tw[nn];
                                 for (int i = 0; i < SGM; ++i)
                                     for (int el = 0; el < 8; ++el) {
-                                        const int rr = ms + i * TM + row_of(el);
-                                        acc64[i][j][el] +=
-                                            (int64_t) fx_a(xsr[i][el], wd, ta[rr] + tw[nn]) * isum[i][j][el];
+                                        acc64[i][j][el] += (int64_t) canon::fx_shift(am[i][el] * wp.m, as[i][el] + ws,
+                                                                                     wp.neg) * isum[i][j][el];
                                         isum[i][j][el] = 0;
                                     }
                             }
+                        }
                     if constexpr (MIN)
                         for (int j = 0; j < SGN; ++j) {
                             const float wm = wml[b * WN + ns + j * TN + lo];
@@ -1736,6 +1747,16 @@ bool takes_work_group(sycl::queue& q) {
     });
 }
 
+// The fixed-point products' tiles: a sub-group's rows halved (twice the sub-groups for the tile), so its int64 sums fit
+// its registers.  XESTRATA_IQ_MMQ_FX_SPLIT=0: the int8 products' shapes (an experiment, measured on the RX 8060S only)
+bool fx_split() {
+    static const bool on = [] {
+        const char* v = std::getenv("XESTRATA_IQ_MMQ_FX_SPLIT");
+        return v == nullptr || v[0] != '0';
+    }();
+    return on;
+}
+
 template<int TY>
 sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, size_t woff, size_t expert_bytes,
                     int64_t w_rows, int64_t w_cols, int n, const void* xq, int64_t total_rows, const int32_t* bounds,
@@ -1746,6 +1767,12 @@ sycl::event by_rows(sycl::queue& q, const void* w, const uint8_t* const* wtab, s
 #define STRATA_MMQ_ROWS(DP4A, TAIL, IS)                                                        \
     do {                                                                                        \
         if (max_rows <= 16) return STRATA_MMQ_LAUNCH(1, 1, DP4A, TAIL, IS);                     \
+        if constexpr (fx_form<TY>())                                                            \
+            if (fx_split()) {                                                                   \
+                if (max_rows <= 32 || mean_rows <= 32) return STRATA_MMQ_LAUNCH(1, 2, DP4A, TAIL, IS); \
+                if (takes_work_group<Kernel<TY, 1, 4, DP4A, TAIL, IS>>(q))                      \
+                    return STRATA_MMQ_LAUNCH(1, 4, DP4A, TAIL, IS);                             \
+            }                                                                                   \
         if (max_rows <= 32 || mean_rows <= 32) return STRATA_MMQ_LAUNCH(2, 1, DP4A, TAIL, IS);  \
         return STRATA_MMQ_LAUNCH(2, 2, DP4A, TAIL, IS);                                         \
     } while (0)
