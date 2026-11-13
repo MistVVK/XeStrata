@@ -10,6 +10,7 @@
 // shuffle-down tree.
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/bf16_bits.hpp"
+#include "strata/kernels/window_limits.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/per_device.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_bf16_gemv
@@ -270,6 +271,13 @@ void multi_dispatch(sycl::queue& q, const float* x, int64_t ldx, const uint16_t*
 void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                int64_t n_in, int64_t n_out, int n_tok, void* stream) {
     if (n_tok == 1 && ldy >= n_out) { bf16_gemv_fp32_mmvf(x, w, y, n_in, n_out, stream); return; }
+    if (n_tok > kVerifyNarrowT && n_tok <= kWindowMaxT) {   // a wide window: its first 8 rows and the rest (wide
+        // instances took VRAM from every run's start; each row's sums are its own either way)
+        bf16_gemv_fp32_mmvf_multi(x, ldx, w, y, ldy, n_in, n_out, kVerifyNarrowT, stream);
+        bf16_gemv_fp32_mmvf_multi(x + kVerifyNarrowT * ldx, ldx, w, y + kVerifyNarrowT * ldy, ldy, n_in, n_out,
+                                  n_tok - kVerifyNarrowT, stream);
+        return;
+    }
     if (n_tok < 1 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_out <= 0 || (ldx & 1) != 0 || x == nullptr ||
         w == nullptr || y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0)
         throw std::invalid_argument("bf16_gemv_fp32_mmvf_multi: 1..8 rows, even n_in/ldx, aligned pointers");
@@ -281,6 +289,7 @@ void bf16_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const uint16_t* w, f
 bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy,
                                    int64_t n_in, int64_t n_out, int n_tok, const uint16_t* w_aux, float* y_aux,
                                    int64_t ldy_aux, void* stream) {
+    if (n_tok > kVerifyNarrowT && n_tok <= kWindowMaxT) return false;   // a wide window: the two products apart
     if (n_tok < 2 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_out < 1 || (ldx & 1) != 0 || x == nullptr ||
         w == nullptr || y == nullptr || w_aux == nullptr || y_aux == nullptr ||
         (reinterpret_cast<uintptr_t>(x) & 7u) != 0 || (reinterpret_cast<uintptr_t>(w_aux) & 3u) != 0)
@@ -420,6 +429,12 @@ void f32_gemm_rows(const float* x, int64_t ldx, const float* w, float* y, int64_
 
 void f32_gemv_fp32_mmvf_multi(const float* x, int64_t ldx, const float* w, float* y, int64_t ldy, int64_t n_in,
                               int64_t n_out, int n_tok, void* stream) {
+    if (n_tok > kVerifyNarrowT && n_tok <= kWindowMaxT) {   // a wide window: its first 8 rows and the rest
+        f32_gemv_fp32_mmvf_multi(x, ldx, w, y, ldy, n_in, n_out, kVerifyNarrowT, stream);
+        f32_gemv_fp32_mmvf_multi(x + kVerifyNarrowT * ldx, ldx, w, y + kVerifyNarrowT * ldy, ldy, n_in, n_out,
+                                 n_tok - kVerifyNarrowT, stream);
+        return;
+    }
     if (n_tok < 1 || n_tok > 8 || n_in <= 0 || (n_in & 1) != 0 || n_in > std::numeric_limits<int>::max() ||
         n_out <= 0 || n_out > std::numeric_limits<int>::max() || (ldx & 1) != 0 || x == nullptr || w == nullptr ||
         y == nullptr || (reinterpret_cast<uintptr_t>(x) & 7u) != 0 || (reinterpret_cast<uintptr_t>(w) & 7u) != 0 ||

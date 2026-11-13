@@ -1094,7 +1094,7 @@ sycl::event launch_mmvq_n(sycl::queue& q, const uint8_t* w, size_t row_bytes, co
 }
 
 // up to 8 columns in one pass, the count exact (upstream 2715a752: 3, 5, 6 and 7 took two or three passes); 8 at a
-// time past 8 (the verify window takes up to 8 tokens)
+// time past 8 (a wide window's 9..16 rows: 9..16-column instances here took 2 MiB of VRAM from every run's start)
 template<int TY>
 sycl::event launch_mmvq(sycl::queue& q, const uint8_t* w, size_t row_bytes, const block_q8_1* x, float* y, int n_in,
                         int n_out, int ncols) {
