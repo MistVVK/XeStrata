@@ -65,7 +65,10 @@ DRAFTERS = {
         "glm-5.3-flash", "incoai/GLM-5.3-Flash-DFlash2", "6cc6c481eee930a5139619ed919f78726371adbc",
         (("config.json", 1273, "c4aeac0101196a6e26705b34c45230bcd0c7c68ee2d2d1efdb242087f3712573"),
          ("model.safetensors", 2342169800, "b038e1d9d1e7833fa3880c2c0135ba9b673013f03da1b29fb831931584759dac")),
-        "glm-5.3-flash-dflash2.q4_0.pack", None, "glm-5.3-flash-dflash2.q4_0-selq4.pack", None,
+        "glm-5.3-flash-dflash2.q4_0.pack",
+        (773469184, "f2b80152f170e7fc037b101876a960aff6db1b7461a40066d15d10430eeff8b1"),
+        "glm-5.3-flash-dflash2.q4_0-selq4.pack",
+        (659477504, "960304755f7adc13a706f0f4ba6dc55bbe81dfd4c187c2352aad2277c9df5d3d"),
         2.3, 0.75, "NOTICE-GLM-5.3-Flash.md"),
     # Qwen3.6-35B-A3B's: hidden 2048, 6 layers, the target's layers 1/6/11/16/22/27/32/37 (its residual: one stream);
     # vocabulary 248,320
@@ -73,7 +76,10 @@ DRAFTERS = {
         "qwen3.6-35b-a3b", "incoai/Qwen3.6-35B-A3B-DFlash2", "51ef7b6923ad6c14cb1bb41c37a9041446496ab6",
         (("config.json", 1291, "86d2e8e57e7c70bb867240708d00c0535ae9ed3c828dbdcb21584471c7bbce59"),
          ("model.safetensors", 1052513456, "d1f16c0ff85afbe6166fabfae998af3ec16fa11da87da4391b5e0e0a7c796a4d")),
-        "qwen3.6-35b-a3b-dflash2.q4_0.pack", None, "qwen3.6-35b-a3b-dflash2.q4_0-selq4.pack", None,
+        "qwen3.6-35b-a3b-dflash2.q4_0.pack",
+        (479229952, "12a69bedca64f9e1196f34192d39519e5eab08a4f56de658abbf7f05db405784"),
+        "qwen3.6-35b-a3b-dflash2.q4_0-selq4.pack",
+        (296466432, "a635ae4af9497e35eca46d78c01d3f95c87709f7d1d2829ffd1dec08084acbed"),
         1.1, 0.45, "NOTICE-Qwen3.6-35B-A3B.md"),
 }
 DEFAULT = "qwen3.8-flash-next"
