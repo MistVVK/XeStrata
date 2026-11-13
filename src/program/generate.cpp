@@ -10862,6 +10862,25 @@ int main(int argc, char** argv) {
                     e = why.empty() ? std::string("a pipelined prompt window failed") : why;
                     return false;
                 };
+                // The drafter's prefill blocks this thread until its stream is idle (on HIP, MtpDrafter::prefill syncs
+                // once per group whatever its `sync` says: prefill_per_group_sync, src/core/mtp.cpp).  With the drafter
+                // on the first card (mtp_first) a stage-0 window still in flight spins on that GPU for doorbells only
+                // this thread serves, so a prefill called beside it never returns: the prompt read stopped for good at
+                // its first window (0.1.56, gfx1201 + gfx1030, --pipeline-windows 2, issue #5147).  Serve stage 0 to its
+                // end first; the rest of the read keeps both stages overlapped.  The tokens are unchanged: the same
+                // windows, in the same order, only served a little earlier.
+                const bool mtp_first = mtp.device() == 0;
+                auto serve_stage0_to_end = [&]() -> bool {
+                    while (f0 < l0) {
+                        strata::core::Verifier& v0 = *PV[0][f0 & 1];
+                        if (v0.service(win_pool_fn, PSD[f0 & 1], e) < 0) return false;
+                        if (v0.done(e)) {
+                            if (!v0.pl_finish(nullptr, e) || !v0.pl_commit_async(wins[f0].T, e)) return false;
+                            ++f0;
+                        } else if (!e.empty()) return false;
+                    }
+                    return true;
+                };
                 while (f1 < N) {
                     if (stop_req.load()) return fail("cancelled");
                     // stage 0: one window at a time; window K+2 (K's parity) only once stage 1 has finished window K,
@@ -10897,6 +10916,9 @@ int main(int argc, char** argv) {
                             if (nonfinite_hit(v, "prompt")) return fail("non-finite logits (#879)");
                             const Win& w = wins[f1];
                             for (int t = 0; t < w.T; ++t) nx[(size_t) t] = (int32_t) cur[(size_t) (w.q + t + 1)];
+                            // the drafter shares stage 0's card: no stage-0 window may still be in flight when its
+                            // prefill waits on the host (see serve_stage0_to_end)
+                            if (mtp_first && !serve_stage0_to_end()) return fail(e);
                             if (!mtp.prefill(v.final_R(0), nx.data(), w.T, w.q, e, false)) return fail(e);
                             if (!strata::gpu::event_record(pl_mtp_ev[f1 & 1], mtp.stream()))
                                 return fail("pipeline: event record failed");
