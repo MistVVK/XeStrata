@@ -370,9 +370,8 @@ struct Gdn {
     }
 
     static void conv(float* hist, const float* qkv, const float* w, float* h, int64_t T, float eps, void* stream) {
-        static const bool serial = strata::env_get("GDN_CONV_SERIAL") != nullptr;   // the old walk (A/B)
         auto& q = Q(stream);
-        if (serial || T <= CONV_TILE) {
+        if (T <= CONV_TILE) {
             // one work-item per channel walks the chunk
             q.parallel_for(sycl::range<1>(C), [=](sycl::id<1> id) {
                 const int c = (int) id[0];
@@ -722,49 +721,15 @@ struct Gdn {
     }
 
     // `with_out` false (KVA's state-only layer): the same recurrence kernels without the output normalization, so z,
-    // gamma and y16 are not read; the one-group-per-head kernel fuses that norm, so it runs only with the output
+    // gamma and y16 are not read
     static void recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                            const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, bool silu, void* stream,
                            bool with_out = true) {
-        static const bool serial = strata::env_get("GDN_REC_HEADS") != nullptr;   // the one-group-per-head kernel (A/B)
         auto& q = Q(stream);
-        if (!with_out && T <= 0) return;
-        if ((serial && with_out) || T <= 0) {
-            q.submit([&](sycl::handler& hd) {
-                sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
-                    red(sycl::range<1>((size_t) RG * S), hd), wsum(sycl::range<1>(16), hd);
-                hd.parallel_for(sycl::nd_range<1>((size_t) HV * S * RG, (size_t) S * RG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
-                    const sycl::sub_group sg = it.get_sub_group();
-                    const int head = (int) it.get_group(0), tid = (int) it.get_local_id(0), col = tid % S, rg = tid / S;
-                    const int qh = head % HK;
-                    float s[RPG];
-                    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
-                    const size_t rs = (size_t) HV * S;
-                    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
-                    const float g_col = gamma[col];
-                    for (int64_t t = 0; t < T; ++t) {
-                        const float oc_all = rec_step<S>(it, s, h + t * C, gate, beta, t, head, qh, rg, col, col, tid,
-                                                         &sk[0], &sq[0], &red[0]);
-                        float oc = 0.0f, sp = 0.0f;
-                        if (rg == 0) { oc = oc_all; sp = oc * oc; }
-                        sp = warp_sum(sg, sp);
-                        if ((tid & 31) == 0) wsum[tid >> 5] = sp;
-                        sycl::group_barrier(it.get_group());
-                        if (rg == 0) {
-                            const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
-                            const float v = oc * sycl::rsqrt(ss / (float) S + eps) * g_col * zgate(z[t * HV * S + (int64_t) head * S + col], silu);
-                            y[t * HV * S + (int64_t) head * S + col] = v;
-                            y16[t * HV * S + (int64_t) head * S + col] = hf(v);
-                        }
-                    }
-                    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
-                });
-            });
-            return;
-        }
-        // D-2: the value columns split over 4 work-groups per head, then the output norm in its own kernel; per column
-        // the same arithmetic in the same order as the kernel above.  The next token's inputs (its q and k rows, v, gate,
-        // beta) are loaded into registers while this one computes (upstream ac6aad4, 04f4a53): the same bits.
+        if (T <= 0) return;
+        // D-2: the value columns split over 4 work-groups per head, then the output norm in its own kernel.  The next
+        // token's inputs (its q and k rows, v, gate, beta) are loaded into registers while this one computes
+        // (upstream ac6aad4, 04f4a53): the same bits.
         // STRATA_GDN_PIPELINE=0: each token's inputs loaded when it starts (rec_step), to compare.
         static const bool pipe_on = [] {
             const char* v = strata::env_get("GDN_PIPELINE");

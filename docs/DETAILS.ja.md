@@ -44,6 +44,8 @@ MTP の推測デコードはオンです。
 
 短いプロンプト（2,048 トークン未満のチャンク）では、VRAM にないエキスパートのうち少しのトークンにしか選ばれないものを、そのあいだ空いている decode 用の CPU のプールが計算します（upstream では opt-in、Xe は既定、`XESTRATA_PREFILL_CPU_SHARE=auto`）。CPU と GPU のエキスパートあたりの時間を測り、両方が同時に終わる割合を渡します。`XESTRATA_PREFILL_CPU_GATE=1` にすると、渡す層と渡さない層を隣どうしで交互に測り、VRAM にないエキスパートあたりの時間が渡す方で短いあいだだけ渡します（upstream f2a3b946、#1282。CPU が忙しいとストリームを出すホストが遅くなり、渡すと遅くなった PC があったため）。渡さない層を試す分だけ遅くなり、1K のプロンプトが B70 で 1.3%、RTX 4070 で 4.4% 遅くなったので、既定では使いません。`XESTRATA_DBG_CPU_GATE=1` でその測定を出します。GPU のキャッシュがすべてのエキスパートを持つとき（流すものがない）と、ホストのメモリが足りないとき（空き RAM が分担のバッファと 3 GiB より少ない、または読むエキスパートのファイルのページを空き RAM が持てない）は、既定では使いません（upstream eaaa237e・04dbe561、`XESTRATA_PREFILL_CPU_SHARE=auto` で使います）。分担のバッファを確保できなかったときは、その要求を失敗させずに分担を止めます。CPU の活性の形で計算するので、GPU だけのときと答えが少し変わります。測った割合は実行ごとに少し動き、CPU が受け持つエキスパートもそれにつれて変わるので、同じ設定の 2 回の greedy の答えが途中から分かれていました。そこで setup のウォームアップが、PC とモデルの組ごとに一度だけ割合を測って実行の設定に書きます（`--prefill-cpu-share`）。プロンプトは毎回同じように読まれます。`--prefill-cpu-share auto` にすると、以前のようにプロンプトごとに測ります。decode の PCIe の分担も実行ごとに変わりますが、CPU と GPU で同じ計算をするエキスパート（gate と up が i-quant・IQ4_XS・Q2_0、down が IQ4_NL・Q2_0。Qwen3.8 の 4 つのファイル）では答えは変わりません。それ以外の型のエキスパートのモデルで 2 回の答えを厳密に比べるときは、`--pcie-frac 0` も付けます。`XESTRATA_PREFILL_CPU_SHARE=0` で GPU だけ、`0.4` などで決まった割合です。262 / 914 トークンのプロンプトは、B70 で 319.2 → 383.1 / 736.3 → 828.0 トークン/秒、RTX 4070 で 109.9 → 266.1 / 275.9 → 457.8 トークン/秒でした（各 1 回）。
 
+2,048〜3,072 トークンのチャンクでは、エキスパートの行を 8 行ずつに分けて CPU と GPU が分担できるか、最初の層で両方を交互に測ります。plain の試行では CPU に渡すエキスパートを最大 16 個にして、測りの負担を小さくします。2 組の時間比の両方で、CPU に渡す方が 10% 以上速いときだけ、その後も渡します。Qwen3.8 の auto では、渡さない層も全 expert の先読みではなく、その層の route に沿って読みます。選択はその実行中だけ使い、ファイルには保存しません。`XESTRATA_PREFILL_STAGED_3K=0` で以前の経路、`=1` でこの分担を強制し、未設定または `=auto` で測って選びます。試す層の計算も答えに影響するため、GPU のみの計算とは出力が変わることがあります。
+
 補助の GPU（`--expert-cache-device1`、または `--layer-split auto` が選んだ補助）があるときは、同じ短いチャンクで、VRAM にないエキスパートのうち補助の GPU が持っていて少しのトークンにしか選ばれないものを、補助の GPU が自分の VRAM から計算します。そのトークンの行を両方の GPU に登録したホストのメモリで渡し、結果も同じ道で戻します。何トークンまで渡すかは、行を補助のリンクで往復する時間が、エキスパートを 1 枚目の GPU に流す時間より短くなる数で、起動時に測った両方のリンクの速さから決めます（B70 と RTX 4070 の x4 で 19）。`XESTRATA_PREFILL_HELPER_ROWS=n` で数を決め、`0` で使いません。補助の GPU の int8 の積で計算するので、1 枚目の GPU だけのときと答えが少し変わります（1K のプロンプトの最初のトークンの KL は 0.011、CPU の分担 0.5 は 0.020）。B70 と RTX 4070 で 1K のプロンプトは 693 → 735 トークン/秒でした。
 
 prefill には、エンジンの環境で入れる opt-in の切り替えが 4 つあります。どれも答えのビットは変わりません。
@@ -75,6 +77,30 @@ decode の速さは文章によっても変わります。
 与えた文書をほとんどそのまま書き返す作業では速くなり、ふつうの会話ではわずかに遅くなります
 （B70、IQ2_XS、K=3: 文書の書き直し 109.6 → 129.2、ふつうの会話 71.1 → 68.3 トークン/秒）。
 `--lookup-chain-min M` は、続きを足すのに要る一致の長さです（既定 3 トークン）。
+
+#### DFlash2（Qwen3.8-Flash-Next のもう一つの drafter）
+
+`--draft mtp|dflash2|auto|off` で drafter を選びます（既定 mtp）。DFlash2 は Qwen3.8-Flash-Next 用の block drafter
+（[incoai/Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2)、Apache-2.0）です。
+target の層 5/15/25/35/45 の隠れ状態を読み、anchor 1 行と mask 7 行の forward 1 回で 7 トークンを推測し、
+top-16 と rank-256 の selector で左から右へ選びます。MTP の層とは別の drafter で、`--draft-model PACK` に
+`tools/dflash2_pack.py` の pack（Q4_0 行列・Q4_0 selector、約 0.5 GB）を渡します。setup が `--drafting auto|dflash2` の
+とき pinned revision から取得してこの PC で pack します（`tools/dflash2_fetch.py`、SHA-256 照合）。
+
+`--draft auto` は MTP と DFlash2 の両方を読み、要求ごとにどちらを使うかを選びます。要求の `xestrata_draft`
+（`mtp|dflash2|auto`）が明示ならそれに従い、なければ `--draft-rule df2|mtp|learn`（既定 learn）です。learn は
+要求の種類（prompt 先頭 32 トークン）× 文脈の深さ（2K/8K/32K の境）ごとに、実測の decode 速度（EMA）の良い方を
+選び、負けた側も時々試します（差 4% 未満で 6 回に 1 回、以上で 12 回に 1 回）。起動直後は MTP から始め、最初の
+数要求で両方を測ります。結果はファイルに残しません（プロセス内だけ）。選ばれなかった drafter も最新に保ちます
+（DFlash2 の ring は context update、MTP は prompt の再読で引き継ぎます）。
+
+DFlash2 の窓は `--draft-conf P` で、selector 確率の積が P を下回る所で閉じます（既定は drafter 読み込み後の
+expert slots から決めます。`--draft-conf` の明示が優先）。`--draft dflash2` は既定で MTP の層を読みません
+（`--draft-fallback mtp` で両方）。DFlash2 は 1 枚の GPU・1 要求ずつです（層分割・`--batch`・pipeline windows は
+MTP のまま）。greedy の答えは drafter によらず同じです（検証の窓が target の argmax を出します）。
+
+plain エンジン（Qwen3.6・Ornith など）も同じ `--draft`・`xestrata_draft`・tap の機構を共有しますが、DFlash2 の
+重みは Qwen3.8-Flash-Next 用なので plain モデル用の pack はまだなく、`--draft dflash2` は拒否、auto は MTP を保ちます。
 
 サーバーの decode では、VRAM にないエキスパートを順位 7 以下（上位 10 のうち重みの小さい 8〜10 番目）で選んだトークンでは、その寄与を 0 にし、検証の窓のどのトークンもその順位でしか選ばないものは読まず計算もしません（`XESTRATA_ROUTE_TAIL_SKIP`、既定 7、upstream b4e3407b）。
 残りのエキスパートの重みは正規化し直しません。そのぶん答えが少し変わります。upstream は窓のほかのトークンがそのエキスパートを使わないときだけ 0 にするので、トークンの出力が窓のほかの行で変わりました。XeStrata はトークンごとに決めます。

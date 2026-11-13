@@ -1627,6 +1627,10 @@ class StrataEngine:
             keys += f" seed={seed}"
         if sampling.get("strata_route_prior") is False:   # the loop guard saw a loop: route exactly from here on
             keys += " route_prior=0"
+        # "xestrata_draft": this request's drafter under the engine's --draft auto (a new field: no strata_ name)
+        dr = sampling.get("xestrata_draft")
+        if isinstance(dr, str) and dr in ("mtp", "dflash2", "df2", "auto"):
+            keys += f" draft={dr}"
         # setup's calibration (tools/calibrate.py): engine settings for this request only, measured without a restart
         tune = sampling.get("strata_tune")
         if isinstance(tune, dict):
@@ -3831,6 +3835,15 @@ def engine_args(cfg: dict) -> list[str]:
             args += ["--split-roles", "helper"]
     if "coupled_draft" in cfg and "--coupled-draft" not in args and "--no-coupled-draft" not in args:
         args += ["--coupled-draft" if cfg["coupled_draft"] else "--no-coupled-draft"]
+    # "drafting": which drafter proposes (setup writes it).  auto loads both the MTP and DFlash2 and each request
+    # picks (the draft= key, else the engine's --draft-rule learn); dflash2 the DFlash2 pack alone; mtp/off as before.
+    drafting = cfg.get("drafting")
+    if drafting in ("auto", "mtp", "dflash2", "off") and "--draft" not in args:
+        args += ["--draft", drafting]
+        if drafting in ("auto", "dflash2") and cfg.get("draft_model") and "--draft-model" not in args:
+            args += ["--draft-model", str(cfg["draft_model"])]
+        if cfg.get("draft_rule") and "--draft-rule" not in args:
+            args += ["--draft-rule", str(cfg["draft_rule"])]
     # #533: the expert cache in segments (vram_elastic_on), so an image job, a vision encoder that starts with its
     # picture and POST /v1/vram can take VRAM and give it back; "vram_segment_mib" sets the segment size (the engine's
     # default: 512)

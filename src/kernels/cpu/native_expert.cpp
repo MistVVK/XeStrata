@@ -310,14 +310,6 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
     static const bool avx512 = cpu_avx512_ok() && strata::env_get("NO_IQ512") == nullptr;
     static const bool avx2 = strata::env_get("NO_IQ256") == nullptr;
     const int mt_min = native_gu_mt_min(f.gu_type);   // #152
-    // Unsloth UD-Q4_K_XL's Q4_K gate/up: the multi-token kernel is bit-exact against ggml's per-token dot (any group
-    // size, no #152 rule).  Opt-in, STRATA_KQ256=1: measured no faster in the engine (a window's expert groups hold
-    // ~1.4 tokens and the weights stay in L1 across ggml's per-token calls; 1.01-1.13x in native_expert_parity).
-    static const bool kq = [] { const char* v = strata::env_get("KQ256"); return cpu_avx2_ok() && v != nullptr && std::strtol(v, nullptr, 10) != 0; }();
-    if (kq && f.gu_type == 12 && nt >= 2) {   // one token: ggml's own dot below (the same bits, less overhead)
-        kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
-        return;
-    }
     // The trellis types (TQ2_T / TQK6 / TQK7 / TQP5-7): Strata's own kernels (tq_cpu.hpp), for every group size - they
     // decode a block once for all the tokens and give each token the same bits whatever the group (no #152 rule needed).
     if (tq_rows_own(f.gu_type)) {
@@ -366,13 +358,8 @@ void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const
     // token on as the gate/up rows (#152): 0.062 / 0.065 ms a row set against ggml-cpu (i7-14700, one thread).
     static const bool iq4nl_mt = strata::env_get("NO_IQ4NL") == nullptr;
     const int mt_min = native_gu_mt_min(f.gu_type);
-    static const bool kq = [] { const char* v = strata::env_get("KQ256"); return v != nullptr && std::strtol(v, nullptr, 10) != 0; }();
     if (tq_rows_own(f.d_type)) {   // the trellis types, as in native_gu_rows
         tq_rows(tq_isa(), f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
-        return;
-    }
-    if (cpu_avx2_ok() && kq && nt >= 2 && (f.d_type == 7 || f.d_type == 8)) {   // Q5_1 / Q8_0 down: bit-exact, any group size
-        kq256_rows(f.d_type, blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
         return;
     }
     if (nt >= mt_min && f.d_type == 20 && iq4nl_mt) {   // #152: the same rule as the gate/up rows

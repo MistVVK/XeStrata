@@ -30,6 +30,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/cvec.hpp"
+#include "strata/kernels/dflash2.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/core/layer.hpp"
@@ -148,7 +149,13 @@ private:
     size_t cap_ = 0, n_ = 0;
 };
 
-constexpr int64_t STREAM_ALL_MIN = 2048;
+// The staged walk lets the CPU pool share missed experts up to 3072 rows.  Keep the existing
+// threshold until the staged walk has been measured against streaming on the target device.
+inline double cpu_share_env();
+inline int64_t stream_all_min() {
+    const int mode = strata::core::cpu_share_staged_3k_mode();
+    return cpu_share_env() != 0.0 && mode != 0 ? 3073 : 2048;
+}
 // STRATA_PREFILL_CPU_SHARE (set_cpu_pool, upstream 978d3558, opt-in there): a chunk below STREAM_ALL_MIN hands the
 // decode CPU pool - idle while a prompt is read - the non-resident experts few of its tokens route to, instead of
 // streaming them.  `auto` (the default here): the share measured (each layer's CPU time per expert and the GPU's per
@@ -199,7 +206,7 @@ inline int ring_slots(size_t T) {
         r = (int) std::min<uint64_t>((uint64_t) r, mem / 8 / blob);
     }
     const int big = std::clamp<int>(r, 16, RING_MAX);
-    return (int64_t) T >= STREAM_ALL_MIN ? big : STAGE;
+    return (int64_t) T >= stream_all_min() ? big : STAGE;
 }
 // The BF16-weight projections (hyper-connection, SSM alpha/beta, indexer, router, shared gate, PLE key/value) take
 // BF16 activations here and FP32 ones in decode.  STRATA_PREFILL_BF16X2 adds each activation's BF16 remainder as a
@@ -726,6 +733,7 @@ struct Prefill::Impl {
     double cpu_ratio[CPU_RATIOS] = {};
     int cpu_nratio = 0;
     bool cpu_gate = false;   // the median ratio is below 1: the layers that share are the cheaper ones
+    strata::core::PromptShareChoice share_3k;
     // layer split: the device, and the hand-off to the next stage (two pinned chunk buffers, used in turn).
     // LAYER SPLIT, same process only: allocated in this stage's context, the next stage reads them where they are
     int device = -1;
@@ -815,8 +823,7 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
 void qsa_attention(const float* q, const strata::kernels::QsaAttnPools& pools, const int32_t* ids,
                    const int32_t* steps, int64_t cap, const strata::kernels::QsaShapes& shapes,
                    float* scratch, float* out, int64_t n, int64_t batch, bool rotate, gpu::Stream stream) {
-    static const bool old_attn = strata::env_get("PROMPT_ATTN_OLD") != nullptr;
-    if (old_attn || !strata::kernels::flash_attn_select(q, pools, ids, steps, cap, shapes, out, n, stream))
+    if (!strata::kernels::flash_attn_select(q, pools, ids, steps, cap, shapes, out, n, stream))
         for (int64_t t = 0; t < n; t += batch) {
             const int64_t nb = std::min(batch, n - t);
             strata::kernels::qsa_decode_attn_batch(q + t * ZV, pools, ids + t * cap,
@@ -954,6 +961,7 @@ void Prefill::reset() { release(); impl_ = std::make_unique<Impl>(); stats_ = {}
 void Prefill::release() {
     if (!impl_) return;
     lm_release();
+    if (tap_dev_) { strata::gpu::free(tap_dev_); tap_dev_ = nullptr; }
     impl_->stager.reset();
     if (impl_->cs) strata::gpu::stream_sync(impl_->cs);
     if (impl_->copy) strata::gpu::stream_sync(impl_->copy);
@@ -1170,7 +1178,7 @@ uint64_t expert_group_bytes(size_t T) {
         dq.take<uint16_t>((size_t) (g_expert_group * GU_ELEMS), ok);
         dq.take<uint16_t>((size_t) (g_expert_group * D_ELEMS), ok);
     }
-    if (mp.any && (int64_t) T >= STREAM_ALL_MIN) {
+    if (mp.any && (int64_t) T >= stream_all_min()) {
         q8.take<uint8_t>(MMQ_GROUP * mp.gu_max, ok);
         q8.take<uint8_t>(MMQ_GROUP * mp.d_max, ok);
     }
@@ -1194,6 +1202,20 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     if (stage_lb_ < 0 || stage_lb_ >= stage_le_ || stage_le_ > g.n_layers || (stage_le_ < g.n_layers) != (next_ != nullptr)) {
         err = "prefill: the stage's layer range is wrong";
         return false;
+    }
+    // the DFlash2 drafter's taps (set_taps): this stage's share of the layers, below the last
+    tap_local_.clear();
+    tap_slot_.assign((size_t) g.n_layers, -1);
+    for (int l : tap_layers_)
+        if (l >= stage_lb_ && l < stage_le_ && l < g.n_layers - 1) {
+            tap_slot_[(size_t) l] = (int) tap_local_.size();
+            tap_local_.push_back(l);
+        }
+    if (!tap_local_.empty() && tap_dev_ == nullptr) {
+        if (tap_cap_ < 1 || !strata::gpu::alloc_device(&tap_dev_, (size_t) tap_cap_ * tap_local_.size() * N * 4)) {
+            err = "prefill: the DFlash2 tap staging does not fit";
+            return false;
+        }
     }
     for (int b = 0; next_ != nullptr && b < 2; ++b)
         if (!m.hand[b] && !strata::gpu::alloc_host((void**) &m.hand[b], (size_t) chunk * D * 4)) {
@@ -1436,7 +1458,7 @@ bool Prefill::carve(size_t T, void* alloc) {
             m.dq_gu = dq.take<uint16_t>((size_t) (g_expert_group * GU_ELEMS), ok);
             m.dq_d = dq.take<uint16_t>((size_t) (g_expert_group * D_ELEMS), ok);
         }
-        if (ok && mmq_plan().any && (int64_t) T >= STREAM_ALL_MIN) {
+        if (ok && mmq_plan().any && (int64_t) T >= stream_all_min()) {
             m.grp_gu = q8.take<uint8_t>(MMQ_GROUP * mmq_plan().gu_max, ok);
             m.grp_d = q8.take<uint8_t>(MMQ_GROUP * mmq_plan().d_max, ok);
         }
@@ -1448,7 +1470,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         // the bounds: n + 1 absolute, then MMQ_GROUP + 1 relative a group; a group may hold one expert (the rows cap)
         m.bounds_dev = o.take<int32_t>((size_t) (m.g->n_expert + 1 + m.g->n_expert * (MMQ_GROUP + 1)), ok);
         m.tab_dev = o.take<int32_t>((size_t) (4 * m.g->n_expert), ok);
-        if ((int64_t) T < STREAM_ALL_MIN) m.mring = o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
+        if ((int64_t) T < stream_all_min()) m.mring = o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
         m.mgrp_live[0] = m.mgrp_live[1] = false;
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
         // lends them - a write now would corrupt a resident expert)
@@ -1693,7 +1715,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
         o.take<int32_t>(T * K, ok);
         o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
         o.take<int32_t>((size_t) (4 * g.n_expert), ok);
-        if ((int64_t) T < STREAM_ALL_MIN) o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
+        if ((int64_t) T < stream_all_min()) o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
     }
     for (int i = 0; i < ring_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
     f(T * N);
@@ -2021,6 +2043,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             std::fflush(stderr);
         }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
+        // the DFlash2 taps of this chunk: the rows at or after tap_first_ (the ring's window)
+        const int64_t tap_t0 = tap_dev_ ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : 0;
+        const int64_t tap_rows = tap_dev_ ? T - tap_t0 : 0;
+        if (tap_rows > tap_cap_) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
         // STRATA_KVA: this chunk is approximated in the layers at and after the split when its last position is
         // before the request's full-computation suffix; a chunk in the suffix runs the ordinary path everywhere.
         const bool kva_approx = kva_run && (p0 + T <= kva_frontier);
@@ -2175,7 +2201,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
-        const bool stream_all = m.ring > STAGE && T >= STREAM_ALL_MIN && m.src != nullptr;
+        const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
         struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; };
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;
@@ -2523,20 +2549,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                     pt.mark(kPfQsaIdx, cs);
                     // C-2: the chunk's appends in three launches instead of one per token (the same end state:
-                    // the queries below read it only after the whole chunk is appended). STRATA_INDEXER_PER_TOKEN=1: the old
+                    // the queries below read it only after the whole chunk is appended)
                     try {
-                        static const bool per_token = strata::env_get("INDEXER_PER_TOKEN") != nullptr;
-                        if (!per_token) {
-                            strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
-                                                                             EPS, ib, s, st.max_cells,
-                                                                             strata::kernels::rope_scaling(), m.cs);
-                        }
-                        for (int64_t t = 0; per_token && t < T; ++t) {
-                            const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
-                            strata::kernels::native_qsa_indexer_append(m.idx_raw + t * 128, step_t + strata::kernels::kStepPos, 0,
-                                                                       (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                                       strata::kernels::rope_scaling(), m.cs);
-                        }
+                        strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
+                                                                         EPS, ib, s, st.max_cells,
+                                                                         strata::kernels::rope_scaling(), m.cs);
                     } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
                     // KVA: the KV pages and the indexer's keys/pool are complete for this chunk.  Nothing that reads
                     // them (query side, selection, attention, output projection, the MoE half) has a consumer left, so
@@ -2556,11 +2573,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // C-1: the grid reaches the batch's last query's n_bid (they rise with the position)
                         const int64_t active = (int64_t) m.steps_host[(size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
                                                                                 strata::kernels::kStepNBid)] + 1;
-                        // the scores on tensor cores (3xTF32: FP32-level, not bitwise); STRATA_SELECT_OLD=1: the warp kernel
-                        static const bool old_sel = strata::env_get("SELECT_OLD") != nullptr;
-                        if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
-                                                                             steps0, nb, m.max_blocks, s, m.sel_scores,
-                                                                             m.cs, active))
+                        // the scores on tensor cores (3xTF32: FP32-level, not bitwise); the warp kernel where that form
+                        // cannot run
+                        if (!strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
+                                                                  steps0, nb, m.max_blocks, s, m.sel_scores,
+                                                                  m.cs, active))
                             strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
                                                               m.max_blocks, s, m.sel_scores, m.cs, active);
                         strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
@@ -2710,11 +2727,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // more than the gate saved on XeStrata's GPUs, 1K IQ3_XXS prompts 844 -> 833 tok/s on a B70 and
                     // 296 -> 283 on an RTX 4070 (2026-10-11, four interleaved rounds).
                     static const bool cpu_gate_on = [] { const char* e = strata::env_get("PREFILL_CPU_GATE"); return e != nullptr && e[0] == '1'; }();
-                    if (cpu_maybe && cpu_share_env() < 0.0 && cpu_gate_on) {
+                    const bool tune_3k = strata::core::cpu_share_staged_3k_mode() < 0 &&
+                                         strata::core::cpu_share_batched(T, true);
+                    if (cpu_maybe && (tune_3k || (cpu_share_env() < 0.0 && cpu_gate_on))) {
                         constexpr int64_t CPU_PROBE = 29;
                         constexpr int CPU_MIN_RATIOS = 3;
                         const int64_t i = m.cpu_layers++;
-                        cpu_arm = m.cpu_nratio < CPU_MIN_RATIOS ? (i & 1) != 0 : (i % CPU_PROBE == 0) != m.cpu_gate;
+                        cpu_arm = tune_3k ? m.share_3k.next()
+                                          : (m.cpu_nratio < CPU_MIN_RATIOS ? (i & 1) != 0 : (i % CPU_PROBE == 0) != m.cpu_gate);
                         if (m.cpu_first_l < 0) m.cpu_first_l = l;
                         cpu_cold = l == m.cpu_first_l;
                         if (m.cpu_wall[0] == nullptr)
@@ -2753,8 +2773,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (strata::gpu::event_elapsed_ms(&g_ms, m.cpu_ev[0], m.cpu_ev[1]))
                             m.cpu_meter.add(m.pend_cpu_ms, m.pend_n_cpu, g_ms, m.pend_n_gpu);
                     }
-                    if (cpu_maybe) {   // the rows buffer, once, at its largest (an expert takes at most MAXT tokens' rows)
-                        const size_t cap = (size_t) std::min<int64_t>(T * K, (int64_t) strata::kernels::cpu::MAXT * m.g->n_expert) * N;
+                    if (cpu_maybe) {   // the rows buffer, once, at its largest for this chunk
+                        const size_t cap = (size_t) (strata::core::cpu_share_batched(T, true) ? T * K :
+                            std::min<int64_t>(T * K, (int64_t) strata::kernels::cpu::MAXT * m.g->n_expert)) * N;
                         if (m.cpu_rows_n < cap) {
                             cpu_cold = true;
                             if (m.cpu_rows) strata::gpu::free(m.cpu_rows);
@@ -2772,7 +2793,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         float w_ms = 0;
                         if (strata::gpu::event_elapsed_ms(&w_ms, m.cpu_wall[(size_t) 2 * m.pend_set], m.cpu_wall[(size_t) 2 * m.pend_set + 1])) {
                             const double w = w_ms / (double) m.pend_wall_n;
-                            if (m.last_arm != 0 && m.last_arm != m.pend_wall && m.pend_l > m.last_l) {   // same chunk
+                            if (tune_3k) {
+                                m.share_3k.add(m.pend_wall == 2, m.pend_l, m.pend_wall_n, w_ms, "Qwen3.8");
+                            } else if (m.last_arm != 0 && m.last_arm != m.pend_wall && m.pend_l > m.last_l) {   // same chunk
                                 std::rotate(m.cpu_ratio, m.cpu_ratio + 1, m.cpu_ratio + Impl::CPU_RATIOS);
                                 m.cpu_ratio[Impl::CPU_RATIOS - 1] = m.pend_wall == 2 ? w / m.last_w : m.last_w / w;
                                 m.cpu_nratio = std::min(m.cpu_nratio + 1, Impl::CPU_RATIOS);
@@ -2839,14 +2862,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             [&](int32_t e) {
                                 return m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
                             },
-                            helped);
+                            helped, strata::core::cpu_share_batched(T, true) ? T : strata::kernels::cpu::MAXT);
                         const std::vector<std::pair<int32_t, int32_t>>& cand = cc.cand;   // (tokens, expert)
                         n_stream = cc.missed;
                         // how many: core's rule (the share measured on this prompt's layers; the gate's arm without
                         // the share takes none)
                         const int64_t take = std::min<int64_t>(
                             (int64_t) cand.size(),
-                            cpu_share_env() < 0.0 && !cpu_arm
+                            !cpu_arm
                                 ? 0
                                 : strata::core::cpu_share_count(n_stream, 0, cpu_share_env(), &m.cpu_meter, nullptr));
                         // the MoE input for the CPU's experts, only when it takes some (a layer whose experts all have
@@ -3030,12 +3053,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         m.cpu_jobs.clear();
                         for (int32_t e = 0; e < m.g->n_expert; ++e) {
                             if (!on_cpu[(size_t) e]) continue;
-                            strata::kernels::cpu::ExpertJobMulti j;
-                            j.blob = cpu_blob[(size_t) e];
-                            j.nt = m.cnt[(size_t) e];
-                            for (int r = 0; r < j.nt; ++r)   // the activations are set on the thread
-                                j.out[r] = m.cpu_rows + (size_t) ((int64_t) m.off[(size_t) e] + r - rows_gpu) * N;
-                            m.cpu_jobs.push_back(j);
+                            for (int start = 0; start < m.cnt[(size_t) e]; start += strata::kernels::cpu::MAXT) {
+                                strata::kernels::cpu::ExpertJobMulti j;
+                                j.blob = cpu_blob[(size_t) e];
+                                j.nt = std::min(strata::kernels::cpu::MAXT, m.cnt[(size_t) e] - start);
+                                for (int r = 0; r < j.nt; ++r)   // the activations are set on the thread
+                                    j.out[r] = m.cpu_rows + (size_t) ((int64_t) m.off[(size_t) e] + start + r - rows_gpu) * N;
+                                m.cpu_jobs.push_back(j);
+                            }
                         }
                         if (cpu_share_env() < 0.0) {
                             if (m.cpu_ev[0] == nullptr &&
@@ -3550,7 +3575,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     }
                     // no reading from a layer the share could not change (nothing taken) or with one-time costs
-                    if (cpu_set >= 0 && n_stream > 0 && (!cpu_arm || n_cpu > 0) && !cpu_cold) {
+                    if (cpu_set >= 0 && n_stream > 0 && (!cpu_arm || n_cpu > 0) && !cpu_cold &&
+                        (!tune_3k || !m.share_3k.decided())) {
                         strata::gpu::event_record(m.cpu_wall[(size_t) 2 * cpu_set + 1], m.cs);
                         m.pend_wall = cpu_arm ? 2 : 1;
                         m.pend_set = cpu_set;
@@ -3614,6 +3640,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     gr_write(m.R, m.bo, m.inj, HC, T, m.cs);
                     if (steered)   // --control-vector-scaled
                         strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
+                }
+                // the DFlash2 tap: this layer's completed output (the GR write has landed), the mean of the streams
+                if (half == 1 && tap_rows > 0 && l < (int64_t) tap_slot_.size() && tap_slot_[(size_t) l] >= 0) {
+                    strata::kernels::df2_tap_rows(m.R + (size_t) tap_t0 * D,
+                                                  tap_dev_ + (size_t) tap_slot_[(size_t) l] * N,
+                                                  (int64_t) tap_local_.size() * N, N, (int) HC, (int) tap_rows, m.cs);
                 }
             }
         }
@@ -3701,7 +3733,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::fclose(f);
             }
         }
-        if (on_chunk || on_stage_chunk) {
+        if (on_chunk || on_stage_chunk || (on_taps && tap_rows > 0)) {
             const auto toc = Clock::now();
             if (!strata::gpu::stream_sync(m.cs)) {
                 err = std::string("prefill: ") + strata::gpu::last_error();
@@ -3709,6 +3741,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             }
             const auto toc2 = Clock::now();
             if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
+            if (on_taps && tap_rows > 0 && !on_taps(tap_dev_, tap_rows, p0 + tap_t0, err)) return false;
             if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
             host_sync_ms += std::chrono::duration<double, std::milli>(toc2 - toc).count();
             host_chunk_ms += ms_since(toc2);
@@ -4576,6 +4609,9 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 const int64_t c0 = sc0 + c * m.T;          // in this run's tokens
                 const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
                 const int64_t t0 = c * m.T;                // in the super-chunk
+                const int64_t tap_t0 = tap_dev_ ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : 0;
+                const int64_t tap_rows = tap_dev_ ? T - tap_t0 : 0;
+                if (tap_rows > tap_cap_) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
                 m.R = lb.r_dev ? lb.R + t0 * D : r_buf(c);
                 if (lb.r_dev && l == LB && LB > 0 &&
                     !strata::gpu::copy_async(m.R, lb.R_in + (size_t) t0 * D, (size_t) T * D * 4, cs)) {
@@ -4630,6 +4666,12 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                     gr_write(m.R, acc, m.inj, HC, T, cs);
                     if (strata::kernels::cvec().covers(l - 1))   // --control-vector-scaled
                         strata::kernels::cvec_apply(m.R, l - 1, T, D, nullptr, 0, nullptr, 0, false, cs);
+                    // the DFlash2 tap of layer l - 1: its completed output, the mean of the streams
+                    if (tap_rows > 0 && l - 1 < (int64_t) tap_slot_.size() && tap_slot_[(size_t) (l - 1)] >= 0) {
+                        strata::kernels::df2_tap_rows(m.R + (size_t) tap_t0 * D,
+                                                      tap_dev_ + (size_t) tap_slot_[(size_t) (l - 1)] * N,
+                                                      (int64_t) tap_local_.size() * N, N, (int) HC, (int) tap_rows, cs);
+                    }
                 }
                 if (l == LE && next_ != nullptr) {
                     // ---- a layer split: this sub-chunk's rows into R_out (on the copy stream, as the per-layer
@@ -4667,12 +4709,13 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             std::fclose(f);
                         }
                     }
-                    if (on_chunk || on_stage_chunk) {
+                    if (on_chunk || on_stage_chunk || (on_taps && tap_rows > 0)) {
                         if (!strata::gpu::stream_sync(cs)) {
                             err = std::string("prefill: ") + strata::gpu::last_error();
                             return false;
                         }
                         lm_mid_ = c + 1 < nc;
+                        if (on_taps && tap_rows > 0 && !on_taps(tap_dev_, tap_rows, p0 + tap_t0, err)) return false;
                         if (on_stage_chunk && !lm_mid_ && !on_stage_chunk(p0 + T, err)) return false;
                         if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
                     }
@@ -4852,18 +4895,9 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                         const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                         pt.mark(kPfQsaIdx, cs);
                         try {
-                            static const bool per_token = strata::env_get("INDEXER_PER_TOKEN") != nullptr;
-                            if (!per_token) {
-                                strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
-                                                                                 EPS, ib, s, st.max_cells,
-                                                                                 strata::kernels::rope_scaling(), cs);
-                            }
-                            for (int64_t t = 0; per_token && t < T; ++t) {
-                                const int32_t* step_t = m.steps_dev + t * strata::kernels::kStepCount;
-                                strata::kernels::native_qsa_indexer_append(m.idx_raw + t * 128, step_t + strata::kernels::kStepPos, 0,
-                                                                           (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                                           strata::kernels::rope_scaling(), cs);
-                            }
+                            strata::kernels::native_qsa_indexer_append_batch(m.idx_raw, T, p0, 0, (const float*) wikn->data,
+                                                                             EPS, ib, s, st.max_cells,
+                                                                             strata::kernels::rope_scaling(), cs);
                         } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
                         pt.mark(kPfQsaSel, cs);
                         for (int64_t q0 = 0; q0 < T; q0 += m.sel_batch) {
@@ -4871,10 +4905,9 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             const int32_t* steps0 = m.steps_dev + q0 * strata::kernels::kStepCount;
                             const int64_t active = (int64_t) m.steps_host[(size_t) ((q0 + nb - 1) * strata::kernels::kStepCount +
                                                                                     strata::kernels::kStepNBid)] + 1;
-                            static const bool old_sel = strata::env_get("SELECT_OLD") != nullptr;
-                            if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512,
-                                                                                 steps0, nb, m.max_blocks, s, m.sel_scores,
-                                                                                 cs, active))
+                            if (!strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512,
+                                                                      steps0, nb, m.max_blocks, s, m.sel_scores,
+                                                                      cs, active))
                                 strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512, steps0, nb,
                                                                   m.max_blocks, s, m.sel_scores, cs, active);
                             strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,

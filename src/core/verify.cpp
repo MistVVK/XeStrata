@@ -18,6 +18,7 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/cvec.hpp"
+#include "strata/kernels/dflash2.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
@@ -334,14 +335,6 @@ bool head_mix_multi_enabled() {
     }();
     return on;
 }
-// STRATA_NO_BATCH_KV_STEP=1: the window's and the commit's K/V and indexer appends one call per token again
-bool no_batch_kv() {
-    static const bool on = [] {
-        const char* v = strata::env_get("NO_BATCH_KV_STEP");
-        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
-    }();
-    return on;
-}
 #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
 
 struct Bump {
@@ -550,6 +543,14 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         err = "verify: the stage's layer range or its hand-off buffers are wrong";
         return false;
     }
+    // the DFlash2 drafter's taps (set_taps): this stage's share of the layers, below the last
+    tap_layers_.clear();
+    tap_slot_.assign((size_t) g.n_layers, -1);
+    for (int l : tap_req_)
+        if (l >= lb_ && l < le_ && l < g.n_layers - 1) {
+            tap_slot_[(size_t) l] = (int) tap_layers_.size();
+            tap_layers_.push_back(l);
+        }
     const WeightRef* wo = wt.find("output.weight");
     if (wo == nullptr) { err = "verify: output.weight is missing"; return false; }
     n_vocab_ = wo->ne1;
@@ -641,6 +642,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         one_ = b.take<int32_t>(4);
         hist_snap_ = b.take<float>(T * HS);
         ple_key_ = b.take<float>(T * (uint64_t) strata::kernels::NG_HC_DIM); ple_val_ = b.take<float>(T * N);
+        tap_dev_ = tap_layers_.empty() ? nullptr : b.take<float>(T * tap_layers_.size() * N);
     };
     Bump count;
     carve(count);
@@ -1118,7 +1120,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 } else
                 if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
                 // the window's cells in one launch per pool (a batch's rows each have their own K/V: one per row)
-                const bool kv_steps = dec_batch && !no_batch_kv() && !batch_rec_;
+                const bool kv_steps = dec_batch && !batch_rec_;
                 if (kv_steps) {
                     const int32_t* step_b = step_ + (ptrdiff_t) tb * kStepCount;
                     const float* kc_b = kcur_ + tb * NKV * HD;
@@ -1418,6 +1420,17 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         } else if (cvec().covers(l)) {
             cvec_apply(Rt(tb), l, n, HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC, true, cs);
         }
+        if (!tap_layers_.empty() && !batch_rec_ && l < (int64_t) tap_slot_.size() && tap_slot_[(size_t) l] >= 0) {
+            // the layer's completed output, the mean of the hc streams: with a control vector the write has landed
+            // in R; without one it is still pending (the next layer's read folds it), so the tap applies it itself
+            const int64_t nt = (int64_t) tap_layers_.size();
+            float* dst = tap_dev_ + ((size_t) tb * nt + (size_t) tap_slot_[(size_t) l]) * N;
+            if (cvec().covers(l))
+                strata::kernels::df2_tap_rows(Rt(tb), dst, nt * N, N, (int) HC, n, cs);
+            else
+                strata::kernels::df2_tap_gr(Rt(tb), HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC, dst, nt * N, n, N,
+                                            (int) HC, cs);
+        }
         return true;
     };
 
@@ -1674,7 +1687,7 @@ bool Verifier::capture_commit(std::string& err) {
                     beta_L_ + (size_t) gdn_index * MT * HV, MT * HV, (int) C, (int) g.ssm_k_heads, (int) HV, (int) MT,
                     (int) n_gdn, commit_, cs_);
         }
-        if (commit_batch && ok && !no_batch_kv()) {
+        if (commit_batch && ok) {
             QsaIndexerLayers il;
             int nq = 0;
             int64_t mc = -1;
@@ -1723,15 +1736,9 @@ bool Verifier::capture_commit(std::string& err) {
                 if (!wikn) { ok = false; break; }
                 copy_from_mapped(st.idx_tail, tail_snap_ + (size_t) qsa_index * TS, TS, cs_);
                 const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                if (!no_batch_kv())
-                    native_qsa_indexer_append_steps(idx_raw_L_ + (size_t) qsa_index * MT * ID, commit_ + 2, 1, (int) MT,
-                                                    0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                    rope_scaling(), cs_);
-                else
-                for (int64_t t = 0; t < MT; ++t)
-                    native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
-                                              (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                              rope_scaling(), cs_);
+                native_qsa_indexer_append_steps(idx_raw_L_ + (size_t) qsa_index * MT * ID, commit_ + 2, 1, (int) MT, 0,
+                                                (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                rope_scaling(), cs_);
                 ++qsa_index;
             }
         }

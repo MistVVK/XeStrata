@@ -214,6 +214,13 @@ public:
     void set_stage(int64_t layer_begin, int64_t layer_end, const float* handoff_in, float* handoff_out) {
         lb_ = layer_begin; le_ = layer_end; hand_in_ = handoff_in; hand_out_ = handoff_out;
     }
+    /// The DFlash2 drafter's taps: the completed output (the mean of the hyper-connection streams) of these layers,
+    /// gathered for every window row into tap_dev() ([T][ntap][n_embd]).  Only the layers this stage runs below the
+    /// last are kept.  Set before init; empty (the default) allocates nothing and records nothing.
+    void set_taps(const std::vector<int>& layers) { tap_req_ = layers; }
+    const float* tap_dev() const { return tap_dev_; }
+    int n_taps() const { return (int) tap_layers_.size(); }
+
     /// The rows the hand-off buffers of `set_stage` hold (0: kVerifyMaxT, the default).  STRATA_PIPED_MTP's groups write
     /// their slots' token and proposal rows at hbase = group * rows-per-group, past kVerifyMaxT with enough slots.
     void set_handoff_rows(int rows) { handoff_rows_ = rows; }
@@ -482,6 +489,9 @@ private:
     bool all_resident() const;
     bool capture_res(int T, std::string& err);
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
+    std::vector<int> tap_req_, tap_layers_;   ///< set_taps: the DFlash2 drafter's tap layers (this stage's share)
+    std::vector<int> tap_slot_;          ///< layer -> its tap index (-1: not tapped)
+    float* tap_dev_ = nullptr;           ///< [max_t][ntap][n_embd], the window's taps (null: none)
     int handoff_rows_ = 0;               ///< set_handoff_rows (0: kVerifyMaxT)
     const float* hand_in_ = nullptr;
     float* hand_out_ = nullptr;

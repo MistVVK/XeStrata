@@ -439,7 +439,7 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/i8_gemm.cpp src/kernels/xe/rows_i8.cpp
                                     src/kernels/xe/sdpa_aotriton.cpp
                                     src/kernels/xe/matrix_report.cpp src/kernels/xe/glm5.cpp
-                                    src/kernels/xe/draft_head.cpp)
+                                    src/kernels/xe/draft_head.cpp src/kernels/xe/dflash2.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_ngram)
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/main/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/main/ggml)
@@ -558,7 +558,7 @@ if(STRATA_ENABLE_XE)
                                    src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
                                    src/core/native_dense.cpp src/core/verify.cpp src/core/moe_window.cpp
                                    src/core/plain_model.cpp src/core/plain_glm5.cpp src/core/pcie_split.cpp
-                                   src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
+                                   src/core/mtp.cpp src/core/dflash2.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
                                    src/core/conversation_file.cpp src/core/control_vector.cpp
                                    src/core/vmm.cpp src/core/draft_head.cpp
@@ -627,6 +627,14 @@ if(STRATA_ENABLE_XE)
     add_executable(coupled_draft_test src/core/coupled_draft_test.cpp)
     target_link_libraries(coupled_draft_test PRIVATE strata_engine)
     add_test(NAME coupled_draft_test COMMAND coupled_draft_test)
+    # the DFlash2 drafter's kernels against CPU references (GPU; skipped without one)
+    add_executable(dflash2_parity src/core/dflash2_parity.cpp)
+    target_link_libraries(dflash2_parity PRIVATE strata_engine)
+    add_test(NAME dflash2_parity COMMAND dflash2_parity)
+    set_tests_properties(dflash2_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    # the ring log's rebuild against the original update (GPU, the real pack: dflash2_ring_test PACK)
+    add_executable(dflash2_ring_test src/core/dflash2_ring_test.cpp)
+    target_link_libraries(dflash2_ring_test PRIVATE strata_engine)
     add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)
     target_link_libraries(pinned_shared_test PRIVATE strata_engine)
     add_test(NAME pinned_shared_test COMMAND pinned_shared_test)
@@ -1565,6 +1573,7 @@ endif()
 #     features, and the fallback exists for tests, exactly as P2.S3 specifies.
 # Plan v0.3 P6: speculation components that need no GPU.
 add_library(strata_spec STATIC src/spec/suffix_drafter.cpp src/spec/controller.cpp src/spec/draft_policy.cpp
+                             src/spec/drafter_policy.cpp
             src/spec/draft_source.cpp src/spec/guess_gate.cpp)
 target_include_directories(strata_spec PUBLIC include)
 if(STRATA_BUILD_TESTS)
@@ -1577,6 +1586,12 @@ if(STRATA_BUILD_TESTS)
   add_executable(draft_policy_test src/spec/draft_policy_test.cpp)
   target_link_libraries(draft_policy_test PRIVATE strata_spec)
   add_test(NAME draft_policy_test COMMAND draft_policy_test)
+  add_executable(drafter_policy_test src/spec/drafter_policy_test.cpp)
+  target_link_libraries(drafter_policy_test PRIVATE strata_spec)
+  add_test(NAME drafter_policy_test COMMAND drafter_policy_test)
+  add_executable(window_rule_test src/spec/window_rule_test.cpp)
+  target_link_libraries(window_rule_test PRIVATE strata_spec)
+  add_test(NAME window_rule_test COMMAND window_rule_test)
   add_executable(spec_start_test src/spec/spec_start_test.cpp)
   target_include_directories(spec_start_test PRIVATE include)
   add_test(NAME spec_start_test COMMAND spec_start_test)

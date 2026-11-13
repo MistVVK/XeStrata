@@ -44,6 +44,8 @@ One run per cell.
 
 While a short prompt (a chunk below 2,048 tokens) is read, the decode CPU pool, idle then, computes the experts outside VRAM that few of its tokens route to (opt-in upstream, the default here: `XESTRATA_PREFILL_CPU_SHARE=auto`). It measures the CPU's and the GPU's time per expert and hands over the share at which both end together. With `XESTRATA_PREFILL_CPU_GATE=1` it also times neighbouring layers with and without the share, and shares only while the layers that share take less time per expert outside VRAM (upstream f2a3b946, #1282: on one PC the busy CPU slowed the host that issues the streams, and every share lost). The layers tried without the share cost more than that saved here, 1.3% of a 1K prompt's speed on the B70 and 4.4% on the RTX 4070, so it is off by default. `XESTRATA_DBG_CPU_GATE=1` prints those readings. The default leaves it off when the GPU cache holds every expert (nothing streams) and when the host is short of memory (less free RAM than the share's buffers and 3 GiB, or file pages of the experts it would read that the free RAM cannot keep) (upstream eaaa237e, 04dbe561; `XESTRATA_PREFILL_CPU_SHARE=auto` turns it on anyway). A buffer of the share that cannot be had ends the share instead of failing the request. The CPU computes in its own activation format, so an answer can differ a little from the GPU-only one. The measured share moved a little from run to run, and the experts the CPU took with it, so two greedy runs with the same settings parted after some tokens. Setup's warm-up therefore measures the share once per PC and model and writes it into the run config (`--prefill-cpu-share`): a prompt is read the same way every run. `--prefill-cpu-share auto` measures it in every prompt as before. The decode's PCIe share also changes from run to run, but it does not change the answer where the experts compute alike on the CPU and the GPU (i-quant, IQ4_XS or Q2_0 gate/up and IQ4_NL or Q2_0 down: the four Qwen3.8 files); to compare two runs' answers exactly on a model with experts of other types, add `--pcie-frac 0` as well. `XESTRATA_PREFILL_CPU_SHARE=0` keeps every expert on the GPU, `0.4` and the like a fixed share. 262- / 914-token prompts went from 319.2 to 383.1 / 736.3 to 828.0 tokens/s on the B70 and from 109.9 to 266.1 / 275.9 to 457.8 tokens/s on the RTX 4070 (one run each).
 
+For a chunk of 2,048 to 3,072 tokens, the CPU pool can take an expert's rows as jobs of up to eight rows. The first layers alternate the share and no-share paths. In plain, a trial sends at most 16 experts to the CPU to keep its cost small. If both of two time ratios show the share at least 10% faster, later layers use it. On Qwen3.8, an unshared layer in auto mode also stages only the experts it routes to, instead of streaming every expert ahead. The choice lasts for the run and is not saved to a file. `XESTRATA_PREFILL_STAGED_3K=0` keeps the earlier path; `=1` forces the share; unset or `=auto` measures and chooses. The trial layers also affect the answer, so it can differ from a GPU-only run.
+
 With a helper GPU (`--expert-cache-device1`, or the helper `--layer-split auto` chose), in the same short chunks the experts not in VRAM that the helper holds and few tokens route to are computed by the helper from its own VRAM. Their tokens' rows go to it through host memory registered on both GPUs, and the results come back the same way. How many tokens an expert may have is where moving its rows over the helper's link and back takes less time than streaming the expert to the first GPU, from both links as measured at the start (19 for a B70 and an RTX 4070 on x4). `XESTRATA_PREFILL_HELPER_ROWS=n` sets it, `0` turns it off. The helper computes with its int8 products, so the reply can differ slightly from the first GPU alone's (the first token's KL on a 1K prompt 0.011; the CPU share at 0.5: 0.020). On a B70 and an RTX 4070 a 1K prompt went from 693 to 735 tokens/s.
 
 The prefill has four opt-in switches, set in the engine's environment. None of them changes a bit of the answers.
@@ -76,6 +78,34 @@ text earlier in the conversation (upstream 2312c83b).
 It speeds up handing back a given text nearly as it was, and slows ordinary chat a little
 (B70, IQ2_XS, K=3: rewriting a document 109.6 → 129.2, ordinary chat 71.1 → 68.3 tokens/s).
 `--lookup-chain-min M` is the match it needs before adding any (default 3 tokens).
+
+#### DFlash2 (Qwen3.8-Flash-Next's other drafter)
+
+`--draft mtp|dflash2|auto|off` picks the drafter (default mtp). DFlash2 is a block drafter for Qwen3.8-Flash-Next
+([incoai/Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2), Apache-2.0). It reads
+the target's hidden states after layers 5/15/25/35/45, proposes 7 tokens in one forward pass of an anchor row and 7
+mask rows, and picks them left to right with a top-16 and a rank-256 selector. It is a different drafter from the MTP
+layer; `--draft-model PACK` takes a `tools/dflash2_pack.py` pack (Q4_0 matrices, Q4_0 selector, about 0.5 GB). Setup
+fetches it from the pinned revision and packs it on this PC when `--drafting auto|dflash2`
+(`tools/dflash2_fetch.py`, checked against its SHA-256).
+
+`--draft auto` loads both the MTP and DFlash2 and picks one per request. A request's `xestrata_draft`
+(`mtp|dflash2|auto`) wins when given; otherwise `--draft-rule df2|mtp|learn` (default learn). learn keeps, per kind of
+request (its first 32 prompt tokens) and context depth (the 2K/8K/32K boundaries), the drafter with the better
+measured decode speed (an EMA), and tries the loser now and then (every 6th request when they are within 4%, every
+12th otherwise). It starts with the MTP and measures both over the first requests. Nothing is written to disk (in the
+process only). The drafter not chosen is kept current too (DFlash2's ring through context updates, the MTP through the
+prompt re-read).
+
+DFlash2's window closes where the product of its selector probabilities falls below `--draft-conf P` (the default
+comes from the expert slots the card holds after the drafter loads; an explicit `--draft-conf` wins). `--draft dflash2`
+loads no MTP layer by default (`--draft-fallback mtp` loads both). DFlash2 runs on one GPU, one request at a time (a
+layer split, `--batch` and pipeline windows keep the MTP). The greedy answer is the same whichever drafter proposes
+(the verify window emits the target's argmax).
+
+The plain engine (Qwen3.6, Ornith and the others) shares the same `--draft`, `xestrata_draft` and tap mechanism, but
+DFlash2's weights are trained for Qwen3.8-Flash-Next, so there is no pack for the plain models yet: `--draft dflash2`
+is refused and auto keeps the MTP.
 
 In the server's decode, a missed expert (not in VRAM) that a token routes at rank 7 or lower (the 8th to 10th of the
 top 10, the smallest weights) contributes zero to that token, and one that every token of a verify window routes that
