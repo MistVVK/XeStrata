@@ -44,6 +44,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/prefill/kva.hpp"   // STRATA_KVA: the approximate late-layer prompt read (opt-in)
+#include "strata/prefill/timer_marks.hpp"   // upstream 4006: a mark that repeats its phase is not recorded
 
 #include "strata/core/gpu.hpp"
 #include "strata/platform/env.hpp"
