@@ -1021,6 +1021,11 @@ FUNC_END = "</function>"
 # `<=NAME>` (the word `function` dropped), `<function:NAME>`, `<function =NAME>`, or the bare `<NAME>`
 _LOOSE_OPEN = re.compile(r"<\s*(?:function\s*[=:]\s*|=\s*)?([A-Za-z0-9_.\-]+)\s*>")
 _LOOSE_PART = re.compile(r"<\s*(?:function[ \t]*[=:]?\s*|=\s*)?[A-Za-z0-9_.\-]*\s*$")
+# #5276: `<toolcall>` / `<tool-call>` as the opener (then whitespace, `<function=NAME>`), and such an opener still
+# arriving
+_MISSPELT_OPEN = re.compile(r"<tool-?call>(\s*)<function=(\s*[^<>\s]+\s*)>")
+_MISSPELT_PART = re.compile(r"<tool-?call>\s*<function=[^<>]{0,80}$|"
+                            r"<tool-?call>\s*(?:<(?:f(?:u(?:n(?:c(?:t(?:i(?:o(?:n)?)?)?)?)?)?)?)?)?$")
 
 
 # The output's end right after a call's own `</function>` (and `</tool_call>`), the parameter before it left open:
@@ -1811,6 +1816,7 @@ class OutputParser:
         self.bare = False            # the call being read opened with <function= alone (no <tool_call> around it)
         self.batch = False           # the call being finished is followed by another in the same wrapper
         self._final = False          # #4701: the turn has ended: a call held for what might follow it is decided now
+        self._held = ""              # #5276: the end of a misspelt opener still arriving (see _opener)
         self._reset_scan()
 
     def _ok_at(self, p: int) -> bool:
@@ -1820,6 +1826,46 @@ class OutputParser:
         ok = self._opener_ok()
         self._restore(snap)
         return ok
+
+    def _opens_at(self, p: int) -> bool:
+        """self.buf[p] would open a call as `<tool_call>` does: in the reasoning at the start of a line outside code, in
+        the answer anywhere outside code (a fence, inline code, an indented block)."""
+        if self.state == "reasoning":
+            return self._ok_at(p)
+        snap = self._snap()
+        self._track(self.buf[:p])
+        ok = not self._in_code()
+        self._restore(snap)
+        return ok
+
+    def _opener(self) -> str | None:
+        """#5276: `<toolcall>` / `<tool-call>` (the opener written as text, misspelled) followed by `<function=NAME>` of
+        a declared tool is `<tool_call>`, where a `<tool_call>` would open a call (start of a line, outside code).
+        Prose that names the misspelled tag, or any other follower, is left as it was.  Returns the tail of an opener
+        still arriving (held back)."""
+        buf = self.buf
+        if "<tool" not in buf:
+            return None
+        pos, out = 0, []
+        for m in _MISSPELT_OPEN.finditer(buf):
+            name = m.group(2).strip()
+            name = self.aliases.get(name, name)
+            if name in self.schemas and self._opens_at(m.start()):
+                out.append(buf[pos:m.start()] + CALL_START + m.group(1) + FUNC_START + m.group(2) + ">")
+                pos = m.end()
+        buf = "".join(out) + buf[pos:]
+        held = None
+        pm = _MISSPELT_PART.search(buf)
+        tail = buf[pm.start():] if pm else None
+        if tail is None:                                    # the opener itself still arriving: a prefix of `<toolcall>`
+            for k in range(min(len(buf), 11), 5, -1):
+                if any(w.startswith(buf[-k:]) for w in ("<toolcall>", "<tool-call>")) and buf[-k:] != "<tool_":
+                    tail = buf[-k:]
+                    break
+        if tail:
+            held, buf = tail, buf[:len(buf) - len(tail)]
+        self.buf = buf
+        return held
 
     def _callable(self, name: str) -> bool:
         """#3075: may a call for `name` be a call?  A tool the request declared (or its Responses spelling); with
@@ -2188,7 +2234,13 @@ class OutputParser:
         return best
 
     def feed(self, delta: str) -> list[Event]:
+        if self._held:
+            delta, self._held = self._held + delta, ""
         self.buf += delta
+        if self.schemas and delta:
+            held = self._opener()
+            if held:
+                self._held = held
         out: list[Event] = []
         while True:
             if self.state == "rcall":
@@ -2486,6 +2538,8 @@ class OutputParser:
         how the turn ended: calls waiting from the reasoning become real calls only on a natural stop (None = stop);
         a turn cut by max tokens (or cancelled, or failed) keeps them as reasoning text (#1058)."""
         out = []
+        if self._held:
+            self.buf, self._held = self.buf + self._held, ""
         if self.buf and self.state in ("call", "rcall"):
             self._final = True      # #4701: a call held after its closing tags (could a file go on?) is whole now
             out += self.feed("")
