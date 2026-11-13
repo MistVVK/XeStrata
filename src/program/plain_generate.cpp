@@ -1116,6 +1116,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         std::string req_grammar, req_bias_text, req_script, req_script_allow, req_script_pending;
         bool req_bias = false;
         double req_spec_min_p = -1.0, req_pcie_frac = -1.0;
+        std::string req_draft;   // draft=mtp|dflash2: the plain engine has only the MTP layer (read, not refused)
         bool req_cvec = true;             // cvec=0|1: a loaded control vector for this request (on when absent)
         // prefill=1 with max_new 0 (split serving, upstream 690172c46): the prompt read but its last token, as the
         // session a next turn that continues it needs (a SAVE after it hands it to another engine), and no token
@@ -1138,6 +1139,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             kf.script_table = &req_script; kf.script_allow = &req_script_allow; kf.script_pending = &req_script_pending;
             kf.cvec_bool = &req_cvec; kf.aux_cpus_immediate = true;
             kf.pcie_frac = &req_pcie_frac; kf.spec_min_p = &req_spec_min_p;
+            kf.draft = &req_draft;
             kf.allowed = &req_allowed; kf.img_keys = &img_keys;
             strata::program::parse_gen_keys(endp, kf, geni, &emb_path);
         }
@@ -2035,6 +2037,8 @@ static void plain_usage(const std::string& arch) {
                  "                       expected to raise the tokens per ms at the measured window costs; or while\n"
                  "                       each is at least --spec-min-p P likely under the MTP layer\n"
                  "  --draft-vocab PATH   the drafts over this token subset (int32 ids, data/draft_vocab*.bin)\n"
+                 "  --draft mtp|auto|off  which drafter proposes (default mtp; the model's MTP layer).  dflash2 has no\n"
+                 "                       pack for the plain models yet; auto keeps the MTP\n"
                  "  --suffix-draft N     --serve: drafts from an earlier repeat of the context's last N+ tokens, a window\n"
                  "                       of them where they go past the MTP's (also without an MTP layer; default 0 = off)\n"
                  "  --lookup-chain K     --serve: after the MTP's drafts, up to K lookup drafts that continue them\n"
@@ -2322,6 +2326,10 @@ int plain_main(int argc, char** argv) {
         }
         else if (a == "--no-pcie-split") opt.pcie_split = false;
         else if (a == "--draft-vocab") opt.draft_vocab = next("--draft-vocab");
+        else if (a == "--draft") opt.draft = next("--draft");
+        else if (a == "--draft-model") opt.draft_model = next("--draft-model");
+        else if (a == "--draft-conf") opt.draft_conf = std::strtod(next("--draft-conf"), nullptr);
+        else if (a == "--draft-rule") opt.draft_rule = next("--draft-rule");
         else if (a == "--prompt-chunk") {
             opt.prompt_chunk = std::strtoll(next("--prompt-chunk"), nullptr, 10);
             opt.prompt_chunk_given = true;
@@ -2506,6 +2514,15 @@ int plain_main(int argc, char** argv) {
         }
         strata::core::set_memory_limit_bytes((uint64_t) mib << 20);
     }
+    // --draft: the plain engine's drafter is the model file's MTP layer.  DFlash2 weights are trained for
+    // Qwen3.8-Flash-Next's taps; none exist for the plain models, so dflash2 is refused (the shared mechanism is
+    // ready for a plain-model pack: core/dflash2.hpp, the tap hook, spec/drafter_policy.hpp).
+    if (opt.draft == "dflash2") {
+        std::fprintf(stderr, "xestrata (%s): DFlash2 has no drafter pack for the plain models yet (its weights are "
+                             "trained for Qwen3.8-Flash-Next); use --draft mtp or auto\n", arch.c_str());
+        return 2;
+    }
+    if (opt.draft == "off") opt.spec = 0;   // no drafter (the suffix lookup may still propose)
     if (!model.load(opt, err) || !model.prompt_warm(err)) {
         std::fprintf(stderr, "xestrata (%s): %s\n", arch.c_str(), err.c_str());
         // --serve: said where the server waits for READY, and ended at once: the clean-up of a model half loaded can

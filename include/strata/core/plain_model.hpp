@@ -219,6 +219,14 @@ struct PlainOptions {
     /// and the uniform of the window row that checks each (coupled_draft.hpp) instead of taking the most likely token
     bool coupled_draft = false;
     double spec_min_p = 0.0;
+    /// --draft mtp|dflash2|auto|off: which drafter proposes (the shared option, generate's too).  The plain engine's
+    /// drafter is the model file's MTP layer; DFlash2 weights are trained for Qwen3.8-Flash-Next's taps and none exist
+    /// for the plain models, so dflash2 is refused and auto keeps the MTP.  The mechanism (core/dflash2.hpp, the tap
+    /// hook, spec/drafter_policy.hpp) is shared, ready for a plain-model drafter pack.
+    std::string draft = "mtp";
+    std::string draft_model;   ///< --draft-model: a DFlash2 pack (none exists for the plain models yet)
+    double draft_conf = 0.0;   ///< --draft-conf: DFlash2's window confidence (the plain engine: unused)
+    std::string draft_rule = "learn";   ///< --draft-rule: a request without a draft= key (--draft auto)
     /// A layer split across the engine's GPUs (--layer-split): GPU 0 runs the blocks before split_at[0], GPU 1 those
     /// from there to split_at[1], and so on, the last GPU the rest, the head and the MTP layer; `split_auto`: the points
     /// chosen at load from each GPU's free memory.  Empty and false: one GPU, the current one.
