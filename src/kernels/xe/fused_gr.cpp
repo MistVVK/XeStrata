@@ -10,6 +10,7 @@
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/core/auto_pick.hpp"
 #include "strata/core/runtime.hpp"
 #include "device_target.hpp"
 #include "strata/kernels/q8_act.hpp"
@@ -481,6 +482,58 @@ sycl::event gr_up_fast(sycl::queue& q, const GrMulti& m) {
     });
 }
 
+// Step 2 of the multi-token read, `RPW` rows a sub-group (upstream 4ab81c796's register blocking): each row's dots are
+// summed over its chunks in the one-row kernel's order and reduced by the same xor tree, so the two forms are bitwise
+// the same; two rows read the token's row of activations once for both.  The extra work-group (RPW apart) holds the
+// inject rows, one a sub-group.
+template <int RPW>
+sycl::event gr_down_bf16(sycl::queue& q, const GrMulti& m, int n_tok) {
+    static_assert(RPW == 1 || RPW == 2, "one or two rows a sub-group");
+    return q.submit([&](sycl::handler& h) {
+        const TokArgs tok(h);
+        h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) (DOWN_BLOCKS / RPW + 1) * THREADS, (size_t) n_tok),
+                                         sycl::range<2>(THREADS, 1)),
+                       [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
+            tok.stage(m, it);
+            const sycl::sub_group sg = it.get_sub_group();
+            const int lane = (int) sg.get_local_linear_id(), warp = (int) sg.get_group_linear_id();
+            const int k = (int) it.get_group(1);
+            const bool inject_block = (int) it.get_group(0) == DOWN_BLOCKS / RPW;
+            const int row0 = inject_block ? warp : ((int) it.get_group(0) * WARPS + warp) * RPW;
+            if (inject_block && (m.a[0].w_inject == nullptr || warp >= HC)) return;
+            const uint16_t* wbase = inject_block ? m.a[0].w_inject : m.a[0].w_down;
+            const float* x = m.xn + (size_t) k * D;
+            float acc[RPW] = {};
+#pragma unroll 8
+            for (int qq = 0; qq < D / 8 / WARP; ++qq) {
+                const int j = lane + WARP * qq;
+                const float4 x0 = load4(x + (size_t) j * 8), x1 = load4(x + (size_t) j * 8 + 4);
+                const float xv[8] = {x0.x(), x0.y(), x0.z(), x0.w(), x1.x(), x1.y(), x1.z(), x1.w()};
+                if (inject_block) {
+                    acc[0] += dot8(load_u4(wbase + (size_t) row0 * D, (size_t) j), xv);
+                } else {
+#pragma unroll
+                    for (int r = 0; r < RPW; ++r)
+                        acc[r] += dot8(load_u4(wbase + (size_t) (row0 + r) * D, (size_t) j), xv);
+                }
+            }
+            if (inject_block) {
+                const float sum = warp_sum(sg, acc[0]);
+                if (lane == 0) tok(m, k).inject_out[row0] = sum;
+                return;
+            }
+#pragma unroll
+            for (int r = 0; r < RPW; ++r) {
+                const float sum = warp_sum(sg, acc[r]);
+                if (lane == 0) {
+                    const float v = sum / (float) HC;
+                    tok(m, k).lo[row0 + r] = v / (1.0f + sycl::exp(-v));
+                }
+            }
+        });
+    });
+}
+
 }  // namespace
 
 void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
@@ -649,40 +702,10 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
     // Step 2 for T tokens: one sub-group per (row, token), the token in the second dimension.  A lane sums its 40
     // chunks (lane + 32 q) in order and the sub-group then reduces by xor, as the single-token kernel does, so each
     // output is bitwise the single-token one; rows and tokens are independent, so splitting them gives the GPU
-    // T times the sub-groups (one per row alone left most of it idle) and needs no local staging.
-    q.submit([&](sycl::handler& h) {
-        const TokArgs tok(h);
-        h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t) (DOWN_BLOCKS + 1) * THREADS, (size_t) n_tok),
-                                         sycl::range<2>(THREADS, 1)),
-                       [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
-            tok.stage(m, it);
-            const sycl::sub_group sg = it.get_sub_group();
-            const int lane = (int) sg.get_local_linear_id(), warp = (int) sg.get_group_linear_id();
-            const int k = (int) it.get_group(1);
-            const bool inject_block = (int) it.get_group(0) == DOWN_BLOCKS;
-            const int row = inject_block ? warp : (int) it.get_group(0) * WARPS + warp;
-            if (inject_block && (m.a[0].w_inject == nullptr || warp >= HC)) return;
-            const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) row * D;
-            const float* x = m.xn + (size_t) k * D;
-            float acc = 0.0f;
-#pragma unroll 8
-            for (int qq = 0; qq < D / 8 / WARP; ++qq) {
-                const int j = lane + WARP * qq;
-                const uint4 w = load_u4(wrow, (size_t) j);
-                const float4 x0 = load4(x + (size_t) j * 8), x1 = load4(x + (size_t) j * 8 + 4);
-                const float xv[8] = {x0.x(), x0.y(), x0.z(), x0.w(), x1.x(), x1.y(), x1.z(), x1.w()};
-                acc += dot8(w, xv);
-            }
-            const float sum = warp_sum(sg, acc);
-            if (lane != 0) return;
-            if (inject_block) {
-                tok(m, k).inject_out[row] = sum;
-            } else {
-                const float v = sum / (float) HC;
-                tok(m, k).lo[row] = v / (1.0f + sycl::exp(-v));
-            }
-        });
-    });
+    // T times the sub-groups (one per row alone left most of it idle) and needs no local staging.  Two rows a
+    // sub-group where the load timed it faster (XESTRATA_HC_DOWN_ROWS): the same dots, the activations read once.
+    if (fused_gr_down_rows(n_tok)) gr_down_bf16<2>(q, m, n_tok);
+    else gr_down_bf16<1>(q, m, n_tok);
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, &q);
 
     // The up projection for T tokens: each row of w_up read once, lane k runs token k's epilogue.
@@ -765,9 +788,23 @@ void fused_gr_quantize_q8_0(const uint16_t* src, uint8_t* dst, int64_t nb, void*
 
 namespace {
 bool g_q8_fuse = false;
+// XESTRATA_HC_DOWN_ROWS: the multi-token read's down projection with two rows a sub-group, and the smallest window it
+// is used for.  auto: what the load timed (fused_gr_time_down); 0/1 forces it (see fused_gr_down_rows).
+bool g_down_rows2 = false;
+int g_down_rows2_from = 1;
 }
 void fused_gr_set_q8_fuse(bool on) { g_q8_fuse = on; }
 bool fused_gr_q8_fuse() { return g_q8_fuse; }
+bool fused_gr_down_rows(int n_tok) {
+    static const core::Pick pick = core::pick_from_env("HC_DOWN_ROWS");
+    if (pick == core::Pick::On) return true;
+    if (pick == core::Pick::Off) return false;
+    return g_down_rows2 && n_tok >= g_down_rows2_from;
+}
+void fused_gr_set_down_rows(bool on, int from_tok) {
+    g_down_rows2 = on;
+    g_down_rows2_from = from_tok < 1 ? 1 : from_tok;
+}
 
 void fused_gr_time_q8(const FusedGrArgs& w, int n_tok, int reps, void* stream, double& bf16_us, double& q8_us,
                       double& q8f_us) {
@@ -816,6 +853,51 @@ void fused_gr_time_q8(const FusedGrArgs& w, int n_tok, int reps, void* stream, d
         bf16_us = std::min(bf16_us, run(0));
         q8_us = std::min(q8_us, run(1));
         q8f_us = std::min(q8f_us, run(2));
+    }
+    sycl::free(buf, q);
+}
+
+void fused_gr_time_down(const FusedGrArgs& w, int n_tok, int reps, void* stream, double& r1_us, double& r2_us) {
+    if (n_tok < 1 || n_tok > kFusedGrMaxT || reps < 1 || w.w_down == nullptr)
+        throw core::DeviceError("fused_gr_time_down: invalid arguments");
+    auto& q = queue_for(stream);
+    // per token: lo, then the inject rows; then the xn scratch
+    const size_t per = (size_t) LR + HC;
+    const size_t total = per * (size_t) n_tok + (size_t) n_tok * D;
+    float* buf = sycl::malloc_device<float>(total, q);
+    if (buf == nullptr) throw core::DeviceError("fused_gr_time_down: no device memory for the inputs");
+    q.memset(buf, 0, total * sizeof(float)).wait();
+    GrMulti m;
+    for (int t = 0; t < n_tok; ++t) {
+        float* b = buf + per * (size_t) t;
+        m.a[t] = w;
+        m.a[t].lo = b;
+        m.a[t].inject_out = b + LR;
+    }
+    m.xn = buf + per * (size_t) n_tok;
+    m.T = n_tok;
+    auto run = [&](int rows) {
+        auto once = [&] {
+            if (rows == 2) gr_down_bf16<2>(q, m, n_tok);
+            else gr_down_bf16<1>(q, m, n_tok);
+        };
+        for (int i = 0; i < 3; ++i) once();
+        q.wait();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < reps; ++i) once();
+        q.wait();
+        return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
+    };
+    // both forms in turn, three times, the fastest of each (the values do not change the time: zero inputs)
+    r1_us = r2_us = 1e30;
+    for (int r = 0; r < 3; ++r) {
+        if ((r & 1) == 0) {
+            r1_us = std::min(r1_us, run(1));
+            r2_us = std::min(r2_us, run(2));
+        } else {
+            r2_us = std::min(r2_us, run(2));
+            r1_us = std::min(r1_us, run(1));
+        }
     }
     sycl::free(buf, q);
 }

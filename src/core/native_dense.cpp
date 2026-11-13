@@ -140,6 +140,40 @@ bool hc_q8_faster(const WeightTable& table, const std::vector<std::pair<WeightRe
     }
     return false;
 }
+
+// XESTRATA_HC_DOWN_ROWS unset: one layer's BF16 down projection timed with one row a sub-group and with two, on one
+// token and on a window of eight; two rows are kept where the eight-token read is faster (from the first window when
+// the one-token read is faster too, else from five tokens, where upstream's row blocking paid).  Said either way.
+void hc_down_rows_choose(const WeightTable& table, void* stream) {
+    for (int l = 0; l < 1024; ++l) {
+        const std::string layer = "blk." + std::to_string(l) + ".";
+        const WeightRef* down = table.find(layer + "hc_attn_down.weight");
+        if (down == nullptr || down->data == nullptr) continue;
+        const WeightRef* inject = table.find(layer + "hc_attn_inject.weight");
+        strata::kernels::FusedGrArgs w;
+        w.w_down = static_cast<const uint16_t*>(down->data);
+        w.w_inject = inject != nullptr ? static_cast<const uint16_t*>(inject->data) : nullptr;
+        double o1 = 0, t1 = 0, o8 = 0, t8 = 0;
+        try {
+            strata::kernels::fused_gr_time_down(w, 1, 40, stream, o1, t1);
+            strata::kernels::fused_gr_time_down(w, 8, 40, stream, o8, t8);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "xestrata: XESTRATA_HC_DOWN_ROWS: timing the read failed (%s): one row a sub-group\n",
+                         e.what());
+            return;
+        }
+        // the largest window is where the read costs most: a form that loses there is not kept, whatever the one-token
+        // read does (the switch's threshold cannot say "two rows below five, one above")
+        const bool one = t1 < 0.99 * o1, window = t8 < 0.99 * o8;
+        strata::kernels::fused_gr_set_down_rows(window, one ? 1 : 5);
+        std::fprintf(stderr, "xestrata: XESTRATA_HC_DOWN_ROWS: the hyper-connection down, 1 and 8 tokens: one row a "
+                             "sub-group %.1f + %.1f us, two rows %.1f + %.1f us: %s (XESTRATA_HC_DOWN_ROWS=0/1 picks "
+                             "one)\n",
+                     o1, o8, t1, t8,
+                     !window ? "one row" : one ? "two rows, every window" : "two rows, 5-token windows and up");
+        return;
+    }
+}
 }
 
 bool NativeDense::served_names(const std::vector<std::string>& shards, bool include_ple_key,
@@ -492,6 +526,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             }
         }
         if (hc_q8_short) hc_q8.clear();
+        if (hc_q8.empty()) hc_down_rows_choose(table, &compute);
         hc_q8_bytes = 0;
         for (const auto& h : hc_q8) hc_q8_bytes += (uint64_t) h.first->ne0 / 32 * 34 * (uint64_t) h.first->ne1;
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
