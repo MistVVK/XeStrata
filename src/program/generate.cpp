@@ -1964,12 +1964,14 @@ void seed_usage_from_prompt(std::vector<float>& usage, const strata::prefill::Pr
 }
 }  // namespace
 
-// XESTRATA_PREFILL_CPU_SHARE_BATCH=1 (opt-in): the prompt path gets the CPU pool beside --batch slots too; a batched
-// read takes the share only while no slot decodes (Prefill::set_share_blocked), since the slots' windows use the pool.
+// The prompt path gets the CPU pool beside --batch slots too (upstream 1b1a28e77's opt-in, on by default here: RX
+// 9060 XT, --batch 2, a 2050-token read --prefill 3072: 577.2 -> 780.4 tok/s, +35.2%; the decode of the same runs
+// 56.5 -> 55.4, -1.9%, within the run spread).  A batched read takes the share only while no slot decodes
+// (Prefill::set_share_blocked), since the slots' windows use the pool; XESTRATA_PREFILL_CPU_SHARE_BATCH=0 turns it off.
 static bool prefill_cpu_share_batch() {
     static const bool on = [] {
         const char* v = strata::env_get("PREFILL_CPU_SHARE_BATCH");
-        return v != nullptr && v[0] == '1';
+        return v == nullptr || v[0] != '0';
     }();
     return on;
 }
