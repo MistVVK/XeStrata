@@ -136,6 +136,10 @@ template<> struct Split<42> {   // Q2_0
     static constexpr bool kParts = true;
     // the calls in a row that share one activation scale (their integer sums add before the scale)
     static constexpr int kGroup = 1;
+    // the fixed-point sums (seg_dot_canon_fx): K 1, the block's d, the activation scale a call reads
+    static constexpr int kFxLog2 = 0;
+    static float block_d(const void* blk) { return (float) static_cast<const block_q2_0*>(blk)->d; }
+    static float act_d(const block_q8_1* bq8_1, int iqs) { return low_half(bq8_1[iqs].ds); }
     static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
         float c;
         int s;
@@ -1068,16 +1072,20 @@ inline int fx_row_top(const sycl::sub_group& sg, const uint8_t* row, int nb, int
     for (int o = LPR / 2; o > 0; o >>= 1) top = sycl::max(top, sycl::permute_group_by_xor(sg, top, o));
     return top;
 }
-template<int TY, int LPR>
+// an activation of nb_all of TY's blocks; S256: its scale is one for each 256 values (each 8th q8_1 block read), else
+// one for each 32
+template<int TY, int LPR, bool S256>
 inline int fx_act_top(const sycl::sub_group& sg, const block_q8_1* x, int nb_all, int seg_lane) {
+    constexpr int step = S256 ? 8 : 1;
+    const int n32 = nb_all * (Fmt<TY>::qk / 32);
     int top = canon::kFxNone;
-    for (int b = seg_lane; b < nb_all; b += LPR)
-        top = sycl::max(top, canon::fx_exp(low_half(x[(size_t) b * (Fmt<TY>::qk / 32)].ds)));
+    for (int b = seg_lane * step; b < n32; b += LPR * step)
+        top = sycl::max(top, canon::fx_exp(low_half(x[b].ds)));
     for (int o = LPR / 2; o > 0; o >>= 1) top = sycl::max(top, sycl::permute_group_by_xor(sg, top, o));
     return top;
 }
 
-template<int TY, int LPR, int NE, class G>
+template<int TY, int LPR, int NE, class G, bool S256>
 inline void seg_dot_canon_fx(const sycl::sub_group& sg, const uint8_t* row, const block_q8_1* const (&x)[NE], int n,
                              int nb, int nb_all, int seg_lane, float (&out)[NE], const G* grid) {
     using F = Fmt<TY>;
@@ -1088,7 +1096,7 @@ inline void seg_dot_canon_fx(const sycl::sub_group& sg, const uint8_t* row, cons
     int64_t s[NE];
     for (int e = 0; e < NE; ++e) {
         s[e] = 0;
-        top[e] = e < n ? fx_act_top<TY, LPR>(sg, x[e], nb_all, seg_lane) + topw : canon::kFxNone;
+        top[e] = e < n ? fx_act_top<TY, LPR, S256>(sg, x[e], nb_all, seg_lane) + topw : canon::kFxNone;
     }
     const int total = nb_all * F::ipb, mine = nb * F::ipb;
     for (int k0 = 0; k0 < total; k0 += LPR) {
@@ -1124,7 +1132,7 @@ inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const b
                           int nb, int nb_all, int seg_lane, float (&out)[NE], const G* grid = nullptr) {
     using F = Fmt<TY>;
     if constexpr (HasFx<typename F::S>::value && (S256 || group_of<typename F::S>() == 1)) {
-        seg_dot_canon_fx<TY, LPR, NE, G>(sg, row, x, n, nb, nb_all, seg_lane, out, grid);
+        seg_dot_canon_fx<TY, LPR, NE, G, S256>(sg, row, x, n, nb, nb_all, seg_lane, out, grid);
         return;
     } else if constexpr (HasParts<typename F::S>::value && (S256 || group_of<typename F::S>() == 1)) {
         seg_dot_canon<TY, LPR, NE, G>(sg, row, x, n, nb, nb_all, seg_lane, out, grid);
@@ -1307,7 +1315,8 @@ sycl::event launch_native_gu_pair(sycl::queue& q, size_t cap_groups, const unsig
                     int top[2][kEntriesPass];
                     int64_t fs[2][kEntriesPass];
                     for (int j = 0; j < kEntriesPass; ++j) {
-                        const int ta = j < n ? fx_act_top<TG, LPR>(sg, xs[j], nb_all, seg_lane) : canon::kFxNone;
+                        const int ta =
+                            j < n ? fx_act_top<TG, LPR, true>(sg, xs[j], nb_all, seg_lane) : canon::kFxNone;
                         for (int r = 0; r < 2; ++r) {
                             top[r][j] = ta + topw[r];
                             fs[r][j] = 0;

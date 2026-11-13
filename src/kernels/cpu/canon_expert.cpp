@@ -173,10 +173,12 @@ inline __m256 silu_mul8(__m256 g, __m256 u) {
 // loops): call k (32 values) d x the scale x its exact (code - 1) x q sum into the sum of k modulo 16, the 16 added
 // as the GPU's butterfly
 float q20_gu_row(const block_q2_0* w, int n, const void* a) {
-    STRATA_CANON_NO_CONTRACT
     const int8_t* xq = act_values(a, n, QK_K);
     const float* xd = act_scales(a);
-    float s[16] = {};
+    int ta = canon::kFxNone, tw = canon::kFxNone;   // canon_math.hpp's fixed-point sums: the row's top
+    for (int k = 0; k < n / QK_K; ++k) ta = std::max(ta, canon::fx_exp(xd[k]));
+    for (int k = 0; k < n / 64; ++k) tw = std::max(tw, canon::fx_exp(h2f(w[k].d)));
+    int64_t s = 0;
     for (int k = 0; k < n / 32; ++k) {
         const block_q2_0& b = w[k / 2];
         int t = 0;
@@ -185,12 +187,9 @@ float q20_gu_row(const block_q2_0* w, int n, const void* a) {
             const int code = (b.qs[v / 4] >> (2 * (v % 4))) & 3;
             t += (code - 1) * (int) xq[act_pos(32 * k + i, CanonOrder::q2_planes, n)];
         }
-        const float c = h2f(b.d) * xd[(32 * k) / QK_K];
-        s[k % 16] = canon::fma(c, (float) t, s[k % 16]);
+        s += (int64_t) canon::fx_scale(xd[(32 * k) / QK_K], h2f(b.d), ta + tw) * t;
     }
-    for (int o = 8; o > 0; o >>= 1)
-        for (int l = 0; l < o; ++l) s[l] += s[l + o];
-    return s[0];
+    return canon::fx_value(s, ta + tw, 0);
 }
 
 // A down activation's scales as canon_math.hpp's fx parts, for the IQ4_NL rows' fixed-point sums: each block's
@@ -207,6 +206,7 @@ void fx_act(const float* dx, int nb, FxAct& a) {
         a.e[b] = p.e;
         a.top = std::max(a.top, p.e);
     }
+    a.top = canon::fx_row_top(a.e[0], a.top);   // the activation's part of the top, as the weights'
 }
 
 // ---- the AVX2 forms of the down rows (the gate/up rows: iq_avx2's iq256_canon_rows)
@@ -383,16 +383,18 @@ void canon_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* a
             with_nt(nt, [&](auto NTc) {
                 constexpr int NT = decltype(NTc)::value;
                 float gr[NT], ur[NT];
+                FxAct fa[NT];   // the activations' parts once for the chunk's rows
+                for (int t = 0; t < NT; ++t) fx_act(dx[t], n / QK_K, fa[t]);
                 for (int r = c0; r < c1; ++r) {
 #if STRATA_AVXVNNI
                     if (vnni_on()) {
-                        vnni::q20_gu_rows_nt<NT>(blob + (size_t) r * f.gu_row, n, x, dx, qs32, gr);
-                        vnni::q20_gu_rows_nt<NT>(blob + f.up_off + (size_t) r * up_row, n, x, dx, qs32, ur);
+                        vnni::q20_gu_rows_nt<NT>(blob + (size_t) r * f.gu_row, n, x, fa, qs32, gr);
+                        vnni::q20_gu_rows_nt<NT>(blob + f.up_off + (size_t) r * up_row, n, x, fa, qs32, ur);
                     } else
 #endif
                     {
-                        plain::q20_gu_rows_nt<NT>(blob + (size_t) r * f.gu_row, n, x, dx, qs32, gr);
-                        plain::q20_gu_rows_nt<NT>(blob + f.up_off + (size_t) r * up_row, n, x, dx, qs32, ur);
+                        plain::q20_gu_rows_nt<NT>(blob + (size_t) r * f.gu_row, n, x, fa, qs32, gr);
+                        plain::q20_gu_rows_nt<NT>(blob + f.up_off + (size_t) r * up_row, n, x, fa, qs32, ur);
                     }
                     for (int t = 0; t < NT && t < nt; ++t) {
                         g[t][r] = gr[t];
@@ -428,14 +430,16 @@ void canon_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const*
         for (int t = 0; t < nt; ++t) qs32[t] = act_sums(hq[t], n, 32);
         with_nt(nt, [&](auto NTc) {
             constexpr int NT = decltype(NTc)::value;
+            FxAct fa[NT];   // the activations' parts once for every row
+            for (int t = 0; t < NT; ++t) fx_act(dx[t], n / 32, fa[t]);
             for (int r = r0; r < r1; ++r) {
                 const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;
                 float o[NT];
 #if STRATA_AVXVNNI
-                if (vnni_on()) vnni::q20_rows_nt<NT>(dr, n, x, dx, qs32, o);
+                if (vnni_on()) vnni::q20_rows_nt<NT>(dr, n, x, fa, qs32, o);
                 else
 #endif
-                    plain::q20_rows_nt<NT>(dr, n, x, dx, qs32, o);
+                    plain::q20_rows_nt<NT>(dr, n, x, fa, qs32, o);
                 for (int t = 0; t < NT; ++t) out[t][r] = o[t];
             }
         });
