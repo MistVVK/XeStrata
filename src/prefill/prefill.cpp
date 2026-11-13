@@ -1384,7 +1384,8 @@ struct Prefill::Impl {
     // this layout's GU, H and Xq are the fused path's (moe_bufs' `fused`), so a layer that runs MMQ or the FP16 path may
     // only write stream_all_min() - 1 of its rows into them; fused_layout() keeps the two in step (#583, #954)
     bool fused_bufs = false;
-    std::unique_ptr<Stager> stager;          // the unpinned experts' host copies (step 4)
+    int64_t tail_req = -1;   // the MMQ tail (tokens) the fused layout was carved for: -1 = stream_all_min() - 1 (start-up, the way back); relayout's `tail`
+    std::unique_ptr<Stager> stager;         // the unpinned experts' host copies (step 4)
     std::unique_ptr<PrefillWarmer> warmer;   // STRATA_PREFILL_WARM=1: the per-layer walk's page warming
     std::vector<std::vector<int64_t>> warm_prev;   // per layer: the file-tier experts of the previous chunk
     cudaEvent_t copied[RING_MAX] = {}, used[RING_MAX] = {};
@@ -1906,21 +1907,24 @@ bool fused_layout(size_t T, bool src) {
 // The MoE buffers MMQ and the fused path share: GU and H in floats, Xq and Hq in bytes.  Without `fused` (the
 // default): MMQ's, for T tokens.
 struct MoeBufs { size_t gu, h, xq, hq; };
-MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused) {
+// `tail` (>= 0, fused only): the MMQ rows a chunk below the floor may bring, in tokens (a lent layout sized for its
+// segment's own last chunk, loan_rules.hpp); -1: stream_all_min() - 1, as the start-up layout.
+MoeBufs moe_bufs(size_t T, int64_t n_expert, bool fused, int64_t tail = -1) {
     if (!fused && pf_group_scratch()) {   // GU, H, Hq: one group's rows (Xq keeps every row: gate/up reads the layer's)
         const size_t gc = (size_t) group_cap_rows(T, n_expert);
         return {gc * kFF2, gc * kFF, mmq::q8_bytes((int64_t) (T * K), N), mmq::q8_bytes((int64_t) gc, kFF)};
     }
     if (!fused) return {T * K * kFF2, T * K * kFF, mmq::q8_bytes((int64_t) (T * K), N), mmq::q8_bytes((int64_t) (T * K), kFF)};
-    const size_t ts = (size_t) std::min<int64_t>((int64_t) T, stream_all_min() - 1);   // MMQ's last small chunk
+    const int64_t tail_tokens = tail >= 0 ? std::min<int64_t>(tail, std::max<int64_t>(stream_all_min() - 1, 0)) : stream_all_min() - 1;
+    const size_t ts = (size_t) std::min<int64_t>((int64_t) T, tail_tokens);   // MMQ's last small chunk
     return {std::max<size_t>(ts * K * kFF2, (fused::group_bytes((int64_t) (T * K), (int) n_expert) + 3) / 4),
             std::max<size_t>(ts * K * kFF, (fused::act_bytes((int64_t) (T * K), kFF) + 3) / 4),
             std::max(mmq::q8_bytes((int64_t) (ts * K), N), fused::act_bytes((int64_t) T, N)),
             mmq::q8_bytes((int64_t) (ts * K), kFF)};
 }
-uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused) {
+uint64_t moe_set_bytes(size_t T, int64_t n_expert, bool fused, int64_t tail = -1) {
     const MmqPlan& mp = mmq_plan();
-    const MoeBufs mb = moe_bufs(T, n_expert, fused);
+    const MoeBufs mb = moe_bufs(T, n_expert, fused, tail);
     Alloc a; a.count_only = true; bool ok = true;
     a.take<float>(T * n_expert, ok); a.take<float>(T * K, ok); a.take<int32_t>(T * K, ok); a.take<int32_t>(T * K, ok);
     a.take<int32_t>(T * K, ok);
@@ -2282,9 +2286,9 @@ bool Prefill::carve(size_t T, void* alloc) {
         // one region for the attention half's and the MoE half's scratch (see gdn_set_bytes)
         const bool fz = fused_layout(T, m.src != nullptr);
         m.fused_bufs = fz;
-        const MoeBufs mb = moe_bufs(T, m.g->n_expert, fz);
+        const MoeBufs mb = moe_bufs(T, m.g->n_expert, fz, m.tail_req);
         const uint64_t region = std::max({gdn_set_bytes(T), qsa_set_bytes(T, m.cap, m.max_blocks, m.sel_batch,
-                                                                           m.attn_batch, s), moe_set_bytes(T, m.g->n_expert, fz),
+                                                                           m.attn_batch, s), moe_set_bytes(T, m.g->n_expert, fz, m.tail_req),
                                            hcr ? hc_set_bytes(T, m.f16_io) : (uint64_t) 0});
         uint8_t* base = o.take<uint8_t>((size_t) region, ok);
         // No region: the sub-allocators below would each cudaMalloc their share (hundreds of MiB) on a card that has just
@@ -2410,8 +2414,9 @@ bool Prefill::carve(size_t T, void* alloc) {
     return ok;
 }
 
-bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err) {
+bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err, int64_t tail) {
     Impl& m = *impl_;
+    m.tail_req = tail;   // read by carve (a failure leaves the layout unusable as before; the caller ends the request)
     if (m.borrow_spill) {
         err = "prefill: a hybrid borrowed/owned layout cannot be changed between requests";
         return false;
@@ -2449,6 +2454,14 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
 }
 
 int64_t Prefill::chunk() const { return impl_->T; }
+int64_t Prefill::layout_tail() const { return impl_->tail_req; }
+int64_t Prefill::tail_room() const {
+    const Impl& m = *impl_;
+    if (!m.fused_bufs) return std::numeric_limits<int64_t>::max();   // MMQ-sized buffers: any chunk the layout has
+    const int64_t d = std::max<int64_t>(stream_all_min() - 1, 0);
+    return m.tail_req >= 0 ? std::min(m.tail_req, d) : d;
+}
+bool Prefill::tail_matters(int64_t chunk, bool src) { return chunk > 0 && fused_layout((size_t) chunk, src); }
 
 void Prefill::set_ring_room_active(bool on) {
     ring_room_active_ = on;
@@ -3102,8 +3115,8 @@ int64_t Prefill::chain_experts_streamed() const {
     return sum;
 }
 
-uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src) {
-    return bytes_needed_impl(g, ss, chunk, false, src);
+uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk, bool src, int64_t tail) {
+    return bytes_needed_impl(g, ss, chunk, false, src, tail);
 }
 
 // What `init` really allocates when the prompt path owns its buffers (no loan): every cudaMalloc rounds up to a 2 MiB
@@ -3114,7 +3127,7 @@ uint64_t Prefill::bytes_needed_owned(const core::ModelGeometry& g, const core::S
 }
 
 uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
-                                    bool owned_pages, bool src) {
+                                    bool owned_pages, bool src, int64_t tail) {
     // the same allocation sequence as `init` (`carve`), counted - with the MoE layout `carve` picks for the same source
     const size_t T = (size_t) chunk;
     bool ok = true;
@@ -3149,7 +3162,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
-                                       moe_set_bytes(T, g.n_expert, fused_layout(T, src)),
+                                       moe_set_bytes(T, g.n_expert, fused_layout(T, src), tail),
                                        hcr ? hc_set_bytes(T, f16_io) : (uint64_t) 0}), ok);
     for (int i = 0; i < DQ; ++i) { o.take<uint16_t>(kFF2 * kEmbd, ok); o.take<uint16_t>(kEmbd * kFF, ok); }
     if (mmq_plan().any) {
@@ -3723,6 +3736,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             std::fflush(stderr);
         }
         const int64_t T = std::min(C, n - c0), p0 = pos0 + c0;
+        // A fused layout carved with a tail (relayout's `tail`, loan_rules.hpp) holds MMQ's rows for that many tokens of a
+        // chunk below the stream floor: a longer one would overrun GU / H / Xq / Hq (an illegal access, or a hang).  The
+        // lend sizes the tail from the segment, so this is the clean error for anything that drifts from it.
+        if (m.fused_bufs && T < stream_all_min() && T > tail_room()) {
+            err = "prefill: a chunk of " + std::to_string((long long) T) + " tokens below the stream floor does not fit the fused layout's tail of " +
+                  std::to_string((long long) tail_room()) + " tokens";
+            return false;
+        }
         // STRATA_KVA: this chunk is approximated in the layers at and after the split when its last position is
         // before the request's full-computation suffix; a chunk in the suffix runs the ordinary path everywhere.
         const bool kva_approx = kva_run && (p0 + T <= kva_frontier);

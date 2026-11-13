@@ -10165,6 +10165,10 @@ int main(int argc, char** argv) {
     // tokens (RTX A6000).  Applies to every piece within 255 tokens under the floor (769-1,023 at 1,024; 2,817-3,071 under the CPU
     // share's 3,072).  STRATA_PREFILL_LOAN_WALK=0 keeps the rounded chunk.
     static const bool loan_by_walk = [] { const char* e = std::getenv("STRATA_PREFILL_LOAN_WALK"); return !(e != nullptr && e[0] == '0'); }();
+    // The lent fused layout's MMQ tail is sized from the segment's own last chunk, not from the stream floor (a floor of 3,584
+    // against 1,024 costs ~92 expert slots on an RTX A6000, streamed again by every chunk above the floor).  One GPU, no peer, no
+    // --batch above one slot, no head alias; a layer split keeps the floor's tail.  STRATA_PREFILL_TAIL_LOAN=0 keeps today's size.
+    static const bool tail_loan_on = [] { const char* e = std::getenv("STRATA_PREFILL_TAIL_LOAN"); return !(e != nullptr && e[0] == '0'); }();
     auto loan_chunk = [&](int64_t tokens, int64_t chunk) -> int64_t {
         return loan_by_walk ? strata::prefill::loan_rules::walk_chunk(tokens, chunk, strata::prefill::Prefill::stream_all_min_tokens())
                             : chunk;
@@ -11171,9 +11175,10 @@ int main(int argc, char** argv) {
                                                      (uint64_t) strata::kernels::cpu::expert_layout().max_blob, need);
         };
         auto on_part_device = [](int dev) { return strata::core::OnDevice(dev); };
-        auto part_slots = [&](const PfPart& p, int64_t c) -> int64_t {
+        // `tail` (>= 0): the lent fused layout's MMQ tail in tokens (loan_rules.hpp); -1: today's floor - 1
+        auto part_slots = [&](const PfPart& p, int64_t c, int64_t tail = -1) -> int64_t {
             return cache_slots_for(*p.cache, strata::program::split_part_figure(on_part_device, p.dev, [&] {
-                return strata::prefill::Prefill::bytes_needed(g, *p.ses, c, srcp != nullptr);
+                return strata::prefill::Prefill::bytes_needed(g, *p.ses, c, srcp != nullptr, tail);
             }));
         };
         auto part_bytes = [&](const PfPart& p, int32_t first) -> uint64_t {
@@ -17784,10 +17789,17 @@ int main(int argc, char** argv) {
                     return false;
                 }
                 bool any = false;
+                namespace lr = strata::prefill::loan_rules;
+                using strata::prefill::Prefill;
+                const int64_t floor_t = Prefill::stream_all_min_tokens();
+                const bool tail_ok = tail_loan_on && pf_parts.size() == 1 && stages.empty() && !multi_gpu && !peer.valid() &&
+                                     !o.prefill_head_alias && o.batch <= 1;
                 for (PfPart& p : pf_parts) {
                     if (p.first < 0) continue;
                     if (!p.lent.empty()) {
-                        if (want <= p.lent_chunk) continue;            // its current loan already covers this
+                        // its current loan already covers this: the chunk, and (a fused layout) the tail the segment's last
+                        // chunk needs when it is read in the loan's own chunks
+                        if (tail_ok ? lr::reuse_ok(want, tokens, p.lent_chunk, p.sp->tail_room(), floor_t) : want <= p.lent_chunk) continue;
                         // ONLY this participant's loan goes back: `refill` would return the other participants'
                         // loans too, and their buffers are still laid out in their caches - marking those slots
                         // resident again would hand the next window a prompt buffer in place of an expert
@@ -17795,6 +17807,7 @@ int main(int argc, char** argv) {
                     }
                     const strata::core::OnDevice on(p.dev);
                     int64_t want_p = want;
+                    int64_t tail_p = -1;   // the tail the layout is laid out with (-1: floor - 1)
                     int32_t first = p.first_now;
                     // --prefill-head-alias: the loan laid out at start (slot 1 on) is kept; a hybrid layout cannot relayout.
                     // (STRATA_MTP_ROOM_MIN's room is not one: its slots are the drafter's own bytes, so a roomed
@@ -17805,10 +17818,18 @@ int main(int argc, char** argv) {
                         // a request's smaller chunk can need MORE slots than the auto chunk's region (p.first) holds.  The
                         // loan starts where the chunk itself needs it (the 128-slot floor aside); a chunk that cannot be
                         // lent even then is halved until it can, instead of ending the engine.
-                        int64_t need_p = part_slots(p, want_p);
+                        // the tail this layout is carved with for chunks of `w` (-1: today's floor - 1): grow-only while the layout's
+                        // chunk stays (loan_rules::next_tail), the need of the moment otherwise
+                        auto tail_for = [&](int64_t w) -> int64_t {
+                            if (!tail_ok || !Prefill::tail_matters(w, srcp != nullptr)) return -1;
+                            return lr::next_tail(p.sp->chunk(), p.sp->layout_tail(), w, lr::segment_tail(tokens, w, floor_t), floor_t);
+                        };
+                        tail_p = tail_for(want_p);
+                        int64_t need_p = part_slots(p, want_p, tail_p);
                         while ((need_p <= 0 || need_p + g_lend_keep > p.cache->slots()) && want_p > 256) {
                             want_p = std::max<int64_t>(256, want_p / 2 / 256 * 256);
-                            need_p = part_slots(p, want_p);
+                            tail_p = tail_for(want_p);
+                            need_p = part_slots(p, want_p, tail_p);
                         }
                         if (need_p <= 0 || need_p + g_lend_keep > p.cache->slots()) {
                             e = "prefill: no chunk of this request fits the slots that can be lent (#2090)";
@@ -17824,9 +17845,23 @@ int main(int argc, char** argv) {
                                          (long long) need_p, (long long) (p.cache->slots() - p.first));
                         first = (int32_t) (p.cache->slots() - need_p);
                     }
-                    if (want_p != p.sp->chunk() || first != p.first_now) {
-                        if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e)) return false;
+                    if (want_p != p.sp->chunk() || first != p.first_now || (tail_p >= 0 && tail_p != p.sp->layout_tail())) {
+                        const auto t_rl = Clock::now();
+                        if (!p.sp->relayout(want_p, p.cache->device_slot(first), part_bytes(p, first), e, tail_p)) return false;
                         p.first_now = first;
+                        if (tail_p >= 0) {
+                            static bool said = false;
+                            if (!said) {
+                                said = true;
+                                std::fprintf(stderr, "strata serve: the lent prompt buffers are sized for the request's own short last chunk "
+                                                     "(tail %lld tokens, not the stream floor's %lld); STRATA_PREFILL_TAIL_LOAN=0 keeps the floor's\n",
+                                             (long long) tail_p, (long long) (floor_t - 1));
+                            }
+                            if (trace)
+                                std::fprintf(stderr, "strata trace: relayout for %lld tokens, tail %lld, first slot %d: %.1f ms\n", (long long) want_p,
+                                             (long long) tail_p, (int) first,
+                                             std::chrono::duration<double, std::milli>(Clock::now() - t_rl).count());
+                        }
                     }
                     for (int64_t l = p.lb; l < p.le; ++l)              // THIS participant's layers only
                         for (int64_t ex = 0; ex < g.n_expert; ++ex) {
