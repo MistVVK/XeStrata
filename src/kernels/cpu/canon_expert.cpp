@@ -24,6 +24,7 @@
 
 #include <immintrin.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -112,27 +113,25 @@ float iq2xs_row(const block_iq2_xs* w, int n, const void* a) {
 // one IQ4_NL row of n values against an activation with a scale per 32 values (the reference loops): the GPU's lane
 // 2 (block % 4) + call, a call the block's values 0-7 and 16-23, or 8-15 and 24-31
 float iq4nl_row(const block_iq4_nl* w, int n, const void* a) {
-    STRATA_CANON_NO_CONTRACT
     const int8_t* xq = act_values(a, n, QK4_NL);
     const float* xd = act_scales(a);
-    float s[8] = {};
     const int nb = n / QK4_NL;
+    int ta = canon::kFxNone, tw = canon::kFxNone;   // canon_math.hpp's fixed-point sums: the row's top
     for (int kbx = 0; kbx < nb; ++kbx) {
-        const float c = h2f(w[kbx].d) * xd[kbx];
-        for (int call = 0; call < 2; ++call) {
-            int t = 0;
-            for (int i = 8 * call; i < 8 * call + 8; ++i) {
-                t += (int) kvalues_iq4nl[w[kbx].qs[i] & 0x0F] * (int) xq[act_pos(32 * kbx + i, CanonOrder::iq4nl_calls, n)];
-                t += (int) kvalues_iq4nl[w[kbx].qs[i] >> 4] *
-                     (int) xq[act_pos(32 * kbx + i + 16, CanonOrder::iq4nl_calls, n)];
-            }
-            float& l = s[2 * (kbx % 4) + call];
-            l = canon::fma(c, (float) t, l);
-        }
+        ta = std::max(ta, canon::fx_exp(xd[kbx]));
+        tw = std::max(tw, canon::fx_exp(h2f(w[kbx].d)));
     }
-    for (int o = 4; o > 0; o >>= 1)
-        for (int l = 0; l < o; ++l) s[l] += s[l + o];
-    return s[0];
+    int64_t s = 0;
+    for (int kbx = 0; kbx < nb; ++kbx) {
+        int t = 0;
+        for (int i = 0; i < 16; ++i) {
+            t += (int) kvalues_iq4nl[w[kbx].qs[i] & 0x0F] * (int) xq[act_pos(32 * kbx + i, CanonOrder::iq4nl_calls, n)];
+            t += (int) kvalues_iq4nl[w[kbx].qs[i] >> 4] *
+                 (int) xq[act_pos(32 * kbx + i + 16, CanonOrder::iq4nl_calls, n)];
+        }
+        s += (int64_t) canon::fx_scale(xd[kbx], h2f(w[kbx].d), ta + tw) * t;
+    }
+    return canon::fx_value(s, ta + tw, 0);
 }
 
 // canon::silu_mul 8 at a time: the same operations in the same order (exp's range reduction, its polynomial and the
@@ -189,6 +188,22 @@ float q20_gu_row(const block_q2_0* w, int n, const void* a) {
     for (int o = 8; o > 0; o >>= 1)
         for (int l = 0; l < o; ++l) s[l] += s[l + o];
     return s[0];
+}
+
+// A down activation's scales as canon_math.hpp's fx parts, for the IQ4_NL rows' fixed-point sums: each block's
+// mantissa and exponent, and the largest exponent
+struct FxAct {
+    alignas(32) int32_t m[kNativeMaxFF / QK4_NL], e[kNativeMaxFF / QK4_NL];
+    int top;
+};
+void fx_act(const float* dx, int nb, FxAct& a) {
+    a.top = canon::kFxNone;
+    for (int b = 0; b < nb; ++b) {
+        const canon::FxPart p = canon::fx_part(dx[b]);   // a scale is never negative
+        a.m[b] = (int32_t) p.m;
+        a.e[b] = p.e;
+        a.top = std::max(a.top, p.e);
+    }
 }
 
 // ---- the AVX2 forms of the down rows (the gate/up rows: iq_avx2's iq256_canon_rows)
@@ -425,6 +440,9 @@ void canon_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const*
     }
     with_nt(nt, [&](auto NTc) {
         constexpr int NT = decltype(NTc)::value;
+        FxAct fa[NT];   // the activations' parts once for every row
+        if (!scalar)
+            for (int t = 0; t < NT; ++t) fx_act(dx[t < nt ? t : 0], n / QK4_NL, fa[t]);
         for (int r = r0; r < r1; ++r) {
             const uint8_t* dr = blob + f.down_off + (size_t) r * f.d_row;
             float o[NT];
@@ -432,10 +450,10 @@ void canon_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const*
                 for (int t = 0; t < NT; ++t) o[t] = iq4nl_row(reinterpret_cast<const block_iq4_nl*>(dr), n, hq[t]);
             else
 #if STRATA_AVXVNNI
-                if (vnni_on()) vnni::iq4nl_rows_nt<NT>(dr, n, x, dx, o);
+                if (vnni_on()) vnni::iq4nl_rows_nt<NT>(dr, n, x, fa, o);
                 else
 #endif
-                    plain::iq4nl_rows_nt<NT>(dr, n, x, dx, o);
+                    plain::iq4nl_rows_nt<NT>(dr, n, x, fa, o);
             for (int t = 0; t < NT; ++t) out[t][r] = o[t];
         }
     });

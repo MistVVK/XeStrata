@@ -60,22 +60,30 @@ STRATA_ROWS_FN inline __m256i dot4u_add(__m256i acc, __m256i u8, __m256i s8) {
 
 // one IQ4_NL row against NT tokens' activations in IQ4_NL's call order (canon_quant's iq4nl_calls: four blocks' 128
 // values as 4 vectors, lane k = 2 b + c of vector m holding block b's call c's m-th 4 values), with a scale for each
-// block (dx).  The GPU's 8 lanes a row: call k (16 values: block k / 2's values 0-7 and 16-23, or 8-15 and 24-31) on
-// lane k % 8, its scale product x its integer sum added with one fma.  The weights are decoded into the same order
-// (block b's bytes 0-3 and 8-11 give vectors 0 and 2, 4-7 and 12-15 vectors 1 and 3), so the 4 products add
-// vertically into the 8 calls' sums; at the end the GPU's butterfly, ((l0 + l4) + (l2 + l6)) + ((l1 + l5) + (l3 + l7)).
-template <int NT> STRATA_ROWS_FN void iq4nl_rows_nt(const uint8_t* row, int n, const int8_t* const* x, const float* const* dx,
-                                     float* res) {
-    STRATA_CANON_NO_CONTRACT
+// block (fa: its fx parts).  The weights are decoded into the same order (block b's bytes 0-3 and 8-11 give vectors 0
+// and 2, 4-7 and 12-15 vectors 1 and 3), so the 4 products add vertically into the 8 calls' integer sums; each call's
+// sum times its block's integer scale (canon_math.hpp's fx_scale, 8 lanes at once: the same integer steps) is added in
+// int64, and the row's value is canon_math.hpp's fx_value - the GPU's (iq_kernels.cpp's seg_dot_canon_fx, iq_mmq.cpp's
+// FX bodies) in any order.
+template <int NT> STRATA_ROWS_FN void iq4nl_rows_nt(const uint8_t* row, int n, const int8_t* const* x, const FxAct* fa,
+                                                    float* res) {
     const __m256i kv = _mm256_broadcastsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl)));
     const __m256i m4 = _mm256_set1_epi8(0x0F);
     const __m256i dup = _mm256_setr_epi32(0, 0, 1, 1, 2, 2, 3, 3);
-    __m256 acc[NT];
-    for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
+    const __m256i one = _mm256_set1_epi32(1), zero = _mm256_setzero_si256();
     const int nb = n / QK4_NL;   // a multiple of 4 (canon_layer)
+    const auto* wb = reinterpret_cast<const block_iq4_nl*>(row);
+    int topw = canon::kFxNone;
+    for (int k = 0; k < nb; ++k) topw = std::max(topw, canon::fx_exp(_cvtsh_ss(wb[k].d)));
+    __m256i acc[NT];   // int64 x 4
+    __m256i shift0[NT];   // kFxHead - the row's top, a lane each
+    for (int t = 0; t < NT; ++t) {
+        acc[t] = zero;
+        shift0[t] = _mm256_set1_epi32(canon::kFxHead - (fa[t].top + topw));
+    }
     const int pf = iq_prefetch_bytes();
     for (int k0 = 0; k0 < nb; k0 += 4) {
-        const auto* w = reinterpret_cast<const block_iq4_nl*>(row) + k0;
+        const block_iq4_nl* w = wb + k0;
         canon_ahead(reinterpret_cast<const uint8_t*>(w), pf);
         __m256i b02, b13;
         call_dwords(w[0].qs, (ptrdiff_t) sizeof(block_iq4_nl), b02, b13);
@@ -85,9 +93,18 @@ template <int NT> STRATA_ROWS_FN void iq4nl_rows_nt(const uint8_t* row, int n, c
         wv[2] = _mm256_shuffle_epi8(kv, _mm256_and_si256(_mm256_srli_epi16(b02, 4), m4));
         wv[3] = _mm256_shuffle_epi8(kv, _mm256_and_si256(_mm256_srli_epi16(b13, 4), m4));
         for (int m = 0; m < 4; ++m) wa[m] = _mm256_sign_epi8(wv[m], wv[m]);
-        // [d0, d0, d1, d1, d2, d2, d3, d3]: a block's two calls share its scale
-        const __m256 dw = _mm256_cvtph_ps(_mm_set_epi16((short) w[3].d, (short) w[3].d, (short) w[2].d, (short) w[2].d,
-                                                        (short) w[1].d, (short) w[1].d, (short) w[0].d, (short) w[0].d));
+        // the blocks' d as fx parts, [d0, d0, d1, d1, d2, d2, d3, d3]: a block's two calls share them
+        const __m256i db = _mm256_permutevar8x32_epi32(
+            _mm256_castsi128_si256(_mm_castps_si128(_mm_cvtph_ps(_mm_set_epi16(0, 0, 0, 0, (short) w[3].d,
+                                                                              (short) w[2].d, (short) w[1].d,
+                                                                              (short) w[0].d)))), dup);
+        const __m256i ef = _mm256_and_si256(_mm256_srli_epi32(db, 23), _mm256_set1_epi32(0xFF));
+        const __m256i live = _mm256_xor_si256(_mm256_cmpeq_epi32(ef, zero), _mm256_set1_epi32(-1));
+        const __m256i wm = _mm256_and_si256(
+            live, _mm256_srli_epi32(_mm256_or_si256(_mm256_and_si256(db, _mm256_set1_epi32(0x7FFFFF)),
+                                                    _mm256_set1_epi32(0x800000)), 13));
+        const __m256i we = _mm256_sub_epi32(ef, _mm256_set1_epi32(137));
+        const __m256i wneg = _mm256_srai_epi32(db, 31);   // -1 where d is negative
         for (int t = 0; t < NT; ++t) {
             const int8_t* xb = x[t] + 32 * (ptrdiff_t) k0;
             __m256i T = _mm256_setzero_si256();
@@ -95,14 +112,27 @@ template <int NT> STRATA_ROWS_FN void iq4nl_rows_nt(const uint8_t* row, int n, c
                 const __m256i y = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(xb + 32 * (ptrdiff_t) m));
                 T = dot4u_add(T, wa[m], _mm256_sign_epi8(y, wv[m]));
             }
-            const __m256 xs = _mm256_permutevar8x32_ps(_mm256_castps128_ps256(_mm_loadu_ps(dx[t] + k0)), dup);
-            acc[t] = _mm256_fmadd_ps(_mm256_mul_ps(dw, xs), _mm256_cvtepi32_ps(T), acc[t]);
+            // fx_scale: (ma mw) 2^s, s = ea + ew - top + kFxHead, rounded half up where s < 0 (0 far below)
+            const __m256i am = _mm256_permutevar8x32_epi32(
+                _mm256_castsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(fa[t].m + k0))), dup);
+            const __m256i ae = _mm256_permutevar8x32_epi32(
+                _mm256_castsi128_si256(_mm_loadu_si128(reinterpret_cast<const __m128i*>(fa[t].e + k0))), dup);
+            const __m256i mm = _mm256_mullo_epi32(am, wm);
+            const __m256i s = _mm256_add_epi32(_mm256_add_epi32(ae, we), shift0[t]);
+            const __m256i ns = _mm256_sub_epi32(zero, s);
+            const __m256i half = _mm256_sllv_epi32(one, _mm256_sub_epi32(ns, one));
+            const __m256i right = _mm256_srlv_epi32(_mm256_add_epi32(mm, half), ns);
+            const __m256i left = _mm256_sllv_epi32(mm, s);
+            __m256i A = _mm256_blendv_epi8(right, left, _mm256_cmpgt_epi32(s, _mm256_set1_epi32(-1)));
+            A = _mm256_sub_epi32(_mm256_xor_si256(A, wneg), wneg);
+            acc[t] = _mm256_add_epi64(acc[t], _mm256_add_epi64(
+                         _mm256_mul_epi32(A, T), _mm256_mul_epi32(_mm256_srli_epi64(A, 32), _mm256_srli_epi64(T, 32))));
         }
     }
     for (int t = 0; t < NT; ++t) {
-        const __m128 v = _mm_add_ps(_mm256_castps256_ps128(acc[t]), _mm256_extractf128_ps(acc[t], 1));   // l + (l + 4)
-        const __m128 u = _mm_add_ps(v, _mm_movehl_ps(v, v));                                              // + (l + 2)
-        res[t] = _mm_cvtss_f32(u) + _mm_cvtss_f32(_mm_shuffle_ps(u, u, 1));
+        alignas(32) int64_t l[4];
+        _mm256_store_si256(reinterpret_cast<__m256i*>(l), acc[t]);
+        res[t] = canon::fx_value(l[0] + l[1] + l[2] + l[3], fa[t].top + topw, 0);
     }
 }
 

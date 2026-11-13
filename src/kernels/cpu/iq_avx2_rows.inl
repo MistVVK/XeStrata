@@ -529,10 +529,13 @@ inline void row_dot_canon_gen(const uint8_t* row, int nblocks, const int8_t* con
 }
 
 // The fixed-point canonical rows (canon_math.hpp's fx_*; iq_kernels.cpp's seg_dot_canon and iq_mmq.cpp's FX bodies take
-// the same steps): IQ3_XXS.  A block's eight 32-value units' (2 ls + 1)-weighted integer sums added first, as above,
+// the same steps).  A block's eight 32-value units' (2 ls + 1)-weighted integer sums added first, as above,
 // then that sum times the block's integer scale (the activation's and the block's d at the row's exponent) added in
-// int64; the row's value from its sum.  Every addition is exact, so no order is the GPU's to follow.
-template <int TY> constexpr bool canon_fx() { return TY == 18 || TY == 118; }
+// int64; the row's value from its sum.  Every addition is exact, so no order is the GPU's to follow.  IQ2_XXS, IQ3_XXS
+// and IQ3_S (and their gathered decodes).
+template <int TY> constexpr bool canon_fx() {
+    return TY == 16 || TY == 18 || TY == 118 || TY == 21 || TY == 121;
+}
 template <int TY> constexpr int fx_k_log2() {
     return Fmt32<TY>::K == 0.125f ? -3 : Fmt32<TY>::K == 0.25f ? -2 : Fmt32<TY>::K == 0.5f ? -1 : 0;
 }

@@ -179,6 +179,10 @@ template<> struct Split<16> {   // IQ2_XXS
     static constexpr bool kParts = true;
     // the calls in a row that share one activation scale (their integer sums add before the scale)
     static constexpr int kGroup = 8;
+    // the fixed-point sums (Split<18>'s): the 1/8, the block's d, the activation scale a call reads
+    static constexpr int kFxLog2 = -3;
+    static float block_d(const void* blk) { return (float) static_cast<const block_iq2_xxs*>(blk)->d; }
+    static float act_d(const block_q8_1* bq8_1, int iqs) { return low_half(bq8_1[iqs / 2].ds); }
     static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
         float c;
         int s;
@@ -256,6 +260,10 @@ template<> struct Split<21> {   // IQ3_S
     static constexpr bool kParts = true;
     // the calls in a row that share one activation scale (their integer sums add before the scale)
     static constexpr int kGroup = 8;
+    // the fixed-point sums (Split<18>'s): K 1, the block's d, the activation scale a call reads
+    static constexpr int kFxLog2 = 0;
+    static float block_d(const void* blk) { return (float) static_cast<const block_iq3_s*>(blk)->d; }
+    static float act_d(const block_q8_1* bq8_1, int iqs) { return low_half(bq8_1[iqs / 2].ds); }
     static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
         float c;
         int s;
@@ -429,6 +437,10 @@ template<> struct Split<20> {   // IQ4_NL
     // block's two calls have the same scale, so a call is a lane's own fma and no lanes exchange sums (the CPU's rows
     // add the 8 lanes as cheaply)
     static constexpr int kGroup = 1;
+    // the fixed-point sums (seg_dot_canon_fx; a down row: a scale for each 32): K 1, the block's d, its activation's
+    static constexpr int kFxLog2 = 0;
+    static float block_d(const void* blk) { return (float) static_cast<const block_iq4_nl*>(blk)->d; }
+    static float act_d(const block_q8_1* bq8_1, int) { return low_half(bq8_1->ds); }
     static float apply(const W& r, const block_q8_1* bq8_1, int iqs) {
         float c;
         int s;
@@ -1032,11 +1044,11 @@ inline void seg_dot_canon(const sycl::sub_group& sg, const uint8_t* row, const b
     }
 }
 
-// A format with kFxLog2 (IQ3_XXS): seg_dot_canon's calls and integer butterflies, each group's sum times its block's
-// integer scale (canon_math.hpp's fx_scale) added in int64 and the lanes' sums by an int64 butterfly - exact, so in any
-// order: the CPU's rows (iq_avx2_rows.inl's row_dot_canon_fx) and the prompt's products (iq_mmq.cpp's FX bodies) give
-// the same bits.  The row's top: the largest exponent of its blocks' d's, read by the segment's lanes, plus each
-// activation's (the scale of each 256, in its first q8_1 block).
+// A format with kFxLog2 (IQ2_XXS, IQ3_XXS, IQ3_S, IQ4_NL): seg_dot_canon's calls and integer butterflies, each group's
+// sum times its block's integer scale (canon_math.hpp's fx_scale) added in int64 and the lanes' sums by an int64
+// butterfly - exact, so in any order: the CPU's rows (iq_avx2_rows.inl's row_dot_canon_fx) and the prompt's products
+// (iq_mmq.cpp's FX bodies) give the same bits.  The row's top: the largest exponent of its blocks' d's, read by the
+// segment's lanes, plus each activation's (the scale of each 256, in its first q8_1 block).
 template<class S, class = void> struct HasFx : std::false_type {};
 template<class S> struct HasFx<S, std::void_t<decltype(S::kFxLog2)>> : std::true_type {};
 
@@ -1062,8 +1074,7 @@ inline void seg_dot_canon_fx(const sycl::sub_group& sg, const uint8_t* row, cons
                              int nb, int nb_all, int seg_lane, float (&out)[NE], const G* grid) {
     using F = Fmt<TY>;
     constexpr int KG = F::S::kGroup;
-    static_assert(LPR % KG == 0 && (KG & (KG - 1)) == 0 && KG > 1,
-                  "a group's calls on neighbouring lanes of one segment");
+    static_assert(LPR % KG == 0 && (KG & (KG - 1)) == 0, "a group's calls on neighbouring lanes of one segment");
     const int topw = fx_row_top<TY, LPR>(sg, row, nb, seg_lane);
     int top[NE];
     int64_t s[NE];
@@ -1104,7 +1115,7 @@ template<int TY, int LPR, int NE, class G = void, bool S256 = true>
 inline void seg_dot_multi(const sycl::sub_group& sg, const uint8_t* row, const block_q8_1* const (&x)[NE], int n,
                           int nb, int nb_all, int seg_lane, float (&out)[NE], const G* grid = nullptr) {
     using F = Fmt<TY>;
-    if constexpr (HasFx<typename F::S>::value && S256) {
+    if constexpr (HasFx<typename F::S>::value && (S256 || group_of<typename F::S>() == 1)) {
         seg_dot_canon_fx<TY, LPR, NE, G>(sg, row, x, n, nb, nb_all, seg_lane, out, grid);
         return;
     } else if constexpr (HasParts<typename F::S>::value && (S256 || group_of<typename F::S>() == 1)) {
