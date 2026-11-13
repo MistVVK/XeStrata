@@ -454,6 +454,16 @@ def source_hint(url: str) -> str:
     return ""
 
 
+def proxy_hint() -> str:
+    """The next step when a download cannot reach its server: behind a proxy, the variables below are what XeStrata
+    (and pip, git) read."""
+    names = ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy")
+    if any(os.environ.get(n) for n in names):
+        return "; a proxy is set in this terminal (HTTPS_PROXY): check that it is the right one and that it is running"
+    return ("; behind a company or school proxy, set HTTPS_PROXY (for example HTTPS_PROXY=http://host:port) in this "
+            "terminal first")
+
+
 def ms_file(url: str):
     """(repo, path) when `url` is a Hugging Face file of a repository setup knows (HF_REVISIONS), else None."""
     m = HF_FILE.match(url)
@@ -538,6 +548,10 @@ MODELS: dict[str, dict[str, Any]] = {
     # same file for the sizes of three shards, and for those of four).  A RAM budget of the experts, the rest read
     # from the GGUF files in place; "about" gives the RAM that holds them all ("arena_gb" + UNSLOTH_RAM_LEFT_GB).
     # Not run here.  Images: the same base model and encoder
+    "UD-IQ1_M": {"about": "~1-bit (Unsloth Dynamic v3.1), the smallest download; on a PC with less than ~59 GB of RAM "
+                          "part of its experts are read from the SSD",
+                 "download_gb": 68.0, "ram_gb": 48, "arena_gb": 34.8, "families": ("unsloth",), "budget": True,
+                 "shards": 3, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00003.gguf", "vision": True},
     "UD-Q2_0": {"about": "2-bit (Unsloth Dynamic v3.1), experts a little larger than the GSQ-RCO IQ2_XS's; on a PC "
                          "with less than ~61 GB of RAM part of its experts are read from the SSD",
                 "download_gb": 70.5, "ram_gb": 48, "arena_gb": 37.4, "families": ("unsloth",), "budget": True,
@@ -629,6 +643,12 @@ MODELS: dict[str, dict[str, Any]] = {
 # LFS pointers, checked after the download (check_shards reads the other model files' directories; these are also
 # hashed once).
 UNSLOTH_V31_SHARDS = {
+    "Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf":
+        (10946618, "b0d883bb9464021f31074145af74bfc2aa2d4bf0cf506f26f6f5107f4ca6ce17"),
+    "Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf":
+        (39196009888, "bddcd79634ccddbb2e0951345c73c6ae8bd7b12594f55a2a529474701757391e"),
+    "Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf":
+        (28800138432, "05716382c280d999b81afff92b2d527fadbfd926ac225ffdc273f2d1d13331c6"),
     "Qwen3.8-Flash-Next-UD-Q2_0-00001-of-00003.gguf":
         (10946618, "38803c4e8d13077165aa9854502b3d4e7fef750e72a21d27a38ee42089f96ad6"),
     "Qwen3.8-Flash-Next-UD-Q2_0-00002-of-00003.gguf":
@@ -915,8 +935,8 @@ FAMILIES: dict[str, dict[str, Any]] = {
               "profile": "expert-profile-coder.bin"},
     # Unsloth's Dynamic v3.1 from 2 to 4 bits (UD-Q2_0 to the EXPERIMENTAL UD-Q4_K_XL) and the 5- to 8-bit files of
     # the original model; "shards", "experimental" and "vision" are per model (MODELS)
-    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "by": "Unsloth's Dynamic v3.1 quantizations",
-                "about": "2 to 4 bits (UD-Q2_0 to UD-Q4_K_XL, 71 to 111 GB downloads) and 5 to 8 bits; with too "
+    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "by": "Unsloth's 1- to 8-bit quantizations",
+                "about": "1 to 4 bits (UD-IQ1_M to UD-Q4_K_XL, 68 to 111 GB downloads) and 5 to 8 bits; with too "
                          "little RAM part of the experts are read from the SSD",
                 "hf": hf("unsloth/Qwen3.8-Flash-Next-GGUF") + "{q}/",
                 "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00004.gguf", "shards": 4, "tag": "unsloth-",
@@ -1588,6 +1608,9 @@ def ask(question, choices, default, yes, free=False):
 
 
 def run(cmd, cwd=None, env=None, check=True, quiet=False):
+    gguf_py = (env or {}).get("XESTRATA_GGUF_PY")
+    if gguf_py and not Path(gguf_py).is_dir() and Path(gguf_py).parent == ROOT / "third_party" / "main" / "llama.cpp":
+        get_llama_cpp()                                # the preparation tools read GGUF files with it: fetched now
     say("  > " + " ".join(str(c) for c in cmd))
     if JSON_OUT and not quiet:                         # the program's lines as log objects, not loose on stdout
         with subprocess.Popen([str(c) for c in cmd], cwd=cwd, env=env, stdout=subprocess.PIPE,
@@ -1600,7 +1623,7 @@ def run(cmd, cwd=None, env=None, check=True, quiet=False):
         return r
     r = subprocess.run([str(c) for c in cmd], cwd=cwd, env=env,
                        stdout=subprocess.PIPE if quiet else None, stderr=subprocess.STDOUT if quiet else None,
-                       text=True)
+                       text=True, errors="replace")
     env = dict(os.environ if env is None else env)
     envvars.put_default(env, "EXIT_WITH_PARENT", "1")   # mtp_fetch.py ends with setup (upstream #3257)
     if check and r.returncode != 0:
@@ -1631,23 +1654,60 @@ def fetch_mtp(mtp: Path, env: dict, tries: int = 3):
 
 def out(cmd):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=60).stdout
+        return subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=60).stdout
     except (OSError, subprocess.TimeoutExpired):
         return ""
 
 
+def _kept_mark(path: Path) -> Path | None:
+    """Where the finish mark of a file in a folder XeStrata cannot write to is kept instead: marks/<hash>.done under
+    the user's state folder.  The hash is of the file's full path, size and modification time, so a file that changed
+    (or a different file at the same place) has no mark."""
+    try:
+        st = path.stat()
+        key = f"{path.resolve()}|{st.st_size}|{st.st_mtime_ns}"
+    except OSError:
+        return None
+    return STATE / "marks" / (hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:24] + ".done")
+
+
+def mark_text(path: Path) -> str | None:
+    """The text of the finish mark of `path` (beside it, else the kept one), or None when it has none."""
+    for m in (path.with_name(path.name + ".done"), _kept_mark(path)):
+        try:
+            if m is not None and m.exists():
+                return m.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+    return None
+
+
 def done(path: Path) -> bool:
-    """A step's finish mark: <path>.done exists (written only after the step completed)."""
-    return path.with_name(path.name + ".done").exists()
+    """A step's finish mark: <path>.done beside it, or the kept one when its folder cannot be written (written only
+    after the step completed)."""
+    return mark_text(path) is not None
 
 
 def mark(path: Path, text=""):
-    """Write the finish mark.  A folder that cannot be written (--gguf-dir on a read-only share, upstream #570) only
-    costs the mark: setup says so and goes on (the step is repeated on the next run), it does not stop."""
+    """Write the finish mark.  A folder that cannot be written (--gguf-dir on a read-only share, upstream #570, a
+    read-only model disk) keeps the mark in XeStrata's own folder instead (state/marks), so a 110 GB model file is
+    hashed once, not on every launch; only when that cannot be written either does setup say so and go on (the step is
+    repeated on the next run), it does not stop."""
+    text = text or time.strftime("%Y-%m-%d %H:%M")
     try:
-        download_core.write_done(path, text or time.strftime("%Y-%m-%d %H:%M"))
+        download_core.write_done(path, text)
+        return
     except OSError as e:
-        warn(f"the finish mark of {path.name} cannot be written ({e}): the next run does this step again")
+        beside = e
+    kept = _kept_mark(path)
+    try:
+        if kept is not None:
+            kept.parent.mkdir(parents=True, exist_ok=True)
+            kept.write_text(text, encoding="utf-8")
+            return
+    except OSError:
+        pass
+    warn(f"the finish mark of {path.name} cannot be written ({beside}): the next run does this step again")
 
 
 # ------------------------------------------------------------------------------------------------ the PC
@@ -1860,7 +1920,8 @@ def nvidia_smi() -> dict:
         return {}
     try:
         r = subprocess.run([exe, "--query-gpu=pci.bus_id,name,memory.total,compute_cap",
-                            "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=60)
+                           "--format=csv,noheader,nounits"], capture_output=True, text=True,
+                           errors="replace", timeout=60)
     except (OSError, subprocess.SubprocessError):
         return {}
     found = {}
@@ -1930,6 +1991,18 @@ def unused_apu_notes(found, used, ram) -> list:
     return out
 
 
+def unused_card_notes(found, used) -> list:
+    """upstream 7aa9a584a: a card that can run alone but is not in this run is said, not asked - one line per card,
+    with the way to use it.  Nothing about the cards used changes; a chosen card (--gpu, --gpus) asks nothing."""
+    first = next((g for g in found if g["index"] in used), None)
+    if first is None or len(used) != 1:
+        return []                                       # a layer split names its cards already
+    return [f"  GPU {g['index']} ({g['name']}, {g['vram_gb']:.0f} GB) is not used: this model runs on GPU "
+            f"{first['index']} alone, and --gpus {first['index']},{g['index']} splits its layers across the two cards"
+            for g in found
+            if g["index"] not in used and not g.get("integrated") and gpu_problem(g) is None]
+
+
 def strix_halo_notes(gpu, ram) -> list:
     """What setup tells a Strix Halo owner (a leading "!" = a warning): nothing is changed or refused."""
     notes = [f"  Strix Halo (gfx1151, Ryzen AI Max): the CPU and the GPU share one memory ({ram:.0f} GB seen by the "
@@ -1967,7 +2040,7 @@ def rocm_lib_dirs() -> list:
     libamdhip64 (a distribution's, or a ROCm that installs an ld.so.conf); ROCm 7.14's packages install none, and the
     SYCL runtime's HIP adapter then did not load (no GPU listed) until its lib/ was on LD_LIBRARY_PATH."""
     try:
-        cached = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True).stdout
+        cached = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, errors="replace").stdout
     except OSError:
         cached = ""
     if "libamdhip64.so" in cached:
@@ -2182,7 +2255,7 @@ def pkg_installed(name: str) -> bool:
            ["pacman", "-T", name] if family == "arch" else
            ["dpkg-query", "-W", "-f", "${db:Status-Abbrev}", name])
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
     except OSError:
         return True                                    # no package manager to ask: nothing is said
     return r.returncode == 0 and (family in ("fedora", "arch") or r.stdout.startswith("ii"))
@@ -2206,7 +2279,7 @@ def amd_libs_loadable() -> bool:
     own packages (the Podman image's ROCm, container/install.sh) are not the distribution's that BUILD.json's runtime
     names."""
     try:
-        cached = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True).stdout
+        cached = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, errors="replace").stdout
     except OSError:
         return False
     return all(f"{lib}.so" in cached for lib in ("libamdhip64", "librocblas", "libhipblaslt"))
@@ -2255,7 +2328,7 @@ def igc_version() -> str | None:
     if WIN:
         return None
     try:
-        out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, timeout=30).stdout
+        out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, errors="replace", timeout=30).stdout
     except (OSError, subprocess.SubprocessError):
         return None
     for line in out.splitlines():
@@ -2274,7 +2347,7 @@ def level_zero_build() -> int | None:
     if WIN:
         return None
     try:
-        out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, timeout=30).stdout
+        out = subprocess.run(["ldconfig", "-p"], capture_output=True, text=True, errors="replace", timeout=30).stdout
     except (OSError, subprocess.SubprocessError):
         return None
     for line in out.splitlines():
@@ -2625,8 +2698,8 @@ def cuda_major(root: str) -> int | None:
         pass
     nvcc = Path(root) / "bin" / "nvcc"
     try:
-        out = subprocess.run([str(nvcc) if nvcc.exists() else "nvcc", "--version"], capture_output=True, text=True,
-                             timeout=30).stdout
+        out = subprocess.run([str(nvcc) if nvcc.exists() else "nvcc", "--version"], capture_output=True,
+                             text=True, errors="replace", timeout=30).stdout
     except (OSError, subprocess.SubprocessError):
         return None
     m = re.search(r"release (\d+)\.", out)
@@ -2774,7 +2847,8 @@ def rocm_missing() -> list:
     clang_ok = False
     for cxx in [str(c) for r in roots for c in (r / "llvm/bin/clang++", r / "lib/llvm/bin/clang++") if c.exists()] + \
             glob.glob("/usr/lib64/rocm/llvm/bin/clang++") + glob.glob("/usr/lib/llvm-*/bin/clang++"):
-        r = subprocess.run([cxx, "-print-libgcc-file-name", "--rtlib=compiler-rt"], capture_output=True, text=True)
+        r = subprocess.run([cxx, "-print-libgcc-file-name", "--rtlib=compiler-rt"], capture_output=True,
+                           text=True, errors="replace")
         clang_ok = clang_ok or (r.returncode == 0 and Path(r.stdout.strip()).is_file())
     # in the order of PACKAGES' AMD part
     have = [any((d / "hip" / "hip_runtime_api.h").exists() for d in inc),
@@ -3058,7 +3132,7 @@ CMAKE_MIN = (3, 24)                    # CMakeLists.txt: cmake_minimum_required(
 def _tool_version(path, name):
     """(ok, version tuple) of `path --version`: ok False when it does not run (a pip launcher whose Python is gone)."""
     try:
-        done = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30)
+        done = subprocess.run([path, "--version"], capture_output=True, text=True, errors="replace", timeout=30)
     except (OSError, subprocess.SubprocessError):
         return False, ()
     if done.returncode != 0:
@@ -3108,6 +3182,33 @@ def tool_usable(name):
 def free_gb(path):
     path.mkdir(parents=True, exist_ok=True)
     return shutil.disk_usage(path).free / 1e9
+
+
+def disk_room_problem(models_dir, pack_dir, other_gb, copy_gb, other_note="", free=None):
+    """None when the files this setup run still writes fit, else (message, hint).  `other_gb` is what goes to the model
+    folder (a download, the preparation, the picture files); `copy_gb` is the Q2_0 experts' pack, which is written to
+    the data folder's packs folder and not to the model folder (a refusal named the model folder although the bytes
+    belonged to the pack in the data folder).  The pack is measured where it goes; on one drive both add up."""
+    free = free or free_gb
+    packs = pack_dir.parent
+    free_models = free(models_dir)
+    models_problem = (f"not enough free disk space in {models_dir}: need ~{other_gb:.0f} GB, {free_models:.0f} GB free"
+                      + other_note, "use --models-dir on a bigger drive")
+    if free_models < other_gb:
+        return models_problem
+    if not copy_gb:
+        return None
+    free_packs = free(packs)
+    try:
+        same_drive = os.stat(models_dir).st_dev == os.stat(packs).st_dev
+    except OSError:
+        same_drive = False
+    needs = copy_gb + (other_gb if same_drive else 0)
+    if free_packs < needs:
+        return (f"not enough free disk space for the Q2_0 experts' pack in {pack_dir}: it needs about {needs:.0f} GB "
+                f"and {free_packs:.0f} GB are free there.",
+                "free some space, or move XeStrata's data folder to a bigger drive (--data-dir)")
+    return None
 
 
 # ------------------------------------------------------------------------------------------------ downloads
@@ -3538,15 +3639,50 @@ class StallNote:
                 "where it stopped")
 
 
+DL_PROBE_WAITS = (1.0, 3.0)                     # seconds before the 2nd and the 3rd range probe
+
+
+def _probe_retryable(exc: BaseException) -> bool:
+    """Is a failed range probe worth one more try?  A hiccup is (a timeout, a reset or dropped connection, a busy
+    server: 429/5xx); no internet is not (no DNS answer, no route, refused): that fails at once, with no wait."""
+    import errno
+    import socket
+    if isinstance(exc, urllib.error.HTTPError):
+        return exc.code in (429, 500, 502, 503, 504)
+    if isinstance(exc, urllib.error.URLError):
+        if not isinstance(exc.reason, BaseException):
+            return False
+        exc = exc.reason
+    if isinstance(exc, (socket.gaierror, ConnectionRefusedError)):
+        return False
+    if isinstance(exc, OSError) and exc.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN):
+        return False
+    return isinstance(exc, (TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError,
+                            BrokenPipeError, http.client.HTTPException))
+
+
+def _probe_ranges(src: "_Source", waits=DL_PROBE_WAITS, sleep=time.sleep) -> bool:
+    """The first range request of a parallel download, tried up to len(waits)+1 times when it fails by a hiccup: one
+    failed probe used to make a 50-100 GB download a single stream.  False: the server does not do ranges, or the probe
+    failed (the caller then reads one stream).  A file that changed raises _Changed, as before."""
+    for attempt in range(len(waits) + 1):
+        try:
+            src.resolve()
+            return True
+        except _NoRange:
+            return False
+        except (OSError, http.client.HTTPException) as exc:
+            if attempt >= len(waits) or not _probe_retryable(exc):
+                return False
+            sleep(waits[attempt])
+    return False
+
+
 def parallel_download(url: str, part: Path, total: int, label: str, conns: int, name: str) -> bool:
     """Fill `part` (total bytes) over `conns` ranged connections.  True when every byte is there; False when the server
     does not do ranges (the caller reads the file in one stream)."""
     src = _Source(url, total)
-    try:
-        src.resolve()
-    except _NoRange:
-        return False
-    except (OSError, http.client.HTTPException):
+    if not _probe_ranges(src):
         return False                                    # the one-stream path has its own retries and messages
     part.parent.mkdir(parents=True, exist_ok=True)
     _claim_part(part, url, src.etag)                    # a .part from another address or version is dropped here
@@ -3822,6 +3958,16 @@ def download_file(url, dst: Path, what=None):
     if dst.exists() and done(dst):
         ok(f"{what or dst.name} already downloaded")
         return
+    pin_here = file_pin(url) if url.startswith(("http://", "https://")) else None
+    if (pin_here and dst.is_file() and dst.stat().st_size == pin_here[0]
+            and not dst.with_name(dst.name + ".part").exists()):
+        # a file copied in by hand (or whose mark was lost) that is the pinned size: checked here, no network, so a PC
+        # with every file but no internet can start
+        say(f"  checking {dst.name} (SHA-256) ...")
+        if _hash_file(dst, pin_here[0]) == pin_here[1]:
+            mark(dst, f"sha256 {pin_here[1]}")
+            ok(f"{what or dst.name} is already here (checked)")
+            return
     if not url.startswith(("http://", "https://")):
         src = Path(url[7:] if url.startswith("file://") else url)
         if not src.exists():
@@ -3858,12 +4004,12 @@ def download_file(url, dst: Path, what=None):
                 continue
             if attempt == 4:
                 fail(f"cannot reach {url.split('/')[2]} ({e})",
-                     "check your internet connection and run it again" + source_hint(url))
+                     "check your internet connection and run it again" + proxy_hint() + source_hint(url))
             time.sleep(5)
         except OSError as e:
             if attempt == 4:
                 fail(f"cannot reach {url.split('/')[2]} ({e})",
-                     "check your internet connection and run it again" + source_hint(url))
+                     "check your internet connection and run it again" + proxy_hint() + source_hint(url))
             time.sleep(5)
     if not total:
         total = range_total(url)
@@ -3917,6 +4063,23 @@ def whole_shard(s: Path) -> bool:
         return False
 
 
+def mark_whole_unless_pinned(shards, hf: str | None, own: bool) -> None:
+    """#173's finish mark for a file copied in by hand (it has the length its own tensor directory says), except a file
+    with a pinned SHA-256 (#4088): a run that stopped between the rename of a finished .part and the end of
+    verify_sha256 leaves a full-length shard with no mark, and marking it "whole" made done() true, so download()
+    skipped it and the pinned hash was never looked at.  A file the pin table names is left unmarked: download() takes
+    its "finished by an older setup (no mark yet), or stopped before the check" path, hashes it and repairs it.
+    `own` is --gguf-dir: a person's own file is not a download and is not hash-checked here either way, so it keeps the
+    mark; so does a file the pin table does not name, and every file of a family with no Hugging Face folder of its own
+    (`hf` None: a family that downloads a file list, not shards)."""
+    for s in shards:
+        if not (s.exists() and not done(s) and whole_shard(s)):
+            continue
+        if not own and hf is not None and file_pin(hf + s.name) is not None:
+            continue
+        mark(s, "whole (checked against its own tensor directory)")
+
+
 SHARD_NAME = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
 
 
@@ -3947,8 +4110,12 @@ def gguf_dir_shards(folder: Path, fam: dict, model: str) -> list[Path]:
 GGUF_QUANT = re.compile(r"(?<![A-Za-z0-9])((?:UD-)?(?:I?Q\d+(?:_[A-Za-z0-9]+)*|BF16|F16|F32))"
                         r"(?=-\d{5}-of-\d{5}\.gguf$|\.gguf$)", re.I)
 SUPPORTED_GGUFS = ("XeStrata runs ISTA-DASLab's GSQ-RCO files (Qwen3.8-Flash-Next Q2_0, IQ2_XS, IQ3_XXS, IQ3_S; Swift "
-                   "1.5's; the Coder's IQ1_M) and Unsloth's (UD-Q2_0 to UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL, Q8_0) "
-                   "only: other GGUFs (K-quants of other makers) cannot be used")
+                   "1.5's; the Coder's IQ1_M) and Unsloth's (UD-IQ1_M, UD-Q2_0, UD-IQ2_XS, UD-Q2_K_XL, UD-IQ3_XXS, "
+                   "UD-Q3_K_XL, UD-IQ4_XS, UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL, Q8_0) only: other GGUFs (Unsloth's "
+                   "UD-IQ1_S, K-quants of other makers) cannot be used")
+# why a GGUF of a name XeStrata knows is still refused (said beside SUPPORTED_GGUFS)
+UNSUPPORTED_WHY = {"UD-IQ1_S": "UD-IQ1_S mixes two expert formats in one layer, which XeStrata cannot load; "
+                               "UD-IQ1_M is the 1-bit choice"}
 
 
 def gguf_unsupported(name: str) -> str | None:
@@ -3974,7 +4141,9 @@ def gguf_dir_problem(folder: Path, first: Path, fam: dict, model: str) -> tuple 
     folder without GGUFs stays check_shards' "missing")."""
     bad = gguf_unsupported(first.name) if first.exists() else None
     if bad:
-        return f"{first.name} is {bad}, a GGUF XeStrata cannot run", SUPPORTED_GGUFS
+        why = UNSUPPORTED_WHY.get(bad.upper())
+        return (f"{first.name} is {bad}, a GGUF XeStrata cannot run",
+                SUPPORTED_GGUFS + (".\n       " + why if why else ""))
     if first.exists():
         return None
 
@@ -3990,6 +4159,9 @@ def gguf_dir_problem(folder: Path, first: Path, fam: dict, model: str) -> tuple 
     hint = SUPPORTED_GGUFS
     if unusable:
         hint += ".\n       Not usable here: " + ", ".join(unusable)
+        for q in dict.fromkeys(gguf_unsupported(n) for n in unusable):
+            if q and q.upper() in UNSUPPORTED_WHY:
+                hint += ".\n       " + UNSUPPORTED_WHY[q.upper()]
     if usable:
         hint += ".\n       Usable here: " + ", ".join(f"--family {f} --model {m}" for f, m in usable)
     return f"{folder} has no {fam['title']} {model} file", hint
@@ -4062,12 +4234,18 @@ def custom_id(name: str) -> str:
     return "custom-" + slug
 
 
+# XeStrata's own draft layer (mtp-q2_0.gguf, tools/mtp_fetch.py) beside a model is not a second model (upstream
+# 788e37279, #4693)
+DRAFT_LAYER = re.compile(r"mtp[-_][a-z0-9_.-]*\.gguf")
+
+
 def model_firsts(folder: Path) -> list[Path]:
     """The models' first files in a folder: each .gguf that is not split or is the first shard of a split one, the
-    picture readers (mmproj*.gguf) aside."""
+    picture readers (mmproj*.gguf) and XeStrata's own draft layer aside."""
     def first(p: Path) -> bool:
         m = SHARD_NAME.search(p.name)
-        return not p.name.lower().startswith("mmproj") and (m is None or m.group(1) == "00001")
+        low = p.name.lower()
+        return not low.startswith("mmproj") and not DRAFT_LAYER.fullmatch(low) and (m is None or m.group(1) == "00001")
     return sorted(p for p in folder.glob("*.gguf") if first(p))
 
 
@@ -4267,17 +4445,6 @@ def alt_reader_places(models_dir, roots, gguf_dir) -> list:
     return places
 
 
-def _kept_mark(path: Path) -> Path | None:
-    """Where the hash of a file in the person's own folder is remembered: a mark under the state folder, never beside
-    their file.  The key is the file's real path, size and modification time, so a replaced file has none."""
-    try:
-        st = path.stat()
-        key = f"{path.resolve()}|{st.st_size}|{st.st_mtime_ns}"
-    except OSError:
-        return None
-    return STATE / "marks" / (hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:24] + ".done")
-
-
 def accepted_alt_reader(places):
     """The first file in `places` that is the alternative picture reader of the pinned one (name, size and SHA-256
     all as pinned in ALT_READERS), else None.  Anything else with that name is ignored: never deleted, never renamed.
@@ -4339,8 +4506,8 @@ def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None, 
     `repair` (a downloaded file's own re-reader, see repair_download): the wrong file is first compared with the server
     piece by piece and only the damaged pieces are written again, then it is checked a second time.  `other`: what the
     person can do instead when their own file (`own`) is not the published one."""
-    m = s.with_name(s.name + ".done")
-    if m.exists() and f"sha256 {sha}" in m.read_text(encoding="utf-8", errors="replace"):
+    kept = mark_text(s)
+    if kept is not None and f"sha256 {sha}" in kept:
         return
     have = s.stat().st_size if s.exists() else -1
     if have != size:
@@ -4365,8 +4532,11 @@ def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None, 
             fail(f"{s.name} does not match the published file (SHA-256 {digest}, expected {sha})",
                  "it may be damaged or another version; your file was left as it is. " +
                  (other or "Copy the whole published file into the folder"))
+        gone = _kept_mark(s)                           # keyed on the file's stat: taken before the file goes
         s.unlink(missing_ok=True)
-        m.unlink(missing_ok=True)
+        s.with_name(s.name + ".done").unlink(missing_ok=True)
+        if gone is not None:
+            gone.unlink(missing_ok=True)
         fail(f"{s.name} has the wrong SHA-256 ({digest}, expected {sha}): deleted",
              "run setup again to download it again")
     mark(s, f"sha256 {sha}")
@@ -4610,7 +4780,7 @@ def engine_tool(*args: str) -> str:
     """xestrata-device's output for `args` (--list-devices, --cpu): where setup has no sysfs or /proc to read (Windows),
     the engine reports the GPUs and the CPU itself."""
     exe = packaged_engine_dir() / ("xestrata-device.exe" if WIN else "xestrata-device")
-    r = subprocess.run([str(exe), *args], capture_output=True, text=True, timeout=120)
+    r = subprocess.run([str(exe), *args], capture_output=True, text=True, errors="replace", timeout=120)
     if r.returncode != 0:
         raise subprocess.SubprocessError((r.stderr or r.stdout).strip() or f"{exe.name} {' '.join(args)} failed")
     return r.stdout
@@ -4655,7 +4825,7 @@ def mkl_root() -> str | None:
 
 
 def compiler_version(cxx, env) -> str:
-    r = subprocess.run([str(cxx), "--version"], capture_output=True, text=True, env=env)
+    r = subprocess.run([str(cxx), "--version"], capture_output=True, text=True, errors="replace", env=env)
     lines = [x.strip() for x in r.stdout.splitlines()] or ["?"]
     # dpclang's first line ends "build based on:", the clang version is on the next
     return f"{lines[0]} {lines[1]}" if lines[0].endswith(":") and len(lines) > 1 else lines[0]
@@ -4674,7 +4844,7 @@ def new_enough(comp: dict) -> bool:
     """Whether the compiler is intel/llvm 7 or later: its SYCL runtime is libsycl 9 (the distribution's dpclang++ 6.2
     has libsycl 8, and gives the Arc Pro B70 no XMX)."""
     r = subprocess.run([comp["cxx"], "-fsycl", "-dM", "-E", "-x", "c++", "-"], input="#include <sycl/sycl.hpp>\n",
-                       capture_output=True, text=True, env=comp["env"])
+                       capture_output=True, text=True, errors="replace", env=comp["env"])
     m = re.search(r"#define __LIBSYCL_MAJOR_VERSION (\d+)", r.stdout)
     return m is not None and int(m.group(1)) >= 9
 
@@ -4740,11 +4910,11 @@ def probe_gpu(comp: dict, pci: str | None) -> dict | None:
     with tempfile.TemporaryDirectory() as d:
         exe = Path(d) / "xmx_probe"
         r = subprocess.run([comp["cxx"], "-fsycl", str(ROOT / "tools" / "xmx_probe.cpp"), "-o", str(exe)],
-                           capture_output=True, text=True, env=comp["env"])
+                           capture_output=True, text=True, errors="replace", env=comp["env"])
         if r.returncode != 0:
             warn(f"{Path(comp['cxx']).name} could not build the XMX probe: {(r.stderr or r.stdout).strip()[-300:]}")
             return None
-        r = subprocess.run([str(exe)], capture_output=True, text=True, env=comp["env"], timeout=120)
+        r = subprocess.run([str(exe)], capture_output=True, text=True, errors="replace", env=comp["env"], timeout=120)
     seen = {}
     for line in r.stdout.splitlines():
         f = dict(x.split("=", 1) for x in line.split(" name=")[0].split() if "=" in x)
@@ -5296,8 +5466,7 @@ def link_identical(dst: Path, sha: str, candidates: list, models_dir: Path) -> N
     if dst.exists():
         return
     for p in [*candidates, *Path(models_dir).glob("*/" + dst.name)]:
-        if p == dst or not p.exists() or not done(p) or f"sha256 {sha}" not in \
-                p.with_name(p.name + ".done").read_text(encoding="utf-8", errors="replace"):
+        if p == dst or not p.exists() or f"sha256 {sha}" not in (mark_text(p) or ""):
             continue
         try:
             dst.parent.mkdir(parents=True, exist_ok=True)
@@ -6473,6 +6642,27 @@ def calibration_targets(have: list, model: str | None, family: str | None) -> li
     return out
 
 
+def mmproj_beside(gguf_dir, name: str, size: int | None = None):
+    """The picture file a person's own GGUF folder (--gguf-dir) already has: in the folder itself, or in the folder
+    above it and that folder's models/ (a XeStrata data folder's layout: models/<size>/ shards, models/<picture file>).
+    The two outer places are taken only at the pinned size (`size`), so a half-copied file is fetched again and not
+    used.  None when there is none (upstream 434c6221b)."""
+    if not gguf_dir:
+        return None
+    base = Path(gguf_dir)
+    own = base / name
+    if own.is_file():
+        return own
+    for r in (base.parent, base.parent / "models"):
+        f = r / name
+        try:
+            if f.is_file() and (size is None or f.stat().st_size == size):
+                return f
+        except OSError:
+            continue
+    return None
+
+
 def find_in(roots: list, rel: str):
     """The first of roots/rel that exists."""
     for r in roots:
@@ -7057,7 +7247,7 @@ def mtp_corrupt(mtp: Path, env=None) -> bool:
     if not (mtp / "tensors").is_dir():
         return False
     r = subprocess.run([sys.executable, str(ROOT / "tools" / "mtp_fetch.py"), "verify", "--out", str(mtp)], env=env,
-                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
     return r.returncode == 3
 
 
@@ -7220,7 +7410,7 @@ def dotnet_has(kind: str) -> bool:
         return False
     try:
         listed = subprocess.run([dotnet, "--list-runtimes" if kind == "runtime" else "--list-sdks"],
-                                capture_output=True, text=True, timeout=30).stdout
+                                capture_output=True, text=True, errors="replace", timeout=30).stdout
     except (OSError, subprocess.SubprocessError):
         return False
     pattern = r"^Microsoft\.NETCore\.App (\d+)\." if kind == "runtime" else r"^(\d+)\."
@@ -8090,6 +8280,10 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     left = 0 if have else d["size"] / 1e9
     mm = fam.get("mmproj") if vision != "none" else None
     mmproj = models_dir / Path(mm["path"]).name if mm else None   # the picture reader, beside the model
+    if mm is not None and mmproj is not None and not mmproj.exists():
+        near = mmproj_beside(a.gguf_dir, mmproj.name, mm["size"])   # the person's own folder, or the one above it
+        if near is not None:
+            mmproj = near
     if mm is not None and mmproj is not None and not (mmproj.exists() and (done(mmproj) or own)):
         left += mm["size"] / 1e9
     if left and free_gb(models_dir) < left:
@@ -8120,9 +8314,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     if mm is not None and mmproj is not None:
         # the same file beside another size or the other family (Qwen3.5-9B's two share one): linked, not fetched
         # (only a copy whose finish mark holds the pinned SHA-256: GLM-5.3-Flash's is named mmproj-BF16.gguf too)
-        other = [p for p in Path(a.models_dir).glob("*/" + mmproj.name) if p != mmproj and done(p)
-                 and f"sha256 {mm['sha256']}" in p.with_name(p.name + ".done").read_text(encoding="utf-8",
-                                                                                         errors="replace")]
+        other = [p for p in Path(a.models_dir).glob("*/" + mmproj.name)
+                 if p != mmproj and f"sha256 {mm['sha256']}" in (mark_text(p) or "")]
         if other and not mmproj.exists() and not a.gguf_dir:
             try:
                 os.link(other[0], mmproj)
@@ -9245,6 +9438,8 @@ def main() -> int:
         if gpu.get("gfx") == STRIX_HALO_GFX and "uma_gb" in gpu:
             for line in strix_halo_notes(gpu, ram_gb()):
                 (warn if line.startswith("!") else say)(line.lstrip("!"))
+        for line in (unused_card_notes(found, set(sel)) if not gpu_chosen and not a.gpus else []):
+            say(line)
         for line in unused_apu_notes(found, set(sel), ram_gb()):
             (warn if line.startswith("!") else say)(line.lstrip("!"))
         for i in sel[1:]:                                  # --gpus: the later layers' cards
@@ -9615,12 +9810,10 @@ def main() -> int:
                 models_dir, shards = cand[0].parent, cand
                 ok(f"model files found in {models_dir}")
                 break
-    for s in shards:   # upstream #173: a whole file copied in by hand has no finish mark (75e6efeb7, 762e58b5b)
-        if not a.custom and s.exists() and not done(s) and whole_shard(s):
-            try:
-                mark(s, "whole (checked against its own tensor directory)")
-            except OSError as e:                       # a read-only folder (--gguf-dir on a share): still whole
-                warn(f"{s.name} is whole but its finish mark cannot be written ({e})")
+    # upstream #173: a whole file copied in by hand has no finish mark (75e6efeb7, 762e58b5b); a file with a pinned
+    # SHA-256 is left for download()'s hash (#4088)
+    hf_base = fam["hf"].format(q=model, d=fam.get("dirs", {}).get(model, model)) if fam.get("hf") else None
+    mark_whole_unless_pinned([] if a.custom else shards, hf_base, bool(a.gguf_dir))
     have_model = all(s.exists() and (done(s) or own) for s in shards)
     # upstream #425: a download that resumes needs room only for what is still missing - the finished shards and the
     # .part files already on the disk count
@@ -9633,12 +9826,14 @@ def main() -> int:
     mtp_have = find_in(roots, "mtp/rt/experts.bin") is not None
     q2_avx = model == "Q2_0" and avx512 and family == "qwen"
     margin = 2 if mtp_have else 8                      # working room: a guess, not bytes that will be written
-    real = to_fetch + (40 if q2_avx and not pack_bin else 0) + (1 if vision != "none" else 0)
+    copy_gb = 40 if q2_avx and not pack_bin else 0     # the Q2_0 experts' pack (goes to the data folder's packs)
+    real = to_fetch + copy_gb + (1 if vision != "none" else 0)
     need = real + margin
     free_now = free_gb(models_dir)
-    if free_now < real:                                # upstream 537f8fef8: stop only when the bytes do not fit
-        fail(f"not enough free disk space in {models_dir}: need ~{real:.0f} GB, {free_now:.0f} GB free",
-             "use --models-dir on a bigger drive")
+    if (problem := disk_room_problem(models_dir, pack_now, real - copy_gb, copy_gb,
+                                     f" ({on_disk:.0f} GB of the model is already there)" if on_disk >= 1
+                                     and not have_model else "")):   # upstream 537f8fef8: only when the bytes lack room
+        fail(*problem)
     if free_now < need:
         warn(f"little free disk space in {models_dir}: {free_now:.0f} GB free for about {real:.0f} GB of files. "
              "Setup goes on and should fit; free up space if it stops")
@@ -9696,9 +9891,17 @@ def main() -> int:
     if not mmproj.exists():
         mmproj = find_in(roots, f"models/{fam['mmproj']}") or mmproj
     if vision != "none":
-        alt_reader = accepted_alt_reader(alt_reader_places(a.models_dir, roots, a.gguf_dir)) \
-            if not mmproj.exists() and fam["mmproj"] == MMPROJ else None
-        if alt_reader is not None:                     # the person's own Unsloth F16 reader: no second download
+        pin = file_pin(fam["mmproj_hf"] + fam["mmproj"])
+        near = None if mmproj.exists() else mmproj_beside(
+            a.gguf_dir or (models_dir if own else None), fam["mmproj"], pin[0] if pin else None)
+        alt_reader = (accepted_alt_reader(alt_reader_places(a.models_dir, roots, a.gguf_dir))
+                      if near is None and not mmproj.exists() and fam["mmproj"] == MMPROJ else None)
+        if near is not None:                           # the person's own folder, or the one above it: used there
+            mmproj = near
+            if pin:
+                verify_sha256(mmproj, pin[0], pin[1], own=True)
+            ok(f"vision encoder: {mmproj}")
+        elif alt_reader is not None:                   # the person's own Unsloth F16 reader: no second download
             mmproj = alt_reader
             ok(f"vision encoder: {mmproj} (Unsloth's mmproj-F16.gguf, SHA-256 checked)")
         else:

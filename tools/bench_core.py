@@ -44,6 +44,73 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))
 WIN = os.name == "nt"
 
+# ---- Windows: the tree a run starts ends through a job object (upstream 8431dde5d, #4260)
+# Windows has no process group to signal: the run's tree used to be ended with `taskkill /T`, which Windows refused
+# ("Access is denied") for a tree this very user started, and the engine then kept the GPU for the next run.  A job
+# object this process owns ends every process in it in one call, which cannot be refused for one member; it is made
+# kill-on-close, so a bench that dies takes its engines with it.  Elsewhere, and when the job cannot be made, nothing
+# changes.
+if WIN:
+    import ctypes
+    from ctypes import wintypes
+
+    class _BasicLimits(ctypes.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", ctypes.c_longlong), ("PerJobUserTimeLimit", ctypes.c_longlong),
+                    ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD)]
+
+    class _IoCounters(ctypes.Structure):
+        _fields_ = [(n, ctypes.c_ulonglong) for n in ("ReadOperationCount", "WriteOperationCount",
+                                                      "OtherOperationCount", "ReadTransferCount",
+                                                      "WriteTransferCount", "OtherTransferCount")]
+
+    class _ExtendedLimits(ctypes.Structure):
+        _fields_ = [("BasicLimitInformation", _BasicLimits), ("IoInfo", _IoCounters),
+                    ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+    _KILL_ON_JOB_CLOSE, _EXTENDED_LIMITS = 0x2000, 9
+    _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _k32.CreateJobObjectW.restype = wintypes.HANDLE
+    _k32.CreateJobObjectW.argtypes = (wintypes.LPVOID, wintypes.LPCWSTR)
+    _k32.SetInformationJobObject.argtypes = (wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD)
+    _k32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    _k32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+
+    def _make_job() -> int:
+        job = _k32.CreateJobObjectW(None, None)       # no security attributes: the handle is not inherited
+        if not job:
+            return 0
+        info = _ExtendedLimits()
+        info.BasicLimitInformation.LimitFlags = _KILL_ON_JOB_CLOSE
+        if not _k32.SetInformationJobObject(job, _EXTENDED_LIMITS, ctypes.byref(info), ctypes.sizeof(info)):
+            _k32.CloseHandle(job)
+            return 0
+        return job
+
+    _JOB = _make_job()                                # one for the run: every child of this bench is in it
+else:
+    _JOB = 0
+
+
+def contain(proc) -> bool:
+    """Put a started process in the run's job, so the run can end it and what it starts in one call that cannot be
+    refused for one member.  False: no job (not Windows, or it could not be made)."""
+    if not _JOB or proc is None:
+        return False
+    try:
+        return bool(_k32.AssignProcessToJobObject(_JOB, int(proc._handle)))
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def end_job() -> bool:
+    """End every process in the run's job now.  False: no job."""
+    return bool(_JOB) and bool(_k32.TerminateJobObject(_JOB, 1))
+
+
 CORPUS = ROOT / "data" / "bench-corpus.json.xz"
 COMMIT = "58dbbe5"
 # the token counts of upstream's code-agent prompts (its bench/results/2026-09-29-speed-0126/matrix.json; 262K: the
@@ -646,6 +713,7 @@ def run_usage(e: Engine, cfg: dict, seed: int, agent_files: list[str], stem: Pat
         "start_new_session": True}
     srv = subprocess.Popen(cmd, cwd=e.root, env=e.env, stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                            **group)
+    contain(srv)                               # the run's job owns the tree it starts (Windows; upstream 8431dde5d)
     turns, why = [], None
     try:
         end = time.monotonic() + 900
@@ -678,9 +746,15 @@ def run_usage(e: Engine, cfg: dict, seed: int, agent_files: list[str], stem: Pat
     finally:
         try:
             if WIN:                            # the whole tree at once, as setup's end_process_group (#48)
-                subprocess.run(["taskkill", "/PID", str(srv.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL, timeout=60)
-                srv.wait()
+                end_job()                      # upstream 8431dde5d: the job ends the tree, and cannot be refused
+                try:
+                    srv.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+                if srv.poll() is None:         # no job, or it did not take the tree: taskkill of the tree, then it
+                    subprocess.run(["taskkill", "/PID", str(srv.pid), "/T", "/F"], stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, timeout=60)
+                    srv.wait()
             else:
                 try:
                     os.killpg(srv.pid, signal.SIGTERM)

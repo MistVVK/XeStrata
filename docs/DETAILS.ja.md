@@ -239,13 +239,14 @@ UkisAI による Qwen3.8-Flash-Next のファインチューンで、ずっと�
 ./setup.sh --setup --family swift --model IQ2_XS
 ```
 
-### Unsloth の Dynamic v3.1（UD-Q2_0〜UD-IQ4_XS）
+### Unsloth の Dynamic v3.1（UD-IQ1_M〜UD-IQ4_XS）
 
-**[Unsloth の Dynamic v3.1](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)**（2026-11-04）は、元のモデルの 2〜4 ビットの版です（upstream #621 の UD-IQ4_XS もこの版に替わりました）。
+**[Unsloth の Dynamic v3.1](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)**（2026-11-04）は、元のモデルの 1〜4 ビットの版です（upstream #621 の UD-IQ4_XS もこの版に替わりました）。
 エキスパートの gate・up は IQ2_XXS〜IQ4_XS、down は Q2_0・IQ4_NL・Q5_0 で、n-gram の表は最後のシャード（IQ4_NL）にあります。
 
 | 大きさ | ダウンロード | エキスパート | すべて RAM に入る RAM |
 | --- | ---: | ---: | ---: |
+| UD-IQ1_M | 68.0 GB | 34.8 GB | 約 59 GB |
 | UD-Q2_0 | 70.5 GB | 37.4 GB | 約 61 GB |
 | UD-IQ2_XS | 75.8 GB | 42.3 GB | 約 66 GB |
 | UD-Q2_K_XL | 79.6 GB | 46.0 GB | 約 70 GB |
@@ -758,6 +759,23 @@ Hugging Face のミラーから取るなら、`HF_ENDPOINT` を設定します�
 setup がダウンロードするモデルのファイルは、どれも大きさと SHA-256 を固定しています（upstream e193161de）。
 サーバーの大きさが固定したものと違えばダウンロードの前に止まり、ダウンロードしたファイルが SHA-256 と合わなければ消して止まります。
 固定したリビジョンがリポジトリから消えていれば止まります（試験のために `XESTRATA_ALLOW_UNPINNED=1` を設定すると、確かめずにいまのファイルを取ります）。
+
+**自分で取る（`hf` コマンド）**: setup のダウンロードは 16 本の接続（`XESTRATA_DL_CONNECTIONS` 1〜32）で行い、止まったところから続け、どのファイルも固定した SHA-256 と照らします。
+upstream が 2 台（家庭の PC と中国のサーバー）で測った匿名のダウンロードは、Hugging Face から接続の数によらず 16〜19 MB/s でした（1 本 7、16 本 17、32 本 19）。
+Hugging Face の `hf` コマンド（Xet）は同じ試験で匿名 16〜24 MB/s で、それ自体が速いわけではありません。
+Hugging Face は IP ごとに匿名の要求を制限していて、ログイン（自分のアカウントのトークン）で上限が上がると言っています。
+遅いときは `hf` で取って `--gguf-dir` で渡せます:
+
+```bash
+uvx hf auth login            # 任意: 自分の Hugging Face のアカウント（XeStrata はこのトークンを読みも送りもしない）
+uvx hf download agentionai/Qwen3.8-Flash-Next-Gyro-GGUF Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf \
+    --revision 1ada08422e404aca51ab9df665f089f34c419c6b --local-dir /data/gyro-s
+./setup.sh --gguf-dir /data/gyro-s       # Windows: xestrata-cli --gguf-dir D:\gyro-s
+```
+
+ファイルの名前とリビジョンは、setup がそのモデルに示すものを使ってください（上のリビジョンはこの版が Gyro-S に固定しているもので、別の版は別のものを固定します）。
+ファイルは元の名前のまま置きます。setup は `--gguf-dir` のファイルを見つけ、SHA-256 を照らし、取り直しません。公開されているものと合わないファイルは言って止まり、自分のフォルダーのファイルは消しません。
+`uvx` が無ければ `pip install -U huggingface_hub` で同じ `hf` が入ります。
 
 **ModelScope から**（中国本土、upstream #908）: setup がダウンロードするリポジトリ（GSQ-RCO のモデル、Swift 1.5、Coder、Unsloth のファイル、MTP の下書きの層を取る元のチェックポイント）は、どれも [ModelScope](https://www.modelscope.cn) に同じ名前・同じファイルであります。
 setup は自分では切り替えません（ダウンロードに失敗したときに案内します）。
@@ -2167,7 +2185,7 @@ Web の「情報」の「モデルの規約」のタブには、今動かして�
   Coder は [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)
   （カードによれば Apache-2.0）で、Strata での対応は @pjgmobile の PR #54 によるものです。
   Swift 1.5 は UkisAI の [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)。
-  UD-Q2_0〜UD-Q4_K_XL（Dynamic v3.1）、UD-Q5_K_XL、UD-Q6_K_XL、Q8_0 は Unsloth の [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)。
+  UD-IQ1_M〜UD-Q4_K_XL（Dynamic v3.1）、UD-Q5_K_XL、UD-Q6_K_XL、Q8_0 は Unsloth の [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)。
   Gyro は agentionai の [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)、
   Gyro-Coder は同じく [agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)。
   abliterated 版は huihui-ai の [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)、

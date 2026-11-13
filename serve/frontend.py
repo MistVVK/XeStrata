@@ -1020,6 +1020,11 @@ FUNC_END = "</function>"
 # #3441: the opener a model writes when it drifts by a token inside the envelope the template documents:
 # `<=NAME>` (the word `function` dropped), `<function:NAME>`, `<function =NAME>`, or the bare `<NAME>`
 _LOOSE_OPEN = re.compile(r"<\s*(?:function\s*[=:]\s*|=\s*)?([A-Za-z0-9_.\-]+)\s*>")
+# #5409: `<function=tools actio>` / `<function=tools>`; the prefixes are the ones of #4751
+_PREFIX_SPACED = re.compile(r"(<function=\s*(?:tools|functions|default_api)[ \t]+)([^<>\s]+)\s*>")
+_PREFIX_PART = re.compile(r"<function=\s*(?:tools|functions|default_api)[ \t]+[^<>\s]{0,80}\s*$")
+_PREFIX_BARE = re.compile(r"(<tool_call>\s*)<function=\s*(tools|functions|default_api)\s*>(.*?)</function>", re.S)
+_PREFIX_BARE_OPEN = re.compile(r"<tool_call>\s*<function=\s*(tools|functions|default_api)\s*>(?!.*</function>)", re.S)
 _LOOSE_PART = re.compile(r"<\s*(?:function[ \t]*[=:]?\s*|=\s*)?[A-Za-z0-9_.\-]*\s*$")
 
 
@@ -2115,8 +2120,56 @@ class OutputParser:
                 start = text.find(tag[0], start + 1)
         return best
 
+    def _prefixed(self) -> str | None:
+        """#5409: a call written `<function=tools NAME>` (a space for the dot of `tools.NAME`) is the call NAME, and one
+        written `<function=tools>` (the bare prefix) is the one declared tool that takes the call's parameters (with
+        tool_call_recovery).  Rewrites the complete ones in self.buf and returns the tail of a call still arriving
+        (held back by feed), else None.  Only a declared name is ever the result; with none, or with two that fit, the
+        text is left as it was."""
+        buf = self.buf
+        if "<function=" not in buf:
+            return None
+
+        def spaced(m):
+            name = m.group(2).strip()
+            return f"<function={name}>" if name in self.schemas else m.group(0)
+        buf = _PREFIX_SPACED.sub(spaced, buf)
+        held = None
+        m = _PREFIX_PART.search(buf)
+        if m:
+            held, buf = buf[m.start():], buf[:m.start()]
+        if self.recover:
+            def bare(m):
+                tool = None if m.group(2) in self.schemas else self._tool_by_params(
+                    re.findall(r"<parameter=\s*([^<>\s]+?)\s*>", m.group(3)))
+                return f"{m.group(1)}<function={tool}>{m.group(3)}</function>" if tool else m.group(0)
+            buf = _PREFIX_BARE.sub(bare, buf)
+            m = _PREFIX_BARE_OPEN.search(buf)
+            if m and m.group(1) not in self.schemas and held is None and len(buf) - m.start() <= RCALL_MAX:
+                held, buf = buf[m.start():], buf[:m.start()]
+        self.buf = buf
+        return held
+
+    def _tool_by_params(self, names: list[str]) -> str | None:
+        """The one declared tool whose properties hold every one of `names` and whose required parameters are all in
+        them."""
+        found = []
+        for tname, schema in self.schemas.items():
+            params = (schema or {}).get("parameters") or {}
+            props = params.get("properties") or {}
+            if names and all(n in props for n in names) and all(r in names for r in params.get("required") or []):
+                found.append(tname)
+        return found[0] if len(found) == 1 else None
+
     def feed(self, delta: str) -> list[Event]:
         self.buf += delta
+        held = self._prefixed() if self.schemas else None
+        out = self._feed()
+        if held:
+            self.buf += held
+        return out
+
+    def _feed(self) -> list[Event]:
         out: list[Event] = []
         while True:
             if self.state == "rcall":

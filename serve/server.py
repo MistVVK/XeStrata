@@ -112,9 +112,10 @@ IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
 
 
-def listen_problem(host: str, port: int, e: OSError) -> str:
+def listen_problem(host: str, port: int, e: OSError, windows: bool = os.name == "nt") -> str:
     """#769: why the server cannot listen.  Only an address that is taken says "already in use"; anything else (a port
-    Windows keeps reserved, an address this PC does not have, no permission) says what the OS said."""
+    Windows keeps reserved, an address this PC does not have, no permission) says what the OS said.  `windows`: the
+    system this sentence is for (the tests give both)."""
     import errno
     code = getattr(e, "winerror", None) or e.errno
     if code in (errno.EADDRINUSE, 10048):
@@ -122,8 +123,12 @@ def listen_problem(host: str, port: int, e: OSError) -> str:
                 f"Close it, or start this one with a different --port")
     what = e.strerror or str(e)
     if code in (10013, errno.EACCES):
-        hint = ("Windows may keep this port for itself (see `netsh int ipv4 show excludedportrange protocol=tcp`) "
-                "or a firewall rule forbids it: start this one with a different --port")
+        if windows:              # Windows keeps whole ranges of ports for Hyper-V, WSL and Docker (upstream 8768e95f)
+            hint = ("Windows may keep this port for itself (see `netsh int ipv4 show excludedportrange protocol=tcp`) "
+                    "or a firewall rule forbids it: start this one with a different --port")
+        else:                    # Linux and macOS keep none of them: below 1024 is where a privilege is needed
+            hint = (f"this system does not let XeStrata use port {port}: on Linux and macOS, ports below 1024 need "
+                    "administrator rights. Start this one with a different --port, for example 8801")
     elif code in (10049, errno.EADDRNOTAVAIL):
         hint = f"{host} is not an address of this PC: check \"host\" in the model's xestrata-<model>.json or --host"
     else:
@@ -1063,9 +1068,11 @@ class StrataEngine:
             pin["pass_fds"] = tuple(fds)
         spawned_at = time.monotonic()
         try:
+            # errors="replace" (upstream b3c633868): a byte that is not UTF-8 on the engine's stdout (a Windows console
+            # code page, a path in another encoding) ended the reader thread, and with it every reply
             self.proc = popen("the XeStrata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
-                              stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", bufsize=1, env=env,
-                              **pin)
+                              stdout=subprocess.PIPE, stderr=self.log, text=True, encoding="utf-8", errors="replace",
+                              bufsize=1, env=env, **pin)
         except OSError:                                  # nothing started: the narrator stops, the log handle goes back
             loading.set()
             if log and not isinstance(self.log, int):
@@ -3020,9 +3027,10 @@ class Vision:
         since = vision_log_size(log)               # this start's own lines of a log that earlier starts wrote too
         # cwd is the encoder's directory: the ENC lines name the files relative to it (#480: no space in the line)
         try:
+            # errors="replace": a byte that is not UTF-8 must not end the reader either (upstream b3c633868)
             self.proc = popen("the image encoder", args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                              stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1, env=env,
-                              cwd=self.dir)
+                              stderr=log or subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+                              bufsize=1, env=env, cwd=self.dir)
         except OSError as e:
             # the reason later pictures get too (they got "the picture reader is not running"): a reader that is not
             # there (a config written for another install, a package that lost it) with its path and the cure
@@ -5858,6 +5866,9 @@ class Service:
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
         raw_ids: list = []                              # every generated id (XESTRATA_DEBUG: dump raw model text)
+        # upstream b3c633868 (#3040): the engine's batch slots refused the request before it read anything, so its
+        # row is an error and no completed request
+        admission_rejected = False
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
         if emb and img_keys:
@@ -6281,6 +6292,15 @@ class Service:
                               f"{run_len} times in a row: ended as \"length\" (repeat_stop_tokens in "
                               "xestrata-<model>.json; 0 turns this off). If a new request with a short prompt does the "
                               "same, restart the server and report it (#606)", flush=True)
+                except GpuBusy:
+                    # upstream b3c633868 (#3040): a batch engine can use up its BGEN refusals before this request has
+                    # been admitted.  The monitor keeps an error row, but it is not a completed generation: no prompt
+                    # tokens and no part in the totals or the latencies.  A continuation after native work (a
+                    # reasoning-budget pass) keeps the earlier accounting.
+                    if not segments and n == 0:
+                        admission_rejected = True
+                        finish = "error"
+                    raise
                 except GeneratorExit:                   # the client disconnected mid-stream
                     finish = "disconnect"
                     raise
@@ -6299,7 +6319,8 @@ class Service:
                             routed = (last.get("lookups") or 0) + (last.get("offloaded") or 0)
                             pcie_share = round(last["offloaded"] / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
-                            seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
+                            # #471: < len(ids) when cancelled mid-read; a refused admission read nothing (b3c633868)
+                            seen = 0 if admission_rejected else prompt_tokens_seen(len(ids), last)
                             self.history.append({
                                 "projection": (sampling or {}).get("experimental_speed_projection") is not False
                                 if loaded else None,
@@ -6319,22 +6340,24 @@ class Service:
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
                                 "drafts_accepted": last.get("drafts_accepted")})
-                            tot = self.totals
-                            tot["requests"] += 1
-                            tot["prompt_tokens"] += seen
-                            tot["reused"] += last.get("reused") or 0
-                            tot["output_tokens"] += n
-                            tot["prompt_ms"] += last.get("prompt_ms") or 0.0
-                            tot["decode_ms"] += last.get("decode_ms") or 0.0
-                            tot["drafts_offered"] += last.get("drafts_offered") or 0
-                            tot["drafts_accepted"] += last.get("drafts_accepted") or 0
-                            ft0 = st.get("first_token")             # this request's own (#465: one per request)
-                            self.latencies.observe(ft0 - started if ft0 else None, n,
-                                                   (last.get("decode_ms") or 0.0) / 1000, time.time() - started)
-                            fresh = getattr(self.engine, "last", None)
-                            if fresh is not None and fresh is not before:      # the engine's clock for THIS request
-                                timings = request_timings(seen, n, last)
-                                self.last_timings = dict(timings, at=int(time.time())) if timings else None
+                            # upstream b3c633868: a refused admission did no work, so it is in no total or latency
+                            if not admission_rejected:
+                                tot = self.totals
+                                tot["requests"] += 1
+                                tot["prompt_tokens"] += seen
+                                tot["reused"] += last.get("reused") or 0
+                                tot["output_tokens"] += n
+                                tot["prompt_ms"] += last.get("prompt_ms") or 0.0
+                                tot["decode_ms"] += last.get("decode_ms") or 0.0
+                                tot["drafts_offered"] += last.get("drafts_offered") or 0
+                                tot["drafts_accepted"] += last.get("drafts_accepted") or 0
+                                ft0 = st.get("first_token")             # this request's own (#465: one per request)
+                                self.latencies.observe(ft0 - started if ft0 else None, n,
+                                                       (last.get("decode_ms") or 0.0) / 1000, time.time() - started)
+                                fresh = getattr(self.engine, "last", None)
+                                if fresh is not None and fresh is not before:      # the engine's clock for THIS request
+                                    timings = request_timings(seen, n, last)
+                                    self.last_timings = dict(timings, at=int(time.time())) if timings else None
                             self.last_request_at = time.time()
                             now = time.time()
                             el = now - st.get("started", now)
@@ -11474,6 +11497,17 @@ def tool_call_recovery_setting(cfg: dict) -> bool:
 
 
 def main() -> int:
+    """The server.  Its console output goes through a bounded queue (serve/nonblocking_out.py, upstream b776e1cd0): a
+    console that stops taking output must not hold a request's turn, a cancel or an admission.
+    XESTRATA_BLOCKING_CONSOLE=1 turns it off (testers)."""
+    if envvars.get("BLOCKING_CONSOLE") == "1":
+        return _main()
+    from serve.nonblocking_out import decoupled_console
+    with decoupled_console():
+        return _main()
+
+
+def _main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--engine", choices=["mock", "xestrata", "strata"], default="mock")   # strata: upstream's name
     ap.add_argument("--config", help="xestrata engine config (JSON: exe, args, cwd, tokenizer, model_name), "
