@@ -388,7 +388,7 @@ NVIDIA の GPU では contrib-llvm のビルドで同じカーネルが動きま
   upstream の測定では、BF16 の表と比べた行ごとの平均誤差は Q8_0 0.53%、FP8 2.64%、Q5_1 3.78%、Q5_0 4.25%、IQ4_NL 7.60%、Q4_0 8.55% です。
 - ネイティブのエキスパートの Q4_0、Q4_1、Q5_0、Q6_K の gate/up の GPU カーネル。CPU のエキスパートの AVX-2 の i-quant と Q2_0 のカーネル。
 - 検証の窓と prefill の経路で起動の数を減らすカーネルの融合（#783 ほか）。
-- `XESTRATA_PREFILL_CPU_SHARE=auto`（既定）: 短いチャンクで、ほとんど選ばれないエキスパートを空いている CPU のプールで計算します。
+- `XESTRATA_PREFILL_CPU_SHARE`（既定は `auto` でプロンプトごとに測ります。0 ですべて GPU）: 短いチャンクで、ほとんど選ばれないエキスパートを空いている CPU のプールで計算します。
 - `--kv-grow`: K/V は要求が届いたセルの分だけ VRAM を取り、残りをエキスパートのキャッシュが使います。
   デバイスの仮想メモリの対応づけの粒度が 2 MiB 以上なら既定で有効です（RTX 4070 は有効、B70 は 64 KiB で無効）。
 - `--adapt-async`（常駐モードの既定）、`--batch-mtp`（`--batch` と `--mtp` のときの既定）、`--pipeline-windows`（Xe2 の GPU 2 枚の分割では既定、ほかは opt-in、[MULTIGPU](MULTIGPU.ja.md)）、`--lookup-chain`（opt-in）。
