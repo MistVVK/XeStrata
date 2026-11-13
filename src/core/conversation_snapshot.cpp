@@ -258,6 +258,21 @@ bool transfer(void* dst, const void* src, size_t n, std::string& error) {
     error = std::string("conversation snapshot copy: ") + strata::gpu::last_error();
     return false;
 }
+
+// One endpoint is a ConversationBuffer (ordinary host memory), the other is a state pool.  Do not infer that an
+// unknown pointer is host memory: virtual device allocations need not be reported as USM.  A host USM pool can be
+// copied by the CPU after the compute queue is drained, preserving transfer's ordering without using a copy engine.
+bool transfer_host(void* dst, const void* src, const void* pool, size_t n, std::string& error) {
+    if (!n) return true;
+    if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
+    if (!strata::gpu::is_host_usm(pool)) return transfer(dst, src, n, error);
+    if (!strata::gpu::stream_sync(nullptr)) {
+        error = std::string("conversation snapshot copy: ") + strata::gpu::last_error();
+        return false;
+    }
+    std::memcpy(dst, src, n);
+    return true;
+}
 } // namespace
 
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
@@ -336,7 +351,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
                 } else {
                     dst[i]->resize(sizes[i]);
                     if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
-                            return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
+                            return transfer_host(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, src[i], n, error);
                         })) return false;
                 }
                 if (reused_bytes) *reused_bytes += keep;
@@ -357,7 +372,7 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         const auto t2 = tick();
         const bool copied = dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
                 const uint8_t* s = src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr;
-                if (!staged) return transfer(p, s, n, error);
+                if (!staged) return transfer_host(p, s, src[i], n, error);
                 if (!strata::gpu::copy_async(a.stage + a.used, s, n, a.stream)) {
                     error = std::string("conversation snapshot stage copy: ") + strata::gpu::last_error();
                     return false;
@@ -431,7 +446,7 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
     } else {
         for (size_t i = 0; i < src.size(); ++i)
             if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
-                    return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+                    return transfer_host(static_cast<uint8_t*>(dst[i]) + at, p, dst[i], n, error);
                 })) return false;
     }
     // VRAM slots still contain the outgoing conversation. Resolve must refill
@@ -470,7 +485,7 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
     auto why = std::make_shared<std::string>();
     s.read = [src, sizes, why](size_t part, size_t offset, void* dst, size_t n) {
         if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) { *why = "K/V read out of range"; return false; }
-        return transfer(dst, src[part] ? static_cast<const uint8_t*>(src[part]) + offset : nullptr, n, *why);
+        return transfer_host(dst, src[part] ? static_cast<const uint8_t*>(src[part]) + offset : nullptr, src[part], n, *why);
     };
     s.error = [why] { return *why; };
     out = std::move(s);
@@ -486,7 +501,7 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
     auto compare = [&](const void* device, const uint8_t* expected, size_t bytes, bool include_hash) {
         for (size_t offset = 0; offset < bytes;) {
             const size_t n = std::min(buffer.size(), bytes - offset);
-            if (!transfer(buffer.data(), static_cast<const uint8_t*>(device) + offset, n, error)) return false;
+            if (!transfer_host(buffer.data(), static_cast<const uint8_t*>(device) + offset, device, n, error)) return false;
             if (std::memcmp(buffer.data(), expected + offset, n) != 0) {
                 error = "conversation snapshot: restored K/V bytes differ";
                 return false;
