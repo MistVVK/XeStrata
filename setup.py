@@ -1379,6 +1379,13 @@ for _t in translate_mod.MODELS.values():
     REPO_PINS.setdefault(_t.repo, {})[_t.file] = TRANSLATE_FILES[_t.file]
 
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
+# A picture reader the person may already have instead of the pinned one: Unsloth's mmproj-F16.gguf for Flash-Next
+# (the same vision tower in F16; the engine runs its F16 mode - nothing changes on the engine side).  Accepted only
+# when it is already there, with this size and this SHA-256 (Unsloth rev 38bb39ee97821de2c9009abb7e93950eec396e66),
+# and only when the pinned file is found nowhere: pinned name -> (file name, bytes, sha256).  Never downloaded.
+ALT_READERS = {MMPROJ: ("mmproj-F16.gguf", 904004000,
+                        "1f7b7f0b984cf065c604360c29c8098362ed61b290db0ff12c6f360bb1a8a980")}
+_ALT_MARK = re.compile(r"alt-reader sha256 ([0-9a-f]{64})")
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
 # under the Qwen Community License, so in third_party/nonfree (XeStrata runs without that folder)
 ESP_VECTOR = (ROOT / "third_party" / "nonfree" / "experimental-speed-projection" /
@@ -4244,6 +4251,71 @@ def check_model(exe: Path, lib_dirs: list, gguf: Path) -> dict:
         fail(f"XeStrata cannot run {gguf.name}:\n       " + "\n       ".join(why[:8]) +
              (f"\n       ({len(why) - 8} more)" if len(why) > 8 else ""))
     return got
+
+
+def alt_reader_places(models_dir, roots, gguf_dir) -> list:
+    """Where an alternative picture reader is looked for: the same places as the pinned one (the data folder's models/,
+    an earlier install's models/, and the person's own GGUF folder: beside the shards, the folder above and that
+    folder's models/)."""
+    alt = ALT_READERS.get(MMPROJ)
+    if alt is None:
+        return []
+    places = [Path(models_dir) / alt[0]] + [Path(r) / "models" / alt[0] for r in roots or []]
+    if gguf_dir:
+        base = Path(gguf_dir)
+        places += [base / alt[0], base.parent / alt[0], base.parent / "models" / alt[0]]
+    return places
+
+
+def _kept_mark(path: Path) -> Path | None:
+    """Where the hash of a file in the person's own folder is remembered: a mark under the state folder, never beside
+    their file.  The key is the file's real path, size and modification time, so a replaced file has none."""
+    try:
+        st = path.stat()
+        key = f"{path.resolve()}|{st.st_size}|{st.st_mtime_ns}"
+    except OSError:
+        return None
+    return STATE / "marks" / (hashlib.sha1(key.encode("utf-8", "replace")).hexdigest()[:24] + ".done")
+
+
+def accepted_alt_reader(places):
+    """The first file in `places` that is the alternative picture reader of the pinned one (name, size and SHA-256
+    all as pinned in ALT_READERS), else None.  Anything else with that name is ignored: never deleted, never renamed.
+    The SHA-256 (0.9 GB, a few seconds) is remembered in a mark in the state folder, never beside the person's file,
+    keyed by the real path, size and modification time, so a replaced file is hashed again."""
+    alt = ALT_READERS.get(MMPROJ)
+    if alt is None:
+        return None
+    name, size, sha = alt
+    for p in places:
+        p = Path(p)
+        try:
+            if p.name != name or not p.is_file() or p.stat().st_size != size:
+                continue                               # absent, another name or another size: ignored as before
+        except OSError:
+            continue
+        kept = _kept_mark(p)
+        digest = None
+        try:
+            found = (_ALT_MARK.match(kept.read_text(encoding="utf-8", errors="replace"))
+                     if kept is not None and kept.exists() else None)
+            digest = found.group(1) if found else None
+        except OSError:
+            digest = None
+        if digest is None:
+            say(f"  checking {p.name} (SHA-256, {size / 1e9:.1f} GB) ...")
+            digest = _hash_file(p, size)
+            if kept is not None:
+                try:
+                    kept.parent.mkdir(parents=True, exist_ok=True)
+                    kept.write_text(f"alt-reader sha256 {digest}\n", encoding="utf-8")
+                except OSError:
+                    pass                               # (not remembered: the next run hashes again)
+        if digest == sha:
+            return p
+        say(f"  note: {p} has the name of Unsloth's picture reader but is a different file, so it is not used. "
+            "The picture reader is downloaded (0.9 GB).")
+    return None
 
 
 def _hash_file(s: Path, size: int) -> str:
@@ -9624,11 +9696,17 @@ def main() -> int:
     if not mmproj.exists():
         mmproj = find_in(roots, f"models/{fam['mmproj']}") or mmproj
     if vision != "none":
-        if not mmproj.exists() and own and (models_dir / fam["mmproj"]).exists():
-            mmproj = models_dir / fam["mmproj"]
+        alt_reader = accepted_alt_reader(alt_reader_places(a.models_dir, roots, a.gguf_dir)) \
+            if not mmproj.exists() and fam["mmproj"] == MMPROJ else None
+        if alt_reader is not None:                     # the person's own Unsloth F16 reader: no second download
+            mmproj = alt_reader
+            ok(f"vision encoder: {mmproj} (Unsloth's mmproj-F16.gguf, SHA-256 checked)")
         else:
-            download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
-        ok(f"vision encoder: {mmproj}")
+            if not mmproj.exists() and own and (models_dir / fam["mmproj"]).exists():
+                mmproj = models_dir / fam["mmproj"]
+            else:
+                download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
+            ok(f"vision encoder: {mmproj}")
         if vision == "cpu" and "BF16" in mmproj.name:       # a tip only (recommend, never force; upstream #625)
             say("       tip: on the CPU a Q8_0 copy of this encoder is a third smaller and about as exact (embedding "
                 "cosine 0.999 vs BF16); see 'A Q8_0 encoder' in docs/DETAILS.md")
