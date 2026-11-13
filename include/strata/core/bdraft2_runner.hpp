@@ -30,6 +30,9 @@ public:
     void set_probe_shead(bool use) { weights_.set_probe_shead(use); }
     bool has_shead() const { return weights_.has_shead(); }
     bool uses_shead() const { return weights_.uses_shead(); }
+    // The caller first selects SHEAD. This runner uses eager launches, so draining the stream releases every
+    // reference to the full-head scratch; a future graph owner must destroy those graphs before this call.
+    bool release_full_head(std::string& err);
     // These update only committed positions. q and scales receive the exact rows to put into the shared ring log.
     bool context(const float* taps, int rows, int64_t pos0, std::vector<int8_t>& q, std::vector<float>& scales,
                  std::string& err);
@@ -66,6 +69,8 @@ private:
     bool stage_positions(const int32_t* positions, int rows, std::string& err);
     Bdraft2Weights weights_;
     Bdraft2Weights::HeadMode mode_ = Bdraft2Weights::HeadMode::Auto;
+    Bdraft2Weights::FullHead full_;
+    uint64_t full_bytes_ = 0;
     Bdraft2Weights::ContextWorkspace context_;
     Bdraft2Weights::BlockWorkspace block_;
     PlainModel* model_ = nullptr;

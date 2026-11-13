@@ -39,7 +39,7 @@ void Bdraft2Runner::release() {
         for (void* p : allocations_) gpu::free(p);
     }
     allocations_.clear(); bytes_ = 0; device_ = -1; model_ = nullptr; stream_ = nullptr;
-    context_ = {}; block_ = {}; mode_ = Bdraft2Weights::HeadMode::Auto;
+    context_ = {}; block_ = {}; full_ = {}; full_bytes_ = 0; mode_ = Bdraft2Weights::HeadMode::Auto;
 }
 
 bool Bdraft2Runner::load(const std::string& path, const std::string& head, PlainModel& model, int device,
@@ -79,6 +79,7 @@ bool Bdraft2Runner::load(const std::string& path, const std::string& head, Plain
             const auto* target_head = model.yskn_draft_head();
             if (!target_head) throw std::runtime_error("bdraft2: the target has no yskn output head");
             Bdraft2Weights::FullHead full;
+            const uint64_t before = bytes_;
             full.weights = target_head;
             const size_t full_scratch = strata::kernels::yskn_scratch_bytes(*target_head, B - 1);
             full.projection = gpu::alloc_device(full_scratch);
@@ -87,6 +88,8 @@ bool Bdraft2Runner::load(const std::string& path, const std::string& head, Plain
             alloc(full.logits, (size_t) (B - 1) * model.vocab());
             alloc(full.top_scratch, (size_t) (B - 1) * kernels::kDf2TopBlocks * kernels::kDf2TopK * 2);
             weights_.set_full_head(full);
+            full_ = full;
+            full_bytes_ = bytes_ - before;
         }
         alloc(block_.h, B * H); alloc(block_.normalized, B * H); alloc(block_.conv, B * H);
         alloc(block_.dynamic, B * H / 4); alloc(block_.output, B * H);
@@ -102,6 +105,26 @@ bool Bdraft2Runner::load(const std::string& path, const std::string& head, Plain
             !gpu::stream_sync(stream_)) throw std::runtime_error("bdraft2: initial buffers");
         return true;
     } catch (const std::exception& e) { err = e.what(); release(); return false; }
+}
+
+bool Bdraft2Runner::release_full_head(std::string& err) {
+    if (!loaded() || !weights_.uses_shead()) { err = "bdraft2: the full head is in use"; return false; }
+    const OnDevice on(device_);
+    if (!gpu::stream_sync(stream_)) { err = "bdraft2: full head is still in use"; return false; }
+    const std::initializer_list<void*> buffers = {full_.projection, full_.logits, full_.top_scratch};
+    for (void* p : buffers)
+        if (p && std::find(allocations_.begin(), allocations_.end(), p) == allocations_.end()) {
+            err = "bdraft2: unknown full head allocation"; return false;
+        }
+    for (void* p : buffers) {
+        if (!p) continue;
+        gpu::free(p);
+        allocations_.erase(std::find(allocations_.begin(), allocations_.end(), p));
+    }
+    bytes_ -= full_bytes_;
+    full_ = {}; full_bytes_ = 0;
+    weights_.set_full_head(full_);
+    return true;
 }
 
 bool Bdraft2Runner::epoch(int32_t value, std::string& err) {
