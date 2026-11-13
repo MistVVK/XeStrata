@@ -433,6 +433,11 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(staged_fo_rule_test PRIVATE include)
   add_test(NAME staged_fo_rule_test COMMAND staged_fo_rule_test)
 
+  # whether a layer the CPU share took experts of keeps the staged fused entry and the int8 kernels for the GPU's own experts: yes in a build without MMQ, no in a build with MMQ (header-only, no GPU)
+  add_executable(share_own_rule_test tests/prefill/share_own_rule_test.cpp)
+  target_include_directories(share_own_rule_test PRIVATE include)
+  add_test(NAME share_own_rule_test COMMAND share_own_rule_test)
+
   # the start-up sentence of an engine built without llama.cpp's MMQ prompt kernels (layer counts per path; header-only, no GPU)
   add_executable(own_only_line_test tests/prefill/own_only_line_test.cpp)
   target_include_directories(own_only_line_test PRIVATE include)

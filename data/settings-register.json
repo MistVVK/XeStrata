@@ -1910,7 +1910,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 1008,
+     "line": 1021,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3268,7 +3268,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 3483,
+     "line": 3496,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3628,7 +3628,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 861,
+     "line": 874,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -3692,7 +3692,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 6901,
+     "line": 6914,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -3731,7 +3731,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5436,
+     "line": 5449,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3797,13 +3797,13 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5092,
+     "line": 5105,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 7383,
+     "line": 7396,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3836,7 +3836,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5098,
+     "line": 5111,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -3870,7 +3870,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5217,
+     "line": 5230,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -3964,19 +3964,19 @@
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5899,
+     "line": 5912,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 6854,
+     "line": 6867,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 7087,
+     "line": 7100,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -4036,19 +4036,19 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5093,
+     "line": 5106,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5108,
+     "line": 5121,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 7383,
+     "line": 7396,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -6207,7 +6207,7 @@
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2738,
+     "line": 2751,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -6327,7 +6327,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5594,
+     "line": 5607,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -6363,19 +6363,19 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5598,
+     "line": 5611,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5601,
+     "line": 5614,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5601,
+     "line": 5614,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -6549,7 +6549,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 660,
+     "line": 673,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -7486,13 +7486,13 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2390,
+     "line": 2403,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 7149,
+     "line": 7162,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -9944,7 +9944,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 689,
+     "line": 702,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -10270,7 +10270,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2313,
+     "line": 2326,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -10928,7 +10928,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 887,
+     "line": 900,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -11326,7 +11326,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 739,
+     "line": 752,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -11361,7 +11361,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 756,
+     "line": 769,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -11395,7 +11395,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 843,
+     "line": 856,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -11807,7 +11807,7 @@
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 816,
+     "line": 829,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -11879,7 +11879,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 4631,
+     "line": 4644,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -12776,7 +12776,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 1746,
+     "line": 1759,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -12993,15 +12993,15 @@
    "engine_sets": [
     {
      "file": "src/kernels/native_i8_parity.cpp",
-     "line": 246
+     "line": 334
     },
     {
      "file": "src/kernels/native_i8_parity.cpp",
-     "line": 255
+     "line": 343
     },
     {
      "file": "src/kernels/native_i8_parity.cpp",
-     "line": 257
+     "line": 345
     }
    ],
    "engine_defaults": [],
@@ -13039,19 +13039,23 @@
    "engine_sets": [
     {
      "file": "src/kernels/native_i8_parity.cpp",
-     "line": 206
+     "line": 294
     },
     {
      "file": "src/kernels/native_i8_parity.cpp",
-     "line": 208
+     "line": 296
     },
     {
      "file": "src/kernels/native_i8_parity.cpp",
-     "line": 234
+     "line": 322
     },
     {
      "file": "src/kernels/native_i8_parity.cpp",
-     "line": 237
+     "line": 325
+    },
+    {
+     "file": "src/kernels/native_i8_parity.cpp",
+     "line": 385
     }
    ],
    "engine_defaults": [],
@@ -13089,11 +13093,15 @@
    "engine_sets": [
     {
      "file": "src/kernels/native_i8_parity.cpp",
-     "line": 233
+     "line": 321
     },
     {
      "file": "src/kernels/native_i8_parity.cpp",
-     "line": 236
+     "line": 324
+    },
+    {
+     "file": "src/kernels/native_i8_parity.cpp",
+     "line": 387
     }
    ],
    "engine_defaults": [],
@@ -13156,7 +13164,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 4964,
+     "line": 4977,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -13305,13 +13313,13 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 4829,
+     "line": 4842,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 8515,
+     "line": 8528,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -14297,7 +14305,7 @@
    "reads": [
     {
      "file": "src/kernels/native_expert_parity.cpp",
-     "line": 919,
+     "line": 923,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -14326,11 +14334,11 @@
    "engine_sets": [
     {
      "file": "src/kernels/native_expert_parity.cpp",
-     "line": 921
+     "line": 925
     },
     {
      "file": "src/kernels/native_expert_parity.cpp",
-     "line": 923
+     "line": 927
     }
    ],
    "engine_defaults": [],
@@ -14935,7 +14943,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 4686,
+     "line": 4699,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -15516,13 +15524,13 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 4771,
+     "line": 4784,
      "backend": "hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 8462,
+     "line": 8475,
      "backend": "hip",
      "fn": "getenv"
     },
@@ -15640,7 +15648,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 3793,
+     "line": 3806,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -15811,7 +15819,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 1574,
+     "line": 1587,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -16196,7 +16204,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 7350,
+     "line": 7363,
      "backend": "hip",
      "fn": "getenv"
     }
@@ -16229,7 +16237,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 7746,
+     "line": 7759,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -19197,7 +19205,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 8792,
+     "line": 8805,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -20460,7 +20468,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2660,
+     "line": 2673,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -20500,7 +20508,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2704,
+     "line": 2717,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -20540,7 +20548,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2665,
+     "line": 2678,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -22337,6 +22345,14 @@
    "code_default": null,
    "engine_sets": [
     {
+     "file": "src/kernels/cpu/pool_cores_test.cpp",
+     "line": 34
+    },
+    {
+     "file": "src/kernels/cpu/pool_cores_test.cpp",
+     "line": 36
+    },
+    {
      "file": "src/kernels/cpu/pool_tasks_test.cpp",
      "line": 276
     },
@@ -22355,6 +22371,14 @@
     {
      "file": "src/kernels/cpu/pool_tasks_test.cpp",
      "line": 337
+    },
+    {
+     "file": "src/kernels/cpu/pool_tasks_test.cpp",
+     "line": 360
+    },
+    {
+     "file": "src/kernels/cpu/pool_tasks_test.cpp",
+     "line": 362
     }
    ],
    "engine_defaults": [],
@@ -22368,8 +22392,8 @@
    "first_commit": "e4d22e7ef1",
    "first_date": "2026-10-20",
    "since": "v0.2.2",
-   "last_commit": "7274c10e9a",
-   "last_date": "2026-10-20",
+   "last_commit": "86203d19a6",
+   "last_date": "2026-11-13",
    "status": "rollback",
    "owner": "kernels/cpu",
    "note": "[reviewed] NUMA split turned on by default in 0.2.2; =0 turns it off. [phaseA-tests/_issues_dump/3667.md:51]",
@@ -24014,7 +24038,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 896,
+     "line": 909,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -24047,7 +24071,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5265,
+     "line": 5278,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -24116,7 +24140,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 812,
+     "line": 825,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -24301,7 +24325,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 6435,
+     "line": 6448,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -24451,7 +24475,7 @@
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 298,
+     "line": 299,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -25257,7 +25281,7 @@
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 869,
+     "line": 882,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -25328,7 +25352,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2030,
+     "line": 2043,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -25361,7 +25385,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2010,
+     "line": 2023,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -25430,7 +25454,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 835,
+     "line": 848,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -25469,7 +25493,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2046,
+     "line": 2059,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -25731,7 +25755,7 @@
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 869,
+     "line": 882,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -25793,7 +25817,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 3042,
+     "line": 3055,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -25832,7 +25856,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 557,
+     "line": 570,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -25865,7 +25889,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 3087,
+     "line": 3100,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -25898,7 +25922,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 3090,
+     "line": 3103,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -25931,7 +25955,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2985,
+     "line": 2998,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -25965,7 +25989,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 3026,
+     "line": 3039,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -26005,7 +26029,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 3060,
+     "line": 3073,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -26045,7 +26069,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 3056,
+     "line": 3069,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -26084,7 +26108,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 3083,
+     "line": 3096,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -26117,7 +26141,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 3011,
+     "line": 3024,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -26172,6 +26196,39 @@
    "status": "research",
    "owner": "prefill",
    "note": "[auto] not documented for users; code default not readable from the call",
+   "retire_after": "",
+   "retired_in": ""
+  },
+  {
+   "name": "STRATA_PF_SHARE_OWN",
+   "backends": [
+    "cuda-hip"
+   ],
+   "reads": [
+    {
+     "file": "src/prefill/prefill.cpp",
+     "line": 416,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    }
+   ],
+   "parse": "string",
+   "default_state": null,
+   "code_default": null,
+   "engine_sets": [],
+   "engine_defaults": [],
+   "launch_files": [],
+   "launch_sets": [],
+   "launch_reads": [],
+   "doc_mentions": [],
+   "first_commit": null,
+   "first_date": null,
+   "since": null,
+   "last_commit": null,
+   "last_date": null,
+   "status": "rollback",
+   "owner": "prefill",
+   "note": "A prompt layer on which the CPU prefill share took experts keeps the staged fused entry and the int8 kernels for the GPU's own experts, in a build without llama.cpp's MMQ (before, such a layer ran the GPU's experts on the FP16 path: 12 to 18 percent slower than the build with MMQ at 2,049 tokens on an RTX A4000). Unset: new rule in a build without MMQ, old rule (MMQ's groups) in a build with MMQ. =0 is the old rule everywhere, =1 the new rule in a build with MMQ too (research). src/prefill/prefill.cpp share_keeps_own_kernels, include/strata/prefill/share_own_rule.hpp.",
    "retire_after": "",
    "retired_in": ""
   },
@@ -26255,7 +26312,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 398,
+     "line": 399,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -26291,7 +26348,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 4481,
+     "line": 4494,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -26352,7 +26409,7 @@
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 807,
+     "line": 820,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -26481,7 +26538,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 1792,
+     "line": 1805,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -27985,8 +28042,14 @@
      "fn": "getenv"
     },
     {
+     "file": "src/kernels/verify_batch_parity.cpp",
+     "line": 174,
+     "backend": "cuda-hip",
+     "fn": "getenv"
+    },
+    {
      "file": "src/prefill/prefill.cpp",
-     "line": 92,
+     "line": 93,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -28040,8 +28103,8 @@
    "first_commit": "7cf709e5b1",
    "first_date": "2026-09-28",
    "since": "v0.1.40.1",
-   "last_commit": "78316c8df4",
-   "last_date": "2026-11-02",
+   "last_commit": "90731f26f7",
+   "last_date": "2026-11-13",
    "status": "default",
    "owner": "core",
    "note": "[auto] on by default for some GPU architectures only (gfx1151 src/core/arch_defaults.cpp:87=1); opt-in elsewhere; the variable overrides it",
@@ -28091,7 +28154,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 258,
+     "line": 259,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -28126,7 +28189,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 264,
+     "line": 265,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -28554,7 +28617,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 723,
+     "line": 736,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -28636,7 +28699,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 4286,
+     "line": 4299,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -28671,7 +28734,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 4290,
+     "line": 4303,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -28706,7 +28769,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 538,
+     "line": 551,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -28792,13 +28855,13 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 566,
+     "line": 579,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 569,
+     "line": 582,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -28834,13 +28897,13 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 7029,
+     "line": 7042,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 8274,
+     "line": 8287,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -28880,13 +28943,13 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 7042,
+     "line": 7055,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 7383,
+     "line": 7396,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -29004,19 +29067,19 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 306,
+     "line": 307,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5728,
+     "line": 5741,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 6257,
+     "line": 6270,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -29058,7 +29121,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2836,
+     "line": 2849,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -29143,7 +29206,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2848,
+     "line": 2861,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -29222,7 +29285,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 4282,
+     "line": 4295,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -29263,7 +29326,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 7263,
+     "line": 7276,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -29373,7 +29436,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 7274,
+     "line": 7287,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -29406,7 +29469,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 7269,
+     "line": 7282,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -29439,7 +29502,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 7295,
+     "line": 7308,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -29472,7 +29535,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 7284,
+     "line": 7297,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -29505,7 +29568,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 7279,
+     "line": 7292,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -29572,25 +29635,25 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 358,
+     "line": 359,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 456,
+     "line": 469,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 1847,
+     "line": 1860,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 6435,
+     "line": 6448,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -29711,7 +29774,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 3223,
+     "line": 3236,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -29780,7 +29843,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 674,
+     "line": 687,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -29823,7 +29886,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 4301,
+     "line": 4314,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -29858,7 +29921,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 4302,
+     "line": 4315,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -29893,7 +29956,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 314,
+     "line": 315,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -29962,7 +30025,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 513,
+     "line": 526,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -30074,13 +30137,13 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 3549,
+     "line": 3562,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 3590,
+     "line": 3603,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -30129,19 +30192,19 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2117,
+     "line": 2130,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2131,
+     "line": 2144,
      "backend": "hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2296,
+     "line": 2309,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -31180,13 +31243,13 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5040,
+     "line": 5053,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 8546,
+     "line": 8559,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -32905,7 +32968,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5012,
+     "line": 5025,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -32945,13 +33008,13 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5013,
+     "line": 5026,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5014,
+     "line": 5027,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -32996,13 +33059,13 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5015,
+     "line": 5028,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5015,
+     "line": 5028,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -33035,7 +33098,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 5024,
+     "line": 5037,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -33126,7 +33189,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 853,
+     "line": 866,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -33159,7 +33222,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 857,
+     "line": 870,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -34196,7 +34259,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 664,
+     "line": 677,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -35405,13 +35468,13 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 4878,
+     "line": 4891,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 8534,
+     "line": 8547,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -35520,13 +35583,13 @@
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 8718,
+     "line": 8731,
      "backend": "metal",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 8760,
+     "line": 8773,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -35746,7 +35809,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 4942,
+     "line": 4955,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -38440,7 +38503,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2287,
+     "line": 2300,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -38474,13 +38537,13 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 987,
+     "line": 1000,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2283,
+     "line": 2296,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -38527,7 +38590,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 334,
+     "line": 335,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -38563,7 +38626,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2275,
+     "line": 2288,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -38599,7 +38662,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2263,
+     "line": 2276,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -38922,7 +38985,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 7226,
+     "line": 7239,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -38973,7 +39036,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 422,
+     "line": 435,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
@@ -40449,7 +40512,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 325,
+     "line": 326,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -40645,7 +40708,7 @@
     },
     {
      "file": "src/kernels/cpu/pool_tasks_test.cpp",
-     "line": 365
+     "line": 369
     }
    ],
    "engine_defaults": [],
@@ -41323,13 +41386,13 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 3919,
+     "line": 3932,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 6957,
+     "line": 6970,
      "backend": "cuda-hip",
      "fn": "getenv"
     },
@@ -43351,7 +43414,7 @@
    "reads": [
     {
      "file": "src/prefill/prefill.cpp",
-     "line": 2394,
+     "line": 2407,
      "backend": "cuda-hip",
      "fn": "getenv"
     }
