@@ -40,4 +40,30 @@ inline bool i8_expert_takes(int state, const char* gcn, int64_t group_entries, b
     return state == 1 || i8_expert_class_default(state, gcn);
 }
 
+// The few-rows route.  A layer whose experts average fewer routed rows than a crossing runs on the grouped kernels (native_expert_grouped, no shared-memory
+// staging: one launch pair per 16 experts like the int8 kernel's, the q8_1 image of the rows made by quantize_q8_1_rows); from the crossing up it runs on the
+// int8 kernel.  Measured on one MoE layer of Flash-Next's shape (average rows per expert where both take equal time): Tesla P100 (sm_60) 8.4, A4000 10.2 - 11.7,
+// RX 6700 XT 10.2 - 10.8, R9700 11.7 (par/RESULTS-I8-RESEARCH.md); the limits below are a little under them, so the int8 side never loses more than 5 %.
+// Without the route the int8 kernel keeps the size floor above (256 entries per group of 16 experts = 16 rows per expert) and the layers under it stay on today's path.
+inline constexpr int kI8FewRowsDefault = 10;   ///< every card but the Tesla P100
+inline constexpr int kI8FewRowsSm60 = 8;       ///< compute capability 6.0 (the P100): its crossing is lower
+
+/// STRATA_I8_FEWROWS read as the limit: not set (or empty, or text that is no number) = the card class's own `class_default`, 0 = no route, N = a limit of N rows per expert.
+inline int i8_fewrows_limit(const char* text, int class_default) {
+    if (text == nullptr || text[0] == '\0') return class_default;
+    if (text[0] < '0' || text[0] > '9') return class_default;
+    long v = 0;
+    for (const char* p = text; *p >= '0' && *p <= '9'; ++p) {
+        v = v * 10 + (*p - '0');
+        if (v > 100000) break;
+    }
+    return (int) v;
+}
+
+/// The class's default limit: the P100 (compute capability 6.0) 8, every other card 10.
+inline int i8_fewrows_class_default(int cc_major, int cc_minor) { return cc_major == 6 && cc_minor == 0 ? kI8FewRowsSm60 : kI8FewRowsDefault; }
+
+/// Does a layer with `rows` routed rows over `experts` experts (those with at least one row) take the grouped kernels?  limit 0 = the route is off.
+inline bool i8_fewrows_takes(int limit, int64_t rows, int64_t experts) { return limit > 0 && experts > 0 && rows < (int64_t) limit * experts; }
+
 }  // namespace strata::kernels

@@ -61,6 +61,33 @@ int main() {
     CHECK(!i8_expert_class_default(0, "gfx1031"));
     CHECK(!i8_expert_class_default(-1, "gfx1201"));
     CHECK(!i8_expert_class_default(-1, nullptr));
+    // the few-rows route: the limit (STRATA_I8_FEWROWS: not set = the class default, 0 = off, N = N rows per expert)
+    CHECK(i8_fewrows_limit(nullptr, 10) == 10);
+    CHECK(i8_fewrows_limit("", 8) == 8);
+    CHECK(i8_fewrows_limit("0", 10) == 0);
+    CHECK(i8_fewrows_limit("0x", 10) == 0);
+    CHECK(i8_fewrows_limit("12", 10) == 12);
+    CHECK(i8_fewrows_limit("6", 8) == 6);
+    CHECK(i8_fewrows_limit("yes", 10) == 10);
+    CHECK(i8_fewrows_limit("-3", 8) == 8);
+    CHECK(i8_fewrows_limit("99999999999", 10) > 100000);   // a huge number does not wrap to a small one
+    // the class default: the P100 (6.0) 8, every other card 10 (6.1, 7.0, 7.5, 8.6, 12.0, a HIP card with no capability at all)
+    CHECK(i8_fewrows_class_default(6, 0) == 8);
+    CHECK(i8_fewrows_class_default(6, 1) == 10);
+    CHECK(i8_fewrows_class_default(7, 0) == 10);
+    CHECK(i8_fewrows_class_default(8, 6) == 10);
+    CHECK(i8_fewrows_class_default(12, 0) == 10);
+    CHECK(i8_fewrows_class_default(0, 0) == 10);
+    // the decision: rows strictly under limit x experts go to the grouped kernels (512 experts: 5,119 rows is under 10 per expert, 5,120 is 10)
+    CHECK(i8_fewrows_takes(10, 5119, 512));
+    CHECK(!i8_fewrows_takes(10, 5120, 512));
+    CHECK(!i8_fewrows_takes(10, 20480, 512));
+    CHECK(i8_fewrows_takes(8, 4095, 512));
+    CHECK(!i8_fewrows_takes(8, 4096, 512));
+    CHECK(i8_fewrows_takes(10, 2560, 400));      // 256 tokens x 10 over the 400 experts that got rows: 6.4 per expert
+    CHECK(!i8_fewrows_takes(0, 100, 512));       // the route is off
+    CHECK(!i8_fewrows_takes(10, 100, 0));        // no experts: nothing to decide
+    CHECK(!i8_fewrows_takes(-1, 100, 512));
     if (failed) {
         std::fprintf(stderr, "i8_expert_rule_test: %d check(s) failed\n", failed);
         return 1;
