@@ -4944,6 +4944,7 @@ int main(int argc, char** argv) {
     // CUDA error left set by the failed `cudaHostRegister` and read later by `gr_read`'s launch check.  See the
     // note in `pinned.cu`.
     strata::core::FileExpertSource src;
+    bool io_pf_by_default = false;   // the file tier's Linux defaults turned io prefetch on (no XESTRATA_IO_PREFETCH given)
     strata::core::ArenaExpertSource arena_src;
     strata::core::ExpertSource* srcp = nullptr;
     std::vector<uint8_t> fill_tmp;   // blob_to_copy's buffer for a transient source
@@ -5043,6 +5044,7 @@ int main(int argc, char** argv) {
         if (io_pf_default || (io_pf_env != nullptr && std::strtol(io_pf_env, nullptr, 10) != 0)) {
             const char* th = strata::env_get("IO_PF_THREADS");
             src.set_io_prefetch(true, th != nullptr ? (int) std::strtol(th, nullptr, 10) : 0);
+            io_pf_by_default = io_pf_default && src.io_prefetch();
             const char* cv = strata::env_get("COLD_OVERLAP");
             const bool zc = cv != nullptr && cv[0] != '\0' ? std::strtol(cv, nullptr, 10) == 4 : src.gguf_mode();
             if (src.io_prefetch())
@@ -5755,6 +5757,48 @@ int main(int argc, char** argv) {
     drive.d.src = srcp;
     drive.d.n_expert = g.n_expert;
     drive.d.jobs.resize((size_t) K);
+    // upstream 994029b02 (PR 4972): when every routed expert sits in the GPU's caches the decode reads nothing from the
+    // file tier, and its Linux defaults (io prefetch, the decode gate) and the routing-aware prefetch only cost time
+    // (2x W7900D gfx1100, all 24576 pairs resident: decode 57 -> 80 tok/s, the answer byte-identical).  Only what the
+    // defaults switched on is suspended: XESTRATA_IO_PREFETCH=1 and XESTRATA_LOOKAHEAD=1 keep their own, and
+    // XESTRATA_FILE_TIER_IDLE=0 turns the policy off.  Checked at the start; the serve's VRAM command (a smaller cache
+    // later) does not turn them back on - the resize cases are rarer than the start this helps.
+    int64_t gpu_held_now = 0;
+    bool gpu_holds_all = false;
+    auto count_gpu_held = [&]() -> int64_t {
+        int64_t held = 0;
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            const int st = multi_gpu ? stage_of(l) : 0;
+            strata::core::ExpertCache& c = st > 0 ? stages[(size_t) st - 1]->cache : xcache;
+            const int64_t live = c.slots();
+            for (int64_t e = 0; e < g.n_expert; ++e) {
+                const int32_t slot = c.slot_of(l, e);
+                held += slot != strata::core::kNotResident && slot < live;
+            }
+        }
+        return held;
+    };
+    const bool file_tier_idle_ok = [] {
+        const char* v = strata::env_get("FILE_TIER_IDLE");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    const bool la_asked = [] {
+        const char* v = strata::env_get("LOOKAHEAD");
+        const char* p = strata::env_get("IO_PREFETCH");
+        return (v != nullptr && v[0] != '\0' && std::strtol(v, nullptr, 10) != 0) ||
+               (p != nullptr && p[0] != '\0' && std::strtol(p, nullptr, 10) != 0);
+    }();
+    if (srcp == &src && file_tier_idle_ok) {
+        gpu_held_now = count_gpu_held();
+        gpu_holds_all = gpu_held_now == g.n_layers * g.n_expert;
+        if (gpu_holds_all && io_pf_by_default) {
+            src.set_io_prefetch(false, 0);
+            std::fprintf(stderr, "xestrata generate: every expert is in the GPU caches (%lld of %lld): the file tier's "
+                                 "Linux defaults (io prefetch, the decode gate) are off; the decode reads nothing from "
+                                 "it (XESTRATA_IO_PREFETCH=1 keeps them, XESTRATA_FILE_TIER_IDLE=0 this policy)\n",
+                         (long long) gpu_held_now, (long long) (g.n_layers * g.n_expert));
+        }
+    }
     // CS-T: routing-aware prefetch of the file tier: the next layer's router on this layer's MoE input predicts its
     // experts, and with io prefetch (upstream 149) the I/O threads read them ahead (else their pages are only advised).
     // It never changes what is computed; STRATA_LOOKAHEAD=0 is the A/B arm, STRATA_LOOKAHEAD_K the experts per token
@@ -5774,13 +5818,19 @@ int main(int argc, char** argv) {
         }
         const char* kv = strata::env_get("LOOKAHEAD_K");
         if (ok && lookahead.start(std::move(routers), g.n_embd, g.n_expert, kv ? (int) std::strtol(kv, nullptr, 10) : 10, &src, err)) {
-            drive.d.lookahead = &lookahead;
-            // two layers ahead with io prefetch (upstream 149's default); STRATA_IO_PREFETCH_DEPTH 1..4
-            if (const char* dv = strata::env_get("IO_PREFETCH_DEPTH"); dv != nullptr && std::strtol(dv, nullptr, 10) > 0)
-                lookahead.set_depth((int) std::strtol(dv, nullptr, 10));
-            else if (src.io_prefetch())
-                lookahead.set_depth(2);
-            std::fprintf(stderr, "xestrata generate: routing-aware prefetch of the file tier on (the next layer's router)\n");
+            if (gpu_holds_all && !la_asked) {
+                std::fprintf(stderr, "xestrata generate: routing-aware prefetch off (every expert is in the GPU caches; "
+                                     "XESTRATA_LOOKAHEAD=1 runs it)\n");
+            } else {
+                drive.d.lookahead = &lookahead;
+                // two layers ahead with io prefetch (upstream 149's default); STRATA_IO_PREFETCH_DEPTH 1..4
+                if (const char* dv = strata::env_get("IO_PREFETCH_DEPTH"); dv != nullptr && std::strtol(dv, nullptr, 10) > 0)
+                    lookahead.set_depth((int) std::strtol(dv, nullptr, 10));
+                else if (src.io_prefetch())
+                    lookahead.set_depth(2);
+                std::fprintf(stderr, "xestrata generate: routing-aware prefetch of the file tier on (the next layer's "
+                                     "router)\n");
+            }
         } else {
             std::fprintf(stderr, "xestrata generate: routing-aware prefetch off (%s)\n",
                          ok ? err.c_str() : "the routers are not BF16 in the arena");
