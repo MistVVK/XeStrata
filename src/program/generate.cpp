@@ -10350,6 +10350,7 @@ int main(int argc, char** argv) {
                 // layouts eat into what the start reported)
                 size_t vf_b = 0, vt_b = 0;
                 if (strata::gpu::mem_info(&vf_b, &vt_b)) strata::core::watchdog_note_request_vram((int64_t) (vf_b >> 20));
+                strata::core::watchdog_note_request_gpu_pause();   // AMD on Linux: the stall report's paused-time line
             }
             int64_t resume = 0;
             bool from_live = false;

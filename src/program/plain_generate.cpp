@@ -1100,6 +1100,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         {
             size_t vf_b = 0, vt_b = 0;
             if (strata::gpu::mem_info(&vf_b, &vt_b)) strata::core::watchdog_note_request_vram((int64_t) (vf_b >> 20));
+            strata::core::watchdog_note_request_gpu_pause();   // AMD on Linux: the stall report's paused-time line
         }
         char* endp = nullptr;
         const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
