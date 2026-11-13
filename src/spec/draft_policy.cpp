@@ -36,12 +36,17 @@ constexpr double kProbeHeld = 0.5;
 DraftPolicy::DraftPolicy(int max_t, double margin)
     : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin) {
     const char* v = strata::env_get("SPEC_COST");
-    robust_ = v != nullptr && std::strtol(v, nullptr, 10) != 0;
+    if (v == nullptr || v[0] == '\0' || v[0] == 'a' || v[0] == 'A')
+        mode_ = Mode::kAuto;
+    else
+        mode_ = std::strtol(v, nullptr, 10) != 0 ? Mode::kOn : Mode::kOff;
 }
 
+int DraftPolicy::ctx_bucket(int64_t pos) { return pos < 6144 ? 0 : pos < 24576 ? 1 : 2; }
+
 void DraftPolicy::set_context(int64_t pos) {
-    if (!robust_) return;
-    const int b = pos < 6144 ? 0 : pos < 24576 ? 1 : 2;
+    pos_ = pos;
+    const int b = cost_aware() ? ctx_bucket(pos) : 0;
     if (b == bk_) return;
     bk_ = b;
     bool any = false;
@@ -64,8 +69,9 @@ void DraftPolicy::set_context(int64_t pos) {
 
 void DraftPolicy::add_cost(int t, double round_ms) {
     double w = 1.0;
-    if (robust_ && cost_n_[bk_][t] >= kProbes && round_ms > 3.0 * cost_[bk_][t]) w = 0.1;   // a graph capture, a stall
-    const double alpha = robust_ ? std::max(kCostAlpha * w, w / (cost_n_[bk_][t] + w)) : kCostAlpha;
+    // a round far above what is known for its width (a graph capture, a stall) counts as a tenth of a sample
+    if (cost_aware() && cost_n_[bk_][t] >= kProbes && round_ms > 3.0 * cost_[bk_][t]) w = 0.1;
+    const double alpha = cost_aware() ? std::max(kCostAlpha * w, w / (cost_n_[bk_][t] + w)) : kCostAlpha;
     cost_[bk_][t] = cost_n_[bk_][t] > 0 ? (1.0 - alpha) * cost_[bk_][t] + alpha * round_ms : round_ms;
     cost_n_[bk_][t] += w;
     last_[bk_][t] = rounds_;
@@ -171,9 +177,9 @@ bool DraftPolicy::mtp_step_pays(int t, double held, double q, double expected) c
     const double dc = cost_ms(t + 1) - cost_ms(t);
     if (dc <= 0.0) return gain > 0.0;   // measured no dearer: the tokens come free
     if (gain / dc > expected / cost_ms(t)) return true;
-    // STRATA_SPEC_COST: the cost is not convex (with experts in RAM a window of 3 can cost about one of 2), so a draft
-    // that does not pay alone is kept when it and one more as likely to hold would
-    if (!robust_ || t + 2 > max_t_ || cost_n_[bk_][t + 2] < kProbes || stale(t + 2)) return false;
+    // the cost-aware window: the cost is not convex (with experts in RAM a window of 3 can cost about one of 2), so a
+    // draft that does not pay alone is kept when it and one more as likely to hold would
+    if (!cost_aware() || t + 2 > max_t_ || cost_n_[bk_][t + 2] < kProbes || stale(t + 2)) return false;
     const double dc2 = cost_ms(t + 2) - cost_ms(t);
     return dc2 > 0.0 && (gain + gain * q) / dc2 > expected / cost_ms(t);
 }

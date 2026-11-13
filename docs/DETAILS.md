@@ -193,7 +193,9 @@ It costs about 13.7 KB of RAM per context token, about 1.7 GB at 128K.
 The expert cache holds the rest, giving slots to the K/V as the context grows and taking them back after a short request.
 Both live in virtual memory (`sycl_ext_oneapi_virtual_mem`) and neither address moves, so the captured graphs stay valid.
 It needs one GPU with virtual memory, an expert profile, no KV streaming and every expert in RAM; otherwise (and with `--batch` or `--vram-elastic`) the engine says so and stays off.
-`XESTRATA_KV_GROW_HOLD=1` keeps the longest parked conversation's cells in the K/V until it comes back.
+`XESTRATA_KV_GROW_HOLD` keeps the longest parked conversation's cells in the K/V until it comes back (`=1` always, `=0` never).
+Unless given, the device's reported virtual-memory granularity decides, as for `--kv-grow` itself: kept at 2 MiB or more.
+Where the pages are smaller (the B70's 64 KiB) the cache in virtual memory is slower there anyway, so holding measured slower (faster on the RTX 4070, slower on the B70, 2026-10-09).
 At a 128K context, int8, IQ2_XS and a 4,945-token prompt (one run each) the result differs by card:
 
 | | prefill (tokens/s) | decode after it | short chat decode | slots |
