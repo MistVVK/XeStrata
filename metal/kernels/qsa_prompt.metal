@@ -377,3 +377,133 @@ kernel void qsa_flash(device const half* qh [[buffer(0)]], device const char* kq
             }
         }
 }
+
+// qsa_flash_fp16: qsa_flash over the direct-half cache (no per-64 scale).  Selected by --kv fp16.
+kernel void qsa_flash_fp16(device const half* qh [[buffer(0)]], device const half* kq [[buffer(1)]],
+                           device const half* vq [[buffer(2)]], device const int* ids [[buffer(3)]],
+                           device const float* qfull [[buffer(4)]], device half* xqh [[buffer(5)]],
+                           constant QsaArgs& a [[buffer(6)]],
+                           uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                           ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr int HPG = QH / QKV;
+    threadgroup float sp[4][16 * QCH];
+    threadgroup half p[16 * QCH];
+    threadgroup int cid[QCH];
+    threadgroup float fac[16], lsum[16], mrun[16];
+    const int g = int(tg.x), t = int(tg.y);
+    const uint n_kv = a.pos0 + uint(t) + 1, width = min(n_kv, uint(QBUDGET));
+    const int nch = int((width + QCH - 1) / QCH);
+    if (tid < 16) { mrun[tid] = -INFINITY; lsum[tid] = 0.0f; }
+    constexpr auto dS = matmul2d_descriptor(16, QCH, 32, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    constexpr auto dO = matmul2d_descriptor(16, 64, 32, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<dS, execution_simdgroup> opS;
+    matmul2d<dO, execution_simdgroup> opO;
+    tensor<device half, dextents<int32_t, 2>, tensor_inline> tQ((device half*)qh + (uint(t) * QH + g * HPG) * QD,
+                                                               dextents<int32_t, 2>(QD, HPG));
+    tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline> tP(p, dextents<int32_t, 2>(QCH, 16));
+    auto rv = opO.template get_right_input_cooperative_tensor<half, half, float>();
+    auto tPh = tP.template slice<32, 16>(0, 0);
+    auto acc = opO.template get_destination_cooperative_tensor<__tensor_ops_detail::__remove_addrspace_t<decltype(tPh)>,
+                                                               __tensor_ops_detail::__remove_addrspace_t<decltype(rv)>, float>();
+    auto tot = opO.template get_destination_cooperative_tensor<__tensor_ops_detail::__remove_addrspace_t<decltype(tPh)>,
+                                                               __tensor_ops_detail::__remove_addrspace_t<decltype(rv)>, float>();
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+        if (acc.is_valid_element(i)) tot[i] = 0.0f;
+    const int d0 = sg * 64;
+    for (int ch = 0; ch < nch; ++ch) {
+        const int c0 = ch * QCH, nc = min(QCH, int(width) - c0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < QCH) {
+            const int id = tid < nc ? ids[t * QBUDGET + c0 + tid] : -1;
+            cid[tid] = id;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {
+            auto rk = opS.template get_right_input_cooperative_tensor<half, half, float>();
+            auto tA = tQ.template slice<32, 16>(d0, 0);
+            auto s = opS.template get_destination_cooperative_tensor<__tensor_ops_detail::__remove_addrspace_t<decltype(tA)>,
+                                                                     __tensor_ops_detail::__remove_addrspace_t<decltype(rk)>, float>();
+            for (uint16_t i = 0; i < s.get_capacity(); ++i)
+                if (s.is_valid_element(i)) s[i] = 0.0f;
+            for (int k0 = d0; k0 < d0 + 64; k0 += 32) {
+                if (!coop_k4) {
+                    for (uint16_t i = 0; i < rk.get_capacity(); ++i) {
+                        const auto ix = rk.get_multidimensional_index(i);
+                        const int k = k0 + ix[0], id = cid[ix[1]];
+                        const uint row = uint(max(id, 0)) * QKV + g;
+                        const float v = float(kq[row * QD + k]);
+                        rk[i] = id >= 0 ? half(v) : half(0.0f);
+                    }
+                } else
+#pragma clang loop unroll(full)
+                for (uint16_t i = 0; i < rk.get_capacity(); i += 4) {
+                    const auto ix = rk.get_multidimensional_index(i);
+                    const int k = k0 + ix[0], c = ix[1], id = cid[c];
+                    half4 w = half4(0.0h);
+                    if (id >= 0) {
+                        const uint row = uint(id) * QKV + g;
+                        w = *(device const half4*)(kq + row * QD + k);
+                    }
+                    rk[i] = w.x; rk[i + 1] = w.y; rk[i + 2] = w.z; rk[i + 3] = w.w;
+                }
+                tA = tQ.template slice<32, 16>(k0, 0);
+                opS.run(tA, rk, s);
+            }
+            tensor<threadgroup float, dextents<int32_t, 2>, tensor_inline> tS(sp[sg], dextents<int32_t, 2>(QCH, 16));
+            s.store(tS);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0 && lane < 16) {
+            if (lane < HPG) {
+                float m = mrun[lane];
+                for (int c = 0; c < nc; ++c) {
+                    const int q = lane * QCH + c;
+                    m = max(m, (((sp[0][q] + sp[1][q]) + (sp[2][q] + sp[3][q])) * 0.0625f));
+                }
+                const float f = exp(mrun[lane] - m);
+                float l = lsum[lane] * f;
+                for (int c = 0; c < QCH; ++c) {
+                    const int q = lane * QCH + c;
+                    const float e = c < nc ? exp(((sp[0][q] + sp[1][q]) + (sp[2][q] + sp[3][q])) * 0.0625f - m) : 0.0f;
+                    l += e;
+                    p[q] = half(e);
+                }
+                mrun[lane] = m;
+                lsum[lane] = l;
+                fac[lane] = f;
+            } else {
+                for (int c = 0; c < QCH; ++c) p[lane * QCH + c] = half(0.0f);
+                fac[lane] = 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+            if (acc.is_valid_element(i)) acc[i] = 0.0f;
+        for (int c0 = 0; c0 < QCH; c0 += 32) {
+#pragma clang loop unroll(full)
+            for (uint16_t i = 0; i < rv.get_capacity(); ++i) {
+                const auto ix = rv.get_multidimensional_index(i);
+                const int c = c0 + ix[0], d = d0 + ix[1], id = cid[c];
+                const uint row = uint(max(id, 0)) * QKV + g;
+                const float v = float(vq[row * QD + d]);
+                rv[i] = id >= 0 ? half(v) : half(0.0f);
+            }
+            tPh = tP.template slice<32, 16>(c0, 0);
+            opO.run(tPh, rv, acc);
+        }
+        for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+            if (acc.is_valid_element(i)) tot[i] = fma(tot[i], fac[acc.get_multidimensional_index(i)[1]], acc[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint16_t i = 0; i < acc.get_capacity(); ++i)
+        if (acc.is_valid_element(i)) {
+            const auto ix = acc.get_multidimensional_index(i);
+            const int h = ix[1], d = d0 + ix[0];
+            if (h < HPG) {
+                const int hh = g * HPG + h;
+                const float gate = qfull[(uint(t) * QH + hh) * 2 * QD + QD + d];
+                const float ls = lsum[h];
+                xqh[(uint(t) * QH + hh) * QD + d] = half((ls > 0.0f ? tot[i] / ls : 0.0f) * (1.0f / (1.0f + exp(-gate))));
+            }
+        }
+}

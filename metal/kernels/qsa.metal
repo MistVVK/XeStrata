@@ -212,6 +212,83 @@ kernel void qsa_prep(device const float* qfull [[buffer(0)]], device const float
     }
 }
 
+// qsa_prep_fp16: the same K/V append without quantization.  K and V are stored as raw halves
+// [cell][kv head][head_dim] (no per-64 scale), so the cache is the checkpoint's FP16 layout and
+// the attention kernels read it directly.  Selected by --kv fp16 on Metal.
+kernel void qsa_prep_fp16(device const float* qfull [[buffer(0)]], device const float* kcur [[buffer(1)]],
+                          device const float* vcur [[buffer(2)]], device const float* iqraw [[buffer(3)]],
+                          device const float* ikraw [[buffer(4)]], device const float* qn [[buffer(5)]],
+                          device const float* kn [[buffer(6)]], device const float* iqn [[buffer(7)]],
+                          device const float* ikn [[buffer(8)]], device const float2* cs [[buffer(9)]],
+                          device float* qcur [[buffer(10)]], device float* qidx [[buffer(11)]],
+                          device half* kq [[buffer(12)]], device half* vq [[buffer(13)]],
+                          device float* tail [[buffer(14)]], device float* dead [[buffer(15)]],
+                          device float* pooled [[buffer(16)]], constant QsaArgs& a [[buffer(17)]],
+                          device const int* mtab [[buffer(18)]],
+                          device const uint* rinfo [[buffer(19), function_constant(qsa_rows)]],
+                          uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                          ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    threadgroup float part[8];
+    threadgroup float row[256];
+    const int r = int(tg.x);
+    if (r == QSA_KEYS_ROW) {
+        if (tg.y != 0) return;
+        for (int t = 0; t < int(a.n_tok); ++t) {
+            uint cell = a.pos0 + uint(t);
+            device float* tail_t = tail; device float* dead_t = dead; device float* pooled_t = pooled;
+            device const int* mt = mtab;
+            if (qsa_rows) {
+                const ulong sl = rinfo[8 + 4 * t];
+                cell = rinfo[8 + 4 * t + 1];
+                tail_t = tail + sl * rinfo[2]; dead_t = dead + sl * rinfo[3]; pooled_t = pooled + sl * rinfo[4];
+                mt = mtab + rinfo[8 + 4 * t + 3];
+            }
+            const float x = tid < ID ? ikraw[t * ID + tid] : 0.0f;
+            if (tid < ID) tail_t[(cell & 3) * ID + tid] = x;
+            threadgroup_barrier(mem_flags::mem_device);
+            if (cell == 0) {
+                const float o = norm_rope(x, 0.0f, ikn, row, part, tid, sg, lane, ID, a.eps, cs, 0, false, mt);
+                if (tid < ID) dead_t[tid] = o;
+            }
+            if ((cell & 3) == 3) {
+                float m = 0.0f;
+                if (tid < ID) m = (((tail_t[tid] + tail_t[ID + tid]) + tail_t[2 * ID + tid]) + tail_t[3 * ID + tid]) * 0.25f;
+                const uint b = cell >> 2;
+                const float o = norm_rope(m, 0.0f, ikn, row, part, tid, sg, lane, ID, a.eps, cs, a.pos_base + 4 * b, true, mt);
+                if (tid < ID) pooled_t[b * ID + tid] = o;
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+        }
+        return;
+    }
+    const int t = int(tg.y);
+    const uint cell = qsa_rows ? rinfo[8 + 4 * t + 1] : a.pos0 + uint(t), absp = a.pos_base + cell;
+    device half* kqr = kq; device half* vqr = vq;
+    device const int* mt = mtab;
+    if (qsa_rows) {
+        const ulong sl = rinfo[8 + 4 * t];
+        kqr = kq + sl * rinfo[0]; vqr = vq + sl * rinfo[0];
+        mt = mtab + rinfo[8 + 4 * t + 3];
+    }
+    if (r < QH) {
+        const float x = qfull[(t * QH + r) * 2 * QD + tid];
+        const float o = norm_rope(x, 0.0f, qn, row, part, tid, sg, lane, QD, a.eps, cs, absp, true, mt);
+        qcur[(t * QH + r) * QD + tid] = o;
+    } else if (r < QH + 2 * QKV) {
+        const bool isv = r >= QH + QKV;
+        const int h = r - QH - (isv ? QKV : 0);
+        float x = (isv ? vcur : kcur)[(t * QKV + h) * QD + tid];
+        if (!isv) x = norm_rope(x, 0.0f, kn, row, part, tid, sg, lane, QD, a.eps, cs, absp, true, mt);
+        const uint rowi = cell * QKV + uint(h);
+        (isv ? vqr : kqr)[rowi * QD + tid] = half(x);   // no quantization: the raw half is the cache
+    } else {
+        const int h = r - QH - 2 * QKV;
+        const float x = tid < ID ? iqraw[(t * IH + h) * ID + tid] : 0.0f;
+        const float o = norm_rope(x, 0.0f, iqn, row, part, tid, sg, lane, ID, a.eps, cs, absp, true, mt);
+        if (tid < ID) qidx[(t * IH + h) * ID + tid] = o;
+    }
+}
+
 // scores [n_tok][max_blocks]; grid (ceil(max_blocks / 8), n_tok), 256 threads: a simdgroup per block.
 kernel void qsa_score(device const float* qidx [[buffer(0)]], device const float* pooled [[buffer(1)]],
                       device const float* dead [[buffer(2)]], device float* scores [[buffer(3)]],
@@ -397,6 +474,79 @@ kernel void qsa_attn(device const float* qcur [[buffer(0)]], device const char* 
     for (int c = 0; c < nc; ++c) {
         const uint rowi = uint(cid[c]) * QKV + uint(g);
         const float v = float(vq[rowi * QD + tid]) * float(vsc[rowi * 4 + (tid >> 6)]);
+        for (int h = 0; h < HPG; ++h) acc[h] = fma(s[h][c], v, acc[h]);
+    }
+    for (int h = 0; h < HPG; ++h) {
+        device float* o = pp + (g * HPG + h) * (QD + 2);
+        o[tid] = acc[h];
+        if (tid == 0) { o[QD] = mh[h]; o[QD + 1] = lh[h]; }
+    }
+}
+
+// qsa_attn_fp16: qsa_attn over the direct-half cache (no per-64 scale).  Same split-K partials,
+// so qsa_merge is unchanged.  Selected by --kv fp16 on Metal.
+kernel void qsa_attn_fp16(device const float* qcur [[buffer(0)]], device const half* kq [[buffer(1)]],
+                          device const half* vq [[buffer(2)]], device const int* ids [[buffer(3)]],
+                          device float* part [[buffer(4)]], constant QsaArgs& a [[buffer(5)]],
+                          device const uint* rinfo [[buffer(6), function_constant(qsa_rows)]],
+                          uint3 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                          ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr int HPG = QH / QKV;   // 12 query heads per kv head
+    threadgroup float qs[HPG][QD];
+    threadgroup float s[HPG][QCH];
+    threadgroup int cid[QCH];
+    const int chunk = int(tg.x), g = int(tg.y), t = int(tg.z);
+    const uint n_kv = (qsa_rows ? rinfo[8 + 4 * t + 1] : a.pos0 + uint(t)) + 1, width = min(n_kv, uint(QBUDGET));
+    if (qsa_rows) { const ulong sl = rinfo[8 + 4 * t]; kq += sl * rinfo[0]; vq += sl * rinfo[0]; }
+    const int c0 = chunk * QCH;
+    const int nchunks = (QBUDGET + QCH - 1) / QCH;
+    device float* pp = part + ((uint(t) * nchunks + chunk) * QH) * (QD + 2);
+    if (uint(c0) >= width) {
+        for (int h = 0; h < HPG; ++h)
+            if (tid == 0) { pp[(g * HPG + h) * (QD + 2) + QD] = -INFINITY; pp[(g * HPG + h) * (QD + 2) + QD + 1] = 0.0f; }
+        return;
+    }
+    const int nc = min(QCH, int(width) - c0);
+    for (int h = 0; h < HPG; ++h) qs[h][tid] = qcur[(t * QH + g * HPG + h) * QD + tid];
+    if (tid < QCH) cid[tid] = tid < nc ? ids[t * QBUDGET + c0 + tid] : 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int c = sg; c < nc; c += 8) {
+        const uint rowi = uint(cid[c]) * QKV + uint(g);
+        // kq is half*: pointer arithmetic is in ELEMENTS (2 B each).  This lane reads the row's dims lane*8 .. +7,
+        // so the base is `off` elements and the second half4 sits 4 elements (not 8) after it.
+        const int off = int(rowi) * QD + lane * 8;
+        const half4 k0 = *(device const half4*)(kq + off);
+        const half4 k1 = *(device const half4*)(kq + off + 4);
+        const float kv[8] = {float(k0.x), float(k0.y), float(k0.z), float(k0.w),
+                             float(k1.x), float(k1.y), float(k1.z), float(k1.w)};
+        for (int h = 0; h < HPG; ++h) {
+            float d = 0.0f;
+            for (int i = 0; i < 8; ++i) d = fma(qs[h][lane * 8 + i], kv[i], d);
+            d = simd_sum(d);
+            if (lane == 0) s[h][c] = d * 0.0625f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float mh[HPG], lh[HPG];
+    for (int h = sg; h < HPG; h += 8) {
+        float m = -INFINITY;
+        for (int c = lane; c < nc; c += 32) m = max(m, s[h][c]);
+        m = simd_max(m);
+        float l = 0.0f;
+        for (int c = lane; c < nc; c += 32) {
+            const float p = exp(s[h][c] - m);
+            s[h][c] = p;
+            l += p;
+        }
+        l = simd_sum(l);
+        if (lane == 0) { mh[h] = m; lh[h] = l; }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float acc[HPG];
+    for (int h = 0; h < HPG; ++h) acc[h] = 0.0f;
+    for (int c = 0; c < nc; ++c) {
+        const uint rowi = uint(cid[c]) * QKV + uint(g);
+        const float v = float(vq[rowi * QD + tid]);   // thread = dim j: the row's half at [j]
         for (int h = 0; h < HPG; ++h) acc[h] = fma(s[h][c], v, acc[h]);
     }
     for (int h = 0; h < HPG; ++h) {
