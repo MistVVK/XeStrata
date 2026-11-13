@@ -48,6 +48,7 @@ macro(strata_hip_mmq)
     set(_strata_pf_own_sources
       src/prefill/moe_fused.cu
       src/prefill/moe_fused_iq.cu
+      src/prefill/moe_fused_iq_q36.cu   # the same kernels again for Qwen3.6's expert shape (gfx12: strata-q36's fused prompt experts)
       src/prefill/moe_f16_kq.cu
       src/prefill/moe_helpers.cu)   # the gathers, SwiGLU passes and row table (cut from moe_mmq.cu)
     if(STRATA_MMQ_KQUANTS)
@@ -104,6 +105,7 @@ macro(strata_hip_pf_own)
     set(_strata_pf_own_sources
       src/prefill/moe_fused.cu
       src/prefill/moe_fused_iq.cu
+      src/prefill/moe_fused_iq_q36.cu
       src/prefill/moe_f16_kq.cu
       src/prefill/moe_helpers.cu)
     set_source_files_properties(${_strata_pf_own_sources} PROPERTIES LANGUAGE HIP INCLUDE_DIRECTORIES "${STRATA_HIP_COMPAT_INCLUDE_DIR}")
@@ -143,6 +145,14 @@ macro(strata_hip_prompt_tests)
     add_test(NAME hip_prefill_fused_iq_f16 COMMAND hip_prefill_fused_iq)
     set_tests_properties(hip_prefill_fused_iq_f16 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 ENVIRONMENT "STRATA_PF_F16=1;STRATA_PF_F16_KQ=1")
     list(APPEND _strata_hip_tests hip_prefill_fused_iq)
+    # the same kernels at Qwen3.6's expert shape (n_embd 2048, n_ff 512: the copy moe_fused_iq_q36.cu compiles, gfx12): UD-Q4_K_XL's pairs (Q4_K / Q5_K and Q5_K gate/up
+    # with Q5_K / Q6_K downs), UD-Q6_K_XL's Q6_K + Q8_0 and the Q8_0 file's Q8_0 / Q8_0 against the reference and the int8 model (77 off gfx12 and without a card)
+    add_executable(hip_prefill_fused_q36 tests/cuda/prefill_fused_q36_test.cpp)
+    target_include_directories(hip_prefill_fused_q36 PRIVATE "${_strata_gg}/include")
+    target_link_libraries(hip_prefill_fused_q36 PRIVATE ${_strata_pf_tests_lib} ggml-base strata_hip_runtime)
+    add_test(NAME hip_prefill_fused_q36 COMMAND hip_prefill_fused_q36)
+    set_tests_properties(hip_prefill_fused_q36 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+    list(APPEND _strata_hip_tests hip_prefill_fused_q36)
     # one prompt layer of experts timed on every path the engine can take (see tests/cuda/prefill_expert_paths_bench.cpp); any AMD card, a small smoke run here
     add_executable(hip_prefill_expert_paths_bench tests/cuda/prefill_expert_paths_bench.cpp)
     target_include_directories(hip_prefill_expert_paths_bench PRIVATE "${_strata_gg}/include")

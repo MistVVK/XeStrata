@@ -343,6 +343,12 @@ int main() {
         check(pr.first, pr.second, 512, 256, s, rng);
         check(pr.first, pr.second, 2560, 640, s, rng);
     }
+    // fourth wave: the Qwen3.6 sets (n_embd 2048, n_ff 512): UD-Q4_K_XL's Q4_K / Q5_K, Q4_K / Q6_K, Q5_K / Q6_K (Q5_K and Q6_K as down), UD-Q6_K_XL's Q6_K / Q8_0 and its one
+    // Q8_0 / Q8_0 layer, and the smaller shapes of the same pairs
+    for (const auto& pr : std::vector<std::pair<int, int>>{{12, 13}, {12, 14}, {13, 14}, {14, 13}, {14, 14}, {8, 8}, {8, 13}, {16, 13}, {23, 14}, {14, 8}}) {
+        check(pr.first, pr.second, 512, 256, s, rng);
+        check(pr.first, pr.second, 2048, 512, s, rng);
+    }
     if (g_run == 0) { std::printf("native_i8_parity: nothing ran (%d skipped: not covered on this device)\n", g_skipped); return 77; }
     if (g_skipped) std::printf("native_i8_parity: %d format rows skipped: not covered on this device\n", g_skipped);
     std::printf("native_i8_parity: %s\n", g_fail ? "FAILED" : "all ok");

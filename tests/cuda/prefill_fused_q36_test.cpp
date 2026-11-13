@@ -608,9 +608,19 @@ int main(int argc, char** argv) {
 #endif
         int n = 0;
         if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) { std::printf("no CUDA device: skipped\n"); return 77; }
+#if defined(__HIPCC__) || defined(__HIP_PLATFORM_AMD__)
+        {   // HIP: the Qwen3.6 copy's kernels are gfx12's (native_w11_kernel); another AMD card skips
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess || std::strncmp(prop.gcnArchName, "gfx12", 5) != 0) {
+                std::printf("the Qwen3.6 fused kernels on HIP are gfx12's (%s: skipped)\n", prop.gcnArchName);
+                return 77;
+            }
+        }
+#else
         int major = 0;
         cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
         if (major < 8) { std::printf("the fused kernels need sm_80 or newer: skipped\n"); return 77; }
+#endif
         if (!mmq::built()) std::printf("no MMQ in this build: the pairs are judged by the no-MMQ rule (the int8 model and its ceiling)\n");
         const std::vector<Pair> pairs = {
             // UD-Q6_K_XL: 40 layers Q6_K / Q8_0 and one Q8_0 / Q8_0; the Q8_0 file: Q8_0 / Q8_0 on all 41
@@ -619,7 +629,8 @@ int main(int argc, char** argv) {
             // UD-Q4_K_XL: Q4_K gate/up with a Q5_K down on 38 layers, Q4_K / Q6_K on 2, Q5_K / Q6_K on 1 (K-quant downs: K = 512 is two 256-value super-blocks)
             {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, "Q4_K / Q5_K", true},
             {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, "Q4_K / Q6_K", true},
-            {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, "Q5_K / Q6_K", true}};
+            {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, "Q5_K / Q6_K", true},
+            {GGML_TYPE_Q5_K, GGML_TYPE_Q5_K, "Q5_K / Q5_K", true}};
         const char* only = nullptr;   // --only=NAME: the pairs whose name contains NAME
         bool timing = true, ref = true;
         std::vector<int> chunks = {2048, 8192};   // --chunks=A,B: the timing part's chunk sizes

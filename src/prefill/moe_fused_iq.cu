@@ -1793,7 +1793,11 @@ native_w11_kernel(const Batch b, const NativeGeom geo, const Tables tb, const ui
                                  : blob + geo.down_off + (size_t) (rbase + ur) * geo.d_row;
         constexpr bool B128 = is_tq(WT);   // (STRATA_PF_FUSED_TQ=1, gfx12) 128-value blocks, gate/up and down: a block per two stages, sub-blocks 0-3
         // (STRATA_PF_FUSED_Q8GU=1, gfx12) a Q8_0 gate/up has 32-value blocks, two a stage, like its down: not a 256-value superblock
-        constexpr bool GU256 = GU && WT != T_Q2_0 && WT != T_Q8_0;
+        // (K-quant DOWN, gfx12 Qwen3.6 copy: n_ff 512 = two whole 256-value super-blocks a row, UD-Q4_K_XL's Q5_K / Q6_K downs) the same walk for a down row: a Q4_K / Q5_K / Q6_K down with K a multiple
+        // of 256, as the CUDA kernel's GU256 (D_ROWS_K % 256 == 0).  False for every other instance: GU instances keep their value, and the downs that exist (Q2_0, Q5_0, Q5_1, Q8_0, IQ4_NL,
+        // the trellis types) are no K-quants.
+        constexpr bool KQD256 = !GU && (WT == T_Q4_K || WT == T_Q5_K || WT == T_Q6_K) && D_ROWS_K % 256 == 0;
+        constexpr bool GU256 = (GU && WT != T_Q2_0 && WT != T_Q8_0) || KQD256;
         auto unit = [&](int s) -> const uint8_t* {
             if constexpr (B128) return wrow + (s >> 1) * BS;
             if (GU256) return wrow + (s >> 2) * BS;   // (Q2_0 gate/up: 64-value blocks, one a stage, like its down)

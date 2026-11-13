@@ -674,5 +674,20 @@ int main() {
         CHECK(!kq_takes(-1, Card{false, false, 16, s86_class(8, 7)}, -1) && !kq_takes(-1, Card{false, false, 132, s86_class(9, 0)}, -1) && !kq_takes(-1, Card{false, false, 68, s86_class(7, 5)}, -1) &&
               !kq_takes(-1, Card{false, false, 84, s86_class(8, 6, true)}, -1));
     }
+    // the Qwen3.6 engine on HIP: gfx12 only, STRATA_PF_FUSED=1 takes a covered pair, =0 never, unset never (a build with MMQ keeps its route); a build without MMQ reads unset as 1
+    {
+        using namespace strata::prefill::fused_tile;
+        for (int env = -1; env <= 1; ++env)
+            for (int gfx12 = 0; gfx12 <= 1; ++gfx12)
+                for (int covered = 0; covered <= 1; ++covered) CHECK(q36_takes_gfx12(env, gfx12 != 0, covered != 0) == (env == 1 && gfx12 && covered));
+        CHECK(q36_start_env(false, -1) == 1 && q36_start_env(false, 0) == 0 && q36_start_env(false, 1) == 1);   // no MMQ: unset -> 1, the user's value kept
+        CHECK(q36_start_env(true, -1) == -1 && q36_start_env(true, 0) == 0 && q36_start_env(true, 1) == 1);     // with MMQ: unchanged
+        // the two together: a build without MMQ takes a covered gfx12 layer by default and =0 takes it back; a build with MMQ takes none until the user sets 1
+        for (int env = -1; env <= 1; ++env) {
+            CHECK(q36_takes_gfx12(q36_start_env(false, env), true, true) == (env != 0));
+            CHECK(q36_takes_gfx12(q36_start_env(true, env), true, true) == (env == 1));
+            CHECK(!q36_takes_gfx12(q36_start_env(false, env), false, true));
+        }
+    }
     return failed == 0 ? 0 : 1;
 }
