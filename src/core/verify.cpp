@@ -520,10 +520,10 @@ bool Verifier::set_allowed(const uint32_t* rows, int T, std::string& err) {
     if (le_ < g_->n_layers) return true;
     allowed_on_ = rows != nullptr;
     if (rows != nullptr) {
-        if (T < 1 || T > strata::kernels::kVerifyMaxT) { err = "grammar mask: window rows out of range"; return false; }
+        if (T < 1 || T > strata::kernels::kVerifyNarrowT) { err = "grammar mask: window rows out of range"; return false; }
         const OnDevice on_device(device_);
         const size_t row = (size_t) ((n_vocab_ + 31) / 32) * sizeof(uint32_t);
-        if (!constraint_upload(allowed_device_, rows, row * strata::kernels::kVerifyMaxT, row * (size_t) T)) {
+        if (!constraint_upload(allowed_device_, rows, row * strata::kernels::kVerifyNarrowT, row * (size_t) T)) {
             err = "cannot upload the grammar's token masks"; return false;
         }
     }
@@ -562,8 +562,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     max_t_ = max_t;
     sampling_.greedy = true;      // a fresh verifier samples greedily until set_sampling says otherwise
     sampling_.temperature = 0.0f;
-    if (max_t < 2 || max_t > strata::kernels::kVerifyMaxT || max_t > strata::kernels::cpu::MAXT) {
-        err = "verify: the window must hold 2.." + std::to_string(strata::kernels::kVerifyMaxT) + " tokens";
+    if (max_t < 2 || max_t > strata::kernels::kVerifyNarrowT) {
+        err = "verify: the window must hold 2.." + std::to_string(strata::kernels::kVerifyNarrowT) + " tokens";
         return false;
     }
     if (hits.d_res == nullptr || hits.cache_base == nullptr || hits.blob <= 0) {
@@ -622,7 +622,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped((2 + T) * 4 + 16, (void**) &h_commit_, (void**) &m_commit_) &&
               mapped(T * N * 4, (void**) &h_ple_, (void**) &m_ple_) &&
               mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) &&
-              mapped((size_t) strata::kernels::kVerifyMaxT * strata::kernels::kNonfiniteBlocks * 4, (void**) &h_nf_,
+              mapped((size_t) strata::kernels::kVerifyNarrowT * strata::kernels::kNonfiniteBlocks * 4, (void**) &h_nf_,
                      (void**) &m_nf_) &&
               mapped((size_t) g.n_layers * T * K * 4, (void**) &h_route_, (void**) &m_route_);
     if (!ok) { err = "verify: mapped staging allocation failed"; return false; }
@@ -1890,7 +1890,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
     const bool do_ple = ss.ple.ready() && ple_stage();
     const bool ple_late = do_ple && !res && lb_ == 0;   // read after the launch below (record_window's ple_late)
-    uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];
+    uint32_t ple_rows[kVerifyNarrowT * PLE_N_HEADS];
     if (do_ple) {
         int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
         for (int t = 0; t < T; ++t) {
@@ -2283,9 +2283,9 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
     using namespace strata::kernels;
     if (rt_dump_ || rt_replay_) { err = "XESTRATA_ROUTE_DUMP / XESTRATA_ROUTE_REPLAY: one request at a time (no batch slots)"; return false; }
     // a slot may own a contiguous group of rows (--batch-mtp), also across the stages of a layer split, whose hand-off
-    // buffers hold kVerifyMaxT rows (a stage that hands rows on or takes them; upstream 48f2c47d)
+    // buffers hold kVerifyNarrowT rows (a stage that hands rows on or takes them; upstream 48f2c47d)
     // (STRATA_PIPED_MTP: set_handoff_rows holds more)
-    const int hand_rows = handoff_rows_ > 0 ? handoff_rows_ : (int) kVerifyMaxT;
+    const int hand_rows = handoff_rows_ > 0 ? handoff_rows_ : (int) kVerifyNarrowT;
     if (S < 1 || S > max_t_ || hbase < 0 || ((next_ != nullptr || lb_ > 0) && hbase + S > hand_rows)) {
         err = "verify: batch rows out of range (init_slots)";
         return false;
@@ -2354,7 +2354,7 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
         for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) pos[t];
     }
     if (ss_->ple.ready() && ple_stage()) {
-        uint32_t ple_rows[kVerifyMaxT * PLE_N_HEADS];   // (not `rows`: that is the slots of the window's rows)
+        uint32_t ple_rows[kVerifyNarrowT * PLE_N_HEADS];   // (not `rows`: that is the slots of the window's rows)
         for (int t = 0; t < S; ++t) {
             const SessionState& sx = *slots_[(size_t) rows[t]];
             int32_t prev[2] = {sx.ple_prev[0], sx.ple_prev[1]};
@@ -2889,7 +2889,7 @@ void Verifier::note_nonfinite(int T, const int64_t* pos_b) {
     nf_mask_ = 0;
     if (!nan_guard_on() || h_nf_ == nullptr || !last_stage()) return;   // (a stage without the head checks nothing)
     const volatile uint32_t* f = h_nf_;
-    for (int t = 0; t < T && t < strata::kernels::kVerifyMaxT; ++t)
+    for (int t = 0; t < T && t < strata::kernels::kVerifyNarrowT; ++t)
         for (int b = 0; b < strata::kernels::kNonfiniteBlocks; ++b)
             if (f[t * strata::kernels::kNonfiniteBlocks + b] != 0) { nf_mask_ |= 1u << t; break; }
     const std::vector<long long>& inject = nan_inject_list();
@@ -3083,7 +3083,7 @@ bool Verifier::pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_
         for (int64_t h = 0; h < g.idx_q_heads; ++h) pi[t * g.idx_q_heads + h] = (int32_t) (pos0 + t);
     }
     if (ss.ple.ready() && ple_stage()) {
-        uint32_t rows[kVerifyMaxT * PLE_N_HEADS];
+        uint32_t rows[kVerifyNarrowT * PLE_N_HEADS];
         int32_t prev[2] = {ple_prev[0], ple_prev[1]};
         for (int t = 0; t < T; ++t) {
             ngram_rows(&tokens[t], prev, 1, ss.ple.consts, rows + (size_t) t * PLE_N_HEADS);

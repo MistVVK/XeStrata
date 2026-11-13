@@ -71,12 +71,22 @@ inline uint32_t read_host(const uint32_t* p) {
 }  // namespace
 
 namespace {
+// The narrow form of a window's row copies: a window of up to kVerifyNarrowT rows passes the kernels the argument it
+// always did (the wide form only past it)
+using GdnRowCopiesNarrow = GdnRowCopiesN<kVerifyNarrowT>;
+GdnRowCopiesNarrow narrow_copies(const GdnRowCopies& c) {
+    GdnRowCopiesNarrow r;
+    r.n = c.n;
+    for (int t = 0; t < c.n && t < kVerifyNarrowT; ++t) r.p[t] = c.p[t];
+    return r;
+}
+
 // COPIES: the rows' histories also to cp (the plain engine's drafts); its own instance, so the verify window's kernel
 // is the one it was
-template <bool COPIES>
+template <bool COPIES, typename CP>
 sycl::event gdn_conv_l2_launch(sycl::queue& q, const float* history, const float* qkv, const float* conv_w, float* h,
                                int C, int qk_heads, float eps, int n_tok, int t_begin, float* hist_out,
-                               const GdnRowCopies cp) {
+                               const CP cp) {
     return q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> part(sycl::range<1>(S / WARP), hd);
         hd.parallel_for(sycl::nd_range<2>({(size_t) n_tok, (size_t) C}, {1, S}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
@@ -107,7 +117,7 @@ sycl::event gdn_conv_l2_launch(sycl::queue& q, const float* history, const float
                 ho[1] = v2;
                 ho[2] = x;
             }
-            // the history after token t, beside the window's own; cp.n is kVerifyMaxT at most (gdn_conv_l2_multi
+            // the history after token t, beside the window's own; cp.n is the array's size at most (gdn_conv_l2_multi
             // checks it), so t < cp.n keeps to the array
             if constexpr (COPIES)
                 if (t < cp.n && cp.p[t] != nullptr) {   // NOLINT(clang-analyzer-security.ArrayBound)
@@ -129,11 +139,14 @@ void gdn_conv_l2_multi(const float* history, const float* qkv, const float* conv
         fail("gdn_conv_l2_multi: invalid arguments");   // the kernel reads copies->p[t] for t < copies->n
     float* hist_out = commit ? const_cast<float*>(history) : nullptr;   // a work-item reads and writes its channel only
     auto& q = Q(stream);
-    const auto e = copies != nullptr && copies->n > 0
+    const auto e = copies != nullptr && copies->n > kVerifyNarrowT
                        ? gdn_conv_l2_launch<true>(q, history, qkv, conv_w, h, channels, qk_heads, eps, n_tok, t_begin,
                                                   hist_out, *copies)
+                   : copies != nullptr && copies->n > 0
+                       ? gdn_conv_l2_launch<true>(q, history, qkv, conv_w, h, channels, qk_heads, eps, n_tok, t_begin,
+                                                  hist_out, narrow_copies(*copies))
                        : gdn_conv_l2_launch<false>(q, history, qkv, conv_w, h, channels, qk_heads, eps, n_tok, t_begin,
-                                                   hist_out, GdnRowCopies{});
+                                                   hist_out, GdnRowCopiesNarrow{});
     done(stream, e, "gdn_conv_l2_multi");
 }
 
@@ -254,7 +267,12 @@ void gdn_ab_run(const float* x, const WT* w_alpha, const WT* w_beta, const float
         case 4: e = gdn_ab_launch<4, true>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
         case 5: e = gdn_ab_launch<5, true>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
         case 6: e = gdn_ab_launch<6, true>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok); break;
-        default: e = gdn_ab_launch<kVerifyMaxT, false>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+        case 7:
+        case 8:
+            e = gdn_ab_launch<kVerifyNarrowT, false>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
+            break;
+        default:   // a wide window
+            e = gdn_ab_launch<kWindowMaxT, false>(q, x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
     }
     done(stream, e, "gdn_ab_multi");
 }
@@ -280,11 +298,11 @@ constexpr int GS_COLS = 32;
 // SNAP: the state after each of the first sn.n tokens also to sn.p[t] (the plain engine's drafts); its own instance, so
 // the forms the verify window takes keep their registers (a copy in the prefetch form took the RTX 4070's 512
 // work-items past the registers it has).
-template <bool Q8, bool SNAP = false>
+template <bool Q8, bool SNAP = false, typename CP = GdnRowCopiesNarrow>
 sycl::event gdn_step_split(sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
                            const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
                            const int32_t* n_keep, int t_out_begin, uint8_t* y_q8_1,
-                           const GdnRowCopies sn) {
+                           const CP sn) {
     q.submit([&](sycl::handler& hd) {
         sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
             red(sycl::range<1>((size_t) RG * GS_COLS), hd);
@@ -607,7 +625,7 @@ int gdn_forced() {   // STRATA_GDN_STEP=0|1|2: one form always (one group a head
 sycl::event gdn_step_form(int form, sycl::queue& q, float* state, const float* hbuf, int C, const float* gate, const float* beta,
                            const float* z, const float* gamma, float eps, float* y, int h_k, int h_v, int T,
                            const int32_t* n_keep, int t_out_begin, uint8_t* y_q8_1,
-                           const GdnRowCopies sn) {
+                           const GdnRowCopiesNarrow sn) {
     if (sn.n > 0) {   // the rows' copies: the split form's own instance
         if (y_q8_1 != nullptr)
             return gdn_step_split<true, true>(q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, T, n_keep,
@@ -647,8 +665,8 @@ void gdn_step_tune(int C, int h_k, int h_v, void* stream) {
             return c;
         }
         // scratch inputs of the model's shape; small values keep the recurrence finite
-        const size_t n_state = (size_t) S * S * h_v, n_h = (size_t) kVerifyMaxT * C;
-        const size_t n_g = (size_t) kVerifyMaxT * h_v, n_y = (size_t) kVerifyMaxT * S * h_v;
+        const size_t n_state = (size_t) S * S * h_v, n_h = (size_t) kVerifyNarrowT * C;
+        const size_t n_g = (size_t) kVerifyNarrowT * h_v, n_y = (size_t) kVerifyNarrowT * S * h_v;
         float* buf = sycl::malloc_device<float>(n_state + n_h + 2 * n_g + 2 * n_y + S + n_y / 32 * 9, q);
         if (buf == nullptr) fail("gdn_step_tune: device allocation failed");
         float *state = buf, *h = state + n_state, *gate = h + n_h, *beta = gate + n_g, *z = beta + n_g;
@@ -660,14 +678,14 @@ void gdn_step_tune(int C, int h_k, int h_v, void* stream) {
         // its clock under the first ones), the first round a warm-up, each form's fastest round kept
         namespace sx = sycl::ext::oneapi::experimental;
         using Exec = sx::command_graph<sx::graph_state::executable>;
-        for (int T = 1; T <= kVerifyMaxT; ++T) {
+        for (int T = 1; T <= kVerifyNarrowT; ++T) {
             std::vector<Exec> exec;
             for (int form = 0; form < kGdnForms; ++form) {
                 sx::command_graph<sx::graph_state::modifiable> graph(q.get_context(), q.get_device());
                 graph.begin_recording(q);
                 for (int i = 0; i < 32; ++i)
                     gdn_step_form(form, q, state, h, C, gate, beta, z, gamma, 1e-6f, y, h_k, h_v, T, nullptr, 0, yq,
-                                  GdnRowCopies{});
+                                  GdnRowCopiesNarrow{});
                 graph.end_recording(q);
                 exec.push_back(graph.finalize());
             }
@@ -685,10 +703,13 @@ void gdn_step_tune(int C, int h_k, int h_v, void* stream) {
                 if (t_min[form] < t_min[c.form[T]]) c.form[T] = (int8_t) form;
         }
         sycl::free(buf, q);
-        char forms[kVerifyMaxT + 1] = {};
-        for (int T = 1; T <= kVerifyMaxT; ++T) forms[T - 1] = (char) ('0' + c.form[T]);
+        // a wider window takes the eighth's form (untimed: the wide windows are a run's choice, the timing is not
+        // worth its start-up time to every run)
+        for (int T = kVerifyNarrowT + 1; T <= kVerifyMaxT; ++T) c.form[T] = c.form[kVerifyNarrowT];
+        char forms[kVerifyNarrowT + 1] = {};
+        for (int T = 1; T <= kVerifyNarrowT; ++T) forms[T - 1] = (char) ('0' + c.form[T]);
         std::fprintf(stderr, "xestrata: GDN step forms for windows of 1..%d tokens: %s (0 one group a head, 1 split, "
-                     "2 prefetch)\n", kVerifyMaxT, forms);
+                     "2 prefetch)\n", kVerifyNarrowT, forms);
         return c;
     });
 }
@@ -745,8 +766,21 @@ void gdn_step_norm_multi(float* state, const float* hbuf, int C, const float* ga
         done(stream, gdn_state_commit(q, state, hbuf, C, gate, beta, h_k, h_v, n_keep), "gdn_step_norm_multi");
         return;
     }
+    // more copies than the narrow form holds: the split's wide instance
+    if (snaps != nullptr && snaps->n > kVerifyNarrowT) {
+        uint8_t* yq = static_cast<uint8_t*>(y_q8_1);
+        const auto e = yq != nullptr
+                           ? gdn_step_split<true, true, GdnRowCopies>(q, state, hbuf, C, gate, beta, z, gamma, eps, y,
+                                                                      h_k, h_v, n_tok, n_keep, t_out_begin, yq, *snaps)
+                           : gdn_step_split<false, true, GdnRowCopies>(q, state, hbuf, C, gate, beta, z, gamma, eps, y,
+                                                                       h_k, h_v, n_tok, n_keep, t_out_begin, nullptr,
+                                                                       *snaps);
+        done(stream, e, "gdn_step_norm_multi");
+        return;
+    }
+    const GdnRowCopiesNarrow sn = snaps != nullptr ? narrow_copies(*snaps) : GdnRowCopiesNarrow{};
     done(stream, gdn_step_form(form, q, state, hbuf, C, gate, beta, z, gamma, eps, y, h_k, h_v, n_tok, n_keep, t_out_begin,
-                               static_cast<uint8_t*>(y_q8_1), snaps != nullptr ? *snaps : GdnRowCopies{}),
+                               static_cast<uint8_t*>(y_q8_1), sn),
          "gdn_step_norm_multi");
 }
 
@@ -772,8 +806,8 @@ bool gdn_commit_layers(float* state, int64_t state_stride, int64_t conv_off, con
 namespace {
 // gdn_step_plain's arithmetic with group gi's own pointers (one launch for a batch window's slots; each group's
 // state, rows and token count are its own, so its arithmetic is that of its own gdn_step_norm_multi call).
-template <bool Q8>
-sycl::event gdn_step_groups_launch(sycl::queue& q, const GdnGroups grp, const float* h0, int C, const float* gate0,
+template <bool Q8, typename G>
+sycl::event gdn_step_groups_launch(sycl::queue& q, const G grp, const float* h0, int C, const float* gate0,
                                    const float* beta0, const float* z0, const float* gamma, float eps, float* y0,
                                    int h_k, int h_v, bool commit) {
     return q.submit([&](sycl::handler& hd) {
@@ -871,8 +905,23 @@ void gdn_step_norm_groups(const GdnGroups& g, const float* h, int C, const float
             fail("gdn_step_norm_groups: invalid group");
     auto& q = Q(stream);
     const bool q8 = g.y_q8_1[0] != nullptr;
-    done(stream, q8 ? gdn_step_groups_launch<true>(q, g, h, C, gate, beta, z, gamma, eps, y, h_k, h_v, commit)
-                    : gdn_step_groups_launch<false>(q, g, h, C, gate, beta, z, gamma, eps, y, h_k, h_v, commit),
+    if (g.n > kVerifyNarrowT) {   // more groups than the narrow argument holds: the wide instance
+        done(stream, q8 ? gdn_step_groups_launch<true>(q, g, h, C, gate, beta, z, gamma, eps, y, h_k, h_v, commit)
+                        : gdn_step_groups_launch<false>(q, g, h, C, gate, beta, z, gamma, eps, y, h_k, h_v, commit),
+             "gdn_step_norm_groups");
+        return;
+    }
+    GdnGroupsN<kVerifyNarrowT> n8;   // the argument a window of up to 8 groups always passed
+    n8.n = g.n;
+    for (int i = 0; i < g.n; ++i) {
+        n8.state[i] = g.state[i];
+        n8.keep[i] = g.keep[i];
+        n8.y_q8_1[i] = g.y_q8_1[i];
+        n8.first[i] = g.first[i];
+        n8.ntok[i] = g.ntok[i];
+    }
+    done(stream, q8 ? gdn_step_groups_launch<true>(q, n8, h, C, gate, beta, z, gamma, eps, y, h_k, h_v, commit)
+                    : gdn_step_groups_launch<false>(q, n8, h, C, gate, beta, z, gamma, eps, y, h_k, h_v, commit),
          "gdn_step_norm_groups");
 }
 
@@ -1039,16 +1088,17 @@ bool doorbell_visible(void* stream) {
     return ok;
 }
 
-void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_expert, const uint8_t* cache_base,
-                   const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx, uint32_t* skip,
-                   uint32_t ring, void* stream) {
-    // One work-item per entry (at most kVerifyMaxT * 10 of them; one work-item alone grouped them in ~70 us a layer,
-    // upstream 882764d).  The plan is the host loop's exactly: groups in order of first occurrence, entries in a group
-    // in index order.  Entry i: L = its expert's first index; its group = the first occurrences before L; the group
-    // starts at the number of entries whose leader is before L; its place in it = the earlier entries with leader L.
-    constexpr int WG = 128;
-    if (n > WG) throw std::invalid_argument("resident_plan: more entries than a work-group");
-    const auto e = Q(stream).submit([&](sycl::handler& h) {
+namespace {
+// One work-item per entry (one work-item alone grouped them in ~70 us a layer, upstream 882764d).  The plan is the host
+// loop's exactly: groups in order of first occurrence, entries in a group in index order.  Entry i: L = its expert's
+// first index; its group = the first occurrences before L; the group starts at the number of entries whose leader is
+// before L; its place in it = the earlier entries with leader L.  WG: 128 for the narrow window's entries (8 rows of 10
+// experts, as it always ran), 256 for a wider window's (upstream 9d3c8c366).
+template <int WG>
+sycl::event resident_plan_launch(sycl::queue& q, const int32_t* ids, int n, int k, const int32_t* res, int n_expert,
+                                 const uint8_t* cache_base, const unsigned long long* slot_off, long long blob,
+                                 int32_t* pl, long long capx, uint32_t* skip, uint32_t ring) {
+    return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<int32_t, 1> s_ids(sycl::range<1>(WG), h);
         sycl::local_accessor<int32_t, 1> s_excl(sycl::range<1>(WG), h);
         h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
@@ -1111,6 +1161,19 @@ void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_e
             *skip = ring;
         });
     });
+}
+}  // namespace
+
+void resident_plan(const int32_t* ids, int n, int k, const int32_t* res, int n_expert, const uint8_t* cache_base,
+                   const unsigned long long* slot_off, long long blob, int32_t* pl, long long capx, uint32_t* skip,
+                   uint32_t ring, void* stream) {
+    constexpr int kNarrow = 128;   // a narrow window's 8 rows of 10 experts
+    if (n > 2 * kNarrow) throw std::invalid_argument("resident_plan: more entries than a work-group");
+    auto& q = Q(stream);
+    const auto e = n <= kNarrow ? resident_plan_launch<kNarrow>(q, ids, n, k, res, n_expert, cache_base, slot_off, blob,
+                                                                pl, capx, skip, ring)
+                                : resident_plan_launch<2 * kNarrow>(q, ids, n, k, res, n_expert, cache_base, slot_off,
+                                                                    blob, pl, capx, skip, ring);
     done(stream, e, "resident_plan");
 }
 

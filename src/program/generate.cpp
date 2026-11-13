@@ -2787,7 +2787,7 @@ int main(int argc, char** argv) {
     // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.
     if (o.suffix_draft > 0 && o.spec >= 2 && o.mtp_max_t == 0) {
         o.mtp_max_t = o.spec;
-        o.spec = std::min(o.spec + 2, 8);   // kVerifyMaxT
+        o.spec = std::min(o.spec + 2, 8);   // kVerifyNarrowT
     }
     // --lookup-chain (opt-in): the MTP keeps its windows; a lookup chained after its drafts may lengthen one by up to K.
     // Sized from the cap actually in force: the suffix block above may already have raised --spec to --spec+2, so sizing
@@ -2795,7 +2795,7 @@ int main(int argc, char** argv) {
     if (o.lookup_chain > 0 && o.spec >= 2) {
         if (o.mtp_max_t == 0) o.mtp_max_t = o.spec;
         const int chain_base = o.spec;
-        o.spec = std::max(chain_base, std::min(std::max(chain_base, o.mtp_max_t) + o.lookup_chain, 8));   // kVerifyMaxT
+        o.spec = std::max(chain_base, std::min(std::max(chain_base, o.mtp_max_t) + o.lookup_chain, 8));   // kVerifyNarrowT
     }
     strata::core::layer_set_shared_early(!o.shared_late);
     if (!o.native_preset.empty()) {
@@ -4645,7 +4645,7 @@ int main(int argc, char** argv) {
         const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
         // --pipeline-windows 2: 8 rows (the chain runs on past the window in flight: its drafts, its bonus token and
         // the next window's drafts), and the round/step graphs carry the forcing kernel
-        const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyMaxT : o.spec;
+        const int mtp_t = o.pipeline_windows >= 2 ? strata::kernels::kVerifyNarrowT : o.spec;
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "xestrata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
     }
@@ -4731,10 +4731,10 @@ int main(int argc, char** argv) {
         const char* why = !o.serve ? "it needs --serve"
                         : o.batch < 2 ? "it needs at least 2 slots"
                         : nullptr;
-        if (o.batch > strata::kernels::kVerifyMaxT && !batch_mtp) {   // --batch-mtp: the slots rotate through the windows
+        if (o.batch > strata::kernels::kVerifyNarrowT && !batch_mtp) {   // --batch-mtp: the slots rotate through the windows
             std::fprintf(stderr, "xestrata generate: --batch %d: a window holds %d rows, so %d slots\n", o.batch,
-                         strata::kernels::kVerifyMaxT, strata::kernels::kVerifyMaxT);
-            o.batch = strata::kernels::kVerifyMaxT;
+                         strata::kernels::kVerifyNarrowT, strata::kernels::kVerifyNarrowT);
+            o.batch = strata::kernels::kVerifyNarrowT;
         }
         if (why != nullptr) {
             std::fprintf(stderr, "xestrata generate: --batch is off: %s\n", why);
@@ -4852,17 +4852,17 @@ int main(int argc, char** argv) {
         // --batch-mtp goes on as it would without it: in serial windows, or off beside the pipelined groups.
         if (batch_mtp && piped_mtp_asked && !stages.empty() && o.batch > 0) {
             pm_drafts = std::clamp((int) std::strtol(piped_mtp_env, nullptr, 10), 1,
-                                   std::max(1, std::min(o.spec - 1, (int) strata::kernels::kVerifyMaxT - 1)));
+                                   std::max(1, std::min(o.spec - 1, (int) strata::kernels::kVerifyNarrowT - 1)));
             char buf[160];
             const char* why = nullptr;
             if (o.batch_groups <= 1) {
                 std::snprintf(buf, sizeof buf, "it needs 2 or more pipelined groups and %d slot%s in %d group%s are left",
                               o.batch, o.batch == 1 ? "" : "s", o.batch_groups, o.batch_groups == 1 ? "" : "s");
                 why = buf;
-            } else if ((o.batch / o.batch_groups) * (1 + pm_drafts) > (int) strata::kernels::kVerifyMaxT) {
+            } else if ((o.batch / o.batch_groups) * (1 + pm_drafts) > (int) strata::kernels::kVerifyNarrowT) {
                 std::snprintf(buf, sizeof buf, "a group's window would hold %d rows (%d slots x %d), more than %d",
                               (o.batch / o.batch_groups) * (1 + pm_drafts), o.batch / o.batch_groups, 1 + pm_drafts,
-                              (int) strata::kernels::kVerifyMaxT);
+                              (int) strata::kernels::kVerifyNarrowT);
                 why = buf;
             }
             if (why != nullptr) {
@@ -7110,7 +7110,7 @@ int main(int argc, char** argv) {
         // the widest window; a request without penalties gets a null buffer and takes the byte-for-byte
         // neutral path (no upload, no buffer handed to the sampler).
         constexpr int kPenaltyWindowCap = 4096;
-        constexpr size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) strata::kernels::kVerifyMaxT;
+        constexpr size_t kHistSlots = (size_t) kPenaltyWindowCap * (size_t) strata::kernels::kVerifyNarrowT;
         int32_t* d_hist = nullptr;
         std::vector<int32_t> hist_stage(kHistSlots, -1);
         const int hist_dev = last_st ? last_st->dev : -1;   // with the head: the last stage's device
@@ -7168,9 +7168,9 @@ int main(int argc, char** argv) {
         }
         if (n_stages > 1) {
             // STRATA_PIPED_MTP: the groups write each slot's token and proposals at hbase = group * rows-per-group, so
-            // the hand-off holds every slot's rows (otherwise kVerifyMaxT, as before)
-            const int hrows = piped_mtp ? std::max<int>(strata::kernels::kVerifyMaxT, (1 + pm_drafts) * o.batch)
-                                        : (int) strata::kernels::kVerifyMaxT;
+            // the hand-off holds every slot's rows (otherwise kVerifyNarrowT, as before)
+            const int hrows = piped_mtp ? std::max<int>(strata::kernels::kVerifyNarrowT, (1 + pm_drafts) * o.batch)
+                                        : (int) strata::kernels::kVerifyNarrowT;
             const size_t hb = (size_t) hrows * (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             auto dev_of = [&](int st) { return st == 0 || split_same ? 0 : stages[(size_t) st - 1]->dev; };
             auto hand_alloc = [&](int dev) -> float* {
@@ -7217,12 +7217,12 @@ int main(int argc, char** argv) {
                     vs.blob = thits.blob;
                     vs.slot_off = gs.cache.slot_offsets();
                     vs.n_slots = gs.cache.slots();
-                    // --batch-mtp: every stage runs the first one's windows of two rows a slot (up to kVerifyMaxT rows,
+                    // --batch-mtp: every stage runs the first one's windows of two rows a slot (up to kVerifyNarrowT rows,
                     // the hand-off's size) and bounds its captured batch layouts like it (upstream 48f2c47d)
                     if (batch_mtp) gs.ver.set_batch_graph_limit(64);
                     if (adapt_device_table_lags()) gs.ver.set_always_publish(true);
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
-                                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err);
+                                       batch_mtp ? strata::kernels::kVerifyNarrowT : std::max(o.spec, o.batch), err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
                     split_drive.cache_slot_off[st] = gs.cache.slot_offsets();
                     // the PCIe share's kernels read the missed experts where CUDA0's runtime allocated or registered
@@ -7271,7 +7271,7 @@ int main(int argc, char** argv) {
         // Verifier::pl_finish copies it across.
         float* pl_mtp_R = nullptr;
         if (pipe) {
-            const size_t hb = (size_t) strata::kernels::kVerifyMaxT *
+            const size_t hb = (size_t) strata::kernels::kVerifyNarrowT *
                               (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             auto hand_alloc = [&](int dev) -> float* {
                 const strata::core::OnDevice on(dev);
@@ -7310,7 +7310,7 @@ int main(int argc, char** argv) {
                                  gs.dev, st + 1, err.c_str());
                     return 1;
                 }
-                if (last && !strata::gpu::alloc_device(&pl_mtp_R, (size_t) strata::kernels::kVerifyMaxT *
+                if (last && !strata::gpu::alloc_device(&pl_mtp_R, (size_t) strata::kernels::kVerifyNarrowT *
                                                                       (size_t) (g.hc * g.n_embd) * sizeof(float))) {
                     std::fprintf(stderr, "xestrata serve: --pipeline-windows: the drafter's row buffer does not fit\n");
                     return 1;
@@ -7331,7 +7331,7 @@ int main(int argc, char** argv) {
         if (df2_loaded) ver.set_taps(df2.tap_layers());   // the DFlash2 drafter's taps (before init allocates them)
         else if (df2_deferred) ver.set_taps(df2_shape.taps);
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
-                      batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
+                      batch_mtp ? strata::kernels::kVerifyNarrowT : std::max(o.spec, o.batch), err) ||
             (use_mtp &&
              !mtp.bind(last_st ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
                        pipe ? pl_mtp_R : ver.final_R_all(), err))) {
@@ -7401,7 +7401,7 @@ int main(int argc, char** argv) {
             }
             // STRATA_PIPED_MTP: the rows a group's commit replays after the verdict, one hand-off row each
             for (int st = 0; slots_ok && piped_mtp && st < n_stages; ++st)
-                if (!stage_ver(st).init_deferred_commit(std::max<int>(strata::kernels::kVerifyMaxT, (1 + pm_drafts) * o.batch),
+                if (!stage_ver(st).init_deferred_commit(std::max<int>(strata::kernels::kVerifyNarrowT, (1 + pm_drafts) * o.batch),
                                                         err)) {
                     std::fprintf(stderr, "xestrata serve: XESTRATA_PIPED_MTP, stage %d: %s%s\n", st + 1, err.c_str(),
                                  vram_free_note().c_str());
@@ -9272,7 +9272,7 @@ int main(int argc, char** argv) {
         struct BSlot {
             bool active = false, stop = false;
             int32_t x = 0;                 ///< the token the next window feeds (not yet in the slot's state)
-            std::array<int32_t, strata::kernels::kVerifyMaxT> draft{};   ///< --batch-mtp: the slot's next proposal
+            std::array<int32_t, strata::kernels::kVerifyNarrowT> draft{};   ///< --batch-mtp: the slot's next proposal
             bool draft_ready = false;
             int n_drafts = 1;              ///< STRATA_PIPED_MTP: how many of `draft` its next window checks
             int64_t p = 0;                 ///< its position
@@ -9451,16 +9451,16 @@ int main(int argc, char** argv) {
         // so it keeps the conversation it holds (#465)
         auto batch_step = [&]() -> bool {
             int S = 0;
-            int rows[strata::kernels::kVerifyMaxT] = {};
-            int32_t tok[strata::kernels::kVerifyMaxT] = {}, outb[strata::kernels::kVerifyMaxT] = {};
-            int64_t pos[strata::kernels::kVerifyMaxT] = {};
+            int rows[strata::kernels::kVerifyNarrowT] = {};
+            int32_t tok[strata::kernels::kVerifyNarrowT] = {}, outb[strata::kernels::kVerifyNarrowT] = {};
+            int64_t pos[strata::kernels::kVerifyNarrowT] = {};
             // --batch-mtp: each slot takes two rows (its token and its proposal), the slots rotating when more are
             // active than a window holds
-            int first[strata::kernels::kVerifyMaxT] = {}, active[strata::kernels::kVerifyMaxT] = {};
+            int first[strata::kernels::kVerifyNarrowT] = {}, active[strata::kernels::kVerifyNarrowT] = {};
             static size_t next_slot = 0;
             int A = 0;
             const int per = batch_mtp ? 2 : 1;
-            for (size_t offset = 0; offset < bs.size() && S + per <= strata::kernels::kVerifyMaxT; ++offset) {
+            for (size_t offset = 0; offset < bs.size() && S + per <= strata::kernels::kVerifyNarrowT; ++offset) {
                 const int b = batch_mtp ? (int) ((next_slot + offset) % bs.size()) : (int) offset;
                 if (!bs[(size_t) b].active) continue;
                 first[A] = S;
@@ -9743,13 +9743,13 @@ int main(int argc, char** argv) {
         struct PGroup {
             bool inflight = false;
             int stage = 0;                  ///< the stage it runs on or waits for
-            int32_t tok[strata::kernels::kVerifyMaxT] = {};
-            int64_t pos[strata::kernels::kVerifyMaxT] = {};
+            int32_t tok[strata::kernels::kVerifyNarrowT] = {};
+            int64_t pos[strata::kernels::kVerifyNarrowT] = {};
             int64_t since = 0;              ///< the turn it started waiting (the longest waiting goes first)
             int S = 0;                      ///< slots in its window: up to its last active one (idle ones cost rows)
             // STRATA_PIPED_MTP (pmtp): S counts ROWS - each of the group's active slots' token, then that slot's
             // proposals - at hand-off rows [hbase, hbase + S)
-            int rows[strata::kernels::kVerifyMaxT] = {};
+            int rows[strata::kernels::kVerifyNarrowT] = {};
             int hbase = 0;
         };
         std::vector<PGroup> pg((size_t) (piped ? o.batch_groups : 0));
@@ -9795,7 +9795,7 @@ int main(int argc, char** argv) {
         // copies and chains (on its GPU) start then.
         const int pmtp_rows_per_group = GS * (1 + pm_drafts);
         const bool pmtp = piped && piped_mtp && batch_mtp && stage_ver(0).deferred_commit_on() &&
-                          pmtp_rows_per_group <= (int) strata::kernels::kVerifyMaxT;
+                          pmtp_rows_per_group <= (int) strata::kernels::kVerifyNarrowT;
         int64_t pm_checked = 0;   // proposals checked since the last timing line (bt_accepted: kept)
         // a slot whose next proposals are drafting (its chain in flight on the drafter's stream), and per slot the event
         // after the copy of its rows on the last stage's stream, which the chain waits for
@@ -9814,7 +9814,7 @@ int main(int argc, char** argv) {
                 }
         }
         // per stage, the commits judged but not yet queued there (the stage had a window in flight)
-        struct PmCommit { int rows[strata::kernels::kVerifyMaxT] = {}; int S = 0, hbase = 0; };
+        struct PmCommit { int rows[strata::kernels::kVerifyNarrowT] = {}; int S = 0, hbase = 0; };
         std::vector<std::vector<PmCommit>> pm_pending((size_t) n_pipe);
         auto pmtp_flush = [&](int k) -> bool {
             for (const PmCommit& c : pm_pending[(size_t) k])
@@ -9858,10 +9858,10 @@ int main(int argc, char** argv) {
             };
             // each slot of the group owns a contiguous block of the window's rows: its token, then its own proposals
             struct Blk { int b = 0, f = 0, n = 0, keep = 1; };
-            Blk blks[strata::kernels::kVerifyMaxT];
+            Blk blks[strata::kernels::kVerifyNarrowT];
             int nb = 0;
-            // batch_launch_rows took at most kVerifyMaxT rows, what blks and outb hold
-            if (G.S > strata::kernels::kVerifyMaxT) return false;
+            // batch_launch_rows took at most kVerifyNarrowT rows, what blks and outb hold
+            if (G.S > strata::kernels::kVerifyNarrowT) return false;
             std::vector<int> keep(bs.size(), 1);
             for (int t = 0; t < G.S;) {
                 const int b = G.rows[t];
@@ -9874,7 +9874,7 @@ int main(int argc, char** argv) {
                 blk.b = b;
                 blk.f = f;
                 blk.n = t - f;
-                // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound): f + keep < t <= G.S <= kVerifyMaxT, checked above
+                // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound): f + keep < t <= G.S <= kVerifyNarrowT, checked above
                 while (blk.keep < blk.n && !sl.stop && outb[f + blk.keep - 1] == G.tok[f + blk.keep] &&
                        !is_eos(outb[f + blk.keep - 1]))
                     ++blk.keep;
@@ -10103,10 +10103,10 @@ int main(int argc, char** argv) {
                 strata::core::progress().busy.store(true);
                 if (pmtp && !pmtp_flush(k)) return false;   // the commits queued for this stage go first
                 if (k == 0) {   // the penalised slots' reply tails for the group's rows (the last stage draws them)
-                    int grows[strata::kernels::kVerifyMaxT] = {};
-                    for (int t = 0; t < G.S && t < (int) strata::kernels::kVerifyMaxT; ++t)
+                    int grows[strata::kernels::kVerifyNarrowT] = {};
+                    for (int t = 0; t < G.S && t < (int) strata::kernels::kVerifyNarrowT; ++t)
                         grows[t] = pmtp ? G.rows[t] : (int) (pick * GS + t);
-                    for (int t = 0; t < G.S && t < (int) strata::kernels::kVerifyMaxT; ++t) {
+                    for (int t = 0; t < G.S && t < (int) strata::kernels::kVerifyNarrowT; ++t) {
                         const BSlot& ps = bs[(size_t) grows[t]];
                         if (ps.pen_n <= 0 || (t > 0 && grows[t - 1] == grows[t])) continue;
                         const int64_t from = std::max<int64_t>(ps.reply0, (int64_t) ps.ids.size() - ps.pen_n);
@@ -10677,7 +10677,7 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 if (!grammar.start(req_grammar, (int) n_vocab, stops, err)) { std::printf("ERR %s\n", err.c_str()); continue; }
-                grammar_rows.resize((size_t) strata::kernels::kVerifyMaxT * (size_t) grammar.words());
+                grammar_rows.resize((size_t) strata::kernels::kVerifyNarrowT * (size_t) grammar.words());
             }
             static strata::core::ScriptGuard script;   // one request at a time (not with --batch), as the grammar
             script.stop();
@@ -10688,7 +10688,7 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 script.apply_bans(req_bias, (int) n_vocab);
-                grammar_rows.resize((size_t) strata::kernels::kVerifyMaxT * (size_t) script.words());
+                grammar_rows.resize((size_t) strata::kernels::kVerifyNarrowT * (size_t) script.words());
             }
             std::vector<int64_t> ids;
             std::string pe;
@@ -12077,7 +12077,7 @@ int main(int argc, char** argv) {
                                  pl_serial);
             }
             if (pl_want && pl_serial == nullptr && !cancelled && produced_n < max_new && kvg.on &&
-                !kvg_ensure(std::min<int64_t>(o.max_context, p + max_new + 2 * (int64_t) strata::kernels::kVerifyMaxT + 64),
+                !kvg_ensure(std::min<int64_t>(o.max_context, p + max_new + 2 * (int64_t) strata::kernels::kVerifyNarrowT + 64),
                             adapt_quiesce)) {
                 std::printf("ERR the K/V cannot grow: no VRAM is left\n");
                 return 1;
@@ -12575,7 +12575,7 @@ int main(int argc, char** argv) {
                         ++pl_on;
                         // the chain over A, forced through B's drafts: B's bonus guess and the next window's drafts
                         mtp.set_source_R(V1(A).final_R(0));
-                        chain_n = std::min(strata::kernels::kVerifyMaxT - 1, B.T + S_mtp - 1);
+                        chain_n = std::min(strata::kernels::kVerifyNarrowT - 1, B.T + S_mtp - 1);
                         if (!mtp.chain_launch(A.T, outp.data(), A.p, a, B.tok + 1, B.T - 1, chain_n, chain_n, err))
                             return die(err);
                         chain_kind = 1;
@@ -12604,7 +12604,7 @@ int main(int argc, char** argv) {
                         B = PW{};
                         if (!last) {
                             mtp.set_source_R(V1(A).final_R(0));
-                            chain_n = strata::kernels::kVerifyMaxT - 1;
+                            chain_n = strata::kernels::kVerifyNarrowT - 1;
                             if (!mtp.chain_launch(A.T, outp.data(), A.p, a, nullptr, 0, chain_n, chain_n, err))
                                 return die(err);
                             chain_kind = 2;
