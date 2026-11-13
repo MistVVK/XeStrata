@@ -1,3 +1,8 @@
+#include "b60_mtp_q8_cache.hpp"
+#include "b60_weight_cache.hpp"
+#include "strata/core/on_device.hpp"
+#include "b60_layout_state.hpp"
+#include "private_mtp_demand.hpp"
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
@@ -8,6 +13,7 @@
 #include "strata/core/on_device.hpp"
 
 #include "strata/core/native_head.hpp"
+#include "strata/workload_trace.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/platform/memory.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -179,6 +185,11 @@ MtpDrafter::~MtpDrafter() {
     if (side_) dpct::get_current_device().destroy_queue(side_);
     if (sh_fork_) dpct::destroy_event(sh_fork_);
     if (sh_join_) dpct::destroy_event(sh_join_);
+    if(owns_weights_&&dense_){
+      const strata::core::OnDevice on(device_);
+      for(const auto&t:tensors_)if(strata::kernels::b60_has_mtp_q8_cache(dense_+t.off))
+        strata::kernels::b60_release_mtp_q8_cache(dense_+t.off,device_,&dpct::get_in_order_queue());
+    }
     if (owns_weights_ && dense_) sycl::free(dense_, dpct::get_in_order_queue());
     if (owns_weights_ && experts_)
         sycl::free(experts_, dpct::get_in_order_queue());
@@ -186,6 +197,11 @@ MtpDrafter::~MtpDrafter() {
     if (arena_) sycl::free(arena_, dpct::get_in_order_queue());
     if (head_logits_) sycl::free(head_logits_, dpct::get_in_order_queue());
     if (owns_draft_head_ && dhead_) {
+      if(strata::kernels::b60_cached_weight(dhead_,24)){
+        const strata::core::OnDevice on(device_);
+        strata::kernels::b60_release_weight_cache(dhead_,24,device_,&dpct::get_in_order_queue());
+      }
+
       strata::kernels::native_q6_k_unpack(dhead_);
       sycl::free(dhead_, dpct::get_in_order_queue());
     }
@@ -398,6 +414,30 @@ bool MtpDrafter::load(const std::string &rt_dir, const ModelGeometry &g,
                               "self_attn.v_proj.weight", "self_attn.o_proj.weight", "mlp.shared_expert.gate_proj.weight",
                               "mlp.shared_expert.up_proj.weight", "mlp.shared_expert.down_proj.weight"};
     for (const char* n : required) if (!q8(n)) { err = std::string("mtp: ") + n + " is missing (q8_0)"; return false; }
+
+    if(owns_weights_&&!q4_&&strata::kernels::b60_mtp_q8_cache_requested()){
+      size_t cache_bytes=0;int cache_count=0;
+      for(const auto&t:tensors_){
+        unsigned mask=0;int rows=0,cols=0;
+        if(t.name=="fc_embedding.weight"){mask=18u;rows=2560;cols=2560;}
+        if(t.name=="fc_hidden.weight"){mask=272u;rows=2560;cols=2560;}
+        if(t.name=="mlp.shared_expert.down_proj.weight"){mask=2u;rows=2560;cols=640;}
+        if(t.name=="mlp.shared_expert.gate_proj.weight"){mask=2u;rows=640;cols=2560;}
+        if(t.name=="mlp.shared_expert.up_proj.weight"){mask=2u;rows=640;cols=2560;}
+        if(t.name=="self_attn.k_proj.weight"){mask=18u;rows=512;cols=2560;}
+        if(t.name=="self_attn.o_proj.weight"){mask=2u;rows=2560;cols=6144;}
+        if(t.name=="self_attn.q_proj.weight"){mask=2u;rows=12288;cols=2560;}
+        if(t.name=="self_attn.v_proj.weight"){mask=18u;rows=512;cols=2560;}
+        if(!mask)continue;
+        if(t.kind!="q8_0"||t.rows!=rows||t.cols!=cols||t.bytes!=uint64_t(rows)*(cols/32)*34)
+          throw std::runtime_error("B60 MTP Q8 RT tensor mismatch");
+        strata::kernels::b60_make_mtp_q8_cache(dense_+t.off,rows,cols,mask,device_,&dpct::get_in_order_queue());
+        cache_bytes+=t.bytes+256;++cache_count;
+      }
+      if(cache_count!=9||cache_bytes!=72071424)throw std::runtime_error("B60 MTP Q8 RT cache count/bytes");
+      vram_+=cache_bytes;
+      std::fprintf(stderr,"B60_MTP_Q8_CACHE device=%d matrices=%d allocation_bytes=%zu\n",device_,cache_count,cache_bytes);
+    }
 
     // ---- the layer's own K/V (dense attention: no indexer state is read)
     const strata::kernels::QsaShapes s = shapes_of(g);
@@ -618,7 +658,14 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const 
             std::fseek(f, 0, SEEK_END);
             const long size = std::ftell(f);
             std::fclose(f);
-            if (size >= 4 && size % 4 == 0) bytes += (uint64_t) (size / 4) * head_row_bytes + (uint64_t) size;
+            if (size >= 4 && size % 4 == 0) {
+                bytes += (uint64_t) (size / 4) * head_row_bytes + (uint64_t) size;
+                // Price the independent padded head cache before auto sizes the expert cache.
+                if (strata::kernels::b60_single_actor_requested() && strata::kernels::b60_cache_requested(24) &&
+                    size / 4 == 106299 && head_row_bytes == 1360 && !q4_head_)
+                    bytes += uint64_t((size / 4 + 15) / 16 * 16) * head_row_bytes +
+                             2 * strata::kernels::kB60WeightCacheGuard;
+            }
         }
     }
     // coupled draft sampling (STRATA_SPEC_COUPLED=1 only): an upper bound - the id -> subset map, the penalty ring,
@@ -808,6 +855,13 @@ bool MtpDrafter::bind(const WeightTable &wt, const NativeHead *head,
             std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
             dhead_type_ = head->type();
+            if(strata::kernels::b60_cache_requested(24)){
+                if(dhead_type_!=23||n_dvocab_!=106299||row_bytes!=1360||q4_head_)throw std::logic_error("B60 exact draft cache requires the fixed raw IQ4 subset");
+                strata::kernels::b60_make_weight_cache(dhead_,int(n_dvocab_),2560,24,device_,&dpct::get_in_order_queue());
+                const uint64_t cache_bytes=uint64_t((n_dvocab_+15)/16*16)*1360+2*strata::kernels::kB60WeightCacheGuard;
+                vram_+=cache_bytes;
+                std::fprintf(stderr,"B60_DRAFT_CACHE device=%d bytes=%llu\n",device_,(unsigned long long)cache_bytes);
+            }
             if (q4_head_ && !make_q4_head(err)) return false;
             if (dhead_type_ == 14 && strata::kernels::native_q6_k_packed_enabled())   // STRATA_Q6_PACKED=1
                 strata::kernels::native_q6_k_pack(dhead_, (int) (row_bytes / 210) * 256, (int) n_dvocab_,
@@ -830,6 +884,7 @@ catch (sycl::exception const &exc) {
 // The layer for T rows.  full = false stops after the K/V append (the prompt only needs the cache).
 bool MtpDrafter::record_forward(int T, int step_row0, dpct::queue_ptr cs,
                                 std::string &err) {
+    strata::workload_trace::Scope forward_trace("decode.mtp_forward", cs, T);
     // step_row0 >= 0: the full layer on step rows [step_row0, +T); step_row0 < 0: K/V only on rows [-1 - step_row0, +T)
     const bool full = step_row0 >= 0;
     if (full && T != 1) { err = "mtp: the full layer runs one row at a time (its attention scratch is sized for one)"; return false; }
@@ -878,6 +933,7 @@ bool MtpDrafter::record_front(int T, int row0, dpct::queue_ptr cs,
         }
         add_streams_broadcast(h2_, e2_, R_, N, (int) HC, T, cs);
         // ---- the attention hyper-connection
+        bool b60_attn_q8=false;
         {
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = 0; t < T; ++t) {
@@ -887,12 +943,12 @@ bool MtpDrafter::record_front(int T, int row0, dpct::queue_ptr cs,
                 fa[t].w_up = bf16("attn_hyper_connection.input_mix_weight_up.weight");
                 fa[t].w_inject = bf16("attn_hyper_connection.block_inject_weight.weight");
                 fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC;
-                fa[t].inject_out = inj_ + t * HC; fa[t].mixed = mixed_ + t * N;
+                fa[t].inject_out = inj_ + t * HC; fa[t].mixed = mixed_ + t * N; if(b60_gr_q8_requested() && T==1)fa[t].q8_mixed=xq_+size_t(t)*(N/32)*36;
             }
-            fused_gr_read_multi(fa, T, xn_, cs);
+            b60_attn_q8=fused_gr_read_multi(fa, T, xn_, cs);
         }
         // ---- attention: K/V into the layer's own cache
-        native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
+        if(!b60_attn_q8)native_quantize_q8_1(mixed_, xq_, (int) N, T, cs);
         native_mmvq(wt_k_proj, wp_k_proj, xq_, kcur_, (int) N, (int) (NKV * HD), T, cs);
         native_mmvq(wt_v_proj, wp_v_proj, xq_, vcur_, (int) N, (int) (NKV * HD), T, cs);
         // #783 PR-d (stuchapin909): the T tokens' K norm, K/V rotation and K/V append each run once over all T rows
@@ -996,12 +1052,18 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
         if (st_.kv_rot) fwht256_inplace_cuda(qcur_, (int64_t) T * NH, cs);
         const QsaAttnPools pools = qsa_attn_pools(st_);
         if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
-        qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
+        // parts_ has no live value here: the same in-order stream overwrites
+        // active MoE outputs later in record_rest before their combine reads.
+        const uint64_t merge_workspace_floats = uint64_t(max_t_) * uint64_t(K) * uint64_t(N);
+        if (!qsa_decode_attn_batch_try_two_stage(qcur_, pools, ident_, step, cap_, s,
+                attn_scratch_, attn_, T, parts_, merge_workspace_floats, cs))
+            qsa_decode_attn_batch(qcur_, pools, ident_, step, cap_, s, attn_scratch_, attn_, T, cs);
         if (st_.kv_rot) fwht256_inplace_cuda(attn_, (int64_t) T * NH, cs);
         native_qsa_gate_apply(attn_, qfull_, attn32_, (int) (T * NH), (int) HD, cs);
         native_quantize_q8_1(attn32_, xq_, (int) (NH * HD), T, cs);
         native_mmvq(wt_o_proj, wp_o_proj, xq_, bo_, (int) (NH * HD), (int) N, T, cs);
         // ---- the MLP hyper-connection (the attention write folded in)
+        bool b60_ffn_q8=false;
         {
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = 0; t < T; ++t) {
@@ -1012,9 +1074,9 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
                 fa[t].w_up = bf16("mlp_hyper_connection.input_mix_weight_up.weight");
                 fa[t].w_inject = bf16("mlp_hyper_connection.block_inject_weight.weight");
                 fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC;
-                fa[t].inject_out = inj2_ + t * HC; fa[t].mixed = mixed_ + t * N;
+                fa[t].inject_out = inj2_ + t * HC; fa[t].mixed = mixed_ + t * N; if(b60_gr_q8_requested() && T==1)fa[t].q8_mixed=xq_+size_t(t)*(N/32)*36;
             }
-            fused_gr_read_multi(fa, T, xn_, cs);
+            b60_ffn_q8=fused_gr_read_multi(fa, T, xn_, cs);
         }
         // ---- MoE: router, the 512 resident experts, the shared expert (on a branch beside them on CUDA), the
         // combine, the write
@@ -1022,7 +1084,7 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
         nsw.gate_data = wq("mlp.shared_expert.gate_proj.weight", nsw.gate_type);
         nsw.up_data = wq("mlp.shared_expert.up_proj.weight", nsw.up_type);
         nsw.down_data = wq("mlp.shared_expert.down_proj.weight", nsw.down_type);
-        nsw.q8_1 = xq_;   // the routed experts read hit_xq_
+        nsw.q8_1 = xq_; nsw.x_q8_1=b60_ffn_q8?xq_:nullptr;   // routed experts retain their original Q8_0 input
         const SForm none{};
         const bool need_bf16_x = !shared_expert_native_bf16_enabled();
         static const bool fuse_head_gr = [] {
@@ -1129,6 +1191,7 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
         if (!fuse_head_gr && !no_multi_gr)
             gr_write_multi(R_, y_, inj2_, gs, R_, T, cs);
         // ---- the final mixer and the main model's head
+        bool b60_head_q8=false;
         if (fuse_head_gr) {
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = 0; t < T; ++t) {
@@ -1139,9 +1202,9 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
                 fa[t].w_up = bf16("hyper_connection_mixer.input_mix_weight_up.weight");
                 fa[t].w_inject = nullptr;
                 fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC;
-                fa[t].inject_out = dummy_inj_; fa[t].mixed = sample_ + t * N;
+                fa[t].inject_out = dummy_inj_; fa[t].mixed = sample_ + t * N; if(b60_gr_q8_requested() && T==1)fa[t].q8_mixed=xq_+size_t(t)*(N/32)*36;
             }
-            fused_gr_read_multi(fa, T, xn_, cs);
+            b60_head_q8=fused_gr_read_multi(fa, T, xn_, cs);
         } else if (head_mix_multi_on) {
             // the window's rows in one read (CUDA; HIP keeps gr_read per row): bitwise the same sums
             FusedGrArgs fa[kFusedGrMaxT];
@@ -1150,9 +1213,9 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
                 fa[t].w_norm = f32("hyper_connection_mixer.hc_norm.weight");
                 fa[t].w_down = bf16("hyper_connection_mixer.input_mix_weight_down.weight");
                 fa[t].w_up = bf16("hyper_connection_mixer.input_mix_weight_up.weight");
-                fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC; fa[t].mixed = sample_ + t * N;
+                fa[t].eps = EPS; fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC; fa[t].mixed = sample_ + t * N; if(b60_gr_q8_requested() && T==1)fa[t].q8_mixed=xq_+size_t(t)*(N/32)*36;
             }
-            fused_gr_read_multi(fa, T, xn_, cs);
+            b60_head_q8=fused_gr_read_multi(fa, T, xn_, cs);
         } else {
             for (int t = 0; t < T; ++t)
                 gr_read(R_ + (size_t) t * HC * N, f32("hyper_connection_mixer.hc_norm.weight"),
@@ -1160,7 +1223,7 @@ bool MtpDrafter::record_rest(int step_row, dpct::queue_ptr cs,
                         bf16("hyper_connection_mixer.input_mix_weight_up.weight"), nullptr, EPS, gs, ss.block.gr,
                         sample_ + t * N, dummy_inj_, cs);
         }
-        native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
+        if(!b60_head_q8)native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
         native_mmvq(sub ? dhead_type_ : head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N,
@@ -1857,6 +1920,16 @@ bool MtpDrafter::chain_launch(int T, const int32_t *tokens, int64_t p, int a,
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (!stage_source_R(T, err)) return false;
     chain_early_ = std::max(0, std::min(n_early, n_out));
+    int submit_n = n_out;
+    if (auto* ds = strata::private_demand::get(this)) {
+        ds->limit = n_out; ds->submitted = ds->target = submit_n = 1;
+        ds->final = n_out == 1;
+        ds->last_ready_ns = 0;
+        ds->T = T; ds->p = p; ds->a = a; ds->n_force = n_force;
+        for (int j = 0; j < T; ++j) ds->tokens[j] = tokens[j];
+        for (int j = 0; j < n_force; ++j) ds->force[j] = force[j];
+        ++ds->chains; ds->requested += n_out; ++ds->actual;
+    }
     bool ok = DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*round_exec_[T])) == 0;
     /*
     DPCT1024: The original code returned the error code that was further
@@ -1865,7 +1938,7 @@ bool MtpDrafter::chain_launch(int T, const int32_t *tokens, int64_t p, int a,
     */
     if (ok && chain_early_ >= 1) ok =
         DPCT_CHECK_ERROR(dpct::sync_barrier(ev_step_[0], cs_)) == 0;
-    for (int j = 1; ok && j < n_out; ++j) {
+    for (int j = 1; ok && j < submit_n; ++j) {
         ok = DPCT_CHECK_ERROR((cs_)->ext_oneapi_graph(*step_exec_[j])) == 0;
         /*
         DPCT1024: The original code returned the error code that was further
@@ -1911,7 +1984,35 @@ catch (sycl::exception const &exc) {
 int MtpDrafter::chain_outputs_ready(std::string &err) try {
     if (!chain_live_) return chain_n_;
     const OnDevice on_device(device_);
-    while (steps_seen_ < chain_early_) {
+    if (auto* ds = strata::private_demand::get(this)) {
+        if (ds->target > ds->submitted) {
+            const long long start_ns = ds->metrics ? strata::private_demand::now_ns() : 0;
+            if (ds->metrics && ds->last_ready_ns) {
+                const auto reaction = start_ns - ds->last_ready_ns;
+                ds->reaction_ns += reaction;
+                ds->max_reaction_ns = std::max(ds->max_reaction_ns, reaction);
+            }
+            if (ds->target > chain_n_ || ds->target > ds->limit) {
+                err = "private demand: target exceeds staged chain"; return -1;
+            }
+            for (int j = ds->submitted; j < ds->target; ++j) {
+                if (DPCT_CHECK_ERROR(cs_->ext_oneapi_graph(*step_exec_[j])) != 0 ||
+                    DPCT_CHECK_ERROR(dpct::sync_barrier(ev_step_[j], cs_)) != 0) {
+                    err = "private demand: continuation failed"; return -1;
+                }
+                ++ds->submitted; ++ds->continuations; ++ds->actual;
+            }
+            if (DPCT_CHECK_ERROR(dpct::sync_barrier(ev_chain_, cs_)) != 0) {
+                err = "private demand: retirement event failed"; return -1;
+            }
+            (void)DPCT_CHECK_ERROR(cs_->ext_oneapi_empty());
+            if (ds->metrics) ds->submit_ns += strata::private_demand::now_ns() - start_ns;
+        }
+    }
+
+    const auto* ds = strata::private_demand::get(this);
+    const int readable = ds ? std::min(chain_early_, ds->submitted) : chain_early_;
+    while (steps_seen_ < readable) {
         const dpct::err0 q = dpct::sycl_event_query(ev_step_[steps_seen_]);
         /*
         DPCT1001: The statement could not be removed.
@@ -1940,6 +2041,8 @@ int MtpDrafter::chain_outputs_ready(std::string &err) try {
         chain_tok_[steps_seen_] = ((volatile int32_t*) h_out_)[steps_seen_];
         chain_prob_[steps_seen_] = ((volatile float*) h_prob_)[steps_seen_];
         ++steps_seen_;
+        if (auto* observed = strata::private_demand::get(this); observed && observed->metrics)
+            observed->last_ready_ns = strata::private_demand::now_ns();
     }
     return steps_seen_;
 }
@@ -1951,6 +2054,7 @@ catch (sycl::exception const &exc) {
 
 int MtpDrafter::chain_poll(std::string &err) try {
     if (!chain_live_) return 1;
+    if (auto* ds = strata::private_demand::get(this); ds && !ds->final) return 0;
     const OnDevice on_device(device_);
     const dpct::err0 q = dpct::sycl_event_query(ev_chain_);
     /*
@@ -1978,6 +2082,7 @@ int MtpDrafter::chain_poll(std::string &err) try {
       err = std::string("mtp chain: ") + dpct::get_error_string_dummy(q);
       return -1;
     }
+    if (auto* ds = strata::private_demand::get(this)) chain_n_ = ds->submitted;
     for (int j = 0; j < chain_n_; ++j) {
         chain_tok_[j] = ((volatile int32_t*) h_out_)[j];
         chain_prob_[j] = ((volatile float*) h_prob_)[j];

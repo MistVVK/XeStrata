@@ -1,3 +1,4 @@
+#include "b60_layout_state.hpp"
 // src/kernels/cuda/shared_expert.cu - P2.S2: the shared expert.
 //
 // `ref/moe.py::shared_expert`, transcribed:
@@ -534,7 +535,7 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
     const unsigned g_embd = (unsigned) ((n_embd + THREADS - 1) / THREADS);
 
     // gate and up projections, then silu(gate) * up in place in `gate`
-    if (native_gate || native_up)
+    if ((native_gate || native_up) && !(b60_layout_requested() && native->x_q8_1 && native->x_q8_1==native->q8_1))
         native_quantize_q8_1(x_f32, native->q8_1, (int) n_embd, 1, stream);
     if (native_gate)
         native_mmvq(native->gate_type, native->gate_data, native->q8_1, gate, (int) n_embd, (int) n_ff, 1, stream);

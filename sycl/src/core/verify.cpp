@@ -1,3 +1,4 @@
+#include "b60_layout_state.hpp"
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #define DPCT_PROFILING_ENABLED
 #include <sycl/sycl.hpp>
@@ -8,6 +9,7 @@
 #include "strata/kernels/dflash2.hpp"
 #include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/dma_batch.hpp"
+#include "strata/workload_trace.hpp"
 #if defined(_WIN32)
 #include <intrin.h>
 #endif
@@ -16,6 +18,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/expert_staging.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -49,6 +52,7 @@
 #include <atomic>
 #include <filesystem>
 #include <map>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -66,6 +70,56 @@
 
 namespace strata::core {
 namespace {
+bool sycl_mirror_adapt() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("STRATA_SYCL_MIRROR_ADAPT");
+        return v && v[0] == '1';
+    }();
+    return enabled;
+}
+class ExpertRouteCount;
+void count_expert_routes(sycl::queue* q, const int32_t* ids, int entries,
+                         int layer, int experts, uint32_t* counts) {
+    q->parallel_for<ExpertRouteCount>(
+        sycl::nd_range<1>((entries + 31) / 32 * 32, 32),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+            const int i = (int)item.get_global_id(0);
+            if (i < entries) {
+                const int expert = ids[i];
+                if (expert >= 0 && expert < experts) {
+                    sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed,
+                        sycl::memory_scope::device, sycl::access::address_space::global_space>
+                        count(counts[layer * experts + expert]);
+                    count.fetch_add(1);
+                }
+            }
+        });
+}
+
+#ifdef STRATA_SYCL_WORKLOAD_TRACE
+// Diagnostic graph copies preserve the actual per-layer plan before its shared
+// scratch is reused. CPU reads them only after the existing end-window wait.
+struct RoutingAudit {
+    int32_t* snapshots = nullptr;
+    FILE* output = nullptr;
+    int64_t words = 0, layers = 0;
+    sycl::queue* queue = nullptr;
+    RoutingAudit(int64_t nwords, int64_t nlayers, sycl::queue* stream, const char* path)
+        : words(nwords), layers(nlayers), queue(stream) {
+        output = std::fopen(path, "a");
+        if (!output) throw std::runtime_error("routing audit output unavailable");
+        snapshots = sycl::malloc_host<int32_t>((size_t)words * layers * 2, *queue);
+        if (!snapshots) { std::fclose(output); output = nullptr; throw std::bad_alloc(); }
+        std::memset(snapshots, 0, (size_t)words * layers * 2 * sizeof(int32_t));
+    }
+    ~RoutingAudit() {
+        if (snapshots) { try { sycl::free(snapshots, *queue); } catch (...) {} }
+        if (output) std::fclose(output);
+    }
+    int32_t* slot(int64_t layer, int group) { return snapshots + (size_t)(layer * 2 + group) * words; }
+};
+std::map<const Verifier*, std::unique_ptr<RoutingAudit>> routing_audits;
+#endif
 
 constexpr float EPS = 1e-6f;
 using Clock = std::chrono::steady_clock;
@@ -465,6 +519,10 @@ Verifier::~Verifier() try {
         for (auto* e : v)
             if (e) delete e;
     if (commit_exec_) delete (commit_exec_);
+#ifdef STRATA_SYCL_WORKLOAD_TRACE
+    routing_audits.erase(this);
+#endif
+    if (expert_usage_counts_d_) sycl::free(expert_usage_counts_d_, *cs_);
     for (auto& kv : exec_bm_)
         if (kv.second) delete (kv.second);
     for (auto& kv : commit_bm_)
@@ -838,6 +896,20 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         */
         if (!ok2) {; all_resident_ = false; device_plan_ = false; }
     }
+    if (sycl_mirror_adapt()) {
+        if (!device_plan_ || !env_on("STRATA_VERIFY_NO_HOST"))
+            throw std::runtime_error("mirror adaptive expert usage requires NoHost device planning");
+        expert_usage_counts_h_.assign((size_t)g.n_layers * (size_t)g.n_expert, 0);
+        expert_usage_counts_d_ = sycl::malloc_device<uint32_t>(expert_usage_counts_h_.size(), *cs_);
+        if (!expert_usage_counts_d_) throw std::bad_alloc();
+        cs_->memset(expert_usage_counts_d_, 0, expert_usage_counts_h_.size() * sizeof(uint32_t)).wait_and_throw();
+    }
+#ifdef STRATA_SYCL_WORKLOAD_TRACE
+    if (const char* audit = std::getenv("STRATA_SYCL_ROUTING_AUDIT_FILE"); audit && *audit) {
+        if (!device_plan_) throw std::runtime_error("routing audit requires device planning");
+        routing_audits[this] = std::make_unique<RoutingAudit>(plan_i32_, g.n_layers, cs_, audit);
+    }
+#endif
     if (std::getenv("STRATA_VERIFY_DEBUG") != nullptr) {   // SYCL port: the per-layer residual ladder (token 0)
         dbgR_ = (float*) sycl::malloc_device((size_t) g.n_layers * g.n_embd * 4, dpct::get_in_order_queue());
         dbgM_ = (float*) sycl::malloc_device((size_t) g.n_layers * g.n_embd * 4, dpct::get_in_order_queue());
@@ -866,6 +938,7 @@ const float* Verifier::final_R(int t) const { return R_ + (size_t) t * (size_t) 
 // while the GPU combines A and runs A's layer l+1.  B's mixer only needs A's mixer of the same layer (K/V, GDN
 // state), never A's experts, so nothing waits that did not wait before.  Every token's arithmetic is unchanged.
 bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
+    strata::kernels::B60MainActorScope b60_actor_scope;
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     // 0.1.43 (STRATA_VERIFY_LEAN=0 turns it off): with the device plan under STRATA_VERIFY_NO_HOST no host ever answers a doorbell, so
@@ -965,6 +1038,10 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     // ---------------------------------------------------------------- pre(l, group): up to the ring
     auto pre = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
+#ifdef STRATA_SYCL_WORKLOAD_TRACE
+        strata::workload_trace::ContextGuard layer_context(strata::workload_trace::context.position, n, l);
+#endif
+        strata::workload_trace::Scope layer_trace("decode.layer.pre", cs, n, N);
         stamp(l, 0, grp);
         const LayerView v(wt, l);
         const char* pfx[2] = {"hc_attn_", "hc_ffn_"};
@@ -1052,6 +1129,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             pending = false;
         }
         auto gr_read_group = [&](int half, bool apply, float* inj_prev, float* inj_out) {
+            strata::workload_trace::Scope gr_trace("decode.gr_read", cs, n, HC * N, g.hc_lr, HC, N, half);
             FusedGrArgs fa[kFusedGrMaxT];
             for (int t = tb; t < te; ++t) {
                 FusedGrArgs& a = fa[t - tb];
@@ -1063,7 +1141,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 a.q8_inject = (const uint8_t*) wi[half]->hc_q8;
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
                 a.inject_out = inj_out + t * HC; a.mixed = mixed_ + t * N;
-                if (qcnt_ != nullptr) {   // S26 STRATA_QFUSE: the consumer's q8_1 image written by the read itself
+                if (qcnt_ != nullptr || (b60_gr_q8_requested() && n==1)) {   // S26 STRATA_QFUSE: the consumer's q8_1 image written by the read itself
                     a.q8_cnt = qcnt_;
                     if (half == 0) a.q8_mixed = xq_ + (size_t) (t - tb) * (N / 32) * 36;
                     else if (strata::kernels::cpu::expert_layout().native) a.q8_mixed = nat_xq_ + (size_t) t * (N / 32) * 36;
@@ -1450,6 +1528,9 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
+        if (expert_usage_counts_d_)
+            count_expert_routes(cs, ids_ + tb * K, (int)(n * K), (int)l,
+                                (int)g.n_expert, expert_usage_counts_d_);
         if (ar_on()) {
             resident_plan(ids_ + tb * K, n * (int) K, (int) K, hits_.d_res + l * g.n_expert, (int) g.n_expert,
                           hits_.cache_base, slot_off_d_, (long long) hits_.blob,
@@ -1544,6 +1625,10 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                               !cvec().covers(g.n_layers - 1);
     auto post = [&](int64_t l, int grp) -> bool {
         const int tb = tb_[grp], te = te_[grp], n = te - tb;
+#ifdef STRATA_SYCL_WORKLOAD_TRACE
+        strata::workload_trace::ContextGuard layer_context(strata::workload_trace::context.position, n, l);
+#endif
+        strata::workload_trace::Scope layer_trace("decode.layer.post", cs, n, N);
         const uint32_t ring = (uint32_t) ((l - lb_) * G + grp + 1);
         const int64_t cap = (int64_t) n * K, capx = (int64_t) max_t_ * K;
         int32_t* pl = plan_ + (size_t) grp * (size_t) (plan_i32_ + 16);
@@ -1566,8 +1651,25 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 const auto& f = lay.fmt[(size_t) l];
                 NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
                 if (f.had_d) { L.had_block = f.had_block; L.d_signs = had_sh_; }   // APR: h is rotated in there
-                native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
-                                      nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, dst_buf, cs, gy);
+                if(b60_single_actor_requested()&&b60_layout_requested()){
+                    if(!lean||gy!=0)throw std::logic_error("B60 single staging needs the complete device plan");
+                    b60_stage_single_experts(const_cast<unsigned long long*>(gp),gn,int(cap),f.gu_type,size_t(f.up_off),size_t(f.down_off),size_t(f.bytes),cs);
+                }
+                if (!b60_layout_requested() && gy == 0 && device_plan_ && env_on("STRATA_VERIFY_NO_HOST") &&
+                    env_on("STRATA_SYCL_EXPERT_STAGE")) {
+                    // NoHost device planning leaves no CPU/DMA owner of this existing workspace.
+                    const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
+                    uint8_t* stage = staging_ + (size_t)(grp * per) * lay.max_blob;
+                    const char* batch_env = std::getenv("STRATA_SYCL_EXPERT_STAGE_GROUPS");
+                    const char* copy_env = std::getenv("STRATA_SYCL_EXPERT_STAGE_COPY");
+                    native_expert_grouped_staged(L,gp,gs,gn,p_dst,p_tok,cap,cap,
+                        nat_xq_ + (size_t)tb * (N / 32) * 36,hit_scratch_,dst_buf,cs,
+                        stage,(size_t)per * lay.max_blob,batch_env ? std::atoi(batch_env) : 8,
+                        copy_env ? std::atoi(copy_env) : 0);
+                } else {
+                    native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
+                                          nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, dst_buf, cs, gy);
+                }
             } else {
                 moe_grouped_s2(gp, gs, gn, p_dst, p_tok, cap, cap, hit_xq_ + (size_t) tb * (N / 32) * 34,
                                hit_xs_ + (size_t) tb * (N / 32), hit_scratch_, dst_buf, cs);
@@ -1652,6 +1754,10 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
             strata::kernels::df2_tap_gr(Rt(tb), HC * N, bo_ + tb * N, N, inj2_ + tb * HC, HC, tap_dev_ + ((size_t) tb * nt + (size_t) tap_slot_[(size_t) l]) * N,
                                         nt * N, n, N, (int) HC, cs);
         }
+#ifdef STRATA_SYCL_WORKLOAD_TRACE
+        if (auto audit = routing_audits.find(this); audit != routing_audits.end())
+            cs->memcpy(audit->second->slot(l, grp), pl, (size_t)plan_i32_ * sizeof(int32_t));
+#endif
         if (l == g.n_layers - 1) {
             if (!fuse_head_gr) {
                 if (dec_batch && !g_no_multi_gr) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
@@ -1691,6 +1797,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
         if (!hn || !hd || !hu) { err = "verify: an output_hc_* weight is missing"; return false; }
         // S25 (STRATA_HC_Q8=1): the final mixer from the GGUF's Q8_0 projections too, through the same multi read
         // (no pending write, no inject)
+        bool b60_head_q8=false;
         const bool mix_q8 = hd->hc_q8 != nullptr && hu->hc_q8 != nullptr && head_ != nullptr && head_->loaded();
         if (mix_q8) {
             FusedGrArgs fa[kFusedGrMaxT];
@@ -1701,9 +1808,9 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 a.w_up = (const uint16_t*) hu->data; a.w_inject = nullptr;
                 a.q8_down = (const uint8_t*) hd->hc_q8; a.q8_up = (const uint8_t*) hu->hc_q8;
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
-                a.mixed = head_mixed_ + t * N;
+                a.mixed = head_mixed_ + t * N; if(b60_gr_q8_requested() && T==1)a.q8_mixed=xq_+size_t(t)*(N/32)*36;
             }
-            fused_gr_read_multi(fa, T, xn_, cs);
+            b60_head_q8=fused_gr_read_multi(fa, T, xn_, cs);
         }
         else if (fuse_head_gr) {
             FusedGrArgs fa[kFusedGrMaxT];
@@ -1719,9 +1826,9 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 a.lo = lo_ + t * g.hc_lr;
                 a.rs = rs_ + t * HC;
                 a.inject_out = head_inj_;
-                a.mixed = head_mixed_ + t * N;
+                a.mixed = head_mixed_ + t * N; if(b60_gr_q8_requested() && T==1)a.q8_mixed=xq_+size_t(t)*(N/32)*36;
             }
-            fused_gr_read_multi(fa, T, xn_, cs);
+            b60_head_q8=fused_gr_read_multi(fa, T, xn_, cs);
         } else if (head_mix_multi_enabled() && head_ != nullptr && head_->loaded()) {
             // the final mixer, the window's tokens in one read (fused_gr_read_multi without the pending write: the
             // last layer's write was done above; its sums are gr_read's)
@@ -1734,9 +1841,9 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
                 fa[t].R = Rt(t); fa[t].R_out = Rt(t); fa[t].apply = false;
                 fa[t].w_norm = (const float*) hn->data; fa[t].w_down = (const uint16_t*) hd->data;
                 fa[t].w_up = (const uint16_t*) hu->data; fa[t].eps = EPS;
-                fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC; fa[t].mixed = head_mixed_ + t * N;
+                fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC; fa[t].mixed = head_mixed_ + t * N; if(b60_gr_q8_requested() && T==1)fa[t].q8_mixed=xq_+size_t(t)*(N/32)*36;
             }
-            fused_gr_read_multi(fa, T, xn_, cs);
+            b60_head_q8=fused_gr_read_multi(fa, T, xn_, cs);
         } else {
             for (int t = 0; t < T; ++t) {
                 BlockBuffers bb = ss.block;
@@ -1751,7 +1858,7 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
         }
         if (head_ != nullptr && head_->loaded()) {
             try {
-                native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
+                if(!b60_head_q8)native_quantize_q8_1(head_mixed_, xq_, (int) N, T, cs);
                 native_mmvq(head_->type(), head_->weights(), xq_, head_logits_, (int) N, (int) n_vocab_, T, cs);
             } catch (const std::exception& e) {
                 err = std::string("verify head: ") + e.what();
@@ -2019,10 +2126,17 @@ bool Verifier::capture_commit(std::string &err) try {
                 float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
                 const float* qkv = qkv_L_ + (size_t) gdn_index * MT * C;
                 gdn_conv_commit(conv, qkv, (int) C, commit_, cs_);
+                static const bool state_only = [] { const char* e=std::getenv("STRATA_SYCL_GDN_STATE_COMMIT"); return e && e[0]=='1'; }();
+                if(state_only)
+                    gdn_commit_state_multi(state,h_L_+(size_t)gdn_index*MT*C,(int)C,
+                        gate_L_+(size_t)gdn_index*MT*HV,beta_L_+(size_t)gdn_index*MT*HV,
+                        (int)g.ssm_k_heads,(int)HV,(int)MT,commit_,cs_);
+                else {
                 gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C, (int) C, gate_L_ + (size_t) gdn_index * MT * HV,
                                     beta_L_ + (size_t) gdn_index * MT * HV, z_, (const float*) wnm->data, EPS, y_dummy_,
                                     (int) g.ssm_k_heads, (int) HV, (int) MT, commit_, cs_,
                                     (int) MT);   // S26: t_out_begin = MT - the replay's outputs (y_dummy_) are never read
+                }
                 ++gdn_index;
             } else {
                 const QsaState& st = ss.qsa_states[qsa_index];
@@ -2222,6 +2336,8 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         std::fflush(sf);
     }
     std::atomic_thread_fence(std::memory_order_seq_cst);
+    if (expert_usage_counts_d_)
+        cs_->memset(expert_usage_counts_d_, 0, expert_usage_counts_h_.size() * sizeof(uint32_t));
     trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
     VDBG("staged; launching\n");
@@ -2544,6 +2660,67 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         err = std::string("verify: ") + dpct::get_error_string_dummy(se);
         return false;
     }
+    if (expert_usage_counts_d_) {
+        if (!expert_usage_counter_ || expert_usage_counter_->size() != expert_usage_counts_h_.size())
+            throw std::runtime_error("mirror adaptive expert usage is unbound");
+        cs_->memcpy(expert_usage_counts_h_.data(), expert_usage_counts_d_,
+                    expert_usage_counts_h_.size() * sizeof(uint32_t)).wait_and_throw();
+        uint64_t total = 0;
+        for (uint32_t count : expert_usage_counts_h_) total += count;
+        if (total != (uint64_t)(le_ - lb_) * (uint64_t)T * (uint64_t)ss.k)
+            throw std::runtime_error("mirror adaptive route histogram coverage mismatch");
+        // Match the CPU usage counter's scalar increment order.
+        static const bool presence = [] { const char* e=std::getenv("STRATA_SYCL_ADAPT_WINDOW_PRESENCE"); return e && e[0]=='1'; }();
+        for (size_t i = 0; i < expert_usage_counts_h_.size(); ++i) {
+            const uint32_t count=presence ? (expert_usage_counts_h_[i]>0 ? 1u : 0u) : expert_usage_counts_h_[i];
+            for (uint32_t n=0;n<count;++n) (*expert_usage_counter_)[i] += 1.f;
+        }
+    }
+#ifdef STRATA_SYCL_WORKLOAD_TRACE
+    if (auto found = routing_audits.find(this); found != routing_audits.end()) {
+        auto& audit = *found->second;
+        const int64_t capx = (int64_t)max_t_ * ss.k;
+        const int64_t ptr_off = ((4 + capx + 1 + 2 * capx) + 1) & ~1ll;
+        const auto& layout = strata::kernels::cpu::expert_layout();
+        if (!layout.native) throw std::runtime_error("routing audit requires native expert layout");
+        for (int64_t layer = lb_; layer < le_; ++layer) for (int group = 0; group < G; ++group) {
+            const int32_t* data = audit.slot(layer, group);
+            const int32_t* starts = data + 4;
+            const int32_t* dst = starts + capx + 1;
+            const int32_t* tok = dst + capx;
+            const auto* pointers = reinterpret_cast<const unsigned long long*>(data + ptr_off);
+            const int n = gte[group] - gtb[group], expected = n * (int)ss.k;
+            if (data[0] < 0 || data[0] > expected || data[1] != expected || data[2] != 0 || starts[0] != 0 || starts[data[0]] != expected)
+                throw std::runtime_error("routing audit: incomplete resident plan");
+            const auto& format = layout.fmt[(size_t)layer];
+            std::vector<bool> seen((size_t)expected, false);
+            std::fprintf(audit.output, "{\"kind\":\"expert_plan\",\"raw_ns\":%lld,\"position\":%lld,\"T\":%d,\"layer\":%lld,\"group\":%d,\"rows\":%d,\"GU_type\":%d,\"down_type\":%d,\"n_embd\":%lld,\"n_ff\":%lld,\"gu_row_bytes\":%llu,\"down_row_bytes\":%llu,\"groups\":%d,\"entries\":%d,\"pcie_plan_groups\":%d,\"plans\":[",
+                (long long)strata::workload_trace::trace_ns(), (long long)pos0, T, (long long)layer, group, n,
+                format.gu_type, format.d_type, (long long)format.n_embd, (long long)format.n_ff,
+                (unsigned long long)format.gu_row, (unsigned long long)format.d_row, data[0], data[1], data[2]);
+            for (int index = 0; index < data[0]; ++index) {
+                const int begin = starts[index], end = starts[index + 1];
+                if (begin < 0 || end <= begin || end > expected || end - begin > n)
+                    throw std::runtime_error("routing audit: invalid group range");
+                const auto allocation = sycl::get_pointer_type(reinterpret_cast<const void*>(pointers[index]), cs_->get_context());
+                const char* residency = allocation == sycl::usm::alloc::device ? "device" : allocation == sycl::usm::alloc::host ? "host" : allocation == sycl::usm::alloc::shared ? "shared" : "unknown";
+                std::fprintf(audit.output, "%s{\"count\":%d,\"allocation\":\"%s\",\"pointer\":%llu,\"dst\":[", index ? "," : "", end - begin, residency, pointers[index]);
+                for (int e = begin; e < end; ++e) {
+                    if (dst[e] < 0 || dst[e] >= expected || seen[(size_t)dst[e]] || tok[e] < 0 || tok[e] >= T)
+                        throw std::runtime_error("routing audit: invalid entry mapping");
+                    seen[(size_t)dst[e]] = true;
+                    std::fprintf(audit.output, "%s%d", e == begin ? "" : ",", dst[e]);
+                }
+                std::fprintf(audit.output, "],\"tok\":[");
+                for (int e = begin; e < end; ++e) std::fprintf(audit.output, "%s%d", e == begin ? "" : ",", tok[e]);
+                std::fprintf(audit.output, "]}");
+            }
+            if (std::find(seen.begin(), seen.end(), false) != seen.end()) throw std::runtime_error("routing audit: missing entry");
+            std::fprintf(audit.output, "]}\n");
+        }
+        std::fflush(audit.output);
+    }
+#endif
     if (no_host && std::getenv("STRATA_VERIFY_DEBUG") != nullptr) {   // SYCL port: what the window left behind
         const int Gd = groups_[T] > 0 ? groups_[T] : 1;
         std::vector<uint32_t> sk((size_t) Gd, 0);
@@ -4298,6 +4475,12 @@ void Verifier::absorb_stats(Verifier& o) {
         for (int i = 0; i < kProfPer; ++i) { prof_sum_[k][i] += o.prof_sum_[k][i]; o.prof_sum_[k][i] = 0; }
     prof_windows_ += o.prof_windows_;
     o.prof_windows_ = 0;
+}
+
+void Verifier::set_expert_usage_counter(std::vector<float>* usage) {
+    if (!expert_usage_counts_d_ || !usage || usage->size() != expert_usage_counts_h_.size())
+        throw std::invalid_argument("mirror adaptive expert usage shape mismatch");
+    expert_usage_counter_ = usage;
 }
 
 }  // namespace strata::core

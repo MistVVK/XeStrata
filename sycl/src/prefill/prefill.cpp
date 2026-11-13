@@ -7,8 +7,10 @@
 #include "strata/copy_queue.hpp"
 #include "strata/prefill/xmx_moe.hpp"
 #include "strata/prefill/esimd_moe.hpp"
+#include "strata/prefill_copy_queue.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/kernels/dflash2.hpp"
+#include "strata/workload_trace.hpp"
 #include "strata/core/gguf_expert_source.hpp"
 #include "../../../src/prefill/mmq_resident_sort.hpp"
 #include "../../../src/prefill/wmma_gemm.h"
@@ -37,6 +39,9 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
+#ifdef STRATA_SYCL_TLA_ATTN
+#include "strata/kernels/qsa_prompt_attn_tla.hpp"
+#endif
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/qsa_two_pass_status.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -61,6 +66,7 @@ void qsa_prompt_attn_percell(const float* q, const QsaAttnPools& pools, const in
 #include <stdexcept>
 #include <sys/stat.h>
 #include <tuple>
+#include "strata/prefill/f16_expert_pair.hpp"
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -113,6 +119,8 @@ void experts_native(const Batch&, const NativeGeom&, int, int64_t, const void*, 
                     float*, void*) {}
 }  // namespace strata::prefill::fused
 #endif
+
+namespace strata::kernels { void iq_dequant_f16_plain_launch(int,const void*,int64_t,uint16_t*,void*); }
 
 namespace strata::prefill {
 namespace {
@@ -760,6 +768,7 @@ struct Prefill::Impl {
     bool borrowed = false;
     dpct::queue_ptr cs = &dpct::get_in_order_queue(),
                     copy = &dpct::get_in_order_queue();
+    std::unique_ptr<sycl::queue> copy_without_profiling;
     Gemm gemm;
     std::vector<void*> owned;
     // chunk buffers
@@ -1132,7 +1141,10 @@ void Prefill::release() {
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty())
             sycl::free(impl_->ple_emb_host[b], dpct::get_in_order_queue());
     }
-    if (impl_->copy) dpct::get_current_device().destroy_queue(impl_->copy);
+    if (impl_->copy_without_profiling) {
+        impl_->copy_without_profiling.reset();
+        impl_->copy = nullptr;
+    } else if (impl_->copy) dpct::get_current_device().destroy_queue(impl_->copy);
     if (impl_->kv_copy) dpct::get_current_device().destroy_queue(
         impl_->kv_copy);
     if (impl_->kv_released) dpct::destroy_event(impl_->kv_released);
@@ -1335,6 +1347,11 @@ bool Prefill::init(const core::WeightTable &wt, const core::ModelGeometry &g,
     // (the Level Zero v2 adapter runs every queue on the compute engine: ~0.8 s of a 4K prompt on a B70 is the compute
     // engine waiting for its own DMA).  nullptr: the ordinary in-order queue.  STRATA_COPY_ENGINE=0 turns it off.
     m.copy = strata::make_copy_engine_queue("the prompt path's expert");
+    const char* copy_profiling = std::getenv("STRATA_SYCL_PREFILL_COPY_PROFILING");
+    if (m.copy == nullptr && copy_profiling && std::strcmp(copy_profiling, "0") == 0) {
+        m.copy_without_profiling = strata::make_prefill_copy_queue(*m.cs);
+        m.copy = m.copy_without_profiling.get();
+    }
     if (m.copy == nullptr &&
         DPCT_CHECK_ERROR(m.copy = dpct::get_current_device().create_queue(true)) != 0) {
         err = "prefill: copy stream"; return false;
@@ -2337,6 +2354,7 @@ struct PfTimer {
     bool sync = std::getenv("STRATA_PREFILL_SYNC") != nullptr;
     long long n_sync = 0;
     void mark(int phase, dpct::queue_ptr s) {
+        workload_trace::phase(phase < kPfCount ? kPfNames[phase] : "unknown", s);
         if (sync) {
             const auto t0 = std::chrono::steady_clock::now();
             s->wait();
@@ -2547,6 +2565,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
     };
     auto ple_gather = [&m, &ss, tokens, n, prev0, &chunk_len](int64_t c0, int buf, std::string& e) -> bool {
         const int64_t T = chunk_len(c0);
+        workload_trace::ContextGuard trace_context(c0, T, -1);
+        workload_trace::Scope trace("prefill.PLE_IO", nullptr, T);
         auto at = [&](int64_t i) { return i < 2 ? prev0[i] : (int32_t) tokens[i - 2]; };   // prev0, then the tokens
         int32_t pv[2] = {at(c0), at(c0 + 1)};
         for (int64_t t = 0; t < T; ++t) {
@@ -2579,6 +2599,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
         const int64_t tap_t0 = tap_dev_ != nullptr ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : T;
         const int64_t tap_rows = T - tap_t0;
         if (tap_rows > tap_cap_) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
+        workload_trace::ContextGuard chunk_context(p0, T, -1);
+        workload_trace::Scope chunk_trace("prefill.chunk", cs, T);
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
         ++stats_.chunks;
         pt.mark(kPfStart, cs);
@@ -3100,6 +3122,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
         };
         for (int64_t l = LB; l < LE; ++l) {
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
+            workload_trace::ContextGuard layer_context(p0, T, l);
+            workload_trace::Scope layer_trace("prefill.layer", cs, T);
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
             const core::LayerView v(*m.wt, l);
@@ -3603,6 +3627,13 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                                                             m.attn, T, m.cs))
                         for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
                             const int64_t nb = std::min(m.attn_batch, T - t0);
+#ifdef STRATA_SYCL_TLA_ATTN
+                            static const bool tla_attn = [] { const char* v=std::getenv("STRATA_SYCL_TLA_ATTN"); return v&&v[0]=='1'; }();
+                            if (tla_attn && nb == 32 && m.cap == 2051 &&
+                                strata::kernels::qsa_prompt_attn_tla_batch(m.q + t0 * kQW, pools, m.sel_ids + t0 * m.cap,
+                                    m.steps_dev + t0 * strata::kernels::kStepCount, m.cap, s, m.attn_scratch,
+                                    m.attn + t0 * ZV, nb, m.cs)) continue;
+#endif
                             // SYCL port: the scores one work-item per cell (qsa_prompt_attn_percell, 128-cell chunks;
                             // FP32, not bitwise with the warp kernel). STRATA_ATTN_PERCELL=0: the warp kernel.
                             static const bool percell = [] { const char* v = std::getenv("STRATA_ATTN_PERCELL"); return !v || v[0] != '0'; }();
@@ -4268,12 +4299,42 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             m.stager->start(std::move(js));
                         }
                         StagerDone stager_done{stream_all ? nullptr : m.stager.get()};
+                        static const bool f16_pair_env = [] { const char* v = std::getenv("STRATA_SYCL_F16_EXPERT_PAIR"); return v && v[0] == '1'; }();
+                        const bool f16_pairs = f16_pair_env && lay.native && !use_mmq && strata::prefill::xmx::mode() == 0;
+                        strata::prefill::f16_expert_pair::Pair f16_pending{};
+                        int f16_n = 0;
+                        int f16_slots[2] = {-1, -1};
+                        auto flush_f16 = [&]() {
+                            if (f16_n == 0) return;
+                            if (f16_n == 2) {
+                                pt.mark(kPfGemmGU, cs);
+                                strata::prefill::f16_expert_pair::gu(*m.cs, f16_pending);
+                                pt.mark(kPfGemmD, cs);
+                                strata::prefill::f16_expert_pair::down(*m.cs, f16_pending);
+                            } else {
+                                const auto& p = f16_pending.v[0];
+                                strata::kernels::iq_dequant_f16_plain_launch(42, p.wdown, 2560 * 640, m.dq_d[0], m.cs);
+                                pt.mark(kPfGemmGU, cs);
+                                m.gemm.f16(p.x, p.wgu, p.gu, p.T, 1280, 2560);
+                                swiglu_interleaved(p.gu, p.h, p.T, m.cs);
+                                pt.mark(kPfGemmD, cs);
+                                m.gemm.f16(p.h, m.dq_d[0], p.y, p.T, 2560, 640);
+                            }
+                            // Release only after the last encoded Down read, before its staging slot is refilled.
+                            for (int i = 0; i < f16_n; ++i) if (f16_slots[i] >= 0) {
+                                const int slot = f16_slots[i];
+                                dpct::sync_barrier(m.used[slot], m.cs);
+                                m.used_of[slot] = slot;
+                            }
+                            f16_n = 0;
+                        };
                         auto stage_one = [&](size_t j) -> bool {
                             try {
                         const int32_t e = order[j];
                             const bool resident = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
                             if (resident) return true;
                             const int sl = stage_next;
+                            if (f16_n && f16_slots[0] == sl) flush_f16();
                             stage_next = (stage_next + 1) % stage_slots();
                             const auto th = Clock::now();
                             const uint8_t* pb0 = m.src->pinned(l, e) ? m.src->blob(l, e) : nullptr;
@@ -4615,6 +4676,22 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 if (xg_n == strata::kernels::kXmxGroupMax || j + 1 == order.size()) xflush();
                                 return true;
                             }
+                            if (f16_pairs) {
+                                const auto& f = lay.fmt[(size_t) l];
+                                const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
+                                if ((f.gu_type == 16 || f.gu_type == 22) && f.d_type == 42 &&
+                                    f.n_ff == 640 && f.n_embd == 2560 && ne > 0 && ne <= 16) {
+                                    const int q = f16_n;
+                                    strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off,
+                                                                       f.n_ff, f.n_embd, m.dq_gu[q], m.cs);
+                                    f16_pending.v[q] = {m.Xs + o0 * N, m.dq_gu[q], blob_dev + f.down_off,
+                                                        m.GU + o0 * 1280, m.Hh + o0 * 640, m.Dm + o0 * N, (int)ne};
+                                    f16_slots[q] = slot;
+                                    if (++f16_n == 2) flush_f16();
+                                    return true;
+                                }
+                                flush_f16();
+                            }
                             const bool xmx_on = strata::prefill::xmx::mode() == 1;
                             const int q = (int) (j % (size_t) dq_slots());
                             if (lay.native) {
@@ -4622,14 +4699,15 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                 const auto& f = lay.fmt[(size_t) l];
                                 // 0.1.43: both matrices in one launch (the same values; STRATA_PF_DQ_FUSED=0: two launches)
                                 static const bool dq_one = [] { const char* v = std::getenv("STRATA_PF_DQ_FUSED"); return !(v && v[0] == '0'); }();
-                                if (dq_one) {
+                                if (dq_one && !f16_pairs) {
                                     strata::kernels::iq_dequant_expert_f16(f.gu_type, f.d_type, blob_dev, blob_dev + f.up_off,
                                                                            blob_dev + f.down_off, f.n_ff, f.n_embd, m.dq_gu[q],
                                                                            m.dq_d[q], m.cs);
                                 } else {
                                     strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
                                                                        m.dq_gu[q], m.cs);
-                                    strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
+                                    if (f16_pairs && f.d_type == 42) strata::kernels::iq_dequant_f16_plain_launch(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
+                                    else strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[q], m.cs);
                                 }
                             } else {
                                 blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
@@ -4719,6 +4797,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             auto release_to = [&](int32_t e_stop) {
                                 try {
                             while (k < kend && seq[k].e < e_stop) {
+                                    if (f16_n) flush_f16();
                                     if (gg_nslots > 0) flush();   // the open group's slots get their event first
                                     if (xg_n > 0) xflush();   // the open group's slots get their event first
                                     const int sl = (int) (k % (size_t) m.ring);
@@ -4749,7 +4828,7 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                                     }
                                     if (!compute(j, m.stage_dev[sl], sl)) return false;
                                     consumed = ++k;
-                                    if ((!group_gather || gg_nslots == 0) && xg_ns == 0) give_back(consumed);   // its group was gathered
+                                    if ((!group_gather || gg_nslots == 0) && xg_ns == 0 && f16_n == 0) give_back(consumed);   // its group was gathered
                                 } else {
                                     const bool r0 = m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0;
                                     const uint8_t* bp = r0 ? m.cache->device_slot(m.host_res[(size_t) l * m.g->n_expert + e])
@@ -4764,6 +4843,8 @@ bool Prefill::run_impl(const int64_t *tokens, int64_t n, int64_t pos0,
                             xflush();
                             give_back(consumed);
                         }
+                        flush_f16();
+                        if (stream_all && f16_pairs) give_back(consumed);
                     }
                     pt.mark(kPfCombine, cs);
                     if (peer_now) {   // multi-GPU: the peer's rows are in Dm (or, without P2P, in host memory)

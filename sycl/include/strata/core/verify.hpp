@@ -93,6 +93,9 @@ public:
     /// Diagnostics: row `t` of the last window's head logits (n_vocab floats) to the host. Valid after run().
     bool copy_logits(int t, float* host) const;
     int64_t vocab() const { return next_ ? next_->vocab() : n_vocab_; }
+    /// STRATA_SYCL_MIRROR_ADAPT: bind the controller's usage counts after init().
+    /// Updated only after a completed NoHost window. The vector must outlive run().
+    void set_expert_usage_counter(std::vector<float>* usage);
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
     /// parameters would otherwise be baked forever - so this can change between requests freely.
@@ -500,6 +503,9 @@ private:
     float *sh_gate_ = nullptr, *sh_up_ = nullptr, *sh_g_ = nullptr;
     float* hist_snap_ = nullptr;                              // T * NG_HIST * NG_HC_DIM
     int64_t cap_ = 0, max_blocks_ = 0, attn_scratch_floats_ = 0;
+    uint32_t* expert_usage_counts_d_ = nullptr;
+    std::vector<uint32_t> expert_usage_counts_h_;
+    std::vector<float>* expert_usage_counter_ = nullptr;
 };
 
 }  // namespace strata::core

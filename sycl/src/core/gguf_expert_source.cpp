@@ -1,6 +1,7 @@
 // src/core/gguf_expert_source.cpp - see the header. Plain C++, no device code.
 #include "strata/core/gguf_expert_source.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "b60_layout_state.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -11,6 +12,10 @@
 #include <dpct/dpct.hpp>
 #include <sycl/sycl.hpp>
 #include <thread>
+#include <atomic>
+#include <algorithm>
+#include <utility>
+#include <stdexcept>
 
 namespace strata::core {
 
@@ -117,13 +122,14 @@ const uint8_t* GgufExpertSource::blob(int64_t layer, int64_t expert) {
 
 int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>& pairs, uint64_t cap, int threads,
                                  std::string& err) {
+    err.clear();
     const auto& lay = strata::kernels::cpu::expert_layout();
     std::vector<std::pair<int64_t, int64_t>> take;
     uint64_t total = 0;
     for (const auto& [l, e] : pairs) {
         if (l < 0 || l >= n_layers_ || e < 0 || e >= n_expert_) continue;
         const uint64_t b = (lay.bytes[(size_t) l] + 255) / 256 * 256;
-        if (total + b > cap) break;
+        if (b > cap - total) break;
         take.push_back({l, e});
         total += b;
     }
@@ -236,4 +242,60 @@ bool GgufExpertSource::read_into(int64_t layer, int64_t expert, uint8_t* dst, si
     return true;
 }
 
+// Exchange existing host/device bytes without an additional expert blob.
+namespace {
+class MirrorCacheExchange;
+void exchange_mirror_bytes(uint8_t* device, uint8_t* mirror, size_t bytes, sycl::queue& q) {
+    if (!device || !mirror || !bytes || bytes % 16 ||
+        (reinterpret_cast<uintptr_t>(device) & 15) || (reinterpret_cast<uintptr_t>(mirror) & 15) ||
+        sycl::get_pointer_type(device, q.get_context()) != sycl::usm::alloc::device ||
+        sycl::get_pointer_type(mirror, q.get_context()) != sycl::usm::alloc::host)
+        throw std::invalid_argument("mirror cache exchange requires aligned device/host whole blobs");
+    const size_t vectors = bytes / 16;
+    auto* dp = reinterpret_cast<uint32_t*>(device);
+    auto* hp = reinterpret_cast<uint32_t*>(mirror);
+    q.parallel_for<MirrorCacheExchange>(
+        sycl::nd_range<1>((vectors + 255) / 256 * 256, 256),
+        [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(32)]] {
+            const size_t i = item.get_global_id(0);
+            if (i >= vectors) return;
+            sycl::uint4 old_device, old_host;
+            old_device.load(0, dp + 4 * i);
+            old_host.load(0, hp + 4 * i);
+            old_host.store(0, dp + 4 * i);
+            old_device.store(0, hp + 4 * i);
+        });
+    q.wait_and_throw();
+}
+}  // namespace
+
+bool GgufExpertSource::exchange_cached_expert(int64_t layer, int32_t incoming, int32_t outgoing,
+                                             void* device_slot, void* stream, std::string& err) {
+    if (layer < 0 || layer >= n_layers_ || incoming < 0 || outgoing < 0 ||
+        incoming >= n_expert_ || outgoing >= n_expert_ || incoming == outgoing ||
+        mirror_ptr_.empty() || !stream) {
+        err = "mirror cache exchange invalid identity"; return false;
+    }
+    const size_t in = (size_t)(layer * n_expert_ + incoming);
+    const size_t out = (size_t)(layer * n_expert_ + outgoing);
+    std::lock_guard<std::mutex> lock(mu_);
+    if (!mirror_ptr_[in] || mirror_ptr_[out]) {
+        err = "mirror cache exchange requires incoming mirror and unmirrored outgoing"; return false;
+    }
+    try {
+        auto* memory = const_cast<uint8_t*>(mirror_ptr_[in]);
+        const auto& layout = strata::kernels::cpu::expert_layout();
+        if (strata::kernels::b60_weights_packed()) {
+            const auto& f = layout.fmt.at((size_t)layer);
+            strata::kernels::b60_exchange_single_expert(static_cast<uint8_t*>(device_slot), memory,
+                f.gu_type, (size_t)f.up_off, (size_t)f.down_off, (size_t)layout.blob_bytes(layer), stream);
+        } else {
+            exchange_mirror_bytes(static_cast<uint8_t*>(device_slot), memory,
+                (size_t)layout.blob_bytes(layer), *static_cast<sycl::queue*>(stream));
+        }
+        mirror_ptr_[out] = memory;
+        mirror_ptr_[in] = nullptr;
+        return true;
+    } catch (const std::exception& e) { err = e.what(); return false; }
+}
 }  // namespace strata::core
