@@ -58,8 +58,8 @@ __host__ __device__ constexpr bool i8_two_scales(int t) { return t == 17 || t ==
 __host__ __device__ constexpr bool i8_unit_scale(int t) { return t == 20 || t == 42 || t == 6 || t == 8 || t == 7; }
 __host__ __device__ constexpr bool i8_wide_scale(int t) { return t == 23; }   // scale -32..31: |sum x scale| can pass 2^23, plain 32-bit multiply
 __host__ __device__ constexpr bool i8_sign_type(int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22; }
-__host__ __device__ constexpr bool i8_gu_type(int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 12 || t == 13 || t == 14; }   // (42: the Q2_0 pack's gate/up)
-__host__ __device__ constexpr bool i8_d_type(int t) { return t == 20 || t == 42 || t == 6 || t == 8 || t == 7; }
+__host__ __device__ constexpr bool i8_gu_type(int t) { return t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 || t == 12 || t == 13 || t == 14 || t == 8; }   // (42: the Q2_0 pack gate/up; 8: Q8_0 gate/up of the Qwen3.6 Q8_0 set and the one Q8_0 layer of UD-Q6_K_XL)
+__host__ __device__ constexpr bool i8_d_type(int t) { return t == 20 || t == 42 || t == 6 || t == 8 || t == 7 || t == 13 || t == 14; }   // (13, 14: Q5_K / Q6_K down of UD-Q4_K_XL; n_ff must be a whole number of 256-value super-blocks, native_expert_i8_supported)
 // Third wave: the K-quants Q4_K (12), Q5_K (13), Q6_K (14) as gate/up and Q5_1 (7) as down.  Q4_K / Q5_K / Q5_1 have a per-32-value minimum: w = base * s * q + min, so
 // sum w x = d_x (base s sum(q a) + min sum(a)): the kernel keeps d_x * sum(a) of every activation block in shared memory (s_as, summed with dp4a when the block is staged) and
 // the decode puts the float `min` (-dmin * m, or + m for Q5_1) in the fourth word of the scale record: one fma more per (row, entry, sub-block).  Q6_K has two int8 scales per 32
@@ -1163,8 +1163,8 @@ size_t i8_sm(int tm) {
 }
 size_t i8_smem_bytes(int gu, int dt, int tm) {
     const size_t a = gu == 16 ? i8_sm<16>(tm) : gu == 17 ? i8_sm<17>(tm) : gu == 18 ? i8_sm<18>(tm) : gu == 21 ? i8_sm<21>(tm) : gu == 23 ? i8_sm<23>(tm) :
-                     gu == 29 ? i8_sm<29>(tm) : gu == 42 ? i8_sm<42>(tm) : gu == 12 ? i8_sm<12>(tm) : gu == 13 ? i8_sm<13>(tm) : gu == 14 ? i8_sm<14>(tm) : i8_sm<22>(tm);
-    const size_t b = dt == 20 ? i8_sm<20>(tm) : dt == 6 ? i8_sm<6>(tm) : dt == 8 ? i8_sm<8>(tm) : dt == 7 ? i8_sm<7>(tm) : i8_sm<42>(tm);
+                     gu == 29 ? i8_sm<29>(tm) : gu == 42 ? i8_sm<42>(tm) : gu == 12 ? i8_sm<12>(tm) : gu == 13 ? i8_sm<13>(tm) : gu == 14 ? i8_sm<14>(tm) : gu == 8 ? i8_sm<8>(tm) : i8_sm<22>(tm);
+    const size_t b = dt == 20 ? i8_sm<20>(tm) : dt == 6 ? i8_sm<6>(tm) : dt == 8 ? i8_sm<8>(tm) : dt == 7 ? i8_sm<7>(tm) : dt == 13 ? i8_sm<13>(tm) : dt == 14 ? i8_sm<14>(tm) : i8_sm<42>(tm);
     return a > b ? a : b;
 }
 int i8_env_int(const char* name, int dflt);
