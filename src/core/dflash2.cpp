@@ -701,47 +701,6 @@ bool Dflash2Drafter::prepare(const float* taps, std::string& err) {
 }
 
 // ---- ring log --------------------------------------------------------------------------------------------
-bool Dflash2Drafter::Lineage::logged(int64_t pos) const {
-    const size_t c = (size_t) (pos / kLogChunk);
-    return pos >= 0 && c < chunks.size() && chunks[c] && chunks[c]->ok[(size_t) (pos % kLogChunk)] != 0;
-}
-
-uint64_t Dflash2Drafter::Lineage::bytes() const {
-    uint64_t b = (uint64_t) hist.capacity() * 4;
-    for (const auto& c : chunks)
-        if (c) b += c->q.size() + c->d.size() * 4 + c->ok.size();
-    return b;
-}
-
-Dflash2Drafter::LogChunk& Dflash2Drafter::Lineage::writable(size_t chunk) {
-    if (chunks.size() <= chunk) chunks.resize(chunk + 1);
-    if (!chunks[chunk]) {
-        auto c = std::make_shared<LogChunk>();
-        c->q.assign((size_t) kLogChunk * wq, 0);
-        c->d.assign((size_t) kLogChunk * (wq / 32), 0.0f);
-        c->ok.assign((size_t) kLogChunk, 0);
-        chunks[chunk] = std::move(c);
-    } else if (chunks[chunk].use_count() > 1) {
-        chunks[chunk] = std::make_shared<LogChunk>(*chunks[chunk]);   // copy on write: a stashed copy keeps the old rows
-    }
-    return *chunks[chunk];
-}
-
-void Dflash2Drafter::Lineage::truncate(int64_t keep) {
-    keep = std::max<int64_t>(0, keep);
-    const size_t c0 = (size_t) (keep / kLogChunk);
-    for (size_t c = c0 + 1; c < chunks.size(); ++c) chunks[c].reset();
-    if (chunks.size() > c0 + 1) chunks.resize(c0 + 1);
-    if (c0 < chunks.size() && chunks[c0]) {
-        if (keep % kLogChunk == 0) {
-            chunks[c0].reset();
-        } else {
-            LogChunk& ch = writable(c0);
-            for (int i = (int) (keep % kLogChunk); i < kLogChunk; ++i) ch.ok[(size_t) i] = 0;
-        }
-    }
-}
-
 uint64_t Dflash2Drafter::ring_log_bytes() const { return cur_.bytes(); }
 uint64_t Dflash2Drafter::ring_stash_bytes() const {
     uint64_t b = 0;

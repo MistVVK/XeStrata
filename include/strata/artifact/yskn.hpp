@@ -63,6 +63,8 @@ struct ModelDesc {
     int layers = 0, hidden = 0, ffn = 0, heads = 0, kv_heads = 0, head_dim = 0, vocab = 0;
     float eps = 0.f, rope_theta = 0.f;
     bool tie_embeddings = false;
+    std::vector<int> target_layers;
+    int block = 0, mask_token = 0, window = 0, top_k = 0, rank = 0;
     std::vector<std::string> layer_types;   ///< "full_attention" / "linear_attention" (qwen3_5)
 };
 

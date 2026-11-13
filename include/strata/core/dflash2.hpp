@@ -24,6 +24,7 @@
 #pragma once
 
 #include "strata/core/draft_head.hpp"
+#include "strata/core/draft_ring_log.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
@@ -232,17 +233,9 @@ private:
     bool ctx_pending_ = false;      ///< context_async queued rows nobody has waited for yet
 
     // ---- ring log (see begin_request)
-    static constexpr int kLogChunk = 256;   ///< positions per log chunk (allocated on first use)
-    struct LogChunk { std::vector<int8_t> q; std::vector<float> d; std::vector<uint8_t> ok; };
-    struct Lineage {
-        size_t wq = 2560;                                 ///< a logged row's int8 codes (the drafter's hidden; wq / 32 scales)
-        std::vector<int32_t> hist;                        ///< the token of every position the ring was filled for
-        std::vector<std::shared_ptr<LogChunk>> chunks;    ///< the activation rows by position / 256 (copy on write)
-        bool logged(int64_t pos) const;
-        uint64_t bytes() const;
-        void truncate(int64_t keep);
-        LogChunk& writable(size_t chunk);
-    };
+    static constexpr int kLogChunk = kDraftLogChunk;
+    using LogChunk = DraftLogChunk;
+    using Lineage = DraftLineage;
     Lineage cur_;
     std::deque<Lineage> stash_;
     bool log_on_ = true;
