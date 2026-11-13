@@ -538,16 +538,19 @@ Form form_of(sycl::queue& q) {
 }
 
 // Whether the merge reads eight slots' partials into registers before it folds them (the same fold order, the same
-// bits): timed once for a device and a slot count, on partials of its own and on a queue of its own, since the
+// bits): timed once for a device and a head count, on partials of its own and on a queue of its own, since the
 // callers' queues are recording a graph when the decode windows first come here.  Below 8 slots the two forms are one.
+// One timing serves every slot count: the forms' ratio held from 33 to 640 slots on the B70 (4.0 / 2.7 us to 38.2 /
+// 19.2) and from 23 to 184 on the RTX 4070 (2.3 / 2.2 to 6.2 / 5.3), and a timing a slot count put 1 to 3% of a
+// 256-token decode into the windows' capture.
 // The B70 at a 32K context (2026-11-14): Ornith-1.5's window 22.53 -> 21.77 ms, Qwen3.8-Flash-Next's drafts 5.06 ->
 // 4.63 ms a round; the RTX 4070 the same within its noise.
 template <int HD, int G>
 bool merge_prefetch(sycl::queue& queue, int n_slots, size_t n_head) {
     if (n_slots < 8) return false;
-    using Key = std::tuple<int, int>;
-    static core::TimedCache<sycl::device, Key, bool> choices;
-    const Key key{n_slots, (int) n_head};
+    static core::TimedCache<sycl::device, int, bool> choices;
+    const int key = (int) n_head;
+    n_slots = std::max(n_slots, 64);
     if (const auto cached = choices.get(queue.get_device(), key)) return *cached;
     if (core::timing_depth != 0) return false;
     sycl::queue probe(queue.get_context(), queue.get_device());
@@ -569,7 +572,7 @@ bool merge_prefetch(sycl::queue& queue, int n_slots, size_t n_head) {
             return true;
         };
         const auto measured = core::timed_choice({{[&] { return run(false); }}, {[&] { return run(true); }}},
-                                                 [&] { probe.wait_and_throw(); }, 5, 1.05, 0.02);
+                                                 [&] { probe.wait_and_throw(); }, 5, 1.05, 0.005);
         pick = measured.pick == 1;
         std::fprintf(stderr, "xestrata: attention merge %s (%d slots, %zu heads of %d; %.1f / %.1f us)\n",
                      pick ? "prefetch" : "plain", n_slots, n_head, HD, measured.seconds[0] * 1e6 / 8,
