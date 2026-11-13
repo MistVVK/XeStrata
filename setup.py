@@ -6483,6 +6483,27 @@ def calibration_targets(have: list, model: str | None, family: str | None) -> li
     return out
 
 
+def mmproj_beside(gguf_dir, name: str, size: int | None = None):
+    """The picture file a person's own GGUF folder (--gguf-dir) already has: in the folder itself, or in the folder
+    above it and that folder's models/ (a XeStrata data folder's layout: models/<size>/ shards, models/<picture file>).
+    The two outer places are taken only at the pinned size (`size`), so a half-copied file is fetched again and not
+    used.  None when there is none (upstream 434c6221b)."""
+    if not gguf_dir:
+        return None
+    base = Path(gguf_dir)
+    own = base / name
+    if own.is_file():
+        return own
+    for r in (base.parent, base.parent / "models"):
+        f = r / name
+        try:
+            if f.is_file() and (size is None or f.stat().st_size == size):
+                return f
+        except OSError:
+            continue
+    return None
+
+
 def find_in(roots: list, rel: str):
     """The first of roots/rel that exists."""
     for r in roots:
@@ -8100,6 +8121,10 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     left = 0 if have else d["size"] / 1e9
     mm = fam.get("mmproj") if vision != "none" else None
     mmproj = models_dir / Path(mm["path"]).name if mm else None   # the picture reader, beside the model
+    if mm is not None and mmproj is not None and not mmproj.exists():
+        near = mmproj_beside(a.gguf_dir, mmproj.name, mm["size"])   # the person's own folder, or the one above it
+        if near is not None:
+            mmproj = near
     if mm is not None and mmproj is not None and not (mmproj.exists() and (done(mmproj) or own)):
         left += mm["size"] / 1e9
     if left and free_gb(models_dir) < left:
@@ -9707,8 +9732,13 @@ def main() -> int:
     if not mmproj.exists():
         mmproj = find_in(roots, f"models/{fam['mmproj']}") or mmproj
     if vision != "none":
-        if not mmproj.exists() and own and (models_dir / fam["mmproj"]).exists():
-            mmproj = models_dir / fam["mmproj"]
+        pin = file_pin(fam["mmproj_hf"] + fam["mmproj"])
+        near = None if mmproj.exists() else mmproj_beside(
+            a.gguf_dir or (models_dir if own else None), fam["mmproj"], pin[0] if pin else None)
+        if near is not None:                           # the person's own folder, or the one above it: used there
+            mmproj = near
+            if pin:
+                verify_sha256(mmproj, pin[0], pin[1], own=True)
         else:
             download(fam["mmproj_hf"] + fam["mmproj"], mmproj, "vision encoder")
         ok(f"vision encoder: {mmproj}")
