@@ -9911,6 +9911,35 @@ def tool_call_recovery_setting(cfg: dict) -> bool:
     return recovery
 
 
+#: #5787: the switch that turns the server's own crash reporter off.
+FAULTHANDLER_OFF = "STRATA_NO_FAULTHANDLER"
+
+
+def arm_faulthandler(env: dict | None = None) -> bool:
+    """#5787: arm CPython's faulthandler for this process, on its own output, and say whether it armed.
+
+    The reports of the serve process dying natively (`0xC0000005` / `0xC0000409` on Windows, SIGSEGV / SIGBUS on Linux
+    and Mac) all have the same shape: the host log carries an exit code, the crash guard restarts the server in about
+    two minutes, and nothing names the Python line.  #5787's ten restarts in three days needed the reporter to set
+    `PYTHONFAULTHANDLER=1` in his own launcher, plus the private `python312.pdb` from the package, to read anything.
+    Armed here, in the server, every launcher (the app, the Terminal, a source start) leaves the stack of the dying
+    thread, and of the request workers beside it, in the log a person can already send.
+
+    It writes nothing while the process runs.  `STRATA_NO_FAULTHANDLER=1` turns it off.  A faulthandler that cannot arm
+    (no module, a closed output) is answered with False and never stops a start.  The process still dies by the same
+    signal with the same exit code, so the crash guard, the app's restart and the OS's own dump are unchanged.
+    """
+    target = os.environ if env is None else env
+    if target.get(FAULTHANDLER_OFF) == "1":
+        return False
+    try:
+        import faulthandler
+        faulthandler.enable(all_threads=True)         # the request workers' stacks are what names a shared cause
+        return True
+    except Exception:                                  # noqa: BLE001 - arming a crash reporter never breaks a start
+        return False
+
+
 def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> int:
     """Serve until stopped. For as long as it runs this server holds the shared activity lease of the runtime folder (the same one `strata serve` and
     a runtime host take), so `strata update` and a calibration run see an engine that was started by running this file directly - the desktop app's
@@ -9920,6 +9949,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     Its console output goes through a bounded queue (serve/nonblocking_out.py, #4479 / #2481): a console that stops taking output must not hold a
     request's turn, a cancel or an admission.  STRATA_BLOCKING_CONSOLE=1 turns it off (testers)."""
     quiet_crash_env()                                  # every child inherits it: no gdb on a user's machine (strata_control/childenv.py)
+    arm_faulthandler()                                 # #5787: a native death names its Python line in this server's own output
     lease = None
     try:
         from strata_control import runtime as _runtime
