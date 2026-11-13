@@ -56,6 +56,12 @@ class WholeMarkNeedsThePin(unittest.TestCase):
         setup.mark_whole_unless_pinned([shard], self.hf, own=True)          # --gguf-dir: not a download
         self.assertTrue(setup.done(shard))
 
+    def test_a_family_without_a_hugging_face_folder_keeps_the_mark(self):
+        shard = self.folder / self.name
+        shard.write_bytes(b"x")
+        setup.mark_whole_unless_pinned([shard], None, own=False)          # a file list, not shards: no pin lookup
+        self.assertTrue(setup.done(shard))
+
     def test_a_marked_or_missing_file_is_not_touched(self):
         shard = self.folder / "marked.gguf"
         shard.write_bytes(b"x")

@@ -3984,18 +3984,19 @@ def whole_shard(s: Path) -> bool:
         return False
 
 
-def mark_whole_unless_pinned(shards, hf: str, own: bool) -> None:
+def mark_whole_unless_pinned(shards, hf: str | None, own: bool) -> None:
     """#173's finish mark for a file copied in by hand (it has the length its own tensor directory says), except a file
     with a pinned SHA-256 (#4088): a run that stopped between the rename of a finished .part and the end of
     verify_sha256 leaves a full-length shard with no mark, and marking it "whole" made done() true, so download()
     skipped it and the pinned hash was never looked at.  A file the pin table names is left unmarked: download() takes
     its "finished by an older setup (no mark yet), or stopped before the check" path, hashes it and repairs it.
     `own` is --gguf-dir: a person's own file is not a download and is not hash-checked here either way, so it keeps the
-    mark; so does a file the pin table does not name."""
+    mark; so does a file the pin table does not name, and every file of a family with no Hugging Face folder of its own
+    (`hf` None: a family that downloads a file list, not shards)."""
     for s in shards:
         if not (s.exists() and not done(s) and whole_shard(s)):
             continue
-        if not own and file_pin(hf + s.name) is not None:
+        if not own and hf is not None and file_pin(hf + s.name) is not None:
             continue
         mark(s, "whole (checked against its own tensor directory)")
 
@@ -9669,8 +9670,8 @@ def main() -> int:
                 break
     # upstream #173: a whole file copied in by hand has no finish mark (75e6efeb7, 762e58b5b); a file with a pinned
     # SHA-256 is left for download()'s hash (#4088)
-    mark_whole_unless_pinned([] if a.custom else shards,
-                             fam["hf"].format(q=model, d=fam.get("dirs", {}).get(model, model)), bool(a.gguf_dir))
+    hf_base = fam["hf"].format(q=model, d=fam.get("dirs", {}).get(model, model)) if fam.get("hf") else None
+    mark_whole_unless_pinned([] if a.custom else shards, hf_base, bool(a.gguf_dir))
     have_model = all(s.exists() and (done(s) or own) for s in shards)
     # upstream #425: a download that resumes needs room only for what is still missing - the finished shards and the
     # .part files already on the disk count
