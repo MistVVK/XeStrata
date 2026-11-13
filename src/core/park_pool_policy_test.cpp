@@ -53,6 +53,9 @@ int main() {
         const size_t s = park_pool_plan(c, kCkpt).segpool_mib;
         check(s == 0 || (s % 64 == 0 && s >= kSegpoolMinMib && s <= kSegpoolMaxMib && s <= c / 4), "an arena is whole 64 MiB steps, between 128 MiB and 2 GiB, within a quarter of the cache");
     }
+    // upkeep only while the engine is idle
+    check(park_pool_permit(true, 64 * MiB) == 0 && park_pool_permit(true, 1) == 0, "a request in flight: the upkeep may make nothing");
+    check(park_pool_permit(false, 64 * MiB) == 64 * MiB && park_pool_permit(false, 0) == 0, "idle: the upkeep may make what it wants");
     std::printf("park_pool_policy_test: %d checks passed\n", checks);
     return 0;
 }

@@ -12551,7 +12551,9 @@ int main(int argc, char** argv) {
                     const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
                     segpool_filler = std::make_unique<strata::core::SegmentPoolFiller>(*segpool,
                         [&segpool_allow, floor](size_t step) -> size_t {
-                            const size_t a = std::min(step, segpool_allow.load());
+                            // upkeep only while the engine is idle (park_pool_policy.hpp): no page population beside a request's GPU work
+                            const size_t a = strata::core::park_pool_permit(strata::core::progress().busy.load(),
+                                                                            std::min(step, segpool_allow.load()));
                             if (a == 0) return 0;
                             const auto mem = strata::core::sample_host_memory();   // the floor and one more GiB of RAM must stay free
                             if (!mem || mem->available < floor + ((uint64_t) 1 << 30) + a) return 0;
@@ -12674,7 +12676,12 @@ int main(int argc, char** argv) {
         // host's core, whenever a take leaves it short; one top-up at a time.  Allocation only: a save overwrites every byte.
         // Not with a layer split (its checkpoints carry stage parts; saved as before).  Unset: no ready checkpoints, nothing
         // allocated ahead of time.
+        // Upkeep only while the engine is idle (park_pool_policy.hpp): while a request is in flight (progress().busy) this returns and a
+        // take that finds the pool short gets fresh vectors; the serve loop calls it again between requests.  Counters for the
+        // request log line: checkpoints taken ready from the pool and allocated fresh.
+        size_t ck_from_pool = 0, ck_fresh = 0;
         auto pool_topup = [&] {
+            if (strata::core::park_pool_permit(strata::core::progress().busy.load(), 1) == 0) return;
             if (ckpt_pool_ready_env() == 0 || !ckpt_pool.on() || !stages.empty()) return;
             const ConvStateSizes pool_z = conv_state_sizes(g, ss);
             if (pool_z.gdn == 0) return;
@@ -12699,6 +12706,7 @@ int main(int argc, char** argv) {
                                                           ple = ss.ple_hist != nullptr] {
                 StageThreads::spread_current_thread();   // (a thread the host starts inherits its one CPU: aux_cpus.hpp)
                 for (size_t k = 0; k < want; ++k) {
+                    if (strata::core::park_pool_permit(strata::core::progress().busy.load(), 1) == 0) break;   // a request began: stop after the one made
                     ConvCheckpoint c;
                     c.gdn.resize(z.gdn); c.ple.resize(ple ? z.ple : 0); c.tails.resize(layers * z.tail);
                     c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
@@ -12726,6 +12734,9 @@ int main(int argc, char** argv) {
                              src.ids.size(), (long long) o.conversation_cache_min_tokens, conversations.size());
                 return true;
             }
+            // With a park pool, no pool memory is given back (shrink, eviction) while device work could still be pending: the GPU is
+            // idle at a park, so this costs nothing
+            if (segpool != nullptr || ckpt_pool.on()) (void) cudaDeviceSynchronize();
             // #342: before make_room evicts oldest-first, the copies of this conversation a turn back go (they hold
             // nothing the outgoing chain does not, apart from the tail this conversation rewrote)
             if (const size_t dropped = conversations.drop_superseded(src.ids, src.imgs, src.checks, src.cvec))
@@ -12862,6 +12873,7 @@ int main(int argc, char** argv) {
                     for (size_t k = 0; k <= view.checkpoints.size(); ++k) {
                         ConvCheckpoint c = ckpt_pool.take();
                         if (c.gdn.empty()) break;
+                        ++ck_from_pool;
                         storage.push_back(std::move(c));
                     }
                 std::vector<ConvCheckpoint> moved;   // STRATA_PARK_ASYNC: the ones this request drops (view: the rest)
@@ -13009,7 +13021,8 @@ int main(int argc, char** argv) {
                     return true;
                 }
             ConvCheckpoint c = parts == nullptr ? ckpt_pool.take() : ConvCheckpoint{};   // (STRATA_CKPT_POOL)
-            if (parts == nullptr) pool_topup();   // the next save finds one ready
+            if (parts == nullptr && ckpt_pool.on()) (c.gdn.empty() ? ck_fresh : ck_from_pool)++;
+            if (parts == nullptr) pool_topup();   // the next save finds one ready (between requests only)
             c.ids.assign(cur.begin(), cur.begin() + L);
             c.imgs = imgs_below(req_imgs, L);
             if (parts != nullptr) {
@@ -16035,6 +16048,11 @@ int main(int argc, char** argv) {
         for (;;) {
             line_drain_ms = 0.0;
             strata::core::manifest::instance().flush_if_dirty("request");   // STRATA_MANIFEST: what the last request added (a no-op when off)
+            // Between requests (nothing in flight): the park pools' upkeep, which the park and the prompt read leave alone
+            if (!batch_on() && !(piped && pipe_inflight()) && !strata::core::progress().busy.load()) {
+                pool_topup();
+                segpool_kick();
+            }
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
                     if (!(piped ? pump(true) : batch_step())) return 1;
@@ -20584,6 +20602,10 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+            if (ck_from_pool + ck_fresh > 0)
+                std::fprintf(stderr, "strata serve: checkpoint pool: this request took %zu checkpoint%s ready from the pool and allocated %zu fresh\n",
+                             ck_from_pool, ck_from_pool == 1 ? "" : "s", ck_fresh);
+            ck_from_pool = ck_fresh = 0;
             {   // AMD on Linux: the time the driver kept the GPU paused inside this request, when it is worth a line
                 const std::string pause_line = strata::core::gpu_pause_request_line(g_req_gpu_pause_ms.load(), gpu_pause_now());
                 if (!pause_line.empty()) std::fprintf(stderr, "%s\n", pause_line.c_str());
