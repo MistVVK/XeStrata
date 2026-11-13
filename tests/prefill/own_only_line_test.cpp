@@ -60,6 +60,31 @@ int main() {
         CHECK_LINE(own_only_line(48, 1024, big, small, false),
                    "strata: [DRAFT] prompt kernels: chunks of 1024 tokens or more run 48 of 48 layers on the FP16 path; shorter chunks run 48 on the int8 kernels.");
     }
+    // the counts of own_only_count_layer: 48 Hadamard-folded fused-only layers (Gyro-S): the staged entry and the int8 kernels read no folded layer, so below the floor they are on the FP16 path
+    {
+        OwnOnlySplit big, small;
+        for (int l = 0; l < 48; ++l) strata::prefill::own_only_count_layer(big, small, true, false, false, true, false);
+        CHECK_LINE(own_only_line(48, 1024, big, small, false),
+                   "strata: [DRAFT] prompt kernels: chunks of 1024 tokens or more run 48 of 48 layers on the fused kernels; shorter chunks run 48 on the FP16 path.");
+    }
+    // the same layers unfolded: the staged entry takes them (the line as before the change)
+    {
+        OwnOnlySplit big, small;
+        for (int l = 0; l < 48; ++l) strata::prefill::own_only_count_layer(big, small, true, false, false, true, true);
+        CHECK_LINE(own_only_line(48, 1024, big, small, false),
+                   "strata: [DRAFT] prompt kernels: chunks of 1024 tokens or more run 48 of 48 layers on the fused kernels; shorter chunks run 48 on the staged fused entry.");
+    }
+    // a mix: 40 folded and 8 unfolded fused-only layers; and an int8 layer and a gated class keep their counts
+    {
+        OwnOnlySplit big, small;
+        for (int l = 0; l < 40; ++l) strata::prefill::own_only_count_layer(big, small, true, false, false, true, false);
+        for (int l = 0; l < 8; ++l) strata::prefill::own_only_count_layer(big, small, true, false, false, true, true);
+        CHECK_LINE(own_only_line(48, 1024, big, small, false),
+                   "strata: [DRAFT] prompt kernels: chunks of 1024 tokens or more run 48 of 48 layers on the fused kernels; shorter chunks run 8 on the staged fused entry and 40 on the FP16 path.");
+        OwnOnlySplit b2, s2;
+        strata::prefill::own_only_count_layer(b2, s2, false, true, true, true, true);   // an int8 layer on a gated class: FP16 in the long class, int8 below
+        if (!(b2.fp16 == 1 && s2.i8 == 1 && b2.i8 == 0)) { std::fprintf(stderr, "FAIL %s:%d: gated int8 layer\n", __FILE__, __LINE__); ++failed; }
+    }
     if (failed) {
         std::fprintf(stderr, "own_only_line_test: %d check(s) failed\n", failed);
         return 1;

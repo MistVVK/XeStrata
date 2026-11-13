@@ -14,6 +14,7 @@
 #include "strata/prefill/stream_floor_rule.hpp"
 #include "strata/prefill/switch_point_rule.hpp"
 #include "strata/kernels/gfx_arch.hpp"
+#include "strata/quant/types.hpp"
 #include "strata/prefill/fewrows.hpp"
 #include "strata/prefill/gp100_prompt_default.hpp"
 #if defined(STRATA_HAVE_DFLASH2)
@@ -458,6 +459,26 @@ inline bool plain_pack_all_fused() {
     return false;
 #endif
 }
+// A build without MMQ (STRATA_PF_OWN_ONLY) on a gfx12 card (R9700, RX 9070 / 9060) loading a native pack whose every layer is a trellis pair (Gyro-S TQK6 / TQK7 and the other trellis types) that the fused kernels
+// take (layers_all_fused_only(): no layer on MMQ or on the FP16 path).  Below the floor the staged fused entry reads these layers about twice as slowly as MMQ did (R9700, Gyro-S, 128 to 1,000 tokens: 542 to 1,241 ms
+// against 252 to 659 ms), the streamed walk is faster than MMQ at every size (167 to 415 ms).  False in a build with MMQ, on every other card, and without a loaded layout.
+inline bool trellis_gfx12_all_fused() {
+#if defined(STRATA_PF_OWN_ONLY) && defined(STRATA_USE_HIP)
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || lay.fmt.empty()) return false;
+    for (const auto& f : lay.fmt)
+        if (f.gu_type < (int) strata::quant::Type::TQ2_T || f.gu_type > (int) strata::quant::Type::TQP7) return false;   // not a trellis gate/up
+    int dev = 0;
+    cudaDeviceProp prop;
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return strata::kernels::gfx_arch_is_gfx12_wmma(prop.gcnArchName) && layers_all_fused_only();
+#else
+    return false;
+#endif
+}
 // The floor without STRATA_PREFILL_STREAM_MIN and the CPU share: stream_floor_rule.hpp's answer, decided once when the expert layout is known (a call before that gets the default and is not cached).
 inline int64_t default_stream_floor() {
     static std::atomic<int64_t> cached{-1};
@@ -467,7 +488,7 @@ inline int64_t default_stream_floor() {
     const bool plain = plain_pack_all_fused();   // a build without MMQ and a non-native pack on the fused kernels: no staged entry or int8 path exists for its layout (stream_floor_rule.hpp)
     if ((!lay.native || lay.fmt.empty()) && !plain) return strata::prefill::kStreamFloorDefault;
     const bool cls = !plain && stream_floor_class_measured();
-    int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only(), staged_fo_on(), plain);
+    int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only(), staged_fo_on(), plain, trellis_gfx12_all_fused());
 #if !defined(STRATA_USE_HIP) && !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
     // the card's counts are not known yet (set_card_expert_share has not run) and the rule is not switched off: the default, not cached
     if (v == strata::prefill::kStreamFloorDefault && switch_point_env() != 0 && !switch_point_known()) return v;
@@ -1901,13 +1922,14 @@ const MmqPlan& mmq_plan() {
             for (int64_t l = 0; l < layers; ++l) {
                 const bool fo = p.fo[(size_t) l] != 0 && !peer_off;
                 bool i8 = false;                                            // the int8 expert kernels take this layer's formats (the class rule or STRATA_EXPERT_I8, i8_wants_identity's test)
+                bool unfolded = true;                                       // no Hadamard fold and no tail: the staged entry and the int8 kernels read neither (fz_staged / i8_l: !had_gu && !had_d && !tail_off)
                 if (lay.native) {
                     const auto& f = lay.fmt[(size_t) l];
-                    if (!f.tail_off && !f.had_gu && !f.had_d)
+                    unfolded = !f.tail_off && !f.had_gu && !f.had_d;
+                    if (unfolded)
                         i8 = strata::kernels::native_expert_i8_prompt(strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff), (int64_t) 1 << 20);
                 }
-                if (fo) ++big.fused; else if (i8 && !i8_gated) ++big.i8; else ++big.fp16;   // (a gated class: no int8 in the long class)
-                if (fo && entry_on) ++small.staged; else if (i8) ++small.i8; else ++small.fp16;
+                strata::prefill::own_only_count_layer(big, small, fo, i8, i8_gated, entry_on, unfolded);
             }
             std::fprintf(stderr, "%s\n", strata::prefill::own_only_line(layers, stream_all_min(), big, small, peer_off).c_str());
             std::string sw;

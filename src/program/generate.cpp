@@ -4849,7 +4849,8 @@ int main(int argc, char** argv) {
 #endif
         // APR (prism.hadamard) packs: every expert path rotates its activations (CPU pool: native_quant_act / _h;
         // GPU verify, remote GPUs, prompt FP16 path: hadamard_rows).  Validated end to end on CUDA (sm_86, sm_89 with
-        // a two-GPU layer split and peer decode, sm_120) and on HIP gfx1151.  Other HIP architectures run the same
+        // a two-GPU layer split and peer decode, sm_120) and on HIP gfx1151 and gfx1201 (R9700: Gyro-S speed gate and
+        // forced-token KL against the FP16 path, 11-13).  Other HIP architectures run the same
         // kernels but have not been run end to end with such a pack: said here, not refused (the P2P prompt peer
         // says the same in Prefill::set_peer).  The former opt-in STRATA_APR is no longer read.
         if (strata::kernels::cpu::hadamard_spec().any()) {
@@ -4861,9 +4862,9 @@ int main(int argc, char** argv) {
             if (cudaGetDevice(&dev) == cudaSuccess && cudaGetDeviceProperties(&p, dev) == cudaSuccess) {
                 std::string arch(p.gcnArchName);
                 if (const size_t colon = arch.find(':'); colon != std::string::npos) arch.resize(colon);
-                if (arch != "gfx1151")
+                if (arch != "gfx1151" && arch != "gfx1201")
                     std::fprintf(stderr, "strata generate: warning: Hadamard-folded experts are validated end to end "
-                                         "on gfx1151 among AMD GPUs, not yet on %s\n", arch.c_str());
+                                         "on gfx1151 and gfx1201 among AMD GPUs, not yet on %s\n", arch.c_str());
             } else {
                 (void) cudaGetLastError();
             }
