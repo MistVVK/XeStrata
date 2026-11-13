@@ -7343,7 +7343,10 @@ bool lm_fused_layer(int64_t l, bool group_scratch) {
 #else
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
     const MmqPlan& mp = mmq_plan();
-    if (group_scratch || !lay.native || l < 0 || l >= (int64_t) mp.layer.size() || l >= (int64_t) lay.fmt.size() || !mp.layer[(size_t) l]) return false;
+    // (a build without MMQ has no layer on MMQ: the layers the fused kernels cover are the plan's `fo` ones, which this walk takes the same way; a build with MMQ keeps
+    // its `fo` layers on the FP16 path in the walk as before)
+    if (group_scratch || !lay.native || l < 0 || l >= (int64_t) mp.layer.size() || l >= (int64_t) lay.fmt.size()) return false;
+    if (!mp.layer[(size_t) l] && !(!mmq::built() && mp.any && mp.fo[(size_t) l])) return false;
     const auto& f = lay.fmt[(size_t) l];
     if (f.had_gu || f.had_d || f.tail_off) return false;
     return fused::native_supported(f.gu_type, f.d_type);
@@ -7997,7 +8000,7 @@ bool Prefill::lm_run(const std::vector<Seg>& segs, int depth, const std::vector<
         // a layer MMQ does not take runs run_impl's FP16 path (port, 2026-10-24): each expert dequantized to FP16 once
         // per super-chunk, then per entry its rows' FP16 inputs (lb.mixed_h, the bits run_impl's gather reads) through
         // two FP16 GEMMs into the group's Dm rows; the group's rows are added per token as on the MMQ path
-        const bool fp16_l = !mmq_plan().layer[(size_t) l];
+        const bool fp16_l = !mmq_plan().layer[(size_t) l] && !fz_l;   // (fz_l without an MMQ layer: a build without MMQ, a layer of the plan's `fo` set)
         const size_t mmq_gub = fp16_l ? 0 : mmq::matrix_bytes(mmq_gt, kFF2, N), mmq_db = fp16_l ? 0 : mmq::matrix_bytes(mmq_dt, N, kFF);
         size_t staged = 0, u = 0;
         const uint8_t* blob_dev = nullptr;
