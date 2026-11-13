@@ -196,7 +196,10 @@ def emit(code: list[int]) -> str:
 
 def header(out: str, t4: dict, t5: dict, ysk: dict | None) -> None:
     def mults(m: list[float]) -> str:
-        return ", ".join(f"{v:.6g}f" for v in m)
+        def lit(v: float) -> str:   # a float literal: 1 is written 1.0f, not 1f
+            t = f"{v:.6g}"
+            return (t if "." in t or "e" in t else t + ".0") + "f"
+        return ", ".join(lit(v) for v in m)
     text = [
         "// SPDX-FileCopyrightText: 2026 the YASAKANI authors",
         "// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors",
