@@ -643,6 +643,16 @@ bool NativeDense::gguf_carries_q8_hc(const std::vector<std::string>& shards) {
     return false;
 }
 
+bool NativeDense::apply_hc_q8_default(const std::vector<std::string>& shards) {
+    if (std::getenv("STRATA_HC_Q8") != nullptr || !gguf_carries_q8_hc(shards)) return false;
+#if defined(_WIN32)
+    _putenv_s("STRATA_HC_Q8", "1");
+#else
+    setenv("STRATA_HC_Q8", "1", 0);
+#endif
+    return true;
+}
+
 bool NativeDense::hc_q8_requested() { return hc_q8_env(); }
 
 bool NativeDense::add_hc_skip(const std::string& pack_dir, std::set<std::string>& skip) {

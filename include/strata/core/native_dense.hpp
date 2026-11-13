@@ -51,6 +51,9 @@ public:
     /// Whether the GGUF shards carry the hyper-connection down / up projections as Q8_0 (an Unsloth UD-* file; the GSQ-RCO packs keep them
     /// BF16).  Reads the tensor directories only.  generate.cpp turns STRATA_HC_Q8 on by default on CUDA when this is true (owner yes 2026-11-07).
     static bool gguf_carries_q8_hc(const std::vector<std::string>& shards);
+    /// The default rule itself: when STRATA_HC_Q8 is not set at all and the shards carry the projections as Q8_0, sets it to 1 (a value the
+    /// user set, also 0, is kept).  Returns whether it set it.  Must run before the first read of the switch (`hc_q8_requested`).
+    static bool apply_hc_q8_default(const std::vector<std::string>& shards);
     static bool hc_q8_requested();
     static bool add_hc_skip(const std::string& pack_dir, std::set<std::string>& skip);
     /// A projection's bf16 values for a path that has no Q8 kernel (the prompt path's GEMMs, the single-token read): the

@@ -233,8 +233,7 @@ what you see.
 
 One fidelity note applies to every `--compat-bf16` pack, UD-Q4_K_XL included. The pack rounds the file's Q8_0
 hyper-connection projections to BF16, and on the Strix Halo that put perplexity 6 to 9% above llama.cpp's on the same
-file (teacher-forced, short context). `STRATA_HC_Q8=1`, which setup writes on CUDA for the UD files, reads the file's Q8_0
-values instead of the rounded BF16. The 6 to 9% gap was measured on AMD, where setup does not write it.
+file (teacher-forced, short context). On NVIDIA the engine reads the file's Q8_0 values instead of the rounded BF16 by default. The 6 to 9% gap was measured on AMD, where setup does not write it.
 
 ## Q4_0 files
 
