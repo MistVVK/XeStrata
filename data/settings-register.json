@@ -790,7 +790,7 @@
   },
   "KV_GROW_HOLD": {
    "reads": [
-    "src/program/generate.cpp:10740"
+    "include/strata/core/kv_grow_hold.hpp:25"
    ]
   },
   "KV_GROW_INIT": {

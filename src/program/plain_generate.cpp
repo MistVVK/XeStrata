@@ -23,6 +23,7 @@
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_cache.hpp"
+#include "strata/core/kv_grow_hold.hpp"
 #include "strata/core/conversation_disk.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/coupled_draft.hpp"
@@ -238,6 +239,11 @@ struct ConversationCache {
         std::vector<Checkpoint> checks;
     };
     std::list<Entry> parked;      // most recent first
+    int64_t longest() const {     // --kv-grow's hold: the longest parked conversation, in tokens
+        int64_t n = 0;
+        for (const Entry& e : parked) n = std::max(n, (int64_t) e.ids.size());
+        return n;
+    }
     int64_t used() const {
         int64_t n = 0;
         for (const Entry& e : parked) {
@@ -1626,8 +1632,10 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         }
         live.resize((size_t) resume);
         drop_checks_past(resume);
-        // ... and what lies far past this request's need back to the expert tier (the conversation set aside first)
-        if (!model.kv_trim(n + max_new + opt.max_t, err)) {
+        // ... and what lies far past this request's need back to the expert tier (the conversation set aside first),
+        // less what a parked conversation may need back (XESTRATA_KV_GROW_HOLD, kv_grow_hold.hpp)
+        const int64_t kv_hold = strata::core::kv_grow_hold() ? cache.longest() + max_new + opt.max_t : 0;
+        if (!model.kv_trim(n + max_new + opt.max_t, kv_hold, err)) {
             std::printf("FATAL %s\n", err.c_str());
             std::fflush(stdout);
             return 1;

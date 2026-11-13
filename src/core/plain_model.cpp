@@ -19,6 +19,7 @@
 // src/models/qwen35.cpp at de7fa0a3) is qwen35moe's with the MoE replaced by a dense SwiGLU, down(silu(gate(h)) * up(h)),
 // in every block and in the MTP layer: no experts, so none of the tiers, the CPU pool or the window protocol.
 #include "strata/core/kv_elastic.hpp"
+#include "strata/core/kv_grow_hold.hpp"
 #include "strata/core/plain_model.hpp"
 #include "strata/core/constraint_upload.hpp"
 
@@ -992,6 +993,9 @@ bool PlainModel::load_qwen(std::string& err) {
         const bool grow = asked && why == nullptr;
         if (opt_.kv_grow > 0 && !grow) std::fprintf(stderr, "xestrata plain: --kv-grow is off: %s\n", why);
         if (grow) opt_.vram_elastic = true;   // the tier in segments it can give up (vram)
+        if (grow)
+            std::fprintf(stderr, "xestrata plain: the elastic K/V: a parked conversation's cells %s\n",
+                         strata::core::kv_grow_hold() ? "stay while it waits" : "go back after each request");
         for (int64_t i = 0; i < n_attn; ++i) {   // this stage's attention blocks, the MTP layer on the last
             bool mine = has_mtp_ && i == mtp_.attn;
             for (int64_t l = lb_; l < le_ && !mine; ++l) mine = blocks_[(size_t) l].attn == i;
@@ -2226,9 +2230,9 @@ bool PlainModel::kv_grow_to(int64_t cells, std::string& err) {
     return true;
 }
 
-bool PlainModel::kv_trim(int64_t cells, std::string& err) {
+bool PlainModel::kv_trim(int64_t cells, int64_t hold, std::string& err) {
     if (kv_cells_ < 0) return true;
-    const int64_t target = kv_elastic_target(cells, kKvGrowStep);
+    const int64_t target = kv_elastic_target(std::max<int64_t>(cells, hold), kKvGrowStep);
     if (kv_cells_ < target + 2 * kKvGrowStep) return true;
     if (!settle_swaps(true, err)) return false;
     if (!strata::gpu::device_sync()) { err = std::string("plain model: ") + strata::gpu::last_error(); return false; }
