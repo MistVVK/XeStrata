@@ -1709,11 +1709,12 @@ namespace {
 // rows (ple_land, read from the SSD beside layer 0) lands on layer 0's 'hc write'.
 enum PfPhase { kPfStart, kPfHc, kPfGdn, kPfQsa, kPfQsaIdx, kPfQsaSel, kPfQsaAttn, kPfRouter, kPfHostGroup, kPfGather,
                kPfWaitCopy, kPfDequant, kPfGemmGU, kPfGemmD, kPfCombine, kPfPle, kPfKvStage, kPfGdnConv, kPfGdnRec, kPfGdnOut,
-               kPfHcWrite, kPfCount };
+               kPfHcWrite, kPfHcDown, kPfHcUp, kPfHcInj, kPfHcMix, kPfCount };
 const char* const kPfNames[kPfCount] = {"embed+steps", "hc read", "gdn", "qsa proj", "qsa indexer", "qsa select",
                                         "qsa attn", "router+shared", "host grouping", "gather", "wait copy", "dequant",
                                         "gemm gate/up", "gemm down", "combine", "ple", "kv stage", "gdn conv+gates",
-                                        "gdn recurrence", "gdn out proj", "hc write"};
+                                        "gdn recurrence", "gdn out proj", "hc write", "hc read: down+silu", "hc read: up",
+                                        "hc read: inject", "hc read: mix"};
 struct PfTimer {
     bool on = env_on("PREFILL_TIMING");
     std::vector<strata::gpu::Event*> ev;
@@ -2349,10 +2350,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 core::WeightRef wdv = *wd, wuv = *wu;
                 if (wd->data == nullptr) wdv.data = core::hc_bf16_view(wd, 0, m.cs);
                 if (wu->data == nullptr) wuv.data = core::hc_bf16_view(wu, 1, m.cs);
+                pt.mark(kPfHcDown, cs);   // STRATA_PREFILL_TIMING: the hyper-connection read's parts on their own lines
                 if (!bf16_proj(m.gemm, &wdv, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo)) return false;
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
+                pt.mark(kPfHcUp, cs);
                 if (!bf16_proj(m.gemm, &wuv, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
+                pt.mark(kPfHcInj, cs);
                 if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo)) return false;
+                pt.mark(kPfHcMix, cs);
                 gr_mix_r(m.R, m.xn, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h,
                          m.mixed_bf_lo);
 
@@ -4693,10 +4698,14 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                     core::WeightRef wdv = *wd, wuv = *wu;
                     if (wd->data == nullptr) wdv.data = core::hc_bf16_view(wd, 0, cs);
                     if (wu->data == nullptr) wuv.data = core::hc_bf16_view(wu, 1, cs);
+                    pt.mark(kPfHcDown, cs);   // (as the default path: the hyper-connection read's parts on their own lines)
                     if (!bf16_proj(m.gemm, &wdv, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo)) return false;
                     gr_silu(m.lo, m.lo16, T, cs, m.lo16_lo);
+                    pt.mark(kPfHcUp, cs);
                     if (!bf16_proj(m.gemm, &wuv, m.lo16, m.gated, T, su, err, 0, m.lo16_lo)) return false;
+                    pt.mark(kPfHcInj, cs);
                     if (!bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo)) return false;
+                    pt.mark(kPfHcMix, cs);
                     gr_mix_r(m.R, m.xn, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, cs, m.mixed_h,
                              m.mixed_bf_lo);
                     if (half == 0 && !core::is_qsa_layer(g, l)) {
