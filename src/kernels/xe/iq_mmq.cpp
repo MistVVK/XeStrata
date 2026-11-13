@@ -153,7 +153,8 @@ template<> struct Dec<18> {   // IQ3_XXS: d (0.5 + ls) / 2
 // IQ3_XXS in the fixed-point sums (canon_math.hpp's fx_*; iq_mmq_grouped's kIqMmqFx + 18, on canonical activations):
 // Dec<18>'s values, s0 the 32's integer scale 2 ls + 1 and s1 the 256's d, which the FX bodies take apart (K = 1/4)
 template<> struct Dec<kIqMmqFx + 18> {
-    static constexpr int QK = 256, BSZ = (int) sizeof(block_iq3_xxs), kFxLog2 = -2;
+    static constexpr int QK = 256, BSZ = (int) sizeof(block_iq3_xxs);
+    static constexpr int fx_log2() { return -2; }   // log2 K
     static Sub get(const uint8_t* row, int sb, size_t row_bytes) {
         Sub r = Dec<18>::get(row, sb, row_bytes);
         const block_iq3_xxs* b = reinterpret_cast<const block_iq3_xxs*>(row) + sb / 8;
@@ -527,7 +528,7 @@ constexpr bool half_scales() { return TY == 17 || TY == 22 || TY == 29 || TY == 
 template<int TY>
 constexpr bool has_min() { return TY == 7 || TY == 12 || TY == 13; }
 template<int TY>
-constexpr bool fx_form() { return TY >= kIqMmqFx; }
+constexpr bool fx_form() { return TY == kIqMmqFx + 18; }
 
 // ---------------------------------------------------------------- the products
 template<typename T>
@@ -627,7 +628,7 @@ struct Kernel {
         return canon::fx_scale(canon::fx_part(xsv), canon::fx_part(wd), top);
     }
     static float fx_out(int64_t sum, int top) {
-        if constexpr (FX) return canon::fx_value(sum, top, Dec<TY>::kFxLog2);
+        if constexpr (FX) return canon::fx_value(sum, top, Dec<TY>::fx_log2());
         else return 0.0f;
     }
 
