@@ -799,7 +799,8 @@ bool DraftPolicy::calibrate(CostFile& cf, std::string& report) {
             if (a.n < kCalibN) continue;
             const double v = a.sum / a.n, base = learned_[(size_t) k][(size_t) t];
             if (!(base > 0.0) || (v >= kCalibOkLo * base && v <= kCalibOkHi * base)) {   // no learned cost (passive): the clamped rounds are taken as they are
-                std::snprintf(b, sizeof b, "%s%d rows %.2f -> %.2f", report.empty() ? "" : ", ", t, base, v);
+                if (base > 0.0) std::snprintf(b, sizeof b, "%s%d rows %.2f -> %.2f", report.empty() ? "" : ", ", t, base, v);
+                else std::snprintf(b, sizeof b, "%s%d rows real %.2f", report.empty() ? "" : ", ", t, v);
                 report += b;
                 real_cost_[(size_t) k][(size_t) t] = v;
                 real_[(size_t) k] |= 1u << (t - 1);
