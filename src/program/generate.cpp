@@ -21844,7 +21844,7 @@ int main(int argc, char** argv) {
                 t_cycle_ms[(size_t) T] += round_ms;
                 ++t_cycle_n[(size_t) T];
             }
-            if (spec_cost && use_mtp && timed_round && !from_sfx && !win_forced) policy.observe_probs(dwin.data(), T_mtp - 1, a);
+            if (spec_cost && use_mtp && timed_round && !from_sfx) policy.observe_probs(dwin.data(), T_mtp - 1, a);
             if (timed_round && chain_n == 0) policy.observe(from_sfx, T, a, sfx_match, round_ms);
             else if (timed_round) policy.observe_chain(T_mtp, chain_n, a, cm, round_ms);
             if (rounds % 64 == 0)
