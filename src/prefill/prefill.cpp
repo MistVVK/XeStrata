@@ -536,26 +536,28 @@ inline int64_t default_stream_floor() {
         std::fprintf(stderr, "prefill: prompt pieces of %lld tokens or more read on the fused kernels, as long prompts do. STRATA_PREFILL_STREAM_MIN=1024 keeps the old rule.\n", (long long) v);
     return v;
 }
-// The CPU share's limit (g_stream_min_share) replaces the default floor, because the share applies to staged chunks only.  Not on the plain pack in a build without MMQ: the share takes experts of
-// a native pack only (cpu_maybe), so there it takes nothing, and the staged walk below the floor runs the plain pack's experts on the dequantize + FP16 path (plain_floor_rule.hpp).
-// STRATA_PF_PLAIN_FLOOR=0 is the way back.  Decided once, when the expert layout is known; before that the old rule answers and is not cached.
-inline bool share_limit_raises_floor_now() {
-#if defined(STRATA_PF_OWN_ONLY)
+// The plain pack in a build without MMQ on a DISCRETE CUDA card takes strata::prefill::kPlainDiscreteFloor, with or without the CPU share (plain_floor_rule.hpp: the share's limit would replace the
+// floor although it takes nothing of that pack, and the plain pack's own 64 was measured on an integrated GPU).  The card must have answered (set_card_expert_share ran: one card, no batch slots) and
+// the expert layout be loaded; before that the old rule answers and nothing is cached.  Integrated cards, HIP builds and a build with MMQ never take it.  STRATA_PF_PLAIN_FLOOR=0 is the way back.
+inline bool plain_discrete_floor_now() {
+#if defined(STRATA_PF_OWN_ONLY) && !defined(STRATA_USE_HIP) && !defined(__HIPCC__) && !defined(STRATA_HIP_GFX906)
     static std::atomic<int> cached{-1};
     const int c = cached.load(std::memory_order_acquire);
     if (c >= 0) return c == 1;
-    if (strata::kernels::cpu::expert_layout().n_layers <= 0) return true;
-    const bool v = strata::prefill::share_limit_raises_floor(plain_pack_all_fused(), std::getenv("STRATA_PF_PLAIN_FLOOR"));
+    if (strata::kernels::cpu::expert_layout().n_layers <= 0 || !switch_point_known()) return false;
+    const bool v = strata::prefill::plain_takes_discrete_floor(plain_pack_all_fused(), !g_sp_integrated, std::getenv("STRATA_PF_PLAIN_FLOOR"));
     cached.store(v ? 1 : 0, std::memory_order_release);
     return v;
 #else
-    return true;
+    return false;
 #endif
 }
 inline int64_t stream_all_min() {
     static const int64_t env = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) -1; }();
     if (env >= 0) return env;
-    return g_stream_min_share > 0 && share_limit_raises_floor_now() ? g_stream_min_share : default_stream_floor();
+    const bool discrete = plain_discrete_floor_now();
+    // (default_stream_floor() prints its line once and caches: only asked when its answer can be the result, as before)
+    return strata::prefill::floor_with_share(discrete, g_stream_min_share, discrete || g_stream_min_share <= 0 ? default_stream_floor() : 0);
 }
 // STRATA_PREFILL_CPU_SHARE (opt-in; set_cpu_pool): a chunk below stream_all_min() hands the decode CPU pool - idle
 // while a prompt is read - the non-resident experts few of its tokens route to, instead of streaming them over PCIe.

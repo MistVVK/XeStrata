@@ -438,7 +438,7 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(share_own_rule_test PRIVATE include)
   add_test(NAME share_own_rule_test COMMAND share_own_rule_test)
 
-  # whether the CPU share's chunk limit raises the long-prompt floor: not for the plain pack in a build without MMQ, where the share takes nothing (header-only, no GPU)
+  # the long-prompt floor of the plain pack by card class and share state: 1,536 tokens on a discrete CUDA card in a build without MMQ, the old answer elsewhere (header-only, no GPU)
   add_executable(plain_floor_rule_test tests/prefill/plain_floor_rule_test.cpp)
   target_include_directories(plain_floor_rule_test PRIVATE include)
   add_test(NAME plain_floor_rule_test COMMAND plain_floor_rule_test)
