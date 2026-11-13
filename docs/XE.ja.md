@@ -211,7 +211,8 @@ upstream の Strata 0.1.44.1 から 0.1.45（`477ac13c`）までの変更を Xe 
 - RAM 常駐の形: 予算に余りがあれば、prompt の経路が借りる枠のエキスパートも RAM に置く（#1683）。
 - `--layer-split auto`: 2 枚で小さな段ができたら置き場所の広さの割合で選び直す（#2644）。
 - serve: 思考の上限（`max_tokens` と Anthropic の `budget_tokens`）、sampling のない要求にモデルカードの値、プロンプトを最後に共有した前置きからトークン化する（#1852）、次のターンを会話のチェックポイントを持つスロットへ送る（#2518）、短い prompt を先に受け入れる（`XESTRATA_ADMIT_SHORT_FIRST`、opt-in）、パーサーの修正。
-- opt-in のまま移したもの: `STRATA_EXCHANGE_ROTATE`、`XESTRATA_RAM_ADAPT`。
+- opt-in のまま移したもの: `XESTRATA_RAM_ADAPT`。
+- `XESTRATA_EXCHANGE_ROTATE` は、層ごとにエキスパートの大きさが違う pack で、予備のぶんの RAM（IQ3_XXS・`--adapt-swaps 80` で 1.20 GiB）の余裕があるときに自動で入ります（`0`・`1` で固定）。
 
 この取り込みの間に XeStrata の側で直したもの:
 
@@ -250,7 +251,7 @@ upstream の Strata 0.1.43.1 から 0.1.44.1（`296b59d2`）までの変更を X
 - 量子化の品質の物差し（`tools/quant_quality.py`、`tools/quant_formats.py`）。
 - `XESTRATA_HC_Q8`（ハイパーコネクションの down/up を Q8_0 で読む、BF16 の pack では読み込み時に Q8_0 にする）: 読み込み時に両方の形を測って速い方を使い、Q8_0 なら GPU 1 枚のときは BF16 の写しを VRAM から外します。AMD では次の射影のための q8_1 も読みの中で書きます（B70 で decode +3.5%。答えが変わる近似）。
 - opt-in のまま移したもの: `XESTRATA_MTP_PRIO`・`XESTRATA_COPY_PRIO`、`XESTRATA_PCIE_MIN1`、arena の `--adapt-async 1`、`XESTRATA_DENSE_F32`。
-- 起動時の短い測りで選ぶもの（`0`・`1` で固定できる）: CPU プールの待ち方（`XESTRATA_POOL_UMWAIT`。CPU の WAITPKG を確かめ、公開から起きるまでの時間をスピンと UMWAIT で測ります）。
+- 起動時の短い測りで選ぶもの（`0`・`1` で固定できる）: CPU プールの待ち方（`XESTRATA_POOL_UMWAIT`。CPU の WAITPKG を確かめ、公開から起きるまでの時間をスピンと UMWAIT で測ります）と、PCIe の分担の下限（`XESTRATA_PCIE_MIN1`。分担を固定したときに 1〜2 個の外れが 0 に丸まらないよう、CPU・PCIe・GPU の 1 個あたりの時間を測って決めます）。
 
 この取り込みの間に XeStrata の側で直したもの:
 
@@ -661,7 +662,7 @@ llama.cpp と分かれるのは、どれも参照の上位 2 候補が僅差の�
   decode の呼び出しの実時間を、分け方が見込んだ時間と比べ、15% を超えてずれていれば CPU の時間をその比で直します（CPU に計算のあった呼び出しの 512 回、さらに 1,024 回、2,048 回の後、3 回まで。upstream の PcieAuto が割合を詰めるのと同じ考え方）。
   RX 9060 XT の IQ3_XXS で decode が 1K 50.3 → 52.2、64K 48.5 → 51.3、262K 42.5 → 44.7 tok/s になり、起動時の時間が実測と合う B70 と RTX 4070 では動きません。`XESTRATA_PCIE_SPLIT_REFINE=0` で起動時の時間のままにします。
 - **領域**: Level Zero では、デバイスへのコピー用に登録したエキスパートの領域を GPU のカーネルが読めません。
-  分け方が PCIe に回すときだけ、領域を層ごとにホスト USM へ移します（IQ3_XXS の 40 GB で約 7.5 秒）。`XESTRATA_ARENA_HOST_USM=1` は最初からホスト USM にします。
+  分け方が PCIe に回すときだけ、領域を層ごとにホスト USM へ移します（IQ3_XXS の 40 GB で約 7.5 秒）。`XESTRATA_ARENA_HOST_USM` は 16 MiB を両方の置き場から GPU へ写して比べ、速い方（差が 2% 以内ならホスト USM）を最初から使います（`0`・`1` で固定）。
 - **READY の前の待ち**: エンジンは READY と言う前に、カーネルがホストのページを動かし終えるまで待ちます（`/proc/vmstat` の `pgmigrate_success` が 2 秒続けて毎秒 10,000 ページ未満、最大 30 秒。Linux だけ）。
   読み込みの直後のメモリの詰め直しは登録した領域のページも動かしうるので、それを最初の要求より前に済ませます。`XESTRATA_SETTLE_S` で最大の秒数を変え、0 で待ちません。
 - **割合のまま**: `--pcie-frac`（`--calibrate` が保存した値を含む）を渡したとき、層の分割、`--pcie-mode dma` と `direct`、測れなかったときは、以前の割合を使います。

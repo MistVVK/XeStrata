@@ -208,7 +208,8 @@ The main ones:
 - The resident RAM mode: with room left in the budget, the experts of the slots the prompt path borrows are kept in RAM too (#1683).
 - `--layer-split auto`: when two cards leave a small stage, it picks again by the ratio of their room (#2644).
 - serve: the thinking limit (`max_tokens` and Anthropic's `budget_tokens`), the model card's sampling for a request without one, the prompt tokenized from the last shared prefix (#1852), the next turn sent to the slot that holds the conversation's checkpoint (#2518), short prompts admitted first (`XESTRATA_ADMIT_SHORT_FIRST`, opt-in), parser fixes.
-- Carried as opt-in: `STRATA_EXCHANGE_ROTATE`, `XESTRATA_RAM_ADAPT`.
+- Carried as opt-in: `XESTRATA_RAM_ADAPT`.
+- `XESTRATA_EXCHANGE_ROTATE` is taken by itself for a pack whose layers differ in block size, when the RAM has room for the spare buffers (1.20 GiB with IQ3_XXS and `--adapt-swaps 80`); 0 or 1 fixes it.
 
 Fixed on XeStrata's side during the integration:
 
@@ -259,7 +260,7 @@ The main ones:
   at load and the faster kept; with Q8_0 on one GPU the BF16 copies leave the VRAM, and on AMD the read also writes
   the next projections' q8_1 (B70 decode +3.5%; an approximation that changes the output).
 - Ported and kept opt-in: `XESTRATA_MTP_PRIO` and `XESTRATA_COPY_PRIO`, `XESTRATA_PCIE_MIN1`, `--adapt-async 1` in the arena
-- Chosen by a short measurement at start (0 or 1 fixes it): the CPU pool's park (`XESTRATA_POOL_UMWAIT`: the CPUID WAITPKG bit, then the time from a publish to the wake, spinning and with UMWAIT).
+- Chosen by a short measurement at start (0 or 1 fixes it): the CPU pool's park (`XESTRATA_POOL_UMWAIT`: the CPUID WAITPKG bit, then the time from a publish to the wake, spinning and with UMWAIT) and the PCIe lane's floor (`XESTRATA_PCIE_MIN1`: with a fixed share, the CPU's, PCIe's and the GPU's time for one expert, so that one or two misses a layer do not round to none).
   mode, `XESTRATA_DENSE_F32`.
 
 Fixed on XeStrata's side during this integration:
@@ -671,7 +672,7 @@ Before, it was a share from the link's speed alone (0.55 from 20 GB/s, below tha
   The decode's calls are set against the time the split expected for them, and when they are more than 15% off, the CPU's times are scaled by the ratio (after 512 calls with experts on the CPU, then 1,024 and 2,048 more, three updates at most; as upstream's PcieAuto refines its share).
   On the RX 9060 XT, IQ3_XXS decodes at 52.2 instead of 50.3 tok/s at 1K, 51.3 instead of 48.5 at 64K and 44.7 instead of 42.5 at 262K; on the B70 and the RTX 4070, whose times at start match the decode's, nothing changes. `XESTRATA_PCIE_SPLIT_REFINE=0` keeps the times taken at start.
 - **The arena**: on Level Zero, GPU kernels cannot read the arena registered for device copies.
-  Only when the split reads experts over PCIe, the arena moves into host USM a layer at a time (about 7.5 s for IQ3_XXS's 40 GB). `XESTRATA_ARENA_HOST_USM=1` puts it in host USM from the start.
+  Only when the split reads experts over PCIe, the arena moves into host USM a layer at a time (about 7.5 s for IQ3_XXS's 40 GB). `XESTRATA_ARENA_HOST_USM` copies 16 MiB to the GPU from both places at start and takes the faster one (host USM when they are within 2%); 0 or 1 fixes it.
 - **The wait before READY**: the engine waits, before it says READY, until the kernel has stopped moving host pages (`pgmigrate_success` in `/proc/vmstat` below 10,000 pages a second for 2 seconds, at most 30 seconds; Linux only).
   The compaction right after the load can move the registered arena's pages as well, so it is over before the first request. `XESTRATA_SETTLE_S` sets the most seconds, 0 no wait.
 - **The share stays**: with `--pcie-frac` (also as `--calibrate` saved it), over a layer split, with `--pcie-mode dma` or `direct`, and when the times cannot be measured.
