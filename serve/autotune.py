@@ -226,11 +226,13 @@ def groups(m: Machine, slots: int):
     return AUTO if len(m.vram) > 1 and slots >= 2 else None
 
 
-def elastic(m: Machine, borrower: bool) -> bool:
+def elastic(m: Machine, borrower: bool, encoder: bool = False) -> bool:
     """The expert cache in segments, so what borrows the VRAM between requests (an image job, a GPU vision encoder)
-    can take it and give it back.  Without a borrower there is nothing to give it to; on a layer split the engine
-    keeps one cache per card and turns the segments off itself."""
-    return bool(borrower) and len([v for v in m.vram if v > 0]) <= 1
+    can take it and give it back.  Without a borrower there is nothing to give it to.  On a layer split the engine
+    keeps one cache per card and turns the segmenting off itself, so only a GPU encoder keeps it (it still starts with
+    its picture, and its VRAM has to be free: the server says so)."""
+    n = len([v for v in m.vram if v > 0])
+    return bool(borrower) and (n <= 1 or encoder)
 
 
 def _split_wanted(cfg: dict) -> bool:
@@ -350,11 +352,11 @@ def resolve(cfg: dict, m: Machine) -> Plan:
     elif isinstance(want, dict):
         notes.append("split_serve: on, as the config says")
 
-    # the batch slots ("parallel") and their groups: a replica is one card with its own slots, so the slots are
-    # counted on one card there, and the groups are the layer split's alone
+    # the batch slots ("parallel") and their groups: a replica or an engine of a split is one card with its own
+    # slots, so the slots are counted on one card there, and the groups are the layer split's alone
     one = Machine(vram=(min(m.vram),), free=(min(m.free or m.vram),), ram=m.ram, model=m.model, experts=m.experts,
                   ctx=m.ctx, kv=m.kv, streaming=m.streaming, cards=(m.cards[0],), slots_ok=m.slots_ok, why=m.why) \
-        if _many_engines(c) and m.vram else m
+        if (_many_engines(c) or c.get("split_serve")) and m.vram else m
     want = c.get("parallel", AUTO)
     if _left_alone(want) or want is True:
         auto.append("parallel")
@@ -366,7 +368,9 @@ def resolve(cfg: dict, m: Machine) -> Plan:
                          f"~{slot:.1f} GB beside half of the experts)")
         else:
             c["parallel"] = 1
-            notes.append("parallel: one at a time (auto: " + _no_parallel(one) + ")")
+            why = ("split serving runs one request at a time (a session file cannot carry the slots)"
+                   if c.get("split_serve") else _no_parallel(one))
+            notes.append("parallel: one at a time (auto: " + why + ")")
     elif isinstance(want, int) and not isinstance(want, bool) and want >= 2:
         notes.append(f"parallel: {want} requests at once, as the config says")
     elif want in (False, 0, 1):
@@ -392,13 +396,18 @@ def resolve(cfg: dict, m: Machine) -> Plan:
 
     # the expert cache in segments
     want = c.get("vram_elastic", AUTO)
-    borrower = bool(c.get("images")) or (isinstance(c.get("vision"), dict) and c["vision"].get("gpu") is True)
+    vsec = c.get("vision")
+    encoder = isinstance(vsec, dict) and vsec.get("gpu") is True
+    borrower = bool(c.get("images")) or encoder
     if _left_alone(want):
         auto.append("vram_elastic")
-        e = elastic(one, borrower)
+        e = elastic(one, borrower, encoder)
         c["vram_elastic"] = e
         notes.append("vram_elastic: " + ("on (auto: an image job or a GPU encoder borrows the VRAM between requests)"
-                                         if e else "off (auto: nothing borrows the VRAM between requests)"))
+                                         if e else
+                                         "off (auto: a layer split keeps one cache per card, which cannot give the "
+                                         "VRAM back)" if borrower else
+                                         "off (auto: nothing borrows the VRAM between requests)"))
     elif isinstance(want, bool):
         notes.append(f"vram_elastic: {'on' if want else 'off'}, as the config says")
 

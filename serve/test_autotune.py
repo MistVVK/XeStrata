@@ -55,6 +55,8 @@ class Elastic(unittest.TestCase):
         self.assertTrue(A.elastic(machine(), borrower=True))
         self.assertFalse(A.elastic(machine(), borrower=False))
         self.assertFalse(A.elastic(machine(vram=(32.0, 32.0)), borrower=True))   # the engine's cache is per card
+        # a GPU encoder still starts with its picture there (the engine turns the segmenting off and says so)
+        self.assertTrue(A.elastic(machine(vram=(32.0, 32.0)), borrower=True, encoder=True))
 
 
 class Replicas(unittest.TestCase):
@@ -166,6 +168,17 @@ class Resolve(unittest.TestCase):
                          machine(vram=(32.0, 32.0), ram=64.0))
         self.assertNotIn("split_serve", plan.cfg)                      # a split cannot run several at once
         self.assertEqual(plan.cfg["parallel"], 2)
+
+    def test_each_engine_holds_its_cache_in_pieces_only_on_one_card(self):
+        # split serving: each engine is on one card, so an image job may borrow its VRAM
+        plan = A.resolve({**self.CFG, "split_pci": ["0000:09:00.0"], "images": {"exe": "x"}},
+                         machine(vram=(32.0, 32.0), ram=64.0))
+        self.assertIn("split_serve", plan.cfg)
+        self.assertIs(plan.cfg["vram_elastic"], True)
+        # a layer split the user set: each card's cache cannot give its VRAM back
+        plan = A.resolve({**self.CFG, "split_pci": ["0000:09:00.0"], "layer_split": "24", "images": {"exe": "x"}},
+                         machine(vram=(32.0, 32.0), ram=64.0))
+        self.assertIs(plan.cfg["vram_elastic"], False)
 
 
 class ModelFiles(unittest.TestCase):
