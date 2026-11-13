@@ -51,8 +51,18 @@ bool native_experts_available() noexcept { return true; }
 // compiled for AVX-512 and iq_avx2.cpp for AVX2, and native_gu_rows asks these on every CPU before it
 // has checked what the CPU can run.  A function in a wide-ISA file may use that ISA anywhere in its body, so an
 // answer that is only a comparison must not come from one (#795).
+// IQ4_XS's gate/up rows in 512-bit lanes (upstream 55dc17697): opt-in (XESTRATA_IQ512_IQ4XS=1), because its rows round
+// differently from the ggml-cpu dot an AVX-512 CPU takes them with today (the reason IQ4_XS had no 512-bit kernel).
+static bool iq4xs_512_on() {
+    static const bool on = [] {
+        const char* v = strata::env_get("IQ512_IQ4XS");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+
 bool iq512_supported(int type) noexcept {
-    return type == 16 || type == 17 || type == 18 || type == 21 || type == 22;
+    return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || (type == 23 && iq4xs_512_on());
 }
 
 bool iq256_supported(int type) noexcept {
@@ -317,8 +327,9 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         return;
     }
     // A format with only an AVX-2 kernel (IQ4_XS, #415) takes it on AVX-2 CPUs only: an AVX-512 CPU keeps ggml-cpu for
-    // it, as before (its rows would round differently).  Each kernel only for the formats it implements: falling
-    // through an empty switch would leave ff unwritten instead of falling back to ggml-cpu.
+    // it, as before (its rows would round differently), unless XESTRATA_IQ512_IQ4XS=1 gives it the 512-bit rows.  Each
+    // kernel only for the formats it implements: falling through an empty switch would leave ff unwritten instead of
+    // falling back to ggml-cpu.
     static const bool cpu512 = cpu_avx512_ok();
     if (nt >= mt_min && (iq512_supported(f.gu_type) || (!cpu512 && iq256_supported(f.gu_type)))) {
         if (avx512 && iq512_supported(f.gu_type)) {
