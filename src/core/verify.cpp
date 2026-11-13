@@ -444,6 +444,7 @@ Verifier::~Verifier() {
     for (float* b : slot_bias_dev_)
         if (b != nullptr) strata::gpu::free(b);
     if (slot_hist_d_) strata::gpu::free(slot_hist_d_);
+    if (slot_params_d_) strata::gpu::free(slot_params_d_);
     if (allowed_device_) strata::gpu::free(allowed_device_);
     if (rp_lambda_d_) strata::gpu::free(rp_lambda_d_);
     if (cs_ && cs_ != ext_stream_) strata::gpu::stream_destroy(cs_);   // set_stream: the stage's stream, shared
@@ -2789,18 +2790,38 @@ bool Verifier::sample_rows(int S, std::string& err) {
             return false;
         }
     }
+    std::vector<strata::kernels::SamplerParams> params((size_t) S);
     for (int t = 0; t < S; ++t) {
-        strata::kernels::SamplerParams sp = slot_sp_[(size_t) last_rows_[t]];
+        auto& sp = params[(size_t) t];
+        sp = slot_sp_[(size_t) last_rows_[t]];
         const bool pen = h > 0 && penalised(sp);
-        const bool bias = sp.logit_bias != nullptr;
-        if (!allowed_on_ && !bias && !pen && (sp.greedy || sp.temperature <= 0.0f)) continue;
-        sp.counter = (uint64_t) last_pos_b_[t];   // Philox(seed, position): the solo window's draw for this position
-        if (!pen) sp.penalty_last_n = 0;          // no history handed to this row: no window to count
+        if (!allowed_on_ && !sp.logit_bias && !pen && (sp.greedy || sp.temperature <= 0.0f)) {
+            sp.penalty_last_n = -1;  // keep the window's argmax
+            continue;
+        }
+        sp.counter = (uint64_t) last_pos_b_[t];
+        if (!pen) sp.penalty_last_n = 0;
         sp.allowed = allowed_on_ ? allowed_device_ + (size_t) t * words : nullptr;
-        strata::kernels::sample_tokens(head_logits_ + (size_t) t * (size_t) n_vocab_, 1, (int) n_vocab_,
-                                       pen ? slot_hist_d_ + (size_t) t * (size_t) h : nullptr, pen ? h : 0, sp,
-                                       m_out_ + t, cs_);
         any = true;
+    }
+    if (any) {
+        const OnDevice on_params(device_);
+        if (slot_params_cap_ < (size_t) S) {
+            if (slot_params_d_) strata::gpu::free(slot_params_d_);
+            slot_params_d_ = nullptr;
+            slot_params_cap_ = 0;
+            if (!strata::gpu::alloc_device(&slot_params_d_, (size_t) S * sizeof(params[0]))) {
+                err = "verify batch: the sampler parameters' allocation failed";
+                return false;
+            }
+            slot_params_cap_ = (size_t) S;
+        }
+        if (!strata::gpu::copy(slot_params_d_, params.data(), (size_t) S * sizeof(params[0]))) {
+            err = "verify batch: the sampler parameters' upload failed";
+            return false;
+        }
+        strata::kernels::sample_token_rows(head_logits_, S, (int) n_vocab_, h ? slot_hist_d_ : nullptr, h,
+                                           slot_params_d_, m_out_, cs_);
     }
     if (any && !strata::gpu::stream_sync(cs_)) { err = "verify batch: the row sampling failed"; return false; }
     return true;
