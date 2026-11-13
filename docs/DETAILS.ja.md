@@ -1098,6 +1098,10 @@ print(r.choices[0].message.content)
   立て直したいクライアントは、持っているツールの名前をモデルに伝えて聞き直せます。要求が宣言していないツールの呼び出しを XeStrata が動かしたり渡したりすることはありません。
   server のウィンドウにも同じ名前が出て、`/metrics/prometheus` は塊の数を `strata:tool_calls_unread_total` で数えます。
   形の崩れた塊（宣言していない名前でないもの）もそこで数えますが、挙げる名前はありません。
+- **`/v1/messages` の Anthropic の tool search**（upstream #4663）: `"defer_loading": true` の tool は宣言されますが、プロンプトのツール一覧には出しません。
+  `tool_result` の中の `tool_reference` の塊（tool search の結果）は、その場所でその tool の定義をプロンプトに入れます（ツール一覧と同じ形なので、tool を読んでもプロンプトの先頭と、そのキャッシュは変わりません）。
+  それ以外の参照は今までどおり落とします（MCP の server が消えた古い参照で、会話が止まらないように）。
+  `defer_loading` の tool を持つ要求は、宣言したより多くの tool を抱えています（Claude Code は ToolSearch と `DeferredToolPlaceholder` を宣言し、MCP の tool は会話の中だけで名指しします）ので、その要求では宣言していない名前の呼び出しも `tool_use` で返します。Claude Code はそれを実行します（text では turn が終わっていました）。
 - **チャットのアプリ**: 「OpenAI 互換」の接続先を持つアプリなら使えます。
   ベース URL は `http://127.0.0.1:8095/v1`、API キーは何でも構いません。
 - **OpenCode**（upstream #543）: `opencode.jsonc`（プロジェクトの中か `~/.config/opencode/`）の出発点です。

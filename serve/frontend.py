@@ -881,11 +881,42 @@ def _anthropic_documents(content, path: str):
     return out
 
 
+def _anthropic_tool(t: dict) -> dict:
+    """An Anthropic tool -> the template's form of it (also what the output parser reads its schema from)."""
+    return {"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
+
+
+def anthropic_tools(req: dict) -> tuple[list[dict] | None, bool]:
+    """#4663, Anthropic's tool search: (every tool the request declared, the `defer_loading` ones included, whether any
+    tool is deferred).  A deferred tool is callable although the prompt does not list it.  A client that defers tools
+    (Claude Code) holds back more than it declares - it names the rest in the conversation and runs a call for any of
+    them - so with one deferred tool a call for an undeclared name is a call too (OutputParser's `deferred`)."""
+    tools = _tool_list(req.get("tools"), None)
+    return [_anthropic_tool(t) for t in tools] or None, any(t.get("defer_loading") for t in tools)
+
+
+def _tool_references(content, deferred: dict):
+    """A tool_result's tool_reference blocks (a tool search's results) -> the referenced deferred tools' definitions,
+    in the form the prompt lists tools: the model sees a tool where it was loaded, and the prompt's start (its tool
+    list) stays the same, so the prompt cache does too.  Any other reference is left out as before (_check_parts): a
+    listed tool is in the prompt already, and an old one (its MCP server gone) must not fail the rest of the session."""
+    if not isinstance(content, list):
+        return content
+    return [{"type": "text",
+             "text": "<tools>\n" + json.dumps(deferred[p.get("tool_name")], ensure_ascii=False) + "\n</tools>"}
+            if isinstance(p, dict) and p.get("type") == "tool_reference" and isinstance(p.get("tool_name"), str)
+            and p["tool_name"] in deferred else p
+            for p in content]
+
+
 def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs).  `think_unasked`: a request
     without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31 (the
     config's "anthropic_thinking": "model"); False renders it without thinking, Anthropic's rule (#278, the server's
     default "on_request")."""
+    declared = _tool_list(req.get("tools"), None)
+    # #4663: a `defer_loading` tool stays out of the prompt's tool list until a tool_reference loads it
+    deferred = {t["name"]: _anthropic_tool(t) for t in declared if t.get("defer_loading")}
     messages = []
     system = req.get("system")
     if system:
@@ -927,8 +958,8 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                 # path's tool messages already do; a text-only result is one string, as before.  Its tool_use_id
                 # puts it beside its call (_order_chat_tool_results): parallel results may come in any order.
                 where = f"messages[{i}].content[{j}].content"
-                result = _parts_of(_check_parts(_anthropic_documents(block.get("content"), where), where,
-                                                TEXT_PARTS + IMAGE_PARTS + FILE_PARTS))
+                content = _tool_references(_anthropic_documents(block.get("content"), where), deferred)
+                result = _parts_of(_check_parts(content, where, TEXT_PARTS + IMAGE_PARTS + FILE_PARTS))
                 if block.get("is_error") is True:   # the tool failed: the model is told so, not only its text
                     result = "Error: " + result if isinstance(result, str) else \
                         [{"type": "text", "text": "Error: "}] + list(result or [])
@@ -942,8 +973,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                 out["tool_calls"] = calls
             messages.append(out)
     _order_chat_tool_results(messages)
-    tools = [{"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
-             for t in _tool_list(req.get("tools"), None)] or None
+    tools = [_anthropic_tool(t) for t in declared if t["name"] not in deferred] or None
     kwargs = {}
     # Anthropic: "thinking": {"type": "disabled"} or {"type": "enabled", "budget_tokens": N};
     # "output_config": {"effort": "low" | "medium" | "high"}
@@ -1759,11 +1789,15 @@ class OutputParser:
     _line_blocks: list[str] | None
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
-                 recover: bool = False, declared_only: bool = False):
+                 recover: bool = False, declared_only: bool = False, deferred: bool = False):
         self.state = "reasoning" if thinking else "content"
         self.buf = ""
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
+        # #4663: the request defers tools (Anthropic's tool search, see anthropic_tools): the client holds back more
+        # tools than it declares, so a call for an undeclared name is a call too - Claude Code runs it, where text ended
+        # the turn.
+        self.deferred = deferred
         # #804/#3075: in the answer too, a call counts only for a tool the request declared.  With tools declared a
         # call for another name stays text (the Responses spelling `namespace__tool` of a `namespace.tool` counts as
         # that tool); `declared_only` extends the rule to a request that declared none (Chat Completions, Anthropic:
@@ -1880,7 +1914,7 @@ class OutputParser:
         none declared, only where `declared_only` is off."""
         if not self.schemas:
             return not self.declared_only
-        return name in self.schemas or name in self.aliases
+        return name in self.schemas or name in self.aliases or self.deferred
 
     def _loose_open(self, after: str):
         """#3441: `after` (text after a `<tool_call>`, whitespace dropped) opens a call in a drifted form that names a
@@ -2267,7 +2301,7 @@ class OutputParser:
                     try:
                         name = body[:end].strip()[len("<function="):].split(">", 1)[0].strip()
                         name = self.aliases.get(name, name)
-                        if name in self.schemas:
+                        if self._callable(name):
                             call = parse_tool_call(body[:end], self.schemas.get(name), self.notes)
                             call.name = name
                     except ValueError:
@@ -2558,7 +2592,7 @@ class OutputParser:
             f = function_end(body)
             name = body.lstrip()[len(FUNC_START):].split(">", 1)[0].strip() if f >= 0 else ""
             name = self.aliases.get(name, name)
-            if f >= 0 and not body[f:].strip() and name in self.schemas:
+            if f >= 0 and not body[f:].strip() and self._callable(name):
                 try:
                     call = parse_tool_call(body[:f], self.schemas.get(name), self.notes)
                     call.name = name

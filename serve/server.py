@@ -68,7 +68,8 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a 
 SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
 from serve.frontend import (CALL_START, THINK_END, ChatTemplate, Event, GlmOutputParser, HarmonyParser,  # noqa: E402
                             OutputParser, ToolCall, allowed_tools, anthropic_format, anthropic_to_messages,
-                            custom_tool_names, forced_call, images_of, legacy_function_call, legacy_functions,
+                            anthropic_tools, custom_tool_names, forced_call, images_of, legacy_function_call,
+                            legacy_functions,
                             literal_tags, thinking_signature, mark_think_literals,
                             openai_to_messages, require_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
@@ -5519,13 +5520,15 @@ class Service:
                loop_guard.STOP: "stopped"}[act.kind]] += 1
 
     def run(self, ids, thinking, tools, max_new, sampling, cancel, force=None,
-            declared_only=False) -> Iterator[tuple[str, object]]:
+            declared_only=False, deferred=False) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
-        `force` (forced_call): the opening of the call the reply must make - see prepare()."""
+        `force` (forced_call): the opening of the call the reply must make - see prepare().  `deferred` (Anthropic's
+        tool search): a call for an undeclared name is a call too - see anthropic_tools."""
         strict = (sampling or {}).get("strata_strict_tools")
         if strict:                     # the strict tools' calls, checked before they are sent (check_strict)
             rest = {k: v for k, v in sampling.items() if k != "strata_strict_tools"}
-            yield from checked_calls(self.run(ids, thinking, tools, max_new, rest, cancel, force, declared_only),
+            yield from checked_calls(self.run(ids, thinking, tools, max_new, rest, cancel, force, declared_only,
+                                              deferred),
                                      strict)
             return
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
@@ -5574,7 +5577,7 @@ class Service:
         reader = GlmOutputParser if getattr(self.template, "call_form", "qwen") == "glm" else OutputParser
         parser = (HarmonyParser(thinking=thinking, tools=tools) if harmony else
                   reader(thinking=thinking, tools=with_history_tools(tools, sampling), stream_tools=True,
-                         recover=self.tool_call_recovery, declared_only=declared_only))
+                         recover=self.tool_call_recovery, declared_only=declared_only, deferred=deferred))
         detok, n, finish = Detokenizer(self.tok), 0, "length"
         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
         # the loop guard (serve/loop_guard.py): every id goes through it before the parser; it holds back a short
@@ -7258,7 +7261,8 @@ def anthropic_search_blocks(x: dict, calls: dict) -> list[dict]:
     return [{"type": "web_search_tool_result", "tool_use_id": sid, "content": content}]
 
 
-def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, run=None):
+def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None, run=None,
+                     deferred=False):
     """`run`: the events to send instead of Service.run's (run_with_mcp with the web search tools): their activity
     becomes Anthropic's server tool blocks (anthropic_search_blocks) and usage.server_tool_use."""
     mid = "msg_" + uuid.uuid4().hex[:24]
@@ -7284,7 +7288,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came (#211)
     server_calls: dict = {}                        # the web search calls run here: id -> web_search / web_fetch
     for kind, x in run if run is not None else svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
-                                                       declared_only=True):
+                                                       declared_only=True, deferred=deferred):
         if kind == "ping":
             yield None
             continue
@@ -10292,14 +10296,16 @@ def make_handler(svc: Service):
                     "locale": search_api.locale(ws.get("user_location"), self.headers.get("Accept-Language"))})
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             self._no_local_images(messages)
+            callable_tools, deferred = anthropic_tools(req)     # #4663: the deferred tools are callable, unlisted
             if search_tools is not None:
                 want = {"web_search": any(t["type"].startswith("web_search_") for t in hosted),
                         "fetch_page": any(t["type"].startswith("web_fetch_") for t in hosted)}
                 offered = [t for t in search_tools.template_tools(exclude={t["name"] for t in tools or []})
                            if want.get(t["name"])]
                 tools = (tools or []) + offered or None
+                callable_tools = (callable_tools or []) + offered
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
-                tools = None
+                tools = callable_tools = None
             force = forced_call(req.get("tool_choice"), tools,        # "any" / {"type": "tool", "name": N}
                                 getattr(svc.template, "call_form", "qwen"))
             messages, validator = anthropic_prepare_format(req, messages, tools)
@@ -10325,7 +10331,8 @@ def make_handler(svc: Service):
                 run = run_with_mcp(svc, search_tools, messages, tools, kw, ids, thinking, max_new,
                                    int(req.get("max_tokens") or 0), req, cancel,
                                    {t["name"] for t in tools} & set(search_tools.routes()), force=force)
-            events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force, run=run)
+            events = anthropic_events(svc, req, ids, thinking, callable_tools, max_new, cancel, force=force, run=run,
+                                      deferred=deferred)
             if validator is not None:
                 events = anthropic_structured(events, validator)
             events = self._capture(events, "anthropic")

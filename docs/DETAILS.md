@@ -1165,6 +1165,9 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   A client that wants to recover can answer the model with the tool names it does have and ask again; XeStrata never runs or forwards a call for a tool the request did not declare.
   The server window prints the same names, and `/metrics/prometheus` counts the blocks in `strata:tool_calls_unread_total`.
   A block that is malformed (not an undeclared name) is counted there as well, but has no name to list.
+- **Anthropic's tool search on `/v1/messages`** (upstream #4663). A tool with `"defer_loading": true` is declared but not listed in the prompt; a `tool_reference` block in a `tool_result` (a tool search's result) puts that tool's definition into the prompt where it stands, in the form the tool list uses, so loading a tool leaves the prompt's start, and the prompt cache, unchanged.
+  Any other reference is left out, as before (a tool whose MCP server is gone must not fail the session).
+  A request with a deferred tool holds back more tools than it declares (Claude Code declares ToolSearch and a `DeferredToolPlaceholder` and names its MCP tools in the conversation), so there a call for an undeclared name is returned as a `tool_use`: Claude Code runs it, where text ended the turn.
 - **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8095/v1`, any API key.
 - **OpenCode** (upstream #543). A starting point for `opencode.jsonc` (in your project, or `~/.config/opencode/`).
   The field names are OpenCode's, so check its config docs if your version differs:
