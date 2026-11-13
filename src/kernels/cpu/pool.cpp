@@ -4,6 +4,7 @@
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/numa_pool.hpp"
+#include "strata/kernels/cpu/cgroup_cpu.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -214,26 +215,15 @@ CpuTopology detect_cpu_topology(bool skip_first, PoolAffinity affinity) {
 
 double container_cpu_quota() {
 #if defined(__linux__)
-    // cgroup v2: "max 100000" (no limit) or "<quota> <period>"; v1: cpu.cfs_quota_us (-1: none) / cpu.cfs_period_us
-    if (std::FILE* f = std::fopen("/sys/fs/cgroup/cpu.max", "r")) {
-        char a[32] = {0};
-        long period = 0;
-        double q = 0;
-        if (std::fscanf(f, "%31s %ld", a, &period) == 2 && std::strcmp(a, "max") != 0 && period > 0)
-            q = std::atof(a) / (double) period;
-        std::fclose(f);
-        return q > 0 ? q : 0.0;
-    }
-    long quota = -1, period = 0;
-    if (std::FILE* f = std::fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r")) {
-        if (std::fscanf(f, "%ld", &quota) != 1) quota = -1;
+    // the smallest cgroup CPU quota from this process's group up to the mount's root (cgroup v2 cpu.max, v1 cfs quota); see cgroup_cpu.hpp
+    std::string self;
+    if (std::FILE* f = std::fopen("/proc/self/cgroup", "r")) {
+        char buf[512];
+        size_t n;
+        while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) self.append(buf, n);
         std::fclose(f);
     }
-    if (std::FILE* f = std::fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r")) {
-        if (std::fscanf(f, "%ld", &period) != 1) period = 0;
-        std::fclose(f);
-    }
-    return quota > 0 && period > 0 ? (double) quota / (double) period : 0.0;
+    return cgroup_cpu_quota_at("/sys/fs/cgroup", self);
 #else
     return 0.0;
 #endif
