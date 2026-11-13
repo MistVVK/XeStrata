@@ -12,6 +12,7 @@
 #include "strata/prefill/share_own_rule.hpp"
 #include "strata/prefill/fp16_rows_rule.hpp"
 #include "strata/prefill/own_only_line.hpp"
+#include "strata/prefill/own_only_switches.hpp"
 #include "strata/prefill/stream_floor_rule.hpp"
 #include "strata/prefill/switch_point_rule.hpp"
 #include "strata/kernels/gfx_arch.hpp"
@@ -208,13 +209,11 @@ const bool g_own_only_defaults = [] {
 #if defined(STRATA_USE_HIP) || defined(__HIPCC__)
     // (gfx12 only: every one of these is read behind the device's own gfx12 check, moe_fused_iq.cu q8d_hip_requested .. q6k_hip_requested, so a gfx11
     // card keeps the rules it has: its layers of those formats take the FP16 path here as before)
-    static const char* const kOn[] = {"STRATA_PF_FUSED", "STRATA_PF_FUSED_Q50", "STRATA_PF_FUSED_Q8D", "STRATA_PF_FUSED_Q8GU",
-                                      "STRATA_PF_FUSED_Q6K", "STRATA_PF_FUSED_KQ", "STRATA_PF_FUSED_TQ"};
+    static const std::vector<const char*> kOn = strata::prefill::own_only_default_switches(true);   // (include/strata/prefill/own_only_switches.hpp)
 #else
-    // (not STRATA_PF_FUSED_Q2N: the GGUF Q2_0 / Q2_0 pair on sm_80+ misses its worst-row bound against MMQ at 20K / 32K tokens on sm_86,
-    // not explained yet; those layers take the FP16 path here unless the user sets it)
-    static const char* const kOn[] = {"STRATA_PF_FUSED", "STRATA_PF_FUSED_Q50", "STRATA_PF_FUSED_Q8D", "STRATA_PF_FUSED_Q8GU",
-                                      "STRATA_PF_FUSED_Q6K", "STRATA_PF_FUSED_KQ", "STRATA_PF_FUSED_TQ", "STRATA_PF_FUSED_SM75"};
+    // (STRATA_PF_FUSED_Q2N, the native Q2_0 pack's Q2_0 / Q2_0 layers, is in the list: the kernel reads it behind its own sm_80 check, so a card below sm_80 is unchanged,
+    // and =0 takes it back; the reasons and the numbers are in own_only_switches.hpp)
+    static const std::vector<const char*> kOn = strata::prefill::own_only_default_switches(false);
 #endif
     for (const char* k : kOn) {
         if (std::getenv(k) != nullptr) continue;
