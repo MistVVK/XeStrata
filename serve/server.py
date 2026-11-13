@@ -10888,6 +10888,10 @@ def desktop_vram_note(amd: bool, vram_free_mib, args: list, desktop: bool) -> st
     does not apply."""
     if not amd or not desktop or not isinstance(vram_free_mib, int) or vram_free_mib >= DESKTOP_FREE_MIB:
         return ""
+    if "--resident-budget-gib" in args:
+        # upstream 530a29ea2: on a unified-memory GPU the RAM budget's page-locked complement takes that room straight
+        # back, so a larger --vram-reserve-mib cannot raise the free VRAM - the advice would only cost the cache
+        return ""
     try:
         reserve = int(args[args.index("--vram-reserve-mib") + 1]) if "--vram-reserve-mib" in args else 700
     except (ValueError, IndexError):
