@@ -6,6 +6,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/plain_model.hpp"
 #include "strata/kernels/dflash2.hpp"
+#include "strata/platform/env.hpp"
 
 #include <algorithm>
 #include <exception>
@@ -38,7 +39,7 @@ void Bdraft2Runner::release() {
         for (void* p : allocations_) gpu::free(p);
     }
     allocations_.clear(); bytes_ = 0; device_ = -1; model_ = nullptr; stream_ = nullptr;
-    context_ = {}; block_ = {};
+    context_ = {}; block_ = {}; mode_ = Bdraft2Weights::HeadMode::Auto;
 }
 
 bool Bdraft2Runner::load(const std::string& path, const std::string& head, PlainModel& model, int device,
@@ -49,6 +50,16 @@ bool Bdraft2Runner::load(const std::string& path, const std::string& head, Plain
     try {
         if (!weights_.load(path, head, device, (int) model.spec().n_embd, (int) model.spec().n_layer,
                            (int) model.vocab(), err)) throw std::runtime_error(err);
+        const char* choice = strata::env_get("BDRAFT_SHEAD");
+        const std::string mode = choice ? choice : "auto";
+        if (mode == "on" || mode == "1") {
+            if (!weights_.has_shead()) throw std::runtime_error("bdraft2: XESTRATA_BDRAFT_SHEAD=on needs a SHEAD file");
+            set_head_mode(Bdraft2Weights::HeadMode::On);
+        } else if (mode == "off" || mode == "0") {
+            set_head_mode(Bdraft2Weights::HeadMode::Off);
+        } else if (mode != "auto") {
+            throw std::runtime_error("bdraft2: XESTRATA_BDRAFT_SHEAD must be auto, off or on");
+        }
         auto alloc = [&](auto*& p, size_t n) {
             using T = std::remove_pointer_t<std::decay_t<decltype(p)>>;
             p = static_cast<T*>(gpu::alloc_device(n * sizeof(T)));
@@ -64,6 +75,17 @@ bool Bdraft2Runner::load(const std::string& path, const std::string& head, Plain
         if (!context_.projection) throw std::runtime_error("bdraft2: projection scratch does not fit");
         allocations_.push_back(context_.projection); bytes_ += weights_.scratch_bytes();
         block_.projection = context_.projection;
+        const auto* target_head = model.yskn_draft_head();
+        if (!target_head) throw std::runtime_error("bdraft2: the target has no yskn output head");
+        Bdraft2Weights::FullHead full;
+        full.weights = target_head;
+        const size_t full_scratch = strata::kernels::yskn_scratch_bytes(*target_head, B - 1);
+        full.projection = gpu::alloc_device(full_scratch);
+        if (!full.projection) throw std::runtime_error("bdraft2: full head scratch does not fit");
+        allocations_.push_back(full.projection); bytes_ += full_scratch;
+        alloc(full.logits, (size_t) (B - 1) * model.vocab());
+        alloc(full.top_scratch, (size_t) (B - 1) * kernels::kDf2TopBlocks * kernels::kDf2TopK * 2);
+        weights_.set_full_head(full);
         alloc(block_.h, B * H); alloc(block_.normalized, B * H); alloc(block_.conv, B * H);
         alloc(block_.dynamic, B * H / 4); alloc(block_.output, B * H);
         alloc(block_.q, B * Q); alloc(block_.qnorm, B * Q); alloc(block_.k, B * KV); alloc(block_.knorm, B * KV);
