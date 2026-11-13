@@ -1512,10 +1512,8 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
   llama.cpp's names `repeat_penalty` and `repeat_last_n` work too, in the config's `sampling` block and in a request (upstream #1819).
   They apply to every token speculative decoding checks at once, exactly as if it decoded one token at a time.
   The draft layer guesses without penalties, so more of its guesses are rejected and requests with penalties run slower.
-  The penalty window (`penalty_last_n`, 64 by default when any penalty is set) is the tokens the current reply has written (upstream #4590).
-  The prompt, including earlier assistant turns in it, is not counted, so the numbers or a quoted earlier answer in a new task are not penalised.
-  `XESTRATA_PENALTY_PROMPT=1` counts the last `penalty_last_n` tokens of prompt and reply together, the old window.
-  The default is that old window for now; it moves to the reply alone once the quality check (quality027) passes on XeStrata's GPUs, because the answers change.
+  The penalty window (`penalty_last_n`, 64 by default when any penalty is set) is the last tokens of prompt and reply together.
+  `XESTRATA_PENALTY_PROMPT=0` counts only the tokens the current reply has written (upstream #4590): the prompt, including earlier assistant turns in it, is not counted, so the numbers or a quoted earlier answer in a new task are not penalised.
   Both engines (Qwen3.8-Flash-Next and plain) count this way.
 - `top_k` keeps at most 64 candidates: `0` ("off") or anything above 64 uses all 64.
 - A sampling field sent as a numeric string (`"0.7"`) is read and used; a value that cannot be read as a number, or of another type (`true`), is a 400 that names the field (upstream #1663).
