@@ -130,7 +130,8 @@ def _inputs(a) -> dict:
         slot_drafts = drafting.slot_drafts_by_default(mode, backend=backend, archs=archs, vram_mib=sig.get("vram_mib"), args=sig.get("args"), slots=parallel)   # the drafter is fetched before the start
     return {"mode": mode, "klass": drafting.card_class(archs), "model_name": model_name, "family": a.family, "data_dir": data,
             "backend": backend, "archs": archs, "mtp_here": drafting.mtp_ready(args) if cfg else None,
-            "blocked": drafting.blocked_by(args, slots=parallel, named=drafting.normalize(mode) == "dflash2", backend=backend, slot_drafts=slot_drafts)}
+            "blocked": drafting.blocked_by(args, slots=parallel, named=drafting.normalize(mode) == "dflash2", backend=backend, slot_drafts=slot_drafts),
+            "slots_none": drafting.slots_draft_nothing(drafting.merged_args(cfg), parallel)}      # (False when the request count is not in the config: today's line)
 
 
 def _signals(a, want: dict) -> dict:

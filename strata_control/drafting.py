@@ -854,6 +854,15 @@ def line(drafter: str, reason: str = "") -> str:
     return f"Drafting: {word} ({reason})" if reason else f"Drafting: {word}"
 
 
+def merged_args(cfg: dict[str, Any]) -> list[str]:
+    """The config's engine arguments with the person's own ``user_args`` over them, as the server merges them at a start (what slots_draft_nothing reads)."""
+    args = [str(a) for a in cfg.get("args") or []]
+    if cfg.get("user_args"):
+        from strata_control import user_args
+        args = user_args.merge(args, cfg["user_args"])
+    return args
+
+
 def slots_draft_nothing(args: list[Any], slots: int | float | None = 0) -> bool:
     """Do this start's request slots draft nothing? Yes for 2 or more requests at once with no ``--batch-mtp`` (and no ``STRATA_BATCH_MTP``, no ``--pipeline-windows``) in the arguments:
     the engine runs the slots with one token per request and step, and only a single request drafts. (Called for a start that runs the MTP layer: the slots' own DFlash2 drafts are
@@ -1380,8 +1389,9 @@ def choice_of(mode: Any, *, model_name: str | None = None, family: str | None = 
 
 def decide(mode: Any, *, klass: str = "other", model_name: str | None = None, family: str | None = None, data_dir: str | Path | None = None,
            backend: str | None = None, archs: Any = None, mtp_here: bool | None = None, blocked: bool = False, vocab_here: bool = True,
-           args: list[Any] | None = None, vram_mib: float | None = None) -> Decision:
-    """The drafter a start uses. Never raises. One drafter, never two. A choice that cannot be applied becomes the other drafter when that one is on this computer,
+           args: list[Any] | None = None, vram_mib: float | None = None, slots_none: bool = False) -> Decision:
+    """The drafter a start uses. Never raises. ``slots_none`` (slots_draft_nothing of the start's arguments and request count; False when the caller cannot know it): the reason for a
+    DFlash2 that is not available here is NONE_IN_SLOTS instead of NOT_HERE, so the plan says what the server says. One drafter, never two. A choice that cannot be applied becomes the other drafter when that one is on this computer,
     else none, with a note in plain words. ``mtp_here`` says whether the MTP layer is on disk (None: not known, taken as there), ``blocked`` that this start is a layer
     split or has several requests at once (see blocked_by), ``vocab_here`` that the draft vocabulary DFlash2 needs is there. ``klass`` is not used any more (Auto
     does not depend on the kind of card) and stays only so the callers keep working."""
@@ -1395,6 +1405,8 @@ def decide(mode: Any, *, klass: str = "other", model_name: str | None = None, fa
 
     if want == "dflash2":
         reason = NOT_HERE if (blocked or not vocab_here) else NOT_DOWNLOADED if not drafter_ready(data_dir, model_name, backend) else ""
+        if reason == NOT_HERE and slots_none:
+            reason = NONE_IN_SLOTS
         if not reason:
             return Decision(asked, "dflash2", flags=engine_flags(pack_path(data_dir)))
         return Decision(asked, "mtp", reason) if have_mtp else Decision(asked, "off", NONE_HERE)
@@ -1556,9 +1568,8 @@ def apply(cfg: dict[str, Any], *, klass: str = "other", data_dir: str | Path | N
                                          drafter_here=vocab is not None and form != FORM_NONE and drafter_ready(data_dir, name, backend))
     decision = decide(mode, model_name=name, family=family, data_dir=data_dir, backend=backend, archs=archs,
                       mtp_here=mtp_here, blocked=blocked_by(strip_draft_flags(args), split=split, slots=slots, named=normalize(mode) == "dflash2", backend=backend, slot_drafts=slot_drafts) or form == FORM_NONE,
-                      vocab_here=vocab is not None, args=strip_mtp_flags(strip_draft_flags(args)), vram_mib=vram_mib)
-    if decision.drafter == "mtp" and decision.note == NOT_HERE and slots_draft_nothing(args, slots):
-        decision.note = NONE_IN_SLOTS                         # request slots with no --batch-mtp draft nothing: say that, not "DFlash2 isn't available in this mode" (MTP slot drafts keep that line)
+                      vocab_here=vocab is not None, args=strip_mtp_flags(strip_draft_flags(args)), vram_mib=vram_mib,
+                      slots_none=slots_draft_nothing(args, slots))     # request slots with no --batch-mtp draft nothing: say that, not "DFlash2 isn't available in this mode" (MTP slot drafts keep that line)
     mine = cfg.get("user_args") or []
     pack = None
     if decision.drafter == "dflash2":

@@ -249,6 +249,48 @@ class TheStart(unittest.TestCase):
         self.assertEqual((d.drafter, d.note), ("mtp", drafting.NOT_HERE))
         self.assertIn("--batch-mtp", c["args"])
 
+    def plan_by_command(self, parallel, args=None, **env) -> str:
+        """The plan line `strata drafting plan` shows for this config (strata_cli/drafting_cmd.py: _inputs, then decide)."""
+        from strata_cli import drafting_cmd
+        cfg = {**self.cfg(), **({} if parallel is None else {"parallel": parallel}), "args": list(args if args is not None else self.args)}
+        path = self.data / "plan.json"
+        path.write_text(__import__("json").dumps(cfg), encoding="utf-8")
+        a = SimpleNamespace(config=str(path), data_dir=str(self.data), mode=None, family="qwen", model=None, no_split=True, engines_unloading=False, drafting_command="plan")
+        with mock.patch.object(drafting, "card_vram_mib", return_value=PRO5000), mock.patch.object(drafting_cmd, "_hardware", return_value=("cuda", ["sm_120"])), \
+                mock.patch.object(drafting_cmd, "_split_expected", return_value=False), mock.patch.dict(os.environ, env):
+            want = drafting_cmd._inputs(a)
+            sig = drafting_cmd._signals(a, want)
+            return drafting.summary_line(drafting.decide(**want, **sig))
+
+    def plan_by_launch(self, parallel, args=None, **env) -> str:
+        """The plan line the Terminal's `strata launch --plan` shows (runner.drafting_plan_line) for an installed config like this one."""
+        from strata_cli.launch import settings as S
+        from strata_cli.launch.runner import Runner
+        from tests.terminal.launch_support import HW_12, Home, catalog
+        cfg = {**self.cfg(), "args": list(args if args is not None else self.args)}
+        with Home():
+            runner = Runner(S.LaunchSettings(family="qwen", model="IQ3_S", context=32768, vision="off", parallel=parallel), catalog=catalog(HW_12))
+            runner._split_expected = False
+            with mock.patch.object(Runner, "installed_state", return_value=(None, cfg)), mock.patch.object(drafting, "detect_hardware", return_value=("cuda", ["sm_120"])), \
+                    mock.patch.object(drafting, "card_vram_mib", return_value=PRO5000), mock.patch.object(drafting, "data_dir_of", return_value=self.data), mock.patch.dict(os.environ, env):
+                return runner.drafting_plan_line()
+
+    def test_the_plan_line_says_what_the_server_says(self):
+        self.pack()
+        none = "Drafting: none in parallel slots (one token per request and step); a single request still drafts"
+        mtp_slots = "Drafting: MTP (DFlash2 isn't available in this mode)"
+        for how in (self.plan_by_command, self.plan_by_launch):
+            name = how.__name__
+            self.assertEqual(how(2), "Drafting: DFlash2", (name, "2 requests on the measured class: DFlash2 slot drafts"))
+            self.assertEqual(how(3), none, (name, "slots with no drafts"))
+            self.assertEqual(how(2, STRATA_BATCH_DF2="0"), none, (name, "the way back from the slot drafts"))
+            self.assertEqual(how(3, args=[*self.args, "--batch-mtp"]), mtp_slots, (name, "MTP slot drafts keep their line"))
+            self.assertEqual(how(3, STRATA_BATCH_MTP="1"), mtp_slots, (name, "MTP slot drafts through the environment"))
+            self.assertEqual(how(1), "Drafting: DFlash2", (name, "one request at a time"))
+            self.assertEqual(how(None), "Drafting: DFlash2", (name, "the number of requests is not known: today's line"))
+        # the plan and the server print the same words in the same case
+        self.assertEqual("[strata] " + self.plan_by_command(3), self.lines(self.cfg(parallel=3))[0])
+
     def test_the_plan_agrees_with_the_start(self):
         from strata_cli import drafting_cmd
         self.pack()
