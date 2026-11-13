@@ -45,7 +45,7 @@ The gain there is in **waiting time**, and a request alone runs slower for the s
 
 So the server uses the slots **only where the experts mostly fit in VRAM** (setup says the same number).
 The expert cache (the cards' VRAM less about 5 GB) must still hold at least half of the model's experts beside the slots, and the slots may take at most a fifth of it, up to 4 slots.
-At a 32K context that is 4 slots from a 24 GB card; a smaller card stays at one at a time and setup says "parallel N reduces waiting for several users but costs about 10-25% speed per request on this card".
+At a 32K context with 8-bit KV that is 4 slots for IQ3_XXS (50.3 GB of experts) on a 64 GB card, and one at a time for the same model on a 24 GB card (Q2_0's 34.0 GB makes 3 there).  One at a time, setup says "parallel N reduces waiting for several users but costs about 10-25% speed per request on this card".
 The model's sizes come from the config, which setup writes (`"model_gb"`, `"experts_gb"`); a config written by hand that does not say them runs one at a time.
 
 The start log says what was chosen and why, a line each.

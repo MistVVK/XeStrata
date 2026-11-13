@@ -46,7 +46,7 @@ KV を流す場合（`--kv-resident N`）は、各 QSA 層の N セルだけが 
 
 そこでサーバーは、**エキスパートの多くが VRAM に収まる所でだけ**スロットを使います（setup も同じ数を表示します）。
 エキスパートキャッシュ（カードの VRAM から約 5 GB を引いた分）が、スロットを置いてもモデルのエキスパートの半分以上を持て、スロットが使うのはその 5 分の 1 まで、最大 4 スロットです。
-32K のコンテキストでは 24 GB 以上のカードで 4 スロットになり、それより小さいカードでは 1 つずつのまま、「parallel N reduces waiting for several users but costs about 10-25% speed per request on this card」と表示します。
+32K のコンテキストの int8 の KV では、64 GB のカードで IQ3_XXS（エキスパート 50.3 GB）が 4 スロット、24 GB のカードでは同じモデルが 1 つずつ（Q2_0 の 34.0 GB なら 3 スロット）です。1 つずつのときは「parallel N reduces waiting for several users but costs about 10-25% speed per request on this card」と表示します。
 モデルのファイルの大きさは setup が設定に書きます（`"model_gb"`・`"experts_gb"`）。手で書いた設定で分からないときは、1 つずつです。
 
 起動のログは、選んだ数とその理由を 1 行ずつ出します。
