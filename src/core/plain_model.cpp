@@ -2658,7 +2658,7 @@ bool PlainModel::set_history(const int32_t* tokens, int n, std::string& err) {
 }
 
 void PlainModel::set_slot_history(int slot, const int32_t* tail, int64_t n) {
-    PlainModel& t = tail();
+    PlainModel& t = this->tail();
     if (slot < 0 || slot >= t.batch_slot_count()) return;
     if ((int) t.slot_tail_.size() <= slot) t.slot_tail_.resize((size_t) slot + 1);
     if (n > 0) t.slot_tail_[(size_t) slot].assign(tail, tail + n);
