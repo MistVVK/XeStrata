@@ -293,6 +293,11 @@ def _timeout_env(name: str, default: float) -> float | None:
 # engine_silence_s, or this variable). XESTRATA_ENGINE_STALL_S overrides it (0 = off).  Needs psutil (setup installs
 # it); without it nothing is ended.
 ENGINE_STALL_S = _timeout_env("ENGINE_STALL_S", 90.0)
+# #4271 (upstream), part 1: a streaming client that stops reading (a hung process, a network that dropped) leaves the
+# thread that writes to it blocked once the socket buffers are full, and that thread holds the engine's turn.  A write
+# that makes no progress for this long ends the request as a disconnect (the engine is stopped, the turn given back).
+# XESTRATA_STREAM_WRITE_TIMEOUT_S=0: no limit, as before.
+STREAM_WRITE_TIMEOUT_S = _timeout_env("STREAM_WRITE_TIMEOUT_S", 60.0) or 0.0
 # --batch: new requests take the control lines (one prompt read at a time) short prompts first: a prompt of at most
 # XESTRATA_ADMIT_SHORT_FIRST tokens goes before longer ones (opt-in; unset or 0: whoever gets the lock first), and a
 # longer one that waited XESTRATA_ADMIT_MAX_WAIT_S (default 30) counts as short.  A chat question then waits for the one
@@ -1910,7 +1915,13 @@ class StrataEngine:
                     turn = False                        # the lines: not the engine this request was meant for
                 if not turn:
                     with self.slot_cv:
-                        self.slot_cv.wait(timeout=0.5)
+                        # #4738: the turn was read, and the lock given up, before this wait: a notification sent in
+                        # between is gone.  Read it again under the lock and only wait when this request still has to.
+                        eligible = after_epoch is None or self.ctl_epoch > after_epoch or self.waiting <= 1
+                        if eligible and new and ADMIT_SHORT_FIRST > 0:
+                            eligible = self._admit_next() is entry
+                        if not eligible or not self.alive():
+                            self.slot_cv.wait(timeout=0.5)
                 if cancel.is_set():
                     return False
                 if time.monotonic() - beat >= 10.0:     # a heartbeat every 10 s, as the engine's own wait
@@ -1918,9 +1929,13 @@ class StrataEngine:
                     yield None
         finally:
             with self.slot_cv:
+                previous_waiting = self.waiting
                 self.waiting = max(0, self.waiting - 1)
                 if entry in self.wait_lens:
                     self.wait_lens.remove(entry)
+                if (previous_waiting > 1 and self.waiting <= 1) or (new and ADMIT_SHORT_FIRST > 0):
+                    # a waiter that leaves (cancelled, closed) can make another one the next in turn: tell it
+                    self.slot_cv.notify_all()
         with self.slot_cv:
             self.ctl_epoch += 1
             self.slot_cv.notify_all()
@@ -3075,10 +3090,13 @@ class Vision:
     #: how long a reader that has already ended may still hold its output pipe open (a debugger attached to it, a
     #: child it started) before the start is judged: the pipe's end does not come, the process's end is what counts
     # (defaults, so a bare Vision built for a test without __init__ is a reader with no fallback)
-    fallback = cpu_spawn = cpu_label = None
+    fallback: tuple | None = None
+    cpu_spawn: tuple | None = None
+    cpu_label: str | None = None
     on_cpu = False
     elastic = False
-    cpu_note = fallback_why = None
+    cpu_note: str | None = None
+    fallback_why: str | None = None
 
     READY_GRACE_S = 2.0
     #: lines kept from a reader's output before its answer (and written to the log): enough to see what it said
@@ -8558,6 +8576,11 @@ def make_handler(svc: Service):
             self.send_header("Cache-Control", "no-cache")
             self._cors()
             self.end_headers()
+            if STREAM_WRITE_TIMEOUT_S > 0:
+                try:
+                    self.connection.settimeout(STREAM_WRITE_TIMEOUT_S)     # (#4271) a stuck write: see _sse
+                except OSError:
+                    pass
             obj = "chat.completion.chunk" if chat else "text_completion"
             sent = {"text": ""}
 
@@ -9806,6 +9829,13 @@ def make_handler(svc: Service):
             self.send_header("X-Accel-Buffering", "no")   # nginx and similar proxies pass each event at once
             self._cors()
             self.end_headers()
+            if STREAM_WRITE_TIMEOUT_S > 0:
+                try:
+                    # (#4271) a write to a client that stopped reading makes no progress: it ends as OSError, and the
+                    # request ends as a disconnect (the engine is stopped, the turn given back)
+                    self.connection.settimeout(STREAM_WRITE_TIMEOUT_S)
+                except OSError:
+                    pass
 
         def _capture(self, items, api):
             """Retain bounded input/output for the monitor without changing the API response (the items as they
