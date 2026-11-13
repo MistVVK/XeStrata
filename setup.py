@@ -4654,6 +4654,41 @@ def verify_sha256(s: Path, size: int, sha: str, own: bool = False, repair=None, 
     mark(s, f"sha256 {sha}")
 
 
+def fetch_yasakani(kind: str, models_dir: Path) -> Path:
+    """Fetch the pinned model; its two identical draft files have one shared inode per models directory."""
+    files = YASAKANI_FILES[kind]
+    repo = YASAKANI_REPOS[kind]
+    folder = models_dir / f"qwen3.8-27b-yasakani-{kind}"
+    shared = models_dir / "qwen3.8-27b-yasakani-draft"
+    folder.mkdir(parents=True, exist_ok=True)
+    shared.mkdir(parents=True, exist_ok=True)
+    for name, (size, sha) in files.items():
+        if name == "kvq_u5.bin":                       # the KV profile is fetched when its decoder is needed
+            continue
+        dst = folder / name
+        if name in ("bdraft2_k8.yskn", "bdraft2_k8.shead"):
+            source = shared / name
+            # A pre-existing destination is checked before linking; it may be a partial or different file.
+            if dst.exists():
+                verify_sha256(dst, size, sha)
+            if not source.exists():
+                if dst.exists():
+                    os.link(dst, source)
+                else:
+                    download(hf(repo) + name, source)
+            verify_sha256(source, size, sha)
+            if dst.exists() and not os.path.samefile(source, dst):
+                dst.unlink()
+            if not dst.exists():
+                os.link(source, dst)
+            mark(dst, f"sha256 {sha}")
+        else:
+            if not dst.exists() or not done(dst):
+                download(hf(repo) + name, dst)
+            verify_sha256(dst, size, sha)
+    return folder / f"qwen38_27b_{kind}.yskn"
+
+
 def tree_sha256(top: Path) -> str:
     """#32: a folder's files as one SHA-256 - each file's path (relative, with /) and its SHA-256, in path order."""
     items = []
@@ -8414,7 +8449,7 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     if fam.get("yskn"):
         shared = models_dir.parent / "qwen3.8-27b-yasakani-draft"
         left = sum(size for name, (size, _) in YASAKANI_FILES[model].items()
-                   if not (models_dir / name).exists() and
+                   if name != "kvq_u5.bin" and not (models_dir / name).exists() and
                    not (name in ("bdraft2_k8.yskn", "bdraft2_k8.shead") and (shared / name).exists())) / 1e9
     mm = fam.get("mmproj") if vision != "none" else None
     mmproj = models_dir / Path(mm["path"]).name if mm else None   # the picture reader, beside the model
