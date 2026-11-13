@@ -108,14 +108,24 @@ int64_t blck_size(ggml_type t) { return ggml_blck_size(t); }
 size_t row_size(ggml_type t, int64_t n) { return (size_t) (n / blck_size(t)) * type_size(t); }
 bool fits_blocks(ggml_type t, int64_t n) { return n % blck_size(t) == 0; }
 
+// NVFP4 (ModelOpt packs: gate/up and down NVFP4): the blob ends with a 16-byte tail {s_gate, s_up, s_down, 0}, the per-expert weight_scale_2 values
+// (cpu::NativeFmt::tail_off = down_off + d_row n_embd).  Every path applies them as the engine does: MMQ around its products (swiglu_scaled, scale_down_rows),
+// the FP16 path on the dequantized weights (iq_dequant_gu_f16 / iq_dequant_f16's scale), the fused kernels on their FP32 products.
+bool nvfp4_pair(const Pair& p) { return p.gu == GGML_TYPE_NVFP4 && p.d == GGML_TYPE_NVFP4; }
+
 struct Geo {
     size_t gu_row, d_row, up_off, down_off, bytes;
+    size_t tail_off = 0;   // 0: no tail
     Geo(const Pair& p, const Shape& s) {
         gu_row = row_size(p.gu, s.N);
         d_row = row_size(p.d, s.FF);
         up_off = gu_row * (size_t) s.FF;
         down_off = 2 * up_off;
         bytes = down_off + d_row * (size_t) s.N;
+        if (nvfp4_pair(p)) {
+            tail_off = bytes;
+            bytes += 16;
+        }
     }
 };
 
@@ -131,6 +141,12 @@ void fill_matrix(uint8_t* m, ggml_type t, int64_t rows, int64_t cols, std::mt199
                    : t == GGML_TYPE_IQ1_M ? 0.002f : 0.0008f;
     std::uniform_real_distribution<float> sc(lo, 6.0f * lo);
     for (size_t i = 0; i < nb * bs; ++i) m[i] = (uint8_t) byte(rng);
+    if (t == GGML_TYPE_NVFP4) {   // four UE4M3 scale bytes then 32 bytes of codes: scales 0x28..0x58 (finite, bit 7 clear), the codes as drawn
+        std::uniform_int_distribution<int> ub(0x28, 0x58);
+        for (size_t b = 0; b < nb; ++b)
+            for (int k = 0; k < 4; ++k) m[b * bs + (size_t) k] = (uint8_t) ub(rng);
+        return;
+    }
     for (size_t b = 0; b < nb; ++b) {
         const ggml_fp16_t h = ggml_fp32_to_fp16(sc(rng));
         uint8_t* blk = m + b * bs;
@@ -152,6 +168,11 @@ std::vector<uint8_t> make_blob(const Pair& p, const Geo& g, const Shape& s, std:
     std::vector<uint8_t> b(g.bytes);
     fill_matrix(b.data(), p.gu, 2 * s.FF, s.N, rng);
     fill_matrix(b.data() + g.down_off, p.d, s.N, s.FF, rng);
+    if (g.tail_off) {   // the per-expert scales, about 1e-4 .. 1e-3
+        std::uniform_real_distribution<float> ss(2e-4f, 2e-3f);
+        const float t[4] = {ss(rng), ss(rng), ss(rng), 0.0f};
+        std::memcpy(b.data() + g.tail_off, t, 16);
+    }
     return b;
 }
 
@@ -163,6 +184,13 @@ void dequant(const Pair& p, const Geo& g, const Shape& s, const std::vector<uint
     const auto* td = ggml_get_type_traits(p.d);
     for (int r = 0; r < 2 * s.FF; ++r) tg->to_float(b.data() + (size_t) r * g.gu_row, gu.data() + (size_t) r * s.N, s.N);
     for (int r = 0; r < s.N; ++r) td->to_float(b.data() + g.down_off + (size_t) r * g.d_row, dn.data() + (size_t) r * s.FF, s.FF);
+    if (g.tail_off) {   // NVFP4: each projection times its own per-expert scale
+        float t[4];
+        std::memcpy(t, b.data() + g.tail_off, 16);
+        for (int r = 0; r < s.FF; ++r) for (int k = 0; k < s.N; ++k) gu[(size_t) r * s.N + k] *= t[0];
+        for (int r = s.FF; r < 2 * s.FF; ++r) for (int k = 0; k < s.N; ++k) gu[(size_t) r * s.N + k] *= t[1];
+        for (size_t i = 0; i < dn.size(); ++i) dn[i] *= t[2];
+    }
 }
 
 // activations: N(0, 1) with a few large values (the hidden state has outliers)
@@ -226,7 +254,7 @@ struct MmqPath {
     const Shape& s;
     const Geo& geo;
     mmq::Context ctx;
-    Dev xq, hq, ident, bounds, grp_gu, grp_d;
+    Dev xq, hq, ident, bounds, grp_gu, grp_d, tails;   // tails: NVFP4's {s_gate, s_up, s_down, 0} of each expert of the open group
     const Dev &gu, &h, &dm;   // shared with the other paths (FP32 [rows][2FF], [rows][FF], [rows][N])
     const Routing& r;
     const std::vector<const uint8_t*>& blob;
@@ -238,7 +266,7 @@ struct MmqPath {
           ident((size_t) mmq::mmq_ids_table_rows((uint64_t) rows_, (uint64_t) (rows_ / s_.K)) * 4),
           bounds((size_t) (2 * (s_.E + s_.E / GROUP + 2)) * 4),
           grp_gu(GROUP * mmq::matrix_bytes(p_.gu, s_.FF2(), s_.N) + 4096), grp_d(GROUP * mmq::matrix_bytes(p_.d, s_.N, s_.FF) + 4096),
-          gu(gu_), h(h_), dm(dm_), r(r_), blob(blob_), rows(rows_) {
+          tails((size_t) GROUP * 16), gu(gu_), h(h_), dm(dm_), r(r_), blob(blob_), rows(rows_) {
         gub = mmq::matrix_bytes(p.gu, s.FF2(), s.N);
         db = mmq::matrix_bytes(p.d, s.N, s.FF);
     }
@@ -257,7 +285,9 @@ struct MmqPath {
         for (size_t j = 0; j < n; ++j) {
             const size_t q = j % GROUP;
             const uint8_t* bl = blob[(size_t) order[j]];
-            mmq::gather_native(bl, bl + geo.up_off, gub / 2, bl + geo.down_off, db, grp_gu.as<uint8_t>() + q * gub, grp_d.as<uint8_t>() + q * db, st);
+            // NVFP4: the expert's tail goes next to its group slot in the same launch, as prefill.cpp's gather
+            mmq::gather_native(bl, bl + geo.up_off, gub / 2, bl + geo.down_off, db, grp_gu.as<uint8_t>() + q * gub, grp_d.as<uint8_t>() + q * db, st,
+                               geo.tail_off ? bl + geo.tail_off : nullptr, geo.tail_off ? tails.as<uint8_t>() + q * 16 : nullptr);
             if (q + 1 < GROUP && j + 1 < n) continue;
             const size_t j0 = j - q, g = j0 / GROUP;
             const int ngx = (int) (q + 1);
@@ -271,7 +301,10 @@ struct MmqPath {
             pg.n = ngx; pg.xq = xq.p; pg.bounds = bounds.as<int32_t>() + j0; pg.ids = ident.as<int32_t>();
             pg.total_rows = rows; pg.max_rows = maxr; pg.dst = gu.as<float>(); pg.ld_dst = FF2;
             ctx.run(pg, st);
-            mmq::swiglu(gu.as<float>() + r0 * FF2, h.as<float>() + r0 * FF, nr, FF, false, st);
+            if (geo.tail_off)   // gate/up scales applied as read (prefill.cpp)
+                mmq::swiglu_scaled(gu.as<float>() + r0 * FF2, h.as<float>() + r0 * FF, nr, FF, bounds.as<int32_t>() + j0, ngx, tails.as<float>(), r0, st);
+            else
+                mmq::swiglu(gu.as<float>() + r0 * FF2, h.as<float>() + r0 * FF, nr, FF, false, st);
             mmq::quantize(h.as<float>() + r0 * FF, nullptr, hq.p, (int) p.d, FF, FF, nr, st);
             mmq::Product pd;
             pd.w = grp_d.p; pd.type = (int) p.d; pd.w_rows = N; pd.w_cols = FF; pd.expert_bytes = db;
@@ -279,6 +312,8 @@ struct MmqPath {
             pd.ids = ident.as<int32_t>(); pd.total_rows = nr; pd.max_rows = maxr; pd.dst = dm.as<float>() + r0 * N;
             pd.ld_dst = N;
             ctx.run(pd, st);
+            // NVFP4's s_down on the FP32 rows (the engine applies it in the combine; the same product per row)
+            if (geo.tail_off) mmq::scale_down_rows(dm.as<float>() + r0 * N, N, pd.bounds, ngx, tails.as<float>(), nr, st);
         }
     }
 };
@@ -333,8 +368,9 @@ struct Fp16Path {
                 const size_t q = j % DQ;
                 uint16_t* dgu = q ? dqgu1.as<uint16_t>() : dqgu0.as<uint16_t>();
                 uint16_t* dd = q ? dqd1.as<uint16_t>() : dqd0.as<uint16_t>();
-                kern::iq_dequant_gu_f16((int) p.gu, bl, bl + geo.up_off, FF, N, dgu, st, nullptr);
-                kern::iq_dequant_f16((int) p.d, bl + geo.down_off, (int64_t) N * FF, dd, st, nullptr);
+                // (NVFP4: the blob's tail {s_gate, s_up, s_down, 0}: the gate / up rows and the down matrix scaled as prefill.cpp's compute lambda does)
+                kern::iq_dequant_gu_f16((int) p.gu, bl, bl + geo.up_off, FF, N, dgu, st, geo.tail_off ? (const float*) (bl + geo.tail_off) : nullptr);
+                kern::iq_dequant_f16((int) p.d, bl + geo.down_off, (int64_t) N * FF, dd, st, geo.tail_off ? (const float*) (bl + geo.tail_off) + 2 : nullptr);
                 gemm.f16(xs.as<uint16_t>() + o0 * N, dgu, gu.as<float>() + o0 * FF2, ne, FF2, N);
                 pf::swiglu_interleaved(gu.as<float>() + o0 * FF2, hh.as<uint16_t>() + o0 * FF, ne, st);
                 gemm.f16(hh.as<uint16_t>() + o0 * FF, dd, dm.as<float>() + o0 * N, ne, N, FF);
@@ -620,7 +656,9 @@ const std::vector<Pair>& all_pairs() {
         {GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, "Q8_0 / Q8_0"},         {GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, "Q6_K + Q8_0"},
         // Qwen3.6's K-quant downs (n_ff 512 is a whole number of 256-value blocks)
         {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, "Q4_K / Q5_K"},         {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, "Q4_K / Q6_K"},
-        {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, "Q5_K / Q6_K"}};
+        {GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, "Q5_K / Q6_K"},
+        // NVFP4 (ModelOpt packs: Strata's GPTQ pack, NVIDIA's): NVFP4 gate/up and down, the blob's tail = the per-expert scales
+        {GGML_TYPE_NVFP4, GGML_TYPE_NVFP4, "NVFP4 / NVFP4"}};
     return pairs;
 }
 constexpr int kDefaultPairs = 4;   // pairs[0..3]
