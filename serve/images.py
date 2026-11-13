@@ -1104,6 +1104,19 @@ def decode_inline_image(value: str, strict: bool) -> bytes:
     return base64.b64decode(value, validate=strict)
 
 
+def png_has_alpha(data: bytes) -> bool:
+    """An alpha channel by the PNG's IHDR colour type (4 grey + alpha, 6 RGBA); False for anything unreadable."""
+    return len(data) > 25 and data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR" and data[25] in (4, 6)
+
+
+def picture_background(png: bytes, fmt: str, opaque: bool) -> str:
+    """What the picture that went out is: "opaque" when the format has no alpha channel or the alpha was put on white,
+    "transparent" when it kept one (background auto with an RGBA PNG, or a flatten that failed).  Upstream 13e7188cc."""
+    if opaque or fmt in ("jpeg", "jpg"):
+        return "opaque"
+    return "transparent" if png_has_alpha(png) else "opaque"
+
+
 def encode_image(png: bytes, fmt: str, compression: int, opaque: bool = False) -> bytes:
     """A made image (png_rgba's PNG) in OpenAI's output_format: PNG as it is, jpeg (no alpha: on white) and webp at
     `compression` as their quality (Pillow), jxl at it as its quality, 100 lossless (cjxl); `opaque` (background
@@ -3653,20 +3666,28 @@ class ImageGen:
         data = []
         fmt = job.get("output_format") or "png"
         applied = [{"name": u["name"], "scale": u["scale"]} for u in job.get("loras") or ()]
+        backgrounds, flatten_s = [], None
         for i, png in enumerate(images):
             item = {"seed": job["seed"] + i} if job.get("ups_only") else \
                 {"revised_prompt": model_prompt(job), "seed": job["seed"] + i}
             if applied:   # the adapters this image was made with
                 item["lora"] = [dict(u) for u in applied]
-            img = encode_image(png, fmt, job.get("output_compression", 100), job.get("background") == "opaque")
+            opaque = job.get("background") == "opaque"
+            t0 = time.monotonic() if opaque else None
+            img = encode_image(png, fmt, job.get("output_compression", 100), opaque)
+            if t0 is not None and fmt == "png":   # the flatten's own time (only PNG suffers no re-encode otherwise)
+                flatten_s = round((flatten_s or 0.0) + time.monotonic() - t0, 3)
+            backgrounds.append(picture_background(png, fmt, opaque))
             if job["response_format"] == "url":
                 item["url"] = f"{base_url}/v1/images/files/{self.store(img, fmt)}"
             else:
                 item["b64_json"] = base64.b64encode(img).decode("ascii")
             data.append(item)
         return {"created": int(time.time()), "data": data, "model": self.model, "output_format": fmt,
-                "size": f"{job['width']}x{job['height']}", "background": job.get("background") or "auto",
-                "quality": job.get("quality") or "auto", "usage": usage(job), "xestrata": figures}
+                "size": f"{job['width']}x{job['height']}",
+                "background": "transparent" if "transparent" in backgrounds else "opaque",
+                "quality": job.get("quality") or "auto", "usage": usage(job),
+                "xestrata": ({**figures, "flatten_s": flatten_s} if flatten_s is not None else figures)}
 
     # ---- the progress the Monitor shows (/metrics' live.image) and the jobs that ended (its Requests table)
     STAGE_LABELS = {"waiting": "Making room on the GPU", "size": "Choosing the image's size",

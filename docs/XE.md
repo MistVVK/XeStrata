@@ -641,6 +641,24 @@ Rounding it down to 64 slots gave every start on a machine the same cache, but i
 Setup's warm-up instead writes the VRAM free at its start, less 32 MiB, into the run config (`--vram-free-mib`): the engine does not count more free at its start than that, so a start with a little more free VRAM gets the same cache (on the B70 it moved by about 20 MiB between starts, 15 slots). A start with less free gets a smaller cache.
 When the same output is needed (comparisons across machines or settings too), fix it with `--expert-cache N`.
 
+The dense products' path changes from start to start too.
+The prompt's and the verify windows' dense products are timed at start per shape (kind, the rows' power-of-two class, N, K) against oneMath's, and take XeStrata's kernels only where they are 5% faster.
+The library's speed moves by up to 2x from start to start (RX 9060 XT, 4096 x 320 x 10240 in BF16: rocBLAS 13.1 to 25.5 TFLOPS, XeStrata's kernels 16.8 to 21.3), and a class that changes sides changes the output's last bits (the same binary and settings split a 64K greedy answer at token 18).
+The library's fast and slow states gave the same bits (`XESTRATA_BLAS=1`'s two runs matched for the first 48 windows).
+
+The verify windows' sizes change from start to start too.
+`--spec-window auto` sizes each window from round times measured per size (wall clock), and `--suffix-draft` widens a window past `--spec` at a repeated position.
+A window's size is part of its rows' computation: the same position's row gave different argmaxes in a 3-token and a 4-token window (XeStrata's own kernels alone too), so the last bits move with the sizes.
+
+A run whose answer must be the same every time (comparisons across machines or settings, the md5 watch) fixes all three (RX 9060 XT, 64K):
+
+- `XESTRATA_NO_BLAS=1`: every dense product on XeStrata's own kernels (the library is not timed).
+- `--spec-window min-p --spec-min-p 0`: every window at `--spec`'s size (no measured times).
+- `--suffix-draft 0`: the suffix drafts do not widen a window.
+
+The three gave the same answer in five 64K A/A runs (2026-11-14).
+Prefill ran at 890 to 906 tokens/s and decode at 34.2 to 34.9 (the default: 962 to 977 and 37.5 to 40.7), 6 to 7% and 8 to 10% slower, so the default keeps the measured path for speed.
+
 ### The output head's VRAM refusal
 
 Sometimes the upload of the output head is refused VRAM at start.

@@ -1064,24 +1064,13 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                         }
                         ++gg.ntok[gg.n - 1];
                     }
-                    int max_tok = 0;
-                    for (int i = 0; i < gg.n; ++i) max_tok = std::max(max_tok, gg.ntok[i]);
-                    // one launch for every slot of the batch window (upstream 7a9245b6c); auto times both forms
-                    const core::Pick bg = core::pick_from_env("BATCH_GDN_GROUPS");
-                    const bool one = bg == core::Pick::On ||
-                                     (bg == core::Pick::Auto &&
-                                      gdn_groups_pays(gg.n, max_tok, (int) C, (int) HK, (int) HV, cs));
-                    if (one)
-                        gdn_step_norm_groups(gg, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
-                                             (int) HV, false, cs);
-                    else
-                        for (int i = 0; i < gg.n; ++i) {
-                            const int first = gg.first[i];
-                            gdn_step_norm_multi(gg.state[i], hb + (size_t) first * C, (int) C, gate + (size_t) first * HV,
-                                                beta + (size_t) first * HV, z_ + (size_t) first * ZV,
-                                                (const float*) wnm->data, EPS, y_ + (size_t) first * ZV, (int) HK,
-                                                (int) HV, gg.ntok[i], nullptr, cs, 0, gg.y_q8_1[i]);
-                        }
+                    for (int i = 0; i < gg.n; ++i) {
+                        const int first = gg.first[i];
+                        gdn_step_norm_multi(gg.state[i], hb + (size_t) first * C, (int) C, gate + (size_t) first * HV,
+                                            beta + (size_t) first * HV, z_ + (size_t) first * ZV,
+                                            (const float*) wnm->data, EPS, y_ + (size_t) first * ZV, (int) HK,
+                                            (int) HV, gg.ntok[i], nullptr, cs, 0, gg.y_q8_1[i]);
+                    }
                 } else
                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
                                     (int) HV, te, self_commit ? one_ : nullptr, cs, tb, qfuse ? (void*) xq_ : nullptr);
@@ -2113,18 +2102,7 @@ bool Verifier::init_slots(const std::vector<SessionState*>& slots, std::string& 
 bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err) {
     strata::gpu::Graph*& ex = exec_bm_[batch_key(rows, S, hbase)];
     if (ex != nullptr) return true;
-    {   // auto: time the batch window's GDN forms here, before the graph holds one
-        if (strata::core::pick_from_env("BATCH_GDN_GROUPS") == strata::core::Pick::Auto && g_ != nullptr) {
-            int ng = 0, max_tok = 0;
-            for (int t = 0; t < S;) {
-                const int f = t;
-                while (t < S && rows[t] == rows[f]) ++t;
-                ++ng;
-                max_tok = std::max(max_tok, t - f);
-            }
-            strata::kernels::gdn_groups_pays(ng, max_tok, (int) g_->ssm_conv_channels, (int) g_->ssm_k_heads,
-                                             (int) g_->ssm_v_heads, cs_);
-        }
+    {   // auto: time the batch window's block scores here, before the graph holds one
         if (strata::core::pick_from_env("BATCH_ATTN_ROWS") == strata::core::Pick::Auto && g_ != nullptr &&
             g_->n_qsa_layers() > 0)
             strata::kernels::qsa_rows_pays(S, max_blocks_, shapes_of(*g_), cs_);
@@ -2171,18 +2149,6 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     const int64_t TS = (s.idx_block - 1) * ID;
     const int64_t HS = (int64_t) NG_HIST * NG_HC_DIM;
-    {   // auto: time the commit's GDN forms here, before the graph holds one
-        if (strata::core::pick_from_env("BATCH_GDN_GROUPS") == strata::core::Pick::Auto) {
-            int ng = 0, max_tok = 0;
-            for (int t = 0; t < S;) {
-                const int f = t;
-                while (t < S && rows[t] == rows[f]) ++t;
-                ++ng;
-                max_tok = std::max(max_tok, t - f);
-            }
-            gdn_groups_pays(ng, max_tok, (int) g.ssm_conv_channels, (int) g.ssm_k_heads, (int) g.ssm_v_heads, cs_);
-        }
-    }
     if (!strata::gpu::begin_capture(cs_)) { err = "verify: begin batch commit capture failed"; return false; }    bool ok = true;
     try {
         for (int t = 0; t < S; ++t)
@@ -2210,27 +2176,13 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                     gg.ntok[gg.n] = t - first;
                     ++gg.n;
                 }
-                {   // one launch for every slot of the commit (upstream 7a9245b6c); auto times both forms
-                    int max_tok = 0;
-                    for (int i = 0; i < gg.n; ++i) max_tok = std::max(max_tok, gg.ntok[i]);
-                    const core::Pick bg = core::pick_from_env("BATCH_GDN_GROUPS");
-                    const bool one = bg == core::Pick::On ||
-                                     (bg == core::Pick::Auto &&
-                                      gdn_groups_pays(gg.n, max_tok, (int) C, (int) g.ssm_k_heads, (int) HV, cs_));
-                    if (one)
-                        gdn_step_norm_groups(gg, h_L_ + (size_t) gdn_index * MT * C, (int) C,
-                                             gate_L_ + (size_t) gdn_index * MT * HV,
-                                             beta_L_ + (size_t) gdn_index * MT * HV, z_, (const float*) wnm->data, EPS,
-                                             y_dummy_, (int) g.ssm_k_heads, (int) HV, true, cs_);
-                    else
-                        for (int i = 0; i < gg.n; ++i)
-                            gdn_step_norm_multi(gg.state[i], h_L_ + (size_t) gdn_index * MT * C + (size_t) gg.first[i] * C,
-                                                (int) C, gate_L_ + (size_t) gdn_index * MT * HV + (size_t) gg.first[i] * HV,
-                                                beta_L_ + (size_t) gdn_index * MT * HV + (size_t) gg.first[i] * HV,
-                                                z_ + (size_t) gg.first[i] * ZV, (const float*) wnm->data, EPS,
-                                                y_dummy_ + (size_t) gg.first[i] * ZV, (int) g.ssm_k_heads, (int) HV,
-                                                gg.ntok[i], gg.keep[i], cs_, gg.ntok[i] > 1 ? gg.ntok[i] : 0);
-                }
+                for (int i = 0; i < gg.n; ++i)
+                    gdn_step_norm_multi(gg.state[i], h_L_ + (size_t) gdn_index * MT * C + (size_t) gg.first[i] * C,
+                                        (int) C, gate_L_ + (size_t) gdn_index * MT * HV + (size_t) gg.first[i] * HV,
+                                        beta_L_ + (size_t) gdn_index * MT * HV + (size_t) gg.first[i] * HV,
+                                        z_ + (size_t) gg.first[i] * ZV, (const float*) wnm->data, EPS,
+                                        y_dummy_ + (size_t) gg.first[i] * ZV, (int) g.ssm_k_heads, (int) HV,
+                                        gg.ntok[i], gg.keep[i], cs_, gg.ntok[i] > 1 ? gg.ntok[i] : 0);
                 ++gdn_index;
             } else {
                 const WeightRef* wikn = need(v, "indexer.k_norm.weight", err);

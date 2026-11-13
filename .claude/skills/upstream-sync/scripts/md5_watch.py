@@ -20,8 +20,12 @@ the image denoiser's quant (default Q8_0).  XE_PROFILE: the shipped expert profi
 EXTRA: options both engines take besides.  MODELS (default "q38 ornith q36 q35 llmjp"), TIERS (default "1k 32k"),
 KINDS (default "llm image"), IMAGE_MODELS (default "qwen-image-turbo mage-flow-turbo moss-image anima-turbo"),
 IMAGE_SIZE (default 512x512), IMAGE_STEPS (4), IMAGE_SEED (7), ROUNDS (2: a cell that answers differently from run
-to run is one the watch cannot read alone), LOGITS (1: keep the dumps, 32 MB a cell) select what runs.  --dry-run:
-print the commands and the image configs instead of running them.
+to run is one the watch cannot read alone), LOGITS (1: keep the dumps, 32 MB a cell) select what runs.  EXACT=1 runs
+the cells with their answers fixed (XESTRATA_NO_BLAS=1 in every cell; Qwen3.8 also --spec-window min-p --spec-min-p 0
+--suffix-draft 0):
+the dense products' own/library choice and the verify windows' sizes are measured per start and move the answer's last
+bits (docs/XE.md, "Why outputs change from run to run").  --dry-run: print the commands and the image configs instead
+of running them.
 
 OUT/md5.json (the rows), OUT/md5.txt (a cell a line), OUT/meta.json (the commit, the engines, the runs' arguments) and
 the runs' files: answers/, logs/, logits/, images/.  md5_judge.py OUT --prev DIR reads it against the previous record.
@@ -76,6 +80,7 @@ image_models = os.environ.get("IMAGE_MODELS", "qwen-image-turbo mage-flow-turbo 
 rounds = int(os.environ.get("ROUNDS", "2"))
 extra = shlex.split(os.environ.get("EXTRA", ""))
 profile = os.environ.get("XE_PROFILE", "")
+EXACT = os.environ.get("EXACT", "") not in ("", "0")
 logits = os.environ.get("LOGITS", "1") != "0"
 for name in models:
     if name not in MODELS:
@@ -89,12 +94,15 @@ if set(kinds) - set(M.KINDS):
 
 def argv_of(name: str) -> list[str]:
     """The model's arguments: its files in the data folder, and the settings that decide its answer."""
-    return [w.replace("<data>", str(data)) for w in MODELS[name]]
+    a = [w.replace("<data>", str(data)) for w in MODELS[name]]
+    if EXACT and name == "q38":   # the fixed window, beside the own kernels this cell's runs take
+        a += ["--spec-window", "min-p", "--spec-min-p", "0", "--suffix-draft", "0"]
+    return a
 
 
 def llm_cells(rows: list[dict], meta: dict) -> None:
     engine = B.Engine.from_spec("xe", "xe", B.need("XE"), profile)
-    meta["llm"] = {"engine": os.environ["XE"], "common": COMMON, "extra": extra, "profile": profile,
+    meta["llm"] = {"engine": os.environ["XE"], "common": COMMON, "extra": extra, "profile": profile, "exact": EXACT,
                    "context": {t: B.CONTEXT[t] for t in tiers},
                    "models": {n: [*argv_of(n), *(["--expert-profile", profile] if profile else [])] for n in models}}
     for folder in ("answers", "logs", "logits"):
@@ -116,10 +124,15 @@ def llm_cells(rows: list[dict], meta: dict) -> None:
                     print(f"DRY {shlex.join(cmd)}")
                     continue
                 t0, rc = time.monotonic(), None
+                env = engine.env
+                if EXACT:            # the plain engine's dense products choose own/library per start as well
+                    env = {**env, "XESTRATA_NO_BLAS": "1"}
                 with open(answer, "wb") as f_out, open(log, "wb") as f_log:
                     f_log.write(f"# {shlex.join(cmd)}\n".encode())
+                    if env is not engine.env:
+                        f_log.write("# XESTRATA_NO_BLAS=1\n".encode())
                     try:
-                        rc = subprocess.run(cmd, cwd=engine.cwd, env=engine.env, stdin=subprocess.DEVNULL,
+                        rc = subprocess.run(cmd, cwd=engine.cwd, env=env, stdin=subprocess.DEVNULL,
                                             stdout=f_out, stderr=f_log, timeout=B.DEADLINE).returncode
                     except subprocess.TimeoutExpired:
                         pass
