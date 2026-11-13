@@ -47,7 +47,7 @@ inline std::string parts(const OwnOnlySplit& s, int64_t layers, bool staged_name
 /// One plain sentence.  `big` runs at `floor_tokens` tokens or more, `small` below it; equal splits (no staged entry, same counts) say "every chunk".
 /// `peer_off`: --peer-device is on, so the fused kernels are off and the counts are the ones that result.
 inline std::string own_only_line(int64_t layers, int64_t floor_tokens, const OwnOnlySplit& big, const OwnOnlySplit& small, bool peer_off) {
-    std::string s = "strata: [DRAFT] prompt kernels: ";
+    std::string s = "strata: prompt kernels: ";
     const bool equal = small.staged == 0 && big == small;
     if (equal) {
         s += "every chunk runs " + own_only_detail::parts(big, layers, false, true);
