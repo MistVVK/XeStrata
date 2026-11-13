@@ -1043,32 +1043,39 @@ void apply_os_budget(const std::string& pci, uint64_t& free) {
         free = std::min(free, budget > usage ? budget - usage : 0);
 }
 
-void apply_uma_limit(uint64_t& free) {
+void apply_uma_limit(uint64_t& free, uint64_t total) {
     static const uint64_t headroom = [] {
         const char* v = strata::env_get("UMA_HEADROOM_GIB");
         const long long g = v != nullptr ? std::strtoll(v, nullptr, 10) : 6;
         return (uint64_t) std::max(0LL, g) << 30;
     }();
+    uint64_t os_total = 0, avail = 0;
 #if defined(_WIN32)
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof ms;
-    if (GlobalMemoryStatusEx(&ms)) {
-        const uint64_t avail = (uint64_t) ms.ullAvailPhys;
-        free = std::min(free, avail > headroom ? avail - headroom : 0);
-    }
+    if (!GlobalMemoryStatusEx(&ms)) return;
+    os_total = (uint64_t) ms.ullTotalPhys;
+    avail = (uint64_t) ms.ullAvailPhys;
 #else
     std::ifstream meminfo("/proc/meminfo");
     std::string key;
     uint64_t kb = 0;
-    while (meminfo >> key >> kb) {
-        if (key == "MemAvailable:") {
-            const uint64_t avail = kb << 10;
-            free = std::min(free, avail > headroom ? avail - headroom : 0);
-            return;
-        }
-        meminfo.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    while ((os_total == 0 || avail == 0) && meminfo >> key >> kb) {
+        if (key == "MemTotal:")
+            os_total = kb << 10;
+        else if (key == "MemAvailable:")
+            avail = kb << 10;
+        else
+            meminfo.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
     }
+    if (avail == 0) return;   // no figure to cut to: the device's own stands
 #endif
+    // A BIOS carve-out is a pool of its own: the device reports more memory than the OS has, so what the OS can give
+    // back says nothing about it (the Strix Halo's 64 GiB carve-out beside the 62 GiB the OS sees; the free figure is
+    // the carve-out's).  Where the device's total is within the OS's RAM, the two are the same pool and the OS's
+    // figure binds (an Intel iGPU, an APU with a small carve-out).
+    if (os_total != 0 && total > os_total) return;
+    free = std::min(free, avail > headroom ? avail - headroom : 0);
 }
 
 // The used memory is the larger of the report's and what the process holds: the B70 reports its global_mem_size
