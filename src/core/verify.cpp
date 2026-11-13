@@ -333,14 +333,6 @@ bool head_mix_multi_enabled() {
     }();
     return on;
 }
-// STRATA_NO_BATCH_KV_STEP=1: the window's and the commit's K/V and indexer appends one call per token again
-bool no_batch_kv() {
-    static const bool on = [] {
-        const char* v = strata::env_get("NO_BATCH_KV_STEP");
-        return v != nullptr && std::strtol(v, nullptr, 10) != 0;
-    }();
-    return on;
-}
 #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
 
 struct Bump {
@@ -1117,7 +1109,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
                 } else
                 if (grp == 0) copy_from_mapped(tail_snap_ + (size_t) qi * TS, st.idx_tail, TS, cs);
                 // the window's cells in one launch per pool (a batch's rows each have their own K/V: one per row)
-                const bool kv_steps = dec_batch && !no_batch_kv() && !batch_rec_;
+                const bool kv_steps = dec_batch && !batch_rec_;
                 if (kv_steps) {
                     const int32_t* step_b = step_ + (ptrdiff_t) tb * kStepCount;
                     const float* kc_b = kcur_ + tb * NKV * HD;
@@ -1673,7 +1665,7 @@ bool Verifier::capture_commit(std::string& err) {
                     beta_L_ + (size_t) gdn_index * MT * HV, MT * HV, (int) C, (int) g.ssm_k_heads, (int) HV, (int) MT,
                     (int) n_gdn, commit_, cs_);
         }
-        if (commit_batch && ok && !no_batch_kv()) {
+        if (commit_batch && ok) {
             QsaIndexerLayers il;
             int nq = 0;
             int64_t mc = -1;
@@ -1722,15 +1714,9 @@ bool Verifier::capture_commit(std::string& err) {
                 if (!wikn) { ok = false; break; }
                 copy_from_mapped(st.idx_tail, tail_snap_ + (size_t) qsa_index * TS, TS, cs_);
                 const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                if (!no_batch_kv())
-                    native_qsa_indexer_append_steps(idx_raw_L_ + (size_t) qsa_index * MT * ID, commit_ + 2, 1, (int) MT,
-                                                    0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                                    rope_scaling(), cs_);
-                else
-                for (int64_t t = 0; t < MT; ++t)
-                    native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commit_ + 2 + t, 0,
-                                              (const float*) wikn->data, EPS, ib, s, st.max_cells,
-                                              rope_scaling(), cs_);
+                native_qsa_indexer_append_steps(idx_raw_L_ + (size_t) qsa_index * MT * ID, commit_ + 2, 1, (int) MT, 0,
+                                                (const float*) wikn->data, EPS, ib, s, st.max_cells,
+                                                rope_scaling(), cs_);
                 ++qsa_index;
             }
         }
