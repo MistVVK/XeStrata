@@ -911,6 +911,23 @@ int main(int argc, char** argv) {
                     "gumbel: flag read, greedy unchanged", flag_bad ? "*** WRONG ***" : "matches", same, T,
                     greedy_same ? "unchanged" : "CHANGED");
         bad += flag_bad;
+
+        // (d) the form's top-k cut (YASAKANI's Q35_SMP_K): 64 equal logits, top_k off - a draw is made only for the
+        // first kGumbelK by (value, id), so the ids after them are never picked
+        {
+            const int nv3 = 64, R3 = 64, launches3 = 160;   // 10,240 draws
+            const std::vector<float> l3((size_t) nv3 * R3, 0.0f);
+            strata::kernels::SamplerParams g3;
+            g3.top_k = 0; g3.top_p = 1.0f; g3.temperature = 1.0f; g3.seed = 11; g3.gumbel = true;
+            int outside = 0;
+            for (int k3 = 0; k3 < launches3; ++k3) {
+                g3.counter = (uint64_t) k3 * R3;
+                for (int id : sample_rows(l3, R3, g3)) outside += id >= strata::kernels::kGumbelK;
+            }
+            std::printf("  %-34s %s (%d of %d picks beyond the cut)\n", "gumbel: top-k cut",
+                        outside ? "*** WRONG ***" : "matches", outside, R3 * launches3);
+            bad += outside != 0;
+        }
     }
 
     std::printf("\nsampler: %d failures\n", bad);
