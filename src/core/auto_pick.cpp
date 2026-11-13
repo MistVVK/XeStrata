@@ -70,7 +70,7 @@ int adapt_lag_chosen() {
 }
 
 void adapt_lag_window(double ms, int64_t tokens, bool first) {
-    if (!first || !adapt_layers_round_alike() || !lag_choice().choosing()) return;
+    if (!first || adapt_lag_forced() > 0 || !adapt_layers_round_alike() || !lag_choice().choosing()) return;
     lag_choice().took(ms, tokens);
     lag_level.store(lag_choice().choosing() ? 0 : (lag_choice().on() ? 1 : 0), std::memory_order_relaxed);
 }

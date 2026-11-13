@@ -64,39 +64,47 @@ int main() {
     {   // ABBA, the default first, then the faster form
         core::WindowChoice c("test", "TEST", "the test form");
         check(!c.on() && c.choosing() && c.blocks() == 4, "the first window is the default, four blocks of two rounds");
-        bool order[16];
-        for (int i = 0; i < 16; ++i) {
+        bool order[32];
+        for (int i = 0; i < 32; ++i) {
             order[i] = c.on();
             c.took(10.0, 1);   // one ms a window under either form: the default wins a tie
         }
-        check(!order[0] && !order[1] && !order[2] && !order[3] && order[4] && order[5] && order[6] && order[7] &&
-                  order[8] && order[9] && order[10] && order[11] && !order[12] && !order[13] && !order[14] && !order[15],
-              "the windows run default, other, other, default");
+        bool abba = true;
+        for (int i = 0; i < 32; ++i) {   // 8 windows a block, A B B A
+            const int b = i / 8;
+            abba = abba && order[i] == (((b % 2) != ((b / 2) % 2)));
+        }
+        check(abba, "the windows run default, other, other, default");
         check(!c.choosing() && !c.on(), "a tie keeps the default (off)");
     }
     {   // the other form 10% faster: on
         core::WindowChoice c("test", "TEST", "the test form");
-        for (int i = 0; i < 16; ++i) c.took(c.on() ? 9.0 : 10.0, 1);
+        for (int i = 0; i < 32; ++i) c.took(c.on() ? 9.0 : 10.0, 1);
         check(!c.choosing() && c.on(), "the other form 10% faster: on");
     }
     {   // the other form 1% faster: within the margin, the default
         core::WindowChoice c("test", "TEST", "the test form");
-        for (int i = 0; i < 16; ++i) c.took(c.on() ? 9.9 : 10.0, 1);
+        for (int i = 0; i < 32; ++i) c.took(c.on() ? 9.9 : 10.0, 1);
         check(!c.choosing() && !c.on(), "the other form 1% faster: off (3% is the margin)");
     }
     {   // the default 10% faster: off
         core::WindowChoice c("test", "TEST", "the test form");
-        for (int i = 0; i < 16; ++i) c.took(c.on() ? 11.0 : 10.0, 1);
+        for (int i = 0; i < 32; ++i) c.took(c.on() ? 11.0 : 10.0, 1);
         check(!c.choosing() && !c.on(), "the default 10% faster: off");
     }
-    {   // no informative window: the blocks still run out, and the default stays
+    {   // no informative window: it keeps waiting, and the default stays
         core::WindowChoice c("test", "TEST", "the test form");
-        for (int i = 0; i < 16; ++i) c.took(c.on() ? 1.0 : 10.0, 1, false);
-        check(!c.choosing() && !c.on(), "no window where the switch matters: off");
+        for (int i = 0; i < 64; ++i) c.took(c.on() ? 1.0 : 10.0, 1, false);
+        check(c.choosing() && !c.on(), "no window where the switch matters: off, still waiting");
+    }
+    {   // a difference smaller than the windows' own spread: within twice the standard error, the default
+        core::WindowChoice c("test", "TEST", "the test form");
+        for (int i = 0; i < 32; ++i) c.took(c.on() ? (i % 2 ? 11.25 : 7.75) : (i % 2 ? 11.5 : 8.5), 1);
+        check(!c.choosing() && !c.on(), "5% apart but noisy: off (twice the standard error)");
     }
     {   // tokens are weighted, not windows: a long window's milliseconds count over its rows
         core::WindowChoice c("test", "TEST", "the test form");
-        for (int i = 0; i < 16; ++i) c.took(c.on() ? 9.0 : 10.0, c.on() ? 4 : 1);
+        for (int i = 0; i < 32; ++i) c.took(c.on() ? 9.0 : 10.0, c.on() ? 4 : 1);
         check(!c.choosing() && c.on(), "the time a token: 9 ms over four tokens beats 10 ms over one");
     }
     std::printf("%s\n", g_fail == 0 ? "auto_pick_test: all passed" : "auto_pick_test: FAILED");

@@ -5,6 +5,8 @@
 
 #include "strata/platform/env.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -25,17 +27,18 @@ inline Pick pick_from_env(const char* name) {
     return Pick::Auto;
 }
 
-/// A switch that shows only inside the engine's windows, chosen by the first ones: the windows run in blocks of
-/// `block`, the switch's other form and its default in turn, `rounds` rounds of two blocks (two rounds: default,
-/// other, other, default, so that a drift over the run falls on both alike), and the faster time a token stays.  The
-/// other form has to be `gain` faster, so a run the two cannot be told apart in keeps the default.  Only windows where
-/// the switch could change anything are counted; the blocks run out all the same, and one that never saw such a window
-/// keeps the default and says so.  Nothing is kept between runs; the decision is one line.
+/// A switch that shows only inside the engine's windows, chosen by the first ones: the windows where it can change
+/// anything run in blocks of `block`, the switch's other form and its default in turn, `rounds` rounds of two blocks
+/// (two rounds: default, other, other, default, so that a drift over the run falls on both alike), and the faster time a
+/// token stays.  The other form has to be `gain` faster AND clearer than the windows' own spread (twice the standard
+/// error of the two means: a handful of windows at a long context differ by 10% from one to the next), so a run the two
+/// cannot be told apart in keeps the default.  Blocks run on the windows where the switch can show, only; one that
+/// never sees such a window keeps the default and says so.  Nothing is kept between runs; the decision is one line.
 class WindowChoice {
 public:
     WindowChoice() = default;
     /// `name` is the switch as a user reads it (XESTRATA_<name>), `what` the decision's subject in its line.
-    WindowChoice(const char* who, const char* name, const char* what, int block = 4, int rounds = 2,
+    WindowChoice(const char* who, const char* name, const char* what, int block = 8, int rounds = 2,
                  double gain = 1.03, const char* unit = "a window")
         : who_(who), name_(name), what_(what), unit_(unit), block_(block < 1 ? 1 : block),
           rounds_(rounds < 1 ? 1 : rounds), gain_(gain) {}
@@ -48,11 +51,12 @@ public:
 
     /// The window that just ran under on(): its milliseconds and tokens, and whether it could show the difference.
     void took(double ms, int64_t tokens, bool informative = true) {
-        if (!choosing()) return;
-        if (informative && tokens > 0) {
-            ms_[on_ ? 1 : 0] += ms;
-            tok_[on_ ? 1 : 0] += tokens;
-        }
+        if (!choosing() || !informative || tokens <= 0) return;
+        const int f = on_ ? 1 : 0;
+        const double per = ms / (double) tokens;
+        ++n_[f];
+        sum_[f] += per;
+        sumsq_[f] += per * per;
         if (++windows_in_block_ < block_) return;
         windows_in_block_ = 0;
         ++block_index_;
@@ -65,28 +69,31 @@ private:
     static bool other(int block) { return (block % 2) != ((block / 2) % 2); }
 
     void decide() {
-        const double def_rate = tok_[0] > 0 ? ms_[0] / (double) tok_[0] : -1.0;
-        const double alt_rate = tok_[1] > 0 ? ms_[1] / (double) tok_[1] : -1.0;
-        if (def_rate < 0.0 || alt_rate < 0.0) {
+        if (n_[0] < 2 || n_[1] < 2) {
             on_ = false;
             std::fprintf(stderr, "%s: XESTRATA_%s: %s: not seen in the first windows: off\n", who_, name_, what_);
             return;
         }
-        on_ = alt_rate * gain_ < def_rate;
-        std::fprintf(stderr, "%s: XESTRATA_%s: %s: %.2f ms %s with it, %.2f without: %s (XESTRATA_%s=0/1 picks one)\n",
-                     who_, name_, what_, alt_rate, unit_, def_rate, on_ ? "on" : "off", name_);
+        const double m0 = sum_[0] / (double) n_[0], m1 = sum_[1] / (double) n_[1];   // ms a token, default / other
+        const double v0 = std::max(0.0, (sumsq_[0] - sum_[0] * sum_[0] / (double) n_[0]) / (double) (n_[0] - 1));
+        const double v1 = std::max(0.0, (sumsq_[1] - sum_[1] * sum_[1] / (double) n_[1]) / (double) (n_[1] - 1));
+        const double se = std::sqrt(v0 / (double) n_[0] + v1 / (double) n_[1]);
+        on_ = m0 - m1 > std::max((gain_ - 1.0) * m0, 2.0 * se);
+        std::fprintf(stderr, "%s: XESTRATA_%s: %s: %.2f ms %s with it, %.2f without (+-%.2f over %d and %d windows): "
+                             "%s (XESTRATA_%s=0/1 picks one)\n", who_, name_, what_, m1, unit_, m0, se, n_[1], n_[0],
+                     on_ ? "on" : "off", name_);
     }
 
     const char* who_ = "xestrata";
     const char* name_ = "";
     const char* what_ = "";
     const char* unit_ = "a window";
-    int block_ = 4, rounds_ = 2;
+    int block_ = 8, rounds_ = 2;
     double gain_ = 1.03;
     int block_index_ = 0, windows_in_block_ = 0;
     bool on_ = false;
-    double ms_[2] = {0.0, 0.0};
-    int64_t tok_[2] = {0, 0};
+    int n_[2] = {0, 0};
+    double sum_[2] = {0.0, 0.0}, sumsq_[2] = {0.0, 0.0};
 };
 
 /// Whether every MoE layer of the pack rounds the CPU's and the GPU's experts to the same bits (a canon layer, or a
