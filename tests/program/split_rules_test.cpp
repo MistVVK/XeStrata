@@ -140,6 +140,15 @@ int main() {
         CHECK(!floors_exceed_minimum(share_floors({0, 0}, L)));
         CHECK(!below_floors({}, 48, {}));
     }
+    // PR #4522: only CUDA0 (stage 0, weights loaded in full when the search runs) is credited what the trim frees; later stages never
+    {
+        const int64_t MiB = 1 << 20;
+        CHECK(trim_credit(0, 2169 * MiB) == 2169 * MiB);
+        CHECK(trim_credit(1, 2169 * MiB) == 0);
+        CHECK(trim_credit(2, 3000 * MiB) == 0);
+        CHECK(trim_credit(0, 0) == 0);
+        CHECK(trim_credit(0, -5) == 0);   // trim off: trim_frees is 0 (never negative); a negative figure is no credit
+    }
     if (failed == 0) std::printf("split_rules_test: ok\n");
     return failed ? 1 : 0;
 }

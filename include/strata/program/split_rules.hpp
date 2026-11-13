@@ -36,6 +36,15 @@ inline bool has_tiny_stage(const std::vector<int64_t>& cuts, int64_t n_layers) {
     return smallest_stage(cuts, n_layers) < kMinStageLayers;
 }
 
+// ---- the trim's credit in the auto search (PR #4522).  At the moment the search runs, CUDA0 holds the dense weights of ALL layers
+// (its arena is built before the split is known) and gives back everything outside its own layers when it reloads trimmed, so its room
+// for experts may count what the trim frees.  A later stage's weights are not loaded yet: its free memory has no full copy in it, and the
+// search already prices its trimmed weights (carve_bytes), so crediting it the same bytes again counts them twice and hands its cache room
+// it does not have.
+inline int64_t trim_credit(int stage, int64_t freed_by_trim) {
+    return stage == 0 && freed_by_trim > 0 ? freed_by_trim : 0;
+}
+
 // ---- #2644: the #1616 floor must not starve a card.  On an asymmetric pair (RTX 4060 Ti 16 GB + RTX 3060 12 GB, 48
 // layers, IQ3_S) the predicted decode window prefers almost every layer on the faster card, the first pick was K=2, and the
 // #1616 retry (every stage at least kMinStageLayers) landed on the edge of that restriction: K=3, the 3060 with 3 layers,
