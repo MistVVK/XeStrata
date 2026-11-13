@@ -1240,12 +1240,17 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         // a request with any of them decodes a token a window (each pick its own mask, history and logits)
         // (a bias is the same for every row of a spec window, and the script guard sets each window's masks)
         const bool constrained = grammar.active() || penalties || req_logprobs >= 0;
-        std::vector<int32_t> seen(ids.begin(), ids.end());   // what the penalties count: the prompt, then the reply
+        std::vector<int32_t> seen(ids.begin(), ids.end());   // the session's tokens: the prompt, then the reply
+        // #4590: the penalties count the reply's tokens (the last prompt token, which the first pick follows, stays
+        // in); XESTRATA_PENALTY_PROMPT=1 counts the prompt's last tokens too, unset is this build's default (see
+        // sampler.hpp: the old window until the quality check passes)
+        static const bool pen_prompt = strata::kernels::penalty_counts_prompt(strata::env_get("PENALTY_PROMPT"));
+        const size_t pen_from = strata::kernels::penalty_window_from(ids.empty() ? 0 : ids.size() - 1, pen_prompt);
         std::vector<float> lrow(req_logprobs >= 0 ? (size_t) V : 0);   // the logits the next pick comes from
         // before a pick after the window that reads `fed`
         auto constrain = [&](int32_t fed) -> bool {
             if (penalties) {
-                const size_t k = std::min(seen.size(), (size_t) sp.penalty_last_n);
+                const size_t k = std::min(seen.size() - pen_from, (size_t) sp.penalty_last_n);
                 if (!model.set_history(seen.data() + seen.size() - k, (int) k, cerr)) return false;
             }
             bool masked = false;

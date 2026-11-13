@@ -3208,10 +3208,13 @@ async function start() {
   if (settings.segments) askPersist();
   setBusy(false);
   renderChat();
-  const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
+  const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... fills the box (a shortcut)
   if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
   thinkingButtons();   // the four of before until /health says the model's own
-  loadHealth().then(() => resumeReplies()).then(loadSwitcher).then(loadMcp).then(loadSkills).then(() => loadUpdate()).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
+  loadHealth().then(() => resumeReplies()).then(loadSwitcher).then(loadMcp).then(loadSkills).then(() => loadUpdate()).then(() => {
+    // upstream #4221: the question is filled in and the box focused; nothing is sent until the person presses Send
+    if (startQuestion) { $("input").value = startQuestion; $("input").focus(); }
+  });
   showTab(location.hash.slice(1) || "chat");
   poll();
   setInterval(() => { if (!switching) loadSwitcher(); }, 15000);   // a switch started elsewhere shows here too

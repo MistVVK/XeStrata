@@ -33,6 +33,9 @@
 #include "strata/program/info_line.hpp"
 #include "strata/program/shared_options.hpp"
 #include "strata/core/conversation_snapshot.hpp"
+#if defined(STRATA_USE_HIP)
+#include "strata/core/serve_stop_bound.hpp"
+#endif
 #include "strata/core/conversation_disk.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/logit_bias.hpp"
@@ -8420,6 +8423,11 @@ int main(int argc, char** argv) {
                     for (AHome& h : ahomes) h.used = false;
                     if (pl) {   // the copies in at each card's next gap: after this step, so fenced (see above)
                         a_res_dirty = true;
+                        // the range is the whole round (upstream #4844): the loop can drain after this plan, and step 3
+                        // then takes the serial rule - a stale lo/hi would mark only an earlier round's batch, and the
+                        // slot would hold the new expert while the table still named the old one
+                        a_lo = 0;
+                        a_hi = a_bi = aswaps.size();
                         for (const ASwap& w : aswaps) a_in_due[(size_t) w.home] = 1;
                         ajob->post(a_stage_in);
                     } else {
@@ -10867,6 +10875,25 @@ int main(int argc, char** argv) {
                     e = why.empty() ? std::string("a pipelined prompt window failed") : why;
                     return false;
                 };
+                // The drafter's prefill blocks this thread until its stream is idle (on HIP, MtpDrafter::prefill syncs
+                // once per group whatever its `sync` says: prefill_per_group_sync, src/core/mtp.cpp).  With the drafter
+                // on the first card (mtp_first) a stage-0 window still in flight spins on that GPU for doorbells only
+                // this thread serves, so a prefill called beside it never returns: the prompt read stopped for good at
+                // its first window (0.1.56, gfx1201 + gfx1030, --pipeline-windows 2, issue #5147).  Serve stage 0 to its
+                // end first; the rest of the read keeps both stages overlapped.  The tokens are unchanged: the same
+                // windows, in the same order, only served a little earlier.
+                const bool mtp_first = mtp.device() == 0;
+                auto serve_stage0_to_end = [&]() -> bool {
+                    while (f0 < l0) {
+                        strata::core::Verifier& v0 = *PV[0][f0 & 1];
+                        if (v0.service(win_pool_fn, PSD[f0 & 1], e) < 0) return false;
+                        if (v0.done(e)) {
+                            if (!v0.pl_finish(nullptr, e) || !v0.pl_commit_async(wins[f0].T, e)) return false;
+                            ++f0;
+                        } else if (!e.empty()) return false;
+                    }
+                    return true;
+                };
                 while (f1 < N) {
                     if (stop_req.load()) return fail("cancelled");
                     // stage 0: one window at a time; window K+2 (K's parity) only once stage 1 has finished window K,
@@ -10902,6 +10929,9 @@ int main(int argc, char** argv) {
                             if (nonfinite_hit(v, "prompt")) return fail("non-finite logits (#879)");
                             const Win& w = wins[f1];
                             for (int t = 0; t < w.T; ++t) nx[(size_t) t] = (int32_t) cur[(size_t) (w.q + t + 1)];
+                            // the drafter shares stage 0's card: no stage-0 window may still be in flight when its
+                            // prefill waits on the host (see serve_stage0_to_end)
+                            if (mtp_first && !serve_stage0_to_end()) return fail(e);
                             if (!mtp.prefill(v.final_R(0), nx.data(), w.T, w.q, e, false)) return fail(e);
                             if (!strata::gpu::event_record(pl_mtp_ev[f1 & 1], mtp.stream()))
                                 return fail("pipeline: event record failed");
@@ -11214,6 +11244,11 @@ int main(int argc, char** argv) {
                                                ? drive.d.pcie_num : pcie_num_of(stages[(size_t) st - 1]->pcie_frac);
             if (pipe) for (int st = 0; st < split_drive.n; ++st) split_drive_b.pcie_num[st] = split_drive.pcie_num[st];
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
+            // #4590: the penalties count the tokens this reply has written, not the prompt's last ones (a task's own
+            // numbers or a quoted earlier answer were penalised just for being there).  Older assistant turns inside
+            // the prompt are not counted either.  XESTRATA_PENALTY_PROMPT=1 keeps the old window (prompt + reply);
+            // unset is this build's default (see sampler.hpp: the old window until the quality check passes).
+            static const bool pen_prompt = strata::kernels::penalty_counts_prompt(strata::env_get("PENALTY_PROMPT"));
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             if (pipe) ver_b.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             bool cancelled = false;
@@ -11380,6 +11415,51 @@ int main(int argc, char** argv) {
             }
             bool first_window = true;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
+            // XESTRATA_FOLLOW=<file> (token forcing, measurement only, off by default; tools/force_check.py): one line
+            // per request in the order the engine decodes them, comma-separated token ids (an empty line: that request
+            // is not forced).  The serial decode windows below take the line's tokens in place of the head's argmax, so
+            // drafts are accepted exactly when they equal the forced continuation, and XESTRATA_FOLLOW_LOGPOS=<file>
+            // gets one STRATA_LOGPOS row (FP32 head logits, XESTRATA_LOGPOS_TOPK) for every row whose logits are valid
+            // (each accepted row plus the one that follows).
+            static const std::vector<std::vector<int32_t>> fol_sets = [] {
+                std::vector<std::vector<int32_t>> v;
+                if (const char* f = strata::env_get("FOLLOW"); f != nullptr && f[0] != '\0') {
+                    std::ifstream in(f);
+                    std::string line;
+                    while (std::getline(in, line)) {
+                        std::vector<int32_t> ids;
+                        for (const char* q = line.c_str(); *q != '\0';) {
+                            if (*q >= '0' && *q <= '9') {
+                                ids.push_back((int32_t) std::atoi(q));
+                                while (*q >= '0' && *q <= '9') ++q;
+                            } else {
+                                ++q;
+                            }
+                        }
+                        v.push_back(std::move(ids));
+                    }
+                }
+                return v;
+            }();
+            static size_t fol_next = 0;
+            static std::FILE* const fol_lp = [] {
+                const char* p = strata::env_get("FOLLOW_LOGPOS");
+                return p != nullptr && p[0] != '\0' ? std::fopen(p, "ab") : nullptr;
+            }();
+            const std::vector<int32_t>* fol = nullptr;
+            if (!fol_sets.empty()) {
+                if (fol_next < fol_sets.size() && !fol_sets[fol_next].empty()) fol = &fol_sets[fol_next];
+                ++fol_next;
+            }
+#if defined(STRATA_USE_HIP)
+            // on by default (HIP, where it was measured: 4 x R9700, Qwen3.8-Flash-Next IQ3_S, 0 of 16 continuations
+            // fell back to the older checkpoint against 4 of 16 without it, #4677); XESTRATA_SERVE_STOP_BOUND=0 turns
+            // it off
+            static const bool stop_bound = [] {
+                const char* v = strata::env_get("SERVE_STOP_BOUND");
+                return v == nullptr || std::strcmp(v, "0") != 0;
+            }();
+#endif
             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
             int64_t t2_rej[8] = {}, t2_hit[8] = {};   // STRATA_MTP_TOP2: rejections inside the MTP drafts by depth, runner-up hits
             int64_t dp_tested[8] = {}, dp_ok[8] = {};   // STRATA_SPEC_DEPTH=1: MTP drafts tested / accepted by depth
@@ -11391,6 +11471,9 @@ int main(int argc, char** argv) {
             std::vector<int32_t> consumed;
             consumed.reserve((size_t) (n + max_new + S));
             for (int64_t i = 0; i < n - 1; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
+            // #4590: where the penalty window may start in `consumed`: the prompt without its last token, which joins
+            // the window as the fed-back head `x`
+            const size_t pen_gen0 = strata::kernels::penalty_window_from(consumed.size(), pen_prompt);
             int64_t reply_ck = (int64_t) consumed.size();   // --reply-checkpoint-every: where the last one was taken
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
@@ -11877,6 +11960,14 @@ int main(int argc, char** argv) {
                     chain_kind = 0;
                     int a = 0;
                     while (a < A.T - 1 && A.tok[a + 1] == outp[(size_t) a]) ++a;
+#if defined(STRATA_USE_HIP)
+                    // #4677: commit only the rows this request can emit, so the parked snapshot is what the client
+                    // got (a snapshot with more is refused and the older checkpoint is read again)
+                    if (stop_bound)
+                        a = strata::core::serve_stop_bound(a + 1, max_new - produced_n, outp.data(), [&](int32_t y) {
+                            return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                        }) - 1;
+#endif
                     for (int i = 0; i < a; ++i)   // the reply ends at its first stop token (as the serial windows')
                         if (std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) outp[(size_t) i]) != o.eos_ids.end()) {
                             a = i;
@@ -12120,7 +12211,8 @@ int main(int argc, char** argv) {
                     // fed-back head `x` (it joins `consumed` only after this window commits), then the drafts
                     // before that row - what plain decode would have counted there.  (Until 0.1.19 only row 0
                     // was staged, and the drafted rows read unwritten slots.)
-                    strata::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), window.data(), T,
+                    strata::kernels::penalty_rows(consumed.data() + pen_gen0, (int64_t) (consumed.size() - pen_gen0),
+                                                  window.data(), T,
                                                   hist_n, hist_stage.data());
                     const strata::core::OnDevice on_h(hist_dev);
                     strata::gpu::copy(d_hist, hist_stage.data(), (size_t) T * (size_t) hist_n * sizeof(int32_t));
@@ -12167,8 +12259,31 @@ int main(int argc, char** argv) {
                         if (f) std::fclose(f);
                     }
                 }
+                if (fol != nullptr) {   // XESTRATA_FOLLOW: the forced continuation stands in for the argmax
+                    for (int i = 0; i < T; ++i) {
+                        const int64_t fi = produced_n + i;   // row i answers continuation index produced_n + i
+                        if (fi >= 0 && fi < (int64_t) fol->size()) outv[(size_t) i] = (*fol)[(size_t) fi];
+                    }
+                }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+#if defined(STRATA_USE_HIP)
+                // #4677: as in the pipelined path: do not cache accepted rows whose outputs this request cannot emit
+                if (stop_bound)
+                    a = strata::core::serve_stop_bound(a + 1, max_new - produced_n, outv.data(), [&](int32_t y) {
+                        return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                    }) - 1;
+#endif
+                if (fol != nullptr && fol_lp != nullptr) {   // rows 0..a have valid logits (their inputs are accepted)
+                    std::vector<int32_t> fol_tg((size_t) a + 1, -1);
+                    for (int i = 0; i <= a; ++i) {
+                        const int64_t fi = produced_n + i;
+                        fol_tg[(size_t) i] = fi >= 0 && fi < (int64_t) fol->size() ? (*fol)[(size_t) fi] : -1;
+                    }
+                    std::string fe;
+                    if (!ver.window_logprobs(fol_tg.data(), a + 1, p, 248046, fol_lp, fe))
+                        std::fprintf(stderr, "xestrata serve: XESTRATA_FOLLOW_LOGPOS: %s\n", fe.c_str());
+                }
                 // the reply ends at its first stop token: the drafts after it (an accepted "\n<|endoftext|>" after
                 // <|im_end|>) stay out of the session, as plain's spec_step keeps them out.  In it they made the session
                 // end in tokens the next turn's prompt does not have ("<|im_end|>\n<|im_start|>"), and a recurrent
@@ -12274,7 +12389,8 @@ int main(int argc, char** argv) {
                 ++rounds;
                 const Clock::time_point tw2 = Clock::now();
                 if (use_mtp && hist_n > 0 && mtp.coupled() && !eos && produced_n < max_new)
-                    mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
+                    mtp.set_draft_history(consumed.data() + pen_gen0, (int64_t) (consumed.size() - pen_gen0),
+                                          outv[(size_t) a]);
                 const bool drafted = !use_mtp || eos || produced_n >= max_new ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), draft_more);
                 {
