@@ -351,7 +351,7 @@ bool Dflash2Drafter::alloc(std::string& err) {
     vram_ += slab_total;
     rt_ctx_ = reinterpret_cast<float*>(d_meta_ + meta_ints());
     rt_blk_ = rt_ctx_ + B * 128;
-    cur_ = Lineage{(size_t) N_, {}, {}};
+    history_.init((size_t) N_, 32, kRing, window_);
     if (!strata::gpu::alloc_host(&h_meta_, meta_bytes() + (size_t) N_ * 4) || !strata::gpu::alloc_host(&h_out_, 64 * 4)) {
         err = "dflash2: host staging";
         return false;
@@ -363,7 +363,6 @@ bool Dflash2Drafter::alloc(std::string& err) {
         err = "dflash2: ring init";
         return false;
     }
-    for (int64_t& t : slot_pos_) t = -1;
     if (const char* e = strata::env_get("DF2_RING_LOG"); e != nullptr && e[0] == '0') log_on_ = false;
     int log_mib = 0;
     if (const char* e = strata::env_get("DF2_LOG_MIB"); e != nullptr && read_int(e, log_mib))
@@ -377,6 +376,7 @@ bool Dflash2Drafter::alloc(std::string& err) {
             std::fprintf(stderr, "xestrata dflash2: the ring log's staging does not fit in host memory: the log is off\n");
         }
     }
+    history_.configure(log_on_, stash_budget_);
     if (!strata::gpu::memset_async(xqp_, 0, (size_t) in_max_ * capacity_rows_ + 4096, cs_) ||
         !strata::gpu::memset_async(xdp_, 0, ((size_t) in_max_ / 32 * capacity_rows_ + 64) * 4, cs_) ||
         !strata::gpu::memset_async(xqc_, 0, (size_t) in_max_ * capacity_rows_ + 4096, cs_) ||
@@ -714,47 +714,22 @@ bool Dflash2Drafter::prepare(const float* taps, std::string& err) {
 }
 
 // ---- ring log --------------------------------------------------------------------------------------------
-uint64_t Dflash2Drafter::ring_log_bytes() const { return cur_.bytes(); }
-uint64_t Dflash2Drafter::ring_stash_bytes() const {
-    uint64_t b = 0;
-    for (const Lineage& l : stash_) b += l.bytes();
-    return b;
-}
+uint64_t Dflash2Drafter::ring_log_bytes() const { return history_.log_bytes(); }
+uint64_t Dflash2Drafter::ring_stash_bytes() const { return history_.stash_bytes(); }
 
 void Dflash2Drafter::reset() {
     have_ctx_ = 0;
-    cur_ = Lineage{(size_t) N_, {}, {}};
-    stash_.clear();
-    invalidate_ring();
-}
-
-void Dflash2Drafter::invalidate_ring() {
-    ++epoch_;
-    ring_hi_ = 0;
-    for (int64_t& t : slot_pos_) t = -1;
-}
-
-void Dflash2Drafter::stash_push(Lineage&& l) {
-    if (!log_on_ || stash_budget_ == 0 || l.hist.size() < 128 || l.chunks.empty()) return;
-    stash_.push_back(std::move(l));
-    ++ring_stats.stash_stores;
-    uint64_t total = ring_stash_bytes();
-    while (!stash_.empty() && total > stash_budget_) {
-        total -= std::min(total, stash_.front().bytes());
-        stash_.pop_front();
-        ++ring_stats.stash_evictions;
-    }
+    history_.reset();
 }
 
 void Dflash2Drafter::log_stage(int64_t pos0, int n) {
     if (!log_on_) return;
     pend_pos0_ = pos0;
     pend_n_ = n;
-    for (int i = 0; i < n; ++i) slot_pos_[(size_t) ((pos0 + i) % kRing)] = ((int64_t) epoch_ << 32) | (pos0 + i);
+    history_.mark_slots(pos0, n);
 }
 
-// The update's quantized rows are still in xqc_ / xdc_ when its stream has run (nothing writes them afterwards):
-// copy them to the host behind the update.
+// Copy the exact quantized rows behind the update, on the same stream.
 void Dflash2Drafter::log_fetch(int n) {
     if (!log_on_ || pend_pos0_ < 0) return;
     strata::gpu::copy_async(h_logq_, xqc_, (size_t) n * N_, cs_, "dflash2 ring log");
@@ -763,28 +738,12 @@ void Dflash2Drafter::log_fetch(int n) {
 
 void Dflash2Drafter::log_flush() {
     if (!log_on_ || pend_pos0_ < 0) return;
-    for (int i = 0; i < pend_n_; ++i) {
-        const int64_t pos = pend_pos0_ + i;
-        LogChunk& ch = cur_.writable((size_t) (pos / kLogChunk));
-        const size_t r = (size_t) (pos % kLogChunk);
-        const size_t W = (size_t) N_, D = (size_t) N_ / 32;
-        std::memcpy(&ch.q[r * W], h_logq_ + (size_t) i * W, W);
-        std::memcpy(&ch.d[r * D], h_logd_ + (size_t) i * D, D * sizeof(float));
-        ch.ok[r] = 1;
-    }
+    history_.store(pend_pos0_, pend_n_, h_logq_, h_logd_);
     pend_pos0_ = -1;
 }
 
-bool Dflash2Drafter::rebuild(int64_t lo, int64_t hi, int64_t* rebuilt, int64_t* missing, std::string& err) {
-    *rebuilt = 0;
-    *missing = 0;
-    std::vector<int32_t> pos;
-    for (int64_t p = lo; p < hi; ++p) {
-        if (slot_pos_[(size_t) (p % kRing)] == (((int64_t) epoch_ << 32) | p)) continue;   // the ring already holds this row
-        if (cur_.logged(p)) pos.push_back((int32_t) p);
-        else ++*missing;
-    }
-    if (pos.empty()) return true;
+bool Dflash2Drafter::replay(const int32_t* positions, const int8_t* q, const float* scales, int rows, int32_t epoch,
+                            std::string& err) {
     const OnDevice on_device(device_);
     std::vector<float> table((size_t) rows * 128);
     strata::kernels::df2_rope_table_cpu(positions, rows, theta_, table.data());
@@ -798,107 +757,31 @@ bool Dflash2Drafter::rebuild(int64_t lo, int64_t hi, int64_t* rebuilt, int64_t* 
         err = "dflash2: ring rebuild upload";
         return false;
     }
-    bool ok = true;
-    for (size_t r0 = 0; ok && r0 < rows; r0 += kRows) {
-        const int m = (int) std::min<size_t>(kRows, rows - r0);
-        // this batch's table before its kernels (an in-order stream)
-        ok = strata::gpu::copy_async(rt_ctx_, tab.data() + r0 * 128, (size_t) m * 128 * 4, cs_, "dflash2 rebuild") &&
-             record_kv(m, rb_q_ + r0 * W, rb_d_ + r0 * D, rb_pos_ + r0, err);
-    }
-    if (!strata::gpu::stream_sync(cs_)) { err = "dflash2: ring rebuild"; return false; }   // the host vectors die with this scope
-    if (!ok) return false;
-    for (int32_t p : pos) slot_pos_[(size_t) (p % kRing)] = ((int64_t) epoch_ << 32) | p;
-    *rebuilt = (int64_t) rows;
-    return true;
+    const bool ok = record_kv(rows, rb_q_, rb_d_, rb_pos_, err);
+    if (!strata::gpu::stream_sync(cs_)) { err = "dflash2: ring rebuild"; return false; }
+    return ok;
 }
 
 bool Dflash2Drafter::begin_request(const int32_t* ids, int64_t n, int64_t resume, bool* cold) {
-    resume = std::max<int64_t>(0, std::min(resume, n));
-    if (cold) *cold = false;
-    ++ring_stats.requests;
-    last_rebuilt = last_missing = 0;
-    last_ms = 0;
-    last_swapped = false;
     std::string err;
-    const Clock::time_point t0 = Clock::now();
-    auto lcp_of = [&](const std::vector<int32_t>& h) {
-        int64_t l = 0;
-        const int64_t lim = std::min<int64_t>((int64_t) h.size(), resume);
-        while (l < lim && h[(size_t) l] == ids[l]) ++l;
-        return l;
-    };
-    if (!log_on_) {   // the pre-log rule: a history that does not cover the resumed prefix starts the ring over
-        const int64_t lcp = lcp_of(cur_.hist);
-        const bool stale = ring_hi_ > lcp && lcp < resume;
-        if (stale) invalidate_ring();
-        if (cold) *cold = stale;
-        cur_.hist.assign(ids, ids + resume);
-        return true;
-    }
-    bool covered = lcp_of(cur_.hist) >= resume;
-    bool swapped = false;
-    if (!covered) {   // a parked lineage may be the one this request resumes
-        for (size_t i = stash_.size(); i-- > 0;) {
-            if (lcp_of(stash_[i].hist) < resume) continue;
-            Lineage got = std::move(stash_[i]);
-            stash_.erase(stash_.begin() + (std::ptrdiff_t) i);
-            stash_push(std::move(cur_));
-            cur_ = std::move(got);
-            invalidate_ring();
-            covered = swapped = true;
-            ++ring_stats.stash_hits;
-            break;
-        }
-    }
-    if (!covered) {   // another conversation: the live lineage is parked, this one starts empty
-        stash_push(std::move(cur_));
-        cur_ = Lineage{(size_t) N_, {}, {}};
-        invalidate_ring();
-        ++ring_stats.cold_starts;
-    } else if ((int64_t) cur_.hist.size() >= resume + 128) {
-        // the rows past `resume` are about to be rewritten (a rewound or branching request): keep the old branch
-        Lineage copy = cur_;
-        stash_push(std::move(copy));
-    }
-    if ((int64_t) cur_.hist.size() > resume) { cur_.hist.resize((size_t) resume); cur_.truncate(resume); }
-    if (!covered) cur_.hist.assign(ids, ids + resume);
-    // the window the first draft reads, below `resume` (the prompt's own taps cover [resume, n))
-    int64_t rebuilt = 0, missing = 0;
-    const int64_t lo = std::max<int64_t>(0, n - (window_ - 1)), hi = resume;
-    if (hi > lo) {
-        if (!rebuild(lo, hi, &rebuilt, &missing, err)) {
-            std::fprintf(stderr, "xestrata dflash2: %s: the ring starts over for this request\n", err.c_str());
-            invalidate_ring();
-            missing = hi - lo;
-            rebuilt = 0;
-        }
-    }
-    if (strata::env_get("DF2_RING_STATS") != nullptr)
+    const auto replay_rows = [this](const int32_t* pos, const int8_t* q, const float* scales, int rows, int32_t epoch,
+                                    std::string& e) { return replay(pos, q, scales, rows, epoch, e); };
+    const bool ok = history_.begin_request(ids, n, resume, replay_rows, cold, err);
+    ring_stats = history_.stats;
+    last_rebuilt = history_.last_rebuilt; last_missing = history_.last_missing;
+    last_ms = history_.last_ms; last_swapped = history_.last_swapped;
+    if (!err.empty()) std::fprintf(stderr, "xestrata dflash2: %s: the ring starts over for this request\n", err.c_str());
+    if (log_on_ && strata::env_get("DF2_RING_STATS") != nullptr)
         std::fprintf(stderr, "xestrata dflash2 ring: request %lld resume %lld of %lld: live log %.1f MiB (%lld positions), "
-                     "parked %zu lineages %.1f MiB, rebuilt %lld rows (missing %lld) in %.2f ms%s\n",
-                     (long long) ring_stats.requests, (long long) resume, (long long) n, (double) cur_.bytes() / 1048576.0,
-                     (long long) cur_.hist.size(), stash_.size(), (double) ring_stash_bytes() / 1048576.0,
-                     (long long) rebuilt, (long long) missing, ms_since(t0), swapped ? " (swapped in)" : "");
-    ring_stats.rows_rebuilt += rebuilt;
-    ring_stats.rows_missing += missing;
-    if (rebuilt > 0) ++ring_stats.rebuilds;
-    const double ms = ms_since(t0);
-    if (rebuilt > 0) ring_stats.ms_rebuild += ms;
-    if (swapped) ring_stats.ms_swap += ms;
-    if (cold) *cold = missing > 0;
-    last_rebuilt = rebuilt;
-    last_missing = missing;
-    last_ms = ms;
-    last_swapped = swapped;
-    return true;
+                             "parked %zu lineages %.1f MiB, rebuilt %lld rows (missing %lld) in %.2f ms%s\n",
+                     (long long) ring_stats.requests, (long long) std::max<int64_t>(0, std::min(resume, n)), (long long) n,
+                     (double) history_.log_bytes() / 1048576.0, (long long) history_.history_size(), history_.stash_size(),
+                     (double) history_.stash_bytes() / 1048576.0, (long long) last_rebuilt, (long long) last_missing,
+                     last_ms, last_swapped ? " (swapped in)" : "");
+    return ok;
 }
 
-void Dflash2Drafter::note_rows(const int32_t* toks, int64_t n, int64_t pos0) {
-    if (pos0 < 0) return;
-    if ((int64_t) cur_.hist.size() > pos0) { cur_.hist.resize((size_t) pos0); if (log_on_) cur_.truncate(pos0); }
-    if ((int64_t) cur_.hist.size() < pos0) return;   // a gap: the history stops being a prefix (the next begin_request starts over)
-    cur_.hist.insert(cur_.hist.end(), toks, toks + n);
-}
+void Dflash2Drafter::note_rows(const int32_t* toks, int64_t n, int64_t pos0) { history_.note_rows(toks, n, pos0); }
 
 bool Dflash2Drafter::debug_ring(std::vector<float>& kv, std::vector<int64_t>& tags, std::string& err) {
     const OnDevice on_device(device_);
@@ -932,7 +815,7 @@ bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::st
         log_flush();
     }
     have_ctx_ = std::max<int64_t>(have_ctx_, pos0 + n);
-    ring_hi_ = std::max<int64_t>(ring_hi_, pos0 + n);
+    history_.mark_end(pos0 + n);
     ms_ctx += ms_since(t0);
     return true;
 }
@@ -947,7 +830,7 @@ bool Dflash2Drafter::context_async(const float* taps, int64_t n, int64_t pos0, s
     log_fetch((int) n);
     ctx_pending_ = true;
     have_ctx_ = std::max<int64_t>(have_ctx_, pos0 + n);
-    ring_hi_ = std::max<int64_t>(ring_hi_, pos0 + n);
+    history_.mark_end(pos0 + n);
     return true;
 }
 
@@ -987,7 +870,7 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
         if (probs) probs[i] = made ? reinterpret_cast<const float*>(h_out_)[16 + i] : 0.0f;
     }
     have_ctx_ = std::max<int64_t>(have_ctx_, s);
-    ring_hi_ = std::max<int64_t>(ring_hi_, pos0 + n_new);
+    history_.mark_end(pos0 + n_new);
     ms_draft += ms_since(t0);
     ++rounds;
     if (block_rows_ == kRows) ++rounds_short; else ++rounds_wide;

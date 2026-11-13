@@ -83,6 +83,8 @@ public:
     // Off uses the full target head. On requires the model-specific SHEAD. Changes must precede graph capture.
     void set_head_mode(HeadMode mode) { head_mode_ = mode; }
     void set_probe_shead(bool use) { probe_shead_ = use; }
+    // Drain the stream and discard every graph using SHEAD before this call. On, or Auto after SHEAD won, refuses it.
+    bool release_shead(std::string& err);
     bool has_shead() const { return head_.loaded(); }
     bool uses_shead() const { return head_mode_ == HeadMode::On || (head_mode_ == HeadMode::Auto && probe_shead_); }
     // The selector projects the normalized rows, scores the selected head's candidates, and walks from anchor.
