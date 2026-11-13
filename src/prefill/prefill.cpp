@@ -13,6 +13,7 @@
 #include "strata/prefill/own_only_line.hpp"
 #include "strata/prefill/stream_floor_rule.hpp"
 #include "strata/kernels/gfx_arch.hpp"
+#include "strata/quant/types.hpp"
 #include "strata/prefill/fewrows.hpp"
 #include "strata/prefill/gp100_prompt_default.hpp"
 #if defined(STRATA_HAVE_DFLASH2)
@@ -419,6 +420,26 @@ inline bool plain_pack_all_fused() {
     return false;
 #endif
 }
+// A build without MMQ (STRATA_PF_OWN_ONLY) on a gfx12 card (R9700, RX 9070 / 9060) loading a native pack whose every layer is a trellis pair (Gyro-S TQK6 / TQK7 and the other trellis types) that the fused kernels
+// take (layers_all_fused_only(): no layer on MMQ or on the FP16 path).  Below the floor the staged fused entry reads these layers about twice as slowly as MMQ did (R9700, Gyro-S, 128 to 1,000 tokens: 542 to 1,241 ms
+// against 252 to 659 ms), the streamed walk is faster than MMQ at every size (167 to 415 ms).  False in a build with MMQ, on every other card, and without a loaded layout.
+inline bool trellis_gfx12_all_fused() {
+#if defined(STRATA_PF_OWN_ONLY) && defined(STRATA_USE_HIP)
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || lay.fmt.empty()) return false;
+    for (const auto& f : lay.fmt)
+        if (f.gu_type < (int) strata::quant::Type::TQ2_T || f.gu_type > (int) strata::quant::Type::TQP7) return false;   // not a trellis gate/up
+    int dev = 0;
+    cudaDeviceProp prop;
+    if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    return strata::kernels::gfx_arch_is_gfx12_wmma(prop.gcnArchName) && layers_all_fused_only();
+#else
+    return false;
+#endif
+}
 // The floor without STRATA_PREFILL_STREAM_MIN and the CPU share: stream_floor_rule.hpp's answer, decided once when the expert layout is known (a call before that gets the default and is not cached).
 inline int64_t default_stream_floor() {
     static std::atomic<int64_t> cached{-1};
@@ -428,7 +449,7 @@ inline int64_t default_stream_floor() {
     const bool plain = plain_pack_all_fused();   // a build without MMQ and a non-native pack on the fused kernels: no staged entry or int8 path exists for its layout (stream_floor_rule.hpp)
     if ((!lay.native || lay.fmt.empty()) && !plain) return strata::prefill::kStreamFloorDefault;
     const bool cls = !plain && stream_floor_class_measured();
-    const int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only(), staged_fo_on(), plain);
+    const int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only(), staged_fo_on(), plain, trellis_gfx12_all_fused());
     cached.store(v, std::memory_order_release);
     if (v != strata::prefill::kStreamFloorDefault)
         std::fprintf(stderr, "prefill: prompt pieces of %lld tokens or more read on the fused kernels, as long prompts do. STRATA_PREFILL_STREAM_MIN=1024 keeps the old rule.\n", (long long) v);

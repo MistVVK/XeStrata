@@ -31,6 +31,13 @@ int main() {
     // a build with MMQ, or a pack that is not plain-and-fused, passes false: the rows above are unchanged
     CHECK(stream_floor_default(false, false, false, false) == kStreamFloorDefault);
     CHECK(stream_floor_default(true, true, true, false) == kStreamFloorDefault);
+    // a build without MMQ on a gfx12 card with a native pack of trellis pairs on the fused kernels (Gyro-S on the R9700): the floor is 64 whatever the staged entry and the class say
+    CHECK(stream_floor_default(false, false, true, false, true) == kFusedOnlyFloor);
+    CHECK(stream_floor_default(false, false, false, false, true) == kFusedOnlyFloor);
+    CHECK(stream_floor_default(true, true, true, false, true) == kFusedOnlyFloor);
+    // without the flag (a build with MMQ, another card, another format set) the rows above stand
+    CHECK(stream_floor_default(false, false, true, false, false) == kStreamFloorDefault);
+    CHECK(stream_floor_default(false, true, true, false, false) == kStreamFloorDefault);
     if (failed) {
         std::fprintf(stderr, "stream_floor_rule_test: %d check(s) failed\n", failed);
         return 1;

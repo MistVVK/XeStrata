@@ -26,8 +26,12 @@ inline constexpr int64_t kFusedOnlyFloor = 64;   // the streamed walk is faster 
 /// `plain_pack_fused`: a build without llama.cpp's MMQ (prefill.cpp STRATA_PF_OWN_ONLY) loading a pack that is not a native one (the AVX-512 Q2_0 pack: no native_experts.txt) whose layers the plan marks
 /// fused (fused::enabled()).  The staged entry and the int8 kernels read the native layout only, so below the floor such a layer would run each routed expert on the dequantize + FP16 path
 /// (Radeon 780M, Q2_0 pack: 367-token prompts 7,435 ms against 3,222 ms with MMQ); the floor is kFusedOnlyFloor there, on every card class.  A build with MMQ passes false.
-constexpr int64_t stream_floor_default(bool class_measured, bool all_layers_fused_only, bool staged_entry, bool plain_pack_fused = false) {
-    return (class_measured && all_layers_fused_only && !staged_entry) || plain_pack_fused ? kFusedOnlyFloor : kStreamFloorDefault;
+///
+/// `trellis_gfx12_fused`: a build without MMQ on a gfx12 card (Radeon AI PRO R9700 / RX 9070) loading a native pack whose every layer is a trellis pair (Gyro-S TQK6 / TQK7) on the fused kernels.  The staged
+/// fused entry reads such layers about twice as slowly as MMQ does below the floor, the streamed walk 1.5 to 1.7 times faster than MMQ from 128 tokens up (R9700, Gyro-S: 128 tokens 252 ms with MMQ, 542 ms on the staged
+/// entry, 167 ms on the streamed walk; par/RESULTS-MMQ-TAIL.md), so the floor is kFusedOnlyFloor there whatever the staged entry says.  A build with MMQ passes false.
+constexpr int64_t stream_floor_default(bool class_measured, bool all_layers_fused_only, bool staged_entry, bool plain_pack_fused = false, bool trellis_gfx12_fused = false) {
+    return (class_measured && all_layers_fused_only && !staged_entry) || plain_pack_fused || trellis_gfx12_fused ? kFusedOnlyFloor : kStreamFloorDefault;
 }
 
 }  // namespace strata::prefill
