@@ -1823,6 +1823,12 @@ class OutputParser:
         for name in self.schemas:
             if isinstance(name, str) and "__" in name:
                 aliases.setdefault(name.replace("__", "_"), set()).add(name)
+                # #5281: a namespaced MCP tool (`mcp__assets__get_asset_info`) written with its last segment only
+                # (`get_asset_info`), as the bare member of a dotted name is accepted above; only when exactly one
+                # declared tool ends that way
+                last = name.rsplit("__", 1)[1]
+                if last:
+                    aliases.setdefault(last, set()).add(name)
         # #4751: a programmatic-tool-calling harness (the DeepSeek Harness's PTC mode) shows the model its tools as
         # `tools.write(...)` inside code, and the model then writes the native call with that spelling (`tools.write`,
         # also `functions.write`).  The prefix is not part of the declared name; the same unambiguous-alias rule
