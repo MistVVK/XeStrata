@@ -242,6 +242,11 @@ if(STRATA_BUILD_TESTS)
   add_executable(timer_marks_test tests/prefill/timer_marks_test.cpp)
   target_include_directories(timer_marks_test PRIVATE include)
   add_test(NAME timer_marks_test COMMAND timer_marks_test)
+  # #4590 (upstream): the penalty window is the reply's own tokens (XESTRATA_PENALTY_PROMPT=1: prompt + reply);
+  # header-only, no GPU
+  add_executable(penalty_window_test src/kernels/penalty_window_test.cpp)
+  target_include_directories(penalty_window_test PRIVATE include)
+  add_test(NAME penalty_window_test COMMAND penalty_window_test)
   # upstream b89bf5947: an engine started at Low disk priority goes back to Normal (Windows; else it skips)
   add_executable(io_priority_test tests/platform/io_priority_test.cpp)
   target_link_libraries(io_priority_test PRIVATE strata_platform)
