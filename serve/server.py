@@ -110,9 +110,10 @@ IM_END = "<|im_end|>"
 IMAGE_PAD = "<|image_pad|>"
 
 
-def listen_problem(host: str, port: int, e: OSError) -> str:
+def listen_problem(host: str, port: int, e: OSError, windows: bool = os.name == "nt") -> str:
     """#769: why the server cannot listen.  Only an address that is taken says "already in use"; anything else (a port
-    Windows keeps reserved, an address this PC does not have, no permission) says what the OS said."""
+    Windows keeps reserved, an address this PC does not have, no permission) says what the OS said.  `windows`: the
+    system this sentence is for (the tests give both)."""
     import errno
     code = getattr(e, "winerror", None) or e.errno
     if code in (errno.EADDRINUSE, 10048):
@@ -120,8 +121,12 @@ def listen_problem(host: str, port: int, e: OSError) -> str:
                 f"Close it, or start this one with a different --port")
     what = e.strerror or str(e)
     if code in (10013, errno.EACCES):
-        hint = ("Windows may keep this port for itself (see `netsh int ipv4 show excludedportrange protocol=tcp`) "
-                "or a firewall rule forbids it: start this one with a different --port")
+        if windows:              # Windows keeps whole ranges of ports for Hyper-V, WSL and Docker (upstream 8768e95f)
+            hint = ("Windows may keep this port for itself (see `netsh int ipv4 show excludedportrange protocol=tcp`) "
+                    "or a firewall rule forbids it: start this one with a different --port")
+        else:                    # Linux and macOS keep none of them: below 1024 is where a privilege is needed
+            hint = (f"this system does not let XeStrata use port {port}: on Linux and macOS, ports below 1024 need "
+                    "administrator rights. Start this one with a different --port, for example 8801")
     elif code in (10049, errno.EADDRNOTAVAIL):
         hint = f"{host} is not an address of this PC: check \"host\" in the model's xestrata-<model>.json or --host"
     else:
