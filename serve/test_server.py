@@ -2564,6 +2564,25 @@ class DraftCosts(unittest.TestCase):
         self.assertEqual(server.draft_costs_args({"model_name": "m"}, list(args)), args)
         self.assertEqual(server.draft_costs_args({"model_name": "m"}, list(args), str(self.tmp / "missing")), args)
 
+    def test_default_is_on_only_on_metal(self):
+        # the taken-over table measured above live costs on Metal and below them on CUDA (l620, 11-13): live costs stay the default there and on HIP
+        self.assertTrue(server.draft_costs_default("darwin"))
+        for platform in ("linux", "win32", "cygwin", "freebsd14", "android"):
+            self.assertFalse(server.draft_costs_default(platform), platform)
+        self.assertEqual(server.DRAFT_COSTS_DEFAULT, sys.platform == "darwin")
+
+    def test_table_off_by_default_gives_no_flag_unless_the_config_asks(self):
+        args = ["--native", "x", "--spec", "6"]
+        new = self.tmp / "new-engine"
+        new.write_bytes(b"\x7fELF strata --spec --serve --draft-costs --draft-costs-key")
+        with mock.patch.object(server, "DRAFT_COSTS_DEFAULT", False):   # CUDA / HIP class
+            self.assertEqual(server.draft_costs_args({"model_name": "m"}, list(args), str(new)), args)
+            self.assertIn("--draft-costs", server.draft_costs_args({"model_name": "m", "draft_costs": True}, list(args), str(new)))   # the test switch
+            self.assertEqual(server.draft_costs_args({"model_name": "m", "draft_costs": False}, list(args), str(new)), args)
+        with mock.patch.object(server, "DRAFT_COSTS_DEFAULT", True):   # Metal class
+            self.assertIn("--draft-costs", server.draft_costs_args({"model_name": "m"}, list(args), str(new)))
+            self.assertEqual(server.draft_costs_args({"model_name": "m", "draft_costs": False}, list(args), str(new)), args)
+
     def test_on_gives_a_file_in_the_redirected_folder(self):
         args = ["--native", "x", "--spec", "6"]
         got = server.draft_costs_args({"model_name": "qwen3.8-flash-next-iq3_s", "draft_costs": True}, list(args))
