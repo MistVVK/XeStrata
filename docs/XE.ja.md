@@ -250,7 +250,8 @@ upstream の Strata 0.1.43.1 から 0.1.44.1（`296b59d2`）までの変更を X
   GPU のランタイムの立ち上げで止まったエンジンの起動し直し、落ちたエンジンの終わり方の表示、Responses API の `reasoning_effort`、会話のキャッシュの画像の照合（#2228）、stdin の読み手の終了の競合。
 - 量子化の品質の物差し（`tools/quant_quality.py`、`tools/quant_formats.py`）。
 - `XESTRATA_HC_Q8`（ハイパーコネクションの down/up を Q8_0 で読む、BF16 の pack では読み込み時に Q8_0 にする）: 読み込み時に両方の形を測って速い方を使い、Q8_0 なら GPU 1 枚のときは BF16 の写しを VRAM から外します。AMD では次の射影のための q8_1 も読みの中で書きます（B70 で decode +3.5%。答えが変わる近似）。
-- opt-in のまま移したもの: `XESTRATA_MTP_PRIO`・`XESTRATA_COPY_PRIO`、`XESTRATA_POOL_UMWAIT`、`XESTRATA_PCIE_MIN1`、arena の `--adapt-async 1`、`XESTRATA_DENSE_F32`。
+- opt-in のまま移したもの: `XESTRATA_MTP_PRIO`、`XESTRATA_POOL_UMWAIT`、`XESTRATA_PCIE_MIN1`、arena の `--adapt-async 1`、`XESTRATA_DENSE_F32`。
+- コピーの stream の優先度（`XESTRATA_COPY_PRIO`）は、コピーのある最初の数窓で 2 つの優先度を交互に回し、窓の時間が短い方を選ぶ（`auto` が既定、`0` と `1` で固定）。
 
 この取り込みの間に XeStrata の側で直したもの:
 

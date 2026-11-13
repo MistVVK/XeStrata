@@ -259,8 +259,10 @@ The main ones:
 - `XESTRATA_HC_Q8` (the hyper-connection down/up read in Q8_0; a BF16 pack's quantized at load): both forms are timed
   at load and the faster kept; with Q8_0 on one GPU the BF16 copies leave the VRAM, and on AMD the read also writes
   the next projections' q8_1 (B70 decode +3.5%; an approximation that changes the output).
-- Ported and kept opt-in: `XESTRATA_MTP_PRIO` and `XESTRATA_COPY_PRIO`, `XESTRATA_POOL_UMWAIT`, `XESTRATA_PCIE_MIN1`, `--adapt-async 1` in the arena
-  mode, `XESTRATA_DENSE_F32`.
+- Ported and kept opt-in: `XESTRATA_MTP_PRIO`, `XESTRATA_POOL_UMWAIT`, `XESTRATA_PCIE_MIN1`, `--adapt-async 1` in the arena mode,
+  `XESTRATA_DENSE_F32`.
+- The copy stream's priority (`XESTRATA_COPY_PRIO`) runs the two priorities in turn over the first windows that have copies and keeps
+  the shorter window time (`auto` is the default; `0` and `1` fix it).
 
 Fixed on XeStrata's side during this integration:
 
