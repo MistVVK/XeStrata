@@ -63,6 +63,10 @@ FALLBACK_MODELS = {
               "families": ("qwen", "swift", "sc117", "sc117-swift")},
     "IQ1_M": {"about": "the Coder's only size: half the experts, stored like IQ3_S (3.5 bits)", "download_gb": 58.4,
               "ram_gb": 32, "arena_gb": 23.4, "families": ("coder",)},
+    "UD-IQ1_M": {"about": "~1-bit (Unsloth Dynamic v3.1), the smallest download; on a PC with less than ~59 GB of RAM "
+                          "part of its experts are read from the SSD",
+                 "download_gb": 68.0, "ram_gb": 48, "arena_gb": 34.8, "families": ("unsloth",), "budget": True,
+                 "vision": True},
     "UD-Q2_0": {"about": "2-bit (Unsloth Dynamic v3.1), experts a little larger than the GSQ-RCO IQ2_XS's; on a PC "
                          "with less than ~61 GB of RAM part of its experts are read from the SSD",
                 "download_gb": 70.5, "ram_gb": 48, "arena_gb": 37.4, "families": ("unsloth",), "budget": True,
@@ -129,7 +133,7 @@ FALLBACK_FAMILIES = {
                                              "authors' numbers)", "tag": "swift-"},
     "coder": {"title": "Qwen3.8-Flash-Next Coder", "about": "half the experts (code, tools, images kept): needs ~32 GB "
                                                             "of RAM, faster; weaker outside coding", "tag": "coder-"},
-    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "about": "2 to 4 bits (UD-Q2_0 to UD-Q4_K_XL, 71 to 111 GB "
+    "unsloth": {"title": "Qwen3.8-Flash-Next (Unsloth)", "about": "1 to 4 bits (UD-IQ1_M to UD-Q4_K_XL, 68 to 111 GB "
                                                                   "downloads) and 5 to 8 bits; with too little RAM "
                                                                   "part of the experts are read from the SSD",
                 "tag": "unsloth-", "vision": False},
@@ -301,7 +305,7 @@ def spawn_detached(cmd: list, cwd: Path, log_path: Path, env: dict | None = None
 def run_quiet(cmd, timeout=30) -> str:
     """A command's stdout ('' when it is missing or fails)."""
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
+        return subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=timeout,
                               stdin=subprocess.DEVNULL).stdout or ""
     except (OSError, subprocess.SubprocessError, ValueError):
         return ""
@@ -780,9 +784,11 @@ class Strata:
                         if d.get("mem_total"):          # a plain model: none of Flash-Next's budget or low-RAM modes
                             pass
                         elif d.get("budget"):
+                            # one label for every model (upstream a16f3fe39): all of its experts in RAM is "fits";
+                            # with less RAM a budget of them is kept and the rest read from the SSD, which runs
+                            # ("may run slower") - never "does not fit", whatever a RAM floor alone said
                             verdict = (("experimental: " if d.get("experimental") else "")
-                                       + "part of its experts in RAM, the rest read from the SSD"
-                                       if ram >= d["ram_gb"] else "does not fit")
+                                       + ("fits" if ram >= d["ram_gb"] else "may run slower"))
                         elif S and S.low_ram_needed(m, ram) and S.low_ram_fits(m, ram, vram):
                             verdict = "fits in the low-RAM mode (slower: the GPU holds part of the experts)"
                     except Exception:                   # noqa: BLE001

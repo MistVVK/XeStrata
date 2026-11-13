@@ -559,10 +559,11 @@ class Helpers(unittest.TestCase):
         self.assertEqual(list(S.CONTEXTS), M.FALLBACK_CONTEXTS)
 
     def test_unsloth_sizes(self):
-        """Dynamic v3.1's UD-Q2_0 to UD-IQ4_XS are regular sizes, listed first by size; UD-Q4_K_XL stays experimental,
-        and UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 (upstream 0.1.44, not run in XeStrata) follow by size, experimental too."""
+        """Dynamic v3.1's UD-IQ1_M to UD-IQ4_XS are regular sizes, listed first by size; UD-Q4_K_XL stays
+        experimental, and UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 (upstream 0.1.44, not run in XeStrata) follow by size,
+        experimental too."""
         s = M.Strata(HERE.parent)
-        regular = ["UD-Q2_0", "UD-IQ2_XS", "UD-Q2_K_XL", "UD-IQ3_XXS", "UD-Q3_K_XL", "UD-IQ4_XS"]
+        regular = ["UD-IQ1_M", "UD-Q2_0", "UD-IQ2_XS", "UD-Q2_K_XL", "UD-IQ3_XXS", "UD-Q3_K_XL", "UD-IQ4_XS"]
         for models in (s.tables()[0], M.FALLBACK_MODELS):
             self.assertEqual(s.sizes_of(models, "unsloth"),
                              [*regular, "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0"])
@@ -578,6 +579,11 @@ class Helpers(unittest.TestCase):
         self.assertEqual((by["UD-Q4_K_XL"]["experimental"], by["UD-Q4_K_XL"]["images"]), (True, True))   # #967
         self.assertFalse(by["UD-IQ4_XS"]["on_this_pc"].startswith("experimental"))
         self.assertTrue(by["UD-Q4_K_XL"]["on_this_pc"].startswith("experimental"))
+        self.assertEqual(by["UD-IQ4_XS"]["on_this_pc"], "fits")             # 63.7 GB of RAM, all of its experts
+        # a 32 GB card with 31 GB of RAM: 51 GB of weights beside 63 GB of memory - it runs, slower (upstream a16f3fe39)
+        fam = next(f for f in s.model_table({"ram_gb": 31.0, "gpus": [{"vram_gb": 32.0, "usable": True}]})
+                   if f["family"] == "unsloth")
+        self.assertEqual({x["model"]: x["on_this_pc"] for x in fam["sizes"]}["UD-IQ4_XS"], "may run slower")
 
     def test_recommendation_follows_ram(self):
         s = M.Strata(HERE.parent)

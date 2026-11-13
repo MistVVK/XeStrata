@@ -65,10 +65,14 @@ class RangeFile(io.RawIOBase):
 
 
 class Header(G.GGUFFile):
-    def __init__(self, name: str, fh):  # noqa: D107 (reuses GGUFFile's parser on any file-like)
+    def __init__(self, name: str, fh, size: int):  # noqa: D107 (reuses GGUFFile's parser on any file-like)
         self.path = pathlib.Path(name)
         self.metadata, self.tensors, self.version, self.alignment = {}, [], 0, 32
-        self._parse(fh)
+        self._size, self._pos = size, 0            # the parser's bounds checks need the whole file's size (#5075)
+        try:
+            self._parse(fh)
+        except ValueError as e:
+            raise ValueError(f"{self.path.name}: {e}") from None
 
 
 def hf_headers(repo: str, rev: str, d: str) -> list[Header]:
@@ -77,7 +81,7 @@ def hf_headers(repo: str, rev: str, d: str) -> list[Header]:
     for e in sorted(tree, key=lambda e: e["path"]):
         if e["type"] == "file" and e["path"].endswith(".gguf"):
             url = f"https://huggingface.co/{repo}/resolve/{rev}/{e['path']}"
-            out.append(Header(e["path"], RangeFile(url)))
+            out.append(Header(e["path"], RangeFile(url), int(e["size"])))
     return out
 
 
