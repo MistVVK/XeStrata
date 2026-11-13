@@ -111,6 +111,20 @@ class Engine:
         self.errf.close()
 
 
+def fresh_profile(cfg, args, tag):
+    """cfg "profile_src": a fresh copy of the expert profile per engine start (the engine may rewrite it), and the
+    args with the copy's path (upstream 13eedf552)."""
+    src = cfg.get("profile_src")
+    if not src or "--expert-profile" not in args:
+        return args
+    import shutil
+    dst = os.path.abspath(tag) + ".profile.bin"
+    shutil.copyfile(src, dst)
+    args = list(args)
+    args[args.index("--expert-profile") + 1] = dst
+    return args
+
+
 def scorer_args(cfg, total_tokens, extra):
     base, out, i = list(cfg["args"]), [], 0
     while i < len(base):
@@ -144,7 +158,7 @@ def cmd_gen(a):
         sel += [r for r in rows if r["kind"] == k][a.offset:a.offset + a.per_kind]
     if mem_available_gb() < a.min_free_gb:
         raise SystemExit("only %.0f GB available (< %d): not starting an engine" % (mem_available_gb(), a.min_free_gb))
-    eng = Engine(cfg, list(cfg["args"]), kv_env(a.env), a.out + ".engine.log")
+    eng = Engine(cfg, fresh_profile(cfg, list(cfg["args"]), a.out), kv_env(a.env), a.out + ".engine.log")
     items = []
     try:
         if not eng.ready():
@@ -193,6 +207,7 @@ def cmd_score(a):
         args = scorer_args(cfg, total, extra)
     if mem_available_gb() < a.min_free_gb:
         raise SystemExit("only %.0f GB available (< %d): not starting an engine" % (mem_available_gb(), a.min_free_gb))
+    args = fresh_profile(cfg, args, str(out))
     eng = Engine(cfg, args, env, str(out) + ".engine.log")
 
     def nlines():
