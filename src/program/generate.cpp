@@ -1050,11 +1050,13 @@ int on_rotational_disk(const std::string& path, std::string& dev) {
 #endif
 
 /// #463's A/B: XESTRATA_ADAPT_NOWAIT=1 lets a verify window start before the adaptive tier's copies have landed
-/// (0.1.37).  Auto (the default) is off: the wait the lag gives (core::adapt_lag) was the faster form on the RTX 4070
-/// and equal on the B70 (2026-10-20), and 1 is the form it replaced; 0 keeps the wait.
+/// (0.1.37).  Auto (the default) is on where the lag probe found the copies land within the window (its choice of 1:
+/// the wait costs it nothing), off where they do not (the RTX 4070, lag 2): not waiting then took 95.55 against 94.92
+/// tok/s on the B70 and 45.23 against 42.52 on the RX 9060 XT (32K, Qwen3.8, 2026-11-13).  0 and 1 fix it.
 bool adapt_nowait() {
-    static const bool v = [] { return strata::core::pick_from_env("ADAPT_NOWAIT") == strata::core::Pick::On; }();
-    return v;
+    static const strata::core::Pick p = strata::core::pick_from_env("ADAPT_NOWAIT");
+    if (p != strata::core::Pick::Auto) return p == strata::core::Pick::On;
+    return strata::core::adapt_lag_chosen() == 1;
 }
 
 /// --adapt-async: one background job at a time (the asynchronous adaptive tier's copies and memcpys).  `post` hands
