@@ -11405,6 +11405,42 @@ int main(int argc, char** argv) {
             }
             bool first_window = true;
             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
+            // XESTRATA_FOLLOW=<file> (token forcing, measurement only, off by default; tools/force_check.py): one line
+            // per request in the order the engine decodes them, comma-separated token ids (an empty line: that request
+            // is not forced).  The serial decode windows below take the line's tokens in place of the head's argmax, so
+            // drafts are accepted exactly when they equal the forced continuation, and XESTRATA_FOLLOW_LOGPOS=<file>
+            // gets one STRATA_LOGPOS row (FP32 head logits, XESTRATA_LOGPOS_TOPK) for every row whose logits are valid
+            // (each accepted row plus the one that follows).
+            static const std::vector<std::vector<int32_t>> fol_sets = [] {
+                std::vector<std::vector<int32_t>> v;
+                if (const char* f = strata::env_get("FOLLOW"); f != nullptr && f[0] != '\0') {
+                    std::ifstream in(f);
+                    std::string line;
+                    while (std::getline(in, line)) {
+                        std::vector<int32_t> ids;
+                        for (const char* q = line.c_str(); *q != '\0';) {
+                            if (*q >= '0' && *q <= '9') {
+                                ids.push_back((int32_t) std::atoi(q));
+                                while (*q >= '0' && *q <= '9') ++q;
+                            } else {
+                                ++q;
+                            }
+                        }
+                        v.push_back(std::move(ids));
+                    }
+                }
+                return v;
+            }();
+            static size_t fol_next = 0;
+            static std::FILE* const fol_lp = [] {
+                const char* p = strata::env_get("FOLLOW_LOGPOS");
+                return p != nullptr && p[0] != '\0' ? std::fopen(p, "ab") : nullptr;
+            }();
+            const std::vector<int32_t>* fol = nullptr;
+            if (!fol_sets.empty()) {
+                if (fol_next < fol_sets.size() && !fol_sets[fol_next].empty()) fol = &fol_sets[fol_next];
+                ++fol_next;
+            }
 #if defined(STRATA_USE_HIP)
             // on by default (HIP, where it was measured: 4 x R9700, Qwen3.8-Flash-Next IQ3_S, 0 of 16 continuations
             // fell back to the older checkpoint against 4 of 16 without it, #4677); XESTRATA_SERVE_STOP_BOUND=0 turns
@@ -12209,6 +12245,12 @@ int main(int argc, char** argv) {
                         if (f) std::fclose(f);
                     }
                 }
+                if (fol != nullptr) {   // XESTRATA_FOLLOW: the forced continuation stands in for the argmax
+                    for (int i = 0; i < T; ++i) {
+                        const int64_t fi = produced_n + i;   // row i answers continuation index produced_n + i
+                        if (fi >= 0 && fi < (int64_t) fol->size()) outv[(size_t) i] = (*fol)[(size_t) fi];
+                    }
+                }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
 #if defined(STRATA_USE_HIP)
@@ -12218,6 +12260,16 @@ int main(int argc, char** argv) {
                         return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     }) - 1;
 #endif
+                if (fol != nullptr && fol_lp != nullptr) {   // rows 0..a have valid logits (their inputs are accepted)
+                    std::vector<int32_t> fol_tg((size_t) a + 1, -1);
+                    for (int i = 0; i <= a; ++i) {
+                        const int64_t fi = produced_n + i;
+                        fol_tg[(size_t) i] = fi >= 0 && fi < (int64_t) fol->size() ? (*fol)[(size_t) fi] : -1;
+                    }
+                    std::string fe;
+                    if (!ver.window_logprobs(fol_tg.data(), a + 1, p, 248046, fol_lp, fe))
+                        std::fprintf(stderr, "xestrata serve: XESTRATA_FOLLOW_LOGPOS: %s\n", fe.c_str());
+                }
                 // the reply ends at its first stop token: the drafts after it (an accepted "\n<|endoftext|>" after
                 // <|im_end|>) stay out of the session, as plain's spec_step keeps them out.  In it they made the session
                 // end in tokens the next turn's prompt does not have ("<|im_end|>\n<|im_start|>"), and a recurrent
