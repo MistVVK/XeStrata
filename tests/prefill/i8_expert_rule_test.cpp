@@ -61,6 +61,52 @@ int main() {
     CHECK(!i8_expert_class_default(0, "gfx1031"));
     CHECK(!i8_expert_class_default(-1, "gfx1201"));
     CHECK(!i8_expert_class_default(-1, nullptr));
+    // a build without llama.cpp's MMQ: an unset switch reads as 1 on every card, a value the user set is kept; a build with MMQ is the table above
+    CHECK(i8_switch_effective(-1, true) == 1);
+    CHECK(i8_switch_effective(0, true) == 0);
+    CHECK(i8_switch_effective(1, true) == 1);
+    CHECK(i8_switch_effective(-1, false) == -1);
+    CHECK(i8_switch_effective(0, false) == 0);
+    CHECK(i8_switch_effective(1, false) == 1);
+    {
+        // state {unset, 0, 1} x build {with MMQ, without} x card {RDNA2 gfx1030, gfx1100, Strix gfx1151, R9700 gfx1201, an NVIDIA card}: takes at 4,096 entries, the formats covered
+        const char* const cards[] = {"gfx1030", "gfx1100", "gfx1151", "gfx1201:sramecc-:xnack-", nullptr, ""};
+        for (const char* gcn : cards) {
+            const bool rdna2 = gfx_arch_is_gfx103x_i8(gcn);
+            // with MMQ: unchanged (only RDNA2 by default)
+            CHECK(i8_expert_takes(i8_switch_effective(-1, false), gcn, 4096, true) == rdna2);
+            CHECK(!i8_expert_takes(i8_switch_effective(0, false), gcn, 4096, true));
+            CHECK(i8_expert_takes(i8_switch_effective(1, false), gcn, 4096, true));
+            // without MMQ: on by default everywhere, =0 the way back, =1 as before
+            CHECK(i8_expert_takes(i8_switch_effective(-1, true), gcn, 4096, true));
+            CHECK(!i8_expert_takes(i8_switch_effective(0, true), gcn, 4096, true));
+            CHECK(i8_expert_takes(i8_switch_effective(1, true), gcn, 4096, true));
+            // the size floor and the format check are the same in both builds
+            CHECK(!i8_expert_takes(i8_switch_effective(-1, true), gcn, 255, true));
+            CHECK(!i8_expert_takes(i8_switch_effective(-1, true), gcn, 4096, false));
+            // which reason the engine's start line gives
+            CHECK(i8_expert_class_default(-1, gcn, true));
+            CHECK(!i8_expert_class_default(1, gcn, true));
+            CHECK(!i8_expert_class_default(0, gcn, true));
+            CHECK(i8_expert_class_default(-1, gcn, false) == rdna2);
+            CHECK(i8_expert_class_default(-1, gcn) == rdna2);   // (the old two-argument form)
+        }
+    }
+    // the order of the paths for a layer of a chunk: the fused kernels, then the staged group entry, then int8, then FP16 (a column "fused covers this layer and is on" and one for the staged entry);
+    // the same for a switch left unset in a build without MMQ and for a user-set 1: the int8 kernels get only what nothing faster takes
+    for (const char* gcn : {"gfx1201", "gfx1151", "gfx1100", "", "gfx1030"}) {
+        for (int raw : {-1, 1}) {
+            CHECK(i8_expert_takes(i8_switch_effective(raw, true), gcn, 4096, true));      // the kernel itself would take the layer on every card
+            CHECK(!i8_layer_takes(raw, true, gcn, 4096, true, true, false));              // fused covers the layer and is on: not int8
+            CHECK(!i8_layer_takes(raw, true, gcn, 4096, true, false, true));              // a short chunk the staged group entry takes: not int8
+            CHECK(!i8_layer_takes(raw, true, gcn, 4096, true, true, true));
+            CHECK(i8_layer_takes(raw, true, gcn, 4096, true, false, false));              // what is left: int8
+            CHECK(!i8_layer_takes(raw, true, gcn, 4096, false, false, false));            // a format the kernel does not cover: FP16
+        }
+        CHECK(!i8_layer_takes(0, true, gcn, 4096, true, false, false));                   // the way back
+        CHECK(!i8_layer_takes(-1, false, gcn, 4096, true, true, false));                  // (with MMQ: fused first as well)
+        CHECK(i8_layer_takes(-1, false, gcn, 4096, true, false, false) == gfx_arch_is_gfx103x_i8(gcn));
+    }
     // the few-rows route: the limit (STRATA_I8_FEWROWS: not set = the class default, 0 = off, N = N rows per expert)
     CHECK(i8_fewrows_limit(nullptr, 10) == 10);
     CHECK(i8_fewrows_limit("", 8) == 8);

@@ -100,9 +100,12 @@ bool native_expert_i8_supported(const NativeExpertLayout& L) noexcept;
 /// device's shared memory still have to allow it (`native_expert_i8_supported`); groups under 256 entries keep the other path.
 /// Shared prompt code, no device work: a Metal build answers false.
 bool native_expert_i8_prompt(const NativeExpertLayout& L, int64_t group_entries) noexcept;
-/// OWN-I8: true when the answer above is "yes" because of the card class (STRATA_EXPERT_I8 not set), not because the variable names it; the engine's
+/// OWN-I8: true when the answer above is "yes" because of the card class or the build (STRATA_EXPERT_I8 not set), not because the variable names it; the engine's
 /// start line differs.  A Metal build answers false.
 bool native_expert_i8_by_default() noexcept;
+/// OWN-I8: called once, before main, by a build without llama.cpp's MMQ (prefill.cpp, STRATA_PF_OWN_ONLY): an unset STRATA_EXPERT_I8 then reads as 1 (i8_expert_rule.hpp,
+/// i8_switch_effective); a build with MMQ never calls it.  A Metal build ignores it.
+void native_expert_i8_set_mmq_free() noexcept;
 /// OWN-I8, the few-rows route (include/strata/kernels/i8_expert_rule.hpp): the average routed rows per expert under which a prompt layer that takes the int8 kernels
 /// runs on the grouped kernels instead; 0 = no route (STRATA_I8_FEWROWS=0, or the int8 kernels are off).  The class default: 6 on a Tesla P100, 7 elsewhere.
 /// Shared prompt code, no device work for a build that has none: a Metal build answers 0.
