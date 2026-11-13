@@ -5721,7 +5721,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // The staging is the resident groups' (STAGE_GRP slots held until the group's launch).  Not (in a build with MMQ) with a layer the CPU share took experts of (share_own_rule.hpp), nor with a peer,
                         // STRATA_MMQ_DIRECT / _WS, the WMMA tiles, STRATA_PF_GROUP_SCRATCH, NVFP4 tails, Hadamard-folded or nibble layers.
                         const bool fz_staged = !stream_all && strata::prefill::staged_entry_layer(use_mmq, fused_only, staged_fo_on()) && lay.native && !fused_l && !wmma_l && !had_gu && !had_d && share_keeps_own_kernels(rows_cpu) &&
-                                               on_peer.empty() && !m.pp && m.group_cap == 0 && !lay.fmt[(size_t) l].tail_off && ws::mode() == 0 &&
+                                               on_peer.empty() && !m.pp && m.group_cap == 0 && (!lay.fmt[(size_t) l].tail_off || fused::native_supported(mmq_gt, mmq_dt)) && ws::mode() == 0 &&   // (an NVFP4 tail: only where the fused kernels take the pair - they apply s_gate / s_up / s_down inside, so the entry needs no row_sd)
                                                !(m.cache && mmq_plan().direct[(size_t) l]) && staged_group_gather() && staged_group_entry_on() &&
                                                MMQ_GROUP <= mmq::kGatherGroupMax && MMQ_GROUP <= fused::kMaxBatch &&
 #if STRATA_EXPERT_NIBBLE_BUILT
@@ -6835,7 +6835,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const int64_t r0c = cpu_at;
                         cudaMemcpyAsync(m.Dm + (size_t) r0c * N, m.cpu_rows, (size_t) rows_cpu * N * sizeof(float),
                                         cudaMemcpyHostToDevice, m.cs);
-                        if (use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off)
+                        if (use_mmq && !fused_l && !fz_staged_l && lay.native && lay.fmt[(size_t) l].tail_off)
                             cudaMemcpyAsync(m.row_sd + r0c, m.cpu_ones, (size_t) rows_cpu * sizeof(float),
                                             cudaMemcpyHostToDevice, m.cs);
                         stats_.experts_cpu += n_cpu;
@@ -6861,7 +6861,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         moe_combine16(reinterpret_cast<const uint16_t*>(m.Dm), m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs);
                     else
                         moe_combine(m.Dm, m.slot_dev, m.w, m.shared, m.sg, m.bo, T, m.cs,
-                                    use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr);
+                                    use_mmq && !fused_l && !fz_staged_l && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr);   // (fz_staged_l: the fused kernels applied s_down already)
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
                         cudaStreamSynchronize(m.cs);
