@@ -1859,7 +1859,7 @@ const MmqPlan& mmq_plan() {
             }
         }
 #if defined(STRATA_PF_OWN_ONLY)
-        if (layers > 0) {   // [DRAFT] wording: the owner's to word.  One line per process (the plan is made once): the layer counts per path, from the rule functions that pick the path.
+        if (layers > 0) {   // The owner approved this wording (11-13).  One line per process (the plan is made once): the layer counts per path, from the rule functions that pick the path.
             const bool peer_off = strata::core::peer_portable();            // the walk's own condition (no_peer): the fused kernels stay off with a peer device
             const bool entry_on = staged_fo_on();                           // the staged group entry for a fused-only layer below the floor (staged_fo_rule.hpp)
             strata::prefill::OwnOnlySplit big, small;                       // at or above the long-prompt floor, below it

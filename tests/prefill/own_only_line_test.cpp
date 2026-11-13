@@ -17,24 +17,24 @@ int main() {
         OwnOnlySplit big; big.fused = 48;
         OwnOnlySplit small; small.staged = 48;
         CHECK_LINE(own_only_line(48, 1024, big, small, false),
-                   "strata: [DRAFT] prompt kernels: chunks of 1024 tokens or more run 48 of 48 layers on the fused kernels; shorter chunks run 48 on the staged fused entry.");
+                   "strata: prompt kernels: chunks of 1024 tokens or more run 48 of 48 layers on the fused kernels; shorter chunks run 48 on the staged fused entry.");
     }
     // an IQ pack no fused kernel covers: every layer on the int8 kernels at every size -> one clause
     {
         OwnOnlySplit s; s.i8 = 48;
-        CHECK_LINE(own_only_line(48, 1024, s, s, false), "strata: [DRAFT] prompt kernels: every chunk runs 48 of 48 layers on the int8 kernels.");
+        CHECK_LINE(own_only_line(48, 1024, s, s, false), "strata: prompt kernels: every chunk runs 48 of 48 layers on the int8 kernels.");
     }
     // mixed: 20 fused / 28 int8 at the floor and above, the staged entry for the 20 below it
     {
         OwnOnlySplit big; big.fused = 20; big.i8 = 28;
         OwnOnlySplit small; small.staged = 20; small.i8 = 28;
         CHECK_LINE(own_only_line(48, 1024, big, small, false),
-                   "strata: [DRAFT] prompt kernels: chunks of 1024 tokens or more run 20 of 48 layers on the fused kernels and 28 on the int8 kernels; "
+                   "strata: prompt kernels: chunks of 1024 tokens or more run 20 of 48 layers on the fused kernels and 28 on the int8 kernels; "
                    "shorter chunks run 20 on the staged fused entry and 28 on the int8 kernels.");
         // the same card without the staged entry: the fused layers of a short chunk take the int8 kernels
         OwnOnlySplit small2; small2.i8 = 48;
         CHECK_LINE(own_only_line(48, 1024, big, small2, false),
-                   "strata: [DRAFT] prompt kernels: chunks of 1024 tokens or more run 20 of 48 layers on the fused kernels and 28 on the int8 kernels; "
+                   "strata: prompt kernels: chunks of 1024 tokens or more run 20 of 48 layers on the fused kernels and 28 on the int8 kernels; "
                    "shorter chunks run 48 on the int8 kernels.");
     }
     // FP16 above 0: a further part
@@ -42,37 +42,37 @@ int main() {
         OwnOnlySplit big; big.fused = 20; big.i8 = 25; big.fp16 = 3;
         OwnOnlySplit small; small.staged = 20; small.i8 = 25; small.fp16 = 3;
         CHECK_LINE(own_only_line(48, 1024, big, small, false),
-                   "strata: [DRAFT] prompt kernels: chunks of 1024 tokens or more run 20 of 48 layers on the fused kernels, 25 on the int8 kernels and 3 on the FP16 path; "
+                   "strata: prompt kernels: chunks of 1024 tokens or more run 20 of 48 layers on the fused kernels, 25 on the int8 kernels and 3 on the FP16 path; "
                    "shorter chunks run 20 on the staged fused entry, 25 on the int8 kernels and 3 on the FP16 path.");
         OwnOnlySplit all; all.fp16 = 48;
-        CHECK_LINE(own_only_line(48, 1024, all, all, false), "strata: [DRAFT] prompt kernels: every chunk runs 48 of 48 layers on the FP16 path.");
+        CHECK_LINE(own_only_line(48, 1024, all, all, false), "strata: prompt kernels: every chunk runs 48 of 48 layers on the FP16 path.");
     }
     // --peer-device: the clause, the counts as they then are
     {
         OwnOnlySplit s; s.i8 = 40; s.fp16 = 8;
         CHECK_LINE(own_only_line(48, 1024, s, s, true),
-                   "strata: [DRAFT] prompt kernels: every chunk runs 40 of 48 layers on the int8 kernels and 8 on the FP16 path (--peer-device: the fused kernels are off).");
+                   "strata: prompt kernels: every chunk runs 40 of 48 layers on the int8 kernels and 8 on the FP16 path (--peer-device: the fused kernels are off).");
     }
     // the Tesla P100 in a build without MMQ (no fused kernels; the int8 default under the chunk limit, the FP16 path from it): the stream floor is the limit: FP16 from it up
     {
         OwnOnlySplit big; big.fp16 = 48;
         OwnOnlySplit small; small.i8 = 48;
         CHECK_LINE(own_only_line(48, 1024, big, small, false),
-                   "strata: [DRAFT] prompt kernels: chunks of 1024 tokens or more run 48 of 48 layers on the FP16 path; shorter chunks run 48 on the int8 kernels.");
+                   "strata: prompt kernels: chunks of 1024 tokens or more run 48 of 48 layers on the FP16 path; shorter chunks run 48 on the int8 kernels.");
     }
     // the counts of own_only_count_layer: 48 Hadamard-folded fused-only layers (Gyro-S): the staged entry and the int8 kernels read no folded layer, so below the floor they are on the FP16 path
     {
         OwnOnlySplit big, small;
         for (int l = 0; l < 48; ++l) strata::prefill::own_only_count_layer(big, small, true, false, false, true, false);
         CHECK_LINE(own_only_line(48, 1024, big, small, false),
-                   "strata: [DRAFT] prompt kernels: chunks of 1024 tokens or more run 48 of 48 layers on the fused kernels; shorter chunks run 48 on the FP16 path.");
+                   "strata: prompt kernels: chunks of 1024 tokens or more run 48 of 48 layers on the fused kernels; shorter chunks run 48 on the FP16 path.");
     }
     // the same layers unfolded: the staged entry takes them (the line as before the change)
     {
         OwnOnlySplit big, small;
         for (int l = 0; l < 48; ++l) strata::prefill::own_only_count_layer(big, small, true, false, false, true, true);
         CHECK_LINE(own_only_line(48, 1024, big, small, false),
-                   "strata: [DRAFT] prompt kernels: chunks of 1024 tokens or more run 48 of 48 layers on the fused kernels; shorter chunks run 48 on the staged fused entry.");
+                   "strata: prompt kernels: chunks of 1024 tokens or more run 48 of 48 layers on the fused kernels; shorter chunks run 48 on the staged fused entry.");
     }
     // a mix: 40 folded and 8 unfolded fused-only layers; and an int8 layer and a gated class keep their counts
     {
@@ -80,7 +80,7 @@ int main() {
         for (int l = 0; l < 40; ++l) strata::prefill::own_only_count_layer(big, small, true, false, false, true, false);
         for (int l = 0; l < 8; ++l) strata::prefill::own_only_count_layer(big, small, true, false, false, true, true);
         CHECK_LINE(own_only_line(48, 1024, big, small, false),
-                   "strata: [DRAFT] prompt kernels: chunks of 1024 tokens or more run 48 of 48 layers on the fused kernels; shorter chunks run 8 on the staged fused entry and 40 on the FP16 path.");
+                   "strata: prompt kernels: chunks of 1024 tokens or more run 48 of 48 layers on the fused kernels; shorter chunks run 8 on the staged fused entry and 40 on the FP16 path.");
         OwnOnlySplit b2, s2;
         strata::prefill::own_only_count_layer(b2, s2, false, true, true, true, true);   // an int8 layer on a gated class: FP16 in the long class, int8 below
         if (!(b2.fp16 == 1 && s2.i8 == 1 && b2.i8 == 0)) { std::fprintf(stderr, "FAIL %s:%d: gated int8 layer\n", __FILE__, __LINE__); ++failed; }
