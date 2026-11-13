@@ -188,7 +188,8 @@ inline int adapt_lag(int windows = 2) {
     const int forced = adapt_lag_forced();
     if (forced > 0) return forced;
     const int chosen = adapt_lag_chosen();
-    return chosen > 0 ? chosen : windows;
+    if (chosen > 0) return chosen;
+    return adapt_lag_forming() == 1 ? 1 : windows;   // the trial: the next window waits, and its cost is measured
 }
 
 /// The adaptive tier's period when --adapt-every is not given, for both engines (generate.cpp, PlainModel): chosen once,

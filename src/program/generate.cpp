@@ -13439,6 +13439,9 @@ int main(int argc, char** argv) {
         if (drive.d.pcie_num > 256) drive.d.pcie_num = 256;
         strata::core::PcieSplitTimes pcie_split;   // the measured split
         setup_pcie_split(drive.d, g.n_layers, o, pcie_given, !split_devs.empty(), ver.fetch_branch(), pcie_split);
+        // what a swapped-in expert costs on the CPU against the GPU (the split probe's times): what a window the lag
+        // keeps it on the CPU costs (auto_pick.hpp's ADAPT_LAG); 0.04 ms when the probe could not run
+        const double per_expert_ms = pcie_split.c > 0.0 ? std::max(0.0, (pcie_split.c - pcie_split.q) * 1000.0) : 0.04;
         pcie_move_if_pays(drive.d, ver.fetch_branch(), prefill.stats(), host_res, o.spec);
         const int64_t pcie0 = drive.d.pcie_experts;
         if (o.adapt_every > 0 && o.adapt_swaps > 0) drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
@@ -13706,12 +13709,20 @@ int main(int argc, char** argv) {
             drive.d.failed = false;
             // #463: the previous adapt round's copies land first - with a non-blocking query, whether a swapped-in
             // expert ran on the GPU or the CPU (they round differently) depended on the copy's timing
-            // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B)
-            // the first window of a round whose swaps are still to be applied: with the lag it computes the
-            // swapped-in expert on the CPU, without it waits for the copy and computes it on the GPU
-            const bool swap_waited = !pending.empty() && pending_age == 0;
-            if (adapt_nowait()) apply_pending(false);
-            else if (pending.empty() || ++pending_age >= adapt_lag()) apply_pending(true);
+            // (STRATA_ADAPT_NOWAIT=1: 0.1.37's non-blocking query, the A/B).  XESTRATA_ADAPT_LAG=auto measures what a
+            // round's lag costs: the wait the window took for the copies, or the swapped experts' CPU work over the
+            // windows a swap waited.
+            if (adapt_nowait()) {
+                apply_pending(false);
+            } else if (!pending.empty() && ++pending_age >= adapt_lag()) {
+                const int lag_now = adapt_lag();
+                const size_t n_swaps = pending.size();
+                const auto lag0 = Clock::now();
+                apply_pending(true);
+                const double wait_ms = std::chrono::duration<double, std::milli>(Clock::now() - lag0).count();
+                strata::core::adapt_lag_window(wait_ms + (lag_now > 1 ? (double) (lag_now - 1) * (double) n_swaps *
+                                                                           per_expert_ms : 0.0));
+            }
             if (!ver.run(T, window.data(), p, &drive_pool_multi, &drive, outv.data(), err)) {
                 std::fprintf(stderr, "xestrata generate: %s\n", err.c_str());
                 return 1;
@@ -13840,10 +13851,8 @@ int main(int argc, char** argv) {
             const bool timed = timed_round && !ver.captured_last();
             if (timed && chain_n == 0) policy.observe(from_sfx, T, a, sfx_match, round_ms);
             else if (timed) policy.observe_chain(T_mtp, chain_n, a, cm, round_ms);
-            if (timed) {   // the switches the windows choose (auto_pick.hpp)
-                strata::core::adapt_lag_window(round_ms, T, swap_waited);
+            if (timed)   // the switch the windows choose (auto_pick.hpp)
                 strata::core::disjoint_adapt_window(round_ms, T, drive.d.remote_count > 0);
-            }
             if (rounds % 64 == 0)
                 std::fprintf(stderr, "xestrata generate: position %lld, %lld tokens, %lld rounds\n", (long long) p,
                              (long long) produced.size(), (long long) rounds);

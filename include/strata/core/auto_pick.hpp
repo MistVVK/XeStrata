@@ -102,13 +102,15 @@ private:
 /// rule that decides whether a window is cut at a swap (ADAPT_CUT).
 bool adapt_layers_round_alike();
 
-/// ADAPT_LAG=auto: the value the first windows chose (1: the next window waits for the copies, 0: not yet, the
+/// ADAPT_LAG=auto: the value the first rounds chose (1: the next window waits for the copies, 0: not yet, the
 /// engine's own default stays).  XESTRATA_ADAPT_LAG=<n> fixes it.
 int adapt_lag_forced();
 int adapt_lag_chosen();
-/// A decode window's time, `tokens` rows, `first` on the first window of a round whose swaps are still to be
-/// applied (the window the lag decides the cost of).
-void adapt_lag_window(double ms, int64_t tokens, bool first);
+/// The form the trial is in for the next window (1: the next window waits; 0: not measuring).
+int adapt_lag_forming();
+/// What a round's lag cost it: the wait the window took for the copies (lag 1), or the swapped experts' CPU work over
+/// the windows a swap waited (lag > 1).  One a round, at the window that applies the swap.
+void adapt_lag_window(double cost_ms);
 
 /// DISJOINT_ADAPT=auto: whether a helper GPU's experts stay out of the primary's promotion candidates, chosen by the
 /// first windows of a run whose helpers hold experts.  XESTRATA_DISJOINT_ADAPT=0/1 fixes it.

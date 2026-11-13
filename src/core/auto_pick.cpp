@@ -17,8 +17,8 @@ namespace {
 // A round of the adaptive tier's swaps is due every `adapt_period` tokens, and its copies land over the windows that
 // follow: only a window with one of them waiting can tell the two forms apart, and only those are counted.
 WindowChoice& lag_choice() {
-    static WindowChoice c("xestrata adaptive tier", "ADAPT_LAG", "the previous round's swaps taken by the next window",
-                          8, 3, 1.03, "a token");
+    static WindowChoice c("xestrata adaptive tier", "ADAPT_LAG",
+                          "the previous round's swaps taken by the next window", 8, 2, 1.03, "a round");
     return c;
 }
 WindowChoice& disjoint_choice() {
@@ -69,9 +69,14 @@ int adapt_lag_chosen() {
     return lag_level.load(std::memory_order_relaxed);
 }
 
-void adapt_lag_window(double ms, int64_t tokens, bool first) {
-    if (!first || adapt_lag_forced() > 0 || !adapt_layers_round_alike() || !lag_choice().choosing()) return;
-    lag_choice().took(ms, tokens);
+int adapt_lag_forming() {
+    if (adapt_lag_forced() > 0 || !adapt_layers_round_alike() || !lag_choice().choosing()) return 0;
+    return lag_choice().on() ? 1 : 0;
+}
+
+void adapt_lag_window(double cost_ms) {
+    if (adapt_lag_forced() > 0 || !adapt_layers_round_alike() || !lag_choice().choosing()) return;
+    lag_choice().took(cost_ms, 1);
     lag_level.store(lag_choice().choosing() ? 0 : (lag_choice().on() ? 1 : 0), std::memory_order_relaxed);
 }
 
