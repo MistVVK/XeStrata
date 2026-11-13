@@ -777,6 +777,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     res_graph_ = !always_publish_ && hits.h_res != nullptr && hits.d_res != nullptr && MoeWindow::resident_graph_on();
     if (!win_.device_plans()) { device_plan_ = false; res_graph_ = false; }
+    // a latent pack keeps the host plan: the plan's activation-row rewrite reads the doorbell's mapped ids, which
+    // the resident / device-plan graphs do not write (EDGE design §4.4; their speed is a later measurement)
+    if (win_.latent()) { device_plan_ = false; res_graph_ = false; }
     std::fprintf(stderr, "xestrata verify: window up to %d tokens, %.1f MiB of device buffers\n", max_t,
                  (double) count.used / 1048576.0);
     return true;
@@ -1361,6 +1364,12 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
         }
         stamp(l, 16, grp);
         gr_read_group(1, true, inj_, inj2_);
+        // the latent MoE's D stage (Edge0): the whole window's rows through D before the router, so the pool's
+        // expert work has the router + plan + doorbell stretch of head start (the pool waits on the D doorbell)
+        if (win_.latent() && grp == 0) {
+            const int n_all = te_[G - 1] - tb_[0];
+            win_.latent_d_stage(l, tb_[0], n_all, mixed_ + (size_t) tb_[0] * N, cs);
+        }
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
         const WeightRef* w_router = v.get("ffn_gate_inp.weight");
