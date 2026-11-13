@@ -1934,14 +1934,16 @@ const MmqPlan& mmq_plan() {
             for (int64_t l = 0; l < layers; ++l) {
                 const bool fo = p.fo[(size_t) l] != 0 && !peer_off;
                 bool i8 = false;                                            // the int8 expert kernels take this layer's formats (the class rule or STRATA_EXPERT_I8, i8_wants_identity's test)
-                bool unfolded = true;                                       // no Hadamard fold and no tail: the staged entry and the int8 kernels read neither (fz_staged / i8_l: !had_gu && !had_d && !tail_off)
+                bool unfolded = true;                                       // no Hadamard fold and no tail: the int8 kernels read neither (i8_l: !had_gu && !had_d && !tail_off)
+                bool staged_ok = true;                                      // the staged entry: no fold; a tail only where the fused kernels take the pair (fz_staged: they apply the tail's scales inside)
                 if (lay.native) {
                     const auto& f = lay.fmt[(size_t) l];
                     unfolded = !f.tail_off && !f.had_gu && !f.had_d;
+                    staged_ok = !f.had_gu && !f.had_d && (!f.tail_off || fo);
                     if (unfolded)
                         i8 = strata::kernels::native_expert_i8_prompt(strata::kernels::native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff), (int64_t) 1 << 20);
                 }
-                strata::prefill::own_only_count_layer(big, small, fo, i8, i8_gated, entry_on, unfolded);
+                strata::prefill::own_only_count_layer(big, small, fo, i8, i8_gated, entry_on, staged_ok);
             }
             std::fprintf(stderr, "%s\n", strata::prefill::own_only_line(layers, stream_all_min(), big, small, peer_off).c_str());
             std::string sw;
