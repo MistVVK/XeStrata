@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """A request whose consumer stops early sends the engine STOP from StrataEngine.generate's `finally`.  When the engine
 is being ended or restarted on another thread at that moment, its stdin can already be closed (close() closes it
 before it clears `proc`) or `proc` can already be None.  The stop path must not raise in any of these states: the
