@@ -18,12 +18,12 @@ namespace {
 // follow: only a window with one of them waiting can tell the two forms apart, and only those are counted.
 WindowChoice& lag_choice() {
     static WindowChoice c("xestrata adaptive tier", "ADAPT_LAG", "the previous round's swaps taken by the next window",
-                          4, 2, 1.03, "a token");
+                          8, 3, 1.03, "a token");
     return c;
 }
 WindowChoice& disjoint_choice() {
     static WindowChoice c("xestrata adaptive tier", "DISJOINT_ADAPT",
-                          "a helper GPU's experts left out of the primary's candidates", 4, 2, 1.03, "a token");
+                          "a helper GPU's experts left out of the primary's candidates", 8, 3, 1.03, "a token");
     return c;
 }
 // The windows run on the decode loop's thread; the adaptive round that reads these may run on its own (--adapt-async,
