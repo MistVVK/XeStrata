@@ -440,6 +440,20 @@ inline bool trellis_gfx12_all_fused() {
     return false;
 #endif
 }
+// The same layer set on a CUDA card (a build without MMQ, STRATA_PF_OWN_ONLY, not HIP): a native pack whose every layer is a trellis pair (Gyro-S TQK6 / TQK7) that the fused kernels take (layers_all_fused_only()).
+// No card query here: on CUDA fused::native_supported takes the trellis pair only where the kernels are set up (the sm_86 class, compute capability 8.0 / 8.6 / 8.9, with 80 or more SMs by default; any
+// sm_80+ card with STRATA_PF_FUSED_TQ=1; none with STRATA_PF_FUSED=0 or _TQ=0), so the floor is lowered exactly where those kernels run.  False in a build with MMQ, on HIP, and without a loaded layout.
+inline bool trellis_cuda_all_fused() {
+#if defined(STRATA_PF_OWN_ONLY) && !defined(STRATA_USE_HIP)
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native || lay.fmt.empty()) return false;
+    for (const auto& f : lay.fmt)
+        if (f.gu_type < (int) strata::quant::Type::TQ2_T || f.gu_type > (int) strata::quant::Type::TQP7) return false;   // not a trellis gate/up
+    return layers_all_fused_only();
+#else
+    return false;
+#endif
+}
 // The floor without STRATA_PREFILL_STREAM_MIN and the CPU share: stream_floor_rule.hpp's answer, decided once when the expert layout is known (a call before that gets the default and is not cached).
 inline int64_t default_stream_floor() {
     static std::atomic<int64_t> cached{-1};
@@ -449,7 +463,7 @@ inline int64_t default_stream_floor() {
     const bool plain = plain_pack_all_fused();   // a build without MMQ and a non-native pack on the fused kernels: no staged entry or int8 path exists for its layout (stream_floor_rule.hpp)
     if ((!lay.native || lay.fmt.empty()) && !plain) return strata::prefill::kStreamFloorDefault;
     const bool cls = !plain && stream_floor_class_measured();
-    const int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only(), staged_fo_on(), plain, trellis_gfx12_all_fused());
+    const int64_t v = strata::prefill::stream_floor_default(cls, cls && layers_all_fused_only(), staged_fo_on(), plain, trellis_gfx12_all_fused(), trellis_cuda_all_fused());
     cached.store(v, std::memory_order_release);
     if (v != strata::prefill::kStreamFloorDefault)
         std::fprintf(stderr, "prefill: prompt pieces of %lld tokens or more read on the fused kernels, as long prompts do. STRATA_PREFILL_STREAM_MIN=1024 keeps the old rule.\n", (long long) v);
