@@ -170,8 +170,15 @@ int main() {
     cudaStream_t s = nullptr;
     ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
     gr_post(s);
-    // the engine's own rule for the batched PLE post-ops (prefill.cpp ple_batch_enabled): off for a CUDA 12.8 build on a 12.0 card unless STRATA_PLE_BATCH says otherwise
-    if (strata::ple_batch_resolve(std::getenv("STRATA_PLE_BATCH"), CUDART_VERSION, false, prop.major, prop.minor))
+    // the engine's own rule for the batched PLE post-ops (prefill.cpp ple_batch_enabled, same toolkit arguments): off for a CUDA 12.8 build on a 12.0 card unless STRATA_PLE_BATCH says otherwise
+#if defined(CUDART_VERSION) && !defined(STRATA_USE_HIP) && !defined(__HIPCC__)
+    constexpr int kRt = CUDART_VERSION;
+    constexpr bool kHip = false;
+#else
+    constexpr int kRt = 0;      // a HIP build has no CUDA toolkit version: the engine passes 0 and hip = true
+    constexpr bool kHip = true;
+#endif
+    if (strata::ple_batch_resolve(std::getenv("STRATA_PLE_BATCH"), kRt, kHip, prop.major, prop.minor))
         ple(s);
     else
         std::printf("SKIP native_ple_postops_batch_snap: built with CUDA 12.8 for RTX 50: the batched PLE post-ops are switched off in this build "
