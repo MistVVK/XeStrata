@@ -157,6 +157,54 @@ void MtpDrafter::release() {
     new (this) MtpDrafter();
 }
 
+void MtpDrafter::release_weights(bool keep_head) {
+    if (dense_ == nullptr) return;
+    const OnDevice on_device(device_);
+    if (cs_) strata::gpu::stream_sync(cs_);
+    if (side_) strata::gpu::stream_sync(side_);
+    for (strata::gpu::Graph** arr : {prefill_exec_, prefill_dev_exec_, round_exec_, step_exec_, round_exec_c_, step_exec_c_})
+        for (int i = 0; i < 9; ++i)
+            if (arr[i]) { strata::gpu::graph_destroy(arr[i]); arr[i] = nullptr; }
+    auto drop = [](auto*& p) {
+        if (p) strata::gpu::free(p);
+        p = nullptr;
+    };
+    drop(pf_dev_);
+    drop(pf_host_);
+    drop(cparams_);
+    drop(cring_);
+    drop(dinv_);
+    drop(cscratch_);
+    drop(h_cparams_);
+    drop(h_chist_);
+    drop(h_force_);
+    drop(arena_);
+    drop(head_logits_);
+    if (owns_weights_) {
+        drop(dense_);
+        drop(experts_);
+    }
+    dense_ = nullptr;
+    experts_ = nullptr;
+    drop(h_tok_);
+    drop(h_step_);
+    drop(h_pos_);
+    drop(h_row_);
+    drop(h_out_);
+    drop(h_prob_);
+    if (pf_ev_) { strata::gpu::event_destroy(pf_ev_); pf_ev_ = nullptr; }
+    if (ev_chain_) { strata::gpu::event_destroy(ev_chain_); ev_chain_ = nullptr; }
+    for (strata::gpu::Event*& e : ev_step_)
+        if (e) { strata::gpu::event_destroy(e); e = nullptr; }
+    int2_.reset();
+    if (!keep_head) {
+        subset_.reset();
+        dhead_ = nullptr;
+        dvocab_ = nullptr;
+    }
+    tensors_.clear();
+}
+
 const float* MtpDrafter::f32(const char* name) const {
     for (const auto& t : tensors_) if (t.name == name && t.kind == "f32") return (const float*) (dense_ + t.off);
     return nullptr;

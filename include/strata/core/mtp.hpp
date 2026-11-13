@@ -47,6 +47,12 @@ public:
     /// Everything given back (VRAM, the host staging, the streams and graphs): the engine's start measured that no
     /// drafter or DFlash2 decodes faster.  The drafter is as a new one after this (unloaded).
     void release();
+    /// The layer's weights, its draft head (unless `keep_head`: DFlash2 reads the same gathered rows), its buffers,
+    /// graphs and host staging given back, its K/V kept: a parked or saved conversation carries the draft layer's
+    /// K/V (conversation_snapshot_*, conversation_kv_*), so the engine keeps that part when the start's measurement
+    /// chose DFlash2 or no drafter.  Nothing drafts or reads a prompt with it after this; kv_state() and kv_restore()
+    /// still work.
+    void release_weights(bool keep_head);
     bool loaded() const { return dense_ != nullptr; }
     MtpDrafter(const MtpDrafter&) = delete;
     MtpDrafter& operator=(const MtpDrafter&) = delete;

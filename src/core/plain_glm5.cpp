@@ -214,6 +214,7 @@ bool PlainModel::load_glm5(std::string& err) {
     if (n_dsa == 0) { err = "plain model: the model has no DSA block"; return false; }
     if (has_mtp_) {   // a DSA block of its own caches, after the trunk's
         const std::string p = "blk." + std::to_string(s.n_layer) + ".nextn.";
+        mtp_allocs_[0] = allocs_.size();   // the layer's own weights (release_mtp)
         gmtp_.kda = false;
         gmtp_.idx = n_dsa++;
         if (!load_gblock(m, s.n_layer, gmtp_, err, true) || !upload(m, p + "eh_proj.weight", mtp_eh_, err) ||
@@ -226,6 +227,7 @@ bool PlainModel::load_glm5(std::string& err) {
             err = "plain model: the MTP layer's eh_proj has another shape or type";
             return false;
         }
+        mtp_allocs_[1] = allocs_.size();
     }
 
     if (!tune_uploaded(err)) return false;

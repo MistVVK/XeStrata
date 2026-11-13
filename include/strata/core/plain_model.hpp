@@ -479,6 +479,11 @@ public:
                          std::string& err);
     /// The taps off after load (DFlash2 released): neither the windows nor the prompt write them.
     void taps_off();
+    /// The MTP layer given back after the start's measurement chose DFlash2 or no drafter: its own weights (the
+    /// allocations its load made), graphs and the drafts' 2-bit head, and its token subset unless `keep_head`
+    /// (DFlash2 reads it).  Its K/V pool and its experts' places stay (a saved state and the tier's layout hold them).
+    /// The VRAM given back.
+    uint64_t release_mtp(bool keep_head);
     /// The most drafts a window can check (spec_step's `ext`): the recurrent states' copies, else a window less one
     int window_drafts() const {
         const PlainModel& t = tail();
@@ -1176,6 +1181,7 @@ private:
     std::function<bool(const float*, int64_t, int64_t, std::string&)> prompt_taps_;
     int n_snap_load_ = -1;             ///< the copies the load made (set_window_drafts frees only those after them)
     int n_mtp_load_ = -1;              ///< the MTP layer's drafts the load set (set_mtp_drafts goes no higher)
+    size_t mtp_allocs_[2] = {0, 0};    ///< allocs_[0] .. [1]: the MTP layer's own weights (release_mtp)
     bool frozen_ = false;              ///< set_frozen (the root's)
     std::vector<std::vector<float*>> gdn_snap_, conv_snap_;
     /// --pipeline-windows 2, a stage before the last: the rows' copies of the window before a guess and the state that

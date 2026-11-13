@@ -825,6 +825,7 @@ bool PlainModel::load_qwen(std::string& err) {
     }
     if (has_mtp_) {
         const std::string p = "blk." + std::to_string(s.n_layer) + ".nextn.";
+        mtp_allocs_[0] = allocs_.size();   // the layer's own weights (release_mtp)
         mtp_.attn = n_attn++;
         if (!load_block(m, s.n_layer, mtp_, err) || !upload(m, p + "eh_proj.weight", mtp_eh_, err) ||
             !upload_f32(m, p + "enorm.weight", N, mtp_enorm_, err) ||
@@ -838,6 +839,7 @@ bool PlainModel::load_qwen(std::string& err) {
         if (m.find(p + "shared_head_norm.weight") != nullptr &&
             !upload_f32(m, p + "shared_head_norm.weight", N, mtp_head_norm_, err))
             return false;
+        mtp_allocs_[1] = allocs_.size();
     }
 
     if (nkv_ == 0) { err = "plain model: the model has no attention block"; return false; }
@@ -3401,12 +3403,47 @@ bool PlainModel::set_window_drafts(int drafts, std::string& err) {
     return true;
 }
 
+uint64_t PlainModel::release_mtp(bool keep_head) {
+    PlainModel& t = tail();
+    if (&t != this) return t.release_mtp(keep_head);
+    if (!has_mtp_) return 0;
+    if (cs_ != nullptr) strata::gpu::stream_sync(cs_);
+    for (auto& g : mexec_)
+        if (g) { strata::gpu::graph_destroy(g); g = nullptr; }
+    for (auto& v : msegs_) {
+        for (auto* g : v) strata::gpu::graph_destroy(g);
+        v.clear();
+    }
+    for (auto& g : mrexec_)
+        if (g) { strata::gpu::graph_destroy(g); g = nullptr; }
+    size_t fb0 = 0, fb1 = 0, tb = 0;
+    strata::gpu::mem_info(&fb0, &tb);
+    // the layer's own weights: the allocations its load made (the K/V pool stays: a saved state carries it)
+    for (size_t i = mtp_allocs_[0]; i < mtp_allocs_[1] && i < allocs_.size(); ++i) {
+        strata::gpu::free(allocs_[i]);
+        allocs_[i] = nullptr;
+    }
+    int2_.reset();
+    if (!keep_head) {   // the drafts' subset (DFlash2 reads it when it stays)
+        subset_.reset();
+        dhead_ = nullptr;
+        dvocab_.clear();
+        n_dvocab_ = 0;
+    }
+    has_mtp_ = false;
+    n_mtp_ = 0;
+    drafts_.clear();
+    dprob_.clear();
+    strata::gpu::mem_info(&fb1, &tb);
+    return fb1 > fb0 ? (uint64_t) (fb1 - fb0) : 0;
+}
+
 PlainModel::HeadView PlainModel::draft_head_view() const {
     const PlainModel& t = tail();
     HeadView v;
     v.type = t.head_.type;
     v.n_in = t.head_.n_in;
-    if (t.dhead_ != nullptr) {
+    if (t.dhead_ != nullptr && t.subset_) {
         v.rows = t.dhead_;
         v.n_rows = t.n_dvocab_;
         v.vocab_dev = t.subset_->ids_device();

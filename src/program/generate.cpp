@@ -8073,7 +8073,7 @@ int main(int argc, char** argv) {
             // E-9: batched through the prompt path when it can (a layer split: not with STRATA_SPLIT_MTP_BATCH=0)
             bool batched = false;
             const strata::program::draft_kv::Plan dkv = strata::program::draft_kv::plan(
-                use_mtp, multi_gpu, split_mtp_batch, strata::core::native_embed() != nullptr);
+                use_mtp && mtp.loaded(), multi_gpu, split_mtp_batch, strata::core::native_embed() != nullptr);
             if (dkv.try_batched || dkv.why != nullptr) {
                 strata::prefill::Prefill& dsp = multi_gpu ? stages.back()->sp : sp;   // the drafter's stage
                 const char* why = dkv.why;
@@ -8091,7 +8091,7 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            if (!e.empty() || (use_mtp && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
+            if (!e.empty() || (use_mtp && mtp.loaded() && !batched && !mtp.prefill(R_rows, nxt.data(), T, p0, e))) return false;
             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
             const int64_t done = p0 + T;
             pp_reached = done;
@@ -8992,8 +8992,12 @@ int main(int argc, char** argv) {
                                             !o.conversation_save.empty();
                 if (use_mtp && keep != strata::spec::Drafter::Mtp && !both) {
                     if (conv_needs_mtp) {
-                        std::fprintf(stderr, "xestrata serve: the MTP layer stays loaded (the conversation cache keeps "
-                                             "its K/V) but does not draft\n");
+                        // a parked or saved conversation carries the draft layer's K/V: that part stays, the rest goes
+                        const long long f0 = free_mib();
+                        mtp.release_weights(df2_loaded && df2.head_shared());
+                        std::fprintf(stderr, "xestrata serve: the MTP layer's weights, head and buffers released (%lld "
+                                             "MiB of VRAM back); its K/V stays (the conversation cache carries it)\n",
+                                     free_mib() - f0);
                         if (keep == strata::spec::Drafter::Df2) o.draft_rule = "df2";   // every request: DFlash2
                     } else {
                         if (df2_loaded && df2.head_shared()) {   // DFlash2's head was the MTP's: its own first
@@ -9039,7 +9043,8 @@ int main(int argc, char** argv) {
                          : use_mtp && !drafting_off ? "the MTP"
                                                      : "no drafter",
                          spec_cap > 0 ? (", window " + std::to_string(spec_cap)).c_str() : "",
-                         drafting_off && use_mtp ? " (the MTP layer loaded, unused)" : "", (long long) (probe_free0 >> 20),
+                         drafting_off && use_mtp ? " (the MTP layer's K/V kept for the conversation cache)" : "",
+                         (long long) (probe_free0 >> 20),
                          free_during, free_mib());
             o.spec_auto = false;
             if (drafting_off) info_spec = 1;
@@ -10661,11 +10666,11 @@ int main(int argc, char** argv) {
                 if (d == "mtp") req_df2 = false;
                 else if (d == "dflash2" || d == "df2" || d == "auto") req_df2 = true;
                 else if (d != "off") req_df2 = drafter_policy.choose(req_kind, n, true) == strata::spec::DrafterPolicy::Df2;   // learn
-                if (!use_mtp) req_df2 = true;   // DFlash2 is the only drafter loaded
+                if (!use_mtp || !mtp.loaded()) req_df2 = true;   // DFlash2 is the only drafter loaded
                 if (req_off) req_df2 = false;
                 if (req_df2 != policy_is_df2) { std::swap(policy, policy_idle); policy_is_df2 = req_df2; }
             }
-            const bool req_mtp = use_mtp && !req_df2 && !req_off;   // the MTP drafts this request
+            const bool req_mtp = use_mtp && mtp.loaded() && !req_df2 && !req_off;   // the MTP drafts this request
             // the windows this request checks: the measurement's arm, else the window the measurement kept
             const int req_cap = req_spec_cap > 0 ? req_spec_cap : spec_cap;
             const int S_r = req_cap > 0 ? std::min(S, req_cap) : S, S_mtp_r = std::min(S_mtp, S_r);
@@ -11496,7 +11501,7 @@ int main(int argc, char** argv) {
                     }();
                     if (logpos != nullptr && !ver.window_logprobs(nxt.data(), T, q, logpos_extra, logpos, e))
                         return false;
-                    if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)))
+                    if (!ver.commit(T, e) || (use_mtp && mtp.loaded() && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e)))
                         return false;
                     q += T;
                     pp_reached = q;   // #471
@@ -11728,7 +11733,7 @@ int main(int argc, char** argv) {
             }
             ver.set_sampling(req_sp);
             if (pipe) ver_b.set_sampling(req_sp);   // (reaches the later stage's odd verifier)
-            if (use_mtp) mtp.set_draft_sampling(req_sp);
+            if (use_mtp && mtp.loaded()) mtp.set_draft_sampling(req_sp);
             {   // aux_cpus=0|1: where the non-pool, non-host threads run for this request (-1 = the start-up --aux-cpus); moves
                 // threads only.  An enabled placement is swept at every request: it catches threads created since.
                 static const bool aux_start = strata::aux_cpus::enabled();

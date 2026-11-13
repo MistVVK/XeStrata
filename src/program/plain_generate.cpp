@@ -998,6 +998,13 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             both = false;
         }
         if (dr.loaded && keep != strata::spec::Drafter::Df2 && !both) dr.release(model);
+        // the MTP layer that lost: its own weights, graphs and 2-bit head back (its K/V pool and its experts' places
+        // in the tier stay: a saved state carries the one, the tier's layout holds the other)
+        if (keep != strata::spec::Drafter::Mtp && !both && model.drafts() > 0) {
+            const uint64_t back = model.release_mtp(dr.loaded);
+            std::fprintf(stderr, "xestrata (%s): the MTP layer's weights released (%llu MiB of VRAM back; its K/V and "
+                                 "its experts' places stay)\n", arch.c_str(), (unsigned long long) (back >> 20));
+        }
         if (dr.loaded) {
             dr.deferred = false;
             draft_rule = both ? "learn" : "df2";
@@ -1008,8 +1015,8 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         std::fprintf(stderr, "xestrata (%s): drafting: %s; VRAM free %lld MiB before the measurement, %lld with every "
                              "drafter loaded, %lld now\n", arch.c_str(),
                      dr.loaded && both ? "the MTP layer and DFlash2 (picked per request)"
-                     : dr.loaded       ? "DFlash2 (the MTP layer loaded, unused)"
-                     : drafting_off    ? "no drafter (the MTP layer loaded, unused)"
+                     : dr.loaded       ? "DFlash2"
+                     : drafting_off    ? "no drafter"
                                        : ("the MTP layer, window " + std::to_string(model.drafts() + 1)).c_str(),
                      (long long) (probe_free0 >> 20), free_during, free_mib());
         announce();
