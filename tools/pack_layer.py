@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import json
 import pathlib
-import struct
 import sys
 
 import numpy as np
@@ -88,6 +87,7 @@ def build(n_layers: int, out_path: pathlib.Path) -> dict:
             layer_off = out.tell()
             # vectorized over the layer's 512 experts (the same bytes the per-block loop wrote; tools/strata_pack.py
             # verify checks them): each role is (512 experts, rows, blocks per row, 18 bytes)
+
             def role_blocks(role, rows, per_row):
                 t = roles[role]
                 n = NE * ROLE_BYTES
