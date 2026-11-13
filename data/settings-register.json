@@ -1703,7 +1703,7 @@
   },
   "SPEC_COST": {
    "reads": [
-    "src/spec/draft_policy.cpp:38"
+    "src/spec/draft_policy.cpp:39"
    ]
   },
   "SPEC_COUPLED": {
