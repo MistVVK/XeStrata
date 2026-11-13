@@ -339,6 +339,29 @@ for _key, _per_sm in _SM89_ALLOWED.items():
         _old = _merged.get(_sm, (0, 0))
         _merged[_sm] = (max(_stack, _old[0]), max(_local, _old[1]))
 
+# sm_89, the other libraries (libstrata_prefill.a, libstrata_qwen35.a, libstrata_mmq.a, libstrata_pf_own.a), from the CTest output of a CUDA 13.2 build
+# of af6226a3c on an RTX 4090 (the pod's cuda_spill_guard run, with MMQ and without): 75 and 68 kernel instances use stack, none uses .local; the 12 keys
+# below cover all of them, each at the measured maximum of its instances.  Same rule as above: any growth fails.
+_SM89_OTHER_LIBS_ALLOWED = {
+    "q36k::k_route_group": {"sm_89": (32, 0)},
+    "strata::prefill::fused::{anonymous}::native_kernel": {"sm_89": (80, 0)},
+    "strata::prefill::fused_q36::{anonymous}::native_kernel": {"sm_89": (80, 0)},
+    "strata::prefill::mmq::{anonymous}::iq4_w4a8_kernel": {"sm_89": (40, 0)},
+    "strata::prefill::{anonymous}::gdn_conv_w_kernel": {"sm_89": (24, 0)},
+    "strata::prefill::{anonymous}::gdn_tc_scan_kernel": {"sm_89": (128, 0)},
+    "strata::prefill::{anonymous}::gr_write_cvec_norm_rs_kernel": {"sm_89": (40, 0)},
+    "strata::prefill::{anonymous}::gr_write_norm_rs_kernel": {"sm_89": (40, 0)},
+    "strata::prefill::{anonymous}::rms_rope_rows_kernel": {"sm_89": (32, 0)},
+    "strata::prefill::{anonymous}::rope_kernel": {"sm_89": (32, 0)},
+    "strata::prefill::{anonymous}::route_kernel": {"sm_89": (64, 0)},
+    "{anonymous}::k_attn_prep": {"sm_89": (32, 0)},
+}
+for _key, _per_sm in _SM89_OTHER_LIBS_ALLOWED.items():
+    _merged = ALLOWED.setdefault(_key, {})
+    for _sm, (_stack, _local) in _per_sm.items():
+        _old = _merged.get(_sm, (0, 0))
+        _merged[_sm] = (max(_stack, _old[0]), max(_local, _old[1]))
+
 
 
 
