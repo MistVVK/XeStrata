@@ -31,15 +31,15 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
                       int64_t active_blocks = -1);   ///< perf-review C-1: > 0 launches only this many blocks (the
                                                      ///< batch's largest n_bid + 1; not for a captured graph)
 
-/// The same scores for a verify window's rows (consecutive positions of one sequence, so their n_bid rise): one
-/// sub-group a block reads its key once for every row, and the four heads' lane sums reduce with the same pairings as
-/// qsa_block_scores' (the bits are its own, upstream 5b6c9398's STRATA_QSA_ROWS).  For a graph: the grid is max_blocks.
 /// Turn FP32 products [nq * idx_n_head, tile] into completed-block scores; the moving tail is written separately.
 void qsa_block_scores_reduce(const float* products, int64_t tile, int64_t b0, int64_t blocks, const int32_t* steps,
                              int64_t nq, int64_t max_blocks, float* scores, void* stream);
 void qsa_block_scores_tail(const float* dead, const float* q_idx, const int32_t* steps, int64_t nq,
                            int64_t max_blocks, float* scores, void* stream);
 
+/// The same scores for a verify window's rows (consecutive positions of one sequence, so their n_bid rise): one
+/// sub-group a block reads its key once for every row, and the four heads' lane sums reduce with the same pairings as
+/// qsa_block_scores' (the bits are its own, upstream 5b6c9398's STRATA_QSA_ROWS).  For a graph: the grid is max_blocks.
 void qsa_block_scores_rows(const float* pooled, const float* dead, const float* q_idx, const int32_t* steps,
                            int64_t nq, int64_t max_blocks, const QsaShapes& s, float* scores, void* stream);
 
