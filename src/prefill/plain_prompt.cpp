@@ -236,7 +236,7 @@ bool PlainModel::prompt_settle(std::string& err) {
 bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& experts, const std::vector<int32_t>& count,
                                     const std::vector<int32_t>& start, std::string& err) {
     // On the host while the GPU computes its share: each routed row's token quantized once to the layer's native
-    // activation, one multi-token job an expert, the outputs back to the GPU into their routing entries' rows of parts.
+    // activation, up to MAXT rows per job, and the outputs back to their routing entries' rows of parts.
     namespace kc = k::cpu;
     PromptBufs& P = pb_;
     const int64_t N = spec_.n_embd;
@@ -261,8 +261,9 @@ bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& expe
             P.h_cpu_row[q] = P.h_entry[r];
             ++j.nt;
             ++q;
+            if (j.nt == kc::MAXT) { jobs.push_back(j); j.nt = 0; }
         }
-        jobs.push_back(j);
+        if (j.nt > 0) jobs.push_back(j);
     }
     // the chunks pipelined over a layer split (prompt_split): the stages take the pool one at a time
     std::unique_lock<std::mutex> turn(root_->pool_mu_, std::defer_lock);
@@ -578,7 +579,7 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
         // the candidates and how many of them (core/expert_tier, as Qwen3.8-Flash-Next's prompt path takes them)
         const CpuShareCandidates cc = cpu_share_candidates(
             count.data(), E, ml, *src_, [&](int32_t e) { return res_[(size_t) (ml * E + e)] >= 0; },
-            [](int32_t) { return false; });
+            [](int32_t) { return false; }, cpu_share_batched(T) ? T : k::cpu::MAXT);
         // a fixed share (--prefill-cpu-share S) gives the CPU S of the missed experts, else the decode's split times:
         // the share measured on the prompt's layers (Qwen3.8-Flash-Next's) was no faster here.  Qwen3.6-35B-A3B
         // UD-Q4_K_XL on the RTX 4070 (2026-11-12, 2 rounds): the same with the split measured; with --pcie-frac 0, where

@@ -256,24 +256,28 @@ void add_route_rows(std::vector<float>& usage, const std::vector<int32_t>& rec, 
     }
 }
 
-/// A prompt chunk's layer, for the CPU's share of the experts the GPU does not hold: `missed` the routed experts not in
-/// VRAM, `cand` (rows, expert) those the CPU may take, fewest rows first - at most MAXT rows (one multi-token job) and a
-/// blob the CPU reads where it lies, page-locked or not assembled into a short-lived buffer (the CPU's jobs keep their
-/// pointers while the GPU's groups stage the rest; upstream 92bce20e).  How many of them the CPU takes is each engine's
-/// (a share of `missed`).  `in_vram(e)`, `skip(e)`: an expert another part computes (a helper GPU's).
+// The staged prompt walk can split one expert's rows into multi-token CPU jobs for short chunks.
+inline bool cpu_share_staged_3k() {
+    static const bool enabled = [] { const char* v = strata::env_get("PREFILL_STAGED_3K"); return v && *v == '1'; }();
+    return enabled;
+}
+inline bool cpu_share_batched(int64_t rows) { return cpu_share_staged_3k() && rows >= 2048 && rows <= 3072; }
+
+/// A prompt chunk's layer: missed experts and those the CPU can read, fewest rows first. max_rows bounds an
+/// expert's rows; the default is one multi-token job. The blob must stay at its address during the jobs.
 struct CpuShareCandidates {
     int64_t missed = 0;
     std::vector<std::pair<int32_t, int32_t>> cand;
 };
 template <class InVram, class Skip>
 CpuShareCandidates cpu_share_candidates(const int32_t* counts, int64_t n_expert, int64_t layer, const ExpertSource& src,
-                                        InVram in_vram, Skip skip) {
+                                        InVram in_vram, Skip skip, int64_t max_rows = kernels::cpu::MAXT) {
     CpuShareCandidates r;
     for (int32_t e = 0; e < (int32_t) n_expert; ++e) {
         const int32_t c = counts[e];
         if (c == 0 || in_vram(e) || skip(e)) continue;
         ++r.missed;
-        if (c <= kernels::cpu::MAXT && (src.pinned(layer, e) || !src.transient(layer, e))) r.cand.emplace_back(c, e);
+        if (c <= max_rows && (src.pinned(layer, e) || !src.transient(layer, e))) r.cand.emplace_back(c, e);
     }
     std::sort(r.cand.begin(), r.cand.end());
     return r;
