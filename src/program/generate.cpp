@@ -10169,6 +10169,9 @@ int main(int argc, char** argv) {
     // against 1,024 costs ~92 expert slots on an RTX A6000, streamed again by every chunk above the floor).  One GPU, no peer, no
     // --batch above one slot, no head alias; a layer split keeps the floor's tail.  STRATA_PREFILL_TAIL_LOAN=0 keeps today's size.
     static const bool tail_loan_on = [] { const char* e = std::getenv("STRATA_PREFILL_TAIL_LOAN"); return !(e != nullptr && e[0] == '0'); }();
+    // STRATA_DBG_TAIL_NOREUSE=1 (a test of the backstop): a loan is reused by chunk alone, as before the tail rule - a later short segment then
+    // overruns the tail and the chunk check in Prefill::run_impl must end the request with its error
+    static const bool dbg_tail_noreuse = [] { const char* e = std::getenv("STRATA_DBG_TAIL_NOREUSE"); return e != nullptr && e[0] == '1'; }();
     auto loan_chunk = [&](int64_t tokens, int64_t chunk) -> int64_t {
         return loan_by_walk ? strata::prefill::loan_rules::walk_chunk(tokens, chunk, strata::prefill::Prefill::stream_all_min_tokens())
                             : chunk;
@@ -17799,7 +17802,8 @@ int main(int argc, char** argv) {
                     if (!p.lent.empty()) {
                         // its current loan already covers this: the chunk, and (a fused layout) the tail the segment's last
                         // chunk needs when it is read in the loan's own chunks
-                        if (tail_ok ? lr::reuse_ok(want, tokens, p.lent_chunk, p.sp->tail_room(), floor_t) : want <= p.lent_chunk) continue;
+                        if (tail_ok && !dbg_tail_noreuse ? lr::reuse_ok(want, tokens, p.lent_chunk, p.sp->tail_room(), floor_t)
+                                                         : want <= p.lent_chunk) continue;
                         // ONLY this participant's loan goes back: `refill` would return the other participants'
                         // loans too, and their buffers are still laid out in their caches - marking those slots
                         // resident again would hand the next window a prompt buffer in place of an expert
