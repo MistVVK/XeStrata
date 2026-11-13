@@ -1085,6 +1085,7 @@ print(r.choices[0].message.content)
   テンプレートの形の隣の形（`<parameter=NAME>` で始まる呼び出し、`<tool_call>` の中の JSON、`<tool_call>` のない `<function=NAME>` の塊、1 つの `<tool_call>` の中の 2 つ目の呼び出し）も、宣言したツールの呼び出しなら読みます（upstream 0.2.8 から既定）。
   エージェントの 1,462 ターンでは、意図どおりに読めたのがこれで 98.3%、なしで 92.9% でした。
   `xestrata-<model>.json` に `"tool_call_recovery": false` を書くと、これを切ります。
+  宣言していない名前の呼び出しも、形が正しければ、`xestrata-<model>.json` の `"undeclared_tool_calls": "call"`（環境変数 `XESTRATA_UNDECLARED_TOOL_CALLS=call`。設定が勝ちます）で呼び出しとして返せます。未知の名前に自分の規則を持つクライアント（持っているツールの名前をモデルに伝えて聞き直す）のための物で、既定の `"text"` は今までどおり文のままで、その横に `strata_rejected_tool_calls` が付きます（upstream #4622）。
   それでも呼び出しとして読めない `<tool_call>` の塊は、server のウィンドウで数を出します。
 - **呼び出しの読み手が直すもの、直さないもの**: 文字列の引数が呼び出しを丸ごと引用していても、自分の `</parameter><parameter=NAME>` を繰り返していても、値はそのままです（upstream #4078）。
   `</function>` の抜けた呼び出しは、回答の中でも思考の中でも呼び出しとして読みます（upstream #4427）。

@@ -1152,6 +1152,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   So are the forms next to the template's (a call that opens with `<parameter=NAME>`, JSON inside `<tool_call>`, a `<function=NAME>` block without `<tool_call>`, a second call inside one `<tool_call>`) when the call is a declared tool's (the default since upstream 0.2.8).
   On 1,462 agent turns 98.3% read as intended with it and 92.9% without.
   `"tool_call_recovery": false` in `xestrata-<model>.json` turns it off.
+  A well-formed call of a name the request did not declare can come back as a tool call instead, with `"undeclared_tool_calls": "call"` in `xestrata-<model>.json` (or `XESTRATA_UNDECLARED_TOOL_CALLS=call`; the config wins): it is for a client with its own policy for unknown names (it answers the model with the tool names it has). The default, `"text"`, stays the text the model wrote, with `strata_rejected_tool_calls` beside it (upstream #4622).
   A `<tool_call>` block that still does not read as a call is counted in the server window.
 - **What the parser repairs, and what it leaves.** A string argument that quotes a whole tool call, or repeats its own `</parameter><parameter=NAME>`, stays exact (upstream #4078).
   A call whose `</function>` was left out is read as the call (upstream #4427), in the answer and inside the thinking.

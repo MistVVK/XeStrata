@@ -4635,6 +4635,46 @@ class ForcedToolChoice(unittest.TestCase):
                         self.assertIn("Here is the report.", content)
                         self.assertIn("<function=lookup>", content)
 
+    def test_undeclared_tool_calls_call_hands_the_call_to_the_client(self):
+        """#4622: "undeclared_tool_calls": "call" returns the well-formed call of an undeclared name as a tool call
+        (the client has its own policy for unknown names); the default ("text") is the test above, unchanged."""
+        from serve.frontend import CALL_END, CALL_START
+        answer = (CALL_START + "\n<function=lookup>\n<parameter=q>\n2+2\n</parameter>\n</function>\n" + CALL_END)
+        self.says(answer)
+        self.svc.undeclared_tool_calls = "call"
+        try:
+            for stream in (False, True):
+                with self.subTest(stream=stream):
+                    code, b = self.openai(stream=stream)
+                    finish, calls, _ = self.call_of(code, b, stream)
+                    self.assertEqual((finish, calls), ("tool_calls", [("lookup", {"q": "2+2"})]), b)
+                    if not stream:
+                        self.assertIsNone(b.get("strata_rejected_tool_calls"))
+            # prose that names the format is still text
+            self.says("Write <tool_call> and <function=x> to call a tool.")
+            code, b = self.openai(stream=False)
+            finish, calls, _ = self.call_of(code, b, False)
+            self.assertEqual((finish, calls), ("stop", []), b)
+        finally:
+            self.svc.undeclared_tool_calls = "text"
+
+    def test_undeclared_tool_calls_setting(self):
+        from serve.server import undeclared_tool_calls_setting
+        old = os.environ.pop("XESTRATA_UNDECLARED_TOOL_CALLS", None)
+        try:
+            self.assertEqual(undeclared_tool_calls_setting({}), "text")
+            self.assertEqual(undeclared_tool_calls_setting({"undeclared_tool_calls": "call"}), "call")
+            os.environ["XESTRATA_UNDECLARED_TOOL_CALLS"] = "call"
+            self.assertEqual(undeclared_tool_calls_setting({}), "call")
+            self.assertEqual(undeclared_tool_calls_setting({"undeclared_tool_calls": "text"}), "text")   # config wins
+            for bad in ("yes", True, 1):
+                with self.assertRaises(SystemExit):
+                    undeclared_tool_calls_setting({"undeclared_tool_calls": bad})
+        finally:
+            os.environ.pop("XESTRATA_UNDECLARED_TOOL_CALLS", None)
+            if old is not None:
+                os.environ["XESTRATA_UNDECLARED_TOOL_CALLS"] = old
+
     def test_a_call_with_a_dropped_function_keyword_is_still_the_call(self):
         """#3441: `<=search>` for `<function=search>`, as a model under a large tool surface writes it."""
         from serve.frontend import CALL_END, CALL_START
