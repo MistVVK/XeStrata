@@ -191,9 +191,9 @@ inline h8 q4_row8(const uint8_t* q4, int64_t row, int dd) {
 
 // 8 values of a trellis-coded pool row (kv_tcq.hpp) from element dd on, as FP16 bits
 template<int HD>
-inline h8 tcq_row8(const uint8_t* pool, int bits, int tab, int64_t row, int dd) {
+inline h8 tcq_row8(const uint8_t* pool, int bits, int64_t row, int dd) {
     float v[8];
-    tcq::values<8>(pool + row * (int64_t) tcq::row_bytes(HD, bits), HD, bits, tab, dd, v);
+    tcq::values<8>(pool + row * (int64_t) tcq::row_bytes(HD, bits), HD, bits, dd, v);
     h8 r;
 #pragma unroll
     for (int e = 0; e < 8; ++e) r[e] = sycl::bit_cast<uint16_t>(sycl::half(v[e]));

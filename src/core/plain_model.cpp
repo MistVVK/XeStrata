@@ -2248,7 +2248,6 @@ k::QsaAttnPools PlainModel::kv_pools(size_t a, int slot) const {
     pools.k_tc = p.k_tc;
     pools.v_tc = p.v_tc;
     pools.tc_bits = opt_.kv_tcq;
-    pools.tc_tab = opt_.kv_tcq == 5 ? k::kv_tcq_table() : 0;
     pools.page_table = table_of(a);   // the identity (a ring's for a sliding-window layer): a slot's pools have the
                                       // live session's shape
     return pools;

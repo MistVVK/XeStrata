@@ -19,10 +19,8 @@
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_kv_tcq
 #include "strata/kernels/device_arch_tag.hpp"
-#include "strata/platform/env.hpp"
 
 #include <algorithm>
-#include <cstring>
 #include <iterator>
 #include <string>
 
@@ -42,27 +40,18 @@ struct Mults {
     int n = 0;
 };
 
-Mults mults_of(int bits, int tab) {
+Mults mults_of(int bits) {
     Mults r;
     const auto put = [&](const auto& a) {
         r.n = (int) std::min<size_t>(std::size(a), MAX_MULT);
         for (int i = 0; i < r.n; ++i) r.m[i] = a[(size_t) i];
     };
     if (bits == 4) put(tcq::kMult4);
-    else if (tab == 1) put(tcq::kMult5Yasakani);
     else put(tcq::kMult5);
     return r;
 }
 
 }  // namespace
-
-int kv_tcq_table() {
-    static const int t = [] {
-        const char* v = strata::env_get("KV_TCQ_TABLE");
-        return v != nullptr && std::strcmp(v, "yasakani") == 0 ? 1 : 0;
-    }();
-    return t;
-}
 
 void fwht256_signed(float* data, int64_t n_rows, bool inverse, void* stream) {
     if (n_rows <= 0) return;
@@ -112,8 +101,8 @@ void kv_append_tcq(const KvAppend& a, const QsaShapes& s, void* stream) {
     if (a.host != nullptr || a.stage != nullptr)
         throw core::DeviceError("kv_append_tcq: the trellis-coded cache has no host copy (KV streaming)");
     if (a.n_tok < 1) return;
-    const int bits = a.tc_bits, tab = bits == 5 ? kv_tcq_table() : 0;
-    const Mults mu = mults_of(bits, tab);
+    const int bits = a.tc_bits;
+    const Mults mu = mults_of(bits);
     const int jobs = mu.n * 4;
     const int kv_heads = (int) s.n_head_kv, page_size = (int) s.page_size;
     const int planes = a.k_tc == a.v_tc && a.k == a.v ? 1 : 2;
@@ -170,7 +159,7 @@ void kv_append_tcq(const KvAppend& a, const QsaShapes& s, void* stream) {
                 int code[8], cost[8];
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
-                    code[i] = tcq::code_of(tab, bits, 32 * i + lane);
+                    code[i] = tcq::code_of(bits, 32 * i + lane);
                     cost[i] = 32 * i + lane == 0 ? 0 : (1 << 29);   // the chain starts in state 0
                 }
                 for (int t = 0; t < kTcqChain; ++t) {
@@ -208,7 +197,7 @@ void kv_append_tcq(const KvAppend& a, const QsaShapes& s, void* stream) {
                 sycl::group_barrier(sg);
                 float e2 = 0.0f;
                 for (int k = lane; k < kTcqChain; k += WARP) {
-                    const float d = xr[c * kTcqChain + k] - (float) tcq::code_of(tab, bits, path[k]) * (sc / 256.0f);
+                    const float d = xr[c * kTcqChain + k] - (float) tcq::code_of(bits, path[k]) * (sc / 256.0f);
                     e2 = sycl::fma(d, d, e2);
                 }
                 e2 = sycl::reduce_over_group(sg, e2, sycl::plus<float>());

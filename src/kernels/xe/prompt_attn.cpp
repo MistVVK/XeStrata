@@ -244,7 +244,7 @@ void gather16(sycl::queue& queue, const QsaAttnPools& pools, int64_t page_size, 
     const uint16_t *kf = pools.k_pool, *vf = pools.v_pool, *ksc = pools.k_scale, *vsc = pools.v_scale;
     const int8_t *ki = pools.k_q, *vi = pools.v_q;
     const uint8_t *k4 = pools.k_q4, *v4 = pools.v_q4, *ktc = pools.k_tc, *vtc = pools.v_tc;
-    const int tc_bits = pools.tc_bits, tc_tab = pools.tc_tab;
+    const int tc_bits = pools.tc_bits;
     const int32_t* tbl = pools.page_table;
     const int64_t PS = page_size, CK = KH * HD;
     queue.parallel_for(sycl::range<1>((size_t) (Tk * CK / 8)), [=](sycl::id<1> id) {
@@ -253,8 +253,8 @@ void gather16(sycl::queue& queue, const QsaAttnPools& pools, int64_t page_size, 
         const int64_t row = ((int64_t) tbl[c / PS] * KH + g) * PS + c % PS;
         h8 kv, vv;
         if (fmt == kFmtTcq) {
-            kv = tcq_row8<HD>(ktc, tc_bits, tc_tab, row, dd);
-            vv = tcq_row8<HD>(vtc, tc_bits, tc_tab, row, dd);
+            kv = tcq_row8<HD>(ktc, tc_bits, row, dd);
+            vv = tcq_row8<HD>(vtc, tc_bits, row, dd);
         } else if (fmt == kFmtF16) {
             kv = *reinterpret_cast<const h8*>(kf + row * HD + dd);
             vv = *reinterpret_cast<const h8*>(vf + row * HD + dd);

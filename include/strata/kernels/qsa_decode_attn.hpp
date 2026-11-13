@@ -35,7 +35,6 @@ struct QsaAttnPools {
     const uint8_t* k_tc = nullptr;      ///< trellis-coded rows (kv_tcq.hpp), same layout, head_dim * bits / 8 + 4 B
     const uint8_t* v_tc = nullptr;
     int tc_bits = 0;                    ///< 4 or 5 with k_tc
-    int tc_tab = 0;                     ///< the codebook, kv_tcq_table()
     const int32_t* page_table = nullptr;
 };
 

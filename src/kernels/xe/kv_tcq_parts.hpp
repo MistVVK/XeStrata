@@ -26,10 +26,8 @@ inline float sign_of(int d) {
     return (x & 1u) ? -1.0f : 1.0f;
 }
 
-// State st's value in 1/256 of the row's scale.  tab: kv_tcq_table() (uniform across a launch).
-inline int code_of(int tab, int bits, int st) {
-    return bits == 4 ? kCode4[st] : tab == 1 ? kCode5Yasakani[st] : kCode5[st];
-}
+// State st's value in 1/256 of the row's scale
+inline int code_of(int bits, int st) { return bits == 4 ? kCode4[st] : kCode5[st]; }
 
 inline int row_bytes(int head_dim, int bits) { return head_dim * bits / 8 + 4; }
 
@@ -47,20 +45,20 @@ inline uint64_t bits64(const uint32_t* w, int at) {
 }
 
 // Value d of a row (r: its first byte)
-inline float value(const uint8_t* r, int head_dim, int bits, int tab, int d) {
+inline float value(const uint8_t* r, int head_dim, int bits, int d) {
     const uint32_t* w = reinterpret_cast<const uint32_t*>(r);
     const int end = bits * (d + 1), first = bits * (d & ~(kTcqChain - 1));
     const int lo = sycl::max(end - 8, first), n = end - lo;
     const int wi = lo >> 5, o = lo & 31;
     const uint64_t z = ((uint64_t) w[wi] << 32) | w[wi + 1];
     const int st = (int) (z >> (64 - o - n)) & ((1 << n) - 1);
-    return (float) code_of(tab, bits, st) * row_scale(r, head_dim, bits);
+    return (float) code_of(bits, st) * row_scale(r, head_dim, bits);
 }
 
 // Values dd .. dd + N - 1 of a row (dd a multiple of N, N of 4 or 8, inside one chain): one 64-bit window of code
 // holds them and the bits before the first (none at a chain's start)
 template<int N>
-inline void values(const uint8_t* r, int head_dim, int bits, int tab, int dd, float* out) {
+inline void values(const uint8_t* r, int head_dim, int bits, int dd, float* out) {
     static_assert(N == 4 || N == 8, "a 64-bit window holds 8 values of 5 bits and the 3 before");
     const uint32_t* w = reinterpret_cast<const uint32_t*>(r);
     const float sc = row_scale(r, head_dim, bits);
@@ -69,7 +67,7 @@ inline void values(const uint8_t* r, int head_dim, int bits, int tab, int dd, fl
 #pragma unroll
     for (int e = 0; e < N; ++e) {
         const int end = pre + bits * (e + 1);
-        out[e] = (float) code_of(tab, bits, (int) (z >> (64 - end)) & 0xFF) * sc;
+        out[e] = (float) code_of(bits, (int) (z >> (64 - end)) & 0xFF) * sc;
     }
 }
 

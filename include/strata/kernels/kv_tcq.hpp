@@ -16,8 +16,9 @@
 // to FP16 first): 132 bytes for B = 4 (Q4_0's 144), 164 for B = 5 (INT8's 264).  A row's bits are a function of the
 // row alone: one token or a prompt's chunk at a time, the same bits.
 //
-// The codebooks: each a trained trellis quantizer of normal values (tools/kv_tcq_table.py); YASAKANI's 5-bit one is
-// kept beside XeStrata's for the comparison (STRATA_KV_TCQ_TABLE=yasakani).
+// The codebooks: each a trellis quantizer trained on normal values (tools/kv_tcq_table.py), XeStrata's own: on held-out
+// normal rows the 5-bit one's error was 28.02 dB below the signal, YASAKANI's 27.97 (kvq_u5.bin), and the two gave the
+// same KL on Qwen3.5-9B (2026-11-14, RX 9060 XT).
 #pragma once
 
 #include "strata/kernels/qsa.hpp"
@@ -34,8 +35,5 @@ inline uint64_t kv_tcq_bytes_per_head(int head_dim, int bits) { return (uint64_t
 /// The signed rotation of rows of 256 floats (in place): forward x -> H D x / 16, inverse y -> D H y / 16, with D the
 /// signs of kvx_codec.cuh's hash of the dimension.
 void fwht256_signed(float* data, int64_t n_rows, bool inverse, void* stream);
-
-/// The codebook in use: 0 XeStrata's, 1 YASAKANI's (bits 5 only; STRATA_KV_TCQ_TABLE=yasakani, the comparison).
-int kv_tcq_table();
 
 }  // namespace strata::kernels

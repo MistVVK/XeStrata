@@ -6,7 +6,7 @@
     python tools/kv_tcq_table.py init  --bits B                  a codebook from the normal quantiles (no training)
     python tools/kv_tcq_table.py train --bits B [--rows N]       trained on rows of normal values (numpy, the CPU)
     python tools/kv_tcq_table.py eval  --bits B [--table F] [--yasakani KVQP]   the error against q4_0 and INT8
-    python tools/kv_tcq_table.py header --out H --bits4 F4 --bits5 F5 [--yasakani KVQP]   kv_tcq_tables.hpp
+    python tools/kv_tcq_table.py header --out H --bits4 F4 --bits5 F5    kv_tcq_tables.hpp
 
 The trellis is YASAKANI's KV5 (kvq_fast.cuh): a state of 8 bits, B bits a step shifted in from the right
 (s' = (s << B | f) & 255), chains of 64 values from state 0, one value a state (the codebook, int16 in 1/256 of the
@@ -194,7 +194,7 @@ def emit(code: list[int]) -> str:
     return "\n".join(lines)
 
 
-def header(out: str, t4: dict, t5: dict, ysk: dict | None) -> None:
+def header(out: str, t4: dict, t5: dict) -> None:
     def mults(m: list[float]) -> str:
         def lit(v: float) -> str:   # a float literal: 1 is written 1.0f, not 1f
             t = f"{v:.6g}"
@@ -218,13 +218,6 @@ def header(out: str, t4: dict, t5: dict, ysk: dict | None) -> None:
         f"inline constexpr int16_t kCode5[256] = {{\n{emit(t5['code'])}\n}};",
         f"inline constexpr float kMult5[] = {{{mults(t5['mult'])}}};",
     ]
-    if ysk is not None:
-        text += [
-            "// YASAKANI's KV5 codebook and multipliers (kvq_u5.bin of Qwen3.8-27B YASAKANI, Apache-2.0), for the",
-            "// comparison with XeStrata's own (STRATA_KV_TCQ_TABLE=yasakani)",
-            f"inline constexpr int16_t kCode5Yasakani[256] = {{\n{emit(ysk['code'])}\n}};",
-            f"inline constexpr float kMult5Yasakani[] = {{{mults(ysk['mult'])}}};",
-        ]
     text += ["", "}  // namespace strata::kernels::tcq", ""]
     Path(out).write_text("\n".join(text))
 
@@ -239,7 +232,7 @@ def main() -> int:
     ap.add_argument("--mult", default="0.9,0.93,0.96,0.98,1.0,1.02,1.04,1.07,1.1",
                     help="the multipliers of the root mean square (init, train)")
     ap.add_argument("--table", action="append", default=[], help="a JSON table (eval; the start of train)")
-    ap.add_argument("--yasakani", help="YASAKANI's kvq_u5.bin (eval, header)")
+    ap.add_argument("--yasakani", help="YASAKANI's kvq_u5.bin, compared by eval")
     ap.add_argument("--bits4"), ap.add_argument("--bits5"), ap.add_argument("--out")
     a = ap.parse_args()
     mult = [float(v) for v in a.mult.split(",")]
@@ -256,7 +249,7 @@ def main() -> int:
     else:
         if not (a.out and a.bits4 and a.bits5):
             ap.error("header needs --out, --bits4 and --bits5")
-        header(a.out, load(a.bits4), load(a.bits5), read_yasakani(a.yasakani) if a.yasakani else None)
+        header(a.out, load(a.bits4), load(a.bits5))
     return 0
 
 

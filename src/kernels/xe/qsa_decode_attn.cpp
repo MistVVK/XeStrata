@@ -125,7 +125,7 @@ inline float load_v1(const QsaAttnPools& p, long long row, int d) {
         return (float) p.v_q[row * HD + d] * sc;
     } else if constexpr (KV_MODE == 4) {   // trellis-coded, rotated (kv_tcq.hpp); the caller rotates the output back
         const int bits = p.tc_bits;
-        return tcq::value(p.v_tc + row * (long long) tcq::row_bytes(HD, bits), HD, bits, p.tc_tab, d);
+        return tcq::value(p.v_tc + row * (long long) tcq::row_bytes(HD, bits), HD, bits, d);
     } else {   // modes 2 and 3: V is rotated Q4_0 (kv_q4.hpp); the caller rotates the output back
         constexpr int bytes_per_head = (HD / QK4_0) * sizeof(block_q4_0);
         const int b = d / QK4_0;
@@ -149,7 +149,7 @@ inline void loadn(const QsaAttnPools& p, bool value, long long row, int d0, floa
     if constexpr (KV_MODE == 4) {
         const int bits = p.tc_bits;
         tcq::values<N>((value ? p.v_tc : p.k_tc) + row * (long long) tcq::row_bytes(HD, bits), HD, bits,
-                       p.tc_tab, d0, out);
+                       d0, out);
     } else if constexpr (KV_MODE == 3) {
         if (value) loadn<HD, 2>(p, true, row, d0, out);
         else loadn<HD, 1>(p, false, row, d0, out);
