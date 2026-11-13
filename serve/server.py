@@ -3851,6 +3851,11 @@ def engine_args(cfg: dict) -> list[str]:
             args += ["--draft-model", str(cfg["draft_model"])]
         if cfg.get("draft_rule") and "--draft-rule" not in args:
             args += ["--draft-rule", str(cfg["draft_rule"])]
+    # "wide_window": "auto" (the engine's default), "off" or "on" - verify and batch windows of up to 16 rows
+    # (--wide-window; auto takes them where a run's drafter measures them or a batch has more than 8 slots)
+    wide = cfg.get("wide_window")
+    if wide in ("auto", "off", "on") and "--wide-window" not in args:
+        args += ["--wide-window", wide]
     # #533: the expert cache in segments (vram_elastic_on), so an image job, a vision encoder that starts with its
     # picture and POST /v1/vram can take VRAM and give it back; "vram_segment_mib" sets the segment size (the engine's
     # default: 512)

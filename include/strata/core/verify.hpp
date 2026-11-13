@@ -31,6 +31,7 @@
 #include "strata/core/moe_window.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include "strata/core/gpu.hpp"
 
@@ -468,14 +469,14 @@ private:
     // batch windows (see init_slots)
     std::vector<SessionState*> slots_;
     bool batch_rec_ = false;               ///< record_window is capturing a batch window
-    int brow_[8] = {};                     ///< ... and row t is slot brow_[t]
+    int brow_[strata::kernels::kWindowMaxT] = {};   ///< ... and row t is slot brow_[t]
     bool last_batch_ = false;              ///< the last run was a batch window (set_plan_slot: one group)
     /// key: batch_key(rows, S, hand-off base) - the whole row layout (--batch-mtp repeats a slot over its rows)
     std::map<std::vector<int>, strata::gpu::Graph*> exec_bm_, commit_bm_;
     std::map<std::vector<int>, uint64_t> bm_used_;   ///< last use of each captured layout (LRU, with a graph limit)
     uint64_t bm_tick_ = 0;
     size_t batch_graph_limit_ = 0;         ///< 0: keep every captured batch graph; N: LRU-evict beyond N layouts
-    int last_rows_[8] = {};                ///< the slots of the last batch window's rows
+    int last_rows_[strata::kernels::kWindowMaxT] = {};   ///< the slots of the last batch window's rows
     static std::vector<int> batch_key(const int* rows, int S, int hbase) {
         std::vector<int> k;
         k.reserve((size_t) S + 1);
@@ -488,7 +489,7 @@ private:
     bool b_running_ = false;
     int64_t b_k_ = 0, b_steps_ = 0;
     std::chrono::steady_clock::time_point b_last_;
-    int32_t b_out_[8] = {};
+    int32_t b_out_[strata::kernels::kWindowMaxT] = {};
     /// The host's half of a batch window: the checks, the graphs, the rows' staging (run_slot_rows, batch_launch).
     bool stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos, std::string& err);
     std::vector<strata::kernels::SamplerParams> slot_sp_;
@@ -500,7 +501,7 @@ private:
     int32_t* commitb_ = nullptr;
     float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot
     void* arena_b_ = nullptr;
-    int64_t last_pos_b_[8] = {};
+    int64_t last_pos_b_[strata::kernels::kWindowMaxT] = {};
     bool capture_batch(const int* rows, int S, int hbase, std::string& err);
     bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);
     // STRATA_PIPED_MTP (init_deferred_commit): the saved rows, laid out as the window scratch (global layer index) with
@@ -516,7 +517,7 @@ private:
     bool sample_rows(int S, std::string& err);
     bool res_graph_ = false;
     bool recording_res_ = false;
-    strata::gpu::Graph* exec_res_[9] = {};
+    strata::gpu::Graph* exec_res_[strata::kernels::kWindowMaxT + 1] = {};
     bool all_resident() const;
     bool capture_res(int T, std::string& err);
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
@@ -559,19 +560,19 @@ private:
     int max_t_ = 0;
     int last_t_ = 0;
     int64_t last_pos0_ = 0;
-    int32_t last_tokens_[8] = {};
+    int32_t last_tokens_[strata::kernels::kWindowMaxT] = {};
     int64_t n_vocab_ = 0;
     strata::gpu::Stream cs_ = nullptr;
     strata::gpu::Stream df_side_[2] = {};   ///< STRATA_DF_BRANCH: the mixer's side branches of the window graph
     bool df_branch_ = false;
     strata::gpu::Stream fetch_side_ = nullptr;   ///< STRATA_FETCH_BRANCH: the PCIe share's fetch beside the VRAM hits
     bool fetch_branch_ = false;
-    strata::gpu::Graph* exec_[9] = {};
+    strata::gpu::Graph* exec_[strata::kernels::kWindowMaxT + 1] = {};
     bool captured_last_ = false;
     size_t graph_bytes_max_ = 0;   ///< the most VRAM a window's capture and first run have taken
     size_t graph_free0_ = 0;       ///< the VRAM free before the capture of the window run() is running, else 0
     strata::gpu::Graph* commit_exec_ = nullptr;
-    std::vector<strata::gpu::Graph*> segs_[9];
+    std::vector<strata::gpu::Graph*> segs_[strata::kernels::kWindowMaxT + 1];
     std::vector<strata::gpu::Graph*>* seg_out_ = nullptr;   // the segments of the window being captured
 
     // mapped staging (host pointer, device alias)
@@ -603,7 +604,7 @@ private:
     // kernels do not see the host's writes runs a window as segments the host launches (win_.segmented()).
     MoeWindow win_;
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
-    int groups_[9] = {};
+    int groups_[strata::kernels::kWindowMaxT + 1] = {};
 
     // device
     void* arena_ = nullptr;
