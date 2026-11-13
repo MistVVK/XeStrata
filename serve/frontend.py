@@ -2487,7 +2487,7 @@ class OutputParser:
         a turn cut by max tokens (or cancelled, or failed) keeps them as reasoning text (#1058)."""
         out = []
         if self.buf and self.state in ("call", "rcall"):
-            self._final = True      # #4701: a call held after its closing tags (could a file's text go on?) is whole now
+            self._final = True      # #4701: a call held after its closing tags (could a file go on?) is whole now
             out += self.feed("")
         if self.state == "rcall" and reason in (None, "stop"):
             # #4427: a call in the reasoning whose `</function>` is the end of the output (the `</tool_call>` left out)
