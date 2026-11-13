@@ -105,14 +105,8 @@ int main() {
         CHECK(nv_kq_line_wanted({{12, 14}}));                                                            // Q6_K down
         CHECK(nv_kq_line_wanted({{21, 7}}));                                                             // only a Q5_1 down (i-quant gate/up): the switch decides that product, so the line stands
         CHECK(nv_kq_line_wanted({{21, 20}, {21, 7}}));
-        // apply with say = false sets the default and prints nothing (the caller prints later); the return value tells the caller there is something to say
-        unset("STRATA_MMQ_KQ"); put("STRATA_NV_KQ_DEFAULT", "1");
-        const auto set = apply_nv_kq_default(8, 6, false, false);
-        CHECK(set.size() == 1 && set[0] == "STRATA_MMQ_KQ" && std::getenv("STRATA_MMQ_KQ") != nullptr);
-        unset("STRATA_MMQ_KQ");
-        put("STRATA_MMQ_KQ", "0");
-        CHECK(apply_nv_kq_default(8, 6, false, false).empty());                                          // the user's value wins: nothing to say
-        unset("STRATA_MMQ_KQ"); unset("STRATA_NV_KQ_DEFAULT");
+        // apply_nv_kq_default is not called here: its two-argument path reads strata::qwen_defaults_026(), which caches STRATA_DEFAULTS at its first call,
+        // and the one-argument check at the end of main needs that first call to see STRATA_DEFAULTS=026.
     }
     {   // which cards: fused_tile::kq_takes with the engine's switches (raw compute capability, SM count)
         unset("STRATA_PF_FUSED"); unset("STRATA_PF_FUSED_KQ"); unset("STRATA_PF_FUSED_SM40"); unset("STRATA_PF_FUSED_SM86"); 
