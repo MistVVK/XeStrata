@@ -1671,7 +1671,8 @@ add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu
             src/kernels/cpu/bf16_gemm_avx512.cpp
             src/kernels/cpu/i8_gemm.cpp src/kernels/cpu/i8_gemm_vnni.cpp src/kernels/cpu/i8_gemm_avx512.cpp
             src/kernels/cpu/cpu_ops.cpp src/kernels/cpu/vision_cpu.cpp src/kernels/cpu/vision_cpu_avx2.cpp
-            src/kernels/cpu/vision_cpu_avx512.cpp src/kernels/cpu/resize_rows.cpp src/kernels/cpu/resize_rows_avx2.cpp)
+            src/kernels/cpu/vision_cpu_avx512.cpp src/kernels/cpu/resize_rows.cpp src/kernels/cpu/resize_rows_avx2.cpp
+            src/kernels/cpu/latent_rows.cpp)
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).

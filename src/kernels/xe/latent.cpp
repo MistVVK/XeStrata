@@ -13,10 +13,12 @@
 #include "strata/kernels/latent.hpp"
 
 #include "strata/core/device.hpp"
+#include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_latent
 #include "strata/kernels/device_arch_tag.hpp"
 #include "strata/kernels/rows_cols.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "cuda_intrinsics.hpp"
 #include "iq_bits.hpp"
 
@@ -28,6 +30,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
+#include <mutex>
+#include <string>
+#include <tuple>
+#include <type_traits>
 
 namespace strata::kernels {
 namespace {
@@ -146,6 +153,107 @@ void latent_u_grouped(const uint8_t* u, const uint8_t* ylq, const int32_t* ids, 
     const auto e = fmt == 4 ? launch_u<4>(q, u, ylq, ids, labels, E, cap_entries, ELL, H, out)
                             : launch_u<8>(q, u, ylq, ids, labels, E, cap_entries, ELL, H, out);
     sync_if_needed(stream, e, "latent_u_grouped");
+}
+
+void latent_u_matvec(const uint8_t* u, const uint8_t* hq, const int32_t* ids, const int32_t* labels,
+                     const int32_t* dst, const int32_t* count, int64_t E, int64_t n_entries, int ELL, int H,
+                     int G, float* parts, void* stream, int fmt) {
+    if (n_entries <= 0 || G <= 0) return;
+    if (u == nullptr || hq == nullptr || ids == nullptr || labels == nullptr || dst == nullptr || count == nullptr ||
+        parts == nullptr || E <= 0 || H <= 0 || ELL <= 0 || ELL % 32 != 0 || (fmt != 4 && fmt != 8))
+        throw core::DeviceError("latent_u_matvec: a null pointer or a bad geometry");
+    auto& q = queue_for(stream);
+    const int nb = ELL / 32;
+    const size_t hq_row = (size_t) nb * 36;
+    const size_t wrow = (size_t) nb * (fmt == 4 ? 18 : 34);
+    const int xgroups = (H + kSubGroups - 1) / kSubGroups;
+    constexpr size_t wg = kSubGroups * kWarp;
+    // one work-group a (group, row tile): the group's entries' hq rows staged in local memory once an entry,
+    // every sub-group of the group reading them there (the mapped rows are across PCIe: one read an entry, not
+    // one a row).  The entries are walked in the same order in every work-group (the barriers are uniform).
+    auto run = [&](auto fmt_tag) {
+        constexpr int FMT = decltype(fmt_tag)::value;
+        return q.submit([&](sycl::handler& h) {
+            sycl::local_accessor<uint8_t, 1> hq_s(sycl::range<1>(hq_row), h);
+            h.parallel_for(sycl::nd_range<2>({(size_t) G, (size_t) xgroups * wg}, {1, wg}),
+                           [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
+                const int g = (int) it.get_group(0);
+                const int h = (int) it.get_group(1) * kSubGroups + (int) it.get_sub_group().get_group_linear_id();
+                const int lane = (int) it.get_local_linear_id() % kWarp;
+                const int tid = (int) it.get_local_linear_id();
+                const int c = *count;
+                for (int64_t r = 0; r < n_entries; ++r) {
+                    const int32_t e = ids[r];
+                    if (e < 0 || e >= E || labels[e] != g) continue;
+                    bool gpu = false;
+                    for (int i = 0; i < c; ++i) if (dst[i] == r) { gpu = true; break; }
+                    if (gpu) {   // the GPU's own row: parts holds zero for it (the hit path adds its U product)
+                        if (h < H) parts[(size_t) r * (size_t) H + h] = 0.0f;
+                        continue;
+                    }
+                    const uint8_t* x = hq + (size_t) r * hq_row;
+                    for (size_t i = (size_t) tid; i < hq_row; i += wg) hq_s[i] = x[i];
+                    sycl::group_barrier(it.get_group());
+                    if (h < H) {
+                        const uint8_t* w = u + ((size_t) g * (size_t) H + (size_t) h) * wrow;
+                        float acc = 0.0f;
+                        for (int b = lane; b < nb; b += kWarp)
+                            acc += lat_block_dot<FMT>(w + (size_t) b * (FMT == 4 ? 18 : 34),
+                                                      (const block_q8_1*) &hq_s[(size_t) b * 36]);
+                        acc = sycl::reduce_over_group(it.get_sub_group(), acc, sycl::plus<float>());
+                        if (lane == 0) parts[(size_t) r * (size_t) H + h] = acc;
+                    }
+                    sycl::group_barrier(it.get_group());
+                }
+            });
+        });
+    };
+    const auto e = fmt == 4 ? run(std::integral_constant<int, 4>{}) : run(std::integral_constant<int, 8>{});
+    sync_if_needed(stream, e, "latent_u_matvec");
+}
+
+void latent_publish_d(const float* xl, const uint8_t* act0, int64_t rows, int ELL, float* xl_out,
+                      uint8_t* act0_out, uint32_t* seq, uint32_t value, void* stream) {
+    if (rows <= 0) return;
+    if (xl == nullptr || act0 == nullptr || xl_out == nullptr || act0_out == nullptr || seq == nullptr || ELL <= 0 ||
+        ELL % 32 != 0)
+        throw core::DeviceError("latent_publish_d: a null pointer or a bad geometry");
+    auto& q = queue_for(stream);
+    const int64_t nf = rows * ELL;
+    const int64_t nb = rows * (ELL / 32) * 34;
+    auto e1 = q.parallel_for(sycl::range<1>((size_t) nf), [=](sycl::id<1> i) { xl_out[i[0]] = xl[i[0]]; });
+    auto e2 = q.parallel_for(sycl::range<1>((size_t) nb), [=](sycl::id<1> i) { act0_out[i[0]] = act0[i[0]]; });
+    auto e3 = q.single_task([=] {
+        sycl::atomic_fence(sycl::memory_order::seq_cst, sycl::memory_scope::system);
+        reinterpret_cast<volatile uint32_t*>(seq)[0] = value;
+    });
+    if (!stream) {
+        core::Runtime::get().wait(e1, "latent_publish_d");
+        core::Runtime::get().wait(e2, "latent_publish_d");
+        core::Runtime::get().wait(e3, "latent_publish_d");
+    }
+}
+
+const float* latent_colscale_dev(int layer, int width) {
+    int stored = 0;
+    const float* host = cpu::latent_gu_colscale(layer, &stored);
+    if (host == nullptr || width <= 0) return nullptr;
+    if (stored != width)
+        throw core::DeviceError("latent_colscale_dev: layer " + std::to_string(layer) + " stores " +
+                                std::to_string(stored) + " values, the caller wants " + std::to_string(width));
+    static std::mutex mu;
+    static std::map<std::tuple<int, const float*, int>, float*> table;   // (engine device, host vector, width)
+    auto& rt = core::Runtime::get();
+    std::lock_guard<std::mutex> lock(mu);
+    float*& d = table[std::make_tuple(core::current_device(), host, width)];
+    if (d == nullptr) {
+        d = sycl::malloc_device<float>((size_t) width, rt.device(), rt.context());
+        if (d == nullptr) throw core::DeviceError("latent_colscale_dev: device allocation failed");
+        auto& q = rt.compute();
+        q.memcpy(d, host, (size_t) width * sizeof(float));
+        rt.finish(q);
+    }
+    return d;
 }
 
 }  // namespace strata::kernels

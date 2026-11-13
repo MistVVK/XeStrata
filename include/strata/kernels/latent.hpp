@@ -34,4 +34,22 @@ void latent_colscale_rows(float* x, int64_t rows, int width, const float* inv, v
 void latent_u_grouped(const uint8_t* u, const uint8_t* ylq, const int32_t* ids, const int32_t* labels,
                       int64_t E, int64_t cap_entries, int ELL, int H, float* out, void* stream, int fmt = 8);
 
+/// The CPU share's U on the GPU (XESTRATA_LATENT_U_GPU): one work-group a (group, hidden-row tile); an entry
+/// whose expert is in the group and is NOT one of the GPU's own rows (dst[0..count)) gets
+/// parts[r*H + h] = U[g][h] . hq[r].  `hq`: the pool's q8_1 rows of h, entry-major, in mapped host memory
+/// (its device alias).  The GPU's own rows are left as they are (the hit path writes them).
+void latent_u_matvec(const uint8_t* u, const uint8_t* hq, const int32_t* ids, const int32_t* labels,
+                     const int32_t* dst, const int32_t* count, int64_t E, int64_t n_entries, int ELL, int H,
+                     int G, float* parts, void* stream, int fmt = 8);
+
+/// The D stage's publish: the xl rows (f32) and their Q8_0 image (act0) into mapped host memory, then the
+/// doorbell seq = value (the pool waits for it before reading the rows).  One kernel, graph-capturable,
+/// no host-issued copy inside the window.
+void latent_publish_d(const float* xl, const uint8_t* act0, int64_t rows, int ELL, float* xl_out,
+                      uint8_t* act0_out, uint32_t* seq, uint32_t value, void* stream);
+
+/// The layer's column-scale reciprocals on the device (uploaded once per device; the host vector is
+/// cpu::latent_gu_colscale's).  nullptr when the pack has no scales.
+const float* latent_colscale_dev(int layer, int width);
+
 }  // namespace strata::kernels
