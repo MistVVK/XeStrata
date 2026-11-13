@@ -892,6 +892,32 @@ int main() {
         h.calibrate(ch, rh);
         check((ch.real[0] & 1u) != 0 && h.table_held() && !h.fixed(), "calib: one real size does not bring the table into use");
     }
+    {
+        // STRATA_DRAFT_COSTS_LEARN=1 keeps its one-start promise (f-dc-learn-fix): (a) a request of the learning stretch starts a new busy run.
+        using strata::spec::CostLearner;
+        static_assert(CostLearner::starts_busy_run(false, 0.0, false) && !CostLearner::starts_busy_run(true, 0.01, false) && CostLearner::starts_busy_run(true, 0.5, false),
+                      "no learning stretch: the first request and a pause of kIdleS start a busy run, a request a few ms later does not");
+        check(CostLearner::starts_busy_run(true, 0.0, true) && CostLearner::starts_busy_run(true, 0.01, true), "learn (a): a request of the learning stretch starts a new busy run, however close");
+        check(!CostLearner::starts_busy_run(true, 0.2, false) && CostLearner::starts_busy_run(true, CostLearner::kIdleS, false), "learn (a): without the learning stretch the rule is the 0.5 s pause as before");
+        // 40 requests back to back of 200 rounds each (3 window sizes, 40 / 44 / 48 ms, 5 % slower after 6 s of load): one long busy run keeps 150 fresh rounds, a busy run per request 6,000
+        const auto sim = [](bool per_request_run) {
+            CostLearner L;
+            double clock = 0.0;
+            for (int q = 0; q < 40; ++q) {
+                double req_start = per_request_run ? clock : 0.0;
+                for (int i = 0; i < 200; ++i) {
+                    const int t = 1 + i % 3;
+                    const double age = clock - req_start;
+                    const double ms = (40.0 + 4.0 * (t - 1)) * (age > CostLearner::kFreshS ? 1.05 : 1.0) * (1.0 + 0.004 * ((i % 5) - 2));
+                    L.add(0, t, ms, age);
+                    clock += ms / 1000.0;
+                }
+            }
+            return L.check(1000, 20);
+        };
+        check(!sim(false).ready, "learn (a): back to back, one busy run: fresh rounds stay at the first seconds, the stretch never finishes (the batch 15 behaviour)");
+        check(sim(true).ready && !sim(true).disturbed, "learn (a): back to back, a busy run per request: the stretch finishes");
+    }
     std::printf(g_fail ? "FAIL\n" : "PASS\n");
     return g_fail ? 1 : 0;
 }

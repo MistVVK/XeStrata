@@ -16530,7 +16530,7 @@ int main(int argc, char** argv) {
                 refresh_file_tier();
                 if (dc_learning || dc_calib) {   // the request's arrival, before its prompt is read: a pause since the last one ended starts a new busy run
                     const Clock::time_point dc_now = Clock::now();
-                    if (!dc_seen_request || std::chrono::duration<double>(dc_now - dc_last_end).count() >= strata::spec::CostLearner::kIdleS) dc_busy_since = dc_now;
+                    if (strata::spec::CostLearner::starts_busy_run(dc_seen_request, std::chrono::duration<double>(dc_now - dc_last_end).count(), dc_learning)) dc_busy_since = dc_now;
                     dc_seen_request = true;
                 }
             }
@@ -20343,8 +20343,7 @@ int main(int argc, char** argv) {
                     cf.key = dc_key;
                     for (int k = 0; k < strata::spec::CostLearner::kCtxBuckets; ++k)
                         cf.tables[(size_t) k] = policy.learner().table(k, kDraftCostMinN, policy.top_size());
-                    cf.state_effect = policy.learner().state_effect(0, kDraftCostMinN);   // real rounds are counted by the same rule (fresh only, or all)
-                    // the CPU prompt share, when it is on and balancing from measured times: its balance as measured so far, to a 0.05
+                    cf.state_effect = policy.learner().state_effect(0, kDraftCostMinN);   // real rounds are counted by the same rule (fresh only, or all)                    // the CPU prompt share, when it is on and balancing from measured times: its balance as measured so far, to a 0.05
                     // step (0.5 when no short prompt has measured it yet: on an RTX A6000 a fixed 0.5 read a 981-token chunk as fast as the
                     // balancing share, 1,001-1,009 against 995-997 ms); fixed from now on like the table
                     if (strata::prefill::Prefill::cpu_share_balancing()) {

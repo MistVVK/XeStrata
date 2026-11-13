@@ -54,6 +54,10 @@ public:
     static constexpr double kStateTol = 0.02; ///< late against fresh round times beyond this in some size = a state effect
     static constexpr int kFallbackFactor = 3; ///< with a state effect, a stretch with this many times min_rounds timed rounds of any age ends with the fresh ones ...
     static constexpr int kFallbackShare = 5;  ///< ... when they are at least 1 / kFallbackShare of min_rounds
+    /// Does a request that arrives `gap_s` seconds after the last one ended start a new busy run (its rounds are fresh again)?  The first request does, and one after a
+    /// pause of kIdleS.  `learning_stretch`: the one-start learning stretch (STRATA_DRAFT_COSTS_LEARN=1, a harness switch) starts a new busy run at EVERY request, so a
+    /// harness that sends its requests back to back still collects fresh rounds (one long busy run keeps only its first kFreshS seconds).  No other caller passes true.
+    static constexpr bool starts_busy_run(bool seen_request, double gap_s, bool learning_stretch) { return !seen_request || learning_stretch || gap_s >= kIdleS; }
     /// `busy_age_s` < 0: unknown (counts as fresh).
     void add(int bucket, int t, double ms, double busy_age_s = -1.0);
     void reset();
