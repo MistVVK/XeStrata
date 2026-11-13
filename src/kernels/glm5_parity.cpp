@@ -350,7 +350,7 @@ int test_kda() {
     // glm5_kda_scan over a wide window (16 tokens, 15 state snapshots: the snapshots' wide argument) against
     // glm5_kda_step token by token: every output, snapshot and the final state bit for bit
     {
-        const int TW = strata::kernels::kVerifyMaxT;
+        const int TW = strata::kernels::kWindowMaxT;
         const size_t TS = (size_t) H * S;
         std::vector<float> s0 = randn((size_t) S * H * S, 0.1f), qw = randn(TW * TS), kw = randn(TW * TS),
                            vw = randn(TW * TS), gw = randn(TW * TS, 0.1f), bw((size_t) TW * H);

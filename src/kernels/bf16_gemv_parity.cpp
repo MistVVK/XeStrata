@@ -124,7 +124,7 @@ int main(int argc, char** argv) {
     // (the instances a window of up to 8 rows takes), bit for bit, BF16 and F32 weights
     {
         const long long n_in = 2560, n_out = 512;
-        const int T = strata::kernels::kVerifyMaxT, H = strata::kernels::kVerifyNarrowT;
+        const int T = strata::kernels::kWindowMaxT, H = strata::kernels::kVerifyNarrowT;
         std::mt19937 rng(1616);  // NOLINT(bugprone-random-generator-seed): a fixed seed keeps the parity inputs reproducible
         std::normal_distribution<float> g(0.0f, 1.0f);
         std::vector<float> fx((size_t) (T * n_in)), fw((size_t) (n_in * n_out));

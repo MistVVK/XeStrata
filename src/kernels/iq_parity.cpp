@@ -102,7 +102,7 @@ int main(int argc, char** argv) try {
         // window of up to 8 rows takes), bit for bit
         bool wide_same = true;
         {
-            const int W = strata::kernels::kVerifyMaxT, N8 = strata::kernels::kVerifyNarrowT;
+            const int W = strata::kernels::kWindowMaxT, N8 = strata::kernels::kVerifyNarrowT;
             std::vector<float> xw((size_t) W * cols);
             for (auto& v : xw) v = nd(rng);
             float* dxw = dev.alloc<float>(xw.size() * 4);
