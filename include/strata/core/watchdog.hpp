@@ -34,6 +34,11 @@ void stall_report(std::FILE* f, uint64_t layers_during);
 /// that never finishes (the driver moves GPU memory to system RAM).  Upstream #2065.
 void watchdog_note_request_vram(int64_t free_mib);
 
+/// AMD on Linux: reads the driver's paused-GPU counter (strata/core/gpu_pause_time.hpp) now and keeps it for the
+/// stall report; "not available" (-1) before the first request, where the counter cannot be read, and in every other
+/// build.  Once per request, never per step.
+void watchdog_note_request_gpu_pause();
+
 /// A request whose heartbeat (tokens, prompt chunks, verify windows) stops for XESTRATA_WATCHDOG_S seconds (default
 /// 60; 0 = off) is stuck on a flag nobody will raise - end the engine with where it was, so the server starts it
 /// again instead of the GPU spinning forever.  While the OS is still reading the file tier, or the layers still

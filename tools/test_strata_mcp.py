@@ -62,7 +62,7 @@ if __name__ == "__main__":
 '''
 
 FAKE_SERVER = r'''
-import json, os, signal, sys, time
+import json, os, signal, socketserver, sys, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 a = sys.argv
@@ -116,7 +116,13 @@ class H(BaseHTTPRequestHandler):
                           "timings": {"predicted_per_second": 61.5, "prompt_per_second": 400.0}})
         else:
             self.js(404, {})
-httpd = ThreadingHTTPServer(("127.0.0.1", port), H)
+class Srv(ThreadingHTTPServer):
+    # http.server's server_bind asks socket.getfqdn("127.0.0.1") for a name nothing here uses; on a slow runner a fresh
+    # process waited longer for that answer than the tests wait for the server
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+httpd = Srv(("127.0.0.1", port), H)
 def term(*_):
     print("[xestrata] stopped (fake)", flush=True)
     os._exit(0)
@@ -559,10 +565,11 @@ class Helpers(unittest.TestCase):
         self.assertEqual(list(S.CONTEXTS), M.FALLBACK_CONTEXTS)
 
     def test_unsloth_sizes(self):
-        """Dynamic v3.1's UD-Q2_0 to UD-IQ4_XS are regular sizes, listed first by size; UD-Q4_K_XL stays experimental,
-        and UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 (upstream 0.1.44, not run in XeStrata) follow by size, experimental too."""
+        """Dynamic v3.1's UD-IQ1_M to UD-IQ4_XS are regular sizes, listed first by size; UD-Q4_K_XL stays
+        experimental, and UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 (upstream 0.1.44, not run in XeStrata) follow by size,
+        experimental too."""
         s = M.Strata(HERE.parent)
-        regular = ["UD-Q2_0", "UD-IQ2_XS", "UD-Q2_K_XL", "UD-IQ3_XXS", "UD-Q3_K_XL", "UD-IQ4_XS"]
+        regular = ["UD-IQ1_M", "UD-Q2_0", "UD-IQ2_XS", "UD-Q2_K_XL", "UD-IQ3_XXS", "UD-Q3_K_XL", "UD-IQ4_XS"]
         for models in (s.tables()[0], M.FALLBACK_MODELS):
             self.assertEqual(s.sizes_of(models, "unsloth"),
                              [*regular, "UD-Q4_K_XL", "UD-Q5_K_XL", "UD-Q6_K_XL", "Q8_0"])
@@ -578,6 +585,11 @@ class Helpers(unittest.TestCase):
         self.assertEqual((by["UD-Q4_K_XL"]["experimental"], by["UD-Q4_K_XL"]["images"]), (True, True))   # #967
         self.assertFalse(by["UD-IQ4_XS"]["on_this_pc"].startswith("experimental"))
         self.assertTrue(by["UD-Q4_K_XL"]["on_this_pc"].startswith("experimental"))
+        self.assertEqual(by["UD-IQ4_XS"]["on_this_pc"], "fits")             # 63.7 GB of RAM, all of its experts
+        # a 32 GB card with 31 GB of RAM: 51 GB of weights beside 63 GB of memory - it runs, slower (upstream a16f3fe39)
+        fam = next(f for f in s.model_table({"ram_gb": 31.0, "gpus": [{"vram_gb": 32.0, "usable": True}]})
+                   if f["family"] == "unsloth")
+        self.assertEqual({x["model"]: x["on_this_pc"] for x in fam["sizes"]}["UD-IQ4_XS"], "may run slower")
 
     def test_recommendation_follows_ram(self):
         s = M.Strata(HERE.parent)
@@ -595,6 +607,34 @@ class Helpers(unittest.TestCase):
         r = s.recommend({"ram_gb": 64, "gpus": [{**gpu[0], "vram_gb": 0.0, "integrated": True}], "cpu": {"avx2": True}})
         self.assertEqual(r["model"], "IQ3_XXS")         # the processor's own graphics: it runs, slowly
         self.assertTrue(any("own graphics" in n for n in r["notes"]))
+
+
+class ProcIdentity(unittest.TestCase):
+    """upstream 7ea172159: an ended process is not "running", not even while nobody has reaped it yet (a zombie) - on
+    Windows, where the test must not be os.kill(pid, 0) (that ends the process), and on Linux (/proc's state)."""
+
+    def test_an_ended_child_is_not_running_before_it_is_reaped(self):
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        try:
+            end = time.time() + 10
+            while M.proc_identity(child.pid) is not None and time.time() < end:
+                time.sleep(0.05)                        # it has ended; wait() is what reaps it
+            self.assertIsNone(M.proc_identity(child.pid))
+            self.assertFalse(M.proc_alive(child.pid, "linux:0"))
+        finally:
+            child.wait()
+
+    def test_a_running_child_is_running_and_its_token_is_its_own(self):
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+        try:
+            ident = M.proc_identity(child.pid)
+            self.assertIsNotNone(ident)
+            self.assertTrue(M.proc_alive(child.pid, ident))
+            self.assertFalse(M.proc_alive(child.pid, ident + "x"))
+        finally:
+            child.kill()
+            child.wait()
+        self.assertIsNone(M.proc_identity(child.pid))
 
 
 if __name__ == "__main__":

@@ -66,6 +66,22 @@ bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     for (const char* suffix : suffixes) if (name.ends_with(suffix)) return true;
     return false;
 }
+// upstream b0b942fa9 (#4741): a native-eligible projection a pack keeps unquantized (BF16, GGUF type 30) has no
+// native kernel, and the prompt path and the verify window then stop with "has no native GGUF blocks".  Its siblings
+// are Q8_0, so it is served as Q8_0 made from the pack's BF16 values (ggml's rounding, as the XESTRATA_HC_Q8 copies),
+// and every dispatcher finds a native projection; the pack's BF16 copy stays.  Not bit-exact against reading the BF16
+// values.
+bool bf16_file_shape(const strata::TensorInfo& tensor) {
+    return tensor.type == 30 && tensor.name != "blk.1.ple_key.weight" && tensor.shape.size() == 2 &&
+           tensor.shape[0] > 0 && tensor.shape[0] <= (uint64_t) INT_MAX && tensor.shape[1] > 0 &&
+           tensor.shape[1] <= (uint64_t) INT_MAX && tensor.shape[0] % 32 == 0;
+}
+bool bf16_as_q8_0(const strata::TensorInfo& tensor, const WeightRef& ref) {
+    return bf16_file_shape(tensor) && !ref.quantized() && ref.kind == WeightKind::Bf16InF32 &&
+           ref.ne0 > 0 && ref.ne1 > 0 && ref.elements == ref.ne0 * ref.ne1 &&
+           ref.bytes == (uint64_t) ref.elements * 2 && tensor.shape[0] == (uint64_t) ref.ne0 &&
+           tensor.shape[1] == (uint64_t) ref.ne1;
+}
 struct DeviceFree { void operator()(void* p) const { if (p) strata::gpu::free(p); } };
 using DevicePtr = std::unique_ptr<void, DeviceFree>;
 struct Pending {
@@ -153,11 +169,15 @@ bool NativeDense::layer_bytes(const std::vector<std::string>& shards, bool inclu
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
             for (const auto& tensor : gguf.tensors()) {
-                if (!eligible(tensor, include_ple_key) || !strata::kernels::native_mmvq_supported((int) tensor.type) ||
-                    tensor.shape.size() != 2 || tensor.shape[0] > INT_MAX || tensor.shape[1] > INT_MAX)
+                if (!eligible(tensor, include_ple_key) || tensor.shape.size() != 2 || tensor.shape[0] > INT_MAX ||
+                    tensor.shape[1] > INT_MAX)
                     continue;
-                const uint64_t b = strata::kernels::native_mmvq_weight_bytes((int) tensor.type, (int) tensor.shape[0],
-                                                                             (int) tensor.shape[1]);
+                const bool as_q8 = bf16_file_shape(tensor);     // #4741: its Q8_0 copy is what is allocated
+                if (!as_q8 && !strata::kernels::native_mmvq_supported((int) tensor.type)) continue;
+                const uint64_t b = as_q8 ? (uint64_t) tensor.shape[0] / 32 * 34 * (uint64_t) tensor.shape[1]
+                                         : strata::kernels::native_mmvq_weight_bytes((int) tensor.type,
+                                                                                     (int) tensor.shape[0],
+                                                                                     (int) tensor.shape[1]);
                 const long l = std::strtol(tensor.name.c_str() + 4, nullptr, 10);
                 if (tensor.name.find("ple") != std::string::npos || l < 0 || l >= n_layers) shared += b;
                 else per_layer[(size_t) l] += b;
@@ -337,6 +357,30 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 auto& ref = found->second;
                 if (ref.native_data) { err = "native dense: override already attached"; return false; }
+                if (bf16_as_q8_0(tensor, ref)) {   // #4741: a BF16 projection of the pack, served as Q8_0
+                    const uint64_t nb = (uint64_t) ref.elements / 32, bytes = nb * 34;
+                    void* allocation = nullptr;
+                    bool status = strata::gpu::alloc_device(&allocation, bytes);
+                    DevicePtr data(allocation);
+                    if (status)
+                        strata::kernels::fused_gr_quantize_q8_0(static_cast<const uint16_t*>(ref.data),
+                                                                static_cast<uint8_t*>(data.get()), (int64_t) nb,
+                                                                &compute);
+                    if (!status) {
+                        err = "native dense upload " + tensor.name + ": " + strata::gpu::last_error(); return false;
+                    }
+                    int type = 8;
+                    if (strata::kernels::native_q8_0_rows_ok((int) ref.ne0)) {   // the layout its Q8_0 siblings have
+                        strata::kernels::native_q8_0_to_rows(data.get(), (int) ref.ne0, (int) ref.ne1, &compute);
+                        type = strata::kernels::kNativeQ8Rows;
+                    }
+                    max_in = (std::max)(max_in, (int) ref.ne0);
+                    total += bytes;
+                    std::fprintf(stderr, "native dense: %s is BF16 in the pack: served as Q8_0 like its siblings\n",
+                                 tensor.name.c_str());
+                    pending.push_back(Pending{&ref, type, bytes, std::move(data)});
+                    continue;
+                }
                 if (!strata::kernels::native_mmvq_supported((int) tensor.type)) continue;
                 // #326: the pack keeps an unquantized (--compat-bf16) key, which the PLE reads from the arena
                 if (tensor.name == "blk.1.ple_key.weight" && !ref.quantized()) continue;

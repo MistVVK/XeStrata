@@ -2729,6 +2729,22 @@ bool Verifier::window_logprobs(const int32_t* targets, int T, int64_t pos0, int3
         err = "window_logprobs: the head logits copy failed";
         return false;
     }
+    // STRATA_FORCE_FAULT=<m>:<bias> (test only, off by default): adds <bias> to the logit of every token id divisible
+    // by <m> before the rows are scored, so the token-forcing checker (tools/force_check.py) can be shown to reject a
+    // faulty build
+    struct Fault { long long every = 0; float bias = 0.0f; };
+    static const Fault fault = [] {
+        Fault f;
+        if (const char* v = strata::env_get("FORCE_FAULT");
+            v != nullptr && std::sscanf(v, "%lld:%f", &f.every, &f.bias) != 2)
+            f.every = 0;
+        if (f.every < 0) f.every = 0;
+        return f;
+    }();
+    if (fault.every > 0)
+        for (int t = 0; t < T; ++t)
+            for (int64_t v = 0; v < n_vocab_; v += fault.every)
+                h[(size_t) t * (size_t) n_vocab_ + (size_t) v] += fault.bias;
     static const int topk = [] {
         const char* v = strata::env_get("LOGPOS_TOPK");
         return v != nullptr ? (int) std::clamp(std::strtol(v, nullptr, 10), 0L, 256L) : 0;

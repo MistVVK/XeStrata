@@ -390,15 +390,23 @@ class ParallelService(unittest.TestCase):
 
     def test_bgen_refused_for_good_is_a_retryable_503_and_frees_the_slots(self):
         """#1994: when the engine keeps refusing, the answer is a 503 (retryable), never a 400, and no slot stays
-        busy."""
+        busy.  upstream b3c633868 (#3040): the refused admission keeps an error row but is not a completed request
+        (no prompt tokens, no part in the totals)."""
         self.start(2)
         self.engine.SLOT_PARK_S = 0.05
         out = self._two_at_once("BUSYALL hello")
         self.assertEqual(out["b"][0], "http", out["b"])
         self.assertEqual(out["b"][1], 503, out["b"])
+        metrics = self.get("/metrics")
+        refused = [row for row in metrics["requests"] if row["output_tokens"] == 0]
+        self.assertEqual(len(refused), 1, metrics["requests"])
+        self.assertEqual((refused[0]["finish"], refused[0]["prompt_tokens"], refused[0]["prompt_read"]),
+                         ("error", 0, None))
+        self.assertEqual(metrics["totals"]["requests"], 1, "only the admitted request counts")
         time.sleep(0.5)
         self.assertEqual(self.engine.slot_busy, [False, False])
         self.assertEqual(self.chat("fine again")["choices"][0]["message"]["content"], "ok, done.")
+        self.assertEqual(self.get("/metrics")["totals"]["requests"], 2, "a later admitted request counts")
 
     def test_engine_reports_fewer_slots(self):
         self.start(4, fit=2)

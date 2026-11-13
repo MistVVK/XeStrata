@@ -95,6 +95,7 @@
 #include "strata/artifact/model_spec.hpp"
 #include "strata/platform/direct_file.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/platform/io_priority.hpp"
 #include <fcntl.h>
 #include <filesystem>
 #if defined(_WIN32)
@@ -2092,6 +2093,9 @@ int main(int argc, char** argv) {
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
     // turns "it crashed at step 7" into "it crashed somewhere", and the difference is a debugging session.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    // upstream b89bf5947: not the low disk priority of the program that started this one (a model read at Low is
+    // several times slower).  The plain engine runs from this main too (plain_generate.cpp's plain_main).
+    strata::platform::restore_normal_io_priority();
     std::set_terminate(report_and_end);   // issue #10: an exception that leaves the engine is reported, not lost
     install_fatal_signals();               // issue #12: and a crash says what it was and where
     strata::core::route_stop_signals();
@@ -10383,6 +10387,7 @@ int main(int argc, char** argv) {
                 // layouts eat into what the start reported)
                 size_t vf_b = 0, vt_b = 0;
                 if (strata::gpu::mem_info(&vf_b, &vt_b)) strata::core::watchdog_note_request_vram((int64_t) (vf_b >> 20));
+                strata::core::watchdog_note_request_gpu_pause();   // AMD on Linux: the stall report's paused-time line
             }
             int64_t resume = 0;
             bool from_live = false;

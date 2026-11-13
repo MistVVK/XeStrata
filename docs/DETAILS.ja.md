@@ -239,13 +239,14 @@ UkisAI による Qwen3.8-Flash-Next のファインチューンで、ずっと�
 ./setup.sh --setup --family swift --model IQ2_XS
 ```
 
-### Unsloth の Dynamic v3.1（UD-Q2_0〜UD-IQ4_XS）
+### Unsloth の Dynamic v3.1（UD-IQ1_M〜UD-IQ4_XS）
 
-**[Unsloth の Dynamic v3.1](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)**（2026-11-04）は、元のモデルの 2〜4 ビットの版です（upstream #621 の UD-IQ4_XS もこの版に替わりました）。
+**[Unsloth の Dynamic v3.1](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)**（2026-11-04）は、元のモデルの 1〜4 ビットの版です（upstream #621 の UD-IQ4_XS もこの版に替わりました）。
 エキスパートの gate・up は IQ2_XXS〜IQ4_XS、down は Q2_0・IQ4_NL・Q5_0 で、n-gram の表は最後のシャード（IQ4_NL）にあります。
 
 | 大きさ | ダウンロード | エキスパート | すべて RAM に入る RAM |
 | --- | ---: | ---: | ---: |
+| UD-IQ1_M | 68.0 GB | 34.8 GB | 約 59 GB |
 | UD-Q2_0 | 70.5 GB | 37.4 GB | 約 61 GB |
 | UD-IQ2_XS | 75.8 GB | 42.3 GB | 約 66 GB |
 | UD-Q2_K_XL | 79.6 GB | 46.0 GB | 約 70 GB |
@@ -759,6 +760,23 @@ setup がダウンロードするモデルのファイルは、どれも大き�
 サーバーの大きさが固定したものと違えばダウンロードの前に止まり、ダウンロードしたファイルが SHA-256 と合わなければ消して止まります。
 固定したリビジョンがリポジトリから消えていれば止まります（試験のために `XESTRATA_ALLOW_UNPINNED=1` を設定すると、確かめずにいまのファイルを取ります）。
 
+**自分で取る（`hf` コマンド）**: setup のダウンロードは 16 本の接続（`XESTRATA_DL_CONNECTIONS` 1〜32）で行い、止まったところから続け、どのファイルも固定した SHA-256 と照らします。
+upstream が 2 台（家庭の PC と中国のサーバー）で測った匿名のダウンロードは、Hugging Face から接続の数によらず 16〜19 MB/s でした（1 本 7、16 本 17、32 本 19）。
+Hugging Face の `hf` コマンド（Xet）は同じ試験で匿名 16〜24 MB/s で、それ自体が速いわけではありません。
+Hugging Face は IP ごとに匿名の要求を制限していて、ログイン（自分のアカウントのトークン）で上限が上がると言っています。
+遅いときは `hf` で取って `--gguf-dir` で渡せます:
+
+```bash
+uvx hf auth login            # 任意: 自分の Hugging Face のアカウント（XeStrata はこのトークンを読みも送りもしない）
+uvx hf download agentionai/Qwen3.8-Flash-Next-Gyro-GGUF Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf \
+    --revision 1ada08422e404aca51ab9df665f089f34c419c6b --local-dir /data/gyro-s
+./setup.sh --gguf-dir /data/gyro-s       # Windows: xestrata-cli --gguf-dir D:\gyro-s
+```
+
+ファイルの名前とリビジョンは、setup がそのモデルに示すものを使ってください（上のリビジョンはこの版が Gyro-S に固定しているもので、別の版は別のものを固定します）。
+ファイルは元の名前のまま置きます。setup は `--gguf-dir` のファイルを見つけ、SHA-256 を照らし、取り直しません。公開されているものと合わないファイルは言って止まり、自分のフォルダーのファイルは消しません。
+`uvx` が無ければ `pip install -U huggingface_hub` で同じ `hf` が入ります。
+
 **ModelScope から**（中国本土、upstream #908）: setup がダウンロードするリポジトリ（GSQ-RCO のモデル、Swift 1.5、Coder、Unsloth のファイル、MTP の下書きの層を取る元のチェックポイント）は、どれも [ModelScope](https://www.modelscope.cn) に同じ名前・同じファイルであります。
 setup は自分では切り替えません（ダウンロードに失敗したときに案内します）。
 `--source modelscope`（`XESTRATA_SOURCE=modelscope`）で選びます。
@@ -1085,6 +1103,7 @@ print(r.choices[0].message.content)
   テンプレートの形の隣の形（`<parameter=NAME>` で始まる呼び出し、`<tool_call>` の中の JSON、`<tool_call>` のない `<function=NAME>` の塊、1 つの `<tool_call>` の中の 2 つ目の呼び出し）も、宣言したツールの呼び出しなら読みます（upstream 0.2.8 から既定）。
   エージェントの 1,462 ターンでは、意図どおりに読めたのがこれで 98.3%、なしで 92.9% でした。
   `xestrata-<model>.json` に `"tool_call_recovery": false` を書くと、これを切ります。
+  宣言していない名前の呼び出しも、形が正しければ、`xestrata-<model>.json` の `"undeclared_tool_calls": "call"`（環境変数 `XESTRATA_UNDECLARED_TOOL_CALLS=call`。設定が勝ちます）で呼び出しとして返せます。未知の名前に自分の規則を持つクライアント（持っているツールの名前をモデルに伝えて聞き直す）のための物で、既定の `"text"` は今までどおり文のままで、その横に `strata_rejected_tool_calls` が付きます（upstream #4622）。
   それでも呼び出しとして読めない `<tool_call>` の塊は、server のウィンドウで数を出します。
 - **呼び出しの読み手が直すもの、直さないもの**: 文字列の引数が呼び出しを丸ごと引用していても、自分の `</parameter><parameter=NAME>` を繰り返していても、値はそのままです（upstream #4078）。
   `</function>` の抜けた呼び出しは、回答の中でも思考の中でも呼び出しとして読みます（upstream #4427）。
@@ -1098,6 +1117,10 @@ print(r.choices[0].message.content)
   立て直したいクライアントは、持っているツールの名前をモデルに伝えて聞き直せます。要求が宣言していないツールの呼び出しを XeStrata が動かしたり渡したりすることはありません。
   server のウィンドウにも同じ名前が出て、`/metrics/prometheus` は塊の数を `strata:tool_calls_unread_total` で数えます。
   形の崩れた塊（宣言していない名前でないもの）もそこで数えますが、挙げる名前はありません。
+- **`/v1/messages` の Anthropic の tool search**（upstream #4663）: `"defer_loading": true` の tool は宣言されますが、プロンプトのツール一覧には出しません。
+  `tool_result` の中の `tool_reference` の塊（tool search の結果）は、その場所でその tool の定義をプロンプトに入れます（ツール一覧と同じ形なので、tool を読んでもプロンプトの先頭と、そのキャッシュは変わりません）。
+  それ以外の参照は今までどおり落とします（MCP の server が消えた古い参照で、会話が止まらないように）。
+  `defer_loading` の tool を持つ要求は、宣言したより多くの tool を抱えています（Claude Code は ToolSearch と `DeferredToolPlaceholder` を宣言し、MCP の tool は会話の中だけで名指しします）ので、その要求では宣言していない名前の呼び出しも `tool_use` で返します。Claude Code はそれを実行します（text では turn が終わっていました）。
 - **チャットのアプリ**: 「OpenAI 互換」の接続先を持つアプリなら使えます。
   ベース URL は `http://127.0.0.1:8095/v1`、API キーは何でも構いません。
 - **OpenCode**（upstream #543）: `opencode.jsonc`（プロジェクトの中か `~/.config/opencode/`）の出発点です。
@@ -2167,7 +2190,7 @@ Web の「情報」の「モデルの規約」のタブには、今動かして�
   Coder は [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)
   （カードによれば Apache-2.0）で、Strata での対応は @pjgmobile の PR #54 によるものです。
   Swift 1.5 は UkisAI の [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)。
-  UD-Q2_0〜UD-Q4_K_XL（Dynamic v3.1）、UD-Q5_K_XL、UD-Q6_K_XL、Q8_0 は Unsloth の [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)。
+  UD-IQ1_M〜UD-Q4_K_XL（Dynamic v3.1）、UD-Q5_K_XL、UD-Q6_K_XL、Q8_0 は Unsloth の [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)。
   Gyro は agentionai の [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)、
   Gyro-Coder は同じく [agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)。
   abliterated 版は huihui-ai の [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)、

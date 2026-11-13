@@ -37,6 +37,7 @@ it. `--compare <older results folder>` prints the two side by side.  Standard li
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
 import getpass
 import json
@@ -73,31 +74,49 @@ BURST_MAX_TOKENS = 128
 
 
 # --------------------------------------------------------------------------------------------------------- redaction
-def redactor(extra: tuple[str, ...] = (), key: str = ""):
-    """-> f(text) -> text with this machine's home folders, user and host names, the Strata folder, IP addresses and the
-    API key replaced.  Applied to everything that is written or printed from the server's or the machine's own text."""
-    subs: list[tuple[re.Pattern, str, int]] = []   # pattern, label, the value's length
+def usable_key(value) -> str:
+    """An API key as a client may send it: "" for nothing, blanks, or "none" in any case (the server's word for no
+    key, #4483)."""
+    if isinstance(value, (list, tuple)):                # a config may list several keys: the first one is the client's
+        value = value[0] if value else None
+    text = "" if value is None else str(value).strip()
+    return "" if text.lower() == "none" else text
 
-    def add(value, label, word=False):
+
+def redactor(extra: tuple[str, ...] = (), key: str = ""):
+    """-> f(text) -> text with this machine's home folders, user and host names, the XeStrata folder, IP addresses and
+    the API key replaced.  Applied to everything that is written or printed from the server's or the machine's own
+    text.  The key is replaced only where it stands as a whole token and in its own case (#4483): a short key is also a
+    common word or a part of a hash.  A hyphen next to it does not make it part of a longer word (`pack-<key>`,
+    `<key>-1`: the key leaked there); letters, digits and the underscore do.  The names (user, host) are not touched
+    inside a label this function wrote: redacting a text twice gives the same text (a user called "user" gave
+    `<<user>>`).  f.structural leaves a login or host name that is also an ordinary word alone (for the report's
+    schema)."""
+    subs: list[tuple[re.Pattern, str, int, bool]] = []   # pattern, label, the value's length, a login or host name
+
+    def add(value, label, word=False, exact=False, name=False):
         if value and len(str(value)) >= 4:
             v = str(value)
             for form in sorted({v, v.replace("\\", "/"), v.replace("/", "\\")}, key=len, reverse=True):
                 pat = re.escape(form)
-                subs.append((re.compile(r"(?<![\w-])" + pat + r"(?![\w-])" if word else pat, re.I), label,
-                             len(form)))
+                if word and exact:
+                    pat = r"(?<!\w)" + pat + r"(?!\w)"
+                elif word:
+                    pat = r"(?<![\w<-])" + pat + r"(?![\w>-])"
+                subs.append((re.compile(pat, 0 if exact else re.I), label, len(form), name))
 
     add(ROOT, "<xestrata>")
     add(Path.home(), "<home>")
     add(tempfile.gettempdir(), "<tmp>")
     try:
-        add(getpass.getuser(), "<user>", True)
+        add(getpass.getuser(), "<user>", True, name=True)
     except Exception:                                   # noqa: BLE001
         pass
-    add(socket.gethostname(), "<host>", True)
-    add(platform.node(), "<host>", True)
+    add(socket.gethostname(), "<host>", True, name=True)
+    add(platform.node(), "<host>", True, name=True)
     for x in extra:
         add(x, "<private>", True)
-    add(key, "<key>")
+    add(usable_key(key), "<key>", word=True, exact=True)
     # the longest VALUE first: the Strata folder before the home folder it is under, before the user's name both
     # hold (by the pattern's length the word-bounded user name came before a short Strata folder and broke it)
     subs.sort(key=lambda p: -p[2])
@@ -106,15 +125,52 @@ def redactor(extra: tuple[str, ...] = (), key: str = ""):
                      r"|169\.254)\.\d{1,3}\.\d{1,3}\b")
     bearer = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
 
-    def f(text):
+    def f(text, names=True):
+        """names=False leaves a login or host name that is also an ordinary word ("user", "test", "admin") alone: for
+        the report's fixed schema text, where the word is not this machine's name.  Paths, addresses and the key are
+        still replaced."""
         if not isinstance(text, str):
             return text
-        for pat, label, _ in subs:
-            text = pat.sub(label, text)
+        for pat, label, _, is_name in subs:
+            if names or not is_name:
+                text = pat.sub(label, text)
         text = path_user.sub(lambda m: f"{m.group(1) or ''}{m.group(2)}{m.group(3)}{m.group(4)}<user>", text)
         text = bearer.sub(r"\1<key>", text)
         return ip4.sub("<ip>", text)
+
+    setattr(f, "structural", lambda text: f(text, names=False))
     return f
+
+
+def redact_values(value, red) -> object:
+    """redact_obj for free text: the strings are replaced, the keys stay."""
+    if isinstance(value, dict):
+        return {k: redact_values(v, red) for k, v in value.items()}
+    if isinstance(value, list):
+        return [redact_values(v, red) for v in value]
+    return red(value) if isinstance(value, str) else value
+
+
+def redact_document(doc: dict, red) -> dict:
+    """The report as results.json carries it: the text a person or a server wrote (the machine, model and configuration
+    facts, error messages) gets the full redaction; everything else is the report's own fixed text (field names, enum
+    values, statuses) and only loses paths, addresses and the key, so a login called "user" or "test" does not turn the
+    report's own words into <user> (upstream #4484)."""
+    structural = getattr(red, "structural", red)
+    out = redact_obj(doc, structural)
+    if "machine" in doc:
+        out["machine"] = redact_values(doc["machine"], red)
+    results = doc.get("results")
+    if isinstance(results, dict):
+        if isinstance(results.get("failures"), list):
+            out["results"]["failures"] = [redact_values(f, red) for f in results["failures"]]
+        for group, block in results.items():
+            if not isinstance(block, dict):
+                continue
+            for name, record in block.items():
+                if isinstance(record, dict) and isinstance(record.get("err"), str):
+                    out["results"][group][name] = {**record, "err": red(record["err"])}
+    return out
 
 
 def redact_obj(obj, red):
@@ -715,6 +771,39 @@ def without_profile_save(cfg: dict) -> tuple[dict, bool]:
     return ({**cfg, "args": out} if removed else cfg), removed
 
 
+@contextlib.contextmanager
+def term_is_interrupt():
+    """While a run owns a server it started, SIGTERM (and Ctrl+Break on Windows) end the run the way Ctrl+C does, so the
+    `finally` that stops the server runs.  Without this a plain `kill` (a service stop, a script's timeout) ended only
+    this tool and left the server and the engine holding the port and the GPU.  Main thread only; the earlier handlers
+    come back afterwards."""
+    import signal
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def handler(signum, frame):
+        raise KeyboardInterrupt
+
+    saved = []
+    for name in ("SIGTERM", "SIGBREAK"):
+        number = getattr(signal, name, None)
+        if number is None:
+            continue
+        try:
+            saved.append((number, signal.signal(number, handler)))
+        except (ValueError, OSError):
+            pass
+    try:
+        yield
+    finally:
+        for number, old in saved:
+            try:
+                signal.signal(number, old)
+            except (ValueError, OSError, TypeError):
+                pass
+
+
 def start_server(cfg_path: Path, port: int, gpu: str | None, log_path: Path):
     try:
         cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
@@ -962,7 +1051,7 @@ def short_table(res: dict) -> str:
 def write_results(res: dict, parent: Path, red, log_lines: list[str]) -> Path:
     d = unique_dir(parent, results_dir_name(res["machine"], res["date"]))
     d.mkdir(parents=True)
-    clean = redact_obj(res, red)
+    clean = redact_document(res, red)
     (d / "results.json").write_text(json.dumps(clean, indent=1, ensure_ascii=False), encoding="utf-8")
     (d / "README.md").write_text(red(render_readme(res)), encoding="utf-8")
     if log_lines:
@@ -1028,7 +1117,7 @@ def main(argv=None) -> int:
                   "or give --url of a running server.", file=sys.stderr)
             return 2
         cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
-    key = a.api_key or ((cfg or {}).get("api_key") or "")
+    key = usable_key(a.api_key) or usable_key((cfg or {}).get("api_key"))
     if a.url:
         base = a.url.rstrip("/")
     else:
@@ -1038,64 +1127,66 @@ def main(argv=None) -> int:
     red = redactor(key=key)
     started = False
     try:
-        if is_strata(base, key):
-            say(f"Using the XeStrata server already running at {base}.")
-        elif a.url:
-            print(f"No XeStrata server answers at {base}.", file=sys.stderr)
-            return 2
-        else:
-            if try_json(base, "/health", key, 3) is not None:
-                print(f"Port {port} is used by something that is not XeStrata: pass --port N.", file=sys.stderr)
+        with term_is_interrupt():
+            if is_strata(base, key):
+                say(f"Using the XeStrata server already running at {base}.")
+            elif a.url:
+                print(f"No XeStrata server answers at {base}.", file=sys.stderr)
                 return 2
-            assert cfg_path is not None
-            log_path = Path(tempfile.gettempdir()) / f"xestrata-bench-{os.getpid()}.log"
-            say(f"Starting {cfg_path.name} on port {port} (loading takes 1-3 minutes; the PC may be slow "
-                "meanwhile) ...")
-            proc = start_server(cfg_path, port, a.gpu, log_path)
-            started = True
-            if not wait_ready(base, key, proc, a.ready_timeout, say):
-                tail = (log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-15:]
-                        if log_path.exists() else [])
-                print("The server did not become ready. Last log lines:\n" + red("\n".join(tail)), file=sys.stderr)
-                return 1
-        t0 = time.time()
-        pre = collect_machine(base, key, cfg, a.gpu)
-        suite = Suite(base, key, pre.get("context"), max(1, a.runs), a.think, log=say, want_clients=a.clients,
-                      want_long=a.long)
-        slots = pre.get("parallel_slots") or 1
-        if a.clients and a.clients > slots:
-            say(f"Note: the server runs {slots} request(s) at a time (--batch), so {a.clients} clients will partly "
-                "wait their turn.")
-        say("Running the suite (about 3-10 minutes) ...")
-        out = suite.run()
-        machine = collect_machine(base, key, cfg, a.gpu)      # again: VRAM and the cache after the work
-        if not machine.get("gpu"):
-            machine["gpu"] = pre.get("gpu")
-        res = {"schema": SCHEMA, "tool": "tools/strata_bench.py", "date": datetime.date.today().isoformat(),
-               "params": {"runs": suite.runs, "think": a.think, "clients": a.clients, "long": a.long,
-                          "started_server": started,
-                          "command": "python tools/strata_bench.py" + "".join(
-                              f" {x}" for x in (f"--clients {a.clients}" if a.clients else "",
-                                                "--long" if a.long else "", "--think" if a.think else "",
-                                                f"--runs {a.runs}" if a.runs != 3 else "") if x)},
-               "elapsed_s": time.time() - t0, "machine": machine, "results": out}
-        parent = Path(a.out) if a.out else ROOT / "bench" / "XeStrataBenchResults"
-        d = write_results(res, parent, red, log_excerpt(log_path) if log_path else [])
-        say("\nResults (median, range over the runs):")
-        say(red(short_table(res)))
-        if out["failures"] or out["skipped"]:
-            say(f"  ({len(out['failures'])} failed request(s), {len(out['skipped'])} skipped test(s): see the report)")
-        if a.compare:
-            say("\nCompared with " + a.compare + ":")
-            say(red(compare_table(load_results(Path(a.compare)), redact_obj(res, lambda s: s))))
-        try:
-            shown = d.relative_to(ROOT)
-        except ValueError:
-            shown = d
-        say(f"\nReport: {shown / 'README.md'}\nIt is in upstream Strata's community report format "
-            f"(its docs/COMMUNITY_BENCHMARKS.md). Home folders, user and host names and IP addresses are already "
-            f"replaced; read it once before you share it.")
-        return 1 if out["failures"] and not any(out[k] for k in ("chat", "prompts", "agent")) else 0
+            else:
+                if try_json(base, "/health", key, 3) is not None:
+                    print(f"Port {port} is used by something that is not XeStrata: pass --port N.", file=sys.stderr)
+                    return 2
+                assert cfg_path is not None
+                log_path = Path(tempfile.gettempdir()) / f"xestrata-bench-{os.getpid()}.log"
+                say(f"Starting {cfg_path.name} on port {port} (loading takes 1-3 minutes; the PC may be slow "
+                    "meanwhile) ...")
+                proc = start_server(cfg_path, port, a.gpu, log_path)
+                started = True
+                if not wait_ready(base, key, proc, a.ready_timeout, say):
+                    tail = (log_path.read_text(encoding="utf-8", errors="replace").splitlines()[-15:]
+                            if log_path.exists() else [])
+                    print("The server did not become ready. Last log lines:\n" + red("\n".join(tail)), file=sys.stderr)
+                    return 1
+            t0 = time.time()
+            pre = collect_machine(base, key, cfg, a.gpu)
+            suite = Suite(base, key, pre.get("context"), max(1, a.runs), a.think, log=say, want_clients=a.clients,
+                          want_long=a.long)
+            slots = pre.get("parallel_slots") or 1
+            if a.clients and a.clients > slots:
+                say(f"Note: the server runs {slots} request(s) at a time (--batch), so {a.clients} clients will partly "
+                    "wait their turn.")
+            say("Running the suite (about 3-10 minutes) ...")
+            out = suite.run()
+            machine = collect_machine(base, key, cfg, a.gpu)      # again: VRAM and the cache after the work
+            if not machine.get("gpu"):
+                machine["gpu"] = pre.get("gpu")
+            res = {"schema": SCHEMA, "tool": "tools/strata_bench.py", "date": datetime.date.today().isoformat(),
+                   "params": {"runs": suite.runs, "think": a.think, "clients": a.clients, "long": a.long,
+                              "started_server": started,
+                              "command": "python tools/strata_bench.py" + "".join(
+                                  f" {x}" for x in (f"--clients {a.clients}" if a.clients else "",
+                                                    "--long" if a.long else "", "--think" if a.think else "",
+                                                    f"--runs {a.runs}" if a.runs != 3 else "") if x)},
+                   "elapsed_s": time.time() - t0, "machine": machine, "results": out}
+            parent = Path(a.out) if a.out else ROOT / "bench" / "XeStrataBenchResults"
+            d = write_results(res, parent, red, log_excerpt(log_path) if log_path else [])
+            say("\nResults (median, range over the runs):")
+            say(red(short_table(res)))
+            if out["failures"] or out["skipped"]:
+                say(f"  ({len(out['failures'])} failed request(s), {len(out['skipped'])} skipped test(s): "
+                    "see the report)")
+            if a.compare:
+                say("\nCompared with " + a.compare + ":")
+                say(red(compare_table(load_results(Path(a.compare)), redact_obj(res, lambda s: s))))
+            try:
+                shown = d.relative_to(ROOT)
+            except ValueError:
+                shown = d
+            say(f"\nReport: {shown / 'README.md'}\nIt is in upstream Strata's community report format "
+                f"(its docs/COMMUNITY_BENCHMARKS.md). Home folders, user and host names and IP addresses are already "
+                f"replaced; read it once before you share it.")
+            return 1 if out["failures"] and not any(out[k] for k in ("chat", "prompts", "agent")) else 0
     finally:
         if started:
             stop_server(proc)

@@ -213,7 +213,7 @@ target_link_libraries(strata-plan PRIVATE strata_plan)
 # ---- host-only platform and n-gram reader ----------------------------------
 # These never touched the GPU runtime; they sat inside the CUDA build only because their consumers did.
 add_library(strata_platform STATIC src/platform/memory.cpp src/platform/direct_file.cpp src/platform/process.cpp
-                                   src/platform/downgrade.cpp)
+                                   src/platform/downgrade.cpp src/platform/io_priority.cpp)
 target_include_directories(strata_platform PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 find_package(Threads REQUIRED)
 target_link_libraries(strata_platform PUBLIC strata_warnings Threads::Threads)
@@ -238,10 +238,19 @@ if(STRATA_BUILD_TESTS)
   add_executable(aux_cpus_test tests/platform/aux_cpus_test.cpp)
   target_link_libraries(aux_cpus_test PRIVATE strata_platform)
   add_test(NAME aux_cpus_test COMMAND aux_cpus_test)
+  # upstream b89bf5947: an engine started at Low disk priority goes back to Normal (Windows; else it skips)
+  add_executable(io_priority_test tests/platform/io_priority_test.cpp)
+  target_link_libraries(io_priority_test PRIVATE strata_platform)
+  add_test(NAME io_priority_test COMMAND io_priority_test)
+  set_tests_properties(io_priority_test PROPERTIES SKIP_RETURN_CODE 77)
   # when the default CPU prefill share is armed (#1595, the host's memory): header-only rules, no GPU
   add_executable(share_rules_test tests/prefill/share_rules_test.cpp)
   target_include_directories(share_rules_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
   add_test(NAME share_rules_test COMMAND share_rules_test)
+  # AMD on Linux: how long the driver paused this process's GPU work (a fake KFD tree; the stall report's line)
+  add_executable(gpu_pause_time_test tests/core/gpu_pause_time_test.cpp)
+  target_include_directories(gpu_pause_time_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  add_test(NAME gpu_pause_time_test COMMAND gpu_pause_time_test)
 endif()
 
 add_executable(platform_memory_test src/platform/memory_test.cpp)

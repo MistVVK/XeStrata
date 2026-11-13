@@ -19,15 +19,25 @@ class ReferenceParser(OutputParser):
             if k < len(parts) - 1:
                 line, self.line = self.line + part, ""
                 s = line.lstrip()
+                was_fenced = bool(self.fence)
                 if self.fence:
-                    if s.startswith(self.fence * 3):
+                    if len(s) - len(s.lstrip(self.fence[0])) >= len(self.fence):   # #4702: as many fence characters
                         self.fence = ""
                 elif s[:3] in ("```", "~~~") and (s[0] * 3) not in s[3:]:
-                    self.fence = s[0]
+                    self.fence = s[0] * (len(s) - len(s.lstrip(s[0])))
                 elif not s:
                     self.ticks = 0
                 else:
                     self.ticks += line.count("`")
+                if was_fenced or self.fence:                                       # #4703: indented code blocks
+                    self._prev_blank = self._indented = False
+                elif not s:
+                    self._prev_blank = True
+                elif line.startswith(("    ", "\t")):
+                    self._indented = self._prev_blank or self._indented
+                    self._prev_blank = False
+                else:
+                    self._prev_blank = self._indented = False
             else:
                 self.line += part
         return text
@@ -35,14 +45,15 @@ class ReferenceParser(OutputParser):
 
 class TrackTests(unittest.TestCase):
     def assert_state(self, actual, expected):
-        self.assertEqual((actual.line, actual.fence, actual.ticks),
-                         (expected.line, expected.fence, expected.ticks))
+        self.assertEqual((actual.line, actual.fence, actual.ticks, actual._prev_blank, actual._indented),
+                         (expected.line, expected.fence, expected.ticks, expected._prev_blank, expected._indented))
         self.assertEqual(actual._opener_ok(), expected._opener_ok())
         self.assertEqual(actual._in_code(), expected._in_code())
 
     def test_fragment_state_from_varied_initial_states(self):
         fragments = ("", "a", "é🙂", "`", "``", "```", "~~~", "\r", "\n", "\r\n",
-                     "\n\n", "  ```python\n", "```quoted```\n", "~\ntext", "\t\nrest")
+                     "\n\n", "\n    code\n", "    x\n", "  ```python\n", "````md\n", "```quoted```\n",
+                     "~\ntext", "\t\nrest")
         for fence, line, ticks, text in itertools.product(("", "`", "~"),
                                                           ("", "  ", "``", "code `"),
                                                           (0, 1, 2, 3), fragments):
