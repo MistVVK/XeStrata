@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <set>
 #include <stdexcept>
 
 namespace strata::core {
@@ -614,7 +615,7 @@ bool Dflash2Drafter::prepare(const float* taps, std::string& err) {
         try {
             for (const Tensor& t : tensors_) {
                 if (t.dtype != "q4_0" || !t.name.ends_with(".weight") || t.rows <= 0 || t.rows > I_ ||
-                    t.cols <= 0 || t.cols > (int64_t) 5 * N_ || t.rows % 16 || t.cols % 512 ||
+                    t.cols <= 0 || t.cols > 5 * N_ || t.rows % 16 || t.cols % 512 ||
                     !shapes.emplace(t.rows, t.cols).second) continue;
                 strata::kernels::Df2Mat mat{blob_ + t.off, gate_, (int) t.rows, true};
                 for (int n = 1; n <= kRows; ++n)
@@ -625,16 +626,8 @@ bool Dflash2Drafter::prepare(const float* taps, std::string& err) {
             return false;
         }
     }
-    const int saved_rows = block_rows_;
-    const int max_context_rows = ndraft_ > kDrafts ? kMaxRows : kRows;
-    for (int rows : {kRows, kMaxRows}) {
-        if (rows == kMaxRows && ndraft_ <= kDrafts) break;
-        block_rows_ = rows;
-        for (int n = 1; n <= max_context_rows; ++n) {
-            if (!capture(n, taps, err)) { block_rows_ = saved_rows; return false; }
-        }
-    }
-    block_rows_ = saved_rows;
+    for (int n = 1; n <= kRows; ++n)
+        if (!capture(n, taps, err)) return false;
     if (!strata::gpu::stream_sync(cs_)) { err = "dflash2: prepare"; return false; }
     graph_taps_ = taps;
     ms_capture = ms_since(t0);

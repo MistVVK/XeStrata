@@ -10,6 +10,7 @@
 #include "strata/kernels/dflash2.hpp"
 
 #include "strata/core/runtime.hpp"
+#include "strata/core/timed_choice.hpp"
 #include "strata/kernels/device_arch_tag.hpp"
 #include "strata/platform/env.hpp"
 #include "cuda_intrinsics.hpp"
@@ -19,7 +20,10 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
+#include <string>
+#include <tuple>
 
 namespace strata::kernels {
 namespace {
@@ -284,11 +288,14 @@ void df2_attention(const float* q, const float* kring, const float* vring, const
 // of one launch share the activations; each runs as its own kernel (the fused launch is a later speed idea).
 namespace {
 
-template <int NC, bool Q4>
+template <int NC, bool Q4, bool PAIR16>
 void gemm_launch(sycl::queue& qu, const void* w, const uint16_t* dpl, float* y, int n_out, int n_in,
                  const int8_t* xq, const float* xd) {
     const int nb = n_in / 32, steps = nb / 16;
-    qu.parallel_for(sycl::nd_range<1>((size_t) n_out * WARP, WARP), [=](nd_item<1> it) DF2_SG32 {
+    qu.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> halves(PAIR16 ? NC * WARP : 1, h);
+        h.parallel_for(sycl::nd_range<1>((size_t) n_out * WARP, WARP),
+                       [=](nd_item<1> it) [[sycl::reqd_sub_group_size(PAIR16 ? 16 : 32)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const int row = (int) it.get_group(0), lane = (int) it.get_local_id(0);
         const int g = row / 8, r = row % 8;
@@ -335,27 +342,40 @@ void gemm_launch(sycl::queue& qu, const void* w, const uint16_t* dpl, float* y, 
                 }
             }
         }
+        if constexpr (PAIR16) {
 #pragma unroll
-        for (int c = 0; c < NC; ++c) {
-            float v = acc[c];
-            for (int o = 16; o > 0; o >>= 1) v += xorf(sg, v, o);
-            if (lane == 0) y[(size_t) c * n_out + row] = v;
+            for (int c = 0; c < NC; ++c) halves[c * WARP + lane] = acc[c];
+            sycl::group_barrier(it.get_group());
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                float v = acc[c] + halves[c * WARP + (lane ^ 16)];
+                for (int o = 8; o > 0; o >>= 1) v += xorf(sg, v, o);
+                if (lane == 0) y[(size_t) c * n_out + row] = v;
+            }
+        } else {
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                float v = acc[c];
+                for (int o = 16; o > 0; o >>= 1) v += xorf(sg, v, o);
+                if (lane == 0) y[(size_t) c * n_out + row] = v;
+            }
         }
+        });
     });
 }
 
-template <bool Q4>
+template <bool Q4, bool PAIR16>
 void gemm_nc(sycl::queue& qu, const void* w, const uint16_t* dpl, float* y, int n_out, int n_in,
              const int8_t* xq, const float* xd, int ncols) {
     switch (ncols) {
-        case 1: gemm_launch<1, Q4>(qu, w, dpl, y, n_out, n_in, xq, xd); break;
-        case 2: gemm_launch<2, Q4>(qu, w, dpl, y, n_out, n_in, xq, xd); break;
-        case 3: gemm_launch<3, Q4>(qu, w, dpl, y, n_out, n_in, xq, xd); break;
-        case 4: gemm_launch<4, Q4>(qu, w, dpl, y, n_out, n_in, xq, xd); break;
-        case 5: gemm_launch<5, Q4>(qu, w, dpl, y, n_out, n_in, xq, xd); break;
-        case 6: gemm_launch<6, Q4>(qu, w, dpl, y, n_out, n_in, xq, xd); break;
-        case 7: gemm_launch<7, Q4>(qu, w, dpl, y, n_out, n_in, xq, xd); break;
-        default: gemm_launch<8, Q4>(qu, w, dpl, y, n_out, n_in, xq, xd); break;
+        case 1: gemm_launch<1, Q4, PAIR16>(qu, w, dpl, y, n_out, n_in, xq, xd); break;
+        case 2: gemm_launch<2, Q4, PAIR16>(qu, w, dpl, y, n_out, n_in, xq, xd); break;
+        case 3: gemm_launch<3, Q4, PAIR16>(qu, w, dpl, y, n_out, n_in, xq, xd); break;
+        case 4: gemm_launch<4, Q4, PAIR16>(qu, w, dpl, y, n_out, n_in, xq, xd); break;
+        case 5: gemm_launch<5, Q4, PAIR16>(qu, w, dpl, y, n_out, n_in, xq, xd); break;
+        case 6: gemm_launch<6, Q4, PAIR16>(qu, w, dpl, y, n_out, n_in, xq, xd); break;
+        case 7: gemm_launch<7, Q4, PAIR16>(qu, w, dpl, y, n_out, n_in, xq, xd); break;
+        default: gemm_launch<8, Q4, PAIR16>(qu, w, dpl, y, n_out, n_in, xq, xd); break;
     }
 }
 
@@ -370,8 +390,38 @@ void df2_gemm(const Df2Mat* mats, int n, const void* xq, const float* xd, int n_
         const uint8_t* w = static_cast<const uint8_t*>(mats[i].w);
         const size_t plane = mats[i].q4 ? (size_t) mats[i].n_out * n_in / 2 : (size_t) mats[i].n_out * n_in;
         const uint16_t* dpl = reinterpret_cast<const uint16_t*>(w + plane);
-        if (mats[i].q4) gemm_nc<true>(qu, w, dpl, mats[i].y, mats[i].n_out, n_in, xqp, xd, ncols);
-        else gemm_nc<false>(qu, w, dpl, mats[i].y, mats[i].n_out, n_in, xqp, xd, ncols);
+        bool pair16 = false;
+        if (mats[i].q4) {
+            const char* mode = strata::env_get("DF2_GEMM_PAIR16");
+            const auto sizes = qu.get_device().get_info<sycl::info::device::sub_group_sizes>();
+            const bool supported = std::find(sizes.begin(), sizes.end(), 16) != sizes.end();
+            if (mode && mode[0] == '1' && mode[1] == '\0') {
+                if (!supported) throw std::runtime_error("XESTRATA_DF2_GEMM_PAIR16 needs subgroup size 16");
+                pair16 = true;
+            } else if (!mode || !*mode || std::string(mode) == "auto") {
+                using Key = std::tuple<int, int, int>;
+                static core::TimedCache<sycl::device, Key, bool> choices;
+                const Key key{mats[i].n_out, n_in, ncols};
+                const auto cached = choices.get(qu.get_device(), key);
+                if (cached) pair16 = *cached;
+                else if (supported && core::timing_depth == 0 &&
+                         qu.ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording) {
+                    const auto measured = core::timed_choice({
+                        {[&] { for (int r = 0; r < 4; ++r) gemm_nc<true, false>(qu, w, dpl, mats[i].y, mats[i].n_out, n_in, xqp, xd, ncols); return true; }},
+                        {[&] { for (int r = 0; r < 4; ++r) gemm_nc<true, true>(qu, w, dpl, mats[i].y, mats[i].n_out, n_in, xqp, xd, ncols); return true; }}
+                    }, [&] { qu.wait_and_throw(); });
+                    pair16 = choices.put(qu.get_device(), key, measured.pick == 1);
+                    std::fprintf(stderr, "xestrata: DFlash2 Q4 GEMM %s (%d x %d x %d; %.1f / %.1f us)\n",
+                                 pair16 ? "paired subgroup" : "one subgroup", mats[i].n_out, n_in, ncols,
+                                 measured.seconds[0] * 1e6 / 4, measured.seconds[1] * 1e6 / 4);
+                }
+            } else if (!(mode[0] == '0' && mode[1] == '\0')) {
+                throw std::runtime_error("XESTRATA_DF2_GEMM_PAIR16 must be auto, 0 or 1");
+            }
+        }
+        if (mats[i].q4 && pair16) gemm_nc<true, true>(qu, w, dpl, mats[i].y, mats[i].n_out, n_in, xqp, xd, ncols);
+        else if (mats[i].q4) gemm_nc<true, false>(qu, w, dpl, mats[i].y, mats[i].n_out, n_in, xqp, xd, ncols);
+        else gemm_nc<false, false>(qu, w, dpl, mats[i].y, mats[i].n_out, n_in, xqp, xd, ncols);
     }
 }
 
