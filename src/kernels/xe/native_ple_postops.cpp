@@ -29,7 +29,7 @@ template <int BlockSize> class RmsRepKernel;   // asked for its work-group (work
 
 namespace {
 
-constexpr int N = 2560, H = 4, D = N * H, HISTORY = 9;
+constexpr int N = NG_N_EMBD, H = NG_HC, D = NG_HC_DIM, HISTORY = 9;
 constexpr int WARP = 32;
 
 inline float warp_sum(const sycl::sub_group& sg, float x) {
