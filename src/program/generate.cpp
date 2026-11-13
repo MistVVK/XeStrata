@@ -14568,7 +14568,7 @@ int main(int argc, char** argv) {
                         sizes += (sizes.empty() ? "" : ", ") + std::to_string(cf.tables[(size_t) k].size());
                     }
                 dc_file = cf;
-                policy.start_calibration(cf.state_effect, cf.real, cf.cal);
+                policy.start_calibration(cf.state_effect, cf.real, cf.cal, cf.real_cost);
                 dc_calib = policy.calibrating();
                 if (cf.cpu_share >= 0.0) strata::prefill::Prefill::fix_cpu_share(cf.cpu_share);
                 std::string extra = cf.cpu_share >= 0.0 ? "; CPU prompt share " + std::to_string(cf.cpu_share).substr(0, 4) : "";
@@ -20085,7 +20085,7 @@ int main(int argc, char** argv) {
                     policy.reset_learning();
                     dc_learning = false;
                     dc_file = cf;
-                    policy.start_calibration(cf.state_effect, cf.real, cf.cal);
+                    policy.start_calibration(cf.state_effect, cf.real, cf.cal, cf.real_cost);
                     dc_calib = policy.calibrating();
                     std::string t0;
                     char b[24];

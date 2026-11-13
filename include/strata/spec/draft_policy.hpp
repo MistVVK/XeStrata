@@ -123,6 +123,7 @@ struct CostFile {
     bool state_effect = false;   ///< the learning stretch showed a load-time effect: only fresh real rounds are counted
     std::array<unsigned, CostLearner::kCtxBuckets> real{};   ///< bit t-1: the cost of size t is a median of real rounds, no longer the learned one
     std::array<std::array<CalAcc, CostLearner::kMaxT + 1>, CostLearner::kCtxBuckets> cal{};   ///< real rounds collected so far for the sizes not yet replaced
+    std::array<std::array<double, CostLearner::kMaxT + 1>, CostLearner::kCtxBuckets> real_cost{};   ///< the cost of a size marked real (the table lines keep the learned costs)
 };
 /// false (with `why` for the log) when the file is missing, unreadable, malformed or truncated, or was learned under another key: the caller
 /// then learns a new table.  Never throws.
@@ -227,11 +228,16 @@ public:
     /// the machine has a load-time effect), across starts through the table file (CostFile::cal).  At kCalibN rounds the size's cost becomes their mean
     /// (a result outside [kCalibOkLo, kCalibOkHi] x the learned cost means a disturbed stretch: the rounds are dropped and collected again) and the size
     /// is marked real (CostFile::real) for good: no later change, so the windows of a repeated start are the same.  A size that real requests never reach
-    /// keeps its learned cost (nothing is guessed from other sizes).  real and cal come from the file (CostFile).
+    /// keeps its learned cost, except for the provisional step below.  real, cal and real_cost come from the file (CostFile).
+    /// Provisional step: a size that is not real yet and has 2 or more rows is priced at its learned cost x the mean of (real cost / learned cost) over the
+    /// real sizes of 2 or more rows (when there are some), so a size that real requests reach rarely (the 4-row lookup: about one round per request) is not
+    /// left at a price that the sizes next to it have already left.  Scaling every size alike would change no choice (the policy compares costs with each
+    /// other); this changes the prices relative to each other, from the engine's own measurements, and only until the size has its own 16 rounds.
     static constexpr int kCalibN = 16;
     static constexpr double kCalibLo = 0.85, kCalibHi = 1.30, kCalibOkLo = 0.86, kCalibOkHi = 1.29;
     void start_calibration(bool state_effect, const std::array<unsigned, kCtxBuckets>& real,
-                           const std::array<std::array<CalAcc, kMaxT + 1>, kCtxBuckets>& cal);
+                           const std::array<std::array<CalAcc, kMaxT + 1>, kCtxBuckets>& cal,
+                           const std::array<std::array<double, kMaxT + 1>, kCtxBuckets>& real_cost);
     bool calibrating() const { return calib_on_; }
     bool calib_dirty() const { return calib_dirty_; }
     /// At a request's end: replaces the sizes that have kCalibN real rounds and puts the table, the real marks and the rounds collected so far into
@@ -289,7 +295,9 @@ private:
     std::array<int, kCtxBuckets> fixed_n_{};               // the length of each bucket's fixed table
     std::array<unsigned, kCtxBuckets> real_{};
     std::array<std::array<CalAcc, kMaxT + 1>, kCtxBuckets> cal_{};
+    std::array<std::array<double, kMaxT + 1>, kCtxBuckets> learned_{}, real_cost_{};   // the table as fixed (learned); the cost of each real size
     void calib_add(int bucket, int t, double ms, double age);
+    void apply_provisional();
     int explore_size(int lookup_k, int pad_cap) const;                  // the size a learning stretch measures next, 0 = none (choose() counts it)
     int explore_next(int reach, int skip) const;                        // the smallest size 2..reach (not `skip`) that still needs rounds; counts it; 0 = none
     bool explore_ok() const;                                            // a forced round counts now (fresh phase, or no state effect)

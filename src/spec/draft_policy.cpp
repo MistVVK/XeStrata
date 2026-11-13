@@ -308,6 +308,16 @@ bool read_cost_file(const std::string& path, const std::string& key, CostFile& o
             out.cal[(size_t) cb][(size_t) ct] = CalAcc{cn, cs};
             continue;
         }
+        if (line.rfind("rc ", 0) == 0) {
+            int rb = -1, rt = -1;
+            double rv = -1.0;
+            if (std::sscanf(line.c_str(), "rc %d %d %lf", &rb, &rt, &rv) != 3 || rb < 0 || rb >= CostLearner::kCtxBuckets || rt < 1 || rt > CostLearner::kMaxT || !(rv > 0.0) || !(rv < 1e5)) {
+                why = "a malformed real cost";
+                return false;
+            }
+            out.real_cost[(size_t) rb][(size_t) rt] = rv;
+            continue;
+        }
         int b = -1, used = 0;
         if (std::sscanf(line.c_str(), "bucket %d %n", &b, &used) < 1 || used == 0 || b < 0 || b >= CostLearner::kCtxBuckets) {
             why = "a malformed line";
@@ -358,6 +368,11 @@ bool write_cost_file(const std::string& path, const CostFile& c, std::string& wh
         if (c.state_effect) f << "state 1\n";
         for (int k = 0; k < CostLearner::kCtxBuckets; ++k) {
             if (c.real[(size_t) k] != 0u) f << "real " << k << " " << c.real[(size_t) k] << "\n";
+            for (int t = 1; t <= CostLearner::kMaxT; ++t)
+                if ((c.real[(size_t) k] >> (t - 1) & 1u) && c.real_cost[(size_t) k][(size_t) t] > 0.0) {
+                    std::snprintf(b, sizeof b, "%.4f", c.real_cost[(size_t) k][(size_t) t]);
+                    f << "rc " << k << " " << t << " " << b << "\n";
+                }
             for (int t = 1; t <= CostLearner::kMaxT; ++t) {
                 const CalAcc& a = c.cal[(size_t) k][(size_t) t];
                 if (a.n <= 0 || (c.real[(size_t) k] >> (t - 1) & 1u)) continue;
@@ -401,6 +416,7 @@ void DraftPolicy::set_fixed_costs(const double* ms, int n, int bucket) {
         const bool in = t <= n && ms[t - 1] > 0.0;
         cost_[bucket][t] = in ? ms[t - 1] : 0.0;
         cost_n_[bucket][t] = in ? 1e6 : 0.0;
+        learned_[(size_t) bucket][(size_t) t] = cost_[bucket][t];
     }
 }
 
@@ -623,11 +639,38 @@ void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double ro
 
 // ---- calibration of a fixed table against real requests (see the header)
 
+void DraftPolicy::apply_provisional() {
+    for (int k = 0; k < kCtxBuckets; ++k) {
+        const int n = fixed_n_[(size_t) k];
+        if (n <= 0) continue;
+        double sum = 0.0;
+        int cnt = 0;
+        for (int t = 2; t <= n; ++t)
+            if ((real_[(size_t) k] >> (t - 1) & 1u) && learned_[(size_t) k][(size_t) t] > 0.0) {
+                sum += real_cost_[(size_t) k][(size_t) t] / learned_[(size_t) k][(size_t) t];
+                ++cnt;
+            }
+        const double r = cnt > 0 ? sum / cnt : 1.0;
+        for (int t = 1; t <= n; ++t) {
+            if (real_[(size_t) k] >> (t - 1) & 1u) cost_[(size_t) k][(size_t) t] = real_cost_[(size_t) k][(size_t) t];
+            else cost_[(size_t) k][(size_t) t] = learned_[(size_t) k][(size_t) t] * (t >= 2 ? r : 1.0);
+        }
+        for (int t = 2; t <= n; ++t)   // more rows never cost less
+            if (cost_[(size_t) k][(size_t) t] < cost_[(size_t) k][(size_t) t - 1]) cost_[(size_t) k][(size_t) t] = cost_[(size_t) k][(size_t) t - 1];
+    }
+}
+
 void DraftPolicy::start_calibration(bool state_effect, const std::array<unsigned, kCtxBuckets>& real,
-                                    const std::array<std::array<CalAcc, kMaxT + 1>, kCtxBuckets>& cal) {
+                                    const std::array<std::array<CalAcc, kMaxT + 1>, kCtxBuckets>& cal,
+                                    const std::array<std::array<double, kMaxT + 1>, kCtxBuckets>& real_cost) {
     calib_fresh_only_ = state_effect;
     real_ = real;
     cal_ = cal;
+    real_cost_ = real_cost;
+    for (int k = 0; k < kCtxBuckets; ++k)   // a mark without a cost (a damaged file) is no mark
+        for (int t = 1; t <= kMaxT; ++t)
+            if ((real_[(size_t) k] >> (t - 1) & 1u) && !(real_cost_[(size_t) k][(size_t) t] > 0.0)) real_[(size_t) k] &= ~(1u << (t - 1));
+    apply_provisional();
     calib_dirty_ = false;
     calib_on_ = false;
     for (int k = 0; k < kCtxBuckets; ++k) {
@@ -641,7 +684,7 @@ void DraftPolicy::calib_add(int bucket, int t, double ms, double age) {
     if (bucket < 0 || bucket >= kCtxBuckets || t < 1 || t > fixed_n_[(size_t) bucket]) return;
     if (real_[(size_t) bucket] >> (t - 1) & 1u) return;
     if (calib_fresh_only_ && age > CostLearner::kFreshS) return;   // the table is what rounds of the first seconds of a busy run cost
-    const double base = cost_[(size_t) bucket][(size_t) t];
+    const double base = learned_[(size_t) bucket][(size_t) t];
     if (!(base > 0.0)) return;
     CalAcc& a = cal_[(size_t) bucket][(size_t) t];
     if (a.n >= kCalibN) return;
@@ -654,28 +697,42 @@ bool DraftPolicy::calibrate(CostFile& cf, std::string& report) {
     report.clear();
     if (!calib_on_ && !calib_dirty_) return false;
     char b[96];
-    bool changed = calib_dirty_;
+    bool changed = calib_dirty_, replaced = false;
     for (int k = 0; k < kCtxBuckets; ++k) {
         const int n = fixed_n_[(size_t) k];
         for (int t = 1; t <= n; ++t) {
             if (real_[(size_t) k] >> (t - 1) & 1u) continue;
             CalAcc& a = cal_[(size_t) k][(size_t) t];
             if (a.n < kCalibN) continue;
-            const double v = a.sum / a.n, base = cost_[(size_t) k][(size_t) t];
+            const double v = a.sum / a.n, base = learned_[(size_t) k][(size_t) t];
             if (v >= kCalibOkLo * base && v <= kCalibOkHi * base) {
                 std::snprintf(b, sizeof b, "%s%d rows %.2f -> %.2f", report.empty() ? "" : ", ", t, base, v);
                 report += b;
-                cost_[(size_t) k][(size_t) t] = v;
+                real_cost_[(size_t) k][(size_t) t] = v;
                 real_[(size_t) k] |= 1u << (t - 1);
+                replaced = true;
             }
             a = CalAcc{};   // replaced, or disturbed (rounds dropped, collected again)
         }
-        for (int t = 2; t <= n; ++t)   // more rows never cost less
-            if (cost_[(size_t) k][(size_t) t] < cost_[(size_t) k][(size_t) t - 1]) cost_[(size_t) k][(size_t) t] = cost_[(size_t) k][(size_t) t - 1];
-        if (n > 0) {
-            cf.tables[(size_t) k].assign(cost_[(size_t) k].begin() + 1, cost_[(size_t) k].begin() + 1 + n);
-            cf.real[(size_t) k] = real_[(size_t) k];
-            for (int t = 0; t <= kMaxT; ++t) cf.cal[(size_t) k][(size_t) t] = cal_[(size_t) k][(size_t) t];
+    }
+    if (replaced) {
+        std::array<std::array<double, kMaxT + 1>, kCtxBuckets> before = cost_;
+        apply_provisional();
+        for (int k = 0; k < kCtxBuckets; ++k)
+            for (int t = 1; t <= fixed_n_[(size_t) k]; ++t)
+                if (!(real_[(size_t) k] >> (t - 1) & 1u) && std::fabs(cost_[(size_t) k][(size_t) t] - before[(size_t) k][(size_t) t]) > 0.005) {
+                    std::snprintf(b, sizeof b, "%s%d rows (not real yet) %.2f -> %.2f", report.empty() ? "" : ", ", t, before[(size_t) k][(size_t) t], cost_[(size_t) k][(size_t) t]);
+                    report += b;
+                }
+    }
+    for (int k = 0; k < kCtxBuckets; ++k) {
+        const int n = fixed_n_[(size_t) k];
+        if (n <= 0) continue;
+        cf.tables[(size_t) k].assign(learned_[(size_t) k].begin() + 1, learned_[(size_t) k].begin() + 1 + n);   // the file keeps the learned costs
+        cf.real[(size_t) k] = real_[(size_t) k];
+        for (int t = 0; t <= kMaxT; ++t) {
+            cf.cal[(size_t) k][(size_t) t] = cal_[(size_t) k][(size_t) t];
+            cf.real_cost[(size_t) k][(size_t) t] = real_cost_[(size_t) k][(size_t) t];
         }
     }
     cf.state_effect = calib_fresh_only_;
@@ -684,7 +741,7 @@ bool DraftPolicy::calibrate(CostFile& cf, std::string& report) {
     for (int k = 0; k < kCtxBuckets; ++k)
         for (int t = 1; t <= fixed_n_[(size_t) k]; ++t)
             if (!(real_[(size_t) k] >> (t - 1) & 1u)) calib_on_ = true;
-    return changed || !report.empty();
+    return changed || replaced;
 }
 
 void DraftPolicy::observe_committed(bool lookup, int t, int accepted, int match) {
