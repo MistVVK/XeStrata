@@ -8419,6 +8419,11 @@ int main(int argc, char** argv) {
                     for (AHome& h : ahomes) h.used = false;
                     if (pl) {   // the copies in at each card's next gap: after this step, so fenced (see above)
                         a_res_dirty = true;
+                        // the range is the whole round (upstream #4844): the loop can drain after this plan, and step 3
+                        // then takes the serial rule - a stale lo/hi would mark only an earlier round's batch, and the
+                        // slot would hold the new expert while the table still named the old one
+                        a_lo = 0;
+                        a_hi = a_bi = aswaps.size();
                         for (const ASwap& w : aswaps) a_in_due[(size_t) w.home] = 1;
                         ajob->post(a_stage_in);
                     } else {
