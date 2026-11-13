@@ -13,7 +13,6 @@
 #include "strata/core/stream_watch.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/core/per_device.hpp"
-#include "strata/core/timed_choice.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/platform/direct_file.hpp"
@@ -64,7 +63,6 @@
 #include <memory>
 #include <mutex>
 #include <thread>
-#include <tuple>
 #include <vector>
 
 namespace strata::prefill {
@@ -827,74 +825,6 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
     p.page_table = table;
     return p;
 }
-// QSA block scoring is a product of the FP32 pooled keys and indexer queries, followed by the per-head ReLU sum.
-// Keep the moving tail in the existing kernel.  The library form is timed against the shared tiled scorer, and is
-// only eligible when its selections on the measured rows are the same.  The full quality check is still required.
-void qsa_scores(const float* pooled, const float* dead, const float* query, const int32_t* steps, int64_t nq,
-                int64_t active, int64_t max_blocks, int64_t cap, const strata::kernels::QsaShapes& s,
-                float* scores, int32_t* ids, float* scratch, uint64_t scratch_floats, gpu::Stream stream) {
-    using namespace strata::kernels;
-    auto& queue = core::Runtime::get().stream(stream);
-    auto baseline = [&](int64_t rows) {
-        if (!qsa_block_scores_tc(pooled, dead, query, steps, rows, max_blocks, s, scores, stream, active))
-            qsa_block_scores(pooled, dead, query, steps, rows, max_blocks, s, scores, stream, active);
-        return true;
-    };
-    const int64_t tile = nq > 0 ? std::min<int64_t>(active, (int64_t) (scratch_floats / ((uint64_t) nq * 4))) : 0;
-    auto product = [&](int64_t rows) {
-        if (s.idx_dim != 128 || s.idx_n_head != 4 || s.idx_block != 4 || tile < 1 || !scratch) return false;
-        for (int64_t b = 0; b < active; b += tile) {
-            const int64_t n = std::min(tile, active - b);
-            if (!Gemm::f32(query, pooled + b * 128, scratch, rows * 4, n, 128, tile, stream)) return false;
-            qsa_block_scores_reduce(scratch, tile, b, n, steps, rows, max_blocks, scores, stream);
-        }
-        qsa_block_scores_tail(dead, query, steps, rows, max_blocks, scores, stream);
-        return true;
-    };
-    const char* mode = strata::env_get("SELECT_GEMM");
-    bool use = false;
-    if (mode && mode[0] == '1' && mode[1] == '\0') use = true;
-    else if (!mode || !*mode || std::strcmp(mode, "auto") == 0) {
-        using Key = std::tuple<int64_t, int64_t, int64_t, int64_t>;
-        static core::TimedCache<sycl::device, Key, bool> choices;
-        static core::TimedCache<sycl::device, int, bool> warmed;
-        const Key key{nq, core::timed_key_class(active), max_blocks, cap};
-        const auto cached = choices.get(queue.get_device(), key);
-        if (cached) use = *cached;
-        else if (tile > 0 && core::timing_depth == 0 &&
-                 queue.ext_oneapi_get_state() != sycl::ext::oneapi::experimental::queue_state::recording) {
-            const int64_t rows = std::min<int64_t>(nq, 8);
-            const size_t bytes = (size_t) rows * (size_t) cap * sizeof(int32_t);
-            std::vector<int32_t> old_ids((size_t) rows * (size_t) cap), new_ids(old_ids.size());
-            queue.memset(ids, 0, bytes); baseline(rows);
-            qsa_block_topk(scores, steps, rows, max_blocks, cap, s, ids, stream);
-            queue.memcpy(old_ids.data(), ids, bytes).wait_and_throw();
-            queue.memset(ids, 0, bytes);
-            bool ok = product(rows);
-            if (ok) {
-                qsa_block_topk(scores, steps, rows, max_blocks, cap, s, ids, stream);
-                queue.memcpy(new_ids.data(), ids, bytes).wait_and_throw();
-                ok = old_ids == new_ids;
-            }
-            bool faster = false;
-            if (ok) {
-                const bool first = warmed.put_first(queue.get_device(), 0, true, [](int) { return true; }).second;
-                const auto m = core::timed_choice({{[&] { return baseline(rows); }}, {[&] { return product(rows); }}},
-                    [&] { queue.wait_and_throw(); }, 5, 1.10, first ? 0.5 : 0.0);
-                faster = m.pick == 1;
-                std::fprintf(stderr, "xestrata: QSA score %s (%lld blocks, %.1f / %.1f us)\n",
-                             faster ? "GEMM" : "tiled", (long long) active, m.seconds[0] * 1e6, m.seconds[1] * 1e6);
-            }
-            use = choices.put(queue.get_device(), key, faster);
-        }
-    } else if (!(mode[0] == '0' && mode[1] == '\0')) {
-        throw core::DeviceError("XESTRATA_SELECT_GEMM must be auto, 0 or 1");
-    }
-    if (use) {
-        if (!product(nq)) throw core::DeviceError("XESTRATA_SELECT_GEMM: FP32 product or scratch unavailable");
-    } else baseline(nq);
-}
-
 // The attention stage is shared by chunk-major and layer-major prefill.
 void qsa_attention(const float* q, const strata::kernels::QsaAttnPools& pools, const int32_t* ids,
                    const int32_t* steps, int64_t cap, const strata::kernels::QsaShapes& shapes,
@@ -2763,9 +2693,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                                 strata::kernels::kStepNBid)] + 1;
                         // the scores on tensor cores (3xTF32: FP32-level, not bitwise); the warp kernel where that form
                         // cannot run
-                        qsa_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb, active, m.max_blocks,
-                                   m.cap, s, m.sel_scores, m.sel_ids + t0 * m.cap, m.attn_scratch,
-                                   (uint64_t) m.attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s), m.cs);
+                        if (!strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512,
+                                                                  steps0, nb, m.max_blocks, s, m.sel_scores,
+                                                                  m.cs, active))
+                            strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + t0 * 512, steps0, nb,
+                                                              m.max_blocks, s, m.sel_scores, m.cs, active);
                         strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                         m.sel_ids + t0 * m.cap, m.cs);
                     }
@@ -5046,9 +4978,11 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             const int32_t* steps0 = m.steps_dev + q0 * strata::kernels::kStepCount;
                             const int64_t active = (int64_t) m.steps_host[(size_t) ((q0 + nb - 1) * strata::kernels::kStepCount +
                                                                                     strata::kernels::kStepNBid)] + 1;
-                            qsa_scores(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512, steps0, nb, active, m.max_blocks,
-                                       m.cap, s, m.sel_scores, m.sel_ids + q0 * m.cap, m.attn_scratch,
-                                       (uint64_t) m.attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s), cs);
+                            if (!strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512,
+                                                                      steps0, nb, m.max_blocks, s, m.sel_scores,
+                                                                      cs, active))
+                                strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512, steps0, nb,
+                                                                  m.max_blocks, s, m.sel_scores, cs, active);
                             strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                             m.sel_ids + q0 * m.cap, cs);
                         }

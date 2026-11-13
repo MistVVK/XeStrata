@@ -353,23 +353,6 @@ bool dense_f32(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
 #endif
 }  // namespace
 
-bool Gemm::f32(const float* X, const float* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
-               void* stream) {
-#if STRATA_ONEMATH
-    auto& q = core::Runtime::get().stream(stream);
-    if (!backend(q.get_device()).blas) return false;
-    try {
-        namespace om = oneapi::math;
-        om::blas::column_major::gemm(q, om::transpose::trans, om::transpose::nontrans, N, T, K, 1.0f,
-                                    W, K, X, K, 0.0f, Y, ldy);
-        return true;
-    } catch (const oneapi::math::exception&) { return false; }
-#else
-    (void) X; (void) W; (void) Y; (void) T; (void) N; (void) K; (void) ldy; (void) stream;
-    return false;
-#endif
-}
-
 void Gemm::prepare() {
 #if STRATA_ONEMATH
     // A backend's first product loads its library and its kernels (cuBLAS: about 0.6 s on an RTX 4070, inside the
