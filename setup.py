@@ -4129,12 +4129,18 @@ def custom_id(name: str) -> str:
     return "custom-" + slug
 
 
+# XeStrata's own draft layer (mtp-q2_0.gguf, tools/mtp_fetch.py) beside a model is not a second model (upstream
+# 788e37279, #4693)
+DRAFT_LAYER = re.compile(r"mtp[-_][a-z0-9_.-]*\.gguf")
+
+
 def model_firsts(folder: Path) -> list[Path]:
     """The models' first files in a folder: each .gguf that is not split or is the first shard of a split one, the
-    picture readers (mmproj*.gguf) aside."""
+    picture readers (mmproj*.gguf) and XeStrata's own draft layer aside."""
     def first(p: Path) -> bool:
         m = SHARD_NAME.search(p.name)
-        return not p.name.lower().startswith("mmproj") and (m is None or m.group(1) == "00001")
+        low = p.name.lower()
+        return not low.startswith("mmproj") and not DRAFT_LAYER.fullmatch(low) and (m is None or m.group(1) == "00001")
     return sorted(p for p in folder.glob("*.gguf") if first(p))
 
 

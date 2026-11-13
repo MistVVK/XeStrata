@@ -33,6 +33,16 @@ def run(fn, *args, **kw):
 
 
 class OwnFileChecks(unittest.TestCase):
+    def test_the_draft_layer_beside_a_model_is_not_a_second_model(self):
+        # upstream #4693: the folder held "several models" for a model and the mtp-q2_0.gguf beside it
+        folder = Path(self.tmp.name) / "own"
+        folder.mkdir()
+        (folder / "My-Finetune-IQ3_S-00001-of-00001.gguf").write_bytes(b"abc")
+        (folder / "mtp-q2_0.gguf").write_bytes(b"abc")
+        self.assertEqual([p.name for p in setup.model_firsts(folder)], ["My-Finetune-IQ3_S-00001-of-00001.gguf"])
+        code, text = run(setup.gguf_files, folder)
+        self.assertEqual(code, 0, text)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
