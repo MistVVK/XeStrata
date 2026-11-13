@@ -14556,6 +14556,11 @@ int main(int argc, char** argv) {
         bool dc_seen_request = false;
         bool dc_pcie_pending = false;    // a loaded table without a PCIe share: written into it once PcieAuto has settled
         strata::spec::CostFile dc_file;  // that table, as loaded
+        bool dc_shares_due = false;      // the table is held back (live costs): its stored CPU prompt share / PCIe share are fixed when it takes over
+        auto dc_apply_shares = [&](const strata::spec::CostFile& cf) {
+            if (cf.cpu_share >= 0.0) strata::prefill::Prefill::fix_cpu_share(cf.cpu_share);
+            if (dc_pcie_ok && cf.pcie_frac >= 0.0) fix_pcie_share(cf.pcie_frac);
+        };
         if (!o.draft_costs.empty() && !policy.fixed()) {
             dc_key = draft_costs_key(argc, argv, o.draft_costs_key, spec_cost);
             strata::spec::CostFile cf;
@@ -14570,10 +14575,10 @@ int main(int argc, char** argv) {
                 dc_file = cf;
                 policy.start_calibration(cf.state_effect, cf.real, cf.cal, cf.real_cost, cf.reqs);
                 dc_calib = policy.calibrating();
-                if (cf.cpu_share >= 0.0) strata::prefill::Prefill::fix_cpu_share(cf.cpu_share);
+                if (policy.table_held()) dc_shares_due = true;   // a held table leaves the shares live too: they are fixed when the table takes over
+                else dc_apply_shares(cf);
                 std::string extra = cf.cpu_share >= 0.0 ? "; CPU prompt share " + std::to_string(cf.cpu_share).substr(0, 4) : "";
                 if (dc_pcie_ok && cf.pcie_frac >= 0.0) {   // PcieAuto's settled share: fixed, no refinement in this run
-                    fix_pcie_share(cf.pcie_frac);
                     extra += "; PCIe share " + std::to_string(cf.pcie_frac).substr(0, 4);
                 } else if (dc_pcie_ok) {   // a file from before the stored PCIe share: refined as before, then written into the file
                     dc_pcie_pending = true;
@@ -20081,8 +20086,6 @@ int main(int argc, char** argv) {
                     if (dc_pcie_ok) cf.pcie_frac = o.pcie_frac;
                     std::string why;
                     const bool saved = strata::spec::write_cost_file(o.draft_costs, cf, why);
-                    if (cf.cpu_share >= 0.0) strata::prefill::Prefill::fix_cpu_share(cf.cpu_share);
-                    if (cf.pcie_frac >= 0.0) fix_pcie_share(cf.pcie_frac);
                     for (int k = 0; k < strata::spec::CostLearner::kCtxBuckets; ++k)
                         if (!cf.tables[(size_t) k].empty())
                             policy.set_fixed_costs(cf.tables[(size_t) k].data(), (int) cf.tables[(size_t) k].size(), k);
@@ -20092,6 +20095,8 @@ int main(int argc, char** argv) {
                     dc_file = cf;
                     policy.start_calibration(cf.state_effect, cf.real, cf.cal, cf.real_cost, cf.reqs);
                     dc_calib = policy.calibrating();
+                    if (policy.table_held()) dc_shares_due = true;   // the shares stay live until the table takes over
+                    else dc_apply_shares(cf);
                     std::string t0;
                     char b[24];
                     for (size_t i = 0; i < cf.tables[0].size(); ++i) {
@@ -20115,6 +20120,7 @@ int main(int argc, char** argv) {
             // --draft-costs, calibration: the real rounds of this request that the sizes still at their learned cost have collected; a size with
             // kCalibN of them takes their mean (the file is rewritten whole, the new cost applies from the next request on, no later change)
             if (dc_calib && (policy.calib_dirty() || policy.table_held())) {
+                const bool dc_was_held = policy.table_held();
                 strata::spec::CostFile cc = dc_file;
                 std::string rep, why;
                 if (policy.calibrate(cc, rep)) {
@@ -20125,9 +20131,14 @@ int main(int argc, char** argv) {
                                      saved ? "" : (" (not saved: " + why + ")").c_str());
                 }
                 dc_calib = policy.calibrating();
-                if (!dc_calib && policy.fixed())
-                    std::fprintf(stderr, "strata serve: draft costs: calibration is over; this machine's table decides the windows from the next "
-                                         "request on\n");
+                if (dc_was_held && policy.fixed()) {   // the table takes over: the stored shares are fixed with it
+                    if (dc_shares_due) dc_apply_shares(dc_file);
+                    dc_shares_due = false;
+                    std::fprintf(stderr, "strata serve: draft costs: %s; this machine's table decides the windows from the next request on%s\n",
+                                 dc_calib ? "100 requests have run, sizes real requests did not reach keep a scaled learned cost until they have their own rounds"
+                                          : "every size is calibrated",
+                                 dc_file.cpu_share >= 0.0 || dc_file.pcie_frac >= 0.0 ? " (the stored shares are fixed with it)" : "");
+                }
             }
             // --draft-costs with a table from before the stored PCIe share: once PcieAuto has settled (three readings, or it gave up), its
             // share goes into the file beside the table and is fixed from the next request; the next start loads it
@@ -20139,9 +20150,11 @@ int main(int argc, char** argv) {
                 std::string why;
                 const bool saved = strata::spec::write_cost_file(o.draft_costs, cf, why);
                 dc_file = cf;
-                fix_pcie_share(cf.pcie_frac);
-                std::fprintf(stderr, "strata serve: draft costs: the PCIe share settled at %.2f; it is %s and fixed from the next request on\n",
-                             cf.pcie_frac, saved ? "stored with this machine's table" : ("not stored (" + why + ")").c_str());
+                if (policy.table_held()) dc_shares_due = true;   // held back: fixed when the table takes over
+                else fix_pcie_share(cf.pcie_frac);
+                std::fprintf(stderr, "strata serve: draft costs: the PCIe share settled at %.2f; it is %s and fixed %s\n",
+                             cf.pcie_frac, saved ? "stored with this machine's table" : ("not stored (" + why + ")").c_str(),
+                             policy.table_held() ? "when the table takes over" : "from the next request on");
             }
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
             if (!ver.wait_commit(err)) {
